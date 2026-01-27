@@ -133,8 +133,10 @@ DeviceRunner &DeviceRunner::Get() {
     return runner;
 }
 
-int DeviceRunner::Init(int deviceId, const std::vector<uint8_t>& aicpuSoBinary,
-                       const std::vector<uint8_t>& aicoreKernelBinary, const std::string& ptoIsaRoot) {
+int DeviceRunner::Init(int deviceId,
+                       const std::vector<uint8_t>& aicpuSoBinary,
+                       const std::vector<uint8_t>& aicoreKernelBinary,
+                       const std::string& ptoIsaRoot) {
     if (initialized_) {
         std::cerr << "Error: DeviceRunner already initialized\n";
         return -1;
@@ -244,7 +246,14 @@ int DeviceRunner::Run(Graph& graph, int blockDim, int launchAicpuNum) {
         return -1;
     }
 
-    int numAiCore = blockDim * 3;
+    // Calculate execution parameters
+    blockDim_ = blockDim;
+
+    // Set kernel args
+    kernelArgs_.args.nrAic = blockDim;
+    kernelArgs_.args.scheCpuNum = launchAicpuNum;
+
+    int numAiCore = blockDim * coresPerBlockdim_;
     // Initialize handshake buffers in graph
     if (numAiCore > GRAPH_MAX_WORKER) {
         std::cerr << "Error: blockDim (" << blockDim << ") exceeds GRAPH_MAX_WORKER (" << GRAPH_MAX_WORKER << ")\n";
@@ -449,7 +458,7 @@ int DeviceRunner::LaunchAicoreKernel(rtStream_t stream, Graph *graph) {
     rtTaskCfgInfo_t cfg = {};
     cfg.schemMode = RT_SCHEM_MODE_BATCH;
 
-    rc = rtKernelLaunchWithHandleV2(binHandle, 0, 1, &rtArgs, nullptr, stream, &cfg);
+    rc = rtKernelLaunchWithHandleV2(binHandle, 0, blockDim_, &rtArgs, nullptr, stream, &cfg);
     if (rc != RT_ERROR_NONE) {
         std::cerr << "rtKernelLaunchWithHandleV2失败: " << rc << '\n';
         return rc;
