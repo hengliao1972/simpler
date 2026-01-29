@@ -60,4 +60,9 @@ target_link_libraries(aicpu_kernel
         pthread
 )
 
-set_target_properties(aicpu_kernel PROPERTIES OUTPUT_NAME "aicpu_kernel")
+set_target_properties(aicpu_kernel PROPERTIES
+    OUTPUT_NAME "aicpu_kernel"
+    # Force .so suffix on all platforms (macOS defaults to .dylib)
+    # This matches the hardcoded paths in Python/C++ code
+    SUFFIX ".so"
+)

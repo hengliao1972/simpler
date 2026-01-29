@@ -67,4 +67,9 @@ target_link_libraries(host_runtime
         dl
 )
 
-set_target_properties(host_runtime PROPERTIES OUTPUT_NAME "host_runtime")
+set_target_properties(host_runtime PROPERTIES
+    OUTPUT_NAME "host_runtime"
+    # Force .so suffix on all platforms (macOS defaults to .dylib)
+    # This matches the hardcoded paths in Python/C++ code
+    SUFFIX ".so"
+)

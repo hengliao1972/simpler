@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -261,6 +262,11 @@ class PTOCompiler:
             "-O3", "-g",
             "-std=c++17",
         ]
+
+        # On macOS, allow undefined symbols to be resolved at dlopen time
+        if sys.platform == "darwin":
+            cmd.append("-undefined")
+            cmd.append("dynamic_lookup")
 
         # Add include dirs
         if extra_include_dirs:

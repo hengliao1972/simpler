@@ -47,6 +47,7 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task* 
 }
 
 __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int block_idx, int core_type) {
+    (void)core_type;
     __gm__ Handshake* my_hank = (__gm__ Handshake*)(&runtime->workers[block_idx]);
 
     // Phase 1: Wait for AICPU initialization signal

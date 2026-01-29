@@ -58,4 +58,9 @@ target_include_directories(aicore_kernel
         ${CMAKE_CUSTOM_INCLUDE_DIRS}
 )
 
-set_target_properties(aicore_kernel PROPERTIES OUTPUT_NAME "aicore_kernel")
+set_target_properties(aicore_kernel PROPERTIES
+    OUTPUT_NAME "aicore_kernel"
+    # Force .so suffix on all platforms (macOS defaults to .dylib)
+    # This matches the hardcoded paths in Python/C++ code
+    SUFFIX ".so"
+)

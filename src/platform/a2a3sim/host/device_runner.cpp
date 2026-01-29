@@ -7,6 +7,11 @@
  *
  * aicpu_execute and aicore_execute_wrapper are loaded dynamically via dlopen from
  * the binaries passed to launch_runtime.
+ *
+ * Cross-platform notes:
+ * - Linux: Uses MAP_ANONYMOUS for anonymous memory mapping
+ * - macOS: Uses MAP_ANON (aliased) and MAP_JIT for executable memory on Apple Silicon
+ *   which requires W^X (write xor execute) protection toggling via pthread_jit_write_protect_np
  */
 
 #include "device_runner.h"
@@ -14,12 +19,31 @@
 #include <cstdio>
 #include <cstring>
 #include <dlfcn.h>
+#include <errno.h>
 #include <fstream>
 #include <iostream>
 #include <thread>
 #include <unistd.h>
 #include <vector>
 #include <sys/mman.h>
+
+#ifdef __APPLE__
+// macOS Apple Silicon requires pthread_jit_write_protect_np for W^X memory
+// and sys_icache_invalidate to flush instruction cache after writing code
+#include <pthread.h>
+#include <libkern/OSCacheControl.h>
+#endif
+
+// Cross-platform mmap flags
+// macOS uses MAP_ANON, Linux uses MAP_ANONYMOUS
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+
+// macOS Apple Silicon requires MAP_JIT for writable+executable memory
+#ifndef MAP_JIT
+#define MAP_JIT 0
+#endif
 
 #include "runtime.h"
 
@@ -322,17 +346,31 @@ int DeviceRunner::register_kernel(int func_id, const uint8_t* bin_data, size_t b
                   << " -> addr=0x" << std::hex << func_ptr << std::dec << '\n';
     } else {
         // Binary mode: bin_data contains .text section binary code
-        // Allocate executable memory using mmap
+        // Allocate executable memory using mmap with MAP_JIT for Apple Silicon
+        // compatibility. MAP_JIT is 0 on Linux so this works cross-platform.
         void* exec_mem = mmap(nullptr, bin_size,
                              PROT_READ | PROT_WRITE | PROT_EXEC,
-                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
         if (exec_mem == MAP_FAILED) {
-            std::cerr << "Error: mmap failed for kernel func_id=" << func_id << '\n';
+            std::cerr << "Error: mmap failed for kernel func_id=" << func_id
+                      << " (errno=" << errno << ": " << strerror(errno) << ")\n";
             return -1;
         }
 
+#ifdef __APPLE__
+        // Apple Silicon enforces W^X: memory cannot be writable and executable
+        // simultaneously. Toggle to write mode, copy code, then toggle back.
+        pthread_jit_write_protect_np(false);
+#endif
+
         // Copy kernel .text binary into executable memory
         std::memcpy(exec_mem, bin_data, bin_size);
+
+#ifdef __APPLE__
+        // Toggle back to execute mode and flush instruction cache
+        pthread_jit_write_protect_np(true);
+        sys_icache_invalidate(exec_mem, bin_size);
+#endif
 
         kernel.exec_mem = exec_mem;
         kernel.size = bin_size;

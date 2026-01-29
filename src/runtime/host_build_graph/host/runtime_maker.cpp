@@ -13,9 +13,6 @@
  *   - Frees device memory
  */
 
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
 #include "runtime.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -24,8 +21,8 @@
 #include <cstdio>
 #include <cstring>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <iostream>
-#include <sys/mman.h>
 #include <unistd.h>
 
 /**
@@ -45,7 +42,7 @@ extern "C" {
 /**
  * Initialize a pre-allocated runtime with dynamic orchestration.
  *
- * This function loads the orchestration SO from binary data using memfd_create,
+ * This function loads the orchestration SO from binary data via a temp file,
  * resolves the orchestration function via dlsym, then calls it to build the
  * task graph. The orchestration function is responsible for:
  * - Allocating device memory via runtime->host_api.device_malloc()
@@ -77,27 +74,29 @@ int init_runtime_impl(Runtime *runtime,
         return -1;
     }
 
-    // Load orchestration SO from binary data using memfd_create
-    int fd = memfd_create("orch_so", MFD_CLOEXEC);
+    // Load orchestration SO from binary data via temp file
+    char fd_path[128];
+    snprintf(fd_path, sizeof(fd_path), "/tmp/orch_so_%d.so", getpid());
+
+    int fd = open(fd_path, O_WRONLY | O_CREAT | O_TRUNC, 0700);
     if (fd < 0) {
-        std::cerr << "Error: memfd_create failed\n";
+        std::cerr << "Error: Failed to create temp SO file\n";
         return -1;
     }
 
     ssize_t written = write(fd, orch_so_binary, orch_so_size);
     if (written < 0 || static_cast<size_t>(written) != orch_so_size) {
-        std::cerr << "Error: Failed to write orchestration SO to memfd\n";
+        std::cerr << "Error: Failed to write orchestration SO to temp file\n";
         close(fd);
+        unlink(fd_path);
         return -1;
     }
-
-    char fd_path[64];
-    snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", fd);
+    close(fd);
 
     void* handle = dlopen(fd_path, RTLD_NOW | RTLD_LOCAL);
+    unlink(fd_path);
     if (handle == nullptr) {
         std::cerr << "Error: dlopen failed: " << dlerror() << "\n";
-        close(fd);
         return -1;
     }
 
@@ -108,11 +107,8 @@ int init_runtime_impl(Runtime *runtime,
     if (dlsym_error != nullptr) {
         std::cerr << "Error: dlsym failed for '" << orch_func_name << "': " << dlsym_error << "\n";
         dlclose(handle);
-        close(fd);
         return -1;
     }
-
-    close(fd);
 
     std::cout << "Loaded orchestration function: " << orch_func_name << "\n";
 
