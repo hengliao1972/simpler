@@ -23,6 +23,8 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/device_runner.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/memory_allocator.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/pto_runtime_c_api.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/host_log.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/unified_log_host.cpp"
 )
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})

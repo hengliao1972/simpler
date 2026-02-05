@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "common/platform_config.h"
+#include "common/unified_log.h"
 #include "runtime.h"
 
 // =============================================================================
@@ -26,7 +27,7 @@ int KernelArgsHelper::init_device_args(const DeviceArgs& host_device_args, Memor
         uint64_t device_args_size = sizeof(DeviceArgs);
         void* device_args_dev = allocator_->alloc(device_args_size);
         if (device_args_dev == nullptr) {
-            std::cerr << "Error: Alloc for device_args failed\n";
+            LOG_ERROR("Alloc for device_args failed");
             return -1;
         }
         args.device_args = reinterpret_cast<DeviceArgs*>(device_args_dev);
@@ -35,7 +36,7 @@ int KernelArgsHelper::init_device_args(const DeviceArgs& host_device_args, Memor
     int rc =
         rtMemcpy(args.device_args, sizeof(DeviceArgs), &host_device_args, sizeof(DeviceArgs), RT_MEMCPY_HOST_TO_DEVICE);
     if (rc != 0) {
-        std::cerr << "Error: rtMemcpy failed: " << rc << '\n';
+        LOG_ERROR("rtMemcpy failed: %d", rc);
         allocator_->free(args.device_args);
         args.device_args = nullptr;
         return rc;
@@ -59,14 +60,14 @@ int KernelArgsHelper::init_runtime_args(const Runtime& host_runtime, MemoryAlloc
         uint64_t runtime_size = sizeof(Runtime);
         void* runtime_dev = allocator_->alloc(runtime_size);
         if (runtime_dev == nullptr) {
-            std::cerr << "Error: Alloc for runtime_args failed\n";
+            LOG_ERROR("Alloc for runtime_args failed");
             return -1;
         }
         args.runtime_args = reinterpret_cast<Runtime*>(runtime_dev);
     }
     int rc = rtMemcpy(args.runtime_args, sizeof(Runtime), &host_runtime, sizeof(Runtime), RT_MEMCPY_HOST_TO_DEVICE);
     if (rc != 0) {
-        std::cerr << "Error: rtMemcpy for runtime failed: " << rc << '\n';
+        LOG_ERROR("rtMemcpy for runtime failed: %d", rc);
         allocator_->free(args.runtime_args);
         args.runtime_args = nullptr;
         return rc;
@@ -91,20 +92,20 @@ int AicpuSoInfo::init(const std::vector<uint8_t>& aicpu_so_binary, MemoryAllocat
     allocator_ = &allocator;
 
     if (aicpu_so_binary.empty()) {
-        std::cerr << "Error: AICPU binary is empty\n";
+        LOG_ERROR("AICPU binary is empty");
         return -1;
     }
 
     size_t file_size = aicpu_so_binary.size();
     void* d_aicpu_data = allocator_->alloc(file_size);
     if (d_aicpu_data == nullptr) {
-        std::cerr << "Error: Alloc failed for AICPU SO\n";
+        LOG_ERROR("Alloc failed for AICPU SO");
         return -1;
     }
 
     int rc = rtMemcpy(d_aicpu_data, file_size, aicpu_so_binary.data(), file_size, RT_MEMCPY_HOST_TO_DEVICE);
     if (rc != 0) {
-        std::cerr << "Error: rtMemcpy failed: " << rc << '\n';
+        LOG_ERROR("rtMemcpy failed: %d", rc);
         allocator_->free(d_aicpu_data);
         d_aicpu_data = nullptr;
         return rc;
@@ -158,26 +159,26 @@ int DeviceRunner::ensure_device_set(int device_id) {
     // Set device
     int rc = rtSetDevice(device_id);
     if (rc != 0) {
-        std::cerr << "Error: rtSetDevice(" << device_id << ") failed: " << rc << '\n';
+        LOG_ERROR("rtSetDevice(%d) failed: %d", device_id, rc);
         return rc;
     }
 
     // Create streams
     rc = rtStreamCreate(&stream_aicpu_, 0);
     if (rc != 0) {
-        std::cerr << "Error: rtStreamCreate (AICPU) failed: " << rc << '\n';
+        LOG_ERROR("rtStreamCreate (AICPU) failed: %d", rc);
         return rc;
     }
 
     rc = rtStreamCreate(&stream_aicore_, 0);
     if (rc != 0) {
-        std::cerr << "Error: rtStreamCreate (AICore) failed: " << rc << '\n';
+        LOG_ERROR("rtStreamCreate (AICore) failed: %d", rc);
         rtStreamDestroy(stream_aicpu_);
         stream_aicpu_ = nullptr;
         return rc;
     }
 
-    std::cout << "DeviceRunner: device=" << device_id << " set, streams created\n";
+    LOG_INFO("DeviceRunner: device=%d set, streams created", device_id);
     return 0;
 }
 
@@ -194,7 +195,7 @@ int DeviceRunner::ensure_binaries_loaded(
 
     // Device must be set first
     if (stream_aicpu_ == nullptr) {
-        std::cerr << "Error: Device not set before loading binaries\n";
+        LOG_ERROR("Device not set before loading binaries");
         return -1;
     }
 
@@ -203,7 +204,7 @@ int DeviceRunner::ensure_binaries_loaded(
     // Load AICPU SO
     int rc = so_info_.init(aicpu_so_binary, mem_alloc_);
     if (rc != 0) {
-        std::cerr << "Error: AicpuSoInfo::init failed: " << rc << '\n';
+        LOG_ERROR("AicpuSoInfo::init failed: %d", rc);
         return rc;
     }
 
@@ -212,13 +213,13 @@ int DeviceRunner::ensure_binaries_loaded(
     device_args_.aicpu_so_len = so_info_.aicpu_so_len;
     rc = kernel_args_.init_device_args(device_args_, mem_alloc_);
     if (rc != 0) {
-        std::cerr << "Error: init_device_args failed: " << rc << '\n';
+        LOG_ERROR("init_device_args failed: %d", rc);
         so_info_.finalize();
         return rc;
     }
 
     binaries_loaded_ = true;
-    std::cout << "DeviceRunner: binaries loaded\n";
+    LOG_INFO("DeviceRunner: binaries loaded");
     return 0;
 }
 
@@ -247,29 +248,29 @@ int DeviceRunner::run(Runtime& runtime,
 
     // Validate launch_aicpu_num
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
-        std::cerr << "Error: launch_aicpu_num (" << launch_aicpu_num
-                  << ") must be in range [1, " << PLATFORM_MAX_AICPU_THREADS << "]\n";
+        LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]",
+                      launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
         return -1;
     }
 
     // Validate block_dim
     if (block_dim < 1 || block_dim > PLATFORM_MAX_BLOCKDIM) {
-        std::cerr << "Error: block_dim (" << block_dim
-                  << ") must be in range [1, " << PLATFORM_MAX_BLOCKDIM << "]\n";
+        LOG_ERROR("block_dim (%d) must be in range [1, %d]",
+                      block_dim, PLATFORM_MAX_BLOCKDIM);
         return -1;
     }
 
     // Validate even distribution: block_dim must be divisible by launch_aicpu_num
     if (block_dim % launch_aicpu_num != 0) {
-        std::cerr << "Error: block_dim (" << block_dim
-                  << ") must be evenly divisible by launch_aicpu_num (" << launch_aicpu_num << ")\n";
+        LOG_ERROR("block_dim (%d) must be evenly divisible by launch_aicpu_num (%d)",
+                      block_dim, launch_aicpu_num);
         return -1;
     }
 
     // Ensure device is initialized (lazy initialization)
     int rc = ensure_device_initialized(device_id, aicpu_so_binary, aicore_kernel_binary);
     if (rc != 0) {
-        std::cerr << "Error: ensure_device_initialized failed: " << rc << '\n';
+        LOG_ERROR("ensure_device_initialized failed: %d", rc);
         return rc;
     }
 
@@ -279,7 +280,8 @@ int DeviceRunner::run(Runtime& runtime,
     int num_ai_core = block_dim * cores_per_blockdim_;
     // Initialize handshake buffers in runtime
     if (num_ai_core > RUNTIME_MAX_WORKER) {
-        std::cerr << "Error: block_dim (" << block_dim << ") exceeds RUNTIME_MAX_WORKER (" << RUNTIME_MAX_WORKER << ")\n";
+        LOG_ERROR("block_dim (%d) exceeds RUNTIME_MAX_WORKER (%d)",
+                      block_dim, RUNTIME_MAX_WORKER);
         return -1;
     }
 
@@ -302,29 +304,29 @@ int DeviceRunner::run(Runtime& runtime,
 
     // Set function_bin_addr for all tasks (NEW - Runtime function pointer
     // dispatch)
-    std::cout << "\n=== Setting function_bin_addr for Tasks ===" << '\n';
+    LOG_DEBUG("\n=== Setting function_bin_addr for Tasks ===");
     for (int i = 0; i < runtime.get_task_count(); i++) {
         Task* task = runtime.get_task(i);
         if (task != nullptr) {
             uint64_t addr = get_function_bin_addr(task->func_id);
             task->function_bin_addr = addr;
-            std::cout << "  Task " << i << " (func_id=" << task->func_id << ") -> function_bin_addr=0x" << std::hex
-                      << addr << std::dec << '\n';
+            LOG_DEBUG("  Task %d (func_id=%d) -> function_bin_addr=0x%lx",
+                          i, task->func_id, addr);
         }
     }
-    std::cout << '\n';
+    LOG_DEBUG("");
 
     // Initialize runtime args
     rc = kernel_args_.init_runtime_args(runtime, mem_alloc_);
     if (rc != 0) {
-        std::cerr << "Error: init_runtime_args failed: " << rc << '\n';
+        LOG_ERROR("init_runtime_args failed: %d", rc);
         return rc;
     }
 
     // Launch AICPU init kernel
     rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServerInit", 1);
     if (rc != 0) {
-        std::cerr << "Error: launch_aicpu_kernel (init) failed: " << rc << '\n';
+        LOG_ERROR("launch_aicpu_kernel (init) failed: %d", rc);
         kernel_args_.finalize_runtime_args();
         return rc;
     }
@@ -332,7 +334,7 @@ int DeviceRunner::run(Runtime& runtime,
     // Launch AICPU main kernel
     rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServer", launch_aicpu_num);
     if (rc != 0) {
-        std::cerr << "Error: launch_aicpu_kernel (main) failed: " << rc << '\n';
+        LOG_ERROR("launch_aicpu_kernel (main) failed: %d", rc);
         kernel_args_.finalize_runtime_args();
         return rc;
     }
@@ -340,7 +342,7 @@ int DeviceRunner::run(Runtime& runtime,
     // Launch AICore kernel
     rc = launch_aicore_kernel(stream_aicore_, kernel_args_.args.runtime_args);
     if (rc != 0) {
-        std::cerr << "Error: launch_aicore_kernel failed: " << rc << '\n';
+        LOG_ERROR("launch_aicore_kernel failed: %d", rc);
         kernel_args_.finalize_runtime_args();
         return rc;
     }
@@ -348,14 +350,14 @@ int DeviceRunner::run(Runtime& runtime,
     // Synchronize streams
     rc = rtStreamSynchronize(stream_aicpu_);
     if (rc != 0) {
-        std::cerr << "Error: rtStreamSynchronize (AICPU) failed: " << rc << '\n';
+        LOG_ERROR("rtStreamSynchronize (AICPU) failed: %d", rc);
         kernel_args_.finalize_runtime_args();
         return rc;
     }
 
     rc = rtStreamSynchronize(stream_aicore_);
     if (rc != 0) {
-        std::cerr << "Error: rtStreamSynchronize (AICore) failed: " << rc << '\n';
+        LOG_ERROR("rtStreamSynchronize (AICore) failed: %d", rc);
         kernel_args_.finalize_runtime_args();
         return rc;
     }
@@ -375,11 +377,11 @@ void DeviceRunner::print_handshake_results() {
     size_t total_size = sizeof(Handshake) * worker_count_;
     rtMemcpy(workers.data(), total_size, kernel_args_.args.runtime_args->workers, total_size, RT_MEMCPY_DEVICE_TO_HOST);
 
-    std::cout << "Handshake results for " << worker_count_ << " cores:" << std::endl;
+    LOG_DEBUG("Handshake results for %d cores:", worker_count_);
     for (int i = 0; i < worker_count_; i++) {
-        std::cout << "  Core " << i << ": aicore_done=" << workers[i].aicore_done
-                  << " aicpu_ready=" << workers[i].aicpu_ready << " control=" << workers[i].control
-                  << " task=" << workers[i].task << std::endl;
+        LOG_DEBUG("  Core %d: aicore_done=%d aicpu_ready=%d control=%d task=%d",
+                      i, workers[i].aicore_done, workers[i].aicpu_ready,
+                      workers[i].control, workers[i].task);
     }
 }
 
@@ -421,7 +423,7 @@ int DeviceRunner::finalize() {
     worker_count_ = 0;
     aicore_kernel_binary_.clear();
 
-    std::cout << "DeviceRunner finalized\n";
+    LOG_INFO("DeviceRunner finalized");
     return 0;
 }
 
@@ -450,7 +452,7 @@ int DeviceRunner::launch_aicpu_kernel(rtStream_t stream, KernelArgs* k_args, con
 
 int DeviceRunner::launch_aicore_kernel(rtStream_t stream, Runtime* runtime) {
     if (aicore_kernel_binary_.empty()) {
-        std::cerr << "Error: AICore kernel binary is empty\n";
+        LOG_ERROR("AICore kernel binary is empty");
         return -1;
     }
 
@@ -466,7 +468,7 @@ int DeviceRunner::launch_aicore_kernel(rtStream_t stream, Runtime* runtime) {
     void* bin_handle = nullptr;
     int rc = rtRegisterAllKernel(&binary, &bin_handle);
     if (rc != RT_ERROR_NONE) {
-        std::cerr << "rtRegisterAllKernel失败: " << rc << '\n';
+        LOG_ERROR("rtRegisterAllKernel failed: %d", rc);
         return rc;
     }
 
@@ -485,7 +487,7 @@ int DeviceRunner::launch_aicore_kernel(rtStream_t stream, Runtime* runtime) {
 
     rc = rtKernelLaunchWithHandleV2(bin_handle, 0, block_dim_, &rt_args, nullptr, stream, &cfg);
     if (rc != RT_ERROR_NONE) {
-        std::cerr << "rtKernelLaunchWithHandleV2失败: " << rc << '\n';
+        LOG_ERROR("rtKernelLaunchWithHandleV2 failed: %d", rc);
         return rc;
     }
 
@@ -498,29 +500,29 @@ int DeviceRunner::launch_aicore_kernel(rtStream_t stream, Runtime* runtime) {
 
 int DeviceRunner::register_kernel(int func_id, const uint8_t* bin_data, size_t bin_size) {
     if (bin_data == nullptr || bin_size == 0) {
-        std::cerr << "Error: Invalid kernel binary data\n";
+        LOG_ERROR("Invalid kernel binary data");
         return -1;
     }
 
     // Device must be set first (set_device() must be called before register_kernel())
     if (stream_aicpu_ == nullptr) {
-        std::cerr << "Error: Device not set. Call set_device() before register_kernel()\n";
+        LOG_ERROR("Device not set. Call set_device() before register_kernel()");
         return -1;
     }
 
     // Skip if already registered
     if (func_id_to_addr_.find(func_id) != func_id_to_addr_.end()) {
-        std::cout << "Kernel func_id=" << func_id << " already registered, skipping\n";
+        LOG_INFO("Kernel func_id=%d already registered, skipping", func_id);
         return 0;
     }
 
-    std::cout << "Registering kernel: func_id=" << func_id << ", size=" << bin_size << " bytes\n";
+    LOG_DEBUG("Registering kernel: func_id=%d, size=%zu bytes", func_id, bin_size);
 
     // Allocate device GM memory (size field + binary data)
     uint64_t alloc_size = sizeof(uint64_t) + bin_size;
     void* gm_addr = mem_alloc_.alloc(alloc_size);
     if (gm_addr == nullptr) {
-        std::cerr << "Error: Failed to allocate device GM memory for kernel func_id=" << func_id << '\n';
+        LOG_ERROR("Failed to allocate device GM memory for kernel func_id=%d", func_id);
         return -1;
     }
 
@@ -533,7 +535,7 @@ int DeviceRunner::register_kernel(int func_id, const uint8_t* bin_data, size_t b
         // Step 3: Copy to device
         int rc = rtMemcpy(gm_addr, alloc_size, host_buf.data(), alloc_size, RT_MEMCPY_HOST_TO_DEVICE);
         if (rc != 0) {
-            std::cerr << "Error: rtMemcpy to device failed: " << rc << '\n';
+            LOG_ERROR("rtMemcpy to device failed: %d", rc);
             mem_alloc_.free(gm_addr);
             return rc;
         }
@@ -542,7 +544,7 @@ int DeviceRunner::register_kernel(int func_id, const uint8_t* bin_data, size_t b
     uint64_t function_bin_addr = reinterpret_cast<uint64_t>(gm_addr) + sizeof(uint64_t);
     func_id_to_addr_[func_id] = function_bin_addr;
 
-    std::cout << "  func_id=" << func_id << " -> function_bin_addr=0x" << std::hex << function_bin_addr << std::dec << '\n';
+    LOG_DEBUG("  func_id=%d -> function_bin_addr=0x%lx", func_id, function_bin_addr);
 
     return 0;
 }
@@ -550,7 +552,7 @@ int DeviceRunner::register_kernel(int func_id, const uint8_t* bin_data, size_t b
 uint64_t DeviceRunner::get_function_bin_addr(int func_id) {
     auto it = func_id_to_addr_.find(func_id);
     if (it == func_id_to_addr_.end()) {
-        std::cerr << "Warning: function_bin_addr not found for func_id=" << func_id << '\n';
+        LOG_WARN("function_bin_addr not found for func_id=%d", func_id);
         return 0;
     }
     return it->second;

@@ -33,6 +33,7 @@ Golden.py interface:
 """
 
 import importlib.util
+import logging
 import os
 import sys
 from pathlib import Path
@@ -40,6 +41,30 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from numpy.testing import assert_allclose
+
+logger = logging.getLogger(__name__)
+
+
+def _setup_logging_if_needed() -> None:
+    """
+    Setup logging if not already configured (for direct CodeRunner usage).
+    Uses PTO_LOG_LEVEL environment variable or defaults to 'info'.
+    """
+    # Only setup if logging hasn't been configured yet
+    if not logging.getLogger().hasHandlers():
+        level_str = os.environ.get('PTO_LOG_LEVEL', 'info')
+        level_map = {
+            'error': logging.ERROR,
+            'warn': logging.WARNING,
+            'info': logging.INFO,
+            'debug': logging.DEBUG,
+        }
+        log_level = level_map.get(level_str.lower(), logging.INFO)
+        logging.basicConfig(
+            level=log_level,
+            format='[%(levelname)s] %(message)s',
+            force=True
+        )
 
 
 def _has_torch() -> bool:
@@ -146,7 +171,7 @@ def _clone_pto_isa(verbose: bool = False) -> bool:
 
     if not _is_git_available():
         if verbose:
-            print("Warning: git command not available, cannot clone pto-isa")
+            logger.warning("git command not available, cannot clone pto-isa")
         return False
 
     clone_path = _get_pto_isa_clone_path()
@@ -157,13 +182,13 @@ def _clone_pto_isa(verbose: bool = False) -> bool:
         deps_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         if verbose:
-            print(f"Warning: Failed to create deps directory: {e}")
+            logger.warning(f"Failed to create deps directory: {e}")
         return False
 
     try:
         if verbose:
-            print(f"\nCloning pto-isa to {clone_path}...")
-            print("This may take a few moments on first run...")
+            logger.info(f"Cloning pto-isa to {clone_path}...")
+            logger.info("This may take a few moments on first run...")
 
         # Clone with shallow depth for faster download
         result = subprocess.run(
@@ -181,23 +206,23 @@ def _clone_pto_isa(verbose: bool = False) -> bool:
 
         if result.returncode != 0:
             if verbose:
-                print(f"Warning: Failed to clone pto-isa:\n{result.stderr}")
+                logger.warning(f"Failed to clone pto-isa:\n{result.stderr}")
             return False
 
         if verbose:
             if result.stdout:
-                print(result.stdout)
-            print(f"pto-isa cloned successfully to: {clone_path}")
+                logger.debug(result.stdout)
+            logger.info(f"pto-isa cloned successfully to: {clone_path}")
 
         return True
 
     except subprocess.TimeoutExpired:
         if verbose:
-            print("Warning: Clone operation timed out")
+            logger.warning("Clone operation timed out")
         return False
     except Exception as e:
         if verbose:
-            print(f"Warning: Failed to clone pto-isa: {e}")
+            logger.warning(f"Failed to clone pto-isa: {e}")
         return False
 
 
@@ -220,7 +245,7 @@ def _ensure_pto_isa_root(verbose: bool = False) -> Optional[str]:
     existing_root = os.environ.get("PTO_ISA_ROOT")
     if existing_root:
         if verbose:
-            print(f"Using existing PTO_ISA_ROOT: {existing_root}")
+            logger.info(f"Using existing PTO_ISA_ROOT: {existing_root}")
         return existing_root
 
     # Try to use cloned repository
@@ -229,22 +254,22 @@ def _ensure_pto_isa_root(verbose: bool = False) -> Optional[str]:
     # Clone if needed
     if not _is_pto_isa_cloned():
         if verbose:
-            print("PTO_ISA_ROOT not set, cloning pto-isa repository...")
+            logger.info("PTO_ISA_ROOT not set, cloning pto-isa repository...")
         if not _clone_pto_isa(verbose=verbose):
             if verbose:
-                print("\nFailed to automatically clone pto-isa.")
-                print("You can manually clone it with:")
-                print(f"  mkdir -p {clone_path.parent}")
-                print(f"  git clone --branch master https://gitcode.com/cann/pto-isa.git {clone_path}")
-                print(f"Or set PTO_ISA_ROOT to an existing pto-isa installation:")
-                print(f"  export PTO_ISA_ROOT=/path/to/pto-isa")
+                logger.warning("Failed to automatically clone pto-isa.")
+                logger.warning("You can manually clone it with:")
+                logger.warning(f"  mkdir -p {clone_path.parent}")
+                logger.warning(f"  git clone --branch master https://gitcode.com/cann/pto-isa.git {clone_path}")
+                logger.warning("Or set PTO_ISA_ROOT to an existing pto-isa installation:")
+                logger.warning("  export PTO_ISA_ROOT=/path/to/pto-isa")
             return None
 
     # Verify clone has expected content
     include_dir = clone_path / "include"
     if not include_dir.exists():
         if verbose:
-            print(f"Warning: pto-isa cloned but missing include directory: {include_dir}")
+            logger.warning(f"pto-isa cloned but missing include directory: {include_dir}")
         return None
 
     # Set environment variable
@@ -252,7 +277,7 @@ def _ensure_pto_isa_root(verbose: bool = False) -> Optional[str]:
     os.environ["PTO_ISA_ROOT"] = pto_isa_root
 
     if verbose:
-        print(f"Set PTO_ISA_ROOT to: {pto_isa_root}")
+        logger.info(f"Set PTO_ISA_ROOT to: {pto_isa_root}")
 
     return pto_isa_root
 
@@ -284,6 +309,9 @@ class CodeRunner:
         device_id: Optional[int] = None,
         platform: str = "a2a3",
     ):
+        # Setup logging if not already configured (e.g., when used directly, not via run_example.py)
+        _setup_logging_if_needed()
+        
         self.kernels_dir = Path(kernels_dir).resolve()
         self.golden_path = Path(golden_path).resolve()
         self.runtime_name = runtime_name
@@ -444,15 +472,15 @@ class CodeRunner:
         # Auto-setup PTO_ISA_ROOT if needed (for all platforms, since kernels may use PTO ISA headers)
         pto_isa_root = _ensure_pto_isa_root(verbose=True)
         if pto_isa_root is None:
-            print("Warning: Could not auto-setup PTO_ISA_ROOT")
-            print("         If kernels use PTO ISA headers, they may fail to compile")
+            logger.warning("Could not auto-setup PTO_ISA_ROOT")
+            logger.warning("If kernels use PTO ISA headers, they may fail to compile")
 
         # Check platform-specific environment (only for a2a3 hardware platform)
         if self.platform == "a2a3":
             self.skip_if_no_env()
 
         # Step 1: Build runtime
-        print(f"\n=== Building Runtime: {self.runtime_name} (platform: {self.platform}) ===")
+        logger.info(f"=== Building Runtime: {self.runtime_name} (platform: {self.platform}) ===")
         builder = RuntimeBuilder(runtime_root=self.project_root, platform=self.platform)
         pto_compiler = builder.get_pto_compiler()
         try:
@@ -464,14 +492,14 @@ class CodeRunner:
             ) from e
 
         # Step 2: Load runtime and set device
-        print(f"\n=== Loading Runtime ({len(host_binary)} bytes) ===")
+        logger.info(f"=== Loading Runtime ({len(host_binary)} bytes) ===")
         Runtime = bind_host_binary(host_binary)
 
-        print(f"\n=== Setting Device {self.device_id} ===")
+        logger.info(f"=== Setting Device {self.device_id} ===")
         set_device(self.device_id)
 
         # Step 3: Compile orchestration
-        print("\n=== Compiling Orchestration ===")
+        logger.info("=== Compiling Orchestration ===")
 
         # Build include directories for orchestration
         orch_include_dirs = [
@@ -482,16 +510,16 @@ class CodeRunner:
             self.orchestration["source"],
             extra_include_dirs=orch_include_dirs,
         )
-        print(f"Compiled orchestration: {len(orch_so_binary)} bytes")
+        logger.debug(f"Compiled orchestration: {len(orch_so_binary)} bytes")
 
         # Step 4: Compile and register kernels
-        print("\n=== Compiling and Registering Kernels ===")
+        logger.info("=== Compiling and Registering Kernels ===")
 
         # Get PTO_ISA_ROOT (use default for sim platform)
         pto_isa_root = os.environ.get("PTO_ISA_ROOT", "/tmp/unused")
 
         for kernel in self.kernels:
-            print(f"Compiling kernel: {kernel['source']} (func_id={kernel['func_id']})")
+            logger.info(f"Compiling kernel: {kernel['source']} (func_id={kernel['func_id']})")
             incore_o = pto_compiler.compile_incore(
                 kernel["source"],
                 core_type=kernel["core_type"],
@@ -507,17 +535,17 @@ class CodeRunner:
             # All kernels use unified entry point "kernel_entry"
             register_kernel(kernel["func_id"], kernel_bin)
 
-        print("All kernels compiled and registered")
+        logger.info("All kernels compiled and registered")
 
         # Step 5: Run each parameter set
         total_cases = len(self.params_list)
         for case_idx, params in enumerate(self.params_list):
-            print(f"\n{'='*60}")
-            print(f"=== Case {case_idx + 1}/{total_cases}: {params} ===")
-            print(f"{'='*60}")
+            logger.info("=" * 60)
+            logger.info(f"=== Case {case_idx + 1}/{total_cases}: {params} ===")
+            logger.info("=" * 60)
 
             # Generate tensors using golden.py
-            print("\n=== Generating Inputs ===")
+            logger.info("=== Generating Inputs ===")
             tensors = self._golden_module.generate_inputs(params)
 
             # Convert any PyTorch tensors to numpy
@@ -525,26 +553,26 @@ class CodeRunner:
 
             # Identify inputs and outputs
             inputs, outputs = self._identify_outputs(tensors)
-            print(f"Inputs: {list(inputs.keys())}")
-            print(f"Outputs: {list(outputs.keys())}")
+            logger.info(f"Inputs: {list(inputs.keys())}")
+            logger.info(f"Outputs: {list(outputs.keys())}")
 
             # Build func_args automatically
             func_args = self._build_func_args(tensors)
 
             # Determine actual tensor order for debugging
             order = self.tensor_order if self.tensor_order else list(tensors.keys())
-            print(f"Tensor order: {order}")
-            print(f"func_args count: {len(func_args)}")
+            logger.debug(f"Tensor order: {order}")
+            logger.debug(f"func_args count: {len(func_args)}")
 
             # Create and initialize runtime
-            print("\n=== Initializing Runtime ===")
+            logger.info("=== Initializing Runtime ===")
             runtime = Runtime()
             runtime.initialize(orch_so_binary, self.orchestration["function_name"], func_args)
 
             # Launch runtime
-            print("\n=== Launching Runtime ===")
-            print(f"Device ID: {self.device_id}")
-            print(f"AICPU threads: {self.aicpu_thread_num}, Block dim: {self.block_dim}")
+            logger.info("=== Launching Runtime ===")
+            logger.debug(f"Device ID: {self.device_id}")
+            logger.debug(f"AICPU threads: {self.aicpu_thread_num}, Block dim: {self.block_dim}")
             import sys
             sys.stdout.flush()  # Ensure output is visible before potential hang
 
@@ -557,21 +585,21 @@ class CodeRunner:
                 aicore_binary=aicore_binary,
             )
 
-            print("Launch completed successfully")  # Will only print if not hung
+            logger.info("Launch completed successfully")  # Will only print if not hung
 
             # Finalize
-            print("\n=== Finalizing Runtime ===")
+            logger.info("=== Finalizing Runtime ===")
             runtime.finalize()
 
             # Compute golden and compare
-            print("\n=== Comparing Results ===")
+            logger.info("=== Comparing Results ===")
             self._compare_with_golden(tensors, inputs, outputs, params)
 
-            print(f"\n=== Case {case_idx + 1}/{total_cases} Passed ===")
+            logger.info(f"=== Case {case_idx + 1}/{total_cases} Passed ===")
 
-        print(f"\n{'='*60}")
-        print(f"=== All {total_cases} cases passed ===")
-        print(f"{'='*60}")
+        logger.info("=" * 60)
+        logger.info(f"=== All {total_cases} cases passed ===")
+        logger.info("=" * 60)
 
     def _compare_with_golden(
         self,
@@ -592,15 +620,15 @@ class CodeRunner:
         for name in outputs:
             actual = outputs[name]
             expected = golden_outputs[name]
-            print(f"Comparing {name}: shape={actual.shape}, dtype={actual.dtype}")
+            logger.info(f"Comparing {name}: shape={actual.shape}, dtype={actual.dtype}")
 
             # Show first 10 values
             if actual.size > 0:
                 flat_actual = actual.flatten()
                 flat_expected = expected.flatten()
                 n_show = min(10, flat_actual.size)
-                print(f"  First {n_show} actual:   {flat_actual[:n_show]}")
-                print(f"  First {n_show} expected: {flat_expected[:n_show]}")
+                logger.debug(f"  First {n_show} actual:   {flat_actual[:n_show]}")
+                logger.debug(f"  First {n_show} expected: {flat_expected[:n_show]}")
 
             assert_allclose(
                 actual,
@@ -610,4 +638,4 @@ class CodeRunner:
                 err_msg=f"Output '{name}' does not match golden",
             )
             matched = np.sum(np.isclose(actual, expected, rtol=self.rtol, atol=self.atol))
-            print(f"  {name}: PASS ({matched}/{actual.size} elements matched)")
+            logger.info(f"  {name}: PASS ({matched}/{actual.size} elements matched)")

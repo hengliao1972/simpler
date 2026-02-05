@@ -7,11 +7,11 @@
 
 #include "host/pto_runtime_c_api.h"
 
-#include <iostream>
 #include <new>  // for placement new
 #include <vector>
 
 #include "device_runner.h"
+#include "common/unified_log.h"
 #include "runtime.h"
 
 extern "C" {
@@ -53,7 +53,7 @@ int init_runtime(RuntimeHandle runtime,
         return -1;
     }
     if (orch_so_binary == NULL || orch_so_size == 0 || orch_func_name == NULL) {
-        std::cerr << "Error: Invalid orchestration parameters\n";
+        LOG_ERROR("Invalid orchestration parameters");
         return -1;
     }
 

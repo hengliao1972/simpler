@@ -2,9 +2,10 @@
 #include <cstdint>
 #include <mutex>
 
-#include "aicpu/device_log.h"
+#include "common/unified_log.h"
 #include "common/platform_config.h"
 #include "runtime.h"
+#include "aicpu/device_log.h"
 
 constexpr int MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
 constexpr int MAX_AIC_PER_THREAD = PLATFORM_MAX_AIC_PER_THREAD;
@@ -76,10 +77,10 @@ int AicpuExecutor::init(Runtime* runtime) {
         return 0;
     }
 
-    DEV_INFO("AicpuExecutor: Initializing");
+    LOG_INFO("AicpuExecutor: Initializing");
 
     if (runtime == nullptr) {
-        DEV_ERROR("runtime is nullptr");
+        LOG_ERROR("runtime is nullptr");
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
@@ -89,7 +90,7 @@ int AicpuExecutor::init(Runtime* runtime) {
 
     // Simplified defensive check
     if (thread_num_ < 1 || thread_num_ > MAX_AICPU_THREADS) {
-        DEV_ERROR("Invalid thread_num: %d (valid range: 1-%d)", thread_num_, MAX_AICPU_THREADS);
+        LOG_ERROR("Invalid thread_num: %d (valid range: 1-%d)", thread_num_, MAX_AICPU_THREADS);
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
@@ -97,7 +98,7 @@ int AicpuExecutor::init(Runtime* runtime) {
     // Perform core discovery: handshake with all cores and collect core type information
     int rc = handshake_all_cores(runtime);
     if (rc != 0) {
-        DEV_ERROR("Core discovery failed");
+        LOG_ERROR("Core discovery failed");
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
@@ -105,7 +106,7 @@ int AicpuExecutor::init(Runtime* runtime) {
     // Calculate cores per thread
     thread_cores_num_ = cores_total_num_ / thread_num_;
 
-    DEV_INFO("Config: threads=%d, cores=%d, cores_per_thread=%d", thread_num_, cores_total_num_, thread_cores_num_);
+    LOG_INFO("Config: threads=%d, cores=%d, cores_per_thread=%d", thread_num_, cores_total_num_, thread_cores_num_);
 
     // Assign discovered cores to threads
     assign_cores_to_threads();
@@ -117,7 +118,7 @@ int AicpuExecutor::init(Runtime* runtime) {
     int initial_ready[RUNTIME_MAX_TASKS];
     int initial_count = runtime->get_initial_ready_tasks(initial_ready);
 
-    DEV_INFO("Init: Found %d initially ready tasks", initial_count);
+    LOG_INFO("Init: Found %d initially ready tasks", initial_count);
 
     // Reset circular queue indices
     ready_queue_aic_head_ = 0;
@@ -144,12 +145,12 @@ int AicpuExecutor::init(Runtime* runtime) {
     ready_count_aic_.store(aic_count, std::memory_order_release);
     ready_count_aiv_.store(aiv_count, std::memory_order_release);
 
-    DEV_INFO("Init: Initial ready tasks: AIC=%d, AIV=%d", aic_count, aiv_count);
+    LOG_INFO("Init: Initial ready tasks: AIC=%d, AIV=%d", aic_count, aiv_count);
 
     finished_count_.store(0, std::memory_order_release);
 
     init_done_.store(true, std::memory_order_release);
-    DEV_INFO("AicpuExecutor: Init complete");
+    LOG_INFO("AicpuExecutor: Init complete");
     return 0;
 }
 
@@ -174,20 +175,20 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
     cores_total_num_ = runtime->worker_count;
 
     if (cores_total_num_ == 0) {
-        DEV_ERROR("worker_count is 0, no cores to handshake");
+        LOG_ERROR("worker_count is 0, no cores to handshake");
         return -1;
     }
 
     // Simplified defensive check
     if (cores_total_num_ > MAX_CORES_PER_THREAD) {
-        DEV_ERROR("Total cores %d exceeds maximum %d", cores_total_num_, MAX_CORES_PER_THREAD);
+        LOG_ERROR("Total cores %d exceeds maximum %d", cores_total_num_, MAX_CORES_PER_THREAD);
         return -1;
     }
 
     aic_count_ = 0;
     aiv_count_ = 0;
 
-    DEV_INFO("Core Discovery: Handshaking with %d cores", cores_total_num_);
+    LOG_INFO("Core Discovery: Handshaking with %d cores", cores_total_num_);
 
     // Step 1: Send handshake signal to all cores
     for (int i = 0; i < cores_total_num_; i++) {
@@ -216,14 +217,14 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
             aiv_cores_[aiv_count_].core_type = type;
             aiv_count_++;
         } else {
-            DEV_ERROR("Unknown core type %d for core %d", static_cast<int>(type), i);
+            LOG_ERROR("Unknown core type %d for core %d", static_cast<int>(type), i);
             return -1;
         }
 
-        DEV_INFO("  Core %d: type=%s", i, core_type_to_string(type));
+        LOG_INFO("  Core %d: type=%s", i, core_type_to_string(type));
     }
 
-    DEV_INFO("Discovery complete: AIC=%d, AIV=%d, Total=%d", aic_count_, aiv_count_, cores_total_num_);
+    LOG_INFO("Discovery complete: AIC=%d, AIV=%d, Total=%d", aic_count_, aiv_count_, cores_total_num_);
     return 0;
 }
 
@@ -243,13 +244,13 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
 void AicpuExecutor::assign_cores_to_threads() {
     // Validate even distribution (strict mode)
     if (aic_count_ % thread_num_ != 0) {
-        DEV_ERROR("AIC cores (%d) cannot be evenly distributed to %d threads", aic_count_, thread_num_);
+        LOG_ERROR("AIC cores (%d) cannot be evenly distributed to %d threads", aic_count_, thread_num_);
         init_failed_.store(true, std::memory_order_release);
         return;
     }
 
     if (aiv_count_ % thread_num_ != 0) {
-        DEV_ERROR("AIV cores (%d) cannot be evenly distributed to %d threads", aiv_count_, thread_num_);
+        LOG_ERROR("AIV cores (%d) cannot be evenly distributed to %d threads", aiv_count_, thread_num_);
         init_failed_.store(true, std::memory_order_release);
         return;
     }
@@ -257,7 +258,7 @@ void AicpuExecutor::assign_cores_to_threads() {
     int aic_per_thread = aic_count_ / thread_num_;
     int aiv_per_thread = aiv_count_ / thread_num_;
 
-    DEV_INFO("Core Assignment: %d AIC/thread, %d AIV/thread", aic_per_thread, aiv_per_thread);
+    LOG_INFO("Core Assignment: %d AIC/thread, %d AIV/thread", aic_per_thread, aiv_per_thread);
 
     for (int t = 0; t < thread_num_; t++) {
         int core_idx = 0;
@@ -299,7 +300,7 @@ void AicpuExecutor::assign_cores_to_threads() {
 
         offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, "]");
 
-        DEV_INFO("%s", log_buffer);
+        LOG_INFO("%s", log_buffer);
     }
 }
 
@@ -309,15 +310,15 @@ void AicpuExecutor::assign_cores_to_threads() {
 int AicpuExecutor::shutdown_aicore(Runtime* runtime, int thread_idx, const int* cur_thread_cores) {
     Handshake* all_hanks = (Handshake*)runtime->workers;
 
-    DEV_INFO("Thread %d: Shutting down %d cores", thread_idx, thread_cores_num_);
+    LOG_INFO("Thread %d: Shutting down %d cores", thread_idx, thread_cores_num_);
 
     for (int i = 0; i < thread_cores_num_; i++) {
         int core_id = cur_thread_cores[i];
         Handshake* hank = &all_hanks[core_id];
-        DEV_INFO("Thread %d: AICPU hank addr = 0x%lx", thread_idx, (uint64_t)hank);
+        LOG_INFO("Thread %d: AICPU hank addr = 0x%lx", thread_idx, (uint64_t)hank);
         hank->control = 1;
     }
-    DEV_INFO("Thread %d: Shutdown complete", thread_idx);
+    LOG_INFO("Thread %d: Shutdown complete", thread_idx);
     return 0;
 }
 
@@ -328,7 +329,7 @@ int AicpuExecutor::shutdown_aicore(Runtime* runtime, int thread_idx, const int* 
 int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const int* cur_thread_cores, int core_num) {
     Handshake* hank = (Handshake*)runtime.workers;
 
-    DEV_INFO("Thread %d: Starting execution with %d cores", thread_idx, core_num);
+    LOG_INFO("Thread %d: Starting execution with %d cores", thread_idx, core_num);
 
     int cur_thread_completed = 0;
     int cur_thread_tasks_in_flight = 0;
@@ -357,7 +358,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                     all_cores_idle = false;
 
                     if (verification_warning_count == 0) {
-                        DEV_WARN("Thread %d: Counter reached %d/%d but core %d still has work (status=%d, task=%p)",
+                        LOG_WARN("Thread %d: Counter reached %d/%d but core %d still has work (status=%d, task=%p)",
                                 thread_idx, completed_tasks_.load(std::memory_order_acquire), task_count,
                                 core_id, h->task_status, (void*)h->task);
                     }
@@ -370,7 +371,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                 int aic_remaining = ready_count_aic_.load(std::memory_order_acquire);
                 int aiv_remaining = ready_count_aiv_.load(std::memory_order_acquire);
                 if (aic_remaining > 0 || aiv_remaining > 0) {
-                    DEV_WARN("Thread %d: Queues not empty after completion! AIC=%d, AIV=%d",
+                    LOG_WARN("Thread %d: Queues not empty after completion! AIC=%d, AIV=%d",
                             thread_idx, aic_remaining, aiv_remaining);
                 }
                 break;  // Exit main loop
@@ -379,7 +380,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
             // Counter reached but cores still working, continue main loop to process them
             verification_warning_count++;
             if (verification_warning_count > MAX_VERIFICATION_WARNINGS) {
-                DEV_ERROR("Thread %d: Counter reached but cores still working after %d checks!",
+                LOG_ERROR("Thread %d: Counter reached but cores still working after %d checks!",
                          thread_idx, verification_warning_count);
                 diagnose_stuck_state(runtime, thread_idx, cur_thread_cores, core_num, hank);
                 return -1;
@@ -401,7 +402,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
 
                 int task_id = task->task_id;
 
-                DEV_INFO("Thread %d: Core %d completed task %d", thread_idx, core_id, task_id);
+                LOG_INFO("Thread %d: Core %d completed task %d", thread_idx, core_id, task_id);
 
                 // Update fanin of successors atomically and add to appropriate
                 // shared ready queue
@@ -421,7 +422,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                             ready_queue_aic_[ready_queue_aic_tail_] = dep_id;
                             ready_queue_aic_tail_ = (ready_queue_aic_tail_ + 1) % RUNTIME_MAX_TASKS;
                             ready_count_aic_.fetch_add(1, std::memory_order_release);
-                            DEV_INFO("Thread %d: Task %d became ready -> AIC queue (tail=%d)",
+                            LOG_INFO("Thread %d: Task %d became ready -> AIC queue (tail=%d)",
                                      thread_idx, dep_id, ready_queue_aic_tail_);
                         } else {  // AIV task
                             std::lock_guard<std::mutex> lock(ready_queue_aiv_mutex_);
@@ -429,7 +430,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                             ready_queue_aiv_[ready_queue_aiv_tail_] = dep_id;
                             ready_queue_aiv_tail_ = (ready_queue_aiv_tail_ + 1) % RUNTIME_MAX_TASKS;
                             ready_count_aiv_.fetch_add(1, std::memory_order_release);
-                            DEV_INFO("Thread %d: Task %d became ready -> AIV queue (tail=%d)",
+                            LOG_INFO("Thread %d: Task %d became ready -> AIV queue (tail=%d)",
                                      thread_idx, dep_id, ready_queue_aiv_tail_);
                         }
                     }
@@ -464,7 +465,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                                 ready_count_aic_.fetch_sub(1, std::memory_order_release);
                                 Task* task = runtime.get_task(task_id);
 
-                                DEV_INFO("Thread %d: Dispatching AIC task %d to core %d (head=%d)",
+                                LOG_INFO("Thread %d: Dispatching AIC task %d to core %d (head=%d)",
                                          thread_idx, task_id, core_id, ready_queue_aic_head_);
 
                                 h->task = reinterpret_cast<uint64_t>(task);
@@ -484,7 +485,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                                 ready_count_aiv_.fetch_sub(1, std::memory_order_release);
                                 Task* task = runtime.get_task(task_id);
 
-                                DEV_INFO("Thread %d: Dispatching AIV task %d to core %d (head=%d)",
+                                LOG_INFO("Thread %d: Dispatching AIV task %d to core %d (head=%d)",
                                          thread_idx, task_id, core_id, ready_queue_aiv_head_);
 
                                 h->task = reinterpret_cast<uint64_t>(task);
@@ -503,11 +504,11 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
             idle_iterations++;
             if (idle_iterations % WARN_INTERVAL == 0) {
                 int current = completed_tasks_.load(std::memory_order_acquire);
-                DEV_WARN("Thread %d: %d idle iterations, progress %d/%d tasks",
+                LOG_WARN("Thread %d: %d idle iterations, progress %d/%d tasks",
                         thread_idx, idle_iterations, current, task_count);
             }
             if (idle_iterations > MAX_IDLE_ITERATIONS) {
-                DEV_ERROR("Thread %d: Timeout after %d idle iterations!", thread_idx, idle_iterations);
+                LOG_ERROR("Thread %d: Timeout after %d idle iterations!", thread_idx, idle_iterations);
                 diagnose_stuck_state(runtime, thread_idx, cur_thread_cores, core_num, hank);
                 return -1;
             }
@@ -516,34 +517,34 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
         }
     }
 
-    DEV_INFO("Thread %d: Execution complete, completed %d tasks", thread_idx, cur_thread_completed);
+    LOG_INFO("Thread %d: Execution complete, completed %d tasks", thread_idx, cur_thread_completed);
     return cur_thread_completed;
 }
 
 int AicpuExecutor::run(Runtime* runtime) {
     int thread_idx = thread_idx_++;
 
-    DEV_INFO("Thread %d: Start", thread_idx);
+    LOG_INFO("Thread %d: Start", thread_idx);
 
     const int* cur_thread_cores = core_assignments_[thread_idx];
 
     // Handshaking is already done in init() - no per-thread handshake needed
-    DEV_INFO("Thread %d: Runtime has %d tasks", thread_idx, runtime->get_task_count());
+    LOG_INFO("Thread %d: Runtime has %d tasks", thread_idx, runtime->get_task_count());
     int completed = resolve_and_dispatch(*runtime, thread_idx, cur_thread_cores, thread_cores_num_);
-    DEV_INFO("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
+    LOG_INFO("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
 
     int rc = shutdown_aicore(runtime, thread_idx, cur_thread_cores);
     if (rc != 0) {
         return rc;
     }
 
-    DEV_INFO("Thread %d: Completed", thread_idx);
+    LOG_INFO("Thread %d: Completed", thread_idx);
 
     // Check if this is the last thread to finish
     int prev_finished = finished_count_.fetch_add(1, std::memory_order_acq_rel);
     if (prev_finished + 1 == thread_num_) {
         finished_.store(true, std::memory_order_release);
-        DEV_INFO("Thread %d: Last thread, marking executor finished", thread_idx);
+        LOG_INFO("Thread %d: Last thread, marking executor finished", thread_idx);
     }
 
     return 0;
@@ -564,7 +565,7 @@ void AicpuExecutor::deinit() {
     total_tasks_.store(0, std::memory_order_release);
     finished_count_.store(0, std::memory_order_release);
 
-    DEV_INFO("DeInit: Runtime execution state reset");
+    LOG_INFO("DeInit: Runtime execution state reset");
 
     initialized_.store(false, std::memory_order_release);
     init_done_.store(false, std::memory_order_release);
@@ -572,28 +573,28 @@ void AicpuExecutor::deinit() {
     thread_idx_.store(0, std::memory_order_release);
     finished_.store(false, std::memory_order_release);
 
-    DEV_INFO("DeInit: AicpuExecutor reset complete");
+    LOG_INFO("DeInit: AicpuExecutor reset complete");
 }
 
 void AicpuExecutor::diagnose_stuck_state(Runtime& runtime, int thread_idx,
                                          const int* cur_thread_cores, int core_num,
                                          Handshake* hank) {
-    DEV_ERROR("========== DIAGNOSTIC REPORT: Thread %d ==========", thread_idx);
+    LOG_ERROR("========== DIAGNOSTIC REPORT: Thread %d ==========", thread_idx);
 
     int completed = completed_tasks_.load(std::memory_order_acquire);
     int total = total_tasks_.load(std::memory_order_acquire);
-    DEV_ERROR("Progress: %d/%d tasks (%.1f%%)",
+    LOG_ERROR("Progress: %d/%d tasks (%.1f%%)",
              completed, total, total > 0 ? completed * 100.0 / total : 0.0);
 
     int aic_ready = ready_count_aic_.load(std::memory_order_acquire);
     int aiv_ready = ready_count_aiv_.load(std::memory_order_acquire);
-    DEV_ERROR("Ready Queues: AIC=%d, AIV=%d", aic_ready, aiv_ready);
+    LOG_ERROR("Ready Queues: AIC=%d, AIV=%d", aic_ready, aiv_ready);
 
     int busy_cores = 0;
     int idle_cores = 0;
     int anomaly_cores = 0;
 
-    DEV_ERROR("Core Status:");
+    LOG_ERROR("Core Status:");
     for (int i = 0; i < core_num; i++) {
         int core_id = cur_thread_cores[i];
         Handshake* h = &hank[core_id];
@@ -604,45 +605,45 @@ void AicpuExecutor::diagnose_stuck_state(Runtime& runtime, int thread_idx,
             Task* task = reinterpret_cast<Task*>(h->task);
             busy_cores++;
 
-            DEV_ERROR("  Core %d [%s, BUSY]: task_id=%d, func_id=%d, fanin=%d, fanout=%d",
+            LOG_ERROR("  Core %d [%s, BUSY]: task_id=%d, func_id=%d, fanin=%d, fanout=%d",
                      core_id, core_type_str,
                      task->task_id, task->func_id,
                      task->fanin.load(std::memory_order_acquire),
                      task->fanout_count);
         } else if (h->task_status != 0) {
             anomaly_cores++;
-            DEV_ERROR("  Core %d [%s, ANOMALY]: status=BUSY but task=NULL", core_id, core_type_str);
+            LOG_ERROR("  Core %d [%s, ANOMALY]: status=BUSY but task=NULL", core_id, core_type_str);
         } else {
             idle_cores++;
         }
     }
 
-    DEV_ERROR("Summary: %d busy, %d idle, %d anomaly", busy_cores, idle_cores, anomaly_cores);
+    LOG_ERROR("Summary: %d busy, %d idle, %d anomaly", busy_cores, idle_cores, anomaly_cores);
 
     // Diagnose deadlock vs livelock
     if (busy_cores == 0 && aic_ready == 0 && aiv_ready == 0 && completed < total) {
-        DEV_ERROR("*** DEADLOCK DETECTED ***");
-        DEV_ERROR("All cores idle, no ready tasks, but %d tasks incomplete", total - completed);
+        LOG_ERROR("*** DEADLOCK DETECTED ***");
+        LOG_ERROR("All cores idle, no ready tasks, but %d tasks incomplete", total - completed);
 
-        DEV_ERROR("Tasks with fanin > 0:");
+        LOG_ERROR("Tasks with fanin > 0:");
         int stuck_count = 0;
         for (int tid = 0; tid < total && stuck_count < 10; tid++) {
             Task* t = runtime.get_task(tid);
             int fanin = t->fanin.load(std::memory_order_acquire);
             if (fanin > 0) {
-                DEV_ERROR("  Task %d: fanin=%d (waiting for dependencies)", tid, fanin);
+                LOG_ERROR("  Task %d: fanin=%d (waiting for dependencies)", tid, fanin);
                 stuck_count++;
             }
         }
         if (stuck_count == 0) {
-            DEV_ERROR("  No tasks waiting! Possible counter corruption.");
+            LOG_ERROR("  No tasks waiting! Possible counter corruption.");
         }
     } else if (busy_cores > 0) {
-        DEV_ERROR("*** LIVELOCK / HUNG TASK ***");
-        DEV_ERROR("%d cores executing but no progress", busy_cores);
+        LOG_ERROR("*** LIVELOCK / HUNG TASK ***");
+        LOG_ERROR("%d cores executing but no progress", busy_cores);
     }
 
-    DEV_ERROR("========== END DIAGNOSTIC ==========");
+    LOG_ERROR("========== END DIAGNOSTIC ==========");
 }
 
 // ===== Public Entry Point =====
@@ -664,34 +665,40 @@ void AicpuExecutor::diagnose_stuck_state(Runtime& runtime, int thread_idx,
  * @return 0 on success, non-zero on error
  */
 extern "C" int aicpu_execute(Runtime* runtime) {
+    // Initialize log switches (only once, thread-safe)
+    static std::once_flag log_init_flag;
+    std::call_once(log_init_flag, []() {
+        init_log_switch();
+    });
+
     if (runtime == nullptr) {
-        DEV_ERROR("%s", "Invalid runtime argument: null pointer");
+        LOG_ERROR("%s", "Invalid runtime argument: null pointer");
         return -1;
     }
 
-    DEV_INFO("%s", "aicpu_execute: Starting AICPU kernel execution");
+    LOG_INFO("%s", "aicpu_execute: Starting AICPU kernel execution");
 
     g_aicpu_executor.init(runtime);
 
     while (!g_aicpu_executor.init_done_.load(std::memory_order_acquire)) {
         if (g_aicpu_executor.init_failed_.load(std::memory_order_acquire)) {
-            DEV_ERROR("%s", "aicpu_execute: Initialization failed, aborting execution");
+            LOG_ERROR("%s", "aicpu_execute: Initialization failed, aborting execution");
             return -1;
         }
     }
 
     int rc = g_aicpu_executor.run(runtime);
     if (rc != 0) {
-        DEV_ERROR("aicpu_execute: Thread execution failed with rc=%d", rc);
+        LOG_ERROR("aicpu_execute: Thread execution failed with rc=%d", rc);
         return rc;
     }
 
     // Last thread cleans up
     if (g_aicpu_executor.finished_.load(std::memory_order_acquire)) {
-        DEV_INFO("aicpu_execute: Last thread finished, cleaning up");
+        LOG_INFO("aicpu_execute: Last thread finished, cleaning up");
         g_aicpu_executor.deinit();
     }
 
-    DEV_INFO("%s", "aicpu_execute: Kernel execution completed successfully");
+    LOG_INFO("%s", "aicpu_execute: Kernel execution completed successfully");
     return 0;
 }

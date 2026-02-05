@@ -1,9 +1,12 @@
 import importlib.util
+import logging
 from pathlib import Path
 from typing import Optional
 
 from binary_compiler import BinaryCompiler
 from pto_compiler import PTOCompiler
+
+logger = logging.getLogger(__name__)
 
 
 class RuntimeBuilder:
@@ -85,25 +88,25 @@ class RuntimeBuilder:
         compiler = self._binary_compiler
 
         # Compile AICore kernel
-        print("\n[1/3] Compiling AICore kernel...")
+        logger.info("[1/3] Compiling AICore kernel...")
         aicore_cfg = build_config["aicore"]
         aicore_include_dirs = [str((config_dir / p).resolve()) for p in aicore_cfg["include_dirs"]]
         aicore_source_dirs = [str((config_dir / p).resolve()) for p in aicore_cfg["source_dirs"]]
         aicore_binary = compiler.compile("aicore", aicore_include_dirs, aicore_source_dirs)
 
         # Compile AICPU kernel
-        print("\n[2/3] Compiling AICPU kernel...")
+        logger.info("[2/3] Compiling AICPU kernel...")
         aicpu_cfg = build_config["aicpu"]
         aicpu_include_dirs = [str((config_dir / p).resolve()) for p in aicpu_cfg["include_dirs"]]
         aicpu_source_dirs = [str((config_dir / p).resolve()) for p in aicpu_cfg["source_dirs"]]
         aicpu_binary = compiler.compile("aicpu", aicpu_include_dirs, aicpu_source_dirs)
 
         # Compile Host runtime
-        print("\n[3/3] Compiling Host runtime...")
+        logger.info("[3/3] Compiling Host runtime...")
         host_cfg = build_config["host"]
         host_include_dirs = [str((config_dir / p).resolve()) for p in host_cfg["include_dirs"]]
         host_source_dirs = [str((config_dir / p).resolve()) for p in host_cfg["source_dirs"]]
         host_binary = compiler.compile("host", host_include_dirs, host_source_dirs)
 
-        print("\nBuild complete!")
+        logger.info("Build complete!")
         return (host_binary, aicpu_binary, aicore_binary)

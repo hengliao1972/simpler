@@ -1,9 +1,12 @@
+import logging
 import os
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import List
 from toolchain import AICoreToolchain, AICPUToolchain, HostToolchain, HostSimToolchain
+
+logger = logging.getLogger(__name__)
 
 
 class BinaryCompiler:
@@ -204,11 +207,9 @@ class BinaryCompiler:
             # Run CMake configuration
             cmake_cmd = ["cmake", cmake_source_dir] + cmake_args.split()
 
-            print(f"\n{'='*80}")
-            print(f"[{platform}] CMake Command:")
-            print(f"  Working directory: {build_dir}")
-            print(f"  Command: {' '.join(cmake_cmd)}")
-            print(f"{'='*80}\n")
+            logger.info(f"[{platform}] Running CMake configuration...")
+            logger.debug(f"  Working directory: {build_dir}")
+            logger.debug(f"  Command: {' '.join(cmake_cmd)}")
 
             try:
                 result = subprocess.run(
@@ -219,14 +220,15 @@ class BinaryCompiler:
                     text=True
                 )
 
-                if result.stdout:
-                    print(f"[{platform}] CMake stdout:")
-                    print(result.stdout)
-                if result.stderr:
-                    print(f"[{platform}] CMake stderr:")
-                    print(result.stderr)
+                if result.stdout and logger.isEnabledFor(10):  # DEBUG = 10
+                    logger.debug(f"[{platform}] CMake stdout:")
+                    logger.debug(result.stdout)
+                if result.stderr and logger.isEnabledFor(10):
+                    logger.debug(f"[{platform}] CMake stderr:")
+                    logger.debug(result.stderr)
 
                 if result.returncode != 0:
+                    logger.error(f"[{platform}] CMake configuration failed: {result.stderr}")
                     raise RuntimeError(
                         f"CMake configuration failed for {platform}: {result.stderr}"
                     )
@@ -236,11 +238,9 @@ class BinaryCompiler:
             # Run Make to build
             make_cmd = ["make", "VERBOSE=1"]
 
-            print(f"\n{'='*80}")
-            print(f"[{platform}] Make Command:")
-            print(f"  Working directory: {build_dir}")
-            print(f"  Command: {' '.join(make_cmd)}")
-            print(f"{'='*80}\n")
+            logger.info(f"[{platform}] Running Make build...")
+            logger.debug(f"  Working directory: {build_dir}")
+            logger.debug(f"  Command: {' '.join(make_cmd)}")
 
             try:
                 result = subprocess.run(
@@ -251,14 +251,15 @@ class BinaryCompiler:
                     text=True
                 )
 
-                if result.stdout:
-                    print(f"[{platform}] Make stdout:")
-                    print(result.stdout)
-                if result.stderr:
-                    print(f"[{platform}] Make stderr:")
-                    print(result.stderr)
+                if result.stdout and logger.isEnabledFor(10):  # DEBUG = 10
+                    logger.debug(f"[{platform}] Make stdout:")
+                    logger.debug(result.stdout)
+                if result.stderr and logger.isEnabledFor(10):
+                    logger.debug(f"[{platform}] Make stderr:")
+                    logger.debug(result.stderr)
 
                 if result.returncode != 0:
+                    logger.error(f"[{platform}] Make build failed: {result.stderr}")
                     raise RuntimeError(
                         f"Make build failed for {platform}: {result.stderr}"
                     )

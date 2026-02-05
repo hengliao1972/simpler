@@ -53,12 +53,71 @@ python examples/scripts/run_example.py \
 | `--platform` | `-p` | Platform name: `a2a3` or `a2a3sim` | `a2a3` |
 | `--device` | `-d` | Device ID | From env var or 0 |
 | `--runtime` | `-r` | Runtime implementation name | `host_build_graph` |
-| `--verbose` | `-v` | Enable verbose output | False |
+| `--verbose` | `-v` | Enable verbose output (equivalent to `--log-level debug`) | False |
+| `--silent` | | Enable silent mode (equivalent to `--log-level error`) | False |
+| `--log-level` | | Set log level: `error`, `warn`, `info`, `debug` | `info` |
 
 ### Platform Description
 
 - **`a2a3`**: Hardware platform, requires Ascend device and CANN toolkit
 - **`a2a3sim`**: Simulation platform, uses thread simulation, only requires gcc/g++
+
+## Logging Control
+
+The test framework supports unified logging across Python and C++ Host code with four levels:
+
+### Log Levels
+
+- **`error`** (ERROR): Only show errors, suitable for CI/CD or production
+- **`warn`** (WARNING): Show warnings and errors
+- **`info`** (INFO, default): Show progress and status information
+- **`debug`** (DEBUG): Show detailed debug information including:
+  - Compiler commands
+  - Compiler stdout/stderr output
+  - Detailed tensor data
+  - Intermediate step information
+
+### Usage Examples
+
+```bash
+# Error level - only show errors
+python examples/scripts/run_example.py -k ./kernels -g ./golden.py --silent
+# or explicitly:
+python examples/scripts/run_example.py -k ./kernels -g ./golden.py --log-level error
+
+# Info level (default) - show progress
+python examples/scripts/run_example.py -k ./kernels -g ./golden.py
+
+# Debug level - show all debug info
+python examples/scripts/run_example.py -k ./kernels -g ./golden.py --verbose
+# or explicitly:
+python examples/scripts/run_example.py -k ./kernels -g ./golden.py --log-level debug
+
+# Warning level - show warnings and errors
+python examples/scripts/run_example.py -k ./kernels -g ./golden.py --log-level warn
+```
+
+### Environment Variable
+
+You can also control logging via environment variable (lower priority than CLI arguments):
+
+```bash
+export PTO_LOG_LEVEL=debug  # Options: error, warn, info, debug
+python examples/scripts/run_example.py -k ./kernels -g ./golden.py
+```
+
+### Priority
+
+Log level is determined by (highest to lowest priority):
+1. CLI arguments (`--log-level`, `--verbose`, `--silent`)
+2. Environment variable (`PTO_LOG_LEVEL`)
+3. Default value (`info` / INFO level)
+
+### Compiler Output Behavior
+
+- **error/warn/info levels**: Compiler output hidden unless compilation fails
+- **debug level**: All compiler output displayed via DEBUG level
+- **Compilation failures**: Always show error messages regardless of log level
 
 ## File Structure Requirements
 
@@ -220,6 +279,16 @@ int BuildExampleGraph(Runtime* runtime, uint64_t* args, int arg_count) {
 
 ## Environment Variables
 
+### Logging Configuration (All Platforms)
+
+```bash
+# Set log level (optional, CLI arguments take priority)
+export PTO_LOG_LEVEL=debug  # Options: error, warn, info, debug
+
+# Optional: Output C++ Host logs to file
+export PTO_LOG_FILE=/tmp/pto_runtime.log
+```
+
 ### a2a3 Platform (Hardware)
 
 ```bash
@@ -236,7 +305,7 @@ export PTO_DEVICE_ID=0
 
 ### a2a3sim Platform (Simulation)
 
-No special environment variables required.
+No special platform-specific environment variables required.
 
 ## Complete Example
 
@@ -366,6 +435,53 @@ def generate_inputs(params: dict) -> dict:
     }
 ```
 
+### Q: How to control log output verbosity?
+
+Use the `--log-level` argument or `--verbose`/`--silent` flags:
+
+```bash
+# Show detailed debug information
+python examples/scripts/run_example.py -k ... -g ... --verbose
+
+# Only show errors
+python examples/scripts/run_example.py -k ... -g ... --silent
+
+# Or use explicit log level
+python examples/scripts/run_example.py -k ... -g ... --log-level debug
+
+# Show warnings and errors
+python examples/scripts/run_example.py -k ... -g ... --log-level warn
+```
+
+### Q: How to hide compiler warnings?
+
+Use info level (default). Compiler output is automatically hidden in error/warn/info levels unless compilation fails:
+
+```bash
+# Default behavior - hides compiler output
+python examples/scripts/run_example.py -k ... -g ...
+```
+
+To see compiler output for debugging, use debug level:
+
+```bash
+python examples/scripts/run_example.py -k ... -g ... --verbose
+# or
+python examples/scripts/run_example.py -k ... -g ... --log-level debug
+```
+
+### Q: How to save C++ logs to a file?
+
+Set the `PTO_LOG_FILE` environment variable:
+
+```bash
+export PTO_LOG_FILE=/tmp/pto_runtime.log
+python examples/scripts/run_example.py -k ... -g ...
+
+# View the logs
+cat /tmp/pto_runtime.log
+```
+
 ## Advanced Usage
 
 ### Custom Runtime Implementation
@@ -403,6 +519,7 @@ runner.run()  # Execute test
 ## Related Documentation
 
 - [Main Project README](../../README.md)
+- [Logging System Usage Guide](../../LOGGING_USAGE.md)
 - [Python Bindings Documentation](../../python/README.md)
 - [Examples Documentation](../README.md)
 

@@ -9,7 +9,7 @@
 
 #include <runtime/rt.h>
 
-#include <iostream>
+#include "common/unified_log.h"
 
 MemoryAllocator::~MemoryAllocator() { finalize(); }
 
@@ -17,7 +17,7 @@ void* MemoryAllocator::alloc(size_t size) {
     void* ptr = nullptr;
     int rc = rtMalloc(&ptr, size, RT_MEMORY_HBM, 0);
     if (rc != 0) {
-        std::cerr << "Error: rtMalloc failed: " << rc << " (size=" << size << ")\n";
+        LOG_ERROR("rtMalloc failed: %d (size=%zu)", rc, size);
         return nullptr;
     }
 
@@ -41,7 +41,7 @@ int MemoryAllocator::free(void* ptr) {
     // Free the memory
     int rc = rtFree(ptr);
     if (rc != 0) {
-        std::cerr << "Error: rtFree failed: " << rc << '\n';
+        LOG_ERROR("rtFree failed: %d", rc);
         return rc;
     }
 
@@ -62,7 +62,7 @@ int MemoryAllocator::finalize() {
     for (void* ptr : ptr_set_) {
         int rc = rtFree(ptr);
         if (rc != 0) {
-            std::cerr << "Error: rtFree failed during Finalize: " << rc << '\n';
+            LOG_ERROR("rtFree failed during Finalize: %d", rc);
             last_error = rc;
         }
     }

@@ -1,9 +1,12 @@
+import logging
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class PTOCompiler:
@@ -136,10 +139,8 @@ class PTOCompiler:
 
         # Execute compilation
         core_type_name = "AIV" if core_type == "aiv" else "AIC"
-        print(f"\n{'='*80}")
-        print(f"[Incore] Compiling ({core_type_name}): {source_path}")
-        print(f"  Command: {' '.join(cmd)}")
-        print(f"{'='*80}\n")
+        logger.info(f"[Incore] Compiling ({core_type_name}): {source_path}")
+        logger.debug(f"  Command: {' '.join(cmd)}")
 
         try:
             result = subprocess.run(
@@ -148,12 +149,13 @@ class PTOCompiler:
                 text=True
             )
 
-            if result.stdout:
-                print(f"[Incore] stdout:\n{result.stdout}")
-            if result.stderr:
-                print(f"[Incore] stderr:\n{result.stderr}")
+            if result.stdout and logger.isEnabledFor(10):  # DEBUG = 10
+                logger.debug(f"[Incore] stdout:\n{result.stdout}")
+            if result.stderr and logger.isEnabledFor(10):
+                logger.debug(f"[Incore] stderr:\n{result.stderr}")
 
             if result.returncode != 0:
+                logger.error(f"[Incore] Compilation failed: {result.stderr}")
                 raise RuntimeError(
                     f"Incore compilation failed with exit code {result.returncode}:\n"
                     f"{result.stderr}"
@@ -172,7 +174,7 @@ class PTOCompiler:
         # Clean up temp file
         os.remove(output_path)
 
-        print(f"[Incore] Compilation successful: {len(binary_data)} bytes")
+        logger.info(f"[Incore] Compilation successful: {len(binary_data)} bytes")
         return binary_data
 
     def _build_compile_command(
@@ -288,11 +290,9 @@ class PTOCompiler:
         # Output and input
         cmd.extend(["-o", output_path, source_path])
 
-        # Print compilation command
-        print(f"\n{'='*80}")
-        print(f"[Orchestration] Compiling: {source_path}")
-        print(f"  Command: {' '.join(cmd)}")
-        print(f"{'='*80}\n")
+        # Log compilation command
+        logger.info(f"[Orchestration] Compiling: {source_path}")
+        logger.debug(f"  Command: {' '.join(cmd)}")
 
         # Execute
         try:
@@ -302,12 +302,13 @@ class PTOCompiler:
                 text=True
             )
 
-            if result.stdout:
-                print(f"[Orchestration] stdout:\n{result.stdout}")
-            if result.stderr:
-                print(f"[Orchestration] stderr:\n{result.stderr}")
+            if result.stdout and logger.isEnabledFor(10):  # DEBUG = 10
+                logger.debug(f"[Orchestration] stdout:\n{result.stdout}")
+            if result.stderr and logger.isEnabledFor(10):
+                logger.debug(f"[Orchestration] stderr:\n{result.stderr}")
 
             if result.returncode != 0:
+                logger.error(f"[Orchestration] Compilation failed: {result.stderr}")
                 raise RuntimeError(
                     f"Orchestration compilation failed with exit code {result.returncode}:\n"
                     f"{result.stderr}"
@@ -326,7 +327,7 @@ class PTOCompiler:
         # Clean up temp file
         os.remove(output_path)
 
-        print(f"[Orchestration] Compilation successful: {len(binary_data)} bytes")
+        logger.info(f"[Orchestration] Compilation successful: {len(binary_data)} bytes")
         return binary_data
 
     def compile_incore_sim(
@@ -384,11 +385,9 @@ class PTOCompiler:
 
         cmd.extend(["-o", output_path, source_path])
 
-        # Print compilation command
-        print(f"\n{'='*80}")
-        print(f"[SimKernel] Compiling: {source_path}")
-        print(f"  Command: {' '.join(cmd)}")
-        print(f"{'='*80}\n")
+        # Log compilation command
+        logger.info(f"[SimKernel] Compiling: {source_path}")
+        logger.debug(f"  Command: {' '.join(cmd)}")
 
         # Execute
         try:
@@ -398,12 +397,13 @@ class PTOCompiler:
                 text=True
             )
 
-            if result.stdout:
-                print(f"[SimKernel] stdout:\n{result.stdout}")
-            if result.stderr:
-                print(f"[SimKernel] stderr:\n{result.stderr}")
+            if result.stdout and logger.isEnabledFor(10):  # DEBUG = 10
+                logger.debug(f"[SimKernel] stdout:\n{result.stdout}")
+            if result.stderr and logger.isEnabledFor(10):
+                logger.debug(f"[SimKernel] stderr:\n{result.stderr}")
 
             if result.returncode != 0:
+                logger.error(f"[SimKernel] Compilation failed: {result.stderr}")
                 raise RuntimeError(
                     f"SimKernel compilation failed with exit code {result.returncode}:\n"
                     f"{result.stderr}"
@@ -422,5 +422,5 @@ class PTOCompiler:
         # Clean up temp files
         os.remove(output_path)
 
-        print(f"[SimKernel] Compilation successful: {len(binary_data)} bytes")
+        logger.info(f"[SimKernel] Compilation successful: {len(binary_data)} bytes")
         return binary_data

@@ -13,7 +13,7 @@
  *   - Frees device memory
  */
 
-#include "runtime.h"
+#include "runtime.h"  // Includes unified_log.h and provides LOG_* macros
 #include <stdint.h>
 #include <stddef.h>
 #include <cstddef>
@@ -22,7 +22,6 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <fcntl.h>
-#include <iostream>
 #include <unistd.h>
 
 /**
@@ -66,11 +65,11 @@ int init_runtime_impl(Runtime *runtime,
                     int func_args_count) {
     // Validate inputs
     if (runtime == nullptr) {
-        std::cerr << "Error: Runtime pointer is null\n";
+        LOG_ERROR("Runtime pointer is null");
         return -1;
     }
     if (orch_so_binary == nullptr || orch_so_size == 0 || orch_func_name == nullptr) {
-        std::cerr << "Error: Invalid orchestration parameters\n";
+        LOG_ERROR("Invalid orchestration parameters");
         return -1;
     }
 
@@ -80,13 +79,13 @@ int init_runtime_impl(Runtime *runtime,
 
     int fd = open(fd_path, O_WRONLY | O_CREAT | O_TRUNC, 0700);
     if (fd < 0) {
-        std::cerr << "Error: Failed to create temp SO file\n";
+        LOG_ERROR("Failed to create temp SO file");
         return -1;
     }
 
     ssize_t written = write(fd, orch_so_binary, orch_so_size);
     if (written < 0 || static_cast<size_t>(written) != orch_so_size) {
-        std::cerr << "Error: Failed to write orchestration SO to temp file\n";
+        LOG_ERROR("Failed to write orchestration SO to temp file");
         close(fd);
         unlink(fd_path);
         return -1;
@@ -96,7 +95,7 @@ int init_runtime_impl(Runtime *runtime,
     void* handle = dlopen(fd_path, RTLD_NOW | RTLD_LOCAL);
     unlink(fd_path);
     if (handle == nullptr) {
-        std::cerr << "Error: dlopen failed: " << dlerror() << "\n";
+        LOG_ERROR("dlopen failed: %s", dlerror());
         return -1;
     }
 
@@ -105,30 +104,30 @@ int init_runtime_impl(Runtime *runtime,
         reinterpret_cast<OrchestrationFunc>(dlsym(handle, orch_func_name));
     const char* dlsym_error = dlerror();
     if (dlsym_error != nullptr) {
-        std::cerr << "Error: dlsym failed for '" << orch_func_name << "': " << dlsym_error << "\n";
+        LOG_ERROR("dlsym failed for '%s': %s", orch_func_name, dlsym_error);
         dlclose(handle);
         return -1;
     }
 
-    std::cout << "Loaded orchestration function: " << orch_func_name << "\n";
+    LOG_INFO("Loaded orchestration function: %s", orch_func_name);
 
     // Clear any previous tensor pairs
     runtime->clear_tensor_pairs();
 
-    std::cout << "\n=== Calling Orchestration Function ===" << '\n';
-    std::cout << "Args count: " << func_args_count << '\n';
+    LOG_INFO("=== Calling Orchestration Function ===");
+    LOG_DEBUG("Args count: %d", func_args_count);
 
     // Call orchestration function to build task graph
     // The orchestration function handles device memory allocation and copy-to-device
     int rc = orch_func(runtime, func_args, func_args_count);
     if (rc != 0) {
-        std::cerr << "Error: Orchestration function failed with code " << rc << '\n';
+        LOG_ERROR("Orchestration function failed with code %d", rc);
         runtime->clear_tensor_pairs();
         dlclose(handle);
         return rc;
     }
 
-    std::cout << "\nRuntime initialized. Ready for execution from Python.\n";
+    LOG_INFO("Runtime initialized. Ready for execution from Python.");
 
     // Note: We intentionally leak the dlopen handle to keep the SO loaded
     // for the lifetime of the process.
@@ -149,13 +148,13 @@ int init_runtime_impl(Runtime *runtime,
  */
 int validate_runtime_impl(Runtime *runtime) {
     if (runtime == nullptr) {
-        std::cerr << "Error: Runtime pointer is null\n";
+        LOG_ERROR("Runtime pointer is null");
         return -1;
     }
 
     int rc = 0;
 
-    std::cout << "\n=== Copying Results Back to Host ===" << '\n';
+    LOG_INFO("=== Copying Results Back to Host ===");
 
     // Copy all recorded tensors from device back to host
     TensorPair* tensor_pairs = runtime->get_tensor_pairs();
@@ -165,27 +164,27 @@ int validate_runtime_impl(Runtime *runtime) {
         const TensorPair& pair = tensor_pairs[i];
         int copy_rc = runtime->host_api.copy_from_device(pair.host_ptr, pair.dev_ptr, pair.size);
         if (copy_rc != 0) {
-            std::cerr << "Error: Failed to copy tensor " << i << " from device: " << copy_rc << '\n';
+            LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
             rc = copy_rc;
             // Continue with cleanup anyway
         } else {
-            std::cout << "Tensor " << i << ": " << pair.size << " bytes copied to host\n";
+            LOG_DEBUG("Tensor %d: %zu bytes copied to host", i, pair.size);
         }
     }
 
     // Note: PrintHandshakeResults is now called in DeviceRunner's destructor
 
     // Cleanup device tensors
-    std::cout << "\n=== Cleaning Up ===" << '\n';
+    LOG_INFO("=== Cleaning Up ===");
     for (int i = 0; i < tensor_pair_count; i++) {
         runtime->host_api.device_free(tensor_pairs[i].dev_ptr);
     }
-    std::cout << "Freed " << tensor_pair_count << " device tensors\n";
+    LOG_INFO("Freed %d device tensors", tensor_pair_count);
 
     // Clear tensor pairs
     runtime->clear_tensor_pairs();
 
-    std::cout << "=== Finalize Complete ===" << '\n';
+    LOG_INFO("=== Finalize Complete ===");
 
     return rc;
 }

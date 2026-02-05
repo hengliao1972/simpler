@@ -28,6 +28,8 @@ set(AICPU_SOURCES "")
 # First, collect all .cpp files from the current platform directory
 file(GLOB PLATFORM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 list(APPEND AICPU_SOURCES ${PLATFORM_SOURCES})
+# Add unified log device implementation
+list(APPEND AICPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../../src/device/unified_log_device.cpp")
 
 # Then, collect sources from CUSTOM_SOURCE_DIRS (runtime sources)
 if(DEFINED CUSTOM_SOURCE_DIRS)
@@ -51,6 +53,12 @@ target_compile_options(aicpu_kernel
         -fPIC
         -O3
         -g
+)
+
+# Platform definition
+target_compile_definitions(aicpu_kernel
+    PRIVATE
+        __AICPU__
 )
 
 # Include directories

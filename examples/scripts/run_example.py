@@ -26,8 +26,19 @@ Examples:
 """
 
 import argparse
+import logging
+import os
 import sys
 from pathlib import Path
+
+# Get script and project directories
+script_dir = Path(__file__).parent.resolve()
+project_root = script_dir.parent.parent
+python_dir = project_root / "python"
+if python_dir.exists():
+    sys.path.insert(0, str(python_dir))
+
+logger = logging.getLogger(__name__)
 
 
 def main():
@@ -91,20 +102,54 @@ Golden.py interface:
     parser.add_argument(
         "-v", "--verbose",
         action="store_true",
-        help="Enable verbose output"
+        help="Enable verbose output (equivalent to --log-level debug)"
+    )
+
+    parser.add_argument(
+        "--silent",
+        action="store_true",
+        help="Silent mode - only show errors (equivalent to --log-level error)"
+    )
+
+    parser.add_argument(
+        "--log-level",
+        choices=["error", "warn", "info", "debug"],
+        help="Set log level explicitly (overrides --verbose and --silent)"
     )
 
     args = parser.parse_args()
 
-    # Add python directory to path
-    script_dir = Path(__file__).parent.resolve()  # examples/scripts/
-    project_root = script_dir.parent.parent        # simpler/
-    python_dir = project_root / "python"
+    # Determine log level from arguments
+    log_level_str = None
+    if args.log_level:
+        log_level_str = args.log_level
+    elif args.verbose:
+        log_level_str = "debug"
+    elif args.silent:
+        log_level_str = "error"
+    else:
+        log_level_str = "info"
+    
+    # Setup logging before any other operations
+    level_map = {
+        'error': logging.ERROR,
+        'warn': logging.WARNING,
+        'info': logging.INFO,
+        'debug': logging.DEBUG,
+    }
+    log_level = level_map.get(log_level_str.lower(), logging.INFO)
+    
+    # Configure Python logging
+    logging.basicConfig(
+        level=log_level,
+        format='[%(levelname)s] %(message)s',
+        force=True
+    )
+    
+    # Set environment variable for C++ side
+    os.environ['PTO_LOG_LEVEL'] = log_level_str
 
-    if python_dir.exists():
-        sys.path.insert(0, str(python_dir))
-
-    # Also add script_dir for code_runner (now co-located)
+    # Add script_dir for code_runner (now co-located)
     sys.path.insert(0, str(script_dir))
 
     # Validate paths
@@ -112,16 +157,16 @@ Golden.py interface:
     golden_path = Path(args.golden)
 
     if not kernels_path.exists():
-        print(f"Error: Kernels directory not found: {kernels_path}")
+        logger.error(f"Kernels directory not found: {kernels_path}")
         return 1
 
     if not golden_path.exists():
-        print(f"Error: Golden script not found: {golden_path}")
+        logger.error(f"Golden script not found: {golden_path}")
         return 1
 
     kernel_config_path = kernels_path / "kernel_config.py"
     if not kernel_config_path.exists():
-        print(f"Error: kernel_config.py not found in {kernels_path}")
+        logger.error(f"kernel_config.py not found in {kernels_path}")
         return 1
 
     # Import and run
@@ -137,19 +182,19 @@ Golden.py interface:
         )
 
         runner.run()
-        print("\n" + "=" * 60)
-        print("TEST PASSED")
-        print("=" * 60)
+        logger.info("=" * 60)
+        logger.info("TEST PASSED")
+        logger.info("=" * 60)
         return 0
 
     except ImportError as e:
-        print(f"Import error: {e}")
-        print("\nMake sure you're running from the project root directory.")
+        logger.error(f"Import error: {e}")
+        logger.error("Make sure you're running from the project root directory.")
         return 1
 
     except Exception as e:
-        print(f"\nTEST FAILED: {e}")
-        if args.verbose:
+        logger.error(f"TEST FAILED: {e}")
+        if log_level_str == "debug":
             import traceback
             traceback.print_exc()
         return 1

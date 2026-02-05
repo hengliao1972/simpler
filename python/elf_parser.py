@@ -5,9 +5,12 @@ Pure Python implementation for extracting .text section from ELF64 or Mach-O .o 
 Based on the C++ implementation in binary_loader.cpp.
 """
 
+import logging
 import struct
 from pathlib import Path
 from typing import Union
+
+logger = logging.getLogger(__name__)
 
 
 # ELF Magic Numbers
@@ -92,7 +95,7 @@ def _extract_text_elf64(elf_data: bytes, source_name: str) -> bytes:
         section_name = _extract_cstring(strtab, sh_name)
         if section_name == '.text':
             text_data = elf_data[sh_offset:sh_offset+sh_size]
-            print(f"Loaded .text section from {source_name} (size: {sh_size} bytes)")
+            logger.debug(f"Loaded .text section from {source_name} (size: {sh_size} bytes)")
             return text_data
 
     raise ValueError(f".text section not found in: {source_name}")
@@ -132,7 +135,7 @@ def _extract_text_macho64(data: bytes, source_name: str) -> bytes:
                     s_size = struct.unpack('<Q', data[sect_off+40:sect_off+48])[0]
                     s_offset = struct.unpack('<I', data[sect_off+48:sect_off+52])[0]
                     text_data = data[s_offset:s_offset+s_size]
-                    print(f"Loaded __text section from {source_name} (size: {s_size} bytes)")
+                    logger.debug(f"Loaded __text section from {source_name} (size: {s_size} bytes)")
                     return text_data
 
         offset += cmdsize

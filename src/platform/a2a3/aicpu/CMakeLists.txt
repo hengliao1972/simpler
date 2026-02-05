@@ -21,6 +21,8 @@ endif()
 set(AICPU_KERNEL_SOURCES "")
 file(GLOB AICPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 list(APPEND AICPU_KERNEL_SOURCES ${AICPU_SOURCES})
+# Add unified log device implementation
+list(APPEND AICPU_KERNEL_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../../src/device/unified_log_device.cpp")
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})
         file(GLOB DIR_SOURCES "${SRC_DIR}/*.cpp" "${SRC_DIR}/*.c")

@@ -28,6 +28,9 @@
 #include "common/core_type.h"
 #include "common/platform_config.h"
 
+// Logging macros using unified logging interface
+#include "common/unified_log.h"
+
 // =============================================================================
 // Configuration Macros
 // =============================================================================

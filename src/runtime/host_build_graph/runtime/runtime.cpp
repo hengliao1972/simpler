@@ -43,12 +43,12 @@ Runtime::Runtime() {
 int Runtime::add_task(uint64_t* args, int num_args, int func_id, CoreType core_type) {
     // Check bounds
     if (next_task_id >= RUNTIME_MAX_TASKS) {
-        fprintf(stderr, "[Runtime] ERROR: Task table full (max=%d)\n", RUNTIME_MAX_TASKS);
+        LOG_ERROR("[Runtime] Task table full (max=%d)", RUNTIME_MAX_TASKS);
         return -1;
     }
 
     if (num_args > RUNTIME_MAX_ARGS) {
-        fprintf(stderr, "[Runtime] ERROR: Too many args (%d > %d)\n", num_args, RUNTIME_MAX_ARGS);
+        LOG_ERROR("[Runtime] Too many args (%d > %d)", num_args, RUNTIME_MAX_ARGS);
         return -1;
     }
 
@@ -75,12 +75,12 @@ int Runtime::add_task(uint64_t* args, int num_args, int func_id, CoreType core_t
 void Runtime::add_successor(int from_task, int to_task) {
     // Validate task IDs
     if (from_task < 0 || from_task >= next_task_id) {
-        fprintf(stderr, "[Runtime] ERROR: Invalid from_task ID %d\n", from_task);
+        LOG_ERROR("[Runtime] Invalid from_task ID %d", from_task);
         return;
     }
 
     if (to_task < 0 || to_task >= next_task_id) {
-        fprintf(stderr, "[Runtime] ERROR: Invalid to_task ID %d\n", to_task);
+        LOG_ERROR("[Runtime] Invalid to_task ID %d", to_task);
         return;
     }
 
@@ -89,7 +89,7 @@ void Runtime::add_successor(int from_task, int to_task) {
 
     // Add to_task to from_task's fanout
     if (from->fanout_count >= RUNTIME_MAX_FANOUT) {
-        fprintf(stderr, "[Runtime] ERROR: Fanout overflow for task %d (max=%d)\n", from_task, RUNTIME_MAX_FANOUT);
+        LOG_ERROR("[Runtime] Fanout overflow for task %d (max=%d)", from_task, RUNTIME_MAX_FANOUT);
         return;
     }
 
@@ -129,59 +129,58 @@ int Runtime::get_initial_ready_tasks(int* ready_tasks) {
 // =============================================================================
 
 void Runtime::print_runtime() const {
-    printf(
-        "\n===================================================================="
-        "============\n");
-    printf("[Runtime] Task Runtime Status\n");
-    printf(
-        "======================================================================"
-        "==========\n");
-    printf("  Total tasks: %d\n", next_task_id);
+    LOG_DEBUG("\n================================================================================");
+    LOG_DEBUG("[Runtime] Task Runtime Status");
+    LOG_DEBUG("========================================================================");
+    LOG_DEBUG("  Total tasks: %d", next_task_id);
 
     // Print initially ready tasks
-    printf("\nInitially Ready Tasks (fanin==0):\n");
-    printf(
-        "----------------------------------------------------------------------"
-        "----------\n");
-    printf("  ");
+    LOG_DEBUG("\nInitially Ready Tasks (fanin==0):");
+    LOG_DEBUG("----------------------------------------------------------------------");
+    
+    // Build ready tasks string
+    char ready_tasks_str[1024] = "  ";
+    int offset = 2;
     int ready_count = 0;
-    for (int i = 0; i < next_task_id; i++) {
+    for (int i = 0; i < next_task_id && offset < 1000; i++) {
         if (tasks[i].fanin.load() == 0) {
-            if (ready_count > 0) printf(", ");
-            printf("%d", i);
+            if (ready_count > 0) {
+                offset += snprintf(ready_tasks_str + offset, sizeof(ready_tasks_str) - offset, ", ");
+            }
+            offset += snprintf(ready_tasks_str + offset, sizeof(ready_tasks_str) - offset, "%d", i);
             ready_count++;
         }
     }
     if (ready_count == 0) {
-        printf("(none)");
+        snprintf(ready_tasks_str, sizeof(ready_tasks_str), "  (none)");
     }
-    printf("\n  Count: %d\n", ready_count);
+    LOG_DEBUG("%s", ready_tasks_str);
+    LOG_DEBUG("  Count: %d", ready_count);
 
-    printf("\nTask Table:\n");
-    printf(
-        "----------------------------------------------------------------------"
-        "----------\n");
+    LOG_DEBUG("\nTask Table:");
+    LOG_DEBUG("----------------------------------------------------------------------");
 
     for (int i = 0; i < next_task_id; i++) {
         const Task* t = &tasks[i];
 
-        printf("  Task %d: func_id=%d, fanin=%d, fanout=%d, args=%d [",
+        // Build fanout string
+        char fanout_str[512];
+        int fo_offset = 0;
+        for (int j = 0; j < t->fanout_count && fo_offset < 500; j++) {
+            fo_offset += snprintf(fanout_str + fo_offset, sizeof(fanout_str) - fo_offset, 
+                                  "%d%s", t->fanout[j], j < t->fanout_count - 1 ? "," : "");
+        }
+
+        LOG_DEBUG("  Task %d: func_id=%d, fanin=%d, fanout=%d, args=%d [%s]",
             i,
             t->func_id,
             t->fanin.load(),
             t->fanout_count,
-            t->num_args);
-
-        // Print fanout list
-        for (int j = 0; j < t->fanout_count; j++) {
-            printf("%d%s", t->fanout[j], j < t->fanout_count - 1 ? "," : "");
-        }
-        printf("]\n");
+            t->num_args,
+            fanout_str);
     }
 
-    printf(
-        "======================================================================"
-        "==========\n\n");
+    LOG_DEBUG("========================================================================");
 }
 
 // =============================================================================
@@ -190,14 +189,14 @@ void Runtime::print_runtime() const {
 
 void Runtime::record_tensor_pair(void* host_ptr, void* dev_ptr, size_t size) {
     if (tensor_pair_count >= RUNTIME_MAX_TENSOR_PAIRS) {
-        fprintf(stderr, "[Runtime] ERROR: Tensor pairs full (max=%d)\n", RUNTIME_MAX_TENSOR_PAIRS);
+        LOG_ERROR("[Runtime] Tensor pairs full (max=%d)", RUNTIME_MAX_TENSOR_PAIRS);
         return;
     }
     tensor_pairs[tensor_pair_count].host_ptr = host_ptr;
     tensor_pairs[tensor_pair_count].dev_ptr = dev_ptr;
     tensor_pairs[tensor_pair_count].size = size;
     tensor_pair_count++;
-    printf("Recorded tensor pair: host=%p dev=%p size=%zu\n", host_ptr, dev_ptr, size);
+    LOG_DEBUG("Recorded tensor pair: host=%p dev=%p size=%zu", host_ptr, dev_ptr, size);
 }
 
 TensorPair* Runtime::get_tensor_pairs() {

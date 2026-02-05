@@ -7,7 +7,7 @@
 #include "host/memory_allocator.h"
 
 #include <cstdlib>
-#include <iostream>
+#include "common/unified_log.h"
 
 MemoryAllocator::~MemoryAllocator() {
     finalize();
@@ -16,7 +16,7 @@ MemoryAllocator::~MemoryAllocator() {
 void* MemoryAllocator::alloc(size_t size) {
     void* ptr = std::malloc(size);
     if (ptr == nullptr) {
-        std::cerr << "Error: malloc failed (size=" << size << ")\n";
+        LOG_ERROR("malloc failed (size=%zu)", size);
         return nullptr;
     }
 
