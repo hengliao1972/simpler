@@ -162,6 +162,7 @@ extern "C" int orchestration(Runtime* runtime) {
 
             for (int bn = 0; bn < bn_this_batch; bn++) {
                 int cur_block_idx = dev_block_table[b_idx * max_num_blocks + bn];
+                int valid_len = min_int(block_size, cur_seq - bn * block_size);
 
                 // Key: (total_blocks, block_size, kv_head_num, head_dim) bf16
                 uint8_t* kj_ptr = dev_key_cache
@@ -193,16 +194,17 @@ extern "C" int orchestration(Runtime* runtime) {
                 if (t_qk < 0) return -1;
 
                 // SF: scale, rowmax, exp, rowsum -> pij, mij, lij
-                uint64_t sf_args[7] = {
+                uint64_t sf_args[8] = {
                     reinterpret_cast<uint64_t>(dev_sij),
                     scale_value_bits,
                     reinterpret_cast<uint64_t>(dev_pij),
                     reinterpret_cast<uint64_t>(dev_mij),
                     reinterpret_cast<uint64_t>(dev_lij),
                     static_cast<uint64_t>(q_tile_size),
-                    static_cast<uint64_t>(block_size)
+                    static_cast<uint64_t>(block_size),
+                    static_cast<uint64_t>(valid_len)
                 };
-                int t_sf = api.add_task(runtime, sf_args, 7, FUNC_SOFTMAX_PREPARE, CoreType::AIV, 0);
+                int t_sf = api.add_task(runtime, sf_args, 8, FUNC_SOFTMAX_PREPARE, CoreType::AIV, 0);
                 if (t_sf < 0) return -1;
 
                 // PV: pij(M, K') @ vj(K', N') -> oi_new(M, N')
