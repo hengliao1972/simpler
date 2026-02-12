@@ -185,6 +185,31 @@ Golden.py interface:
         logger.info("=" * 60)
         logger.info("TEST PASSED")
         logger.info("=" * 60)
+
+        # If profiling was enabled, generate merged swimlane JSON
+        if args.enable_profiling:
+            logger.info("Generating swimlane visualization...")
+            kernel_config_path = kernels_path / "kernel_config.py"
+            swimlane_script = project_root / "tools" / "swimlane_converter.py"
+
+            if swimlane_script.exists():
+                import subprocess
+                try:
+                    # Call swimlane_converter.py with kernel_config.py path
+                    cmd = [sys.executable, str(swimlane_script), "-k", str(kernel_config_path)]
+                    if log_level_str == "debug":
+                        cmd.append("-v")
+
+                    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                    logger.info(result.stdout)
+                    logger.info("Swimlane JSON generation completed")
+                except subprocess.CalledProcessError as e:
+                    logger.warning(f"Failed to generate swimlane JSON: {e}")
+                    if log_level_str == "debug":
+                        logger.debug(f"stderr: {e.stderr}")
+            else:
+                logger.warning(f"Swimlane converter script not found: {swimlane_script}")
+
         return 0
 
     except ImportError as e:
