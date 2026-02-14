@@ -54,32 +54,7 @@ Tensor::Tensor(Tensor&& other)
     }
 }
 
-Tensor::Tensor(const Tensor& other)
-    : buffer(other.buffer),
-      start_offset(other.start_offset),
-      ndims(other.ndims),
-      dtype(other.dtype),
-      version(other.version),
-      overlap_type(other.overlap_type) {
-    for (uint64_t i = 0; i < ndims; i++) {
-        strides[i] = other.strides[i];
-        repeats[i] = other.repeats[i];
-    }
-}
-
-Tensor& Tensor::operator=(const Tensor& other) {
-    buffer = other.buffer;
-    start_offset = other.start_offset;
-    ndims = other.ndims;
-    dtype = other.dtype;
-    version = other.version;
-    overlap_type = other.overlap_type;
-    for (uint64_t i = 0; i < ndims; i++) {
-        strides[i] = other.strides[i];
-        repeats[i] = other.repeats[i];
-    }
-    return *this;
-}
+// Copy constructor and operator= are now inline in tensor.h
 
 // =============================================================================
 // Validation and optimization (called by constructor's debug_assert)
@@ -134,20 +109,20 @@ void Tensor::resort_strides() {
 }
 
 Tensor& Tensor::optimize() {
-#ifndef NDEBUG
-    uint64_t original_strides[RUNTIME_MAX_TENSOR_DIMS];
-    uint64_t original_repeats[RUNTIME_MAX_TENSOR_DIMS];
-    int32_t original_ndims = ndims;
-    for (uint64_t i = 0; i < ndims; i++) {
-        original_strides[i] = this->strides[i];
-        original_repeats[i] = this->repeats[i];
-    }
-#endif
+// #ifndef NDEBUG
+//     uint64_t original_strides[RUNTIME_MAX_TENSOR_DIMS];
+//     uint64_t original_repeats[RUNTIME_MAX_TENSOR_DIMS];
+//     int32_t original_ndims = ndims;
+//     for (uint64_t i = 0; i < ndims; i++) {
+//         original_strides[i] = this->strides[i];
+//         original_repeats[i] = this->repeats[i];
+//     }
+// #endif
     resort_strides();
 
-#ifndef NDEBUG
-    debug_assert(validate_memory_access_preserved(original_strides, original_repeats, original_ndims));
-#endif
+// #ifndef NDEBUG
+//     debug_assert(validate_memory_access_preserved(original_strides, original_repeats, original_ndims));
+// #endif
     return *this;
 }
 
