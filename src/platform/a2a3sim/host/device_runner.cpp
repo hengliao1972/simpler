@@ -321,6 +321,30 @@ void DeviceRunner::print_handshake_results() {
     }
 }
 
+int DeviceRunner::clean_cache() {
+    // Skip if not initialized
+    if (device_id_ == -1) {
+        return 0;
+    }
+
+    // Only cleanup test-specific resources:
+
+    // 1. Close dlopen'd kernel libraries (different tests may have different kernels)
+    for (auto& pair : func_id_to_addr_) {
+        MappedKernel& kernel = pair.second;
+        if (kernel.dl_handle != nullptr) {
+            dlclose(kernel.dl_handle);
+            LOG_DEBUG("Closed dlopen kernel: func_id=%d", pair.first);
+            kernel.dl_handle = nullptr;
+            kernel.func_addr = 0;
+        }
+    }
+    func_id_to_addr_.clear();
+
+    LOG_INFO("DeviceRunner(sim): cache cleaned (test-specific resources only)");
+    return 0;
+}
+
 int DeviceRunner::finalize() {
     // Skip if already finalized
     if (device_id_ == -1 && aicpu_so_handle_ == nullptr && aicore_so_handle_ == nullptr) {

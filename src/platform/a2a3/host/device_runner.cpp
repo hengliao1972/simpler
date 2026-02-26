@@ -455,6 +455,20 @@ void DeviceRunner::print_handshake_results() {
     }
 }
 
+int DeviceRunner::clean_cache() {
+    if (stream_aicpu_ == nullptr) {
+        return 0;  // Nothing to cleanup if device not initialized
+    }
+    for (const auto& [func_id, addr] : func_id_to_addr_) {
+        void* gm_addr = reinterpret_cast<void*>(addr - sizeof(uint64_t));
+        mem_alloc_.free(gm_addr);
+    }
+    func_id_to_addr_.clear();
+
+    LOG_INFO("DeviceRunner: cache cleaned (test-specific resources only)");
+    return 0;
+}
+
 int DeviceRunner::finalize() {
     if (stream_aicpu_ == nullptr) {
         return 0;
