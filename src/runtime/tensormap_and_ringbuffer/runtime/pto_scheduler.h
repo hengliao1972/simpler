@@ -32,10 +32,10 @@
  */
 typedef struct {
     int32_t* task_ids;    // Circular buffer of task IDs
-    int32_t  head;        // Dequeue position
-    int32_t  tail;        // Enqueue position
-    int32_t  capacity;    // Queue capacity
-    int32_t  count;       // Current number of tasks in queue
+    uint64_t head;        // Dequeue position
+    uint64_t tail;        // Enqueue position
+    uint64_t capacity;    // Queue capacity
+    uint64_t count;       // Current number of tasks in queue
 } PTO2ReadyQueue;
 
 // =============================================================================
@@ -54,11 +54,11 @@ typedef struct PTO2SchedulerState {
 
     // Local copies of ring pointers (written to shared memory after update)
     int32_t last_task_alive;      // Task ring tail
-    int32_t heap_tail;            // Heap ring tail
+    uint64_t heap_tail;           // Heap ring tail
 
     // === DYNAMIC CONFIGURATION ===
-    int32_t task_window_size;     // Task window size (power of 2)
-    int32_t task_window_mask;     // task_window_size - 1 (for fast modulo)
+    uint64_t task_window_size;    // Task window size (power of 2)
+    uint64_t task_window_mask;    // task_window_size - 1 (for fast modulo)
 
     // === PRIVATE DATA (not in shared memory) ===
 
@@ -121,7 +121,7 @@ void pto2_scheduler_reset(PTO2SchedulerState* sched);
 /**
  * Initialize a ready queue
  */
-bool pto2_ready_queue_init(PTO2ReadyQueue* queue, int32_t capacity);
+bool pto2_ready_queue_init(PTO2ReadyQueue* queue, uint64_t capacity);
 
 /**
  * Destroy ready queue
@@ -162,7 +162,7 @@ static inline bool pto2_ready_queue_full(PTO2ReadyQueue* queue) {
 /**
  * Get ready queue count
  */
-static inline int32_t pto2_ready_queue_count(PTO2ReadyQueue* queue) {
+static inline uint64_t pto2_ready_queue_count(PTO2ReadyQueue* queue) {
     return queue->count;
 }
 

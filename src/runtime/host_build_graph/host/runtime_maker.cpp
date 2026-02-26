@@ -110,8 +110,8 @@ int init_runtime_impl(Runtime *runtime,
         return -1;
     }
 
-    ssize_t written = write(fd, orch_so_binary, orch_so_size);
-    if (written < 0 || static_cast<size_t>(written) != orch_so_size) {
+    ssize_t written = write(fd, orch_so_binary, static_cast<size_t>(orch_so_size));
+    if (written < 0 || static_cast<uint64_t>(written) != orch_so_size) {
         LOG_ERROR("Failed to write orchestration SO to temp file");
         close(fd);
         unlink(fd_path);

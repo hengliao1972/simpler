@@ -894,9 +894,9 @@ int AicpuExecutor::run(Runtime* runtime) {
             }
 
             // Read config from orchestration SO (or use defaults)
-            int32_t task_window_size = PTO2_TASK_WINDOW_SIZE;
-            int32_t dep_list_pool_size = PTO2_DEP_LIST_POOL_SIZE;
-            int32_t heap_size = PTO2_HEAP_SIZE;
+            uint64_t task_window_size = PTO2_TASK_WINDOW_SIZE;
+            uint64_t dep_list_pool_size = PTO2_DEP_LIST_POOL_SIZE;
+            uint64_t heap_size = PTO2_HEAP_SIZE;
             int expected_arg_count = 0;
             if (config_func) {
                 PTO2OrchestrationConfig cfg = config_func(args, arg_count);
@@ -919,7 +919,7 @@ int AicpuExecutor::run(Runtime* runtime) {
             void* gm_heap = runtime->get_pto2_gm_heap_ptr();
 
             // Create shared memory handle and runtime (ops table populated inside)
-            int32_t sm_size = pto2_sm_calculate_size(task_window_size, dep_list_pool_size);
+            uint64_t sm_size = pto2_sm_calculate_size(task_window_size, dep_list_pool_size);
             PTO2SharedMemoryHandle* sm_handle =
                 pto2_sm_create_from_buffer(sm_ptr, sm_size, task_window_size,
                                             heap_size, dep_list_pool_size);
@@ -949,8 +949,8 @@ int AicpuExecutor::run(Runtime* runtime) {
             }
 
             // Set orchestrator's aicpu parallel mode pointers
-            int32_t ws = header->task_window_size;
-            if (ws <= 0 || ws > PTO2_MAX_SLOTS) ws = PTO2_MAX_SLOTS;
+            uint64_t ws = header->task_window_size;
+            if (ws == 0 || ws > PTO2_MAX_SLOTS) ws = PTO2_MAX_SLOTS;
             rt->orchestrator.aicpu_fanin_refcount = s_pto2_fanin_refcount;
             rt->orchestrator.aicpu_task_completed = s_pto2_task_completed;
             rt->orchestrator.aicpu_window_mask = ws - 1;
@@ -1001,9 +1001,10 @@ int AicpuExecutor::run(Runtime* runtime) {
             dlclose(handle);
             unlink(so_path);
 
-            // Device mode: task count lives in PTO2 shared memory (current_task_index at offset 0)
+            // Device mode: task count lives in PTO2 shared memory
             void* sm = runtime->get_pto2_gm_sm_ptr();
-            int32_t pto2_task_count = sm ? *(volatile int32_t*)sm : 0;
+            PTO2SharedMemoryHeader* sm_header = static_cast<PTO2SharedMemoryHeader*>(sm);
+            int32_t pto2_task_count = sm_header ? sm_header->current_task_index : 0;
             DEV_INFO("Thread 3: PTO2 task count = %d", pto2_task_count);
             total_tasks_.store(pto2_task_count, std::memory_order_release);
             orchestrator_done_.store(true, std::memory_order_release);

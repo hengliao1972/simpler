@@ -288,7 +288,7 @@ public:
      * orchestration plugin `.so` (instead of relinking/reuploading the full runtime).
      */
     uint8_t aicpu_orch_so_storage[RUNTIME_MAX_AICPU_ORCH_SO_SIZE];
-    uint32_t aicpu_orch_so_size;
+    uint64_t aicpu_orch_so_size;
     char aicpu_orch_func_name[64];
 
     // Attempt to embed AICPU orchestration plugin bytes into Runtime.
@@ -297,7 +297,7 @@ public:
     bool try_set_aicpu_orch_so(const void* data, size_t size);
     void set_aicpu_orch_so(const void* data, size_t size);
     const void* get_aicpu_orch_so_data() const;
-    size_t get_aicpu_orch_so_size() const;
+    uint64_t get_aicpu_orch_so_size() const;
 
     /**
      * Build mode:

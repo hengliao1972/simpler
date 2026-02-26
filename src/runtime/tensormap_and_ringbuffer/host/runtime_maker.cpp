@@ -233,8 +233,8 @@ extern "C" int init_runtime_impl(Runtime *runtime,
 
     // Allocate PTO2 shared memory
     long long t_sm_start = _now_ms();
-    int32_t sm_size = pto2_sm_calculate_size(PTO2_TASK_WINDOW_SIZE, PTO2_DEP_LIST_POOL_SIZE);
-    void* sm_ptr = runtime->host_api.device_malloc(static_cast<size_t>(sm_size));
+    uint64_t sm_size = pto2_sm_calculate_size(PTO2_TASK_WINDOW_SIZE, PTO2_DEP_LIST_POOL_SIZE);
+    void* sm_ptr = runtime->host_api.device_malloc(sm_size);
     long long t_sm_end = _now_ms();
     if (sm_ptr == nullptr) {
         std::cerr << "Error: Failed to allocate PTO2 shared memory\n";
@@ -289,7 +289,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
     // PTO2 (device orchestration): graph output may be in packed buffer
     void* pto2_sm = runtime->get_pto2_gm_sm_ptr();
     uint64_t graph_out_ptr = 0;
-    int32_t graph_out_size = 0;
+    uint64_t graph_out_size = 0;
 
     if (pto2_sm != nullptr) {
         // Copy header from device to host to read graph_output_ptr/size

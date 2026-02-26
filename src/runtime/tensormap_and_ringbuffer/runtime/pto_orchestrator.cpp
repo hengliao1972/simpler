@@ -7,6 +7,7 @@
  */
 
 #include "pto_orchestrator.h"
+#include <inttypes.h>
 
 #include <assert.h>
 #include <stdio.h>
@@ -65,7 +66,7 @@ static inline void task_fanout_unlock(PTO2TaskDescriptor* task) { PTO2_STORE_REL
 // =============================================================================
 
 bool pto2_orchestrator_init(
-    PTO2OrchestratorState* orch, PTO2SharedMemoryHandle* sm_handle, void* gm_heap, int32_t heap_size) {
+    PTO2OrchestratorState* orch, PTO2SharedMemoryHandle* sm_handle, void* gm_heap, uint64_t heap_size) {
     memset(orch, 0, sizeof(PTO2OrchestratorState));
 
     orch->sm_handle = sm_handle;
@@ -82,7 +83,7 @@ bool pto2_orchestrator_init(
         &sm_handle->header->last_task_alive);
 
     // Initialize dependency list pool
-    pto2_dep_pool_init(&orch->dep_pool, sm_handle->dep_list_pool, sm_handle->header->dep_list_pool_size);
+    pto2_dep_pool_init(&orch->dep_pool, sm_handle->dep_list_pool, (int32_t)sm_handle->header->dep_list_pool_size);
 
     // Initialize TensorMap
     if (!pto2_tensormap_init_default(&orch->tensor_map)) {
@@ -92,7 +93,7 @@ bool pto2_orchestrator_init(
     orch->tensormap_last_cleanup = 0;
 
     // Initialize scope stack: one flat buffer for task IDs + one array for begin offsets
-    int32_t max_depth = PTO2_MAX_SCOPE_DEPTH;
+    uint64_t max_depth = PTO2_MAX_SCOPE_DEPTH;
     int32_t init_cap = PTO2_SCOPE_TASKS_INIT_CAP;
     orch->scope_tasks = (int32_t*)malloc(init_cap * sizeof(int32_t));
     orch->scope_begins = (int32_t*)malloc(max_depth * sizeof(int32_t));
@@ -166,7 +167,7 @@ static void scope_tasks_push(PTO2OrchestratorState* orch, int32_t task_id) {
 }
 
 void pto2_scope_begin(PTO2OrchestratorState* orch) {
-    assert(orch->scope_stack_top < orch->scope_stack_capacity - 1 && "Scope stack overflow");
+    assert(orch->scope_stack_top < (int32_t)(orch->scope_stack_capacity - 1) && "Scope stack overflow");
 
     ++orch->scope_stack_top;
     orch->scope_begins[orch->scope_stack_top] = orch->scope_tasks_size;
@@ -496,7 +497,7 @@ void pto2_orchestrator_print_stats(PTO2OrchestratorState* orch) {
     printf("Bytes allocated:     %lld\n", (long long)orch->bytes_allocated);
     printf("Current scope depth: %d\n", orch->scope_stack_top + 1);
     printf("Task ring active:    %d\n", pto2_task_ring_active_count(&orch->task_ring));
-    printf("Heap ring used:      %d / %d\n", orch->heap_ring.top, orch->heap_ring.size);
+    printf("Heap ring used:      %" PRIu64 " / %" PRIu64 "\n", orch->heap_ring.top, orch->heap_ring.size);
     printf("Dep pool used:       %d / %d\n", pto2_dep_pool_used(&orch->dep_pool), orch->dep_pool.capacity);
     printf("TensorMap valid:     %d\n", pto2_tensormap_valid_count(&orch->tensor_map));
     printf("===============================\n");

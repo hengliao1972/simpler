@@ -8,6 +8,7 @@
  */
 
 #include "pto_ring_buffer.h"
+#include <inttypes.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>  // for exit()
@@ -21,8 +22,8 @@
 // Heap Ring Buffer Implementation
 // =============================================================================
 
-void pto2_heap_ring_init(PTO2HeapRing* ring, void* base, int32_t size,
-                          volatile int32_t* tail_ptr) {
+void pto2_heap_ring_init(PTO2HeapRing* ring, void* base, uint64_t size,
+                          volatile uint64_t* tail_ptr) {
     ring->base = base;
     ring->size = size;
     ring->top = 0;
@@ -34,10 +35,10 @@ void pto2_heap_ring_init(PTO2HeapRing* ring, void* base, int32_t size,
 // Heap ring spin limit - after this, report deadlock and exit
 #define PTO2_HEAP_SPIN_LIMIT        100000
 
-void* pto2_heap_ring_alloc(PTO2HeapRing* ring, int32_t size) {
+void* pto2_heap_ring_alloc(PTO2HeapRing* ring, uint64_t size) {
     // Align size for DMA efficiency
     size = PTO2_ALIGN_UP(size, PTO2_ALIGN_SIZE);
-    
+
     // Spin-wait if insufficient space (back-pressure from Scheduler)
     int spin_count = 0;
 #if PTO2_SPIN_VERBOSE_LOGGING
@@ -54,69 +55,70 @@ void* pto2_heap_ring_alloc(PTO2HeapRing* ring, int32_t size) {
 #endif
             return ptr;
         }
-        
+
         // No space available, spin-wait
         spin_count++;
-        
+
 #if PTO2_SPIN_VERBOSE_LOGGING
         // Periodic block notification
         if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0 &&
             spin_count < PTO2_HEAP_SPIN_LIMIT) {
-            int32_t tail = PTO2_LOAD_ACQUIRE(ring->tail_ptr);
-            int32_t available = pto2_heap_ring_available(ring);
-            fprintf(stderr, "[HeapRing] BLOCKED: requesting %d bytes, available=%d, "
-                    "top=%d, tail=%d, spins=%d\n",
-                    size, available, ring->top, tail, spin_count);
+            uint64_t tail = PTO2_LOAD_ACQUIRE(ring->tail_ptr);
+            uint64_t available = pto2_heap_ring_available(ring);
+            fprintf(stderr, "[HeapRing] BLOCKED: requesting %" PRIu64 " bytes, available=%" PRIu64 ", "
+                    "top=%" PRIu64 ", tail=%" PRIu64 ", spins=%d\n",
+                    size, available,
+                    ring->top, tail, spin_count);
             notified = true;
         }
 #endif
-        
+
         if (spin_count >= PTO2_HEAP_SPIN_LIMIT) {
-            int32_t tail = PTO2_LOAD_ACQUIRE(ring->tail_ptr);
-            int32_t available = pto2_heap_ring_available(ring);
+            uint64_t tail = PTO2_LOAD_ACQUIRE(ring->tail_ptr);
+            uint64_t available = pto2_heap_ring_available(ring);
             fprintf(stderr, "\n");
             fprintf(stderr, "========================================\n");
             fprintf(stderr, "FATAL: Heap Ring Deadlock Detected!\n");
             fprintf(stderr, "========================================\n");
             fprintf(stderr, "Orchestrator blocked waiting for heap space after %d spins.\n", spin_count);
-            fprintf(stderr, "  - Requested:     %d bytes\n", size);
-            fprintf(stderr, "  - Available:     %d bytes\n", available);
-            fprintf(stderr, "  - Heap top:      %d\n", ring->top);
-            fprintf(stderr, "  - Heap tail:     %d\n", tail);
-            fprintf(stderr, "  - Heap size:     %d\n", ring->size);
+            fprintf(stderr, "  - Requested:     %" PRIu64 " bytes\n", size);
+            fprintf(stderr, "  - Available:     %" PRIu64 " bytes\n", available);
+            fprintf(stderr, "  - Heap top:      %" PRIu64 "\n", ring->top);
+            fprintf(stderr, "  - Heap tail:     %" PRIu64 "\n", tail);
+            fprintf(stderr, "  - Heap size:     %" PRIu64 "\n", ring->size);
             fprintf(stderr, "\n");
             fprintf(stderr, "Solution: Increase PTO2_HEAP_SIZE (e.g. 256*1024 for 4 x 64KB outputs).\n");
             fprintf(stderr, "========================================\n");
             fprintf(stderr, "\n");
             exit(1);
         }
-        
+
         PTO2_SPIN_PAUSE();
     }
 }
 
-void* pto2_heap_ring_try_alloc(PTO2HeapRing* ring, int32_t size) {
+void* pto2_heap_ring_try_alloc(PTO2HeapRing* ring, uint64_t size) {
     // Align size for DMA efficiency
     size = PTO2_ALIGN_UP(size, PTO2_ALIGN_SIZE);
-    
+
     // Read latest tail from shared memory (Scheduler updates this)
-    int32_t tail = PTO2_LOAD_ACQUIRE(ring->tail_ptr);
-    int32_t top = ring->top;
-    
+    uint64_t tail = PTO2_LOAD_ACQUIRE(ring->tail_ptr);
+    uint64_t top = ring->top;
+
     if (top >= tail) {
         // Case 1: top is at or ahead of tail (normal case)
         //   [....tail====top......]
         //                   ^-- space_at_end = size - top
-        
-        int32_t space_at_end = ring->size - top;
-        
+
+        uint64_t space_at_end = ring->size - top;
+
         if (space_at_end >= size) {
             // Enough space at end - allocate here
             void* ptr = (char*)ring->base + top;
             ring->top = top + size;
             return ptr;
         }
-        
+
         // Not enough space at end - check if we can wrap to beginning
         // IMPORTANT: Don't split buffer, skip remaining space at end
         if (tail > size) {
@@ -124,35 +126,35 @@ void* pto2_heap_ring_try_alloc(PTO2HeapRing* ring, int32_t size) {
             ring->top = size;
             return ring->base;
         }
-        
+
         // Not enough space anywhere - return NULL
         return NULL;
-        
+
     } else {
         // Case 2: top has wrapped, tail is ahead
         //   [====top....tail=====]
         //         ^-- free space = tail - top
-        
-        int32_t gap = tail - top;
+
+        uint64_t gap = tail - top;
         if (gap >= size) {
             void* ptr = (char*)ring->base + top;
             ring->top = top + size;
             return ptr;
         }
-        
+
         // Not enough space - return NULL
         return NULL;
     }
 }
 
-int32_t pto2_heap_ring_available(PTO2HeapRing* ring) {
-    int32_t tail = PTO2_LOAD_ACQUIRE(ring->tail_ptr);
-    int32_t top = ring->top;
-    
+uint64_t pto2_heap_ring_available(PTO2HeapRing* ring) {
+    uint64_t tail = PTO2_LOAD_ACQUIRE(ring->tail_ptr);
+    uint64_t top = ring->top;
+
     if (top >= tail) {
         // Space at end + space at beginning (if any)
-        int32_t at_end = ring->size - top;
-        int32_t at_begin = tail;
+        uint64_t at_end = ring->size - top;
+        uint64_t at_begin = tail;
         return at_end > at_begin ? at_end : at_begin;  // Max usable
     } else {
         // Contiguous space between top and tail

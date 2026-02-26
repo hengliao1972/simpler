@@ -87,7 +87,7 @@ struct PTO2Runtime {
 
     // GM Heap for output buffers
     void*                   gm_heap;
-    int32_t                 gm_heap_size;
+    uint64_t                  gm_heap_size;
     bool                    gm_heap_owned;  // True if we allocated it
 
     // Mode
@@ -119,9 +119,9 @@ PTO2Runtime* pto2_runtime_create(PTO2RuntimeMode mode);
  * @return Runtime context, or NULL on failure
  */
 PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
-                                         int32_t task_window_size,
-                                         int32_t heap_size,
-                                         int32_t dep_list_size);
+                                         uint64_t task_window_size,
+                                         uint64_t heap_size,
+                                         uint64_t dep_list_size);
 
 /**
  * Create runtime from existing shared memory and GM heap (e.g. on device).
@@ -136,7 +136,7 @@ PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
 PTO2Runtime* pto2_runtime_create_from_sm(PTO2RuntimeMode mode,
                                           PTO2SharedMemoryHandle* sm_handle,
                                           void* gm_heap,
-                                          int32_t heap_size);
+                                          uint64_t heap_size);
 
 /**
  * Destroy runtime and free all resources
@@ -285,9 +285,9 @@ struct PTO2OrchestrationBeginInfo {
     uint64_t*   args;
     int         arg_count;
     int         expected_arg_count;
-    int32_t     task_window_size;
-    int32_t     dep_list_pool_size;
-    int32_t     heap_size;
+    uint64_t      task_window_size;
+    uint64_t      dep_list_pool_size;
+    uint64_t      heap_size;
     void*       gm_heap_ptr = nullptr;
 };
 
@@ -319,7 +319,7 @@ public:
         }
         header_ = static_cast<PTO2SharedMemoryHeader*>(begin_info.sm_ptr);
 
-        int32_t sm_size = pto2_sm_calculate_size(begin_info.task_window_size,
+        uint64_t sm_size = pto2_sm_calculate_size(begin_info.task_window_size,
                                                   begin_info.dep_list_pool_size);
         PTO2SharedMemoryHandle* sm_handle =
             pto2_sm_create_from_buffer(begin_info.sm_ptr, sm_size,
@@ -329,13 +329,13 @@ public:
         if (!sm_handle) return;
 
         void*   gm_heap      = begin_info.gm_heap_ptr;
-        int32_t gm_heap_size = begin_info.heap_size;
+        uint64_t gm_heap_size = begin_info.heap_size;
         if (begin_info.arg_count >= 2) {
             uint64_t heap_arg  = begin_info.args[begin_info.arg_count - 2];
             uint64_t size_arg  = begin_info.args[begin_info.arg_count - 1];
             if (heap_arg != 0 && size_arg != 0) {
                 gm_heap      = reinterpret_cast<void*>(static_cast<uintptr_t>(heap_arg));
-                gm_heap_size = static_cast<int32_t>(size_arg & 0x7FFFFFFF);
+                gm_heap_size = size_arg;
             }
         }
 

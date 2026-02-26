@@ -41,12 +41,12 @@
  */
 struct PTO2HeapRing {
     void*    base;        // GM_Heap_Base pointer
-    int32_t  size;        // GM_Heap_Size (total heap size in bytes)
-    int32_t  top;         // Allocation pointer (local copy)
-    
+    uint64_t size;        // GM_Heap_Size (total heap size in bytes)
+    uint64_t top;         // Allocation pointer (local copy)
+
     // Reference to shared memory tail (for back-pressure)
-    volatile int32_t* tail_ptr;  // Points to header->heap_tail
-    
+    volatile uint64_t* tail_ptr;  // Points to header->heap_tail
+
 };
 
 /**
@@ -57,35 +57,35 @@ struct PTO2HeapRing {
  * @param size      Total heap size in bytes
  * @param tail_ptr  Pointer to shared memory heap_tail
  */
-void pto2_heap_ring_init(PTO2HeapRing* ring, void* base, int32_t size,
-                          volatile int32_t* tail_ptr);
+void pto2_heap_ring_init(PTO2HeapRing* ring, void* base, uint64_t size,
+                          volatile uint64_t* tail_ptr);
 
 /**
  * Allocate memory from heap ring
- * 
+ *
  * O(1) bump allocation with wrap-around.
  * May STALL (spin-wait) if insufficient space (back-pressure).
  * Never splits a buffer across the wrap-around boundary.
- * 
+ *
  * @param ring  Heap ring
  * @param size  Requested size in bytes
  * @return Pointer to allocated memory, never NULL (stalls instead)
  */
-void* pto2_heap_ring_alloc(PTO2HeapRing* ring, int32_t size);
+void* pto2_heap_ring_alloc(PTO2HeapRing* ring, uint64_t size);
 
 /**
  * Try to allocate memory without stalling
- * 
+ *
  * @param ring  Heap ring
  * @param size  Requested size in bytes
  * @return Pointer to allocated memory, or NULL if no space
  */
-void* pto2_heap_ring_try_alloc(PTO2HeapRing* ring, int32_t size);
+void* pto2_heap_ring_try_alloc(PTO2HeapRing* ring, uint64_t size);
 
 /**
  * Get available space in heap ring
  */
-int32_t pto2_heap_ring_available(PTO2HeapRing* ring);
+uint64_t pto2_heap_ring_available(PTO2HeapRing* ring);
 
 /**
  * Reset heap ring to initial state

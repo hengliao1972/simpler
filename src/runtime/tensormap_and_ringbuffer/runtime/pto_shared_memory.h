@@ -41,36 +41,37 @@ extern "C" {
  */
 typedef struct {
     // === FLOW CONTROL POINTERS ===
-    
+
     // Written by Orchestrator, Read by Scheduler
+    volatile uint64_t heap_top;           // Heap ring allocation pointer
     volatile int32_t current_task_index;  // Task ring head (next to allocate)
-    volatile int32_t heap_top;            // Heap ring allocation pointer
     volatile int32_t orchestrator_done;   // Flag: orchestration complete
     
     // Written by Scheduler, Read by Orchestrator (for back-pressure)
+    volatile uint64_t heap_tail;          // Heap ring free pointer (on-device, matches pto2_heap_ring_init)
     volatile int32_t last_task_alive;     // Task ring tail (oldest active task)
-    volatile int32_t heap_tail;           // Heap ring free pointer
-    
+    volatile int32_t _reserved;           // Explicit padding for 8-byte alignment
+
     // === LAYOUT INFO (set once at init) ===
-    int32_t task_window_size;             // PTO2_TASK_WINDOW_SIZE
-    int32_t heap_size;                    // Total heap size
-    int32_t dep_list_pool_size;           // Dependency list pool size
-    
+    uint64_t task_window_size;            // PTO2_TASK_WINDOW_SIZE
+    uint64_t heap_size;                   // Total heap size
+    uint64_t dep_list_pool_size;          // Dependency list pool size
+
     // Offsets into shared memory (relative to SM_Base)
-    int32_t task_descriptors_offset;      // Offset to TaskDescriptor array
-    int32_t dep_list_pool_offset;         // Offset to DepListPool
-    
+    uint64_t task_descriptors_offset;     // Offset to TaskDescriptor array
+    uint64_t dep_list_pool_offset;        // Offset to DepListPool
+
     // Total shared memory size (for validation)
-    int32_t total_size;
-    
+    uint64_t total_size;
+
     // Graph output for copy-back (set by orchestrator when using packed buffer)
     // Host finalize copies from this address instead of dev_ptr when non-zero
     volatile uint64_t graph_output_ptr;   // Address where final output was written (packed buffer)
-    volatile int32_t  graph_output_size;  // Size in bytes
-    
-    // Padding to cache line
-    int32_t _padding[2];
-    
+    volatile uint64_t graph_output_size;  // Size in bytes
+
+    // Padding to 128-byte cache line
+    uint64_t _padding[4];
+
 } PTO2SharedMemoryHeader;
 
 // =============================================================================
@@ -83,8 +84,8 @@ typedef struct {
  */
 typedef struct {
     void*   sm_base;              // Base address of shared memory
-    int32_t sm_size;              // Total size of shared memory
-    
+    uint64_t sm_size;             // Total size of shared memory
+
     // Quick pointers into shared memory regions
     PTO2SharedMemoryHeader* header;
     PTO2TaskDescriptor*     task_descriptors;
@@ -106,7 +107,7 @@ typedef struct {
  * @param dep_list_pool_size Number of dependency list entries
  * @return Total bytes required
  */
-int32_t pto2_sm_calculate_size(int32_t task_window_size, int32_t dep_list_pool_size);
+uint64_t pto2_sm_calculate_size(uint64_t task_window_size, uint64_t dep_list_pool_size);
 
 /**
  * Create shared memory for Orchestrator and Scheduler
@@ -119,9 +120,9 @@ int32_t pto2_sm_calculate_size(int32_t task_window_size, int32_t dep_list_pool_s
  * @param dep_list_pool_size Number of dependency list entries
  * @return Handle with both views, or NULL on failure
  */
-PTO2SharedMemoryHandle* pto2_sm_create(int32_t task_window_size,
-                                        int32_t heap_size,
-                                        int32_t dep_list_pool_size);
+PTO2SharedMemoryHandle* pto2_sm_create(uint64_t task_window_size,
+                                        uint64_t heap_size,
+                                        uint64_t dep_list_pool_size);
 
 /**
  * Create shared memory with default sizes
@@ -140,10 +141,10 @@ PTO2SharedMemoryHandle* pto2_sm_create_default(void);
  * @return Handle, or NULL on failure
  */
 PTO2SharedMemoryHandle* pto2_sm_create_from_buffer(void* sm_base,
-                                                    int32_t sm_size,
-                                                    int32_t task_window_size,
-                                                    int32_t heap_size,
-                                                    int32_t dep_list_pool_size);
+                                                    uint64_t sm_size,
+                                                    uint64_t task_window_size,
+                                                    uint64_t heap_size,
+                                                    uint64_t dep_list_pool_size);
 
 /**
  * Destroy shared memory and free resources
@@ -155,9 +156,9 @@ void pto2_sm_destroy(PTO2SharedMemoryHandle* handle);
  * Called after memory is allocated
  */
 void pto2_sm_init_header(PTO2SharedMemoryHandle* handle,
-                          int32_t task_window_size,
-                          int32_t heap_size,
-                          int32_t dep_list_pool_size);
+                          uint64_t task_window_size,
+                          uint64_t heap_size,
+                          uint64_t dep_list_pool_size);
 
 /**
  * Reset shared memory to initial state (for reuse)
@@ -169,9 +170,9 @@ void pto2_sm_reset(PTO2SharedMemoryHandle* handle);
  * Get task descriptor by task ID
  * Uses runtime window_size for ring buffer indexing (not compile-time constant)
  */
-static inline PTO2TaskDescriptor* pto2_sm_get_task(PTO2SharedMemoryHandle* handle, 
+static inline PTO2TaskDescriptor* pto2_sm_get_task(PTO2SharedMemoryHandle* handle,
                                                     int32_t task_id) {
-    int32_t window_mask = handle->header->task_window_size - 1;
+    uint64_t window_mask = handle->header->task_window_size - 1;
     return &handle->task_descriptors[task_id & window_mask];
 }
 

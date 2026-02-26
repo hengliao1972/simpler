@@ -7,6 +7,7 @@
  */
 
 #include "pto_scheduler.h"
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -30,17 +31,17 @@ const char* pto2_task_state_name(PTO2TaskState state) {
 // Ready Queue Implementation
 // =============================================================================
 
-bool pto2_ready_queue_init(PTO2ReadyQueue* queue, int32_t capacity) {
+bool pto2_ready_queue_init(PTO2ReadyQueue* queue, uint64_t capacity) {
     queue->task_ids = (int32_t*)malloc(capacity * sizeof(int32_t));
     if (!queue->task_ids) {
         return false;
     }
-    
+
     queue->head = 0;
     queue->tail = 0;
     queue->capacity = capacity;
     queue->count = 0;
-    
+
     return true;
 }
 
@@ -94,7 +95,7 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
     sched->dep_pool = dep_pool;
     
     // Get runtime task_window_size from shared memory header
-    int32_t window_size = sm_handle->header->task_window_size;
+    uint64_t window_size = sm_handle->header->task_window_size;
     sched->task_window_size = window_size;
     sched->task_window_mask = window_size - 1;  // For fast modulo (window_size must be power of 2)
     
@@ -162,7 +163,7 @@ void pto2_scheduler_destroy(PTO2SchedulerState* sched) {
 void pto2_scheduler_reset(PTO2SchedulerState* sched) {
     sched->last_task_alive = 0;
     sched->heap_tail = 0;
-    
+
     memset(sched->task_state, 0, PTO2_TASK_WINDOW_SIZE * sizeof(PTO2TaskState));
     memset(sched->fanin_refcount, 0, PTO2_TASK_WINDOW_SIZE * sizeof(int32_t));
     memset(sched->fanout_refcount, 0, PTO2_TASK_WINDOW_SIZE * sizeof(int32_t));
@@ -403,7 +404,7 @@ bool pto2_scheduler_is_done(PTO2SchedulerState* sched) {
 void pto2_scheduler_print_stats(PTO2SchedulerState* sched) {
     printf("=== Scheduler Statistics ===\n");
     printf("last_task_alive:   %d\n", sched->last_task_alive);
-    printf("heap_tail:         %d\n", sched->heap_tail);
+    printf("heap_tail:         %" PRIu64 "\n", sched->heap_tail);
     printf("tasks_completed:   %lld\n", (long long)sched->tasks_completed);
     printf("tasks_consumed:    %lld\n", (long long)sched->tasks_consumed);
     printf("============================\n");
@@ -415,7 +416,7 @@ void pto2_scheduler_print_queues(PTO2SchedulerState* sched) {
     const char* worker_names[] = {"CUBE", "VECTOR", "AI_CPU", "ACCELERATOR"};
     
     for (int i = 0; i < PTO2_NUM_WORKER_TYPES; i++) {
-        printf("  %s: count=%d\n", worker_names[i], 
+        printf("  %s: count=%" PRIu64 "\n", worker_names[i],
                pto2_ready_queue_count(&sched->ready_queues[i]));
     }
     

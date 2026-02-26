@@ -59,9 +59,9 @@ PTO2Runtime* pto2_runtime_create(PTO2RuntimeMode mode) {
 }
 
 PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
-                                         int32_t task_window_size,
-                                         int32_t heap_size,
-                                         int32_t dep_list_size) {
+                                         uint64_t task_window_size,
+                                         uint64_t heap_size,
+                                         uint64_t dep_list_size) {
     // Allocate runtime context
     PTO2Runtime* rt = (PTO2Runtime*)calloc(1, sizeof(PTO2Runtime));
     if (!rt) {
@@ -122,7 +122,7 @@ PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
 PTO2Runtime* pto2_runtime_create_from_sm(PTO2RuntimeMode mode,
                                           PTO2SharedMemoryHandle* sm_handle,
                                           void* gm_heap,
-                                          int32_t heap_size) {
+                                          uint64_t heap_size) {
     if (!sm_handle) return NULL;
 
     PTO2Runtime* rt = (PTO2Runtime*)calloc(1, sizeof(PTO2Runtime));

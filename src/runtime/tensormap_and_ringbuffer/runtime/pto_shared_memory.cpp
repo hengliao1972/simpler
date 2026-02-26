@@ -8,6 +8,7 @@
  */
 
 #include "pto_shared_memory.h"
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -16,8 +17,8 @@
 // Size Calculation
 // =============================================================================
 
-int32_t pto2_sm_calculate_size(int32_t task_window_size, int32_t dep_list_pool_size) {
-    int32_t size = 0;
+uint64_t pto2_sm_calculate_size(uint64_t task_window_size, uint64_t dep_list_pool_size) {
+    uint64_t size = 0;
     
     // Header (aligned to cache line)
     size += PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
@@ -35,9 +36,9 @@ int32_t pto2_sm_calculate_size(int32_t task_window_size, int32_t dep_list_pool_s
 // Creation and Destruction
 // =============================================================================
 
-PTO2SharedMemoryHandle* pto2_sm_create(int32_t task_window_size,
-                                        int32_t heap_size,
-                                        int32_t dep_list_pool_size) {
+PTO2SharedMemoryHandle* pto2_sm_create(uint64_t task_window_size,
+                                        uint64_t heap_size,
+                                        uint64_t dep_list_pool_size) {
     // Allocate handle
     PTO2SharedMemoryHandle* handle = (PTO2SharedMemoryHandle*)calloc(1, sizeof(PTO2SharedMemoryHandle));
     if (!handle) {
@@ -45,16 +46,16 @@ PTO2SharedMemoryHandle* pto2_sm_create(int32_t task_window_size,
     }
     
     // Calculate total size
-    int32_t sm_size = pto2_sm_calculate_size(task_window_size, dep_list_pool_size);
+    uint64_t sm_size = pto2_sm_calculate_size(task_window_size, dep_list_pool_size);
     
     // Allocate shared memory (aligned for DMA efficiency)
     #if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
-        if (posix_memalign(&handle->sm_base, PTO2_ALIGN_SIZE, sm_size) != 0) {
+        if (posix_memalign(&handle->sm_base, PTO2_ALIGN_SIZE, static_cast<size_t>(sm_size)) != 0) {
             free(handle);
             return NULL;
         }
     #else
-        handle->sm_base = aligned_alloc(PTO2_ALIGN_SIZE, sm_size);
+        handle->sm_base = aligned_alloc(PTO2_ALIGN_SIZE, static_cast<size_t>(sm_size));
         if (!handle->sm_base) {
             free(handle);
             return NULL;
@@ -65,7 +66,7 @@ PTO2SharedMemoryHandle* pto2_sm_create(int32_t task_window_size,
     handle->is_owner = true;
     
     // Initialize to zero
-    memset(handle->sm_base, 0, sm_size);
+    memset(handle->sm_base, 0, static_cast<size_t>(sm_size));
     
     // Set up pointers
     char* ptr = (char*)handle->sm_base;
@@ -94,13 +95,13 @@ PTO2SharedMemoryHandle* pto2_sm_create_default(void) {
 }
 
 PTO2SharedMemoryHandle* pto2_sm_create_from_buffer(void* sm_base,
-                                                    int32_t sm_size,
-                                                    int32_t task_window_size,
-                                                    int32_t heap_size,
-                                                    int32_t dep_list_pool_size) {
-    if (!sm_base || sm_size <= 0) return NULL;
+                                                    uint64_t sm_size,
+                                                    uint64_t task_window_size,
+                                                    uint64_t heap_size,
+                                                    uint64_t dep_list_pool_size) {
+    if (!sm_base || sm_size == 0) return NULL;
 
-    int32_t required = pto2_sm_calculate_size(task_window_size, dep_list_pool_size);
+    uint64_t required = pto2_sm_calculate_size(task_window_size, dep_list_pool_size);
     if (sm_size < required) return NULL;
 
     PTO2SharedMemoryHandle* handle = (PTO2SharedMemoryHandle*)calloc(1, sizeof(PTO2SharedMemoryHandle));
@@ -136,9 +137,9 @@ void pto2_sm_destroy(PTO2SharedMemoryHandle* handle) {
 // =============================================================================
 
 void pto2_sm_init_header(PTO2SharedMemoryHandle* handle,
-                          int32_t task_window_size,
-                          int32_t heap_size,
-                          int32_t dep_list_pool_size) {
+                          uint64_t task_window_size,
+                          uint64_t heap_size,
+                          uint64_t dep_list_pool_size) {
     PTO2SharedMemoryHeader* header = handle->header;
     
     // Flow control pointers (start at 0)
@@ -147,14 +148,14 @@ void pto2_sm_init_header(PTO2SharedMemoryHandle* handle,
     header->orchestrator_done = 0;
     header->last_task_alive = 0;
     header->heap_tail = 0;
-    
+
     // Layout info
     header->task_window_size = task_window_size;
     header->heap_size = heap_size;
     header->dep_list_pool_size = dep_list_pool_size;
     
     // Calculate offsets
-    int32_t offset = PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
+    uint64_t offset = PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
     header->task_descriptors_offset = offset;
     
     offset += PTO2_ALIGN_UP(task_window_size * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
@@ -173,7 +174,7 @@ void pto2_sm_reset(PTO2SharedMemoryHandle* handle) {
     if (!handle) return;
     
     PTO2SharedMemoryHeader* header = handle->header;
-    
+
     // Reset flow control pointers
     header->current_task_index = 0;
     header->heap_top = 0;
@@ -203,22 +204,22 @@ void pto2_sm_print_layout(PTO2SharedMemoryHandle* handle) {
     
     printf("=== PTO2 Shared Memory Layout ===\n");
     printf("Base address:       %p\n", handle->sm_base);
-    printf("Total size:         %d bytes\n", h->total_size);
+    printf("Total size:         %" PRIu64 " bytes\n", h->total_size);
     printf("\n");
-    printf("Task window size:   %d\n", h->task_window_size);
-    printf("Heap size:          %d bytes\n", h->heap_size);
-    printf("DepList pool size:  %d entries\n", h->dep_list_pool_size);
+    printf("Task window size:   %" PRIu64 "\n", h->task_window_size);
+    printf("Heap size:          %" PRIu64 " bytes\n", h->heap_size);
+    printf("DepList pool size:  %" PRIu64 " entries\n", h->dep_list_pool_size);
     printf("\n");
     printf("Offsets:\n");
-    printf("  TaskDescriptors:  %d (0x%x)\n", h->task_descriptors_offset, h->task_descriptors_offset);
-    printf("  DepListPool:      %d (0x%x)\n", h->dep_list_pool_offset, h->dep_list_pool_offset);
+    printf("  TaskDescriptors:  %" PRIu64 " (0x%" PRIx64 ")\n", h->task_descriptors_offset, h->task_descriptors_offset);
+    printf("  DepListPool:      %" PRIu64 " (0x%" PRIx64 ")\n", h->dep_list_pool_offset, h->dep_list_pool_offset);
     printf("\n");
     printf("Flow control:\n");
+    printf("  heap_top:           %" PRIu64 "\n", h->heap_top);
+    printf("  heap_tail:          %" PRIu64 "\n", h->heap_tail);
     printf("  current_task_index: %d\n", h->current_task_index);
-    printf("  last_task_alive:    %d\n", h->last_task_alive);
-    printf("  heap_top:           %d\n", h->heap_top);
-    printf("  heap_tail:          %d\n", h->heap_tail);
     printf("  orchestrator_done:  %d\n", h->orchestrator_done);
+    printf("  last_task_alive:    %d\n", h->last_task_alive);
     printf("================================\n");
 }
 
@@ -240,8 +241,8 @@ bool pto2_sm_validate(PTO2SharedMemoryHandle* handle) {
     // Check flow control pointer sanity
     if (h->current_task_index < 0) return false;
     if (h->last_task_alive < 0) return false;
-    if (h->heap_top < 0 || h->heap_top > h->heap_size) return false;
-    if (h->heap_tail < 0 || h->heap_tail > h->heap_size) return false;
+    if (h->heap_top > h->heap_size) return false;
+    if (h->heap_tail > h->heap_size) return false;
     
     return true;
 }
