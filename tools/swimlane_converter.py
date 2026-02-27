@@ -105,8 +105,8 @@ def load_kernel_config(config_path):
 def parse_sched_cpu_from_device_log(log_path, task_count):
     """Parse device log for PTO2 scheduler stats and return scheduler CPU time per task (us).
 
-    Looks for lines like: "Thread N: PTO2 scheduler stats: ... total=32522.740us"
-    Sums the 'total' values (one per scheduler thread, typically 3) and divides by task_count.
+    Looks for lines like: "Thread N: completed=X tasks in Yus (Z loops, W tasks/loop)"
+    Sums the 'total_us' values (one per scheduler thread, typically 3) and divides by task_count.
 
     Returns:
         float: scheduler_us_per_task, or None if parsing failed / file missing
@@ -115,13 +115,13 @@ def parse_sched_cpu_from_device_log(log_path, task_count):
     path = Path(log_path)
     if not path.exists() or task_count <= 0:
         return None
-    pattern = re.compile(r'total=([\d.]+)us')
+    pattern = re.compile(r'Thread \d+: completed=\d+ tasks in ([\d.]+)us')
     totals = []
     try:
         with open(path, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
                 m = pattern.search(line)
-                if m and 'PTO2 scheduler stats' in line:
+                if m:
                     totals.append(float(m.group(1)))
     except Exception:
         return None
