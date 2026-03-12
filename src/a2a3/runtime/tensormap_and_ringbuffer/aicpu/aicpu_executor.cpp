@@ -4,15 +4,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
-#include <string>
-#include <thread>
 
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <unistd.h>
 #ifdef __linux__
-#include <sched.h>
 #include <sys/mman.h>
 #endif
 
@@ -668,7 +664,7 @@ void AicpuExecutor::assign_cores_to_threads() {
  * Writes into new_core_assignments_ / new_core_count_per_thread_.
  */
 void AicpuExecutor::reassign_cores_for_all_threads() {
-    DEV_INFO("Reassigning cores (cluster-aligned) for all %d threads: %d AIC, %d AIV",
+    DEV_INFO("Reassigning cores (cluster-aligned) for %d threads: %d AIC, %d AIV",
              thread_num_, aic_count_, aiv_count_);
 
     // Collect running/idle state from all threads before reassignment
@@ -1500,7 +1496,7 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
 
     DEV_ALWAYS("Thread %d: Start", thread_idx);
 
-    // Orchestrator threads: thread_idx >= sched_thread_num_
+    // Orchestrator check
     if (thread_idx >= sched_thread_num_) {
         int32_t orch_idx = thread_idx - sched_thread_num_;
         if (runtime->get_orch_built_on_host()) {
