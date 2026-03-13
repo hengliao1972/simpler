@@ -150,25 +150,6 @@ void pto2_sm_init_header(PTO2SharedMemoryHandle* handle,
                           uint64_t task_window_size,
                           uint64_t heap_size);
 
-/**
- * Get task descriptor by task ID
- * Uses runtime window_size for ring buffer indexing (not compile-time constant)
- */
-static inline PTO2TaskDescriptor* pto2_sm_get_task(PTO2SharedMemoryHandle* handle,
-                                                    int32_t task_id) {
-    uint64_t window_mask = handle->header->task_window_size - 1;
-    return &handle->task_descriptors[task_id & window_mask];
-}
-
-/**
- * Get task descriptor by task slot
- * Uses runtime window_size for ring buffer indexing (not compile-time constant)
- */
-static inline PTO2TaskDescriptor& pto2_sm_get_task_by_slot(PTO2SharedMemoryHandle* handle,
-                                                    int32_t slot) {
-    return handle->task_descriptors[slot];
-}
-
 // =============================================================================
 // Debug Utilities
 // =============================================================================

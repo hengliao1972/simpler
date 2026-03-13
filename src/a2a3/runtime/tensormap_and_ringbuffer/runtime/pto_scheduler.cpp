@@ -85,7 +85,7 @@ bool pto2_ready_queue_init(PTO2ReadyQueue* queue, uint64_t capacity) {
 
     for (uint64_t i = 0; i < capacity; i++) {
         queue->slots[i].sequence.store((int64_t)i, std::memory_order_relaxed);
-        queue->slots[i].task_id = -1;
+        queue->slots[i].slot_state = nullptr;
     }
 
     return true;
@@ -115,18 +115,14 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
 #endif
     sched->ring_advance_lock.store(0, std::memory_order_relaxed);
 
-    // Get runtime task_window_size from shared memory header
-    uint64_t window_size = sm_handle->header->task_window_size;
-    sched->task_window_size = window_size;
-    sched->task_window_mask = window_size - 1;  // For fast modulo (window_size must be power of 2)
-
     // Initialize local copies of ring pointers
+    sched->task_window_mask = sm_handle->header->task_window_size - 1;
     sched->last_task_alive = 0;
     sched->last_heap_consumed = 0;
     sched->heap_tail = 0;
 
     // Allocate per-task slot state array (dynamically sized based on runtime window_size)
-    sched->slot_states = new (std::nothrow) PTO2TaskSlotState[window_size];
+    sched->slot_states = new (std::nothrow) PTO2TaskSlotState[sm_handle->header->task_window_size];
     if (!sched->slot_states) {
         return false;
     }
@@ -135,7 +131,7 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
     // new[] default-initializes std::atomic<T> which leaves values indeterminate.
     // Scheduler logic (e.g. fanin_refcount fetch_add in release_fanin_and_check_ready)
     // assumes slots start at zero before init_task writes them.
-    for (uint64_t i = 0; i < window_size; i++) {
+    for (uint64_t i = 0; i < sm_handle->header->task_window_size; i++) {
         sched->slot_states[i].fanout_lock.store(0, std::memory_order_relaxed);
         sched->slot_states[i].fanout_count = 0;
         sched->slot_states[i].fanout_head = nullptr;

@@ -192,7 +192,7 @@ void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
         PTO2DepListEntry* cur = ss.fanout_head;
 
         while (cur != nullptr && record->fanout_count < RUNTIME_MAX_FANOUT) {
-            record->fanout[record->fanout_count++] = cur->task_id;
+            record->fanout[record->fanout_count++] = cur->slot_state->task->mixed_task_id;
             cur = cur->next;
         }
     }

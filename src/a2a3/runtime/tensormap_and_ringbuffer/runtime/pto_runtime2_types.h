@@ -262,9 +262,10 @@ typedef struct {
  *
  * Used for both fanin_list and fanout_list
  */
+struct PTO2TaskSlotState;  // Forward declaration
 struct PTO2DepListEntry {
-    int32_t task_id;          // The dependent/dependency task ID
-    PTO2DepListEntry* next;      // next entry
+    PTO2TaskSlotState* slot_state;    // Consumer slot state (direct pointer)
+    PTO2DepListEntry* next;           // next entry
 };
 
 // =============================================================================
@@ -287,12 +288,6 @@ struct PTO2TaskDescriptor {
     // Per-slot kernel IDs (INVALID_KERNEL_ID = inactive)
     int32_t kernel_id[PTO2_SUBTASK_SLOT_COUNT];
 
-    // Active subtask mask: bit0=AIC, bit1=AIV0, bit2=AIV1
-    uint8_t active_mask;
-
-    // Completion aggregation: each subtask sets its done bit atomically
-    std::atomic<uint8_t> subtask_done_mask;
-
     // Packed output buffer (all outputs packed into single contiguous buffer)
     void*    packed_buffer_base;  // Start of packed buffer in GM Heap
     void*    packed_buffer_end;   // End of packed buffer (for heap reclamation)
@@ -301,6 +296,23 @@ struct PTO2TaskDescriptor {
 // =============================================================================
 // Per-Slot Scheduling State
 // =============================================================================
+
+/**
+ * Task payload data (cold path - only accessed during orchestration and dispatch)
+ *
+ * Separated from PTO2TaskDescriptor to keep the descriptor cache-friendly
+ * for the scheduler's hot completion path (~80 bytes vs ~2912 bytes).
+ */
+struct PTO2TaskPayload {
+    PTO2DispatchPayload dispatch;  // function_bin_addr + args[], built in-place at dispatch time
+    Tensor tensors[16];
+    uint64_t scalar_value[16];
+    bool is_tensor[16];
+    int param_count{0};
+    PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS]; // Producer slot states (cold path, used by on_task_release)
+    int32_t fanin_actual_count{0};             // Actual fanin count (without the +1 redundance)
+    int32_t dep_pool_mark{0};                  // Dep pool top after this task's submission (for reclamation)
+};
 
 /**
  * Per-task slot scheduling state (scheduler-private, NOT in shared memory)
@@ -329,25 +341,18 @@ struct alignas(64) PTO2TaskSlotState {
     int32_t fanin_count;                      // Number of producer dependencies (set once)
 
     // Fanout refcount (accessed with fanout_count in check_and_handle_consumed)
-    std::atomic<int32_t> fanout_refcount;    // Dynamic: counts released references
+    std::atomic<int32_t> fanout_refcount;  // Dynamic: counts released references
+
+    PTO2TaskPayload* payload;
+
+    PTO2TaskDescriptor* task;
+
+    // Hot-path completion fields (moved from TaskDescriptor to avoid cross-struct access)
+    uint8_t active_mask;                         // Bitmask of active subtask slots (set once)
+    std::atomic<uint8_t> subtask_done_mask;      // Each subtask sets its done bit on completion
 };
 
-/**
- * Task payload data (cold path - only accessed during orchestration and dispatch)
- *
- * Separated from PTO2TaskDescriptor to keep the descriptor cache-friendly
- * for the scheduler's hot completion path (~80 bytes vs ~2912 bytes).
- */
-struct PTO2TaskPayload {
-    PTO2DispatchPayload dispatch;  // function_bin_addr + args[], built in-place at dispatch time
-    Tensor tensors[16];
-    uint64_t scalar_value[16];
-    bool is_tensor[16];
-    int param_count{0};
-    int32_t fanin_tasks[PTO2_MAX_INPUTS];   // Producer task IDs (cold path, used by on_task_release)
-    int32_t fanin_actual_count{0};           // Actual fanin count (without the +1 redundance)
-    int32_t dep_pool_mark{0};                // Dep pool top after this task's submission (for reclamation)
-};
+static_assert(sizeof(PTO2TaskSlotState) == 64);
 
 // =============================================================================
 // Cycle Cost Function Type

@@ -477,12 +477,12 @@ struct PTO2DepListPool {
      * O(1) operation: allocates new entry and links to current head.
      *
      * @param current_head  Current list head offset (0 = empty list)
-     * @param task_id       Task ID to prepend
+     * @param task_slot     Task slot to prepend
      * @return New head offset
      */
-    PTO2DepListEntry* pto2_dep_list_prepend(PTO2DepListEntry* cur, int32_t task_id) {
+    PTO2DepListEntry* pto2_dep_list_prepend(PTO2DepListEntry* cur, PTO2TaskSlotState* slot_state) {
         PTO2DepListEntry& new_entry = alloc();
-        new_entry.task_id = task_id;
+        new_entry.slot_state = slot_state;
         new_entry.next = cur;
         return &new_entry;
     }
