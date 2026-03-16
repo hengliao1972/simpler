@@ -267,17 +267,17 @@ struct AicpuExecutor {
 #if PTO2_PROFILING
         ,
         bool profiling_enabled,
+        uint32_t& phase_complete_count
+#endif
+#if PTO2_SCHED_PROFILING
+        ,
         uint64_t& complete_probe_count,
         uint64_t& complete_hit_count,
-        uint32_t& phase_complete_count,
         uint64_t& notify_edges_total,
         int32_t& notify_max_degree,
         uint64_t& notify_tasks_enqueued,
         uint64_t& fanin_edges_total,
-        int32_t& fanin_max_degree
-#endif
-#if PTO2_SCHED_PROFILING
-        ,
+        int32_t& fanin_max_degree,
         uint64_t& sched_complete_perf_cycle
 #endif
     ) {
@@ -290,7 +290,7 @@ struct AicpuExecutor {
             int32_t reg_task_id = EXTRACT_TASK_ID(reg_val);
             int32_t reg_state = EXTRACT_TASK_STATE(reg_val);
             bool done = reg_task_id == task_id && reg_state == TASK_FIN_STATE;
-#if PTO2_PROFILING
+#if PTO2_SCHED_PROFILING
             if (profiling_enabled) {
                 complete_probe_count++;
                 if (done) {
@@ -314,14 +314,11 @@ struct AicpuExecutor {
                     if (cstats.fanout_edges > notify_max_degree) notify_max_degree = cstats.fanout_edges;
                     notify_tasks_enqueued += cstats.tasks_enqueued;
                     phase_complete_count++;
-#elif PTO2_PROFILING
-                    PTO2CompletionStats cstats = rt->scheduler.on_mixed_task_complete(slot_state, local_bufs);
-                    notify_edges_total += cstats.fanout_edges;
-                    if (cstats.fanout_edges > notify_max_degree) notify_max_degree = cstats.fanout_edges;
-                    notify_tasks_enqueued += cstats.tasks_enqueued;
-                    phase_complete_count++;
 #else
                     rt->scheduler.on_mixed_task_complete(slot_state, local_bufs);
+#if PTO2_PROFILING
+                    phase_complete_count++;
+#endif
 #endif
                     if (deferred_release_count < 256) {
                         deferred_release_slot_states[deferred_release_count++] = &slot_state;
@@ -336,7 +333,7 @@ struct AicpuExecutor {
                                 rt->scheduler.on_task_release(*deferred_release_slot_states[--deferred_release_count]);
 #endif
                             (void)fe;
-#if PTO2_PROFILING
+#if PTO2_SCHED_PROFILING
                             fanin_edges_total += fe;
                             if (fe > fanin_max_degree) fanin_max_degree = fe;
 #endif
@@ -442,10 +439,8 @@ struct AicpuExecutor {
     }
 
     PTO2TaskSlotState* pop_ready_task(PTO2ResourceShape shape, int32_t thread_idx
-#if PTO2_PROFILING
-        , uint64_t& pop_hit, uint64_t& pop_miss
-#endif
 #if PTO2_SCHED_PROFILING
+        , uint64_t& pop_hit, uint64_t& pop_miss
         , uint64_t& sched_dispatch_pop_cycle
 #endif
     ) {
@@ -460,11 +455,11 @@ struct AicpuExecutor {
         PTO2TaskSlotState* slot_state = rt->scheduler.get_ready_task(shape);
 #endif
         if (slot_state) {
-#if PTO2_PROFILING
+#if PTO2_SCHED_PROFILING
             pop_hit++;
 #endif
         } else {
-#if PTO2_PROFILING
+#if PTO2_SCHED_PROFILING
             pop_miss++;
 #endif
         }
@@ -916,9 +911,12 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
     uint64_t sched_complete_cycle = 0;
     uint64_t sched_dispatch_cycle = 0;
     uint64_t sched_idle_cycle = 0;
+    uint64_t sched_loop_count = 0;
+    uint32_t phase_complete_count = 0;
+    uint32_t phase_dispatch_count = 0;
+#if PTO2_SCHED_PROFILING
     uint64_t complete_probe_count = 0;
     uint64_t complete_hit_count = 0;
-    uint64_t sched_loop_count = 0;
     uint64_t notify_edges_total = 0;
     int32_t  notify_max_degree = 0;
     uint64_t notify_tasks_enqueued = 0;
@@ -926,11 +924,8 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
     int32_t  fanin_max_degree = 0;
     uint64_t pop_hit = 0;
     uint64_t pop_miss = 0;
-    uint32_t phase_complete_count = 0;
-    uint32_t phase_dispatch_count = 0;
     uint64_t local_dispatch_count = 0;
     uint64_t local_overflow_count = 0;
-#if PTO2_SCHED_PROFILING
     uint64_t sched_complete_perf_cycle = 0;
     uint64_t sched_dispatch_pop_cycle = 0;
     uint64_t sched_dispatch_setup_cycle = 0;
@@ -1009,12 +1004,12 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 deferred_release_slot_states, deferred_release_count,
                 local_bufs
 #if PTO2_PROFILING
-                , profiling_enabled, complete_probe_count, complete_hit_count, phase_complete_count,
-                notify_edges_total, notify_max_degree, notify_tasks_enqueued,
-                fanin_edges_total, fanin_max_degree
+                , profiling_enabled, phase_complete_count
 #endif
 #if PTO2_SCHED_PROFILING
-                , sched_complete_perf_cycle
+                , complete_probe_count, complete_hit_count,
+                notify_edges_total, notify_max_degree, notify_tasks_enqueued,
+                fanin_edges_total, fanin_max_degree, sched_complete_perf_cycle
 #endif
             );
         }
@@ -1028,12 +1023,12 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 deferred_release_slot_states, deferred_release_count,
                 local_bufs
 #if PTO2_PROFILING
-                , profiling_enabled, complete_probe_count, complete_hit_count, phase_complete_count,
-                notify_edges_total, notify_max_degree, notify_tasks_enqueued,
-                fanin_edges_total, fanin_max_degree
+                , profiling_enabled, phase_complete_count
 #endif
 #if PTO2_SCHED_PROFILING
-                , sched_complete_perf_cycle
+                , complete_probe_count, complete_hit_count,
+                notify_edges_total, notify_max_degree, notify_tasks_enqueued,
+                fanin_edges_total, fanin_max_degree, sched_complete_perf_cycle
 #endif
             );
         }
@@ -1115,11 +1110,11 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                         );
                     }
 #if PTO2_PROFILING
-                    pop_hit++;
                     phase_dispatch_count++;
-                    local_dispatch_count++;
 #endif
 #if PTO2_SCHED_PROFILING
+                    pop_hit++;
+                    local_dispatch_count++;
                     sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
 #endif
                     made_progress = true;
@@ -1130,7 +1125,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                         ci);
                 } else {
                     overflow_ptrs[overflow_count++] = slot_state;
-#if PTO2_PROFILING
+#if PTO2_SCHED_PROFILING
                     local_overflow_count++;
 #endif
                 }
@@ -1154,10 +1149,8 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 if (ci < 0) break;
 
                 PTO2TaskSlotState* slot_state = pop_ready_task(shape, thread_idx
-#if PTO2_PROFILING
-                    , pop_hit, pop_miss
-#endif
 #if PTO2_SCHED_PROFILING
+                    , pop_hit, pop_miss
                     , sched_dispatch_pop_cycle
 #endif
                 );
@@ -1238,7 +1231,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 int32_t fe = rt->scheduler.on_task_release(*deferred_release_slot_states[--deferred_release_count]);
 #endif
                 (void)fe;
-#if PTO2_PROFILING
+#if PTO2_SCHED_PROFILING
                 fanin_edges_total += fe;
                 if (fe > fanin_max_degree) fanin_max_degree = fe;
 #endif
@@ -1629,6 +1622,12 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                     unlink(so_path);
                     return -1;
                 }
+
+#if PTO2_PROFILING
+                for (int i = 0; i < orch_thread_num_; i++) {
+                    rt->orchestrators[i].enable_profiling = runtime->enable_profiling;
+                }
+#endif
 
                 // Wire up slot_states pointer for profiling (complete_perf_records)
                 runtime->set_pto2_slot_states_ptr(rt->scheduler.slot_states);

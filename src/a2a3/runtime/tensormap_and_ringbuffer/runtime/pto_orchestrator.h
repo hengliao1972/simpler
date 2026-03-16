@@ -65,7 +65,10 @@ struct PTO2OrchestratorState {
     // Note: In simulated mode, orchestrator and scheduler share address space
     // In real mode, they communicate via shared memory only
     PTO2SchedulerState* scheduler;  // For simulated mode only
-    bool init_task_on_submit;       // If true, call scheduler_init_task on submit
+#if PTO2_PROFILING
+    // Runtime profiling switch copied from Runtime::enable_profiling.
+    bool enable_profiling;
+#endif
 
     // === GM HEAP (for output buffers) ===
     void* gm_heap_base;    // Base address of GM heap
@@ -126,16 +129,6 @@ void pto2_orchestrator_destroy(PTO2OrchestratorState* orch);
  */
 void pto2_orchestrator_set_scheduler(PTO2OrchestratorState* orch, PTO2SchedulerState* scheduler);
 
-/**
- * Set scheduler reference with mode control
- *
- * @param orch           Orchestrator state
- * @param scheduler      Scheduler state
- * @param init_on_submit If true, init task on submit (single-threaded mode)
- *                       If false, scheduler thread polls for new tasks (multi-threaded)
- */
-void pto2_orchestrator_set_scheduler_mode(
-    PTO2OrchestratorState* orch, PTO2SchedulerState* scheduler, bool init_on_submit);
 
 // =============================================================================
 // Scope Management
@@ -229,7 +222,6 @@ struct PTO2OrchProfilingData {
     uint64_t alloc_wait_cycle;      // Cycles spent waiting in task_ring_alloc
     uint64_t heap_wait_cycle;       // Cycles spent waiting in heap_ring_alloc
     uint64_t fanin_wait_cycle;      // Cycles spent waiting in fanout_lock
-    uint64_t finalize_wait_cycle;   // Cycles spent in ready queue push CAS retries
     // Atomic operation counts per phase
     uint64_t alloc_atomic_count;
     uint64_t params_atomic_count;

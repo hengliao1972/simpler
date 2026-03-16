@@ -23,7 +23,7 @@
 // =============================================================================
 // Orchestrator Profiling (compile-time toggle)
 // =============================================================================
-#if PTO2_PROFILING
+#if PTO2_ORCH_PROFILING
 #include "aicpu/device_time.h"
 #include "aicpu/performance_collector_aicpu.h"
 // Weak fallback for builds that don't link device_time.cpp (e.g. host).
@@ -43,7 +43,7 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { retur
 // Also hidden to prevent HOST .so from polluting the global symbol table.
 __attribute__((weak, visibility("hidden"))) void perf_aicpu_record_orch_phase(
     AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint32_t) {}
-// Accumulated nanoseconds per sub-step
+// Accumulated cycles per sub-step (only needed for ORCH_PROFILING export)
 static uint64_t g_orch_sync_cycle = 0;       // tensormap sync
 static uint64_t g_orch_alloc_cycle = 0;      // task ring alloc
 static uint64_t g_orch_params_cycle = 0;     // param copy
@@ -54,7 +54,6 @@ static uint64_t g_orch_fanin_cycle = 0;      // fanin list + early-return check
 static uint64_t g_orch_scope_end_cycle = 0;  // scope_end overhead
 static int64_t  g_orch_submit_count = 0;
 static uint32_t g_orch_submit_idx = 0;
-#if PTO2_ORCH_PROFILING
 uint64_t g_orch_alloc_wait_cycle = 0;
 uint64_t g_orch_heap_wait_cycle = 0;
 uint64_t g_orch_fanin_wait_cycle = 0;
@@ -64,14 +63,6 @@ uint64_t g_orch_heap_atomic_count = 0;
 uint64_t g_orch_fanin_atomic_count = 0;
 uint64_t g_orch_finalize_atomic_count = 0;
 uint64_t g_orch_scope_end_atomic_count = 0;
-#elif PTO2_SCHED_PROFILING
-// When only PTO2_SCHED_PROFILING is enabled, shared methods still need
-// orch counters as targets for orchestrator-context calls.
-uint64_t g_orch_fanin_atomic_count = 0;
-uint64_t g_orch_fanin_wait_cycle = 0;
-uint64_t g_orch_finalize_atomic_count = 0;
-uint64_t g_orch_scope_end_atomic_count = 0;
-#endif
 #define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
 #define CYCLE_COUNT_LAP(acc) do { _t1 = get_sys_cnt_aicpu(); acc += (_t1 - _t0); _t0 = _t1; } while(0)
 #define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid)                                    \
@@ -80,6 +71,26 @@ uint64_t g_orch_scope_end_atomic_count = 0;
         acc += (_t1 - _t0);                                                           \
         perf_aicpu_record_orch_phase((phase_id), _t0, _t1, g_orch_submit_idx, (tid)); \
         _t0 = _t1;                                                                    \
+    } while (0)
+#elif PTO2_PROFILING
+#include "aicpu/device_time.h"
+#include "aicpu/performance_collector_aicpu.h"
+__attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
+__attribute__((weak, visibility("hidden"))) void perf_aicpu_record_orch_phase(
+    AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint32_t) {}
+// submit_idx needed for swimlane task_id tagging (no cycle accumulation at this level)
+static uint32_t g_orch_submit_idx = 0;
+#define CYCLE_COUNT_START()                                                           \
+    bool _prof_active = orch->enable_profiling;                                       \
+    uint64_t _t0 = _prof_active ? get_sys_cnt_aicpu() : 0, _t1 = 0
+#define CYCLE_COUNT_LAP(acc) do { } while(0)
+#define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid)                                    \
+    do {                                                                              \
+        if (_prof_active) {                                                           \
+            _t1 = get_sys_cnt_aicpu();                                                \
+            perf_aicpu_record_orch_phase((phase_id), _t0, _t1, g_orch_submit_idx, (tid)); \
+            _t0 = _t1;                                                                \
+        }                                                                             \
     } while (0)
 #else
 #define CYCLE_COUNT_START()
@@ -163,14 +174,8 @@ void pto2_orchestrator_destroy(PTO2OrchestratorState* orch) {
 
 void pto2_orchestrator_set_scheduler(PTO2OrchestratorState* orch, PTO2SchedulerState* scheduler) {
     orch->scheduler = scheduler;
-    orch->init_task_on_submit = true;  // Default: initialize task on submit
 }
 
-void pto2_orchestrator_set_scheduler_mode(
-    PTO2OrchestratorState* orch, PTO2SchedulerState* scheduler, bool init_on_submit) {
-    orch->scheduler = scheduler;
-    orch->init_task_on_submit = init_on_submit;
-}
 
 // =============================================================================
 // Dep Pool Reclamation
@@ -271,7 +276,7 @@ void pto2_scope_begin(PTO2OrchestratorState* orch) {
 void pto2_scope_end(PTO2OrchestratorState* orch) {
     assert(orch->scope_stack_top >= 0 && "Scope stack underflow");
 
-#if PTO2_PROFILING
+#if PTO2_ORCH_PROFILING
     uint64_t _se0 = get_sys_cnt_aicpu();
 #endif
 
@@ -285,7 +290,7 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
     // Rewind the task buffer — these entries are no longer needed
     orch->scope_tasks_size = begin;
 
-#if PTO2_PROFILING
+#if PTO2_ORCH_PROFILING
     uint64_t _se1 = get_sys_cnt_aicpu();
     g_orch_scope_end_cycle += (_se1 - _se0);
     // perf_aicpu_record_orch_phase(AicpuPhaseId::ORCH_SCOPE_END, _se0, _se1, g_orch_submit_idx, -1);
@@ -549,7 +554,7 @@ void pto2_submit_mixed_task(
             PTO2TaskSlotState& producer_slot_state = sched->slot_states[prod_slot];
             orch->dep_pool_cur_entry->slot_state = &cur_slot_state;
             orch->dep_pool_cur_entry->next = producer_slot_state.fanout_head;
-#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+#if PTO2_ORCH_PROFILING
             pto2_fanout_lock(producer_slot_state, g_orch_fanin_atomic_count, g_orch_fanin_wait_cycle);
 #else
             pto2_fanout_lock(producer_slot_state);
@@ -569,7 +574,7 @@ void pto2_submit_mixed_task(
                 orch->dep_pool_cur_entry = &dep_pool.alloc();
             }
         }
-        // Combined release: merge early_finished batch + init_task's +1 release
+        // Combined release: merge early_finished batch with the +1 init release
         // into a single atomic fetch_add (saves one acq_rel cache-line bounce per task).
         int32_t initial_refcount = early_finished + 1;  // +1 for the init release
         int32_t new_rc = cur_slot_state.fanin_refcount.fetch_add(initial_refcount, std::memory_order_acq_rel)
@@ -578,7 +583,7 @@ void pto2_submit_mixed_task(
             PTO2ResourceShape shape = pto2_active_mask_to_shape(active_mask);
             sched->ready_queues[static_cast<int32_t>(shape)].push(&cur_slot_state);
         }
-#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+#if PTO2_ORCH_PROFILING
         // Per producer: fetch_add(fanout_count) + load(task_state) + store(unlock) = 3 atomics
         // Lock atomics (loads + CAS) are counted inside pto2_fanout_lock
         g_orch_fanin_atomic_count += fanin_count * 3;
@@ -595,7 +600,9 @@ void pto2_submit_mixed_task(
 
 #if PTO2_PROFILING
     orch->tasks_submitted++;
+#if PTO2_ORCH_PROFILING
     g_orch_submit_count++;
+#endif
     g_orch_submit_idx++;
 #endif
 }
@@ -612,6 +619,9 @@ void pto2_orchestrator_done(PTO2OrchestratorState* orch) {
              orch->dep_pool.top - orch->dep_pool.tail,
              orch->dep_pool.high_water, orch->dep_pool.capacity);
     orch->sm_handle->header->orchestrator_done.store(1, std::memory_order_release);
+#if !PTO2_ORCH_PROFILING && PTO2_PROFILING
+    g_orch_submit_idx = 0;
+#endif
 }
 
 // =============================================================================

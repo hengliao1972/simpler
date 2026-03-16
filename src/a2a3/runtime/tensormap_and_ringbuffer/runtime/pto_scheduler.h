@@ -420,7 +420,7 @@ struct PTO2SchedulerState {
                                         PTO2LocalReadyBuffer* local_bufs = nullptr) {
         // Atomically increment fanin_refcount and check if all producers are done
         // ACQ_REL on fanin_refcount already synchronizes with the orchestrator's
-        // release in init_task, making fanin_count visible — plain load suffices.
+        // init release, making fanin_count visible — plain load suffices.
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
 
         if (new_refcount == slot_state.fanin_count) {
@@ -508,7 +508,7 @@ struct PTO2SchedulerState {
     }
 
     void on_scope_end(PTO2TaskSlotState** task_slot_states, int32_t count) {
-#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+#if PTO2_ORCH_PROFILING
         extern uint64_t g_orch_scope_end_atomic_count;
         for (int32_t i = 0; i < count; i++) {
             release_producer(*task_slot_states[i], g_orch_scope_end_atomic_count);
@@ -541,7 +541,7 @@ struct PTO2SchedulerState {
      * (i.e., on_subtask_complete returned true).
      * Handles fanout notification, fanin release, and self-consumption check.
      */
-#if PTO2_SCHED_PROFILING || PTO2_PROFILING
+#if PTO2_SCHED_PROFILING
     PTO2CompletionStats
 #else
     void
@@ -552,7 +552,7 @@ struct PTO2SchedulerState {
 #endif
 
         PTO2LocalReadyBuffer* local_bufs = nullptr) {
-#if PTO2_SCHED_PROFILING || PTO2_PROFILING
+#if PTO2_SCHED_PROFILING
         PTO2CompletionStats stats = {0, 0, 0, true};
 #endif
 #if PTO2_SCHED_PROFILING
@@ -585,18 +585,10 @@ struct PTO2SchedulerState {
 #endif
         while (current != nullptr) {
             PTO2TaskSlotState& consumer_slot = *current->slot_state;
-#if PTO2_PROFILING
-            stats.fanout_edges++;
-#endif
 #if PTO2_SCHED_PROFILING
+            stats.fanout_edges++;
             if (release_fanin_and_check_ready(consumer_slot,
                                                fanout_atomics, push_wait, local_bufs)) {
-#if PTO2_PROFILING
-                stats.tasks_enqueued++;
-#endif
-            }
-#elif PTO2_PROFILING
-            if (release_fanin_and_check_ready(consumer_slot, local_bufs)) {
                 stats.tasks_enqueued++;
             }
 #else
@@ -609,9 +601,6 @@ struct PTO2SchedulerState {
         g_sched_fanout_atomic_count[thread_idx] += fanout_atomics;
         g_sched_push_wait_cycle[thread_idx] += push_wait;
         PTO2_SCHED_CYCLE_LAP(g_sched_fanout_cycle[thread_idx]);
-#endif
-
-#if PTO2_PROFILING
         return stats;
 #endif
     }
