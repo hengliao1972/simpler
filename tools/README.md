@@ -270,11 +270,12 @@ flowchart TD
 
 ### 功能概述
 
-`benchmark_rounds.sh` 遍历 `EXAMPLES` 数组中配置的测试用例（位于 `tests/device_tests/tensormap_and_ringbuffer/` 下），依次调用 `run_example.py` 运行每个 example，然后从生成的 device log 中提取 `orch_start` / `end` 时间戳计算每轮 elapsed 时间。
+`benchmark_rounds.sh` 遍历 `EXAMPLES` 数组中配置的测试用例（位于 `tests/device_tests/tensormap_and_ringbuffer/` 下），依次调用 `run_example.py` 运行每个 example，然后从生成的 device log 中提取 `orch_start` / `orch_end` / `sched_end` 时间戳计算每轮 elapsed 时间。
 
 当前预配置的 examples：
 - `alternating_matmul_add`
 - `benchmark_bgemm`
+- `paged_attention_unroll`
 - `batch_paged_attention`
 - `paged_attention`
 
@@ -472,7 +473,7 @@ python3 tools/perf_to_mermaid.py -k ./kernels/kernel_config.py
 ### benchmark_rounds.sh 无 timing 数据
 - 确保运行时启用了 profiling（`PTO2_PROFILING` 环境变量）
 - 检查 device log 目录是否可访问
-- 确认 log 中包含 `orch_start` / `end` 时间戳行
+- 确认 log 中包含 `orch_start` / `orch_end` / `sched_end` 时间戳行（需要 `PTO2_PROFILING=1`）
 
 ### Mermaid 图在 GitHub 上不显示
 - 确保文件是 `.md` 扩展名

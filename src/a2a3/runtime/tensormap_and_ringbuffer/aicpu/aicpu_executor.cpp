@@ -294,6 +294,9 @@ struct AicpuExecutor {
         uint64_t& sched_complete_perf_cycle
 #endif
     ) {
+#if !PTO2_PROFILING
+        (void)hank;
+#endif
         for (int32_t i = ct.running_count - 1; i >= 0; i--) {
             int32_t core_id = ct.running[i];
             uint64_t reg_addr = core_id_to_reg_addr_[core_id];
@@ -504,6 +507,9 @@ struct AicpuExecutor {
         int32_t thread_idx
 #endif
     ) {
+#if !PTO2_PROFILING
+        (void)runtime;
+#endif
         PTO2DispatchPayload& payload = s_pto2_payload_per_core[core_id];
         PTO2TaskDescriptor& task = *slot_state.task;
         int32_t slot_idx = static_cast<int32_t>(subslot);
@@ -986,6 +992,11 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 
     bool cores_released = false;
 
+#if PTO2_PROFILING
+    // Benchmark: scheduler lifetime start timestamp (independent of enable_profiling)
+    DEV_ALWAYS("Thread %d: sched_start=%llu", thread_idx, (unsigned long long)get_sys_cnt_aicpu());
+#endif
+
     while (true) {
         bool made_progress = false;
 #if PTO2_PROFILING
@@ -1270,8 +1281,13 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 _t0_phase = _t1;
                 phase_dispatch_count = 0;
             }
-#endif
         }
+#endif
+
+#if !PTO2_PROFILING
+        (void)try_completed;
+        (void)try_pushed;
+#endif
 
         if (made_progress) {
             idle_iterations = 0;
@@ -1392,6 +1408,11 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
             }
             if (idle_iterations > MAX_IDLE_ITERATIONS) {
                 DEV_ERROR("Thread %d: PTO2 timeout after %d idle iterations", thread_idx, idle_iterations);
+#if PTO2_PROFILING
+                // Benchmark: scheduler lifetime end timestamp on timeout path
+                DEV_ALWAYS("Thread %d: sched_end(timeout)=%llu",
+                           thread_idx, (unsigned long long)get_sys_cnt_aicpu());
+#endif
                 return -1;
             } else {
                 SPIN_WAIT_HINT();
@@ -1543,8 +1564,8 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 
 int32_t AicpuExecutor::run(Runtime* runtime) {
     int32_t thread_idx = thread_idx_++;
+    DEV_INFO("Thread %d: Start", thread_idx);
 
-    DEV_ALWAYS("Thread %d: Start", thread_idx);
 
     // Orchestrator check
     if (thread_idx >= sched_thread_num_) {
@@ -1750,17 +1771,17 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
             }
 #endif
 
-            // Call orchestration function wrapped in an outer scope
-            DEV_ALWAYS("Thread %d: Calling aicpu_orchestration_entry from SO (orch_idx=%d/(0~%d))",
-                       thread_idx, orch_idx, orch_thread_num_ - 1);
 #if PTO2_PROFILING
-            DEV_ALWAYS("Thread=%d orch_start=%llu", thread_idx, (unsigned long long)get_sys_cnt_aicpu());
             uint64_t orch_cycle_start = get_sys_cnt_aicpu();
+            DEV_ALWAYS("Thread %d: orch_start=%llu orch_idx=%d/(0~%d)", thread_idx, (unsigned long long)orch_cycle_start, orch_idx, orch_thread_num_ - 1);
 #endif
             PTO2_SCOPE(rt) { orch_func_(rt, orch_args_cached_, orch_arg_count_cached_, orch_thread_num_, orch_idx); }
 #if PTO2_PROFILING
             uint64_t orch_cycle_end = get_sys_cnt_aicpu();
-            DEV_ALWAYS("Thread %d: aicpu_orchestration_entry returned, cost %.3fus (orch_idx=%d)",
+            // Function-level timing: measures only orch_func_ execution time.
+            // This differs from `orch_end`, which marks stage-level end right before
+            // requesting core transition (includes additional post-orchestration work).
+            DEV_ALWAYS("Thread %d: aicpu_orchestration_entry returned, orch_func_cost=%.3fus (orch_idx=%d)",
                 thread_idx, cycles_to_us(orch_cycle_end - orch_cycle_start), orch_idx);
 #endif
 
@@ -1911,8 +1932,9 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                     // Compute new core assignments for all threads and initialize donated slots
                     DEV_INFO("Thread %d: Set orchestrator_done=true, requesting core transition", thread_idx);
 #if PTO2_PROFILING
-                    // Benchmark: record orchestrator end timestamp before waiting for schedulers
-                    DEV_ALWAYS("BENCHMARK: thread=%d end=%llu", thread_idx, (unsigned long long)get_sys_cnt_aicpu());
+                    // Stage-level end: orchestrator phase finishes before requesting transition.
+                    DEV_ALWAYS("Thread %d: orch_stage_end=%llu, requesting core transition", thread_idx,
+                               (unsigned long long)get_sys_cnt_aicpu());
 #endif
                     transition_requested_.store(true, std::memory_order_release);
 
@@ -1954,13 +1976,15 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                 }
             }
         }
+#if PTO2_PROFILING
+        DEV_ALWAYS("Thread %d: orch_end=%llu", thread_idx, (unsigned long long)get_sys_cnt_aicpu());
+#endif
         DEV_INFO("Thread %d: Orchestrator completed (orch_idx=%d)", thread_idx, orch_idx);
     }
 
     // Scheduler thread (orchestrator threads skip dispatch when orch_to_sched_ is false)
     if (!completed_.load(std::memory_order_acquire) &&
         (thread_idx < sched_thread_num_ || orch_to_sched_)) {
-        DEV_ALWAYS("Thread %d: Starting PTO2 dispatch", thread_idx);
         // Device orchestration: wait for primary orchestrator to initialize SM header
         if (!runtime->get_orch_built_on_host()) {
             while (!runtime_init_ready_.load(std::memory_order_acquire)) {
@@ -1978,14 +2002,11 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
     {
         const int32_t* shutdown_cores = core_assignments_[thread_idx];
         int32_t shutdown_count = core_count_per_thread_[thread_idx];
+        if (shutdown_count > 0) {
 #if PTO2_PROFILING
-        // Benchmark: record scheduler end timestamp before shutdown cleanup
-        if (shutdown_count > 0) {
-            DEV_ALWAYS("Thread=%d end=%llu",
+            DEV_ALWAYS("Thread %d: sched_end=%llu",
                        thread_idx, (unsigned long long)get_sys_cnt_aicpu());
-        }
 #endif
-        if (shutdown_count > 0) {
             auto rc = shutdown_aicore(runtime, thread_idx, shutdown_cores, shutdown_count);
             if (rc != 0) {
                 return rc;
@@ -2005,7 +2026,6 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
             dlclose(orch_so_handle_);
             unlink(orch_so_path_);
         }
-        DEV_ALWAYS("Thread %d: Last thread, marking executor finished", thread_idx);
     }
 
     return 0;

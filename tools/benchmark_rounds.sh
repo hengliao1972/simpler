@@ -120,7 +120,7 @@ parse_timing() {
     local log_file="$1"
 
     local timing
-    timing=$(grep -E 'Thread=[0-9]+ (orch_start|end)=' "$log_file" || true)
+    timing=$(grep -E 'Thread [0-9]+: (orch_start|orch_end|sched_end|orch_stage_end)=' "$log_file" || true)
 
     if [[ -z "$timing" ]]; then
         echo "  (no benchmark timing data — was PTO2_PROFILING enabled?)"
@@ -136,7 +136,7 @@ parse_timing() {
     }
     BEGIN { round = 0; min_start = 0; max_end = 0; count = 0 }
     /orch_start=/ {
-        match($0, /Thread=([0-9]+)/, tm)
+        match($0, /Thread ([0-9]+):/, tm)
         tid = tm[1] + 0
         if (tid in seen) {
             flush_round()
