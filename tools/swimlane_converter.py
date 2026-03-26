@@ -31,6 +31,21 @@ except ImportError:
     from tools.sched_overhead_analysis import parse_scheduler_threads, run_analysis as run_sched_overhead_analysis
 
 
+def normalize_pto2_task_id_int(v):
+    """Unsigned 64-bit PTO2 task id (matches host JSON / device ``task_id.raw``).
+
+    Normalizes signed values to unsigned for ``(ring_id << 32) | local_id``.
+    Returns None if ``v`` is not convertible to int.
+    """
+    try:
+        t = int(v)
+    except (TypeError, ValueError):
+        return None
+    if t < 0:
+        t &= (1 << 64) - 1
+    return t
+
+
 def format_task_display(task_id):
     """Format PTO2 task_id for human-readable labels.
 
@@ -41,12 +56,9 @@ def format_task_display(task_id):
 
     For invalid or non-numeric values, returns str(task_id).
     """
-    try:
-        tid = int(task_id)
-    except (TypeError, ValueError):
+    tid = normalize_pto2_task_id_int(task_id)
+    if tid is None:
         return str(task_id)
-    if tid < 0:
-        tid &= (1 << 64) - 1
     ring = (tid >> 32) & 0xFF
     local = tid & 0xFFFFFFFF
     if ring == 0:
@@ -704,7 +716,7 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
                 # Strip "orch_" prefix for display name
                 display_name = phase.replace("orch_", "") if phase.startswith("orch_") else phase
 
-                # Show packed task_id as rXtY / tY for task-specific phases
+                # Full PTO2TaskId in JSON (device uses task_id.raw, same as TensorMap) → rXtY / tY
                 if task_id >= 0:
                     label = f"{display_name}({format_task_display(task_id)})"
                 else:
@@ -893,59 +905,76 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
                 })
                 flow_id += 1
 
-    # Orchestrator → scheduler dispatch: anchor at orch_fanin end (not orch_finalize.start).
-    # Fanin completion ⇒ dependencies satisfied ⇒ task becomes dispatchable; tie flow to dispatch_time_us.
+    # Orchestrator → scheduler dispatch:
+    # - Prefer orch_fanin end → dispatch (explicit deps / fanin path).
+    # - If no orch_fanin for this task (e.g. aicpu_build_graph without fanin records), use orch_params end → dispatch.
     if orchestrator_phases and scheduler_phases:
         orch_fanin_by_task = {}
+        orch_params_by_task = {}
         for orch_idx, thread_records in enumerate(orch_threads):
             for record in thread_records:
-                if record.get("phase") == "orch_fanin":
-                    task_id = record.get("task_id", -1)
-                    if task_id >= 0:
-                        orch_fanin_by_task[task_id] = (record, orch_idx)
+                phase = record.get("phase")
+                task_id = record.get("task_id", -1)
+                if task_id < 0:
+                    continue
+                tid_k = normalize_pto2_task_id_int(task_id)
+                if tid_k is None:
+                    continue
+                if phase == "orch_fanin":
+                    orch_fanin_by_task[tid_k] = (record, orch_idx)
+                elif phase == "orch_params" and tid_k not in orch_params_by_task:
+                    orch_params_by_task[tid_k] = (record, orch_idx)
 
-        # Use core_to_sched_thread mapping (built above) to find the correct
-        # scheduler thread for each task's core.
-        if orch_fanin_by_task and has_aicpu_data:
+        if has_aicpu_data and (orch_fanin_by_task or orch_params_by_task):
             for task in tasks:
-                tid = task.get('task_id')
-                if tid is None or tid not in orch_fanin_by_task:
+                tid = normalize_pto2_task_id_int(task.get('task_id'))
+                if tid is None:
                     continue
 
                 dispatch_us = task.get('dispatch_time_us', 0)
                 if dispatch_us <= 0:
                     continue
 
-                fanin_rec, orch_idx = orch_fanin_by_task[tid]
-                fanin_end_us = fanin_rec["end_time_us"]
-
                 matched_thread = core_to_sched_thread.get(task['core_id'])
+                if matched_thread is None:
+                    continue
 
-                if matched_thread is not None:
-                    sched_tid = 3000 + matched_thread
-                    orch_tid = 4000 + orch_idx
+                sched_tid = 3000 + matched_thread
 
-                    # Flow: fanin end → dispatch (dependencies ready → scheduler issues dispatch)
-                    events.append({
-                        "cat": "flow",
-                        "id": flow_id,
-                        "name": "fanin→dispatch",
-                        "ph": "s",
-                        "pid": 4,
-                        "tid": orch_tid,
-                        "ts": fanin_end_us
-                    })
-                    events.append({
-                        "cat": "flow",
-                        "id": flow_id,
-                        "name": "fanin→dispatch",
-                        "ph": "f",
-                        "pid": 3,
-                        "tid": sched_tid,
-                        "ts": dispatch_us,
-                        "bp": "e"
-                    })
-                    flow_id += 1
+                row_pair = orch_fanin_by_task.get(tid)
+                flow_name = "fanin→dispatch"
+                if row_pair is None:
+                    row_pair = orch_params_by_task.get(tid)
+                    flow_name = "params→dispatch"
+
+                if row_pair is None:
+                    continue
+
+                anchor_rec, orch_idx = row_pair
+                anchor_us = anchor_rec["end_time_us"]
+
+                orch_tid = 4000 + orch_idx
+
+                events.append({
+                    "cat": "flow",
+                    "id": flow_id,
+                    "name": flow_name,
+                    "ph": "s",
+                    "pid": 4,
+                    "tid": orch_tid,
+                    "ts": anchor_us
+                })
+                events.append({
+                    "cat": "flow",
+                    "id": flow_id,
+                    "name": flow_name,
+                    "ph": "f",
+                    "pid": 3,
+                    "tid": sched_tid,
+                    "ts": dispatch_us,
+                    "bp": "e"
+                })
+                flow_id += 1
 
     if verbose:
         print(f"  Total events: {len(events)}")

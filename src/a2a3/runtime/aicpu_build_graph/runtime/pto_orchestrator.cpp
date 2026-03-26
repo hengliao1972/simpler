@@ -348,7 +348,7 @@ PTO2TaskId pto2_submit_mixed_task(
         scope_tasks_push(orch, nullptr);
     }
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, local_id);
+    CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, task_id.raw);
 
     // === STEP 2: Heap allocation for OUTPUT tensors ===
     int32_t total_output_size = 0;
@@ -378,7 +378,7 @@ PTO2TaskId pto2_submit_mixed_task(
         }
     }
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_heap_cycle, AicpuPhaseId::ORCH_HEAP, local_id);
+    CYCLE_COUNT_LAP_RECORD(g_orch_heap_cycle, AicpuPhaseId::ORCH_HEAP, task_id.raw);
 
     // Periodically reclaim dep_pool entries from retired tasks
     if (sched) {
@@ -398,7 +398,7 @@ PTO2TaskId pto2_submit_mixed_task(
     payload->fanin_actual_count = 0;
     payload->init(params);
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_params_cycle, AicpuPhaseId::ORCH_PARAMS, local_id);
+    CYCLE_COUNT_LAP_RECORD(g_orch_params_cycle, AicpuPhaseId::ORCH_PARAMS, task_id.raw);
 
     // Record dep pool watermark
     if (sched) {
