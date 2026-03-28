@@ -2,9 +2,10 @@
  * Orchestration Build Graph Types - Data structures for orchestration runtime extensions
  *
  * Standalone header defining orchestration-specific types for:
+ * - TaskOutputTensors: Return value from submit containing materialized output Tensors
  * - PTOParam: Aggregated parameter container for pto_submit_task API
  *
- * Tensor descriptor types (Tensor, PTOBufferHandle, PTOOverlapStrategy) are
+ * Tensor descriptor types (Tensor, PTOBufferHandle, TensorCreateInfo) are
  * defined in tensor.h.
  *
  * This header is independent of orch_build_graph_runtime.h to allow inclusion from runtime.h
@@ -31,6 +32,50 @@
 #define PTO2_MAX_INOUTS           8       // Maximum in-out params per task
 
 // =============================================================================
+// Task Output Tensors (return value from submit)
+// =============================================================================
+
+/**
+ * TaskOutputTensors — returned by submit, holds materialized output Tensors.
+ *
+ * Only runtime-created outputs are stored here, indexed in add_output order.
+ *
+ * The underlying storage is uninitialized; only output_count elements are
+ * valid after submit returns.  This avoids default-constructing Tensor[]
+ * on the hot path (2 KB of unnecessary zeroing per submit).
+ *
+ * Users must hold a named TaskOutputTensors variable and borrow via get_ref();
+ * binding get_ref() on an rvalue is compile-time rejected to prevent dangling.
+ */
+class TaskOutputTensors {
+public:
+    TaskOutputTensors() : output_count(0) {}
+
+    uint32_t output_count;
+
+    bool empty() const { return output_count == 0; }
+    uint32_t size() const { return output_count; }
+
+    /// Borrow a materialized output tensor by index (lvalue only).
+    const Tensor& get_ref(uint32_t index) const & {
+        always_assert(index < output_count);
+        return *reinterpret_cast<const Tensor*>(_storage + index * sizeof(Tensor));
+    }
+    const Tensor& get_ref(uint32_t index) const && = delete;
+
+    /// Runtime-internal: writable pointer for materialization.
+    Tensor* output_ptr(uint32_t index) {
+        return reinterpret_cast<Tensor*>(_storage + index * sizeof(Tensor));
+    }
+    const Tensor* output_ptr(uint32_t index) const {
+        return reinterpret_cast<const Tensor*>(_storage + index * sizeof(Tensor));
+    }
+
+private:
+    alignas(Tensor) unsigned char _storage[PTO2_MAX_OUTPUTS * sizeof(Tensor)];
+};
+
+// =============================================================================
 // Parameter Types (for pto_submit_task API)
 // =============================================================================
 
@@ -39,30 +84,43 @@
  */
 enum class PTOParamType : int32_t {
     INPUT = 0,   // Read-only input buffer
-    OUTPUT = 1,  // Write-only output buffer (NULL addr: runtime allocates; non-NULL: use as-is)
+    OUTPUT = 1,  // Write-only output from TensorCreateInfo (runtime allocates)
     INOUT = 2,   // Read-then-write: consumer of prior producer + modifier for downstream
+};
+
+/**
+ * Tagged union for a single PTOParam slot — either a Tensor* or a TensorCreateInfo value.
+ * The active member is determined by PTOParamType (OUTPUT → create_info, else → tensor).
+ */
+union PTOParamRef {
+    const Tensor* tensor;
+    TensorCreateInfo create_info;
+    PTOParamRef() : tensor(nullptr) {}
 };
 
 /**
  * Aggregated parameter container for pto_submit_task
  *
- * Tensor pointers and types are stored in separate parallel arrays for
- * efficient bulk copy: the runtime can memcpy the pointer array and type
- * array independently, avoiding per-element branching.
+ * Each param slot stores a PTOParamRef union (Tensor* or TensorCreateInfo*)
+ * discriminated by the corresponding PTOParamType entry.
  * Tensors are dispatched first in kernel args, followed by scalars.
  *
+ * Output parameters follow two distinct ownership models:
+ * - add_output(const TensorCreateInfo&): OUTPUT — runtime allocates buffer
+ *   and materializes a new Tensor, returned via TaskOutputTensors.
+ * - add_inout(const Tensor&): INOUT — reuses an existing Tensor as the write target.
+ *
  * Example:
- *   Tensor td_a = make_tensor_external(dev_a, shapes, 2);
- *   Tensor td_c = make_tensor(shapes, 2);
+ *   Tensor x = make_tensor_external(dev_a, shapes, 2);
  *   PTOParam params;
- *   params.add_input(td_a);
- *   params.add_output(td_c);
+ *   params.add_input(x);
+ *   params.add_output(TensorCreateInfo(shapes, 2));
  *   params.add_scalar(some_value);
- *   pto2_rt_submit_aic_task(rt, kernel_id, params);
- *   // td_c.buffer.addr is already updated via pointer write-back
+ *   TaskOutputTensors outs = pto2_rt_submit_aic_task(kernel_id, params);
+ *   const Tensor& y = outs.get_ref(0);
  */
 struct PTOParam {
-    Tensor* tensors[PTO2_MAX_TENSOR_PARAMS];
+    PTOParamRef refs[PTO2_MAX_TENSOR_PARAMS];
     PTOParamType tensor_types[PTO2_MAX_TENSOR_PARAMS];
     uint64_t scalars[PTO2_MAX_SCALAR_PARAMS];
     int32_t tensor_count{0};
@@ -97,58 +155,36 @@ struct PTOParam {
         return true;
     }
 
-    void add_input(Tensor& t) {
+    void add_input(const Tensor& t) {
         if (!check_add_tensor_valid()) { return; }
-        if (t.buffer.addr == 0) {
-            set_error("INPUT tensor must have a non-NULL buffer address");
-            return;
-        }
-        tensors[tensor_count] = &t;
+        refs[tensor_count].tensor = &t;
         tensor_types[tensor_count] = PTOParamType::INPUT;
         tensor_count++;
     }
 
-    void add_output(Tensor& t) {
+    /// Standard future-output path: runtime allocates buffer from heap,
+    /// materializes Tensor into TaskOutputTensors.
+    void add_output(const TensorCreateInfo& ci) {
         if (!check_add_tensor_valid()) { return; }
-        tensors[tensor_count] = &t;
+        refs[tensor_count].create_info = ci;
         tensor_types[tensor_count] = PTOParamType::OUTPUT;
         tensor_count++;
     }
 
-    void add_inout(Tensor& t) {
+    /// Runtime-allocated output with an initial element value replicated
+    /// across the full buffer after HeapRing allocation.
+    void add_output(const TensorCreateInfo& ci, uint64_t initial_value) {
         if (!check_add_tensor_valid()) { return; }
-        if (t.buffer.addr == 0) {
-            set_error("INOUT tensor must have a non-NULL buffer address");
-            return;
-        }
-        tensors[tensor_count] = &t;
+        refs[tensor_count].create_info = ci;
+        refs[tensor_count].create_info.set_initial_value(initial_value);
+        tensor_types[tensor_count] = PTOParamType::OUTPUT;
+        tensor_count++;
+    }
+
+    void add_inout(const Tensor& t) {
+        if (!check_add_tensor_valid()) { return; }
+        refs[tensor_count].tensor = &t;
         tensor_types[tensor_count] = PTOParamType::INOUT;
-        tensor_count++;
-    }
-
-    /**
-     * Add an OUTPUT tensor with initial value.
-     *
-     * Registers as OUTPUT so the runtime allocates from HeapRing, then
-     * writes initial_value to the allocated buffer. The initial value is
-     * stored on the Tensor itself (has_initial_value flag on cache line 1,
-     * value on cache line 2) and consumed during HeapRing allocation in
-     * the submit path.
-     *
-     * The tensor must not have been allocated yet (addr must be 0).
-     * For already-allocated tensors, use add_inout() instead.
-     */
-    void add_output(Tensor& t, uint64_t initial_value) {
-        if (!check_add_tensor_valid()) { return; }
-        if (t.buffer.addr != 0) {
-            set_error("add_output with initial_value requires unallocated tensor (addr==0). "
-                      "Use add_inout() for already-allocated tensors");
-            return;
-        }
-        tensors[tensor_count] = &t;
-        t.has_initial_value = true;
-        t.initial_value = initial_value;
-        tensor_types[tensor_count] = PTOParamType::OUTPUT;
         tensor_count++;
     }
 

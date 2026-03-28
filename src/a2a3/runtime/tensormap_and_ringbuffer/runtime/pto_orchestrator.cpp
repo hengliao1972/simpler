@@ -240,13 +240,15 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
 // =============================================================================
 // Task Submission
 // =============================================================================
-void pto2_submit_mixed_task(
+TaskOutputTensors pto2_submit_mixed_task(
     PTO2OrchestratorState* orch, const MixedKernels& mixed_kernels, const PTOParam& params) {
     CYCLE_COUNT_START();
 
+    TaskOutputTensors result;
+
     // Fast path after fatal error — all subsequent submits are no-ops
     if (orch->fatal) {
-        return;
+        return result;
     }
 
     // Validate PTOParam construction (errors recorded by add_input/add_output/etc.)
@@ -261,7 +263,7 @@ void pto2_submit_mixed_task(
         orch->sm_handle->header->orch_error_code.store(
             PTO2_ERROR_INVALID_PARAM, std::memory_order_release);
         orch->fatal = true;
-        return;
+        return result;
     }
 
 
@@ -324,24 +326,24 @@ void pto2_submit_mixed_task(
             orch->sm_handle->header->orch_error_code.store(
                 PTO2_ERROR_SCOPE_DEADLOCK, std::memory_order_release);
             orch->fatal = true;
-            return;
+            return result;
         }
     }
 
-    // === Calculate output size (read from params only, no GM access) ===
+    // === Calculate output size (from runtime-created OUTPUT params) ===
     bool needs_alloc[PTO2_MAX_TENSOR_PARAMS] = {};
     int32_t total_output_size = 0;
     for (int i = 0; i < params.tensor_count; i++) {
-        if (params.tensor_types[i] == PTOParamType::OUTPUT
-            && params.tensors[i]->buffer.addr == 0) {
+        if (params.tensor_types[i] == PTOParamType::OUTPUT) {
             needs_alloc[i] = true;
-            total_output_size += PTO2_ALIGN_UP(params.tensors[i]->buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
+            total_output_size += PTO2_ALIGN_UP(params.refs[i].create_info.buffer_size_bytes(),
+                                               PTO2_PACKED_OUTPUT_ALIGN);
         }
     }
 
     // === STEP 1: Unified alloc — task slot + packed output buffer (blocks until available) ===
     PTO2TaskAllocResult alloc_result = allocator.alloc(total_output_size);
-    if (alloc_result.failed()) { orch->fatal = true; return; }
+    if (alloc_result.failed()) { orch->fatal = true; return result; }
 
     int32_t local_id = alloc_result.task_id;
     int32_t slot = alloc_result.slot;
@@ -411,7 +413,24 @@ void pto2_submit_mixed_task(
 
     CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, task_id.raw);
 
-    // === STEP 3: Lookup inputs + assign output addrs (all from params, no GM) ===
+    // === STEP 3: Lookup inputs + materialize runtime-created outputs ===
+    auto fill_initial_value = [](void* addr, uint64_t buffer_size, DataType dtype, uint64_t initial_value) {
+        uint64_t elem_size = get_element_size(dtype);
+        char* dst = reinterpret_cast<char*>(addr);
+        constexpr uint64_t BLK = 64;
+        uint64_t blk = (buffer_size < BLK) ? buffer_size : BLK;
+        for (uint64_t b = 0; b < blk; b += elem_size) {
+            memcpy(dst + b, &initial_value, elem_size);
+        }
+        uint64_t off = blk;
+        for (; off + blk <= buffer_size; off += blk) {
+            memcpy(dst + off, dst, blk);
+        }
+        if (off < buffer_size) {
+            memcpy(dst + off, dst, buffer_size - off);
+        }
+    };
+
     int32_t offset = 0;
     for (int i = 0; i < params.tensor_count; i++) {
         PTOParamType ptype = params.tensor_types[i];
@@ -419,10 +438,10 @@ void pto2_submit_mixed_task(
         switch (ptype) {
             case PTOParamType::INOUT:
             case PTOParamType::INPUT: {
-                if (params.tensors[i]->manual_dep) break;
+                if (params.refs[i].tensor->manual_dep) break;
                 // Look up producer via TensorMap (reads from cached stack tensor)
                 PTO2LookupResult lookup_result;
-                orch->tensor_map.lookup(*params.tensors[i], lookup_result);
+                orch->tensor_map.lookup(*params.refs[i].tensor, lookup_result);
 
                 for (int r = 0; r < lookup_result.count; r++) {
                     PTO2TensorMapEntry& entry = *lookup_result.entries[r].entry;
@@ -447,10 +466,6 @@ void pto2_submit_mixed_task(
                         }
                     }
                     if (ptype == PTOParamType::INOUT && overlap_status == OverlapStatus::COVERED) {
-                        // inout因为会再次insert进tensor map，
-                        // 因此为了尽量减少依赖构建个数（尽可能构造链式依赖），当该tensor完全覆盖前面的tensor时，
-                        // 应将前面的tensor从tensor map中剔除。
-                        // 但是最开始的tensor除外，因为必须建立和最开始的task的依赖关系以保证tensor生命周期的正确管理
                         if (!entry.with_alloc) {
                             orch->tensor_map.remove_entry(entry);
                         }
@@ -460,29 +475,17 @@ void pto2_submit_mixed_task(
             }
 
             case PTOParamType::OUTPUT: {
-                Tensor& tensor = *params.tensors[i];
-                if (tensor.buffer.addr == 0) {
-                    uint64_t alloc_addr = reinterpret_cast<uint64_t>((char*)alloc_result.packed_base + offset);
-                    tensor.buffer.addr = alloc_addr;
-                    offset += PTO2_ALIGN_UP(tensor.buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
-                    // Cache line 1 is hot (just wrote buffer.addr at offset 0).
-                    // has_initial_value sits on the same cache line (offset 39) — zero-cost check.
-                    if (tensor.has_initial_value) {
-                        uint64_t elem_size = get_element_size(tensor.dtype);
-                        tensor.has_initial_value = false;
-                        uint64_t total = tensor.buffer.size;
-                        char* dst = reinterpret_cast<char*>(alloc_addr);
-                        constexpr uint64_t BLK = 64;
-                        uint64_t blk = (total < BLK) ? total : BLK;
-                        for (uint64_t b = 0; b < blk; b += elem_size)
-                            memcpy(dst + b, &tensor.initial_value, elem_size);
-                        uint64_t off = blk;
-                        for (; off + blk <= total; off += blk)
-                            memcpy(dst + off, dst, blk);
-                        if (off < total)
-                            memcpy(dst + off, dst, total - off);
-                    }
+                const TensorCreateInfo& ci = params.refs[i].create_info;
+                uint64_t buffer_size = ci.buffer_size_bytes();
+                uint64_t alloc_addr = reinterpret_cast<uint64_t>((char*)alloc_result.packed_base + offset);
+                offset += PTO2_ALIGN_UP(buffer_size, PTO2_PACKED_OUTPUT_ALIGN);
+                result.output_ptr(result.output_count)->init_from_create_info(
+                    ci, reinterpret_cast<void*>(alloc_addr), /*version=*/0);
+                if (ci.has_initial_value) {
+                    fill_initial_value(reinterpret_cast<void*>(alloc_addr), buffer_size,
+                                       ci.dtype, ci.initial_value);
                 }
+                result.output_count++;
                 break;
             }
         }
@@ -491,11 +494,23 @@ void pto2_submit_mixed_task(
     CYCLE_COUNT_LAP_RECORD(g_orch_lookup_cycle, AicpuPhaseId::ORCH_LOOKUP, task_id.raw);
 
     // === STEP 4: Register outputs/inouts in TensorMap (must be separate from lookup) ===
-    for (int i = 0; i < params.tensor_count; i++) {
-        PTOParamType ptype = params.tensor_types[i];
-        if (ptype == PTOParamType::OUTPUT || ptype == PTOParamType::INOUT) {
-            if (!params.tensors[i]->manual_dep) {
-                orch->tensor_map.insert(*params.tensors[i], task_id, needs_alloc[i]);
+    {
+        int32_t out_idx = 0;
+        for (int i = 0; i < params.tensor_count; i++) {
+            PTOParamType ptype = params.tensor_types[i];
+            if (ptype == PTOParamType::OUTPUT || ptype == PTOParamType::INOUT) {
+                bool skip_dep = (ptype == PTOParamType::OUTPUT)
+                    ? params.refs[i].create_info.manual_dep
+                    : params.refs[i].tensor->manual_dep;
+                if (!skip_dep) {
+                    const Tensor& t = (ptype == PTOParamType::OUTPUT)
+                        ? *result.output_ptr(out_idx)
+                        : *params.refs[i].tensor;
+                    orch->tensor_map.insert(t, task_id, needs_alloc[i]);
+                }
+            }
+            if (ptype == PTOParamType::OUTPUT) {
+                out_idx++;
             }
         }
     }
@@ -523,7 +538,7 @@ void pto2_submit_mixed_task(
         }
     }
 
-    payload->init(params);
+    payload->init(params, result);
 
     CYCLE_COUNT_LAP_RECORD(g_orch_params_cycle, AicpuPhaseId::ORCH_PARAMS, task_id.raw);
 #if PTO2_ORCH_PROFILING
@@ -599,6 +614,7 @@ void pto2_submit_mixed_task(
 #endif
     g_orch_submit_idx++;
 #endif
+    return result;
 }
 
 // =============================================================================
