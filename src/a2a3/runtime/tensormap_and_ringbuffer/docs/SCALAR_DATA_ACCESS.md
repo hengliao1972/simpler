@@ -9,11 +9,15 @@ During task graph construction, orchestration sometimes needs to read InCore ker
 ## 2. API
 
 ```cpp
-// Blocking read: returns raw uint64_t bit pattern at the given indices
-uint64_t get_tensor_data(const Tensor& tensor, uint32_t ndims, const uint32_t indices[]);
+// Blocking read: returns value at the given indices (default: raw uint64_t bits)
+// Specify T for typed read: float val = get_tensor_data<float>(tensor, 1, idx);
+template<typename T = uint64_t>
+T get_tensor_data(const Tensor& tensor, uint32_t ndims, const uint32_t indices[]);
 
-// Blocking write: stores value at the given indices
-void set_tensor_data(Tensor& tensor, uint32_t ndims, const uint32_t indices[], uint64_t value);
+// Blocking write: stores value at the given indices (type deduced from argument)
+// Typed write: set_tensor_data(tensor, 1, idx, 42.0f);
+template<typename T = uint64_t>
+void set_tensor_data(Tensor& tensor, uint32_t ndims, const uint32_t indices[], T value);
 ```
 
 Both call into the runtime through the ops table — orchestration .so needs no runtime symbol linkage.
@@ -22,7 +26,7 @@ Both call into the runtime through the ops table — orchestration .so needs no 
 
 ### 3.1 get_tensor_data Flow
 
-```
+```text
 addr null-check → TensorMap lookup → spin-wait producer COMPLETED → compute flat offset → memcpy read
 ```
 
@@ -33,7 +37,7 @@ addr null-check → TensorMap lookup → spin-wait producer COMPLETED → comput
 
 ### 3.2 set_tensor_data Flow
 
-```
+```text
 addr null-check → TensorMap lookup → spin-wait producer COMPLETED → spin-wait consumers done → memcpy write
 ```
 
@@ -53,6 +57,7 @@ args.add_output(ci, initial_value);
 ```
 
 **Mechanism**:
+
 1. `add_output(ci, initial_value)` copies `ci` into `Arg` and marks the create-info with an initial value
 2. During orchestrator submit, after HeapRing allocation, the output tensor is materialized from the copied create-info
 3. Fill strategy:
@@ -71,13 +76,13 @@ TensorCreateInfo scalar_ci(shapes, 1, DataType::FLOAT32);
 
 // Submit with initial value and keep the returned tensor
 Arg args;
-args.add_output(scalar_ci, float_to_u64(77.0f));
+args.add_output(scalar_ci, 77.0f);
 TaskOutputTensors outs = pto2_rt_submit_aiv_task(FUNC_NOOP, args);
 const Tensor& scalar_tensor = outs.get_ref(0);
 
 // Orchestration-side blocking read (waits for kernel completion)
 uint32_t idx[1] = {0};
-uint64_t raw = get_tensor_data(scalar_tensor, 1, idx);
+float val = get_tensor_data<float>(scalar_tensor, 1, idx);
 ```
 
 **Advantage**: Fully reuses existing TensorMap (producer tracking, fanin/fanout dependencies) — no new infrastructure needed.
@@ -85,6 +90,7 @@ uint64_t raw = get_tensor_data(scalar_tensor, 1, idx);
 ## 6. Data Hazard Analysis
 
 Three actors:
+
 - **Kernel**: InCore task submitted via add_input/add_output/add_inout (asynchronous execution)
 - **Orch Read**: orchestration calls `get_tensor_data` (blocking read)
 - **Orch Write**: orchestration calls `set_tensor_data` (blocking write)
@@ -92,7 +98,7 @@ Three actors:
 ### Hazard Matrix (earlier operation → later operation)
 
 | # | Earlier Op | Later Op | Hazard | Guarantee | Safe? |
-|---|------------|----------|--------|-----------|-------|
+| - | ---------- | -------- | ------ | --------- | ----- |
 | 1 | Kernel write (OUTPUT) | Orch Read | RAW | spin-wait producer COMPLETED | Yes |
 | 2 | Kernel write (OUTPUT) | Orch Write | WAW | spin-wait producer COMPLETED | Yes |
 | 3 | Kernel read (INPUT) | Orch Write | WAR | spin-wait fanout_refcount | **Needs INOUT** |
@@ -120,7 +126,7 @@ get/set_tensor_data are blocking calls, and orchestration is single-threaded ser
 `make_tensor_external()` creates tensors with a pre-set `buffer.addr` (pointing to host-allocated device memory).
 
 | Scenario | Behavior |
-|----------|----------|
+| -------- | -------- |
 | External tensor never submitted as OUTPUT/INOUT | No TensorMap entry — get/set execute immediately |
 | External tensor previously submitted as OUTPUT/INOUT | TensorMap has producer entry — get/set spin-wait |
 | External tensor submitted as INPUT, then set_tensor_data | **WAR risk** — must use INOUT instead (same as scenario #3) |
