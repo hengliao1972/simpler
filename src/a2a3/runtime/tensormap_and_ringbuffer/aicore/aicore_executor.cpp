@@ -1,9 +1,20 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
 #include "aicore/aicore.h"
-#include "runtime.h"
-#include "pto2_dispatch_payload.h"
-#include "common/perf_profiling.h"
 #include "aicore/performance_collector_aicore.h"
+#include "common/perf_profiling.h"
 #include "common/platform_config.h"  // Register-based communication
+#include "pto2_dispatch_payload.h"   // NOLINT(build/include_subdir)
+#include "runtime.h"                 // NOLINT(build/include_subdir)
 
 /**
  * Unified function pointer type for kernel dispatch
@@ -20,16 +31,14 @@ typedef void (*UnifiedKernelFunc)(__gm__ int64_t*);
  *
  * @param payload Pointer to PTO2DispatchPayload in global memory
  */
-__aicore__ __attribute__((always_inline)) static void execute_task(
-    __gm__ PTO2DispatchPayload* payload
-) {
+__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2DispatchPayload* payload) {
     if (payload == nullptr || payload->function_bin_addr == 0) {
         return;
     }
 
     UnifiedKernelFunc kernel = (UnifiedKernelFunc)payload->function_bin_addr;
     kernel(reinterpret_cast<__gm__ int64_t*>(payload->args));
-    FULL_MEMORY_BARRIER();
+    OUT_OF_ORDER_STORE_BARRIER();
 }
 
 /**
@@ -70,14 +79,13 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
 
     // Phase 3: Report core type, signal ready
     my_hank->core_type = core_type;
-    STORE_RELEASE_FENCE();
+    OUT_OF_ORDER_STORE_BARRIER();
     my_hank->aicore_done = block_idx + 1;  // Signal ready (use block_idx + 1 to avoid 0)
 
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
     // Cache per-core dispatch payload pointer (set by AICPU before aicpu_ready)
-    __gm__ PTO2DispatchPayload* payload =
-        reinterpret_cast<__gm__ PTO2DispatchPayload*>(my_hank->task);
+    __gm__ PTO2DispatchPayload* payload = reinterpret_cast<__gm__ PTO2DispatchPayload*>(my_hank->task);
 
     bool profiling_enabled = runtime->enable_profiling;
 
@@ -118,8 +126,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
             if (profiling_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
                 __gm__ PerfBuffer* perf_buf = (__gm__ PerfBuffer*)my_hank->perf_records_addr;
-                perf_aicore_record_task(perf_buf, task_id,
-                                       start_time, end_time);
+                perf_aicore_record_task(perf_buf, task_id, start_time, end_time);
             }
 
             last_reg_val = reg_val;

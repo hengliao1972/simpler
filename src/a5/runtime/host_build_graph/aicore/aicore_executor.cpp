@@ -1,8 +1,19 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
 #include "aicore/aicore.h"
-#include "runtime.h"
-#include "common/perf_profiling.h"
 #include "aicore/performance_collector_aicore.h"
+#include "common/perf_profiling.h"
 #include "common/platform_config.h"  // Platform configuration (C/C++ compatible)
+#include "runtime.h"                 // NOLINT(build/include_subdir)
 
 typedef void (*KernelFunc)(__gm__ int64_t*);
 
@@ -12,7 +23,7 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task* 
     }
     KernelFunc kernel = (KernelFunc)task->function_bin_addr;
     kernel(reinterpret_cast<__gm__ int64_t*>(task->args));
-    FULL_MEMORY_BARRIER();
+    OUT_OF_ORDER_STORE_BARRIER();
 }
 
 __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int core_idx, CoreType core_type) {
@@ -35,7 +46,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
 
     // Phase 3: Report core type, signal ready
     my_hank->core_type = core_type;
-    STORE_RELEASE_FENCE();
+    OUT_OF_ORDER_STORE_BARRIER();
     my_hank->aicore_done = core_idx + 1;
 
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
@@ -70,8 +81,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
             if (profiling_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
                 __gm__ PerfBuffer* perf_buf = (__gm__ PerfBuffer*)my_hank->perf_records_addr;
-                perf_aicore_record_task(perf_buf, actual_task_id,
-                                      start_time, end_time);
+                perf_aicore_record_task(perf_buf, actual_task_id, start_time, end_time);
             }
 
             last_task_id = task_id;
