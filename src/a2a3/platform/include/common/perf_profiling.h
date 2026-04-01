@@ -62,7 +62,7 @@
 
 // Maximum number of successor tasks per PerfRecord (matches Task::fanout)
 #ifndef RUNTIME_MAX_FANOUT
-#define RUNTIME_MAX_FANOUT 512
+#define RUNTIME_MAX_FANOUT 128
 #endif
 
 // =============================================================================

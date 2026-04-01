@@ -1,3 +1,14 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
 /**
  * Runtime Class - Task Dependency Runtime Management
  *
@@ -15,8 +26,8 @@
  * and lightweight scheduling use cases.
  */
 
-#ifndef RUNTIME_H
-#define RUNTIME_H
+#ifndef SRC_A2A3_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_RUNTIME_H_
+#define SRC_A2A3_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_RUNTIME_H_
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -45,7 +56,7 @@
 #endif
 
 #ifndef RUNTIME_MAX_FANOUT
-#define RUNTIME_MAX_FANOUT 512
+#define RUNTIME_MAX_FANOUT 128
 #endif
 
 #ifndef RUNTIME_MAX_WORKER
@@ -101,17 +112,17 @@
  * - physical_core_id: Written by AICPU, read by AICore (physical core ID)
  */
 struct Handshake {
-    volatile uint32_t aicpu_ready;          // AICPU ready signal: 0=not ready, 1=ready
-    volatile uint32_t aicore_done;          // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;                 // Task pointer: 0=no task, non-zero=Task* address
-    volatile int32_t task_status;           // Task execution status: 0=idle, 1=busy
-    volatile int32_t control;               // Control signal: 0=execute, 1=quit
-    volatile CoreType core_type;            // Core type: CoreType::AIC or CoreType::AIV
-    volatile uint64_t perf_records_addr;    // Performance records address
-    volatile uint32_t perf_buffer_status;   // 0 = not full, 1 = full
-    volatile uint32_t physical_core_id;     // Physical core ID
+    volatile uint32_t aicpu_ready;         // AICPU ready signal: 0=not ready, 1=ready
+    volatile uint32_t aicore_done;         // AICore ready signal: 0=not ready, core_id+1=ready
+    volatile uint64_t task;                // Task pointer: 0=no task, non-zero=Task* address
+    volatile int32_t task_status;          // Task execution status: 0=idle, 1=busy
+    volatile int32_t control;              // Control signal: 0=execute, 1=quit
+    volatile CoreType core_type;           // Core type: CoreType::AIC or CoreType::AIV
+    volatile uint64_t perf_records_addr;   // Performance records address
+    volatile uint32_t perf_buffer_status;  // 0 = not full, 1 = full
+    volatile uint32_t physical_core_id;    // Physical core ID
     volatile uint32_t aicpu_regs_ready;    // AICPU register init done: 0=pending, 1=done
-    volatile uint32_t aicore_regs_ready;     // AICore ID reported: 0=pending, 1=done
+    volatile uint32_t aicore_regs_ready;   // AICore ID reported: 0=pending, 1=done
 } __attribute__((aligned(64)));
 
 /**
@@ -182,32 +193,32 @@ typedef struct {
  * Dependencies are managed manually via add_successor().
  */
 class Runtime {
-public:
+ public:
     // Handshake buffers for AICPU-AICore communication
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
     int worker_count;                       // Number of active workers
 
     // Execution parameters for AICPU scheduling
-    int sche_cpu_num;  // Number of AICPU threads for scheduling
+    int sche_cpu_num;     // Number of AICPU threads for scheduling
     int orch_thread_num;  // Number of orchestrator threads (unused, for API compatibility)
 
     // Profiling support
-    bool enable_profiling;                  // Enable profiling flag
-    uint64_t perf_data_base;                // Performance data shared memory base address (device-side)
+    bool enable_profiling;    // Enable profiling flag
+    uint64_t perf_data_base;  // Performance data shared memory base address (device-side)
 
     // Task storage
     Task tasks[RUNTIME_MAX_TASKS];  // Fixed-size task array
 
-private:
-    int next_task_id;               // Next available task ID
+ private:
+    int next_task_id;  // Next available task ID
 
     // Initial ready tasks (computed once, read-only after)
     int initial_ready_tasks[RUNTIME_MAX_TASKS];
     int initial_ready_count;
 
-  // Tensor pairs for host-device memory tracking
-  TensorPair tensor_pairs[RUNTIME_MAX_TENSOR_PAIRS];
-  int tensor_pair_count;
+    // Tensor pairs for host-device memory tracking
+    TensorPair tensor_pairs[RUNTIME_MAX_TENSOR_PAIRS];
+    int tensor_pair_count;
 
     // Function address mapping (for API compatibility with rt2)
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
@@ -216,7 +227,7 @@ private:
     int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];
     int registered_kernel_count_;
 
-public:
+ public:
     /**
      * Constructor - zero-initialize all arrays
      */
@@ -235,7 +246,7 @@ public:
      * @param core_type Core type for this task (CoreType::AIC or CoreType::AIV)
      * @return Task ID (>= 0) on success, -1 on failure
      */
-    int add_task(uint64_t *args, int num_args, int func_id, CoreType core_type = CoreType::AIC);
+    int add_task(uint64_t* args, int num_args, int func_id, CoreType core_type = CoreType::AIC);
 
     /**
      * Add a dependency edge: from_task -> to_task
@@ -258,7 +269,7 @@ public:
      * @param task_id  Task ID to query
      * @return Pointer to task, or nullptr if invalid ID
      */
-    Task *get_task(int task_id);
+    Task* get_task(int task_id);
 
     /**
      * Get the total number of tasks in the runtime
@@ -278,7 +289,7 @@ public:
      * nullptr)
      * @return Number of initially ready tasks
      */
-    int get_initial_ready_tasks(int *ready_tasks);
+    int get_initial_ready_tasks(int* ready_tasks);
 
     // =========================================================================
     // Utility Methods
@@ -373,4 +384,4 @@ public:
     HostApi host_api;
 };
 
-#endif  // RUNTIME_H
+#endif  // SRC_A2A3_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_RUNTIME_H_

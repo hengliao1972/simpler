@@ -482,12 +482,18 @@ int DeviceRunner::run(Runtime& runtime,
             LOG_ERROR("rtStreamSynchronize (AICore) failed: %d", rc);
             return rc;
         }
+
+        // Signal collector that device execution is complete
+        if (runtime.enable_profiling) {
+            perf_collector_.signal_execution_complete();
+        }
     }
 
     // Stop memory management, drain remaining buffers, collect phase data, export
     if (runtime.enable_profiling) {
         perf_collector_.stop_memory_manager();
         perf_collector_.drain_remaining_buffers();
+        perf_collector_.scan_remaining_perf_buffers();
         perf_collector_.collect_phase_data();
         export_swimlane_json();
     }
@@ -748,7 +754,10 @@ int DeviceRunner::init_performance_profiling(Runtime& runtime, int num_aicore, i
         return allocator->free(dev_ptr);
     };
 
-    return perf_collector_.initialize(runtime, num_aicore, device_id, alloc_cb, register_cb, free_cb, &mem_alloc_);
+    auto set_device_cb = [](int device_id, void* /*user_data*/) -> int { return rtSetDevice(device_id); };
+
+    return perf_collector_.initialize(
+        runtime, num_aicore, device_id, alloc_cb, register_cb, free_cb, &mem_alloc_, set_device_cb);
 }
 
 void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {

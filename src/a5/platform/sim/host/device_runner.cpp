@@ -342,6 +342,11 @@ int DeviceRunner::run(Runtime& runtime,
         t.join();
     }
 
+    // Signal collector that device execution is complete
+    if (runtime.enable_profiling) {
+        perf_collector_.signal_execution_complete();
+    }
+
     // Wait for collector thread if it was launched
     if (runtime.enable_profiling && collector_thread.joinable()) {
         collector_thread.join();
@@ -353,6 +358,7 @@ int DeviceRunner::run(Runtime& runtime,
     if (runtime.enable_profiling) {
         perf_collector_.stop_memory_manager();
         perf_collector_.drain_remaining_buffers();
+        perf_collector_.scan_remaining_perf_buffers();
         perf_collector_.collect_phase_data();
         export_swimlane_json();
     }
