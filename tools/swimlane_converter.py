@@ -44,6 +44,23 @@ except ImportError:
     from tools.sched_overhead_analysis import run_analysis as run_sched_overhead_analysis
 
 
+def _func_id_to_letter(func_id):
+    """Map a non-negative integer func_id to a base-26 letter label.
+
+    0 → 'a', 1 → 'b', …, 25 → 'z', 26 → 'aa', 27 → 'ab', …
+    """
+    try:
+        n = int(func_id)
+    except (TypeError, ValueError):
+        return str(func_id)
+    letters = []
+    n += 1  # shift so that 0 maps to 'a' (1-based bijective base-26)
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        letters.append(chr(ord("a") + rem))
+    return "".join(reversed(letters))
+
+
 def normalize_pto2_task_id_int(v):
     """Unsigned 64-bit PTO2 task id (matches host JSON / device ``task_id.raw``).
 
@@ -303,7 +320,7 @@ def print_task_statistics(tasks, func_id_to_name=None, sched_info=None):
         if func_id_to_name and str(func_id) in func_id_to_name:
             func_name = func_id_to_name[str(func_id)]
         else:
-            func_name = f"Func_{func_id}"
+            func_name = f"func_{_func_id_to_letter(func_id)}"
 
         # Calculate averages
         avg_head_overhead = (
@@ -487,7 +504,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             func_name = func_id_to_name[str(func_id)]
             task_name = f"{func_name}({tdisp})"
         else:
-            task_name = f"Func_{func_id}({tdisp})"
+            task_name = f"func_{_func_id_to_letter(func_id)}({tdisp})"
 
         events.append(
             {
@@ -530,7 +547,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                 func_name = func_id_to_name[str(func_id)]
                 task_name = f"{func_name}({tdisp})"
             else:
-                task_name = f"Func_{func_id}({tdisp})"
+                task_name = f"func_{_func_id_to_letter(func_id)}({tdisp})"
 
             events.append(
                 {
