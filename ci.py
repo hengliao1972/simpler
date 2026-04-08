@@ -91,6 +91,7 @@ class RuntimeBinariesLike(Protocol):
     host_path: BinaryArtifactPathLike
     aicpu_path: BinaryArtifactPathLike
     aicore_path: BinaryArtifactPathLike
+    sim_context_path: Any
 
 
 class GoldenModuleLike(Protocol):
@@ -522,6 +523,7 @@ def device_worker(
                 str(rt_bins.host_path),
                 rt_bins.aicpu_path.read_bytes(),
                 rt_bins.aicore_path.read_bytes(),
+                sim_context_lib_path=str(rt_bins.sim_context_path) if rt_bins.sim_context_path else "",
             )
             worker.set_device(device_id)
         except Exception as e:
@@ -1021,6 +1023,7 @@ def _run_tasks_on_device(
                 str(rt_bins.host_path),
                 rt_bins.aicpu_path.read_bytes(),
                 rt_bins.aicore_path.read_bytes(),
+                sim_context_lib_path=str(rt_bins.sim_context_path) if rt_bins.sim_context_path else "",
             )
             worker.set_device(device_id)
         except Exception as e:
