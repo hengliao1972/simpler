@@ -31,6 +31,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <type_traits>
+
 // Type headers needed by orchestration
 #include "pto_submit_types.h"  // MixedKernels, INVALID_KERNEL_ID, subtask slots  // NOLINT(build/include_subdir)
 #include "pto_types.h"         // Arg, TaskOutputTensors, TensorArgType  // NOLINT(build/include_subdir)
@@ -131,6 +133,7 @@ typedef struct PTO2RuntimeOps {
     void (*set_tensor_data)(
         PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
     );
+    TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const Arg &args);
 } PTO2RuntimeOps;
 
 /**
@@ -149,6 +152,33 @@ struct PTO2Runtime {
 // =============================================================================
 
 static inline PTO2Runtime *pto2_current_runtime() { return pto2_framework_current_runtime(); }
+
+static inline TaskOutputTensors alloc_tensors(const Arg &args) {
+    PTO2Runtime *rt = pto2_current_runtime();
+    return rt->ops->alloc_tensors(rt, args);
+}
+
+static inline TaskOutputTensors alloc_tensors(const TensorCreateInfo create_infos[], uint32_t count) {
+    Arg args;
+    for (uint32_t i = 0; i < count; i++) {
+        args.add_output(create_infos[i]);
+    }
+    always_assert(!args.has_error && "alloc_tensors failed to construct output-only Arg");
+    return alloc_tensors(args);
+}
+
+template <typename... CIs>
+static inline TaskOutputTensors alloc_tensors(const CIs &...cis) {
+    static_assert(sizeof...(cis) > 0, "alloc_tensors requires at least one TensorCreateInfo");
+    static_assert(
+        (std::is_same_v<std::decay_t<CIs>, TensorCreateInfo> && ...),
+        "alloc_tensors only accepts TensorCreateInfo arguments"
+    );
+    Arg args;
+    (args.add_output(cis), ...);
+    always_assert(!args.has_error && "alloc_tensors failed to construct output-only Arg");
+    return alloc_tensors(args);
+}
 
 static inline TaskOutputTensors pto2_rt_submit_task(const MixedKernels &mixed_kernels, const Arg &args) {
     PTO2Runtime *rt = pto2_current_runtime();
