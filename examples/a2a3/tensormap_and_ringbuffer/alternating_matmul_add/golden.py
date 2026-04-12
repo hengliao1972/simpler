@@ -1,3 +1,11 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """
 Golden test specification for alternating matmul-add test.
 
@@ -10,8 +18,9 @@ Args layout: [A, B, C, X, Y, Z, batch, M_val, N_val, matmul_batch, add_batch]
 """
 
 import ctypes
-import torch
 import time
+
+import torch
 
 __outputs__ = ["C", "Z"]
 RTOL = 1e-3
@@ -34,7 +43,6 @@ ALL_CASES = {
         "matmul_batch": 4,  # Number of matmul tiles per task
         "add_batch": 5,  # Number of add tiles per task
     },
-
 }
 
 DEFAULT_CASE = "Case1"
@@ -67,14 +75,10 @@ def generate_inputs(params: dict) -> list:
 
     if total_matmul_tasks % matmul_batch != 0:
         raise ValueError(
-            f"total_matmul_tasks ({total_matmul_tasks}) must be "
-            f"divisible by matmul_batch ({matmul_batch})"
+            f"total_matmul_tasks ({total_matmul_tasks}) must be divisible by matmul_batch ({matmul_batch})"
         )
     if total_add_tasks % add_batch != 0:
-        raise ValueError(
-            f"total_add_tasks ({total_add_tasks}) must be "
-            f"divisible by add_batch ({add_batch})"
-        )
+        raise ValueError(f"total_add_tasks ({total_add_tasks}) must be divisible by add_batch ({add_batch})")
 
     # Prevent integer overflow in orchestration (task_idx = b * M + m or b * N + n)
     INT32_MAX = 2**31 - 1
