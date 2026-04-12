@@ -21,14 +21,36 @@ Usage:
 
 from __future__ import annotations
 
+import os
+import sys
+
+# ---------------------------------------------------------------------------
+# macOS libomp collision workaround — MUST run before any import that may
+# transitively load numpy or torch.  See docs/macos-libomp-collision.md for
+# the full analysis.
+#
+# On macOS with a --system-site-packages venv, homebrew's numpy pulls in
+# /opt/homebrew/opt/libomp/lib/libomp.dylib (via openblas), while pip's
+# torch ships its own .venv/.../torch/lib/libomp.dylib under a different
+# install name (/opt/llvm-openmp/lib/libomp.dylib).  Because the two
+# dylibs have distinct install names, dyld loads them both, and Intel's
+# libomp aborts the process with "OMP: Error #15 ... libomp already
+# initialized" (SIGABRT).
+#
+# The officially-documented escape hatch is KMP_DUPLICATE_LIB_OK=TRUE.
+# For our CI workload (numpy random + torch golden compute, no heavy
+# parallel OMP regions) the two runtimes never actually race, so allowing
+# the duplicate load is safe in practice.
+# ---------------------------------------------------------------------------
+if sys.platform == "darwin":
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import argparse
 import importlib.util
 import json
 import logging
-import os
 import signal
 import subprocess
-import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor

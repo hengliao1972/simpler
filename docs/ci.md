@@ -227,6 +227,10 @@ python ci.py -p a2a3 -d 4-7 -c 6622890 -t 600
 python ci.py -p a2a3sim -r tensormap_and_ringbuffer
 ```
 
+### Platform notes
+
+- **macOS libomp collision**: on macOS, `ci.py` sets `KMP_DUPLICATE_LIB_OK=TRUE` at the top of the file to work around a duplicate-libomp abort triggered by homebrew numpy and pip torch coexisting in one process. Do not reorder the imports or remove this workaround without reading [macos-libomp-collision.md](macos-libomp-collision.md) first.
+
 ### Task discovery
 
 `ci.py` scans two directories:
