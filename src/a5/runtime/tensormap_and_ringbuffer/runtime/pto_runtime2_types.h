@@ -31,6 +31,7 @@
 
 #include <atomic>
 
+#include "pto_runtime_status.h"
 #include "pto2_dispatch_payload.h"
 #include "pto_submit_types.h"
 #include "pto_task_id.h"
@@ -67,22 +68,6 @@
 #if PTO2_TENSORMAP_PROFILING && !PTO2_ORCH_PROFILING
 #error "PTO2_TENSORMAP_PROFILING requires PTO2_ORCH_PROFILING=1"
 #endif
-
-// =============================================================================
-// AICPU Error Codes (written to shared memory for Host-side diagnosis)
-// =============================================================================
-
-// Orchestrator errors (1-99): detected in orchestrator thread
-#define PTO2_ERROR_NONE 0
-#define PTO2_ERROR_SCOPE_DEADLOCK 1
-#define PTO2_ERROR_HEAP_RING_DEADLOCK 2
-#define PTO2_ERROR_FLOW_CONTROL_DEADLOCK 3
-#define PTO2_ERROR_DEP_POOL_OVERFLOW 4
-#define PTO2_ERROR_INVALID_ARGS 5         // Arg construction error (invalid args)
-#define PTO2_ERROR_DEPENDENCY_OVERFLOW 6  // Too many unique fanin dependencies for one task
-
-// Scheduler errors (100+): detected in scheduler threads
-#define PTO2_ERROR_SCHEDULER_TIMEOUT 100
 
 // =============================================================================
 // Configuration Constants
@@ -456,8 +441,8 @@ struct alignas(64) PTO2TaskSlotState {
 
     // SPMD multi-block (occupies the 8 tail bytes previously implicit padding)
     std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
-    int16_t total_required_subtasks{0};          // = block_num * popcount(active_mask)
-    int16_t block_num{1};                        // Total logical blocks (set by orchestrator)
+    int16_t total_required_subtasks{0};          // = logical_block_num * popcount(active_mask)
+    int16_t logical_block_num{1};                // Total logical blocks (set by orchestrator)
     int16_t next_block_idx{0};                   // Next block to dispatch (scheduler state)
 };
 
