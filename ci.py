@@ -425,7 +425,6 @@ def run_single_task(
     """Run all cases in a compiled task on a given worker. Returns True if all pass."""
     import ctypes  # noqa: PLC0415
 
-    import numpy as np  # noqa: PLC0415
     import torch  # noqa: PLC0415
 
     from simpler_setup.code_runner import _kernel_config_runtime_env, _temporary_env  # noqa: PLC0415
@@ -449,12 +448,8 @@ def run_single_task(
 
             for item in result:
                 name, value = item
-                if isinstance(value, (torch.Tensor, np.ndarray)):
-                    tensor = (
-                        torch.as_tensor(value).cpu().contiguous()
-                        if not isinstance(value, torch.Tensor)
-                        else value.cpu().contiguous()
-                    )
+                if isinstance(value, torch.Tensor):
+                    tensor = value.cpu().contiguous()
                     args[name] = tensor
                     orch_args.add_tensor(make_tensor_arg(tensor))
                     if name in output_set:

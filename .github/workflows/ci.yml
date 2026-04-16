@@ -30,7 +30,7 @@ jobs:
           python-version: '3.10'
 
       - name: Install Python dependencies
-        run: pip install numpy ml_dtypes
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Install package (for pyright C extension symbol resolution)
         run: pip install .
@@ -90,8 +90,7 @@ jobs:
           python3 -m venv .venv
           . .venv/bin/activate
           pip install --upgrade pip
-          pip install scikit-build-core nanobind cmake
-          pip install numpy ml_dtypes pytest
+          pip install scikit-build-core nanobind cmake pytest
           pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Run packaging matrix (5 modes × 4 entry points, fully isolated)
@@ -126,13 +125,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install numpy
-          pip install ml_dtypes
-          pip install pytest
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-      - name: Build nanobind extension
-        run: pip install .
+          pip install '.[test]'
 
       - name: Run unit tests
         run: pytest tests -m "not requires_hardware" -v
@@ -210,13 +204,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install numpy
-          pip install ml_dtypes
-          pip install pytest
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-      - name: Build nanobind extension
-        run: pip install .
+          pip install '.[test]'
 
       - name: Run simulation examples (a2a3sim)
         run: python ci.py -p a2a3sim -c d96c8784 -t 600 --clone-protocol https
@@ -274,13 +263,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install numpy
-          pip install ml_dtypes
-          pip install pytest
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-      - name: Build nanobind extension
-        run: pip install .
+          pip install '.[test]'
 
       - name: Run simulation examples (a5sim)
         run: python ci.py -p a5sim -c d96c8784 -t 600 --clone-protocol https

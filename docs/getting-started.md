@@ -88,7 +88,7 @@ All workflows assume an activated project-local venv (see [`.claude/rules/venv-i
 ```bash
 python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
-pip install --no-build-isolation scikit-build-core nanobind cmake pytest numpy ml_dtypes torch
+pip install --no-build-isolation scikit-build-core nanobind cmake pytest torch
 pip install --no-build-isolation -e .
 ```
 
@@ -217,7 +217,7 @@ python examples/scripts/run_example.py -k <kernels> -g <golden.py> -p a2a3 --dev
 - **Handshake cores**: Usually 3 (1c2v configuration: 1 core, 2 vector units)
 - **Kernel compilation**: Requires `ASCEND_HOME_PATH` environment variable
 - **Memory management**: MemoryAllocator automatically tracks allocations
-- **Python requirement**: NumPy for efficient array operations
+- **Python requirement**: PyTorch for tensor operations in golden scripts
 
 ## Logging
 

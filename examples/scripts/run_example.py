@@ -95,8 +95,8 @@ Examples:
 
 Golden.py interface:
     def generate_inputs(params: dict) -> dict:
-        '''Return dict of numpy arrays (inputs + outputs)'''
-        return {"a": np.array(...), "out_f": np.zeros(...)}
+        '''Return dict of torch tensors (inputs + outputs)'''
+        return {"a": torch.tensor(...), "out_f": torch.zeros(...)}
 
     def compute_golden(tensors: dict, params: dict) -> None:
         '''Compute expected outputs in-place'''

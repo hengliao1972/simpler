@@ -47,6 +47,17 @@ _task_interface.*.so      nanobind extension at site-packages root
 
 Internal coupling: `simpler_setup.toolchain`, `simpler_setup.kernel_compiler`, and `simpler_setup.runtime_compiler` import `simpler.env_manager`. This is the only direction allowed (`simpler_setup → simpler`); never the reverse. `simpler` must not depend on `simpler_setup`.
 
+### Dependencies
+
+| Category | Packages |
+| -------- | -------- |
+| `simpler` runtime | No third-party Python deps. Requires platform backend: simulation (`a*sim`) or NPU hardware (`a2a3`/`a5` with CANN toolkit) |
+| `simpler_setup` runtime | `torch` (tensor operations in golden scripts, test comparison) |
+| Build | `scikit-build-core`, `nanobind`, `cmake` |
+| Test | `pytest` (ut-py, st), `googletest` + `ctest` (ut-cpp) |
+
+`pyproject.toml` declares no `[project.dependencies]` — both `torch` and `pytest` are environment prerequisites, not pip-installed transitively. This is intentional: torch's index URL (`--index-url https://download.pytorch.org/whl/cpu`) and hardware-specific builds make automatic resolution impractical.
+
 ### `PROJECT_ROOT` resolution
 
 `simpler_setup.environment.PROJECT_ROOT` auto-detects between:
@@ -107,7 +118,7 @@ For developers who don't want to use pip at all:
 
 ```bash
 . .venv/bin/activate
-pip install scikit-build-core nanobind cmake pytest numpy ml_dtypes torch  # one-time
+pip install scikit-build-core nanobind cmake pytest torch  # one-time
 cmake -S . -B build/cmake_only -Dnanobind_DIR=$(python -c 'import nanobind; print(nanobind.cmake_dir())')
 cmake --build build/cmake_only
 export PYTHONPATH=$(pwd):$(pwd)/python
@@ -125,7 +136,7 @@ The cmake build places `_task_interface.cpython-XYZ.so` directly into `python/` 
 | `python ci.py` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `python examples/scripts/run_example.py` | ✅ | ✅ | ✅ | ✅ | ✅ |
 
-On macOS, set `KMP_DUPLICATE_LIB_OK=TRUE` to silence the homebrew-numpy + pip-torch libomp collision (also documented in `ci.py`).
+On macOS with `--system-site-packages`, set `KMP_DUPLICATE_LIB_OK=TRUE` if the system numpy is present and its libomp collides with torch's (see `docs/macos-libomp-collision.md`).
 
 ## Verification protocol when changing package structure
 
@@ -144,7 +155,7 @@ Any change that touches:
 ```bash
 # Locally — same script CI runs.
 source .venv/bin/activate
-pip install scikit-build-core nanobind cmake pytest numpy ml_dtypes torch  # one-time
+pip install scikit-build-core nanobind cmake pytest torch  # one-time
 bash tools/verify_packaging.sh
 ```
 

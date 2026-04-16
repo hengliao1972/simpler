@@ -80,7 +80,7 @@ print('simpler_setup:', simpler_setup.__file__)
 # ---------------------------------------------------------------------------
 python -c "import scikit_build_core, nanobind, cmake, torch, pytest" 2>/dev/null || {
     echo "ERROR: venv missing required deps. Install with:" >&2
-    echo "  pip install scikit-build-core nanobind cmake pytest numpy ml_dtypes torch" >&2
+    echo "  pip install scikit-build-core nanobind cmake pytest torch" >&2
     exit 1
 }
 

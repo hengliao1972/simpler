@@ -100,16 +100,8 @@ def _to_torch(tensor) -> torch.Tensor:
         # Already a torch tensor, ensure it's on CPU and contiguous
         return tensor.cpu().contiguous()
 
-    # For any non-torch tensor, try direct torch conversion first
-    # This handles most array-like objects including numpy arrays
-    try:
-        return torch.as_tensor(tensor)
-    except (TypeError, RuntimeError):
-        # If direct conversion fails, fall back to numpy path
-        import numpy as np  # noqa: PLC0415  # type: ignore[import-not-found]
-
-        arr = np.asarray(tensor)
-        return torch.from_numpy(arr)
+    # For any non-torch tensor, convert directly
+    return torch.as_tensor(tensor).cpu().contiguous()
 
 
 def _load_module_from_path(module_path: Path, module_name: str):
@@ -307,7 +299,7 @@ class CodeRunner:
         Build ChipStorageTaskArgs from an explicit argument list returned by generate_inputs.
 
         Every element must be a (name, value) pair where value is either:
-        - torch.Tensor / numpy array: a tensor argument
+        - torch.Tensor: a tensor argument
         - ctypes scalar (ctypes.c_int64, ctypes.c_float, etc.): a scalar argument
 
         All named items (tensors and scalars) are collected into the args dict
@@ -317,8 +309,6 @@ class CodeRunner:
             Tuple of (orch_args, args, inputs, outputs)
             where args contains all named items, inputs/outputs contain tensor-only subsets.
         """
-        import numpy as np  # noqa: PLC0415  # type: ignore[import-not-found]
-
         if not self.output_names:
             raise ValueError("No output tensors identified. Define __outputs__ = ['tensor_name'] in golden.py")
         output_set = set(self.output_names)
@@ -338,9 +328,8 @@ class CodeRunner:
 
             name, value = item
 
-            if isinstance(value, (torch.Tensor, np.ndarray)):
+            if isinstance(value, torch.Tensor):
                 tensor = _to_torch(value)
-                tensor = tensor.cpu().contiguous()
                 args[name] = tensor
 
                 orch_args.add_tensor(make_tensor_arg(tensor))
@@ -357,7 +346,7 @@ class CodeRunner:
             else:
                 raise TypeError(
                     f"Unsupported value type for arg '{name}': {type(value)}\n"
-                    f"Expected torch.Tensor, numpy array, or ctypes scalar (ctypes.c_int64, ctypes.c_float, etc.)"
+                    f"Expected torch.Tensor or ctypes scalar (ctypes.c_int64, ctypes.c_float, etc.)"
                 )
 
         if not outputs:
