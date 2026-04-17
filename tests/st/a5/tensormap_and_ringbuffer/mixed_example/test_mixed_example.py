@@ -7,9 +7,15 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Mixed AIC+AIV example: all 5 resource shapes per iteration.
+"""Mixed AIC+AIV example covering all 5 resource shapes.
 
-Args layout (15 tensors): [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O]
+  1. AIC_AIV_X2: C = A@B, F = D+E, I = G*H
+  2. AIC_ONLY:   J = A@B
+  3. AIV_X1:     K = D+E
+  4. AIV_X2:     L = D+E, M = G*H
+  5. AIC_AIV_X1: N = A@B, O = D+E
+
+All use 128x128 float32 tiles, repeated over num_iters slices.
 """
 
 import torch
@@ -90,15 +96,15 @@ class TestMixedExample(SceneTestCase):
     CASES = [
         {
             "name": "case1",
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 3},
             "params": {"num_iters": 4},
         },
         {
             "name": "case2",
-            "manual": True,
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 3},
+            "manual": True,
             "params": {"num_iters": 1},
         },
     ]
@@ -106,51 +112,57 @@ class TestMixedExample(SceneTestCase):
     def generate_args(self, params):
         num_iters = params["num_iters"]
         torch.manual_seed(42)
-        A = torch.randn(MATMUL_SIZE, MATMUL_SIZE, dtype=torch.float32) * 0.01
-        B = torch.randn(MATMUL_SIZE, MATMUL_SIZE, dtype=torch.float32) * 0.01
-        D_t = torch.randn(TILE_ELEMS, dtype=torch.float32) * 0.01
+
+        A = (torch.randn(MATMUL_SIZE, MATMUL_SIZE, dtype=torch.float32) * 0.01).flatten()
+        B = (torch.randn(MATMUL_SIZE, MATMUL_SIZE, dtype=torch.float32) * 0.01).flatten()
+        D = torch.randn(TILE_ELEMS, dtype=torch.float32) * 0.01
         E = torch.randn(TILE_ELEMS, dtype=torch.float32) * 0.01
         G = torch.randn(TILE_ELEMS, dtype=torch.float32) * 0.01
         H = torch.randn(TILE_ELEMS, dtype=torch.float32) * 0.01
 
-        def z():
+        def zeros():
             return torch.zeros(num_iters * TILE_ELEMS, dtype=torch.float32)
 
         return TaskArgsBuilder(
-            Tensor("A", A.flatten()),
-            Tensor("B", B.flatten()),
-            Tensor("C", z()),
-            Tensor("D", D_t),
+            Tensor("A", A),
+            Tensor("B", B),
+            Tensor("C", zeros()),
+            Tensor("D", D),
             Tensor("E", E),
-            Tensor("F", z()),
+            Tensor("F", zeros()),
             Tensor("G", G),
             Tensor("H", H),
-            Tensor("I", z()),
-            Tensor("J", z()),
-            Tensor("K", z()),
-            Tensor("L", z()),
-            Tensor("M", z()),
-            Tensor("N", z()),
-            Tensor("O", z()),
+            Tensor("I", zeros()),
+            Tensor("J", zeros()),
+            Tensor("K", zeros()),
+            Tensor("L", zeros()),
+            Tensor("M", zeros()),
+            Tensor("N", zeros()),
+            Tensor("O", zeros()),
         )
 
     def compute_golden(self, args, params):
         num_iters = params["num_iters"]
-        golden_matmul = torch.matmul(
-            args.A.reshape(MATMUL_SIZE, MATMUL_SIZE), args.B.reshape(MATMUL_SIZE, MATMUL_SIZE)
-        ).flatten()
+
+        A = args.A.reshape(MATMUL_SIZE, MATMUL_SIZE)
+        B = args.B.reshape(MATMUL_SIZE, MATMUL_SIZE)
+
+        golden_matmul = torch.matmul(A, B).flatten()
         golden_add = args.D + args.E
         golden_mul = args.G * args.H
-        for t in [args.C, args.J, args.N]:
-            out = t.reshape(num_iters, TILE_ELEMS)
+
+        for name in ["C", "J", "N"]:
+            out = getattr(args, name).reshape(num_iters, TILE_ELEMS)
             for i in range(num_iters):
                 out[i] = golden_matmul
-        for t in [args.F, args.K, args.L, args.O]:
-            out = t.reshape(num_iters, TILE_ELEMS)
+
+        for name in ["F", "K", "L", "O"]:
+            out = getattr(args, name).reshape(num_iters, TILE_ELEMS)
             for i in range(num_iters):
                 out[i] = golden_add
-        for t in [args.I, args.M]:
-            out = t.reshape(num_iters, TILE_ELEMS)
+
+        for name in ["I", "M"]:
+            out = getattr(args, name).reshape(num_iters, TILE_ELEMS)
             for i in range(num_iters):
                 out[i] = golden_mul
 

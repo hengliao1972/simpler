@@ -7,23 +7,22 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Paged attention — host_build_graph runtime.
+"""Paged attention unroll — tensormap_and_ringbuffer test (production scale, bfloat16).
 
-Tests host_build_graph runtime with AIC+AIV mixed execution and INOUT tensors.
-Templated kernels support variable tile sizes via runtime dispatch.
+Same algorithm as paged_attention but with higher block_dim for unrolled dispatch.
 """
 
 import torch
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, Tensor, scene_test
-from simpler_setup.goldens.paged_attention import compute_golden as _pa_compute_golden  # noqa: PLC0415
-from simpler_setup.goldens.paged_attention import generate_inputs as _pa_generate_inputs  # noqa: PLC0415
+from simpler_setup.goldens.paged_attention import compute_golden as _pa_compute_golden
+from simpler_setup.goldens.paged_attention import generate_inputs as _pa_generate_inputs
 
 
-@scene_test(level=2, runtime="host_build_graph")
-class TestPagedAttentionHostBuildGraph(SceneTestCase):
-    """Paged attention with host_build_graph runtime."""
+@scene_test(level=2, runtime="tensormap_and_ringbuffer")
+class TestPagedAttentionUnroll(SceneTestCase):
+    """Paged attention unroll with tensormap_and_ringbuffer runtime on A5."""
 
     RTOL = 1e-3
     ATOL = 1e-3
@@ -69,23 +68,23 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
     CASES = [
         {
             "name": "Case1",
-            "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 3, "block_dim": 24},
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
             "params": {
                 "batch": 256,
                 "num_heads": 16,
                 "kv_head_num": 1,
                 "head_dim": 128,
                 "block_size": 128,
-                "context_len": 8100,
+                "context_len": 8192,
                 "max_model_len": 32768,
                 "dtype": "bfloat16",
             },
         },
         {
             "name": "Case2",
-            "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 3, "block_dim": 24},
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
             "manual": True,
             "params": {
                 "batch": 64,
@@ -93,39 +92,24 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
                 "kv_head_num": 1,
                 "head_dim": 128,
                 "block_size": 64,
-                "context_len": 8150,
+                "context_len": 8192,
                 "max_model_len": 32768,
                 "dtype": "bfloat16",
             },
         },
         {
-            "name": "small1",
-            "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 3, "block_dim": 3},
-            "params": {
-                "batch": 1,
-                "num_heads": 16,
-                "kv_head_num": 1,
-                "head_dim": 16,
-                "block_size": 16,
-                "context_len": 16,
-                "max_model_len": 256,
-                "dtype": "bfloat16",
-            },
-        },
-        {
-            "name": "small2",
-            "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 3, "block_dim": 3},
+            "name": "Case3",
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
             "manual": True,
             "params": {
-                "batch": 1,
-                "num_heads": 16,
+                "batch": 64,
+                "num_heads": 64,
                 "kv_head_num": 1,
-                "head_dim": 16,
-                "block_size": 16,
-                "context_len": 64,
-                "max_model_len": 256,
+                "head_dim": 256,
+                "block_size": 64,
+                "context_len": 8192,
+                "max_model_len": 32768,
                 "dtype": "bfloat16",
             },
         },

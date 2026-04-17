@@ -7,15 +7,17 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""SPMD basic context accessors: single MIX task verifying block_idx, block_num, sub_block_id.
+"""SPMD sync_start AIV: 4 AIV tasks (3 sync_start + 1 baseline).
 
-Submits one MIX task (AIC + AIV0 + AIV1) with block_dim=1.
-Each subtask writes its SPMD context at a sub_block_id-based offset.
+Exercises AIV-specific fast path (count_idle_aiv_cores) and drain slow path.
 
-Output layout (float32[48], 3 cache lines):
-  [0..15]  = AIC  slot: [block_idx, block_num, pad x14]
-  [16..31] = AIV0 slot: [block_idx, block_num, sub_block_id=0, pad x13]
-  [32..47] = AIV1 slot: [block_idx, block_num, sub_block_id=1, pad x13]
+Tasks:
+  T0: block_num=4,  sync_start=True  -> CL 0..3    (fast path)
+  T1: block_num=16, sync_start=True  -> CL 4..19   (saturate one thread)
+  T2: block_num=4,  sync_start=False -> CL 20..23  (baseline)
+  T3: block_num=24, sync_start=True  -> CL 24..47  (cross-thread drain)
+
+Output tensor: 48 cache lines = 768 float32.
 """
 
 import torch
@@ -25,52 +27,56 @@ from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 
 FLOATS_PER_CACHE_LINE = 16
 
+TASKS = [
+    (4, 0),
+    (16, 4),
+    (4, 20),
+    (24, 24),
+]
+
+TOTAL_CL = sum(block_num for block_num, _ in TASKS)
+
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
-class TestSpmdBasic(SceneTestCase):
-    """SPMD context accessors with a single MIX task."""
-
+class TestSpmdSyncStartAiv(SceneTestCase):
     RTOL = 0
     ATOL = 0
 
     CALLABLE = {
         "orchestration": {
-            "source": "kernels/orchestration/spmd_basic_orch.cpp",
+            "source": "kernels/orchestration/spmd_sync_start_aiv_orch.cpp",
             "function_name": "aicpu_orchestration_entry",
             "signature": [D.INOUT],
         },
         "incores": [
-            {"func_id": 0, "name": "SPMD_READ_AIC", "source": "kernels/aic/kernel_spmd_read.cpp", "core_type": "aic"},
-            {"func_id": 1, "name": "SPMD_READ_AIV0", "source": "kernels/aiv/kernel_spmd_read.cpp", "core_type": "aiv"},
-            {"func_id": 2, "name": "SPMD_READ_AIV1", "source": "kernels/aiv/kernel_spmd_read.cpp", "core_type": "aiv"},
+            {
+                "func_id": 0,
+                "name": "SPMD_WRITE_AIV",
+                "source": "../spmd_multiblock_aiv/kernels/aiv/kernel_spmd_write.cpp",
+                "core_type": "aiv",
+            },
         ],
     }
 
     CASES = [
         {
             "name": "Case1",
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {},
         },
     ]
 
     def generate_args(self, params):
-        output = torch.zeros(3 * FLOATS_PER_CACHE_LINE, dtype=torch.float32)
+        output = torch.zeros(TOTAL_CL * FLOATS_PER_CACHE_LINE, dtype=torch.float32)
         return TaskArgsBuilder(Tensor("output", output))
 
     def compute_golden(self, args, params):
         out = args.output
-        out[0] = 0.0
-        out[1] = 1.0
-        base = 1 * FLOATS_PER_CACHE_LINE
-        out[base + 0] = 0.0
-        out[base + 1] = 1.0
-        out[base + 2] = 0.0
-        base = 2 * FLOATS_PER_CACHE_LINE
-        out[base + 0] = 0.0
-        out[base + 1] = 1.0
-        out[base + 2] = 1.0
+        for block_num, base_cl in TASKS:
+            for block_idx in range(block_num):
+                cl = base_cl + block_idx
+                out[cl * FLOATS_PER_CACHE_LINE] = float(block_idx)
 
 
 if __name__ == "__main__":

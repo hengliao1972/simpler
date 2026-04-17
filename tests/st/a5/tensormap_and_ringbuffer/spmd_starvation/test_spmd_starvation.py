@@ -9,6 +9,15 @@
 # -----------------------------------------------------------------------------------------------------------
 """SPMD starvation prevention: 18 normal MIX + 2 sync_start MIX tasks.
 
+Validates that the drain mechanism prevents sync_start tasks from being starved.
+
+Layout:
+  Wave 1: 6 x normal(block_num=4)      -> CL 0..71
+  Sync 0: 1 x sync_start(block_num=6)  -> CL 72..89
+  Wave 2: 6 x normal(block_num=4)      -> CL 90..161
+  Sync 1: 1 x sync_start(block_num=6)  -> CL 162..179
+  Wave 3: 6 x normal(block_num=4)      -> CL 180..251
+
 Total: 252 CL = 4032 float32.
 """
 
@@ -19,24 +28,27 @@ from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 
 FLOATS_PER_CACHE_LINE = 16
 SLOTS_PER_BLOCK = 3
-NORMAL_BN, SYNC_BN = 4, 6
-NORMAL_CL, SYNC_CL = NORMAL_BN * SLOTS_PER_BLOCK, SYNC_BN * SLOTS_PER_BLOCK
+NORMAL_BLOCK_NUM = 4
+SYNC_BLOCK_NUM = 6
+NORMAL_CL = NORMAL_BLOCK_NUM * SLOTS_PER_BLOCK
+SYNC_CL = SYNC_BLOCK_NUM * SLOTS_PER_BLOCK
 
 
 def _build_tasks():
-    tasks, cl = [], 0
+    tasks = []
+    cl = 0
     for _ in range(6):
-        tasks.append((NORMAL_BN, cl))
+        tasks.append((NORMAL_BLOCK_NUM, cl))
         cl += NORMAL_CL
-    tasks.append((SYNC_BN, cl))
+    tasks.append((SYNC_BLOCK_NUM, cl))
     cl += SYNC_CL
     for _ in range(6):
-        tasks.append((NORMAL_BN, cl))
+        tasks.append((NORMAL_BLOCK_NUM, cl))
         cl += NORMAL_CL
-    tasks.append((SYNC_BN, cl))
+    tasks.append((SYNC_BLOCK_NUM, cl))
     cl += SYNC_CL
     for _ in range(6):
-        tasks.append((NORMAL_BN, cl))
+        tasks.append((NORMAL_BLOCK_NUM, cl))
         cl += NORMAL_CL
     return tasks
 
@@ -81,14 +93,15 @@ class TestSpmdStarvation(SceneTestCase):
     CASES = [
         {
             "name": "Case1",
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {},
-        }
+        },
     ]
 
     def generate_args(self, params):
-        return TaskArgsBuilder(Tensor("output", torch.zeros(TOTAL_CL * FLOATS_PER_CACHE_LINE, dtype=torch.float32)))
+        output = torch.zeros(TOTAL_CL * FLOATS_PER_CACHE_LINE, dtype=torch.float32)
+        return TaskArgsBuilder(Tensor("output", output))
 
     def compute_golden(self, args, params):
         out = args.output

@@ -28,8 +28,6 @@ FLOATS_PER_CACHE_LINE = 16
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
 class TestSpmdBasic(SceneTestCase):
-    """SPMD context accessors with a single MIX task."""
-
     RTOL = 0
     ATOL = 0
 
@@ -49,7 +47,7 @@ class TestSpmdBasic(SceneTestCase):
     CASES = [
         {
             "name": "Case1",
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {},
         },

@@ -7,9 +7,15 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""SPMD starvation prevention: 18 normal MIX + 2 sync_start MIX tasks.
+"""SPMD sync_start: 4 MIX tasks (3 sync_start + 1 baseline).
 
-Total: 252 CL = 4032 float32.
+Tasks (AIC=slot0, AIV0=slot1, AIV1=slot2):
+  T0: block_num=2,  sync_start=True  -> CL 0..5
+  T1: block_num=8,  sync_start=True  -> CL 6..29
+  T2: block_num=2,  sync_start=False -> CL 30..35  (baseline)
+  T3: block_num=12, sync_start=True  -> CL 36..71
+
+Output tensor: 72 cache lines = 1152 float32.
 """
 
 import torch
@@ -19,40 +25,25 @@ from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 
 FLOATS_PER_CACHE_LINE = 16
 SLOTS_PER_BLOCK = 3
-NORMAL_BN, SYNC_BN = 4, 6
-NORMAL_CL, SYNC_CL = NORMAL_BN * SLOTS_PER_BLOCK, SYNC_BN * SLOTS_PER_BLOCK
 
+TASKS = [
+    (2, 0),
+    (8, 6),
+    (2, 30),
+    (12, 36),
+]
 
-def _build_tasks():
-    tasks, cl = [], 0
-    for _ in range(6):
-        tasks.append((NORMAL_BN, cl))
-        cl += NORMAL_CL
-    tasks.append((SYNC_BN, cl))
-    cl += SYNC_CL
-    for _ in range(6):
-        tasks.append((NORMAL_BN, cl))
-        cl += NORMAL_CL
-    tasks.append((SYNC_BN, cl))
-    cl += SYNC_CL
-    for _ in range(6):
-        tasks.append((NORMAL_BN, cl))
-        cl += NORMAL_CL
-    return tasks
-
-
-TASKS = _build_tasks()
-TOTAL_CL = sum(bn * SLOTS_PER_BLOCK for bn, _ in TASKS)
+TOTAL_CL = sum(block_num * SLOTS_PER_BLOCK for block_num, _ in TASKS)
 
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
-class TestSpmdStarvation(SceneTestCase):
+class TestSpmdSyncStart(SceneTestCase):
     RTOL = 0
     ATOL = 0
 
     CALLABLE = {
         "orchestration": {
-            "source": "kernels/orchestration/spmd_starvation_orch.cpp",
+            "source": "kernels/orchestration/spmd_sync_start_orch.cpp",
             "function_name": "aicpu_orchestration_entry",
             "signature": [D.INOUT],
         },
@@ -81,14 +72,15 @@ class TestSpmdStarvation(SceneTestCase):
     CASES = [
         {
             "name": "Case1",
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {},
-        }
+        },
     ]
 
     def generate_args(self, params):
-        return TaskArgsBuilder(Tensor("output", torch.zeros(TOTAL_CL * FLOATS_PER_CACHE_LINE, dtype=torch.float32)))
+        output = torch.zeros(TOTAL_CL * FLOATS_PER_CACHE_LINE, dtype=torch.float32)
+        return TaskArgsBuilder(Tensor("output", output))
 
     def compute_golden(self, args, params):
         out = args.output
