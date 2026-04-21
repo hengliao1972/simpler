@@ -27,47 +27,46 @@
 // =============================================================================
 // Fanin Spill Pool Implementation
 // =============================================================================
-void PTO2FaninPool::reclaim(PTO2SchedulerState &sched, uint8_t ring_id, int32_t sm_last_task_alive) {
+void PTO2FaninPool::reclaim(PTO2SharedMemoryRingHeader &ring, int32_t sm_last_task_alive) {
     if (sm_last_task_alive <= reclaim_task_cursor) return;
 
     int32_t scan_end = sm_last_task_alive;
     for (int32_t task_id = reclaim_task_cursor; task_id < scan_end; ++task_id) {
-        PTO2TaskSlotState &slot_state = sched.ring_sched_states[ring_id].get_slot_state_by_task_id(task_id);
-        PTO2TaskPayload *payload = slot_state.payload;
-        if (payload == nullptr || payload->fanin_spill_pool != this) {
+        PTO2TaskPayload &payload = ring.get_payload_by_task_id(task_id);
+        if (payload.fanin_spill_pool != this) {
             continue;
         }
 
-        int32_t inline_count = std::min(payload->fanin_actual_count, PTO2_FANIN_INLINE_CAP);
-        int32_t spill_edge_count = payload->fanin_actual_count - inline_count;
+        int32_t inline_count = std::min(payload.fanin_actual_count, PTO2_FANIN_INLINE_CAP);
+        int32_t spill_edge_count = payload.fanin_actual_count - inline_count;
         if (spill_edge_count > 0) {
-            advance_tail(payload->fanin_spill_start + spill_edge_count);
+            advance_tail(payload.fanin_spill_start + spill_edge_count);
         }
     }
     reclaim_task_cursor = scan_end;
 }
 
-void PTO2FaninPool::ensure_space(PTO2SchedulerState &sched, PTO2RingFlowControl &fc, uint8_t ring_id, int32_t needed) {
+void PTO2FaninPool::ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed) {
     if (available() >= needed) return;
 
     int spin_count = 0;
-    int32_t prev_last_alive = fc.last_task_alive.load(std::memory_order_acquire);
+    int32_t prev_last_alive = ring.fc.last_task_alive.load(std::memory_order_acquire);
     while (available() < needed) {
-        reclaim(sched, ring_id, prev_last_alive);
+        reclaim(ring, prev_last_alive);
         if (available() >= needed) return;
 
         spin_count++;
 
-        int32_t cur_last_alive = fc.last_task_alive.load(std::memory_order_acquire);
+        int32_t cur_last_alive = ring.fc.last_task_alive.load(std::memory_order_acquire);
         if (cur_last_alive > prev_last_alive) {
             spin_count = 0;
             prev_last_alive = cur_last_alive;
         }
 
         if (spin_count >= PTO2_DEP_POOL_SPIN_LIMIT) {
-            int32_t current = fc.current_task_index.load(std::memory_order_acquire);
+            int32_t current = ring.fc.current_task_index.load(std::memory_order_acquire);
             LOG_ERROR("========================================");
-            LOG_ERROR("FATAL: Fanin Spill Pool Deadlock Detected! (ring %d)", ring_id);
+            LOG_ERROR("FATAL: Fanin Spill Pool Deadlock Detected!");
             LOG_ERROR("========================================");
             LOG_ERROR("Fanin spill pool cannot reclaim space after %d spins (no progress).", spin_count);
             LOG_ERROR(
@@ -98,9 +97,9 @@ void PTO2FaninPool::ensure_space(PTO2SchedulerState &sched, PTO2RingFlowControl 
 // =============================================================================
 // Dependency List Pool Implementation
 // =============================================================================
-void PTO2DepListPool::reclaim(PTO2SchedulerState &sched, uint8_t ring_id, int32_t sm_last_task_alive) {
+void PTO2DepListPool::reclaim(PTO2SharedMemoryRingHeader &ring, int32_t sm_last_task_alive) {
     if (sm_last_task_alive >= last_reclaimed + PTO2_DEP_POOL_CLEANUP_INTERVAL && sm_last_task_alive > 0) {
-        int32_t mark = sched.ring_sched_states[ring_id].get_slot_state_by_task_id(sm_last_task_alive - 1).dep_pool_mark;
+        int32_t mark = ring.get_slot_state_by_task_id(sm_last_task_alive - 1).dep_pool_mark;
         if (mark > 0) {
             advance_tail(mark);
         }
@@ -108,30 +107,28 @@ void PTO2DepListPool::reclaim(PTO2SchedulerState &sched, uint8_t ring_id, int32_
     }
 }
 
-void PTO2DepListPool::ensure_space(
-    PTO2SchedulerState &sched, PTO2RingFlowControl &fc, uint8_t ring_id, int32_t needed
-) {
+void PTO2DepListPool::ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed) {
     if (available() >= needed) return;
 
     int spin_count = 0;
-    int32_t prev_last_alive = fc.last_task_alive.load(std::memory_order_acquire);
+    int32_t prev_last_alive = ring.fc.last_task_alive.load(std::memory_order_acquire);
     while (available() < needed) {
-        reclaim(sched, ring_id, prev_last_alive);
+        reclaim(ring, prev_last_alive);
         if (available() >= needed) return;
 
         spin_count++;
 
         // Progress detection: reset spin counter if last_task_alive advances
-        int32_t cur_last_alive = fc.last_task_alive.load(std::memory_order_acquire);
+        int32_t cur_last_alive = ring.fc.last_task_alive.load(std::memory_order_acquire);
         if (cur_last_alive > prev_last_alive) {
             spin_count = 0;
             prev_last_alive = cur_last_alive;
         }
 
         if (spin_count >= PTO2_DEP_POOL_SPIN_LIMIT) {
-            int32_t current = fc.current_task_index.load(std::memory_order_acquire);
+            int32_t current = ring.fc.current_task_index.load(std::memory_order_acquire);
             LOG_ERROR("========================================");
-            LOG_ERROR("FATAL: Dependency Pool Deadlock Detected! (ring %d)", ring_id);
+            LOG_ERROR("FATAL: Dependency Pool Deadlock Detected!");
             LOG_ERROR("========================================");
             LOG_ERROR("DepListPool cannot reclaim space after %d spins (no progress).", spin_count);
             LOG_ERROR(

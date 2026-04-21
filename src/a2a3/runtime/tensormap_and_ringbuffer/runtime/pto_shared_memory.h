@@ -19,9 +19,11 @@
  *   +---------------------------+
  *   | Ring 0: TaskDescriptor[]  |
  *   | Ring 0: TaskPayload[]     |
+ *   | Ring 0: TaskSlotState[]   |
  *   +---------------------------+
  *   | Ring 1: TaskDescriptor[]  |
  *   | Ring 1: TaskPayload[]     |
+ *   | Ring 1: TaskSlotState[]   |
  *   +---------------------------+
  *   | ...                       |
  *   +---------------------------+
@@ -73,13 +75,34 @@ static_assert(sizeof(PTO2RingFlowControl) == 128, "PTO2RingFlowControl must be e
 /**
  * Per-ring shared memory header section.
  *
- * Groups flow-control and layout info for a single ring to avoid parallel arrays.
+ * Groups flow-control, layout info, and per-ring data pointers for a single ring.
+ * Pointers are host-side only (set by pto2_sm_setup_pointers, invalid on device).
  */
-struct PTO2SharedMemoryRingHeader {
+struct alignas(64) PTO2SharedMemoryRingHeader {
     PTO2RingFlowControl fc;
+
+    // Layout metadata (set once at init)
     uint64_t task_window_size;
+    int32_t task_window_mask;
     uint64_t heap_size;
     uint64_t task_descriptors_offset;  // Offset from SM base, in bytes
+
+    // Per-ring data pointers (host-side, set by pto2_sm_setup_pointers)
+    PTO2TaskDescriptor *task_descriptors;
+    PTO2TaskPayload *task_payloads;
+    PTO2TaskSlotState *slot_states;
+
+    PTO2TaskDescriptor &get_task_by_slot(int32_t slot) { return task_descriptors[slot]; }
+
+    PTO2TaskDescriptor &get_task_by_task_id(int32_t local_id) { return task_descriptors[local_id & task_window_mask]; }
+
+    PTO2TaskPayload &get_payload_by_slot(int32_t slot) { return task_payloads[slot]; }
+
+    PTO2TaskPayload &get_payload_by_task_id(int32_t local_id) { return task_payloads[local_id & task_window_mask]; }
+
+    PTO2TaskSlotState &get_slot_state_by_slot(int32_t slot) { return slot_states[slot]; }
+
+    PTO2TaskSlotState &get_slot_state_by_task_id(int32_t local_id) { return slot_states[local_id & task_window_mask]; }
 };
 
 /**
@@ -116,8 +139,8 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
 };
 
 static_assert(
-    sizeof(PTO2SharedMemoryHeader) % PTO2_ALIGN_SIZE == 0,
-    "PTO2SharedMemoryHeader must be aligned to cache line (PTO2_ALIGN_SIZE)"
+    (sizeof(PTO2SharedMemoryHeader) % PTO2_ALIGN_SIZE == 0) && (sizeof(PTO2SharedMemoryHeader) < 4096),
+    "PTO2SharedMemoryHeader should be reasonably sized"
 );
 
 // =============================================================================
@@ -125,17 +148,14 @@ static_assert(
 // =============================================================================
 
 /**
- * Handle for shared memory access
- * Provides both Orchestrator and Scheduler views of the same memory
+ * Handle for shared memory lifecycle management (create/destroy).
+ * Runtime components (orchestrator, scheduler) use PTO2SharedMemoryHeader* directly.
  */
 struct PTO2SharedMemoryHandle {
     void *sm_base;     // Base address of shared memory
     uint64_t sm_size;  // Total size of shared memory
 
-    // Quick pointers into shared memory regions (per-ring)
     PTO2SharedMemoryHeader *header;
-    PTO2TaskDescriptor *task_descriptors[PTO2_MAX_RING_DEPTH];
-    PTO2TaskPayload *task_payloads[PTO2_MAX_RING_DEPTH];
 
     // Ownership flag
     bool is_owner;  // True if this handle allocated the memory
