@@ -656,6 +656,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     skip_golden,
     enable_profiling,
     enable_dump_tensor,
+    enable_pmu,
 ):
     """Execute a pre-filtered list of cases for one class (layers 5-6).
 
@@ -678,6 +679,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 skip_golden=skip_golden,
                 enable_profiling=enable_profiling,
                 enable_dump_tensor=enable_dump_tensor,
+                enable_pmu=enable_pmu,
             )
         finally:
             if enable_profiling:
@@ -854,7 +856,7 @@ class SceneTestCase:
             return self._compile_l3_callables(platform)
         raise ValueError(f"Unsupported level: {self._st_level}")
 
-    def _build_config(self, config_dict, enable_profiling=False, enable_dump_tensor=False):
+    def _build_config(self, config_dict, enable_profiling=False, enable_dump_tensor=False, enable_pmu=0):
         from simpler.task_interface import ChipCallConfig  # noqa: PLC0415
 
         config = ChipCallConfig()
@@ -862,6 +864,7 @@ class SceneTestCase:
         config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 3)
         config.enable_profiling = enable_profiling
         config.enable_dump_tensor = enable_dump_tensor
+        config.enable_pmu = enable_pmu  # 0=disabled, >0=enabled with event type
         return config
 
     def _resolve_env(self):
@@ -891,6 +894,7 @@ class SceneTestCase:
         skip_golden=False,
         enable_profiling=False,
         enable_dump_tensor=False,
+        enable_pmu=0,
     ):
         if self._st_level == 2:
             self._run_and_validate_l2(
@@ -901,6 +905,7 @@ class SceneTestCase:
                 skip_golden=skip_golden,
                 enable_profiling=enable_profiling,
                 enable_dump_tensor=enable_dump_tensor,
+                enable_pmu=enable_pmu,
             )
         elif self._st_level == 3:
             self._run_and_validate_l3(
@@ -912,10 +917,19 @@ class SceneTestCase:
                 skip_golden=skip_golden,
                 enable_profiling=enable_profiling,
                 enable_dump_tensor=enable_dump_tensor,
+                enable_pmu=enable_pmu,
             )
 
     def _run_and_validate_l2(
-        self, worker, callable_obj, case, rounds=1, skip_golden=False, enable_profiling=False, enable_dump_tensor=False
+        self,
+        worker,
+        callable_obj,
+        case,
+        rounds=1,
+        skip_golden=False,
+        enable_profiling=False,
+        enable_dump_tensor=False,
+        enable_pmu=0,
     ):
         params = case.get("params", {})
         config_dict = case.get("config", {})
@@ -947,6 +961,7 @@ class SceneTestCase:
                 config_dict,
                 enable_profiling=(enable_profiling and round_idx == 0),
                 enable_dump_tensor=enable_dump_tensor,
+                enable_pmu=enable_pmu,
             )
 
             with _temporary_env(self._resolve_env()):
@@ -965,6 +980,7 @@ class SceneTestCase:
         skip_golden=False,
         enable_profiling=False,
         enable_dump_tensor=False,
+        enable_pmu=0,
     ):
         # Defensive belt-and-braces: the pytest dispatcher and run_module both
         # block --enable-profiling for L3 at the CLI boundary. Catch any code
@@ -1013,6 +1029,7 @@ class SceneTestCase:
                 config_dict,
                 enable_profiling=(enable_profiling and round_idx == 0),
                 enable_dump_tensor=enable_dump_tensor,
+                enable_pmu=enable_pmu,
             )
 
             # Orch fn signature: (orch, args, cfg) — inner fn forwards to
@@ -1039,9 +1056,17 @@ class SceneTestCase:
         skip_golden = request.config.getoption("--skip-golden", default=False)
         enable_profiling = request.config.getoption("--enable-profiling", default=False)
         enable_dump_tensor = request.config.getoption("--dump-tensor", default=False)
-        if rounds > 1 and enable_profiling:
-            logger.warning("Profiling disabled: --rounds > 1")
-            enable_profiling = False
+        enable_pmu = request.config.getoption("--enable-pmu", default=0)
+        if rounds > 1:
+            if enable_profiling:
+                logger.warning("Profiling disabled: --rounds > 1")
+                enable_profiling = False
+            if enable_dump_tensor:
+                logger.warning("Dump tensor disabled: --rounds > 1")
+                enable_dump_tensor = False
+            if enable_pmu:
+                logger.warning("PMU disabled: --rounds > 1")
+                enable_pmu = 0
 
         cls_name = type(self).__name__
         callable_obj = self.build_callable(st_platform)
@@ -1086,6 +1111,7 @@ class SceneTestCase:
             skip_golden=skip_golden,
             enable_profiling=enable_profiling,
             enable_dump_tensor=enable_dump_tensor,
+            enable_pmu=enable_pmu,
         )
 
     # ------------------------------------------------------------------
@@ -1129,6 +1155,16 @@ class SceneTestCase:
         parser.add_argument("--skip-golden", action="store_true", help="Skip golden comparison (benchmark mode)")
         parser.add_argument("--enable-profiling", action="store_true", help="Enable profiling (first round only)")
         parser.add_argument("--dump-tensor", action="store_true", help="Dump per-task tensor I/O at runtime")
+        parser.add_argument(
+            "--enable-pmu",
+            nargs="?",
+            const=2,
+            default=0,
+            type=int,
+            metavar="EVENT_TYPE",
+            help="Enable PMU collection. Bare flag = PIPE_UTILIZATION(2). "
+            "Pass event type to override (e.g. --enable-pmu 4)",
+        )
         parser.add_argument("--build", action="store_true", help="Compile runtime from source")
         parser.add_argument(
             "--runtime",
@@ -1318,6 +1354,7 @@ class SceneTestCase:
                                 skip_golden=args.skip_golden,
                                 enable_profiling=args.enable_profiling,
                                 enable_dump_tensor=args.dump_tensor,
+                                enable_pmu=args.enable_pmu,
                             )
                             print("PASSED")
                         except Exception as e:  # noqa: BLE001
