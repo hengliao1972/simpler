@@ -555,21 +555,17 @@ def _run_swimlane_converter(
     device_log: Path | None = None,
     func_names_path: Path | None = None,
 ) -> None:
-    """Invoke ``tools/swimlane_converter.py``.
+    """Invoke the bundled swimlane converter as a subprocess.
 
     When ``input_path`` is given, the converter derives its output filename from
-    the input's timestamp (see ``tools/swimlane_converter.py::_resolve_output_path``).
+    the input's timestamp (see ``swimlane_converter._resolve_output_path``).
     Without it, the converter auto-selects the latest ``l2_perf_records_*.json``.
     """
     import logging  # noqa: PLC0415
     import subprocess  # noqa: PLC0415
 
     logger = logging.getLogger(__name__)
-    script = _project_root() / "tools" / "swimlane_converter.py"
-    if not script.exists():
-        logger.warning(f"Swimlane converter script not found: {script}")
-        return
-    cmd = [sys.executable, str(script)]
+    cmd = [sys.executable, "-m", "simpler_setup.tools.swimlane_converter"]
     if input_path is not None:
         cmd.append(str(input_path))
     if func_names_path is not None:

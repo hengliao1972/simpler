@@ -14,11 +14,11 @@ Converts performance data JSON (.json) to Mermaid flowchart format
 for visualizing task dependencies.
 
 Usage:
-    python3 perf_to_mermaid.py  # Uses latest l2_perf_records_*.json in outputs/
-    python3 perf_to_mermaid.py l2_perf_records_20260210_143526.json
-    python3 perf_to_mermaid.py l2_perf_records_20260210_143526.json -o dependency_graph.md
-    python3 perf_to_mermaid.py l2_perf_records_20260210_143526.json -k kernel_config.py
-    python3 perf_to_mermaid.py l2_perf_records_20260210_143526.json --style compact
+    python -m simpler_setup.tools.perf_to_mermaid  # latest l2_perf_records_*.json under ./outputs/
+    python -m simpler_setup.tools.perf_to_mermaid l2_perf_records_20260210_143526.json
+    python -m simpler_setup.tools.perf_to_mermaid l2_perf_records_20260210_143526.json -o dep.md
+    python -m simpler_setup.tools.perf_to_mermaid l2_perf_records_20260210_143526.json -k kernel_config.py
+    python -m simpler_setup.tools.perf_to_mermaid l2_perf_records_20260210_143526.json --style compact
 """
 
 import argparse
@@ -76,13 +76,6 @@ def load_kernel_config(config_path):
 
     if not config_path.exists():
         raise ValueError(f"Kernel config file not found: {config_path}")
-
-    # Load the Python module dynamically.
-    # kernel_config.py may import `task_interface` from the project's python/ directory,
-    # so ensure it's on sys.path before executing the module.
-    python_dir = str(Path(__file__).resolve().parent.parent / "python")
-    if python_dir not in sys.path:
-        sys.path.insert(0, python_dir)
 
     spec = importlib.util.spec_from_file_location("kernel_config", config_path)
     if spec is None or spec.loader is None:
@@ -280,7 +273,7 @@ def _resolve_input_path(args):
             return None
         return input_path
 
-    outputs_dir = Path(__file__).parent.parent / "outputs"
+    outputs_dir = Path.cwd() / "outputs"
     json_files = list(outputs_dir.glob("l2_perf_records_*.json"))
     if not json_files:
         print(f"Error: no l2_perf_records_*.json under {outputs_dir}", file=sys.stderr)
@@ -304,7 +297,7 @@ def _resolve_output_path(args, input_path):
     else:
         timestamp_part = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    outputs_dir = Path(__file__).parent.parent / "outputs"
+    outputs_dir = Path.cwd() / "outputs"
     outputs_dir.mkdir(exist_ok=True)
     return outputs_dir / f"mermaid_diagram_{timestamp_part}.md"
 

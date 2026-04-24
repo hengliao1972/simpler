@@ -16,10 +16,10 @@ Analyzes scheduling overhead from two sources:
      - From device log (fallback for older data or PTO2_SCHED_PROFILING=1 details)
 
 Usage:
-    python sched_overhead_analysis.py                          # auto-select latest files
-    python sched_overhead_analysis.py --l2-perf-records-json <path>       # specify perf data
-    python sched_overhead_analysis.py --device-log <path>      # specify device log
-    python sched_overhead_analysis.py --l2-perf-records-json <path> -d 0  # resolve from device-0
+    python -m simpler_setup.tools.sched_overhead_analysis                   # auto-select latest files
+    python -m simpler_setup.tools.sched_overhead_analysis --l2-perf-records-json <path>
+    python -m simpler_setup.tools.sched_overhead_analysis --device-log <path>
+    python -m simpler_setup.tools.sched_overhead_analysis --l2-perf-records-json <path> -d 0
 """
 
 import argparse
@@ -28,15 +28,12 @@ import re
 import sys
 from pathlib import Path
 
-try:
-    from device_log_resolver import infer_device_id_from_log_path, resolve_device_log_path
-except ImportError:
-    from tools.device_log_resolver import infer_device_id_from_log_path, resolve_device_log_path
+from .device_log_resolver import infer_device_id_from_log_path, resolve_device_log_path
 
 
 def auto_select_l2_perf_records_json():
-    """Find the latest l2_perf_records_*.json in outputs/ directory."""
-    outputs_dir = Path(__file__).parent.parent / "outputs"
+    """Find the latest l2_perf_records_*.json under ./outputs/."""
+    outputs_dir = Path.cwd() / "outputs"
     files = sorted(outputs_dir.glob("l2_perf_records_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not files:
         raise FileNotFoundError(f"No l2_perf_records_*.json files found in {outputs_dir}")

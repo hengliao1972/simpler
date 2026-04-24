@@ -20,23 +20,20 @@ With no filters: lists all tensors.
 With filters: lists matching tensors. Add --export to save them to txt.
 
 Usage:
-    # List all tensors (auto-picks latest outputs/tensor_dump_* dir)
-    python tools/dump_viewer.py
+    # List all tensors (auto-picks latest outputs/tensor_dump_* dir under ./outputs/)
+    python -m simpler_setup.tools.dump_viewer
 
     # List all tensors in a specific dump dir
-    python tools/dump_viewer.py outputs/tensor_dump_xxx/
+    python -m simpler_setup.tools.dump_viewer outputs/tensor_dump_xxx/
 
     # List before-dispatch inputs of func_id=3 (latest dir)
-    python tools/dump_viewer.py --func 3 --stage before --role input
-
-    # List before-dispatch inputs of func_id=3 (specific dir)
-    python tools/dump_viewer.py outputs/tensor_dump_xxx/ --func 3 --stage before --role input
+    python -m simpler_setup.tools.dump_viewer --func 3 --stage before --role input
 
     # Export them to txt
-    python tools/dump_viewer.py outputs/tensor_dump_xxx/ --func 3 --stage before --role input --export
+    python -m simpler_setup.tools.dump_viewer outputs/tensor_dump_xxx/ --func 3 --stage before --role input --export
 
     # Export a specific tensor by index
-    python tools/dump_viewer.py outputs/tensor_dump_xxx/ --index 42 --export
+    python -m simpler_setup.tools.dump_viewer outputs/tensor_dump_xxx/ --index 42 --export
 """
 
 from __future__ import annotations

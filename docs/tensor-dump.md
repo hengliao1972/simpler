@@ -371,7 +371,7 @@ payload file.
 }
 ```
 
-### 3.3 Inspect with `tools/dump_viewer.py`
+### 3.3 Inspect with `dump_viewer`
 
 The viewer auto-picks the latest `outputs/tensor_dump_*` directory
 when invoked without arguments. It loads the `*.json` manifest found in
@@ -379,16 +379,16 @@ that directory and uses its `bin_file` field to locate the payload:
 
 ```bash
 # List every dumped tensor in the latest run
-python tools/dump_viewer.py
+python -m simpler_setup.tools.dump_viewer
 
 # Filter and save matching tensors to human-readable .txt files
-python tools/dump_viewer.py --func 0 --stage before --role input --export
+python -m simpler_setup.tools.dump_viewer --func 0 --stage before --role input --export
 
 # Export one specific entry by its manifest index
-python tools/dump_viewer.py --index 42
+python -m simpler_setup.tools.dump_viewer --index 42
 
 # Pin to a specific dump directory
-python tools/dump_viewer.py outputs/tensor_dump_20260414_092413 \
+python -m simpler_setup.tools.dump_viewer outputs/tensor_dump_20260414_092413 \
     --task 0x0000000200000a00 --export
 ```
 

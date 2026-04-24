@@ -14,11 +14,11 @@ Converts performance data JSON (.json) to Chrome Trace Event Format JSON
 for visualization in Perfetto (https://ui.perfetto.dev/).
 
 Usage:
-    python3 swimlane_converter.py  # Uses latest l2_perf_records_*.json in outputs/
-    python3 swimlane_converter.py l2_perf_records_20260210_143526.json
-    python3 swimlane_converter.py l2_perf_records_20260210_143526.json -o custom_output.json
-    python3 swimlane_converter.py l2_perf_records_20260210_143526.json -k kernel_config.py
-    python3 swimlane_converter.py l2_perf_records_20260210_143526.json -v
+    python -m simpler_setup.tools.swimlane_converter  # latest l2_perf_records_*.json under ./outputs/
+    python -m simpler_setup.tools.swimlane_converter l2_perf_records_20260210_143526.json
+    python -m simpler_setup.tools.swimlane_converter l2_perf_records_20260210_143526.json -o out.json
+    python -m simpler_setup.tools.swimlane_converter l2_perf_records_20260210_143526.json -k kernel_config.py
+    python -m simpler_setup.tools.swimlane_converter l2_perf_records_20260210_143526.json -v
 """
 
 import argparse
@@ -31,17 +31,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-try:
-    from device_log_resolver import infer_device_id_from_log_path, resolve_device_log_path
-except ImportError:
-    from tools.device_log_resolver import infer_device_id_from_log_path, resolve_device_log_path
-
-try:
-    from sched_overhead_analysis import parse_scheduler_threads
-    from sched_overhead_analysis import run_analysis as run_sched_overhead_analysis
-except ImportError:
-    from tools.sched_overhead_analysis import parse_scheduler_threads
-    from tools.sched_overhead_analysis import run_analysis as run_sched_overhead_analysis
+from .device_log_resolver import infer_device_id_from_log_path, resolve_device_log_path
+from .sched_overhead_analysis import parse_scheduler_threads
+from .sched_overhead_analysis import run_analysis as run_sched_overhead_analysis
 
 
 def _func_id_to_letter(func_id):
@@ -144,13 +136,6 @@ def load_kernel_config(config_path):
 
     if not config_path.exists():
         raise ValueError(f"Kernel config file not found: {config_path}")
-
-    # Load the Python module dynamically.
-    # kernel_config.py may import `task_interface` from the project's python/ directory,
-    # so ensure it's on sys.path before executing the module.
-    python_dir = str(Path(__file__).resolve().parent.parent / "python")
-    if python_dir not in sys.path:
-        sys.path.insert(0, python_dir)
 
     spec = importlib.util.spec_from_file_location("kernel_config", config_path)
     if spec is None or spec.loader is None:
@@ -1160,7 +1145,7 @@ def _resolve_input_path(args):
             return None
         return input_path
 
-    outputs_dir = Path(__file__).parent.parent / "outputs"
+    outputs_dir = Path.cwd() / "outputs"
     json_files = list(outputs_dir.glob("l2_perf_records_*.json"))
     if not json_files:
         print(f"Error: No l2_perf_records_*.json files found in {outputs_dir}", file=sys.stderr)
@@ -1184,7 +1169,7 @@ def _resolve_output_path(args, input_path):
     else:
         timestamp_part = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    outputs_dir = Path(__file__).parent.parent / "outputs"
+    outputs_dir = Path.cwd() / "outputs"
     outputs_dir.mkdir(exist_ok=True)
     return outputs_dir / f"merged_swimlane_{timestamp_part}.json"
 

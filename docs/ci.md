@@ -214,30 +214,6 @@ class TestVectorExample(SceneTestCase):
 
 No `--platform` means "run all sims" — tests with no sim in their `platforms` list are skipped. No additional markers are used.
 
-## Discovery Layer (`tools/test_catalog.py`)
-
-Single source of truth for platform, runtime, and test case discovery. Used by `tests/conftest.py` (via import) and available as a CLI for scripting.
-
-### Python API
-
-```python
-from test_catalog import (
-    discover_platforms,           # -> ["a2a3", "a2a3sim", "a5", "a5sim"]
-    discover_runtimes_for_arch,   # -> ["host_build_graph", "aicpu_build_graph", ...]
-    discover_test_cases,          # -> [TestCase(name, dir, arch, runtime, source), ...]
-    arch_from_platform,           # "a2a3sim" -> "a2a3"
-)
-```
-
-### CLI
-
-```bash
-python tools/test_catalog.py platforms
-python tools/test_catalog.py runtimes --arch a2a3
-python tools/test_catalog.py cases --platform a2a3sim --source example
-python tools/test_catalog.py cases --platform a2a3 --source st --format json
-```
-
 ## Platform notes
 
 - **macOS libomp collision**: on macOS, the root `conftest.py` sets `KMP_DUPLICATE_LIB_OK=TRUE` before `import pytest` to work around a duplicate-libomp abort triggered by homebrew numpy and pip torch coexisting in one Python process (see [macos-libomp-collision.md](macos-libomp-collision.md)). Standalone `python test_*.py` bypasses conftest — rely on the env var being exported by the shell or `tools/verify_packaging.sh`.

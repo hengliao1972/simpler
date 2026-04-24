@@ -9,7 +9,6 @@
 """Pytest configuration for platform-aware testing."""
 
 import os
-import sys
 from pathlib import Path
 
 import pytest
@@ -17,16 +16,41 @@ import pytest
 PROJECT_ROOT = Path(__file__).parent.parent
 
 
-# Make tools/ importable so we can use the shared discovery module
-_tools_dir = str(PROJECT_ROOT / "tools")
-if _tools_dir not in sys.path:
-    sys.path.insert(0, _tools_dir)
+def arch_from_platform(platform: str) -> str:
+    """Extract architecture name from platform (e.g. 'a2a3sim' -> 'a2a3')."""
+    if platform.endswith("sim"):
+        return platform[:-3]
+    return platform
 
-from test_catalog import (  # noqa: E402
-    arch_from_platform,
-    discover_platforms,
-    discover_runtimes_for_arch,
-)
+
+def discover_platforms() -> list[str]:
+    """Scan src/*/platform/{onboard,sim}/ for available platforms."""
+    src_dir = PROJECT_ROOT / "src"
+    if not src_dir.exists():
+        return []
+
+    platforms: list[str] = []
+    for arch_dir in sorted(src_dir.iterdir()):
+        if not arch_dir.is_dir():
+            continue
+        platform_dir = arch_dir / "platform"
+        if not platform_dir.exists():
+            continue
+        if (platform_dir / "onboard").exists():
+            platforms.append(arch_dir.name)
+        if (platform_dir / "sim").exists():
+            platforms.append(f"{arch_dir.name}sim")
+    return platforms
+
+
+def discover_runtimes_for_arch(arch: str) -> list[str]:
+    """Scan src/{arch}/runtime/*/build_config.py for available runtimes."""
+    runtime_dir = PROJECT_ROOT / "src" / arch / "runtime"
+    if not runtime_dir.exists():
+        return []
+    return [
+        item.name for item in sorted(runtime_dir.iterdir()) if item.is_dir() and (item / "build_config.py").exists()
+    ]
 
 
 @pytest.fixture
