@@ -85,6 +85,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             }
 
             if (l2_perf_enabled) {
+                dcci(my_hank, SINGLE_CACHE_LINE);
                 uint64_t end_time = get_sys_cnt_aicore();
                 __gm__ L2PerfBuffer *l2_perf_buf = (__gm__ L2PerfBuffer *)my_hank->l2_perf_records_addr;
                 l2_perf_aicore_record_task(l2_perf_buf, actual_task_id, start_time, end_time);
