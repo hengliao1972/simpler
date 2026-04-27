@@ -28,8 +28,6 @@
 #include <stdint.h>
 #include <string.h>
 
-#include <utility>
-
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #endif
@@ -40,11 +38,12 @@
 #include "tensor_arg.h"
 
 // Task arguments
-#define MAX_TENSOR_ARGS 16   // Maximum tensor arguments per task
-#define MAX_SCALAR_ARGS 32   // Maximum scalar arguments per task
-#define PTO2_MAX_OUTPUTS 16  // Maximum outputs per task
-#define PTO2_MAX_INPUTS 16   // Maximum inputs per task
-#define PTO2_MAX_INOUTS 8    // Maximum in-out args per task
+#define MAX_TENSOR_ARGS 16         // Maximum tensor arguments per task
+#define MAX_SCALAR_ARGS 32         // Maximum scalar arguments per task
+#define PTO2_MAX_OUTPUTS 16        // Maximum outputs per task
+#define PTO2_MAX_INPUTS 16         // Maximum inputs per task
+#define PTO2_MAX_INOUTS 8          // Maximum in-out args per task
+#define PTO2_MAX_EXPLICIT_DEPS 16  // Maximum explicit task dependencies per task
 
 typedef enum {
     PTO2_ASYNC_ENGINE_SDMA = 0,
@@ -61,6 +60,11 @@ enum class PTO2CompletionType : int32_t {
 // =============================================================================
 // Task Output Tensors (return value from submit)
 // =============================================================================
+
+enum class PTO2ScopeMode : uint8_t {
+    AUTO = 0,
+    MANUAL = 1,
+};
 
 /**
  * TaskOutputTensors — returned by submit, holds materialized output Tensors.
@@ -105,6 +109,8 @@ private:
     uint32_t output_count_;
     const Tensor *tensors_[PTO2_MAX_OUTPUTS];
 };
+
+using TaskSubmitResult = TaskOutputTensors;
 
 // =============================================================================
 // Argument Types (for pto_submit_task API)
@@ -155,6 +161,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
         clear();
         has_error = false;
         error_msg = nullptr;
+        explicit_deps_.reset();
     }
 
     void set_error(const char *msg) {
@@ -166,7 +173,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
 
     template <typename... Args>
     void add_input(Args &&...args) {
-        if (!check_add_tensor_valid<false>(std::forward<Args>(args)...)) {
+        if (!check_add_tensor_valid<false>(args...)) {
             return;
         }
         ((tensors_[tensor_count_].ptr = &args, tags_[tensor_count_] = TensorArgType::INPUT, tensor_count_++), ...);
@@ -177,7 +184,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
     ///   add_output(t1, t2)           — write-only existing tensors (OUTPUT_EXISTING)
     template <typename... Args>
     void add_output(Args &&...args) {
-        if (!check_add_tensor_valid<true>(std::forward<Args>(args)...)) return;
+        if (!check_add_tensor_valid<true>(args...)) return;
         if constexpr ((std::is_same_v<std::decay_t<Args>, TensorCreateInfo> && ...)) {
             ((tensors_[tensor_count_].create_info = &args, tags_[tensor_count_] = TensorArgType::OUTPUT,
               tensor_count_++),
@@ -191,7 +198,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
 
     template <typename... Args>
     void add_inout(Args &&...args) {
-        if (!check_add_tensor_valid<false>(std::forward<Args>(args)...)) {
+        if (!check_add_tensor_valid<false>(args...)) {
             return;
         }
         ((tensors_[tensor_count_].ptr = &args, tags_[tensor_count_] = TensorArgType::INOUT, tensor_count_++), ...);
@@ -200,9 +207,26 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
     /// No-dependency existing tensor: skips OverlapMap lookup, depends on creator only.
     template <typename... Args>
     void add_no_dep(Args &&...args) {
-        if (!check_add_tensor_valid<false>(std::forward<Args>(args)...)) return;
+        if (!check_add_tensor_valid<false>(args...)) return;
         ((tensors_[tensor_count_].ptr = &args, tags_[tensor_count_] = TensorArgType::NO_DEP, tensor_count_++), ...);
     }
+
+    template <typename... TaskIds>
+    void add_dep(TaskIds... task_ids) {
+        static_assert(sizeof...(TaskIds) >= 1, "add_dep: at least one task id is required");
+        static_assert(
+            (std::is_same_v<std::decay_t<TaskIds>, PTO2TaskId> && ...), "add_dep: all arguments must be PTO2TaskId"
+        );
+        if (explicit_deps_.size() + sizeof...(TaskIds) > PTO2_MAX_EXPLICIT_DEPS) {
+            set_error("Too many explicit deps (exceeds explicit dependency capacity=16)");
+            return;
+        }
+        (explicit_deps_.add(task_ids), ...);
+    }
+
+    uint32_t explicit_dep_count() const { return explicit_deps_.size(); }
+
+    PTO2TaskId explicit_dep(uint32_t index) const { return explicit_deps_.get(index); }
 
     /**
      * Add scalar values. Types are deduced per argument; each value is
@@ -281,6 +305,30 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
     }
 
 private:
+    struct ExplicitDepStorage {
+        PTO2TaskId task_ids[PTO2_MAX_EXPLICIT_DEPS]{};
+        uint32_t count{0};
+
+        void reset() { count = 0; }
+
+        bool add(PTO2TaskId task_id) {
+            if (count >= PTO2_MAX_EXPLICIT_DEPS) {
+                return false;
+            }
+            task_ids[count++] = task_id;
+            return true;
+        }
+
+        uint32_t size() const { return count; }
+
+        PTO2TaskId get(uint32_t index) const {
+            always_assert(index < count);
+            return task_ids[index];
+        }
+    };
+
+    ExplicitDepStorage explicit_deps_;
+
     template <bool is_output, typename... Args>
     bool check_add_tensor_valid(Args &&...) {
         static_assert(sizeof...(Args) >= 1, "at least one argument required");
