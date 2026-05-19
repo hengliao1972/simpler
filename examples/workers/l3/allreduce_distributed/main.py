@@ -80,8 +80,8 @@ def parse_device_range(spec: str) -> list[int]:
         ids = list(range(lo, hi + 1))
     else:
         ids = [int(spec)]
-    if len(ids) != 2:
-        raise ValueError(f"allreduce_distributed needs exactly 2 devices, got {ids}")
+    if not (2 <= len(ids) <= 16):
+        raise ValueError(f"allreduce_distributed needs between 2 and 16 devices, got {len(ids)} ({ids})")
     return ids
 
 
@@ -228,7 +228,7 @@ def run(
                 chip_args.add_scalar(domain.device_ctx)
                 orch.submit_next_level(chip_cid, chip_args, cfg, worker=i)
 
-        print("[allreduce] running 2-chip allreduce DAG...")
+        print(f"[allreduce] running {nranks}-chip allreduce DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())
 
         expected = torch.tensor(expected_output(nranks), dtype=torch.float32)
@@ -254,7 +254,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 
     parser.add_argument("-p", "--platform", default="a2a3", help="Platform backend, e.g. a2a3 or a2a3sim.")
-    parser.add_argument("-d", "--device", default="0-1", help="Device range, e.g. '0-1'. Two chips required.")
+    parser.add_argument(
+        "-d", "--device", default="0-1", help="Device range, e.g. '0-1' or '0-3'. 2 to 16 chips required."
+    )
     parser.add_argument(
         "--build", action="store_true", help="Rebuild runtime from source instead of using cached libs."
     )
