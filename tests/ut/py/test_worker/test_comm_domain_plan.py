@@ -201,6 +201,37 @@ class TestChipWorkerCommDomainBindings:
     def test_native_worker_exposes_multi_domain_comm_methods(self):
         worker = _ChipWorker()
 
-        assert hasattr(worker, "comm_create_subcomm")
-        assert hasattr(worker, "comm_create_domain")
+        assert hasattr(worker, "comm_derive_context")
         assert hasattr(worker, "comm_destroy_all")
+
+
+class TestChipBootstrapConfigRejectsOrphanHostStaging:
+    """Bootstrap config without a `comm` plan must not silently drop host staging.
+
+    Pre-validation guard: host_inputs / host_outputs are keyed by
+    `(domain_name, buffer_name)`, so without a plan there is no domain to
+    attach them to and `bootstrap_context` would discard them.  Failing in
+    `domain_bootstrap_configs` keeps the error close to the caller's mistake
+    instead of surfacing later as a missing buffer pointer on the chip.
+    """
+
+    def test_host_inputs_without_comm_plan_raises(self):
+        cfg = ChipBootstrapConfig(
+            comm=None,
+            host_inputs=[HostBufferStaging(domain_name=None, name="x", shm_name="psm_x", size=16)],
+        )
+        with pytest.raises(ValueError, match="host_inputs requires a comm plan"):
+            cfg.domain_bootstrap_configs()
+
+    def test_host_outputs_without_comm_plan_raises(self):
+        cfg = ChipBootstrapConfig(
+            comm=None,
+            host_outputs=[HostBufferStaging(domain_name=None, name="y", shm_name="psm_y", size=16)],
+        )
+        with pytest.raises(ValueError, match="host_outputs requires a comm plan"):
+            cfg.domain_bootstrap_configs()
+
+    def test_no_comm_plan_and_no_staging_is_fine(self):
+        # Pure no-op config: no domains, no staging. Returns empty list.
+        cfg = ChipBootstrapConfig(comm=None)
+        assert cfg.domain_bootstrap_configs() == []

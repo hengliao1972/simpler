@@ -306,6 +306,21 @@ class ChipBootstrapConfig:
 
     def domain_bootstrap_configs(self) -> list[ChipDomainBootstrapConfig]:
         if self.comm is None:
+            # Host staging is keyed by `(domain_name, buffer_name)`, so without a
+            # `comm` plan there is no domain to attach it to and the staging
+            # would silently be dropped by `bootstrap_context`. Surface this
+            # mismatch at config-construction time instead of after the chip
+            # child is already forked.
+            if self.host_inputs:
+                raise ValueError(
+                    "ChipBootstrapConfig.host_inputs requires a comm plan (cfg.comm is None); "
+                    f"got {len(self.host_inputs)} entries that would never be staged"
+                )
+            if self.host_outputs:
+                raise ValueError(
+                    "ChipBootstrapConfig.host_outputs requires a comm plan (cfg.comm is None); "
+                    f"got {len(self.host_outputs)} entries that would never be flushed"
+                )
             return []
         if not isinstance(self.comm, list):
             raise TypeError("ChipBootstrapConfig.comm must be a list of ChipDomainBootstrapConfig or None")
@@ -575,38 +590,6 @@ class ChipWorker:
             Opaque communicator handle (uint64) for the other ``comm_*`` calls.
         """
         return int(self._impl.comm_init(int(rank), int(nranks), str(rootinfo_path)))
-
-    def comm_create_subcomm(
-        self,
-        comm_handle: int,
-        sub_comm_id: int,
-        rank_ids: list[int],
-        sub_comm_rank_id: int,
-    ) -> int:
-        """Create a domain communicator from a hidden base communicator."""
-        return int(
-            self._impl.comm_create_subcomm(
-                int(comm_handle),
-                int(sub_comm_id),
-                [int(x) for x in rank_ids],
-                int(sub_comm_rank_id),
-            )
-        )
-
-    def comm_create_domain(
-        self,
-        sub_comm_id: int,
-        rank_ids: list[int],
-        sub_comm_rank_id: int,
-    ) -> int:
-        """Create a domain communicator from the ChipWorker-owned base communicator."""
-        return int(
-            self._impl.comm_create_domain(
-                int(sub_comm_id),
-                [int(x) for x in rank_ids],
-                int(sub_comm_rank_id),
-            )
-        )
 
     def comm_alloc_windows(self, comm_handle: int, win_size: int) -> int:
         """Allocate per-rank windows. Returns a device CommContext pointer (uint64)."""
