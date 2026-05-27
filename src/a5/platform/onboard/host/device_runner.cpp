@@ -195,40 +195,75 @@ static int prof_free_cb(void *dev_ptr) { return rtFree(dev_ptr); }
 
 DeviceRunner::~DeviceRunner() { finalize(); }
 
-int DeviceRunner::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size) {
-    if (static_arena_.is_committed()) {
-        if (gm_heap_size <= cached_gm_heap_size_ && gm_sm_size <= cached_gm_sm_size_) return 0;
-        static_arena_.release();
-        gm_heap_region_off_ = SIZE_MAX;
-        gm_sm_region_off_ = SIZE_MAX;
+int DeviceRunner::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) {
+    // Three independent device_malloc'd buffers: GM heap, PTO2 SM, prebuilt
+    // runtime arena. Split out from a single large allocation because the
+    // combined size can exceed the device allocator's largest contiguous
+    // block. Each arena commits exactly one region, so its base() is the
+    // pooled pointer the caller wants.
+    //
+    // Idempotent for the production case (sizes do not change across a
+    // worker's lifetime). If a caller asks for a larger layout on any
+    // region, redo just that region — already-committed peers stay alive
+    // so their callers don't have to re-acquire.
+    auto commit_region = [](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
+        if (requested_size == 0) {
+            // hbg's runtime_arena path: caller passed 0 and never reserved
+            // a region. Leave the arena uncommitted; acquire_pooled_* will
+            // return nullptr.
+            if (arena.is_committed() && cached_size != 0) {
+                arena.release();
+                cached_size = 0;
+            }
+            return 0;
+        }
+        if (arena.is_committed() && requested_size <= cached_size) {
+            return 0;
+        }
+        arena.release();
+        cached_size = 0;
+        arena.reserve(requested_size, DeviceArena::kDefaultBaseAlign);
+        if (arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
+            // commit() failure leaves committed_=false, so the next entry's
+            // is_committed() guard skips the release branch. release() is
+            // idempotent on a never-committed arena (zeroes cursor_).
+            arena.release();
+            return -1;
+        }
+        cached_size = requested_size;
+        return 0;
+    };
+    if (commit_region(gm_heap_arena_, cached_gm_heap_size_, gm_heap_size) != 0) return -1;
+    if (commit_region(gm_sm_arena_, cached_gm_sm_size_, gm_sm_size) != 0) {
+        gm_heap_arena_.release();
         cached_gm_heap_size_ = 0;
-        cached_gm_sm_size_ = 0;
-    }
-    gm_heap_region_off_ = static_arena_.reserve(gm_heap_size, DeviceArena::kDefaultBaseAlign);
-    gm_sm_region_off_ = static_arena_.reserve(gm_sm_size, DeviceArena::kDefaultBaseAlign);
-    if (static_arena_.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
-        // Roll back the two reserves: commit() failure leaves committed_=false,
-        // so the next entry would skip the release branch and stack new
-        // reserves on top of the stale cursor. release() is idempotent on a
-        // never-committed arena (just zeroes cursor_ / region_count_).
-        static_arena_.release();
-        gm_heap_region_off_ = SIZE_MAX;
-        gm_sm_region_off_ = SIZE_MAX;
         return -1;
     }
-    cached_gm_heap_size_ = gm_heap_size;
-    cached_gm_sm_size_ = gm_sm_size;
+    if (commit_region(runtime_arena_pool_, cached_runtime_arena_size_, runtime_arena_size) != 0) {
+        gm_heap_arena_.release();
+        gm_sm_arena_.release();
+        cached_gm_heap_size_ = 0;
+        cached_gm_sm_size_ = 0;
+        return -1;
+    }
     return 0;
 }
 
 void *DeviceRunner::acquire_pooled_gm_heap() {
-    if (!static_arena_.is_committed()) return nullptr;
-    return static_arena_.region_ptr(gm_heap_region_off_);
+    if (!gm_heap_arena_.is_committed()) return nullptr;
+    return gm_heap_arena_.base();
 }
 
 void *DeviceRunner::acquire_pooled_gm_sm() {
-    if (!static_arena_.is_committed()) return nullptr;
-    return static_arena_.region_ptr(gm_sm_region_off_);
+    if (!gm_sm_arena_.is_committed()) return nullptr;
+    return gm_sm_arena_.base();
+}
+
+void *DeviceRunner::acquire_pooled_runtime_arena() {
+    // hbg calls setup_static_arena(...,0) and leaves runtime_arena_pool_
+    // uncommitted — fail loudly if a caller asks for it anyway.
+    if (!runtime_arena_pool_.is_committed()) return nullptr;
+    return runtime_arena_pool_.base();
 }
 
 std::thread DeviceRunner::create_thread(std::function<void()> fn) {
@@ -1050,14 +1085,25 @@ int DeviceRunner::finalize() {
         pmu_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
 
-    // Release per-Worker static arena (GM heap + PTO2 SM in a single backing
-    // device allocation). Must precede mem_alloc_.finalize() so the arena
-    // frees through the still-live allocator, not after it.
-    static_arena_.release();
-    gm_heap_region_off_ = SIZE_MAX;
-    gm_sm_region_off_ = SIZE_MAX;
+    // Release the three per-Worker pooled arenas (GM heap, PTO2 SM, optional
+    // trb prebuilt runtime arena — each its own device_malloc). Must precede
+    // mem_alloc_.finalize() so the arenas free through the still-live
+    // allocator, not after it.
+    gm_heap_arena_.release();
+    gm_sm_arena_.release();
+    runtime_arena_pool_.release();
     cached_gm_heap_size_ = 0;
     cached_gm_sm_size_ = 0;
+    cached_runtime_arena_size_ = 0;
+
+    // Free the 8-byte device_wall buffer (allocated lazily in run()) while
+    // mem_alloc_ and the device context are still live. free_tensor() routes
+    // through mem_alloc_.free(), so it must run before finalize() and before
+    // rtDeviceReset() tears down the device runtime.
+    if (device_wall_dev_ptr_ != nullptr) {
+        free_tensor(device_wall_dev_ptr_);
+        device_wall_dev_ptr_ = nullptr;
+    }
 
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     mem_alloc_.finalize();
@@ -1068,11 +1114,6 @@ int DeviceRunner::finalize() {
         return rc;
     }
 
-    // Free the 8-byte device_wall buffer (allocated lazily in run()).
-    if (device_wall_dev_ptr_ != nullptr) {
-        free_tensor(device_wall_dev_ptr_);
-        device_wall_dev_ptr_ = nullptr;
-    }
     device_id_ = -1;
     block_dim_ = 0;
     worker_count_ = 0;

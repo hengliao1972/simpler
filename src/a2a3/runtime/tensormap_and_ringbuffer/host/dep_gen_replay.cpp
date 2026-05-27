@@ -487,11 +487,15 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         PTO2TensorMap::reserve_layout(replay_arena, PTO2_TENSORMAP_NUM_BUCKETS, pool_size, task_window_sizes);
     auto annot_layout =
         PTO2TensorMap::reserve_layout(replay_arena, PTO2_TENSORMAP_NUM_BUCKETS, pool_size, task_window_sizes);
-    if (replay_arena.commit() == nullptr || !tm_oracle.init_from_layout(oracle_layout, replay_arena) ||
-        !tm_annot.init_from_layout(annot_layout, replay_arena)) {
+    if (replay_arena.commit() == nullptr || !tm_oracle.init_data_from_layout(oracle_layout, replay_arena) ||
+        !tm_annot.init_data_from_layout(annot_layout, replay_arena)) {
         LOG_ERROR("dep_gen replay: tensormap.init failed (buckets=%d, pool=%d)", PTO2_TENSORMAP_NUM_BUCKETS, pool_size);
         return -3;
     }
+    // Replay tensormaps live entirely on host; only arena-internal pointer
+    // fields need wiring (no parent-orch back-reference exists anymore).
+    tm_oracle.wire_arena_pointers(oracle_layout, replay_arena);
+    tm_annot.wire_arena_pointers(annot_layout, replay_arena);
 
     // JSON output accumulators.
     std::vector<TaskTableEntry> task_table;
