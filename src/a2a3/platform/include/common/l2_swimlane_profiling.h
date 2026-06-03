@@ -30,7 +30,9 @@
  * │ L2SwimlaneAicoreTaskPool[0..num_cores-1]                    │
  * │  - head:       active L2SwimlaneAicoreTaskBuffer (AICore    │
  * │                dcci-polls; AICPU rotates at dispatch        │
- * │                boundaries by bumping current_buf_seq)       │
+ * │                boundaries by counting per-core dispatches   │
+ * │                and bumping current_buf_seq when the count   │
+ * │                crosses PLATFORM_AICORE_BUFFER_SIZE)         │
  * │  - free_queue: SPSC ring of recycled AICore buffers         │
  * ├─────────────────────────────────────────────────────────────┤
  * │ L2SwimlaneAicpuSchedPhasePool[0..num_sched_phase_threads-1] │
@@ -83,45 +85,45 @@ enum class L2SwimlaneLevel : uint32_t {
 };
 
 // =============================================================================
-// L2SwimlaneAicpuTaskRecord - Single Task Execution Record
+// L2SwimlaneAicpuTaskRecord - AICPU-side timing record
 // =============================================================================
 
 /**
- * Single task execution record.
+ * AICPU-side timing record. The minimal AICPU-only payload after the
+ * AICore-as-producer split: identity (task_token_raw, core_type) and
+ * AICore-side timing (start/end) all live in L2SwimlaneAicoreTaskRecord; the
+ * AICPU record only carries the two timestamps the AICore side cannot
+ * produce, plus the host-side join key against the AICore stream.
+ *
+ *   - dispatch_time : AICPU timestamp when DATA_MAIN_BASE was written.
+ *   - finish_time   : AICPU timestamp when AICPU observed FIN.
+ *   - reg_task_id   : per-core monotonic dispatch token; join key against
+ *                     L2SwimlaneAicoreTaskRecord.reg_task_id.
+ *
+ * Host post-processing pulls task_token_raw + start_time + end_time from
+ * the matched AICore record, derives core_type from the per-core static
+ * table published via L2SwimlaneCollector::set_core_types, and emits
+ * func_id = -1 (resolved post-process by `swimlane_converter.py` from
+ * deps.json's `kernel_ids[]`). Same path AICORE_TIMING (level=1) uses.
  *
  * Fanout edges live in the static DAG (deps.json from dep_gen) — not in
  * this record. Keeping fanout out of the hot AICPU commit path avoids a
  * per-task ~1 KB GM store + a linked-list walk on the scheduler's
- * critical fanin tail. The host swimlane export emits empty fanout
- * fields; `swimlane_converter.py` joins deps.json at post-process time.
+ * critical fanin tail. `swimlane_converter.py` joins deps.json at
+ * post-process time.
+ *
+ * Layout: 16B timing + 4B reg_task_id → 20B logical; `aligned(32)` rounds
+ * the struct size up to 32B (compiler-inserted trailing pad) and forces
+ * 32B placement alignment so each record sits in one half of a 64B cache
+ * line. Two records per cache line.
  */
 struct L2SwimlaneAicpuTaskRecord {
-    // Timing information (device clock timestamps)
-    uint64_t start_time;  // Task start timestamp (get_sys_cnt) — host-filled at flush from AICore buffer
-    uint64_t end_time;    // Task end timestamp — host-filled at flush from AICore buffer
-    uint64_t duration;    // Execution duration (end - start) — host-filled at flush
-
-    // AICPU-side timestamps (written by AICPU directly)
     uint64_t dispatch_time;  // AICPU timestamp: when task was dispatched to AICore
     uint64_t finish_time;    // AICPU timestamp: when AICPU observed task completion
+    uint32_t reg_task_id;    // Per-core dispatch token; host join key vs AICore record
+} __attribute__((aligned(32)));
 
-    // Full PTO2 task id (host-visible identity, what swimlane export and
-    // dep_gen join keys use). For tensormap_and_ringbuffer this is
-    // (ring_id << 32) | local_id; for host_build_graph it is the plain
-    // integer task index.
-    uint64_t task_id;
-    uint32_t func_id;      // Kernel function identifier
-    CoreType core_type;    // Core type (AIC/AIV)
-    uint32_t reg_task_id;  // Register dispatch token (monotonic per core).
-                           // Used by the host as the join key against
-                           // L2SwimlaneAicoreTaskRecord.task_id, which is what
-                           // AICore writes into the slim record.
-} __attribute__((aligned(64)));
-
-static_assert(
-    sizeof(L2SwimlaneAicpuTaskRecord) % 64 == 0,
-    "L2SwimlaneAicpuTaskRecord must be 64-byte aligned for optimal cache performance"
-);
+static_assert(sizeof(L2SwimlaneAicpuTaskRecord) == 32, "L2SwimlaneAicpuTaskRecord must be 32B");
 
 // =============================================================================
 // L2SwimlaneAicoreTaskRecord - Slim AICore-Only Record (written by AICore, read by Host)
@@ -130,17 +132,41 @@ static_assert(
 /**
  * Slim per-task record written by AICore directly into its own per-core
  * output buffer (no staging slot, no AICPU read). AICPU never touches this
- * record. The host post-processor joins it against the AICPU-side
- * L2SwimlaneAicpuTaskRecord on `task_id` at flush time.
+ * record at AICORE_TIMING (level=1); at AICPU_TIMING+ the host joins it
+ * against the AICPU record stream on `reg_task_id` (NOT `task_token_raw`).
  *
- * Layout: 24B payload + 8B pad → 32B (half a cache line). Two records pack
- * into one cache line so AICore's per-task store is at most a single line
- * commit + dcci.
+ * Two identity fields with different roles:
+ *
+ * - `task_token_raw` — the PTO2 task identity `(ring_id << 32) | local_id`.
+ *   Per-task unique. AICore reads it from
+ *   `LocalContext.async_ctx.task_token.raw` (already in the dispatch
+ *   payload's cache line). The host pulls it from here as the canonical
+ *   task id + ring decoder at ALL levels — the AICPU record carries no
+ *   identity after the slim-down (only dispatch/finish timestamps and the
+ *   reg_task_id join key), so AICore is the single source of truth for
+ *   task identity. NOT a join key on its own: SPMD `block_num > num_cores`,
+ *   MIX cluster spread, and pipeline dual-issue all dispatch the same
+ *   `task_token_raw` multiple times to the same core, each producing one
+ *   AICore execution record sharing the same token. The host disambiguates
+ *   by `reg_task_id` below.
+ *
+ * - `reg_task_id` — the per-core dispatch token (low 32 bits of the
+ *   per-core monotonic `dispatch_seq`). Per-dispatch unique within a core.
+ *   At level≥2 the host uses this as the join key against the AICPU
+ *   record stream's `L2SwimlaneAicpuTaskRecord.reg_task_id`. Each dispatch
+ *   produces one AICore record + one AICPU record sharing the same
+ *   reg_task_id, giving a clean 1:1 join even when multiple dispatches
+ *   of the same task land on the same core.
+ *
+ * Layout: 24B identity/timing + 4B reg_task_id + 4B pad → 32B (half a
+ * cache line). Two records pack into one cache line so AICore's per-task
+ * store is at most a single line commit + dcci.
  */
 struct L2SwimlaneAicoreTaskRecord {
-    uint64_t start_time;  // Task start timestamp (get_sys_cnt)
-    uint64_t end_time;    // Task end timestamp
-    uint32_t task_id;     // Register dispatch token (low 32 bits)
+    uint64_t start_time;      // Task start timestamp (get_sys_cnt)
+    uint64_t end_time;        // Task end timestamp
+    uint64_t task_token_raw;  // PTO2TaskId::raw — identity (NOT join key)
+    uint32_t reg_task_id;     // Per-core dispatch token — host join key vs AICPU stream
     uint32_t _pad;
 } __attribute__((aligned(32)));
 
@@ -240,9 +266,11 @@ static_assert(sizeof(L2SwimlaneFreeQueue) == 128, "L2SwimlaneFreeQueue must be 1
  *
  * Race avoidance for AicoreTask pools: AICPU rotates strictly before
  * `write_reg(DATA_MAIN_BASE)` for the first task of a new BUFFER_SIZE batch.
- * The runtime's completion-before-dispatch invariant guarantees all prior
- * tasks have FIN'd, so AICore has already finished writing their records into
- * the old buffer before AICPU enqueues it to ready_queue.
+ * The runtime's completion-before-dispatch invariant (AICore is single-
+ * threaded per core and AICPU does not dispatch task K+1 until K FIN'd)
+ * guarantees all prior tasks have FIN'd at rotation time, so AICore has
+ * already finished writing their records (and dcci'd them out) into the
+ * old buffer before AICPU enqueues it to ready_queue.
  */
 struct L2SwimlaneActiveHead {
     volatile uint64_t current_buf_ptr;       // 8 — active buffer device address (0 = none)
@@ -289,14 +317,21 @@ static_assert(
 /**
  * Per-core AICore-written pool.
  *
- *   head:       cache line AICPU writes when rotating; AICore dcci-polls per
- *               task to detect a current_buf_seq bump (= "generation" change).
- *   free_queue: SPSC ring of recycled L2SwimlaneAicoreTaskBuffer*; host pushes,
- *               AICPU pops when rotating.
+ *   head:        cache line AICPU writes when rotating; AICore dcci-polls per
+ *                task to detect a current_buf_seq bump (= "generation" change).
+ *   free_queue:  SPSC ring of recycled L2SwimlaneAicoreTaskBuffer*; host pushes,
+ *                AICPU pops when rotating.
  *
  * AICore records flow through the existing per-thread ready_queue in
  * L2SwimlaneDataHeader (with ReadyQueueEntry::kind = AicoreTask). This keeps
  * the mgmt-thread drain path uniform with the AICPU buffer paths.
+ *
+ * Rotation trigger: AICPU counts dispatches per core in the scheduler dispatch
+ * path; when a core's count crosses a PLATFORM_AICORE_BUFFER_SIZE boundary,
+ * AICPU rotates BEFORE writing the next DATA_MAIN_BASE. The completion-before-
+ * dispatch invariant guarantees AICore has FIN'd (and dcci'd out) every record
+ * in the old buffer by then. No AICore-side signal is needed — AICPU has full
+ * dispatch-count visibility on its own.
  *
  * The AICore-readable rotation channel that AICore's per-task dcci targets is
  * exactly `&pool.head` — AICPU publishes that address into
@@ -310,9 +345,8 @@ struct L2SwimlaneAicoreTaskPool {
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(L2SwimlaneAicoreTaskPool) == 192, "L2SwimlaneAicoreTaskPool must be 192 bytes");
-// Same ABI lock as AicpuTaskPool: head must be the line AICore dcci's, so
-// `&pool.head` (= base + 0) and `&pool.free_queue` (= base + 64) must stay
-// at these exact offsets across builds.
+// ABI lock: `&pool.head` is what AICPU publishes into the rotation_table for
+// AICore to dcci. Must stay at offset 0 so AICore can index from KernelArgs.
 static_assert(offsetof(L2SwimlaneAicoreTaskPool, head) == 0, "L2SwimlaneAicoreTaskPool::head must be at offset 0");
 static_assert(
     offsetof(L2SwimlaneAicoreTaskPool, free_queue) == 64, "L2SwimlaneAicoreTaskPool::free_queue must be at offset 64"
