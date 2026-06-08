@@ -293,7 +293,7 @@ public:
     // Pending dispatch: returns bit offsets of cores eligible for pending-slot dispatch.
     // AIC: 1 bit per cluster (aic_mask_ positions). AIV: 1 bit per AIV core (aiv_mask_ positions).
     // MIX: 1 bit per cluster where ALL 3 cores have free pending slots AND at least one is running.
-    //       Idle cores participate via to_pending=false in dispatch_mix_block_to_cluster.
+    //       Idle cores participate via to_pending=false in the MIX prepare path.
     BitStates get_pending_core_offset_states(PTO2ResourceShape shape) const {
         if (shape == PTO2ResourceShape::MIX) {
             // Any core without a pending payload can accept a dispatch (idle or running).
