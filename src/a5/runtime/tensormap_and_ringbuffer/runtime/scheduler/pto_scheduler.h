@@ -432,7 +432,7 @@ void ready_queue_destroy(PTO2ReadyQueue *queue);
 // on the hot path. Only when the local cache says "full" or "empty"
 // does the thread issue an acquire load on the remote index.
 //
-// Memory layout: 4 cache-line-aligned fields ensure zero false sharing.
+// Memory layout: 5 cache-line-aligned fields ensure zero false sharing.
 
 struct alignas(64) PTO2SpscQueue {
     // --- Producer cache lines (orchestrator thread) ---
@@ -443,9 +443,12 @@ struct alignas(64) PTO2SpscQueue {
     alignas(64) std::atomic<uint64_t> tail_{0};
     alignas(64) uint64_t head_cached_{0};
 
-    // --- Shared (immutable after init) ---
-    PTO2TaskSlotState **buffer_{nullptr};
+    // --- Shared Cacheline (read only) with mask and data ptr (immutable after init) ---
+    alignas(64) PTO2TaskSlotState **buffer_{nullptr};
     uint64_t mask_{0};
+
+    // Padding to exactly 5 cache lines
+    char padding[64 - sizeof(PTO2TaskSlotState **) - sizeof(uint64_t)];
 
     // Reserve the backing buffer region on the supplied arena. Returns the
     // region offset, to be passed to init_from_layout() after the arena is
@@ -508,7 +511,7 @@ struct alignas(64) PTO2SpscQueue {
     int pop_batch(PTO2TaskSlotState **out, int max_count) {
         uint64_t t = tail_.load(std::memory_order_relaxed);
         uint64_t avail = head_cached_ - t;
-        if (avail == 0) {
+        if (avail < static_cast<uint64_t>(max_count)) {
             head_cached_ = head_.load(std::memory_order_acquire);
             avail = head_cached_ - t;
             if (avail == 0) return 0;
@@ -529,7 +532,7 @@ struct alignas(64) PTO2SpscQueue {
     }
 };
 
-static_assert(sizeof(PTO2SpscQueue) == 256, "PTO2SpscQueue must be exactly 4 cache lines (256B)");
+static_assert(sizeof(PTO2SpscQueue) == 5 * 64, "PTO2SpscQueue must be exactly 5 cache lines (320B)");
 // =============================================================================
 
 /**
@@ -646,7 +649,7 @@ struct PTO2SchedulerState {
     static_assert(
         offsetof(WiringState, queue) == 256, "WiringState: batch region must be exactly 4 cache lines before queue"
     );
-    static_assert(sizeof(WiringState) == 576, "WiringState must be exactly 9 cache lines (576B)");
+    static_assert(sizeof(WiringState) == 640, "WiringState must be exactly 10 cache lines (640B)");
 
     alignas(64) AsyncWaitList async_wait_list;
 
