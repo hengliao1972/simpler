@@ -45,7 +45,7 @@
  * M4. A MIX task encountered in M2 raises a fatal error.
  */
 
-#include "dist_engine.h"
+#include "dist_engine/dist_engine.h"
 
 #include <atomic>
 #include <chrono>
@@ -784,9 +784,14 @@ void advance_frontier() {
 }
 
 // Resolve a kernel id to its executable address (CoreCallable::resolved_addr()).
+// Reads Runtime::func_id_to_addr_ directly (public POD array) rather than
+// calling the get_function_bin_addr() member so this compiles into libaicore
+// too — the AICore .so does not link against libaicpu, so a member-function
+// dispatch would fail with an unresolved symbol at dlopen.
 uint64_t resolve_kernel_addr(Runtime *runtime, int32_t kernel_id) {
     if (kernel_id == INVALID_KERNEL_ID) return 0;
-    uint64_t callable_addr = runtime->get_function_bin_addr(kernel_id);
+    if (kernel_id < 0 || kernel_id >= RUNTIME_MAX_FUNC_ID) return 0;
+    uint64_t callable_addr = runtime->func_id_to_addr_[kernel_id];
     if (callable_addr == 0) return 0;
     const CoreCallable *callable = reinterpret_cast<const CoreCallable *>(callable_addr);
     return callable->resolved_addr();
