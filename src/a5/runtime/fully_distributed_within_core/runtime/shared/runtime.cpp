@@ -70,6 +70,14 @@ Runtime::Runtime() {
     for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
         func_id_to_addr_[i] = 0;
     }
+
+    // Initialize sim-only trace-driven replay state (see runtime.h). Zero =
+    // fallback to running the real kernel; runtime_apply_example_exec_time
+    // (host-side) fills these when CallConfig::use_example_exec_time is set.
+    use_example_exec_time_ = false;
+    for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
+        example_exec_time_ns_[i] = 0;
+    }
 }
 
 // =============================================================================
