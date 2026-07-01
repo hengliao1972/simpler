@@ -98,6 +98,16 @@
 #include <vector>
 #endif
 
+// Fatal-log call site macro. Host / sim / AICPU forward to fprintf(stderr, ...);
+// AICore has no host stdio (nor variadic-fprintf support in CCEC's runtime), so
+// the call collapses to a no-op — the fatal flag itself already tears the run
+// down and the failure is observable via runtime state.
+#if DIST_HOST_ONLY
+#define DIST_ERRF(...) fprintf(stderr, __VA_ARGS__)
+#else
+#define DIST_ERRF(...) ((void)0)
+#endif
+
 #include "callable.h"
 #include "common/core_type.h"
 #include "intrinsic.h"
@@ -119,33 +129,6 @@
 #endif
 #include "tensor.h"
 #include "tensor_create_info.h"
-
-// -----------------------------------------------------------------------------
-// Compile-time gate for host-only facilities.
-//
-// DIST_HOST_ONLY covers the swimlane tracer (per-task span capture + JSON
-// dump), the sim-only trace-driven replay (use_example_exec_time busy-wait),
-// the host wall-clock timer (now_ns / thread_cpu_ns), and every AICPU-side
-// diagnostic (fprintf, getenv, signal handlers, watchdog dumps). These are all
-// unavailable under CCEC — no <atomic>, <chrono>, <vector>, <csignal>, no
-// posix APIs — so they collapse to a single gate: enabled only when
-// PTO2_PROFILING is on AND we are NOT compiling for the AICore target. Sim /
-// AICPU builds get the full facility; CCEC AICore compiles them all out.
-//
-// PTO2_PROFILING comes from profiling_config.h (default 1; explicit 0 for
-// perf-only sim builds). __CCE_AICORE__ is defined by ccec under
-// --cce-aicore-arch=*. No #ifndef fallback on purpose: undefined ⇒ off.
-#if PTO2_PROFILING && !defined(__CCE_AICORE__)
-#define DIST_HOST_ONLY 1
-#else
-#define DIST_HOST_ONLY 0
-#endif
-
-// Legacy aliases still referenced throughout this file. Kept as the single
-// unified gate above so the code below reads exactly the same regardless of
-// which alias a call site historically used.
-#define DIST_TRACE_ENABLED DIST_HOST_ONLY
-#define DIST_SIM_HOST_CLOCK DIST_HOST_ONLY
 
 namespace {
 
@@ -755,18 +738,23 @@ inline void trace_lap_impl(DistCore *self, int32_t task_id, int32_t func_id, Tra
 
 // Opt-in per-core tracing (set PTO_DIST_TRACE=1). Off by default so a passing
 // run is quiet; fatal/error/heap-exhaustion diagnostics are always emitted.
+// Host-only: relies on getenv; every caller sits under DIST_HOST_ONLY.
+#if DIST_HOST_ONLY
 inline bool dist_trace() {
     static const bool on = (getenv("PTO_DIST_TRACE") != nullptr);
     return on;
 }
+#endif
 
 // -----------------------------------------------------------------------------
 // Fatal / claim / execution helpers
 // -----------------------------------------------------------------------------
-inline bool fatal_set() { return g_dist.fatal.load(std::memory_order_acquire) != 0; }
-inline void set_fatal() { g_dist.fatal.store(1, std::memory_order_release); }
+PTO_DEVICE_FUNC inline bool fatal_set() { return g_dist.fatal.load(std::memory_order_acquire) != 0; }
+PTO_DEVICE_FUNC inline void set_fatal() { g_dist.fatal.store(1, std::memory_order_release); }
 
+#if DIST_HOST_ONLY
 void dist_dump_state(int);  // defined below; dumps full engine state for hangs
+#endif
 
 // Env-gated stall watchdog (set PTO_DIST_WATCHDOG=<seconds>, default off). Called
 // from inside the engine's spin loops on a worker thread (so fprintf is safe,
@@ -819,7 +807,7 @@ PTO_DEVICE_FUNC bool claim(std::atomic<int32_t> &cursor, int32_t N) {
 // publishes flag(N), the contiguous-done prefix may have grown, so any core walks
 // F forward while flag(F+1) is set. Lock-free; the CAS makes exactly one core win
 // each step and the cost is amortized across all cores.
-void advance_frontier() {
+PTO_DEVICE_FUNC void advance_frontier() {
     int32_t f = g_dist.frontier.load(std::memory_order_acquire);
     while (true) {
         const int32_t next = f + 1;
@@ -837,7 +825,7 @@ void advance_frontier() {
 // calling the get_function_bin_addr() member so this compiles into libaicore
 // too — the AICore .so does not link against libaicpu, so a member-function
 // dispatch would fail with an unresolved symbol at dlopen.
-uint64_t resolve_kernel_addr(Runtime *runtime, int32_t kernel_id) {
+PTO_DEVICE_FUNC uint64_t resolve_kernel_addr(Runtime *runtime, int32_t kernel_id) {
     if (kernel_id == INVALID_KERNEL_ID) return 0;
     if (kernel_id < 0 || kernel_id >= RUNTIME_MAX_FUNC_ID) return 0;
     uint64_t callable_addr = runtime->func_id_to_addr_[kernel_id];
@@ -849,7 +837,7 @@ uint64_t resolve_kernel_addr(Runtime *runtime, int32_t kernel_id) {
 // Execute one owned task, then publish its completion flag (release). In sim all
 // cores share the address space, so the release/acquire pair is the visibility
 // barrier between the kernel's output writes and a consumer's input reads.
-void execute_slot([[maybe_unused]] DistCore *self, RingSlot &s) {
+PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] DistCore *self, RingSlot &s) {
     typedef void (*KernelFn)(int64_t *);
 #if DIST_SIM_HOST_CLOCK
     // Sim-only trace-driven replay (CallConfig::use_example_exec_time): when the
@@ -927,7 +915,7 @@ void execute_slot([[maybe_unused]] DistCore *self, RingSlot &s) {
 // Phase B: execute every ready owned task in the private ring. A task is ready
 // once all its fan-in producers have set their completion flag (acquire).
 // Returns the number of slots freed this pass.
-int32_t drain_phase_b(DistCore *self) {
+PTO_DEVICE_FUNC int32_t drain_phase_b(DistCore *self) {
     // Fast path: an empty private ring has nothing to drain. Skips the per-slot
     // scan on every submit point (called twice per task, on every core) when the
     // ring is empty — the common case for fine-grained / skip-exec workloads.
@@ -952,7 +940,7 @@ int32_t drain_phase_b(DistCore *self) {
     return freed;
 }
 
-int32_t alloc_ring_slot(DistCore *self) {
+PTO_DEVICE_FUNC int32_t alloc_ring_slot(DistCore *self) {
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         if (!self->slots[i].occupied) return i;
     }
@@ -960,7 +948,7 @@ int32_t alloc_ring_slot(DistCore *self) {
 }
 
 // Kernel id for a physical lane (AIC/AIV0/AIV1) of a MixedKernels.
-inline int32_t kernel_id_for_lane(const MixedKernels &mixed, int32_t lane) {
+PTO_DEVICE_FUNC inline int32_t kernel_id_for_lane(const MixedKernels &mixed, int32_t lane) {
     switch (lane) {
     case LANE_AIC:
         return mixed.aic_kernel_id;
@@ -973,7 +961,7 @@ inline int32_t kernel_id_for_lane(const MixedKernels &mixed, int32_t lane) {
     }
 }
 
-inline bool lane_active(const ActiveMask &M, int32_t lane) {
+PTO_DEVICE_FUNC inline bool lane_active(const ActiveMask &M, int32_t lane) {
     return M.subtask_active(static_cast<PTO2SubtaskSlot>(lane));
 }
 
@@ -981,7 +969,7 @@ inline bool lane_active(const ActiveMask &M, int32_t lane) {
 // owner build path and the follower drain path). `tensors`/`scalars` are copied
 // in; args[] is (re)built to point at this slot's own copies so the slot is
 // self-contained and executable at any later time.
-void build_ring_slot(
+PTO_DEVICE_FUNC void build_ring_slot(
     RingSlot &s, int32_t task_id, int32_t func_id, uint64_t fn_addr, const Tensor *tensors, int32_t tc,
     const uint64_t *scalars, int32_t sc, const int32_t *fanin, int32_t fc, int32_t sub_block_id, bool is_multicore,
     int32_t won_block, int32_t won_slot
@@ -1018,7 +1006,7 @@ void build_ring_slot(
 
 // Reserve a free block.won slot in `block`. Returns slot index or -1 if full.
 // 2V allows either AIV of the block to be an anchor, so allocation must be atomic.
-int32_t alloc_won_slot(int32_t block) {
+PTO_DEVICE_FUNC int32_t alloc_won_slot(int32_t block) {
     BlockWon &bw = g_dist.blocks[block];
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         int32_t exp = 0;
@@ -1031,7 +1019,7 @@ int32_t alloc_won_slot(int32_t block) {
 
 // True if a published block.won deposit for this core's lane has not yet been
 // taken — used by the termination check to avoid finishing before draining.
-bool has_pending_won(DistCore *self) {
+PTO_DEVICE_FUNC bool has_pending_won(DistCore *self) {
     if (self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
     BlockWon &bw = g_dist.blocks[self->block_id];
     if (bw.any_pub.load(std::memory_order_acquire) == 0) return false;  // no deposit ever published
@@ -1047,7 +1035,7 @@ bool has_pending_won(DistCore *self) {
 // this core's physical lane that we have not yet taken, building each into a free
 // private-ring slot (back-pressure: stop when the ring is full). Non-blocking —
 // if nothing is addressed to us we simply return.
-void drain_block_won(DistCore *self) {
+PTO_DEVICE_FUNC void drain_block_won(DistCore *self) {
     if (self->lane == LANE_AIC || self->lane == LANE_NONE) return;  // AIC is never a follower
     BlockWon &bw = g_dist.blocks[self->block_id];
     // Fast path: if no anchor has ever published a deposit into this block, there
@@ -1098,7 +1086,7 @@ void drain_block_won(DistCore *self) {
 // ring; losers return with map + outputs updated so downstream get_ref() and
 // fan-in resolution stay consistent across cores.
 // -----------------------------------------------------------------------------
-TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &args) {
+PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &args) {
     DistCore *self = g_self;
     if (self == nullptr) return TaskOutputTensors{};
     Runtime *runtime = g_dist.runtime;
@@ -1129,8 +1117,8 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
     const int32_t tc = args.tensor_count();
     if (N >= kFlagCap) {  // flag ring + vend[] are non-windowed; cap total tasks
         set_fatal();
-        fprintf(
-            stderr, "[dist_engine] task id %d exceeds kFlagCap %d (enlarge or window the flag/vend rings)\n", N,
+        DIST_ERRF(
+            "[dist_engine] task id %d exceeds kFlagCap %d (enlarge or window the flag/vend rings)\n", N,
             kFlagCap
         );
         return TaskOutputTensors{};
@@ -1152,8 +1140,8 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
     if (total > 0 && g_dist.heap_base != nullptr) {
         if (total > ring) {
             set_fatal();
-            fprintf(
-                stderr, "[dist_engine] task %d outputs %llu B exceed heap ring %zu B (enlarge PTO_DIST_HEAP_MB)\n", N,
+            DIST_ERRF(
+                "[dist_engine] task %d outputs %llu B exceed heap ring %zu B (enlarge PTO_DIST_HEAP_MB)\n", N,
                 (unsigned long long)total, ring
             );
             return TaskOutputTensors{};
@@ -1171,7 +1159,7 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
         const uint64_t sz = PTO2_ALIGN_UP(logical, PTO2_PACKED_OUTPUT_ALIGN);
         if (g_dist.heap_base == nullptr) {
             set_fatal();
-            fprintf(stderr, "[dist_engine] GM output heap not allocated at task %d\n", N);
+            DIST_ERRF("[dist_engine] GM output heap not allocated at task %d\n", N);
             return result;
         }
         const uint64_t phys = (task_base + off) % ring;  // straddle-pad guarantees phys+logical <= ring
@@ -1335,8 +1323,7 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
             if (self->heap_next - vstart_live <= ring) break;  // window fits — region free
             if (f >= N - 1) {  // every predecessor done yet H-window still overflows the ring
                 set_fatal();
-                fprintf(
-                    stderr,
+                DIST_ERRF(
                     "[dist_engine] heap ring %zu B too small for H=%d window at task %d (live=%llu B); "
                     "enlarge PTO_DIST_HEAP_MB or reduce PTO_DIST_H\n",
                     ring, g_dist.H, N, (unsigned long long)(self->heap_next - vstart_live)
@@ -1358,7 +1345,7 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
     int32_t si = alloc_ring_slot(self);
     if (si < 0) {  // should not happen given the back-pressure gate above
         set_fatal();
-        fprintf(stderr, "[dist_engine] no free private-ring slot after back-pressure at task %d\n", N);
+        DIST_ERRF("[dist_engine] no free private-ring slot after back-pressure at task %d\n", N);
         return result;
     }
     // Reserve so concurrent drains (including the block.won back-pressure loop
@@ -1445,7 +1432,15 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
 
 // -----------------------------------------------------------------------------
 // Remaining ops — minimal stubs (bgemm exercises submit/scope/log only).
+//
+// The distributed engine only exposes an ops-table via g_dist_ops in the AICPU
+// build (aicpu_executor swaps it into rt->ops so orchestration code goes through
+// the dist submit path). CCEC does not link against any of these — the AICore
+// runs dist_core_main directly — and several use variadic fprintf / va_list
+// that CCEC's runtime does not carry. Gate the whole ops surface off under
+// AICore compile.
 // -----------------------------------------------------------------------------
+#if DIST_HOST_ONLY
 void dist_scope_begin(PTO2Runtime *) {}
 void dist_scope_end(PTO2Runtime *) {}
 void dist_orchestration_done(PTO2Runtime *) {}
@@ -1516,6 +1511,7 @@ void dist_set_tensor_data(
     const uint64_t esz = get_element_size(tensor.dtype);
     memcpy(reinterpret_cast<void *>(tensor.buffer.addr + flat * esz), &value, esz);
 }
+#endif  // DIST_HOST_ONLY
 
 // alloc_tensors — a kernel-less "hidden task" that only reserves GM output
 // buffers (no compute). It consumes one task id, allocates its outputs on the
@@ -1524,7 +1520,7 @@ void dist_set_tensor_data(
 // kernel runs. A later writer (INOUT / OUTPUT_EXISTING) becomes the new producer
 // of the region, so real consumers depend on the writer, not on this alloc. Every
 // core replays it identically, keeping heap addresses + maps consistent.
-TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
+PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
     DistCore *self = g_self;
     if (self == nullptr) return TaskOutputTensors{};
     // EXECUTE-FIRST (docs §6 step 0+1, §6.1): every submit point first seeks an
@@ -1539,7 +1535,7 @@ TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
     const int32_t tc = args.tensor_count();
     if (N >= kFlagCap) {
         set_fatal();
-        fprintf(stderr, "[dist_engine] alloc task id %d exceeds kFlagCap %d\n", N, kFlagCap);
+        DIST_ERRF("[dist_engine] alloc task id %d exceeds kFlagCap %d\n", N, kFlagCap);
         return TaskOutputTensors{};
     }
 
@@ -1554,8 +1550,8 @@ TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
     if (total > 0 && g_dist.heap_base != nullptr) {
         if (total > ring) {
             set_fatal();
-            fprintf(
-                stderr, "[dist_engine] alloc task %d outputs %llu B exceed heap ring %zu B\n", N,
+            DIST_ERRF(
+                "[dist_engine] alloc task %d outputs %llu B exceed heap ring %zu B\n", N,
                 (unsigned long long)total, ring
             );
             return TaskOutputTensors{};
@@ -1574,7 +1570,7 @@ TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
         const uint64_t sz = PTO2_ALIGN_UP(logical, PTO2_PACKED_OUTPUT_ALIGN);
         if (g_dist.heap_base == nullptr) {
             set_fatal();
-            fprintf(stderr, "[dist_engine] GM output heap not allocated at alloc %d\n", N);
+            DIST_ERRF("[dist_engine] GM output heap not allocated at alloc %d\n", N);
             return result;
         }
         const uint64_t phys = (task_base + off) % ring;
@@ -1622,8 +1618,8 @@ TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
             if (self->heap_next - vstart_live <= ring) break;  // window fits — region free
             if (f >= N - 1) {
                 set_fatal();
-                fprintf(
-                    stderr, "[dist_engine] heap ring %zu B too small for H=%d window at alloc %d (live=%llu B)\n", ring,
+                DIST_ERRF(
+                    "[dist_engine] heap ring %zu B too small for H=%d window at alloc %d (live=%llu B)\n", ring,
                     g_dist.H, N, (unsigned long long)(self->heap_next - vstart_live)
                 );
                 return result;
@@ -1644,6 +1640,7 @@ TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
     return result;
 }
 
+#if DIST_HOST_ONLY
 TaskOutputTensors dist_submit_dummy(PTO2Runtime *, const L0TaskArgs &) { return TaskOutputTensors{}; }
 void dist_scope_set_site(const char *, int) {}
 
@@ -1652,12 +1649,14 @@ const PTO2RuntimeOps g_dist_ops = {
     dist_report_fatal,    dist_log_error,       dist_log_warn,      dist_log_debug,          dist_log_info_v,
     dist_get_tensor_data, dist_set_tensor_data, dist_alloc_tensors, dist_submit_dummy,       dist_scope_set_site,
 };
+#endif  // DIST_HOST_ONLY
 
 // -----------------------------------------------------------------------------
 // Deadlock diagnostics: dump the full engine state on SIGUSR1. Sim runs every
 // core as a pthread in one process, so a single handler can walk g_dist. Used to
 // debug hangs (kill -USR1 <pid>); compiled in but inert unless signalled.
 // -----------------------------------------------------------------------------
+#if DIST_HOST_ONLY
 void dist_dump_state(int) {
     fprintf(stderr, "\n===== DIST STATE DUMP =====\n");
     fprintf(
@@ -1707,11 +1706,12 @@ void dist_dump_state(int) {
     }
     fprintf(stderr, "===== END DUMP =====\n");
 }
+#endif  // DIST_HOST_ONLY
 
 // -----------------------------------------------------------------------------
 // Per-core entry point invoked by each AICore worker thread.
 // -----------------------------------------------------------------------------
-void dist_core_main(void *runtime_v, int core_idx, int core_type_int) {
+PTO_DEVICE_FUNC void dist_core_main(void *runtime_v, int core_idx, int core_type_int) {
     if (core_idx < 0 || core_idx >= RUNTIME_MAX_WORKER) return;
     Runtime *runtime = reinterpret_cast<Runtime *>(runtime_v);
     DistCore *self = &g_dist.cores[core_idx];
@@ -1723,10 +1723,12 @@ void dist_core_main(void *runtime_v, int core_idx, int core_type_int) {
     self->reset(role, lay.block_id, lay.lane);
     self->core_idx = core_idx;
     g_self = self;
+#if DIST_HOST_ONLY
     if (dist_trace())
         fprintf(
             stderr, "[dist] core %d role=%d block=%d lane=%d START\n", core_idx, core_type_int, lay.block_id, lay.lane
         );
+#endif
 
     // Startup barrier: wait until every worker thread has been scheduled in and
     // reached this point before anyone begins replay. In sim the OS brings the
@@ -1773,12 +1775,14 @@ void dist_core_main(void *runtime_v, int core_idx, int core_type_int) {
         }
     }
 
+#if DIST_HOST_ONLY
     if (dist_trace() || fatal_set()) {
         fprintf(
             stderr, "[dist] core %d role=%d DONE replayed=%d owned=%d fatal=%d\n", core_idx, core_type_int,
             self->local_index, self->owned_total, fatal_set() ? 1 : 0
         );
     }
+#endif
     g_self = nullptr;
     __atomic_add_fetch(&runtime->dist.done_count, 1, __ATOMIC_ACQ_REL);
 }
