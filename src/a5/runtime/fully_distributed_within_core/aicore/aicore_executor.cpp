@@ -45,18 +45,25 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2Di
 }
 
 /**
- * AICore main execution loop
+ * AICore main execution loop — fully_distributed_within_core variant.
  *
- * Implements the AICPU-AICore register-based dispatch protocol:
- * 1. Wait for AICPU ready signal via handshake buffer
- * 2. Report physical core ID and core type, signal AICore ready
- * 3. Cache per-core PTO2DispatchPayload pointer from hank->task
- * 4. Poll DATA_MAIN_BASE register for task dispatch until exit signal
+ * Instead of polling DATA_MAIN_BASE for AICPU-dispatched tasks, each AICore
+ * worker invokes the distributed engine entry (compiled into the AICPU .so on
+ * sim; onboard is the target of the subsequent CCEC migration, see
+ * docs/fully_distributed_within_core.md). The engine replays the orchestration
+ * submit stream, claims/builds the tasks it wins, and executes them; on return
+ * it has set this worker's completion flags. The worker then honors the
+ * existing teardown protocol (wait for EXIT, ack EXITED) so the AICPU
+ * scheduler/shutdown path is reused unchanged.
  *
- * AICPU writes &s_payload_per_core[i] to hank->task before setting
- * aicpu_ready=1. AICore caches this pointer and reads function_bin_addr +
- * args pointer from it on each dispatch. reg_val is a monotonically
- * increasing task ID used only for dispatch signaling and ACK/FIN protocol.
+ * Handshake phases 1-3 are preserved verbatim (register handshake, physical
+ * core id publication, per-core dispatch payload cache). The trb-style
+ * Phase 4 poll loop is replaced by a single dist_core_main invocation.
+ *
+ * Profiling state (get_aicore_profiling_flag etc.) is not touched here: on the
+ * dist path, per-task profiling records are emitted from inside dist_core_main
+ * / dist_engine_dump_trace on the AICPU side, so this loop does not need to
+ * pre-resolve the L2 swimlane / PMU rings.
  *
  * @param runtime Pointer to Runtime in global memory
  * @param s_block_idx Block index (core ID)
@@ -90,106 +97,37 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
-    // Cache per-core dispatch payload pointer (set by AICPU before aicpu_ready)
-    __gm__ PTO2DispatchPayload *payload = reinterpret_cast<__gm__ PTO2DispatchPayload *>(my_hank->task);
-
-    // Cache profiling state once after Phase 3. The L2 / PMU rings and the
-    // PMU MMIO base are all stable for the entire run (host-resolved at
-    // AICore kernel entry from KernelArgs::regs[physical_core_id]), so
-    // they are safe to cache here.
-    uint32_t profiling_flag = get_aicore_profiling_flag();
-    bool l2_swimlane_enabled = GET_PROFILING_FLAG(profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
-    bool dump_tensor_enabled = GET_PROFILING_FLAG(profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
-    bool pmu_enabled = GET_PROFILING_FLAG(profiling_flag, PROFILING_FLAG_PMU);
-    // Per-core L2SwimlaneActiveHead channel — lazy-resolved on first task; the
-    // table slot AICPU populates inside `l2_swimlane_aicpu_init` runs
-    // concurrently with kernel entry, so we cannot deref at startup. The
-    // first dispatch is proof AICPU init is done.
-    __gm__ L2SwimlaneActiveHead *l2_swimlane_head = nullptr;
-    L2SwimlaneAicoreLocalState l2_swimlane_local = {nullptr, UINT32_MAX, 0};
-    __gm__ PmuAicoreRing *pmu_ring = pmu_enabled ? get_aicore_pmu_ring() : nullptr;
-    uint64_t pmu_reg_base = pmu_enabled ? get_aicore_pmu_reg_base() : 0;
-
-    // Phase 4: Main execution loop - poll register for tasks until exit signal
-    // Register encoding: AICPU_IDLE_TASK_ID=idle, task_id=task, AICORE_EXIT_SIGNAL=exit
-    uint32_t reg_val = AICPU_IDLE_TASK_ID;
-    uint32_t last_reg_val = AICPU_IDLE_TASK_ID;
-
-    while (true) {
-        reg_val = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
-        if (reg_val == AICORE_EXIT_SIGNAL) {
-            // Signal exit acknowledgment to AICPU
-            write_reg(RegId::COND, AICORE_EXITED_VALUE);
-            break;
-        }
-
-        // Execute task if new (reg_val encoding: AICPU_IDLE_TASK_ID=idle, task_id=task)
-        if (reg_val == AICPU_IDLE_TASK_ID || reg_val == last_reg_val) {
-            SPIN_WAIT_HINT();
-            continue;
-        }
-
-        {
-            // receive_time is captured the instant DATA_MAIN_BASE returned a
-            // new task_id, BEFORE the per-task dcci + ack pair. Paired with
-            // start_time (captured after dcci + ack) it lets DFX split head_OH
-            // into the AICPU→AICore NoC propagation (dispatch_ts → receive_time,
-            // hardware-bound) and the AICore-local dcci+ack cost
-            // (receive_time → start_time, software-tunable). Stored in the
-            // record as a 32-bit delta `start_time - receive_time`.
-            uint64_t receive_time = get_sys_cnt_aicore();
-
-            uint32_t task_id = reg_val;  // Decode: register holds task_id directly
-
-            // First-task lazy resolve of the rotation channel.
-            if (l2_swimlane_enabled && l2_swimlane_head == nullptr) {
-                l2_swimlane_head = get_l2_swimlane_aicore_head();
-            }
-
-            // Select dual-buffer slot: same bit as AICPU used when writing payload
-            __gm__ PTO2DispatchPayload *exec_payload = payload + (task_id & 1u);
-
-            // Invalidate payload buffer (AICPU updates its content each dispatch)
-            dcci(exec_payload, ENTIRE_DATA_CACHE);
-
-            write_reg(RegId::COND, MAKE_ACK_VALUE(task_id));
-
-            // Performance profiling: record start time
-            uint64_t start_time = get_sys_cnt_aicore();
-
-            if (pmu_enabled) {
-                pmu_aicore_begin();
-            }
-
-            // Execute the task
-            execute_task(exec_payload);
-
-            if (pmu_enabled) {
-                pmu_aicore_end();
-                pmu_aicore_record_task(pmu_ring, pmu_reg_base, task_id);
-            }
-
-            if (dump_tensor_enabled) {
-                pipe_barrier(PIPE_ALL);
-            }
-
-            // Performance profiling: record task execution. task_token_raw is
-            // the PTO2 identity (already in AICore cache from the dispatch
-            // payload); reg_task_id is the per-core dispatch token AICore just
-            // read. Host uses reg_task_id as join key vs the AICPU stream.
-            if (l2_swimlane_enabled) {
-                uint64_t end_time = get_sys_cnt_aicore();
-                uint64_t task_token_raw = exec_payload->local_context.async_ctx.task_token.raw;
-                l2_swimlane_aicore_record_task(
-                    l2_swimlane_head, &l2_swimlane_local, task_token_raw, task_id, receive_time, start_time, end_time
-                );
-            }
-
-            last_reg_val = reg_val;
-            write_reg(RegId::COND, MAKE_FIN_VALUE(task_id));
+    // ===========================================================================
+    // Phase 4 (dist): wait for the AICPU to publish the engine entry, invoke it
+    // once, then hand off to the shutdown protocol below. The engine handles all
+    // per-core orchestration replay, task claim/build/execute, and completion
+    // flag publication internally; there is no per-task register handshake.
+    // ===========================================================================
+    while (runtime->dist.go == 0) {
+        dcci(&runtime->dist, SINGLE_CACHE_LINE);
+        SPIN_WAIT_HINT();
+    }
+    {
+        DistCoreMainFn core_main = reinterpret_cast<DistCoreMainFn>(runtime->dist.core_main_fn);
+        if (core_main != nullptr) {
+            // The engine sees `runtime` as a plain pointer (dist_engine.h keeps
+            // the header light by taking void*). CCEC otherwise rejects the
+            // implicit __gm__ Runtime* -> void* conversion; the explicit cast
+            // resolves it on onboard and is a no-op on sim (__gm__ is empty).
+            core_main(reinterpret_cast<void *>(runtime), s_block_idx, static_cast<int>(core_type));
+        } else {
+            __atomic_add_fetch(&runtime->dist.done_count, 1, __ATOMIC_ACQ_REL);
         }
     }
 
-    // Flush all dirty cache lines to HBM before kernel exit.
+    // Teardown: wait for the AICPU EXIT signal on DATA_MAIN_BASE and ack.
+    while (true) {
+        uint32_t reg_val = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
+        if (reg_val == AICORE_EXIT_SIGNAL) {
+            write_reg(RegId::COND, AICORE_EXITED_VALUE);
+            break;
+        }
+        SPIN_WAIT_HINT();
+    }
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 }
