@@ -38,12 +38,37 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#if !defined(__CCE_AICORE__)
+// <stdexcept> pulls in <string> which drags in std::allocator / <exception>;
+// CCEC (AICore compiler) does not ship a usable version of that chain, and
+// its runtime has no exception support anyway. Host / sim / AICPU builds still
+// get the full-fat error path (throw std::logic_error / std::out_of_range);
+// the AICore build compiles a header-only slim path where the throws become
+// silent no-ops so the SPMD orchestration replay does not need a C++ runtime.
 #include <stdexcept>
+#endif
 #include <type_traits>
+#if !defined(__CCE_AICORE__)
 #include <vector>
+#endif
 
 #include "arg_direction.h"
+#include "data_type.h"  // PTO_DEVICE_FUNC — expands to __aicore__ under CCEC, empty on host
 #include "tensor.h"  // unified Tensor (strided) + TensorArgType, carried by TaskArgs and on the wire
+
+// Compact TASKARGS_THROW / TASKARGS_LOGIC_THROW: host paths still raise the
+// existing exceptions (unchanged behavior for orchestrator/user code); on
+// CCEC AICore both collapse to a silent no-op so the same header compiles
+// into an on-core kernel binary.
+#if defined(__CCE_AICORE__)
+#define TASKARGS_THROW_LOGIC(msg)  ((void)0)
+#define TASKARGS_THROW_OOR(msg)    ((void)0)
+#define TASKARGS_THROW_RUNTIME(msg_expr) ((void)0)
+#else
+#define TASKARGS_THROW_LOGIC(msg)  throw std::logic_error(msg)
+#define TASKARGS_THROW_OOR(msg)    throw std::out_of_range(msg)
+#define TASKARGS_THROW_RUNTIME(msg_expr) throw std::runtime_error(msg_expr)
+#endif
 
 // ============================================================================
 // TensorTagMixin — conditionally provides per-tensor tag storage
@@ -54,12 +79,15 @@ template <typename TensorTag, size_t MaxT>
 struct TensorTagMixin {
     TensorTag tags_[MaxT]{};
 
-    const TensorTag &tag(int32_t i) const { return tags_[i]; }
-    TensorTag &tag(int32_t i) { return tags_[i]; }
-    const TensorTag *tag_data() const { return tags_; }
+    PTO_DEVICE_FUNC const TensorTag &tag(int32_t i) const { return tags_[i]; }
+    PTO_DEVICE_FUNC TensorTag &tag(int32_t i) { return tags_[i]; }
+    PTO_DEVICE_FUNC const TensorTag *tag_data() const { return tags_; }
 };
 
-// Dynamic vector of tags (MaxT == 0, TensorTag != void)
+#if !defined(__CCE_AICORE__)
+// Dynamic vector of tags (MaxT == 0, TensorTag != void). Only realized on
+// hosts; the AICore side only ever instantiates the static specializations
+// above via ChipStorageTaskArgs / L2TaskArgs.
 template <typename TensorTag>
 struct TensorTagMixin<TensorTag, 0> {
     std::vector<TensorTag> tags_;
@@ -68,14 +96,17 @@ struct TensorTagMixin<TensorTag, 0> {
     TensorTag &tag(int32_t i) { return tags_[static_cast<size_t>(i)]; }
     const TensorTag *tag_data() const { return tags_.data(); }
 };
+#endif
 
 // Empty: TensorTag == void, static (zero overhead)
 template <size_t MaxT>
 struct TensorTagMixin<void, MaxT> {};
 
+#if !defined(__CCE_AICORE__)
 // Empty: TensorTag == void, dynamic (resolves ambiguity)
 template <>
 struct TensorTagMixin<void, 0> {};
+#endif
 
 // ============================================================================
 // TaskArgsTpl — primary template (static / fixed-size)
@@ -88,32 +119,41 @@ struct TaskArgsTpl : TensorTagMixin<TensorTag, MaxT> {
     int32_t tensor_count_{0};
     int32_t scalar_count_{0};
 
-    void add_tensor(const T &t) {
-        if (scalar_count_ > 0) throw std::logic_error("TaskArgs: cannot add tensor after scalar");
-        if (static_cast<size_t>(tensor_count_) >= MaxT) throw std::out_of_range("TaskArgs: tensor capacity exceeded");
+    PTO_DEVICE_FUNC void add_tensor(const T &t) {
+        if (scalar_count_ > 0) {
+            TASKARGS_THROW_LOGIC("TaskArgs: cannot add tensor after scalar");
+            return;
+        }
+        if (static_cast<size_t>(tensor_count_) >= MaxT) {
+            TASKARGS_THROW_OOR("TaskArgs: tensor capacity exceeded");
+            return;
+        }
         tensors_[tensor_count_++] = t;
     }
 
-    void add_scalar(S s) {
-        if (static_cast<size_t>(scalar_count_) >= MaxS) throw std::out_of_range("TaskArgs: scalar capacity exceeded");
+    PTO_DEVICE_FUNC void add_scalar(S s) {
+        if (static_cast<size_t>(scalar_count_) >= MaxS) {
+            TASKARGS_THROW_OOR("TaskArgs: scalar capacity exceeded");
+            return;
+        }
         scalars_[scalar_count_++] = s;
     }
 
-    const T &tensor(int32_t i) const { return tensors_[i]; }
-    T &tensor(int32_t i) { return tensors_[i]; }
+    PTO_DEVICE_FUNC const T &tensor(int32_t i) const { return tensors_[i]; }
+    PTO_DEVICE_FUNC T &tensor(int32_t i) { return tensors_[i]; }
 
-    S scalar(int32_t i) const { return scalars_[i]; }
-    S &scalar(int32_t i) { return scalars_[i]; }
+    PTO_DEVICE_FUNC S scalar(int32_t i) const { return scalars_[i]; }
+    PTO_DEVICE_FUNC S &scalar(int32_t i) { return scalars_[i]; }
 
-    const S *scalars() const { return scalars_; }
+    PTO_DEVICE_FUNC const S *scalars() const { return scalars_; }
 
-    const T *tensor_data() const { return tensors_; }
-    const S *scalar_data() const { return scalars_; }
+    PTO_DEVICE_FUNC const T *tensor_data() const { return tensors_; }
+    PTO_DEVICE_FUNC const S *scalar_data() const { return scalars_; }
 
-    int32_t tensor_count() const { return tensor_count_; }
-    int32_t scalar_count() const { return scalar_count_; }
+    PTO_DEVICE_FUNC int32_t tensor_count() const { return tensor_count_; }
+    PTO_DEVICE_FUNC int32_t scalar_count() const { return scalar_count_; }
 
-    void clear() {
+    PTO_DEVICE_FUNC void clear() {
         tensor_count_ = 0;
         scalar_count_ = 0;
     }
@@ -122,6 +162,12 @@ struct TaskArgsTpl : TensorTagMixin<TensorTag, MaxT> {
 // ============================================================================
 // TaskArgsTpl — partial specialization (dynamic / vector-backed, MaxT==0, MaxS==0)
 // ============================================================================
+//
+// Host-only: this specialization is only realized by the user-facing
+// TaskArgs typedef below (Orchestrator.submit_*). The AICore path never
+// instantiates a dynamic TaskArgsTpl — its L2TaskArgs / ChipStorageTaskArgs
+// go through the static primary template above.
+#if !defined(__CCE_AICORE__)
 
 template <typename T, typename S, typename TensorTag>
 struct TaskArgsTpl<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
@@ -167,14 +213,20 @@ struct TaskArgsTpl<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
     }
 };
 
+#endif  // !__CCE_AICORE__ (dynamic TaskArgsTpl<...,0,0,...> specialization)
+
 // ============================================================================
 // Type aliases
 // ============================================================================
 
+#if !defined(__CCE_AICORE__)
 // Unified user-facing builder: vector-backed with TensorArgType tags.
 // Used by Orchestrator.submit_*; tags drive dependency inference at submit
-// time and are stripped before the args cross the dispatch boundary.
+// time and are stripped before the args cross the dispatch boundary. Host
+// only — dist_engine's on-core replay uses ChipStorageTaskArgs / L2TaskArgs
+// (static-storage), not TaskArgs.
 using TaskArgs = TaskArgsTpl<Tensor, uint64_t, 0, 0, TensorArgType>;
+#endif
 
 // L2 runtime ABI: fixed POD matching runtime.so byte-for-byte.
 // Assembled from a TaskArgsView on the child side just before pto2_run_runtime.
@@ -186,6 +238,12 @@ using ChipStorageTaskArgs = TaskArgsTpl<Tensor, uint64_t, CHIP_MAX_TENSOR_ARGS, 
 //
 // View-only: refers to externally owned tensor + scalar arrays. No tags
 // (tags are consumed by Orchestrator at submit time and never travel further).
+//
+// Host-only: all of the transport helpers below (TaskArgsView, make_view,
+// task_args_blob_size, write_blob, read_blob, view_to_chip_storage) depend on
+// std::to_string / throw / the dynamic TaskArgs typedef. AICore never runs
+// this code — the on-core replay reads its args straight out of L2TaskArgs.
+#if !defined(__CCE_AICORE__)
 
 struct TaskArgsView {
     int32_t tensor_count;
@@ -324,3 +382,5 @@ inline ChipStorageTaskArgs view_to_chip_storage(TaskArgsView view) {
     }
     return out;
 }
+
+#endif  // !__CCE_AICORE__ (host-only TaskArgsView + wire helpers + view_to_chip_storage)
