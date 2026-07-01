@@ -182,12 +182,22 @@ struct Task {
     uint64_t function_bin_addr;
 };
 
+class Runtime;  // fwd-decl for the DistCoreMainFn typedef below; full definition is further down
+
 // Per-core entry point of the fully_distributed_within_core engine. Implemented
-// in runtime/dist_engine.cpp (compiled into the AICPU .so), invoked by each
-// AICore worker thread via Runtime::dist.core_main_fn. `runtime` is Runtime*,
-// `core_type` is CoreType (cast to int to keep this typedef header-light).
-// See docs/fully_distributed_within_core.md.
-typedef void (*DistCoreMainFn)(void *runtime, int core_idx, int core_type);
+// in runtime/dist_engine/dist_engine.cpp (compiled into libaicore_kernel; sim
+// also compiles it into libaicpu_kernel for the transitional handoff). Invoked
+// by each AICore worker thread. `core_type` is CoreType (cast to int so this
+// typedef stays header-light). The __gm__ qualifier is a CCE address-space
+// annotation: real hardware requires it on any GM-resident pointer, while
+// on hosts (sim / AICPU) __gm__ expands to nothing. Guarantee the fallback
+// definition locally so this header is safe to include from either target
+// without pulling in common/intrinsic.h. See
+// docs/fully_distributed_within_core.md.
+#ifndef __gm__
+#define __gm__
+#endif
+typedef void (*DistCoreMainFn)(__gm__ Runtime *runtime, int core_idx, int core_type);
 
 // =============================================================================
 // Runtime Class
