@@ -807,7 +807,7 @@ inline void watchdog([[maybe_unused]] uint64_t &start_ns) {
 // cursor to N. No hardware fetch_max on the target, so this is the equivalent
 // acq-rel CAS retry. Monotonic: each task id is claimed by exactly one core and
 // no id is skipped within a cursor's subsequence.
-bool claim(std::atomic<int32_t> &cursor, int32_t N) {
+PTO_DEVICE_FUNC bool claim(std::atomic<int32_t> &cursor, int32_t N) {
     int32_t c = cursor.load(std::memory_order_acquire);
     while (true) {
         if (N <= c) return false;
