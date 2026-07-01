@@ -365,7 +365,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
      *   args.add_scalar(3.14f, int32_t(42), 7u);     // mixed batch
      */
     template <typename... Args>
-    void add_scalar(Args &&...args) {
+    PTO_DEVICE_FUNC void add_scalar(Args &&...args) {
         static_assert(sizeof...(Args) >= 1, "add_scalar: at least one argument required");
         static_assert((is_supported_scalar_arg_v<Args> && ...), "add_scalar: all types must be arithmetic or enum");
         if (scalar_count_ + sizeof...(Args) > MaxS) {
@@ -475,7 +475,7 @@ private:
     }
 
     template <typename T>
-    void add_scalar_one(T &&value) {
+    PTO_DEVICE_FUNC void add_scalar_one(T &&value) {
         scalars_[scalar_count_] = to_u64(value);
 #if PTO2_PROFILING
         uintptr_t scalar_source_ptr = 0;

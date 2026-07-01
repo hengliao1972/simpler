@@ -47,17 +47,56 @@
 
 #include "dist_engine/dist_engine.h"
 
+// Basic C-stdlib headers are always safe (CCEC ships a full libc / libstdc++
+// subset; these show up transitively anyway). Everything else waits behind the
+// DIST_HOST_ONLY gate below.
+#include <cstdint>
+#include <cstring>
+
+// PTO2_PROFILING is defined by profiling_config.h (default 1). Pull it in
+// explicitly so DIST_HOST_ONLY below can read it without relying on transitive
+// includes from the project headers further down (which themselves depend on
+// stdlib headers we haven't decided to bring in yet).
+#include "profiling_config.h"
+
+// Compile-time gate for host-only facilities.
+//
+// DIST_HOST_ONLY covers the swimlane tracer (per-task span capture + JSON
+// dump), the sim-only trace-driven replay (use_example_exec_time busy-wait),
+// the host wall-clock timer (now_ns / thread_cpu_ns), and every AICPU-side
+// diagnostic (fprintf, getenv, signal handlers, watchdog dumps). These are all
+// unavailable under CCEC — no <atomic>, <chrono>, <vector>, <csignal>, no
+// posix APIs — so they collapse to a single gate: enabled only when
+// PTO2_PROFILING is on AND we are NOT compiling for the AICore target. Sim /
+// AICPU builds get the full facility; CCEC AICore compiles them all out.
+//
+// PTO2_PROFILING comes from profiling_config.h (default 1; explicit 0 for
+// perf-only sim builds). __CCE_AICORE__ is defined by ccec under
+// --cce-aicore-arch=*. No #ifndef fallback on purpose: undefined ⇒ off.
+#if PTO2_PROFILING && !defined(__CCE_AICORE__)
+#define DIST_HOST_ONLY 1
+#else
+#define DIST_HOST_ONLY 0
+#endif
+
+// Legacy aliases still referenced throughout this file. Kept as the single
+// unified gate above so the code below reads exactly the same regardless of
+// which alias a call site historically used.
+#define DIST_TRACE_ENABLED DIST_HOST_ONLY
+#define DIST_SIM_HOST_CLOCK DIST_HOST_ONLY
+
+#if DIST_HOST_ONLY
+// Host / sim / AICPU only: full stdlib. CCEC AICore skips these.
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <ctime>
 #include <cstdarg>
-#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <string>
 #include <vector>
+#endif
 
 #include "callable.h"
 #include "common/core_type.h"
@@ -68,39 +107,45 @@
 #include "pto_submit_types.h"
 #include "pto_types.h"
 #include "runtime.h"
+#if defined(__CCE_AICORE__)
+// AICore has no scheduler to yield to; a spin hint here would be meaningless.
+// Provide a local no-op so we don't have to depend on the AICPU spin_hint.h
+// header being reachable from the AICore include path.
+#ifndef SPIN_WAIT_HINT
+#define SPIN_WAIT_HINT() ((void)0)
+#endif
+#else
 #include "spin_hint.h"
+#endif
 #include "tensor.h"
 #include "tensor_create_info.h"
 
 // -----------------------------------------------------------------------------
-// Compile-time gates.
+// Compile-time gate for host-only facilities.
 //
-// PTO2_PROFILING comes from profiling_config.h (default 1; a CCEC build passes
-// -DPTO2_PROFILING=0). It is pulled in transitively via pto_types.h above, which
-// is included before this point — so the gate below sees the real value.
+// DIST_HOST_ONLY covers the swimlane tracer (per-task span capture + JSON
+// dump), the sim-only trace-driven replay (use_example_exec_time busy-wait),
+// the host wall-clock timer (now_ns / thread_cpu_ns), and every AICPU-side
+// diagnostic (fprintf, getenv, signal handlers, watchdog dumps). These are all
+// unavailable under CCEC — no <atomic>, <chrono>, <vector>, <csignal>, no
+// posix APIs — so they collapse to a single gate: enabled only when
+// PTO2_PROFILING is on AND we are NOT compiling for the AICore target. Sim /
+// AICPU builds get the full facility; CCEC AICore compiles them all out.
 //
-// DIST_TRACE_ENABLED — swimlane tracing (per-task span capture + JSON dump).
-// Reuses the project's PTO2_PROFILING macro: sim builds pass PTO2_PROFILING=1, so
-// tracing is on there; an AICore/CCEC build that does not pass the macro gets
-// `#if (PTO2_PROFILING + 0)` == `#if 0`, so all tracing code (and its host-only
-// std::vector / std::chrono / clock_gettime / fprintf usage) is compiled out.
-// No #ifndef fallback on purpose: undefined ⇒ off.
-#define DIST_TRACE_ENABLED (PTO2_PROFILING + 0)
-
-// DIST_SIM_HOST_CLOCK — sim-only host facilities (steady_clock now_ns() and the
-// use_example_exec_time busy-wait kernel emulation). Unavailable under CCEC.
-#if defined(__CCE_AICORE__) || defined(__DAV_C220__) || defined(__CCE_KT_TEST__)
-#define DIST_SIM_HOST_CLOCK 0
+// PTO2_PROFILING comes from profiling_config.h (default 1; explicit 0 for
+// perf-only sim builds). __CCE_AICORE__ is defined by ccec under
+// --cce-aicore-arch=*. No #ifndef fallback on purpose: undefined ⇒ off.
+#if PTO2_PROFILING && !defined(__CCE_AICORE__)
+#define DIST_HOST_ONLY 1
 #else
-#define DIST_SIM_HOST_CLOCK 1
+#define DIST_HOST_ONLY 0
 #endif
 
-// Tracing needs the host wall clock (now_ns lives under DIST_SIM_HOST_CLOCK), so
-// the two gates cannot diverge into "trace on, host clock off". In practice both
-// are off together on a CCEC build; assert it so a stray -D combination fails loud.
-#if DIST_TRACE_ENABLED && !DIST_SIM_HOST_CLOCK
-#error "DIST_TRACE_ENABLED requires DIST_SIM_HOST_CLOCK (swimlane uses the host clock)"
-#endif
+// Legacy aliases still referenced throughout this file. Kept as the single
+// unified gate above so the code below reads exactly the same regardless of
+// which alias a call site historically used.
+#define DIST_TRACE_ENABLED DIST_HOST_ONLY
+#define DIST_SIM_HOST_CLOCK DIST_HOST_ONLY
 
 namespace {
 
@@ -728,8 +773,11 @@ void dist_dump_state(int);  // defined below; dumps full engine state for hangs
 // unlike a signal handler). On the first call it records a start time; if a loop
 // keeps spinning past the budget the engine is presumed deadlocked, so it dumps
 // the full state once and sets fatal to unwind every core for a fast, diagnosed
-// failure instead of an indefinite hang.
-inline void watchdog(uint64_t &start_ns) {
+// failure instead of an indefinite hang. CCEC/onboard has no getenv/chrono/
+// fprintf, so the function collapses to a no-op there — call sites remain
+// unchanged and pay a single unused-argument tag.
+inline void watchdog([[maybe_unused]] uint64_t &start_ns) {
+#if DIST_HOST_ONLY
     static const long budget_s = []() -> long {
         const char *e = getenv("PTO_DIST_WATCHDOG");
         return e ? atol(e) : 0;
@@ -752,6 +800,7 @@ inline void watchdog(uint64_t &start_ns) {
         }
         set_fatal();
     }
+#endif
 }
 
 // CAS-loop fetch_max (§11.1): returns true (WON) iff this core advanced the
@@ -1736,6 +1785,15 @@ void dist_core_main(void *runtime_v, int core_idx, int core_type_int) {
 
 }  // namespace
 
+// dist_engine_register / dist_engine_dump_trace are host-side entry points
+// called from libaicpu_kernel (sim orchestrator thread) and — in the current
+// transitional layout — from the AICPU stub on onboard. They own configuration
+// reads (env vars), signal-handler installation, host malloc, and the swimlane
+// dumper, none of which are available under CCEC. Gate the entire host-only
+// tail so CCEC compilations of dist_engine.cpp end at the namespace close and
+// leave these symbols to libaicpu_kernel.
+#if DIST_HOST_ONLY
+
 void *dist_engine_register(
     PTO2Runtime *rt, DistOrchFunc orch_func, const L2TaskArgs *orch_args, int num_workers, Runtime *runtime
 ) {
@@ -2100,3 +2158,5 @@ void dist_engine_dump_trace() {
 // Tracing compiled out: keep the public symbol so aicpu_executor.cpp still links.
 void dist_engine_dump_trace() {}
 #endif  // DIST_TRACE_ENABLED
+
+#endif  // DIST_HOST_ONLY
