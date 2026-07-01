@@ -34,7 +34,7 @@
 #include "pto_runtime2.h"
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
-#include "dist_engine.h"
+#include "dist_engine/dist_engine.h"
 
 // Performance profiling headers
 #include "aicpu/dep_gen_collector_aicpu.h"

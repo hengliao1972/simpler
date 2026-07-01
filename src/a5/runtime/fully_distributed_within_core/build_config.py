@@ -25,7 +25,10 @@
 # by the Tensor constructor's validation logic).
 
 BUILD_CONFIG = {
-    "aicore": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["aicore", "orchestration"]},
+    "aicore": {
+        "include_dirs": ["runtime", "common", ".."],
+        "source_dirs": ["aicore", "orchestration", "runtime/dist_engine"],
+    },
     "aicpu": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["aicpu", "runtime", "orchestration"]},
     "host": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["host", "runtime/shared", "orchestration"]},
     "orchestration": {"include_dirs": ["runtime", "orchestration", "common", ".."], "source_dirs": ["orchestration"]},
