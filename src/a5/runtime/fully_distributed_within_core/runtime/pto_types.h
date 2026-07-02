@@ -231,7 +231,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     Arg &operator=(Arg &&) = delete;
 
     bool has_error{false};
-    const char *error_msg{nullptr};
+    __gm__ const char *error_msg{nullptr};
     PTO2LaunchSpec launch_spec;  // SPMD launch parameters (block_num, etc.)
 
     void clear() {
@@ -249,7 +249,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
         error_msg = nullptr;
     }
 
-    void set_error(const char *msg) {
+    PTO_DEVICE_FUNC void set_error(__gm__ const char *msg) {
         if (!has_error) {
             has_error = true;
             error_msg = msg;
@@ -286,7 +286,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
 #endif
 
     template <typename... Args>
-    void add_input(Args &&...args) {
+    PTO_DEVICE_FUNC void add_input(Args &&...args) {
         assert_add_tensor_args<false, Args...>();
         if (!check_add_tensor_capacity(static_cast<int32_t>(sizeof...(Args)))) {
             return;
@@ -298,19 +298,26 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     ///   add_output(ci1, ci2)         — runtime allocates buffers (OUTPUT)
     ///   add_output(t1, t2)           — write-only existing tensors (OUTPUT_EXISTING)
     template <typename... Args>
-    void add_output(Args &&...args) {
+    PTO_DEVICE_FUNC void add_output(Args &&...args) {
         assert_add_tensor_args<true, Args...>();
         if (!check_add_tensor_capacity(static_cast<int32_t>(sizeof...(Args)))) return;
+#if defined(__CCE_AICORE__)
+        // CCEC has no <type_traits>; skip the compile-time tag dispatch and
+        // trust the caller to pass TensorCreateInfo (OUTPUT) — the common
+        // orch path. OUTPUT_EXISTING is host-only in practice today.
+        ((tensors_[tensor_count_] = &args, tags_[tensor_count_] = TensorArgType::OUTPUT, tensor_count_++), ...);
+#else
         if constexpr ((std::is_same_v<std::decay_t<Args>, TensorCreateInfo> && ...)) {
             ((tensors_[tensor_count_] = &args, tags_[tensor_count_] = TensorArgType::OUTPUT, tensor_count_++), ...);
         } else {
             ((tensors_[tensor_count_] = &args, tags_[tensor_count_] = TensorArgType::OUTPUT_EXISTING, tensor_count_++),
              ...);
         }
+#endif
     }
 
     template <typename... Args>
-    void add_inout(Args &&...args) {
+    PTO_DEVICE_FUNC void add_inout(Args &&...args) {
         assert_add_tensor_args<false, Args...>();
         if (!check_add_tensor_capacity(static_cast<int32_t>(sizeof...(Args)))) {
             return;
@@ -320,7 +327,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
 
     /// No-dependency existing tensor: skips OverlapMap lookup, depends on creator only.
     template <typename... Args>
-    void add_no_dep(Args &&...args) {
+    PTO_DEVICE_FUNC void add_no_dep(Args &&...args) {
         assert_add_tensor_args<false, Args...>();
         if (!check_add_tensor_capacity(static_cast<int32_t>(sizeof...(Args)))) return;
         ((tensors_[tensor_count_] = &args, tags_[tensor_count_] = TensorArgType::NO_DEP, tensor_count_++), ...);
@@ -479,13 +486,25 @@ private:
     // Capacity-overflow messages — spell the actual limit (MaxS/MaxT, whatever
     // the instantiation is) into the text via std::to_string. Built once into a
     // function-local static so set_error() can hold the const char* safely.
-    static const char *scalar_cap_msg() {
+    // CCEC has no <string>; fall back to a compact static string that omits the
+    // specific limit (device orch is not the primary diagnostic surface).
+    // Return type is __gm__-qualified because CCEC places the fallback literal
+    // in GM; __gm__ collapses to nothing under host / sim.
+    PTO_DEVICE_FUNC static __gm__ const char *scalar_cap_msg() {
+#if defined(__CCE_AICORE__)
+        return "Too many scalar args";
+#else
         static const std::string msg = "Too many scalar args (max " + std::to_string(MaxS) + ")";
         return msg.c_str();
+#endif
     }
-    static const char *tensor_cap_msg() {
+    PTO_DEVICE_FUNC static __gm__ const char *tensor_cap_msg() {
+#if defined(__CCE_AICORE__)
+        return "Too many tensor args";
+#else
         static const std::string msg = "Too many tensor args (max " + std::to_string(MaxT) + ")";
         return msg.c_str();
+#endif
     }
 
     template <typename T>
@@ -547,8 +566,12 @@ private:
     // a stored &arg would dangle after the call), and element type. Driven
     // purely by Args, with no runtime state.
     template <bool is_output, typename... Args>
-    static void assert_add_tensor_args() {
+    PTO_DEVICE_FUNC static void assert_add_tensor_args() {
         static_assert(sizeof...(Args) >= 1, "at least one argument required");
+#if !defined(__CCE_AICORE__)
+        // <type_traits> is host-only. CCEC skips the value-category / element-type
+        // checks; the AICore orchestration path is trusted to pass lvalues and
+        // matching element types (temporaries would fail differently on device).
         static_assert(
             (std::is_lvalue_reference_v<Args> && ...),
             "temporaries are not allowed — stored pointers would dangle after the call"
@@ -562,11 +585,12 @@ private:
         } else {
             static_assert((std::is_same_v<std::decay_t<Args>, Tensor> && ...), "all arguments must be Tensor");
         }
+#endif
     }
 
     // Runtime validation: tensor-before-scalar ordering + slot capacity. Records
     // an error and returns false on violation.
-    bool check_add_tensor_capacity(int32_t count) {
+    PTO_DEVICE_FUNC bool check_add_tensor_capacity(int32_t count) {
         if (scalar_count_ != 0) {
             set_error(
                 "add_input/add_output/add_inout called after add_scalar: "
