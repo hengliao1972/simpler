@@ -113,11 +113,11 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             core_main(runtime, s_block_idx, static_cast<int>(core_type));
         }
 #if !defined(__CCE_AICORE__)
-        // sim-only diagnostic: if dist_engine never wired a core_main we still
-        // want to release the AICPU-side "done" spin so the run tears down.
-        // CCEC's backend refuses to lower AtomicLoadAdd on a GM int32 (addrspace
-        // 1) — onboard never hits this branch because dist_engine_register is a
-        // hard prerequisite for launching the AICore kernel.
+        // sim-only diagnostic fallback: if dist_engine never wired a core_main
+        // we still want to release the AICPU-side "done" spin so the run tears
+        // down cleanly. Onboard never hits this branch because dist_engine_register
+        // is a hard prerequisite for launching the AICore kernel, so the CCEC
+        // build has no reason to carry the extra atomic add here.
         else {
             __atomic_add_fetch(&runtime->dist.done_count, 1, __ATOMIC_ACQ_REL);
         }

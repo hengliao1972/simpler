@@ -130,6 +130,66 @@
 #include "tensor.h"
 #include "tensor_create_info.h"
 
+// -----------------------------------------------------------------------------
+// Atomic wrappers.
+//
+// dist_engine.cpp is compiled into two targets: sim / AICPU (host toolchain,
+// full <atomic>) and AICore (CCEC, no <atomic> and stricter language subset).
+// Instead of #if'ing every load / store / CAS, we route every shared-memory
+// atomic through a tiny wrapper layer that uses __atomic_* GCC intrinsics on
+// both sides (host libstdc++ implements them on top of the same fences as
+// std::atomic; trb's aicore_executor / aicpu_executor already use these under
+// CCEC).
+//
+// Fields that used to be `std::atomic<T> x;` become plain `volatile T x;` so
+// the object layout matches on both compilers (std::atomic<T> is not a POD
+// under CCEC, and its members are host-tagged). Callers use atom_load(x, mo),
+// atom_store(x, v, mo), atom_cas(x, exp, des, s_mo, f_mo), atom_fetch_add(x, d,
+// mo), atom_thread_fence(mo) — all trivially inlined.
+//
+// One CCEC-backend gotcha (verified via aicore_executor.cpp comment): 32-bit
+// atomic add on a GM (addrspace 1) address is rejected with "Cannot select:
+// AtomicLoadAdd s32". Every field that participates in atom_fetch_add is
+// therefore int64_t, not int32_t.
+// -----------------------------------------------------------------------------
+namespace {
+
+template <typename T>
+PTO_DEVICE_FUNC inline T atom_load(const volatile T &p, int mo) {
+    return __atomic_load_n(&p, mo);
+}
+template <typename T>
+PTO_DEVICE_FUNC inline T atom_load(const T &p, int mo) {
+    return __atomic_load_n(&p, mo);
+}
+template <typename T, typename V>
+PTO_DEVICE_FUNC inline void atom_store(volatile T &p, V v, int mo) {
+    __atomic_store_n(&p, static_cast<T>(v), mo);
+}
+template <typename T, typename V>
+PTO_DEVICE_FUNC inline void atom_store(T &p, V v, int mo) {
+    __atomic_store_n(&p, static_cast<T>(v), mo);
+}
+template <typename T>
+PTO_DEVICE_FUNC inline bool atom_cas_weak(volatile T &p, T &expected, T desired, int s_mo, int f_mo) {
+    return __atomic_compare_exchange_n(&p, &expected, desired, /*weak=*/true, s_mo, f_mo);
+}
+template <typename T>
+PTO_DEVICE_FUNC inline bool atom_cas_strong(volatile T &p, T &expected, T desired, int s_mo, int f_mo) {
+    return __atomic_compare_exchange_n(&p, &expected, desired, /*weak=*/false, s_mo, f_mo);
+}
+template <typename T>
+PTO_DEVICE_FUNC inline T atom_fetch_add(volatile T &p, T d, int mo) {
+    return __atomic_fetch_add(&p, d, mo);
+}
+template <typename T>
+PTO_DEVICE_FUNC inline T atom_fetch_sub(volatile T &p, T d, int mo) {
+    return __atomic_fetch_sub(&p, d, mo);
+}
+PTO_DEVICE_FUNC inline void atom_thread_fence(int mo) { __atomic_thread_fence(mo); }
+
+}  // namespace
+
 namespace {
 
 // -----------------------------------------------------------------------------
@@ -443,11 +503,17 @@ struct BuiltSubtask {
 };
 
 struct WonSlot {
-    std::atomic<int32_t> state;  // 0=free, 1=published, 2=reserving
+    // volatile T + __atomic_*: std::atomic<T>'s members are host-tagged under
+    // CCEC and its object is not a POD, so it can't sit in a struct the AICore
+    // touches. We reproduce the same acq/rel/relaxed semantics through the
+    // atom_* wrappers at the top of the file.
+    volatile int32_t state;                        // 0=free, 1=published, 2=reserving
     int32_t task_id;
-    std::atomic<int32_t> remaining;                         // co-owners (incl. anchor) left to finish
-    std::atomic<int32_t> drained[PTO2_SUBTASK_SLOT_COUNT];  // 0/1 per follower lane
-    BuiltSubtask lane[PTO2_SUBTASK_SLOT_COUNT];             // deposited follower subtasks
+    // int64_t: CCEC backend refuses 32-bit atomic add on GM (see wrappers
+    // preamble). fetch_sub happens on this field, so bump to 64-bit.
+    volatile int64_t remaining;                    // co-owners (incl. anchor) left to finish
+    volatile int32_t drained[PTO2_SUBTASK_SLOT_COUNT];  // 0/1 per follower lane
+    BuiltSubtask lane[PTO2_SUBTASK_SLOT_COUNT];    // deposited follower subtasks
 };
 
 struct BlockWon {
@@ -457,7 +523,7 @@ struct BlockWon {
     // multi-core (e.g. 2V) tasks — the common case (bgemm is all single-core), so
     // every AIV core skips a 4-slot won-scan on every submit. Never reset within a
     // session; once true the scan path is taken (those workloads have real work).
-    std::atomic<int32_t> any_pub;
+    volatile int32_t any_pub;
 };
 
 enum LaneId : int32_t { LANE_AIC = 0, LANE_AIV0 = 1, LANE_AIV1 = 2, LANE_NONE = -1 };
@@ -582,8 +648,8 @@ constexpr int32_t kCursorShards = 4;
 constexpr size_t kCacheLine = 64;
 
 struct alignas(kCacheLine) PaddedCursor {
-    std::atomic<int32_t> v;
-    uint8_t pad[kCacheLine - sizeof(std::atomic<int32_t>)];
+    volatile int32_t v;
+    uint8_t pad[kCacheLine - sizeof(int32_t)];
 };
 
 // -----------------------------------------------------------------------------
@@ -595,7 +661,7 @@ struct DistGlobal {
     PaddedCursor cube_cursor[kCursorShards];    // highest claimed AIC-anchored id, per shard
     PaddedCursor vector_cursor[kCursorShards];  // highest claimed AIV-only id, per shard
     PaddedCursor alloc_cursor[kCursorShards];   // highest claimed kernel-less alloc id, per shard
-    std::atomic<uint8_t> flags[kFlagCap];       // completion-flag ring (1 == task done)
+    volatile uint8_t flags[kFlagCap];           // completion-flag ring (1 == task done)
 
     // M4 reclamation (§9.5/§11.4). `frontier` (F) is the global continuous
     // completion frontier — the largest prefix s.t. every task id <= F is done;
@@ -603,9 +669,9 @@ struct DistGlobal {
     // the prefix. `R = frontier - H` is the reclaim frontier. `vend[N]` is the
     // cumulative virtual heap bytes through task N (deterministic & identical on
     // every core), so any core can compute the live byte window [vend[R], top).
-    std::atomic<int32_t> frontier;
+    volatile int32_t frontier;
     int32_t H;
-    std::atomic<uint64_t> vend[kFlagCap];
+    volatile uint64_t vend[kFlagCap];
 
     uint8_t *heap_base;
     size_t heap_size;  // == bounded ring size
@@ -615,7 +681,7 @@ struct DistGlobal {
     PTO2Runtime *rt;
     Runtime *runtime;  // outer Runtime (for kernel-address resolution + done_count)
 
-    std::atomic<int32_t> fatal;
+    volatile int32_t fatal;
 
     // Physical-block topology (1 AIC + 2 AIV per block), derived once at register
     // time from Runtime::workers[].core_type, identical to the centralized
@@ -628,8 +694,9 @@ struct DistGlobal {
 
     // Global "all cores finished orchestration replay" counter. A follower must
     // not conclude "no more pushes are coming for my lane" until every core has
-    // finished replaying the submit stream (§7 tail-idle).
-    std::atomic<int32_t> replay_done;
+    // finished replaying the submit stream (§7 tail-idle). int64_t because CCEC
+    // rejects 32-bit atomic add on GM addresses (see wrappers preamble).
+    volatile int64_t replay_done;
 
     // Startup barrier: every worker thread bumps this on entry and spins until it
     // reaches num_workers before beginning replay. In sim each "core" is a host
@@ -638,7 +705,8 @@ struct DistGlobal {
     // later cores have not even been scheduled — the swimlane shows a long
     // cold-start stagger that is host-scheduling noise, not engine behavior.
     // Aligning the start makes the trace reflect steady-state contention.
-    std::atomic<int32_t> started_count;
+    // int64_t for the same GM-atomic-add reason as replay_done above.
+    volatile int64_t started_count;
 
     DistCore cores[RUNTIME_MAX_WORKER];
 };
@@ -749,8 +817,8 @@ inline bool dist_trace() {
 // -----------------------------------------------------------------------------
 // Fatal / claim / execution helpers
 // -----------------------------------------------------------------------------
-PTO_DEVICE_FUNC inline bool fatal_set() { return g_dist.fatal.load(std::memory_order_acquire) != 0; }
-PTO_DEVICE_FUNC inline void set_fatal() { g_dist.fatal.store(1, std::memory_order_release); }
+PTO_DEVICE_FUNC inline bool fatal_set() { return atom_load(g_dist.fatal, __ATOMIC_ACQUIRE) != 0; }
+PTO_DEVICE_FUNC inline void set_fatal() { atom_store(g_dist.fatal, 1, __ATOMIC_RELEASE); }
 
 #if DIST_HOST_ONLY
 void dist_dump_state(int);  // defined below; dumps full engine state for hangs
@@ -795,11 +863,11 @@ inline void watchdog([[maybe_unused]] uint64_t &start_ns) {
 // cursor to N. No hardware fetch_max on the target, so this is the equivalent
 // acq-rel CAS retry. Monotonic: each task id is claimed by exactly one core and
 // no id is skipped within a cursor's subsequence.
-PTO_DEVICE_FUNC bool claim(std::atomic<int32_t> &cursor, int32_t N) {
-    int32_t c = cursor.load(std::memory_order_acquire);
+PTO_DEVICE_FUNC bool claim(volatile int32_t &cursor, int32_t N) {
+    int32_t c = atom_load(cursor, __ATOMIC_ACQUIRE);
     while (true) {
         if (N <= c) return false;
-        if (cursor.compare_exchange_weak(c, N, std::memory_order_acq_rel, std::memory_order_acquire)) return true;
+        if (atom_cas_weak(cursor, c, N, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return true;
     }
 }
 
@@ -808,12 +876,12 @@ PTO_DEVICE_FUNC bool claim(std::atomic<int32_t> &cursor, int32_t N) {
 // F forward while flag(F+1) is set. Lock-free; the CAS makes exactly one core win
 // each step and the cost is amortized across all cores.
 PTO_DEVICE_FUNC void advance_frontier() {
-    int32_t f = g_dist.frontier.load(std::memory_order_acquire);
+    int32_t f = atom_load(g_dist.frontier, __ATOMIC_ACQUIRE);
     while (true) {
         const int32_t next = f + 1;
         if (next >= kFlagCap) break;
-        if (g_dist.flags[next & (kFlagCap - 1)].load(std::memory_order_acquire) == 0) break;
-        if (g_dist.frontier.compare_exchange_weak(f, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        if (atom_load(g_dist.flags[next & (kFlagCap - 1)], __ATOMIC_ACQUIRE) == 0) break;
+        if (atom_cas_weak(g_dist.frontier, f, next, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
             f = next;
         }
         // On CAS failure f was reloaded with the current value; retry.
@@ -899,13 +967,13 @@ PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] DistCore *self, RingSlot &s) 
         // subtask to finish) publishes the single global completion flag (§3.1),
         // then frees the block.won entry for reuse.
         WonSlot &w = g_dist.blocks[s.won_block].slots[s.won_slot];
-        if (w.remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            g_dist.flags[s.task_id & (kFlagCap - 1)].store(1, std::memory_order_release);
-            w.state.store(0, std::memory_order_release);  // recycle the id-keyed slot
+        if (atom_fetch_sub<int64_t>(w.remaining, 1, __ATOMIC_ACQ_REL) == 1) {
+            atom_store(g_dist.flags[s.task_id & (kFlagCap - 1)], 1, __ATOMIC_RELEASE);
+            atom_store(w.state, 0, __ATOMIC_RELEASE);  // recycle the id-keyed slot
             advance_frontier();
         }
     } else {
-        g_dist.flags[s.task_id & (kFlagCap - 1)].store(1, std::memory_order_release);
+        atom_store(g_dist.flags[s.task_id & (kFlagCap - 1)], 1, __ATOMIC_RELEASE);
         advance_frontier();
     }
     s.built = false;
@@ -927,7 +995,7 @@ PTO_DEVICE_FUNC int32_t drain_phase_b(DistCore *self) {
         if (!s.occupied || !s.built) continue;  // skip reserved-but-unbuilt slots
         bool ready = true;
         for (int32_t f = 0; f < s.fanin_count; f++) {
-            if (g_dist.flags[s.fanin[f] & (kFlagCap - 1)].load(std::memory_order_acquire) == 0) {
+            if (atom_load(g_dist.flags[s.fanin[f] & (kFlagCap - 1)], __ATOMIC_ACQUIRE) == 0) {
                 ready = false;
                 break;
             }
@@ -1010,7 +1078,7 @@ PTO_DEVICE_FUNC int32_t alloc_won_slot(int32_t block) {
     BlockWon &bw = g_dist.blocks[block];
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         int32_t exp = 0;
-        if (bw.slots[i].state.compare_exchange_strong(exp, 2, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        if (atom_cas_strong(bw.slots[i].state, exp, 2, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
             return i;
         }
     }
@@ -1022,11 +1090,11 @@ PTO_DEVICE_FUNC int32_t alloc_won_slot(int32_t block) {
 PTO_DEVICE_FUNC bool has_pending_won(DistCore *self) {
     if (self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
     BlockWon &bw = g_dist.blocks[self->block_id];
-    if (bw.any_pub.load(std::memory_order_acquire) == 0) return false;  // no deposit ever published
+    if (atom_load(bw.any_pub, __ATOMIC_ACQUIRE) == 0) return false;  // no deposit ever published
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         WonSlot &w = bw.slots[i];
-        if (w.state.load(std::memory_order_acquire) != 1) continue;
-        if (w.lane[self->lane].present && w.drained[self->lane].load(std::memory_order_acquire) == 0) return true;
+        if (atom_load(w.state, __ATOMIC_ACQUIRE) != 1) continue;
+        if (w.lane[self->lane].present && atom_load(w.drained[self->lane], __ATOMIC_ACQUIRE) == 0) return true;
     }
     return false;
 }
@@ -1040,20 +1108,18 @@ PTO_DEVICE_FUNC void drain_block_won(DistCore *self) {
     BlockWon &bw = g_dist.blocks[self->block_id];
     // Fast path: if no anchor has ever published a deposit into this block, there
     // is nothing to drain — skip the per-slot scan on every submit (hot path).
-    if (bw.any_pub.load(std::memory_order_acquire) == 0) return;
+    if (atom_load(bw.any_pub, __ATOMIC_ACQUIRE) == 0) return;
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         WonSlot &w = bw.slots[i];
-        if (w.state.load(std::memory_order_acquire) != 1) continue;
+        if (atom_load(w.state, __ATOMIC_ACQUIRE) != 1) continue;
         if (!w.lane[self->lane].present) continue;
         int32_t exp = 0;
-        if (!w.drained[self->lane].compare_exchange_strong(
-                exp, 1, std::memory_order_acq_rel, std::memory_order_relaxed
-            ))
+        if (!atom_cas_strong(w.drained[self->lane], exp, 1, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
             continue;  // already taken by us on a prior pass
         int32_t si = alloc_ring_slot(self);
         if (si < 0) {
             // Ring full: hand the deposit back and let Phase B free a slot first.
-            w.drained[self->lane].store(0, std::memory_order_release);
+            atom_store(w.drained[self->lane], 0, __ATOMIC_RELEASE);
             return;
         }
         const BuiltSubtask &b = w.lane[self->lane];
@@ -1173,7 +1239,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
     // Publish cumulative virtual bytes through task N so any core can derive the
     // live window [vend[R], heap_next) for reclaim back-pressure. Deterministic, so
     // all cores store the same value (this core also reads its own writes for R<N).
-    if (N >= 0 && N < kFlagCap) g_dist.vend[N].store(self->heap_next, std::memory_order_relaxed);
+    if (N >= 0 && N < kFlagCap) atom_store(g_dist.vend[N], self->heap_next, __ATOMIC_RELAXED);
 
     // Once fatal, stop claiming/executing but keep replaying the deterministic
     // allocation above so this task's `result` carries valid (materialized) output
@@ -1205,7 +1271,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
         // Pick the shard for this task (§6.6): shard = N % kCursorShards, a pure
         // function of the task id so every core targets the same sub-cursor for N.
         PaddedCursor *cursors = anchor_is_cube ? g_dist.cube_cursor : g_dist.vector_cursor;
-        std::atomic<int32_t> &cursor = cursors[N % kCursorShards].v;
+        volatile int32_t &cursor = cursors[N % kCursorShards].v;
         is_winner = claim(cursor, N);
     }
 
@@ -1317,9 +1383,9 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
         const size_t ring = g_dist.heap_size;
         uint64_t wd_heap = 0;
         while (!fatal_set()) {
-            const int32_t f = g_dist.frontier.load(std::memory_order_acquire);
+            const int32_t f = atom_load(g_dist.frontier, __ATOMIC_ACQUIRE);
             const int32_t R = f - g_dist.H;
-            const uint64_t vstart_live = (R < 0) ? 0 : g_dist.vend[R].load(std::memory_order_relaxed);
+            const uint64_t vstart_live = (R < 0) ? 0 : atom_load(g_dist.vend[R], __ATOMIC_RELAXED);
             if (self->heap_next - vstart_live <= ring) break;  // window fits — region free
             if (f >= N - 1) {  // every predecessor done yet H-window still overflows the ring
                 set_fatal();
@@ -1384,9 +1450,9 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
         if (fatal_set()) return result;
         WonSlot &w = g_dist.blocks[won_block].slots[won_slot];
         w.task_id = N;
-        w.remaining.store(pc, std::memory_order_relaxed);
+        atom_store<int64_t>(w.remaining, pc, __ATOMIC_RELAXED);
         for (int32_t L = 0; L < PTO2_SUBTASK_SLOT_COUNT; L++) {
-            w.drained[L].store(0, std::memory_order_relaxed);
+            atom_store(w.drained[L], 0, __ATOMIC_RELAXED);
             w.lane[L].present = false;
         }
         for (int32_t L = 0; L < PTO2_SUBTASK_SLOT_COUNT; L++) {
@@ -1406,9 +1472,9 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
                 b.fanin[k] = fanin[k];
             b.sub_block_id = (L == LANE_AIV1) ? 1 : 0;
         }
-        std::atomic_thread_fence(std::memory_order_release);
-        g_dist.blocks[won_block].any_pub.store(1, std::memory_order_release);  // enable follower drains
-        w.state.store(1, std::memory_order_release);                           // publish the deposits to followers
+        atom_thread_fence(__ATOMIC_RELEASE);
+        atom_store(g_dist.blocks[won_block].any_pub, 1, __ATOMIC_RELEASE);  // enable follower drains
+        atom_store(w.state, 1, __ATOMIC_RELEASE);                           // publish the deposits to followers
     }
 
     const int32_t own_sub_block = (own_lane == LANE_AIV1) ? 1 : 0;
@@ -1481,7 +1547,7 @@ void wait_producer_ready(DistCore *self, const Tensor &t) {
     if (p < 0) return;
     uint64_t wd = 0;
     while (!fatal_set()) {
-        if (g_dist.flags[p & (kFlagCap - 1)].load(std::memory_order_acquire) != 0) break;
+        if (atom_load(g_dist.flags[p & (kFlagCap - 1)], __ATOMIC_ACQUIRE) != 0) break;
         drain_block_won(self);
         if (drain_phase_b(self) == 0) {
             SPIN_WAIT_HINT();
@@ -1581,7 +1647,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0Task
         off += sz;
     }
     self->heap_next = task_base + off;
-    if (N >= 0 && N < kFlagCap) g_dist.vend[N].store(self->heap_next, std::memory_order_relaxed);
+    if (N >= 0 && N < kFlagCap) atom_store(g_dist.vend[N], self->heap_next, __ATOMIC_RELAXED);
     if (fatal_set()) return result;
 
     // (b) Register this alloc as producer of each output — EVERY core (map parity).
@@ -1612,9 +1678,9 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0Task
     if (total > 0 && g_dist.heap_base != nullptr) {
         uint64_t wd_heap = 0;
         while (!fatal_set()) {
-            const int32_t f = g_dist.frontier.load(std::memory_order_acquire);
+            const int32_t f = atom_load(g_dist.frontier, __ATOMIC_ACQUIRE);
             const int32_t R = f - g_dist.H;
-            const uint64_t vstart_live = (R < 0) ? 0 : g_dist.vend[R].load(std::memory_order_relaxed);
+            const uint64_t vstart_live = (R < 0) ? 0 : atom_load(g_dist.vend[R], __ATOMIC_RELAXED);
             if (self->heap_next - vstart_live <= ring) break;  // window fits — region free
             if (f >= N - 1) {
                 set_fatal();
@@ -1634,7 +1700,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0Task
     }
 
     // (e) Winner completes inline (no kernel runs).
-    g_dist.flags[N & (kFlagCap - 1)].store(1, std::memory_order_release);
+    atom_store(g_dist.flags[N & (kFlagCap - 1)], 1, __ATOMIC_RELEASE);
     advance_frontier();
     TRACE_LAP(self, N, -1, TracePhase::Alloc);
     return result;
@@ -1660,16 +1726,23 @@ const PTO2RuntimeOps g_dist_ops = {
 void dist_dump_state(int) {
     fprintf(stderr, "\n===== DIST STATE DUMP =====\n");
     fprintf(
-        stderr, "frontier=%d H=%d ring=%zuB replay_done=%d/%d num_blocks=%d fatal=%d\n", g_dist.frontier.load(),
-        g_dist.H, g_dist.heap_size, g_dist.replay_done.load(), g_dist.num_workers, g_dist.num_blocks,
-        g_dist.fatal.load()
+        stderr, "frontier=%d H=%d ring=%zuB replay_done=%ld/%d num_blocks=%d fatal=%d\n",
+        atom_load(g_dist.frontier, __ATOMIC_RELAXED), g_dist.H, g_dist.heap_size,
+        static_cast<long>(atom_load(g_dist.replay_done, __ATOMIC_RELAXED)), g_dist.num_workers, g_dist.num_blocks,
+        atom_load(g_dist.fatal, __ATOMIC_RELAXED)
     );
     fprintf(stderr, "cube_cursor[%d]=", kCursorShards);
     for (int32_t s = 0; s < kCursorShards; s++)
-        fprintf(stderr, "%d%s", g_dist.cube_cursor[s].v.load(), s + 1 < kCursorShards ? "," : "");
+        fprintf(
+            stderr, "%d%s", atom_load(g_dist.cube_cursor[s].v, __ATOMIC_RELAXED),
+            s + 1 < kCursorShards ? "," : ""
+        );
     fprintf(stderr, " vector_cursor[%d]=", kCursorShards);
     for (int32_t s = 0; s < kCursorShards; s++)
-        fprintf(stderr, "%d%s", g_dist.vector_cursor[s].v.load(), s + 1 < kCursorShards ? "," : "");
+        fprintf(
+            stderr, "%d%s", atom_load(g_dist.vector_cursor[s].v, __ATOMIC_RELAXED),
+            s + 1 < kCursorShards ? "," : ""
+        );
     fprintf(stderr, "\n");
     for (int32_t c = 0; c < g_dist.num_workers && c < RUNTIME_MAX_WORKER; c++) {
         DistCore &co = g_dist.cores[c];
@@ -1682,7 +1755,7 @@ void dist_dump_state(int) {
             if (!s.occupied) continue;
             int32_t unmet = -1;
             for (int32_t f = 0; f < s.fanin_count; f++)
-                if (g_dist.flags[s.fanin[f] & (kFlagCap - 1)].load() == 0) {
+                if (atom_load(g_dist.flags[s.fanin[f] & (kFlagCap - 1)], __ATOMIC_RELAXED) == 0) {
                     unmet = s.fanin[f];
                     break;
                 }
@@ -1695,12 +1768,13 @@ void dist_dump_state(int) {
     for (int32_t b = 0; b < g_dist.num_blocks; b++) {
         for (int32_t i = 0; i < kPrivateSlots; i++) {
             WonSlot &w = g_dist.blocks[b].slots[i];
-            int32_t st = w.state.load();
+            int32_t st = atom_load(w.state, __ATOMIC_RELAXED);
             if (st == 0) continue;
             fprintf(
-                stderr, "  won blk%d slot%d state=%d tid=%d remaining=%d drained=[%d,%d,%d] present=[%d,%d,%d]\n", b, i,
-                st, w.task_id, w.remaining.load(), w.drained[0].load(), w.drained[1].load(), w.drained[2].load(),
-                w.lane[0].present, w.lane[1].present, w.lane[2].present
+                stderr, "  won blk%d slot%d state=%d tid=%d remaining=%ld drained=[%d,%d,%d] present=[%d,%d,%d]\n", b,
+                i, st, w.task_id, static_cast<long>(atom_load(w.remaining, __ATOMIC_RELAXED)),
+                atom_load(w.drained[0], __ATOMIC_RELAXED), atom_load(w.drained[1], __ATOMIC_RELAXED),
+                atom_load(w.drained[2], __ATOMIC_RELAXED), w.lane[0].present, w.lane[1].present, w.lane[2].present
             );
         }
     }
@@ -1737,9 +1811,9 @@ PTO_DEVICE_FUNC void dist_core_main(void *runtime_v, int core_idx, int core_type
     // skew rather than engine scheduling. Bare spin (no yield) per the AICPU
     // spin-wait convention. Skipped under fatal so a failed run still tears down.
     if (!fatal_set()) {
-        g_dist.started_count.fetch_add(1, std::memory_order_acq_rel);
+        atom_fetch_add<int64_t>(g_dist.started_count, 1, __ATOMIC_ACQ_REL);
         uint64_t wd_start = 0;
-        while (g_dist.started_count.load(std::memory_order_acquire) < g_dist.num_workers && !fatal_set()) {
+        while (atom_load(g_dist.started_count, __ATOMIC_ACQUIRE) < g_dist.num_workers && !fatal_set()) {
             SPIN_WAIT_HINT();
             watchdog(wd_start);
         }
@@ -1755,7 +1829,7 @@ PTO_DEVICE_FUNC void dist_core_main(void *runtime_v, int core_idx, int core_type
 
     // Publish "my replay is done" so followers can eventually conclude that no
     // further block.won deposits will arrive for them (§7 tail-idle).
-    g_dist.replay_done.fetch_add(1, std::memory_order_acq_rel);
+    atom_fetch_add<int64_t>(g_dist.replay_done, 1, __ATOMIC_ACQ_REL);
 
     // Drain to completion: pull any follower deposits addressed to my lane, run
     // ready tasks, and only finish once every core has finished replay (no more
@@ -1765,7 +1839,7 @@ PTO_DEVICE_FUNC void dist_core_main(void *runtime_v, int core_idx, int core_type
     while (!fatal_set()) {
         drain_block_won(self);
         int32_t freed = drain_phase_b(self);
-        const bool all_replayed = g_dist.replay_done.load(std::memory_order_acquire) >= g_dist.num_workers;
+        const bool all_replayed = atom_load(g_dist.replay_done, __ATOMIC_ACQUIRE) >= g_dist.num_workers;
         const bool ring_empty = (self->occupied_count == 0);
         const bool pending = has_pending_won(self);
         if (all_replayed && ring_empty && !pending) break;
@@ -1853,16 +1927,16 @@ void *dist_engine_register(
 #endif
 
     for (int32_t s = 0; s < kCursorShards; s++) {
-        g_dist.cube_cursor[s].v.store(-1, std::memory_order_relaxed);
-        g_dist.vector_cursor[s].v.store(-1, std::memory_order_relaxed);
-        g_dist.alloc_cursor[s].v.store(-1, std::memory_order_relaxed);
+        atom_store(g_dist.cube_cursor[s].v, -1, __ATOMIC_RELAXED);
+        atom_store(g_dist.vector_cursor[s].v, -1, __ATOMIC_RELAXED);
+        atom_store(g_dist.alloc_cursor[s].v, -1, __ATOMIC_RELAXED);
     }
-    g_dist.frontier.store(-1, std::memory_order_relaxed);
+    atom_store(g_dist.frontier, -1, __ATOMIC_RELAXED);
     for (int32_t i = 0; i < kFlagCap; i++)
-        g_dist.flags[i].store(0, std::memory_order_relaxed);
-    g_dist.fatal.store(0, std::memory_order_relaxed);
-    g_dist.replay_done.store(0, std::memory_order_relaxed);
-    g_dist.started_count.store(0, std::memory_order_relaxed);
+        atom_store(g_dist.flags[i], 0, __ATOMIC_RELAXED);
+    atom_store(g_dist.fatal, 0, __ATOMIC_RELAXED);
+    atom_store<int64_t>(g_dist.replay_done, 0, __ATOMIC_RELAXED);
+    atom_store<int64_t>(g_dist.started_count, 0, __ATOMIC_RELAXED);
     g_dist.orch_func = orch_func;
     g_dist.orch_args = orch_args;
     g_dist.rt = rt;
@@ -1890,9 +1964,9 @@ void *dist_engine_register(
         g_dist.layout[aic_ids[b]] = CoreLayout{b, LANE_AIC};
         if (2 * b < naiv) g_dist.layout[aiv_ids[2 * b]] = CoreLayout{b, LANE_AIV0};
         if (2 * b + 1 < naiv) g_dist.layout[aiv_ids[2 * b + 1]] = CoreLayout{b, LANE_AIV1};
-        g_dist.blocks[b].any_pub.store(0, std::memory_order_relaxed);
+        atom_store(g_dist.blocks[b].any_pub, 0, __ATOMIC_RELAXED);
         for (int32_t s = 0; s < kPrivateSlots; s++) {
-            g_dist.blocks[b].slots[s].state.store(0, std::memory_order_relaxed);
+            atom_store(g_dist.blocks[b].slots[s].state, 0, __ATOMIC_RELAXED);
         }
     }
 
@@ -1912,7 +1986,7 @@ void *dist_engine_register(
     }
 
     // Publish all of the above before any worker observes Runtime::dist.go.
-    std::atomic_thread_fence(std::memory_order_release);
+    atom_thread_fence(__ATOMIC_RELEASE);
     rt->ops = &g_dist_ops;
     return reinterpret_cast<void *>(&dist_core_main);
 }

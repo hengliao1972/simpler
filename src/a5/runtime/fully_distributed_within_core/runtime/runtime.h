@@ -271,7 +271,10 @@ public:
         volatile uint64_t core_main_fn;  // DistCoreMainFn (in AICPU .so)
         volatile uint32_t go;            // 1 once engine wired and cores may start
         volatile int32_t num_workers;    // number of AICore workers participating
-        volatile int32_t done_count;     // workers atomically increment when done
+        // int64_t (not int32_t): CCEC's aicore backend refuses to lower
+        // AtomicLoadAdd on a 32-bit GM (addrspace 1) target, and workers do
+        // __atomic_add_fetch on this counter from aicore_executor.cpp.
+        volatile int64_t done_count;     // workers atomically increment when done
     } dist;
 
 private:
