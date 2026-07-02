@@ -79,6 +79,10 @@ template <typename TensorTag, size_t MaxT>
 struct TensorTagMixin {
     TensorTag tags_[MaxT]{};
 
+    // Explicit device-space default ctor: the implicit one is __host__ in CCEC,
+    // which breaks Arg::Arg() = default when Arg is instantiated on device.
+    PTO_DEVICE_FUNC TensorTagMixin() = default;
+
     PTO_DEVICE_FUNC const TensorTag &tag(int32_t i) const { return tags_[i]; }
     PTO_DEVICE_FUNC TensorTag &tag(int32_t i) { return tags_[i]; }
     PTO_DEVICE_FUNC const TensorTag *tag_data() const { return tags_; }
@@ -100,7 +104,9 @@ struct TensorTagMixin<TensorTag, 0> {
 
 // Empty: TensorTag == void, static (zero overhead)
 template <size_t MaxT>
-struct TensorTagMixin<void, MaxT> {};
+struct TensorTagMixin<void, MaxT> {
+    PTO_DEVICE_FUNC TensorTagMixin() = default;
+};
 
 #if !defined(__CCE_AICORE__)
 // Empty: TensorTag == void, dynamic (resolves ambiguity)
@@ -118,6 +124,11 @@ struct TaskArgsTpl : TensorTagMixin<TensorTag, MaxT> {
     S scalars_[MaxS];
     int32_t tensor_count_{0};
     int32_t scalar_count_{0};
+
+    // Explicit device-space default ctor: same reason as TensorTagMixin above.
+    // CCEC treats the implicit default ctor as __host__ and rejects it when the
+    // derived Arg / L0TaskArgs is stack-allocated inside a __aicore__ function.
+    PTO_DEVICE_FUNC TaskArgsTpl() = default;
 
     PTO_DEVICE_FUNC void add_tensor(const T &t) {
         if (scalar_count_ > 0) {

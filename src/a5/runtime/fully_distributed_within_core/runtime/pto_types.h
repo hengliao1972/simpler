@@ -224,7 +224,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     // Minimal-permission: an Arg is built in place and consumed by reference;
     // it is never copied/moved (it is a large object, and its TensorRef slots
     // are non-copyable by design).
-    Arg() = default;
+    PTO_DEVICE_FUNC Arg() = default;
     Arg(const Arg &) = delete;
     Arg(Arg &&) = delete;
     Arg &operator=(const Arg &) = delete;
