@@ -350,15 +350,27 @@ struct DistTensorMap {
     int32_t alive_floor;              // producer < alive_floor == retired
     int32_t cleaned_upto;             // tasks < cleaned_upto already freed
 
-    PTO_DEVICE_FUNC void reset() {
-        free_head = -1;
-        high_water = 0;
-        alive_floor = 0;
-        cleaned_upto = 0;
+    // Under CCEC, DistTensorMap lives in GM (nested inside DistGlobal.cores[]),
+    // and CCE rejects address-space qualifiers on the `this` parameter of
+    // non-static member functions ("function type may not be qualified with an
+    // address space"). To keep a single implementation for both sim and CCEC,
+    // every method that mutates or reads state takes an explicit `self` — the
+    // qualifier travels on the reference instead of on `this`. `__gm__`
+    // expands to empty on sim (see common/intrinsic.h), so sim call sites are
+    // byte-for-byte equivalent to plain `self.field` access. Reference (not
+    // pointer) because self is never null on any call path (dist_core_main
+    // constructs it from &g_dist.cores[core_idx]) and the call sites read
+    // cleaner without the explicit `&` / `->` dance.
+
+    PTO_DEVICE_FUNC static void reset(__gm__ DistTensorMap &self) {
+        self.free_head = -1;
+        self.high_water = 0;
+        self.alive_floor = 0;
+        self.cleaned_upto = 0;
         for (int32_t i = 0; i < kMapBuckets; i++)
-            buckets[i] = -1;
+            self.buckets[i] = -1;
         for (int32_t i = 0; i < kTaskWindow; i++)
-            task_heads[i] = -1;
+            self.task_heads[i] = -1;
     }
 
     PTO_DEVICE_FUNC static uint32_t hash(uint64_t addr) {
@@ -366,66 +378,78 @@ struct DistTensorMap {
         return static_cast<uint32_t>(addr >> (64 - kMapBucketShift));
     }
 
-    PTO_DEVICE_FUNC static void byte_range(const Tensor &t, uint64_t &addr, uint64_t &lo, uint64_t &hi) {
+    PTO_DEVICE_FUNC static void byte_range(__gm__ const Tensor &t, uint64_t &addr, uint64_t &lo, uint64_t &hi) {
         const uint64_t esz = get_element_size(t.dtype);
         addr = t.buffer.addr;
         lo = t.start_offset * esz;
-        hi = (t.start_offset + t.extent_elem()) * esz;
+        // Inline extent_elem() here — Tensor::extent_elem is a non-static member
+        // and CCE cannot invoke it on a __gm__ receiver. `is_contiguous` /
+        // `extent_elem_cache` / `shapes[]` are POD fields, so reading them off
+        // the __gm__ reference is fine.
+        uint64_t ext;
+        if (t.is_contiguous) {
+            ext = 1;
+            for (uint32_t i = 0; i < t.ndims; i++)
+                ext *= t.shapes[i];
+        } else {
+            ext = t.extent_elem_cache;
+        }
+        hi = (t.start_offset + ext) * esz;
     }
 
-    PTO_DEVICE_FUNC int32_t alloc_slot() {
-        if (free_head >= 0) {
-            const int32_t s = free_head;
-            free_head = entries[s].next_in_bucket;
+    PTO_DEVICE_FUNC static int32_t alloc_slot(__gm__ DistTensorMap &self) {
+        if (self.free_head >= 0) {
+            const int32_t s = self.free_head;
+            self.free_head = self.entries[s].next_in_bucket;
             return s;
         }
-        if (high_water < kMapCap) return high_water++;
+        if (self.high_water < kMapCap) return self.high_water++;
         return -1;  // pool exhausted (live H-window exceeds kMapCap)
     }
 
     // Unlink `idx` from its bucket chain (O(1) via prev) and push to the free list.
-    PTO_DEVICE_FUNC void free_entry(int32_t idx) {
-        MapEntry &e = entries[idx];
-        if (e.prev_in_bucket < 0) buckets[e.bucket] = e.next_in_bucket;
-        else entries[e.prev_in_bucket].next_in_bucket = e.next_in_bucket;
-        if (e.next_in_bucket >= 0) entries[e.next_in_bucket].prev_in_bucket = e.prev_in_bucket;
+    PTO_DEVICE_FUNC static void free_entry(__gm__ DistTensorMap &self, int32_t idx) {
+        __gm__ MapEntry &e = self.entries[idx];
+        if (e.prev_in_bucket < 0) self.buckets[e.bucket] = e.next_in_bucket;
+        else self.entries[e.prev_in_bucket].next_in_bucket = e.next_in_bucket;
+        if (e.next_in_bucket >= 0) self.entries[e.next_in_bucket].prev_in_bucket = e.prev_in_bucket;
         e.bucket = -1;
-        e.next_in_bucket = free_head;
-        free_head = idx;
+        e.next_in_bucket = self.free_head;
+        self.free_head = idx;
     }
 
     // Free every entry produced by retired tasks [cleaned_upto, new_floor) by
     // walking each task's own chain (never the whole pool). Mirrors PTO2TensorMap
     // ::cleanup_retired. Advances alive_floor so lookups skip the freed window.
-    PTO_DEVICE_FUNC void advance_retire(int32_t N, int32_t H) {
+    PTO_DEVICE_FUNC static void advance_retire(__gm__ DistTensorMap &self, int32_t N, int32_t H) {
         const int32_t new_floor = N - H;
-        if (new_floor <= cleaned_upto) {  // nothing newly retired
-            if (new_floor > alive_floor) alive_floor = new_floor;
+        if (new_floor <= self.cleaned_upto) {  // nothing newly retired
+            if (new_floor > self.alive_floor) self.alive_floor = new_floor;
             return;
         }
-        for (int32_t id = cleaned_upto; id < new_floor; id++) {
-            int32_t cur = task_heads[id & kTaskWindowMask];
+        for (int32_t id = self.cleaned_upto; id < new_floor; id++) {
+            int32_t cur = self.task_heads[id & kTaskWindowMask];
             while (cur >= 0) {
-                const int32_t nxt = entries[cur].next_in_task;
-                debug_assert(entries[cur].producer == id);
-                free_entry(cur);
+                const int32_t nxt = self.entries[cur].next_in_task;
+                debug_assert(self.entries[cur].producer == id);
+                free_entry(self, cur);
                 cur = nxt;
             }
-            task_heads[id & kTaskWindowMask] = -1;
+            self.task_heads[id & kTaskWindowMask] = -1;
         }
-        cleaned_upto = new_floor;
-        alive_floor = new_floor;
+        self.cleaned_upto = new_floor;
+        self.alive_floor = new_floor;
     }
 
     // Link a fresh entry for `producer`'s write of `t`'s region. Always a new
     // entry (no in-place replace) so it parks under producer's task chain.
-    PTO_DEVICE_FUNC void insert(const Tensor &t, int32_t producer) {
+    PTO_DEVICE_FUNC static void insert(__gm__ DistTensorMap &self, __gm__ const Tensor &t, int32_t producer) {
         uint64_t addr, lo, hi;
         byte_range(t, addr, lo, hi);
-        const int32_t s = alloc_slot();
+        const int32_t s = alloc_slot(self);
         if (s < 0) return;  // pool full within the live window (should not happen)
         const uint32_t b = hash(addr);
-        MapEntry &e = entries[s];
+        __gm__ MapEntry &e = self.entries[s];
         e.buf_addr = addr;
         e.lo = lo;
         e.hi = hi;
@@ -433,25 +457,31 @@ struct DistTensorMap {
         e.bucket = static_cast<int32_t>(b);
         // Insert at bucket head.
         e.prev_in_bucket = -1;
-        e.next_in_bucket = buckets[b];
-        if (buckets[b] >= 0) entries[buckets[b]].prev_in_bucket = s;
-        buckets[b] = s;
+        e.next_in_bucket = self.buckets[b];
+        if (self.buckets[b] >= 0) self.entries[self.buckets[b]].prev_in_bucket = s;
+        self.buckets[b] = s;
         // Insert at task-chain head.
         const int32_t slot = producer & kTaskWindowMask;
-        e.next_in_task = task_heads[slot];
-        task_heads[slot] = s;
+        e.next_in_task = self.task_heads[slot];
+        self.task_heads[slot] = s;
     }
 
     // Most-recent producer whose region overlaps `t`, or -1 if none. Entries
     // below alive_floor are treated as already retired (skipped — defensive,
     // since cleanup has usually freed them already).
-    PTO_DEVICE_FUNC int32_t lookup(const Tensor &t) const {
+    // All Tensor lvalues that reach the dist engine live in GM: orch args
+    // that reference host-uploaded Tensors, outpool[] entries the engine
+    // itself materializes, block.won deposits. So byte_range / lookup /
+    // insert all take a __gm__ const Tensor&. The __gm__ macro collapses
+    // to empty on sim / AICPU, so the same signatures compile identically
+    // in the host toolchain (host callers see plain `const Tensor&`).
+    PTO_DEVICE_FUNC static int32_t lookup(__gm__ const DistTensorMap &self, __gm__ const Tensor &t) {
         uint64_t addr, lo, hi;
         byte_range(t, addr, lo, hi);
         int32_t best = -1;
-        for (int32_t cur = buckets[hash(addr)]; cur >= 0; cur = entries[cur].next_in_bucket) {
-            const MapEntry &e = entries[cur];
-            if (e.producer < alive_floor) continue;
+        for (int32_t cur = self.buckets[hash(addr)]; cur >= 0; cur = self.entries[cur].next_in_bucket) {
+            __gm__ const MapEntry &e = self.entries[cur];
+            if (e.producer < self.alive_floor) continue;
             if (e.buf_addr == addr && lo < e.hi && e.lo < hi) {
                 if (e.producer > best) best = e.producer;
             }
@@ -657,34 +687,41 @@ struct DistCore {
     std::vector<DepEdge> slot_edges;
 #endif  // DIST_TRACE_ENABLED
 
-    PTO_DEVICE_FUNC void reset(CoreType r, int32_t block, int32_t lane_id) {
-        role = r;
-        block_id = block;
-        lane = lane_id;
-        sub_block_id = (lane_id == LANE_AIV1) ? 1 : 0;
-        local_index = 0;
-        heap_next = 0;
-        map.reset();
-        occupied_count = 0;
-        owned_total = 0;
-        outpool_head = 0;
+    // Same rationale as DistTensorMap: CCEC cannot qualify the `this` of a
+    // non-static member function with __gm__, so DistCore state mutation goes
+    // through a static entry taking an explicit `self` reference. sim's
+    // __gm__-empty expansion collapses this to a plain reference. Trace fields
+    // (`trace`, `dep_edges`, `slot_edges`) are std::vectors used only under
+    // DIST_HOST_ONLY (sim / AICPU), so the trace-reset block cannot run on
+    // CCEC and does not need __gm__-aware member calls.
+    PTO_DEVICE_FUNC static void reset(__gm__ DistCore &self, CoreType r, int32_t block, int32_t lane_id) {
+        self.role = r;
+        self.block_id = block;
+        self.lane = lane_id;
+        self.sub_block_id = (lane_id == LANE_AIV1) ? 1 : 0;
+        self.local_index = 0;
+        self.heap_next = 0;
+        DistTensorMap::reset(self.map);
+        self.occupied_count = 0;
+        self.owned_total = 0;
+        self.outpool_head = 0;
         for (int32_t i = 0; i < kPrivateSlots; i++) {
-            slots[i].occupied = false;
-            slots[i].built = false;
+            self.slots[i].occupied = false;
+            self.slots[i].built = false;
         }
 #if DIST_TRACE_ENABLED
-        trace_last_ns = 0;
-        trace_last_cpu = 0;
-        trace.clear();
+        self.trace_last_ns = 0;
+        self.trace_last_cpu = 0;
+        self.trace.clear();
         // Pre-size the trace vector only when tracing is on (see g_trace_on),
         // so push_back never reallocs mid-run (a realloc would perturb the heap
         // layout — exactly the kind of disturbance that historically interacted
         // badly with the sim; keep it stable). Costs nothing on a normal run.
-        if (g_trace_reserve > 0) trace.reserve(g_trace_reserve);
-        dep_edges.clear();
-        if (g_trace_reserve > 0) dep_edges.reserve(g_trace_reserve);
-        slot_edges.clear();
-        if (g_trace_reserve > 0) slot_edges.reserve(g_trace_reserve);
+        if (g_trace_reserve > 0) self.trace.reserve(g_trace_reserve);
+        self.dep_edges.clear();
+        if (g_trace_reserve > 0) self.dep_edges.reserve(g_trace_reserve);
+        self.slot_edges.clear();
+        if (g_trace_reserve > 0) self.slot_edges.reserve(g_trace_reserve);
 #endif  // DIST_TRACE_ENABLED
     }
 };
@@ -944,7 +981,7 @@ PTO_DEVICE_FUNC inline void watchdog([[maybe_unused]] uint64_t &start_ns) {
 // cursor to N. No hardware fetch_max on the target, so this is the equivalent
 // acq-rel CAS retry. Monotonic: each task id is claimed by exactly one core and
 // no id is skipped within a cursor's subsequence.
-PTO_DEVICE_FUNC bool claim(volatile int32_t &cursor, int32_t N) {
+PTO_DEVICE_FUNC bool claim(__gm__ volatile int32_t &cursor, int32_t N) {
     int32_t c = atom_load(cursor, __ATOMIC_ACQUIRE);
     while (true) {
         if (N <= c) return false;
@@ -987,7 +1024,10 @@ PTO_DEVICE_FUNC uint64_t resolve_kernel_addr(Runtime *runtime, int32_t kernel_id
 // cores share the address space, so the release/acquire pair is the visibility
 // barrier between the kernel's output writes and a consumer's input reads.
 PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] __gm__ DistCore *self, __gm__ RingSlot &s) {
-    typedef void (*KernelFn)(int64_t *);
+    // Kernel dispatch signature: on-device kernels take a __gm__ int64_t*
+    // (their args live in GM alongside the RingSlot); sim host kernels ignore
+    // the address space (empty __gm__ macro). One typedef covers both targets.
+    typedef void (*KernelFn)(__gm__ int64_t *);
 #if DIST_SIM_HOST_CLOCK
     // Sim-only trace-driven replay (CallConfig::use_example_exec_time): when the
     // host filled example_exec_time_ns_[func_id] > 0 for this func, "execute" it
@@ -1022,7 +1062,7 @@ PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] __gm__ DistCore *self, __gm__
 #if DIST_TRACE_ENABLED
         if (g_trace_on) {
             const uint64_t t0 = now_ns();
-            fn(reinterpret_cast<int64_t *>(s.args));
+            fn(reinterpret_cast<__gm__ int64_t *>(s.args));
             const uint64_t t1 = now_ns();
             self->trace.push_back(
                 TraceEvent{
@@ -1031,16 +1071,16 @@ PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] __gm__ DistCore *self, __gm__
                 }
             );
         } else {
-            fn(reinterpret_cast<int64_t *>(s.args));
+            fn(reinterpret_cast<__gm__ int64_t *>(s.args));
         }
 #else
-        fn(reinterpret_cast<int64_t *>(s.args));
+        fn(reinterpret_cast<__gm__ int64_t *>(s.args));
 #endif
     }
 #else   // !DIST_SIM_HOST_CLOCK — AICore/CCEC: no host clock, no busy-wait emulation.
     if (s.function_bin_addr != 0) {
         KernelFn fn = reinterpret_cast<KernelFn>(s.function_bin_addr);
-        fn(reinterpret_cast<int64_t *>(s.args));
+        fn(reinterpret_cast<__gm__ int64_t *>(s.args));
     }
 #endif  // DIST_SIM_HOST_CLOCK
     if (s.is_multicore) {
@@ -1118,9 +1158,18 @@ PTO_DEVICE_FUNC inline bool lane_active(const ActiveMask &M, int32_t lane) {
 // owner build path and the follower drain path). `tensors`/`scalars` are copied
 // in; args[] is (re)built to point at this slot's own copies so the slot is
 // self-contained and executable at any later time.
+// build_ring_slot has two callers with different address spaces on the
+// input arrays: the winner branch of dist_submit_impl passes the LM-stack
+// `built[]` / `scalars` / `fanin` local arrays, and drain_block_won passes
+// `b.tensors[]` / `b.scalars[]` / `b.fanin[]` reached through a __gm__
+// BuiltSubtask. Templating the three source-array pointer types lets both
+// call sites bind naturally without a second overload — CCEC deduces the
+// address-space qualifier on each pointer at instantiation time; sim just
+// sees `const T *`.
+template <typename TensorArrPtr, typename ScalarArrPtr, typename FaninArrPtr>
 PTO_DEVICE_FUNC void build_ring_slot(
-    __gm__ RingSlot &s, int32_t task_id, int32_t func_id, uint64_t fn_addr, const Tensor *tensors, int32_t tc,
-    const uint64_t *scalars, int32_t sc, const int32_t *fanin, int32_t fc, int32_t sub_block_id, bool is_multicore,
+    __gm__ RingSlot &s, int32_t task_id, int32_t func_id, uint64_t fn_addr, TensorArrPtr tensors, int32_t tc,
+    ScalarArrPtr scalars, int32_t sc, FaninArrPtr fanin, int32_t fc, int32_t sub_block_id, bool is_multicore,
     int32_t won_block, int32_t won_slot
 ) {
     s.occupied = true;
@@ -1131,7 +1180,7 @@ PTO_DEVICE_FUNC void build_ring_slot(
     s.tensor_count = tc;
     s.scalar_count = sc;
     for (int32_t i = 0; i < tc; i++)
-        s.tensors[i].copy(tensors[i]);
+        Tensor::copy(s.tensors[i], tensors[i]);
     for (int32_t j = 0; j < sc; j++)
         s.scalars[j] = scalars[j];
     int32_t n = 0;
@@ -1141,7 +1190,17 @@ PTO_DEVICE_FUNC void build_ring_slot(
         s.args[n++] = s.scalars[j];
     s.local_ctx.s_block_idx = 0;
     s.local_ctx.s_block_num = 1;
-    s.local_ctx.async_ctx = AsyncCtx{};
+    // Field-wise reset instead of `= AsyncCtx{}`: CCEC rejects overload
+    // resolution across address spaces (assigning a host temporary into a
+    // __gm__ struct member has no viable operator=). AsyncCtx is a POD, so
+    // zeroing its fields directly gives the same semantics.
+    s.local_ctx.async_ctx.completion_count = nullptr;
+    s.local_ctx.async_ctx.completion_error_code = nullptr;
+    s.local_ctx.async_ctx.completion_entries = nullptr;
+    s.local_ctx.async_ctx.completion_capacity = 0;
+    // Write the .raw uint64_t directly instead of `= PTO2TaskId::invalid()`:
+    // CCEC has no viable operator= across address spaces for a __gm__ dest.
+    s.local_ctx.async_ctx.task_token.raw = UINT64_MAX;
     s.global_ctx.sub_block_id = sub_block_id;
     s.args[SPMD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&s.local_ctx);
     s.args[SPMD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&s.global_ctx);
@@ -1203,7 +1262,7 @@ PTO_DEVICE_FUNC void drain_block_won(__gm__ DistCore *self) {
             atom_store(w.drained[self->lane], 0, __ATOMIC_RELEASE);
             return;
         }
-        const BuiltSubtask &b = w.lane[self->lane];
+        __gm__ const BuiltSubtask &b = w.lane[self->lane];
 #if DIST_TRACE_ENABLED
         const uint64_t t_won0 = trace_now();
         const uint64_t t_won0_cpu = trace_now_cpu();
@@ -1281,7 +1340,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
     uint64_t total = 0;
     for (int32_t i = 0; i < tc; i++) {
         if (args.tag(i) != TensorArgType::OUTPUT) continue;
-        total += PTO2_ALIGN_UP(args.tensor(i).create_info().buffer_size_bytes(), PTO2_PACKED_OUTPUT_ALIGN);
+        total += PTO2_ALIGN_UP(TensorCreateInfo::buffer_size_bytes(args.tensor(i).create_info()), PTO2_PACKED_OUTPUT_ALIGN);
     }
     uint64_t task_base = PTO2_ALIGN_UP(self->heap_next, PTO2_PACKED_OUTPUT_ALIGN);
     if (total > 0 && g_dist.heap_base != nullptr) {
@@ -1301,8 +1360,8 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
     TaskOutputTensors result;
     for (int32_t i = 0; i < tc; i++) {
         if (args.tag(i) != TensorArgType::OUTPUT) continue;
-        const TensorCreateInfo &ci = args.tensor(i).create_info();
-        const uint64_t logical = ci.buffer_size_bytes();
+        __gm__ const TensorCreateInfo &ci = args.tensor(i).create_info();
+        const uint64_t logical = TensorCreateInfo::buffer_size_bytes(ci);
         const uint64_t sz = PTO2_ALIGN_UP(logical, PTO2_PACKED_OUTPUT_ALIGN);
         if (g_dist.heap_base == nullptr) {
             set_fatal();
@@ -1310,7 +1369,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
             return result;
         }
         const uint64_t phys = (task_base + off) % ring;  // straddle-pad guarantees phys+logical <= ring
-        Tensor &slot_t = self->outpool[self->outpool_head];
+        __gm__ Tensor &slot_t = self->outpool[self->outpool_head];
         self->outpool_head = (self->outpool_head + 1) % kOutPoolSlots;
         init_tensor_from_create_info(slot_t, ci, g_dist.heap_base + phys, logical);
         result.materialize_output(slot_t);
@@ -1332,7 +1391,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
     // Retire producer-map entries that have left the H span (deterministic,
     // N-derived) before this task's lookups/inserts. Bounds chain length so
     // submit stays ~O(N) instead of O(N^2). See DistTensorMap.
-    self->map.advance_retire(N, g_dist.H);
+    DistTensorMap::advance_retire(self->map, N, g_dist.H);
 
     // (b) Anchor type + claim race FIRST — resolved from the mask alone (no map
     // ops, no Tensor copies). Deciding the winner up front lets the ~2/3 of cores
@@ -1367,9 +1426,9 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
         for (int32_t i = 0; i < tc; i++) {
             const TensorArgType tag = args.tag(i);
             if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
-            const Tensor &t = args.tensor(i).ref();
+            __gm__ const Tensor &t = args.tensor(i).ref();
             if (t.manual_dep) continue;
-            const int32_t p = self->map.lookup(t);
+            const int32_t p = DistTensorMap::lookup(self->map, t);
             if (p < 0) continue;
             bool dup = false;
             for (int32_t k = 0; k < fc; k++)
@@ -1387,10 +1446,10 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
     for (int32_t i = 0; i < tc; i++) {
         const TensorArgType tag = args.tag(i);
         if (tag == TensorArgType::OUTPUT) {
-            self->map.insert(result.get_ref(out_idx), N);
+            DistTensorMap::insert(self->map, result.get_ref(out_idx), N);
             out_idx++;
         } else if (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING) {
-            self->map.insert(args.tensor(i).ref(), N);
+            DistTensorMap::insert(self->map, args.tensor(i).ref(), N);
         }
     }
 
@@ -1412,10 +1471,10 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
         uint32_t bo = 0;
         for (int32_t i = 0; i < tc; i++) {
             if (args.tag(i) == TensorArgType::OUTPUT) {
-                built[i].copy(result.get_ref(bo));
+                Tensor::copy(built[i], result.get_ref(bo));
                 bo++;
             } else {
-                built[i].copy(args.tensor(i).ref());
+                Tensor::copy(built[i], args.tensor(i).ref());
             }
         }
     }
@@ -1538,14 +1597,14 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
         }
         for (int32_t L = 0; L < PTO2_SUBTASK_SLOT_COUNT; L++) {
             if (L == own_lane || !lane_active(M, L)) continue;
-            BuiltSubtask &b = w.lane[L];
+            __gm__ BuiltSubtask &b = w.lane[L];
             b.present = true;
             b.func_id = kernel_id_for_lane(mixed, L);
             b.function_bin_addr = resolve_kernel_addr(runtime, kernel_id_for_lane(mixed, L));
             b.tensor_count = tc;
             b.scalar_count = sc;
             for (int32_t i = 0; i < tc; i++)
-                b.tensors[i].copy(built[i]);
+                Tensor::copy(b.tensors[i], built[i]);
             for (int32_t j = 0; j < sc; j++)
                 b.scalars[j] = scalars[j];
             b.fanin_count = fc;
@@ -1624,7 +1683,7 @@ void dist_log_info_v(const char *, int, const char *, ...) {}
 // modeled, mirroring the centralized runtime's documented INPUT-reader limitation.
 void wait_producer_ready(DistCore *self, const Tensor &t) {
     // Cold path (get/set_tensor_data); uses the map's current alive_floor.
-    const int32_t p = self->map.lookup(t);
+    const int32_t p = DistTensorMap::lookup(self->map, t);
     if (p < 0) return;
     uint64_t wd = 0;
     while (!fatal_set()) {
@@ -1691,7 +1750,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0Task
     uint64_t total = 0;
     for (int32_t i = 0; i < tc; i++) {
         if (args.tag(i) != TensorArgType::OUTPUT) continue;
-        total += PTO2_ALIGN_UP(args.tensor(i).create_info().buffer_size_bytes(), PTO2_PACKED_OUTPUT_ALIGN);
+        total += PTO2_ALIGN_UP(TensorCreateInfo::buffer_size_bytes(args.tensor(i).create_info()), PTO2_PACKED_OUTPUT_ALIGN);
     }
     uint64_t task_base = PTO2_ALIGN_UP(self->heap_next, PTO2_PACKED_OUTPUT_ALIGN);
     if (total > 0 && g_dist.heap_base != nullptr) {
@@ -1712,8 +1771,8 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0Task
     TaskOutputTensors result;
     for (int32_t i = 0; i < tc; i++) {
         if (args.tag(i) != TensorArgType::OUTPUT) continue;
-        const TensorCreateInfo &ci = args.tensor(i).create_info();
-        const uint64_t logical = ci.buffer_size_bytes();
+        __gm__ const TensorCreateInfo &ci = args.tensor(i).create_info();
+        const uint64_t logical = TensorCreateInfo::buffer_size_bytes(ci);
         const uint64_t sz = PTO2_ALIGN_UP(logical, PTO2_PACKED_OUTPUT_ALIGN);
         if (g_dist.heap_base == nullptr) {
             set_fatal();
@@ -1721,7 +1780,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0Task
             return result;
         }
         const uint64_t phys = (task_base + off) % ring;
-        Tensor &slot_t = self->outpool[self->outpool_head];
+        __gm__ Tensor &slot_t = self->outpool[self->outpool_head];
         self->outpool_head = (self->outpool_head + 1) % kOutPoolSlots;
         init_tensor_from_create_info(slot_t, ci, g_dist.heap_base + phys, logical);
         result.materialize_output(slot_t);
@@ -1732,11 +1791,11 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0Task
     if (fatal_set()) return result;
 
     // (b) Register this alloc as producer of each output — EVERY core (map parity).
-    self->map.advance_retire(N, g_dist.H);
+    DistTensorMap::advance_retire(self->map, N, g_dist.H);
     uint32_t out_idx = 0;
     for (int32_t i = 0; i < tc; i++) {
         if (args.tag(i) != TensorArgType::OUTPUT) continue;
-        self->map.insert(result.get_ref(out_idx), N);
+        DistTensorMap::insert(self->map, result.get_ref(out_idx), N);
         out_idx++;
     }
 
@@ -1883,8 +1942,13 @@ PTO_DEVICE_FUNC void dist_core_main(void *runtime_v, int core_idx, int core_type
 
     // sub_block lane: only meaningful for AIV in MIX tasks (M3). bgemm's 1V add
     // ignores it, so 0 is correct for the M2 single-core scope.
-    const CoreLayout lay = g_dist.layout[core_idx];
-    self->reset(role, lay.block_id, lay.lane);
+    // Copy field-by-field from the __gm__ layout entry into a stack local so
+    // downstream code reads plain int32_t (CCEC forbids copy-initializing a
+    // non-__gm__ struct value from a __gm__ struct value, and CoreLayout has
+    // no user-defined ctor / operator= to overload for the cross-space copy).
+    __gm__ const CoreLayout &layout_gm = g_dist.layout[core_idx];
+    const CoreLayout lay = {layout_gm.block_id, layout_gm.lane};
+    DistCore::reset(*self, role, lay.block_id, lay.lane);
     self->core_idx = core_idx;
     g_self = self;
 #if DIST_HOST_ONLY
