@@ -1636,20 +1636,128 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
     return result;
 }
 
+}  // namespace (close internal ns so external-linkage API wrappers below can be
+   // reached by orchestration code compiled in other TUs.)
+
 // -----------------------------------------------------------------------------
-// Remaining ops — minimal stubs (bgemm exercises submit/scope/log only).
+// Device-callable API (dist_engine_api.h). Orchestration wrappers in
+// pto_orchestration_api.h call these directly instead of going through
+// rt->ops, so the sim / CCEC paths use the same code (no per-arch indirection).
+// The old ops-table below (g_dist_ops) is kept so aicpu_executor.cpp's
+// dist_engine_register still populates rt->ops for downstream code that reads
+// it, but fdwic orchestration no longer traverses ops entries.
 //
-// The distributed engine only exposes an ops-table via g_dist_ops in the AICPU
-// build (aicpu_executor swaps it into rt->ops so orchestration code goes through
-// the dist submit path). CCEC does not link against any of these — the AICore
-// runs dist_core_main directly — and several use variadic fprintf / va_list
-// that CCEC's runtime does not carry. Gate the whole ops surface off under
-// AICore compile.
+// Gated to DIST_HOST_ONLY for now — CCEC-side orch is still linked via the
+// dlopen route (transitionally). Once C.4.b/c wires orch cpp into the AICore
+// build, this gate will drop and these symbols become the shared entry points
+// on both sides.
 // -----------------------------------------------------------------------------
 #if DIST_HOST_ONLY
-void dist_scope_begin(PTO2Runtime *) {}
-void dist_scope_end(PTO2Runtime *) {}
-void dist_orchestration_done(PTO2Runtime *) {}
+
+// Fatal-state query / report — no va_list version so this is safe to compile
+// under CCEC when the gate lifts.
+PTO_DEVICE_FUNC bool dist_is_fatal_query() { return fatal_set(); }
+
+PTO_DEVICE_FUNC void dist_report_fatal_msg(int32_t code, const char *func, const char *msg) {
+    set_fatal();
+    fprintf(stderr, "[dist_engine][FATAL][%s] code=%d: %s\n", func ? func : "?", code, msg ? msg : "");
+}
+
+// Log sinks — const-string message API (no va_list).
+PTO_DEVICE_FUNC void dist_log_error_msg(const char *func, const char *msg) {
+    fprintf(stderr, "[dist_engine][E][%s] %s\n", func ? func : "?", msg ? msg : "");
+}
+PTO_DEVICE_FUNC void dist_log_warn_msg(const char *, const char *) {}
+PTO_DEVICE_FUNC void dist_log_debug_msg(const char *, const char *) {}
+PTO_DEVICE_FUNC void dist_log_info_v_msg(const char *, int, const char *) {}
+
+// Scope guard hooks — no-op in the distributed engine (per-core replay does not
+// need scope batching).
+PTO_DEVICE_FUNC void dist_scope_begin_impl(PTO2Runtime *) {}
+PTO_DEVICE_FUNC void dist_scope_end_impl(PTO2Runtime *) {}
+PTO_DEVICE_FUNC void dist_orchestration_done_impl(PTO2Runtime *) {}
+PTO_DEVICE_FUNC void dist_scope_set_site_impl(const char *, int) {}
+
+// Dependency-only task — currently unused by fdwic examples, kept as no-op.
+PTO_DEVICE_FUNC TaskOutputTensors dist_submit_dummy_impl(PTO2Runtime *, const L0TaskArgs &) {
+    return TaskOutputTensors{};
+}
+
+#endif  // DIST_HOST_ONLY
+
+namespace {  // reopen internal namespace for wait_producer_ready only
+
+// Orchestration-side tensor data access (get/set_tensor_data). Replay runs on the
+// AICore worker and reads/writes real GM, so these are genuine memory accesses.
+// The only subtlety is read-after-write across tasks: if the region has a producer
+// in this core's map, wait until that producer's completion flag is set (draining
+// this core's own ring meanwhile so an owned producer actually runs). External
+// tensors (no producer) are accessed immediately. Consumer (WAR) tracking is not
+// modeled, mirroring the centralized runtime's documented INPUT-reader limitation.
+#if DIST_HOST_ONLY
+// wait_producer_ready + the dist_get/set_tensor_data_impl path below are only
+// exercised on sim / AICPU (host-side orchestration replay). CCEC-side orch
+// runs through a different code path (C.4.b/c) that will re-introduce a
+// __gm__-aware equivalent. Gate the whole cluster off under CCEC so we don't
+// force DistCore/DistTensorMap through a non-__gm__ reference chain.
+PTO_DEVICE_FUNC void wait_producer_ready(DistCore *self, const Tensor &t) {
+    // Cold path (get/set_tensor_data); uses the map's current alive_floor.
+    const int32_t p = DistTensorMap::lookup(self->map, t);
+    if (p < 0) return;
+    uint64_t wd = 0;
+    while (!fatal_set()) {
+        if (atom_load(g_dist.flags[p & (kFlagCap - 1)], __ATOMIC_ACQUIRE) != 0) break;
+        drain_block_won(self);
+        if (drain_phase_b(self) == 0) {
+            SPIN_WAIT_HINT();
+            watchdog(wd);
+        }
+    }
+}
+#endif  // DIST_HOST_ONLY
+
+}  // namespace
+
+#if DIST_HOST_ONLY
+PTO_DEVICE_FUNC uint64_t dist_get_tensor_data_impl(
+    PTO2Runtime *, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]
+) {
+    if (tensor.buffer.addr == 0) return 0;
+    // Sim/AICPU: g_self is a plain thread_local DistCore*. Reachable to
+    // wait_producer_ready as a non-__gm__ pointer.
+    DistCore *self = g_self;
+    if (self != nullptr) wait_producer_ready(self, tensor);
+    const uint64_t flat = tensor.compute_flat_offset(indices, ndims);
+    const uint64_t esz = get_element_size(tensor.dtype);
+    uint64_t result = 0;
+    __builtin_memcpy(&result, reinterpret_cast<const void *>(tensor.buffer.addr + flat * esz), esz);
+    return result;
+}
+
+PTO_DEVICE_FUNC void dist_set_tensor_data_impl(
+    PTO2Runtime *, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
+) {
+    if (tensor.buffer.addr == 0) return;
+    DistCore *self = g_self;
+    if (self != nullptr) wait_producer_ready(self, tensor);
+    const uint64_t flat = tensor.compute_flat_offset(indices, ndims);
+    const uint64_t esz = get_element_size(tensor.dtype);
+    __builtin_memcpy(reinterpret_cast<void *>(tensor.buffer.addr + flat * esz), &value, esz);
+}
+#endif  // DIST_HOST_ONLY
+
+namespace {  // reopen internal namespace for legacy stubs and the ops-table.
+
+// -----------------------------------------------------------------------------
+// Legacy ops-table stubs — host-only (aicpu_executor still populates rt->ops
+// from g_dist_ops so downstream host code that reads it stays wired up; fdwic
+// orchestration itself no longer traverses these entries, it calls the
+// dist_engine_api.h symbols above directly).
+// -----------------------------------------------------------------------------
+#if DIST_HOST_ONLY
+void dist_scope_begin(PTO2Runtime *rt) { dist_scope_begin_impl(rt); }
+void dist_scope_end(PTO2Runtime *rt) { dist_scope_end_impl(rt); }
+void dist_orchestration_done(PTO2Runtime *rt) { dist_orchestration_done_impl(rt); }
 bool dist_is_fatal(PTO2Runtime *) { return fatal_set(); }
 
 void dist_report_fatal(PTO2Runtime *, int32_t code, const char *func, const char *fmt, ...) {
@@ -1674,48 +1782,16 @@ void dist_log_warn(const char *, const char *, ...) {}
 void dist_log_debug(const char *, const char *, ...) {}
 void dist_log_info_v(const char *, int, const char *, ...) {}
 
-// Orchestration-side tensor data access (get/set_tensor_data). Replay runs on the
-// AICore worker and reads/writes real GM, so these are genuine memory accesses.
-// The only subtlety is read-after-write across tasks: if the region has a producer
-// in this core's map, wait until that producer's completion flag is set (draining
-// this core's own ring meanwhile so an owned producer actually runs). External
-// tensors (no producer) are accessed immediately. Consumer (WAR) tracking is not
-// modeled, mirroring the centralized runtime's documented INPUT-reader limitation.
-void wait_producer_ready(DistCore *self, const Tensor &t) {
-    // Cold path (get/set_tensor_data); uses the map's current alive_floor.
-    const int32_t p = DistTensorMap::lookup(self->map, t);
-    if (p < 0) return;
-    uint64_t wd = 0;
-    while (!fatal_set()) {
-        if (atom_load(g_dist.flags[p & (kFlagCap - 1)], __ATOMIC_ACQUIRE) != 0) break;
-        drain_block_won(self);
-        if (drain_phase_b(self) == 0) {
-            SPIN_WAIT_HINT();
-            watchdog(wd);
-        }
-    }
+// Adapters so the legacy ops table still has the ChipStorage/Tensor overloads
+// it expects (device-side impls take pointer-array indices; ops table wants a
+// (Tensor, ndims, uint32_t const *) function pointer that returns uint64_t).
+uint64_t dist_get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t *indices) {
+    return dist_get_tensor_data_impl(rt, tensor, ndims, indices);
 }
-
-uint64_t dist_get_tensor_data(PTO2Runtime *, const Tensor &tensor, uint32_t ndims, const uint32_t *indices) {
-    if (tensor.buffer.addr == 0) return 0;
-    __gm__ DistCore *self = g_self;
-    if (self != nullptr) wait_producer_ready(self, tensor);
-    const uint64_t flat = tensor.compute_flat_offset(indices, ndims);
-    const uint64_t esz = get_element_size(tensor.dtype);
-    uint64_t result = 0;
-    memcpy(&result, reinterpret_cast<const void *>(tensor.buffer.addr + flat * esz), esz);
-    return result;
-}
-
 void dist_set_tensor_data(
-    PTO2Runtime *, const Tensor &tensor, uint32_t ndims, const uint32_t *indices, uint64_t value
+    PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t *indices, uint64_t value
 ) {
-    if (tensor.buffer.addr == 0) return;
-    __gm__ DistCore *self = g_self;
-    if (self != nullptr) wait_producer_ready(self, tensor);
-    const uint64_t flat = tensor.compute_flat_offset(indices, ndims);
-    const uint64_t esz = get_element_size(tensor.dtype);
-    memcpy(reinterpret_cast<void *>(tensor.buffer.addr + flat * esz), &value, esz);
+    dist_set_tensor_data_impl(rt, tensor, ndims, indices, value);
 }
 #endif  // DIST_HOST_ONLY
 
@@ -1847,13 +1923,10 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0Task
 }
 
 #if DIST_HOST_ONLY
-TaskOutputTensors dist_submit_dummy(PTO2Runtime *, const L0TaskArgs &) { return TaskOutputTensors{}; }
-void dist_scope_set_site(const char *, int) {}
-
 const PTO2RuntimeOps g_dist_ops = {
-    dist_submit_impl,     dist_scope_begin,     dist_scope_end,     dist_orchestration_done, dist_is_fatal,
-    dist_report_fatal,    dist_log_error,       dist_log_warn,      dist_log_debug,          dist_log_info_v,
-    dist_get_tensor_data, dist_set_tensor_data, dist_alloc_tensors, dist_submit_dummy,       dist_scope_set_site,
+    dist_submit_impl,          dist_scope_begin,          dist_scope_end,     dist_orchestration_done, dist_is_fatal,
+    dist_report_fatal,         dist_log_error,            dist_log_warn,      dist_log_debug,          dist_log_info_v,
+    dist_get_tensor_data,      dist_set_tensor_data,      dist_alloc_tensors, dist_submit_dummy_impl,  dist_scope_set_site_impl,
 };
 #endif  // DIST_HOST_ONLY
 
@@ -2015,7 +2088,14 @@ PTO_DEVICE_FUNC void dist_core_main(void *runtime_v, int core_idx, int core_type
     __atomic_add_fetch(&runtime->dist.done_count, 1, __ATOMIC_ACQ_REL);
 }
 
-}  // namespace
+// (No trailing anonymous-namespace close: dist_alloc_tensors / g_dist_ops /
+// dist_dump_state / dist_core_main were pulled out into external linkage above
+// so orch wrappers can reach dist_submit_impl / dist_alloc_tensors directly.)
+
+}  // namespace (close anonymous ns holding legacy stubs, g_dist_ops,
+   // dist_alloc_tensors, dist_dump_state, dist_core_main. The engine's
+   // external entry points dist_engine_register / dist_engine_dump_trace
+   // follow below.)
 
 // dist_engine_register / dist_engine_dump_trace are host-side entry points
 // called from libaicpu_kernel (sim orchestrator thread) and — in the current
