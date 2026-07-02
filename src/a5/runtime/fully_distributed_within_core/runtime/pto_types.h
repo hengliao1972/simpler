@@ -38,6 +38,7 @@
 
 #include "aicpu/dump_arg_selection.h"
 #include "data_type.h"
+#include "intrinsic.h"  // for __gm__ (empty on sim/AICPU; __gm__ under CCEC)
 #include "profiling_config.h"
 #include "pto_submit_types.h"
 #include "task_args.h"
@@ -103,15 +104,20 @@ public:
     PTO_DEVICE_FUNC bool empty() const { return output_count_ == 0; }
     PTO_DEVICE_FUNC uint32_t size() const { return output_count_; }
 
-    /// Borrow a materialized output tensor by index (lvalue only).
-    PTO_DEVICE_FUNC const Tensor &get_ref(uint32_t index) const & {
+    /// Borrow a materialized output tensor by index (lvalue only). Returns a
+    /// __gm__ reference — under CCEC the pointed-to Tensor lives in the shared
+    /// engine state (outpool[]) and the caller must reach it through GM;
+    /// __gm__ is empty on sim so the return type collapses to `const Tensor&`.
+    PTO_DEVICE_FUNC __gm__ const Tensor &get_ref(uint32_t index) const & {
         always_assert(index < output_count_);
         return *tensors_[index];
     }
-    const Tensor &get_ref(uint32_t index) const && = delete;
+    __gm__ const Tensor &get_ref(uint32_t index) const && = delete;
 
-    /// Runtime-internal: append one materialized output Tensor.
-    PTO_DEVICE_FUNC void materialize_output(const Tensor &tensor) {
+    /// Runtime-internal: append one materialized output Tensor. Also __gm__
+    /// for the same aicore reason; sim callers pass a plain Tensor& (the
+    /// qualifier vanishes) so their code compiles unchanged.
+    PTO_DEVICE_FUNC void materialize_output(__gm__ const Tensor &tensor) {
         always_assert(output_count_ < MAX_TENSOR_ARGS);
         tensors_[output_count_++] = &tensor;
     }
@@ -125,7 +131,9 @@ private:
     uint32_t output_count_;
     // Upper bound: a task cannot have more outputs than total tensor args
     // (every OUTPUT/OUTPUT_EXISTING slot is one of the Arg's tensor slots).
-    const Tensor *tensors_[MAX_TENSOR_ARGS];
+    // __gm__ so the aicore build can point at Tensors that live in the shared
+    // engine state; empty macro on sim keeps the field a plain pointer.
+    __gm__ const Tensor *tensors_[MAX_TENSOR_ARGS];
 };
 
 // =============================================================================
@@ -145,32 +153,38 @@ private:
  * value.
  */
 class TensorRef {
+    // In the fdwic model everything the AICore engine touches — orch args
+    // included — lives in GM (the only cross-core storage on device; only
+    // kernel-internal scratch is LM). So the Tensor / TensorCreateInfo we hold
+    // a pointer to sits in GM, and the pointer type carries __gm__. On sim /
+    // AICPU __gm__ expands to empty (see common/intrinsic.h) and this becomes
+    // a plain pointer, preserving the pre-CCEC layout / call sites.
     union {
-        const Tensor *ptr_;
-        const TensorCreateInfo *create_info_;
+        __gm__ const Tensor *ptr_;
+        __gm__ const TensorCreateInfo *create_info_;
     };
 
 public:
-    TensorRef() :
+    PTO_DEVICE_FUNC TensorRef() :
         ptr_(nullptr) {}
     TensorRef(const TensorRef &) = delete;
     TensorRef(TensorRef &&) = delete;
     TensorRef &operator=(const TensorRef &) = delete;
     TensorRef &operator=(TensorRef &&) = delete;
 
-    TensorRef &operator=(const Tensor *p) {
+    PTO_DEVICE_FUNC TensorRef &operator=(__gm__ const Tensor *p) {
         ptr_ = p;
         return *this;
     }
-    TensorRef &operator=(const TensorCreateInfo *ci) {
+    PTO_DEVICE_FUNC TensorRef &operator=(__gm__ const TensorCreateInfo *ci) {
         create_info_ = ci;
         return *this;
     }
 
-    const Tensor &ref() const { return *ptr_; }
-    const TensorCreateInfo &create_info() const { return *create_info_; }
-    bool refers_to(const Tensor *t) const { return ptr_ == t; }
-    bool refers_to(const TensorCreateInfo *ci) const { return create_info_ == ci; }
+    PTO_DEVICE_FUNC __gm__ const Tensor &ref() const { return *ptr_; }
+    PTO_DEVICE_FUNC __gm__ const TensorCreateInfo &create_info() const { return *create_info_; }
+    PTO_DEVICE_FUNC bool refers_to(__gm__ const Tensor *t) const { return ptr_ == t; }
+    PTO_DEVICE_FUNC bool refers_to(__gm__ const TensorCreateInfo *ci) const { return create_info_ == ci; }
 };
 
 /**

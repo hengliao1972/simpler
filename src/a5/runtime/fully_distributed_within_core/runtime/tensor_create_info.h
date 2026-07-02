@@ -26,6 +26,7 @@
 #include <stdint.h>
 
 #include "data_type.h"
+#include "intrinsic.h"  // for __gm__ (empty on sim, __gm__ under CCEC)
 #include "tensor.h"
 
 class alignas(64) TensorCreateInfo {
@@ -68,6 +69,26 @@ public:
         return total * get_element_size(dtype);
     }
 
+    // CCEC entry: TensorCreateInfo instances reached through orch args live
+    // in GM (see TensorRef in pto_types.h — the fdwic engine only exchanges
+    // Tensors / create-info through GM). CCE forbids qualifying `this` with
+    // __gm__ on a non-static method, so provide a static form that takes an
+    // explicit `self` reference. Sim provides a shim that just forwards to
+    // the non-static overload so call sites can uniformly say
+    //   TensorCreateInfo::buffer_size_bytes(x)
+    // regardless of target.
+#if defined(__CCE_AICORE__)
+    PTO_DEVICE_FUNC static uint64_t buffer_size_bytes(__gm__ const TensorCreateInfo &self) {
+        uint64_t total = 1;
+        for (uint32_t i = 0; i < self.ndims; i++) {
+            total *= self.shapes[i];
+        }
+        return total * get_element_size(self.dtype);
+    }
+#else
+    static uint64_t buffer_size_bytes(const TensorCreateInfo &self) { return self.buffer_size_bytes(); }
+#endif
+
 public:
     // --- Bytes [0, 32): TensorCreateInfo-only fields ---
     // These occupy the same positions as Tensor::buffer, Tensor::owner_task_id,
@@ -109,7 +130,10 @@ static_assert(offsetof(TensorCreateInfo, shapes) == offsetof(Tensor, shapes));
 // ============================================================================
 
 /// Fill the entire backing buffer of `t` with `initial_value` (doubling memcpy).
-PTO_DEVICE_FUNC inline void fill_tensor_initial_value(Tensor &t, uint64_t initial_value) {
+/// The `t` reference is __gm__-qualified so the aicore build can call this on
+/// a Tensor that lives in the shared engine state; __gm__ is empty on sim, so
+/// the qualifier is a no-op there.
+PTO_DEVICE_FUNC inline void fill_tensor_initial_value(__gm__ Tensor &t, uint64_t initial_value) {
     always_assert(reinterpret_cast<char *>(t.buffer.addr) != nullptr);
     uint64_t elem_size = get_element_size(t.dtype);
     char *dst = reinterpret_cast<char *>(t.buffer.addr);
@@ -133,11 +157,16 @@ PTO_DEVICE_FUNC inline void fill_tensor_initial_value(Tensor &t, uint64_t initia
 /// Single 64B memcpy covers cache line 1; `ci` pre-initialises start_offset (=0)
 /// and is_contiguous (=true) in its line-1 slots so they need no reset here.
 /// Cache line 2 (stride/extent) is computed from `ci.shapes` in a single reverse pass.
-PTO_DEVICE_FUNC inline void init_tensor_from_create_info(Tensor &t, const TensorCreateInfo &ci, void *addr, uint64_t buffer_size) {
+PTO_DEVICE_FUNC inline void init_tensor_from_create_info(__gm__ Tensor &t, __gm__ const TensorCreateInfo &ci, void *addr, uint64_t buffer_size) {
     always_assert(ci.ndims > 0 && ci.ndims <= MAX_TENSOR_DIMS);
     __builtin_memcpy(&t, &ci, 64);
-    t.buffer = {reinterpret_cast<uint64_t>(addr), buffer_size};
-    t.owner_task_id = PTO2TaskId::invalid();  // caller (orchestrator) overwrites with actual task_id
+    // Field-wise assignment: CCEC has no viable operator= across address
+    // spaces (a host-space brace-initialized PTOBufferHandle temporary cannot
+    // be assigned into a __gm__ Buffer). Same reason we hand-write the raw
+    // PTO2TaskId store below.
+    t.buffer.addr = reinterpret_cast<uint64_t>(addr);
+    t.buffer.size = buffer_size;
+    t.owner_task_id.raw = UINT64_MAX;  // == PTO2TaskId::invalid(); caller overwrites with the actual task_id
     uint32_t s = 1;
     for (int32_t i = static_cast<int32_t>(t.ndims) - 1; i >= 0; --i) {
         t.strides[i] = s;

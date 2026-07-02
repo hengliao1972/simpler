@@ -244,6 +244,51 @@ struct alignas(64) Tensor {
     /// deep copy. Equivalent to `init_from(other)`.
     PTO_DEVICE_FUNC void copy(const Tensor &other) { init_from(other); }
 
+    // Address-space-aware copy entries. dist_engine keeps its RingSlot /
+    // BuiltSubtask / outpool Tensors in GM (they cross cores), and orch args /
+    // TaskOutputTensors::get_ref() also point into GM; only the winner-local
+    // built[] scratch on dist_submit_impl's stack is LM. So a Tensor copy can
+    // happen with either operand in either address space. Overload sets below
+    // cover (dst, src) ∈ {LM, GM}² so every call site reads uniformly as
+    //   Tensor::copy(dst, src);
+    // regardless of where the operands live. Under CCEC each overload keeps a
+    // distinct signature (__gm__ is a real address-space qualifier there);
+    // under sim __gm__ macro-expands to empty and the four signatures collapse
+    // to one, so we only emit the LM-LM variant unconditionally and gate the
+    // rest under __CCE_AICORE__ to avoid a redefinition error.
+    PTO_DEVICE_FUNC static void copy(Tensor &dst, const Tensor &src) { dst.init_from(src); }
+#if defined(__CCE_AICORE__)
+    PTO_DEVICE_FUNC static void copy(__gm__ Tensor &dst, const Tensor &src) { copy_bytes(dst, src); }
+    PTO_DEVICE_FUNC static void copy(Tensor &dst, __gm__ const Tensor &src) { copy_bytes(dst, src); }
+    PTO_DEVICE_FUNC static void copy(__gm__ Tensor &dst, __gm__ const Tensor &src) { copy_bytes(dst, src); }
+
+private:
+    // Address-space-parametric body used by every CCEC copy overload above.
+    // `Dst` / `Src` bind whatever qualifiers the caller had (with or without
+    // __gm__). We access `src` fields by reading the address-space-qualified
+    // reference, which CCEC lowers to the appropriate GM/LM load, and we write
+    // `dst` fields the same way. Kept private since it is only meant to be
+    // called by the three copy(...) overloads that split on address space.
+    template <typename Dst, typename Src>
+    PTO_DEVICE_FUNC static void copy_bytes(Dst &dst, Src &src) {
+        __builtin_memcpy(&dst, &src, 64);
+        if (src.is_contiguous && src.start_offset == 0) {
+            uint32_t s = 1;
+            for (int32_t i = static_cast<int32_t>(src.ndims) - 1; i >= 0; --i) {
+                dst.strides[i] = s;
+                s *= src.shapes[i];
+            }
+            dst.extent_elem_cache = s;
+        } else {
+            dst.extent_elem_cache = src.extent_elem_cache;
+            for (uint32_t i = 0; i < src.ndims; i++) {
+                dst.strides[i] = src.strides[i];
+            }
+        }
+    }
+public:
+#endif
+
     // Materialization from a TensorCreateInfo (runtime-allocated outputs) lives
     // in the runtime tensor_create_info.h as the free functions
     // init_tensor_from_create_info() / fill_tensor_initial_value(); they operate
