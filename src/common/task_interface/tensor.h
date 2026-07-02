@@ -168,7 +168,7 @@ struct alignas(64) Tensor {
     /// accessor used by orchestration sources to read raw tensor data; matches
     /// the former ContinuousTensor::data_as<T>() semantics.
     template <typename T>
-    T *data_as() const {
+    PTO_DEVICE_FUNC T *data_as() const {
         return reinterpret_cast<T *>(static_cast<uintptr_t>(buffer.addr));
     }
 
