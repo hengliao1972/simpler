@@ -104,19 +104,19 @@ public:
     PTO_DEVICE_FUNC bool empty() const { return output_count_ == 0; }
     PTO_DEVICE_FUNC uint32_t size() const { return output_count_; }
 
-    /// Borrow a materialized output tensor by index (lvalue only). Returns a
-    /// __gm__ reference — under CCEC the pointed-to Tensor lives in the shared
-    /// engine state (outpool[]) and the caller must reach it through GM;
-    /// __gm__ is empty on sim so the return type collapses to `const Tensor&`.
+    /// Borrow a materialized output tensor by index (lvalue only). Under
+    /// CCEC the pointed-to Tensor lives in the engine's outpool[] on GM at
+    /// run time — that's why the stored pointer is __gm__-qualified; sim
+    /// collapses the qualifier away.
     PTO_DEVICE_FUNC __gm__ const Tensor &get_ref(uint32_t index) const & {
         always_assert(index < output_count_);
         return *tensors_[index];
     }
     __gm__ const Tensor &get_ref(uint32_t index) const && = delete;
 
-    /// Runtime-internal: append one materialized output Tensor. Also __gm__
-    /// for the same aicore reason; sim callers pass a plain Tensor& (the
-    /// qualifier vanishes) so their code compiles unchanged.
+    /// Runtime-internal: append one materialized output Tensor. The engine
+    /// resides in GM (dist_engine.cpp DistCore::outpool[]), so the passed
+    /// reference is __gm__.
     PTO_DEVICE_FUNC void materialize_output(__gm__ const Tensor &tensor) {
         always_assert(output_count_ < MAX_TENSOR_ARGS);
         tensors_[output_count_++] = &tensor;
@@ -132,7 +132,8 @@ private:
     // Upper bound: a task cannot have more outputs than total tensor args
     // (every OUTPUT/OUTPUT_EXISTING slot is one of the Arg's tensor slots).
     // __gm__ so the aicore build can point at Tensors that live in the shared
-    // engine state; empty macro on sim keeps the field a plain pointer.
+    // engine state (DistCore::outpool[]); empty macro on sim keeps the field
+    // a plain pointer.
     __gm__ const Tensor *tensors_[MAX_TENSOR_ARGS];
 };
 
@@ -153,15 +154,23 @@ private:
  * value.
  */
 class TensorRef {
-    // In the fdwic model everything the AICore engine touches — orch args
-    // included — lives in GM (the only cross-core storage on device; only
-    // kernel-internal scratch is LM). So the Tensor / TensorCreateInfo we hold
-    // a pointer to sits in GM, and the pointer type carries __gm__. On sim /
-    // AICPU __gm__ expands to empty (see common/intrinsic.h) and this becomes
-    // a plain pointer, preserving the pre-CCEC layout / call sites.
+    // In the fdwic model the orchestration entry runs on-core, and every
+    // temporary orch builds (L0TaskArgs, Tensor views derived from
+    // orch_args.tensor(i).ref(), TensorCreateInfo) is a stack local — CCEC
+    // classifies those as the default address space (physically the AICore
+    // kernel stack, GM-backed at launch time by the runtime). Only when the
+    // engine hands a task off to another core does the payload get copied
+    // into a WonSlot on GM — that's where the address-space transition
+    // happens, via the __gm__ dst overloads of Tensor::copy / TensorRef.
+    //
+    // So the stored pointers here are default-address-space too: they
+    // reference orch's stack-resident Tensor/TensorCreateInfo, and it is the
+    // engine's job to marshal that content into GM when the payload leaves
+    // the orch's frame. Under host / sim __gm__ collapses to empty and this
+    // is a plain pointer either way, preserving the pre-CCEC layout.
     union {
-        __gm__ const Tensor *ptr_;
-        __gm__ const TensorCreateInfo *create_info_;
+        const Tensor *ptr_;
+        const TensorCreateInfo *create_info_;
     };
 
 public:
@@ -172,19 +181,40 @@ public:
     TensorRef &operator=(const TensorRef &) = delete;
     TensorRef &operator=(TensorRef &&) = delete;
 
-    PTO_DEVICE_FUNC TensorRef &operator=(__gm__ const Tensor *p) {
+    PTO_DEVICE_FUNC TensorRef &operator=(const Tensor *p) {
         ptr_ = p;
         return *this;
     }
-    PTO_DEVICE_FUNC TensorRef &operator=(__gm__ const TensorCreateInfo *ci) {
+    PTO_DEVICE_FUNC TensorRef &operator=(const TensorCreateInfo *ci) {
         create_info_ = ci;
         return *this;
     }
 
-    PTO_DEVICE_FUNC __gm__ const Tensor &ref() const { return *ptr_; }
-    PTO_DEVICE_FUNC __gm__ const TensorCreateInfo &create_info() const { return *create_info_; }
-    PTO_DEVICE_FUNC bool refers_to(__gm__ const Tensor *t) const { return ptr_ == t; }
-    PTO_DEVICE_FUNC bool refers_to(__gm__ const TensorCreateInfo *ci) const { return create_info_ == ci; }
+#if defined(__CCE_AICORE__)
+    // CCEC-only overloads for __gm__ pointers: TaskOutputTensors::get_ref
+    // returns a __gm__ const Tensor & (outpool lives in GM), and orch code
+    // chains that result into params.add_input(...), so the & of a __gm__
+    // Tensor lvalue has __gm__ type. We narrow it into the default-address-
+    // space storage slot by memcpy'ing the pointer bits — CCEC's IR/backend
+    // rejects reinterpret_cast_from_gm-to-default in some larger call graphs
+    // (backend "error pointer address space cast") but accepts a byte-level
+    // copy of the pointer value. The physical address is preserved; the
+    // engine's copy helpers re-widen back to __gm__ (via Tensor::copy's
+    // __gm__ dst overloads) when payload leaves the orch frame.
+    PTO_DEVICE_FUNC TensorRef &operator=(__gm__ const Tensor *p) {
+        __builtin_memcpy(&ptr_, &p, sizeof(uintptr_t));
+        return *this;
+    }
+    PTO_DEVICE_FUNC TensorRef &operator=(__gm__ const TensorCreateInfo *ci) {
+        __builtin_memcpy(&create_info_, &ci, sizeof(uintptr_t));
+        return *this;
+    }
+#endif
+
+    PTO_DEVICE_FUNC const Tensor &ref() const { return *ptr_; }
+    PTO_DEVICE_FUNC const TensorCreateInfo &create_info() const { return *create_info_; }
+    PTO_DEVICE_FUNC bool refers_to(const Tensor *t) const { return ptr_ == t; }
+    PTO_DEVICE_FUNC bool refers_to(const TensorCreateInfo *ci) const { return create_info_ == ci; }
 };
 
 /**
