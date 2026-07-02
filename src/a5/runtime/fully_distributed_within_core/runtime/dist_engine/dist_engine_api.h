@@ -37,7 +37,8 @@
 
 #include <stdint.h>
 
-#include "pto_submit_types.h"  // MixedKernels
+#include "intrinsic.h"          // __gm__ (empty macro on host)
+#include "pto_submit_types.h"   // MixedKernels
 #include "pto_types.h"          // L0TaskArgs, TaskOutputTensors, PTO_DEVICE_FUNC (via data_type.h)
 #include "tensor.h"             // Tensor
 
@@ -51,16 +52,20 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *rt, const L0Ta
 // Fatal-state helpers. dist_engine.cpp already exposes fatal_set() /
 // set_fatal(); these are the CCEC-safe wrappers orchestration reaches.
 PTO_DEVICE_FUNC bool dist_is_fatal_query();
-PTO_DEVICE_FUNC void dist_report_fatal_msg(int32_t code, const char *func, const char *msg);
+PTO_DEVICE_FUNC void dist_report_fatal_msg(int32_t code, __gm__ const char *func, __gm__ const char *msg);
 
 // Log sinks. On host / sim these forward to unified_log_host (varargs); on
 // AICore the current implementation is a no-op stub — a real unified_log_device
 // pipeline (GM log-ring + AICPU flush) is a follow-up. Signatures are kept
 // simple (const-string msg only) to avoid CCEC va_list constraints.
-PTO_DEVICE_FUNC void dist_log_error_msg(const char *func, const char *msg);
-PTO_DEVICE_FUNC void dist_log_warn_msg(const char *func, const char *msg);
-PTO_DEVICE_FUNC void dist_log_debug_msg(const char *func, const char *msg);
-PTO_DEVICE_FUNC void dist_log_info_v_msg(const char *func, int v, const char *msg);
+// `func` / `msg` are declared __gm__ because CCEC places string literals
+// (__FUNCTION__, "..." format strings expanded at call sites) in GM; the
+// qualifier is empty under host / sim builds so callers there compile
+// unchanged.
+PTO_DEVICE_FUNC void dist_log_error_msg(__gm__ const char *func, __gm__ const char *msg);
+PTO_DEVICE_FUNC void dist_log_warn_msg(__gm__ const char *func, __gm__ const char *msg);
+PTO_DEVICE_FUNC void dist_log_debug_msg(__gm__ const char *func, __gm__ const char *msg);
+PTO_DEVICE_FUNC void dist_log_info_v_msg(__gm__ const char *func, int v, __gm__ const char *msg);
 
 // Cross-layer tensor data access — orchestration reads/writes tensor values
 // through the engine so producer/consumer synchronization stays consistent.

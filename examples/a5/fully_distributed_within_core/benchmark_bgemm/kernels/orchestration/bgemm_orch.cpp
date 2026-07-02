@@ -44,7 +44,7 @@ __attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestrati
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO_DEVICE_FUNC void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     // Tensor args
     const Tensor &ext_A = orch_args.tensor(0).ref();
     const Tensor &ext_B = orch_args.tensor(1).ref();
