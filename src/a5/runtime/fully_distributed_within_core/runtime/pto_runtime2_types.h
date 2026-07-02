@@ -231,6 +231,13 @@ struct PTO2TaskPayload {
      * @param args                Task arguments (tensors + scalars)
      * @param result  Materialized output tensors (from TensorCreateInfo path)
      */
+#if !defined(__CCE_AICORE__)
+    // Host / AICPU only: the trb scheduler path fills a PTO2TaskPayload from
+    // L0TaskArgs on the AICPU side. The distributed engine (fdwic) never invokes
+    // this method — it copies task tensors into its own RingSlot inline in
+    // dist_engine.cpp — so gate this body under host so CCEC does not have to
+    // resolve args.tag() / args.tensor() (host-tagged const-overload issues) on
+    // types whose device overloads are __aicore__.
     void init(
         const L0TaskArgs &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout
     ) {
@@ -255,6 +262,7 @@ struct PTO2TaskPayload {
         // Eliminates branches; extra bytes within the same CL have zero additional cost.
         memcpy(scalars, args.scalars(), PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
     }
+#endif  // !__CCE_AICORE__
 };
 
 // PTO2TaskPayload layout verification (offsetof requires complete type).
