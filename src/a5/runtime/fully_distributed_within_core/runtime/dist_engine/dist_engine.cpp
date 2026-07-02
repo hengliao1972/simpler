@@ -397,6 +397,26 @@ struct DistTensorMap {
         hi = (t.start_offset + ext) * esz;
     }
 
+#if defined(__CCE_AICORE__)
+    // Non-__gm__ overload for CCEC callers whose Tensor lives on the AICore
+    // kernel stack (orch-side, address-space-agnostic type). Body is a byte
+    // copy of the __gm__ version — POD field reads only.
+    PTO_DEVICE_FUNC static void byte_range(const Tensor &t, uint64_t &addr, uint64_t &lo, uint64_t &hi) {
+        const uint64_t esz = get_element_size(t.dtype);
+        addr = t.buffer.addr;
+        lo = t.start_offset * esz;
+        uint64_t ext;
+        if (t.is_contiguous) {
+            ext = 1;
+            for (uint32_t i = 0; i < t.ndims; i++)
+                ext *= t.shapes[i];
+        } else {
+            ext = t.extent_elem_cache;
+        }
+        hi = (t.start_offset + ext) * esz;
+    }
+#endif
+
     PTO_DEVICE_FUNC static int32_t alloc_slot(__gm__ DistTensorMap &self) {
         if (self.free_head >= 0) {
             const int32_t s = self.free_head;
@@ -466,6 +486,36 @@ struct DistTensorMap {
         self.task_heads[slot] = s;
     }
 
+#if defined(__CCE_AICORE__)
+    // Non-__gm__ overload for the CCEC path. TensorRef::ref() now returns a
+    // default-address-space reference (orch stack local), so args.tensor(i).ref()
+    // and result.get_ref(...) — where result is a stack-local TaskOutputTensors
+    // — bind here rather than the __gm__ version. Byte-range extraction reads
+    // scalar fields only; the Tensor is physically on the AICore kernel stack
+    // which is GM-backed at launch, so pointer-identity math over `addr` still
+    // matches the on-core owner's earlier __gm__ insert.
+    PTO_DEVICE_FUNC static void insert(__gm__ DistTensorMap &self, const Tensor &t, int32_t producer) {
+        uint64_t addr, lo, hi;
+        byte_range(t, addr, lo, hi);
+        const int32_t s = alloc_slot(self);
+        if (s < 0) return;
+        const uint32_t b = hash(addr);
+        __gm__ MapEntry &e = self.entries[s];
+        e.buf_addr = addr;
+        e.lo = lo;
+        e.hi = hi;
+        e.producer = producer;
+        e.bucket = static_cast<int32_t>(b);
+        e.prev_in_bucket = -1;
+        e.next_in_bucket = self.buckets[b];
+        if (self.buckets[b] >= 0) self.entries[self.buckets[b]].prev_in_bucket = s;
+        self.buckets[b] = s;
+        const int32_t slot = producer & kTaskWindowMask;
+        e.next_in_task = self.task_heads[slot];
+        self.task_heads[slot] = s;
+    }
+#endif
+
     // Most-recent producer whose region overlaps `t`, or -1 if none. Entries
     // below alive_floor are treated as already retired (skipped — defensive,
     // since cleanup has usually freed them already).
@@ -488,6 +538,23 @@ struct DistTensorMap {
         }
         return best;
     }
+
+#if defined(__CCE_AICORE__)
+    // Non-__gm__ overload — same rationale as insert() above.
+    PTO_DEVICE_FUNC static int32_t lookup(__gm__ const DistTensorMap &self, const Tensor &t) {
+        uint64_t addr, lo, hi;
+        byte_range(t, addr, lo, hi);
+        int32_t best = -1;
+        for (int32_t cur = self.buckets[hash(addr)]; cur >= 0; cur = self.entries[cur].next_in_bucket) {
+            __gm__ const MapEntry &e = self.entries[cur];
+            if (e.producer < self.alive_floor) continue;
+            if (e.buf_addr == addr && lo < e.hi && e.lo < hi) {
+                if (e.producer > best) best = e.producer;
+            }
+        }
+        return best;
+    }
+#endif
 };
 
 // -----------------------------------------------------------------------------
@@ -1360,7 +1427,12 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
     TaskOutputTensors result;
     for (int32_t i = 0; i < tc; i++) {
         if (args.tag(i) != TensorArgType::OUTPUT) continue;
-        __gm__ const TensorCreateInfo &ci = args.tensor(i).create_info();
+        // TensorRef::create_info() now returns a default-address-space ref
+        // (see pto_types.h — orch is all stack-local under CCEC). The engine
+        // still writes the derived Tensor into a GM outpool slot; the
+        // cross-space transition happens inside init_tensor_from_create_info,
+        // whose signature takes __gm__ dst + non-__gm__ src.
+        const TensorCreateInfo &ci = args.tensor(i).create_info();
         const uint64_t logical = TensorCreateInfo::buffer_size_bytes(ci);
         const uint64_t sz = PTO2_ALIGN_UP(logical, PTO2_PACKED_OUTPUT_ALIGN);
         if (g_dist.heap_base == nullptr) {
@@ -1426,7 +1498,11 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
         for (int32_t i = 0; i < tc; i++) {
             const TensorArgType tag = args.tag(i);
             if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
-            __gm__ const Tensor &t = args.tensor(i).ref();
+            // TensorRef::ref() now returns default-address-space; orch's
+            // stack-local Tensor is the physical source. DistTensorMap::lookup
+            // needs a Tensor to compare buffer.addr against — the address
+            // itself is space-agnostic, so a plain reference is enough.
+            const Tensor &t = args.tensor(i).ref();
             if (t.manual_dep) continue;
             const int32_t p = DistTensorMap::lookup(self->map, t);
             if (p < 0) continue;
@@ -1847,7 +1923,12 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0Task
     TaskOutputTensors result;
     for (int32_t i = 0; i < tc; i++) {
         if (args.tag(i) != TensorArgType::OUTPUT) continue;
-        __gm__ const TensorCreateInfo &ci = args.tensor(i).create_info();
+        // TensorRef::create_info() now returns a default-address-space ref
+        // (see pto_types.h — orch is all stack-local under CCEC). The engine
+        // still writes the derived Tensor into a GM outpool slot; the
+        // cross-space transition happens inside init_tensor_from_create_info,
+        // whose signature takes __gm__ dst + non-__gm__ src.
+        const TensorCreateInfo &ci = args.tensor(i).create_info();
         const uint64_t logical = TensorCreateInfo::buffer_size_bytes(ci);
         const uint64_t sz = PTO2_ALIGN_UP(logical, PTO2_PACKED_OUTPUT_ALIGN);
         if (g_dist.heap_base == nullptr) {

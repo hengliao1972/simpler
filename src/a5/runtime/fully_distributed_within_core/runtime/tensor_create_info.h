@@ -85,6 +85,11 @@ public:
         }
         return total * get_element_size(self.dtype);
     }
+    // Non-__gm__ overload: since TensorRef::create_info() now returns a
+    // default-address-space reference (orch stack local), engine-side call
+    // sites like args.tensor(i).create_info() land here rather than the
+    // __gm__ overload above.
+    PTO_DEVICE_FUNC static uint64_t buffer_size_bytes(const TensorCreateInfo &self) { return self.buffer_size_bytes(); }
 #else
     static uint64_t buffer_size_bytes(const TensorCreateInfo &self) { return self.buffer_size_bytes(); }
 #endif
@@ -177,3 +182,26 @@ PTO_DEVICE_FUNC inline void init_tensor_from_create_info(__gm__ Tensor &t, __gm_
         fill_tensor_initial_value(t, ci.initial_value);
     }
 }
+
+#if defined(__CCE_AICORE__)
+// Non-__gm__ ci overload: TensorRef::create_info() returns default-address-
+// space under CCEC (orch stack-local storage); the engine still writes the
+// derived Tensor into a __gm__ outpool slot. Body mirrors the __gm__/__gm__
+// version — the memcpy is legal across the stack→GM boundary.
+PTO_DEVICE_FUNC inline void init_tensor_from_create_info(__gm__ Tensor &t, const TensorCreateInfo &ci, void *addr, uint64_t buffer_size) {
+    always_assert(ci.ndims > 0 && ci.ndims <= MAX_TENSOR_DIMS);
+    __builtin_memcpy(&t, &ci, 64);
+    t.buffer.addr = reinterpret_cast<uint64_t>(addr);
+    t.buffer.size = buffer_size;
+    t.owner_task_id.raw = UINT64_MAX;
+    uint32_t s = 1;
+    for (int32_t i = static_cast<int32_t>(t.ndims) - 1; i >= 0; --i) {
+        t.strides[i] = s;
+        s *= t.shapes[i];
+    }
+    t.extent_elem_cache = s;
+    if (ci.has_initial_value) {
+        fill_tensor_initial_value(t, ci.initial_value);
+    }
+}
+#endif

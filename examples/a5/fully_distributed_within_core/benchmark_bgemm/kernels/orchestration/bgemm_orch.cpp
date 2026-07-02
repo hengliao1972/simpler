@@ -45,7 +45,10 @@ __attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestrati
 }
 
 __attribute__((visibility("default"))) PTO_DEVICE_FUNC void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
-    // Tensor args
+    // Tensor args. TensorRef stores default-address-space pointers (see
+    // pto_types.h) — orch is all stack-local on the AICore, and the engine
+    // marshals content into GM on cross-core handoff paths. Host / sim
+    // collapses __gm__ to empty, so this reads uniformly.
     const Tensor &ext_A = orch_args.tensor(0).ref();
     const Tensor &ext_B = orch_args.tensor(1).ref();
     const Tensor &ext_C = orch_args.tensor(2).ref();
@@ -91,8 +94,8 @@ __attribute__((visibility("default"))) PTO_DEVICE_FUNC void aicpu_orchestration_
                 (static_cast<uint64_t>(group_idx) * grid_k + static_cast<uint64_t>(k_idx)) * group_tile_elems;
 
             uint32_t a_view_offsets[1] = {static_cast<uint32_t>(ab_offset)};
-            Tensor A_view = ext_A.view(group_shapes, a_view_offsets);
             uint32_t b_view_offsets[1] = {static_cast<uint32_t>(ab_offset)};
+            Tensor A_view = ext_A.view(group_shapes, a_view_offsets);
             Tensor B_view = ext_B.view(group_shapes, b_view_offsets);
             L0TaskArgs params_gemm;
             params_gemm.add_input(A_view);
