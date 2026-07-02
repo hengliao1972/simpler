@@ -109,19 +109,22 @@ static_assert(offsetof(TensorCreateInfo, shapes) == offsetof(Tensor, shapes));
 // ============================================================================
 
 /// Fill the entire backing buffer of `t` with `initial_value` (doubling memcpy).
-inline void fill_tensor_initial_value(Tensor &t, uint64_t initial_value) {
+PTO_DEVICE_FUNC inline void fill_tensor_initial_value(Tensor &t, uint64_t initial_value) {
     always_assert(reinterpret_cast<char *>(t.buffer.addr) != nullptr);
     uint64_t elem_size = get_element_size(t.dtype);
     char *dst = reinterpret_cast<char *>(t.buffer.addr);
     constexpr uint64_t blk_size = 64;
     uint64_t blk = (t.buffer.size < blk_size) ? t.buffer.size : blk_size;
     for (uint64_t b = 0; b < blk; b += elem_size) {
-        memcpy(dst + b, &initial_value, elem_size);
+        // __builtin_memcpy: CCEC's <string.h> memcpy is __host__-tagged and
+        // cannot be called from __aicore__ context, but the compiler intrinsic
+        // is target-agnostic.
+        __builtin_memcpy(dst + b, &initial_value, elem_size);
     }
     uint64_t filled = blk;
     while (filled < t.buffer.size) {
         uint64_t copy_size = ((t.buffer.size - filled) < filled) ? (t.buffer.size - filled) : filled;
-        memcpy(dst + filled, dst, copy_size);
+        __builtin_memcpy(dst + filled, dst, copy_size);
         filled += copy_size;
     }
 }
@@ -130,9 +133,9 @@ inline void fill_tensor_initial_value(Tensor &t, uint64_t initial_value) {
 /// Single 64B memcpy covers cache line 1; `ci` pre-initialises start_offset (=0)
 /// and is_contiguous (=true) in its line-1 slots so they need no reset here.
 /// Cache line 2 (stride/extent) is computed from `ci.shapes` in a single reverse pass.
-inline void init_tensor_from_create_info(Tensor &t, const TensorCreateInfo &ci, void *addr, uint64_t buffer_size) {
+PTO_DEVICE_FUNC inline void init_tensor_from_create_info(Tensor &t, const TensorCreateInfo &ci, void *addr, uint64_t buffer_size) {
     always_assert(ci.ndims > 0 && ci.ndims <= MAX_TENSOR_DIMS);
-    memcpy(&t, &ci, 64);
+    __builtin_memcpy(&t, &ci, 64);
     t.buffer = {reinterpret_cast<uint64_t>(addr), buffer_size};
     t.owner_task_id = PTO2TaskId::invalid();  // caller (orchestrator) overwrites with actual task_id
     uint32_t s = 1;

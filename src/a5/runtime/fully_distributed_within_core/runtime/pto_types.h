@@ -96,29 +96,29 @@ enum class PTO2ScopeMode : uint8_t {
  */
 class TaskOutputTensors {
 public:
-    TaskOutputTensors() :
+    PTO_DEVICE_FUNC TaskOutputTensors() :
         task_id_(PTO2TaskId::invalid()),
         output_count_(0) {}
 
-    bool empty() const { return output_count_ == 0; }
-    uint32_t size() const { return output_count_; }
+    PTO_DEVICE_FUNC bool empty() const { return output_count_ == 0; }
+    PTO_DEVICE_FUNC uint32_t size() const { return output_count_; }
 
     /// Borrow a materialized output tensor by index (lvalue only).
-    const Tensor &get_ref(uint32_t index) const & {
+    PTO_DEVICE_FUNC const Tensor &get_ref(uint32_t index) const & {
         always_assert(index < output_count_);
         return *tensors_[index];
     }
     const Tensor &get_ref(uint32_t index) const && = delete;
 
     /// Runtime-internal: append one materialized output Tensor.
-    void materialize_output(const Tensor &tensor) {
+    PTO_DEVICE_FUNC void materialize_output(const Tensor &tensor) {
         always_assert(output_count_ < MAX_TENSOR_ARGS);
         tensors_[output_count_++] = &tensor;
     }
 
-    void set_task_id(PTO2TaskId id) { task_id_ = id; }
+    PTO_DEVICE_FUNC void set_task_id(PTO2TaskId id) { task_id_ = id; }
 
-    PTO2TaskId task_id() const { return task_id_; }
+    PTO_DEVICE_FUNC PTO2TaskId task_id() const { return task_id_; }
 
 private:
     PTO2TaskId task_id_;
@@ -580,6 +580,13 @@ using L0TaskArgs = Arg<MAX_TENSOR_ARGS, MAX_SCALAR_ARGS>;
 // already-allocated inputs (capacity matches ChipStorageTaskArgs).
 // aicpu_orchestration_entry/config receive a const L2TaskArgs&.
 struct L2TaskArgs : Arg<CHIP_MAX_TENSOR_ARGS, CHIP_MAX_SCALAR_ARGS> {
+#if !defined(__CCE_AICORE__)
+    // Host / AICPU only: consumes a ChipStorageTaskArgs (executor scratch) and
+    // rebuilds this as an entry-arg L2TaskArgs. CCEC compiles for AICore see
+    // L2TaskArgs by layout only (pto_runtime2.h stores const L2TaskArgs* in
+    // DistGlobal), so this method is unreachable from device code and its body
+    // uses host-tagged ChipStorageTaskArgs::tensor()/scalar() overloads that
+    // CCEC would reject.
     // Build from the executor's ChipStorageTaskArgs: each input becomes a
     // TensorRef pointing at src's Tensor, so `src` must outlive this (on the
     // executor path src is runtime->orch_args_storage_, alive for the whole run).
@@ -597,6 +604,7 @@ struct L2TaskArgs : Arg<CHIP_MAX_TENSOR_ARGS, CHIP_MAX_SCALAR_ARGS> {
             add_scalar(src.scalar(i));
         }
     }
+#endif  // !__CCE_AICORE__
 };
 
 #endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_TYPES_H_

@@ -49,15 +49,35 @@ enum class DataType : uint8_t {
 
 static_assert(sizeof(DataType) == 1, "DataType must stay 1 byte");
 
+// Kernel-callable qualifier: when compiling for AICore (ccec compiler defines
+// __DAV_VEC__ or __DAV_CUBE__), PTO_DEVICE_FUNC adds the __aicore__ attribute.
+// In orchestration / host builds, PTO_DEVICE_FUNC expands to nothing. Defined
+// up here (rather than further below near the uint64_t packing helpers) so
+// get_element_size / get_dtype_name can carry the qualifier for the AICore
+// tree — shared runtime headers (tensor.h, tensor_create_info.h) call them.
+#if defined(__DAV_VEC__) || defined(__DAV_CUBE__)
+// Ensure __aicore__ is available (CCE attribute for bisheng compiler).
+// Platform headers (inner_kernel.h) normally define this, but data_type.h
+// may be included before them.
+#ifndef __aicore__
+#define __aicore__ [aicore]
+#endif
+#define PTO_DEVICE_FUNC __aicore__
+#else
+#define PTO_DEVICE_FUNC
+#endif
+
 /**
  * Get the size in bytes of a single element of the given data type
  *
  * @param dtype Data type
  * @return Size in bytes (0 for unknown types)
  */
-inline uint64_t get_element_size(DataType dtype) {
-    // Order must match the enum definition exactly
-    constexpr static std::array<uint64_t, static_cast<int>(DataType::DATA_TYPE_NUM)> data_type_size = {
+PTO_DEVICE_FUNC inline uint64_t get_element_size(DataType dtype) {
+    // Order must match the enum definition exactly. Plain array (not std::array)
+    // so CCEC — which lacks <array> — can also compile this. `constexpr static`
+    // still fine under CCEC for a POD table.
+    constexpr static uint64_t data_type_size[static_cast<int>(DataType::DATA_TYPE_NUM)] = {
         4,  // case DataType::FLOAT32
         2,  // DataType::FLOAT16
         4,  // DataType::INT32
@@ -114,21 +134,6 @@ inline const char *get_dtype_name(DataType dtype) {
 // =============================================================================
 // uint64_t Packing/Unpacking Utilities
 // =============================================================================
-
-// Kernel-callable qualifier: when compiling for AICore (ccec compiler defines
-// __DAV_VEC__ or __DAV_CUBE__), PTO_DEVICE_FUNC adds the __aicore__ attribute.
-// In orchestration / host builds, PTO_DEVICE_FUNC expands to nothing.
-#if defined(__DAV_VEC__) || defined(__DAV_CUBE__)
-// Ensure __aicore__ is available (CCE attribute for bisheng compiler).
-// Platform headers (inner_kernel.h) normally define this, but data_type.h
-// may be included before them.
-#ifndef __aicore__
-#define __aicore__ [aicore]
-#endif
-#define PTO_DEVICE_FUNC __aicore__
-#else
-#define PTO_DEVICE_FUNC
-#endif
 
 // -----------------------------------------------------------------------------
 // Unified template interface for all targets (AICore + CPU).
