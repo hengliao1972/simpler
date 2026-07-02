@@ -269,6 +269,15 @@ public:
     // runtime/dist_engine.* and docs/fully_distributed_within_core.md.
     struct DistHandoff {
         volatile uint64_t core_main_fn;  // DistCoreMainFn (in AICPU .so)
+        // Address of the DistGlobal struct that carries engine state (cursors,
+        // completion flags, block.won, per-core DistCore slots). Written once by
+        // dist_engine_register on the AICPU orchestrator thread; every AICore
+        // worker reads it at dist_core_main entry and stashes it in a per-block
+        // scratch pointer (CCEC forbids file-scope globals inside __aicore__
+        // functions, so we cannot keep the dist engine's state in BSS on device).
+        // In sim the AICPU thread writes `&g_dist` (host BSS) since all workers
+        // share one address space; onboard writes the GM allocation address.
+        volatile uint64_t shared_addr;
         volatile uint32_t go;            // 1 once engine wired and cores may start
         volatile int32_t num_workers;    // number of AICore workers participating
         // int64_t (not int32_t): CCEC's aicore backend refuses to lower
