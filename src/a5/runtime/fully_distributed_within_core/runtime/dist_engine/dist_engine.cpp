@@ -43,6 +43,20 @@
  * M2 scope: single-core tasks (1C / 1V) only — sufficient for benchmark_bgemm.
  * Multi-core co-ownership (MIX / 2V, block.won) is M3; GM heap reclamation is
  * M4. A MIX task encountered in M2 raises a fatal error.
+ *
+ * CCEC-onboard readiness (C.3.c in the plan): most of the SPMD engine is now
+ * gated correctly for CCEC — helpers wear PTO_DEVICE_FUNC, shared engine state
+ * flows through a GM `DistGlobal` pointed at by g_dist_ptr, the per-shard
+ * cursors / block.won / DistCore references carry `__gm__`, and the atom_*
+ * wrappers ship both plain and __gm__ overloads. What still blocks a full
+ * CCEC build is that DistTensorMap / DistCore / Tensor / TaskOutputTensors
+ * define member functions but CCE rejects address-space qualifiers on the
+ * `this` parameter ("function type may not be qualified with an address
+ * space"), so calling `self->map.lookup(t)` on a __gm__ DistCore is illegal.
+ * The fix — hoist those methods to free functions taking a __gm__ pointer,
+ * or store engine state as plain POD accessed only through GM helpers — is
+ * the remaining rework in this stage and touches every method call site on
+ * these types.
  */
 
 #include "dist_engine/dist_engine.h"
@@ -187,6 +201,47 @@ PTO_DEVICE_FUNC inline T atom_fetch_sub(volatile T &p, T d, int mo) {
     return __atomic_fetch_sub(&p, d, mo);
 }
 PTO_DEVICE_FUNC inline void atom_thread_fence(int mo) { __atomic_thread_fence(mo); }
+
+// __gm__ overloads: CCEC's shared DistGlobal lives in GM, so every field
+// accessed through g_dist_ptr carries the __gm__ address space. Overload
+// resolution otherwise fails ("cannot bind volatile T & to __gm__ volatile T").
+// On sim / AICPU __gm__ expands to nothing (intrinsic.h) and these become
+// duplicates of the plain overloads above — guard the block so we only emit
+// them for the CCEC target.
+#if defined(__CCE_AICORE__)
+template <typename T>
+PTO_DEVICE_FUNC inline T atom_load(__gm__ const volatile T &p, int mo) {
+    return __atomic_load_n(&p, mo);
+}
+template <typename T>
+PTO_DEVICE_FUNC inline T atom_load(__gm__ const T &p, int mo) {
+    return __atomic_load_n(&p, mo);
+}
+template <typename T, typename V>
+PTO_DEVICE_FUNC inline void atom_store(__gm__ volatile T &p, V v, int mo) {
+    __atomic_store_n(&p, static_cast<T>(v), mo);
+}
+template <typename T, typename V>
+PTO_DEVICE_FUNC inline void atom_store(__gm__ T &p, V v, int mo) {
+    __atomic_store_n(&p, static_cast<T>(v), mo);
+}
+template <typename T>
+PTO_DEVICE_FUNC inline bool atom_cas_weak(__gm__ volatile T &p, T &expected, T desired, int s_mo, int f_mo) {
+    return __atomic_compare_exchange_n(&p, &expected, desired, /*weak=*/true, s_mo, f_mo);
+}
+template <typename T>
+PTO_DEVICE_FUNC inline bool atom_cas_strong(__gm__ volatile T &p, T &expected, T desired, int s_mo, int f_mo) {
+    return __atomic_compare_exchange_n(&p, &expected, desired, /*weak=*/false, s_mo, f_mo);
+}
+template <typename T>
+PTO_DEVICE_FUNC inline T atom_fetch_add(__gm__ volatile T &p, T d, int mo) {
+    return __atomic_fetch_add(&p, d, mo);
+}
+template <typename T>
+PTO_DEVICE_FUNC inline T atom_fetch_sub(__gm__ volatile T &p, T d, int mo) {
+    return __atomic_fetch_sub(&p, d, mo);
+}
+#endif  // __CCE_AICORE__
 
 }  // namespace
 
@@ -711,8 +766,34 @@ struct DistGlobal {
     DistCore cores[RUNTIME_MAX_WORKER];
 };
 
+// g_dist / g_self storage. sim / AICPU keep the plain BSS globals so nothing
+// downstream (host thread wake-up, thread_local semantics, code that expects
+// `g_dist` to name a struct-lvalue) changes. CCEC refuses file-scope globals
+// referenced from an __aicore__ function, so on that target we route through
+// pointers stashed in the per-block scratch that CCEC allows ([[block_local]]
+// static). The `g_dist` macro then makes `g_dist.field` textually resolve to
+// `(*g_dist_ptr).field` under CCEC — every hot-path reference below stays
+// unchanged. dist_core_main is the sole writer of both pointers on device:
+// it loads shared_addr from runtime->dist at entry and picks the DistCore
+// slot by core_idx.
+#if defined(__CCE_AICORE__)
+// g_dist lives in GM: AICore cores can only share data through global memory,
+// so DistGlobal (cursors, completion flags, block.won, per-core DistCore slots)
+// is allocated by the AICPU orchestrator (dist_engine_register) and its address
+// is published via runtime->dist.shared_addr. dist_core_main reads that on
+// entry and stashes it here. `g_self` is a per-core scratch pointer into the
+// GM cores[] slot the local core owns — a plain __gm__ DistCore* is enough,
+// no shared writer (only this core's dist_core_main mutates its own slot).
+[[block_local]] static __gm__ DistGlobal *g_dist_ptr;
+[[block_local]] static __gm__ DistCore *g_self;
+#define g_dist (*g_dist_ptr)
+#else
+// sim / AICPU: g_dist is a BSS symbol shared across the worker pthreads (which
+// share one address space, unlike real AICore cores). g_self must be
+// thread_local so each worker pthread sees only its own DistCore*.
 DistGlobal g_dist;
 thread_local DistCore *g_self = nullptr;
+#endif
 
 #if DIST_SIM_HOST_CLOCK
 // Orchestration/scheduling overhead isolation (set PTO_DIST_SKIP_EXEC=1). When
@@ -832,7 +913,7 @@ void dist_dump_state(int);  // defined below; dumps full engine state for hangs
 // failure instead of an indefinite hang. CCEC/onboard has no getenv/chrono/
 // fprintf, so the function collapses to a no-op there — call sites remain
 // unchanged and pay a single unused-argument tag.
-inline void watchdog([[maybe_unused]] uint64_t &start_ns) {
+PTO_DEVICE_FUNC inline void watchdog([[maybe_unused]] uint64_t &start_ns) {
 #if DIST_HOST_ONLY
     static const long budget_s = []() -> long {
         const char *e = getenv("PTO_DIST_WATCHDOG");
@@ -905,7 +986,7 @@ PTO_DEVICE_FUNC uint64_t resolve_kernel_addr(Runtime *runtime, int32_t kernel_id
 // Execute one owned task, then publish its completion flag (release). In sim all
 // cores share the address space, so the release/acquire pair is the visibility
 // barrier between the kernel's output writes and a consumer's input reads.
-PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] DistCore *self, RingSlot &s) {
+PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] __gm__ DistCore *self, __gm__ RingSlot &s) {
     typedef void (*KernelFn)(int64_t *);
 #if DIST_SIM_HOST_CLOCK
     // Sim-only trace-driven replay (CallConfig::use_example_exec_time): when the
@@ -966,7 +1047,7 @@ PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] DistCore *self, RingSlot &s) 
         // Joint ownership: the co-owner that drives remaining to zero (the last
         // subtask to finish) publishes the single global completion flag (§3.1),
         // then frees the block.won entry for reuse.
-        WonSlot &w = g_dist.blocks[s.won_block].slots[s.won_slot];
+        __gm__ WonSlot &w = g_dist.blocks[s.won_block].slots[s.won_slot];
         if (atom_fetch_sub<int64_t>(w.remaining, 1, __ATOMIC_ACQ_REL) == 1) {
             atom_store(g_dist.flags[s.task_id & (kFlagCap - 1)], 1, __ATOMIC_RELEASE);
             atom_store(w.state, 0, __ATOMIC_RELEASE);  // recycle the id-keyed slot
@@ -983,7 +1064,7 @@ PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] DistCore *self, RingSlot &s) 
 // Phase B: execute every ready owned task in the private ring. A task is ready
 // once all its fan-in producers have set their completion flag (acquire).
 // Returns the number of slots freed this pass.
-PTO_DEVICE_FUNC int32_t drain_phase_b(DistCore *self) {
+PTO_DEVICE_FUNC int32_t drain_phase_b(__gm__ DistCore *self) {
     // Fast path: an empty private ring has nothing to drain. Skips the per-slot
     // scan on every submit point (called twice per task, on every core) when the
     // ring is empty — the common case for fine-grained / skip-exec workloads.
@@ -991,7 +1072,7 @@ PTO_DEVICE_FUNC int32_t drain_phase_b(DistCore *self) {
     if (self->occupied_count == 0) return 0;
     int32_t freed = 0;
     for (int32_t i = 0; i < kPrivateSlots; i++) {
-        RingSlot &s = self->slots[i];
+        __gm__ RingSlot &s = self->slots[i];
         if (!s.occupied || !s.built) continue;  // skip reserved-but-unbuilt slots
         bool ready = true;
         for (int32_t f = 0; f < s.fanin_count; f++) {
@@ -1008,7 +1089,7 @@ PTO_DEVICE_FUNC int32_t drain_phase_b(DistCore *self) {
     return freed;
 }
 
-PTO_DEVICE_FUNC int32_t alloc_ring_slot(DistCore *self) {
+PTO_DEVICE_FUNC int32_t alloc_ring_slot(__gm__ DistCore *self) {
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         if (!self->slots[i].occupied) return i;
     }
@@ -1038,7 +1119,7 @@ PTO_DEVICE_FUNC inline bool lane_active(const ActiveMask &M, int32_t lane) {
 // in; args[] is (re)built to point at this slot's own copies so the slot is
 // self-contained and executable at any later time.
 PTO_DEVICE_FUNC void build_ring_slot(
-    RingSlot &s, int32_t task_id, int32_t func_id, uint64_t fn_addr, const Tensor *tensors, int32_t tc,
+    __gm__ RingSlot &s, int32_t task_id, int32_t func_id, uint64_t fn_addr, const Tensor *tensors, int32_t tc,
     const uint64_t *scalars, int32_t sc, const int32_t *fanin, int32_t fc, int32_t sub_block_id, bool is_multicore,
     int32_t won_block, int32_t won_slot
 ) {
@@ -1075,7 +1156,7 @@ PTO_DEVICE_FUNC void build_ring_slot(
 // Reserve a free block.won slot in `block`. Returns slot index or -1 if full.
 // 2V allows either AIV of the block to be an anchor, so allocation must be atomic.
 PTO_DEVICE_FUNC int32_t alloc_won_slot(int32_t block) {
-    BlockWon &bw = g_dist.blocks[block];
+    __gm__ BlockWon &bw = g_dist.blocks[block];
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         int32_t exp = 0;
         if (atom_cas_strong(bw.slots[i].state, exp, 2, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
@@ -1087,12 +1168,12 @@ PTO_DEVICE_FUNC int32_t alloc_won_slot(int32_t block) {
 
 // True if a published block.won deposit for this core's lane has not yet been
 // taken — used by the termination check to avoid finishing before draining.
-PTO_DEVICE_FUNC bool has_pending_won(DistCore *self) {
+PTO_DEVICE_FUNC bool has_pending_won(__gm__ DistCore *self) {
     if (self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
-    BlockWon &bw = g_dist.blocks[self->block_id];
+    __gm__ BlockWon &bw = g_dist.blocks[self->block_id];
     if (atom_load(bw.any_pub, __ATOMIC_ACQUIRE) == 0) return false;  // no deposit ever published
     for (int32_t i = 0; i < kPrivateSlots; i++) {
-        WonSlot &w = bw.slots[i];
+        __gm__ WonSlot &w = bw.slots[i];
         if (atom_load(w.state, __ATOMIC_ACQUIRE) != 1) continue;
         if (w.lane[self->lane].present && atom_load(w.drained[self->lane], __ATOMIC_ACQUIRE) == 0) return true;
     }
@@ -1103,14 +1184,14 @@ PTO_DEVICE_FUNC bool has_pending_won(DistCore *self) {
 // this core's physical lane that we have not yet taken, building each into a free
 // private-ring slot (back-pressure: stop when the ring is full). Non-blocking —
 // if nothing is addressed to us we simply return.
-PTO_DEVICE_FUNC void drain_block_won(DistCore *self) {
+PTO_DEVICE_FUNC void drain_block_won(__gm__ DistCore *self) {
     if (self->lane == LANE_AIC || self->lane == LANE_NONE) return;  // AIC is never a follower
-    BlockWon &bw = g_dist.blocks[self->block_id];
+    __gm__ BlockWon &bw = g_dist.blocks[self->block_id];
     // Fast path: if no anchor has ever published a deposit into this block, there
     // is nothing to drain — skip the per-slot scan on every submit (hot path).
     if (atom_load(bw.any_pub, __ATOMIC_ACQUIRE) == 0) return;
     for (int32_t i = 0; i < kPrivateSlots; i++) {
-        WonSlot &w = bw.slots[i];
+        __gm__ WonSlot &w = bw.slots[i];
         if (atom_load(w.state, __ATOMIC_ACQUIRE) != 1) continue;
         if (!w.lane[self->lane].present) continue;
         int32_t exp = 0;
@@ -1153,7 +1234,7 @@ PTO_DEVICE_FUNC void drain_block_won(DistCore *self) {
 // fan-in resolution stay consistent across cores.
 // -----------------------------------------------------------------------------
 PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &args) {
-    DistCore *self = g_self;
+    __gm__ DistCore *self = g_self;
     if (self == nullptr) return TaskOutputTensors{};
     Runtime *runtime = g_dist.runtime;
 
@@ -1270,8 +1351,8 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
     if (type_match) {
         // Pick the shard for this task (§6.6): shard = N % kCursorShards, a pure
         // function of the task id so every core targets the same sub-cursor for N.
-        PaddedCursor *cursors = anchor_is_cube ? g_dist.cube_cursor : g_dist.vector_cursor;
-        volatile int32_t &cursor = cursors[N % kCursorShards].v;
+        __gm__ PaddedCursor *cursors = anchor_is_cube ? g_dist.cube_cursor : g_dist.vector_cursor;
+        __gm__ volatile int32_t &cursor = cursors[N % kCursorShards].v;
         is_winner = claim(cursor, N);
     }
 
@@ -1359,7 +1440,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
     // wait, so the entry snapshot is the complete set.
     if (g_trace_on && self->occupied_count >= kPrivateSlots - kWonReserve) {
         for (int32_t i = 0; i < kPrivateSlots; i++) {
-            const RingSlot &rs = self->slots[i];
+            __gm__ const RingSlot &rs = self->slots[i];
             if (rs.occupied && rs.built) self->slot_edges.push_back({N, rs.task_id});
         }
     }
@@ -1448,7 +1529,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
             won_slot = alloc_won_slot(won_block);
         }
         if (fatal_set()) return result;
-        WonSlot &w = g_dist.blocks[won_block].slots[won_slot];
+        __gm__ WonSlot &w = g_dist.blocks[won_block].slots[won_slot];
         w.task_id = N;
         atom_store<int64_t>(w.remaining, pc, __ATOMIC_RELAXED);
         for (int32_t L = 0; L < PTO2_SUBTASK_SLOT_COUNT; L++) {
@@ -1558,7 +1639,7 @@ void wait_producer_ready(DistCore *self, const Tensor &t) {
 
 uint64_t dist_get_tensor_data(PTO2Runtime *, const Tensor &tensor, uint32_t ndims, const uint32_t *indices) {
     if (tensor.buffer.addr == 0) return 0;
-    DistCore *self = g_self;
+    __gm__ DistCore *self = g_self;
     if (self != nullptr) wait_producer_ready(self, tensor);
     const uint64_t flat = tensor.compute_flat_offset(indices, ndims);
     const uint64_t esz = get_element_size(tensor.dtype);
@@ -1571,7 +1652,7 @@ void dist_set_tensor_data(
     PTO2Runtime *, const Tensor &tensor, uint32_t ndims, const uint32_t *indices, uint64_t value
 ) {
     if (tensor.buffer.addr == 0) return;
-    DistCore *self = g_self;
+    __gm__ DistCore *self = g_self;
     if (self != nullptr) wait_producer_ready(self, tensor);
     const uint64_t flat = tensor.compute_flat_offset(indices, ndims);
     const uint64_t esz = get_element_size(tensor.dtype);
@@ -1587,7 +1668,7 @@ void dist_set_tensor_data(
 // of the region, so real consumers depend on the writer, not on this alloc. Every
 // core replays it identically, keeping heap addresses + maps consistent.
 PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
-    DistCore *self = g_self;
+    __gm__ DistCore *self = g_self;
     if (self == nullptr) return TaskOutputTensors{};
     // EXECUTE-FIRST (docs §6 step 0+1, §6.1): every submit point first seeks an
     // execution opportunity before advancing the deterministic replay below.
@@ -1788,7 +1869,16 @@ void dist_dump_state(int) {
 PTO_DEVICE_FUNC void dist_core_main(void *runtime_v, int core_idx, int core_type_int) {
     if (core_idx < 0 || core_idx >= RUNTIME_MAX_WORKER) return;
     Runtime *runtime = reinterpret_cast<Runtime *>(runtime_v);
-    DistCore *self = &g_dist.cores[core_idx];
+#if defined(__CCE_AICORE__)
+    // Wire the per-block pointer to the DistGlobal that dist_engine_register
+    // published in runtime->dist.shared_addr. Every worker in this block will
+    // read `g_dist.*` through this pointer for the rest of the run. On sim
+    // g_dist is a BSS symbol so this branch is skipped (`g_dist` names the
+    // struct directly).
+    g_dist_ptr = reinterpret_cast<__gm__ DistGlobal *>(runtime->dist.shared_addr);
+    if (g_dist_ptr == nullptr) return;
+#endif
+    __gm__ DistCore *self = &g_dist.cores[core_idx];
     const CoreType role = static_cast<CoreType>(core_type_int);
 
     // sub_block lane: only meaningful for AIV in MIX tasks (M3). bgemm's 1V add
@@ -1984,6 +2074,12 @@ void *dist_engine_register(
         signal(SIGUSR1, dist_dump_state);
         handler_installed = true;
     }
+
+    // Publish the DistGlobal struct address so device workers can wire up
+    // their g_dist_ptr at dist_core_main entry. In sim the host BSS `g_dist`
+    // is shared across every worker pthread, so its own address is what all
+    // AICore workers see; onboard will replace this with a real GM allocation.
+    runtime->dist.shared_addr = reinterpret_cast<uint64_t>(&g_dist);
 
     // Publish all of the above before any worker observes Runtime::dist.go.
     atom_thread_fence(__ATOMIC_RELEASE);
