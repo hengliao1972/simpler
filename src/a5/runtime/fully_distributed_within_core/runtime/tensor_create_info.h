@@ -30,7 +30,7 @@
 
 class alignas(64) TensorCreateInfo {
 public:
-    TensorCreateInfo(
+    PTO_DEVICE_FUNC TensorCreateInfo(
         const uint32_t shapes_in[], uint32_t ndims_in, DataType dtype_in = DataType::FLOAT32, bool manual_dep_in = false
     ) :
         initial_value(0),
@@ -52,15 +52,15 @@ public:
         }
     }
 
-    void copy(const TensorCreateInfo &other) { memcpy(this, &other, sizeof(other)); }
+    PTO_DEVICE_FUNC void copy(const TensorCreateInfo &other) { __builtin_memcpy(this, &other, sizeof(other)); }
 
     template <typename T = uint64_t>
-    void set_initial_value(T value) {
+    PTO_DEVICE_FUNC void set_initial_value(T value) {
         has_initial_value = true;
         initial_value = to_u64(value);
     }
 
-    uint64_t buffer_size_bytes() const {
+    PTO_DEVICE_FUNC uint64_t buffer_size_bytes() const {
         uint64_t total = 1;
         for (uint32_t i = 0; i < ndims; i++) {
             total *= shapes[i];

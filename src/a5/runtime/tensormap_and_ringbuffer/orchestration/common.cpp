@@ -10,6 +10,17 @@
  */
 #include "common.h"
 
+// This TU is host-side: it defines the orchestration SO's runtime-binding
+// hook (framework_bind_runtime), the addr2line stack tracer, and the throwing
+// assert_impl / AssertionError constructor. Its body relies on <dlfcn.h>,
+// <execinfo.h>, <cxxabi.h>, C++ exceptions, popen(), and other POSIX/glibc
+// facilities that CCEC does not carry. The AICore build path picks up this
+// file via the runtime's build_config.py source glob for "orchestration/"
+// (aicore.source_dirs includes "orchestration"). Nothing in aicore-side code
+// actually invokes these symbols, so simply compile the entire body out under
+// CCEC. See sibling runtimes (fully_distributed_within_core) for the mirror.
+#if !defined(__CCE_AICORE__)
+
 #ifdef __linux__
 #include <cxxabi.h>
 #include <dlfcn.h>
@@ -195,3 +206,5 @@ AssertionError::AssertionError(const char *condition, const char *file, int line
 
     throw AssertionError(condition, file, line);
 }
+
+#endif  // !__CCE_AICORE__

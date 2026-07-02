@@ -295,7 +295,7 @@ struct DistTensorMap {
     int32_t alive_floor;              // producer < alive_floor == retired
     int32_t cleaned_upto;             // tasks < cleaned_upto already freed
 
-    void reset() {
+    PTO_DEVICE_FUNC void reset() {
         free_head = -1;
         high_water = 0;
         alive_floor = 0;
@@ -306,19 +306,19 @@ struct DistTensorMap {
             task_heads[i] = -1;
     }
 
-    static uint32_t hash(uint64_t addr) {
+    PTO_DEVICE_FUNC static uint32_t hash(uint64_t addr) {
         addr *= 0x9E3779B97F4A7C15ULL;  // golden-ratio multiplicative mix
         return static_cast<uint32_t>(addr >> (64 - kMapBucketShift));
     }
 
-    static void byte_range(const Tensor &t, uint64_t &addr, uint64_t &lo, uint64_t &hi) {
+    PTO_DEVICE_FUNC static void byte_range(const Tensor &t, uint64_t &addr, uint64_t &lo, uint64_t &hi) {
         const uint64_t esz = get_element_size(t.dtype);
         addr = t.buffer.addr;
         lo = t.start_offset * esz;
         hi = (t.start_offset + t.extent_elem()) * esz;
     }
 
-    int32_t alloc_slot() {
+    PTO_DEVICE_FUNC int32_t alloc_slot() {
         if (free_head >= 0) {
             const int32_t s = free_head;
             free_head = entries[s].next_in_bucket;
@@ -329,7 +329,7 @@ struct DistTensorMap {
     }
 
     // Unlink `idx` from its bucket chain (O(1) via prev) and push to the free list.
-    void free_entry(int32_t idx) {
+    PTO_DEVICE_FUNC void free_entry(int32_t idx) {
         MapEntry &e = entries[idx];
         if (e.prev_in_bucket < 0) buckets[e.bucket] = e.next_in_bucket;
         else entries[e.prev_in_bucket].next_in_bucket = e.next_in_bucket;
@@ -342,7 +342,7 @@ struct DistTensorMap {
     // Free every entry produced by retired tasks [cleaned_upto, new_floor) by
     // walking each task's own chain (never the whole pool). Mirrors PTO2TensorMap
     // ::cleanup_retired. Advances alive_floor so lookups skip the freed window.
-    void advance_retire(int32_t N, int32_t H) {
+    PTO_DEVICE_FUNC void advance_retire(int32_t N, int32_t H) {
         const int32_t new_floor = N - H;
         if (new_floor <= cleaned_upto) {  // nothing newly retired
             if (new_floor > alive_floor) alive_floor = new_floor;
@@ -364,7 +364,7 @@ struct DistTensorMap {
 
     // Link a fresh entry for `producer`'s write of `t`'s region. Always a new
     // entry (no in-place replace) so it parks under producer's task chain.
-    void insert(const Tensor &t, int32_t producer) {
+    PTO_DEVICE_FUNC void insert(const Tensor &t, int32_t producer) {
         uint64_t addr, lo, hi;
         byte_range(t, addr, lo, hi);
         const int32_t s = alloc_slot();
@@ -390,7 +390,7 @@ struct DistTensorMap {
     // Most-recent producer whose region overlaps `t`, or -1 if none. Entries
     // below alive_floor are treated as already retired (skipped — defensive,
     // since cleanup has usually freed them already).
-    int32_t lookup(const Tensor &t) const {
+    PTO_DEVICE_FUNC int32_t lookup(const Tensor &t) const {
         uint64_t addr, lo, hi;
         byte_range(t, addr, lo, hi);
         int32_t best = -1;
@@ -602,7 +602,7 @@ struct DistCore {
     std::vector<DepEdge> slot_edges;
 #endif  // DIST_TRACE_ENABLED
 
-    void reset(CoreType r, int32_t block, int32_t lane_id) {
+    PTO_DEVICE_FUNC void reset(CoreType r, int32_t block, int32_t lane_id) {
         role = r;
         block_id = block;
         lane = lane_id;

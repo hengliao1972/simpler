@@ -21,18 +21,8 @@
 
 #pragma once
 
-// Host / AICPU: <stdexcept> gives us std::runtime_error for AssertionError and
-// throw semantics for the assert macros. CCEC does not carry <stdexcept> nor
-// C++ exceptions, so the AICore build skips it and points assert_impl at a
-// device-only stub that traps (see the __CCE_AICORE__ branch below).
-#if !defined(__CCE_AICORE__)
 #include <stdexcept>
 #include <string>
-#endif
-
-#include "data_type.h"  // for PTO_DEVICE_FUNC
-
-#if !defined(__CCE_AICORE__)
 
 /**
  * Get the current stack trace, including file paths and line numbers.
@@ -60,23 +50,6 @@ private:
  * Assertion failure handler.
  */
 [[noreturn]] void assert_impl(const char *condition, const char *file, int line);
-
-#else  // __CCE_AICORE__
-
-// AICore has no exceptions, no host-side stack-trace / stdlib, and no way to
-// overload on __aicore__ attribute (CCEC treats same-signature overloads as
-// redefinitions). Assertion failure has no meaningful runtime handler on the
-// device either — the diagnostic value only exists on host. So under CCEC
-// compile every debug_assert / always_assert to `((void)0)` and skip the
-// assert_impl declarations entirely; the surrounding code loses only its
-// failure-mode diagnostic, which is host-side by design.
-//
-// Note this override sits ABOVE the debug_assert / always_assert macro
-// definitions below; the guarded #ifdef inside those blocks then compiles
-// them out for CCEC (see the __CCE_AICORE__ short-circuit at each macro
-// definition).
-
-#endif  // __CCE_AICORE__
 
 /**
  * debug_assert macro:

@@ -229,6 +229,13 @@ struct alignas(64) PTO2TensorMapEntry {
      * COVERED is returned when `input` completely contains `entry` per-dim
      * — dep_compute uses this to retire the now-redundant entry.
      */
+#if !defined(__CCE_AICORE__)
+    // Host-only: this is trb's central dep tracker used by pto_dep_compute /
+    // pto_orchestrator; the fdwic distributed engine ignores it and defines
+    // its own producer map (DistTensorMap in dist_engine.cpp). CCEC parses
+    // this class via the pto_runtime2.h include chain but calls get_element_size
+    // (device-tagged) from an unmarked host method, which it can't resolve —
+    // gate the body out under CCEC.
     OverlapStatus check_overlap(const Tensor &input) const {
         debug_assert(input.buffer.addr == buffer_addr);
         debug_assert(input.version >= version);
@@ -331,6 +338,7 @@ struct alignas(64) PTO2TensorMapEntry {
         }
         return input_contains_entry ? OverlapStatus::COVERED : OverlapStatus::OTHER;
     }
+#endif  // !__CCE_AICORE__
 };
 
 static_assert(sizeof(PTO2TensorMapEntry) == 128, "TensorMapEntry must be exactly 2 cache lines (128 bytes)");
@@ -494,6 +502,10 @@ struct PTO2TensorMap {
      * @param on_match  Callback invoked for each overlapping entry
      */
     template <typename Fn>
+#if !defined(__CCE_AICORE__)
+    // Host-only lookup: relies on PTO2TensorMapEntry::check_overlap which is
+    // itself CCEC-gated above; fdwic's device path uses its own DistTensorMap
+    // (dist_engine.cpp) and never invokes this.
     void lookup(const Tensor &tensor, Fn &&on_match) {
         uint32_t bucket_index = hash(tensor.buffer.addr);
         PTO2TensorMapEntry *cur_entry = buckets[bucket_index];
@@ -547,6 +559,7 @@ struct PTO2TensorMap {
         if (chain_len > g_lookup_chain_max) g_lookup_chain_max = chain_len;
 #endif
     }
+#endif  // !__CCE_AICORE__
 
     /**
      * Insert a new entry (called when task produces output)
