@@ -11,8 +11,6 @@
 #include <atomic>
 #include <cinttypes>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 
 #include "aicpu/device_time.h"
 #include "aicpu/platform_aicpu_affinity.h"
@@ -53,10 +51,6 @@ struct AicpuExecutor {
 
     std::atomic<int32_t> finished_count_{0};
     std::atomic<bool> runtime_done_{false};
-
-    // Entry-arg L2TaskArgs built from get_orch_args() and consumed by the
-    // AICore-side distributed engine.
-    L2TaskArgs orch_args_cached_;
 
     // ===== Core lifecycle context =====
     // Still named SchedulerContext because it also owns legacy dispatch code,
@@ -142,7 +136,21 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
             // Build the entry-arg once per run. The AICore-side dist engine
             // consumes it when replaying the linked orchestration entry.
-            orch_args_cached_.create_from_chip_args(runtime->get_orch_args());
+            runtime->dist.orch_args.create_from_chip_args(runtime->get_orch_args());
+            const ChipStorageTaskArgs &orch_args = runtime->get_orch_args();
+            runtime->dist.ccec_orch_tensor_count = orch_args.tensor_count();
+            runtime->dist.ccec_orch_scalar_count = orch_args.scalar_count();
+            for (int32_t i = 0; i < orch_args.tensor_count() && i < CHIP_MAX_TENSOR_ARGS; i++) {
+                Tensor::copy(runtime->dist.ccec_orch_tensors[i], orch_args.tensor(i));
+            }
+            for (int32_t i = 0; i < orch_args.scalar_count() && i < CHIP_MAX_SCALAR_ARGS; i++) {
+                runtime->dist.ccec_orch_scalars[i] = orch_args.scalar(i);
+            }
+            cache_flush_range(runtime->dist.ccec_orch_tensors, sizeof(runtime->dist.ccec_orch_tensors));
+            cache_flush_range(runtime->dist.ccec_orch_scalars, sizeof(runtime->dist.ccec_orch_scalars));
+            cache_flush_range(
+                const_cast<const int32_t *>(&runtime->dist.ccec_orch_tensor_count), 2 * sizeof(int32_t)
+            );
 
             // rt is bound to *this* run's memory and must be reattached every
             // run.
@@ -195,22 +203,45 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // See runtime/dist_engine.* and docs/fully_distributed_within_core.md.
             {
                 const int32_t num_workers = runtime->worker_count;
-                void *core_main = dist_engine_register(rt, &orch_args_cached_, num_workers, runtime);
+                void *core_main = dist_engine_register(rt, &runtime->dist.orch_args, num_workers, runtime);
                 runtime->dist.core_main_fn = reinterpret_cast<uint64_t>(core_main);
                 runtime->dist.num_workers = num_workers;
                 __atomic_store_n(&runtime->dist.done_count, 0, __ATOMIC_RELEASE);
-                __atomic_store_n(&runtime->dist.go, 1u, __ATOMIC_RELEASE);
-                const bool dist_trace = (getenv("PTO_DIST_TRACE") != nullptr);
-                if (dist_trace)
-                    fprintf(stderr, "[dist] Thread %d: engine wired, %d workers launched\n", thread_idx, num_workers);
-                while (__atomic_load_n(&runtime->dist.done_count, __ATOMIC_ACQUIRE) < num_workers) {
+                cache_flush_range(const_cast<const uint64_t *>(&runtime->dist.core_main_fn), sizeof(uint64_t));
+                cache_flush_range(const_cast<const int32_t *>(&runtime->dist.num_workers), sizeof(int32_t));
+                cache_flush_range(const_cast<const int64_t *>(&runtime->dist.done_count), sizeof(int64_t));
+                uint64_t *regs = reinterpret_cast<uint64_t *>(get_platform_regs());
+                if (regs == nullptr) {
+                    LOG_ERROR("Thread %d: platform regs unavailable", thread_idx);
+                    runtime_done_.store(true, std::memory_order_release);
+                    return -1;
+                }
+                for (int32_t i = 0; i < num_workers; i++) {
+                    const uint32_t physical_core_id = runtime->workers[i].physical_core_id;
+                    write_reg(regs[physical_core_id], RegId::COND, AICORE_IDLE_VALUE);
+                }
+                for (int32_t i = 0; i < num_workers; i++) {
+                    runtime->workers[i].aicpu_ready = AICPU_READY_DIST_RUN;
+                    cache_flush_range(const_cast<const uint32_t *>(&runtime->workers[i].aicpu_ready), sizeof(uint32_t));
+                }
+                while (true) {
+                    if (__atomic_load_n(&runtime->dist.done_count, __ATOMIC_ACQUIRE) >= num_workers) break;
+                    bool all_cond_done = true;
+                    for (int32_t i = 0; i < num_workers; i++) {
+                        const uint32_t physical_core_id = runtime->workers[i].physical_core_id;
+                        const uint64_t cond = read_reg(regs[physical_core_id], RegId::COND);
+                        const bool done = cond == MAKE_FIN_VALUE(0);
+                        all_cond_done = all_cond_done && done;
+                    }
+                    if (all_cond_done) {
+                        __atomic_store_n(&runtime->dist.done_count, num_workers, __ATOMIC_RELEASE);
+                        break;
+                    }
                     SPIN_WAIT_HINT();
                 }
                 // All workers done (single-threaded here): emit the per-core
                 // execution swimlane if PTO_DIST_SWIMLANE is set (else no-op).
                 dist_engine_dump_trace();
-                if (dist_trace)
-                    fprintf(stderr, "[dist] Thread %d: all %d distributed workers finished\n", thread_idx, num_workers);
             }
             runtime_done_.store(true, std::memory_order_release);
         }
@@ -264,7 +295,6 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     aicpu_thread_num_ = 0;
     sched_thread_num_ = 0;
 
-    orch_args_cached_.reset();
     // Clear file-scope PTO2Runtime pointer (freed by orchestrator thread before deinit)
     rt = nullptr;
 

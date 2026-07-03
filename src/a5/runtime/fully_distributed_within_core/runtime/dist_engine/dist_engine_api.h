@@ -26,9 +26,10 @@
  * a direct call resolves at link time and needs no runtime function-pointer
  * indirection. In sim, per-example orchestration is compiled into
  * libaicore_kernel.so and reaches these symbols from the AICore image.
- * On CCEC onboard builds, submit/alloc/core-main are currently link-stage
- * placeholders; the full GM replay engine is still blocked on CCEC GM atomic
- * lowering and shared DistGlobal ownership.
+ * On CCEC onboard builds, submit/core-main currently provide a minimal
+ * direct-call submit path for ordinary single-core tasks. The full GM replay
+ * engine is still blocked on CCEC GM atomic lowering and shared DistGlobal
+ * ownership.
  *
  * PTO_DEVICE_FUNC expands to `__aicore__` under CCEC and to nothing on host /
  * sim / AICPU builds, so a single declaration serves both worlds.
@@ -46,8 +47,8 @@
 struct PTO2Runtime;
 
 // Task submission and allocation. Host/sim definitions use the per-core g_self
-// stashed by dist_core_main / thread_local sim; CCEC definitions are placeholders
-// until the onboard replay path is enabled.
+// stashed by dist_core_main / thread_local sim. CCEC definitions cover only the
+// minimal direct-call submit path until the onboard replay path is enabled.
 PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *rt, const MixedKernels &mixed, const L0TaskArgs &args);
 PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *rt, const L0TaskArgs &args);
 

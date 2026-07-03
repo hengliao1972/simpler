@@ -617,11 +617,11 @@ int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
 
     // Step 1: Write per-core payload addresses and send handshake signal.
     // OUT_OF_ORDER_STORE_BARRIER() ensures task is globally visible before
-    // aicpu_ready=1, so AICore reads the correct payload pointer after waking up.
+    // AICPU_READY_HANDSHAKE, so AICore reads the correct payload pointer after waking up.
     for (int32_t i = 0; i < cores_total_num_; i++) {
         all_handshakes[i].task = reinterpret_cast<uint64_t>(&payload_per_core_[i][0]);
         OUT_OF_ORDER_STORE_BARRIER();
-        all_handshakes[i].aicpu_ready = 1;
+        all_handshakes[i].aicpu_ready = AICPU_READY_HANDSHAKE;
     }
     OUT_OF_ORDER_STORE_BARRIER();
 

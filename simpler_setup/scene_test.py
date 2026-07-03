@@ -57,29 +57,87 @@ def clear_compile_cache() -> None:
     gc.collect()
 
 
-def _aicore_extra_cache_key(cache_key, orch_source: Path) -> str:
+def _aicore_extra_cache_key(cache_key, sources: list[Path]) -> str:
     h = hashlib.sha256()
     h.update(repr(cache_key).encode("utf-8"))
-    h.update(str(orch_source.resolve()).encode("utf-8"))
-    if orch_source.is_file():
-        h.update(orch_source.read_bytes())
+    for source in sources:
+        h.update(str(source.resolve()).encode("utf-8"))
+        if source.is_file():
+            h.update(source.read_bytes())
     return h.hexdigest()[:16]
+
+
+def _write_aicore_incore_wrapper(cache_key: str, incores: list[dict]) -> Path | None:
+    if not incores:
+        return None
+
+    wrapper_dir = _project_root() / "build" / "cache" / "aicore-extra-wrappers"
+    wrapper_dir.mkdir(parents=True, exist_ok=True)
+    wrapper_path = wrapper_dir / f"linked_incores_{cache_key}.cpp"
+
+    lines = [
+        "#include <cstdint>",
+        '#include "pto_types.h"',
+        "",
+    ]
+    for core_type, guard, caller in (
+        ("aic", "#ifndef __DAV_VEC__", "pto_call_linked_kernel_aic"),
+        ("aiv", "#ifdef __DAV_VEC__", "pto_call_linked_kernel_aiv"),
+    ):
+        lines.extend([guard, ""])
+        for incore in incores:
+            if str(incore["core_type"]).lower() != core_type:
+                continue
+            func_id = int(incore["func_id"])
+            source = Path(incore["source"]).resolve()
+            symbol = f"pto_linked_kernel_func_{func_id}"
+            lines.extend(
+                [
+                    f"#define kernel_entry {symbol}",
+                    f'#include "{source}"',
+                    "#undef kernel_entry",
+                    "",
+                ]
+            )
+
+        lines.append(f'extern "C" PTO_DEVICE_FUNC int32_t {caller}(int32_t func_id, __gm__ int64_t *args) {{')
+        for incore in incores:
+            if str(incore["core_type"]).lower() != core_type:
+                continue
+            func_id = int(incore["func_id"])
+            symbol = f"pto_linked_kernel_func_{func_id}"
+            lines.append(f"    if (func_id == {func_id}) {{")
+            lines.append(f"        {symbol}(args);")
+            lines.append("        return 1;")
+            lines.append("    }")
+        lines.extend(["    return 0;", "}", "#endif", ""])
+
+    wrapper_path.write_text("\n".join(lines))
+    return wrapper_path
 
 
 def get_aicore_path_override(cache_key) -> Path | None:
     return _aicore_override_cache.get(cache_key)
 
 
-def maybe_build_aicore_override(cache_key, platform: str, runtime: str, orch_source: str) -> Path | None:
-    if platform != "a5sim" or runtime != "fully_distributed_within_core":
+def maybe_build_aicore_override(
+    cache_key, platform: str, runtime: str, orch_source: str, incores: list[dict]
+) -> Path | None:
+    if platform not in {"a5", "a5sim"} or runtime != "fully_distributed_within_core":
         return None
 
     from .runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
-    source_path = Path(orch_source).resolve()
-    key = _aicore_extra_cache_key(cache_key, source_path)
+    source_paths = [Path(orch_source).resolve()]
+    if platform == "a5":
+        incore_sources = [Path(incore["source"]).resolve() for incore in incores]
+        key = _aicore_extra_cache_key(cache_key, [Path(orch_source).resolve(), *incore_sources])
+        wrapper_path = _write_aicore_incore_wrapper(key, incores)
+        if wrapper_path is not None:
+            source_paths.append(wrapper_path)
+    key = _aicore_extra_cache_key(cache_key, source_paths)
     builder = RuntimeBuilder(platform)
-    return builder.build_aicore_with_extra_sources(runtime, [source_path], key)
+    return builder.build_aicore_with_extra_sources(runtime, source_paths, key)
 
 
 # ---------------------------------------------------------------------------
@@ -1036,7 +1094,7 @@ def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
         children=kernel_binaries,
         config_name=orch.get("config_name", ""),
     )
-    aicore_override = maybe_build_aicore_override(cache_key, platform, runtime, orch["source"])
+    aicore_override = maybe_build_aicore_override(cache_key, platform, runtime, orch["source"], incores)
     if aicore_override is not None:
         _aicore_override_cache[cache_key] = aicore_override
     _compile_cache[cache_key] = chip_callable
