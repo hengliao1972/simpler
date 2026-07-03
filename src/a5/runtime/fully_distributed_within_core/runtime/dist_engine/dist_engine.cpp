@@ -140,6 +140,12 @@
 
 #if defined(__CPU_SIM)
 extern "C" PTO_DEVICE_FUNC void aicpu_orchestration_entry(const L2TaskArgs &orch_args);
+#elif defined(__CCE_AICORE__)
+extern "C" PTO_DEVICE_FUNC void aicpu_orchestration_entry(const L2TaskArgs &orch_args) __attribute__((weak));
+extern "C" PTO_DEVICE_FUNC int32_t pto_call_linked_kernel_aic(int32_t func_id, __gm__ int64_t *args)
+    __attribute__((weak));
+extern "C" PTO_DEVICE_FUNC int32_t pto_call_linked_kernel_aiv(int32_t func_id, __gm__ int64_t *args)
+    __attribute__((weak));
 #endif
 #if defined(__CPU_SIM) && !defined(__CCE_AICORE__)
 extern "C" void framework_bind_runtime(PTO2Runtime *rt);
@@ -149,6 +155,7 @@ extern "C" void framework_bind_runtime(PTO2Runtime *rt);
 // AICore has no scheduler to yield to; a spin hint here would be meaningless.
 // Provide a local no-op so we don't have to depend on the AICPU spin_hint.h
 // header being reachable from the AICore include path.
+#include "inner_kernel.h"
 #ifndef SPIN_WAIT_HINT
 #define SPIN_WAIT_HINT() ((void)0)
 #endif
@@ -895,6 +902,15 @@ struct DistGlobal {
 #if defined(__CCE_AICORE__)
 [[block_local]] static __gm__ DistGlobal *g_dist_ptr;
 [[block_local]] static __gm__ DistCore *g_self;
+[[block_local]] static __gm__ Runtime *g_ccec_runtime;
+[[block_local]] static int32_t g_ccec_core_idx;
+[[block_local]] static int32_t g_ccec_core_type;
+[[block_local]] static int32_t g_ccec_aic_submit_index;
+[[block_local]] static int32_t g_ccec_aiv_submit_index;
+[[block_local]] static int32_t g_ccec_aic_count;
+[[block_local]] static int32_t g_ccec_aiv_count;
+[[block_local]] static int32_t g_ccec_ordinal;
+[[block_local]] static bool g_ccec_valid_worker;
 #define g_dist (*g_dist_ptr)
 #elif defined(__CPU_SIM)
 static DistGlobal *g_dist_ptr = nullptr;
@@ -1725,8 +1741,8 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
 // -----------------------------------------------------------------------------
 // Device-callable API (dist_engine_api.h). CCEC orchestration wrappers in
 // pto_orchestration_api.h call these directly instead of going through
-// rt->ops. Host/sim definitions below are functional; CCEC definitions are
-// link-stage placeholders until the GM atomic replay path is enabled.
+// rt->ops. Host/sim definitions below are functional; CCEC currently carries a
+// minimal onboard submit path until the full GM replay engine is enabled.
 // -----------------------------------------------------------------------------
 
 // Fatal-state query / report — no va_list version so this is safe to compile
@@ -1912,7 +1928,129 @@ void dist_set_tensor_data(
 #endif  // DIST_HOST_ONLY
 
 #if defined(__CCE_AICORE__)
-DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &, const L0TaskArgs &) {
+namespace {
+
+PTO_DEVICE_FUNC void ccec_invalidate_region(__gm__ const void *ptr, uint64_t bytes) {
+    __gm__ const uint8_t *p = reinterpret_cast<__gm__ const uint8_t *>(ptr);
+    for (uint64_t off = 0; off < bytes; off += 64) {
+        dcci(const_cast<__gm__ uint8_t *>(p + off), SINGLE_CACHE_LINE);
+    }
+}
+
+PTO_DEVICE_FUNC void ccec_flush_region(__gm__ void *ptr, uint64_t bytes) {
+    __gm__ uint8_t *p = reinterpret_cast<__gm__ uint8_t *>(ptr);
+    for (uint64_t off = 0; off < bytes; off += 64) {
+        dcci(p + off, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    }
+}
+
+PTO_DEVICE_FUNC void ccec_init_worker_layout() {
+    if (g_ccec_runtime == nullptr) return;
+    const int32_t num_workers = g_ccec_runtime->dist.num_workers;
+    const int32_t block_dim = num_workers / PLATFORM_CORES_PER_BLOCKDIM;
+    g_ccec_aic_count = block_dim;
+    g_ccec_aiv_count = block_dim * PLATFORM_AIV_CORES_PER_BLOCKDIM;
+    g_ccec_ordinal = INVALID_KERNEL_ID;
+    g_ccec_valid_worker = false;
+    const CoreType self_type = static_cast<CoreType>(g_ccec_core_type);
+    if (self_type == CoreType::AIC && g_ccec_core_idx >= 0 && g_ccec_core_idx < block_dim) {
+        g_ccec_ordinal = g_ccec_core_idx;
+        g_ccec_valid_worker = true;
+    } else if (self_type == CoreType::AIV && g_ccec_core_idx >= block_dim && g_ccec_core_idx < num_workers) {
+        g_ccec_ordinal = g_ccec_core_idx - block_dim;
+        g_ccec_valid_worker = true;
+    }
+}
+
+PTO_DEVICE_FUNC int32_t ccec_current_kernel_id(const MixedKernels &mixed) {
+    if (g_ccec_runtime == nullptr) return INVALID_KERNEL_ID;
+    ccec_init_worker_layout();
+    const bool has_aic = mixed.aic_kernel_id != INVALID_KERNEL_ID;
+    const bool has_aiv = mixed.aiv0_kernel_id != INVALID_KERNEL_ID || mixed.aiv1_kernel_id != INVALID_KERNEL_ID;
+    if (has_aic && !has_aiv) {
+        const int32_t submit_idx = g_ccec_aic_submit_index++;
+        if (g_ccec_core_type == static_cast<int32_t>(CoreType::AIC) &&
+            g_ccec_aic_count > 0 && g_ccec_ordinal == submit_idx % g_ccec_aic_count) {
+            return mixed.aic_kernel_id;
+        }
+        return INVALID_KERNEL_ID;
+    }
+    if (!has_aic && has_aiv) {
+        const int32_t submit_idx = g_ccec_aiv_submit_index++;
+        if (g_ccec_core_type == static_cast<int32_t>(CoreType::AIV) &&
+            g_ccec_aiv_count > 0 && g_ccec_ordinal == submit_idx % g_ccec_aiv_count) {
+            return mixed.aiv0_kernel_id != INVALID_KERNEL_ID ? mixed.aiv0_kernel_id : mixed.aiv1_kernel_id;
+        }
+        return INVALID_KERNEL_ID;
+    }
+    return INVALID_KERNEL_ID;
+}
+
+PTO_DEVICE_FUNC bool ccec_is_valid_worker() {
+    return g_ccec_valid_worker;
+}
+
+PTO_DEVICE_FUNC void ccec_publish_done() {
+    OUT_OF_ORDER_STORE_BARRIER();
+    write_reg(RegId::COND, MAKE_FIN_VALUE(0));
+}
+
+PTO_DEVICE_FUNC void ccec_replay_orch(__gm__ Runtime *runtime) {
+    if (aicpu_orchestration_entry == nullptr || !ccec_is_valid_worker()) return;
+    ccec_invalidate_region(runtime->dist.ccec_orch_tensors, sizeof(runtime->dist.ccec_orch_tensors));
+    ccec_invalidate_region(runtime->dist.ccec_orch_scalars, sizeof(runtime->dist.ccec_orch_scalars));
+    ccec_invalidate_region(
+        const_cast<__gm__ const int32_t *>(&runtime->dist.ccec_orch_tensor_count), 64
+    );
+    L2TaskArgs local_args;
+    Tensor local_tensors[CHIP_MAX_TENSOR_ARGS];
+    const int32_t tensor_count = runtime->dist.ccec_orch_tensor_count;
+    const int32_t scalar_count = runtime->dist.ccec_orch_scalar_count;
+    for (int32_t i = 0; i < tensor_count && i < CHIP_MAX_TENSOR_ARGS; i++) {
+        Tensor::copy(local_tensors[i], runtime->dist.ccec_orch_tensors[i]);
+        local_args.add_input(local_tensors[i]);
+    }
+    for (int32_t i = 0; i < scalar_count && i < CHIP_MAX_SCALAR_ARGS; i++) {
+        const uint64_t scalar = runtime->dist.ccec_orch_scalars[i];
+        local_args.add_scalar(scalar);
+    }
+    aicpu_orchestration_entry(local_args);
+}
+
+}  // namespace
+
+DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(
+    PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &args
+) {
+    const int32_t kernel_id = ccec_current_kernel_id(mixed);
+    if (kernel_id == INVALID_KERNEL_ID) return TaskOutputTensors{};
+    const bool is_aic = g_ccec_core_type == static_cast<int32_t>(CoreType::AIC);
+
+    __gm__ PTO2DispatchPayload *payload =
+        reinterpret_cast<__gm__ PTO2DispatchPayload *>(g_ccec_runtime->workers[g_ccec_core_idx].task);
+    if (payload == nullptr) return TaskOutputTensors{};
+
+    int32_t argc = 0;
+    for (int32_t i = 0; i < args.tensor_count() && argc < PTO2_DISPATCH_MAX_ARGS; i++) {
+        const Tensor &tensor = args.tensor(i).ref();
+        __gm__ Tensor &dst = g_ccec_runtime->dist.ccec_kernel_tensors[g_ccec_core_idx].tensors[i];
+        Tensor::copy(dst, tensor);
+        ccec_flush_region(&dst, sizeof(Tensor));
+        payload->args[argc++] = reinterpret_cast<uint64_t>(&dst);
+    }
+    for (int32_t i = 0; i < args.scalar_count() && argc < PTO2_DISPATCH_MAX_ARGS; i++) {
+        payload->args[argc++] = args.scalar(i);
+    }
+    ccec_flush_region(payload, sizeof(PTO2DispatchPayload));
+
+    if (is_aic) {
+        if (pto_call_linked_kernel_aic != nullptr) {
+            pto_call_linked_kernel_aic(kernel_id, reinterpret_cast<__gm__ int64_t *>(payload->args));
+        }
+    } else if (pto_call_linked_kernel_aiv != nullptr) {
+        pto_call_linked_kernel_aiv(kernel_id, reinterpret_cast<__gm__ int64_t *>(payload->args));
+    }
+    OUT_OF_ORDER_STORE_BARRIER();
     return TaskOutputTensors{};
 }
 #else
@@ -2133,14 +2271,19 @@ void dist_dump_state(int) {
 // -----------------------------------------------------------------------------
 DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int core_idx, int core_type_int) {
 #if defined(__CCE_AICORE__)
-    // CCEC onboard currently links orchestration into the AICore image but does
-    // not replay it yet. Publish completion so the existing AICPU shutdown path
-    // can still observe a finished core-main call during build/smoke probes.
-    (void)core_idx;
-    (void)core_type_int;
-    if (runtime != nullptr) {
-        runtime->dist.done_count = runtime->dist.done_count + 1;
-    }
+    if (runtime == nullptr || core_idx < 0 || core_idx >= RUNTIME_MAX_WORKER) return;
+
+    g_ccec_runtime = runtime;
+    g_ccec_core_idx = core_idx;
+    g_ccec_core_type = core_type_int;
+    g_ccec_aic_submit_index = 0;
+    g_ccec_aiv_submit_index = 0;
+    ccec_init_worker_layout();
+
+    ccec_replay_orch(runtime);
+    ccec_publish_done();
+
+    g_ccec_runtime = nullptr;
     return;
 #else
     if (core_idx < 0 || core_idx >= RUNTIME_MAX_WORKER) return;
@@ -2373,7 +2516,8 @@ void *dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num
     // AICore workers see; onboard will replace this with a real GM allocation.
     runtime->dist.shared_addr = reinterpret_cast<uint64_t>(&g_dist);
 
-    // Publish all of the above before any worker observes Runtime::dist.go.
+    // Publish all of the above before AICPU wakes workers through their
+    // per-core handshake flags.
     atom_thread_fence(__ATOMIC_RELEASE);
     return reinterpret_cast<void *>(&dist_core_main);
 }

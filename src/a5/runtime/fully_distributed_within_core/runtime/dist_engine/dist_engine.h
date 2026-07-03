@@ -38,8 +38,8 @@ class Runtime;
  *
  * Resets the global claim cursors + completion-flag ring, (re)acquires the GM
  * output heap, and stores the args / PTO2Runtime used by on-core orchestration
- * replay. Must be called once on the AICPU setup thread before publishing
- * Runtime::dist.go.
+ * replay. Must be called once on the AICPU setup thread before waking workers
+ * through their per-core handshake flags.
  *
  * CPU-sim AICore workers bind rt->ops to their local distributed ops table
  * after entering dist_core_main(); CCEC wrappers call the dist_engine_api.h
@@ -59,6 +59,6 @@ void *dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num
  * block (pid) and lane AIC/AIV0/AIV1 (tid), so the trace shows how the
  * execute-first claim race spreads work across cores (load balance, docs §6.1).
  * Must be called AFTER all workers have finished a run (single-threaded), e.g.
- * by the AICPU stub once Runtime::dist.done_count == num_workers.
+ * by the AICPU stub after all worker completion registers report done.
  */
 void dist_engine_dump_trace();

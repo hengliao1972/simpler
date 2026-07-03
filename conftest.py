@@ -1299,7 +1299,7 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
 
         kwargs = {}
         aicore_pool_token = ""
-        if runtime == "fully_distributed_within_core" and st_platform == "a5sim":
+        if runtime == "fully_distributed_within_core" and st_platform in {"a5", "a5sim"}:
             from simpler_setup.scene_test import get_aicore_path_override  # noqa: PLC0415
 
             cache_key = (cls.__qualname__, st_platform, runtime)

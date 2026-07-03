@@ -39,6 +39,7 @@
 #include "common/core_type.h"
 #include "common/platform_config.h"
 #include "pto2_dispatch_payload.h"
+#include "pto_types.h"
 #include "task_args.h"
 
 // =============================================================================
@@ -58,6 +59,10 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
 // Data Structures
 // =============================================================================
 
+constexpr uint32_t AICPU_READY_NONE = 0;
+constexpr uint32_t AICPU_READY_HANDSHAKE = 1;
+constexpr uint32_t AICPU_READY_DIST_RUN = 2;
+
 /**
  * Handshake Structure - Shared between Host, AICPU, and AICore
  *
@@ -65,12 +70,12 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
  * AICPU and AICore during task execution.
  *
  * Protocol State Machine:
- * 1. Initialization: AICPU sets aicpu_ready=1
+ * 1. Initialization: AICPU sets aicpu_ready=AICPU_READY_HANDSHAKE
  * 2. Acknowledgment: AICore sets aicore_done=core_id+1
- * 3. Task Dispatch: AICPU writes DATA_MAIN_BASE after updating the per-core payload
- * 4. Task Execution: AICore reads the cached PTO2DispatchPayload and executes
- * 5. Task Completion: AICore writes FIN to COND; AICPU observes completion
- * 6. Shutdown: AICPU sets control=1, AICore exits
+ * 3. Dist Run: AICPU sets aicpu_ready=AICPU_READY_DIST_RUN after publishing
+ *    shared runtime state
+ * 4. Task Completion: AICore writes FIN to COND; AICPU observes completion
+ * 5. Shutdown: AICPU sets control=1, AICore exits
  *
  * Each AICore instance has its own handshake buffer to enable concurrent
  * task execution across multiple cores.
@@ -99,7 +104,7 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
  * - aicpu_regs_ready / aicore_regs_ready: handshake sequence flags
  */
 struct Handshake {
-    volatile uint32_t aicpu_ready;        // AICPU ready signal: 0=not ready, 1=ready
+    volatile uint32_t aicpu_ready;        // AICPU ready signal: AICPU_READY_*
     volatile uint32_t aicore_done;        // AICore ready signal: 0=not ready, core_id+1=ready
     volatile uint64_t task;               // Init: PTO2DispatchPayload* (set before aicpu_ready); runtime: unused
     volatile CoreType core_type;          // Core type: CoreType::AIC or CoreType::AIV
@@ -260,15 +265,18 @@ public:
     // Controlled via PTO2_ORCH_TO_SCHED environment variable.
     bool orch_to_sched;
 
-    // ---- fully_distributed_within_core handoff (SPMD-on-core) ----
-    // The AICPU orchestrator thread initializes shared engine state, then hands
-    // the per-core engine entry off to the AICore worker threads through these
-    // fields. Each AICore worker invokes core_main_fn(runtime, idx, core_type)
-    // once `go` is set, initializes its local state, directly calls the
-    // orchestration entry linked into the AICore image, then increments
-    // `done_count` when finished. See runtime/dist_engine.* and
-    // docs/fully_distributed_within_core.md.
-    struct DistHandoff {
+    // ---- fully_distributed_within_core handoff ----
+    // The AICPU setup thread initializes the shared entry args, then hands the
+    // per-core engine entry off to the AICore worker threads through these
+    // fields. Each AICore worker invokes the orchestration entry linked into the
+    // AICore image after its per-worker ready flag is set, publishes completion
+    // through its own COND register, and AICPU sends EXIT after all workers
+    // report completion.
+    struct alignas(64) DistHandoff {
+        struct alignas(64) KernelTensorArgs {
+            Tensor tensors[MAX_TENSOR_ARGS];
+        };
+
         volatile uint64_t core_main_fn;  // DistCoreMainFn (in AICPU .so)
         // Address of the DistGlobal struct that carries engine state (cursors,
         // completion flags, block.won, per-core DistCore slots). Written once by
@@ -279,12 +287,14 @@ public:
         // In sim the AICPU thread writes `&g_dist` (host BSS) since all workers
         // share one address space; onboard writes the GM allocation address.
         volatile uint64_t shared_addr;
-        volatile uint32_t go;            // 1 once engine wired and cores may start
         volatile int32_t num_workers;    // number of AICore workers participating
-        // int64_t (not int32_t): CCEC's aicore backend refuses to lower
-        // AtomicLoadAdd on a 32-bit GM (addrspace 1) target, and workers do
-        // __atomic_add_fetch on this counter from aicore_executor.cpp.
-        volatile int64_t done_count;     // workers atomically increment when done
+        L2TaskArgs orch_args;            // GM-visible orchestration entry args
+        Tensor ccec_orch_tensors[CHIP_MAX_TENSOR_ARGS];
+        uint64_t ccec_orch_scalars[CHIP_MAX_SCALAR_ARGS];
+        volatile int32_t ccec_orch_tensor_count;
+        volatile int32_t ccec_orch_scalar_count;
+        KernelTensorArgs ccec_kernel_tensors[RUNTIME_MAX_WORKER];
+        alignas(64) volatile int64_t done_count;  // AICPU-owned progress mirror.
     } dist;
 
 private:

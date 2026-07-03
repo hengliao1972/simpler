@@ -87,8 +87,8 @@ public:
     //  - folds inline_completed_tasks into completed_tasks_
     //  - flips orchestrator_done_ and triggers core transition
     //    (skipped on fatal error — emergency_shutdown runs instead)
-    // The direct distributed AICore path publishes Runtime::dist.go and waits
-    // for Runtime::dist.done_count instead.
+    // The direct distributed AICore path wakes workers through their per-core
+    // handshake flags and waits for their COND completion registers instead.
     void on_orchestration_done(Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks);
 
     // Bind the PTO2Runtime scheduler pointer for the legacy central scheduler.
