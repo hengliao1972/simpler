@@ -26,6 +26,9 @@
  * a direct call resolves at link time and needs no runtime function-pointer
  * indirection. In sim, per-example orchestration is compiled into
  * libaicore_kernel.so and reaches these symbols from the AICore image.
+ * On CCEC onboard builds, submit/alloc/core-main are currently link-stage
+ * placeholders; the full GM replay engine is still blocked on CCEC GM atomic
+ * lowering and shared DistGlobal ownership.
  *
  * PTO_DEVICE_FUNC expands to `__aicore__` under CCEC and to nothing on host /
  * sim / AICPU builds, so a single declaration serves both worlds.
@@ -42,8 +45,9 @@
 
 struct PTO2Runtime;
 
-// Task submission and allocation (defined in dist_engine.cpp — both use the
-// per-core g_self stashed by dist_core_main / thread_local sim).
+// Task submission and allocation. Host/sim definitions use the per-core g_self
+// stashed by dist_core_main / thread_local sim; CCEC definitions are placeholders
+// until the onboard replay path is enabled.
 PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *rt, const MixedKernels &mixed, const L0TaskArgs &args);
 PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *rt, const L0TaskArgs &args);
 
@@ -65,8 +69,8 @@ PTO_DEVICE_FUNC void dist_log_warn_msg(__gm__ const char *func, __gm__ const cha
 PTO_DEVICE_FUNC void dist_log_debug_msg(__gm__ const char *func, __gm__ const char *msg);
 PTO_DEVICE_FUNC void dist_log_info_v_msg(__gm__ const char *func, int v, __gm__ const char *msg);
 
-// Cross-layer tensor data access — orchestration reads/writes tensor values
-// through the engine so producer/consumer synchronization stays consistent.
+// Cross-layer tensor data access. Host/sim waits for producers through the
+// engine; CCEC currently performs direct GM scalar access only.
 PTO_DEVICE_FUNC uint64_t dist_get_tensor_data_impl(
     PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]
 );

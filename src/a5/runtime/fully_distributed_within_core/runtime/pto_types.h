@@ -264,7 +264,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     __gm__ const char *error_msg{nullptr};
     PTO2LaunchSpec launch_spec;  // SPMD launch parameters (block_num, etc.)
 
-    void clear() {
+    PTO_DEVICE_FUNC void clear() {
         Base::clear();
 #if PTO2_PROFILING
         dump_arg_selection_.clear();
@@ -273,7 +273,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
         explicit_dep_count_ = 0;
     }
 
-    void reset() {
+    PTO_DEVICE_FUNC void reset() {
         clear();
         has_error = false;
         error_msg = nullptr;
@@ -423,7 +423,11 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
             set_error(scalar_cap_msg());
             return;
         }
+#if defined(__CCE_AICORE__)
+        (add_scalar_one(args), ...);
+#else
         (add_scalar_one(std::forward<Args>(args)), ...);
+#endif
     }
 
     void add_scalars(const uint64_t *values, int count) {
@@ -540,7 +544,7 @@ private:
     template <typename T>
     PTO_DEVICE_FUNC void add_scalar_one(T &&value) {
         scalars_[scalar_count_] = to_u64(value);
-#if PTO2_PROFILING
+#if PTO2_PROFILING && !defined(__CCE_AICORE__)
         uintptr_t scalar_source_ptr = 0;
         if constexpr (std::is_lvalue_reference_v<T>) {
             scalar_source_ptr = reinterpret_cast<uintptr_t>(&value);

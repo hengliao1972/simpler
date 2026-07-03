@@ -23,7 +23,6 @@
  *   Value: (total_blocks, block_size, head_dim) bf16
  */
 
-#include <algorithm>
 #include <cstdint>
 #include <cstring>
 
@@ -36,6 +35,10 @@
 #define FUNC_PV_MATMUL 2
 #define FUNC_ONLINE_UPDATE 3
 constexpr uint64_t PLATFORM_PROF_SYS_CNT_FREQ = 50000000;  // 50 MHz
+
+PTO_DEVICE_FUNC inline uint64_t min_u64(uint64_t a, uint64_t b) {
+    return a < b ? a : b;
+}
 
 inline double cycles_to_us(uint64_t cycles) {
     return (static_cast<double>(cycles) / PLATFORM_PROF_SYS_CNT_FREQ) * 1000000.0;
@@ -65,14 +68,16 @@ extern "C" {
  * Orchestration config — the executor reads these values to set up
  * shared memory and runtime before calling aicpu_orchestration_entry.
  */
-__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
+__attribute__((visibility("default"), weak)) PTO2OrchestrationConfig aicpu_orchestration_config(
+    const L2TaskArgs &orch_args
+) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 7,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
+__attribute__((visibility("default"), weak)) PTO_DEVICE_FUNC void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #ifdef ENABLE_PROFILING
     uint64_t prof_param_extract = 0;
     uint64_t prof_ext_tensor = 0;
@@ -104,7 +109,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
     // scale from scalar arg
     uint64_t scale_value = orch_args.scalar(0);
     uint64_t q_head_num = num_heads;
-    uint64_t q_tile = std::min(num_heads, static_cast<uint64_t>(128));
+    uint64_t q_tile = min_u64(num_heads, static_cast<uint64_t>(128));
     uint64_t q_loop = (q_head_num + q_tile - 1) / q_tile;
     CYCLE_COUNT_LAP(prof_param_extract);
 
@@ -171,9 +176,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
 #endif
                 CYCLE_COUNT_LAP(prof_param_setup);
                 TaskOutputTensors alloc_outs = alloc_tensors(tile2d_ci, scalar_ci, scalar_ci);
-                const Tensor &oi = alloc_outs.get_ref(0);
-                const Tensor &li_update = alloc_outs.get_ref(1);
-                const Tensor &mi_update = alloc_outs.get_ref(2);
+                __gm__ const Tensor &oi = alloc_outs.get_ref(0);
+                __gm__ const Tensor &li_update = alloc_outs.get_ref(1);
+                __gm__ const Tensor &mi_update = alloc_outs.get_ref(2);
 #ifdef ENABLE_PROFILING
                 prof_submit_count++;
                 CYCLE_COUNT_LAP(prof_submit_task);
@@ -184,11 +189,11 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                 L0TaskArgs params_qk, params_sf, params_pv, params_up;
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn += N_UNROLL) {
-                    uint64_t n_blocks = std::min(static_cast<uint64_t>(N_UNROLL), bn_this_batch - bn);
+                    uint64_t n_blocks = min_u64(static_cast<uint64_t>(N_UNROLL), bn_this_batch - bn);
 
                     // Valid length for last block in this group
                     uint64_t last_block_seq_start = (bn + n_blocks - 1) * block_size;
-                    uint64_t valid_len_last = std::min(block_size, cur_seq - last_block_seq_start);
+                    uint64_t valid_len_last = min_u64(block_size, cur_seq - last_block_seq_start);
                     CYCLE_COUNT_LAP(prof_param_extract);
 
                     // === Task 1: Batched QK matmul ===
@@ -207,7 +212,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                     params_qk.add_scalar(n_blocks, b_idx * block_num + bn);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     TaskOutputTensors qk_outs = rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
-                    const Tensor &sij_buf = qk_outs.get_ref(0);
+                    __gm__ const Tensor &sij_buf = qk_outs.get_ref(0);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
@@ -229,9 +234,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                     params_sf.add_scalar(scale_value, n_blocks, valid_len_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     TaskOutputTensors sf_outs = rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
-                    const Tensor &pij_buf = sf_outs.get_ref(0);
-                    const Tensor &mi = sf_outs.get_ref(1);
-                    const Tensor &li = sf_outs.get_ref(2);
+                    __gm__ const Tensor &pij_buf = sf_outs.get_ref(0);
+                    __gm__ const Tensor &mi = sf_outs.get_ref(1);
+                    __gm__ const Tensor &li = sf_outs.get_ref(2);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
@@ -244,7 +249,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                     params_pv.add_scalar(n_blocks, b_idx * block_num + bn);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     TaskOutputTensors pv_outs = rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
-                    const Tensor &oi_new = pv_outs.get_ref(0);
+                    __gm__ const Tensor &oi_new = pv_outs.get_ref(0);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);

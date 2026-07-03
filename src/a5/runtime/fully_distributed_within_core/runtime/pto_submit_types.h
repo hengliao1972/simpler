@@ -20,6 +20,8 @@
 
 #include <stdint.h>
 
+#include "data_type.h"  // PTO_DEVICE_FUNC
+
 inline constexpr int32_t INVALID_KERNEL_ID = -1;
 
 /**
@@ -74,19 +76,21 @@ inline constexpr int32_t PTO2_NUM_RESOURCE_SHAPES = 3;
  */
 class ActiveMask {
 public:
-    constexpr ActiveMask() = default;
-    constexpr explicit ActiveMask(uint8_t raw) :
+    PTO_DEVICE_FUNC constexpr ActiveMask() = default;
+    PTO_DEVICE_FUNC constexpr explicit ActiveMask(uint8_t raw) :
         raw_(raw) {}
 
-    uint8_t raw() const { return raw_; }
+    PTO_DEVICE_FUNC uint8_t raw() const { return raw_; }
 
-    bool subtask_active(PTO2SubtaskSlot slot) const { return (raw_ & (1u << static_cast<uint8_t>(slot))) != 0; }
+    PTO_DEVICE_FUNC bool subtask_active(PTO2SubtaskSlot slot) const {
+        return (raw_ & (1u << static_cast<uint8_t>(slot))) != 0;
+    }
 
-    uint8_t core_mask() const { return raw_ & 0x07u; }
+    PTO_DEVICE_FUNC uint8_t core_mask() const { return raw_ & 0x07u; }
 
-    bool requires_sync_start() const { return (raw_ & PTO2_SUBTASK_FLAG_SYNC_START) != 0; }
+    PTO_DEVICE_FUNC bool requires_sync_start() const { return (raw_ & PTO2_SUBTASK_FLAG_SYNC_START) != 0; }
 
-    PTO2ResourceShape to_shape() const {
+    PTO_DEVICE_FUNC PTO2ResourceShape to_shape() const {
         uint8_t cmask = core_mask();
         if (cmask == 0) return PTO2ResourceShape::DUMMY;
         int bit_count = __builtin_popcount(cmask);
@@ -95,22 +99,22 @@ public:
         return PTO2ResourceShape::AIV;
     }
 
-    void set_sync_start() { raw_ |= PTO2_SUBTASK_FLAG_SYNC_START; }
+    PTO_DEVICE_FUNC void set_sync_start() { raw_ |= PTO2_SUBTASK_FLAG_SYNC_START; }
 
-    bool operator==(ActiveMask other) const { return raw_ == other.raw_; }
-    bool operator!=(ActiveMask other) const { return raw_ != other.raw_; }
+    PTO_DEVICE_FUNC bool operator==(ActiveMask other) const { return raw_ == other.raw_; }
+    PTO_DEVICE_FUNC bool operator!=(ActiveMask other) const { return raw_ != other.raw_; }
 
-    ActiveMask operator|(ActiveMask other) const { return ActiveMask(raw_ | other.raw_); }
-    ActiveMask &operator|=(ActiveMask other) {
+    PTO_DEVICE_FUNC ActiveMask operator|(ActiveMask other) const { return ActiveMask(raw_ | other.raw_); }
+    PTO_DEVICE_FUNC ActiveMask &operator|=(ActiveMask other) {
         raw_ |= other.raw_;
         return *this;
     }
 
-    ActiveMask operator&(uint8_t mask) const { return ActiveMask(raw_ & mask); }
+    PTO_DEVICE_FUNC ActiveMask operator&(uint8_t mask) const { return ActiveMask(raw_ & mask); }
 
-    bool has_mask(uint8_t mask) const { return (raw_ & mask) != 0; }
+    PTO_DEVICE_FUNC bool has_mask(uint8_t mask) const { return (raw_ & mask) != 0; }
 
-    explicit operator bool() const { return raw_ != 0; }
+    PTO_DEVICE_FUNC explicit operator bool() const { return raw_ != 0; }
 
 private:
     uint8_t raw_{0};
@@ -129,7 +133,7 @@ struct MixedKernels {
     int32_t aiv0_kernel_id{INVALID_KERNEL_ID};
     int32_t aiv1_kernel_id{INVALID_KERNEL_ID};
 
-    ActiveMask to_active_mask() const {
+    PTO_DEVICE_FUNC ActiveMask to_active_mask() const {
         uint8_t mask = 0;
         if (aic_kernel_id != INVALID_KERNEL_ID) mask |= PTO2_SUBTASK_MASK_AIC;
         if (aiv0_kernel_id != INVALID_KERNEL_ID) mask |= PTO2_SUBTASK_MASK_AIV0;
