@@ -287,6 +287,10 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
             if (rc == 0) {
                 host_dlopen_guard.dismiss();
             }
+        } else if (artifacts.aicore_linked_orch) {
+            rc = runner->register_callable_aicore_orch(
+                callable_id, std::move(kernel_addrs), std::move(artifacts.signature)
+            );
         } else {
             rc = runner->register_callable(
                 callable_id, artifacts.orch_so_data, artifacts.orch_so_size, artifacts.func_name.c_str(),

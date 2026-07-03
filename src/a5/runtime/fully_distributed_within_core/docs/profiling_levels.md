@@ -47,9 +47,7 @@ Each sub-level macro requires `PTO2_PROFILING=1`:
 **What's compiled:**
 
 - Debug/diagnostic logs (always present)
-- Progress tracking (`PTO2 progress: completed=...`)
-- Stall detection and dump (triggered after the `SCHEDULER_TIMEOUT_MS` wall-clock no-progress budget)
-- Deadlock/livelock detection (`diagnose_stuck_state`, called on stall)
+- Distributed replay completion tracking (`Runtime::dist.done_count`)
 
 **What's NOT compiled:**
 
@@ -61,9 +59,7 @@ Each sub-level macro requires `PTO2_PROFILING=1`:
 
 - No `sched_start/sched_end/sched_cost` timestamps
 - No `orch_start/orch_end/orch_cost` timestamps
-- No `Scheduler summary: total_time=...`
-- No `PTO2 total submitted tasks` log
-- `PTO2 progress: completed=... total=...` may appear (thread 0 only, at task completion milestones)
+- No central-scheduler summary logs
 
 ---
 
@@ -71,12 +67,8 @@ Each sub-level macro requires `PTO2_PROFILING=1`:
 
 **What's compiled:**
 
-- Base timing counters for scheduler loop (`sched_complete/dispatch/idle/scan`)
 - Per-thread orchestration timing (`orch_start`, `orch_end`, `orch_cost`)
-- Stage-level orchestration end timestamp (`orch_stage_end`, printed by last orch thread only, marks the moment all orch threads have finished and core transition is about to be requested; only when `orch_to_sched_` is true)
-- PTO2 total submitted tasks count (printed by last orch thread, after orch timing line)
-- Scheduler summary output (`total_time`, `loops`, `tasks_scheduled`)
-- Scheduler lifetime timestamps and cost (`sched_start`, `sched_end`, `sched_cost` — captured inside `resolve_and_dispatch_pto2()`, printed before Scheduler summary)
+- Optional distributed-engine trace/profiling data when compiled in
 
 **What's NOT compiled:**
 
@@ -85,52 +77,26 @@ Each sub-level macro requires `PTO2_PROFILING=1`:
 
 **Log output (additional lines vs Level 0, per normal run):**
 
-- `Thread %d: orch_start=%llu orch_end=%llu orch_cost=%.3fus` — each orch thread, after orchestration fully complete
-- `PTO2 total submitted tasks = %d, already executed %d tasks` — last orch thread only (×1), after orch timing line
-- `Thread %d: orch_stage_end=%llu` — last orch thread only (×1), only when `orch_to_sched_=true`
-- `Thread %d: sched_start=%llu sched_end=%llu sched_cost=%.3fus` — each sched thread, printed before Scheduler summary
-- `Thread %d: Scheduler summary: total_time=%.3fus, loops=%llu, tasks_scheduled=%d` — each sched thread
-- `Thread %d: sched_start=%llu sched_end(timeout)=%llu sched_cost=%.3fus` — timeout path only (replaces normal `sched_end`)
+- `Thread %d: orch_start=%llu orch_end=%llu orch_cost=%.3fus` — AICPU setup thread, after AICore distributed replay completes
 
 **LOG_INFO_V9 count (normal run):**
 
-- `orch_to_sched_=false` (default): `N_sched*2 + N_orch*1 + 1` (orch_timing + PTO2_total + sched_timing + Scheduler_summary)
-- `orch_to_sched_=true` (`PTO2_ORCH_TO_SCHED=1`): adds 1 (`orch_stage_end`)
+- Direct distributed AICore mode: one AICPU setup-thread orch timing line per callable run
 
 > See the table at the end for concrete counts based on the `paged_attention` example.
 
-**Example log output — `orch_to_sched_=false`** (from `paged_attention`, device 10):
+**Example log output**:
 
 ```text
-Thread 2: orch_start=48214752948321 orch_end=48214752959379 orch_cost=230.000us
-Thread 3: orch_start=48214752948316 orch_end=48214752961505 orch_cost=275.000us
-PTO2 total submitted tasks = 13, already executed 13 tasks
-Thread 1: sched_start=48214752948235 sched_end=48214752962379 sched_cost=295.000us
-Thread 1: Scheduler summary: total_time=159.560us, loops=3782, tasks_scheduled=6
-Thread 0: sched_start=48214752948200 sched_end=48214752963571 sched_cost=320.000us
-Thread 0: Scheduler summary: total_time=183.180us, loops=4611, tasks_scheduled=7
+Thread 3: orch_start=1783051497915574420 orch_end=1783051498123092400 orch_cost=207517.980us
 ```
-
-**Example log output — `orch_to_sched_=true`** (`PTO2_ORCH_TO_SCHED=1`, from `paged_attention`, device 11):
-
-```text
-Thread 3: orch_stage_end=48236915058307
-Thread 3: orch_start=48236915044001 orch_end=48236915058781 orch_cost=308.000us
-Thread 2: orch_start=48236915044003 orch_end=48236915058782 orch_cost=308.000us
-PTO2 total submitted tasks = 13, already executed 13 tasks
-Thread 0: sched_start=48236915043911 sched_end=48236915059191 sched_cost=318.000us
-Thread 0: Scheduler summary: total_time=187.920us, loops=4561, tasks_scheduled=4
-Thread 1: sched_start=48236915043947 sched_end=48236915061881 sched_cost=372.000us
-Thread 1: Scheduler summary: total_time=168.620us, loops=3880, tasks_scheduled=9
-```
-
-> With `orch_to_sched_=true`, orch threads transition to schedulers after orchestration. They print `orch_end` but do NOT print `Scheduler summary` or `sched_end` (they have no cores assigned at shutdown time).
 
 **Note:**
 
 - All logs above are controlled by compile-time macro `PTO2_PROFILING`, not by `enable_l2_swimlane`.
 - `enable_l2_swimlane` only controls shared-memory data collection / swimlane export.
-- Enable `orch_to_sched_` via environment variable: `PTO2_ORCH_TO_SCHED=1`.
+- The old `orch_to_sched_` central-scheduler path is not used by the direct
+  distributed AICore executor.
 
 ---
 
@@ -388,15 +354,15 @@ definitions to runtime headers.
 
 ## Log Output Summary
 
-> Example: `paged_attention` on Ascend hardware, 2 sched threads + 2 orch threads, normal run (no stall/timeout).
+> Direct distributed AICore path, normal run.
 
-| Level | Macro Settings | LOG_INFO_V9 Count (`orch_to_sched_=false`) | LOG_INFO_V9 Count (`orch_to_sched_=true`) | Description |
-| ----- | -------------- | ------------------------------------------ | ----------------------------------------- | ----------- |
-| 0 | `PTO2_PROFILING=0` | 0 | 0 | No timing output |
-| 1 | `PTO2_PROFILING=1` | 7 | 8 | Timing timestamps + scheduler summary |
-| 2 | `+PTO2_SCHED_PROFILING=1` | — | — | Scheduler detailed phase breakdown |
-| 3 | `+PTO2_ORCH_PROFILING=1` | — | — | Orchestrator detailed phase breakdown |
-| 4 | `+PTO2_TENSORMAP_PROFILING=1` | — | — | TensorMap lookup stats |
+| Level | Macro Settings | Direct-Path LOG_INFO_V9 Count | Description |
+| ----- | -------------- | ----------------------------- | ----------- |
+| 0 | `PTO2_PROFILING=0` | 0 | No timing output |
+| 1 | `PTO2_PROFILING=1` | 1 | AICPU replay-window timing |
+| 2 | `+PTO2_SCHED_PROFILING=1` | — | Legacy central-scheduler phase breakdown |
+| 3 | `+PTO2_ORCH_PROFILING=1` | — | Orchestrator detailed phase breakdown when that code path is compiled |
+| 4 | `+PTO2_TENSORMAP_PROFILING=1` | — | TensorMap lookup stats when orchestrator profiling is compiled |
 
 ---
 

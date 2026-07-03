@@ -9,14 +9,12 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Host/AICPU shared runtime-arena layout, init_data and wire implementations.
+ * Host-side runtime-arena layout, init_data and wire implementations.
  *
- * Lives under runtime/shared/ so it is included in both the host_runtime.so
- * build (host pre-populates the prebuilt arena image) and the aicpu_runtime
- * build (AICPU runs wire_arena_pointers + destroy after attach). The
- * device-only parts of pto_runtime2.cpp / pto_orchestrator.cpp / pto_scheduler.cpp
- * (ops table, scope/submit/dispatch business logic, profiling) stay in their
- * original files and the aicpu build only.
+ * The host pre-populates the legacy arena image and uploads it with the
+ * Runtime. The current direct distributed AICPU setup path only reads the
+ * PTO2Runtime header from that image; it no longer attaches or wires the full
+ * arena.
  */
 
 #include <stdlib.h>
@@ -414,7 +412,8 @@ PTO2Runtime *runtime_init_data_from_layout(
     auto *sm_wrap = static_cast<PTO2SharedMemoryHandle *>(arena.region_ptr(layout.off_sm_handle));
     memset(sm_wrap, 0, sizeof(*sm_wrap));
 
-    // rt->ops is filled by the AICPU at boot.
+    // CPU-sim AICore binds rt->ops to its local distributed ops table when
+    // entering dist_core_main. CCEC wrappers call dist_engine symbols directly.
     rt->mode = mode;
     rt->gm_heap = gm_heap_dev_base;
     uint64_t total_heap_size = 0;

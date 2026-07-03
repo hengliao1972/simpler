@@ -38,6 +38,7 @@ Runtime::Runtime() {
 
     // fully_distributed_within_core handoff fields
     dist.core_main_fn = 0;
+    dist.orch_func = 0;
     dist.go = 0;
     dist.num_workers = 0;
     dist.done_count = 0;

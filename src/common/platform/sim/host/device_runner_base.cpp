@@ -220,6 +220,12 @@ int SimDeviceRunnerBase::prepare_orch_so(Runtime &runtime) {
         runtime.set_active_callable_id(cid, /*is_new=*/false);
         return 0;
     }
+    if (state.aicore_linked_orch) {
+        runtime.set_dev_orch_so(0, 0);
+        runtime.set_active_callable_id(cid, /*is_new=*/false);
+        LOG_INFO_V0("AICore-linked orchestration prepared cid=%d", cid);
+        return 0;
+    }
     const bool first_sighting = aicpu_seen_callable_ids_.insert(cid).second;
     if (first_sighting) {
         ++aicpu_dlopen_total_;
@@ -237,7 +243,7 @@ int SimDeviceRunnerBase::register_callable(
     int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name, const char *config_name,
     std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
 ) {
-    // The AICPU executor reserves `orch_so_table_[MAX_REGISTERED_CALLABLE_IDS]`
+    // The AICPU executor reserves fixed-size per-callable state
     // (declared in src/common/task_interface/callable_protocol.h) and indexes
     // it by callable_id; rejecting an out-of-range id here keeps the host and
     // AICPU sides in sync and avoids an OOB access at run time.
@@ -292,6 +298,30 @@ int SimDeviceRunnerBase::register_callable(
     return 0;
 }
 
+int SimDeviceRunnerBase::register_callable_aicore_orch(
+    int32_t callable_id, std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+) {
+    if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
+        LOG_ERROR(
+            "register_callable_aicore_orch: callable_id=%d out of range [0, %d)", callable_id,
+            MAX_REGISTERED_CALLABLE_IDS
+        );
+        return -1;
+    }
+    if (callables_.count(callable_id) != 0) {
+        LOG_ERROR("register_callable_aicore_orch: callable_id=%d already registered", callable_id);
+        return -1;
+    }
+
+    CallableState state;
+    state.aicore_linked_orch = true;
+    state.kernel_addrs = std::move(kernel_addrs);
+    state.signature = std::move(signature);
+    callables_.emplace(callable_id, std::move(state));
+    LOG_INFO_V0("register_callable_aicore_orch: cid=%d", callable_id);
+    return 0;
+}
+
 int SimDeviceRunnerBase::register_callable_host_orch(
     int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
     std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
@@ -334,6 +364,9 @@ int SimDeviceRunnerBase::unregister_callable(int32_t callable_id) {
     if (state.host_dlopen_handle != nullptr) {
         // hbg: dlclose the host handle; no orch SO refcount to decrement.
         dlclose(state.host_dlopen_handle);
+        return 0;
+    }
+    if (state.aicore_linked_orch) {
         return 0;
     }
 

@@ -49,6 +49,9 @@ struct ChildKernelAddr {
  *   - tensormap_and_ringbuffer: kernel_addrs + orch_so_data + orch_so_size
  *                       + func_name + config_name (orch SO is uploaded to
  *                       device by DeviceRunner; host does no dlopen)
+ *   - fully_distributed_within_core a5sim: kernel_addrs +
+ *                       aicore_linked_orch (orch entry is resolved from the
+ *                       AICore image; no standalone orch SO is uploaded)
  *
  * func_name / config_name are non-empty only for the trb path; the hbg path
  * resolves its entry symbol during prepare_callable_impl and stores the
@@ -63,6 +66,7 @@ struct CallableArtifacts {
     std::vector<ArgDirection> signature;
     void *host_dlopen_handle{nullptr};  // hbg only
     void *host_orch_func_ptr{nullptr};  // hbg only
+    bool aicore_linked_orch{false};     // fdwic a5sim only
     const void *orch_so_data{nullptr};  // trb only
     size_t orch_so_size{0};             // trb only
     std::string func_name;              // trb only (orch entry symbol)

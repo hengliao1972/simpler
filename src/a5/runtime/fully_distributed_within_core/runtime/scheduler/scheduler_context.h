@@ -37,8 +37,10 @@ struct PTO2Runtime;
 /**
  * SchedulerContext: owns all scheduler-side state and methods.
  *
- * Held as a member of AicpuExecutor (sched_ctx_).  The single public entry
- * point is resolve_and_dispatch(), called once per scheduler thread.
+ * Held as a member of AicpuExecutor (sched_ctx_). In the direct distributed
+ * AICore path, AICPU uses this context for core discovery, per-core register
+ * ownership, and EXIT/shutdown. The legacy central scheduler entry points
+ * remain implemented here but are not called by aicpu_executor.cpp.
  *
  * All dispatch/completion/drain/cold-path logic is implemented as private
  * member methods, split across three .cpp files by responsibility:
@@ -70,7 +72,8 @@ public:
     // Per-thread execution entry points (called by AicpuExecutor::run)
     // =========================================================================
 
-    // Main scheduler thread entry: poll completion + dispatch ready tasks.
+    // Legacy central scheduler thread entry: poll completion + dispatch ready
+    // tasks. The direct distributed AICore path does not call this.
     int32_t resolve_and_dispatch(Runtime *runtime, int32_t thread_idx);
 
     // Shutdown AICore registers for this thread's assigned cores.
@@ -78,18 +81,17 @@ public:
     // Orchestrator threads (core_trackers_[thread_idx].core_num() == 0) are a no-op.
     int32_t shutdown(int32_t thread_idx);
 
-    // Run all post-orchestration scheduler bookkeeping:
+    // Legacy post-orchestration scheduler bookkeeping:
     //  - publishes core assignments to the perf collector (PTO2_PROFILING)
     //  - latches submitted task count from PTO2 shared memory
     //  - folds inline_completed_tasks into completed_tasks_
     //  - flips orchestrator_done_ and triggers core transition
     //    (skipped on fatal error — emergency_shutdown runs instead)
-    // Callers must invoke rt_orchestration_done(rt) before this — that
-    // step belongs to the orchestrator lifecycle, not the scheduler.
+    // The direct distributed AICore path publishes Runtime::dist.go and waits
+    // for Runtime::dist.done_count instead.
     void on_orchestration_done(Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks);
 
-    // Bind the PTO2Runtime scheduler pointer. Required in device-orchestration
-    // mode where rt is created by the orchestrator thread after init().
+    // Bind the PTO2Runtime scheduler pointer for the legacy central scheduler.
     void bind_runtime(PTO2Runtime *rt);
 
     // =========================================================================
@@ -102,7 +104,7 @@ public:
     int32_t completed_tasks_count() const { return completed_tasks_.load(std::memory_order_acquire); }
 
     // Block until the first scheduler thread has finished one-time PTO2 init.
-    // Called by the orchestrator thread in device-orch mode.
+    // Legacy central-scheduler synchronization point.
     void wait_init_complete() const;
 
 private:

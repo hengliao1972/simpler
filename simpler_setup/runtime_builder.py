@@ -327,6 +327,48 @@ class RuntimeBuilder:
             dispatcher_path=dispatcher_path,
         )
 
+    def build_aicore_with_extra_sources(
+        self,
+        name: str,
+        extra_sources: list[Path],
+        cache_key: str,
+    ) -> Path:
+        """Build a per-callable AICore image with additional source files.
+
+        This is used by fully_distributed_within_core while moving per-example
+        orchestration into the AICore image. It intentionally stages the result
+        outside the baseline runtime output directory so `build_runtimes.py`
+        remains a per-runtime prebuild.
+        """
+        self._validate_runtime(name)
+        config_path = self._runtimes[name]
+        config_dir = config_path.parent
+        build_config = load_build_config(config_path)
+        include_dirs, source_dirs = self._resolve_target_dirs(config_dir, build_config, "aicore")
+        if "orchestration" in build_config:
+            orch_include_dirs, _orch_source_dirs = self._resolve_target_dirs(config_dir, build_config, "orchestration")
+            include_dirs.extend(orch_include_dirs)
+
+        arch, variant = self._arch, self._variant
+        cache_dir = self._CACHE_DIR / arch / variant / name / "aicore-extra" / cache_key
+        output_dir = self._LIB_DIR / arch / variant / name / "aicore-extra" / cache_key
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        current_commit = _get_git_head(PROJECT_ROOT)
+        lock_path = cache_dir / ".aicore-extra.lock"
+        with open(lock_path, "w") as lock_fd:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            _invalidate_cache_if_stale(cache_dir / "aicore", current_commit)
+            return self._runtime_compiler.compile(  # type: ignore[return-value]
+                "aicore",
+                include_dirs,
+                source_dirs,
+                build_dir=str(cache_dir),
+                output_dir=output_dir,
+                source_files=[str(p) for p in extra_sources],
+            )
+
     def _resolve_dispatcher_path(self) -> Optional[Path]:
         """Return path to libsimpler_aicpu_dispatcher.so for onboard variants.
 

@@ -16,66 +16,57 @@ ls -lt $HOME/ascend/log/debug/device-<device_id>/ | head -5
 
 ## Log Structure Overview
 
-A single run produces two profiling blocks in the device log:
+A direct distributed AICore run produces one AICPU timing line after the
+AICore replay window completes. Older central-scheduler builds also produced
+per-scheduler summaries; those are not emitted by the slim AICPU executor.
 
 | Block | Emitted by | Function | Content |
 | ----- | ---------- | -------- | ------- |
-| **Orchestrator Profiling** | Thread 3 (orchestrator) | `aicpu_orchestration_entry` | Time breakdown of graph construction on device |
-| **PTO2 Scheduler Summary** | Threads 0/1/2 (schedulers) | `SchedulerContext::resolve_and_dispatch` | Per-thread scheduling statistics, phase timing, and lock contention |
+| **AICore Replay Timing** | Thread 3 (AICPU setup thread) | `AicpuExecutor::run` | Wall time from releasing AICores to all workers reporting done |
 
 All timing values are in microseconds (us), converted from AICPU cycle counters.
 
 ---
 
-## Block 1: Orchestrator Profiling
+## Block 1: AICore Replay Timing
 
-Thread 3 loads the orchestration `.so` via `dlopen`, calls `aicpu_orchestration_entry`, and prints a profiling summary after it returns.
+fdwic links the per-example orchestration source into `libaicore_kernel.so`.
+Thread 3 initializes the shared distributed-engine state, releases the AICore
+workers, waits for every worker to increment `Runtime::dist.done_count`, and
+then prints the replay-window timing. It does not `dlopen` a standalone
+orchestration `.so`.
 
-### Example (from a real run: batch=64, 16704 tasks)
+### Example
 
 ```text
-Thread 3: Calling aicpu_orchestration_entry from SO
-Thread 3: aicpu_orchestration_entry returned, cost 20943.940us
-Thread 3: === Orchestrator Profiling: 16704 tasks, total=14601.580us ===
-Thread 3:   sync_tensormap : 286.300us (2.0%)
-Thread 3:   task_ring_alloc: 380.400us (2.6%)
-Thread 3:   param_copy     : 2147.800us (14.7%)
-Thread 3:   lookup+dep     : 7290.300us (49.9%)
-Thread 3:   heap_alloc     : 701.500us (4.8%)
-Thread 3:   tensormap_ins  : 1890.380us (12.9%)
-Thread 3:   fanin+ready    : 1207.400us (8.3%)
-Thread 3:   finalize+SM    : 697.500us (4.8%)
-Thread 3:   scope_end      : 364.080us
-Thread 3:   avg/task       : 0.874us
-Thread 3: PTO2 total submitted tasks = 16704
+Thread 3: orch_start=1783051497915574420 orch_end=1783051498123092400 orch_cost=207517.980us
 ```
 
 ### Field Reference
 
-| Field | Source (`pto_orchestrator.cpp`) | Description |
-| ----- | ------------------------------- | ----------- |
-| **cost** | Wall-clock around `orch_func()` call | Total time including orchestration logic + scope overhead |
-| **total** | Sum of all sub-steps below | Accumulated time inside `submit_task` across all tasks |
-| **sync_tensormap** | `g_orch_sync_cycle` | TensorMap validity sync and optional cleanup before each submission |
-| **task_ring_alloc** | `g_orch_alloc_cycle` | Allocating a task slot from the task ring buffer |
-| **param_copy** | `g_orch_args_cycle` | Copying param descriptors + tensor descriptor copies into task-owned storage |
-| **lookup+dep** | `g_orch_lookup_cycle` | TensorMap lookup for inputs/inouts + building fanin/fanout dependency edges |
-| **heap_alloc** | `g_orch_heap_cycle` | Allocating packed output buffers from the heap ring |
-| **tensormap_ins** | `g_orch_insert_cycle` | Inserting output/inout tensors into the TensorMap |
-| **fanin+ready** | `g_orch_fanin_cycle` | Building the fanin list + checking if task is already ready (Step 5/5b) |
-| **scope_end** | `g_orch_scope_end_cycle` | `end_scope` overhead (notifying scheduler of scope completion) |
-| **avg/task** | `total / submit_count` | Average orchestrator time per task submission |
+| Field | Source | Description |
+| ----- | ------ | ----------- |
+| **orch_start** | `AicpuExecutor::run` | Timestamp just before AICPU publishes `Runtime::dist.go = 1` |
+| **orch_end** | `AicpuExecutor::run` | Timestamp after `Runtime::dist.done_count == num_workers` |
+| **orch_cost** | `AicpuExecutor::run` | Full distributed replay window, including AICore orchestration and kernel execution |
 
 ### Interpreting the Numbers
 
-- **cost > total**: The difference is overhead outside `submit_task` (the orchestration user code itself, scope_begin/end, TensorCreateInfo construction, etc.).
-- **lookup+dep** is typically the dominant cost (~50%) because it involves TensorMap hash lookups and building dependency edges with spinlock-protected fanout list insertions.
-- **param_copy** scales with the number of parameters per task.
-- **avg/task < 1us** indicates efficient graph construction.
+- `orch_cost` is end-to-end for the AICore replay window, not just host-side
+  graph construction.
+- With `--use-example-exec-time`, kernels with configured
+  `example_exec_time_ns` busy-wait instead of executing their real body; golden
+  comparison is skipped in that mode.
+- Without `--use-example-exec-time`, real kernels execute and scene tests run
+  the normal golden comparison unless `--skip-golden` is passed.
 
 ---
 
-## Block 2: PTO2 Scheduler Summary
+## Historical Block: PTO2 Scheduler Summary
+
+The following section applies only to the legacy central-scheduler path. The
+direct distributed AICore path keeps `SchedulerContext` for core discovery and
+shutdown, but does not call `SchedulerContext::resolve_and_dispatch`.
 
 Each of the 3 scheduler threads (Thread 0, 1, 2) prints its own summary after completing all tasks. The output has two sub-sections: **summary** and **phase breakdown**.
 

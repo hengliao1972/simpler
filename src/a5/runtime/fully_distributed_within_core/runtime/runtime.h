@@ -17,13 +17,13 @@
  * - Handshake buffers for AICPU-AICore communication
  * - Execution parameters (block_dim, aicpu_thread_num)
  * - Tensor pair management for host-device memory tracking
- * - Device orchestration state (gm_sm_ptr_, orch_args_)
+ * - Device orchestration arguments and prebuilt runtime header handoff
  * - Function address mapping (func_id_to_addr_)
  *
- * Task dispatch uses a per-core PTO2DispatchPayload written by the scheduler.
- * At dispatch time, build_payload() copies tensor pointers and scalars from
- * the task payload into the per-core args[], populates SPMD context, then
- * signals AICore via DATA_MAIN_BASE.
+ * The direct distributed path publishes Runtime::dist from AICPU, then AICore
+ * workers replay orchestration and execute claimed tasks on-core. Legacy
+ * central-scheduler payload fields remain for compatibility with shared
+ * platform/runtime helpers.
  */
 
 #ifndef SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_
@@ -261,12 +261,13 @@ public:
     bool orch_to_sched;
 
     // ---- fully_distributed_within_core handoff (SPMD-on-core) ----
-    // The AICPU orchestrator thread does dlopen/arena setup, then hands the
-    // resolved orchestration entry + per-core engine off to the AICore worker
-    // threads through these fields instead of running orchestration/scheduling
-    // itself. Each AICore worker invokes core_main_fn(runtime, idx, core_type)
-    // once `go` is set, then increments `done_count` when finished. See
-    // runtime/dist_engine.* and docs/fully_distributed_within_core.md.
+    // The AICPU orchestrator thread initializes shared engine state, then hands
+    // the per-core engine entry off to the AICore worker threads through these
+    // fields. Each AICore worker invokes core_main_fn(runtime, idx, core_type)
+    // once `go` is set, initializes its local state, directly calls the
+    // orchestration entry linked into the AICore image, then increments
+    // `done_count` when finished. See runtime/dist_engine.* and
+    // docs/fully_distributed_within_core.md.
     struct DistHandoff {
         volatile uint64_t core_main_fn;  // DistCoreMainFn (in AICPU .so)
         // Address of the DistGlobal struct that carries engine state (cursors,
@@ -293,25 +294,20 @@ private:
 
     void *gm_sm_ptr_;                        // GM pointer to PTO2 shared memory (device)
     void *gm_heap_ptr_;                      // GM heap for orchestrator output buffers (device)
-    void *slot_states_ptr_;                  // Pointer to PTO2TaskSlotState array (scheduler-private, for profiling)
     ChipStorageTaskArgs orch_args_storage_;  // Copy of args for device
 
-    // Prebuilt-arena fast path (trb only). Set by the host before rtMemcpy'ing
-    // Runtime to device; AICPU reads them in the boot path to skip
-    // runtime_create_from_sm and reuse the pooled, prebuilt arena buffer
-    // (already populated by runtime_init_data_from_layout + wire on host).
+    // Prebuilt runtime header. Set by the host before rtMemcpy'ing Runtime to
+    // device; the AICPU setup thread reads `prebuilt_arena_base_ +
+    // prebuilt_runtime_offset_` as PTO2Runtime*. The direct distributed path
+    // no longer attaches/wires the full arena on AICPU.
     void *prebuilt_arena_base_;
     size_t prebuilt_runtime_offset_;
 
-    // Device orchestration SO (for dlopen on AICPU thread 3).
-    // The SO bytes themselves live in a separately-allocated device buffer
-    // owned by DeviceRunner; only the metadata below travels inside Runtime.
+    // Legacy device orchestration SO metadata retained for common host callable
+    // plumbing shared with other runtimes.
     uint64_t dev_orch_so_addr_;
     uint64_t dev_orch_so_size_;
-    // Per-callable_id dispatch. AICPU dispatches via
-    // `orch_so_table_[active_callable_id_]`; `register_new_callable_id_`
-    // signals whether the host is delivering a freshly-registered
-    // callable_id (write+dlopen) or reusing an already-loaded one.
+    // Per-callable_id dispatch state shared by the host and AICPU executor.
     int32_t active_callable_id_;
     bool register_new_callable_id_;
     char device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
@@ -336,27 +332,21 @@ public:
     const ChipStorageTaskArgs &get_orch_args() const;
     void set_gm_sm_ptr(void *p);
     void set_gm_heap(void *p);
-    void set_slot_states_ptr(void *p);
     void set_orch_args(const ChipStorageTaskArgs &args);
 
-    // Prebuilt-arena fast path (trb only). Set by host's
-    // bind_callable_to_runtime_impl; consumed by AICPU at boot to attach a
-    // DeviceArena to `prebuilt_arena_base_` and pick up the PTO2Runtime at
-    // `prebuilt_arena_base_ + prebuilt_runtime_offset_`. Both stay zero on
-    // first construction (Runtime() ctor zeros them) so a non-prebuilt boot
-    // path can still detect "no prebuilt image set" via nullptr.
+    // Prebuilt runtime header location. Both stay zero on first construction
+    // (Runtime() ctor zeros them) so the setup thread can detect "not set" via
+    // nullptr.
     void set_prebuilt_arena(void *arena_base, size_t runtime_off);
     void *get_prebuilt_arena_base() const;
     size_t get_prebuilt_runtime_offset() const;
 
-    // Device orchestration SO binary (for dlopen on AICPU thread 3)
+    // Legacy device orchestration SO metadata retained for common callable ABI.
     void set_dev_orch_so(uint64_t dev_addr, uint64_t size);
     uint64_t get_dev_orch_so_addr() const;
     uint64_t get_dev_orch_so_size() const;
     // Per-callable_id dispatch. callable_id must be in
-    // [0, MAX_REGISTERED_CALLABLE_IDS); register_new_callable_id_ tells AICPU
-    // whether to (re)load the orch SO into orch_so_table_[callable_id] or
-    // reuse the cached entry.
+    // [0, MAX_REGISTERED_CALLABLE_IDS).
     void set_active_callable_id(int32_t callable_id, bool is_new);
     int32_t get_active_callable_id() const;
     bool register_new_callable_id() const;
@@ -364,7 +354,6 @@ public:
     const char *get_device_orch_func_name() const;
     void set_device_orch_config_name(const char *name);
     const char *get_device_orch_config_name() const;
-
     uint64_t get_function_bin_addr(int func_id) const;
     void set_function_bin_addr(int func_id, uint64_t addr);
     /**

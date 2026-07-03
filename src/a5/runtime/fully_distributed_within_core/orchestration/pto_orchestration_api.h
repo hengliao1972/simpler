@@ -124,9 +124,9 @@ struct PTO2Runtime {
 //
 // Two dispatch modes:
 //
-//   host / sim / AICPU  (default) — go through rt->ops. The ops table is
-//     populated by dist_engine_register() from libaicpu_kernel.so via the
-//     dlopen'd orch SO's rt binding hook.
+//   host / sim / AICPU  (default) — go through rt->ops. In fdwic a5sim,
+//     dist_core_main binds rt->ops to the distributed ops table inside the
+//     AICore image before directly calling the linked orchestration entry.
 //
 //   CCEC / AICore       (__CCE_AICORE__ defined) — direct-call the
 //     dist_engine_api.h symbols. On device there is no ops-table indirection:

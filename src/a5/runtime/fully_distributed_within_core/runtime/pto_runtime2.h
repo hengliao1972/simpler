@@ -11,25 +11,8 @@
 /**
  * PTO Runtime2 - Main Interface
  *
- * This is the main header for the PTO Runtime2 system.
- * It provides a unified API for task graph construction and execution.
- *
- * Key Features:
- * - Ring buffer based memory management (zero allocation overhead)
- * - Lazy invalidation TensorMap for dependency discovery
- * - Scope-based buffer lifecycle management
- * - Per-task spinlocks for concurrent fanout updates
- * - Orchestrator-Scheduler decoupling via shared memory
- *
- * Usage:
- *   1. Create runtime: PTO2Runtime create methods
- *   2. Build task graph in orchestration function:
- *      - begin_scope() / end_scope()
- *      - submit_task()
- *   3. Mark orchestration complete: mark_done()
- *   4. Destroy runtime
- *
- * Based on: docs/RUNTIME_LOGIC.md
+ * Runtime2 data layout shared by the host prebuilt image and the direct
+ * distributed AICore replay path.
  */
 
 #pragma once
@@ -58,11 +41,9 @@ enum PTO2RuntimeMode {
 };
 
 /**
- * Function-pointer ops table for runtime operations.
- *
- * The orchestration .so calls runtime functions through this table
- * (via pto_orchestration_api.h inline wrappers), so it has zero link
- * dependencies on runtime .cpp files.
+ * Function-pointer ops table for runtime operations. CPU-sim AICore
+ * orchestration uses this ABI to call the distributed ops table inside the
+ * AICore image; CCEC wrappers call dist_engine_api.h directly.
  */
 typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
 
@@ -148,14 +129,10 @@ struct PTO2Runtime {
     // Statistics
     int64_t total_cycles;
 
-    // Prebuilt-arena fast path metadata. Carries every offset
-    // wire_arena_pointers needs at AICPU boot so the AICPU can reconstruct
-    // all arena-internal pointer fields without re-running init_data. The
-    // device base of the runtime arena travels separately on the host-side
-    // Runtime (Runtime::prebuilt_arena_base_), since the AICPU needs it
-    // *before* dereferencing this image. Populated on host by
-    // runtime_init_data_from_layout + runtime_wire_arena_pointers; read by
-    // aicpu_executor.cpp.
+    // Prebuilt-arena fast path metadata. The host builds a complete runtime
+    // header image and records the layout beside it. The direct AICPU path
+    // reads the header from Runtime::prebuilt_arena_base_ and passes it to
+    // dist_engine_register; it no longer wires the full arena at AICPU boot.
     PTO2RuntimeArenaLayout prebuilt_layout;
 };
 
@@ -189,9 +166,7 @@ PTO2RuntimeArenaLayout runtime_reserve_layout(
  * mirror of the runtime image — the resulting buffer is rtMemcpy-ready.
  *
  * Returns the PTO2Runtime* that sits at layout.off_runtime within the arena.
- * Caller must follow up with runtime_wire_arena_pointers; rt->ops and the
- * AICore-side count fields are left untouched and must be filled by the
- * AICPU at boot.
+ * Caller must follow up with runtime_wire_arena_pointers.
  */
 PTO2Runtime *runtime_init_data_from_layout(
     DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode, void *sm_dev_base, uint64_t sm_size,
@@ -206,78 +181,14 @@ PTO2Runtime *runtime_init_data_from_layout(
  * Phase 3 — wire every arena-internal pointer field (rt->sm_handle,
  * rt->aicore_mailbox, orchestrator.{scope_tasks, scope_begins, scheduler,
  * tensor_map.*, rings[].fanin_pool.base}, scheduler.{ready_queues, dep_pool,
- * wiring.queue}) so each holds arena.base() + offset. Idempotent — runs on
- * both host (writing host-mirror addresses) and AICPU (writing device
- * addresses) sides.
+ * wiring.queue}) so each holds arena.base() + offset.
  */
 void runtime_wire_arena_pointers(DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2Runtime *rt);
 
 /**
- * AICPU-only Phase 4 — fill in the few fields the host could not know at
- * prebuilt-image build time: the ops table (s_runtime_ops is a device-side
- * file-local global, host cannot resolve its device address) and the
- * orchestrator's core counts (depend on the executor's scheduler context).
- * Call once per boot after runtime_wire_arena_pointers.
- */
-void runtime_finalize_after_wire(PTO2Runtime *rt, int32_t aic_count, int32_t aiv_count);
-
-/**
- * Destroy runtime. With the prebuilt-arena fast path the arena buffer is
- * pooled across runs by DeviceRunner, so we never call arena.release()
- * here — the destructor only forgets sub-structure pointers (idempotent
- * cleanup).
+ * Destroy runtime sub-structures without releasing the arena buffer.
  */
 void runtime_destroy(PTO2Runtime *rt, DeviceArena &arena);
-
-/**
- * Set execution mode
- */
-void runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode);
-
-// =============================================================================
-// Orchestration API (called by orchestration function)
-// =============================================================================
-
-/**
- * Begin a new scope
- *
- * All tasks submitted within this scope will have their lifetime
- * bounded by the scope. When scope_end() is called, the scope
- * releases its reference to all enclosed tasks.
- */
-void rt_scope_begin(PTO2Runtime *rt);
-
-/**
- * End current scope
- *
- * Releases scope reference for all tasks submitted since scope_begin().
- * Tasks whose refcount reaches zero will have their buffers released.
- */
-void rt_scope_end(PTO2Runtime *rt);
-
-/**
- * Mark orchestration as complete
- *
- * Signals that no more tasks will be submitted.
- */
-void rt_orchestration_done(PTO2Runtime *rt);
-
-/**
- * Enter fatal state explicitly from orchestration.
- */
-void rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...);
-
-/**
- * Cross-layer data access: read a tensor value by waiting for its producer.
- */
-uint64_t get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
-
-/**
- * Cross-layer data access: write a value to a tensor at given indices.
- * Waits for producer completion (WAW) and all consumers (WAR) via TensorMap.
- * See set_tensor_data in pto_orchestration_api.h for full documentation.
- */
-void set_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value);
 
 /**
  * Slim config struct exported by orchestration .so via aicpu_orchestration_config().

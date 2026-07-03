@@ -40,7 +40,13 @@ class BuildTarget:
     def get_binary_name(self) -> str:
         return self._binary_name
 
-    def gen_cmake_args(self, include_dirs: list[str], source_dirs: list[str], sanitizers: str = "") -> list[str]:
+    def gen_cmake_args(
+        self,
+        include_dirs: list[str],
+        source_dirs: list[str],
+        sanitizers: str = "",
+        source_files: Optional[list[str]] = None,
+    ) -> list[str]:
         """Generate CMake arguments list from toolchain args + custom directories."""
         inc = ";".join(os.path.abspath(d) for d in include_dirs)
         src = ";".join(os.path.abspath(d) for d in source_dirs)
@@ -48,6 +54,9 @@ class BuildTarget:
             f"-DCUSTOM_INCLUDE_DIRS={inc}",
             f"-DCUSTOM_SOURCE_DIRS={src}",
         ]
+        if source_files:
+            files = ";".join(os.path.abspath(f) for f in source_files)
+            args.append(f"-DCUSTOM_SOURCE_FILES={files}")
         # Sanitizers only apply to host-compiled targets — device toolchains
         # (ccec, aarch64 cross) run on the NPU and can't carry a host sanitizer
         # runtime. cmake/sanitizers.cmake reads both defines.
@@ -221,6 +230,7 @@ class RuntimeCompiler:
         build_dir: Optional[str] = None,
         output_dir: Optional[Union[str, Path]] = None,
         dispatcher_dest: Optional[Union[str, Path]] = None,
+        source_files: Optional[list[str]] = None,
     ) -> Union[bytes, Path]:
         """
         Compile binary for the specified target platform.
@@ -257,7 +267,12 @@ class RuntimeCompiler:
         else:
             raise ValueError(f"Invalid target platform: {target_platform}. Must be 'aicore', 'aicpu', or 'host'.")
 
-        cmake_args = target.gen_cmake_args(include_dirs, source_dirs, sanitizers=self._sanitizers)
+        cmake_args = target.gen_cmake_args(
+            include_dirs,
+            source_dirs,
+            sanitizers=self._sanitizers,
+            source_files=source_files,
+        )
         cmake_source_dir = target.get_root_dir()
         binary_name = target.get_binary_name()
         platform = target_platform.upper()

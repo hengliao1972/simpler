@@ -16,9 +16,9 @@ Python process (ChipWorker)
     |     |
     |     +-- dlopen(aicpu_sim_XXXXXX, RTLD_NOW | RTLD_LOCAL)    ← AICPU SO (temp file)
     |     |     |
-    |     |     +-- dlopen(libdevice_orch_<PID>.so, RTLD_LAZY | RTLD_LOCAL)  ← orch SO (temp file)
+    |     |     +-- dlopen(libdevice_orch_<PID>.so, RTLD_LAZY | RTLD_LOCAL)  ← orch SO (temp file; legacy/trb)
     |     |
-    |     +-- dlopen(aicore_sim_XXXXXX, RTLD_NOW | RTLD_LOCAL)   ← AICore SO (temp file)
+    |     +-- dlopen(aicore_sim_XXXXXX, RTLD_NOW | RTLD_LOCAL)   ← AICore SO (temp file; fdwic may carry orch)
     |
     +-- DeviceRunner::upload_chip_callable_buffer()
           |
@@ -313,7 +313,9 @@ device_worker_main(device_id)
     for each callable:
         ChipWorker.prepare_callable(callable)   # returns opaque handle
           prepare_callable(ctx, internal callable entry, callable)
-            upload child kernels, copy orch SO to device buffer
+            upload child kernels
+            trb/onboard legacy: copy orch SO to device buffer
+            fdwic a5sim: mark callable as AICore-linked orch, no orch SO copy
         for each launch with that handle:
           ChipWorker.run(handle, args, config)
             run_prepared(ctx, buf, internal callable entry, args, block_dim, aicpu_thread_num, …)

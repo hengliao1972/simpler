@@ -51,6 +51,12 @@ else()
     message(FATAL_ERROR "MUST set CUSTOM_SOURCE_DIRS to build AICore (simulation)")
 endif()
 
+if(DEFINED CUSTOM_SOURCE_FILES)
+    foreach(SRC_FILE ${CUSTOM_SOURCE_FILES})
+        list(APPEND AICORE_SOURCES "${SRC_FILE}")
+    endforeach()
+endif()
+
 # Create shared library (host-compatible for dlopen)
 add_library(aicore_kernel SHARED ${AICORE_SOURCES})
 
