@@ -65,8 +65,9 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from multiprocessing.shared_memory import SharedMemory
+from pathlib import Path
 from typing import Any, Optional
 
 import cloudpickle
@@ -1496,7 +1497,7 @@ class Worker:
         for i in range(MAX_REGISTERED_CALLABLE_IDS):
             if i not in self._callable_registry and i not in self._pending_unregister_cids:
                 return i
-        # The AICPU side keeps a fixed-size orch_so_table_ keyed by cid;
+        # The AICPU side keeps fixed-size per-callable state keyed by cid;
         # raise here so the failure surfaces at register-time with a
         # protocol-aware message, not later from
         # DeviceRunner::register_callable with a generic
@@ -1675,8 +1676,8 @@ class Worker:
 
         Failure semantics (docs section 8): unregister is best-effort.
         If any chip child reports an error, the parent **warns and still
-        pops the registry entry** — orch_so_table_ on the AICPU side will
-        be overwritten on target-local resource reuse, and refusing to
+        pops the registry entry** — AICPU per-callable state will be
+        overwritten on target-local resource reuse, and refusing to
         release a known-bad entry would just exhaust the resource space
         faster.
 
@@ -1876,6 +1877,9 @@ class Worker:
 
         builder = RuntimeBuilder(platform)
         binaries = builder.get_binaries(runtime)
+        aicore_path_override = self._config.get("aicore_path_override")
+        if aicore_path_override:
+            binaries = replace(binaries, aicore_path=Path(aicore_path_override))
 
         self._chip_worker = ChipWorker()
         self._chip_worker.init(device_id, binaries)

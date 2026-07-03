@@ -131,6 +131,14 @@
 #include "pto_submit_types.h"
 #include "pto_types.h"
 #include "runtime.h"
+
+#if defined(__CPU_SIM)
+extern "C" PTO_DEVICE_FUNC void aicpu_orchestration_entry(const L2TaskArgs &orch_args);
+#endif
+#if defined(__CPU_SIM) && !defined(__CCE_AICORE__)
+extern "C" void framework_bind_runtime(PTO2Runtime *rt);
+#endif
+
 #if defined(__CCE_AICORE__)
 // AICore has no scheduler to yield to; a spin hint here would be meaningless.
 // Provide a local no-op so we don't have to depend on the AICPU spin_hint.h
@@ -835,7 +843,6 @@ struct DistGlobal {
     uint8_t *heap_base;
     size_t heap_size;  // == bounded ring size
 
-    DistOrchFunc orch_func;
     const L2TaskArgs *orch_args;
     PTO2Runtime *rt;
     Runtime *runtime;  // outer Runtime (for kernel-address resolution + done_count)
@@ -870,31 +877,20 @@ struct DistGlobal {
     DistCore cores[RUNTIME_MAX_WORKER];
 };
 
-// g_dist / g_self storage. sim / AICPU keep the plain BSS globals so nothing
-// downstream (host thread wake-up, thread_local semantics, code that expects
-// `g_dist` to name a struct-lvalue) changes. CCEC refuses file-scope globals
-// referenced from an __aicore__ function, so on that target we route through
-// pointers stashed in the per-block scratch that CCEC allows ([[block_local]]
-// static). The `g_dist` macro then makes `g_dist.field` textually resolve to
-// `(*g_dist_ptr).field` under CCEC — every hot-path reference below stays
-// unchanged. dist_core_main is the sole writer of both pointers on device:
-// it loads shared_addr from runtime->dist at entry and picks the DistCore
-// slot by core_idx.
+// g_dist / g_self storage. The AICPU build owns the BSS DistGlobal and
+// initializes it in dist_engine_register. AICore builds attach to the published
+// Runtime::dist.shared_addr at dist_core_main entry: CCEC uses GM pointers,
+// while CPU sim uses an ordinary process pointer into the AICPU DSO's BSS.
+// The `g_dist` macro keeps hot-path code identical.
 #if defined(__CCE_AICORE__)
-// g_dist lives in GM: AICore cores can only share data through global memory,
-// so DistGlobal (cursors, completion flags, block.won, per-core DistCore slots)
-// is allocated by the AICPU orchestrator (dist_engine_register) and its address
-// is published via runtime->dist.shared_addr. dist_core_main reads that on
-// entry and stashes it here. `g_self` is a per-core scratch pointer into the
-// GM cores[] slot the local core owns — a plain __gm__ DistCore* is enough,
-// no shared writer (only this core's dist_core_main mutates its own slot).
 [[block_local]] static __gm__ DistGlobal *g_dist_ptr;
 [[block_local]] static __gm__ DistCore *g_self;
 #define g_dist (*g_dist_ptr)
+#elif defined(__CPU_SIM)
+static DistGlobal *g_dist_ptr = nullptr;
+thread_local DistCore *g_self = nullptr;
+#define g_dist (*g_dist_ptr)
 #else
-// sim / AICPU: g_dist is a BSS symbol shared across the worker pthreads (which
-// share one address space, unlike real AICore cores). g_self must be
-// thread_local so each worker pthread sees only its own DistCore*.
 DistGlobal g_dist;
 thread_local DistCore *g_self = nullptr;
 #endif
@@ -1716,17 +1712,13 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
    // reached by orchestration code compiled in other TUs.)
 
 // -----------------------------------------------------------------------------
-// Device-callable API (dist_engine_api.h). Orchestration wrappers in
+// Device-callable API (dist_engine_api.h). CCEC orchestration wrappers in
 // pto_orchestration_api.h call these directly instead of going through
-// rt->ops, so the sim / CCEC paths use the same code (no per-arch indirection).
-// The old ops-table below (g_dist_ops) is kept so aicpu_executor.cpp's
-// dist_engine_register still populates rt->ops for downstream code that reads
-// it, but fdwic orchestration no longer traverses ops entries.
+// rt->ops.
 //
-// Gated to DIST_HOST_ONLY for now — CCEC-side orch is still linked via the
-// dlopen route (transitionally). Once C.4.b/c wires orch cpp into the AICore
-// build, this gate will drop and these symbols become the shared entry points
-// on both sides.
+// Gated to DIST_HOST_ONLY because these wrappers still use host-only helpers
+// for logging/tracing in CPU sim. CCEC orchestration wrappers direct-call the
+// device-safe symbols that are available in AICore builds.
 // -----------------------------------------------------------------------------
 #if DIST_HOST_ONLY
 
@@ -1825,10 +1817,8 @@ PTO_DEVICE_FUNC void dist_set_tensor_data_impl(
 namespace {  // reopen internal namespace for legacy stubs and the ops-table.
 
 // -----------------------------------------------------------------------------
-// Legacy ops-table stubs — host-only (aicpu_executor still populates rt->ops
-// from g_dist_ops so downstream host code that reads it stays wired up; fdwic
-// orchestration itself no longer traverses these entries, it calls the
-// dist_engine_api.h symbols above directly).
+// Ops-table stubs used by CPU-sim AICore orchestration wrappers. CCEC wrappers
+// call dist_engine_api.h directly and do not need this indirection.
 // -----------------------------------------------------------------------------
 #if DIST_HOST_ONLY
 void dist_scope_begin(PTO2Runtime *rt) { dist_scope_begin_impl(rt); }
@@ -2079,16 +2069,15 @@ void dist_dump_state(int) {
 // -----------------------------------------------------------------------------
 // Per-core entry point invoked by each AICore worker thread.
 // -----------------------------------------------------------------------------
-PTO_DEVICE_FUNC void dist_core_main(void *runtime_v, int core_idx, int core_type_int) {
+PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int core_idx, int core_type_int) {
     if (core_idx < 0 || core_idx >= RUNTIME_MAX_WORKER) return;
-    Runtime *runtime = reinterpret_cast<Runtime *>(runtime_v);
 #if defined(__CCE_AICORE__)
     // Wire the per-block pointer to the DistGlobal that dist_engine_register
-    // published in runtime->dist.shared_addr. Every worker in this block will
-    // read `g_dist.*` through this pointer for the rest of the run. On sim
-    // g_dist is a BSS symbol so this branch is skipped (`g_dist` names the
-    // struct directly).
+    // published in runtime->dist.shared_addr.
     g_dist_ptr = reinterpret_cast<__gm__ DistGlobal *>(runtime->dist.shared_addr);
+    if (g_dist_ptr == nullptr) return;
+#elif defined(__CPU_SIM)
+    g_dist_ptr = reinterpret_cast<DistGlobal *>(runtime->dist.shared_addr);
     if (g_dist_ptr == nullptr) return;
 #endif
     __gm__ DistCore *self = &g_dist.cores[core_idx];
@@ -2105,6 +2094,11 @@ PTO_DEVICE_FUNC void dist_core_main(void *runtime_v, int core_idx, int core_type
     DistCore::reset(*self, role, lay.block_id, lay.lane);
     self->core_idx = core_idx;
     g_self = self;
+#if defined(__CPU_SIM) && !defined(__CCE_AICORE__)
+    if (g_dist.rt != nullptr) {
+        g_dist.rt->ops = &g_dist_ops;
+    }
+#endif
 #if DIST_HOST_ONLY
     if (dist_trace())
         fprintf(
@@ -2131,8 +2125,13 @@ PTO_DEVICE_FUNC void dist_core_main(void *runtime_v, int core_idx, int core_type
     // claim/build owned tasks into the private ring (back-pressure inline). MIX
     // anchors deposit follower subtasks into block.won during this replay.
     TRACE_LAP_RESET(self);  // origin for the first lap span (post-barrier, pre-replay)
-    if (g_dist.orch_func != nullptr && g_dist.orch_args != nullptr && !fatal_set()) {
-        g_dist.orch_func(*g_dist.orch_args);
+    if (g_dist.orch_args != nullptr && !fatal_set()) {
+#if defined(__CPU_SIM) && !defined(__CCE_AICORE__)
+        framework_bind_runtime(g_dist.rt);
+#endif
+#if defined(__CPU_SIM)
+        aicpu_orchestration_entry(*g_dist.orch_args);
+#endif
     }
 
     // Publish "my replay is done" so followers can eventually conclude that no
@@ -2169,6 +2168,13 @@ PTO_DEVICE_FUNC void dist_core_main(void *runtime_v, int core_idx, int core_type
     __atomic_add_fetch(&runtime->dist.done_count, 1, __ATOMIC_ACQ_REL);
 }
 
+#if defined(__CPU_SIM)
+extern "C" __attribute__((visibility("default"))) PTO_DEVICE_FUNC void
+aicore_dist_core_main(__gm__ Runtime *runtime, int core_idx, int core_type_int) {
+    dist_core_main(runtime, core_idx, core_type_int);
+}
+#endif
+
 // (No trailing anonymous-namespace close: dist_alloc_tensors / g_dist_ops /
 // dist_dump_state / dist_core_main were pulled out into external linkage above
 // so orch wrappers can reach dist_submit_impl / dist_alloc_tensors directly.)
@@ -2187,9 +2193,7 @@ PTO_DEVICE_FUNC void dist_core_main(void *runtime_v, int core_idx, int core_type
 // leave these symbols to libaicpu_kernel.
 #if DIST_HOST_ONLY
 
-void *dist_engine_register(
-    PTO2Runtime *rt, DistOrchFunc orch_func, const L2TaskArgs *orch_args, int num_workers, Runtime *runtime
-) {
+void *dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_workers, Runtime *runtime) {
     // GM output heap: a BOUNDED ring reclaimed by the completion frontier (M4).
     // Size from PTO_DIST_HEAP_MB (MiB) else kHeapRingDefault. Allocated once per
     // process; if a later run needs a different size, free + realloc.
@@ -2252,7 +2256,6 @@ void *dist_engine_register(
     atom_store(g_dist.fatal, 0, __ATOMIC_RELAXED);
     atom_store<int64_t>(g_dist.replay_done, 0, __ATOMIC_RELAXED);
     atom_store<int64_t>(g_dist.started_count, 0, __ATOMIC_RELAXED);
-    g_dist.orch_func = orch_func;
     g_dist.orch_args = orch_args;
     g_dist.rt = rt;
     g_dist.runtime = runtime;
@@ -2308,7 +2311,6 @@ void *dist_engine_register(
 
     // Publish all of the above before any worker observes Runtime::dist.go.
     atom_thread_fence(__ATOMIC_RELEASE);
-    rt->ops = &g_dist_ops;
     return reinterpret_cast<void *>(&dist_core_main);
 }
 

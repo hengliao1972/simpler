@@ -236,6 +236,7 @@ public:
     // runtime/dist_engine.* and docs/fully_distributed_within_core.md.
     struct DistHandoff {
         volatile uint64_t core_main_fn;  // DistCoreMainFn (in AICPU .so)
+        volatile uint64_t orch_func;
         volatile uint32_t go;            // 1 once engine wired and cores may start
         volatile int32_t num_workers;    // number of AICore workers participating
         volatile int32_t done_count;     // workers atomically increment when done

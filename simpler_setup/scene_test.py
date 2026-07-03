@@ -23,6 +23,7 @@ A scene test class declares three things:
 from __future__ import annotations
 
 import gc
+import hashlib
 import inspect
 import logging
 import os
@@ -37,6 +38,7 @@ from .pto_isa import ensure_pto_isa_root
 logger = logging.getLogger(__name__)
 
 _compile_cache: dict[tuple[str, str, str], object] = {}
+_aicore_override_cache: dict[tuple[str, str, str], Path] = {}
 
 
 def clear_compile_cache() -> None:
@@ -51,7 +53,33 @@ def clear_compile_cache() -> None:
     module is still wired up.
     """
     _compile_cache.clear()
+    _aicore_override_cache.clear()
     gc.collect()
+
+
+def _aicore_extra_cache_key(cache_key, orch_source: Path) -> str:
+    h = hashlib.sha256()
+    h.update(repr(cache_key).encode("utf-8"))
+    h.update(str(orch_source.resolve()).encode("utf-8"))
+    if orch_source.is_file():
+        h.update(orch_source.read_bytes())
+    return h.hexdigest()[:16]
+
+
+def get_aicore_path_override(cache_key) -> Path | None:
+    return _aicore_override_cache.get(cache_key)
+
+
+def maybe_build_aicore_override(cache_key, platform: str, runtime: str, orch_source: str) -> Path | None:
+    if platform != "a5sim" or runtime != "fully_distributed_within_core":
+        return None
+
+    from .runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+    source_path = Path(orch_source).resolve()
+    key = _aicore_extra_cache_key(cache_key, source_path)
+    builder = RuntimeBuilder(platform)
+    return builder.build_aicore_with_extra_sources(runtime, [source_path], key)
 
 
 # ---------------------------------------------------------------------------
@@ -1008,6 +1036,9 @@ def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
         children=kernel_binaries,
         config_name=orch.get("config_name", ""),
     )
+    aicore_override = maybe_build_aicore_override(cache_key, platform, runtime, orch["source"])
+    if aicore_override is not None:
+        _aicore_override_cache[cache_key] = aicore_override
     _compile_cache[cache_key] = chip_callable
     return chip_callable
 
@@ -1097,7 +1128,13 @@ class SceneTestCase:
         """
         from simpler.worker import Worker  # noqa: PLC0415
 
-        w = Worker(level=2, device_id=device_id, platform=platform, runtime=cls._st_runtime)
+        cache_key = (cls.__qualname__, platform, cls._st_runtime)
+        cls.compile_chip_callable(platform)
+        aicore_override = get_aicore_path_override(cache_key)
+        kwargs = {}
+        if aicore_override is not None:
+            kwargs["aicore_path_override"] = aicore_override
+        w = Worker(level=2, device_id=device_id, platform=platform, runtime=cls._st_runtime, **kwargs)
         w.init()
         return w
 

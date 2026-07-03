@@ -1147,15 +1147,16 @@ def st_platform(request):
 
 @pytest.fixture(scope="session")
 def _l2_worker_pool(request, st_platform):
-    """Session-scoped L2 worker pool keyed by (runtime, device_id).
+    """Session-scoped L2 worker pool keyed by runtime/device/runtime image.
 
     Under xdist, each worker process owns one device (slicing done in
     pytest_configure), so this pool typically ends up with one entry per
     runtime. Tests on the same worker that share a runtime reuse the same
-    ``ChipWorker`` — amortizing the init cost (three dlopens + device
-    acquire) over every class on that device.
+    ``ChipWorker`` when they also share the same runtime image. a5sim fdwic
+    uses per-orchestration AICore overrides, so the override path is part of the
+    key to avoid running one test's linked orchestration in another test.
     """
-    pool: dict[tuple[str, int], object] = {}
+    pool: dict[tuple[str, int, str], object] = {}
     yield pool
     # Session teardown: close every Worker we minted.
     for w in pool.values():
@@ -1294,17 +1295,32 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
                 f"507899 cascade (a fresh worker process recovers)."
             )
 
-        # L2 share: reuse any Worker already created for this runtime in the
-        # current process. Under xdist, each worker process is sliced to a
+        from simpler.worker import Worker  # noqa: PLC0415
+
+        kwargs = {}
+        aicore_pool_token = ""
+        if runtime == "fully_distributed_within_core" and st_platform == "a5sim":
+            from simpler_setup.scene_test import get_aicore_path_override  # noqa: PLC0415
+
+            cache_key = (cls.__qualname__, st_platform, runtime)
+            cls.compile_chip_callable(st_platform)
+            aicore_override = get_aicore_path_override(cache_key)
+            if aicore_override is not None:
+                aicore_override = aicore_override.resolve()
+                kwargs["aicore_path_override"] = aicore_override
+                aicore_pool_token = str(aicore_override)
+
+        # L2 share: reuse any Worker already created for this runtime image in
+        # the current process. Under xdist, each worker process is sliced to a
         # single device so there's at most one matching entry. On first call
         # we allocate a device from the pool and immediately release it back —
         # the pool is a process-scoped counter for other fixtures (e.g.
         # st_device_ids) that also draw from it; retaining the id would drain
         # the pool and break any non-st_worker test that runs afterward on the
         # same xdist worker.
-        for (rt, dev_id), existing in _l2_worker_pool.items():
-            if rt == runtime:
-                _register_l2_pool_heal(request, _l2_worker_pool, (rt, dev_id))
+        for (rt, dev_id, token), existing in _l2_worker_pool.items():
+            if rt == runtime and token == aicore_pool_token:
+                _register_l2_pool_heal(request, _l2_worker_pool, (rt, dev_id, token))
                 yield existing
                 return
 
@@ -1313,10 +1329,8 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
             pytest.fail(f"no devices available in --device pool (requested 1, pool has {len(device_pool._available)})")
         dev_id = ids[0]
         device_pool.release(ids)
-        key = (runtime, dev_id)
-        from simpler.worker import Worker  # noqa: PLC0415
-
-        w = Worker(level=2, device_id=dev_id, platform=st_platform, runtime=runtime)
+        key = (runtime, dev_id, aicore_pool_token)
+        w = Worker(level=2, device_id=dev_id, platform=st_platform, runtime=runtime, **kwargs)
         w._st_device_id = dev_id
         # First rebuild after a poison-and-heal lands here. On arches where the
         # device re-inits cleanly this just works; on a5 the op-timeout poison

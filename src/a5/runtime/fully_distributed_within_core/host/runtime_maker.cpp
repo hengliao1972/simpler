@@ -17,7 +17,7 @@
  * init_runtime_impl:
  *   - Converts host tensor pointers to device pointers (all inputs copied H2D;
  *     only OUTPUT/INOUT tensors are copied back D2H)
- *   - Copies orchestration SO to device memory
+ *   - Registers callable-side orchestration metadata
  *   - Sets up runtime state for device orchestration
  *
  * validate_runtime_impl:
@@ -281,7 +281,7 @@ static int32_t read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader *hos
  * lets us run this once per callable_id and amortize across runs.
  *
  * @param runtime   Pointer to pre-constructed Runtime (host_api populated)
- * @param callable  ChipCallable carrying the orch SO + child kernel binaries
+ * @param callable  ChipCallable carrying child kernel binaries
  * @return 0 on success, -1 on failure
  */
 extern "C" int
@@ -309,27 +309,30 @@ prepare_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const 
         }
     }
 
+#if defined(SIMPLER_AICORE_LINKED_ORCH)
+    out->aicore_linked_orch = true;
+    LOG_INFO_V0("AICore-linked orchestration staged; standalone orch SO is not registered");
+#else
     const uint8_t *orch_so_binary = static_cast<const uint8_t *>(callable->binary_data());
     size_t orch_so_size = callable->binary_size();
-
     if (orch_so_binary == nullptr || orch_so_size == 0) {
         LOG_ERROR("Orchestration SO binary is required for device orchestration");
         return -1;
     }
-
     out->orch_so_data = orch_so_binary;
     out->orch_so_size = orch_so_size;
     out->func_name = callable->func_name();
     out->config_name = callable->config_name();
     LOG_INFO_V0("Orchestration SO: %zu bytes staged (host-only)", orch_so_size);
+#endif
     return 0;
 }
 
 /**
  * Per-run binding: build device-side argument storage (tensor copy-out, GM
  * heap, PTO2 shared memory) and publish it to the runtime. Assumes the
- * callable-side state (kernel binaries, orch SO bytes, func/config names)
- * is already populated by prepare_callable_impl.
+ * callable-side state (kernel binaries and orchestration entry metadata) is
+ * already populated by prepare_callable_impl.
  *
  * Splitting this from prepare_callable_impl matches the per-callable_id
  * design: register/run_prepared invokes this every call, while the prep
@@ -512,12 +515,11 @@ extern "C" int bind_callable_to_runtime_impl(
     // -------------------------------------------------------------------------
     // Build the prebuilt runtime-arena image on host.
     //
-    // We pre-compute every byte the AICPU's runtime arena would otherwise have
-    // to write at boot: layout offsets, sub-structure init data, and pointers
-    // back to the SM / GM heap. Then we rtMemcpy the image into the pooled
-    // runtime-arena region that DeviceRunner keeps alive across runs. AICPU
-    // boot becomes attach + wire (cheap pointer fixup) + sm_handle->init (SM
-    // reset) + a handful of device-only field fixups.
+    // We pre-compute the runtime header and legacy arena image on host, then
+    // rtMemcpy it into the pooled runtime-arena region that DeviceRunner keeps
+    // alive across runs. The direct distributed AICPU setup path only reads the
+    // PTO2Runtime header; it no longer attaches/wires the full arena or resets
+    // the central SM.
     // -------------------------------------------------------------------------
     PTO2Runtime *rt =
         runtime_init_data_from_layout(host_arena, layout, PTO2_MODE_EXECUTE, sm_ptr, sm_size, gm_heap, eff_heap_sizes);
@@ -527,11 +529,9 @@ extern "C" int bind_callable_to_runtime_impl(
     }
     runtime_wire_arena_pointers(host_arena, layout, rt);
 
-    // Stash the layout inside the PTO2Runtime image so the AICPU can recover
-    // every arena-internal offset after rtMemcpy. The runtime arena's device
-    // base does NOT travel in this image — it's on the host Runtime
-    // (set_prebuilt_arena below), since the AICPU needs that pointer
-    // *before* it can dereference the image.
+    // Keep the layout in the PTO2Runtime image for compatibility with the
+    // prebuilt image format. The direct distributed AICPU setup path only uses
+    // set_prebuilt_arena below to locate the PTO2Runtime header.
     rt->prebuilt_layout = layout;
 
     int rc_upload = runtime->host_api.copy_to_device(runtime_arena_dev, host_arena.base(), layout.arena_size);

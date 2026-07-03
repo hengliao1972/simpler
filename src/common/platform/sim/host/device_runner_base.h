@@ -89,6 +89,10 @@ public:
         int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
         const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
+    int register_callable_aicore_orch(
+        int32_t callable_id, std::vector<std::pair<int, uint64_t>> kernel_addrs,
+        std::vector<ArgDirection> signature
+    );
     int register_callable_host_orch(
         int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
         std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
@@ -153,7 +157,6 @@ protected:
     // owned for the rest of the runner's lifetime.
     std::vector<uint8_t> aicpu_so_binary_;
     std::vector<uint8_t> aicore_kernel_binary_;
-
     MemoryAllocator mem_alloc_;
 
     // Three independent per-Worker arenas, each backing a single pooled
@@ -210,6 +213,8 @@ protected:
         size_t dev_orch_so_size{0};
         std::string func_name;
         std::string config_name;
+        // fdwic a5sim path
+        bool aicore_linked_orch{false};
         // common
         std::vector<std::pair<int, uint64_t>> kernel_addrs;
         std::vector<ArgDirection> signature;

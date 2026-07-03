@@ -17,17 +17,15 @@
  * example, under examples/.../kernels/orchestration/) drives that engine
  * through the
  * inline wrappers in pto_orchestration_api.h. Those wrappers used to route
- * through rt->ops (a cross-library function-pointer table populated by
- * dist_engine_register), which required the orchestration .so to be dlopen'd
- * from the AICPU stub — a host-only mechanism that has no analogue on-core.
+ * through rt->ops (a cross-library function-pointer table), which tied the
+ * orchestration path to runtime symbol binding instead of normal linking.
  *
  * This header exposes the same set of engine operations as direct symbols that
  * the wrappers can call at compile time. Since orchestration is compiled into
  * the same translation-unit family as dist_engine on device (aicore_kernel.o),
  * a direct call resolves at link time and needs no runtime function-pointer
- * indirection. In sim the same code path is used — orchestration lives inside
- * libaicore_kernel.so, or (transitionally) still dlopen'd but bound to these
- * symbols at load time.
+ * indirection. In sim, per-example orchestration is compiled into
+ * libaicore_kernel.so and reaches these symbols from the AICore image.
  *
  * PTO_DEVICE_FUNC expands to `__aicore__` under CCEC and to nothing on host /
  * sim / AICPU builds, so a single declaration serves both worlds.

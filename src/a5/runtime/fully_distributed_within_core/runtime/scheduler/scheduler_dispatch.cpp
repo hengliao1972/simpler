@@ -498,11 +498,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     );
 
     // One-time init: assign perf buffers (one thread does it; others wait).
-    // l2_swimlane_aicpu_init / l2_swimlane_aicpu_init_phase already ran eagerly in
-    // SchedulerContext::init() so the orchestrator thread can read the
-    // promoted g_l2_swimlane_level before caching it on rt->orchestrator. Only
-    // dump_tensor / pmu init remain dispatch-time because they depend on
-    // handshake-derived core IDs / counts.
+    // l2_swimlane_aicpu_init / l2_swimlane_aicpu_init_phase already ran eagerly
+    // in SchedulerContext::init(). Only dump_tensor / pmu init remain
+    // dispatch-time because they depend on handshake-derived core IDs / counts.
     if (!init_claimed_.exchange(true, std::memory_order_acq_rel)) {
         LOG_INFO_V0("Thread %d: doing one-time init", thread_idx);
 

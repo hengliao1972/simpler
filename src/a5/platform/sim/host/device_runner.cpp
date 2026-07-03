@@ -129,7 +129,6 @@ int DeviceRunner::ensure_binaries_loaded() {
         std::remove(aicore_so_path_.c_str());
         aicore_so_path_.clear();
     }
-
     if (!aicore_kernel_binary_.empty()) {
         if (!simpler::common::sim_host::create_temp_so_file(
                 "/tmp/aicore_sim_XXXXXX", aicore_kernel_binary_.data(), aicore_kernel_binary_.size(), &aicore_so_path_
@@ -188,7 +187,6 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         LOG_ERROR("ensure_device_initialized failed: %d", rc);
         return rc;
     }
-
     if (device_wall_dev_ptr_ == nullptr) {
         device_wall_dev_ptr_ = allocate_tensor(sizeof(uint64_t));
         if (device_wall_dev_ptr_ != nullptr) {

@@ -50,7 +50,6 @@ Runtime::Runtime() {
     // Initialize device orchestration state
     gm_sm_ptr_ = nullptr;
     gm_heap_ptr_ = nullptr;
-    slot_states_ptr_ = nullptr;
     orch_args_storage_.clear();
     prebuilt_arena_base_ = nullptr;
     prebuilt_runtime_offset_ = 0;
@@ -89,7 +88,6 @@ void *Runtime::get_gm_heap_ptr() const { return gm_heap_ptr_; }
 const ChipStorageTaskArgs &Runtime::get_orch_args() const { return orch_args_storage_; }
 void Runtime::set_gm_sm_ptr(void *p) { gm_sm_ptr_ = p; }
 void Runtime::set_gm_heap(void *p) { gm_heap_ptr_ = p; }
-void Runtime::set_slot_states_ptr(void *p) { slot_states_ptr_ = p; }
 void Runtime::set_orch_args(const ChipStorageTaskArgs &args) { orch_args_storage_ = args; }
 
 void Runtime::set_prebuilt_arena(void *arena_base, size_t runtime_off) {
@@ -99,8 +97,7 @@ void Runtime::set_prebuilt_arena(void *arena_base, size_t runtime_off) {
 void *Runtime::get_prebuilt_arena_base() const { return prebuilt_arena_base_; }
 size_t Runtime::get_prebuilt_runtime_offset() const { return prebuilt_runtime_offset_; }
 
-// Device orchestration SO metadata (bytes live in a separate device buffer
-// owned by DeviceRunner; only the address/size travels in Runtime).
+// Legacy device orchestration SO metadata retained for the common callable ABI.
 void Runtime::set_dev_orch_so(uint64_t dev_addr, uint64_t size) {
     dev_orch_so_addr_ = dev_addr;
     dev_orch_so_size_ = size;

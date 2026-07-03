@@ -872,14 +872,10 @@ int32_t SchedulerContext::init(
 
 #if PTO2_PROFILING
     // l2_swimlane_aicpu_init promotes g_l2_swimlane_level from the shared-memory
-    // header — must be called BEFORE the orchestrator thread caches the level
-    // via rt->orchestrator.l2_swimlane_level = get_l2_swimlane_level() in
-    // AicpuExecutor::run(). Otherwise the cached value would still be DISABLED
-    // (only the binary enable bit has been seeded by kernel.cpp at this point),
-    // and the CYCLE_COUNT_START() gate in pto_orchestrator.cpp would suppress
-    // all ORCH_PHASES records. Reset the cached level on disabled runs so a
-    // prior enabled launch's level can't leak into the phase-record gates in
-    // scheduler_dispatch (`>= SCHED_PHASES`).
+    // header before any scheduler/orchestration lifecycle code consults it.
+    // Reset the cached level on disabled runs so a prior enabled launch's level
+    // can't leak into the phase-record gates in scheduler_dispatch
+    // (`>= SCHED_PHASES`).
     if (is_l2_swimlane_enabled()) {
         l2_swimlane_aicpu_init(runtime->worker_count);
         l2_swimlane_level_ = get_l2_swimlane_level();
