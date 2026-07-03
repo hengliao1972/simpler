@@ -159,6 +159,22 @@ PTO_DEVICE_FUNC inline TaskOutputTensors alloc_tensors(const TensorCreateInfo cr
     return alloc_tensors(args);
 }
 
+template <typename... CIs>
+PTO_DEVICE_FUNC inline TaskOutputTensors alloc_tensors(const CIs &...cis) {
+    static_assert(sizeof...(cis) > 0, "alloc_tensors requires at least one TensorCreateInfo");
+    if (dist_is_fatal_query()) return TaskOutputTensors{};
+    L0TaskArgs args;
+    (args.add_output(cis), ...);
+    if (args.has_error) {
+        dist_report_fatal_msg(
+            PTO2_ERROR_INVALID_ARGS, __FUNCTION__,
+            args.error_msg ? args.error_msg : "alloc_tensors failed to construct output-only Arg"
+        );
+        return TaskOutputTensors{};
+    }
+    return alloc_tensors(args);
+}
+
 PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_task(const MixedKernels &mixed_kernels, const L0TaskArgs &args) {
     if (dist_is_fatal_query()) return TaskOutputTensors{};
     return dist_submit_impl(nullptr, mixed_kernels, args);

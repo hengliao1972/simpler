@@ -122,6 +122,12 @@
 #define DIST_ERRF(...) ((void)0)
 #endif
 
+#if defined(__CCE_AICORE__)
+#define DIST_API_ATTR __attribute__((weak))
+#else
+#define DIST_API_ATTR
+#endif
+
 #include "callable.h"
 #include "common/core_type.h"
 #include "intrinsic.h"
@@ -174,6 +180,10 @@ extern "C" void framework_bind_runtime(PTO2Runtime *rt);
 // AtomicLoadAdd s32". Every field that participates in atom_fetch_add is
 // therefore int64_t, not int32_t.
 // -----------------------------------------------------------------------------
+#if DIST_HOST_ONLY
+void dist_dump_state(int);  // defined below; dumps full engine state for hangs
+#endif
+
 namespace {
 
 template <typename T>
@@ -1001,10 +1011,6 @@ inline bool dist_trace() {
 PTO_DEVICE_FUNC inline bool fatal_set() { return atom_load(g_dist.fatal, __ATOMIC_ACQUIRE) != 0; }
 PTO_DEVICE_FUNC inline void set_fatal() { atom_store(g_dist.fatal, 1, __ATOMIC_RELEASE); }
 
-#if DIST_HOST_ONLY
-void dist_dump_state(int);  // defined below; dumps full engine state for hangs
-#endif
-
 // Env-gated stall watchdog (set PTO_DIST_WATCHDOG=<seconds>, default off). Called
 // from inside the engine's spin loops on a worker thread (so fprintf is safe,
 // unlike a signal handler). On the first call it records a start time; if a loop
@@ -1355,6 +1361,11 @@ PTO_DEVICE_FUNC void drain_block_won(__gm__ DistCore *self) {
 // ring; losers return with map + outputs updated so downstream get_ref() and
 // fan-in resolution stay consistent across cores.
 // -----------------------------------------------------------------------------
+}  // namespace
+
+#if defined(__CCE_AICORE__)
+namespace {
+#endif
 PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &args) {
     __gm__ DistCore *self = g_self;
     if (self == nullptr) return TaskOutputTensors{};
@@ -1707,51 +1718,64 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
     TRACE_LAP(self, N, -1, TracePhase::Commit);
     return result;
 }
-
-}  // namespace (close internal ns so external-linkage API wrappers below can be
-   // reached by orchestration code compiled in other TUs.)
+#if defined(__CCE_AICORE__)
+}  // namespace
+#endif
 
 // -----------------------------------------------------------------------------
 // Device-callable API (dist_engine_api.h). CCEC orchestration wrappers in
 // pto_orchestration_api.h call these directly instead of going through
-// rt->ops.
-//
-// Gated to DIST_HOST_ONLY because these wrappers still use host-only helpers
-// for logging/tracing in CPU sim. CCEC orchestration wrappers direct-call the
-// device-safe symbols that are available in AICore builds.
+// rt->ops. Host/sim definitions below are functional; CCEC definitions are
+// link-stage placeholders until the GM atomic replay path is enabled.
 // -----------------------------------------------------------------------------
-#if DIST_HOST_ONLY
 
 // Fatal-state query / report — no va_list version so this is safe to compile
 // under CCEC when the gate lifts.
-PTO_DEVICE_FUNC bool dist_is_fatal_query() { return fatal_set(); }
+DIST_API_ATTR PTO_DEVICE_FUNC bool dist_is_fatal_query() {
+#if defined(__CCE_AICORE__)
+    return false;
+#else
+    return fatal_set();
+#endif
+}
 
-PTO_DEVICE_FUNC void dist_report_fatal_msg(int32_t code, const char *func, const char *msg) {
+DIST_API_ATTR PTO_DEVICE_FUNC void dist_report_fatal_msg(
+    int32_t code, __gm__ const char *func, __gm__ const char *msg
+) {
+#if DIST_HOST_ONLY
     set_fatal();
     fprintf(stderr, "[dist_engine][FATAL][%s] code=%d: %s\n", func ? func : "?", code, msg ? msg : "");
+#else
+    (void)code;
+    (void)func;
+    (void)msg;
+#endif
 }
 
 // Log sinks — const-string message API (no va_list).
-PTO_DEVICE_FUNC void dist_log_error_msg(const char *func, const char *msg) {
+DIST_API_ATTR PTO_DEVICE_FUNC void dist_log_error_msg(__gm__ const char *func, __gm__ const char *msg) {
+#if DIST_HOST_ONLY
     fprintf(stderr, "[dist_engine][E][%s] %s\n", func ? func : "?", msg ? msg : "");
+#else
+    (void)func;
+    (void)msg;
+#endif
 }
-PTO_DEVICE_FUNC void dist_log_warn_msg(const char *, const char *) {}
-PTO_DEVICE_FUNC void dist_log_debug_msg(const char *, const char *) {}
-PTO_DEVICE_FUNC void dist_log_info_v_msg(const char *, int, const char *) {}
+DIST_API_ATTR PTO_DEVICE_FUNC void dist_log_warn_msg(__gm__ const char *, __gm__ const char *) {}
+DIST_API_ATTR PTO_DEVICE_FUNC void dist_log_debug_msg(__gm__ const char *, __gm__ const char *) {}
+DIST_API_ATTR PTO_DEVICE_FUNC void dist_log_info_v_msg(__gm__ const char *, int, __gm__ const char *) {}
 
 // Scope guard hooks — no-op in the distributed engine (per-core replay does not
 // need scope batching).
-PTO_DEVICE_FUNC void dist_scope_begin_impl(PTO2Runtime *) {}
-PTO_DEVICE_FUNC void dist_scope_end_impl(PTO2Runtime *) {}
-PTO_DEVICE_FUNC void dist_orchestration_done_impl(PTO2Runtime *) {}
-PTO_DEVICE_FUNC void dist_scope_set_site_impl(const char *, int) {}
+DIST_API_ATTR PTO_DEVICE_FUNC void dist_scope_begin_impl(PTO2Runtime *) {}
+DIST_API_ATTR PTO_DEVICE_FUNC void dist_scope_end_impl(PTO2Runtime *) {}
+DIST_API_ATTR PTO_DEVICE_FUNC void dist_orchestration_done_impl(PTO2Runtime *) {}
+DIST_API_ATTR PTO_DEVICE_FUNC void dist_scope_set_site_impl(const char *, int) {}
 
 // Dependency-only task — currently unused by fdwic examples, kept as no-op.
-PTO_DEVICE_FUNC TaskOutputTensors dist_submit_dummy_impl(PTO2Runtime *, const L0TaskArgs &) {
+DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_dummy_impl(PTO2Runtime *, const L0TaskArgs &) {
     return TaskOutputTensors{};
 }
-
-#endif  // DIST_HOST_ONLY
 
 namespace {  // reopen internal namespace for wait_producer_ready only
 
@@ -1786,35 +1810,61 @@ PTO_DEVICE_FUNC void wait_producer_ready(DistCore *self, const Tensor &t) {
 
 }  // namespace
 
-#if DIST_HOST_ONLY
-PTO_DEVICE_FUNC uint64_t dist_get_tensor_data_impl(
+DIST_API_ATTR PTO_DEVICE_FUNC uint64_t dist_get_tensor_data_impl(
     PTO2Runtime *, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]
 ) {
     if (tensor.buffer.addr == 0) return 0;
+#if DIST_HOST_ONLY
     // Sim/AICPU: g_self is a plain thread_local DistCore*. Reachable to
     // wait_producer_ready as a non-__gm__ pointer.
     DistCore *self = g_self;
     if (self != nullptr) wait_producer_ready(self, tensor);
+#endif
     const uint64_t flat = tensor.compute_flat_offset(indices, ndims);
     const uint64_t esz = get_element_size(tensor.dtype);
     uint64_t result = 0;
+#if DIST_HOST_ONLY
     __builtin_memcpy(&result, reinterpret_cast<const void *>(tensor.buffer.addr + flat * esz), esz);
+#else
+    const uint64_t addr = tensor.buffer.addr + flat * esz;
+    if (esz == 1) {
+        result = *reinterpret_cast<__gm__ const uint8_t *>(addr);
+    } else if (esz == 2) {
+        result = *reinterpret_cast<__gm__ const uint16_t *>(addr);
+    } else if (esz == 4) {
+        result = *reinterpret_cast<__gm__ const uint32_t *>(addr);
+    } else {
+        result = *reinterpret_cast<__gm__ const uint64_t *>(addr);
+    }
+#endif
     return result;
 }
 
-PTO_DEVICE_FUNC void dist_set_tensor_data_impl(
+DIST_API_ATTR PTO_DEVICE_FUNC void dist_set_tensor_data_impl(
     PTO2Runtime *, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
 ) {
     if (tensor.buffer.addr == 0) return;
+#if DIST_HOST_ONLY
     DistCore *self = g_self;
     if (self != nullptr) wait_producer_ready(self, tensor);
+#endif
     const uint64_t flat = tensor.compute_flat_offset(indices, ndims);
     const uint64_t esz = get_element_size(tensor.dtype);
+#if DIST_HOST_ONLY
     __builtin_memcpy(reinterpret_cast<void *>(tensor.buffer.addr + flat * esz), &value, esz);
+#else
+    const uint64_t addr = tensor.buffer.addr + flat * esz;
+    if (esz == 1) {
+        *reinterpret_cast<__gm__ uint8_t *>(addr) = static_cast<uint8_t>(value);
+    } else if (esz == 2) {
+        *reinterpret_cast<__gm__ uint16_t *>(addr) = static_cast<uint16_t>(value);
+    } else if (esz == 4) {
+        *reinterpret_cast<__gm__ uint32_t *>(addr) = static_cast<uint32_t>(value);
+    } else {
+        *reinterpret_cast<__gm__ uint64_t *>(addr) = value;
+    }
+#endif
 }
-#endif  // DIST_HOST_ONLY
-
-namespace {  // reopen internal namespace for legacy stubs and the ops-table.
 
 // -----------------------------------------------------------------------------
 // Ops-table stubs used by CPU-sim AICore orchestration wrappers. CCEC wrappers
@@ -1861,6 +1911,11 @@ void dist_set_tensor_data(
 }
 #endif  // DIST_HOST_ONLY
 
+#if defined(__CCE_AICORE__)
+DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &, const L0TaskArgs &) {
+    return TaskOutputTensors{};
+}
+#else
 // alloc_tensors — a kernel-less "hidden task" that only reserves GM output
 // buffers (no compute). It consumes one task id, allocates its outputs on the
 // deterministic heap exactly like dist_submit_impl step (a), registers itself as
@@ -1868,7 +1923,7 @@ void dist_set_tensor_data(
 // kernel runs. A later writer (INOUT / OUTPUT_EXISTING) becomes the new producer
 // of the region, so real consumers depend on the writer, not on this alloc. Every
 // core replays it identically, keeping heap addresses + maps consistent.
-PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
+DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
     __gm__ DistCore *self = g_self;
     if (self == nullptr) return TaskOutputTensors{};
     // EXECUTE-FIRST (docs §6 step 0+1, §6.1): every submit point first seeks an
@@ -1992,6 +2047,13 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0Task
     TRACE_LAP(self, N, -1, TracePhase::Alloc);
     return result;
 }
+#endif
+
+#if defined(__CCE_AICORE__)
+DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &) {
+    return TaskOutputTensors{};
+}
+#endif
 
 #if DIST_HOST_ONLY
 const PTO2RuntimeOps g_dist_ops = {
@@ -2069,14 +2131,20 @@ void dist_dump_state(int) {
 // -----------------------------------------------------------------------------
 // Per-core entry point invoked by each AICore worker thread.
 // -----------------------------------------------------------------------------
-PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int core_idx, int core_type_int) {
-    if (core_idx < 0 || core_idx >= RUNTIME_MAX_WORKER) return;
+DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int core_idx, int core_type_int) {
 #if defined(__CCE_AICORE__)
-    // Wire the per-block pointer to the DistGlobal that dist_engine_register
-    // published in runtime->dist.shared_addr.
-    g_dist_ptr = reinterpret_cast<__gm__ DistGlobal *>(runtime->dist.shared_addr);
-    if (g_dist_ptr == nullptr) return;
-#elif defined(__CPU_SIM)
+    // CCEC onboard currently links orchestration into the AICore image but does
+    // not replay it yet. Publish completion so the existing AICPU shutdown path
+    // can still observe a finished core-main call during build/smoke probes.
+    (void)core_idx;
+    (void)core_type_int;
+    if (runtime != nullptr) {
+        runtime->dist.done_count = runtime->dist.done_count + 1;
+    }
+    return;
+#else
+    if (core_idx < 0 || core_idx >= RUNTIME_MAX_WORKER) return;
+#if defined(__CPU_SIM)
     g_dist_ptr = reinterpret_cast<DistGlobal *>(runtime->dist.shared_addr);
     if (g_dist_ptr == nullptr) return;
 #endif
@@ -2166,6 +2234,7 @@ PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int core_idx, int c
 #endif
     g_self = nullptr;
     __atomic_add_fetch(&runtime->dist.done_count, 1, __ATOMIC_ACQ_REL);
+#endif
 }
 
 #if defined(__CPU_SIM)
@@ -2178,11 +2247,6 @@ aicore_dist_core_main(__gm__ Runtime *runtime, int core_idx, int core_type_int) 
 // (No trailing anonymous-namespace close: dist_alloc_tensors / g_dist_ops /
 // dist_dump_state / dist_core_main were pulled out into external linkage above
 // so orch wrappers can reach dist_submit_impl / dist_alloc_tensors directly.)
-
-}  // namespace (close anonymous ns holding legacy stubs, g_dist_ops,
-   // dist_alloc_tensors, dist_dump_state, dist_core_main. The engine's
-   // external entry points dist_engine_register / dist_engine_dump_trace
-   // follow below.)
 
 // dist_engine_register / dist_engine_dump_trace are host-side entry points
 // called from libaicpu_kernel (sim orchestrator thread) and — in the current
