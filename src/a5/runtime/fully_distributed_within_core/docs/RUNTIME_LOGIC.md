@@ -17,12 +17,13 @@ Core elements (see the spec):
 - Deterministic, per-core-replicated GM output heap with frontier-based
   reclamation.
 
-## Current state (re-based on tensormap_and_ringbuffer)
+## Current state
 
-This runtime is re-based on `tensormap_and_ringbuffer` to reuse its
+This runtime still reuses shared orchestration-facing types such as
 `PTO2TensorMap`, `MixedKernels`/`ActiveMask`, `L0TaskArgs`, the
 `pto_orchestration_api.h` submit API, and kernel-address resolution. The
-distributed model is layered on incrementally:
+central AICPU orchestrator/scheduler implementation is no longer linked into
+this runtime; execution is driven by the distributed engine:
 
 - `runtime/` — adds global claim cursors, a global completion-flag ring, a
   deterministic GM output heap, and per-core replicated TensorMap + private task
@@ -34,6 +35,6 @@ distributed model is layered on incrementally:
   cores).
 - `orchestration/` — the PTO2 orchestration API (unchanged surface).
 
-The legacy AICPU orchestrator/scheduler sources inherited from
-`tensormap_and_ringbuffer` (`runtime/scheduler/`, the orchestrator pipeline) are
-progressively replaced or bypassed by the distributed path.
+The old `runtime/scheduler/`, `pto_orchestrator.*`, `pto_ring_buffer.*`, and
+`pto_shared_memory.*` files were removed from this runtime. Equivalent legacy
+coverage remains in `tensormap_and_ringbuffer`.

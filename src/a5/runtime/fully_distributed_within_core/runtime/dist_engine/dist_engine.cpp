@@ -281,8 +281,6 @@ PTO_DEVICE_FUNC inline T atom_fetch_sub(__gm__ volatile T &p, T d, int mo) {
 
 }  // namespace
 
-namespace {
-
 // -----------------------------------------------------------------------------
 // Tunables. The completion-flag ring is sized to hold an entire run without
 // wrap (>= total tasks); the GM output heap is a BOUNDED RING reclaimed by the
@@ -895,13 +893,21 @@ struct DistGlobal {
 [[block_local]] static __gm__ Runtime::DistHandoff::SubmitCoreState *g_submit_core;
 #define g_dist (*g_dist_ptr)
 #elif defined(__CPU_SIM)
+static DistGlobal g_dist_fallback;
 static DistGlobal *g_dist_ptr = nullptr;
 thread_local DistCore *g_self = nullptr;
 #define g_dist (*g_dist_ptr)
 #else
-DistGlobal g_dist;
+static DistGlobal g_dist_fallback;
+static DistGlobal *g_dist_ptr = &g_dist_fallback;
 thread_local DistCore *g_self = nullptr;
+#define g_dist (*g_dist_ptr)
 #endif
+
+static_assert(sizeof(DistGlobal) <= kDistEngineGlobalStateSize, "DistGlobal exceeds the reserved runtime arena size");
+static_assert(alignof(DistGlobal) <= kDistEngineGlobalStateAlign, "DistGlobal exceeds the reserved runtime arena align");
+
+namespace {
 
 #if DIST_SIM_HOST_CLOCK
 // Orchestration/scheduling overhead isolation (set PTO_DIST_SKIP_EXEC=1). When
@@ -2597,30 +2603,14 @@ aicore_dist_core_main(__gm__ Runtime *runtime, int core_idx, int core_type_int) 
 #if DIST_HOST_ONLY
 
 void *dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_workers, Runtime *runtime) {
-    // GM output heap: a BOUNDED ring reclaimed by the completion frontier (M4).
-    // Size from PTO_DIST_HEAP_MB (MiB) else kHeapRingDefault. Allocated once per
-    // process; if a later run needs a different size, free + realloc.
-    {
-        size_t want = kHeapRingDefault;
-        if (const char *e = getenv("PTO_DIST_HEAP_MB")) {
-            const long mb = atol(e);
-            if (mb > 0) want = static_cast<size_t>(mb) << 20;
-        }
-        if (g_dist.heap_base != nullptr && g_dist.heap_size != want) {
-            free(g_dist.heap_base);
-            g_dist.heap_base = nullptr;
-        }
-        if (g_dist.heap_base == nullptr) {
-            g_dist.heap_base = static_cast<uint8_t *>(malloc(want));
-            g_dist.heap_size = (g_dist.heap_base != nullptr) ? want : 0;
-        }
-        // Zero the heap each run so freshly-allocated output regions read as 0,
-        // matching the centralized runtime's zero-initialized GM. Kernels that
-        // read a padded tile (e.g. softmax/PV where valid_len < tile width) rely
-        // on the unwritten remainder being zero; an uninitialized (malloc) or
-        // recycled heap would otherwise yield nondeterministic results.
-        if (g_dist.heap_base != nullptr) memset(g_dist.heap_base, 0, g_dist.heap_size);
+    if (rt == nullptr || rt->dist_global == nullptr || rt->gm_heap == nullptr || rt->gm_heap_size == 0) {
+        DIST_ERRF("[dist_engine] missing host-allocated runtime state\n");
+        if (runtime != nullptr) runtime->dist.shared_addr = 0;
+        return nullptr;
     }
+    g_dist_ptr = reinterpret_cast<DistGlobal *>(rt->dist_global);
+    g_dist.heap_base = static_cast<uint8_t *>(rt->gm_heap);
+    g_dist.heap_size = rt->gm_heap_size;
     // Dependency-span bound H (R = F - H). Env override for graphs with longer
     // heap spans; default kHDefault.
     g_dist.H = kHDefault;
@@ -2717,7 +2707,7 @@ void *dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num
     // their g_dist_ptr at dist_core_main entry. In sim the host BSS `g_dist`
     // is shared across every worker pthread, so its own address is what all
     // AICore workers see; onboard will replace this with a real GM allocation.
-    runtime->dist.shared_addr = reinterpret_cast<uint64_t>(&g_dist);
+    runtime->dist.shared_addr = reinterpret_cast<uint64_t>(g_dist_ptr);
 
     // Publish all of the above before AICPU wakes workers through their
     // per-core handshake flags.

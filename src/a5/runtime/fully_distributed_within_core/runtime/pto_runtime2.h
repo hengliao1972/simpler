@@ -20,11 +20,7 @@
 #include "utils/device_arena.h"
 #include "pto_runtime2_types.h"
 #include "pto_submit_types.h"
-#include "pto_shared_memory.h"
-#include "pto_ring_buffer.h"
 #include "pto_tensormap.h"
-#include "scheduler/pto_scheduler.h"
-#include "pto_orchestrator.h"
 #include "aicore_completion_mailbox.h"
 
 // =============================================================================
@@ -78,23 +74,13 @@ struct PTO2RuntimeOps {
 };
 
 /**
- * Layout descriptor for the prebuilt runtime arena. Holds all sub-region
- * offsets (orchestrator / scheduler / sm_handle wrapper / runtime header /
- * AICore mailbox) plus the layout-defining capacities. Produced once on the
- * host by runtime_reserve_layout(); consumed by runtime_init_data_from_layout
- * and runtime_wire_arena_pointers.
+ * Layout descriptor for the prebuilt dist-engine runtime arena. Holds the
+ * runtime header and the distributed engine's global state. Produced once on
+ * the host by runtime_reserve_layout(); consumed by runtime_init_data_from_layout.
  */
 struct PTO2RuntimeArenaLayout {
-    size_t off_sm_handle{0};
-    PTO2OrchestratorLayout orch;
-    PTO2SchedulerLayout sched;
+    size_t off_dist_global{0};
     size_t off_runtime{0};
-    size_t off_mailbox{0};
-
-    // Cached parameters (re-used by init_data + wire stages).
-    uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]{};
-    uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]{};
-    int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH]{};
 
     // Total arena byte size post-commit. Used by host to size the prebuilt
     // image buffer and as the rtMemcpy length.
@@ -104,8 +90,8 @@ struct PTO2RuntimeArenaLayout {
 /**
  * PTO Runtime2 context
  *
- * Contains all state for orchestration and scheduling.
- * In simulated mode, runs in single process with shared address space.
+ * Contains the direct distributed runtime header shared between host, AICPU,
+ * and AICore replay.
  */
 struct PTO2Runtime {
     // Ops table (first field — used by orchestration .so via function pointers)
@@ -113,10 +99,7 @@ struct PTO2Runtime {
     PTO2ScopeMode pending_scope_mode;
 
     // Components
-    PTO2SharedMemoryHandle *sm_handle;
-    PTO2OrchestratorState orchestrator;
-    PTO2SchedulerState scheduler;
-    AICoreCompletionMailbox *aicore_mailbox;
+    void *dist_global;
 
     // GM Heap for output buffers
     void *gm_heap;
@@ -141,19 +124,12 @@ struct PTO2Runtime {
 // =============================================================================
 
 /**
- * Phase 1 — declare every sub-region (sm_handle wrapper, orchestrator /
- * scheduler / tensor_map / mailbox / PTO2Runtime header) on the supplied
- * arena. Pure arithmetic; does not touch device memory and may run on host.
- * Returns the layout descriptor; caller commits/attaches the arena before
- * Phase 2/3.
+ * Phase 1 — declare the dist-engine runtime header and global-state regions on
+ * the supplied arena. Pure arithmetic; does not touch device memory and may run
+ * on host. Returns the layout descriptor; caller commits/attaches the arena
+ * before Phase 2/3.
  */
-PTO2RuntimeArenaLayout runtime_reserve_layout(
-    DeviceArena &arena, uint64_t task_window_size, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
-);
-PTO2RuntimeArenaLayout runtime_reserve_layout(
-    DeviceArena &arena, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH],
-    const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH], const int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH]
-);
+PTO2RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena);
 
 /**
  * Phase 2 — write the data half of the runtime arena: standalone fields,
@@ -161,29 +137,16 @@ PTO2RuntimeArenaLayout runtime_reserve_layout(
  * pointers. The arena must already be committed (or attached); writes go
  * into arena.base() + sub-region offsets.
  *
- * `sm_dev_base` / `gm_heap_dev_base` are device addresses; we only store
- * them (never dereference). Safe to run on a host arena that owns a host
- * mirror of the runtime image — the resulting buffer is rtMemcpy-ready.
+ * `gm_heap_dev_base` is a device address; we only store it (never dereference).
+ * Safe to run on a host arena that owns a host mirror of the runtime image —
+ * the resulting buffer is rtMemcpy-ready.
  *
  * Returns the PTO2Runtime* that sits at layout.off_runtime within the arena.
- * Caller must follow up with runtime_wire_arena_pointers.
  */
 PTO2Runtime *runtime_init_data_from_layout(
-    DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode, void *sm_dev_base, uint64_t sm_size,
-    void *gm_heap_dev_base, uint64_t heap_size
+    DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode, void *gm_heap_dev_base,
+    uint64_t heap_size
 );
-PTO2Runtime *runtime_init_data_from_layout(
-    DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode, void *sm_dev_base, uint64_t sm_size,
-    void *gm_heap_dev_base, const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
-);
-
-/**
- * Phase 3 — wire every arena-internal pointer field (rt->sm_handle,
- * rt->aicore_mailbox, orchestrator.{scope_tasks, scope_begins, scheduler,
- * tensor_map.*, rings[].fanin_pool.base}, scheduler.{ready_queues, dep_pool,
- * wiring.queue}) so each holds arena.base() + offset.
- */
-void runtime_wire_arena_pointers(DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2Runtime *rt);
 
 /**
  * Destroy runtime sub-structures without releasing the arena buffer.

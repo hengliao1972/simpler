@@ -66,9 +66,8 @@ enum class PTO2ResourceShape : uint8_t {
     DUMMY = 3,  // Dependency-only (no AICore dispatch)
 };
 
-// Number of *dispatchable* resource shapes (AIC, AIV, MIX). DUMMY does not
-// allocate a per-shape ready_queue entry / local buffer — it lives in a
-// dedicated queue inside PTO2SchedulerState.
+// Number of *dispatchable* resource shapes (AIC, AIV, MIX). DUMMY remains a
+// dependency-only shape and does not allocate AICore execution resources.
 inline constexpr int32_t PTO2_NUM_RESOURCE_SHAPES = 3;
 
 /**

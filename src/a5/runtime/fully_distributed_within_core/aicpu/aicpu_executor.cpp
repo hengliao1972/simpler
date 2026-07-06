@@ -30,8 +30,13 @@
 #include "aicpu/platform_regs.h"
 #include "common/platform_config.h"
 
-// Scheduler context class
-#include "scheduler/scheduler_context.h"
+#if defined(__aarch64__)
+#define AICPU_STORE_BARRIER() __asm__ volatile("dmb ishst" ::: "memory")
+#elif defined(__x86_64__)
+#define AICPU_STORE_BARRIER() __asm__ volatile("" ::: "memory")
+#else
+#define AICPU_STORE_BARRIER() std::atomic_thread_fence(std::memory_order_release)
+#endif
 
 static PTO2Runtime *rt{nullptr};
 
@@ -53,15 +58,16 @@ struct AicpuExecutor {
     std::atomic<bool> runtime_done_{false};
 
     // ===== Core lifecycle context =====
-    // Still named SchedulerContext because it also owns legacy dispatch code,
-    // but this executor only uses its handshake, core counting, and shutdown
-    // responsibilities.
-    SchedulerContext sched_ctx_;
+    PTO2DispatchPayload payload_per_core_[RUNTIME_MAX_WORKER][2];
+    uint64_t core_reg_addrs_[RUNTIME_MAX_WORKER]{};
+    int32_t core_count_{0};
 
     // ===== Methods =====
     int32_t init(Runtime *runtime);
     int32_t run(Runtime *runtime);
     void deinit(Runtime *runtime);
+    int32_t handshake_all_cores(Runtime *runtime);
+    int32_t shutdown_cores(int32_t thread_idx);
 
     ~AicpuExecutor() = default;
 };
@@ -91,13 +97,13 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     if (aicpu_thread_num_ == 0) aicpu_thread_num_ = 1;
     sched_thread_num_ = aicpu_thread_num_ - 1;
 
-    if (aicpu_thread_num_ < 1 || aicpu_thread_num_ > MAX_AICPU_THREADS) {
+    if (aicpu_thread_num_ < 1 || aicpu_thread_num_ > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR("Invalid aicpu_thread_num: %d", aicpu_thread_num_);
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
 
-    if (sched_ctx_.init(runtime, aicpu_thread_num_, sched_thread_num_, false, get_platform_regs()) != 0) {
+    if (handshake_all_cores(runtime) != 0) {
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
@@ -108,6 +114,97 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     init_done_.store(true, std::memory_order_release);
     LOG_INFO_V0("AicpuExecutor: Init complete");
     return 0;
+}
+
+int32_t AicpuExecutor::handshake_all_cores(Runtime *runtime) {
+    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->workers);
+    core_count_ = runtime->worker_count;
+
+    if (core_count_ <= 0 || core_count_ > RUNTIME_MAX_WORKER) {
+        LOG_ERROR("Invalid worker_count %d (expected 1-%d)", core_count_, RUNTIME_MAX_WORKER);
+        return -1;
+    }
+
+    uint64_t *regs = reinterpret_cast<uint64_t *>(get_platform_regs());
+    if (regs == nullptr) {
+        LOG_ERROR("platform regs unavailable during handshake");
+        return -1;
+    }
+    const uint32_t max_physical_cores_count = platform_get_physical_cores_count();
+
+    LOG_INFO_V0("Handshaking with %d cores", core_count_);
+    for (int32_t i = 0; i < core_count_; i++) {
+        all_handshakes[i].task = reinterpret_cast<uint64_t>(&payload_per_core_[i][0]);
+        AICPU_STORE_BARRIER();
+        all_handshakes[i].aicpu_ready = AICPU_READY_HANDSHAKE;
+    }
+    AICPU_STORE_BARRIER();
+
+    bool failed = false;
+    for (int32_t i = 0; i < core_count_; i++) {
+        Handshake *hank = &all_handshakes[i];
+
+        while (hank->aicore_regs_ready == 0) {
+            SPIN_WAIT_HINT();
+        }
+
+        const uint32_t physical_core_id = hank->physical_core_id;
+        if (physical_core_id >= max_physical_cores_count) {
+            LOG_ERROR(
+                "Core %d reported invalid physical_core_id=%u (platform max=%u)", i, physical_core_id,
+                max_physical_cores_count
+            );
+            failed = true;
+            continue;
+        }
+
+        const uint64_t reg_addr = regs[physical_core_id];
+        platform_init_aicore_regs(reg_addr);
+        core_reg_addrs_[i] = reg_addr;
+        AICPU_STORE_BARRIER();
+        hank->aicpu_regs_ready = 1;
+        AICPU_STORE_BARRIER();
+
+        while (hank->aicore_done == 0) {
+            SPIN_WAIT_HINT();
+        }
+
+        LOG_INFO_V0(
+            "Core %d: %s, physical_id=%u, reg_addr=0x%lx", i,
+            hank->core_type == CoreType::AIC ? "AIC" : "AIV", physical_core_id, reg_addr
+        );
+    }
+
+    if (failed) {
+        for (int32_t i = 0; i < core_count_; i++) {
+            if (core_reg_addrs_[i] != 0) {
+                platform_deinit_aicore_regs(core_reg_addrs_[i]);
+            }
+        }
+        return -1;
+    }
+    return 0;
+}
+
+int32_t AicpuExecutor::shutdown_cores(int32_t thread_idx) {
+    if (thread_idx != 0) return 0;
+
+    LOG_INFO_V0("Thread %d: Shutting down %d cores", thread_idx, core_count_);
+    int32_t rc = 0;
+    for (int32_t i = 0; i < core_count_; i++) {
+        if (core_reg_addrs_[i] == 0) {
+            LOG_ERROR("Thread %d: Core %d has invalid register address", thread_idx, i);
+            rc = -1;
+            continue;
+        }
+        if (platform_deinit_aicore_regs(core_reg_addrs_[i]) != 0) {
+            LOG_ERROR("Thread %d: Core %d deinit timed out", thread_idx, i);
+            rc = -1;
+        }
+        core_reg_addrs_[i] = 0;
+    }
+    LOG_INFO_V0("Thread %d: Shutdown complete", thread_idx);
+    return rc;
 }
 
 /**
@@ -264,7 +361,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     // Shutdown is gated by runtime_done_: AICores only enter the EXIT wait
     // after completing the distributed replay, so sending EXIT earlier would
     // either race execution or time out while workers are still inside Phase 4.
-    int32_t shutdown_rc = sched_ctx_.shutdown(thread_idx);
+    int32_t shutdown_rc = shutdown_cores(thread_idx);
     if (shutdown_rc != 0 && run_rc == 0) {
         run_rc = shutdown_rc;
     }
@@ -287,14 +384,12 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     //    bypasses this cache. Invalidating now ensures next round reads from HBM.
     cache_invalidate_range(runtime, sizeof(Runtime));
 
-    // Reset all SchedulerContext-owned state in one place.
-    sched_ctx_.deinit();
-
     finished_count_.store(0, std::memory_order_release);
     runtime_done_.store(false, std::memory_order_release);
 
     aicpu_thread_num_ = 0;
     sched_thread_num_ = 0;
+    core_count_ = 0;
 
     // Clear file-scope PTO2Runtime pointer (freed by orchestrator thread before deinit)
     rt = nullptr;
