@@ -288,6 +288,12 @@ public:
         struct alignas(64) CcecMapPool {
             CcecMapEntry entries[8];
         };
+        struct alignas(64) SubmitCoreState {
+            uint64_t heap_next;
+            int32_t outpool_head;
+            int32_t map_count;
+            int32_t pad[11];
+        };
 
         volatile uint64_t core_main_fn;  // DistCoreMainFn (in AICPU .so)
         // Address of the DistGlobal struct that carries engine state (cursors,
@@ -305,6 +311,7 @@ public:
         uint64_t ccec_orch_scalars[CHIP_MAX_SCALAR_ARGS];
         volatile int32_t ccec_orch_tensor_count;
         volatile int32_t ccec_orch_scalar_count;
+        SubmitCoreState submit_cores[RUNTIME_MAX_WORKER];
         KernelTensorArgs ccec_kernel_tensors[RUNTIME_MAX_WORKER];
         CcecTensorPool ccec_output_tensors[RUNTIME_MAX_WORKER];
         CcecMapPool ccec_maps[RUNTIME_MAX_WORKER];
