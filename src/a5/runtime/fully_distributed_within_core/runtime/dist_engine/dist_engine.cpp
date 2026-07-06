@@ -152,6 +152,17 @@ extern "C" void framework_bind_runtime(PTO2Runtime *rt);
 #endif
 
 #if defined(__CCE_AICORE__)
+extern "C" __attribute__((weak)) PTO_DEVICE_FUNC void *memcpy(void *dst, const void *src, unsigned long n) {
+    uint8_t *d = reinterpret_cast<uint8_t *>(dst);
+    const uint8_t *s = reinterpret_cast<const uint8_t *>(src);
+    for (unsigned long i = 0; i < n; i++) {
+        d[i] = s[i];
+    }
+    return dst;
+}
+#endif
+
+#if defined(__CCE_AICORE__)
 // AICore has no scheduler to yield to; a spin hint here would be meaningless.
 // Provide a local no-op so we don't have to depend on the AICPU spin_hint.h
 // header being reachable from the AICore include path.
@@ -911,6 +922,10 @@ struct DistGlobal {
 [[block_local]] static int32_t g_ccec_aiv_count;
 [[block_local]] static int32_t g_ccec_ordinal;
 [[block_local]] static bool g_ccec_valid_worker;
+[[block_local]] static int32_t g_ccec_local_index;
+[[block_local]] static uint64_t g_ccec_heap_next;
+[[block_local]] static int32_t g_ccec_outpool_head;
+[[block_local]] static int32_t g_ccec_map_count;
 #define g_dist (*g_dist_ptr)
 #elif defined(__CPU_SIM)
 static DistGlobal *g_dist_ptr = nullptr;
@@ -1944,6 +1959,139 @@ PTO_DEVICE_FUNC void ccec_flush_region(__gm__ void *ptr, uint64_t bytes) {
     }
 }
 
+PTO_DEVICE_FUNC uint64_t ccec_tensor_bytes(const Tensor &t) {
+    uint64_t elems = 1;
+    for (uint32_t i = 0; i < t.ndims; i++) {
+        elems *= t.shapes[i];
+    }
+    return elems * get_element_size(t.dtype);
+}
+
+PTO_DEVICE_FUNC int32_t ccec_lookup_producer(const Tensor &t) {
+    if (g_ccec_runtime == nullptr || g_ccec_core_idx < 0 || g_ccec_core_idx >= RUNTIME_MAX_WORKER) return -1;
+    const uint64_t addr = t.buffer.addr + t.start_offset * get_element_size(t.dtype);
+    const uint64_t size = ccec_tensor_bytes(t);
+    __gm__ Runtime::DistHandoff::CcecMapEntry *entries =
+        g_ccec_runtime->dist.ccec_maps[g_ccec_core_idx].entries;
+    for (int32_t i = g_ccec_map_count - 1; i >= 0; i--) {
+        __gm__ const Runtime::DistHandoff::CcecMapEntry &entry = entries[i];
+        if (entry.addr == addr && entry.size == size) return entry.task_id;
+    }
+    return -1;
+}
+
+PTO_DEVICE_FUNC void ccec_insert_producer(const Tensor &t, int32_t task_id) {
+    if (g_ccec_runtime == nullptr || g_ccec_core_idx < 0 || g_ccec_core_idx >= RUNTIME_MAX_WORKER) return;
+    const uint64_t addr = t.buffer.addr + t.start_offset * get_element_size(t.dtype);
+    const uint64_t size = ccec_tensor_bytes(t);
+    __gm__ Runtime::DistHandoff::CcecMapEntry *entries =
+        g_ccec_runtime->dist.ccec_maps[g_ccec_core_idx].entries;
+    for (int32_t i = g_ccec_map_count - 1; i >= 0; i--) {
+        __gm__ Runtime::DistHandoff::CcecMapEntry &entry = entries[i];
+        if (entry.addr == addr && entry.size == size) {
+            entry.task_id = task_id;
+            ccec_flush_region(&entry, sizeof(entry));
+            return;
+        }
+    }
+    if (g_ccec_map_count < 8) {
+        __gm__ Runtime::DistHandoff::CcecMapEntry &entry = entries[g_ccec_map_count++];
+        entry.addr = addr;
+        entry.size = size;
+        entry.task_id = task_id;
+        entry.pad = 0;
+        ccec_flush_region(&entry, sizeof(entry));
+    }
+}
+
+PTO_DEVICE_FUNC void ccec_publish_flag(int32_t task_id) {
+    if (g_ccec_runtime == nullptr || task_id < 0 || task_id >= 2048) return;
+    g_ccec_runtime->dist.ccec_flags[task_id] = 1;
+    ccec_flush_region(const_cast<__gm__ int64_t *>(&g_ccec_runtime->dist.ccec_flags[task_id]), 64);
+}
+
+PTO_DEVICE_FUNC void ccec_wait_flag(int32_t task_id) {
+    if (g_ccec_runtime == nullptr || task_id < 0 || task_id >= 2048) return;
+    while (true) {
+        ccec_invalidate_region(const_cast<__gm__ int64_t *>(&g_ccec_runtime->dist.ccec_flags[task_id]), 64);
+        if (g_ccec_runtime->dist.ccec_flags[task_id] != 0) return;
+        SPIN_WAIT_HINT();
+    }
+}
+
+PTO_DEVICE_FUNC void ccec_wait_fanin(const int32_t fanin[], int32_t count) {
+    for (int32_t i = 0; i < count; i++) {
+        ccec_wait_flag(fanin[i]);
+    }
+}
+
+PTO_DEVICE_FUNC TaskOutputTensors ccec_materialize_outputs(const L0TaskArgs &args) {
+    TaskOutputTensors result;
+    if (g_ccec_runtime == nullptr || g_ccec_core_idx < 0 || g_ccec_core_idx >= RUNTIME_MAX_WORKER) return result;
+    const uint64_t heap_base = g_ccec_runtime->dist.ccec_heap_base;
+    const uint64_t heap_size = g_ccec_runtime->dist.ccec_heap_size;
+    if (heap_base == 0 || heap_size == 0) return result;
+
+    uint64_t total = 0;
+    for (int32_t i = 0; i < args.tensor_count(); i++) {
+        if (args.tag(i) != TensorArgType::OUTPUT) continue;
+        total += PTO2_ALIGN_UP(TensorCreateInfo::buffer_size_bytes(args.tensor(i).create_info()), PTO2_PACKED_OUTPUT_ALIGN);
+    }
+    uint64_t task_base = PTO2_ALIGN_UP(g_ccec_heap_next, PTO2_PACKED_OUTPUT_ALIGN);
+    if (total > 0 && (task_base % heap_size) + total > heap_size) {
+        task_base = ((task_base / heap_size) + 1) * heap_size;
+    }
+
+    uint64_t off = 0;
+    for (int32_t i = 0; i < args.tensor_count(); i++) {
+        if (args.tag(i) != TensorArgType::OUTPUT) continue;
+        const TensorCreateInfo &ci = args.tensor(i).create_info();
+        const uint64_t logical = TensorCreateInfo::buffer_size_bytes(ci);
+        const uint64_t sz = PTO2_ALIGN_UP(logical, PTO2_PACKED_OUTPUT_ALIGN);
+        const uint64_t phys = (task_base + off) % heap_size;
+        __gm__ Tensor &slot_t =
+            g_ccec_runtime->dist.ccec_output_tensors[g_ccec_core_idx].tensors[g_ccec_outpool_head];
+        g_ccec_outpool_head = (g_ccec_outpool_head + 1) % 8;
+        init_tensor_from_create_info(slot_t, ci, reinterpret_cast<void *>(heap_base + phys), logical);
+        ccec_flush_region(&slot_t, sizeof(Tensor));
+        result.materialize_output(slot_t);
+        off += sz;
+    }
+    g_ccec_heap_next = task_base + off;
+    return result;
+}
+
+PTO_DEVICE_FUNC void ccec_register_outputs(const L0TaskArgs &args, const TaskOutputTensors &result, int32_t task_id) {
+    uint32_t out_idx = 0;
+    for (int32_t i = 0; i < args.tensor_count(); i++) {
+        const TensorArgType tag = args.tag(i);
+        if (tag == TensorArgType::OUTPUT) {
+            Tensor t;
+            Tensor::copy(t, result.get_ref(out_idx));
+            ccec_insert_producer(t, task_id);
+            out_idx++;
+        } else if (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING) {
+            ccec_insert_producer(args.tensor(i).ref(), task_id);
+        }
+    }
+}
+
+PTO_DEVICE_FUNC int32_t ccec_kernel_id_for_winner(const MixedKernels &mixed, int32_t task_id) {
+    const bool has_aic = mixed.aic_kernel_id != INVALID_KERNEL_ID;
+    const bool has_aiv = mixed.aiv0_kernel_id != INVALID_KERNEL_ID || mixed.aiv1_kernel_id != INVALID_KERNEL_ID;
+    if (has_aic && !has_aiv) {
+        if (g_ccec_core_type != static_cast<int32_t>(CoreType::AIC)) return INVALID_KERNEL_ID;
+        if (g_ccec_aic_count <= 0 || g_ccec_ordinal != task_id % g_ccec_aic_count) return INVALID_KERNEL_ID;
+        return mixed.aic_kernel_id;
+    }
+    if (!has_aic && has_aiv) {
+        if (g_ccec_core_type != static_cast<int32_t>(CoreType::AIV)) return INVALID_KERNEL_ID;
+        if (g_ccec_aiv_count <= 0 || g_ccec_ordinal != task_id % g_ccec_aiv_count) return INVALID_KERNEL_ID;
+        return mixed.aiv0_kernel_id != INVALID_KERNEL_ID ? mixed.aiv0_kernel_id : mixed.aiv1_kernel_id;
+    }
+    return INVALID_KERNEL_ID;
+}
+
 PTO_DEVICE_FUNC void ccec_init_worker_layout() {
     if (g_ccec_runtime == nullptr) return;
     const int32_t num_workers = g_ccec_runtime->dist.num_workers;
@@ -2022,19 +2170,50 @@ PTO_DEVICE_FUNC void ccec_replay_orch(__gm__ Runtime *runtime) {
 DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(
     PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &args
 ) {
-    const int32_t kernel_id = ccec_current_kernel_id(mixed);
-    if (kernel_id == INVALID_KERNEL_ID) return TaskOutputTensors{};
+    const int32_t task_id = g_ccec_local_index++;
+    TaskOutputTensors result = ccec_materialize_outputs(args);
+
+    int32_t fanin[kMaxFanin];
+    int32_t fc = 0;
+    for (int32_t i = 0; i < args.tensor_count(); i++) {
+        const TensorArgType tag = args.tag(i);
+        if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
+        const int32_t producer = ccec_lookup_producer(args.tensor(i).ref());
+        if (producer < 0) continue;
+        bool dup = false;
+        for (int32_t k = 0; k < fc; k++) {
+            if (fanin[k] == producer) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup && fc < kMaxFanin) fanin[fc++] = producer;
+    }
+    ccec_register_outputs(args, result, task_id);
+
+    const int32_t kernel_id = ccec_kernel_id_for_winner(mixed, task_id);
+    if (kernel_id == INVALID_KERNEL_ID) return result;
     const bool is_aic = g_ccec_core_type == static_cast<int32_t>(CoreType::AIC);
 
     __gm__ PTO2DispatchPayload *payload =
         reinterpret_cast<__gm__ PTO2DispatchPayload *>(g_ccec_runtime->workers[g_ccec_core_idx].task);
-    if (payload == nullptr) return TaskOutputTensors{};
+    if (payload == nullptr) return result;
+
+    ccec_wait_fanin(fanin, fc);
 
     int32_t argc = 0;
+    uint32_t out_idx = 0;
     for (int32_t i = 0; i < args.tensor_count() && argc < PTO2_DISPATCH_MAX_ARGS; i++) {
-        const Tensor &tensor = args.tensor(i).ref();
         __gm__ Tensor &dst = g_ccec_runtime->dist.ccec_kernel_tensors[g_ccec_core_idx].tensors[i];
-        Tensor::copy(dst, tensor);
+        if (args.tag(i) == TensorArgType::OUTPUT) {
+            Tensor tensor;
+            Tensor::copy(tensor, result.get_ref(out_idx));
+            Tensor::copy(dst, tensor);
+            out_idx++;
+        } else {
+            const Tensor &tensor = args.tensor(i).ref();
+            Tensor::copy(dst, tensor);
+        }
         ccec_flush_region(&dst, sizeof(Tensor));
         payload->args[argc++] = reinterpret_cast<uint64_t>(&dst);
     }
@@ -2051,7 +2230,8 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(
         pto_call_linked_kernel_aiv(kernel_id, reinterpret_cast<__gm__ int64_t *>(payload->args));
     }
     OUT_OF_ORDER_STORE_BARRIER();
-    return TaskOutputTensors{};
+    ccec_publish_flag(task_id);
+    return result;
 }
 #else
 // alloc_tensors — a kernel-less "hidden task" that only reserves GM output
@@ -2188,8 +2368,16 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
 #endif
 
 #if defined(__CCE_AICORE__)
-DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &) {
-    return TaskOutputTensors{};
+DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
+    const int32_t task_id = g_ccec_local_index++;
+    TaskOutputTensors result = ccec_materialize_outputs(args);
+    ccec_register_outputs(args, result, task_id);
+    if (g_ccec_core_idx == 0) {
+        ccec_publish_flag(task_id);
+    } else {
+        ccec_wait_flag(task_id);
+    }
+    return result;
 }
 #endif
 
@@ -2278,6 +2466,10 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
     g_ccec_core_type = core_type_int;
     g_ccec_aic_submit_index = 0;
     g_ccec_aiv_submit_index = 0;
+    g_ccec_local_index = 0;
+    g_ccec_heap_next = 0;
+    g_ccec_outpool_head = 0;
+    g_ccec_map_count = 0;
     ccec_init_worker_layout();
 
     ccec_replay_orch(runtime);
@@ -2466,6 +2658,13 @@ void *dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num
     g_dist.orch_args = orch_args;
     g_dist.rt = rt;
     g_dist.runtime = runtime;
+    if (runtime != nullptr) {
+        runtime->dist.ccec_heap_base = rt != nullptr ? reinterpret_cast<uint64_t>(rt->gm_heap) : 0;
+        runtime->dist.ccec_heap_size = rt != nullptr ? rt->gm_heap_size : 0;
+        for (int32_t i = 0; i < 2048; i++) {
+            atom_store<int64_t>(runtime->dist.ccec_flags[i], 0, __ATOMIC_RELAXED);
+        }
+    }
 
     // Derive the physical-block topology (1 AIC + 2 AIV per block) the same way
     // the centralized scheduler discovers clusters: AIC/AIV cores in worker-index

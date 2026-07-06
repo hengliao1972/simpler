@@ -276,6 +276,18 @@ public:
         struct alignas(64) KernelTensorArgs {
             Tensor tensors[MAX_TENSOR_ARGS];
         };
+        struct alignas(64) CcecTensorPool {
+            Tensor tensors[8];
+        };
+        struct CcecMapEntry {
+            uint64_t addr;
+            uint64_t size;
+            int32_t task_id;
+            int32_t pad;
+        };
+        struct alignas(64) CcecMapPool {
+            CcecMapEntry entries[8];
+        };
 
         volatile uint64_t core_main_fn;  // DistCoreMainFn (in AICPU .so)
         // Address of the DistGlobal struct that carries engine state (cursors,
@@ -294,6 +306,11 @@ public:
         volatile int32_t ccec_orch_tensor_count;
         volatile int32_t ccec_orch_scalar_count;
         KernelTensorArgs ccec_kernel_tensors[RUNTIME_MAX_WORKER];
+        CcecTensorPool ccec_output_tensors[RUNTIME_MAX_WORKER];
+        CcecMapPool ccec_maps[RUNTIME_MAX_WORKER];
+        volatile uint64_t ccec_heap_base;
+        volatile uint64_t ccec_heap_size;
+        alignas(64) volatile int64_t ccec_flags[2048];
         alignas(64) volatile int64_t done_count;  // AICPU-owned progress mirror.
     } dist;
 
