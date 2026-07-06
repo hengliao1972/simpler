@@ -23,7 +23,7 @@ __attribute__((visibility("default"), weak)) PTO2OrchestrationConfig aicpu_orche
 ) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
-        .expected_arg_count = 4,
+        .expected_arg_count = 5,
     };
 }
 
@@ -34,6 +34,7 @@ __attribute__((visibility("default"), weak)) PTO_DEVICE_FUNC void aicpu_orchestr
     const Tensor &output = orch_args.tensor(1).ref();
     uint64_t n = orch_args.scalar(0);
     uint64_t delta = orch_args.scalar(1);
+    uint64_t mixed = orch_args.scalar(2);
 
     for (uint64_t i = 0; i < n; i++) {
         L0TaskArgs args;
@@ -42,7 +43,12 @@ __attribute__((visibility("default"), weak)) PTO_DEVICE_FUNC void aicpu_orchestr
         args.add_scalar(n);
         args.add_scalar(delta);
         args.add_scalar(i);
-        if (i % 3 == 0) {
+        if (mixed != 0) {
+            MixedKernels mk;
+            mk.aic_kernel_id = FUNC_MARK_AIC;
+            mk.aiv0_kernel_id = FUNC_MARK_AIV;
+            rt_submit_task(mk, args);
+        } else if (i % 3 == 0) {
             rt_submit_aic_task(FUNC_MARK_AIC, args);
         } else {
             rt_submit_aiv_task(FUNC_MARK_AIV, args);

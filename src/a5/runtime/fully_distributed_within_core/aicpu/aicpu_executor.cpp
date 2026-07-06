@@ -304,6 +304,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 runtime->dist.core_main_fn = reinterpret_cast<uint64_t>(core_main);
                 runtime->dist.num_workers = num_workers;
                 __atomic_store_n(&runtime->dist.done_count, 0, __ATOMIC_RELEASE);
+                cache_flush_range(rt->dist_global, dist_engine_global_state_size());
                 cache_flush_range(&runtime->dist, sizeof(runtime->dist));
                 cache_flush_range(const_cast<const uint64_t *>(&runtime->dist.core_main_fn), sizeof(uint64_t));
                 cache_flush_range(const_cast<const int32_t *>(&runtime->dist.num_workers), sizeof(int32_t));

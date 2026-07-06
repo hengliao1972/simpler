@@ -49,53 +49,66 @@ class TestSimpleOrchSmoke(SceneTestCase):
             "name": "A5SimBd1Delta7",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 1},
-            "params": {"n": 3, "delta": 7},
+            "params": {"n": 3, "delta": 7, "mixed": 0},
         },
         {
             "name": "A5OnboardBd1Delta7",
             "manual": True,
             "platforms": ["a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 1},
-            "params": {"n": 3, "delta": 7},
+            "params": {"n": 3, "delta": 7, "mixed": 0},
         },
         {
             "name": "A5SimBd36Delta5",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
-            "params": {"n": 3, "delta": 5},
+            "params": {"n": 3, "delta": 5, "mixed": 0},
         },
         {
             "name": "A5OnboardBd36Delta5",
             "manual": True,
             "platforms": ["a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
-            "params": {"n": 3, "delta": 5},
+            "params": {"n": 3, "delta": 5, "mixed": 0},
         },
         {
             "name": "A5SimBd36Delta11",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
-            "params": {"n": 3, "delta": 11},
+            "params": {"n": 3, "delta": 11, "mixed": 0},
         },
         {
             "name": "A5OnboardBd36Delta11",
             "manual": True,
             "platforms": ["a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
-            "params": {"n": 3, "delta": 11},
+            "params": {"n": 3, "delta": 11, "mixed": 0},
+        },
+        {
+            "name": "A5SimBd36MixedDelta17",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 3, "delta": 17, "mixed": 1},
+        },
+        {
+            "name": "A5OnboardBd36MixedDelta17",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 3, "delta": 17, "mixed": 1},
         },
         {
             "name": "A5SimBd36ManyTasks",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
-            "params": {"n": 144, "delta": 13},
+            "params": {"n": 144, "delta": 13, "mixed": 0},
         },
         {
             "name": "A5OnboardBd36ManyTasks",
             "manual": True,
             "platforms": ["a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
-            "params": {"n": 144, "delta": 13},
+            "params": {"n": 144, "delta": 13, "mixed": 0},
         },
     ]
 
@@ -104,11 +117,13 @@ class TestSimpleOrchSmoke(SceneTestCase):
         delta = int(params["delta"])
         x = torch.arange(n, dtype=torch.float32)
         y = torch.full((n * 16,), -1.0, dtype=torch.float32)
+        mixed = int(params.get("mixed", 0))
         return TaskArgsBuilder(
             Tensor("input", x),
             Tensor("output", y),
             Scalar("n", n),
             Scalar("delta", delta),
+            Scalar("mixed", mixed),
         )
 
     def compute_golden(self, args, params):

@@ -817,20 +817,26 @@ constexpr int32_t kCursorShards = 4;
 constexpr size_t kCacheLine = 64;
 
 struct alignas(kCacheLine) PaddedCursor {
-    volatile int32_t v;
-    uint8_t pad[kCacheLine - sizeof(int32_t)];
+    volatile int64_t v;
+    uint8_t pad[kCacheLine - sizeof(int64_t)];
 };
 
+struct alignas(kCacheLine) DistTaskCell {
+    volatile int64_t flag;
+    volatile uint64_t vend;
+    uint8_t pad[kCacheLine - sizeof(int64_t) - sizeof(uint64_t)];
+};
+static_assert(sizeof(DistTaskCell) == kCacheLine);
+
 // -----------------------------------------------------------------------------
-// Global engine state (shared by all worker threads in this process). Cursors +
-// flags live here rather than in GM because in sim every core is a host thread
-// in one address space; the GM output heap below is a real shared buffer.
+// Global engine state (shared by all worker threads in this process). Each task
+// cell owns a cache line because CCEC cache writeback is cacheline-granular; two
+// independent completion flags must never share one line.
 // -----------------------------------------------------------------------------
 struct DistGlobal {
     PaddedCursor cube_cursor[kCursorShards];    // highest claimed AIC-anchored id, per shard
     PaddedCursor vector_cursor[kCursorShards];  // highest claimed AIV-only id, per shard
     PaddedCursor alloc_cursor[kCursorShards];   // highest claimed kernel-less alloc id, per shard
-    volatile uint8_t flags[kFlagCap];           // completion-flag ring (1 == task done)
 
     // M4 reclamation (§9.5/§11.4). `frontier` (F) is the global continuous
     // completion frontier — the largest prefix s.t. every task id <= F is done;
@@ -840,7 +846,7 @@ struct DistGlobal {
     // every core), so any core can compute the live byte window [vend[R], top).
     volatile int32_t frontier;
     int32_t H;
-    volatile uint64_t vend[kFlagCap];
+    DistTaskCell tasks[kFlagCap];
 
     uint8_t *heap_base;
     size_t heap_size;  // == bounded ring size
@@ -894,7 +900,6 @@ struct DistGlobal {
 [[block_local]] static int32_t g_ccec_aiv_count;
 [[block_local]] static int32_t g_ccec_ordinal;
 [[block_local]] static bool g_ccec_valid_worker;
-[[block_local]] static int32_t g_ccec_local_index;
 [[block_local]] static __gm__ Runtime::DistHandoff::SubmitCoreState *g_submit_core;
 #define g_dist (*g_dist_ptr)
 #elif defined(__CPU_SIM)
@@ -913,6 +918,11 @@ static_assert(sizeof(DistGlobal) <= kDistEngineGlobalStateSize, "DistGlobal exce
 static_assert(alignof(DistGlobal) <= kDistEngineGlobalStateAlign, "DistGlobal exceeds the reserved runtime arena align");
 
 namespace {
+
+#if defined(__CCE_AICORE__)
+PTO_DEVICE_FUNC void ccec_invalidate_region(__gm__ const void *ptr, uint64_t bytes);
+PTO_DEVICE_FUNC void ccec_flush_region(__gm__ void *ptr, uint64_t bytes);
+#endif
 
 #if DIST_SIM_HOST_CLOCK
 // Orchestration/scheduling overhead isolation (set PTO_DIST_SKIP_EXEC=1). When
@@ -1074,12 +1084,73 @@ PTO_DEVICE_FUNC inline void watchdog([[maybe_unused]] uint64_t &start_ns) {
 // cursor to N. No hardware fetch_max on the target, so this is the equivalent
 // acq-rel CAS retry. Monotonic: each task id is claimed by exactly one core and
 // no id is skipped within a cursor's subsequence.
-PTO_DEVICE_FUNC bool claim(__gm__ volatile int32_t &cursor, int32_t N) {
-    int32_t c = atom_load(cursor, __ATOMIC_ACQUIRE);
+PTO_DEVICE_FUNC bool claim(__gm__ volatile int64_t &cursor, int32_t N) {
+#if defined(__CCE_AICORE__)
+    __gm__ int64_t *addr = const_cast<__gm__ int64_t *>(&cursor);
+    const int64_t old = atomicMax(addr, static_cast<int64_t>(N));
+    return N > old;
+#else
+    int64_t c = atom_load(cursor, __ATOMIC_ACQUIRE);
     while (true) {
         if (N <= c) return false;
-        if (atom_cas_weak(cursor, c, N, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return true;
+        if (atom_cas_weak(cursor, c, static_cast<int64_t>(N), __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return true;
     }
+#endif
+}
+
+PTO_DEVICE_FUNC inline __gm__ DistTaskCell &task_cell(int32_t task_id) {
+    return g_dist.tasks[task_id & (kFlagCap - 1)];
+}
+
+PTO_DEVICE_FUNC void publish_task_flag(int32_t task_id) {
+    if (task_id < 0 || task_id >= kFlagCap) return;
+    __gm__ DistTaskCell &cell = task_cell(task_id);
+#if defined(__CCE_AICORE__)
+    cell.flag = 1;
+    ccec_flush_region(&cell, sizeof(DistTaskCell));
+#else
+    atom_store(cell.flag, 1, __ATOMIC_RELEASE);
+#endif
+}
+
+PTO_DEVICE_FUNC bool task_flag_ready(int32_t task_id, int memorder) {
+    if (task_id < 0 || task_id >= kFlagCap) return false;
+    __gm__ DistTaskCell &cell = task_cell(task_id);
+#if defined(__CCE_AICORE__)
+    (void)memorder;
+    ccec_invalidate_region(&cell, sizeof(DistTaskCell));
+    return cell.flag != 0;
+#else
+    return atom_load(cell.flag, memorder) != 0;
+#endif
+}
+
+PTO_DEVICE_FUNC void store_task_vend(int32_t task_id, uint64_t vend) {
+    if (task_id < 0 || task_id >= kFlagCap) return;
+    __gm__ DistTaskCell &cell = task_cell(task_id);
+#if defined(__CCE_AICORE__)
+    cell.vend = vend;
+    ccec_flush_region(&cell, sizeof(DistTaskCell));
+#else
+    atom_store(cell.vend, vend, __ATOMIC_RELAXED);
+#endif
+}
+
+PTO_DEVICE_FUNC uint64_t load_task_vend(int32_t task_id) {
+    if (task_id < 0) return 0;
+    __gm__ DistTaskCell &cell = task_cell(task_id);
+#if defined(__CCE_AICORE__)
+    ccec_invalidate_region(&cell, sizeof(DistTaskCell));
+    return cell.vend;
+#else
+    return atom_load(cell.vend, __ATOMIC_RELAXED);
+#endif
+}
+
+PTO_DEVICE_FUNC void reset_task_cell(int32_t task_id) {
+    __gm__ DistTaskCell &cell = task_cell(task_id);
+    atom_store(cell.flag, 0, __ATOMIC_RELAXED);
+    atom_store(cell.vend, 0, __ATOMIC_RELAXED);
 }
 
 // Cooperatively advance the global completion frontier F (§11.4): after any core
@@ -1091,7 +1162,7 @@ PTO_DEVICE_FUNC void advance_frontier() {
     while (true) {
         const int32_t next = f + 1;
         if (next >= kFlagCap) break;
-        if (atom_load(g_dist.flags[next & (kFlagCap - 1)], __ATOMIC_ACQUIRE) == 0) break;
+        if (!task_flag_ready(next, __ATOMIC_ACQUIRE)) break;
         if (atom_cas_weak(g_dist.frontier, f, next, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
             f = next;
         }
@@ -1182,12 +1253,12 @@ PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] __gm__ DistCore *self, __gm__
         // then frees the block.won entry for reuse.
         __gm__ WonSlot &w = g_dist.blocks[s.won_block].slots[s.won_slot];
         if (atom_fetch_sub<int64_t>(w.remaining, 1, __ATOMIC_ACQ_REL) == 1) {
-            atom_store(g_dist.flags[s.task_id & (kFlagCap - 1)], 1, __ATOMIC_RELEASE);
+            publish_task_flag(s.task_id);
             atom_store(w.state, 0, __ATOMIC_RELEASE);  // recycle the id-keyed slot
             advance_frontier();
         }
     } else {
-        atom_store(g_dist.flags[s.task_id & (kFlagCap - 1)], 1, __ATOMIC_RELEASE);
+        publish_task_flag(s.task_id);
         advance_frontier();
     }
     s.built = false;
@@ -1209,7 +1280,7 @@ PTO_DEVICE_FUNC int32_t drain_phase_b(__gm__ DistCore *self) {
         if (!s.occupied || !s.built) continue;  // skip reserved-but-unbuilt slots
         bool ready = true;
         for (int32_t f = 0; f < s.fanin_count; f++) {
-            if (atom_load(g_dist.flags[s.fanin[f] & (kFlagCap - 1)], __ATOMIC_ACQUIRE) == 0) {
+            if (!task_flag_ready(s.fanin[f], __ATOMIC_ACQUIRE)) {
                 ready = false;
                 break;
             }
@@ -1420,21 +1491,35 @@ struct DistSubmitCtx {
     int32_t fanin_count;
     int32_t kernel_id;
     bool won;
+    bool joint;
+    bool joint_init;
+    int32_t joint_block;
+    int32_t joint_slot;
+    int32_t joint_count;
 };
 
 PTO_DEVICE_FUNC DistSubmitCtx dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &args) {
     DistSubmitCtx ctx;
-    ctx.self = self;
 #if defined(__CCE_AICORE__)
-    ctx.task_id = g_ccec_local_index++;
+    ctx.self = self != nullptr ? self : g_self;
 #else
-    ctx.task_id = self->local_index++;
+    ctx.self = self;
 #endif
+    if (ctx.self == nullptr) {
+        ctx.task_id = kFlagCap;
+    } else {
+        ctx.task_id = ctx.self->local_index++;
+    }
     ctx.tensor_count = args.tensor_count();
     ctx.output_bytes = 0;
     ctx.fanin_count = 0;
     ctx.kernel_id = INVALID_KERNEL_ID;
     ctx.won = false;
+    ctx.joint = false;
+    ctx.joint_init = false;
+    ctx.joint_block = -1;
+    ctx.joint_slot = -1;
+    ctx.joint_count = 0;
     return ctx;
 }
 
@@ -1455,18 +1540,16 @@ PTO_DEVICE_FUNC bool dist_submit_check_task_cap(const DistSubmitCtx &ctx, DistSu
 PTO_DEVICE_FUNC bool dist_submit_materialize_outputs(const L0TaskArgs &args, DistSubmitCtx &ctx, DistSubmitKind kind) {
 #if defined(__CCE_AICORE__)
     (void)kind;
-    if (g_ccec_runtime == nullptr || g_submit_core == nullptr || g_ccec_core_idx < 0 || g_ccec_core_idx >= RUNTIME_MAX_WORKER)
-        return false;
-    const uint64_t heap_base = g_ccec_runtime->dist.ccec_heap_base;
-    const uint64_t heap_size = g_ccec_runtime->dist.ccec_heap_size;
-    if (heap_base == 0 || heap_size == 0) return false;
+    if (ctx.self == nullptr || g_dist.heap_base == nullptr || g_dist.heap_size == 0) return false;
+    const uint64_t heap_base = reinterpret_cast<uint64_t>(g_dist.heap_base);
+    const uint64_t heap_size = g_dist.heap_size;
 
     uint64_t total = 0;
     for (int32_t i = 0; i < ctx.tensor_count; i++) {
         if (args.tag(i) != TensorArgType::OUTPUT) continue;
         total += PTO2_ALIGN_UP(TensorCreateInfo::buffer_size_bytes(args.tensor(i).create_info()), PTO2_PACKED_OUTPUT_ALIGN);
     }
-    uint64_t task_base = PTO2_ALIGN_UP(g_submit_core->heap_next, PTO2_PACKED_OUTPUT_ALIGN);
+    uint64_t task_base = PTO2_ALIGN_UP(ctx.self->heap_next, PTO2_PACKED_OUTPUT_ALIGN);
     if (total > 0 && (task_base % heap_size) + total > heap_size) {
         task_base = ((task_base / heap_size) + 1) * heap_size;
     }
@@ -1478,15 +1561,14 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_outputs(const L0TaskArgs &args, Dis
         const uint64_t logical = TensorCreateInfo::buffer_size_bytes(ci);
         const uint64_t sz = PTO2_ALIGN_UP(logical, PTO2_PACKED_OUTPUT_ALIGN);
         const uint64_t phys = (task_base + off) % heap_size;
-        __gm__ Tensor &slot_t =
-            g_ccec_runtime->dist.ccec_output_tensors[g_ccec_core_idx].tensors[g_submit_core->outpool_head];
-        g_submit_core->outpool_head = (g_submit_core->outpool_head + 1) % 8;
+        __gm__ Tensor &slot_t = ctx.self->outpool[ctx.self->outpool_head];
+        ctx.self->outpool_head = (ctx.self->outpool_head + 1) % kOutPoolSlots;
         init_tensor_from_create_info(slot_t, ci, reinterpret_cast<void *>(heap_base + phys), logical);
         ccec_flush_region(&slot_t, sizeof(Tensor));
         ctx.result.materialize_output(slot_t);
         off += sz;
     }
-    g_submit_core->heap_next = task_base + off;
+    ctx.self->heap_next = task_base + off;
     ctx.output_bytes = total;
     return true;
 #else
@@ -1542,8 +1624,7 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_outputs(const L0TaskArgs &args, Dis
     }
     ctx.self->heap_next = task_base + off;
     ctx.output_bytes = total;
-    if (ctx.task_id >= 0 && ctx.task_id < kFlagCap)
-        atom_store(g_dist.vend[ctx.task_id], ctx.self->heap_next, __ATOMIC_RELAXED);
+    store_task_vend(ctx.task_id, ctx.self->heap_next);
     return true;
 #endif
 }
@@ -1667,7 +1748,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
         // Pick the shard for this task (§6.6): shard = N % kCursorShards, a pure
         // function of the task id so every core targets the same sub-cursor for N.
         __gm__ PaddedCursor *cursors = anchor_is_cube ? g_dist.cube_cursor : g_dist.vector_cursor;
-        __gm__ volatile int32_t &cursor = cursors[N % kCursorShards].v;
+        __gm__ volatile int64_t &cursor = cursors[N % kCursorShards].v;
         is_winner = claim(cursor, N);
     }
 
@@ -1758,7 +1839,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
         while (!fatal_set()) {
             const int32_t f = atom_load(g_dist.frontier, __ATOMIC_ACQUIRE);
             const int32_t R = f - g_dist.H;
-            const uint64_t vstart_live = (R < 0) ? 0 : atom_load(g_dist.vend[R], __ATOMIC_RELAXED);
+            const uint64_t vstart_live = load_task_vend(R);
             if (self->heap_next - vstart_live <= ring) break;  // window fits — region free
             if (f >= N - 1) {  // every predecessor done yet H-window still overflows the ring
                 set_fatal();
@@ -1948,7 +2029,7 @@ PTO_DEVICE_FUNC void wait_producer_ready(DistCore *self, const Tensor &t) {
     if (p < 0) return;
     uint64_t wd = 0;
     while (!fatal_set()) {
-        if (atom_load(g_dist.flags[p & (kFlagCap - 1)], __ATOMIC_ACQUIRE) != 0) break;
+        if (task_flag_ready(p, __ATOMIC_ACQUIRE)) break;
         drain_block_won(self);
         if (drain_phase_b(self) == 0) {
             SPIN_WAIT_HINT();
@@ -2126,16 +2207,14 @@ PTO_DEVICE_FUNC void ccec_insert_producer(const Tensor &t, int32_t task_id) {
 }
 
 PTO_DEVICE_FUNC void ccec_publish_flag(int32_t task_id) {
-    if (g_ccec_runtime == nullptr || task_id < 0 || task_id >= 2048) return;
-    g_ccec_runtime->dist.ccec_flags[task_id] = 1;
-    ccec_flush_region(const_cast<__gm__ int64_t *>(&g_ccec_runtime->dist.ccec_flags[task_id]), 64);
+    if (g_dist_ptr == nullptr || task_id < 0 || task_id >= kFlagCap) return;
+    publish_task_flag(task_id);
 }
 
 PTO_DEVICE_FUNC void ccec_wait_flag(int32_t task_id) {
-    if (g_ccec_runtime == nullptr || task_id < 0 || task_id >= 2048) return;
+    if (g_dist_ptr == nullptr || task_id < 0 || task_id >= kFlagCap) return;
     while (true) {
-        ccec_invalidate_region(const_cast<__gm__ int64_t *>(&g_ccec_runtime->dist.ccec_flags[task_id]), 64);
-        if (g_ccec_runtime->dist.ccec_flags[task_id] != 0) return;
+        if (task_flag_ready(task_id, __ATOMIC_ACQUIRE)) return;
         SPIN_WAIT_HINT();
     }
 }
@@ -2146,38 +2225,99 @@ PTO_DEVICE_FUNC void ccec_wait_fanin(const int32_t fanin[], int32_t count) {
     }
 }
 
-PTO_DEVICE_FUNC bool ccec_claim_kernel_submit_deterministic(const MixedKernels &mixed, DistSubmitCtx &ctx) {
+PTO_DEVICE_FUNC bool ccec_claim_kernel_submit(const MixedKernels &mixed, DistSubmitCtx &ctx) {
     ctx.kernel_id = INVALID_KERNEL_ID;
     ctx.won = false;
+    if (ctx.self == nullptr || ctx.task_id < 0 || ctx.task_id >= kFlagCap) return false;
     const bool has_aic = mixed.aic_kernel_id != INVALID_KERNEL_ID;
     const bool has_aiv = mixed.aiv0_kernel_id != INVALID_KERNEL_ID || mixed.aiv1_kernel_id != INVALID_KERNEL_ID;
+    if (has_aic && has_aiv) {
+        if (g_ccec_aic_count <= 0) return false;
+        const int32_t block = ctx.task_id % g_ccec_aic_count;
+        ctx.joint = true;
+        ctx.joint_block = block;
+        ctx.joint_slot = ctx.task_id % kPrivateSlots;
+        ctx.joint_count = 1;
+        if (mixed.aiv0_kernel_id != INVALID_KERNEL_ID) ctx.joint_count++;
+        if (mixed.aiv1_kernel_id != INVALID_KERNEL_ID) ctx.joint_count++;
+        const bool is_aic_owner =
+            ctx.self->role == CoreType::AIC && ctx.self->block_id == block && ctx.self->lane == LANE_AIC;
+        const bool is_aiv0_owner =
+            mixed.aiv0_kernel_id != INVALID_KERNEL_ID && ctx.self->role == CoreType::AIV &&
+            ctx.self->block_id == block && ctx.self->lane == LANE_AIV0;
+        const bool is_aiv1_owner =
+            mixed.aiv1_kernel_id != INVALID_KERNEL_ID && ctx.self->role == CoreType::AIV &&
+            ctx.self->block_id == block && ctx.self->lane == LANE_AIV1;
+        if (is_aic_owner) {
+            ctx.kernel_id = mixed.aic_kernel_id;
+            ctx.joint_init = true;
+        } else if (is_aiv0_owner) {
+            ctx.kernel_id = mixed.aiv0_kernel_id;
+        } else if (is_aiv1_owner) {
+            ctx.kernel_id = mixed.aiv1_kernel_id;
+        } else {
+            return false;
+        }
+        ctx.won = true;
+        return true;
+    }
     if (has_aic && !has_aiv) {
         if (g_ccec_core_type != static_cast<int32_t>(CoreType::AIC)) return false;
         if (g_ccec_aic_count <= 0 || g_ccec_ordinal != ctx.task_id % g_ccec_aic_count) return false;
-        ctx.kernel_id = mixed.aic_kernel_id;
         ctx.won = true;
+        if (!ctx.won) return false;
+        ctx.kernel_id = mixed.aic_kernel_id;
         return true;
     }
     if (!has_aic && has_aiv) {
         if (g_ccec_core_type != static_cast<int32_t>(CoreType::AIV)) return false;
         if (g_ccec_aiv_count <= 0 || g_ccec_ordinal != ctx.task_id % g_ccec_aiv_count) return false;
-        ctx.kernel_id = mixed.aiv0_kernel_id != INVALID_KERNEL_ID ? mixed.aiv0_kernel_id : mixed.aiv1_kernel_id;
         ctx.won = true;
+        if (!ctx.won) return false;
+        ctx.kernel_id = mixed.aiv0_kernel_id != INVALID_KERNEL_ID ? mixed.aiv0_kernel_id : mixed.aiv1_kernel_id;
         return true;
     }
     return false;
 }
 
-PTO_DEVICE_FUNC bool ccec_claim_alloc_submit_single_owner(DistSubmitCtx &ctx) {
+PTO_DEVICE_FUNC bool ccec_claim_alloc_submit(DistSubmitCtx &ctx) {
     ctx.kernel_id = INVALID_KERNEL_ID;
+    if (ctx.self == nullptr || ctx.task_id < 0 || ctx.task_id >= kFlagCap) return false;
     ctx.won = g_ccec_core_idx == 0;
     return ctx.won;
 }
 
 PTO_DEVICE_FUNC bool ccec_claim_submit(DistSubmitKind kind, const MixedKernels *mixed, DistSubmitCtx &ctx) {
-    if (kind == DistSubmitKind::Alloc) return ccec_claim_alloc_submit_single_owner(ctx);
+    if (kind == DistSubmitKind::Alloc) return ccec_claim_alloc_submit(ctx);
     if (mixed == nullptr) return false;
-    return ccec_claim_kernel_submit_deterministic(*mixed, ctx);
+    return ccec_claim_kernel_submit(*mixed, ctx);
+}
+
+PTO_DEVICE_FUNC void ccec_prepare_joint_submit(DistSubmitCtx &ctx) {
+    if (!ctx.joint) return;
+    __gm__ WonSlot &w = g_dist.blocks[ctx.joint_block].slots[ctx.joint_slot];
+    if (ctx.joint_init) {
+        w.task_id = ctx.task_id;
+        w.remaining = ctx.joint_count;
+        w.state = 1;
+        ccec_flush_region(&w, sizeof(WonSlot));
+        return;
+    }
+    while (true) {
+        ccec_invalidate_region(&w, sizeof(WonSlot));
+        if (w.state == 1 && w.task_id == ctx.task_id) return;
+        SPIN_WAIT_HINT();
+    }
+}
+
+PTO_DEVICE_FUNC void ccec_complete_joint_submit(DistSubmitCtx &ctx) {
+    __gm__ WonSlot &w = g_dist.blocks[ctx.joint_block].slots[ctx.joint_slot];
+    __gm__ int64_t *remaining = const_cast<__gm__ int64_t *>(&w.remaining);
+    if (atomicSub(remaining, static_cast<int64_t>(1)) == 1) {
+        w.state = 0;
+        ccec_flush_region(&w, sizeof(WonSlot));
+        ccec_publish_flag(ctx.task_id);
+    }
 }
 
 PTO_DEVICE_FUNC bool ccec_build_kernel_payload(
@@ -2224,10 +2364,15 @@ PTO_DEVICE_FUNC void ccec_execute_won_submit(const L0TaskArgs &args, DistSubmitC
     if (payload == nullptr) return;
 
     ccec_wait_fanin(ctx.fanin, ctx.fanin_count);
+    ccec_prepare_joint_submit(ctx);
     if (!ccec_build_kernel_payload(args, ctx.result, payload)) return;
     ccec_call_winner_kernel(ctx.kernel_id, payload);
     OUT_OF_ORDER_STORE_BARRIER();
-    ccec_publish_flag(ctx.task_id);
+    if (ctx.joint) {
+        ccec_complete_joint_submit(ctx);
+    } else {
+        ccec_publish_flag(ctx.task_id);
+    }
 }
 
 PTO_DEVICE_FUNC void ccec_complete_alloc_submit(DistSubmitCtx &ctx) {
@@ -2350,7 +2495,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
         while (!fatal_set()) {
             const int32_t f = atom_load(g_dist.frontier, __ATOMIC_ACQUIRE);
             const int32_t R = f - g_dist.H;
-            const uint64_t vstart_live = (R < 0) ? 0 : atom_load(g_dist.vend[R], __ATOMIC_RELAXED);
+            const uint64_t vstart_live = load_task_vend(R);
             if (self->heap_next - vstart_live <= ring) break;  // window fits — region free
             if (f >= N - 1) {
                 set_fatal();
@@ -2370,7 +2515,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
     }
 
     // (e) Winner completes inline (no kernel runs).
-    atom_store(g_dist.flags[N & (kFlagCap - 1)], 1, __ATOMIC_RELEASE);
+    publish_task_flag(N);
     advance_frontier();
     TRACE_LAP(self, N, -1, TracePhase::Alloc);
     return ctx.result;
@@ -2413,13 +2558,13 @@ void dist_dump_state(int) {
     fprintf(stderr, "cube_cursor[%d]=", kCursorShards);
     for (int32_t s = 0; s < kCursorShards; s++)
         fprintf(
-            stderr, "%d%s", atom_load(g_dist.cube_cursor[s].v, __ATOMIC_RELAXED),
+            stderr, "%ld%s", static_cast<long>(atom_load(g_dist.cube_cursor[s].v, __ATOMIC_RELAXED)),
             s + 1 < kCursorShards ? "," : ""
         );
     fprintf(stderr, " vector_cursor[%d]=", kCursorShards);
     for (int32_t s = 0; s < kCursorShards; s++)
         fprintf(
-            stderr, "%d%s", atom_load(g_dist.vector_cursor[s].v, __ATOMIC_RELAXED),
+            stderr, "%ld%s", static_cast<long>(atom_load(g_dist.vector_cursor[s].v, __ATOMIC_RELAXED)),
             s + 1 < kCursorShards ? "," : ""
         );
     fprintf(stderr, "\n");
@@ -2434,7 +2579,7 @@ void dist_dump_state(int) {
             if (!s.occupied) continue;
             int32_t unmet = -1;
             for (int32_t f = 0; f < s.fanin_count; f++)
-                if (atom_load(g_dist.flags[s.fanin[f] & (kFlagCap - 1)], __ATOMIC_RELAXED) == 0) {
+                if (!task_flag_ready(s.fanin[f], __ATOMIC_RELAXED)) {
                     unmet = s.fanin[f];
                     break;
                 }
@@ -2468,19 +2613,30 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
 #if defined(__CCE_AICORE__)
     if (runtime == nullptr || core_idx < 0 || core_idx >= RUNTIME_MAX_WORKER) return;
 
+    ccec_invalidate_region(const_cast<__gm__ uint64_t *>(&runtime->dist.shared_addr), 64);
+    g_dist_ptr = reinterpret_cast<__gm__ DistGlobal *>(runtime->dist.shared_addr);
+    if (g_dist_ptr == nullptr) return;
+
     g_ccec_runtime = runtime;
     g_ccec_core_idx = core_idx;
     g_ccec_core_type = core_type_int;
+    g_self = &g_dist.cores[core_idx];
+
+    ccec_invalidate_region(&g_dist.layout[core_idx], sizeof(CoreLayout));
+    __gm__ const CoreLayout &layout_gm = g_dist.layout[core_idx];
+    const CoreLayout lay = {layout_gm.block_id, layout_gm.lane};
+    DistCore::reset(*g_self, static_cast<CoreType>(core_type_int), lay.block_id, lay.lane);
+    g_self->core_idx = core_idx;
+
     g_submit_core = &runtime->dist.submit_cores[core_idx];
-    g_submit_core->heap_next = 0;
-    g_submit_core->outpool_head = 0;
     g_submit_core->map_count = 0;
-    g_ccec_local_index = 0;
+    ccec_invalidate_region(const_cast<__gm__ int32_t *>(&runtime->dist.num_workers), 64);
     ccec_init_worker_layout();
 
     ccec_replay_orch(runtime);
     ccec_publish_done();
 
+    g_self = nullptr;
     g_ccec_runtime = nullptr;
     g_submit_core = nullptr;
     return;
@@ -2645,20 +2801,13 @@ void *dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num
     }
     atom_store(g_dist.frontier, -1, __ATOMIC_RELAXED);
     for (int32_t i = 0; i < kFlagCap; i++)
-        atom_store(g_dist.flags[i], 0, __ATOMIC_RELAXED);
+        reset_task_cell(i);
     atom_store(g_dist.fatal, 0, __ATOMIC_RELAXED);
     atom_store<int64_t>(g_dist.replay_done, 0, __ATOMIC_RELAXED);
     atom_store<int64_t>(g_dist.started_count, 0, __ATOMIC_RELAXED);
     g_dist.orch_args = orch_args;
     g_dist.rt = rt;
     g_dist.runtime = runtime;
-    if (runtime != nullptr) {
-        runtime->dist.ccec_heap_base = rt != nullptr ? reinterpret_cast<uint64_t>(rt->gm_heap) : 0;
-        runtime->dist.ccec_heap_size = rt != nullptr ? rt->gm_heap_size : 0;
-        for (int32_t i = 0; i < 2048; i++) {
-            atom_store<int64_t>(runtime->dist.ccec_flags[i], 0, __ATOMIC_RELAXED);
-        }
-    }
 
     // Derive the physical-block topology (1 AIC + 2 AIV per block) the same way
     // the centralized scheduler discovers clusters: AIC/AIV cores in worker-index
