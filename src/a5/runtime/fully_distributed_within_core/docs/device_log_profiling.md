@@ -65,8 +65,9 @@ Thread 3: orch_start=1783051497915574420 orch_end=1783051498123092400 orch_cost=
 ## Historical Block: PTO2 Scheduler Summary
 
 The following section applies only to the legacy central-scheduler path. The
-direct distributed AICore path keeps `SchedulerContext` for core discovery and
-shutdown, but does not call `SchedulerContext::resolve_and_dispatch`.
+direct distributed AICore path does not link `SchedulerContext`; AICPU performs
+only worker handshake, register setup, release, completion polling, and
+shutdown.
 
 Each of the 3 scheduler threads (Thread 0, 1, 2) prints its own summary after completing all tasks. The output has two sub-sections: **summary** and **phase breakdown**.
 

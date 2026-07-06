@@ -21,9 +21,7 @@
  * - Function address mapping (func_id_to_addr_)
  *
  * The direct distributed path publishes Runtime::dist from AICPU, then AICore
- * workers replay orchestration and execute claimed tasks on-core. Legacy
- * central-scheduler payload fields remain for compatibility with shared
- * platform/runtime helpers.
+ * workers replay orchestration and execute claimed tasks on-core.
  */
 
 #ifndef SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_
@@ -49,11 +47,7 @@
 #define RUNTIME_MAX_ARGS 128
 #define RUNTIME_MAX_WORKER 108  // 36 AIC + 72 AIV cores
 #define RUNTIME_MAX_FUNC_ID 1024
-#define RUNTIME_MAX_ORCH_SO_SIZE (4 * 1024 * 1024)  // 4MB max for orchestration SO
 #define RUNTIME_MAX_ORCH_SYMBOL_NAME 64
-
-// Default ready queue shards: one shard per worker thread (total minus orchestrator)
-constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 1;
 
 // =============================================================================
 // Data Structures
@@ -221,15 +215,8 @@ public:
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
     int worker_count;                       // Number of active workers
 
-    // Execution parameters for AICPU scheduling.
-    //
-    // aicpu_thread_num is the *total* AICPU thread count launched on this run
-    // (= orch + schedulers). AicpuExecutor splits this into one orchestrator
-    // thread (highest idx, runs aicpu_orchestration_entry) and the remaining
-    // aicpu_thread_num-1 scheduler threads that dispatch tasks to AICore.
-    // The orch thread also dispatches when env PTO2_ORCH_TO_SCHED is set.
+    // Execution parameters for AICPU launch and affinity.
     int aicpu_thread_num;
-    int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
     // Filter-style affinity gate input (a5 onboard). Host fills before
     // launch from device-side OCCUPY + DSMI CPU_TOPO via
@@ -258,12 +245,6 @@ public:
     // direct AICore-side access, mirroring func_id_to_addr_.
     bool use_example_exec_time_;
     int32_t example_exec_time_ns_[RUNTIME_MAX_FUNC_ID];
-
-    // Orchestrator-to-scheduler transition control
-    // When true, orchestrator threads convert to scheduler threads after orchestration completes.
-    // When false (default), orchestrator threads exit after orchestration without dispatching tasks.
-    // Controlled via PTO2_ORCH_TO_SCHED environment variable.
-    bool orch_to_sched;
 
     // ---- fully_distributed_within_core handoff ----
     // The AICPU setup thread initializes the shared entry args, then hands the
@@ -326,8 +307,6 @@ private:
     int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];
     int registered_kernel_count_;
 
-    void *gm_sm_ptr_;                        // GM pointer to PTO2 shared memory (device)
-    void *gm_heap_ptr_;                      // GM heap for orchestrator output buffers (device)
     ChipStorageTaskArgs orch_args_storage_;  // Copy of args for device
 
     // Prebuilt runtime header. Set by the host before rtMemcpy'ing Runtime to
@@ -337,8 +316,9 @@ private:
     void *prebuilt_arena_base_;
     size_t prebuilt_runtime_offset_;
 
-    // Legacy device orchestration SO metadata retained for common host callable
-    // plumbing shared with other runtimes.
+    // Retained for common callable cache plumbing. The direct distributed path
+    // no longer executes this SO on AICPU, but common DeviceRunner code still
+    // stamps the prepared callable metadata through Runtime.
     uint64_t dev_orch_so_addr_;
     uint64_t dev_orch_so_size_;
     // Per-callable_id dispatch state shared by the host and AICPU executor.
@@ -361,11 +341,8 @@ public:
     // Device orchestration (for AICPU thread 3)
     // =========================================================================
 
-    void *get_gm_sm_ptr() const;
-    void *get_gm_heap_ptr() const;
     const ChipStorageTaskArgs &get_orch_args() const;
     void set_gm_sm_ptr(void *p);
-    void set_gm_heap(void *p);
     void set_orch_args(const ChipStorageTaskArgs &args);
 
     // Prebuilt runtime header location. Both stay zero on first construction
@@ -375,7 +352,7 @@ public:
     void *get_prebuilt_arena_base() const;
     size_t get_prebuilt_runtime_offset() const;
 
-    // Legacy device orchestration SO metadata retained for common callable ABI.
+    // Compatibility metadata for common callable plumbing shared with other runtimes.
     void set_dev_orch_so(uint64_t dev_addr, uint64_t size);
     uint64_t get_dev_orch_so_addr() const;
     uint64_t get_dev_orch_so_size() const;

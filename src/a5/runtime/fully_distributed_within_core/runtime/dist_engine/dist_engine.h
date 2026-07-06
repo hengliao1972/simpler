@@ -29,9 +29,21 @@
 
 #pragma once
 
+#include <cstddef>
+
 struct PTO2Runtime;
 struct L2TaskArgs;
 class Runtime;
+
+// Arena footprint of the distributed engine's private DistGlobal. Host runtime
+// does not link dist_engine.cpp, so these are header constants; dist_engine.cpp
+// static_asserts the private type against them.
+inline constexpr size_t kDistEngineGlobalStateSize = 0x6a60300;
+inline constexpr size_t kDistEngineGlobalStateAlign = 64;
+
+inline constexpr size_t dist_engine_global_state_size() { return kDistEngineGlobalStateSize; }
+
+inline constexpr size_t dist_engine_global_state_align() { return kDistEngineGlobalStateAlign; }
 
 /**
  * Wire the distributed engine for one run.

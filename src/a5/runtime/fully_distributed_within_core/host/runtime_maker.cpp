@@ -9,16 +9,16 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Runtime Builder - rt2 Implementation (Device Orchestration)
+ * Runtime Builder - fully_distributed_within_core host binding
  *
- * Provides init_runtime_impl and validate_runtime_impl functions for rt2 runtime.
- * Supports device orchestration where AICPU thread 3 runs the orchestrator.
+ * Stages per-run tensor arguments, prepares the direct distributed runtime
+ * arena, and copies mutable outputs back to host at finalize.
  *
  * init_runtime_impl:
  *   - Converts host tensor pointers to device pointers (all inputs copied H2D;
  *     only OUTPUT/INOUT tensors are copied back D2H)
- *   - Registers callable-side orchestration metadata
- *   - Sets up runtime state for device orchestration
+ *   - Registers callable-side kernel metadata
+ *   - Uploads the prebuilt direct distributed runtime header
  *
  * validate_runtime_impl:
  *   - Copies OUTPUT/INOUT tensors back from device to host (read-only inputs
@@ -28,21 +28,11 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <sys/time.h>
 
-#include <cerrno>
 #include <cinttypes>
-#include <cstddef>
-#include <cstdint>
-#include <cctype>
 #include <cstdlib>
-#include <cstring>
-#include <limits>
-#include <string>
 
-#include "../common/pto_runtime_status.h"
 #include "../runtime/pto_runtime2.h"
-#include "../runtime/pto_shared_memory.h"
 #include "../runtime/runtime.h"
 #include "../../../../common/task_interface/call_config.h"
 #include "utils/device_arena.h"
@@ -51,230 +41,8 @@
 #include "common/unified_log.h"
 #include "prepare_callable_common.h"
 
-static_assert(
-    RUNTIME_ENV_RING_COUNT == PTO2_MAX_RING_DEPTH, "RuntimeEnv ring count must match PTO2 runtime ring depth"
-);
-
-// Helper: return current time in milliseconds
-static int64_t _now_ms() {
-    struct timeval tv;
-    gettimeofday(&tv, nullptr);
-    return static_cast<int64_t>(tv.tv_sec) * 1000 + tv.tv_usec / 1000;
-}
-
-static bool is_power_of_2_u64(uint64_t value) { return value != 0 && (value & (value - 1)) == 0; }
-
-template <typename T>
-static std::string format_ring_array(const T (&values)[PTO2_MAX_RING_DEPTH]) {
-    std::string out = "[";
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; ++r) {
-        if (r != 0) {
-            out += ", ";
-        }
-        out += std::to_string(values[r]);
-    }
-    out += "]";
-    return out;
-}
-
-static std::string trim_copy(const std::string &input) {
-    size_t begin = 0;
-    while (begin < input.size() && std::isspace(static_cast<unsigned char>(input[begin]))) {
-        ++begin;
-    }
-    size_t end = input.size();
-    while (end > begin && std::isspace(static_cast<unsigned char>(input[end - 1]))) {
-        --end;
-    }
-    return input.substr(begin, end - begin);
-}
-
-static bool parse_uint_token(
-    const char *name, const std::string &raw, uint64_t min_val, uint64_t max_val, bool require_power_of_2, uint64_t *out
-) {
-    std::string token = trim_copy(raw);
-    if (token.empty()) {
-        LOG_WARN("%s has an empty value in '%s', ignored", name, raw.c_str());
-        return false;
-    }
-
-    if (token[0] == '-') {
-        LOG_WARN("%s=%s invalid (must be a non-negative integer), ignored", name, token.c_str());
-        return false;
-    }
-    char *endptr = nullptr;
-    errno = 0;
-    unsigned long long parsed = std::strtoull(token.c_str(), &endptr, 10);
-    if (errno == ERANGE || endptr == token.c_str() || *endptr != '\0') {
-        LOG_WARN("%s=%s invalid (must be a non-negative integer), ignored", name, token.c_str());
-        return false;
-    }
-    uint64_t val = static_cast<uint64_t>(parsed);
-
-    if (val < min_val || val > max_val) {
-        LOG_WARN(
-            "%s=%s invalid (must be in [%" PRIu64 ", %" PRIu64 "]), ignored", name, token.c_str(), min_val, max_val
-        );
-        return false;
-    }
-    if (require_power_of_2 && !is_power_of_2_u64(val)) {
-        LOG_WARN("%s=%s invalid (must be a power of 2), ignored", name, token.c_str());
-        return false;
-    }
-    *out = val;
-    return true;
-}
-
-static void apply_env_ring_values(
-    const char *name, uint64_t min_val, uint64_t max_val, bool require_power_of_2, uint64_t out[PTO2_MAX_RING_DEPTH]
-) {
-    const char *env = std::getenv(name);
-    if (!env) return;
-
-    std::string text(env);
-    if (text.find(',') == std::string::npos) {
-        uint64_t value = 0;
-        if (!parse_uint_token(name, text, min_val, max_val, require_power_of_2, &value)) {
-            return;
-        }
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            out[r] = value;
-        }
-        return;
-    }
-
-    uint64_t parsed[PTO2_MAX_RING_DEPTH]{};
-    size_t pos = 0;
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        size_t comma = text.find(',', pos);
-        std::string token = text.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
-        if (!parse_uint_token(name, token, min_val, max_val, require_power_of_2, &parsed[r])) {
-            return;
-        }
-        if (comma == std::string::npos) {
-            if (r != PTO2_MAX_RING_DEPTH - 1) {
-                LOG_WARN(
-                    "%s=%s invalid (expected exactly %d comma-separated values), ignored", name, env,
-                    PTO2_MAX_RING_DEPTH
-                );
-                return;
-            }
-            pos = text.size();
-        } else {
-            pos = comma + 1;
-        }
-    }
-    if (pos < text.size() || (!text.empty() && text.back() == ',')) {
-        LOG_WARN("%s=%s invalid (expected exactly %d comma-separated values), ignored", name, env, PTO2_MAX_RING_DEPTH);
-        return;
-    }
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        out[r] = parsed[r];
-    }
-}
-
-static bool resolve_ring_config(
-    uint64_t ring_task_window, uint64_t ring_heap, uint64_t ring_dep_pool, const uint64_t *ring_task_windows,
-    const uint64_t *ring_heaps, const uint64_t *ring_dep_pools, uint64_t eff_task_window_sizes[PTO2_MAX_RING_DEPTH],
-    uint64_t eff_heap_sizes[PTO2_MAX_RING_DEPTH], int32_t eff_dep_pool_capacities[PTO2_MAX_RING_DEPTH]
-) {
-    uint64_t dep_pool_values[PTO2_MAX_RING_DEPTH];
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        eff_task_window_sizes[r] = PTO2_TASK_WINDOW_SIZE;
-        eff_heap_sizes[r] = PTO2_HEAP_SIZE;
-        dep_pool_values[r] = PTO2_DEP_LIST_POOL_SIZE;
-    }
-
-    apply_env_ring_values("PTO2_RING_TASK_WINDOW", 4, static_cast<uint64_t>(INT32_MAX), true, eff_task_window_sizes);
-    apply_env_ring_values("PTO2_RING_HEAP", 1024, std::numeric_limits<uint64_t>::max(), false, eff_heap_sizes);
-    apply_env_ring_values("PTO2_RING_DEP_POOL", 4, static_cast<uint64_t>(INT32_MAX), false, dep_pool_values);
-
-    if (ring_task_window != 0) {
-        if (ring_task_window < 4 || ring_task_window > static_cast<uint64_t>(INT32_MAX) ||
-            !is_power_of_2_u64(ring_task_window)) {
-            LOG_ERROR(
-                "runtime_env.ring_task_window=%" PRIu64 " must be a power of 2 in [4, INT32_MAX]", ring_task_window
-            );
-            return false;
-        }
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            eff_task_window_sizes[r] = ring_task_window;
-        }
-    }
-    if (ring_heap != 0) {
-        if (ring_heap < 1024) {
-            LOG_ERROR("runtime_env.ring_heap=%" PRIu64 " must be >= 1024", ring_heap);
-            return false;
-        }
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            eff_heap_sizes[r] = ring_heap;
-        }
-    }
-    if (ring_dep_pool != 0) {
-        if (ring_dep_pool < 4 || ring_dep_pool > static_cast<uint64_t>(INT32_MAX)) {
-            LOG_ERROR("runtime_env.ring_dep_pool=%" PRIu64 " must be in [4, INT32_MAX]", ring_dep_pool);
-            return false;
-        }
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            dep_pool_values[r] = ring_dep_pool;
-        }
-    }
-
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        if (ring_task_windows != nullptr && ring_task_windows[r] != 0) {
-            eff_task_window_sizes[r] = ring_task_windows[r];
-        }
-        if (ring_heaps != nullptr && ring_heaps[r] != 0) {
-            eff_heap_sizes[r] = ring_heaps[r];
-        }
-        if (ring_dep_pools != nullptr && ring_dep_pools[r] != 0) {
-            dep_pool_values[r] = ring_dep_pools[r];
-        }
-
-        if (eff_task_window_sizes[r] < 4 || eff_task_window_sizes[r] > static_cast<uint64_t>(INT32_MAX) ||
-            !is_power_of_2_u64(eff_task_window_sizes[r])) {
-            LOG_ERROR(
-                "ring_task_windows[%d]=%" PRIu64 " must be a power of 2 in [4, INT32_MAX]", r, eff_task_window_sizes[r]
-            );
-            return false;
-        }
-        if (eff_heap_sizes[r] < 1024) {
-            LOG_ERROR("ring_heaps[%d]=%" PRIu64 " must be >= 1024", r, eff_heap_sizes[r]);
-            return false;
-        }
-        if (dep_pool_values[r] < 4 || dep_pool_values[r] > static_cast<uint64_t>(INT32_MAX)) {
-            LOG_ERROR("ring_dep_pools[%d]=%" PRIu64 " must be in [4, INT32_MAX]", r, dep_pool_values[r]);
-            return false;
-        }
-        eff_dep_pool_capacities[r] = static_cast<int32_t>(dep_pool_values[r]);
-    }
-
-    return true;
-}
-
-static int32_t read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader *host_header) {
-    if (runtime == nullptr || host_header == nullptr) {
-        return 0;
-    }
-
-    void *sm_ptr = runtime->get_gm_sm_ptr();
-    if (sm_ptr == nullptr) {
-        return 0;
-    }
-
-    int hdr_rc = runtime->host_api.copy_from_device(host_header, sm_ptr, sizeof(PTO2SharedMemoryHeader));
-    if (hdr_rc != 0) {
-        LOG_WARN("Failed to copy PTO2 header from device");
-        return 0;
-    }
-
-    int32_t orch_error_code = host_header->orch_error_code.load(std::memory_order_relaxed);
-    int32_t sched_error_code = host_header->sched_error_code.load(std::memory_order_relaxed);
-    return runtime_status_from_error_codes(orch_error_code, sched_error_code);
-}
-
 /**
- * Stage the per-callable resources (kernel binaries + orchestration SO) into
+ * Stage the per-callable resources (kernel binaries + orchestration entry) into
  * the supplied runtime so a subsequent bind_callable_to_runtime_impl can use
  * them. This is the cacheable half of init_runtime_impl: nothing here depends
  * on per-run argument values, so the prepare_callable / run_prepared split
@@ -330,7 +98,7 @@ prepare_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const 
 
 /**
  * Per-run binding: build device-side argument storage (tensor copy-out, GM
- * heap, PTO2 shared memory) and publish it to the runtime. Assumes the
+ * heap, runtime arena) and publish it to the runtime. Assumes the
  * callable-side state (kernel binaries and orchestration entry metadata) is
  * already populated by prepare_callable_impl.
  *
@@ -362,34 +130,18 @@ extern "C" int bind_callable_to_runtime_impl(
         LOG_ERROR("bind_callable_to_runtime_impl: trb does not accept a host_orch_func_ptr");
         return -1;
     }
+    (void)ring_task_window;
+    (void)ring_dep_pool;
+    (void)ring_task_windows;
+    (void)ring_dep_pools;
 
     int tensor_count = orch_args->tensor_count();
     int scalar_count = orch_args->scalar_count();
-    LOG_INFO_V0("RT2 bind: %d tensors + %d scalars, device orchestration mode", tensor_count, scalar_count);
-
-    int64_t t_total_start = _now_ms();
-
-    uint64_t eff_task_window_sizes[PTO2_MAX_RING_DEPTH];
-    uint64_t eff_heap_sizes[PTO2_MAX_RING_DEPTH];
-    int32_t eff_dep_pool_capacities[PTO2_MAX_RING_DEPTH];
-    if (!resolve_ring_config(
-            ring_task_window, ring_heap, ring_dep_pool, ring_task_windows, ring_heaps, ring_dep_pools,
-            eff_task_window_sizes, eff_heap_sizes, eff_dep_pool_capacities
-        )) {
-        return -1;
-    }
-    const std::string task_window_log = format_ring_array(eff_task_window_sizes);
-    const std::string heap_log = format_ring_array(eff_heap_sizes);
-    const std::string dep_pool_log = format_ring_array(eff_dep_pool_capacities);
-    LOG_INFO_V0(
-        "Ring buffer sizes: task_window=%s heap=%s dep_pool=%s", task_window_log.c_str(), heap_log.c_str(),
-        dep_pool_log.c_str()
-    );
+    LOG_INFO_V0("fdwic bind: %d tensors + %d scalars", tensor_count, scalar_count);
 
     // Build device args: copy from input, replace host tensor pointers with device pointers
     ChipStorageTaskArgs device_args;
 
-    int64_t t_args_start = _now_ms();
     for (int i = 0; i < tensor_count; i++) {
         Tensor t = orch_args->tensor(i);
 
@@ -442,66 +194,53 @@ extern "C" int bind_callable_to_runtime_impl(
     for (int i = 0; i < scalar_count; i++) {
         device_args.add_scalar(orch_args->scalar(i));
     }
-    int64_t t_args_end = _now_ms();
 
-    // Read orchestrator-to-scheduler transition flag from environment
-    {
-        const char *env_val = std::getenv("PTO2_ORCH_TO_SCHED");
-        if (env_val && (env_val[0] == '1' || env_val[0] == 't' || env_val[0] == 'T')) {
-            runtime->orch_to_sched = true;
-        }
-        LOG_INFO_V0("Orchestrator-to-scheduler transition: %s", runtime->orch_to_sched ? "enabled" : "disabled");
-    }
-
-    // Lay out the per-Worker static device arena. GM heap, PTO2 shared memory,
-    // and the prebuilt runtime arena all live in a single backing allocation;
-    // setup_static_arena reserves the three regions and commits in one shot.
+    // Lay out the per-Worker static device arena. Direct distributed runtime
+    // uses one GM output heap plus one prebuilt runtime arena; the old PTO2
+    // shared-memory region is not part of this path.
     // Owned by DeviceRunner across runs — do NOT record in tensor_pairs_; the
     // free is deferred to DeviceRunner::finalize(). The runtime-arena size is
     // determined by replaying the reserve sequence on a host-side arena.
-    uint64_t total_heap_size = 0;
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        if (eff_heap_sizes[r] > std::numeric_limits<uint64_t>::max() - total_heap_size) {
-            LOG_ERROR("Total ring heap size overflows uint64_t");
+    uint64_t total_heap_size = PTO2_HEAP_SIZE;
+    if (ring_heap != 0) {
+        if (ring_heap < 1024) {
+            LOG_ERROR("runtime_env.ring_heap=%" PRIu64 " must be >= 1024", ring_heap);
             return -1;
         }
-        total_heap_size += eff_heap_sizes[r];
+        total_heap_size = ring_heap;
     }
-    uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(eff_task_window_sizes);
+    if (ring_heaps != nullptr && ring_heaps[0] != 0) {
+        if (ring_heaps[0] < 1024) {
+            LOG_ERROR("ring_heaps[0]=%" PRIu64 " must be >= 1024", ring_heaps[0]);
+            return -1;
+        }
+        total_heap_size = ring_heaps[0];
+    }
+    if (const char *e = std::getenv("PTO_DIST_HEAP_MB")) {
+        const long mb = std::atol(e);
+        if (mb > 0) {
+            total_heap_size = static_cast<uint64_t>(mb) << 20;
+        }
+    }
+    LOG_INFO_V0("Dist heap size: %" PRIu64 " bytes", total_heap_size);
 
-    int64_t t_prebuilt_start = _now_ms();
     DeviceArena host_arena;  // libc malloc backend by default
-    PTO2RuntimeArenaLayout layout =
-        runtime_reserve_layout(host_arena, eff_task_window_sizes, eff_heap_sizes, eff_dep_pool_capacities);
+    PTO2RuntimeArenaLayout layout = runtime_reserve_layout(host_arena);
     if (host_arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
         LOG_ERROR("Failed to commit host arena for prebuilt runtime image");
         return -1;
     }
 
-    int64_t t_setup_start = _now_ms();
-    if (runtime->host_api.setup_static_arena(total_heap_size, sm_size, layout.arena_size) != 0) {
+    if (runtime->host_api.setup_static_arena(total_heap_size, 0, layout.arena_size) != 0) {
         LOG_ERROR("Failed to setup pooled static arena");
         return -1;
     }
-    int64_t t_setup_end = _now_ms();
 
-    int64_t t_heap_start = _now_ms();
     void *gm_heap = runtime->host_api.acquire_pooled_gm_heap();
-    int64_t t_heap_end = _now_ms();
     if (gm_heap == nullptr) {
         LOG_ERROR("Failed to acquire pooled GM heap");
         return -1;
     }
-    runtime->set_gm_heap(gm_heap);
-
-    int64_t t_sm_start = _now_ms();
-    void *sm_ptr = runtime->host_api.acquire_pooled_gm_sm();
-    int64_t t_sm_end = _now_ms();
-    if (sm_ptr == nullptr) {
-        LOG_ERROR("Failed to acquire pooled PTO2 shared memory");
-        return -1;
-    }
-    runtime->set_gm_sm_ptr(sm_ptr);
 
     void *runtime_arena_dev = runtime->host_api.acquire_pooled_runtime_arena();
     if (runtime_arena_dev == nullptr) {
@@ -509,25 +248,22 @@ extern "C" int bind_callable_to_runtime_impl(
         return -1;
     }
 
-    // Set up device orchestration state
     runtime->set_orch_args(device_args);
 
     // -------------------------------------------------------------------------
     // Build the prebuilt runtime-arena image on host.
     //
-    // We pre-compute the runtime header and legacy arena image on host, then
+    // We pre-compute the runtime header and dist-global image on host, then
     // rtMemcpy it into the pooled runtime-arena region that DeviceRunner keeps
     // alive across runs. The direct distributed AICPU setup path only reads the
-    // PTO2Runtime header; it no longer attaches/wires the full arena or resets
-    // the central SM.
+    // PTO2Runtime header and the DistGlobal pointed to by rt->dist_global.
     // -------------------------------------------------------------------------
-    PTO2Runtime *rt =
-        runtime_init_data_from_layout(host_arena, layout, PTO2_MODE_EXECUTE, sm_ptr, sm_size, gm_heap, eff_heap_sizes);
+    PTO2Runtime *rt = runtime_init_data_from_layout(host_arena, layout, PTO2_MODE_EXECUTE, gm_heap, total_heap_size);
     if (rt == nullptr) {
         LOG_ERROR("runtime_init_data_from_layout failed");
         return -1;
     }
-    runtime_wire_arena_pointers(host_arena, layout, rt);
+    rt->dist_global = static_cast<char *>(runtime_arena_dev) + layout.off_dist_global;
 
     // Keep the layout in the PTO2Runtime image for compatibility with the
     // prebuilt image format. The direct distributed AICPU setup path only uses
@@ -540,17 +276,8 @@ extern "C" int bind_callable_to_runtime_impl(
         return -1;
     }
     runtime->set_prebuilt_arena(runtime_arena_dev, layout.off_runtime);
-    int64_t t_prebuilt_end = _now_ms();
 
-    LOG_INFO_V0("Device orchestration ready: %d tensors + %d scalars", tensor_count, scalar_count);
-
-    int64_t t_total_end = _now_ms();
-    LOG_INFO_V0("TIMING: args_malloc_copy = %" PRId64 "ms", t_args_end - t_args_start);
-    LOG_INFO_V0("TIMING: static_arena_setup = %" PRId64 "ms", t_setup_end - t_setup_start);
-    LOG_INFO_V0("TIMING: gm_heap_acquire = %" PRId64 "ms", t_heap_end - t_heap_start);
-    LOG_INFO_V0("TIMING: shared_mem_acquire = %" PRId64 "ms", t_sm_end - t_sm_start);
-    LOG_INFO_V0("TIMING: prebuilt_runtime_arena = %" PRId64 "ms", t_prebuilt_end - t_prebuilt_start);
-    LOG_INFO_V0("TIMING: total_init_runtime_impl = %" PRId64 "ms", t_total_end - t_total_start);
+    LOG_INFO_V0("fdwic runtime ready: %d tensors + %d scalars", tensor_count, scalar_count);
 
     return 0;
 }
@@ -582,76 +309,35 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
 
     LOG_INFO_V0("Tensor pairs to process: %d", tensor_pair_count);
 
-    // PTO2 (device orchestration): graph output may be in packed buffer
-    uint64_t graph_out_ptr = 0;
-    uint64_t graph_out_size = 0;
-    bool skip_tensor_copy_back = false;
-    int32_t runtime_status = 0;
-    PTO2SharedMemoryHeader host_header;
-    memset(&host_header, 0, sizeof(host_header));
+    for (int i = 0; i < tensor_pair_count; i++) {
+        const TensorPair &pair = tensor_pairs[i];
 
-    runtime_status = read_runtime_status(runtime, &host_header);
-    if (runtime_status != 0) {
-        int32_t orch_error_code = host_header.orch_error_code.load(std::memory_order_relaxed);
-        int32_t sched_error_code = host_header.sched_error_code.load(std::memory_order_relaxed);
-        LOG_ERROR(
-            "PTO2 runtime failed: orch_error_code=%d sched_error_code=%d runtime_status=%d", orch_error_code,
-            sched_error_code, runtime_status
-        );
-        skip_tensor_copy_back = true;
-    } else {
-        graph_out_ptr = host_header.graph_output_ptr;
-        graph_out_size = host_header.graph_output_size;
-        if (graph_out_ptr != 0) {
-            LOG_INFO_V0("Graph output buffer: ptr=0x%" PRIx64 ", size=%" PRIu64, graph_out_ptr, graph_out_size);
+        // Skip if device pointer is null
+        if (pair.dev_ptr == nullptr) {
+            LOG_WARN("Tensor %d has null device pointer, skipping", i);
+            continue;
         }
-    }
 
-    if (skip_tensor_copy_back) {
-        LOG_WARN("Skipping tensor copy-back because PTO2 runtime reported fatal status");
-    } else {
-        bool first_output_tensor = true;
-        for (int i = 0; i < tensor_pair_count; i++) {
-            const TensorPair &pair = tensor_pairs[i];
+        // If host pointer is null, this is a device-only allocation (no copy-back)
+        if (pair.host_ptr == nullptr) {
+            LOG_INFO_V0("Tensor %d: device-only allocation (no copy-back)", i);
+            continue;
+        }
 
-            // Skip if device pointer is null
-            if (pair.dev_ptr == nullptr) {
-                LOG_WARN("Tensor %d has null device pointer, skipping", i);
-                continue;
-            }
+        // Read-only INPUT tensors were uploaded H2D but the kernel never
+        // wrote them — copying them back (potentially ~GB) is pure waste.
+        // They are still device_free'd in the cleanup loop below.
+        if (!pair.needs_copy_back) {
+            LOG_INFO_V0("Tensor %d: read-only input, skipping copy-back", i);
+            continue;
+        }
 
-            // If host pointer is null, this is a device-only allocation (no copy-back)
-            if (pair.host_ptr == nullptr) {
-                LOG_INFO_V0("Tensor %d: device-only allocation (no copy-back)", i);
-                continue;
-            }
-
-            // Read-only INPUT tensors were uploaded H2D but the kernel never
-            // wrote them — copying them back (potentially ~GB) is pure waste.
-            // They are still device_free'd in the cleanup loop below.
-            if (!pair.needs_copy_back) {
-                LOG_INFO_V0("Tensor %d: read-only input, skipping copy-back", i);
-                continue;
-            }
-
-            void *src_ptr = pair.dev_ptr;
-            size_t copy_size = pair.size;
-
-            // Use graph_output_ptr for the first output tensor if available
-            if (first_output_tensor && graph_out_ptr != 0 && graph_out_size > 0) {
-                src_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(graph_out_ptr));
-                copy_size = static_cast<size_t>(graph_out_size);
-                LOG_INFO_V0("Using packed output buffer for tensor %d", i);
-                first_output_tensor = false;
-            }
-
-            int copy_rc = runtime->host_api.copy_from_device(pair.host_ptr, src_ptr, copy_size);
-            if (copy_rc != 0) {
-                LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
-                rc = copy_rc;
-            } else {
-                LOG_INFO_V0("Tensor %d: %zu bytes copied to host", i, pair.size);
-            }
+        int copy_rc = runtime->host_api.copy_from_device(pair.host_ptr, pair.dev_ptr, pair.size);
+        if (copy_rc != 0) {
+            LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
+            rc = copy_rc;
+        } else {
+            LOG_INFO_V0("Tensor %d: %zu bytes copied to host", i, pair.size);
         }
     }
 
@@ -682,10 +368,6 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
     runtime->tensor_pairs_.clear();
 
     LOG_INFO_V0("=== Finalize Complete ===");
-
-    if (rc == 0 && runtime_status != 0) {
-        rc = runtime_status;
-    }
 
     return rc;
 }
