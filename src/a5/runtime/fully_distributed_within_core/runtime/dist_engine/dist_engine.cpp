@@ -892,9 +892,7 @@ struct DistGlobal {
 [[block_local]] static int32_t g_ccec_ordinal;
 [[block_local]] static bool g_ccec_valid_worker;
 [[block_local]] static int32_t g_ccec_local_index;
-[[block_local]] static uint64_t g_ccec_heap_next;
-[[block_local]] static int32_t g_ccec_outpool_head;
-[[block_local]] static int32_t g_ccec_map_count;
+[[block_local]] static __gm__ Runtime::DistHandoff::SubmitCoreState *g_submit_core;
 #define g_dist (*g_dist_ptr)
 #elif defined(__CPU_SIM)
 static DistGlobal *g_dist_ptr = nullptr;
@@ -1451,7 +1449,8 @@ PTO_DEVICE_FUNC bool dist_submit_check_task_cap(const DistSubmitCtx &ctx, DistSu
 PTO_DEVICE_FUNC bool dist_submit_materialize_outputs(const L0TaskArgs &args, DistSubmitCtx &ctx, DistSubmitKind kind) {
 #if defined(__CCE_AICORE__)
     (void)kind;
-    if (g_ccec_runtime == nullptr || g_ccec_core_idx < 0 || g_ccec_core_idx >= RUNTIME_MAX_WORKER) return false;
+    if (g_ccec_runtime == nullptr || g_submit_core == nullptr || g_ccec_core_idx < 0 || g_ccec_core_idx >= RUNTIME_MAX_WORKER)
+        return false;
     const uint64_t heap_base = g_ccec_runtime->dist.ccec_heap_base;
     const uint64_t heap_size = g_ccec_runtime->dist.ccec_heap_size;
     if (heap_base == 0 || heap_size == 0) return false;
@@ -1461,7 +1460,7 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_outputs(const L0TaskArgs &args, Dis
         if (args.tag(i) != TensorArgType::OUTPUT) continue;
         total += PTO2_ALIGN_UP(TensorCreateInfo::buffer_size_bytes(args.tensor(i).create_info()), PTO2_PACKED_OUTPUT_ALIGN);
     }
-    uint64_t task_base = PTO2_ALIGN_UP(g_ccec_heap_next, PTO2_PACKED_OUTPUT_ALIGN);
+    uint64_t task_base = PTO2_ALIGN_UP(g_submit_core->heap_next, PTO2_PACKED_OUTPUT_ALIGN);
     if (total > 0 && (task_base % heap_size) + total > heap_size) {
         task_base = ((task_base / heap_size) + 1) * heap_size;
     }
@@ -1474,14 +1473,14 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_outputs(const L0TaskArgs &args, Dis
         const uint64_t sz = PTO2_ALIGN_UP(logical, PTO2_PACKED_OUTPUT_ALIGN);
         const uint64_t phys = (task_base + off) % heap_size;
         __gm__ Tensor &slot_t =
-            g_ccec_runtime->dist.ccec_output_tensors[g_ccec_core_idx].tensors[g_ccec_outpool_head];
-        g_ccec_outpool_head = (g_ccec_outpool_head + 1) % 8;
+            g_ccec_runtime->dist.ccec_output_tensors[g_ccec_core_idx].tensors[g_submit_core->outpool_head];
+        g_submit_core->outpool_head = (g_submit_core->outpool_head + 1) % 8;
         init_tensor_from_create_info(slot_t, ci, reinterpret_cast<void *>(heap_base + phys), logical);
         ccec_flush_region(&slot_t, sizeof(Tensor));
         ctx.result.materialize_output(slot_t);
         off += sz;
     }
-    g_ccec_heap_next = task_base + off;
+    g_submit_core->heap_next = task_base + off;
     ctx.output_bytes = total;
     return true;
 #else
@@ -2082,12 +2081,13 @@ PTO_DEVICE_FUNC uint64_t ccec_tensor_bytes(const Tensor &t) {
 }
 
 PTO_DEVICE_FUNC int32_t ccec_lookup_producer(const Tensor &t) {
-    if (g_ccec_runtime == nullptr || g_ccec_core_idx < 0 || g_ccec_core_idx >= RUNTIME_MAX_WORKER) return -1;
+    if (g_ccec_runtime == nullptr || g_submit_core == nullptr || g_ccec_core_idx < 0 || g_ccec_core_idx >= RUNTIME_MAX_WORKER)
+        return -1;
     const uint64_t addr = t.buffer.addr + t.start_offset * get_element_size(t.dtype);
     const uint64_t size = ccec_tensor_bytes(t);
     __gm__ Runtime::DistHandoff::CcecMapEntry *entries =
         g_ccec_runtime->dist.ccec_maps[g_ccec_core_idx].entries;
-    for (int32_t i = g_ccec_map_count - 1; i >= 0; i--) {
+    for (int32_t i = g_submit_core->map_count - 1; i >= 0; i--) {
         __gm__ const Runtime::DistHandoff::CcecMapEntry &entry = entries[i];
         if (entry.addr == addr && entry.size == size) return entry.task_id;
     }
@@ -2095,12 +2095,13 @@ PTO_DEVICE_FUNC int32_t ccec_lookup_producer(const Tensor &t) {
 }
 
 PTO_DEVICE_FUNC void ccec_insert_producer(const Tensor &t, int32_t task_id) {
-    if (g_ccec_runtime == nullptr || g_ccec_core_idx < 0 || g_ccec_core_idx >= RUNTIME_MAX_WORKER) return;
+    if (g_ccec_runtime == nullptr || g_submit_core == nullptr || g_ccec_core_idx < 0 || g_ccec_core_idx >= RUNTIME_MAX_WORKER)
+        return;
     const uint64_t addr = t.buffer.addr + t.start_offset * get_element_size(t.dtype);
     const uint64_t size = ccec_tensor_bytes(t);
     __gm__ Runtime::DistHandoff::CcecMapEntry *entries =
         g_ccec_runtime->dist.ccec_maps[g_ccec_core_idx].entries;
-    for (int32_t i = g_ccec_map_count - 1; i >= 0; i--) {
+    for (int32_t i = g_submit_core->map_count - 1; i >= 0; i--) {
         __gm__ Runtime::DistHandoff::CcecMapEntry &entry = entries[i];
         if (entry.addr == addr && entry.size == size) {
             entry.task_id = task_id;
@@ -2108,8 +2109,8 @@ PTO_DEVICE_FUNC void ccec_insert_producer(const Tensor &t, int32_t task_id) {
             return;
         }
     }
-    if (g_ccec_map_count < 8) {
-        __gm__ Runtime::DistHandoff::CcecMapEntry &entry = entries[g_ccec_map_count++];
+    if (g_submit_core->map_count < 8) {
+        __gm__ Runtime::DistHandoff::CcecMapEntry &entry = entries[g_submit_core->map_count++];
         entry.addr = addr;
         entry.size = size;
         entry.task_id = task_id;
@@ -2464,16 +2465,18 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
     g_ccec_runtime = runtime;
     g_ccec_core_idx = core_idx;
     g_ccec_core_type = core_type_int;
+    g_submit_core = &runtime->dist.submit_cores[core_idx];
+    g_submit_core->heap_next = 0;
+    g_submit_core->outpool_head = 0;
+    g_submit_core->map_count = 0;
     g_ccec_local_index = 0;
-    g_ccec_heap_next = 0;
-    g_ccec_outpool_head = 0;
-    g_ccec_map_count = 0;
     ccec_init_worker_layout();
 
     ccec_replay_orch(runtime);
     ccec_publish_done();
 
     g_ccec_runtime = nullptr;
+    g_submit_core = nullptr;
     return;
 #else
     if (core_idx < 0 || core_idx >= RUNTIME_MAX_WORKER) return;
