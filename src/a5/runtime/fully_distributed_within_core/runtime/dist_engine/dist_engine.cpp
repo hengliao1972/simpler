@@ -63,52 +63,57 @@
 
 // Basic C-stdlib headers are always safe (CCEC ships a full libc / libstdc++
 // subset; these show up transitively anyway). Everything else waits behind the
-// DIST_HOST_ONLY gate below.
+// DIST_CONTROL_PLANE gate below.
 #include <cstdint>
 #include <cstring>
 
 // PTO2_PROFILING is defined by profiling_config.h (default 1). Pull it in
-// explicitly so DIST_HOST_ONLY below can read it without relying on transitive
-// includes from the project headers further down (which themselves depend on
-// stdlib headers we haven't decided to bring in yet).
+// explicitly so trace/profiling gates below can read it without relying on
+// transitive includes from the project headers further down.
 #include "profiling_config.h"
 
-// Compile-time gate for host-only facilities.
-//
-// DIST_HOST_ONLY covers the swimlane tracer (per-task span capture + JSON
-// dump), the sim-only trace-driven replay (use_example_exec_time busy-wait),
-// the host wall-clock timer (now_ns / thread_cpu_ns), and every AICPU-side
-// diagnostic (fprintf, getenv, signal handlers, watchdog dumps). These are all
-// unavailable under CCEC — no <atomic>, <chrono>, <vector>, <csignal>, no
-// posix APIs — so they collapse to a single gate: enabled only when
-// PTO2_PROFILING is on AND we are NOT compiling for the AICore target. Sim /
-// AICPU builds get the full facility; CCEC AICore compiles them all out.
-//
-// PTO2_PROFILING comes from profiling_config.h (default 1; explicit 0 for
-// perf-only sim builds). __CCE_AICORE__ is defined by ccec under
-// --cce-aicore-arch=*. No #ifndef fallback on purpose: undefined ⇒ off.
-#if PTO2_PROFILING && !defined(__CCE_AICORE__)
-#define DIST_HOST_ONLY 1
+// Compile-time gate for the AICPU/sim control-plane build of this file.
+// `dist_engine_register()` runs on AICPU during onboard execution and on host
+// threads in CPU sim. CCEC AICore builds only keep the device-callable replay
+// path, so stdlib-heavy control-plane helpers are compiled out there.
+#if !defined(__CCE_AICORE__)
+#define DIST_CONTROL_PLANE 1
 #else
-#define DIST_HOST_ONLY 0
+#define DIST_CONTROL_PLANE 0
 #endif
 
-// Legacy aliases still referenced throughout this file. Kept as the single
-// unified gate above so the code below reads exactly the same regardless of
-// which alias a call site historically used.
-#define DIST_TRACE_ENABLED DIST_HOST_ONLY
-#define DIST_SIM_HOST_CLOCK DIST_HOST_ONLY
+// CPU-sim-only helpers. Onboard AICPU participates in the control plane, but it
+// does not support the host-side trace/vector/chrono facilities used here.
+#if defined(__CPU_SIM) && DIST_CONTROL_PLANE
+#define DIST_CPU_SIM_CONTROL 1
+#else
+#define DIST_CPU_SIM_CONTROL 0
+#endif
 
-#if DIST_HOST_ONLY
-// Host / sim / AICPU only: full stdlib. CCEC AICore skips these.
+// Trace/profiling helpers are additionally gated by PTO2_PROFILING. The sim
+// host-clock path is CPU-sim-only but not profiling-only: it also backs
+// use_example_exec_time replay.
+#if PTO2_PROFILING && DIST_CPU_SIM_CONTROL
+#define DIST_TRACE_ENABLED 1
+#else
+#define DIST_TRACE_ENABLED 0
+#endif
+#define DIST_SIM_HOST_CLOCK DIST_CPU_SIM_CONTROL
+
+#if DIST_CONTROL_PLANE
+// Control plane only: AICPU and CPU sim both use these basic facilities. CCEC
+// AICore skips them.
 #include <atomic>
-#include <chrono>
-#include <csignal>
-#include <ctime>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
-#include <string>
+#endif
+#if DIST_SIM_HOST_CLOCK
+#include <chrono>
+#include <ctime>
+#endif
+#if DIST_TRACE_ENABLED
+#include <csignal>
 #include <vector>
 #endif
 
@@ -116,7 +121,7 @@
 // AICore has no host stdio (nor variadic-fprintf support in CCEC's runtime), so
 // the call collapses to a no-op — the fatal flag itself already tears the run
 // down and the failure is observable via runtime state.
-#if DIST_HOST_ONLY
+#if DIST_CONTROL_PLANE
 #define DIST_ERRF(...) fprintf(stderr, __VA_ARGS__)
 #else
 #define DIST_ERRF(...) ((void)0)
@@ -198,7 +203,7 @@ extern "C" __attribute__((weak)) PTO_DEVICE_FUNC void *memcpy(void *dst, const v
 // AtomicLoadAdd s32". Every field that participates in atom_fetch_add is
 // therefore int64_t, not int32_t.
 // -----------------------------------------------------------------------------
-#if DIST_HOST_ONLY
+#if DIST_CONTROL_PLANE
 void dist_dump_state(int);  // defined below; dumps full engine state for hangs
 #endif
 
@@ -1019,14 +1024,15 @@ inline void trace_lap_impl(DistCore *self, int32_t task_id, int32_t func_id, Tra
 #define TRACE_OVERHEAD(self, task_id, func_id, phase, t0_ns, t0_cpu) ((void)0)
 #endif  // DIST_TRACE_ENABLED
 
-// Opt-in per-core tracing (set PTO_DIST_TRACE=1). Off by default so a passing
-// run is quiet; fatal/error/heap-exhaustion diagnostics are always emitted.
-// Host-only: relies on getenv; every caller sits under DIST_HOST_ONLY.
-#if DIST_HOST_ONLY
+// Opt-in per-core tracing (set PTO_DIST_TRACE=1). CPU sim only; onboard AICPU
+// keeps the control plane but not the host-side trace machinery.
+#if DIST_TRACE_ENABLED
 inline bool dist_trace() {
     static const bool on = (getenv("PTO_DIST_TRACE") != nullptr);
     return on;
 }
+#else
+inline bool dist_trace() { return false; }
 #endif
 
 // -----------------------------------------------------------------------------
@@ -1035,16 +1041,10 @@ inline bool dist_trace() {
 PTO_DEVICE_FUNC inline bool fatal_set() { return atom_load(g_dist.fatal, __ATOMIC_ACQUIRE) != 0; }
 PTO_DEVICE_FUNC inline void set_fatal() { atom_store(g_dist.fatal, 1, __ATOMIC_RELEASE); }
 
-// Env-gated stall watchdog (set PTO_DIST_WATCHDOG=<seconds>, default off). Called
-// from inside the engine's spin loops on a worker thread (so fprintf is safe,
-// unlike a signal handler). On the first call it records a start time; if a loop
-// keeps spinning past the budget the engine is presumed deadlocked, so it dumps
-// the full state once and sets fatal to unwind every core for a fast, diagnosed
-// failure instead of an indefinite hang. CCEC/onboard has no getenv/chrono/
-// fprintf, so the function collapses to a no-op there — call sites remain
-// unchanged and pay a single unused-argument tag.
+// Env-gated stall watchdog (set PTO_DIST_WATCHDOG=<seconds>, default off).
+// CPU-sim only: it relies on host clocks and signal/debug dump support.
 PTO_DEVICE_FUNC inline void watchdog([[maybe_unused]] uint64_t &start_ns) {
-#if DIST_HOST_ONLY
+#if DIST_SIM_HOST_CLOCK
     static const long budget_s = []() -> long {
         const char *e = getenv("PTO_DIST_WATCHDOG");
         return e ? atol(e) : 0;
@@ -1892,7 +1892,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC bool dist_is_fatal_query() {
 DIST_API_ATTR PTO_DEVICE_FUNC void dist_report_fatal_msg(
     int32_t code, __gm__ const char *func, __gm__ const char *msg
 ) {
-#if DIST_HOST_ONLY
+#if DIST_CONTROL_PLANE
     set_fatal();
     fprintf(stderr, "[dist_engine][FATAL][%s] code=%d: %s\n", func ? func : "?", code, msg ? msg : "");
 #else
@@ -1904,7 +1904,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_report_fatal_msg(
 
 // Log sinks — const-string message API (no va_list).
 DIST_API_ATTR PTO_DEVICE_FUNC void dist_log_error_msg(__gm__ const char *func, __gm__ const char *msg) {
-#if DIST_HOST_ONLY
+#if DIST_CONTROL_PLANE
     fprintf(stderr, "[dist_engine][E][%s] %s\n", func ? func : "?", msg ? msg : "");
 #else
     (void)func;
@@ -1936,7 +1936,7 @@ namespace {  // reopen internal namespace for wait_producer_ready only
 // this core's own ring meanwhile so an owned producer actually runs). External
 // tensors (no producer) are accessed immediately. Consumer (WAR) tracking is not
 // modeled, mirroring the centralized runtime's documented INPUT-reader limitation.
-#if DIST_HOST_ONLY
+#if DIST_CONTROL_PLANE
 // wait_producer_ready + the dist_get/set_tensor_data_impl path below are only
 // exercised on sim / AICPU (host-side orchestration replay). CCEC-side orch
 // runs through a different code path (C.4.b/c) that will re-introduce a
@@ -1956,7 +1956,7 @@ PTO_DEVICE_FUNC void wait_producer_ready(DistCore *self, const Tensor &t) {
         }
     }
 }
-#endif  // DIST_HOST_ONLY
+#endif  // DIST_CONTROL_PLANE
 
 }  // namespace
 
@@ -1964,7 +1964,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC uint64_t dist_get_tensor_data_impl(
     PTO2Runtime *, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]
 ) {
     if (tensor.buffer.addr == 0) return 0;
-#if DIST_HOST_ONLY
+#if DIST_CONTROL_PLANE
     // Sim/AICPU: g_self is a plain thread_local DistCore*. Reachable to
     // wait_producer_ready as a non-__gm__ pointer.
     DistCore *self = g_self;
@@ -1973,7 +1973,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC uint64_t dist_get_tensor_data_impl(
     const uint64_t flat = tensor.compute_flat_offset(indices, ndims);
     const uint64_t esz = get_element_size(tensor.dtype);
     uint64_t result = 0;
-#if DIST_HOST_ONLY
+#if DIST_CONTROL_PLANE
     __builtin_memcpy(&result, reinterpret_cast<const void *>(tensor.buffer.addr + flat * esz), esz);
 #else
     const uint64_t addr = tensor.buffer.addr + flat * esz;
@@ -1994,13 +1994,13 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_set_tensor_data_impl(
     PTO2Runtime *, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
 ) {
     if (tensor.buffer.addr == 0) return;
-#if DIST_HOST_ONLY
+#if DIST_CONTROL_PLANE
     DistCore *self = g_self;
     if (self != nullptr) wait_producer_ready(self, tensor);
 #endif
     const uint64_t flat = tensor.compute_flat_offset(indices, ndims);
     const uint64_t esz = get_element_size(tensor.dtype);
-#if DIST_HOST_ONLY
+#if DIST_CONTROL_PLANE
     __builtin_memcpy(reinterpret_cast<void *>(tensor.buffer.addr + flat * esz), &value, esz);
 #else
     const uint64_t addr = tensor.buffer.addr + flat * esz;
@@ -2020,7 +2020,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_set_tensor_data_impl(
 // Ops-table stubs used by CPU-sim AICore orchestration wrappers. CCEC wrappers
 // call dist_engine_api.h directly and do not need this indirection.
 // -----------------------------------------------------------------------------
-#if DIST_HOST_ONLY
+#if DIST_CONTROL_PLANE
 void dist_scope_begin(PTO2Runtime *rt) { dist_scope_begin_impl(rt); }
 void dist_scope_end(PTO2Runtime *rt) { dist_scope_end_impl(rt); }
 void dist_orchestration_done(PTO2Runtime *rt) { dist_orchestration_done_impl(rt); }
@@ -2059,7 +2059,7 @@ void dist_set_tensor_data(
 ) {
     dist_set_tensor_data_impl(rt, tensor, ndims, indices, value);
 }
-#endif  // DIST_HOST_ONLY
+#endif  // DIST_CONTROL_PLANE
 
 #if defined(__CCE_AICORE__)
 namespace {
@@ -2388,20 +2388,20 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
 }
 #endif
 
-#if DIST_HOST_ONLY
+#if DIST_CONTROL_PLANE
 const PTO2RuntimeOps g_dist_ops = {
     dist_submit_impl,          dist_scope_begin,          dist_scope_end,     dist_orchestration_done, dist_is_fatal,
     dist_report_fatal,         dist_log_error,            dist_log_warn,      dist_log_debug,          dist_log_info_v,
     dist_get_tensor_data,      dist_set_tensor_data,      dist_alloc_tensors, dist_submit_dummy_impl,  dist_scope_set_site_impl,
 };
-#endif  // DIST_HOST_ONLY
+#endif  // DIST_CONTROL_PLANE
 
 // -----------------------------------------------------------------------------
 // Deadlock diagnostics: dump the full engine state on SIGUSR1. Sim runs every
 // core as a pthread in one process, so a single handler can walk g_dist. Used to
 // debug hangs (kill -USR1 <pid>); compiled in but inert unless signalled.
 // -----------------------------------------------------------------------------
-#if DIST_HOST_ONLY
+#if DIST_CONTROL_PLANE
 void dist_dump_state(int) {
     fprintf(stderr, "\n===== DIST STATE DUMP =====\n");
     fprintf(
@@ -2459,7 +2459,7 @@ void dist_dump_state(int) {
     }
     fprintf(stderr, "===== END DUMP =====\n");
 }
-#endif  // DIST_HOST_ONLY
+#endif  // DIST_CONTROL_PLANE
 
 // -----------------------------------------------------------------------------
 // Per-core entry point invoked by each AICore worker thread.
@@ -2512,7 +2512,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
         g_dist.rt->ops = &g_dist_ops;
     }
 #endif
-#if DIST_HOST_ONLY
+#if DIST_CONTROL_PLANE
     if (dist_trace())
         fprintf(
             stderr, "[dist] core %d role=%d block=%d lane=%d START\n", core_idx, core_type_int, lay.block_id, lay.lane
@@ -2569,7 +2569,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
         }
     }
 
-#if DIST_HOST_ONLY
+#if DIST_CONTROL_PLANE
     if (dist_trace() || fatal_set()) {
         fprintf(
             stderr, "[dist] core %d role=%d DONE replayed=%d owned=%d fatal=%d\n", core_idx, core_type_int,
@@ -2600,7 +2600,7 @@ aicore_dist_core_main(__gm__ Runtime *runtime, int core_idx, int core_type_int) 
 // dumper, none of which are available under CCEC. Gate the entire host-only
 // tail so CCEC compilations of dist_engine.cpp end at the namespace close and
 // leave these symbols to libaicpu_kernel.
-#if DIST_HOST_ONLY
+#if DIST_CONTROL_PLANE
 
 void *dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_workers, Runtime *runtime) {
     if (rt == nullptr || rt->dist_global == nullptr || rt->gm_heap == nullptr || rt->gm_heap_size == 0) {
@@ -2695,6 +2695,7 @@ void *dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num
         );
     }
 
+#if DIST_SIM_HOST_CLOCK
     // Install the SIGUSR1 deadlock dumper once, but only when diagnostics are
     // opted in (PTO_DIST_WATCHDOG set) — default runs install no signal handler.
     static bool handler_installed = false;
@@ -2702,6 +2703,7 @@ void *dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num
         signal(SIGUSR1, dist_dump_state);
         handler_installed = true;
     }
+#endif
 
     // Publish the DistGlobal struct address so device workers can wire up
     // their g_dist_ptr at dist_core_main entry. In sim the host BSS `g_dist`
@@ -2966,4 +2968,4 @@ void dist_engine_dump_trace() {
 void dist_engine_dump_trace() {}
 #endif  // DIST_TRACE_ENABLED
 
-#endif  // DIST_HOST_ONLY
+#endif  // DIST_CONTROL_PLANE
