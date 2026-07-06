@@ -1395,6 +1395,137 @@ PTO_DEVICE_FUNC void dist_submit_execute_first(__gm__ DistCore *self) {
     TRACE_LAP(self, self->local_index, -1, TracePhase::EfDrain);
 }
 
+enum class DistSubmitKind : int32_t {
+    Kernel = 0,
+    Alloc = 1,
+};
+
+struct DistSubmitCtx {
+    __gm__ DistCore *self;
+    int32_t task_id;
+    int32_t tensor_count;
+    uint64_t output_bytes;
+    TaskOutputTensors result;
+};
+
+PTO_DEVICE_FUNC DistSubmitCtx dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &args) {
+    DistSubmitCtx ctx;
+    ctx.self = self;
+    ctx.task_id = self->local_index++;
+    ctx.tensor_count = args.tensor_count();
+    ctx.output_bytes = 0;
+    return ctx;
+}
+
+PTO_DEVICE_FUNC bool dist_submit_check_task_cap(const DistSubmitCtx &ctx, DistSubmitKind kind) {
+    if (ctx.task_id < kFlagCap) return true;
+    set_fatal();
+    if (kind == DistSubmitKind::Alloc) {
+        DIST_ERRF("[dist_engine] alloc task id %d exceeds kFlagCap %d\n", ctx.task_id, kFlagCap);
+    } else {
+        DIST_ERRF(
+            "[dist_engine] task id %d exceeds kFlagCap %d (enlarge or window the flag/vend rings)\n", ctx.task_id,
+            kFlagCap
+        );
+    }
+    return false;
+}
+
+PTO_DEVICE_FUNC bool dist_submit_materialize_outputs(const L0TaskArgs &args, DistSubmitCtx &ctx, DistSubmitKind kind) {
+    const size_t ring = g_dist.heap_size;
+    uint64_t total = 0;
+    for (int32_t i = 0; i < ctx.tensor_count; i++) {
+        if (args.tag(i) != TensorArgType::OUTPUT) continue;
+        total += PTO2_ALIGN_UP(TensorCreateInfo::buffer_size_bytes(args.tensor(i).create_info()), PTO2_PACKED_OUTPUT_ALIGN);
+    }
+    uint64_t task_base = PTO2_ALIGN_UP(ctx.self->heap_next, PTO2_PACKED_OUTPUT_ALIGN);
+    if (total > 0 && g_dist.heap_base != nullptr) {
+        if (total > ring) {
+            set_fatal();
+            if (kind == DistSubmitKind::Alloc) {
+                DIST_ERRF(
+                    "[dist_engine] alloc task %d outputs %llu B exceed heap ring %zu B\n", ctx.task_id,
+                    (unsigned long long)total, ring
+                );
+            } else {
+                DIST_ERRF(
+                    "[dist_engine] task %d outputs %llu B exceed heap ring %zu B (enlarge PTO_DIST_HEAP_MB)\n",
+                    ctx.task_id, (unsigned long long)total, ring
+                );
+            }
+            return false;
+        }
+        if ((task_base % ring) + total > ring) {
+            task_base = ((task_base / ring) + 1) * ring;  // skip the ring tail; start next lap
+        }
+    }
+
+    uint64_t off = 0;
+    for (int32_t i = 0; i < ctx.tensor_count; i++) {
+        if (args.tag(i) != TensorArgType::OUTPUT) continue;
+        const TensorCreateInfo &ci = args.tensor(i).create_info();
+        const uint64_t logical = TensorCreateInfo::buffer_size_bytes(ci);
+        const uint64_t sz = PTO2_ALIGN_UP(logical, PTO2_PACKED_OUTPUT_ALIGN);
+        if (g_dist.heap_base == nullptr) {
+            set_fatal();
+            if (kind == DistSubmitKind::Alloc) {
+                DIST_ERRF("[dist_engine] GM output heap not allocated at alloc %d\n", ctx.task_id);
+            } else {
+                DIST_ERRF("[dist_engine] GM output heap not allocated at task %d\n", ctx.task_id);
+            }
+            return false;
+        }
+        const uint64_t phys = (task_base + off) % ring;
+        __gm__ Tensor &slot_t = ctx.self->outpool[ctx.self->outpool_head];
+        ctx.self->outpool_head = (ctx.self->outpool_head + 1) % kOutPoolSlots;
+        init_tensor_from_create_info(slot_t, ci, g_dist.heap_base + phys, logical);
+        ctx.result.materialize_output(slot_t);
+        off += sz;
+    }
+    ctx.self->heap_next = task_base + off;
+    ctx.output_bytes = total;
+    if (ctx.task_id >= 0 && ctx.task_id < kFlagCap)
+        atom_store(g_dist.vend[ctx.task_id], ctx.self->heap_next, __ATOMIC_RELAXED);
+    return true;
+}
+
+PTO_DEVICE_FUNC void dist_submit_prepare_map(__gm__ DistCore *self, int32_t task_id) {
+    DistTensorMap::advance_retire(self->map, task_id, g_dist.H);
+}
+
+PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const DistSubmitCtx &ctx, int32_t fanin[]) {
+    int32_t fc = 0;
+    for (int32_t i = 0; i < ctx.tensor_count; i++) {
+        const TensorArgType tag = args.tag(i);
+        if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
+        const Tensor &t = args.tensor(i).ref();
+        if (t.manual_dep) continue;
+        const int32_t p = DistTensorMap::lookup(ctx.self->map, t);
+        if (p < 0) continue;
+        bool dup = false;
+        for (int32_t k = 0; k < fc; k++)
+            if (fanin[k] == p) {
+                dup = true;
+                break;
+            }
+        if (!dup && fc < kMaxFanin) fanin[fc++] = p;
+    }
+    return fc;
+}
+
+PTO_DEVICE_FUNC void dist_submit_register_outputs(const L0TaskArgs &args, DistSubmitCtx &ctx, bool include_existing) {
+    uint32_t out_idx = 0;
+    for (int32_t i = 0; i < ctx.tensor_count; i++) {
+        const TensorArgType tag = args.tag(i);
+        if (tag == TensorArgType::OUTPUT) {
+            DistTensorMap::insert(ctx.self->map, ctx.result.get_ref(out_idx), ctx.task_id);
+            out_idx++;
+        } else if (include_existing && (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING)) {
+            DistTensorMap::insert(ctx.self->map, args.tensor(i).ref(), ctx.task_id);
+        }
+    }
+}
+
 PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &args) {
     __gm__ DistCore *self = g_self;
     if (self == nullptr) return TaskOutputTensors{};
@@ -1414,17 +1545,11 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
     // purpose (a deliberate gap between submits, not a runtime span).
     dist_submit_execute_first(self);
 
-    const int32_t N = self->local_index++;
+    DistSubmitCtx ctx = dist_submit_begin(self, args);
+    const int32_t N = ctx.task_id;
     const ActiveMask M = mixed.to_active_mask();
-    const int32_t tc = args.tensor_count();
-    if (N >= kFlagCap) {  // flag ring + vend[] are non-windowed; cap total tasks
-        set_fatal();
-        DIST_ERRF(
-            "[dist_engine] task id %d exceeds kFlagCap %d (enlarge or window the flag/vend rings)\n", N,
-            kFlagCap
-        );
-        return TaskOutputTensors{};
-    }
+    const int32_t tc = ctx.tensor_count;
+    if (!dist_submit_check_task_cap(ctx, DistSubmitKind::Kernel)) return TaskOutputTensors{};
 
     // (a) Deterministic GM output-heap allocation + materialization (§9.3, §11.4).
     // The virtual bump `heap_next` is unbounded and identical on every core; the
@@ -1432,67 +1557,19 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
     // bytes so we can keep the whole task within one ring lap: if it would straddle
     // the ring end, pad the virtual base up to the next ring boundary (deterministic
     // → every core agrees). A single task larger than the ring is unsatisfiable.
-    const size_t ring = g_dist.heap_size;
-    uint64_t total = 0;
-    for (int32_t i = 0; i < tc; i++) {
-        if (args.tag(i) != TensorArgType::OUTPUT) continue;
-        total += PTO2_ALIGN_UP(TensorCreateInfo::buffer_size_bytes(args.tensor(i).create_info()), PTO2_PACKED_OUTPUT_ALIGN);
-    }
-    uint64_t task_base = PTO2_ALIGN_UP(self->heap_next, PTO2_PACKED_OUTPUT_ALIGN);
-    if (total > 0 && g_dist.heap_base != nullptr) {
-        if (total > ring) {
-            set_fatal();
-            DIST_ERRF(
-                "[dist_engine] task %d outputs %llu B exceed heap ring %zu B (enlarge PTO_DIST_HEAP_MB)\n", N,
-                (unsigned long long)total, ring
-            );
-            return TaskOutputTensors{};
-        }
-        if ((task_base % ring) + total > ring) {
-            task_base = ((task_base / ring) + 1) * ring;  // skip the ring tail; start next lap
-        }
-    }
-    uint64_t off = 0;
-    TaskOutputTensors result;
-    for (int32_t i = 0; i < tc; i++) {
-        if (args.tag(i) != TensorArgType::OUTPUT) continue;
-        // TensorRef::create_info() now returns a default-address-space ref
-        // (see pto_types.h — orch is all stack-local under CCEC). The engine
-        // still writes the derived Tensor into a GM outpool slot; the
-        // cross-space transition happens inside init_tensor_from_create_info,
-        // whose signature takes __gm__ dst + non-__gm__ src.
-        const TensorCreateInfo &ci = args.tensor(i).create_info();
-        const uint64_t logical = TensorCreateInfo::buffer_size_bytes(ci);
-        const uint64_t sz = PTO2_ALIGN_UP(logical, PTO2_PACKED_OUTPUT_ALIGN);
-        if (g_dist.heap_base == nullptr) {
-            set_fatal();
-            DIST_ERRF("[dist_engine] GM output heap not allocated at task %d\n", N);
-            return result;
-        }
-        const uint64_t phys = (task_base + off) % ring;  // straddle-pad guarantees phys+logical <= ring
-        __gm__ Tensor &slot_t = self->outpool[self->outpool_head];
-        self->outpool_head = (self->outpool_head + 1) % kOutPoolSlots;
-        init_tensor_from_create_info(slot_t, ci, g_dist.heap_base + phys, logical);
-        result.materialize_output(slot_t);
-        off += sz;
-    }
-    self->heap_next = task_base + off;
-    // Publish cumulative virtual bytes through task N so any core can derive the
-    // live window [vend[R], heap_next) for reclaim back-pressure. Deterministic, so
-    // all cores store the same value (this core also reads its own writes for R<N).
-    if (N >= 0 && N < kFlagCap) atom_store(g_dist.vend[N], self->heap_next, __ATOMIC_RELAXED);
+    dist_submit_materialize_outputs(args, ctx, DistSubmitKind::Kernel);
 
     // Once fatal, stop claiming/executing but keep replaying the deterministic
     // allocation above so this task's `result` carries valid (materialized) output
     // refs — the orchestration may still call get_ref() on them. This degrades a
     // fatal (e.g. heap-too-small) into a clean wrong-answer failure + diagnostic
     // rather than an assertion crash mid-replay.
-    if (fatal_set()) return result;
+    if (fatal_set()) return ctx.result;
 
     // Retire producer-map entries that have left the H span (deterministic,
     // N-derived) before this task's lookups/inserts. Bounds chain length so
     // submit stays ~O(N) instead of O(N^2). See DistTensorMap.
-    DistTensorMap::advance_retire(self->map, N, g_dist.H);
+    dist_submit_prepare_map(self, N);
 
     // (b) Anchor type + claim race FIRST — resolved from the mask alone (no map
     // ops, no Tensor copies). Deciding the winner up front lets the ~2/3 of cores
@@ -1524,43 +1601,16 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
     int32_t fanin[kMaxFanin];
     int32_t fc = 0;
     if (is_winner) {
-        for (int32_t i = 0; i < tc; i++) {
-            const TensorArgType tag = args.tag(i);
-            if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
-            // TensorRef::ref() now returns default-address-space; orch's
-            // stack-local Tensor is the physical source. DistTensorMap::lookup
-            // needs a Tensor to compare buffer.addr against — the address
-            // itself is space-agnostic, so a plain reference is enough.
-            const Tensor &t = args.tensor(i).ref();
-            if (t.manual_dep) continue;
-            const int32_t p = DistTensorMap::lookup(self->map, t);
-            if (p < 0) continue;
-            bool dup = false;
-            for (int32_t k = 0; k < fc; k++)
-                if (fanin[k] == p) {
-                    dup = true;
-                    break;
-                }
-            if (!dup && fc < kMaxFanin) fanin[fc++] = p;
-        }
+        fc = dist_submit_collect_fanin(args, ctx, fanin);
     }
 
     // (d) Register this task as the producer of its OUTPUT / INOUT / existing
     // outputs — UNCONDITIONAL (every core, so all duplicate maps stay identical).
-    uint32_t out_idx = 0;
-    for (int32_t i = 0; i < tc; i++) {
-        const TensorArgType tag = args.tag(i);
-        if (tag == TensorArgType::OUTPUT) {
-            DistTensorMap::insert(self->map, result.get_ref(out_idx), N);
-            out_idx++;
-        } else if (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING) {
-            DistTensorMap::insert(self->map, args.tensor(i).ref(), N);
-        }
-    }
+    dist_submit_register_outputs(args, ctx, /*include_existing=*/true);
 
     if (!is_winner) {
         TRACE_LAP(self, N, -1, TracePhase::Replay);
-        return result;  // wrong type or lost the race: map updated, nothing to build
+        return ctx.result;  // wrong type or lost the race: map updated, nothing to build
     }
 
     // (e) Winner only: assemble the shared argument Tensors (identical for every
@@ -1576,7 +1626,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
         uint32_t bo = 0;
         for (int32_t i = 0; i < tc; i++) {
             if (args.tag(i) == TensorArgType::OUTPUT) {
-                Tensor::copy(built[i], result.get_ref(bo));
+                Tensor::copy(built[i], ctx.result.get_ref(bo));
                 bo++;
             } else {
                 Tensor::copy(built[i], args.tensor(i).ref());
@@ -1616,7 +1666,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
             watchdog(wd_self);
         }
     }
-    if (fatal_set()) return result;
+    if (fatal_set()) return ctx.result;
 
     // Heap reclaim back-pressure (§9.5/§11.4): this owner is about to build (and
     // later write) task N's outputs at deterministic physical offsets. Recycling a
@@ -1639,7 +1689,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
                     "enlarge PTO_DIST_HEAP_MB or reduce PTO_DIST_H\n",
                     ring, g_dist.H, N, (unsigned long long)(self->heap_next - vstart_live)
                 );
-                return result;
+                return ctx.result;
             }
             drain_block_won(self);
             if (drain_phase_b(self) == 0) {
@@ -1647,7 +1697,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
                 watchdog(wd_heap);
             }
         }
-        if (fatal_set()) return result;
+        if (fatal_set()) return ctx.result;
     }
     // Time spent in the two back-pressure spins above (ring-slot wait + heap
     // reclaim wait) — dependency/slot WAITING, kept separate from Build.
@@ -1657,7 +1707,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
     if (si < 0) {  // should not happen given the back-pressure gate above
         set_fatal();
         DIST_ERRF("[dist_engine] no free private-ring slot after back-pressure at task %d\n", N);
-        return result;
+        return ctx.result;
     }
     // Reserve so concurrent drains (including the block.won back-pressure loop
     // below, which calls drain_phase_b) do not reuse this slot. Mark it unbuilt
@@ -1692,7 +1742,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
             }
             won_slot = alloc_won_slot(won_block);
         }
-        if (fatal_set()) return result;
+        if (fatal_set()) return ctx.result;
         __gm__ WonSlot &w = g_dist.blocks[won_block].slots[won_slot];
         w.task_id = N;
         atom_store<int64_t>(w.remaining, pc, __ATOMIC_RELAXED);
@@ -1738,7 +1788,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
     }
 #endif
     TRACE_LAP(self, N, -1, TracePhase::Commit);
-    return result;
+    return ctx.result;
 }
 #if defined(__CCE_AICORE__)
 }  // namespace
@@ -2273,72 +2323,21 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
     // EXECUTE-FIRST (docs §6 step 0+1, §6.1): every submit point first seeks an
     // execution opportunity before advancing the deterministic replay below.
     dist_submit_execute_first(self);
-    const int32_t N = self->local_index++;
-    const int32_t tc = args.tensor_count();
-    if (N >= kFlagCap) {
-        set_fatal();
-        DIST_ERRF("[dist_engine] alloc task id %d exceeds kFlagCap %d\n", N, kFlagCap);
-        return TaskOutputTensors{};
-    }
+    DistSubmitCtx ctx = dist_submit_begin(self, args);
+    const int32_t N = ctx.task_id;
+    if (!dist_submit_check_task_cap(ctx, DistSubmitKind::Alloc)) return TaskOutputTensors{};
 
     // Deterministic GM heap allocation + straddle-padding (identical to submit (a)).
     const size_t ring = g_dist.heap_size;
-    uint64_t total = 0;
-    for (int32_t i = 0; i < tc; i++) {
-        if (args.tag(i) != TensorArgType::OUTPUT) continue;
-        total += PTO2_ALIGN_UP(TensorCreateInfo::buffer_size_bytes(args.tensor(i).create_info()), PTO2_PACKED_OUTPUT_ALIGN);
-    }
-    uint64_t task_base = PTO2_ALIGN_UP(self->heap_next, PTO2_PACKED_OUTPUT_ALIGN);
-    if (total > 0 && g_dist.heap_base != nullptr) {
-        if (total > ring) {
-            set_fatal();
-            DIST_ERRF(
-                "[dist_engine] alloc task %d outputs %llu B exceed heap ring %zu B\n", N,
-                (unsigned long long)total, ring
-            );
-            return TaskOutputTensors{};
-        }
-        if ((task_base % ring) + total > ring) task_base = ((task_base / ring) + 1) * ring;
-    }
-
     // (a) Materialize outputs + publish the deterministic heap layout — EVERY core
     // (like dist_submit_impl step (a)), so duplicate maps and vend[] stay identical.
-    uint64_t off = 0;
-    TaskOutputTensors result;
-    for (int32_t i = 0; i < tc; i++) {
-        if (args.tag(i) != TensorArgType::OUTPUT) continue;
-        // TensorRef::create_info() now returns a default-address-space ref
-        // (see pto_types.h — orch is all stack-local under CCEC). The engine
-        // still writes the derived Tensor into a GM outpool slot; the
-        // cross-space transition happens inside init_tensor_from_create_info,
-        // whose signature takes __gm__ dst + non-__gm__ src.
-        const TensorCreateInfo &ci = args.tensor(i).create_info();
-        const uint64_t logical = TensorCreateInfo::buffer_size_bytes(ci);
-        const uint64_t sz = PTO2_ALIGN_UP(logical, PTO2_PACKED_OUTPUT_ALIGN);
-        if (g_dist.heap_base == nullptr) {
-            set_fatal();
-            DIST_ERRF("[dist_engine] GM output heap not allocated at alloc %d\n", N);
-            return result;
-        }
-        const uint64_t phys = (task_base + off) % ring;
-        __gm__ Tensor &slot_t = self->outpool[self->outpool_head];
-        self->outpool_head = (self->outpool_head + 1) % kOutPoolSlots;
-        init_tensor_from_create_info(slot_t, ci, g_dist.heap_base + phys, logical);
-        result.materialize_output(slot_t);
-        off += sz;
-    }
-    self->heap_next = task_base + off;
-    if (N >= 0 && N < kFlagCap) atom_store(g_dist.vend[N], self->heap_next, __ATOMIC_RELAXED);
-    if (fatal_set()) return result;
+    dist_submit_materialize_outputs(args, ctx, DistSubmitKind::Alloc);
+    const uint64_t total = ctx.output_bytes;
+    if (fatal_set()) return ctx.result;
 
     // (b) Register this alloc as producer of each output — EVERY core (map parity).
-    DistTensorMap::advance_retire(self->map, N, g_dist.H);
-    uint32_t out_idx = 0;
-    for (int32_t i = 0; i < tc; i++) {
-        if (args.tag(i) != TensorArgType::OUTPUT) continue;
-        DistTensorMap::insert(self->map, result.get_ref(out_idx), N);
-        out_idx++;
-    }
+    dist_submit_prepare_map(self, N);
+    dist_submit_register_outputs(args, ctx, /*include_existing=*/false);
 
     // (c) Single-owner election (mirrors dist_submit_impl's claim). The first core
     // to reach this alloc id wins; that core is by construction at/ahead of the
@@ -2351,7 +2350,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
     bool is_winner = claim(g_dist.alloc_cursor[N % kCursorShards].v, N);
     if (!is_winner) {
         TRACE_LAP(self, N, -1, TracePhase::Replay);
-        return result;
+        return ctx.result;
     }
 
     // (d) Winner-only heap reclaim back-pressure: drain this core's ring while the
@@ -2369,7 +2368,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
                     "[dist_engine] heap ring %zu B too small for H=%d window at alloc %d (live=%llu B)\n", ring,
                     g_dist.H, N, (unsigned long long)(self->heap_next - vstart_live)
                 );
-                return result;
+                return ctx.result;
             }
             drain_block_won(self);
             if (drain_phase_b(self) == 0) {
@@ -2377,14 +2376,14 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
                 watchdog(wd_heap);
             }
         }
-        if (fatal_set()) return result;
+        if (fatal_set()) return ctx.result;
     }
 
     // (e) Winner completes inline (no kernel runs).
     atom_store(g_dist.flags[N & (kFlagCap - 1)], 1, __ATOMIC_RELEASE);
     advance_frontier();
     TRACE_LAP(self, N, -1, TracePhase::Alloc);
-    return result;
+    return ctx.result;
 }
 #endif
 
