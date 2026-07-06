@@ -1386,6 +1386,12 @@ PTO_DEVICE_FUNC void drain_block_won(__gm__ DistCore *self) {
 #if defined(__CCE_AICORE__)
 namespace {
 #endif
+#if defined(__CCE_AICORE__)
+PTO_DEVICE_FUNC void ccec_flush_region(__gm__ void *ptr, uint64_t bytes);
+PTO_DEVICE_FUNC int32_t ccec_lookup_producer(const Tensor &t);
+PTO_DEVICE_FUNC void ccec_insert_producer(const Tensor &t, int32_t task_id);
+#endif
+
 PTO_DEVICE_FUNC void dist_submit_execute_first(__gm__ DistCore *self) {
     TRACE_LAP_RESET(self);
     if (!fatal_set()) {
@@ -1406,14 +1412,25 @@ struct DistSubmitCtx {
     int32_t tensor_count;
     uint64_t output_bytes;
     TaskOutputTensors result;
+    int32_t fanin[kMaxFanin];
+    int32_t fanin_count;
+    int32_t kernel_id;
+    bool won;
 };
 
 PTO_DEVICE_FUNC DistSubmitCtx dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &args) {
     DistSubmitCtx ctx;
     ctx.self = self;
+#if defined(__CCE_AICORE__)
+    ctx.task_id = g_ccec_local_index++;
+#else
     ctx.task_id = self->local_index++;
+#endif
     ctx.tensor_count = args.tensor_count();
     ctx.output_bytes = 0;
+    ctx.fanin_count = 0;
+    ctx.kernel_id = INVALID_KERNEL_ID;
+    ctx.won = false;
     return ctx;
 }
 
@@ -1432,6 +1449,42 @@ PTO_DEVICE_FUNC bool dist_submit_check_task_cap(const DistSubmitCtx &ctx, DistSu
 }
 
 PTO_DEVICE_FUNC bool dist_submit_materialize_outputs(const L0TaskArgs &args, DistSubmitCtx &ctx, DistSubmitKind kind) {
+#if defined(__CCE_AICORE__)
+    (void)kind;
+    if (g_ccec_runtime == nullptr || g_ccec_core_idx < 0 || g_ccec_core_idx >= RUNTIME_MAX_WORKER) return false;
+    const uint64_t heap_base = g_ccec_runtime->dist.ccec_heap_base;
+    const uint64_t heap_size = g_ccec_runtime->dist.ccec_heap_size;
+    if (heap_base == 0 || heap_size == 0) return false;
+
+    uint64_t total = 0;
+    for (int32_t i = 0; i < ctx.tensor_count; i++) {
+        if (args.tag(i) != TensorArgType::OUTPUT) continue;
+        total += PTO2_ALIGN_UP(TensorCreateInfo::buffer_size_bytes(args.tensor(i).create_info()), PTO2_PACKED_OUTPUT_ALIGN);
+    }
+    uint64_t task_base = PTO2_ALIGN_UP(g_ccec_heap_next, PTO2_PACKED_OUTPUT_ALIGN);
+    if (total > 0 && (task_base % heap_size) + total > heap_size) {
+        task_base = ((task_base / heap_size) + 1) * heap_size;
+    }
+
+    uint64_t off = 0;
+    for (int32_t i = 0; i < ctx.tensor_count; i++) {
+        if (args.tag(i) != TensorArgType::OUTPUT) continue;
+        const TensorCreateInfo &ci = args.tensor(i).create_info();
+        const uint64_t logical = TensorCreateInfo::buffer_size_bytes(ci);
+        const uint64_t sz = PTO2_ALIGN_UP(logical, PTO2_PACKED_OUTPUT_ALIGN);
+        const uint64_t phys = (task_base + off) % heap_size;
+        __gm__ Tensor &slot_t =
+            g_ccec_runtime->dist.ccec_output_tensors[g_ccec_core_idx].tensors[g_ccec_outpool_head];
+        g_ccec_outpool_head = (g_ccec_outpool_head + 1) % 8;
+        init_tensor_from_create_info(slot_t, ci, reinterpret_cast<void *>(heap_base + phys), logical);
+        ccec_flush_region(&slot_t, sizeof(Tensor));
+        ctx.result.materialize_output(slot_t);
+        off += sz;
+    }
+    g_ccec_heap_next = task_base + off;
+    ctx.output_bytes = total;
+    return true;
+#else
     const size_t ring = g_dist.heap_size;
     uint64_t total = 0;
     for (int32_t i = 0; i < ctx.tensor_count; i++) {
@@ -1487,10 +1540,16 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_outputs(const L0TaskArgs &args, Dis
     if (ctx.task_id >= 0 && ctx.task_id < kFlagCap)
         atom_store(g_dist.vend[ctx.task_id], ctx.self->heap_next, __ATOMIC_RELAXED);
     return true;
+#endif
 }
 
 PTO_DEVICE_FUNC void dist_submit_prepare_map(__gm__ DistCore *self, int32_t task_id) {
+#if defined(__CCE_AICORE__)
+    (void)self;
+    (void)task_id;
+#else
     DistTensorMap::advance_retire(self->map, task_id, g_dist.H);
+#endif
 }
 
 PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const DistSubmitCtx &ctx, int32_t fanin[]) {
@@ -1498,9 +1557,13 @@ PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const 
     for (int32_t i = 0; i < ctx.tensor_count; i++) {
         const TensorArgType tag = args.tag(i);
         if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
+#if defined(__CCE_AICORE__)
+        const int32_t p = ccec_lookup_producer(args.tensor(i).ref());
+#else
         const Tensor &t = args.tensor(i).ref();
         if (t.manual_dep) continue;
         const int32_t p = DistTensorMap::lookup(ctx.self->map, t);
+#endif
         if (p < 0) continue;
         bool dup = false;
         for (int32_t k = 0; k < fc; k++)
@@ -1518,10 +1581,20 @@ PTO_DEVICE_FUNC void dist_submit_register_outputs(const L0TaskArgs &args, DistSu
     for (int32_t i = 0; i < ctx.tensor_count; i++) {
         const TensorArgType tag = args.tag(i);
         if (tag == TensorArgType::OUTPUT) {
+#if defined(__CCE_AICORE__)
+            Tensor t;
+            Tensor::copy(t, ctx.result.get_ref(out_idx));
+            ccec_insert_producer(t, ctx.task_id);
+#else
             DistTensorMap::insert(ctx.self->map, ctx.result.get_ref(out_idx), ctx.task_id);
+#endif
             out_idx++;
         } else if (include_existing && (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING)) {
+#if defined(__CCE_AICORE__)
+            ccec_insert_producer(args.tensor(i).ref(), ctx.task_id);
+#else
             DistTensorMap::insert(ctx.self->map, args.tensor(i).ref(), ctx.task_id);
+#endif
         }
     }
 }
@@ -2066,79 +2139,7 @@ PTO_DEVICE_FUNC void ccec_wait_fanin(const int32_t fanin[], int32_t count) {
     }
 }
 
-struct CcecSubmitCtx {
-    int32_t task_id;
-    TaskOutputTensors result;
-    int32_t fanin[kMaxFanin];
-    int32_t fanin_count;
-    int32_t kernel_id;
-    bool won;
-};
-
-enum class CcecSubmitKind : int32_t {
-    Kernel = 0,
-    Alloc = 1,
-};
-
-PTO_DEVICE_FUNC CcecSubmitCtx ccec_begin_submit() {
-    CcecSubmitCtx ctx;
-    ctx.task_id = g_ccec_local_index++;
-    ctx.fanin_count = 0;
-    ctx.kernel_id = INVALID_KERNEL_ID;
-    ctx.won = false;
-    return ctx;
-}
-
-PTO_DEVICE_FUNC void ccec_materialize_outputs(const L0TaskArgs &args, CcecSubmitCtx &ctx) {
-    if (g_ccec_runtime == nullptr || g_ccec_core_idx < 0 || g_ccec_core_idx >= RUNTIME_MAX_WORKER) return;
-    const uint64_t heap_base = g_ccec_runtime->dist.ccec_heap_base;
-    const uint64_t heap_size = g_ccec_runtime->dist.ccec_heap_size;
-    if (heap_base == 0 || heap_size == 0) return;
-
-    uint64_t total = 0;
-    for (int32_t i = 0; i < args.tensor_count(); i++) {
-        if (args.tag(i) != TensorArgType::OUTPUT) continue;
-        total += PTO2_ALIGN_UP(TensorCreateInfo::buffer_size_bytes(args.tensor(i).create_info()), PTO2_PACKED_OUTPUT_ALIGN);
-    }
-    uint64_t task_base = PTO2_ALIGN_UP(g_ccec_heap_next, PTO2_PACKED_OUTPUT_ALIGN);
-    if (total > 0 && (task_base % heap_size) + total > heap_size) {
-        task_base = ((task_base / heap_size) + 1) * heap_size;
-    }
-
-    uint64_t off = 0;
-    for (int32_t i = 0; i < args.tensor_count(); i++) {
-        if (args.tag(i) != TensorArgType::OUTPUT) continue;
-        const TensorCreateInfo &ci = args.tensor(i).create_info();
-        const uint64_t logical = TensorCreateInfo::buffer_size_bytes(ci);
-        const uint64_t sz = PTO2_ALIGN_UP(logical, PTO2_PACKED_OUTPUT_ALIGN);
-        const uint64_t phys = (task_base + off) % heap_size;
-        __gm__ Tensor &slot_t =
-            g_ccec_runtime->dist.ccec_output_tensors[g_ccec_core_idx].tensors[g_ccec_outpool_head];
-        g_ccec_outpool_head = (g_ccec_outpool_head + 1) % 8;
-        init_tensor_from_create_info(slot_t, ci, reinterpret_cast<void *>(heap_base + phys), logical);
-        ccec_flush_region(&slot_t, sizeof(Tensor));
-        ctx.result.materialize_output(slot_t);
-        off += sz;
-    }
-    g_ccec_heap_next = task_base + off;
-}
-
-PTO_DEVICE_FUNC void ccec_register_outputs(const L0TaskArgs &args, CcecSubmitCtx &ctx) {
-    uint32_t out_idx = 0;
-    for (int32_t i = 0; i < args.tensor_count(); i++) {
-        const TensorArgType tag = args.tag(i);
-        if (tag == TensorArgType::OUTPUT) {
-            Tensor t;
-            Tensor::copy(t, ctx.result.get_ref(out_idx));
-            ccec_insert_producer(t, ctx.task_id);
-            out_idx++;
-        } else if (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING) {
-            ccec_insert_producer(args.tensor(i).ref(), ctx.task_id);
-        }
-    }
-}
-
-PTO_DEVICE_FUNC bool ccec_claim_kernel_submit_deterministic(const MixedKernels &mixed, CcecSubmitCtx &ctx) {
+PTO_DEVICE_FUNC bool ccec_claim_kernel_submit_deterministic(const MixedKernels &mixed, DistSubmitCtx &ctx) {
     ctx.kernel_id = INVALID_KERNEL_ID;
     ctx.won = false;
     const bool has_aic = mixed.aic_kernel_id != INVALID_KERNEL_ID;
@@ -2160,34 +2161,16 @@ PTO_DEVICE_FUNC bool ccec_claim_kernel_submit_deterministic(const MixedKernels &
     return false;
 }
 
-PTO_DEVICE_FUNC bool ccec_claim_alloc_submit_single_owner(CcecSubmitCtx &ctx) {
+PTO_DEVICE_FUNC bool ccec_claim_alloc_submit_single_owner(DistSubmitCtx &ctx) {
     ctx.kernel_id = INVALID_KERNEL_ID;
     ctx.won = g_ccec_core_idx == 0;
     return ctx.won;
 }
 
-PTO_DEVICE_FUNC bool ccec_claim_submit(CcecSubmitKind kind, const MixedKernels *mixed, CcecSubmitCtx &ctx) {
-    if (kind == CcecSubmitKind::Alloc) return ccec_claim_alloc_submit_single_owner(ctx);
+PTO_DEVICE_FUNC bool ccec_claim_submit(DistSubmitKind kind, const MixedKernels *mixed, DistSubmitCtx &ctx) {
+    if (kind == DistSubmitKind::Alloc) return ccec_claim_alloc_submit_single_owner(ctx);
     if (mixed == nullptr) return false;
     return ccec_claim_kernel_submit_deterministic(*mixed, ctx);
-}
-
-PTO_DEVICE_FUNC void ccec_collect_fanin(const L0TaskArgs &args, CcecSubmitCtx &ctx) {
-    ctx.fanin_count = 0;
-    for (int32_t i = 0; i < args.tensor_count(); i++) {
-        const TensorArgType tag = args.tag(i);
-        if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
-        const int32_t producer = ccec_lookup_producer(args.tensor(i).ref());
-        if (producer < 0) continue;
-        bool dup = false;
-        for (int32_t k = 0; k < ctx.fanin_count; k++) {
-            if (ctx.fanin[k] == producer) {
-                dup = true;
-                break;
-            }
-        }
-        if (!dup && ctx.fanin_count < kMaxFanin) ctx.fanin[ctx.fanin_count++] = producer;
-    }
 }
 
 PTO_DEVICE_FUNC bool ccec_build_kernel_payload(
@@ -2228,7 +2211,7 @@ PTO_DEVICE_FUNC void ccec_call_winner_kernel(int32_t kernel_id, __gm__ PTO2Dispa
     }
 }
 
-PTO_DEVICE_FUNC void ccec_execute_won_submit(const L0TaskArgs &args, CcecSubmitCtx &ctx) {
+PTO_DEVICE_FUNC void ccec_execute_won_submit(const L0TaskArgs &args, DistSubmitCtx &ctx) {
     __gm__ PTO2DispatchPayload *payload =
         reinterpret_cast<__gm__ PTO2DispatchPayload *>(g_ccec_runtime->workers[g_ccec_core_idx].task);
     if (payload == nullptr) return;
@@ -2240,7 +2223,7 @@ PTO_DEVICE_FUNC void ccec_execute_won_submit(const L0TaskArgs &args, CcecSubmitC
     ccec_publish_flag(ctx.task_id);
 }
 
-PTO_DEVICE_FUNC void ccec_complete_alloc_submit(CcecSubmitCtx &ctx) {
+PTO_DEVICE_FUNC void ccec_complete_alloc_submit(DistSubmitCtx &ctx) {
     if (ctx.won) {
         ccec_publish_flag(ctx.task_id);
     } else {
@@ -2302,11 +2285,11 @@ PTO_DEVICE_FUNC void ccec_replay_orch(__gm__ Runtime *runtime) {
 DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(
     PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &args
 ) {
-    CcecSubmitCtx ctx = ccec_begin_submit();
-    ccec_materialize_outputs(args, ctx);
-    ccec_collect_fanin(args, ctx);
-    ccec_register_outputs(args, ctx);
-    if (ccec_claim_submit(CcecSubmitKind::Kernel, &mixed, ctx)) ccec_execute_won_submit(args, ctx);
+    DistSubmitCtx ctx = dist_submit_begin(nullptr, args);
+    dist_submit_materialize_outputs(args, ctx, DistSubmitKind::Kernel);
+    ctx.fanin_count = dist_submit_collect_fanin(args, ctx, ctx.fanin);
+    dist_submit_register_outputs(args, ctx, /*include_existing=*/true);
+    if (ccec_claim_submit(DistSubmitKind::Kernel, &mixed, ctx)) ccec_execute_won_submit(args, ctx);
     return ctx.result;
 }
 #else
@@ -2389,10 +2372,10 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
 
 #if defined(__CCE_AICORE__)
 DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
-    CcecSubmitCtx ctx = ccec_begin_submit();
-    ccec_materialize_outputs(args, ctx);
-    ccec_register_outputs(args, ctx);
-    ccec_claim_submit(CcecSubmitKind::Alloc, nullptr, ctx);
+    DistSubmitCtx ctx = dist_submit_begin(nullptr, args);
+    dist_submit_materialize_outputs(args, ctx, DistSubmitKind::Alloc);
+    dist_submit_register_outputs(args, ctx, /*include_existing=*/false);
+    ccec_claim_submit(DistSubmitKind::Alloc, nullptr, ctx);
     ccec_complete_alloc_submit(ctx);
     return ctx.result;
 }
