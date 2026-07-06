@@ -294,11 +294,7 @@ public:
         volatile int32_t ccec_orch_scalar_count;
         SubmitCoreState submit_cores[RUNTIME_MAX_WORKER];
         KernelTensorArgs ccec_kernel_tensors[RUNTIME_MAX_WORKER];
-        CcecTensorPool ccec_output_tensors[RUNTIME_MAX_WORKER];
         CcecMapPool ccec_maps[RUNTIME_MAX_WORKER];
-        volatile uint64_t ccec_heap_base;
-        volatile uint64_t ccec_heap_size;
-        alignas(64) volatile int64_t ccec_flags[2048];
         alignas(64) volatile int64_t done_count;  // AICPU-owned progress mirror.
     } dist;
 
