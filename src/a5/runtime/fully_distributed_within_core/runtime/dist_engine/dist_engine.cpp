@@ -900,7 +900,6 @@ struct DistGlobal {
 [[block_local]] static int32_t g_ccec_aiv_count;
 [[block_local]] static int32_t g_ccec_ordinal;
 [[block_local]] static bool g_ccec_valid_worker;
-[[block_local]] static __gm__ Runtime::DistHandoff::SubmitCoreState *g_submit_core;
 #define g_dist (*g_dist_ptr)
 #elif defined(__CPU_SIM)
 static DistGlobal g_dist_fallback;
@@ -1463,8 +1462,6 @@ namespace {
 #endif
 #if defined(__CCE_AICORE__)
 PTO_DEVICE_FUNC void ccec_flush_region(__gm__ void *ptr, uint64_t bytes);
-PTO_DEVICE_FUNC int32_t ccec_lookup_producer(const Tensor &t);
-PTO_DEVICE_FUNC void ccec_insert_producer(const Tensor &t, int32_t task_id);
 #endif
 
 PTO_DEVICE_FUNC void dist_submit_execute_first(__gm__ DistCore *self) {
@@ -1630,12 +1627,8 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_outputs(const L0TaskArgs &args, Dis
 }
 
 PTO_DEVICE_FUNC void dist_submit_prepare_map(__gm__ DistCore *self, int32_t task_id) {
-#if defined(__CCE_AICORE__)
-    (void)self;
-    (void)task_id;
-#else
+    if (self == nullptr) return;
     DistTensorMap::advance_retire(self->map, task_id, g_dist.H);
-#endif
 }
 
 PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const DistSubmitCtx &ctx, int32_t fanin[]) {
@@ -1644,7 +1637,7 @@ PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const 
         const TensorArgType tag = args.tag(i);
         if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
 #if defined(__CCE_AICORE__)
-        const int32_t p = ccec_lookup_producer(args.tensor(i).ref());
+        const int32_t p = DistTensorMap::lookup(ctx.self->map, args.tensor(i).ref());
 #else
         const Tensor &t = args.tensor(i).ref();
         if (t.manual_dep) continue;
@@ -1670,14 +1663,14 @@ PTO_DEVICE_FUNC void dist_submit_register_outputs(const L0TaskArgs &args, DistSu
 #if defined(__CCE_AICORE__)
             Tensor t;
             Tensor::copy(t, ctx.result.get_ref(out_idx));
-            ccec_insert_producer(t, ctx.task_id);
+            DistTensorMap::insert(ctx.self->map, t, ctx.task_id);
 #else
             DistTensorMap::insert(ctx.self->map, ctx.result.get_ref(out_idx), ctx.task_id);
 #endif
             out_idx++;
         } else if (include_existing && (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING)) {
 #if defined(__CCE_AICORE__)
-            ccec_insert_producer(args.tensor(i).ref(), ctx.task_id);
+            DistTensorMap::insert(ctx.self->map, args.tensor(i).ref(), ctx.task_id);
 #else
             DistTensorMap::insert(ctx.self->map, args.tensor(i).ref(), ctx.task_id);
 #endif
@@ -2159,53 +2152,6 @@ PTO_DEVICE_FUNC void ccec_flush_region(__gm__ void *ptr, uint64_t bytes) {
     }
 }
 
-PTO_DEVICE_FUNC uint64_t ccec_tensor_bytes(const Tensor &t) {
-    uint64_t elems = 1;
-    for (uint32_t i = 0; i < t.ndims; i++) {
-        elems *= t.shapes[i];
-    }
-    return elems * get_element_size(t.dtype);
-}
-
-PTO_DEVICE_FUNC int32_t ccec_lookup_producer(const Tensor &t) {
-    if (g_ccec_runtime == nullptr || g_submit_core == nullptr || g_ccec_core_idx < 0 || g_ccec_core_idx >= RUNTIME_MAX_WORKER)
-        return -1;
-    const uint64_t addr = t.buffer.addr + t.start_offset * get_element_size(t.dtype);
-    const uint64_t size = ccec_tensor_bytes(t);
-    __gm__ Runtime::DistHandoff::CcecMapEntry *entries =
-        g_ccec_runtime->dist.ccec_maps[g_ccec_core_idx].entries;
-    for (int32_t i = g_submit_core->map_count - 1; i >= 0; i--) {
-        __gm__ const Runtime::DistHandoff::CcecMapEntry &entry = entries[i];
-        if (entry.addr == addr && entry.size == size) return entry.task_id;
-    }
-    return -1;
-}
-
-PTO_DEVICE_FUNC void ccec_insert_producer(const Tensor &t, int32_t task_id) {
-    if (g_ccec_runtime == nullptr || g_submit_core == nullptr || g_ccec_core_idx < 0 || g_ccec_core_idx >= RUNTIME_MAX_WORKER)
-        return;
-    const uint64_t addr = t.buffer.addr + t.start_offset * get_element_size(t.dtype);
-    const uint64_t size = ccec_tensor_bytes(t);
-    __gm__ Runtime::DistHandoff::CcecMapEntry *entries =
-        g_ccec_runtime->dist.ccec_maps[g_ccec_core_idx].entries;
-    for (int32_t i = g_submit_core->map_count - 1; i >= 0; i--) {
-        __gm__ Runtime::DistHandoff::CcecMapEntry &entry = entries[i];
-        if (entry.addr == addr && entry.size == size) {
-            entry.task_id = task_id;
-            ccec_flush_region(&entry, sizeof(entry));
-            return;
-        }
-    }
-    if (g_submit_core->map_count < 8) {
-        __gm__ Runtime::DistHandoff::CcecMapEntry &entry = entries[g_submit_core->map_count++];
-        entry.addr = addr;
-        entry.size = size;
-        entry.task_id = task_id;
-        entry.pad = 0;
-        ccec_flush_region(&entry, sizeof(entry));
-    }
-}
-
 PTO_DEVICE_FUNC void ccec_publish_flag(int32_t task_id) {
     if (g_dist_ptr == nullptr || task_id < 0 || task_id >= kFlagCap) return;
     publish_task_flag(task_id);
@@ -2439,6 +2385,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(
 ) {
     DistSubmitCtx ctx = dist_submit_begin(nullptr, args);
     dist_submit_materialize_outputs(args, ctx, DistSubmitKind::Kernel);
+    dist_submit_prepare_map(ctx.self, ctx.task_id);
     ctx.fanin_count = dist_submit_collect_fanin(args, ctx, ctx.fanin);
     dist_submit_register_outputs(args, ctx, /*include_existing=*/true);
     if (ccec_claim_submit(DistSubmitKind::Kernel, &mixed, ctx)) ccec_execute_won_submit(args, ctx);
@@ -2526,6 +2473,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
 DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
     DistSubmitCtx ctx = dist_submit_begin(nullptr, args);
     dist_submit_materialize_outputs(args, ctx, DistSubmitKind::Alloc);
+    dist_submit_prepare_map(ctx.self, ctx.task_id);
     dist_submit_register_outputs(args, ctx, /*include_existing=*/false);
     ccec_claim_submit(DistSubmitKind::Alloc, nullptr, ctx);
     ccec_complete_alloc_submit(ctx);
@@ -2628,8 +2576,6 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
     DistCore::reset(*g_self, static_cast<CoreType>(core_type_int), lay.block_id, lay.lane);
     g_self->core_idx = core_idx;
 
-    g_submit_core = &runtime->dist.submit_cores[core_idx];
-    g_submit_core->map_count = 0;
     ccec_invalidate_region(const_cast<__gm__ int32_t *>(&runtime->dist.num_workers), 64);
     ccec_init_worker_layout();
 
@@ -2638,7 +2584,6 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
 
     g_self = nullptr;
     g_ccec_runtime = nullptr;
-    g_submit_core = nullptr;
     return;
 #else
     if (core_idx < 0 || core_idx >= RUNTIME_MAX_WORKER) return;
