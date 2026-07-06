@@ -916,8 +916,6 @@ struct DistGlobal {
 [[block_local]] static __gm__ Runtime *g_ccec_runtime;
 [[block_local]] static int32_t g_ccec_core_idx;
 [[block_local]] static int32_t g_ccec_core_type;
-[[block_local]] static int32_t g_ccec_aic_submit_index;
-[[block_local]] static int32_t g_ccec_aiv_submit_index;
 [[block_local]] static int32_t g_ccec_aic_count;
 [[block_local]] static int32_t g_ccec_aiv_count;
 [[block_local]] static int32_t g_ccec_ordinal;
@@ -2025,12 +2023,34 @@ PTO_DEVICE_FUNC void ccec_wait_fanin(const int32_t fanin[], int32_t count) {
     }
 }
 
-PTO_DEVICE_FUNC TaskOutputTensors ccec_materialize_outputs(const L0TaskArgs &args) {
+struct CcecSubmitCtx {
+    int32_t task_id;
     TaskOutputTensors result;
-    if (g_ccec_runtime == nullptr || g_ccec_core_idx < 0 || g_ccec_core_idx >= RUNTIME_MAX_WORKER) return result;
+    int32_t fanin[kMaxFanin];
+    int32_t fanin_count;
+    int32_t kernel_id;
+    bool won;
+};
+
+enum class CcecSubmitKind : int32_t {
+    Kernel = 0,
+    Alloc = 1,
+};
+
+PTO_DEVICE_FUNC CcecSubmitCtx ccec_begin_submit() {
+    CcecSubmitCtx ctx;
+    ctx.task_id = g_ccec_local_index++;
+    ctx.fanin_count = 0;
+    ctx.kernel_id = INVALID_KERNEL_ID;
+    ctx.won = false;
+    return ctx;
+}
+
+PTO_DEVICE_FUNC void ccec_materialize_outputs(const L0TaskArgs &args, CcecSubmitCtx &ctx) {
+    if (g_ccec_runtime == nullptr || g_ccec_core_idx < 0 || g_ccec_core_idx >= RUNTIME_MAX_WORKER) return;
     const uint64_t heap_base = g_ccec_runtime->dist.ccec_heap_base;
     const uint64_t heap_size = g_ccec_runtime->dist.ccec_heap_size;
-    if (heap_base == 0 || heap_size == 0) return result;
+    if (heap_base == 0 || heap_size == 0) return;
 
     uint64_t total = 0;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
@@ -2054,42 +2074,135 @@ PTO_DEVICE_FUNC TaskOutputTensors ccec_materialize_outputs(const L0TaskArgs &arg
         g_ccec_outpool_head = (g_ccec_outpool_head + 1) % 8;
         init_tensor_from_create_info(slot_t, ci, reinterpret_cast<void *>(heap_base + phys), logical);
         ccec_flush_region(&slot_t, sizeof(Tensor));
-        result.materialize_output(slot_t);
+        ctx.result.materialize_output(slot_t);
         off += sz;
     }
     g_ccec_heap_next = task_base + off;
-    return result;
 }
 
-PTO_DEVICE_FUNC void ccec_register_outputs(const L0TaskArgs &args, const TaskOutputTensors &result, int32_t task_id) {
+PTO_DEVICE_FUNC void ccec_register_outputs(const L0TaskArgs &args, CcecSubmitCtx &ctx) {
     uint32_t out_idx = 0;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         const TensorArgType tag = args.tag(i);
         if (tag == TensorArgType::OUTPUT) {
             Tensor t;
-            Tensor::copy(t, result.get_ref(out_idx));
-            ccec_insert_producer(t, task_id);
+            Tensor::copy(t, ctx.result.get_ref(out_idx));
+            ccec_insert_producer(t, ctx.task_id);
             out_idx++;
         } else if (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING) {
-            ccec_insert_producer(args.tensor(i).ref(), task_id);
+            ccec_insert_producer(args.tensor(i).ref(), ctx.task_id);
         }
     }
 }
 
-PTO_DEVICE_FUNC int32_t ccec_kernel_id_for_winner(const MixedKernels &mixed, int32_t task_id) {
+PTO_DEVICE_FUNC bool ccec_claim_kernel_submit_deterministic(const MixedKernels &mixed, CcecSubmitCtx &ctx) {
+    ctx.kernel_id = INVALID_KERNEL_ID;
+    ctx.won = false;
     const bool has_aic = mixed.aic_kernel_id != INVALID_KERNEL_ID;
     const bool has_aiv = mixed.aiv0_kernel_id != INVALID_KERNEL_ID || mixed.aiv1_kernel_id != INVALID_KERNEL_ID;
     if (has_aic && !has_aiv) {
-        if (g_ccec_core_type != static_cast<int32_t>(CoreType::AIC)) return INVALID_KERNEL_ID;
-        if (g_ccec_aic_count <= 0 || g_ccec_ordinal != task_id % g_ccec_aic_count) return INVALID_KERNEL_ID;
-        return mixed.aic_kernel_id;
+        if (g_ccec_core_type != static_cast<int32_t>(CoreType::AIC)) return false;
+        if (g_ccec_aic_count <= 0 || g_ccec_ordinal != ctx.task_id % g_ccec_aic_count) return false;
+        ctx.kernel_id = mixed.aic_kernel_id;
+        ctx.won = true;
+        return true;
     }
     if (!has_aic && has_aiv) {
-        if (g_ccec_core_type != static_cast<int32_t>(CoreType::AIV)) return INVALID_KERNEL_ID;
-        if (g_ccec_aiv_count <= 0 || g_ccec_ordinal != task_id % g_ccec_aiv_count) return INVALID_KERNEL_ID;
-        return mixed.aiv0_kernel_id != INVALID_KERNEL_ID ? mixed.aiv0_kernel_id : mixed.aiv1_kernel_id;
+        if (g_ccec_core_type != static_cast<int32_t>(CoreType::AIV)) return false;
+        if (g_ccec_aiv_count <= 0 || g_ccec_ordinal != ctx.task_id % g_ccec_aiv_count) return false;
+        ctx.kernel_id = mixed.aiv0_kernel_id != INVALID_KERNEL_ID ? mixed.aiv0_kernel_id : mixed.aiv1_kernel_id;
+        ctx.won = true;
+        return true;
     }
-    return INVALID_KERNEL_ID;
+    return false;
+}
+
+PTO_DEVICE_FUNC bool ccec_claim_alloc_submit_single_owner(CcecSubmitCtx &ctx) {
+    ctx.kernel_id = INVALID_KERNEL_ID;
+    ctx.won = g_ccec_core_idx == 0;
+    return ctx.won;
+}
+
+PTO_DEVICE_FUNC bool ccec_claim_submit(CcecSubmitKind kind, const MixedKernels *mixed, CcecSubmitCtx &ctx) {
+    if (kind == CcecSubmitKind::Alloc) return ccec_claim_alloc_submit_single_owner(ctx);
+    if (mixed == nullptr) return false;
+    return ccec_claim_kernel_submit_deterministic(*mixed, ctx);
+}
+
+PTO_DEVICE_FUNC void ccec_collect_fanin(const L0TaskArgs &args, CcecSubmitCtx &ctx) {
+    ctx.fanin_count = 0;
+    for (int32_t i = 0; i < args.tensor_count(); i++) {
+        const TensorArgType tag = args.tag(i);
+        if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
+        const int32_t producer = ccec_lookup_producer(args.tensor(i).ref());
+        if (producer < 0) continue;
+        bool dup = false;
+        for (int32_t k = 0; k < ctx.fanin_count; k++) {
+            if (ctx.fanin[k] == producer) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup && ctx.fanin_count < kMaxFanin) ctx.fanin[ctx.fanin_count++] = producer;
+    }
+}
+
+PTO_DEVICE_FUNC bool ccec_build_kernel_payload(
+    const L0TaskArgs &args, const TaskOutputTensors &result, __gm__ PTO2DispatchPayload *payload
+) {
+    if (payload == nullptr || g_ccec_runtime == nullptr) return false;
+    int32_t argc = 0;
+    uint32_t out_idx = 0;
+    for (int32_t i = 0; i < args.tensor_count() && argc < PTO2_DISPATCH_MAX_ARGS; i++) {
+        __gm__ Tensor &dst = g_ccec_runtime->dist.ccec_kernel_tensors[g_ccec_core_idx].tensors[i];
+        if (args.tag(i) == TensorArgType::OUTPUT) {
+            Tensor tensor;
+            Tensor::copy(tensor, result.get_ref(out_idx));
+            Tensor::copy(dst, tensor);
+            out_idx++;
+        } else {
+            const Tensor &tensor = args.tensor(i).ref();
+            Tensor::copy(dst, tensor);
+        }
+        ccec_flush_region(&dst, sizeof(Tensor));
+        payload->args[argc++] = reinterpret_cast<uint64_t>(&dst);
+    }
+    for (int32_t i = 0; i < args.scalar_count() && argc < PTO2_DISPATCH_MAX_ARGS; i++) {
+        payload->args[argc++] = args.scalar(i);
+    }
+    ccec_flush_region(payload, sizeof(PTO2DispatchPayload));
+    return true;
+}
+
+PTO_DEVICE_FUNC void ccec_call_winner_kernel(int32_t kernel_id, __gm__ PTO2DispatchPayload *payload) {
+    const bool is_aic = g_ccec_core_type == static_cast<int32_t>(CoreType::AIC);
+    if (is_aic) {
+        if (pto_call_linked_kernel_aic != nullptr) {
+            pto_call_linked_kernel_aic(kernel_id, reinterpret_cast<__gm__ int64_t *>(payload->args));
+        }
+    } else if (pto_call_linked_kernel_aiv != nullptr) {
+        pto_call_linked_kernel_aiv(kernel_id, reinterpret_cast<__gm__ int64_t *>(payload->args));
+    }
+}
+
+PTO_DEVICE_FUNC void ccec_execute_won_submit(const L0TaskArgs &args, CcecSubmitCtx &ctx) {
+    __gm__ PTO2DispatchPayload *payload =
+        reinterpret_cast<__gm__ PTO2DispatchPayload *>(g_ccec_runtime->workers[g_ccec_core_idx].task);
+    if (payload == nullptr) return;
+
+    ccec_wait_fanin(ctx.fanin, ctx.fanin_count);
+    if (!ccec_build_kernel_payload(args, ctx.result, payload)) return;
+    ccec_call_winner_kernel(ctx.kernel_id, payload);
+    OUT_OF_ORDER_STORE_BARRIER();
+    ccec_publish_flag(ctx.task_id);
+}
+
+PTO_DEVICE_FUNC void ccec_complete_alloc_submit(CcecSubmitCtx &ctx) {
+    if (ctx.won) {
+        ccec_publish_flag(ctx.task_id);
+    } else {
+        ccec_wait_flag(ctx.task_id);
+    }
 }
 
 PTO_DEVICE_FUNC void ccec_init_worker_layout() {
@@ -2108,30 +2221,6 @@ PTO_DEVICE_FUNC void ccec_init_worker_layout() {
         g_ccec_ordinal = g_ccec_core_idx - block_dim;
         g_ccec_valid_worker = true;
     }
-}
-
-PTO_DEVICE_FUNC int32_t ccec_current_kernel_id(const MixedKernels &mixed) {
-    if (g_ccec_runtime == nullptr) return INVALID_KERNEL_ID;
-    ccec_init_worker_layout();
-    const bool has_aic = mixed.aic_kernel_id != INVALID_KERNEL_ID;
-    const bool has_aiv = mixed.aiv0_kernel_id != INVALID_KERNEL_ID || mixed.aiv1_kernel_id != INVALID_KERNEL_ID;
-    if (has_aic && !has_aiv) {
-        const int32_t submit_idx = g_ccec_aic_submit_index++;
-        if (g_ccec_core_type == static_cast<int32_t>(CoreType::AIC) &&
-            g_ccec_aic_count > 0 && g_ccec_ordinal == submit_idx % g_ccec_aic_count) {
-            return mixed.aic_kernel_id;
-        }
-        return INVALID_KERNEL_ID;
-    }
-    if (!has_aic && has_aiv) {
-        const int32_t submit_idx = g_ccec_aiv_submit_index++;
-        if (g_ccec_core_type == static_cast<int32_t>(CoreType::AIV) &&
-            g_ccec_aiv_count > 0 && g_ccec_ordinal == submit_idx % g_ccec_aiv_count) {
-            return mixed.aiv0_kernel_id != INVALID_KERNEL_ID ? mixed.aiv0_kernel_id : mixed.aiv1_kernel_id;
-        }
-        return INVALID_KERNEL_ID;
-    }
-    return INVALID_KERNEL_ID;
 }
 
 PTO_DEVICE_FUNC bool ccec_is_valid_worker() {
@@ -2170,68 +2259,12 @@ PTO_DEVICE_FUNC void ccec_replay_orch(__gm__ Runtime *runtime) {
 DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(
     PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &args
 ) {
-    const int32_t task_id = g_ccec_local_index++;
-    TaskOutputTensors result = ccec_materialize_outputs(args);
-
-    int32_t fanin[kMaxFanin];
-    int32_t fc = 0;
-    for (int32_t i = 0; i < args.tensor_count(); i++) {
-        const TensorArgType tag = args.tag(i);
-        if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
-        const int32_t producer = ccec_lookup_producer(args.tensor(i).ref());
-        if (producer < 0) continue;
-        bool dup = false;
-        for (int32_t k = 0; k < fc; k++) {
-            if (fanin[k] == producer) {
-                dup = true;
-                break;
-            }
-        }
-        if (!dup && fc < kMaxFanin) fanin[fc++] = producer;
-    }
-    ccec_register_outputs(args, result, task_id);
-
-    const int32_t kernel_id = ccec_kernel_id_for_winner(mixed, task_id);
-    if (kernel_id == INVALID_KERNEL_ID) return result;
-    const bool is_aic = g_ccec_core_type == static_cast<int32_t>(CoreType::AIC);
-
-    __gm__ PTO2DispatchPayload *payload =
-        reinterpret_cast<__gm__ PTO2DispatchPayload *>(g_ccec_runtime->workers[g_ccec_core_idx].task);
-    if (payload == nullptr) return result;
-
-    ccec_wait_fanin(fanin, fc);
-
-    int32_t argc = 0;
-    uint32_t out_idx = 0;
-    for (int32_t i = 0; i < args.tensor_count() && argc < PTO2_DISPATCH_MAX_ARGS; i++) {
-        __gm__ Tensor &dst = g_ccec_runtime->dist.ccec_kernel_tensors[g_ccec_core_idx].tensors[i];
-        if (args.tag(i) == TensorArgType::OUTPUT) {
-            Tensor tensor;
-            Tensor::copy(tensor, result.get_ref(out_idx));
-            Tensor::copy(dst, tensor);
-            out_idx++;
-        } else {
-            const Tensor &tensor = args.tensor(i).ref();
-            Tensor::copy(dst, tensor);
-        }
-        ccec_flush_region(&dst, sizeof(Tensor));
-        payload->args[argc++] = reinterpret_cast<uint64_t>(&dst);
-    }
-    for (int32_t i = 0; i < args.scalar_count() && argc < PTO2_DISPATCH_MAX_ARGS; i++) {
-        payload->args[argc++] = args.scalar(i);
-    }
-    ccec_flush_region(payload, sizeof(PTO2DispatchPayload));
-
-    if (is_aic) {
-        if (pto_call_linked_kernel_aic != nullptr) {
-            pto_call_linked_kernel_aic(kernel_id, reinterpret_cast<__gm__ int64_t *>(payload->args));
-        }
-    } else if (pto_call_linked_kernel_aiv != nullptr) {
-        pto_call_linked_kernel_aiv(kernel_id, reinterpret_cast<__gm__ int64_t *>(payload->args));
-    }
-    OUT_OF_ORDER_STORE_BARRIER();
-    ccec_publish_flag(task_id);
-    return result;
+    CcecSubmitCtx ctx = ccec_begin_submit();
+    ccec_materialize_outputs(args, ctx);
+    ccec_collect_fanin(args, ctx);
+    ccec_register_outputs(args, ctx);
+    if (ccec_claim_submit(CcecSubmitKind::Kernel, &mixed, ctx)) ccec_execute_won_submit(args, ctx);
+    return ctx.result;
 }
 #else
 // alloc_tensors — a kernel-less "hidden task" that only reserves GM output
@@ -2369,15 +2402,12 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
 
 #if defined(__CCE_AICORE__)
 DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
-    const int32_t task_id = g_ccec_local_index++;
-    TaskOutputTensors result = ccec_materialize_outputs(args);
-    ccec_register_outputs(args, result, task_id);
-    if (g_ccec_core_idx == 0) {
-        ccec_publish_flag(task_id);
-    } else {
-        ccec_wait_flag(task_id);
-    }
-    return result;
+    CcecSubmitCtx ctx = ccec_begin_submit();
+    ccec_materialize_outputs(args, ctx);
+    ccec_register_outputs(args, ctx);
+    ccec_claim_submit(CcecSubmitKind::Alloc, nullptr, ctx);
+    ccec_complete_alloc_submit(ctx);
+    return ctx.result;
 }
 #endif
 
@@ -2464,8 +2494,6 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
     g_ccec_runtime = runtime;
     g_ccec_core_idx = core_idx;
     g_ccec_core_type = core_type_int;
-    g_ccec_aic_submit_index = 0;
-    g_ccec_aiv_submit_index = 0;
     g_ccec_local_index = 0;
     g_ccec_heap_next = 0;
     g_ccec_outpool_head = 0;
