@@ -31,8 +31,8 @@
     do {          \
     } while (0)
 #endif
-#if !defined(__CCE_AICORE__) && !defined(ENTIRE_DATA_CACHE)
-#define ENTIRE_DATA_CACHE 0
+#if !defined(__CCE_AICORE__) && !defined(SINGLE_CACHE_LINE)
+#define SINGLE_CACHE_LINE 0
 #endif
 #if !defined(__CCE_AICORE__) && !defined(CACHELINE_OUT)
 #define CACHELINE_OUT 0
@@ -52,5 +52,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     for (uint64_t i = 0; i < n; i++) {
         output[i] = seed[i] + left[i] + right[i] + 8.0f;
     }
-    dcci(output, ENTIRE_DATA_CACHE, CACHELINE_OUT);
+    for (uint64_t off = 0; off < n * sizeof(float); off += 64) {
+        dcci(reinterpret_cast<__gm__ uint8_t *>(output) + off, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    }
 }

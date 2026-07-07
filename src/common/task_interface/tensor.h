@@ -23,6 +23,48 @@
 #include "data_type.h"
 #include "pto_task_id.h"
 
+template <typename Dst, typename Src>
+PTO_DEVICE_FUNC inline Dst *aicore_memcpy(Dst *dst, const Src *src, unsigned long n) {
+    volatile uint8_t *d = reinterpret_cast<volatile uint8_t *>(dst);
+    const volatile uint8_t *s = reinterpret_cast<const volatile uint8_t *>(src);
+    for (unsigned long i = 0; i < n; i++) {
+        d[i] = s[i];
+    }
+    return dst;
+}
+
+#if defined(__CCE_AICORE__)
+template <typename Dst, typename Src>
+PTO_DEVICE_FUNC inline __gm__ Dst *aicore_memcpy(__gm__ Dst *dst, const Src *src, unsigned long n) {
+    volatile __gm__ uint8_t *d = reinterpret_cast<volatile __gm__ uint8_t *>(dst);
+    const volatile uint8_t *s = reinterpret_cast<const volatile uint8_t *>(src);
+    for (unsigned long i = 0; i < n; i++) {
+        d[i] = s[i];
+    }
+    return dst;
+}
+
+template <typename Dst, typename Src>
+PTO_DEVICE_FUNC inline Dst *aicore_memcpy(Dst *dst, __gm__ const Src *src, unsigned long n) {
+    volatile uint8_t *d = reinterpret_cast<volatile uint8_t *>(dst);
+    const volatile __gm__ uint8_t *s = reinterpret_cast<const volatile __gm__ uint8_t *>(src);
+    for (unsigned long i = 0; i < n; i++) {
+        d[i] = s[i];
+    }
+    return dst;
+}
+
+template <typename Dst, typename Src>
+PTO_DEVICE_FUNC inline __gm__ Dst *aicore_memcpy(__gm__ Dst *dst, __gm__ const Src *src, unsigned long n) {
+    volatile __gm__ uint8_t *d = reinterpret_cast<volatile __gm__ uint8_t *>(dst);
+    const volatile __gm__ uint8_t *s = reinterpret_cast<const volatile __gm__ uint8_t *>(src);
+    for (unsigned long i = 0; i < n; i++) {
+        d[i] = s[i];
+    }
+    return dst;
+}
+#endif
+
 constexpr int MAX_TENSOR_DIMS = 5;
 
 /**
@@ -233,12 +275,37 @@ struct alignas(64) Tensor {
         }
     }
 
+private:
+    PTO_DEVICE_FUNC static constexpr bool is_tensor_ref(const Tensor *) { return true; }
+#if defined(__CCE_AICORE__)
+    PTO_DEVICE_FUNC static constexpr bool is_tensor_ref(__gm__ const Tensor *) { return true; }
+#endif
+
+public:
     /// View ops use this: copy cache line 1 only, leaving cache line 2 (stride,
     /// extent_elem_cache) untouched. The op then mutates shapes / start_offset
     /// in place and calls `refresh_derived()` to recompute line 2 once. This
     /// avoids the wasted line 2 writes that `init_from()` would do just before
     /// the op overwrites them.
-    PTO_DEVICE_FUNC void init_from_line1(const Tensor &other) { __builtin_memcpy(this, &other, 64); }
+    template <typename Source>
+    PTO_DEVICE_FUNC static void init_from_line1(Tensor &dst, const Source &other) {
+        static_assert(is_tensor_ref(static_cast<Source *>(nullptr)), "Tensor::init_from_line1 source must be Tensor");
+        dst.buffer.addr = other.buffer.addr;
+        dst.buffer.size = other.buffer.size;
+        dst.owner_task_id.raw = other.owner_task_id.raw;
+        dst.start_offset = other.start_offset;
+        dst.version = other.version;
+        dst.ndims = other.ndims;
+        dst.dtype = other.dtype;
+        dst.manual_dep = other.manual_dep;
+        dst.is_contiguous = other.is_contiguous;
+        dst.child_memory = other.child_memory;
+        for (uint32_t i = 0; i < MAX_TENSOR_DIMS; i++) {
+            dst.shapes[i] = other.shapes[i];
+        }
+    }
+
+    PTO_DEVICE_FUNC void init_from_line1(const Tensor &other) { Tensor::init_from_line1(*this, other); }
 
     /// Backward-compat alias used by orchestrator hot paths that need a full
     /// deep copy. Equivalent to `init_from(other)`.
@@ -271,20 +338,9 @@ private:
     // called by the three copy(...) overloads that split on address space.
     template <typename Dst, typename Src>
     PTO_DEVICE_FUNC static void copy_bytes(Dst &dst, Src &src) {
-        __builtin_memcpy(&dst, &src, 64);
-        if (src.is_contiguous && src.start_offset == 0) {
-            uint32_t s = 1;
-            for (int32_t i = static_cast<int32_t>(src.ndims) - 1; i >= 0; --i) {
-                dst.strides[i] = s;
-                s *= src.shapes[i];
-            }
-            dst.extent_elem_cache = s;
-        } else {
-            dst.extent_elem_cache = src.extent_elem_cache;
-            for (uint32_t i = 0; i < src.ndims; i++) {
-                dst.strides[i] = src.strides[i];
-            }
-        }
+        static_assert(is_tensor_ref(static_cast<Dst *>(nullptr)), "Tensor::copy destination must be Tensor");
+        static_assert(is_tensor_ref(static_cast<Src *>(nullptr)), "Tensor::copy source must be Tensor");
+        aicore_memcpy(&dst, &src, sizeof(Tensor));
     }
 public:
 #endif
@@ -318,21 +374,37 @@ public:
     /// Updates start_offset += Σ off[i]·strides[i]; shapes := new_shape; stride unchanged.
     /// Each (offset[i], new_shape[i]) must stay within the current shapes[i] —
     /// i.e. a view cannot expand any dimension beyond what the parent view sees.
-    PTO_DEVICE_FUNC Tensor view(const uint32_t view_shapes[], const uint32_t view_offsets[], bool in_manual_dep = false) const {
+    template <typename Source>
+    PTO_DEVICE_FUNC static Tensor view(
+        const Source &source, const uint32_t view_shapes[], const uint32_t view_offsets[], bool in_manual_dep = false
+    ) {
+        static_assert(is_tensor_ref(static_cast<Source *>(nullptr)), "Tensor::view source must be Tensor");
+        return make_view(source, view_shapes, view_offsets, in_manual_dep);
+    }
+
+private:
+    template <typename Source>
+    PTO_DEVICE_FUNC static Tensor make_view(
+        const Source &source, const uint32_t view_shapes[], const uint32_t view_offsets[], bool in_manual_dep
+    ) {
+        static_assert(is_tensor_ref(static_cast<Source *>(nullptr)), "Tensor::view source must be Tensor");
         Tensor result;
-        // Copy line 1 only; stride from *this is still in result's line 2 garbage
-        // — we need to bring it forward explicitly since view keeps stride.
-        result.init_from_line1(*this);
-        for (uint32_t i = 0; i < ndims; i++) {
-            debug_assert(view_offsets[i] + view_shapes[i] <= shapes[i]);
-            result.start_offset += static_cast<uint64_t>(view_offsets[i]) * static_cast<uint64_t>(strides[i]);
+        Tensor::init_from_line1(result, source);
+        for (uint32_t i = 0; i < source.ndims; i++) {
+            debug_assert(view_offsets[i] + view_shapes[i] <= source.shapes[i]);
+            result.start_offset += static_cast<uint64_t>(view_offsets[i]) * static_cast<uint64_t>(source.strides[i]);
             result.shapes[i] = view_shapes[i];
-            result.strides[i] = strides[i];
+            result.strides[i] = source.strides[i];
         }
         result.manual_dep = in_manual_dep;
         result.refresh_derived();
         result.assert_in_buffer_bounds();
         return result;
+    }
+
+public:
+    PTO_DEVICE_FUNC Tensor view(const uint32_t view_shapes[], const uint32_t view_offsets[], bool in_manual_dep = false) const {
+        return Tensor::view(*this, view_shapes, view_offsets, in_manual_dep);
     }
 
     PTO_DEVICE_FUNC bool valid_transpose(uint32_t x, uint32_t y) const { return x < ndims && y < ndims; }

@@ -85,7 +85,7 @@ __attribute__((visibility("default"))) PTO_DEVICE_FUNC void aicpu_orchestration_
 
         uint32_t c_elem_offset = static_cast<uint32_t>(static_cast<uint64_t>(group_idx) * group_tile_elems);
         uint32_t c_view_offsets[1] = {c_elem_offset};
-        Tensor C_view = ext_C.view(group_shapes, c_view_offsets);
+        Tensor C_view = Tensor::view(ext_C, group_shapes, c_view_offsets);
 
         for (int k_idx = 0; k_idx < grid_k; k_idx++) {
             // In layout [num_groups, grid_k, incore_loop, tile_size, tile_size],
@@ -95,8 +95,8 @@ __attribute__((visibility("default"))) PTO_DEVICE_FUNC void aicpu_orchestration_
 
             uint32_t a_view_offsets[1] = {static_cast<uint32_t>(ab_offset)};
             uint32_t b_view_offsets[1] = {static_cast<uint32_t>(ab_offset)};
-            Tensor A_view = ext_A.view(group_shapes, a_view_offsets);
-            Tensor B_view = ext_B.view(group_shapes, b_view_offsets);
+            Tensor A_view = Tensor::view(ext_A, group_shapes, a_view_offsets);
+            Tensor B_view = Tensor::view(ext_B, group_shapes, b_view_offsets);
             L0TaskArgs params_gemm;
             params_gemm.add_input(A_view);
             params_gemm.add_input(B_view);

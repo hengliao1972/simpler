@@ -38,7 +38,7 @@ class Runtime;
 // Arena footprint of the distributed engine's private DistGlobal. Host runtime
 // does not link dist_engine.cpp, so these are header constants; dist_engine.cpp
 // static_asserts the private type against them.
-inline constexpr size_t kDistEngineGlobalStateSize = 0x6dd0340;
+inline constexpr size_t kDistEngineGlobalStateSize = 0x42000000;
 inline constexpr size_t kDistEngineGlobalStateAlign = 64;
 
 inline constexpr size_t dist_engine_global_state_size() { return kDistEngineGlobalStateSize; }

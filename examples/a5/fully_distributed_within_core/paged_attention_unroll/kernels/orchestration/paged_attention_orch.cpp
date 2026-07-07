@@ -166,10 +166,10 @@ __attribute__((visibility("default"), weak)) PTO_DEVICE_FUNC void aicpu_orchestr
 
                 uint32_t qi_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
                 uint32_t qi_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
-                Tensor qi = query.view(qi_shapes, qi_offsets);
+                Tensor qi = Tensor::view(query, qi_shapes, qi_offsets);
                 uint32_t out_view_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
                 uint32_t out_view_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
-                Tensor out_view = out.view(out_view_shapes, out_view_offsets, true);
+                Tensor out_view = Tensor::view(out, out_view_shapes, out_view_offsets, true);
 #ifdef ENABLE_PROFILING
                 prof_view_count += 2;
                 CYCLE_COUNT_LAP(prof_tensor_view);

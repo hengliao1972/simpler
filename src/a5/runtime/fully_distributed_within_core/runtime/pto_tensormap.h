@@ -100,7 +100,7 @@ extern uint64_t g_insert_count;
  * TensorMap entry structure — cache-line optimized for lookup
  *
  * Cache line 1 (64B, lookup hot path) mirrors Tensor cache line 1 byte-for-byte
- * from byte 16 onward, so that `memcpy(this, &tensor, 64)` populates everything
+ * from byte 16 onward, so that copying the first 64 bytes populates everything
  * we need for overlap checks. Bytes [0, 16) carry entry-only fields (hash
  * bucket head + chain pointer) that overlap Tensor::buffer (addr in [0, 8) is
  * the hash key, size in [8, 16) is unused by the entry — we repurpose it for
@@ -160,8 +160,8 @@ struct alignas(64) PTO2TensorMapEntry {
      * so the producer Tensor's cache line 2 stays cold during insert. Only
      * non-contiguous producers pay one extra line 2 read.
      */
-    void copy_from_tensor(const Tensor &tensor) {
-        memcpy(this, &tensor, 64);
+    PTO_DEVICE_FUNC void copy_from_tensor(const Tensor &tensor) {
+        aicore_memcpy(this, &tensor, 64);
         if (tensor.is_contiguous && tensor.start_offset == 0) {
             uint64_t numel = 1;
             for (uint32_t i = 0; i < tensor.ndims; i++)
@@ -180,8 +180,8 @@ struct alignas(64) PTO2TensorMapEntry {
         }
     }
 
-    void copy_tensor_create_info(const TensorCreateInfo &tensor_create_info, uint64_t addr) {
-        memcpy(this, &tensor_create_info, 64);
+    PTO_DEVICE_FUNC void copy_tensor_create_info(const TensorCreateInfo &tensor_create_info, uint64_t addr) {
+        aicore_memcpy(this, &tensor_create_info, 64);
         buffer_addr = addr;
         // Create-info outputs are always contiguous with start_offset = 0;
         // extent_elem = prod(shapes); stride is row-major.
