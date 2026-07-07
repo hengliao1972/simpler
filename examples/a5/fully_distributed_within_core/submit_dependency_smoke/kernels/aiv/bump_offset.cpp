@@ -39,16 +39,15 @@
 #endif
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
-    __gm__ Tensor *input_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
-    __gm__ Tensor *right_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
-    const uint64_t n = static_cast<uint64_t>(args[2]);
+    __gm__ Tensor *tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    const uint64_t n = static_cast<uint64_t>(args[1]);
+    const uint64_t offset = static_cast<uint64_t>(args[2]);
 
-    __gm__ float *input = reinterpret_cast<__gm__ float *>(input_tensor->buffer.addr) + input_tensor->start_offset;
-    __gm__ float *right = reinterpret_cast<__gm__ float *>(right_tensor->buffer.addr) + right_tensor->start_offset;
+    __gm__ float *data = reinterpret_cast<__gm__ float *>(tensor->buffer.addr) + tensor->start_offset + offset;
     for (uint64_t i = 0; i < n; i++) {
-        right[i] = input[i] * 3.0f + 5.0f;
+        data[i] += 1.0f;
     }
     for (uint64_t off = 0; off < n * sizeof(float); off += 64) {
-        dcci(reinterpret_cast<__gm__ uint8_t *>(right) + off, SINGLE_CACHE_LINE, CACHELINE_OUT);
+        dcci(reinterpret_cast<__gm__ uint8_t *>(data) + off, SINGLE_CACHE_LINE, CACHELINE_OUT);
     }
 }

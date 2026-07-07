@@ -24,7 +24,7 @@ class TestSubmitDependencySmoke(SceneTestCase):
         "orchestration": {
             "source": "kernels/orchestration/submit_dependency_orch.cpp",
             "function_name": "aicpu_orchestration_entry",
-            "signature": [D.IN, D.INOUT],
+            "signature": [D.IN, D.INOUT, D.INOUT],
         },
         "incores": [
             {
@@ -55,6 +55,27 @@ class TestSubmitDependencySmoke(SceneTestCase):
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.IN, D.INOUT],
             },
+            {
+                "func_id": 4,
+                "name": "BUMP_INOUT_AIV",
+                "source": "kernels/aiv/bump_inout.cpp",
+                "core_type": "aiv",
+                "signature": [D.INOUT],
+            },
+            {
+                "func_id": 5,
+                "name": "BUMP_OFFSET_AIV",
+                "source": "kernels/aiv/bump_offset.cpp",
+                "core_type": "aiv",
+                "signature": [D.INOUT],
+            },
+            {
+                "func_id": 6,
+                "name": "INSPECT_VIEW_AIV",
+                "source": "kernels/aiv/inspect_view.cpp",
+                "core_type": "aiv",
+                "signature": [D.IN, D.INOUT, D.INOUT],
+            },
         ],
     }
 
@@ -63,69 +84,225 @@ class TestSubmitDependencySmoke(SceneTestCase):
             "name": "A5SimBd1N16",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 1},
-            "params": {"n": 16},
+            "params": {"n": 16, "mode": 0},
         },
         {
             "name": "A5OnboardBd1N16",
             "manual": True,
             "platforms": ["a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 1},
-            "params": {"n": 16},
+            "params": {"n": 16, "mode": 0},
         },
         {
             "name": "A5OnboardBd2N16",
             "manual": True,
             "platforms": ["a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 2},
-            "params": {"n": 16},
+            "params": {"n": 16, "mode": 0},
         },
         {
             "name": "A5OnboardBd4N16",
             "manual": True,
             "platforms": ["a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 4},
-            "params": {"n": 16},
+            "params": {"n": 16, "mode": 0},
         },
         {
             "name": "A5OnboardBd8N16",
             "manual": True,
             "platforms": ["a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 8},
-            "params": {"n": 16},
+            "params": {"n": 16, "mode": 0},
         },
         {
             "name": "A5OnboardBd16N16",
             "manual": True,
             "platforms": ["a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 16},
-            "params": {"n": 16},
+            "params": {"n": 16, "mode": 0},
         },
         {
             "name": "A5OnboardBd24N16",
             "manual": True,
             "platforms": ["a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
-            "params": {"n": 16},
+            "params": {"n": 16, "mode": 0},
         },
         {
             "name": "A5SimBd36N128",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
-            "params": {"n": 128},
+            "params": {"n": 128, "mode": 0},
         },
         {
             "name": "A5OnboardBd36N16",
             "manual": True,
             "platforms": ["a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
-            "params": {"n": 16},
+            "params": {"n": 16, "mode": 0},
         },
         {
             "name": "A5OnboardBd36N128",
             "manual": True,
             "platforms": ["a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
-            "params": {"n": 128},
+            "params": {"n": 128, "mode": 0},
+        },
+        {
+            "name": "A5SimBd36OverlapSubView",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 1},
+        },
+        {
+            "name": "A5OnboardBd36OverlapSubView",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 1},
+        },
+        {
+            "name": "A5SimBd36ExistingInoutChain",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 2},
+        },
+        {
+            "name": "A5OnboardBd36ExistingInoutChain",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 2},
+        },
+        {
+            "name": "A5SimBd36SubViewOnly",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 3},
+        },
+        {
+            "name": "A5OnboardBd36SubViewOnly",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 3},
+        },
+        {
+            "name": "A5SimBd36ScalarOffsetOnly",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 4},
+        },
+        {
+            "name": "A5OnboardBd36ScalarOffsetOnly",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 4},
+        },
+        {
+            "name": "A5SimBd36InspectSubView",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 5},
+        },
+        {
+            "name": "A5OnboardBd36InspectSubView",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 5},
+        },
+        {
+            "name": "A5SimBd36InspectLocalCopy",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 6},
+        },
+        {
+            "name": "A5OnboardBd36InspectLocalCopy",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 6},
+        },
+        {
+            "name": "A5SimBd36AllocDescriptor",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 7},
+        },
+        {
+            "name": "A5OnboardBd36AllocDescriptor",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 7},
+        },
+        {
+            "name": "A5SimBd36AllocFillFanin",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 128, "mode": 8},
+        },
+        {
+            "name": "A5OnboardBd36AllocFillFanin",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 128, "mode": 8},
+        },
+        {
+            "name": "A5SimBd36LeftOutputFanin",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 128, "mode": 9},
+        },
+        {
+            "name": "A5OnboardBd36LeftOutputFanin",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 128, "mode": 9},
+        },
+        {
+            "name": "A5SimBd36RightOutputFanin",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 128, "mode": 10},
+        },
+        {
+            "name": "A5OnboardBd36RightOutputFanin",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 128, "mode": 10},
+        },
+        {
+            "name": "A5SimBd36TaskOutputViewFanin",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 128, "mode": 15},
+        },
+        {
+            "name": "A5OnboardBd36TaskOutputViewFanin",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 128, "mode": 15},
+        },
+        {
+            "name": "A5SimBd36L0TaskArgsTagPersistence",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 14},
+        },
+        {
+            "name": "A5OnboardBd36L0TaskArgsTagPersistence",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 14},
         },
     ]
 
@@ -133,14 +310,70 @@ class TestSubmitDependencySmoke(SceneTestCase):
         n = int(params["n"])
         x = torch.arange(n, dtype=torch.float32)
         y = torch.full((n,), -1.0, dtype=torch.float32)
+        dump = torch.full((n,), -1.0, dtype=torch.float32)
         return TaskArgsBuilder(
             Tensor("input", x),
             Tensor("output", y),
+            Tensor("dump", dump),
             Scalar("n", n),
+            Scalar("mode", int(params.get("mode", 0))),
         )
 
     def compute_golden(self, args, params):
-        del params
+        mode = int(params.get("mode", 0))
+        if mode == 1:
+            n = int(params["n"])
+            args.output[:] = args.input + 7.0
+            start = n // 4
+            end = start + n // 2
+            args.output[start:end] += 1.0
+            return
+        if mode == 2:
+            args.output[:] = args.input + 8.0
+            return
+        if mode == 3 or mode == 4:
+            n = int(params["n"])
+            start = n // 4
+            end = start + n // 2
+            args.output[:] = -1.0
+            args.output[start:end] += 1.0
+            return
+        if mode == 5:
+            args.output[:] = -1.0
+            args.output[:4] = 1.0
+            args.output[80:110] = 1.0
+            args.dump[:3] = 1.0
+            return
+        if mode == 14:
+            args.output[:] = -1.0
+            args.output[:12] = 1.0
+            return
+        if mode == 6:
+            args.output[:] = -1.0
+            args.output[:4] = 1.0
+            args.dump[:3] = 1.0
+            return
+        if mode == 7:
+            args.output[:] = -1.0
+            args.output[:10] = 1.0
+            args.output[16:26] = 1.0
+            return
+        if mode == 8:
+            args.output[:] = (args.input + 7.0) * 3.0 + 8.0
+            return
+        if mode == 9:
+            args.output[:] = (args.input * 2.0 + 3.0) * 3.0 + 8.0
+            return
+        if mode == 10:
+            args.output[:] = (args.input * 3.0 + 5.0) * 3.0 + 8.0
+            return
+        if mode == 15:
+            n = int(params["n"])
+            start = n // 4
+            end = start + n // 2
+            args.output[:] = -1.0
+            args.output[: n // 2] = (args.input[start:end] * 2.0 + 3.0) * 3.0 + 8.0
+            return
         args.output[:] = args.input * 6.0 + 23.0
 
 

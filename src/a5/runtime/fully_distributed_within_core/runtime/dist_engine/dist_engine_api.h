@@ -37,6 +37,7 @@
 
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "intrinsic.h"          // __gm__ (empty macro on host)
@@ -45,6 +46,21 @@
 #include "tensor.h"             // Tensor
 
 struct PTO2Runtime;
+
+#if defined(__CCE_AICORE__)
+struct alignas(64) DistTaskPayload {
+    int32_t tensor_count;
+    int32_t scalar_count;
+    TensorArgType tags[MAX_TENSOR_ARGS];
+    alignas(64) Tensor tensors[MAX_TENSOR_ARGS];
+    alignas(64) uint64_t scalars[MAX_SCALAR_ARGS];
+};
+static_assert(sizeof(DistTaskPayload) % 64 == 0, "DistTaskPayload must not share cachelines");
+static_assert(alignof(DistTaskPayload) == 64, "DistTaskPayload must be cacheline-aligned");
+static_assert(offsetof(DistTaskPayload, tensors) % 64 == 0, "payload tensors must be cacheline-aligned");
+static_assert(offsetof(DistTaskPayload, scalars) % 64 == 0, "payload scalars must be cacheline-aligned");
+
+#endif
 
 // Task submission and allocation. Host/sim definitions use the per-core g_self
 // stashed by dist_core_main / thread_local sim. CCEC definitions cover only the

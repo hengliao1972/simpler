@@ -16,7 +16,7 @@
  * It carries the metadata required to materialize a fresh contiguous output:
  * dtype, ndims, shapes, manual_dep, and an optional initial value fill. Its
  * 64B layout mirrors Tensor cache line 1 so init_tensor_from_create_info() can
- * copy the whole line with a single memcpy.
+ * populate the Tensor descriptor with field-wise stores across address spaces.
  */
 
 #pragma once
@@ -53,7 +53,7 @@ public:
         }
     }
 
-    PTO_DEVICE_FUNC void copy(const TensorCreateInfo &other) { __builtin_memcpy(this, &other, sizeof(other)); }
+    PTO_DEVICE_FUNC void copy(const TensorCreateInfo &other) { aicore_memcpy(this, &other, sizeof(TensorCreateInfo)); }
 
     template <typename T = uint64_t>
     PTO_DEVICE_FUNC void set_initial_value(T value) {
@@ -128,6 +128,38 @@ static_assert(offsetof(TensorCreateInfo, is_contiguous) == offsetof(Tensor, is_c
 static_assert(offsetof(TensorCreateInfo, __pad_flags__) == offsetof(Tensor, child_memory));
 static_assert(offsetof(TensorCreateInfo, shapes) == offsetof(Tensor, shapes));
 
+template <typename Dst, typename Src>
+PTO_DEVICE_FUNC inline void copy_tensor_create_info_fields(Dst &dst, const Src &src) {
+    dst.initial_value = src.initial_value;
+    dst.has_initial_value = src.has_initial_value;
+    for (uint32_t i = 0; i < 7; i++) {
+        dst.__pad1__[i] = src.__pad1__[i];
+    }
+    dst.__pad2__ = src.__pad2__;
+    dst.start_offset = src.start_offset;
+    dst.version = src.version;
+    dst.ndims = src.ndims;
+    dst.dtype = src.dtype;
+    dst.manual_dep = src.manual_dep;
+    dst.is_contiguous = src.is_contiguous;
+    dst.__pad_flags__ = src.__pad_flags__;
+    for (uint32_t i = 0; i < MAX_TENSOR_DIMS; i++) {
+        dst.shapes[i] = src.shapes[i];
+    }
+}
+
+PTO_DEVICE_FUNC inline uint8_t tensor_initial_value_byte(uint64_t value, uint64_t byte_index) {
+    return static_cast<uint8_t>((value >> ((byte_index & 7U) * 8U)) & 0xFFU);
+}
+
+PTO_DEVICE_FUNC inline void store_tensor_initial_value_byte(uint64_t addr, uint64_t byte_index, uint8_t value) {
+#if defined(__CCE_AICORE__)
+    *reinterpret_cast<__gm__ uint8_t *>(addr + byte_index) = value;
+#else
+    *reinterpret_cast<uint8_t *>(addr + byte_index) = value;
+#endif
+}
+
 // ============================================================================
 // Materialization helpers — operate on a Tensor& through its public members.
 // Factored out of Tensor (which now lives in the wire/host-facing common
@@ -141,30 +173,38 @@ static_assert(offsetof(TensorCreateInfo, shapes) == offsetof(Tensor, shapes));
 PTO_DEVICE_FUNC inline void fill_tensor_initial_value(__gm__ Tensor &t, uint64_t initial_value) {
     always_assert(reinterpret_cast<char *>(t.buffer.addr) != nullptr);
     uint64_t elem_size = get_element_size(t.dtype);
-    char *dst = reinterpret_cast<char *>(t.buffer.addr);
     constexpr uint64_t blk_size = 64;
     uint64_t blk = (t.buffer.size < blk_size) ? t.buffer.size : blk_size;
     for (uint64_t b = 0; b < blk; b += elem_size) {
-        // __builtin_memcpy: CCEC's <string.h> memcpy is __host__-tagged and
-        // cannot be called from __aicore__ context, but the compiler intrinsic
-        // is target-agnostic.
-        __builtin_memcpy(dst + b, &initial_value, elem_size);
+        for (uint64_t j = 0; j < elem_size; j++) {
+            store_tensor_initial_value_byte(t.buffer.addr, b + j, tensor_initial_value_byte(initial_value, j));
+        }
     }
     uint64_t filled = blk;
     while (filled < t.buffer.size) {
         uint64_t copy_size = ((t.buffer.size - filled) < filled) ? (t.buffer.size - filled) : filled;
-        __builtin_memcpy(dst + filled, dst, copy_size);
+        aicore_memcpy(
+#if defined(__CCE_AICORE__)
+            reinterpret_cast<__gm__ uint8_t *>(t.buffer.addr + filled),
+            reinterpret_cast<__gm__ const uint8_t *>(t.buffer.addr),
+#else
+            reinterpret_cast<uint8_t *>(t.buffer.addr + filled),
+            reinterpret_cast<const uint8_t *>(t.buffer.addr),
+#endif
+            copy_size
+        );
         filled += copy_size;
     }
 }
 
 /// Materialize a TensorCreateInfo into `t` (fresh contiguous output).
-/// Single 64B memcpy covers cache line 1; `ci` pre-initialises start_offset (=0)
+/// Field-wise descriptor copy covers cache line 1; `ci` pre-initialises start_offset (=0)
 /// and is_contiguous (=true) in its line-1 slots so they need no reset here.
 /// Cache line 2 (stride/extent) is computed from `ci.shapes` in a single reverse pass.
-PTO_DEVICE_FUNC inline void init_tensor_from_create_info(__gm__ Tensor &t, __gm__ const TensorCreateInfo &ci, void *addr, uint64_t buffer_size) {
+template <typename Src>
+PTO_DEVICE_FUNC inline void init_tensor_from_create_info(__gm__ Tensor &t, const Src &ci, void *addr, uint64_t buffer_size) {
     always_assert(ci.ndims > 0 && ci.ndims <= MAX_TENSOR_DIMS);
-    __builtin_memcpy(&t, &ci, 64);
+    aicore_memcpy(&t, &ci, sizeof(TensorCreateInfo));
     // Field-wise assignment: CCEC has no viable operator= across address
     // spaces (a host-space brace-initialized PTOBufferHandle temporary cannot
     // be assigned into a __gm__ Buffer). Same reason we hand-write the raw
@@ -182,26 +222,3 @@ PTO_DEVICE_FUNC inline void init_tensor_from_create_info(__gm__ Tensor &t, __gm_
         fill_tensor_initial_value(t, ci.initial_value);
     }
 }
-
-#if defined(__CCE_AICORE__)
-// Non-__gm__ ci overload: TensorRef::create_info() returns default-address-
-// space under CCEC (orch stack-local storage); the engine still writes the
-// derived Tensor into a __gm__ outpool slot. Body mirrors the __gm__/__gm__
-// version — the memcpy is legal across the stack→GM boundary.
-PTO_DEVICE_FUNC inline void init_tensor_from_create_info(__gm__ Tensor &t, const TensorCreateInfo &ci, void *addr, uint64_t buffer_size) {
-    always_assert(ci.ndims > 0 && ci.ndims <= MAX_TENSOR_DIMS);
-    __builtin_memcpy(&t, &ci, 64);
-    t.buffer.addr = reinterpret_cast<uint64_t>(addr);
-    t.buffer.size = buffer_size;
-    t.owner_task_id.raw = UINT64_MAX;
-    uint32_t s = 1;
-    for (int32_t i = static_cast<int32_t>(t.ndims) - 1; i >= 0; --i) {
-        t.strides[i] = s;
-        s *= t.shapes[i];
-    }
-    t.extent_elem_cache = s;
-    if (ci.has_initial_value) {
-        fill_tensor_initial_value(t, ci.initial_value);
-    }
-}
-#endif

@@ -254,10 +254,6 @@ public:
     // through its own COND register, and AICPU sends EXIT after all workers
     // report completion.
     struct alignas(64) DistHandoff {
-        struct alignas(64) KernelTensorArgs {
-            Tensor tensors[MAX_TENSOR_ARGS];
-        };
-
         volatile uint64_t core_main_fn;  // DistCoreMainFn (in AICPU .so)
         // Address of the DistGlobal struct that carries engine state (cursors,
         // completion flags, block.won, per-core DistCore slots). Written once by
@@ -269,13 +265,12 @@ public:
         // share one address space; onboard writes the GM allocation address.
         volatile uint64_t shared_addr;
         volatile int32_t num_workers;    // number of AICore workers participating
-        L2TaskArgs orch_args;            // GM-visible orchestration entry args
         Tensor ccec_orch_tensors[CHIP_MAX_TENSOR_ARGS];
         uint64_t ccec_orch_scalars[CHIP_MAX_SCALAR_ARGS];
         volatile int32_t ccec_orch_tensor_count;
         volatile int32_t ccec_orch_scalar_count;
-        KernelTensorArgs ccec_kernel_tensors[RUNTIME_MAX_WORKER];
         alignas(64) volatile int64_t done_count;  // AICPU-owned progress mirror.
+        L2TaskArgs orch_args;                      // Host/sim orchestration entry args.
     } dist;
 
 private:

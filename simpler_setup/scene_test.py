@@ -1049,12 +1049,18 @@ def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
     """Compare output tensors against golden values."""
     import torch  # noqa: PLC0415
 
+    mismatches = []
     for name in output_names:
         actual = getattr(test_args, name)
         expected = getattr(golden_args, name)
         if not torch.allclose(actual, expected, rtol=rtol, atol=atol):
             diff = (actual - expected).abs().max().item()
-            raise AssertionError(f"Golden mismatch on '{name}': max_diff={diff}, rtol={rtol}, atol={atol}")
+            mismatches.append(
+                f"Golden mismatch on '{name}': max_diff={diff}, rtol={rtol}, atol={atol}, "
+                f"actual_head={actual.flatten()[:128].tolist()}, expected_head={expected.flatten()[:128].tolist()}"
+            )
+    if mismatches:
+        raise AssertionError("\n".join(mismatches))
 
 
 def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):

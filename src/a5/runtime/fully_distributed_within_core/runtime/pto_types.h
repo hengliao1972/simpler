@@ -105,8 +105,8 @@ public:
     PTO_DEVICE_FUNC uint32_t size() const { return output_count_; }
 
     /// Borrow a materialized output tensor by index (lvalue only). Under
-    /// CCEC the pointed-to Tensor lives in the engine's outpool[] on GM at
-    /// run time — that's why the stored pointer is __gm__-qualified; sim
+    /// CCEC the pointed-to Tensor lives in the submitting task's payload on GM
+    /// at run time — that's why the stored pointer is __gm__-qualified; sim
     /// collapses the qualifier away.
     PTO_DEVICE_FUNC __gm__ const Tensor &get_ref(uint32_t index) const & {
         always_assert(index < output_count_);
@@ -114,9 +114,8 @@ public:
     }
     __gm__ const Tensor &get_ref(uint32_t index) const && = delete;
 
-    /// Runtime-internal: append one materialized output Tensor. The engine
-    /// resides in GM (dist_engine.cpp DistCore::outpool[]), so the passed
-    /// reference is __gm__.
+    /// Runtime-internal: append one materialized output Tensor. The backing
+    /// descriptor resides in GM, so the passed reference is __gm__.
     PTO_DEVICE_FUNC void materialize_output(__gm__ const Tensor &tensor) {
         always_assert(output_count_ < MAX_TENSOR_ARGS);
         tensors_[output_count_++] = &tensor;
@@ -132,7 +131,7 @@ private:
     // Upper bound: a task cannot have more outputs than total tensor args
     // (every OUTPUT/OUTPUT_EXISTING slot is one of the Arg's tensor slots).
     // __gm__ so the aicore build can point at Tensors that live in the shared
-    // engine state (DistCore::outpool[]); empty macro on sim keeps the field
+    // engine state; empty macro on sim keeps the field
     // a plain pointer.
     __gm__ const Tensor *tensors_[MAX_TENSOR_ARGS];
 };
@@ -175,7 +174,8 @@ class TensorRef {
 
 public:
     PTO_DEVICE_FUNC TensorRef() :
-        ptr_(nullptr) {}
+        ptr_(nullptr)
+    {}
     TensorRef(const TensorRef &) = delete;
     TensorRef(TensorRef &&) = delete;
     TensorRef &operator=(const TensorRef &) = delete;
@@ -189,27 +189,6 @@ public:
         create_info_ = ci;
         return *this;
     }
-
-#if defined(__CCE_AICORE__)
-    // CCEC-only overloads for __gm__ pointers: TaskOutputTensors::get_ref
-    // returns a __gm__ const Tensor & (outpool lives in GM), and orch code
-    // chains that result into params.add_input(...), so the & of a __gm__
-    // Tensor lvalue has __gm__ type. We narrow it into the default-address-
-    // space storage slot by memcpy'ing the pointer bits — CCEC's IR/backend
-    // rejects reinterpret_cast_from_gm-to-default in some larger call graphs
-    // (backend "error pointer address space cast") but accepts a byte-level
-    // copy of the pointer value. The physical address is preserved; the
-    // engine's copy helpers re-widen back to __gm__ (via Tensor::copy's
-    // __gm__ dst overloads) when payload leaves the orch frame.
-    PTO_DEVICE_FUNC TensorRef &operator=(__gm__ const Tensor *p) {
-        __builtin_memcpy(&ptr_, &p, sizeof(uintptr_t));
-        return *this;
-    }
-    PTO_DEVICE_FUNC TensorRef &operator=(__gm__ const TensorCreateInfo *ci) {
-        __builtin_memcpy(&create_info_, &ci, sizeof(uintptr_t));
-        return *this;
-    }
-#endif
 
     PTO_DEVICE_FUNC const Tensor &ref() const { return *ptr_; }
     PTO_DEVICE_FUNC const TensorCreateInfo &create_info() const { return *create_info_; }
@@ -287,7 +266,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     }
 
     template <typename... Args>
-    void dump(Args &&...args) {
+    PTO_DEVICE_FUNC void dump(Args &&...args) {
 #if PTO2_PROFILING
         static_assert(
             (std::is_lvalue_reference_v<Args> && ...),
@@ -308,11 +287,13 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     }
 
 #if PTO2_PROFILING
-    uint64_t dump_arg_mask() const { return dump_arg_selection_.dump_arg_mask(); }
-    uint64_t dump_arg_index_ambiguous_mask() const { return dump_arg_selection_.dump_arg_index_ambiguous_mask(); }
+    PTO_DEVICE_FUNC uint64_t dump_arg_mask() const { return dump_arg_selection_.dump_arg_mask(); }
+    PTO_DEVICE_FUNC uint64_t dump_arg_index_ambiguous_mask() const {
+        return dump_arg_selection_.dump_arg_index_ambiguous_mask();
+    }
 #else
-    uint64_t dump_arg_mask() const { return 0; }
-    uint64_t dump_arg_index_ambiguous_mask() const { return 0; }
+    PTO_DEVICE_FUNC uint64_t dump_arg_mask() const { return 0; }
+    PTO_DEVICE_FUNC uint64_t dump_arg_index_ambiguous_mask() const { return 0; }
 #endif
 
     template <typename... Args>
@@ -321,7 +302,11 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
         if (!check_add_tensor_capacity(static_cast<int32_t>(sizeof...(Args)))) {
             return;
         }
-        ((tensors_[tensor_count_] = &args, tags_[tensor_count_] = TensorArgType::INPUT, tensor_count_++), ...);
+        if constexpr (MaxT == MAX_TENSOR_ARGS) {
+            (add_tensor_copy(args, TensorArgType::INPUT), ...);
+        } else {
+            ((tensors_[tensor_count_] = &args, tags_[tensor_count_] = TensorArgType::INPUT, tensor_count_++), ...);
+        }
     }
 
     /// Batch add outputs — all Tensor or all TensorCreateInfo:
@@ -331,19 +316,11 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     PTO_DEVICE_FUNC void add_output(Args &&...args) {
         assert_add_tensor_args<true, Args...>();
         if (!check_add_tensor_capacity(static_cast<int32_t>(sizeof...(Args)))) return;
-#if defined(__CCE_AICORE__)
-        // CCEC has no <type_traits>; skip the compile-time tag dispatch and
-        // trust the caller to pass TensorCreateInfo (OUTPUT) — the common
-        // orch path. OUTPUT_EXISTING is host-only in practice today.
-        ((tensors_[tensor_count_] = &args, tags_[tensor_count_] = TensorArgType::OUTPUT, tensor_count_++), ...);
-#else
-        if constexpr ((std::is_same_v<std::decay_t<Args>, TensorCreateInfo> && ...)) {
-            ((tensors_[tensor_count_] = &args, tags_[tensor_count_] = TensorArgType::OUTPUT, tensor_count_++), ...);
+        if constexpr (MaxT == MAX_TENSOR_ARGS) {
+            (add_output_copy(args), ...);
         } else {
-            ((tensors_[tensor_count_] = &args, tags_[tensor_count_] = TensorArgType::OUTPUT_EXISTING, tensor_count_++),
-             ...);
+            (add_output_ref(args), ...);
         }
-#endif
     }
 
     template <typename... Args>
@@ -352,7 +329,11 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
         if (!check_add_tensor_capacity(static_cast<int32_t>(sizeof...(Args)))) {
             return;
         }
-        ((tensors_[tensor_count_] = &args, tags_[tensor_count_] = TensorArgType::INOUT, tensor_count_++), ...);
+        if constexpr (MaxT == MAX_TENSOR_ARGS) {
+            (add_tensor_copy(args, TensorArgType::INOUT), ...);
+        } else {
+            ((tensors_[tensor_count_] = &args, tags_[tensor_count_] = TensorArgType::INOUT, tensor_count_++), ...);
+        }
     }
 
     /// No-dependency existing tensor: skips OverlapMap lookup, depends on creator only.
@@ -360,7 +341,11 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     PTO_DEVICE_FUNC void add_no_dep(Args &&...args) {
         assert_add_tensor_args<false, Args...>();
         if (!check_add_tensor_capacity(static_cast<int32_t>(sizeof...(Args)))) return;
-        ((tensors_[tensor_count_] = &args, tags_[tensor_count_] = TensorArgType::NO_DEP, tensor_count_++), ...);
+        if constexpr (MaxT == MAX_TENSOR_ARGS) {
+            (add_tensor_copy(args, TensorArgType::NO_DEP), ...);
+        } else {
+            ((tensors_[tensor_count_] = &args, tags_[tensor_count_] = TensorArgType::NO_DEP, tensor_count_++), ...);
+        }
     }
 
     /**
@@ -381,7 +366,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
      * deps are already set will fail with set_error(). Use count == 0 first
      * if you need to re-set.
      */
-    void set_dependencies(const PTO2TaskId *deps, uint32_t count) {
+    PTO_DEVICE_FUNC void set_dependencies(const PTO2TaskId *deps, uint32_t count) {
         if (count == 0) {
             explicit_deps_ = nullptr;
             explicit_dep_count_ = 0;
@@ -399,14 +384,14 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
         explicit_dep_count_ = count;
     }
 
-    uint32_t explicit_dep_count() const { return explicit_dep_count_; }
+    PTO_DEVICE_FUNC uint32_t explicit_dep_count() const { return explicit_dep_count_; }
 
-    PTO2TaskId explicit_dep(uint32_t index) const {
+    PTO_DEVICE_FUNC PTO2TaskId explicit_dep(uint32_t index) const {
         always_assert(index < explicit_dep_count_);
         return explicit_deps_[index];
     }
 
-    const PTO2TaskId *explicit_deps_data() const { return explicit_deps_; }
+    PTO_DEVICE_FUNC const PTO2TaskId *explicit_deps_data() const { return explicit_deps_; }
 
     /**
      * Add scalar values. Types are deduced per argument; each value is
@@ -430,12 +415,12 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
 #endif
     }
 
-    void add_scalars(const uint64_t *values, int count) {
+    PTO_DEVICE_FUNC void add_scalars(const uint64_t *values, int count) {
         if (count < 0 || scalar_count_ + count > MaxS) {
             set_error(scalar_cap_msg());
             return;
         }
-        memcpy(&scalars_[scalar_count_], values, count * sizeof(uint64_t));
+        aicore_memcpy(&scalars_[scalar_count_], values, count * sizeof(uint64_t));
 #if PTO2_PROFILING
         dump_arg_selection_.clear_scalar_metadata(scalar_count_, count);
 #endif
@@ -448,7 +433,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
      * (e.g., -1 → 0x00000000FFFFFFFF, not 0xFFFFFFFFFFFFFFFF).
      * Uses NEON to process 4 elements per iteration on aarch64.
      */
-    void add_scalars_i32(const int32_t *values, int count) {
+    PTO_DEVICE_FUNC void add_scalars_i32(const int32_t *values, int count) {
         if (count < 0 || scalar_count_ + count > MaxS) {
             set_error(scalar_cap_msg());
             return;
@@ -481,7 +466,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
      * Copy scalars from another Arg's scalar array.
      * Useful when multiple tasks share the same scalar data (e.g., block indices).
      */
-    void copy_scalars_from(const Arg &src, int src_offset, int count) {
+    PTO_DEVICE_FUNC void copy_scalars_from(const Arg &src, int src_offset, int count) {
         if (src_offset < 0 || count < 0 || src_offset + count > src.scalar_count_) {
             set_error("Source scalar range out of bounds in copy_scalars_from");
             return;
@@ -490,7 +475,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
             set_error(scalar_cap_msg());
             return;
         }
-        memcpy(&scalars_[scalar_count_], &src.scalars_[src_offset], count * sizeof(uint64_t));
+        aicore_memcpy(&scalars_[scalar_count_], &src.scalars_[src_offset], count * sizeof(uint64_t));
 #if PTO2_PROFILING
         dump_arg_selection_.copy_scalar_dtypes_from(src.dump_arg_selection_, scalar_count_, src_offset, count);
 #endif
@@ -498,9 +483,9 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     }
 
 #if PTO2_PROFILING
-    const uint8_t *scalar_dtypes() const { return dump_arg_selection_.scalar_dtypes(); }
+    PTO_DEVICE_FUNC const uint8_t *scalar_dtypes() const { return dump_arg_selection_.scalar_dtypes(); }
 #else
-    const uint8_t *scalar_dtypes() const { return nullptr; }
+    PTO_DEVICE_FUNC const uint8_t *scalar_dtypes() const { return nullptr; }
 #endif
 
 private:
@@ -638,6 +623,108 @@ private:
         }
         return true;
     }
+
+    PTO_DEVICE_FUNC void add_output_ref(const TensorCreateInfo &create_info) {
+        tensors_[tensor_count_] = &create_info;
+        tags_[tensor_count_] = TensorArgType::OUTPUT;
+        tensor_count_++;
+    }
+
+    PTO_DEVICE_FUNC void add_output_ref(const Tensor &tensor) {
+        tensors_[tensor_count_] = &tensor;
+        tags_[tensor_count_] = TensorArgType::OUTPUT_EXISTING;
+        tensor_count_++;
+    }
+
+#if defined(__CCE_AICORE__)
+    PTO_DEVICE_FUNC void add_output_ref(__gm__ const TensorCreateInfo &create_info) {
+        tensors_[tensor_count_] = &create_info;
+        tags_[tensor_count_] = TensorArgType::OUTPUT;
+        tensor_count_++;
+    }
+
+    PTO_DEVICE_FUNC void add_output_ref(__gm__ const Tensor &tensor) {
+        tensors_[tensor_count_] = &tensor;
+        tags_[tensor_count_] = TensorArgType::OUTPUT_EXISTING;
+        tensor_count_++;
+    }
+#endif
+
+    static constexpr size_t kStorageSlots = (MaxT == MAX_TENSOR_ARGS) ? 8 : 1;
+    Tensor tensor_storage_[kStorageSlots];
+    TensorCreateInfo create_info_storage_[kStorageSlots];
+
+    PTO_DEVICE_FUNC void add_tensor_copy(const Tensor &tensor, TensorArgType tag) {
+        if (tensor_count_ >= static_cast<int32_t>(kStorageSlots)) {
+            set_error("Too many copied tensor args");
+            return;
+        }
+        Tensor::copy(tensor_storage_[tensor_count_], tensor);
+        tensors_[tensor_count_] = &tensor_storage_[tensor_count_];
+        this->tag(tensor_count_) = tag;
+        tensor_count_++;
+    }
+
+#if defined(__CCE_AICORE__)
+    PTO_DEVICE_FUNC void add_tensor_copy(__gm__ const Tensor &tensor, TensorArgType tag) {
+        if (tensor_count_ >= static_cast<int32_t>(kStorageSlots)) {
+            set_error("Too many copied tensor args");
+            return;
+        }
+        Tensor::copy(tensor_storage_[tensor_count_], tensor);
+        tensors_[tensor_count_] = &tensor_storage_[tensor_count_];
+        this->tag(tensor_count_) = tag;
+        tensor_count_++;
+    }
+#endif
+
+    PTO_DEVICE_FUNC void add_output_copy(const TensorCreateInfo &create_info) {
+        if (tensor_count_ >= static_cast<int32_t>(kStorageSlots)) {
+            set_error("Too many copied tensor args");
+            return;
+        }
+        copy_tensor_create_info_fields(create_info_storage_[tensor_count_], create_info);
+        tensors_[tensor_count_] = &create_info_storage_[tensor_count_];
+        this->tag(tensor_count_) = TensorArgType::OUTPUT;
+        tensor_count_++;
+    }
+
+#if defined(__CCE_AICORE__)
+    PTO_DEVICE_FUNC void add_output_copy(__gm__ const TensorCreateInfo &create_info) {
+        if (tensor_count_ >= static_cast<int32_t>(kStorageSlots)) {
+            set_error("Too many copied tensor args");
+            return;
+        }
+        copy_tensor_create_info_fields(create_info_storage_[tensor_count_], create_info);
+        tensors_[tensor_count_] = &create_info_storage_[tensor_count_];
+        this->tag(tensor_count_) = TensorArgType::OUTPUT;
+        tensor_count_++;
+    }
+#endif
+
+    PTO_DEVICE_FUNC void add_output_copy(const Tensor &tensor) {
+        if (tensor_count_ >= static_cast<int32_t>(kStorageSlots)) {
+            set_error("Too many copied tensor args");
+            return;
+        }
+        Tensor::copy(tensor_storage_[tensor_count_], tensor);
+        tensors_[tensor_count_] = &tensor_storage_[tensor_count_];
+        this->tag(tensor_count_) = TensorArgType::OUTPUT_EXISTING;
+        tensor_count_++;
+    }
+
+#if defined(__CCE_AICORE__)
+    PTO_DEVICE_FUNC void add_output_copy(__gm__ const Tensor &tensor) {
+        if (tensor_count_ >= static_cast<int32_t>(kStorageSlots)) {
+            set_error("Too many copied tensor args");
+            return;
+        }
+        Tensor::copy(tensor_storage_[tensor_count_], tensor);
+        tensors_[tensor_count_] = &tensor_storage_[tensor_count_];
+        this->tag(tensor_count_) = TensorArgType::OUTPUT_EXISTING;
+        tensor_count_++;
+    }
+#endif
 };
 
 // =============================================================================
