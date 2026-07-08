@@ -4,7 +4,7 @@
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
@@ -34,7 +34,8 @@
 #endif
 
 template <typename TensorT>
-PTO_DEVICE_FUNC void write_descriptor_checks(TensorT &tensor, __gm__ float *out, uint32_t base, uint64_t n, const Tensor &reference) {
+PTO_DEVICE_FUNC void
+write_descriptor_checks(TensorT &tensor, __gm__ float *out, uint32_t base, uint64_t n, const Tensor &reference) {
     out[base + 0] = tensor.buffer.addr != 0 ? 1.0f : 0.0f;
     out[base + 1] = tensor.buffer.size == n * sizeof(float) ? 1.0f : 0.0f;
     out[base + 2] = tensor.start_offset == 0 ? 1.0f : 0.0f;
@@ -49,18 +50,16 @@ PTO_DEVICE_FUNC void write_descriptor_checks(TensorT &tensor, __gm__ float *out,
 
 extern "C" {
 
-__attribute__((visibility("default"), weak)) PTO2OrchestrationConfig aicpu_orchestration_config(
-    const L2TaskArgs &orch_args
-) {
+__attribute__((visibility("default"), weak)) PTO2OrchestrationConfig
+aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 5,
     };
 }
 
-__attribute__((visibility("default"), weak)) PTO_DEVICE_FUNC void aicpu_orchestration_entry(
-    const L2TaskArgs &orch_args
-) {
+__attribute__((visibility("default"), weak)) PTO_DEVICE_FUNC void
+aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     const Tensor &input = orch_args.tensor(0).ref();
     const Tensor &output = orch_args.tensor(1).ref();
     const Tensor &dump = orch_args.tensor(2).ref();
@@ -330,6 +329,36 @@ __attribute__((visibility("default"), weak)) PTO_DEVICE_FUNC void aicpu_orchestr
         fanin_args.add_inout(output);
         fanin_args.add_scalar(sub_n);
         rt_submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
+        return;
+    }
+
+    if (mode == 16) {
+        TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
+        TaskOutputTensors seed_out = alloc_tensors(scratch_ci);
+        __gm__ const Tensor &seed = seed_out.get_ref(0);
+
+        L0TaskArgs fill_args;
+        fill_args.add_input(input);
+        fill_args.add_inout(seed);
+        fill_args.add_scalar(n);
+        fill_args.add_scalar(static_cast<uint64_t>(2000000));
+        rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
+
+        const uint32_t sub_n = static_cast<uint32_t>(n / 8);
+        const uint32_t sub_shape[1] = {sub_n};
+        const uint32_t seed_offset[1] = {0};
+        Tensor seed_view = Tensor::view(seed, sub_shape, seed_offset);
+        for (uint64_t i = 0; i < 6; i++) {
+            const uint32_t out_offset[1] = {static_cast<uint32_t>(i * sub_n)};
+            Tensor output_view = Tensor::view(output, sub_shape, out_offset);
+            L0TaskArgs fanin_args;
+            fanin_args.add_input(seed_view);
+            fanin_args.add_input(seed_view);
+            fanin_args.add_input(seed_view);
+            fanin_args.add_inout(output_view);
+            fanin_args.add_scalar(sub_n);
+            rt_submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
+        }
         return;
     }
 

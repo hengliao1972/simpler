@@ -4,7 +4,7 @@
 # CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
-# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """fdwic submit dependency smoke test."""
@@ -292,6 +292,19 @@ class TestSubmitDependencySmoke(SceneTestCase):
             "params": {"n": 128, "mode": 15},
         },
         {
+            "name": "A5SimBd36DelayedRingFanout",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 257, "mode": 16},
+        },
+        {
+            "name": "A5OnboardBd36DelayedRingFanout",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 257, "mode": 16},
+        },
+        {
             "name": "A5SimBd36L0TaskArgsTagPersistence",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
@@ -331,7 +344,7 @@ class TestSubmitDependencySmoke(SceneTestCase):
         if mode == 2:
             args.output[:] = args.input + 8.0
             return
-        if mode == 3 or mode == 4:
+        if mode in {3, 4}:
             n = int(params["n"])
             start = n // 4
             end = start + n // 2
@@ -373,6 +386,13 @@ class TestSubmitDependencySmoke(SceneTestCase):
             end = start + n // 2
             args.output[:] = -1.0
             args.output[: n // 2] = (args.input[start:end] * 2.0 + 3.0) * 3.0 + 8.0
+            return
+        if mode == 16:
+            sub_n = int(params["n"]) // 8
+            args.output[:] = -1.0
+            expected = (args.input[:sub_n] + 7.0) * 3.0 + 8.0
+            for i in range(6):
+                args.output[i * sub_n : (i + 1) * sub_n] = expected
             return
         args.output[:] = args.input * 6.0 + 23.0
 

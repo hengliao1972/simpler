@@ -299,9 +299,9 @@ constexpr int32_t kPrivateSlots = 4;  // PRIVATE_TASK_SLOT_NUM (back-pressure ca
 // and run an (immediately-ready) deposit even when its ring is otherwise full of
 // not-yet-ready consumers — breaking the consumer<->deposit priority inversion.
 constexpr int32_t kWonReserve = 2;
-constexpr int32_t kMaxFanin = 16;        // max distinct producers a task waits on
-constexpr int32_t kMapCap = 16384;       // per-core producer-map capacity (distinct regions)
-constexpr int32_t kFlagCap = 1 << 16;    // global completion-flag ring (>= total tasks)
+constexpr int32_t kMaxFanin = 16;      // max distinct producers a task waits on
+constexpr int32_t kMapCap = 16384;     // per-core producer-map capacity (distinct regions)
+constexpr int32_t kFlagCap = 1 << 16;  // global completion-flag ring (>= total tasks)
 // Submit payloads are keyed by each core's replay-local task id. They need a
 // deeper retention window than the tiny private execution ring, but stay
 // per-core so submit-side descriptor reads do not become cross-core GM traffic.
@@ -324,7 +324,7 @@ struct DistOutputLayout {
 //     of task N has id <= N + H. R = F - H. Must be >= the graph's true heap span
 //     or a producer region could be recycled while a late consumer still reads it
 //     (run-time-checked → fatal "heap span exceeded").
-constexpr size_t kHeapRingDefault = 64ull << 20;
+[[maybe_unused]] constexpr size_t kHeapRingDefault = 64ull << 20;
 constexpr int32_t kHDefault = 64;
 
 // -----------------------------------------------------------------------------
@@ -710,7 +710,7 @@ struct WonSlot {
     // CCEC and its object is not a POD, so it can't sit in a struct the AICore
     // touches. We reproduce the same acq/rel/relaxed semantics through the
     // atom_* wrappers at the top of the file.
-    volatile int32_t state;                        // 0=free, 1=published, 2=reserving
+    volatile int32_t state;  // 0=free, 1=published, 2=reserving
     int32_t task_id;
     // int64_t: CCEC backend refuses 32-bit atomic add on GM (see wrappers
     // preamble). fetch_sub happens on this field, so bump to 64-bit.
@@ -924,7 +924,9 @@ thread_local DistCore *g_self = nullptr;
 #endif
 
 static_assert(sizeof(DistGlobal) <= kDistEngineGlobalStateSize, "DistGlobal exceeds the reserved runtime arena size");
-static_assert(alignof(DistGlobal) <= kDistEngineGlobalStateAlign, "DistGlobal exceeds the reserved runtime arena align");
+static_assert(
+    alignof(DistGlobal) <= kDistEngineGlobalStateAlign, "DistGlobal exceeds the reserved runtime arena align"
+);
 
 namespace {
 
@@ -966,9 +968,7 @@ inline uint64_t thread_cpu_ns() {
 inline uint64_t trace_now() { return g_trace_on ? now_ns() : 0; }
 inline uint64_t trace_now_cpu() { return g_trace_on ? thread_cpu_ns() : 0; }
 
-inline DistCoreTraceState &trace_state(DistCore *self) {
-    return g_trace_cores[self->core_idx];
-}
+inline DistCoreTraceState &trace_state(DistCore *self) { return g_trace_cores[self->core_idx]; }
 
 inline void trace_reset_core(DistCore *self) {
     DistCoreTraceState &ts = trace_state(self);
@@ -1066,7 +1066,7 @@ PTO_DEVICE_FUNC inline void watchdog([[maybe_unused]] uint64_t &start_ns) {
 #if DIST_SIM_HOST_CLOCK
     static const long budget_s = []() -> long {
         const char *e = getenv("PTO_DIST_WATCHDOG");
-        return e ? atol(e) : 0;
+        return e ? std::strtol(e, nullptr, 10) : 0;
     }();
     if (budget_s <= 0) return;
     const uint64_t now = static_cast<uint64_t>(
@@ -1403,35 +1403,35 @@ PTO_DEVICE_FUNC void populate_won_slot(
     atom_store<int64_t>(w.remaining, pc, __ATOMIC_RELAXED);
 #endif
 #if defined(__CCE_AICORE__)
-#define RESET_WON_LANE(L) \
-    do { \
-        w.drained[(L)].v = 0; \
+#define RESET_WON_LANE(L)            \
+    do {                             \
+        w.drained[(L)].v = 0;        \
         w.lane[(L)].present = false; \
     } while (0)
 #else
-#define RESET_WON_LANE(L) \
-    do { \
+#define RESET_WON_LANE(L)                                  \
+    do {                                                   \
         atom_store(w.drained[(L)].v, 0, __ATOMIC_RELAXED); \
-        w.lane[(L)].present = false; \
+        w.lane[(L)].present = false;                       \
     } while (0)
 #endif
-#define POPULATE_WON_LANE(L) \
-    do { \
-        if ((L) == own_lane || !lane_active(M, (L))) break; \
-        __gm__ BuiltSubtask &b = w.lane[(L)]; \
-        b.present = true; \
-        b.func_id = kernel_id_for_lane(mixed, (L)); \
+#define POPULATE_WON_LANE(L)                                                                    \
+    do {                                                                                        \
+        if ((L) == own_lane || !lane_active(M, (L))) break;                                     \
+        __gm__ BuiltSubtask &b = w.lane[(L)];                                                   \
+        b.present = true;                                                                       \
+        b.func_id = kernel_id_for_lane(mixed, (L));                                             \
         b.function_bin_addr = runtime != nullptr ? resolve_kernel_addr(runtime, b.func_id) : 0; \
-        b.tensor_count = tc; \
-        b.scalar_count = sc; \
-        for (int32_t i = 0; i < tc; i++) \
-            Tensor::copy(b.tensors[i], tensors[i]); \
-        for (int32_t j = 0; j < sc; j++) \
-            b.scalars[j] = scalars[j]; \
-        b.fanin_count = fc; \
-        for (int32_t k = 0; k < fc; k++) \
-            b.fanin[k] = fanin[k]; \
-        b.sub_block_id = ((L) == LANE_AIV1) ? 1 : 0; \
+        b.tensor_count = tc;                                                                    \
+        b.scalar_count = sc;                                                                    \
+        for (int32_t i = 0; i < tc; i++)                                                        \
+            Tensor::copy(b.tensors[i], tensors[i]);                                             \
+        for (int32_t j = 0; j < sc; j++)                                                        \
+            b.scalars[j] = scalars[j];                                                          \
+        b.fanin_count = fc;                                                                     \
+        for (int32_t k = 0; k < fc; k++)                                                        \
+            b.fanin[k] = fanin[k];                                                              \
+        b.sub_block_id = ((L) == LANE_AIV1) ? 1 : 0;                                            \
     } while (0)
     RESET_WON_LANE(LANE_AIC);
     RESET_WON_LANE(LANE_AIV0);
@@ -1681,17 +1681,13 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
 }
 
 #if defined(__CCE_AICORE__)
-PTO_DEVICE_FUNC inline TensorArgType payload_tag(const DistSubmitCtx &ctx, int32_t i) {
-    return ctx.payload->tags[i];
-}
+PTO_DEVICE_FUNC inline TensorArgType payload_tag(const DistSubmitCtx &ctx, int32_t i) { return ctx.payload->tags[i]; }
 
 PTO_DEVICE_FUNC inline __gm__ const Tensor &payload_tensor(const DistSubmitCtx &ctx, int32_t i) {
     return ctx.payload->tensors[i];
 }
 #else
-PTO_DEVICE_FUNC inline TensorArgType payload_tag(const DistSubmitCtx &ctx, int32_t i) {
-    return ctx.payload->tags[i];
-}
+PTO_DEVICE_FUNC inline TensorArgType payload_tag(const DistSubmitCtx &ctx, int32_t i) { return ctx.payload->tags[i]; }
 
 PTO_DEVICE_FUNC inline const Tensor &payload_tensor(const DistSubmitCtx &ctx, int32_t i) {
     return ctx.payload->tensors[i];
@@ -1997,9 +1993,8 @@ DIST_API_ATTR PTO_DEVICE_FUNC bool dist_is_fatal_query() {
 #endif
 }
 
-DIST_API_ATTR PTO_DEVICE_FUNC void dist_report_fatal_msg(
-    int32_t code, __gm__ const char *func, __gm__ const char *msg
-) {
+DIST_API_ATTR PTO_DEVICE_FUNC void
+dist_report_fatal_msg(int32_t code, __gm__ const char *func, __gm__ const char *msg) {
 #if DIST_CONTROL_PLANE
     set_fatal();
     fprintf(stderr, "[dist_engine][FATAL][%s] code=%d: %s\n", func ? func : "?", code, msg ? msg : "");
@@ -2068,9 +2063,8 @@ PTO_DEVICE_FUNC void wait_producer_ready(DistCore *self, const Tensor &t) {
 
 }  // namespace
 
-DIST_API_ATTR PTO_DEVICE_FUNC uint64_t dist_get_tensor_data_impl(
-    PTO2Runtime *, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]
-) {
+DIST_API_ATTR PTO_DEVICE_FUNC uint64_t
+dist_get_tensor_data_impl(PTO2Runtime *, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
     if (tensor.buffer.addr == 0) return 0;
 #if DIST_CONTROL_PLANE
     // Sim/AICPU: g_self is a plain thread_local DistCore*. Reachable to
@@ -2158,6 +2152,7 @@ void dist_scope_end(PTO2Runtime *rt) { dist_scope_end_impl(rt); }
 void dist_orchestration_done(PTO2Runtime *rt) { dist_orchestration_done_impl(rt); }
 bool dist_is_fatal(PTO2Runtime *) { return fatal_set(); }
 
+// NOLINTNEXTLINE(modernize-avoid-variadic-functions): PTO2RuntimeOps legacy ABI.
 void dist_report_fatal(PTO2Runtime *, int32_t code, const char *func, const char *fmt, ...) {
     set_fatal();
     va_list ap;
@@ -2168,6 +2163,7 @@ void dist_report_fatal(PTO2Runtime *, int32_t code, const char *func, const char
     va_end(ap);
 }
 
+// NOLINTNEXTLINE(modernize-avoid-variadic-functions): PTO2RuntimeOps legacy ABI.
 void dist_log_error(const char *func, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -2176,9 +2172,9 @@ void dist_log_error(const char *func, const char *fmt, ...) {
     fprintf(stderr, "\n");
     va_end(ap);
 }
-void dist_log_warn(const char *, const char *, ...) {}
-void dist_log_debug(const char *, const char *, ...) {}
-void dist_log_info_v(const char *, int, const char *, ...) {}
+void dist_log_warn(const char *, const char *, ...) {}         // NOLINT(modernize-avoid-variadic-functions)
+void dist_log_debug(const char *, const char *, ...) {}        // NOLINT(modernize-avoid-variadic-functions)
+void dist_log_info_v(const char *, int, const char *, ...) {}  // NOLINT(modernize-avoid-variadic-functions)
 
 // Adapters so the legacy ops table still has the ChipStorage/Tensor overloads
 // it expects (device-side impls take pointer-array indices; ops table wants a
@@ -2241,21 +2237,6 @@ PTO_DEVICE_FUNC void ccec_complete_task(DistSubmitCtx &ctx) {
     store_task_vend(ctx.task_id, ctx.self->heap_next);
     ccec_publish_flag(ctx.task_id);
     ccec_advance_frontier();
-}
-
-PTO_DEVICE_FUNC void ccec_wait_flag(int32_t task_id) {
-    if (g_dist_ptr == nullptr || task_id < 0 || task_id >= kFlagCap) return;
-    while (true) {
-        if (task_flag_ready(task_id, __ATOMIC_ACQUIRE)) return;
-        SPIN_WAIT_HINT();
-    }
-}
-
-template <typename FaninPtr>
-PTO_DEVICE_FUNC void ccec_wait_fanin(FaninPtr fanin, int32_t count) {
-    for (int32_t i = 0; i < count; i++) {
-        ccec_wait_flag(fanin[i]);
-    }
 }
 
 PTO_DEVICE_FUNC int32_t anchor_lane_for_mask(const ActiveMask &M) {
@@ -2326,7 +2307,8 @@ PTO_DEVICE_FUNC bool ccec_claim_submit(DistSubmitKind kind, const MixedKernels *
     return ccec_claim_kernel_submit(*mixed, ctx);
 }
 
-PTO_DEVICE_FUNC void ccec_execute_slot_direct(__gm__ RingSlot &slot, __gm__ DistCore *self);
+PTO_DEVICE_FUNC bool ccec_drain_block_won_direct(__gm__ DistCore *self);
+PTO_DEVICE_FUNC int32_t ccec_drain_ready_slots_direct(__gm__ DistCore *self);
 
 PTO_DEVICE_FUNC __gm__ RingSlot *ccec_alloc_direct_slot(__gm__ DistCore *self) {
     if (self == nullptr) return nullptr;
@@ -2340,7 +2322,15 @@ PTO_DEVICE_FUNC __gm__ RingSlot *ccec_alloc_direct_slot(__gm__ DistCore *self) {
     return &slot;
 }
 
-PTO_DEVICE_FUNC int32_t ccec_alloc_won_slot_direct(int32_t block) {
+PTO_DEVICE_FUNC void ccec_wait_direct_slot_capacity(__gm__ DistCore *self) {
+    if (self == nullptr) return;
+    while (self->occupied_count >= kPrivateSlots - kWonReserve) {
+        ccec_drain_block_won_direct(self);
+        if (ccec_drain_ready_slots_direct(self) == 0) SPIN_WAIT_HINT();
+    }
+}
+
+PTO_DEVICE_FUNC int32_t ccec_alloc_won_slot_direct(__gm__ DistCore *self, int32_t block) {
     __gm__ BlockWon &bw = g_dist.blocks[block];
     while (true) {
         ccec_invalidate_region(&bw, sizeof(BlockWon));
@@ -2350,6 +2340,8 @@ PTO_DEVICE_FUNC int32_t ccec_alloc_won_slot_direct(int32_t block) {
             ccec_flush_region(&bw.slots[i], sizeof(WonSlot));
             return i;
         }
+        ccec_drain_block_won_direct(self);
+        ccec_drain_ready_slots_direct(self);
         SPIN_WAIT_HINT();
     }
 }
@@ -2359,8 +2351,8 @@ PTO_DEVICE_FUNC void ccec_publish_joint_deposits(DistSubmitCtx &ctx, const Mixed
     __gm__ WonSlot &w = g_dist.blocks[ctx.joint_block].slots[ctx.joint_slot];
     const ActiveMask M = mixed.to_active_mask();
     populate_won_slot(
-        w, ctx.task_id, M, mixed, ctx.self->lane, nullptr, ctx.payload->tensors, ctx.tensor_count,
-        ctx.payload->scalars, ctx.payload->scalar_count, ctx.fanin, ctx.fanin_count
+        w, ctx.task_id, M, mixed, ctx.self->lane, nullptr, ctx.payload->tensors, ctx.tensor_count, ctx.payload->scalars,
+        ctx.payload->scalar_count, ctx.fanin, ctx.fanin_count
     );
     w.state = 1;
     g_dist.blocks[ctx.joint_block].any_pub = 1;
@@ -2382,11 +2374,10 @@ PTO_DEVICE_FUNC bool ccec_drain_won_slot_direct(__gm__ DistCore *self, int32_t w
     ccec_flush_region(&w.drained[self->lane], sizeof(DrainedCell));
     __gm__ BuiltSubtask &b = w.lane[self->lane];
     build_ring_slot(
-        *slot, w.task_id, b.func_id, b.function_bin_addr, b.tensors, b.tensor_count, b.scalars, b.scalar_count,
-        b.fanin, b.fanin_count, b.sub_block_id, /*is_multicore=*/true, self->block_id, won_slot
+        *slot, w.task_id, b.func_id, b.function_bin_addr, b.tensors, b.tensor_count, b.scalars, b.scalar_count, b.fanin,
+        b.fanin_count, b.sub_block_id, /*is_multicore=*/true, self->block_id, won_slot
     );
     ccec_flush_region(slot, sizeof(RingSlot));
-    ccec_execute_slot_direct(*slot, self);
     return true;
 }
 
@@ -2417,8 +2408,7 @@ PTO_DEVICE_FUNC bool ccec_build_winner_slot(DistSubmitCtx &ctx, __gm__ RingSlot 
     const int32_t sub_block_id = ctx.self != nullptr && ctx.self->lane == LANE_AIV1 ? 1 : 0;
     build_ring_slot(
         *slot, ctx.task_id, ctx.kernel_id, 0, ctx.payload->tensors, ctx.tensor_count, ctx.payload->scalars,
-        ctx.payload->scalar_count, ctx.fanin, ctx.fanin_count, sub_block_id, ctx.joint, ctx.joint_block,
-        ctx.joint_slot
+        ctx.payload->scalar_count, ctx.fanin, ctx.fanin_count, sub_block_id, ctx.joint, ctx.joint_block, ctx.joint_slot
     );
     ccec_flush_region(slot, sizeof(RingSlot));
     return true;
@@ -2448,8 +2438,15 @@ PTO_DEVICE_FUNC void ccec_complete_slot(__gm__ RingSlot &slot, __gm__ DistCore *
     }
 }
 
-PTO_DEVICE_FUNC void ccec_execute_slot_direct(__gm__ RingSlot &slot, __gm__ DistCore *self) {
-    ccec_wait_fanin(slot.fanin, slot.fanin_count);
+PTO_DEVICE_FUNC bool ccec_slot_fanin_ready(__gm__ const RingSlot &slot) {
+    for (int32_t i = 0; i < slot.fanin_count; i++) {
+        if (!task_flag_ready(slot.fanin[i], __ATOMIC_ACQUIRE)) return false;
+    }
+    return true;
+}
+
+PTO_DEVICE_FUNC bool ccec_try_execute_slot_direct(__gm__ RingSlot &slot, __gm__ DistCore *self) {
+    if (!slot.occupied || !slot.built || !ccec_slot_fanin_ready(slot)) return false;
     ccec_call_slot_kernel(slot);
     OUT_OF_ORDER_STORE_BARRIER();
     ccec_complete_slot(slot, self);
@@ -2457,19 +2454,31 @@ PTO_DEVICE_FUNC void ccec_execute_slot_direct(__gm__ RingSlot &slot, __gm__ Dist
     slot.occupied = false;
     if (self != nullptr && self->occupied_count > 0) self->occupied_count--;
     ccec_flush_region(&slot, sizeof(RingSlot));
+    return true;
+}
+
+PTO_DEVICE_FUNC int32_t ccec_drain_ready_slots_direct(__gm__ DistCore *self) {
+    if (self == nullptr || self->occupied_count == 0) return 0;
+    int32_t freed = 0;
+    for (int32_t i = 0; i < kPrivateSlots; i++) {
+        __gm__ RingSlot &slot = self->slots[i];
+        ccec_invalidate_region(&slot, sizeof(RingSlot));
+        if (ccec_try_execute_slot_direct(slot, self)) freed++;
+    }
+    return freed;
 }
 
 PTO_DEVICE_FUNC void ccec_execute_won_submit(DistSubmitCtx &ctx, const MixedKernels &mixed) {
     if (ctx.self == nullptr) return;
+    ccec_wait_direct_slot_capacity(ctx.self);
     if (ctx.joint && ctx.joint_slot < 0) {
-        ctx.joint_slot = ccec_alloc_won_slot_direct(ctx.joint_block);
+        ctx.joint_slot = ccec_alloc_won_slot_direct(ctx.self, ctx.joint_block);
     }
     __gm__ RingSlot *slot = ccec_alloc_direct_slot(ctx.self);
     if (slot == nullptr) return;
 
     if (ctx.joint) ccec_publish_joint_deposits(ctx, mixed);
     if (!ccec_build_winner_slot(ctx, slot)) return;
-    ccec_execute_slot_direct(*slot, ctx.self);
 }
 
 PTO_DEVICE_FUNC void ccec_complete_alloc_submit(DistSubmitCtx &ctx) {
@@ -2496,9 +2505,7 @@ PTO_DEVICE_FUNC void ccec_init_worker_layout() {
     }
 }
 
-PTO_DEVICE_FUNC bool ccec_is_valid_worker() {
-    return g_ccec_valid_worker;
-}
+PTO_DEVICE_FUNC bool ccec_is_valid_worker() { return g_ccec_valid_worker; }
 
 PTO_DEVICE_FUNC void ccec_attach_run_state() {
     ccec_invalidate_region(const_cast<__gm__ int32_t *>(&g_dist.num_blocks), sizeof(g_dist.num_blocks));
@@ -2526,12 +2533,39 @@ PTO_DEVICE_FUNC void ccec_finish_worker() {
     ccec_publish_done();
 }
 
+PTO_DEVICE_FUNC bool ccec_has_pending_won_direct(__gm__ DistCore *self) {
+    if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
+    __gm__ BlockWon &bw = g_dist.blocks[self->block_id];
+    ccec_invalidate_region(&bw, sizeof(BlockWon));
+    if (bw.any_pub == 0) return false;
+    for (int32_t i = 0; i < kPrivateSlots; i++) {
+        __gm__ WonSlot &w = bw.slots[i];
+        if (w.state != 1) continue;
+        if (w.lane[self->lane].present && w.drained[self->lane].v == 0) return true;
+    }
+    return false;
+}
+
+PTO_DEVICE_FUNC void ccec_drain_to_completion(__gm__ DistCore *self) {
+    if (self == nullptr) return;
+    __gm__ int64_t *replay_done = const_cast<__gm__ int64_t *>(&g_dist.replay_done);
+    atomicAdd(replay_done, static_cast<int64_t>(1));
+    while (true) {
+        ccec_drain_block_won_direct(self);
+        const int32_t freed = ccec_drain_ready_slots_direct(self);
+        ccec_invalidate_region(replay_done, sizeof(g_dist.replay_done));
+        const bool all_replayed = g_dist.replay_done >= g_dist.num_workers;
+        const bool ring_empty = self->occupied_count == 0;
+        const bool pending = ccec_has_pending_won_direct(self);
+        if (all_replayed && ring_empty && !pending) break;
+        if (freed == 0) SPIN_WAIT_HINT();
+    }
+}
+
 PTO_DEVICE_FUNC void ccec_replay_orch(__gm__ Runtime *runtime) {
     ccec_invalidate_region(runtime->dist.ccec_orch_tensors, sizeof(runtime->dist.ccec_orch_tensors));
     ccec_invalidate_region(runtime->dist.ccec_orch_scalars, sizeof(runtime->dist.ccec_orch_scalars));
-    ccec_invalidate_region(
-        const_cast<__gm__ const int32_t *>(&runtime->dist.ccec_orch_tensor_count), 64
-    );
+    ccec_invalidate_region(const_cast<__gm__ const int32_t *>(&runtime->dist.ccec_orch_tensor_count), 64);
     if (aicpu_orchestration_entry == nullptr || !ccec_is_valid_worker()) return;
     L2TaskArgs local_args;
     Tensor local_tensors[CHIP_MAX_TENSOR_ARGS];
@@ -2550,12 +2584,12 @@ PTO_DEVICE_FUNC void ccec_replay_orch(__gm__ Runtime *runtime) {
 
 }  // namespace
 
-DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(
-    PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &args
-) {
+DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors
+dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &args) {
     DistSubmitCtx ctx;
     dist_submit_begin(nullptr, args, ctx);
     ccec_drain_block_won_direct(ctx.self);
+    ccec_drain_ready_slots_direct(ctx.self);
     if (!dist_submit_materialize_and_prepare_map(ctx.self, args, ctx, DistSubmitKind::Kernel)) return ctx.result;
     const bool is_winner = ccec_claim_submit(DistSubmitKind::Kernel, &mixed, ctx);
     if (is_winner) {
@@ -2650,6 +2684,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
     DistSubmitCtx ctx;
     dist_submit_begin(nullptr, args, ctx);
     ccec_drain_block_won_direct(ctx.self);
+    ccec_drain_ready_slots_direct(ctx.self);
     if (!dist_submit_materialize_and_prepare_map(ctx.self, args, ctx, DistSubmitKind::Alloc)) return ctx.result;
     dist_submit_register_outputs(ctx, /*include_existing=*/false);
     const bool is_winner = ccec_claim_submit(DistSubmitKind::Alloc, nullptr, ctx);
@@ -2660,10 +2695,10 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
 #endif
 
 #if DIST_CONTROL_PLANE
-const PTO2RuntimeOps g_dist_ops = {
-    dist_submit_impl,          dist_scope_begin,          dist_scope_end,     dist_orchestration_done, dist_is_fatal,
-    dist_report_fatal,         dist_log_error,            dist_log_warn,      dist_log_debug,          dist_log_info_v,
-    dist_get_tensor_data,      dist_set_tensor_data,      dist_alloc_tensors, dist_submit_dummy_impl,  dist_scope_set_site_impl,
+[[maybe_unused]] const PTO2RuntimeOps g_dist_ops = {
+    dist_submit_impl,     dist_scope_begin,     dist_scope_end,     dist_orchestration_done, dist_is_fatal,
+    dist_report_fatal,    dist_log_error,       dist_log_warn,      dist_log_debug,          dist_log_info_v,
+    dist_get_tensor_data, dist_set_tensor_data, dist_alloc_tensors, dist_submit_dummy_impl,  dist_scope_set_site_impl,
 };
 #endif  // DIST_CONTROL_PLANE
 
@@ -2760,6 +2795,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
 
     ccec_replay_orch(runtime);
 
+    ccec_drain_to_completion(g_self);
     ccec_finish_worker();
     return;
 #else
@@ -2893,7 +2929,7 @@ void *dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num
     // heap spans; default kHDefault.
     g_dist.H = kHDefault;
     if (const char *e = getenv("PTO_DIST_H")) {
-        const long h = atol(e);
+        const long h = std::strtol(e, nullptr, 10);
         if (h >= 0) g_dist.H = static_cast<int32_t>(h);
     }
     // The producer map recycles a task's entry-head slot kTaskWindow tasks later;
@@ -2962,7 +2998,7 @@ void *dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num
     if (dist_trace()) {
         fprintf(
             stderr, "[dist] register: num_workers=%d heap_base=%p heap_size=%zu\n", num_workers,
-            (void *)g_dist.heap_base, g_dist.heap_size
+            reinterpret_cast<void *>(g_dist.heap_base), g_dist.heap_size
         );
     }
 
