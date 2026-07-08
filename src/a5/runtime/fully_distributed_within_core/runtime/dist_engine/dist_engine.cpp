@@ -700,6 +700,11 @@ struct BuiltSubtask {
     int32_t sub_block_id;
 };
 
+struct alignas(64) DrainedCell {
+    volatile int32_t v;
+};
+static_assert(sizeof(DrainedCell) == 64, "DrainedCell must occupy one cacheline");
+
 struct WonSlot {
     // volatile T + __atomic_*: std::atomic<T>'s members are host-tagged under
     // CCEC and its object is not a POD, so it can't sit in a struct the AICore
@@ -710,18 +715,18 @@ struct WonSlot {
     // int64_t: CCEC backend refuses 32-bit atomic add on GM (see wrappers
     // preamble). fetch_sub happens on this field, so bump to 64-bit.
     volatile int64_t remaining;                    // co-owners (incl. anchor) left to finish
-    volatile int32_t drained[PTO2_SUBTASK_SLOT_COUNT];  // 0/1 per follower lane
+    DrainedCell drained[PTO2_SUBTASK_SLOT_COUNT];  // 0/1 per follower lane, isolated for CCEC flush
     BuiltSubtask lane[PTO2_SUBTASK_SLOT_COUNT];    // deposited follower subtasks
 };
 
 struct BlockWon {
-    WonSlot slots[kPrivateSlots];
+    alignas(64) WonSlot slots[kPrivateSlots];
     // Monotone "has any anchor ever published a deposit into this block?" flag.
     // Lets follower drains short-circuit the per-slot scan for workloads with no
     // multi-core (e.g. 2V) tasks — the common case (bgemm is all single-core), so
     // every AIV core skips a 4-slot won-scan on every submit. Never reset within a
     // session; once true the scan path is taken (those workloads have real work).
-    volatile int32_t any_pub;
+    alignas(64) volatile int32_t any_pub;
 };
 
 enum LaneId : int32_t { LANE_AIC = 0, LANE_AIV0 = 1, LANE_AIV1 = 2, LANE_NONE = -1 };
@@ -1394,13 +1399,13 @@ PTO_DEVICE_FUNC void populate_won_slot(
 #if defined(__CCE_AICORE__)
 #define RESET_WON_LANE(L) \
     do { \
-        w.drained[(L)] = 0; \
+        w.drained[(L)].v = 0; \
         w.lane[(L)].present = false; \
     } while (0)
 #else
 #define RESET_WON_LANE(L) \
     do { \
-        atom_store(w.drained[(L)], 0, __ATOMIC_RELAXED); \
+        atom_store(w.drained[(L)].v, 0, __ATOMIC_RELAXED); \
         w.lane[(L)].present = false; \
     } while (0)
 #endif
@@ -1454,7 +1459,7 @@ PTO_DEVICE_FUNC bool has_pending_won(__gm__ DistCore *self) {
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         __gm__ WonSlot &w = bw.slots[i];
         if (atom_load(w.state, __ATOMIC_ACQUIRE) != 1) continue;
-        if (w.lane[self->lane].present && atom_load(w.drained[self->lane], __ATOMIC_ACQUIRE) == 0) return true;
+        if (w.lane[self->lane].present && atom_load(w.drained[self->lane].v, __ATOMIC_ACQUIRE) == 0) return true;
     }
     return false;
 }
@@ -1474,12 +1479,12 @@ PTO_DEVICE_FUNC void drain_block_won(__gm__ DistCore *self) {
         if (atom_load(w.state, __ATOMIC_ACQUIRE) != 1) continue;
         if (!w.lane[self->lane].present) continue;
         int32_t exp = 0;
-        if (!atom_cas_strong(w.drained[self->lane], exp, 1, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        if (!atom_cas_strong(w.drained[self->lane].v, exp, 1, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
             continue;  // already taken by us on a prior pass
         int32_t si = alloc_ring_slot(self);
         if (si < 0) {
             // Ring full: hand the deposit back and let Phase B free a slot first.
-            atom_store(w.drained[self->lane], 0, __ATOMIC_RELEASE);
+            atom_store(w.drained[self->lane].v, 0, __ATOMIC_RELEASE);
             return;
         }
         __gm__ const BuiltSubtask &b = w.lane[self->lane];
@@ -2273,7 +2278,7 @@ PTO_DEVICE_FUNC bool ccec_claim_kernel_submit(const MixedKernels &mixed, DistSub
         const int32_t block = ctx.task_id % g_ccec_aic_count;
         ctx.joint = true;
         ctx.joint_block = block;
-        ctx.joint_slot = ctx.task_id % kPrivateSlots;
+        ctx.joint_slot = -1;
         ctx.joint_count = pc;
         const int32_t anchor_lane = anchor_lane_for_mask(M);
         if (!ccec_self_is_lane(ctx.self, block, anchor_lane)) return false;
@@ -2329,6 +2334,20 @@ PTO_DEVICE_FUNC __gm__ RingSlot *ccec_alloc_direct_slot(__gm__ DistCore *self) {
     return &slot;
 }
 
+PTO_DEVICE_FUNC int32_t ccec_alloc_won_slot_direct(int32_t block) {
+    __gm__ BlockWon &bw = g_dist.blocks[block];
+    while (true) {
+        ccec_invalidate_region(&bw, sizeof(BlockWon));
+        for (int32_t i = 0; i < kPrivateSlots; i++) {
+            if (bw.slots[i].state != 0) continue;
+            bw.slots[i].state = 2;
+            ccec_flush_region(&bw.slots[i], sizeof(WonSlot));
+            return i;
+        }
+        SPIN_WAIT_HINT();
+    }
+}
+
 PTO_DEVICE_FUNC void ccec_publish_joint_deposits(DistSubmitCtx &ctx, const MixedKernels &mixed) {
     if (!ctx.joint) return;
     __gm__ WonSlot &w = g_dist.blocks[ctx.joint_block].slots[ctx.joint_slot];
@@ -2340,18 +2359,21 @@ PTO_DEVICE_FUNC void ccec_publish_joint_deposits(DistSubmitCtx &ctx, const Mixed
     w.state = 1;
     g_dist.blocks[ctx.joint_block].any_pub = 1;
     ccec_flush_region(&w, sizeof(WonSlot));
-    ccec_flush_region(&g_dist.blocks[ctx.joint_block], sizeof(BlockWon));
+    ccec_flush_region(
+        const_cast<__gm__ int32_t *>(&g_dist.blocks[ctx.joint_block].any_pub),
+        sizeof(g_dist.blocks[ctx.joint_block].any_pub)
+    );
 }
 
 PTO_DEVICE_FUNC bool ccec_drain_won_slot_direct(__gm__ DistCore *self, int32_t won_slot) {
     if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
     __gm__ WonSlot &w = g_dist.blocks[self->block_id].slots[won_slot];
     ccec_invalidate_region(&w, sizeof(WonSlot));
-    if (w.state != 1 || !w.lane[self->lane].present || w.drained[self->lane] != 0) return false;
+    if (w.state != 1 || !w.lane[self->lane].present || w.drained[self->lane].v != 0) return false;
     __gm__ RingSlot *slot = ccec_alloc_direct_slot(self);
     if (slot == nullptr) return false;
-    w.drained[self->lane] = 1;
-    ccec_flush_region(&w, sizeof(WonSlot));
+    w.drained[self->lane].v = 1;
+    ccec_flush_region(&w.drained[self->lane], sizeof(DrainedCell));
     __gm__ BuiltSubtask &b = w.lane[self->lane];
     build_ring_slot(
         *slot, w.task_id, b.func_id, b.function_bin_addr, b.tensors, b.tensor_count, b.scalars, b.scalar_count,
@@ -2433,6 +2455,9 @@ PTO_DEVICE_FUNC void ccec_execute_slot_direct(__gm__ RingSlot &slot, __gm__ Dist
 
 PTO_DEVICE_FUNC void ccec_execute_won_submit(DistSubmitCtx &ctx, const MixedKernels &mixed) {
     if (ctx.self == nullptr) return;
+    if (ctx.joint && ctx.joint_slot < 0) {
+        ctx.joint_slot = ccec_alloc_won_slot_direct(ctx.joint_block);
+    }
     __gm__ RingSlot *slot = ccec_alloc_direct_slot(ctx.self);
     if (slot == nullptr) return;
 
@@ -2671,8 +2696,8 @@ void dist_dump_state(int) {
             fprintf(
                 stderr, "  won blk%d slot%d state=%d tid=%d remaining=%ld drained=[%d,%d,%d] present=[%d,%d,%d]\n", b,
                 i, st, w.task_id, static_cast<long>(atom_load(w.remaining, __ATOMIC_RELAXED)),
-                atom_load(w.drained[0], __ATOMIC_RELAXED), atom_load(w.drained[1], __ATOMIC_RELAXED),
-                atom_load(w.drained[2], __ATOMIC_RELAXED), w.lane[0].present, w.lane[1].present, w.lane[2].present
+                atom_load(w.drained[0].v, __ATOMIC_RELAXED), atom_load(w.drained[1].v, __ATOMIC_RELAXED),
+                atom_load(w.drained[2].v, __ATOMIC_RELAXED), w.lane[0].present, w.lane[1].present, w.lane[2].present
             );
         }
     }
