@@ -43,7 +43,12 @@ __attribute__((visibility("default"), weak)) PTO_DEVICE_FUNC void aicpu_orchestr
         args.add_scalar(n);
         args.add_scalar(delta);
         args.add_scalar(i);
-        if (mixed != 0) {
+        if (mixed == 2) {
+            MixedKernels mk;
+            mk.aiv0_kernel_id = FUNC_MARK_AIV;
+            mk.aiv1_kernel_id = FUNC_MARK_AIV;
+            rt_submit_task(mk, args);
+        } else if (mixed != 0) {
             MixedKernels mk;
             mk.aic_kernel_id = FUNC_MARK_AIC;
             mk.aiv0_kernel_id = FUNC_MARK_AIV;

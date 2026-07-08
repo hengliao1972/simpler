@@ -26,10 +26,10 @@
  * a direct call resolves at link time and needs no runtime function-pointer
  * indirection. In sim, per-example orchestration is compiled into
  * libaicore_kernel.so and reaches these symbols from the AICore image.
- * On CCEC onboard builds, submit/core-main currently provide a minimal
- * direct-call submit path for ordinary single-core tasks. The full GM replay
- * engine is still blocked on CCEC GM atomic lowering and shared DistGlobal
- * ownership.
+ * On CCEC onboard builds, orchestration is still replayed through a direct
+ * AICore entry, but submit/alloc share the same payload materialization,
+ * producer-map, fan-in, and output registration stages as the sim path. The
+ * remaining CCEC-specific surface is the claim/execution/completion backend.
  *
  * PTO_DEVICE_FUNC expands to `__aicore__` under CCEC and to nothing on host /
  * sim / AICPU builds, so a single declaration serves both worlds.
@@ -47,7 +47,6 @@
 
 struct PTO2Runtime;
 
-#if defined(__CCE_AICORE__)
 struct alignas(64) DistTaskPayload {
     int32_t tensor_count;
     int32_t scalar_count;
@@ -60,11 +59,10 @@ static_assert(alignof(DistTaskPayload) == 64, "DistTaskPayload must be cacheline
 static_assert(offsetof(DistTaskPayload, tensors) % 64 == 0, "payload tensors must be cacheline-aligned");
 static_assert(offsetof(DistTaskPayload, scalars) % 64 == 0, "payload scalars must be cacheline-aligned");
 
-#endif
-
 // Task submission and allocation. Host/sim definitions use the per-core g_self
-// stashed by dist_core_main / thread_local sim. CCEC definitions cover only the
-// minimal direct-call submit path until the onboard replay path is enabled.
+// stashed by dist_core_main / thread_local sim. CCEC definitions use the same
+// materialize/map/fanin/register stages, then dispatch through the current
+// direct AICore execution backend.
 PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *rt, const MixedKernels &mixed, const L0TaskArgs &args);
 PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *rt, const L0TaskArgs &args);
 
