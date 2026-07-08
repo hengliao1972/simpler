@@ -362,6 +362,49 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         return;
     }
 
+    if (mode == 17) {
+        TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
+        L0TaskArgs right_args;
+        right_args.add_input(input);
+        right_args.add_output(scratch_ci);
+        right_args.add_scalar(n);
+        TaskOutputTensors right_out = rt_submit_aiv_task(FUNC_MAKE_RIGHT_AIV, right_args);
+        __gm__ const Tensor &right = right_out.get_ref(0);
+
+        L0TaskArgs fill_args;
+        fill_args.add_input(right);
+        fill_args.add_inout(output);
+        fill_args.add_scalar(n);
+        rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
+        return;
+    }
+
+    if (mode == 18) {
+        TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
+        L0TaskArgs right_args;
+        right_args.add_input(input);
+        right_args.add_output(scratch_ci);
+        right_args.add_scalar(n);
+        right_args.add_scalar(static_cast<uint64_t>(8000000));
+        TaskOutputTensors right_out = rt_submit_aiv_task(FUNC_MAKE_RIGHT_AIV, right_args);
+        __gm__ const Tensor &right = right_out.get_ref(0);
+
+        const uint32_t sub_n = 32;
+        const uint32_t sub_shape[1] = {sub_n};
+        const uint32_t right_offset[1] = {0};
+        Tensor right_view = Tensor::view(right, sub_shape, right_offset);
+        for (uint64_t i = 0; i < 6; i++) {
+            const uint32_t out_offset[1] = {static_cast<uint32_t>(i * sub_n)};
+            Tensor output_view = Tensor::view(output, sub_shape, out_offset);
+            L0TaskArgs fill_args;
+            fill_args.add_input(right_view);
+            fill_args.add_inout(output_view);
+            fill_args.add_scalar(sub_n);
+            rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
+        }
+        return;
+    }
+
     TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
 
     TaskOutputTensors seed_out = alloc_tensors(scratch_ci);
