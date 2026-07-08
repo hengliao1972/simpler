@@ -2317,6 +2317,18 @@ PTO_DEVICE_FUNC bool ccec_claim_submit(DistSubmitKind kind, const MixedKernels *
 
 PTO_DEVICE_FUNC void ccec_execute_slot_direct(__gm__ RingSlot &slot, __gm__ DistCore *self);
 
+PTO_DEVICE_FUNC __gm__ RingSlot *ccec_alloc_direct_slot(__gm__ DistCore *self) {
+    if (self == nullptr) return nullptr;
+    const int32_t si = alloc_ring_slot(self);
+    if (si < 0) return nullptr;
+    __gm__ RingSlot &slot = self->slots[si];
+    slot.occupied = true;
+    slot.built = false;
+    self->occupied_count++;
+    ccec_flush_region(&slot, sizeof(RingSlot));
+    return &slot;
+}
+
 PTO_DEVICE_FUNC void ccec_publish_joint_deposits(DistSubmitCtx &ctx, const MixedKernels &mixed) {
     if (!ctx.joint) return;
     __gm__ WonSlot &w = g_dist.blocks[ctx.joint_block].slots[ctx.joint_slot];
@@ -2336,16 +2348,17 @@ PTO_DEVICE_FUNC bool ccec_drain_won_slot_direct(__gm__ DistCore *self, int32_t w
     __gm__ WonSlot &w = g_dist.blocks[self->block_id].slots[won_slot];
     ccec_invalidate_region(&w, sizeof(WonSlot));
     if (w.state != 1 || !w.lane[self->lane].present || w.drained[self->lane] != 0) return false;
+    __gm__ RingSlot *slot = ccec_alloc_direct_slot(self);
+    if (slot == nullptr) return false;
     w.drained[self->lane] = 1;
     ccec_flush_region(&w, sizeof(WonSlot));
     __gm__ BuiltSubtask &b = w.lane[self->lane];
-    __gm__ RingSlot &slot = self->slots[w.task_id & (kPrivateSlots - 1)];
     build_ring_slot(
-        slot, w.task_id, b.func_id, b.function_bin_addr, b.tensors, b.tensor_count, b.scalars, b.scalar_count,
+        *slot, w.task_id, b.func_id, b.function_bin_addr, b.tensors, b.tensor_count, b.scalars, b.scalar_count,
         b.fanin, b.fanin_count, b.sub_block_id, /*is_multicore=*/true, self->block_id, won_slot
     );
-    ccec_flush_region(&slot, sizeof(RingSlot));
-    ccec_execute_slot_direct(slot, self);
+    ccec_flush_region(slot, sizeof(RingSlot));
+    ccec_execute_slot_direct(*slot, self);
     return true;
 }
 
@@ -2414,16 +2427,18 @@ PTO_DEVICE_FUNC void ccec_execute_slot_direct(__gm__ RingSlot &slot, __gm__ Dist
     ccec_complete_slot(slot, self);
     slot.built = false;
     slot.occupied = false;
+    if (self != nullptr && self->occupied_count > 0) self->occupied_count--;
     ccec_flush_region(&slot, sizeof(RingSlot));
 }
 
 PTO_DEVICE_FUNC void ccec_execute_won_submit(DistSubmitCtx &ctx, const MixedKernels &mixed) {
     if (ctx.self == nullptr) return;
-    __gm__ RingSlot &slot = ctx.self->slots[ctx.task_id & (kPrivateSlots - 1)];
+    __gm__ RingSlot *slot = ccec_alloc_direct_slot(ctx.self);
+    if (slot == nullptr) return;
 
     if (ctx.joint) ccec_publish_joint_deposits(ctx, mixed);
-    if (!ccec_build_winner_slot(ctx, &slot)) return;
-    ccec_execute_slot_direct(slot, ctx.self);
+    if (!ccec_build_winner_slot(ctx, slot)) return;
+    ccec_execute_slot_direct(*slot, ctx.self);
 }
 
 PTO_DEVICE_FUNC void ccec_complete_alloc_submit(DistSubmitCtx &ctx) {
@@ -2582,6 +2597,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
 DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
     DistSubmitCtx ctx;
     dist_submit_begin(nullptr, args, ctx);
+    ccec_drain_block_won_direct(ctx.self);
     if (!dist_submit_materialize_and_prepare_map(ctx.self, args, ctx, DistSubmitKind::Alloc)) return ctx.result;
     dist_submit_register_outputs(ctx, /*include_existing=*/false);
     const bool is_winner = ccec_claim_submit(DistSubmitKind::Alloc, nullptr, ctx);
