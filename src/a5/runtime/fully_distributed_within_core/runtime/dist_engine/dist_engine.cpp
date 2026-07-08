@@ -1724,25 +1724,12 @@ PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const DistSubmitCtx &ctx, int3
 }
 
 PTO_DEVICE_FUNC void dist_submit_register_outputs(DistSubmitCtx &ctx, bool include_existing) {
-    uint32_t out_idx = 0;
     for (int32_t i = 0; i < ctx.tensor_count; i++) {
         const TensorArgType tag = payload_tag(ctx, i);
-        if (tag == TensorArgType::OUTPUT) {
-#if defined(__CCE_AICORE__)
-            Tensor t;
-            Tensor::copy(t, ctx.result.get_ref(out_idx));
-            DistTensorMap::insert(ctx.self->map, t, ctx.task_id);
-#else
-            DistTensorMap::insert(ctx.self->map, ctx.result.get_ref(out_idx), ctx.task_id);
-#endif
-            out_idx++;
-        } else if (include_existing && (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING)) {
-#if defined(__CCE_AICORE__)
-            DistTensorMap::insert(ctx.self->map, payload_tensor(ctx, i), ctx.task_id);
-#else
-            DistTensorMap::insert(ctx.self->map, payload_tensor(ctx, i), ctx.task_id);
-#endif
-        }
+        const bool registers_producer =
+            tag == TensorArgType::OUTPUT ||
+            (include_existing && (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING));
+        if (registers_producer) DistTensorMap::insert(ctx.self->map, payload_tensor(ctx, i), ctx.task_id);
     }
 }
 

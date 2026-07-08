@@ -305,6 +305,32 @@ class TestSubmitDependencySmoke(SceneTestCase):
             "params": {"n": 257, "mode": 16},
         },
         {
+            "name": "A5SimBd36AicConsumesAivOutput",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 128, "mode": 17},
+        },
+        {
+            "name": "A5OnboardBd36AicConsumesAivOutput",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 128, "mode": 17},
+        },
+        {
+            "name": "A5SimBd1AicSlotCapacityWait",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 263, "mode": 18},
+        },
+        {
+            "name": "A5OnboardBd1AicSlotCapacityWait",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 263, "mode": 18},
+        },
+        {
             "name": "A5SimBd36L0TaskArgsTagPersistence",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
@@ -391,8 +417,16 @@ class TestSubmitDependencySmoke(SceneTestCase):
             sub_n = int(params["n"]) // 8
             args.output[:] = -1.0
             expected = (args.input[:sub_n] + 7.0) * 3.0 + 8.0
-            for i in range(6):
-                args.output[i * sub_n : (i + 1) * sub_n] = expected
+            args.output[: 6 * sub_n] = expected.repeat(6)
+            return
+        if mode == 17:
+            args.output[:] = args.input * 3.0 + 12.0
+            return
+        if mode == 18:
+            sub_n = 32
+            args.output[:] = -1.0
+            expected = args.input[:sub_n] * 3.0 + 12.0
+            args.output[: 6 * sub_n] = expected.repeat(6)
             return
         args.output[:] = args.input * 6.0 + 23.0
 
