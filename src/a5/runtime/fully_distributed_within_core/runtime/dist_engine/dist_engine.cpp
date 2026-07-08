@@ -1093,11 +1093,17 @@ PTO_DEVICE_FUNC inline void watchdog([[maybe_unused]] uint64_t &start_ns) {
 // cursor to N. No hardware fetch_max on the target, so this is the equivalent
 // acq-rel CAS retry. Monotonic: each task id is claimed by exactly one core and
 // no id is skipped within a cursor's subsequence.
-PTO_DEVICE_FUNC bool claim(__gm__ volatile int64_t &cursor, int32_t N) {
 #if defined(__CCE_AICORE__)
+PTO_DEVICE_FUNC bool ccec_claim_cursor(__gm__ volatile int64_t &cursor, int32_t N) {
     __gm__ int64_t *addr = const_cast<__gm__ int64_t *>(&cursor);
     const int64_t old = atomicMax(addr, static_cast<int64_t>(N));
     return N > old;
+}
+#endif
+
+PTO_DEVICE_FUNC bool claim(__gm__ volatile int64_t &cursor, int32_t N) {
+#if defined(__CCE_AICORE__)
+    return ccec_claim_cursor(cursor, N);
 #else
     int64_t c = atom_load(cursor, __ATOMIC_ACQUIRE);
     while (true) {
@@ -2494,9 +2500,30 @@ PTO_DEVICE_FUNC bool ccec_is_valid_worker() {
     return g_ccec_valid_worker;
 }
 
+PTO_DEVICE_FUNC void ccec_attach_run_state() {
+    ccec_invalidate_region(const_cast<__gm__ int32_t *>(&g_dist.num_blocks), sizeof(g_dist.num_blocks));
+    ccec_invalidate_region(g_dist.cube_cursor, sizeof(g_dist.cube_cursor));
+    ccec_invalidate_region(g_dist.vector_cursor, sizeof(g_dist.vector_cursor));
+    ccec_invalidate_region(g_dist.alloc_cursor, sizeof(g_dist.alloc_cursor));
+    ccec_invalidate_region(const_cast<__gm__ int64_t *>(&g_dist.frontier), sizeof(g_dist.frontier));
+    ccec_invalidate_region(const_cast<__gm__ int64_t *>(&g_dist.replay_done), sizeof(g_dist.replay_done));
+    ccec_invalidate_region(const_cast<__gm__ int64_t *>(&g_dist.started_count), sizeof(g_dist.started_count));
+    ccec_invalidate_region(const_cast<__gm__ int32_t *>(&g_dist.fatal), sizeof(g_dist.fatal));
+    for (int32_t b = 0; b < g_dist.num_blocks; b++) {
+        ccec_invalidate_region(&g_dist.blocks[b], sizeof(BlockWon));
+    }
+}
+
 PTO_DEVICE_FUNC void ccec_publish_done() {
     OUT_OF_ORDER_STORE_BARRIER();
     write_reg(RegId::COND, MAKE_FIN_VALUE(0));
+}
+
+PTO_DEVICE_FUNC void ccec_finish_worker() {
+    g_self = nullptr;
+    g_ccec_runtime = nullptr;
+    g_ccec_valid_worker = false;
+    ccec_publish_done();
 }
 
 PTO_DEVICE_FUNC void ccec_replay_orch(__gm__ Runtime *runtime) {
@@ -2729,12 +2756,11 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
 
     ccec_invalidate_region(const_cast<__gm__ int32_t *>(&runtime->dist.num_workers), 64);
     ccec_init_worker_layout();
+    ccec_attach_run_state();
 
     ccec_replay_orch(runtime);
-    ccec_publish_done();
 
-    g_self = nullptr;
-    g_ccec_runtime = nullptr;
+    ccec_finish_worker();
     return;
 #else
     if (core_idx < 0 || core_idx >= RUNTIME_MAX_WORKER) return;
