@@ -1379,6 +1379,59 @@ PTO_DEVICE_FUNC void build_ring_slot(
     s.won_slot = won_slot;
 }
 
+template <typename TensorArrPtr, typename ScalarArrPtr, typename FaninArrPtr>
+PTO_DEVICE_FUNC void populate_won_slot(
+    __gm__ WonSlot &w, int32_t task_id, const ActiveMask &M, const MixedKernels &mixed, int32_t own_lane,
+    Runtime *runtime, TensorArrPtr tensors, int32_t tc, ScalarArrPtr scalars, int32_t sc, FaninArrPtr fanin, int32_t fc
+) {
+    const int32_t pc = __builtin_popcount(M.core_mask());
+    w.task_id = task_id;
+#if defined(__CCE_AICORE__)
+    w.remaining = pc;
+#else
+    atom_store<int64_t>(w.remaining, pc, __ATOMIC_RELAXED);
+#endif
+#if defined(__CCE_AICORE__)
+#define RESET_WON_LANE(L) \
+    do { \
+        w.drained[(L)] = 0; \
+        w.lane[(L)].present = false; \
+    } while (0)
+#else
+#define RESET_WON_LANE(L) \
+    do { \
+        atom_store(w.drained[(L)], 0, __ATOMIC_RELAXED); \
+        w.lane[(L)].present = false; \
+    } while (0)
+#endif
+#define POPULATE_WON_LANE(L) \
+    do { \
+        if ((L) == own_lane || !lane_active(M, (L))) break; \
+        __gm__ BuiltSubtask &b = w.lane[(L)]; \
+        b.present = true; \
+        b.func_id = kernel_id_for_lane(mixed, (L)); \
+        b.function_bin_addr = runtime != nullptr ? resolve_kernel_addr(runtime, b.func_id) : 0; \
+        b.tensor_count = tc; \
+        b.scalar_count = sc; \
+        for (int32_t i = 0; i < tc; i++) \
+            Tensor::copy(b.tensors[i], tensors[i]); \
+        for (int32_t j = 0; j < sc; j++) \
+            b.scalars[j] = scalars[j]; \
+        b.fanin_count = fc; \
+        for (int32_t k = 0; k < fc; k++) \
+            b.fanin[k] = fanin[k]; \
+        b.sub_block_id = ((L) == LANE_AIV1) ? 1 : 0; \
+    } while (0)
+    RESET_WON_LANE(LANE_AIC);
+    RESET_WON_LANE(LANE_AIV0);
+    RESET_WON_LANE(LANE_AIV1);
+    POPULATE_WON_LANE(LANE_AIC);
+    POPULATE_WON_LANE(LANE_AIV0);
+    POPULATE_WON_LANE(LANE_AIV1);
+#undef POPULATE_WON_LANE
+#undef RESET_WON_LANE
+}
+
 // Reserve a free block.won slot in `block`. Returns slot index or -1 if full.
 // 2V allows either AIV of the block to be an anchor, so allocation must be atomic.
 PTO_DEVICE_FUNC int32_t alloc_won_slot(int32_t block) {
@@ -1887,29 +1940,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKer
         }
         if (fatal_set()) return ctx.result;
         __gm__ WonSlot &w = g_dist.blocks[won_block].slots[won_slot];
-        w.task_id = N;
-        atom_store<int64_t>(w.remaining, pc, __ATOMIC_RELAXED);
-        for (int32_t L = 0; L < PTO2_SUBTASK_SLOT_COUNT; L++) {
-            atom_store(w.drained[L], 0, __ATOMIC_RELAXED);
-            w.lane[L].present = false;
-        }
-        for (int32_t L = 0; L < PTO2_SUBTASK_SLOT_COUNT; L++) {
-            if (L == own_lane || !lane_active(M, L)) continue;
-            __gm__ BuiltSubtask &b = w.lane[L];
-            b.present = true;
-            b.func_id = kernel_id_for_lane(mixed, L);
-            b.function_bin_addr = resolve_kernel_addr(runtime, kernel_id_for_lane(mixed, L));
-            b.tensor_count = tc;
-            b.scalar_count = sc;
-            for (int32_t i = 0; i < tc; i++)
-                Tensor::copy(b.tensors[i], ctx.payload->tensors[i]);
-            for (int32_t j = 0; j < sc; j++)
-                b.scalars[j] = scalars[j];
-            b.fanin_count = fc;
-            for (int32_t k = 0; k < fc; k++)
-                b.fanin[k] = fanin[k];
-            b.sub_block_id = (L == LANE_AIV1) ? 1 : 0;
-        }
+        populate_won_slot(w, N, M, mixed, own_lane, runtime, ctx.payload->tensors, tc, scalars, sc, fanin, fc);
         atom_thread_fence(__ATOMIC_RELEASE);
         atom_store(g_dist.blocks[won_block].any_pub, 1, __ATOMIC_RELEASE);  // enable follower drains
         atom_store(w.state, 1, __ATOMIC_RELEASE);                           // publish the deposits to followers
@@ -2216,6 +2247,20 @@ PTO_DEVICE_FUNC void ccec_wait_fanin(FaninPtr fanin, int32_t count) {
     }
 }
 
+PTO_DEVICE_FUNC int32_t anchor_lane_for_mask(const ActiveMask &M) {
+    if (lane_active(M, LANE_AIC)) return LANE_AIC;
+    if (lane_active(M, LANE_AIV0)) return LANE_AIV0;
+    if (lane_active(M, LANE_AIV1)) return LANE_AIV1;
+    return LANE_NONE;
+}
+
+PTO_DEVICE_FUNC bool ccec_self_is_lane(__gm__ DistCore *self, int32_t block, int32_t lane) {
+    if (self == nullptr || self->block_id != block || self->lane != lane) return false;
+    if (lane == LANE_AIC) return self->role == CoreType::AIC;
+    if (lane == LANE_AIV0 || lane == LANE_AIV1) return self->role == CoreType::AIV;
+    return false;
+}
+
 PTO_DEVICE_FUNC bool ccec_claim_kernel_submit(const MixedKernels &mixed, DistSubmitCtx &ctx) {
     ctx.kernel_id = INVALID_KERNEL_ID;
     ctx.won = false;
@@ -2230,28 +2275,13 @@ PTO_DEVICE_FUNC bool ccec_claim_kernel_submit(const MixedKernels &mixed, DistSub
         ctx.joint_block = block;
         ctx.joint_slot = ctx.task_id % kPrivateSlots;
         ctx.joint_count = pc;
-        const bool is_aic_owner =
-            lane_active(M, LANE_AIC) && ctx.self->role == CoreType::AIC && ctx.self->block_id == block &&
-            ctx.self->lane == LANE_AIC;
-        const bool is_aiv0_owner =
-            lane_active(M, LANE_AIV0) && ctx.self->role == CoreType::AIV &&
-            ctx.self->block_id == block && ctx.self->lane == LANE_AIV0;
-        const bool is_aiv1_owner =
-            lane_active(M, LANE_AIV1) && ctx.self->role == CoreType::AIV &&
-            ctx.self->block_id == block && ctx.self->lane == LANE_AIV1;
-        if (is_aic_owner) {
-            ctx.kernel_id = mixed.aic_kernel_id;
-            ctx.joint_init = true;
-        } else if (is_aiv0_owner) {
-            ctx.kernel_id = mixed.aiv0_kernel_id;
-            ctx.joint_init = !lane_active(M, LANE_AIC);
-        } else if (is_aiv1_owner) {
-            ctx.kernel_id = mixed.aiv1_kernel_id;
-            ctx.joint_init = !lane_active(M, LANE_AIC) && !lane_active(M, LANE_AIV0);
-        } else {
-            return false;
-        }
-        ctx.won = true;
+        const int32_t anchor_lane = anchor_lane_for_mask(M);
+        if (!ccec_self_is_lane(ctx.self, block, anchor_lane)) return false;
+        __gm__ PaddedCursor *cursors = anchor_lane == LANE_AIC ? g_dist.cube_cursor : g_dist.vector_cursor;
+        ctx.won = claim(cursors[ctx.task_id % kCursorShards].v, ctx.task_id);
+        if (!ctx.won) return false;
+        ctx.kernel_id = kernel_id_for_lane(mixed, anchor_lane);
+        ctx.joint_init = true;
         return true;
     }
     if (lane_active(M, LANE_AIC)) {
@@ -2285,21 +2315,50 @@ PTO_DEVICE_FUNC bool ccec_claim_submit(DistSubmitKind kind, const MixedKernels *
     return ccec_claim_kernel_submit(*mixed, ctx);
 }
 
-PTO_DEVICE_FUNC void ccec_prepare_joint_submit(DistSubmitCtx &ctx) {
+PTO_DEVICE_FUNC void ccec_execute_slot_direct(__gm__ RingSlot &slot, __gm__ DistCore *self);
+
+PTO_DEVICE_FUNC void ccec_publish_joint_deposits(DistSubmitCtx &ctx, const MixedKernels &mixed) {
     if (!ctx.joint) return;
     __gm__ WonSlot &w = g_dist.blocks[ctx.joint_block].slots[ctx.joint_slot];
-    if (ctx.joint_init) {
-        w.task_id = ctx.task_id;
-        w.remaining = ctx.joint_count;
-        w.state = 1;
-        ccec_flush_region(&w, sizeof(WonSlot));
-        return;
+    const ActiveMask M = mixed.to_active_mask();
+    populate_won_slot(
+        w, ctx.task_id, M, mixed, ctx.self->lane, nullptr, ctx.payload->tensors, ctx.tensor_count,
+        ctx.payload->scalars, ctx.payload->scalar_count, ctx.fanin, ctx.fanin_count
+    );
+    w.state = 1;
+    g_dist.blocks[ctx.joint_block].any_pub = 1;
+    ccec_flush_region(&w, sizeof(WonSlot));
+    ccec_flush_region(&g_dist.blocks[ctx.joint_block], sizeof(BlockWon));
+}
+
+PTO_DEVICE_FUNC bool ccec_drain_won_slot_direct(__gm__ DistCore *self, int32_t won_slot) {
+    if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
+    __gm__ WonSlot &w = g_dist.blocks[self->block_id].slots[won_slot];
+    ccec_invalidate_region(&w, sizeof(WonSlot));
+    if (w.state != 1 || !w.lane[self->lane].present || w.drained[self->lane] != 0) return false;
+    w.drained[self->lane] = 1;
+    ccec_flush_region(&w, sizeof(WonSlot));
+    __gm__ BuiltSubtask &b = w.lane[self->lane];
+    __gm__ RingSlot &slot = self->slots[w.task_id & (kPrivateSlots - 1)];
+    build_ring_slot(
+        slot, w.task_id, b.func_id, b.function_bin_addr, b.tensors, b.tensor_count, b.scalars, b.scalar_count,
+        b.fanin, b.fanin_count, b.sub_block_id, /*is_multicore=*/true, self->block_id, won_slot
+    );
+    ccec_flush_region(&slot, sizeof(RingSlot));
+    ccec_execute_slot_direct(slot, self);
+    return true;
+}
+
+PTO_DEVICE_FUNC bool ccec_drain_block_won_direct(__gm__ DistCore *self) {
+    if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
+    __gm__ BlockWon &bw = g_dist.blocks[self->block_id];
+    ccec_invalidate_region(&bw, sizeof(BlockWon));
+    if (bw.any_pub == 0) return false;
+    bool drained = false;
+    for (int32_t i = 0; i < kPrivateSlots; i++) {
+        drained = ccec_drain_won_slot_direct(self, i) || drained;
     }
-    while (true) {
-        ccec_invalidate_region(&w, sizeof(WonSlot));
-        if (w.state == 1 && w.task_id == ctx.task_id) return;
-        SPIN_WAIT_HINT();
-    }
+    return drained;
 }
 
 PTO_DEVICE_FUNC void ccec_complete_joint_submit(DistSubmitCtx &ctx) {
@@ -2358,11 +2417,11 @@ PTO_DEVICE_FUNC void ccec_execute_slot_direct(__gm__ RingSlot &slot, __gm__ Dist
     ccec_flush_region(&slot, sizeof(RingSlot));
 }
 
-PTO_DEVICE_FUNC void ccec_execute_won_submit(DistSubmitCtx &ctx) {
+PTO_DEVICE_FUNC void ccec_execute_won_submit(DistSubmitCtx &ctx, const MixedKernels &mixed) {
     if (ctx.self == nullptr) return;
     __gm__ RingSlot &slot = ctx.self->slots[ctx.task_id & (kPrivateSlots - 1)];
 
-    ccec_prepare_joint_submit(ctx);
+    if (ctx.joint) ccec_publish_joint_deposits(ctx, mixed);
     if (!ccec_build_winner_slot(ctx, &slot)) return;
     ccec_execute_slot_direct(slot, ctx.self);
 }
@@ -2429,13 +2488,18 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(
 ) {
     DistSubmitCtx ctx;
     dist_submit_begin(nullptr, args, ctx);
+    ccec_drain_block_won_direct(ctx.self);
     if (!dist_submit_materialize_and_prepare_map(ctx.self, args, ctx, DistSubmitKind::Kernel)) return ctx.result;
     const bool is_winner = ccec_claim_submit(DistSubmitKind::Kernel, &mixed, ctx);
     if (is_winner) {
         ctx.fanin_count = dist_submit_collect_fanin(ctx, ctx.fanin);
     }
     dist_submit_register_outputs(ctx, /*include_existing=*/true);
-    if (is_winner) ccec_execute_won_submit(ctx);
+    if (is_winner) {
+        ccec_execute_won_submit(ctx, mixed);
+    } else {
+        ccec_drain_block_won_direct(ctx.self);
+    }
     return ctx.result;
 }
 
