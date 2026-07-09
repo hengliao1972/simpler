@@ -153,29 +153,29 @@ private:
  * value.
  */
 class TensorRef {
-    // In the fdwic model the orchestration entry runs on-core, and every
-    // temporary orch builds (L0TaskArgs, Tensor views derived from
-    // orch_args.tensor(i).ref(), TensorCreateInfo) is a stack local — CCEC
-    // classifies those as the default address space (physically the AICore
-    // kernel stack, GM-backed at launch time by the runtime). Only when the
-    // engine hands a task off to another core does the payload get copied
-    // into a WonSlot on GM — that's where the address-space transition
-    // happens, via the __gm__ dst overloads of Tensor::copy / TensorRef.
-    //
-    // So the stored pointers here are default-address-space too: they
-    // reference orch's stack-resident Tensor/TensorCreateInfo, and it is the
-    // engine's job to marshal that content into GM when the payload leaves
-    // the orch's frame. Under host / sim __gm__ collapses to empty and this
-    // is a plain pointer either way, preserving the pre-CCEC layout.
+    // Most orchestration-created descriptors are stack locals in the default
+    // address space, but TaskOutputTensors::get_ref() exposes descriptors that
+    // already live in GM. Keep the source address space with the slot so later
+    // materialization can read from the correct place.
     union {
         const Tensor *ptr_;
+#if defined(__CCE_AICORE__)
+        __gm__ const Tensor *gm_ptr_;
+#endif
         const TensorCreateInfo *create_info_;
+    };
+    uint8_t kind_;
+
+    enum Kind : uint8_t {
+        kTensor = 0,
+        kGmTensor = 1,
+        kCreateInfo = 2,
     };
 
 public:
     PTO_DEVICE_FUNC TensorRef() :
-        ptr_(nullptr)
-    {}
+        ptr_(nullptr),
+        kind_(kTensor) {}
     TensorRef(const TensorRef &) = delete;
     TensorRef(TensorRef &&) = delete;
     TensorRef &operator=(const TensorRef &) = delete;
@@ -183,15 +183,27 @@ public:
 
     PTO_DEVICE_FUNC TensorRef &operator=(const Tensor *p) {
         ptr_ = p;
+        kind_ = kTensor;
         return *this;
     }
     PTO_DEVICE_FUNC TensorRef &operator=(const TensorCreateInfo *ci) {
         create_info_ = ci;
+        kind_ = kCreateInfo;
         return *this;
     }
-
+#if defined(__CCE_AICORE__)
+    PTO_DEVICE_FUNC TensorRef &set_gm_tensor(__gm__ const Tensor *p) {
+        gm_ptr_ = p;
+        kind_ = kGmTensor;
+        return *this;
+    }
+#endif
     PTO_DEVICE_FUNC const Tensor &ref() const { return *ptr_; }
+#if defined(__CCE_AICORE__)
+    PTO_DEVICE_FUNC __gm__ const Tensor &gm_ref() const { return *gm_ptr_; }
+#endif
     PTO_DEVICE_FUNC const TensorCreateInfo &create_info() const { return *create_info_; }
+    PTO_DEVICE_FUNC bool tensor_from_gm() const { return kind_ == kGmTensor; }
     PTO_DEVICE_FUNC bool refers_to(const Tensor *t) const { return ptr_ == t; }
     PTO_DEVICE_FUNC bool refers_to(const TensorCreateInfo *ci) const { return create_info_ == ci; }
 };
@@ -303,21 +315,39 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
             return;
         }
         if constexpr (MaxT == MAX_TENSOR_ARGS) {
-            (add_tensor_copy(args, TensorArgType::INPUT), ...);
+            (add_tensor_arg(args, TensorArgType::INPUT), ...);
         } else {
-            ((tensors_[tensor_count_] = &args, tags_[tensor_count_] = TensorArgType::INPUT, tensor_count_++), ...);
+            (add_tensor_ref(args, TensorArgType::INPUT), ...);
         }
     }
 
     /// Batch add outputs — all Tensor or all TensorCreateInfo:
     ///   add_output(ci1, ci2)         — runtime allocates buffers (OUTPUT)
     ///   add_output(t1, t2)           — write-only existing tensors (OUTPUT_EXISTING)
+    PTO_DEVICE_FUNC void add_output(TensorCreateInfo &create_info) {
+        if (!check_add_tensor_capacity(1)) return;
+        if constexpr (MaxT == MAX_TENSOR_ARGS) {
+            add_output_create_info_ptr(&create_info);
+        } else {
+            add_output_ref(create_info);
+        }
+    }
+
+    PTO_DEVICE_FUNC void add_output(const TensorCreateInfo &create_info) {
+        if (!check_add_tensor_capacity(1)) return;
+        if constexpr (MaxT == MAX_TENSOR_ARGS) {
+            add_output_create_info_ptr(&create_info);
+        } else {
+            add_output_ref(create_info);
+        }
+    }
+
     template <typename... Args>
     PTO_DEVICE_FUNC void add_output(Args &&...args) {
         assert_add_tensor_args<true, Args...>();
         if (!check_add_tensor_capacity(static_cast<int32_t>(sizeof...(Args)))) return;
         if constexpr (MaxT == MAX_TENSOR_ARGS) {
-            (add_output_copy(args), ...);
+            (add_output_arg(args), ...);
         } else {
             (add_output_ref(args), ...);
         }
@@ -330,9 +360,9 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
             return;
         }
         if constexpr (MaxT == MAX_TENSOR_ARGS) {
-            (add_tensor_copy(args, TensorArgType::INOUT), ...);
+            (add_tensor_arg(args, TensorArgType::INOUT), ...);
         } else {
-            ((tensors_[tensor_count_] = &args, tags_[tensor_count_] = TensorArgType::INOUT, tensor_count_++), ...);
+            (add_tensor_ref(args, TensorArgType::INOUT), ...);
         }
     }
 
@@ -342,9 +372,9 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
         assert_add_tensor_args<false, Args...>();
         if (!check_add_tensor_capacity(static_cast<int32_t>(sizeof...(Args)))) return;
         if constexpr (MaxT == MAX_TENSOR_ARGS) {
-            (add_tensor_copy(args, TensorArgType::NO_DEP), ...);
+            (add_tensor_arg(args, TensorArgType::NO_DEP), ...);
         } else {
-            ((tensors_[tensor_count_] = &args, tags_[tensor_count_] = TensorArgType::NO_DEP, tensor_count_++), ...);
+            (add_tensor_ref(args, TensorArgType::NO_DEP), ...);
         }
     }
 
@@ -495,6 +525,7 @@ private:
 #endif
     const PTO2TaskId *explicit_deps_{nullptr};
     uint32_t explicit_dep_count_{0};
+    uint8_t cacheline_pad_[48];
 #if PTO2_PROFILING
     template <typename T>
     static constexpr bool is_supported_dump_arg_v =
@@ -625,106 +656,107 @@ private:
     }
 
     PTO_DEVICE_FUNC void add_output_ref(const TensorCreateInfo &create_info) {
-        tensors_[tensor_count_] = &create_info;
-        tags_[tensor_count_] = TensorArgType::OUTPUT;
-        tensor_count_++;
+        add_output_create_info_ptr(&create_info);
     }
 
     PTO_DEVICE_FUNC void add_output_ref(const Tensor &tensor) {
+        materialize_local_tensor(tensor);
         tensors_[tensor_count_] = &tensor;
         tags_[tensor_count_] = TensorArgType::OUTPUT_EXISTING;
         tensor_count_++;
     }
 
 #if defined(__CCE_AICORE__)
-    PTO_DEVICE_FUNC void add_output_ref(__gm__ const TensorCreateInfo &create_info) {
-        tensors_[tensor_count_] = &create_info;
-        tags_[tensor_count_] = TensorArgType::OUTPUT;
-        tensor_count_++;
-    }
-
     PTO_DEVICE_FUNC void add_output_ref(__gm__ const Tensor &tensor) {
-        tensors_[tensor_count_] = &tensor;
+        tensors_[tensor_count_].set_gm_tensor(&tensor);
         tags_[tensor_count_] = TensorArgType::OUTPUT_EXISTING;
         tensor_count_++;
     }
 #endif
 
-    static constexpr size_t kStorageSlots = (MaxT == MAX_TENSOR_ARGS) ? 8 : 1;
-    Tensor tensor_storage_[kStorageSlots];
-    TensorCreateInfo create_info_storage_[kStorageSlots];
-
-    PTO_DEVICE_FUNC void add_tensor_copy(const Tensor &tensor, TensorArgType tag) {
-        if (tensor_count_ >= static_cast<int32_t>(kStorageSlots)) {
-            set_error("Too many copied tensor args");
-            return;
-        }
-        Tensor::copy(tensor_storage_[tensor_count_], tensor);
-        tensors_[tensor_count_] = &tensor_storage_[tensor_count_];
-        this->tag(tensor_count_) = tag;
+    PTO_DEVICE_FUNC void add_tensor_ref(const Tensor &tensor, TensorArgType tag) {
+        materialize_local_tensor(tensor);
+        tensors_[tensor_count_] = &tensor;
+        tags_[tensor_count_] = tag;
         tensor_count_++;
     }
 
 #if defined(__CCE_AICORE__)
-    PTO_DEVICE_FUNC void add_tensor_copy(__gm__ const Tensor &tensor, TensorArgType tag) {
-        if (tensor_count_ >= static_cast<int32_t>(kStorageSlots)) {
-            set_error("Too many copied tensor args");
-            return;
-        }
-        Tensor::copy(tensor_storage_[tensor_count_], tensor);
-        tensors_[tensor_count_] = &tensor_storage_[tensor_count_];
-        this->tag(tensor_count_) = tag;
+    PTO_DEVICE_FUNC void add_tensor_ref(__gm__ const Tensor &tensor, TensorArgType tag) {
+        tensors_[tensor_count_].set_gm_tensor(&tensor);
+        tags_[tensor_count_] = tag;
+        tensor_count_++;
+    }
+#endif
+
+    PTO_DEVICE_FUNC void add_output_create_info_ptr(const TensorCreateInfo *create_info) {
+        tensors_[tensor_count_] = create_info;
+        set_tag_slot(tensor_count_, TensorArgType::OUTPUT);
+        tensor_count_++;
+    }
+
+    PTO_DEVICE_FUNC void add_output_ptr(const TensorCreateInfo *create_info) {
+        add_output_create_info_ptr(create_info);
+    }
+
+    PTO_DEVICE_FUNC void add_output_arg(const TensorCreateInfo &create_info) {
+        add_output_create_info_ptr(&create_info);
+    }
+
+    PTO_DEVICE_FUNC void add_output_arg(const Tensor &tensor) {
+        materialize_local_tensor(tensor);
+        tensors_[tensor_count_] = &tensor;
+        set_tag_slot(tensor_count_, TensorArgType::OUTPUT_EXISTING);
+        tensor_count_++;
+    }
+
+#if defined(__CCE_AICORE__)
+    PTO_DEVICE_FUNC void add_output_arg(__gm__ const Tensor &tensor) {
+        tensors_[tensor_count_].set_gm_tensor(&tensor);
+        set_tag_slot(tensor_count_, TensorArgType::OUTPUT_EXISTING);
+        tensor_count_++;
+    }
+#endif
+
+    PTO_DEVICE_FUNC void add_tensor_arg(const Tensor &tensor, TensorArgType tag) {
+        materialize_local_tensor(tensor);
+        tensors_[tensor_count_] = &tensor;
+        set_tag_slot(tensor_count_, tag);
+        tensor_count_++;
+    }
+
+#if defined(__CCE_AICORE__)
+    PTO_DEVICE_FUNC void add_tensor_arg(__gm__ const Tensor &tensor, TensorArgType tag) {
+        tensors_[tensor_count_].set_gm_tensor(&tensor);
+        set_tag_slot(tensor_count_, tag);
         tensor_count_++;
     }
 #endif
 
     PTO_DEVICE_FUNC void add_output_copy(const TensorCreateInfo &create_info) {
-        if (tensor_count_ >= static_cast<int32_t>(kStorageSlots)) {
-            set_error("Too many copied tensor args");
-            return;
-        }
-        copy_tensor_create_info_fields(create_info_storage_[tensor_count_], create_info);
-        tensors_[tensor_count_] = &create_info_storage_[tensor_count_];
-        this->tag(tensor_count_) = TensorArgType::OUTPUT;
+        tensors_[tensor_count_] = &create_info;
+        set_tag_slot(tensor_count_, TensorArgType::OUTPUT);
         tensor_count_++;
     }
-
-#if defined(__CCE_AICORE__)
-    PTO_DEVICE_FUNC void add_output_copy(__gm__ const TensorCreateInfo &create_info) {
-        if (tensor_count_ >= static_cast<int32_t>(kStorageSlots)) {
-            set_error("Too many copied tensor args");
-            return;
-        }
-        copy_tensor_create_info_fields(create_info_storage_[tensor_count_], create_info);
-        tensors_[tensor_count_] = &create_info_storage_[tensor_count_];
-        this->tag(tensor_count_) = TensorArgType::OUTPUT;
-        tensor_count_++;
-    }
-#endif
 
     PTO_DEVICE_FUNC void add_output_copy(const Tensor &tensor) {
-        if (tensor_count_ >= static_cast<int32_t>(kStorageSlots)) {
-            set_error("Too many copied tensor args");
-            return;
-        }
-        Tensor::copy(tensor_storage_[tensor_count_], tensor);
-        tensors_[tensor_count_] = &tensor_storage_[tensor_count_];
-        this->tag(tensor_count_) = TensorArgType::OUTPUT_EXISTING;
+        materialize_local_tensor(tensor);
+        tensors_[tensor_count_] = &tensor;
+        set_tag_slot(tensor_count_, TensorArgType::OUTPUT_EXISTING);
         tensor_count_++;
     }
 
 #if defined(__CCE_AICORE__)
     PTO_DEVICE_FUNC void add_output_copy(__gm__ const Tensor &tensor) {
-        if (tensor_count_ >= static_cast<int32_t>(kStorageSlots)) {
-            set_error("Too many copied tensor args");
-            return;
-        }
-        Tensor::copy(tensor_storage_[tensor_count_], tensor);
-        tensors_[tensor_count_] = &tensor_storage_[tensor_count_];
-        this->tag(tensor_count_) = TensorArgType::OUTPUT_EXISTING;
+        tensors_[tensor_count_].set_gm_tensor(&tensor);
+        set_tag_slot(tensor_count_, TensorArgType::OUTPUT_EXISTING);
         tensor_count_++;
     }
 #endif
+
+    PTO_DEVICE_FUNC static void materialize_local_tensor(const Tensor &tensor) { (void)tensor; }
+
+    PTO_DEVICE_FUNC void set_tag_slot(int32_t index, TensorArgType tag) { tags_[index] = tag; }
 };
 
 // =============================================================================
@@ -734,6 +766,10 @@ private:
 // L0TaskArgs — core-level container used to build and submit tasks inside
 //   orchestration (small, stack-friendly).
 using L0TaskArgs = Arg<MAX_TENSOR_ARGS, MAX_SCALAR_ARGS>;
+static_assert(sizeof(L0TaskArgs) % 64 == 0, "L0TaskArgs size must be cacheline padded");
+static_assert(
+    sizeof(Arg<CHIP_MAX_TENSOR_ARGS, CHIP_MAX_SCALAR_ARGS>) % 64 == 0, "L2 Arg size must be cacheline padded"
+);
 
 // L2TaskArgs — chip-level entry-arg holding the orchestration entry's
 // already-allocated inputs (capacity matches ChipStorageTaskArgs).

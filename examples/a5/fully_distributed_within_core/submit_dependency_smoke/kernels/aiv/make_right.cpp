@@ -17,6 +17,7 @@
 #include <pto/pto-inst.hpp>
 #endif
 #include "tensor.h"
+#include "pipe_sync.h"
 
 #ifndef __gm__
 #define __gm__
@@ -59,4 +60,5 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     for (uint64_t off = 0; off < n * sizeof(float); off += 64) {
         dcci(reinterpret_cast<__gm__ uint8_t *>(right) + off, SINGLE_CACHE_LINE, CACHELINE_OUT);
     }
+    pipe_sync();
 }

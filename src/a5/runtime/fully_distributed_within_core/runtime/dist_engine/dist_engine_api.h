@@ -40,22 +40,22 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "intrinsic.h"          // __gm__ (empty macro on host)
-#include "pto_submit_types.h"   // MixedKernels
-#include "pto_types.h"          // L0TaskArgs, TaskOutputTensors, PTO_DEVICE_FUNC (via data_type.h)
-#include "tensor.h"             // Tensor
+#include "intrinsic.h"         // __gm__ (empty macro on host)
+#include "pto_submit_types.h"  // MixedKernels
+#include "pto_types.h"         // L0TaskArgs, TaskOutputTensors, PTO_DEVICE_FUNC (via data_type.h)
+#include "tensor.h"            // Tensor
 
 struct PTO2Runtime;
 
-struct alignas(64) DistTaskPayload {
+struct DistTaskPayload {
     int32_t tensor_count;
     int32_t scalar_count;
     TensorArgType tags[MAX_TENSOR_ARGS];
-    alignas(64) Tensor tensors[MAX_TENSOR_ARGS];
-    alignas(64) uint64_t scalars[MAX_SCALAR_ARGS];
+    uint8_t tensors_pad_[56];
+    Tensor tensors[MAX_TENSOR_ARGS];
+    uint64_t scalars[MAX_SCALAR_ARGS];
 };
 static_assert(sizeof(DistTaskPayload) % 64 == 0, "DistTaskPayload must not share cachelines");
-static_assert(alignof(DistTaskPayload) == 64, "DistTaskPayload must be cacheline-aligned");
 static_assert(offsetof(DistTaskPayload, tensors) % 64 == 0, "payload tensors must be cacheline-aligned");
 static_assert(offsetof(DistTaskPayload, scalars) % 64 == 0, "payload scalars must be cacheline-aligned");
 
@@ -86,9 +86,8 @@ PTO_DEVICE_FUNC void dist_log_info_v_msg(__gm__ const char *func, int v, __gm__ 
 
 // Cross-layer tensor data access. Host/sim waits for producers through the
 // engine; CCEC currently performs direct GM scalar access only.
-PTO_DEVICE_FUNC uint64_t dist_get_tensor_data_impl(
-    PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]
-);
+PTO_DEVICE_FUNC uint64_t
+dist_get_tensor_data_impl(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
 PTO_DEVICE_FUNC void dist_set_tensor_data_impl(
     PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
 );

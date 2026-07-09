@@ -64,10 +64,10 @@ static_assert(
  * AICore caches a pointer to its per-core slot at startup (via Handshake.task)
  * and reads from it on each dispatch.
  *
- * The struct is cache-line aligned to prevent false sharing across
- * concurrently dispatched cores.
+ * The struct is padded to a cache-line-sized ABI footprint; per-core arrays
+ * must place each element on a cache-line boundary.
  */
-struct alignas(64) PTO2DispatchPayload {
+struct PTO2DispatchPayload {
     uint64_t function_bin_addr;            /**< Kernel entry address in GM (set by Scheduler) */
     uint64_t args[PTO2_DISPATCH_MAX_ARGS]; /**< Kernel arguments (GM pointers + scalars + ext params) */
 
@@ -81,7 +81,7 @@ struct alignas(64) PTO2DispatchPayload {
      *  args[SPMD_GLOBAL_CONTEXT_INDEX] points here. */
     GlobalContext global_context;
 
-    uint8_t reserved_payload_abi_pad[8];
+    uint8_t reserved_payload_abi_pad[48];
 
     static_assert(sizeof(args[0]) == 8);
     static_assert(

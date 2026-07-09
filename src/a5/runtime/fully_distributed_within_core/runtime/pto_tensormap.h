@@ -122,7 +122,7 @@ extern uint64_t g_insert_count;
  *
  * Entry size: 128B (2 cache lines), matches Tensor.
  */
-struct alignas(64) PTO2TensorMapEntry {
+struct PTO2TensorMapEntry {
     // === Cache line 1 (64B) — lookup hot path; mirrors Tensor line 1 from byte 16 ===
     uint64_t buffer_addr;                // 8B [0, 8):   tensor base address (hash key, mirrors Tensor::buffer.addr)
     PTO2TensorMapEntry *next_in_bucket;  // 8B [8, 16):  next entry in hash bucket chain (overlays Tensor::buffer.size)

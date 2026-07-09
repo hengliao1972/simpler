@@ -212,7 +212,8 @@ struct PTO2TaskPayload {
     int32_t fanin_spill_start{0};   // Linear start index in fanin spill pool (0 = no spill)
     PTO2FaninPool *fanin_spill_pool{nullptr};
     PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
-    // === Cache lines 9-72 (4096B) — tensors (alignas(64) forces alignment) ===
+    uint8_t tensors_pad_[40];
+    // === Cache lines 9-72 (4096B) — tensors ===
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 73-74 (128B) — scalars ===
     uint64_t scalars[MAX_SCALAR_ARGS];

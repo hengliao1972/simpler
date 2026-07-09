@@ -36,9 +36,7 @@
 #define FUNC_ONLINE_UPDATE 3
 constexpr uint64_t PLATFORM_PROF_SYS_CNT_FREQ = 50000000;  // 50 MHz
 
-PTO_DEVICE_FUNC inline uint64_t min_u64(uint64_t a, uint64_t b) {
-    return a < b ? a : b;
-}
+PTO_DEVICE_FUNC inline uint64_t min_u64(uint64_t a, uint64_t b) { return a < b ? a : b; }
 
 inline double cycles_to_us(uint64_t cycles) {
     return (static_cast<double>(cycles) / PLATFORM_PROF_SYS_CNT_FREQ) * 1000000.0;
@@ -68,16 +66,16 @@ extern "C" {
  * Orchestration config — the executor reads these values to set up
  * shared memory and runtime before calling aicpu_orchestration_entry.
  */
-__attribute__((visibility("default"), weak)) PTO2OrchestrationConfig aicpu_orchestration_config(
-    const L2TaskArgs &orch_args
-) {
+__attribute__((visibility("default"), weak)) PTO2OrchestrationConfig
+aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 7,
     };
 }
 
-__attribute__((visibility("default"), weak)) PTO_DEVICE_FUNC void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
+__attribute__((visibility("default"), weak)) PTO_DEVICE_FUNC void
+aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #ifdef ENABLE_PROFILING
     uint64_t prof_param_extract = 0;
     uint64_t prof_ext_tensor = 0;
@@ -175,7 +173,11 @@ __attribute__((visibility("default"), weak)) PTO_DEVICE_FUNC void aicpu_orchestr
                 CYCLE_COUNT_LAP(prof_tensor_view);
 #endif
                 CYCLE_COUNT_LAP(prof_param_setup);
-                TaskOutputTensors alloc_outs = alloc_tensors(tile2d_ci, scalar_ci, scalar_ci);
+                L0TaskArgs alloc_args;
+                alloc_args.add_output(tile2d_ci);
+                alloc_args.add_output(scalar_ci);
+                alloc_args.add_output(scalar_ci);
+                TaskOutputTensors alloc_outs = alloc_tensors(alloc_args);
                 __gm__ const Tensor &oi = alloc_outs.get_ref(0);
                 __gm__ const Tensor &li_update = alloc_outs.get_ref(1);
                 __gm__ const Tensor &mi_update = alloc_outs.get_ref(2);

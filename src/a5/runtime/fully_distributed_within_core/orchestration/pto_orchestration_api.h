@@ -30,10 +30,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#if !defined(__CCE_AICORE__)
-#include <type_traits>
-#endif
-
 // Type headers needed by orchestration
 #if !defined(__CCE_AICORE__)
 #include "common.h"  // framework_bind_runtime / framework_current_runtime (host-only, dlopen TLS)
@@ -143,38 +139,6 @@ PTO_DEVICE_FUNC inline TaskOutputTensors alloc_tensors(const L0TaskArgs &args) {
     return dist_alloc_tensors(nullptr, args);
 }
 
-PTO_DEVICE_FUNC inline TaskOutputTensors alloc_tensors(const TensorCreateInfo create_infos[], uint32_t count) {
-    if (dist_is_fatal_query()) return TaskOutputTensors{};
-    L0TaskArgs args;
-    for (uint32_t i = 0; i < count; i++) {
-        args.add_output(create_infos[i]);
-    }
-    if (args.has_error) {
-        dist_report_fatal_msg(
-            PTO2_ERROR_INVALID_ARGS, __FUNCTION__,
-            args.error_msg ? args.error_msg : "alloc_tensors failed to construct output-only Arg"
-        );
-        return TaskOutputTensors{};
-    }
-    return alloc_tensors(args);
-}
-
-template <typename... CIs>
-PTO_DEVICE_FUNC inline TaskOutputTensors alloc_tensors(const CIs &...cis) {
-    static_assert(sizeof...(cis) > 0, "alloc_tensors requires at least one TensorCreateInfo");
-    if (dist_is_fatal_query()) return TaskOutputTensors{};
-    L0TaskArgs args;
-    (args.add_output(cis), ...);
-    if (args.has_error) {
-        dist_report_fatal_msg(
-            PTO2_ERROR_INVALID_ARGS, __FUNCTION__,
-            args.error_msg ? args.error_msg : "alloc_tensors failed to construct output-only Arg"
-        );
-        return TaskOutputTensors{};
-    }
-    return alloc_tensors(args);
-}
-
 PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_task(const MixedKernels &mixed_kernels, const L0TaskArgs &args) {
     if (dist_is_fatal_query()) return TaskOutputTensors{};
     return dist_submit_impl(nullptr, mixed_kernels, args);
@@ -232,52 +196,6 @@ static inline TaskOutputTensors alloc_tensors(const L0TaskArgs &args) {
         return TaskOutputTensors{};
     }
     return rt->ops->alloc_tensors(rt, args);
-}
-
-static inline TaskOutputTensors alloc_tensors(const TensorCreateInfo create_infos[], uint32_t count) {
-    PTO2Runtime *rt = current_runtime();
-    if (rt->ops->is_fatal(rt)) {
-        return TaskOutputTensors{};
-    }
-    L0TaskArgs args;
-    for (uint32_t i = 0; i < count; i++) {
-        args.add_output(create_infos[i]);
-    }
-    if (args.has_error) {
-        rt->ops->report_fatal(
-            rt, PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "%s",
-            args.error_msg ? args.error_msg : "alloc_tensors failed to construct output-only Arg"
-        );
-        return TaskOutputTensors{};
-    }
-    return alloc_tensors(args);
-}
-
-// Variadic-template convenience factory (host-only: uses std::is_same_v /
-// std::decay_t; CCEC toolchain has no <type_traits>). Device orchestration
-// should stick to the explicit (create_infos, count) form or the array
-// overload above.
-template <typename... CIs>
-static inline TaskOutputTensors alloc_tensors(const CIs &...cis) {
-    static_assert(sizeof...(cis) > 0, "alloc_tensors requires at least one TensorCreateInfo");
-    static_assert(
-        (std::is_same_v<std::decay_t<CIs>, TensorCreateInfo> && ...),
-        "alloc_tensors only accepts TensorCreateInfo arguments"
-    );
-    PTO2Runtime *rt = current_runtime();
-    if (rt->ops->is_fatal(rt)) {
-        return TaskOutputTensors{};
-    }
-    L0TaskArgs args;
-    (args.add_output(cis), ...);
-    if (args.has_error) {
-        rt->ops->report_fatal(
-            rt, PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "%s",
-            args.error_msg ? args.error_msg : "alloc_tensors failed to construct output-only Arg"
-        );
-        return TaskOutputTensors{};
-    }
-    return alloc_tensors(args);
 }
 
 static inline TaskOutputTensors rt_submit_task(const MixedKernels &mixed_kernels, const L0TaskArgs &args) {

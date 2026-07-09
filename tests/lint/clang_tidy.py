@@ -66,11 +66,73 @@ def _macos_isysroot_args() -> list[str]:
     ]
 
 
+def _linux_cxx_isystem_args() -> list[str]:
+    """Teach clang-tidy where GCC's C++ standard library headers live.
+
+    Some Linux developer images provide clang-tidy without a matching clang++
+    driver configuration. The compile database uses g++, so the build succeeds,
+    but clang-tidy cannot find headers such as <atomic> or <cstdint>. Query the
+    active g++ search list and pass those include directories explicitly.
+    """
+    if platform.system() != "Linux":
+        return []
+    compiler = shutil.which("g++")
+    if compiler is None:
+        return []
+    try:
+        result = subprocess.run(
+            [compiler, "-E", "-x", "c++", "-", "-v"],
+            input="",
+            text=True,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+
+    include_dirs: list[str] = []
+    in_search_list = False
+    for raw_line in result.stderr.splitlines():
+        line = raw_line.strip()
+        if line == "#include <...> search starts here:":
+            in_search_list = True
+            continue
+        if line == "End of search list.":
+            break
+        if in_search_list and line:
+            path = line.split(" (framework directory)", 1)[0]
+            include_dirs.append(path)
+
+    filtered_dirs: list[str] = []
+    for path in include_dirs:
+        resolved = Path(path).resolve()
+        if not resolved.is_dir():
+            continue
+        resolved_path = str(resolved)
+        # GCC's internal include directory contains headers such as arm_neon.h
+        # that rely on GCC-only builtin vector type names. clang-tidy already
+        # has its own compiler builtin headers, so only add the libstdc++ and
+        # system include roots discovered from g++.
+        if "/lib/gcc/" in resolved_path:
+            continue
+        if "/include/c++/" in resolved_path or resolved_path.startswith("/usr/include"):
+            filtered_dirs.append(resolved_path)
+
+    return [f"--extra-arg=-isystem{path}" for path in filtered_dirs]
+
+
 # Suppress compiler flags that are valid for GCC but unknown to clang.
-_SUPPRESS_ARGS = [
-    "--extra-arg=-Wno-unknown-warning-option",
-    "--extra-arg=-Wno-unused-command-line-argument",
-] + _macos_isysroot_args()
+_SUPPRESS_ARGS = (
+    [
+        "--extra-arg=-Wno-unknown-warning-option",
+        "--extra-arg=-Wno-unused-command-line-argument",
+    ]
+    + _macos_isysroot_args()
+    + _linux_cxx_isystem_args()
+)
 
 # GCC-only flags to strip from compile_commands.json before passing to clang-tidy.
 _GCC_ONLY_FLAGS = {"-fno-gnu-unique"}

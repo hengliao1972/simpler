@@ -171,8 +171,10 @@ extern "C" void framework_bind_runtime(PTO2Runtime *rt);
 #ifndef SPIN_WAIT_HINT
 #define SPIN_WAIT_HINT() ((void)0)
 #endif
-#else
+#elif __has_include("spin_hint.h")
 #include "spin_hint.h"
+#else
+#define SPIN_WAIT_HINT() ((void)0)
 #endif
 #include "tensor.h"
 #include "tensor_create_info.h"
@@ -658,6 +660,7 @@ struct RingSlot {
 
     int32_t tensor_count;
     int32_t scalar_count;
+    uint8_t tensors_pad[32];
     Tensor tensors[MAX_TENSOR_ARGS];
     uint64_t scalars[MAX_SCALAR_ARGS];
 
@@ -693,6 +696,7 @@ struct BuiltSubtask {
     uint64_t function_bin_addr;
     int32_t tensor_count;
     int32_t scalar_count;
+    uint8_t tensors_pad[40];
     Tensor tensors[MAX_TENSOR_ARGS];
     uint64_t scalars[MAX_SCALAR_ARGS];
     int32_t fanin[kMaxFanin];
@@ -700,8 +704,12 @@ struct BuiltSubtask {
     int32_t sub_block_id;
 };
 
-struct alignas(64) DrainedCell {
+static_assert(offsetof(RingSlot, tensors) % 64 == 0, "RingSlot tensors must be cacheline-aligned");
+static_assert(offsetof(BuiltSubtask, tensors) % 64 == 0, "BuiltSubtask tensors must be cacheline-aligned");
+
+struct DrainedCell {
     volatile int32_t v;
+    uint8_t pad[64 - sizeof(int32_t)];
 };
 static_assert(sizeof(DrainedCell) == 64, "DrainedCell must occupy one cacheline");
 
@@ -720,14 +728,19 @@ struct WonSlot {
 };
 
 struct BlockWon {
-    alignas(64) WonSlot slots[kPrivateSlots];
+    WonSlot slots[kPrivateSlots];
     // Monotone "has any anchor ever published a deposit into this block?" flag.
     // Lets follower drains short-circuit the per-slot scan for workloads with no
     // multi-core (e.g. 2V) tasks — the common case (bgemm is all single-core), so
     // every AIV core skips a 4-slot won-scan on every submit. Never reset within a
     // session; once true the scan path is taken (those workloads have real work).
-    alignas(64) volatile int32_t any_pub;
+    uint8_t any_pub_pad[64 - ((sizeof(WonSlot) * kPrivateSlots) % 64)];
+    volatile int32_t any_pub;
+    uint8_t any_pub_tail_pad[64 - sizeof(int32_t)];
 };
+static_assert(offsetof(BlockWon, slots) % 64 == 0, "BlockWon slots must be cacheline-aligned");
+static_assert(offsetof(BlockWon, any_pub) % 64 == 0, "BlockWon any_pub must be cacheline-aligned");
+static_assert(sizeof(BlockWon) % 64 == 0, "BlockWon must not share cachelines");
 
 enum LaneId : int32_t { LANE_AIC = 0, LANE_AIV0 = 1, LANE_AIV1 = 2, LANE_NONE = -1 };
 
@@ -786,10 +799,12 @@ struct DistCore {
 
     DistTensorMap map;
 
+    uint8_t slots_pad[16];
     RingSlot slots[kPrivateSlots];
     int32_t occupied_count;
     int32_t owned_total;  // tasks this core claimed+executed (debug)
 
+    uint8_t task_payloads_pad[24];
     DistTaskPayload task_payloads[kTaskPayloadSlots];
 
     // Same rationale as DistTensorMap: CCEC cannot qualify the `this` of a
@@ -812,6 +827,8 @@ struct DistCore {
         }
     }
 };
+static_assert(offsetof(DistCore, slots) % 64 == 0, "DistCore slots must be cacheline-aligned");
+static_assert(offsetof(DistCore, task_payloads) % 64 == 0, "DistCore task_payloads must be cacheline-aligned");
 
 // -----------------------------------------------------------------------------
 // Cursor sharding (docs §6.6). Each per-anchor-type claim cursor is split into
@@ -825,13 +842,16 @@ struct DistCore {
 // shards never share a line; all entries init to -1 (no id claimed yet).
 constexpr int32_t kCursorShards = 4;
 constexpr size_t kCacheLine = 64;
+static_assert(PTO2_PACKED_OUTPUT_ALIGN >= kCacheLine);
+static_assert((PTO2_PACKED_OUTPUT_ALIGN % kCacheLine) == 0);
 
-struct alignas(kCacheLine) PaddedCursor {
+struct PaddedCursor {
     volatile int64_t v;
     uint8_t pad[kCacheLine - sizeof(int64_t)];
 };
+static_assert(sizeof(PaddedCursor) == kCacheLine, "PaddedCursor must occupy one cacheline");
 
-struct alignas(kCacheLine) DistTaskCell {
+struct DistTaskCell {
     volatile int64_t flag;
     volatile uint64_t vend;
     uint8_t pad[kCacheLine - sizeof(int64_t) - sizeof(uint64_t)];
@@ -855,7 +875,9 @@ struct DistGlobal {
     // cumulative virtual heap bytes through task N (deterministic & identical on
     // every core), so any core can compute the live byte window [vend[R], top).
     volatile int64_t frontier;
+    uint8_t frontier_pad[kCacheLine - sizeof(int64_t)];
     int32_t H;
+    uint8_t tasks_pad[kCacheLine - sizeof(int32_t)];
     DistTaskCell tasks[kFlagCap];
 
     uint8_t *heap_base;
@@ -865,7 +887,9 @@ struct DistGlobal {
     PTO2Runtime *rt;
     Runtime *runtime;  // outer Runtime (for kernel-address resolution + done_count)
 
+    uint8_t fatal_pad[24];
     volatile int32_t fatal;
+    uint8_t fatal_tail_pad[kCacheLine - sizeof(int32_t)];
 
     // Physical-block topology (1 AIC + 2 AIV per block), derived once at register
     // time from Runtime::workers[].core_type, identical to the centralized
@@ -874,6 +898,7 @@ struct DistGlobal {
     int32_t num_workers;
     int32_t num_blocks;
     CoreLayout layout[RUNTIME_MAX_WORKER];
+    uint8_t blocks_pad[24];
     BlockWon blocks[RUNTIME_MAX_WORKER];  // indexed by block_id (<= num AIC)
 
     // Global "all cores finished orchestration replay" counter. A follower must
@@ -881,6 +906,7 @@ struct DistGlobal {
     // finished replaying the submit stream (§7 tail-idle). int64_t because CCEC
     // rejects 32-bit atomic add on GM addresses (see wrappers preamble).
     volatile int64_t replay_done;
+    uint8_t replay_done_pad[kCacheLine - sizeof(int64_t)];
 
     // Startup barrier: every worker thread bumps this on entry and spins until it
     // reaches num_workers before beginning replay. In sim each "core" is a host
@@ -891,9 +917,17 @@ struct DistGlobal {
     // Aligning the start makes the trace reflect steady-state contention.
     // int64_t for the same GM-atomic-add reason as replay_done above.
     volatile int64_t started_count;
+    uint8_t started_count_pad[kCacheLine - sizeof(int64_t)];
 
     DistCore cores[RUNTIME_MAX_WORKER];
 };
+static_assert(offsetof(DistGlobal, frontier) % 64 == 0, "DistGlobal frontier must be cacheline-aligned");
+static_assert(offsetof(DistGlobal, tasks) % 64 == 0, "DistGlobal tasks must be cacheline-aligned");
+static_assert(offsetof(DistGlobal, fatal) % 64 == 0, "DistGlobal fatal must be cacheline-aligned");
+static_assert(offsetof(DistGlobal, blocks) % 64 == 0, "DistGlobal blocks must be cacheline-aligned");
+static_assert(offsetof(DistGlobal, replay_done) % 64 == 0, "DistGlobal replay_done must be cacheline-aligned");
+static_assert(offsetof(DistGlobal, started_count) % 64 == 0, "DistGlobal started_count must be cacheline-aligned");
+static_assert(offsetof(DistGlobal, cores) % 64 == 0, "DistGlobal cores must be cacheline-aligned");
 
 // g_dist / g_self storage. The AICPU build owns the BSS DistGlobal and
 // initializes it in dist_engine_register. AICore builds attach to the published
@@ -1577,6 +1611,7 @@ PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &
         ctx.task_id = ctx.self->local_index++;
         ctx.payload = &ctx.self->task_payloads[ctx.task_id & kTaskPayloadMask];
     }
+    ctx.result.set_task_id(PTO2TaskId::make(0, static_cast<uint32_t>(ctx.task_id)));
     ctx.tensor_count = args.tensor_count();
     ctx.output_bytes = 0;
     ctx.fanin_count = 0;
@@ -1648,7 +1683,15 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
         const TensorArgType tag = args.tag(i);
         ctx.payload->tags[i] = tag;
         if (tag != TensorArgType::OUTPUT) {
+#if defined(__CCE_AICORE__)
+            if (args.tensor(i).tensor_from_gm()) {
+                Tensor::copy(ctx.payload->tensors[i], args.tensor(i).gm_ref());
+            } else {
+                Tensor::copy(ctx.payload->tensors[i], args.tensor(i).ref());
+            }
+#else
             Tensor::copy(ctx.payload->tensors[i], args.tensor(i).ref());
+#endif
             continue;
         }
         const auto &ci = args.tensor(i).create_info();
@@ -1664,6 +1707,7 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
         const uint64_t phys = (task_base + layout.offsets[i]) % ring;
         __gm__ Tensor &slot_t = ctx.payload->tensors[i];
         init_tensor_from_create_info(slot_t, ci, g_dist.heap_base + phys, layout.buffer_sizes[i]);
+        slot_t.owner_task_id.raw = ctx.result.task_id().raw;
         ctx.result.materialize_output(slot_t);
     }
     for (int32_t i = 0; i < args.scalar_count(); i++) {
@@ -1699,10 +1743,20 @@ PTO_DEVICE_FUNC void dist_submit_prepare_map(__gm__ DistCore *self, int32_t task
     DistTensorMap::advance_retire(self->map, task_id, g_dist.H);
 }
 
+PTO_DEVICE_FUNC void dist_submit_add_fanin(int32_t fanin[], int32_t &fanin_count, int32_t producer) {
+    if (producer < 0) return;
+    for (int32_t k = 0; k < fanin_count; k++)
+        if (fanin[k] == producer) return;
+    if (fanin_count < kMaxFanin) fanin[fanin_count++] = producer;
+}
+
 PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const DistSubmitCtx &ctx, int32_t fanin[]) {
     int32_t fc = 0;
     for (int32_t i = 0; i < ctx.tensor_count; i++) {
         const TensorArgType tag = payload_tag(ctx, i);
+        if (tag == TensorArgType::OUTPUT) continue;
+        const uint64_t owner_raw = payload_tensor(ctx, i).owner_task_id.raw;
+        if (owner_raw != UINT64_MAX) dist_submit_add_fanin(fanin, fc, static_cast<int32_t>(owner_raw & 0xFFFFFFFFu));
         if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
 #if defined(__CCE_AICORE__)
         const int32_t p = DistTensorMap::lookup(ctx.self->map, payload_tensor(ctx, i));
@@ -1711,14 +1765,7 @@ PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const DistSubmitCtx &ctx, int3
         if (t.manual_dep) continue;
         const int32_t p = DistTensorMap::lookup(ctx.self->map, t);
 #endif
-        if (p < 0) continue;
-        bool dup = false;
-        for (int32_t k = 0; k < fc; k++)
-            if (fanin[k] == p) {
-                dup = true;
-                break;
-            }
-        if (!dup && fc < kMaxFanin) fanin[fc++] = p;
+        dist_submit_add_fanin(fanin, fc, p);
     }
     return fc;
 }
@@ -2317,6 +2364,48 @@ PTO_DEVICE_FUNC void ccec_wait_direct_slot_capacity(__gm__ DistCore *self) {
     }
 }
 
+PTO_DEVICE_FUNC bool ccec_fatal_set() {
+    ccec_invalidate_region(const_cast<__gm__ int32_t *>(&g_dist.fatal), sizeof(g_dist.fatal));
+    return g_dist.fatal != 0;
+}
+
+PTO_DEVICE_FUNC void ccec_set_fatal() {
+    g_dist.fatal = 1;
+    ccec_flush_region(const_cast<__gm__ int32_t *>(&g_dist.fatal), sizeof(g_dist.fatal));
+}
+
+PTO_DEVICE_FUNC bool ccec_wait_heap_capacity(DistSubmitCtx &ctx, DistSubmitKind kind) {
+    if (ctx.self == nullptr || ctx.output_bytes == 0 || g_dist.heap_base == nullptr) return true;
+    const size_t ring = g_dist.heap_size;
+    while (!ccec_fatal_set()) {
+        __gm__ int64_t *frontier = const_cast<__gm__ int64_t *>(&g_dist.frontier);
+        ccec_invalidate_region(frontier, 64);
+        const int32_t f = static_cast<int32_t>(g_dist.frontier);
+        const int32_t R = f - g_dist.H;
+        const uint64_t vstart_live = load_task_vend(R);
+        if (ctx.self->heap_next - vstart_live <= ring) return true;
+        if (f >= ctx.task_id - 1) {
+            ccec_set_fatal();
+            if (kind == DistSubmitKind::Alloc) {
+                DIST_ERRF(
+                    "[dist_engine] heap ring %zu B too small for H=%d window at alloc %d (live=%llu B)\n", ring,
+                    g_dist.H, ctx.task_id, (unsigned long long)(ctx.self->heap_next - vstart_live)
+                );
+            } else {
+                DIST_ERRF(
+                    "[dist_engine] heap ring %zu B too small for H=%d window at task %d (live=%llu B); "
+                    "enlarge PTO_DIST_HEAP_MB or reduce PTO_DIST_H\n",
+                    ring, g_dist.H, ctx.task_id, (unsigned long long)(ctx.self->heap_next - vstart_live)
+                );
+            }
+            return false;
+        }
+        ccec_drain_block_won_direct(ctx.self);
+        if (ccec_drain_ready_slots_direct(ctx.self) == 0) SPIN_WAIT_HINT();
+    }
+    return false;
+}
+
 PTO_DEVICE_FUNC int32_t ccec_alloc_won_slot_direct(__gm__ DistCore *self, int32_t block) {
     __gm__ BlockWon &bw = g_dist.blocks[block];
     while (true) {
@@ -2458,6 +2547,7 @@ PTO_DEVICE_FUNC int32_t ccec_drain_ready_slots_direct(__gm__ DistCore *self) {
 PTO_DEVICE_FUNC void ccec_execute_won_submit(DistSubmitCtx &ctx, const MixedKernels &mixed) {
     if (ctx.self == nullptr) return;
     ccec_wait_direct_slot_capacity(ctx.self);
+    if (!ccec_wait_heap_capacity(ctx, DistSubmitKind::Kernel)) return;
     if (ctx.joint && ctx.joint_slot < 0) {
         ctx.joint_slot = ccec_alloc_won_slot_direct(ctx.self, ctx.joint_block);
     }
@@ -2470,6 +2560,7 @@ PTO_DEVICE_FUNC void ccec_execute_won_submit(DistSubmitCtx &ctx, const MixedKern
 
 PTO_DEVICE_FUNC void ccec_complete_alloc_submit(DistSubmitCtx &ctx) {
     if (ctx.won) {
+        if (!ccec_wait_heap_capacity(ctx, DistSubmitKind::Alloc)) return;
         ccec_complete_task(ctx);
     }
 }

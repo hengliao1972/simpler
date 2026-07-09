@@ -54,19 +54,19 @@
 
 #include "arg_direction.h"
 #include "data_type.h"  // PTO_DEVICE_FUNC — expands to __aicore__ under CCEC, empty on host
-#include "tensor.h"  // unified Tensor (strided) + TensorArgType, carried by TaskArgs and on the wire
+#include "tensor.h"     // unified Tensor (strided) + TensorArgType, carried by TaskArgs and on the wire
 
 // Compact TASKARGS_THROW / TASKARGS_LOGIC_THROW: host paths still raise the
 // existing exceptions (unchanged behavior for orchestrator/user code); on
 // CCEC AICore both collapse to a silent no-op so the same header compiles
 // into an on-core kernel binary.
 #if defined(__CCE_AICORE__)
-#define TASKARGS_THROW_LOGIC(msg)  ((void)0)
-#define TASKARGS_THROW_OOR(msg)    ((void)0)
+#define TASKARGS_THROW_LOGIC(msg) ((void)0)
+#define TASKARGS_THROW_OOR(msg) ((void)0)
 #define TASKARGS_THROW_RUNTIME(msg_expr) ((void)0)
 #else
-#define TASKARGS_THROW_LOGIC(msg)  throw std::logic_error(msg)
-#define TASKARGS_THROW_OOR(msg)    throw std::out_of_range(msg)
+#define TASKARGS_THROW_LOGIC(msg) throw std::logic_error(msg)
+#define TASKARGS_THROW_OOR(msg) throw std::out_of_range(msg)
 #define TASKARGS_THROW_RUNTIME(msg_expr) throw std::runtime_error(msg_expr)
 #endif
 
@@ -259,12 +259,9 @@ using ChipStorageTaskArgs = TaskArgsTpl<Tensor, uint64_t, CHIP_MAX_TENSOR_ARGS, 
 struct TaskArgsView {
     int32_t tensor_count;
     int32_t scalar_count;
-    // Raw bytes of the tensor array, NOT a `const Tensor*`. When this view is
-    // over a mailbox blob the tensor region starts at an 8-byte boundary, but
-    // `Tensor` is `alignas(64)` — forming a `Tensor*`/`Tensor&` to it would be
-    // undefined behavior. Copy a tensor out with tensors(i); bulk movers
-    // memcpy straight from these bytes. (For the make_view path the bytes are
-    // a 64-aligned vector, but the accessor keeps a single uniform contract.)
+    // Raw bytes of the tensor array, NOT a `const Tensor*`. Mailbox blobs only
+    // promise the tensor region starts at an 8-byte boundary; copy a tensor out
+    // with tensors(i) instead of relying on stronger in-place alignment.
     const uint8_t *tensor_bytes;
     const uint64_t *scalars;  // 8-byte aligned by blob construction; safe to address as uint64_t*
 
@@ -299,10 +296,10 @@ inline TaskArgsView make_view(const TaskArgs &a) {
 //   offset 8 + 128T:          uint64_t scalars[S]           (8 B each)
 // total bytes used:           8 + 128T + 8S
 //
-// NOTE: Tensor is alignas(64) but the array starts at the 8-byte header
-// boundary, so blob Tensors are NOT guaranteed 64-aligned. All consumers
-// extract them via memcpy / trivially-copyable copy (never in-place SIMD or
-// atomics), which is alignment-tolerant on aarch64.
+// NOTE: the array starts at the 8-byte header boundary, so blob Tensors are NOT
+// guaranteed 64-aligned. All consumers extract them via memcpy /
+// trivially-copyable copy (never in-place SIMD or atomics), which is
+// alignment-tolerant on aarch64.
 
 inline constexpr size_t TASK_ARGS_BLOB_HEADER_SIZE = 8;
 
