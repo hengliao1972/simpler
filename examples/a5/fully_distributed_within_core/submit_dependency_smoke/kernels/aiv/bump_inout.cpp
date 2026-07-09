@@ -4,7 +4,7 @@
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
@@ -17,6 +17,7 @@
 #include <pto/pto-inst.hpp>
 #endif
 #include "tensor.h"
+#include "pipe_sync.h"
 
 #ifndef __gm__
 #define __gm__
@@ -49,4 +50,5 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     for (uint64_t off = 0; off < n * sizeof(float); off += 64) {
         dcci(reinterpret_cast<__gm__ uint8_t *>(data) + off, SINGLE_CACHE_LINE, CACHELINE_OUT);
     }
+    pipe_sync();
 }

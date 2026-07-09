@@ -136,7 +136,7 @@ enum class TensorArgType : int32_t {
  *   - TaskOutputTensors returned by submit(...)
  *   - Tensor::view() / reshape() / transpose() / permute() / slice() on an existing valid Tensor
  */
-struct alignas(64) Tensor {
+struct Tensor {
     // === Cache line 1 (64B) — hot path ===
     PTOBufferHandle buffer;            // Underlying memory buffer (addr in bytes, size in bytes)
     PTO2TaskId owner_task_id;          // Creator task; PTO2TaskId::invalid() for external tensors
@@ -342,6 +342,7 @@ private:
         static_assert(is_tensor_ref(static_cast<Src *>(nullptr)), "Tensor::copy source must be Tensor");
         aicore_memcpy(&dst, &src, sizeof(Tensor));
     }
+
 public:
 #endif
 
@@ -384,9 +385,8 @@ public:
 
 private:
     template <typename Source>
-    PTO_DEVICE_FUNC static Tensor make_view(
-        const Source &source, const uint32_t view_shapes[], const uint32_t view_offsets[], bool in_manual_dep
-    ) {
+    PTO_DEVICE_FUNC static Tensor
+    make_view(const Source &source, const uint32_t view_shapes[], const uint32_t view_offsets[], bool in_manual_dep) {
         static_assert(is_tensor_ref(static_cast<Source *>(nullptr)), "Tensor::view source must be Tensor");
         Tensor result;
         Tensor::init_from_line1(result, source);
@@ -403,7 +403,8 @@ private:
     }
 
 public:
-    PTO_DEVICE_FUNC Tensor view(const uint32_t view_shapes[], const uint32_t view_offsets[], bool in_manual_dep = false) const {
+    PTO_DEVICE_FUNC Tensor
+    view(const uint32_t view_shapes[], const uint32_t view_offsets[], bool in_manual_dep = false) const {
         return Tensor::view(*this, view_shapes, view_offsets, in_manual_dep);
     }
 
@@ -450,7 +451,8 @@ public:
 
     /// Slice dimension `dim` with `[start, end)` and positive `step`.
     /// strides[dim] *= step; shapes[dim] = ⌈(end-start)/step⌉; start_offset += start·strides[dim_old].
-    PTO_DEVICE_FUNC Tensor slice(uint32_t dim, uint32_t start, uint32_t end, uint32_t step = 1, bool in_manual_dep = false) const {
+    PTO_DEVICE_FUNC Tensor
+    slice(uint32_t dim, uint32_t start, uint32_t end, uint32_t step = 1, bool in_manual_dep = false) const {
         debug_assert(dim < ndims);
         debug_assert(step >= 1);
         debug_assert(end > start);

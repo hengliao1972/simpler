@@ -29,7 +29,7 @@
 #include "intrinsic.h"  // for __gm__ (empty on sim, __gm__ under CCEC)
 #include "tensor.h"
 
-class alignas(64) TensorCreateInfo {
+class TensorCreateInfo {
 public:
     PTO_DEVICE_FUNC TensorCreateInfo(
         const uint32_t shapes_in[], uint32_t ndims_in, DataType dtype_in = DataType::FLOAT32, bool manual_dep_in = false
@@ -69,26 +69,12 @@ public:
         return total * get_element_size(dtype);
     }
 
-    // CCEC entry: TensorCreateInfo instances reached through orch args live
-    // in GM (see TensorRef in pto_types.h — the fdwic engine only exchanges
-    // Tensors / create-info through GM). CCE forbids qualifying `this` with
-    // __gm__ on a non-static method, so provide a static form that takes an
-    // explicit `self` reference. Sim provides a shim that just forwards to
-    // the non-static overload so call sites can uniformly say
+    // TensorCreateInfo instances are submit-time orchestration locals. They
+    // stay in the default address space and must outlive the submit call, so
+    // call sites can uniformly say
     //   TensorCreateInfo::buffer_size_bytes(x)
-    // regardless of target.
+    // regardless of target without a GM overload.
 #if defined(__CCE_AICORE__)
-    PTO_DEVICE_FUNC static uint64_t buffer_size_bytes(__gm__ const TensorCreateInfo &self) {
-        uint64_t total = 1;
-        for (uint32_t i = 0; i < self.ndims; i++) {
-            total *= self.shapes[i];
-        }
-        return total * get_element_size(self.dtype);
-    }
-    // Non-__gm__ overload: since TensorRef::create_info() now returns a
-    // default-address-space reference (orch stack local), engine-side call
-    // sites like args.tensor(i).create_info() land here rather than the
-    // __gm__ overload above.
     PTO_DEVICE_FUNC static uint64_t buffer_size_bytes(const TensorCreateInfo &self) { return self.buffer_size_bytes(); }
 #else
     static uint64_t buffer_size_bytes(const TensorCreateInfo &self) { return self.buffer_size_bytes(); }
@@ -188,8 +174,7 @@ PTO_DEVICE_FUNC inline void fill_tensor_initial_value(__gm__ Tensor &t, uint64_t
             reinterpret_cast<__gm__ uint8_t *>(t.buffer.addr + filled),
             reinterpret_cast<__gm__ const uint8_t *>(t.buffer.addr),
 #else
-            reinterpret_cast<uint8_t *>(t.buffer.addr + filled),
-            reinterpret_cast<const uint8_t *>(t.buffer.addr),
+            reinterpret_cast<uint8_t *>(t.buffer.addr + filled), reinterpret_cast<const uint8_t *>(t.buffer.addr),
 #endif
             copy_size
         );
@@ -202,16 +187,22 @@ PTO_DEVICE_FUNC inline void fill_tensor_initial_value(__gm__ Tensor &t, uint64_t
 /// and is_contiguous (=true) in its line-1 slots so they need no reset here.
 /// Cache line 2 (stride/extent) is computed from `ci.shapes` in a single reverse pass.
 template <typename Src>
-PTO_DEVICE_FUNC inline void init_tensor_from_create_info(__gm__ Tensor &t, const Src &ci, void *addr, uint64_t buffer_size) {
+PTO_DEVICE_FUNC inline void
+init_tensor_from_create_info(__gm__ Tensor &t, const Src &ci, void *addr, uint64_t buffer_size) {
     always_assert(ci.ndims > 0 && ci.ndims <= MAX_TENSOR_DIMS);
-    aicore_memcpy(&t, &ci, sizeof(TensorCreateInfo));
-    // Field-wise assignment: CCEC has no viable operator= across address
-    // spaces (a host-space brace-initialized PTOBufferHandle temporary cannot
-    // be assigned into a __gm__ Buffer). Same reason we hand-write the raw
-    // PTO2TaskId store below.
     t.buffer.addr = reinterpret_cast<uint64_t>(addr);
     t.buffer.size = buffer_size;
     t.owner_task_id.raw = UINT64_MAX;  // == PTO2TaskId::invalid(); caller overwrites with the actual task_id
+    t.start_offset = ci.start_offset;
+    t.version = ci.version;
+    t.ndims = ci.ndims;
+    t.dtype = ci.dtype;
+    t.manual_dep = ci.manual_dep;
+    t.is_contiguous = ci.is_contiguous;
+    t.child_memory = ci.__pad_flags__;
+    for (uint32_t i = 0; i < MAX_TENSOR_DIMS; i++) {
+        t.shapes[i] = ci.shapes[i];
+    }
     uint32_t s = 1;
     for (int32_t i = static_cast<int32_t>(t.ndims) - 1; i >= 0; --i) {
         t.strides[i] = s;

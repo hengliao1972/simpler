@@ -76,6 +76,13 @@ class TestSubmitDependencySmoke(SceneTestCase):
                 "core_type": "aiv",
                 "signature": [D.IN, D.INOUT, D.INOUT],
             },
+            {
+                "func_id": 7,
+                "name": "INSPECT_ALLOC_AIC",
+                "source": "kernels/aic/inspect_alloc.cpp",
+                "core_type": "aic",
+                "signature": [D.IN, D.INOUT, D.INOUT],
+            },
         ],
     }
 
@@ -188,6 +195,27 @@ class TestSubmitDependencySmoke(SceneTestCase):
             "params": {"n": 4096, "mode": 3},
         },
         {
+            "name": "A5OnboardBd1SubViewOnly",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 4096, "mode": 3},
+        },
+        {
+            "name": "A5OnboardBd1ViewDescriptorOnly",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 4096, "mode": 20},
+        },
+        {
+            "name": "A5OnboardBd1ArgViewDescriptorOnly",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 4096, "mode": 21},
+        },
+        {
             "name": "A5SimBd36ScalarOffsetOnly",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
@@ -250,6 +278,19 @@ class TestSubmitDependencySmoke(SceneTestCase):
             "manual": True,
             "platforms": ["a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 128, "mode": 8},
+        },
+        {
+            "name": "A5SimBd1AllocFillFanin",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 128, "mode": 8},
+        },
+        {
+            "name": "A5OnboardBd1AllocFillFanin",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
             "params": {"n": 128, "mode": 8},
         },
         {
@@ -343,6 +384,239 @@ class TestSubmitDependencySmoke(SceneTestCase):
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
             "params": {"n": 4096, "mode": 14},
         },
+        {
+            "name": "A5SimBd1AllocFillRunAhead1",
+            "platforms": ["a5sim"],
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 1,
+                "runtime_env": {"ring_heap": 68 * 1024},
+            },
+            "params": {"n": 1, "mode": 22},
+        },
+        {
+            "name": "A5OnboardBd1AllocFillRunAhead1",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 1,
+                "runtime_env": {"ring_heap": 68 * 1024},
+            },
+            "params": {"n": 1, "mode": 22},
+        },
+        {
+            "name": "A5SimBd1AllocFillRunAheadDefaultHeap",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 1, "mode": 22},
+        },
+        {
+            "name": "A5OnboardBd1AllocFillRunAheadDefaultHeap",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 1, "mode": 22},
+        },
+        {
+            "name": "A5SimBd36AllocFillRunAhead1",
+            "platforms": ["a5sim"],
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 36,
+                "runtime_env": {"ring_heap": 68 * 1024},
+            },
+            "params": {"n": 1, "mode": 22},
+        },
+        {
+            "name": "A5OnboardBd36AllocFillRunAhead1",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 36,
+                "runtime_env": {"ring_heap": 68 * 1024},
+            },
+            "params": {"n": 1, "mode": 22},
+        },
+        {
+            "name": "A5SimBd1AllocFillRunAhead16",
+            "platforms": ["a5sim"],
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 1,
+                "runtime_env": {"ring_heap": 68 * 1024},
+            },
+            "params": {"n": 16, "mode": 22},
+        },
+        {
+            "name": "A5OnboardBd1AllocFillRunAhead16",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 1,
+                "runtime_env": {"ring_heap": 68 * 1024},
+            },
+            "params": {"n": 16, "mode": 22},
+        },
+        {
+            "name": "A5SimBd1AllocFillRunAhead32",
+            "platforms": ["a5sim"],
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 1,
+                "runtime_env": {"ring_heap": 68 * 1024},
+            },
+            "params": {"n": 32, "mode": 22},
+        },
+        {
+            "name": "A5OnboardBd1AllocFillRunAhead32",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 1,
+                "runtime_env": {"ring_heap": 68 * 1024},
+            },
+            "params": {"n": 32, "mode": 22},
+        },
+        {
+            "name": "A5SimBd1AllocFillRunAhead67",
+            "platforms": ["a5sim"],
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 1,
+                "runtime_env": {"ring_heap": 68 * 1024},
+            },
+            "params": {"n": 67, "mode": 22},
+        },
+        {
+            "name": "A5OnboardBd1AllocFillRunAhead67",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 1,
+                "runtime_env": {"ring_heap": 68 * 1024},
+            },
+            "params": {"n": 67, "mode": 22},
+        },
+        {
+            "name": "A5SimBd1AllocFillRunAhead128",
+            "platforms": ["a5sim"],
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 1,
+                "runtime_env": {"ring_heap": 68 * 1024},
+            },
+            "params": {"n": 128, "mode": 22},
+        },
+        {
+            "name": "A5OnboardBd1AllocFillRunAhead128",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 1,
+                "runtime_env": {"ring_heap": 68 * 1024},
+            },
+            "params": {"n": 128, "mode": 22},
+        },
+        {
+            "name": "A5SimBd1AllocOnly1",
+            "platforms": ["a5sim"],
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 1,
+                "runtime_env": {"ring_heap": 68 * 1024},
+            },
+            "params": {"n": 1, "mode": 23},
+        },
+        {
+            "name": "A5OnboardBd1AllocOnly1",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 1,
+                "runtime_env": {"ring_heap": 68 * 1024},
+            },
+            "params": {"n": 1, "mode": 23},
+        },
+        {
+            "name": "A5SimBd1TailAicOutput",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 128, "mode": 24},
+        },
+        {
+            "name": "A5OnboardBd1TailAicOutput",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 128, "mode": 24},
+        },
+        {
+            "name": "A5SimBd1DeadAicOutput",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 128, "mode": 25},
+        },
+        {
+            "name": "A5OnboardBd1DeadAicOutput",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 128, "mode": 25},
+        },
+        {
+            "name": "A5SimBd1AllocDescriptorInSlot",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 128, "mode": 26},
+        },
+        {
+            "name": "A5OnboardBd1AllocDescriptorInSlot",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 128, "mode": 26},
+        },
+        {
+            "name": "A5SimBd1AllocDescriptorInAicSlot",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 128, "mode": 27},
+        },
+        {
+            "name": "A5OnboardBd1AllocDescriptorInAicSlot",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 128, "mode": 27},
+        },
+        {
+            "name": "A5SimBd1AllocHeapBackPressure",
+            "platforms": ["a5sim"],
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 1,
+                "runtime_env": {"ring_heap": 68 * 1024},
+            },
+            "params": {"n": 67, "mode": 19},
+        },
+        {
+            "name": "A5OnboardBd1AllocHeapBackPressure",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 1,
+                "runtime_env": {"ring_heap": 68 * 1024},
+            },
+            "params": {"n": 67, "mode": 19},
+        },
     ]
 
     def generate_args(self, params):
@@ -358,7 +632,7 @@ class TestSubmitDependencySmoke(SceneTestCase):
             Scalar("mode", int(params.get("mode", 0))),
         )
 
-    def compute_golden(self, args, params):
+    def compute_golden(self, args, params):  # noqa: PLR0912 - smoke cases intentionally share one golden dispatcher
         mode = int(params.get("mode", 0))
         if mode == 1:
             n = int(params["n"])
@@ -427,6 +701,41 @@ class TestSubmitDependencySmoke(SceneTestCase):
             args.output[:] = -1.0
             expected = args.input[:sub_n] * 3.0 + 12.0
             args.output[: 6 * sub_n] = expected.repeat(6)
+            return
+        if mode == 19:
+            args.output[:] = (args.input * 2.0 + 3.0) * 3.0 + 8.0
+            return
+        if mode == 20:
+            args.output[:] = -1.0
+            args.output[:8] = 1.0
+            return
+        if mode == 21:
+            args.output[:] = -1.0
+            args.output[[0, 1, 2, 3, 4, 7, 8, 9, 10]] = 1.0
+            args.output[[5, 6]] = 0.0
+            return
+        if mode == 22:
+            args.output[:] = -1.0
+            return
+        if mode == 23:
+            args.output[:] = -1.0
+            return
+        if mode == 24:
+            args.output[:] = args.input + 7.0
+            return
+        if mode == 25:
+            args.output[:] = -1.0
+            return
+        if mode == 26:
+            args.output[:] = -1.0
+            args.output[0] = 0.0
+            args.output[1:4] = 1.0
+            args.dump[:3] = 1.0
+            return
+        if mode == 27:
+            args.output[:] = -1.0
+            args.output[:10] = 1.0
+            args.dump[:3] = 1.0
             return
         args.output[:] = args.input * 6.0 + 23.0
 

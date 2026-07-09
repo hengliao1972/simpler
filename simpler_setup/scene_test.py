@@ -965,6 +965,13 @@ def _plot_case_scope_stats(case_label: str, output_prefix: Path) -> None:
         sys.path.remove(str(tools_dir))
 
 
+def _format_case_context(cls_name: str, case: dict, worker) -> str:
+    platform = worker._config.get("platform", "<unknown>")
+    config = case.get("config", {})
+    params = case.get("params", {})
+    return f"{cls_name}_{case['name']} platform={platform} config={config!r} params={params!r}"
+
+
 def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI surface
     worker,
     cls_inst,
@@ -1006,6 +1013,8 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
         logger.warning("device-log timing is not supported for L3 (multi-chip); ignoring")
     for case in cases:
         case_label = f"{cls_name}_{case['name']}"
+        case_context = _format_case_context(cls_name, case, worker)
+        print(f"[scene_test] RUN CASE {case_context}", flush=True)
         # Per-case directory the runtime writes into. Required (non-empty) when
         # any diagnostic flag is on; CallConfig::validate() throws otherwise.
         # scope_stats now writes <prefix>/scope_stats/scope_stats.jsonl (sibling of
@@ -1029,6 +1038,9 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 enable_scope_stats=enable_scope_stats,
                 output_prefix=str(prefix) if diagnostics_on else "",
             )
+        except BaseException as exc:
+            exc.add_note(f"SceneTest case context: {case_context}")
+            raise
         finally:
             if enable_l2_swimlane:
                 _convert_case_swimlane(

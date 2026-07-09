@@ -40,21 +40,26 @@
 #endif
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
-    __gm__ Tensor *view_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *scratch_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ Tensor *output_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
     __gm__ Tensor *dump_tensor = reinterpret_cast<__gm__ Tensor *>(args[2]);
-    const uint64_t expected_offset = static_cast<uint64_t>(args[3]);
-    const uint64_t expected_n = static_cast<uint64_t>(args[4]);
+    const uint64_t expected_n = static_cast<uint64_t>(args[3]);
 
     __gm__ float *output = reinterpret_cast<__gm__ float *>(output_tensor->buffer.addr) + output_tensor->start_offset;
     __gm__ float *dump = reinterpret_cast<__gm__ float *>(dump_tensor->buffer.addr) + dump_tensor->start_offset;
-    output[0] = view_tensor->buffer.addr == output_tensor->buffer.addr ? 1.0f : 0.0f;
-    output[1] = view_tensor->start_offset == expected_offset ? 1.0f : 0.0f;
-    output[2] = view_tensor->shapes[0] == expected_n ? 1.0f : 0.0f;
-    output[3] = view_tensor->strides[0] == 1 ? 1.0f : 0.0f;
-    dump[0] = view_tensor->start_offset == expected_offset ? 1.0f : 0.0f;
-    dump[1] = view_tensor->shapes[0] == expected_n ? 1.0f : 0.0f;
-    dump[2] = view_tensor->strides[0] == 1 ? 1.0f : 0.0f;
+    output[0] = scratch_tensor->buffer.addr != 0 ? 1.0f : 0.0f;
+    output[1] = scratch_tensor->buffer.size == expected_n * sizeof(float) ? 1.0f : 0.0f;
+    output[2] = scratch_tensor->start_offset == 0 ? 1.0f : 0.0f;
+    output[3] = scratch_tensor->ndims == 1 ? 1.0f : 0.0f;
+    output[4] = scratch_tensor->dtype == DataType::FLOAT32 ? 1.0f : 0.0f;
+    output[5] = scratch_tensor->is_contiguous ? 1.0f : 0.0f;
+    output[6] = scratch_tensor->shapes[0] == expected_n ? 1.0f : 0.0f;
+    output[7] = scratch_tensor->strides[0] == 1 ? 1.0f : 0.0f;
+    output[8] = scratch_tensor->extent_elem_cache == expected_n ? 1.0f : 0.0f;
+    output[9] = scratch_tensor->buffer.addr != output_tensor->buffer.addr ? 1.0f : 0.0f;
+    dump[0] = output[0];
+    dump[1] = output[1];
+    dump[2] = output[8];
     dcci(output, SINGLE_CACHE_LINE, CACHELINE_OUT);
     dcci(dump, SINGLE_CACHE_LINE, CACHELINE_OUT);
     pipe_sync();

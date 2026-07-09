@@ -7,6 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 import fcntl
+import hashlib
 import json
 import logging
 import shutil
@@ -23,6 +24,18 @@ from .runtime_compiler import RuntimeCompiler
 logger = logging.getLogger(__name__)
 
 _GIT_COMMIT_FILE = ".git_commit"
+_SOURCE_STATE_VERSION = "source-v2"
+_SOURCE_FINGERPRINT_SUFFIXES = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cxx",
+    ".h",
+    ".hh",
+    ".hpp",
+    ".hxx",
+    ".inc",
+}
 
 
 def _get_git_head(repo_root: Path) -> str:
@@ -41,38 +54,60 @@ def _get_git_head(repo_root: Path) -> str:
         return ""
 
 
-def _invalidate_cache_if_stale(target_cache_dir: Path, current_commit: str) -> None:
-    """Clear target_cache_dir if it was built from a different git commit.
+def _source_fingerprint(paths: list[Path]) -> str:
+    """Return a content fingerprint for source/header paths."""
+    files: list[Path] = []
+    for path in paths:
+        if path.is_file():
+            if path.suffix in _SOURCE_FINGERPRINT_SUFFIXES:
+                files.append(path)
+            continue
+        if path.is_dir():
+            files.extend(p for p in path.rglob("*") if p.is_file() and p.suffix in _SOURCE_FINGERPRINT_SUFFIXES)
+
+    h = hashlib.sha256()
+    for path in sorted(set(p.resolve() for p in files)):
+        h.update(str(path).encode("utf-8"))
+        h.update(b"\0")
+        h.update(path.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _invalidate_cache_if_stale(target_cache_dir: Path, current_state: str) -> None:
+    """Clear target_cache_dir if it was built from a different source state.
 
     git does not update file mtimes on checkout, so cmake's incremental build
     cannot detect that source files changed. Comparing the HEAD commit stored
     at last build time against the current HEAD is a reliable signal that
     sources may have changed and a clean rebuild is needed.
 
-    When the current commit can't be determined (no git, transient failure),
-    fall through to a clean rebuild — a fresh compile is cheap relative to
-    the risk of linking against stale objects.
+    Callers that also need dirty worktree/header tracking can append a content
+    fingerprint to the state token.
     """
-    if not current_commit:
+    if not current_state:
         if target_cache_dir.is_dir():
-            logger.info("git HEAD unavailable, clearing cmake cache: %s", target_cache_dir)
+            logger.info("source state unavailable, clearing cmake cache: %s", target_cache_dir)
             shutil.rmtree(target_cache_dir)
         target_cache_dir.mkdir(parents=True, exist_ok=True)
         return
     commit_file = target_cache_dir / _GIT_COMMIT_FILE
     if commit_file.is_file():
         cached_commit = commit_file.read_text().strip()
-        if cached_commit == current_commit:
+        if cached_commit == current_state:
             return
         logger.info(
-            "git HEAD changed (%s → %s), clearing cmake cache: %s",
+            "source state changed (%s → %s), clearing cmake cache: %s",
             cached_commit[:12],
-            current_commit[:12],
+            current_state[:12],
             target_cache_dir,
         )
         shutil.rmtree(target_cache_dir)
+    elif target_cache_dir.is_dir() and any(target_cache_dir.iterdir()):
+        logger.info("source state stamp missing, clearing cmake cache: %s", target_cache_dir)
+        shutil.rmtree(target_cache_dir)
     target_cache_dir.mkdir(parents=True, exist_ok=True)
-    commit_file.write_text(current_commit + "\n")
+    commit_file.write_text(current_state + "\n")
 
 
 @dataclass
@@ -348,6 +383,9 @@ class RuntimeBuilder:
         if "orchestration" in build_config:
             orch_include_dirs, _orch_source_dirs = self._resolve_target_dirs(config_dir, build_config, "orchestration")
             include_dirs.extend(orch_include_dirs)
+        from .kernel_compiler import KernelCompiler  # noqa: PLC0415
+
+        include_dirs.extend(KernelCompiler(platform=self.platform).get_incore_include_dirs())
 
         arch, variant = self._arch, self._variant
         cache_dir = self._CACHE_DIR / arch / variant / name / "aicore-extra" / cache_key
@@ -356,10 +394,12 @@ class RuntimeBuilder:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         current_commit = _get_git_head(PROJECT_ROOT)
+        fingerprint_paths = [*(Path(p) for p in include_dirs), *(Path(p) for p in source_dirs), *extra_sources]
+        current_state = _SOURCE_STATE_VERSION + ":" + current_commit + ":" + _source_fingerprint(fingerprint_paths)
         lock_path = cache_dir / ".aicore-extra.lock"
         with open(lock_path, "w") as lock_fd:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            _invalidate_cache_if_stale(cache_dir / "aicore", current_commit)
+            _invalidate_cache_if_stale(cache_dir / "aicore", current_state)
             return self._runtime_compiler.compile(  # type: ignore[return-value]
                 "aicore",
                 include_dirs,
