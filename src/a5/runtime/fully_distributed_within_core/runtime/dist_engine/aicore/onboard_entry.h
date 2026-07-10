@@ -13,17 +13,22 @@
 
 #include "dist_engine/common/target.h"
 
-PTO_DEVICE_FUNC void dist_aicore_onboard_main(__gm__ Runtime *runtime, int core_idx, int core_type_int) {
-#if defined(__CCE_AICORE__)
-    if (runtime == nullptr || core_idx < 0 || core_idx >= RUNTIME_MAX_WORKER) return;
+PTO_DEVICE_FUNC __gm__ DistCore *dist_aicore_attach_worker(__gm__ Runtime *runtime, int core_idx, int core_type_int) {
+    if (runtime == nullptr || core_idx < 0 || core_idx >= RUNTIME_MAX_WORKER) return nullptr;
 
+#if defined(__CCE_AICORE__)
     dist_aicore_invalidate_region(const_cast<__gm__ uint64_t *>(&runtime->dist.shared_addr), 64);
     g_dist_ptr = reinterpret_cast<__gm__ DistGlobal *>(runtime->dist.shared_addr);
-    if (g_dist_ptr == nullptr) return;
+#else
+    g_dist_ptr = reinterpret_cast<DistGlobal *>(runtime->dist.shared_addr);
+#endif
+    if (g_dist_ptr == nullptr) return nullptr;
 
+#if defined(__CCE_AICORE__)
     g_ccec_runtime = runtime;
     g_ccec_core_idx = core_idx;
     g_ccec_core_type = core_type_int;
+#endif
     g_self = &g_dist.cores[core_idx];
 
     dist_aicore_invalidate_region(&g_dist.layout[core_idx], sizeof(CoreLayout));
@@ -32,17 +37,21 @@ PTO_DEVICE_FUNC void dist_aicore_onboard_main(__gm__ Runtime *runtime, int core_
     dist_core_reset(*g_self, static_cast<CoreType>(core_type_int), lay.block_id, lay.lane);
     g_self->core_idx = core_idx;
 
+#if defined(__CCE_AICORE__)
     dist_aicore_invalidate_region(const_cast<__gm__ int32_t *>(&runtime->dist.num_workers), 64);
     ccec_init_worker_layout();
     ccec_attach_run_state();
+#endif
+    return g_self;
+}
 
-    direct_replay_orch(runtime);
-
-    direct_drain_to_completion(g_self);
+PTO_DEVICE_FUNC void dist_aicore_finish_worker(__gm__ Runtime *runtime) {
+#if defined(__CCE_AICORE__)
+    (void)runtime;
     ccec_finish_worker();
 #else
-    (void)runtime;
-    (void)core_idx;
-    (void)core_type_int;
+    g_self = nullptr;
+    ccec_publish_done();
+    __atomic_add_fetch(&runtime->dist.done_count, 1, __ATOMIC_ACQ_REL);
 #endif
 }
