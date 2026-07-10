@@ -1,3 +1,11 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """Pytest configuration for platform-aware testing."""
 
 import os
@@ -5,73 +13,44 @@ from pathlib import Path
 
 import pytest
 
-
 PROJECT_ROOT = Path(__file__).parent.parent
 
 
+def arch_from_platform(platform: str) -> str:
+    """Extract architecture name from platform (e.g. 'a2a3sim' -> 'a2a3')."""
+    if platform.endswith("sim"):
+        return platform[:-3]
+    return platform
+
+
 def discover_platforms() -> list[str]:
-    """Discover available platforms by scanning src/*/platform/{onboard,sim}/ directories.
-
-    Returns:
-        List of platform names (e.g., ["a2a3", "a2a3sim", "a5", "a5sim"])
-    """
-    platforms = []
+    """Scan src/*/platform/{onboard,sim}/ for available platforms."""
     src_dir = PROJECT_ROOT / "src"
-
     if not src_dir.exists():
-        return platforms
+        return []
 
+    platforms: list[str] = []
     for arch_dir in sorted(src_dir.iterdir()):
         if not arch_dir.is_dir():
             continue
-
-        arch_name = arch_dir.name
         platform_dir = arch_dir / "platform"
-
         if not platform_dir.exists():
             continue
-
-        # Check for onboard (hardware) platform
         if (platform_dir / "onboard").exists():
-            platforms.append(arch_name)
-
-        # Check for sim (simulation) platform
+            platforms.append(arch_dir.name)
         if (platform_dir / "sim").exists():
-            platforms.append(f"{arch_name}sim")
-
+            platforms.append(f"{arch_dir.name}sim")
     return platforms
 
 
 def discover_runtimes_for_arch(arch: str) -> list[str]:
-    """Discover available runtimes for a specific architecture.
-
-    Args:
-        arch: Architecture name (e.g., "a2a3", "a5")
-
-    Returns:
-        List of runtime names (e.g., ["host_build_graph", "aicpu_build_graph"])
-    """
+    """Scan src/{arch}/runtime/*/build_config.py for available runtimes."""
     runtime_dir = PROJECT_ROOT / "src" / arch / "runtime"
-
     if not runtime_dir.exists():
         return []
-
-    runtimes = []
-    for item in sorted(runtime_dir.iterdir()):
-        if item.is_dir() and (item / "build_config.py").exists():
-            runtimes.append(item.name)
-
-    return runtimes
-
-
-def pytest_addoption(parser):
-    """Add custom command-line options for pytest."""
-    parser.addoption(
-        "--platform",
-        action="store",
-        default=None,
-        help="Platform to test (e.g., a2a3sim, a5sim). If not specified, tests all platforms."
-    )
+    return [
+        item.name for item in sorted(runtime_dir.iterdir()) if item.is_dir() and (item / "build_config.py").exists()
+    ]
 
 
 @pytest.fixture
@@ -91,10 +70,7 @@ def default_test_platform(request):
 @pytest.fixture
 def test_arch(default_test_platform):
     """Extract architecture name from platform (e.g., 'a2a3sim' -> 'a2a3')."""
-    platform = default_test_platform
-    if platform.endswith("sim"):
-        return platform[:-3]
-    return platform
+    return arch_from_platform(default_test_platform)
 
 
 def pytest_generate_tests(metafunc):
@@ -116,28 +92,21 @@ def pytest_generate_tests(metafunc):
         # Build platform×runtime combinations
         test_params = []
         for platform in platforms:
-            # Extract architecture from platform name
-            arch = platform[:-3] if platform.endswith("sim") else platform
-
-            # Discover runtimes for this architecture
+            arch = arch_from_platform(platform)
             runtimes = discover_runtimes_for_arch(arch)
 
-            # Add all valid combinations
             for runtime in runtimes:
                 # Mark hardware platforms (non-sim) as requiring Ascend
                 marks = []
                 if not platform.endswith("sim"):
-                    marks.append(pytest.mark.skipif(
-                        not os.getenv("ASCEND_HOME_PATH"),
-                        reason=f"ASCEND_HOME_PATH not set; Ascend toolkit required for {platform}"
-                    ))
+                    marks.append(
+                        pytest.mark.skipif(
+                            not os.getenv("ASCEND_HOME_PATH"),
+                            reason=f"ASCEND_HOME_PATH not set; Ascend toolkit required for {platform}",
+                        )
+                    )
 
-                test_params.append(pytest.param(
-                    platform,
-                    runtime,
-                    marks=marks,
-                    id=f"{platform}-{runtime}"
-                ))
+                test_params.append(pytest.param(platform, runtime, marks=marks, id=f"{platform}-{runtime}"))
 
         # Apply parametrization
         metafunc.parametrize("platform,runtime_name", test_params)
@@ -154,23 +123,13 @@ def pytest_collection_modifyitems(session, config, items):
     if not platform_filter:
         platform_filter = "a2a3sim"
 
-    # Extract architecture from platform
-    arch = platform_filter[:-3] if platform_filter.endswith("sim") else platform_filter
-
-    # Get available runtimes for this architecture
+    arch = arch_from_platform(platform_filter)
     available_runtimes = discover_runtimes_for_arch(arch)
 
     for item in items:
-        # Skip aicpu_build_graph tests for architectures that don't have it
-        if "test_discovers_aicpu_build_graph" in item.nodeid:
-            if "aicpu_build_graph" not in available_runtimes:
-                item.add_marker(pytest.mark.skip(
-                    reason=f"aicpu_build_graph not available for {arch} architecture"
-                ))
-
         # Skip tensormap_and_ringbuffer tests for architectures that don't have it
         if "tensormap_and_ringbuffer" in item.nodeid:
             if "tensormap_and_ringbuffer" not in available_runtimes:
-                item.add_marker(pytest.mark.skip(
-                    reason=f"tensormap_and_ringbuffer not available for {arch} architecture"
-                ))
+                item.add_marker(
+                    pytest.mark.skip(reason=f"tensormap_and_ringbuffer not available for {arch} architecture")
+                )

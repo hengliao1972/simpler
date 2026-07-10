@@ -29,7 +29,6 @@ body:
       description: Which runtime variant is affected?
       options:
         - tensormap_and_ringbuffer
-        - aicpu_build_graph
         - host_build_graph
         - All / Unknown
     validations:
@@ -93,10 +92,8 @@ body:
         ```bash
         ./tools/benchmark_rounds.sh -p a2a3 -d 4 -n 10
         # Or run a specific example:
-        python examples/scripts/run_example.py \
-            -k tests/device_tests/a2a3/tensormap_and_ringbuffer/paged_attention/kernels \
-            -g tests/device_tests/a2a3/tensormap_and_ringbuffer/paged_attention/golden.py \
-            -p a2a3 -d 4 -n 10
+        python tests/st/a2a3/tensormap_and_ringbuffer/paged_attention/test_paged_attention.py \
+            -p a2a3 -d 4 --rounds 10 --skip-golden
         ```
       render: bash
     validations:

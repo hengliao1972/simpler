@@ -1,3 +1,14 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
 /**
  * Runtime Class - Task Dependency Runtime Management
  *
@@ -15,8 +26,8 @@
  * and lightweight scheduling use cases.
  */
 
-#ifndef RUNTIME_H
-#define RUNTIME_H
+#ifndef SRC_A5_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_RUNTIME_H_
+#define SRC_A5_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_RUNTIME_H_
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -24,10 +35,11 @@
 #include <string.h>  // for memset
 
 #include <atomic>
+#include <vector>
 
 #include "common/core_type.h"
-#include "common/perf_profiling.h"
 #include "common/platform_config.h"
+#include "tensor_info.h"
 
 // Logging macros using unified logging interface
 #include "common/unified_log.h"
@@ -45,19 +57,15 @@
 #endif
 
 #ifndef RUNTIME_MAX_FANOUT
-#define RUNTIME_MAX_FANOUT 512
+#define RUNTIME_MAX_FANOUT 128
 #endif
 
 #ifndef RUNTIME_MAX_WORKER
 #define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES_PER_THREAD
 #endif
 
-#ifndef RUNTIME_MAX_TENSOR_PAIRS
-#define RUNTIME_MAX_TENSOR_PAIRS 64
-#endif
-
 #ifndef RUNTIME_MAX_FUNC_ID
-#define RUNTIME_MAX_FUNC_ID 32
+#define RUNTIME_MAX_FUNC_ID 1024
 #endif
 
 // =============================================================================
@@ -73,9 +81,9 @@
  * Protocol State Machine:
  * 1. Initialization: AICPU sets aicpu_ready=1
  * 2. Acknowledgment: AICore sets aicore_done=core_id+1
- * 3. Task Dispatch: AICPU assigns task pointer and sets task_status=1
- * 4. Task Execution: AICore reads task, executes, sets task_status=0
- * 5. Task Completion: AICPU reads task_status=0, clears task=0
+ * 3. Task Dispatch: AICPU writes DATA_MAIN_BASE with the task_id after publishing Task*
+ * 4. Task Execution: AICore reads the task and executes
+ * 5. Task Completion: AICore writes FIN to COND; AICPU observes completion
  * 6. Shutdown: AICPU sets control=1, AICore exits
  *
  * Each AICore instance has its own handshake buffer to enable concurrent
@@ -89,29 +97,29 @@
  * The structure is cache-line aligned (64 bytes) to prevent false sharing
  * between cores and optimize cache coherency operations.
  *
+ * Profiling state lives outside this struct: enablement bits and per-core
+ * ring/reg addresses travel through `KernelArgs::enable_profiling_flag` +
+ * `KernelArgs::aicore_* per-core address arrays`, which the AICore kernel entry
+ * forwards into platform-owned per-core slots
+ * (`aicore/aicore_profiling_state.h`). Adding a profiling sub-feature does
+ * not require touching this struct anymore.
+ *
  * Field Access Patterns:
  * - aicpu_ready: Written by AICPU, read by AICore
  * - aicore_done: Written by AICore, read by AICPU
  * - task: Written by AICPU, read by AICore (0 = no task assigned)
- * - task_status: Written by both (AICPU=1 on dispatch, AICore=0 on completion)
- * - control: Written by AICPU, read by AICore (0 = continue, 1 = quit)
  * - core_type: Written by AICPU, read by AICore (CoreType::AIC or CoreType::AIV)
- * - perf_records_addr: Written by AICPU, read by AICore (performance records address)
- * - perf_buffer_status: Written by both (AICPU=1 on buffer full, AICore=0 on buffer empty)
- * - physical_core_id: Written by AICPU, read by AICore (physical core ID)
+ * - physical_core_id: Written by AICore (Phase 2), read by AICPU
+ * - aicpu_regs_ready / aicore_regs_ready: handshake sequence flags
  */
 struct Handshake {
-    volatile uint32_t aicpu_ready;          // AICPU ready signal: 0=not ready, 1=ready
-    volatile uint32_t aicore_done;          // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;                 // Task pointer: 0=no task, non-zero=Task* address
-    volatile int32_t task_status;           // Task execution status: 0=idle, 1=busy
-    volatile int32_t control;               // Control signal: 0=execute, 1=quit
-    volatile CoreType core_type;            // Core type: CoreType::AIC or CoreType::AIV
-    volatile uint64_t perf_records_addr;    // Performance records address
-    volatile uint32_t perf_buffer_status;   // 0 = not full, 1 = full
-    volatile uint32_t physical_core_id;     // Physical core ID
-    volatile uint32_t aicpu_regs_ready;    // AICPU register init done: 0=pending, 1=done
-    volatile uint32_t aicore_regs_ready;     // AICore ID reported: 0=pending, 1=done
+    volatile uint32_t aicpu_ready;        // AICPU ready signal: 0=not ready, 1=ready
+    volatile uint32_t aicore_done;        // AICore ready signal: 0=not ready, core_id+1=ready
+    volatile uint64_t task;               // Task pointer: 0=no task, non-zero=Task* address
+    volatile CoreType core_type;          // Core type: CoreType::AIC or CoreType::AIV
+    volatile uint32_t physical_core_id;   // Physical core ID
+    volatile uint32_t aicpu_regs_ready;   // AICPU register init done: 0=pending, 1=done
+    volatile uint32_t aicore_regs_ready;  // AICore ID reported: 0=pending, 1=done
 } __attribute__((aligned(64)));
 
 /**
@@ -119,8 +127,8 @@ struct Handshake {
  * Used for copy-back during finalize.
  */
 struct TensorPair {
-    void* host_ptr;
-    void* dev_ptr;
+    void *host_ptr;
+    void *dev_ptr;
     size_t size;
 };
 
@@ -129,12 +137,36 @@ struct TensorPair {
  * Allows runtime to use pluggable device memory backends.
  */
 struct HostApi {
-    void* (*device_malloc)(size_t size);
-    void (*device_free)(void* dev_ptr);
-    int (*copy_to_device)(void* dev_ptr, const void* host_ptr, size_t size);
-    int (*copy_from_device)(void* host_ptr, const void* dev_ptr, size_t size);
-    uint64_t (*upload_kernel_binary)(int func_id, const uint8_t* bin_data, size_t bin_size);
-    void (*remove_kernel_binary)(int func_id);
+    void *(*device_malloc)(size_t size);
+    void (*device_free)(void *dev_ptr);
+    int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
+    int (*copy_from_device)(void *host_ptr, const void *dev_ptr, size_t size);
+    // Device-side memset (zero-init pure OUTPUT buffers in lieu of an H2D
+    // copy-in). Unused by host_build_graph; present only so the platform
+    // layer can populate the same HostApi shape regardless of runtime variant.
+    int (*device_memset)(void *dev_ptr, int value, size_t size);
+    // PTO2 static-arena hooks. The host_build_graph runtime does not currently
+    // use these — the fields exist only so the platform layer's
+    // pto_runtime_c_api.cpp can populate the same HostApi struct regardless of
+    // which runtime variant it is built against. Unset for this variant; do
+    // not call.
+    int (*setup_static_arena)(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
+    void *(*acquire_pooled_gm_heap)();
+    void *(*acquire_pooled_gm_sm)();
+    void *(*acquire_pooled_runtime_arena)();
+    // Single-shot upload of the entire ChipCallable buffer. `callable` is a
+    // `const ChipCallable *` (declared void* to avoid pulling task_interface
+    // headers into runtime.h). DeviceRunner walks child_offsets_ to compute
+    // total byte size, allocates device GM once, fixes up each child's
+    // resolved_addr_ in an internal host scratch (onboard: device addr; sim:
+    // dlopen function pointer), H2D's once, and returns the device-side
+    // address of the ChipCallable header. Pool-managed: identical buffer
+    // contents (FNV-1a 64-bit) hit the dedup cache; all chip buffers are
+    // bulk-freed in DeviceRunner::finalize(). Returns 0 on error or when
+    // child_count() == 0. Caller computes child addrs as
+    //     chip_dev + offsetof(ChipCallable, storage_) + child_offset(i)
+    // and stores them via runtime->set_function_bin_addr(fid, child_dev).
+    uint64_t (*upload_chip_callable_buffer)(const void *callable);
 };
 
 /**
@@ -187,27 +219,42 @@ public:
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
     int worker_count;                       // Number of active workers
 
-    // Execution parameters for AICPU scheduling
-    int sche_cpu_num;  // Number of AICPU threads for scheduling
-    int orch_thread_num;  // Number of orchestrator threads (unused, for API compatibility)
-
-    // Profiling support
-    bool enable_profiling;                  // Enable profiling flag
-    uint64_t perf_data_base;                // Performance data shared memory base address (device-side)
+    // Total AICPU threads launched on this run. host_build_graph has no
+    // orchestrator/scheduler split — every thread dispatches tasks in
+    // round-robin across the assigned cores. See AicpuExecutor::init.
+    int aicpu_thread_num;
 
     // Task storage
     Task tasks[RUNTIME_MAX_TASKS];  // Fixed-size task array
 
+    // Filter-style affinity gate input (a5 onboard). Placed AFTER `tasks`
+    // because AICore reads runtime->tasks[] by offset (see
+    // src/a5/runtime/host_build_graph/aicore/aicore_executor.cpp); inserting
+    // fields before `tasks` shifts that offset and silently produces NaN
+    // outputs in any test that exercises the AICore task-execute path.
+    // Host fills before launch from device-side OCCUPY + DSMI CPU_TOPO via
+    // pto::a5::compute_allowed_cpus. The on-device gate keeps threads whose
+    // sched_getcpu() lands on one of these cpu_ids; exec_idx = position in
+    // this array drives sched/orch role assignment. Indices 0..count-2 are
+    // scheduler slots, index count-1 is the orchestrator slot. Sized to
+    // PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH for headroom — current
+    // policy is 4 sched + 1 orch = 5 active.
+    int32_t aicpu_allowed_cpus[16];
+    int32_t aicpu_allowed_cpu_count;
+    // Actual AICPU thread launch count for this run. Set by the host
+    // topology probe to popcount(OCCUPY) so CANN spreads threads across
+    // every user-schedulable cpu_id (one per cpu, no over-subscription on
+    // the same physical cpu — over-subscription deadlocks the production
+    // AICPU kernel on SKUs with fewer user cpus than the compile-time
+    // PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH bound).
+    int32_t aicpu_launch_count;
+
 private:
-    int next_task_id;               // Next available task ID
+    int next_task_id;  // Next available task ID
 
     // Initial ready tasks (computed once, read-only after)
     int initial_ready_tasks[RUNTIME_MAX_TASKS];
     int initial_ready_count;
-
-  // Tensor pairs for host-device memory tracking
-  TensorPair tensor_pairs[RUNTIME_MAX_TENSOR_PAIRS];
-  int tensor_pair_count;
 
     // Function address mapping (for API compatibility with rt2)
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
@@ -215,6 +262,17 @@ private:
     // Kernel binary tracking for cleanup
     int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];
     int registered_kernel_count_;
+
+    // Tensor info metadata for tensor dump
+    void *tensor_info_storage_;
+    uint64_t tensor_info_storage_bytes_;
+    uint32_t tensor_info_offsets_[RUNTIME_MAX_TASKS];
+    uint16_t tensor_info_counts_[RUNTIME_MAX_TASKS];
+
+    // Device allocation ranges used to recover tensor buffer addresses from task.args[]
+    void *tensor_allocation_storage_;
+    uint64_t tensor_allocation_storage_bytes_;
+    uint32_t tensor_allocation_count_;
 
 public:
     /**
@@ -292,50 +350,76 @@ public:
     void print_runtime() const;
 
     // =========================================================================
-    // Tensor Pair Management
+    // Tensor Info Metadata
     // =========================================================================
 
-    /**
-     * Record a host-device tensor pair for copy-back during finalize.
-     *
-     * @param host_ptr  Host memory pointer (destination for copy-back)
-     * @param dev_ptr   Device memory pointer (source for copy-back)
-     * @param size     Size of tensor in bytes
-     */
-    void record_tensor_pair(void* host_ptr, void* dev_ptr, size_t size);
+    void set_tensor_info_storage(void *ptr, uint64_t bytes) {
+        tensor_info_storage_ = ptr;
+        tensor_info_storage_bytes_ = bytes;
+    }
 
-    /**
-     * Get pointer to tensor pairs array.
-     *
-     * @return Pointer to tensor pairs array
-     */
-    TensorPair* get_tensor_pairs();
+    void clear_tensor_info_storage() {
+        tensor_info_storage_ = nullptr;
+        tensor_info_storage_bytes_ = 0;
+    }
 
-    /**
-     * Get number of recorded tensor pairs.
-     *
-     * @return Number of tensor pairs
-     */
-    int get_tensor_pair_count() const;
+    void set_tensor_info_range(int task_id, uint32_t offset, uint16_t count) {
+        if (task_id < 0 || task_id >= RUNTIME_MAX_TASKS) return;
+        tensor_info_offsets_[task_id] = offset;
+        tensor_info_counts_[task_id] = count;
+    }
 
-    /**
-     * Clear all recorded tensor pairs.
-     */
-    void clear_tensor_pairs();
+    const TensorInfo *get_tensor_info(int task_id, int *count) const {
+        if (count != nullptr) {
+            *count = 0;
+        }
+        if (task_id < 0 || task_id >= RUNTIME_MAX_TASKS || tensor_info_storage_ == nullptr) {
+            return nullptr;
+        }
+        uint16_t tensor_info_count = tensor_info_counts_[task_id];
+        if (tensor_info_count == 0) {
+            return nullptr;
+        }
+        if (count != nullptr) {
+            *count = static_cast<int>(tensor_info_count);
+        }
+        const TensorInfo *base = reinterpret_cast<const TensorInfo *>(tensor_info_storage_);
+        return base + tensor_info_offsets_[task_id];
+    }
 
-    // =========================================================================
-    // Performance Profiling
-    // =========================================================================
+    void *get_tensor_info_storage() const { return tensor_info_storage_; }
 
-    /**
-     * Fill fanout information for performance records
-     *
-     * Extracts task dependency data from the task graph and populates
-     * fanout arrays in performance records.
-     *
-     * @param perf_buf Performance buffer containing records to complete
-     */
-    void complete_perf_records(PerfBuffer* perf_buf);
+    uint64_t get_tensor_info_storage_bytes() const { return tensor_info_storage_bytes_; }
+
+    void set_tensor_allocation_storage(void *ptr, uint32_t count, uint64_t bytes) {
+        tensor_allocation_storage_ = ptr;
+        tensor_allocation_count_ = count;
+        tensor_allocation_storage_bytes_ = bytes;
+    }
+
+    void clear_tensor_allocation_storage() {
+        tensor_allocation_storage_ = nullptr;
+        tensor_allocation_count_ = 0;
+        tensor_allocation_storage_bytes_ = 0;
+    }
+
+    bool is_tensor_buffer_addr(uint64_t addr) const {
+        if (tensor_allocation_storage_ == nullptr || tensor_allocation_count_ == 0) {
+            return false;
+        }
+        const TensorAllocationInfo *allocations =
+            reinterpret_cast<const TensorAllocationInfo *>(tensor_allocation_storage_);
+        for (uint32_t i = 0; i < tensor_allocation_count_; i++) {
+            if (allocations[i].contains(addr)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void *get_tensor_allocation_storage() const { return tensor_allocation_storage_; }
+
+    uint64_t get_tensor_allocation_storage_bytes() const { return tensor_allocation_storage_bytes_; }
 
     // =========================================================================
     // Device Orchestration (stub for API compatibility)
@@ -345,7 +429,7 @@ public:
      * Set PTO2 shared memory pointer (stub for host_build_graph).
      * This is a no-op for host orchestration; only used by rt2.
      */
-    void set_pto2_gm_sm_ptr(void*) { /* no-op */ }
+    void set_gm_sm_ptr(void *) { /* no-op */ }
 
     /**
      * Get function binary address by func_id.
@@ -360,13 +444,16 @@ public:
      * Set function binary address for a func_id.
      * Called by platform layer after kernel registration.
      */
-    void set_function_bin_addr(int func_id, uint64_t addr) {
-        if (func_id >= 0 && func_id < RUNTIME_MAX_FUNC_ID) {
-            func_id_to_addr_[func_id] = addr;
-            if (addr != 0 && registered_kernel_count_ < RUNTIME_MAX_FUNC_ID) {
-                registered_kernel_func_ids_[registered_kernel_count_++] = func_id;
-            }
-        }
+    void set_function_bin_addr(int func_id, uint64_t addr);
+
+    /**
+     * Replay a previously-uploaded kernel address onto a fresh Runtime
+     * without recording it in registered_kernel_func_ids_. See a2a3 hbg
+     * runtime.h for the full contract.
+     */
+    void replay_function_bin_addr(int func_id, uint64_t addr) {
+        if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return;
+        func_id_to_addr_[func_id] = addr;
     }
 
     int get_registered_kernel_count() const { return registered_kernel_count_; }
@@ -385,6 +472,56 @@ public:
     // Host API function pointers for device memory operations
     // NOTE: Placed at end of class to avoid affecting device memory layout
     HostApi host_api;
+
+    // Device orchestration SO metadata (see a2a3 host_build_graph runtime.h).
+    uint64_t dev_orch_so_addr_{0};
+    uint64_t dev_orch_so_size_{0};
+    // Per-callable_id dispatch. hbg orch runs on host, so AICPU never reads
+    // `active_callable_id_`; the field exists for parity with the
+    // shared platform layer (DeviceRunner stamps it on every run).
+    int32_t active_callable_id_{-1};
+    bool register_new_callable_id_{false};
+
+    // Device-orchestration entry/config symbol names (trb path). Always
+    // empty on this hbg variant — included for API parity so the shared
+    // platform layer can call set_device_orch_func_name unconditionally.
+    char device_orch_func_name_[64]{};
+    char device_orch_config_name_[64]{};
+
+    void set_device_orch_func_name(const char *name) {
+        device_orch_func_name_[0] = '\0';
+        if (name) {
+            strncpy(device_orch_func_name_, name, sizeof(device_orch_func_name_) - 1);
+            device_orch_func_name_[sizeof(device_orch_func_name_) - 1] = '\0';
+        }
+    }
+    const char *get_device_orch_func_name() const { return device_orch_func_name_; }
+    void set_device_orch_config_name(const char *name) {
+        device_orch_config_name_[0] = '\0';
+        if (name) {
+            strncpy(device_orch_config_name_, name, sizeof(device_orch_config_name_) - 1);
+            device_orch_config_name_[sizeof(device_orch_config_name_) - 1] = '\0';
+        }
+    }
+    const char *get_device_orch_config_name() const { return device_orch_config_name_; }
+
+    void set_dev_orch_so(uint64_t dev_addr, uint64_t size) {
+        dev_orch_so_addr_ = dev_addr;
+        dev_orch_so_size_ = size;
+    }
+    void set_active_callable_id(int32_t callable_id, bool is_new) {
+        active_callable_id_ = callable_id;
+        register_new_callable_id_ = is_new;
+    }
+    int32_t get_active_callable_id() const { return active_callable_id_; }
+    bool register_new_callable_id() const { return register_new_callable_id_; }
+
+    // Host-side tensor ledger for D2H copy-back at finalize. Populated by
+    // runtime_maker.cpp from orch_args at bind time; iterated in
+    // validate_runtime_impl. Not read by AICPU/AICore — the device-side
+    // Runtime image carries the std::vector control block as harmless
+    // garbage, identical to host_api above. No fixed cap.
+    std::vector<TensorPair> tensor_pairs_;
 };
 
-#endif  // RUNTIME_H
+#endif  // SRC_A5_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_RUNTIME_H_

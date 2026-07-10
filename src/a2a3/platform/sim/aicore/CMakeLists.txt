@@ -1,3 +1,12 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+#
 # Build AICore runtime for a2a3sim (Simulation)
 #
 # This builds the AICore executor as a host-compatible shared library (.so)
@@ -13,6 +22,9 @@ project(aicore_sim LANGUAGES CXX)
 set(CMAKE_CUSTOM_INCLUDE_DIRS "")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/include")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/log/include")
 
 if(DEFINED CUSTOM_INCLUDE_DIRS)
     foreach(INC_DIR ${CUSTOM_INCLUDE_DIRS})
@@ -29,14 +41,9 @@ set(AICORE_SOURCES "")
 file(GLOB LOCAL_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 list(APPEND AICORE_SOURCES ${LOCAL_SOURCES})
 
-# Add host_log.cpp for HostLogger support (required by runtime.cpp)
-list(APPEND AICORE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/host_log.cpp")
-# Add unified_log_host.cpp for unified logging support (required by runtime.cpp)
-list(APPEND AICORE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/unified_log_host.cpp")
-
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})
-        file(GLOB DIR_SOURCES "${SRC_DIR}/*.cpp" "${SRC_DIR}/*.c")
+        file(GLOB_RECURSE DIR_SOURCES "${SRC_DIR}/*.cpp" "${SRC_DIR}/*.c")
         list(APPEND AICORE_SOURCES ${DIR_SOURCES})
     endforeach()
 else()
@@ -55,6 +62,7 @@ target_compile_options(aicore_kernel
         -fPIC
         -O3
         -g
+        $<$<CXX_COMPILER_ID:GNU>:-fno-gnu-unique>
 )
 
 # Define __CPU_SIM for CPU simulation backend
@@ -67,9 +75,23 @@ target_include_directories(aicore_kernel
         ${CMAKE_CUSTOM_INCLUDE_DIRS}
 )
 
+
+# Allow undefined HostLogger / unified_log_* symbols — resolved at runtime
+# via libsimpler_log.so loaded with RTLD_GLOBAL by ChipWorker.
+if(APPLE)
+    target_link_options(aicore_kernel PRIVATE -undefined dynamic_lookup)
+endif()
 set_target_properties(aicore_kernel PROPERTIES
     OUTPUT_NAME "aicore_kernel"
     # Force .so suffix on all platforms (macOS defaults to .dylib)
     # This matches the hardcoded paths in Python/C++ code
     SUFFIX ".so"
 )
+
+# Apply compiler sanitizers to this host-compiled target. No-op unless
+# SIMPLER_SANITIZERS is set at configure time, which runtime_compiler only
+# passes for host toolchains (sim + onboard host). See cmake/sanitizers.cmake.
+if(SIMPLER_SANITIZERS)
+    include("${SIMPLER_CMAKE_DIR}/sanitizers.cmake")
+    simpler_apply_sanitizers(aicore_kernel)
+endif()

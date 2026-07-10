@@ -1,3 +1,14 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
 /**
  * @file inner_kernel.h
  * @brief Platform-specific AICore definitions for simulation (a2a3sim)
@@ -12,6 +23,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <dlfcn.h>
 
 #include "common/platform_config.h"
 
@@ -26,15 +38,28 @@
 //   - with CACHELINE_OUT: write-back/flush (write to memory) -> release semantics
 // On aarch64, acquire-only fences do NOT prevent store-store reordering across the
 // barrier, so using acquire for the flush direction causes a race: the AICPU can
-// observe the COND register FIN signal before perf_buf->count is visible.
+// observe the COND register FIN signal before l2_swimlane_buf->count is visible.
 // Using seq_cst (dmb ish / full barrier) covers both directions safely.
 // Use variadic macro to support both 2-arg and 3-arg calls.
 #define dcci(...) std::atomic_thread_fence(std::memory_order_seq_cst)
+
+// dsb / mem_dsb_t — CANN provides these on real AICore; l2_swimlane_collector uses them after dcci flush.
+// Simulation: full fence (same strength as dcci above) so AICPU ordering matches hardware intent.
+typedef int mem_dsb_t;
+#define dsb(_kind)                                           \
+    do {                                                     \
+        (void)(_kind);                                       \
+        std::atomic_thread_fence(std::memory_order_seq_cst); \
+    } while (0)
 
 // Cache coherency constants (no-op in simulation)
 #define ENTIRE_DATA_CACHE 0
 #define SINGLE_CACHE_LINE 0
 #define CACHELINE_OUT 0
+
+// pipe_barrier - memory barrier in simulation (hardware pipeline synchronization)
+#define PIPE_ALL 0
+#define pipe_barrier(pipe) __sync_synchronize()
 
 // SPIN_WAIT_HINT - CPU pause hint + OS yield for idle polling loops in simulation.
 // In simulation, all AICore/AICPU threads share a small number of host CPU cores.
@@ -44,29 +69,49 @@
 #include <sched.h>
 
 #if defined(__aarch64__)
-#define SPIN_WAIT_HINT() do { __asm__ volatile("yield" ::: "memory"); sched_yield(); } while(0)
+#define SPIN_WAIT_HINT()                        \
+    do {                                        \
+        __asm__ volatile("yield" ::: "memory"); \
+        sched_yield();                          \
+    } while (0)
 #elif defined(__x86_64__)
-#define SPIN_WAIT_HINT() do { __builtin_ia32_pause(); sched_yield(); } while(0)
+#define SPIN_WAIT_HINT()        \
+    do {                        \
+        __builtin_ia32_pause(); \
+        sched_yield();          \
+    } while (0)
 #else
 #define SPIN_WAIT_HINT() sched_yield()
 #endif
 
-// STORE_RELEASE_FENCE - store-store barrier to prevent reordering of data writes
-// (physical_core_id, core_type) past the signal write (aicore_done) in handshake.
-// Without this fence, aarch64 can reorder stores to different addresses, causing
-// AICPU to read stale physical_core_id after observing aicore_done != 0.
+// OUT_OF_ORDER_STORE_BARRIER - store-store barrier preventing store reordering.
+// Ensures stores preceding the barrier are visible before stores following it.
+// Used in the AICore-AICPU handshake to ensure data fields (core_type) are
+// visible before the signal field (aicore_done), and to flush kernel outputs
+// before writing the FIN signal register.
 #if defined(__aarch64__)
-#define STORE_RELEASE_FENCE() __asm__ volatile("dmb ishst" ::: "memory")
+#define OUT_OF_ORDER_STORE_BARRIER() __asm__ volatile("dmb ishst" ::: "memory")
 #elif defined(__x86_64__)
-#define STORE_RELEASE_FENCE() __asm__ volatile("" ::: "memory")
+#define OUT_OF_ORDER_STORE_BARRIER() __asm__ volatile("" ::: "memory")
 #else
-#define STORE_RELEASE_FENCE() std::atomic_thread_fence(std::memory_order_release)
+#define OUT_OF_ORDER_STORE_BARRIER() std::atomic_thread_fence(std::memory_order_release)
 #endif
 
-// FULL_MEMORY_BARRIER - full memory barrier preventing all load/store reordering.
-// Used after kernel execution to ensure all writes are visible before signalling
-// completion. Equivalent to dmb ish (aarch64) / mfence (x86).
-#define FULL_MEMORY_BARRIER() __sync_synchronize()
+// OUT_OF_ORDER_LOAD_BARRIER - load-acquire barrier preventing load reordering.
+// Ensures loads following the barrier are not reordered before the load
+// immediately preceding it. Used after reading a signal register to ensure
+// subsequent payload reads observe AICPU's writes.
+#if defined(__aarch64__)
+#define OUT_OF_ORDER_LOAD_BARRIER() __asm__ volatile("dmb ishld" ::: "memory")
+#elif defined(__x86_64__)
+#define OUT_OF_ORDER_LOAD_BARRIER() __asm__ volatile("" ::: "memory")
+#else
+#define OUT_OF_ORDER_LOAD_BARRIER() std::atomic_thread_fence(std::memory_order_acquire)
+#endif
+
+// OUT_OF_ORDER_FULL_BARRIER - full memory barrier preventing all load/store reordering.
+// Equivalent to dmb ish (aarch64) / mfence (x86).
+#define OUT_OF_ORDER_FULL_BARRIER() __sync_synchronize()
 
 // =============================================================================
 // System Counter Simulation
@@ -79,17 +124,14 @@
  */
 inline uint64_t get_sys_cnt_aicore() {
     auto now = std::chrono::high_resolution_clock::now();
-    uint64_t elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        now.time_since_epoch()
-    ).count();
+    uint64_t elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
 
     // Convert nanoseconds to counter ticks
     constexpr uint64_t kNsPerSec = std::nano::den;
     uint64_t seconds = elapsed_ns / kNsPerSec;
     uint64_t remaining_ns = elapsed_ns % kNsPerSec;
 
-    uint64_t ticks = seconds * PLATFORM_PROF_SYS_CNT_FREQ +
-                     (remaining_ns * PLATFORM_PROF_SYS_CNT_FREQ) / kNsPerSec;
+    uint64_t ticks = seconds * PLATFORM_PROF_SYS_CNT_FREQ + (remaining_ns * PLATFORM_PROF_SYS_CNT_FREQ) / kNsPerSec;
 
     return ticks;
 }
@@ -99,17 +141,13 @@ inline uint64_t get_sys_cnt_aicore() {
 // =============================================================================
 
 /**
- * Per-thread simulated register base address.
- * Set by the kernel wrapper before calling aicore_execute().
- * Points to a SIM_REG_BLOCK_SIZE-byte block allocated by DeviceRunner.
+ * Per-thread simulated register base address and physical core ID.
+ * Stored in pthread TLS (not C++ thread_local) to avoid glibc TLSDESC
+ * issues when this SO is loaded with RTLD_LOCAL on aarch64.
+ * Set by aicore_execute_wrapper, read by read_reg/write_reg.
  */
-extern thread_local volatile uint8_t* g_sim_reg_base;
-
-/**
- * Per-thread simulated physical core ID.
- * Set by the kernel wrapper before calling aicore_execute().
- */
-extern thread_local uint32_t g_sim_physical_core_id;
+volatile uint8_t *sim_get_reg_base();
+uint32_t sim_get_physical_core_id();
 
 /**
  * Read an AICore register from simulated register memory
@@ -119,9 +157,20 @@ extern thread_local uint32_t g_sim_physical_core_id;
  */
 inline uint64_t read_reg(RegId reg) {
     uint32_t offset = reg_offset(reg);
-    FULL_MEMORY_BARRIER();
-    return static_cast<uint64_t>(
-        *reinterpret_cast<volatile uint32_t*>(g_sim_reg_base + offset));
+    uint64_t val = static_cast<uint64_t>(*reinterpret_cast<volatile uint32_t *>(sim_get_reg_base() + offset));
+    OUT_OF_ORDER_LOAD_BARRIER();
+    return val;
+}
+
+/**
+ * Read the high 32 bits of DATA_MAIN_BASE (speculative-dispatch doorbell).
+ * The high word lives one 32-bit slot above the dispatch token.
+ */
+inline uint32_t read_dmb_high32() {
+    uint32_t offset = reg_offset(RegId::DATA_MAIN_BASE);
+    uint32_t hi = *reinterpret_cast<volatile uint32_t *>(sim_get_reg_base() + offset + 4);
+    OUT_OF_ORDER_LOAD_BARRIER();
+    return hi;
 }
 
 /**
@@ -132,9 +181,8 @@ inline uint64_t read_reg(RegId reg) {
  */
 inline void write_reg(RegId reg, uint64_t value) {
     uint32_t offset = reg_offset(reg);
-    *reinterpret_cast<volatile uint32_t*>(g_sim_reg_base + offset) =
-        static_cast<uint32_t>(value);
-    FULL_MEMORY_BARRIER();
+    *reinterpret_cast<volatile uint32_t *>(sim_get_reg_base() + offset) = static_cast<uint32_t>(value);
+    OUT_OF_ORDER_STORE_BARRIER();
 }
 
 /**
@@ -142,8 +190,6 @@ inline void write_reg(RegId reg, uint64_t value) {
  *
  * @return Physical core ID for the current simulated core
  */
-inline uint32_t get_physical_core_id() {
-    return g_sim_physical_core_id;
-}
+inline uint32_t get_physical_core_id() { return sim_get_physical_core_id(); }
 
 #endif  // PLATFORM_A2A3SIM_AICORE_INNER_KERNEL_H_
