@@ -11,12 +11,22 @@
 
 #pragma once
 
-#include <stdio.h>
-#include <stdlib.h>
+namespace {
 
-// Assertion macros (always_assert / debug_assert), AssertionError, and the
-// MAYBE_UNINITIALIZED diagnostics live in the shared header so the unified
-// Tensor (src/common/task_interface/tensor.h) can use them without depending
-// on this runtime-specific header. assert_impl / get_stacktrace are defined in
-// runtime/assert/assert_compat.cpp for runtime targets.
-#include "assert_compat.h"
+PTO_DEVICE_FUNC void dist_core_reset(__gm__ DistCore &self, CoreType r, int32_t block, int32_t lane_id) {
+    self.role = r;
+    self.block_id = block;
+    self.lane = lane_id;
+    self.sub_block_id = (lane_id == LANE_AIV1) ? 1 : 0;
+    self.local_index = 0;
+    self.heap_next = 0;
+    dist_tensor_map_reset(self.map);
+    self.occupied_count = 0;
+    self.owned_total = 0;
+    for (int32_t i = 0; i < kPrivateSlots; i++) {
+        self.slots[i].occupied = false;
+        self.slots[i].built = false;
+    }
+}
+
+}  // namespace

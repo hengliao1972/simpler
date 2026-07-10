@@ -11,12 +11,20 @@
 
 #pragma once
 
-#include <stdio.h>
-#include <stdlib.h>
+#if defined(__CPU_SIM)
+#define DIST_SIM_HOST_CLOCK 1
+#else
+#define DIST_SIM_HOST_CLOCK 0
+#endif
 
-// Assertion macros (always_assert / debug_assert), AssertionError, and the
-// MAYBE_UNINITIALIZED diagnostics live in the shared header so the unified
-// Tensor (src/common/task_interface/tensor.h) can use them without depending
-// on this runtime-specific header. assert_impl / get_stacktrace are defined in
-// runtime/assert/assert_compat.cpp for runtime targets.
-#include "assert_compat.h"
+#if defined(PTO2_PROFILING) && PTO2_PROFILING && defined(__CPU_SIM)
+#define DIST_TRACE_ENABLED 1
+#else
+#define DIST_TRACE_ENABLED 0
+#endif
+
+#if defined(__CCE_AICORE__)
+#define DIST_API_ATTR __attribute__((weak))
+#else
+#define DIST_API_ATTR
+#endif

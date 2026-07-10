@@ -36,42 +36,7 @@ enum PTO2RuntimeMode {
     PTO2_MODE_GRAPH_ONLY = 2  // Build graph only, no execution
 };
 
-/**
- * Function-pointer ops table for runtime operations. CPU-sim AICore
- * orchestration uses this ABI to call the distributed ops table inside the
- * AICore image; CCEC wrappers call dist_engine_api.h directly.
- */
 typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
-
-struct PTO2RuntimeOps {
-    TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const L0TaskArgs &args);
-    void (*scope_begin)(PTO2Runtime *rt);
-    void (*scope_end)(PTO2Runtime *rt);
-    void (*orchestration_done)(PTO2Runtime *rt);
-    bool (*is_fatal)(PTO2Runtime *rt);
-    void (*report_fatal)(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...);
-
-    // Logging (populated by runtime, called by orchestration)
-    void (*log_error)(const char *func, const char *fmt, ...);
-    void (*log_warn)(const char *func, const char *fmt, ...);
-    void (*log_debug)(const char *func, const char *fmt, ...);
-    // INFO with explicit verbosity tier (v ∈ [0,9]; gating done inside).
-    void (*log_info_v)(const char *func, int v, const char *fmt, ...);
-
-    // Cross-layer data access (orchestration reads/writes tensor values via runtime)
-    // Placed after logging to avoid shifting hot-path field offsets.
-    uint64_t (*get_tensor_data)(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
-    void (*set_tensor_data)(
-        PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
-    );
-    TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const L0TaskArgs &args);
-    TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const L0TaskArgs &args);
-
-    // Stash the call-site captured by PTO2ScopeGuard into the [ScopeStats]
-    // collector. Always present to keep ops-table layout stable across
-    // PTO2_PROFILING settings; set to nullptr at PTO2_PROFILING=0.
-    void (*scope_set_site)(const char *file, int line);
-};
 
 /**
  * Layout descriptor for the prebuilt dist-engine runtime arena. Holds the
@@ -94,8 +59,6 @@ struct PTO2RuntimeArenaLayout {
  * and AICore replay.
  */
 struct PTO2Runtime {
-    // Ops table (first field — used by orchestration .so via function pointers)
-    const PTO2RuntimeOps *ops;
     PTO2ScopeMode pending_scope_mode;
 
     // Components

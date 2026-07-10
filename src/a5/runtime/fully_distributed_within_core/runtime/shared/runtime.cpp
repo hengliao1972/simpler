@@ -37,7 +37,6 @@ Runtime::Runtime() {
     aicpu_launch_count = 0;
 
     // fully_distributed_within_core handoff fields
-    dist.core_main_fn = 0;
     dist.num_workers = 0;
     dist.orch_args.reset();
     dist.ccec_orch_tensor_count = 0;

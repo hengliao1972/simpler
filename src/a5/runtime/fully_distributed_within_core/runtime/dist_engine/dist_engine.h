@@ -14,17 +14,13 @@
  *
  * The distributed runtime moves orchestration + scheduling + execution onto the
  * AI cores in SPMD fashion (see docs/fully_distributed_within_core.md). The
- * engine itself (per-core TensorMap, claim race over global cursors, private
- * task ring, run-ahead loop, completion-flag ring, deterministic GM output
- * heap) lives in dist_engine.cpp and is compiled into the AICPU .so so it can
- * reuse the full submit-side type set (TensorMap, MixedKernels, L0TaskArgs,
- * kernel-address resolution).
+ * per-core submit engine is linked into the AICore image; the AICPU side only
+ * initializes the shared DistGlobal state before waking workers.
  *
  * The AICPU "stub" thread does arena setup, then calls dist_engine_register()
- * once and publishes the returned per-core entry pointer via
- * Runtime::dist.core_main_fn. Each AICore worker thread invokes that entry,
- * which directly calls the orchestration entry linked into the AICore image and
- * executes the tasks it wins.
+ * once before waking AICore workers. Each AICore worker invokes the
+ * dist_core_main entry linked into its own image, directly calls the
+ * orchestration entry, and executes the tasks it wins.
  */
 
 #pragma once
@@ -53,15 +49,9 @@ inline constexpr size_t dist_engine_global_state_align() { return kDistEngineGlo
  * replay. Must be called once on the AICPU setup thread before waking workers
  * through their per-core handshake flags.
  *
- * CPU-sim AICore workers bind rt->ops to their local distributed ops table
- * after entering dist_core_main(); CCEC wrappers call the dist_engine_api.h
- * symbols directly and do not use rt->ops.
- *
- * Returns the address of the per-core entry function
- * (signature: void(void *runtime, int core_idx, int core_type)) to store into
- * Runtime::dist.core_main_fn. Returned as void* to keep this header light.
+ * AICore workers call dist_engine_api.h symbols directly on sim and onboard.
  */
-void *dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_workers, Runtime *runtime);
+void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_workers, Runtime *runtime);
 
 /**
  * Dump a per-core execution swimlane as a Chrome Trace Event JSON.
