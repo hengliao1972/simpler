@@ -10,15 +10,6 @@
  */
 #include "common.h"
 
-// This TU is host-side: it defines the orchestration SO's runtime-binding
-// hook (framework_bind_runtime), the addr2line stack tracer, and the throwing
-// assert_impl / AssertionError constructor. Its body relies on <dlfcn.h>,
-// <execinfo.h>, <cxxabi.h>, C++ exceptions, popen(), and other POSIX/glibc
-// facilities that CCEC does not carry. The AICore build path picks up this
-// file only via the runtime's build_config.py source glob for "orchestration/",
-// then complains loudly. Nothing in dist_engine.cpp actually calls these
-// symbols from device code, so simply compile the entire body out under CCEC.
-// See sibling runtimes (tensormap_and_ringbuffer) for the mirror gate.
 #if !defined(__CCE_AICORE__)
 
 #ifdef __linux__
@@ -28,41 +19,17 @@
 #include <unistd.h>
 
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <vector>
 #endif
 
-struct PTO2Runtime;
-
 // Unified-log error sink. Forward-declared here rather than pulled via
 // common/unified_log.h: that header lives under common/log/include, which is
-// not on the orchestration .so build's include path. The symbol resolves at
-// link time for the runtime targets, and at dlopen time for the orchestration
-// .so (against the executor's unified_log_device), so onboard diagnostics still
-// reach the CANN device log.
+// not on every runtime target's include path. The symbol resolves at link time
+// for runtime targets and at dlopen time for the orchestration .so.
 extern "C" void unified_log_error(const char *func, const char *fmt, ...);
 
-namespace {
-// Plain global (not thread_local) to avoid glibc TLSDESC stale-resolution
-// crash (BZ #32412) when the orchestration SO is dlclose'd/re-dlopen'd
-// between execution rounds.  All orchestrator threads bind the same rt
-// value, so per-thread storage is unnecessary.
-PTO2Runtime *g_current_runtime = nullptr;
-}  // namespace
-
-extern "C" __attribute__((visibility("default"))) void framework_bind_runtime(PTO2Runtime *rt) {
-    g_current_runtime = rt;
-}
-
-// Keep current_runtime local to this .so so orchestration helpers do not
-// accidentally bind to the AICPU binary's same-named symbol.
-extern "C" __attribute__((visibility("hidden"))) PTO2Runtime *framework_current_runtime() { return g_current_runtime; }
-
-/**
- * Use addr2line to convert an address to file:line information.
- * Uses the -i flag to expand inlines; returns the first line (innermost actual code location).
- * If inlining is present, also returns the outer call chain via inline_chain.
- */
 #ifdef __linux__
 static std::string addr_to_line(const char *executable, void *addr, std::string *inline_chain = nullptr) {
     char cmd[512];
@@ -71,7 +38,7 @@ static std::string addr_to_line(const char *executable, void *addr, std::string 
     std::array<char, 256> buffer;
     std::string raw_output;
 
-    FILE *pipe = popen(cmd, "r");
+    FILE *pipe = popen(cmd, "r");  // NOLINT(bugprone-command-processor): diagnostic addr2line helper.
     if (pipe) {
         while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
             raw_output += buffer.data();
@@ -83,7 +50,6 @@ static std::string addr_to_line(const char *executable, void *addr, std::string 
         return "";
     }
 
-    // Split by lines
     std::vector<std::string> lines;
     size_t pos = 0;
     while (pos < raw_output.size()) {
@@ -98,7 +64,6 @@ static std::string addr_to_line(const char *executable, void *addr, std::string 
 
     if (lines.empty()) return "";
 
-    // First line is the innermost actual code location; subsequent lines are outer inline callers
     if (inline_chain && lines.size() > 1) {
         *inline_chain = "";
         for (size_t j = 1; j < lines.size(); j++) {
@@ -110,12 +75,8 @@ static std::string addr_to_line(const char *executable, void *addr, std::string 
 }
 #endif
 
-/**
- * Get current stack trace information (including file paths and line numbers).
- * Uses dladdr to locate the shared library for each stack frame, then calls addr2line with relative addresses.
- */
 std::string get_stacktrace(int skip_frames) {
-    (void)skip_frames;  // May be unused on non-Linux platforms
+    (void)skip_frames;
     std::string result;
 #ifdef __linux__
     const int max_frames = 64;
@@ -128,12 +89,14 @@ std::string get_stacktrace(int skip_frames) {
         for (int i = skip_frames; i < nframes; i++) {
             std::string frame_info;
 
-            void *addr = (void *)((char *)buffer[i] - 1);
+            void *addr = static_cast<char *>(buffer[i]) - 1;
 
             Dl_info dl_info;
             std::string inline_chain;
             if (dladdr(addr, &dl_info) && dl_info.dli_fname) {
-                void *rel_addr = (void *)((char *)addr - (char *)dl_info.dli_fbase);
+                const auto rel_addr_value =
+                    reinterpret_cast<uintptr_t>(addr) - reinterpret_cast<uintptr_t>(dl_info.dli_fbase);
+                void *rel_addr = reinterpret_cast<void *>(rel_addr_value);
                 std::string addr2line_result = addr_to_line(dl_info.dli_fname, rel_addr, &inline_chain);
 
                 if (addr2line_result.empty()) {
@@ -177,7 +140,6 @@ std::string get_stacktrace(int skip_frames) {
     return result;
 }
 
-// AssertionError constructor
 static std::string build_assert_message(const char *condition, const char *file, int line) {
     std::string msg = "Assertion failed: " + std::string(condition) + "\n";
     msg += "  Location: " + std::string(file) + ":" + std::to_string(line) + "\n";
@@ -192,12 +154,6 @@ AssertionError::AssertionError(const char *condition, const char *file, int line
     line_(line) {}
 
 [[noreturn]] void assert_impl(const char *condition, const char *file, int line) {
-    // Use unified_log_error directly rather than the LOG_ERROR macro: that macro
-    // lives in pto_orchestration_api.h and expands to
-    // current_runtime()->ops->log_error, but the ops table's definition pulls in
-    // pto_types.h (Arg → __aicore__-only to_u64), which the AICore build of this
-    // TU cannot compile. unified_log_error reaches the same sink without that
-    // dependency.
     unified_log_error(__FUNCTION__, "\n========================================");
     unified_log_error(__FUNCTION__, "Assertion failed: %s", condition);
     unified_log_error(__FUNCTION__, "Location: %s:%d", file, line);

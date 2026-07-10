@@ -9,19 +9,11 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * PTO Orchestration API - Slim header for orchestration .so files
+ * PTO Orchestration API - direct distributed-engine header.
  *
- * This header provides everything an orchestration source needs without
- * pulling in runtime implementation headers.  The orchestration .so has
- * zero link dependencies on runtime .cpp files; all runtime calls go
- * through the PTO2RuntimeOps function-pointer table embedded in
- * PTO2Runtime.
- *
- * Orchestration sources include ONLY this header:
- *   #include "pto_orchestration_api.h"
- *
- * Runtime sources continue to use pto_runtime2.h (which defines the
- * full PTO2Runtime struct with all internal fields).
+ * fully_distributed_within_core replays orchestration on AICore. The submit
+ * helpers therefore call dist_engine_api.h symbols directly on both CPU sim and
+ * CCEC onboard; this runtime has no submit function-pointer indirection.
  */
 
 #pragma once
@@ -30,109 +22,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// Type headers needed by orchestration
-#if !defined(__CCE_AICORE__)
-#include "common.h"  // framework_bind_runtime / framework_current_runtime (host-only, dlopen TLS)
-#endif
-#include "pto_runtime2_types.h"  // PTO2_ERROR_*
-#include "pto_submit_types.h"    // MixedKernels, INVALID_KERNEL_ID, subtask slots
-#include "pto_types.h"           // Arg, TaskOutputTensors, TensorArgType
-#include "task_args.h"           // ChipStorageTaskArgs, Tensor
-#include "tensor.h"              // Tensor, TensorCreateInfo
-
-#if defined(__CCE_AICORE__)
-// CCEC-only: the wrappers below dispatch straight to the dist_engine device
-// symbols (defined in dist_engine.cpp). The old ops-table path is host-only
-// (populated by dlopen from libaicpu_kernel.so) and has no analogue on the
-// AICore side.
 #include "dist_engine/dist_engine_api.h"  // NOLINT(build/include_subdir)
-#endif
+#include "pto_runtime2_types.h"           // PTO2_ERROR_*
+#include "pto_submit_types.h"             // MixedKernels, INVALID_KERNEL_ID
+#include "pto_types.h"                    // Arg, TaskOutputTensors, TensorArgType
+#include "task_args.h"                    // ChipStorageTaskArgs, Tensor
+#include "tensor.h"                       // Tensor, TensorCreateInfo
 
-// =============================================================================
-// Tensor Factory Helpers
-// =============================================================================
-
-// make_tensor_external(...) — canonical factory for pre-allocated external
-// memory — is defined in the unified tensor.h (common), so host and runtime
-// build Tensors through the same controlled path.
-
-// =============================================================================
-// Ops Table and Opaque Runtime
-// =============================================================================
-
-/**
- * Forward declaration — the orchestration sees PTO2Runtime as a partial
- * struct whose first field is the ops pointer.  The full definition
- * lives in pto_runtime2.h (used only by runtime .cpp files).
- */
-typedef struct PTO2Runtime PTO2Runtime;
-
-/**
- * Function-pointer table for runtime operations.
- * Populated by the runtime; called by orchestration through inline wrappers.
- */
-typedef struct PTO2RuntimeOps {
-    TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const L0TaskArgs &args);
-    void (*scope_begin)(PTO2Runtime *rt);
-    void (*scope_end)(PTO2Runtime *rt);
-    void (*orchestration_done)(PTO2Runtime *rt);
-    bool (*is_fatal)(PTO2Runtime *rt);
-    void (*report_fatal)(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...);
-
-    // Logging (populated by runtime, called by orchestration)
-    void (*log_error)(const char *func, const char *fmt, ...);
-    void (*log_warn)(const char *func, const char *fmt, ...);
-    void (*log_debug)(const char *func, const char *fmt, ...);
-    // INFO with explicit verbosity tier (v ∈ [0,9]; gating done inside).
-    void (*log_info_v)(const char *func, int v, const char *fmt, ...);
-
-    // Cross-layer data access (orchestration reads/writes tensor values via runtime)
-    // Placed after logging to avoid shifting hot-path field offsets.
-    uint64_t (*get_tensor_data)(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
-    void (*set_tensor_data)(
-        PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
-    );
-    TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const L0TaskArgs &args);
-    TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const L0TaskArgs &args);
-
-    // Stash the call-site of the next PTO2ScopeGuard so the [ScopeStats]
-    // collector can log it. Always present to keep ops-table layout stable
-    // across PTO2_PROFILING settings; set to nullptr at PTO2_PROFILING=0.
-    void (*scope_set_site)(const char *file, int line);
-} PTO2RuntimeOps;
-
-/**
- * Partial PTO2Runtime definition for orchestration.
- *
- * Exposes the ops pointer (for runtime calls) and pending_scope_mode
- * (read directly by inline scope wrappers).  The real struct (in
- * pto_runtime2.h) has the same first fields, so accessing them through
- * this definition is well-defined (C struct layout guarantee).
- */
-struct PTO2Runtime {
-    const PTO2RuntimeOps *ops;
-    PTO2ScopeMode pending_scope_mode;
-};
-
-// =============================================================================
-// Inline Convenience Wrappers
-// =============================================================================
-//
-// Two dispatch modes:
-//
-//   host / sim / AICPU  (default) — go through rt->ops. In fdwic a5sim,
-//     dist_core_main binds rt->ops to the distributed ops table inside the
-//     AICore image before directly calling the linked orchestration entry.
-//
-//   CCEC / AICore       (__CCE_AICORE__ defined) — direct-call the
-//     dist_engine_api.h symbols. On device there is no ops-table indirection:
-//     orchestration is linked into the same TU family as dist_engine.cpp, so
-//     the wrappers resolve straight to dist_*_impl / _msg / _query. rt is
-//     stashed in g_dist.rt at engine wire time and unused by dist_*_impl
-//     (all impls take PTO2Runtime * only to preserve the host ABI); we pass
-//     nullptr from the wrapper.
-
-#if defined(__CCE_AICORE__)
+struct PTO2Runtime;
 
 PTO_DEVICE_FUNC inline TaskOutputTensors alloc_tensors(const L0TaskArgs &args) {
     if (dist_is_fatal_query()) return TaskOutputTensors{};
@@ -163,8 +60,6 @@ PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_dummy_task(const L0TaskArgs &
 
 PTO_DEVICE_FUNC inline void rt_scope_begin(PTO2ScopeMode /*mode*/ = PTO2ScopeMode::AUTO) {
     if (dist_is_fatal_query()) return;
-    // Scope mode is discarded on device: dist_engine's per-core replay does
-    // not batch scopes, so scope_begin / _end are no-ops in dist_scope_*_impl.
     dist_scope_begin_impl(nullptr);
 }
 
@@ -177,112 +72,11 @@ PTO_DEVICE_FUNC inline void rt_orchestration_done() { dist_orchestration_done_im
 
 PTO_DEVICE_FUNC inline bool rt_is_fatal() { return dist_is_fatal_query(); }
 
-// va_list is unavailable / awkward under CCEC; the device-side msg entry
-// takes a const-string message only. On device we discard the args tail —
-// this is a probe-stage stub; C.4.d will wire a real unified_log_device
-// pipeline (GM log-ring + AICPU flush).
 #define rt_report_fatal(code, fmt, ...)                     \
     do {                                                    \
         dist_report_fatal_msg((code), __FUNCTION__, (fmt)); \
     } while (0)
 
-#else  // !__CCE_AICORE__
-
-static inline PTO2Runtime *current_runtime() { return framework_current_runtime(); }
-
-static inline TaskOutputTensors alloc_tensors(const L0TaskArgs &args) {
-    PTO2Runtime *rt = current_runtime();
-    if (rt->ops->is_fatal(rt)) {
-        return TaskOutputTensors{};
-    }
-    return rt->ops->alloc_tensors(rt, args);
-}
-
-static inline TaskOutputTensors rt_submit_task(const MixedKernels &mixed_kernels, const L0TaskArgs &args) {
-    PTO2Runtime *rt = current_runtime();
-    if (rt->ops->is_fatal(rt)) {
-        return TaskOutputTensors{};
-    }
-    return rt->ops->submit_task(rt, mixed_kernels, args);
-}
-
-/**
- * Convenience wrapper: submit an AIC-only task.
- */
-static inline TaskOutputTensors rt_submit_aic_task(int32_t kernel_id, const L0TaskArgs &args) {
-    MixedKernels mk;
-    mk.aic_kernel_id = kernel_id;
-    return rt_submit_task(mk, args);
-}
-
-/**
- * Convenience wrapper: submit an AIV-only task (uses AIV0 slot).
- */
-static inline TaskOutputTensors rt_submit_aiv_task(int32_t kernel_id, const L0TaskArgs &args) {
-    MixedKernels mk;
-    mk.aiv0_kernel_id = kernel_id;
-    return rt_submit_task(mk, args);
-}
-
-/**
- * Submit a dependency-only task. Accepts the same Arg shape as rt_submit_task
- * (inputs, outputs, inouts, explicit_deps, scalars) but does not run any
- * AICore kernel. The task still participates in the dependency graph: it
- * waits on its fanin and notifies its fanout. Useful as a synchronization
- * barrier or as a placeholder producer for tests / dep-graph wiring.
- */
-static inline TaskOutputTensors rt_submit_dummy_task(const L0TaskArgs &args) {
-    PTO2Runtime *rt = current_runtime();
-    if (rt->ops->is_fatal(rt)) {
-        return TaskOutputTensors{};
-    }
-    return rt->ops->submit_dummy_task(rt, args);
-}
-
-static inline void rt_scope_begin(PTO2ScopeMode mode = PTO2ScopeMode::AUTO) {
-    PTO2Runtime *rt = current_runtime();
-    if (rt->ops->is_fatal(rt)) {
-        return;
-    }
-    rt->pending_scope_mode = mode;
-    rt->ops->scope_begin(rt);
-}
-
-static inline void rt_scope_end() {
-    PTO2Runtime *rt = current_runtime();
-    if (rt->ops->is_fatal(rt)) {
-        return;
-    }
-    rt->ops->scope_end(rt);
-}
-
-static inline void rt_orchestration_done() {
-    PTO2Runtime *rt = current_runtime();
-    rt->ops->orchestration_done(rt);
-}
-
-static inline bool rt_is_fatal() {
-    PTO2Runtime *rt = current_runtime();
-    return rt->ops->is_fatal(rt);
-}
-
-#define rt_report_fatal(code, fmt, ...)                                          \
-    do {                                                                         \
-        PTO2Runtime *_rt = current_runtime();                                    \
-        _rt->ops->report_fatal(_rt, (code), __FUNCTION__, (fmt), ##__VA_ARGS__); \
-    } while (0)
-
-#endif  // __CCE_AICORE__
-
-// =============================================================================
-// Logging Macros for Orchestration
-// =============================================================================
-
-#if defined(__CCE_AICORE__)
-
-// CCEC-side logging: forwards to dist_log_*_msg. The msg entry takes a
-// const-string only (no va_list under CCEC); the varargs tail is discarded
-// at the probe stage. C.4.d wires a real unified_log_device pipeline.
 #define LOG_ERROR(fmt, ...) dist_log_error_msg(__FUNCTION__, (fmt))
 #define LOG_WARN(fmt, ...) dist_log_warn_msg(__FUNCTION__, (fmt))
 #define LOG_DEBUG(fmt, ...) dist_log_debug_msg(__FUNCTION__, (fmt))
@@ -297,148 +91,33 @@ static inline bool rt_is_fatal() {
 #define LOG_INFO_V8(fmt, ...) dist_log_info_v_msg(__FUNCTION__, 8, (fmt))
 #define LOG_INFO_V9(fmt, ...) dist_log_info_v_msg(__FUNCTION__, 9, (fmt))
 
-#else  // !__CCE_AICORE__
-
-#define LOG_ERROR(fmt, ...) current_runtime()->ops->log_error(__FUNCTION__, fmt, ##__VA_ARGS__)
-#define LOG_WARN(fmt, ...) current_runtime()->ops->log_warn(__FUNCTION__, fmt, ##__VA_ARGS__)
-#define LOG_DEBUG(fmt, ...) current_runtime()->ops->log_debug(__FUNCTION__, fmt, ##__VA_ARGS__)
-
-// INFO verbosity tiers. v=0 most verbose, v=9 must-see, v=5 default.
-#define LOG_INFO_V0(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 0, fmt, ##__VA_ARGS__)
-#define LOG_INFO_V1(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 1, fmt, ##__VA_ARGS__)
-#define LOG_INFO_V2(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 2, fmt, ##__VA_ARGS__)
-#define LOG_INFO_V3(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 3, fmt, ##__VA_ARGS__)
-#define LOG_INFO_V4(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 4, fmt, ##__VA_ARGS__)
-#define LOG_INFO_V5(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 5, fmt, ##__VA_ARGS__)
-#define LOG_INFO_V6(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 6, fmt, ##__VA_ARGS__)
-#define LOG_INFO_V7(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 7, fmt, ##__VA_ARGS__)
-#define LOG_INFO_V8(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 8, fmt, ##__VA_ARGS__)
-#define LOG_INFO_V9(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 9, fmt, ##__VA_ARGS__)
-
-#endif  // __CCE_AICORE__
-
-// =============================================================================
-// Cross-Layer Data Access
-// =============================================================================
-
-/**
- * Read a value from a tensor at the given multi-dimensional indices.
- *
- * Default T = uint64_t preserves old behavior (raw bits).
- * Specify T to get automatic type conversion:
- *
- *   uint64_t raw = get_tensor_data(tensor, 1, idx);       // old usage unchanged
- *   float val = get_tensor_data<float>(tensor, 1, idx);   // typed read
- *
- * If the tensor has a producer in TensorMap, spin-waits until the producer
- * task completes before reading. External tensors (make_tensor_external)
- * are read immediately without waiting.
- */
 template <typename T = uint64_t>
 PTO_DEVICE_FUNC inline T get_tensor_data(const Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
-#if defined(__CCE_AICORE__)
     if (dist_is_fatal_query()) return from_u64<T>(0);
     return from_u64<T>(dist_get_tensor_data_impl(nullptr, tensor, ndims, indices));
-#else
-    PTO2Runtime *rt = current_runtime();
-    if (rt->ops->is_fatal(rt)) {
-        return from_u64<T>(0);
-    }
-    return from_u64<T>(rt->ops->get_tensor_data(rt, tensor, ndims, indices));
-#endif
 }
 
-/**
- * Write a value to a tensor at the given multi-dimensional indices.
- *
- * Type is deduced from value argument; uint64_t by default:
- *
- *   set_tensor_data(tensor, 1, idx, raw_u64);     // old usage unchanged
- *   set_tensor_data(tensor, 1, idx, 42.0f);       // typed write (T = float)
- *
- * If the tensor has a producer in TensorMap, spin-waits until the producer
- * and all its consumers complete before writing (WAW + WAR safety).
- * External tensors (make_tensor_external) with no TensorMap entry are
- * written immediately without waiting.
- *
- * Limitation: TensorMap only tracks producers (OUTPUT/INOUT), not consumers
- * that used the tensor as INPUT. If a kernel reads this tensor as INPUT
- * (not INOUT) and the tensor has no TensorMap producer entry, set_tensor_data
- * cannot detect the reader and may cause a data race.
- *
- * To ensure WAR safety for all access patterns, use add_inout() instead of
- * add_input() for kernel parameters that may later be written via
- * set_tensor_data. INOUT creates a TensorMap entry that enables automatic
- * consumer tracking via fanout_refcount.
- *
- * The tensor must already have an allocated buffer (addr != 0).
- * For runtime-created outputs, call this only on the Tensor returned by
- * add_output(TensorCreateInfo) after submit returns.
- */
 template <typename T = uint64_t>
 PTO_DEVICE_FUNC inline void set_tensor_data(const Tensor &tensor, uint32_t ndims, const uint32_t indices[], T value) {
-#if defined(__CCE_AICORE__)
     if (dist_is_fatal_query()) return;
     dist_set_tensor_data_impl(nullptr, tensor, ndims, indices, to_u64(value));
-#else
-    PTO2Runtime *rt = current_runtime();
-    if (rt->ops->is_fatal(rt)) {
-        return;
-    }
-    rt->ops->set_tensor_data(rt, tensor, ndims, indices, to_u64(value));
-#endif
 }
 
-// =============================================================================
-// C++ Scope Guards and Macros
-// =============================================================================
-
-/**
- * RAII Scope Guard.
- *
- * Host: routes through rt->ops (populated via dlopen).
- * CCEC: dispatches direct to dist_scope_*_impl (no-ops in dist_engine per-core
- * replay). rt_ is retained as a nullable field only on the host build; CCEC
- * has no per-instance state to stash.
- */
 class PTO2ScopeGuard {
 public:
     PTO_DEVICE_FUNC explicit PTO2ScopeGuard(
         PTO2ScopeMode mode = PTO2ScopeMode::AUTO, const char *file = __builtin_FILE(), int line = __builtin_LINE()
-    )
-#if defined(__CCE_AICORE__)
-    {
+    ) {
         (void)mode;
         if (dist_is_fatal_query()) return;
         dist_scope_set_site_impl(file, line);
         dist_scope_begin_impl(nullptr);
     }
-#else
-        :
-        rt_(current_runtime()) {
-        if (!rt_->ops->is_fatal(rt_)) {
-            rt_->pending_scope_mode = mode;
-            if (rt_->ops->scope_set_site) rt_->ops->scope_set_site(file, line);
-            rt_->ops->scope_begin(rt_);
-        }
-    }
-#endif
 
     PTO_DEVICE_FUNC ~PTO2ScopeGuard() {
-#if defined(__CCE_AICORE__)
         if (dist_is_fatal_query()) return;
         dist_scope_end_impl(nullptr);
-#else
-        if (!rt_->ops->is_fatal(rt_)) {
-            rt_->ops->scope_end(rt_);
-        }
-#endif
     }
-
-private:
-#if !defined(__CCE_AICORE__)
-    PTO2Runtime *rt_;
-#endif
 };
 
 #define _PTO2_CONCATENATE_IMPL(x, y) x##y
@@ -447,25 +126,8 @@ private:
 #define PTO2_SCOPE_GUARD(...) \
     [[maybe_unused]] PTO2ScopeGuard _PTO2_CONCATENATE(scope_guard_, __COUNTER__) { __VA_ARGS__ }
 
-/**
- * Scoped block macro:
- *   PTO2_SCOPE() {
- *       rt_submit_task(...);
- *   }
- */
 #define PTO2_SCOPE(...) if (PTO2ScopeGuard _PTO2_CONCATENATE(scope_guard_, __COUNTER__){__VA_ARGS__}; true)
 
-// =============================================================================
-// Orchestration Config
-// =============================================================================
-
-/**
- * Configuration exported by orchestration .so via aicpu_orchestration_config().
- * The executor reads these values to set up shared memory and runtime.
- *
- * This struct is defined identically in pto_runtime2.h (with an include
- * guard) so the executor can use the same type without including this header.
- */
 #ifndef PTO2_ORCHESTRATION_CONFIG_DEFINED
 #define PTO2_ORCHESTRATION_CONFIG_DEFINED
 struct PTO2OrchestrationConfig {
@@ -473,8 +135,4 @@ struct PTO2OrchestrationConfig {
 };
 #endif
 
-// Convenience layer (L0TaskArgsWithDeps<N> + matching rt_submit_*_task overloads).
-// Pulled in at the bottom so the wrapper sees L0TaskArgs, MixedKernels, and the
-// rt_submit_*_task primitives defined above. Orchestration sources include
-// only this single header to access both the primitive and convenience APIs.
-#include "pto_arg_with_deps.h"  // NOLINT(build/include_subdir)
+#include "pto_arg_with_deps.h"

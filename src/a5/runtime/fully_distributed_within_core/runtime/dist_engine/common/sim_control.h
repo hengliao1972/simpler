@@ -11,12 +11,12 @@
 
 #pragma once
 
-#include <stdio.h>
-#include <stdlib.h>
+#include "dist_engine/common/target.h"
 
-// Assertion macros (always_assert / debug_assert), AssertionError, and the
-// MAYBE_UNINITIALIZED diagnostics live in the shared header so the unified
-// Tensor (src/common/task_interface/tensor.h) can use them without depending
-// on this runtime-specific header. assert_impl / get_stacktrace are defined in
-// runtime/assert/assert_compat.cpp for runtime targets.
-#include "assert_compat.h"
+namespace {
+
+#if DIST_SIM_HOST_CLOCK
+bool g_skip_exec = false;
+#endif
+
+}  // namespace

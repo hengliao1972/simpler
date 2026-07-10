@@ -11,12 +11,14 @@
 
 #pragma once
 
-#include <stdio.h>
-#include <stdlib.h>
+#include "dist_engine/common/target.h"
 
-// Assertion macros (always_assert / debug_assert), AssertionError, and the
-// MAYBE_UNINITIALIZED diagnostics live in the shared header so the unified
-// Tensor (src/common/task_interface/tensor.h) can use them without depending
-// on this runtime-specific header. assert_impl / get_stacktrace are defined in
-// runtime/assert/assert_compat.cpp for runtime targets.
-#include "assert_compat.h"
+PTO_DEVICE_FUNC inline uint64_t dist_aicore_slot_function_addr(Runtime *runtime, int32_t kernel_id) {
+#if defined(__CCE_AICORE__)
+    (void)runtime;
+    (void)kernel_id;
+    return 0;
+#else
+    return resolve_kernel_addr(runtime, kernel_id);
+#endif
+}

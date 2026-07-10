@@ -121,7 +121,12 @@ def get_aicore_path_override(cache_key) -> Path | None:
 
 
 def maybe_build_aicore_override(
-    cache_key, platform: str, runtime: str, orch_source: str, incores: list[dict]
+    cache_key,
+    platform: str,
+    runtime: str,
+    orch_source: str,
+    incores: list[dict],
+    pto_isa_root: str | None = None,
 ) -> Path | None:
     if platform not in {"a5", "a5sim"} or runtime != "fully_distributed_within_core":
         return None
@@ -137,7 +142,7 @@ def maybe_build_aicore_override(
             source_paths.append(wrapper_path)
     key = _aicore_extra_cache_key(cache_key, source_paths)
     builder = RuntimeBuilder(platform)
-    return builder.build_aicore_with_extra_sources(runtime, source_paths, key)
+    return builder.build_aicore_with_extra_sources(runtime, source_paths, key, pto_isa_root=pto_isa_root)
 
 
 # ---------------------------------------------------------------------------
@@ -1112,7 +1117,9 @@ def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
         children=kernel_binaries,
         config_name=orch.get("config_name", ""),
     )
-    aicore_override = maybe_build_aicore_override(cache_key, platform, runtime, orch["source"], incores)
+    aicore_override = maybe_build_aicore_override(
+        cache_key, platform, runtime, orch["source"], incores, pto_isa_root=pto_isa_root
+    )
     if aicore_override is not None:
         _aicore_override_cache[cache_key] = aicore_override
     _compile_cache[cache_key] = chip_callable

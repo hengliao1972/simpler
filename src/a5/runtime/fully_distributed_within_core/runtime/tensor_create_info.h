@@ -139,11 +139,7 @@ PTO_DEVICE_FUNC inline uint8_t tensor_initial_value_byte(uint64_t value, uint64_
 }
 
 PTO_DEVICE_FUNC inline void store_tensor_initial_value_byte(uint64_t addr, uint64_t byte_index, uint8_t value) {
-#if defined(__CCE_AICORE__)
     *reinterpret_cast<__gm__ uint8_t *>(addr + byte_index) = value;
-#else
-    *reinterpret_cast<uint8_t *>(addr + byte_index) = value;
-#endif
 }
 
 // ============================================================================
@@ -170,13 +166,8 @@ PTO_DEVICE_FUNC inline void fill_tensor_initial_value(__gm__ Tensor &t, uint64_t
     while (filled < t.buffer.size) {
         uint64_t copy_size = ((t.buffer.size - filled) < filled) ? (t.buffer.size - filled) : filled;
         aicore_memcpy(
-#if defined(__CCE_AICORE__)
             reinterpret_cast<__gm__ uint8_t *>(t.buffer.addr + filled),
-            reinterpret_cast<__gm__ const uint8_t *>(t.buffer.addr),
-#else
-            reinterpret_cast<uint8_t *>(t.buffer.addr + filled), reinterpret_cast<const uint8_t *>(t.buffer.addr),
-#endif
-            copy_size
+            reinterpret_cast<__gm__ const uint8_t *>(t.buffer.addr), copy_size
         );
         filled += copy_size;
     }
