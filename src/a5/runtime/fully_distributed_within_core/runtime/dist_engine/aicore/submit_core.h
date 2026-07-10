@@ -11,6 +11,25 @@
 
 #pragma once
 
+PTO_DEVICE_FUNC inline void dist_aicore_call_slot_kernel(__gm__ RingSlot &slot) {
+#if defined(__CCE_AICORE__)
+    const bool is_aic = g_ccec_core_type == static_cast<int32_t>(CoreType::AIC);
+    if (is_aic) {
+        if (pto_call_linked_kernel_aic != nullptr) {
+            pto_call_linked_kernel_aic(slot.func_id, reinterpret_cast<__gm__ int64_t *>(slot.args));
+        }
+    } else if (pto_call_linked_kernel_aiv != nullptr) {
+        pto_call_linked_kernel_aiv(slot.func_id, reinterpret_cast<__gm__ int64_t *>(slot.args));
+    }
+#else
+    typedef void (*KernelFn)(__gm__ int64_t *);
+    if (slot.function_bin_addr != 0) {
+        KernelFn fn = reinterpret_cast<KernelFn>(slot.function_bin_addr);
+        fn(reinterpret_cast<__gm__ int64_t *>(slot.args));
+    }
+#endif
+}
+
 namespace {
 
 PTO_DEVICE_FUNC void publish_task_flag(int32_t task_id) {
@@ -47,16 +66,85 @@ PTO_DEVICE_FUNC void store_task_vend(int32_t task_id, uint64_t vend) {
 #endif
 }
 
+PTO_DEVICE_FUNC void store_won_remaining(__gm__ WonSlot &w, int32_t count) {
+#if defined(__CCE_AICORE__)
+    w.remaining = count;
+#else
+    atom_store<int64_t>(w.remaining, count, __ATOMIC_RELAXED);
+#endif
+}
+
+PTO_DEVICE_FUNC void reset_won_lane(__gm__ WonSlot &w, int32_t lane) {
+#if defined(__CCE_AICORE__)
+    w.drained[lane].v = 0;
+#else
+    atom_store(w.drained[lane].v, 0, __ATOMIC_RELAXED);
+#endif
+    w.lane[lane].present = false;
+}
+
+PTO_DEVICE_FUNC bool decrement_won_remaining_is_last(__gm__ WonSlot &w) {
+#if defined(__CCE_AICORE__)
+    __gm__ int64_t *remaining = const_cast<__gm__ int64_t *>(&w.remaining);
+    return atomicSub(remaining, static_cast<int64_t>(1)) == 1;
+#else
+    return atom_fetch_sub<int64_t>(w.remaining, 1, __ATOMIC_ACQ_REL) == 1;
+#endif
+}
+
+PTO_DEVICE_FUNC void clear_won_slot_state(__gm__ WonSlot &w) {
+#if defined(__CCE_AICORE__)
+    w.state = 0;
+    dist_aicore_flush_region(&w, sizeof(WonSlot));
+#else
+    atom_store(w.state, 0, __ATOMIC_RELEASE);
+#endif
+}
+
+PTO_DEVICE_FUNC int64_t load_frontier_for_advance() {
+#if defined(__CCE_AICORE__)
+    __gm__ int64_t *frontier = const_cast<__gm__ int64_t *>(&g_dist.frontier);
+    dist_aicore_invalidate_region(frontier, 64);
+    return g_dist.frontier;
+#else
+    return atom_load(g_dist.frontier, __ATOMIC_ACQUIRE);
+#endif
+}
+
+PTO_DEVICE_FUNC bool try_advance_frontier_to(int64_t &frontier, int64_t next) {
+#if defined(__CCE_AICORE__)
+    __gm__ int64_t *frontier_addr = const_cast<__gm__ int64_t *>(&g_dist.frontier);
+    const int64_t old = atomicMax(frontier_addr, next);
+    frontier = old > next ? old : next;
+    return next > old;
+#else
+    if (atom_cas_weak(g_dist.frontier, frontier, next, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        frontier = next;
+        return true;
+    }
+    return false;
+#endif
+}
+
 PTO_DEVICE_FUNC void advance_frontier() {
-    int64_t f = atom_load(g_dist.frontier, __ATOMIC_ACQUIRE);
+#if defined(__CCE_AICORE__)
+    if (g_dist_ptr == nullptr) return;
+#endif
+    int64_t f = load_frontier_for_advance();
     while (true) {
         const int64_t next = f + 1;
         if (next >= kFlagCap) break;
         if (!task_flag_ready(static_cast<int32_t>(next), __ATOMIC_ACQUIRE)) break;
-        if (atom_cas_weak(g_dist.frontier, f, next, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            f = next;
-        }
+        try_advance_frontier_to(f, next);
     }
+}
+
+PTO_DEVICE_FUNC void complete_executed_task(__gm__ DistCore *self, int32_t task_id) {
+    if (self != nullptr) {
+        store_task_vend(task_id, self->heap_next);
+    }
+    publish_task_flag(task_id);
+    advance_frontier();
 }
 
 PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] __gm__ DistCore *self, __gm__ RingSlot &s) {
@@ -103,24 +191,21 @@ PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] __gm__ DistCore *self, __gm__
 #endif
     }
 #else
-    if (s.function_bin_addr != 0) {
-        KernelFn fn = reinterpret_cast<KernelFn>(s.function_bin_addr);
-        fn(reinterpret_cast<__gm__ int64_t *>(s.args));
-    }
+    dist_aicore_call_slot_kernel(s);
 #endif
+    dist_aicore_store_barrier();
     if (s.is_multicore) {
         __gm__ WonSlot &w = g_dist.blocks[s.won_block].slots[s.won_slot];
-        if (atom_fetch_sub<int64_t>(w.remaining, 1, __ATOMIC_ACQ_REL) == 1) {
-            publish_task_flag(s.task_id);
-            atom_store(w.state, 0, __ATOMIC_RELEASE);
-            advance_frontier();
+        if (decrement_won_remaining_is_last(w)) {
+            clear_won_slot_state(w);
+            complete_executed_task(self, s.task_id);
         }
     } else {
-        publish_task_flag(s.task_id);
-        advance_frontier();
+        complete_executed_task(self, s.task_id);
     }
     s.built = false;
     s.occupied = false;
+    dist_aicore_flush_region(&s, sizeof(RingSlot));
 }
 
 PTO_DEVICE_FUNC int32_t drain_phase_b(__gm__ DistCore *self) {
@@ -392,9 +477,6 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
 #endif
     ctx.self->heap_next = task_base + layout.total_output_size;
     ctx.output_bytes = total;
-#if !defined(__CCE_AICORE__)
-    store_task_vend(ctx.task_id, ctx.self->heap_next);
-#endif
     return true;
 }
 

@@ -11,34 +11,9 @@
 
 namespace {
 
-PTO_DEVICE_FUNC void direct_publish_flag(int32_t task_id) {
-    if (g_dist_ptr == nullptr || task_id < 0 || task_id >= kFlagCap) return;
-    publish_task_flag(task_id);
-}
-
-PTO_DEVICE_FUNC void direct_advance_frontier() {
-#if defined(__CCE_AICORE__)
-    if (g_dist_ptr == nullptr) return;
-    __gm__ int64_t *frontier = const_cast<__gm__ int64_t *>(&g_dist.frontier);
-    dist_aicore_invalidate_region(frontier, 64);
-    int64_t f = g_dist.frontier;
-    while (true) {
-        const int64_t next = f + 1;
-        if (next >= kFlagCap) break;
-        if (!task_flag_ready(static_cast<int32_t>(next), __ATOMIC_ACQUIRE)) break;
-        const int64_t old = atomicMax(frontier, next);
-        f = old > next ? old : next;
-    }
-#else
-    advance_frontier();
-#endif
-}
-
 PTO_DEVICE_FUNC void direct_complete_task(DistSubmitCtx &ctx) {
     if (ctx.self == nullptr) return;
-    store_task_vend(ctx.task_id, ctx.self->heap_next);
-    direct_publish_flag(ctx.task_id);
-    direct_advance_frontier();
+    complete_executed_task(ctx.self, ctx.task_id);
 }
 
 PTO_DEVICE_FUNC int32_t anchor_lane_for_mask(const ActiveMask &M) {
@@ -256,15 +231,6 @@ PTO_DEVICE_FUNC bool direct_drain_block_won(__gm__ DistCore *self) {
     return drained;
 }
 
-PTO_DEVICE_FUNC void direct_complete_joint_submit(DistSubmitCtx &ctx) {
-    __gm__ WonSlot &w = g_dist.blocks[ctx.joint_block].slots[ctx.joint_slot];
-    if (decrement_won_remaining_is_last(w)) {
-        w.state = 0;
-        dist_aicore_flush_region(&w, sizeof(WonSlot));
-        direct_complete_task(ctx);
-    }
-}
-
 PTO_DEVICE_FUNC bool direct_build_winner_slot(DistSubmitCtx &ctx, __gm__ RingSlot *slot) {
     if (slot == nullptr || ctx.payload == nullptr) return false;
     const int32_t sub_block_id = ctx.self != nullptr && ctx.self->lane == LANE_AIV1 ? 1 : 0;
@@ -277,21 +243,6 @@ PTO_DEVICE_FUNC bool direct_build_winner_slot(DistSubmitCtx &ctx, __gm__ RingSlo
     return true;
 }
 
-PTO_DEVICE_FUNC void direct_call_slot_kernel(__gm__ RingSlot &slot) { dist_aicore_call_slot_kernel(slot); }
-
-PTO_DEVICE_FUNC void direct_complete_slot(__gm__ RingSlot &slot, __gm__ DistCore *self) {
-    DistSubmitCtx ctx;
-    ctx.self = self;
-    ctx.task_id = slot.task_id;
-    if (slot.is_multicore) {
-        ctx.joint_block = slot.won_block;
-        ctx.joint_slot = slot.won_slot;
-        direct_complete_joint_submit(ctx);
-    } else {
-        direct_complete_task(ctx);
-    }
-}
-
 PTO_DEVICE_FUNC bool direct_slot_fanin_ready(__gm__ const RingSlot &slot) {
     for (int32_t i = 0; i < slot.fanin_count; i++) {
         if (!task_flag_ready(slot.fanin[i], __ATOMIC_ACQUIRE)) return false;
@@ -299,17 +250,10 @@ PTO_DEVICE_FUNC bool direct_slot_fanin_ready(__gm__ const RingSlot &slot) {
     return true;
 }
 
-PTO_DEVICE_FUNC void direct_slot_store_barrier() { dist_aicore_store_barrier(); }
-
 PTO_DEVICE_FUNC bool direct_try_execute_slot(__gm__ RingSlot &slot, __gm__ DistCore *self) {
     if (!slot.occupied || !slot.built || !direct_slot_fanin_ready(slot)) return false;
-    direct_call_slot_kernel(slot);
-    direct_slot_store_barrier();
-    direct_complete_slot(slot, self);
-    slot.built = false;
-    slot.occupied = false;
+    execute_slot(self, slot);
     if (self != nullptr && self->occupied_count > 0) self->occupied_count--;
-    dist_aicore_flush_region(&slot, sizeof(RingSlot));
     return true;
 }
 
