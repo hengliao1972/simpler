@@ -1,17 +1,28 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 # Build AICore kernel using kernel.cpp + common folder + custom includes and sources (for `Task`)
 # BISHENG_CC and BISHENG_LD are set when calling cmake
 # CUSTOM_INCLUDE_DIRS and CUSTOM_SOURCE_DIRS are set when calling cmake
 cmake_minimum_required(VERSION 3.16.3)
 
 # Build complete include list
-set(CMAKE_CUSTOM_INCLUDE_DIR_FLAGS "")
-list(APPEND CMAKE_CUSTOM_INCLUDE_DIR_FLAGS "-I${CMAKE_CURRENT_SOURCE_DIR}")
-list(APPEND CMAKE_CUSTOM_INCLUDE_DIR_FLAGS "-I${CMAKE_CURRENT_SOURCE_DIR}/../../include")
+set(CMAKE_CUSTOM_INCLUDE_DIRS "")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/include")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/log/include")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common")
 if(DEFINED CUSTOM_INCLUDE_DIRS)
     foreach(INC_DIR ${CUSTOM_INCLUDE_DIRS})
-        list(APPEND CMAKE_CUSTOM_INCLUDE_DIR_FLAGS "-I${INC_DIR}")
+        list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${INC_DIR}")
     endforeach()
-    string(REPLACE ";" " " CMAKE_CUSTOM_INCLUDE_DIR_FLAGS "${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS}")
 else()
     message(FATAL_ERROR "MUST set CUSTOM_INCLUDE_DIRS to build with `Task` implementation")
 endif()
@@ -20,11 +31,16 @@ endif()
 set(ALL_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/kernel.cpp")
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})
-        file(GLOB DIR_SOURCES "${SRC_DIR}/*.cpp" "${SRC_DIR}/*.c")
+        file(GLOB_RECURSE DIR_SOURCES "${SRC_DIR}/*.cpp" "${SRC_DIR}/*.c")
         list(APPEND ALL_SOURCES ${DIR_SOURCES})
     endforeach()
 else()
     message(FATAL_ERROR "MUST set CUSTOM_SOURCE_DIRS to build with `Task` implementation")
+endif()
+if(DEFINED CUSTOM_SOURCE_FILES)
+    foreach(SRC_FILE ${CUSTOM_SOURCE_FILES})
+        list(APPEND ALL_SOURCES "${SRC_FILE}")
+    endforeach()
 endif()
 list(LENGTH ALL_SOURCES NUM_SOURCES)
 message(STATUS "AICore kernel: ${NUM_SOURCES} source files")
@@ -32,6 +48,12 @@ message(VERBOSE "AICore kernel sources: ${ALL_SOURCES}")
 
 # Output files
 set(AICORE_KERNEL_OBJ ${CMAKE_CURRENT_BINARY_DIR}/aicore_kernel.o)
+
+# Convert include dirs to -I flags for compiler command
+set(CMAKE_CUSTOM_INCLUDE_DIR_FLAGS "")
+foreach(INC_DIR ${CMAKE_CUSTOM_INCLUDE_DIRS})
+    list(APPEND CMAKE_CUSTOM_INCLUDE_DIR_FLAGS "-I${INC_DIR}")
+endforeach()
 
 # Compiler flags
 set(AICORE_FLAGS
@@ -61,7 +83,7 @@ foreach(SRC_FILE ${ALL_SOURCES})
     # Compile for AIC architecture
     add_custom_command(
         OUTPUT ${OBJ_AIC}
-        COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS} -D__AIC__ --cce-aicore-arch=dav-c310-cube
+        COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS} --cce-aicore-arch=dav-c310-cube
                 -o ${OBJ_AIC} ${SRC_FILE}
         DEPENDS ${SRC_FILE}
         COMMENT "Compiling ${SRC_NAME} for AIC"
@@ -70,7 +92,7 @@ foreach(SRC_FILE ${ALL_SOURCES})
     # Compile for AIV architecture
     add_custom_command(
         OUTPUT ${OBJ_AIV}
-        COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS} -D__AIV__ --cce-aicore-arch=dav-c310-vec
+        COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS} --cce-aicore-arch=dav-c310-vec
                 -o ${OBJ_AIV} ${SRC_FILE}
         DEPENDS ${SRC_FILE}
         COMMENT "Compiling ${SRC_NAME} for AIV"

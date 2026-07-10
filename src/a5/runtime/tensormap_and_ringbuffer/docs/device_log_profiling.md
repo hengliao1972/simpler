@@ -2,9 +2,9 @@
 
 ## How to Find Device Logs
 
-AICPU logs (via `DEV_ALWAYS`) are written by CANN's **dlog** subsystem and do **not** appear in the `run_example.py` terminal output. They are written to CANN's device log directory:
+AICPU logs (via `LOG_INFO_V9`) are written by CANN's **dlog** subsystem and do **not** appear in the `python test_*.py` / pytest terminal output. They are written to CANN's device log directory:
 
-```
+```text
 $HOME/ascend/log/debug/device-<device_id>/device-<pid>_<timestamp>.log
 ```
 
@@ -19,9 +19,9 @@ ls -lt $HOME/ascend/log/debug/device-<device_id>/ | head -5
 A single run produces two profiling blocks in the device log:
 
 | Block | Emitted by | Function | Content |
-|-------|-----------|----------|---------|
+| ----- | ---------- | -------- | ------- |
 | **Orchestrator Profiling** | Thread 3 (orchestrator) | `aicpu_orchestration_entry` | Time breakdown of graph construction on device |
-| **PTO2 Scheduler Summary** | Threads 0/1/2 (schedulers) | `resolve_and_dispatch_pto2` | Per-thread scheduling statistics, phase timing, and lock contention |
+| **PTO2 Scheduler Summary** | Threads 0/1/2 (schedulers) | `SchedulerContext::resolve_and_dispatch` | Per-thread scheduling statistics, phase timing, and lock contention |
 
 All timing values are in microseconds (us), converted from AICPU cycle counters.
 
@@ -33,9 +33,8 @@ Thread 3 loads the orchestration `.so` via `dlopen`, calls `aicpu_orchestration_
 
 ### Example (from a real run: batch=64, 16704 tasks)
 
-```
+```text
 Thread 3: Calling aicpu_orchestration_entry from SO
-aicpu_orchestration_entry ">>>>>> batch = 64"
 Thread 3: aicpu_orchestration_entry returned, cost 20943.940us
 Thread 3: === Orchestrator Profiling: 16704 tasks, total=14601.580us ===
 Thread 3:   sync_tensormap : 286.300us (2.0%)
@@ -54,22 +53,22 @@ Thread 3: PTO2 total submitted tasks = 16704
 ### Field Reference
 
 | Field | Source (`pto_orchestrator.cpp`) | Description |
-|-------|-------------------------------|-------------|
+| ----- | ------------------------------- | ----------- |
 | **cost** | Wall-clock around `orch_func()` call | Total time including orchestration logic + scope overhead |
-| **total** | Sum of all sub-steps below | Accumulated time inside `pto2_submit_task` across all tasks |
+| **total** | Sum of all sub-steps below | Accumulated time inside `submit_task` across all tasks |
 | **sync_tensormap** | `g_orch_sync_cycle` | TensorMap validity sync and optional cleanup before each submission |
 | **task_ring_alloc** | `g_orch_alloc_cycle` | Allocating a task slot from the task ring buffer |
-| **param_copy** | `g_orch_params_cycle` | Copying param descriptors + tensor descriptor copies into task-owned storage |
+| **param_copy** | `g_orch_args_cycle` | Copying param descriptors + tensor descriptor copies into task-owned storage |
 | **lookup+dep** | `g_orch_lookup_cycle` | TensorMap lookup for inputs/inouts + building fanin/fanout dependency edges |
 | **heap_alloc** | `g_orch_heap_cycle` | Allocating packed output buffers from the heap ring |
 | **tensormap_ins** | `g_orch_insert_cycle` | Inserting output/inout tensors into the TensorMap |
 | **fanin+ready** | `g_orch_fanin_cycle` | Building the fanin list + checking if task is already ready (Step 5/5b) |
-| **scope_end** | `g_orch_scope_end_cycle` | `pto2_scope_end` overhead (notifying scheduler of scope completion) |
+| **scope_end** | `g_orch_scope_end_cycle` | `end_scope` overhead (notifying scheduler of scope completion) |
 | **avg/task** | `total / submit_count` | Average orchestrator time per task submission |
 
 ### Interpreting the Numbers
 
-- **cost > total**: The difference is overhead outside `pto2_submit_task` (the orchestration user code itself, scope_begin/end, make_tensor calls, etc.).
+- **cost > total**: The difference is overhead outside `submit_task` (the orchestration user code itself, scope_begin/end, TensorCreateInfo construction, etc.).
 - **lookup+dep** is typically the dominant cost (~50%) because it involves TensorMap hash lookups and building dependency edges with spinlock-protected fanout list insertions.
 - **param_copy** scales with the number of parameters per task.
 - **avg/task < 1us** indicates efficient graph construction.
@@ -82,23 +81,23 @@ Each of the 3 scheduler threads (Thread 0, 1, 2) prints its own summary after co
 
 ### Example (Thread 0, from a different run: batch=1, 1044 tasks)
 
-```
+```text
 Thread 0: completed=352 tasks in 3477.420us (147 loops, 2.4 tasks/loop)
 Thread 0: --- Phase Breakdown ---
-Thread 0:   complete:    1485.020us (42.7%)  [fanout: edges=432, max_degree=2, avg=1.2]  [fanin: edges=320, max_degree=3, avg=0.9]
+Thread 0:   complete:    1485.020us (42.7%)
 Thread 0:   scan:        14.400us (0.4%)
-Thread 0:   dispatch:    1973.060us (56.7%)  [pop: hit=352, miss=3043, hit_rate=10.4%]
+Thread 0:   dispatch:    1973.060us (56.7%)
 Thread 0:   idle:        4.940us (0.1%)
 ```
 
 ### Summary Line
 
-```
+```text
 Thread N: completed=X tasks in Yus (Z loops, W tasks/loop)
 ```
 
 | Field | Description |
-|-------|-------------|
+| ----- | ----------- |
 | **completed** | Number of tasks this thread processed to completion |
 | **Y us** | Total scheduler loop time (sum of all phase cycles) |
 | **Z loops** | Number of scheduler loop iterations |
@@ -109,10 +108,10 @@ Thread N: completed=X tasks in Yus (Z loops, W tasks/loop)
 The scheduler loop runs four phases each iteration. Each phase's time is accumulated across all loop iterations.
 
 | Phase | What it does | Inline stats |
-|-------|-------------|-------------|
-| **complete** | Polls handshake on each managed core; when a core completes, traverses fanout list (notify consumers) and fanin list (release producers) via `on_task_complete` | `fanout`: edges/max_degree/avg for consumer notification; `fanin`: edges/max_degree/avg for producer release |
+| ----- | ------------ | ------------ |
+| **complete** | Polls handshake on each managed core; when a core completes, calls `on_subtask_complete(task_id, subslot)` to increment the completion counter; when `completed_subtasks == total_required_subtasks`, triggers `on_task_complete` which traverses fanout list (notify consumers) and fanin list (release producers) | `fanout`: edges/max_degree/avg for consumer notification; `fanin`: edges/max_degree/avg for producer release |
 | **scan** | Updates the perf profiling header with latest scheduler state | — |
-| **dispatch** | For each idle core, pops a task from the ready queue via `pto2_scheduler_get_ready_task`, builds the dispatch payload, and writes the task to the core's handshake register | `pop`: `hit` = successful pops (task dispatched), `miss` = empty queue pops, `hit_rate` = hit/(hit+miss) |
+| **dispatch** | For each idle core, pops a task from the shape-based ready queue via `get_ready_task(shape)`, builds the dispatch payload, and writes the task to the core's handshake register | `pop`: `hit` = successful pops (task dispatched), `miss` = empty queue pops, `hit_rate` = hit/(hit+miss) |
 | **idle** | Scheduler loop iteration where no progress was made (no completions, no dispatches) | — |
 
 **Interpreting phase percentages:**
@@ -132,7 +131,7 @@ The scheduler loop runs four phases each iteration. Each phase's time is accumul
 Divide each thread's phase times by its `completed` count to get per-task scheduling cost:
 
 | Metric | Formula | Typical value |
-|--------|---------|---------------|
+| ------ | ------- | ------------- |
 | Scheduling overhead per task | total_time / completed | ~5-10 us/task |
 | Dispatch per task | dispatch_time / completed | ~3-6 us/task |
 | Complete per task | complete_time / completed | ~2-4 us/task |
@@ -141,10 +140,10 @@ Divide each thread's phase times by its `completed` count to get per-task schedu
 
 ## Cross-Referencing with Host Profiling
 
-When `--enable-profiling` is used, the host terminal prints a **Task Statistics by Function** table with `Total_Exec` (total AICore kernel execution time). Combined with device log data:
+When `--enable-l2-swimlane` is used, the host terminal prints a **Task Statistics by Function** table with `Total_Exec` (total AICore kernel execution time). Combined with device log data:
 
 | Metric | Source | Description |
-|--------|--------|-------------|
+| ------ | ------ | ----------- |
 | Avg kernel exec time | `Total_Exec / total_tasks` (host) | Time AICore spends executing each kernel |
 | Avg scheduling overhead | `sum(thread_total) / total_tasks` (device log) | Time AICPU spends scheduling each task |
 | Sched/Exec ratio | scheduling / execution | Scheduling overhead relative to kernel execution |

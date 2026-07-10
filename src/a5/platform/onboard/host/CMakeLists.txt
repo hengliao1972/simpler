@@ -1,3 +1,11 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 # Build Host runtime using host/* + common/* + custom includes and sources (for `Runtime`)
 # CMAKE_C_COMPILER and CMAKE_CXX_COMPILER are set when calling cmake
 # CUSTOM_INCLUDE_DIRS and CUSTOM_SOURCE_DIRS are set when calling cmake
@@ -9,6 +17,14 @@ project(host_runtime LANGUAGES C CXX)
 # Build complete include list
 set(CMAKE_CUSTOM_INCLUDE_DIRS "")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/include")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/worker")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/log/include")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host")
 if(DEFINED CUSTOM_INCLUDE_DIRS)
     foreach(INC_DIR ${CUSTOM_INCLUDE_DIRS})
         list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${INC_DIR}")
@@ -20,18 +36,34 @@ endif()
 # Build complete source list: core host sources + sources from CUSTOM_SOURCE_DIRS
 set(HOST_RUNTIME_SOURCES "")
 list(APPEND HOST_RUNTIME_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/aicpu_topology_probe.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/device_runner.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/memory_allocator.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/profiling_copy.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/pto_runtime_c_api.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/platform_compile_info.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/platform_compile_info.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/host_regs.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/host_log.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/unified_log_host.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/performance_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/l2_swimlane_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/pmu_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/dep_gen_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/scope_stats_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/tensor_dump_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/comm_hccl.cpp"
+)
+# Add common/aicpu_loader/host sources (LoadAicpuOp)
+list(APPEND HOST_RUNTIME_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/aicpu_loader/host/load_aicpu_op.cpp"
+)
+# Add common/platform/onboard/host sources (shared between a2a3 / a5 onboard).
+# See .docs/ONBOARD_HOST_COMMON_REFACTOR.md for the migration plan.
+list(APPEND HOST_RUNTIME_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_helpers.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_base.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/c_api_shared.cpp"
 )
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})
-        file(GLOB DIR_SOURCES "${SRC_DIR}/*.cpp" "${SRC_DIR}/*.c")
+        file(GLOB_RECURSE DIR_SOURCES "${SRC_DIR}/*.cpp" "${SRC_DIR}/*.c")
         list(APPEND HOST_RUNTIME_SOURCES ${DIR_SOURCES})
     endforeach()
 else()
@@ -60,25 +92,41 @@ target_compile_options(host_runtime
         -g
 )
 
+# Platform name baked into the shared get_platform() impl in
+# src/common/platform/shared/host/platform_compile_info.cpp.
+target_compile_definitions(host_runtime PRIVATE SIMPLER_PLATFORM_NAME="a5")
+
 # Include directories - always include local headers
 target_include_directories(host_runtime
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        # Shared platform_comm headers (comm.h / comm_context.h) live in
+        # src/common so a5 (HCCL) and a5/a2a3 sim (POSIX-shm) can use the
+        # same contract.
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../../common
         ${CMAKE_CUSTOM_INCLUDE_DIRS}
     PRIVATE
         ${ASCEND_HOME_PATH}/include
         ${ASCEND_HOME_PATH}/pkg_inc
         ${ASCEND_HOME_PATH}/pkg_inc/runtime
+        # pkg_inc/runtime/runtime exposes rts_kernel.h + kernel.h (CANN 7.0+
+        # rtsLaunchCpuKernel API used by LoadAicpuOp).
+        ${ASCEND_HOME_PATH}/pkg_inc/runtime/runtime
         ${ASCEND_HOME_PATH}/pkg_inc/profiling
         ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/driver
 )
 
-target_link_directories(host_runtime
-    PRIVATE
-        ${ASCEND_HOME_PATH}/lib64
-        ${ASCEND_HOME_PATH}/runtime/lib64
-)
+# CANN 9.x exposes the working non-V2 HCCL entry points through libhcomm.
+# Link it explicitly so comm_hccl.cpp can follow the same initialization path
+# as the pto-isa communication tests.
+find_library(HCOMM_LIB NAMES hcomm PATHS ${ASCEND_HOME_PATH}/lib64 NO_DEFAULT_PATH)
+if(HCOMM_LIB)
+    set(HCCL_LINK_TARGETS ${HCOMM_LIB})
+    message(STATUS "Using HCCL library: ${HCOMM_LIB}")
+else()
+    message(FATAL_ERROR "libhcomm not found under ${ASCEND_HOME_PATH}/lib64")
+endif()
 
 # Link against CANN runtime libraries
 # ascend_hal is dynamically loaded at runtime via dlopen in device_runner
@@ -87,7 +135,22 @@ target_link_libraries(host_runtime
     PRIVATE
         runtime
         ascendcl
+        ${HCCL_LINK_TARGETS}
         dl
 )
 
+target_link_directories(host_runtime
+    PRIVATE
+        ${ASCEND_HOME_PATH}/lib64
+        ${ASCEND_HOME_PATH}/runtime/lib64
+)
+
 set_target_properties(host_runtime PROPERTIES OUTPUT_NAME "host_runtime")
+
+# Apply compiler sanitizers to this host-compiled target. No-op unless
+# SIMPLER_SANITIZERS is set at configure time, which runtime_compiler only
+# passes for host toolchains (sim + onboard host). See cmake/sanitizers.cmake.
+if(SIMPLER_SANITIZERS)
+    include("${SIMPLER_CMAKE_DIR}/sanitizers.cmake")
+    simpler_apply_sanitizers(host_runtime)
+endif()

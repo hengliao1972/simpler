@@ -1,58 +1,38 @@
 # Developer Guidelines
 
+See [docs/developer-guide.md](docs/developer-guide.md) for full directory structure, compilation pipeline, and conventions.
+
 ## Directory Ownership
 
-Each developer role has a designated working directory. Stay within your assigned area unless explicitly requested by the user.
-
-### Platform Developer
-- **Working directory**: `src/platform/`
-- Write platform-specific logic and abstractions here
-
-### Runtime Developer
-- **Working directory**: `src/runtime/`
-- Write runtime logic including host, aicpu, aicore, and common modules here
-
-### Codegen Developer
-- **Working directory**: `examples/`
-- Write code generation examples and kernel implementations here
-
-## Architecture
-
-PTO Runtime compiles three independent programs (Host `.so`, AICPU `.so`, AICore `.o`) that communicate through handshake buffers on Ascend NPU devices. Three runtime variants live under `src/runtime/` (`host_build_graph`, `aicpu_build_graph`, `tensormap_and_ringbuffer`), two platform backends under `src/platform/` (`a2a3` = hardware, `a2a3sim` = simulation). See `README.md` for the full architecture diagram.
+| Role | Working directory |
+| ---- | ----------------- |
+| Platform Developer | `src/{arch}/platform/` |
+| Runtime Developer | `src/{arch}/runtime/` |
+| Codegen Developer | `examples/` |
 
 ## Common Commands
 
-### Simulation tests (no hardware required)
-```bash
-./ci.sh -p a2a3sim
-```
+See [docs/testing.md](docs/testing.md) for the full testing guide (st, pyut, cpput) and [docs/ci.md](docs/ci.md) for CI pipeline details.
 
-### Hardware tests (requires Ascend device)
-```bash
-./ci.sh -p a2a3 -d 4-7 --parallel
-```
+### Python environment
 
-### Run a single example
-```bash
-python examples/scripts/run_example.py \
-    -k examples/a2a3/host_build_graph/vector_example/kernels \
-    -g examples/a2a3/host_build_graph/vector_example/golden.py \
-    -p a2a3sim
-```
+This repo requires `pip install .` to run. **Always use a project-local venv created with `--system-site-packages`** — never install into the user/global site. Applies equally to git worktrees (create `.venv` inside the worktree). See [.claude/rules/venv-isolation.md](.claude/rules/venv-isolation.md).
 
-### Python unit tests
 ```bash
-pytest tests -v
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+pip install .
 ```
 
 ### Format C++ code
+
 ```bash
 clang-format -i <file>
 ```
 
 ## Important Rules
 
-1. **Consult `.claude/rules/` for coding conventions** (architecture, codestyle, terminology) — these are always-loaded guidelines. **Consult `.claude/skills/` for task-specific workflows** (e.g., `git-commit/` when committing, `testing/` when running tests)
+1. **Consult `.claude/rules/` for coding conventions** (architecture, codestyle, terminology, [discipline](.claude/rules/discipline.md), [doc-consistency](.claude/rules/doc-consistency.md), [env-macro-gating](.claude/rules/env-macro-gating.md)) — these are always-loaded guidelines. **Consult `.claude/skills/` for task-specific workflows** (e.g., `git-commit/` when committing, `testing/` when running tests)
 2. **Do not modify directories outside your assigned area** unless the user explicitly requests it
 3. Create new subdirectories under your assigned directory as needed
 4. When in doubt, ask the user before making changes to other areas

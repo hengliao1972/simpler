@@ -1,22 +1,35 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
 #include "aicore/aicore.h"
-#include "runtime.h"
-#include "common/perf_profiling.h"
-#include "aicore/performance_collector_aicore.h"
+#include "aicore/aicore_profiling_state.h"
+#include "aicore/l2_swimlane_collector_aicore.h"
+#include "aicore/pmu_collector_aicore.h"
+#include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"  // Platform configuration (C/C++ compatible)
+#include "runtime.h"
 
-typedef void (*KernelFunc)(__gm__ int64_t*);
+typedef void (*KernelFunc)(__gm__ int64_t *);
 
-__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task* task) {
+__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task *task) {
     if (task->function_bin_addr == 0) {
         return;
     }
     KernelFunc kernel = (KernelFunc)task->function_bin_addr;
-    kernel(reinterpret_cast<__gm__ int64_t*>(task->args));
-    FULL_MEMORY_BARRIER();
+    kernel(reinterpret_cast<__gm__ int64_t *>(task->args));
+    OUT_OF_ORDER_STORE_BARRIER();
 }
 
-__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type) {
-    __gm__ Handshake* my_hank = (__gm__ Handshake*)(&runtime->workers[block_idx]);
+__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
+    __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->workers[block_idx]);
 
     // Phase 1: Wait for AICPU initialization signal
     while (my_hank->aicpu_ready == 0) {
@@ -25,6 +38,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
 
     // Phase 2: Report physical core ID, signal ready
     my_hank->physical_core_id = get_physical_core_id();
+    OUT_OF_ORDER_STORE_BARRIER();
     my_hank->aicore_regs_ready = 1;
     dcci(&my_hank->aicore_regs_ready, SINGLE_CACHE_LINE, CACHELINE_OUT);
     while (my_hank->aicpu_regs_ready == 0) {
@@ -35,13 +49,23 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
 
     // Phase 3: Report core type, signal ready
     my_hank->core_type = core_type;
-    STORE_RELEASE_FENCE();
+    OUT_OF_ORDER_STORE_BARRIER();
     my_hank->aicore_done = block_idx + 1;
 
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
-    bool profiling_enabled = runtime->enable_profiling;
-    uint64_t kernel_ready_time = get_sys_cnt_aicore();
+    uint32_t enable_profiling_flag = get_aicore_profiling_flag();
+    bool l2_swimlane_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
+    bool dump_tensor_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
+    bool pmu_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
+
+    // Per-core L2SwimlaneActiveHead channel; see tensormap_and_ringbuffer/.../aicore_executor.cpp.
+    // Deferred until first task so AICPU's init has populated the rotation
+    // table (the dispatch itself proves init is done).
+    __gm__ L2SwimlaneActiveHead *l2_swimlane_head = nullptr;
+    // cached_buf_seq must start != AICPU's initial head.current_buf_seq (0)
+    // so the first record_task observes a mismatch and loads the buffer ptr.
+    L2SwimlaneAicoreLocalState l2_swimlane_local = {nullptr, UINT32_MAX, 0};
 
     volatile uint32_t task_id = AICPU_IDLE_TASK_ID;
     volatile uint32_t last_task_id = AICPU_IDLE_TASK_ID;
@@ -60,19 +84,52 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
         }
 
         {
+            // receive_time captures the instant DATA_MAIN_BASE returned a new
+            // task_id, BEFORE the ack write. Paired with start_time (captured
+            // after task_ptr resolve) it lets DFX split head_OH into the
+            // AICPU→AICore NoC propagation (dispatch_ts → receive_time,
+            // hardware-bound) and the AICore-local ack + task_ptr resolve
+            // (receive_time → start_time). host_build_graph has no per-task
+            // dcci so the local-setup span is naturally tighter than the
+            // tensormap_and_ringbuffer runtime; the field still records it.
+            uint64_t receive_time = get_sys_cnt_aicore();
+
             uint32_t actual_task_id = task_id;
             write_reg(RegId::COND, MAKE_ACK_VALUE(actual_task_id));
 
-            __gm__ Task* task_ptr = &(runtime->tasks[actual_task_id]);
+            // First-task lazy resolve of the rotation channel.
+            if (l2_swimlane_enabled && l2_swimlane_head == nullptr) {
+                l2_swimlane_head = get_l2_swimlane_aicore_head();
+            }
+
+            __gm__ Task *task_ptr = &(runtime->tasks[actual_task_id]);
             uint64_t start_time = get_sys_cnt_aicore();
+
+            if (pmu_enabled) {
+                pmu_aicore_begin();
+            }
 
             execute_task(task_ptr);
 
-            if (profiling_enabled) {
+            if (pmu_enabled) {
+                pmu_aicore_end();
+            }
+
+            if (dump_tensor_enabled) {
+                pipe_barrier(PIPE_ALL);
+            }
+
+            if (l2_swimlane_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
-                __gm__ PerfBuffer* perf_buf = (__gm__ PerfBuffer*)my_hank->perf_records_addr;
-                perf_aicore_record_task(perf_buf, actual_task_id,
-                                      start_time, end_time, kernel_ready_time);
+                // host_build_graph uses plain task indices; zero-extend into
+                // the task_token_raw slot (identity) AND pass as reg_task_id
+                // (join key). With block_num always == 1 in this runtime
+                // there is no dispatch fan-out per task, so identity and
+                // dispatch token coincide and a single value covers both.
+                l2_swimlane_aicore_record_task(
+                    l2_swimlane_head, &l2_swimlane_local, static_cast<uint64_t>(actual_task_id),
+                    static_cast<uint32_t>(actual_task_id), receive_time, start_time, end_time
+                );
             }
 
             last_task_id = task_id;
