@@ -18,7 +18,7 @@ PTO_DEVICE_FUNC void publish_task_flag(int32_t task_id) {
     __gm__ DistTaskCell &cell = task_cell(task_id);
 #if defined(__CCE_AICORE__)
     cell.flag = 1;
-    ccec_flush_region(&cell, sizeof(DistTaskCell));
+    dist_aicore_flush_region(&cell, sizeof(DistTaskCell));
 #else
     atom_store(cell.flag, 1, __ATOMIC_RELEASE);
 #endif
@@ -29,7 +29,7 @@ PTO_DEVICE_FUNC bool task_flag_ready(int32_t task_id, int memorder) {
     __gm__ DistTaskCell &cell = task_cell(task_id);
 #if defined(__CCE_AICORE__)
     (void)memorder;
-    ccec_invalidate_region(&cell, sizeof(DistTaskCell));
+    dist_aicore_invalidate_region(&cell, sizeof(DistTaskCell));
     return cell.flag != 0;
 #else
     return atom_load(cell.flag, memorder) != 0;
@@ -41,7 +41,7 @@ PTO_DEVICE_FUNC void store_task_vend(int32_t task_id, uint64_t vend) {
     __gm__ DistTaskCell &cell = task_cell(task_id);
 #if defined(__CCE_AICORE__)
     cell.vend = vend;
-    ccec_flush_region(&cell, sizeof(DistTaskCell));
+    dist_aicore_flush_region(&cell, sizeof(DistTaskCell));
 #else
     atom_store(cell.vend, vend, __ATOMIC_RELAXED);
 #endif
@@ -388,7 +388,7 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
         ctx.payload->scalars[i] = args.scalar(i);
     }
 #if defined(__CCE_AICORE__)
-    ccec_flush_region(ctx.payload, sizeof(DistTaskPayload));
+    dist_aicore_flush_region(ctx.payload, sizeof(DistTaskPayload));
 #endif
     ctx.self->heap_next = task_base + layout.total_output_size;
     ctx.output_bytes = total;

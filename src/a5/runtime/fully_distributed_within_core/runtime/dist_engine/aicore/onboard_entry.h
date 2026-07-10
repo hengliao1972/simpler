@@ -17,7 +17,7 @@ PTO_DEVICE_FUNC void dist_aicore_onboard_main(__gm__ Runtime *runtime, int core_
 #if defined(__CCE_AICORE__)
     if (runtime == nullptr || core_idx < 0 || core_idx >= RUNTIME_MAX_WORKER) return;
 
-    ccec_invalidate_region(const_cast<__gm__ uint64_t *>(&runtime->dist.shared_addr), 64);
+    dist_aicore_invalidate_region(const_cast<__gm__ uint64_t *>(&runtime->dist.shared_addr), 64);
     g_dist_ptr = reinterpret_cast<__gm__ DistGlobal *>(runtime->dist.shared_addr);
     if (g_dist_ptr == nullptr) return;
 
@@ -26,13 +26,13 @@ PTO_DEVICE_FUNC void dist_aicore_onboard_main(__gm__ Runtime *runtime, int core_
     g_ccec_core_type = core_type_int;
     g_self = &g_dist.cores[core_idx];
 
-    ccec_invalidate_region(&g_dist.layout[core_idx], sizeof(CoreLayout));
+    dist_aicore_invalidate_region(&g_dist.layout[core_idx], sizeof(CoreLayout));
     __gm__ const CoreLayout &layout_gm = g_dist.layout[core_idx];
     const CoreLayout lay = {layout_gm.block_id, layout_gm.lane};
     dist_core_reset(*g_self, static_cast<CoreType>(core_type_int), lay.block_id, lay.lane);
     g_self->core_idx = core_idx;
 
-    ccec_invalidate_region(const_cast<__gm__ int32_t *>(&runtime->dist.num_workers), 64);
+    dist_aicore_invalidate_region(const_cast<__gm__ int32_t *>(&runtime->dist.num_workers), 64);
     ccec_init_worker_layout();
     ccec_attach_run_state();
 
