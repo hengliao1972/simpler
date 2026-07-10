@@ -10,6 +10,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import os
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -367,6 +368,7 @@ class RuntimeBuilder:
         name: str,
         extra_sources: list[Path],
         cache_key: str,
+        pto_isa_root: Optional[str] = None,
     ) -> Path:
         """Build a per-callable AICore image with additional source files.
 
@@ -386,6 +388,11 @@ class RuntimeBuilder:
         from .kernel_compiler import KernelCompiler  # noqa: PLC0415
 
         include_dirs.extend(KernelCompiler(platform=self.platform).get_incore_include_dirs())
+        if pto_isa_root is None:
+            pto_isa_root = os.environ.get("PTO_ISA_ROOT")
+        if pto_isa_root:
+            pto_root = Path(pto_isa_root)
+            include_dirs.extend([str(pto_root / "include"), str(pto_root / "include" / "pto")])
 
         arch, variant = self._arch, self._variant
         cache_dir = self._CACHE_DIR / arch / variant / name / "aicore-extra" / cache_key
