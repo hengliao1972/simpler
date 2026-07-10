@@ -38,8 +38,6 @@ PTO2Runtime *runtime_init_data_from_layout(
     *rt = PTO2Runtime{};
     memset(arena.region_ptr(layout.off_dist_global), 0, dist_engine_global_state_size());
 
-    // CPU-sim AICore binds rt->ops to its local distributed ops table when
-    // entering dist_core_main. CCEC wrappers call dist_engine symbols directly.
     rt->mode = mode;
     rt->dist_global = arena.region_ptr(layout.off_dist_global);
     rt->gm_heap = gm_heap_dev_base;

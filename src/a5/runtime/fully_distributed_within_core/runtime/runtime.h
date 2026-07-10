@@ -181,23 +181,6 @@ struct Task {
     uint64_t function_bin_addr;
 };
 
-class Runtime;  // fwd-decl for the DistCoreMainFn typedef below; full definition is further down
-
-// Per-core entry point of the fully_distributed_within_core engine. Implemented
-// in runtime/dist_engine/dist_engine.cpp (compiled into libaicore_kernel; sim
-// also compiles it into libaicpu_kernel for the transitional handoff). Invoked
-// by each AICore worker thread. `core_type` is CoreType (cast to int so this
-// typedef stays header-light). The __gm__ qualifier is a CCE address-space
-// annotation: real hardware requires it on any GM-resident pointer, while
-// on hosts (sim / AICPU) __gm__ expands to nothing. Guarantee the fallback
-// definition locally so this header is safe to include from either target
-// without pulling in common/intrinsic.h. See
-// docs/fully_distributed_within_core.md.
-#ifndef __gm__
-#define __gm__
-#endif
-typedef void (*DistCoreMainFn)(__gm__ Runtime *runtime, int core_idx, int core_type);
-
 // =============================================================================
 // Runtime Class
 // =============================================================================
@@ -247,14 +230,12 @@ public:
     int32_t example_exec_time_ns_[RUNTIME_MAX_FUNC_ID];
 
     // ---- fully_distributed_within_core handoff ----
-    // The AICPU setup thread initializes the shared entry args, then hands the
-    // per-core engine entry off to the AICore worker threads through these
-    // fields. Each AICore worker invokes the orchestration entry linked into the
-    // AICore image after its per-worker ready flag is set, publishes completion
-    // through its own COND register, and AICPU sends EXIT after all workers
-    // report completion.
+    // The AICPU setup thread initializes the shared entry args and wakes the
+    // AICore worker threads. Each AICore worker invokes the dist engine entry
+    // linked into the AICore image after its per-worker ready flag is set,
+    // publishes completion through its own COND register, and AICPU sends EXIT
+    // after all workers report completion.
     struct alignas(64) DistHandoff {
-        volatile uint64_t core_main_fn;  // DistCoreMainFn (in AICPU .so)
         // Address of the DistGlobal struct that carries engine state (cursors,
         // completion flags, block.won, per-core DistCore slots). Written once by
         // dist_engine_register on the AICPU orchestrator thread; every AICore
@@ -264,13 +245,13 @@ public:
         // In sim the AICPU thread writes `&g_dist` (host BSS) since all workers
         // share one address space; onboard writes the GM allocation address.
         volatile uint64_t shared_addr;
-        volatile int32_t num_workers;    // number of AICore workers participating
+        volatile int32_t num_workers;  // number of AICore workers participating
         Tensor ccec_orch_tensors[CHIP_MAX_TENSOR_ARGS];
         uint64_t ccec_orch_scalars[CHIP_MAX_SCALAR_ARGS];
         volatile int32_t ccec_orch_tensor_count;
         volatile int32_t ccec_orch_scalar_count;
         alignas(64) volatile int64_t done_count;  // AICPU-owned progress mirror.
-        L2TaskArgs orch_args;                      // Host/sim orchestration entry args.
+        L2TaskArgs orch_args;                     // Host/sim orchestration entry args.
     } dist;
 
 private:

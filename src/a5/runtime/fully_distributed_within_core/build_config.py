@@ -20,16 +20,24 @@
 # task ring + global completion-flag ring) is layered on incrementally per the
 # spec; the AICPU is reduced to an init/teardown stub.
 #
-# The "orchestration" directory contains source files compiled into both
-# runtime targets AND the orchestration .so (e.g., tensor methods needed
-# by the Tensor constructor's validation logic).
+# The "orchestration" directory contains submit wrappers compiled into the
+# AICore image and the standalone orchestration .so. AICPU/host no longer build
+# it because orchestration replay happens on AICore. Runtime-wide host-side
+# assertion support lives in runtime/assert and is linked wherever common.h is
+# used.
 
 BUILD_CONFIG = {
     "aicore": {
         "include_dirs": ["runtime", "common", ".."],
-        "source_dirs": ["aicore", "orchestration", "runtime/dist_engine"],
+        "source_dirs": ["aicore", "orchestration", "runtime/dist_engine/aicore", "runtime/assert"],
     },
-    "aicpu": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["aicpu", "runtime", "orchestration"]},
-    "host": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["host", "runtime/shared", "orchestration"]},
-    "orchestration": {"include_dirs": ["runtime", "orchestration", "common", ".."], "source_dirs": ["orchestration"]},
+    "aicpu": {
+        "include_dirs": ["runtime", "common", ".."],
+        "source_dirs": ["aicpu", "runtime/shared", "runtime/dist_engine/aicpu", "runtime/assert"],
+    },
+    "host": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["host", "runtime/shared", "runtime/assert"]},
+    "orchestration": {
+        "include_dirs": ["runtime", "orchestration", "common", ".."],
+        "source_dirs": ["orchestration", "runtime/assert"],
+    },
 }
