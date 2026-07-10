@@ -90,6 +90,24 @@ PTO_DEVICE_FUNC void publish_replay_done(__gm__ int64_t &replay_done) {
 #endif
 }
 
+PTO_DEVICE_FUNC void publish_worker_started() {
+#if defined(__CCE_AICORE__)
+    __gm__ int64_t *started = const_cast<__gm__ int64_t *>(&g_dist.started_count);
+    atomicAdd(started, static_cast<int64_t>(1));
+#else
+    atom_fetch_add<int64_t>(g_dist.started_count, 1, __ATOMIC_ACQ_REL);
+#endif
+}
+
+PTO_DEVICE_FUNC int64_t load_worker_started_count() {
+#if defined(__CCE_AICORE__)
+    dist_aicore_invalidate_region(const_cast<__gm__ int64_t *>(&g_dist.started_count), sizeof(g_dist.started_count));
+    return g_dist.started_count;
+#else
+    return atom_load(g_dist.started_count, __ATOMIC_ACQUIRE);
+#endif
+}
+
 template <typename TensorArrPtr, typename ScalarArrPtr, typename FaninArrPtr>
 PTO_DEVICE_FUNC void populate_won_slot(
     __gm__ WonSlot &w, int32_t task_id, const ActiveMask &M, const MixedKernels &mixed, int32_t own_lane,

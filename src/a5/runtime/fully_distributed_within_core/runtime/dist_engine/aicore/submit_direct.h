@@ -397,6 +397,9 @@ PTO_DEVICE_FUNC void direct_replay_orch(__gm__ Runtime *runtime) {
     aicpu_orchestration_entry(local_args);
 #else
     (void)runtime;
+    if (g_dist.orch_args != nullptr && !fatal_set()) {
+        aicpu_orchestration_entry(*g_dist.orch_args);
+    }
 #endif
 }
 
