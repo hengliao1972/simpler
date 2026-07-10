@@ -9,23 +9,26 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Tile-based Matrix Multiplication Kernel (Cube Core)
+ * MIX co-ownership test — AIC (cube) subtask: Cmm = A @ B (single tile).
  *
- * Computes: output = input_a @ input_b (tile_size x tile_size tile matmul)
- * Uses TMATMUL instruction
+ * This is the AIC lane of a 1C+2V MIX task. All three lanes share one argument
+ * list; each lane writes ITS OWN designated output by fixed index:
  *
- * Tile size is determined by golden.py configuration and passed through
- * tensor shapes from orchestration.
- *
- * Args (Tensor*):
- *   args[0] = input_a (INPUT)
- *   args[1] = input_b (INPUT)
- *   args[2] = output  (OUTPUT)
- *   args[3] = config  (INPUT) - int64_t[4]: [tile_size, grid_k, num_groups, incore_loop]
+ *   args[0] = A     (INPUT)
+ *   args[1] = B     (INPUT)
+ *   args[2] = Cmm   (INOUT, external)   <- this AIC lane writes here
+ *   args[3] = V0    (OUTPUT, heap)      <- AIV0 lane
+ *   args[4] = V1    (OUTPUT, heap)      <- AIV1 lane
+ *   args[5] = config (INPUT) int64_t[4]: [tile_size, grid_k, num_groups, num_tiles]
  */
 
 #include <cstdint>
+
+#if __has_include("inner_kernel.h")
+#include "inner_kernel.h"
+#elif __has_include(<pto/pto-inst.hpp>)
 #include <pto/pto-inst.hpp>
+#endif
 #include <pto/common/constants.hpp>
 #include <pto/common/pto_tile.hpp>
 
@@ -35,10 +38,14 @@ using namespace pto;
 using ::pto::Stride;  // resolve ambiguity with CANN global Stride enum
 #endif
 
+#if __has_include(<pto/pto-inst.hpp>)
 using namespace pto;
 
+#endif
 
+#if __has_include("pipe_sync.h")
 #include "pipe_sync.h"
+#endif
 
 #ifndef __gm__
 #define __gm__
@@ -57,7 +64,7 @@ AICORE constexpr inline T CeilAlign(T num_1, T num_2) {
 }
 
 template <int TILE>
-static __aicore__ void gemm_tile_impl(__gm__ float *input_a, __gm__ float *input_b, __gm__ float *output) {
+static __aicore__ void mm_tile_impl(__gm__ float *input_a, __gm__ float *input_b, __gm__ float *output) {
     constexpr int blockAlign = C0_SIZE_BYTE / sizeof(float);
     constexpr int M = CeilAlign<int>(TILE, 16);
     constexpr int K = CeilAlign<int>(TILE, blockAlign);
@@ -118,17 +125,17 @@ static __aicore__ void gemm_tile_impl(__gm__ float *input_a, __gm__ float *input
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *input_a = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ Tensor *input_b = reinterpret_cast<__gm__ Tensor *>(args[1]);
-    __gm__ Tensor *output = reinterpret_cast<__gm__ Tensor *>(args[2]);
-    __gm__ Tensor *config = reinterpret_cast<__gm__ Tensor *>(args[3]);
+    __gm__ Tensor *cmm = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ Tensor *config = reinterpret_cast<__gm__ Tensor *>(args[5]);
 
     __gm__ int64_t *cfg = reinterpret_cast<__gm__ int64_t *>(config->buffer.addr);
     uint64_t tile_size = static_cast<uint64_t>(cfg[0]);
     uint64_t tile_elems = tile_size * tile_size;
-    int num_tiles = static_cast<uint64_t>(cfg[3]);
+    int num_tiles = static_cast<int>(cfg[3]);
 
     __gm__ float *base_a = reinterpret_cast<__gm__ float *>(input_a->buffer.addr) + input_a->start_offset;
     __gm__ float *base_b = reinterpret_cast<__gm__ float *>(input_b->buffer.addr) + input_b->start_offset;
-    __gm__ float *base_c = reinterpret_cast<__gm__ float *>(output->buffer.addr) + output->start_offset;
+    __gm__ float *base_c = reinterpret_cast<__gm__ float *>(cmm->buffer.addr) + cmm->start_offset;
 
     for (int tile_idx = 0; tile_idx < num_tiles; tile_idx++) {
         __gm__ float *a_ptr = base_a + (tile_idx * tile_elems);
@@ -137,16 +144,16 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
 
         switch (tile_size) {
         case 16:
-            gemm_tile_impl<16>(a_ptr, b_ptr, c_ptr);
+            mm_tile_impl<16>(a_ptr, b_ptr, c_ptr);
             break;
         case 32:
-            gemm_tile_impl<32>(a_ptr, b_ptr, c_ptr);
+            mm_tile_impl<32>(a_ptr, b_ptr, c_ptr);
             break;
         case 64:
-            gemm_tile_impl<64>(a_ptr, b_ptr, c_ptr);
+            mm_tile_impl<64>(a_ptr, b_ptr, c_ptr);
             break;
         case 128:
-            gemm_tile_impl<128>(a_ptr, b_ptr, c_ptr);
+            mm_tile_impl<128>(a_ptr, b_ptr, c_ptr);
             break;
         default:
             break;

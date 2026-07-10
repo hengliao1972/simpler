@@ -299,7 +299,16 @@ class RuntimeCompiler:
                     dest_dir.mkdir(parents=True, exist_ok=True)
                     dest_dispatcher = dest_dir / dispatcher_name
                     shutil.copy2(dispatcher_so, dest_dispatcher)
-                    subprocess.run(["strip", "-s", str(dest_dispatcher)], check=True)
+                    strip_result = subprocess.run(
+                        ["strip", "-s", str(dest_dispatcher)],
+                        capture_output=True,
+                    )
+                    if strip_result.returncode != 0:
+                        logger.debug(
+                            "strip on %s failed (likely cross-arch aarch64 SO on x86 host): %s",
+                            dest_dispatcher,
+                            strip_result.stderr.decode(errors="replace").strip(),
+                        )
             if output_dir is not None:
                 od = Path(output_dir)
                 od.mkdir(parents=True, exist_ok=True)

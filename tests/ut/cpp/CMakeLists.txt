@@ -470,6 +470,26 @@ target_link_libraries(test_host_log_off PRIVATE
 )
 add_test(NAME test_host_log_off COMMAND test_host_log_off)
 
+# ---------------------------------------------------------------------------
+# Standalone distributed-atomic minibench tests (MB-1/3/5/9)
+# ---------------------------------------------------------------------------
+# These tests re-implement the core data structures (claim cursor, frontier
+# CAS, SharedTensorMap ring, private replica) from scratch using std::atomic
+# and std::thread. No dist_engine.cpp dependency — pure host, pure logic.
+function(add_standalone_dist_test name src)
+    add_executable(${name} ${src})
+    target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/../../../src/common)
+    target_link_libraries(${name} PRIVATE pthread)
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
+endfunction()
+
+add_standalone_dist_test(test_dist_tensormap_ring a2a3/test_dist_tensormap_ring.cpp)
+add_standalone_dist_test(test_dist_atomic_mb1_claim a5/test_dist_atomic_mb1_claim.cpp)
+add_standalone_dist_test(test_dist_atomic_mb3_frontier a5/test_dist_atomic_mb3_frontier.cpp)
+add_standalone_dist_test(test_dist_atomic_mb5_shared_map a5/test_dist_atomic_mb5_shared_map.cpp)
+add_standalone_dist_test(test_dist_atomic_mb9_private_det a5/test_dist_atomic_mb9_private_det.cpp)
+
 # Hardware-gated tests.  Block is only entered when the project is configured
 # with -DSIMPLER_ENABLE_HARDWARE_TESTS=ON.  CI's no-hw `ut` job does not pass
 # this flag, so nothing here is compiled there — this is the structural
