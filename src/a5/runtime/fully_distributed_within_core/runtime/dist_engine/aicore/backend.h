@@ -22,22 +22,3 @@ PTO_DEVICE_FUNC inline uint64_t dist_aicore_slot_function_addr(Runtime *runtime,
     return resolve_kernel_addr(runtime, kernel_id);
 #endif
 }
-
-PTO_DEVICE_FUNC inline void dist_aicore_call_slot_kernel(__gm__ RingSlot &slot) {
-#if defined(__CCE_AICORE__)
-    const bool is_aic = g_ccec_core_type == static_cast<int32_t>(CoreType::AIC);
-    if (is_aic) {
-        if (pto_call_linked_kernel_aic != nullptr) {
-            pto_call_linked_kernel_aic(slot.func_id, reinterpret_cast<__gm__ int64_t *>(slot.args));
-        }
-    } else if (pto_call_linked_kernel_aiv != nullptr) {
-        pto_call_linked_kernel_aiv(slot.func_id, reinterpret_cast<__gm__ int64_t *>(slot.args));
-    }
-#else
-    typedef void (*KernelFn)(__gm__ int64_t *);
-    if (slot.function_bin_addr != 0) {
-        KernelFn fn = reinterpret_cast<KernelFn>(slot.function_bin_addr);
-        fn(reinterpret_cast<__gm__ int64_t *>(slot.args));
-    }
-#endif
-}

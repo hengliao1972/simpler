@@ -55,32 +55,6 @@ PTO_DEVICE_FUNC uint64_t resolve_kernel_addr(Runtime *runtime, int32_t kernel_id
     return callable->resolved_addr();
 }
 
-PTO_DEVICE_FUNC void store_won_remaining(__gm__ WonSlot &w, int32_t count) {
-#if defined(__CCE_AICORE__)
-    w.remaining = count;
-#else
-    atom_store<int64_t>(w.remaining, count, __ATOMIC_RELAXED);
-#endif
-}
-
-PTO_DEVICE_FUNC void reset_won_lane(__gm__ WonSlot &w, int32_t lane) {
-#if defined(__CCE_AICORE__)
-    w.drained[lane].v = 0;
-#else
-    atom_store(w.drained[lane].v, 0, __ATOMIC_RELAXED);
-#endif
-    w.lane[lane].present = false;
-}
-
-PTO_DEVICE_FUNC bool decrement_won_remaining_is_last(__gm__ WonSlot &w) {
-#if defined(__CCE_AICORE__)
-    __gm__ int64_t *remaining = const_cast<__gm__ int64_t *>(&w.remaining);
-    return atomicSub(remaining, static_cast<int64_t>(1)) == 1;
-#else
-    return atom_fetch_sub<int64_t>(w.remaining, 1, __ATOMIC_ACQ_REL) == 1;
-#endif
-}
-
 PTO_DEVICE_FUNC void publish_replay_done(__gm__ int64_t &replay_done) {
 #if defined(__CCE_AICORE__)
     __gm__ int64_t *addr = const_cast<__gm__ int64_t *>(&replay_done);
