@@ -25,18 +25,19 @@
  */
 
 #include <cstdint>
-#include <pto/pto-inst.hpp>
-#include <pto/common/constants.hpp>
-#include <pto/common/pto_tile.hpp>
 
-#include "tensor.h"
+#if __has_include("inner_kernel.h")
+#include "inner_kernel.h"
+#endif
 #if __has_include(<pto/pto-inst.hpp>)
+#include <pto/pto-inst.hpp>
 using namespace pto;
-using ::pto::Stride;  // resolve ambiguity with CANN global Stride enum
+#endif
+#if __has_include(<pto/common/constants.hpp>)
+#include <pto/common/constants.hpp>
 #endif
 
-using namespace pto;
-
+#include "tensor.h"
 
 #include "pipe_sync.h"
 
@@ -64,11 +65,11 @@ static __aicore__ void gemm_tile_impl(__gm__ float *input_a, __gm__ float *input
     constexpr int N = CeilAlign<int>(TILE, blockAlign);
 
     using GlobalDataA =
-        GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>, Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
+        GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>, pto::Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
     using GlobalDataB =
-        GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>, Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
+        GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>, pto::Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
     using GlobalDataC =
-        GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>, Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
+        GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>, pto::Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
 
     GlobalDataA src0Global(input_a);
     GlobalDataB src1Global(input_b);

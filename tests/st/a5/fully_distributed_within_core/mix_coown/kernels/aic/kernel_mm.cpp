@@ -26,22 +26,16 @@
 
 #if __has_include("inner_kernel.h")
 #include "inner_kernel.h"
-#elif __has_include(<pto/pto-inst.hpp>)
-#include <pto/pto-inst.hpp>
 #endif
+#if __has_include(<pto/pto-inst.hpp>)
+#include <pto/pto-inst.hpp>
+using namespace pto;
+#endif
+#if __has_include(<pto/common/constants.hpp>)
 #include <pto/common/constants.hpp>
-#include <pto/common/pto_tile.hpp>
+#endif
 
 #include "tensor.h"
-#if __has_include(<pto/pto-inst.hpp>)
-using namespace pto;
-using ::pto::Stride;  // resolve ambiguity with CANN global Stride enum
-#endif
-
-#if __has_include(<pto/pto-inst.hpp>)
-using namespace pto;
-
-#endif
 
 #if __has_include("pipe_sync.h")
 #include "pipe_sync.h"
@@ -71,11 +65,11 @@ static __aicore__ void mm_tile_impl(__gm__ float *input_a, __gm__ float *input_b
     constexpr int N = CeilAlign<int>(TILE, blockAlign);
 
     using GlobalDataA =
-        GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>, Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
+        GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>, pto::Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
     using GlobalDataB =
-        GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>, Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
+        GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>, pto::Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
     using GlobalDataC =
-        GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>, Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
+        GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>, pto::Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
 
     GlobalDataA src0Global(input_a);
     GlobalDataB src1Global(input_b);

@@ -21,7 +21,8 @@
 
 #if __has_include("inner_kernel.h")
 #include "inner_kernel.h"
-#elif __has_include(<pto/pto-inst.hpp>)
+#endif
+#if __has_include(<pto/pto-inst.hpp>)
 #include <pto/pto-inst.hpp>
 #endif
 #include "tensor.h"
@@ -51,5 +52,8 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
         result[i] = buf[i] + 1.0f;
     }
 
+#if defined(__CCE_AICORE__)
+    dcci(reinterpret_cast<__gm__ uint8_t *>(result), SINGLE_CACHE_LINE, CACHELINE_OUT);
+#endif
     pipe_sync();
 }

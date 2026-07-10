@@ -37,14 +37,14 @@
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
+__attribute__((visibility("default"), weak)) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 4,
     };
 }
 
-__attribute__((visibility("default"))) PTO_DEVICE_FUNC void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
+__attribute__((visibility("default"), weak)) PTO_DEVICE_FUNC void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     // Tensor args. TensorRef stores default-address-space pointers (see
     // pto_types.h) — orch is all stack-local on the AICore, and the engine
     // marshals content into GM on cross-core handoff paths. Host / sim
