@@ -60,7 +60,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
         aicpu_orchestration_entry(*g_dist.orch_args);
     }
 
-    ccec_drain_to_completion(self);
+    direct_drain_to_completion(self);
     g_self = nullptr;
     ccec_publish_done();
     __atomic_add_fetch(&runtime->dist.done_count, 1, __ATOMIC_ACQ_REL);
