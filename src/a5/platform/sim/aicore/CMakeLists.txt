@@ -74,7 +74,7 @@ target_compile_options(aicore_kernel
 
 # Define __CPU_SIM for CPU simulation backend
 # This enables CPU stubs for PTO instructions (TLOAD, TSTORE, TADD, etc.)
-target_compile_definitions(aicore_kernel PRIVATE __CPU_SIM)
+target_compile_definitions(aicore_kernel PRIVATE __CPU_SIM __SIM_AICORE__)
 
 # Include directories
 target_include_directories(aicore_kernel
