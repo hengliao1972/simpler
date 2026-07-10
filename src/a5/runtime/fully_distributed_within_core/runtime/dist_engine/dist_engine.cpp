@@ -1155,8 +1155,8 @@ PTO_DEVICE_FUNC void publish_task_flag(int32_t task_id) {
     if (task_id < 0 || task_id >= kFlagCap) return;
     __gm__ DistTaskCell &cell = task_cell(task_id);
 #if defined(__CCE_AICORE__)
-    cell.flag = 1;
-    ccec_flush_region(&cell, sizeof(DistTaskCell));
+    __gm__ int64_t *flag_addr = const_cast<__gm__ int64_t *>(&cell.flag);
+    (void)atomicMax(flag_addr, static_cast<int64_t>(1));
 #else
     atom_store(cell.flag, 1, __ATOMIC_RELEASE);
 #endif
@@ -1167,8 +1167,8 @@ PTO_DEVICE_FUNC bool task_flag_ready(int32_t task_id, int memorder) {
     __gm__ DistTaskCell &cell = task_cell(task_id);
 #if defined(__CCE_AICORE__)
     (void)memorder;
-    ccec_invalidate_region(&cell, sizeof(DistTaskCell));
-    return cell.flag != 0;
+    __gm__ int64_t *flag_addr = const_cast<__gm__ int64_t *>(&cell.flag);
+    return atomicMax(flag_addr, static_cast<int64_t>(0)) > 0;
 #else
     return atom_load(cell.flag, memorder) != 0;
 #endif
@@ -2491,6 +2491,7 @@ PTO_DEVICE_FUNC bool ccec_build_winner_slot(DistSubmitCtx &ctx, __gm__ RingSlot 
 }
 
 PTO_DEVICE_FUNC void ccec_call_slot_kernel(__gm__ RingSlot &slot) {
+    ccec_invalidate_region(&slot, sizeof(RingSlot));
     const bool is_aic = g_ccec_core_type == static_cast<int32_t>(CoreType::AIC);
     if (is_aic) {
         if (pto_call_linked_kernel_aic != nullptr) {
@@ -2522,9 +2523,18 @@ PTO_DEVICE_FUNC bool ccec_slot_fanin_ready(__gm__ const RingSlot &slot) {
 }
 
 PTO_DEVICE_FUNC bool ccec_try_execute_slot_direct(__gm__ RingSlot &slot, __gm__ DistCore *self) {
+    ccec_invalidate_region(&slot.occupied, 64);
     if (!slot.occupied || !slot.built || !ccec_slot_fanin_ready(slot)) return false;
     ccec_call_slot_kernel(slot);
     OUT_OF_ORDER_STORE_BARRIER();
+#if defined(__CCE_AICORE__)
+    for (int32_t i = 0; i < slot.tensor_count; i++) {
+        __gm__ uint8_t *base = reinterpret_cast<__gm__ uint8_t *>(
+            static_cast<uintptr_t>(slot.tensors[i].buffer.addr)
+        );
+        ccec_flush_region(base, slot.tensors[i].buffer.size);
+    }
+#endif
     ccec_complete_slot(slot, self);
     slot.built = false;
     slot.occupied = false;
