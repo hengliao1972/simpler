@@ -11,20 +11,6 @@
 
 #pragma once
 
-#if defined(__CPU_SIM)
-#define DIST_SIM_HOST_CLOCK 1
-#else
-#define DIST_SIM_HOST_CLOCK 0
-#endif
+#include <cstdio>
 
-#if defined(PTO2_PROFILING) && PTO2_PROFILING && defined(__CPU_SIM)
-#define DIST_TRACE_ENABLED 1
-#else
-#define DIST_TRACE_ENABLED 0
-#endif
-
-#if defined(__CCE_AICORE__)
-#define DIST_API_ATTR __attribute__((weak))
-#else
-#define DIST_API_ATTR
-#endif
+#define DIST_ERRF(...) fprintf(stderr, __VA_ARGS__)

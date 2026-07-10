@@ -16,9 +16,7 @@
  * submit path used by fully_distributed_within_core. Orchestration source (per
  * example, under examples/.../kernels/orchestration/) drives that engine
  * through the
- * inline wrappers in pto_orchestration_api.h. Those wrappers used to route
- * through rt->ops (a cross-library function-pointer table), which tied the
- * orchestration path to runtime symbol binding instead of normal linking.
+ * inline wrappers in pto_orchestration_api.h.
  *
  * This header exposes the same set of engine operations as direct symbols that
  * the wrappers can call at compile time. Since orchestration is compiled into
@@ -44,20 +42,9 @@
 #include "pto_submit_types.h"  // MixedKernels
 #include "pto_types.h"         // L0TaskArgs, TaskOutputTensors, PTO_DEVICE_FUNC (via data_type.h)
 #include "tensor.h"            // Tensor
+#include "dist_engine/common/state.h"
 
 struct PTO2Runtime;
-
-struct DistTaskPayload {
-    int32_t tensor_count;
-    int32_t scalar_count;
-    TensorArgType tags[MAX_TENSOR_ARGS];
-    uint8_t tensors_pad_[56];
-    Tensor tensors[MAX_TENSOR_ARGS];
-    uint64_t scalars[MAX_SCALAR_ARGS];
-};
-static_assert(sizeof(DistTaskPayload) % 64 == 0, "DistTaskPayload must not share cachelines");
-static_assert(offsetof(DistTaskPayload, tensors) % 64 == 0, "payload tensors must be cacheline-aligned");
-static_assert(offsetof(DistTaskPayload, scalars) % 64 == 0, "payload scalars must be cacheline-aligned");
 
 // Task submission and allocation. Host/sim definitions use the per-core g_self
 // stashed by dist_core_main / thread_local sim. CCEC definitions use the same

@@ -170,8 +170,8 @@ int32_t AicpuExecutor::handshake_all_cores(Runtime *runtime) {
         }
 
         LOG_INFO_V0(
-            "Core %d: %s, physical_id=%u, reg_addr=0x%lx", i,
-            hank->core_type == CoreType::AIC ? "AIC" : "AIV", physical_core_id, reg_addr
+            "Core %d: %s, physical_id=%u, reg_addr=0x%lx", i, hank->core_type == CoreType::AIC ? "AIC" : "AIV",
+            physical_core_id, reg_addr
         );
     }
 
@@ -245,9 +245,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
             cache_flush_range(runtime->dist.ccec_orch_tensors, sizeof(runtime->dist.ccec_orch_tensors));
             cache_flush_range(runtime->dist.ccec_orch_scalars, sizeof(runtime->dist.ccec_orch_scalars));
-            cache_flush_range(
-                const_cast<const int32_t *>(&runtime->dist.ccec_orch_tensor_count), 2 * sizeof(int32_t)
-            );
+            cache_flush_range(const_cast<const int32_t *>(&runtime->dist.ccec_orch_tensor_count), 2 * sizeof(int32_t));
 
             // rt is bound to *this* run's memory and must be reattached every
             // run.
@@ -269,10 +267,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
 
             // Host has pre-populated the runtime header and uploaded it into
-            // the pooled runtime_arena buffer. The distributed path only needs
-            // the PTO2Runtime header itself: CPU-sim AICore wrappers bind
-            // rt->ops inside dist_core_main(), and dist_engine reads the
-            // example-exec-time fields from rt.
+            // the pooled runtime_arena buffer. The distributed path reads the
+            // PTO2Runtime header directly from that arena.
             void *prebuilt_arena = runtime->get_prebuilt_arena_base();
             size_t off_runtime = runtime->get_prebuilt_runtime_offset();
             if (prebuilt_arena == nullptr) {
@@ -293,20 +289,18 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 #endif
             // ---- fully_distributed_within_core handoff ----
             // Instead of running orchestration here, wire the distributed engine
-            // (resets cursors/flags/heap) and hand the per-core entry off to
-            // the AICore worker threads, which replay orchestration in SPMD
-            // fashion and execute the tasks they win. This AICPU thread then
-            // waits for all workers.
+            // (resets cursors/flags/heap) and wake the AICore worker threads,
+            // which call their own linked dist_core_main entry, replay
+            // orchestration in SPMD fashion, and execute the tasks they win.
+            // This AICPU thread then waits for all workers.
             // See runtime/dist_engine.* and docs/fully_distributed_within_core.md.
             {
                 const int32_t num_workers = runtime->worker_count;
-                void *core_main = dist_engine_register(rt, &runtime->dist.orch_args, num_workers, runtime);
-                runtime->dist.core_main_fn = reinterpret_cast<uint64_t>(core_main);
+                dist_engine_register(rt, &runtime->dist.orch_args, num_workers, runtime);
                 runtime->dist.num_workers = num_workers;
                 __atomic_store_n(&runtime->dist.done_count, 0, __ATOMIC_RELEASE);
                 cache_flush_range(rt->dist_global, dist_engine_global_state_size());
                 cache_flush_range(&runtime->dist, sizeof(runtime->dist));
-                cache_flush_range(const_cast<const uint64_t *>(&runtime->dist.core_main_fn), sizeof(uint64_t));
                 cache_flush_range(const_cast<const int32_t *>(&runtime->dist.num_workers), sizeof(int32_t));
                 cache_flush_range(const_cast<const int64_t *>(&runtime->dist.done_count), sizeof(int64_t));
                 uint64_t *regs = reinterpret_cast<uint64_t *>(get_platform_regs());

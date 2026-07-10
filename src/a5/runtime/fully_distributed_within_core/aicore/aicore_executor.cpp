@@ -19,12 +19,7 @@
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
 
-#if defined(__CPU_SIM)
-extern "C" PTO_DEVICE_FUNC void aicore_dist_core_main(__gm__ Runtime *runtime, int core_idx, int core_type_int);
-#endif
-#if defined(__CCE_AICORE__)
 PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int core_idx, int core_type_int);
-#endif
 
 /**
  * Unified function pointer type for kernel dispatch
@@ -55,13 +50,12 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2Di
  * AICore main execution loop — fully_distributed_within_core variant.
  *
  * Instead of polling DATA_MAIN_BASE for AICPU-dispatched tasks, each AICore
- * worker invokes the distributed engine entry (compiled into the AICPU .so on
- * sim; onboard is the target of the subsequent CCEC migration, see
- * docs/fully_distributed_within_core.md). The engine replays the orchestration
- * submit stream, claims/builds the tasks it wins, and executes them; on return
- * it has published this worker's completion. The worker then honors the
- * existing teardown protocol (wait for EXIT, ack EXITED). AICPU sends EXIT
- * only after every worker reports completion.
+ * worker invokes the distributed engine entry linked into the AICore image.
+ * The engine replays the orchestration submit stream, claims/builds the tasks
+ * it wins, and executes them; on return it has published this worker's
+ * completion. The worker then honors the existing teardown protocol (wait for
+ * EXIT, ack EXITED). AICPU sends EXIT only after every worker reports
+ * completion.
  *
  * Handshake phases 1-3 are preserved verbatim (register handshake, physical
  * core id publication, per-core dispatch payload cache). The trb-style
@@ -105,25 +99,17 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
     // ===========================================================================
-    // Phase 4 (dist): wait for the AICPU to publish the engine entry, invoke it
-    // once, then hand off to the shutdown protocol below. The engine handles all
-    // per-core orchestration replay, task claim/build/execute, and completion
-    // flag publication internally; there is no per-task register handshake.
+    // Phase 4 (dist): wait for the AICPU to publish shared engine state,
+    // invoke the linked engine entry once, then hand off to the shutdown
+    // protocol below. The engine handles all per-core orchestration replay,
+    // task claim/build/execute, and completion flag publication internally;
+    // there is no per-task register handshake.
     // ===========================================================================
     while (my_hank->aicpu_ready != AICPU_READY_DIST_RUN) {
         dcci(my_hank, SINGLE_CACHE_LINE);
         SPIN_WAIT_HINT();
     }
-#if defined(__CPU_SIM)
-    aicore_dist_core_main(runtime, s_block_idx, static_cast<int>(core_type));
-#elif defined(__CCE_AICORE__)
     dist_core_main(runtime, s_block_idx, static_cast<int>(core_type));
-#else
-    DistCoreMainFn core_main = reinterpret_cast<DistCoreMainFn>(runtime->dist.core_main_fn);
-    if (core_main != nullptr) {
-        core_main(runtime, s_block_idx, static_cast<int>(core_type));
-    }
-#endif
     // Teardown: wait for the AICPU EXIT signal on DATA_MAIN_BASE and ack.
     while (true) {
         uint32_t reg_val = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));

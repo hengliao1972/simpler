@@ -20,7 +20,8 @@ template<typename T = uint64_t>
 void set_tensor_data(Tensor& tensor, uint32_t ndims, const uint32_t indices[], T value);
 ```
 
-Both call into the runtime through the ops table — orchestration .so needs no runtime symbol linkage.
+In fully_distributed_within_core, both helpers call the distributed engine's
+direct API from orchestration; this runtime has no submit/runtime ops table.
 
 ## 3. Blocking Interface Design
 
