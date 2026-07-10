@@ -34,7 +34,7 @@ PTO_DEVICE_FUNC uint64_t load_task_vend(int32_t task_id) {
     if (task_id < 0) return 0;
     __gm__ DistTaskCell &cell = task_cell(task_id);
 #if defined(__CCE_AICORE__)
-    ccec_invalidate_region(&cell, sizeof(DistTaskCell));
+    dist_aicore_invalidate_region(&cell, sizeof(DistTaskCell));
     return cell.vend;
 #else
     return atom_load(cell.vend, __ATOMIC_RELAXED);
@@ -55,6 +55,41 @@ PTO_DEVICE_FUNC uint64_t resolve_kernel_addr(Runtime *runtime, int32_t kernel_id
     return callable->resolved_addr();
 }
 
+PTO_DEVICE_FUNC void store_won_remaining(__gm__ WonSlot &w, int32_t count) {
+#if defined(__CCE_AICORE__)
+    w.remaining = count;
+#else
+    atom_store<int64_t>(w.remaining, count, __ATOMIC_RELAXED);
+#endif
+}
+
+PTO_DEVICE_FUNC void reset_won_lane(__gm__ WonSlot &w, int32_t lane) {
+#if defined(__CCE_AICORE__)
+    w.drained[lane].v = 0;
+#else
+    atom_store(w.drained[lane].v, 0, __ATOMIC_RELAXED);
+#endif
+    w.lane[lane].present = false;
+}
+
+PTO_DEVICE_FUNC bool decrement_won_remaining_is_last(__gm__ WonSlot &w) {
+#if defined(__CCE_AICORE__)
+    __gm__ int64_t *remaining = const_cast<__gm__ int64_t *>(&w.remaining);
+    return atomicSub(remaining, static_cast<int64_t>(1)) == 1;
+#else
+    return atom_fetch_sub<int64_t>(w.remaining, 1, __ATOMIC_ACQ_REL) == 1;
+#endif
+}
+
+PTO_DEVICE_FUNC void publish_replay_done(__gm__ int64_t &replay_done) {
+#if defined(__CCE_AICORE__)
+    __gm__ int64_t *addr = const_cast<__gm__ int64_t *>(&replay_done);
+    atomicAdd(addr, static_cast<int64_t>(1));
+#else
+    atom_fetch_add<int64_t>(replay_done, 1, __ATOMIC_ACQ_REL);
+#endif
+}
+
 template <typename TensorArrPtr, typename ScalarArrPtr, typename FaninArrPtr>
 PTO_DEVICE_FUNC void populate_won_slot(
     __gm__ WonSlot &w, int32_t task_id, const ActiveMask &M, const MixedKernels &mixed, int32_t own_lane,
@@ -62,24 +97,7 @@ PTO_DEVICE_FUNC void populate_won_slot(
 ) {
     const int32_t pc = __builtin_popcount(M.core_mask());
     w.task_id = task_id;
-#if defined(__CCE_AICORE__)
-    w.remaining = pc;
-#else
-    atom_store<int64_t>(w.remaining, pc, __ATOMIC_RELAXED);
-#endif
-#if defined(__CCE_AICORE__)
-#define RESET_WON_LANE(L)            \
-    do {                             \
-        w.drained[(L)].v = 0;        \
-        w.lane[(L)].present = false; \
-    } while (0)
-#else
-#define RESET_WON_LANE(L)                                  \
-    do {                                                   \
-        atom_store(w.drained[(L)].v, 0, __ATOMIC_RELAXED); \
-        w.lane[(L)].present = false;                       \
-    } while (0)
-#endif
+    store_won_remaining(w, pc);
 #define POPULATE_WON_LANE(L)                                                                    \
     do {                                                                                        \
         if ((L) == own_lane || !lane_active(M, (L))) break;                                     \
@@ -98,14 +116,13 @@ PTO_DEVICE_FUNC void populate_won_slot(
             b.fanin[k] = fanin[k];                                                              \
         b.sub_block_id = ((L) == LANE_AIV1) ? 1 : 0;                                            \
     } while (0)
-    RESET_WON_LANE(LANE_AIC);
-    RESET_WON_LANE(LANE_AIV0);
-    RESET_WON_LANE(LANE_AIV1);
+    reset_won_lane(w, LANE_AIC);
+    reset_won_lane(w, LANE_AIV0);
+    reset_won_lane(w, LANE_AIV1);
     POPULATE_WON_LANE(LANE_AIC);
     POPULATE_WON_LANE(LANE_AIV0);
     POPULATE_WON_LANE(LANE_AIV1);
 #undef POPULATE_WON_LANE
-#undef RESET_WON_LANE
 }
 
 PTO_DEVICE_FUNC int32_t alloc_won_slot(int32_t block) {

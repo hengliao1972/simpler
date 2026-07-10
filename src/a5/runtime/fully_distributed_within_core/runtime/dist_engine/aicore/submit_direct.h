@@ -20,7 +20,7 @@ PTO_DEVICE_FUNC void direct_advance_frontier() {
 #if defined(__CCE_AICORE__)
     if (g_dist_ptr == nullptr) return;
     __gm__ int64_t *frontier = const_cast<__gm__ int64_t *>(&g_dist.frontier);
-    ccec_invalidate_region(frontier, 64);
+    dist_aicore_invalidate_region(frontier, 64);
     int64_t f = g_dist.frontier;
     while (true) {
         const int64_t next = f + 1;
@@ -120,7 +120,7 @@ PTO_DEVICE_FUNC __gm__ RingSlot *direct_alloc_slot(__gm__ DistCore *self) {
     slot.occupied = true;
     slot.built = false;
     self->occupied_count++;
-    ccec_flush_region(&slot, sizeof(RingSlot));
+    dist_aicore_flush_region(&slot, sizeof(RingSlot));
     return &slot;
 }
 
@@ -134,7 +134,7 @@ PTO_DEVICE_FUNC void direct_wait_slot_capacity(__gm__ DistCore *self) {
 
 PTO_DEVICE_FUNC bool direct_fatal_set() {
 #if defined(__CCE_AICORE__)
-    ccec_invalidate_region(const_cast<__gm__ int32_t *>(&g_dist.fatal), sizeof(g_dist.fatal));
+    dist_aicore_invalidate_region(const_cast<__gm__ int32_t *>(&g_dist.fatal), sizeof(g_dist.fatal));
     return g_dist.fatal != 0;
 #else
     return fatal_set();
@@ -144,7 +144,7 @@ PTO_DEVICE_FUNC bool direct_fatal_set() {
 PTO_DEVICE_FUNC void direct_set_fatal() {
 #if defined(__CCE_AICORE__)
     g_dist.fatal = 1;
-    ccec_flush_region(const_cast<__gm__ int32_t *>(&g_dist.fatal), sizeof(g_dist.fatal));
+    dist_aicore_flush_region(const_cast<__gm__ int32_t *>(&g_dist.fatal), sizeof(g_dist.fatal));
 #else
     set_fatal();
 #endif
@@ -155,7 +155,7 @@ PTO_DEVICE_FUNC bool direct_wait_heap_capacity(DistSubmitCtx &ctx, DistSubmitKin
     const size_t ring = g_dist.heap_size;
     while (!direct_fatal_set()) {
         __gm__ int64_t *frontier = const_cast<__gm__ int64_t *>(&g_dist.frontier);
-        ccec_invalidate_region(frontier, 64);
+        dist_aicore_invalidate_region(frontier, 64);
         const int32_t f = static_cast<int32_t>(g_dist.frontier);
         const int32_t R = f - g_dist.H;
         const uint64_t vstart_live = load_task_vend(R);
@@ -189,11 +189,11 @@ PTO_DEVICE_FUNC int32_t direct_alloc_won_slot(__gm__ DistCore *self, int32_t blo
 #else
     __gm__ BlockWon &bw = g_dist.blocks[block];
     while (true) {
-        ccec_invalidate_region(&bw, sizeof(BlockWon));
+        dist_aicore_invalidate_region(&bw, sizeof(BlockWon));
         for (int32_t i = 0; i < kPrivateSlots; i++) {
             if (bw.slots[i].state != 0) continue;
             bw.slots[i].state = 2;
-            ccec_flush_region(&bw.slots[i], sizeof(WonSlot));
+            dist_aicore_flush_region(&bw.slots[i], sizeof(WonSlot));
             return i;
         }
         direct_drain_block_won(self);
@@ -219,8 +219,8 @@ PTO_DEVICE_FUNC void direct_publish_joint_deposits(DistSubmitCtx &ctx, const Mix
     );
     w.state = 1;
     g_dist.blocks[ctx.joint_block].any_pub = 1;
-    ccec_flush_region(&w, sizeof(WonSlot));
-    ccec_flush_region(
+    dist_aicore_flush_region(&w, sizeof(WonSlot));
+    dist_aicore_flush_region(
         const_cast<__gm__ int32_t *>(&g_dist.blocks[ctx.joint_block].any_pub),
         sizeof(g_dist.blocks[ctx.joint_block].any_pub)
     );
@@ -229,25 +229,25 @@ PTO_DEVICE_FUNC void direct_publish_joint_deposits(DistSubmitCtx &ctx, const Mix
 PTO_DEVICE_FUNC bool direct_drain_won_slot(__gm__ DistCore *self, int32_t won_slot) {
     if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
     __gm__ WonSlot &w = g_dist.blocks[self->block_id].slots[won_slot];
-    ccec_invalidate_region(&w, sizeof(WonSlot));
+    dist_aicore_invalidate_region(&w, sizeof(WonSlot));
     if (w.state != 1 || !w.lane[self->lane].present || w.drained[self->lane].v != 0) return false;
     __gm__ RingSlot *slot = direct_alloc_slot(self);
     if (slot == nullptr) return false;
     w.drained[self->lane].v = 1;
-    ccec_flush_region(&w.drained[self->lane], sizeof(DrainedCell));
+    dist_aicore_flush_region(&w.drained[self->lane], sizeof(DrainedCell));
     __gm__ BuiltSubtask &b = w.lane[self->lane];
     build_ring_slot(
         *slot, w.task_id, b.func_id, b.function_bin_addr, b.tensors, b.tensor_count, b.scalars, b.scalar_count, b.fanin,
         b.fanin_count, b.sub_block_id, /*is_multicore=*/true, self->block_id, won_slot
     );
-    ccec_flush_region(slot, sizeof(RingSlot));
+    dist_aicore_flush_region(slot, sizeof(RingSlot));
     return true;
 }
 
 PTO_DEVICE_FUNC bool direct_drain_block_won(__gm__ DistCore *self) {
     if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
     __gm__ BlockWon &bw = g_dist.blocks[self->block_id];
-    ccec_invalidate_region(&bw, sizeof(BlockWon));
+    dist_aicore_invalidate_region(&bw, sizeof(BlockWon));
     if (bw.any_pub == 0) return false;
     bool drained = false;
     for (int32_t i = 0; i < kPrivateSlots; i++) {
@@ -258,14 +258,9 @@ PTO_DEVICE_FUNC bool direct_drain_block_won(__gm__ DistCore *self) {
 
 PTO_DEVICE_FUNC void direct_complete_joint_submit(DistSubmitCtx &ctx) {
     __gm__ WonSlot &w = g_dist.blocks[ctx.joint_block].slots[ctx.joint_slot];
-#if defined(__CCE_AICORE__)
-    __gm__ int64_t *remaining = const_cast<__gm__ int64_t *>(&w.remaining);
-    if (atomicSub(remaining, static_cast<int64_t>(1)) == 1) {
-#else
-    if (atom_fetch_sub<int64_t>(w.remaining, 1, __ATOMIC_ACQ_REL) == 1) {
-#endif
+    if (decrement_won_remaining_is_last(w)) {
         w.state = 0;
-        ccec_flush_region(&w, sizeof(WonSlot));
+        dist_aicore_flush_region(&w, sizeof(WonSlot));
         direct_complete_task(ctx);
     }
 }
@@ -278,7 +273,7 @@ PTO_DEVICE_FUNC bool direct_build_winner_slot(DistSubmitCtx &ctx, __gm__ RingSlo
         *slot, ctx.task_id, ctx.kernel_id, fn_addr, ctx.payload->tensors, ctx.tensor_count, ctx.payload->scalars,
         ctx.payload->scalar_count, ctx.fanin, ctx.fanin_count, sub_block_id, ctx.joint, ctx.joint_block, ctx.joint_slot
     );
-    ccec_flush_region(slot, sizeof(RingSlot));
+    dist_aicore_flush_region(slot, sizeof(RingSlot));
     return true;
 }
 
@@ -314,7 +309,7 @@ PTO_DEVICE_FUNC bool direct_try_execute_slot(__gm__ RingSlot &slot, __gm__ DistC
     slot.built = false;
     slot.occupied = false;
     if (self != nullptr && self->occupied_count > 0) self->occupied_count--;
-    ccec_flush_region(&slot, sizeof(RingSlot));
+    dist_aicore_flush_region(&slot, sizeof(RingSlot));
     return true;
 }
 
@@ -323,7 +318,7 @@ PTO_DEVICE_FUNC int32_t direct_drain_ready_slots(__gm__ DistCore *self) {
     int32_t freed = 0;
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         __gm__ RingSlot &slot = self->slots[i];
-        ccec_invalidate_region(&slot, sizeof(RingSlot));
+        dist_aicore_invalidate_region(&slot, sizeof(RingSlot));
         if (direct_try_execute_slot(slot, self)) freed++;
     }
     return freed;
@@ -355,7 +350,7 @@ PTO_DEVICE_FUNC void direct_complete_alloc_submit(DistSubmitCtx &ctx) {
 PTO_DEVICE_FUNC bool direct_has_pending_won(__gm__ DistCore *self) {
     if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
     __gm__ BlockWon &bw = g_dist.blocks[self->block_id];
-    ccec_invalidate_region(&bw, sizeof(BlockWon));
+    dist_aicore_invalidate_region(&bw, sizeof(BlockWon));
     if (bw.any_pub == 0) return false;
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         __gm__ WonSlot &w = bw.slots[i];
@@ -368,15 +363,11 @@ PTO_DEVICE_FUNC bool direct_has_pending_won(__gm__ DistCore *self) {
 PTO_DEVICE_FUNC void direct_drain_to_completion(__gm__ DistCore *self) {
     if (self == nullptr) return;
     __gm__ int64_t *replay_done = const_cast<__gm__ int64_t *>(&g_dist.replay_done);
-#if defined(__CCE_AICORE__)
-    atomicAdd(replay_done, static_cast<int64_t>(1));
-#else
-    atom_fetch_add<int64_t>(*replay_done, 1, __ATOMIC_ACQ_REL);
-#endif
+    publish_replay_done(*replay_done);
     while (true) {
         direct_drain_block_won(self);
         const int32_t freed = direct_drain_ready_slots(self);
-        ccec_invalidate_region(replay_done, sizeof(g_dist.replay_done));
+        dist_aicore_invalidate_region(replay_done, sizeof(g_dist.replay_done));
         const bool all_replayed = g_dist.replay_done >= g_dist.num_workers;
         const bool ring_empty = self->occupied_count == 0;
         const bool pending = direct_has_pending_won(self);
@@ -387,9 +378,9 @@ PTO_DEVICE_FUNC void direct_drain_to_completion(__gm__ DistCore *self) {
 
 PTO_DEVICE_FUNC void direct_replay_orch(__gm__ Runtime *runtime) {
 #if defined(__CCE_AICORE__)
-    ccec_invalidate_region(runtime->dist.ccec_orch_tensors, sizeof(runtime->dist.ccec_orch_tensors));
-    ccec_invalidate_region(runtime->dist.ccec_orch_scalars, sizeof(runtime->dist.ccec_orch_scalars));
-    ccec_invalidate_region(const_cast<__gm__ const int32_t *>(&runtime->dist.ccec_orch_tensor_count), 64);
+    dist_aicore_invalidate_region(runtime->dist.ccec_orch_tensors, sizeof(runtime->dist.ccec_orch_tensors));
+    dist_aicore_invalidate_region(runtime->dist.ccec_orch_scalars, sizeof(runtime->dist.ccec_orch_scalars));
+    dist_aicore_invalidate_region(const_cast<__gm__ const int32_t *>(&runtime->dist.ccec_orch_tensor_count), 64);
     if (aicpu_orchestration_entry == nullptr || !ccec_is_valid_worker()) return;
     L2TaskArgs local_args;
     Tensor local_tensors[CHIP_MAX_TENSOR_ARGS];

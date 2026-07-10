@@ -16,8 +16,6 @@
 #include "pto_types.h"
 #include "runtime.h"
 
-#include "dist_engine/aicore/cache_ops.h"  // NOLINT(build/include_subdir)
-
 #include "dist_engine/common/state.h"          // NOLINT(build/include_subdir)
 #include "dist_engine/common/atomic.h"         // NOLINT(build/include_subdir)
 #include "dist_engine/common/trace.h"          // NOLINT(build/include_subdir)
