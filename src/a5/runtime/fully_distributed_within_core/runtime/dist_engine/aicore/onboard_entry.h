@@ -36,9 +36,9 @@ PTO_DEVICE_FUNC void dist_aicore_onboard_main(__gm__ Runtime *runtime, int core_
     ccec_init_worker_layout();
     ccec_attach_run_state();
 
-    ccec_replay_orch(runtime);
+    direct_replay_orch(runtime);
 
-    ccec_drain_to_completion(g_self);
+    direct_drain_to_completion(g_self);
     ccec_finish_worker();
 #else
     (void)runtime;
