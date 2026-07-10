@@ -22,7 +22,8 @@
 
 #if __has_include("inner_kernel.h")
 #include "inner_kernel.h"
-#elif __has_include(<pto/pto-inst.hpp>)
+#endif
+#if __has_include(<pto/pto-inst.hpp>)
 #include <pto/pto-inst.hpp>
 #endif
 #include "tensor.h"
@@ -46,5 +47,8 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ float *out = reinterpret_cast<__gm__ float *>(out_tensor->buffer.addr) + out_tensor->start_offset;
     out[0] = static_cast<float>(index) + 1.0f;
 
+#if defined(__CCE_AICORE__)
+    dcci(reinterpret_cast<__gm__ uint8_t *>(out), SINGLE_CACHE_LINE, CACHELINE_OUT);
+#endif
     pipe_sync();
 }

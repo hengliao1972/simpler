@@ -19,23 +19,16 @@
 
 #if __has_include("inner_kernel.h")
 #include "inner_kernel.h"
-#elif __has_include(<pto/pto-inst.hpp>)
-#include <pto/pto-inst.hpp>
 #endif
+#if __has_include(<pto/pto-inst.hpp>)
+#include <pto/pto-inst.hpp>
+using namespace pto;
+#endif
+#if __has_include(<pto/common/constants.hpp>)
 #include <pto/common/constants.hpp>
+#endif
 
 #include "tensor.h"
-#if __has_include(<pto/pto-inst.hpp>)
-using namespace pto;
-using ::pto::Stride;  // resolve ambiguity with CANN global Stride enum
-#endif
-
-#if __has_include(<pto/pto-inst.hpp>)
-using namespace pto;
-
-#endif
-
-
 
 #if __has_include("pipe_sync.h")
 #include "pipe_sync.h"
@@ -52,7 +45,7 @@ using namespace pto;
 template <int TILE>
 static __aicore__ void add_tile_impl(__gm__ float *a_ptr, __gm__ float *b_ptr, __gm__ float *dst_ptr) {
     using DynShapeDim5 = Shape<1, 1, 1, TILE, TILE>;
-    using DynStridDim5 = Stride<1, 1, 1, TILE, 1>;
+    using DynStridDim5 = pto::Stride<1, 1, 1, TILE, 1>;
     using GlobalData = GlobalTensor<float, DynShapeDim5, DynStridDim5>;
     using TileData = Tile<TileType::Vec, float, TILE, TILE, BLayout::RowMajor, -1, -1>;
 

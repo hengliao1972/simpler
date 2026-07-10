@@ -1,4 +1,9 @@
-# Atomic Minibench 上板移植与修复记录（2026-07-10）
+# Atomic Minibench 上板移植与修复记录（2026-07-10，更新 2026-07-10 v2）
+
+## 当前状态（基线 `01a706e3`，dist_engine 重构后）
+
+基线代码将 `dist_engine.cpp` 拆分为 `dist_engine/aicore/`、`dist_engine/aicpu/`、
+`dist_engine/common/` 多文件结构。本仓移植的测试用例无需修改即与新结构兼容。
 
 ## 背景
 
@@ -61,56 +66,29 @@
 | `prod_outs.get_ref(0)` → `add_input(ext_buf)` | 本仓 INOUT→INPUT 通过 TensorMap 自动建依赖，不需要 `TaskOutputTensors::get_ref()` |
 | `ELEMS` 常量重命名为 `PRODUCER_ELEMS`/`CONSUMER_ELEMS` | CCEC 把同目录所有 .cpp 编在一起，同名 namespace-scope constexpr 冲突 |
 
-### 4. Runtime 修复（上板根因）
+### 4. Runtime 修复（上板根因）——已回退，仅记录发现
 
-**根因 A：kernel 输出数据未 flush 到 HBM**（最关键）
+> 以下 dist_engine.cpp 改动在 `a83196e4` 中引入，在 `b422c48f` 中回退。
+> 原因：A/B 对照实验证明现有主线测试（vector TSTORE kernel）不需要这些改动。
 
-`ccec_try_execute_slot_direct` 在 kernel 调用后没有把 kernel 写入的 tensor
-数据从 AICore data cache 刷回 HBM。test framework（AICPU/host 侧）从 HBM
-读到全零。
+**发现 A：scalar 写需要 dcci flush，vector 写不需要**
 
-修复（`dist_engine.cpp`）：在 kernel 调用 + barrier 之后、publish flag 之前，
-对 slot 中每个 tensor 的 buffer 区域做 `ccec_flush_region`：
+A/B 对照实验（去掉 flush，分别跑 vector_example 和 MB-2）：
 
-```cpp
-ccec_call_slot_kernel(slot);
-OUT_OF_ORDER_STORE_BARRIER();
-#if defined(__CCE_AICORE__)
-for (int32_t i = 0; i < slot.tensor_count; i++) {
-    __gm__ uint8_t *base = reinterpret_cast<__gm__ uint8_t *>(
-        static_cast<uintptr_t>(slot.tensors[i].buffer.addr)
-    );
-    ccec_flush_region(base, slot.tensors[i].buffer.size);
-}
-#endif
-ccec_complete_slot(slot, self);
-```
+| 写类型 | 硬件路径 | 到 HBM | 需要 dcci flush |
+|--------|---------|--------|----------------|
+| Scalar store（`out[i]=val`） | L1 data cache | ❌ 不自动 | ✅ 必须 `dcci CACHELINE_OUT` |
+| Vector TSTORE | L2 cache | ✅ write-through | ❌ 不需要 |
 
-**根因 B：完成标志 publish/read 用 store+flush / invalidate+load（TOCTOU + cacheline clobber）**
+vector_example（纯 TSTORE）去掉 flush 后仍 PASS；MB-2（scalar 裸写）去掉 flush
+后 FAIL。当前主线 runtime 代码不含 flush，MB-2 scalar-write 场景需要 kernel
+侧自行 flush 或在 runtime 层补 flush。
 
-`publish_task_flag` 用 `cell.flag = 1; ccec_flush_region(...)` —— plain store +
-整行回写，会把 cacheline 邻居的陈旧数据一起写回 HBM（C4 cacheline clobber）。
+**发现 B：完成标志 publish/read 的 cacheline clobber / TOCTOU**
 
-`task_flag_ready` 用 `ccec_invalidate_region(...) + plain load` —— invalidate
-后、load 前，硬件预取可能重新填充陈旧 cacheline（TOCTOU 窗口）。
-
-修复：改用内存级硬件原子 `atomicMax`：
-
-```cpp
-// publish: atomicMax 直接写 HBM 单字，绕开整行回写
-(void)atomicMax(flag_addr, static_cast<int64_t>(1));
-
-// read: 幂等 atomicMax(p, 0) 读回真值，无 TOCTOU 窗口
-return atomicMax(flag_addr, static_cast<int64_t>(0)) > 0;
-```
-
-**辅助修复：kernel 调用前 invalidate slot**
-
-`ccec_call_slot_kernel` 加入 `ccec_invalidate_region(&slot, sizeof(RingSlot))`，
-确保 kernel 读到的 tensor descriptor 从 HBM 加载而非陈旧 cache。
-
-`ccec_try_execute_slot_direct` 加入 slot.occupied 区域二次 invalidate，
-防止 drain 时读到陈旧 slot 状态。
+`publish_task_flag` 用 `cell.flag = 1; ccec_flush_region(...)` 有 cacheline
+clobber 风险。`task_flag_ready` 用 `invalidate + plain load` 有 TOCTOU 窗口。
+改用 `atomicMax` 可避免。此改动也已回退，当前主线仍用 store+flush / invalidate+load。
 
 ## 验证矩阵
 
@@ -140,19 +118,19 @@ return atomicMax(flag_addr, static_cast<int64_t>(0)) > 0;
 | MB-8 dcci 50 rounds | ✅ |
 | mix_coown | ✅ |
 
-### Python ST — a5 onboard（真硬件）
+### Python ST — a5 onboard（真硬件，基线 `01a706e3`）
 
-| 测试 | 修复前 | 修复后 | 说明 |
-|------|--------|--------|------|
-| simple_orch_smoke | ✅ | ✅ | 不回归 |
-| submit_dependency_smoke | ✅ | ✅ | 不回归 |
-| **vector_example** | hang | **✅** | kernel flush 修复 |
-| **MB-2 flags 512** | ~90% task 丢失 | **✅** | kernel flush 修复 |
-| **MB-8 dcci 50 rounds** | hang | **✅** | kernel flush 修复 |
-| MB-4 block.won | — | ❌ CCEC 编译 | PTO-ISA `Stride` 与 CANN `Stride` enum 冲突 |
-| MB-5 shared_map | — | ❌ CCEC 编译 | 同上（benchmark_bgemm kernel） |
-| MB-6 heap | — | ❌ CCEC 编译 | 同上 |
-| MB-7 runahead | — | ❌ CCEC 编译 | 同上 |
+| 测试 | 结果 | 说明 |
+|------|------|------|
+| simple_orch_smoke | ✅ | 不回归 |
+| submit_dependency_smoke | ✅ | 不回归 |
+| vector_example | ✅ | 纯 vector TSTORE，L2 write-through |
+| MB-2 flags 512 | ❌ | scalar 裸写需 flush，主线无 flush |
+| MB-8 dcci 50 rounds | ✅ | 纯 vector，不需要 flush |
+| MB-4 block.won | ❌ CCEC 编译 | PTO-ISA `Stride` 歧义 |
+| MB-5 shared_map | ❌ CCEC 编译 | 同上 |
+| MB-6 heap | ❌ CCEC 编译 | 同上 |
+| MB-7 runahead | ❌ CCEC 编译 | 同上 |
 
 ## 遗留问题
 
@@ -174,6 +152,13 @@ return atomicMax(flag_addr, static_cast<int64_t>(0)) > 0;
    不依赖 `using namespace pto`
 2. 或在 PTO-ISA 头文件中 rename `Stride` 为 `TensorStride` 等
 3. 或用 CCEC `-DStride=pto::Stride` 宏覆盖（hack）
+
+### MB-2 scalar 写需要 dcci flush（应在 kernel 侧自行处理）
+
+MB-2 的 `kernel_write_index` 用裸 scalar 写（`out[0] = float(index) + 1`）。
+A5 上 scalar store 只到 L1 data cache，需要 kernel 自行调用 `dcci CACHELINE_OUT`
+刷到 HBM。**不应在 runtime 层泛化处理**——vector TSTORE 走 L2 write-through 不
+需要 flush，统一 flush 会引入冗余开销。正确做法：谁写谁 flush。
 
 ### MB-8 过程中曾出现 kernel hang
 
