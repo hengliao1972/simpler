@@ -31,16 +31,22 @@ import torch
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+try:
+    from tests.st.a5.fully_distributed_within_core.atomic_minibench._runtime_contract import DistRuntimeContractMixin
+except ModuleNotFoundError:
+    from _runtime_contract import DistRuntimeContractMixin
 
 ELEMS = 16
 
 
 @scene_test(level=2, runtime="fully_distributed_within_core")
-class TestMB8DcciSeam(SceneTestCase):
+class TestMB8DcciSeam(DistRuntimeContractMixin, SceneTestCase):
     """dcci seam: producer→consumer cross-core publish/observe."""
 
     RTOL = 0
     ATOL = 0
+
+    RUNTIME_ENV = {"PTO_DIST_DEPSIG": "1"}
 
     CALLABLE = {
         "orchestration": {

@@ -31,10 +31,14 @@ import torch
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+try:
+    from tests.st.a5.fully_distributed_within_core.atomic_minibench._runtime_contract import DistRuntimeContractMixin
+except ModuleNotFoundError:
+    from _runtime_contract import DistRuntimeContractMixin
 
 
 @scene_test(level=2, runtime="fully_distributed_within_core")
-class TestMB2FlagsClobber(SceneTestCase):
+class TestMB2FlagsClobber(DistRuntimeContractMixin, SceneTestCase):
     """flags[] cacheline clobber: N independent tasks, dense flag packing."""
 
     RTOL = 0

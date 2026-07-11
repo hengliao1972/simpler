@@ -37,14 +37,19 @@ import torch
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+try:
+    from tests.st.a5.fully_distributed_within_core.atomic_minibench._runtime_contract import DistRuntimeContractMixin
+except ModuleNotFoundError:
+    from _runtime_contract import DistRuntimeContractMixin
 
 
 @scene_test(level=2, runtime="fully_distributed_within_core")
-class TestMB5SharedMap(SceneTestCase):
+class TestMB5SharedMap(DistRuntimeContractMixin, SceneTestCase):
     """Shared TensorMap: BGEMM in shared mode, DEPSIG must match private."""
 
     RTOL = 1e-3
     ATOL = 1e-3
+    DIST_REQUIRE_TMOPS_ON_SIM = True
 
     RUNTIME_ENV = {
         "PTO_DIST_TENSORMAP_MODE": "shared",
@@ -78,30 +83,51 @@ class TestMB5SharedMap(SceneTestCase):
 
     CASES = [
         {
-            # Standard BGEMM in shared mode: golden must pass, DEPSIG must
-            # match private mode (run same case without PTO_DIST_TENSORMAP_MODE).
-            "name": "Shared",
+            # Private is the reference run for the identical graph.  The
+            # runtime contract records its DEPSIG/TMOPS instead of trusting the
+            # numerical golden alone.
+            "name": "PrivateReference",
+            "oracle_group": "bgemm180",
             "platforms": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 3},
             "params": {"matmul_add_task_num": 180, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2},
+            "runtime_env": {"PTO_DIST_TENSORMAP_MODE": "private"},
+        },
+        {
+            # Standard BGEMM in shared mode: the mode marker must say shared,
+            # and its DEPSIG must match PrivateReference.
+            "name": "Shared",
+            "oracle_group": "bgemm180",
+            "platforms": ["a5sim", "a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 3},
+            "params": {"matmul_add_task_num": 180, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2},
+            "runtime_env": {"PTO_DIST_TENSORMAP_MODE": "shared"},
         },
         {
             # High block count: more cores appending to the shared ring,
             # maximum sequencer contention + seq ABA pressure.
             "name": "Shared24",
+            "oracle_group": "bgemm360",
             "manual": True,
             "platforms": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {"matmul_add_task_num": 360, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2},
+            "runtime_env": {"PTO_DIST_TENSORMAP_MODE": "shared", "PTO_DIST_RUNAHEAD": "4"},
         },
         {
             # Tight runahead: stresses the shared ring's live window.
-            # Set PTO_DIST_RUNAHEAD=4 externally to force backpressure.
+            # Inject PTO_DIST_RUNAHEAD=4 for this case to force backpressure.
             "name": "SharedTightRunahead",
+            "oracle_group": "bgemm360",
             "manual": True,
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {"matmul_add_task_num": 360, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2},
+            "runtime_env": {
+                "PTO_DIST_TENSORMAP_MODE": "shared",
+                "PTO_DIST_RUNAHEAD": "4",
+                "PTO_DIST_FAKE_EXEC_NS": "1000",
+            },
         },
     ]
 

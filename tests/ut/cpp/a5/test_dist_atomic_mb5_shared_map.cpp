@@ -20,7 +20,8 @@
 // Criteria (docs MB-5):
 //   1. private vs shared lookup results are bit-identical (every fan-in resolves
 //      to the same producer)
-//   2. inserts count == num_tasks (each task appended exactly once via sequencer)
+//   2. every task is appended exactly once and total region inserts equals the
+//      deterministic operation stream
 //   3. appends happen in strict id order (sequencer serializes 0,1,2,...)
 //   4. seq ABA guard: slot reuse under concurrent lookup doesn't corrupt results
 //   5. ring overflow → deterministic FATAL (never silent overwrite)
@@ -164,7 +165,8 @@ static std::atomic<int32_t> g_slot_assign{0};
 void shared_worker(SharedTensorMap &sm, std::atomic<int32_t> &tm_insert_next,
                    const std::vector<TaskOps> &ops, int32_t num_tasks, int32_t H,
                    const std::vector<std::vector<int32_t>> &priv_results, SharedStats &stats,
-                   std::atomic<int32_t> *core_progress, int32_t num_threads) {
+                   std::atomic<int32_t> *core_progress, int32_t num_threads,
+                   std::vector<int32_t> *append_order) {
     int32_t my_idx = g_slot_assign.fetch_add(1, std::memory_order_relaxed);
     core_progress[my_idx].store(0, std::memory_order_relaxed);
 
@@ -191,8 +193,13 @@ void shared_worker(SharedTensorMap &sm, std::atomic<int32_t> &tm_insert_next,
                     int32_t rfloor = mn - H - 1;
                     for (const auto &o : ops[N].inserts)
                         sm.append(o.base, o.lo, o.hi, N, rfloor);
+                    // The sequencer guarantees one appender at a time. Record
+                    // the task id before publishing N+1 so this vector is not
+                    // concurrently modified by another worker.
+                    append_order->push_back(N);
                     tm_insert_next.store(N + 1, std::memory_order_release);
-                    stats.total_inserts.fetch_add(1, std::memory_order_relaxed);
+                    stats.total_inserts.fetch_add(static_cast<int32_t>(ops[N].inserts.size()),
+                                                  std::memory_order_relaxed);
                     break;
                 }
             }
@@ -254,22 +261,30 @@ bool test_shared_vs_private(int32_t num_tasks, int32_t num_threads, int32_t H, i
     std::vector<std::atomic<int32_t>> core_progress(num_threads);
     for (auto &cp : core_progress) cp.store(0, std::memory_order_relaxed);
     SharedStats stats;
+    std::vector<int32_t> append_order;
+    append_order.reserve(num_tasks);
 
     std::vector<std::thread> threads;
     for (int32_t t = 0; t < num_threads; t++)
         threads.emplace_back(shared_worker, std::ref(sm), std::ref(tm_insert_next), std::cref(ops), num_tasks, H,
-                             std::cref(priv_results), std::ref(stats), core_progress.data(), num_threads);
+                             std::cref(priv_results), std::ref(stats), core_progress.data(), num_threads,
+                             &append_order);
     for (auto &th : threads) th.join();
 
-    bool inserts_ok = (stats.total_inserts.load() == num_tasks);
+    int32_t expected_inserts = 0;
+    for (const auto &task : ops) expected_inserts += static_cast<int32_t>(task.inserts.size());
+    bool inserts_ok = (stats.total_inserts.load() == expected_inserts);
     bool mism_ok = (stats.mismatches.load() == 0);
     bool overflow_ok = !sm.overflowed.load();
     bool seq_ok = (tm_insert_next.load() == num_tasks);
+    bool order_ok = (append_order.size() == static_cast<size_t>(num_tasks));
+    for (size_t i = 0; order_ok && i < append_order.size(); i++)
+        order_ok = append_order[i] == static_cast<int32_t>(i);
 
-    bool ok = inserts_ok && mism_ok && overflow_ok && seq_ok;
-    printf("  tasks=%d threads=%d  inserts=%d/%d  mismatches=%d  overflow=%d  seq=%d  %s\n",
-           num_tasks, num_threads, stats.total_inserts.load(), num_tasks, stats.mismatches.load(),
-           sm.overflowed.load(), tm_insert_next.load(), ok ? "PASS" : "FAIL");
+    bool ok = inserts_ok && mism_ok && overflow_ok && seq_ok && order_ok;
+    printf("  tasks=%d threads=%d  inserts=%d/%d  mismatches=%d  overflow=%d  seq=%d  order=%d  %s\n",
+           num_tasks, num_threads, stats.total_inserts.load(), expected_inserts, stats.mismatches.load(),
+           sm.overflowed.load(), tm_insert_next.load(), order_ok, ok ? "PASS" : "FAIL");
     return ok;
 }
 
@@ -279,7 +294,6 @@ bool test_shared_vs_private(int32_t num_tasks, int32_t num_threads, int32_t H, i
 bool test_aba_wrap(int32_t num_tasks, int32_t num_threads) {
     // Very small cap + many distinct bases in the SAME bucket → aggressive wrap.
     // Use a fixed hash to force same bucket.
-    std::mt19937_64 rng(0xABBA);
     int32_t H = 4;
     int32_t cap = 8;  // tiny → wraps every 8 inserts in a bucket
 
@@ -298,35 +312,38 @@ bool test_aba_wrap(int32_t num_tasks, int32_t num_threads) {
         ref.advance_retire(N, H);
         for (const auto &q : ops[N].lookups) priv_results[N].push_back(ref.lookup(q.base, q.lo, q.hi));
         for (const auto &o : ops[N].inserts) ref.insert(o.base, o.lo, o.hi, N);
-        if (ref.overflowed) {
-            // Expected: tiny cap overflows — this tests that overflow is detected.
-            printf("  aba-wrap  private overflow at N=%d (cap=%d) — expected for tiny cap\n", N, cap);
-            return true;  // overflow detection is the pass criterion here
-        }
     }
 
-    // If private didn't overflow, run shared and compare.
-    // With a tiny cap, the shared ring is EXPECTED to overflow — that's the
-    // deterministic FATAL path (docs §12.7.2: "NEVER silently drop"). The pass
-    // criterion is: overflow is detected (not silent corruption). If no overflow,
-    // then zero mismatches is required.
+    // Always run the shared map, even if the private reference already
+    // overflowed.  The old test returned here and never exercised the subject
+    // under test.  With a tiny cap the shared map must report overflow rather
+    // than silently overwrite a live slot.
     SharedTensorMap sm(cap);
     std::atomic<int32_t> tm_insert_next(0);
     g_slot_assign.store(0, std::memory_order_relaxed);
     std::vector<std::atomic<int32_t>> core_progress(num_threads);
     for (auto &cp : core_progress) cp.store(0, std::memory_order_relaxed);
     SharedStats stats;
+    std::vector<int32_t> append_order;
+    append_order.reserve(num_tasks);
     std::vector<std::thread> threads;
     for (int32_t t = 0; t < num_threads; t++)
         threads.emplace_back(shared_worker, std::ref(sm), std::ref(tm_insert_next), std::cref(ops), num_tasks, H,
-                             std::cref(priv_results), std::ref(stats), core_progress.data(), num_threads);
+                             std::cref(priv_results), std::ref(stats), core_progress.data(), num_threads,
+                             &append_order);
     for (auto &th : threads) th.join();
 
-    // Overflow detected = PASS (deterministic FATAL, not silent drop).
-    // No overflow + zero mismatches = PASS (ABA guard works under wrap).
-    bool ok = sm.overflowed.load() || (stats.mismatches.load() == 0);
-    printf("  aba-wrap  tasks=%d threads=%d  mismatches=%d overflow=%d  %s\n", num_tasks, num_threads,
-           stats.mismatches.load(), sm.overflowed.load(),
+    bool order_ok = (append_order.size() == static_cast<size_t>(num_tasks));
+    for (size_t i = 0; order_ok && i < append_order.size(); i++)
+        order_ok = append_order[i] == static_cast<int32_t>(i);
+    // The private and shared reclaim floors are intentionally different, so a
+    // deliberately tiny cap may overflow one model before the other.  The
+    // subject under test is shared mode: if it overflows, that is the required
+    // loud outcome; if it does not, every lookup must still match the private
+    // reference.
+    bool ok = order_ok && (sm.overflowed.load() || stats.mismatches.load() == 0);
+    printf("  aba-wrap  tasks=%d threads=%d  mismatches=%d private_overflow=%d shared_overflow=%d order=%d  %s\n",
+           num_tasks, num_threads, stats.mismatches.load(), ref.overflowed, sm.overflowed.load(), order_ok,
            ok ? (sm.overflowed.load() ? "PASS(overflow=FATAL)" : "PASS") : "FAIL");
     return ok;
 }

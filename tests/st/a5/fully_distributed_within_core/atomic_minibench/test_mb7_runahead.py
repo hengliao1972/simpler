@@ -30,16 +30,23 @@ import torch
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+try:
+    from tests.st.a5.fully_distributed_within_core.atomic_minibench._runtime_contract import DistRuntimeContractMixin
+except ModuleNotFoundError:
+    from _runtime_contract import DistRuntimeContractMixin
 
 
 @scene_test(level=2, runtime="fully_distributed_within_core")
-class TestMB7Runahead(SceneTestCase):
+class TestMB7Runahead(DistRuntimeContractMixin, SceneTestCase):
     """Run-ahead backpressure + load balance via bgemm at scale."""
 
     RTOL = 1e-3
     ATOL = 1e-3
 
-    RUNTIME_ENV = {"PTO_DIST_DEPSIG": "1"}
+    RUNTIME_ENV = {
+        "PTO_DIST_TENSORMAP_MODE": "shared",
+        "PTO_DIST_DEPSIG": "1",
+    }
 
     CALLABLE = {
         "orchestration": {
@@ -67,30 +74,37 @@ class TestMB7Runahead(SceneTestCase):
 
     CASES = [
         {
-            # Default runahead (engine auto = 2*num_workers): should complete normally.
+            # Explicitly disable the throttle: this is the unbounded baseline.
             "name": "Default",
+            "oracle_group": "bgemm180",
             "platforms": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 3},
             "params": {"matmul_add_task_num": 180, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2},
+            "runtime_env": {"PTO_DIST_RUNAHEAD": "0", "PTO_DIST_FAKE_EXEC_NS": "1000"},
         },
         {
-            # Tight runahead: set PTO_DIST_RUNAHEAD=4 externally to force backpressure.
-            # Golden must still pass (throttle changes scheduling, not data).
+            # Tight runahead: inject PTO_DIST_RUNAHEAD=4 for this case to force
+            # backpressure. Golden must still pass (throttle changes
+            # scheduling, not data).
             "name": "TightRunahead",
+            "oracle_group": "bgemm180",
             "manual": True,
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 3},
             "params": {"matmul_add_task_num": 180, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2},
+            "runtime_env": {"PTO_DIST_RUNAHEAD": "4", "PTO_DIST_FAKE_EXEC_NS": "1000"},
         },
         {
-            # Full-core balance: 36 blocks, 360 tasks. Run with
-            #   PTO_DIST_FAKE_EXEC_NS=1000 PTO_DIST_RUNAHEAD=8
-            # to verify window constraint + no deadlock at scale.
+            # Full-core balance: 36 blocks, 360 tasks, with an explicit
+            # fake-exec/runahead pair to verify window constraint + no deadlock
+            # at scale.
             "name": "FullCore36",
+            "oracle_group": "bgemm360",
             "manual": True,
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
             "params": {"matmul_add_task_num": 360, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2},
+            "runtime_env": {"PTO_DIST_RUNAHEAD": "8", "PTO_DIST_FAKE_EXEC_NS": "1000"},
         },
     ]
 

@@ -134,11 +134,28 @@ ExpResult run_experiment(int32_t num_tasks, int32_t num_threads, int32_t shards,
     for (auto &th : threads) th.join();
 
     ExpResult exp;
+    std::vector<int32_t> all_won;
     for (auto &r : results) {
         exp.total_owned += r.owned_total;
         exp.global_xor ^= r.won_xor;
+        all_won.insert(all_won.end(), r.won_ids.begin(), r.won_ids.end());
     }
     exp.permutation_ok = (exp.total_owned == num_tasks && exp.global_xor == xor_range(0, num_tasks));
+
+    // XOR plus a count is a useful cheap signature, but it is not a complete
+    // permutation proof: two duplicated/missing ids can cancel in XOR.  Sort
+    // the actual winner list as the definitive no-duplicate/no-skip oracle.
+    std::sort(all_won.begin(), all_won.end());
+    if (all_won.size() != static_cast<size_t>(num_tasks)) {
+        exp.permutation_ok = false;
+    } else {
+        for (int32_t i = 0; i < num_tasks; i++) {
+            if (all_won[static_cast<size_t>(i)] != i) {
+                exp.permutation_ok = false;
+                break;
+            }
+        }
+    }
 
     // Check monotonicity per shard: within each shard, won ids must be strictly
     // increasing (cursor is monotone — once it advances past N, no lower id can win).
