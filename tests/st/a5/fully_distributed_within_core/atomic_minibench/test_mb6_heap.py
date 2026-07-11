@@ -28,10 +28,14 @@ import torch
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+try:
+    from tests.st.a5.fully_distributed_within_core.atomic_minibench._runtime_contract import DistRuntimeContractMixin
+except ModuleNotFoundError:
+    from _runtime_contract import DistRuntimeContractMixin
 
 
 @scene_test(level=2, runtime="fully_distributed_within_core")
-class TestMB6HeapReclaim(SceneTestCase):
+class TestMB6HeapReclaim(DistRuntimeContractMixin, SceneTestCase):
     """Deterministic GM heap + reclaim backpressure via bgemm with dependencies."""
 
     RTOL = 1e-3
@@ -78,6 +82,7 @@ class TestMB6HeapReclaim(SceneTestCase):
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {"matmul_add_task_num": 500, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2},
+            "runtime_env": {"PTO_DIST_HEAP_MB": "8", "PTO_DIST_H": "64"},
         },
         {
             # Full-core + large batch: maximum heap pressure.
@@ -86,6 +91,7 @@ class TestMB6HeapReclaim(SceneTestCase):
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
             "params": {"matmul_add_task_num": 360, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2},
+            "runtime_env": {"PTO_DIST_HEAP_MB": "8", "PTO_DIST_H": "64"},
         },
     ]
 

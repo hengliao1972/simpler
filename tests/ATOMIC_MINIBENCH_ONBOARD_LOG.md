@@ -1,4 +1,28 @@
-# Atomic Minibench 上板移植与修复记录（2026-07-10，更新 2026-07-10 v2）
+# Atomic Minibench 上板移植与修复记录（2026-07-10，更新 2026-07-10 v3）
+
+## 当前 pull 验证（`e63f072d`）
+
+本轮测试仓库为 `/home/q00473782/atomic/sfd/gpt/simpler`，HEAD 为
+`e63f072d`（`Fix: resolve CCEC Stride ambiguity, symbol conflicts, and scalar dcci for all MB onboard`）。
+测试开始前工作区 clean；该提交已包含 PTO 双 include、`pto::Stride` 完全限定、AIV 重名函数修复，
+以及 atomic minibench scalar kernel 的 `dcci CACHELINE_OUT`。
+
+### 当前 HEAD a5 上板结果
+
+| 测试 | 结果 |
+|------|------|
+| MB-2 flags 512 | ✅ 1 passed（与 MB-8 合并运行） |
+| MB-4 block.won | ✅ 1 passed，34.86s |
+| MB-5 shared_map | ✅ 1 passed，27.68s |
+| MB-6 heap | ✅ 1 passed，27.31s |
+| MB-7 runahead | ✅ 1 passed，27.71s |
+| MB-8 DCCI 50 rounds | ✅ 1 passed（与 MB-2 合并运行，总 41.16s） |
+| benchmark_bgemm | ✅ 1 passed，42.93s |
+| vector_example | ✅ 1 passed，30.05s |
+| simple + submit dependency smoke | ✅ 2 passed，142.27s |
+
+MB-4/5/6/7 已越过此前的 CCEC 编译阻塞并完成真硬件运行。下方旧验证矩阵中的
+`01a706e3` 结果是历史基线，不代表本次 `e63f072d`。
 
 ## 当前状态（基线 `01a706e3`，dist_engine 重构后）
 
