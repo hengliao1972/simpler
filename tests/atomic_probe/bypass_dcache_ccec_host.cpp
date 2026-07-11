@@ -84,6 +84,22 @@ static void run_mode(aclrtFuncHandle funcHandle, aclrtStream stream,
         printf("[%-16s] mode=%u  bypass=0x%x normal_after=0x%x(exp 0xaa) after_dcci=0x%x  %.0fus  L1:%s\n",
                label, mode, bypass_val, normal_after, after_dcci, host_us,
                polluted ? "POLLUTED" : "CLEAN");
+    } else if (mode == 6) {
+        uint32_t err_bypass = r[16];
+        uint32_t err_inval  = r[17];
+        uint32_t err_stale  = r[18];
+        bool pass = (err_bypass == 0) && (err_inval == 0);
+        printf("[%-16s] mode=%u  bypass_err=%u inval_err=%u stale_err=%u  %.0fus  %s\n",
+               label, mode, err_bypass, err_inval, err_stale, host_us,
+               pass ? "PASS" : "FAIL");
+        printf("  word[0]: bypass=0x%x inval=0x%x  byte[8]=0x%02x half[5]=0x%04x\n",
+               r[19], r[20], r[21], r[22]);
+        // Print byte-level snapshot for ground truth
+        uint8_t *snap = reinterpret_cast<uint8_t*>(&r[23]);
+        printf("  64B snapshot:");
+        for (uint32_t i = 0; i < 16; i++) printf(" %02x", snap[i]);
+        printf("\n");
+        printf("  expected:    ef be ad de 00 00 00 00 ab 00 be ba 00 00 00 00\n");
     }
 }
 
@@ -126,6 +142,7 @@ int main(int argc, char *argv[]) {
     run_mode(funcHandle, stream, gx_dev, 3, "ByPassReadVsL1");
     run_mode(funcHandle, stream, gx_dev, 4, "ByPass+Atomic");
     run_mode(funcHandle, stream, gx_dev, 5, "ByPassNoPollute");
+    run_mode(funcHandle, stream, gx_dev, 6, "PartialWrite+Read");
 
     printf("\n=== Summary ===\n");
     printf("st_dev: write GM bypassing DCache (no dirty, no clobber)\n");
