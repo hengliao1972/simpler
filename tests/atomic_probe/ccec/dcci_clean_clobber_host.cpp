@@ -16,6 +16,7 @@ static void check(aclError err, const char *msg) {
 
 static void run_mode(aclrtFuncHandle fh, aclrtStream stream,
                      void *gx_dev, uint32_t mode, const char *label) {
+    // Zero whole region; gx[30] = BARRIER_SLOT must start at 0.
     uint32_t zeros[64] = {0};
     check(aclrtMemcpy(gx_dev, sizeof(zeros), zeros, sizeof(zeros),
                       ACL_MEMCPY_HOST_TO_DEVICE), "init");
