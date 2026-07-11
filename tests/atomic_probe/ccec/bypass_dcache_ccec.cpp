@@ -8,7 +8,7 @@
 // st_dev signature:  st_dev(value, __gm__ ptr, flag=0)
 // ld_dev signature:  ld_dev(__gm__ ptr, flag=0) -> value
 //
-// Tests (gx[30]=BARRIER_SLOT reserved):
+// Tests:
 //   0 = 1B st_dev write blast radius
 //   1 = 4B st_dev write blast radius
 //   2 = ld_dev read correctness (1B/2B/4B/8B)
@@ -20,6 +20,8 @@
 //
 // Build: see run_bypass_dcache.sh / run_all.sh
 #include "ccec_utils.h"
+
+CCEC_PROBE_KERNEL_META(bypass_dcache_probe);
 
 extern "C" __global__ __aicore__ void KERNEL_ENTRY(bypass_dcache_probe)(
     __gm__ uint32_t *gx, uint32_t mode, uint32_t num_blocks)
@@ -48,8 +50,8 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(bypass_dcache_probe)(
             uint32_t corrupted = 0;
             for (uint32_t i = 1; i < 64; i++)
                 if (bytes[i] != (uint8_t)(i + 1)) corrupted++;
-            gx[16] = corrupted;
-            for (uint32_t i = 0; i <= 15; i++) gx[17 + i] = gx[i];
+            st_dev_b32(&gx[16], corrupted);
+            for (uint32_t i = 0; i <= 15; i++) st_dev_b32(&gx[32 + i], ld_dev_b32(&gx[i]));
         }
         ccec_barrier(gx, num_blocks, 4);
 
@@ -74,13 +76,13 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(bypass_dcache_probe)(
             uint32_t corrupted = 0;
             for (uint32_t i = 4; i < 64; i++)
                 if (bytes[i] != (uint8_t)(i + 1)) corrupted++;
-            gx[16] = corrupted;
-            for (uint32_t i = 0; i <= 15; i++) gx[17 + i] = gx[i];
+            st_dev_b32(&gx[16], corrupted);
+            for (uint32_t i = 0; i <= 15; i++) st_dev_b32(&gx[32 + i], ld_dev_b32(&gx[i]));
         }
         ccec_barrier(gx, num_blocks, 4);
 
     // ================================================================
-    // Mode 2: ld_dev read correctness (1B/2B/4B)
+    // Mode 2: ld_dev read correctness (1B/2B/4B/8B)
     // ================================================================
     } else if (mode == 2) {
         ccec_barrier(gx, num_blocks, 1);
@@ -108,8 +110,17 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(bypass_dcache_probe)(
                 uint32_t exp = b0|(b1<<8)|(b2<<16)|(b3<<24);
                 if (ld_dev_b32(&gx[i]) != exp) errors++;
             }
-            gx[16] = errors;
-            gx[17] = 64 + 32 + 16;
+            // 8B
+            __gm__ uint64_t *wide = reinterpret_cast<__gm__ uint64_t *>(gx);
+            for (uint32_t i = 0; i < 8; i++) {
+                uint64_t exp = 0;
+                for (uint32_t b = 0; b < 8; b++) {
+                    exp |= (uint64_t)(uint8_t)(0x30 + 8 * i + b) << (8 * b);
+                }
+                if (ld_dev_b64(&wide[i]) != exp) errors++;
+            }
+            st_dev_b32(&gx[16], errors);
+            st_dev_b32(&gx[17], 64 + 32 + 16 + 8);
         }
         ccec_barrier(gx, num_blocks, 3);
 
@@ -132,10 +143,10 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(bypass_dcache_probe)(
             volatile __gm__ uint32_t *vgx = gx;
             uint32_t normal_val = vgx[0];
             uint32_t bypass_val = ld_dev_b32(&gx[0]);
-            gx[17] = normal_val;
-            gx[18] = bypass_val;
-            gx[19] = 0xDEADBEEFu;
-            gx[16] = (bypass_val == 0xDEADBEEFu) ? 0 : 1;
+            st_dev_b32(&gx[17], normal_val);
+            st_dev_b32(&gx[18], bypass_val);
+            st_dev_b32(&gx[19], 0xDEADBEEFu);
+            st_dev_b32(&gx[16], (bypass_val == 0xDEADBEEFu) ? 0 : 1);
         }
         ccec_barrier(gx, num_blocks, 4);
 
@@ -146,6 +157,9 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(bypass_dcache_probe)(
         ccec_barrier(gx, num_blocks, 1);
         if (bid == 0) {
             for (uint32_t i = 0; i < 100; i++) atomicAdd(&gx[0], 1u);
+            // Count the actually launched core-type participants without
+            // assuming whether the linked AIC/AIV pair both execute.
+            atomicAdd(&gx[18], 100u);
         }
         if (bid == 1) {
             for (uint32_t i = 1; i <= 15; i++)
@@ -157,9 +171,8 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(bypass_dcache_probe)(
             uint32_t corrupted = 0;
             for (uint32_t i = 1; i <= 15; i++)
                 if (ld_dev_b32(&gx[i]) != 0xA000u + i) corrupted++;
-            gx[16] = corrupted;
-            gx[17] = g0;
-            gx[18] = 100;
+            st_dev_b32(&gx[16], corrupted);
+            st_dev_b32(&gx[17], g0);
         }
         ccec_barrier(gx, num_blocks, 3);
 
@@ -183,10 +196,11 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(bypass_dcache_probe)(
         }
         ccec_barrier(gx, num_blocks, 3);
         if (bid == 0) {
-            gx[17] = ld_dev_b32(&gx[0]);
-            gx[18] = ld_dev_b32(&gx[3]);
-            gx[19] = 0xDEADBEEFu;
-            gx[16] = (gx[17] == 0xDEADBEEFu) ? 0 : 1;
+            uint32_t w0 = ld_dev_b32(&gx[0]);
+            st_dev_b32(&gx[17], w0);
+            st_dev_b32(&gx[18], ld_dev_b32(&gx[3]));
+            st_dev_b32(&gx[19], 0xDEADBEEFu);
+            st_dev_b32(&gx[16], (w0 == 0xDEADBEEFu) ? 0 : 1);
         }
         ccec_barrier(gx, num_blocks, 4);
 
@@ -211,10 +225,11 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(bypass_dcache_probe)(
         }
         ccec_barrier(gx, num_blocks, 4);
         if (bid == 0) {
-            gx[17] = ld_dev_b32(&gx[0]);
-            gx[18] = ld_dev_b32(&gx[3]);
-            gx[19] = 0xDEADBEEFu;
-            gx[16] = (gx[17] == 0) ? 1 : 0;
+            uint32_t w0 = ld_dev_b32(&gx[0]);
+            st_dev_b32(&gx[17], w0);
+            st_dev_b32(&gx[18], ld_dev_b32(&gx[3]));
+            st_dev_b32(&gx[19], 0xDEADBEEFu);
+            st_dev_b32(&gx[16], (w0 == 0) ? 1 : 0);
         }
         ccec_barrier(gx, num_blocks, 5);
 
@@ -240,10 +255,11 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(bypass_dcache_probe)(
         }
         ccec_barrier(gx, num_blocks, 4);
         if (bid == 0) {
-            gx[17] = ld_dev_b32(&gx[0]);
-            gx[18] = ld_dev_b32(&gx[3]);
-            gx[19] = 0xDEADBEEFu;
-            gx[16] = (gx[17] == 0xDEADBEEFu) ? 0 : 1;
+            uint32_t w0 = ld_dev_b32(&gx[0]);
+            st_dev_b32(&gx[17], w0);
+            st_dev_b32(&gx[18], ld_dev_b32(&gx[3]));
+            st_dev_b32(&gx[19], 0xDEADBEEFu);
+            st_dev_b32(&gx[16], (w0 == 0xDEADBEEFu) ? 0 : 1);
         }
         ccec_barrier(gx, num_blocks, 5);
     }

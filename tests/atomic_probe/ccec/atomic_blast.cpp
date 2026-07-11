@@ -7,7 +7,7 @@
 //
 // Uses atomicMax (lowercase CCEC builtin), NOT AscendC's AtomicMax.
 //
-// Layout (gx[30] = BARRIER_SLOT reserved for ccec_barrier):
+// Layout:
 //   gx[0..15]  = test cache line (64B = 16 x uint32)
 //   gx[16]     = corruption count (defender reports clobbered neighbours)
 //   gx[17]     = gx[0] actual value after test
@@ -24,6 +24,8 @@
 // Build: see run_atomic_blast.sh / run_all.sh
 #include "ccec_utils.h"
 
+CCEC_PROBE_KERNEL_META(atomic_blast);
+
 constexpr uint32_t ATOMIC_TARGET = 0xFFFFFFFFu;  // atomicMax target for gx[0]
 constexpr uint32_t SENTINEL_BASE = 0xA000u;      // gx[1]=0xA001, gx[2]=0xA002, ...
 
@@ -31,12 +33,12 @@ constexpr uint32_t SENTINEL_BASE = 0xA000u;      // gx[1]=0xA001, gx[2]=0xA002, 
 __aicore__ inline void report_word_result(__gm__ uint32_t *gx, uint32_t gx0_expected) {
     uint32_t corrupted = 0;
     for (uint32_t i = 1; i <= 15; i++) {
-        if (gx[i] != SENTINEL_BASE + i) corrupted++;
+        if (ld_dev_b32(&gx[i]) != SENTINEL_BASE + i) corrupted++;
     }
-    gx[16] = corrupted;
-    gx[17] = gx[0];
-    gx[18] = gx0_expected;
-    for (uint32_t i = 0; i <= 15; i++) gx[31 + i] = gx[i];
+    st_dev_b32(&gx[16], corrupted);
+    st_dev_b32(&gx[17], ld_dev_b32(&gx[0]));
+    st_dev_b32(&gx[18], gx0_expected);
+    for (uint32_t i = 0; i <= 15; i++) st_dev_b32(&gx[31 + i], ld_dev_b32(&gx[i]));
 }
 
 extern "C" __global__ __aicore__ void KERNEL_ENTRY(atomic_blast)(
@@ -66,10 +68,10 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(atomic_blast)(
             for (uint32_t i = 4; i < 64; i++) {
                 if (bytes[i] != (uint8_t)(i + 1)) corrupted++;
             }
-            gx[16] = corrupted;
-            gx[17] = gx[0];
-            gx[18] = ATOMIC_TARGET;
-            for (uint32_t i = 0; i <= 15; i++) gx[31 + i] = gx[i];
+            st_dev_b32(&gx[16], corrupted);
+            st_dev_b32(&gx[17], ld_dev_b32(&gx[0]));
+            st_dev_b32(&gx[18], ATOMIC_TARGET);
+            for (uint32_t i = 0; i <= 15; i++) st_dev_b32(&gx[31 + i], ld_dev_b32(&gx[i]));
         }
         ccec_barrier(gx, num_blocks, 4);
 
@@ -129,10 +131,10 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(atomic_blast)(
             for (uint32_t i = 4; i < 64; i++) {
                 if (bytes[i] != (uint8_t)(i + 1)) corrupted++;
             }
-            gx[16] = corrupted;
-            gx[17] = gx[0];
-            gx[18] = ATOMIC_TARGET;
-            for (uint32_t i = 0; i <= 15; i++) gx[31 + i] = gx[i];
+            st_dev_b32(&gx[16], corrupted);
+            st_dev_b32(&gx[17], ld_dev_b32(&gx[0]));
+            st_dev_b32(&gx[18], ATOMIC_TARGET);
+            for (uint32_t i = 0; i <= 15; i++) st_dev_b32(&gx[31 + i], ld_dev_b32(&gx[i]));
         }
         ccec_barrier(gx, num_blocks, 5);
     }

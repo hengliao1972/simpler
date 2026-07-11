@@ -1,11 +1,19 @@
 // Host runner for dcci_clean_clobber probe.
-#include "acl/acl.h"
+#include "../probe_host.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <vector>
 #include <time.h>
+
+struct KernelArgs {
+    uint64_t storage_pointer;
+    uint32_t mode;
+    uint32_t num_blocks;
+};
+
+static_assert(sizeof(KernelArgs) == 16, "unexpected CCEC kernel argument ABI");
 
 static void check(aclError err, const char *msg) {
     if (err != ACL_SUCCESS) {
@@ -15,8 +23,8 @@ static void check(aclError err, const char *msg) {
 }
 
 static void run_mode(aclrtFuncHandle fh, aclrtStream stream,
-                     void *gx_dev, uint32_t mode, const char *label) {
-    // Zero whole region; gx[30] = BARRIER_SLOT must start at 0.
+                     void *gx_dev, uint32_t mode, const char *label,
+                     atomic_probe::Result &result) {
     uint32_t zeros[64] = {0};
     check(aclrtMemcpy(gx_dev, sizeof(zeros), zeros, sizeof(zeros),
                       ACL_MEMCPY_HOST_TO_DEVICE), "init");
@@ -24,14 +32,9 @@ static void run_mode(aclrtFuncHandle fh, aclrtStream stream,
     struct timespec ts0, ts1;
     clock_gettime(CLOCK_MONOTONIC, &ts0);
 
-    uint64_t gx_ptr = (uint64_t)(uintptr_t)gx_dev;
-    uint64_t args[3] = {gx_ptr, (uint64_t)mode, 2};
-    aclrtArgsHandle ah;
-    check(aclrtKernelArgsInit(fh, &ah), "init");
-    aclrtParamHandle ph;
-    check(aclrtKernelArgsAppend(ah, args, sizeof(args), &ph), "append");
-    check(aclrtKernelArgsFinalize(ah), "finalize");
-    check(aclrtLaunchKernelWithConfig(fh, 2, stream, nullptr, ah, nullptr), "launch");
+    KernelArgs args{(uint64_t)(uintptr_t)gx_dev, mode, 2};
+    check(aclrtLaunchKernelWithHostArgs(fh, 2, stream, nullptr,
+                                        &args, sizeof(args), nullptr, 0), "launch");
     check(aclrtSynchronizeStream(stream), "sync");
 
     clock_gettime(CLOCK_MONOTONIC, &ts1);
@@ -44,22 +47,27 @@ static void run_mode(aclrtFuncHandle fh, aclrtStream stream,
         printf("[%-24s] w0=0x%x(exp 0xAA) w3=0x%x(exp 0x%x)  %.0fus  w3:%s\n",
                label, r[18], r[19], r[20], us,
                r[17] ? "CLOBBERED!" : "survived");
+        result.Expect(r[18] == 0xAA && r[19] == 0, "dirty dcci invalidate exact clobber");
     } else if (mode == 1) {
         printf("[%-24s] w3=0x%x(exp 0x%x)  %.0fus  w3:%s\n",
                label, r[19], r[20], us,
                r[16] ? "CLOBBERED!" : "survived(CLEAN line safe)");
+        result.Expect(r[19] == 0xCAFEBABEu, "clean dcci invalidate preserves st_dev");
     } else if (mode == 2) {
         printf("[%-24s] w0=0x%x w3=0x%x(exp 0x%x)  %.0fus  w3:%s\n",
                label, r[18], r[19], r[20], us,
                r[17] ? "CLOBBERED!" : "survived");
+        result.Expect(r[18] == 0xAA && r[19] == 0, "dirty dcci flush exact clobber");
     } else if (mode == 3) {
         printf("[%-24s] w0=0x%x(stuck in L1) w3=0x%x(exp 0x%x)  %.0fus  w0:%s w3:%s\n",
                label, r[18], r[19], r[20], us,
                (r[18] == 0) ? "NOT visible(L1)" : "visible",
                r[17] ? "CLOBBERED!" : "survived");
+        result.Expect(r[18] == 0 && r[19] == 0xCAFEBABEu, "no-dcci control exact result");
     } else if (mode == 4) {
         printf("[%-24s] clobbered=%u/15 words  w0=0x%x  %.0fus\n",
                label, r[16], r[17], us);
+        result.Expect(r[16] == 15 && r[17] == 0xAA, "full cacheline dcci clobber exact result");
     }
 }
 
@@ -67,8 +75,10 @@ int main(int argc, char *argv[]) {
     const char *kernel_path = "./dcci_clean_kernel.o";
     if (argc > 1) kernel_path = argv[1];
 
+    int32_t deviceId = atomic_probe::DeviceId();
+    if (deviceId < 0) return EXIT_FAILURE;
     check(aclInit(nullptr), "aclInit");
-    check(aclrtSetDevice(0), "aclrtSetDevice");
+    check(aclrtSetDevice(deviceId), "aclrtSetDevice");
     aclrtStream stream;
     check(aclrtCreateStream(&stream), "aclrtCreateStream");
 
@@ -79,7 +89,7 @@ int main(int argc, char *argv[]) {
     f.read(bin.data(), sz);
 
     aclrtBinHandle bh;
-    check(aclrtBinaryLoadFromData(bin.data(), sz, nullptr, &bh), "load");
+    check(atomic_probe::LoadAicoreBinaryFromData(bin.data(), sz, &bh), "LoadAicoreBinaryFromData");
     aclrtFuncHandle fh;
     check(aclrtBinaryGetFunctionByEntry(bh, 0, &fh), "getfunc");
 
@@ -89,20 +99,23 @@ int main(int argc, char *argv[]) {
     printf("=== dcci Clean-Clobber Probe ===\n");
     printf("Question: does dcci(inval)'s clean step clobber another core's st_dev write?\n\n");
 
-    run_mode(fh, stream, gx_dev, 0, "dcci(inval) DIRTY");
-    run_mode(fh, stream, gx_dev, 1, "dcci(inval) CLEAN");
-    run_mode(fh, stream, gx_dev, 2, "dcci(flush) DIRTY");
-    run_mode(fh, stream, gx_dev, 3, "Control no dcci");
-    run_mode(fh, stream, gx_dev, 4, "Full 64B clobber");
+    atomic_probe::Result result;
+    uint32_t mode = 0;
+    if (!atomic_probe::RequiredUintEnv("ATOMIC_PROBE_MODE", 5, &mode)) return EXIT_FAILURE;
+    const char *labels[] = {
+        "dcci(inval) DIRTY", "dcci(inval) CLEAN", "dcci(flush) DIRTY",
+        "Control no dcci", "Full 64B clobber"
+    };
+    run_mode(fh, stream, gx_dev, mode, labels[mode], result);
 
     printf("\n=== Conclusion ===\n");
     printf("DIRTY L1 + dcci = CLOBBERS st_dev writes in same cache line\n");
     printf("CLEAN L1 + dcci = safe (clean is no-op for clean lines)\n");
 
-    aclrtFree(gx_dev);
-    aclrtBinaryUnLoad(bh);
-    aclrtDestroyStream(stream);
-    aclrtResetDevice(0);
-    aclFinalize();
-    return 0;
+    check(aclrtFree(gx_dev), "aclrtFree");
+    check(aclrtBinaryUnLoad(bh), "aclrtBinaryUnLoad");
+    check(aclrtDestroyStream(stream), "aclrtDestroyStream");
+    check(aclrtResetDevice(deviceId), "aclrtResetDevice");
+    check(aclFinalize(), "aclFinalize");
+    return result.ExitCode();
 }

@@ -1,4 +1,60 @@
-# Atomic Minibench 上板移植与修复记录（2026-07-10，更新 2026-07-10 v3）
+# Atomic Minibench 上板移植与修复记录（2026-07-10，更新 2026-07-11 v4）
+
+## 2026-07-11 atomic probe 当前工作区直接上板证据
+
+本节只记录 `tests/atomic_probe/` 当前未提交工作区的直接设备验证，不用下方旧提交结果替代。
+执行环境：base HEAD `57841544fe4c2360ea703eeb583d6112cd379037`、CANN 9.1、
+`dav-3510`、device 0、PTO-ISA `ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8`。本轮经用户授权直接
+占用设备，没有经过 `task-submit`，所以结果必须连同 dirty worktree diff 使用，不能只按 base HEAD 复现。
+
+### 两个 AIV 并发 `st_dev` / `WriteGmByPassDCache` 同 line 最简对照
+
+永久用例：
+
+- `atomic_probe/ccec/st_dev_same_line.cpp`
+- `atomic_probe/ascendc/st_dev_same_line.asc`
+
+每次 launch 精确验证两个 AIV 的参与计数和 marker；每个 AIV 只写自己的 4B slot。20 次 launch、每次
+100 trial、每个 trial 257 轮，结果如下：
+
+| 路径 | 同 line、仅 loop-end DSB | 分 line、仅 loop-end DSB | 同 line、逐轮 DSB |
+|---|---:|---:|---:|
+| CCEC `st_dev` | 1589/4000 mismatch（正确性断言失败，exit 1） | 0/4000 | 0/4000 |
+| AscendC `WriteGmByPassDCache<uint32_t>` | 1792/4000 mismatch（正确性断言失败，exit 1） | 0/4000 | 0/4000 |
+
+临时单 AIV 隔离 control 为 20 launch × 100 trial：同址连续 257 次 `st_dev`、仅 loop-end DSB，
+`0/2000` mismatch；逐写 DSB 同样 `0/2000`。因此当前证据支持的是“多个 AIV 并发写同一 64B line
+的不同 slot 时存在干扰”，不支持“单 AIV 同址 store 自身乱序”。底层机制尚未由本测试判定。
+
+复现入口：
+
+```bash
+source /home/q00473782/cann/cann-9.1.0/bin/setenv.bash
+export PTO_ISA_ROOT=/home/q00473782/atomic/codex/simpler-fully_distributed/build/pto-isa
+export ATOMIC_PROBE_DEVICE=0
+tests/atomic_probe/ccec/run_all.sh st_dev_same_line
+tests/atomic_probe/ascendc/_run_asc_probe.sh st_dev_same_line
+```
+
+### 当前工作区入口验证记录
+
+同一工作区、同一环境的当前目标用例与改 oracle 前完整入口记录如下：
+
+| 入口 | 结果 | 关键证据 |
+|---|---|---|
+| `tests/atomic_probe/ccec/run_all.sh st_dev_same_line` | exit 1 | 当前正确性 oracle：same-line mismatch 1589/4000；两个 control 0/4000；`semantic_failures=1` |
+| `tests/atomic_probe/ascendc/_run_asc_probe.sh st_dev_same_line` | exit 1 | 当前正确性 oracle：same-line mismatch 1792/4000；两个 control 0/4000；`failures=1` |
+| `tests/atomic_probe/ccec/run_all.sh` | 历史验证 exit 0 | 改为正确性断言前，所有 AIV-only probe 与 8-mode matrix 均完成；same-line mismatch 1634/4000，两个 control 0/4000 |
+| `tests/atomic_probe/ascendc/_run_asc_probe.sh` | 历史验证 exit 0 | 改为正确性断言前，`failures=0 executables=11 sources=11`；same-line mismatch 1738/4000，两个 control 0/4000 |
+| `.venv/bin/python -m pytest tests/atomic_probe/test_atomic_probe.py -k cpu -q` | exit 0 | `1 passed, 2 deselected` |
+
+上述两个完整入口的 exit 0 来自旧的 `mismatch > 0` 成功条件，不再代表当前 oracle。当前
+`st_dev_same_line` 要求同-line mismatch 为 0；设备复现任一 mismatch 时，目标用例及包含它的完整入口
+都必须返回非零，不能把问题存在本身包装成 PASS。
+
+CCEC publish/observe seam 曾在前序压力后出现 40/100 stale reads。producer 在 16 个 payload `st_dev` 完成后、
+发布 atomic flag 前加入一处 `dsb(DSB_ALL)`；保持 consumer 不变后，单项压力后与完整 runner 均为
+flag=100、errors=0。
 
 ## 当前 pull 验证（`e63f072d`）
 
@@ -68,6 +124,17 @@ MB-4/5/6/7 已越过此前的 CCEC 编译阻塞并完成真硬件运行。下方
 ### 1. 环境（editable install 路径修正）
 
 `_simpler_editable.py` / `.pth` 硬编码旧目录，已替换为当前目录。
+
+本机已有 PTO-ISA checkout，测试和 editable build 应直接复用，避免再次 clone：
+
+```bash
+export PTO_ISA_ROOT=/home/q00473782/atomic/codex/simpler-fully_distributed/build/pto-isa
+git -C "$PTO_ISA_ROOT" rev-parse HEAD
+# ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8
+test -f "$PTO_ISA_ROOT/include/pto/pto-inst.hpp"
+```
+
+`PTO_ISA_ROOT` 必须指向仓库根目录，构建器会使用其 `include/`；无需把 PTO-ISA 复制进本仓。
 
 ### 2. Build 管道
 
