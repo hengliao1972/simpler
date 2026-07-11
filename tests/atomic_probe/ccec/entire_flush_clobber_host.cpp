@@ -45,6 +45,7 @@ int main(int argc, char *argv[]) {
     uint32_t test_blocks[] = {1, 2, 4, 8, 16, 32, 64};
     for (size_t i = 0; i < sizeof(test_blocks)/sizeof(test_blocks[0]); i++) {
         uint32_t numBlocks = test_blocks[i];
+        // Zero whole region; gx[30] = BARRIER_SLOT must start at 0.
         uint32_t zero[256] = {0};
         check(aclrtMemcpy(gx_dev, sizeof(zero), zero, sizeof(zero),
                           ACL_MEMCPY_HOST_TO_DEVICE), "aclrtMemcpy init");
@@ -68,9 +69,10 @@ int main(int argc, char *argv[]) {
         check(aclrtMemcpy(result, sizeof(result), gx_dev, sizeof(result),
                           ACL_MEMCPY_DEVICE_TO_HOST), "aclrtMemcpy result");
 
-        printf("blocks=%2u  survivors=%u/%u  flags: ", numBlocks, result[64], numBlocks);
+        // Flags live at gx[64+bid], summary at gx[128], raw at gx[129+bid].
+        printf("blocks=%2u  survivors=%u/%u  flags: ", numBlocks, result[128], numBlocks);
         for (uint32_t b = 0; b < numBlocks && b < 10; b++)
-            printf("[%u]=%u ", b, result[65+b]);
+            printf("[%u]=%u ", b, result[129+b]);
         printf("\n");
     }
 

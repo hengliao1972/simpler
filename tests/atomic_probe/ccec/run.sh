@@ -27,6 +27,7 @@ ASC_IMPL="$ASCEND_HOME_PATH/x86_64-linux/asc/impl"
 ASCENDC_INCLUDE="$ASCEND_HOME_PATH/x86_64-linux/ascendc/include"
 
 INC_FLAGS=(
+    -I"$SCRIPT_DIR"
     -I"$TIKCFW"
     -I"$ASC_INCLUDE" -I"$ASC_INCLUDE/basic_api"
     -I"$ASC_IMPL" -I"$ASC_IMPL/basic_api"
