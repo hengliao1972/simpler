@@ -5,7 +5,7 @@
 // ccec-compiled kernel binary.
 //
 // Build: see run_dcci_seam.sh
-#include "acl/acl.h"
+#include "../probe_host.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -26,8 +26,10 @@ int main(int argc, char *argv[]) {
 
     constexpr uint32_t NUM_ROUNDS = 100;
 
+    int32_t deviceId = atomic_probe::DeviceId();
+    if (deviceId < 0) return EXIT_FAILURE;
     check(aclInit(nullptr), "aclInit");
-    check(aclrtSetDevice(0), "aclrtSetDevice");
+    check(aclrtSetDevice(deviceId), "aclrtSetDevice");
 
     aclrtStream stream;
     check(aclrtCreateStream(&stream), "aclrtCreateStream");
@@ -41,7 +43,7 @@ int main(int argc, char *argv[]) {
     printf("Kernel binary: %s (%zu bytes)\n\n", kernel_path, sz);
 
     aclrtBinHandle bh;
-    check(aclrtBinaryLoadFromData(bin.data(), sz, nullptr, &bh), "aclrtBinaryLoadFromData");
+    check(atomic_probe::LoadAicoreBinaryFromData(bin.data(), sz, &bh), "LoadAicoreBinaryFromData");
     aclrtFuncHandle fh;
     check(aclrtBinaryGetFunctionByEntry(bh, 0, &fh), "aclrtBinaryGetFunctionByEntry");
 
@@ -49,7 +51,7 @@ int main(int argc, char *argv[]) {
     check(aclrtMalloc(&gx_dev, 64 * sizeof(uint32_t), ACL_MEM_MALLOC_HUGE_FIRST),
           "aclrtMalloc gx");
 
-    // Zero flag + error counter; gx[30] = BARRIER_SLOT must start at 0.
+    // Zero payload, flag, and error counter.
     uint32_t zeros[64] = {0};
     check(aclrtMemcpy(gx_dev, sizeof(zeros), zeros, sizeof(zeros),
                       ACL_MEMCPY_HOST_TO_DEVICE), "init gx");
@@ -85,11 +87,13 @@ int main(int argc, char *argv[]) {
     printf("Producer st_dev + atomicAdd(flag), consumer ld_dev(poll) + dcci(inval) + read\n");
     printf("is a correct publish/observe seam: %s.\n",
            pass ? "consumer always reads fresh data" : "STALE DATA DETECTED");
+    atomic_probe::Result result;
+    result.Expect(pass, "CCEC dcci seam exact data and completion count");
 
-    aclrtFree(gx_dev);
-    aclrtBinaryUnLoad(bh);
-    aclrtDestroyStream(stream);
-    aclrtResetDevice(0);
-    aclFinalize();
-    return 0;
+    check(aclrtFree(gx_dev), "aclrtFree");
+    check(aclrtBinaryUnLoad(bh), "aclrtBinaryUnLoad");
+    check(aclrtDestroyStream(stream), "aclrtDestroyStream");
+    check(aclrtResetDevice(deviceId), "aclrtResetDevice");
+    check(aclFinalize(), "aclFinalize");
+    return result.ExitCode();
 }

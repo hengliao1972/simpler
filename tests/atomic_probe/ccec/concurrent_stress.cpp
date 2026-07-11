@@ -8,7 +8,7 @@
 // Uses lowercase CCEC builtins: st_dev (via st_dev_b32), ld_dev (via
 // ld_dev_b32), dcci. NOT AscendC templates.
 //
-// Layout (gx[30] = BARRIER_SLOT reserved for ccec_barrier):
+// Layout:
 //   gx[0..15]  = test cache line (64B)
 //   gx[16..23] = result slots (w0, w1, ..., st_err, dcci_err, etc.)
 //
@@ -21,6 +21,8 @@
 #include "ccec_utils.h"
 
 constexpr uint32_t ROUNDS = 1000;
+
+CCEC_PROBE_KERNEL_META(concurrent_stress);
 
 extern "C" __global__ __aicore__ void KERNEL_ENTRY(concurrent_stress)(
     __gm__ uint32_t *gx, uint32_t mode, uint32_t num_blocks)
@@ -50,22 +52,28 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(concurrent_stress)(
             uint32_t w1 = ld_dev_b32(&gx[1]);
             uint32_t w2 = ld_dev_b32(&gx[2]);
             uint32_t w3 = ld_dev_b32(&gx[3]);
-            gx[16] = w0; gx[17] = w1; gx[18] = w2; gx[19] = w3;
-            gx[20] = 0xA000A000u + ROUNDS - 1;  // expected for block 0
-            gx[21] = 0xB000B000u + ROUNDS - 1;  // expected for block 1
+            uint32_t expected_a = 0xA000A000u + ROUNDS - 1;
+            uint32_t expected_b = 0xB000B000u + ROUNDS - 1;
+            st_dev_b32(&gx[16], w0);
+            st_dev_b32(&gx[17], w1);
+            st_dev_b32(&gx[18], w2);
+            st_dev_b32(&gx[19], w3);
+            st_dev_b32(&gx[20], expected_a);
+            st_dev_b32(&gx[21], expected_b);
             uint32_t err = 0;
-            if (w0 < 0xA000A000u) err++;  // clobbered by block 1
-            if (w1 < 0xA000A000u) err++;
-            if (w2 < 0xB000B000u) err++;  // clobbered by block 0
-            if (w3 < 0xB000B000u) err++;
-            gx[22] = err;
+            if (w0 != expected_a) err++;
+            if (w1 != expected_a) err++;
+            if (w2 != expected_b) err++;
+            if (w3 != expected_b) err++;
+            st_dev_b32(&gx[22], err);
         }
         ccec_barrier(gx, num_blocks, 3);
 
     // ================================================================
     // Mode 1: 2-block tight-loop st_dev
     //   block0 st_dev words 0-3, block1 st_dev words 8-11.
-    //   st_dev bypasses DCache entirely -> no clobber expected.
+    //   Per-round DSB completes each batch of st_dev writes before the next
+    //   batch; the final values are an exact ordered control.
     // ================================================================
     } else if (mode == 1) {
         ccec_barrier(gx, num_blocks, 1);
@@ -75,6 +83,9 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(concurrent_stress)(
                 st_dev_b32(&gx[1], 0xDEAD0000u + r);
                 st_dev_b32(&gx[2], 0xDEAD0000u + r);
                 st_dev_b32(&gx[3], 0xDEAD0000u + r);
+                // This final-round oracle requires round N to complete before
+                // round N+1; serialize only this repeated-address test loop.
+                dsb(DSB_ALL);
             }
         } else if (bid == 1) {
             for (uint32_t r = 0; r < ROUNDS; r++) {
@@ -82,21 +93,22 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(concurrent_stress)(
                 st_dev_b32(&gx[9],  0xBEEF0000u + r);
                 st_dev_b32(&gx[10], 0xBEEF0000u + r);
                 st_dev_b32(&gx[11], 0xBEEF0000u + r);
+                dsb(DSB_ALL);
             }
         }
         ccec_barrier(gx, num_blocks, 2);
         if (bid == 0) {
             uint32_t st_err = 0, b_err = 0;
             for (uint32_t w = 0; w < 4; w++) {
-                if (ld_dev_b32(&gx[w]) < 0xDEAD0000u) st_err++;
+                if (ld_dev_b32(&gx[w]) != 0xDEAD0000u + ROUNDS - 1) st_err++;
             }
             for (uint32_t w = 8; w < 12; w++) {
-                if (ld_dev_b32(&gx[w]) < 0xBEEF0000u) b_err++;
+                if (ld_dev_b32(&gx[w]) != 0xBEEF0000u + ROUNDS - 1) b_err++;
             }
-            gx[16] = ld_dev_b32(&gx[0]);  // st_dev word[0]
-            gx[17] = ld_dev_b32(&gx[8]);  // st_dev word[8]
-            gx[22] = st_err;
-            gx[23] = b_err;
+            st_dev_b32(&gx[16], ld_dev_b32(&gx[0]));
+            st_dev_b32(&gx[17], ld_dev_b32(&gx[8]));
+            st_dev_b32(&gx[22], st_err);
+            st_dev_b32(&gx[23], b_err);
         }
         ccec_barrier(gx, num_blocks, 3);
 
@@ -114,6 +126,7 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(concurrent_stress)(
                 st_dev_b32(&gx[1], 0xDEAD0000u + r);
                 st_dev_b32(&gx[2], 0xDEAD0000u + r);
                 st_dev_b32(&gx[3], 0xDEAD0000u + r);
+                dsb(DSB_ALL);
             }
         } else if (bid == 1) {
             // Block 1: store + dcci to words 8-11
@@ -130,16 +143,16 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(concurrent_stress)(
             uint32_t st_err = 0, dcci_err = 0;
             // st_dev words should survive
             for (uint32_t w = 0; w < 4; w++) {
-                if (ld_dev_b32(&gx[w]) < 0xDEAD0000u) st_err++;
+                if (ld_dev_b32(&gx[w]) != 0xDEAD0000u + ROUNDS - 1) st_err++;
             }
             // store+dcci words may be clobbered
             for (uint32_t w = 8; w < 12; w++) {
-                if (ld_dev_b32(&gx[w]) < 0xBEEF0000u) dcci_err++;
+                if (ld_dev_b32(&gx[w]) != 0xBEEF0000u + ROUNDS - 1) dcci_err++;
             }
-            gx[16] = ld_dev_b32(&gx[0]);  // st_dev word[0]
-            gx[17] = ld_dev_b32(&gx[8]);  // store+dcci word[8]
-            gx[22] = st_err;
-            gx[23] = dcci_err;
+            st_dev_b32(&gx[16], ld_dev_b32(&gx[0]));
+            st_dev_b32(&gx[17], ld_dev_b32(&gx[8]));
+            st_dev_b32(&gx[22], st_err);
+            st_dev_b32(&gx[23], dcci_err);
         }
         ccec_barrier(gx, num_blocks, 3);
     }

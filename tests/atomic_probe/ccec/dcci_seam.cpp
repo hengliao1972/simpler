@@ -7,7 +7,7 @@
 // Uses lowercase CCEC builtins: atomicAdd, st_dev (via st_dev_b32 helper),
 // ld_dev (via ld_dev_b32 helper), dcci.
 //
-// Layout (gx[30] = BARRIER_SLOT reserved for ccec_barrier):
+// Layout:
 //   gx[0..15] = 16-word data payload (64B = 1 cache line)
 //   gx[16]    = flag (atomicAdd counter)
 //   gx[17]    = error count (host checks)
@@ -17,6 +17,8 @@
 
 constexpr uint32_t DATA_ELEMS = 16;
 constexpr uint32_t NUM_ROUNDS = 100;
+
+CCEC_PROBE_KERNEL_META(dcci_seam);
 
 extern "C" __global__ __aicore__ void KERNEL_ENTRY(dcci_seam)(
     __gm__ uint32_t *gx, uint32_t num_blocks)
@@ -36,6 +38,9 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(dcci_seam)(
             for (uint32_t i = 0; i < DATA_ELEMS; i++) {
                 st_dev_b32(&data[i], pattern + i);
             }
+            // Release this round's payload before publishing its flag. The
+            // atomic flag update is not used as an implicit st_dev fence.
+            dsb(DSB_ALL);
             atomicAdd(flag, 1u);
         } else if (bid == 1) {
             // Consumer: poll flag via ld_dev until >= round+1, then

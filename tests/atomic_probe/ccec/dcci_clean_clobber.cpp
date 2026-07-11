@@ -18,9 +18,10 @@
 // Mode 3: Control — st_dev survives without any dcci
 // Mode 4: dcci(inval) clobber — FULL 64B verification
 //
-// gx[30] = BARRIER_SLOT reserved for ccec_barrier.
 // Build: see run_dcci_clean.sh / run_all.sh
 #include "ccec_utils.h"
+
+CCEC_PROBE_KERNEL_META(dcci_clean_probe);
 
 extern "C" __global__ __aicore__ void KERNEL_ENTRY(dcci_clean_probe)(
     __gm__ uint32_t *gx, uint32_t mode, uint32_t num_blocks)
@@ -47,11 +48,11 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(dcci_clean_probe)(
         if (bid == 1) {
             uint32_t w0 = ld_dev_b32(&gx[0]);  // expect 0xAA
             uint32_t w3 = ld_dev_b32(&gx[3]);  // expect 0 (CLOBBERED!)
-            gx[16] = (w0 == 0xAA) ? 0 : 1;     // word[0] ok?
-            gx[17] = (w3 == 0) ? 1 : 0;        // word[3] clobbered? 1=yes
-            gx[18] = w0;
-            gx[19] = w3;
-            gx[20] = 0xCAFEBABEu;              // expected word[3]
+            st_dev_b32(&gx[16], (w0 == 0xAA) ? 0 : 1);
+            st_dev_b32(&gx[17], (w3 == 0) ? 1 : 0);
+            st_dev_b32(&gx[18], w0);
+            st_dev_b32(&gx[19], w3);
+            st_dev_b32(&gx[20], 0xCAFEBABEu);
         }
         ccec_barrier(gx, num_blocks, 5);
 
@@ -76,11 +77,11 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(dcci_clean_probe)(
         ccec_barrier(gx, num_blocks, 4);
         if (bid == 1) {
             uint32_t w3 = ld_dev_b32(&gx[3]);
-            gx[16] = (w3 == 0xCAFEBABEu) ? 0 : 1;  // 0=ok
-            gx[17] = 0;  // N/A for this mode
-            gx[18] = 0;
-            gx[19] = w3;
-            gx[20] = 0xCAFEBABEu;
+            st_dev_b32(&gx[16], (w3 == 0xCAFEBABEu) ? 0 : 1);
+            st_dev_b32(&gx[17], 0);
+            st_dev_b32(&gx[18], 0);
+            st_dev_b32(&gx[19], w3);
+            st_dev_b32(&gx[20], 0xCAFEBABEu);
         }
         ccec_barrier(gx, num_blocks, 5);
 
@@ -104,11 +105,11 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(dcci_clean_probe)(
         if (bid == 1) {
             uint32_t w0 = ld_dev_b32(&gx[0]);
             uint32_t w3 = ld_dev_b32(&gx[3]);
-            gx[16] = (w0 == 0xAA) ? 0 : 1;
-            gx[17] = (w3 == 0) ? 1 : 0;  // clobbered?
-            gx[18] = w0;
-            gx[19] = w3;
-            gx[20] = 0xCAFEBABEu;
+            st_dev_b32(&gx[16], (w0 == 0xAA) ? 0 : 1);
+            st_dev_b32(&gx[17], (w3 == 0) ? 1 : 0);
+            st_dev_b32(&gx[18], w0);
+            st_dev_b32(&gx[19], w3);
+            st_dev_b32(&gx[20], 0xCAFEBABEu);
         }
         ccec_barrier(gx, num_blocks, 5);
 
@@ -130,11 +131,11 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(dcci_clean_probe)(
         if (bid == 1) {
             uint32_t w0 = ld_dev_b32(&gx[0]);
             uint32_t w3 = ld_dev_b32(&gx[3]);
-            gx[16] = (w0 == 0) ? 0 : 1;     // word[0] NOT visible (stuck in L1)
-            gx[17] = (w3 == 0xCAFEBABEu) ? 0 : 1;  // word[3] survived
-            gx[18] = w0;
-            gx[19] = w3;
-            gx[20] = 0xCAFEBABEu;
+            st_dev_b32(&gx[16], (w0 == 0) ? 0 : 1);
+            st_dev_b32(&gx[17], (w3 == 0xCAFEBABEu) ? 0 : 1);
+            st_dev_b32(&gx[18], w0);
+            st_dev_b32(&gx[19], w3);
+            st_dev_b32(&gx[20], 0xCAFEBABEu);
         }
         ccec_barrier(gx, num_blocks, 5);
 
@@ -162,8 +163,8 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(dcci_clean_probe)(
                 uint32_t v = ld_dev_b32(&gx[w]);
                 if (v != 0xB000u + w) clobbered++;
             }
-            gx[16] = clobbered;  // expect 15 (all clobbered)
-            gx[17] = ld_dev_b32(&gx[0]);  // expect 0xAA (block 0's store)
+            st_dev_b32(&gx[16], clobbered);
+            st_dev_b32(&gx[17], ld_dev_b32(&gx[0]));
         }
         ccec_barrier(gx, num_blocks, 5);
     }
