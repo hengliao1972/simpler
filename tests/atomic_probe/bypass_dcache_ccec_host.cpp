@@ -73,33 +73,28 @@ static void run_mode(aclrtFuncHandle funcHandle, aclrtStream stream,
                (bypass == exp) ? "OK" : "FAIL",
                (normal == exp) ? "OK" : "STALE");
     } else if (mode == 4) {
-        bool pass = (r[16] == 0) && (r[17] == 100);
-        printf("[%-16s] mode=%u  corrupt=%u/15  gx0=%u(exp %u)  %.0fus  %s\n",
-               label, mode, r[16], r[17], r[18], host_us, pass ? "PASS" : "FAIL");
-    } else if (mode == 5) {
-        uint32_t polluted = r[16];
-        uint32_t bypass_val = r[17];
-        uint32_t normal_after = r[18];
-        uint32_t after_dcci = r[35];
-        printf("[%-16s] mode=%u  bypass=0x%x normal_after=0x%x(exp 0xaa) after_dcci=0x%x  %.0fus  L1:%s\n",
-               label, mode, bypass_val, normal_after, after_dcci, host_us,
-               polluted ? "POLLUTED" : "CLEAN");
-    } else if (mode == 6) {
-        uint32_t err_bypass = r[16];
-        uint32_t err_inval  = r[17];
-        uint32_t err_stale  = r[18];
-        bool pass = (err_bypass == 0) && (err_inval == 0);
-        printf("[%-16s] mode=%u  bypass_err=%u inval_err=%u stale_err=%u  %.0fus  %s\n",
-               label, mode, err_bypass, err_inval, err_stale, host_us,
-               pass ? "PASS" : "FAIL");
-        printf("  word[0]: bypass=0x%x inval=0x%x  byte[8]=0x%02x half[5]=0x%04x\n",
-               r[19], r[20], r[21], r[22]);
-        // Print byte-level snapshot for ground truth
-        uint8_t *snap = reinterpret_cast<uint8_t*>(&r[23]);
-        printf("  64B snapshot:");
-        for (uint32_t i = 0; i < 16; i++) printf(" %02x", snap[i]);
-        printf("\n");
-        printf("  expected:    ef be ad de 00 00 00 00 ab 00 be ba 00 00 00 00\n");
+        // AIC+AIV both run 100 atomics each = 200 total
+        bool pass = (r[16] == 0) && (r[17] == 200);
+        printf("[%-16s] mode=%u  corrupt=%u/15  gx0=%u(exp 200)  %.0fus  %s\n",
+               label, mode, r[16], r[17], host_us, pass ? "PASS" : "FAIL");
+    } else {
+        uint32_t status = r[16];
+        uint32_t w0 = r[17];
+        uint32_t w3 = r[18];
+        uint32_t expected_w0 = r[19];
+        if (mode == 5) {
+            printf("[%-16s] mode=%u  st_dev gx[0]=0x%x(exp 0x%x) store+dcci gx[3]=0x%x  %.0fus  gx[0]:%s\n",
+                   label, mode, w0, expected_w0, w3, host_us,
+                   status ? "CLOBBERED" : "SURVIVED");
+        } else if (mode == 6) {
+            printf("[%-16s] mode=%u  gx[0]=0x%x(exp 0 clobbered) gx[3]=0x%x(exp 0xCAFEBABE)  %.0fus  %s\n",
+                   label, mode, w0, w3, host_us,
+                   (w0 == 0 && w3 == 0xCAFEBABEu) ? "CLOBBERED(Confirmed)" : "UNEXPECTED");
+        } else if (mode == 7) {
+            printf("[%-16s] mode=%u  gx[0]=0x%x(exp 0x%x) gx[3]=0x%x(exp 0xCAFEBABE)  %.0fus  %s\n",
+                   label, mode, w0, expected_w0, w3, host_us,
+                   (w0 == expected_w0 && w3 == 0xCAFEBABEu) ? "PASS(inval-fix)" : "FAIL");
+        }
     }
 }
 
@@ -140,9 +135,32 @@ int main(int argc, char *argv[]) {
     run_mode(funcHandle, stream, gx_dev, 1, "ByPass4B(blast)");
     run_mode(funcHandle, stream, gx_dev, 2, "ByPassReadCheck");
     run_mode(funcHandle, stream, gx_dev, 3, "ByPassReadVsL1");
-    run_mode(funcHandle, stream, gx_dev, 4, "ByPass+Atomic");
-    run_mode(funcHandle, stream, gx_dev, 5, "ByPassNoPollute");
-    run_mode(funcHandle, stream, gx_dev, 6, "PartialWrite+Read");
+    run_mode(funcHandle, stream, gx_dev, 4, "stdev+Atomic");
+    run_mode(funcHandle, stream, gx_dev, 5, "ConcurrentMixed");
+    run_mode(funcHandle, stream, gx_dev, 6, "dcciClobbersStdev");
+    run_mode(funcHandle, stream, gx_dev, 7, "InvalFix");
+
+    // Run concurrent mode 5 multiple times to show race distribution
+    printf("\n--- Mode 5 (ConcurrentMixed) x20 runs ---\n");
+    uint32_t survived = 0, clobbered = 0;
+    for (int i = 0; i < 20; i++) {
+        uint32_t zeros[64] = {0};
+        check(aclrtMemcpy(gx_dev, sizeof(zeros), zeros, sizeof(zeros),
+                          ACL_MEMCPY_HOST_TO_DEVICE), "init");
+        uint64_t gx_ptr = (uint64_t)(uintptr_t)gx_dev;
+        uint64_t args[3] = {gx_ptr, 5, 2};
+        aclrtArgsHandle ah;
+        check(aclrtKernelArgsInit(funcHandle, &ah), "init");
+        aclrtParamHandle ph;
+        check(aclrtKernelArgsAppend(ah, args, sizeof(args), &ph), "append");
+        check(aclrtKernelArgsFinalize(ah), "finalize");
+        check(aclrtLaunchKernelWithConfig(funcHandle, 2, stream, nullptr, ah, nullptr), "launch");
+        check(aclrtSynchronizeStream(stream), "sync");
+        uint32_t r2[64] = {0};
+        check(aclrtMemcpy(r2, sizeof(r2), gx_dev, sizeof(r2), ACL_MEMCPY_DEVICE_TO_HOST), "copy");
+        if (r2[16] == 0) survived++; else clobbered++;
+    }
+    printf("  st_dev survived=%u/20  clobbered_by_dcci=%u/20\n\n", survived, clobbered);
 
     printf("\n=== Summary ===\n");
     printf("st_dev: write GM bypassing DCache (no dirty, no clobber)\n");
