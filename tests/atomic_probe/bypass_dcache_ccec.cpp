@@ -234,5 +234,114 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(bypass_dcache_probe)(
             gx[35] = after;  // 0xAA (dcci wrote L1's 0xAA back)
         }
         SyncAll();
+
+    // ================================================================
+    // Mode 6: Partial write + cross-core correct read (end-to-end)
+    //
+    // Core question: one core writes PART of a cache line (1B/2B/4B
+    // at different offsets).  Can another core correctly read each
+    // written fragment AND verify unwritten bytes are NOT corrupted?
+    //
+    // Writer (block 0): 3 partial writes at different widths/offsets
+    //   word[0]      = 0xDEADBEEF  (4 bytes, offset 0)
+    //   byte[8]      = 0xAB        (1 byte,  offset 8)
+    //   half[5]      = 0xBABE      (2 bytes, offset 10)
+    //
+    // Reader (block 1): verifies via 3 read methods
+    //   a) ReadGmByPassDCache — always fresh from HBM
+    //   b) dcci(inval) + normal read — fresh after cache line invalidate
+    //   c) normal read WITHOUT inval — may be stale (if L1 was warmed)
+    //
+    // Also verifies ALL 64 bytes: written = expected, unwritten = 0.
+    // ================================================================
+    } else if (mode == 6) {
+        SyncAll();
+
+        // Reader (block 1): warm L1 with all zeros BEFORE writer acts
+        if (bid == 1) {
+            volatile __gm__ uint8_t *vb = reinterpret_cast<__gm__ uint8_t*>(gx);
+            uint32_t sum = 0;
+            for (uint32_t i = 0; i < 64; i++) sum += vb[i];
+            (void)sum;  // L1 now has all-zero cache line
+        }
+
+        SyncAll();
+
+        // Writer (block 0): 3 partial ByPassDCache writes
+        if (bid == 0) {
+            // 4-byte write at word[0] (bytes 0-3)
+            WriteGmByPassDCache<uint32_t>(&gx[0], 0xDEADBEEFu);
+            // 1-byte write at byte[8] (word[2], low byte)
+            __gm__ uint8_t *bytes = reinterpret_cast<__gm__ uint8_t*>(gx);
+            WriteGmByPassDCache<uint8_t>(&bytes[8], 0xAB);
+            // 2-byte write at half[5] (bytes 10-11)
+            __gm__ uint16_t *half = reinterpret_cast<__gm__ uint16_t*>(gx);
+            WriteGmByPassDCache<uint16_t>(&half[5], 0xBABEu);
+        }
+
+        SyncAll();
+
+        // Reader (block 1): read back via 3 methods, verify everything
+        if (bid == 1) {
+            __gm__ uint8_t *bytes = reinterpret_cast<__gm__ uint8_t*>(gx);
+            uint32_t errors_bypass = 0;
+            uint32_t errors_inval  = 0;
+            uint32_t errors_stale  = 0;
+
+            // --- Method A: ReadGmByPassDCache (always fresh) ---
+            // Check written bytes
+            uint32_t w0 = ReadGmByPassDCache<uint32_t>(&gx[0]);
+            if (w0 != 0xDEADBEEFu) errors_bypass++;
+            uint8_t b8 = ReadGmByPassDCache<uint8_t>(&bytes[8]);
+            if (b8 != 0xAB) errors_bypass++;
+            uint16_t h5 = ReadGmByPassDCache<uint16_t>(
+                reinterpret_cast<__gm__ uint16_t*>(&bytes[10]));
+            if (h5 != 0xBABEu) errors_bypass++;
+            // Check ALL 64 bytes: written = expected, unwritten = 0
+            for (uint32_t i = 0; i < 64; i++) {
+                uint8_t v = ReadGmByPassDCache<uint8_t>(&bytes[i]);
+                uint8_t exp = 0;
+                if (i < 4) exp = (uint8_t)(0xDEADBEEFu >> (i * 8));
+                else if (i == 8) exp = 0xAB;
+                else if (i == 10) exp = (uint8_t)0xBABEu;       // low byte
+                else if (i == 11) exp = (uint8_t)(0xBABEu >> 8); // high byte
+                if (v != exp) errors_bypass++;
+            }
+
+            // --- Method B: dcci inval + normal read (fresh) ---
+            dcci(gx, SINGLE_CACHE_LINE);  // invalidate L1
+            volatile __gm__ uint32_t *vgx = gx;
+            uint32_t w0_inval = vgx[0];
+            if (w0_inval != 0xDEADBEEFu) errors_inval++;
+            volatile __gm__ uint8_t *vb = bytes;
+            if (vb[8] != 0xAB) errors_inval++;
+            volatile __gm__ uint16_t *vh = reinterpret_cast<volatile __gm__ uint16_t*>(gx);
+            if (vh[5] != 0xBABEu) errors_inval++;
+            // Check unwritten word[1] is still 0
+            if (vgx[1] != 0) errors_inval++;
+
+            // --- Method C: normal read WITHOUT inval ---
+            // After method B's inval + reads, L1 is now warm with the
+            // correct HBM data.  So a second round of normal reads
+            // without inval should also be correct (L1 was populated
+            // by method B's reads).
+            // To test true stale behavior, we'd need a separate run.
+            // For now, just verify current normal reads are consistent.
+            uint32_t w0_normal = vgx[0];
+            if (w0_normal != 0xDEADBEEFu) errors_stale++;
+
+            // Pack results
+            gx[16] = errors_bypass;  // expect 0
+            gx[17] = errors_inval;   // expect 0
+            gx[18] = errors_stale;   // expect 0
+            gx[19] = w0;             // word[0] via bypass
+            gx[20] = w0_inval;       // word[0] via inval+normal
+            gx[21] = (uint32_t)b8;   // byte[8] via bypass
+            gx[22] = (uint32_t)h5;   // half[5] via bypass
+            // Snapshot all 64 bytes (via bypass for ground truth)
+            for (uint32_t i = 0; i < 16; i++)
+                gx[23 + i] = ReadGmByPassDCache<uint32_t>(&gx[i]);
+        }
+        SyncAll();
     }
 }
