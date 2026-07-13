@@ -17,7 +17,11 @@
 #define DIST_SIM_HOST_CLOCK 0
 #endif
 
-#if defined(PTO2_PROFILING) && PTO2_PROFILING && defined(__CPU_SIM)
+#ifndef PTO2_PROFILING
+#define PTO2_PROFILING 1
+#endif
+
+#if defined(PTO2_PROFILING) && PTO2_PROFILING
 #define DIST_TRACE_ENABLED 1
 #else
 #define DIST_TRACE_ENABLED 0

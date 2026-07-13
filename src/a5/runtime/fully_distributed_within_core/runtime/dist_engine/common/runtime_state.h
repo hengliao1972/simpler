@@ -13,11 +13,11 @@
 
 #include "dist_engine/common/atomic.h"
 #include "dist_engine/common/state.h"
-#include "dist_engine/common/trace.h"
 #include "dist_engine/common/worker_state.h"
 
 #if DIST_SIM_HOST_CLOCK
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #endif
@@ -27,6 +27,15 @@ void dist_dump_state(int);
 #endif
 
 namespace {
+
+#if DIST_SIM_HOST_CLOCK
+inline uint64_t dist_now_ns() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count()
+    );
+}
+#endif
 
 PTO_DEVICE_FUNC inline bool fatal_set() { return atom_load(g_dist.fatal, __ATOMIC_ACQUIRE) != 0; }
 PTO_DEVICE_FUNC inline void set_fatal() { atom_store(g_dist.fatal, 1, __ATOMIC_RELEASE); }
@@ -38,7 +47,7 @@ PTO_DEVICE_FUNC inline void watchdog([[maybe_unused]] uint64_t &start_ns) {
         return e ? std::strtol(e, nullptr, 10) : 0;
     }();
     if (budget_s <= 0) return;
-    const uint64_t now = now_ns();
+    const uint64_t now = dist_now_ns();
     if (start_ns == 0) {
         start_ns = now;
         return;

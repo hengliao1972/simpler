@@ -70,6 +70,102 @@ def _task_display_name(func_id, func_id_to_name, tdisp):
     return f"func_{_func_id_to_letter(func_id)}({tdisp})"
 
 
+def _append_fdwic_dist_engine_events(events, fdwic_events, func_id_to_name=None):
+    """Append fully_distributed_within_core AICore-runtime spans.
+
+    The visual shape follows the a2a3 dist_engine swimlane where it applies on
+    device: one process per physical block, AIC/AIV lanes as threads, and
+    kernel spans on a separate sub-lane so runtime waits do not hide kernels.
+    Onboard has no host wall/cpu split, so only a single device-time view is
+    emitted.
+    """
+
+    def lane_name(lane):
+        return {0: "AIC", 1: "AIV0", 2: "AIV1"}.get(int(lane), "?")
+
+    def phase_name(phase):
+        return {
+            "Kernel": "kernel",
+            "Alloc": "alloc",
+            "Build": "build",
+            "DrainWon": "drain_won",
+            "Replay": "replay",
+            "RingBp": "ringbp",
+            "EfDrain": "efdrain",
+            "Commit": "commit",
+        }.get(str(phase), str(phase).lower())
+
+    def kernel_name(func_id):
+        if func_id_to_name:
+            return func_id_to_name.get(str(func_id), func_id_to_name.get(func_id, f"f{func_id}"))
+        return f"f{func_id}"
+
+    blocks = sorted({int(e["block_id"]) for e in fdwic_events if int(e["block_id"]) >= 0})
+    core_by_block_lane = {}
+    for e in fdwic_events:
+        block_id = int(e["block_id"])
+        lane = int(e["lane"])
+        core_by_block_lane.setdefault((block_id, lane), int(e["core_id"]))
+
+    for block_id in blocks:
+        events.append({"ph": "M", "name": "process_name", "pid": block_id, "args": {"name": f"block{block_id}"}})
+        events.append({"ph": "M", "name": "process_sort_index", "pid": block_id, "args": {"sort_index": block_id}})
+        for lane in (0, 1, 2):
+            core_id = core_by_block_lane.get((block_id, lane))
+            if core_id is None:
+                continue
+            events.append(
+                {
+                    "ph": "M",
+                    "name": "thread_name",
+                    "pid": block_id,
+                    "tid": lane,
+                    "args": {"name": f"{lane_name(lane)} (core{core_id})"},
+                }
+            )
+            events.append(
+                {
+                    "ph": "M",
+                    "name": "thread_name",
+                    "pid": block_id,
+                    "tid": lane + 3,
+                    "args": {"name": f"{lane_name(lane)}·kernel (core{core_id})"},
+                }
+            )
+
+    for e in fdwic_events:
+        phase = phase_name(e["phase"])
+        func_id = int(e["func_id"])
+        task_id = int(e["task_id"])
+        lane = int(e["lane"])
+        if phase == "kernel" and func_id >= 0:
+            name = f"{kernel_name(func_id)}#{task_id}"
+            tid = lane + 3
+        elif phase == "commit":
+            name = f"{phase}#{task_id}"
+            tid = lane + 3
+        else:
+            name = f"{phase}#{task_id}"
+            tid = lane
+        events.append(
+            {
+                "ph": "X",
+                "name": name,
+                "pid": int(e["block_id"]),
+                "tid": tid,
+                "ts": round(float(e["start_time_us"]), 3),
+                "dur": round(float(e["duration_us"]), 3),
+                "args": {
+                    "phase": phase,
+                    "task_id": task_id,
+                    "func_id": func_id,
+                    "core": int(e["core_id"]),
+                    "mc": int(e["flags"]) & 1,
+                },
+            }
+        )
+
+
 def normalize_pto2_task_id_int(v):
     """Unsigned 64-bit PTO2 task id (matches host JSON / device ``task_id.raw``).
 
@@ -123,7 +219,9 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
                             end_cycles, receive_to_start_cycles], ...],
           "aicpu_tasks":  [[core_id, reg_task_id, dispatch_cycles, finish_cycles], ...],
           "aicpu_scheduler_phases":     [ [ {kind, start_cycles, end_cycles, ...}, ... ], ... ],
-          "aicpu_orchestrator_phases":  [ [ {submit_idx, task_id, start_cycles, end_cycles}, ... ], ... ]
+          "aicpu_orchestrator_phases":  [ [ {submit_idx, task_id, start_cycles, end_cycles}, ... ], ... ],
+          "fdwic_events": [[core_id, block_id, lane, task_id, func_id, phase,
+                            start_cycles, end_cycles, flags, aux], ...]
         }
 
     aicore_tasks columns (v3 schema): the trailing receive_to_start_cycles
@@ -177,6 +275,7 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
     aicpu_rows = data.get("aicpu_tasks") or []
     sched_phases_raw = data.get("aicpu_scheduler_phases") or []
     orch_phases_raw = data.get("aicpu_orchestrator_phases") or []
+    fdwic_rows = data.get("fdwic_events") or []
 
     # AICore lookup keyed by (core_id, reg_task_id). Two dispatches of the
     # same PTO2 task_token_raw to the same core (SPMD over-subscription, MIX
@@ -228,6 +327,9 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
         for pr in thread_records:
             _track(int(pr.get("start_cycles", 0)))
             _track(int(pr.get("end_cycles", 0)))
+    for row in fdwic_rows:
+        _track(int(row[6]))
+        _track(int(row[7]))
 
     if base_time_cycles is None:
         base_time_cycles = 0
@@ -356,6 +458,27 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
             converted.append(out)
         aicpu_orchestrator_phases.append(converted)
 
+    fdwic_events = []
+    for row in fdwic_rows:
+        core_id, block_id, lane, task_id, func_id, phase, start_cycles, end_cycles, flags, aux = row
+        start_us = _to_us(int(start_cycles))
+        end_us = _to_us(int(end_cycles))
+        fdwic_events.append(
+            {
+                "core_id": int(core_id),
+                "block_id": int(block_id),
+                "lane": int(lane),
+                "task_id": int(task_id),
+                "func_id": int(func_id),
+                "phase": str(phase),
+                "start_time_us": start_us,
+                "end_time_us": end_us,
+                "duration_us": end_us - start_us,
+                "flags": int(flags),
+                "aux": int(aux),
+            }
+        )
+
     out = {
         "l2_swimlane_level": level,
         "tasks": tasks,
@@ -366,6 +489,8 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
         out["aicpu_orchestrator_phases"] = aicpu_orchestrator_phases
     if core_to_thread:
         out["core_to_thread"] = core_to_thread
+    if fdwic_events:
+        out["fdwic_events"] = fdwic_events
     return out
 
 
@@ -866,6 +991,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     deps_edges=None,
     deps_kernel_map=None,
     emit_overhead=False,
+    fdwic_events=None,
 ):
     """Generate Chrome Trace Event Format JSON from task data.
 
@@ -891,6 +1017,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     if verbose:
         print("Generating Chrome Trace JSON...")
         print(f"  Tasks: {len(tasks)}")
+        if fdwic_events:
+            print(f"  FDWIC events: {len(fdwic_events)}")
         if func_id_to_name:
             print(f"  Function names: {len(func_id_to_name)} entries")
 
@@ -920,8 +1048,15 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 if resolved >= 0:
                     task["func_id"] = resolved
 
-    # Step 2: Generate JSON events
     events = []
+
+    if fdwic_events and not tasks:
+        _append_fdwic_dist_engine_events(events, fdwic_events, func_id_to_name)
+        with open(output_path, "w") as f:
+            json.dump({"displayTimeUnit": "ns", "traceEvents": events}, f, indent=2)
+        if verbose:
+            print(f"JSON written to: {output_path}")
+        return
 
     # Metadata event: Process names and sort order.
     # pid is renumbered in pipeline order (top → bottom in Perfetto):
@@ -2143,7 +2278,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             print(f"  Overhead Analysis: {sum(1 for e in oh if e.get('ph') == 'C')} counter points (8 tracks)")
 
     with open(output_path, "w") as f:
-        json.dump({"traceEvents": events}, f, indent=2)
+        json.dump({"displayTimeUnit": "ns", "traceEvents": events}, f, indent=2)
 
     if verbose:
         print(f"JSON written to: {output_path}")
@@ -2343,6 +2478,7 @@ def main():
             deps_edges=deps_edges,
             deps_kernel_map=deps_kernel_map,
             emit_overhead=args.overhead,
+            fdwic_events=data.get("fdwic_events"),
         )
         if args.overhead and deps_edges is None:
             print(

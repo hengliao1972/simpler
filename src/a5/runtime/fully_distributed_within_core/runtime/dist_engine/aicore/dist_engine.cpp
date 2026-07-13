@@ -19,6 +19,7 @@
 #include "dist_engine/common/state.h"          // NOLINT(build/include_subdir)
 #include "dist_engine/common/atomic.h"         // NOLINT(build/include_subdir)
 #include "dist_engine/common/trace.h"          // NOLINT(build/include_subdir)
+#include "dist_engine/common/swimlane.h"       // NOLINT(build/include_subdir)
 #include "dist_engine/common/worker_state.h"   // NOLINT(build/include_subdir)
 #include "dist_engine/common/runtime_state.h"  // NOLINT(build/include_subdir)
 #include "dist_engine/common/debug_dump.h"     // NOLINT(build/include_subdir)

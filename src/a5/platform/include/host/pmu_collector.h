@@ -50,6 +50,7 @@
 #define SRC_A5_PLATFORM_INCLUDE_HOST_PMU_COLLECTOR_H_
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -302,9 +303,12 @@ inline PmuEventType resolve_pmu_event_type(int requested_event_type) {
     if (pmu_env == nullptr) {
         return resolved;
     }
-    int val = std::atoi(pmu_env);
-    if (val > 0 && pmu_resolve_event_config_a5(static_cast<PmuEventType>(val)) != nullptr) {
-        resolved = static_cast<PmuEventType>(val);
+    errno = 0;
+    char *parse_end = nullptr;
+    long parsed_value = std::strtol(pmu_env, &parse_end, 10);  // NOLINT(runtime/int)
+    if (errno == 0 && parse_end != pmu_env && *parse_end == '\0' && parsed_value > 0 &&
+        pmu_resolve_event_config_a5(static_cast<PmuEventType>(parsed_value)) != nullptr) {
+        resolved = static_cast<PmuEventType>(parsed_value);
         LOG_INFO_V0("PMU event type set to %u from SIMPLER_PMU_EVENT_TYPE", static_cast<uint32_t>(resolved));
         return resolved;
     }

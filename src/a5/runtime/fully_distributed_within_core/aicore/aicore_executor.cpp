@@ -61,10 +61,9 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2Di
  * core id publication, per-core dispatch payload cache). The trb-style
  * Phase 4 poll loop is replaced by a single dist_core_main invocation.
  *
- * Profiling state (get_aicore_profiling_flag etc.) is not touched here: on the
- * dist path, per-task profiling records are emitted from inside dist_core_main
- * / dist_engine_dump_trace on the AICPU side, so this loop does not need to
- * pre-resolve the L2 swimlane / PMU rings.
+ * Profiling state (get_aicore_profiling_flag etc.) is not touched here: the
+ * dist path publishes its own trace buffer through Runtime::DistHandoff, so
+ * this loop does not need to pre-resolve the L2 swimlane / PMU rings.
  *
  * @param runtime Pointer to Runtime in global memory
  * @param s_block_idx Block index (core ID)

@@ -332,9 +332,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     }
                     SPIN_WAIT_HINT();
                 }
-                // All workers done (single-threaded here): emit the per-core
-                // execution swimlane if PTO_DIST_SWIMLANE is set (else no-op).
-                dist_engine_dump_trace();
             }
             runtime_done_.store(true, std::memory_order_release);
         }

@@ -15,9 +15,7 @@
 DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int core_idx, int core_type_int) {
     __gm__ DistCore *self = dist_aicore_attach_worker(runtime, core_idx, core_type_int);
     if (self == nullptr) return;
-#if DIST_TRACE_ENABLED
     trace_reset_core(self);
-#endif
 
     if (!direct_fatal_set()) {
         publish_worker_started();
