@@ -55,6 +55,11 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_d
     return -1;
 }
 
+extern "C" __attribute__((weak)) int
+fdwic_swimlane_host_init(Runtime *runtime, int num_cores, int enabled, const char *output_prefix);
+extern "C" __attribute__((weak)) int fdwic_swimlane_host_export(Runtime *runtime);
+extern "C" __attribute__((weak)) void fdwic_swimlane_host_finalize(Runtime *runtime);
+
 // =============================================================================
 // DeviceRunner Implementation
 // =============================================================================
@@ -260,6 +265,22 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     });
 
     // Initialize per-subsystem shared memory.
+    const bool original_enable_l2_swimlane = enable_l2_swimlane_;
+    auto l2_swimlane_flag_cleanup = RAIIScopeGuard([this, original_enable_l2_swimlane]() {
+        enable_l2_swimlane_ = original_enable_l2_swimlane;
+    });
+    bool fdwic_swimlane_active = false;
+    if (enable_l2_swimlane_ && fdwic_swimlane_host_init != nullptr) {
+        rc = fdwic_swimlane_host_init(&runtime, num_aicore, 1, output_prefix_.c_str());
+        if (rc < 0) {
+            LOG_ERROR("fdwic swimlane init failed: %d", rc);
+            return rc;
+        }
+        if (rc > 0) {
+            fdwic_swimlane_active = true;
+            enable_l2_swimlane_ = false;
+        }
+    }
     if (enable_l2_swimlane_) {
         rc = init_l2_swimlane(num_aicore, runtime.aicpu_thread_num, device_id_);
         if (rc != 0) {
@@ -304,8 +325,12 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // Cleanup guard for early returns: stops all started collectors so
     // their mgmt + poll threads exit cleanly. stop() is idempotent and a
     // no-op on collectors that never started.
-    auto perf_cleanup = RAIIScopeGuard([this]() {
+    auto perf_cleanup = RAIIScopeGuard([this, &runtime, &fdwic_swimlane_active]() {
         finalize_collectors();
+        if (fdwic_swimlane_active && fdwic_swimlane_host_finalize != nullptr) {
+            fdwic_swimlane_host_finalize(&runtime);
+            fdwic_swimlane_active = false;
+        }
     });
 
     LOG_INFO_V0("=== Initialize runtime args ===");
@@ -407,12 +432,18 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         // idempotent, so this runs only on the error return; the success path
         // still exports exactly once below.
         teardown_shared_collectors_after_run();
+        if (fdwic_swimlane_active && fdwic_swimlane_host_export != nullptr) {
+            fdwic_swimlane_host_export(&runtime);
+        }
         return rc;
     }
 
     read_device_wall_ns();
 
     teardown_shared_collectors_after_run();
+    if (fdwic_swimlane_active && fdwic_swimlane_host_export != nullptr) {
+        fdwic_swimlane_host_export(&runtime);
+    }
 
     // a5-specific dep_gen teardown: stop + reconcile + replay emit.
     if (enable_dep_gen_) {

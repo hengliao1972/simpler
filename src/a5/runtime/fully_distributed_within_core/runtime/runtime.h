@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "common/core_type.h"
+#include "dist_engine/common/swimlane_types.h"
 #include "common/platform_config.h"
 #include "pto2_dispatch_payload.h"
 #include "pto_types.h"
@@ -246,6 +247,9 @@ public:
         // share one address space; onboard writes the GM allocation address.
         volatile uint64_t shared_addr;
         volatile int32_t num_workers;  // number of AICore workers participating
+        volatile uint64_t swimlane_base;
+        volatile uint32_t swimlane_enabled;
+        volatile uint32_t swimlane_records_per_core;
         Tensor ccec_orch_tensors[CHIP_MAX_TENSOR_ARGS];
         uint64_t ccec_orch_scalars[CHIP_MAX_SCALAR_ARGS];
         volatile int32_t ccec_orch_tensor_count;
@@ -253,6 +257,13 @@ public:
         alignas(64) volatile int64_t done_count;  // AICPU-owned progress mirror.
         L2TaskArgs orch_args;                     // Host/sim orchestration entry args.
     } dist;
+
+    void *fdwic_swimlane_host_shadow_;
+    uint64_t fdwic_swimlane_dev_base_;
+    uint64_t fdwic_swimlane_bytes_;
+    uint32_t fdwic_swimlane_num_cores_;
+    uint32_t fdwic_swimlane_records_per_core_;
+    char fdwic_swimlane_output_prefix_[512];
 
 private:
     // Kernel binary tracking for cleanup

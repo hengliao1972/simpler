@@ -158,40 +158,28 @@ PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] __gm__ DistCore *self, __gm__
     if (sim_ns > 0) {
         const uint64_t t0 = now_ns();
         const uint64_t target = t0 + static_cast<uint64_t>(sim_ns);
+        TRACE_SPAN_BEGIN(kernel_trace);
         while (now_ns() < target) { /* spin: emulate kernel busy time */
         }
-#if DIST_TRACE_ENABLED
-        if (g_trace_on) {
-            trace_state(self).trace.push_back(
-                TraceEvent{
-                    s.task_id, s.func_id, self->lane, static_cast<uint8_t>(s.is_multicore ? 1 : 0), TracePhase::Kernel,
-                    t0 - g_trace_epoch_ns, static_cast<uint64_t>(sim_ns), static_cast<uint64_t>(sim_ns)
-                }
-            );
-        }
-#endif
+        TRACE_SPAN_END(
+            kernel_trace, self, s.task_id, s.func_id, TracePhase::Kernel, static_cast<uint32_t>(s.is_multicore ? 1 : 0),
+            0
+        );
     } else if (s.function_bin_addr != 0 && !g_skip_exec) {
         KernelFn fn = reinterpret_cast<KernelFn>(s.function_bin_addr);
-#if DIST_TRACE_ENABLED
-        if (g_trace_on) {
-            const uint64_t t0 = now_ns();
-            fn(reinterpret_cast<__gm__ int64_t *>(s.args));
-            const uint64_t t1 = now_ns();
-            trace_state(self).trace.push_back(
-                TraceEvent{
-                    s.task_id, s.func_id, self->lane, static_cast<uint8_t>(s.is_multicore ? 1 : 0), TracePhase::Kernel,
-                    t0 - g_trace_epoch_ns, t1 - t0, t1 - t0
-                }
-            );
-        } else {
-            fn(reinterpret_cast<__gm__ int64_t *>(s.args));
-        }
-#else
+        TRACE_SPAN_BEGIN(kernel_trace);
         fn(reinterpret_cast<__gm__ int64_t *>(s.args));
-#endif
+        TRACE_SPAN_END(
+            kernel_trace, self, s.task_id, s.func_id, TracePhase::Kernel, static_cast<uint32_t>(s.is_multicore ? 1 : 0),
+            0
+        );
     }
 #else
+    TRACE_SPAN_BEGIN(kernel_trace);
     dist_aicore_call_slot_kernel(s);
+    TRACE_SPAN_END(
+        kernel_trace, self, s.task_id, s.func_id, TracePhase::Kernel, static_cast<uint32_t>(s.is_multicore ? 1 : 0), 0
+    );
 #endif
     dist_aicore_store_barrier();
     if (s.is_multicore) {
@@ -203,6 +191,7 @@ PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] __gm__ DistCore *self, __gm__
     } else {
         complete_executed_task(self, s.task_id);
     }
+    TRACE_INSTANT(self, s.task_id, s.func_id, TracePhase::Commit, static_cast<uint32_t>(s.is_multicore ? 1 : 0));
     s.built = false;
     s.occupied = false;
     dist_aicore_flush_region(&s, sizeof(RingSlot));
@@ -309,23 +298,16 @@ PTO_DEVICE_FUNC void drain_block_won(__gm__ DistCore *self) {
             return;
         }
         __gm__ const BuiltSubtask &b = w.lane[self->lane];
-#if DIST_TRACE_ENABLED
-        const uint64_t t_won0 = trace_now();
-        const uint64_t t_won0_cpu = trace_now_cpu();
-#endif
+        TRACE_SPAN_BEGIN(drain_won_trace);
         build_ring_slot(
             self->slots[si], w.task_id, b.func_id, b.function_bin_addr, b.tensors, b.tensor_count, b.scalars,
             b.scalar_count, b.fanin, b.fanin_count, b.sub_block_id, /*is_multicore=*/true, self->block_id, i
         );
+        TRACE_SPAN_END(
+            drain_won_trace, self, w.task_id, b.func_id, TracePhase::DrainWon, /*flags=*/1u, static_cast<uint32_t>(i)
+        );
         self->occupied_count++;
         self->owned_total++;
-#if DIST_TRACE_ENABLED
-        if (g_trace_on) {
-            for (int32_t k = 0; k < b.fanin_count; k++)
-                trace_state(self).dep_edges.push_back({w.task_id, b.fanin[k]});
-        }
-        trace_overhead_impl(self, w.task_id, b.func_id, TracePhase::DrainWon, t_won0, t_won0_cpu);
-#endif
     }
 }
 
@@ -531,6 +513,7 @@ PTO_DEVICE_FUNC void dist_submit_register_outputs(DistSubmitCtx &ctx, bool inclu
 PTO_DEVICE_FUNC bool dist_submit_materialize_and_prepare_map(
     __gm__ DistCore *self, const L0TaskArgs &args, DistSubmitCtx &ctx, DistSubmitKind kind
 ) {
+    TRACE_LAP_RESET(self);
     if (!dist_submit_check_task_cap(ctx, kind)) return false;
     if (!dist_submit_materialize_args(args, ctx, kind)) return false;
 #if !defined(__CCE_AICORE__)

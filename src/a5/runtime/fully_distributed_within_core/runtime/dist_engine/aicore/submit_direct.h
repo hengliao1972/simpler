@@ -99,11 +99,17 @@ PTO_DEVICE_FUNC __gm__ RingSlot *direct_alloc_slot(__gm__ DistCore *self) {
     return &slot;
 }
 
-PTO_DEVICE_FUNC void direct_wait_slot_capacity(__gm__ DistCore *self) {
+PTO_DEVICE_FUNC void direct_wait_slot_capacity(__gm__ DistCore *self, int32_t task_id) {
     if (self == nullptr) return;
+    bool waited = false;
+    TRACE_SPAN_BEGIN(ring_bp_trace);
     while (self->occupied_count >= kPrivateSlots - kWonReserve) {
+        waited = true;
         direct_drain_block_won(self);
         if (direct_drain_ready_slots(self) == 0) SPIN_WAIT_HINT();
+    }
+    if (waited) {
+        TRACE_SPAN_END(ring_bp_trace, self, task_id, -1, TracePhase::RingBp, 0, 0);
     }
 }
 
@@ -128,13 +134,20 @@ PTO_DEVICE_FUNC void direct_set_fatal() {
 PTO_DEVICE_FUNC bool direct_wait_heap_capacity(DistSubmitCtx &ctx, DistSubmitKind kind) {
     if (ctx.self == nullptr || ctx.output_bytes == 0 || g_dist.heap_base == nullptr) return true;
     const size_t ring = g_dist.heap_size;
+    bool waited = false;
+    TRACE_SPAN_BEGIN(heap_bp_trace);
     while (!direct_fatal_set()) {
         __gm__ int64_t *frontier = const_cast<__gm__ int64_t *>(&g_dist.frontier);
         dist_aicore_invalidate_region(frontier, 64);
         const int32_t f = static_cast<int32_t>(g_dist.frontier);
         const int32_t R = f - g_dist.H;
         const uint64_t vstart_live = load_task_vend(R);
-        if (ctx.self->heap_next - vstart_live <= ring) return true;
+        if (ctx.self->heap_next - vstart_live <= ring) {
+            if (waited) {
+                TRACE_SPAN_END(heap_bp_trace, ctx.self, ctx.task_id, -1, TracePhase::RingBp, 0, 1);
+            }
+            return true;
+        }
         if (f >= ctx.task_id - 1) {
             direct_set_fatal();
             if (kind == DistSubmitKind::Alloc) {
@@ -151,8 +164,12 @@ PTO_DEVICE_FUNC bool direct_wait_heap_capacity(DistSubmitCtx &ctx, DistSubmitKin
             }
             return false;
         }
+        waited = true;
         direct_drain_block_won(ctx.self);
         if (direct_drain_ready_slots(ctx.self) == 0) SPIN_WAIT_HINT();
+    }
+    if (waited) {
+        TRACE_SPAN_END(heap_bp_trace, ctx.self, ctx.task_id, -1, TracePhase::RingBp, 0, 1);
     }
     return false;
 }
@@ -211,10 +228,12 @@ PTO_DEVICE_FUNC bool direct_drain_won_slot(__gm__ DistCore *self, int32_t won_sl
     w.drained[self->lane].v = 1;
     dist_aicore_flush_region(&w.drained[self->lane], sizeof(DrainedCell));
     __gm__ BuiltSubtask &b = w.lane[self->lane];
+    TRACE_SPAN_BEGIN(drain_won_trace);
     build_ring_slot(
         *slot, w.task_id, b.func_id, b.function_bin_addr, b.tensors, b.tensor_count, b.scalars, b.scalar_count, b.fanin,
         b.fanin_count, b.sub_block_id, /*is_multicore=*/true, self->block_id, won_slot
     );
+    TRACE_SPAN_END(drain_won_trace, self, w.task_id, b.func_id, TracePhase::DrainWon, /*flags=*/1u, won_slot);
     dist_aicore_flush_region(slot, sizeof(RingSlot));
     return true;
 }
@@ -270,7 +289,7 @@ PTO_DEVICE_FUNC int32_t direct_drain_ready_slots(__gm__ DistCore *self) {
 
 PTO_DEVICE_FUNC void direct_build_won_submit(DistSubmitCtx &ctx, const MixedKernels &mixed) {
     if (ctx.self == nullptr) return;
-    direct_wait_slot_capacity(ctx.self);
+    direct_wait_slot_capacity(ctx.self, ctx.task_id);
     if (!direct_wait_heap_capacity(ctx, DistSubmitKind::Kernel)) return;
     if (ctx.joint && ctx.joint_slot < 0) {
         ctx.joint_slot = direct_alloc_won_slot(ctx.self, ctx.joint_block);
@@ -321,11 +340,15 @@ PTO_DEVICE_FUNC void direct_drain_to_completion(__gm__ DistCore *self) {
 }
 
 PTO_DEVICE_FUNC void direct_replay_orch(__gm__ Runtime *runtime) {
+    __gm__ DistCore *self = g_self;
+    (void)self;
 #if defined(__CCE_AICORE__)
     dist_aicore_invalidate_region(runtime->dist.ccec_orch_tensors, sizeof(runtime->dist.ccec_orch_tensors));
     dist_aicore_invalidate_region(runtime->dist.ccec_orch_scalars, sizeof(runtime->dist.ccec_orch_scalars));
     dist_aicore_invalidate_region(const_cast<__gm__ const int32_t *>(&runtime->dist.ccec_orch_tensor_count), 64);
-    if (aicpu_orchestration_entry == nullptr || !ccec_is_valid_worker()) return;
+    if (aicpu_orchestration_entry == nullptr || !ccec_is_valid_worker()) {
+        return;
+    }
     L2TaskArgs local_args;
     Tensor local_tensors[CHIP_MAX_TENSOR_ARGS];
     const int32_t tensor_count = runtime->dist.ccec_orch_tensor_count;
@@ -355,8 +378,10 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors
 dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &args) {
     DistSubmitCtx ctx;
     dist_submit_begin(nullptr, args, ctx);
+    TRACE_LAP_RESET(ctx.self);
     direct_drain_block_won(ctx.self);
     direct_drain_ready_slots(ctx.self);
+    TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::EfDrain);
     if (!dist_submit_materialize_and_prepare_map(ctx.self, args, ctx, DistSubmitKind::Kernel)) return ctx.result;
     const bool is_winner = direct_claim_submit(DistSubmitKind::Kernel, &mixed, ctx);
     if (is_winner) {
@@ -364,8 +389,10 @@ dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &arg
     }
     dist_submit_register_outputs(ctx, /*include_existing=*/true);
     if (is_winner) {
+        TRACE_LAP(ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Build);
         direct_build_won_submit(ctx, mixed);
     } else {
+        TRACE_LAP(ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Replay);
         direct_drain_block_won(ctx.self);
     }
     return ctx.result;
@@ -374,12 +401,18 @@ dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &arg
 DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
     DistSubmitCtx ctx;
     dist_submit_begin(nullptr, args, ctx);
+    TRACE_LAP_RESET(ctx.self);
     direct_drain_block_won(ctx.self);
     direct_drain_ready_slots(ctx.self);
+    TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::EfDrain);
     if (!dist_submit_materialize_and_prepare_map(ctx.self, args, ctx, DistSubmitKind::Alloc)) return ctx.result;
     dist_submit_register_outputs(ctx, /*include_existing=*/false);
     const bool is_winner = direct_claim_submit(DistSubmitKind::Alloc, nullptr, ctx);
-    (void)is_winner;
-    direct_complete_alloc_submit(ctx);
+    if (is_winner) {
+        direct_complete_alloc_submit(ctx);
+        TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::Alloc);
+    } else {
+        TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::Replay);
+    }
     return ctx.result;
 }

@@ -55,6 +55,11 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_d
     return -1;
 }
 
+extern "C" __attribute__((weak)) int
+fdwic_swimlane_host_init(Runtime *runtime, int num_cores, int enabled, const char *output_prefix);
+extern "C" __attribute__((weak)) int fdwic_swimlane_host_export(Runtime *runtime);
+extern "C" __attribute__((weak)) void fdwic_swimlane_host_finalize(Runtime *runtime);
+
 // a5 sim: malloc / free wrappers shared by the four profiling subsystems'
 // init_* methods. Plain function pointers convert implicitly into the
 // framework's std::function alloc / free shapes. Kept on the subclass (not
@@ -252,6 +257,23 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 
     last_runtime_ = &runtime;
 
+    const bool original_enable_l2_swimlane = enable_l2_swimlane_;
+    auto l2_swimlane_flag_cleanup = RAIIScopeGuard([this, original_enable_l2_swimlane]() {
+        enable_l2_swimlane_ = original_enable_l2_swimlane;
+    });
+    bool fdwic_swimlane_active = false;
+    if (enable_l2_swimlane_ && fdwic_swimlane_host_init != nullptr) {
+        rc = fdwic_swimlane_host_init(&runtime, num_aicore, 1, output_prefix_.c_str());
+        if (rc < 0) {
+            LOG_ERROR("fdwic swimlane init failed: %d", rc);
+            return rc;
+        }
+        if (rc > 0) {
+            fdwic_swimlane_active = true;
+            enable_l2_swimlane_ = false;
+        }
+    }
+
     if (enable_l2_swimlane_) {
         rc = init_l2_swimlane(num_aicore, runtime.aicpu_thread_num, device_id_);
         if (rc != 0) {
@@ -303,8 +325,12 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // Cleanup guard for early returns: stops all started collectors so their
     // mgmt + poll threads exit cleanly. stop() is idempotent and a no-op on
     // collectors that never started.
-    auto perf_cleanup = RAIIScopeGuard([this]() {
+    auto perf_cleanup = RAIIScopeGuard([this, &runtime, &fdwic_swimlane_active]() {
         stop_collectors();
+        if (fdwic_swimlane_active && fdwic_swimlane_host_finalize != nullptr) {
+            fdwic_swimlane_host_finalize(&runtime);
+            fdwic_swimlane_active = false;
+        }
     });
 
     // Allocate simulated register blocks for all AICore cores. Uses sparse
@@ -445,6 +471,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     int runtime_rc = aicpu_rc.load(std::memory_order_acquire);
     if (runtime_rc != 0) {
         LOG_ERROR("AICPU execution failed with rc=%d", runtime_rc);
+        if (fdwic_swimlane_active && fdwic_swimlane_host_export != nullptr) {
+            fdwic_swimlane_host_export(&runtime);
+        }
         return runtime_rc;
     }
 
@@ -455,6 +484,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         l2_swimlane_collector_.read_phase_header_metadata();
         l2_swimlane_collector_.reconcile_counters();
         l2_swimlane_collector_.export_swimlane_json();
+    }
+    if (fdwic_swimlane_active && fdwic_swimlane_host_export != nullptr) {
+        fdwic_swimlane_host_export(&runtime);
     }
 
     if (enable_dump_tensor_) {

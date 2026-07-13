@@ -52,15 +52,3 @@ inline constexpr size_t dist_engine_global_state_align() { return kDistEngineGlo
  * AICore workers call dist_engine_api.h symbols directly on sim and onboard.
  */
 void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_workers, Runtime *runtime);
-
-/**
- * Dump a per-core execution swimlane as a Chrome Trace Event JSON.
- *
- * Self-gated on the PTO_DIST_SWIMLANE env var (output file path); a no-op when
- * unset. Each executed (sub)task is one duration event laid out by physical
- * block (pid) and lane AIC/AIV0/AIV1 (tid), so the trace shows how the
- * execute-first claim race spreads work across cores (load balance, docs §6.1).
- * Must be called AFTER all workers have finished a run (single-threaded), e.g.
- * by the AICPU stub after all worker completion registers report done.
- */
-void dist_engine_dump_trace();
