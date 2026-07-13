@@ -124,6 +124,20 @@ class TestSimpleOrchSmoke(SceneTestCase):
             "params": {"n": 18, "delta": 31, "mixed": 1},
         },
         {
+            "name": "A5SimBd36MixedWonLargeStress",
+            "manual": True,
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 144, "delta": 41, "mixed": 1},
+        },
+        {
+            "name": "A5OnboardBd36MixedWonLargeStress",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 144, "delta": 41, "mixed": 1},
+        },
+        {
             "name": "A5SimBd36DualAivDelta19",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
@@ -161,6 +175,20 @@ class TestSimpleOrchSmoke(SceneTestCase):
             "platforms": ["a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
             "params": {"n": 18, "delta": 37, "mixed": 2},
+        },
+        {
+            "name": "A5SimBd36DualAivWonLargeStress",
+            "manual": True,
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 144, "delta": 43, "mixed": 2},
+        },
+        {
+            "name": "A5OnboardBd36DualAivWonLargeStress",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 144, "delta": 43, "mixed": 2},
         },
         {
             "name": "A5SimBd36ManyTasks",

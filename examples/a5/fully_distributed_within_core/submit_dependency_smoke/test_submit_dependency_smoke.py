@@ -398,6 +398,20 @@ class TestSubmitDependencySmoke(SceneTestCase):
             "params": {"n": 512, "mode": 29},
         },
         {
+            "name": "A5SimBd36FaninLargeStress",
+            "manual": True,
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 30},
+        },
+        {
+            "name": "A5OnboardBd36FaninLargeStress",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 30},
+        },
+        {
             "name": "A5SimBd36L0TaskArgsTagPersistence",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
@@ -739,6 +753,12 @@ class TestSubmitDependencySmoke(SceneTestCase):
             args.output[:] = -1.0
             expected = args.input[:sub_n] * 6.0 + 23.0
             args.output[: 12 * sub_n] = expected.repeat(12)
+            return
+        if mode == 30:
+            sub_n = 32
+            args.output[:] = -1.0
+            expected = args.input[:sub_n] * 6.0 + 23.0
+            args.output[: 96 * sub_n] = expected.repeat(96)
             return
         if mode == 19:
             args.output[:] = (args.input * 2.0 + 3.0) * 3.0 + 8.0

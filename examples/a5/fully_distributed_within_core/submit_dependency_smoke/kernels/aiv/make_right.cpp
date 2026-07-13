@@ -46,7 +46,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
 
     __gm__ float *input = reinterpret_cast<__gm__ float *>(input_tensor->buffer.addr) + input_tensor->start_offset;
     __gm__ float *right = reinterpret_cast<__gm__ float *>(right_tensor->buffer.addr) + right_tensor->start_offset;
-    if (n == 263 || n == 512) {
+    if (n == 263 || n == 512 || n == 4096) {
         const uint64_t spin = static_cast<uint64_t>(args[3]);
         volatile uint64_t sink = 0;
         for (uint64_t i = 0; i < spin; i++) {
