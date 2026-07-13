@@ -87,9 +87,7 @@ PTO_DEVICE_FUNC void populate_won_slot(
     __gm__ WonSlot &w, int32_t task_id, const ActiveMask &M, const MixedKernels &mixed, int32_t own_lane,
     Runtime *runtime, TensorArrPtr tensors, int32_t tc, ScalarArrPtr scalars, int32_t sc, FaninArrPtr fanin, int32_t fc
 ) {
-    const int32_t pc = __builtin_popcount(M.core_mask());
     w.task_id = task_id;
-    store_won_remaining(w, pc);
 #define POPULATE_WON_LANE(L)                                                                    \
     do {                                                                                        \
         if ((L) == own_lane || !lane_active(M, (L))) break;                                     \
@@ -107,6 +105,7 @@ PTO_DEVICE_FUNC void populate_won_slot(
         for (int32_t k = 0; k < fc; k++)                                                        \
             b.fanin[k] = fanin[k];                                                              \
         b.sub_block_id = ((L) == LANE_AIV1) ? 1 : 0;                                            \
+        exchange_won_drained(w, (L), kDrainedFree);                                             \
     } while (0)
     reset_won_lane(w, LANE_AIC);
     reset_won_lane(w, LANE_AIV0);
@@ -119,13 +118,21 @@ PTO_DEVICE_FUNC void populate_won_slot(
 
 PTO_DEVICE_FUNC int32_t alloc_won_slot(int32_t block) {
     __gm__ BlockWon &bw = g_dist.blocks[block];
+#if defined(__CCE_AICORE__)
     for (int32_t i = 0; i < kPrivateSlots; i++) {
-        int32_t exp = 0;
-        if (atom_cas_strong(bw.slots[i].state, exp, 2, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        __gm__ int64_t *state = const_cast<__gm__ int64_t *>(&bw.slots[i].state);
+        if (atomicMax(state, kWonStateClaimed) == kWonStateFree) return i;
+    }
+    return -1;
+#else
+    for (int32_t i = 0; i < kPrivateSlots; i++) {
+        int64_t exp = kWonStateFree;
+        if (atom_cas_strong(bw.slots[i].state, exp, kWonStateClaimed, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
             return i;
         }
     }
     return -1;
+#endif
 }
 
 }  // namespace

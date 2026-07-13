@@ -62,13 +62,15 @@ void dist_dump_state(int) {
     for (int32_t b = 0; b < g_dist.num_blocks; b++) {
         for (int32_t i = 0; i < kPrivateSlots; i++) {
             WonSlot &w = g_dist.blocks[b].slots[i];
-            int32_t st = atom_load(w.state, __ATOMIC_RELAXED);
-            if (st == 0) continue;
+            int64_t st = atom_load(w.state, __ATOMIC_RELAXED);
+            if (st == kWonStateFree) continue;
             fprintf(
-                stderr, "  won blk%d slot%d state=%d tid=%d remaining=%ld drained=[%d,%d,%d] present=[%d,%d,%d]\n", b,
-                i, st, w.task_id, static_cast<long>(atom_load(w.remaining, __ATOMIC_RELAXED)),
-                atom_load(w.drained[0].v, __ATOMIC_RELAXED), atom_load(w.drained[1].v, __ATOMIC_RELAXED),
-                atom_load(w.drained[2].v, __ATOMIC_RELAXED), w.lane[0].present, w.lane[1].present, w.lane[2].present
+                stderr, "  won blk%d slot%d state=%ld tid=%d remaining=%ld drained=[%ld,%ld,%ld] present=[%d,%d,%d]\n",
+                b, i, st, w.task_id, static_cast<long>(atom_load(w.remaining, __ATOMIC_RELAXED)),
+                static_cast<long>(atom_load(w.drained[0].v, __ATOMIC_RELAXED)),
+                static_cast<long>(atom_load(w.drained[1].v, __ATOMIC_RELAXED)),
+                static_cast<long>(atom_load(w.drained[2].v, __ATOMIC_RELAXED)), w.lane[0].present, w.lane[1].present,
+                w.lane[2].present
             );
         }
     }
