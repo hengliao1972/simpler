@@ -268,16 +268,28 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors
 dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &args) {
     DistSubmitCtx ctx;
     dist_submit_begin(nullptr, args, ctx);
+    TRACE_SPAN_BEGIN(submit_trace);
     TRACE_LAP_RESET(ctx.self);
     drain_block_won(ctx.self);
     drain_phase_b(ctx.self);
     TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::EfDrain);
     if (!dist_submit_materialize_and_prepare_map(ctx.self, args, ctx, DistSubmitKind::Kernel)) return ctx.result;
+    TRACE_SPAN_BEGIN(claim_trace);
     const bool is_winner = dist_submit_claim(DistSubmitKind::Kernel, &mixed, ctx);
+    TRACE_SPAN_END(
+        claim_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Claim, static_cast<uint32_t>(is_winner), 0
+    );
     if (is_winner) {
+        TRACE_SPAN_BEGIN(fanin_trace);
         ctx.fanin_count = dist_submit_collect_fanin(ctx, ctx.fanin);
+        TRACE_SPAN_END(
+            fanin_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Fanin, 0,
+            static_cast<uint32_t>(ctx.fanin_count)
+        );
     }
+    TRACE_SPAN_BEGIN(register_trace);
     dist_submit_register_outputs(ctx, /*include_existing=*/true);
+    TRACE_SPAN_END(register_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Register, 0, 1);
     if (is_winner) {
         TRACE_LAP(ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Build);
         dist_submit_build_winner_task(ctx, mixed);
@@ -285,24 +297,33 @@ dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &arg
         TRACE_LAP(ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Replay);
         drain_block_won(ctx.self);
     }
+    TRACE_SPAN_END(
+        submit_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Submit, static_cast<uint32_t>(is_winner), 0
+    );
     return ctx.result;
 }
 
 DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
     DistSubmitCtx ctx;
     dist_submit_begin(nullptr, args, ctx);
+    TRACE_SPAN_BEGIN(submit_trace);
     TRACE_LAP_RESET(ctx.self);
     drain_block_won(ctx.self);
     drain_phase_b(ctx.self);
     TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::EfDrain);
     if (!dist_submit_materialize_and_prepare_map(ctx.self, args, ctx, DistSubmitKind::Alloc)) return ctx.result;
+    TRACE_SPAN_BEGIN(register_trace);
     dist_submit_register_outputs(ctx, /*include_existing=*/false);
+    TRACE_SPAN_END(register_trace, ctx.self, ctx.task_id, -1, TracePhase::Register, 0, 0);
+    TRACE_SPAN_BEGIN(claim_trace);
     const bool is_winner = dist_submit_claim(DistSubmitKind::Alloc, nullptr, ctx);
+    TRACE_SPAN_END(claim_trace, ctx.self, ctx.task_id, -1, TracePhase::Claim, static_cast<uint32_t>(is_winner), 1);
     if (is_winner) {
         dist_submit_complete_alloc(ctx);
         TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::Alloc);
     } else {
         TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::Replay);
     }
+    TRACE_SPAN_END(submit_trace, ctx.self, ctx.task_id, -1, TracePhase::Submit, static_cast<uint32_t>(is_winner), 1);
     return ctx.result;
 }

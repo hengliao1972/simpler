@@ -98,6 +98,12 @@ enum class TracePhase : int32_t {
     RingBp = 5,
     EfDrain = 6,
     Commit = 7,
+    Submit = 8,
+    Materialize = 9,
+    PrepareMap = 10,
+    Claim = 11,
+    Fanin = 12,
+    Register = 13,
 };
 
 struct RingSlot {

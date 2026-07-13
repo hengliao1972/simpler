@@ -93,6 +93,12 @@ def _append_fdwic_dist_engine_events(events, fdwic_events, func_id_to_name=None)
             "RingBp": "ringbp",
             "EfDrain": "efdrain",
             "Commit": "commit",
+            "Submit": "submit",
+            "Materialize": "materialize",
+            "PrepareMap": "prepare_map",
+            "Claim": "claim",
+            "Fanin": "fanin",
+            "Register": "register",
         }.get(str(phase), str(phase).lower())
 
     def kernel_name(func_id):
