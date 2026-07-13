@@ -86,13 +86,18 @@ compile_and_run() {
         echo "  compiled -> $out_bin"
         if [ "$display_name" = "mb8_dcci_seam" ] || \
            [ "$display_name" = "dcci_atomic_clobber" ] || \
-           [ "$display_name" = "st_dev_separate_line_stress" ]; then
+           [ "$display_name" = "st_dev_separate_line_stress" ] || \
+           [ "$display_name" = "st_dev_single_core_stress" ]; then
             if [ -n "${ATOMIC_PROBE_MODE:-}" ]; then
                 probe_modes=("$ATOMIC_PROBE_MODE")
             elif [ "$display_name" = "dcci_atomic_clobber" ]; then
                 probe_modes=(0 1 2 3 4 5 6 7)
             elif [ "$display_name" = "st_dev_separate_line_stress" ]; then
                 probe_modes=(0 1 2 3)
+            elif [ "$display_name" = "st_dev_single_core_stress" ]; then
+                # High-signal loop-end cases plus their per-write DSB controls.
+                # Modes 0/2/3 remain available through ATOMIC_PROBE_MODE.
+                probe_modes=(1 4 5 6)
             else
                 probe_modes=(0 1 2 3 4)
             fi
@@ -129,7 +134,8 @@ for asc in "${ASC_FILES[@]}"; do
                 -DPROBE_CORE_VARIANT=2 -D__MIX_CORE_AIC_RATION__=1
         fi
     elif [ "$name" = "mb8_dcci_seam" ] || [ "$name" = "dcci_atomic_clobber" ] || \
-         [ "$name" = "st_dev_separate_line_stress" ]; then
+         [ "$name" = "st_dev_separate_line_stress" ] || \
+         [ "$name" = "st_dev_single_core_stress" ]; then
         compile_and_run "$asc" "$name" "$BUILD_DIR/${name}_out" \
             -mllvm -cce-aicore-dcci-insert-for-scalar=false \
             -mllvm -cce-aicore-dcci-before-kernel-end=false
