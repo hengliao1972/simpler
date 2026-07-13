@@ -152,7 +152,7 @@ PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] __gm__ DistCore *self, __gm__
 }
 
 PTO_DEVICE_FUNC int32_t drain_phase_b(__gm__ DistCore *self) {
-    if (self->occupied_count == 0) return 0;
+    if (self == nullptr || self->occupied_count == 0) return 0;
     int32_t freed = 0;
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         __gm__ RingSlot &s = self->slots[i];
@@ -245,7 +245,7 @@ PTO_DEVICE_FUNC bool drain_block_won(__gm__ DistCore *self) {
         __gm__ WonSlot &w = bw.slots[i];
         if (atomic_load(w.state) != kWonStatePublished) continue;
 #if defined(__CCE_AICORE__)
-        dist_aicore_invalidate_region(&w.lane[self->lane], 64);
+        dist_aicore_invalidate_region(&w.lane[self->lane].present, sizeof(w.lane[self->lane].present));
 #endif
         if (!w.lane[self->lane].present) continue;
         if (!claim_won_lane(w, self->lane)) continue;
@@ -286,7 +286,7 @@ PTO_DEVICE_FUNC bool has_pending_won(__gm__ DistCore *self) {
         __gm__ WonSlot &w = bw.slots[i];
         if (atomic_load(w.state) != kWonStatePublished) continue;
 #if defined(__CCE_AICORE__)
-        dist_aicore_invalidate_region(&w.lane[self->lane], 64);
+        dist_aicore_invalidate_region(&w.lane[self->lane].present, sizeof(w.lane[self->lane].present));
 #endif
         if (!w.lane[self->lane].present) continue;
         if (atomic_load(w.drained[self->lane].v) == kDrainedFree) return true;

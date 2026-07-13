@@ -53,5 +53,5 @@ extern "C" PTO_DEVICE_FUNC void aicpu_orchestration_entry(const L2TaskArgs &orch
 #include "dist_engine/aicore/submit_helpers.h"      // NOLINT(build/include_subdir)
 #include "dist_engine/aicore/tensor_data_access.h"  // NOLINT(build/include_subdir)
 #include "dist_engine/aicore/backend.h"             // NOLINT(build/include_subdir)
-#include "dist_engine/aicore/submit_direct.h"       // NOLINT(build/include_subdir)
+#include "dist_engine/aicore/submit_runtime.h"      // NOLINT(build/include_subdir)
 #include "dist_engine/aicore/core_main.h"           // NOLINT(build/include_subdir)

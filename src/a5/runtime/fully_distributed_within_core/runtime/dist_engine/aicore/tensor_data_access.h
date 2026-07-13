@@ -16,7 +16,7 @@
 namespace {
 
 #if !defined(__CCE_AICORE__)
-// AICore sim orchestration replay shares the direct submit path, so scalar
+// AICore sim orchestration replay shares the submit runtime path, so scalar
 // reads/writes must drain the worker's own queue until the producer is complete.
 PTO_DEVICE_FUNC void wait_producer_ready(DistCore *self, const Tensor &t) {
     const int32_t p = dist_tensor_map_lookup(self->map, t);
