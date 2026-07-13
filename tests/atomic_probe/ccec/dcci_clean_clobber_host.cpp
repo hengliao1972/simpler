@@ -47,27 +47,32 @@ static void run_mode(aclrtFuncHandle fh, aclrtStream stream,
         printf("[%-24s] w0=0x%x(exp 0xAA) w3=0x%x(exp 0x%x)  %.0fus  w3:%s\n",
                label, r[18], r[19], r[20], us,
                r[17] ? "CLOBBERED!" : "survived");
-        result.Expect(r[18] == 0xAA && r[19] == 0, "dirty dcci invalidate exact clobber");
+        result.Expect(r[18] == 0xAA && r[19] == 0,
+                      "dirty + DEFAULT：word[0] 必须发布为 0xAA，word[3] 必须被旧快照覆盖为 0");
     } else if (mode == 1) {
         printf("[%-24s] w3=0x%x(exp 0x%x)  %.0fus  w3:%s\n",
                label, r[19], r[20], us,
-               r[16] ? "CLOBBERED!" : "survived(CLEAN line safe)");
-        result.Expect(r[19] == 0xCAFEBABEu, "clean dcci invalidate preserves st_dev");
+               r[16] ? "CLOBBERED!" : "survived(clean line)");
+        result.Expect(r[19] == 0xCAFEBABEu,
+                      "clean + DEFAULT：word[3] 必须保留另一个核写入的 0xCAFEBABE");
     } else if (mode == 2) {
         printf("[%-24s] w0=0x%x w3=0x%x(exp 0x%x)  %.0fus  w3:%s\n",
                label, r[18], r[19], r[20], us,
                r[17] ? "CLOBBERED!" : "survived");
-        result.Expect(r[18] == 0xAA && r[19] == 0, "dirty dcci flush exact clobber");
+        result.Expect(r[18] == 0xAA && r[19] == 0,
+                      "dirty + OUT：word[0] 必须发布为 0xAA，word[3] 必须被旧快照覆盖为 0");
     } else if (mode == 3) {
         printf("[%-24s] w0=0x%x(stuck in L1) w3=0x%x(exp 0x%x)  %.0fus  w0:%s w3:%s\n",
                label, r[18], r[19], r[20], us,
                (r[18] == 0) ? "NOT visible(L1)" : "visible",
                r[17] ? "CLOBBERED!" : "survived");
-        result.Expect(r[18] == 0 && r[19] == 0xCAFEBABEu, "no-dcci control exact result");
+        result.Expect(r[18] == 0 && r[19] == 0xCAFEBABEu,
+                      "NO DCCI：dirty word[0] 不得发布，word[3] 必须保留 0xCAFEBABE");
     } else if (mode == 4) {
         printf("[%-24s] clobbered=%u/15 words  w0=0x%x  %.0fus\n",
                label, r[16], r[17], us);
-        result.Expect(r[16] == 15 && r[17] == 0xAA, "full cacheline dcci clobber exact result");
+        result.Expect(r[16] == 15 && r[17] == 0xAA,
+                      "完整 64B：word[1..15] 必须全部被旧快照覆盖，word[0] 必须为 0xAA");
     }
 }
 
@@ -96,21 +101,17 @@ int main(int argc, char *argv[]) {
     void *gx_dev;
     check(aclrtMalloc(&gx_dev, 64 * sizeof(uint32_t), ACL_MEM_MALLOC_HUGE_FIRST), "malloc");
 
-    printf("=== dcci Clean-Clobber Probe ===\n");
-    printf("Question: does dcci(inval)'s clean step clobber another core's st_dev write?\n\n");
+    printf("=== DCCI 同 cacheline 覆盖探针 ===\n");
+    printf("目标：按严格核间时序检查 DCCI 后的完整 GM 结果，不从 selector 名称推断动作。\n\n");
 
     atomic_probe::Result result;
     uint32_t mode = 0;
     if (!atomic_probe::RequiredUintEnv("ATOMIC_PROBE_MODE", 5, &mode)) return EXIT_FAILURE;
     const char *labels[] = {
-        "dcci(inval) DIRTY", "dcci(inval) CLEAN", "dcci(flush) DIRTY",
+        "dcci(default) DIRTY", "dcci(default) CLEAN", "dcci(OUT) DIRTY",
         "Control no dcci", "Full 64B clobber"
     };
     run_mode(fh, stream, gx_dev, mode, labels[mode], result);
-
-    printf("\n=== Conclusion ===\n");
-    printf("DIRTY L1 + dcci = CLOBBERS st_dev writes in same cache line\n");
-    printf("CLEAN L1 + dcci = safe (clean is no-op for clean lines)\n");
 
     check(aclrtFree(gx_dev), "aclrtFree");
     check(aclrtBinaryUnLoad(bh), "aclrtBinaryUnLoad");

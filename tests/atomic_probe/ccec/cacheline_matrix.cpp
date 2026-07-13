@@ -73,8 +73,8 @@ template <typename T>
 __aicore__ inline void StoreBypass(__gm__ T *address, T value)
 {
     __builtin_cce_st_dev(value, address, 0);
-    // This oracle requires round N to precede round N+1. Serialize only this
-    // probe's repeated same-address writes; this is not a general API rule.
+    // 精确判定要求第 N 轮先于第 N+1 轮完成，因此只串行化本探针的同址重复写；
+    // 这不是对该 API 的通用使用规则。
     dsb(DSB_ALL);
 }
 

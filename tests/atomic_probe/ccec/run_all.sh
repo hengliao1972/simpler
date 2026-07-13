@@ -33,19 +33,11 @@ fi
 CCEC="$ASCEND_HOME_PATH/bin/ccec"
 LD="$ASCEND_HOME_PATH/bin/ld.lld"
 
-TIKCFW="$ASCEND_HOME_PATH/x86_64-linux/tikcpp/tikcfw"
-ASC_INCLUDE="$ASCEND_HOME_PATH/x86_64-linux/asc/include"
-ASC_IMPL="$ASCEND_HOME_PATH/x86_64-linux/asc/impl"
-ASCENDC_INCLUDE="$ASCEND_HOME_PATH/x86_64-linux/ascendc/include"
-
+# CCEC kernels may use compiler intrinsic headers and the PTO metadata header,
+# but must not resolve any AscendC/kernel_operator header through this runner.
 INC_FLAGS=(
     -I"$SCRIPT_DIR"
     -I"$PTO_ISA_ROOT/include"
-    -I"$TIKCFW"
-    -I"$ASC_INCLUDE" -I"$ASC_INCLUDE/basic_api"
-    -I"$ASC_IMPL" -I"$ASC_IMPL/basic_api"
-    -I"$ASCENDC_INCLUDE" -I"$ASCENDC_INCLUDE/basic_api"
-    -I"$ASCENDC_INCLUDE/basic_api/impl"
 )
 
 CCEC_FLAGS=(
@@ -71,9 +63,11 @@ PROBES=(
     "dcci_clean_clobber.cpp:dcci_clean_kernel.o:dcci_clean_clobber_host.cpp:dcci_clean_host"
     "atomic_blast.cpp:atomic_blast_kernel.o:atomic_blast_host.cpp:atomic_blast_host"
     "dcci_seam.cpp:dcci_seam_kernel.o:dcci_seam_host.cpp:dcci_seam_host"
+    "dcci_atomic_clobber.cpp:dcci_atomic_clobber_kernel.o:dcci_atomic_clobber_host.cpp:dcci_atomic_clobber_host"
     "concurrent_stress.cpp:concurrent_stress_kernel.o:concurrent_stress_host.cpp:concurrent_stress_host"
     "atomic_exch_same_line.cpp:atomic_exch_same_line_kernel.o:st_dev_same_line_host.cpp:atomic_exch_same_line_host"
     "st_dev_same_line.cpp:st_dev_same_line_kernel.o:st_dev_same_line_host.cpp:st_dev_same_line_host"
+    "st_dev_separate_line_stress.cpp:st_dev_separate_line_stress_kernel.o:st_dev_separate_line_stress_host.cpp:st_dev_separate_line_stress_host"
     "cacheline_matrix.cpp:cacheline_matrix_kernel.o:cacheline_matrix_host.cpp:cacheline_matrix_host"
 )
 
@@ -145,6 +139,7 @@ build_one() {
 run_one() {
     local ko="$1" hb="$2"
     local tag
+    local probe_failures=0
     tag="$(basename "$ko" .o)"
     echo "=== Running [$tag] ==="
     if [[ "$tag" == "cacheline_matrix_kernel" ]]; then
@@ -155,8 +150,10 @@ run_one() {
         fi
         for matrix_mode in "${matrix_modes[@]}"; do
             echo "--- CCEC matrix variant=aiv mode=$matrix_mode ---"
-            ATOMIC_PROBE_MATRIX_MODE="$matrix_mode" \
-                timeout "$RUN_TIMEOUT" "$BUILD_DIR/$hb" "$BUILD_DIR/$ko" aiv
+            if ! ATOMIC_PROBE_MATRIX_MODE="$matrix_mode" \
+                timeout "$RUN_TIMEOUT" "$BUILD_DIR/$hb" "$BUILD_DIR/$ko" aiv; then
+                probe_failures=$((probe_failures + 1))
+            fi
         done
     elif [[ "$tag" == "bypass_dcache_kernel" ]]; then
         if [[ -n "${ATOMIC_PROBE_MODE:-}" ]]; then
@@ -166,8 +163,10 @@ run_one() {
         fi
         for probe_mode in "${probe_modes[@]}"; do
             echo "--- CCEC bypass mode=$probe_mode ---"
-            ATOMIC_PROBE_MODE="$probe_mode" \
-                timeout "$RUN_TIMEOUT" "$BUILD_DIR/$hb" "$BUILD_DIR/$ko"
+            if ! ATOMIC_PROBE_MODE="$probe_mode" \
+                timeout "$RUN_TIMEOUT" "$BUILD_DIR/$hb" "$BUILD_DIR/$ko"; then
+                probe_failures=$((probe_failures + 1))
+            fi
         done
     elif [[ "$tag" == "dcci_clean_kernel" ]]; then
         if [[ -n "${ATOMIC_PROBE_MODE:-}" ]]; then
@@ -177,8 +176,10 @@ run_one() {
         fi
         for probe_mode in "${probe_modes[@]}"; do
             echo "--- CCEC dcci-clean mode=$probe_mode ---"
-            ATOMIC_PROBE_MODE="$probe_mode" \
-                timeout "$RUN_TIMEOUT" "$BUILD_DIR/$hb" "$BUILD_DIR/$ko"
+            if ! ATOMIC_PROBE_MODE="$probe_mode" \
+                timeout "$RUN_TIMEOUT" "$BUILD_DIR/$hb" "$BUILD_DIR/$ko"; then
+                probe_failures=$((probe_failures + 1))
+            fi
         done
     elif [[ "$tag" == "atomic_blast_kernel" ]]; then
         if [[ -n "${ATOMIC_PROBE_MODE:-}" ]]; then
@@ -188,8 +189,10 @@ run_one() {
         fi
         for probe_mode in "${probe_modes[@]}"; do
             echo "--- CCEC atomic-blast mode=$probe_mode ---"
-            ATOMIC_PROBE_MODE="$probe_mode" \
-                timeout "$RUN_TIMEOUT" "$BUILD_DIR/$hb" "$BUILD_DIR/$ko"
+            if ! ATOMIC_PROBE_MODE="$probe_mode" \
+                timeout "$RUN_TIMEOUT" "$BUILD_DIR/$hb" "$BUILD_DIR/$ko"; then
+                probe_failures=$((probe_failures + 1))
+            fi
         done
     elif [[ "$tag" == "concurrent_stress_kernel" ]]; then
         if [[ -n "${ATOMIC_PROBE_MODE:-}" ]]; then
@@ -199,11 +202,71 @@ run_one() {
         fi
         for probe_mode in "${probe_modes[@]}"; do
             echo "--- CCEC concurrent-stress mode=$probe_mode ---"
-            ATOMIC_PROBE_MODE="$probe_mode" \
-                timeout "$RUN_TIMEOUT" "$BUILD_DIR/$hb" "$BUILD_DIR/$ko"
+            if ! ATOMIC_PROBE_MODE="$probe_mode" \
+                timeout "$RUN_TIMEOUT" "$BUILD_DIR/$hb" "$BUILD_DIR/$ko"; then
+                probe_failures=$((probe_failures + 1))
+            fi
+        done
+    elif [[ "$tag" == "dcci_seam_kernel" ]]; then
+        if [[ -n "${ATOMIC_PROBE_MODE:-}" ]]; then
+            probe_modes=("$ATOMIC_PROBE_MODE")
+        else
+            probe_modes=(0 1 2 3 4)
+        fi
+        for probe_mode in "${probe_modes[@]}"; do
+            echo "--- CCEC dcci-seam mode=$probe_mode ---"
+            if ! ATOMIC_PROBE_MODE="$probe_mode" \
+                timeout "$RUN_TIMEOUT" "$BUILD_DIR/$hb" "$BUILD_DIR/$ko"; then
+                probe_failures=$((probe_failures + 1))
+            fi
+        done
+    elif [[ "$tag" == "dcci_atomic_clobber_kernel" ]]; then
+        if [[ -n "${ATOMIC_PROBE_MODE:-}" ]]; then
+            probe_modes=("$ATOMIC_PROBE_MODE")
+        else
+            probe_modes=(0 1 2 3 4 5 6 7)
+        fi
+        for probe_mode in "${probe_modes[@]}"; do
+            echo "--- CCEC dcci-atomic-clobber mode=$probe_mode ---"
+            if ! ATOMIC_PROBE_MODE="$probe_mode" \
+                timeout "$RUN_TIMEOUT" "$BUILD_DIR/$hb" "$BUILD_DIR/$ko"; then
+                probe_failures=$((probe_failures + 1))
+            fi
+        done
+    elif [[ "$tag" == "st_dev_same_line_kernel" ]]; then
+        if [[ -n "${ATOMIC_PROBE_MODE:-}" ]]; then
+            probe_modes=("$ATOMIC_PROBE_MODE")
+        else
+            probe_modes=(0 1 2)
+        fi
+        for probe_mode in "${probe_modes[@]}"; do
+            echo "--- CCEC st-dev same-line mode=$probe_mode ---"
+            if ! ATOMIC_PROBE_MODE="$probe_mode" \
+                timeout "$RUN_TIMEOUT" "$BUILD_DIR/$hb" "$BUILD_DIR/$ko"; then
+                probe_failures=$((probe_failures + 1))
+            fi
+        done
+    elif [[ "$tag" == "st_dev_separate_line_stress_kernel" ]]; then
+        if [[ -n "${ATOMIC_PROBE_MODE:-}" ]]; then
+            probe_modes=("$ATOMIC_PROBE_MODE")
+        else
+            probe_modes=(0 1 2 3)
+        fi
+        for probe_mode in "${probe_modes[@]}"; do
+            echo "--- CCEC st-dev separate-line-only stress mode=$probe_mode ---"
+            if ! ATOMIC_PROBE_MODE="$probe_mode" \
+                timeout "$RUN_TIMEOUT" "$BUILD_DIR/$hb" "$BUILD_DIR/$ko"; then
+                probe_failures=$((probe_failures + 1))
+            fi
         done
     else
-        timeout "$RUN_TIMEOUT" "$BUILD_DIR/$hb" "$BUILD_DIR/$ko"
+        if ! timeout "$RUN_TIMEOUT" "$BUILD_DIR/$hb" "$BUILD_DIR/$ko"; then
+            probe_failures=$((probe_failures + 1))
+        fi
+    fi
+    if [[ "$probe_failures" -ne 0 ]]; then
+        echo "CCEC [$tag] failed runs: $probe_failures" >&2
+        return 1
     fi
     echo
 }
@@ -211,6 +274,7 @@ run_one() {
 export LD_LIBRARY_PATH="$ASCEND_HOME_PATH/x86_64-linux/lib64:${LD_LIBRARY_PATH:-}"
 
 selected=0
+suite_run_failures=0
 for entry in "${PROBES[@]}"; do
     IFS=':' read -r ks ko hs hb <<< "$entry"
     if [[ -n "$SELECT" && "$(basename "$ks" .cpp)" != "$SELECT" ]]; then
@@ -222,7 +286,9 @@ for entry in "${PROBES[@]}"; do
         build_one "$ks" "$ko" "$hs" "$hb"
     fi
     if [[ "$ACTION" == "all" || "$ACTION" == "run" ]]; then
-        run_one "$ko" "$hb"
+        if ! run_one "$ko" "$hb"; then
+            suite_run_failures=$((suite_run_failures + 1))
+        fi
     fi
 done
 
@@ -231,4 +297,7 @@ if [[ "$selected" -eq 0 ]]; then
     exit 1
 fi
 
-echo "=== Done. ==="
+echo "=== Done. run_failures=$suite_run_failures ==="
+if [[ "$suite_run_failures" -ne 0 ]]; then
+    exit 1
+fi
