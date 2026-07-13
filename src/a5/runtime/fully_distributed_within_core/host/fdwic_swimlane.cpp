@@ -44,6 +44,18 @@ const char *phase_name(int32_t phase) {
         return "EfDrain";
     case FdwicSwimlanePhase::Commit:
         return "Commit";
+    case FdwicSwimlanePhase::Submit:
+        return "Submit";
+    case FdwicSwimlanePhase::Materialize:
+        return "Materialize";
+    case FdwicSwimlanePhase::PrepareMap:
+        return "PrepareMap";
+    case FdwicSwimlanePhase::Claim:
+        return "Claim";
+    case FdwicSwimlanePhase::Fanin:
+        return "Fanin";
+    case FdwicSwimlanePhase::Register:
+        return "Register";
     }
     return "Unknown";
 }

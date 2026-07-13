@@ -498,11 +498,15 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_and_prepare_map(
 ) {
     TRACE_LAP_RESET(self);
     if (!dist_submit_check_task_cap(ctx, kind)) return false;
+    TRACE_SPAN_BEGIN(materialize_trace);
     if (!dist_submit_materialize_args(args, ctx, kind)) return false;
+    TRACE_SPAN_END(materialize_trace, self, ctx.task_id, -1, TracePhase::Materialize, 0, static_cast<uint32_t>(kind));
 #if !defined(__CCE_AICORE__)
     if (fatal_set()) return false;
 #endif
+    TRACE_SPAN_BEGIN(prepare_map_trace);
     dist_submit_prepare_map(self, ctx.task_id);
+    TRACE_SPAN_END(prepare_map_trace, self, ctx.task_id, -1, TracePhase::PrepareMap, 0, static_cast<uint32_t>(kind));
     return true;
 }
 
