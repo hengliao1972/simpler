@@ -1,4 +1,30 @@
-# Atomic Minibench 上板移植与修复记录（2026-07-10，更新 2026-07-11 v4）
+# Atomic Minibench 上板移植与修复记录（2026-07-10，更新 2026-07-13 v5）
+
+## 2026-07-13 AtomicExch 同-line 对照
+
+执行环境：base HEAD `ea1639f19f0a97ea2e7f98ff56ff6c9a935373c1`、CANN 9.1、`dav-3510`、
+device 0、PTO-ISA `ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8`。新增
+`atomic_probe/ascendc/atomic_exch_same_line.asc` 与
+`atomic_probe/ccec/atomic_exch_same_line.cpp`；CCEC 复用同布局 host。
+
+两条路径固定两个 AIV，每核独占一个 4B slot，执行 20 launch × 100 trial × 257 round。除把
+`st_dev` / `WriteGmByPassDCache<uint32_t>` 替换为 `atomicExch` / `AtomicExch<uint32_t>` 外，
+布局、值公式、DSB 和跨 AIV 同步点均与 `st_dev_same_line` 相同。结果：
+
+| 路径 | 同 line、仅 loop-end DSB | 分 line、仅 loop-end DSB | 同 line、逐轮 DSB |
+|---|---:|---:|---:|
+| CCEC `atomicExch` | 0/4000 mismatch | 0/4000 | 0/4000 |
+| AscendC `AtomicExch<uint32_t>` | 0/4000 mismatch | 0/4000 | 0/4000 |
+
+两个 runner 均 exit 0，参与计数和 marker 全部精确。该证据仅说明 AtomicExch 在本同构压力下没有
+复现 st_dev 的末值回退，不外推到 AtomicAdd/AtomicMax/CAS 或其他数据宽度、核拓扑和内存序场景。
+
+复现入口：
+
+```bash
+tests/atomic_probe/ccec/run_all.sh atomic_exch_same_line
+tests/atomic_probe/ascendc/_run_asc_probe.sh atomic_exch_same_line
+```
 
 ## 2026-07-11 atomic probe 当前工作区直接上板证据
 

@@ -81,7 +81,7 @@ int main(int argc, char **argv)
                           host[RESULT_BASE + 8] == 0xA1A00000u &&
                           host[RESULT_BASE + 9] == 0xA1A00001u;
         char label[96];
-        std::snprintf(label, sizeof(label), "st_dev same-line participation launch=%u", launch);
+        std::snprintf(label, sizeof(label), "same-line participation launch=%u", launch);
         result.Expect(control_ok, label);
 
         total_same_errors += host[RESULT_BASE + 0];
