@@ -20,9 +20,12 @@ DCCI、`st_dev` 与 atomic 的 API 功能、隔离规则和代码评审清单见
 - 2026-07-11：两个 `st_dev_same_line` 用例按正确性契约断言同-line mismatch 必须为 0；当前设备会
   复现 mismatch 并返回非零。其余 control 与完整入口结果见上板记录。
 - 2026-07-13：新增 AscendC/CCEC `atomic_exch_same_line` 同构对照；三组路径均为 `0/4000` mismatch。
-- 2026-07-13：CCEC `st_dev_same_line` 新增三 AIV 拓扑模式与正式单 AIV 同址模式；记录 raw
-  `core/subblock` 与 PTO 公式派生的 `comm_slot` 后，AIV0+AIV2 同-line 路径仍复现 mismatch，单 AIV
-  同址为 `0/2000`。`comm_slot` 不是物理组号。
+- 2026-07-13：CCEC `st_dev_same_line` 新增三 AIV 拓扑模式与低压力单 AIV 同址 mode；记录 raw
+  `core/subblock` 与 PTO 公式派生的 `comm_slot` 后，AIV0+AIV2 同-line 路径仍复现 mismatch。当时
+  单 AIV 同址 `0/2000` 只是一轮历史低压力样本，已被下述独立压力结果取代。`comm_slot` 不是物理组号。
+- 2026-07-13：新增 AscendC/CCEC `st_dev_single_core_stress`。只启动一个 AIV，不调用跨核同步；
+  line1 单址、仅 loop-end DSB 分别复现 `3/2000000` 与 `4/2000000` mismatch，line1/line2 双址分别
+  复现 `83821/1000000` 与 `78130/1000000`。同址和双址的逐写 DSB 控制均为 0 mismatch。
 - 2026-07-13：新增 AscendC/CCEC `st_dev_separate_line_stress` 四模式独立压力。两个 AIV 始终写不同
   64B line；line0/1 布局高频复现，line1/2 布局低频复现，证明旧 `0/4000` 分-line 样本不能作为
   “不同 cacheline 必然安全”的证据。
@@ -184,8 +187,8 @@ CCEC 另增加 mode 1/2，并由 runner 在独立 host 进程中分别执行三�
 | 2 | 只启动 block0 | block0 `(18,0,0)` | 同址 0/2000 | 不适用 | 同址逐写 DSB 0/2000 |
 
 表中数字来自当时 device 0 带首错诊断的 20-launch 复跑；mode 0/1 因同-line 正确性门禁分别 exit 1，
-mode 2 exit 0。AscendC 原双 AIV 路径为同-line `1792/4000`、两个旧对照均 `0/4000`、exit 1。正式
-单 AIV 同址路径没有复现，因此不能写成单 AIV 同址 `st_dev` 自身不保序。
+mode 2 exit 0。AscendC 原双 AIV 路径为同-line `1792/4000`、两个旧对照均 `0/4000`、exit 1。mode 2
+的 `0/2000` 只说明该轮低压力没有命中，不能支持单 AIV 同址安全结论；当前结论以下一节独立压力为准。
 
 原双 AIV/AscendC 与 CCEC mode 0 的旧分-line 路径位于 allocation 内部 line1/line2；CCEC mode 1
 的 block0+block2 路径位于 line5/line6。它们都只有 4000 次检查，并嵌在同-line 与逐轮 DSB 路径
@@ -196,6 +199,46 @@ cacheline”或“分-line 必然安全”。分-line 的当前主证据见下�
 本用例的目标是让同-line 问题以正确性失败显式暴露。问题路径必须保留 loop-end DSB，不能通过改成
 逐轮 DSB、替换成分-line 布局，或把 `mismatch > 0` 写成成功条件来让测试通过。逐轮 DSB 只保留为
 同-line 对照；分-line 本身由下一节独立压测，不能再当作规避问题的安全修改。
+
+## 单 AIV `st_dev` 独立压力
+
+`ascendc/st_dev_single_core_stress.asc` 与 `ccec/st_dev_single_core_stress.cpp` 是同构用例。每次 kernel
+只启动一个 AIV；写者和 bypass/`ld_dev` 读者都是 block0，不调用 `SyncAll`，不存在核间交权、核间
+数据共享或多个 writer。data line0..2、result、participation、topology marker、tail guard 各自独占
+64B；控制区使用 atomic 写，避免把控制发布本身混入 repeated `st_dev` 数据路径。
+
+七个 mode 将 allocation 内偏移、单/双地址和 DSB 位置显式分开：
+
+| Mode | data 地址 | DSB 位置 | runner 默认执行 |
+|---:|---|---|---|
+| 0 | line0 单址 | 257 次写后一次 | 否；可用 `ATOMIC_PROBE_MODE=0` 单独执行 |
+| 1 | line1 单址 | 257 次写后一次 | 是 |
+| 2 | line2 单址 | 257 次写后一次 | 否；可单独执行 |
+| 3 | 每轮依次写 line0 / line1 | 257 轮后一次 | 否；可单独执行 |
+| 4 | 每轮依次写 line1 / line2 | 257 轮后一次 | 是 |
+| 5 | line1 单址 | 每次写后立即执行 | 是，mode 1 的控制 |
+| 6 | 每轮依次写 line1 / line2 | 每个 slot 每次写后立即执行 | 是，mode 4 的控制 |
+
+每个 launch 含 100 trial，每个 slot 每 trial 连续写 257 次，然后同一 AIV bypass-read 精确终值。
+2026-07-13 device 0 未加设备锁直跑，单址 mode 使用 20000 launch，双址 mode 使用 5000 launch：
+
+| Mode | CCEC mismatch | AscendC mismatch | host 最终快照错误（CCEC / AscendC） |
+|---:|---:|---:|---:|
+| 1：line1 单址、loop-end DSB | 4/2000000 | 3/2000000 | 0 / 0 |
+| 4：line1/line2 双址、loop-end DSB | 78130/1000000 | 83821/1000000 | 784 / 838 |
+| 5：line1 单址、逐写 DSB | 0/2000000 | 0/2000000 | 0 / 0 |
+| 6：line1/line2 双址、逐写 DSB | 0/1000000 | 0/1000000 | 0 / 0 |
+
+两端 allocation 均为 `mod128=0`、`mod256=0`、`mod512=0`，且 marker 都记录唯一参与者为
+`block0(core18,sub0,comm_slot0)`。所有参与计数、result header、marker、非目标 data 和 guard 检查
+均精确。mode 1/4 按正确性契约返回非零；mode 5/6 返回 0。mode 4 的 host 最终快照错误也是目标值
+不精确，单独计数并参与失败，不能归入 protocol/guard 错误。
+
+因此已证实：多 AIV、跨核同步和跨核数据共享都不是本现象出现的必要条件；同一 AIV 对同一 4B
+地址 repeated `st_dev`，只在 257 次写后执行一次 DSB，仍可能读到前一轮值。首错均表现为期望
+round 256、实际为 round 255 或更早，但当前用例只证明精确终值回退，没有证明底层机制必然是
+编译器重排、硬件 store queue、cache bank/set 或其他具体原因。逐写 DSB 在本轮样本中把错误压到 0，
+这是实测控制结果，不是所有芯片、地址、宽度和时序的通用充分性证明。
 
 ## 分 line `st_dev` 独立压力
 
@@ -223,8 +266,8 @@ participation、marker、guard 和 `comm_slot` 公式检查均为 0 failure；da
 line1/line2 也在三组运行中低频复现。CCEC mode 2 的单次 `0/100000` 不能被解释为安全保证。
 allocation 内部 line offset 与本轮失败频率呈显著相关，但测试没有证明 cache bank、set、store
 队列或其他底层机制，不能据此指定根因；CCEC 与 AscendC 的具体失败 slot 也不一致，不能扩大为某个
-固定 writer 必然失败。该结论只覆盖多个 AIV、repeated bypass store、loop-end DSB 和随后跨 AIV
-会合的当前场景，不外推为单 AIV 同址 store 乱序。
+固定 writer 必然失败。该分-line 用例自身只覆盖多个 AIV、repeated bypass store、loop-end DSB 和
+随后跨 AIV 会合，不能单独用于判断单 AIV；上节独立单核用例已另行证明跨 AIV 不是问题复现的必要条件。
 
 旧双 AIV/AscendC 与 CCEC mode 0 路径使用本轮低频的 line1/line2 布局，且只有 4000 次检查；CCEC
 mode 1 另用 line5/line6，同样只有 4000 次。旧路径还与同-line、逐轮 DSB 路径共处一个 kernel
@@ -256,7 +299,8 @@ AtomicExch 没有复现 st_dev 的末值回退。该判定只检查每个 trial 
 | `ascendc/bypass_dcache_probe.asc` / `ccec/bypass_dcache_ccec.cpp` | gating | 1/2/4/8B ld_dev 共 120 次精确读取、st_dev/atomic、publish/observe |
 | `ascendc/concurrent_cacheline.asc` | gating + observation | 多 block st_dev、producer/consumer、持续读；store+dcci race 单列观察 |
 | `ascendc/cacheline_stress.asc` / `ccec/concurrent_stress.cpp` | observation + control | tight-loop dcci hazard；CCEC st_dev control 精确终值 |
-| `ascendc/st_dev_same_line.asc` / `ccec/st_dev_same_line.cpp` | regression gating + comparison | 多 AIV 同 line 使用精确终值断言；CCEC 另覆盖 block0+block2、raw core/subblock/`comm_slot` 与正式单 AIV 同址；原分-line 路径仅为低压力历史对照 |
+| `ascendc/st_dev_same_line.asc` / `ccec/st_dev_same_line.cpp` | regression gating + comparison | 多 AIV 同 line 使用精确终值断言；CCEC 另覆盖 block0+block2、raw core/subblock/`comm_slot` 与低压力单 AIV 同址历史样本；原分-line 路径同样只作历史对照 |
+| `ascendc/st_dev_single_core_stress.asc` / `ccec/st_dev_single_core_stress.cpp` | regression gating + control | 只启动一个 AIV；覆盖三个 allocation line 偏移、单/双地址 loop-end DSB，以及同址逐写 DSB 控制 |
 | `ascendc/st_dev_separate_line_stress.asc` / `ccec/st_dev_separate_line_stress.cpp` | regression gating | 只含分-line 数据路径；四模式覆盖两组活跃 block 与两种 allocation 内 line offset，100000 次精确终值检查 |
 | `ascendc/atomic_exch_same_line.asc` / `ccec/atomic_exch_same_line.cpp` | gating + control | 与 st_dev 同构的 AtomicExch 末值顺序对照；三组路径均精确通过 |
 | `ascendc/dcci_atomic_stress.asc` | legacy observation | 旧的混合 stress；不再作为 DCCI selector 语义证据 |

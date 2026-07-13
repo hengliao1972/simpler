@@ -1,4 +1,78 @@
-# Atomic Minibench 上板移植与修复记录（2026-07-10，更新 2026-07-13 v9）
+# Atomic Minibench 上板移植与修复记录（2026-07-10，更新 2026-07-13 v10）
+
+## 2026-07-13 单 AIV repeated `st_dev` 独立压力
+
+执行环境：base HEAD `2391ed1841fb466ff7938a4aae47b1a57162dc4b`、dirty worktree、CANN 9.1、
+`dav-3510`、device 0、PTO-ISA `ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8`。本轮直接使用 device 0，
+没有 `task-submit` 设备锁；结果必须连同本节新增的 AscendC/CCEC 用例 diff 使用，不能只按 base HEAD
+复现。
+
+新增 `atomic_probe/ascendc/st_dev_single_core_stress.asc`、
+`atomic_probe/ccec/st_dev_single_core_stress.cpp` 和对应 CCEC host。每次 kernel 只启动一个 AIV；
+写者与 bypass/`ld_dev` 读者都是 block0，不调用 `SyncAll`，没有核间同步、核间数据共享或第二个 writer。
+data line0..2、result、participation、topology marker、tail guard 各自独占 64B；控制信息用 atomic
+发布，避免控制区的 repeated `st_dev` 干扰被测路径。
+
+七个 mode 为：
+
+| Mode | data 地址 | DSB 位置 |
+|---:|---|---|
+| 0 | line0 单址 | 257 次写后一次 |
+| 1 | line1 单址 | 257 次写后一次 |
+| 2 | line2 单址 | 257 次写后一次 |
+| 3 | 每轮依次写 line0 / line1 | 257 轮后一次 |
+| 4 | 每轮依次写 line1 / line2 | 257 轮后一次 |
+| 5 | line1 单址 | 每次写后立即执行 |
+| 6 | 每轮依次写 line1 / line2 | 每个 slot 每次写后立即执行 |
+
+默认 runner 执行高信号 mode 1/4 和对应逐写 DSB 控制 5/6；mode 0/2/3 可通过
+`ATOMIC_PROBE_MODE` 单独扫描。host 默认单址 5000 launch、双址 500 launch。本轮定量复跑显式扩大为
+单址 20000 launch、双址 5000 launch；每个 launch 有 100 trial，每个 slot 每 trial 写 257 次：
+
+| Mode | CCEC mismatch | AscendC mismatch | host 最终快照错误（CCEC / AscendC） | 退出 |
+|---:|---:|---:|---:|---|
+| 1：line1 单址、loop-end DSB | 4/2000000 | 3/2000000 | 0 / 0 | 两端 exit 1 |
+| 4：line1/line2 双址、loop-end DSB | 78130/1000000 | 83821/1000000 | 784 / 838 | 两端 exit 1 |
+| 5：line1 单址、逐写 DSB | 0/2000000 | 0/2000000 | 0 / 0 | 两端 exit 0 |
+| 6：line1/line2 双址、逐写 DSB | 0/1000000 | 0/1000000 | 0 / 0 | 两端 exit 0 |
+
+两端 allocation 均输出 `mod128=0`、`mod256=0`、`mod512=0`，marker 均为
+`block0(core18,sub0,comm_slot0)`。所有参与计数、result header、topology marker、非目标 data 和
+guard 检查精确；mode 4 的 host 最终快照错误属于目标数据终值错误，不属于 protocol/guard 失败。
+CCEC mode 1 首错为 actual `0xa10330ff`、expected `0xa1033100`；AscendC mode 1 首错为 actual
+`0xa105b0ff`、expected `0xa105b100`，都实际保留在期望 round 256 之前的 round 255。错误频率不是
+硬件常数，两种前端的次数不同不能解释为语义差异。
+
+这组结果推翻了旧低压力 `0/2000` 所能暗示的单核安全性：多 AIV、跨核同步和跨核数据共享都不是
+问题复现的必要条件。已证明的是 repeated `st_dev` 的精确终值会回退；尚未证明根因必然是编译器
+重排、硬件 store queue、cache bank/set 或其他具体机制。逐写 DSB 在本轮共 3000000 次/前端的
+控制检查中为 0，只能表述为“当前样本中抑制了错误”，不能升级为所有地址、宽度和芯片的充分保证。
+
+复现入口：
+
+```bash
+source /home/q00473782/cann/cann-9.1.0/bin/setenv.bash
+export PTO_ISA_ROOT=/home/q00473782/atomic/codex/simpler-fully_distributed/build/pto-isa
+export ATOMIC_PROBE_DEVICE=0
+
+# runner 默认执行 mode 1/4/5/6；已知问题 mode 会按正确性契约返回非零
+tests/atomic_probe/ccec/run_all.sh st_dev_single_core_stress
+tests/atomic_probe/ascendc/_run_asc_probe.sh st_dev_single_core_stress
+
+# 本节定量口径；每个 mode 使用独立 host 进程
+ATOMIC_PROBE_MODE=1 ATOMIC_PROBE_STRESS_LAUNCHES=20000 \
+    tests/atomic_probe/ccec/run_all.sh st_dev_single_core_stress
+ATOMIC_PROBE_MODE=4 ATOMIC_PROBE_STRESS_LAUNCHES=5000 \
+    tests/atomic_probe/ccec/run_all.sh st_dev_single_core_stress
+ATOMIC_PROBE_MODE=5 ATOMIC_PROBE_STRESS_LAUNCHES=20000 \
+    tests/atomic_probe/ccec/run_all.sh st_dev_single_core_stress
+ATOMIC_PROBE_MODE=6 ATOMIC_PROBE_STRESS_LAUNCHES=5000 \
+    tests/atomic_probe/ccec/run_all.sh st_dev_single_core_stress
+
+# AscendC 使用同样四组 ATOMIC_PROBE_MODE / ATOMIC_PROBE_STRESS_LAUNCHES，
+# 将上一组命令的入口替换为：
+tests/atomic_probe/ascendc/_run_asc_probe.sh st_dev_single_core_stress
+```
 
 ## 2026-07-13 DCCI selector 五模式与 AtomicExch 八模式对照
 
@@ -99,7 +173,8 @@ block1 `(core19,sub0,comm_slot0)`，第二个活跃者 block2 为 `(core72,sub0,
 因此当前证据足以否定“两个 AIV 写不同 64B cacheline 就必然安全”。line0/line1 布局在两种前端
 均高频复现，line1/line2 布局也出现低频 mismatch；CCEC mode 2 的单次 `0/100000` 不能作为安全
 保证。allocation 内部 line offset 与本轮失败频率相关，但当前用例没有区分 cache bank、set、store
-队列或其他底层机制，不能指定根因；结论也不外推为单 AIV 同址 store 自身乱序。
+队列或其他底层机制，不能指定根因。该多 AIV 用例自身不能判断单 AIV；最上方独立单核压力已另行
+证明跨 AIV 不是问题复现的必要条件，但同样没有确定底层机制。
 
 旧双 AIV/AscendC 与 CCEC mode 0 分-line 路径使用 allocation 内 line1/line2；CCEC mode 1 使用
 line5/line6。它们都只有 4000 次检查，而且与同-line、逐轮 DSB 路径共处一个 kernel 时序。旧路径
@@ -150,7 +225,7 @@ tests/atomic_probe/ccec/run_all.sh atomic_exch_same_line
 tests/atomic_probe/ascendc/_run_asc_probe.sh atomic_exch_same_line
 ```
 
-## 2026-07-13 CCEC 三 AIV 拓扑与正式单 AIV `st_dev` 对照
+## 2026-07-13 CCEC 三 AIV 拓扑与低压力单 AIV `st_dev` 对照（历史）
 
 执行环境：base HEAD `c2739e23ed3a6729eeaaa4a3fa336875319d8c17`、dirty worktree、CANN 9.1、
 `dav-3510`、device 0、PTO-ISA `ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8`。扩展
@@ -172,8 +247,8 @@ launch 中记录保持一致：
 | 2 | block0 `(18,0,0)` | 同址 0/2000 | 不适用 | 同址 0/2000 |
 
 mode 0/1 的 active writer 记录为不同 `comm_slot`；该派生编号不能用于解释硬件物理位置。两者仍
-复现同-line 终值错误并按正确性契约 exit 1。mode 2 exit 0，说明本轮正式单 AIV 同址用例没有复现
-末值回退。结论只限定为该设备与当前压力下的观测，不把它扩大为底层乱序机制说明。
+复现同-line 终值错误并按正确性契约 exit 1。mode 2 exit 0 只说明该轮 2000 次低压力没有命中；
+最上方独立单核压力已在 AscendC/CCEC 各 2000000 次同址检查中复现，取代本节旧边界。
 
 加入首错 actual/expected 诊断前的一次独立运行中，mode 0/1 的分-line 路径各出现过
 `1/4000` mismatch；表中带诊断复跑当时均为 `0/4000`，当前同版本 mode 0 又得到 `3/4000`。永久
@@ -218,7 +293,8 @@ tests/atomic_probe/ccec/run_all.sh atomic_exch_same_line
 | AscendC `WriteGmByPassDCache<uint32_t>` | 1792/4000 mismatch（正确性断言失败，exit 1） | 0/4000 | 0/4000 |
 
 当时的临时单 AIV 隔离 control 为 20 launch × 100 trial：同址连续 257 次 `st_dev`、仅 loop-end DSB，
-`0/2000` mismatch；逐写 DSB 同样 `0/2000`。该路径现已由上方 2026-07-13 CCEC mode 2 固化。
+`0/2000` mismatch；逐写 DSB 同样 `0/2000`。该低压力结果随后由 CCEC mode 2 固化，但当前已被
+最上方 AscendC/CCEC 独立单核压力的 2000000 次同址检查取代。
 
 复现入口：
 
@@ -244,8 +320,9 @@ tests/atomic_probe/ascendc/_run_asc_probe.sh st_dev_same_line
 | `.venv/bin/python -m pytest tests/atomic_probe/test_atomic_probe.py -k cpu -q` | exit 0 | `1 passed, 2 deselected` |
 
 上述两个完整入口的 exit 0 来自旧的 `mismatch > 0` 成功条件，不再代表当前判定标准。
-`st_dev_same_line` 与 `st_dev_separate_line_stress` 都要求各自终值 mismatch 为 0；设备复现任一
-mismatch 时，目标用例及包含它的完整入口都必须返回非零，不能把问题存在本身包装成 PASS。
+`st_dev_same_line`、`st_dev_separate_line_stress` 与 `st_dev_single_core_stress` 都要求各自终值
+mismatch 为 0；设备复现任一 mismatch 时，目标用例及包含它的完整入口都必须返回非零，不能把
+问题存在本身包装成 PASS。
 
 CCEC publish/observe seam 曾在前序压力后出现 40/100 stale reads。producer 在 16 个 payload `st_dev` 完成后、
 发布 atomic flag 前加入一处 `dsb(DSB_ALL)`；保持 consumer 不变后，单项压力后与完整 runner 均为
