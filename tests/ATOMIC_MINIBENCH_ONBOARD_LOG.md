@@ -1,4 +1,128 @@
-# Atomic Minibench 上板移植与修复记录（2026-07-10，更新 2026-07-13 v5）
+# Atomic Minibench 上板移植与修复记录（2026-07-10，更新 2026-07-13 v9）
+
+## 2026-07-13 DCCI selector 五模式与 AtomicExch 八模式对照
+
+执行环境：base HEAD `c2739e23ed3a6729eeaaa4a3fa336875319d8c17`、dirty worktree、CANN 9.1、
+`dav-3510`、device 0、PTO-ISA `ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8`。本轮经用户既有授权
+直接占用 device 0，没有经过 `task-submit`；结果必须连同本节对应 diff 使用，不能只按 base HEAD 复现。
+
+### ordinary clean line：DEFAULT/ALL/OUT/ATOMIC/no-DCCI
+
+AscendC `mb8_dcci_seam.asc` 与 CCEC `dcci_seam.cpp` 使用两个 AIV。读核仅 normal-load data，
+从不写 data line；写核仅 bypass-store data。data、两个 atomic phase、writer marker、reader result
+均独占 64B line。每轮由 `ready`/`done` atomic 严格排序“读核预读旧值 → 写核写新值并 DSB →
+读核 DCCI+DSB 后 normal/bypass 双读”，不存在 data line 的并发访问。
+
+| 路径 | DEFAULT | ALL | OUT | ATOMIC | NO DCCI | GM/协议 |
+|---|---:|---:|---:|---:|---:|---|
+| CCEC | 100/0 | 100/0 | 100/0 | 100/0 | 0/100 | `other=0`、`gm_bad=0`，phase/marker/round 全精确 |
+| AscendC | 100/0 | 100/0 | 100/0 | 100/0 | 0/100 | `other=0`、`gm_bad=0`，phase/marker/round 全精确 |
+
+表中数字为 `fresh/stale`。ATOMIC 又在 AscendC、CCEC 各用独立进程重复 5 次，每次均为
+`100/0`。no-DCCI 的 `0/100` 证明 DCCI 前 clean stale line 确实驻留，排除“自然 eviction 导致
+假 fresh”。当前精确门禁说明三个 selector 在本机 A5、single-line ordinary clean entry 上都会使
+后续 normal load 取得 GM 新值；不外推为其他 entry 类别或芯片的通用 ISA 契约。
+
+两个 runner 将五个 mode 放在独立 host 进程中执行。初版同进程连续 launch 时第二次 launch 的
+phase/marker 全为 0；该次没有留下能够证明 kernel 执行的标记，因此不能把结果归因于 OUT 的硬件行为。
+CCEC runner 继续关闭 scalar auto-DCCI 与 kernel-end DCCI；AscendC runner 仅对本 DCCI probe 定向
+显式关闭这两项，避免自动插入污染对照。
+
+### ordinary dirty line：DCCI 与 AtomicExch 同/分 line
+
+新增 AscendC/CCEC `dcci_atomic_clobber` 同构用例。核0先普通预读完整 data line，再 scalar store
+邻接 word 形成 stale dirty line；DSB/独立 atomic phase 后，核1完成一次 AtomicExch；核0再次经
+DSB/phase 取得权限后才执行 DCCI。整个时序严格串行，不存在两个核同时访问被测 data line。
+
+| DCCI | atomic 与 dirty data 同 64B line | atomic 与 dirty data 分 64B line |
+|---|---|---|
+| ALL | dirty line 发布，AtomicExch 新值被旧快照覆盖 | dirty data 发布，AtomicExch 新值保留 |
+| OUT | dirty line 发布，AtomicExch 新值被旧快照覆盖 | dirty data 发布，AtomicExch 新值保留 |
+| ATOMIC | dirty line 发布，AtomicExch 新值被旧快照覆盖 | dirty data 发布，AtomicExch 新值保留 |
+| NO DCCI | dirty scalar 值未发布，AtomicExch 新值保留 | dirty scalar 值未发布，AtomicExch 新值保留 |
+
+AscendC 与 CCEC 八个 mode 的实际状态逐项一致，完整检查两条 16-word line、AtomicExch 返回旧值、
+ready/done、两核 marker 与未使用 slot。同-line 的 ALL/OUT/ATOMIC 三个 mode 均触发正确性门禁并
+以非零退出；分-line 与 no-DCCI 五个 control 均通过。结论是：atomic RMW 已完成不等于能阻止另一个
+核随后进行的 stale dirty 整-line DCCI writeback；在本用例覆盖的 ordinary dirty line 场景中，
+atomic 控制量必须与可能被 DCCI 的 data 分 64B line 管理。
+
+复现入口：
+
+```bash
+source /home/q00473782/cann/cann-9.1.0/bin/setenv.bash
+export PTO_ISA_ROOT=/home/q00473782/atomic/codex/simpler-fully_distributed/build/pto-isa
+export ATOMIC_PROBE_DEVICE=0
+tests/atomic_probe/ccec/run_all.sh dcci_seam
+tests/atomic_probe/ascendc/_run_asc_probe.sh mb8_dcci_seam
+tests/atomic_probe/ccec/run_all.sh dcci_atomic_clobber
+tests/atomic_probe/ascendc/_run_asc_probe.sh dcci_atomic_clobber
+
+# CACHELINE_ATOMIC clean-reader 路径的 5 次独立进程复测
+for i in {1..5}; do ATOMIC_PROBE_MODE=3 tests/atomic_probe/ccec/run_all.sh dcci_seam; done
+for i in {1..5}; do ATOMIC_PROBE_MODE=3 tests/atomic_probe/ascendc/_run_asc_probe.sh mb8_dcci_seam; done
+```
+
+## 2026-07-13 `st_dev` 分-line 独立压力
+
+执行环境：base HEAD `c2739e23ed3a6729eeaaa4a3fa336875319d8c17`、dirty worktree、CANN 9.1、
+`dav-3510`、device 0、PTO-ISA `ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8`。新增
+`atomic_probe/ascendc/st_dev_separate_line_stress.asc` 与
+`atomic_probe/ccec/st_dev_separate_line_stress.cpp`。本节是当前分-line 主证据；下方旧
+`st_dev_same_line` 中的 `0/4000` 分-line 数据只是历史低压力样本。
+
+该用例不包含任何两个 AIV 写同一 cacheline 的路径。每个 mode 在独立 host 进程中执行 500 launch；
+每个 launch 有 100 trial，两个活跃 AIV 各自对独占 64B line 的 word0 连续执行 257 次 bypass store，
+仅在循环末执行一次 DSB。随后所有已启动 AIV 会合，由 block0 bypass-read 两个终值。每个 mode 共
+检查 100,000 个终值，并独立核对首错、slot 计数、最终 host snapshot、参与数、marker、未用 data
+line 和 tail guard。
+
+四模式结果如下：
+
+| Mode | 活跃 block | data line | CCEC mismatch | AscendC mismatch |
+|---:|---|---|---:|---:|
+| 0 | block0 + block1 | line0 / line1 | 41484/100000 | 42165/100000 |
+| 1 | block0 + block2；block1 data-idle | line0 / line1 | 39974/100000 | 37320/100000 |
+| 2 | block0 + block1 | line1 / line2 | 0/100000 | 46/100000 |
+| 3 | block0 + block2；block1 data-idle | line1 / line2 | 10/100000 | 5/100000 |
+
+CCEC 的 slot 分解分别为 mode 0 `0/41484`、mode 1 `5/39969`、mode 2 `0/0`、mode 3 `5/5`；
+AscendC 分别为 `42134/31`、`37301/19`、`25/21`、`0/5`。两种前端的具体失败 slot 不一致，
+因此不能把问题归因到某个固定逻辑 block 或固定 writer。
+
+两端本轮 allocation 首地址均输出 `mod128=0`、`mod256=0`、`mod512=0`。mode 0/2 的记录为
+block0 `(core18,sub0,comm_slot0)`、block1 `(core72,sub0,comm_slot18)`；mode 1/3 另有 data-idle
+block1 `(core19,sub0,comm_slot0)`，第二个活跃者 block2 为 `(core72,sub0,comm_slot18)`。
+`comm_slot` 严格按 PTO `TSYNC_CVID` 的 signed 公式派生，只是软件 CV 通信配对编号，不是硬件物理
+组号。所有 protocol、participation、marker、guard 与 `comm_slot` 公式检查均为 0 failure。
+
+因此当前证据足以否定“两个 AIV 写不同 64B cacheline 就必然安全”。line0/line1 布局在两种前端
+均高频复现，line1/line2 布局也出现低频 mismatch；CCEC mode 2 的单次 `0/100000` 不能作为安全
+保证。allocation 内部 line offset 与本轮失败频率相关，但当前用例没有区分 cache bank、set、store
+队列或其他底层机制，不能指定根因；结论也不外推为单 AIV 同址 store 自身乱序。
+
+旧双 AIV/AscendC 与 CCEC mode 0 分-line 路径使用 allocation 内 line1/line2；CCEC mode 1 使用
+line5/line6。它们都只有 4000 次检查，而且与同-line、逐轮 DSB 路径共处一个 kernel 时序。旧路径
+曾跑出 `0/4000`，也曾出现 `1/4000`；当前同版本 CCEC mode 0 又得到 `3/4000`。新用例只保留
+分-line 数据路径、覆盖 line0/line1 与 line1/line2，并把样本提高到 100,000 次，因此能更稳定地
+暴露问题且没有引入同-line 数据交互。line5/line6 尚未由新独立用例同压复测，两类用例的完整指令
+序列也并非逐条相同，当前证据不能把频率差异进一步归因到某个底层机制。
+
+复现入口：
+
+```bash
+source /home/q00473782/cann/cann-9.1.0/bin/setenv.bash
+export PTO_ISA_ROOT=/home/q00473782/atomic/codex/simpler-fully_distributed/build/pto-isa
+export ATOMIC_PROBE_DEVICE=0
+tests/atomic_probe/ccec/run_all.sh st_dev_separate_line_stress
+tests/atomic_probe/ascendc/_run_asc_probe.sh st_dev_separate_line_stress
+
+# 可缩短或扩大每个 mode 的独立 launch 数
+ATOMIC_PROBE_STRESS_LAUNCHES=500 ATOMIC_PROBE_MODE=0 \
+    tests/atomic_probe/ccec/run_all.sh st_dev_separate_line_stress
+ATOMIC_PROBE_STRESS_LAUNCHES=500 ATOMIC_PROBE_MODE=0 \
+    tests/atomic_probe/ascendc/_run_asc_probe.sh st_dev_separate_line_stress
+```
 
 ## 2026-07-13 AtomicExch 同-line 对照
 
@@ -26,9 +150,54 @@ tests/atomic_probe/ccec/run_all.sh atomic_exch_same_line
 tests/atomic_probe/ascendc/_run_asc_probe.sh atomic_exch_same_line
 ```
 
-## 2026-07-11 atomic probe 当前工作区直接上板证据
+## 2026-07-13 CCEC 三 AIV 拓扑与正式单 AIV `st_dev` 对照
 
-本节只记录 `tests/atomic_probe/` 当前未提交工作区的直接设备验证，不用下方旧提交结果替代。
+执行环境：base HEAD `c2739e23ed3a6729eeaaa4a3fa336875319d8c17`、dirty worktree、CANN 9.1、
+`dav-3510`、device 0、PTO-ISA `ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8`。扩展
+`atomic_probe/ccec/st_dev_same_line.cpp`，runner 以三个独立 host 进程执行：
+
+- mode 0：启动两个 block，block0 与 block1 写数据，保留原双 AIV 回归路径；
+- mode 1：启动三个 block，仅 block0 与 block2 写数据；block1 只写独占拓扑 marker，并参加每个
+  flag-14 `SyncAll`，从始至终不访问任何被测 data line；
+- mode 2：只启动一个 block，同一地址连续执行 257 次 `st_dev`，分别只在循环末 DSB 和逐写 DSB。
+
+每个 marker 独占 64B，记录逻辑 block、`get_coreid()`、`get_subblockid()` 以及按本机 PTO-ISA
+`TSYNC_CVID` A5 公式计算的 `comm_slot`。该值是软件 CV 通信配对编号，不是硬件物理组号。20 次
+launch 中记录保持一致：
+
+| mode | core/subblock/comm_slot 记录 | 同-line、仅 loop-end DSB | 旧分-line 低压路径 | 同-line、逐写 DSB |
+|---:|---|---:|---:|---:|
+| 0 | block0 `(core18,sub0,comm0)`；block1 `(core72,sub0,comm18)` | 1679/4000 mismatch | 0/4000 | 0/4000 |
+| 1 | block0 `(18,0,0)`；idle block1 `(19,0,0)`；block2 `(72,0,18)` | 1736/4000 mismatch | 0/4000 | 0/4000 |
+| 2 | block0 `(18,0,0)` | 同址 0/2000 | 不适用 | 同址 0/2000 |
+
+mode 0/1 的 active writer 记录为不同 `comm_slot`；该派生编号不能用于解释硬件物理位置。两者仍
+复现同-line 终值错误并按正确性契约 exit 1。mode 2 exit 0，说明本轮正式单 AIV 同址用例没有复现
+末值回退。结论只限定为该设备与当前压力下的观测，不把它扩大为底层乱序机制说明。
+
+加入首错 actual/expected 诊断前的一次独立运行中，mode 0/1 的分-line 路径各出现过
+`1/4000` mismatch；表中带诊断复跑当时均为 `0/4000`，当前同版本 mode 0 又得到 `3/4000`。永久
+用例仍要求 mismatch 精确为 0，出现非零必须作为正确性失败暴露。该低压力路径的安全性结论已被
+上方 `st_dev_separate_line_stress` 的 100,000 次独立压力结果取代。
+
+由于 `st_dev_same_line_host.cpp` 同时被原有 `atomic_exch_same_line` 复用，扩展后又执行兼容回归：
+CCEC AtomicExch 的同-line、分-line、同-line 逐轮 DSB 均为 `0/4000`，20 次参与计数和 marker 全精确，
+runner exit 0。
+
+复现入口：
+
+```bash
+source /home/q00473782/cann/cann-9.1.0/bin/setenv.bash
+export PTO_ISA_ROOT=/home/q00473782/atomic/codex/simpler-fully_distributed/build/pto-isa
+export ATOMIC_PROBE_DEVICE=0
+tests/atomic_probe/ccec/run_all.sh st_dev_same_line
+tests/atomic_probe/ccec/run_all.sh atomic_exch_same_line
+```
+
+## 2026-07-11 atomic probe 两 AIV 原始上板证据（历史）
+
+本节记录当时 `tests/atomic_probe/` 未提交工作区的直接设备验证；CCEC 最新三 mode 结果以上方
+2026-07-13 小节为准，分-line 结论以最上方独立压力小节为准，不用本节旧数字替代。
 执行环境：base HEAD `57841544fe4c2360ea703eeb583d6112cd379037`、CANN 9.1、
 `dav-3510`、device 0、PTO-ISA `ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8`。本轮经用户授权直接
 占用设备，没有经过 `task-submit`，所以结果必须连同 dirty worktree diff 使用，不能只按 base HEAD 复现。
@@ -48,9 +217,8 @@ tests/atomic_probe/ascendc/_run_asc_probe.sh atomic_exch_same_line
 | CCEC `st_dev` | 1589/4000 mismatch（正确性断言失败，exit 1） | 0/4000 | 0/4000 |
 | AscendC `WriteGmByPassDCache<uint32_t>` | 1792/4000 mismatch（正确性断言失败，exit 1） | 0/4000 | 0/4000 |
 
-临时单 AIV 隔离 control 为 20 launch × 100 trial：同址连续 257 次 `st_dev`、仅 loop-end DSB，
-`0/2000` mismatch；逐写 DSB 同样 `0/2000`。因此当前证据支持的是“多个 AIV 并发写同一 64B line
-的不同 slot 时存在干扰”，不支持“单 AIV 同址 store 自身乱序”。底层机制尚未由本测试判定。
+当时的临时单 AIV 隔离 control 为 20 launch × 100 trial：同址连续 257 次 `st_dev`、仅 loop-end DSB，
+`0/2000` mismatch；逐写 DSB 同样 `0/2000`。该路径现已由上方 2026-07-13 CCEC mode 2 固化。
 
 复现入口：
 
@@ -62,21 +230,22 @@ tests/atomic_probe/ccec/run_all.sh st_dev_same_line
 tests/atomic_probe/ascendc/_run_asc_probe.sh st_dev_same_line
 ```
 
-### 当前工作区入口验证记录
+### 当时工作区入口验证记录
 
-同一工作区、同一环境的当前目标用例与改 oracle 前完整入口记录如下：
+同一工作区、同一环境在当时版本上的目标用例与修改判定条件前的完整入口记录如下。这些
+`0/4000` 分-line 样本不代表上方 dedicated separate-line 压力的当前结论：
 
 | 入口 | 结果 | 关键证据 |
 |---|---|---|
-| `tests/atomic_probe/ccec/run_all.sh st_dev_same_line` | exit 1 | 当前正确性 oracle：same-line mismatch 1589/4000；两个 control 0/4000；`semantic_failures=1` |
-| `tests/atomic_probe/ascendc/_run_asc_probe.sh st_dev_same_line` | exit 1 | 当前正确性 oracle：same-line mismatch 1792/4000；两个 control 0/4000；`failures=1` |
+| `tests/atomic_probe/ccec/run_all.sh st_dev_same_line` | exit 1 | 当时 20-launch 判定：same-line mismatch 1589/4000；两个低压对照 0/4000；`semantic_failures=1` |
+| `tests/atomic_probe/ascendc/_run_asc_probe.sh st_dev_same_line` | exit 1 | 当时 20-launch 判定：same-line mismatch 1792/4000；两个低压对照 0/4000；`failures=1` |
 | `tests/atomic_probe/ccec/run_all.sh` | 历史验证 exit 0 | 改为正确性断言前，所有 AIV-only probe 与 8-mode matrix 均完成；same-line mismatch 1634/4000，两个 control 0/4000 |
 | `tests/atomic_probe/ascendc/_run_asc_probe.sh` | 历史验证 exit 0 | 改为正确性断言前，`failures=0 executables=11 sources=11`；same-line mismatch 1738/4000，两个 control 0/4000 |
 | `.venv/bin/python -m pytest tests/atomic_probe/test_atomic_probe.py -k cpu -q` | exit 0 | `1 passed, 2 deselected` |
 
-上述两个完整入口的 exit 0 来自旧的 `mismatch > 0` 成功条件，不再代表当前 oracle。当前
-`st_dev_same_line` 要求同-line mismatch 为 0；设备复现任一 mismatch 时，目标用例及包含它的完整入口
-都必须返回非零，不能把问题存在本身包装成 PASS。
+上述两个完整入口的 exit 0 来自旧的 `mismatch > 0` 成功条件，不再代表当前判定标准。
+`st_dev_same_line` 与 `st_dev_separate_line_stress` 都要求各自终值 mismatch 为 0；设备复现任一
+mismatch 时，目标用例及包含它的完整入口都必须返回非零，不能把问题存在本身包装成 PASS。
 
 CCEC publish/observe seam 曾在前序压力后出现 40/100 stale reads。producer 在 16 个 payload `st_dev` 完成后、
 发布 atomic flag 前加入一处 `dsb(DSB_ALL)`；保持 consumer 不变后，单项压力后与完整 runner 均为
@@ -188,18 +357,22 @@ test -f "$PTO_ISA_ROOT/include/pto/pto-inst.hpp"
 > 以下 dist_engine.cpp 改动在 `a83196e4` 中引入，在 `b422c48f` 中回退。
 > 原因：A/B 对照实验证明现有主线测试（vector TSTORE kernel）不需要这些改动。
 
-**发现 A：scalar 写需要 dcci flush，vector 写不需要**
+**历史发现 A：该 scalar 用例需要显式发布，vector 用例不需要**
+
+> 这是早期 A/B 记录中的用语。当前 selector 专项测试只证明普通 scalar dirty line 在执行
+> DEFAULT/ALL/OUT/ATOMIC 后均被发布；不能据此声称只有 OUT 才能发布，也不把 GM 可见性等同为
+> 已追踪到物理 HBM。
 
 A/B 对照实验（去掉 flush，分别跑 vector_example 和 MB-2）：
 
-| 写类型 | 硬件路径 | 到 HBM | 需要 dcci flush |
+| 写类型 | 硬件路径 | host/ld_dev 可见 | 该旧用例采用的发布手段 |
 |--------|---------|--------|----------------|
-| Scalar store（`out[i]=val`） | L1 data cache | ❌ 不自动 | ✅ 必须 `dcci CACHELINE_OUT` |
-| Vector TSTORE | L2 cache | ✅ write-through | ❌ 不需要 |
+| Scalar store（`out[i]=val`） | L1 data cache | ❌ 不自动 | `dcci CACHELINE_OUT` |
+| Vector TSTORE | L2 cache | ✅ | 不执行 DCCI |
 
-vector_example（纯 TSTORE）去掉 flush 后仍 PASS；MB-2（scalar 裸写）去掉 flush
-后 FAIL。当前主线 runtime 代码不含 flush，MB-2 scalar-write 场景需要 kernel
-侧自行 flush 或在 runtime 层补 flush。
+vector_example（纯 TSTORE）去掉 DCCI 后仍 PASS；MB-2（scalar 裸写）去掉 DCCI
+后 FAIL。当前主线 runtime 代码不含这一步显式 DCCI，MB-2 scalar-write 场景需要 kernel
+侧自行发布，或另行论证是否应由 runtime 处理。
 
 **发现 B：完成标志 publish/read 的 cacheline clobber / TOCTOU**
 
@@ -270,12 +443,12 @@ clobber 风险。`task_flag_ready` 用 `invalidate + plain load` 有 TOCTOU 窗�
 2. 或在 PTO-ISA 头文件中 rename `Stride` 为 `TensorStride` 等
 3. 或用 CCEC `-DStride=pto::Stride` 宏覆盖（hack）
 
-### MB-2 scalar 写需要 dcci flush（应在 kernel 侧自行处理）
+### MB-2 scalar 写需要显式发布（应在 kernel 侧自行处理）
 
 MB-2 的 `kernel_write_index` 用裸 scalar 写（`out[0] = float(index) + 1`）。
-A5 上 scalar store 只到 L1 data cache，需要 kernel 自行调用 `dcci CACHELINE_OUT`
-刷到 HBM。**不应在 runtime 层泛化处理**——vector TSTORE 走 L2 write-through 不
-需要 flush，统一 flush 会引入冗余开销。正确做法：谁写谁 flush。
+A5 上该 scalar store 不会自动变成 host/ld_dev 可见值；旧实现用 kernel 内的
+`dcci CACHELINE_OUT` 发布。**不应在 runtime 层泛化处理**——vector TSTORE 的旧对照不需要
+DCCI，统一插入会引入冗余开销。具体选择哪个 DcciDst 必须按目标 entry 类型另行验证。
 
 ### MB-8 过程中曾出现 kernel hang
 

@@ -112,8 +112,4 @@ __aicore__ inline void ccec_sync_all()
 #define ld_dev_b16(addr) ((uint16_t)__builtin_cce_ld_dev((addr), 0))
 #define ld_dev_b8(addr)  ((uint8_t)__builtin_cce_ld_dev((addr), 0))
 
-// ---- dcci shorthand ----
-#define dcci_flush(p) __builtin_cce_dcci((p), SINGLE_CACHE_LINE, CACHELINE_OUT)
-#define dcci_inval(p) __builtin_cce_dcci((p), SINGLE_CACHE_LINE)
-
 #endif

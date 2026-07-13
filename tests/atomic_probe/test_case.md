@@ -2,11 +2,14 @@
 
 ## Goal
 
-A5 每个核的 scalar data cache 没有 CPU 式多核 cache coherence。测试需要回答：多个核并发读写同一
-64B cache line 时，哪些 scalar 访问方式能保持精确值，哪些 cache 管理路径会覆盖其他核的修改。
+A5 每个核的 scalar data cache 没有 CPU 式多核 cache coherence。测试需要回答：多个核并发访问同一
+或不同 64B cache line 时，哪些 scalar 访问方式能保持精确值，哪些 cache 管理路径会覆盖或遗漏修改。
 
 测试分别覆盖 AscendC API、CCEC 原始 intrinsic，并以无数据竞争的 CPU 多线程程序作为 coherent
-control。结论只能来自精确 oracle 或明确标为 observational 的统计，不能用一次随机现象替代契约。
+control。结论只能来自精确判定标准或明确标为观察项的统计，不能用一次随机现象替代契约。
+
+DCCI、`st_dev` 与 atomic 的 API 功能、隔离规则和代码评审清单见
+[`ATOMIC_USAGE_GUIDE.md`](ATOMIC_USAGE_GUIDE.md)。
 
 ## 当前验证状态
 
@@ -17,13 +20,23 @@ control。结论只能来自精确 oracle 或明确标为 observational 的统�
 - 2026-07-11：两个 `st_dev_same_line` 用例按正确性契约断言同-line mismatch 必须为 0；当前设备会
   复现 mismatch 并返回非零。其余 control 与完整入口结果见上板记录。
 - 2026-07-13：新增 AscendC/CCEC `atomic_exch_same_line` 同构对照；三组路径均为 `0/4000` mismatch。
+- 2026-07-13：CCEC `st_dev_same_line` 新增三 AIV 拓扑模式与正式单 AIV 同址模式；记录 raw
+  `core/subblock` 与 PTO 公式派生的 `comm_slot` 后，AIV0+AIV2 同-line 路径仍复现 mismatch，单 AIV
+  同址为 `0/2000`。`comm_slot` 不是物理组号。
+- 2026-07-13：新增 AscendC/CCEC `st_dev_separate_line_stress` 四模式独立压力。两个 AIV 始终写不同
+  64B line；line0/1 布局高频复现，line1/2 布局低频复现，证明旧 `0/4000` 分-line 样本不能作为
+  “不同 cacheline 必然安全”的证据。
+- 2026-07-13：新增 DCCI selector 五模式与 AtomicExch 同/分-line 八模式；两种前端结果一致，
+  同-line 的 ALL/OUT/ATOMIC 三项按正确性门禁返回非零，另外五项 control 全部通过。
+- 2026-07-13：新增 `ATOMIC_USAGE_GUIDE.md`，汇总 DCCI、无参 DCI、bypass load/store、atomic、
+  DSB 的本机 API 边界、实测状态和 64B cacheline 隔离规则。
 - 原始环境与定量结果记录在 `tests/ATOMIC_MINIBENCH_ONBOARD_LOG.md` 的 2026-07-11 与 2026-07-13 小节。
 
 ## 权威覆盖矩阵
 
 `ascendc/cacheline_matrix.asc` 与 `ccec/cacheline_matrix.cpp` 使用相同数据布局和相同值生成公式。
 
-| Mode | 宽度 | 布局 | 参与者 | Oracle |
+| Mode | 宽度 | 布局 | 参与者 | 精确判定标准 |
 |---:|---:|---|---|---|
 | 0 | 1B | 同一 cache line、不同 slot | 2/4 blocks | 每个 slot 等于最后一轮精确值 |
 | 1 | 2B | 同一 cache line、不同 slot | 2/4 blocks | 同上 |
@@ -65,24 +78,160 @@ DataSyncBarrier<MemDsbT::ALL>()
 当前核此前的相应 memory access，不是跨核 rendezvous，也不提供 cache coherence；跨 AIV 会合另由
 `SyncAll<true>()`/FFTS flag 14 完成。
 
+## DCCI 参数的本机定义边界
+
+本机 CANN 9.1 `cce_aicore_intrinsics.h` 对第二参数有直接注释：
+
+- `SINGLE_CACHE_LINE=0`：处理地址对应的单个 data-cache cacheline entry；
+- `ENTIRE_DATA_CACHE=1`：处理整个 data cache，此时本机 C API 的封装传空地址。
+
+第三参数类型为 `dcci_dst_t` / `DcciDst`，A5 可用编码为 `CACHELINE_ALL=0`、
+`CACHELINE_OUT=2`、`CACHELINE_ATOMIC=3`。两参数调用在 A5 SIMT intrinsic 中的默认第三参数是 0，
+即与 `CACHELINE_ALL` 同编码。AscendC 公共接口对三种 selector 都统一命名为
+`DataCacheCleanAndInvalid`，因此不能把 OUT、ATOMIC 解释为 clean-only / invalidate-only 动作开关。
+
+本机代码没有进一步公开 OUT/ATOMIC 的硬件 entry 分类规则，也不能仅凭名称证明
+`ALL == OUT ∪ ATOMIC`。CANN 业务中 OUT 同时用于普通 GM 读取前和 scalar 写入后；ATOMIC 仅找到
+一处在普通 `GlobalTensor::SetValue` 后的调用。这些只能说明实际使用方式，三种编码在本机 A5
+当前场景中的行为由以下两组精确用例确定。
+
+A5 C API 另外声明了无参 `asc_dci()`，底层调用 `dci()`/`__builtin_cce_dci`。本机头文件没有给出
+它的作用域和同步语义，当前也没有精确上板用例，因此只能确认该 primitive 存在，不能把它解释为
+“按指定地址失效单条 64B line”，也不能用它替代以下 DCCI 所有权协议。
+
+## clean reader 的 DCCI selector 对照
+
+`ascendc/mb8_dcci_seam.asc` 与 `ccec/dcci_seam.cpp` 固定启动两个 AIV，验证读核从未写过
+目标 64B line 时，两参数 DEFAULT、显式 ALL/OUT/ATOMIC 与 no-DCCI 的行为。data、ready、done、writer marker
+和 reader result 各自独占 cache line；ready/done 使用单调 atomic phase 严格串行以下时序：
+
+1. 读核用普通 scalar load 预读旧 data，使本核持有 clean cache line，DSB 后 atomic 发布 ready；
+2. 写核看到 ready 后用 bypass store 更新整条 data，DSB 后 atomic 发布 done；
+3. 读核看到 done 后执行对应 DCCI 和 DSB，再用普通 load 观察本核 cache，用 bypass load 观察 GM；
+4. 下一轮 ready 只能在本轮检查结束后发布，因此两个核对 data line 没有并发访问。
+
+no-DCCI mode 只用于证明普通 load 确实持有 stale clean line，不是一种 DCCI 方案。每轮普通读取
+只能精确等于“写核本轮新 line”或“本轮 DCCI 前实际预读的完整 line”，拒绝任意历史轮次、torn
+或其他值。精确判定标准如下：
+
+| Mode | 精确判定标准 |
+|---|---|
+| 两参数 DEFAULT | 100 轮普通/bypass 读取均为写核本轮新 line；GM、phase、marker 全精确 |
+| 显式 CACHELINE_ALL | 与 DEFAULT 完全相同，用于核对默认编码路径 |
+| CACHELINE_OUT | 100 轮普通/bypass 均为本轮完整新 line；`gm_bad=0`；最终 16-word line 等于最后一轮值 |
+| CACHELINE_ATOMIC | 100 轮普通/bypass 均为本轮完整新 line；`gm_bad=0`；最终 16-word line 等于最后一轮值 |
+| NO DCCI control | 100 轮普通读取均等于本轮实际预读旧 line；bypass 均为写核本轮新 line |
+
+device 0 直接上板结果：AscendC 与 CCEC 完全一致，DEFAULT、ALL、OUT、ATOMIC 均为
+`100 fresh / 0 stale / 0 other / 0 gm_bad`，no-DCCI 为
+`0 fresh / 100 stale / 0 other / 0 gm_bad`；phase、marker、轮数全部精确。ATOMIC 又在两端各用独立
+进程重复 5 次，结果不变。no-DCCI 排除了“目标 line 在 DCCI 前自然失驻”的解释。
+
+该结果直接证明：在本机 A5 的 `SINGLE_CACHE_LINE`、ordinary clean scalar cache entry 上，三个显式
+selector 执行后，后续普通 load 都取得了 GM 新值；clean line 上的 clean 动作本身不可由该组观测。
+结合下一组 dirty-line 结果，可确认三者也都会发布该场景的 ordinary dirty line。仍不能证明三种
+selector 对所有 entry 类别都等价，也不能证明第三参数在其他 scope、地址属性或芯片上会被忽略。
+
+## dirty line、AtomicExch 与 DCCI 的同/分 line 对照
+
+`ascendc/dcci_atomic_clobber.asc` 与 `ccec/dcci_atomic_clobber.cpp` 固定启动两个 AIV，并把时序写死：
+
+1. 核0普通预读整条 data，再 scalar store 邻接 word，使本核持有包含 atomic 目标旧值的 dirty line；
+2. 核0 DSB 后通过独立 ready line 交权；核1 `AtomicExch` 目标 word，DSB 后通过独立 done line 交回；
+3. 核0看到 done 后先 DSB，再执行 ALL/OUT/ATOMIC DCCI 或 no-DCCI，随后 DSB 并用 bypass load
+   逐字保存 data 与独立 atomic line；
+4. 每个 mode 独立进程执行，完整检查两条 16-word line、AtomicExch 返回旧值、phase 与两核 marker。
+
+因此该用例没有“两个核同时操作被测 data line”的调度竞态。device 0 上 AscendC 与 CCEC 的八个
+mode 逐项一致：
+
+| DCCI | atomic 与 dirty data 同 64B line | atomic 与 dirty data 分 64B line |
+|---|---|---|
+| CACHELINE_ALL | dirty line 被发布；AtomicExch 新值被旧快照覆盖 | dirty data 被发布；AtomicExch 新值保留 |
+| CACHELINE_OUT | dirty line 被发布；AtomicExch 新值被旧快照覆盖 | dirty data 被发布；AtomicExch 新值保留 |
+| CACHELINE_ATOMIC | dirty line 被发布；AtomicExch 新值被旧快照覆盖 | dirty data 被发布；AtomicExch 新值保留 |
+| NO DCCI | dirty scalar 值未发布；AtomicExch 新值保留 | dirty scalar 值未发布；AtomicExch 新值保留 |
+
+上表记录实际状态，不把问题存在本身当作成功条件。同-line 的三个 selector mode 使用正确性门禁：
+AtomicExch 新值必须保留；device 0 当前均因新值被覆盖而返回非零。分-line 与 no-DCCI 五个 mode
+全部通过，作为精确 control。两个 runner 都会跑完本 probe 的八个 mode 后再汇总失败。
+
+结论限定为：atomic 指令本身已经成功完成，仍不能阻止另一个核随后把同一 64B line 的 stale dirty
+快照通过 DCCI 写回。因此工程与测试都要求 atomic 控制量和 DCCI 数据位于不同 64B line；否则
+stale dirty line 的后续 clean 仍可能覆盖
+已经成功完成的 atomic 更新。多个纯 atomic 控制字能否共 line 不由本用例外推。
+
 ## 同 line `st_dev` 最简对照
 
-`ascendc/st_dev_same_line.asc` 与 `ccec/st_dev_same_line.cpp` 固定启动两个 AIV，每个 AIV 只写自己的
-4B slot，使用相同值公式和三组路径：
+`ascendc/st_dev_same_line.asc` 固定启动两个 AIV；`ccec/st_dev_same_line.cpp` 的 mode 0 保留同构双 AIV
+路径。每个活跃 AIV 只写自己的 4B slot，使用相同值公式和三组路径：
 
-| 路径 | 类型 | Oracle |
+| 路径 | 类型 | 精确判定标准 |
 |---|---|---|
 | 不同 slot、同一 64B line、仅 loop-end DSB | regression gating | 4000 次必须全部等于最后一轮值；任一 mismatch 都使测试失败 |
-| 每个 AIV 独占 64B line、仅 loop-end DSB | gating control | 4000 次全部等于最后一轮值 |
+| 每个 AIV 独占 64B line、仅 loop-end DSB | 低压力正确性门禁 | 4000 次全部等于最后一轮值；失败同样暴露问题 |
 | 不同 slot、同一 64B line、逐轮 DSB | gating control | 4000 次全部等于最后一轮值 |
 
-device 0 当前正确性断言实测：CCEC 同-line mismatch `1589/4000`、exit 1，AscendC
-`1792/4000`、exit 1；两个 control 在两条路径均为 `0/4000`。另做的单 AIV 同址隔离 control 为
-`0/2000`，所以当前结论限定为多 AIV 同 cacheline 干扰，不能写成单 AIV 同址 `st_dev` 自身不保序，
-也不推断尚未验证的底层实现机制。
+CCEC 另增加 mode 1/2，并由 runner 在独立 host 进程中分别执行三个 mode。每个 block 使用独占
+64B marker 记录 `get_coreid()`、`get_subblockid()` 和按本机 PTO-ISA A5 `TSYNC_CVID` 公式计算的
+`comm_slot`。该值只是软件 CV 通信配对编号，不能解释为硬件物理组。三 AIV mode 中 AIV1 不访问
+任何被测数据，只写自己的参与计数和独占 marker，并按相同顺序参加每次 `SyncAll`：
 
-本用例的目标是让该问题以正确性失败显式暴露。问题路径必须保留 loop-end DSB，不能通过改成逐轮
-DSB、拆到不同 cache line，或把 `mismatch > 0` 写成成功条件来让测试通过；后两种安全路径只作为对照。
+| CCEC mode | 启动与活跃者 | 本轮每次 launch 的记录 | 同-line loop-end DSB | 旧分-line 低压路径 | 同-line 逐轮 DSB |
+|---:|---|---|---:|---:|---:|
+| 0 | 启动 2；block0+block1 活跃 | block0 `(core18,sub0,comm0)`；block1 `(core72,sub0,comm18)` | 1679/4000 mismatch | 0/4000 | 0/4000 |
+| 1 | 启动 3；block0+block2 活跃，block1 data-idle | block0 `(18,0,0)`；block1 `(19,0,0)`；block2 `(72,0,18)` | 1736/4000 mismatch | 0/4000 | 0/4000 |
+| 2 | 只启动 block0 | block0 `(18,0,0)` | 同址 0/2000 | 不适用 | 同址逐写 DSB 0/2000 |
+
+表中数字来自当时 device 0 带首错诊断的 20-launch 复跑；mode 0/1 因同-line 正确性门禁分别 exit 1，
+mode 2 exit 0。AscendC 原双 AIV 路径为同-line `1792/4000`、两个旧对照均 `0/4000`、exit 1。正式
+单 AIV 同址路径没有复现，因此不能写成单 AIV 同址 `st_dev` 自身不保序。
+
+原双 AIV/AscendC 与 CCEC mode 0 的旧分-line 路径位于 allocation 内部 line1/line2；CCEC mode 1
+的 block0+block2 路径位于 line5/line6。它们都只有 4000 次检查，并嵌在同-line 与逐轮 DSB 路径
+之中。在加入首错记录前，CCEC mode 0/1 曾各出现 `1/4000`；随后一轮为 0，而当前同版本 mode 0
+复跑又得到 `3/4000`。因此这些 `0/4000` 只能作为历史低压力样本，不能继续支持“问题只限同一
+cacheline”或“分-line 必然安全”。分-line 的当前主证据见下一节独立压力用例。
+
+本用例的目标是让同-line 问题以正确性失败显式暴露。问题路径必须保留 loop-end DSB，不能通过改成
+逐轮 DSB、替换成分-line 布局，或把 `mismatch > 0` 写成成功条件来让测试通过。逐轮 DSB 只保留为
+同-line 对照；分-line 本身由下一节独立压测，不能再当作规避问题的安全修改。
+
+## 分 line `st_dev` 独立压力
+
+`ascendc/st_dev_separate_line_stress.asc` 与 `ccec/st_dev_separate_line_stress.cpp` 不包含任何同-line
+数据路径。每个 mode 由独立 host 进程执行 500 launch；每个 launch 有 100 trial，每个活跃 AIV 对
+自己的 4B 地址连续执行 257 次 bypass store，只在循环末执行一次 DSB。两个目标地址始终分属不同
+64B line，block0 在 `SyncAll` 后用 bypass load 检查各自最后一次写入值，总计 100,000 次终值检查。
+
+四个 mode 同时区分活跃 block 映射和 allocation 内部 line offset：
+
+| Mode | 活跃 block | 被测 data line | CCEC mismatch | AscendC mismatch |
+|---:|---|---|---:|---:|
+| 0 | block0 + block1 | line0 / line1 | 41484/100000 | 42165/100000 |
+| 1 | block0 + block2；block1 data-idle | line0 / line1 | 39974/100000 | 37320/100000 |
+| 2 | block0 + block1 | line1 / line2 | 0/100000 | 46/100000 |
+| 3 | block0 + block2；block1 data-idle | line1 / line2 | 10/100000 | 5/100000 |
+
+两端本轮 allocation 首地址均满足 `mod128=0`、`mod256=0`、`mod512=0`。mode 0/2 记录 block0
+`(core18,sub0,comm_slot0)`、block1 `(core72,sub0,comm_slot18)`；mode 1/3 另记录 data-idle block1
+`(core19,sub0,comm_slot0)`，第二个活跃者 block2 为 `(core72,sub0,comm_slot18)`。所有 protocol、
+participation、marker、guard 和 `comm_slot` 公式检查均为 0 failure；data-idle block1 不访问两条
+被测 data line。
+
+当前证据足以否定“两个 AIV 写不同 cacheline 就必然安全”：line0/line1 在两种前端均高频复现，
+line1/line2 也在三组运行中低频复现。CCEC mode 2 的单次 `0/100000` 不能被解释为安全保证。
+allocation 内部 line offset 与本轮失败频率呈显著相关，但测试没有证明 cache bank、set、store
+队列或其他底层机制，不能据此指定根因；CCEC 与 AscendC 的具体失败 slot 也不一致，不能扩大为某个
+固定 writer 必然失败。该结论只覆盖多个 AIV、repeated bypass store、loop-end DSB 和随后跨 AIV
+会合的当前场景，不外推为单 AIV 同址 store 乱序。
+
+旧双 AIV/AscendC 与 CCEC mode 0 路径使用本轮低频的 line1/line2 布局，且只有 4000 次检查；CCEC
+mode 1 另用 line5/line6，同样只有 4000 次。旧路径还与同-line、逐轮 DSB 路径共处一个 kernel
+时序。独立用例只保留分-line 数据路径，并把样本提高到 100,000 次；旧 CCEC mode 0 随后也复现了
+`3/4000`。这些数据足以解释为什么 4000 次旧样本经常为 0，也证明新用例没有引入同-line 数据交互；
+line5/line6 尚未由新独立用例同压复测，且两者完整指令序列并非逐条相同，不能把频率差异进一步
+归因到某个底层机制。
 
 ## 同 line `AtomicExch` 对照
 
@@ -93,7 +242,7 @@ DSB、拆到不同 cache line，或把 `mismatch > 0` 写成成功条件来让�
 
 device 0 实测：CCEC 与 AscendC 的同-line loop-end DSB、分-line loop-end DSB、同-line 逐轮 DSB
 均为 `0/4000` mismatch，参与计数与 marker 精确，两个用例均 exit 0。当前证据说明同构压力下
-AtomicExch 没有复现 st_dev 的末值回退。该 oracle 只检查每个 trial 的最终值，不证明中间 AtomicExch
+AtomicExch 没有复现 st_dev 的末值回退。该判定只检查每个 trial 的最终值，不证明中间 AtomicExch
 绝无重排；本用例仍是两个核写同一 cacheline 的不同 4B slot，不覆盖两个核写同一个 4B 地址，也不能
 外推到其他 atomic 类型或其他内存序场景。
 
@@ -107,25 +256,29 @@ AtomicExch 没有复现 st_dev 的末值回退。该 oracle 只检查每个 tria
 | `ascendc/bypass_dcache_probe.asc` / `ccec/bypass_dcache_ccec.cpp` | gating | 1/2/4/8B ld_dev 共 120 次精确读取、st_dev/atomic、publish/observe |
 | `ascendc/concurrent_cacheline.asc` | gating + observation | 多 block st_dev、producer/consumer、持续读；store+dcci race 单列观察 |
 | `ascendc/cacheline_stress.asc` / `ccec/concurrent_stress.cpp` | observation + control | tight-loop dcci hazard；CCEC st_dev control 精确终值 |
-| `ascendc/st_dev_same_line.asc` / `ccec/st_dev_same_line.cpp` | regression gating + control | 两 AIV 同 line 使用精确终值断言，当前问题以非零退出码暴露；分 line 与逐轮 DSB 为精确 control |
+| `ascendc/st_dev_same_line.asc` / `ccec/st_dev_same_line.cpp` | regression gating + comparison | 多 AIV 同 line 使用精确终值断言；CCEC 另覆盖 block0+block2、raw core/subblock/`comm_slot` 与正式单 AIV 同址；原分-line 路径仅为低压力历史对照 |
+| `ascendc/st_dev_separate_line_stress.asc` / `ccec/st_dev_separate_line_stress.cpp` | regression gating | 只含分-line 数据路径；四模式覆盖两组活跃 block 与两种 allocation 内 line offset，100000 次精确终值检查 |
 | `ascendc/atomic_exch_same_line.asc` / `ccec/atomic_exch_same_line.cpp` | gating + control | 与 st_dev 同构的 AtomicExch 末值顺序对照；三组路径均精确通过 |
-| `ascendc/dcci_atomic_stress.asc` | gating + observation | dcci type 调查、10K st_dev、ld_dev snapshot、atomic 并发 |
+| `ascendc/dcci_atomic_stress.asc` | legacy observation | 旧的混合 stress；不再作为 DCCI selector 语义证据 |
 | `ccec/dcci_clean_clobber.cpp` | gating | 有序 dirty/clean line 的 dcci clobber 与 control |
 | `ascendc/mb2_flags_clobber.asc` | gating + observation | AtomicMax flags 无丢失；store+dcci 仅统计 |
-| `ascendc/mb8_dcci_seam.asc` / `ccec/dcci_seam.cpp` | gating | 数据、flag round count、error count 全精确 |
+| `ascendc/mb8_dcci_seam.asc` / `ccec/dcci_seam.cpp` | gating | clean reader 的 DEFAULT/ALL/OUT/ATOMIC/no-DCCI 五模式精确对照 |
+| `ascendc/dcci_atomic_clobber.asc` / `ccec/dcci_atomic_clobber.cpp` | regression gating + control | 同-line 三 selector 当前明确失败；分-line 与 no-DCCI 五模式精确通过 |
 | `cpu/cpu_atomicity.cpp` | gating + observation | coherent CPU 同/异 cacheline 同构 control、atomic、snapshot、spinlock |
 
-## Oracle 与退出码规则
+## 判定标准与退出码规则
 
 1. **确定性安全契约必须 gating**：目标值、邻居值、参与核数、执行 marker 全部精确匹配；任一失败返回非零。
-2. **风险场景若有严格 phase ordering，可 gating**：例如 dirty line 在 st_dev 后执行 dcci，预期覆盖值可精确断言。
+2. **风险状态若有严格 phase ordering，可以精确分类和记录**；PASS/FAIL 仍由该用例的安全契约决定。
+   例如 dirty line 在 atomic 更新后执行 DCCI，可以精确识别旧快照覆盖，但要求 atomic 新值保留的
+   regression mode 仍必须判失败。
 3. **一般无 ordering 竞态只 observational**：输出 survived/clobbered 分布，不硬编码某次调度结果。
    但 `st_dev_same_line` 验证的是各核独占 slot 的正确性契约，不是把已知错误当成功条件的
    characterization；它要求 mismatch 为 0，同时打印实际 mismatch 数量用于复现与诊断。
 4. ACL、编译、link、timeout、kernel sync 或 semantic assertion 失败均向 runner 传播非零退出码。
 5. 结果槽用 bypass store 发布，并在 host 消费前显式完成；CCEC 不依赖 scalar 自动 dcci。
 
-原 stress oracle 已从 `actual >= base` 改为 `actual == base + last_round`。byte-width 探针同时检查原子或
+原 stress 判定条件已从 `actual >= base` 改为 `actual == base + last_round`。byte-width 探针同时检查原子或
 st_dev 的目标字节确实改变，防止 no-op kernel 因“邻居没坏”而假通过。
 
 ## CCEC 编译约束
@@ -144,8 +297,9 @@ cce-aicore-dcci-before-kernel-end = 1 (default: 1)
 -mllvm -cce-aicore-dcci-before-kernel-end=false
 ```
 
-普通 scalar store + 显式 dcci 只保留在专门制造 cache-line hazard 的 mode；安全数据路径与结果发布使用
-`st_dev`。这两个选项关闭的是编译器插入，不改变显式 dcci。
+普通 scalar store + 显式 dcci 只保留在专门制造 cache-line hazard 的 mode；需要绕过 DCache 的路径
+与结果发布使用 `st_dev`。`st_dev` 本身不提供跨核终值正确性保证，repeated/multi-AIV 路径仍需单独
+设置 DSB、同步和精确判定。这两个选项关闭的是编译器插入，不改变显式 dcci。
 
 ## 执行入口
 
@@ -194,12 +348,14 @@ device 与 timeout。保存原始证据时直接对上面的 `task-submit` 命�
 
 - AscendC 与 CCEC 的 AIV-only 参与计数和 marker 均符合预期；
 - 1/2/4/8B × same/separate-line 全部精确通过；
-- 同-line regression gating 与 separate-line、逐轮 DSB control 明确分离；
-- safe path、ordered hazard、unordered observation 三类不混淆；
+- 同-line regression、dedicated repeated-`st_dev` separate-line 压力与逐轮 DSB control 明确分离；
+- 已通过路径、正确性失败路径和无序观察项三类不混淆；
 - CPU control 无 C++ data race，并验证同 line 不影响正确性；
 - 全量 runner 不漏文件、不吞错误；
 - 新提交对应的 A5 原始日志与环境元数据可追溯。
 
-当前工作区尚未通过上述充分性判定：AscendC/CCEC 的同-line regression gating 均在 device 0
-稳定复现 mismatch 并返回非零；这正是该测试当前要暴露的问题。其余已执行的精确 control、矩阵与
-CPU control 通过。结论只覆盖本文件 goal；AIC/MIX 比例和未测试的数据宽度/拓扑不能由此外推。
+当前工作区尚未通过上述充分性判定：AscendC/CCEC 的同-line regression，以及 dedicated
+separate-line repeated-`st_dev` 的多个 mode，均在 device 0 复现 mismatch 并按正确性契约返回
+非零；这正是测试要暴露的问题。AtomicExch、逐轮 DSB、DCCI 特定分-line/no-DCCI 模式、既有矩阵与
+CPU control 的已执行结果仍按各自场景记录，不能拿来覆盖 repeated-`st_dev` 的失败。结论只覆盖本
+文件 goal；AIC/MIX 比例和未测试的数据宽度/拓扑不能由此外推。

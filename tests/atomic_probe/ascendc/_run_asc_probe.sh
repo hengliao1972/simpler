@@ -84,7 +84,29 @@ compile_and_run() {
     echo "--- $display_name ---"
     if bisheng -xasc "$asc" --npu-arch=dav-3510 "$@" -o "$out_bin" 2>&1; then
         echo "  compiled -> $out_bin"
-        if timeout "$RUN_TIMEOUT" "$out_bin"; then
+        if [ "$display_name" = "mb8_dcci_seam" ] || \
+           [ "$display_name" = "dcci_atomic_clobber" ] || \
+           [ "$display_name" = "st_dev_separate_line_stress" ]; then
+            if [ -n "${ATOMIC_PROBE_MODE:-}" ]; then
+                probe_modes=("$ATOMIC_PROBE_MODE")
+            elif [ "$display_name" = "dcci_atomic_clobber" ]; then
+                probe_modes=(0 1 2 3 4 5 6 7)
+            elif [ "$display_name" = "st_dev_separate_line_stress" ]; then
+                probe_modes=(0 1 2 3)
+            else
+                probe_modes=(0 1 2 3 4)
+            fi
+            for probe_mode in "${probe_modes[@]}"; do
+                echo "  running mode=$probe_mode"
+                if ATOMIC_PROBE_MODE="$probe_mode" timeout "$RUN_TIMEOUT" "$out_bin"; then
+                    echo "  mode=$probe_mode PASS"
+                else
+                    status=$?
+                    echo "  mode=$probe_mode RUN FAILED (exit $status)" >&2
+                    failures=$((failures + 1))
+                fi
+            done
+        elif timeout "$RUN_TIMEOUT" "$out_bin"; then
             echo "  PASS"
         else
             status=$?
@@ -106,6 +128,11 @@ for asc in "${ASC_FILES[@]}"; do
             compile_and_run "$asc" "${name}[AIC+AIV optional]" "$BUILD_DIR/${name}_mix_out" \
                 -DPROBE_CORE_VARIANT=2 -D__MIX_CORE_AIC_RATION__=1
         fi
+    elif [ "$name" = "mb8_dcci_seam" ] || [ "$name" = "dcci_atomic_clobber" ] || \
+         [ "$name" = "st_dev_separate_line_stress" ]; then
+        compile_and_run "$asc" "$name" "$BUILD_DIR/${name}_out" \
+            -mllvm -cce-aicore-dcci-insert-for-scalar=false \
+            -mllvm -cce-aicore-dcci-before-kernel-end=false
     else
         compile_and_run "$asc" "$name" "$BUILD_DIR/${name}_out"
     fi

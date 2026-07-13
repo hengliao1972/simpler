@@ -83,8 +83,8 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(concurrent_stress)(
                 st_dev_b32(&gx[1], 0xDEAD0000u + r);
                 st_dev_b32(&gx[2], 0xDEAD0000u + r);
                 st_dev_b32(&gx[3], 0xDEAD0000u + r);
-                // This final-round oracle requires round N to complete before
-                // round N+1; serialize only this repeated-address test loop.
+                // 精确判定要求最终值来自最后一轮，因此这里只串行化该同址重复写循环，
+                // 保证第 N 轮完成后才进入第 N+1 轮。
                 dsb(DSB_ALL);
             }
         } else if (bid == 1) {

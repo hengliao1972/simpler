@@ -8,13 +8,13 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-// AtomicExch counterpart of st_dev_same_line.cpp. Two AIVs repeatedly write:
-//   1. different 4B slots in the same 64B cache line, one DSB after the loop;
-//   2. one cache line per AIV, one DSB after the loop;
-//   3. different slots in one line, one DSB after every round.
+// st_dev_same_line.cpp 的 AtomicExch 同构对照。两个 AIV 反复写：
+//   1. 同一 64B cache line 内不同 4B slot，只在循环末执行一次 DSB；
+//   2. 每个 AIV 独占一条 cache line，只在循环末执行一次 DSB；
+//   3. 同一 line 内不同 slot，每轮后均执行 DSB。
 //
-// AtomicExch preserves arbitrary round values in the final-value oracle;
-// AtomicMax or AtomicAdd would make that oracle insensitive to write order.
+// 精确判定要求终值等于最后一轮任意生成值，因此使用 AtomicExch；AtomicMax 或
+// AtomicAdd 的终值会由运算性质决定，无法同样敏感地检查最后一轮值。
 #include "ccec_utils.h"
 
 CCEC_PROBE_KERNEL_META(atomic_exch_same_line);
