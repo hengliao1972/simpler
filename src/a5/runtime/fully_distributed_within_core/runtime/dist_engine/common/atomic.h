@@ -17,73 +17,71 @@
 
 namespace {
 
-template <typename T>
-PTO_DEVICE_FUNC inline T atom_load(const volatile T &p, int mo) {
-    return __atomic_load_n(&p, mo);
-}
-template <typename T>
-PTO_DEVICE_FUNC inline T atom_load(const T &p, int mo) {
-    return __atomic_load_n(&p, mo);
-}
-template <typename T, typename V>
-PTO_DEVICE_FUNC inline void atom_store(volatile T &p, V v, int mo) {
-    __atomic_store_n(&p, static_cast<T>(v), mo);
-}
-template <typename T, typename V>
-PTO_DEVICE_FUNC inline void atom_store(T &p, V v, int mo) {
-    __atomic_store_n(&p, static_cast<T>(v), mo);
-}
-template <typename T>
-PTO_DEVICE_FUNC inline bool atom_cas_weak(volatile T &p, T &expected, T desired, int s_mo, int f_mo) {
-    return __atomic_compare_exchange_n(&p, &expected, desired, /*weak=*/true, s_mo, f_mo);
-}
-template <typename T>
-PTO_DEVICE_FUNC inline bool atom_cas_strong(volatile T &p, T &expected, T desired, int s_mo, int f_mo) {
-    return __atomic_compare_exchange_n(&p, &expected, desired, /*weak=*/false, s_mo, f_mo);
-}
-template <typename T>
-PTO_DEVICE_FUNC inline T atom_fetch_add(volatile T &p, T d, int mo) {
-    return __atomic_fetch_add(&p, d, mo);
-}
-template <typename T>
-PTO_DEVICE_FUNC inline T atom_fetch_sub(volatile T &p, T d, int mo) {
-    return __atomic_fetch_sub(&p, d, mo);
-}
-PTO_DEVICE_FUNC inline void atom_thread_fence(int mo) { __atomic_thread_fence(mo); }
-
+PTO_DEVICE_FUNC inline void store_barrier() {
 #if defined(__CCE_AICORE__)
-template <typename T>
-PTO_DEVICE_FUNC inline T atom_load(__gm__ const volatile T &p, int mo) {
-    return __atomic_load_n(&p, mo);
-}
-template <typename T>
-PTO_DEVICE_FUNC inline T atom_load(__gm__ const T &p, int mo) {
-    return __atomic_load_n(&p, mo);
-}
-template <typename T, typename V>
-PTO_DEVICE_FUNC inline void atom_store(__gm__ volatile T &p, V v, int mo) {
-    __atomic_store_n(&p, static_cast<T>(v), mo);
-}
-template <typename T, typename V>
-PTO_DEVICE_FUNC inline void atom_store(__gm__ T &p, V v, int mo) {
-    __atomic_store_n(&p, static_cast<T>(v), mo);
-}
-template <typename T>
-PTO_DEVICE_FUNC inline bool atom_cas_weak(__gm__ volatile T &p, T &expected, T desired, int s_mo, int f_mo) {
-    return __atomic_compare_exchange_n(&p, &expected, desired, /*weak=*/true, s_mo, f_mo);
-}
-template <typename T>
-PTO_DEVICE_FUNC inline bool atom_cas_strong(__gm__ volatile T &p, T &expected, T desired, int s_mo, int f_mo) {
-    return __atomic_compare_exchange_n(&p, &expected, desired, /*weak=*/false, s_mo, f_mo);
-}
-template <typename T>
-PTO_DEVICE_FUNC inline T atom_fetch_add(__gm__ volatile T &p, T d, int mo) {
-    return __atomic_fetch_add(&p, d, mo);
-}
-template <typename T>
-PTO_DEVICE_FUNC inline T atom_fetch_sub(__gm__ volatile T &p, T d, int mo) {
-    return __atomic_fetch_sub(&p, d, mo);
-}
+    OUT_OF_ORDER_STORE_BARRIER();
+#else
+    __atomic_thread_fence(__ATOMIC_RELEASE);
 #endif
+}
+
+template <typename T>
+PTO_DEVICE_FUNC inline T atomic_load(__gm__ volatile T &value, int memorder = __ATOMIC_ACQUIRE) {
+#if defined(__CCE_AICORE__)
+    (void)memorder;
+    __gm__ T *addr = const_cast<__gm__ T *>(&value);
+    return atomicAdd(addr, static_cast<T>(0));
+#else
+    return __atomic_load_n(&value, memorder);
+#endif
+}
+
+template <typename T, typename V>
+PTO_DEVICE_FUNC inline T atomic_exchange(__gm__ volatile T &value, V desired, int memorder = __ATOMIC_ACQ_REL) {
+#if defined(__CCE_AICORE__)
+    (void)memorder;
+    __gm__ T *addr = const_cast<__gm__ T *>(&value);
+    return atomicExch(addr, static_cast<T>(desired));
+#else
+    return __atomic_exchange_n(&value, static_cast<T>(desired), memorder);
+#endif
+}
+
+template <typename T>
+PTO_DEVICE_FUNC inline T atomic_fetch_add(__gm__ volatile T &value, T delta, int memorder = __ATOMIC_ACQ_REL) {
+#if defined(__CCE_AICORE__)
+    (void)memorder;
+    __gm__ T *addr = const_cast<__gm__ T *>(&value);
+    return atomicAdd(addr, delta);
+#else
+    return __atomic_fetch_add(&value, delta, memorder);
+#endif
+}
+
+template <typename T>
+PTO_DEVICE_FUNC inline T atomic_fetch_sub(__gm__ volatile T &value, T delta, int memorder = __ATOMIC_ACQ_REL) {
+#if defined(__CCE_AICORE__)
+    (void)memorder;
+    __gm__ T *addr = const_cast<__gm__ T *>(&value);
+    return atomicSub(addr, delta);
+#else
+    return __atomic_fetch_sub(&value, delta, memorder);
+#endif
+}
+
+template <typename T>
+PTO_DEVICE_FUNC inline T atomic_fetch_max(__gm__ volatile T &value, T desired, int memorder = __ATOMIC_ACQ_REL) {
+#if defined(__CCE_AICORE__)
+    (void)memorder;
+    __gm__ T *addr = const_cast<__gm__ T *>(&value);
+    return atomicMax(addr, desired);
+#else
+    T cur = __atomic_load_n(&value, __ATOMIC_ACQUIRE);
+    while (desired > cur) {
+        if (__atomic_compare_exchange_n(&value, &cur, desired, /*weak=*/true, memorder, __ATOMIC_ACQUIRE)) return cur;
+    }
+    return cur;
+#endif
+}
 
 }  // namespace

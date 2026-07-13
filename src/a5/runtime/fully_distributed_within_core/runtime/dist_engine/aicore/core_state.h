@@ -23,6 +23,7 @@ PTO_DEVICE_FUNC void dist_core_reset(__gm__ DistCore &self, CoreType r, int32_t 
     dist_tensor_map_reset(self.map);
     self.occupied_count = 0;
     self.owned_total = 0;
+    self.swimlane_last_cycle = 0;
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         self.slots[i].occupied = false;
         self.slots[i].built = false;

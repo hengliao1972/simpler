@@ -13,7 +13,7 @@
 
 #include "dist_engine/common/target.h"
 
-// AICore-target primitives shared by the direct submit backend. Onboard CCEC
+// AICore-target primitives shared by the submit runtime. Onboard CCEC
 // needs explicit GM cache maintenance; sim AICore shares process memory and only
 // needs compiler/CPU fences to preserve ordering.
 
@@ -45,15 +45,7 @@ PTO_DEVICE_FUNC inline void dist_aicore_flush_region(__gm__ void *ptr, uint64_t 
 #else
     (void)ptr;
     (void)bytes;
-    atom_thread_fence(__ATOMIC_SEQ_CST);
-#endif
-}
-
-PTO_DEVICE_FUNC inline void dist_aicore_store_barrier() {
-#if defined(__CCE_AICORE__)
-    OUT_OF_ORDER_STORE_BARRIER();
-#else
-    atom_thread_fence(__ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
 #endif
 }
 
