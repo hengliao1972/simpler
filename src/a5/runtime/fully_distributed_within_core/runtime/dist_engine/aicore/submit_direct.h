@@ -112,33 +112,13 @@ PTO_DEVICE_FUNC void direct_wait_slot_capacity(__gm__ DistCore *self, int32_t ta
     }
 }
 
-PTO_DEVICE_FUNC bool direct_fatal_set() {
-#if defined(__CCE_AICORE__)
-    dist_aicore_invalidate_region(const_cast<__gm__ int32_t *>(&g_dist.fatal), sizeof(g_dist.fatal));
-    return g_dist.fatal != 0;
-#else
-    return fatal_set();
-#endif
-}
-
-PTO_DEVICE_FUNC void direct_set_fatal() {
-#if defined(__CCE_AICORE__)
-    g_dist.fatal = 1;
-    dist_aicore_flush_region(const_cast<__gm__ int32_t *>(&g_dist.fatal), sizeof(g_dist.fatal));
-#else
-    set_fatal();
-#endif
-}
-
 PTO_DEVICE_FUNC bool direct_wait_heap_capacity(DistSubmitCtx &ctx, DistSubmitKind kind) {
     if (ctx.self == nullptr || ctx.output_bytes == 0 || g_dist.heap_base == nullptr) return true;
     const size_t ring = g_dist.heap_size;
     bool waited = false;
     TRACE_SPAN_BEGIN(heap_bp_trace);
-    while (!direct_fatal_set()) {
-        __gm__ int64_t *frontier = const_cast<__gm__ int64_t *>(&g_dist.frontier);
-        dist_aicore_invalidate_region(frontier, 64);
-        const int32_t f = static_cast<int32_t>(g_dist.frontier);
+    while (!fatal_set()) {
+        const int32_t f = static_cast<int32_t>(atomic_load(g_dist.frontier));
         const int32_t R = f - g_dist.H;
         const uint64_t vstart_live = load_task_vend(R);
         if (ctx.self->heap_next - vstart_live <= ring) {
@@ -148,7 +128,7 @@ PTO_DEVICE_FUNC bool direct_wait_heap_capacity(DistSubmitCtx &ctx, DistSubmitKin
             return true;
         }
         if (f >= ctx.task_id - 1) {
-            direct_set_fatal();
+            set_fatal();
             if (kind == DistSubmitKind::Alloc) {
                 DIST_ERRF(
                     "[dist_engine] heap ring %zu B too small for H=%d window at alloc %d (live=%llu B)\n", ring,
@@ -193,12 +173,12 @@ PTO_DEVICE_FUNC void publish_joint_deposits(DistSubmitCtx &ctx, const MixedKerne
 #endif
     store_won_remaining(w, ctx.joint_count);
     publish_won_slot(w);
-    publish_block_won_hint(g_dist.blocks[ctx.joint_block]);
+    atomic_exchange(g_dist.blocks[ctx.joint_block].any_pub, 1);
 }
 
 PTO_DEVICE_FUNC int32_t wait_alloc_won_slot(__gm__ DistCore *self, int32_t block) {
     int32_t won_slot = alloc_won_slot(block);
-    while (won_slot < 0 && !direct_fatal_set()) {
+    while (won_slot < 0 && !fatal_set()) {
         drain_block_won(self);
         if (direct_drain_ready_slots(self) == 0) SPIN_WAIT_HINT();
         won_slot = alloc_won_slot(block);
@@ -269,13 +249,11 @@ PTO_DEVICE_FUNC void direct_complete_alloc_submit(DistSubmitCtx &ctx) {
 
 PTO_DEVICE_FUNC void direct_drain_to_completion(__gm__ DistCore *self) {
     if (self == nullptr) return;
-    __gm__ int64_t *replay_done = const_cast<__gm__ int64_t *>(&g_dist.replay_done);
-    publish_replay_done(*replay_done);
+    atomic_fetch_add<int64_t>(g_dist.replay_done, 1);
     while (true) {
         drain_block_won(self);
         const int32_t freed = direct_drain_ready_slots(self);
-        dist_aicore_invalidate_region(replay_done, sizeof(g_dist.replay_done));
-        const bool all_replayed = g_dist.replay_done >= g_dist.num_workers;
+        const bool all_replayed = atomic_load(g_dist.replay_done) >= g_dist.num_workers;
         const bool ring_empty = self->occupied_count == 0;
         const bool pending = has_pending_won(self);
         if (all_replayed && ring_empty && !pending) break;

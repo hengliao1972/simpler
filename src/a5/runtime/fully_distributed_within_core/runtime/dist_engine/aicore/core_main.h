@@ -17,10 +17,10 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
     if (self == nullptr) return;
     trace_reset_core(self);
 
-    if (!direct_fatal_set()) {
-        publish_worker_started();
+    if (!fatal_set()) {
+        atomic_fetch_add<int64_t>(g_dist.started_count, 1);
         uint64_t wd_start = 0;
-        while (load_worker_started_count() < g_dist.num_workers && !direct_fatal_set()) {
+        while (atomic_load(g_dist.started_count) < g_dist.num_workers && !fatal_set()) {
             SPIN_WAIT_HINT();
             watchdog(wd_start);
         }

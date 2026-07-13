@@ -35,145 +35,48 @@ namespace {
 PTO_DEVICE_FUNC void publish_task_flag(int32_t task_id) {
     if (task_id < 0 || task_id >= kFlagCap) return;
     __gm__ DistTaskCell &cell = task_cell(task_id);
-#if defined(__CCE_AICORE__)
-    cell.flag = 1;
-    dist_aicore_flush_region(&cell, sizeof(DistTaskCell));
-#else
-    atom_store(cell.flag, 1, __ATOMIC_RELEASE);
-#endif
+    atomic_exchange(cell.flag, int64_t{1}, __ATOMIC_RELEASE);
 }
 
 PTO_DEVICE_FUNC bool task_flag_ready(int32_t task_id, int memorder) {
     if (task_id < 0 || task_id >= kFlagCap) return false;
     __gm__ DistTaskCell &cell = task_cell(task_id);
-#if defined(__CCE_AICORE__)
-    (void)memorder;
-    dist_aicore_invalidate_region(&cell, sizeof(DistTaskCell));
-    return cell.flag != 0;
-#else
-    return atom_load(cell.flag, memorder) != 0;
-#endif
+    return atomic_load(cell.flag, memorder) != 0;
 }
 
 PTO_DEVICE_FUNC void store_task_vend(int32_t task_id, uint64_t vend) {
     if (task_id < 0 || task_id >= kFlagCap) return;
     __gm__ DistTaskCell &cell = task_cell(task_id);
-#if defined(__CCE_AICORE__)
-    cell.vend = vend;
-    dist_aicore_flush_region(&cell, sizeof(DistTaskCell));
-#else
-    atom_store(cell.vend, vend, __ATOMIC_RELAXED);
-#endif
+    atomic_exchange(cell.vend, vend, __ATOMIC_RELAXED);
 }
 
 PTO_DEVICE_FUNC void store_won_remaining(__gm__ WonSlot &w, int32_t count) {
-#if defined(__CCE_AICORE__)
-    __gm__ int64_t *remaining = const_cast<__gm__ int64_t *>(&w.remaining);
-    atomicExch(remaining, static_cast<int64_t>(count));
-#else
-    atom_store<int64_t>(w.remaining, count, __ATOMIC_RELAXED);
-#endif
-}
-
-PTO_DEVICE_FUNC int64_t exchange_won_state(__gm__ WonSlot &w, int64_t value) {
-#if defined(__CCE_AICORE__)
-    __gm__ int64_t *state = const_cast<__gm__ int64_t *>(&w.state);
-    return atomicExch(state, value);
-#else
-    return __atomic_exchange_n(&w.state, value, __ATOMIC_ACQ_REL);
-#endif
-}
-
-PTO_DEVICE_FUNC int64_t load_won_state(__gm__ WonSlot &w) {
-#if defined(__CCE_AICORE__)
-    __gm__ int64_t *state = const_cast<__gm__ int64_t *>(&w.state);
-    return atomicAdd(state, static_cast<int64_t>(0));
-#else
-    return atom_load(w.state, __ATOMIC_ACQUIRE);
-#endif
-}
-
-PTO_DEVICE_FUNC int64_t exchange_won_drained(__gm__ WonSlot &w, int32_t lane, int64_t value) {
-#if defined(__CCE_AICORE__)
-    __gm__ int64_t *drained = const_cast<__gm__ int64_t *>(&w.drained[lane].v);
-    return atomicExch(drained, value);
-#else
-    return __atomic_exchange_n(&w.drained[lane].v, value, __ATOMIC_ACQ_REL);
-#endif
-}
-
-PTO_DEVICE_FUNC int64_t load_won_drained(__gm__ WonSlot &w, int32_t lane) {
-#if defined(__CCE_AICORE__)
-    __gm__ int64_t *drained = const_cast<__gm__ int64_t *>(&w.drained[lane].v);
-    return atomicAdd(drained, static_cast<int64_t>(0));
-#else
-    return atom_load(w.drained[lane].v, __ATOMIC_ACQUIRE);
-#endif
-}
-
-PTO_DEVICE_FUNC void publish_block_won_hint(__gm__ BlockWon &bw) {
-#if defined(__CCE_AICORE__)
-    __gm__ int32_t *any_pub = const_cast<__gm__ int32_t *>(&bw.any_pub);
-    atomicExch(any_pub, 1);
-#else
-    atom_store(bw.any_pub, 1, __ATOMIC_RELEASE);
-#endif
-}
-
-PTO_DEVICE_FUNC int32_t load_block_won_hint(__gm__ BlockWon &bw) {
-#if defined(__CCE_AICORE__)
-    __gm__ int32_t *any_pub = const_cast<__gm__ int32_t *>(&bw.any_pub);
-    return atomicAdd(any_pub, 0);
-#else
-    return atom_load(bw.any_pub, __ATOMIC_ACQUIRE);
-#endif
+    atomic_exchange(w.remaining, static_cast<int64_t>(count), __ATOMIC_RELAXED);
 }
 
 PTO_DEVICE_FUNC void reset_won_lane(__gm__ WonSlot &w, int32_t lane) {
-    exchange_won_drained(w, lane, kDrainedClaimed);
+    atomic_exchange(w.drained[lane].v, kDrainedClaimed);
     w.lane[lane].present = false;
 }
 
 PTO_DEVICE_FUNC bool claim_won_lane(__gm__ WonSlot &w, int32_t lane) {
-    return exchange_won_drained(w, lane, kDrainedClaimed) == kDrainedFree;
+    return atomic_exchange(w.drained[lane].v, kDrainedClaimed) == kDrainedFree;
 }
 
-PTO_DEVICE_FUNC void publish_won_slot(__gm__ WonSlot &w) { exchange_won_state(w, kWonStatePublished); }
+PTO_DEVICE_FUNC void publish_won_slot(__gm__ WonSlot &w) { atomic_exchange(w.state, kWonStatePublished); }
 
 PTO_DEVICE_FUNC bool decrement_won_remaining_is_last(__gm__ WonSlot &w) {
-#if defined(__CCE_AICORE__)
-    __gm__ int64_t *remaining = const_cast<__gm__ int64_t *>(&w.remaining);
-    return atomicSub(remaining, static_cast<int64_t>(1)) == 1;
-#else
-    return atom_fetch_sub<int64_t>(w.remaining, 1, __ATOMIC_ACQ_REL) == 1;
-#endif
+    return atomic_fetch_sub<int64_t>(w.remaining, 1) == 1;
 }
 
-PTO_DEVICE_FUNC void clear_won_slot_state(__gm__ WonSlot &w) { exchange_won_state(w, kWonStateFree); }
+PTO_DEVICE_FUNC void clear_won_slot_state(__gm__ WonSlot &w) { atomic_exchange(w.state, kWonStateFree); }
 
-PTO_DEVICE_FUNC int64_t load_frontier_for_advance() {
-#if defined(__CCE_AICORE__)
-    __gm__ int64_t *frontier = const_cast<__gm__ int64_t *>(&g_dist.frontier);
-    dist_aicore_invalidate_region(frontier, 64);
-    return g_dist.frontier;
-#else
-    return atom_load(g_dist.frontier, __ATOMIC_ACQUIRE);
-#endif
-}
+PTO_DEVICE_FUNC int64_t load_frontier_for_advance() { return atomic_load(g_dist.frontier); }
 
 PTO_DEVICE_FUNC bool try_advance_frontier_to(int64_t &frontier, int64_t next) {
-#if defined(__CCE_AICORE__)
-    __gm__ int64_t *frontier_addr = const_cast<__gm__ int64_t *>(&g_dist.frontier);
-    const int64_t old = atomicMax(frontier_addr, next);
+    const int64_t old = atomic_fetch_max<int64_t>(g_dist.frontier, next);
     frontier = old > next ? old : next;
     return next > old;
-#else
-    if (atom_cas_weak(g_dist.frontier, frontier, next, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-        frontier = next;
-        return true;
-    }
-    return false;
-#endif
 }
 
 PTO_DEVICE_FUNC void advance_frontier() {
@@ -193,6 +96,7 @@ PTO_DEVICE_FUNC void complete_executed_task(__gm__ DistCore *self, int32_t task_
     if (self != nullptr) {
         store_task_vend(task_id, self->heap_next);
     }
+    store_barrier();
     publish_task_flag(task_id);
     advance_frontier();
 }
@@ -231,7 +135,7 @@ PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] __gm__ DistCore *self, __gm__
         kernel_trace, self, s.task_id, s.func_id, TracePhase::Kernel, static_cast<uint32_t>(s.is_multicore ? 1 : 0), 0
     );
 #endif
-    dist_aicore_store_barrier();
+    store_barrier();
     if (s.is_multicore) {
         __gm__ WonSlot &w = g_dist.blocks[s.won_block].slots[s.won_slot];
         if (decrement_won_remaining_is_last(w)) {
@@ -335,11 +239,11 @@ PTO_DEVICE_FUNC void build_ring_slot(
 PTO_DEVICE_FUNC bool drain_block_won(__gm__ DistCore *self) {
     if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
     __gm__ BlockWon &bw = g_dist.blocks[self->block_id];
-    if (load_block_won_hint(bw) == 0) return false;
+    if (atomic_load(bw.any_pub) == 0) return false;
     bool drained = false;
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         __gm__ WonSlot &w = bw.slots[i];
-        if (load_won_state(w) != kWonStatePublished) continue;
+        if (atomic_load(w.state) != kWonStatePublished) continue;
 #if defined(__CCE_AICORE__)
         dist_aicore_invalidate_region(&w.lane[self->lane], 64);
 #endif
@@ -347,7 +251,7 @@ PTO_DEVICE_FUNC bool drain_block_won(__gm__ DistCore *self) {
         if (!claim_won_lane(w, self->lane)) continue;
         int32_t si = alloc_ring_slot(self);
         if (si < 0) {
-            exchange_won_drained(w, self->lane, kDrainedFree);
+            atomic_exchange(w.drained[self->lane].v, kDrainedFree);
             return drained;
         }
 #if defined(__CCE_AICORE__)
@@ -377,11 +281,15 @@ PTO_DEVICE_FUNC bool drain_block_won(__gm__ DistCore *self) {
 PTO_DEVICE_FUNC bool has_pending_won(__gm__ DistCore *self) {
     if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
     __gm__ BlockWon &bw = g_dist.blocks[self->block_id];
-    if (load_block_won_hint(bw) == 0) return false;
+    if (atomic_load(bw.any_pub) == 0) return false;
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         __gm__ WonSlot &w = bw.slots[i];
-        if (load_won_state(w) != kWonStatePublished) continue;
-        if (load_won_drained(w, self->lane) == kDrainedFree) return true;
+        if (atomic_load(w.state) != kWonStatePublished) continue;
+#if defined(__CCE_AICORE__)
+        dist_aicore_invalidate_region(&w.lane[self->lane], 64);
+#endif
+        if (!w.lane[self->lane].present) continue;
+        if (atomic_load(w.drained[self->lane].v) == kDrainedFree) return true;
     }
     return false;
 }
