@@ -16,7 +16,8 @@ control。结论只能来自精确 oracle 或明确标为 observational 的统�
 - 2026-07-11：经用户授权直接使用 device 0；AIV-only 权威矩阵与 AscendC/CCEC 同-line 最简对照已上板。
 - 2026-07-11：两个 `st_dev_same_line` 用例按正确性契约断言同-line mismatch 必须为 0；当前设备会
   复现 mismatch 并返回非零。其余 control 与完整入口结果见上板记录。
-- 原始环境与定量结果记录在 `tests/ATOMIC_MINIBENCH_ONBOARD_LOG.md` 的 2026-07-11 小节。
+- 2026-07-13：新增 AscendC/CCEC `atomic_exch_same_line` 同构对照；三组路径均为 `0/4000` mismatch。
+- 原始环境与定量结果记录在 `tests/ATOMIC_MINIBENCH_ONBOARD_LOG.md` 的 2026-07-11 与 2026-07-13 小节。
 
 ## 权威覆盖矩阵
 
@@ -83,6 +84,19 @@ device 0 当前正确性断言实测：CCEC 同-line mismatch `1589/4000`、exit
 本用例的目标是让该问题以正确性失败显式暴露。问题路径必须保留 loop-end DSB，不能通过改成逐轮
 DSB、拆到不同 cache line，或把 `mismatch > 0` 写成成功条件来让测试通过；后两种安全路径只作为对照。
 
+## 同 line `AtomicExch` 对照
+
+`ascendc/atomic_exch_same_line.asc` 与 `ccec/atomic_exch_same_line.cpp` 完全复用上述两个 AIV、
+4B slot、20 launch × 100 trial × 257 round、三组布局和同步点，仅把测试数据写替换为
+`AtomicExch<uint32_t>` / `atomicExch`。选择 exchange 是为了保留任意轮次值；`AtomicMax` 与
+`AtomicAdd` 的终值会天然掩盖执行顺序。
+
+device 0 实测：CCEC 与 AscendC 的同-line loop-end DSB、分-line loop-end DSB、同-line 逐轮 DSB
+均为 `0/4000` mismatch，参与计数与 marker 精确，两个用例均 exit 0。当前证据说明同构压力下
+AtomicExch 没有复现 st_dev 的末值回退。该 oracle 只检查每个 trial 的最终值，不证明中间 AtomicExch
+绝无重排；本用例仍是两个核写同一 cacheline 的不同 4B slot，不覆盖两个核写同一个 4B 地址，也不能
+外推到其他 atomic 类型或其他内存序场景。
+
 ## 其余探针
 
 | 文件 | 类型 | 验证内容 |
@@ -94,6 +108,7 @@ DSB、拆到不同 cache line，或把 `mismatch > 0` 写成成功条件来让�
 | `ascendc/concurrent_cacheline.asc` | gating + observation | 多 block st_dev、producer/consumer、持续读；store+dcci race 单列观察 |
 | `ascendc/cacheline_stress.asc` / `ccec/concurrent_stress.cpp` | observation + control | tight-loop dcci hazard；CCEC st_dev control 精确终值 |
 | `ascendc/st_dev_same_line.asc` / `ccec/st_dev_same_line.cpp` | regression gating + control | 两 AIV 同 line 使用精确终值断言，当前问题以非零退出码暴露；分 line 与逐轮 DSB 为精确 control |
+| `ascendc/atomic_exch_same_line.asc` / `ccec/atomic_exch_same_line.cpp` | gating + control | 与 st_dev 同构的 AtomicExch 末值顺序对照；三组路径均精确通过 |
 | `ascendc/dcci_atomic_stress.asc` | gating + observation | dcci type 调查、10K st_dev、ld_dev snapshot、atomic 并发 |
 | `ccec/dcci_clean_clobber.cpp` | gating | 有序 dirty/clean line 的 dcci clobber 与 control |
 | `ascendc/mb2_flags_clobber.asc` | gating + observation | AtomicMax flags 无丢失；store+dcci 仅统计 |

@@ -72,6 +72,7 @@ PROBES=(
     "atomic_blast.cpp:atomic_blast_kernel.o:atomic_blast_host.cpp:atomic_blast_host"
     "dcci_seam.cpp:dcci_seam_kernel.o:dcci_seam_host.cpp:dcci_seam_host"
     "concurrent_stress.cpp:concurrent_stress_kernel.o:concurrent_stress_host.cpp:concurrent_stress_host"
+    "atomic_exch_same_line.cpp:atomic_exch_same_line_kernel.o:st_dev_same_line_host.cpp:atomic_exch_same_line_host"
     "st_dev_same_line.cpp:st_dev_same_line_kernel.o:st_dev_same_line_host.cpp:st_dev_same_line_host"
     "cacheline_matrix.cpp:cacheline_matrix_kernel.o:cacheline_matrix_host.cpp:cacheline_matrix_host"
 )
