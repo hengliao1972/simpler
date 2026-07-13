@@ -37,8 +37,8 @@ inline uint64_t dist_now_ns() {
 }
 #endif
 
-PTO_DEVICE_FUNC inline bool fatal_set() { return atom_load(g_dist.fatal, __ATOMIC_ACQUIRE) != 0; }
-PTO_DEVICE_FUNC inline void set_fatal() { atom_store(g_dist.fatal, 1, __ATOMIC_RELEASE); }
+PTO_DEVICE_FUNC inline bool fatal_set() { return atomic_load(g_dist.fatal) != 0; }
+PTO_DEVICE_FUNC inline void set_fatal() { atomic_exchange(g_dist.fatal, 1); }
 
 PTO_DEVICE_FUNC inline void watchdog([[maybe_unused]] uint64_t &start_ns) {
 #if DIST_SIM_HOST_CLOCK
@@ -70,8 +70,8 @@ PTO_DEVICE_FUNC inline __gm__ DistTaskCell &task_cell(int32_t task_id) {
 
 PTO_DEVICE_FUNC void reset_task_cell(int32_t task_id) {
     __gm__ DistTaskCell &cell = task_cell(task_id);
-    atom_store(cell.flag, 0, __ATOMIC_RELAXED);
-    atom_store(cell.vend, 0, __ATOMIC_RELAXED);
+    atomic_exchange(cell.flag, int64_t{0}, __ATOMIC_RELAXED);
+    atomic_exchange(cell.vend, uint64_t{0}, __ATOMIC_RELAXED);
 }
 
 }  // namespace

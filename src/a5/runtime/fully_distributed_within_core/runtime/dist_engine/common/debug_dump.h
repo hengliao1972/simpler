@@ -20,20 +20,20 @@ void dist_dump_state(int) {
     fprintf(stderr, "\n===== DIST STATE DUMP =====\n");
     fprintf(
         stderr, "frontier=%ld H=%d ring=%zuB replay_done=%ld/%d num_blocks=%d fatal=%d\n",
-        static_cast<long>(atom_load(g_dist.frontier, __ATOMIC_RELAXED)), g_dist.H, g_dist.heap_size,
-        static_cast<long>(atom_load(g_dist.replay_done, __ATOMIC_RELAXED)), g_dist.num_workers, g_dist.num_blocks,
-        atom_load(g_dist.fatal, __ATOMIC_RELAXED)
+        static_cast<long>(atomic_load(g_dist.frontier, __ATOMIC_RELAXED)), g_dist.H, g_dist.heap_size,
+        static_cast<long>(atomic_load(g_dist.replay_done, __ATOMIC_RELAXED)), g_dist.num_workers, g_dist.num_blocks,
+        atomic_load(g_dist.fatal, __ATOMIC_RELAXED)
     );
     fprintf(stderr, "cube_cursor[%d]=", kCursorShards);
     for (int32_t s = 0; s < kCursorShards; s++)
         fprintf(
-            stderr, "%ld%s", static_cast<long>(atom_load(g_dist.cube_cursor[s].v, __ATOMIC_RELAXED)),
+            stderr, "%ld%s", static_cast<long>(atomic_load(g_dist.cube_cursor[s].v, __ATOMIC_RELAXED)),
             s + 1 < kCursorShards ? "," : ""
         );
     fprintf(stderr, " vector_cursor[%d]=", kCursorShards);
     for (int32_t s = 0; s < kCursorShards; s++)
         fprintf(
-            stderr, "%ld%s", static_cast<long>(atom_load(g_dist.vector_cursor[s].v, __ATOMIC_RELAXED)),
+            stderr, "%ld%s", static_cast<long>(atomic_load(g_dist.vector_cursor[s].v, __ATOMIC_RELAXED)),
             s + 1 < kCursorShards ? "," : ""
         );
     fprintf(stderr, "\n");
@@ -49,7 +49,7 @@ void dist_dump_state(int) {
             int32_t unmet = -1;
             for (int32_t f = 0; f < s.fanin_count; f++)
                 if (s.fanin[f] < 0 || s.fanin[f] >= kFlagCap ||
-                    atom_load(task_cell(s.fanin[f]).flag, __ATOMIC_RELAXED) == 0) {
+                    atomic_load(task_cell(s.fanin[f]).flag, __ATOMIC_RELAXED) == 0) {
                     unmet = s.fanin[f];
                     break;
                 }
@@ -62,14 +62,14 @@ void dist_dump_state(int) {
     for (int32_t b = 0; b < g_dist.num_blocks; b++) {
         for (int32_t i = 0; i < kPrivateSlots; i++) {
             WonSlot &w = g_dist.blocks[b].slots[i];
-            int64_t st = atom_load(w.state, __ATOMIC_RELAXED);
+            int64_t st = atomic_load(w.state, __ATOMIC_RELAXED);
             if (st == kWonStateFree) continue;
             fprintf(
                 stderr, "  won blk%d slot%d state=%ld tid=%d remaining=%ld drained=[%ld,%ld,%ld] present=[%d,%d,%d]\n",
-                b, i, st, w.task_id, static_cast<long>(atom_load(w.remaining, __ATOMIC_RELAXED)),
-                static_cast<long>(atom_load(w.drained[0].v, __ATOMIC_RELAXED)),
-                static_cast<long>(atom_load(w.drained[1].v, __ATOMIC_RELAXED)),
-                static_cast<long>(atom_load(w.drained[2].v, __ATOMIC_RELAXED)), w.lane[0].present, w.lane[1].present,
+                b, i, st, w.task_id, static_cast<long>(atomic_load(w.remaining, __ATOMIC_RELAXED)),
+                static_cast<long>(atomic_load(w.drained[0].v, __ATOMIC_RELAXED)),
+                static_cast<long>(atomic_load(w.drained[1].v, __ATOMIC_RELAXED)),
+                static_cast<long>(atomic_load(w.drained[2].v, __ATOMIC_RELAXED)), w.lane[0].present, w.lane[1].present,
                 w.lane[2].present
             );
         }

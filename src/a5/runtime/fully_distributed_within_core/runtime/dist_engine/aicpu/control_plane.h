@@ -39,16 +39,16 @@ void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_
 #endif
 
     for (int32_t s = 0; s < kCursorShards; s++) {
-        atom_store(g_dist.cube_cursor[s].v, -1, __ATOMIC_RELAXED);
-        atom_store(g_dist.vector_cursor[s].v, -1, __ATOMIC_RELAXED);
-        atom_store(g_dist.alloc_cursor[s].v, -1, __ATOMIC_RELAXED);
+        atomic_exchange(g_dist.cube_cursor[s].v, int64_t{-1}, __ATOMIC_RELAXED);
+        atomic_exchange(g_dist.vector_cursor[s].v, int64_t{-1}, __ATOMIC_RELAXED);
+        atomic_exchange(g_dist.alloc_cursor[s].v, int64_t{-1}, __ATOMIC_RELAXED);
     }
-    atom_store(g_dist.frontier, -1, __ATOMIC_RELAXED);
+    atomic_exchange(g_dist.frontier, int64_t{-1}, __ATOMIC_RELAXED);
     for (int32_t i = 0; i < kFlagCap; i++)
         reset_task_cell(i);
-    atom_store(g_dist.fatal, 0, __ATOMIC_RELAXED);
-    atom_store<int64_t>(g_dist.replay_done, 0, __ATOMIC_RELAXED);
-    atom_store<int64_t>(g_dist.started_count, 0, __ATOMIC_RELAXED);
+    atomic_exchange(g_dist.fatal, int32_t{0}, __ATOMIC_RELAXED);
+    atomic_exchange(g_dist.replay_done, int64_t{0}, __ATOMIC_RELAXED);
+    atomic_exchange(g_dist.started_count, int64_t{0}, __ATOMIC_RELAXED);
     g_dist.orch_args = orch_args;
     g_dist.rt = rt;
     g_dist.runtime = runtime;
@@ -75,9 +75,9 @@ void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_
         g_dist.layout[aic_ids[b]] = CoreLayout{b, LANE_AIC};
         if (2 * b < naiv) g_dist.layout[aiv_ids[2 * b]] = CoreLayout{b, LANE_AIV0};
         if (2 * b + 1 < naiv) g_dist.layout[aiv_ids[2 * b + 1]] = CoreLayout{b, LANE_AIV1};
-        atom_store(g_dist.blocks[b].any_pub, 0, __ATOMIC_RELAXED);
+        atomic_exchange(g_dist.blocks[b].any_pub, int32_t{0}, __ATOMIC_RELAXED);
         for (int32_t s = 0; s < kPrivateSlots; s++) {
-            atom_store(g_dist.blocks[b].slots[s].state, 0, __ATOMIC_RELAXED);
+            atomic_exchange(g_dist.blocks[b].slots[s].state, int64_t{0}, __ATOMIC_RELAXED);
         }
     }
 
@@ -106,6 +106,6 @@ void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_
 
     // Publish all of the above before AICPU wakes workers through their
     // per-core handshake flags.
-    atom_thread_fence(__ATOMIC_RELEASE);
+    store_barrier();
     return;
 }
