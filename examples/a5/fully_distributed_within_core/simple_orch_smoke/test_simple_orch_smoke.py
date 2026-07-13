@@ -111,6 +111,19 @@ class TestSimpleOrchSmoke(SceneTestCase):
             "params": {"n": 9, "delta": 29, "mixed": 1},
         },
         {
+            "name": "A5SimBd36MixedWonReuseStress",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 18, "delta": 31, "mixed": 1},
+        },
+        {
+            "name": "A5OnboardBd36MixedWonReuseStress",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 18, "delta": 31, "mixed": 1},
+        },
+        {
             "name": "A5SimBd36DualAivDelta19",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
@@ -135,6 +148,19 @@ class TestSimpleOrchSmoke(SceneTestCase):
             "platforms": ["a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
             "params": {"n": 9, "delta": 23, "mixed": 2},
+        },
+        {
+            "name": "A5SimBd36DualAivWonReuseStress",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 18, "delta": 37, "mixed": 2},
+        },
+        {
+            "name": "A5OnboardBd36DualAivWonReuseStress",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 18, "delta": 37, "mixed": 2},
         },
         {
             "name": "A5SimBd36ManyTasks",

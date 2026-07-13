@@ -372,6 +372,32 @@ class TestSubmitDependencySmoke(SceneTestCase):
             "params": {"n": 263, "mode": 18},
         },
         {
+            "name": "A5SimBd1AicRingReuseStress",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 512, "mode": 28},
+        },
+        {
+            "name": "A5OnboardBd1AicRingReuseStress",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 512, "mode": 28},
+        },
+        {
+            "name": "A5SimBd36FaninRingReuseStress",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 512, "mode": 29},
+        },
+        {
+            "name": "A5OnboardBd36FaninRingReuseStress",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 512, "mode": 29},
+        },
+        {
             "name": "A5SimBd36L0TaskArgsTagPersistence",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
@@ -701,6 +727,18 @@ class TestSubmitDependencySmoke(SceneTestCase):
             args.output[:] = -1.0
             expected = args.input[:sub_n] * 3.0 + 12.0
             args.output[: 6 * sub_n] = expected.repeat(6)
+            return
+        if mode == 28:
+            sub_n = 32
+            args.output[:] = -1.0
+            expected = args.input[:sub_n] * 3.0 + 12.0
+            args.output[: 12 * sub_n] = expected.repeat(12)
+            return
+        if mode == 29:
+            sub_n = 32
+            args.output[:] = -1.0
+            expected = args.input[:sub_n] * 6.0 + 23.0
+            args.output[: 12 * sub_n] = expected.repeat(12)
             return
         if mode == 19:
             args.output[:] = (args.input * 2.0 + 3.0) * 3.0 + 8.0
