@@ -13,7 +13,7 @@
 
 #include "dist_engine/common/target.h"
 
-// AICore-target primitives shared by the direct submit backend. Onboard CCEC
+// AICore-target primitives shared by the submit runtime. Onboard CCEC
 // needs explicit GM cache maintenance; sim AICore shares process memory and only
 // needs compiler/CPU fences to preserve ordering.
 

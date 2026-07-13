@@ -27,8 +27,8 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
     }
 
     TRACE_LAP_RESET(self);  // origin for the first lap span (post-barrier, pre-replay)
-    direct_replay_orch(runtime);
+    dist_submit_replay_orch(runtime);
 
-    direct_drain_to_completion(self);
+    dist_submit_drain_to_completion(self);
     dist_aicore_finish_worker(runtime);
 }
