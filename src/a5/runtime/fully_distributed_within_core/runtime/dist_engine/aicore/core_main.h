@@ -15,22 +15,20 @@
 DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int core_idx, int core_type_int) {
     __gm__ DistCore *self = dist_aicore_attach_worker(runtime, core_idx, core_type_int);
     if (self == nullptr) return;
-#if DIST_TRACE_ENABLED
     trace_reset_core(self);
-#endif
 
-    if (!direct_fatal_set()) {
-        publish_worker_started();
+    if (!fatal_set()) {
+        atomic_fetch_add<int64_t>(g_dist.started_count, 1);
         uint64_t wd_start = 0;
-        while (load_worker_started_count() < g_dist.num_workers && !direct_fatal_set()) {
+        while (atomic_load(g_dist.started_count) < g_dist.num_workers && !fatal_set()) {
             SPIN_WAIT_HINT();
             watchdog(wd_start);
         }
     }
 
     TRACE_LAP_RESET(self);  // origin for the first lap span (post-barrier, pre-replay)
-    direct_replay_orch(runtime);
+    dist_submit_replay_orch(runtime);
 
-    direct_drain_to_completion(self);
+    dist_submit_drain_to_completion(self);
     dist_aicore_finish_worker(runtime);
 }

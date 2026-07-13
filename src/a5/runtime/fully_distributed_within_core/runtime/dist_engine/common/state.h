@@ -16,10 +16,6 @@
 
 #include "dist_engine/common/target.h"
 
-#if DIST_TRACE_ENABLED
-#include <vector>
-#endif
-
 #include "dist_engine/dist_engine.h"
 #include "common/core_type.h"
 #include "pto2_dispatch_payload.h"
@@ -93,7 +89,6 @@ struct DistTensorMap {
     int32_t cleaned_upto;
 };
 
-#if DIST_TRACE_ENABLED
 enum class TracePhase : int32_t {
     Kernel = 0,
     Alloc = 1,
@@ -103,32 +98,13 @@ enum class TracePhase : int32_t {
     RingBp = 5,
     EfDrain = 6,
     Commit = 7,
+    Submit = 8,
+    Materialize = 9,
+    PrepareMap = 10,
+    Claim = 11,
+    Fanin = 12,
+    Register = 13,
 };
-
-struct TraceEvent {
-    int32_t task_id;
-    int32_t func_id;
-    int32_t lane;
-    uint8_t multicore;
-    TracePhase phase;
-    uint64_t ts_ns;
-    uint64_t dur_ns;
-    uint64_t cpu_ns;
-};
-
-struct DepEdge {
-    int32_t consumer_task;
-    int32_t producer_task;
-};
-
-struct DistCoreTraceState {
-    std::vector<TraceEvent> trace;
-    uint64_t trace_last_ns;
-    uint64_t trace_last_cpu;
-    std::vector<DepEdge> dep_edges;
-    std::vector<DepEdge> slot_edges;
-};
-#endif
 
 struct RingSlot {
     bool occupied;
@@ -173,14 +149,22 @@ static_assert(offsetof(RingSlot, tensors) % 64 == 0, "RingSlot tensors must be c
 static_assert(offsetof(BuiltSubtask, tensors) % 64 == 0, "BuiltSubtask tensors must be cacheline-aligned");
 
 struct DrainedCell {
-    volatile int32_t v;
-    uint8_t pad[64 - sizeof(int32_t)];
+    volatile int64_t v;
+    uint8_t pad[64 - sizeof(int64_t)];
 };
 static_assert(sizeof(DrainedCell) == 64, "DrainedCell must occupy one cacheline");
 
+constexpr int64_t kDrainedFree = 0;
+constexpr int64_t kDrainedClaimed = 1;
+
+constexpr int64_t kWonStateFree = 0;
+constexpr int64_t kWonStateClaimed = 1;
+constexpr int64_t kWonStatePublished = 2;
+
 struct WonSlot {
-    volatile int32_t state;
+    volatile int64_t state;
     int32_t task_id;
+    uint8_t task_id_pad[4];
     volatile int64_t remaining;
     DrainedCell drained[PTO2_SUBTASK_SLOT_COUNT];
     BuiltSubtask lane[PTO2_SUBTASK_SLOT_COUNT];
@@ -218,8 +202,9 @@ struct DistCore {
     RingSlot slots[kPrivateSlots];
     int32_t occupied_count;
     int32_t owned_total;
+    uint64_t swimlane_last_cycle;
 
-    uint8_t task_payloads_pad[24];
+    uint8_t task_payloads_pad[16];
     DistTaskPayload task_payloads[kTaskPayloadSlots];
 };
 static_assert(offsetof(DistCore, slots) % 64 == 0, "DistCore slots must be cacheline-aligned");
