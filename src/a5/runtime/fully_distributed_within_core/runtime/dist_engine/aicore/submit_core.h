@@ -68,20 +68,77 @@ PTO_DEVICE_FUNC void store_task_vend(int32_t task_id, uint64_t vend) {
 
 PTO_DEVICE_FUNC void store_won_remaining(__gm__ WonSlot &w, int32_t count) {
 #if defined(__CCE_AICORE__)
-    w.remaining = count;
+    __gm__ int64_t *remaining = const_cast<__gm__ int64_t *>(&w.remaining);
+    atomicExch(remaining, static_cast<int64_t>(count));
 #else
     atom_store<int64_t>(w.remaining, count, __ATOMIC_RELAXED);
 #endif
 }
 
-PTO_DEVICE_FUNC void reset_won_lane(__gm__ WonSlot &w, int32_t lane) {
+PTO_DEVICE_FUNC int64_t exchange_won_state(__gm__ WonSlot &w, int64_t value) {
 #if defined(__CCE_AICORE__)
-    w.drained[lane].v = 0;
+    __gm__ int64_t *state = const_cast<__gm__ int64_t *>(&w.state);
+    return atomicExch(state, value);
 #else
-    atom_store(w.drained[lane].v, 0, __ATOMIC_RELAXED);
+    return __atomic_exchange_n(&w.state, value, __ATOMIC_ACQ_REL);
 #endif
+}
+
+PTO_DEVICE_FUNC int64_t load_won_state(__gm__ WonSlot &w) {
+#if defined(__CCE_AICORE__)
+    __gm__ int64_t *state = const_cast<__gm__ int64_t *>(&w.state);
+    return atomicAdd(state, static_cast<int64_t>(0));
+#else
+    return atom_load(w.state, __ATOMIC_ACQUIRE);
+#endif
+}
+
+PTO_DEVICE_FUNC int64_t exchange_won_drained(__gm__ WonSlot &w, int32_t lane, int64_t value) {
+#if defined(__CCE_AICORE__)
+    __gm__ int64_t *drained = const_cast<__gm__ int64_t *>(&w.drained[lane].v);
+    return atomicExch(drained, value);
+#else
+    return __atomic_exchange_n(&w.drained[lane].v, value, __ATOMIC_ACQ_REL);
+#endif
+}
+
+PTO_DEVICE_FUNC int64_t load_won_drained(__gm__ WonSlot &w, int32_t lane) {
+#if defined(__CCE_AICORE__)
+    __gm__ int64_t *drained = const_cast<__gm__ int64_t *>(&w.drained[lane].v);
+    return atomicAdd(drained, static_cast<int64_t>(0));
+#else
+    return atom_load(w.drained[lane].v, __ATOMIC_ACQUIRE);
+#endif
+}
+
+PTO_DEVICE_FUNC void publish_block_won_hint(__gm__ BlockWon &bw) {
+#if defined(__CCE_AICORE__)
+    __gm__ int32_t *any_pub = const_cast<__gm__ int32_t *>(&bw.any_pub);
+    atomicExch(any_pub, 1);
+#else
+    atom_store(bw.any_pub, 1, __ATOMIC_RELEASE);
+#endif
+}
+
+PTO_DEVICE_FUNC int32_t load_block_won_hint(__gm__ BlockWon &bw) {
+#if defined(__CCE_AICORE__)
+    __gm__ int32_t *any_pub = const_cast<__gm__ int32_t *>(&bw.any_pub);
+    return atomicAdd(any_pub, 0);
+#else
+    return atom_load(bw.any_pub, __ATOMIC_ACQUIRE);
+#endif
+}
+
+PTO_DEVICE_FUNC void reset_won_lane(__gm__ WonSlot &w, int32_t lane) {
+    exchange_won_drained(w, lane, kDrainedClaimed);
     w.lane[lane].present = false;
 }
+
+PTO_DEVICE_FUNC bool claim_won_lane(__gm__ WonSlot &w, int32_t lane) {
+    return exchange_won_drained(w, lane, kDrainedClaimed) == kDrainedFree;
+}
+
+PTO_DEVICE_FUNC void publish_won_slot(__gm__ WonSlot &w) { exchange_won_state(w, kWonStatePublished); }
 
 PTO_DEVICE_FUNC bool decrement_won_remaining_is_last(__gm__ WonSlot &w) {
 #if defined(__CCE_AICORE__)
@@ -92,14 +149,7 @@ PTO_DEVICE_FUNC bool decrement_won_remaining_is_last(__gm__ WonSlot &w) {
 #endif
 }
 
-PTO_DEVICE_FUNC void clear_won_slot_state(__gm__ WonSlot &w) {
-#if defined(__CCE_AICORE__)
-    w.state = 0;
-    dist_aicore_flush_region(&w, sizeof(WonSlot));
-#else
-    atom_store(w.state, 0, __ATOMIC_RELEASE);
-#endif
-}
+PTO_DEVICE_FUNC void clear_won_slot_state(__gm__ WonSlot &w) { exchange_won_state(w, kWonStateFree); }
 
 PTO_DEVICE_FUNC int64_t load_frontier_for_advance() {
 #if defined(__CCE_AICORE__)
@@ -282,33 +332,58 @@ PTO_DEVICE_FUNC void build_ring_slot(
     s.won_slot = won_slot;
 }
 
-PTO_DEVICE_FUNC void drain_block_won(__gm__ DistCore *self) {
-    if (self->lane == LANE_AIC || self->lane == LANE_NONE) return;
+PTO_DEVICE_FUNC bool drain_block_won(__gm__ DistCore *self) {
+    if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
     __gm__ BlockWon &bw = g_dist.blocks[self->block_id];
-    if (atom_load(bw.any_pub, __ATOMIC_ACQUIRE) == 0) return;
+    if (load_block_won_hint(bw) == 0) return false;
+    bool drained = false;
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         __gm__ WonSlot &w = bw.slots[i];
-        if (atom_load(w.state, __ATOMIC_ACQUIRE) != 1) continue;
+        if (load_won_state(w) != kWonStatePublished) continue;
+#if defined(__CCE_AICORE__)
+        dist_aicore_invalidate_region(&w.lane[self->lane], 64);
+#endif
         if (!w.lane[self->lane].present) continue;
-        int32_t exp = 0;
-        if (!atom_cas_strong(w.drained[self->lane].v, exp, 1, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) continue;
+        if (!claim_won_lane(w, self->lane)) continue;
         int32_t si = alloc_ring_slot(self);
         if (si < 0) {
-            atom_store(w.drained[self->lane].v, 0, __ATOMIC_RELEASE);
-            return;
+            exchange_won_drained(w, self->lane, kDrainedFree);
+            return drained;
         }
+#if defined(__CCE_AICORE__)
+        dist_aicore_invalidate_region(&w, 64);
+        dist_aicore_invalidate_region(&w.lane[self->lane], sizeof(w.lane[self->lane]));
+#endif
+        const int32_t task_id = w.task_id;
         __gm__ const BuiltSubtask &b = w.lane[self->lane];
         TRACE_SPAN_BEGIN(drain_won_trace);
         build_ring_slot(
-            self->slots[si], w.task_id, b.func_id, b.function_bin_addr, b.tensors, b.tensor_count, b.scalars,
+            self->slots[si], task_id, b.func_id, b.function_bin_addr, b.tensors, b.tensor_count, b.scalars,
             b.scalar_count, b.fanin, b.fanin_count, b.sub_block_id, /*is_multicore=*/true, self->block_id, i
         );
         TRACE_SPAN_END(
-            drain_won_trace, self, w.task_id, b.func_id, TracePhase::DrainWon, /*flags=*/1u, static_cast<uint32_t>(i)
+            drain_won_trace, self, task_id, b.func_id, TracePhase::DrainWon, /*flags=*/1u, static_cast<uint32_t>(i)
         );
+#if defined(__CCE_AICORE__)
+        dist_aicore_flush_region(&self->slots[si], sizeof(RingSlot));
+#endif
         self->occupied_count++;
         self->owned_total++;
+        drained = true;
     }
+    return drained;
+}
+
+PTO_DEVICE_FUNC bool has_pending_won(__gm__ DistCore *self) {
+    if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
+    __gm__ BlockWon &bw = g_dist.blocks[self->block_id];
+    if (load_block_won_hint(bw) == 0) return false;
+    for (int32_t i = 0; i < kPrivateSlots; i++) {
+        __gm__ WonSlot &w = bw.slots[i];
+        if (load_won_state(w) != kWonStatePublished) continue;
+        if (load_won_drained(w, self->lane) == kDrainedFree) return true;
+    }
+    return false;
 }
 
 PTO_DEVICE_FUNC void dist_submit_execute_first(__gm__ DistCore *self) {

@@ -143,14 +143,22 @@ static_assert(offsetof(RingSlot, tensors) % 64 == 0, "RingSlot tensors must be c
 static_assert(offsetof(BuiltSubtask, tensors) % 64 == 0, "BuiltSubtask tensors must be cacheline-aligned");
 
 struct DrainedCell {
-    volatile int32_t v;
-    uint8_t pad[64 - sizeof(int32_t)];
+    volatile int64_t v;
+    uint8_t pad[64 - sizeof(int64_t)];
 };
 static_assert(sizeof(DrainedCell) == 64, "DrainedCell must occupy one cacheline");
 
+constexpr int64_t kDrainedFree = 0;
+constexpr int64_t kDrainedClaimed = 1;
+
+constexpr int64_t kWonStateFree = 0;
+constexpr int64_t kWonStateClaimed = 1;
+constexpr int64_t kWonStatePublished = 2;
+
 struct WonSlot {
-    volatile int32_t state;
+    volatile int64_t state;
     int32_t task_id;
+    uint8_t task_id_pad[4];
     volatile int64_t remaining;
     DrainedCell drained[PTO2_SUBTASK_SLOT_COUNT];
     BuiltSubtask lane[PTO2_SUBTASK_SLOT_COUNT];

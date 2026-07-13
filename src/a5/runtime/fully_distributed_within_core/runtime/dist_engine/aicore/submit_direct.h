@@ -84,7 +84,6 @@ PTO_DEVICE_FUNC bool direct_claim_submit(DistSubmitKind kind, const MixedKernels
     return direct_claim_kernel_submit(*mixed, ctx);
 }
 
-PTO_DEVICE_FUNC bool direct_drain_block_won(__gm__ DistCore *self);
 PTO_DEVICE_FUNC int32_t direct_drain_ready_slots(__gm__ DistCore *self);
 
 PTO_DEVICE_FUNC __gm__ RingSlot *direct_alloc_slot(__gm__ DistCore *self) {
@@ -105,7 +104,7 @@ PTO_DEVICE_FUNC void direct_wait_slot_capacity(__gm__ DistCore *self, int32_t ta
     TRACE_SPAN_BEGIN(ring_bp_trace);
     while (self->occupied_count >= kPrivateSlots - kWonReserve) {
         waited = true;
-        direct_drain_block_won(self);
+        drain_block_won(self);
         if (direct_drain_ready_slots(self) == 0) SPIN_WAIT_HINT();
     }
     if (waited) {
@@ -165,7 +164,7 @@ PTO_DEVICE_FUNC bool direct_wait_heap_capacity(DistSubmitCtx &ctx, DistSubmitKin
             return false;
         }
         waited = true;
-        direct_drain_block_won(ctx.self);
+        drain_block_won(ctx.self);
         if (direct_drain_ready_slots(ctx.self) == 0) SPIN_WAIT_HINT();
     }
     if (waited) {
@@ -174,28 +173,7 @@ PTO_DEVICE_FUNC bool direct_wait_heap_capacity(DistSubmitCtx &ctx, DistSubmitKin
     return false;
 }
 
-PTO_DEVICE_FUNC int32_t direct_alloc_won_slot(__gm__ DistCore *self, int32_t block) {
-#if !defined(__CCE_AICORE__)
-    (void)self;
-    return alloc_won_slot(block);
-#else
-    __gm__ BlockWon &bw = g_dist.blocks[block];
-    while (true) {
-        dist_aicore_invalidate_region(&bw, sizeof(BlockWon));
-        for (int32_t i = 0; i < kPrivateSlots; i++) {
-            if (bw.slots[i].state != 0) continue;
-            bw.slots[i].state = 2;
-            dist_aicore_flush_region(&bw.slots[i], sizeof(WonSlot));
-            return i;
-        }
-        direct_drain_block_won(self);
-        direct_drain_ready_slots(self);
-        SPIN_WAIT_HINT();
-    }
-#endif
-}
-
-PTO_DEVICE_FUNC void direct_publish_joint_deposits(DistSubmitCtx &ctx, const MixedKernels &mixed) {
+PTO_DEVICE_FUNC void publish_joint_deposits(DistSubmitCtx &ctx, const MixedKernels &mixed) {
     if (!ctx.joint) return;
     __gm__ WonSlot &w = g_dist.blocks[ctx.joint_block].slots[ctx.joint_slot];
     const ActiveMask M = mixed.to_active_mask();
@@ -209,45 +187,23 @@ PTO_DEVICE_FUNC void direct_publish_joint_deposits(DistSubmitCtx &ctx, const Mix
         ctx.payload->tensors, ctx.tensor_count, ctx.payload->scalars, ctx.payload->scalar_count, ctx.fanin,
         ctx.fanin_count
     );
-    w.state = 1;
-    g_dist.blocks[ctx.joint_block].any_pub = 1;
-    dist_aicore_flush_region(&w, sizeof(WonSlot));
-    dist_aicore_flush_region(
-        const_cast<__gm__ int32_t *>(&g_dist.blocks[ctx.joint_block].any_pub),
-        sizeof(g_dist.blocks[ctx.joint_block].any_pub)
-    );
+#if defined(__CCE_AICORE__)
+    dist_aicore_flush_region(&w, 64);
+    dist_aicore_flush_region(w.lane, sizeof(w.lane));
+#endif
+    store_won_remaining(w, ctx.joint_count);
+    publish_won_slot(w);
+    publish_block_won_hint(g_dist.blocks[ctx.joint_block]);
 }
 
-PTO_DEVICE_FUNC bool direct_drain_won_slot(__gm__ DistCore *self, int32_t won_slot) {
-    if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
-    __gm__ WonSlot &w = g_dist.blocks[self->block_id].slots[won_slot];
-    dist_aicore_invalidate_region(&w, sizeof(WonSlot));
-    if (w.state != 1 || !w.lane[self->lane].present || w.drained[self->lane].v != 0) return false;
-    __gm__ RingSlot *slot = direct_alloc_slot(self);
-    if (slot == nullptr) return false;
-    w.drained[self->lane].v = 1;
-    dist_aicore_flush_region(&w.drained[self->lane], sizeof(DrainedCell));
-    __gm__ BuiltSubtask &b = w.lane[self->lane];
-    TRACE_SPAN_BEGIN(drain_won_trace);
-    build_ring_slot(
-        *slot, w.task_id, b.func_id, b.function_bin_addr, b.tensors, b.tensor_count, b.scalars, b.scalar_count, b.fanin,
-        b.fanin_count, b.sub_block_id, /*is_multicore=*/true, self->block_id, won_slot
-    );
-    TRACE_SPAN_END(drain_won_trace, self, w.task_id, b.func_id, TracePhase::DrainWon, /*flags=*/1u, won_slot);
-    dist_aicore_flush_region(slot, sizeof(RingSlot));
-    return true;
-}
-
-PTO_DEVICE_FUNC bool direct_drain_block_won(__gm__ DistCore *self) {
-    if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
-    __gm__ BlockWon &bw = g_dist.blocks[self->block_id];
-    dist_aicore_invalidate_region(&bw, sizeof(BlockWon));
-    if (bw.any_pub == 0) return false;
-    bool drained = false;
-    for (int32_t i = 0; i < kPrivateSlots; i++) {
-        drained = direct_drain_won_slot(self, i) || drained;
+PTO_DEVICE_FUNC int32_t wait_alloc_won_slot(__gm__ DistCore *self, int32_t block) {
+    int32_t won_slot = alloc_won_slot(block);
+    while (won_slot < 0 && !direct_fatal_set()) {
+        drain_block_won(self);
+        if (direct_drain_ready_slots(self) == 0) SPIN_WAIT_HINT();
+        won_slot = alloc_won_slot(block);
     }
-    return drained;
+    return won_slot;
 }
 
 PTO_DEVICE_FUNC bool direct_build_winner_slot(DistSubmitCtx &ctx, __gm__ RingSlot *slot) {
@@ -292,12 +248,13 @@ PTO_DEVICE_FUNC void direct_build_won_submit(DistSubmitCtx &ctx, const MixedKern
     direct_wait_slot_capacity(ctx.self, ctx.task_id);
     if (!direct_wait_heap_capacity(ctx, DistSubmitKind::Kernel)) return;
     if (ctx.joint && ctx.joint_slot < 0) {
-        ctx.joint_slot = direct_alloc_won_slot(ctx.self, ctx.joint_block);
+        ctx.joint_slot = wait_alloc_won_slot(ctx.self, ctx.joint_block);
+        if (ctx.joint_slot < 0) return;
     }
     __gm__ RingSlot *slot = direct_alloc_slot(ctx.self);
     if (slot == nullptr) return;
 
-    if (ctx.joint) direct_publish_joint_deposits(ctx, mixed);
+    if (ctx.joint) publish_joint_deposits(ctx, mixed);
     if (!direct_build_winner_slot(ctx, slot)) return;
 }
 
@@ -310,30 +267,17 @@ PTO_DEVICE_FUNC void direct_complete_alloc_submit(DistSubmitCtx &ctx) {
 
 #include "dist_engine/aicore/run_state.h"
 
-PTO_DEVICE_FUNC bool direct_has_pending_won(__gm__ DistCore *self) {
-    if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
-    __gm__ BlockWon &bw = g_dist.blocks[self->block_id];
-    dist_aicore_invalidate_region(&bw, sizeof(BlockWon));
-    if (bw.any_pub == 0) return false;
-    for (int32_t i = 0; i < kPrivateSlots; i++) {
-        __gm__ WonSlot &w = bw.slots[i];
-        if (w.state != 1) continue;
-        if (w.lane[self->lane].present && w.drained[self->lane].v == 0) return true;
-    }
-    return false;
-}
-
 PTO_DEVICE_FUNC void direct_drain_to_completion(__gm__ DistCore *self) {
     if (self == nullptr) return;
     __gm__ int64_t *replay_done = const_cast<__gm__ int64_t *>(&g_dist.replay_done);
     publish_replay_done(*replay_done);
     while (true) {
-        direct_drain_block_won(self);
+        drain_block_won(self);
         const int32_t freed = direct_drain_ready_slots(self);
         dist_aicore_invalidate_region(replay_done, sizeof(g_dist.replay_done));
         const bool all_replayed = g_dist.replay_done >= g_dist.num_workers;
         const bool ring_empty = self->occupied_count == 0;
-        const bool pending = direct_has_pending_won(self);
+        const bool pending = has_pending_won(self);
         if (all_replayed && ring_empty && !pending) break;
         if (freed == 0) SPIN_WAIT_HINT();
     }
@@ -379,7 +323,7 @@ dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &arg
     DistSubmitCtx ctx;
     dist_submit_begin(nullptr, args, ctx);
     TRACE_LAP_RESET(ctx.self);
-    direct_drain_block_won(ctx.self);
+    drain_block_won(ctx.self);
     direct_drain_ready_slots(ctx.self);
     TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::EfDrain);
     if (!dist_submit_materialize_and_prepare_map(ctx.self, args, ctx, DistSubmitKind::Kernel)) return ctx.result;
@@ -393,7 +337,7 @@ dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &arg
         direct_build_won_submit(ctx, mixed);
     } else {
         TRACE_LAP(ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Replay);
-        direct_drain_block_won(ctx.self);
+        drain_block_won(ctx.self);
     }
     return ctx.result;
 }
@@ -402,7 +346,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
     DistSubmitCtx ctx;
     dist_submit_begin(nullptr, args, ctx);
     TRACE_LAP_RESET(ctx.self);
-    direct_drain_block_won(ctx.self);
+    drain_block_won(ctx.self);
     direct_drain_ready_slots(ctx.self);
     TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::EfDrain);
     if (!dist_submit_materialize_and_prepare_map(ctx.self, args, ctx, DistSubmitKind::Alloc)) return ctx.result;
