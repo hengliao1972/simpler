@@ -362,6 +362,42 @@ PTO_DEVICE_FUNC bool dist_submit_check_task_cap(const DistSubmitCtx &ctx, DistSu
     return false;
 }
 
+PTO_DEVICE_FUNC inline void
+dist_submit_flush_payload_range(__gm__ DistTaskPayload *payload, uint64_t offset_bytes, uint64_t size_bytes) {
+#if defined(__CCE_AICORE__)
+    if (size_bytes == 0) return;
+    const uint64_t base = reinterpret_cast<uint64_t>(payload) + offset_bytes;
+    const uint64_t start = base & ~uint64_t{63};
+    const uint64_t end = (base + size_bytes + 63) & ~uint64_t{63};
+    for (uint64_t addr = start; addr < end; addr += 64) {
+        dcci(reinterpret_cast<__gm__ uint8_t *>(addr), SINGLE_CACHE_LINE, CACHELINE_OUT);
+    }
+#else
+    (void)payload;
+    (void)offset_bytes;
+    (void)size_bytes;
+#endif
+}
+
+PTO_DEVICE_FUNC inline void
+dist_submit_flush_payload(__gm__ DistTaskPayload *payload, int32_t tensor_count, int32_t scalar_count) {
+#if defined(__CCE_AICORE__)
+    __asm__ volatile("" ::: "memory");
+    dist_submit_flush_payload_range(payload, 0, offsetof(DistTaskPayload, tensors));
+    dist_submit_flush_payload_range(
+        payload, offsetof(DistTaskPayload, tensors), static_cast<uint64_t>(tensor_count) * sizeof(Tensor)
+    );
+    dist_submit_flush_payload_range(
+        payload, offsetof(DistTaskPayload, scalars), static_cast<uint64_t>(scalar_count) * sizeof(uint64_t)
+    );
+    dsb((mem_dsb_t)0);
+#else
+    (void)payload;
+    (void)tensor_count;
+    (void)scalar_count;
+#endif
+}
+
 PTO_DEVICE_FUNC void calculate_output_layout(const L0TaskArgs &args, DistOutputLayout &layout) {
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         if (args.tag(i) != TensorArgType::OUTPUT) continue;
@@ -437,9 +473,7 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
     for (int32_t i = 0; i < args.scalar_count(); i++) {
         ctx.payload->scalars[i] = args.scalar(i);
     }
-#if defined(__CCE_AICORE__)
-    dist_aicore_flush_region(ctx.payload, sizeof(DistTaskPayload));
-#endif
+    dist_submit_flush_payload(ctx.payload, ctx.tensor_count, args.scalar_count());
     ctx.self->heap_next = task_base + layout.total_output_size;
     ctx.output_bytes = total;
     return true;
