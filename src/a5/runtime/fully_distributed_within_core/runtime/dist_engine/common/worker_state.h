@@ -12,6 +12,7 @@
 #pragma once
 
 #include "dist_engine/common/target.h"
+#include "dist_engine/common/swimlane_types.h"
 
 // g_dist / g_self storage. The AICPU build owns the BSS DistGlobal and
 // initializes it in dist_engine_register. AICore builds attach to the published
@@ -28,15 +29,30 @@
 [[block_local]] static int32_t g_ccec_aiv_count;
 [[block_local]] static int32_t g_ccec_ordinal;
 [[block_local]] static bool g_ccec_valid_worker;
+[[block_local]] static bool g_fdwic_swimlane_enabled;
+[[block_local]] static __gm__ FdwicSwimlaneHeader *g_fdwic_swimlane_header;
+[[block_local]] static __gm__ FdwicSwimlaneCoreState *g_fdwic_swimlane_core;
+[[block_local]] static __gm__ FdwicSwimlaneRecord *g_fdwic_swimlane_records;
+[[block_local]] static uint32_t g_fdwic_swimlane_records_per_core;
 #define g_dist (*g_dist_ptr)
 #elif defined(__CPU_SIM)
 static DistGlobal g_dist_fallback;
 static DistGlobal *g_dist_ptr = nullptr;
 thread_local DistCore *g_self = nullptr;
+thread_local bool g_fdwic_swimlane_enabled = false;
+thread_local FdwicSwimlaneHeader *g_fdwic_swimlane_header = nullptr;
+thread_local FdwicSwimlaneCoreState *g_fdwic_swimlane_core = nullptr;
+thread_local FdwicSwimlaneRecord *g_fdwic_swimlane_records = nullptr;
+thread_local uint32_t g_fdwic_swimlane_records_per_core = 0;
 #define g_dist (*g_dist_ptr)
 #else
 static DistGlobal g_dist_fallback;
 static DistGlobal *g_dist_ptr = &g_dist_fallback;
 thread_local DistCore *g_self = nullptr;
+thread_local bool g_fdwic_swimlane_enabled = false;
+thread_local FdwicSwimlaneHeader *g_fdwic_swimlane_header = nullptr;
+thread_local FdwicSwimlaneCoreState *g_fdwic_swimlane_core = nullptr;
+thread_local FdwicSwimlaneRecord *g_fdwic_swimlane_records = nullptr;
+thread_local uint32_t g_fdwic_swimlane_records_per_core = 0;
 #define g_dist (*g_dist_ptr)
 #endif

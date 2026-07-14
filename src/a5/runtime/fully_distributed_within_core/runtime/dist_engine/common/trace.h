@@ -97,6 +97,7 @@ PTO_DEVICE_FUNC inline uint64_t trace_span_begin_impl() { return fdwic_swimlane_
     trace_span_impl((self), (task_id), (func_id), (phase), (name), trace_span_begin_impl(), (flags), (aux))
 #define TRACE_INSTANT(self, task_id, func_id, phase, flags) \
     trace_instant_impl((self), (task_id), (func_id), (phase), (flags))
+#define TRACE_FLUSH_CORE(self) fdwic_swimlane_flush_core((self))
 
 #else
 
@@ -107,6 +108,7 @@ PTO_DEVICE_FUNC inline void trace_reset_core(__gm__ DistCore *) {}
 #define TRACE_SPAN_BEGIN(name) ((void)0)
 #define TRACE_SPAN_END(name, self, task_id, func_id, phase, flags, aux) ((void)0)
 #define TRACE_INSTANT(self, task_id, func_id, phase, flags) ((void)0)
+#define TRACE_FLUSH_CORE(self) ((void)0)
 
 #endif
 
