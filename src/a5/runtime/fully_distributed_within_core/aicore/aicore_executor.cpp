@@ -95,7 +95,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     OUT_OF_ORDER_STORE_BARRIER();
     my_hank->aicore_done = s_block_idx + 1;  // Signal ready (use s_block_idx + 1 to avoid 0)
 
-    dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dcci(&my_hank->aicore_done, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
     // ===========================================================================
     // Phase 4 (dist): wait for the AICPU to publish shared engine state,
@@ -118,5 +118,5 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         }
         SPIN_WAIT_HINT();
     }
-    dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dcci(&my_hank->aicore_done, SINGLE_CACHE_LINE, CACHELINE_OUT);
 }

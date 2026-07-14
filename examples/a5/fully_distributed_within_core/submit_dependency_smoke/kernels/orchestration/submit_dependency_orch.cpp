@@ -21,6 +21,8 @@
 #define FUNC_BUMP_OFFSET_AIV 5
 #define FUNC_INSPECT_VIEW_AIV 6
 #define FUNC_INSPECT_ALLOC_AIC 7
+#define FUNC_DCCI_ATOMIC_CLOBBER_AIC 8
+#define FUNC_DCCI_ATOMIC_CLOBBER_AIV 9
 
 #if !defined(__CCE_AICORE__) && !defined(dcci)
 #define dcci(...) \
@@ -694,6 +696,16 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
             fill_args.add_scalar(n);
             rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
         }
+        return;
+    }
+
+    if (mode == 31) {
+        L0TaskArgs probe_args;
+        probe_args.add_inout(output);
+        MixedKernels mk;
+        mk.aic_kernel_id = FUNC_DCCI_ATOMIC_CLOBBER_AIC;
+        mk.aiv0_kernel_id = FUNC_DCCI_ATOMIC_CLOBBER_AIV;
+        rt_submit_task(mk, probe_args);
         return;
     }
 
