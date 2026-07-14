@@ -46,7 +46,7 @@ PTO_DEVICE_FUNC void populate_won_slot(
     __gm__ WonSlot &w, int32_t task_id, const ActiveMask &M, const MixedKernels &mixed, int32_t own_lane,
     Runtime *runtime, TensorArrPtr tensors, int32_t tc, ScalarArrPtr scalars, int32_t sc, FaninArrPtr fanin, int32_t fc
 ) {
-    w.task_id = task_id;
+    w.meta.task_id = task_id;
 #define POPULATE_WON_LANE(L)                                                                    \
     do {                                                                                        \
         if ((L) == own_lane || !lane_active(M, (L))) break;                                     \
@@ -78,7 +78,7 @@ PTO_DEVICE_FUNC void populate_won_slot(
 PTO_DEVICE_FUNC int32_t alloc_won_slot(int32_t block) {
     __gm__ BlockWon &bw = g_dist.blocks[block];
     for (int32_t i = 0; i < kPrivateSlots; i++) {
-        if (atomic_fetch_max<int64_t>(bw.slots[i].state, kWonStateClaimed) == kWonStateFree) return i;
+        if (atomic_fetch_max<int64_t>(bw.slots[i].state.v, kWonStateClaimed) == kWonStateFree) return i;
     }
     return -1;
 }

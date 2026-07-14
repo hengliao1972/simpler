@@ -83,6 +83,20 @@ class TestSubmitDependencySmoke(SceneTestCase):
                 "core_type": "aic",
                 "signature": [D.IN, D.INOUT, D.INOUT],
             },
+            {
+                "func_id": 8,
+                "name": "DCCI_ATOMIC_CLOBBER_AIC",
+                "source": "kernels/aic/dcci_atomic_clobber.cpp",
+                "core_type": "aic",
+                "signature": [D.INOUT],
+            },
+            {
+                "func_id": 9,
+                "name": "DCCI_ATOMIC_CLOBBER_AIV",
+                "source": "kernels/aiv/dcci_atomic_clobber.cpp",
+                "core_type": "aiv",
+                "signature": [D.INOUT],
+            },
         ],
     }
 
@@ -657,6 +671,12 @@ class TestSubmitDependencySmoke(SceneTestCase):
             },
             "params": {"n": 67, "mode": 19},
         },
+        {
+            "name": "A5Bd1DcciAtomicClobber",
+            "platforms": ["a5sim", "a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 64, "mode": 31},
+        },
     ]
 
     def generate_args(self, params):
@@ -672,7 +692,7 @@ class TestSubmitDependencySmoke(SceneTestCase):
             Scalar("mode", int(params.get("mode", 0))),
         )
 
-    def compute_golden(self, args, params):  # noqa: PLR0912 - smoke cases intentionally share one golden dispatcher
+    def compute_golden(self, args, params):  # noqa: PLR0912, PLR0915 - smoke cases share one golden dispatcher
         mode = int(params.get("mode", 0))
         if mode == 1:
             n = int(params["n"])
@@ -794,6 +814,13 @@ class TestSubmitDependencySmoke(SceneTestCase):
             args.output[:] = -1.0
             args.output[:10] = 1.0
             args.dump[:3] = 1.0
+            return
+        if mode == 31:
+            args.output[:] = -1.0
+            args.output[0] = 1.0
+            args.output[1] = 11.0
+            args.output[16] = 1.0
+            args.output[17] = 1.0
             return
         args.output[:] = args.input * 6.0 + 23.0
 

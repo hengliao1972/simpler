@@ -44,16 +44,6 @@ PTO_DEVICE_FUNC bool ccec_is_valid_worker() {
 PTO_DEVICE_FUNC void ccec_attach_run_state() {
 #if defined(__CCE_AICORE__)
     dist_aicore_invalidate_region(const_cast<__gm__ int32_t *>(&g_dist.num_blocks), sizeof(g_dist.num_blocks));
-    dist_aicore_invalidate_region(g_dist.cube_cursor, sizeof(g_dist.cube_cursor));
-    dist_aicore_invalidate_region(g_dist.vector_cursor, sizeof(g_dist.vector_cursor));
-    dist_aicore_invalidate_region(g_dist.alloc_cursor, sizeof(g_dist.alloc_cursor));
-    dist_aicore_invalidate_region(const_cast<__gm__ int64_t *>(&g_dist.frontier), sizeof(g_dist.frontier));
-    dist_aicore_invalidate_region(const_cast<__gm__ int64_t *>(&g_dist.replay_done), sizeof(g_dist.replay_done));
-    dist_aicore_invalidate_region(const_cast<__gm__ int64_t *>(&g_dist.started_count), sizeof(g_dist.started_count));
-    dist_aicore_invalidate_region(const_cast<__gm__ int32_t *>(&g_dist.fatal), sizeof(g_dist.fatal));
-    for (int32_t b = 0; b < g_dist.num_blocks; b++) {
-        dist_aicore_invalidate_region(&g_dist.blocks[b], sizeof(BlockWon));
-    }
 #endif
 }
 

@@ -28,6 +28,7 @@
 #define SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>   // for fprintf, printf
 #include <string.h>  // for memset
@@ -94,19 +95,24 @@ constexpr uint32_t AICPU_READY_DIST_RUN = 2;
  * - aicpu_ready: Written by AICPU, read by AICore
  * - aicore_done: Written by AICore, read by AICPU
  * - task: Written by AICPU, read by AICore (Init: PTO2DispatchPayload*; runtime: unused)
- * - core_type: Written by AICPU, read by AICore (CoreType::AIC or CoreType::AIV)
+ * - core_type: Written by AICore, read by AICPU (CoreType::AIC or CoreType::AIV)
  * - physical_core_id: Written by AICore (Phase 2), read by AICPU
  * - aicpu_regs_ready / aicore_regs_ready: handshake sequence flags
  */
 struct Handshake {
-    volatile uint32_t aicpu_ready;        // AICPU ready signal: AICPU_READY_*
+    volatile uint64_t task;              // Init: PTO2DispatchPayload* (set before aicpu_ready); runtime: unused
+    volatile uint32_t aicpu_ready;       // AICPU ready signal: AICPU_READY_*
+    volatile uint32_t aicpu_regs_ready;  // AICPU register init done: 0=pending, 1=done
+    uint8_t aicpu_line_pad[64 - sizeof(uint64_t) - sizeof(uint32_t) - sizeof(uint32_t)];
+
     volatile uint32_t aicore_done;        // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;               // Init: PTO2DispatchPayload* (set before aicpu_ready); runtime: unused
     volatile CoreType core_type;          // Core type: CoreType::AIC or CoreType::AIV
     volatile uint32_t physical_core_id;   // Physical core ID
-    volatile uint32_t aicpu_regs_ready;   // AICPU register init done: 0=pending, 1=done
     volatile uint32_t aicore_regs_ready;  // AICore ID reported: 0=pending, 1=done
 } __attribute__((aligned(64)));
+static_assert(offsetof(Handshake, task) % 64 == 0, "AICPU-owned handshake line must be cacheline-aligned");
+static_assert(offsetof(Handshake, aicore_done) % 64 == 0, "AICore-owned handshake line must be cacheline-aligned");
+static_assert(sizeof(Handshake) % 64 == 0, "Handshake must not share cachelines");
 
 /**
  * Tensor pair for tracking host-device memory mappings.
