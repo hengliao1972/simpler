@@ -154,6 +154,18 @@ struct DrainedCell {
 };
 static_assert(sizeof(DrainedCell) == 64, "DrainedCell must occupy one cacheline");
 
+struct WonAtomicCell {
+    volatile int64_t v;
+    uint8_t pad[64 - sizeof(int64_t)];
+};
+static_assert(sizeof(WonAtomicCell) == 64, "WonSlot atomic cell must occupy one cacheline");
+
+struct WonMetaLine {
+    int32_t task_id;
+    uint8_t pad[64 - sizeof(int32_t)];
+};
+static_assert(sizeof(WonMetaLine) == 64, "WonSlot metadata must occupy one cacheline");
+
 constexpr int64_t kDrainedFree = 0;
 constexpr int64_t kDrainedClaimed = 1;
 
@@ -162,13 +174,19 @@ constexpr int64_t kWonStateClaimed = 1;
 constexpr int64_t kWonStatePublished = 2;
 
 struct WonSlot {
-    volatile int64_t state;
-    int32_t task_id;
-    uint8_t task_id_pad[4];
-    volatile int64_t remaining;
+    WonAtomicCell state;
+    WonMetaLine meta;
+    WonAtomicCell remaining;
     DrainedCell drained[PTO2_SUBTASK_SLOT_COUNT];
     BuiltSubtask lane[PTO2_SUBTASK_SLOT_COUNT];
+    uint8_t tail_pad[40];
 };
+static_assert(offsetof(WonSlot, state) % 64 == 0, "WonSlot state must be cacheline-aligned");
+static_assert(offsetof(WonSlot, meta) % 64 == 0, "WonSlot metadata must be cacheline-aligned");
+static_assert(offsetof(WonSlot, remaining) % 64 == 0, "WonSlot remaining must be cacheline-aligned");
+static_assert(offsetof(WonSlot, drained) % 64 == 0, "WonSlot drained cells must be cacheline-aligned");
+static_assert(offsetof(WonSlot, lane) % 64 == 0, "WonSlot lanes must be cacheline-aligned");
+static_assert(sizeof(WonSlot) % 64 == 0, "WonSlot must not share cachelines");
 
 struct BlockWon {
     WonSlot slots[kPrivateSlots];

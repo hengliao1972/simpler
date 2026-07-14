@@ -62,11 +62,11 @@ void dist_dump_state(int) {
     for (int32_t b = 0; b < g_dist.num_blocks; b++) {
         for (int32_t i = 0; i < kPrivateSlots; i++) {
             WonSlot &w = g_dist.blocks[b].slots[i];
-            int64_t st = atomic_load(w.state, __ATOMIC_RELAXED);
+            int64_t st = atomic_load(w.state.v, __ATOMIC_RELAXED);
             if (st == kWonStateFree) continue;
             fprintf(
                 stderr, "  won blk%d slot%d state=%ld tid=%d remaining=%ld drained=[%ld,%ld,%ld] present=[%d,%d,%d]\n",
-                b, i, st, w.task_id, static_cast<long>(atomic_load(w.remaining, __ATOMIC_RELAXED)),
+                b, i, st, w.meta.task_id, static_cast<long>(atomic_load(w.remaining.v, __ATOMIC_RELAXED)),
                 static_cast<long>(atomic_load(w.drained[0].v, __ATOMIC_RELAXED)),
                 static_cast<long>(atomic_load(w.drained[1].v, __ATOMIC_RELAXED)),
                 static_cast<long>(atomic_load(w.drained[2].v, __ATOMIC_RELAXED)), w.lane[0].present, w.lane[1].present,

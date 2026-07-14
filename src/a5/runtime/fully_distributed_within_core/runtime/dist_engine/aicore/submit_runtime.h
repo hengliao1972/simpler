@@ -161,7 +161,7 @@ PTO_DEVICE_FUNC void publish_joint_deposits(DistSubmitCtx &ctx, const MixedKerne
         ctx.fanin_count
     );
 #if defined(__CCE_AICORE__)
-    dist_aicore_flush_region(&w, 64);
+    dist_aicore_flush_region(&w.meta, sizeof(w.meta));
     dist_aicore_flush_region(w.lane, sizeof(w.lane));
 #endif
     store_won_remaining(w, ctx.joint_count);
