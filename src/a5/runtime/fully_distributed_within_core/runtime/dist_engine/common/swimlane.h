@@ -31,13 +31,24 @@ PTO_DEVICE_FUNC inline uint64_t fdwic_swimlane_detail_now() {
 #endif
 }
 
-PTO_DEVICE_FUNC inline bool fdwic_swimlane_enabled() {
-    return g_dist.runtime != nullptr && g_dist.runtime->dist.swimlane_enabled != 0 &&
-           g_dist.runtime->dist.swimlane_base != 0 && g_dist.runtime->dist.swimlane_records_per_core != 0;
-}
+PTO_DEVICE_FUNC inline bool fdwic_swimlane_enabled() { return g_fdwic_swimlane_enabled; }
 
-PTO_DEVICE_FUNC inline __gm__ FdwicSwimlaneHeader *fdwic_swimlane_header() {
-    return reinterpret_cast<__gm__ FdwicSwimlaneHeader *>(g_dist.runtime->dist.swimlane_base);
+PTO_DEVICE_FUNC inline void fdwic_swimlane_attach(__gm__ Runtime *runtime) {
+    g_fdwic_swimlane_enabled = false;
+    g_fdwic_swimlane_header = nullptr;
+    g_fdwic_swimlane_core = nullptr;
+    g_fdwic_swimlane_records = nullptr;
+    g_fdwic_swimlane_records_per_core = 0;
+    if (runtime == nullptr) return;
+#if defined(__CCE_AICORE__)
+    dist_aicore_invalidate_region(const_cast<__gm__ uint64_t *>(&runtime->dist.swimlane_base), 64);
+#endif
+    const uint64_t base = runtime->dist.swimlane_base;
+    const uint32_t records_per_core = runtime->dist.swimlane_records_per_core;
+    if (runtime->dist.swimlane_enabled == 0 || base == 0 || records_per_core == 0) return;
+    g_fdwic_swimlane_header = reinterpret_cast<__gm__ FdwicSwimlaneHeader *>(base);
+    g_fdwic_swimlane_records_per_core = records_per_core;
+    g_fdwic_swimlane_enabled = true;
 }
 
 PTO_DEVICE_FUNC inline __gm__ FdwicSwimlaneRecord *fdwic_swimlane_detail_records(__gm__ FdwicSwimlaneHeader *header) {
@@ -48,11 +59,27 @@ PTO_DEVICE_FUNC inline __gm__ FdwicSwimlaneRecord *fdwic_swimlane_detail_records
 
 PTO_DEVICE_FUNC inline void fdwic_swimlane_reset_core(__gm__ DistCore *self) {
     if (!fdwic_swimlane_enabled() || self == nullptr) return;
-    __gm__ FdwicSwimlaneHeader *header = fdwic_swimlane_header();
+    __gm__ FdwicSwimlaneHeader *header = g_fdwic_swimlane_header;
+    if (header == nullptr) return;
     if (self->core_idx < 0 || self->core_idx >= static_cast<int32_t>(header->num_cores)) return;
-    header->cores[self->core_idx].count = 0;
-    header->cores[self->core_idx].dropped = 0;
-    dist_aicore_flush_region(&header->cores[self->core_idx], sizeof(FdwicSwimlaneCoreState));
+    g_fdwic_swimlane_core = &header->cores[self->core_idx];
+    g_fdwic_swimlane_records = &fdwic_swimlane_detail_records(
+        header
+    )[static_cast<uint64_t>(self->core_idx) * g_fdwic_swimlane_records_per_core];
+    g_fdwic_swimlane_core->count = 0;
+    g_fdwic_swimlane_core->dropped = 0;
+}
+
+PTO_DEVICE_FUNC inline void fdwic_swimlane_flush_core(__gm__ DistCore *self) {
+    if (!fdwic_swimlane_enabled() || self == nullptr) return;
+    const uint32_t records_per_core = g_fdwic_swimlane_records_per_core;
+    __gm__ FdwicSwimlaneCoreState *core = g_fdwic_swimlane_core;
+    if (core == nullptr || g_fdwic_swimlane_records == nullptr || records_per_core == 0) return;
+    const uint32_t count = core->count < records_per_core ? core->count : records_per_core;
+    if (count > 0) {
+        dist_aicore_flush_region(g_fdwic_swimlane_records, static_cast<uint64_t>(count) * sizeof(FdwicSwimlaneRecord));
+    }
+    dist_aicore_flush_region(core, sizeof(FdwicSwimlaneCoreState));
 }
 
 PTO_DEVICE_FUNC inline void fdwic_swimlane_detail_record(
@@ -60,19 +87,16 @@ PTO_DEVICE_FUNC inline void fdwic_swimlane_detail_record(
     uint64_t end_cycle, uint32_t flags = 0, uint32_t aux = 0
 ) {
     if (!fdwic_swimlane_enabled() || self == nullptr) return;
-    __gm__ FdwicSwimlaneHeader *header = fdwic_swimlane_header();
     const int32_t core_idx = self->core_idx;
-    if (core_idx < 0 || core_idx >= static_cast<int32_t>(header->num_cores)) return;
-    const uint32_t records_per_core = header->records_per_core;
-    __gm__ FdwicSwimlaneCoreState *core = &header->cores[core_idx];
+    const uint32_t records_per_core = g_fdwic_swimlane_records_per_core;
+    __gm__ FdwicSwimlaneCoreState *core = g_fdwic_swimlane_core;
+    if (core == nullptr || g_fdwic_swimlane_records == nullptr || records_per_core == 0) return;
     uint32_t slot = core->count;
     if (slot >= records_per_core) {
         core->dropped = core->dropped + 1;
-        dist_aicore_flush_region(core, sizeof(FdwicSwimlaneCoreState));
         return;
     }
-    __gm__ FdwicSwimlaneRecord *records = fdwic_swimlane_detail_records(header);
-    __gm__ FdwicSwimlaneRecord *record = &records[static_cast<uint64_t>(core_idx) * records_per_core + slot];
+    __gm__ FdwicSwimlaneRecord *record = &g_fdwic_swimlane_records[slot];
     record->start_cycle = start_cycle;
     record->end_cycle = end_cycle;
     record->task_id = task_id;
@@ -83,9 +107,7 @@ PTO_DEVICE_FUNC inline void fdwic_swimlane_detail_record(
     record->core_idx = core_idx;
     record->flags = flags;
     record->aux = aux;
-    dist_aicore_flush_region(record, sizeof(FdwicSwimlaneRecord));
     core->count = slot + 1;
-    dist_aicore_flush_region(core, sizeof(FdwicSwimlaneCoreState));
 }
 
 PTO_DEVICE_FUNC inline void fdwic_swimlane_lap_reset(__gm__ DistCore *self) {
