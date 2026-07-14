@@ -87,7 +87,6 @@ PTO_DEVICE_FUNC __gm__ RingSlot *dist_submit_alloc_slot(__gm__ DistCore *self) {
     slot.occupied = true;
     slot.built = false;
     self->occupied_count++;
-    dist_aicore_flush_region(&slot, sizeof(RingSlot));
     return &slot;
 }
 
@@ -186,7 +185,6 @@ PTO_DEVICE_FUNC bool dist_submit_build_winner_slot(DistSubmitCtx &ctx, const L0T
         *slot, ctx.task_id, ctx.kernel_id, fn_addr, args, ctx, ctx.fanin, ctx.fanin_count, sub_block_id, ctx.joint,
         ctx.joint_block, ctx.joint_slot
     );
-    dist_aicore_flush_region(slot, sizeof(RingSlot));
     return true;
 }
 
