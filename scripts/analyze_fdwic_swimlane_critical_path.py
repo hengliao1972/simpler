@@ -19,6 +19,9 @@ from typing import Any, cast
 
 Event = list[Any]
 
+SUBMIT_PHASE = "Submit"
+LAP_PHASES = {"Replay", "Build", "Alloc"}
+
 
 def latest_trace() -> Path:
     traces = list(Path("outputs").glob("TestPagedAttentionUnroll_Case1_*/l2_swimlane_records.json"))
@@ -46,6 +49,54 @@ def phase_rows(events: list[Event]) -> dict[str, list[int]]:
     return rows
 
 
+def interval_union_ns(intervals: list[tuple[int, int]]) -> int:
+    if not intervals:
+        return 0
+    intervals.sort()
+    total = 0
+    current_start, current_end = intervals[0]
+    for start, end in intervals[1:]:
+        if start > current_end:
+            total += current_end - current_start
+            current_start, current_end = start, end
+        else:
+            current_end = max(current_end, end)
+    total += current_end - current_start
+    return total
+
+
+def submit_exclusive_rows(events: list[Event]) -> dict[str, list[int]]:
+    submit_events: list[Event] = []
+    child_intervals_by_core_task: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
+    for event in events:
+        phase = _field_str(event, 5)
+        if phase == SUBMIT_PHASE:
+            submit_events.append(event)
+        elif phase not in LAP_PHASES:
+            child_intervals_by_core_task[(_field_int(event, 0), _field_int(event, 2))].append(
+                (_field_int(event, 6), _field_int(event, 7))
+            )
+
+    rows: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0])
+    for event in submit_events:
+        submit_start = _field_int(event, 6)
+        submit_end = _field_int(event, 7)
+        child_intervals: list[tuple[int, int]] = []
+        for child_start, child_end in child_intervals_by_core_task[(_field_int(event, 0), _field_int(event, 2))]:
+            if child_start >= submit_start and child_end <= submit_end:
+                child_intervals.append((child_start, child_end))
+        submit_ns = submit_end - submit_start
+        child_ns = interval_union_ns(child_intervals)
+        exclusive_ns = max(0, submit_ns - child_ns)
+        rows["SubmitExclusive"][0] += 1
+        rows["SubmitExclusive"][1] += exclusive_ns
+        rows["SubmitExclusive"][2] = max(rows["SubmitExclusive"][2], exclusive_ns)
+        rows["SubmitChildren"][0] += 1
+        rows["SubmitChildren"][1] += child_ns
+        rows["SubmitChildren"][2] = max(rows["SubmitChildren"][2], child_ns)
+    return rows
+
+
 def print_phase_table(events: list[Event], span_ns: int, title: str) -> None:
     print(title)
     print(f"{'phase':12s} {'count':>8s} {'sum_us':>12s} {'avg_ns':>10s} {'max_us':>9s} {'span%':>8s}")
@@ -55,6 +106,17 @@ def print_phase_table(events: list[Event], span_ns: int, title: str) -> None:
         avg_ns = total_ns / count if count else 0
         span_pct = total_ns * 100 / span_ns if span_ns > 0 else 0
         print(f"{phase:12s} {count:8d} {total_ns / 1000:12.3f} {avg_ns:10.1f} {max_ns / 1000:9.3f} {span_pct:7.1f}%")
+
+
+def print_submit_exclusive_table(events: list[Event], span_ns: int, title: str) -> None:
+    print(title)
+    print(f"{'metric':15s} {'count':>8s} {'sum_us':>12s} {'avg_ns':>10s} {'max_us':>9s} {'span%':>8s}")
+    for metric, (count, total_ns, max_ns) in sorted(
+        submit_exclusive_rows(events).items(), key=lambda item: item[1][1], reverse=True
+    ):
+        avg_ns = total_ns / count if count else 0
+        span_pct = total_ns * 100 / span_ns if span_ns > 0 else 0
+        print(f"{metric:15s} {count:8d} {total_ns / 1000:12.3f} {avg_ns:10.1f} {max_ns / 1000:9.3f} {span_pct:7.1f}%")
 
 
 def main() -> int:
@@ -104,7 +166,11 @@ def main() -> int:
     print()
     print_phase_table(by_core[top_core], max_core_span_ns, f"Top core {top_core} phase totals:")
     print()
+    print_submit_exclusive_table(by_core[top_core], max_core_span_ns, f"Top core {top_core} submit exclusive:")
+    print()
     print_phase_table(events, global_span_ns, "All-core phase totals:")
+    print()
+    print_submit_exclusive_table(events, global_span_ns, "All-core submit exclusive:")
     return 0
 
 
