@@ -398,6 +398,7 @@ dist_submit_flush_output_payload(__gm__ DistTaskPayload *payload, int32_t tensor
 }
 
 PTO_DEVICE_FUNC void calculate_output_layout(const L0TaskArgs &args, DistOutputLayout &layout) {
+    layout.total_output_size = 0;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         if (args.tag(i) != TensorArgType::OUTPUT) continue;
         layout.offsets[i] = layout.total_output_size;
