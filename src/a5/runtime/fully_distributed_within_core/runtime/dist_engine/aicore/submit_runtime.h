@@ -146,19 +146,18 @@ PTO_DEVICE_FUNC bool dist_submit_wait_heap_capacity(DistSubmitCtx &ctx, DistSubm
     return false;
 }
 
-PTO_DEVICE_FUNC void publish_joint_deposits(DistSubmitCtx &ctx, const MixedKernels &mixed) {
+PTO_DEVICE_FUNC void publish_joint_deposits(DistSubmitCtx &ctx, const MixedKernels &mixed, const L0TaskArgs &args) {
     if (!ctx.joint) return;
     __gm__ WonSlot &w = g_dist.blocks[ctx.joint_block].slots[ctx.joint_slot];
     const ActiveMask M = mixed.to_active_mask();
-    populate_won_slot(
+    populate_won_slot_from_submit(
         w, ctx.task_id, M, mixed, ctx.self->lane,
 #if defined(__CCE_AICORE__)
         nullptr,
 #else
         g_dist.runtime,
 #endif
-        ctx.payload->tensors, ctx.tensor_count, ctx.payload->scalars, ctx.payload->scalar_count, ctx.fanin,
-        ctx.fanin_count
+        args, ctx, ctx.fanin, ctx.fanin_count
     );
 #if defined(__CCE_AICORE__)
     dist_aicore_flush_region(&w.meta, sizeof(w.meta));
@@ -179,19 +178,20 @@ PTO_DEVICE_FUNC int32_t wait_alloc_won_slot(__gm__ DistCore *self, int32_t block
     return won_slot;
 }
 
-PTO_DEVICE_FUNC bool dist_submit_build_winner_slot(DistSubmitCtx &ctx, __gm__ RingSlot *slot) {
+PTO_DEVICE_FUNC bool dist_submit_build_winner_slot(DistSubmitCtx &ctx, const L0TaskArgs &args, __gm__ RingSlot *slot) {
     if (slot == nullptr || ctx.payload == nullptr) return false;
     const int32_t sub_block_id = ctx.self != nullptr && ctx.self->lane == LANE_AIV1 ? 1 : 0;
     const uint64_t fn_addr = dist_aicore_slot_function_addr(g_dist.runtime, ctx.kernel_id);
-    build_ring_slot(
-        *slot, ctx.task_id, ctx.kernel_id, fn_addr, ctx.payload->tensors, ctx.tensor_count, ctx.payload->scalars,
-        ctx.payload->scalar_count, ctx.fanin, ctx.fanin_count, sub_block_id, ctx.joint, ctx.joint_block, ctx.joint_slot
+    build_ring_slot_from_submit(
+        *slot, ctx.task_id, ctx.kernel_id, fn_addr, args, ctx, ctx.fanin, ctx.fanin_count, sub_block_id, ctx.joint,
+        ctx.joint_block, ctx.joint_slot
     );
     dist_aicore_flush_region(slot, sizeof(RingSlot));
     return true;
 }
 
-PTO_DEVICE_FUNC void dist_submit_build_winner_task(DistSubmitCtx &ctx, const MixedKernels &mixed) {
+PTO_DEVICE_FUNC void
+dist_submit_build_winner_task(DistSubmitCtx &ctx, const MixedKernels &mixed, const L0TaskArgs &args) {
     if (ctx.self == nullptr) return;
     dist_submit_wait_slot_capacity(ctx.self, ctx.task_id);
     if (!dist_submit_wait_heap_capacity(ctx, DistSubmitKind::Kernel)) return;
@@ -202,8 +202,8 @@ PTO_DEVICE_FUNC void dist_submit_build_winner_task(DistSubmitCtx &ctx, const Mix
     __gm__ RingSlot *slot = dist_submit_alloc_slot(ctx.self);
     if (slot == nullptr) return;
 
-    if (ctx.joint) publish_joint_deposits(ctx, mixed);
-    if (!dist_submit_build_winner_slot(ctx, slot)) return;
+    if (ctx.joint) publish_joint_deposits(ctx, mixed, args);
+    if (!dist_submit_build_winner_slot(ctx, args, slot)) return;
 }
 
 PTO_DEVICE_FUNC void dist_submit_complete_alloc(DistSubmitCtx &ctx) {
@@ -281,18 +281,18 @@ dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &arg
     );
     if (is_winner) {
         TRACE_SPAN_BEGIN(fanin_trace);
-        ctx.fanin_count = dist_submit_collect_fanin(ctx, ctx.fanin);
+        ctx.fanin_count = dist_submit_collect_fanin(args, ctx, ctx.fanin);
         TRACE_SPAN_END(
             fanin_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Fanin, 0,
             static_cast<uint32_t>(ctx.fanin_count)
         );
     }
     TRACE_SPAN_BEGIN(register_trace);
-    dist_submit_register_outputs(ctx, /*include_existing=*/true);
+    dist_submit_register_outputs(ctx, args, /*include_existing=*/true);
     TRACE_SPAN_END(register_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Register, 0, 1);
     if (is_winner) {
         TRACE_LAP(ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Build);
-        dist_submit_build_winner_task(ctx, mixed);
+        dist_submit_build_winner_task(ctx, mixed, args);
     } else {
         TRACE_LAP(ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Replay);
         drain_block_won(ctx.self);
@@ -313,7 +313,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
     TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::EfDrain);
     if (!dist_submit_materialize_and_prepare_map(ctx.self, args, ctx, DistSubmitKind::Alloc)) return ctx.result;
     TRACE_SPAN_BEGIN(register_trace);
-    dist_submit_register_outputs(ctx, /*include_existing=*/false);
+    dist_submit_register_outputs(ctx, args, /*include_existing=*/false);
     TRACE_SPAN_END(register_trace, ctx.self, ctx.task_id, -1, TracePhase::Register, 0, 0);
     TRACE_SPAN_BEGIN(claim_trace);
     const bool is_winner = dist_submit_claim(DistSubmitKind::Alloc, nullptr, ctx);

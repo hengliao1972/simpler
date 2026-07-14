@@ -43,16 +43,10 @@ constexpr int32_t kTaskPayloadMask = kTaskPayloadSlots - 1;
 static_assert((kTaskPayloadSlots & kTaskPayloadMask) == 0, "task payload slots must be a power of two");
 
 struct DistTaskPayload {
-    int32_t tensor_count;
-    int32_t scalar_count;
-    TensorArgType tags[MAX_TENSOR_ARGS];
-    uint8_t tensors_pad_[56];
     Tensor tensors[MAX_TENSOR_ARGS];
-    uint64_t scalars[MAX_SCALAR_ARGS];
 };
 static_assert(sizeof(DistTaskPayload) % 64 == 0, "DistTaskPayload must not share cachelines");
 static_assert(offsetof(DistTaskPayload, tensors) % 64 == 0, "payload tensors must be cacheline-aligned");
-static_assert(offsetof(DistTaskPayload, scalars) % 64 == 0, "payload scalars must be cacheline-aligned");
 
 struct DistOutputLayout {
     uint64_t offsets[MAX_TENSOR_ARGS] = {};

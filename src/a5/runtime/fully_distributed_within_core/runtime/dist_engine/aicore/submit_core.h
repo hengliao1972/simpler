@@ -313,6 +313,7 @@ struct DistSubmitCtx {
     __gm__ DistTaskPayload *payload;
     int32_t task_id;
     int32_t tensor_count;
+    int32_t scalar_count;
     uint64_t output_bytes;
     TaskOutputTensors result;
     int32_t fanin[kMaxFanin];
@@ -337,6 +338,7 @@ PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &
     }
     ctx.result.set_task_id(PTO2TaskId::make(0, static_cast<uint32_t>(ctx.task_id)));
     ctx.tensor_count = args.tensor_count();
+    ctx.scalar_count = args.scalar_count();
     ctx.output_bytes = 0;
     ctx.fanin_count = 0;
     ctx.kernel_id = INVALID_KERNEL_ID;
@@ -380,21 +382,18 @@ dist_submit_flush_payload_range(__gm__ DistTaskPayload *payload, uint64_t offset
 }
 
 PTO_DEVICE_FUNC inline void
-dist_submit_flush_payload(__gm__ DistTaskPayload *payload, int32_t tensor_count, int32_t scalar_count) {
+dist_submit_flush_output_payload(__gm__ DistTaskPayload *payload, int32_t tensor_count, bool has_outputs) {
 #if defined(__CCE_AICORE__)
+    if (!has_outputs) return;
     __asm__ volatile("" ::: "memory");
-    dist_submit_flush_payload_range(payload, 0, offsetof(DistTaskPayload, tensors));
     dist_submit_flush_payload_range(
         payload, offsetof(DistTaskPayload, tensors), static_cast<uint64_t>(tensor_count) * sizeof(Tensor)
-    );
-    dist_submit_flush_payload_range(
-        payload, offsetof(DistTaskPayload, scalars), static_cast<uint64_t>(scalar_count) * sizeof(uint64_t)
     );
     dsb((mem_dsb_t)0);
 #else
     (void)payload;
     (void)tensor_count;
-    (void)scalar_count;
+    (void)has_outputs;
 #endif
 }
 
@@ -409,9 +408,8 @@ PTO_DEVICE_FUNC void calculate_output_layout(const L0TaskArgs &args, DistOutputL
 
 PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSubmitCtx &ctx, DistSubmitKind kind) {
     if (ctx.payload == nullptr) return false;
-    ctx.payload->tensor_count = args.tensor_count();
-    ctx.payload->scalar_count = args.scalar_count();
     ctx.tensor_count = args.tensor_count();
+    ctx.scalar_count = args.scalar_count();
 
     const size_t ring = g_dist.heap_size;
     DistOutputLayout layout;
@@ -441,17 +439,7 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
 
     for (int32_t i = 0; i < ctx.tensor_count; i++) {
         const TensorArgType tag = args.tag(i);
-        ctx.payload->tags[i] = tag;
         if (tag != TensorArgType::OUTPUT) {
-#if defined(__CCE_AICORE__)
-            if (args.tensor(i).tensor_from_gm()) {
-                Tensor::copy(ctx.payload->tensors[i], args.tensor(i).gm_ref());
-            } else {
-                Tensor::copy(ctx.payload->tensors[i], args.tensor(i).ref());
-            }
-#else
-            Tensor::copy(ctx.payload->tensors[i], args.tensor(i).ref());
-#endif
             continue;
         }
         const auto &ci = args.tensor(i).create_info();
@@ -470,19 +458,67 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
         slot_t.owner_task_id.raw = ctx.result.task_id().raw;
         ctx.result.materialize_output(slot_t);
     }
-    for (int32_t i = 0; i < args.scalar_count(); i++) {
-        ctx.payload->scalars[i] = args.scalar(i);
-    }
-    dist_submit_flush_payload(ctx.payload, ctx.tensor_count, args.scalar_count());
+    dist_submit_flush_output_payload(ctx.payload, ctx.tensor_count, total > 0);
     ctx.self->heap_next = task_base + layout.total_output_size;
     ctx.output_bytes = total;
     return true;
 }
 
-PTO_DEVICE_FUNC inline TensorArgType payload_tag(const DistSubmitCtx &ctx, int32_t i) { return ctx.payload->tags[i]; }
+PTO_DEVICE_FUNC inline void
+dist_submit_copy_arg_tensor(__gm__ Tensor &dst, const L0TaskArgs &args, const DistSubmitCtx &ctx, int32_t i) {
+    if (args.tag(i) == TensorArgType::OUTPUT) {
+        Tensor::copy(dst, ctx.payload->tensors[i]);
+        return;
+    }
+#if defined(__CCE_AICORE__)
+    if (args.tensor(i).tensor_from_gm()) {
+        Tensor::copy(dst, args.tensor(i).gm_ref());
+    } else {
+        Tensor::copy(dst, args.tensor(i).ref());
+    }
+#else
+    Tensor::copy(dst, args.tensor(i).ref());
+#endif
+}
 
-PTO_DEVICE_FUNC inline const auto &payload_tensor(const DistSubmitCtx &ctx, int32_t i) {
-    return ctx.payload->tensors[i];
+template <typename FaninArrPtr>
+PTO_DEVICE_FUNC void build_ring_slot_from_submit(
+    __gm__ RingSlot &s, int32_t task_id, int32_t func_id, uint64_t fn_addr, const L0TaskArgs &args,
+    const DistSubmitCtx &ctx, FaninArrPtr fanin, int32_t fc, int32_t sub_block_id, bool is_multicore, int32_t won_block,
+    int32_t won_slot
+) {
+    s.occupied = true;
+    s.task_id = task_id;
+    s.func_id = func_id;
+    s.function_bin_addr = fn_addr;
+    s.built = true;
+    s.tensor_count = ctx.tensor_count;
+    s.scalar_count = ctx.scalar_count;
+    for (int32_t i = 0; i < ctx.tensor_count; i++)
+        dist_submit_copy_arg_tensor(s.tensors[i], args, ctx, i);
+    for (int32_t j = 0; j < ctx.scalar_count; j++)
+        s.scalars[j] = args.scalar(j);
+    int32_t n = 0;
+    for (int32_t i = 0; i < ctx.tensor_count; i++)
+        s.args[n++] = reinterpret_cast<uint64_t>(&s.tensors[i]);
+    for (int32_t j = 0; j < ctx.scalar_count; j++)
+        s.args[n++] = s.scalars[j];
+    s.local_ctx.s_block_idx = 0;
+    s.local_ctx.s_block_num = 1;
+    s.local_ctx.async_ctx.completion_count = nullptr;
+    s.local_ctx.async_ctx.completion_error_code = nullptr;
+    s.local_ctx.async_ctx.completion_entries = nullptr;
+    s.local_ctx.async_ctx.completion_capacity = 0;
+    s.local_ctx.async_ctx.task_token.raw = UINT64_MAX;
+    s.global_ctx.sub_block_id = sub_block_id;
+    s.args[SPMD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&s.local_ctx);
+    s.args[SPMD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&s.global_ctx);
+    s.fanin_count = fc;
+    for (int32_t k = 0; k < fc; k++)
+        s.fanin[k] = fanin[k];
+    s.is_multicore = is_multicore;
+    s.won_block = won_block;
+    s.won_slot = won_slot;
 }
 
 PTO_DEVICE_FUNC void dist_submit_prepare_map(__gm__ DistCore *self, int32_t task_id) {
@@ -497,33 +533,66 @@ PTO_DEVICE_FUNC void dist_submit_add_fanin(int32_t fanin[], int32_t &fanin_count
     if (fanin_count < kMaxFanin) fanin[fanin_count++] = producer;
 }
 
-PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const DistSubmitCtx &ctx, int32_t fanin[]) {
+PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const DistSubmitCtx &ctx, int32_t fanin[]) {
     int32_t fc = 0;
     for (int32_t i = 0; i < ctx.tensor_count; i++) {
-        const TensorArgType tag = payload_tag(ctx, i);
+        const TensorArgType tag = args.tag(i);
         if (tag == TensorArgType::OUTPUT) continue;
-        const uint64_t owner_raw = payload_tensor(ctx, i).owner_task_id.raw;
+#if defined(__CCE_AICORE__)
+        if (args.tensor(i).tensor_from_gm()) {
+            const uint64_t owner_raw = args.tensor(i).gm_ref().owner_task_id.raw;
+            if (owner_raw != UINT64_MAX) {
+                dist_submit_add_fanin(fanin, fc, static_cast<int32_t>(owner_raw & 0xFFFFFFFFu));
+            }
+            if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
+            const int32_t p = dist_tensor_map_lookup(ctx.self->map, args.tensor(i).gm_ref());
+            dist_submit_add_fanin(fanin, fc, p);
+        } else {
+            const Tensor &t = args.tensor(i).ref();
+            const uint64_t owner_raw = t.owner_task_id.raw;
+            if (owner_raw != UINT64_MAX) {
+                dist_submit_add_fanin(fanin, fc, static_cast<int32_t>(owner_raw & 0xFFFFFFFFu));
+            }
+            if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
+            const int32_t p = dist_tensor_map_lookup(ctx.self->map, t);
+            dist_submit_add_fanin(fanin, fc, p);
+        }
+#else
+        const Tensor &t = args.tensor(i).ref();
+        const uint64_t owner_raw = t.owner_task_id.raw;
         if (owner_raw != UINT64_MAX) dist_submit_add_fanin(fanin, fc, static_cast<int32_t>(owner_raw & 0xFFFFFFFFu));
         if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
-#if defined(__CCE_AICORE__)
-        const int32_t p = dist_tensor_map_lookup(ctx.self->map, payload_tensor(ctx, i));
-#else
-        const Tensor &t = payload_tensor(ctx, i);
         if (t.manual_dep) continue;
         const int32_t p = dist_tensor_map_lookup(ctx.self->map, t);
-#endif
         dist_submit_add_fanin(fanin, fc, p);
+#endif
     }
     return fc;
 }
 
-PTO_DEVICE_FUNC void dist_submit_register_outputs(DistSubmitCtx &ctx, bool include_existing) {
+PTO_DEVICE_FUNC void dist_submit_insert_tensor(DistSubmitCtx &ctx, const L0TaskArgs &args, int32_t i) {
+    if (args.tag(i) == TensorArgType::OUTPUT) {
+        dist_tensor_map_insert(ctx.self->map, ctx.payload->tensors[i], ctx.task_id);
+        return;
+    }
+#if defined(__CCE_AICORE__)
+    if (args.tensor(i).tensor_from_gm()) {
+        dist_tensor_map_insert(ctx.self->map, args.tensor(i).gm_ref(), ctx.task_id);
+    } else {
+        dist_tensor_map_insert(ctx.self->map, args.tensor(i).ref(), ctx.task_id);
+    }
+#else
+    dist_tensor_map_insert(ctx.self->map, args.tensor(i).ref(), ctx.task_id);
+#endif
+}
+
+PTO_DEVICE_FUNC void dist_submit_register_outputs(DistSubmitCtx &ctx, const L0TaskArgs &args, bool include_existing) {
     for (int32_t i = 0; i < ctx.tensor_count; i++) {
-        const TensorArgType tag = payload_tag(ctx, i);
+        const TensorArgType tag = args.tag(i);
         const bool registers_producer =
             tag == TensorArgType::OUTPUT ||
             (include_existing && (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING));
-        if (registers_producer) dist_tensor_map_insert(ctx.self->map, payload_tensor(ctx, i), ctx.task_id);
+        if (registers_producer) dist_submit_insert_tensor(ctx, args, i);
     }
 }
 
