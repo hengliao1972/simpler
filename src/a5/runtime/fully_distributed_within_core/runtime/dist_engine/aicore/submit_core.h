@@ -593,8 +593,7 @@ PTO_DEVICE_FUNC void dist_submit_register_outputs(DistSubmitCtx &ctx, const L0Ta
     for (int32_t i = 0; i < ctx.tensor_count; i++) {
         const TensorArgType tag = args.tag(i);
         const bool registers_producer =
-            tag == TensorArgType::OUTPUT ||
-            (include_existing && (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING));
+            include_existing && (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING);
         if (registers_producer) dist_submit_insert_tensor(ctx, args, i);
     }
 }
