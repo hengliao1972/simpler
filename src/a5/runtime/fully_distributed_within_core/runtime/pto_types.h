@@ -79,10 +79,10 @@ enum class PTO2ScopeMode : uint8_t {
  * binding get_ref() on an rvalue is compile-time rejected to prevent dangling.
  *
  * LIFETIME — single-scope only:
- *   Internally this class stores pointers into the submitting task's payload
- *   (PTO2TaskPayload::tensors[]), which lives in a ring-buffer slot. After
- *   scope_end the slot becomes eligible for reuse, and a later submit will
- *   overwrite the same Tensor storage in place. Therefore the
+ *   Internally this class stores pointers into the submitting task's
+ *   runtime-owned output descriptor payload. After scope_end the payload slot
+ *   becomes eligible for reuse, and a later submit will overwrite the same
+ *   Tensor storage in place. Therefore the
  *   TaskOutputTensors instance, the const Tensor& returned by get_ref(), and
  *   any pointer derived from either MUST NOT outlive the PTO2_SCOPE in which
  *   submit was called — do not move/copy them to outer-scope variables, do
