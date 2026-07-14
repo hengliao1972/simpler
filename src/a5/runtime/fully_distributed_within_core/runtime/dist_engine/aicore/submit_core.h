@@ -401,7 +401,6 @@ PTO_DEVICE_FUNC void calculate_output_layout(const L0TaskArgs &args, DistOutputL
     layout.total_output_size = 0;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         if (args.tag(i) != TensorArgType::OUTPUT) continue;
-        layout.offsets[i] = layout.total_output_size;
         layout.buffer_sizes[i] = TensorCreateInfo::buffer_size_bytes(args.tensor(i).create_info());
         layout.total_output_size += PTO2_ALIGN_UP(layout.buffer_sizes[i], PTO2_PACKED_OUTPUT_ALIGN);
     }
@@ -438,6 +437,7 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
         }
     }
 
+    uint64_t output_offset = 0;
     for (int32_t i = 0; i < ctx.tensor_count; i++) {
         const TensorArgType tag = args.tag(i);
         if (tag != TensorArgType::OUTPUT) {
@@ -453,11 +453,13 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
             }
             return false;
         }
-        const uint64_t phys = (task_base + layout.offsets[i]) % ring;
+        const uint64_t buffer_size = layout.buffer_sizes[i];
+        const uint64_t phys = (task_base + output_offset) % ring;
         __gm__ Tensor &slot_t = ctx.payload->tensors[i];
-        init_tensor_from_create_info(slot_t, ci, g_dist.heap_base + phys, layout.buffer_sizes[i]);
+        init_tensor_from_create_info(slot_t, ci, g_dist.heap_base + phys, buffer_size);
         slot_t.owner_task_id.raw = ctx.result.task_id().raw;
         ctx.result.materialize_output(slot_t);
+        output_offset += PTO2_ALIGN_UP(buffer_size, PTO2_PACKED_OUTPUT_ALIGN);
     }
     dist_submit_flush_output_payload(ctx.payload, ctx.tensor_count, total > 0);
     ctx.self->heap_next = task_base + layout.total_output_size;
