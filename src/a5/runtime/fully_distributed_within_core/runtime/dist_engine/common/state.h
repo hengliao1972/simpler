@@ -49,7 +49,6 @@ static_assert(sizeof(DistTaskPayload) % 64 == 0, "DistTaskPayload must not share
 static_assert(offsetof(DistTaskPayload, tensors) % 64 == 0, "payload tensors must be cacheline-aligned");
 
 struct DistOutputLayout {
-    uint64_t offsets[MAX_TENSOR_ARGS];
     uint64_t buffer_sizes[MAX_TENSOR_ARGS];
     uint64_t total_output_size;
 };
