@@ -173,9 +173,10 @@ class TensorRef {
     };
 
 public:
-    PTO_DEVICE_FUNC TensorRef() :
-        ptr_(nullptr),
-        kind_(kTensor) {}
+    // Slots become valid only when an add_* call assigns both the pointer and
+    // its kind. Runtime consumers are bounded by tensor_count_, so eagerly
+    // initializing all MAX_TENSOR_ARGS slots here only writes unused storage.
+    PTO_DEVICE_FUNC TensorRef() = default;
     TensorRef(const TensorRef &) = delete;
     TensorRef(TensorRef &&) = delete;
     TensorRef &operator=(const TensorRef &) = delete;
@@ -207,6 +208,11 @@ public:
     PTO_DEVICE_FUNC bool refers_to(const Tensor *t) const { return ptr_ == t; }
     PTO_DEVICE_FUNC bool refers_to(const TensorCreateInfo *ci) const { return create_info_ == ci; }
 };
+
+static_assert(
+    std::is_trivially_default_constructible_v<TensorRef>,
+    "unused TensorRef slots must remain lazily initialized"
+);
 
 /**
  * Aggregated argument container for pto_submit_task
