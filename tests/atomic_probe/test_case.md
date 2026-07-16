@@ -33,6 +33,9 @@ DCCI、`st_dev` 与 atomic 的 API 功能、隔离规则和代码评审清单见
   同-line 的 ALL/OUT/ATOMIC 三项按正确性门禁返回非零，另外五项 control 全部通过。
 - 2026-07-13：新增 `ATOMIC_USAGE_GUIDE.md`，汇总 DCCI、无参 DCI、bypass load/store、atomic、
   DSB 的本机 API 边界、实测状态和 64B cacheline 隔离规则。
+- 2026-07-14：新增 CCEC `ld_dev_fanout_publish`。24 AIV 受控对照中，ordinary+DSB 为
+  `0/4416` 可见，st_dev+DSB 与 AtomicExch 均为 `4416/4416`；72 AIV 持续读压力同时破坏独立
+  control 对照，单列记录为高压力进展失败，不能外推为某个 data writer 的独立语义结论。
 - 原始环境与定量结果记录在 `tests/ATOMIC_MINIBENCH_ONBOARD_LOG.md` 的 2026-07-11 与 2026-07-13 小节。
 
 ## 权威覆盖矩阵
@@ -289,6 +292,70 @@ AtomicExch 没有复现 st_dev 的末值回退。该判定只检查每个 trial 
 绝无重排；本用例仍是两个核写同一 cacheline 的不同 4B slot，不覆盖两个核写同一个 4B 地址，也不能
 外推到其他 atomic 类型或其他内存序场景。
 
+## `ld_dev` 多读者 fanout 发布对照
+
+`ccec/ld_dev_fanout_publish.cpp` 固定 block0 为唯一 writer，其余所有实际启动的 AIV 都是 reader，
+每个 reader 从始至终只用 raw `ld_dev` 读取同一个 data word。data、host-only launch config、
+control epoch、ready、ack、timing 和每核结果分别从独立 64B cacheline 开始；data line 不含任何
+atomic 控制字，全用例不执行 DCCI。runner 默认启动 72 个 AIV，也可用
+`ATOMIC_PROBE_AIVS=2..72` 缩小并发数；host 会逐核检查
+marker，并要求每个 block 的 `(get_coreid(), get_subblockid())` 二元组唯一，不能把请求 block 数当作
+实际多核参与证明。
+
+三个 mode 的精确 writer 序列为：
+
+| Mode | writer 发布序列 | 单指令 timing | 发布 timing |
+|---:|---|---|---|
+| 0 | `volatile ordinary scalar GM store -> DSB`；明确无 DCCI | 只包围 ordinary store | 包含其后的 DSB |
+| 1 | `st_dev -> DSB` | 只包围 `st_dev` | 包含其后的 DSB |
+| 2 | `AtomicExch`；不额外补 DSB | 包围 AtomicExch | 与单指令 timing 相同 |
+
+每个 kernel 执行 64 轮。每轮 reader 先在独立 ready line 上 atomic 加一，再用 `ld_dev` 等待 writer
+通过独立 control line 发布 epoch；writer 确认全部 reader ready 后才写本轮唯一序列值。reader
+只有精确看到该值或设备侧 20ms 有限超时后才 atomic ack；writer 等到全部 ack 后才进入下一轮。
+因此正常路径不允许 writer 跳过中间值，判定的是“每个 reader 逐轮看到完整序列”，不是只在 kernel
+结束时碰巧读到最终值。失败 reader 仍会 ack，所有控制与 data 轮询都有 `get_sys_cnt()` 超时，错误
+mode 必须返回首错和 timeout，不能死循环。
+
+用例同时记录三类 A5 sys-counter 指标：单条 writer 写指令周期、包含必要 DSB 的 writer 发布序列
+周期、从 write start 到全部 reader ack 的端到端周期。host 输出 min/p50/p95/max/mean；单指令数据
+包含两次计数器读取的固定开销，跨 mode 比较必须使用同一并发数和独占设备。计时 record、每核结果
+均在被测轮次结束后用 atomic 写到非 data line，不参与本轮端到端时间。
+
+三个 mode 都使用同一正确性门禁：所有 `reader * 64` 次读取都必须精确，control 不得 timeout，
+writer 每轮 `ld_dev` 快照与 kernel 返回后的最终 GM 值也必须精确。ordinary mode 不会为了让门禁通过
+而补 DCCI；它另用 writer 本核 ordinary load 检查最终 store，区分“写者本核 store 已执行但没有
+发布到 GM”和“store 根本没执行”。若 ordinary dirty line 对 `ld_dev` 不可见，就应以非零退出码和
+明确 timeout 暴露。
+
+device 0 独占执行的 24 AIV 受控结果如下；每项包含 3 个独立 kernel launch、每次 64 轮，即每个 mode
+共检查 `23 * 64 * 3 = 4416` 个 reader/round 观察点：
+
+| Writer mode | reader 精确看到本轮值 | writer 单指令 mean | 完整发布 mean | write-start 到全部 ack mean |
+|---|---:|---:|---:|---:|
+| ordinary+DSB，无 DCCI | `0/4416` | 16.520 us | 16.530 us | 20018.053 us（timeout 路径） |
+| st_dev+DSB | `4416/4416` | 5.525 us | 5.707 us | 7.193 us |
+| AtomicExch | `4416/4416` | 15.597 us | 15.597 us | 17.478 us |
+
+ordinary writer 的本核 ordinary load 始终看到最终 store，但 writer 的 `ld_dev`、所有 reader 的
+`ld_dev` 和 kernel 返回后的 GM 均仍为 0；因此该路径精确暴露“写入本核 scalar cache、DSB 完成，
+但没有发布到 bypass reader 所见 GM”。st_dev 的本用例结果只覆盖每轮一次写且逐轮 DSB 的发布序列，
+不能覆盖或推翻重复 st_dev 压力用例已经记录的末值回退。
+
+72 AIV 独占压力确认 72 个 block 的 `(core, subblock)` 均唯一，但三种 mode 的独立 control line 也
+分别出现 `5263/13632`、`10072/13632`、`5967/13632` 次 timeout；data 精确观察分别为
+`0/13632`、`2986/13632`、`5921/13632`。把 watchdog 从 2ms 提高到 20ms 后，写指令或发布序列的
+长尾也从约 2ms 移到约 20ms，仍未恢复 control。现有证据只说明 36+ AIV（35+ 个无退避
+`ld_dev` reader）的持续读压力会造成与 watchdog 边界绑定的进展失败；在 control 已失败时，三种
+data 结果不是隔离的写入语义对照，不能据此声称 st_dev 或 AtomicExch 本身在 72 AIV 下丢写。默认
+72 AIV 保留这一高压力
+看护；需要比较三种 writer 的可见性与 timing 时，使用已验证的 `ATOMIC_PROBE_AIVS=24` 受控配置。
+
+```bash
+ATOMIC_PROBE_AIVS=24 ATOMIC_PROBE_FANOUT_LAUNCHES=3 \
+  tests/atomic_probe/ccec/run_all.sh ld_dev_fanout_publish
+```
+
 ## 其余探针
 
 | 文件 | 类型 | 验证内容 |
@@ -303,6 +370,7 @@ AtomicExch 没有复现 st_dev 的末值回退。该判定只检查每个 trial 
 | `ascendc/st_dev_single_core_stress.asc` / `ccec/st_dev_single_core_stress.cpp` | regression gating + control | 只启动一个 AIV；覆盖三个 allocation line 偏移、单/双地址 loop-end DSB，以及同址逐写 DSB 控制 |
 | `ascendc/st_dev_separate_line_stress.asc` / `ccec/st_dev_separate_line_stress.cpp` | regression gating | 只含分-line 数据路径；四模式覆盖两组活跃 block 与两种 allocation 内 line offset，100000 次精确终值检查 |
 | `ascendc/atomic_exch_same_line.asc` / `ccec/atomic_exch_same_line.cpp` | gating + control | 与 st_dev 同构的 AtomicExch 末值顺序对照；三组路径均精确通过 |
+| `ccec/ld_dev_fanout_publish.cpp` | regression gating + timing | 唯一 writer 以 ordinary+DSB、st_dev+DSB、AtomicExch 三种方式逐轮发布；其余全部 AIV 只用 ld_dev 读取完整序列，并记录 writer/全读者周期 |
 | `ascendc/dcci_atomic_stress.asc` | legacy observation | 旧的混合 stress；不再作为 DCCI selector 语义证据 |
 | `ccec/dcci_clean_clobber.cpp` | gating | 有序 dirty/clean line 的 dcci clobber 与 control |
 | `ascendc/mb2_flags_clobber.asc` | gating + observation | AtomicMax flags 无丢失；store+dcci 仅统计 |
