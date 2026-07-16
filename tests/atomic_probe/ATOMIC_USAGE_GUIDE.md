@@ -28,19 +28,27 @@ load/store 和 atomic 的代码。API 定义来自本机 CANN 头文件，行为
    已经成功完成的 atomic 更新。
 4. 基于上述实测，本仓采用保守布局规则：atomic 控制字与被 DCCI 的 data 分 cacheline；关键 atomic
    默认一变量独占一条 64B line；其整条 line 按 atomic-only 管理，不混入普通 scalar store/DCCI。
-5. `st_dev`/`WriteGmByPassDCache` 绕过 scalar DCache，但不因此获得跨核 coherence、原子性或
-   repeated-store 精确终值保证。当前单 AIV 与 multi-AIV 场景都已复现终值回退；测试仍未确定
-   根因就是编译器或硬件 store 重排。
-6. AscendC/CCEC 单 AIV 独立压力已经排除跨核因素：line1 同址、257 次写后仅一次 DSB 分别复现
+5. 所有跨核共享的可变控制状态和交权动作都必须使用 atomic 或已有明确契约的硬件同步原语，包括
+   `lock/state/phase/ready/done/remaining/refcount/cursor`。普通 scalar store、`st_dev`、DCCI、DSB
+   都不能替代 atomic 交权。该规则不要求业务 payload 的每个 word 都执行 atomic：payload 可以在
+   atomic 已授予某个核整条 64B line 的排他所有权后使用普通 scalar+DCCI；全生命周期不可变的纯读
+   数据也不需要为了读取而改成 atomic。
+6. `st_dev`/`WriteGmByPassDCache` 绕过 scalar DCache，但不因此获得跨核 coherence、原子性或
+   repeated-store 精确终值保证。当前单 AIV 与 multi-AIV 场景都已复现终值回退；因此本仓把
+   **`st_dev` 写路径视为当前不可用**，禁止用于需要正确性保证的业务数据或控制状态，只允许保留在
+   明确隔离的探针、诊断或待迁移代码中。该政策不等于已经证明每一条孤立 `st_dev` 都必然失败；
+   在 ISA/实现约束查清并由业务同构精确回归支持前，不重新启用。测试仍未确定根因就是编译器或
+   硬件 store 重排。
+7. AscendC/CCEC 单 AIV 独立压力已经排除跨核因素：line1 同址、257 次写后仅一次 DSB 分别复现
    `3/2000000` 与 `4/2000000` mismatch；同一个 AIV 每轮依次写 line1/line2 时分别为
    `83821/1000000` 与 `78130/1000000`。对应的逐写 DSB 控制均为 0。准确表述是“当前精确终值会
    回退，跨核不是必要条件”，不能把这一现象直接命名为已查明的底层乱序机制。
-7. 工程调用默认显式选择 `SINGLE_CACHE_LINE`。在获得专项精确证据前，本仓并发协议默认禁用
+8. 工程调用默认显式选择 `SINGLE_CACHE_LINE`。在获得专项精确证据前，本仓并发协议默认禁用
    `ENTIRE_DATA_CACHE`；后者的 scope 是发指令核整个 data cache，可能把 SINGLE dirty-writeback
    的风险扩大到与当前目标地址无关的 entry，但该扩大风险目前是实现定义与实测机制的组合推论。
-8. DSB 是当前核的 Data Synchronization Barrier，不是跨核 barrier，也不提供 cache coherence。
+9. DSB 是当前核的 Data Synchronization Barrier，不是跨核 barrier，也不提供 cache coherence。
    跨核交权需要独立 atomic phase/lock；AIV 会合需要对应同步原语，并且写发布前仍要先 DSB。
-9. 只要某条 data line 至少有一个核可能写，多个核对该 line 的 ordinary scalar 读写和 DCCI 就必须
+10. 只要某条 data line 至少有一个核可能写，多个核对该 line 的 ordinary scalar 读写和 DCCI 就必须
    100% 按不安全处理，整个 64B line 放进同一个排他所有权区。仅当数据在全部并发读者生命周期内
    确定不可变时，才能把纯读共享作为另一种协议单独论证。
 
@@ -56,6 +64,11 @@ load/store 和 atomic 的代码。API 定义来自本机 CANN 头文件，行为
 表中的“绕过 DCache”来自本机 `kernel_scalar.h`：AscendC 的 1/2/4/8B
 `WriteGmByPassDCache`、`ReadGmByPassDCache` 分别直接调用 `st_dev`、`ld_dev`。这只说明访问路径，
 不能外推为跨核内存模型保证。
+
+跨核控制面的判定以“变量是否由多个核观察或更新”而不是“源码是否看起来只有一个 writer”为准。
+只要其他核会依据该值决定是否读取 payload、推进状态或回收资源，该值就是跨核交权变量，必须使用
+atomic 或已有明确契约的硬件同步原语。atomic 完成目标 word 的更新后，payload 可见性和 cacheline
+所有权仍由独立的 DSB/DCCI/布局协议保证，不能从 atomic 控制字自动外推到邻接数据。
 
 ## 2. DCCI API 与参数
 
@@ -152,6 +165,24 @@ ENTIRE 不会直接操作其他核的 cache，但它可能把本核持有的任�
 用例。确认发指令核没有共享 dirty line、执行期间没有其他核更新相关 line，只能作为必要的审计前提，
 当前证据尚未证明这些条件足以构成通用硬件安全保证。
 
+### 2.6 DCCI 之后仍需要 DSB
+
+本机 CANN 9.1 的 AscendC `DataCacheCleanAndInvalid` wrapper 只调用 `DcciGMImpl`，后者直接下沉为
+`dcci(...)`；这条调用链没有隐含 `dsb`。本机头文件也没有给出“DCCI 返回即代表 cache clean/
+invalidation 已完成、后续访问可立即依赖”的契约。因此本仓不能把 DCCI 当作 DSB 的替代品。
+
+只要后续动作依赖 DCCI 已经完成，就必须在 DCCI 后显式执行
+`DataSyncBarrier<MemDsbT::ALL>()`/`dsb(DSB_ALL)`：
+
+- 写者发布 ordinary dirty data：`ordinary store -> DCCI OUT -> DSB -> atomic publish`；
+- 读者取得所有权后刷新 stale entry：`atomic acquire -> DSB -> DCCI -> DSB -> ordinary load`；
+- 连续处理多条 cacheline 时，可以先对所有目标 line 发出 DCCI，再在真正读取、发布或交权前统一执行
+  一次 DSB；不能在中间已经依赖某条 line 完成时把 barrier 推迟到最后。
+
+HCCL 的 `FlushDataCache` helper 和本仓 fdwic 的 cache-region helper 都采用“DCCI 后显式 DSB”，只能
+作为本机实际用法的佐证，不能代替 API/ISA 契约。反过来也要注意：DSB 只等待发指令核的相关 memory
+access，不提供跨核会合或 coherence，更不能修复一个本来就会覆盖其他核新值的 stale dirty DCCI。
+
 ## 3. `st_dev` / bypass load-store
 
 ### 3.1 API
@@ -166,6 +197,10 @@ uint32_t value = ReadGmByPassDCache<uint32_t>(address);
 本机 A5 支持 1/2/4/8B 整数类型。CCEC 探针使用 `st_dev_b8/b16/b32/b64`、
 `ld_dev_b8/b16/b32/b64` 等便捷封装，底层对应 `st_dev`、`ld_dev` builtin。
 
+这里列出 API 只为说明测试与存量代码的映射，不表示推荐业务使用 `st_dev`。当前禁用政策针对
+bypass store；`ld_dev`/`ReadGmByPassDCache` 仍是可单独审计的读取接口，但它不提供 coherence、
+atomic 或跨核同步语义，也不能反向证明配套 `st_dev` 写路径可用。
+
 ### 3.2 必须避免的误解
 
 - bypass DCache 不等于 atomic；两个核写同一个 word 仍是数据竞争。
@@ -173,6 +208,8 @@ uint32_t value = ReadGmByPassDCache<uint32_t>(address);
 - bypass DCache 不等于 store 顺序已经满足业务协议；发布前仍需要 DSB。
 - DSB 只等待当前核此前的相应 memory access，不会让另一个核自动失效 cache，也不是 AIV 会合。
 - 将两个 writer 拆到不同 64B line，仍不足以保证 repeated `st_dev` 的最后一轮值。
+- 单 AIV、单 writer、同址也已经失败，因此不能再把“没有跨核并发”当作 `st_dev` 的安全条件。
+- 逐写 DSB 的控制样本为 0 mismatch，只是观察结果，不能作为重新启用 `st_dev` 业务写路径的条件。
 
 ### 3.3 当前实测边界
 
@@ -205,17 +242,19 @@ uint32_t value = ReadGmByPassDCache<uint32_t>(address);
 
 ### 3.4 使用建议
 
-1. `st_dev` 适合绕过本核 scalar DCache 的单次数据传输或诊断读取，不应直接当作多 AIV 共享状态的
-   原子寄存器。
-2. 如果业务要求“最后一次赋值必须精确保留”，`AtomicExch` 是优先候选，不要直接用 repeated
-   `st_dev` 模拟 exchange。当前 AtomicExch 只有旧同构三路径各 `0/4000` 的证据；替换后仍必须使用
-   atomic-only 布局，并按实际业务拓扑、次数和时序做同构精确回归。它也不能抵御同-line stale
-   dirty DCCI writeback。
-3. `st_dev` 写完、通过 atomic flag/phase 交权之前，至少执行一次 `DataSyncBarrier<MemDsbT::ALL>()`
-   或 `dsb(DSB_ALL)`。
+1. 新增或修改业务代码时，不使用 `st_dev`/`WriteGmByPassDCache` 写 GM。当前证据没有覆盖所有
+   “只写一次”的地址、宽度和时序，不能据此断言单次 store 必错；但单核 repeated store 已经推翻
+   可依赖的通用正确性边界，因此本仓按不可用处理，而不是让每个调用点自行猜测例外。
+2. 如果业务要求“最后一次赋值必须精确保留”，`AtomicExch` 是优先候选，不要用 `st_dev` 模拟
+   exchange。当前 AtomicExch 只有旧同构三路径各 `0/4000` 的证据；替换后仍必须使用 atomic-only
+   布局，并按实际业务拓扑、次数和时序做同构精确回归。它也不能抵御同-line stale dirty DCCI
+   writeback。
+3. 仅在探针或尚未迁移的存量路径中保留 `st_dev` 时，写后、通过 atomic flag/phase 交权前仍至少
+   执行一次 `DataSyncBarrier<MemDsbT::ALL>()` 或 `dsb(DSB_ALL)`；这只是必要排序，不能把该路径
+   升级为可用或安全。
 4. 逐写 DSB 在当前单 AIV 同址/双址压力中分别为两端 `0/2000000` 与 `0/1000000`，旧多 AIV
    同-line对照也为 `0/4000`。它在已测样本中抑制了错误，但仍只是控制路径，不是通用 ISA 正确性
-   证明；性能代价也必须由业务 workload 单独评估。
+   证明，也不是业务放行方案。
 5. 不要在同一 64B line 上混用 ordinary scalar store 和 bypass/atomic 更新；后续 DCCI 可能用
    ordinary dirty 快照覆盖 bypass/atomic 新值。
 
@@ -337,7 +376,7 @@ atomic acquire 本身不会替当前核刷新 data cache，所以第 3 步不能
 所以它必须在取得整条 data line 的唯一所有权之后执行。若需要并发多读者，必须另行设计 reader
 生命周期和 writer 排他阶段；不能直接让多个读者各自 DCCI，同时允许 writer 修改同一 line。
 
-### 5.3 bypass data + atomic phase
+### 5.3 bypass data + atomic phase（仅解释存量/探针时序）
 
 最小发布顺序为：
 
@@ -346,9 +385,10 @@ writer: st_dev(data) -> DSB -> atomic publish phase
 reader: observe atomic phase -> DSB -> ld_dev(data)
 ```
 
-该顺序避免普通 scalar stale cache，并已在简单 publish/observe 用例中使用。但它不能修复本手册
-记录的单 AIV 或多 AIV repeated `st_dev` 终值问题。若同一地址需要多次覆盖且最后值必须精确，可评估
-`AtomicExch`，并为该业务建立独立精确压力用例。
+该顺序只是存量代码或探针使用 bypass store 时的最低排序前提，不是本仓推荐的新业务设计。它避免
+把普通 scalar stale cache 混入该特定 publish/observe 时序，但不能修复本手册记录的单 AIV 或多 AIV
+repeated `st_dev` 终值问题，也不能使 `st_dev` 写路径重新可用。新业务应改用有专项证据的 atomic
+操作，或使用受 64B line 排他所有权保护的普通 scalar+DCCI 协议，并建立同构精确压力用例。
 
 ## 6. 场景判定表
 
@@ -358,10 +398,11 @@ reader: observe atomic phase -> DSB -> ld_dev(data)
 | dirty stale line，其他核 atomic 更新同 line，随后 SINGLE DCCI | atomic 新值被旧快照覆盖 | 禁止；atomic 与 data 分 line |
 | dirty data 与 atomic 位于不同 line，随后 SINGLE DCCI(data) | 当前八模式对照中 atomic 新值保留 | 推荐基础隔离方式 |
 | dirty data 与 atomic 分 line，但执行 ENTIRE DCCI | scope 定义可覆盖其他 entry；结合 SINGLE writeback 得到理论风险，尚无精确 clobber 证据 | 本仓并发区默认禁用，等待专项用例 |
-| 单 AIV 独自 repeated `st_dev`，仅 loop-end DSB | 同址低频、双址高频复现终值错误；两种前端一致 | 不能用于必须保留最后值的状态 |
-| 单 AIV repeated `st_dev`，每次写后 DSB | 当前同址/双址压力均为 0 mismatch | 仅作已测控制；不升级为通用保证，评估性能 |
-| 两 AIV repeated `st_dev`，写同 line不同 slot | 稳定复现终值错误 | 禁止用于精确共享状态 |
-| 两 AIV repeated `st_dev`，各写独占 line | 高频或低频复现终值错误 | 分 line 仍不能当修复方案 |
+| 孤立单次 `st_dev` | 新压力未直接证明每条单次 store 必错，但也没有足够契约和同构压力支持业务启用 | 当前仍按业务写路径不可用处理 |
+| 单 AIV 独自 repeated `st_dev`，仅 loop-end DSB | 同址低频、双址高频复现终值错误；两种前端一致 | `st_dev` 业务写路径禁用 |
+| 单 AIV repeated `st_dev`，每次写后 DSB | 当前同址/双址压力均为 0 mismatch | 仅作已测控制；不能作为业务放行条件 |
+| 两 AIV repeated `st_dev`，写同 line不同 slot | 稳定复现终值错误 | `st_dev` 业务写路径禁用 |
+| 两 AIV repeated `st_dev`，各写独占 line | 高频或低频复现终值错误 | 分 line 不能修复；业务写路径仍禁用 |
 | 两 AIV `AtomicExch`，同/分 line | 当前三路径均 `0/4000` | 可作已测 atomic 对照，仍遵守 atomic-only line |
 | 多个纯 atomic word 共 line | AtomicExch 特定压力未复现问题 | 可审计后使用；关键变量仍建议独占 line |
 
@@ -410,6 +451,10 @@ CCEC runner 对全部 probe 显式关闭；AscendC runner 当前只对 `mb8_dcci
 ## 9. 代码评审检查表
 
 - [ ] 每个跨核共享对象都列出了 64B cacheline 归属，而不只是变量地址。
+- [ ] 所有跨核可变控制字和交权动作都使用 atomic 或已有明确契约的硬件同步原语；没有用普通
+      store、`st_dev`、DCCI 或 DSB 模拟 `lock/state/phase/ready/done/remaining/refcount/cursor`。
+- [ ] 非 atomic payload 只在 atomic 已授予整条 64B line 的排他所有权后访问；纯读例外已证明在
+      全部并发读者生命周期内不可变。
 - [ ] atomic line 与普通 scalar/DCCI data line 完全分离。
 - [ ] 关键 atomic 默认独占一条 64B line；合并时整条 line 保证 atomic-only。
 - [ ] 没有任何 ordinary scalar store 写入 atomic line 的邻接 slot。
@@ -418,7 +463,11 @@ CCEC runner 对全部 probe 显式关闭；AscendC runner 当前只对 `mb8_dcci
 - [ ] 没有把 OUT/ATOMIC selector 当成 invalid-only 或 atomic 保护开关。
 - [ ] 没有在缺少 scope/order 证据时把无参 `dci()` 当成按地址 invalid-only。
 - [ ] DCCI 只在取得被处理 data line 的唯一所有权后执行。
-- [ ] `st_dev` 发布前有 DSB，跨核交权使用独立 atomic phase/lock。
+- [ ] 所有 DCCI 在后续普通访问、atomic 发布或跨核交权依赖其完成之前都有显式 DSB；批量 DCCI 只在
+      中间没有依赖动作时合并到一个末尾 DSB。
+- [ ] 业务代码没有使用 `st_dev`/`WriteGmByPassDCache` 写 GM；探针或待迁移例外已明确隔离和标注。
+- [ ] 仍保留的 `st_dev` 例外在发布前有 DSB，跨核交权使用独立 atomic phase/lock，且没有把这些
+      必要条件写成安全性保证。
 - [ ] 没有把 `SyncAll`、DSB、DCCI、atomic 四者互相替代。
 - [ ] repeated `st_dev` 的最终值使用精确值判定，不用范围判断或“出现错误即通过”。
 - [ ] 压力测试覆盖多个 allocation 内 line offset、多个逻辑 block 映射和足够样本数。
