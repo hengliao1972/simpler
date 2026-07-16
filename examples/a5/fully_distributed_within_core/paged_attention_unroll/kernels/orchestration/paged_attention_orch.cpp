@@ -172,12 +172,15 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                 prof_view_count += 2;
                 CYCLE_COUNT_LAP(prof_tensor_view);
 #endif
+                // alloc_tensors() and the four kernel submits synchronously
+                // consume their Arg. One scope-local container is sufficient;
+                // reset() repopulates its active slots for each next call.
+                L0TaskArgs params;
                 CYCLE_COUNT_LAP(prof_param_setup);
-                L0TaskArgs alloc_args;
-                alloc_args.add_output(tile2d_ci);
-                alloc_args.add_output(scalar_ci);
-                alloc_args.add_output(scalar_ci);
-                TaskOutputTensors alloc_outs = alloc_tensors(alloc_args);
+                params.add_output(tile2d_ci);
+                params.add_output(scalar_ci);
+                params.add_output(scalar_ci);
+                TaskOutputTensors alloc_outs = alloc_tensors(params);
                 __gm__ const Tensor &oi = alloc_outs.get_ref(0);
                 __gm__ const Tensor &li_update = alloc_outs.get_ref(1);
                 __gm__ const Tensor &mi_update = alloc_outs.get_ref(2);
@@ -185,10 +188,6 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                 prof_submit_count++;
                 CYCLE_COUNT_LAP(prof_submit_task);
 #endif
-
-                // Reusable Arg objects — reset() before each use avoids
-                // repeated stack-frame construction in the inner loop.
-                L0TaskArgs params_qk, params_sf, params_pv, params_up;
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn += N_UNROLL) {
                     uint64_t n_blocks = min_u64(static_cast<uint64_t>(N_UNROLL), bn_this_batch - bn);
@@ -208,12 +207,12 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                     CYCLE_COUNT_LAP(prof_make_tensor);
 #endif
 
-                    params_qk.reset();
-                    params_qk.add_input(qi, key_cache, block_table);
-                    params_qk.add_output(sij_buf_ci);
-                    params_qk.add_scalar(n_blocks, b_idx * block_num + bn);
+                    params.reset();
+                    params.add_input(qi, key_cache, block_table);
+                    params.add_output(sij_buf_ci);
+                    params.add_scalar(n_blocks, b_idx * block_num + bn);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors qk_outs = rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
+                    TaskOutputTensors qk_outs = rt_submit_aic_task(FUNC_QK_MATMUL, params);
                     __gm__ const Tensor &sij_buf = qk_outs.get_ref(0);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
@@ -230,12 +229,12 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                     CYCLE_COUNT_LAP(prof_make_tensor);
 #endif
 
-                    params_sf.reset();
-                    params_sf.add_input(sij_buf);
-                    params_sf.add_output(pij_buf_ci, scalar_ci, scalar_ci);
-                    params_sf.add_scalar(scale_value, n_blocks, valid_len_last);
+                    params.reset();
+                    params.add_input(sij_buf);
+                    params.add_output(pij_buf_ci, scalar_ci, scalar_ci);
+                    params.add_scalar(scale_value, n_blocks, valid_len_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors sf_outs = rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
+                    TaskOutputTensors sf_outs = rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params);
                     __gm__ const Tensor &pij_buf = sf_outs.get_ref(0);
                     __gm__ const Tensor &mi = sf_outs.get_ref(1);
                     __gm__ const Tensor &li = sf_outs.get_ref(2);
@@ -245,12 +244,12 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #endif
 
                     // === Task 3: SplitK PV matmul (accumulated P @ V) ===
-                    params_pv.reset();
-                    params_pv.add_input(pij_buf, value_cache, block_table);
-                    params_pv.add_output(tile2d_ci);
-                    params_pv.add_scalar(n_blocks, b_idx * block_num + bn);
+                    params.reset();
+                    params.add_input(pij_buf, value_cache, block_table);
+                    params.add_output(tile2d_ci);
+                    params.add_scalar(n_blocks, b_idx * block_num + bn);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors pv_outs = rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
+                    TaskOutputTensors pv_outs = rt_submit_aic_task(FUNC_PV_MATMUL, params);
                     __gm__ const Tensor &oi_new = pv_outs.get_ref(0);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
@@ -261,12 +260,12 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                     uint64_t is_first = (bn == 0) ? 1 : 0;
                     uint64_t is_last = (bn + n_blocks >= bn_this_batch) ? 1 : 0;
 
-                    params_up.reset();
-                    params_up.add_input(mi, li, oi_new);
-                    params_up.add_inout(mi_update, li_update, oi, out_view);
-                    params_up.add_scalar(is_first, is_last);
+                    params.reset();
+                    params.add_input(mi, li, oi_new);
+                    params.add_inout(mi_update, li_update, oi, out_view);
+                    params.add_scalar(is_first, is_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
+                    rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);

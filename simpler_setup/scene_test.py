@@ -1106,7 +1106,7 @@ def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
         incore = kc.compile_incore(
             k["source"], core_type=k["core_type"], pto_isa_root=pto_isa_root, extra_include_dirs=inc_dirs
         )
-        if not is_sim:
+        if not is_sim and runtime != "fully_distributed_within_core":
             incore = extract_text_section(incore)
         kernel_binaries.append((k["func_id"], CoreCallable.build(signature=k.get("signature", []), binary=incore)))
 

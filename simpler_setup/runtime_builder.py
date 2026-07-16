@@ -394,6 +394,12 @@ class RuntimeBuilder:
             pto_root = Path(pto_isa_root)
             include_dirs.extend([str(pto_root / "include"), str(pto_root / "include" / "pto")])
 
+        pto_isa_root = os.environ.get("PTO_ISA_ROOT")
+        if pto_isa_root:
+            pto_include = os.path.join(pto_isa_root, "include")
+            pto_pto_include = os.path.join(pto_isa_root, "include", "pto")
+            include_dirs.extend([pto_include, pto_pto_include])
+
         arch, variant = self._arch, self._variant
         cache_dir = self._CACHE_DIR / arch / variant / name / "aicore-extra" / cache_key
         output_dir = self._LIB_DIR / arch / variant / name / "aicore-extra" / cache_key
