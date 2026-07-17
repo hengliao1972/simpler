@@ -11,6 +11,7 @@
 
 #include "aicpu_topology_probe.h"
 
+#include <acl/acl_rt.h>
 #include <dlfcn.h>
 
 #include <algorithm>
@@ -126,6 +127,19 @@ bool query_cpu_topo(uint32_t device_id, DsmiCpuTopo &out) {
     return false;
 }
 
+bool query_acl_aicpu_count(uint32_t device_id, int64_t &out_count) {
+    out_count = 0;
+    aclError rc = aclrtGetDeviceInfo(device_id, ACL_DEV_ATTR_AICPU_CORE_NUM, &out_count);
+    if (rc != ACL_SUCCESS || out_count <= 0) {
+        LOG_WARN(
+            "aicpu_topology_probe: aclrtGetDeviceInfo(AICPU_CORE_NUM) rc=%d count=%lld", rc,
+            static_cast<long long>(out_count)
+        );
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 namespace {
@@ -144,23 +158,53 @@ bool probe_aicpu_topology_uncached(uint32_t device_id, std::vector<AicpuLogicalC
     if (!query_occupy(device_id, occupy)) return false;
 
     DsmiCpuTopo topo{};
-    if (!query_cpu_topo(device_id, topo)) return false;
-
-    for (uint32_t i = 0; i < topo.total_nums; ++i) {
-        const DsmiSingleCpu &c = topo.cpus[i];
-        // Skip any cpu_id not in the device-side OCCUPY pool. Guard the
-        // shift against cpu_id >= 64 (UB in C++) — no a5 SKU is expected
-        // to expose more than 64 logical AICPU cpus, but a driver bug or
-        // future SKU change shouldn't trip undefined behavior here.
-        if (c.cpu_id >= 64 || ((occupy >> c.cpu_id) & 1ULL) == 0) continue;
-        AicpuLogicalCpu e{};
-        e.cpu_id = static_cast<int32_t>(c.cpu_id);
-        e.phy_cpu_id = static_cast<int32_t>(c.phy_cpu_id);
-        e.hyperthread_id = static_cast<int32_t>(c.hyperthread_id);
-        // a5 cluster mapping: 2 phy/cluster, 2 cluster/die.
-        e.cluster_id = e.phy_cpu_id / 2;
-        e.die_id = e.phy_cpu_id / 4;
-        out_user_cpus.push_back(e);
+    if (query_cpu_topo(device_id, topo)) {
+        for (uint32_t i = 0; i < topo.total_nums; ++i) {
+            const DsmiSingleCpu &c = topo.cpus[i];
+            // Skip any cpu_id not in the device-side OCCUPY pool. Guard the
+            // shift against cpu_id >= 64 (UB in C++) — no a5 SKU is expected
+            // to expose more than 64 logical AICPU cpus, but a driver bug or
+            // future SKU change shouldn't trip undefined behavior here.
+            if (c.cpu_id >= 64 || ((occupy >> c.cpu_id) & 1ULL) == 0) continue;
+            AicpuLogicalCpu e{};
+            e.cpu_id = static_cast<int32_t>(c.cpu_id);
+            e.phy_cpu_id = static_cast<int32_t>(c.phy_cpu_id);
+            e.hyperthread_id = static_cast<int32_t>(c.hyperthread_id);
+            // a5 cluster mapping: 2 phy/cluster, 2 cluster/die.
+            e.cluster_id = e.phy_cpu_id / 2;
+            e.die_id = e.phy_cpu_id / 4;
+            out_user_cpus.push_back(e);
+        }
+    } else {
+        // Older a5 drivers do not expose CPU_TOPO (both HAL and DSMI return
+        // 65534). OCCUPY alone is safe only when ACL independently reports
+        // the same user-visible core count; otherwise the host bitmap may
+        // contain reserved/withheld CPUs and we must keep failing closed.
+        int64_t acl_count = 0;
+        const int32_t occupy_count = __builtin_popcountll(occupy);
+        if (!query_acl_aicpu_count(device_id, acl_count) || acl_count != occupy_count) {
+            LOG_WARN(
+                "aicpu_topology_probe: CPU_TOPO unavailable and flat fallback rejected "
+                "(OCCUPY=0x%llx popcount=%d, ACL AICPU count=%lld)",
+                static_cast<unsigned long long>(occupy), occupy_count, static_cast<long long>(acl_count)
+            );
+            return false;
+        }
+        for (int32_t cpu_id = 0; cpu_id < 64; ++cpu_id) {
+            if (((occupy >> cpu_id) & 1ULL) == 0) continue;
+            AicpuLogicalCpu e{};
+            e.cpu_id = cpu_id;
+            e.phy_cpu_id = -1;
+            e.hyperthread_id = -1;
+            e.cluster_id = -1;
+            e.die_id = -1;
+            out_user_cpus.push_back(e);
+        }
+        LOG_WARN(
+            "aicpu_topology_probe: CPU_TOPO unavailable; using flat OCCUPY fallback "
+            "(mask=0x%llx, count=%d); topology-aware packing disabled",
+            static_cast<unsigned long long>(occupy), occupy_count
+        );
     }
     std::sort(out_user_cpus.begin(), out_user_cpus.end(), [](const AicpuLogicalCpu &a, const AicpuLogicalCpu &b) {
         return a.cpu_id < b.cpu_id;
