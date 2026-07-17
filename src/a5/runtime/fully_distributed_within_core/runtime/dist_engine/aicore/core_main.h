@@ -15,6 +15,7 @@
 DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int core_idx, int core_type_int) {
     __gm__ DistCore *self = dist_aicore_attach_worker(runtime, core_idx, core_type_int);
     if (self == nullptr) return;
+    g_fdwic_joint_submit_seen = false;
     fdwic_swimlane_attach(runtime);
     trace_reset_core(self);
 

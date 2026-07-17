@@ -236,6 +236,8 @@ PTO_DEVICE_FUNC void build_ring_slot(
 }
 
 PTO_DEVICE_FUNC bool drain_block_won(__gm__ DistCore *self) {
+    // Workers replay the same stream; polling is enabled before the initial drain of their first joint submit.
+    if (!g_fdwic_joint_submit_seen) return false;
     if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
     __gm__ BlockWon &bw = g_dist.blocks[self->block_id];
     if (atomic_load(bw.any_pub) == 0) return false;
@@ -275,6 +277,7 @@ PTO_DEVICE_FUNC bool drain_block_won(__gm__ DistCore *self) {
 }
 
 PTO_DEVICE_FUNC bool has_pending_won(__gm__ DistCore *self) {
+    if (!g_fdwic_joint_submit_seen) return false;
     if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
     __gm__ BlockWon &bw = g_dist.blocks[self->block_id];
     if (atomic_load(bw.any_pub) == 0) return false;
@@ -310,6 +313,7 @@ struct DistSubmitCtx {
     int32_t task_id;
     int32_t tensor_count;
     int32_t scalar_count;
+    uint32_t register_mask;
     uint64_t output_bytes;
     TaskOutputTensors result;
     int32_t fanin[kMaxFanin];
@@ -335,6 +339,7 @@ PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &
     ctx.result.set_task_id(PTO2TaskId::make(0, static_cast<uint32_t>(ctx.task_id)));
     ctx.tensor_count = args.tensor_count();
     ctx.scalar_count = args.scalar_count();
+    ctx.register_mask = 0;
     ctx.output_bytes = 0;
     ctx.fanin_count = 0;
     ctx.kernel_id = INVALID_KERNEL_ID;
@@ -360,13 +365,20 @@ PTO_DEVICE_FUNC bool dist_submit_check_task_cap(const DistSubmitCtx &ctx, DistSu
     return false;
 }
 
-PTO_DEVICE_FUNC void calculate_output_layout(const L0TaskArgs &args, DistOutputLayout &layout) {
+PTO_DEVICE_FUNC uint32_t
+calculate_output_layout(const L0TaskArgs &args, DistOutputLayout &layout, uint32_t &register_mask) {
     layout.total_output_size = 0;
+    register_mask = 0;
+    uint32_t output_mask = 0;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
-        if (args.tag(i) != TensorArgType::OUTPUT) continue;
+        const TensorArgType tag = args.tag(i);
+        if (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING) register_mask |= 1u << i;
+        if (tag != TensorArgType::OUTPUT) continue;
+        output_mask |= 1u << i;
         layout.buffer_sizes[i] = TensorCreateInfo::buffer_size_bytes(args.tensor(i).create_info());
         layout.total_output_size += PTO2_ALIGN_UP(layout.buffer_sizes[i], PTO2_PACKED_OUTPUT_ALIGN);
     }
+    return output_mask;
 }
 
 PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSubmitCtx &ctx, DistSubmitKind kind) {
@@ -376,7 +388,7 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
 
     const size_t ring = g_dist.heap_size;
     DistOutputLayout layout;
-    calculate_output_layout(args, layout);
+    uint32_t output_mask = calculate_output_layout(args, layout, ctx.register_mask);
     const uint64_t total = layout.total_output_size;
     uint64_t task_base = PTO2_ALIGN_UP(ctx.self->heap_next, PTO2_PACKED_OUTPUT_ALIGN);
     if (total > 0 && g_dist.heap_base != nullptr) {
@@ -401,11 +413,8 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
     }
 
     uint64_t output_offset = 0;
-    for (int32_t i = 0; i < ctx.tensor_count; i++) {
-        const TensorArgType tag = args.tag(i);
-        if (tag != TensorArgType::OUTPUT) {
-            continue;
-        }
+    for (int32_t i = 0; output_mask != 0; i++, output_mask >>= 1) {
+        if ((output_mask & 1u) == 0) continue;
         const auto &ci = args.tensor(i).create_info();
         if (g_dist.heap_base == nullptr) {
             set_fatal();
@@ -535,11 +544,7 @@ PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const 
     return fc;
 }
 
-PTO_DEVICE_FUNC void dist_submit_insert_tensor(DistSubmitCtx &ctx, const L0TaskArgs &args, int32_t i) {
-    if (args.tag(i) == TensorArgType::OUTPUT) {
-        dist_tensor_map_insert(ctx.self->map, ctx.payload->tensors[i], ctx.task_id);
-        return;
-    }
+PTO_DEVICE_FUNC void dist_submit_insert_existing_tensor(DistSubmitCtx &ctx, const L0TaskArgs &args, int32_t i) {
 #if defined(__CCE_AICORE__)
     if (args.tensor(i).tensor_from_gm()) {
         dist_tensor_map_insert(ctx.self->map, args.tensor(i).gm_ref(), ctx.task_id);
@@ -552,11 +557,10 @@ PTO_DEVICE_FUNC void dist_submit_insert_tensor(DistSubmitCtx &ctx, const L0TaskA
 }
 
 PTO_DEVICE_FUNC void dist_submit_register_outputs(DistSubmitCtx &ctx, const L0TaskArgs &args, bool include_existing) {
-    for (int32_t i = 0; i < ctx.tensor_count; i++) {
-        const TensorArgType tag = args.tag(i);
-        const bool registers_producer =
-            include_existing && (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING);
-        if (registers_producer) dist_submit_insert_tensor(ctx, args, i);
+    if (!include_existing) return;
+    uint32_t register_mask = ctx.register_mask;
+    for (int32_t i = 0; register_mask != 0; i++, register_mask >>= 1) {
+        if ((register_mask & 1u) != 0) dist_submit_insert_existing_tensor(ctx, args, i);
     }
 }
 
