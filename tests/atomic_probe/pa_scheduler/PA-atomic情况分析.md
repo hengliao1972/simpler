@@ -31,7 +31,7 @@ Submit 路径，供后续继续优化。快照日期为 2026-07-17，当前代�
   fanin ready 轮询。
 
 环境安装、编译和基线复现过程见
-[A5 FDWIC Paged Attention 安装与复现指南](A5_FDWIC_PAGED_ATTENTION_REPRO.md)。
+[A5 FDWIC Paged Attention 安装与复现指南](../A5_FDWIC_PAGED_ATTENTION_REPRO.md)。
 
 ## 2. Case1 工作量与 atomic 语义
 
@@ -298,3 +298,43 @@ Submit 调度而非 kernel 计算变快。
 `Materialize/PrepareMap/Claim/Fanin/Register` 相加。可加总的是显式互斥
 span，或单独定义 `Submit.end - Build/Replay/Alloc.end` 为 action tail。
 后续文档和脚本都应沿用这一口径。
+
+## 6. 独立 PA 调度复现的对应关系
+
+`pa_scheduler/` 下的 CCEC、AscendC 和 CPU 用例以本文的真实 PA 路径为模型，
+目标是脱离 simpler 的编译和链接依赖后，仍能单独研究 Submit 调度性能。这里的
+“脱离 simpler”不表示删减 PA 调度逻辑。当前独立模型保留：
+
+- Case1 的 256 batch、Alloc/QK/SF/PV/UP 五 task 拓扑和 AIC/AIV active mask；
+- 96 worker 全量回放、四分片 Claim cursor 和固定 73728 次 Claim atomicMax；
+- TaskArgs/Tensor/TaskPayload/DistSubmitCtx 的关键 ABI 和真实 tag 扫描；
+- materialize、TensorMap retire/lookup/insert、register、fanin、slot payload；
+- EfDrain、Replay、WaitForSlot、HeapGuard、flag/vend/frontier 和最终 drain；
+- 单 lane Case1 的 BlockWon 动态次数为零，以及真实泳道记录格式。
+
+只有 QK/SF/PV/UP 的计算体由可控 NOP 模拟；NOP 默认值按本文最好真实泳道的
+44.170/53.729/27.626/1.565 us 校准。独立用例不会在 Claim、Register、
+PrepareMap 或等待路径中增加 NOP 来硬凑 5 ms。
+
+当前严格校验覆盖 73,728 次 Claim、每 task 唯一 winner、1,024 个 kernel、
+TensorMap/heap 最终状态、fanin、flag、vend、frontier、cursor、ring placement
+和每 worker 的前端操作次数。2026-07-17 三个 CCEC 独立进程首轮为
+4.846431/4.798260/4.830184 ms，中位数 4.830184 ms；AscendC 独立进程首轮为
+4.917014 ms，均为 PASS；真实最好泳道为 5.096685 ms。
+差异主要来自真实 orchestration 与 `dist_submit_impl` 跨翻译单元，而 standalone
+共享实现会和固定任务图一起被编译器优化。为制造编译边界而做的强制 noinline、
+拆设备目标和全局 memory clobber 实验曾分别触发状态破坏、device exception 或
+明显 RingBp，均已回退。
+
+四阶段诊断通过 `--profile-phases` 输出：Claim 和 EfDrain 每 worker 调用
+1280 次；WaitForSlot 由 1024 个 kernel winner 调用；HeapGuard 由每 batch 的
+Alloc/QK/SF/PV winner 调用，共 1024 次。当前代表性 CCEC 轮次的累计中位数为：
+
+| role | Claim | EfDrain | WaitForSlot | HeapGuard |
+| ---- | ----: | ------: | ----------: | --------: |
+| AIC | 470.503 us | 711.005 us | 234.063 us（全 AIC 43 次等待） | 21.349 us（约 1 次 heap 等待） |
+| AIV | 533.755 us | 401.962 us | 0.067 us（无等待） | 3.723 us（约 1 次 heap 等待） |
+
+完整构建、参数、内存占用、冷热运行口径和脱仓复制方法见同目录
+[PA 调度器独立复现与泳道使用指南](PA调度器独立复现与泳道使用指南.md)。后续调度优化应先在该
+独立用例做协议回归和阶段定位，再回到真实 PA Case1 做最终性能确认。
