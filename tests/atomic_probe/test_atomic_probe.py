@@ -42,6 +42,14 @@ def test_cpu_cacheline_control(tmp_path: Path) -> None:
     subprocess.run([str(binary)], check=True)
 
 
+def test_cpu_nested_lambda_compiler_probe() -> None:
+    subprocess.run(
+        [str(HERE / "run_nested_lambda.sh"), "cpu"],
+        cwd=HERE,
+        check=True,
+    )
+
+
 def _onboard_environment(st_device_ids: list[int]) -> dict[str, str]:
     assert os.environ.get("ASCEND_HOME_PATH"), "ASCEND_HOME_PATH is required for A5 probes"
     environment = os.environ.copy()
@@ -71,5 +79,20 @@ def test_a5_ccec_cacheline_probes(st_device_ids: list[int]) -> None:
         [str(HERE / "ccec" / "run_all.sh")],
         cwd=HERE / "ccec",
         env=_onboard_environment(st_device_ids),
+        check=True,
+    )
+
+
+@pytest.mark.requires_hardware
+@pytest.mark.platforms(["a5"])
+@pytest.mark.device_count(1)
+@pytest.mark.timeout(900)
+def test_a5_ccec_nested_lambda_args_runtime_read(st_device_ids: list[int]) -> None:
+    environment = _onboard_environment(st_device_ids)
+    environment["ATOMIC_PROBE_MODE"] = "args-runtime-read"
+    subprocess.run(
+        [str(HERE / "run_nested_lambda.sh"), "ccec-cross-tu"],
+        cwd=HERE,
+        env=environment,
         check=True,
     )

@@ -1,9 +1,10 @@
 #!/bin/bash
 # Build & run ALL ccec atomic probes on A5 onboard hardware.
 #
-# For each probe: compiles the kernel .cpp as AIV-only with ccec -x cce,
-# links it into an AICore binary with ld.lld, then compiles the host launcher
-# with g++ and runs it.
+# For each probe: compiles the kernel .cpp with ccec -x cce, links it into
+# an AICore binary with ld.lld, then compiles the host launcher with g++ and
+# runs it. Probes are AIV-only except the explicit cross-TU compiler/ABI probe,
+# which targets AIC to match the affected orchestration build.
 #
 # All kernels are pure-CCEC (ccec_utils.h + lowercase builtins); no
 # kernel_operator.h, no AscendC APIs.
@@ -57,6 +58,7 @@ RUN_TIMEOUT="${ATOMIC_PROBE_TIMEOUT:-120}"
 
 # Probe table: kernel_src : kernel_obj : host_src : host_bin
 PROBES=(
+    "nested_lambda.cpp:nested_lambda_kernel.o:nested_lambda_host.cpp:nested_lambda_host"
     "atomic_cas_probe.cpp:atomic_cas_kernel.o:atomic_cas_host.cpp:atomic_cas_host"
     "entire_flush_clobber.cpp:entire_flush_clobber_kernel.o:entire_flush_clobber_host.cpp:entire_flush_clobber_host"
     "bypass_dcache_ccec.cpp:bypass_dcache_kernel.o:bypass_dcache_ccec_host.cpp:bypass_dcache_ccec_host"
@@ -71,6 +73,13 @@ PROBES=(
     "st_dev_single_core_stress.cpp:st_dev_single_core_stress_kernel.o:st_dev_single_core_stress_host.cpp:st_dev_single_core_stress_host"
     "ld_dev_fanout_publish.cpp:ld_dev_fanout_publish_kernel.o:ld_dev_fanout_publish_host.cpp:ld_dev_fanout_publish_host"
     "cacheline_matrix.cpp:cacheline_matrix_kernel.o:cacheline_matrix_host.cpp:cacheline_matrix_host"
+)
+
+# This compiler-regression probe can intentionally trigger an AICore exception
+# on affected CCEC builds, so it is selectable by name but is not part of the
+# default cache-line suite.
+MANUAL_PROBES=(
+    "nested_lambda_cross_tu.cpp:nested_lambda_cross_tu_kernel.o:nested_lambda_cross_tu_host.cpp:nested_lambda_cross_tu_host"
 )
 
 REQUESTED="${1:-all}"
@@ -117,14 +126,46 @@ build_one() {
         probe_flags+=(-DCCEC_MATRIX_AIV_ONLY)
     fi
 
-    echo "=== [$tag] Compiling AIV-only (dav-c310-vec) ==="
-    "$CCEC" "${CCEC_FLAGS[@]}" --cce-aicore-arch=dav-c310-vec \
-        "${probe_flags[@]}" "${INC_FLAGS[@]}" \
-        -o "$BUILD_DIR/${tag}_vec.o" "$SCRIPT_DIR/$ks"
+    local kernel_objects=()
+    if [[ "$ks" == "nested_lambda_cross_tu.cpp" ]]; then
+        local repo_root
+        repo_root="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+        local cross_tu_inc_flags=(
+            "${INC_FLAGS[@]}"
+            -I"$repo_root/src/a5/platform/onboard/aicore"
+            -I"$repo_root/src/a5/platform/include"
+            -I"$repo_root/src/common/platform/include"
+            -I"$repo_root/src/common/task_interface"
+            -I"$repo_root/src/common/log/include"
+            -I"$repo_root/src/common"
+            -I"$repo_root/src/a5/runtime/fully_distributed_within_core/runtime"
+            -I"$repo_root/src/a5/runtime/fully_distributed_within_core/common"
+            -I"$repo_root/src/a5/runtime/fully_distributed_within_core/orchestration"
+            -I"$repo_root/src/a5/runtime"
+        )
+        echo "=== [$tag] Compiling orchestration TU for AIC (dav-c310-cube) ==="
+        "$CCEC" "${CCEC_FLAGS[@]}" --cce-aicore-arch=dav-c310-cube \
+            "${cross_tu_inc_flags[@]}" \
+            -o "$BUILD_DIR/${tag}_caller_aic.o" "$SCRIPT_DIR/$ks"
+        echo "=== [$tag] Compiling runtime TU for AIC (dav-c310-cube) ==="
+        "$CCEC" "${CCEC_FLAGS[@]}" --cce-aicore-arch=dav-c310-cube \
+            "${cross_tu_inc_flags[@]}" \
+            -o "$BUILD_DIR/${tag}_runtime_aic.o" "$SCRIPT_DIR/nested_lambda_cross_tu_runtime.cpp"
+        kernel_objects+=(
+            "$BUILD_DIR/${tag}_caller_aic.o"
+            "$BUILD_DIR/${tag}_runtime_aic.o"
+        )
+    else
+        echo "=== [$tag] Compiling AIV-only (dav-c310-vec) ==="
+        "$CCEC" "${CCEC_FLAGS[@]}" --cce-aicore-arch=dav-c310-vec \
+            "${probe_flags[@]}" "${INC_FLAGS[@]}" \
+            -o "$BUILD_DIR/${tag}_vec.o" "$SCRIPT_DIR/$ks"
+        kernel_objects+=("$BUILD_DIR/${tag}_vec.o")
+    fi
 
     echo "=== [$tag] Linking AICore binary ==="
     "$LD" -m aicorelinux -Ttext=0 -static --allow-multiple-definition \
-        -o "$BUILD_DIR/$ko" "$BUILD_DIR/${tag}_vec.o"
+        -o "$BUILD_DIR/$ko" "${kernel_objects[@]}"
 
     echo "=== [$tag] Compiling host ==="
     g++ -O2 -std=c++17 \
@@ -144,7 +185,30 @@ run_one() {
     local probe_failures=0
     tag="$(basename "$ko" .o)"
     echo "=== Running [$tag] ==="
-    if [[ "$tag" == "cacheline_matrix_kernel" ]]; then
+    if [[ "$tag" == "nested_lambda_cross_tu_kernel" ]]; then
+        if [[ -n "${ATOMIC_PROBE_MODE:-}" ]]; then
+            probe_modes=("$ATOMIC_PROBE_MODE")
+        else
+            # Run each variant in its own process: an expected AICore exception
+            # in a bad compiler variant must not hide the remaining controls.
+            probe_modes=(
+                strong-context
+                args-runtime-read
+                weak-args-storage
+                weak-context-materialize-3
+                weak-context-materialize-2
+                weak-context-materialize-1
+                weak-context-materialize-0
+            )
+        fi
+        for probe_mode in "${probe_modes[@]}"; do
+            echo "--- CCEC cross-TU variant=$probe_mode ---"
+            if ! timeout "$RUN_TIMEOUT" \
+                "$BUILD_DIR/$hb" "$BUILD_DIR/$ko" "$probe_mode"; then
+                probe_failures=$((probe_failures + 1))
+            fi
+        done
+    elif [[ "$tag" == "cacheline_matrix_kernel" ]]; then
         if [[ -n "${ATOMIC_PROBE_MATRIX_MODE:-}" ]]; then
             matrix_modes=("$ATOMIC_PROBE_MATRIX_MODE")
         else
@@ -305,7 +369,11 @@ export LD_LIBRARY_PATH="$ASCEND_HOME_PATH/x86_64-linux/lib64:${LD_LIBRARY_PATH:-
 
 selected=0
 suite_run_failures=0
-for entry in "${PROBES[@]}"; do
+entries=("${PROBES[@]}")
+if [[ "$SELECT" == "nested_lambda_cross_tu" ]]; then
+    entries+=("${MANUAL_PROBES[@]}")
+fi
+for entry in "${entries[@]}"; do
     IFS=':' read -r ks ko hs hb <<< "$entry"
     if [[ -n "$SELECT" && "$(basename "$ks" .cpp)" != "$SELECT" ]]; then
         continue
