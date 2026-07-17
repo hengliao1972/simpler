@@ -87,12 +87,19 @@ def test_a5_ccec_cacheline_probes(st_device_ids: list[int]) -> None:
 @pytest.mark.platforms(["a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.timeout(900)
-def test_a5_ccec_nested_lambda_args_runtime_read(st_device_ids: list[int]) -> None:
+def test_a5_ccec_nested_lambda_call_boundary_controls(st_device_ids: list[int]) -> None:
     environment = _onboard_environment(st_device_ids)
-    environment["ATOMIC_PROBE_MODE"] = "args-runtime-read"
     subprocess.run(
-        [str(HERE / "run_nested_lambda.sh"), "ccec-cross-tu"],
-        cwd=HERE,
+        [str(HERE / "ccec" / "run_all.sh"), "nested_lambda_cross_tu", "build"],
+        cwd=HERE / "ccec",
         env=environment,
         check=True,
     )
+    for mode in ("args-runtime-read", "weak-context-materialize-0"):
+        environment["ATOMIC_PROBE_MODE"] = mode
+        subprocess.run(
+            [str(HERE / "ccec" / "run_all.sh"), "nested_lambda_cross_tu", "run"],
+            cwd=HERE / "ccec",
+            env=environment,
+            check=True,
+        )

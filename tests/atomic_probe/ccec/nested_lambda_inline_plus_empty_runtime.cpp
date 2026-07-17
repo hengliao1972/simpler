@@ -8,8 +8,4 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#include "nested_lambda_cross_tu_api.h"
-
-// This translation unit intentionally emits no runtime submit functions. It is
-// linked only by the two-object control to separate object count from an actual
-// cross-object call boundary.
+#include "nested_lambda_cross_tu.cpp"

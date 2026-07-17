@@ -28,10 +28,9 @@ using nested_lambda_cross_tu_probe::Field;
 using nested_lambda_cross_tu_probe::Variant;
 
 constexpr int32_t kSiteId = 7;
+static_assert(sizeof(L0TaskArgs) == nested_lambda_cross_tu_probe::kExpectedL0TaskArgsBytes);
 
-PTO_DEVICE_FUNC void BindContext(
-    int32_t site_id, int32_t phase, uint64_t caller_context, L0TaskArgs *args)
-{
+PTO_DEVICE_FUNC void BindContext(int32_t site_id, int32_t phase, uint64_t caller_context, L0TaskArgs *args) {
     if (site_id != kSiteId) return;
     const auto *context = reinterpret_cast<const CallerContext *>(caller_context);
     if (phase == static_cast<int32_t>(DispatchPhase::Prepare)) {
@@ -41,23 +40,21 @@ PTO_DEVICE_FUNC void BindContext(
     args->add_input(*context->first, *context->second, *context->third);
 }
 
-PTO_DEVICE_FUNC void InitTensor(Tensor &tensor, uint32_t round, uint32_t tensor_index)
-{
+PTO_DEVICE_FUNC void InitTensor(Tensor &tensor, uint32_t round, uint32_t tensor_index) {
     tensor.buffer.addr = nested_lambda_cross_tu_probe::TensorAddress(round, tensor_index);
     tensor.start_offset = nested_lambda_cross_tu_probe::TensorOffset(round, tensor_index);
     tensor.version = nested_lambda_cross_tu_probe::TensorVersion(round, tensor_index);
     tensor.shapes[0] = nested_lambda_cross_tu_probe::TensorShape(round, tensor_index);
 }
 
-PTO_DEVICE_FUNC void StoreField(__gm__ uint32_t *storage, Field field, uint32_t value)
-{
+PTO_DEVICE_FUNC void StoreField(__gm__ uint32_t *storage, Field field, uint32_t value) {
     st_dev_b32(&storage[nested_lambda_cross_tu_probe::FieldIndex(field)], value);
 }
 
 PTO_DEVICE_FUNC void StoreResults(
     __gm__ uint32_t *storage, Variant variant, uint32_t completed_rounds, uint32_t mismatches,
-    uint32_t dispatcher_calls, uint32_t materializations, uint64_t checksum)
-{
+    uint32_t dispatcher_calls, uint32_t materializations, uint64_t checksum
+) {
     StoreField(storage, Field::CompletedRounds, completed_rounds);
     StoreField(storage, Field::MismatchCount, mismatches);
     StoreField(storage, Field::DispatcherCalls, dispatcher_calls);
@@ -70,8 +67,7 @@ PTO_DEVICE_FUNC void StoreResults(
 }
 
 template <bool StrongDispatcher>
-PTO_DEVICE_FUNC TaskOutputTensors SubmitContext(uint64_t caller_context, L0TaskArgs *args)
-{
+PTO_DEVICE_FUNC TaskOutputTensors SubmitContext(uint64_t caller_context, L0TaskArgs *args) {
     if constexpr (StrongDispatcher) {
         return nested_probe_submit_strong_context(kSiteId, caller_context, args);
     }
@@ -79,8 +75,7 @@ PTO_DEVICE_FUNC TaskOutputTensors SubmitContext(uint64_t caller_context, L0TaskA
 }
 
 template <uint32_t Materializations, bool StrongDispatcher>
-PTO_DEVICE_FUNC void RunContextVariant(__gm__ uint32_t *storage, Variant variant)
-{
+PTO_DEVICE_FUNC void RunContextVariant(__gm__ uint32_t *storage, Variant variant) {
     L0TaskArgs args;
     uint32_t completed_rounds = 0;
     uint32_t mismatches = 0;
@@ -129,8 +124,7 @@ PTO_DEVICE_FUNC void RunContextVariant(__gm__ uint32_t *storage, Variant variant
 }
 
 template <bool RuntimeRead>
-PTO_DEVICE_FUNC void RunArgsStorageVariant(__gm__ uint32_t *storage, Variant variant)
-{
+PTO_DEVICE_FUNC void RunArgsStorageVariant(__gm__ uint32_t *storage, Variant variant) {
     L0TaskArgs args;
     uint32_t completed_rounds = 0;
     uint32_t mismatches = 0;
@@ -178,21 +172,18 @@ PTO_DEVICE_FUNC void RunArgsStorageVariant(__gm__ uint32_t *storage, Variant var
         completed_rounds++;
     }
 
-    StoreResults(
-        storage, variant, completed_rounds, mismatches, dispatcher_calls, 3, checksum);
+    StoreResults(storage, variant, completed_rounds, mismatches, dispatcher_calls, 3, checksum);
 }
 
-} // namespace
+}  // namespace
 
-extern "C" __attribute__((weak)) PTO_DEVICE_FUNC void nested_probe_weak_context_dispatch(
-    int32_t site_id, int32_t phase, uint64_t caller_context, L0TaskArgs *args)
-{
+extern "C" __attribute__((weak)) PTO_DEVICE_FUNC void
+nested_probe_weak_context_dispatch(int32_t site_id, int32_t phase, uint64_t caller_context, L0TaskArgs *args) {
     BindContext(site_id, phase, caller_context, args);
 }
 
-extern "C" __attribute__((weak)) PTO_DEVICE_FUNC void nested_probe_weak_args_dispatch(
-    int32_t site_id, int32_t phase, L0TaskArgs *args)
-{
+extern "C" __attribute__((weak)) PTO_DEVICE_FUNC void
+nested_probe_weak_args_dispatch(int32_t site_id, int32_t phase, L0TaskArgs *args) {
     if (site_id != kSiteId) return;
     if (phase == static_cast<int32_t>(DispatchPhase::Prepare)) {
         args->scalar(4) = args->scalar(11);
@@ -204,9 +195,8 @@ extern "C" __attribute__((weak)) PTO_DEVICE_FUNC void nested_probe_weak_args_dis
     args->add_input(*first, *second, *third);
 }
 
-extern "C" PTO_DEVICE_FUNC void nested_probe_strong_context_dispatch(
-    int32_t site_id, int32_t phase, uint64_t caller_context, L0TaskArgs *args)
-{
+extern "C" PTO_DEVICE_FUNC void
+nested_probe_strong_context_dispatch(int32_t site_id, int32_t phase, uint64_t caller_context, L0TaskArgs *args) {
     BindContext(site_id, phase, caller_context, args);
 }
 
@@ -214,79 +204,59 @@ extern "C" PTO_DEVICE_FUNC void nested_probe_strong_context_dispatch(
 // aicpu_orchestration_entry. Putting it directly in a __global__ wrapper would
 // move its locals from the orchestration function stack to the kernel stack and
 // miss the suspected reg93 stack-address materialization path.
-extern "C" __attribute__((weak)) PTO_DEVICE_FUNC void nested_probe_orchestration_ctx_m0(
-    __gm__ uint32_t *storage)
-{
+extern "C" __attribute__((weak)) PTO_DEVICE_FUNC void nested_probe_orchestration_ctx_m0(__gm__ uint32_t *storage) {
     RunContextVariant<0, false>(storage, Variant::WeakContextMaterialize0);
 }
 
-extern "C" __attribute__((weak)) PTO_DEVICE_FUNC void nested_probe_orchestration_ctx_m1(
-    __gm__ uint32_t *storage)
-{
+extern "C" __attribute__((weak)) PTO_DEVICE_FUNC void nested_probe_orchestration_ctx_m1(__gm__ uint32_t *storage) {
     RunContextVariant<1, false>(storage, Variant::WeakContextMaterialize1);
 }
 
-extern "C" __attribute__((weak)) PTO_DEVICE_FUNC void nested_probe_orchestration_ctx_m2(
-    __gm__ uint32_t *storage)
-{
+extern "C" __attribute__((weak)) PTO_DEVICE_FUNC void nested_probe_orchestration_ctx_m2(__gm__ uint32_t *storage) {
     RunContextVariant<2, false>(storage, Variant::WeakContextMaterialize2);
 }
 
-extern "C" __attribute__((weak)) PTO_DEVICE_FUNC void nested_probe_orchestration_ctx_m3(
-    __gm__ uint32_t *storage)
-{
+extern "C" __attribute__((weak)) PTO_DEVICE_FUNC void nested_probe_orchestration_ctx_m3(__gm__ uint32_t *storage) {
     RunContextVariant<3, false>(storage, Variant::WeakContextMaterialize3);
 }
 
-extern "C" __attribute__((weak)) PTO_DEVICE_FUNC void nested_probe_orchestration_args(
-    __gm__ uint32_t *storage)
-{
+extern "C" __attribute__((weak)) PTO_DEVICE_FUNC void nested_probe_orchestration_args(__gm__ uint32_t *storage) {
     RunArgsStorageVariant<false>(storage, Variant::WeakArgsStorage);
 }
 
-extern "C" __attribute__((weak)) PTO_DEVICE_FUNC void nested_probe_orchestration_strong(
-    __gm__ uint32_t *storage)
-{
+extern "C" __attribute__((weak)) PTO_DEVICE_FUNC void nested_probe_orchestration_strong(__gm__ uint32_t *storage) {
     RunContextVariant<0, true>(storage, Variant::StrongContext);
 }
 
-extern "C" __attribute__((weak)) PTO_DEVICE_FUNC void nested_probe_orchestration_runtime_args(
-    __gm__ uint32_t *storage)
-{
+extern "C" __attribute__((weak)) PTO_DEVICE_FUNC void
+nested_probe_orchestration_runtime_args(__gm__ uint32_t *storage) {
     RunArgsStorageVariant<true>(storage, Variant::ArgsRuntimeRead);
 }
 
-extern "C" __global__ __aicore__ void nested_lambda_cross_tu_ctx_m0_0_mix_aic(__gm__ uint32_t *storage)
-{
+extern "C" __global__ __aicore__ void nested_lambda_cross_tu_ctx_m0_0_mix_aic(__gm__ uint32_t *storage) {
     if (get_block_idx() == 0) nested_probe_orchestration_ctx_m0(storage);
 }
 
-extern "C" __global__ __aicore__ void nested_lambda_cross_tu_ctx_m1_1_mix_aic(__gm__ uint32_t *storage)
-{
+extern "C" __global__ __aicore__ void nested_lambda_cross_tu_ctx_m1_1_mix_aic(__gm__ uint32_t *storage) {
     if (get_block_idx() == 0) nested_probe_orchestration_ctx_m1(storage);
 }
 
-extern "C" __global__ __aicore__ void nested_lambda_cross_tu_ctx_m2_2_mix_aic(__gm__ uint32_t *storage)
-{
+extern "C" __global__ __aicore__ void nested_lambda_cross_tu_ctx_m2_2_mix_aic(__gm__ uint32_t *storage) {
     if (get_block_idx() == 0) nested_probe_orchestration_ctx_m2(storage);
 }
 
-extern "C" __global__ __aicore__ void nested_lambda_cross_tu_ctx_m3_3_mix_aic(__gm__ uint32_t *storage)
-{
+extern "C" __global__ __aicore__ void nested_lambda_cross_tu_ctx_m3_3_mix_aic(__gm__ uint32_t *storage) {
     if (get_block_idx() == 0) nested_probe_orchestration_ctx_m3(storage);
 }
 
-extern "C" __global__ __aicore__ void nested_lambda_cross_tu_args_4_mix_aic(__gm__ uint32_t *storage)
-{
+extern "C" __global__ __aicore__ void nested_lambda_cross_tu_args_4_mix_aic(__gm__ uint32_t *storage) {
     if (get_block_idx() == 0) nested_probe_orchestration_args(storage);
 }
 
-extern "C" __global__ __aicore__ void nested_lambda_cross_tu_strong_5_mix_aic(__gm__ uint32_t *storage)
-{
+extern "C" __global__ __aicore__ void nested_lambda_cross_tu_strong_5_mix_aic(__gm__ uint32_t *storage) {
     if (get_block_idx() == 0) nested_probe_orchestration_strong(storage);
 }
 
-extern "C" __global__ __aicore__ void nested_lambda_cross_tu_runtime_args_6_mix_aic(__gm__ uint32_t *storage)
-{
+extern "C" __global__ __aicore__ void nested_lambda_cross_tu_runtime_args_6_mix_aic(__gm__ uint32_t *storage) {
     if (get_block_idx() == 0) nested_probe_orchestration_runtime_args(storage);
 }

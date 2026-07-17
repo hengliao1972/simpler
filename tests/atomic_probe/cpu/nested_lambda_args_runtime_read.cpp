@@ -16,18 +16,16 @@
 
 namespace {
 
-void InitTensor(Tensor &tensor, uint32_t round, uint32_t tensor_index)
-{
+void InitTensor(Tensor &tensor, uint32_t round, uint32_t tensor_index) {
     tensor.buffer.addr = nested_lambda_cross_tu_probe::TensorAddress(round, tensor_index);
     tensor.start_offset = nested_lambda_cross_tu_probe::TensorOffset(round, tensor_index);
     tensor.version = nested_lambda_cross_tu_probe::TensorVersion(round, tensor_index);
     tensor.shapes[0] = nested_lambda_cross_tu_probe::TensorShape(round, tensor_index);
 }
 
-} // namespace
+}  // namespace
 
-int main()
-{
+int main() {
     L0TaskArgs args;
     uint32_t completed_rounds = 0;
     uint32_t mismatches = 0;
@@ -68,16 +66,15 @@ int main()
         completed_rounds++;
     }
 
-    const bool exact = completed_rounds == nested_lambda_cross_tu_probe::kRounds &&
-        mismatches == 0 && checksum == nested_lambda_cross_tu_probe::ExpectedTotalChecksum() &&
-        sizeof(L0TaskArgs) > 0 && sizeof(L0TaskArgs) < 32U * 1024U && sizeof(L0TaskArgs) % 64U == 0;
+    const bool exact = completed_rounds == nested_lambda_cross_tu_probe::kRounds && mismatches == 0 &&
+                       checksum == nested_lambda_cross_tu_probe::ExpectedTotalChecksum() &&
+                       sizeof(L0TaskArgs) == nested_lambda_cross_tu_probe::kExpectedL0TaskArgsBytes;
     std::printf("=== CPU L0TaskArgs Runtime-Read Probe ===\n");
     std::printf(
-        "[VALUES] rounds=%u mismatches=%u checksum=0x%016llx L0TaskArgs=%zuB\n",
-        completed_rounds, mismatches, static_cast<unsigned long long>(checksum), sizeof(L0TaskArgs));
-    std::printf(
-        "[ASSERT] CPU L0TaskArgs args-runtime-read semantics %s\n",
-        exact ? "PASS" : "FAIL");
+        "[VALUES] rounds=%u mismatches=%u checksum=0x%016llx L0TaskArgs=%zuB\n", completed_rounds, mismatches,
+        static_cast<unsigned long long>(checksum), sizeof(L0TaskArgs)
+    );
+    std::printf("[ASSERT] CPU L0TaskArgs args-runtime-read semantics %s\n", exact ? "PASS" : "FAIL");
     std::printf("[SUMMARY] semantic_failures=%u\n", exact ? 0U : 1U);
     return exact ? 0 : 1;
 }

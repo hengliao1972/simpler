@@ -1,10 +1,18 @@
 #!/bin/bash
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 # Build & run ALL ccec atomic probes on A5 onboard hardware.
 #
 # For each probe: compiles the kernel .cpp with ccec -x cce, links it into
 # an AICore binary with ld.lld, then compiles the host launcher with g++ and
-# runs it. Probes are AIV-only except the explicit cross-TU compiler/ABI probe,
-# which targets AIC to match the affected orchestration build.
+# runs it. Probes are AIV-only except the explicit caller-capture compiler
+# probes, which target AIC to match the affected orchestration build.
 #
 # All kernels are pure-CCEC (ccec_utils.h + lowercase builtins); no
 # kernel_operator.h, no AscendC APIs.
@@ -75,11 +83,13 @@ PROBES=(
     "cacheline_matrix.cpp:cacheline_matrix_kernel.o:cacheline_matrix_host.cpp:cacheline_matrix_host"
 )
 
-# This compiler-regression probe can intentionally trigger an AICore exception
-# on affected CCEC builds, so it is selectable by name but is not part of the
-# default cache-line suite.
+# These caller-capture build-shape probes are selectable by name but are not
+# part of the default cache-line suite. The noinline target can intentionally
+# trigger an AICore exception on affected CCEC builds.
 MANUAL_PROBES=(
     "nested_lambda_cross_tu.cpp:nested_lambda_cross_tu_kernel.o:nested_lambda_cross_tu_host.cpp:nested_lambda_cross_tu_host"
+    "nested_lambda_inline_plus_empty_runtime.cpp:nested_lambda_inline_plus_empty_runtime_kernel.o:nested_lambda_cross_tu_host.cpp:nested_lambda_inline_plus_empty_runtime_host"
+    "nested_lambda_only_weak_submit_noinline.cpp:nested_lambda_only_weak_submit_noinline_kernel.o:nested_lambda_cross_tu_host.cpp:nested_lambda_only_weak_submit_noinline_host"
 )
 
 REQUESTED="${1:-all}"
@@ -127,7 +137,9 @@ build_one() {
     fi
 
     local kernel_objects=()
-    if [[ "$ks" == "nested_lambda_cross_tu.cpp" ]]; then
+    if [[ "$ks" == "nested_lambda_cross_tu.cpp" ||
+          "$ks" == "nested_lambda_inline_plus_empty_runtime.cpp" ||
+          "$ks" == "nested_lambda_only_weak_submit_noinline.cpp" ]]; then
         local repo_root
         repo_root="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
         local cross_tu_inc_flags=(
@@ -147,14 +159,33 @@ build_one() {
         "$CCEC" "${CCEC_FLAGS[@]}" --cce-aicore-arch=dav-c310-cube \
             "${cross_tu_inc_flags[@]}" \
             -o "$BUILD_DIR/${tag}_caller_aic.o" "$SCRIPT_DIR/$ks"
-        echo "=== [$tag] Compiling runtime TU for AIC (dav-c310-cube) ==="
-        "$CCEC" "${CCEC_FLAGS[@]}" --cce-aicore-arch=dav-c310-cube \
-            "${cross_tu_inc_flags[@]}" \
-            -o "$BUILD_DIR/${tag}_runtime_aic.o" "$SCRIPT_DIR/nested_lambda_cross_tu_runtime.cpp"
-        kernel_objects+=(
-            "$BUILD_DIR/${tag}_caller_aic.o"
-            "$BUILD_DIR/${tag}_runtime_aic.o"
-        )
+        kernel_objects+=("$BUILD_DIR/${tag}_caller_aic.o")
+        if [[ "$ks" == "nested_lambda_inline_plus_empty_runtime.cpp" ]]; then
+            echo "=== [$tag] Compiling empty runtime TU for AIC (dav-c310-cube) ==="
+            "$CCEC" "${CCEC_FLAGS[@]}" --cce-aicore-arch=dav-c310-cube \
+                "${cross_tu_inc_flags[@]}" \
+                -o "$BUILD_DIR/${tag}_runtime_empty_aic.o" \
+                "$SCRIPT_DIR/nested_lambda_cross_tu_runtime.cpp"
+            kernel_objects+=("$BUILD_DIR/${tag}_runtime_empty_aic.o")
+        fi
+        local expected_objects=1
+        if [[ "$ks" == "nested_lambda_inline_plus_empty_runtime.cpp" ]]; then
+            expected_objects=2
+            local section_table runtime_text_size
+            if ! section_table="$(readelf -S -W "$BUILD_DIR/${tag}_runtime_empty_aic.o")"; then
+                echo "Error: failed to read empty runtime object sections" >&2
+                exit 1
+            fi
+            runtime_text_size="$(awk '$3 == ".text" {print $7}' <<< "$section_table")"
+            if [[ "$runtime_text_size" != "000000" ]]; then
+                echo "Error: runtime object control must have an empty .text section" >&2
+                exit 1
+            fi
+        fi
+        if [[ "${#kernel_objects[@]}" -ne "$expected_objects" ]]; then
+            echo "Error: unexpected caller-capture AIC input object count" >&2
+            exit 1
+        fi
     else
         echo "=== [$tag] Compiling AIV-only (dav-c310-vec) ==="
         "$CCEC" "${CCEC_FLAGS[@]}" --cce-aicore-arch=dav-c310-vec \
@@ -166,6 +197,34 @@ build_one() {
     echo "=== [$tag] Linking AICore binary ==="
     "$LD" -m aicorelinux -Ttext=0 -static --allow-multiple-definition \
         -o "$BUILD_DIR/$ko" "${kernel_objects[@]}"
+
+    if [[ "$ks" == "nested_lambda_cross_tu.cpp" ||
+          "$ks" == "nested_lambda_inline_plus_empty_runtime.cpp" ||
+          "$ks" == "nested_lambda_only_weak_submit_noinline.cpp" ]]; then
+        local symbol_table submit_symbols
+        if ! symbol_table="$(readelf -Ws -W "$BUILD_DIR/$ko")"; then
+            echo "Error: failed to read caller-capture symbol table" >&2
+            exit 1
+        fi
+        submit_symbols="$(
+            awk '$4 == "FUNC" && $8 ~ /nested_probe_submit_/ {sub(/\$local$/, "", $8); print $8}' \
+                <<< "$symbol_table" |
+                sort -u
+        )"
+        if [[ "$ks" == "nested_lambda_only_weak_submit_noinline.cpp" ]]; then
+            if [[ "$(printf '%s\n' "$submit_symbols" | sed '/^$/d' | wc -l)" -ne 1 ||
+                  "$submit_symbols" != *nested_probe_submit_weak_context* ]]; then
+                echo "Error: noinline control must retain only nested_probe_submit_weak_context" >&2
+                exit 1
+            fi
+        elif [[ -n "$submit_symbols" ]]; then
+            echo "Error: inline caller-capture probe retained runtime submit symbols" >&2
+            exit 1
+        fi
+        echo "[ASSERT] CCEC caller-capture runtime symbol shape PASS"
+        echo "[VALUES] aic_input_objects=${#kernel_objects[@]}" \
+            "runtime_text=${runtime_text_size:-n/a} submit_symbols=${submit_symbols:-none}"
+    fi
 
     echo "=== [$tag] Compiling host ==="
     g++ -O2 -std=c++17 \
@@ -185,24 +244,27 @@ run_one() {
     local probe_failures=0
     tag="$(basename "$ko" .o)"
     echo "=== Running [$tag] ==="
-    if [[ "$tag" == "nested_lambda_cross_tu_kernel" ]]; then
+    if [[ "$tag" == "nested_lambda_cross_tu_kernel" ||
+          "$tag" == "nested_lambda_inline_plus_empty_runtime_kernel" ||
+          "$tag" == "nested_lambda_only_weak_submit_noinline_kernel" ]]; then
         if [[ -n "${ATOMIC_PROBE_MODE:-}" ]]; then
             probe_modes=("$ATOMIC_PROBE_MODE")
-        else
-            # Run each variant in its own process: an expected AICore exception
-            # in a bad compiler variant must not hide the remaining controls.
+        elif [[ "$tag" == "nested_lambda_only_weak_submit_noinline_kernel" ]]; then
             probe_modes=(
                 strong-context
-                args-runtime-read
-                weak-args-storage
-                weak-context-materialize-3
-                weak-context-materialize-2
                 weak-context-materialize-1
+                weak-context-materialize-0
+            )
+        elif [[ "$tag" == "nested_lambda_inline_plus_empty_runtime_kernel" ]]; then
+            probe_modes=(weak-context-materialize-0)
+        else
+            probe_modes=(
+                args-runtime-read
                 weak-context-materialize-0
             )
         fi
         for probe_mode in "${probe_modes[@]}"; do
-            echo "--- CCEC cross-TU variant=$probe_mode ---"
+            echo "--- CCEC caller-capture variant=$probe_mode ---"
             if ! timeout "$RUN_TIMEOUT" \
                 "$BUILD_DIR/$hb" "$BUILD_DIR/$ko" "$probe_mode"; then
                 probe_failures=$((probe_failures + 1))
@@ -370,7 +432,9 @@ export LD_LIBRARY_PATH="$ASCEND_HOME_PATH/x86_64-linux/lib64:${LD_LIBRARY_PATH:-
 selected=0
 suite_run_failures=0
 entries=("${PROBES[@]}")
-if [[ "$SELECT" == "nested_lambda_cross_tu" ]]; then
+if [[ "$SELECT" == "nested_lambda_cross_tu" ||
+      "$SELECT" == "nested_lambda_inline_plus_empty_runtime" ||
+      "$SELECT" == "nested_lambda_only_weak_submit_noinline" ]]; then
     entries+=("${MANUAL_PROBES[@]}")
 fi
 for entry in "${entries[@]}"; do
