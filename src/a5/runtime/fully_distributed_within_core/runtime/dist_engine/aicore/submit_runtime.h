@@ -264,6 +264,8 @@ PTO_DEVICE_FUNC void dist_submit_replay_orch(__gm__ Runtime *runtime) {
 
 DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors
 dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &args) {
+    const ActiveMask active = mixed.to_active_mask();
+    if (__builtin_popcount(active.core_mask()) >= 2) g_fdwic_joint_submit_seen = true;
     DistSubmitCtx ctx;
     dist_submit_begin(nullptr, args, ctx);
     TRACE_SPAN_BEGIN(submit_trace);

@@ -17,9 +17,9 @@
 
 namespace pto::a5 {
 
-// Per-cpu_id metadata used by the packing algorithm. Filled from DSMI
-// CPU_TOPO + halGetDeviceInfo(AICPU, OCCUPY). cluster/die ids derive from
-// phy_cpu_id via the a5 mapping (cluster = phy/2, die = phy/4).
+// Per-cpu_id metadata used by the packing algorithm. Normally filled from
+// DSMI CPU_TOPO + halGetDeviceInfo(AICPU, OCCUPY). On older drivers without
+// CPU_TOPO, physical/topology fields are -1 and packing uses a flat pool.
 struct AicpuLogicalCpu {
     int32_t cpu_id;
     int32_t phy_cpu_id;
@@ -28,15 +28,19 @@ struct AicpuLogicalCpu {
     int32_t die_id;          // phy_cpu_id / 4
 };
 
-// Probe device-side AICPU topology. Returns true iff the user pool was
-// successfully resolved (at least one entry in `out_user_cpus`). The output
-// only contains cpu_ids that are in the device-side OCCUPY bitmap (i.e.
-// user-schedulable), sorted by cpu_id ascending.
+// Probe the AICPU user pool and, when available, its topology. Returns true
+// iff the user pool was successfully resolved (at least one entry in
+// `out_user_cpus`). The output
+// only contains cpu_ids that are in the OCCUPY bitmap (i.e.
+// user-schedulable), sorted by cpu_id ascending. The flat fallback is accepted
+// only when OCCUPY popcount matches ACL_DEV_ATTR_AICPU_CORE_NUM.
 //
-// This function performs three driver calls:
+// This function uses these queries:
 //   * halGetDeviceInfo(AICPU, OCCUPY) — user-schedulable bitmap
 //   * halGetDeviceInfoByBuff(SYSTEM, CPU_TOPO)  (primary)
 //   * dsmi_get_device_info(SOC_INFO, CPU_TOPO)  (fallback)
+//   * aclrtGetDeviceInfo(AICPU_CORE_NUM) — validates the flat fallback when
+//     both CPU_TOPO queries are unavailable
 //
 // All driver entry points are dlsym'd from the host process (CANN is
 // expected to be already loaded by the surrounding `aclInit` path).
