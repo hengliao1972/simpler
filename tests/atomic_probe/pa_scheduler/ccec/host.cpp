@@ -10,6 +10,7 @@
  */
 
 #include "../common/host_support.h"
+#include "pmu_owner_host.h"
 #include "pmu_probe.h"
 
 #include "acl/acl.h"
@@ -230,13 +231,19 @@ void PrintPmuAggregate(const char *name, const PmuAggregate &aggregate) {
     );
 }
 
-bool ValidatePmu(const pa_scheduler::SchedulerState &state, uint32_t run, const PmuOptions &pmu) {
+bool ValidatePmu(
+    const pa_scheduler::SchedulerState &state, uint32_t run, const PmuOptions &pmu,
+    const pa_scheduler::pmu_owner::PmuOwnerControl *owner
+) {
     using namespace pa_scheduler::ccec_pmu;
     if (pmu.mode == WindowMode::Off) return true;
 
     bool seen[kPhysicalSubcoreCount] = {};
     uint32_t trusted = 0;
     uint32_t unique = 0;
+    uint32_t owner_members = 0;
+    uint32_t exact_worker_slots = 0;
+    uint32_t physical_role_matches = 0;
     uint32_t prior_larger = 0;
     uint32_t bad_printed = 0;
     PmuAggregate all;
@@ -247,7 +254,12 @@ bool ValidatePmu(const pa_scheduler::SchedulerState &state, uint32_t run, const 
         const uint32_t status = result.pmu_status;
         const uint32_t core_id = StatusCoreId(status);
         const bool record_trusted = (status & kStatusRequired) == kStatusRequired;
+        const bool logical_aic = worker < pa_scheduler::kAicWorkers;
+        const bool physical_aic = pa_scheduler::pmu_owner::IsAicPhysicalSlot(core_id);
         trusted += record_trusted;
+        owner_members += owner != nullptr && pa_scheduler::pmu_owner::IsConfigured(*owner, core_id);
+        exact_worker_slots += result.worker_id == worker;
+        physical_role_matches += logical_aic == physical_aic;
         prior_larger += (status & kStatusPriorSnapshotLarger) != 0;
         if (core_id < kPhysicalSubcoreCount && !seen[core_id]) {
             seen[core_id] = true;
@@ -266,11 +278,32 @@ bool ValidatePmu(const pa_scheduler::SchedulerState &state, uint32_t run, const 
         AddPmuSample(result, result.role == static_cast<uint32_t>(pa_scheduler::CoreRole::Aic) ? &aic : &aiv);
     }
 
+    uint32_t mixed_triplet_matches = 0U;
+    for (uint32_t block = 0U; block < pa_scheduler::kAicWorkers; ++block) {
+        const uint32_t aic_id = StatusCoreId(state.results[block].pmu_status);
+        if (!pa_scheduler::pmu_owner::IsAicPhysicalSlot(aic_id)) continue;
+        const uint32_t die_base = (aic_id / pa_scheduler::pmu_owner::kSubcoresPerDie) *
+            pa_scheduler::pmu_owner::kSubcoresPerDie;
+        const uint32_t local = aic_id % pa_scheduler::pmu_owner::kSubcoresPerDie;
+        const uint32_t expected_aiv0 = die_base + pa_scheduler::pmu_owner::kAicPerDie + local * 2U;
+        const uint32_t aiv0_id = StatusCoreId(
+            state.results[pa_scheduler::kAicWorkers + block * 2U].pmu_status
+        );
+        const uint32_t aiv1_id = StatusCoreId(
+            state.results[pa_scheduler::kAicWorkers + block * 2U + 1U].pmu_status
+        );
+        mixed_triplet_matches += aiv0_id == expected_aiv0 && aiv1_id == expected_aiv0 + 1U;
+    }
+
     PrintPmuAggregate("ALL", all);
     PrintPmuAggregate("AIC", aic);
     PrintPmuAggregate("AIV", aiv);
     const bool records_ok = trusted == pa_scheduler::kWorkers;
     const bool core_ids_ok = unique == pa_scheduler::kWorkers;
+    const bool owner_members_ok = owner_members == pa_scheduler::kWorkers;
+    const bool worker_slots_ok = exact_worker_slots == pa_scheduler::kWorkers;
+    const bool physical_roles_ok = physical_role_matches == pa_scheduler::kWorkers;
+    const bool mixed_triplets_ok = mixed_triplet_matches == pa_scheduler::kAicWorkers;
     std::printf(
         "[PMU] run=%u window=%s scalar_nops=%u trusted=%u/%u unique_coreids=%u/%u prior_larger=%u/%u\n", run,
         PmuModeName(pmu.mode), pmu.scalar_nops, trusted, pa_scheduler::kWorkers, unique, pa_scheduler::kWorkers,
@@ -280,7 +313,16 @@ bool ValidatePmu(const pa_scheduler::SchedulerState &state, uint32_t run, const 
                 records_ok ? "PASS" : "FAIL");
     std::printf("[ASSERT] %-48s %s\n", "all 96 PMU physical subcore ids are unique",
                 core_ids_ok ? "PASS" : "FAIL");
-    return records_ok && core_ids_ok;
+    std::printf("[ASSERT] %-48s %s\n", "all PMU physical ids belong to the owner bitmap",
+                owner_members_ok ? "PASS" : "FAIL");
+    std::printf("[ASSERT] %-48s %s\n", "worker result slots and ids match exactly",
+                worker_slots_ok ? "PASS" : "FAIL");
+    std::printf("[ASSERT] %-48s %s\n", "logical AIC/AIV roles match physical subcores",
+                physical_roles_ok ? "PASS" : "FAIL");
+    std::printf("[ASSERT] %-48s %s\n", "all 32 mixed blocks map to physical 1:2 triplets",
+                mixed_triplets_ok ? "PASS" : "FAIL");
+    return records_ok && core_ids_ok && owner_members_ok && worker_slots_ok &&
+        physical_roles_ok && mixed_triplets_ok;
 }
 
 }  // namespace
@@ -310,7 +352,7 @@ int main(int argc, char **argv) {
     }
     pa_scheduler::host::PrintBanner("CCEC", options);
     std::printf(
-        "[PMU-CONFIG] window=%s scalar_nops=%u source=direct-per-core requires=msprof-PipeUtilization\n",
+        "[PMU-CONFIG] window=%s scalar_nops=%u source=direct-per-core owner=main-aicpu-path-a\n",
         PmuModeName(pmu_options.mode), pmu_options.scalar_nops
     );
 
@@ -349,24 +391,25 @@ int main(int argc, char **argv) {
     }
 
     PmuRegisterMappings pmu_mappings;
-    void *pmu_registers_device = nullptr;
+    pa_scheduler::pmu_owner::PmuOwnerSession pmu_owner;
+    const void *pmu_registers_device = nullptr;
     if (pmu_options.mode != pa_scheduler::ccec_pmu::WindowMode::Off) {
         if (!MapPmuRegisters(options.device, &pmu_mappings)) return EXIT_FAILURE;
-        const size_t register_bytes = pmu_mappings.register_bases.size() * sizeof(uint64_t);
-        if (!CheckAcl(
-                aclrtMalloc(&pmu_registers_device, register_bytes, ACL_MEM_MALLOC_NORMAL_ONLY),
-                "aclrtMalloc(PMU register table)"
+        const std::string dispatcher_path = pa_scheduler::pmu_owner::ArtifactBesideKernel(
+            options.kernel_path, "libpa_scheduler_pmu_owner_dispatcher.so"
+        );
+        const std::string owner_path = pa_scheduler::pmu_owner::ArtifactBesideKernel(
+            options.kernel_path, "libpa_scheduler_pmu_owner_aicpu.so"
+        );
+        if (!pmu_owner.Initialize(
+                options.device, stream, dispatcher_path, owner_path, pmu_mappings.register_bases
             ) ||
-            !CheckAcl(
-                aclrtMemcpy(
-                    pmu_registers_device, register_bytes, pmu_mappings.register_bases.data(), register_bytes,
-                    ACL_MEMCPY_HOST_TO_DEVICE
-                ),
-                "aclrtMemcpy(H2D PMU register table)"
-            )) {
+            !pmu_owner.Configure()) {
+            (void)pmu_owner.Finalize();
             (void)UnmapPmuRegisters(options.device, &pmu_mappings);
             return EXIT_FAILURE;
         }
+        pmu_registers_device = reinterpret_cast<const void *>(pmu_owner.RegisterTableDeviceAddress());
     }
 
     // 泳道区按 96 worker 各 65536 条记录预留，约 384 MiB；关闭泳道时不申请，也不会传递有效 base。
@@ -497,7 +540,10 @@ int main(int argc, char **argv) {
             *state, run, host_us, options.trace_enabled ? &trace_header : nullptr
         );
         all_passed &= metrics.passed;
-        all_passed &= ValidatePmu(*state, run, pmu_options);
+        all_passed &= ValidatePmu(
+            *state, run, pmu_options,
+            pmu_options.mode == pa_scheduler::ccec_pmu::WindowMode::Off ? nullptr : &pmu_owner.Control()
+        );
         spans.push_back(metrics.submit_span_us);
         if (options.analyze_swimlane &&
             !pa_scheduler::host::AnalyzeSwimlaneRecords(trace_header, *state, read_trace_records)) {
@@ -534,7 +580,8 @@ int main(int argc, char **argv) {
         cleanup_ok &= CheckAcl(aclrtFree(trace_device), "aclrtFree(swimlane trace)");
     }
     if (pmu_registers_device != nullptr) {
-        cleanup_ok &= CheckAcl(aclrtFree(pmu_registers_device), "aclrtFree(PMU register table)");
+        // owner 必须在 MMIO 映射、device context 和 ACL runtime 仍有效时恢复。
+        cleanup_ok &= pmu_owner.Finalize();
         cleanup_ok &= UnmapPmuRegisters(options.device, &pmu_mappings);
     }
     cleanup_ok &= CheckAcl(aclrtFree(state_device), "aclrtFree(state)");

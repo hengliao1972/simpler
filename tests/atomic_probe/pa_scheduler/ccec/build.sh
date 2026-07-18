@@ -24,13 +24,14 @@ fi
 
 CCEC="$ASCEND_HOME_PATH/bin/ccec"
 LD="$ASCEND_HOME_PATH/bin/ld.lld"
+HCC="$ASCEND_HOME_PATH/tools/hcc/bin/aarch64-target-linux-gnu-g++"
 CXX_BIN="${CXX:-g++}"
 READELF_BIN="${READELF:-readelf}"
 PTO_INCLUDE_ROOT="${PTO_ISA_ROOT:-$ASCEND_HOME_PATH/x86_64-linux}"
 
 # ccec/ld.lld 必须来自当前已 source 的 CANN；host 编译器和 readelf 允许用户通过环境变量替换。
-if [[ ! -x "$CCEC" || ! -x "$LD" ]]; then
-    echo "CCEC or ld.lld is missing under ASCEND_HOME_PATH=$ASCEND_HOME_PATH" >&2
+if [[ ! -x "$CCEC" || ! -x "$LD" || ! -x "$HCC" ]]; then
+    echo "CCEC, ld.lld, or the AICPU HCC compiler is missing under ASCEND_HOME_PATH=$ASCEND_HOME_PATH" >&2
     exit 1
 fi
 if ! command -v "$READELF_BIN" >/dev/null 2>&1; then
@@ -97,6 +98,45 @@ for entry in pa_scheduler_0_mix_aic pa_scheduler_0_mix_aiv; do
 done
 echo "[CHECK] both 1:2 mixed entries and metadata sections are present"
 
+# PMU selector/CTRL 的所有权必须由主 aicpu_scheduler 配置并在退出前恢复。
+# standalone 目录内自带 Path-A dispatcher 与 owner：前者负责把 owner SO
+# 落到设备预安装目录，后者由 mode=0 JSON 注册并通过统一入口执行命令。
+echo "[BUILD] self-contained AICPU PMU dispatcher"
+"$HCC" -shared -fPIC -O3 -g -std=gnu++17 -Wall -Wextra -Werror \
+    -Wl,--build-id \
+    "$SCRIPT_DIR/pmu_owner_dispatcher.cpp" \
+    -o "$BUILD_DIR/libpa_scheduler_pmu_owner_dispatcher.so"
+
+echo "[BUILD] self-contained AICPU PMU owner"
+"$HCC" -shared -fPIC -O3 -g -std=gnu++17 -Wall -Wextra -Werror \
+    -Wl,--build-id \
+    -I"$SCRIPT_DIR" \
+    "$SCRIPT_DIR/pmu_owner_aicpu.cpp" \
+    -o "$BUILD_DIR/libpa_scheduler_pmu_owner_aicpu.so"
+
+OWNER_HEADER="$("$READELF_BIN" --file-header "$BUILD_DIR/libpa_scheduler_pmu_owner_aicpu.so")"
+OWNER_SYMBOLS="$("$READELF_BIN" --dyn-syms --wide "$BUILD_DIR/libpa_scheduler_pmu_owner_aicpu.so")"
+DISPATCHER_HEADER="$("$READELF_BIN" --file-header "$BUILD_DIR/libpa_scheduler_pmu_owner_dispatcher.so")"
+DISPATCHER_SYMBOLS="$("$READELF_BIN" --dyn-syms --wide "$BUILD_DIR/libpa_scheduler_pmu_owner_dispatcher.so")"
+if [[ "$OWNER_HEADER" != *"Type:                              DYN"* ||
+      "$OWNER_HEADER" != *"Machine:                           AArch64"* ||
+      "$DISPATCHER_HEADER" != *"Type:                              DYN"* ||
+      "$DISPATCHER_HEADER" != *"Machine:                           AArch64"* ]]; then
+    echo "PMU dispatcher and owner must both be AArch64 shared objects." >&2
+    exit 1
+fi
+if [[ "$OWNER_SYMBOLS" != *" simpler_aicpu_exec"* ]]; then
+    echo "Missing main AICPU PMU owner entry: simpler_aicpu_exec" >&2
+    exit 1
+fi
+for entry in StaticTileFwkBackendKernelServer DynTileFwkBackendKernelServerInit DynTileFwkBackendKernelServer; do
+    if [[ "$DISPATCHER_SYMBOLS" != *" $entry"* ]]; then
+        echo "Missing AICPU PMU dispatcher entry: $entry" >&2
+        exit 1
+    fi
+done
+echo "[CHECK] Path-A dispatcher and main AICPU PMU owner exports are present"
+
 # host runner 只链接用户 CANN 9.1 的 ACL/runtime，并写入同一安装目录的 rpath，运行时不需要 simpler 动态库。
 # `-Werror` 让 host API 签名或尺寸类型变化在构建期暴露，避免到上板阶段才出现参数截断。
 echo "[BUILD] CCEC host runner"
@@ -105,6 +145,7 @@ echo "[BUILD] CCEC host runner"
     -I"$ASCEND_HOME_PATH/include" \
     -I"$ASCEND_HOME_PATH/pkg_inc" \
     -I"$ASCEND_HOME_PATH/pkg_inc/runtime" \
+    -I"$ASCEND_HOME_PATH/pkg_inc/runtime/runtime" \
     "$SCRIPT_DIR/host.cpp" \
     -L"$ASCEND_HOME_PATH/x86_64-linux/lib64" \
     -Wl,-rpath,"$ASCEND_HOME_PATH/x86_64-linux/lib64" \
