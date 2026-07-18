@@ -1560,3 +1560,74 @@ repeat 都执行；repeat 完整性仍使用 CCEC count1→count2 engine PMU 精
 RingBp。这说明 standalone 已达到“独立复现约 5 ms 调度”的目标；仍然保留
 本文第 6 节的边界：它不依赖 simpler 生产代码，也不复刻真实 PA 数值数据流和
 通用多 group/joint 拓扑。
+
+#### 7.5.14 默认真负载的 Submit I-cache 基线
+
+本节只回答一个目标：完整 Submit 控制流窗口内，平均单核、尤其 AIV 上发生多少
+I-cache miss，以及其中多少性能损失可以被当前证据支持。正式主指标按每轮角色
+`sum / cores` 计算后再取五轮中位数；逐核百分比不做算术平均。
+
+默认负载切换完成后，以当前同一 CCEC ELF 显式指定
+`real-compute/constant/6,28,4,1`，关闭泳道和逐 atomic，采集 5 个独立
+`submit-all` PMU-only 进程。每轮均为 schema v3、96/96 trusted、32 AIC +
+64 AIV、32 个完整 triplet；协议、真计算数值、Submit 内 placement/engine、
+start/stop、counter 门槛和 Restore 全部 PASS。新增的
+`pmu_sidecar_analyzer.py` 从 96 条 raw 独立重算 ALL/AIC/AIV 全字段，与 host
+summary 五轮完全一致：
+
+| 轮次 | Submit span | request 总和 | miss 总和 | 总 miss rate | AIC / AIV miss rate |
+| ---- | ----------: | -----------: | --------: | -------------: | --------------------: |
+| 1 | 4,027.976 us | 45,857,671 | 5,908,019 | 12.8834% | 8.5382% / 15.0323% |
+| 2 | 3,719.597 us | 45,498,660 | 5,896,760 | 12.9603% | 8.5318% / 15.1902% |
+| 3 | 3,732.543 us | 45,520,846 | 5,909,025 | 12.9809% | 8.5716% / 15.2014% |
+| 4 | 3,621.080 us | 45,603,314 | 5,897,686 | 12.9326% | 8.4889% / 15.1748% |
+| 5 | 3,581.265 us | 45,551,060 | 5,894,904 | 12.9413% | 8.5307% / 15.1632% |
+
+五轮中位数为 Submit 3,719.597 us、request 45,551,060、miss 5,897,686，
+总/AIC/AIV miss rate 为 12.9413%/8.5318%/15.1748%。request 全范围跨度约
+0.79%，miss 约 0.24%；相比 Submit span 和 scalar busy，I-cache 总量在这
+五轮更稳定，但这不取消正式 A/B 对多个独立进程和交错顺序的要求。
+
+直接面向目标的逐核结果为：ALL 平均 61,434.229 miss/核，AIC 平均
+40,626.219 miss/核，AIV 平均 **71,865.516 miss/核**；AIV 的五轮范围为
+71,768.250～72,068.734 miss/核，逐核分布 p95 的五轮中位数为 73,035。
+AIV 平均 request 为 473,306/核，按组内 `sum(miss)/sum(request)` 得到上述
+15.1748%。由于 AIC/AIV 是明显双峰，ALL 的逐核 median 不用于替代分角色均值。
+
+同一 ELF 又显式运行 3 个历史标定强度的 scalar-NOP 样本
+`129600,157900,79950,2400`。raw 重算中位数为 request 70,236,792、miss
+5,942,635；与真计算相比，request 多约 35.1%，绝对 miss 只多约 0.76%。AIC/AIV
+每核 miss 中位数分别约 40.2K/72.8K，真计算为 40.6K/71.9K。这个对照只支持：
+当前约 5.9M 的 CNT7 总量对 winner 负载模式不敏感，更可能主要来自两种模式共用的
+调度控制流和代码布局；不能仅看真计算 miss rate 较高，就错误归因为真引擎造成更多
+miss。两组负载和调度到达不同，本轮也不是交错配对性能 A/B，故不使用其 Submit
+差值宣称性能收益。
+
+同一 ELF 的 3 个 `empty` 进程只在 RunScheduler 后打开空 gate。每轮 96 核
+owner/selector/start/stop/Restore 均闭环，total 每核中位数为 173～179；全核
+request/miss 中位数仅 958/444，分别约为正式 Submit 中位数的 0.0021%/0.0075%。
+empty 的 46% 左右 miss rate 来自极小分母，没有性能含义，也不从 Submit 中机械
+相减。
+
+按 90 ns/miss 的受控 cold/warm 标尺，AIC/AIV 每核的串行等效量约为
+3.66/6.47 ms；AIV 结果甚至超过本轮约 3.72 ms 的 PMU-only Submit span，也超过
+熟悉的约 5 ms 泳道基线。这正面证明 miss 会在不同核间并行，在单核内也可能重叠，
+并且受控 cold miss 与真实热路径 miss 不能假定为同一个可加常数。因此 6.47 ms
+**不是实际损失**，当前 A5 PIPE_UTIL 事件表也没有已经核实的 I-cache stall-cycle
+counter。实际暴露损失必须由同语义代码布局 A/B 同时给出 `ΔAIV miss/核` 和关闭
+PMU/泳道后的 `ΔSubmit span`；在该 A/B 完成前，本节把实际损失明确记为“尚未测得”，
+不从总 miss 机械换算。
+
+这里的 3.719597 ms 是本组 `--no-swimlane`、PMU gate 打开的五轮中位数；约
+5 ms 是标准泳道配置的熟悉基线，两者不是同一观察配置，不能直接相减。PMU
+`submit-all` 是每 worker 从 orchestration 初始化前到本核最后一次 Submit 返回；
+`submit_span_us` 则是 96 核最早的首个 `Submit.begin` 到最晚的末个
+`Submit.end`。二者都覆盖完整 Submit 控制流，但边界不完全相同。
+
+本机未入库的原始 sidecar 位于：
+
+~~~text
+outputs/pmu_submit_all_real_compute_b256_20260718T140539Z/run1.json ... run5.json
+outputs/pmu_empty_real_compute_b256_20260718T140908Z/run1.json ... run3.json
+outputs/pmu_submit_all_scalar_nop_b256_same_elf_20260718T141455Z/run1.json ... run3.json
+~~~

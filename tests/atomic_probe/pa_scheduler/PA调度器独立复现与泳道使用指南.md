@@ -747,6 +747,40 @@ tests/atomic_probe/pa_scheduler/outputs/pmu_validation/
 模式扩展成 Claim、EfDrain 等多个正式局部窗口。性能 A/B 仍要保持观察布局一致，
 最终端到端收益以关闭 PMU 和泳道的独立进程结果为准。
 
+#### 校验并聚合多轮 PMU sidecar
+
+`pmu_sidecar_analyzer.py` 只读消费当前 schema-v3 JSON。它不信任单轮 host 已写好的
+summary，而是从每份文件的 worker raw 记录重新计算 ALL/AIC/AIV 的
+`sum/mean/median/p95/max` 与 `sum(miss)/sum(request)`；同时检查 accepted、
+96 核 start/stop、物理核唯一性、owner membership、角色、counter 门槛和 Restore。
+任一字段不一致即拒绝整组输入。
+
+同一次构建、同一观察参数的多个独立进程可直接聚合：
+
+```bash
+source /home/q00473782/.venv/bin/activate
+python pmu_sidecar_analyzer.py "$OUT"/run*.json
+python pmu_sidecar_analyzer.py --json "$OUT"/run*.json
+```
+
+工具把 device、batch、AIC/AIV 数、PMU window、selector、trace 配置和完整
+winner workload 纳入配置指纹。`submit-all` 与 `empty`、scalar-NOP 与
+real-compute 等不同口径不能混合聚合。当前 JSON 没有记录 ELF 内容哈希，所以
+调用者仍必须用独立输出目录隔离不同构建，不能只因 kernel 路径字符串相同就认为
+是同一二进制。
+
+默认 `--icache-miss-ns 90` 只打印受控 cold/warm 标尺下的一阶 core-work 等效量。
+输出明确标记 `not_wall_or_additive_stall`：96 核总和不是 Submit 墙钟，逐核估算也
+可能因 miss 重叠、事件来源和真实层级差异超过窗口时间，不能据此做绝对减法。
+文本输出的 `[PRIMARY]` 以 AIV 平均 request/miss、AIV 逐核 p95 和组内 miss rate
+为主；`[ACTUAL-EXPOSED-LOSS]` 在没有同语义配对 A/B 前固定报告 `UNMEASURED`，
+避免把 90 ns 标尺误写成约 5 ms Submit 中已经暴露的损失。
+分析器回归可独立执行：
+
+```bash
+python -m unittest -v test_pmu_sidecar_analyzer.py
+```
+
 ## 6. 当前 A5 结果与真实 PA 的差异
 
 2026-07-17 `scalar-nop` 阶段的一轮代表性结果如下。这是保留的历史
