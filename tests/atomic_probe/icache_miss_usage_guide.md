@@ -43,12 +43,13 @@ atomic wrapper、ClockBaseline、runtime phase-profile 和旧 cold/warm 冲刷�
 
 ## 3. `none` 与 `claim` 如何选择
 
-当前只有两个编译期 phase：
+当前已验证三个编译期 phase：
 
 | phase | 边界 | 优先用途 |
 | --- | --- | --- |
 | `none` | 完整 Submit 中不读局部 shadow counter | 回答完整 Submit 的 AIC/AIV 每核 request/miss；这是默认选择 |
 | `claim` | 每次 `Claim()` 调用前后读局部 shadow counter | 当 `none` 已证明 miss 值得追踪时，试验 Claim 的 running read-clear 下界/上界归因链路 |
+| `efdrain` | 每次 Submit 开头唯一的 `DrainReady(...EfDrain...)` 前后 | 观察 opportunistic drain；不混入 RingBackpressure 或 FinalDrain |
 
 `claim` 的 begin/end 读取本身会执行 scalar 指令、占用取指并改变多核
 时序。因此：
@@ -89,11 +90,18 @@ export CXX="$GCC15_ROOT/usr/bin/g++-15"
 ./run.sh build-submit-pmu ccec claim
 ```
 
+需要 EfDrain 局部归因时独立构建：
+
+```bash
+./run.sh build-submit-pmu ccec efdrain
+```
+
 产物分别位于：
 
 ```text
 pa_scheduler/build/ccec/submit-pmu/none/
 pa_scheduler/build/ccec/submit-pmu/claim/
+pa_scheduler/build/ccec/submit-pmu/efdrain/
 ```
 
 每个 phase 目录中的 `pa_scheduler_host`、`pa_scheduler_kernel.o`、
@@ -144,6 +152,22 @@ mkdir -p "$OUT_CLAIM"
   --winner-workload real-compute --real-compute-counts 6,28,4,1 \
   --pmu-json "$OUT_CLAIM/run1.json"
 ```
+
+### 5.3 EfDrain 局部归因
+
+```bash
+OUT_EFDRAIN="./outputs/submit_pmu_efdrain_$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$OUT_EFDRAIN"
+
+./run.sh submit-pmu ccec efdrain \
+  --device 0 --batches 256 \
+  --winner-workload real-compute --real-compute-counts 6,28,4,1 \
+  --pmu-json "$OUT_EFDRAIN/run1.json"
+```
+
+`efdrain` 每核固定调用 `batches * 5` 次；b256 的 AIC/AIV/global calls
+分别为 40,960/81,920/122,880。插点只位于 Submit 开头的 EfDrain 专属
+call-site；复用的 `DrainReady()` 函数体不插桩。
 
 `submit-pmu` action 已固定：
 
@@ -230,6 +254,8 @@ CNT8/CNT5 是顺序 `ld_dev`，不是同一时刻的原子配对快照，因此�
 - `none` 的 phase calls/begin/end/request/miss 全部为 0；
 - `claim` 的 begin/end/calls 逐核平衡，每核 calls 为 `batches * 5`，
   全局 calls 为 `batches * 5 * 96`；
+- `efdrain` 与 `claim` 具有相同的每核固定 calls 形状，但边界必须只覆盖
+  Submit 开头的 EfDrain call-site；
 - phase request/miss 分别不超过对应 shadow/primary，且可编程 counter
   低于当前 25% 保守风险阈值。
 
@@ -348,7 +374,7 @@ core-work 等效总量，不是端到端 Submit 总损失。要测真正暴露�
 新 phase 不能只增加一个 CLI 字符串。最小完整修改包括：
 
 1. `pa_scheduler/common/pa_model.h`：在 `SubmitPmuPhase` 尾部追加稳定
-   id，不重排已有 `None=0/Claim=1`。
+   id，不重排已有 `None=0/Claim=1/EfDrain=2`。
 2. `pa_scheduler/ccec/pmu_probe.h`：为 `SubmitPmuPhaseName()` 增加名称映射，
    并核对 phase status/边界闭合定义。
 3. `pa_scheduler/ccec/build.sh`：在白名单中将 phase 名映射到稳定

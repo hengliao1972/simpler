@@ -217,7 +217,7 @@ export CXX="$GCC15_ROOT/usr/bin/g++-15"
 | 构建 | 后端 | 内容 | 构建命令 | 产物目录 |
 | --- | --- | --- | --- | --- |
 | `swimlane` | CCEC/AscendC/CPU | 普通阶段与 schema-v3 atomic（direct + PollBatch）合并采集；不配置 PMU | `./run.sh build ccec` 或 `./run.sh build all` | CCEC 为 `build/ccec/` |
-| `submit-pmu` | 仅 CCEC | 每核完整 Submit PMU，并在编译期可选一个局部阶段；当前只有 `none|claim` | `./run.sh build-submit-pmu ccec none|claim` | `build/ccec/submit-pmu/<phase>/` |
+| `submit-pmu` | 仅 CCEC | 每核完整 Submit PMU，并在编译期可选一个局部阶段；当前有 `none|claim|efdrain` | `./run.sh build-submit-pmu ccec <phase>` | `build/ccec/submit-pmu/<phase>/` |
 
 `./run.sh build all` 只构建三后端的 `swimlane` 产物；`submit-pmu`
 必须按 phase 另行构建。`none` 是不做局部边界读取的完整 Submit
@@ -234,7 +234,7 @@ export CXX="$GCC15_ROOT/usr/bin/g++-15"
 | `smoke` | 固定 b1/r1/`scalar-nop=0` 的快速语义回归 | 否，只做内存记录校验 |
 | `run` | 自行控制 batch、run、winner 负载和诊断参数 | 仅显式传入 `--swimlane-json` 时生成 raw |
 | `swimlane` | 单轮运行并自动生成 raw 和 Perfetto merged JSON | 是 |
-| `build-submit-pmu` | 构建指定 `none|claim` 的 CCEC PMU-only ELF | 否 |
+| `build-submit-pmu` | 构建指定 `none|claim|efdrain` 的 CCEC PMU-only ELF | 否 |
 | `submit-pmu` | 单轮采集完整 Submit PMU，可选导出 JSON | 否，与泳道隔离 |
 
 `ccec|ascendc|cpu|all` 用于选择后端；`all` 始终按 CCEC、AscendC、CPU
@@ -688,12 +688,14 @@ phase/lap/Kernel 边界修复之前的 schema-v2 逐调用模型，只能用于�
 | --- | --- | --- |
 | `none` | 不做任何中途 shadow counter 读取 | 完整 Submit 主基准，优先用于回答 AIC/AIV 每核 request/miss |
 | `claim` | 每次 `Claim()` 调用前后读取 shadow counter | 验证局部归因链路，输出带观察扰动的 running read-clear 下界和保守上界 |
+| `efdrain` | Submit 开头唯一的 EfDrain call-site 前后 | 归因 opportunistic drain，不包含 RingBackpressure/FinalDrain |
 
 分别构建：
 
 ```bash
 ./run.sh build-submit-pmu ccec none
 ./run.sh build-submit-pmu ccec claim
+./run.sh build-submit-pmu ccec efdrain
 ```
 
 产物完全分开：
@@ -701,6 +703,7 @@ phase/lap/Kernel 边界修复之前的 schema-v2 逐调用模型，只能用于�
 ```text
 build/ccec/submit-pmu/none/
 build/ccec/submit-pmu/claim/
+build/ccec/submit-pmu/efdrain/
 ```
 
 每个目录都自包含同 phase 的 host、mixed kernel、PMU owner 和 dispatcher，
@@ -737,7 +740,7 @@ CNT8 shadow whole request == CNT6 primary whole request
 CNT5 shadow whole miss    == CNT7 primary whole miss
 ```
 
-`claim` 在 A5 上运行中反复 read-clear 时，shadow 可能在边界处单向少计，
+`claim/efdrain` 在 A5 上运行中反复 read-clear 时，shadow 可能在边界处单向少计，
 因此接受条件改为逐核：
 
 ```text
@@ -755,7 +758,9 @@ phase miss    ∈ [observed miss,    observed miss    + miss loss]
 不要求局部 `phase miss <= phase request`；只要求二者分别不超过对应 shadow，
 上界分别不超过对应 primary。`none` 中 phase calls/begin/end/request/miss 必须
 全为 0；`claim` 中每核 begin/end/calls 必须配对，且每核 calls 必须等于
-`batches * 5`，全局为 `batches * 5 * 96`。
+`batches * 5`，全局为 `batches * 5 * 96`。`efdrain` 的 calls 形状相同；
+但插点只允许包围 Submit 开头的 EfDrain 专属调用，不能插入复用的
+`DrainReady()` 函数体。
 
 局部边界读取本身会增加 scalar 指令、改变 I-cache 布局和多核时序，
 因此 `claim` 是带边界扰动的归因结果。`none` 与 `claim` 是不同 ELF/
@@ -780,7 +785,7 @@ ratio，不是实际 miss rate 的数学下界。更完整的 I-cache 采集、�
 以下 `empty/scalar/scalar-double/icache-single`、CNT8 fix-busy 和 schema-v3
 文字保留为 2026-07-18 观察链路的建设过程与历史数据。当前
 `swimlane` 构建不提供 PMU，当前 `submit-pmu` 也只接受完整
-Submit 的 `none|claim`；不应继续照抄下文的历史校准命令作为当前用法。
+Submit 的 `none|claim|efdrain`；不应继续照抄下文的历史校准命令作为当前用法。
 
 CCEC 后端提供与泳道分离的 PMU sidecar。正式取数由本目录自带的 Main AICPU
 Path-A owner 配置 selector、保存并恢复 PMU 状态；kernel 在每个物理子核内门控并

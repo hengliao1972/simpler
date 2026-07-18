@@ -21,8 +21,8 @@ Usage:
   ./run.sh run    ccec|ascendc|cpu|all [benchmark options]
   ./run.sh smoke  ccec|ascendc|cpu|all [--device N]
   ./run.sh swimlane ccec|ascendc|cpu|all [benchmark options]
-  ./run.sh build-submit-pmu ccec none|claim
-  ./run.sh submit-pmu ccec none|claim [benchmark options]
+  ./run.sh build-submit-pmu ccec none|claim|efdrain
+  ./run.sh submit-pmu ccec none|claim|efdrain [benchmark options]
 
 Benchmark options:
   --device N
@@ -64,8 +64,8 @@ CCEC-only and cannot target all.
 
 The submit-pmu action is a separate CCEC-only build. It fixes one PMU-only run
 covering the complete Submit window. phase=none performs no internal snapshots;
-phase=claim reports running read-clear lower/loss-adjusted upper bounds for one
-compile-time phase while CNT6/7 retain the authoritative whole-window counters.
+phase=claim/efdrain reports running read-clear lower/loss-adjusted upper bounds
+for one compile-time phase while CNT6/7 retain the authoritative whole-window counters.
 
 The swimlane action performs exactly one run and writes both the raw capture
 and merged Perfetto JSON below this directory's outputs/ folder. It rejects
@@ -136,9 +136,9 @@ run_backend() {
 
 validate_submit_pmu_phase() {
     case "$1" in
-        none|claim) ;;
+        none|claim|efdrain) ;;
         *)
-            echo "Unknown submit-pmu phase: $1 (expected none|claim)" >&2
+            echo "Unknown submit-pmu phase: $1 (expected none|claim|efdrain)" >&2
             exit 1
             ;;
     esac
@@ -159,6 +159,7 @@ validate_submit_pmu_artifacts() {
     case "$phase" in
         none) phase_id=0 ;;
         claim) phase_id=1 ;;
+        efdrain) phase_id=2 ;;
         *) submit_pmu_artifact_failure "$phase" "unsupported phase"; return 1 ;;
     esac
 
@@ -377,7 +378,7 @@ case "$ACTION" in
         ;;
     build-submit-pmu)
         if [[ "$BACKEND" != "ccec" || $# -ne 1 ]]; then
-            echo "Usage: $0 build-submit-pmu ccec none|claim" >&2
+            echo "Usage: $0 build-submit-pmu ccec none|claim|efdrain" >&2
             exit 1
         fi
         PHASE="$1"
@@ -386,7 +387,7 @@ case "$ACTION" in
         ;;
     submit-pmu)
         if [[ "$BACKEND" != "ccec" || $# -lt 1 ]]; then
-            echo "Usage: $0 submit-pmu ccec none|claim [benchmark options]" >&2
+            echo "Usage: $0 submit-pmu ccec none|claim|efdrain [benchmark options]" >&2
             exit 1
         fi
         PHASE="$1"

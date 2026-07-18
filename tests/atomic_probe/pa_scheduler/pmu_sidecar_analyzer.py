@@ -59,7 +59,7 @@ SUBMIT_PMU_METRIC_NAMES = (
 SUMMARY_FIELDS = ("sum", "mean", "median", "p95", "max")
 SUBMIT_PMU_BUILD_VARIANT = "submit-pmu"
 SUBMIT_PMU_BUILD_VARIANT_ID = 2
-SUBMIT_PMU_PHASE_IDS = {"none": 0, "claim": 1}
+SUBMIT_PMU_PHASE_IDS = {"none": 0, "claim": 1, "efdrain": 2}
 TASKS_PER_BATCH = 5
 PHASE_STATUS_REQUIRED_MASK = 0x3CF
 
@@ -641,7 +641,11 @@ def _validate_submit_pmu_record(
         f"{prefix} phase upper bound exceeds the authoritative primary whole",
     )
 
-    expected_calls = 0 if phase_name == "none" else batches * TASKS_PER_BATCH
+    expected_calls = (
+        0 if phase_name == "none"
+        else batches * TASKS_PER_BATCH if phase_name in ("claim", "efdrain")
+        else -1
+    )
     _require(calls == expected_calls, f"{prefix} phase_calls does not match the phase contract")
     if phase_name == "none":
         _require(

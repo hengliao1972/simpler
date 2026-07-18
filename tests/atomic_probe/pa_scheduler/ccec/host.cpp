@@ -488,6 +488,24 @@ struct PmuValidation {
 // 高水位作为保守拒绝阈值；它只降低风险，不把“未越线”表述成回卷证明。
 constexpr uint32_t kProgrammableCounterRiskThreshold = UINT32_MAX / 4U;
 
+uint32_t ExpectedSubmitPmuPhaseCallsPerWorker(
+    const pa_scheduler::WorkerResult &result, uint32_t batches
+) {
+    // 固定流阶段按每核完整回放次数闭合；保留 result 入参，后续 winner-only
+    // 阶段必须从本核真实 wins/heap_guards 推导，不能继续套用固定 5B。
+    (void)result;
+    switch (pa_scheduler::kCompiledSubmitPmuPhase) {
+    case pa_scheduler::SubmitPmuPhase::None:
+        return 0U;
+    case pa_scheduler::SubmitPmuPhase::Claim:
+    case pa_scheduler::SubmitPmuPhase::EfDrain:
+        return batches * pa_scheduler::kTasksPerBatch;
+    case pa_scheduler::SubmitPmuPhase::Count:
+        break;
+    }
+    return UINT32_MAX;
+}
+
 bool ValidatePmu(
     const pa_scheduler::SchedulerState &state, uint32_t run, const PmuOptions &pmu,
     const WinnerWorkloadOptions &workload,
@@ -521,6 +539,7 @@ bool ValidatePmu(
     uint32_t phase_boundary_matches = 0;
     uint32_t phase_call_shape_matches = 0;
     uint64_t phase_calls = 0;
+    uint64_t expected_phase_calls = 0;
     uint64_t shadow_request_abs_delta_sum = 0;
     uint64_t shadow_miss_abs_delta_sum = 0;
     int64_t shadow_request_signed_delta_sum = 0;
@@ -532,12 +551,10 @@ bool ValidatePmu(
     PmuAggregate all;
     PmuAggregate aic;
     PmuAggregate aiv;
-    const uint32_t expected_phase_calls_per_worker =
-        pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
-            ? 0U
-            : state.config.batches * pa_scheduler::kTasksPerBatch;
     for (uint32_t worker = 0; worker < pa_scheduler::kWorkers; ++worker) {
         const pa_scheduler::WorkerResult &result = state.results[worker];
+        const uint32_t expected_phase_calls_per_worker =
+            ExpectedSubmitPmuPhaseCallsPerWorker(result, state.config.batches);
         const uint32_t status = result.pmu_status;
         const uint32_t core_id = StatusCoreId(status);
         const bool record_trusted = (status & kStatusRequired) == kStatusRequired;
@@ -580,6 +597,7 @@ bool ValidatePmu(
         phase_boundary_matches += boundaries_match;
         phase_call_shape_matches += phase_call_shape_matches_record;
         phase_calls += result.pmu_phase_calls;
+        expected_phase_calls += expected_phase_calls_per_worker;
         shadow_request_abs_delta_sum += request_abs_delta;
         shadow_miss_abs_delta_sum += miss_abs_delta;
         shadow_request_signed_delta_sum +=
@@ -646,13 +664,14 @@ bool ValidatePmu(
              !phase_call_shape_matches_record) && bad_printed < 8) {
             std::printf(
                 "[PMU-BAD] worker=%u role=%llu coreid=%u status=0x%08x total=%llu scalar=%u "
-                "req=%u miss=%u phase_status=0x%08x phase=%u/%u calls=%u boundaries=%u/%u "
+                "req=%u miss=%u phase_status=0x%08x phase=%u/%u calls=%u/%u boundaries=%u/%u "
                 "shadow=%u/%u\n",
                 worker, static_cast<unsigned long long>(result.role), core_id, status,
                 static_cast<unsigned long long>(result.pmu_total_cycles), result.pmu_scalar_busy,
                 result.pmu_icache_requests, result.pmu_icache_misses,
                 result.pmu_phase_status, result.pmu_phase_id,
                 static_cast<uint32_t>(pa_scheduler::kCompiledSubmitPmuPhase), result.pmu_phase_calls,
+                expected_phase_calls_per_worker,
                 result.pmu_phase_begin_reads, result.pmu_phase_end_reads,
                 result.pmu_shadow_icache_requests, result.pmu_shadow_icache_misses
             );
@@ -714,11 +733,6 @@ bool ValidatePmu(
             : shadow_primary_bounded_ok;
     const bool phase_boundaries_ok = phase_boundary_matches == pa_scheduler::kWorkers;
     const bool phase_call_shape_ok = phase_call_shape_matches == pa_scheduler::kWorkers;
-    const uint64_t expected_phase_calls =
-        pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
-            ? 0ULL
-            : static_cast<uint64_t>(state.config.batches) * pa_scheduler::kTasksPerBatch *
-                  pa_scheduler::kWorkers;
     const bool phase_calls_ok = phase_calls == expected_phase_calls;
     const bool submit_engine_observation_ok =
         pmu.mode != WindowMode::SubmitAll ||

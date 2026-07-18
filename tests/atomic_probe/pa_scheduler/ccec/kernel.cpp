@@ -645,7 +645,13 @@ __aicore__ inline void CcecOps::PmuWindowStop(
         context.phase_calls == state->config.batches * pa_scheduler::kTasksPerBatch &&
         context.begin_reads == context.phase_calls &&
         context.end_reads == context.phase_calls;
-    if (none_shape || claim_shape) context.phase_status |= kPhaseStatusPhaseShape;
+    const bool efdrain_shape =
+        pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::EfDrain &&
+        context.phase_calls == state->config.batches * pa_scheduler::kTasksPerBatch &&
+        context.begin_reads == context.phase_calls &&
+        context.end_reads == context.phase_calls;
+    if (none_shape || claim_shape || efdrain_shape)
+        context.phase_status |= kPhaseStatusPhaseShape;
 
     PublishPmuSnapshot(result, sample);
     PublishSubmitPmuContext(result, context);

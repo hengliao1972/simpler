@@ -561,7 +561,11 @@ PA_DEVICE bool SubmitTask(
 
     ResetTraceLap<Ops>(stats.trace, stats.result, worker);
     // EfDrain 在当前 Submit 的参数物化前执行上一批已就绪 slot，是绝大多数 kernel 的正常落点。
+    // 只在这个唯一 call-site 划 PMU 边界；DrainReady 还被 ring 背压和最终 drain
+    // 复用，不能把 phase 插入函数体后按 place 混合累计。
+    BeginSubmitPmuPhase<SubmitPmuPhase::EfDrain, Ops>(pmu_context);
     DrainReady<Ops>(state, worker, DrainPlace::EfDrain, stats);
+    EndSubmitPmuPhase<SubmitPmuPhase::EfDrain, Ops>(pmu_context);
     WriteTraceLap<Ops, Profile>(
         stats.trace, worker, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::EfDrain,
         ProfilePhase::EfDrain

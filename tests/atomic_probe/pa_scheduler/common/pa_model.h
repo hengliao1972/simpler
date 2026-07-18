@@ -183,12 +183,14 @@ enum class ProfilePhase : uint32_t {
 };
 
 // submit-pmu 每个 ELF 只编译一个局部归因阶段。none 不做中途 counter
-// 读取，是完整 Submit 的正式基线；claim 是首个连续、无提前返回的验证阶段。
+// 读取，是完整 Submit 的正式基线；claim 是首个连续、无提前返回的验证阶段，
+// EfDrain 只包围每次 Submit 开头唯一的 opportunistic drain call-site。
 // 后续阶段只能在各自边界和闭环经过 A5 验证后向枚举尾部追加。
 enum class SubmitPmuPhase : uint32_t {
     None = 0,
     Claim = 1,
-    Count = 2,
+    EfDrain = 2,
+    Count = 3,
 };
 
 #ifndef PA_SUBMIT_PMU_PHASE_ID

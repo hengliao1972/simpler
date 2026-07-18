@@ -201,7 +201,7 @@ def _capture(offset: int = 0, window: str = "submit-all") -> dict[str, Any]:
 
 
 def _submit_pmu_capture(offset: int = 0, phase: str = "claim") -> dict[str, Any]:
-    phase_ids = {"none": 0, "claim": 1}
+    phase_ids = {"none": 0, "claim": 1, "efdrain": 2}
     phase_id = phase_ids[phase]
     batches = 2
     calls_per_worker = 0 if phase == "none" else batches * TASKS_PER_BATCH
@@ -685,30 +685,45 @@ class PmuSidecarAnalyzerTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "mixed_triplet_matches"):
                 load_capture(path)
 
-    def test_submit_pmu_claim_calls_are_exact_per_worker(self) -> None:
-        capture = _submit_pmu_capture()
-        first = capture["records"][0]
-        second = capture["records"][1]
-        first["phase_calls"] -= 1
-        first["phase_begin_reads"] -= 1
-        first["phase_end_reads"] -= 1
-        first["shadow_read_segments"] -= 2
-        second["phase_calls"] += 1
-        second["phase_begin_reads"] += 1
-        second["phase_end_reads"] += 1
-        second["shadow_read_segments"] += 2
-        records = capture["records"]
-        capture["summary"] = {
-            "all": _submit_pmu_summary(records),
-            "aic": _submit_pmu_summary(records[:A5_AIC_WORKERS]),
-            "aiv": _submit_pmu_summary(records[A5_AIC_WORKERS:]),
-        }
-        # 全局 calls、每条 begin/end 与 shadow segment 都保持闭合，只有逐核
-        # claim 调用契约被破坏。
+    def test_submit_pmu_fixed_phase_calls_are_exact_per_worker(self) -> None:
+        for phase in ("claim", "efdrain"):
+            with self.subTest(phase=phase):
+                capture = _submit_pmu_capture(phase=phase)
+                first = capture["records"][0]
+                second = capture["records"][1]
+                first["phase_calls"] -= 1
+                first["phase_begin_reads"] -= 1
+                first["phase_end_reads"] -= 1
+                first["shadow_read_segments"] -= 2
+                second["phase_calls"] += 1
+                second["phase_begin_reads"] += 1
+                second["phase_end_reads"] += 1
+                second["shadow_read_segments"] += 2
+                records = capture["records"]
+                capture["summary"] = {
+                    "all": _submit_pmu_summary(records),
+                    "aic": _submit_pmu_summary(records[:A5_AIC_WORKERS]),
+                    "aiv": _submit_pmu_summary(records[A5_AIC_WORKERS:]),
+                }
+                # 全局 calls、每条 begin/end 与 shadow segment 都保持闭合，
+                # 只有逐核固定流 phase 的调用契约被破坏。
+                with tempfile.TemporaryDirectory() as directory:
+                    path = self._write(
+                        directory, f"redistributed-{phase}-calls.json", capture
+                    )
+                    with self.assertRaisesRegex(ValueError, "phase_calls does not match"):
+                        load_capture(path)
+
+    def test_submit_pmu_efdrain_is_an_independent_phase(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = self._write(directory, "redistributed-claim-calls.json", capture)
-            with self.assertRaisesRegex(ValueError, "phase_calls does not match"):
-                load_capture(path)
+            path = self._write(directory, "efdrain.json", _submit_pmu_capture(phase="efdrain"))
+            result = analyze([path])
+
+        self.assertEqual(result["phase_observation"]["compiled_phase"], "efdrain")
+        self.assertEqual(
+            result["aggregate"]["groups"]["all"]["phase_calls_per_core"]["median"],
+            2 * TASKS_PER_BATCH,
+        )
 
     def test_submit_pmu_none_rejects_nonzero_phase_counters(self) -> None:
         capture = _submit_pmu_capture(phase="none")

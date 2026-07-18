@@ -150,6 +150,8 @@ inline const char *SubmitPmuPhaseName(SubmitPmuPhase phase) {
         return "none";
     case SubmitPmuPhase::Claim:
         return "claim";
+    case SubmitPmuPhase::EfDrain:
+        return "efdrain";
     case SubmitPmuPhase::Count:
         break;
     }

@@ -33,7 +33,7 @@ Submit 路径，供后续继续优化。快照日期更新至 2026-07-18；当�
   fanin 成功/失败 load 与 frontier 重复前推，再进行单变量消减。
 - standalone 观察产物现已固定为两类：`swimlane` 合并普通阶段与 schema-v3
   atomic（direct Atomic 加 PollBatch）泳道；`submit-pmu` 独立重编译完整 Submit PMU，当前只支持
-  `none|claim`。两者不在同一进程采集；`none` 提供完整 Submit 的严格
+  `none|claim|efdrain`。两者不在同一进程采集；`none` 提供完整 Submit 的严格
   闭合计数，局部 phase 只提供 running read-clear 的下界/保守上界。
 
 环境安装、编译和基线复现过程见
@@ -1772,12 +1772,16 @@ schema-v3 以及“`--no-swimlane` 仍保留 phase timestamp”都是观察链�
 - `claim`：在每次 `Claim()` 前后读取 read-to-clear shadow，累计每核
   1,280 次 Claim 的观测下界，并用本核 primary-shadow residual 给出保守
   上界；b256 全局期望 calls 为 `256 * 5 * 96 = 122880`。
+- `efdrain`：只包围每次 Submit 开头唯一的 `DrainReady(...EfDrain...)`，
+  不把复用该函数的 RingBackpressure/FinalDrain 混入；calls 与 Claim 同为
+  每核 `5 * batches`。
 
 对应命令和产物为：
 
 ~~~bash
 ./run.sh build-submit-pmu ccec none
 ./run.sh build-submit-pmu ccec claim
+./run.sh build-submit-pmu ccec efdrain
 
 ./run.sh submit-pmu ccec none \
   --device 0 --batches 256 \
@@ -1788,11 +1792,17 @@ schema-v3 以及“`--no-swimlane` 仍保留 phase timestamp”都是观察链�
   --device 0 --batches 256 \
   --winner-workload real-compute --real-compute-counts 6,28,4,1 \
   --pmu-json ./outputs/<unique-claim>/run1.json
+
+./run.sh submit-pmu ccec efdrain \
+  --device 0 --batches 256 \
+  --winner-workload real-compute --real-compute-counts 6,28,4,1 \
+  --pmu-json ./outputs/<unique-efdrain>/run1.json
 ~~~
 
 ~~~text
 build/ccec/submit-pmu/none/
 build/ccec/submit-pmu/claim/
+build/ccec/submit-pmu/efdrain/
 ~~~
 
 每个 phase 目录中的 host、mixed kernel、owner 与 dispatcher 是同一构建
@@ -1904,4 +1914,28 @@ AIV 约 4.917 ms/core-equivalent。它们不能相加，也不能叫 Submit 墙�
 outputs/submit_pmu_none_validation_20260718_b256_real/run1.json ... run4.json
 outputs/submit_pmu_final_gate_20260718/none_b256/run1.json
 outputs/submit_pmu_final_gate_20260718/claim_b256/run1.json
+~~~
+
+#### 7.5.17 EfDrain 独立 phase 的 A5 闭环
+
+EfDrain 只在 `SubmitTask` 开头的专属 call-site 划界；`DrainReady()` 仍由
+RingBackpressure、HeapGuard 和 FinalDrain 复用，函数体本身没有 phase 分支。
+因此成功流每核固定 calls 为 `5 * batches`：
+
+| 规模 | 每核 calls | AIC/AIV calls | global calls | exact/bounded | request loss | miss loss | Submit span |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| b1 | 5 | 160 / 320 | 480 | 87/96，96/96 | 9 | 0 | 62.402 us |
+| b256 | 1,280 | 40,960 / 81,920 | 122,880 | 60/96，96/96 | 1,113 | 0 | 4,844.973 us |
+
+b256 的 phase request 为 `3,258,436..3,259,549`，phase miss 为
+`482,396..482,396`；调度语义、任务拓扑、真计算输出、placement/engine、
+owner/Restore 和分析器 raw 复算全部 PASS。该窗口既可能走空 ring fast path，
+也可能执行 ready slot 的真实 Cube/Vector workload、scalar wait、completion
+发布和 slot 回收。不同 phase ELF 的 Submit span 与局部计数仍不可相减。
+
+本机证据：
+
+~~~text
+outputs/submit_pmu_phases_20260718/efdrain_b1/run1.json
+outputs/submit_pmu_phases_20260718/efdrain_b256/run1.json
 ~~~
