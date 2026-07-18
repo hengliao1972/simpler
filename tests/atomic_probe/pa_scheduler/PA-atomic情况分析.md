@@ -337,9 +337,11 @@ span，或单独定义 `Submit.end - Build/Replay/Alloc.end` 为 action tail。
 - EfDrain、Replay、WaitForSlot、HeapGuard、flag/vend/frontier 和最终 drain；
 - 单 lane Case1 的 BlockWon 动态次数为零，以及真实泳道记录格式。
 
-只有 QK/SF/PV/UP 的计算体由可控 NOP 模拟；NOP 默认值按本文最好真实泳道的
-44.170/53.729/27.626/1.565 us 校准。独立用例不会在 Claim、Register、
-PrepareMap 或等待路径中增加 NOP 来硬凑 5 ms。
+QK/SF/PV/UP 默认仍可由可控 scalar NOP 模拟，旧默认值按本文最好真实泳道的
+44.170/53.729/27.626/1.565 us 校准。2026-07-18 起 CCEC 另提供显式
+`real-compute`：QK/PV 运行真实 Cube matmul，SF/UP 运行真实 Vector add/mul，
+每轮都含 GM load、计算、GM store 和完成等待；AscendC/CPU 尚按独立阶段迁移。
+两种模式都不会在 Claim、Register、PrepareMap 或等待路径中硬补 5 ms。
 
 当前严格校验覆盖 73,728 次 Claim、每 task 唯一 winner、1,024 个 kernel、
 TensorMap/heap 最终状态、fanin、flag、vend、frontier、cursor、ring placement
@@ -869,10 +871,10 @@ calibrated_cores == 96/96
 | 64 trials/core × 10 | 86.596（86.532～86.792）ns/miss | 85.913（85.848～86.202）ns/miss | 86.938（86.861～87.086）ns/miss |
 | 128 trials/core × 5 | 89.629（89.615～89.648）ns/miss | 92.100（91.984～92.267）ns/miss | 88.410（88.310～88.440）ns/miss |
 
-总体系数观测范围为 86.532～89.648 ns/miss；同一时段重跑 64 和 128 trials
-都约为 89.6 ns/miss。AIC/AIV 差值的方向在两组规模间改变，不建立跨时段
-的角色精确常数。几 ns 的变化属于并发环境下的有效 miss penalty 波动，
-不应保留成伪精确常数。后续 scalar 分析使用下面的取整公式即可：
+总体系数观测范围为 86.532～89.648 ns/miss；本表 64 和 128 trials 的中位数
+分别为 86.596 和 89.629 ns/miss。AIC/AIV 差值的方向在两组规模间改变，不建立
+跨时段的角色精确常数。几 ns 的变化属于并发环境下的有效 miss penalty 波动，
+不应保留成伪精确常数；后续统一取 90 只用于量级估算：
 
 ~~~text
 T_icache_est_ns = CNT7_miss_total * 90
@@ -905,10 +907,10 @@ tests/atomic_probe/pa_scheduler/outputs/pmu_validation/
 不再通过热路径内反复 stop/start 尝试扣除模拟计算体。
 
 `metrics_prof_start/stop()` 自带 `PIPE_ALL` 屏障，门控会收口流水并可能改变多核
-到达时序。A/B 两侧必须保持相同 gate 次数、NOP 和代码布局，端到端收益仍由无 PMU、
-无泳道的独立进程交错 A/B 判断。standalone 的 QK/SF/PV/UP NOP 循环由 scalar
-执行，会计入 scalar busy；它不是实际 Vector/Cube 计算，也不模拟真实 task 执行期间
-scalar 的等待状态。因此这里的 sidecar 只用于同配置调度分析，不能直接替代真实 PA。
+到达时序。A/B 两侧必须保持相同 gate 次数、winner mode/count 和代码布局，端到端
+收益仍由无 PMU、无泳道的独立进程交错 A/B 判断。`scalar-nop` 的 QK/SF/PV/UP
+循环由 scalar 执行并计入 scalar busy；CCEC `real-compute` 则真实激活
+Cube/Vector/MTE/FIX。两种模式不能混比，且两者 sidecar 都不能直接替代真实 PA。
 
 ### 7.4 阶段 D1：精确分类 fanin 与 frontier 动态原子次数
 
@@ -1108,7 +1110,7 @@ PA 的端到端 GAP 是“发布发射 -> 自然消费者首次观察到新值�
 duration 不直接包含自己的 record 写入；但这次写入、附加指令和代码布局
 会影响后续 atomic 到达、竞争与 I-cache，整轮仍是插桩运行。
 
-开启逐 atomic trace 时，每个 worker 在最终 drain 之后额外记录一个
+开启逐 atomic trace 时，每个 worker 在最终 drain 之后额外记录两条
 `ClockBaseline`：一条是连续两次 `get_sys_cnt()`，另一条是纯寄存器依赖
 hook 后读 `SYS_CNT`。它们只给出同一二进制、同一物理核上两类边界的
 计时分辨率和固定底噪分布，使用边界是：
@@ -1143,8 +1145,8 @@ trace 容量不足时必须明确报 overflow 并判该轮观察无效，不能�
 CCEC 只保留一个正式逐 worker Submit 窗口，CPU/AscendC 对应 hook 是空实现，不伪造
 PMU 数据：`submit-all` 在本 worker 通过启动屏障、完成 `ResetTraceLap` 后，于
 orchestration 初始化前打开 gate，在该 worker 最后一次 Submit 返回后关闭。窗口包含
-参数构造、全部 Submit 调度，以及 standalone 用 scalar NOP 模拟的 QK/SF/PV/UP
-计算体。
+参数构造、全部 Submit 调度，以及本 worker 在窗口内执行的 winner 计算体：默认模式
+为 scalar NOP，CCEC `real-compute` 模式为真实 Cube/Vector 与对应搬运流水。
 
 它是“每核从 orchestration 到最后一次 Submit 返回”的累计窗口，不是全局最早
 `Submit.start` 到最晚 `Submit.end` 的墙钟窗口，也不是逐次 Submit 窗口。
@@ -1153,8 +1155,8 @@ orchestration 初始化前打开 gate，在该 worker 最后一次 Submit 返回
 直接一一对齐。
 
 `metrics_prof_start/stop()` 都含 `PIPE_ALL` 屏障，门控边界会收口流水并可能改变
-worker 到达与争用时序。这个开销属于观察配置本身；只能比较 gate、NOP、构建布局
-完全相同的样本，不能把 PMU 样本的 Submit span 当成无观察性能基线。
+worker 到达与争用时序。这个开销属于观察配置本身；只能比较 gate、负载模式和构建
+布局完全相同的样本，不能把 PMU 样本的 Submit span 当成无观察性能基线。
 
 PMU JSON sidecar 按 worker 保留 raw 记录，并分别汇总 32 AIC、64 AIV 和全部 96 核。
 各字段严格按下面口径解释：
@@ -1215,8 +1217,9 @@ PMU hook 和 CNT0..8 sidecar 已实现。2026-07-18 已用干净重编的 CCEC A
 二进制完成 b1 atomic-trace-only 上板：全部协议断言 PASS，raw 共 4959 条、
 `expected=4959`、`dropped=0`，其中 Atomic 1395 条、ClockBaseline 192 条。
 Claim raw schema v2 也已直接闭环为 `won=5/lost=283/not_attempted=192`，不再
-借助 Atomic 记录反推 role-filtered Claim。converter 的直接脚本与 `python -m unittest`
-两种入口均为 4/4 PASS。b1 的 Atomic 按边界闭环为
+借助 Atomic 记录反推 role-filtered Claim。当时 converter 原四项在直接脚本与
+`python -m unittest` 两种入口均为 4/4 PASS；增加 winner workload metadata
+回归后，当前完整集合为 5/5 PASS。b1 的 Atomic 按边界闭环为
 `return_ready=1193/source_issue=202`。本轮未入库产物为：
 
 ~~~text
@@ -1245,7 +1248,7 @@ outputs/scalar_observation_final_20260718/atomic_inlineasm_ccec_b256/merged_swim
 frontier helping 和 winner 分布会带来明显轮间波动；一次 5.209261 ms 插桩轮
 不能与三轮中任一轮做单样本减法后归因 trace 成本。
 
-仍未完成的正式重采如下：
+正式重采状态如下：
 
 | 结果 | 当前状态 |
 | ---- | -------- |
@@ -1254,6 +1257,7 @@ frontier helping 和 winner 分布会带来明显轮间波动；一次 5.209261 
 | 192 条 ClockBaseline 的 AIC/AIV 分布 | **b1/256 batch 已闭环** |
 | `submit-all` 的 owner/gate/CNT0..8/total 闭环 | **b1、零 NOP 单次上板已通过** |
 | 256 batch `submit-all` 的 I-cache 与 pipe 分组分布 | **3 个 PMU-only 独立进程已采并完成 raw→summary 重算** |
+| real-compute 引擎 PMU 与 placement | **b8 count1/count2 精确倍增并逐 worker 闭合** |
 
 此前开发过程中的探索性输出不在这里引用为正式结论。最终按同一源码依次执行：
 
@@ -1261,7 +1265,10 @@ frontier helping 和 winner 分布会带来明显轮间波动；一次 5.209261 
 2. CCEC atomic-trace-only，检查上述计数闭环、ClockBaseline 和 raw→merged；
 3. CCEC PMU-only 的 `submit-all` 已完成 3 个独立进程 A/A；后续每轮仍使用
    唯一 JSON 路径，并检查 96 核、owner bitmap/triplet、start/stop、25% 风险门槛和 Restore；
-4. 比较任何 atomic 优化前后时，双方使用相同观察模式、相同 gate/trace 配置和
+4. real-compute b8 count1/count2 已完成 Cube/Vector busy 精确倍增与
+   `EfDrain` placement 闭合；
+5. 比较任何 atomic 优化前后时，双方使用相同观察模式、相同 winner mode/count、
+   相同 gate/trace 配置和
    独立进程交错 A/B；正式端到端 Submit 仍以无诊断构建复测。
 
 #### 7.5.7 绝不能从 O2 声称的结论
@@ -1276,8 +1283,9 @@ frontier helping 和 winner 分布会带来明显轮间波动；一次 5.209261 
 - trace 开启后的 Submit span 可以直接与无 trace 基线比较并宣布性能收益；
 - `scalar_busy/total_cycles` 是墙钟时间，或 I-cache miss 数可以直接换算成精确
   stall ns；7.3.3 的 90 ns/miss 只是受控 cold/warm 探针得到的一阶等效估算；
-- standalone 的 scalar NOP 已经真实模拟了 vector/cube task 期间 scalar 的等待状态；
-  NOP 本身在 scalar 上执行并被 `submit-all` 统计，`PIPE_ALL` gate 还会收口流水；
+- standalone 的 `scalar-nop` 已经真实模拟了 vector/cube task 期间 scalar 的等待状态；
+  NOP 本身在 scalar 上执行并被 `submit-all` 统计。CCEC `real-compute` 虽已真实激活
+  Cube/Vector/MTE/FIX，也仍不能由此推导完整真实 PA 的 scalar 等待与资源竞争；
 - 最大 32-bit counter 低于 25% 风险门槛就证明本轮没有回卷；该门槛只降低风险，
   最终寄存器值不能直接检出恰好一圈或多圈的 wrap；
 - standalone 的 PMU/atomic 分布可以直接替代真实 FDWIC PA。迁移真实用例时仍需
@@ -1319,3 +1327,57 @@ I-cache 和 pipe 分组基线；它显示 AIV miss rate 在本三轮持续高于
 counter 仍不能把 miss 定位到 materialize/register 或某条 atomic。开始改 Claim 后，
 应使用同配置的 PMU-only 交错 A/B 观察 request/miss 是否同步变化，端到端收益
 仍由无诊断的独立进程 A/B 确认。
+
+#### 7.5.9 CCEC winner 负载从 scalar NOP 迁移到真实 Cube/Vector
+
+为避免 winner 执行期的 scalar NOP 污染 `scalar_busy`，2026-07-18 先在
+standalone CCEC 增加显式 `--winner-workload real-compute`，没有迁移真实 PA。
+整体无参数默认仍为 `scalar-nop`，保证旧三后端基线不静默变化；选择真计算而未
+指定次数时，QK/SF/PV/UP 使用 `6,28,4,1`。
+
+实现与门禁如下：
+
+1. QK/PV 只在 AIC 执行完整 `128x128 float` Cube matmul，包含
+   MTE2/MTE1、M、FIX、GM store 和最终完成等待；
+2. SF/UP 只在 AIV 执行完整 Vector add/mul，包含 MTE2、V、MTE3、GM store
+   和最终完成等待；每次 repeat 完成写回后才复用 tile；
+3. 两个 GM 输入 tile 为所有 worker 只读共享，每 worker、每角色使用独占输出
+   tile。host 在计时外初始化/传输，计时后逐 tile 验证 768/5/6 与 inactive
+   sentinel，共 12,713,984 bytes；
+4. 最终 device ELF 严格限制为两个 mixed kernel GLOBAL 入口；冷路径 dispatcher
+   与 Cube/add/mul 三个执行 helper 必须是非空 LOCAL 函数。这个门禁来自一次已
+   复现故障：错误暴露的 GLOBAL helper
+   被 runtime 当入口启动，导致 scalar 模式也进入 Cube 路径；修正后同一 ELF 的
+   scalar b1 与 real b1 均通过；
+5. repeats 上限为 128，避免 b256 极端 winner 分布让 32-bit PMU 计数接近回卷
+   区域。真计算 count 与 NOP count 互斥，0 次被拒绝。
+
+标定不是以凑齐 5.1 ms 为目标。三个独立 b256 进程的 QK/SF/PV 中位数约为
+41.336/54.039/27.971 us，最接近真实泳道目标 44.170/53.729/27.626 us；
+UP 一次完整流水约 2.5 us，已经是当前正整数下限。三轮 Submit 为
+3.808/3.555/3.706 ms，中位数 3.706 ms；最终重建后的单轮为 3.683649 ms。
+Cube/Vector 分布在物理子核并行执行，与 scalar NOP 串行占用 scalar 的到达时序
+本来不同，不能通过增加无关 repeat 把总时间硬拉回 5.1 ms。
+
+最终常量 tile 只证明某个 active worker-kind 至少完成一次，因为同一 tile 会被
+后续 repeat 覆盖；全部 repeat 的证据来自下面的受控 PMU 倍增，而不是数值结果本身。
+
+`submit-all` PMU 做了独立倍增取证。b8、四类 count=1 时，窗口内 placement 为
+29 个 EfDrain 和 3 个 FinalDrain；恰有 14 个 AIC worker 的 Cube 非零且逐核
+`cube_busy=8281`，15 个 AIV worker 的 Vector 非零且逐核
+`vector_busy=936/937`，与 29 个 EfDrain 精确闭合。独立 count=2 样本为
+28 个 EfDrain、4 个 FinalDrain，14 个 AIC 与 14 个 AIV 非零计数档位分别为
+16562 和 1872/1874，精确两倍。获胜 worker 会随调度变化，不能把两轮按同一核
+强配对。FinalDrain 位于每核 PMU stop 之后，故 count1/count2 的 3/4 个
+FinalDrain kernel 不应出现在 Submit sidecar；这不是漏计。
+
+泳道 raw/merged 的 `trace_schema_version` 仍为 2；本轮只扩展可选 metadata，
+没有把它误升为 PMU JSON 的 schema v3。metadata 同时保存 mode、四类 count、迭代单位与
+QK/PV=Cube、SF/UP=Vector 映射，并增加可见的全局 capture metadata 事件。
+最终 b1 real-compute 泳道有 4964 条 raw data event；converter 产出 4965 条
+data event（增加一条 capture instant），再加 256 条 process/thread metadata，
+最终 `traceEvents` 为 5221 条，`dropped=0`。转换器含旧 schema 兼容在内为 5/5 PASS。
+
+阶段边界：本节只证明 CCEC standalone 的真实引擎负载、数值、角色、PMU 与
+泳道闭环。AscendC 真实计算、CPU 等价算术必须继续按后端分步实现和验证；在它们
+完成前，不能宣称三后端 winner 负载已经对等，更不能直接迁移真实 PA。

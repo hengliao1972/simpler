@@ -12,6 +12,7 @@
 #include "../common/host_support.h"
 #include "pmu_owner_host.h"
 #include "pmu_probe.h"
+#include "winner_workload.h"
 
 #include "acl/acl.h"
 #include "driver/ascend_hal.h"
@@ -45,6 +46,31 @@ bool CheckRt(rtError_t error, const char *label) {
     return false;
 }
 
+class ScopedAclDeviceAllocation {
+public:
+    ScopedAclDeviceAllocation() = default;
+    ScopedAclDeviceAllocation(const ScopedAclDeviceAllocation &) = delete;
+    ScopedAclDeviceAllocation &operator=(const ScopedAclDeviceAllocation &) = delete;
+
+    ~ScopedAclDeviceAllocation() {
+        // 早退路径没有机会汇入末尾 cleanup；这里只负责尽力释放本类新增的
+        // real-compute workspace。正常路径会先 Release，再检查 aclrtFree 返回值。
+        if (pointer_ != nullptr) (void)aclrtFree(pointer_);
+    }
+
+    void **Address() { return &pointer_; }
+    void *Get() const { return pointer_; }
+
+    void *Release() {
+        void *pointer = pointer_;
+        pointer_ = nullptr;
+        return pointer;
+    }
+
+private:
+    void *pointer_ = nullptr;
+};
+
 std::vector<char> ReadBinary(const std::string &path) {
     // ELF 整体保存在 vector 中直到 runtime 卸载完成，保证 rtDevBinary_t.data 在整个注册生命周期内有效。
     std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -63,6 +89,140 @@ struct PmuOptions {
     uint32_t icache_trials = 64;
     std::string json_path;
 };
+
+struct WinnerWorkloadOptions {
+    pa_scheduler::WinnerWorkloadMode mode = pa_scheduler::WinnerWorkloadMode::ScalarNop;
+    pa_scheduler::WorkloadCounts repeats = pa_scheduler::ccec_workload::kDefaultRealComputeCounts;
+    bool counts_explicit = false;
+    bool nop_override_explicit = false;
+};
+
+const char *WinnerWorkloadModeName(pa_scheduler::WinnerWorkloadMode mode) {
+    switch (mode) {
+    case pa_scheduler::WinnerWorkloadMode::ScalarNop:
+        return "scalar-nop";
+    case pa_scheduler::WinnerWorkloadMode::RealCompute:
+        return "real-compute";
+    }
+    return "invalid";
+}
+
+bool ParseWorkloadCounts(const char *raw, pa_scheduler::WorkloadCounts *counts) {
+    unsigned int qk = 0;
+    unsigned int sf = 0;
+    unsigned int pv = 0;
+    unsigned int up = 0;
+    char tail = '\0';
+    if (std::sscanf(raw, "%u,%u,%u,%u%c", &qk, &sf, &pv, &up, &tail) != 4) return false;
+    const uint32_t maximum = pa_scheduler::ccec_workload::kMaxRealComputeCount;
+    if (qk == 0 || sf == 0 || pv == 0 || up == 0 ||
+        qk > maximum || sf > maximum || pv > maximum || up > maximum) {
+        return false;
+    }
+    *counts = pa_scheduler::WorkloadCounts{qk, sf, pv, up};
+    return true;
+}
+
+bool ParseWinnerWorkloadOptions(
+    int argc, char **argv, WinnerWorkloadOptions *workload, std::vector<char *> *remaining_argv
+) {
+    bool mode_seen = false;
+    bool count_seen = false;
+    remaining_argv->clear();
+    remaining_argv->push_back(argv[0]);
+    for (int index = 1; index < argc; ++index) {
+        const std::string argument = argv[index];
+        if (argument == "--nop-count" || argument == "--nop-counts") {
+            workload->nop_override_explicit = true;
+        }
+        if (argument != "--winner-workload" && argument != "--real-compute-count" &&
+            argument != "--real-compute-counts") {
+            remaining_argv->push_back(argv[index]);
+            continue;
+        }
+        if (index + 1 >= argc) {
+            std::fprintf(stderr, "Missing value after %s\n", argument.c_str());
+            return false;
+        }
+        const char *value = argv[++index];
+        if (argument == "--winner-workload") {
+            if (mode_seen) {
+                std::fprintf(stderr, "Specify --winner-workload only once.\n");
+                return false;
+            }
+            const std::string name = value;
+            if (name == "scalar-nop") {
+                workload->mode = pa_scheduler::WinnerWorkloadMode::ScalarNop;
+            } else if (name == "real-compute") {
+                workload->mode = pa_scheduler::WinnerWorkloadMode::RealCompute;
+            } else {
+                std::fprintf(
+                    stderr,
+                    "Invalid --winner-workload value: %s (expected scalar-nop|real-compute)\n",
+                    value
+                );
+                return false;
+            }
+            mode_seen = true;
+            continue;
+        }
+        if (count_seen) {
+            std::fprintf(stderr, "Specify only one real-compute count override.\n");
+            return false;
+        }
+        if (argument == "--real-compute-count") {
+            uint32_t count = 0;
+            if (!pa_scheduler::host::ParseUint(
+                    value, 1, pa_scheduler::ccec_workload::kMaxRealComputeCount, &count
+                )) {
+                std::fprintf(stderr, "Invalid --real-compute-count value: %s\n", value);
+                return false;
+            }
+            workload->repeats = pa_scheduler::WorkloadCounts{count, count, count, count};
+        } else if (!ParseWorkloadCounts(value, &workload->repeats)) {
+            std::fprintf(stderr, "Invalid --real-compute-counts value: %s\n", value);
+            return false;
+        }
+        count_seen = true;
+        workload->counts_explicit = true;
+    }
+    return true;
+}
+
+bool ValidateWinnerWorkloadOptions(const WinnerWorkloadOptions &workload) {
+    if (workload.mode == pa_scheduler::WinnerWorkloadMode::RealCompute) {
+        if (workload.nop_override_explicit) {
+            std::fprintf(
+                stderr,
+                "--winner-workload real-compute cannot be combined with --nop-count or --nop-counts.\n"
+            );
+            return false;
+        }
+        return true;
+    }
+    if (workload.counts_explicit) {
+        std::fprintf(
+            stderr,
+            "--real-compute-count(s) requires --winner-workload real-compute.\n"
+        );
+        return false;
+    }
+    return true;
+}
+
+void ConfigureWinnerWorkload(
+    pa_scheduler::SchedulerState *state, const WinnerWorkloadOptions &workload,
+    const void *workspace_device
+) {
+    state->winner_workload.mode = static_cast<uint32_t>(workload.mode);
+    state->winner_workload.version = pa_scheduler::kWinnerWorkloadConfigVersion;
+    state->winner_workload.repeats = workload.repeats;
+    state->winner_workload.workspace_base = reinterpret_cast<uint64_t>(workspace_device);
+    state->winner_workload.workspace_bytes =
+        workload.mode == pa_scheduler::WinnerWorkloadMode::RealCompute
+        ? pa_scheduler::ccec_workload::kWorkspaceBytes
+        : 0;
+}
 
 const char *PmuModeName(pa_scheduler::ccec_pmu::WindowMode mode) {
     switch (mode) {
@@ -241,6 +401,80 @@ void ConfigurePmu(pa_scheduler::SchedulerState *state, const PmuOptions &pmu, co
     state->config.reserved[kConfigMagic] = pmu.mode == WindowMode::Off ? 0 : kConfigMagicValue;
 }
 
+const char *TaskKindName(pa_scheduler::TaskKind kind) {
+    switch (kind) {
+    case pa_scheduler::TaskKind::Qk:
+        return "QK";
+    case pa_scheduler::TaskKind::Sf:
+        return "SF";
+    case pa_scheduler::TaskKind::Pv:
+        return "PV";
+    case pa_scheduler::TaskKind::Up:
+        return "UP";
+    default:
+        return "invalid";
+    }
+}
+
+bool ValidateRealComputeOutputs(
+    const pa_scheduler::SchedulerState &state, const std::vector<float> &outputs, uint32_t run
+) {
+    using namespace pa_scheduler::ccec_workload;
+    const size_t expected_elements = static_cast<size_t>(kOutputTiles) * kTileElements;
+    if (outputs.size() != expected_elements) {
+        std::fprintf(
+            stderr, "[ASSERT] real-compute output buffer size matches workspace layout FAIL\n"
+        );
+        return false;
+    }
+
+    uint32_t active_tiles = 0;
+    uint32_t inactive_tiles = 0;
+    for (uint32_t worker = 0; worker < pa_scheduler::kWorkers; ++worker) {
+        const pa_scheduler::WorkerResult &result = state.results[worker];
+        const bool aic = result.role == static_cast<uint32_t>(pa_scheduler::CoreRole::Aic);
+        const pa_scheduler::TaskKind kinds[2] = {
+            aic ? pa_scheduler::TaskKind::Qk : pa_scheduler::TaskKind::Sf,
+            aic ? pa_scheduler::TaskKind::Pv : pa_scheduler::TaskKind::Up,
+        };
+        for (uint32_t kind_slot = 0; kind_slot < 2; ++kind_slot) {
+            const pa_scheduler::TaskKind kind = kinds[kind_slot];
+            const uint32_t kernel_index = static_cast<uint32_t>(kind) - 1;
+            const bool active = result.kernel_counts[kernel_index] != 0;
+            const float expected = active
+                ? (aic ? kExpectedAicValue
+                       : (kind == pa_scheduler::TaskKind::Sf ? kExpectedSfValue : kExpectedUpValue))
+                : kOutputSentinel;
+            const size_t tile_index =
+                static_cast<size_t>(worker) * kOutputTilesPerWorker + kind_slot;
+            const size_t begin = tile_index * kTileElements;
+            for (size_t element = 0; element < kTileElements; ++element) {
+                if (outputs[begin + element] == expected) continue;
+                std::fprintf(
+                    stderr,
+                    "[REAL-COMPUTE-FAIL] run=%u worker=%u kind=%s element=%zu expected=%.1f actual=%.9g\n",
+                    run, worker, TaskKindName(kind), element, expected,
+                    static_cast<double>(outputs[begin + element])
+                );
+                std::fprintf(
+                    stderr, "[ASSERT] real-compute output tiles match role-specific PTO results FAIL\n"
+                );
+                return false;
+            }
+            active_tiles += active ? 1U : 0U;
+            inactive_tiles += active ? 0U : 1U;
+        }
+    }
+    const bool passed = active_tiles != 0 &&
+        active_tiles + inactive_tiles == pa_scheduler::ccec_workload::kOutputTiles;
+    std::printf(
+        "[ASSERT] %-48s %s (active_tiles=%u inactive_sentinel_tiles=%u)\n",
+        "real-compute output tiles match role-specific PTO results",
+        passed ? "PASS" : "FAIL", active_tiles, inactive_tiles
+    );
+    return passed;
+}
+
 struct PmuAggregate {
     std::vector<uint64_t> total_cycles;
     std::vector<uint64_t> window_ticks;
@@ -378,9 +612,12 @@ struct PmuValidation {
     uint32_t icache_pairs = 0;
     uint32_t icache_calibrated_cores = 0;
     uint32_t prior_snapshot_larger = 0;
+    uint32_t submit_engine_workers_expected = 0;
+    uint32_t submit_engine_workers_matched = 0;
     uint32_t maximum_programmable_counter = 0;
     bool icache_order_valid = true;
     bool icache_measurement_valid = true;
+    bool submit_engine_observation_valid = true;
     bool counter_below_risk_threshold = true;
     bool passed = true;
 };
@@ -391,6 +628,7 @@ constexpr uint32_t kProgrammableCounterRiskThreshold = UINT32_MAX / 4U;
 
 bool ValidatePmu(
     const pa_scheduler::SchedulerState &state, uint32_t run, const PmuOptions &pmu,
+    const WinnerWorkloadOptions &workload,
     const pa_scheduler::pmu_owner::PmuOwnerControl *owner, PmuValidation *validation
 ) {
     using namespace pa_scheduler::ccec_pmu;
@@ -410,6 +648,8 @@ bool ValidatePmu(
     uint32_t icache_pairs = 0;
     uint32_t icache_calibrated_cores = 0;
     uint32_t prior_larger = 0;
+    uint32_t submit_engine_workers_expected = 0;
+    uint32_t submit_engine_workers_matched = 0;
     uint32_t maximum_programmable_counter = 0;
     bool icache_order_valid = true;
     uint32_t bad_printed = 0;
@@ -431,6 +671,17 @@ bool ValidatePmu(
         window_stopped += (status & kStatusWindowStopped) != 0U;
         icache_pairs += (status & kStatusIcachePairObserved) != 0U;
         prior_larger += (status & kStatusPriorSnapshotLarger) != 0;
+        if (pmu.mode == WindowMode::SubmitAll &&
+            workload.mode == pa_scheduler::WinnerWorkloadMode::RealCompute) {
+            const uint64_t submit_engine_tasks =
+                result.placement[static_cast<uint32_t>(pa_scheduler::DrainPlace::EfDrain)] +
+                result.placement[static_cast<uint32_t>(pa_scheduler::DrainPlace::RingBackpressure)];
+            const uint32_t relevant_busy = logical_aic ? result.pmu_cube_busy : result.pmu_vector_busy;
+            const bool engine_observation_matches =
+                (submit_engine_tasks == 0U) == (relevant_busy == 0U);
+            submit_engine_workers_expected += submit_engine_tasks != 0U;
+            submit_engine_workers_matched += engine_observation_matches;
+        }
         icache_order_valid &= result.pmu_icache_misses <= result.pmu_icache_requests &&
             result.pmu_warm_icache_misses <= result.pmu_warm_icache_requests;
         if (pmu.mode == WindowMode::IcacheSingle) {
@@ -512,6 +763,10 @@ bool ValidatePmu(
     const bool mixed_triplets_ok = mixed_triplet_matches == pa_scheduler::kAicWorkers;
     const bool windows_started_ok = window_started == pa_scheduler::kWorkers;
     const bool windows_stopped_ok = window_stopped == pa_scheduler::kWorkers;
+    const bool submit_engine_observation_ok =
+        pmu.mode != WindowMode::SubmitAll ||
+        workload.mode != pa_scheduler::WinnerWorkloadMode::RealCompute ||
+        submit_engine_workers_matched == pa_scheduler::kWorkers;
     const bool counter_below_risk_threshold =
         maximum_programmable_counter < kProgrammableCounterRiskThreshold;
     std::printf(
@@ -544,6 +799,15 @@ bool ValidatePmu(
                 icache_order_valid ? "PASS" : "FAIL");
     std::printf("[ASSERT] %-48s %s\n", "programmable counters stay below 25% risk threshold",
                 counter_below_risk_threshold ? "PASS" : "FAIL");
+    if (pmu.mode == WindowMode::SubmitAll &&
+        workload.mode == pa_scheduler::WinnerWorkloadMode::RealCompute) {
+        std::printf(
+            "[ASSERT] %-48s %s (active_workers=%u matched_workers=%u/%u)\n",
+            "Submit placement has matching AIC/AIV engine PMU",
+            submit_engine_observation_ok ? "PASS" : "FAIL", submit_engine_workers_expected,
+            submit_engine_workers_matched, pa_scheduler::kWorkers
+        );
+    }
     if (pmu.mode == WindowMode::IcacheSingle) {
         std::printf("[ASSERT] %-48s %s\n", "each cold trial adds exactly one CNT7 I-cache miss",
                     icache_measurement_ok ? "PASS" : "FAIL");
@@ -559,13 +823,17 @@ bool ValidatePmu(
     validation->icache_pairs = icache_pairs;
     validation->icache_calibrated_cores = icache_calibrated_cores;
     validation->prior_snapshot_larger = prior_larger;
+    validation->submit_engine_workers_expected = submit_engine_workers_expected;
+    validation->submit_engine_workers_matched = submit_engine_workers_matched;
     validation->maximum_programmable_counter = maximum_programmable_counter;
     validation->icache_order_valid = icache_order_valid;
     validation->icache_measurement_valid = icache_measurement_ok;
+    validation->submit_engine_observation_valid = submit_engine_observation_ok;
     validation->counter_below_risk_threshold = counter_below_risk_threshold;
     validation->passed = records_ok && core_ids_ok && owner_members_ok && worker_slots_ok &&
         physical_roles_ok && mixed_triplets_ok && windows_started_ok && windows_stopped_ok &&
-        icache_order_valid && icache_measurement_ok && counter_below_risk_threshold;
+        icache_order_valid && icache_measurement_ok && submit_engine_observation_ok &&
+        counter_below_risk_threshold;
     return validation->passed;
 }
 
@@ -727,8 +995,9 @@ uint32_t CountConfiguredMixedTriplets(const pa_scheduler::pmu_owner::PmuOwnerCon
 
 bool ExportPmuJson(
     const pa_scheduler::SchedulerState &state, const pa_scheduler::host::Options &options,
-    const PmuOptions &pmu, uint32_t run, double host_us, double submit_span_us,
-    const PmuValidation &validation, bool semantic_passed,
+    const PmuOptions &pmu, const WinnerWorkloadOptions &workload,
+    uint32_t run, double host_us, double submit_span_us,
+    const PmuValidation &validation, bool semantic_passed, bool workload_output_passed,
     const pa_scheduler::pmu_owner::PmuOwnerControl &owner, bool restore_passed,
     const std::string &output_path
 ) {
@@ -736,10 +1005,25 @@ bool ExportPmuJson(
     PmuAggregate all;
     PmuAggregate aic;
     PmuAggregate aiv;
+    uint32_t active_output_tiles = 0;
+    uint64_t ef_drain_kernels = 0;
+    uint64_t ring_backpressure_kernels = 0;
+    uint64_t final_drain_kernels = 0;
     for (uint32_t worker = 0; worker < pa_scheduler::kWorkers; ++worker) {
         const pa_scheduler::WorkerResult &result = state.results[worker];
         AddPmuSample(result, &all);
         AddPmuSample(result, result.role == static_cast<uint32_t>(pa_scheduler::CoreRole::Aic) ? &aic : &aiv);
+        if (result.role == static_cast<uint32_t>(pa_scheduler::CoreRole::Aic)) {
+            active_output_tiles += result.kernel_counts[0] != 0;
+            active_output_tiles += result.kernel_counts[2] != 0;
+        } else if (result.role == static_cast<uint32_t>(pa_scheduler::CoreRole::Aiv)) {
+            active_output_tiles += result.kernel_counts[1] != 0;
+            active_output_tiles += result.kernel_counts[3] != 0;
+        }
+        ef_drain_kernels += result.placement[static_cast<uint32_t>(pa_scheduler::DrainPlace::EfDrain)];
+        ring_backpressure_kernels +=
+            result.placement[static_cast<uint32_t>(pa_scheduler::DrainPlace::RingBackpressure)];
+        final_drain_kernels += result.placement[static_cast<uint32_t>(pa_scheduler::DrainPlace::FinalDrain)];
     }
 
     const auto generated = std::chrono::system_clock::now().time_since_epoch();
@@ -769,11 +1053,18 @@ bool ExportPmuJson(
 
     const bool submit_window = IsSubmitWindow(pmu.mode);
     const bool icache_single = pmu.mode == WindowMode::IcacheSingle;
-    const bool simulated_task_nops_nonzero =
-        options.nops.qk != 0U || options.nops.sf != 0U || options.nops.pv != 0U || options.nops.up != 0U;
+    const bool real_compute = workload.mode == pa_scheduler::WinnerWorkloadMode::RealCompute;
+    const bool simulated_task_nops_nonzero = !real_compute &&
+        (options.nops.qk != 0U || options.nops.sf != 0U ||
+         options.nops.pv != 0U || options.nops.up != 0U);
+    const pa_scheduler::WorkloadCounts active_counts = real_compute
+        ? workload.repeats
+        : pa_scheduler::WorkloadCounts{
+              options.nops.qk, options.nops.sf, options.nops.pv, options.nops.up
+          };
     const uint32_t owner_bitmap_count = pa_scheduler::pmu_owner::CountConfigured(owner);
     const uint32_t owner_complete_triplets = CountConfiguredMixedTriplets(owner);
-    std::fputs("{\n\"schema\":{\"name\":\"pa_scheduler_pmu_phase_windows\",\"version\":2},\n", output);
+    std::fputs("{\n\"schema\":{\"name\":\"pa_scheduler_pmu_phase_windows\",\"version\":3},\n", output);
     std::fputs("\"capture\":{\"capture_id\":", output);
     WriteJsonString(output, capture_id);
     std::fprintf(
@@ -783,13 +1074,15 @@ bool ExportPmuJson(
         "\"usable_as_absolute_real_pa_profile\":false,\"window_scope\":\"%s\","
         "\"pmu_probe_position\":\"%s\",\"scheduler_hot_path_included\":%s,"
         "\"total_sum_is_core_work_not_wall_time\":true,"
+        "\"submit_window_excludes_final_drain\":%s,"
         "\"published_after_runtime_cleanup\":true,\"runtime_cleanup_passed\":true,"
         "\"owner_restore_passed\":%s},\n",
         static_cast<unsigned long long>(generated_ns), run,
         submit_window ? "true" : "false",
         submit_window ? "per_worker_orchestration_to_last_submit_return" : "post_scheduler_calibration_probe",
         submit_window ? "inside_RunScheduler" : "after_RunScheduler",
-        submit_window ? "true" : "false", restore_passed ? "true" : "false"
+        submit_window ? "true" : "false", submit_window ? "true" : "false",
+        restore_passed ? "true" : "false"
     );
     std::fputs("\"configuration\":{\"kernel_path\":", output);
     WriteJsonString(output, options.kernel_path);
@@ -797,14 +1090,56 @@ bool ExportPmuJson(
         output,
         ",\"device\":%u,\"batches\":%u,\"workers\":%u,\"aic_workers\":%u,\"aiv_workers\":%u,"
         "\"trace_enabled\":%s,\"trace_atomics\":%s,\"profile_phases\":%s,"
-        "\"nop_counts\":{\"qk\":%u,\"sf\":%u,"
-        "\"pv\":%u,\"up\":%u},\"pmu_window\":",
+        "\"winner_workload\":{\"mode\":",
         options.device, options.batches, pa_scheduler::kWorkers, pa_scheduler::kAicWorkers,
         pa_scheduler::kAivWorkers, options.trace_enabled ? "true" : "false",
         options.trace_atomics ? "true" : "false",
-        options.profile_phases ? "true" : "false", options.nops.qk, options.nops.sf, options.nops.pv,
-        options.nops.up
+        options.profile_phases ? "true" : "false"
     );
+    WriteJsonString(output, WinnerWorkloadModeName(workload.mode));
+    std::fprintf(
+        output,
+        ",\"config_version\":%u,\"counts\":{\"qk\":%u,\"sf\":%u,\"pv\":%u,\"up\":%u},"
+        "\"unit\":",
+        pa_scheduler::kWinnerWorkloadConfigVersion, active_counts.qk, active_counts.sf,
+        active_counts.pv, active_counts.up
+    );
+    WriteJsonString(
+        output,
+        real_compute ? "complete_128x128_engine_pipeline_iteration" : "scalar_nop_instruction"
+    );
+    std::fprintf(
+        output,
+        ",\"tile_rows\":%u,\"tile_cols\":%u,\"shared_input_tiles\":%u,"
+        "\"output_tiles_per_worker\":%u,\"workspace_bytes\":%zu,\"role_mapping\":",
+        real_compute ? pa_scheduler::ccec_workload::kTileRows : 0,
+        real_compute ? pa_scheduler::ccec_workload::kTileCols : 0,
+        real_compute ? pa_scheduler::ccec_workload::kSharedInputTiles : 0,
+        real_compute ? pa_scheduler::ccec_workload::kOutputTilesPerWorker : 0,
+        real_compute ? pa_scheduler::ccec_workload::kWorkspaceBytes : 0
+    );
+    if (real_compute) {
+        std::fputs(
+            "{\"qk\":\"cube_matmul\",\"pv\":\"cube_matmul\","
+            "\"sf\":\"vector_add\",\"up\":\"vector_mul\"}",
+            output
+        );
+    } else {
+        std::fputs("null", output);
+    }
+    std::fprintf(
+        output, ",\"engine_completion_waited_before_task_publish\":%s},\"nop_counts\":",
+        real_compute ? "true" : "false"
+    );
+    if (real_compute) {
+        std::fputs("null", output);
+    } else {
+        std::fprintf(
+            output, "{\"qk\":%u,\"sf\":%u,\"pv\":%u,\"up\":%u}",
+            options.nops.qk, options.nops.sf, options.nops.pv, options.nops.up
+        );
+    }
+    std::fputs(",\"pmu_window\":", output);
     WriteJsonString(output, PmuModeName(pmu.mode));
     std::fputs(",\"calibration_scalar_nops_per_segment\":", output);
     if (submit_window || icache_single) {
@@ -833,18 +1168,29 @@ bool ExportPmuJson(
         "\"gate_start_stop_have_pipe_all_barriers\":true,"
         "\"phase_timestamp_calls_present\":true,\"phase_record_writes\":false,"
         "\"atomic_trace\":false,\"profile_accumulation\":false,"
-        "\"simulated_task_nop_mechanism_executes_on_scalar\":true,"
+        "\"simulated_task_nop_mechanism_executes_on_scalar\":%s,"
         "\"simulated_task_nops_nonzero\":%s,"
         "\"icache_miss_rate_definition\":\"sum(icache_misses)/sum(icache_requests)\"},\n",
         icache_single ? 2U : 0U, icache_single ? "1" : "null",
         host_us, submit_span_us, kVectorBusyEvent, kCubeBusyEvent, kScalarBusyEvent,
         kMte1BusyEvent, kMte2BusyEvent, kMte3BusyEvent, kIcacheRequestEvent, kIcacheMissEvent,
         kFixBusyEvent, kProgrammableCounterRiskThreshold,
+        real_compute ? "false" : "true",
         simulated_task_nops_nonzero ? "true" : "false"
     );
     std::fprintf(
         output,
-        "\"validation\":{\"semantic_passed\":%s,\"pmu_passed\":%s,\"trusted_records\":%u,"
+        "\"validation\":{\"semantic_passed\":%s,\"pmu_passed\":%s,"
+        "\"real_compute_output_validation_required\":%s,"
+        "\"real_compute_output_validation_passed\":%s,"
+        "\"real_compute_active_output_tiles\":%u,"
+        "\"real_compute_inactive_sentinel_tiles\":%u,"
+        "\"real_compute_output_mismatches\":%u,"
+        "\"submit_engine_observation_valid\":%s,"
+        "\"submit_engine_workers_expected\":%u,"
+        "\"submit_engine_workers_matched\":%u,"
+        "\"kernel_placement_counts\":{\"ef_drain\":%llu,\"ring_backpressure\":%llu,"
+        "\"final_drain\":%llu},\"trusted_records\":%u,"
         "\"expected_records\":%u,\"unique_physical_core_ids\":%u,\"expected_unique_core_ids\":%u,"
         "\"owner_bitmap_member_records\":%u,\"expected_owner_bitmap_member_records\":%u,"
         "\"exact_worker_slot_records\":%u,\"expected_exact_worker_slot_records\":%u,"
@@ -857,7 +1203,19 @@ bool ExportPmuJson(
         "\"icache_miss_le_request\":%s,\"counter_below_risk_threshold\":%s,"
         "\"maximum_programmable_counter\":%u,\"programmable_counter_risk_threshold\":%u,"
         "\"programmable_counter_headroom\":%u},\n",
-        semantic_passed ? "true" : "false", validation.passed ? "true" : "false", validation.trusted,
+        semantic_passed ? "true" : "false", validation.passed ? "true" : "false",
+        real_compute ? "true" : "false",
+        real_compute ? (workload_output_passed ? "true" : "false") : "null",
+        real_compute ? active_output_tiles : 0,
+        real_compute ? pa_scheduler::ccec_workload::kOutputTiles - active_output_tiles : 0,
+        real_compute && !workload_output_passed ? 1U : 0U,
+        validation.submit_engine_observation_valid ? "true" : "false",
+        validation.submit_engine_workers_expected,
+        validation.submit_engine_workers_matched,
+        static_cast<unsigned long long>(ef_drain_kernels),
+        static_cast<unsigned long long>(ring_backpressure_kernels),
+        static_cast<unsigned long long>(final_drain_kernels),
+        validation.trusted,
         pa_scheduler::kWorkers, validation.unique_physical_core_ids, pa_scheduler::kWorkers,
         validation.owner_bitmap_members, pa_scheduler::kWorkers,
         validation.exact_worker_slots, pa_scheduler::kWorkers,
@@ -1014,8 +1372,15 @@ int main(int argc, char **argv) {
     // 参数和 ELF 在创建 ACL 资源前完成校验，早期错误不会留下 device、stream 或 kernel handle。
     pa_scheduler::host::Options options;
     PmuOptions pmu_options;
+    WinnerWorkloadOptions workload_options;
+    std::vector<char *> pmu_argv;
     std::vector<char *> common_argv;
-    if (!ParsePmuOptions(argc, argv, &pmu_options, &common_argv)) return EXIT_FAILURE;
+    if (!ParseWinnerWorkloadOptions(argc, argv, &workload_options, &pmu_argv) ||
+        !ParsePmuOptions(
+            static_cast<int>(pmu_argv.size()), pmu_argv.data(), &pmu_options, &common_argv
+        )) {
+        return EXIT_FAILURE;
+    }
     const pa_scheduler::host::ParseStatus parse_status = pa_scheduler::host::ParseOptions(
         static_cast<int>(common_argv.size()), common_argv.data(), true, &options
     );
@@ -1027,9 +1392,15 @@ int main(int argc, char **argv) {
                 "off|empty|scalar|scalar-double|icache-single|submit-all] "
                 "[--pmu-scalar-nops N] [--pmu-icache-trials N] [--pmu-json FILE]\n"
             );
+            std::fprintf(
+                stderr,
+                "CCEC winner workload options: [--winner-workload scalar-nop|real-compute] "
+                "[--real-compute-count N | --real-compute-counts QK,SF,PV,UP]\n"
+            );
         }
         return parse_status == pa_scheduler::host::ParseStatus::Help ? EXIT_SUCCESS : EXIT_FAILURE;
     }
+    if (!ValidateWinnerWorkloadOptions(workload_options)) return EXIT_FAILURE;
     if (!pmu_options.json_path.empty() &&
         pmu_options.mode == pa_scheduler::ccec_pmu::WindowMode::Off) {
         std::fprintf(stderr, "--pmu-json requires a non-off --pmu-window.\n");
@@ -1064,7 +1435,33 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "Cannot read kernel binary: %s\n", options.kernel_path.c_str());
         return EXIT_FAILURE;
     }
+    const bool real_compute =
+        workload_options.mode == pa_scheduler::WinnerWorkloadMode::RealCompute;
+    std::vector<float> workload_image;
+    std::vector<float> workload_outputs;
+    if (real_compute) {
+        using namespace pa_scheduler::ccec_workload;
+        workload_image.assign(kWorkspaceTiles * kTileElements, kOutputSentinel);
+        std::fill_n(workload_image.begin(), kTileElements, kInputAValue);
+        std::fill_n(workload_image.begin() + kTileElements, kTileElements, kInputBValue);
+        workload_outputs.resize(static_cast<size_t>(kOutputTiles) * kTileElements);
+    }
     pa_scheduler::host::PrintBanner("CCEC", options);
+    if (real_compute) {
+        std::printf(
+            "[WINNER-WORKLOAD] mode=real-compute counts=%u,%u,%u,%u "
+            "unit=complete_128x128_engine_pipeline_iteration workspace_bytes=%zu\n",
+            workload_options.repeats.qk, workload_options.repeats.sf,
+            workload_options.repeats.pv, workload_options.repeats.up,
+            pa_scheduler::ccec_workload::kWorkspaceBytes
+        );
+    } else {
+        std::printf(
+            "[WINNER-WORKLOAD] mode=scalar-nop counts=%u,%u,%u,%u "
+            "unit=scalar_nop_instruction workspace_bytes=0\n",
+            options.nops.qk, options.nops.sf, options.nops.pv, options.nops.up
+        );
+    }
     std::printf(
         "[PMU-CONFIG] window=%s calibration_scalar_nops=%u icache_trials=%u source=direct-per-core "
         "owner=main-aicpu-path-a\n",
@@ -1105,6 +1502,41 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
+    // 真实 PTO 负载使用独立 GM，不解引用调度器中只用于依赖建模的 synthetic tensor 地址。
+    // 这里先于 PMU owner 分配；每轮 H2D 初始化虽在 owner 配置之后，但仍位于
+    // launch/wall 计时之前，因此两者都不进入 Submit 性能窗口。
+    ScopedAclDeviceAllocation workload_allocation;
+    if (real_compute &&
+        !CheckAcl(
+            aclrtMalloc(
+                workload_allocation.Address(), pa_scheduler::ccec_workload::kWorkspaceBytes,
+                ACL_MEM_MALLOC_HUGE_FIRST
+            ),
+            "aclrtMalloc(real-compute workspace)"
+        )) {
+        return EXIT_FAILURE;
+    }
+    void *workload_device = workload_allocation.Get();
+    if (real_compute && (reinterpret_cast<uintptr_t>(workload_device) & 63U) != 0) {
+        std::fprintf(stderr, "Real-compute workspace is not 64-byte aligned: %p\n", workload_device);
+        return EXIT_FAILURE;
+    }
+
+    // 泳道区按 96 worker 各 65536 条记录预留，约 384 MiB；关闭泳道时不申请，也不会传递有效 base。
+    // 该分配先于 PMU owner 配置，失败时不会留下需要恢复的 selector/MMIO 会话。
+    void *trace_device = nullptr;
+    if (options.trace_enabled &&
+        !CheckAcl(
+            aclrtMalloc(&trace_device, pa_scheduler::kTraceBytes, ACL_MEM_MALLOC_HUGE_FIRST),
+            "aclrtMalloc(swimlane trace)"
+        )) {
+        return EXIT_FAILURE;
+    }
+    if (options.trace_enabled && (reinterpret_cast<uintptr_t>(trace_device) & 63U) != 0) {
+        std::fprintf(stderr, "Device swimlane trace is not 64-byte aligned: %p\n", trace_device);
+        return EXIT_FAILURE;
+    }
+
     PmuRegisterMappings pmu_mappings;
     pa_scheduler::pmu_owner::PmuOwnerSession pmu_owner;
     pa_scheduler::pmu_owner::PmuOwnerControl pmu_owner_evidence{};
@@ -1131,29 +1563,17 @@ int main(int argc, char **argv) {
         pmu_registers_device = reinterpret_cast<const void *>(pmu_owner.RegisterTableDeviceAddress());
     }
 
-    // 泳道区按 96 worker 各 65536 条记录预留，约 384 MiB；关闭泳道时不申请，也不会传递有效 base。
-    void *trace_device = nullptr;
-    if (options.trace_enabled &&
-        !CheckAcl(
-            aclrtMalloc(&trace_device, pa_scheduler::kTraceBytes, ACL_MEM_MALLOC_HUGE_FIRST),
-            "aclrtMalloc(swimlane trace)"
-        )) {
-        return EXIT_FAILURE;
-    }
-    if (options.trace_enabled && (reinterpret_cast<uintptr_t>(trace_device) & 63U) != 0) {
-        std::fprintf(stderr, "Device swimlane trace is not 64-byte aligned: %p\n", trace_device);
-        return EXIT_FAILURE;
-    }
-
     // host shadow 保留约 1 GiB 总跨度以便按关键 offset 寻址，但每轮传输只选择
     // 共享前缀、控制区和结果区。
     std::unique_ptr<pa_scheduler::SchedulerState> state(new pa_scheduler::SchedulerState);
     pa_scheduler::TraceHeader trace_header{};
     std::vector<double> spans;
+    bool execution_ok = true;
     bool all_passed = true;
     bool postprocess_ok = true;
     bool pmu_json_ready = false;
     bool pmu_json_semantic_passed = false;
+    bool pmu_json_workload_output_passed = false;
     uint32_t pmu_json_run = 0U;
     double pmu_json_host_us = 0.0;
     double pmu_json_submit_span_us = 0.0;
@@ -1162,6 +1582,19 @@ int main(int argc, char **argv) {
         pa_scheduler::host::InitializeState(state.get(), options);
         pa_scheduler::host::ConfigureTrace(state.get(), options, trace_device);
         ConfigurePmu(state.get(), pmu_options, pmu_registers_device);
+        ConfigureWinnerWorkload(state.get(), workload_options, workload_device);
+        if (real_compute &&
+            !CheckAcl(
+                aclrtMemcpy(
+                    workload_device, pa_scheduler::ccec_workload::kWorkspaceBytes,
+                    workload_image.data(), pa_scheduler::ccec_workload::kWorkspaceBytes,
+                    ACL_MEMCPY_HOST_TO_DEVICE
+                ),
+                "aclrtMemcpy(H2D real-compute workspace)"
+            )) {
+            execution_ok = false;
+            break;
+        }
         if (options.trace_enabled) {
             // 每轮只需重置约 7 KiB header；各 worker 会从 count=0 覆盖自己的记录区，无需清零整块 384 MiB。
             pa_scheduler::host::InitializeTraceHeader(&trace_header);
@@ -1172,7 +1605,8 @@ int main(int argc, char **argv) {
                     ),
                     "aclrtMemcpy(H2D swimlane header)"
                 )) {
-                return EXIT_FAILURE;
+                execution_ok = false;
+                break;
             }
         }
         // 为避免每轮搬运约 1 GiB，只 H2D 被测共享前缀和位于生产总跨度之后的
@@ -1193,9 +1627,9 @@ int main(int argc, char **argv) {
                 ),
                 "aclrtMemcpy(H2D standalone controls)"
             )) {
-            return EXIT_FAILURE;
+            execution_ok = false;
+            break;
         }
-
         void *kernel_args[] = {state_device};
         rtArgsEx_t args_info{};
         args_info.args = kernel_args;
@@ -1211,7 +1645,8 @@ int main(int argc, char **argv) {
                 "rtKernelLaunchWithHandleV2"
             ) ||
             !CheckAcl(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream")) {
-            return EXIT_FAILURE;
+            execution_ok = false;
+            break;
         }
         const auto wall_end = std::chrono::steady_clock::now();
         const double host_us = std::chrono::duration<double, std::micro>(wall_end - wall_begin).count();
@@ -1231,7 +1666,26 @@ int main(int argc, char **argv) {
                 ),
                 "aclrtMemcpy(D2H worker results)"
             )) {
-            return EXIT_FAILURE;
+            execution_ok = false;
+            break;
+        }
+        if (real_compute &&
+            !CheckAcl(
+                aclrtMemcpy(
+                    workload_outputs.data(),
+                    static_cast<size_t>(pa_scheduler::ccec_workload::kOutputTiles) *
+                        pa_scheduler::ccec_workload::kTileBytes,
+                    static_cast<uint8_t *>(workload_device) +
+                        pa_scheduler::ccec_workload::kSharedInputTiles *
+                            pa_scheduler::ccec_workload::kTileBytes,
+                    static_cast<size_t>(pa_scheduler::ccec_workload::kOutputTiles) *
+                        pa_scheduler::ccec_workload::kTileBytes,
+                    ACL_MEMCPY_DEVICE_TO_HOST
+                ),
+                "aclrtMemcpy(D2H real-compute outputs)"
+            )) {
+            execution_ok = false;
+            break;
         }
         if (options.trace_enabled &&
             !CheckAcl(
@@ -1241,7 +1695,8 @@ int main(int argc, char **argv) {
                 ),
                 "aclrtMemcpy(D2H swimlane header)"
             )) {
-            return EXIT_FAILURE;
+            execution_ok = false;
+            break;
         }
         // 常规校验只需 header 中的 per-worker count；真实 records 在分析或导出时才按核、按实际 count 懒加载。
         const auto read_trace_records =
@@ -1265,22 +1720,26 @@ int main(int argc, char **argv) {
             *state, run, host_us, options.trace_enabled ? &trace_header : nullptr
         );
         all_passed &= metrics.passed;
+        const bool workload_passed =
+            !real_compute || ValidateRealComputeOutputs(*state, workload_outputs, run);
+        all_passed &= workload_passed;
         PmuValidation pmu_validation;
         const bool pmu_passed = ValidatePmu(
-            *state, run, pmu_options,
+            *state, run, pmu_options, workload_options,
             pmu_options.mode == pa_scheduler::ccec_pmu::WindowMode::Off ? nullptr : &pmu_owner.Control(),
             &pmu_validation
         );
         all_passed &= pmu_passed;
         spans.push_back(metrics.submit_span_us);
         if (!pmu_options.json_path.empty()) {
-            if (!metrics.passed || !pmu_passed || !pmu_owner_evidence_valid) {
+            if (!metrics.passed || !workload_passed || !pmu_passed || !pmu_owner_evidence_valid) {
                 std::fprintf(stderr, "PMU JSON rejected because semantic, PMU, or owner validation failed.\n");
                 postprocess_ok = false;
                 break;
             }
             pmu_json_ready = true;
-            pmu_json_semantic_passed = metrics.passed;
+            pmu_json_semantic_passed = metrics.passed && workload_passed;
+            pmu_json_workload_output_passed = workload_passed;
             pmu_json_run = run;
             pmu_json_host_us = host_us;
             pmu_json_submit_span_us = metrics.submit_span_us;
@@ -1295,13 +1754,19 @@ int main(int argc, char **argv) {
         if (!options.swimlane_json.empty()) {
             // 只有语义校验通过才把 raw JSON 经“临时文件写完后 rename”发布，
             // 避免把截断或错误调度结果误当成可用性能证据。
-            if (!metrics.passed) {
+            if (!metrics.passed || !workload_passed) {
                 std::fprintf(stderr, "Skipping swimlane export because semantic validation failed.\n");
                 postprocess_ok = false;
                 break;
             }
             if (!pa_scheduler::host::ExportSwimlaneRecords(
-                    trace_header, options.swimlane_json, read_trace_records
+                    trace_header, options.swimlane_json, workload_options.mode,
+                    real_compute
+                        ? workload_options.repeats
+                        : pa_scheduler::WorkloadCounts{
+                              options.nops.qk, options.nops.sf, options.nops.pv, options.nops.up
+                          },
+                    read_trace_records
                 )) {
                 postprocess_ok = false;
                 break;
@@ -1309,9 +1774,12 @@ int main(int argc, char **argv) {
         }
     }
 
+    const double median_submit_span_us = spans.empty() ? 0.0 : pa_scheduler::host::Median(spans);
     std::printf(
-        "[SUMMARY] runs=%u median_submit_span_us=%.3f semantic_status=%s postprocess_status=%s\n", options.runs,
-        pa_scheduler::host::Median(spans), all_passed ? "PASS" : "FAIL", postprocess_ok ? "PASS" : "FAIL"
+        "[SUMMARY] runs=%u completed_runs=%zu median_submit_span_us=%.3f "
+        "execution_status=%s semantic_status=%s postprocess_status=%s\n",
+        options.runs, spans.size(), median_submit_span_us, execution_ok ? "PASS" : "FAIL",
+        all_passed ? "PASS" : "FAIL", postprocess_ok ? "PASS" : "FAIL"
     );
 
     // 后处理失败也统一走设备资源释放、ELF 卸载和 ACL 收尾，避免文件系统错误遗留运行时上下文。
@@ -1327,6 +1795,11 @@ int main(int argc, char **argv) {
         cleanup_ok &= pmu_owner_restore_ok;
         cleanup_ok &= UnmapPmuRegisters(options.device, &pmu_mappings);
     }
+    if (workload_device != nullptr) {
+        cleanup_ok &= CheckAcl(
+            aclrtFree(workload_allocation.Release()), "aclrtFree(real-compute workspace)"
+        );
+    }
     cleanup_ok &= CheckAcl(aclrtFree(state_device), "aclrtFree(state)");
     const rtError_t unload_error =
         registered_all ? rtDevBinaryUnRegister(kernel_handle) : rtBinaryUnLoad(kernel_handle);
@@ -1339,8 +1812,9 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "PMU JSON was not published because the capture or restore transaction failed.\n");
             postprocess_ok = false;
         } else if (!ExportPmuJson(
-                       *state, options, pmu_options, pmu_json_run, pmu_json_host_us,
-                       pmu_json_submit_span_us, pmu_json_validation, pmu_json_semantic_passed,
+                       *state, options, pmu_options, workload_options, pmu_json_run,
+                       pmu_json_host_us, pmu_json_submit_span_us, pmu_json_validation,
+                       pmu_json_semantic_passed, pmu_json_workload_output_passed,
                        pmu_owner_evidence,
                        pmu_owner_restore_ok, pmu_options.json_path
                    )) {
@@ -1348,5 +1822,5 @@ int main(int argc, char **argv) {
         }
     }
     // 运行语义、后处理和资源清理三者全部成功，进程才返回成功，脚本据此决定是否继续生成 merged 泳道。
-    return all_passed && postprocess_ok && cleanup_ok ? EXIT_SUCCESS : EXIT_FAILURE;
+    return execution_ok && all_passed && postprocess_ok && cleanup_ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

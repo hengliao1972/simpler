@@ -40,6 +40,16 @@ CCEC-only PMU probe options (selectors are owned by the standalone Main AICPU he
   --pmu-icache-trials N
   --pmu-json FILE
 
+CCEC-only winner workload options:
+  --winner-workload scalar-nop|real-compute
+  --real-compute-count N
+  --real-compute-counts QK,SF,PV,UP
+
+real-compute is opt-in. Its calibrated A5 defaults are QK/SF/PV/UP=6/28/4/1;
+one count is one complete 128x128 load/engine/store/completion-wait pipeline
+per winner task, not a scalar NOP count. Explicit count options override those
+four defaults.
+
 The swimlane action enables atomic tracing by default. For the lower-level run
 action, --trace-atomics still requires swimlane tracing; add
 --analyze-swimlane to print the per-role/per-site timing distributions.
@@ -122,20 +132,22 @@ reject_managed_swimlane_options() {
     done
 }
 
-reject_pmu_options_for_non_ccec() {
+reject_ccec_only_options_for_non_ccec() {
     local backend="$1"
     shift
     if [[ "$backend" == "ccec" ]]; then
         return
     fi
 
-    # PMU selector、校准 NOP 和导出路径都由 CCEC Main AICPU 所有者消费。
+    # PMU selector、校准 NOP、导出路径和真实 winner 负载都只由 CCEC 分支消费。
     # 在顶层展开 all 之前拒绝，避免先启动 CCEC、再由其他后端迟到报错。
     for argument in "$@"; do
         case "$argument" in
             --pmu-window|--pmu-window=*|--pmu-scalar-nops|--pmu-scalar-nops=*|\
-            --pmu-icache-trials|--pmu-icache-trials=*|--pmu-json|--pmu-json=*)
-                echo "PMU option $argument is CCEC-only; backend '$backend' is not supported." >&2
+            --pmu-icache-trials|--pmu-icache-trials=*|--pmu-json|--pmu-json=*|\
+            --winner-workload|--winner-workload=*|--real-compute-count|--real-compute-count=*|\
+            --real-compute-counts|--real-compute-counts=*)
+                echo "CCEC-only option $argument is not supported by backend '$backend'." >&2
                 exit 1
                 ;;
         esac
@@ -161,7 +173,7 @@ else
 fi
 
 # 后端约束必须早于 build/run/smoke/swimlane 的任何文件创建、构建或设备动作。
-reject_pmu_options_for_non_ccec "$BACKEND" "$@"
+reject_ccec_only_options_for_non_ccec "$BACKEND" "$@"
 
 case "$ACTION" in
     build)
@@ -185,6 +197,17 @@ case "$ACTION" in
         # smoke 仍启动全部 96 个 worker，并默认注入 1 batch、1 run、0 NOP；
         # 后置用户参数仍由共享 parser 处理。它用于快速检查原子协议、拓扑和
         # 最终状态，不作为性能数据。
+        for argument in "$@"; do
+            case "$argument" in
+                --batches|--batches=*|--runs|--runs=*|--nop-count|--nop-count=*|\
+                --nop-counts|--nop-counts=*|--winner-workload|--winner-workload=*|\
+                --real-compute-count|--real-compute-count=*|--real-compute-counts|\
+                --real-compute-counts=*)
+                    echo "The smoke action fixes b1/r1/scalar-nop=0; use 'run ccec' for real-compute." >&2
+                    exit 1
+                    ;;
+            esac
+        done
         for backend in "${BACKENDS[@]}"; do
             run_backend "$backend" --batches 1 --runs 1 --nop-count 0 "$@"
         done

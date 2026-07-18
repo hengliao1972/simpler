@@ -26,6 +26,47 @@ except ImportError:
 
 
 class SwimlaneConverterLayoutTest(unittest.TestCase):
+    def test_real_compute_metadata_is_preserved_and_visible(self) -> None:
+        # raw 与 merged 都必须自描述真实 engine 负载；否则同名 QK/SF/PV/UP
+        # span 无法与历史 scalar-NOP 泳道区分。
+        workload = {
+            "mode": "real-compute",
+            "counts": {"qk": 6, "sf": 28, "pv": 4, "up": 1},
+            "unit": "complete_128x128_engine_pipeline_iteration",
+            "engine_mapping": {
+                "qk": "cube_matmul",
+                "sf": "vector_add",
+                "pv": "cube_matmul",
+                "up": "vector_mul",
+            },
+        }
+        capture = {
+            "l2_swimlane_level": 1,
+            "metadata": {
+                "clock_freq_hz": 1_000_000_000,
+                "num_cores": 1,
+                "trace_schema_version": 2,
+                "winner_workload": workload,
+                "core_types": ["AIC"],
+            },
+            "fdwic_events": [[0, 0, 0, 1, 0, "Kernel", 100, 200, 0, 0]],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            emitted, blocks, base_cycle = convert(input_path, output_path)
+            merged = json.loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertEqual((emitted, blocks, base_cycle), (2, 1, 100))
+        self.assertEqual(merged["metadata"]["winner_workload"], workload)
+        capture_event = next(
+            event for event in merged["traceEvents"]
+            if event.get("name") == "pa_scheduler.capture"
+        )
+        self.assertEqual(capture_event["args"]["winner_workload"], workload)
+
     def test_atomic_and_clock_share_the_scalar_lane(self) -> None:
         # 同一 mixed block 放一条 AIC 和一条 AIV0；Atomic 是 AIC scalar
         # 上 Claim 的子区间，ClockBaseline 也是 AIV0 scalar 指令，而

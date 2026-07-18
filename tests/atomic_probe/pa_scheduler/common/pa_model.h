@@ -80,10 +80,10 @@ static_assert((kPayloadSlots & kPayloadMask) == 0, "payload slots must be a powe
 static_assert(kMaxTasks < kTaskCellCapacity, "every frontier scan must terminate on an in-range not-ready flag");
 
 // These are the measured means from the best PA A5 trace, in 1 GHz ticks.
-// The CCEC stage calibrates the NOP counts against these targets before the
-// defaults are considered final.
-// 这里只用 NOP 代替四个计算 kernel 的执行体；Submit、依赖、heap 与
-// completion 路径均不靠 NOP 补时。target 是真实泳道均值，不是调度阶段预算。
+// The scalar-NOP baseline calibrates its counts against these targets.
+// 默认模式只用 NOP 代替四个计算 kernel；CCEC 显式 real-compute 模式改用
+// 完整 Cube/Vector 流水。两种模式的 Submit、依赖、heap 与 completion 路径
+// 均不靠 NOP 补时。target 是真实泳道均值，不是调度阶段预算。
 constexpr uint32_t kTargetQkTicks = 44170;
 constexpr uint32_t kTargetSfTicks = 53729;
 constexpr uint32_t kTargetPvTicks = 27626;
@@ -102,7 +102,7 @@ enum class CoreRole : uint32_t {
 };
 
 // task_id % 5 即 kind；该周期性是不变量，既决定 Claim cursor/active role，
-// 也决定输出大小、fanin 拓扑和 NOP kernel 的选择。
+// 也决定输出大小、fanin 拓扑和 winner workload 的选择。
 enum class TaskKind : uint32_t {
     Alloc = 0,
     Qk = 1,
@@ -172,6 +172,41 @@ struct NopCounts {
     uint32_t pv;
     uint32_t up;
 };
+
+// winner 的计算负载与 NOP 校准量使用两套独立计数，禁止把同一个数字同时解释成
+// scalar 指令条数和 vector/cube 工作迭代数。首阶段只有 CCEC 实现 RealCompute；
+// 该 ABI 放在公共模型中，便于后续按相同配置逐步迁移 AscendC 与 CPU。
+struct WorkloadCounts {
+    uint32_t qk;
+    uint32_t sf;
+    uint32_t pv;
+    uint32_t up;
+};
+static_assert(sizeof(WorkloadCounts) == 16, "workload counts ABI changed");
+
+enum class WinnerWorkloadMode : uint32_t {
+    ScalarNop = 0,
+    RealCompute = 1,
+};
+
+constexpr uint32_t kWinnerWorkloadConfigVersion = 1;
+
+// 真实计算工作区是 standalone sidecar，不属于生产 DistGlobal/DistCore ABI。
+// workspace_base 指向 host 单独申请并初始化的 GM；每个 worker 只写自己的输出片段。
+struct alignas(64) WinnerWorkloadConfig {
+    uint32_t mode;
+    uint32_t version;
+    WorkloadCounts repeats;
+    uint64_t workspace_base;
+    uint64_t workspace_bytes;
+    uint32_t reserved[6];
+};
+static_assert(sizeof(WinnerWorkloadConfig) == 64, "winner workload config must occupy one cache line");
+static_assert(offsetof(WinnerWorkloadConfig, mode) == 0, "winner workload mode offset changed");
+static_assert(offsetof(WinnerWorkloadConfig, version) == 4, "winner workload version offset changed");
+static_assert(offsetof(WinnerWorkloadConfig, repeats) == 8, "winner workload counts offset changed");
+static_assert(offsetof(WinnerWorkloadConfig, workspace_base) == 24, "winner workload base offset changed");
+static_assert(offsetof(WinnerWorkloadConfig, workspace_bytes) == 32, "winner workload bytes offset changed");
 
 // RunConfig 是 host 在 launch 前写、worker 启动时只读的控制 cache line。
 // 输入为 batch/NOP/诊断开关；输出不回写这里，而发布到独立 WorkerResult。
@@ -634,6 +669,7 @@ struct alignas(64) SchedulerState {
     // Standalone-only controls live after the complete DistGlobal image. They
     // therefore do not shift any cursor/task/fatal/worker address under test.
     RunConfig config;
+    WinnerWorkloadConfig winner_workload;
     // Context lengths are the only PA input elements read by orchestration;
     // keeping them in GM preserves the per-batch descriptor-based load.
     // 除这 256 个长度值外，其余 tensor 仅需稳定的合成地址来复现
@@ -660,6 +696,15 @@ static_assert(offsetof(SchedulerState, workers) % 64 == 0, "worker table must be
 static_assert(offsetof(SchedulerState, results) % 64 == 0, "result table must be cache-line aligned");
 static_assert(offsetof(SchedulerState, workers) == kRealDistCoreOffset, "DistCore table offset must match PA");
 static_assert(offsetof(SchedulerState, config) == kRealDistGlobalBytes, "DistGlobal byte size must match PA");
+static_assert(
+    offsetof(SchedulerState, winner_workload) == kRealDistGlobalBytes + sizeof(RunConfig),
+    "winner workload sidecar must follow RunConfig"
+);
+static_assert(
+    offsetof(SchedulerState, context_lens) ==
+        kRealDistGlobalBytes + sizeof(RunConfig) + sizeof(WinnerWorkloadConfig),
+    "context lengths must follow standalone controls"
+);
 
 }  // namespace pa_scheduler
 

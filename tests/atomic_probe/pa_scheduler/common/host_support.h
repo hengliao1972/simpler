@@ -405,9 +405,16 @@ inline bool ValidateTraceHeader(const TraceHeader &header, const char *operation
 
 template <typename ReadRecords>
 inline bool ExportSwimlaneRecords(
-    const TraceHeader &header, const std::string &output_path, ReadRecords read_records
+    const TraceHeader &header, const std::string &output_path,
+    WinnerWorkloadMode workload_mode, const WorkloadCounts &workload_counts,
+    ReadRecords read_records
 ) {
     if (!ValidateTraceHeader(header, "swimlane export")) return false;
+    if (workload_mode != WinnerWorkloadMode::ScalarNop &&
+        workload_mode != WinnerWorkloadMode::RealCompute) {
+        std::fprintf(stderr, "swimlane export rejected invalid winner workload mode.\n");
+        return false;
+    }
 
     // 先写同目录临时文件，全部记录写完并关闭后再 rename 替换，避免把半截 JSON
     // 当成有效采集；这里没有 fsync 文件和目录，不承诺掉电后的持久化原子性。
@@ -428,8 +435,20 @@ inline bool ExportSwimlaneRecords(
         output,
         "{\n\"l2_swimlane_level\":1,\n"
         "\"metadata\":{\"clock_freq_hz\":%llu,\"num_cores\":%u,"
-        "\"trace_schema_version\":2,\"core_types\":[",
-        static_cast<unsigned long long>(header.frequency_hz), kWorkers
+        "\"trace_schema_version\":2,"
+        "\"winner_workload\":{\"mode\":\"%s\","
+        "\"counts\":{\"qk\":%u,\"sf\":%u,\"pv\":%u,\"up\":%u},"
+        "\"unit\":\"%s\",\"engine_mapping\":%s},\"core_types\":[",
+        static_cast<unsigned long long>(header.frequency_hz), kWorkers,
+        workload_mode == WinnerWorkloadMode::RealCompute ? "real-compute" : "scalar-nop",
+        workload_counts.qk, workload_counts.sf, workload_counts.pv, workload_counts.up,
+        workload_mode == WinnerWorkloadMode::RealCompute
+            ? "complete_128x128_engine_pipeline_iteration"
+            : "scalar_nop_instruction",
+        workload_mode == WinnerWorkloadMode::RealCompute
+            ? "{\"qk\":\"cube_matmul\",\"sf\":\"vector_add\","
+              "\"pv\":\"cube_matmul\",\"up\":\"vector_mul\"}"
+            : "null"
     );
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
         std::fprintf(output, "%s\"%s\"", worker == 0 ? "" : ",", worker < kAicWorkers ? "aic" : "aiv");
@@ -763,6 +782,7 @@ inline Metrics Validate(
     bool worker_checksums_ok = true;
     bool fanin_worker_counts_ok = true;
     bool frontier_worker_counts_ok = true;
+    bool role_kernel_routing_ok = true;
 
     // 按真实输出大小、1 KiB 对齐和 256 MiB 环回规则重算每个 task 可接受的最小 vend。
     uint64_t expected_heap_next = 0;
@@ -860,6 +880,13 @@ inline Metrics Validate(
         worker_checksums_ok &= result.checksum == (0xcbf29ce484222325ULL ^ result.worker_id);
         const uint64_t worker_kernel_completions = result.kernel_counts[0] + result.kernel_counts[1] +
                                                    result.kernel_counts[2] + result.kernel_counts[3];
+        if (result.role == static_cast<uint32_t>(CoreRole::Aic)) {
+            role_kernel_routing_ok &= result.kernel_counts[1] == 0 && result.kernel_counts[3] == 0;
+        } else if (result.role == static_cast<uint32_t>(CoreRole::Aiv)) {
+            role_kernel_routing_ok &= result.kernel_counts[0] == 0 && result.kernel_counts[2] == 0;
+        } else {
+            role_kernel_routing_ok = false;
+        }
         const uint64_t worker_completions = result.wins[0] + worker_kernel_completions;
         frontier_worker_counts_ok &= result.frontier_initial_loads == worker_completions;
         frontier_worker_counts_ok &= result.frontier_terminal_loads == result.frontier_initial_loads;
@@ -918,6 +945,10 @@ inline Metrics Validate(
         kernel_counts[0] == batches && kernel_counts[1] == batches && kernel_counts[2] == batches &&
             kernel_counts[3] == batches,
         "each kernel kind executes once per batch", &metrics
+    );
+    Expect(
+        role_kernel_routing_ok,
+        "AIC executes only QK/PV and AIV executes only SF/UP", &metrics
     );
     Expect(heap_guards == static_cast<uint64_t>(batches) * 4, "heap guard count matches output winners", &metrics);
     Expect(

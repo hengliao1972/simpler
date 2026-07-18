@@ -87,7 +87,7 @@ def _integer(value: Any, label: str) -> int:
 # 读取 raw JSON，校验十列结构、字段范围与可转整数值，并返回规范化视图。
 def _load_and_validate(
     input_path: Path,
-) -> tuple[int, int, list[tuple[Any, ...]], dict[tuple[int, int], int], int]:
+) -> tuple[int, int, list[tuple[Any, ...]], dict[tuple[int, int], int], int, dict[str, Any]]:
     # raw 文件沿用真实 l2_swimlane_records.json 的十列 fdwic_events ABI：
     # core、block、lane、task、func、phase、start、end、flags、aux。
     with input_path.open("r", encoding="utf-8") as input_file:
@@ -117,6 +117,49 @@ def _load_and_validate(
     core_types = metadata.get("core_types")
     if not isinstance(core_types, list) or len(core_types) != num_cores:
         raise ValueError("metadata.core_types length must equal metadata.num_cores")
+    winner_workload = metadata.get("winner_workload")
+    if winner_workload is not None:
+        if not isinstance(winner_workload, dict):
+            raise ValueError("metadata.winner_workload must be a JSON object")
+        workload_mode = winner_workload.get("mode")
+        if workload_mode not in ("scalar-nop", "real-compute"):
+            raise ValueError("metadata.winner_workload.mode must be scalar-nop or real-compute")
+        workload_counts = winner_workload.get("counts")
+        if not isinstance(workload_counts, dict):
+            raise ValueError("metadata.winner_workload.counts must be a JSON object")
+        normalized_counts: dict[str, int] = {}
+        for kind in ("qk", "sf", "pv", "up"):
+            value = _integer(
+                workload_counts.get(kind), f"metadata.winner_workload.counts.{kind}"
+            )
+            if value < 0 or (workload_mode == "real-compute" and value == 0):
+                raise ValueError(
+                    f"metadata.winner_workload.counts.{kind} is invalid for {workload_mode}"
+                )
+            normalized_counts[kind] = value
+        expected_unit = (
+            "complete_128x128_engine_pipeline_iteration"
+            if workload_mode == "real-compute"
+            else "scalar_nop_instruction"
+        )
+        if winner_workload.get("unit") != expected_unit:
+            raise ValueError(
+                f"metadata.winner_workload.unit must be {expected_unit!r} for {workload_mode}"
+            )
+        engine_mapping = winner_workload.get("engine_mapping")
+        if workload_mode == "real-compute":
+            expected_mapping = {
+                "qk": "cube_matmul",
+                "sf": "vector_add",
+                "pv": "cube_matmul",
+                "up": "vector_mul",
+            }
+            if engine_mapping != expected_mapping:
+                raise ValueError("metadata.winner_workload.engine_mapping is invalid")
+        elif engine_mapping is not None:
+            raise ValueError("scalar-nop metadata.winner_workload.engine_mapping must be null")
+        # 后续 merged 顶层与 instant event 使用经过整数归一的同一份配置。
+        winner_workload["counts"] = normalized_counts
 
     rows = data.get("fdwic_events")
     if not isinstance(rows, list) or not rows:
@@ -181,7 +224,7 @@ def _load_and_validate(
         )
 
     assert base_cycle is not None
-    return frequency_hz, trace_schema_version, rows, core_by_block_lane, base_cycle
+    return frequency_hz, trace_schema_version, rows, core_by_block_lane, base_cycle, metadata
 
 
 # 写一个 Chrome Trace Event，并统一处理数组元素间的逗号。
@@ -195,7 +238,14 @@ def _emit_event(output: TextIO, event: dict[str, Any], first: bool) -> bool:
 
 # 完成一次 raw 到 merged 的转换，成功时返回事件数、block 数和基准 cycle。
 def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
-    frequency_hz, trace_schema_version, rows, core_by_block_lane, base_cycle = _load_and_validate(input_path)
+    (
+        frequency_hz,
+        trace_schema_version,
+        rows,
+        core_by_block_lane,
+        base_cycle,
+        capture_metadata,
+    ) = _load_and_validate(input_path)
     # 禁止原地转换；否则创建临时文件或最终 replace 时可能破坏唯一一份 raw。
     if input_path.resolve() == output_path.resolve():
         raise ValueError("input and output paths must differ")
@@ -228,7 +278,25 @@ def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
     # .tmp 再向上传播。格式/IO 错误由 main 简短报告，Ctrl-C 保留默认中断行为。
     try:
         with temporary_path.open("w", encoding="utf-8") as output:
-            output.write('{"displayTimeUnit":"ns","traceEvents":[\n')
+            output.write('{"displayTimeUnit":"ns","metadata":')
+            json.dump(capture_metadata, output, ensure_ascii=False, separators=(",", ":"))
+            output.write(',"traceEvents":[\n')
+            winner_workload = capture_metadata.get("winner_workload")
+            if winner_workload is not None:
+                first = _emit_event(
+                    output,
+                    {
+                        "ph": "i",
+                        "s": "g",
+                        "name": "pa_scheduler.capture",
+                        "pid": 0,
+                        "tid": 0,
+                        "ts": 0,
+                        "args": {"winner_workload": winner_workload},
+                    },
+                    first,
+                )
+                emitted += 1
             # 每个物理 block 建一个 process；每条硬件 lane 再拆成 runtime
             # 与 kernel 两个 thread，避免等待/提交阶段覆盖 kernel 执行条。
             for block_id in blocks:

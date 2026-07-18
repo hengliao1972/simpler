@@ -42,6 +42,12 @@ if [[ ! -f "$PTO_INCLUDE_ROOT/include/pto/common/kernel_meta.hpp" ]]; then
     echo "PTO kernel metadata header is missing under $PTO_INCLUDE_ROOT/include" >&2
     exit 1
 fi
+for header in pto/pto-inst.hpp pto/common/constants.hpp pto/common/pto_tile.hpp; do
+    if [[ ! -f "$PTO_INCLUDE_ROOT/include/$header" ]]; then
+        echo "PTO real-compute header is missing: $PTO_INCLUDE_ROOT/include/$header" >&2
+        exit 1
+    fi
+done
 
 mkdir -p "$BUILD_DIR"
 
@@ -82,13 +88,15 @@ echo "[BUILD] Static 1:2 mixed AICore ELF"
     "$BUILD_DIR/pa_scheduler_aic.o" \
     "$BUILD_DIR/pa_scheduler_aiv.o"
 
-SYMBOL_TABLE="$("$READELF_BIN" --symbols --wide "$BUILD_DIR/pa_scheduler_kernel.o")"
+SYMBOL_TABLE="$("$READELF_BIN" --symbols --wide --sym-base=10 "$BUILD_DIR/pa_scheduler_kernel.o")"
 SECTION_TABLE="$("$READELF_BIN" --sections --wide "$BUILD_DIR/pa_scheduler_kernel.o")"
 # 构建成功不等于 mixed launch 可用：同时检查两个入口符号及其 metadata section，缺一即拒绝产物。
 # `set -e` 同时保证 readelf 自身失败时不会拿空字符串继续做伪检查。
 for entry in pa_scheduler_0_mix_aic pa_scheduler_0_mix_aiv; do
-    if [[ "$SYMBOL_TABLE" != *" $entry"* ]]; then
-        echo "Missing mixed-kernel entry: $entry" >&2
+    if ! awk -v name="$entry" \
+        '$4 == "FUNC" && $5 == "GLOBAL" && $7 != "UND" && $NF == name && $3 != "0" && $3 != "0x0" {found = 1} END {exit !found}' \
+        <<<"$SYMBOL_TABLE"; then
+        echo "Missing non-empty defined GLOBAL mixed-kernel entry: $entry" >&2
         exit 1
     fi
     if [[ "$SECTION_TABLE" != *".ascend.meta.$entry"* ]]; then
@@ -97,6 +105,45 @@ for entry in pa_scheduler_0_mix_aic pa_scheduler_0_mix_aiv; do
     fi
 done
 echo "[CHECK] both 1:2 mixed entries and metadata sections are present"
+
+# A5 runtime 会把已定义的 GLOBAL FUNC 当作可启动候选；最终 device ELF 只允许
+# 两个带 metadata 的 mixed 入口暴露为全局函数。任何新增 helper 都必须保持 LOCAL。
+while IFS= read -r global_func; do
+    case "$global_func" in
+        pa_scheduler_0_mix_aic|pa_scheduler_0_mix_aiv) ;;
+        *)
+            echo "Unexpected GLOBAL device function (possible kernel-entry pollution): $global_func" >&2
+            exit 1
+            ;;
+    esac
+done < <(awk '$4 == "FUNC" && $5 == "GLOBAL" && $7 != "UND" {print $NF}' <<<"$SYMBOL_TABLE")
+echo "[CHECK] only the two mixed entries are exported as GLOBAL device functions"
+
+# noinline/used 的三个本地函数是 CCEC 真计算模式的构建期证据；它们不得导出为
+# GLOBAL，否则 runtime 可能把 helper 误识别成可启动 kernel。运行期还必须用
+# 数值闭环和 PMU 的 AIC cube_busy/AIV vector_busy 共同证明它们确实执行。
+for workload_symbol in \
+    pa_execute_real_winner_workload \
+    pa_real_cube_workload_aic \
+    pa_real_vector_add_workload_aiv \
+    pa_real_vector_mul_workload_aiv; do
+    workload_size="$(
+        awk -v name="$workload_symbol" \
+            '$4 == "FUNC" && $5 == "LOCAL" && $7 != "UND" && index($NF, name) != 0 && $3 + 0 > 0 {print $3; exit}' \
+            <<<"$SYMBOL_TABLE"
+    )"
+    if [[ -z "$workload_size" ]]; then
+        echo "Missing non-empty LOCAL CCEC real-compute workload function: $workload_symbol" >&2
+        exit 1
+    fi
+    if awk -v name="$workload_symbol" \
+        '$4 == "FUNC" && $5 == "GLOBAL" && $7 != "UND" && index($NF, name) != 0 {found = 1} END {exit !found}' \
+        <<<"$SYMBOL_TABLE"; then
+        echo "CCEC real-compute helper must not be a GLOBAL kernel candidate: $workload_symbol" >&2
+        exit 1
+    fi
+done
+echo "[CHECK] CCEC cube/vector real-compute helpers are non-empty LOCAL functions"
 
 check_icache_probe_layout() {
     local role="$1"

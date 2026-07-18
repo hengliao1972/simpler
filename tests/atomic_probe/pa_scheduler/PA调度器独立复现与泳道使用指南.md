@@ -28,10 +28,10 @@ frontier 和 worker 状态，任一不符都会返回失败。
 
 有意保留的替代只有两类：
 
-1. QK/SF/PV/UP 的真实计算体由可控 NOP 数做时长标定，使每个 task 的
-   占用时间接近真实 PA；调度前后路径没有用 NOP 补时。NOP 实际由
-   scalar 执行，只校准了时长，没有复现真实 Vector/Cube 计算单元及其间
-   scalar 等待状态。
+1. 默认 `scalar-nop` 模式仍以可控 NOP 标定 QK/SF/PV/UP，供三后端沿用旧基线。
+   CCEC 另有显式 `real-compute` 模式：QK/PV 运行完整 Cube matmul，SF/UP
+   运行完整 Vector add/mul，并执行 GM load、引擎计算、GM store 和完成等待。
+   AscendC 与 CPU 的对等真计算仍按阶段迁移，当前不能把 CCEC 结果泛化到三后端。
 2. simpler 的 AICPU/runtime 装载链路由本目录 host runner 代替；测试关注的
    首个 Submit 到最后一个 Submit 区间不含 AICPU 初始化和最终回收。
 
@@ -45,20 +45,22 @@ Register、PrepareMap 或等待路径中插入虚假延时。
 ## 2. 三种实现
 
 三种后端共用 `common/` 中完全相同的 PA 模型和调度器，只分别实现原子指令、
-时钟、NOP 和启动入口。
+时钟、winner 计算体和启动入口。
 
-| 后端 | 启动形式 | atomic load | Claim fetch-max |
-| --- | --- | --- | --- |
-| CCEC | 1:2 mixed AIC/AIV ELF | `atomicAdd(addr, 0)` | `atomicMax` |
-| AscendC | `__mix__(1, 2)` | `AtomicAdd(addr, 0)` | `AtomicMax` |
-| CPU | 96 个 pthread | `fetch_add(0)` | C++17 CAS loop |
+| 后端 | 启动形式 | atomic load | Claim fetch-max | 当前 winner 负载 |
+| --- | --- | --- | --- | --- |
+| CCEC | 1:2 mixed AIC/AIV ELF | `atomicAdd(addr, 0)` | `atomicMax` | `scalar-nop` 或真实 Cube/Vector |
+| AscendC | `__mix__(1, 2)` | `AtomicAdd(addr, 0)` | `AtomicMax` | 当前为 `scalar-nop` |
+| CPU | 96 个 pthread | `fetch_add(0)` | C++17 CAS loop | 当前为 `scalar-nop` |
 
 AscendC 对 64 位 vend 使用 signed `AtomicAdd(addr, 0)`。CANN 9.1 虽提供
 unsigned overload，但它在本 mixed kernel 的 64 MiB heap wrap 位置发生过
 稳定停滞；PA vend 小于 `INT64_MAX`，因此 signed add-zero 返回的位模式与比较
 语义不变。CPU 版本用于协议和边界检查，host 线程调度耗时不能与 A5 比较。
 
-## 3. 默认 kernel 时间
+## 3. Winner 计算负载
+
+### 3.1 三后端默认 `scalar-nop`
 
 真实 PA 最好泳道中四类 kernel 的 1 GHz counter 均值和当前 A5 NOP 校准值为：
 
@@ -79,6 +81,44 @@ Alloc 没有模拟 kernel body。NOP 数是 A5 实测校准量，不应解释为
 
 `--nop-count N` 同时设置四类 kernel；`--nop-counts` 的顺序固定为
 QK、SF、PV、UP，允许范围为 0 到 10,000,000。
+
+### 3.2 CCEC 真实 Cube/Vector 模式
+
+CCEC 可显式切换到真实计算：
+
+```bash
+./run.sh run ccec --winner-workload real-compute --batches 256 --runs 1 --no-swimlane
+```
+
+未传 count 时，QK/SF/PV/UP 默认使用 `6,28,4,1` 次完整迭代。每次迭代均为
+`128x128 float` 的完整流水，不是 scalar NOP：
+
+- AIC 的 QK/PV：GM load → MTE2/MTE1 → Cube matmul → FIX → GM store → 完成等待；
+- AIV 的 SF：GM load → Vector add → GM store → 完成等待；
+- AIV 的 UP：GM load → Vector mul → GM store → 完成等待。
+
+可以统一或分类型覆盖，范围为 1 到 128：
+
+```bash
+./run.sh run ccec --winner-workload real-compute --real-compute-count 1
+./run.sh run ccec --winner-workload real-compute --real-compute-counts 6,28,4,1
+```
+
+`--real-compute-count*` 与 `--nop-count*` 不能混用；当前这些选项只允许 CCEC。
+workspace 包含两个只读输入 tile，并为每个 worker 按其 role 对应的两个 task kind
+各保留一个独占输出 tile，共
+12,713,984 bytes。host 在计时前初始化并 H2D，计时后 D2H；所有 active
+worker-kind 的最终 tile 必须分别等于 QK/PV 的 768、SF 的 5、UP 的 6，未获胜
+输出必须保留 sentinel。同一 worker-kind 的 repeat 会覆盖同一 tile，因此最终常量
+结果只证明至少完成一次；全部 repeat 的完整性另由受控 PMU count1→2 倍增取证。
+输入使用常量 2 和 3，足以验证计算、角色路由和写回，但不单独证明转置或 stride
+布局；这是一项有意保留的性能替身边界。
+
+默认次数来自三个独立 b256 进程的标定：QK、SF、PV 中位数分别约
+41.336、54.039、27.971 us，接近真实 PA 的 44.170、53.729、27.626 us。
+UP 的一次完整 `128x128` 流水约 2.5 us，已经是正整数迭代下限；若后续要贴近
+1.565 us，应缩小 UP tile，不能用 0 次掩盖执行。真实计算下 Cube/Vector 会在
+不同物理子核并行，因此整体 Submit 约 3.6～3.8 ms，不应增加无关工作量硬凑 5.1 ms。
 
 ## 4. 本机依赖和构建
 
@@ -101,7 +141,8 @@ export CXX="$GCC15_ROOT/usr/bin/g++-15"
 组合构建严格按 CCEC、AscendC、CPU 的顺序执行。CCEC 构建会检查 1:2 mixed
 的两个入口和 metadata section；CANN 9.1 自带的 PTO 头可直接使用。若换用单独
 安装的 PTO ISA，可把 `PTO_ISA_ROOT` 指向包含
-`include/pto/common/kernel_meta.hpp` 的目录。
+`include/pto/common/kernel_meta.hpp` 的目录；同一 include tree 还必须具有
+`pto/pto-inst.hpp`、`pto/common/constants.hpp` 和 `pto/common/pto_tile.hpp`。
 
 ## 5. 使用说明：运行、测量与泳道查看
 
@@ -111,12 +152,15 @@ export CXX="$GCC15_ROOT/usr/bin/g++-15"
 | action | 用途 | 是否生成泳道文件 |
 | --- | --- | --- |
 | `build` | 构建指定后端 | 否 |
-| `smoke` | 1 batch、1 run、零 NOP 的快速语义回归 | 否，只做内存记录校验 |
-| `run` | 自行控制 batch、run、NOP 和诊断参数 | 仅显式传入 `--swimlane-json` 时生成 raw |
+| `smoke` | 固定 b1/r1/`scalar-nop=0` 的快速语义回归 | 否，只做内存记录校验 |
+| `run` | 自行控制 batch、run、winner 负载和诊断参数 | 仅显式传入 `--swimlane-json` 时生成 raw |
 | `swimlane` | 单轮运行并自动生成 raw 和 Perfetto merged JSON | 是 |
 
 `ccec|ascendc|cpu|all` 用于选择后端；`all` 始终按 CCEC、AscendC、CPU
 的顺序执行。
+CCEC `run/swimlane` 可使用 `--winner-workload scalar-nop|real-compute`、
+`--real-compute-count N` 或 `--real-compute-counts QK,SF,PV,UP`；真计算 count
+与 `--nop-count*` 互斥。`smoke` 有意固定 scalar-nop，不接受这些覆盖项。
 
 ### 5.1 首次回归
 
@@ -149,6 +193,9 @@ semantic_status=PASS postprocess_status=PASS
   --profile-phases --analyze-swimlane
 ```
 
+这两条未传 `--winner-workload`，都使用默认 scalar-NOP；需要 CCEC 真计算时按
+3.2 节显式传入 `--winner-workload real-compute`。
+
 此模式输出指标和泳道统计，但不会自动落盘 JSON。若只关注性能且不需要完整
 泳道逐事件分析，可去掉 `--analyze-swimlane`；若也不需要记录泳道，可使用
 `--no-swimlane` 进一步节省约 384 MiB device 内存。
@@ -160,6 +207,9 @@ semantic_status=PASS postprocess_status=PASS
 ```bash
 ./run.sh swimlane ccec \
   --device 0 --batches 256 --profile-phases --analyze-swimlane
+
+./run.sh swimlane ccec \
+  --device 0 --batches 1 --winner-workload real-compute --trace-atomics
 ```
 
 `swimlane` action 会管理 `--runs 1` 和输出路径，因此不要再传
@@ -184,6 +234,9 @@ runner 结束时会打印准确目录：
 ```text
 [SWIMLANE] output_root=.../outputs/pa_scheduler_swimlane_<UTC时间>_<PID>
 ```
+
+真计算泳道必须同时检查 raw/merged 顶层的 `winner_workload` metadata；逻辑
+`·kernel` span 只说明 winner 执行区间，单凭轨道名称不能证明使用了硬件引擎。
 
 查看步骤：
 
@@ -447,18 +500,17 @@ start/stop、`miss <= request`，以及 owner Restore 成功。
 | `scalar` | `RunScheduler` 完成后，一个 gate 中执行 `--pmu-scalar-nops N` | 验证 scalar/I-cache 正向敏感性 |
 | `scalar-double` | `RunScheduler` 完成后，两段相同 NOP 中间只 stop/start、不读 counter | 验证暂停后继续累计 |
 | `icache-single` | `RunScheduler` 完成后，每 worker 做 cold/warm 配对试验；64 KiB sweep 或目标预热在目标 gate 外 | 标定受控单次 CNT7 miss 的一阶等效时间 |
-| `submit-all` | 每 worker 通过启动屏障后，在首次 PA 参数构造前 start，最后一次 Submit 返回后 stop | 累计 orchestration、Submit 和模拟 kernel NOP |
+| `submit-all` | 每 worker 通过启动屏障后，在首次 PA 参数构造前 start，最后一次 Submit 返回后 stop | 累计 orchestration、Submit，以及本 worker 在窗口内执行的 NOP 或真实引擎计算 |
 
 `submit-all` 不含启动屏障，也不含 `replay_done`、最终 drain、末尾 ClockBaseline
 或 PMU 结果发布。它是 **每 worker 从 orchestration 初始化前到本核最后一次 Submit
 返回后的累计窗口**，不是全局“最早 `Submit.begin` 到最晚 `Submit.end`”墙钟 span。
 
 每次 `metrics_prof_start/stop()` 都带 `PIPE_ALL` 流水屏障。该屏障用于明确门控边界，
-也会收口流水并可能改变多核到达时序；因此 PMU 样本只能与相同 gate、相同 NOP、
-相同构建配置的样本比较，不能把它当成无观察开销的端到端基线。当前模拟 QK/SF/PV/UP
-的 NOP 循环实际在 scalar 上执行，`submit-all` 会把它计入 scalar 相关事件；这与真实
-Vector/Cube task 运行时 scalar 等待的状态并不等价，所以 sidecar 不声称是绝对的
-真实 PA profile。
+也会收口流水并可能改变多核到达时序；因此 PMU 样本只能与相同 gate、相同负载模式、
+相同构建配置的样本比较，不能把它当成无观察开销的端到端基线。`scalar-nop` 的循环
+实际在 scalar 上执行并计入 scalar 事件；CCEC `real-compute` 则真实激活 Cube/Vector
+及其搬运流水。两种口径不能混比，且 standalone sidecar 都不声称是完整真实 PA profile。
 
 `icache-single` 的可执行标定命令为：
 
@@ -495,6 +547,16 @@ mkdir -p "$OUT"
   --pmu-json "$OUT/pmu_submit_all.json"
 ```
 
+上述命令没有选择 winner 模式，采集的是默认 `scalar-nop`。验证真实引擎计数时
+必须显式写出模式和次数，例如已用于 count 倍增取证的 b8 命令：
+
+```bash
+./run.sh run ccec \
+  --device 0 --batches 8 --runs 1 --no-swimlane \
+  --winner-workload real-compute --real-compute-count 1 \
+  --pmu-window submit-all --pmu-json "$OUT/pmu_real_b8_count1.json"
+```
+
 `--pmu-json` 只允许 CCEC 的非 off 窗口并强制 `--runs 1`。正式 JSON 还要求
 `--no-swimlane`，且不能同时开启 `--trace-atomics`、`--profile-phases`、
 `--analyze-swimlane` 或 `--swimlane-json`。已有目标文件或同名 `.tmp` 会被拒绝，
@@ -508,8 +570,9 @@ record write、无 atomic trace、无 profile accumulation”。因此该模式�
 
 JSON 包含：
 
-- `capture/configuration/validation`：采集边界、NOP 配置、`PIPE_ALL` 门控语义、九个
-  selector、计数器位宽、实际 start/stop、96 条记录可信性及可编程 counter 风险门槛；
+- `capture/configuration/validation`：采集边界、winner mode/count/unit/角色引擎映射、
+  `PIPE_ALL` 门控语义、九个 selector、计数器位宽、实际 start/stop、96 条记录可信性
+  及可编程 counter 风险门槛；real-compute 还记录数值输出与 placement/引擎闭合门禁；
 - `owner`：Main AICPU Path-A、配置 bitmap、AIC/AIV 数量、完整 triplet 和 Restore
   结果；
 - `records`：每 worker 的物理子核 id、role、block/lane、原始 CNT0..8 和 total，
@@ -529,7 +592,8 @@ JSON 包含：
 正式观察保留三类互不混用的样本：关闭所有诊断的性能 golden、PMU-only
 `submit-all` sidecar、Atomic-trace-only 泳道。PMU sidecar 只有整个窗口的每核累计，
 没有可与单条 Atomic span 对齐的子窗口；不能把 AIC/AIV 平均 miss rate 回填成
-泳道中某条 atomic 的属性。优化前后需保持相同源码观察布局、NOP 和 owner 配置，
+泳道中某条 atomic 的属性。优化前后需保持相同源码观察布局、winner mode/count 和
+owner 配置，
 并用多个独立进程交错 A/B。
 
 #### 2026-07-18 上板验收样本
@@ -567,7 +631,8 @@ PMU-only 验收。Submit span 为 3,688.236/4,089.057/4,673.237 us，中位数
 | 64 trials/core × 10 | 86.596（86.532～86.792）ns/miss | 85.913（85.848～86.202）ns/miss | 86.938（86.861～87.086）ns/miss |
 | 128 trials/core × 5 | 89.629（89.615～89.648）ns/miss | 92.100（91.984～92.267）ns/miss | 88.410（88.310～88.440）ns/miss |
 
-同一时段重跑 64 与 128 trials 时，ALL 都约为 89.6 ns/miss。64-trial 样本中
+同一时段的 64 与 128 trials，ALL 分别约为 86.6 与 89.6 ns/miss。统一取 90
+只是便于总量级归因的保守取整，不是把两组实测改写成同一精确常数。64-trial 样本中
 AIV 略高，128-trial 样本中则 AIC 更高；角色差值方向并不稳定，不建立
 AIC/AIV 精确常数。只做总量级归因时，统一取整为：
 
@@ -637,13 +702,47 @@ HeapGuard 只有 0 至 3 次偶发等待。当前主要
 可靠的 PA 语义模拟。当前选择是保持源级协议和 ABI 对等，坦诚记录约
 0.1 至 0.4 ms 的后端/冷热差异，不用虚假 NOP 填平调度阶段。
 
+### 6.1 2026-07-18 CCEC 真实计算阶段结果
+
+CCEC `real-compute` 已按“构建门禁 → b1 数值 → b256 标定 → PMU 倍增 →
+泳道元数据”的顺序上板闭环：
+
+- 最终 b256 默认 `6,28,4,1` 的 Submit 为 3,683.649 us，全部协议与
+  192 个 active output tile 数值断言通过；此前三个独立进程 Submit 为
+  3,808/3,555/3,706 ms，中位数 3.706 ms；
+- b8、四类 count=1 时，Submit 窗口内 29 个 EfDrain 恰好对应 14 个非零
+  AIC Cube worker 和 15 个非零 AIV Vector worker；AIC 每个 `cube_busy=8281`，
+  AIV 每个 `vector_busy=936/937`；
+- 独立 count=2 样本的 placement 为 28 个 EfDrain、4 个 FinalDrain，14 个 AIC
+  和 14 个 AIV worker 的非零计数档位分别为 16562 与 1872/1874，恰为 count=1
+  档位的两倍。获胜核会随调度变化，不能把两轮强行按同一 worker 配对；
+- `submit-all` 明确排除 FinalDrain，所以 count1/count2 分别落在 FinalDrain 的
+  3/4 个 kernel 不应出现在该窗口的引擎 PMU 中。每轮都由 placement 与非零引擎
+  worker 数量闭合；
+- scalar-NOP 与 real-compute 使用同一个最终 ELF 分别跑 b1，避免把代码布局变化
+  误判为负载效果；最终 ELF 只暴露两个 mixed kernel 全局入口，冷路径 dispatcher
+  以及 Cube/add/mul 三个执行 helper 均为非空 LOCAL 函数；
+- real-compute b1 泳道 raw/merged 均记录 mode、`6,28,4,1`、完整迭代单位和
+  QK/PV=Cube、SF/UP=Vector 的映射；4964 条 raw data event 转换为 4965 条
+  data event（多一条 capture instant），最终 `traceEvents` 还含 256 条
+  process/thread metadata，共 5221 条，且无 dropped record。
+
+这组结果证明 standalone CCEC 的显式 `real-compute` 模式已不再用 scalar NOP
+冒充 winner 计算，并能从
+数值、角色、PMU 和泳道四个方向闭环。它不证明 AscendC/CPU 已迁移，也不证明
+standalone 的 3.7 ms 应等于真实 PA 的 5.1 ms；真实引擎并行正是两者时序口径
+发生变化的原因之一。
+
 ## 7. 内存占用和脱仓复制
 
 为保持真实 DistGlobal/DistCore 偏移、65,536 个 task cell、每 worker payload
 和 TensorMap，当前 `WorkerResult` 为 832 bytes，用当前头文件实际编译得到的
-`SchedulerState` 为 1,007,104,832 bytes。默认泳道缓冲区另占
-402,660,160 bytes，所以 A5 device 侧总计约 1.31 GiB，host 侧也需分配相近
-内存。`smoke` 不缩小 State；只有 `--no-swimlane` 能省去泳道缓冲区。
+`SchedulerState` 为 1,007,104,896 bytes。新增的 64 bytes 是独立、对齐的
+winner workload 配置 cache line，生产 DistGlobal/DistCore 关键偏移保持不变。
+默认泳道缓冲区另占 402,660,160 bytes；CCEC `real-compute` 还分配
+12,713,984 bytes workspace。因此 scalar-nop+trace 的 A5 device 占用约
+1.313 GiB，real-compute+trace 约 1.325 GiB，host 侧也需分配相近内存。
+`smoke` 不缩小 State；只有 `--no-swimlane` 能省去泳道缓冲区。
 256 batch 的正常采集约有 86 万条事件；原始 JSON 和 merged JSON 都可能达到
 数十至数百 MiB。writer 与 converter 都使用临时文件后原子替换，失败时不会把
 半截文件冒充完整产物。

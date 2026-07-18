@@ -10,15 +10,21 @@
  */
 
 #include "cce_aicore_intrinsics.h"
+#include <pto/common/constants.hpp>
 #include <pto/common/kernel_meta.hpp>
+#include <pto/common/pto_tile.hpp>
+#include <pto/pto-inst.hpp>
 
 #include "pmu_probe.h"
+#include "winner_workload.h"
 
 #define PA_DEVICE __aicore__ inline
 #define PA_GM __gm__
 #include "../common/pa_scheduler_core.h"
 
 namespace {
+
+using namespace pto;
 
 template <uint32_t Count>
 __aicore__ inline void EmitNops() {
@@ -44,6 +50,166 @@ __aicore__ inline void RuntimeNop(uint32_t count) {
     if ((count & 2U) != 0) EmitNops<2>();
     if ((count & 1U) != 0) EmitNops<1>();
     __builtin_cce_pipe_barrier(PIPE_ALL);
+}
+
+#if defined(PA_BUILD_AIC)
+// QK/PV 的首版真实负载使用完整的 128x128 float cube 路径。输入来自独立 GM
+// workspace，输出属于当前 worker；每次迭代都等 FIX 写回 GM 后再复用 L0C，
+// 因而函数返回就是该模拟 task 的完成边界，而不是单纯的指令发射边界。
+static __aicore__ __attribute__((noinline, used)) void pa_real_cube_workload_aic(
+    __gm__ float *input_a, __gm__ float *input_b, __gm__ float *output, uint32_t repeats
+) {
+    constexpr int kTile = static_cast<int>(pa_scheduler::ccec_workload::kTileRows);
+    constexpr int kBlockAlign = C0_SIZE_BYTE / sizeof(float);
+    static_assert(kTile % 16 == 0, "cube M must be 16-aligned");
+    static_assert(kTile % kBlockAlign == 0, "cube K/N must satisfy C0 alignment");
+
+    using GlobalData = GlobalTensor<
+        float, Shape<1, 1, 1, kTile, kTile>,
+        pto::Stride<kTile * kTile, kTile * kTile, kTile * kTile, kTile, 1>>;
+    using TileMatA = Tile<
+        TileType::Mat, float, kTile, kTile, BLayout::ColMajor,
+        kTile, kTile, SLayout::RowMajor, 512>;
+    using TileMatB = Tile<
+        TileType::Mat, float, kTile, kTile, BLayout::ColMajor,
+        kTile, kTile, SLayout::RowMajor, 512>;
+    using LeftTile = TileLeft<float, kTile, kTile, kTile, kTile>;
+    using RightTile = TileRight<float, kTile, kTile, kTile, kTile>;
+    using AccTile = TileAcc<float, kTile, kTile, kTile, kTile>;
+
+    GlobalData input_a_global(input_a);
+    GlobalData input_b_global(input_b);
+    GlobalData output_global(output);
+    TileMatA input_a_mat;
+    TileMatB input_b_mat;
+    LeftTile input_a_l0;
+    RightTile input_b_l0;
+    AccTile output_l0;
+    TASSIGN(input_a_mat, 0x0);
+    TASSIGN(input_b_mat, 0x20000);
+    TASSIGN(input_a_l0, 0x0);
+    TASSIGN(input_b_l0, 0x0);
+    TASSIGN(output_l0, 0x0);
+
+    for (uint32_t iteration = 0; iteration < repeats; ++iteration) {
+        TLOAD(input_a_mat, input_a_global);
+        TLOAD(input_b_mat, input_b_global);
+        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+        TMOV(input_a_l0, input_a_mat);
+        TMOV(input_b_l0, input_b_mat);
+        set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+        wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+        TMATMUL(output_l0, input_a_l0, input_b_l0);
+        set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+        wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+        TSTORE(output_global, output_l0);
+        set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
+        wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
+    }
+}
+#elif defined(PA_BUILD_AIV)
+template <bool Multiply>
+__aicore__ inline void RunRealVectorWorkload(
+    __gm__ float *input_a, __gm__ float *input_b, __gm__ float *output, uint32_t repeats
+) {
+    constexpr int kRows = static_cast<int>(pa_scheduler::ccec_workload::kTileRows);
+    constexpr int kCols = static_cast<int>(pa_scheduler::ccec_workload::kTileCols);
+    using GlobalData = GlobalTensor<
+        float, Shape<1, 1, 1, kRows, kCols>, pto::Stride<1, 1, 1, kCols, 1>>;
+    using TileData = Tile<
+        TileType::Vec, float, kRows, kCols, BLayout::RowMajor, -1, -1>;
+
+    GlobalData input_a_global(input_a);
+    GlobalData input_b_global(input_b);
+    GlobalData output_global(output);
+    TileData input_a_tile(kRows, kCols);
+    TileData input_b_tile(kRows, kCols);
+    TileData output_tile(kRows, kCols);
+    TASSIGN(input_a_tile, 0x0);
+    TASSIGN(input_b_tile, 0x10000);
+    TASSIGN(output_tile, 0x20000);
+
+    for (uint32_t iteration = 0; iteration < repeats; ++iteration) {
+        TLOAD(input_a_tile, input_a_global);
+        TLOAD(input_b_tile, input_b_global);
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        if constexpr (Multiply) {
+            TMUL(output_tile, input_a_tile, input_b_tile);
+        } else {
+            TADD(output_tile, input_a_tile, input_b_tile);
+        }
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        TSTORE(output_global, output_tile);
+        set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+        wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+    }
+}
+
+static __aicore__ __attribute__((noinline, used)) void pa_real_vector_add_workload_aiv(
+    __gm__ float *input_a, __gm__ float *input_b, __gm__ float *output, uint32_t repeats
+) {
+    RunRealVectorWorkload<false>(input_a, input_b, output, repeats);
+}
+
+static __aicore__ __attribute__((noinline, used)) void pa_real_vector_mul_workload_aiv(
+    __gm__ float *input_a, __gm__ float *input_b, __gm__ float *output, uint32_t repeats
+) {
+    RunRealVectorWorkload<true>(input_a, input_b, output, repeats);
+}
+#endif
+
+// 整段真实负载分派保持为 LOCAL noinline 冷路径，避免 workspace 校验、地址计算和
+// kind 分支膨胀 scalar-NOP 的 Submit 热代码；正常 NOP 对照只多一次 mode 判断。
+static __aicore__ __attribute__((noinline, used)) void pa_execute_real_winner_workload(
+    __gm__ pa_scheduler::SchedulerState *state, __gm__ pa_scheduler::WorkerState &worker,
+    pa_scheduler::TaskKind kind
+) {
+    const uint64_t workspace = state->winner_workload.workspace_base;
+    const uint32_t repeats = pa_scheduler::WorkloadCountForKind(
+        state->winner_workload.repeats, kind
+    );
+    // 错版 host、截断 workspace 或越界 worker 不能继续解引用 GM。这里不额外
+    // 写共享 fatal，避免在正常热路增加 atomic；host 的逐 kind sentinel/数值
+    // 闭环会把这种配置错误判为失败。
+    if (state->winner_workload.version != pa_scheduler::kWinnerWorkloadConfigVersion ||
+        workspace == 0 ||
+        state->winner_workload.workspace_bytes < pa_scheduler::ccec_workload::kWorkspaceBytes ||
+        worker.core_idx < 0 || static_cast<uint32_t>(worker.core_idx) >= pa_scheduler::kWorkers ||
+        repeats == 0 || repeats > pa_scheduler::ccec_workload::kMaxRealComputeCount) {
+        return;
+    }
+#if defined(PA_BUILD_AIC)
+    if (kind != pa_scheduler::TaskKind::Qk && kind != pa_scheduler::TaskKind::Pv) return;
+#elif defined(PA_BUILD_AIV)
+    if (kind != pa_scheduler::TaskKind::Sf && kind != pa_scheduler::TaskKind::Up) return;
+#endif
+    __gm__ float *input_a = reinterpret_cast<__gm__ float *>(workspace);
+    __gm__ float *input_b = reinterpret_cast<__gm__ float *>(
+        workspace + pa_scheduler::ccec_workload::kTileBytes
+    );
+    const uint32_t kind_slot =
+        (kind == pa_scheduler::TaskKind::Pv || kind == pa_scheduler::TaskKind::Up) ? 1U : 0U;
+    const uint32_t output_tile =
+        pa_scheduler::ccec_workload::kSharedInputTiles +
+        static_cast<uint32_t>(worker.core_idx) *
+            pa_scheduler::ccec_workload::kOutputTilesPerWorker +
+        kind_slot;
+    __gm__ float *output = reinterpret_cast<__gm__ float *>(
+        workspace + static_cast<uint64_t>(output_tile) *
+            pa_scheduler::ccec_workload::kTileBytes
+    );
+#if defined(PA_BUILD_AIC)
+    pa_real_cube_workload_aic(input_a, input_b, output, repeats);
+#elif defined(PA_BUILD_AIV)
+    if (kind == pa_scheduler::TaskKind::Sf) {
+        pa_real_vector_add_workload_aiv(input_a, input_b, output, repeats);
+    } else {
+        pa_real_vector_mul_workload_aiv(input_a, input_b, output, repeats);
+    }
+#endif
 }
 
 #if defined(PA_BUILD_AIC)
@@ -138,7 +304,17 @@ struct CcecOps {
         return cycle;
     }
 
-    __aicore__ static inline void Nop(uint32_t count) { RuntimeNop(count); }
+    __aicore__ static inline void ExecuteKernel(
+        __gm__ pa_scheduler::SchedulerState *state, __gm__ pa_scheduler::WorkerState &worker,
+        pa_scheduler::TaskKind kind, uint32_t nop_count
+    ) {
+        const auto mode = static_cast<pa_scheduler::WinnerWorkloadMode>(state->winner_workload.mode);
+        if (mode != pa_scheduler::WinnerWorkloadMode::RealCompute) {
+            RuntimeNop(nop_count);
+            return;
+        }
+        pa_execute_real_winner_workload(state, worker, kind);
+    }
 
     __aicore__ static inline bool PmuWindowStart(
         __gm__ pa_scheduler::SchedulerState *state, uint32_t worker_id

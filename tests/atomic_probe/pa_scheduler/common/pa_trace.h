@@ -35,13 +35,15 @@ struct TraceContext {
 };
 
 // Attach 只缓存本 worker 的 header 状态、分区首址和物理 lane 信息。配置先做
-// cache invalidate，确保 A5 worker 看到 host 在 launch 前写入的 trace 开关与地址。
+// cache invalidate，确保 A5 worker 看到 host 在 launch 前写入的 trace 开关、地址与 winner 负载配置。
 template <typename Ops>
 PA_DEVICE TraceContext AttachTrace(
     PA_GM SchedulerState *state, PA_GM const WorkerState &worker, uint32_t worker_id
 ) {
     TraceContext trace{nullptr, nullptr, 0, false, worker.lane, worker.block_id, static_cast<int32_t>(worker_id)};
-    Ops::InvalidateRegion(&state->config, sizeof(state->config));
+    Ops::InvalidateRegion(
+        &state->config, sizeof(state->config) + sizeof(state->winner_workload)
+    );
     const uint64_t base = state->config.trace_base;
     const uint32_t capacity = state->config.trace_records_per_core;
     if ((state->config.trace_enabled & kTracePhasesEnabled) == 0 || base == 0 || capacity == 0 ||

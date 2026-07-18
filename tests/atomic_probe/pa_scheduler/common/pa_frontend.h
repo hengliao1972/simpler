@@ -17,7 +17,8 @@
 namespace pa_scheduler {
 
 // 这些基址只充当稳定的 tensor identity，供 descriptor、区间重叠和 heap 地址
-// 计算使用；NOP kernel 不读取其中的数据。context_lens 是唯一按真实 GM 指针读取的输入。
+// 计算使用；winner workload 不解引用这些 synthetic 地址，real-compute 使用独立
+// workspace。context_lens 是唯一按真实 GM 指针读取的 PA 前端输入。
 constexpr uint64_t kInvalidTaskId = UINT64_MAX;
 constexpr uint64_t kSyntheticQueryBase = 0x200000000ULL;
 constexpr uint64_t kSyntheticKeyBase = 0x300000000ULL;
@@ -236,7 +237,7 @@ PA_DEVICE TensorArgType TaskTag(const TaskArgs &args, uint32_t index) {
 
 PA_DEVICE void ClearDumpArgSelection(PaDumpArgSelection &selection) {
     // Volatile stores intentionally preserve the profiling-enabled PA reset
-    // traffic even when the standalone NOP kernels never consume dump data.
+    // traffic even though the standalone winner workload never consumes dump data.
     // volatile 的目的不是同步，而是阻止编译器删掉这段生产基线中存在的写流量。
     volatile uint64_t *masks = &selection.dump_arg_mask;
     masks[0] = 0;

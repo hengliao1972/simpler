@@ -54,6 +54,21 @@ PA_DEVICE uint32_t NopCountForKind(PA_GM const NopCounts &nops, TaskKind kind) {
     }
 }
 
+PA_DEVICE uint32_t WorkloadCountForKind(PA_GM const WorkloadCounts &counts, TaskKind kind) {
+    switch (kind) {
+        case TaskKind::Qk:
+            return counts.qk;
+        case TaskKind::Sf:
+            return counts.sf;
+        case TaskKind::Pv:
+            return counts.pv;
+        case TaskKind::Up:
+            return counts.up;
+        default:
+            return 0;
+    }
+}
+
 PA_DEVICE uint32_t CountBits(uint32_t value) {
     uint32_t count = 0;
     while (value != 0) {
@@ -189,7 +204,7 @@ PA_DEVICE uint32_t DrainReady(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker, DrainPlace place, LocalStats &stats
 ) {
     // 同一套 drain 被三个位置复用：每次 Submit 开头的 EfDrain、ring 背压等待和所有 Submit 后的最终 drain。
-    // slot 属于当前 worker；只有其全部跨核 fanin 已 ready 时才执行 NOP 模拟的 kernel、发布完成并释放 slot。
+    // slot 属于当前 worker；只有其全部跨核 fanin 已 ready 时才执行所选 winner 负载、发布完成并释放 slot。
     if (worker.occupied_count == 0) {
         return 0;
     }
@@ -202,7 +217,7 @@ PA_DEVICE uint32_t DrainReady(
         }
         const TaskKind kind = static_cast<TaskKind>(slot.kind + 1);
         const uint64_t kernel_begin = Ops::Now();
-        Ops::Nop(NopCountForKind(state->config.nops, kind));
+        Ops::ExecuteKernel(state, worker, kind, NopCountForKind(state->config.nops, kind));
         const uint64_t kernel_end = Ops::Now();
         WriteTrace<false>(
             stats.trace, stats.result, static_cast<int32_t>(slot.task_id), static_cast<int32_t>(slot.kind),

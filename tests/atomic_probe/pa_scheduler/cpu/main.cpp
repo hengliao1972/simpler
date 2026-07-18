@@ -129,7 +129,12 @@ struct CpuOps {
         return Now();
     }
 
-    static inline void Nop(uint32_t count) { RuntimeNop(count); }
+    static inline void ExecuteKernel(
+        pa_scheduler::SchedulerState *, pa_scheduler::WorkerState &, pa_scheduler::TaskKind,
+        uint32_t nop_count
+    ) {
+        RuntimeNop(nop_count);
+    }
 
     static inline bool PmuWindowStart(pa_scheduler::SchedulerState *, uint32_t) { return false; }
 
@@ -240,7 +245,12 @@ int main(int argc, char **argv) {
                 break;
             }
             if (!pa_scheduler::host::ExportSwimlaneRecords(
-                    *trace_header, options.swimlane_json, read_trace_records
+                    *trace_header, options.swimlane_json,
+                    pa_scheduler::WinnerWorkloadMode::ScalarNop,
+                    pa_scheduler::WorkloadCounts{
+                        options.nops.qk, options.nops.sf, options.nops.pv, options.nops.up
+                    },
+                    read_trace_records
                 )) {
                 postprocess_ok = false;
                 break;
