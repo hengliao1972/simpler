@@ -407,12 +407,22 @@ template <typename ReadRecords>
 inline bool ExportSwimlaneRecords(
     const TraceHeader &header, const std::string &output_path,
     WinnerWorkloadMode workload_mode, const WorkloadCounts &workload_counts,
-    ReadRecords read_records
+    const char *workload_pattern, ReadRecords read_records
 ) {
     if (!ValidateTraceHeader(header, "swimlane export")) return false;
     if (workload_mode != WinnerWorkloadMode::ScalarNop &&
         workload_mode != WinnerWorkloadMode::RealCompute) {
         std::fprintf(stderr, "swimlane export rejected invalid winner workload mode.\n");
+        return false;
+    }
+    const bool real_compute = workload_mode == WinnerWorkloadMode::RealCompute;
+    const bool pattern_valid = workload_pattern != nullptr &&
+        ((real_compute &&
+          (std::strcmp(workload_pattern, "constant") == 0 ||
+           std::strcmp(workload_pattern, "layout-diagnostic") == 0)) ||
+         (!real_compute && std::strcmp(workload_pattern, "none") == 0));
+    if (!pattern_valid) {
+        std::fprintf(stderr, "swimlane export rejected invalid winner workload input pattern.\n");
         return false;
     }
 
@@ -438,13 +448,15 @@ inline bool ExportSwimlaneRecords(
         "\"trace_schema_version\":2,"
         "\"winner_workload\":{\"mode\":\"%s\","
         "\"counts\":{\"qk\":%u,\"sf\":%u,\"pv\":%u,\"up\":%u},"
-        "\"unit\":\"%s\",\"engine_mapping\":%s},\"core_types\":[",
+        "\"unit\":\"%s\",\"input_pattern\":\"%s\","
+        "\"engine_mapping\":%s},\"core_types\":[",
         static_cast<unsigned long long>(header.frequency_hz), kWorkers,
         workload_mode == WinnerWorkloadMode::RealCompute ? "real-compute" : "scalar-nop",
         workload_counts.qk, workload_counts.sf, workload_counts.pv, workload_counts.up,
         workload_mode == WinnerWorkloadMode::RealCompute
             ? "complete_128x128_engine_pipeline_iteration"
             : "scalar_nop_instruction",
+        workload_pattern,
         workload_mode == WinnerWorkloadMode::RealCompute
             ? "{\"qk\":\"cube_matmul\",\"sf\":\"vector_add\","
               "\"pv\":\"cube_matmul\",\"up\":\"vector_mul\"}"

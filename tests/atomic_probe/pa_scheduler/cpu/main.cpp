@@ -259,7 +259,8 @@ int main(int argc, char **argv) {
             std::fprintf(
                 stderr,
                 "CPU winner workload options: [--winner-workload scalar-nop|real-compute] "
-                "[--real-compute-count N | --real-compute-counts QK,SF,PV,UP]\n"
+                "[--real-compute-count N | --real-compute-counts QK,SF,PV,UP] "
+                "[--real-compute-pattern constant|layout-diagnostic]\n"
             );
         }
         return parse_status == pa_scheduler::host::ParseStatus::Help ? EXIT_SUCCESS : EXIT_FAILURE;
@@ -300,9 +301,9 @@ int main(int argc, char **argv) {
         pa_scheduler::host::ConfigureTrace(state.get(), options, trace_memory);
         if (real_compute) {
             // runs>1 必须恢复所有输出 sentinel，避免上一轮 winner 的 tile 被误认
-            // 为本轮结果；输入也由公共 helper 恢复成与设备后端相同的 2/3。
+            // 为本轮结果；输入也由公共 helper 恢复成与设备后端相同的选定 pattern。
             pa_scheduler::host::InitializeWinnerWorkloadBuffers(
-                &workload_image, &workload_outputs
+                workload_options, &workload_image, &workload_outputs
             );
         }
         pa_scheduler::host::ConfigureWinnerWorkload(
@@ -358,7 +359,7 @@ int main(int argc, char **argv) {
         );
         const bool workload_passed =
             !real_compute || pa_scheduler::host::ValidateRealComputeOutputs(
-                *state, workload_outputs, run
+                *state, workload_options, workload_outputs, run
             );
         all_passed &= metrics.passed && workload_passed;
         spans.push_back(metrics.submit_span_us);
@@ -386,6 +387,9 @@ int main(int argc, char **argv) {
                         : pa_scheduler::WorkloadCounts{
                               options.nops.qk, options.nops.sf, options.nops.pv, options.nops.up
                           },
+                    real_compute
+                        ? pa_scheduler::host::RealComputePatternName(workload_options.pattern)
+                        : "none",
                     read_trace_records
                 )) {
                 postprocess_ok = false;

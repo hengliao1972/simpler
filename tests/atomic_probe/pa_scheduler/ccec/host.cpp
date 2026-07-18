@@ -896,6 +896,11 @@ bool ExportPmuJson(
         options.profile_phases ? "true" : "false"
     );
     WriteJsonString(output, WinnerWorkloadModeName(workload.mode));
+    std::fputs(",\"input_pattern\":", output);
+    WriteJsonString(
+        output,
+        real_compute ? pa_scheduler::host::RealComputePatternName(workload.pattern) : "none"
+    );
     std::fprintf(
         output,
         ",\"config_version\":%u,\"counts\":{\"qk\":%u,\"sf\":%u,\"pv\":%u,\"up\":%u},"
@@ -1194,7 +1199,8 @@ int main(int argc, char **argv) {
             std::fprintf(
                 stderr,
                 "CCEC winner workload options: [--winner-workload scalar-nop|real-compute] "
-                "[--real-compute-count N | --real-compute-counts QK,SF,PV,UP]\n"
+                "[--real-compute-count N | --real-compute-counts QK,SF,PV,UP] "
+                "[--real-compute-pattern constant|layout-diagnostic]\n"
             );
         }
         return parse_status == pa_scheduler::host::ParseStatus::Help ? EXIT_SUCCESS : EXIT_FAILURE;
@@ -1240,7 +1246,7 @@ int main(int argc, char **argv) {
     std::vector<float> workload_outputs;
     if (real_compute) {
         pa_scheduler::host::InitializeWinnerWorkloadBuffers(
-            &workload_image, &workload_outputs
+            workload_options, &workload_image, &workload_outputs
         );
     }
     pa_scheduler::host::PrintBanner("CCEC", options);
@@ -1504,7 +1510,9 @@ int main(int argc, char **argv) {
         );
         all_passed &= metrics.passed;
         const bool workload_passed =
-            !real_compute || ValidateRealComputeOutputs(*state, workload_outputs, run);
+            !real_compute || ValidateRealComputeOutputs(
+                *state, workload_options, workload_outputs, run
+            );
         all_passed &= workload_passed;
         PmuValidation pmu_validation;
         const bool pmu_passed = ValidatePmu(
@@ -1549,6 +1557,9 @@ int main(int argc, char **argv) {
                         : pa_scheduler::WorkloadCounts{
                               options.nops.qk, options.nops.sf, options.nops.pv, options.nops.up
                           },
+                    real_compute
+                        ? pa_scheduler::host::RealComputePatternName(workload_options.pattern)
+                        : "none",
                     read_trace_records
                 )) {
                 postprocess_ok = false;

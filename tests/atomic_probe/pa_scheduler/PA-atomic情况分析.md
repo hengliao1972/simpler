@@ -338,10 +338,12 @@ span，或单独定义 `Submit.end - Build/Replay/Alloc.end` 为 action tail。
 - 单 lane Case1 的 BlockWon 动态次数为零，以及真实泳道记录格式。
 
 QK/SF/PV/UP 默认仍可由可控 scalar NOP 模拟，旧默认值按本文最好真实泳道的
-44.170/53.729/27.626/1.565 us 校准。2026-07-18 起 CCEC 另提供显式
-`real-compute`：QK/PV 运行真实 Cube matmul，SF/UP 运行真实 Vector add/mul，
-每轮都含 GM load、计算、GM store 和完成等待；AscendC/CPU 尚按独立阶段迁移。
-两种模式都不会在 Claim、Register、PrepareMap 或等待路径中硬补 5 ms。
+44.170/53.729/27.626/1.565 us 校准。2026-07-18 起三后端均提供显式
+`real-compute`：CCEC/AscendC 的 QK/PV 运行真实 Cube matmul，SF/UP 运行
+真实 Vector add/mul，每轮都含 GM load、计算、GM store 和完成等待；
+CPU 使用相同 workspace、角色路由和数学运算做协议回归，不代表 A5 引擎时间或
+PMU。两种模式都不会在 Claim、Register、PrepareMap 或等待路径中硬补
+5 ms。
 
 当前严格校验覆盖 73,728 次 Claim、每 task 唯一 winner、1,024 个 kernel、
 TensorMap/heap 最终状态、fanin、flag、vend、frontier、cursor、ring placement
@@ -1378,6 +1380,129 @@ QK/PV=Cube、SF/UP=Vector 映射，并增加可见的全局 capture metadata 事
 data event（增加一条 capture instant），再加 256 条 process/thread metadata，
 最终 `traceEvents` 为 5221 条，`dropped=0`。转换器含旧 schema 兼容在内为 5/5 PASS。
 
-阶段边界：本节只证明 CCEC standalone 的真实引擎负载、数值、角色、PMU 与
-泳道闭环。AscendC 真实计算、CPU 等价算术必须继续按后端分步实现和验证；在它们
-完成前，不能宣称三后端 winner 负载已经对等，更不能直接迁移真实 PA。
+当时的阶段边界：提交 `e66001ff` 只证明 CCEC standalone 的真实引擎负载、
+数值、角色、PMU 与泳道闭环；当时 AscendC 真实计算和 CPU 对等算术尚未完成，
+因此本阶段没有宣称三后端 winner 负载已经对等，也没有迁移真实 PA。
+后续完成情况分别记录在 7.5.10 和 7.5.11。
+
+#### 7.5.10 AscendC winner 负载迁移到真实 Cube/Vector
+
+提交 `9aeda0dd` 在不改动 PA 调度模型的前提下，把 CCEC 已验证的
+winner workload 布局、参数解析和 host 数值校验抽到三后端共用头文件，然后
+在 AscendC mixed kernel 内分角色接入真实计算：
+
+1. AIC 上的 QK/PV 执行 `128x128 float` matmul，路径为 GM ND 到
+   A1/B1 的 NZ 布局、A1/B1 到 A2/B2、`Mmad`、FIX 回写 GM；
+   `MTE2_MTE1`、`MTE1_M`、`M_FIX` 和最后的 `FIX_S` 保证 Kernel span
+   包住本轮回写完成边界；
+2. AIV 上的 SF/UP 执行 GM 到 UB、`Add`/`Mul`、UB 到 GM，并用
+   `MTE2_V`、`V_MTE3`、`MTE3_S` 等待完整的 load/Vector/store 流水；
+3. 12,713,984-byte workspace、输入 2/3、输出 768/5/6、每 worker-kind
+   独占 tile 和 inactive sentinel 与 CCEC 共用同一个口径。H2D 初始化在
+   launch 计时前，D2H 与数值校验在计时后，不把 host 搬运写入 Submit span。
+
+首个 AIC 版本的数值闭环暴露了真实错误：A1 和 B1 虽然是不同逻辑位置，
+但映射到同一块物理 L1；两个 64 KiB tile 都从地址 0 开始时，后搬入的 B
+覆盖 A，因而把本应为 `2 * 3 * 128 = 768` 的结果错算成
+`3 * 3 * 128 = 1152`。将 B1 起始地址错开 64 KiB 后，整个输出 tile 恢复为
+768。右矩阵 B 在 GM 中是普通 KxN row-major，所以 L1 zN 到 L0B nZ 时设置
+分形 transpose，而不是盲目复用 A 的非转置参数。当前常量 B=3 不能单独
+证明转置差异，因此本阶段先以 CANN 布局语义修正；随后再用 7.5.12 的非均匀
+输入逐元素上板闭合，没有把常量输出冒充布局证据。
+
+修正后的分层证据为：
+
+| 场景 | 参数 | Submit span | 数值/调度结果 |
+| ---- | ---- | ----------: | ---------------- |
+| b1 | count=`1,1,1,1` | 59.280 us | PASS，4 active tile + 188 sentinel tile |
+| b8 | count=`1,1,1,1` | 166.426 us | PASS，32 active tile + 160 sentinel tile |
+| b256 样本 1 | count=`6,28,4,1` | 3810.471 us | PASS，191 active tile + 1 sentinel tile |
+| b256 样本 2 | count=`6,28,4,1` | 4828.567 us | PASS，192 active tile |
+| b256 样本 3 | count=`6,28,4,1` | 3777.371 us | PASS，192 active tile |
+
+三个独立 b256 进程的 Submit span 中位数为 3810.471 us。相同三个样本中，
+QK/SF/PV/UP 的每 task 平均 Kernel span 分别约为 41.1–41.4 / 47.3–49.7 /
+27.5–28.2 / 2.5–2.7 us。这些 span 含上述引擎完成等待，但 AscendC 路径
+没有 CCEC Main AICPU PMU owner，因此不伪造 Cube/Vector busy counter，也不用
+这三轮总时间反推 scalar PMU。
+
+b1 count=1 还完成了带 atomic 的泳道闭环：4652 条 raw data event 与静态
+期望精确一致，`dropped=0`，atomic 源码边界调用为 1088。converter 增加一条
+capture instant 后有 4653 条 data event，再加 256 条 process/thread metadata，
+最终 `traceEvents=4909`。raw 和 merged 都记录 `real-compute`、`1,1,1,1`
+及 QK/PV=Cube、SF/UP=Vector 映射，数值校验也同轮 PASS。
+
+本阶段证明 AscendC standalone 已脱离 scalar NOP 执行真实 A5 Cube/Vector
+流水，且调度语义、输出和泳道闭环一致；它不是真实 PA 迁移，也不替代
+CCEC 的 PMU 取证。
+
+#### 7.5.11 CPU winner 负载补齐对等算术
+
+提交 `1d3a374a` 让 CPU 后端使用同一组 workspace、角色路由、repeat
+参数和输出校验：QK/PV 以三重浮点循环执行完整 `128x128` 矩阵乘，
+SF/UP 执行逐元素 add/mul；每个 repeat 后保留 compiler memory boundary，避免
+因为下一轮覆盖同一 tile 而被 O3 删除。每轮重新初始化 2/3 输入和输出
+sentinel，所以 `runs>1` 不会沿用上一轮 winner 结果。
+
+分层回归中，scalar-NOP b1、real-compute b1 count=`1,1,1,1` 均 PASS；
+后者 Submit span 为 39.821 ms，并校验 4 active tile + 188 sentinel tile。b8
+count=`2,3,2,1` 连续两轮也均 PASS，两轮分别为 80.310/54.185 ms，
+均校验 25 active tile + 167 sentinel tile。同时保留 CLI 互斥和边界门禁：
+real-compute 与 NOP override 不能混用，count 必须与 real-compute 模式一起使用，
+取值限制为 1..128，CCEC 专属 PMU 参数仍会被非 CCEC 后端拒绝。
+
+CPU 阶段的“对等”只包括 PA 任务调度、AIC/AIV 角色选择、workspace 编址、
+repeat 次数和 768/5/6 数学结果。CPU pthread 调度、普通浮点循环和 x86 atomic
+都不是 A5 Cube/Vector/scalar 流水；上述毫秒数据只用于证明用例实际执行完成，
+不用作 A5 timing 或 PMU 性能结论。
+
+至此，三后端的 winner workload 参数、workspace、角色路由、数学输出和
+泳道 metadata 口径已对齐；CCEC/AscendC 执行真实 A5 引擎负载，CPU 仅做
+调度与算术回归。这仍然是 standalone 验证，不能替代真实 PA 的计数闭环、
+正确性和无诊断性能 A/B。
+
+#### 7.5.12 用非均匀输入闭合 Cube/Vector 数据布局
+
+常量 A=2、B=3 能验证真实指令、角色和 GM 写回，却会同时掩盖 B 转置、
+ND/NZ stride 与分形重排错误。为把该盲区变成可重复工具，三后端公共 CLI 增加
+`--real-compute-pattern constant|layout-diagnostic`：默认仍为 `constant`，不改变
+性能基线；诊断模式只改变计时窗外的 host 输入生成和输出期望，不进入
+`SchedulerState`，也不在 CCEC/AscendC device 热路径增加分支。
+
+诊断输入定义为：
+
+```text
+A[r,c] = (r == c) ? (r + 1) : 0
+B[r,c] = 1 + ((131*r + 17*c + 7*r*c) mod 251)
+```
+
+QK/PV 的期望为 `(r+1)*B[r,c]`，SF 为 `A[r,c]+B[r,c]`，UP 为
+`A[r,c]*B[r,c]`。B 是非对称稠密矩阵，A 是带权对角矩阵，因此 B 转置、A 行映射、
+stride 或输出重排都会在确定元素上产生不同整数；最大结果不超过 32128，FP32
+可做逐元素精确比较而无需容差。
+
+严格按 CCEC → AscendC → CPU 顺序，以 b1、count=`1,1,1,1` 上板/运行：
+
+| 后端 | Submit span | QK/SF/PV/UP Kernel span | 输出门禁 |
+| ---- | ----------: | ----------------------- | -------- |
+| CCEC | 37.682 us | 9.172 / 3.819 / 7.415 / 2.512 us | 4 active + 188 sentinel，PASS |
+| AscendC | 55.041 us | 8.478 / 4.211 / 20.801 / 3.008 us | 4 active + 188 sentinel，PASS |
+| CPU | 51.958 ms | 3.457 ms / 26.118 us / 3.390 ms / 17.349 us | 4 active + 188 sentinel，PASS |
+
+CCEC 先证明公共期望与 PTO `A*B` 语义正确；随后 AscendC 使用同一输入通过，直接
+闭合了 A1/B1 错位、普通 KxN B 的 zN→nZ 分形 transpose、ND/NZ stride 和
+FIXPIPE NZ→ND 输出。CPU 只证明 host 公式与调度路由，不把毫秒值外推到 A5。
+三后端又以 `pattern=constant` 做 b1 count1 回归，并以 `smoke all` 回归原
+scalar-NOP，均 PASS，说明诊断模式没有静默改变性能默认或旧控制路径。
+
+AscendC 同模式泳道位于
+`outputs/pa_scheduler_swimlane_20260718_125904_3613100/ascendc/`，raw 为
+4584 条 data event、`dropped=0`，merged 增加一条 capture instant；raw/merged
+的 `metadata.winner_workload.input_pattern` 都是 `layout-diagnostic`。CCEC 的
+`submit-all` PMU sidecar 同样记录该字段，且 `accepted=true`、
+`semantic_passed=true`。converter 对新字段保留旧 schema-v2 兼容，并新增非法
+pattern 拒绝回归，当前两种 unittest 入口均为 6/6 PASS。
+
+该诊断证明一次完整 engine pipeline 的数学和布局，不单独证明同一 task 的 N 次
+repeat 都执行；repeat 完整性仍使用 CCEC count1→count2 engine PMU 精确倍增，
+不把最终覆盖同一 tile 的结果夸大成次数证明。

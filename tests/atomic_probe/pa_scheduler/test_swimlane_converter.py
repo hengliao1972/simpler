@@ -33,6 +33,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             "mode": "real-compute",
             "counts": {"qk": 6, "sf": 28, "pv": 4, "up": 1},
             "unit": "complete_128x128_engine_pipeline_iteration",
+            "input_pattern": "layout-diagnostic",
             "engine_mapping": {
                 "qk": "cube_matmul",
                 "sf": "vector_add",
@@ -66,6 +67,37 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             if event.get("name") == "pa_scheduler.capture"
         )
         self.assertEqual(capture_event["args"]["winner_workload"], workload)
+
+    def test_invalid_real_compute_input_pattern_is_rejected(self) -> None:
+        capture = {
+            "l2_swimlane_level": 1,
+            "metadata": {
+                "clock_freq_hz": 1_000_000_000,
+                "num_cores": 1,
+                "trace_schema_version": 2,
+                "winner_workload": {
+                    "mode": "real-compute",
+                    "counts": {"qk": 1, "sf": 1, "pv": 1, "up": 1},
+                    "unit": "complete_128x128_engine_pipeline_iteration",
+                    "input_pattern": "unknown-layout",
+                    "engine_mapping": {
+                        "qk": "cube_matmul",
+                        "sf": "vector_add",
+                        "pv": "cube_matmul",
+                        "up": "vector_mul",
+                    },
+                },
+                "core_types": ["AIC"],
+            },
+            "fdwic_events": [[0, 0, 0, 1, 0, "Kernel", 100, 200, 0, 0]],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "input_pattern is invalid"):
+                convert(input_path, output_path)
+            self.assertFalse(output_path.exists())
 
     def test_atomic_and_clock_share_the_scalar_lane(self) -> None:
         # 同一 mixed block 放一条 AIC 和一条 AIV0；Atomic 是 AIC scalar

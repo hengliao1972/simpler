@@ -28,10 +28,11 @@ frontier 和 worker 状态，任一不符都会返回失败。
 
 有意保留的替代只有两类：
 
-1. 默认 `scalar-nop` 模式仍以可控 NOP 标定 QK/SF/PV/UP，供三后端沿用旧基线。
-   CCEC 另有显式 `real-compute` 模式：QK/PV 运行完整 Cube matmul，SF/UP
-   运行完整 Vector add/mul，并执行 GM load、引擎计算、GM store 和完成等待。
-   AscendC 与 CPU 的对等真计算仍按阶段迁移，当前不能把 CCEC 结果泛化到三后端。
+1. 三后端默认的 `scalar-nop` 模式仍以可控 NOP 标定 QK/SF/PV/UP，保留旧基线。
+   三后端也都已支持显式 `real-compute`：CCEC 和 AscendC 在 A5 上让 QK/PV
+   执行完整 Cube matmul，让 SF/UP 执行完整 Vector add/mul，并覆盖 GM load、
+   引擎计算、GM store 和完成等待；CPU 使用同一 `128x128 float` 输入、输出布局
+   执行普通浮点 matmul/add/mul，只用于回归算术、角色路由和输出闭环。
 2. simpler 的 AICPU/runtime 装载链路由本目录 host runner 代替；测试关注的
    首个 Submit 到最后一个 Submit 区间不含 AICPU 初始化和最终回收。
 
@@ -49,14 +50,15 @@ Register、PrepareMap 或等待路径中插入虚假延时。
 
 | 后端 | 启动形式 | atomic load | Claim fetch-max | 当前 winner 负载 |
 | --- | --- | --- | --- | --- |
-| CCEC | 1:2 mixed AIC/AIV ELF | `atomicAdd(addr, 0)` | `atomicMax` | `scalar-nop` 或真实 Cube/Vector |
-| AscendC | `__mix__(1, 2)` | `AtomicAdd(addr, 0)` | `AtomicMax` | 当前为 `scalar-nop` |
-| CPU | 96 个 pthread | `fetch_add(0)` | C++17 CAS loop | 当前为 `scalar-nop` |
+| CCEC | 1:2 mixed AIC/AIV ELF | `atomicAdd(addr, 0)` | `atomicMax` | `scalar-nop` 或 A5 Cube/Vector 真计算 |
+| AscendC | `__mix__(1, 2)` | `AtomicAdd(addr, 0)` | `AtomicMax` | `scalar-nop` 或 A5 Cube/Vector 真计算 |
+| CPU | 96 个 pthread | `fetch_add(0)` | C++17 CAS loop | `scalar-nop` 或 CPU 对等浮点算术 |
 
 AscendC 对 64 位 vend 使用 signed `AtomicAdd(addr, 0)`。CANN 9.1 虽提供
 unsigned overload，但它在本 mixed kernel 的 64 MiB heap wrap 位置发生过
 稳定停滞；PA vend 小于 `INT64_MAX`，因此 signed add-zero 返回的位模式与比较
-语义不变。CPU 版本用于协议和边界检查，host 线程调度耗时不能与 A5 比较。
+语义不变。CPU 版本用于协议、边界、算术和输出检查；它没有 A5
+Cube/Vector 指令、流水线、GM 搬运和 PMU 语义，host pthread 耗时不能与 A5 比较或外推。
 
 ## 3. Winner 计算负载
 
@@ -82,43 +84,78 @@ Alloc 没有模拟 kernel body。NOP 数是 A5 实测校准量，不应解释为
 `--nop-count N` 同时设置四类 kernel；`--nop-counts` 的顺序固定为
 QK、SF、PV、UP，允许范围为 0 到 10,000,000。
 
-### 3.2 CCEC 真实 Cube/Vector 模式
+### 3.2 三后端 `real-compute` 模式
 
-CCEC 可显式切换到真实计算：
+三后端共用同一组参数，可通过 `all` 按 CCEC、AscendC、CPU 的顺序统一运行：
 
 ```bash
-./run.sh run ccec --winner-workload real-compute --batches 256 --runs 1 --no-swimlane
+./run.sh run all \
+  --winner-workload real-compute --batches 8 --runs 1 \
+  --real-compute-count 1 --no-swimlane
 ```
 
-未传 count 时，QK/SF/PV/UP 默认使用 `6,28,4,1` 次完整迭代。每次迭代均为
-`128x128 float` 的完整流水，不是 scalar NOP：
+也可单独选择后端：
 
-- AIC 的 QK/PV：GM load → MTE2/MTE1 → Cube matmul → FIX → GM store → 完成等待；
-- AIV 的 SF：GM load → Vector add → GM store → 完成等待；
-- AIV 的 UP：GM load → Vector mul → GM store → 完成等待。
+```bash
+./run.sh run ccec   --winner-workload real-compute --batches 256 --runs 1 --no-swimlane
+./run.sh run ascendc --winner-workload real-compute --batches 256 --runs 1 --no-swimlane
+./run.sh run cpu    --winner-workload real-compute --batches 1 --runs 1 \
+  --real-compute-count 1 --no-swimlane
+```
+
+未传 count 时，QK/SF/PV/UP 默认使用 `6,28,4,1` 次完整迭代。这组默认值来自
+CCEC 的 A5 标定；AscendC 需用自身实测解读，CPU 只复用参数含义而不复用
+性能结论。每次迭代的输入、输出形状均为 `128x128 float`，不是 scalar NOP：
+
+- CCEC/AscendC AIC 的 QK/PV：GM load → MTE2/MTE1 → Cube matmul → FIX
+  → GM store → 完成等待；
+- CCEC/AscendC AIV 的 SF/UP：GM load → Vector add/mul → GM store
+  → 完成等待；
+- CPU 的 QK/PV 执行三重循环 float matmul，SF/UP 执行 elementwise add/mul；
+  这是数学与工作区布局对等，不是设备引擎对等。
 
 可以统一或分类型覆盖，范围为 1 到 128：
 
 ```bash
-./run.sh run ccec --winner-workload real-compute --real-compute-count 1
-./run.sh run ccec --winner-workload real-compute --real-compute-counts 6,28,4,1
+./run.sh run all --winner-workload real-compute --real-compute-count 1 --no-swimlane
+./run.sh run ascendc --winner-workload real-compute --real-compute-counts 6,28,4,1
 ```
 
-`--real-compute-count*` 与 `--nop-count*` 不能混用；当前这些选项只允许 CCEC。
+`--real-compute-count*` 与 `--nop-count*` 不能混用；三后端全部使用相同的
+范围 1 至 128、QK/SF/PV/UP 顺序和互斥规则。
+真计算默认使用 `constant` 输入模式做性能测量；需要核验矩阵布局时使用：
+
+```bash
+./run.sh run all \
+  --winner-workload real-compute --real-compute-count 1 \
+  --real-compute-pattern layout-diagnostic --batches 1 --runs 1 --no-swimlane
+```
+
+`layout-diagnostic` 使用带权对角矩阵
+`A[r,c]=(r==c ? r+1 : 0)` 和非对称稠密矩阵
+`B[r,c]=1+((131r+17c+7rc) mod 251)`。QK/PV 逐元素校验
+`(r+1)*B[r,c]`，SF/UP 分别校验 `A+B` 和 `A*B`，可直接发现 B 转置、
+ND/NZ stride、分形重排或 FIXPIPE 输出重排错误。输入生成与校验都在 Submit
+计时窗外，设备执行路径和 workspace ABI 不增加 pattern 分支。
+
 workspace 包含两个只读输入 tile，并为每个 worker 按其 role 对应的两个 task kind
 各保留一个独占输出 tile，共
-12,713,984 bytes。host 在计时前初始化并 H2D，计时后 D2H；所有 active
+12,713,984 bytes。CCEC/AscendC host 在计时前初始化并 H2D，计时后 D2H；
+CPU 直接访问同布局的 host workspace。所有 active
 worker-kind 的最终 tile 必须分别等于 QK/PV 的 768、SF 的 5、UP 的 6，未获胜
 输出必须保留 sentinel。同一 worker-kind 的 repeat 会覆盖同一 tile，因此最终常量
-结果只证明至少完成一次；全部 repeat 的完整性另由受控 PMU count1→2 倍增取证。
-输入使用常量 2 和 3，足以验证计算、角色路由和写回，但不单独证明转置或 stride
-布局；这是一项有意保留的性能替身边界。
+结果只证明至少完成一次。CCEC 的 repeat 完整性另由受控 PMU count1→2
+精确倍增取证；AscendC 不伪造 PMU，只将官方引擎循环、输出闭环与 count1/默认
+`[KERNEL]` span 缩放合并作为证据；CPU 则在每次算术迭代后保留编译器物化边界。
+性能默认输入使用常量 2 和 3，便于与既有 768/5/6 和 PMU 标定比较；它本身
+不证明转置或 stride。正式布局闭环由上述 opt-in 诊断完成，实测见 6.4 节。
 
-默认次数来自三个独立 b256 进程的标定：QK、SF、PV 中位数分别约
+默认次数来自三个独立 CCEC b256 进程的标定：QK、SF、PV 中位数分别约
 41.336、54.039、27.971 us，接近真实 PA 的 44.170、53.729、27.626 us。
 UP 的一次完整 `128x128` 流水约 2.5 us，已经是正整数迭代下限；若后续要贴近
 1.565 us，应缩小 UP tile，不能用 0 次掩盖执行。真实计算下 Cube/Vector 会在
-不同物理子核并行，因此整体 Submit 约 3.6～3.8 ms，不应增加无关工作量硬凑 5.1 ms。
+不同物理子核并行，因此 CCEC 整体 Submit 约 3.6～3.8 ms，不应增加无关工作量
+硬凑 5.1 ms。AscendC 的独立实测见 6.2 节；CPU 数值不进入 A5 性能对比。
 
 ## 4. 本机依赖和构建
 
@@ -158,8 +195,10 @@ export CXX="$GCC15_ROOT/usr/bin/g++-15"
 
 `ccec|ascendc|cpu|all` 用于选择后端；`all` 始终按 CCEC、AscendC、CPU
 的顺序执行。
-CCEC `run/swimlane` 可使用 `--winner-workload scalar-nop|real-compute`、
-`--real-compute-count N` 或 `--real-compute-counts QK,SF,PV,UP`；真计算 count
+CCEC、AscendC 和 CPU 的 `run/swimlane` 都可使用
+`--winner-workload scalar-nop|real-compute`、
+`--real-compute-count N`、`--real-compute-counts QK,SF,PV,UP` 或
+`--real-compute-pattern constant|layout-diagnostic`；真计算 count/pattern
 与 `--nop-count*` 互斥。`smoke` 有意固定 scalar-nop，不接受这些覆盖项。
 
 ### 5.1 首次回归
@@ -193,8 +232,9 @@ semantic_status=PASS postprocess_status=PASS
   --profile-phases --analyze-swimlane
 ```
 
-这两条未传 `--winner-workload`，都使用默认 scalar-NOP；需要 CCEC 真计算时按
-3.2 节显式传入 `--winner-workload real-compute`。
+这两条未传 `--winner-workload`，都使用默认 scalar-NOP；需要真计算时按
+3.2 节显式传入 `--winner-workload real-compute`。CPU 使用同一选项；
+需同配置串行回归三后端时，直接把 backend 换成 `all`。
 
 此模式输出指标和泳道统计，但不会自动落盘 JSON。若只关注性能且不需要完整
 泳道逐事件分析，可去掉 `--analyze-swimlane`；若也不需要记录泳道，可使用
@@ -210,6 +250,10 @@ semantic_status=PASS postprocess_status=PASS
 
 ./run.sh swimlane ccec \
   --device 0 --batches 1 --winner-workload real-compute --trace-atomics
+
+./run.sh swimlane ascendc \
+  --device 0 --batches 1 --winner-workload real-compute \
+  --real-compute-count 1
 ```
 
 `swimlane` action 会管理 `--runs 1` 和输出路径，因此不要再传
@@ -223,7 +267,8 @@ export PYTHON=/path/to/venv/bin/python
 转换器只使用 Python 标准库，不需要 PyTorch，也不需要安装 simpler Python 包。
 
 该 action 固定执行一轮，产物全部位于本目录的
-`outputs/pa_scheduler_swimlane_<UTC时间>_<PID>/ccec/`：
+`outputs/pa_scheduler_swimlane_<UTC时间>_<PID>/<backend>/`。选择 `all` 时，
+同一 output root 下会按顺序建立 `ccec/`、`ascendc/` 和 `cpu/` 三个子目录：
 
 - `l2_swimlane_records.json`：与真实 PA 相同的十列 `fdwic_events` 原始格式；
 - `merged_swimlane.json`：Chrome Trace Event 格式，拖入
@@ -235,7 +280,12 @@ runner 结束时会打印准确目录：
 [SWIMLANE] output_root=.../outputs/pa_scheduler_swimlane_<UTC时间>_<PID>
 ```
 
-真计算泳道必须同时检查 raw/merged 顶层的 `winner_workload` metadata；逻辑
+真计算泳道必须同时检查 raw/merged 顶层
+`metadata.winner_workload`；其 `mode`、`counts`、`unit`、`input_pattern`
+和 `engine_mapping`
+分别应为 `real-compute`、实际 QK/SF/PV/UP 次数、
+`complete_128x128_engine_pipeline_iteration`、实际输入模式以及
+`qk/pv=cube_matmul、sf=vector_add、up=vector_mul`。逻辑
 `·kernel` span 只说明 winner 执行区间，单凭轨道名称不能证明使用了硬件引擎。
 
 查看步骤：
@@ -666,7 +716,8 @@ tests/atomic_probe/pa_scheduler/outputs/pmu_validation/
 
 ## 6. 当前 A5 结果与真实 PA 的差异
 
-2026-07-17 当时版本的一轮代表性结果如下。所有严格校验均为 PASS，kernel
+2026-07-17 `scalar-nop` 阶段的一轮代表性结果如下。这是保留的历史
+基线，不是后续 `real-compute` 数据；当时所有严格校验均为 PASS，kernel
 时间使用上表附近的校准 NOP：
 
 | 实现 | 首轮 `submit_span_us` | EfDrain/RingBp/FinalDrain |
@@ -728,10 +779,85 @@ CCEC `real-compute` 已按“构建门禁 → b1 数值 → b256 标定 → PMU 
   process/thread metadata，共 5221 条，且无 dropped record。
 
 这组结果证明 standalone CCEC 的显式 `real-compute` 模式已不再用 scalar NOP
-冒充 winner 计算，并能从
-数值、角色、PMU 和泳道四个方向闭环。它不证明 AscendC/CPU 已迁移，也不证明
-standalone 的 3.7 ms 应等于真实 PA 的 5.1 ms；真实引擎并行正是两者时序口径
-发生变化的原因之一。
+冒充 winner 计算，并能从数值、角色、PMU 和泳道四个方向闭环。这是
+CCEC 后端当时的阶段结论；AscendC 和 CPU 后续已分步补齐，见 6.2 和 6.3 节。
+三后端闭环仍不证明 standalone 的 3～5 ms 应等于真实 PA 的 5.1 ms；
+真实引擎并行和代码生成差异都会改变调度时序。
+
+### 6.2 2026-07-18 AscendC 真计算验证
+
+AscendC 按 CCEC 之后独立接入同一 workspace 和参数规则。AIC 路径使用
+`DataCopy/LoadData/Mmad/FIX` 完成 `128x128` matmul，AIV 路径使用
+`DataCopy/Add/Mul` 完成 elementwise 计算；两条路径都在 task 发布前等待 GM
+写回完成。分层上板结果为：
+
+| 场景 | `submit_span_us` | QK/SF/PV/UP `[KERNEL] mean_us` | 数值输出 |
+| --- | ---: | --- | --- |
+| b1，count=`1,1,1,1` | 59.280 | 8.837 / 14.267 / 8.342 / 11.307 | 4 active + 188 sentinel，PASS |
+| b8，count=`1,1,1,1` | 166.426 | 7.713 / 2.559 / 7.694 / 2.852 | 32 active + 160 sentinel，PASS |
+| b256，count=`6,28,4,1` | 3810.471 | 41.232 / 48.047 / 27.940 / 2.528 | 191 active + 1 sentinel，PASS |
+
+b256 三个独立进程的 Submit span 为 3810.471、4828.567 和 3777.371 us，
+中位数为 **3810.471 us**。三轮都通过全部 PA 协议、角色路由和真计算输出
+断言；数据离散也说明独立进程首轮需报告中位数，不能只挑最快值。
+
+`[KERNEL] mean_us` 是公共调度器对每个 winner `ExecuteKernel` 前后的
+1 GHz `SYS_CNT` span 求均值；b256 每类均为 256 个样本。它覆盖本 task 的
+GM load、Cube/Vector 计算、GM store、完成等待及少量调用边界，因此是
+**完整 winner 计算 span 均值**，不是纯 Cube/Vector busy counter，也不是 CCEC
+PMU 计数。AscendC 当前不伪造 CCEC-only PMU sidecar；本阶段的取证是官方指令
+接口、完整数值 tile、角色路由和上述 span 共同闭环。
+
+已生成的 AscendC b1 count=1 泳道位于：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_swimlane_20260718_124326_3574886/ascendc/
+    l2_swimlane_records.json
+    merged_swimlane.json
+```
+
+该轮 raw 有 4652 条 data event，merged 增加一条 capture instant 后为 4653 条
+data event，再加 256 条 process/thread metadata，`traceEvents` 合计 4909 条。
+raw 和 merged 的 `metadata.winner_workload` 均为 `mode=real-compute`、
+`counts=1,1,1,1`、`unit=complete_128x128_engine_pipeline_iteration`，且
+QK/PV、SF、UP 分别映射到 `cube_matmul`、`vector_add`、`vector_mul`。
+泳道轮次的协议、输出、record 数和 `dropped=0` 闭环全部 PASS。
+
+### 6.3 2026-07-18 CPU 对等算术回归
+
+CPU 在 AscendC 之后补齐了同一 `real-compute` CLI、workspace 编址、输入
+2/3、active tile 结果 768/5/6 和 inactive sentinel 校验。b1 count=1 的
+4 active + 188 sentinel 通过；b8 count=`2,3,2,1` 连续运行两轮，两轮的
+25 active + 167 sentinel 均通过，同时验证了 runs 间输出会重置为 sentinel。
+
+CPU 上的 matmul/add/mul 是普通 x86 浮点循环，`[KERNEL]`、`submit_span_us`
+和泳道 `·kernel` 都会被 pthread 调度、CPU cache 和编译器影响。它们只用于
+回归公共 PA 控制流与算术闭环，不得当作 A5 Cube/Vector 时间、PMU 或端到端
+性能的估计。CPU 泳道里的 `engine_mapping` 是三后端共用的逻辑 workload
+映射标签，不表示 x86 上存在对应物理引擎。
+
+### 6.4 2026-07-18 非均匀布局诊断
+
+常量 2/3 会掩盖 `B` 转置和分形重排错误，因此在性能默认不变的前提下增加了
+`--real-compute-pattern layout-diagnostic`。按 CCEC → AscendC → CPU 的顺序，
+三后端均以 b1、count=`1,1,1,1` 运行同一带权对角 A 和非对称 B，并逐元素扫描
+4 个 active tile 与 188 个 inactive sentinel tile，全部 PASS：
+
+| 后端 | Submit span | QK/SF/PV/UP `[KERNEL] mean_us` | 结论 |
+| --- | ---: | --- | --- |
+| CCEC | 37.682 us | 9.172 / 3.819 / 7.415 / 2.512 | PTO Cube/Vector 数学与布局基准 PASS |
+| AscendC | 55.041 us | 8.478 / 4.211 / 20.801 / 3.008 | L1 错位、B 分形转置、ND/NZ 与 FIXPIPE 闭环 PASS |
+| CPU | 51.958 ms | 3.457 ms / 26.118 us / 3.390 ms / 17.349 us | host 期望公式与路由回归 PASS；不作 A5 性能数据 |
+
+AscendC 诊断泳道位于
+`outputs/pa_scheduler_swimlane_20260718_125904_3613100/ascendc/`：raw 为
+4584 条 data event，merged 增加一条 capture instant，`dropped=0`；raw/merged
+的 `metadata.winner_workload.input_pattern` 都是 `layout-diagnostic`。CCEC 同模式的
+`submit-all` PMU sidecar 也记录该字段且 `accepted/semantic_passed=true`。
+
+诊断只证明单次完整迭代的数学与数据布局闭环；默认常量性能负载仍用于稳定比较，
+CCEC 的 repeat 次数证明仍以 count1→count2 的 engine PMU 精确倍增为准。
 
 ## 7. 内存占用和脱仓复制
 
@@ -739,9 +865,10 @@ standalone 的 3.7 ms 应等于真实 PA 的 5.1 ms；真实引擎并行正是�
 和 TensorMap，当前 `WorkerResult` 为 832 bytes，用当前头文件实际编译得到的
 `SchedulerState` 为 1,007,104,896 bytes。新增的 64 bytes 是独立、对齐的
 winner workload 配置 cache line，生产 DistGlobal/DistCore 关键偏移保持不变。
-默认泳道缓冲区另占 402,660,160 bytes；CCEC `real-compute` 还分配
+默认泳道缓冲区另占 402,660,160 bytes；CCEC/AscendC `real-compute` 还在 device 分配
 12,713,984 bytes workspace。因此 scalar-nop+trace 的 A5 device 占用约
 1.313 GiB，real-compute+trace 约 1.325 GiB，host 侧也需分配相近内存。
+CPU 后端只在 host 侧分配相同 workspace，不存在 device 内存口径。
 `smoke` 不缩小 State；只有 `--no-swimlane` 能省去泳道缓冲区。
 256 batch 的正常采集约有 86 万条事件；原始 JSON 和 merged JSON 都可能达到
 数十至数百 MiB。writer 与 converter 都使用临时文件后原子替换，失败时不会把

@@ -146,6 +146,20 @@ def _load_and_validate(
             raise ValueError(
                 f"metadata.winner_workload.unit must be {expected_unit!r} for {workload_mode}"
             )
+        # input_pattern 是 real-compute 布局诊断新增的可选元数据。旧 schema-v2
+        # 文件没有该字段，仍保持可读；新采集若给出则必须与 workload 模式一致。
+        input_pattern = winner_workload.get("input_pattern")
+        if input_pattern is not None:
+            valid_patterns = (
+                {"constant", "layout-diagnostic"}
+                if workload_mode == "real-compute"
+                else {"none"}
+            )
+            if input_pattern not in valid_patterns:
+                raise ValueError(
+                    "metadata.winner_workload.input_pattern is invalid for "
+                    f"{workload_mode}"
+                )
         engine_mapping = winner_workload.get("engine_mapping")
         if workload_mode == "real-compute":
             expected_mapping = {

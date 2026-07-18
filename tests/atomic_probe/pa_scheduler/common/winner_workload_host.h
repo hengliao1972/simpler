@@ -21,13 +21,23 @@
 
 namespace pa_scheduler::host {
 
+// 常量模式用于稳定的性能负载；布局诊断模式使用带权对角 A 和非对称稠密 B，
+// 专门暴露 B 转置、ND/NZ stride 与输出重排错误。该选择只影响计时窗外的
+// host 输入生成和结果校验，不进入 SchedulerState，也不增加 device 热路径分支。
+enum class RealComputePattern : uint32_t {
+    Constant = 0,
+    LayoutDiagnostic = 1,
+};
+
 // winner 负载参数在通用 benchmark parser 前单独剥离，CCEC 可在其后继续剥离
 // PMU 参数；AscendC/CPU 则直接把剩余 argv 交给 ParseOptions。这样不把后端
 // 私有功能塞入公共 PA 参数结构，也不会复制三套互斥规则。
 struct WinnerWorkloadOptions {
     WinnerWorkloadMode mode = WinnerWorkloadMode::ScalarNop;
     WorkloadCounts repeats = winner_workload::kDefaultRealComputeCounts;
+    RealComputePattern pattern = RealComputePattern::Constant;
     bool counts_explicit = false;
+    bool pattern_explicit = false;
     bool nop_override_explicit = false;
 };
 
@@ -37,6 +47,16 @@ inline const char *WinnerWorkloadModeName(WinnerWorkloadMode mode) {
         return "scalar-nop";
     case WinnerWorkloadMode::RealCompute:
         return "real-compute";
+    }
+    return "invalid";
+}
+
+inline const char *RealComputePatternName(RealComputePattern pattern) {
+    switch (pattern) {
+    case RealComputePattern::Constant:
+        return "constant";
+    case RealComputePattern::LayoutDiagnostic:
+        return "layout-diagnostic";
     }
     return "invalid";
 }
@@ -62,6 +82,7 @@ inline bool ParseWinnerWorkloadOptions(
 ) {
     bool mode_seen = false;
     bool count_seen = false;
+    bool pattern_seen = false;
     remaining_argv->clear();
     remaining_argv->push_back(argv[0]);
     for (int index = 1; index < argc; ++index) {
@@ -70,7 +91,7 @@ inline bool ParseWinnerWorkloadOptions(
             workload->nop_override_explicit = true;
         }
         if (argument != "--winner-workload" && argument != "--real-compute-count" &&
-            argument != "--real-compute-counts") {
+            argument != "--real-compute-counts" && argument != "--real-compute-pattern") {
             remaining_argv->push_back(argv[index]);
             continue;
         }
@@ -100,6 +121,29 @@ inline bool ParseWinnerWorkloadOptions(
             mode_seen = true;
             continue;
         }
+        if (argument == "--real-compute-pattern") {
+            if (pattern_seen) {
+                std::fprintf(stderr, "Specify --real-compute-pattern only once.\n");
+                return false;
+            }
+            const std::string name = value;
+            if (name == "constant") {
+                workload->pattern = RealComputePattern::Constant;
+            } else if (name == "layout-diagnostic") {
+                workload->pattern = RealComputePattern::LayoutDiagnostic;
+            } else {
+                std::fprintf(
+                    stderr,
+                    "Invalid --real-compute-pattern value: %s "
+                    "(expected constant|layout-diagnostic)\n",
+                    value
+                );
+                return false;
+            }
+            pattern_seen = true;
+            workload->pattern_explicit = true;
+            continue;
+        }
         if (count_seen) {
             std::fprintf(stderr, "Specify only one real-compute count override.\n");
             return false;
@@ -123,6 +167,11 @@ inline bool ParseWinnerWorkloadOptions(
 
 inline bool ValidateWinnerWorkloadOptions(const WinnerWorkloadOptions &workload) {
     if (workload.mode == WinnerWorkloadMode::RealCompute) {
+        if (workload.pattern != RealComputePattern::Constant &&
+            workload.pattern != RealComputePattern::LayoutDiagnostic) {
+            std::fprintf(stderr, "Invalid real-compute input pattern.\n");
+            return false;
+        }
         if (workload.nop_override_explicit) {
             std::fprintf(
                 stderr,
@@ -132,10 +181,10 @@ inline bool ValidateWinnerWorkloadOptions(const WinnerWorkloadOptions &workload)
         }
         return true;
     }
-    if (workload.counts_explicit) {
+    if (workload.counts_explicit || workload.pattern_explicit) {
         std::fprintf(
             stderr,
-            "--real-compute-count(s) requires --winner-workload real-compute.\n"
+            "--real-compute-count(s)/pattern requires --winner-workload real-compute.\n"
         );
         return false;
     }
@@ -153,13 +202,35 @@ inline void ConfigureWinnerWorkload(
         workload.mode == WinnerWorkloadMode::RealCompute ? winner_workload::kWorkspaceBytes : 0;
 }
 
+inline float LayoutDiagnosticInputA(uint32_t row, uint32_t column) {
+    return row == column ? static_cast<float>(row + 1U) : 0.0F;
+}
+
+inline float LayoutDiagnosticInputB(uint32_t row, uint32_t column) {
+    const uint32_t value =
+        (131U * row + 17U * column + 7U * row * column) % 251U;
+    return static_cast<float>(value + 1U);
+}
+
 inline void InitializeWinnerWorkloadBuffers(
-    std::vector<float> *workspace_image, std::vector<float> *workspace_outputs
+    const WinnerWorkloadOptions &workload, std::vector<float> *workspace_image,
+    std::vector<float> *workspace_outputs
 ) {
     using namespace winner_workload;
     workspace_image->assign(kWorkspaceTiles * kTileElements, kOutputSentinel);
-    std::fill_n(workspace_image->begin(), kTileElements, kInputAValue);
-    std::fill_n(workspace_image->begin() + kTileElements, kTileElements, kInputBValue);
+    if (workload.pattern == RealComputePattern::Constant) {
+        std::fill_n(workspace_image->begin(), kTileElements, kInputAValue);
+        std::fill_n(workspace_image->begin() + kTileElements, kTileElements, kInputBValue);
+    } else {
+        for (uint32_t row = 0; row < kTileRows; ++row) {
+            for (uint32_t column = 0; column < kTileCols; ++column) {
+                const size_t element = static_cast<size_t>(row) * kTileCols + column;
+                (*workspace_image)[element] = LayoutDiagnosticInputA(row, column);
+                (*workspace_image)[kTileElements + element] =
+                    LayoutDiagnosticInputB(row, column);
+            }
+        }
+    }
     workspace_outputs->resize(static_cast<size_t>(kOutputTiles) * kTileElements);
 }
 
@@ -178,8 +249,27 @@ inline const char *TaskKindName(TaskKind kind) {
     }
 }
 
+inline float ExpectedRealComputeValue(
+    RealComputePattern pattern, TaskKind kind, uint32_t row, uint32_t column
+) {
+    using namespace winner_workload;
+    if (pattern == RealComputePattern::Constant) {
+        return kind == TaskKind::Qk || kind == TaskKind::Pv
+            ? kExpectedAicValue
+            : (kind == TaskKind::Sf ? kExpectedSfValue : kExpectedUpValue);
+    }
+    const float input_a = LayoutDiagnosticInputA(row, column);
+    const float input_b = LayoutDiagnosticInputB(row, column);
+    if (kind == TaskKind::Qk || kind == TaskKind::Pv) {
+        // A 是带权对角矩阵，因此 A*B 的 (row,column) 只有一个非零乘积。
+        return static_cast<float>(row + 1U) * input_b;
+    }
+    return kind == TaskKind::Sf ? input_a + input_b : input_a * input_b;
+}
+
 inline bool ValidateRealComputeOutputs(
-    const SchedulerState &state, const std::vector<float> &outputs, uint32_t run
+    const SchedulerState &state, const WinnerWorkloadOptions &workload,
+    const std::vector<float> &outputs, uint32_t run
 ) {
     using namespace winner_workload;
     const size_t expected_elements = static_cast<size_t>(kOutputTiles) * kTileElements;
@@ -203,13 +293,15 @@ inline bool ValidateRealComputeOutputs(
             const TaskKind kind = kinds[kind_slot];
             const uint32_t kernel_index = static_cast<uint32_t>(kind) - 1;
             const bool active = result.kernel_counts[kernel_index] != 0;
-            const float expected = active
-                ? (aic ? kExpectedAicValue : (kind == TaskKind::Sf ? kExpectedSfValue : kExpectedUpValue))
-                : kOutputSentinel;
             const size_t tile_index =
                 static_cast<size_t>(worker) * kOutputTilesPerWorker + kind_slot;
             const size_t begin = tile_index * kTileElements;
             for (size_t element = 0; element < kTileElements; ++element) {
+                const uint32_t row = static_cast<uint32_t>(element / kTileCols);
+                const uint32_t column = static_cast<uint32_t>(element % kTileCols);
+                const float expected = active
+                    ? ExpectedRealComputeValue(workload.pattern, kind, row, column)
+                    : kOutputSentinel;
                 if (outputs[begin + element] == expected) continue;
                 std::fprintf(
                     stderr,
@@ -242,8 +334,9 @@ inline void PrintWinnerWorkloadConfig(
 ) {
     if (workload.mode == WinnerWorkloadMode::RealCompute) {
         std::printf(
-            "[WINNER-WORKLOAD] mode=real-compute counts=%u,%u,%u,%u "
+            "[WINNER-WORKLOAD] mode=real-compute pattern=%s counts=%u,%u,%u,%u "
             "unit=complete_128x128_engine_pipeline_iteration workspace_bytes=%zu\n",
+            RealComputePatternName(workload.pattern),
             workload.repeats.qk, workload.repeats.sf, workload.repeats.pv,
             workload.repeats.up, winner_workload::kWorkspaceBytes
         );

@@ -44,12 +44,15 @@ Standalone winner workload options (CCEC, AscendC, and CPU):
   --winner-workload scalar-nop|real-compute
   --real-compute-count N
   --real-compute-counts QK,SF,PV,UP
+  --real-compute-pattern constant|layout-diagnostic
 
 real-compute is opt-in. Its CCEC-calibrated A5 defaults are QK/SF/PV/UP=6/28/4/1;
 one count is one complete 128x128 load/engine/store/completion-wait pipeline
 per winner task, not a scalar NOP count. Explicit count options override those
 four defaults. AscendC must be calibrated independently; CPU only preserves
 the arithmetic and routing semantics and is not an A5 timing reference.
+The constant pattern is the performance default. layout-diagnostic uses a
+weighted diagonal A and asymmetric B to detect transpose/stride/reorder bugs.
 
 The swimlane action enables atomic tracing by default. For the lower-level run
 action, --trace-atomics still requires swimlane tracing; add
@@ -202,7 +205,7 @@ case "$ACTION" in
                 --batches|--batches=*|--runs|--runs=*|--nop-count|--nop-count=*|\
                 --nop-counts|--nop-counts=*|--winner-workload|--winner-workload=*|\
                 --real-compute-count|--real-compute-count=*|--real-compute-counts|\
-                --real-compute-counts=*)
+                --real-compute-counts=*|--real-compute-pattern|--real-compute-pattern=*)
                     echo "The smoke action fixes b1/r1/scalar-nop=0; use the run action for real-compute." >&2
                     exit 1
                     ;;
