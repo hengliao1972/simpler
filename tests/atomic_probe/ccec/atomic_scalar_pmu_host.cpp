@@ -18,7 +18,7 @@
 // 中的哪一项，而不混入多核竞争、轮询次数变化或未消费返回值的并行发射。
 
 #include "atomic_scalar_pmu_shared.h"
-#include "pmu_probe_control.h"
+#include "pmu_probe_host_support.h"
 #include "../probe_host.h"
 
 #include "aicpu_loader/host/load_aicpu_op.h"
@@ -183,15 +183,44 @@ bool RunPmuCommand(
         )) {
         return false;
     }
+    const uint32_t bitmap_count = atomic_probe::pmu::CountPmuConfiguredSubcores(*control);
     const bool expected_state = command == atomic_probe::pmu::PmuCommand::Configure
-        ? control->configured == 1 && control->processed_subcores == atomic_probe::pmu::kPmuPhysicalSubcores
-        : control->configured == 0 && control->processed_subcores == 0;
+        ? control->configured == 1 && control->processed_subcores == control->expected_subcores &&
+            bitmap_count == control->expected_subcores &&
+            control->skipped_subcores + bitmap_count == atomic_probe::pmu::kPmuPhysicalSubcores
+        : control->configured == 0 && control->processed_subcores == 0 && bitmap_count == 0;
     if (control->status != 0 || !expected_state) {
+        const auto failed_field =
+            static_cast<atomic_probe::pmu::PmuRegisterField>(control->first_failed_field);
         std::fprintf(
-            stderr, "PMU helper failed: command=%u status=%d configured=%u processed=%u\n", control->command,
-            static_cast<int>(control->status), control->configured, control->processed_subcores
+            stderr,
+            "PMU helper failed: command=%u status=%d configured=%u processed=%u bitmap_count=%u "
+            "expected_subcores=%u skipped=%u failed_index=%u failed_field=%s(%u) "
+            "observed=0x%x expected=0x%x\n",
+            control->command, static_cast<int>(control->status), control->configured,
+            control->processed_subcores, bitmap_count, control->expected_subcores,
+            control->skipped_subcores, control->first_failed_index,
+            atomic_probe::pmu::PmuRegisterFieldName(failed_field), control->first_failed_field,
+            control->first_failed_observed, control->first_failed_expected
         );
         return false;
+    }
+    if (command == atomic_probe::pmu::PmuCommand::Configure) {
+        const auto failed_field =
+            static_cast<atomic_probe::pmu::PmuRegisterField>(control->first_failed_field);
+        std::printf(
+            "[PMU_OWNER] configured=%u bitmap_count=%u expected=%u skipped=%u "
+            "first_skipped_index=%u first_skipped_field=%s(%u) observed=0x%x expected_value=0x%x\n",
+            control->processed_subcores, bitmap_count, control->expected_subcores,
+            control->skipped_subcores, control->first_failed_index,
+            atomic_probe::pmu::PmuRegisterFieldName(failed_field), control->first_failed_field,
+            control->first_failed_observed, control->first_failed_expected
+        );
+        std::printf(
+            "[PMU_OWNER] configured_bitmap=%08x:%08x:%08x:%08x\n",
+            control->configured_bitmap[3], control->configured_bitmap[2],
+            control->configured_bitmap[1], control->configured_bitmap[0]
+        );
     }
     return true;
 }
@@ -282,7 +311,8 @@ struct Sample {
 };
 
 bool ValidateSample(
-    const Sample &sample, atomic_scalar_pmu::Mode mode, uint32_t rounds, uint64_t seed, std::string *reason
+    const Sample &sample, atomic_scalar_pmu::Mode mode, uint32_t rounds, uint64_t seed,
+    const atomic_probe::pmu::PmuControl &pmu_control, std::string *reason
 ) {
     const Oracle oracle = Simulate(seed, rounds);
     const uint64_t expected_checksum = mode == atomic_scalar_pmu::Mode::Empty ? 0 : oracle.checksum;
@@ -297,6 +327,12 @@ bool ValidateSample(
     }
     if (sample.result.physical_core_id >= kPhysicalSubcoreCount) {
         *reason = "physical-core-id";
+        return false;
+    }
+    if (!atomic_probe::pmu::IsPmuSubcoreConfigured(
+            pmu_control, static_cast<uint32_t>(sample.result.physical_core_id)
+        )) {
+        *reason = "physical-core-not-in-configured-bitmap";
         return false;
     }
     if ((sample.result.pmu_ctrl_after_stop & 1ULL) != 0) {
@@ -316,7 +352,8 @@ bool ValidateSample(
 
 bool RunOne(
     aclrtFuncHandle function, aclrtStream stream, void *state_device, uint64_t pmu_register_bases,
-    atomic_scalar_pmu::Mode mode, uint32_t rounds, uint32_t repeat, uint64_t seed, Sample *sample
+    atomic_scalar_pmu::Mode mode, uint32_t rounds, uint32_t repeat, uint64_t seed,
+    const atomic_probe::pmu::PmuControl &pmu_control, Sample *sample
 ) {
     atomic_scalar_pmu::ProbeState state{};
     state.control.pmu_register_bases = pmu_register_bases;
@@ -352,7 +389,7 @@ bool RunOne(
     sample->result = state.result;
     sample->final_value = state.target.value;
     std::string reason;
-    const bool semantic_ok = ValidateSample(*sample, mode, rounds, seed, &reason);
+    const bool semantic_ok = ValidateSample(*sample, mode, rounds, seed, pmu_control, &reason);
     std::printf(
         "[RAW] repeat=%u rounds=%u mode=%s sys_cycles=%llu total=%llu scalar=%llu "
         "icache_req=%llu icache_miss=%llu checksum=%llu final=%llu physical=%llu ctrl=0x%llx status=%s%s%s\n",
@@ -485,6 +522,8 @@ int main(int argc, char **argv) {
     }
     aclrtStream stream = nullptr;
     if (!CheckAcl(aclrtCreateStream(&stream), "aclrtCreateStream")) return EXIT_FAILURE;
+    atomic_probe::pmu::ActiveSubcoreLimits active_limits;
+    if (!atomic_probe::pmu::QueryActiveSubcoreLimits(stream, &active_limits)) return EXIT_FAILURE;
 
     aclrtBinHandle binary_handle = nullptr;
     if (!CheckAcl(
@@ -528,7 +567,7 @@ int main(int argc, char **argv) {
     atomic_probe::pmu::PmuControl pmu_control{};
     pmu_control.magic = atomic_probe::pmu::kPmuControlMagic;
     pmu_control.version = atomic_probe::pmu::kPmuControlVersion;
-    pmu_control.expected_subcores = atomic_probe::pmu::kPmuPhysicalSubcores;
+    pmu_control.expected_subcores = active_limits.total;
     if (!CheckAcl(
             aclrtMemcpy(
                 pmu_control_device, sizeof(pmu_control), &pmu_control, sizeof(pmu_control),
@@ -581,7 +620,7 @@ int main(int argc, char **argv) {
                 const auto mode = static_cast<atomic_scalar_pmu::Mode>(mode_index);
                 const bool passed = RunOne(
                     function, stream, state_device, reinterpret_cast<uint64_t>(pmu_regs_device), mode, rounds,
-                    repeat, seed, &sample
+                    repeat, seed, pmu_control, &sample
                 );
                 all_passed &= passed;
                 samples[mode_index].push_back(sample);
