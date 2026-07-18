@@ -191,7 +191,11 @@ runner 结束时会打印准确目录：
 3. 每个 `block0` 至 `block31` 是一个物理 1AIC+2AIV block；
 4. `AIC`、`AIV0`、`AIV1` 轨展示 Submit、Claim、EfDrain、Replay、RingBp 等
    runtime 阶段，带 `·kernel` 的轨展示 QK、SF、PV、UP；
-5. 点击事件可查看 `task_id`、`func_id`、`core`、`mc` 和 `aux`。
+5. 开启 `--trace-atomics` 时，Atomic 及 ClockBaseline 直接画在对应
+   `AIC/AIV` scalar lane，名称与 category 显式区分 `return_ready` 和
+   `source_issue`；不生成带 `·atomic` 的伪并行子轨；
+6. 普通事件可查看 `task_id`、`func_id`、`core`、`mc` 和 `aux`；Atomic 的
+   字段和解读边界见 5.6 节。
 
 WaitForSlot 和 HeapGuard 没有可伪造的逐事件起止时间，因此不单独生成 Perfetto
 事件；它们由 `--profile-phases` 的 `[PHASE]` 累计统计呈现。实际发生等待时，
@@ -238,6 +242,9 @@ CPU 完整协议回归建议关闭大泳道缓冲区：
 - `--profile-phases`：分别统计 Claim、EfDrain、WaitForSlot、HeapGuard；
 - `--analyze-swimlane`：读取完整记录，输出各阶段的 per-worker 累计分布以及
   EfDrain/Materialize/Claim/Register 的 per-role、per-task-kind 单事件分布；
+- `--trace-atomics`：在已开启的泳道中记录每次源码 atomic 调用括号；建议同时
+  传 `--analyze-swimlane` 输出按 AIC/AIV、调用点分组的分布。不能与
+  `--no-swimlane` 同用；
 - `--swimlane-json FILE`：流式导出原始 `fdwic_events` JSON，要求单轮运行；
 - `--no-swimlane`：关闭泳道记录，不能与 `--analyze-swimlane` 或
   `--swimlane-json` 同时使用；
@@ -288,94 +295,230 @@ frontier_initial=... frontier_flag=... frontier_ready_fetch_max=... frontier_ter
 结果区，不为诊断新增共享 atomic。它们仍会增加少量 scalar 指令，因此优化 A/B
 必须使用相同的计数布局；不能把启用分类后的绝对时间直接与旧二进制比较。
 
-### 5.6 CCEC 每核 scalar PMU 与 I-cache 诊断
+### 5.6 逐 atomic 语义边界泳道
 
-CCEC 后端提供一个显式诊断模式，用来验证局部 scalar 性能观察链路。它不读取
-`msprof` 导出的整任务 PMU 汇总作为局部结果，而是由 kernel 在每个物理子核上
-直接读取 `CNT_TOTAL/CNT2/CNT6/CNT7`，最后写入该 worker 独占的
-`WorkerResult`。对应含义为：
+`--trace-atomics` 记录 standalone 调度器中每一次动态 atomic 调用，不只记录
+winner 或慢样本。生成带文字分析的 CCEC 泳道可直接执行：
 
-| 字段 | PipeUtilization selector | 含义 |
-| --- | ---: | --- |
-| `pmu_total_cycles` | PMU total | gate 窗口累计周期 |
-| `pmu_scalar_busy` | `CNT2 = 0x1` | scalar 原始事件计数 |
-| `pmu_icache_requests` | `CNT6 = 0x34` | I-cache request |
-| `pmu_icache_misses` | `CNT7 = 0x35` | I-cache miss |
+```bash
+./run.sh swimlane ccec \
+  --device 0 --batches 256 \
+  --trace-atomics --analyze-swimlane
+```
 
-selector 和 PMU framework 仍由 CANN 9.1 的 task-based profiler 配置；CCEC
-只做门控与读取。一次 snapshot 会消费/清除此前累计，因此窗口前先冻结并做一次
-baseline read-clear，窗口中间只切 gate，末尾再做唯一一次结果 snapshot。host
-按正式 A5 runtime 的方式调用 `halResMap`，构造 36 个
-物理 AICore 展开后的 108 项子核 MMIO 表；kernel 使用真实 `get_coreid()` 索引，
-不能用逻辑 `worker_id` 猜物理核。
+转换后 Atomic 和 ClockBaseline 都放在对应 AIC/AIV 的原 scalar lane；
+它们本来就是 scalar 指令，不再伪装成与 scalar 并行的独立子轨。
+Kernel 仍放在独立计算单元轨。Atomic 事件名显式区分两种边界：
 
-在本目录先构建 CCEC，再直接让 `msprof` 包住 host runner：
+```text
+atomic.return_ready.<site>.<op>#<task_id>
+atomic.source_issue.<site>.<op>#<task_id>
+```
+
+category 也分别为 `atomic.return_ready` 与 `atomic.source_issue`，可在
+Perfetto 中直接过滤，无需逐条点开 args 才能区分。
+
+当前固定 schema 共有 15 个调用点：
+
+| `site_id` | Perfetto `site` | `op` | 所属路径 |
+| ---: | --- | --- | --- |
+| 0 | `startup_increment` | `fetch_add` | 启动屏障到达计数 |
+| 1 | `startup_poll` | `load` | 启动屏障轮询 |
+| 2 | `fatal_poll` | `load` | fatal 状态检查 |
+| 3 | `fatal_set` | `exchange` | fatal 状态发布 |
+| 4 | `claim_max` | `fetch_max` | Submit lane Claim |
+| 5 | `fanin_flag_load` | `load` | fanin 依赖 flag |
+| 6 | `completion_vend_exchange` | `exchange` | completion vend 发布 |
+| 7 | `completion_flag_exchange` | `exchange` | completion flag 发布 |
+| 8 | `frontier_initial_load` | `load` | completion frontier 首次读取 |
+| 9 | `frontier_flag_load` | `load` | frontier 扫描 flag |
+| 10 | `frontier_max` | `fetch_max` | frontier 推进 |
+| 11 | `heap_frontier_load` | `load` | HeapGuard frontier |
+| 12 | `heap_vend_load` | `load` | HeapGuard vend |
+| 13 | `replay_done_increment` | `fetch_add` | 回放完成屏障到达计数 |
+| 14 | `replay_done_poll` | `load` | 最终 drain 中轮询回放完成 |
+
+上表是源码调用点集合，不代表每轮都会出现 15 类事件；例如正常成功路径不应
+执行 `fatal_set`。轮询点则会为每一次实际 load 生成独立事件。
+
+原始 `fdwic_events` 仍是十列格式。对 `phase="Atomic"` 的记录，
+`task_id` 是所属 PA task（启动/最终屏障等生命周期 atomic 为 -1），
+`function_id` 固定为 -1，`auxiliary` 是上表 `site_id`，`flags` 使用独立 ABI：低 4 bit 是
+`op_id`（Load/Exchange/FetchAdd/FetchMax 依次为 0/1/2/3），bit 4 表示
+返回的旧值参与后续逻辑，bit 5 仅对 Load 表示本次读到零，bit 6
+表示是否取得了“返回值本核可消费”边界，bits 8..31
+仅对 FetchMax 保存饱和后的软件重试次数。CCEC/AscendC 的硬件
+`atomicMax` 当前报告重试数 0；CPU CAS loop 才有可观察的软件重试。
+merged 事件的 `args` 会显式导出 `site/site_id`、`op/op_id`、原始整数
+`cycles`、`result_used`、`return_ready_observed`、`completion_boundary`，以及操作
+适用时的 `value_zero` 或 `retries`。
+
+边界必须按源码调用点语义解读：
+
+- `source_issue_bracket`：返回旧值本来就丢弃的发布型调用。当前五处是
+  `startup_increment/replay_done_increment/completion_vend_exchange/`
+  `completion_flag_exchange/fatal_set`。结束时钟与旧值无依赖，只能表示
+  源码发射包围区间。
+- `return_value_ready`：协议本来就会判断返回值的 `Load/FetchMax`。CCEC
+  在 atomic 后生成紧邻的 `dependent MOV -> MOV SYS_CNT`；这证明旧值已可被
+  本核 scalar 消费，不证明其他核已看到发布的新值。
+
+两种终点都早于本条 64-byte trace record 写入。当前不为每条 atomic
+加 DSB/ISB/额外 GM load；这些操作要么后端不支持，要么会明显改写
+被测路径。两种 bracket 都不能直接称为跨核可见或 atomic retire 延迟。
+
+开启该诊断时，每个 worker 在最终 drain 之后还会写两条
+`ClockBaseline`：`clock.consecutive_sys_cnt_reads` 和
+`clock.atomic_return_dependency_hook`。前者量连续时钟读，后者量纯寄存器依赖 hook
+的固定底噪。全局因此恰有 `96*2=192` 条，都只是分辨率参考，不是
+可以从每条 Atomic 机械相减的校正常数。`[TRACE_ATOMIC]`
+按 AIC/AIV、site 和 op 输出事件数、源码括号原始累计、中位数、p95 和最大值。
+
+记录写本身不在它自己的 span 内，但会改变后续指令布局、cache、多核到达顺序和
+atomic 争用；轮询次数也可能随之变化。所以不应将 `source_bracket_cycles_total`
+与未插桩 Submit 时间相减，或用它计算 atomic 对 golden 的绝对占比。每核分区固定
+容纳 65,536 条记录；通过必须同时满足 `dropped=0`、总记录数闭合，以及每 worker
+新增诊断记录数精确等于 `atomic_trace_calls + 2` 闭合。CPU 线程调度可能放大启动轮询并撑满分区；这种
+情况应视为本次 trace 无效，不能截断后继续分析。
+
+### 5.7 CCEC 每核 PMU 与 I-cache sidecar
+
+CCEC 后端提供与泳道分离的 PMU sidecar。正式取数由本目录自带的 Main AICPU
+Path-A owner 配置 selector、保存并恢复 PMU 状态；kernel 在每个物理子核内门控并
+读取 `CNT_TOTAL` 和 `CNT0..8`，再写入该 worker 独占的 `WorkerResult`。该链路不需要
+目录外探针或整任务 profiler 的计数结果。完整字段为：
+
+| sidecar 字段 | 寄存器 / selector | 原始事件含义 |
+| --- | --- | --- |
+| `total_cycles` | 64-bit PMU total | gate 窗口的 PMU total 原始计数 |
+| `vector_busy` | `CNT0 = 0x501` | Vector pipe busy |
+| `cube_busy` | `CNT1 = 0x301` | Cube pipe busy |
+| `scalar_busy` | `CNT2 = 0x001` | Scalar pipe busy |
+| `mte1_busy` | `CNT3 = 0x701` | MTE1 pipe busy |
+| `mte2_busy` | `CNT4 = 0x202` | MTE2 pipe busy |
+| `mte3_busy` | `CNT5 = 0x203` | MTE3 pipe busy |
+| `icache_requests` | `CNT6 = 0x034` | I-cache request |
+| `icache_misses` | `CNT7 = 0x035` | I-cache miss |
+| `fix_busy` | `CNT8 = 0x714` | Fix pipe busy |
+
+#### Main AICPU Path-A owner
+
+owner 已自包含在 `ccec/`：构建会同时产出 dispatcher 和 owner AArch64 SO。host
+通过 CANN 9.1 已验证的 Main AICPU Path-A 完成 bootstrap 和 mode-0 注册，运行时
+调用 `simpler_aicpu_exec` 执行 Configure/Restore；不要求用户另行启动 PMU 配置进程。
+owner 对本轮会话独占的 PMU 状态先保存、再配置并读回，结束时只按成功 bitmap 从
+107 到 0 逆序恢复。
+
+host 对同一 stream 调用 `aclrtGetStreamResLimit`，当前 A5 实报
+`AIC=32/AIV=64/total=96`。owner 扫描 108 个物理 MMIO slot，只对完整读回一致的
+96 个置 bitmap，跳过 12 个不可配置 slot；32 个可用物理组都必须形成
+`1 AIC + 2 AIV` 完整 triplet。当前上板 bitmap 为：
+
+```text
+000003ff:fff3ff7f:f7cffcff:fffdf7ff
+```
+
+kernel 用真实 `get_coreid()` 查 host 通过 `halResMap` 建立的 MMIO 表，不用逻辑
+`worker_id` 猜物理核。正式结果必须同时满足：九个 selector 全部匹配、96 条记录
+可信且物理核 id 唯一、worker slot/role 与物理 triplet 对应、96 个核都实际执行过
+start/stop、`miss <= request`，以及 owner Restore 成功。
+
+`off` 是默认值，不建立 PMU owner 会话。四种非 off 模式中，前三种只用于观察链路
+校准；`submit-all` 是唯一正式的 Submit 取数窗口：
+
+| `--pmu-window` | 位置与窗口边界 | 用途 |
+| --- | --- | --- |
+| `empty` | `RunScheduler` 完成后，baseline read-clear → start → stop → 末尾 snapshot | 量一段空 gate 底噪 |
+| `scalar` | `RunScheduler` 完成后，一个 gate 中执行 `--pmu-scalar-nops N` | 验证 scalar/I-cache 正向敏感性 |
+| `scalar-double` | `RunScheduler` 完成后，两段相同 NOP 中间只 stop/start、不读 counter | 验证暂停后继续累计 |
+| `submit-all` | 每 worker 通过启动屏障后，在首次 PA 参数构造前 start，最后一次 Submit 返回后 stop | 累计 orchestration、Submit 和模拟 kernel NOP |
+
+`submit-all` 不含启动屏障，也不含 `replay_done`、最终 drain、末尾 ClockBaseline
+或 PMU 结果发布。它是 **每 worker 从 orchestration 初始化前到本核最后一次 Submit
+返回后的累计窗口**，不是全局“最早 `Submit.begin` 到最晚 `Submit.end`”墙钟 span。
+
+每次 `metrics_prof_start/stop()` 都带 `PIPE_ALL` 流水屏障。该屏障用于明确门控边界，
+也会收口流水并可能改变多核到达时序；因此 PMU 样本只能与相同 gate、相同 NOP、
+相同构建配置的样本比较，不能把它当成无观察开销的端到端基线。当前模拟 QK/SF/PV/UP
+的 NOP 循环实际在 scalar 上执行，`submit-all` 会把它计入 scalar 相关事件；这与真实
+Vector/Cube task 运行时 scalar 等待的状态并不等价，所以 sidecar 不声称是绝对的
+真实 PA profile。
+
+#### 生成正式 PMU-only JSON
+
+正式 sidecar 使用单轮、独立进程和唯一输出路径：
 
 ```bash
 ./run.sh build ccec
 
-OUT="./outputs/pmu_validation/empty"
-msprof \
-  --output="$OUT" \
-  --type=db \
-  --ai-core=on \
-  --aic-mode=task-based \
-  --aic-metrics=PipeUtilization \
-  ./build/ccec/pa_scheduler_host \
-  --kernel ./build/ccec/pa_scheduler_kernel.o \
-  --device 0 --batches 1 --runs 10 --nop-count 0 --no-swimlane \
-  --pmu-window empty
+OUT="./outputs/pmu_submit_all_$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$OUT"
+./run.sh run ccec \
+  --device 0 --batches 256 --runs 1 --no-swimlane \
+  --pmu-window submit-all \
+  --pmu-json "$OUT/pmu_submit_all.json"
 ```
 
-三个诊断窗口的用途是：
+`--pmu-json` 只允许 CCEC 的非 off 窗口并强制 `--runs 1`。正式 JSON 还要求
+`--no-swimlane`，且不能同时开启 `--trace-atomics`、`--profile-phases`、
+`--analyze-swimlane` 或 `--swimlane-json`。已有目标文件或同名 `.tmp` 会被拒绝，
+不会静默覆盖。host 只在协议、96 核 PMU/owner 门禁、Restore 和 runtime 清理全部
+成功后，才把临时文件原子发布为最终 JSON。
 
-- `empty`：只执行一次 start/stop，量空窗口的 gate 固定开销；末尾 snapshot 在
-  stop 后执行，其 MMIO 读取开销不计入 total；
-- `scalar`：在同一窗口内执行 `--pmu-scalar-nops N` 个受控 NOP；
-- `scalar-double`：执行两段相同 NOP，中间只 stop/start、不读 counter，用于验证
-  多个局部窗口能否暂停后继续累计；
-- `off`：默认值，不申请 MMIO 表，也不要求由 `msprof` 启动。
+`--no-swimlane` 会关闭 phase/atomic record 写和泳道后处理，但当前普通调度路径中的
+阶段 `SYS_CNT` 调用点仍存在；JSON 会显式记录“有 phase timestamp call、无 phase
+record write、无 atomic trace、无 profile accumulation”。因此该模式是 PMU-only
+采集口径，不等于编译期删除所有时间戳指令的零观察二进制。
 
-例如 10 万 NOP 的正向敏感性测试只需把末尾参数换成：
+JSON 包含：
 
-```bash
---pmu-window scalar --pmu-scalar-nops 100000
-```
+- `capture/configuration/validation`：采集边界、NOP 配置、`PIPE_ALL` 门控语义、九个
+  selector、计数器位宽、实际 start/stop、96 条记录可信性及可编程 counter 风险门槛；
+- `owner`：Main AICPU Path-A、配置 bitmap、AIC/AIV 数量、完整 triplet 和 Restore
+  结果；
+- `records`：每 worker 的物理子核 id、role、block/lane、原始 CNT0..8 和 total，
+  以及本核 owner/slot/role、window started/stopped 断言；
+- `summary.all/aic/aiv`：全部 96 核、32 个 AIC 和 64 个 AIV 分组后，各原始计数的
+  `sum/mean/median/p95/max`。
 
-每轮必须同时看到：
+控制台对应输出 `[PMU-ALL]`、`[PMU-AIC]`、`[PMU-AIV]`。I-cache miss rate 始终按
+`sum(icache_misses) / sum(icache_requests)` 计算，不平均逐核百分比。AIC 与 AIV
+核数不同，比较每核强度时应看 mean/median 或 miss rate，不能直接比较两组 sum。
+`total_cycles` 是 PMU total 的原始值；96 核求和是 core-work，不是 Submit 墙钟
+时间，在没有额外核实其时钟/事件语义前不应直接换算成微秒。CNT0..CNT8 是
+32 bit，total 是 64 bit。正式门禁要求本轮最大可编程 counter 小于 `UINT32_MAX/4`
+（25% 高水位），这只是缩短窗口后采用的保守风险阈值；最终 32-bit 值无法证明
+计数器没有恰好回卷一圈或多圈，因此通过该门禁也不能声称“已证明无回卷”。
 
-```text
-trusted=96/96 unique_coreids=96/96
-[ASSERT] all PMU records have configured selectors and data PASS
-[ASSERT] all 96 PMU physical subcore ids are unique PASS
-```
+正式观察保留三类互不混用的样本：关闭所有诊断的性能 golden、PMU-only
+`submit-all` sidecar、Atomic-trace-only 泳道。PMU sidecar 只有整个窗口的每核累计，
+没有可与单条 Atomic span 对齐的子窗口；不能把 AIC/AIV 平均 miss rate 回填成
+泳道中某条 atomic 的属性。优化前后需保持相同源码观察布局、NOP 和 owner 配置，
+并用多个独立进程交错 A/B。
 
-`trusted` 会逐核检查 MMIO 映射、三个 selector 和非零 total；因此不能用“外部
-profiler 已经启动”代替实际 selector 读回。AIC 与 AIV 分开输出，I-cache miss
-rate 使用 `sum(miss) / sum(request)`，不平均逐核百分比。`pmu_scalar_busy` 是原始
-事件计数；empty 窗口中它可以大于 total，不能把两者比值直接宣传成利用率。
+#### 2026-07-18 上板验收样本
 
-2026-07-18 的 A5 验证结果为：
+自包含 owner 的本次验收中，`empty`、`scalar 100,000` 和
+`scalar-double 2×100,000` 的 96 核 total 中位数分别约为 214、56,568 和
+112,994；三个样本均为 `96/96 trusted`，owner 为 32 AIC + 64 AIV、32 个完整 triplet，
+且每个样本 Restore PASS。它们是各模式的一次上板样本，不是多轮稳定性统计；只用于
+确认空窗底噪、scalar 正向响应和双段近似倍增。
 
-| 窗口 | 轮次 | 96 核 total 中位数 | 结论 |
-| --- | ---: | ---: | --- |
-| empty | 10 | 预热后约 419，轮间约 ±1 | 空窗口 gate 开销稳定 |
-| scalar 100,000 | 10 | 预热后约 56,774，轮间约 ±2 | scalar/req/miss 均稳定响应 |
-| scalar-double 2×100,000 | 10 | 预热后约 113,113，轮间约 ±8 | 扣除 empty 后为单段的 1.9997 倍，多 gate 可续积 |
+同一版本的 `batches=1,nop-count=0,submit-all` 单次样本也通过 96 核 start/stop、
+selector、owner/slot/role/triplet 与 Restore 门禁：all/AIC/AIV 的 total 中位数约为
+36,066.5/28,708/39,745，96 核 scalar busy 求和约 2,661,612，I-cache request/miss
+求和为 210,399/30,283（约 14.3931%），host `submit_span_us` 约 47.770。该样本只
+证明 `submit-all` 观察闭环可运行；`batches=1`、零模拟计算体和单次运行都不足以
+支持 256 batch 性能归因或真实 PA 绝对结论。
 
-同一轮中，I-cache request 从 empty 的每核约 22 增至单段的约 26,245，双段约
-52,476；miss 也从每核约 4 增至约 23/45。双段十轮中 96 核均满足
-`trusted=96/96` 和物理子核 id 唯一，说明本链路能直接看到 scalar 和 I-cache
-变化，也证明 stop/start 之间不读 counter 时，多段窗口会累计到末尾唯一一次
-snapshot。首次热身的 p95 偶有偏高，正式比较应丢弃首轮，并保留 A/A
-重复性数据。
-
-这里验证的是观察手段，不是 PA 优化本身。后续用于 Claim、EfDrain、
-WaitForSlot 或 HeapGuard 时，应先做一次 baseline read-clear，多个局部窗口之间只切
-gate，最后每核读取一次；禁止每个 Submit 都读 MMIO。当前双段只证明多窗口续积
-机制成立，扩展到上千个真实小窗口时仍要核对 gate 次数、empty 对照和 counter
-是否溢出。empty 开销和诊断代码布局必须在 A/B 两边完全相同，真实 PA 的最终
-结论仍需撤回诊断代码后再跑原始泳道与 golden。
+按上述正式命令和默认 PA NOP 还完成了 3 个独立进程的 256 batch
+PMU-only 验收。Submit span 为 3,688.236/4,089.057/4,673.237 us，中位数
+4,089.057 us；I-cache request 总和为 69,812,583/69,451,706/70,065,443，miss
+总和为 5,854,421/5,847,256/5,830,645，miss rate 为 8.3859%/8.4192%/8.3217%。
+三轮均通过 96 核、owner/slot/role/triplet、start/stop、counter 风险门槛和 Restore，
+并使用本用户 `.venv` 从 raw 记录独立重算 summary 一致。这三轮证明的是
+同配置 PMU 取数可重复；由于 gate 包含 `PIPE_ALL` 且未与无 PMU 样本交错配对，
+不应将它们与约 5 ms 无诊断基线直接相减。
 
 ## 6. 当前 A5 结果与真实 PA 的差异
 
