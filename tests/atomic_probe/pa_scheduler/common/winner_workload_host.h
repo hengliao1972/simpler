@@ -33,7 +33,7 @@ enum class RealComputePattern : uint32_t {
 // PMU 参数；AscendC/CPU 则直接把剩余 argv 交给 ParseOptions。这样不把后端
 // 私有功能塞入公共 PA 参数结构，也不会复制三套互斥规则。
 struct WinnerWorkloadOptions {
-    WinnerWorkloadMode mode = WinnerWorkloadMode::ScalarNop;
+    WinnerWorkloadMode mode = WinnerWorkloadMode::RealCompute;
     WorkloadCounts repeats = winner_workload::kDefaultRealComputeCounts;
     RealComputePattern pattern = RealComputePattern::Constant;
     bool counts_explicit = false;
@@ -162,6 +162,13 @@ inline bool ParseWinnerWorkloadOptions(
         count_seen = true;
         workload->counts_explicit = true;
     }
+    // 无参数运行以真实 Cube/Vector 为默认。旧命令若显式给出 NOP 次数但没有
+    // 指定 workload mode，则把 NOP override 本身视为选择 scalar-nop；这样
+    // 既不让 --nop-count 悄悄失效，也不破坏既有标定脚本。显式指定
+    // real-compute 再叠加 NOP 仍由下方互斥校验拒绝。
+    if (!mode_seen && workload->nop_override_explicit) {
+        workload->mode = WinnerWorkloadMode::ScalarNop;
+    }
     return true;
 }
 
@@ -184,7 +191,7 @@ inline bool ValidateWinnerWorkloadOptions(const WinnerWorkloadOptions &workload)
     if (workload.counts_explicit || workload.pattern_explicit) {
         std::fprintf(
             stderr,
-            "--real-compute-count(s)/pattern requires --winner-workload real-compute.\n"
+            "--real-compute-count(s)/pattern requires real-compute workload mode.\n"
         );
         return false;
     }

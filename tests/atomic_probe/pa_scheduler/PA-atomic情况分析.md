@@ -337,13 +337,32 @@ span，或单独定义 `Submit.end - Build/Replay/Alloc.end` 为 action tail。
 - EfDrain、Replay、WaitForSlot、HeapGuard、flag/vend/frontier 和最终 drain；
 - 单 lane Case1 的 BlockWon 动态次数为零，以及真实泳道记录格式。
 
-QK/SF/PV/UP 默认仍可由可控 scalar NOP 模拟，旧默认值按本文最好真实泳道的
-44.170/53.729/27.626/1.565 us 校准。2026-07-18 起三后端均提供显式
-`real-compute`：CCEC/AscendC 的 QK/PV 运行真实 Cube matmul，SF/UP 运行
-真实 Vector add/mul，每轮都含 GM load、计算、GM store 和完成等待；
-CPU 使用相同 workspace、角色路由和数学运算做协议回归，不代表 A5 引擎时间或
-PMU。两种模式都不会在 Claim、Register、PrepareMap 或等待路径中硬补
-5 ms。
+Case1 的 standalone 依赖图由 tensor owner 与每 worker TensorMap 的 lookup 共同
+收集，不是按 task 名字直接跳过依赖：Alloc 和 QK 的 fanin 均为 0；SF 依赖 QK；
+PV 依赖 SF；UP 的多个输入/原地输出按 producer 去重后依赖 Alloc、SF、PV。
+所以每 batch 的 fanin 数是 `0+0+1+1+3=5`，默认 256 batch 的严格终态断言
+要求 `fanin_edges=1280`。EfDrain 只有在这些 producer completion flag 全部
+ready 后才执行 winner 负载。
+
+该图只对等 Case1 的调度依赖。真计算 workspace 用统一的受控 A/B 输入分别验证
+QK/PV matmul、SF add 和 UP mul，并按 worker-kind 写独占输出 tile；这些数值输出
+没有按 QK→SF→PV→UP 串接成 PA 的真实 tensor 数据流。因此它能验证 fanin、完成
+发布、角色路由和各类引擎算术，不能验证后继 task 消费前驱真实数值的语义。
+当前也只覆盖 Case1 的单 block group、`q_loop=1` 和全单-lane 图；通用多 group、
+多 q-loop、跨迭代更新及 joint/mixed task 的依赖数量与竞争形态均未模拟。
+
+当前三后端无参数默认使用 `real-compute`：CCEC/AscendC 的 QK/PV 运行真实 Cube
+matmul，SF/UP 运行真实 Vector add/mul，每轮都含 GM load、计算、GM store 和完成
+等待；CPU 使用相同 workspace、角色路由和数学运算做协议回归，不代表 A5 引擎
+时间或 PMU。可控 `scalar-nop` 只作为显式兼容/校准模式保留，其历史默认值按
+本文最好真实泳道的 44.170/53.729/27.626/1.565 us 校准。两种模式都不会在
+Claim、Register、PrepareMap 或等待路径中硬补 5 ms。
+
+当前真计算默认次数为 QK/SF/PV/UP=`6,28,4,1`。依据是其每 task 完整
+load/compute/store span 已接近真实 PA 的 44.170/53.729/27.626/1.565 us；它
+优先保持 per-task core work 口径，不通过增加无关 repeat 把 standalone 总时间
+硬凑到 5.1 ms。standalone 未覆盖的真实控制流、代码布局和资源竞争仍会形成
+端到端差值，不能把这部分差值反推成缺少的 kernel repeat。
 
 当前严格校验覆盖 73,728 次 Claim、每 task 唯一 winner、1,024 个 kernel、
 TensorMap/heap 最终状态、fanin、flag、vend、frontier、cursor、ring placement
@@ -699,7 +718,7 @@ worker 到达时序；真实动态调度不能由上述固定状态推导出必�
 #### 7.2.2 standalone 正确性与完整运行
 
 F1 修改后重建 CCEC、AscendC 和 CPU 三后端，并分别运行 smoke、256 batch 零
-NOP、256 batch 默认 NOP。全部结果的语义断言和后处理都为 PASS；完整用例
+NOP、256 batch 当时默认 NOP。全部结果的语义断言和后处理都为 PASS；完整用例
 仍为 73,728 次 Claim、1,280 个唯一 winner、1,024 个 kernel，placement 总数为
 1,024。关键单轮结果如下：
 
@@ -707,7 +726,7 @@ NOP、256 batch 默认 NOP。全部结果的语义断言和后处理都为 PASS�
 | ---- | -----------------------: | ------: | --: |
 | smoke | `6 / 34.912` | `5 / 40.142` | `6 / 156383.064` |
 | 256 batch、零 NOP | `42546 / 3415.839` | `25515 / 3498.038` | `1983 / 163840.941` |
-| 256 batch、默认 NOP | `40958 / 4019.835` | `47692 / 4283.306` | `1051412 / 185456.323` |
+| 256 batch、当时默认 NOP | `40958 / 4019.835` | `47692 / 4283.306` | `1051412 / 185456.323` |
 
 CPU 只用于语义对照，不作为 A5 性能依据。单轮 fanin load 对 worker 调度非常
 敏感，不能用上表三个数值直接归因，因此又执行了独立进程的交错 A/B。
@@ -715,7 +734,7 @@ CPU 只用于语义对照，不作为 A5 性能依据。单轮 fanin load 对 wo
 #### 7.2.3 CCEC 十对交错 A/B
 
 基线固定在 H1 提交 `2c3dd1e2`，使用 detached worktree
-`/tmp/simpler-f1-baseline`。两端都用 256 batch、默认 NOP、关闭泳道和 phase profile；
+`/tmp/simpler-f1-baseline`。两端都用 256 batch、当时默认 NOP、关闭泳道和 phase profile；
 每个样本是独立进程首轮，统一 60 s timeout。前 5 对为 baseline -> F1，
 后 5 对为 F1 -> baseline。双方均 10/10 PASS、0 timeout、Claim=73,728、CAS retry=0。
 
@@ -819,7 +838,7 @@ request/miss 求和为 210,399/30,283，按总和计算的 miss rate 约 14.3931
 `submit_span_us` 约 47.770。该样本只证明观察闭环可运行，不能替代 256 batch
 约 5 ms 基线，也不能作为性能优化收益。
 
-同一源码和默认 PA NOP 随后完成了 3 个独立进程的
+同一源码和当时默认 PA NOP 随后完成了 3 个独立进程的
 `batches=256,submit-all,PMU-only`。三轮均为 96/96 trusted，owner/slot/role/
 triplet/start/stop 门禁全部 PASS，Restore PASS，且原始 96 核记录重算
 ALL/AIC/AIV 的 `sum/mean/median/p95/max` 与 JSON summary 完全一致：
@@ -929,7 +948,7 @@ D1 已在 standalone 公共调度器中增加 worker-local 软件计数，不新
 `WorkerResult` 在 D1 从 704 B 扩展到 768 B；合入 atomic 泳道计数和 I-cache
 cold/warm 配对字段后，standalone 诊断 sidecar 按完整 cache line 扩展到 832 B。
 原 PMU 字段 offset、生产 DistGlobal/DistCore offset 和 `LocalSlot` ABI 都不变。
-三后端完整重建后，smoke 和 256 batch 默认 NOP 均通过全部语义断言。
+三后端完整重建后，smoke 和 256 batch 当时默认 NOP 均通过全部语义断言。
 
 对任一 worker，若其完成数为 `Cw`、fanin 边数为 `Ew`、失败 load 为 `Fw`，则
 逐核检查：
@@ -956,7 +975,7 @@ atomicMax；CPU 的 FetchMax 是 load/CAS 实现，`A` 只能解释为逻辑调�
 
 #### 7.4.2 CCEC 十轮动态基线
 
-在 256 batch、默认 NOP、关闭泳道和 phase profile 的同一进程十轮基线中，全部
+在 256 batch、当时默认 NOP、关闭泳道和 phase profile 的同一进程十轮基线中，全部
 语义断言和上述计数恒等式均 PASS：
 
 | 指标 | 中位数 | 均值 | nearest-rank p90 | 范围 |
@@ -1147,8 +1166,9 @@ trace 容量不足时必须明确报 overflow 并判该轮观察无效，不能�
 CCEC 只保留一个正式逐 worker Submit 窗口，CPU/AscendC 对应 hook 是空实现，不伪造
 PMU 数据：`submit-all` 在本 worker 通过启动屏障、完成 `ResetTraceLap` 后，于
 orchestration 初始化前打开 gate，在该 worker 最后一次 Submit 返回后关闭。窗口包含
-参数构造、全部 Submit 调度，以及本 worker 在窗口内执行的 winner 计算体：默认模式
-为 scalar NOP，CCEC `real-compute` 模式为真实 Cube/Vector 与对应搬运流水。
+参数构造、全部 Submit 调度，以及本 worker 在窗口内执行的 winner 计算体：当前
+无参数默认的 `real-compute` 是真实 Cube/Vector 与对应搬运流水；显式
+`scalar-nop` 校准样本的 NOP 则在 scalar 上执行并计入窗口。
 
 它是“每核从 orchestration 到最后一次 Submit 返回”的累计窗口，不是全局最早
 `Submit.start` 到最晚 `Submit.end` 的墙钟窗口，也不是逐次 Submit 窗口。
@@ -1334,8 +1354,10 @@ counter 仍不能把 miss 定位到 materialize/register 或某条 atomic。开�
 
 为避免 winner 执行期的 scalar NOP 污染 `scalar_busy`，2026-07-18 先在
 standalone CCEC 增加显式 `--winner-workload real-compute`，没有迁移真实 PA。
-整体无参数默认仍为 `scalar-nop`，保证旧三后端基线不静默变化；选择真计算而未
-指定次数时，QK/SF/PV/UP 使用 `6,28,4,1`。
+在提交 `e66001ff` 对应的这个历史阶段，无参数默认当时仍为 `scalar-nop`，用于
+保证旧三后端基线不静默变化；当时选择真计算而未指定次数时，QK/SF/PV/UP
+使用 `6,28,4,1`。三后端闭环后当前默认已经切换为 `real-compute`，但本节后续
+数据仍按当时的显式模式和参数解读，不能追改成新默认口径。
 
 实现与门禁如下：
 
@@ -1447,9 +1469,12 @@ sentinel，所以 `runs>1` 不会沿用上一轮 winner 结果。
 分层回归中，scalar-NOP b1、real-compute b1 count=`1,1,1,1` 均 PASS；
 后者 Submit span 为 39.821 ms，并校验 4 active tile + 188 sentinel tile。b8
 count=`2,3,2,1` 连续两轮也均 PASS，两轮分别为 80.310/54.185 ms，
-均校验 25 active tile + 167 sentinel tile。同时保留 CLI 互斥和边界门禁：
-real-compute 与 NOP override 不能混用，count 必须与 real-compute 模式一起使用，
-取值限制为 1..128，CCEC 专属 PMU 参数仍会被非 CCEC 后端拒绝。
+均校验 25 active tile + 167 sentinel tile。同时保留 CLI 互斥和边界门禁。在该
+历史阶段，real-compute 与 NOP override 不能混用，count 需要与 real-compute
+模式一起使用，取值限制为 1..128，CCEC 专属 PMU 参数仍会被非 CCEC 后端拒绝。
+当前无参数默认已是 real-compute，因此当前 CLI 允许 count/pattern 直接覆盖默认
+真计算；显式 NOP override 会选择 scalar-nop，显式 real-compute 与 NOP override
+仍然互斥。
 
 CPU 阶段的“对等”只包括 PA 任务调度、AIC/AIV 角色选择、workspace 编址、
 repeat 次数和 768/5/6 数学结果。CPU pthread 调度、普通浮点循环和 x86 atomic
@@ -1493,7 +1518,7 @@ CCEC 先证明公共期望与 PTO `A*B` 语义正确；随后 AscendC 使用同�
 闭合了 A1/B1 错位、普通 KxN B 的 zN→nZ 分形 transpose、ND/NZ stride 和
 FIXPIPE NZ→ND 输出。CPU 只证明 host 公式与调度路由，不把毫秒值外推到 A5。
 三后端又以 `pattern=constant` 做 b1 count1 回归，并以 `smoke all` 回归原
-scalar-NOP，均 PASS，说明诊断模式没有静默改变性能默认或旧控制路径。
+scalar-NOP，均 PASS，说明诊断模式没有静默改变当时的性能默认或旧控制路径。
 
 AscendC 同模式泳道位于
 `outputs/pa_scheduler_swimlane_20260718_125904_3613100/ascendc/`，raw 为
@@ -1506,3 +1531,32 @@ pattern 拒绝回归，当前两种 unittest 入口均为 6/6 PASS。
 该诊断证明一次完整 engine pipeline 的数学和布局，不单独证明同一 task 的 N 次
 repeat 都执行；repeat 完整性仍使用 CCEC count1→count2 engine PMU 精确倍增，
 不把最终覆盖同一 tile 的结果夸大成次数证明。
+
+#### 7.5.13 默认切换为真负载及同口径性能验收
+
+完成 CCEC→AscendC→CPU 分阶段闭环后，共享 `WinnerWorkloadOptions`
+的无参数默认从 `scalar-nop` 切换为
+`real-compute/constant/6,28,4,1`。`smoke` 仍显式固定 b1/r1/scalar-nop=0；
+旧命令未指定 mode 但显式给出 `--nop-count*` 时自动选择 scalar-nop。
+显式 real-compute 与 NOP override、显式 scalar-nop 与 real count/pattern 仍互斥。
+
+性能验收先纠正了观察口径：早先 3.7～4.4 ms 是 `--no-swimlane`，
+真实 PA 5.1 ms 是标准 L2 泳道；泳道记录不仅增加指令，还会改变 worker
+到达、fanin 失败重试和 RingBp，所以不能把两者直接相减成“缺失的调度时间”。
+当前 CCEC b256 真负载、标准泳道、不开逐 atomic 的 5 个独立进程为：
+
+```text
+5002.413 / 4875.193 / 4968.894 / 4992.477 / 4876.282 us
+```
+
+中位数 4,968.894 us。真实 PA 最终三轮中位数 5,115.620 us，同口径
+差 146.726 us，约 2.87%。五轮 standalone 的 QK/SF/PV/UP 每 task 均值
+中位数为 41.461/54.007/28.053/2.649 us，总 core work 已贴近真实 PA，
+不通过增加 repeat 继续硬凑总时间。
+
+保留的一轮 raw 为
+`outputs/performance_gap_20260718/standalone_ccec_real_b256_raw.json`；863,237 条
+记录全部有效，与真实 PA 863,232 条的基本阶段数完全相同，只额外有 5 条
+RingBp。这说明 standalone 已达到“独立复现约 5 ms 调度”的目标；仍然保留
+本文第 6 节的边界：它不依赖 simpler 生产代码，也不复刻真实 PA 数值数据流和
+通用多 group/joint 拓扑。

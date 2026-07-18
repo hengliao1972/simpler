@@ -46,7 +46,7 @@ Standalone winner workload options (CCEC, AscendC, and CPU):
   --real-compute-counts QK,SF,PV,UP
   --real-compute-pattern constant|layout-diagnostic
 
-real-compute is opt-in. Its CCEC-calibrated A5 defaults are QK/SF/PV/UP=6/28/4/1;
+real-compute is the default. Its CCEC-calibrated A5 counts are QK/SF/PV/UP=6/28/4/1;
 one count is one complete 128x128 load/engine/store/completion-wait pipeline
 per winner task, not a scalar NOP count. Explicit count options override those
 four defaults. AscendC must be calibrated independently; CPU only preserves
@@ -197,7 +197,7 @@ case "$ACTION" in
         done
         ;;
     smoke)
-        # smoke 仍启动全部 96 个 worker，并默认注入 1 batch、1 run、0 NOP；
+        # smoke 仍启动全部 96 个 worker，并显式注入 1 batch、1 run、scalar-nop=0；
         # 后置用户参数仍由共享 parser 处理。它用于快速检查原子协议、拓扑和
         # 最终状态，不作为性能数据。
         for argument in "$@"; do
@@ -212,7 +212,8 @@ case "$ACTION" in
             esac
         done
         for backend in "${BACKENDS[@]}"; do
-            run_backend "$backend" --batches 1 --runs 1 --nop-count 0 "$@"
+            run_backend "$backend" --batches 1 --runs 1 \
+                --winner-workload scalar-nop --nop-count 0 "$@"
         done
         ;;
     swimlane)

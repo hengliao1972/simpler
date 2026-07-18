@@ -1202,6 +1202,11 @@ int main(int argc, char **argv) {
                 "[--real-compute-count N | --real-compute-counts QK,SF,PV,UP] "
                 "[--real-compute-pattern constant|layout-diagnostic]\n"
             );
+            std::fprintf(
+                stderr,
+                "Default: real-compute, constant, counts=6,28,4,1; "
+                "scalar-nop is the calibration compatibility mode.\n"
+            );
         }
         return parse_status == pa_scheduler::host::ParseStatus::Help ? EXIT_SUCCESS : EXIT_FAILURE;
     }

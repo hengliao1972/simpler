@@ -26,13 +26,37 @@
 执行。每次运行都会校验这些数量以及最终 TensorMap、heap、cursor、flag、vend、
 frontier 和 worker 状态，任一不符都会返回失败。
 
+Case1 的 task 不是五个彼此独立的占位符。standalone 会从 Tensor descriptor 的
+owner 和本 worker 的 TensorMap 收集 producer，去重后构造下列 fanin 图：
+
+| task | 直接 producer | fanin 数 |
+| --- | --- | ---: |
+| Alloc | 无 | 0 |
+| QK | 无；query/key/block-table 是外部输入 | 0 |
+| SF | QK | 1 |
+| PV | SF | 1 |
+| UP | Alloc、SF、PV；同一 producer 的多个 tensor 会去重 | 3 |
+
+因此每个 batch 恰有 5 条 fanin 边，默认 256 batch 恰有 1,280 条。worker 在
+EfDrain 中逐条读取 producer completion flag，只有全部 ready 才能执行 winner
+负载；descriptor materialize、TensorMap lookup/register、fanin 去重、ring slot
+拷贝和 completion 发布都走实际的 standalone 调度路径。
+
+这里的“依赖对等”是 **Case1 调度依赖图对等**，不是 PA 数值数据流复刻。
+`real-compute` workspace 的 QK/SF/PV/UP 都读取同一组受控输入，并写入各
+worker-kind 的独占输出 tile；QK 的数值输出没有作为 SF 的真计算输入，SF/PV
+的数值输出也没有继续串到后继真计算中。fanin 会真实约束执行次序，但 workspace
+只校验每类 Cube/Vector 算术和角色路由。Case1 只有一个 block group 且
+`q_loop=1`；通用 PA 的多 group、多 q-loop、跨迭代数据更新以及 joint/mixed
+task 依赖当前均未覆盖，不能从本用例外推其 fanin 数量或时序。
+
 有意保留的替代只有两类：
 
-1. 三后端默认的 `scalar-nop` 模式仍以可控 NOP 标定 QK/SF/PV/UP，保留旧基线。
-   三后端也都已支持显式 `real-compute`：CCEC 和 AscendC 在 A5 上让 QK/PV
+1. 三后端当前无参数默认使用 `real-compute`：CCEC 和 AscendC 在 A5 上让 QK/PV
    执行完整 Cube matmul，让 SF/UP 执行完整 Vector add/mul，并覆盖 GM load、
    引擎计算、GM store 和完成等待；CPU 使用同一 `128x128 float` 输入、输出布局
    执行普通浮点 matmul/add/mul，只用于回归算术、角色路由和输出闭环。
+   `scalar-nop` 仍作为显式兼容/校准模式保留；历史 NOP 数据继续按当时口径解释。
 2. simpler 的 AICPU/runtime 装载链路由本目录 host runner 代替；测试关注的
    首个 Submit 到最后一个 Submit 区间不含 AICPU 初始化和最终回收。
 
@@ -62,11 +86,11 @@ Cube/Vector 指令、流水线、GM 搬运和 PMU 语义，host pthread 耗时�
 
 ## 3. Winner 计算负载
 
-### 3.1 三后端默认 `scalar-nop`
+### 3.1 三后端 `scalar-nop` 兼容/校准模式
 
 真实 PA 最好泳道中四类 kernel 的 1 GHz counter 均值和当前 A5 NOP 校准值为：
 
-| Kernel | 目标时间 | 默认 NOP 数 |
+| Kernel | 目标时间 | `scalar-nop` 标定数 |
 | --- | ---: | ---: |
 | QK | 44.170 us | 129,600 |
 | SF | 53.729 us | 157,900 |
@@ -77,16 +101,20 @@ Alloc 没有模拟 kernel body。NOP 数是 A5 实测校准量，不应解释为
 可以在运行时覆盖：
 
 ```bash
-./run.sh run ccec --nop-count 100000
-./run.sh run ccec --nop-counts 129600,157900,79950,2400
+./run.sh run ccec --winner-workload scalar-nop --nop-count 100000
+./run.sh run ccec --winner-workload scalar-nop \
+  --nop-counts 129600,157900,79950,2400
 ```
 
 `--nop-count N` 同时设置四类 kernel；`--nop-counts` 的顺序固定为
-QK、SF、PV、UP，允许范围为 0 到 10,000,000。
+QK、SF、PV、UP，允许范围为 0 到 10,000,000。兼容旧命令时，显式提供
+`--nop-count*` 而不写 `--winner-workload` 也会自动选择 `scalar-nop`；新脚本
+建议像上面一样把模式写明，避免把校准样本误认成当前默认真计算。
 
-### 3.2 三后端 `real-compute` 模式
+### 3.2 三后端默认 `real-compute` 模式
 
-三后端共用同一组参数，可通过 `all` 按 CCEC、AscendC、CPU 的顺序统一运行：
+三后端当前无参数运行即选择 `real-compute`。三后端共用同一组参数，可通过
+`all` 按 CCEC、AscendC、CPU 的顺序统一运行；命令中显式写出模式仍然有效：
 
 ```bash
 ./run.sh run all \
@@ -154,8 +182,10 @@ worker-kind 的最终 tile 必须分别等于 QK/PV 的 768、SF 的 5、UP 的 
 41.336、54.039、27.971 us，接近真实 PA 的 44.170、53.729、27.626 us。
 UP 的一次完整 `128x128` 流水约 2.5 us，已经是正整数迭代下限；若后续要贴近
 1.565 us，应缩小 UP tile，不能用 0 次掩盖执行。真实计算下 Cube/Vector 会在
-不同物理子核并行，因此 CCEC 整体 Submit 约 3.6～3.8 ms，不应增加无关工作量
-硬凑 5.1 ms。AscendC 的独立实测见 6.2 节；CPU 数值不进入 A5 性能对比。
+不同物理子核并行；关闭泳道和开启标准泳道还会改变 worker 到达、fanin 重试与
+RingBp，不能把两种观察布局的绝对时间直接相减。当前 `6,28,4,1` 优先贴近
+真实 PA 的 **per-task core work**，不通过增加无关 repeat 硬凑 5.1 ms。
+同观察口径的完整验收见 6.5 节；CPU 数值不进入 A5 性能对比。
 
 ## 4. 本机依赖和构建
 
@@ -232,9 +262,10 @@ semantic_status=PASS postprocess_status=PASS
   --profile-phases --analyze-swimlane
 ```
 
-这两条未传 `--winner-workload`，都使用默认 scalar-NOP；需要真计算时按
-3.2 节显式传入 `--winner-workload real-compute`。CPU 使用同一选项；
-需同配置串行回归三后端时，直接把 backend 换成 `all`。
+这两条未传 `--winner-workload`，使用当前默认 `real-compute` 和
+`6,28,4,1`。需要复现历史 NOP 基线时按 3.1 节显式传入
+`--winner-workload scalar-nop`；CPU 使用同一选项。需同配置串行回归三后端
+时，直接把 backend 换成 `all`，但 CPU 真计算只作协议/算术回归，不作 A5 性能值。
 
 此模式输出指标和泳道统计，但不会自动落盘 JSON。若只关注性能且不需要完整
 泳道逐事件分析，可去掉 `--analyze-swimlane`；若也不需要记录泳道，可使用
@@ -597,8 +628,9 @@ mkdir -p "$OUT"
   --pmu-json "$OUT/pmu_submit_all.json"
 ```
 
-上述命令没有选择 winner 模式，采集的是默认 `scalar-nop`。验证真实引擎计数时
-必须显式写出模式和次数，例如已用于 count 倍增取证的 b8 命令：
+上述命令没有选择 winner 模式，采集的是当前默认 `real-compute` 和
+`6,28,4,1`。为了让 PMU 取证参数自描述，正式样本仍建议显式写出模式和次数；
+例如已用于 count 倍增取证的 b8 命令：
 
 ```bash
 ./run.sh run ccec \
@@ -661,8 +693,9 @@ selector、owner/slot/role/triplet 与 Restore 门禁：all/AIC/AIV 的 total �
 证明 `submit-all` 观察闭环可运行；`batches=1`、零模拟计算体和单次运行都不足以
 支持 256 batch 性能归因或真实 PA 绝对结论。
 
-按上述正式命令和默认 PA NOP 还完成了 3 个独立进程的 256 batch
-PMU-only 验收。Submit span 为 3,688.236/4,089.057/4,673.237 us，中位数
+按当时的正式命令和当时默认 PA NOP，还完成了 3 个独立进程的 256 batch
+PMU-only 验收。该段保留的是切换默认模式之前的历史样本。Submit span 为
+3,688.236/4,089.057/4,673.237 us，中位数
 4,089.057 us；I-cache request 总和为 69,812,583/69,451,706/70,065,443，miss
 总和为 5,854,421/5,847,256/5,830,645，miss rate 为 8.3859%/8.4192%/8.3217%。
 三轮均通过 96 核、owner/slot/role/triplet、start/stop、counter 风险门槛和 Restore，
@@ -839,7 +872,8 @@ CPU 上的 matmul/add/mul 是普通 x86 浮点循环，`[KERNEL]`、`submit_span
 
 ### 6.4 2026-07-18 非均匀布局诊断
 
-常量 2/3 会掩盖 `B` 转置和分形重排错误，因此在性能默认不变的前提下增加了
+常量 2/3 会掩盖 `B` 转置和分形重排错误，因此在不改变 `constant` 性能输入默认的
+前提下增加了
 `--real-compute-pattern layout-diagnostic`。按 CCEC → AscendC → CPU 的顺序，
 三后端均以 b1、count=`1,1,1,1` 运行同一带权对角 A 和非对称 B，并逐元素扫描
 4 个 active tile 与 188 个 inactive sentinel tile，全部 PASS：
@@ -858,6 +892,40 @@ AscendC 诊断泳道位于
 
 诊断只证明单次完整迭代的数学与数据布局闭环；默认常量性能负载仍用于稳定比较，
 CCEC 的 repeat 次数证明仍以 count1→count2 的 engine PMU 精确倍增为准。
+
+### 6.5 2026-07-18 默认真负载与 5 ms 口径验收
+
+三后端重编后，无 workload 参数的 b1 均打印
+`mode=real-compute pattern=constant counts=6,28,4,1`，并通过 96 核、5 个
+fanin/batch、唯一 winner、角色路由、TensorMap/heap/completion 与数值输出断言。
+旧命令只给 `--nop-count 0` 时会显式打印 `mode=scalar-nop`，证明兼容
+分支没有让 NOP override 静默失效。
+
+CCEC b256 关闭泳道的 3 个独立进程为 4,411.760/4,297.704/4,677.634 us，
+中位数 4,411.760 us；它只用于无观察热路对比。与真实 PA 5.1 ms 比较时，
+必须同样开启标准泳道且不开逐 atomic；standalone 5 个独立进程为：
+
+```text
+5002.413 / 4875.193 / 4968.894 / 4992.477 / 4876.282 us
+```
+
+中位数为 **4,968.894 us**。真实 PA 最终三轮为
+5,115.620/5,145.057/5,096.685 us，中位数 **5,115.620 us**；同口径差值
+146.726 us，约 2.87%，已满足独立调度复现目标。五轮 standalone 的
+QK/SF/PV/UP 每 task 均值中位数为 41.461/54.007/28.053/2.649 us，
+与真实 44.170/53.729/27.626/1.565 us 的总 core work 接近，不再调整
+repeat 追求逐微秒一致。
+
+只保留一轮标准泳道原始证据：
+
+```text
+outputs/performance_gap_20260718/standalone_ccec_real_b256_raw.json
+```
+
+该轮有 863,237 条记录、`dropped=0`，比真实 PA 的 863,232 条只多 5 条
+RingBp；两端的 122,880 个 Submit 与各前端阶段、1,024 个 Kernel/Fanin/Build
+数量一致。这证明总体性能已接近，不等于真实 PA 数值数据流、代码生成与通用
+多 group/joint 调度已完全相同。
 
 ## 7. 内存占用和脱仓复制
 

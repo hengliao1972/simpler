@@ -80,10 +80,11 @@ static_assert((kPayloadSlots & kPayloadMask) == 0, "payload slots must be a powe
 static_assert(kMaxTasks < kTaskCellCapacity, "every frontier scan must terminate on an in-range not-ready flag");
 
 // These are the measured means from the best PA A5 trace, in 1 GHz ticks.
-// The scalar-NOP baseline calibrates its counts against these targets.
-// 默认模式只用 NOP 代替四个计算 kernel；CCEC 显式 real-compute 模式改用
-// 完整 Cube/Vector 流水。两种模式的 Submit、依赖、heap 与 completion 路径
-// 均不靠 NOP 补时。target 是真实泳道均值，不是调度阶段预算。
+// The scalar-NOP compatibility baseline calibrates its counts against these targets.
+// 无参数默认使用 real-compute：CCEC/AscendC 执行完整 Cube/Vector 流水，
+// CPU 执行对等算术；下列 NOP 常量只供显式 scalar-nop 校准。两种模式的
+// Submit、依赖、heap 与 completion 路径都不靠补时修改。target 是真实泳道
+// 均值，不是调度阶段预算。
 constexpr uint32_t kTargetQkTicks = 44170;
 constexpr uint32_t kTargetSfTicks = 53729;
 constexpr uint32_t kTargetPvTicks = 27626;
