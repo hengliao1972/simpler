@@ -97,6 +97,51 @@ for entry in pa_scheduler_0_mix_aic pa_scheduler_0_mix_aiv; do
 done
 echo "[CHECK] both 1:2 mixed entries and metadata sections are present"
 
+check_icache_probe_layout() {
+    local role="$1"
+    local target="pa_icache_target_${role}"
+    local harness="pa_icache_measure_${role}"
+    local thrash="pa_icache_thrash_${role}"
+    local target_record
+    local harness_record
+    local thrash_record
+    target_record="$(awk -v name="$target" '$4 == "FUNC" && index($NF, name) != 0 {print $2, $3; exit}' <<<"$SYMBOL_TABLE")"
+    harness_record="$(awk -v name="$harness" '$4 == "FUNC" && index($NF, name) != 0 {print $2, $3; exit}' <<<"$SYMBOL_TABLE")"
+    thrash_record="$(awk -v name="$thrash" '$4 == "FUNC" && index($NF, name) != 0 {print $2, $3; exit}' <<<"$SYMBOL_TABLE")"
+    if [[ -z "$target_record" || -z "$harness_record" || -z "$thrash_record" ]]; then
+        echo "Missing I-cache probe symbols for $role" >&2
+        exit 1
+    fi
+
+    local target_hex target_size harness_hex harness_size thrash_hex thrash_size
+    read -r target_hex target_size <<<"$target_record"
+    read -r harness_hex harness_size <<<"$harness_record"
+    read -r thrash_hex thrash_size <<<"$thrash_record"
+    local target_address=$((16#$target_hex))
+    local harness_address=$((16#$harness_hex))
+    local thrash_address=$((16#$thrash_hex))
+    if (( target_address % 128 != 0 || target_size == 0 || target_size > 16 )); then
+        echo "Invalid single-fetch-block I-cache target for $role: address=0x$target_hex size=$target_size" >&2
+        exit 1
+    fi
+    if (( thrash_size < 65536 )); then
+        echo "I-cache thrash body is smaller than 64 KiB for $role: size=$thrash_size" >&2
+        exit 1
+    fi
+    if (( harness_address % 128 != 0 || target_address + 128 > harness_address ||
+          harness_address + harness_size > thrash_address )); then
+        echo "I-cache layout must be target -> harness -> thrash for $role" >&2
+        exit 1
+    fi
+    echo "[CHECK] $role I-cache target=0x$target_hex/$target_size harness=0x$harness_hex/$harness_size "\
+         "thrash=0x$thrash_hex/$thrash_size"
+}
+
+# 编译器不能把目标扩到两个 16B fetch block，也不能折叠 64 KiB 冲刷体；否则
+# cold/warm 虽然仍可能产生数字，却不再代表可解释的单次 I-cache miss。
+check_icache_probe_layout aic
+check_icache_probe_layout aiv
+
 # host runner 只链接用户 CANN 9.1 的 ACL/runtime，并写入同一安装目录的 rpath，运行时不需要 simpler 动态库。
 # `-Werror` 让 host API 签名或尺寸类型变化在构建期暴露，避免到上板阶段才出现参数截断。
 echo "[BUILD] CCEC host runner"

@@ -790,7 +790,53 @@ tests/atomic_probe/pa_scheduler/outputs/pmu_validation/
   scalar2x100k_10_20260718_021035_console.log
 ~~~
 
-#### 7.3.3 阶段决定与后续使用边界
+#### 7.3.3 单次 CNT7 I-cache miss 的时间标尺
+
+此前 100000 NOP 的 aggregate residual 只能证明 I-cache 事件会响应，不能把一段
+热循环里的多次 request/miss 直接除成“单次 miss 延迟”。为给 scalar 性能分析
+建立与“单次 atomic 约 160 ns”同样直观的数量级，CCEC 新增
+`--pmu-window icache-single` 配对校准：目标函数只有 8 B 并按 128 B I-cache line
+对齐；每个 cold trial 先在窗口外执行 64 KiB 指令 capacity sweep，warm trial 则在
+PMU read-clear 前额外调用一次相同目标。1 GHz sys counter 只包住最终目标调用，
+两条路径的 PMU gate、harness 和目标符号完全相同。
+
+64 trials/core × 10 轮以及 128 trials/core × 5 轮均满足：
+
+~~~text
+cold CNT7 miss == trials
+warm CNT7 miss == 0
+miss_delta == 96 * trials
+calibrated_cores == 96/96
+~~~
+
+总体系数的观测范围为 86.532～89.648 ns/miss；同一时段重跑 64 和 128 trials
+都约为 89.6 ns/miss，说明几 ns 的变化属于并发环境下的有效 miss penalty 波动，
+不应保留成伪精确常数。后续 scalar 分析使用下面的取整公式即可：
+
+~~~text
+T_icache_est_ns = CNT7_miss_total * 90
+T_icache_est_us = CNT7_miss_total * 0.09
+~~~
+
+即 1,000 个 miss 约解释 90 us，10,000 个约解释 0.9 ms；单次 I-cache miss 的
+量级约为当前 160 ns atomic 标尺的 56%。如果结果已经按角色拆开，也可以使用当次
+探针打印的 AIC/AIV 系数分别计算后相加；只有总 miss 时统一乘 90 ns。
+
+compulsory、capacity、conflict miss 都会进入 `CNT7` 总数，PMU 本身不提供原因
+分类，所以上式三类全算。本探针刻意制造的是 capacity eviction，测得的是 96 核
+并发、cold 相对 warm 的一阶等效时间。真实 scalar 路径可能存在预取、多个 miss
+重叠、不同下级命中位置或排队，因此乘积用于直观归因和数量级判断，不能宣称为
+逐次精确、完全可加的 stall 时间。
+
+原始日志为：
+
+~~~text
+tests/atomic_probe/pa_scheduler/outputs/pmu_validation/
+  icache_single_64x10_20260718_085929_3232836_console.log
+  icache_single_128x5_20260718_090151_3235468_console.log
+~~~
+
+#### 7.3.4 阶段决定与后续使用边界
 
 O1 已达到“可用”的门槛：物理核映射、事件 selector、正向敏感性、A/A 重复性
 和双 gate 累计全部在真实 A5 上得到动态验证。因此后续可以恢复 atomic 优化，
@@ -816,9 +862,10 @@ D1 已在 standalone 公共调度器中增加 worker-local 软件计数，不新
 - 扫描遇到 not-ready flag 退出时递增 terminal load。
 
 计数先保存在本核 `LocalStats`，kernel 结束时才发布到独占 `WorkerResult`。
-`WorkerResult` 从 704 B 扩展到 768 B，但原 PMU 字段 offset、生产 DistGlobal/DistCore
-offset 和 `LocalSlot` ABI 都不变。三后端完整重建后，smoke 和 256 batch 默认 NOP
-均通过全部语义断言。
+`WorkerResult` 在 D1 从 704 B 扩展到 768 B；合入 atomic 泳道计数和 I-cache
+cold/warm 配对字段后，standalone 诊断 sidecar 按完整 cache line 扩展到 832 B。
+原 PMU 字段 offset、生产 DistGlobal/DistCore offset 和 `LocalSlot` ABI 都不变。
+三后端完整重建后，smoke 和 256 batch 默认 NOP 均通过全部语义断言。
 
 对任一 worker，若其完成数为 `Cw`、fanin 边数为 `Ew`、失败 load 为 `Fw`，则
 逐核检查：

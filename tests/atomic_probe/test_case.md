@@ -468,7 +468,31 @@ cd tests/atomic_probe/ccec
 | `ascendc/mb2_flags_clobber.asc` | gating + observation | AtomicMax flags 无丢失；store+dcci 仅统计 |
 | `ascendc/mb8_dcci_seam.asc` / `ccec/dcci_seam.cpp` | gating | clean reader 的 DEFAULT/ALL/OUT/ATOMIC/no-DCCI 五模式精确对照 |
 | `ascendc/dcci_atomic_clobber.asc` / `ccec/dcci_atomic_clobber.cpp` | regression gating + control | 同-line 三 selector 当前明确失败；分-line 与 no-DCCI 五模式精确通过 |
+| `pa_scheduler/ccec/kernel.cpp` | calibration | cold/warm 同核配对；每个 cold trial 严格增加一个 CNT7 I-cache miss，建立 scalar 时间标尺 |
 | `cpu/cpu_atomicity.cpp` | gating + observation | coherent CPU 同/异 cacheline 同构 control、atomic、snapshot、spinlock |
+
+### PA I-cache 单 miss 实测数据
+
+2026-07-18 在 device 0、32 AIC + 64 AIV 并发、`msprof PipeUtilization` 下，
+`icache-single` 得到以下结果。时间列为多轮 `ns/miss` 中位数，括号内是最小值～最大值：
+
+| 配置 | 每轮 cold/warm CNT7 miss（ALL） | 严格门禁 | ALL | AIC | AIV |
+|---|---:|---:|---:|---:|---:|
+| 64 trials/core × 10 | 6,144 / 0（2,048 AIC + 4,096 AIV） | 10/10 PASS | 86.596（86.532～86.792） | 85.913（85.848～86.202） | 86.938（86.861～87.086） |
+| 128 trials/core × 5 | 12,288 / 0（4,096 AIC + 8,192 AIV） | 5/5 PASS | 89.629（89.615～89.648） | 92.100（91.984～92.267） | 88.410（88.310～88.440） |
+
+两组每轮均为 `calibrated_cores=96/96`，并通过 “each cold trial adds exactly
+one CNT7 I-cache miss” 断言。AIC/AIV 差值只有数 ns 且方向随运行时段变化，
+因此不建立两个伪精确常数。原始日志为
+[`64×10`](pa_scheduler/outputs/pmu_validation/icache_single_64x10_20260718_085929_3232836_console.log)
+和
+[`128×5`](pa_scheduler/outputs/pmu_validation/icache_single_128x5_20260718_090151_3235468_console.log)。
+
+PA scalar 分析只需要数量级时，使用 `T_icache_est_ns = CNT7_miss_total * 90`；例如
+1,000 个 I-cache miss 约为 90 us。compulsory、capacity、conflict miss 都包含在
+`CNT7_miss_total` 内。该乘积是 cold/warm 校准得到的一阶等效时间，不是逐次精确
+可加的 stall；方法、角色分项和原始日志见
+[`PA调度器独立复现与泳道使用指南.md`](pa_scheduler/PA调度器独立复现与泳道使用指南.md#单次-cnt7-i-cache-miss-的-scalar-估算标尺)。
 
 ## 判定标准与退出码规则
 

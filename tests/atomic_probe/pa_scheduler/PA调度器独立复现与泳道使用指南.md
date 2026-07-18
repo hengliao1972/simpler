@@ -301,6 +301,10 @@ CCEC 后端提供一个显式诊断模式，用来验证局部 scalar 性能观�
 | `pmu_scalar_busy` | `CNT2 = 0x1` | scalar 原始事件计数 |
 | `pmu_icache_requests` | `CNT6 = 0x34` | I-cache request |
 | `pmu_icache_misses` | `CNT7 = 0x35` | I-cache miss |
+| `pmu_window_ticks` | 1 GHz sys counter | cold 目标调用窗口，1 tick = 1 ns |
+| `pmu_warm_total_cycles` | PMU total | 同核 warm 对照窗口累计周期 |
+| `pmu_warm_window_ticks` | 1 GHz sys counter | warm 目标调用窗口 |
+| `pmu_warm_icache_requests/misses` | `CNT6/CNT7` | 同核 warm 对照 request/miss |
 
 selector 和 PMU framework 仍由 CANN 9.1 的 task-based profiler 配置；CCEC
 只做门控与读取。一次 snapshot 会消费/清除此前累计，因此窗口前先冻结并做一次
@@ -327,13 +331,18 @@ msprof \
   --pmu-window empty
 ```
 
-三个诊断窗口的用途是：
+各诊断模式的用途是：
 
 - `empty`：只执行一次 start/stop，量空窗口的 gate 固定开销；末尾 snapshot 在
   stop 后执行，其 MMIO 读取开销不计入 total；
 - `scalar`：在同一窗口内执行 `--pmu-scalar-nops N` 个受控 NOP；
 - `scalar-double`：执行两段相同 NOP，中间只 stop/start、不读 counter，用于验证
   多个局部窗口能否暂停后继续累计；
+- `icache-single`：每核反复执行同一个 8 B、128 B line 对齐的目标函数。cold
+  路径先在计时窗外执行 64 KiB 指令 sweep 逐出目标，warm 路径再在 read-clear
+  前预取一次相同目标；target、harness、thrash 的链接顺序由构建门禁核对。每个
+  phase 先丢弃一次分支训练样本，AIC/AIV 内各由一半 worker 采用 cold-first、
+  一半采用 warm-first；
 - `off`：默认值，不申请 MMIO 表，也不要求由 `msprof` 启动。
 
 例如 10 万 NOP 的正向敏感性测试只需把末尾参数换成：
@@ -341,6 +350,23 @@ msprof \
 ```bash
 --pmu-window scalar --pmu-scalar-nops 100000
 ```
+
+单次 I-cache miss 标尺使用：
+
+```bash
+--pmu-window icache-single --pmu-icache-trials 64
+```
+
+除通用 PMU 断言外，每轮还必须看到：
+
+```text
+icache_pairs=96/96 calibrated_cores=96/96
+[ASSERT] each cold trial adds exactly one CNT7 I-cache miss PASS
+```
+
+门禁逐核要求 cold 的 `CNT7 == trials`、warm 的 `CNT7 == 0`，并要求 cold-warm
+时间差为正。也就是说，最终系数的分母不是推测的循环次数，而是严格闭合的
+`CNT7` miss 差值。
 
 每轮必须同时看到：
 
@@ -369,6 +395,38 @@ rate 使用 `sum(miss) / sum(request)`，不平均逐核百分比。`pmu_scalar_
 变化，也证明 stop/start 之间不读 counter 时，多段窗口会累计到末尾唯一一次
 snapshot。首次热身的 p95 偶有偏高，正式比较应丢弃首轮，并保留 A/A
 重复性数据。
+
+#### 单次 CNT7 I-cache miss 的 scalar 估算标尺
+
+2026-07-18 的 96 核并发 cold/warm 配对结果中，每个 cold trial 都严格增加一个
+`CNT7` miss，warm miss 恒为 0。64 trials/core 的 10 轮总体系数为
+86.532～86.792 ns/miss；同一日稍后 128 trials/core 的 5 轮为
+89.615～89.648 ns/miss。64 trials/core 在后一时段复测也约为 89.6 ns/miss，
+因此 86 与 90 ns 的差异主要反映运行时段和共享下级存储状态，不值得作为 scalar
+归因标尺保留小数精度。工程分析统一取整为：
+
+```text
+估算的 scalar I-cache miss 时间(ns) = CNT7_I-cache_miss_total × 90
+估算的 scalar I-cache miss 时间(us) = CNT7_I-cache_miss_total × 0.09
+```
+
+例如 1,000 次 miss 约为 90 us，10,000 次约为 0.9 ms。若已有 AIC/AIV 分项，
+可以分别乘各自当次校准输出的 `[ICACHE-FORMULA-AIC/AIV]`；只需要总量级时直接
+使用 90 ns/miss，避免伪精确。
+
+`CNT7` 只报告 I-cache miss 总数，不区分 compulsory、capacity 和 conflict 原因；
+三类都应计入上式。本探针用 64 KiB sweep 明确制造 capacity eviction，因此得到的
+是 96 核并发条件下、cold 相对 warm 的有效 miss penalty。它适合回答“这些 miss
+大约能解释多少 scalar 时间”，不是硬件逐次给出的可加 stall：真实代码中的预取、
+miss 重叠、下级命中位置和并发排队都会让实际关键路径与简单乘积有偏差。
+
+原始输出保留在：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/pmu_validation/
+  icache_single_64x10_20260718_085929_3232836_console.log
+  icache_single_128x5_20260718_090151_3235468_console.log
+```
 
 这里验证的是观察手段，不是 PA 优化本身。后续用于 Claim、EfDrain、
 WaitForSlot 或 HeapGuard 时，应先做一次 baseline read-clear，多个局部窗口之间只切

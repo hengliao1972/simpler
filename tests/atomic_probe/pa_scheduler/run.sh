@@ -35,8 +35,9 @@ Benchmark options:
   --no-swimlane
 
 CCEC-only PMU probe options (the host must be launched by msprof PipeUtilization):
-  --pmu-window off|empty|scalar|scalar-double
+  --pmu-window off|empty|scalar|scalar-double|icache-single
   --pmu-scalar-nops N
+  --pmu-icache-trials N
 
 The swimlane action enables atomic tracing by default. For the lower-level run
 action, --trace-atomics still requires swimlane tracing; add

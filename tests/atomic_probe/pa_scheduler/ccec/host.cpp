@@ -54,6 +54,7 @@ std::vector<char> ReadBinary(const std::string &path) {
 struct PmuOptions {
     pa_scheduler::ccec_pmu::WindowMode mode = pa_scheduler::ccec_pmu::WindowMode::Off;
     uint32_t scalar_nops = 100000;
+    uint32_t icache_trials = 64;
 };
 
 const char *PmuModeName(pa_scheduler::ccec_pmu::WindowMode mode) {
@@ -66,6 +67,8 @@ const char *PmuModeName(pa_scheduler::ccec_pmu::WindowMode mode) {
         return "scalar";
     case pa_scheduler::ccec_pmu::WindowMode::ScalarDouble:
         return "scalar-double";
+    case pa_scheduler::ccec_pmu::WindowMode::IcacheSingle:
+        return "icache-single";
     }
     return "invalid";
 }
@@ -74,11 +77,13 @@ bool ParsePmuOptions(int argc, char **argv, PmuOptions *pmu, std::vector<char *>
     // PMU 参数只属于 CCEC 验证分支；先摘出再交给三后端共享 parser，避免 CPU/AscendC 静默接受却不生效。
     bool mode_seen = false;
     bool nops_seen = false;
+    bool icache_trials_seen = false;
     common_argv->clear();
     common_argv->push_back(argv[0]);
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
-        if (argument != "--pmu-window" && argument != "--pmu-scalar-nops") {
+        if (argument != "--pmu-window" && argument != "--pmu-scalar-nops" &&
+            argument != "--pmu-icache-trials") {
             common_argv->push_back(argv[index]);
             continue;
         }
@@ -101,24 +106,39 @@ bool ParsePmuOptions(int argc, char **argv, PmuOptions *pmu, std::vector<char *>
                 pmu->mode = pa_scheduler::ccec_pmu::WindowMode::Scalar;
             } else if (name == "scalar-double") {
                 pmu->mode = pa_scheduler::ccec_pmu::WindowMode::ScalarDouble;
+            } else if (name == "icache-single") {
+                pmu->mode = pa_scheduler::ccec_pmu::WindowMode::IcacheSingle;
             } else {
                 std::fprintf(
-                    stderr, "Invalid --pmu-window value: %s (expected off|empty|scalar|scalar-double)\n", value
+                    stderr,
+                    "Invalid --pmu-window value: %s "
+                    "(expected off|empty|scalar|scalar-double|icache-single)\n",
+                    value
                 );
                 return false;
             }
             mode_seen = true;
-        } else {
+        } else if (argument == "--pmu-scalar-nops") {
             if (nops_seen || !pa_scheduler::host::ParseUint(value, 0, 10000000, &pmu->scalar_nops)) {
                 std::fprintf(stderr, "Invalid or duplicate --pmu-scalar-nops value: %s\n", value);
                 return false;
             }
             nops_seen = true;
+        } else {
+            if (icache_trials_seen || !pa_scheduler::host::ParseUint(value, 1, 10000, &pmu->icache_trials)) {
+                std::fprintf(stderr, "Invalid or duplicate --pmu-icache-trials value: %s\n", value);
+                return false;
+            }
+            icache_trials_seen = true;
         }
     }
     if (nops_seen && pmu->mode != pa_scheduler::ccec_pmu::WindowMode::Scalar &&
         pmu->mode != pa_scheduler::ccec_pmu::WindowMode::ScalarDouble) {
         std::fprintf(stderr, "--pmu-scalar-nops requires a scalar PMU window.\n");
+        return false;
+    }
+    if (icache_trials_seen && pmu->mode != pa_scheduler::ccec_pmu::WindowMode::IcacheSingle) {
+        std::fprintf(stderr, "--pmu-icache-trials requires the icache-single PMU window.\n");
         return false;
     }
     return true;
@@ -195,23 +215,73 @@ bool MapPmuRegisters(uint32_t device, PmuRegisterMappings *mappings) {
 void ConfigurePmu(pa_scheduler::SchedulerState *state, const PmuOptions &pmu, const void *register_table) {
     using namespace pa_scheduler::ccec_pmu;
     state->config.reserved[kConfigMode] = static_cast<uint32_t>(pmu.mode);
-    state->config.reserved[kConfigScalarNops] = pmu.scalar_nops;
+    state->config.reserved[kConfigWorkAmount] =
+        pmu.mode == WindowMode::IcacheSingle ? pmu.icache_trials : pmu.scalar_nops;
     StorePointer(state->config.reserved, register_table);
     state->config.reserved[kConfigMagic] = pmu.mode == WindowMode::Off ? 0 : kConfigMagicValue;
 }
 
 struct PmuAggregate {
     std::vector<uint64_t> total_cycles;
+    std::vector<uint64_t> warm_total_cycles;
+    uint64_t window_ticks = 0;
+    uint64_t warm_window_ticks = 0;
     uint64_t scalar_busy = 0;
     uint64_t icache_requests = 0;
     uint64_t icache_misses = 0;
+    uint64_t warm_icache_requests = 0;
+    uint64_t warm_icache_misses = 0;
 };
 
 void AddPmuSample(const pa_scheduler::WorkerResult &result, PmuAggregate *aggregate) {
     aggregate->total_cycles.push_back(result.pmu_total_cycles);
+    aggregate->warm_total_cycles.push_back(result.pmu_warm_total_cycles);
+    aggregate->window_ticks += result.pmu_window_ticks;
+    aggregate->warm_window_ticks += result.pmu_warm_window_ticks;
     aggregate->scalar_busy += result.pmu_scalar_busy;
     aggregate->icache_requests += result.pmu_icache_requests;
     aggregate->icache_misses += result.pmu_icache_misses;
+    aggregate->warm_icache_requests += result.pmu_warm_icache_requests;
+    aggregate->warm_icache_misses += result.pmu_warm_icache_misses;
+}
+
+bool PrintSingleIcacheAggregate(const char *name, const PmuAggregate &aggregate, uint32_t trials_per_core) {
+    const pa_scheduler::host::Uint64Distribution cold_cycles =
+        pa_scheduler::host::SummarizeUint64(aggregate.total_cycles);
+    const pa_scheduler::host::Uint64Distribution warm_cycles =
+        pa_scheduler::host::SummarizeUint64(aggregate.warm_total_cycles);
+    const int64_t cycle_delta = static_cast<int64_t>(cold_cycles.total) - static_cast<int64_t>(warm_cycles.total);
+    const int64_t tick_delta =
+        static_cast<int64_t>(aggregate.window_ticks) - static_cast<int64_t>(aggregate.warm_window_ticks);
+    const int64_t miss_delta =
+        static_cast<int64_t>(aggregate.icache_misses) - static_cast<int64_t>(aggregate.warm_icache_misses);
+    const uint64_t attempted = static_cast<uint64_t>(trials_per_core) * aggregate.total_cycles.size();
+    const double misses_per_trial = attempted == 0 ? 0.0 : static_cast<double>(miss_delta) / attempted;
+    const double cycles_per_miss = miss_delta <= 0 ? 0.0 : static_cast<double>(cycle_delta) / miss_delta;
+    // get_sys_cnt 是本用例既有的 1 GHz 时间基准，因此一个 tick 直接对应 1 ns。
+    const double ns_per_miss = miss_delta <= 0 ? 0.0 : static_cast<double>(tick_delta) / miss_delta;
+    std::printf(
+        "[ICACHE-SINGLE-%s] cores=%zu trials_per_core=%u attempted=%llu "
+        "cold_cycles=%llu warm_cycles=%llu cycle_delta=%lld cold_ticks=%llu warm_ticks=%llu tick_delta=%lld "
+        "cold_req=%llu warm_req=%llu cold_miss=%llu warm_miss=%llu miss_delta=%lld "
+        "misses_per_trial=%.6f cycles_per_miss=%.3f ns_per_miss=%.3f\n",
+        name, aggregate.total_cycles.size(), trials_per_core, static_cast<unsigned long long>(attempted),
+        static_cast<unsigned long long>(cold_cycles.total), static_cast<unsigned long long>(warm_cycles.total),
+        static_cast<long long>(cycle_delta), static_cast<unsigned long long>(aggregate.window_ticks),
+        static_cast<unsigned long long>(aggregate.warm_window_ticks), static_cast<long long>(tick_delta),
+        static_cast<unsigned long long>(aggregate.icache_requests),
+        static_cast<unsigned long long>(aggregate.warm_icache_requests),
+        static_cast<unsigned long long>(aggregate.icache_misses),
+        static_cast<unsigned long long>(aggregate.warm_icache_misses), static_cast<long long>(miss_delta),
+        misses_per_trial, cycles_per_miss, ns_per_miss
+    );
+    std::printf(
+        "[ICACHE-FORMULA-%s] estimated_scalar_icache_time_ns = cnt7_icache_miss * %.3f\n",
+        name, ns_per_miss
+    );
+    // 校准窗口必须做到每次 cold arm 恰好多一个 CNT7 miss；否则这个系数不能
+    // 直接乘到 scalar 的总 CNT7 计数上。
+    return cycle_delta > 0 && tick_delta > 0 && miss_delta == static_cast<int64_t>(attempted);
 }
 
 void PrintPmuAggregate(const char *name, const PmuAggregate &aggregate) {
@@ -238,6 +308,8 @@ bool ValidatePmu(const pa_scheduler::SchedulerState &state, uint32_t run, const 
     uint32_t trusted = 0;
     uint32_t unique = 0;
     uint32_t prior_larger = 0;
+    uint32_t icache_pairs = 0;
+    uint32_t icache_calibrated_cores = 0;
     uint32_t bad_printed = 0;
     PmuAggregate all;
     PmuAggregate aic;
@@ -249,16 +321,34 @@ bool ValidatePmu(const pa_scheduler::SchedulerState &state, uint32_t run, const 
         const bool record_trusted = (status & kStatusRequired) == kStatusRequired;
         trusted += record_trusted;
         prior_larger += (status & kStatusPriorSnapshotLarger) != 0;
+        icache_pairs += (status & kStatusIcachePairObserved) != 0;
+        if (pmu.mode == WindowMode::IcacheSingle) {
+            const int64_t worker_cycle_delta =
+                static_cast<int64_t>(result.pmu_total_cycles) -
+                static_cast<int64_t>(result.pmu_warm_total_cycles);
+            const int64_t worker_tick_delta =
+                static_cast<int64_t>(result.pmu_window_ticks) -
+                static_cast<int64_t>(result.pmu_warm_window_ticks);
+            const int64_t worker_miss_delta =
+                static_cast<int64_t>(result.pmu_icache_misses) -
+                static_cast<int64_t>(result.pmu_warm_icache_misses);
+            icache_calibrated_cores += worker_cycle_delta > 0 && worker_tick_delta > 0 &&
+                worker_miss_delta == static_cast<int64_t>(pmu.icache_trials) &&
+                result.pmu_warm_icache_misses == 0 && result.pmu_icache_misses == pmu.icache_trials;
+        }
         if (core_id < kPhysicalSubcoreCount && !seen[core_id]) {
             seen[core_id] = true;
             ++unique;
         }
         if (!record_trusted && bad_printed < 8) {
             std::printf(
-                "[PMU-BAD] worker=%u role=%llu coreid=%u status=0x%08x total=%llu scalar=%u req=%u miss=%u\n",
+                "[PMU-BAD] worker=%u role=%llu coreid=%u status=0x%08x total=%llu scalar=%u req=%u miss=%u "
+                "warm_total=%llu warm_req=%u warm_miss=%u\n",
                 worker, static_cast<unsigned long long>(result.role), core_id, status,
                 static_cast<unsigned long long>(result.pmu_total_cycles), result.pmu_scalar_busy,
-                result.pmu_icache_requests, result.pmu_icache_misses
+                result.pmu_icache_requests, result.pmu_icache_misses,
+                static_cast<unsigned long long>(result.pmu_warm_total_cycles), result.pmu_warm_icache_requests,
+                result.pmu_warm_icache_misses
             );
             ++bad_printed;
         }
@@ -269,18 +359,32 @@ bool ValidatePmu(const pa_scheduler::SchedulerState &state, uint32_t run, const 
     PrintPmuAggregate("ALL", all);
     PrintPmuAggregate("AIC", aic);
     PrintPmuAggregate("AIV", aiv);
+    bool icache_measurement_ok = true;
+    if (pmu.mode == WindowMode::IcacheSingle) {
+        const bool all_ok = PrintSingleIcacheAggregate("ALL", all, pmu.icache_trials);
+        const bool aic_ok = PrintSingleIcacheAggregate("AIC", aic, pmu.icache_trials);
+        const bool aiv_ok = PrintSingleIcacheAggregate("AIV", aiv, pmu.icache_trials);
+        icache_measurement_ok = all_ok && aic_ok && aiv_ok && icache_pairs == pa_scheduler::kWorkers &&
+            icache_calibrated_cores == pa_scheduler::kWorkers;
+    }
     const bool records_ok = trusted == pa_scheduler::kWorkers;
     const bool core_ids_ok = unique == pa_scheduler::kWorkers;
     std::printf(
-        "[PMU] run=%u window=%s scalar_nops=%u trusted=%u/%u unique_coreids=%u/%u prior_larger=%u/%u\n", run,
-        PmuModeName(pmu.mode), pmu.scalar_nops, trusted, pa_scheduler::kWorkers, unique, pa_scheduler::kWorkers,
-        prior_larger, pa_scheduler::kWorkers
+        "[PMU] run=%u window=%s scalar_nops=%u icache_trials=%u trusted=%u/%u unique_coreids=%u/%u "
+        "prior_larger=%u/%u icache_pairs=%u/%u calibrated_cores=%u/%u\n",
+        run, PmuModeName(pmu.mode), pmu.scalar_nops, pmu.icache_trials, trusted, pa_scheduler::kWorkers, unique,
+        pa_scheduler::kWorkers, prior_larger, pa_scheduler::kWorkers, icache_pairs, pa_scheduler::kWorkers,
+        icache_calibrated_cores, pa_scheduler::kWorkers
     );
     std::printf("[ASSERT] %-48s %s\n", "all PMU records have configured selectors and data",
                 records_ok ? "PASS" : "FAIL");
     std::printf("[ASSERT] %-48s %s\n", "all 96 PMU physical subcore ids are unique",
                 core_ids_ok ? "PASS" : "FAIL");
-    return records_ok && core_ids_ok;
+    if (pmu.mode == WindowMode::IcacheSingle) {
+        std::printf("[ASSERT] %-48s %s\n", "each cold trial adds exactly one CNT7 I-cache miss",
+                    icache_measurement_ok ? "PASS" : "FAIL");
+    }
+    return records_ok && core_ids_ok && icache_measurement_ok;
 }
 
 }  // namespace
@@ -298,7 +402,8 @@ int main(int argc, char **argv) {
         if (parse_status == pa_scheduler::host::ParseStatus::Help) {
             std::fprintf(
                 stderr,
-                "CCEC PMU options: [--pmu-window off|empty|scalar|scalar-double] [--pmu-scalar-nops N]\n"
+                "CCEC PMU options: [--pmu-window off|empty|scalar|scalar-double|icache-single] "
+                "[--pmu-scalar-nops N] [--pmu-icache-trials N]\n"
             );
         }
         return parse_status == pa_scheduler::host::ParseStatus::Help ? EXIT_SUCCESS : EXIT_FAILURE;
@@ -310,8 +415,9 @@ int main(int argc, char **argv) {
     }
     pa_scheduler::host::PrintBanner("CCEC", options);
     std::printf(
-        "[PMU-CONFIG] window=%s scalar_nops=%u source=direct-per-core requires=msprof-PipeUtilization\n",
-        PmuModeName(pmu_options.mode), pmu_options.scalar_nops
+        "[PMU-CONFIG] window=%s scalar_nops=%u icache_trials=%u source=direct-per-core "
+        "requires=msprof-PipeUtilization\n",
+        PmuModeName(pmu_options.mode), pmu_options.scalar_nops, pmu_options.icache_trials
     );
 
     // 正常及后处理路径依次完成 ACL 初始化、选卡、stream/ELF/设备区创建、launch/D2H

@@ -46,6 +46,30 @@ __aicore__ inline void RuntimeNop(uint32_t count) {
     __builtin_cce_pipe_barrier(PIPE_ALL);
 }
 
+#if defined(PA_BUILD_AIC)
+#define PA_ICACHE_TARGET_NAME pa_icache_target_aic
+#define PA_ICACHE_MEASURE_NAME pa_icache_measure_aic
+#define PA_ICACHE_THRASH_NAME pa_icache_thrash_aic
+#elif defined(PA_BUILD_AIV)
+#define PA_ICACHE_TARGET_NAME pa_icache_target_aiv
+#define PA_ICACHE_MEASURE_NAME pa_icache_measure_aiv
+#define PA_ICACHE_THRASH_NAME pa_icache_thrash_aiv
+#endif
+
+// 目标函数的入口与 128B I-cache line 对齐，并保持在一个 16B IFU fetch block
+// 内；cold/warm 两条路径调用完全相同的符号，唯一变量是计时窗前是否执行过它。
+__aicore__ static __attribute__((noinline, used, aligned(128), section(".text.pa_icache_target")))
+void PA_ICACHE_TARGET_NAME() {
+    asm volatile(
+        ".rept 1\n"
+        "nop\n"
+        ".endr\n"
+    );
+}
+
+__aicore__ static __attribute__((noinline, used, aligned(128), section(".text.pa_icache_thrash")))
+void PA_ICACHE_THRASH_NAME();
+
 struct CcecOps {
     static constexpr bool kAtomicReturnReadyObserved = true;
 
@@ -161,6 +185,13 @@ struct PmuSnapshot {
     uint32_t status = 0;
 };
 
+struct IcachePairSnapshot {
+    PmuSnapshot cold;
+    PmuSnapshot warm;
+    uint64_t cold_window_ticks = 0;
+    uint64_t warm_window_ticks = 0;
+};
+
 template <uint32_t BlockOffset, uint32_t RegisterOffset>
 __aicore__ inline uint32_t ReadPmuRegister(uint64_t reg_base) {
     // 传给 ld_dev 的是重基址后的 __gm__ 指针；相对 offset 均落在编译器允许的 [-2048, 2047]。
@@ -184,10 +215,86 @@ __aicore__ inline PmuSnapshot ReadObservedCounters(uint64_t reg_base) {
     return sample;
 }
 
+__aicore__ inline void AccumulateObserved(const PmuSnapshot &sample, PmuSnapshot *total) {
+    total->total_cycles += sample.total_cycles;
+    total->scalar_busy += sample.scalar_busy;
+    total->icache_requests += sample.icache_requests;
+    total->icache_misses += sample.icache_misses;
+}
+
+// 禁止内联，确保 cold/warm 经过同一个函数体、同一个 PMU gate 和同一个目标
+// callsite；否则 -O3 会复制两份测量代码，capacity sweep 后两份 harness 自身的
+// I-cache 状态不同，cold-warm 就不再是单变量实验。
+__aicore__ static __attribute__((noinline, used, aligned(128), section(".text.pa_icache_harness")))
+void PA_ICACHE_MEASURE_NAME(
+    uint64_t reg_base, bool warm, PmuSnapshot *total, uint64_t *window_ticks
+) {
+    // 两个 arm 都先做同样的 capacity sweep。warm arm 只多一次窗外目标调用，
+    // 因而窗内 PMU 与 1 GHz sys counter 的差值对应同一目标行的 hit/miss 差异。
+    bisheng::cce::metrics_prof_stop();
+    PA_ICACHE_THRASH_NAME();
+    if (warm) PA_ICACHE_TARGET_NAME();
+    // CNT6/CNT7 在 stop 后仍可能留下窗外取指残余；warm 预热必须发生在本次
+    // read-clear 之前，否则这次刻意制造的预热 miss 会被误记到 warm 窗口。
+    (void)ReadObservedCounters(reg_base);
+
+    bisheng::cce::metrics_prof_start();
+    const uint64_t begin = static_cast<uint64_t>(get_sys_cnt());
+    PA_ICACHE_TARGET_NAME();
+    const uint64_t end = static_cast<uint64_t>(get_sys_cnt());
+    bisheng::cce::metrics_prof_stop();
+
+    AccumulateObserved(ReadObservedCounters(reg_base), total);
+    *window_ticks += end - begin;
+}
+
+// DAV_3510 的 scalar I-cache 最大为 32 KiB；定义刻意放在 target 与 measure
+// 之后，使链接布局为 target -> harness -> thrash。窗外顺序执行 64 KiB 指令
+// 覆盖全部 set 多轮，返回较低地址的 harness 时不会向前预取更低地址的 target。
+__aicore__ static void PA_ICACHE_THRASH_NAME() {
+    asm volatile(
+        ".rept 16384\n"
+        "nop\n"
+        ".endr\n"
+    );
+}
+
+__aicore__ inline void RunIcachePhase(
+    uint64_t reg_base, bool warm, uint32_t trials, PmuSnapshot *total, uint64_t *window_ticks
+) {
+    // 先丢弃一次同分支样本，让条件分支和目标取指预测进入本 phase 的稳定状态；
+    // 否则逐 trial 交替 warm/cold 会让 false 分支也提前取回目标行。
+    PmuSnapshot discarded;
+    uint64_t discarded_ticks = 0;
+    PA_ICACHE_MEASURE_NAME(reg_base, warm, &discarded, &discarded_ticks);
+    for (uint32_t trial = 0; trial < trials; ++trial) {
+        PA_ICACHE_MEASURE_NAME(reg_base, warm, total, window_ticks);
+    }
+}
+
+__aicore__ inline IcachePairSnapshot RunSingleIcacheProbe(
+    uint64_t reg_base, uint32_t trials, uint32_t worker_id
+) {
+    IcachePairSnapshot pair;
+    // 每个角色内奇偶 worker 各占一半，分别采用 cold-first/warm-first，抵消两个
+    // 连续 phase 的固定时间顺序；同一 phase 内保持分支历史稳定。
+    if ((worker_id & 1U) == 0) {
+        RunIcachePhase(reg_base, false, trials, &pair.cold, &pair.cold_window_ticks);
+        RunIcachePhase(reg_base, true, trials, &pair.warm, &pair.warm_window_ticks);
+    } else {
+        RunIcachePhase(reg_base, true, trials, &pair.warm, &pair.warm_window_ticks);
+        RunIcachePhase(reg_base, false, trials, &pair.cold, &pair.cold_window_ticks);
+    }
+    return pair;
+}
+
 __aicore__ inline void RunPmuProbe(__gm__ pa_scheduler::SchedulerState *state, uint32_t worker_id) {
     using namespace pa_scheduler::ccec_pmu;
     __gm__ pa_scheduler::WorkerResult &result = state->results[worker_id];
     PmuSnapshot sample;
+    PmuSnapshot warm_sample;
+    uint64_t window_ticks = 0;
+    uint64_t warm_window_ticks = 0;
 
     const WindowMode mode = static_cast<WindowMode>(state->config.reserved[kConfigMode]);
     if (mode != WindowMode::Off) {
@@ -218,18 +325,29 @@ __aicore__ inline void RunPmuProbe(__gm__ pa_scheduler::SchedulerState *state, u
                 // A5 的 snapshot 会消费/清除当前累计；stop/start 只负责门控，中间不读取才能续积多段窗口。
                 bisheng::cce::metrics_prof_stop();
                 const PmuSnapshot prior = ReadObservedCounters(reg_base);
-                bisheng::cce::metrics_prof_start();
-                if (mode == WindowMode::Scalar || mode == WindowMode::ScalarDouble) {
-                    RuntimeNop(state->config.reserved[kConfigScalarNops]);
-                }
-                if (mode == WindowMode::ScalarDouble) {
-                    // 两段相同工作量之间只切 gate、不读取 counter，用于确认 resume 是累计还是重置。
-                    bisheng::cce::metrics_prof_stop();
+                if (mode == WindowMode::IcacheSingle) {
+                    const IcachePairSnapshot pair =
+                        RunSingleIcacheProbe(reg_base, state->config.reserved[kConfigIcacheTrials], worker_id);
+                    sample = pair.cold;
+                    warm_sample = pair.warm;
+                    window_ticks = pair.cold_window_ticks;
+                    warm_window_ticks = pair.warm_window_ticks;
+                    sample.status |= kStatusIcachePairObserved;
+                } else {
                     bisheng::cce::metrics_prof_start();
-                    RuntimeNop(state->config.reserved[kConfigScalarNops]);
+                    if (mode == WindowMode::Scalar || mode == WindowMode::ScalarDouble) {
+                        RuntimeNop(state->config.reserved[kConfigScalarNops]);
+                    }
+                    if (mode == WindowMode::ScalarDouble) {
+                        // 两段相同工作量之间只切 gate、不读取 counter，用于确认 resume 是累计还是重置。
+                        bisheng::cce::metrics_prof_stop();
+                        bisheng::cce::metrics_prof_start();
+                        RuntimeNop(state->config.reserved[kConfigScalarNops]);
+                    }
+                    bisheng::cce::metrics_prof_stop();
+                    sample = ReadObservedCounters(reg_base);
                 }
                 bisheng::cce::metrics_prof_stop();
-                sample = ReadObservedCounters(reg_base);
                 sample.status |= kStatusRequested | kStatusRegMapped | kStatusCoreIdValid |
                                  (physical_core_id << kStatusCoreIdShift);
                 if (selector2 == kScalarBusyEvent) sample.status |= kStatusCnt2Selector;
@@ -244,12 +362,17 @@ __aicore__ inline void RunPmuProbe(__gm__ pa_scheduler::SchedulerState *state, u
         }
     }
 
-    // 结果位于每核独占 sidecar，五次 bypass store 不参与 Submit 时间口径。
+    // 结果位于每核独占 sidecar，这些 bypass store 不参与 Submit 或探针窗口时间口径。
     CcecOps::Publish(&result.pmu_total_cycles, sample.total_cycles);
     CcecOps::Publish(&result.pmu_scalar_busy, sample.scalar_busy);
     CcecOps::Publish(&result.pmu_icache_requests, sample.icache_requests);
     CcecOps::Publish(&result.pmu_icache_misses, sample.icache_misses);
     CcecOps::Publish(&result.pmu_status, sample.status);
+    CcecOps::Publish(&result.pmu_window_ticks, window_ticks);
+    CcecOps::Publish(&result.pmu_warm_total_cycles, warm_sample.total_cycles);
+    CcecOps::Publish(&result.pmu_warm_window_ticks, warm_window_ticks);
+    CcecOps::Publish(&result.pmu_warm_icache_requests, warm_sample.icache_requests);
+    CcecOps::Publish(&result.pmu_warm_icache_misses, warm_sample.icache_misses);
 }
 
 }  // namespace

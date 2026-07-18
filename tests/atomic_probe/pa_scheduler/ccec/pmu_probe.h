@@ -16,18 +16,21 @@
 
 namespace pa_scheduler::ccec_pmu {
 
-// 第一阶段只验证观察链路，不把门控下沉到真实 Submit 热路径。
-// Empty 用于量 start/stop 本身的底噪，Scalar 在同一窗口内执行可控 NOP 段。
+// Empty 用于量 start/stop 本身的底噪，Scalar 在同一窗口内执行可控 NOP 段；
+// IcacheSingle 在每核上成对累计隔离的 cold/warm 目标调用，用两者差值计算单次 miss 代价。
 enum class WindowMode : uint32_t {
     Off = 0,
     Empty = 1,
     Scalar = 2,
     ScalarDouble = 3,
+    IcacheSingle = 4,
 };
 
 // RunConfig::reserved 保持既有 64B ABI；CCEC 独占解释以下五个槽位，其他后端仍看到全零。
 constexpr uint32_t kConfigMode = 0;
-constexpr uint32_t kConfigScalarNops = 1;
+constexpr uint32_t kConfigWorkAmount = 1;
+constexpr uint32_t kConfigScalarNops = kConfigWorkAmount;
+constexpr uint32_t kConfigIcacheTrials = kConfigWorkAmount;
 constexpr uint32_t kConfigRegTableLow = 2;
 constexpr uint32_t kConfigRegTableHigh = 3;
 constexpr uint32_t kConfigMagic = 4;
@@ -66,6 +69,7 @@ constexpr uint32_t kStatusCoreIdValid = 1U << 2;
 constexpr uint32_t kStatusCnt2Selector = 1U << 3;
 constexpr uint32_t kStatusCnt6Selector = 1U << 4;
 constexpr uint32_t kStatusCnt7Selector = 1U << 5;
+constexpr uint32_t kStatusIcachePairObserved = 1U << 6;
 constexpr uint32_t kStatusTotalNonzero = 1U << 7;
 constexpr uint32_t kStatusPriorSnapshotLarger = 1U << 8;
 constexpr uint32_t kStatusRequired = kStatusRequested | kStatusRegMapped | kStatusCoreIdValid |
