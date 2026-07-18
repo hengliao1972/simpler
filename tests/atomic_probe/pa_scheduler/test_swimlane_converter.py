@@ -25,6 +25,84 @@ except ImportError:
     from swimlane_converter import convert
 
 
+def _standalone_topology(core_id: int) -> tuple[int, int, str]:
+    """返回 standalone 固定 32 AIC + 64 AIV 拓扑中的 block/lane/type。"""
+    if core_id < 32:
+        return core_id, 0, "aic"
+    vector_id = core_id - 32
+    return vector_id // 2, 1 + vector_id % 2, "aiv"
+
+
+def _v3_capture(
+    rows: list[list[object]],
+    *,
+    num_cores: int = 1,
+    add_clock_baselines: bool = True,
+    dependency_applied: bool = True,
+) -> dict[str, object]:
+    """构造带 producer weighted summary 的最小 schema-v3 raw。"""
+    all_rows = [list(row) for row in rows]
+    if add_clock_baselines:
+        dependency_flags = 0x3 if dependency_applied else 0x1
+        for core_id in range(num_cores):
+            block_id, lane, _ = _standalone_topology(core_id)
+            start = 10 + core_id * 4
+            all_rows.extend(
+                [
+                    [
+                        core_id,
+                        block_id,
+                        lane,
+                        -1,
+                        -1,
+                        "ClockBaseline",
+                        start,
+                        start + 1,
+                        0,
+                        0,
+                    ],
+                    [
+                        core_id,
+                        block_id,
+                        lane,
+                        -1,
+                        -1,
+                        "ClockBaseline",
+                        start + 2,
+                        start + 3,
+                        dependency_flags,
+                        0,
+                    ],
+                ]
+            )
+    atomic_rows = [row for row in all_rows if row[5] == "Atomic"]
+    batch_rows = [row for row in atomic_rows if int(row[8]) & 0x80]
+    batch_calls = sum((int(row[8]) >> 8) & 0xFFFFFF for row in batch_rows)
+    core_types = [_standalone_topology(core_id)[2] for core_id in range(num_cores)]
+    summary = {
+        "records": len(all_rows),
+        "atomic_records": len(atomic_rows),
+        "clock_baseline_records": sum(
+            row[5] == "ClockBaseline" for row in all_rows
+        ),
+        "atomic_calls": len(atomic_rows) - len(batch_rows) + batch_calls,
+        "batched_poll_calls": batch_calls,
+        "poll_batch_records": len(batch_rows),
+        "dropped_records": 0,
+    }
+    return {
+        "l2_swimlane_level": 4,
+        "metadata": {
+            "clock_freq_hz": 1_000_000_000,
+            "num_cores": num_cores,
+            "trace_schema_version": 3,
+            "core_types": core_types,
+            "fdwic_summary": summary,
+        },
+        "fdwic_events": all_rows,
+    }
+
+
 class SwimlaneConverterLayoutTest(unittest.TestCase):
     def test_real_compute_metadata_is_preserved_and_visible(self) -> None:
         # raw 与 merged 都必须自描述真实 engine 负载；否则同名 QK/SF/PV/UP
@@ -249,6 +327,337 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             input_path.write_text(json.dumps(capture), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "invalid Claim flags"):
                 convert(input_path, output_path)
+
+    def test_v3_poll_batches_preserve_exact_calls_on_scalar_lane(self) -> None:
+        # standalone 只允许六类显式等待区 observation load 聚合；每个
+        # PollBatch 都必须保留精确 call_count，但不能伪装成单次延迟。
+        sites = {
+            1: "startup_poll",
+            2: "fatal_poll",
+            5: "fanin_flag_load",
+            11: "heap_frontier_load",
+            12: "heap_vend_load",
+            14: "replay_done_poll",
+        }
+        call_count = 12_345
+        flags = (call_count << 8) | 0x90
+        for site_id, site_name in sites.items():
+            with self.subTest(site=site_name), tempfile.TemporaryDirectory() as directory:
+                capture = _v3_capture(
+                    [[0, 0, 0, -1, -1, "Atomic", 100, 900, flags, site_id]]
+                )
+                input_path = Path(directory) / "raw.json"
+                output_path = Path(directory) / "merged.json"
+                input_path.write_text(json.dumps(capture), encoding="utf-8")
+                emitted, blocks, base_cycle = convert(input_path, output_path)
+                merged = json.loads(output_path.read_text(encoding="utf-8"))
+
+                self.assertEqual((emitted, blocks, base_cycle), (3, 1, 10))
+                batch = next(
+                    event
+                    for event in merged["traceEvents"]
+                    if event.get("cat") == "atomic.poll_batch"
+                )
+                self.assertEqual(
+                    batch["name"], f"atomic.poll_batch.{site_name}.load×{call_count}"
+                )
+                self.assertEqual((batch["pid"], batch["tid"]), (0, 0))
+                self.assertEqual(batch["args"]["call_count"], call_count)
+                self.assertEqual(batch["args"]["poll_window_cycles"], 800)
+                self.assertEqual(
+                    batch["args"]["duration_semantics"],
+                    "logical_poll_episode_envelope_not_single_atomic_latency",
+                )
+                self.assertEqual(
+                    batch["args"]["batch_semantics"], "observation_load_calls"
+                )
+                self.assertTrue(
+                    batch["args"]["may_contain_interleaved_direct_atomics"]
+                )
+                self.assertNotIn("cycles", batch["args"])
+                self.assertNotIn("completion_boundary", batch["args"])
+                self.assertNotIn("return_ready_observed", batch["args"])
+                self.assertEqual(
+                    merged["metadata"]["fdwic_summary"]["atomic_calls"],
+                    call_count,
+                )
+
+    def test_v3_poll_batch_accepts_maximum_24_bit_count(self) -> None:
+        call_count = 0xFFFFFF
+        capture = _v3_capture(
+            [[
+                0,
+                0,
+                0,
+                -1,
+                -1,
+                "Atomic",
+                100,
+                900,
+                (call_count << 8) | 0x90,
+                1,
+            ]]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            convert(input_path, output_path)
+            events = json.loads(output_path.read_text(encoding="utf-8"))["traceEvents"]
+
+        batch = next(event for event in events if event.get("cat") == "atomic.poll_batch")
+        self.assertEqual(batch["args"]["call_count"], call_count)
+
+    def test_v3_rejects_invalid_poll_batch_schema(self) -> None:
+        valid = (7 << 8) | 0x90
+        cases = (
+            (0x90, 5, -1, -1),  # call_count=0
+            ((7 << 8) | 0x91, 5, -1, -1),  # observation 只能是 Load
+            (valid, 9, -1, -1),  # frontier scan 不是显式等待区
+            ((7 << 8) | 0xB0, 5, -1, -1),  # batch 没有 value_zero
+            ((7 << 8) | 0xD0, 5, -1, -1),  # batch 没有 return-ready
+            (valid, 5, 0, -1),  # batch 不归属单个 task
+            (valid, 5, -1, 0),  # batch 不归属 kernel function
+        )
+        for flags, site, task_id, func_id in cases:
+            with self.subTest(flags=flags, site=site), tempfile.TemporaryDirectory() as directory:
+                capture = _v3_capture(
+                    [[
+                        0,
+                        0,
+                        0,
+                        task_id,
+                        func_id,
+                        "Atomic",
+                        100,
+                        110,
+                        flags,
+                        site,
+                    ]]
+                )
+                input_path = Path(directory) / "raw.json"
+                output_path = Path(directory) / "merged.json"
+                input_path.write_text(json.dumps(capture), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "invalid Atomic PollBatch"):
+                    convert(input_path, output_path)
+                self.assertFalse(output_path.exists())
+
+    def test_v2_reserves_poll_batch_flag(self) -> None:
+        capture = {
+            "l2_swimlane_level": 4,
+            "metadata": {
+                "clock_freq_hz": 1_000_000_000,
+                "num_cores": 1,
+                "trace_schema_version": 2,
+                "core_types": ["aic"],
+            },
+            "fdwic_events": [
+                [0, 0, 0, -1, -1, "Atomic", 100, 110, (7 << 8) | 0x90, 5]
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "invalid Atomic PollBatch"):
+                convert(input_path, output_path)
+
+    def test_v3_rejects_invalid_direct_atomic_schema(self) -> None:
+        cases = (
+            (0x51, 4, -1),  # ClaimMax 的 op 必须是 FetchMax
+            (0x12, 0, -1),  # StartupIncrement 不消费返回值
+            (0x42, 0, -1),  # 未消费返回值不能声明 return-ready
+            (0x73, 4, -1),  # value_zero 只属于 Load
+            ((1 << 8) | 0x50, 1, -1),  # retry payload 只属于 FetchMax
+            (0x50, 15, -1),  # standalone 未定义生产 BlockWon site
+            (0x53, 4, 0),  # Atomic 不携带 function id
+        )
+        for flags, site, func_id in cases:
+            with self.subTest(flags=flags, site=site), tempfile.TemporaryDirectory() as directory:
+                capture = _v3_capture(
+                    [[0, 0, 0, 7, func_id, "Atomic", 100, 110, flags, site]]
+                )
+                input_path = Path(directory) / "raw.json"
+                output_path = Path(directory) / "merged.json"
+                input_path.write_text(json.dumps(capture), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "invalid direct Atomic"):
+                    convert(input_path, output_path)
+
+    def test_v3_direct_boundary_must_match_core_clock_baseline(self) -> None:
+        # baseline 声明该后端应用依赖钩子，消费返回值的直接 Atomic 却没有
+        # return-ready bit；converter 必须拒绝这种自相矛盾的 raw。
+        capture = _v3_capture(
+            [[0, 0, 0, 7, -1, "Atomic", 100, 110, 0x13, 4]],
+            dependency_applied=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "does not match.*ClockBaseline"):
+                convert(input_path, output_path)
+
+    def test_v3_source_issue_direct_boundary_matches_cpu_baseline(self) -> None:
+        # CPU/A5Sim 的依赖基线明确声明 dependency_applied=0；消费返回值的
+        # direct span 因而保留 source-issue，不能被 converter 擅自升级。
+        capture = _v3_capture(
+            [[0, 0, 0, 7, -1, "Atomic", 100, 110, 0x13, 4]],
+            dependency_applied=False,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            convert(input_path, output_path)
+            events = json.loads(output_path.read_text(encoding="utf-8"))["traceEvents"]
+
+        direct = next(
+            event for event in events if event.get("cat") == "atomic.source_issue"
+        )
+        self.assertEqual(direct["args"]["call_count"], 1)
+        self.assertTrue(direct["args"]["result_used"])
+        self.assertFalse(direct["args"]["return_ready_observed"])
+
+    def test_v3_rejects_invalid_clock_baseline_schema(self) -> None:
+        cases = (
+            (0x2, -1, -1, 0),  # applied 不能脱离 dependency bit
+            (0x4, -1, -1, 0),  # 未定义 flag
+            (0x0, 0, -1, 0),  # baseline 不归属 task
+            (0x0, -1, 0, 0),  # baseline 不归属 function
+            (0x0, -1, -1, 1),  # aux 必须为零
+        )
+        for flags, task_id, func_id, auxiliary in cases:
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as directory:
+                capture = _v3_capture([], add_clock_baselines=False)
+                capture["fdwic_events"] = [
+                    [
+                        0,
+                        0,
+                        0,
+                        task_id,
+                        func_id,
+                        "ClockBaseline",
+                        10,
+                        11,
+                        flags,
+                        auxiliary,
+                    ]
+                ]
+                summary = capture["metadata"]["fdwic_summary"]
+                summary["records"] = 1
+                summary["clock_baseline_records"] = 1
+                input_path = Path(directory) / "raw.json"
+                output_path = Path(directory) / "merged.json"
+                input_path.write_text(json.dumps(capture), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "invalid ClockBaseline"):
+                    convert(input_path, output_path)
+
+    def test_v3_requires_two_clock_baselines_per_core(self) -> None:
+        capture = _v3_capture([], add_clock_baselines=False)
+        capture["fdwic_events"] = [
+            [0, 0, 0, -1, -1, "ClockBaseline", 10, 11, 0, 0]
+        ]
+        summary = capture["metadata"]["fdwic_summary"]
+        summary["records"] = 1
+        summary["clock_baseline_records"] = 1
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "requires exactly one plain"):
+                convert(input_path, output_path)
+
+    def test_v3_rejects_each_broken_weighted_summary_field(self) -> None:
+        rows = [
+            [0, 0, 0, -1, -1, "Atomic", 100, 200, (17 << 8) | 0x90, 1],
+            [0, 0, 0, 4, -1, "Atomic", 210, 220, 0x53, 4],
+        ]
+        keys = (
+            "records",
+            "atomic_records",
+            "clock_baseline_records",
+            "atomic_calls",
+            "batched_poll_calls",
+            "poll_batch_records",
+            "dropped_records",
+        )
+        for key in keys:
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                capture = _v3_capture(rows)
+                capture["metadata"]["fdwic_summary"][key] += 1
+                input_path = Path(directory) / "raw.json"
+                output_path = Path(directory) / "merged.json"
+                input_path.write_text(json.dumps(capture), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, rf"fdwic_summary\.{key}"):
+                    convert(input_path, output_path)
+
+    def test_v3_weighted_summary_closes_mixed_direct_and_batches(self) -> None:
+        rows = [
+            [0, 0, 0, -1, -1, "Atomic", 100, 200, (17 << 8) | 0x90, 1],
+            [0, 0, 0, -1, -1, "Atomic", 201, 250, (9 << 8) | 0x90, 14],
+            [0, 0, 0, 4, -1, "Atomic", 251, 260, 0x53, 4],
+        ]
+        capture = _v3_capture(rows)
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            emitted, _, _ = convert(input_path, output_path)
+            merged = json.loads(output_path.read_text(encoding="utf-8"))
+
+        summary = merged["metadata"]["fdwic_summary"]
+        self.assertEqual(summary["records"], 5)
+        self.assertEqual(summary["atomic_records"], 3)
+        self.assertEqual(summary["clock_baseline_records"], 2)
+        self.assertEqual(summary["atomic_calls"], 27)
+        self.assertEqual(summary["batched_poll_calls"], 26)
+        self.assertEqual(summary["poll_batch_records"], 2)
+        self.assertEqual(summary["dropped_records"], 0)
+        self.assertEqual(emitted, 5)
+        atomic_events = [
+            event
+            for event in merged["traceEvents"]
+            if str(event.get("cat", "")).startswith("atomic.")
+        ]
+        self.assertEqual(len(atomic_events), summary["atomic_records"])
+
+    def test_v3_requires_level4_and_producer_summary(self) -> None:
+        capture = _v3_capture(
+            [[0, 0, 0, -1, -1, "Atomic", 100, 110, (3 << 8) | 0x90, 14]]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+
+            capture["l2_swimlane_level"] = 1
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "requires l2_swimlane_level=4"):
+                convert(input_path, output_path)
+
+            capture["l2_swimlane_level"] = 4
+            del capture["metadata"]["fdwic_summary"]
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "fdwic_summary is required"):
+                convert(input_path, output_path)
+
+    def test_v3_rejects_non_standalone_topology(self) -> None:
+        cases = {
+            "core_type": lambda capture: capture["metadata"]["core_types"].__setitem__(
+                0, "aiv"
+            ),
+            "block": lambda capture: capture["fdwic_events"][0].__setitem__(1, 1),
+            "lane": lambda capture: capture["fdwic_events"][0].__setitem__(2, 1),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(field=name), tempfile.TemporaryDirectory() as directory:
+                capture = _v3_capture([])
+                mutate(capture)
+                input_path = Path(directory) / "raw.json"
+                output_path = Path(directory) / "merged.json"
+                input_path.write_text(json.dumps(capture), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "does not match standalone topology"):
+                    convert(input_path, output_path)
+                self.assertFalse(output_path.exists())
 
 
 if __name__ == "__main__":

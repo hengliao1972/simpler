@@ -19,6 +19,8 @@
 #include "../common/winner_workload.h"
 
 #define PA_DEVICE __aicore__ inline
+#define PA_DEVICE_NOINLINE static __aicore__ __attribute__((noinline))
+#define PA_LOOP_NOUNROLL _Pragma("clang loop unroll(disable)")
 #define PA_GM __gm__
 #include "../common/pa_scheduler_core.h"
 
@@ -212,16 +214,17 @@ static __aicore__ __attribute__((noinline, used)) void pa_execute_real_winner_wo
 #endif
 }
 
-#if defined(PA_BUILD_AIC)
+#if PA_BUILD_SUBMIT_PMU && defined(PA_BUILD_AIC)
 #define PA_ICACHE_TARGET_NAME pa_icache_target_aic
 #define PA_ICACHE_MEASURE_NAME pa_icache_measure_aic
 #define PA_ICACHE_THRASH_NAME pa_icache_thrash_aic
-#elif defined(PA_BUILD_AIV)
+#elif PA_BUILD_SUBMIT_PMU && defined(PA_BUILD_AIV)
 #define PA_ICACHE_TARGET_NAME pa_icache_target_aiv
 #define PA_ICACHE_MEASURE_NAME pa_icache_measure_aiv
 #define PA_ICACHE_THRASH_NAME pa_icache_thrash_aiv
 #endif
 
+#if PA_BUILD_SUBMIT_PMU
 // cold/warm 两条路径调用同一个 8B 目标函数。入口按 128B I-cache line
 // 对齐，构建脚本还会核对符号尺寸、对齐和 target -> harness -> thrash 布局。
 __aicore__ static __attribute__((noinline, used, aligned(128), section(".text.pa_icache_target")))
@@ -235,6 +238,7 @@ void PA_ICACHE_TARGET_NAME() {
 
 __aicore__ static __attribute__((noinline, used, aligned(128), section(".text.pa_icache_thrash")))
 void PA_ICACHE_THRASH_NAME();
+#endif
 
 struct CcecOps {
     static constexpr bool kAtomicReturnReadyObserved = true;
@@ -316,6 +320,7 @@ struct CcecOps {
         pa_execute_real_winner_workload(state, worker, kind);
     }
 
+#if PA_BUILD_SUBMIT_PMU
     __aicore__ static inline bool PmuWindowStart(
         __gm__ pa_scheduler::SchedulerState *state, uint32_t worker_id
     );
@@ -323,6 +328,17 @@ struct CcecOps {
     __aicore__ static inline void PmuWindowStop(
         __gm__ pa_scheduler::SchedulerState *state, uint32_t worker_id, bool started
     );
+#else
+    // swimlane 产物不携带 PMU 读寄存器或门控代码；公共调度器保留同一 hook
+    // 形状，编译器会把这两个空实现完整消去。
+    __aicore__ static inline bool PmuWindowStart(
+        __gm__ pa_scheduler::SchedulerState *, uint32_t
+    ) { return false; }
+
+    __aicore__ static inline void PmuWindowStop(
+        __gm__ pa_scheduler::SchedulerState *, uint32_t, bool
+    ) {}
+#endif
 
     // SPIN_WAIT_HINT is also a no-op in the real A5 inner-kernel contract.
     // 同理不额外插入 nop，让等待循环保留真实 PA 内核“不主动退避”的指令成本。
@@ -361,6 +377,7 @@ struct CcecOps {
     }
 };
 
+#if PA_BUILD_SUBMIT_PMU
 struct PmuSnapshot {
     uint64_t total_cycles = 0;
     uint32_t vector_busy = 0;
@@ -656,6 +673,7 @@ __aicore__ inline void RunPmuProbe(__gm__ pa_scheduler::SchedulerState *state, u
     }
     PublishPmuSnapshot(result, sample);
 }
+#endif  // PA_BUILD_SUBMIT_PMU
 
 }  // namespace
 
@@ -667,7 +685,9 @@ extern "C" __global__ __aicore__ void pa_scheduler_0_mix_aic(__gm__ pa_scheduler
     // 32 个物理 block 的 AIC 直接使用 block_idx，形成连续 worker 0..31。
     const uint32_t worker_id = static_cast<uint32_t>(get_block_idx());
     pa_scheduler::RunScheduler<CcecOps>(state, worker_id, pa_scheduler::CoreRole::Aic);
+#if PA_BUILD_SUBMIT_PMU
     RunPmuProbe(state, worker_id);
+#endif
 }
 #elif defined(PA_BUILD_AIV)
 PTO_SYNCALL_MIX_AIC_KERNEL_META(pa_scheduler_0_mix_aiv, 1, 2);
@@ -677,7 +697,9 @@ extern "C" __global__ __aicore__ void pa_scheduler_0_mix_aiv(__gm__ pa_scheduler
     const uint32_t vector_id = static_cast<uint32_t>(get_block_idx() * get_subblockdim() + get_subblockid());
     const uint32_t worker_id = pa_scheduler::kAicWorkers + vector_id;
     pa_scheduler::RunScheduler<CcecOps>(state, worker_id, pa_scheduler::CoreRole::Aiv);
+#if PA_BUILD_SUBMIT_PMU
     RunPmuProbe(state, worker_id);
+#endif
 }
 #else
 #error "Compile with PA_BUILD_AIC or PA_BUILD_AIV"

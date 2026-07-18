@@ -1211,6 +1211,25 @@ int main(int argc, char **argv) {
         return parse_status == pa_scheduler::host::ParseStatus::Help ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     if (!ValidateWinnerWorkloadOptions(workload_options)) return EXIT_FAILURE;
+#if PA_BUILD_SWIMLANE
+    // swimlane host 与同目录 kernel 是成套产物；它不允许借旧参数重新开启
+    // 已从 device ELF 编译掉的 PMU/phase-profile 路径。
+    if (pmu_options.mode != pa_scheduler::ccec_pmu::WindowMode::Off ||
+        !pmu_options.json_path.empty()) {
+        std::fprintf(
+            stderr,
+            "This is a swimlane build; PMU collection requires the separate submit-pmu build.\n"
+        );
+        return EXIT_FAILURE;
+    }
+    if (options.profile_phases) {
+        std::fprintf(
+            stderr,
+            "--profile-phases is not part of the swimlane build; use submit-pmu phase attribution.\n"
+        );
+        return EXIT_FAILURE;
+    }
+#endif
     if (!pmu_options.json_path.empty() &&
         pmu_options.mode == pa_scheduler::ccec_pmu::WindowMode::Off) {
         std::fprintf(stderr, "--pmu-json requires a non-off --pmu-window.\n");
@@ -1565,6 +1584,7 @@ int main(int argc, char **argv) {
                     real_compute
                         ? pa_scheduler::host::RealComputePatternName(workload_options.pattern)
                         : "none",
+                    options.trace_atomics,
                     read_trace_records
                 )) {
                 postprocess_ok = false;

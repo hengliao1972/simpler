@@ -30,6 +30,18 @@ echo "[BUILD] CPU scheduler executable"
     "$SCRIPT_DIR/main.cpp" \
     -o "$BUILD_DIR/pa_scheduler_cpu"
 
+# PollBatch 是 common/ 中的设备/CPU 共用模板。这里用普通 C++17 编译器
+# 直接实例化并执行边界自测；任一断言失败都会借助 set -e 阻止构建成功。
+echo "[BUILD] atomic PollBatch boundary self-test"
+"$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+    -DPA_BUILD_SWIMLANE=1 \
+    -I"$ROOT_DIR/common" \
+    "$ROOT_DIR/common/test_atomic_poll_batch.cpp" \
+    -o "$BUILD_DIR/test_atomic_poll_batch"
+
+echo "[TEST] atomic PollBatch boundary self-test"
+"$BUILD_DIR/test_atomic_poll_batch"
+
 # set -e 保证编译或链接失败时不会打印 complete，也不会在组合构建中继续
 # 后续步骤；只有成功退出的构建才被本脚本声明为可运行产物。
 echo "[BUILD] complete: $BUILD_DIR/pa_scheduler_cpu"

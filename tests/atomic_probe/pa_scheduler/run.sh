@@ -84,7 +84,11 @@ build_backend() {
     # 固定为 CCEC、AscendC、CPU，便于按用户要求分阶段复现。
     case "$1" in
         ccec|ascendc|cpu)
-            "$SCRIPT_DIR/$1/build.sh"
+            if [[ "$1" == "ccec" ]]; then
+                "$SCRIPT_DIR/ccec/build.sh" swimlane
+            else
+                "$SCRIPT_DIR/$1/build.sh"
+            fi
             ;;
         *)
             echo "Unknown backend: $1" >&2

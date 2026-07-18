@@ -1012,26 +1012,28 @@ frontier helping 的额外 FetchMax 中位数为 `A-T=14085` 次。ready-prefix 
 结果并撤回，不迁移真实 FDWIC。standalone 第一版只验证当前单-lane PA Case1，
 不能拿它的 PASS 代替 joint/BlockWon 覆盖。
 
-### 7.5 阶段 O2：逐 atomic 泳道与 Submit scalar PMU
+### 7.5 阶段 O2：atomic schema-v3 泳道与 Submit scalar PMU
 
 #### 7.5.1 观察目标与证据拆分
 
 O2 先完成观察链路，不在同一阶段继续消减 atomic。它回答两个不同问题：
 
-1. 逐 atomic 泳道回答“哪一个源码 atomic 调用发生在何时、属于哪个 site/op、
-   该调用按源码语义是 source-issue 还是本核 return-ready 边界、bracket 多宽”；
+1. atomic 泳道回答“每个 site/op 执行了多少次逻辑调用”：direct Atomic 逐条给出
+   source-issue 或本核 return-ready bracket；显式等待区内六类 observation load
+   用带精确 `call_count` 的 PollBatch 给出逻辑轮询 episode；
 2. PMU sidecar 回答“指定 Submit 窗口内，每个物理子核累计了多少
    scalar/vector/cube/MTE/fix busy、I-cache request/miss 和 raw total”。
 
-两类数据默认分开采集。逐 atomic trace 会增加两次 `get_sys_cnt()`、分支和一条
-64 B 私有 record 写入，进而改变代码布局、I-cache、worker 到达顺序、共享地址竞争
-和轮询次数。PMU-only 不写完整泳道记录，观察机制与扰动来源不同；由于
+两类数据默认分开采集。direct trace 会增加两次 `get_sys_cnt()`、分支和一条
+64 B 私有 record 写入，PollBatch 还会增加等待区内的私有累计与边界落盘；二者都会
+改变代码布局、I-cache、worker 到达顺序、共享地址竞争和轮询次数。PMU-only 不写
+完整泳道记录，观察机制与扰动来源不同；由于
 `submit-all` gate 自带 `PIPE_ALL`，当前没有同配置 A/B 证明其总扰动一定更小。
 它用于取 AIC/AIV 平均和 PMU event A/B。正式 PMU JSON 强制
 `--no-swimlane`，不与 atomic trace 或 phase profile 合并；
 两套结果只按同一源码版本和各自明确的 scope 交叉解释，不能声称逐 tick 精确对齐。
 
-#### 7.5.2 十五个 site 与四种 op
+#### 7.5.2 十五个 site、四种 op 与六类 PollBatch
 
 `AtomicSite` 是 raw/merged trace 的稳定编号，当前覆盖 standalone PA 公共调度器中
 所有显式共享 atomic 源码调用点。`AtomicOp` 只有 `Load/Exchange/FetchAdd/FetchMax`
@@ -1055,26 +1057,53 @@ O2 先完成观察链路，不在同一阶段继续消减 atomic。它回答两�
 | 13 | `ReplayDoneIncrement` | `FetchAdd` | worker 回放结束计数发布 |
 | 14 | `ReplayDonePoll` | `Load` | 最终 drain 的 replay_done 轮询 |
 
-每次源码调用只生成一条同时包含 `start_cycle/end_cycle` 的 `Atomic` span，避免用
-start/end 两条记录把容量再放大一倍。raw schema 使用：
+schema-v3 要求 `metadata.trace_schema_version=3` 且 `l2_swimlane_level=4`，并将
+**逻辑调用数**与**物理记录数**分开。direct Atomic 仍是一条源码调用
+对应一条同时包含 `start_cycle/end_cycle` 的记录；只有下列六类 observation load
+在匹配的显式等待区内才允许聚合为 PollBatch：
 
-- `auxiliary`：上表 site id；
-- `flags[3:0]`：op id；bit 4：返回的旧值是否参与后续判断；
-- 对 `Load`，bit 5 表示观察值是否为零；
-- bit 6 表示本条结束时刻是否有“返回值本核可消费”依赖证据；
-- 对 `FetchMax`，bits 8..31 保存饱和后的软件 retry 数；A5 单条硬件
-  `atomicMax` 当前为 0，CPU CAS 回归可非零；
-- `task_id`：能归属任务时写真实 task id，生命周期 atomic 写 `-1`。
+| `site_id` | site | op |
+| ---: | --- | --- |
+| 1 | `startup_poll` | `Load` |
+| 2 | `fatal_poll` | `Load` |
+| 5 | `fanin_flag_load` | `Load` |
+| 11 | `heap_frontier_load` | `Load` |
+| 12 | `heap_vend_load` | `Load` |
+| 14 | `replay_done_poll` | `Load` |
 
-converter 把这些事件放在对应 AIC/AIV 的原 scalar lane，atomic 不再
-伪装成与 scalar 并行的独立执行单元。名称显式带边界：
+standalone 没有真实 PA 追加的 BlockWon site，也没有允许聚合的幂等失败 exchange；
+不能照搬真实 PA 的“九类 observation load 加一类 exchange”allowlist。同一 site 在
+显式等待区外的一次性或 opportunistic 读取仍逐条记录。
+
+raw 的 `auxiliary` 保存 site id。direct Atomic 的 `flags` 约定为：低 4 bit 是 op id，
+bit 4 表示返回旧值是否参与后续判断，bit 5 仅对 Load 表示观察值是否为零，bit 6
+表示是否有“返回值本核可消费”依赖证据，bit 7 必须为 0；bits 8..31 仅对 direct
+FetchMax 保存软件 retry 数，不能按调用次数解析。能归属任务时 `task_id` 写真实
+task id，生命周期 atomic 写 `-1`。
+
+PollBatch 的 `flags` 则必须同时满足：低 4 bit 为 `Load(0)`、bit 4 为 1、bit 5/6
+为 0、bit 7 为 1，bits 8..31 保存 `1..0xFFFFFF` 的精确无符号 24 bit
+`call_count`；`task_id=-1`、`function_id=-1`。达到 `0xFFFFFF` 时先落盘，再从
+1 开启下一条 batch，不能饱和后丢计数。
+
+converter 把 direct Atomic、PollBatch 和 ClockBaseline 放在对应 AIC/AIV 的原
+scalar lane，atomic 不再伪装成与 scalar 并行的独立执行单元。direct 名称显式带边界：
 `atomic.return_ready.<site>.<op>#<task_id>` 或
 `atomic.source_issue.<site>.<op>#<task_id>`；category 也分别为
-`atomic.return_ready`/`atomic.source_issue`，无需点开 span 即可过滤区分。args 中
-保留整数 `cycles`、site/op、
+`atomic.return_ready`/`atomic.source_issue`，无需点开 span 即可过滤区分。direct
+args 中保留 `call_count=1`、整数 `cycles`、site/op、
 `result_used`、`return_ready_observed`、`completion_boundary`、Load 的
 `value_zero` 和 FetchMax 的 `retries`。Perfetto 的浮点微秒显示不用于
 替代 raw 整数 tick。
+
+PollBatch 名称为 `atomic.poll_batch.<site>.load×<call_count>`，category 为
+`atomic.poll_batch`；args 还明确给出 `poll_window_cycles`、
+`batch_semantics=observation_load_calls`、
+`duration_semantics=logical_poll_episode_envelope_not_single_atomic_latency` 和
+`may_contain_interleaved_direct_atomics=true`。一个等待区可以同时累计多个 site，
+所以不同 PollBatch 窗口可以重叠，窗口内也可能交错 direct Atomic。
+host 文字分析也保持两套口径：`[TRACE_ATOMIC]` 只统计 direct bracket，
+`[TRACE_ATOMIC_POLL]` 只统计 episode 数、精确逻辑调用数和等待包络分布。
 
 #### 7.5.3 按调用点语义区分的两种结束边界
 
@@ -1127,11 +1156,29 @@ PA 的端到端 GAP 是“发布发射 -> 自然消费者首次观察到新值�
 复用现有 load 记录做离线派生，但其包含互连可见性、消费者调度与轮询
 间隔，且在对外报告跨核时间差前还需单独验证各核 `SYS_CNT` 的对齐性。
 
-两种边界的 `end` 都在本条 64 B trace record 写入之前取得，所以本条
-duration 不直接包含自己的 record 写入；但这次写入、附加指令和代码布局
-会影响后续 atomic 到达、竞争与 I-cache，整轮仍是插桩运行。
+两种 direct 边界的 `end` 都在本条 64 B trace record 写入之前取得，所以本条
+duration 不直接包含自己的 record 写入；但这次写入、附加指令和代码布局会影响
+后续 atomic 到达、竞争与 I-cache，整轮仍是插桩运行。direct record 写入不会隐式
+关闭活跃 PollBatch，否则等待区内自然交错的发布/推进 atomic 会把一个逻辑等待
+episode 人为切碎。
 
-开启逐 atomic trace 时，每个 worker 在最终 drain 之后额外记录两条
+PollBatch 使用另一种时间语义：`duration`/`poll_window_cycles` 是从该 site 在显式
+等待区内首次累计调用到边界关闭的逻辑等待 episode 包络。它不是独占 scalar 时间，
+不是 `call_count` 次 atomic 延迟之和，也不是其中某次 load 的 return-ready 延迟；
+不同 site 的窗口可以重叠，窗口内还可能包含 direct Atomic，不能把 PollBatch 混入
+direct 单次延迟的 median/p95。
+
+边界实现复用真实 PA 已验证的规则，并让 phase/lap 与 batch 使用同一次 cycle 采样：
+
+1. 显式等待区退出时关闭与该 region 匹配的 PollBatch；
+2. `TraceTimestamp` 先采 cycle，再以该 cycle 关闭全部活跃 batch，然后写 phase
+   begin/end；
+3. `ResetTraceLap` 在推进 lap 起点前关闭，`WriteTraceLap` 在写 lap 前用同一
+   `end_cycle` 关闭；
+4. Kernel begin/end 都经过 `TraceTimestamp`，所以 PollBatch 不能跨入或跨出 Kernel；
+5. `FlushTraceCore` 的最终关闭只作防御性兜底，不能代替上述语义边界。
+
+开启 atomic trace 时，每个 worker 在最终 drain 之后额外记录两条
 `ClockBaseline`：一条是连续两次 `get_sys_cnt()`，另一条是纯寄存器依赖
 hook 后读 `SYS_CNT`。它们只给出同一二进制、同一物理核上两类边界的
 计时分辨率和固定底噪分布，使用边界是：
@@ -1143,17 +1190,37 @@ hook 后读 `SYS_CNT`。它们只给出同一二进制、同一物理核上两�
 
 #### 7.5.4 计数闭环与容量门禁
 
-逐 atomic 结果只有同时满足以下闭环才可进入正式分析：
+schema-v3 结果只有同时满足逻辑调用与物理记录闭环才可进入正式分析。设
+`direct_atomic_records` 是 bit 7 为 0 的物理 Atomic 条数，则逐核和全局都必须满足：
 
-1. 每个 worker 的 raw `Atomic` 记录数等于其独占
-   `WorkerResult.atomic_trace_calls`；
-2. 全局 raw `Atomic` 记录数等于 96 个 worker 的软件计数之和；
-3. 每个 worker 恰有 2 条 `ClockBaseline`（连续时钟与返回依赖 hook 各一条），
-   因此全局固定为 192 条；
-4. 原阶段记录、动态 wait 记录、atomic 记录和 192 条 ClockBaseline 的总和与
-   trace header count 精确相等；
-5. 每核 `dropped==0`，且 raw 到 merged 后逐 atomic 事件数不变；
-6. 原有 Claim、winner、kernel、fanin、frontier、cursor、heap 和每 worker
+~~~text
+logical_atomic_calls = direct_atomic_records + Σ(PollBatch.call_count)
+physical_atomic_records = direct_atomic_records + poll_batch_records
+physical_atomic_records
+    = logical_atomic_calls - batched_poll_calls + poll_batch_records
+~~~
+
+这里 `batched_poll_calls` 是所有 PollBatch `call_count` 之和，不是 batch 条数。
+producer 的逐核 state、host 扫描 raw 行、导出的 metadata 和 converter 重算必须同时
+闭合以下七项：
+
+~~~text
+records
+atomic_records
+clock_baseline_records
+atomic_calls
+batched_poll_calls
+poll_batch_records
+dropped_records
+~~~
+
+此外还必须满足：
+
+1. 每条 PollBatch 都属于六类 allowlist，flags 合法且 `call_count>0`；
+2. 每个 worker 恰有 2 条 ClockBaseline，因此 96 核全局固定为 192 条；
+3. 原 phase、动态 wait、物理 Atomic 和 ClockBaseline 总数与 trace header 精确相等；
+4. 每核和全局 `dropped_records==0`，raw 到 merged 后物理 Atomic 条数不变；
+5. 原有 Claim、winner、kernel、fanin、frontier、cursor、heap 和每 worker
    1280 Submit 语义断言仍全部 PASS。
 
 trace 容量不足时必须明确报 overflow 并判该轮观察无效，不能只分析前缀，也不能
@@ -1232,25 +1299,60 @@ JSON/同名 `.tmp`，并只在协议、PMU/owner 门禁、Restore 和 runtime �
 `SYS_CNT` 调用点仍存在；sidecar 会明确记录“有 timestamp call、无 record write、
 无 atomic trace、无 profile accumulation”，不能把该模式描述成编译期零插桩。
 
-#### 7.5.6 当前证据状态与正式重采矩阵
+#### 7.5.6 当前实现状态、历史证据与正式重采矩阵
 
-O2 的 schema、逐 atomic wrapper、两条 ClockBaseline、scalar lane converter、Submit
-PMU hook 和 CNT0..8 sidecar 已实现。2026-07-18 已用干净重编的 CCEC AIC/AIV
-二进制完成 b1 atomic-trace-only 上板：全部协议断言 PASS，raw 共 4959 条、
-`expected=4959`、`dropped=0`，其中 Atomic 1395 条、ClockBaseline 192 条。
-Claim raw schema v2 也已直接闭环为 `won=5/lost=283/not_attempted=192`，不再
-借助 Atomic 记录反推 role-filtered Claim。当时 converter 原四项在直接脚本与
-`python -m unittest` 两种入口均为 4/4 PASS；增加 winner workload metadata
-回归后，当前完整集合为 5/5 PASS。b1 的 Atomic 按边界闭环为
-`return_ready=1193/source_issue=202`。本轮未入库产物为：
+当前源码已经实现 schema-v3 的六类 PollBatch、精确 `call_count`、七项 summary
+闭环、两条 ClockBaseline、scalar lane converter，以及 phase/lap/Kernel 共 cycle
+边界关闭。2026-07-18 已用边界修复版 CCEC 完成 b1 与 b256 真机重测，当前证据为：
+
+| 样本 | winner 负载 | 总 `records` | 逻辑 `atomic_calls` | direct | 物理 Atomic | `batched_poll_calls` | PollBatch | ClockBaseline | dropped | 首末 Submit |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| b1 | `scalar-nop=0` | 4,414 | 1,031 | 613 | 850 | 418 | 237 | 192 | 0 | 54.056 us |
+| b256 | `real-compute/6,28,4,1` | 967,307 | 105,580 | 103,618 | 103,883 | 1,962 | 265 | 192 | 0 | 5,774.295 us |
+
+两轮的 producer、raw 行与 converter 七项 summary 均闭合，96 核逐核异常数为 0：
+
+~~~text
+b1:   613 + 418 = 1,031;       613 + 237 = 850 = 1,031 - 418 + 237
+b256: 103,618 + 1,962 = 105,580; 103,618 + 265 = 103,883 = 105,580 - 1,962 + 265
+~~~
+
+b1/b256 每核记录峰值分别为 57/10,252，均低于 65,536 条固定容量。PollBatch
+实际分布在 `startup_poll/fatal_poll/fanin_flag_load/replay_done_poll` 四类 site：
+b1 的物理 episode/逻辑调用依次为 `96/143、42/47、2/6、97/222`，b256 为
+`96/143、42/47、16/467、111/1305`；HeapGuard 两类 allowlist 本轮为 0，不是漏插桩。
+
+同核区间复核中，b1 的 237 个 PollBatch 与 4 个 Kernel、b256 的 265 个 PollBatch
+与 1,024 个 Kernel 均为严格 overlap 0；分别有 3 和 31 处仅在 `end==begin` 端点
+相接，符合“边界先以同一 cycle 关闭 PollBatch，再进入/退出 Kernel”的设计。b256
+真实 Cube/Vector 计算、调度终态和全部语义断言均 PASS。产物为：
+
+~~~text
+outputs/pa_scheduler_swimlane_20260718_182649_4060527/ccec/l2_swimlane_records.json
+outputs/pa_scheduler_swimlane_20260718_182649_4060527/ccec/merged_swimlane.json
+outputs/pa_scheduler_swimlane_20260718_182725_4061524/ccec/l2_swimlane_records.json
+outputs/pa_scheduler_swimlane_20260718_182725_4061524/ccec/merged_swimlane.json
+~~~
+
+b1 是零 winner 负载的快速验收，b256 是开启 atomic 泳道的诊断运行；5.774295 ms
+只证明观察构建保持目标量级，不是关闭 trace 的正式性能基线，也不能与下列历史样本
+做单轮减法归因观察开销。
+
+以下是 2026-07-18 的**历史 schema-v2、逐调用、边界修复前**证据，保留用于追溯，
+不作为当前 schema-v3 的物理记录规模、逻辑调用数或边界闭合验收。历史 b1
+atomic-trace-only 上板中，全部协议断言 PASS，raw 共 4959 条、
+`expected=4959`、`dropped=0`，其中逐条 Atomic 1395 条、ClockBaseline 192 条。
+Claim 当时已按 schema-v2 闭合为 `won=5/lost=283/not_attempted=192`。当时 converter
+回归最终为 5/5 PASS，Atomic direct bracket 为
+`return_ready=1193/source_issue=202`。历史未入库产物为：
 
 ~~~text
 outputs/scalar_observation_final_20260718/atomic_inlineasm_ccec_b1/raw.json
 outputs/scalar_observation_final_20260718/atomic_inlineasm_ccec_b1/merged_swimlane.json
 ~~~
 
-b1 用于确认边界、schema 和泳道布局，不用它的插桩后 Submit span 替代
-256 batch 约 5 ms 的无诊断基线。同一二进制的 256 batch 随后也完成一轮：
+该历史 b1 只用于说明旧边界、旧 schema 和泳道布局，不用它的插桩后 Submit span
+替代 256 batch 约 5 ms 的无诊断基线。同一历史二进制的 256 batch 随后也完成一轮：
 全部断言 PASS，raw/merged 均为 963368 个 span，`expected=963368`、
 `dropped=0`，Atomic 99944 条、ClockBaseline 192 条；Claim 为
 `won=1280/lost=72448/not_attempted=49152`，恰好闭环 `96*1280`。合并泳道
@@ -1264,9 +1366,9 @@ outputs/scalar_observation_final_20260718/atomic_inlineasm_ccec_b256/raw.json
 outputs/scalar_observation_final_20260718/atomic_inlineasm_ccec_b256/merged_swimlane.json
 ~~~
 
-同一源码随后关闭 swimlane/atomic-trace/PMU 做了三个独立进程，Submit 为
+同一历史源码随后关闭 swimlane/atomic-trace/PMU 做了三个独立进程，Submit 为
 3.729925/4.904346/5.563417 ms，中位数 4.904346 ms，三轮语义全部 PASS。
-这组数据说明当前 standalone 仍复现约 5 ms 量级，也显示了多核轮询、
+这组数据说明该历史 standalone 版本复现了约 5 ms 量级，也显示了多核轮询、
 frontier helping 和 winner 分布会带来明显轮间波动；一次 5.209261 ms 插桩轮
 不能与三轮中任一轮做单样本减法后归因 trace 成本。
 
@@ -1274,9 +1376,11 @@ frontier helping 和 winner 分布会带来明显轮间波动；一次 5.209261 
 
 | 结果 | 当前状态 |
 | ---- | -------- |
-| 256 batch 逐 atomic raw/merged 事件数与 dropped | **已闭环** |
-| 15 site 按 AIC/AIV 的 events/median/p95/max | **b1/256 batch 已采，未执行 site 明确为 0** |
-| 192 条 ClockBaseline 的 AIC/AIV 分布 | **b1/256 batch 已闭环** |
+| schema-v3 六类 PollBatch、flags、logical/physical 公式与拓扑的 converter 静态回归 | **19/19 PASS；不替代真机验收** |
+| schema-v3 b1 的七项 summary、逐核/全局公式与 dropped | **96/96 闭合，dropped=0** |
+| schema-v3 256 batch 的 direct/PollBatch raw→merged 与容量 | **已闭合，单核峰值 10,252/65,536** |
+| 15-site schema 与六类 PollBatch allowlist | **两轮 flags 全合法；实际四类有事件、HeapGuard 两类为 0** |
+| 当前版本 192 条 ClockBaseline 与 Kernel 边界 | **两轮均闭合；严格 overlap=0** |
 | `submit-all` 的 owner/gate/CNT0..8/total 闭环 | **b1、零 NOP 单次上板已通过** |
 | 256 batch `submit-all` 的 I-cache 与 pipe 分组分布 | **3 个 PMU-only 独立进程已采并完成 raw→summary 重算** |
 | real-compute 引擎 PMU 与 placement | **b8 count1/count2 精确倍增并逐 worker 闭合** |
@@ -1284,7 +1388,9 @@ frontier helping 和 winner 分布会带来明显轮间波动；一次 5.209261 
 此前开发过程中的探索性输出不在这里引用为正式结论。最终按同一源码依次执行：
 
 1. 三后端全量重建及 no-trace/no-PMU 语义回归；
-2. CCEC atomic-trace-only，检查上述计数闭环、ClockBaseline 和 raw→merged；
+2. CCEC schema-v3 atomic-trace-only 已按 b1、b256 顺序完成，六类 allowlist、flags、
+   七项 summary、逐核/全局三条公式、ClockBaseline、Kernel overlap 和 raw→merged
+   均已检查；后续改动仍按同一门禁复测；
 3. CCEC PMU-only 的 `submit-all` 已完成 3 个独立进程 A/A；后续每轮仍使用
    唯一 JSON 路径，并检查 96 核、owner bitmap/triplet、start/stop、25% 风险门槛和 Restore；
 4. real-compute b8 count1/count2 已完成 Cube/Vector busy 精确倍增与
@@ -1300,7 +1406,10 @@ frontier helping 和 winner 分布会带来明显轮间波动；一次 5.209261 
 - 单条 source-issue 或 return-ready bracket 就是硬件 atomic retire 延迟、跨核
   可见延迟或一致性完成时间；
 - 所有 atomic duration 相加就是 Submit 中“atomic 占用时间”，或删除这些 atomic
-  一定能等量缩短墙钟时间；不同核 bracket 会重叠，poll 数也会随插桩改变；
+  一定能等量缩短墙钟时间；不同核 direct bracket 会重叠，PollBatch 之间也可重叠，
+  poll 数还会随插桩改变；
+- PollBatch duration 是单次 load 延迟、`call_count` 次延迟之和或独占 scalar 时间；
+  它只表示逻辑等待 episode 包络；
 - `ClockBaseline` 可以逐事件相减并得到无偏的 atomic 硬件净耗时；
 - trace 开启后的 Submit span 可以直接与无 trace 基线比较并宣布性能收益；
 - `scalar_busy/total_cycles` 是墙钟时间，或 I-cache miss 数可以直接换算成精确
@@ -1313,9 +1422,12 @@ frontier helping 和 winner 分布会带来明显轮间波动；一次 5.209261 
 - standalone 的 PMU/atomic 分布可以直接替代真实 FDWIC PA。迁移真实用例时仍需
   复用已验证的最小观察代码，并重新完成计数闭环、正确性和无诊断性能 A/B。
 
-#### 7.5.8 256 batch loser ClaimMax 的定量归因
+#### 7.5.8 历史 schema-v2：256 batch loser ClaimMax 的定量归因
 
-2026-07-18 的 `atomic_inlineasm_ccec_b256` 中，Claim 三态为 1280 个 winner、
+本节只保留 2026-07-18 边界修复前 `atomic_inlineasm_ccec_b256` 的历史定量结果。
+ClaimMax 在 schema-v3 中仍是 direct FetchMax，不会被 PollBatch 聚合；但下列数值来自
+旧二进制，只能作为后续重测的优先级假设，不能充当当前版本验收数据。该历史样本中，
+Claim 三态为 1280 个 winner、
 72448 个 attempted loser 和 49152 个 role-filtered not-attempted。每个 attempted Claim
 恰好包含一条 `claim_max.fetch_max`，与 73728 条 ClaimMax 精确闭环。
 
@@ -1343,7 +1455,7 @@ AIV core93 上，对应数字为 0.261731/5.191702 ms，也约 5.0%。这只是�
 可见的本核返回等待占比；真正改动 Claim 协议后还会改变 winner 到达、
 frontier/fanin 时序和竞争形态，不能简单从 5.209261 ms 中减去 0.258 ms。
 
-阶段性结论是：ClaimMax loser 是后续 atomic 消减的第一优先级，但尚未证明
+历史阶段性结论是：ClaimMax loser 是后续 atomic 消减的第一优先级，但尚未证明
 它是整个调度的主瓶颈。256 batch PMU-only 三轮 A/A 已补齐 Submit 全窗的
 I-cache 和 pipe 分组基线；它显示 AIV miss rate 在本三轮持续高于 AIC，但现有
 counter 仍不能把 miss 定位到 materialize/register 或某条 atomic。开始改 Claim 后，
@@ -1543,7 +1655,7 @@ repeat 都执行；repeat 完整性仍使用 CCEC count1→count2 engine PMU 精
 性能验收先纠正了观察口径：早先 3.7～4.4 ms 是 `--no-swimlane`，
 真实 PA 5.1 ms 是标准 L2 泳道；泳道记录不仅增加指令，还会改变 worker
 到达、fanin 失败重试和 RingBp，所以不能把两者直接相减成“缺失的调度时间”。
-当前 CCEC b256 真负载、标准泳道、不开逐 atomic 的 5 个独立进程为：
+当前保留的 CCEC b256 真负载历史 phase-only 泳道、不开逐 atomic 的 5 个独立进程为：
 
 ```text
 5002.413 / 4875.193 / 4968.894 / 4992.477 / 4876.282 us
@@ -1554,12 +1666,14 @@ repeat 都执行；repeat 完整性仍使用 CCEC count1→count2 engine PMU 精
 中位数为 41.461/54.007/28.053/2.649 us，总 core work 已贴近真实 PA，
 不通过增加 repeat 继续硬凑总时间。
 
-保留的一轮 raw 为
+保留的一轮历史 phase-only raw 为
 `outputs/performance_gap_20260718/standalone_ccec_real_b256_raw.json`；863,237 条
 记录全部有效，与真实 PA 863,232 条的基本阶段数完全相同，只额外有 5 条
 RingBp。这说明 standalone 已达到“独立复现约 5 ms 调度”的目标；仍然保留
 本文第 6 节的边界：它不依赖 simpler 生产代码，也不复刻真实 PA 数值数据流和
-通用多 group/joint 拓扑。
+通用多 group/joint 拓扑。当前正式 `swimlane` action 已固定合并普通阶段和
+逐 atomic 记录，因此该 863,237 条历史文件只用于同口径性能参照，不能作为当前
+合并泳道的记录数量或容量证据。
 
 #### 7.5.14 默认真负载的 Submit I-cache 基线
 

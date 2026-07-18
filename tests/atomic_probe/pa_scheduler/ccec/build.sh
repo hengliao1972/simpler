@@ -14,7 +14,16 @@ set -euo pipefail
 # 所有输入和产物都从脚本自身位置解析，调用者无需位于仓库根目录。
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# CCEC 不再生成同时夹带泳道与 PMU 的统一 ELF。无参数保持兼容并明确等价于
+# swimlane；该产物只保留普通阶段和 atomic 的合并泳道能力。
+BUILD_VARIANT="${1:-swimlane}"
+if [[ $# -gt 1 || "$BUILD_VARIANT" != "swimlane" ]]; then
+    echo "Usage: $0 [swimlane]" >&2
+    exit 1
+fi
 BUILD_DIR="$ROOT_DIR/build/ccec"
+VARIANT_DEFINES=(-DPA_BUILD_SWIMLANE=1 -DPA_BUILD_SUBMIT_PMU=0)
 
 # 编译只依赖本目录源码与用户安装的 CANN/PTO 头，不引用 pa_scheduler 目录外的 simpler 构建产物。
 if [[ -z "${ASCEND_HOME_PATH:-}" ]]; then
@@ -30,8 +39,8 @@ READELF_BIN="${READELF:-readelf}"
 PTO_INCLUDE_ROOT="${PTO_ISA_ROOT:-$ASCEND_HOME_PATH/x86_64-linux}"
 
 # ccec/ld.lld 必须来自当前已 source 的 CANN；host 编译器和 readelf 允许用户通过环境变量替换。
-if [[ ! -x "$CCEC" || ! -x "$LD" || ! -x "$HCC" ]]; then
-    echo "CCEC, ld.lld, or the AICPU HCC compiler is missing under ASCEND_HOME_PATH=$ASCEND_HOME_PATH" >&2
+if [[ ! -x "$CCEC" || ! -x "$LD" ]]; then
+    echo "CCEC or ld.lld is missing under ASCEND_HOME_PATH=$ASCEND_HOME_PATH" >&2
     exit 1
 fi
 if ! command -v "$READELF_BIN" >/dev/null 2>&1; then
@@ -50,6 +59,11 @@ for header in pto/pto-inst.hpp pto/common/constants.hpp pto/common/pto_tile.hpp;
 done
 
 mkdir -p "$BUILD_DIR"
+# 旧统一构建可能在根目录残留 PMU owner；swimlane 构建主动移除这两个
+# 不属于本变体的产物，避免 direct host 调用误加载上一版诊断 SO。
+rm -f \
+    "$BUILD_DIR/libpa_scheduler_pmu_owner_dispatcher.so" \
+    "$BUILD_DIR/libpa_scheduler_pmu_owner_aicpu.so"
 
 # 关闭编译器自动插入的 scalar DCCI，由 kernel.cpp 中与 PA 对齐的显式失效/回写协议负责 cache 可见性。
 # 两种架构共用这些 ABI、栈和优化参数，避免 AIC/AIV 对共享 SchedulerState 产生不同解释。
@@ -64,6 +78,7 @@ COMMON_FLAGS=(
     -mllvm -cce-aicore-dcci-before-kernel-end=false
     -I"$ROOT_DIR/common"
     -I"$PTO_INCLUDE_ROOT/include"
+    "${VARIANT_DEFINES[@]}"
 )
 
 # 同一入口源码分别面向 cube 与 vector ISA 编译，宏只选择各自的全局入口和 mixed metadata。
@@ -185,54 +200,24 @@ check_icache_probe_layout() {
          "thrash=0x$thrash_hex/$thrash_size"
 }
 
-# 编译器不能把目标扩到两个 16B fetch block，也不能折叠 64 KiB 冲刷体；否则
-# cold/warm 虽然仍可能产生数字，却不再代表可解释的单次 I-cache miss。
-check_icache_probe_layout aic
-check_icache_probe_layout aiv
+# swimlane ELF 明确不含 PMU 校准目标；I-cache 布局检查只属于后续独立的
+# submit-pmu 诊断构建，不能反过来要求泳道产物携带 64 KiB 冲刷体。
+if [[ "$BUILD_VARIANT" != "swimlane" ]]; then
+    check_icache_probe_layout aic
+    check_icache_probe_layout aiv
+fi
 
 # PMU selector/CTRL 的所有权必须由主 aicpu_scheduler 配置并在退出前恢复。
 # standalone 目录内自带 Path-A dispatcher 与 owner：前者负责把 owner SO
 # 落到设备预安装目录，后者由 mode=0 JSON 注册并通过统一入口执行命令。
-echo "[BUILD] self-contained AICPU PMU dispatcher"
-"$HCC" -shared -fPIC -O3 -g -std=gnu++17 -Wall -Wextra -Werror \
-    -Wl,--build-id \
-    "$SCRIPT_DIR/pmu_owner_dispatcher.cpp" \
-    -o "$BUILD_DIR/libpa_scheduler_pmu_owner_dispatcher.so"
-
-echo "[BUILD] self-contained AICPU PMU owner"
-"$HCC" -shared -fPIC -O3 -g -std=gnu++17 -Wall -Wextra -Werror \
-    -Wl,--build-id \
-    -I"$SCRIPT_DIR" \
-    "$SCRIPT_DIR/pmu_owner_aicpu.cpp" \
-    -o "$BUILD_DIR/libpa_scheduler_pmu_owner_aicpu.so"
-
-OWNER_HEADER="$("$READELF_BIN" --file-header "$BUILD_DIR/libpa_scheduler_pmu_owner_aicpu.so")"
-OWNER_SYMBOLS="$("$READELF_BIN" --dyn-syms --wide "$BUILD_DIR/libpa_scheduler_pmu_owner_aicpu.so")"
-DISPATCHER_HEADER="$("$READELF_BIN" --file-header "$BUILD_DIR/libpa_scheduler_pmu_owner_dispatcher.so")"
-DISPATCHER_SYMBOLS="$("$READELF_BIN" --dyn-syms --wide "$BUILD_DIR/libpa_scheduler_pmu_owner_dispatcher.so")"
-if [[ "$OWNER_HEADER" != *"Type:                              DYN"* ||
-      "$OWNER_HEADER" != *"Machine:                           AArch64"* ||
-      "$DISPATCHER_HEADER" != *"Type:                              DYN"* ||
-      "$DISPATCHER_HEADER" != *"Machine:                           AArch64"* ]]; then
-    echo "PMU dispatcher and owner must both be AArch64 shared objects." >&2
-    exit 1
-fi
-if [[ "$OWNER_SYMBOLS" != *" simpler_aicpu_exec"* ]]; then
-    echo "Missing main AICPU PMU owner entry: simpler_aicpu_exec" >&2
-    exit 1
-fi
-for entry in StaticTileFwkBackendKernelServer DynTileFwkBackendKernelServerInit DynTileFwkBackendKernelServer; do
-    if [[ "$DISPATCHER_SYMBOLS" != *" $entry"* ]]; then
-        echo "Missing AICPU PMU dispatcher entry: $entry" >&2
-        exit 1
-    fi
-done
-echo "[CHECK] Path-A dispatcher and main AICPU PMU owner exports are present"
+# swimlane 构建不生成 PMU owner/dispatcher；二者必须与 submit-pmu kernel、
+# host 使用同一编译期 phase 配置并保存在对应诊断目录中。
 
 # host runner 只链接用户 CANN 9.1 的 ACL/runtime，并写入同一安装目录的 rpath，运行时不需要 simpler 动态库。
 # `-Werror` 让 host API 签名或尺寸类型变化在构建期暴露，避免到上板阶段才出现参数截断。
 echo "[BUILD] CCEC host runner"
 "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror -Wno-deprecated-declarations \
+    "${VARIANT_DEFINES[@]}" \
     -I"$ROOT_DIR/common" \
     -I"$ASCEND_HOME_PATH/include" \
     -I"$ASCEND_HOME_PATH/pkg_inc" \

@@ -74,6 +74,50 @@ ATOMIC_OP_NAMES = {
     3: "fetch_max",
 }
 
+# schema-v3 的校验表必须与 standalone C++ 的稳定 AtomicSite 编号一致。
+# 这里只描述本独立调度器实际实现的 0..14；真实 PA 追加的 BlockWon site
+# 不属于本用例，不能为了兼容生产 converter 在这里凭空放宽输入。
+ATOMIC_SITE_OP_IDS = {
+    0: 2,
+    1: 0,
+    2: 0,
+    3: 1,
+    4: 3,
+    5: 0,
+    6: 1,
+    7: 1,
+    8: 0,
+    9: 0,
+    10: 3,
+    11: 0,
+    12: 0,
+    13: 2,
+    14: 0,
+}
+# 这些发布型调用不消费 atomic 返回的旧值；其余 standalone site 的
+# 返回值都参与协议判断。v3 输入必须与源码语义完全一致。
+ATOMIC_RESULT_UNUSED_SITE_IDS = {0, 3, 6, 7, 13}
+# 只有显式 scheduler 等待区中的六类 observation load 可以合并。
+# frontier 扫描和 Claim 即使调用很多次也必须继续保留逐调用记录。
+POLL_BATCH_SITE_OP_IDS = {1: 0, 2: 0, 5: 0, 11: 0, 12: 0, 14: 0}
+
+ATOMIC_RESULT_USED = 1 << 4
+ATOMIC_VALUE_ZERO = 1 << 5
+ATOMIC_RETURN_READY = 1 << 6
+ATOMIC_POLL_BATCH = 1 << 7
+ATOMIC_PAYLOAD_SHIFT = 8
+ATOMIC_PAYLOAD_MASK = 0xFFFFFF
+
+
+# schema-v3 只由本目录的 standalone producer 生成；其 worker 编号与
+# 32 AIC + 64 AIV 的 mixed-block 映射是 raw ABI 的一部分，converter 不再
+# 只检查“同一 block/lane 不重复”这个弱条件。
+def _standalone_topology(core_id: int) -> tuple[int, int, str]:
+    if core_id < 32:
+        return core_id, 0, "aic"
+    vector_id = core_id - 32
+    return vector_id // 2, 1 + vector_id % 2, "aiv"
+
 
 # 把可转为整数的 raw 标量归一为 int，并在错误中保留精确字段路径。
 def _integer(value: Any, label: str) -> int:
@@ -106,17 +150,30 @@ def _load_and_validate(
     frequency_hz = _integer(metadata.get("clock_freq_hz"), "metadata.clock_freq_hz")
     if frequency_hz <= 0:
         raise ValueError("metadata.clock_freq_hz must be positive")
-    # v1 是旧 raw，Claim flags 只有 winner bit；v2 追加 attempted bit。
+    # v1 是旧 raw，Claim flags 只有 winner bit；v2 追加 attempted bit；
+    # v3 再加入精确计数 PollBatch 与 producer summary 闭合。
     # 不认识的新版本直接拒绝，避免把新 flags 按旧语义误读。
     trace_schema_version = _integer(metadata.get("trace_schema_version", 1), "metadata.trace_schema_version")
-    if trace_schema_version not in (1, 2):
+    if trace_schema_version not in (1, 2, 3):
         raise ValueError(f"unsupported metadata.trace_schema_version: {trace_schema_version}")
+    if trace_schema_version == 3 and level != 4:
+        raise ValueError("metadata.trace_schema_version=3 requires l2_swimlane_level=4")
     num_cores = _integer(metadata.get("num_cores"), "metadata.num_cores")
     if num_cores <= 0:
         raise ValueError("metadata.num_cores must be positive")
     core_types = metadata.get("core_types")
     if not isinstance(core_types, list) or len(core_types) != num_cores:
         raise ValueError("metadata.core_types length must equal metadata.num_cores")
+    if trace_schema_version == 3:
+        if num_cores > 96:
+            raise ValueError("schema-v3 standalone metadata.num_cores must not exceed 96")
+        for core_id, core_type in enumerate(core_types):
+            expected_type = _standalone_topology(core_id)[2]
+            if core_type != expected_type:
+                raise ValueError(
+                    f"metadata.core_types[{core_id}]={core_type!r} does not match "
+                    f"standalone topology {expected_type!r}"
+                )
     winner_workload = metadata.get("winner_workload")
     if winner_workload is not None:
         if not isinstance(winner_workload, dict):
@@ -183,6 +240,22 @@ def _load_and_validate(
     # 若在 raw 中映射到两个 core，说明采集已损坏，不能继续生成误导性泳道。
     core_by_block_lane: dict[tuple[int, int], int] = {}
     base_cycle: int | None = None
+    observed_summary = {
+        "records": len(rows),
+        "atomic_records": 0,
+        "clock_baseline_records": 0,
+        "atomic_calls": 0,
+        "batched_poll_calls": 0,
+        "poll_batch_records": 0,
+        # dropped 无法从已经导出的有效行反推；v3 必须由 producer summary
+        # 明确承诺为零，下面再逐字段核对。
+        "dropped_records": 0,
+    }
+    v3_clock_rows: dict[int, dict[str, int | bool | None]] = {
+        core_id: {"plain": 0, "dependency": 0, "return_ready": None}
+        for core_id in range(num_cores)
+    }
+    v3_result_used_direct_rows: list[tuple[int, int, bool]] = []
     # 逐行在写输出前检查列数、范围和可转整数的字段。任一行不满足这些约束
     # 都会整体拒绝输入，不生成缺少关键阶段的“部分可看”泳道。
     for index, row in enumerate(rows):
@@ -206,11 +279,101 @@ def _load_and_validate(
             raise ValueError(f"fdwic_events[{index}] has invalid lane {lane}")
         if phase not in PHASE_NAMES:
             raise ValueError(f"fdwic_events[{index}] has unknown phase {phase!r}")
+        if trace_schema_version == 3:
+            if task_id < -1 or function_id < -1 or auxiliary < 0:
+                raise ValueError(
+                    f"fdwic_events[{index}] has invalid v3 base fields: "
+                    f"task={task_id} func={function_id} aux={auxiliary}"
+                )
+            if not 0 <= flags <= 0xFFFFFFFF:
+                raise ValueError(
+                    f"fdwic_events[{index}] has invalid uint32 flags {flags}"
+                )
+            expected_block, expected_lane, _ = _standalone_topology(core_id)
+            if block_id != expected_block or lane != expected_lane:
+                raise ValueError(
+                    f"fdwic_events[{index}] block/lane={block_id}/{lane} does not match "
+                    f"standalone topology {expected_block}/{expected_lane} for core {core_id}"
+                )
         if phase == "Claim" and trace_schema_version >= 2:
             if flags & ~0x3 or (flags & 0x1 and not flags & 0x2):
                 raise ValueError(
                     f"fdwic_events[{index}] has invalid Claim flags 0x{flags:x}"
                 )
+            if trace_schema_version == 3 and auxiliary > 1:
+                raise ValueError(
+                    f"fdwic_events[{index}] has invalid Claim auxiliary {auxiliary}"
+                )
+        if phase == "Atomic":
+            poll_batch = bool(flags & ATOMIC_POLL_BATCH)
+            atomic_op = flags & 0xF
+            result_used = bool(flags & ATOMIC_RESULT_USED)
+            value_zero = bool(flags & ATOMIC_VALUE_ZERO)
+            return_ready = bool(flags & ATOMIC_RETURN_READY)
+            payload = (flags >> ATOMIC_PAYLOAD_SHIFT) & ATOMIC_PAYLOAD_MASK
+            if poll_batch:
+                if (
+                    trace_schema_version != 3
+                    or payload == 0
+                    or POLL_BATCH_SITE_OP_IDS.get(auxiliary) != atomic_op
+                    or not result_used
+                    or value_zero
+                    or return_ready
+                    or task_id != -1
+                    or function_id != -1
+                ):
+                    raise ValueError(
+                        f"fdwic_events[{index}] has invalid Atomic PollBatch "
+                        f"site={auxiliary} flags=0x{flags:x}"
+                    )
+            elif trace_schema_version == 3:
+                expected_result_used = (
+                    auxiliary in ATOMIC_SITE_OP_IDS
+                    and auxiliary not in ATOMIC_RESULT_UNUSED_SITE_IDS
+                )
+                if (
+                    ATOMIC_SITE_OP_IDS.get(auxiliary) != atomic_op
+                    or result_used != expected_result_used
+                    or (return_ready and not result_used)
+                    or (value_zero and atomic_op != 0)
+                    or (payload and atomic_op != 3)
+                    or function_id != -1
+                ):
+                    raise ValueError(
+                        f"fdwic_events[{index}] has invalid direct Atomic "
+                        f"site={auxiliary} flags=0x{flags:x}"
+                    )
+                if result_used:
+                    v3_result_used_direct_rows.append((index, core_id, return_ready))
+            observed_summary["atomic_records"] += 1
+            if poll_batch:
+                observed_summary["atomic_calls"] += payload
+                observed_summary["batched_poll_calls"] += payload
+                observed_summary["poll_batch_records"] += 1
+            else:
+                observed_summary["atomic_calls"] += 1
+        elif phase == "ClockBaseline":
+            observed_summary["clock_baseline_records"] += 1
+            if trace_schema_version == 3:
+                dependency = bool(flags & 0x1)
+                dependency_applied = bool(flags & 0x2)
+                if (
+                    flags & ~0x3
+                    or (dependency_applied and not dependency)
+                    or task_id != -1
+                    or function_id != -1
+                    or auxiliary != 0
+                ):
+                    raise ValueError(
+                        f"fdwic_events[{index}] has invalid ClockBaseline "
+                        f"flags=0x{flags:x} auxiliary={auxiliary}"
+                    )
+                clock_state = v3_clock_rows[core_id]
+                if dependency:
+                    clock_state["dependency"] = int(clock_state["dependency"]) + 1
+                    clock_state["return_ready"] = dependency_applied
+                else:
+                    clock_state["plain"] = int(clock_state["plain"]) + 1
         if start_cycle <= 0 or end_cycle < start_cycle:
             raise ValueError(
                 f"fdwic_events[{index}] has invalid cycles start={start_cycle} end={end_cycle}"
@@ -238,6 +401,39 @@ def _load_and_validate(
         )
 
     assert base_cycle is not None
+    if trace_schema_version == 3:
+        # 每核两条基线同时证明采集完整性和该后端是否真正应用了
+        # atomic 返回值依赖；所有消费返回值的直接记录必须与本核证据一致。
+        for core_id, clock_state in v3_clock_rows.items():
+            if clock_state["plain"] != 1 or clock_state["dependency"] != 1:
+                raise ValueError(
+                    f"core {core_id} requires exactly one plain and one dependency "
+                    f"ClockBaseline: plain={clock_state['plain']} "
+                    f"dependency={clock_state['dependency']}"
+                )
+        for row_index, core_id, return_ready in v3_result_used_direct_rows:
+            expected_return_ready = bool(v3_clock_rows[core_id]["return_ready"])
+            if return_ready != expected_return_ready:
+                raise ValueError(
+                    f"fdwic_events[{row_index}] direct Atomic return_ready={return_ready} "
+                    f"does not match core {core_id} ClockBaseline "
+                    f"dependency_applied={expected_return_ready}"
+                )
+
+        producer_summary = metadata.get("fdwic_summary")
+        if not isinstance(producer_summary, dict):
+            raise ValueError(
+                "metadata.fdwic_summary is required for trace_schema_version=3"
+            )
+        for key, observed_value in observed_summary.items():
+            producer_value = _integer(
+                producer_summary.get(key), f"metadata.fdwic_summary.{key}"
+            )
+            if producer_value != observed_value:
+                raise ValueError(
+                    f"metadata.fdwic_summary.{key}={producer_value} "
+                    f"does not match raw value {observed_value}"
+                )
     return frequency_hz, trace_schema_version, rows, core_by_block_lane, base_cycle, metadata
 
 
@@ -392,10 +588,29 @@ def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
                     atomic_op_id = flags & 0xF
                     atomic_site = ATOMIC_SITE_NAMES.get(atomic_site_id, f"site_{atomic_site_id}")
                     atomic_op = ATOMIC_OP_NAMES.get(atomic_op_id, f"op_{atomic_op_id}")
-                    # 边界直接写入 span 名称，打开泳道后无需点开 args
-                    # 就能区分“本核返回值可消费”和“只包围源码发射”。
-                    atomic_boundary_tag = "return_ready" if flags & (1 << 6) else "source_issue"
-                    name = f"atomic.{atomic_boundary_tag}.{atomic_site}.{atomic_op}#{task_id}"
+                    atomic_poll_batch = (
+                        trace_schema_version >= 3 and bool(flags & ATOMIC_POLL_BATCH)
+                    )
+                    if atomic_poll_batch:
+                        atomic_call_count = (
+                            flags >> ATOMIC_PAYLOAD_SHIFT
+                        ) & ATOMIC_PAYLOAD_MASK
+                        name = (
+                            f"atomic.poll_batch.{atomic_site}.{atomic_op}"
+                            f"×{atomic_call_count}"
+                        )
+                    else:
+                        # 边界直接写入 span 名称，打开泳道后无需点开 args
+                        # 就能区分“本核返回值可消费”和“只包围源码发射”。
+                        atomic_boundary_tag = (
+                            "return_ready"
+                            if flags & ATOMIC_RETURN_READY
+                            else "source_issue"
+                        )
+                        name = (
+                            f"atomic.{atomic_boundary_tag}.{atomic_site}."
+                            f"{atomic_op}#{task_id}"
+                        )
                     thread_id = lane
                 elif phase == "clock_baseline":
                     name = (
@@ -433,36 +648,70 @@ def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
                     },
                 }
                 if phase == "atomic":
-                    # Atomic 的 flags/aux 有独立 ABI，不沿用普通 phase 的 mc 语义。
-                    # cycles 保留原始整数，避免 Perfetto dur 的微秒浮点换算丢失短 atomic 精度。
-                    event["args"] = {
-                        "phase": phase,
-                        "task_id": task_id,
-                        "func_id": function_id,
-                        "core": core_id,
-                        "site": atomic_site,
-                        "site_id": atomic_site_id,
-                        "op": atomic_op,
-                        "op_id": atomic_op_id,
-                        "cycles": end - start,
-                        "result_used": bool(flags & (1 << 4)),
-                        "return_ready_observed": bool(flags & (1 << 6)),
-                        "completion_boundary": (
-                            "return_value_ready"
-                            if flags & (1 << 6)
-                            else "source_issue_bracket"
-                        ),
-                        "flags": flags,
-                        "execution_unit": "scalar",
-                    }
-                    # 分类同样带边界，便于 Perfetto 过滤和分组；二者
-                    # 仍在同一 AIC/AIV scalar lane，不伪造并行执行单元。
-                    event["cat"] = f"atomic.{atomic_boundary_tag}"
-                    # bit5 只对 Load 有意义；bits8..31 只对 FetchMax 表示饱和后的 retry 数。
-                    if atomic_op_id == 0:
-                        event["args"]["value_zero"] = bool(flags & (1 << 5))
-                    if atomic_op_id == 3:
-                        event["args"]["retries"] = (flags >> 8) & 0xFFFFFF
+                    # PollBatch 表示显式等待区内的逻辑调用次数；它的 span
+                    # 只是 episode 包络，可能与其他 site 或直接 Atomic 交错，
+                    # 因而绝不能伪装成一次 atomic 的 completion boundary。
+                    if atomic_poll_batch:
+                        event["args"] = {
+                            "phase": "atomic_poll_batch",
+                            "task_id": task_id,
+                            "func_id": function_id,
+                            "core": core_id,
+                            "site": atomic_site,
+                            "site_id": atomic_site_id,
+                            "op": atomic_op,
+                            "op_id": atomic_op_id,
+                            "call_count": atomic_call_count,
+                            "poll_window_cycles": end - start,
+                            "estimate_formula": "call_count * calibrated_atomic_cost",
+                            "is_poll_batch": True,
+                            "batch_semantics": "observation_load_calls",
+                            "duration_semantics": (
+                                "logical_poll_episode_envelope_not_single_atomic_latency"
+                            ),
+                            "may_contain_interleaved_direct_atomics": True,
+                            "flags": flags,
+                            "execution_unit": "scalar",
+                        }
+                        event["cat"] = "atomic.poll_batch"
+                    else:
+                        # 直接 Atomic 的 flags/aux 有独立 ABI，不沿用普通
+                        # phase 的 mc 语义。cycles 保留原始整数，避免短
+                        # atomic 经微秒浮点换算后丢失 tick 精度。
+                        event["args"] = {
+                            "phase": phase,
+                            "task_id": task_id,
+                            "func_id": function_id,
+                            "core": core_id,
+                            "site": atomic_site,
+                            "site_id": atomic_site_id,
+                            "op": atomic_op,
+                            "op_id": atomic_op_id,
+                            "call_count": 1,
+                            "cycles": end - start,
+                            "result_used": bool(flags & ATOMIC_RESULT_USED),
+                            "return_ready_observed": bool(flags & ATOMIC_RETURN_READY),
+                            "completion_boundary": (
+                                "return_value_ready"
+                                if flags & ATOMIC_RETURN_READY
+                                else "source_issue_bracket"
+                            ),
+                            "flags": flags,
+                            "execution_unit": "scalar",
+                        }
+                        # 分类同样带边界，便于 Perfetto 过滤和分组；二者
+                        # 仍在同一 AIC/AIV scalar lane，不伪造并行执行单元。
+                        event["cat"] = f"atomic.{atomic_boundary_tag}"
+                        # bit5 只对 Load 有意义；bits8..31 只对 FetchMax
+                        # 表示饱和后的 retry 数。
+                        if atomic_op_id == 0:
+                            event["args"]["value_zero"] = bool(
+                                flags & ATOMIC_VALUE_ZERO
+                            )
+                        if atomic_op_id == 3:
+                            event["args"]["retries"] = (
+                                flags >> ATOMIC_PAYLOAD_SHIFT
+                            ) & ATOMIC_PAYLOAD_MASK
                 elif phase == "claim":
                     event["args"] = {
                         "phase": phase,

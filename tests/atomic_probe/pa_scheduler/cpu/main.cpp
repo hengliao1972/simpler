@@ -13,6 +13,7 @@
 #include "../common/winner_workload_host.h"
 
 #define PA_DEVICE inline
+#define PA_DEVICE_NOINLINE static __attribute__((noinline))
 #define PA_GM
 // CPU 后端直接实例化与设备端相同的公共调度器；这里只消去 AICore 地址空间
 // 修饰符，不另写一套简化状态机，因此它可以承担协议和边界回归。
@@ -135,9 +136,10 @@ __attribute__((noinline)) void ExecuteRealWinnerWorkload(
 }
 
 struct CpuOps {
-    // CPU 原子 built-in 在函数返回前已产生旧值；该后端只做协议回归，不把
-    // x86 时间分布外推到 A5。
-    static constexpr bool kAtomicReturnReadyObserved = true;
+    // CPU 后端只验证调度协议与 raw schema，没有建立与 A5 CCEC
+    // 同构的“atomic 返回值依赖 + SYS_CNT”硬件边界；因此必须标记为
+    // source_issue，不能让 x86 built-in 的函数返回冒充 A5 return_ready。
+    static constexpr bool kAtomicReturnReadyObserved = false;
 
     // 用 fetch_add(0) 模拟 A5 atomicAdd(addr, 0) 原子读，而不是退化为普通
     // CPU load。Acquire/AcqRel 只建立本 CPU 协议回归需要的发布/观察关系，
@@ -395,6 +397,7 @@ int main(int argc, char **argv) {
                     real_compute
                         ? pa_scheduler::host::RealComputePatternName(workload_options.pattern)
                         : "none",
+                    options.trace_atomics,
                     read_trace_records
                 )) {
                 postprocess_ok = false;

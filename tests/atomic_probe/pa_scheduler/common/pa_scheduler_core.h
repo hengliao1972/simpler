@@ -31,6 +31,17 @@ struct LocalStats {
     TraceContext trace;
 };
 
+template <typename Ops>
+PA_DEVICE uint64_t TraceTimestamp(TraceContext &trace, WorkerResult &result) {
+    (void)result;
+    // 对齐真实 FDWIC 的 TRACE_SPAN_BEGIN/END：取一次时间后立即以同一
+    // cycle 关闭活跃 PollBatch。不能在 WriteTrace 中统一关闭，否则直接
+    // Atomic 记录也会错误切断等待 episode。
+    const uint64_t cycle = Ops::Now();
+    AtomicPollBoundaryAt<Ops>(trace, cycle);
+    return cycle;
+}
+
 PA_DEVICE uint32_t KindIndex(TaskKind kind) { return static_cast<uint32_t>(kind); }
 
 PA_DEVICE TaskKind GetTaskKind(uint32_t task_id) { return static_cast<TaskKind>(task_id % kTasksPerBatch); }
@@ -216,16 +227,16 @@ PA_DEVICE uint32_t DrainReady(
             continue;
         }
         const TaskKind kind = static_cast<TaskKind>(slot.kind + 1);
-        const uint64_t kernel_begin = Ops::Now();
+        const uint64_t kernel_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
         Ops::ExecuteKernel(state, worker, kind, NopCountForKind(state->config.nops, kind));
-        const uint64_t kernel_end = Ops::Now();
+        const uint64_t kernel_end = TraceTimestamp<Ops>(stats.trace, stats.result);
         WriteTrace<false>(
             stats.trace, stats.result, static_cast<int32_t>(slot.task_id), static_cast<int32_t>(slot.kind),
             TracePhase::Kernel, ProfilePhase::ReplayTail, kernel_begin, kernel_end
         );
         RecordKernelCycles(stats, kind, kernel_end - kernel_begin);
         CompleteTask<Ops>(state, worker, slot.task_id, stats);
-        const uint64_t commit_cycle = Ops::Now();
+        const uint64_t commit_cycle = TraceTimestamp<Ops>(stats.trace, stats.result);
         WriteTrace<false>(
             stats.trace, stats.result, static_cast<int32_t>(slot.task_id), static_cast<int32_t>(slot.kind),
             TracePhase::Commit, ProfilePhase::ReplayTail, commit_cycle, commit_cycle
@@ -253,8 +264,13 @@ PA_DEVICE void WaitForSlot(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_id, LocalStats &stats
 ) {
     // 四个物理 slot 中预留两个 won slot 语义位，仅有 kUsableSlots 个可供本图使用；满时靠 drain 取得进展。
-    const uint64_t wait_begin = Ops::Now();
+    const uint64_t wait_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
     bool waited = false;
+    // 只聚合这个显式背压等待区中的 fanin 观察；每次 Submit 开头的
+    // opportunistic EfDrain 仍保留逐条 Atomic，不能仅凭 site 名称全局聚合。
+    const uint32_t poll_region = AtomicPollRegionBegin<Ops>(
+        stats.trace, stats.result, TraceAtomicSiteMask(AtomicSite::FaninFlagLoad)
+    );
     // 退出条件只有 occupied_count 重新低于可用容量；依赖尚未 ready 时 SpinHint 后继续重试。
     while (worker.occupied_count >= kUsableSlots) {
         waited = true;
@@ -265,15 +281,19 @@ PA_DEVICE void WaitForSlot(
             Ops::SpinHint();
         }
     }
+    AtomicPollRegionEnd<Ops>(stats.trace, stats.result, poll_region);
     if (waited) {
         ++stats.result.wait_events[0];
-        const uint64_t wait_end = Ops::Now();
+        const uint64_t wait_end = TraceTimestamp<Ops>(stats.trace, stats.result);
         WriteTrace<Profile>(
             stats.trace, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::RingBp,
             ProfilePhase::WaitForSlot, wait_begin, wait_end, 0, 0
         );
     } else if constexpr (Profile) {
-        AccumulatePhase<true>(stats.result, ProfilePhase::WaitForSlot, wait_begin, Ops::Now());
+        AccumulatePhase<true>(
+            stats.result, ProfilePhase::WaitForSlot, wait_begin,
+            TraceTimestamp<Ops>(stats.trace, stats.result)
+        );
     }
 }
 
@@ -289,17 +309,37 @@ PA_DEVICE bool HeapGuard(
     }
     const uint64_t ring = state->heap_size;
     ++stats.result.heap_guards;
-    const uint64_t wait_begin = Ops::Now();
+    const uint64_t wait_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
     bool waited = false;
+    bool poll_region_active = false;
+    uint32_t poll_region = 0;
     // 正常出口是 heap_next-vend 落入一个 ring；检测到不可能释放的覆盖或其他核 fatal 时返回失败。
     while (!IsFatal<Ops>(state, stats, static_cast<int32_t>(task_id))) {
         // 逻辑 heap 尚未走完第一圈时，所有物理输出区间都位于 [0, heap_next)，
         // 不可能覆盖此前分配；保留上面的 fatal 原子检查后，可直接跳过 frontier/vend 读取。
         if (worker.heap_next <= ring) {
+            if (poll_region_active) {
+                AtomicPollRegionEnd<Ops>(stats.trace, stats.result, poll_region);
+            }
             if constexpr (Profile) {
-                AccumulatePhase<true>(stats.result, ProfilePhase::HeapGuard, wait_begin, Ops::Now());
+                AccumulatePhase<true>(
+                    stats.result, ProfilePhase::HeapGuard, wait_begin,
+                    TraceTimestamp<Ops>(stats.trace, stats.result)
+                );
             }
             return true;
+        }
+        // 与真实 PA 一样，首圈 fast path 上方的 FatalPoll 仍是直接记录；只有
+        // 确认进入 heap wrap 慢路径后，才开启本等待 episode 的四类观察聚合。
+        if (!poll_region_active) {
+            poll_region = AtomicPollRegionBegin<Ops>(
+                stats.trace, stats.result,
+                TraceAtomicSiteMask(AtomicSite::FatalPoll) |
+                    TraceAtomicSiteMask(AtomicSite::HeapFrontierLoad) |
+                    TraceAtomicSiteMask(AtomicSite::HeapVendLoad) |
+                    TraceAtomicSiteMask(AtomicSite::FaninFlagLoad)
+            );
+            poll_region_active = true;
         }
         const int64_t frontier = LoadLine<Ops>(
             state->frontier, stats, AtomicSite::HeapFrontierLoad, static_cast<int32_t>(task_id)
@@ -312,20 +352,25 @@ PA_DEVICE bool HeapGuard(
                   &state->tasks[retire].vend
               );
         if (worker.heap_next - vend <= ring) {
+            AtomicPollRegionEnd<Ops>(stats.trace, stats.result, poll_region);
             if (waited) {
                 ++stats.result.wait_events[1];
-                const uint64_t wait_end = Ops::Now();
+                const uint64_t wait_end = TraceTimestamp<Ops>(stats.trace, stats.result);
                 WriteTrace<Profile>(
                     stats.trace, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::RingBp,
                     ProfilePhase::HeapGuard, wait_begin, wait_end, 0, 1
                 );
             } else if constexpr (Profile) {
-                AccumulatePhase<true>(stats.result, ProfilePhase::HeapGuard, wait_begin, Ops::Now());
+                AccumulatePhase<true>(
+                    stats.result, ProfilePhase::HeapGuard, wait_begin,
+                    TraceTimestamp<Ops>(stats.trace, stats.result)
+                );
             }
             return true;
         }
         if (frontier >= static_cast<int64_t>(task_id) - 1) {
             SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+            AtomicPollRegionEnd<Ops>(stats.trace, stats.result, poll_region);
             return false;
         }
         waited = true;
@@ -336,9 +381,12 @@ PA_DEVICE bool HeapGuard(
             Ops::SpinHint();
         }
     }
+    if (poll_region_active) {
+        AtomicPollRegionEnd<Ops>(stats.trace, stats.result, poll_region);
+    }
     if (waited) {
         ++stats.result.wait_events[1];
-        const uint64_t wait_end = Ops::Now();
+        const uint64_t wait_end = TraceTimestamp<Ops>(stats.trace, stats.result);
         WriteTrace<Profile>(
             stats.trace, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::RingBp,
             ProfilePhase::HeapGuard, wait_begin, wait_end, 0, 1
@@ -470,12 +518,12 @@ PA_DEVICE bool SubmitTask(
     // 且 winner 不入 kernel slot，而是在 heap guard 后直接发布完成。
     BeginSubmit(worker, args, context);
     const uint32_t task_id = static_cast<uint32_t>(context.task_id);
-    const uint64_t submit_begin = Ops::Now();
+    const uint64_t submit_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
     if (task_id == 0) {
         stats.result.submit_begin = submit_begin;
     }
 
-    ResetTraceLap<Ops>(worker);
+    ResetTraceLap<Ops>(stats.trace, stats.result, worker);
     // EfDrain 在当前 Submit 的参数物化前执行上一批已就绪 slot，是绝大多数 kernel 的正常落点。
     DrainReady<Ops>(state, worker, DrainPlace::EfDrain, stats);
     WriteTraceLap<Ops, Profile>(
@@ -487,13 +535,13 @@ PA_DEVICE bool SubmitTask(
     // two independently traced spans. Build/Replay later consumes this origin.
     // lap 起点在 materialize 前重置；Materialize/PrepareMap 各自取独立绝对区间，而后续
     // Build/Replay 会从这个起点形成覆盖式 span。因此泳道上的这些阶段不能直接相加。
-    ResetTraceLap<Ops>(worker);
-    const uint64_t materialize_begin = Ops::Now();
+    ResetTraceLap<Ops>(stats.trace, stats.result, worker);
+    const uint64_t materialize_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
     if (!MaterializeTask(worker, task_id, args, context, state->heap_base, state->heap_size)) {
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
-    const uint64_t materialize_end = Ops::Now();
+    const uint64_t materialize_end = TraceTimestamp<Ops>(stats.trace, stats.result);
     WriteTrace<Profile>(
         stats.trace, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::Materialize,
         ProfilePhase::Materialize, materialize_begin, materialize_end, 0,
@@ -501,9 +549,9 @@ PA_DEVICE bool SubmitTask(
     );
     stats.result.materialized_outputs += context.result.count;
 
-    const uint64_t prepare_begin = Ops::Now();
+    const uint64_t prepare_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
     AdvanceTensorMap(worker.map, task_id, static_cast<int32_t>(state->heap_window));
-    const uint64_t prepare_end = Ops::Now();
+    const uint64_t prepare_end = TraceTimestamp<Ops>(stats.trace, stats.result);
     WriteTrace<Profile>(
         stats.trace, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::PrepareMap,
         ProfilePhase::PrepareMap, prepare_begin, prepare_end, 0, kind == TaskKind::Alloc ? 1U : 0U
@@ -514,20 +562,20 @@ PA_DEVICE bool SubmitTask(
 
     if (kind == TaskKind::Alloc) {
         // Alloc 没有 kernel lane，96 个 worker 都维护本地物化/heap 状态，但只有 Claim winner 发布全局完成。
-        const uint64_t register_begin = Ops::Now();
+        const uint64_t register_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
         RegisterOutputs(context, args, false);
-        const uint64_t register_end = Ops::Now();
+        const uint64_t register_end = TraceTimestamp<Ops>(stats.trace, stats.result);
         WriteTrace<Profile>(
             stats.trace, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::Register,
             ProfilePhase::Register, register_begin, register_end, 0, 0
         );
 
-        const uint64_t claim_begin = Ops::Now();
+        const uint64_t claim_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
         const ClaimOutcome claim = Claim<Ops>(state, worker, task_id, kind, stats);
         winner = claim.won;
         context.won = winner;
         context.kernel_id = claim.function_id;
-        const uint64_t claim_end = Ops::Now();
+        const uint64_t claim_end = TraceTimestamp<Ops>(stats.trace, stats.result);
         WriteTrace<Profile>(
             stats.trace, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::Claim,
             ProfilePhase::Claim, claim_begin, claim_end,
@@ -553,13 +601,13 @@ PA_DEVICE bool SubmitTask(
             );
         }
     } else {
-        const uint64_t claim_begin = Ops::Now();
+        const uint64_t claim_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
         const ClaimOutcome claim = Claim<Ops>(state, worker, task_id, kind, stats);
         winner = claim.won;
         function_id = claim.function_id;
         context.won = winner;
         context.kernel_id = function_id;
-        const uint64_t claim_end = Ops::Now();
+        const uint64_t claim_end = TraceTimestamp<Ops>(stats.trace, stats.result);
         WriteTrace<Profile>(
             stats.trace, stats.result, static_cast<int32_t>(task_id), function_id, TracePhase::Claim,
             ProfilePhase::Claim, claim_begin, claim_end,
@@ -568,9 +616,9 @@ PA_DEVICE bool SubmitTask(
         RecordClaimOutcome(stats, kind, claim);
 
         if (winner) {
-            const uint64_t fanin_begin = Ops::Now();
+            const uint64_t fanin_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
             context.fanin_count = static_cast<int32_t>(CollectFanin(worker.map, args, context.fanin));
-            const uint64_t fanin_end = Ops::Now();
+            const uint64_t fanin_end = TraceTimestamp<Ops>(stats.trace, stats.result);
             WriteTrace<Profile>(
                 stats.trace, stats.result, static_cast<int32_t>(task_id), function_id, TracePhase::Fanin,
                 ProfilePhase::Fanin, fanin_begin, fanin_end, 0, static_cast<uint32_t>(context.fanin_count)
@@ -578,9 +626,9 @@ PA_DEVICE bool SubmitTask(
             stats.result.map_lookups += static_cast<uint32_t>(args.tensor_count) - context.result.count;
         }
 
-        const uint64_t register_begin = Ops::Now();
+        const uint64_t register_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
         RegisterOutputs(context, args, true);
-        const uint64_t register_end = Ops::Now();
+        const uint64_t register_end = TraceTimestamp<Ops>(stats.trace, stats.result);
         WriteTrace<Profile>(
             stats.trace, stats.result, static_cast<int32_t>(task_id), function_id, TracePhase::Register,
             ProfilePhase::Register, register_begin, register_end, 0, 1
@@ -610,7 +658,7 @@ PA_DEVICE bool SubmitTask(
     }
 
     ++stats.result.submits;
-    const uint64_t submit_end = Ops::Now();
+    const uint64_t submit_end = TraceTimestamp<Ops>(stats.trace, stats.result);
     WriteTrace<Profile>(
         stats.trace, stats.result, static_cast<int32_t>(task_id), function_id, TracePhase::Submit,
         ProfilePhase::Submit, submit_begin, submit_end, winner ? 1U : 0U, kind == TaskKind::Alloc ? 1U : 0U
@@ -741,6 +789,10 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     );
     const uint64_t start_wait = Ops::Now();
     uint32_t start_polls = 0;
+    const uint32_t startup_poll_region = AtomicPollRegionBegin<Ops>(
+        stats.trace, stats.result,
+        TraceAtomicSiteMask(AtomicSite::StartupPoll) | TraceAtomicSiteMask(AtomicSite::FatalPoll)
+    );
     // 全员到齐或任一核发布 fatal 即退出启动等待；watchdog 防止缺失参与者造成永久挂死。
     while (LoadLine<Ops>(state->started_count, stats, AtomicSite::StartupPoll) <
                static_cast<int64_t>(state->config.workers) &&
@@ -750,6 +802,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             break;
         }
     }
+    AtomicPollRegionEnd<Ops>(stats.trace, stats.result, startup_poll_region);
 
     const uint32_t batches = state->config.batches;
     const uint32_t task_count = batches * kTasksPerBatch;
@@ -761,9 +814,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         // CCEC 可在这里开启本 worker 私有 PMU 窗口；CPU/AscendC 适配层是空实现。
         // 窗口覆盖从首个参数构造到末次 Submit 返回，与全局“首 Submit.begin～末 Submit.end”
         // 口径接近但不相同，host sidecar 必须按 per-worker 累计解释。
-        ResetTraceLap<Ops>(worker);
-        // lap 重置属于泳道观察自身，不应污染 PMU-only 的 Submit 取数；窗口从
-        // orchestration 初始化（即首批参数构造）前一条边界开始。
+        ResetTraceLap<Ops>(stats.trace, stats.result, worker);
         const bool pmu_window_started = Ops::PmuWindowStart(state, worker_id);
         InitPaOrchestration(orchestration, batches, &state->context_lens[0]);
         for (uint32_t batch = 0; batch < batches; ++batch) {
@@ -831,6 +882,10 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         stats.trace, stats.result, -1, AtomicSite::ReplayDoneIncrement,
         &state->replay_done.value, 1
     );
+    const uint32_t final_poll_region = AtomicPollRegionBegin<Ops>(
+        stats.trace, stats.result,
+        TraceAtomicSiteMask(AtomicSite::ReplayDonePoll) | TraceAtomicSiteMask(AtomicSite::FaninFlagLoad)
+    );
     while (true) {
         const uint32_t freed =
             DrainReady<Ops>(state, worker, DrainPlace::FinalDrain, stats);
@@ -845,6 +900,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             Ops::SpinHint();
         }
     }
+    AtomicPollRegionEnd<Ops>(stats.trace, stats.result, final_poll_region);
 
     if (stats.trace.atomics_enabled) {
         // 两条基线都放在最终 drain 之后。第一条量连续
@@ -870,7 +926,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 
     // PA writes swimlane records through the ordinary GM cache and explicitly
     // cleans each worker's record range before the kernel finishes.
-    FlushTraceCore<Ops>(stats.trace);
+    FlushTraceCore<Ops>(stats.trace, stats.result);
     stats.result.finish_cycle = Ops::Now();
     stats.result.max_occupied = stats.max_occupied;
     stats.result.final_occupied = worker.occupied_count;
@@ -884,12 +940,19 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 
 template <typename Ops>
 PA_DEVICE void RunScheduler(PA_GM SchedulerState *state, uint32_t worker_id, CoreRole role) {
+    // 两个正式 CCEC 构建都不再携带旧 phase-profile 模板副本：swimlane 用
+    // records 表达阶段，submit-pmu 使用独立 PMU 边界。其他后端暂时保留原
+    // 运行时入口，保证公共 standalone 的 CPU/AscendC 回归不被 CCEC 构建切分影响。
+#if PA_BUILD_SWIMLANE || PA_BUILD_SUBMIT_PMU
+    RunSchedulerImpl<Ops, false>(state, worker_id, role);
+#else
     // Profile 作为编译期模板参数，只在显式开启时保留阶段累计代码，关闭时不在热路径增加运行时分支。
     if (state->config.profile_phases != 0) {
         RunSchedulerImpl<Ops, true>(state, worker_id, role);
     } else {
         RunSchedulerImpl<Ops, false>(state, worker_id, role);
     }
+#endif
 }
 
 }  // namespace pa_scheduler

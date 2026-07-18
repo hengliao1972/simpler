@@ -15,6 +15,21 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// CCEC 的正式产物只允许二选一：swimlane 保存普通阶段与 atomic 记录，
+// submit-pmu 则编译掉泳道观察代码。CPU/AscendC 未传这些宏时继续使用原有
+// 通用实现，避免公共模型反向依赖某个后端的构建脚本。
+#ifndef PA_BUILD_SWIMLANE
+#define PA_BUILD_SWIMLANE 0
+#endif
+
+#ifndef PA_BUILD_SUBMIT_PMU
+#define PA_BUILD_SUBMIT_PMU 0
+#endif
+
+#if PA_BUILD_SWIMLANE && PA_BUILD_SUBMIT_PMU
+#error "PA_BUILD_SWIMLANE and PA_BUILD_SUBMIT_PMU are mutually exclusive"
+#endif
+
 namespace pa_scheduler {
 
 // 这里固定的是 PA Case1 的调度拓扑，而不是为了缩小 standalone 人为选择的规模：
@@ -267,7 +282,8 @@ enum class AtomicSite : uint32_t {
 
 // Atomic 记录 flags 的低四位保存操作种类；bit4 表示返回值参与后续判断，
 // bit5 表示 Load 观察到零，bit6 表示结束时间已由返回值依赖推进到
-// return-ready 边界，bits[31:8] 保存 FetchMax 的软件重试数（饱和）。
+// return-ready 边界。schema-v3 中 bit7 区分等待区 PollBatch：此时
+// bits[31:8] 是精确调用次数；直接 FetchMax 中同一区域仍表示软件重试数。
 enum class AtomicOp : uint32_t {
     Load = 0,
     Exchange = 1,
@@ -278,7 +294,98 @@ constexpr uint32_t kAtomicOpMask = 0x0fU;
 constexpr uint32_t kAtomicResultUsed = 1U << 4;
 constexpr uint32_t kAtomicValueZero = 1U << 5;
 constexpr uint32_t kAtomicReturnReady = 1U << 6;
+constexpr uint32_t kAtomicPollBatch = 1U << 7;
 constexpr uint32_t kAtomicRetriesShift = 8;
+constexpr uint32_t kAtomicPollCountShift = 8;
+constexpr uint32_t kAtomicPollCountMax = 0x00ffffffU;
+constexpr uint32_t kAtomicPollBatchSiteCount = 6;
+
+// 这些映射是 raw ABI 的一部分，同时被 device 聚合器与 host 闭环校验使用。
+// 0..14 与真实 PA 保持稳定；BlockWon 尚未在 standalone 中实现，不能只为
+// 编号齐全而追加没有真实调用路径的 site。
+#ifdef PA_DEVICE
+#define PA_MODEL_INLINE PA_DEVICE
+#else
+#define PA_MODEL_INLINE inline
+#endif
+
+PA_MODEL_INLINE constexpr AtomicOp AtomicSiteExpectedOp(AtomicSite site) {
+    switch (site) {
+        case AtomicSite::StartupIncrement:
+        case AtomicSite::ReplayDoneIncrement:
+            return AtomicOp::FetchAdd;
+        case AtomicSite::FatalSet:
+        case AtomicSite::CompletionVendExchange:
+        case AtomicSite::CompletionFlagExchange:
+            return AtomicOp::Exchange;
+        case AtomicSite::ClaimMax:
+        case AtomicSite::FrontierMax:
+            return AtomicOp::FetchMax;
+        default:
+            return AtomicOp::Load;
+    }
+}
+
+PA_MODEL_INLINE constexpr bool AtomicSiteResultUsed(AtomicSite site) {
+    switch (site) {
+        case AtomicSite::StartupIncrement:
+        case AtomicSite::FatalSet:
+        case AtomicSite::CompletionVendExchange:
+        case AtomicSite::CompletionFlagExchange:
+        case AtomicSite::ReplayDoneIncrement:
+            return false;
+        default:
+            return true;
+    }
+}
+
+PA_MODEL_INLINE constexpr int32_t AtomicPollBatchIndex(AtomicSite site) {
+    switch (site) {
+        case AtomicSite::StartupPoll:
+            return 0;
+        case AtomicSite::FatalPoll:
+            return 1;
+        case AtomicSite::FaninFlagLoad:
+            return 2;
+        case AtomicSite::HeapFrontierLoad:
+            return 3;
+        case AtomicSite::HeapVendLoad:
+            return 4;
+        case AtomicSite::ReplayDonePoll:
+            return 5;
+        default:
+            return -1;
+    }
+}
+
+PA_MODEL_INLINE constexpr AtomicSite AtomicPollBatchSite(uint32_t index) {
+    switch (index) {
+        case 0:
+            return AtomicSite::StartupPoll;
+        case 1:
+            return AtomicSite::FatalPoll;
+        case 2:
+            return AtomicSite::FaninFlagLoad;
+        case 3:
+            return AtomicSite::HeapFrontierLoad;
+        case 4:
+            return AtomicSite::HeapVendLoad;
+        case 5:
+            return AtomicSite::ReplayDonePoll;
+        default:
+            return AtomicSite::Count;
+    }
+}
+
+PA_MODEL_INLINE constexpr bool AtomicSiteIsPollBatchable(AtomicSite site) {
+    return AtomicPollBatchIndex(site) >= 0;
+}
+
+PA_MODEL_INLINE constexpr uint32_t AtomicSiteMask(AtomicSite site) {
+    return 1U << static_cast<uint32_t>(site);
+}
+
+#undef PA_MODEL_INLINE
 
 // ClockBaseline 的 bit0 区分普通连续 SYS_CNT 与后端的 atomic 返回依赖
 // 计时钩子；后者用于量化那一条依赖 MOV 自身带来的固定底噪。
@@ -288,7 +395,17 @@ constexpr uint32_t kClockAtomicDependencyApplied = 1U << 1;
 struct alignas(64) TraceCoreState {
     volatile uint32_t count;
     volatile uint32_t dropped;
-    uint32_t padding[14];
+    // logical atomic 调用数与物理记录数分开闭合：PollBatch 的一条记录可以
+    // 表示多次只读轮询，physical = atomic_calls - poll_calls + batch_records。
+    volatile uint32_t atomic_calls;
+    volatile uint32_t poll_calls;
+    volatile uint32_t poll_batch_records;
+    // 拓扑在一个 worker 分区内恒定；当前仍保留 64B TraceRecord 兼容布局，
+    // 但在 core state 再保存一份权威身份，host 会验证每条记录与之相符。
+    volatile int32_t core_idx;
+    volatile int32_t block_id;
+    volatile int32_t lane;
+    uint32_t padding[8];
 };
 // 每个 worker 独占一个计数 cache line 和一段定长 records，不需要为了写 trace
 // 再引入跨核 atomic；满容量后只增加本 worker 的 dropped。
