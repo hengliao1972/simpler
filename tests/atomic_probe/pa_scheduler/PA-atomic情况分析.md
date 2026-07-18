@@ -352,8 +352,8 @@ Alloc/QK/SF/PV winner 调用，共 1024 次。当前代表性 CCEC 轮次的累�
 | 阶段 | 单变量 | 当前状态 |
 | ---- | ------ | -------- |
 | H1 | HeapGuard 首圈 fast path | 正确性与真实性能完成，保留并本地提交 |
-| F1 | fanin 依赖检查顺序 | H1 提交后开始 |
-| 后续 | ready cache、退避、frontier、Claim | 尚未开始，必须逐项验证 |
+| F1 | fanin 依赖检查顺序 | standalone 性能未改善，已回退 |
+| 后续 | ready cache、退避、frontier、Claim | 按风险从低到高逐项验证 |
 
 ### 7.1 阶段 H1：HeapGuard 首圈 fast path
 
@@ -648,3 +648,76 @@ A5 十对中心趋势和 p90 均未回退，并且直接 atomic 数量确定下�
 
 真实性能收益较小且仍有单轮反向，不把 H1 宣传成大幅优化。下一阶段 F1 只研究
 fanin 依赖检查顺序；不得同时加入 ready cache 或退避，避免失去因果归属。
+
+### 7.2 阶段 F1：fanin 依赖检查顺序
+
+#### 7.2.1 候选改动与静态分析
+
+F1 只在 standalone `CollectFanin()` 完成原有去重和 16 项截断后，将有效
+fanin 前缀按 producer task id 降序排列。排序放在截断之后，所以不改变
+原实现选中的依赖集合、`kMaxFanin=16` 语义或 slot ABI。fanin ready 是 AND
+条件，仅改变检查顺序不改变“所有 producer 都完成后才可执行”的结果。
+
+PA 中只有 UP 包含 3 个 fanin，原顺序是 `[SF, PV, Alloc]`，降序后为
+`[PV, SF, Alloc]`。PV 依赖 SF，因此在其他调度状态不变时：
+
+- SF、PV 均未完成：两种顺序都在第 1 次 ready load 后返回；
+- SF 已完成、PV 未完成：原顺序读 2 次，新顺序读 1 次；
+- PV 已完成：由依赖关系可知 SF 已完成，两种顺序都成功读完 3 项。
+
+所以在固定调度状态下，UP 每次失败检查的 ready atomic load 不会增加，
+且在 SF 已完成而 PV 尚未完成的窗口可减少 1 次。QK 的 fanin 为 0，
+SF/PV 各为 1，本改动对它们不产生重排。不过，排序本身会改变标量指令和
+worker 到达时序；真实动态调度不能由上述固定状态推导出必然性能收益。
+
+#### 7.2.2 standalone 正确性与完整运行
+
+F1 修改后重建 CCEC、AscendC 和 CPU 三后端，并分别运行 smoke、256 batch 零
+NOP、256 batch 默认 NOP。全部结果的语义断言和后处理都为 PASS；完整用例
+仍为 73,728 次 Claim、1,280 个唯一 winner、1,024 个 kernel，placement 总数为
+1,024。关键单轮结果如下：
+
+| 场景 | CCEC `fanin / Submit us` | AscendC | CPU |
+| ---- | -----------------------: | ------: | --: |
+| smoke | `6 / 34.912` | `5 / 40.142` | `6 / 156383.064` |
+| 256 batch、零 NOP | `42546 / 3415.839` | `25515 / 3498.038` | `1983 / 163840.941` |
+| 256 batch、默认 NOP | `40958 / 4019.835` | `47692 / 4283.306` | `1051412 / 185456.323` |
+
+CPU 只用于语义对照，不作为 A5 性能依据。单轮 fanin load 对 worker 调度非常
+敏感，不能用上表三个数值直接归因，因此又执行了独立进程的交错 A/B。
+
+#### 7.2.3 CCEC 十对交错 A/B
+
+基线固定在 H1 提交 `2c3dd1e2`，使用 detached worktree
+`/tmp/simpler-f1-baseline`。两端都用 256 batch、默认 NOP、关闭泳道和 phase profile；
+每个样本是独立进程首轮，统一 60 s timeout。前 5 对为 baseline -> F1，
+后 5 对为 F1 -> baseline。双方均 10/10 PASS、0 timeout、Claim=73,728、CAS retry=0。
+
+| 指标 | baseline | F1 | 相对变化 |
+| ---- | -------: | -: | -------: |
+| Submit 中位数（us） | 4290.401 | 4623.944 | **+7.774%** |
+| Submit 均值（us） | 4498.804 | 4684.302 | **+4.123%** |
+| Submit nearest-rank p90（us） | 5303.373 | 5219.956 | -1.573% |
+| Submit 样本标准差（us） | 944.376 | 475.794 | - |
+| fanin load 中位数 | 67914 | 65433.5 | -3.652% |
+| fanin load 均值 | 82844.5 | 72219.2 | -12.826% |
+| fanin load nearest-rank p90 | 118955 | 94088 | -20.905% |
+
+F1 的 Submit 为 4 胜 6 负；配对相对变化中位数为 `+6.439%`，均值为
+`+8.410%`。交换顺序后，后 5 对的配对变化中位数仍为 `+3.423%`，没有把
+中心趋势变成收益。fanin load 的配对变化中位数为 `-13.582%`，但均值为
+`+0.665%`，单对范围从 `-58.082%` 到 `+89.165%`，说明其仍强烈受动态调度影响。
+
+F1 的 p90 略好主要由 baseline 的 5.303 ms 和 6.640 ms 慢样本抬高；在中位数、
+均值和配对中心全部回退时，不能单独用这个 p90 宣称收益。原始日志保留在：
+
+```text
+/tmp/f1_standalone_ab_20260718_010300/
+```
+
+#### 7.2.4 阶段决定
+
+F1 在固定状态下的 atomic load 不增证明成立，三后端语义也全部通过；但
+standalone 的 Submit 中位数、均值和配对中心都没有改善。因此不将这个启发式
+重排迁移到真实 `dist_submit_collect_fanin()`，也不进行真实 PA A/B。standalone
+候选代码已撤回，本节保留负结果，防止后续重复同一实验。
