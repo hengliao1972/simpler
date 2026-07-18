@@ -131,6 +131,10 @@ struct CpuOps {
 
     static inline void Nop(uint32_t count) { RuntimeNop(count); }
 
+    static inline bool PmuWindowStart(pa_scheduler::SchedulerState *, uint32_t) { return false; }
+
+    static inline void PmuWindowStop(pa_scheduler::SchedulerState *, uint32_t, bool) {}
+
     static inline void SpinHint() {}
 
     static inline void InvalidateRegion(const void *, uint64_t) {

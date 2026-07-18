@@ -116,6 +116,14 @@ struct CcecOps {
 
     __aicore__ static inline void Nop(uint32_t count) { RuntimeNop(count); }
 
+    __aicore__ static inline bool PmuWindowStart(
+        __gm__ pa_scheduler::SchedulerState *state, uint32_t worker_id
+    );
+
+    __aicore__ static inline void PmuWindowStop(
+        __gm__ pa_scheduler::SchedulerState *state, uint32_t worker_id, bool started
+    );
+
     // SPIN_WAIT_HINT is also a no-op in the real A5 inner-kernel contract.
     // 同理不额外插入 nop，让等待循环保留真实 PA 内核“不主动退避”的指令成本。
     __aicore__ static inline void SpinHint() {}
@@ -155,9 +163,15 @@ struct CcecOps {
 
 struct PmuSnapshot {
     uint64_t total_cycles = 0;
+    uint32_t vector_busy = 0;
+    uint32_t cube_busy = 0;
     uint32_t scalar_busy = 0;
+    uint32_t mte1_busy = 0;
+    uint32_t mte2_busy = 0;
+    uint32_t mte3_busy = 0;
     uint32_t icache_requests = 0;
     uint32_t icache_misses = 0;
+    uint32_t fix_busy = 0;
     uint32_t status = 0;
 };
 
@@ -170,12 +184,24 @@ __aicore__ inline uint32_t ReadPmuRegister(uint64_t reg_base) {
 
 __aicore__ inline PmuSnapshot ReadObservedCounters(uint64_t reg_base) {
     PmuSnapshot sample;
+    sample.vector_busy = ReadPmuRegister<pa_scheduler::ccec_pmu::kCounterBlockOffset,
+                                         pa_scheduler::ccec_pmu::kCnt0Offset>(reg_base);
+    sample.cube_busy = ReadPmuRegister<pa_scheduler::ccec_pmu::kCounterBlockOffset,
+                                       pa_scheduler::ccec_pmu::kCnt1Offset>(reg_base);
     sample.scalar_busy = ReadPmuRegister<pa_scheduler::ccec_pmu::kCounterBlockOffset,
                                          pa_scheduler::ccec_pmu::kCnt2Offset>(reg_base);
+    sample.mte1_busy = ReadPmuRegister<pa_scheduler::ccec_pmu::kCounterBlockOffset,
+                                       pa_scheduler::ccec_pmu::kCnt3Offset>(reg_base);
+    sample.mte2_busy = ReadPmuRegister<pa_scheduler::ccec_pmu::kCounterBlockOffset,
+                                       pa_scheduler::ccec_pmu::kCnt4Offset>(reg_base);
+    sample.mte3_busy = ReadPmuRegister<pa_scheduler::ccec_pmu::kCounterBlockOffset,
+                                       pa_scheduler::ccec_pmu::kCnt5Offset>(reg_base);
     sample.icache_requests = ReadPmuRegister<pa_scheduler::ccec_pmu::kCounterBlockOffset,
                                              pa_scheduler::ccec_pmu::kCnt6Offset>(reg_base);
     sample.icache_misses = ReadPmuRegister<pa_scheduler::ccec_pmu::kCounterBlockOffset,
                                            pa_scheduler::ccec_pmu::kCnt7Offset>(reg_base);
+    sample.fix_busy = ReadPmuRegister<pa_scheduler::ccec_pmu::kCounterBlockOffset,
+                                      pa_scheduler::ccec_pmu::kCnt8Offset>(reg_base);
     const uint64_t low = ReadPmuRegister<pa_scheduler::ccec_pmu::kCounterBlockOffset,
                                          pa_scheduler::ccec_pmu::kTotalLowOffset>(reg_base);
     const uint64_t high = ReadPmuRegister<pa_scheduler::ccec_pmu::kCounterBlockOffset,
@@ -184,72 +210,138 @@ __aicore__ inline PmuSnapshot ReadObservedCounters(uint64_t reg_base) {
     return sample;
 }
 
-__aicore__ inline void RunPmuProbe(__gm__ pa_scheduler::SchedulerState *state, uint32_t worker_id) {
+struct PmuRegisterContext {
+    uint64_t reg_base = 0;
+    uint32_t status = 0;
+};
+
+__aicore__ inline PmuRegisterContext ResolvePmuRegisters(__gm__ pa_scheduler::SchedulerState *state) {
     using namespace pa_scheduler::ccec_pmu;
-    __gm__ pa_scheduler::WorkerResult &result = state->results[worker_id];
-    PmuSnapshot sample;
-
-    const WindowMode mode = static_cast<WindowMode>(state->config.reserved[kConfigMode]);
-    if (mode != WindowMode::Off) {
-        sample.status |= kStatusRequested;
-        const uint32_t physical_core_id = static_cast<uint32_t>(get_coreid()) & kStatusCoreIdMask;
-        sample.status |= physical_core_id << kStatusCoreIdShift;
-        const uint64_t table_address =
-            static_cast<uint64_t>(state->config.reserved[kConfigRegTableLow]) |
-            (static_cast<uint64_t>(state->config.reserved[kConfigRegTableHigh]) << 32);
-        if (state->config.reserved[kConfigMagic] == kConfigMagicValue && table_address != 0 &&
-            physical_core_id < kPhysicalSubcoreCount) {
-            sample.status |= kStatusCoreIdValid;
-            __gm__ const uint64_t *register_bases = reinterpret_cast<__gm__ const uint64_t *>(table_address);
-            const uint64_t reg_base = register_bases[physical_core_id];
-            if (reg_base != 0) {
-                sample.status |= kStatusRegMapped;
-                const uint32_t selector2 =
-                    ReadPmuRegister<kSelectorBlockOffset, kCnt2SelectorOffset>(reg_base);
-                const uint32_t selector6 =
-                    ReadPmuRegister<kSelectorBlockOffset, kCnt6SelectorOffset>(reg_base);
-                const uint32_t selector7 =
-                    ReadPmuRegister<kSelectorBlockOffset, kCnt7SelectorOffset>(reg_base);
-                if (selector2 == kScalarBusyEvent) sample.status |= kStatusCnt2Selector;
-                if (selector6 == kIcacheRequestEvent) sample.status |= kStatusCnt6Selector;
-                if (selector7 == kIcacheMissEvent) sample.status |= kStatusCnt7Selector;
-
-                // 外部 profiler 启动 task 时可能已经累计了 scheduler；先冻结并读取一次窗口前快照。
-                // A5 的 snapshot 会消费/清除当前累计；stop/start 只负责门控，中间不读取才能续积多段窗口。
-                bisheng::cce::metrics_prof_stop();
-                const PmuSnapshot prior = ReadObservedCounters(reg_base);
-                bisheng::cce::metrics_prof_start();
-                if (mode == WindowMode::Scalar || mode == WindowMode::ScalarDouble) {
-                    RuntimeNop(state->config.reserved[kConfigScalarNops]);
-                }
-                if (mode == WindowMode::ScalarDouble) {
-                    // 两段相同工作量之间只切 gate、不读取 counter，用于确认 resume 是累计还是重置。
-                    bisheng::cce::metrics_prof_stop();
-                    bisheng::cce::metrics_prof_start();
-                    RuntimeNop(state->config.reserved[kConfigScalarNops]);
-                }
-                bisheng::cce::metrics_prof_stop();
-                sample = ReadObservedCounters(reg_base);
-                sample.status |= kStatusRequested | kStatusRegMapped | kStatusCoreIdValid |
-                                 (physical_core_id << kStatusCoreIdShift);
-                if (selector2 == kScalarBusyEvent) sample.status |= kStatusCnt2Selector;
-                if (selector6 == kIcacheRequestEvent) sample.status |= kStatusCnt6Selector;
-                if (selector7 == kIcacheMissEvent) sample.status |= kStatusCnt7Selector;
-                if (sample.total_cycles != 0) sample.status |= kStatusTotalNonzero;
-
-                // 窗口前 read-clear 之后只做这一次最终 snapshot；重复读取会看到读取路径自身的残余。
-                // prior 更大只作为“已从此前 scheduler 累计中隔离”的辅助证据，不作为长负载通用门禁。
-                if (sample.total_cycles < prior.total_cycles) sample.status |= kStatusPriorSnapshotLarger;
-            }
-        }
+    PmuRegisterContext context;
+    const uint32_t physical_core_id = static_cast<uint32_t>(get_coreid()) & kStatusCoreIdMask;
+    context.status = kStatusRequested | (physical_core_id << kStatusCoreIdShift);
+    const uint64_t table_address =
+        static_cast<uint64_t>(state->config.reserved[kConfigRegTableLow]) |
+        (static_cast<uint64_t>(state->config.reserved[kConfigRegTableHigh]) << 32);
+    if (state->config.reserved[kConfigMagic] != kConfigMagicValue || table_address == 0 ||
+        physical_core_id >= kPhysicalSubcoreCount) {
+        return context;
     }
+    context.status |= kStatusCoreIdValid;
+    __gm__ const uint64_t *register_bases = reinterpret_cast<__gm__ const uint64_t *>(table_address);
+    context.reg_base = register_bases[physical_core_id];
+    if (context.reg_base == 0) return context;
+    context.status |= kStatusRegMapped;
 
-    // 结果位于每核独占 sidecar，五次 bypass store 不参与 Submit 时间口径。
+    // selector 与 standalone owner 的 A5 PIPE_UTILIZATION 事件表逐项核对，避免
+    // 配置或 ABI 错位时仍把 CNT0..8 的数值按 vector/scalar/I-cache 名称导出。
+    if (ReadPmuRegister<kSelectorBlockOffset, kCnt0SelectorOffset>(context.reg_base) == kVectorBusyEvent)
+        context.status |= kStatusCnt0Selector;
+    if (ReadPmuRegister<kSelectorBlockOffset, kCnt1SelectorOffset>(context.reg_base) == kCubeBusyEvent)
+        context.status |= kStatusCnt1Selector;
+    if (ReadPmuRegister<kSelectorBlockOffset, kCnt2SelectorOffset>(context.reg_base) == kScalarBusyEvent)
+        context.status |= kStatusCnt2Selector;
+    if (ReadPmuRegister<kSelectorBlockOffset, kCnt3SelectorOffset>(context.reg_base) == kMte1BusyEvent)
+        context.status |= kStatusCnt3Selector;
+    if (ReadPmuRegister<kSelectorBlockOffset, kCnt4SelectorOffset>(context.reg_base) == kMte2BusyEvent)
+        context.status |= kStatusCnt4Selector;
+    if (ReadPmuRegister<kSelectorBlockOffset, kCnt5SelectorOffset>(context.reg_base) == kMte3BusyEvent)
+        context.status |= kStatusCnt5Selector;
+    if (ReadPmuRegister<kSelectorBlockOffset, kCnt6SelectorOffset>(context.reg_base) == kIcacheRequestEvent)
+        context.status |= kStatusCnt6Selector;
+    if (ReadPmuRegister<kSelectorBlockOffset, kCnt7SelectorOffset>(context.reg_base) == kIcacheMissEvent)
+        context.status |= kStatusCnt7Selector;
+    if (ReadPmuRegister<kSelectorBlockOffset, kCnt8SelectorOffset>(context.reg_base) == kFixBusyEvent)
+        context.status |= kStatusCnt8Selector;
+    return context;
+}
+
+__aicore__ inline void PublishPmuSnapshot(
+    __gm__ pa_scheduler::WorkerResult &result, const PmuSnapshot &sample
+) {
+    // 每核独占 sidecar 通过 bypass store 一次性发布；这些写发生在 PMU stop/read 之后，
+    // 不进入被导出的 Submit 窗口。
     CcecOps::Publish(&result.pmu_total_cycles, sample.total_cycles);
     CcecOps::Publish(&result.pmu_scalar_busy, sample.scalar_busy);
     CcecOps::Publish(&result.pmu_icache_requests, sample.icache_requests);
     CcecOps::Publish(&result.pmu_icache_misses, sample.icache_misses);
     CcecOps::Publish(&result.pmu_status, sample.status);
+    CcecOps::Publish(&result.pmu_vector_busy, sample.vector_busy);
+    CcecOps::Publish(&result.pmu_cube_busy, sample.cube_busy);
+    CcecOps::Publish(&result.pmu_mte1_busy, sample.mte1_busy);
+    CcecOps::Publish(&result.pmu_mte2_busy, sample.mte2_busy);
+    CcecOps::Publish(&result.pmu_mte3_busy, sample.mte3_busy);
+    CcecOps::Publish(&result.pmu_fix_busy, sample.fix_busy);
+}
+
+__aicore__ inline bool CcecOps::PmuWindowStart(
+    __gm__ pa_scheduler::SchedulerState *state, uint32_t worker_id
+) {
+    using namespace pa_scheduler::ccec_pmu;
+    (void)worker_id;
+    const WindowMode mode = static_cast<WindowMode>(state->config.reserved[kConfigMode]);
+    if (mode != WindowMode::SubmitAll) return false;
+    const PmuRegisterContext context = ResolvePmuRegisters(state);
+    if (context.reg_base == 0) return false;
+    // Main AICPU owner 已在 launch 前配置并开启计数；先 stop + snapshot/read-clear，
+    // 再从本 worker 的首个 orchestration 动作开始独立累计。
+    bisheng::cce::metrics_prof_stop();
+    (void)ReadObservedCounters(context.reg_base);
+    bisheng::cce::metrics_prof_start();
+    return true;
+}
+
+__aicore__ inline void CcecOps::PmuWindowStop(
+    __gm__ pa_scheduler::SchedulerState *state, uint32_t worker_id, bool started
+) {
+    using namespace pa_scheduler::ccec_pmu;
+    if (!started) return;
+    // 先冻结 gate，再读取 selector 和 counter。若先 ResolvePmuRegisters，九次
+    // selector ld_dev 会被误计入本 worker 的 Submit 窗口。
+    bisheng::cce::metrics_prof_stop();
+    const PmuRegisterContext context = ResolvePmuRegisters(state);
+    PmuSnapshot sample;
+    sample.status = context.status;
+    if (context.reg_base != 0) {
+        sample = ReadObservedCounters(context.reg_base);
+        sample.status = context.status | kStatusWindowStarted | kStatusWindowStopped;
+        if (sample.total_cycles != 0) sample.status |= kStatusTotalNonzero;
+    }
+    PublishPmuSnapshot(state->results[worker_id], sample);
+}
+
+__aicore__ inline void RunPmuProbe(__gm__ pa_scheduler::SchedulerState *state, uint32_t worker_id) {
+    using namespace pa_scheduler::ccec_pmu;
+    __gm__ pa_scheduler::WorkerResult &result = state->results[worker_id];
+    const WindowMode mode = static_cast<WindowMode>(state->config.reserved[kConfigMode]);
+    // SubmitAll 已在公共调度器 hook 内完成 start/stop/read/publish；此处只保留
+    // empty/scalar/scalar-double 校准，保证校准链路与正式窗口可独立复验。
+    if (mode == WindowMode::SubmitAll) return;
+
+    PmuSnapshot sample;
+    if (mode != WindowMode::Off) {
+        const PmuRegisterContext context = ResolvePmuRegisters(state);
+        sample.status = context.status;
+        if (context.reg_base != 0) {
+            bisheng::cce::metrics_prof_stop();
+            const PmuSnapshot prior = ReadObservedCounters(context.reg_base);
+            bisheng::cce::metrics_prof_start();
+            if (mode == WindowMode::Scalar || mode == WindowMode::ScalarDouble) {
+                RuntimeNop(state->config.reserved[kConfigScalarNops]);
+            }
+            if (mode == WindowMode::ScalarDouble) {
+                bisheng::cce::metrics_prof_stop();
+                bisheng::cce::metrics_prof_start();
+                RuntimeNop(state->config.reserved[kConfigScalarNops]);
+            }
+            bisheng::cce::metrics_prof_stop();
+            sample = ReadObservedCounters(context.reg_base);
+            sample.status = context.status | kStatusWindowStarted | kStatusWindowStopped;
+            if (sample.total_cycles != 0) sample.status |= kStatusTotalNonzero;
+            if (sample.total_cycles < prior.total_cycles) sample.status |= kStatusPriorSnapshotLarger;
+        }
+    }
+    PublishPmuSnapshot(result, sample);
 }
 
 }  // namespace

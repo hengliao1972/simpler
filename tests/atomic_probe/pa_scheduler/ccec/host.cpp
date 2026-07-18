@@ -17,7 +17,12 @@
 #include "driver/ascend_hal.h"
 #include "runtime/rt.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <chrono>
+#include <cerrno>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <dlfcn.h>
@@ -55,6 +60,7 @@ std::vector<char> ReadBinary(const std::string &path) {
 struct PmuOptions {
     pa_scheduler::ccec_pmu::WindowMode mode = pa_scheduler::ccec_pmu::WindowMode::Off;
     uint32_t scalar_nops = 100000;
+    std::string json_path;
 };
 
 const char *PmuModeName(pa_scheduler::ccec_pmu::WindowMode mode) {
@@ -67,6 +73,8 @@ const char *PmuModeName(pa_scheduler::ccec_pmu::WindowMode mode) {
         return "scalar";
     case pa_scheduler::ccec_pmu::WindowMode::ScalarDouble:
         return "scalar-double";
+    case pa_scheduler::ccec_pmu::WindowMode::SubmitAll:
+        return "submit-all";
     }
     return "invalid";
 }
@@ -75,11 +83,12 @@ bool ParsePmuOptions(int argc, char **argv, PmuOptions *pmu, std::vector<char *>
     // PMU 参数只属于 CCEC 验证分支；先摘出再交给三后端共享 parser，避免 CPU/AscendC 静默接受却不生效。
     bool mode_seen = false;
     bool nops_seen = false;
+    bool json_seen = false;
     common_argv->clear();
     common_argv->push_back(argv[0]);
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
-        if (argument != "--pmu-window" && argument != "--pmu-scalar-nops") {
+        if (argument != "--pmu-window" && argument != "--pmu-scalar-nops" && argument != "--pmu-json") {
             common_argv->push_back(argv[index]);
             continue;
         }
@@ -102,19 +111,31 @@ bool ParsePmuOptions(int argc, char **argv, PmuOptions *pmu, std::vector<char *>
                 pmu->mode = pa_scheduler::ccec_pmu::WindowMode::Scalar;
             } else if (name == "scalar-double") {
                 pmu->mode = pa_scheduler::ccec_pmu::WindowMode::ScalarDouble;
+            } else if (name == "submit-all") {
+                pmu->mode = pa_scheduler::ccec_pmu::WindowMode::SubmitAll;
             } else {
                 std::fprintf(
-                    stderr, "Invalid --pmu-window value: %s (expected off|empty|scalar|scalar-double)\n", value
+                    stderr,
+                    "Invalid --pmu-window value: %s "
+                    "(expected off|empty|scalar|scalar-double|submit-all)\n",
+                    value
                 );
                 return false;
             }
             mode_seen = true;
-        } else {
+        } else if (argument == "--pmu-scalar-nops") {
             if (nops_seen || !pa_scheduler::host::ParseUint(value, 0, 10000000, &pmu->scalar_nops)) {
                 std::fprintf(stderr, "Invalid or duplicate --pmu-scalar-nops value: %s\n", value);
                 return false;
             }
             nops_seen = true;
+        } else {
+            if (json_seen || *value == '\0') {
+                std::fprintf(stderr, "Invalid or duplicate --pmu-json path: %s\n", value);
+                return false;
+            }
+            pmu->json_path = value;
+            json_seen = true;
         }
     }
     if (nops_seen && pmu->mode != pa_scheduler::ccec_pmu::WindowMode::Scalar &&
@@ -203,40 +224,95 @@ void ConfigurePmu(pa_scheduler::SchedulerState *state, const PmuOptions &pmu, co
 
 struct PmuAggregate {
     std::vector<uint64_t> total_cycles;
-    uint64_t scalar_busy = 0;
-    uint64_t icache_requests = 0;
-    uint64_t icache_misses = 0;
+    std::vector<uint64_t> vector_busy;
+    std::vector<uint64_t> cube_busy;
+    std::vector<uint64_t> scalar_busy;
+    std::vector<uint64_t> mte1_busy;
+    std::vector<uint64_t> mte2_busy;
+    std::vector<uint64_t> mte3_busy;
+    std::vector<uint64_t> icache_requests;
+    std::vector<uint64_t> icache_misses;
+    std::vector<uint64_t> fix_busy;
+    uint32_t trusted = 0;
 };
 
 void AddPmuSample(const pa_scheduler::WorkerResult &result, PmuAggregate *aggregate) {
     aggregate->total_cycles.push_back(result.pmu_total_cycles);
-    aggregate->scalar_busy += result.pmu_scalar_busy;
-    aggregate->icache_requests += result.pmu_icache_requests;
-    aggregate->icache_misses += result.pmu_icache_misses;
+    aggregate->vector_busy.push_back(result.pmu_vector_busy);
+    aggregate->cube_busy.push_back(result.pmu_cube_busy);
+    aggregate->scalar_busy.push_back(result.pmu_scalar_busy);
+    aggregate->mte1_busy.push_back(result.pmu_mte1_busy);
+    aggregate->mte2_busy.push_back(result.pmu_mte2_busy);
+    aggregate->mte3_busy.push_back(result.pmu_mte3_busy);
+    aggregate->icache_requests.push_back(result.pmu_icache_requests);
+    aggregate->icache_misses.push_back(result.pmu_icache_misses);
+    aggregate->fix_busy.push_back(result.pmu_fix_busy);
+    aggregate->trusted +=
+        (result.pmu_status & pa_scheduler::ccec_pmu::kStatusRequired) == pa_scheduler::ccec_pmu::kStatusRequired;
 }
 
 void PrintPmuAggregate(const char *name, const PmuAggregate &aggregate) {
     const pa_scheduler::host::Uint64Distribution total =
         pa_scheduler::host::SummarizeUint64(aggregate.total_cycles);
-    const double miss_rate = aggregate.icache_requests == 0
-        ? 0.0
-        : 100.0 * aggregate.icache_misses / aggregate.icache_requests;
+    const pa_scheduler::host::Uint64Distribution scalar =
+        pa_scheduler::host::SummarizeUint64(aggregate.scalar_busy);
+    const pa_scheduler::host::Uint64Distribution vector =
+        pa_scheduler::host::SummarizeUint64(aggregate.vector_busy);
+    const pa_scheduler::host::Uint64Distribution cube =
+        pa_scheduler::host::SummarizeUint64(aggregate.cube_busy);
+    const pa_scheduler::host::Uint64Distribution mte1 =
+        pa_scheduler::host::SummarizeUint64(aggregate.mte1_busy);
+    const pa_scheduler::host::Uint64Distribution mte2 =
+        pa_scheduler::host::SummarizeUint64(aggregate.mte2_busy);
+    const pa_scheduler::host::Uint64Distribution mte3 =
+        pa_scheduler::host::SummarizeUint64(aggregate.mte3_busy);
+    const pa_scheduler::host::Uint64Distribution requests =
+        pa_scheduler::host::SummarizeUint64(aggregate.icache_requests);
+    const pa_scheduler::host::Uint64Distribution misses =
+        pa_scheduler::host::SummarizeUint64(aggregate.icache_misses);
+    const double miss_rate = requests.total == 0 ? 0.0 : 100.0 * misses.total / requests.total;
     std::printf(
-        "[PMU-%s] cores=%zu total_sum=%llu total_median=%.1f total_p95=%llu scalar_busy=%llu "
-        "icache_req=%llu icache_miss=%llu miss_rate=%.4f%%\n",
+        "[PMU-%s] cores=%zu total_sum=%llu total_median=%.1f total_p95=%llu "
+        "scalar_busy=%llu vector_busy=%llu cube_busy=%llu mte1_busy=%llu mte2_busy=%llu "
+        "mte3_busy=%llu icache_req=%llu icache_miss=%llu miss_rate=%.4f%%\n",
         name, aggregate.total_cycles.size(), static_cast<unsigned long long>(total.total), total.median,
-        static_cast<unsigned long long>(total.p95), static_cast<unsigned long long>(aggregate.scalar_busy),
-        static_cast<unsigned long long>(aggregate.icache_requests),
-        static_cast<unsigned long long>(aggregate.icache_misses), miss_rate
+        static_cast<unsigned long long>(total.p95), static_cast<unsigned long long>(scalar.total),
+        static_cast<unsigned long long>(vector.total), static_cast<unsigned long long>(cube.total),
+        static_cast<unsigned long long>(mte1.total), static_cast<unsigned long long>(mte2.total),
+        static_cast<unsigned long long>(mte3.total),
+        static_cast<unsigned long long>(requests.total), static_cast<unsigned long long>(misses.total), miss_rate
     );
 }
 
+struct PmuValidation {
+    uint32_t trusted = 0;
+    uint32_t unique_physical_core_ids = 0;
+    uint32_t owner_bitmap_members = 0;
+    uint32_t exact_worker_slots = 0;
+    uint32_t physical_role_matches = 0;
+    uint32_t mixed_triplet_matches = 0;
+    uint32_t window_started = 0;
+    uint32_t window_stopped = 0;
+    uint32_t prior_snapshot_larger = 0;
+    uint32_t maximum_programmable_counter = 0;
+    bool icache_order_valid = true;
+    bool counter_below_risk_threshold = true;
+    bool passed = true;
+};
+
+// 32-bit programmable counter 无法仅凭终值证明从未回卷。正式文件采用 25%
+// 高水位作为保守拒绝阈值；它只降低风险，不把“未越线”表述成回卷证明。
+constexpr uint32_t kProgrammableCounterRiskThreshold = UINT32_MAX / 4U;
+
 bool ValidatePmu(
     const pa_scheduler::SchedulerState &state, uint32_t run, const PmuOptions &pmu,
-    const pa_scheduler::pmu_owner::PmuOwnerControl *owner
+    const pa_scheduler::pmu_owner::PmuOwnerControl *owner, PmuValidation *validation
 ) {
     using namespace pa_scheduler::ccec_pmu;
-    if (pmu.mode == WindowMode::Off) return true;
+    if (pmu.mode == WindowMode::Off) {
+        *validation = PmuValidation{};
+        return true;
+    }
 
     bool seen[kPhysicalSubcoreCount] = {};
     uint32_t trusted = 0;
@@ -244,7 +320,11 @@ bool ValidatePmu(
     uint32_t owner_members = 0;
     uint32_t exact_worker_slots = 0;
     uint32_t physical_role_matches = 0;
+    uint32_t window_started = 0;
+    uint32_t window_stopped = 0;
     uint32_t prior_larger = 0;
+    uint32_t maximum_programmable_counter = 0;
+    bool icache_order_valid = true;
     uint32_t bad_printed = 0;
     PmuAggregate all;
     PmuAggregate aic;
@@ -260,7 +340,18 @@ bool ValidatePmu(
         owner_members += owner != nullptr && pa_scheduler::pmu_owner::IsConfigured(*owner, core_id);
         exact_worker_slots += result.worker_id == worker;
         physical_role_matches += logical_aic == physical_aic;
+        window_started += (status & kStatusWindowStarted) != 0U;
+        window_stopped += (status & kStatusWindowStopped) != 0U;
         prior_larger += (status & kStatusPriorSnapshotLarger) != 0;
+        icache_order_valid &= result.pmu_icache_misses <= result.pmu_icache_requests;
+        const uint32_t programmable[] = {
+            result.pmu_vector_busy, result.pmu_cube_busy, result.pmu_scalar_busy,
+            result.pmu_mte1_busy, result.pmu_mte2_busy, result.pmu_mte3_busy,
+            result.pmu_icache_requests, result.pmu_icache_misses, result.pmu_fix_busy,
+        };
+        for (uint32_t value : programmable) {
+            maximum_programmable_counter = std::max(maximum_programmable_counter, value);
+        }
         if (core_id < kPhysicalSubcoreCount && !seen[core_id]) {
             seen[core_id] = true;
             ++unique;
@@ -286,13 +377,14 @@ bool ValidatePmu(
             pa_scheduler::pmu_owner::kSubcoresPerDie;
         const uint32_t local = aic_id % pa_scheduler::pmu_owner::kSubcoresPerDie;
         const uint32_t expected_aiv0 = die_base + pa_scheduler::pmu_owner::kAicPerDie + local * 2U;
+        const uint32_t expected_aiv1 = expected_aiv0 + 1U;
         const uint32_t aiv0_id = StatusCoreId(
             state.results[pa_scheduler::kAicWorkers + block * 2U].pmu_status
         );
         const uint32_t aiv1_id = StatusCoreId(
             state.results[pa_scheduler::kAicWorkers + block * 2U + 1U].pmu_status
         );
-        mixed_triplet_matches += aiv0_id == expected_aiv0 && aiv1_id == expected_aiv0 + 1U;
+        mixed_triplet_matches += aiv0_id == expected_aiv0 && aiv1_id == expected_aiv1;
     }
 
     PrintPmuAggregate("ALL", all);
@@ -304,10 +396,16 @@ bool ValidatePmu(
     const bool worker_slots_ok = exact_worker_slots == pa_scheduler::kWorkers;
     const bool physical_roles_ok = physical_role_matches == pa_scheduler::kWorkers;
     const bool mixed_triplets_ok = mixed_triplet_matches == pa_scheduler::kAicWorkers;
+    const bool windows_started_ok = window_started == pa_scheduler::kWorkers;
+    const bool windows_stopped_ok = window_stopped == pa_scheduler::kWorkers;
+    const bool counter_below_risk_threshold =
+        maximum_programmable_counter < kProgrammableCounterRiskThreshold;
     std::printf(
-        "[PMU] run=%u window=%s scalar_nops=%u trusted=%u/%u unique_coreids=%u/%u prior_larger=%u/%u\n", run,
+        "[PMU] run=%u window=%s calibration_scalar_nops=%u trusted=%u/%u unique_coreids=%u/%u "
+        "prior_larger=%u/%u programmable_max=%u headroom=%u\n", run,
         PmuModeName(pmu.mode), pmu.scalar_nops, trusted, pa_scheduler::kWorkers, unique, pa_scheduler::kWorkers,
-        prior_larger, pa_scheduler::kWorkers
+        prior_larger, pa_scheduler::kWorkers, maximum_programmable_counter,
+        UINT32_MAX - maximum_programmable_counter
     );
     std::printf("[ASSERT] %-48s %s\n", "all PMU records have configured selectors and data",
                 records_ok ? "PASS" : "FAIL");
@@ -321,8 +419,397 @@ bool ValidatePmu(
                 physical_roles_ok ? "PASS" : "FAIL");
     std::printf("[ASSERT] %-48s %s\n", "all 32 mixed blocks map to physical 1:2 triplets",
                 mixed_triplets_ok ? "PASS" : "FAIL");
-    return records_ok && core_ids_ok && owner_members_ok && worker_slots_ok &&
-        physical_roles_ok && mixed_triplets_ok;
+    std::printf("[ASSERT] %-48s %s\n", "all 96 PMU windows executed start",
+                windows_started_ok ? "PASS" : "FAIL");
+    std::printf("[ASSERT] %-48s %s\n", "all 96 started PMU windows executed stop",
+                windows_stopped_ok ? "PASS" : "FAIL");
+    std::printf("[ASSERT] %-48s %s\n", "I-cache misses do not exceed requests",
+                icache_order_valid ? "PASS" : "FAIL");
+    std::printf("[ASSERT] %-48s %s\n", "programmable counters stay below 25% risk threshold",
+                counter_below_risk_threshold ? "PASS" : "FAIL");
+    validation->trusted = trusted;
+    validation->unique_physical_core_ids = unique;
+    validation->owner_bitmap_members = owner_members;
+    validation->exact_worker_slots = exact_worker_slots;
+    validation->physical_role_matches = physical_role_matches;
+    validation->mixed_triplet_matches = mixed_triplet_matches;
+    validation->window_started = window_started;
+    validation->window_stopped = window_stopped;
+    validation->prior_snapshot_larger = prior_larger;
+    validation->maximum_programmable_counter = maximum_programmable_counter;
+    validation->icache_order_valid = icache_order_valid;
+    validation->counter_below_risk_threshold = counter_below_risk_threshold;
+    validation->passed = records_ok && core_ids_ok && owner_members_ok && worker_slots_ok &&
+        physical_roles_ok && mixed_triplets_ok && windows_started_ok && windows_stopped_ok &&
+        icache_order_valid && counter_below_risk_threshold;
+    return validation->passed;
+}
+
+void WriteJsonString(std::FILE *output, const std::string &value) {
+    std::fputc('"', output);
+    for (unsigned char character : value) {
+        switch (character) {
+        case '"':
+            std::fputs("\\\"", output);
+            break;
+        case '\\':
+            std::fputs("\\\\", output);
+            break;
+        case '\b':
+            std::fputs("\\b", output);
+            break;
+        case '\f':
+            std::fputs("\\f", output);
+            break;
+        case '\n':
+            std::fputs("\\n", output);
+            break;
+        case '\r':
+            std::fputs("\\r", output);
+            break;
+        case '\t':
+            std::fputs("\\t", output);
+            break;
+        default:
+            if (character < 0x20U) {
+                std::fprintf(output, "\\u%04x", static_cast<unsigned int>(character));
+            } else {
+                std::fputc(character, output);
+            }
+        }
+    }
+    std::fputc('"', output);
+}
+
+void WriteMetricDistribution(std::FILE *output, const std::vector<uint64_t> &values) {
+    const pa_scheduler::host::Uint64Distribution summary = pa_scheduler::host::SummarizeUint64(values);
+    const double mean = values.empty() ? 0.0 : static_cast<double>(summary.total) / values.size();
+    std::fprintf(
+        output, "{\"sum\":%llu,\"mean\":%.17g,\"median\":%.17g,\"p95\":%llu,\"max\":%llu}",
+        static_cast<unsigned long long>(summary.total), mean, summary.median,
+        static_cast<unsigned long long>(summary.p95), static_cast<unsigned long long>(summary.maximum)
+    );
+}
+
+void WritePmuAggregateJson(std::FILE *output, const PmuAggregate &aggregate) {
+    const pa_scheduler::host::Uint64Distribution requests =
+        pa_scheduler::host::SummarizeUint64(aggregate.icache_requests);
+    const pa_scheduler::host::Uint64Distribution misses =
+        pa_scheduler::host::SummarizeUint64(aggregate.icache_misses);
+    uint32_t active_cores = 0;
+    for (uint64_t cycles : aggregate.total_cycles) active_cores += cycles != 0;
+    std::fprintf(
+        output, "{\"cores\":%zu,\"active_cores\":%u,\"trusted_cores\":%u,\"total_cycles\":",
+        aggregate.total_cycles.size(), active_cores, aggregate.trusted
+    );
+    WriteMetricDistribution(output, aggregate.total_cycles);
+    std::fputs(",\"vector_busy\":", output);
+    WriteMetricDistribution(output, aggregate.vector_busy);
+    std::fputs(",\"cube_busy\":", output);
+    WriteMetricDistribution(output, aggregate.cube_busy);
+    std::fputs(",\"scalar_busy\":", output);
+    WriteMetricDistribution(output, aggregate.scalar_busy);
+    std::fputs(",\"mte1_busy\":", output);
+    WriteMetricDistribution(output, aggregate.mte1_busy);
+    std::fputs(",\"mte2_busy\":", output);
+    WriteMetricDistribution(output, aggregate.mte2_busy);
+    std::fputs(",\"mte3_busy\":", output);
+    WriteMetricDistribution(output, aggregate.mte3_busy);
+    std::fputs(",\"icache_requests\":", output);
+    WriteMetricDistribution(output, aggregate.icache_requests);
+    std::fputs(",\"icache_misses\":", output);
+    WriteMetricDistribution(output, aggregate.icache_misses);
+    std::fputs(",\"fix_busy\":", output);
+    WriteMetricDistribution(output, aggregate.fix_busy);
+    std::fputs(",\"icache_miss_rate\":", output);
+    if (requests.total == 0) {
+        std::fputs("null", output);
+    } else {
+        // 全局 miss rate 必须以总 miss/总 request 计算，不能平均逐核百分比。
+        std::fprintf(output, "%.17g", static_cast<double>(misses.total) / requests.total);
+    }
+    std::fputc('}', output);
+}
+
+uint32_t PmuWindowSegments(pa_scheduler::ccec_pmu::WindowMode mode) {
+    if (mode == pa_scheduler::ccec_pmu::WindowMode::ScalarDouble) return 2U;
+    return 1U;
+}
+
+uint32_t CountConfiguredMixedTriplets(const pa_scheduler::pmu_owner::PmuOwnerControl &owner) {
+    uint32_t complete = 0U;
+    for (uint32_t die_base = 0U;
+         die_base < pa_scheduler::pmu_owner::kPhysicalSubcoreCount;
+         die_base += pa_scheduler::pmu_owner::kSubcoresPerDie) {
+        for (uint32_t local = 0U; local < pa_scheduler::pmu_owner::kAicPerDie; ++local) {
+            const uint32_t aic = die_base + local;
+            const uint32_t aiv0 = die_base + pa_scheduler::pmu_owner::kAicPerDie + local * 2U;
+            const uint32_t aiv1 = aiv0 + 1U;
+            complete += pa_scheduler::pmu_owner::IsConfigured(owner, aic) &&
+                pa_scheduler::pmu_owner::IsConfigured(owner, aiv0) &&
+                pa_scheduler::pmu_owner::IsConfigured(owner, aiv1);
+        }
+    }
+    return complete;
+}
+
+bool ExportPmuJson(
+    const pa_scheduler::SchedulerState &state, const pa_scheduler::host::Options &options,
+    const PmuOptions &pmu, uint32_t run, double host_us, double submit_span_us,
+    const PmuValidation &validation, bool semantic_passed,
+    const pa_scheduler::pmu_owner::PmuOwnerControl &owner, bool restore_passed,
+    const std::string &output_path
+) {
+    using namespace pa_scheduler::ccec_pmu;
+    PmuAggregate all;
+    PmuAggregate aic;
+    PmuAggregate aiv;
+    for (uint32_t worker = 0; worker < pa_scheduler::kWorkers; ++worker) {
+        const pa_scheduler::WorkerResult &result = state.results[worker];
+        AddPmuSample(result, &all);
+        AddPmuSample(result, result.role == static_cast<uint32_t>(pa_scheduler::CoreRole::Aic) ? &aic : &aiv);
+    }
+
+    const auto generated = std::chrono::system_clock::now().time_since_epoch();
+    const uint64_t generated_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(generated).count()
+    );
+    const std::string capture_id = "pa-pmu-" + std::to_string(generated_ns) + "-run" + std::to_string(run);
+    const std::string temporary_path = output_path + ".tmp";
+    // 临时文件与最终文件都采用 no-replace 语义：并发采集不能截断同名 tmp，
+    // 也不能在最终发布时覆盖另一份已经完成的证据文件。
+    const int output_fd = open(temporary_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    std::FILE *output = output_fd < 0 ? nullptr : fdopen(output_fd, "wb");
+    if (output == nullptr) {
+        const int open_error = errno;
+        if (output_fd >= 0) {
+            (void)close(output_fd);
+            (void)std::remove(temporary_path.c_str());
+        }
+        std::fprintf(
+            stderr, "Cannot exclusively create PMU JSON output %s: %s\n", temporary_path.c_str(),
+            std::strerror(open_error)
+        );
+        return false;
+    }
+    std::vector<char> output_buffer(1U << 20);
+    std::setvbuf(output, output_buffer.data(), _IOFBF, output_buffer.size());
+
+    const bool submit_window = IsSubmitWindow(pmu.mode);
+    const bool simulated_task_nops_nonzero =
+        options.nops.qk != 0U || options.nops.sf != 0U || options.nops.pv != 0U || options.nops.up != 0U;
+    const uint32_t owner_bitmap_count = pa_scheduler::pmu_owner::CountConfigured(owner);
+    const uint32_t owner_complete_triplets = CountConfiguredMixedTriplets(owner);
+    std::fputs("{\n\"schema\":{\"name\":\"pa_scheduler_pmu_phase_windows\",\"version\":2},\n", output);
+    std::fputs("\"capture\":{\"capture_id\":", output);
+    WriteJsonString(output, capture_id);
+    std::fprintf(
+        output,
+        ",\"generated_unix_time_ns\":%llu,\"run_index\":%u,\"accepted\":true,"
+        "\"usable_for_same_configuration_submit_comparison\":%s,"
+        "\"usable_as_absolute_real_pa_profile\":false,\"window_scope\":\"%s\","
+        "\"pmu_probe_position\":\"%s\",\"scheduler_hot_path_included\":%s,"
+        "\"total_sum_is_core_work_not_wall_time\":true,"
+        "\"published_after_runtime_cleanup\":true,\"runtime_cleanup_passed\":true,"
+        "\"owner_restore_passed\":%s},\n",
+        static_cast<unsigned long long>(generated_ns), run,
+        submit_window ? "true" : "false",
+        submit_window ? "per_worker_orchestration_to_last_submit_return" : "post_scheduler_calibration_probe",
+        submit_window ? "inside_RunScheduler" : "after_RunScheduler",
+        submit_window ? "true" : "false", restore_passed ? "true" : "false"
+    );
+    std::fputs("\"configuration\":{\"kernel_path\":", output);
+    WriteJsonString(output, options.kernel_path);
+    std::fprintf(
+        output,
+        ",\"device\":%u,\"batches\":%u,\"workers\":%u,\"aic_workers\":%u,\"aiv_workers\":%u,"
+        "\"trace_enabled\":%s,\"trace_atomics\":%s,\"profile_phases\":%s,"
+        "\"nop_counts\":{\"qk\":%u,\"sf\":%u,"
+        "\"pv\":%u,\"up\":%u},\"pmu_window\":",
+        options.device, options.batches, pa_scheduler::kWorkers, pa_scheduler::kAicWorkers,
+        pa_scheduler::kAivWorkers, options.trace_enabled ? "true" : "false",
+        options.trace_atomics ? "true" : "false",
+        options.profile_phases ? "true" : "false", options.nops.qk, options.nops.sf, options.nops.pv,
+        options.nops.up
+    );
+    WriteJsonString(output, PmuModeName(pmu.mode));
+    std::fputs(",\"calibration_scalar_nops_per_segment\":", output);
+    if (submit_window) {
+        std::fputs("null", output);
+    } else {
+        std::fprintf(output, "%u", pmu.scalar_nops);
+    }
+    std::fprintf(
+        output,
+        ",\"window_segments_are_mode_contract_per_record\":true,"
+        "\"host_launch_to_sync_us\":%.17g,\"submit_span_us\":%.17g,"
+        "\"selectors\":{\"cnt0_vector_busy\":%u,\"cnt1_cube_busy\":%u,"
+        "\"cnt2_scalar_busy\":%u,\"cnt3_mte1_busy\":%u,\"cnt4_mte2_busy\":%u,"
+        "\"cnt5_mte3_busy\":%u,\"cnt6_icache_request\":%u,\"cnt7_icache_miss\":%u,"
+        "\"cnt8_fix_busy\":%u},\"counter_width_bits\":{\"total\":64,\"programmable\":32},"
+        "\"counter_wrap_not_directly_detectable\":true,\"counter_wrap_absence_proven\":false,"
+        "\"programmable_counter_risk_threshold\":%u,"
+        "\"gate_start_stop_have_pipe_all_barriers\":true,"
+        "\"phase_timestamp_calls_present\":true,\"phase_record_writes\":false,"
+        "\"atomic_trace\":false,\"profile_accumulation\":false,"
+        "\"simulated_task_nop_mechanism_executes_on_scalar\":true,"
+        "\"simulated_task_nops_nonzero\":%s,"
+        "\"icache_miss_rate_definition\":\"sum(icache_misses)/sum(icache_requests)\"},\n",
+        host_us, submit_span_us, kVectorBusyEvent, kCubeBusyEvent, kScalarBusyEvent,
+        kMte1BusyEvent, kMte2BusyEvent, kMte3BusyEvent, kIcacheRequestEvent, kIcacheMissEvent,
+        kFixBusyEvent, kProgrammableCounterRiskThreshold,
+        simulated_task_nops_nonzero ? "true" : "false"
+    );
+    std::fprintf(
+        output,
+        "\"validation\":{\"semantic_passed\":%s,\"pmu_passed\":%s,\"trusted_records\":%u,"
+        "\"expected_records\":%u,\"unique_physical_core_ids\":%u,\"expected_unique_core_ids\":%u,"
+        "\"owner_bitmap_member_records\":%u,\"expected_owner_bitmap_member_records\":%u,"
+        "\"exact_worker_slot_records\":%u,\"expected_exact_worker_slot_records\":%u,"
+        "\"physical_role_match_records\":%u,\"expected_physical_role_match_records\":%u,"
+        "\"mixed_triplet_matches\":%u,\"expected_mixed_triplet_matches\":%u,"
+        "\"window_started_records\":%u,\"window_stopped_records\":%u,"
+        "\"expected_window_records\":%u,\"prior_snapshot_larger_records\":%u,"
+        "\"icache_miss_le_request\":%s,\"counter_below_risk_threshold\":%s,"
+        "\"maximum_programmable_counter\":%u,\"programmable_counter_risk_threshold\":%u,"
+        "\"programmable_counter_headroom\":%u},\n",
+        semantic_passed ? "true" : "false", validation.passed ? "true" : "false", validation.trusted,
+        pa_scheduler::kWorkers, validation.unique_physical_core_ids, pa_scheduler::kWorkers,
+        validation.owner_bitmap_members, pa_scheduler::kWorkers,
+        validation.exact_worker_slots, pa_scheduler::kWorkers,
+        validation.physical_role_matches, pa_scheduler::kWorkers,
+        validation.mixed_triplet_matches, pa_scheduler::kAicWorkers,
+        validation.window_started, validation.window_stopped, pa_scheduler::kWorkers,
+        validation.prior_snapshot_larger, validation.icache_order_valid ? "true" : "false",
+        validation.counter_below_risk_threshold ? "true" : "false",
+        validation.maximum_programmable_counter, kProgrammableCounterRiskThreshold,
+        UINT32_MAX - validation.maximum_programmable_counter
+    );
+    std::fprintf(
+        output,
+        "\"owner\":{\"mode\":\"main_aicpu_path_a\","
+        "\"snapshot_phase\":\"after_configure_before_restore\","
+        "\"control_magic\":%u,\"control_version\":%u,\"configure_status\":%d,"
+        "\"configured_flag\":%u,\"configured_bitmap_count\":%u,"
+        "\"expected\":{\"total\":%u,\"aic\":%u,\"aiv\":%u},"
+        "\"active\":{\"total\":%u,\"aic\":%u,\"aiv\":%u},"
+        "\"discovered\":{\"total\":%u,\"aic\":%u,\"aiv\":%u},"
+        "\"physical_slots_scanned\":%u,\"skipped_physical_slots\":%u,"
+        "\"configured_bitmap_word_order\":\"least_significant_physical_ids_first\","
+        "\"configured_bitmap_words\":[%u,%u,%u,%u],"
+        "\"configured_complete_mixed_triplets\":%u,\"expected_complete_mixed_triplets\":%u,"
+        "\"configured_broken_mixed_triplets\":%u,\"restore_passed\":%s},\n",
+        owner.magic, owner.version, static_cast<int>(owner.status), owner.configured, owner_bitmap_count,
+        owner.expected_total, owner.expected_aic, owner.expected_aiv,
+        owner.active_total, owner.active_aic, owner.active_aiv,
+        owner.discovered_total, owner.discovered_aic, owner.discovered_aiv,
+        pa_scheduler::pmu_owner::kPhysicalSubcoreCount, owner.skipped_total,
+        owner.configured_bitmap[0], owner.configured_bitmap[1],
+        owner.configured_bitmap[2], owner.configured_bitmap[3],
+        owner_complete_triplets, pa_scheduler::kAicWorkers,
+        owner_bitmap_count / 3U - owner_complete_triplets, restore_passed ? "true" : "false"
+    );
+    std::fputs("\"records\":[\n", output);
+    for (uint32_t worker = 0; worker < pa_scheduler::kWorkers; ++worker) {
+        const pa_scheduler::WorkerResult &result = state.results[worker];
+        const uint32_t status = result.pmu_status;
+        const uint32_t physical_core_id = StatusCoreId(status);
+        const bool trusted = (status & kStatusRequired) == kStatusRequired;
+        const bool is_aic = result.role == static_cast<uint32_t>(pa_scheduler::CoreRole::Aic);
+        const uint32_t vector_id = is_aic ? 0U : worker - pa_scheduler::kAicWorkers;
+        const uint32_t block_id = is_aic ? worker : vector_id / 2U;
+        const uint32_t lane = is_aic ? 0U : 1U + vector_id % 2U;
+        const uint32_t segments = PmuWindowSegments(pmu.mode);
+        const bool owner_bitmap_member = pa_scheduler::pmu_owner::IsConfigured(owner, physical_core_id);
+        const bool worker_slot_exact = result.worker_id == worker;
+        const bool physical_role_matches =
+            is_aic == pa_scheduler::pmu_owner::IsAicPhysicalSlot(physical_core_id);
+        const bool window_started = (status & kStatusWindowStarted) != 0U;
+        const bool window_stopped = (status & kStatusWindowStopped) != 0U;
+        std::fprintf(
+            output,
+            "%s{\"worker_id\":%u,\"physical_core_id\":%u,\"role\":\"%s\",\"block_id\":%u,"
+            "\"lane\":%u,\"window_segments\":%u,\"window_segment_count_source\":\"mode_contract\","
+            "\"window_started\":%s,\"window_stopped\":%s,\"total_cycles\":%llu,\"vector_busy\":%u,"
+            "\"cube_busy\":%u,\"scalar_busy\":%u,\"mte1_busy\":%u,\"mte2_busy\":%u,"
+            "\"mte3_busy\":%u,\"icache_requests\":%u,\"icache_misses\":%u,\"fix_busy\":%u,"
+            "\"status\":%u,\"status_hex\":"
+            "\"0x%08x\",\"trusted\":%s,\"physical_core_id_valid\":%s,\"selectors_match\":%s,"
+            "\"owner_bitmap_member\":%s,\"worker_slot_exact\":%s,"
+            "\"physical_role_matches\":%s,\"prior_snapshot_larger\":%s}",
+            worker == 0 ? "" : ",\n", worker, physical_core_id, is_aic ? "aic" : "aiv", block_id,
+            lane, segments, window_started ? "true" : "false", window_stopped ? "true" : "false",
+            static_cast<unsigned long long>(result.pmu_total_cycles), result.pmu_vector_busy,
+            result.pmu_cube_busy, result.pmu_scalar_busy, result.pmu_mte1_busy, result.pmu_mte2_busy,
+            result.pmu_mte3_busy, result.pmu_icache_requests, result.pmu_icache_misses,
+            result.pmu_fix_busy, status, status, trusted ? "true" : "false",
+            (status & kStatusCoreIdValid) != 0 ? "true" : "false",
+            (status & (kStatusCnt0Selector | kStatusCnt1Selector | kStatusCnt2Selector |
+                       kStatusCnt3Selector | kStatusCnt4Selector | kStatusCnt5Selector |
+                       kStatusCnt6Selector | kStatusCnt7Selector | kStatusCnt8Selector)) ==
+                    (kStatusCnt0Selector | kStatusCnt1Selector | kStatusCnt2Selector |
+                     kStatusCnt3Selector | kStatusCnt4Selector | kStatusCnt5Selector |
+                     kStatusCnt6Selector | kStatusCnt7Selector | kStatusCnt8Selector)
+                ? "true"
+                : "false",
+            owner_bitmap_member ? "true" : "false", worker_slot_exact ? "true" : "false",
+            physical_role_matches ? "true" : "false",
+            (status & kStatusPriorSnapshotLarger) != 0 ? "true" : "false"
+        );
+    }
+    std::fputs("\n],\n\"summary\":{\"all\":", output);
+    WritePmuAggregateJson(output, all);
+    std::fputs(",\"aic\":", output);
+    WritePmuAggregateJson(output, aic);
+    std::fputs(",\"aiv\":", output);
+    WritePmuAggregateJson(output, aiv);
+    std::fputs("}\n}\n", output);
+
+    bool success = std::ferror(output) == 0;
+    int write_error = success ? 0 : EIO;
+    if (std::fflush(output) != 0) {
+        success = false;
+        write_error = errno;
+    }
+    if (success && fsync(fileno(output)) != 0) {
+        success = false;
+        write_error = errno;
+    }
+    if (std::fclose(output) != 0) {
+        success = false;
+        write_error = errno;
+    }
+    if (!success) {
+        std::fprintf(stderr, "Failed while writing PMU JSON output %s: %s\n", temporary_path.c_str(),
+                     std::strerror(write_error));
+        (void)std::remove(temporary_path.c_str());
+        return false;
+    }
+    // 同目录 hard-link 在最终名称不存在时原子发布；EEXIST 时保留既有证据，
+    // 不采用会替换目标的 POSIX rename。
+    if (link(temporary_path.c_str(), output_path.c_str()) != 0) {
+        std::fprintf(
+            stderr, "Cannot publish PMU JSON without replacement %s -> %s: %s\n",
+            temporary_path.c_str(), output_path.c_str(),
+            std::strerror(errno)
+        );
+        (void)std::remove(temporary_path.c_str());
+        return false;
+    }
+    if (unlink(temporary_path.c_str()) != 0) {
+        const int unlink_error = errno;
+        // 最终文件已链接但事务尚未完成；尽力撤回最终名称，避免失败返回时留下
+        // 一份被调用方误认为成功发布的文件。
+        (void)unlink(output_path.c_str());
+        std::fprintf(
+            stderr, "Cannot remove PMU JSON temporary link %s: %s\n", temporary_path.c_str(),
+            std::strerror(unlink_error)
+        );
+        return false;
+    }
+    std::printf("[PMU-JSON] capture_id=%s records=%u output=%s\n", capture_id.c_str(), pa_scheduler::kWorkers,
+                output_path.c_str());
+    return true;
 }
 
 }  // namespace
@@ -340,10 +827,41 @@ int main(int argc, char **argv) {
         if (parse_status == pa_scheduler::host::ParseStatus::Help) {
             std::fprintf(
                 stderr,
-                "CCEC PMU options: [--pmu-window off|empty|scalar|scalar-double] [--pmu-scalar-nops N]\n"
+                "CCEC PMU options: [--pmu-window "
+                "off|empty|scalar|scalar-double|submit-all] [--pmu-scalar-nops N] "
+                "[--pmu-json FILE]\n"
             );
         }
         return parse_status == pa_scheduler::host::ParseStatus::Help ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (!pmu_options.json_path.empty() &&
+        pmu_options.mode == pa_scheduler::ccec_pmu::WindowMode::Off) {
+        std::fprintf(stderr, "--pmu-json requires a non-off --pmu-window.\n");
+        return EXIT_FAILURE;
+    }
+    if (!pmu_options.json_path.empty() && options.runs != 1) {
+        // 一个 sidecar 对应一次采集，禁止多轮覆写后丢失逐轮边界。
+        std::fprintf(stderr, "--pmu-json requires --runs 1 to avoid overwriting captures.\n");
+        return EXIT_FAILURE;
+    }
+    if (!pmu_options.json_path.empty() &&
+        (options.trace_enabled || options.trace_atomics || options.profile_phases ||
+         options.analyze_swimlane || !options.swimlane_json.empty())) {
+        std::fprintf(
+            stderr,
+            "--pmu-json requires PMU-only collection: add --no-swimlane and do not enable "
+            "phase profiling, atomic tracing, swimlane analysis, or swimlane JSON.\n"
+        );
+        return EXIT_FAILURE;
+    }
+    if (!pmu_options.json_path.empty() &&
+        (access(pmu_options.json_path.c_str(), F_OK) == 0 ||
+         access((pmu_options.json_path + ".tmp").c_str(), F_OK) == 0)) {
+        std::fprintf(
+            stderr, "Refusing to overwrite an existing PMU JSON or temporary file: %s\n",
+            pmu_options.json_path.c_str()
+        );
+        return EXIT_FAILURE;
     }
     const std::vector<char> binary_data = ReadBinary(options.kernel_path);
     if (binary_data.empty()) {
@@ -352,7 +870,8 @@ int main(int argc, char **argv) {
     }
     pa_scheduler::host::PrintBanner("CCEC", options);
     std::printf(
-        "[PMU-CONFIG] window=%s scalar_nops=%u source=direct-per-core owner=main-aicpu-path-a\n",
+        "[PMU-CONFIG] window=%s calibration_scalar_nops=%u source=direct-per-core "
+        "owner=main-aicpu-path-a\n",
         PmuModeName(pmu_options.mode), pmu_options.scalar_nops
     );
 
@@ -392,6 +911,8 @@ int main(int argc, char **argv) {
 
     PmuRegisterMappings pmu_mappings;
     pa_scheduler::pmu_owner::PmuOwnerSession pmu_owner;
+    pa_scheduler::pmu_owner::PmuOwnerControl pmu_owner_evidence{};
+    bool pmu_owner_evidence_valid = false;
     const void *pmu_registers_device = nullptr;
     if (pmu_options.mode != pa_scheduler::ccec_pmu::WindowMode::Off) {
         if (!MapPmuRegisters(options.device, &pmu_mappings)) return EXIT_FAILURE;
@@ -409,6 +930,8 @@ int main(int argc, char **argv) {
             (void)UnmapPmuRegisters(options.device, &pmu_mappings);
             return EXIT_FAILURE;
         }
+        pmu_owner_evidence = pmu_owner.Control();
+        pmu_owner_evidence_valid = true;
         pmu_registers_device = reinterpret_cast<const void *>(pmu_owner.RegisterTableDeviceAddress());
     }
 
@@ -433,6 +956,12 @@ int main(int argc, char **argv) {
     std::vector<double> spans;
     bool all_passed = true;
     bool postprocess_ok = true;
+    bool pmu_json_ready = false;
+    bool pmu_json_semantic_passed = false;
+    uint32_t pmu_json_run = 0U;
+    double pmu_json_host_us = 0.0;
+    double pmu_json_submit_span_us = 0.0;
+    PmuValidation pmu_json_validation;
     for (uint32_t run = 1; run <= options.runs; ++run) {
         pa_scheduler::host::InitializeState(state.get(), options);
         pa_scheduler::host::ConfigureTrace(state.get(), options, trace_device);
@@ -540,11 +1069,27 @@ int main(int argc, char **argv) {
             *state, run, host_us, options.trace_enabled ? &trace_header : nullptr
         );
         all_passed &= metrics.passed;
-        all_passed &= ValidatePmu(
+        PmuValidation pmu_validation;
+        const bool pmu_passed = ValidatePmu(
             *state, run, pmu_options,
-            pmu_options.mode == pa_scheduler::ccec_pmu::WindowMode::Off ? nullptr : &pmu_owner.Control()
+            pmu_options.mode == pa_scheduler::ccec_pmu::WindowMode::Off ? nullptr : &pmu_owner.Control(),
+            &pmu_validation
         );
+        all_passed &= pmu_passed;
         spans.push_back(metrics.submit_span_us);
+        if (!pmu_options.json_path.empty()) {
+            if (!metrics.passed || !pmu_passed || !pmu_owner_evidence_valid) {
+                std::fprintf(stderr, "PMU JSON rejected because semantic, PMU, or owner validation failed.\n");
+                postprocess_ok = false;
+                break;
+            }
+            pmu_json_ready = true;
+            pmu_json_semantic_passed = metrics.passed;
+            pmu_json_run = run;
+            pmu_json_host_us = host_us;
+            pmu_json_submit_span_us = metrics.submit_span_us;
+            pmu_json_validation = pmu_validation;
+        }
         if (options.analyze_swimlane &&
             !pa_scheduler::host::AnalyzeSwimlaneRecords(trace_header, *state, read_trace_records)) {
             // 后处理错误使用 break 汇入统一 cleanup；与初始化/launch 失败的进程级立即返回语义区分开。
@@ -575,13 +1120,15 @@ int main(int argc, char **argv) {
 
     // 后处理失败也统一走设备资源释放、ELF 卸载和 ACL 收尾，避免文件系统错误遗留运行时上下文。
     bool cleanup_ok = true;
+    bool pmu_owner_restore_ok = true;
     // 先释放依赖当前 device/context 的大块内存，再卸载 ELF、销毁 stream，最后 reset device 与 finalize ACL。
     if (trace_device != nullptr) {
         cleanup_ok &= CheckAcl(aclrtFree(trace_device), "aclrtFree(swimlane trace)");
     }
     if (pmu_registers_device != nullptr) {
         // owner 必须在 MMIO 映射、device context 和 ACL runtime 仍有效时恢复。
-        cleanup_ok &= pmu_owner.Finalize();
+        pmu_owner_restore_ok = pmu_owner.Finalize();
+        cleanup_ok &= pmu_owner_restore_ok;
         cleanup_ok &= UnmapPmuRegisters(options.device, &pmu_mappings);
     }
     cleanup_ok &= CheckAcl(aclrtFree(state_device), "aclrtFree(state)");
@@ -591,6 +1138,19 @@ int main(int argc, char **argv) {
     cleanup_ok &= CheckAcl(aclrtDestroyStream(stream), "aclrtDestroyStream");
     cleanup_ok &= CheckAcl(aclrtResetDevice(options.device), "aclrtResetDevice");
     cleanup_ok &= CheckAcl(aclFinalize(), "aclFinalize");
+    if (!pmu_options.json_path.empty()) {
+        if (!pmu_json_ready || !all_passed || !postprocess_ok || !cleanup_ok || !pmu_owner_restore_ok) {
+            std::fprintf(stderr, "PMU JSON was not published because the capture or restore transaction failed.\n");
+            postprocess_ok = false;
+        } else if (!ExportPmuJson(
+                       *state, options, pmu_options, pmu_json_run, pmu_json_host_us,
+                       pmu_json_submit_span_us, pmu_json_validation, pmu_json_semantic_passed,
+                       pmu_owner_evidence,
+                       pmu_owner_restore_ok, pmu_options.json_path
+                   )) {
+            postprocess_ok = false;
+        }
+    }
     // 运行语义、后处理和资源清理三者全部成功，进程才返回成功，脚本据此决定是否继续生成 merged 泳道。
     return all_passed && postprocess_ok && cleanup_ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

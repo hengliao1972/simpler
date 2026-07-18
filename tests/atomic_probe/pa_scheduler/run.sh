@@ -34,13 +34,16 @@ Benchmark options:
   --swimlane-json FILE
   --no-swimlane
 
-CCEC-only PMU probe options (the host must be launched by msprof PipeUtilization):
-  --pmu-window off|empty|scalar|scalar-double
+CCEC-only PMU probe options (selectors are owned by the standalone Main AICPU helper):
+  --pmu-window off|empty|scalar|scalar-double|submit-all
   --pmu-scalar-nops N
+  --pmu-json FILE
 
 The swimlane action enables atomic tracing by default. For the lower-level run
 action, --trace-atomics still requires swimlane tracing; add
 --analyze-swimlane to print the per-role/per-site timing distributions.
+--pmu-json requires --runs 1 and a non-off PMU window. PMU probe options are
+CCEC-only and cannot target all.
 
 The swimlane action performs exactly one run and writes both the raw capture
 and merged Perfetto JSON below this directory's outputs/ folder. It rejects
@@ -118,6 +121,25 @@ reject_managed_swimlane_options() {
     done
 }
 
+reject_pmu_options_for_non_ccec() {
+    local backend="$1"
+    shift
+    if [[ "$backend" == "ccec" ]]; then
+        return
+    fi
+
+    # PMU selector、校准 NOP 和导出路径都由 CCEC Main AICPU 所有者消费。
+    # 在顶层展开 all 之前拒绝，避免先启动 CCEC、再由其他后端迟到报错。
+    for argument in "$@"; do
+        case "$argument" in
+            --pmu-window|--pmu-window=*|--pmu-scalar-nops|--pmu-scalar-nops=*|--pmu-json|--pmu-json=*)
+                echo "PMU option $argument is CCEC-only; backend '$backend' is not supported." >&2
+                exit 1
+                ;;
+        esac
+    done
+}
+
 # 顶层先解释 action/backend；run 的其余参数交给共享 parser，build、smoke 和
 # swimlane 再分别处理自己的约束或默认注入项。参数不足会在创建目录前失败。
 if [[ $# -lt 2 ]]; then
@@ -135,6 +157,9 @@ if [[ "$BACKEND" == "all" ]]; then
 else
     BACKENDS=("$BACKEND")
 fi
+
+# 后端约束必须早于 build/run/smoke/swimlane 的任何文件创建、构建或设备动作。
+reject_pmu_options_for_non_ccec "$BACKEND" "$@"
 
 case "$ACTION" in
     build)

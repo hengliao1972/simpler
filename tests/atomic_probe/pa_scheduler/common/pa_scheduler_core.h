@@ -743,7 +743,13 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     SubmitContext context;
     if (!IsFatal<Ops>(state, stats)) {
         // Case1 每个 batch 固定回放 Alloc/QK/SF/PV/UP 五个 task；所有 worker 顺序相同，执行 lane 由 Claim 筛选。
+        // CCEC 可在这里开启本 worker 私有 PMU 窗口；CPU/AscendC 适配层是空实现。
+        // 窗口覆盖从首个参数构造到末次 Submit 返回，与全局“首 Submit.begin～末 Submit.end”
+        // 口径接近但不相同，host sidecar 必须按 per-worker 累计解释。
         ResetTraceLap<Ops>(worker);
+        // lap 重置属于泳道观察自身，不应污染 PMU-only 的 Submit 取数；窗口从
+        // orchestration 初始化（即首批参数构造）前一条边界开始。
+        const bool pmu_window_started = Ops::PmuWindowStart(state, worker_id);
         InitPaOrchestration(orchestration, batches, &state->context_lens[0]);
         for (uint32_t batch = 0; batch < batches; ++batch) {
             BuildAllocArgs(orchestration, args, batch);
@@ -802,6 +808,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 break;
             }
         }
+        Ops::PmuWindowStop(state, worker_id, pmu_window_started);
     }
 
     // replay_done 表示所有 worker 已退出回放循环（成功路径即完整提交）；之后仍需 drain 到本核 slot 为空。

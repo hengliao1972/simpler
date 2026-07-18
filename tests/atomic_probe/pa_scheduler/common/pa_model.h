@@ -568,6 +568,15 @@ struct alignas(64) WorkerResult {
     // 仅在 trace_enabled bit1 开启时递增；每次源码 atomic 调用恰好增加一，
     // host 用它与 Atomic span 数逐 worker 闭合，禁止把丢记录的泳道当成完整结果。
     uint64_t atomic_trace_calls;
+
+    // PIPE_UTILIZATION 已同时配置 CNT0/1/3/4/5/8；与上面的 scalar/I-cache
+    // 一样只保存每核原始累计值，AIC/AIV 汇总与比率统一在 host sidecar 中计算。
+    uint32_t pmu_vector_busy;
+    uint32_t pmu_cube_busy;
+    uint32_t pmu_mte1_busy;
+    uint32_t pmu_mte2_busy;
+    uint32_t pmu_mte3_busy;
+    uint32_t pmu_fix_busy;
 };
 // WorkerResult 是 standalone 尾部的诊断 sidecar，不属于真实 DistCore ABI；按
 // cache line 隔离后，各 worker 发布统计不会相互覆盖或污染被测共享状态。
@@ -576,6 +585,7 @@ static_assert(offsetof(WorkerResult, pmu_total_cycles) == 680, "WorkerResult PMU
 static_assert(offsetof(WorkerResult, pmu_status) == 700, "WorkerResult PMU status offset mismatch");
 static_assert(offsetof(WorkerResult, fanin_not_ready_loads) == 704, "WorkerResult atomic diagnostic offset mismatch");
 static_assert(offsetof(WorkerResult, atomic_trace_calls) == 736, "WorkerResult atomic trace offset mismatch");
+static_assert(offsetof(WorkerResult, pmu_vector_busy) == 744, "WorkerResult extended PMU offset mismatch");
 
 // 从 cube_cursor 到 workers 结束保留关键字段 offset、DistCore ABI 和生产总字节跨度，
 // 并非字段级完整镜像。RunConfig、输入 context_lens 与校验结果追加在该跨度之后，
