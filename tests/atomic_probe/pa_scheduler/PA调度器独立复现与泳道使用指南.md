@@ -266,6 +266,28 @@ CPU 完整协议回归建议关闭大泳道缓冲区：
 WaitForSlot 和 HeapGuard 的 `calls_total` 会按 winner 所在角色分布，AIC/AIV
 相加必须分别等于 1,024；等待事件则对应额外的 RingBp 泳道记录。
 
+每轮还会输出一行不依赖泳道的动态原子分类：
+
+```text
+[ATOMIC] submit_completion_ops=... fanin_ready=... fanin_not_ready=... \
+frontier_initial=... frontier_flag=... frontier_ready_fetch_max=... frontier_terminal=...
+```
+
+- `fanin_ready/not_ready` 分别是依赖 flag 返回 1/0 的次数，两者之和等于
+  `[METRIC] fanin_loads`；
+- `frontier_initial` 是每个 completion 对 frontier 的首次 load；
+- `frontier_ready_fetch_max` 同时计数 ready flag 和紧随其后的 FetchMax，两者在
+  这条控制流中一一对应；CCEC/AscendC 上它是一条真实 A5 atomicMax，CPU 上只是
+  一次逻辑 FetchMax 调用；
+- `frontier_terminal` 是每次扫描最终遇到的 not-ready flag，当前工作量下应与
+  completion 数相等；`frontier_flag = ready + terminal`；
+- `submit_completion_ops` 覆盖 Claim、第一圈 HeapGuard、fanin、completion 发布和
+  frontier，不包含 started/replay_done 生命周期屏障。
+
+这些字段在每个 worker 的私有 `LocalStats` 中递增，kernel 结束时才发布到独占
+结果区，不为诊断新增共享 atomic。它们仍会增加少量 scalar 指令，因此优化 A/B
+必须使用相同的计数布局；不能把启用分类后的绝对时间直接与旧二进制比较。
+
 ### 5.6 CCEC 每核 scalar PMU 与 I-cache 诊断
 
 CCEC 后端提供一个显式诊断模式，用来验证局部 scalar 性能观察链路。它不读取
@@ -284,7 +306,7 @@ selector 和 PMU framework 仍由 CANN 9.1 的 task-based profiler 配置；CCEC
 只做门控与读取。一次 snapshot 会消费/清除此前累计，因此窗口前先冻结并做一次
 baseline read-clear，窗口中间只切 gate，末尾再做唯一一次结果 snapshot。host
 按正式 A5 runtime 的方式调用 `halResMap`，构造 36 个
-物理 AICore展开后的 108 项子核 MMIO 表；kernel 使用真实 `get_coreid()` 索引，
+物理 AICore 展开后的 108 项子核 MMIO 表；kernel 使用真实 `get_coreid()` 索引，
 不能用逻辑 `worker_id` 猜物理核。
 
 在本目录先构建 CCEC，再直接让 `msprof` 包住 host runner：

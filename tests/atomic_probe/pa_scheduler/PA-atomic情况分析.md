@@ -803,3 +803,81 @@ O1 已达到“可用”的门槛：物理核映射、事件 selector、正向�
 等 worker-local 诊断计数，不增加共享 atomic。得到动态规模后，首个低风险单变量
 候选是每个私有 slot 缓存已经观察为 ready 的 fanin 前缀；slot 重用时必须重置，
 且先完成 CCEC 交错 A/B，再决定是否迁移到真实 FDWIC。
+
+### 7.4 阶段 D1：精确分类 fanin 与 frontier 动态原子次数
+
+#### 7.4.1 计数实现与闭合关系
+
+D1 已在 standalone 公共调度器中增加 worker-local 软件计数，不新增共享 atomic：
+
+- fanin 每次 flag load 只递增一个分类：`ready` 或 `not_ready`；
+- 每次 completion 递增一个 frontier initial load；
+- ready flag 与紧随其后的 FetchMax 共用一个一一对应计数 `A`；
+- 扫描遇到 not-ready flag 退出时递增 terminal load。
+
+计数先保存在本核 `LocalStats`，kernel 结束时才发布到独占 `WorkerResult`。
+`WorkerResult` 从 704 B 扩展到 768 B，但原 PMU 字段 offset、生产 DistGlobal/DistCore
+offset 和 `LocalSlot` ABI 都不变。三后端完整重建后，smoke 和 256 batch 默认 NOP
+均通过全部语义断言。
+
+对任一 worker，若其完成数为 `Cw`、fanin 边数为 `Ew`、失败 load 为 `Fw`，则
+逐核检查：
+
+~~~text
+frontier_initial_w == Cw
+frontier_terminal_w == Cw
+fanin_ready_w >= Ew
+fanin_ready_w - Ew <= 2 * Fw
+~~~
+
+最后一个上界来自 PA 最大 fanin 为 3：一次失败检查最多先重读两个 ready 前缀，
+然后在一个 not-ready 依赖上返回。全局 `T=1280` 时还必须满足：
+
+~~~text
+frontier_initial = frontier_terminal = T
+frontier_ready = frontier_FetchMax = A >= T
+frontier_flag_loads = A + T
+Submit+completion ops = 79872 + G + 2A
+~~~
+
+其中 `G=fanin_ready+fanin_not_ready`。CCEC/AscendC 的 `A` 对应真实 A5
+atomicMax；CPU 的 FetchMax 是 load/CAS 实现，`A` 只能解释为逻辑调用数。
+
+#### 7.4.2 CCEC 十轮动态基线
+
+在 256 batch、默认 NOP、关闭泳道和 phase profile 的同一进程十轮基线中，全部
+语义断言和上述计数恒等式均 PASS：
+
+| 指标 | 中位数 | 均值 | nearest-rank p90 | 范围 |
+| ---- | -----: | ---: | ----------------: | ---: |
+| Submit（us） | 4776.940 | 4802.821 | 5335.931 | 3805.757～5535.473 |
+| fanin 总 load `G` | 93201.5 | 99442.6 | 145045 | 56620～151260 |
+| fanin ready | 7323.5 | 7418.0 | 9370 | 4191～9933 |
+| fanin not-ready | 86675.5 | 92024.6 | 136347 | 49038～141327 |
+| frontier FetchMax `A` | 15365 | 14957.8 | 18957 | 5587～20026 |
+| Submit+completion ops | 203803.5 | 209230.2 | 264969 | 164508～269046 |
+
+日志位于：
+
+~~~text
+tests/atomic_probe/pa_scheduler/outputs/atomic_diagnostics/
+  ccec_baseline_10_20260718_023551.log
+~~~
+
+该十轮不是独立进程交错 A/B，因此只用于确认动态规模，不用于宣布性能收益。
+分类代码新增约 `2T+A` 次 worker 私有 scalar 增量，且结果 sidecar 扩大了一条
+cache line；本节绝对 Submit 不能与 D1 之前的二进制直接归因比较。
+
+#### 7.4.3 对下一候选的约束
+
+当前动态最大项不是 ready 前缀，而是 not-ready 重试：其中位数约 86676 次；
+frontier helping 的额外 FetchMax 中位数为 `A-T=14085` 次。ready-prefix cache 在
+固定轮询序列下最多删除 `fanin_ready-E=6043.5` 次中位重复 load，约占 fanin 总量
+6.5%、Submit+completion ops 3.0%，预期只能是小幅候选。
+
+仍先做该候选，因为它不改变依赖集合、flag 发布或跨核共享状态，正确性风险最低。
+但 probe 变短后可能在同一等待期间发起更多 not-ready 重试，所以整轮 `G` 不保证
+静态单调下降。保留门槛是：优化后 `fanin_ready == fanin_edges == 1280`，CCEC
+独立进程交错十对中 fanin 总 load 配对中心下降、Submit 中心不回退；否则记录负
+结果并撤回，不迁移真实 FDWIC。standalone 第一版只验证当前单-lane PA Case1，
+不能拿它的 PASS 代替 joint/BlockWon 覆盖。

@@ -100,6 +100,7 @@ template <typename Ops>
 PA_DEVICE void AdvanceFrontier(PA_GM SchedulerState *state, LocalStats &stats) {
     // frontier 只表示“从 task 0 开始已经连续完成”的最高 task id，不能越过尚未发布 flag 的空洞。
     // 多个完成者可以同时扫描同一段连续区间，FetchMax 保证共享 frontier 只前进、不回退。
+    ++stats.result.frontier_initial_loads;
     int64_t frontier = LoadLine<Ops>(state->frontier);
     while (true) {
         const int64_t next = frontier + 1;
@@ -107,10 +108,12 @@ PA_DEVICE void AdvanceFrontier(PA_GM SchedulerState *state, LocalStats &stats) {
             break;
         }
         if (Ops::Load(&state->tasks[next].flag) == 0) {
+            ++stats.result.frontier_terminal_loads;
             break;
         }
         uint64_t retries = 0;
         // FetchMax 返回更新前的值；若其他核已经走得更远，就从其 old 值继续扫描，避免重复从 next 起步。
+        ++stats.result.frontier_updates;
         const int64_t old = Ops::FetchMax(&state->frontier.value, next, retries);
         stats.result.cas_retries += retries;
         frontier = old > next ? old : next;
@@ -133,10 +136,11 @@ template <typename Ops>
 PA_DEVICE bool SlotReady(PA_GM SchedulerState *state, PA_GM LocalSlot &slot, LocalStats &stats) {
     // 每个 fanin flag 都是跨核共享的完成条件；遇到第一个未就绪依赖即返回，后续 drain 会再次轮询。
     for (uint32_t index = 0; index < slot.fanin_count; ++index) {
-        ++stats.result.fanin_loads;
         if (Ops::Load(&state->tasks[slot.fanin[index]].flag) == 0) {
+            ++stats.result.fanin_not_ready_loads;
             return false;
         }
+        ++stats.result.fanin_ready_loads;
     }
     return true;
 }
@@ -583,7 +587,7 @@ PA_DEVICE void PublishResult(PA_GM WorkerResult &destination, const WorkerResult
     PA_PUBLISH_FIELD(claim_attempts);
     PA_PUBLISH_FIELD(claim_wins);
     PA_PUBLISH_FIELD(heap_guards);
-    PA_PUBLISH_FIELD(fanin_loads);
+    PA_PUBLISH_FIELD(fanin_ready_loads);
     PA_PUBLISH_FIELD(completion_duplicates);
     PA_PUBLISH_FIELD(cas_retries);
     PA_PUBLISH_FIELD(joint_polls);
@@ -628,6 +632,10 @@ PA_DEVICE void PublishResult(PA_GM WorkerResult &destination, const WorkerResult
     PA_PUBLISH_FIELD(role);
     PA_PUBLISH_FIELD(max_occupied);
     PA_PUBLISH_FIELD(final_occupied);
+    PA_PUBLISH_FIELD(fanin_not_ready_loads);
+    PA_PUBLISH_FIELD(frontier_initial_loads);
+    PA_PUBLISH_FIELD(frontier_updates);
+    PA_PUBLISH_FIELD(frontier_terminal_loads);
 #undef PA_PUBLISH_FIELD
     Ops::StoreBarrier();
 }

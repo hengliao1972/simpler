@@ -67,6 +67,7 @@ constexpr size_t kRealReplayDoneOffset = 10043776;
 constexpr size_t kRealStartedCountOffset = 10043840;
 constexpr uint32_t kTraceRecordsPerCore = 1U << 16;
 static_assert((kPayloadSlots & kPayloadMask) == 0, "payload slots must be a power of two");
+static_assert(kMaxTasks < kTaskCellCapacity, "every frontier scan must terminate on an in-range not-ready flag");
 
 // These are the measured means from the best PA A5 trace, in 1 GHz ticks.
 // The CCEC stage calibrates the NOP counts against these targets before the
@@ -449,7 +450,7 @@ struct alignas(64) WorkerResult {
     uint64_t claim_attempts;
     uint64_t claim_wins;
     uint64_t heap_guards;
-    uint64_t fanin_loads;
+    uint64_t fanin_ready_loads;
     uint64_t completion_duplicates;
     uint64_t cas_retries;
     uint64_t joint_polls;
@@ -501,12 +502,20 @@ struct alignas(64) WorkerResult {
     uint32_t pmu_icache_requests;
     uint32_t pmu_icache_misses;
     uint32_t pmu_status;
+
+    // 这些计数只在 worker 私有 LocalStats 中递增，结束时一次性发布；它们把动态
+    // fanin 重试和 frontier helping 展开为准确次数，不为取数再增加共享 atomic。
+    uint64_t fanin_not_ready_loads;
+    uint64_t frontier_initial_loads;
+    uint64_t frontier_updates;
+    uint64_t frontier_terminal_loads;
 };
 // WorkerResult 是 standalone 尾部的诊断 sidecar，不属于真实 DistCore ABI；按
 // cache line 隔离后，各 worker 发布统计不会相互覆盖或污染被测共享状态。
-static_assert(sizeof(WorkerResult) == 704, "WorkerResult PMU fields must only consume existing tail padding");
+static_assert(sizeof(WorkerResult) == 768, "WorkerResult diagnostics must occupy whole cache lines");
 static_assert(offsetof(WorkerResult, pmu_total_cycles) == 680, "WorkerResult PMU offset mismatch");
 static_assert(offsetof(WorkerResult, pmu_status) == 700, "WorkerResult PMU status offset mismatch");
+static_assert(offsetof(WorkerResult, fanin_not_ready_loads) == 704, "WorkerResult atomic diagnostic offset mismatch");
 
 // 从 cube_cursor 到 workers 结束保留关键字段 offset、DistCore ABI 和生产总字节跨度，
 // 并非字段级完整镜像。RunConfig、输入 context_lens 与校验结果追加在该跨度之后，

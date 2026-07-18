@@ -581,7 +581,11 @@ inline Metrics Validate(
     uint64_t claims = 0;
     uint64_t wins = 0;
     uint64_t heap_guards = 0;
-    uint64_t fanin_loads = 0;
+    uint64_t fanin_ready_loads = 0;
+    uint64_t fanin_not_ready_loads = 0;
+    uint64_t frontier_initial_loads = 0;
+    uint64_t frontier_updates = 0;
+    uint64_t frontier_terminal_loads = 0;
     uint64_t duplicates = 0;
     uint64_t cas_retries = 0;
     uint64_t joint_polls = 0;
@@ -616,6 +620,8 @@ inline Metrics Validate(
     bool frontend_worker_counts_ok = true;
     bool final_worker_state_ok = true;
     bool worker_checksums_ok = true;
+    bool fanin_worker_counts_ok = true;
+    bool frontier_worker_counts_ok = true;
 
     // 按真实输出大小、1 KiB 对齐和 256 MiB 环回规则重算每个 task 可接受的最小 vend。
     uint64_t expected_heap_next = 0;
@@ -675,7 +681,11 @@ inline Metrics Validate(
         if (result.claim_wins != 0) ++winning_workers;
         max_worker_wins = std::max(max_worker_wins, result.claim_wins);
         heap_guards += result.heap_guards;
-        fanin_loads += result.fanin_loads;
+        fanin_ready_loads += result.fanin_ready_loads;
+        fanin_not_ready_loads += result.fanin_not_ready_loads;
+        frontier_initial_loads += result.frontier_initial_loads;
+        frontier_updates += result.frontier_updates;
+        frontier_terminal_loads += result.frontier_terminal_loads;
         duplicates += result.completion_duplicates;
         cas_retries += result.cas_retries;
         joint_polls += result.joint_polls;
@@ -706,6 +716,17 @@ inline Metrics Validate(
         final_worker_state_ok &= result.map_alive_floor == expected_map_floor;
         final_worker_state_ok &= result.map_cleaned_upto == expected_map_floor;
         worker_checksums_ok &= result.checksum == (0xcbf29ce484222325ULL ^ result.worker_id);
+        const uint64_t worker_kernel_completions = result.kernel_counts[0] + result.kernel_counts[1] +
+                                                   result.kernel_counts[2] + result.kernel_counts[3];
+        const uint64_t worker_completions = result.wins[0] + worker_kernel_completions;
+        frontier_worker_counts_ok &= result.frontier_initial_loads == worker_completions;
+        frontier_worker_counts_ok &= result.frontier_terminal_loads == result.frontier_initial_loads;
+        fanin_worker_counts_ok &= result.fanin_ready_loads >= result.fanin_edges;
+        if (result.fanin_ready_loads >= result.fanin_edges) {
+            // PA 最大 fanin 为 3；每次失败检查最多先重读两个 ready 前缀，再遇到一个 not-ready。
+            fanin_worker_counts_ok &=
+                result.fanin_ready_loads - result.fanin_edges <= 2 * result.fanin_not_ready_loads;
+        }
         for (uint32_t kind = 0; kind < 5; ++kind)
             wins_by_kind[kind] += result.wins[kind];
         for (uint32_t kind = 0; kind < 4; ++kind) {
@@ -734,6 +755,8 @@ inline Metrics Validate(
     }
     const uint64_t kernel_total = kernel_counts[0] + kernel_counts[1] + kernel_counts[2] + kernel_counts[3];
     const uint64_t placement_total = placements[0] + placements[1] + placements[2];
+    const uint64_t fanin_loads = fanin_ready_loads + fanin_not_ready_loads;
+    const uint64_t frontier_flag_loads = frontier_updates + frontier_terminal_loads;
 
     // 第一组断言覆盖参与者拓扑、Claim/winner、completion 和最终 drain 等调度主协议。
     Expect(aic_count == kAicWorkers && aiv_count == kAivWorkers, "participant topology is 32 AIC + 64 AIV", &metrics);
@@ -755,7 +778,19 @@ inline Metrics Validate(
         "each kernel kind executes once per batch", &metrics
     );
     Expect(heap_guards == static_cast<uint64_t>(batches) * 4, "heap guard count matches output winners", &metrics);
-    Expect(fanin_loads >= static_cast<uint64_t>(batches) * 5, "successful fanin checks meet PA lower bound", &metrics);
+    Expect(
+        fanin_worker_counts_ok && fanin_ready_loads >= fanin_edges &&
+            fanin_ready_loads - fanin_edges <= 2 * fanin_not_ready_loads,
+        "fanin ready/failure load classification is complete", &metrics
+    );
+    Expect(
+        frontier_worker_counts_ok && frontier_initial_loads == task_count,
+        "frontier initial loads match completed tasks", &metrics
+    );
+    Expect(
+        frontier_terminal_loads == task_count && frontier_updates >= task_count,
+        "frontier ready/update/terminal load identity is exact", &metrics
+    );
     Expect(duplicates == 0, "completion flags are published once", &metrics);
     Expect(ready_flags == task_count, "all task flags are ready", &metrics);
     Expect(vend_values_ok, "all published vend values are nonzero and aligned", &metrics);
@@ -871,6 +906,20 @@ inline Metrics Validate(
         "[METRIC] run=%u submit_span_us=%.3f host_launch_us=%.3f claims=%llu fanin_loads=%llu cas_retries=%llu\n", run,
         metrics.submit_span_us, host_us, static_cast<unsigned long long>(claims),
         static_cast<unsigned long long>(fanin_loads), static_cast<unsigned long long>(cas_retries)
+    );
+    const uint64_t submit_completion_ops =
+        claims + heap_guards + fanin_loads + 2ULL * task_count + frontier_initial_loads +
+        frontier_flag_loads + frontier_updates;
+    std::printf(
+        "[ATOMIC] submit_completion_ops=%llu fanin_ready=%llu fanin_not_ready=%llu frontier_initial=%llu "
+        "frontier_flag=%llu frontier_ready_fetch_max=%llu frontier_terminal=%llu\n",
+        static_cast<unsigned long long>(submit_completion_ops),
+        static_cast<unsigned long long>(fanin_ready_loads),
+        static_cast<unsigned long long>(fanin_not_ready_loads),
+        static_cast<unsigned long long>(frontier_initial_loads),
+        static_cast<unsigned long long>(frontier_flag_loads),
+        static_cast<unsigned long long>(frontier_updates),
+        static_cast<unsigned long long>(frontier_terminal_loads)
     );
     std::printf(
         "[WINNERS] active_workers=%u max_wins_per_worker=%llu\n", winning_workers,
