@@ -16,7 +16,7 @@
 #include <pto/pto-inst.hpp>
 
 #include "pmu_probe.h"
-#include "winner_workload.h"
+#include "../common/winner_workload.h"
 
 #define PA_DEVICE __aicore__ inline
 #define PA_GM __gm__
@@ -59,7 +59,7 @@ __aicore__ inline void RuntimeNop(uint32_t count) {
 static __aicore__ __attribute__((noinline, used)) void pa_real_cube_workload_aic(
     __gm__ float *input_a, __gm__ float *input_b, __gm__ float *output, uint32_t repeats
 ) {
-    constexpr int kTile = static_cast<int>(pa_scheduler::ccec_workload::kTileRows);
+    constexpr int kTile = static_cast<int>(pa_scheduler::winner_workload::kTileRows);
     constexpr int kBlockAlign = C0_SIZE_BYTE / sizeof(float);
     static_assert(kTile % 16 == 0, "cube M must be 16-aligned");
     static_assert(kTile % kBlockAlign == 0, "cube K/N must satisfy C0 alignment");
@@ -113,8 +113,8 @@ template <bool Multiply>
 __aicore__ inline void RunRealVectorWorkload(
     __gm__ float *input_a, __gm__ float *input_b, __gm__ float *output, uint32_t repeats
 ) {
-    constexpr int kRows = static_cast<int>(pa_scheduler::ccec_workload::kTileRows);
-    constexpr int kCols = static_cast<int>(pa_scheduler::ccec_workload::kTileCols);
+    constexpr int kRows = static_cast<int>(pa_scheduler::winner_workload::kTileRows);
+    constexpr int kCols = static_cast<int>(pa_scheduler::winner_workload::kTileCols);
     using GlobalData = GlobalTensor<
         float, Shape<1, 1, 1, kRows, kCols>, pto::Stride<1, 1, 1, kCols, 1>>;
     using TileData = Tile<
@@ -176,9 +176,9 @@ static __aicore__ __attribute__((noinline, used)) void pa_execute_real_winner_wo
     // 闭环会把这种配置错误判为失败。
     if (state->winner_workload.version != pa_scheduler::kWinnerWorkloadConfigVersion ||
         workspace == 0 ||
-        state->winner_workload.workspace_bytes < pa_scheduler::ccec_workload::kWorkspaceBytes ||
+        state->winner_workload.workspace_bytes < pa_scheduler::winner_workload::kWorkspaceBytes ||
         worker.core_idx < 0 || static_cast<uint32_t>(worker.core_idx) >= pa_scheduler::kWorkers ||
-        repeats == 0 || repeats > pa_scheduler::ccec_workload::kMaxRealComputeCount) {
+        repeats == 0 || repeats > pa_scheduler::winner_workload::kMaxRealComputeCount) {
         return;
     }
 #if defined(PA_BUILD_AIC)
@@ -188,18 +188,18 @@ static __aicore__ __attribute__((noinline, used)) void pa_execute_real_winner_wo
 #endif
     __gm__ float *input_a = reinterpret_cast<__gm__ float *>(workspace);
     __gm__ float *input_b = reinterpret_cast<__gm__ float *>(
-        workspace + pa_scheduler::ccec_workload::kTileBytes
+        workspace + pa_scheduler::winner_workload::kTileBytes
     );
     const uint32_t kind_slot =
         (kind == pa_scheduler::TaskKind::Pv || kind == pa_scheduler::TaskKind::Up) ? 1U : 0U;
     const uint32_t output_tile =
-        pa_scheduler::ccec_workload::kSharedInputTiles +
+        pa_scheduler::winner_workload::kSharedInputTiles +
         static_cast<uint32_t>(worker.core_idx) *
-            pa_scheduler::ccec_workload::kOutputTilesPerWorker +
+            pa_scheduler::winner_workload::kOutputTilesPerWorker +
         kind_slot;
     __gm__ float *output = reinterpret_cast<__gm__ float *>(
         workspace + static_cast<uint64_t>(output_tile) *
-            pa_scheduler::ccec_workload::kTileBytes
+            pa_scheduler::winner_workload::kTileBytes
     );
 #if defined(PA_BUILD_AIC)
     pa_real_cube_workload_aic(input_a, input_b, output, repeats);
