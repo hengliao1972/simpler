@@ -110,6 +110,9 @@ PTO_DEVICE_FUNC bool dist_submit_wait_heap_capacity(DistSubmitCtx &ctx, DistSubm
     bool waited = false;
     TRACE_SPAN_BEGIN(heap_bp_trace);
     while (!fatal_set()) {
+        // 逻辑 heap 尚未走完第一圈时，物理地址还没有发生环形复用；保留 fatal
+        // 原子检查后，可直接跳过 frontier/vend 原子读取。
+        if (ctx.self->heap_next <= ring) return true;
         const int32_t f = static_cast<int32_t>(atomic_load(g_dist.frontier));
         const int32_t R = f - g_dist.H;
         const uint64_t vstart_live = load_task_vend(R);

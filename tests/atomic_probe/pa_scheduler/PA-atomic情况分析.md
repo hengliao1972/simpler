@@ -269,6 +269,9 @@ Submit 调度而非 kernel 计算变快。
 
 ## 5. 后续优化顺序与验证要求
 
+本节是首轮分析时给出的候选方向。实际推进采用“单变量、低风险到高风险”的
+阶段门禁，并持续记录在第 7 节；若两处顺序不同，以第 7 节已经完成验证的结论为准。
+
 建议按以下顺序继续，且每次只改一个变量：
 
 1. **Claim cursor 竞争。** 73728 次 `atomicMax` 是最大固定项。可以研究
@@ -338,3 +341,310 @@ Alloc/QK/SF/PV winner 调用，共 1024 次。当前代表性 CCEC 轮次的累�
 完整构建、参数、内存占用、冷热运行口径和脱仓复制方法见同目录
 [PA 调度器独立复现与泳道使用指南](PA调度器独立复现与泳道使用指南.md)。后续调度优化应先在该
 独立用例做协议回归和阶段定位，再回到真实 PA Case1 做最终性能确认。
+
+## 7. Atomic 消减阶段日志
+
+从 2026-07-17 起，每个候选必须按以下节奏更新本节：先写静态证明和直接消减
+口径，再记录 standalone 三后端结果、压力/反例结果和性能 A/B，最后写是否允许
+进入真实 PA。失败、超时和回退同样保留，不能只记录正向数据。一次只验证一个
+变量，后续阶段不得把前一阶段的间接调度变化冒充为本阶段的直接 atomic 收益。
+
+| 阶段 | 单变量 | 当前状态 |
+| ---- | ------ | -------- |
+| H1 | HeapGuard 首圈 fast path | 正确性与真实性能完成，保留并本地提交 |
+| F1 | fanin 依赖检查顺序 | H1 提交后开始 |
+| 后续 | ready cache、退避、frontier、Claim | 尚未开始，必须逐项验证 |
+
+### 7.1 阶段 H1：HeapGuard 首圈 fast path
+
+#### 7.1.1 修改范围与正确性证明
+
+本阶段只在 standalone 的 `HeapGuard()` 中增加以下判断；原 slow path 未改：
+
+```cpp
+while (!IsFatal<Ops>(state)) {
+    if (worker.heap_next <= ring) {
+        return true;
+    }
+    // 原 frontier/vend 容量检查。
+}
+```
+
+判断放在 `IsFatal()` 之后，因此仍保留每次 HeapGuard 的 fatal 原子检查。profile
+版本在 fast path 返回前仍累计 HeapGuard 时间，没有改变统计调用次数。
+
+该判断依赖以下由现有代码确认的不变量：
+
+1. 每个 worker 的 `heap_next` 从 0 开始，materialize 只按单调逻辑地址推进；
+2. 只有生成物理输出地址时才对 ring 取模；
+3. 每个输出按 1 KiB 对齐，单 task 输出超过 ring 会直接失败；
+4. 当前 task 若跨越 ring 尾部，会先把 `task_base` 推到下一圈；
+5. HeapGuard 在当前 task 完成 materialize 后执行。
+
+所以在 `uint64_t` 未溢出的前提下，`heap_next <= ring` 表示所有已分配逻辑区间
+仍位于 `[0, ring)`，取模后一一对应，尚不可能覆盖旧输出。`heap_next == ring`
+也安全，因为已分配区间右端为开区间；第一个真正进入第二圈的非零输出会使
+`heap_next > ring`。不能用 `output_bytes <= ring` 替代该条件，后者无法证明
+历史分配没有 wrap。
+
+本阶段不顺手修改 slow path 中 `heap_next - vend` 的无符号下溢边界，也不修改
+frontier、fanin、Claim 或 completion 协议，避免把两个正确性问题混在一起。
+
+#### 7.1.2 直接 atomic 消减口径
+
+默认 256 batch 的 standalone 共调用 1024 次 HeapGuard。默认 256 MiB ring 下，
+每个 worker 的最终状态为：
+
+```text
+heap_next = 206,569,472 B
+ring      = 268,435,456 B
+剩余       =  61,865,984 B
+```
+
+1024 次调用全部处于第一圈，直接消减如下：
+
+| 操作 | 修改前 | 修改后 | 直接消减 |
+| ---- | -----: | -----: | -------: |
+| fatal atomic load | 1024 | 1024 | 0 |
+| frontier atomic load | 1024 | 0 | 固定 1024 |
+| vend atomic load | `V` | 0 | 动态 `V` |
+
+只有 `retire = frontier - H >= 0` 时原逻辑才读取 vend。按 1280 task、`H=64`
+和输出 task 分布，`0 <= V <= 972`。所以默认 workload 直接删除的是
+`1024 + V` 次 HeapGuard 原子读取，不是所有观测指标的变化量。
+
+#### 7.1.3 默认配置正确性门禁
+
+恢复默认 256 MiB 配置前，本阶段已经完成一次 CCEC、AscendC、CPU 的全量构建，
+以及 256 batch、零 NOP、开启四阶段统计、关闭泳道大缓冲区的完整运行：
+
+```bash
+./run.sh run all --device 0 --batches 256 --runs 1 \
+  --nop-count 0 --profile-phases --no-swimlane
+```
+
+三个后端均为 `semantic_status=PASS`、`postprocess_status=PASS`。严格校验包括
+73,728 次 Claim、1280 个唯一 winner、1024 个 kernel、1024 次 HeapGuard、
+fanin、flag、vend、frontier、cursor、TensorMap/heap 最终状态和每 worker
+前端操作次数。该结果只证明 standalone 协议，没有替代真实输出 golden。
+
+#### 7.1.4 16 MiB wrap 压力与 CPU 对照
+
+为覆盖首圈之外的原 slow path，曾临时把 `kHeapBytes` 从 256 MiB 改为 16 MiB
+并全量重编。256 batch 的静态状态为：
+
+```text
+ring                  = 16,777,216 B
+最终逻辑 heap_next    = 209,385,472 B
+跨 ring 尾部跳转      = 12 次
+首圈 fast path        = 82 次 HeapGuard
+原 slow path          = 942 次 HeapGuard
+```
+
+CCEC 和 AscendC 的 256 batch 完整语义与阶段统计均 PASS。设备结果确实进入慢路径：
+CCEC 的 HeapGuard wait event 为 `629 + 3 = 632`，AscendC 为
+`542 + 6 = 548`，不是仍停留在首圈的伪压力测试。
+
+CPU 结果需要单独解释：fast 版的 32、64、128 batch 均快速 PASS；256 batch
+在开启阶段统计时持续运行超过 8 分钟未结束，关闭阶段统计后也未在观察窗口结束。
+为排除 fast path 回归，保持 16 MiB 和 256 batch 不变，只临时撤掉 fast path、
+重编 CPU 原版，并用统一的 120 秒门限运行；原版同样超时。由此只能得出：
+
+- 该 CPU synthetic-heap 模型在 16 MiB、多圈、256 batch 下存在原有的长程活性
+  或 host 线程调度问题；
+- 当前证据不能把该超时归因于 H1，也不能把 CPU 256 batch 记为 PASS；
+- 真实 tiny-ring 数据 golden 仍是生产迁移前不可省略的门禁。
+
+对照完成后已恢复 `kHeapBytes = 256 MiB`，临时原版构建不保留为源码改动。
+
+恢复后再次执行 `build all`，并用与 7.1.3 相同的 256 batch 命令完成终验；
+CCEC、AscendC、CPU 再次全部 PASS。该轮 HeapGuard wait event 均为 0，符合默认
+配置全程不 wrap 的静态结论。CCEC/AscendC/CPU 的 Submit span 分别为
+3499.426 us、3523.687 us、229235.747 us；CPU 时间仅反映 host pthread 调度，
+不参与 A5 性能比较。
+
+#### 7.1.5 CCEC A5 standalone 十样本 A/B
+
+baseline 和 H1 均使用独立进程首轮，各保留 10 个具有完整 PASS 结果的有效样本；
+单位为微秒：
+
+```text
+baseline = [
+  4451.574, 4847.797, 5089.239, 5403.477, 5227.148,
+  5217.446, 4929.629, 4084.562, 5268.516, 5246.626
+]
+
+H1 = [
+  3759.041, 4142.396, 4582.740, 4134.989, 5670.639,
+  4348.529, 4503.739, 5507.320, 4286.019, 4088.046
+]
+```
+
+| 指标 | baseline（us） | H1（us） | 相对变化 |
+| ---- | ------------: | -------: | -------: |
+| 样本数 | 10 | 10 | - |
+| 中位数 | 5153.3425 | 4317.2740 | -16.2238% |
+| 均值 | 4976.6014 | 4502.3458 | -9.5297% |
+| p90 | 5268.516 | 5507.320 | +4.5327% |
+| 最小值 | 4084.562 | 3759.041 | - |
+| 最大值 | 5403.477 | 5670.639 | - |
+
+九组可按采集顺序配对的样本中 H1 有 7 组更快，配对变化中位数为 `-14.55%`，
+两组反向样本为 `+8.48%` 和 `+34.83%`。动态指标也随调度时序变化：fanin
+load 中位数从 91,254 降至 66,318.5（-27.33%），但 p90 上升 11.47%；
+RingBp placement 中位数从 118.5 降至 101（-14.77%），p90 下降 3.76%。
+
+另有两次没有生成完整结果的 baseline 异常：首次外层 launch 约四分钟无结果后
+人工中断；后续 baseline `r9` 在 60 秒门限超时。二者均未计入耗时分布，也不能
+记为 PASS 或 FAIL；异常后设备 smoke 恢复正常。正式 A/B 必须让两边使用相同
+timeout，并把 timeout 率单独报告，避免只统计成功样本造成幸存者偏差。
+
+fanin 和 RingBp 代码并未在 H1 修改，其变化幅度又远大于固定 1024 次 frontier
+读取，因此只能解释为 worker 到达、依赖完成和 drain 相对时序改变后的间接效应。
+当前中心趋势显示方向性收益，但 H1 的 p90 变差且离散较大，不能声称尾延迟稳定
+改善，更不能把 16.22% 全部归因于 `1024 + V` 次直接 atomic 消减。
+
+#### 7.1.6 阶段结论与下一门禁
+
+H1 当前状态是“standalone 默认配置通过，允许进入真实 PA 正确性验证”，不是
+“真实 PA 已优化完成”。继续推进前按以下顺序执行：
+
+1. 默认 256 MiB 恢复后重建三后端并再次执行完整回归，确认临时压力常量无残留；
+2. 对真实 `dist_submit_wait_heap_capacity()` 做一次单点、等价修改；
+3. 运行 fully-distributed PA Case1 的 A5Sim golden；
+4. 运行已有 68 KiB `AllocFillRunAhead`、`AllocHeapBackPressure` 和 MB6 heap
+   reclaim 用例，验证真实输出没有 premature reuse；
+5. A5 正确性通过后，再做双方相同门限、独立进程、交错顺序的至少 10 轮 A/B；
+6. H1 通过真实门禁后，下一项低风险候选是只调整 fanin 检查顺序；ready cache、
+   backoff、frontier 合并和 Claim 参与者缩减必须分别作为后续单变量阶段。
+
+standalone 使用 synthetic heap 且计算 kernel 由 NOP 模拟，它能验证控制协议、
+分支和 atomic 计数，但不能用 synthetic 地址证明真实 tensor 内容未被提前覆盖。
+
+#### 7.1.7 真实 fully-distributed 迁移与正确性结果
+
+standalone 门禁通过后，只在真实实现的
+`dist_submit_wait_heap_capacity()` 中加入同形判断：
+
+```cpp
+while (!fatal_set()) {
+    if (ctx.self->heap_next <= ring) return true;
+    // 原 slow path 不变。
+}
+```
+
+生产实现没有 standalone 的 HeapGuard phase profile，因此没有搬入额外统计字段。
+判断仍位于 `TRACE_SPAN_BEGIN` 之后和 fatal 检查之内：原本不等待的成功路径就不会
+生成 RingBp 事件，新 fast path 的 trace 语义不变。真实函数共被 1280 个 winner
+调用，UP 因 `output_bytes == 0` 在进入 atomic-bearing loop 前返回；实际消减口径
+仍是 Alloc/QK/SF/PV 的 1024 次 guard。
+
+测试统一使用用户环境 `/home/q00473782/.venv`、CANN 9.1、本地 GCC 15，并按
+仓库 CI 固定 PTO-ISA 到：
+
+```text
+ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8
+```
+
+未传 SHA 时测试会把 managed clone 更新到当时的 `origin/main ea90d400`，该组合的
+CPU stub/`pto_instr.hpp` 出现大量重复定义，kernel 未能编译；这不是 H1 结果，
+也没有通过修改 PTO-ISA 头文件规避。非交互 shell 还必须显式加入用户本地
+`g++-15` 路径，不能假设会自动 source `.bashrc`。
+
+真实数据门禁结果如下：
+
+| 平台 | 用例 | 覆盖点 | 结果 |
+| ---- | ---- | ------ | ---- |
+| A5Sim | `AllocFillRunAhead67`，68 KiB | 首圈边界 | PASS |
+| A5Sim | `AllocFillRunAhead128`，68 KiB | 跨圈 slow path | PASS |
+| A5Sim | `AllocHeapBackPressure`，68 KiB | 等待、回收、真实数据 golden | PASS |
+| A5Sim | PA Case1，真实 kernel | 256 batch 数值 golden | PASS |
+| A5 | `AllocFillRunAhead67`，68 KiB | 首圈边界 | PASS |
+| A5 | `AllocFillRunAhead128`，68 KiB | 跨圈 slow path | PASS |
+| A5 | `AllocHeapBackPressure`，68 KiB | 等待、回收、真实数据 golden | PASS |
+| A5 | PA Case1，真实 kernel | 256 batch 数值 golden | PASS |
+
+PA A5Sim 的真实 kernel orchestration 约为 38.824 s。另一次带
+`--use-example-exec-time` 的 A5Sim 调度运行也 PASS，但该选项会跳过数值 golden，
+所以只作为控制流证据，不计入上表的正确性依据。
+
+MB6 需要保留两个基线问题，不能写成 PASS：
+
+1. `Normal` 已完成底层数值运行，但 `DistRuntimeContractMixin` 随后因没有捕获到
+   `[dist] DEPSIG` 而失败；当前 `src/`、`simpler_setup/` 和 runtime 构建源码中
+   查不到 `PTO_DIST_DEPSIG/DEPSIG` 实现，因此属于测试契约与当前 runtime 不匹配，
+   不能靠加 shell 环境变量伪造 oracle。
+2. `Heavy` 的 8 MiB/H=64 A5Sim 压力在运行中触发 native abort。保持全部参数
+   不变、只撤销生产 H1 后，基线同样以相同调用路径 abort；所以该失败不是 H1
+   引入，但也不能作为 H1 的通过项。`FullCore36` 在 Heavy 基线已经失败后未继续跑。
+
+综合现有证据，H1 已通过目标 PA 与真实 68 KiB 回卷/回收的 A5Sim+A5 golden，
+可以进入真实 PA 性能 A/B。MB6 的两项既有问题作为未关闭风险保留，不能被其他
+PASS 掩盖，也不在 H1 中顺手修改测试框架或 heap slow path。
+
+#### 7.1.8 真实 A5 PA Case1 十对性能 A/B
+
+真实性能使用提交前基线 `290dbda0` 的 detached 临时 worktree 和带 H1 的主
+worktree。两边均预先完成一次不计入统计的 warm run，随后按
+`baseline -> H1` 顺序采集 10 对独立 pytest 进程。统一条件为：
+
+- A5 device 0，真实 PA kernel，256 batch；
+- 用户 `/home/q00473782/.venv`、CANN 9.1、GCC 15；
+- PTO-ISA 固定为 `ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8`；
+- 开启 L2 swimlane，不使用 `--use-example-exec-time` 或 `--skip-golden`；
+- 每个进程统一 180 s timeout；双方均 10/10 PASS、0 timeout；
+- 为避免自动生成数百 MiB merged JSON 影响采集周转，双方仅在测试进程内对称地
+  关闭 post-case converter；设备执行和原始 `l2_swimlane_records.json` 不变；
+- 每个原始文件均有 122,880 个 Submit 事件，指标直接取最早 start 到最晚 end。
+
+预热样本为 baseline 5.134950 ms、H1 5.116055 ms，只验证两边构建和设备状态，
+不进入下面统计。10 对正式样本为：
+
+| 对次 | baseline（ms） | H1（ms） | 配对变化 |
+| ---: | ------------: | -------: | -------: |
+| 1 | 5.149955 | 5.301485 | +2.942% |
+| 2 | 5.331087 | 5.110060 | -4.146% |
+| 3 | 5.137861 | 5.098696 | -0.762% |
+| 4 | 5.150200 | 5.119599 | -0.594% |
+| 5 | 5.129350 | 5.112860 | -0.321% |
+| 6 | 5.146475 | 5.129671 | -0.327% |
+| 7 | 5.111929 | 5.105638 | -0.123% |
+| 8 | 5.274224 | 5.229773 | -0.843% |
+| 9 | 5.114477 | 5.137014 | +0.441% |
+| 10 | 5.125086 | 5.125040 | -0.001% |
+
+| 统计 | baseline（ms） | H1（ms） | 相对变化 |
+| ---- | ------------: | -------: | -------: |
+| 中位数 | 5.142168 | 5.122320 | -0.386% |
+| 均值 | 5.167064 | 5.146984 | -0.389% |
+| nearest-rank p90 | 5.274224 | 5.229773 | -0.843% |
+| 最小值 | 5.111929 | 5.098696 | - |
+| 最大值 | 5.331087 | 5.301485 | - |
+| 样本标准差 | 0.073960 | 0.065764 | - |
+
+H1 在 10 对中 8 胜 2 负；配对变化中位数为 -0.324%，均值为 -0.373%。第 1、2
+对分别有 +2.942% 和 -4.146% 的反向大波动，且采集顺序固定为 baseline 在前，
+因此这 10 对只能支持“小幅方向性收益”，不能声称统计上已经稳定到每轮必胜。
+与 standalone 的 -16.22% 中位数不同，真实 PA 的约 0.3%～0.4% 中心改善更符合
+固定删除少量 HeapGuard atomic 的规模；standalone 的巨大间接调度变化不应外推。
+
+最佳 H1 样本为第 3 对的 5.098696 ms，单独生成的泳道文件为：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260717_173313/
+merged_swimlane_heapguard_first_lap_fastpath_5.098696ms.json
+```
+
+原始 A/B 文件分别位于临时 baseline worktree 和主 worktree 的对应 timestamp
+目录。自动 converter 被关闭的正式样本仍保留 raw JSON；上述最佳样本在统计完成后
+单独补做了 converter，未重新执行 device workload。
+
+#### 7.1.9 H1 最终阶段决定
+
+H1 满足保留条件：正确性证明成立，standalone 三后端默认配置 PASS，真实
+A5Sim/A5 的 68 KiB 首圈/跨圈/回收 golden 与 PA Case1 golden 全部 PASS，真实
+A5 十对中心趋势和 p90 均未回退，并且直接 atomic 数量确定下降。因此将 standalone
+与生产同形改动、测试证据文档作为一个本地 commit 保存，不 push。
+
+真实性能收益较小且仍有单轮反向，不把 H1 宣传成大幅优化。下一阶段 F1 只研究
+fanin 依赖检查顺序；不得同时加入 ready cache 或退避，避免失去因果归属。

@@ -247,6 +247,14 @@ PA_DEVICE bool HeapGuard(
     bool waited = false;
     // 正常出口是 heap_next-vend 落入一个 ring；检测到不可能释放的覆盖或其他核 fatal 时返回失败。
     while (!IsFatal<Ops>(state)) {
+        // 逻辑 heap 尚未走完第一圈时，所有物理输出区间都位于 [0, heap_next)，
+        // 不可能覆盖此前分配；保留上面的 fatal 原子检查后，可直接跳过 frontier/vend 读取。
+        if (worker.heap_next <= ring) {
+            if constexpr (Profile) {
+                AccumulatePhase<true>(stats.result, ProfilePhase::HeapGuard, wait_begin, Ops::Now());
+            }
+            return true;
+        }
         const int64_t frontier = LoadLine<Ops>(state->frontier);
         const int64_t retire = frontier - static_cast<int64_t>(state->heap_window);
         const uint64_t vend = retire < 0 ? 0 : Ops::Load(&state->tasks[retire].vend);
