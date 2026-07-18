@@ -59,6 +59,10 @@ inline void RuntimeNop(uint32_t count) {
 }
 
 struct CpuOps {
+    // CPU 原子 built-in 在函数返回前已产生旧值；该后端只做协议回归，不把
+    // x86 时间分布外推到 A5。
+    static constexpr bool kAtomicReturnReadyObserved = true;
+
     // 用 fetch_add(0) 模拟 A5 atomicAdd(addr, 0) 原子读，而不是退化为普通
     // CPU load。Acquire/AcqRel 只建立本 CPU 协议回归需要的发布/观察关系，
     // 不模拟 A5 cache 或设备内存模型细节。
@@ -116,6 +120,13 @@ struct CpuOps {
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
                 .count()
         );
+    }
+
+    template <typename T>
+    static inline uint64_t NowAfterAtomicResult(T value) {
+        // 空 asm 让编译器保留返回值到计时点的数据依赖，不额外插入 CPU fence。
+        asm volatile("" : "+r"(value));
+        return Now();
     }
 
     static inline void Nop(uint32_t count) { RuntimeNop(count); }

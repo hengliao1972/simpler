@@ -40,10 +40,39 @@ PHASE_NAMES = {
     "Claim": "claim",
     "Fanin": "fanin",
     "Register": "register",
+    "Atomic": "atomic",
+    "ClockBaseline": "clock_baseline",
 }
 KERNEL_NAMES = {0: "QK", 1: "SF", 2: "PV", 3: "UP"}
 # 一个物理 mixed block 的三条 runtime lane：AIC、AIV0、AIV1。
 LANE_NAMES = {0: "AIC", 1: "AIV0", 2: "AIV1"}
+
+# Atomic raw ABI：auxiliary 存放调用点，flags 低 4 位存放操作类型。这里的
+# 数值必须与 standalone C++ AtomicSite/AtomicOp 枚举保持一致；未知值仍会
+# 以 site_<id>/op_<id> 完整导出，便于识别版本不匹配，不会伪装成已知操作。
+ATOMIC_SITE_NAMES = {
+    0: "startup_increment",
+    1: "startup_poll",
+    2: "fatal_poll",
+    3: "fatal_set",
+    4: "claim_max",
+    5: "fanin_flag_load",
+    6: "completion_vend_exchange",
+    7: "completion_flag_exchange",
+    8: "frontier_initial_load",
+    9: "frontier_flag_load",
+    10: "frontier_max",
+    11: "heap_frontier_load",
+    12: "heap_vend_load",
+    13: "replay_done_increment",
+    14: "replay_done_poll",
+}
+ATOMIC_OP_NAMES = {
+    0: "load",
+    1: "exchange",
+    2: "fetch_add",
+    3: "fetch_max",
+}
 
 
 # 把可转为整数的 raw 标量归一为 int，并在错误中保留精确字段路径。
@@ -56,7 +85,9 @@ def _integer(value: Any, label: str) -> int:
 
 
 # 读取 raw JSON，校验十列结构、字段范围与可转整数值，并返回规范化视图。
-def _load_and_validate(input_path: Path) -> tuple[int, list[tuple[Any, ...]], dict[tuple[int, int], int], int]:
+def _load_and_validate(
+    input_path: Path,
+) -> tuple[int, int, list[tuple[Any, ...]], dict[tuple[int, int], int], int]:
     # raw 文件沿用真实 l2_swimlane_records.json 的十列 fdwic_events ABI：
     # core、block、lane、task、func、phase、start、end、flags、aux。
     with input_path.open("r", encoding="utf-8") as input_file:
@@ -75,6 +106,11 @@ def _load_and_validate(input_path: Path) -> tuple[int, list[tuple[Any, ...]], di
     frequency_hz = _integer(metadata.get("clock_freq_hz"), "metadata.clock_freq_hz")
     if frequency_hz <= 0:
         raise ValueError("metadata.clock_freq_hz must be positive")
+    # v1 是旧 raw，Claim flags 只有 winner bit；v2 追加 attempted bit。
+    # 不认识的新版本直接拒绝，避免把新 flags 按旧语义误读。
+    trace_schema_version = _integer(metadata.get("trace_schema_version", 1), "metadata.trace_schema_version")
+    if trace_schema_version not in (1, 2):
+        raise ValueError(f"unsupported metadata.trace_schema_version: {trace_schema_version}")
     num_cores = _integer(metadata.get("num_cores"), "metadata.num_cores")
     if num_cores <= 0:
         raise ValueError("metadata.num_cores must be positive")
@@ -113,6 +149,11 @@ def _load_and_validate(input_path: Path) -> tuple[int, list[tuple[Any, ...]], di
             raise ValueError(f"fdwic_events[{index}] has invalid lane {lane}")
         if phase not in PHASE_NAMES:
             raise ValueError(f"fdwic_events[{index}] has unknown phase {phase!r}")
+        if phase == "Claim" and trace_schema_version >= 2:
+            if flags & ~0x3 or (flags & 0x1 and not flags & 0x2):
+                raise ValueError(
+                    f"fdwic_events[{index}] has invalid Claim flags 0x{flags:x}"
+                )
         if start_cycle <= 0 or end_cycle < start_cycle:
             raise ValueError(
                 f"fdwic_events[{index}] has invalid cycles start={start_cycle} end={end_cycle}"
@@ -140,7 +181,7 @@ def _load_and_validate(input_path: Path) -> tuple[int, list[tuple[Any, ...]], di
         )
 
     assert base_cycle is not None
-    return frequency_hz, rows, core_by_block_lane, base_cycle
+    return frequency_hz, trace_schema_version, rows, core_by_block_lane, base_cycle
 
 
 # 写一个 Chrome Trace Event，并统一处理数组元素间的逗号。
@@ -154,7 +195,7 @@ def _emit_event(output: TextIO, event: dict[str, Any], first: bool) -> bool:
 
 # 完成一次 raw 到 merged 的转换，成功时返回事件数、block 数和基准 cycle。
 def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
-    frequency_hz, rows, core_by_block_lane, base_cycle = _load_and_validate(input_path)
+    frequency_hz, trace_schema_version, rows, core_by_block_lane, base_cycle = _load_and_validate(input_path)
     # 禁止原地转换；否则创建临时文件或最终 replace 时可能破坏唯一一份 raw。
     if input_path.resolve() == output_path.resolve():
         raise ValueError("input and output paths must differ")
@@ -167,6 +208,20 @@ def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
     # Perfetto 的显示精度。1 GHz A5 counter 因此每 tick 对应 0.001 us。
     factor = 1_000_000.0 / float(frequency_hz)
     blocks = sorted({block_id for block_id, _ in core_by_block_lane})
+    # v1 raw 没有 Claim attempted bit。若同一份 capture 确实含逐 atomic
+    # 记录，则可以用同核、同 task 且时间被 Claim 完整包含的
+    # claim_max 作为实测证据恢复 attempted；不含 atomic 时保留 unknown，
+    # 绝不根据 task kind 或 AIC/AIV role 在转换器中猜业务路由。
+    legacy_claim_max_spans: dict[tuple[int, int, int, int], list[tuple[int, int]]] = {}
+    has_atomic_trace = False
+    if trace_schema_version == 1:
+        for core_id, block_id, lane, task_id, _, phase, start, end, _, auxiliary in rows:
+            if phase != "Atomic":
+                continue
+            has_atomic_trace = True
+            if auxiliary == 4:  # AtomicSite::ClaimMax
+                key = (core_id, block_id, lane, task_id)
+                legacy_claim_max_spans.setdefault(key, []).append((start, end))
     first = True
     emitted = 0
     # 临时文件的整个生命周期都在 try 内；包括 Ctrl-C 在内的异常都会先清理
@@ -211,13 +266,63 @@ def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
                             },
                             first,
                         )
-
             for row in rows:
                 core_id, block_id, lane, task_id, function_id, phase_raw, start, end, flags, auxiliary = row
                 phase = PHASE_NAMES[phase_raw]
-                # Kernel 和 Commit 放到 lane+3 的 kernel 子泳道；其他阶段留在
-                # lane 0..2 的 runtime 泳道。这与真实 PA merged 文件的布局一致。
-                if phase == "kernel" and function_id >= 0:
+                # Kernel/Commit 放到 lane+3 的计算单元子泳道；Atomic/ClockBaseline
+                # 都是 AIC/AIV 对应 scalar 上执行的指令，必须与 runtime 阶段共用
+                # lane 0..2。这样 atomic span 作为 Claim/Fanin/轮询等阶段的子区间
+                # 叠加显示，不会伪装成 AIC/AIV 之外的第三类执行单元。
+                if phase == "claim":
+                    claim_attempted: bool | None
+                    claim_attempted_source: str
+                    if trace_schema_version >= 2:
+                        claim_attempted = bool(flags & 0x2)
+                        claim_attempted_source = "raw_flag"
+                    elif has_atomic_trace:
+                        key = (core_id, block_id, lane, task_id)
+                        matched_claim_max = any(
+                            atomic_start >= start and atomic_end <= end
+                            for atomic_start, atomic_end in legacy_claim_max_spans.get(key, [])
+                        )
+                        # 命中的 claim_max 能正向证明 attempted；但 v1 raw 没有
+                        # 显式“atomic 记录完整”元数据，未命中不能反向证明
+                        # not_attempted，因此保留 unknown。
+                        claim_attempted = True if matched_claim_max else None
+                        claim_attempted_source = (
+                            "contained_claim_max"
+                            if matched_claim_max
+                            else "unknown_v1_without_matching_claim_max"
+                        )
+                    else:
+                        claim_attempted = None
+                        claim_attempted_source = "unknown_v1_without_atomic_trace"
+                    claim_won = bool(flags & 0x1)
+                    if claim_attempted is False:
+                        name = f"claim.not_attempted#{task_id}"
+                    elif claim_attempted is True:
+                        name = f"claim.{'won' if claim_won else 'lost'}#{task_id}"
+                    else:
+                        name = f"claim#{task_id}"
+                    thread_id = lane
+                elif phase == "atomic":
+                    atomic_site_id = auxiliary
+                    atomic_op_id = flags & 0xF
+                    atomic_site = ATOMIC_SITE_NAMES.get(atomic_site_id, f"site_{atomic_site_id}")
+                    atomic_op = ATOMIC_OP_NAMES.get(atomic_op_id, f"op_{atomic_op_id}")
+                    # 边界直接写入 span 名称，打开泳道后无需点开 args
+                    # 就能区分“本核返回值可消费”和“只包围源码发射”。
+                    atomic_boundary_tag = "return_ready" if flags & (1 << 6) else "source_issue"
+                    name = f"atomic.{atomic_boundary_tag}.{atomic_site}.{atomic_op}#{task_id}"
+                    thread_id = lane
+                elif phase == "clock_baseline":
+                    name = (
+                        "clock.atomic_return_dependency_hook"
+                        if flags & 1
+                        else "clock.consecutive_sys_cnt_reads"
+                    )
+                    thread_id = lane
+                elif phase == "kernel" and function_id >= 0:
                     name = f"{KERNEL_NAMES.get(function_id, f'f{function_id}')}#{task_id}"
                     thread_id = lane + 3
                 elif phase == "commit":
@@ -245,6 +350,67 @@ def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
                         "aux": auxiliary,
                     },
                 }
+                if phase == "atomic":
+                    # Atomic 的 flags/aux 有独立 ABI，不沿用普通 phase 的 mc 语义。
+                    # cycles 保留原始整数，避免 Perfetto dur 的微秒浮点换算丢失短 atomic 精度。
+                    event["args"] = {
+                        "phase": phase,
+                        "task_id": task_id,
+                        "func_id": function_id,
+                        "core": core_id,
+                        "site": atomic_site,
+                        "site_id": atomic_site_id,
+                        "op": atomic_op,
+                        "op_id": atomic_op_id,
+                        "cycles": end - start,
+                        "result_used": bool(flags & (1 << 4)),
+                        "return_ready_observed": bool(flags & (1 << 6)),
+                        "completion_boundary": (
+                            "return_value_ready"
+                            if flags & (1 << 6)
+                            else "source_issue_bracket"
+                        ),
+                        "flags": flags,
+                        "execution_unit": "scalar",
+                    }
+                    # 分类同样带边界，便于 Perfetto 过滤和分组；二者
+                    # 仍在同一 AIC/AIV scalar lane，不伪造并行执行单元。
+                    event["cat"] = f"atomic.{atomic_boundary_tag}"
+                    # bit5 只对 Load 有意义；bits8..31 只对 FetchMax 表示饱和后的 retry 数。
+                    if atomic_op_id == 0:
+                        event["args"]["value_zero"] = bool(flags & (1 << 5))
+                    if atomic_op_id == 3:
+                        event["args"]["retries"] = (flags >> 8) & 0xFFFFFF
+                elif phase == "claim":
+                    event["args"] = {
+                        "phase": phase,
+                        "task_id": task_id,
+                        "func_id": function_id,
+                        "core": core_id,
+                        "claim_attempted": claim_attempted,
+                        "claim_won": claim_won,
+                        "claim_attempted_source": claim_attempted_source,
+                        "claim_path": "alloc" if auxiliary == 1 else "kernel",
+                        "execution_unit": "scalar",
+                        "flags": flags,
+                    }
+                    event["cat"] = "scalar_scheduler"
+                elif phase == "clock_baseline":
+                    dependency_hook = bool(flags & 1)
+                    event["args"] = {
+                        "phase": phase,
+                        "core": core_id,
+                        "ticks": end - start,
+                        "clock_freq_hz": frequency_hz,
+                        "definition": (
+                            "atomic-return-dependency-hook"
+                            if dependency_hook
+                            else "consecutive-sys-cnt-reads"
+                        ),
+                        "dependency_applied": bool(flags & 2) if dependency_hook else False,
+                        "execution_unit": "scalar",
+                    }
+                    event["cat"] = "scalar_clock"
                 first = _emit_event(output, event, first)
                 emitted += 1
             output.write("\n]}\n")

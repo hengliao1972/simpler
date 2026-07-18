@@ -64,35 +64,44 @@ PA_DEVICE uint32_t CountBits(uint32_t value) {
 }
 
 template <typename Ops>
-PA_DEVICE int64_t LoadLine(PA_GM AtomicLine &line) {
+PA_DEVICE int64_t LoadLine(
+    PA_GM AtomicLine &line, LocalStats &stats, AtomicSite site, int32_t task_id = -1
+) {
     // Ops::Load 在 A5 后端是 atomicAdd(0)；返回值是该 RMW 线性化时观察到的共享值。
-    return Ops::Load(&line.value);
+    return TraceAtomicLoad<Ops>(stats.trace, stats.result, task_id, site, &line.value);
 }
 
 template <typename Ops>
-PA_DEVICE int32_t LoadLine(PA_GM AtomicFlagLine &line) {
-    return Ops::Load(&line.value);
+PA_DEVICE int32_t LoadLine(
+    PA_GM AtomicFlagLine &line, LocalStats &stats, AtomicSite site, int32_t task_id = -1
+) {
+    return TraceAtomicLoad<Ops>(stats.trace, stats.result, task_id, site, &line.value);
 }
 
 template <typename Ops>
-PA_DEVICE void SetFatal(PA_GM SchedulerState *state) {
+PA_DEVICE void SetFatal(PA_GM SchedulerState *state, LocalStats &stats, int32_t task_id = -1) {
     // fatal 只从 0 单调置 1，重复 Exchange 不会把其他 worker 已观察到的失败状态清除。
-    Ops::Exchange(&state->fatal.value, static_cast<int32_t>(1));
+    TraceAtomicExchange<Ops>(
+        stats.trace, stats.result, task_id, AtomicSite::FatalSet, &state->fatal.value,
+        static_cast<int32_t>(1)
+    );
 }
 
 template <typename Ops>
-PA_DEVICE bool IsFatal(PA_GM SchedulerState *state) {
-    return LoadLine<Ops>(state->fatal) != 0;
+PA_DEVICE bool IsFatal(PA_GM SchedulerState *state, LocalStats &stats, int32_t task_id = -1) {
+    return LoadLine<Ops>(state->fatal, stats, AtomicSite::FatalPoll, task_id) != 0;
 }
 
 template <typename Ops>
-PA_DEVICE bool WatchdogExpired(PA_GM SchedulerState *state, uint64_t begin, uint32_t &polls) {
+PA_DEVICE bool WatchdogExpired(
+    PA_GM SchedulerState *state, LocalStats &stats, uint64_t begin, uint32_t &polls
+) {
     // 每 1024 次自旋才读取系统计数器，降低正常启动屏障上的计时开销；超时后向所有 worker 广播 fatal。
     ++polls;
     if ((polls & 1023U) != 0 || Ops::Now() - begin <= kWatchdogTicks) {
         return false;
     }
-    SetFatal<Ops>(state);
+    SetFatal<Ops>(state, stats);
     return true;
 }
 
@@ -101,20 +110,28 @@ PA_DEVICE void AdvanceFrontier(PA_GM SchedulerState *state, LocalStats &stats) {
     // frontier 只表示“从 task 0 开始已经连续完成”的最高 task id，不能越过尚未发布 flag 的空洞。
     // 多个完成者可以同时扫描同一段连续区间，FetchMax 保证共享 frontier 只前进、不回退。
     ++stats.result.frontier_initial_loads;
-    int64_t frontier = LoadLine<Ops>(state->frontier);
+    int64_t frontier = LoadLine<Ops>(
+        state->frontier, stats, AtomicSite::FrontierInitialLoad
+    );
     while (true) {
         const int64_t next = frontier + 1;
         if (next < 0 || next >= static_cast<int64_t>(kTaskCellCapacity)) {
             break;
         }
-        if (Ops::Load(&state->tasks[next].flag) == 0) {
+        if (TraceAtomicLoad<Ops>(
+                stats.trace, stats.result, static_cast<int32_t>(next), AtomicSite::FrontierFlagLoad,
+                &state->tasks[next].flag
+            ) == 0) {
             ++stats.result.frontier_terminal_loads;
             break;
         }
         uint64_t retries = 0;
         // FetchMax 返回更新前的值；若其他核已经走得更远，就从其 old 值继续扫描，避免重复从 next 起步。
         ++stats.result.frontier_updates;
-        const int64_t old = Ops::FetchMax(&state->frontier.value, next, retries);
+        const int64_t old = TraceAtomicFetchMax<Ops>(
+            stats.trace, stats.result, static_cast<int32_t>(next), AtomicSite::FrontierMax,
+            &state->frontier.value, next, retries
+        );
         stats.result.cas_retries += retries;
         frontier = old > next ? old : next;
     }
@@ -126,9 +143,15 @@ PA_DEVICE void CompleteTask(
 ) {
     // 完成发布顺序与 PA 一致：先公布该 worker 的 heap 游标，再发布 ready flag，最后推进连续 frontier。
     // fanin 和 heap 回收方以 flag/frontier 为可见性条件，因此不能交换 vend 与 flag 的先后关系。
-    Ops::Exchange(&state->tasks[task_id].vend, worker.heap_next);
+    TraceAtomicExchange<Ops>(
+        stats.trace, stats.result, static_cast<int32_t>(task_id), AtomicSite::CompletionVendExchange,
+        &state->tasks[task_id].vend, worker.heap_next
+    );
     Ops::StoreBarrier();
-    Ops::Exchange(&state->tasks[task_id].flag, 1);
+    TraceAtomicExchange<Ops>(
+        stats.trace, stats.result, static_cast<int32_t>(task_id), AtomicSite::CompletionFlagExchange,
+        &state->tasks[task_id].flag, static_cast<int64_t>(1)
+    );
     AdvanceFrontier<Ops>(state, stats);
 }
 
@@ -136,7 +159,11 @@ template <typename Ops>
 PA_DEVICE bool SlotReady(PA_GM SchedulerState *state, PA_GM LocalSlot &slot, LocalStats &stats) {
     // 每个 fanin flag 都是跨核共享的完成条件；遇到第一个未就绪依赖即返回，后续 drain 会再次轮询。
     for (uint32_t index = 0; index < slot.fanin_count; ++index) {
-        if (Ops::Load(&state->tasks[slot.fanin[index]].flag) == 0) {
+        const int32_t dependency = slot.fanin[index];
+        if (TraceAtomicLoad<Ops>(
+                stats.trace, stats.result, dependency, AtomicSite::FaninFlagLoad,
+                &state->tasks[dependency].flag
+            ) == 0) {
             ++stats.result.fanin_not_ready_loads;
             return false;
         }
@@ -250,7 +277,7 @@ PA_DEVICE bool HeapGuard(
     const uint64_t wait_begin = Ops::Now();
     bool waited = false;
     // 正常出口是 heap_next-vend 落入一个 ring；检测到不可能释放的覆盖或其他核 fatal 时返回失败。
-    while (!IsFatal<Ops>(state)) {
+    while (!IsFatal<Ops>(state, stats, static_cast<int32_t>(task_id))) {
         // 逻辑 heap 尚未走完第一圈时，所有物理输出区间都位于 [0, heap_next)，
         // 不可能覆盖此前分配；保留上面的 fatal 原子检查后，可直接跳过 frontier/vend 读取。
         if (worker.heap_next <= ring) {
@@ -259,9 +286,16 @@ PA_DEVICE bool HeapGuard(
             }
             return true;
         }
-        const int64_t frontier = LoadLine<Ops>(state->frontier);
+        const int64_t frontier = LoadLine<Ops>(
+            state->frontier, stats, AtomicSite::HeapFrontierLoad, static_cast<int32_t>(task_id)
+        );
         const int64_t retire = frontier - static_cast<int64_t>(state->heap_window);
-        const uint64_t vend = retire < 0 ? 0 : Ops::Load(&state->tasks[retire].vend);
+        const uint64_t vend = retire < 0
+            ? 0
+            : TraceAtomicLoad<Ops>(
+                  stats.trace, stats.result, static_cast<int32_t>(task_id), AtomicSite::HeapVendLoad,
+                  &state->tasks[retire].vend
+              );
         if (worker.heap_next - vend <= ring) {
             if (waited) {
                 ++stats.result.wait_events[1];
@@ -276,7 +310,7 @@ PA_DEVICE bool HeapGuard(
             return true;
         }
         if (frontier >= static_cast<int64_t>(task_id) - 1) {
-            SetFatal<Ops>(state);
+            SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
             return false;
         }
         waited = true;
@@ -307,7 +341,8 @@ struct ClaimOutcome {
 
 template <typename Ops>
 PA_DEVICE ClaimOutcome Claim(
-    PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_id, TaskKind kind
+    PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_id, TaskKind kind,
+    LocalStats &stats
 ) {
     // Claim 在四个 shard 的单调 cursor 上执行 atomicMax：同一 task 只有观察到旧值更小的竞争者获胜。
     // Alloc 由全部 96 个 worker 竞争；QK/PV 仅 32 个 AIC，SF/UP 仅 64 个 AIV 进入真正的 atomicMax。
@@ -350,7 +385,10 @@ PA_DEVICE ClaimOutcome Claim(
     }
     outcome.attempted = true;
     // atomicMax 返回写入前的 cursor：old<task_id 表示本核完成首次推进并获胜，old>=task_id 则必须 Replay。
-    const int64_t old = Ops::FetchMax(&cursor->value, static_cast<int64_t>(task_id), outcome.retries);
+    const int64_t old = TraceAtomicFetchMax<Ops>(
+        stats.trace, stats.result, static_cast<int32_t>(task_id), AtomicSite::ClaimMax,
+        &cursor->value, static_cast<int64_t>(task_id), outcome.retries
+    );
     outcome.won = old < static_cast<int64_t>(task_id);
     if (!outcome.won) outcome.function_id = -1;
     return outcome;
@@ -381,7 +419,7 @@ PA_DEVICE bool BuildWinner(
     }
     const int32_t slot_index = FindFreeSlot(worker);
     if (slot_index < 0) {
-        SetFatal<Ops>(state);
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
     PA_GM LocalSlot &slot = worker.slots[slot_index];
@@ -437,7 +475,7 @@ PA_DEVICE bool SubmitTask(
     ResetTraceLap<Ops>(worker);
     const uint64_t materialize_begin = Ops::Now();
     if (!MaterializeTask(worker, task_id, args, context, state->heap_base, state->heap_size)) {
-        SetFatal<Ops>(state);
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
     const uint64_t materialize_end = Ops::Now();
@@ -470,14 +508,15 @@ PA_DEVICE bool SubmitTask(
         );
 
         const uint64_t claim_begin = Ops::Now();
-        const ClaimOutcome claim = Claim<Ops>(state, worker, task_id, kind);
+        const ClaimOutcome claim = Claim<Ops>(state, worker, task_id, kind, stats);
         winner = claim.won;
         context.won = winner;
         context.kernel_id = claim.function_id;
         const uint64_t claim_end = Ops::Now();
         WriteTrace<Profile>(
             stats.trace, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::Claim,
-            ProfilePhase::Claim, claim_begin, claim_end, winner ? 1U : 0U, 1
+            ProfilePhase::Claim, claim_begin, claim_end,
+            (winner ? kClaimWon : 0U) | (claim.attempted ? kClaimAttempted : 0U), 1
         );
         RecordClaimOutcome(stats, kind, claim);
         if (winner) {
@@ -500,7 +539,7 @@ PA_DEVICE bool SubmitTask(
         }
     } else {
         const uint64_t claim_begin = Ops::Now();
-        const ClaimOutcome claim = Claim<Ops>(state, worker, task_id, kind);
+        const ClaimOutcome claim = Claim<Ops>(state, worker, task_id, kind, stats);
         winner = claim.won;
         function_id = claim.function_id;
         context.won = winner;
@@ -508,7 +547,8 @@ PA_DEVICE bool SubmitTask(
         const uint64_t claim_end = Ops::Now();
         WriteTrace<Profile>(
             stats.trace, stats.result, static_cast<int32_t>(task_id), function_id, TracePhase::Claim,
-            ProfilePhase::Claim, claim_begin, claim_end, winner ? 1U : 0U, 0
+            ProfilePhase::Claim, claim_begin, claim_end,
+            (winner ? kClaimWon : 0U) | (claim.attempted ? kClaimAttempted : 0U), 0
         );
         RecordClaimOutcome(stats, kind, claim);
 
@@ -636,6 +676,7 @@ PA_DEVICE void PublishResult(PA_GM WorkerResult &destination, const WorkerResult
     PA_PUBLISH_FIELD(frontier_initial_loads);
     PA_PUBLISH_FIELD(frontier_updates);
     PA_PUBLISH_FIELD(frontier_terminal_loads);
+    PA_PUBLISH_FIELD(atomic_trace_calls);
 #undef PA_PUBLISH_FIELD
     Ops::StoreBarrier();
 }
@@ -679,14 +720,18 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 
     // 96 个参与者全部完成本地状态初始化后再进入 task 0，主要用于压低启动偏斜对
     // winner 分布和 Submit 时序的干扰；atomicMax 的唯一 winner 正确性本身不依赖该屏障。
-    Ops::FetchAdd(&state->started_count.value, 1);
+    TraceAtomicFetchAdd<Ops>(
+        stats.trace, stats.result, -1, AtomicSite::StartupIncrement,
+        &state->started_count.value, 1
+    );
     const uint64_t start_wait = Ops::Now();
     uint32_t start_polls = 0;
     // 全员到齐或任一核发布 fatal 即退出启动等待；watchdog 防止缺失参与者造成永久挂死。
-    while (LoadLine<Ops>(state->started_count) < static_cast<int64_t>(state->config.workers) &&
-           !IsFatal<Ops>(state)) {
+    while (LoadLine<Ops>(state->started_count, stats, AtomicSite::StartupPoll) <
+               static_cast<int64_t>(state->config.workers) &&
+           !IsFatal<Ops>(state, stats)) {
         Ops::SpinHint();
-        if (WatchdogExpired<Ops>(state, start_wait, start_polls)) {
+        if (WatchdogExpired<Ops>(state, stats, start_wait, start_polls)) {
             break;
         }
     }
@@ -696,7 +741,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     PaOrchestrationState orchestration;
     TaskArgs args;
     SubmitContext context;
-    if (!IsFatal<Ops>(state)) {
+    if (!IsFatal<Ops>(state, stats)) {
         // Case1 每个 batch 固定回放 Alloc/QK/SF/PV/UP 五个 task；所有 worker 顺序相同，执行 lane 由 Claim 筛选。
         ResetTraceLap<Ops>(worker);
         InitPaOrchestration(orchestration, batches, &state->context_lens[0]);
@@ -760,12 +805,16 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     }
 
     // replay_done 表示所有 worker 已退出回放循环（成功路径即完整提交）；之后仍需 drain 到本核 slot 为空。
-    Ops::FetchAdd(&state->replay_done.value, 1);
+    TraceAtomicFetchAdd<Ops>(
+        stats.trace, stats.result, -1, AtomicSite::ReplayDoneIncrement,
+        &state->replay_done.value, 1
+    );
     while (true) {
         const uint32_t freed =
             DrainReady<Ops>(state, worker, DrainPlace::FinalDrain, stats);
         const bool all_replayed =
-            LoadLine<Ops>(state->replay_done) >= static_cast<int64_t>(state->config.workers);
+            LoadLine<Ops>(state->replay_done, stats, AtomicSite::ReplayDonePoll) >=
+            static_cast<int64_t>(state->config.workers);
         // 必须同时满足“无人再生产新 slot”和“本核旧 slot 全部完成”，否则继续帮助系统推进 completion。
         if (all_replayed && worker.occupied_count == 0) {
             break;
@@ -773,6 +822,28 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         if (freed == 0) {
             Ops::SpinHint();
         }
+    }
+
+    if (stats.trace.atomics_enabled) {
+        // 两条基线都放在最终 drain 之后。第一条量连续
+        // SYS_CNT，第二条量返回依赖钩子的固定成本；它们只描述计时底噪，不能
+        // 从每条 atomic 中机械相减后宣称得到跨核全局可见性延迟。
+        const uint64_t clock_begin = Ops::Now();
+        const uint64_t clock_end = Ops::Now();
+        WriteTrace<false>(
+            stats.trace, stats.result, -1, -1, TracePhase::ClockBaseline,
+            ProfilePhase::ReplayTail, clock_begin, clock_end
+        );
+        const uint64_t dependency_begin = Ops::Now();
+        const uint64_t dependency_end = Ops::NowAfterAtomicResult(
+            static_cast<uint64_t>(worker_id)
+        );
+        WriteTrace<false>(
+            stats.trace, stats.result, -1, -1, TracePhase::ClockBaseline,
+            ProfilePhase::ReplayTail, dependency_begin, dependency_end,
+            kClockAtomicDependency |
+                (Ops::kAtomicReturnReadyObserved ? kClockAtomicDependencyApplied : 0U)
+        );
     }
 
     // PA writes swimlane records through the ordinary GM cache and explicitly

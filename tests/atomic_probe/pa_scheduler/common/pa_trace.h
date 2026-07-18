@@ -28,6 +28,7 @@ struct TraceContext {
     PA_GM TraceCoreState *core;
     PA_GM TraceRecord *records;
     uint32_t capacity;
+    bool atomics_enabled;
     int32_t lane;
     int32_t block_id;
     int32_t core_idx;
@@ -39,11 +40,12 @@ template <typename Ops>
 PA_DEVICE TraceContext AttachTrace(
     PA_GM SchedulerState *state, PA_GM const WorkerState &worker, uint32_t worker_id
 ) {
-    TraceContext trace{nullptr, nullptr, 0, worker.lane, worker.block_id, static_cast<int32_t>(worker_id)};
+    TraceContext trace{nullptr, nullptr, 0, false, worker.lane, worker.block_id, static_cast<int32_t>(worker_id)};
     Ops::InvalidateRegion(&state->config, sizeof(state->config));
     const uint64_t base = state->config.trace_base;
     const uint32_t capacity = state->config.trace_records_per_core;
-    if (state->config.trace_enabled == 0 || base == 0 || capacity == 0 || worker_id >= kWorkers) {
+    if ((state->config.trace_enabled & kTracePhasesEnabled) == 0 || base == 0 || capacity == 0 ||
+        worker_id >= kWorkers) {
         return trace;
     }
     PA_GM TraceHeader *header = reinterpret_cast<PA_GM TraceHeader *>(base);
@@ -55,9 +57,113 @@ PA_DEVICE TraceContext AttachTrace(
     // 成功返回的不变量是 core/records/capacity 同时有效；任一前置条件失败则三者
     // 保持空值，后续 WriteTrace/FlushTraceCore 可无分支地安全退化为 no-op。
     trace.capacity = capacity;
+    trace.atomics_enabled = (state->config.trace_enabled & kTraceAtomicsEnabled) != 0;
     trace.core->count = 0;
     trace.core->dropped = 0;
     return trace;
+}
+
+template <bool Profile>
+PA_DEVICE void WriteTrace(
+    TraceContext &trace, WorkerResult &result, int32_t task_id, int32_t function_id,
+    TracePhase trace_phase, ProfilePhase profile_phase, uint64_t start_cycle, uint64_t end_cycle,
+    uint32_t flags = 0, uint32_t auxiliary = 0
+);
+
+PA_DEVICE uint32_t AtomicTraceFlags(
+    AtomicOp op, bool result_used, bool return_ready, bool value_zero = false,
+    uint64_t retries = 0
+) {
+    // 高 24 bit 只能容纳有限重试次数；A5 硬件 atomicMax 当前报告 0，CPU CAS
+    // 回归若超过范围则饱和，避免溢出覆盖低位的 op/语义标志。
+    constexpr uint64_t kMaxRetries = (1ULL << (32 - kAtomicRetriesShift)) - 1;
+    const uint32_t encoded_retries = static_cast<uint32_t>(retries > kMaxRetries ? kMaxRetries : retries);
+    return static_cast<uint32_t>(op) | (result_used ? kAtomicResultUsed : 0U) |
+           (value_zero ? kAtomicValueZero : 0U) | (return_ready ? kAtomicReturnReady : 0U) |
+           (encoded_retries << kAtomicRetriesShift);
+}
+
+template <typename Ops>
+PA_DEVICE void WriteAtomicTrace(
+    TraceContext &trace, WorkerResult &result, int32_t task_id, AtomicSite site, AtomicOp op,
+    uint64_t start_cycle, uint64_t end_cycle, bool result_used, bool return_ready,
+    bool value_zero = false, uint64_t retries = 0
+) {
+    // 一次源码 atomic 只写一条同时含 start/end 的 span；结束时间先于 64B record
+    // 写入，因此本条区间不直接包含自己的记录写开销，但下一次竞争到达会受它影响。
+    ++result.atomic_trace_calls;
+    WriteTrace<false>(
+        trace, result, task_id, -1, TracePhase::Atomic, ProfilePhase::ReplayTail,
+        start_cycle, end_cycle,
+        AtomicTraceFlags(op, result_used, return_ready, value_zero, retries),
+        static_cast<uint32_t>(site)
+    );
+}
+
+template <typename Ops, typename T>
+PA_DEVICE T TraceAtomicLoad(
+    TraceContext &trace, WorkerResult &result, int32_t task_id, AtomicSite site,
+    PA_GM volatile T *address, bool result_used = true
+) {
+    if (!trace.atomics_enabled) return Ops::Load(address);
+    const uint64_t begin = Ops::Now();
+    const T old = Ops::Load(address);
+    // CCEC 只在返回值本来就参与协议判断时插入一条依赖 MOV，再读 SYS_CNT。
+    // 这样不会把未消费返回值的 RED/no-return 路径强制改成返回型 ATOM。
+    const bool return_ready = result_used && Ops::kAtomicReturnReadyObserved;
+    const uint64_t end = result_used ? Ops::NowAfterAtomicResult(old) : Ops::Now();
+    WriteAtomicTrace<Ops>(
+        trace, result, task_id, site, AtomicOp::Load, begin, end, result_used, return_ready,
+        old == static_cast<T>(0)
+    );
+    return old;
+}
+
+template <typename Ops, typename T>
+PA_DEVICE T TraceAtomicExchange(
+    TraceContext &trace, WorkerResult &result, int32_t task_id, AtomicSite site,
+    PA_GM volatile T *address, T value, bool result_used = false
+) {
+    if (!trace.atomics_enabled) return Ops::Exchange(address, value);
+    const uint64_t begin = Ops::Now();
+    const T old = Ops::Exchange(address, value);
+    const uint64_t end = Ops::Now();
+    WriteAtomicTrace<Ops>(
+        trace, result, task_id, site, AtomicOp::Exchange, begin, end, result_used, false
+    );
+    return old;
+}
+
+template <typename Ops>
+PA_DEVICE int64_t TraceAtomicFetchAdd(
+    TraceContext &trace, WorkerResult &result, int32_t task_id, AtomicSite site,
+    PA_GM volatile int64_t *address, int64_t value, bool result_used = false
+) {
+    if (!trace.atomics_enabled) return Ops::FetchAdd(address, value);
+    const uint64_t begin = Ops::Now();
+    const int64_t old = Ops::FetchAdd(address, value);
+    const uint64_t end = Ops::Now();
+    WriteAtomicTrace<Ops>(
+        trace, result, task_id, site, AtomicOp::FetchAdd, begin, end, result_used, false
+    );
+    return old;
+}
+
+template <typename Ops>
+PA_DEVICE int64_t TraceAtomicFetchMax(
+    TraceContext &trace, WorkerResult &result, int32_t task_id, AtomicSite site,
+    PA_GM volatile int64_t *address, int64_t value, uint64_t &retries, bool result_used = true
+) {
+    if (!trace.atomics_enabled) return Ops::FetchMax(address, value, retries);
+    const uint64_t begin = Ops::Now();
+    const int64_t old = Ops::FetchMax(address, value, retries);
+    const bool return_ready = result_used && Ops::kAtomicReturnReadyObserved;
+    const uint64_t end = result_used ? Ops::NowAfterAtomicResult(old) : Ops::Now();
+    WriteAtomicTrace<Ops>(
+        trace, result, task_id, site, AtomicOp::FetchMax, begin, end, result_used,
+        return_ready, false, retries
+    );
+    return old;
 }
 
 template <bool Profile>
@@ -83,8 +189,8 @@ PA_DEVICE void AccumulatePhase(
 template <bool Profile>
 PA_DEVICE void WriteTrace(
     TraceContext &trace, WorkerResult &result, int32_t task_id, int32_t function_id, TracePhase trace_phase,
-    ProfilePhase profile_phase, uint64_t start_cycle, uint64_t end_cycle, uint32_t flags = 0,
-    uint32_t auxiliary = 0
+    ProfilePhase profile_phase, uint64_t start_cycle, uint64_t end_cycle, uint32_t flags,
+    uint32_t auxiliary
 ) {
     // 每段先更新轻量 phase 统计，再按需写 64-byte 原始记录。一个分区只有对应
     // worker 写入，因此 count/dropped 保持普通单写者更新，不额外引入 atomic。

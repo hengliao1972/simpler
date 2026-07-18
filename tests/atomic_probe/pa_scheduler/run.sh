@@ -30,12 +30,17 @@ Benchmark options:
   --nop-counts QK,SF,PV,UP
   --profile-phases
   --analyze-swimlane
+  --trace-atomics
   --swimlane-json FILE
   --no-swimlane
 
 CCEC-only PMU probe options (the host must be launched by msprof PipeUtilization):
   --pmu-window off|empty|scalar|scalar-double
   --pmu-scalar-nops N
+
+The swimlane action enables atomic tracing by default. For the lower-level run
+action, --trace-atomics still requires swimlane tracing; add
+--analyze-swimlane to print the per-role/per-site timing distributions.
 
 The swimlane action performs exactly one run and writes both the raw capture
 and merged Perfetto JSON below this directory's outputs/ folder. It rejects
@@ -185,7 +190,9 @@ case "$ACTION" in
             mkdir -p "$BACKEND_OUTPUT"
             # runner 先执行单轮严格语义校验并流式写 raw；成功后才调用本地
             # converter 生成 Perfetto 文件。set -e 保证任一步失败即停止。
-            run_backend "$backend" --runs 1 --swimlane-json "$RAW_JSON" "$@"
+            # 用户要求泳道默认带齐逐 atomic 性能。重复传入 --trace-atomics
+            # 只是幂等布尔开关，不会产生两份记录；直接 run 仍可选择 phase-only。
+            run_backend "$backend" --runs 1 --trace-atomics --swimlane-json "$RAW_JSON" "$@"
             "$PYTHON_BIN" "$SCRIPT_DIR/swimlane_converter.py" "$RAW_JSON" -o "$MERGED_JSON"
         done
         echo "[SWIMLANE] output_root=$OUTPUT_ROOT"

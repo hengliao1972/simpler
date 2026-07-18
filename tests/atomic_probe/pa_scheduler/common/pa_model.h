@@ -56,6 +56,16 @@ constexpr uint32_t kTaskWindow = 1 << 10;
 constexpr uint32_t kTaskWindowMask = kTaskWindow - 1;
 constexpr uint64_t kSystemCounterHz = 1000000000ULL;
 constexpr uint64_t kWatchdogTicks = 2 * kSystemCounterHz;
+// trace_enabled 是位图而不是 bool：bit0 保持既有阶段泳道，bit1 额外开启
+// 逐条 atomic 源码括号记录。atomic 记录依赖同一份 trace buffer，因此 bit1
+// 只能与 bit0 一起配置。
+constexpr uint32_t kTracePhasesEnabled = 1U << 0;
+constexpr uint32_t kTraceAtomicsEnabled = 1U << 1;
+// Claim trace flags 是独立 raw ABI：bit0 表示获胜，bit1 表示已经通过
+// AIC/AIV role 路由并真正执行 atomicMax。未 attempted 的 Claim 仍保留
+// role-selection 开销，但转换器会明确标成 claim.not_attempted。
+constexpr uint32_t kClaimWon = 1U << 0;
+constexpr uint32_t kClaimAttempted = 1U << 1;
 // 下列 offset/size 来自真实 DistGlobal/DistCore ABI。standalone 保留被测关键字段的
 // offset、DistCore ABI 和 kRealDistGlobalBytes 总跨度；其余区域可用 opaque padding，
 // 并不是对生产结构全部字段的逐一镜像。
@@ -192,7 +202,52 @@ enum class TracePhase : int32_t {
     Claim = 11,
     Fanin = 12,
     Register = 13,
+    Atomic = 14,
+    // 逐 atomic 诊断构建中，每个 worker 只记录一次连续两次 SYS_CNT 的
+    // 空括号，用来给出同一二进制、同一物理核上的计时分辨率下限。
+    ClockBaseline = 15,
 };
+
+// AtomicSite 按 standalone PA 中真实出现的源码调用点分类。编号写入 TraceRecord::auxiliary，
+// 是离线泳道 schema 的一部分；追加新位置只能在 Count 前扩展，不能重排既有值。
+enum class AtomicSite : uint32_t {
+    StartupIncrement = 0,
+    StartupPoll = 1,
+    FatalPoll = 2,
+    FatalSet = 3,
+    ClaimMax = 4,
+    FaninFlagLoad = 5,
+    CompletionVendExchange = 6,
+    CompletionFlagExchange = 7,
+    FrontierInitialLoad = 8,
+    FrontierFlagLoad = 9,
+    FrontierMax = 10,
+    HeapFrontierLoad = 11,
+    HeapVendLoad = 12,
+    ReplayDoneIncrement = 13,
+    ReplayDonePoll = 14,
+    Count = 15,
+};
+
+// Atomic 记录 flags 的低四位保存操作种类；bit4 表示返回值参与后续判断，
+// bit5 表示 Load 观察到零，bit6 表示结束时间已由返回值依赖推进到
+// return-ready 边界，bits[31:8] 保存 FetchMax 的软件重试数（饱和）。
+enum class AtomicOp : uint32_t {
+    Load = 0,
+    Exchange = 1,
+    FetchAdd = 2,
+    FetchMax = 3,
+};
+constexpr uint32_t kAtomicOpMask = 0x0fU;
+constexpr uint32_t kAtomicResultUsed = 1U << 4;
+constexpr uint32_t kAtomicValueZero = 1U << 5;
+constexpr uint32_t kAtomicReturnReady = 1U << 6;
+constexpr uint32_t kAtomicRetriesShift = 8;
+
+// ClockBaseline 的 bit0 区分普通连续 SYS_CNT 与后端的 atomic 返回依赖
+// 计时钩子；后者用于量化那一条依赖 MOV 自身带来的固定底噪。
+constexpr uint32_t kClockAtomicDependency = 1U << 0;
+constexpr uint32_t kClockAtomicDependencyApplied = 1U << 1;
 
 struct alignas(64) TraceCoreState {
     volatile uint32_t count;
@@ -509,6 +564,10 @@ struct alignas(64) WorkerResult {
     uint64_t frontier_initial_loads;
     uint64_t frontier_updates;
     uint64_t frontier_terminal_loads;
+
+    // 仅在 trace_enabled bit1 开启时递增；每次源码 atomic 调用恰好增加一，
+    // host 用它与 Atomic span 数逐 worker 闭合，禁止把丢记录的泳道当成完整结果。
+    uint64_t atomic_trace_calls;
 };
 // WorkerResult 是 standalone 尾部的诊断 sidecar，不属于真实 DistCore ABI；按
 // cache line 隔离后，各 worker 发布统计不会相互覆盖或污染被测共享状态。
@@ -516,6 +575,7 @@ static_assert(sizeof(WorkerResult) == 768, "WorkerResult diagnostics must occupy
 static_assert(offsetof(WorkerResult, pmu_total_cycles) == 680, "WorkerResult PMU offset mismatch");
 static_assert(offsetof(WorkerResult, pmu_status) == 700, "WorkerResult PMU status offset mismatch");
 static_assert(offsetof(WorkerResult, fanin_not_ready_loads) == 704, "WorkerResult atomic diagnostic offset mismatch");
+static_assert(offsetof(WorkerResult, atomic_trace_calls) == 736, "WorkerResult atomic trace offset mismatch");
 
 // 从 cube_cursor 到 workers 结束保留关键字段 offset、DistCore ABI 和生产总字节跨度，
 // 并非字段级完整镜像。RunConfig、输入 context_lens 与校验结果追加在该跨度之后，

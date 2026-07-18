@@ -35,6 +35,7 @@ struct Options {
     NopCounts nops{kDefaultQkNops, kDefaultSfNops, kDefaultPvNops, kDefaultUpNops};
     bool profile_phases = false;
     bool trace_enabled = true;
+    bool trace_atomics = false;
     bool analyze_swimlane = false;
 };
 
@@ -84,7 +85,7 @@ inline void PrintUsage(const char *program, bool require_kernel) {
     std::fprintf(
         stderr,
         "[--nop-count N | --nop-counts QK,SF,PV,UP] [--profile-phases] [--analyze-swimlane] "
-        "[--swimlane-json FILE] [--no-swimlane]\n"
+        "[--trace-atomics] [--swimlane-json FILE] [--no-swimlane]\n"
     );
 }
 
@@ -105,6 +106,10 @@ inline ParseStatus ParseOptions(int argc, char **argv, bool require_kernel, Opti
         }
         if (argument == "--no-swimlane") {
             options->trace_enabled = false;
+            continue;
+        }
+        if (argument == "--trace-atomics") {
+            options->trace_atomics = true;
             continue;
         }
         if (argument == "--analyze-swimlane") {
@@ -165,6 +170,10 @@ inline ParseStatus ParseOptions(int argc, char **argv, bool require_kernel, Opti
         std::fprintf(stderr, "--analyze-swimlane requires swimlane tracing.\n");
         return ParseStatus::Error;
     }
+    if (options->trace_atomics && !options->trace_enabled) {
+        std::fprintf(stderr, "--trace-atomics cannot be combined with --no-swimlane.\n");
+        return ParseStatus::Error;
+    }
     if (!options->swimlane_json.empty() && !options->trace_enabled) {
         std::fprintf(stderr, "--swimlane-json requires swimlane tracing.\n");
         return ParseStatus::Error;
@@ -207,7 +216,9 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
 
 inline void ConfigureTrace(SchedulerState *state, const Options &options, const void *trace_base) {
     // device 只持有裸地址和每核容量；TraceHeader/record 缓冲区由 host 单独分配并初始化。
-    state->config.trace_enabled = options.trace_enabled ? 1U : 0U;
+    state->config.trace_enabled = options.trace_enabled
+        ? kTracePhasesEnabled | (options.trace_atomics ? kTraceAtomicsEnabled : 0U)
+        : 0U;
     state->config.trace_base = options.trace_enabled ? reinterpret_cast<uint64_t>(trace_base) : 0;
     state->config.trace_records_per_core = options.trace_enabled ? kTraceRecordsPerCore : 0;
 }
@@ -330,9 +341,43 @@ inline const char *TracePhaseName(uint32_t phase) {
     // 名称必须与 l2_swimlane_records.json 的 fdwic_events schema 保持一致。
     const char *names[] = {
         "Kernel", "Alloc", "Build", "DrainWon", "Replay", "RingBp", "EfDrain", "Commit",
-        "Submit", "Materialize", "PrepareMap", "Claim", "Fanin", "Register",
+        "Submit", "Materialize", "PrepareMap", "Claim", "Fanin", "Register", "Atomic",
+        "ClockBaseline",
     };
     return phase < sizeof(names) / sizeof(names[0]) ? names[phase] : "Unknown";
+}
+
+inline const char *AtomicSiteName(uint32_t site) {
+    // 顺序与 pa_model.h::AtomicSite 的稳定 raw ABI 完全一致。
+    const char *names[] = {
+        "StartupIncrement", "StartupPoll", "FatalPoll", "FatalSet", "ClaimMax",
+        "FaninFlagLoad", "CompletionVendExchange", "CompletionFlagExchange",
+        "FrontierInitialLoad", "FrontierFlagLoad", "FrontierMax", "HeapFrontierLoad",
+        "HeapVendLoad", "ReplayDoneIncrement", "ReplayDonePoll",
+    };
+    return site < sizeof(names) / sizeof(names[0]) ? names[site] : "Unknown";
+}
+
+inline const char *AtomicOpName(uint32_t op) {
+    const char *names[] = {"Load", "Exchange", "FetchAdd", "FetchMax"};
+    return op < sizeof(names) / sizeof(names[0]) ? names[op] : "Unknown";
+}
+
+inline AtomicOp AtomicSiteOp(AtomicSite site) {
+    switch (site) {
+        case AtomicSite::StartupIncrement:
+        case AtomicSite::ReplayDoneIncrement:
+            return AtomicOp::FetchAdd;
+        case AtomicSite::FatalSet:
+        case AtomicSite::CompletionVendExchange:
+        case AtomicSite::CompletionFlagExchange:
+            return AtomicOp::Exchange;
+        case AtomicSite::ClaimMax:
+        case AtomicSite::FrontierMax:
+            return AtomicOp::FetchMax;
+        default:
+            return AtomicOp::Load;
+    }
 }
 
 inline bool ValidateTraceHeader(const TraceHeader &header, const char *operation) {
@@ -382,7 +427,8 @@ inline bool ExportSwimlaneRecords(
     std::fprintf(
         output,
         "{\n\"l2_swimlane_level\":1,\n"
-        "\"metadata\":{\"clock_freq_hz\":%llu,\"num_cores\":%u,\"core_types\":[",
+        "\"metadata\":{\"clock_freq_hz\":%llu,\"num_cores\":%u,"
+        "\"trace_schema_version\":2,\"core_types\":[",
         static_cast<unsigned long long>(header.frequency_hz), kWorkers
     );
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
@@ -399,7 +445,7 @@ inline bool ExportSwimlaneRecords(
     bool first_record = true;
     uint64_t exported_records = 0;
     std::vector<TraceRecord> scratch(kTraceRecordsPerCore);
-    constexpr int32_t kTracePhaseCount = static_cast<int32_t>(TracePhase::Register) + 1;
+    constexpr int32_t kTracePhaseCount = static_cast<int32_t>(TracePhase::ClockBaseline) + 1;
     for (uint32_t worker = 0; worker < kWorkers && success; ++worker) {
         // 每次只读取一个 worker 的有效区间；完整 384 MiB trace 缓冲无需整体回拷。
         const uint32_t available = header.cores[worker].count;
@@ -419,10 +465,30 @@ inline bool ExportSwimlaneRecords(
             const TraceRecord &record = scratch[index];
             // 这里只检查 lane/block 的合法范围以及 core_idx 是否落在所属 worker 槽，
             // 不把生产者应遵守的 worker↔block/lane 精确映射误说成 exporter 已完成的校验。
+            const bool atomic_record = record.phase == static_cast<int32_t>(TracePhase::Atomic);
+            const bool claim_record = record.phase == static_cast<int32_t>(TracePhase::Claim);
+            const uint32_t atomic_op = record.flags & kAtomicOpMask;
+            const bool atomic_result_used = (record.flags & kAtomicResultUsed) != 0;
+            const bool atomic_return_ready = (record.flags & kAtomicReturnReady) != 0;
+            const bool atomic_return_ready_valid = !atomic_return_ready ||
+                (atomic_result_used &&
+                 (atomic_op == static_cast<uint32_t>(AtomicOp::Load) ||
+                  atomic_op == static_cast<uint32_t>(AtomicOp::FetchMax)));
+            const bool atomic_schema_valid = !atomic_record ||
+                (record.auxiliary < static_cast<uint32_t>(AtomicSite::Count) &&
+                 atomic_op <= static_cast<uint32_t>(AtomicOp::FetchMax) &&
+                 atomic_return_ready_valid &&
+                 atomic_op == static_cast<uint32_t>(
+                     AtomicSiteOp(static_cast<AtomicSite>(record.auxiliary))
+                 ));
+            const bool claim_schema_valid = !claim_record ||
+                ((record.flags & ~(kClaimWon | kClaimAttempted)) == 0 &&
+                 ((record.flags & kClaimWon) == 0 || (record.flags & kClaimAttempted) != 0));
             const bool record_valid = record.end_cycle >= record.start_cycle && record.phase >= 0 &&
                                       record.phase < kTracePhaseCount && record.lane >= 0 && record.lane <= 2 &&
                                       record.block_id >= 0 && record.block_id < static_cast<int32_t>(kAicWorkers) &&
-                                      record.core_idx == static_cast<int32_t>(worker);
+                                      record.core_idx == static_cast<int32_t>(worker) && atomic_schema_valid &&
+                                      claim_schema_valid;
             if (!record_valid) {
                 std::fprintf(
                     stderr,
@@ -480,13 +546,18 @@ inline bool AnalyzeSwimlaneRecords(
     if (!ValidateTraceHeader(header, "swimlane analysis")) return false;
 
     // 第一组数组统计“每个 worker 在某阶段的累计时间”；task_durations 则保留重点阶段的单事件分布。
-    constexpr uint32_t kTracePhaseCount = static_cast<uint32_t>(TracePhase::Register) + 1;
+    constexpr uint32_t kTracePhaseCount = static_cast<uint32_t>(TracePhase::ClockBaseline) + 1;
     constexpr TracePhase kDetailedPhases[] = {
         TracePhase::EfDrain, TracePhase::Materialize, TracePhase::Claim, TracePhase::Register,
     };
     uint64_t cycles[kWorkers][kTracePhaseCount] = {};
     uint64_t counts[kWorkers][kTracePhaseCount] = {};
     std::vector<uint64_t> task_durations[2][kTasksPerBatch][sizeof(kDetailedPhases) / sizeof(kDetailedPhases[0])];
+    std::vector<uint64_t> atomic_durations[2][static_cast<uint32_t>(AtomicSite::Count)];
+    uint64_t atomic_return_ready_counts[2][static_cast<uint32_t>(AtomicSite::Count)] = {};
+    std::vector<uint64_t> clock_baselines[2];
+    std::vector<uint64_t> clock_dependency_baselines[2];
+    uint64_t clock_dependency_applied[2] = {};
     std::vector<TraceRecord> scratch(kTraceRecordsPerCore);
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
         const uint32_t available = header.cores[worker].count;
@@ -505,6 +576,25 @@ inline bool AnalyzeSwimlaneRecords(
             const uint64_t duration = record.end_cycle - record.start_cycle;
             cycles[worker][phase] += duration;
             ++counts[worker][phase];
+            if (record.phase == static_cast<int32_t>(TracePhase::Atomic) &&
+                record.auxiliary < static_cast<uint32_t>(AtomicSite::Count)) {
+                const uint32_t role_index =
+                    state.results[worker].role == static_cast<uint64_t>(CoreRole::Aic) ? 0U : 1U;
+                atomic_durations[role_index][record.auxiliary].push_back(duration);
+                atomic_return_ready_counts[role_index][record.auxiliary] +=
+                    (record.flags & kAtomicReturnReady) != 0;
+            }
+            if (record.phase == static_cast<int32_t>(TracePhase::ClockBaseline)) {
+                const uint32_t role_index =
+                    state.results[worker].role == static_cast<uint64_t>(CoreRole::Aic) ? 0U : 1U;
+                if ((record.flags & kClockAtomicDependency) != 0) {
+                    clock_dependency_baselines[role_index].push_back(duration);
+                    clock_dependency_applied[role_index] +=
+                        (record.flags & kClockAtomicDependencyApplied) != 0;
+                } else {
+                    clock_baselines[role_index].push_back(duration);
+                }
+            }
             if (record.task_id >= 0) {
                 // task_id % 5 恰好对应 Alloc/QK/SF/PV/UP，这是固定 PA Case1 图的拓扑约束。
                 const uint32_t role_index =
@@ -538,6 +628,56 @@ inline bool AnalyzeSwimlaneRecords(
                 static_cast<unsigned long long>(record_count), summary.median / 1000.0,
                 static_cast<double>(summary.p95) / 1000.0,
                 static_cast<double>(summary.maximum) / 1000.0
+            );
+        }
+    }
+    for (uint32_t role_index = 0; role_index < 2; ++role_index) {
+        const Uint64Distribution summary = SummarizeUint64(clock_baselines[role_index]);
+        if (!clock_baselines[role_index].empty()) {
+            std::printf(
+                "[TRACE_CLOCK] role=%s samples=%zu definition=consecutive-sys-cnt-reads "
+                "median_ns=%.1f p95_ns=%llu max_ns=%llu\n",
+                role_names[role_index], clock_baselines[role_index].size(), summary.median,
+                static_cast<unsigned long long>(summary.p95),
+                static_cast<unsigned long long>(summary.maximum)
+            );
+        }
+        const Uint64Distribution dependency_summary =
+            SummarizeUint64(clock_dependency_baselines[role_index]);
+        if (!clock_dependency_baselines[role_index].empty()) {
+            std::printf(
+                "[TRACE_CLOCK] role=%s samples=%zu definition=atomic-return-dependency-hook "
+                "dependency_applied=%llu/%zu median_ns=%.1f p95_ns=%llu max_ns=%llu\n",
+                role_names[role_index], clock_dependency_baselines[role_index].size(),
+                static_cast<unsigned long long>(clock_dependency_applied[role_index]),
+                clock_dependency_baselines[role_index].size(), dependency_summary.median,
+                static_cast<unsigned long long>(dependency_summary.p95),
+                static_cast<unsigned long long>(dependency_summary.maximum)
+            );
+        }
+    }
+    // Atomic 只报告原始括号分布，不扣除计时底噪，也不把 total_cycles
+    // 解释成可与 Submit 墙钟直接相加的“atomic 占比”。return-ready 只表示
+    // 本核可消费返回值，不表示其他核已经观察到更新。
+    for (uint32_t role_index = 0; role_index < 2; ++role_index) {
+        for (uint32_t site = 0; site < static_cast<uint32_t>(AtomicSite::Count); ++site) {
+            const std::vector<uint64_t> &durations = atomic_durations[role_index][site];
+            if (durations.empty()) continue;
+            const Uint64Distribution summary = SummarizeUint64(durations);
+            const AtomicOp op = AtomicSiteOp(static_cast<AtomicSite>(site));
+            const uint64_t return_ready_count = atomic_return_ready_counts[role_index][site];
+            const char *boundary = return_ready_count == durations.size()
+                ? "return-ready"
+                : (return_ready_count == 0 ? "source-issue" : "mixed");
+            std::printf(
+                "[TRACE_ATOMIC] role=%s site=%s op=%s events=%zu boundary=%s "
+                "return_ready=%llu/%zu bracket_cycles_total=%llu median_ns=%.1f "
+                "p95_ns=%llu max_ns=%llu\n",
+                role_names[role_index], AtomicSiteName(site), AtomicOpName(static_cast<uint32_t>(op)),
+                durations.size(), boundary, static_cast<unsigned long long>(return_ready_count),
+                durations.size(), static_cast<unsigned long long>(summary.total), summary.median,
+                static_cast<unsigned long long>(summary.p95),
+                static_cast<unsigned long long>(summary.maximum)
             );
         }
     }
@@ -586,6 +726,7 @@ inline Metrics Validate(
     uint64_t frontier_initial_loads = 0;
     uint64_t frontier_updates = 0;
     uint64_t frontier_terminal_loads = 0;
+    uint64_t atomic_trace_calls = 0;
     uint64_t duplicates = 0;
     uint64_t cas_retries = 0;
     uint64_t joint_polls = 0;
@@ -686,6 +827,7 @@ inline Metrics Validate(
         frontier_initial_loads += result.frontier_initial_loads;
         frontier_updates += result.frontier_updates;
         frontier_terminal_loads += result.frontier_terminal_loads;
+        atomic_trace_calls += result.atomic_trace_calls;
         duplicates += result.completion_duplicates;
         cas_retries += result.cas_retries;
         joint_polls += result.joint_polls;
@@ -876,25 +1018,41 @@ inline Metrics Validate(
                 const WorkerResult &result = state.results[worker];
                 const uint64_t worker_kernels = result.kernel_counts[0] + result.kernel_counts[1] +
                                                 result.kernel_counts[2] + result.kernel_counts[3];
-                const uint64_t worker_expected = 7 * result.submits +
-                                                 result.claim_wins - result.wins[0] +
-                                                 2 * worker_kernels + result.wait_events[0] +
-                                                 result.wait_events[1];
+                const uint64_t worker_expected =
+                    7 * result.submits + result.claim_wins - result.wins[0] +
+                    2 * worker_kernels + result.wait_events[0] + result.wait_events[1] +
+                    (((state.config.trace_enabled & kTraceAtomicsEnabled) != 0)
+                         ? result.atomic_trace_calls + 2
+                         : 0);
                 per_worker_trace_counts_ok &= trace_header->cores[worker].count == worker_expected;
             }
         }
         const uint64_t expected_trace_records =
-            static_cast<uint64_t>(batches) * (static_cast<uint64_t>(kWorkers) * 35 + 12) + trace_wait_records;
+            static_cast<uint64_t>(batches) * (static_cast<uint64_t>(kWorkers) * 35 + 12) +
+            trace_wait_records +
+            (((state.config.trace_enabled & kTraceAtomicsEnabled) != 0)
+                 ? atomic_trace_calls + 2 * kWorkers
+                 : 0);
         // 每 batch 固定记录为 96*35+12；RingBp 等真实等待按运行时次数额外加入。
         Expect(trace_shape_ok, "swimlane header and per-worker capacities are valid", &metrics);
         Expect(trace_dropped == 0, "swimlane records fit without drops", &metrics);
         Expect(trace_records == expected_trace_records, "swimlane record count matches PA phase flow", &metrics);
         Expect(per_worker_trace_counts_ok, "every worker swimlane record count is exact", &metrics);
+        if ((state.config.trace_enabled & kTraceAtomicsEnabled) != 0) {
+            Expect(atomic_trace_calls != 0, "atomic trace captured source-level calls", &metrics);
+        } else {
+            Expect(atomic_trace_calls == 0, "atomic trace counters stay zero when disabled", &metrics);
+        }
         std::printf(
             "[TRACE] records=%llu expected=%llu dropped=%llu bytes=%zu\n",
             static_cast<unsigned long long>(trace_records),
             static_cast<unsigned long long>(expected_trace_records),
             static_cast<unsigned long long>(trace_dropped), kTraceBytes
+        );
+        std::printf(
+            "[ATOMIC_TRACE] enabled=%s calls=%llu definition=per-record-boundary-flags\n",
+            (state.config.trace_enabled & kTraceAtomicsEnabled) != 0 ? "yes" : "no",
+            static_cast<unsigned long long>(atomic_trace_calls)
         );
     }
 
@@ -999,9 +1157,10 @@ inline void PrintBanner(const char *backend, const Options &options) {
     std::printf("=== Standalone PA Scheduler Benchmark: %s ===\n", backend);
     std::printf(
         "device=%u batches=%u tasks=%u workers=%u runs=%u nops=%u,%u,%u,%u state_bytes=%zu "
-        "swimlane=%s trace_bytes=%zu\n", options.device,
+        "swimlane=%s trace_atomics=%s trace_bytes=%zu\n", options.device,
         options.batches, options.batches * kTasksPerBatch, kWorkers, options.runs, options.nops.qk, options.nops.sf,
         options.nops.pv, options.nops.up, sizeof(SchedulerState), options.trace_enabled ? "on" : "off",
+        options.trace_atomics ? "on" : "off",
         options.trace_enabled ? kTraceBytes : 0
     );
     if (!options.swimlane_json.empty()) {

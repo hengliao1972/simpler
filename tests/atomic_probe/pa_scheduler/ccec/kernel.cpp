@@ -47,6 +47,8 @@ __aicore__ inline void RuntimeNop(uint32_t count) {
 }
 
 struct CcecOps {
+    static constexpr bool kAtomicReturnReadyObserved = true;
+
     // 该适配层把平台无关调度器需要的原子、计时、NOP 和 cache 操作逐一映射到 CCEC intrinsic。
     // A5 上 PA 的共享“读取”使用 atomicAdd(addr, 0)，不是普通 GM load；这里保留其 RMW 竞争语义。
     __aicore__ static inline int32_t Load(__gm__ volatile int32_t *address) {
@@ -95,6 +97,22 @@ struct CcecOps {
     __aicore__ static inline void StoreBarrier() {}
 
     __aicore__ static inline uint64_t Now() { return static_cast<uint64_t>(get_sys_cnt()); }
+
+    template <typename T>
+    __aicore__ static inline uint64_t NowAfterAtomicResult(T value) {
+        static_assert(sizeof(T) == 4 || sizeof(T) == 8, "atomic dependency expects a scalar result");
+        uint64_t cycle = 0;
+        // 同一个 inline asm 块先真正消费 atomic 返回寄存器，再读取
+        // SYS_CNT；编译器不能把 t1 拆到依赖 MOV 之前。AIC/AIV 对该序列
+        // 生成相同指令字节，且不增加 DSB/ISB/GM 访存。该边界仍只表示
+        // 返回值已可被本核 scalar 消费，不表示跨核全局可见。
+        asm volatile(
+            "MOV %0, %0\n"
+            "MOV %1, SYS_CNT\n"
+            : "+l"(value), "=&l"(cycle)
+        );
+        return cycle;
+    }
 
     __aicore__ static inline void Nop(uint32_t count) { RuntimeNop(count); }
 
