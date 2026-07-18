@@ -35,8 +35,9 @@ Benchmark options:
   --no-swimlane
 
 CCEC-only PMU probe options (selectors are owned by the standalone Main AICPU helper):
-  --pmu-window off|empty|scalar|scalar-double|submit-all
+  --pmu-window off|empty|scalar|scalar-double|icache-single|submit-all
   --pmu-scalar-nops N
+  --pmu-icache-trials N
   --pmu-json FILE
 
 The swimlane action enables atomic tracing by default. For the lower-level run
@@ -132,7 +133,8 @@ reject_pmu_options_for_non_ccec() {
     # 在顶层展开 all 之前拒绝，避免先启动 CCEC、再由其他后端迟到报错。
     for argument in "$@"; do
         case "$argument" in
-            --pmu-window|--pmu-window=*|--pmu-scalar-nops|--pmu-scalar-nops=*|--pmu-json|--pmu-json=*)
+            --pmu-window|--pmu-window=*|--pmu-scalar-nops|--pmu-scalar-nops=*|\
+            --pmu-icache-trials|--pmu-icache-trials=*|--pmu-json|--pmu-json=*)
                 echo "PMU option $argument is CCEC-only; backend '$backend' is not supported." >&2
                 exit 1
                 ;;

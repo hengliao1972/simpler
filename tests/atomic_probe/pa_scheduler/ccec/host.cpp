@@ -60,6 +60,7 @@ std::vector<char> ReadBinary(const std::string &path) {
 struct PmuOptions {
     pa_scheduler::ccec_pmu::WindowMode mode = pa_scheduler::ccec_pmu::WindowMode::Off;
     uint32_t scalar_nops = 100000;
+    uint32_t icache_trials = 64;
     std::string json_path;
 };
 
@@ -73,6 +74,8 @@ const char *PmuModeName(pa_scheduler::ccec_pmu::WindowMode mode) {
         return "scalar";
     case pa_scheduler::ccec_pmu::WindowMode::ScalarDouble:
         return "scalar-double";
+    case pa_scheduler::ccec_pmu::WindowMode::IcacheSingle:
+        return "icache-single";
     case pa_scheduler::ccec_pmu::WindowMode::SubmitAll:
         return "submit-all";
     }
@@ -83,12 +86,14 @@ bool ParsePmuOptions(int argc, char **argv, PmuOptions *pmu, std::vector<char *>
     // PMU 参数只属于 CCEC 验证分支；先摘出再交给三后端共享 parser，避免 CPU/AscendC 静默接受却不生效。
     bool mode_seen = false;
     bool nops_seen = false;
+    bool icache_trials_seen = false;
     bool json_seen = false;
     common_argv->clear();
     common_argv->push_back(argv[0]);
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
-        if (argument != "--pmu-window" && argument != "--pmu-scalar-nops" && argument != "--pmu-json") {
+        if (argument != "--pmu-window" && argument != "--pmu-scalar-nops" &&
+            argument != "--pmu-icache-trials" && argument != "--pmu-json") {
             common_argv->push_back(argv[index]);
             continue;
         }
@@ -111,13 +116,15 @@ bool ParsePmuOptions(int argc, char **argv, PmuOptions *pmu, std::vector<char *>
                 pmu->mode = pa_scheduler::ccec_pmu::WindowMode::Scalar;
             } else if (name == "scalar-double") {
                 pmu->mode = pa_scheduler::ccec_pmu::WindowMode::ScalarDouble;
+            } else if (name == "icache-single") {
+                pmu->mode = pa_scheduler::ccec_pmu::WindowMode::IcacheSingle;
             } else if (name == "submit-all") {
                 pmu->mode = pa_scheduler::ccec_pmu::WindowMode::SubmitAll;
             } else {
                 std::fprintf(
                     stderr,
                     "Invalid --pmu-window value: %s "
-                    "(expected off|empty|scalar|scalar-double|submit-all)\n",
+                    "(expected off|empty|scalar|scalar-double|icache-single|submit-all)\n",
                     value
                 );
                 return false;
@@ -129,6 +136,13 @@ bool ParsePmuOptions(int argc, char **argv, PmuOptions *pmu, std::vector<char *>
                 return false;
             }
             nops_seen = true;
+        } else if (argument == "--pmu-icache-trials") {
+            if (icache_trials_seen ||
+                !pa_scheduler::host::ParseUint(value, 1, 10000, &pmu->icache_trials)) {
+                std::fprintf(stderr, "Invalid or duplicate --pmu-icache-trials value: %s\n", value);
+                return false;
+            }
+            icache_trials_seen = true;
         } else {
             if (json_seen || *value == '\0') {
                 std::fprintf(stderr, "Invalid or duplicate --pmu-json path: %s\n", value);
@@ -141,6 +155,10 @@ bool ParsePmuOptions(int argc, char **argv, PmuOptions *pmu, std::vector<char *>
     if (nops_seen && pmu->mode != pa_scheduler::ccec_pmu::WindowMode::Scalar &&
         pmu->mode != pa_scheduler::ccec_pmu::WindowMode::ScalarDouble) {
         std::fprintf(stderr, "--pmu-scalar-nops requires a scalar PMU window.\n");
+        return false;
+    }
+    if (icache_trials_seen && pmu->mode != pa_scheduler::ccec_pmu::WindowMode::IcacheSingle) {
+        std::fprintf(stderr, "--pmu-icache-trials requires the icache-single PMU window.\n");
         return false;
     }
     return true;
@@ -217,13 +235,17 @@ bool MapPmuRegisters(uint32_t device, PmuRegisterMappings *mappings) {
 void ConfigurePmu(pa_scheduler::SchedulerState *state, const PmuOptions &pmu, const void *register_table) {
     using namespace pa_scheduler::ccec_pmu;
     state->config.reserved[kConfigMode] = static_cast<uint32_t>(pmu.mode);
-    state->config.reserved[kConfigScalarNops] = pmu.scalar_nops;
+    state->config.reserved[kConfigWorkAmount] =
+        pmu.mode == WindowMode::IcacheSingle ? pmu.icache_trials : pmu.scalar_nops;
     StorePointer(state->config.reserved, register_table);
     state->config.reserved[kConfigMagic] = pmu.mode == WindowMode::Off ? 0 : kConfigMagicValue;
 }
 
 struct PmuAggregate {
     std::vector<uint64_t> total_cycles;
+    std::vector<uint64_t> window_ticks;
+    std::vector<uint64_t> warm_total_cycles;
+    std::vector<uint64_t> warm_window_ticks;
     std::vector<uint64_t> vector_busy;
     std::vector<uint64_t> cube_busy;
     std::vector<uint64_t> scalar_busy;
@@ -232,12 +254,17 @@ struct PmuAggregate {
     std::vector<uint64_t> mte3_busy;
     std::vector<uint64_t> icache_requests;
     std::vector<uint64_t> icache_misses;
+    std::vector<uint64_t> warm_icache_requests;
+    std::vector<uint64_t> warm_icache_misses;
     std::vector<uint64_t> fix_busy;
     uint32_t trusted = 0;
 };
 
 void AddPmuSample(const pa_scheduler::WorkerResult &result, PmuAggregate *aggregate) {
     aggregate->total_cycles.push_back(result.pmu_total_cycles);
+    aggregate->window_ticks.push_back(result.pmu_window_ticks);
+    aggregate->warm_total_cycles.push_back(result.pmu_warm_total_cycles);
+    aggregate->warm_window_ticks.push_back(result.pmu_warm_window_ticks);
     aggregate->vector_busy.push_back(result.pmu_vector_busy);
     aggregate->cube_busy.push_back(result.pmu_cube_busy);
     aggregate->scalar_busy.push_back(result.pmu_scalar_busy);
@@ -246,9 +273,64 @@ void AddPmuSample(const pa_scheduler::WorkerResult &result, PmuAggregate *aggreg
     aggregate->mte3_busy.push_back(result.pmu_mte3_busy);
     aggregate->icache_requests.push_back(result.pmu_icache_requests);
     aggregate->icache_misses.push_back(result.pmu_icache_misses);
+    aggregate->warm_icache_requests.push_back(result.pmu_warm_icache_requests);
+    aggregate->warm_icache_misses.push_back(result.pmu_warm_icache_misses);
     aggregate->fix_busy.push_back(result.pmu_fix_busy);
     aggregate->trusted +=
         (result.pmu_status & pa_scheduler::ccec_pmu::kStatusRequired) == pa_scheduler::ccec_pmu::kStatusRequired;
+}
+
+bool PrintSingleIcacheAggregate(
+    const char *name, const PmuAggregate &aggregate, uint32_t trials_per_core
+) {
+    const pa_scheduler::host::Uint64Distribution cold_cycles =
+        pa_scheduler::host::SummarizeUint64(aggregate.total_cycles);
+    const pa_scheduler::host::Uint64Distribution warm_cycles =
+        pa_scheduler::host::SummarizeUint64(aggregate.warm_total_cycles);
+    const pa_scheduler::host::Uint64Distribution cold_ticks =
+        pa_scheduler::host::SummarizeUint64(aggregate.window_ticks);
+    const pa_scheduler::host::Uint64Distribution warm_ticks =
+        pa_scheduler::host::SummarizeUint64(aggregate.warm_window_ticks);
+    const pa_scheduler::host::Uint64Distribution cold_requests =
+        pa_scheduler::host::SummarizeUint64(aggregate.icache_requests);
+    const pa_scheduler::host::Uint64Distribution warm_requests =
+        pa_scheduler::host::SummarizeUint64(aggregate.warm_icache_requests);
+    const pa_scheduler::host::Uint64Distribution cold_misses =
+        pa_scheduler::host::SummarizeUint64(aggregate.icache_misses);
+    const pa_scheduler::host::Uint64Distribution warm_misses =
+        pa_scheduler::host::SummarizeUint64(aggregate.warm_icache_misses);
+    const int64_t cycle_delta = static_cast<int64_t>(cold_cycles.total) -
+        static_cast<int64_t>(warm_cycles.total);
+    const int64_t tick_delta = static_cast<int64_t>(cold_ticks.total) -
+        static_cast<int64_t>(warm_ticks.total);
+    const int64_t miss_delta = static_cast<int64_t>(cold_misses.total) -
+        static_cast<int64_t>(warm_misses.total);
+    const uint64_t attempted = static_cast<uint64_t>(trials_per_core) * aggregate.total_cycles.size();
+    const double misses_per_trial = attempted == 0U ? 0.0 : static_cast<double>(miss_delta) / attempted;
+    const double cycles_per_miss = miss_delta <= 0 ? 0.0 : static_cast<double>(cycle_delta) / miss_delta;
+    // 本用例的 get_sys_cnt 已按 1 GHz 时间基准校准，因此一个 tick 对应 1 ns。
+    const double ns_per_miss = miss_delta <= 0 ? 0.0 : static_cast<double>(tick_delta) / miss_delta;
+    std::printf(
+        "[ICACHE-SINGLE-%s] cores=%zu trials_per_core=%u attempted=%llu "
+        "cold_cycles=%llu warm_cycles=%llu cycle_delta=%lld cold_ticks=%llu warm_ticks=%llu "
+        "tick_delta=%lld cold_req=%llu warm_req=%llu cold_miss=%llu warm_miss=%llu "
+        "miss_delta=%lld misses_per_trial=%.6f cycles_per_miss=%.3f ns_per_miss=%.3f\n",
+        name, aggregate.total_cycles.size(), trials_per_core, static_cast<unsigned long long>(attempted),
+        static_cast<unsigned long long>(cold_cycles.total),
+        static_cast<unsigned long long>(warm_cycles.total), static_cast<long long>(cycle_delta),
+        static_cast<unsigned long long>(cold_ticks.total),
+        static_cast<unsigned long long>(warm_ticks.total), static_cast<long long>(tick_delta),
+        static_cast<unsigned long long>(cold_requests.total),
+        static_cast<unsigned long long>(warm_requests.total),
+        static_cast<unsigned long long>(cold_misses.total),
+        static_cast<unsigned long long>(warm_misses.total), static_cast<long long>(miss_delta),
+        misses_per_trial, cycles_per_miss, ns_per_miss
+    );
+    std::printf(
+        "[ICACHE-FORMULA-%s] estimated_scalar_icache_time_ns = cnt7_icache_miss * %.3f\n",
+        name, ns_per_miss
+    );
+    return cycle_delta > 0 && tick_delta > 0 && miss_delta == static_cast<int64_t>(attempted);
 }
 
 void PrintPmuAggregate(const char *name, const PmuAggregate &aggregate) {
@@ -293,9 +375,12 @@ struct PmuValidation {
     uint32_t mixed_triplet_matches = 0;
     uint32_t window_started = 0;
     uint32_t window_stopped = 0;
+    uint32_t icache_pairs = 0;
+    uint32_t icache_calibrated_cores = 0;
     uint32_t prior_snapshot_larger = 0;
     uint32_t maximum_programmable_counter = 0;
     bool icache_order_valid = true;
+    bool icache_measurement_valid = true;
     bool counter_below_risk_threshold = true;
     bool passed = true;
 };
@@ -322,6 +407,8 @@ bool ValidatePmu(
     uint32_t physical_role_matches = 0;
     uint32_t window_started = 0;
     uint32_t window_stopped = 0;
+    uint32_t icache_pairs = 0;
+    uint32_t icache_calibrated_cores = 0;
     uint32_t prior_larger = 0;
     uint32_t maximum_programmable_counter = 0;
     bool icache_order_valid = true;
@@ -342,12 +429,27 @@ bool ValidatePmu(
         physical_role_matches += logical_aic == physical_aic;
         window_started += (status & kStatusWindowStarted) != 0U;
         window_stopped += (status & kStatusWindowStopped) != 0U;
+        icache_pairs += (status & kStatusIcachePairObserved) != 0U;
         prior_larger += (status & kStatusPriorSnapshotLarger) != 0;
-        icache_order_valid &= result.pmu_icache_misses <= result.pmu_icache_requests;
+        icache_order_valid &= result.pmu_icache_misses <= result.pmu_icache_requests &&
+            result.pmu_warm_icache_misses <= result.pmu_warm_icache_requests;
+        if (pmu.mode == WindowMode::IcacheSingle) {
+            const int64_t worker_cycle_delta = static_cast<int64_t>(result.pmu_total_cycles) -
+                static_cast<int64_t>(result.pmu_warm_total_cycles);
+            const int64_t worker_tick_delta = static_cast<int64_t>(result.pmu_window_ticks) -
+                static_cast<int64_t>(result.pmu_warm_window_ticks);
+            const int64_t worker_miss_delta = static_cast<int64_t>(result.pmu_icache_misses) -
+                static_cast<int64_t>(result.pmu_warm_icache_misses);
+            icache_calibrated_cores += worker_cycle_delta > 0 && worker_tick_delta > 0 &&
+                worker_miss_delta == static_cast<int64_t>(pmu.icache_trials) &&
+                result.pmu_warm_icache_misses == 0U &&
+                result.pmu_icache_misses == pmu.icache_trials;
+        }
         const uint32_t programmable[] = {
             result.pmu_vector_busy, result.pmu_cube_busy, result.pmu_scalar_busy,
             result.pmu_mte1_busy, result.pmu_mte2_busy, result.pmu_mte3_busy,
             result.pmu_icache_requests, result.pmu_icache_misses, result.pmu_fix_busy,
+            result.pmu_warm_icache_requests, result.pmu_warm_icache_misses,
         };
         for (uint32_t value : programmable) {
             maximum_programmable_counter = std::max(maximum_programmable_counter, value);
@@ -358,10 +460,13 @@ bool ValidatePmu(
         }
         if (!record_trusted && bad_printed < 8) {
             std::printf(
-                "[PMU-BAD] worker=%u role=%llu coreid=%u status=0x%08x total=%llu scalar=%u req=%u miss=%u\n",
+                "[PMU-BAD] worker=%u role=%llu coreid=%u status=0x%08x total=%llu scalar=%u "
+                "req=%u miss=%u warm_total=%llu warm_req=%u warm_miss=%u\n",
                 worker, static_cast<unsigned long long>(result.role), core_id, status,
                 static_cast<unsigned long long>(result.pmu_total_cycles), result.pmu_scalar_busy,
-                result.pmu_icache_requests, result.pmu_icache_misses
+                result.pmu_icache_requests, result.pmu_icache_misses,
+                static_cast<unsigned long long>(result.pmu_warm_total_cycles),
+                result.pmu_warm_icache_requests, result.pmu_warm_icache_misses
             );
             ++bad_printed;
         }
@@ -390,6 +495,15 @@ bool ValidatePmu(
     PrintPmuAggregate("ALL", all);
     PrintPmuAggregate("AIC", aic);
     PrintPmuAggregate("AIV", aiv);
+    bool icache_measurement_ok = true;
+    if (pmu.mode == WindowMode::IcacheSingle) {
+        const bool all_ok = PrintSingleIcacheAggregate("ALL", all, pmu.icache_trials);
+        const bool aic_ok = PrintSingleIcacheAggregate("AIC", aic, pmu.icache_trials);
+        const bool aiv_ok = PrintSingleIcacheAggregate("AIV", aiv, pmu.icache_trials);
+        icache_measurement_ok = all_ok && aic_ok && aiv_ok &&
+            icache_pairs == pa_scheduler::kWorkers &&
+            icache_calibrated_cores == pa_scheduler::kWorkers;
+    }
     const bool records_ok = trusted == pa_scheduler::kWorkers;
     const bool core_ids_ok = unique == pa_scheduler::kWorkers;
     const bool owner_members_ok = owner_members == pa_scheduler::kWorkers;
@@ -401,10 +515,13 @@ bool ValidatePmu(
     const bool counter_below_risk_threshold =
         maximum_programmable_counter < kProgrammableCounterRiskThreshold;
     std::printf(
-        "[PMU] run=%u window=%s calibration_scalar_nops=%u trusted=%u/%u unique_coreids=%u/%u "
-        "prior_larger=%u/%u programmable_max=%u headroom=%u\n", run,
-        PmuModeName(pmu.mode), pmu.scalar_nops, trusted, pa_scheduler::kWorkers, unique, pa_scheduler::kWorkers,
-        prior_larger, pa_scheduler::kWorkers, maximum_programmable_counter,
+        "[PMU] run=%u window=%s calibration_scalar_nops=%u icache_trials=%u trusted=%u/%u "
+        "unique_coreids=%u/%u prior_larger=%u/%u icache_pairs=%u/%u calibrated_cores=%u/%u "
+        "programmable_max=%u headroom=%u\n", run,
+        PmuModeName(pmu.mode), pmu.scalar_nops, pmu.icache_trials, trusted, pa_scheduler::kWorkers,
+        unique, pa_scheduler::kWorkers, prior_larger, pa_scheduler::kWorkers,
+        icache_pairs, pa_scheduler::kWorkers, icache_calibrated_cores, pa_scheduler::kWorkers,
+        maximum_programmable_counter,
         UINT32_MAX - maximum_programmable_counter
     );
     std::printf("[ASSERT] %-48s %s\n", "all PMU records have configured selectors and data",
@@ -427,6 +544,10 @@ bool ValidatePmu(
                 icache_order_valid ? "PASS" : "FAIL");
     std::printf("[ASSERT] %-48s %s\n", "programmable counters stay below 25% risk threshold",
                 counter_below_risk_threshold ? "PASS" : "FAIL");
+    if (pmu.mode == WindowMode::IcacheSingle) {
+        std::printf("[ASSERT] %-48s %s\n", "each cold trial adds exactly one CNT7 I-cache miss",
+                    icache_measurement_ok ? "PASS" : "FAIL");
+    }
     validation->trusted = trusted;
     validation->unique_physical_core_ids = unique;
     validation->owner_bitmap_members = owner_members;
@@ -435,13 +556,16 @@ bool ValidatePmu(
     validation->mixed_triplet_matches = mixed_triplet_matches;
     validation->window_started = window_started;
     validation->window_stopped = window_stopped;
+    validation->icache_pairs = icache_pairs;
+    validation->icache_calibrated_cores = icache_calibrated_cores;
     validation->prior_snapshot_larger = prior_larger;
     validation->maximum_programmable_counter = maximum_programmable_counter;
     validation->icache_order_valid = icache_order_valid;
+    validation->icache_measurement_valid = icache_measurement_ok;
     validation->counter_below_risk_threshold = counter_below_risk_threshold;
     validation->passed = records_ok && core_ids_ok && owner_members_ok && worker_slots_ok &&
         physical_roles_ok && mixed_triplets_ok && windows_started_ok && windows_stopped_ok &&
-        icache_order_valid && counter_below_risk_threshold;
+        icache_order_valid && icache_measurement_ok && counter_below_risk_threshold;
     return validation->passed;
 }
 
@@ -491,7 +615,9 @@ void WriteMetricDistribution(std::FILE *output, const std::vector<uint64_t> &val
     );
 }
 
-void WritePmuAggregateJson(std::FILE *output, const PmuAggregate &aggregate) {
+void WritePmuAggregateJson(
+    std::FILE *output, const PmuAggregate &aggregate, bool icache_single
+) {
     const pa_scheduler::host::Uint64Distribution requests =
         pa_scheduler::host::SummarizeUint64(aggregate.icache_requests);
     const pa_scheduler::host::Uint64Distribution misses =
@@ -528,11 +654,57 @@ void WritePmuAggregateJson(std::FILE *output, const PmuAggregate &aggregate) {
         // 全局 miss rate 必须以总 miss/总 request 计算，不能平均逐核百分比。
         std::fprintf(output, "%.17g", static_cast<double>(misses.total) / requests.total);
     }
+    if (icache_single) {
+        const pa_scheduler::host::Uint64Distribution cold_cycles =
+            pa_scheduler::host::SummarizeUint64(aggregate.total_cycles);
+        const pa_scheduler::host::Uint64Distribution warm_cycles =
+            pa_scheduler::host::SummarizeUint64(aggregate.warm_total_cycles);
+        const pa_scheduler::host::Uint64Distribution cold_ticks =
+            pa_scheduler::host::SummarizeUint64(aggregate.window_ticks);
+        const pa_scheduler::host::Uint64Distribution warm_ticks =
+            pa_scheduler::host::SummarizeUint64(aggregate.warm_window_ticks);
+        const pa_scheduler::host::Uint64Distribution warm_requests =
+            pa_scheduler::host::SummarizeUint64(aggregate.warm_icache_requests);
+        const pa_scheduler::host::Uint64Distribution warm_misses =
+            pa_scheduler::host::SummarizeUint64(aggregate.warm_icache_misses);
+        const int64_t cycle_delta = static_cast<int64_t>(cold_cycles.total) -
+            static_cast<int64_t>(warm_cycles.total);
+        const int64_t tick_delta = static_cast<int64_t>(cold_ticks.total) -
+            static_cast<int64_t>(warm_ticks.total);
+        const int64_t miss_delta = static_cast<int64_t>(misses.total) -
+            static_cast<int64_t>(warm_misses.total);
+        std::fputs(",\"icache_single_pair\":{\"cold_window_ticks\":", output);
+        WriteMetricDistribution(output, aggregate.window_ticks);
+        std::fputs(",\"warm_total_cycles\":", output);
+        WriteMetricDistribution(output, aggregate.warm_total_cycles);
+        std::fputs(",\"warm_window_ticks\":", output);
+        WriteMetricDistribution(output, aggregate.warm_window_ticks);
+        std::fputs(",\"warm_icache_requests\":", output);
+        WriteMetricDistribution(output, aggregate.warm_icache_requests);
+        std::fputs(",\"warm_icache_misses\":", output);
+        WriteMetricDistribution(output, aggregate.warm_icache_misses);
+        std::fprintf(
+            output,
+            ",\"cycle_delta\":%lld,\"tick_delta\":%lld,\"miss_delta\":%lld,"
+            "\"cold_request_sum\":%llu,\"warm_request_sum\":%llu,\"ns_per_miss\":",
+            static_cast<long long>(cycle_delta), static_cast<long long>(tick_delta),
+            static_cast<long long>(miss_delta), static_cast<unsigned long long>(requests.total),
+            static_cast<unsigned long long>(warm_requests.total)
+        );
+        if (miss_delta <= 0) {
+            std::fputs("null", output);
+        } else {
+            std::fprintf(output, "%.17g", static_cast<double>(tick_delta) / miss_delta);
+        }
+        std::fputc('}', output);
+    }
     std::fputc('}', output);
 }
 
-uint32_t PmuWindowSegments(pa_scheduler::ccec_pmu::WindowMode mode) {
+uint32_t PmuWindowSegments(const PmuOptions &pmu) {
+    const pa_scheduler::ccec_pmu::WindowMode mode = pmu.mode;
     if (mode == pa_scheduler::ccec_pmu::WindowMode::ScalarDouble) return 2U;
+    if (mode == pa_scheduler::ccec_pmu::WindowMode::IcacheSingle) return pmu.icache_trials * 2U;
     return 1U;
 }
 
@@ -596,6 +768,7 @@ bool ExportPmuJson(
     std::setvbuf(output, output_buffer.data(), _IOFBF, output_buffer.size());
 
     const bool submit_window = IsSubmitWindow(pmu.mode);
+    const bool icache_single = pmu.mode == WindowMode::IcacheSingle;
     const bool simulated_task_nops_nonzero =
         options.nops.qk != 0U || options.nops.sf != 0U || options.nops.pv != 0U || options.nops.up != 0U;
     const uint32_t owner_bitmap_count = pa_scheduler::pmu_owner::CountConfigured(owner);
@@ -634,14 +807,22 @@ bool ExportPmuJson(
     );
     WriteJsonString(output, PmuModeName(pmu.mode));
     std::fputs(",\"calibration_scalar_nops_per_segment\":", output);
-    if (submit_window) {
+    if (submit_window || icache_single) {
         std::fputs("null", output);
     } else {
         std::fprintf(output, "%u", pmu.scalar_nops);
     }
+    std::fputs(",\"icache_single_trials_per_core\":", output);
+    if (icache_single) {
+        std::fprintf(output, "%u", pmu.icache_trials);
+    } else {
+        std::fputs("null", output);
+    }
     std::fprintf(
         output,
         ",\"window_segments_are_mode_contract_per_record\":true,"
+        "\"icache_single_discarded_training_samples_per_core\":%u,"
+        "\"icache_single_sys_counter_tick_ns\":%s,"
         "\"host_launch_to_sync_us\":%.17g,\"submit_span_us\":%.17g,"
         "\"selectors\":{\"cnt0_vector_busy\":%u,\"cnt1_cube_busy\":%u,"
         "\"cnt2_scalar_busy\":%u,\"cnt3_mte1_busy\":%u,\"cnt4_mte2_busy\":%u,"
@@ -655,6 +836,7 @@ bool ExportPmuJson(
         "\"simulated_task_nop_mechanism_executes_on_scalar\":true,"
         "\"simulated_task_nops_nonzero\":%s,"
         "\"icache_miss_rate_definition\":\"sum(icache_misses)/sum(icache_requests)\"},\n",
+        icache_single ? 2U : 0U, icache_single ? "1" : "null",
         host_us, submit_span_us, kVectorBusyEvent, kCubeBusyEvent, kScalarBusyEvent,
         kMte1BusyEvent, kMte2BusyEvent, kMte3BusyEvent, kIcacheRequestEvent, kIcacheMissEvent,
         kFixBusyEvent, kProgrammableCounterRiskThreshold,
@@ -670,6 +852,8 @@ bool ExportPmuJson(
         "\"mixed_triplet_matches\":%u,\"expected_mixed_triplet_matches\":%u,"
         "\"window_started_records\":%u,\"window_stopped_records\":%u,"
         "\"expected_window_records\":%u,\"prior_snapshot_larger_records\":%u,"
+        "\"icache_pair_records\":%u,\"icache_calibrated_cores\":%u,"
+        "\"icache_measurement_valid\":%s,"
         "\"icache_miss_le_request\":%s,\"counter_below_risk_threshold\":%s,"
         "\"maximum_programmable_counter\":%u,\"programmable_counter_risk_threshold\":%u,"
         "\"programmable_counter_headroom\":%u},\n",
@@ -680,7 +864,10 @@ bool ExportPmuJson(
         validation.physical_role_matches, pa_scheduler::kWorkers,
         validation.mixed_triplet_matches, pa_scheduler::kAicWorkers,
         validation.window_started, validation.window_stopped, pa_scheduler::kWorkers,
-        validation.prior_snapshot_larger, validation.icache_order_valid ? "true" : "false",
+        validation.prior_snapshot_larger, validation.icache_pairs,
+        validation.icache_calibrated_cores,
+        validation.icache_measurement_valid ? "true" : "false",
+        validation.icache_order_valid ? "true" : "false",
         validation.counter_below_risk_threshold ? "true" : "false",
         validation.maximum_programmable_counter, kProgrammableCounterRiskThreshold,
         UINT32_MAX - validation.maximum_programmable_counter
@@ -719,13 +906,14 @@ bool ExportPmuJson(
         const uint32_t vector_id = is_aic ? 0U : worker - pa_scheduler::kAicWorkers;
         const uint32_t block_id = is_aic ? worker : vector_id / 2U;
         const uint32_t lane = is_aic ? 0U : 1U + vector_id % 2U;
-        const uint32_t segments = PmuWindowSegments(pmu.mode);
+        const uint32_t segments = PmuWindowSegments(pmu);
         const bool owner_bitmap_member = pa_scheduler::pmu_owner::IsConfigured(owner, physical_core_id);
         const bool worker_slot_exact = result.worker_id == worker;
         const bool physical_role_matches =
             is_aic == pa_scheduler::pmu_owner::IsAicPhysicalSlot(physical_core_id);
         const bool window_started = (status & kStatusWindowStarted) != 0U;
         const bool window_stopped = (status & kStatusWindowStopped) != 0U;
+        const bool icache_pair_observed = (status & kStatusIcachePairObserved) != 0U;
         std::fprintf(
             output,
             "%s{\"worker_id\":%u,\"physical_core_id\":%u,\"role\":\"%s\",\"block_id\":%u,"
@@ -733,16 +921,23 @@ bool ExportPmuJson(
             "\"window_started\":%s,\"window_stopped\":%s,\"total_cycles\":%llu,\"vector_busy\":%u,"
             "\"cube_busy\":%u,\"scalar_busy\":%u,\"mte1_busy\":%u,\"mte2_busy\":%u,"
             "\"mte3_busy\":%u,\"icache_requests\":%u,\"icache_misses\":%u,\"fix_busy\":%u,"
+            "\"window_ticks\":%llu,\"warm_total_cycles\":%llu,\"warm_window_ticks\":%llu,"
+            "\"warm_icache_requests\":%u,\"warm_icache_misses\":%u,"
             "\"status\":%u,\"status_hex\":"
             "\"0x%08x\",\"trusted\":%s,\"physical_core_id_valid\":%s,\"selectors_match\":%s,"
             "\"owner_bitmap_member\":%s,\"worker_slot_exact\":%s,"
-            "\"physical_role_matches\":%s,\"prior_snapshot_larger\":%s}",
+            "\"physical_role_matches\":%s,\"icache_pair_observed\":%s,"
+            "\"prior_snapshot_larger\":%s}",
             worker == 0 ? "" : ",\n", worker, physical_core_id, is_aic ? "aic" : "aiv", block_id,
             lane, segments, window_started ? "true" : "false", window_stopped ? "true" : "false",
             static_cast<unsigned long long>(result.pmu_total_cycles), result.pmu_vector_busy,
             result.pmu_cube_busy, result.pmu_scalar_busy, result.pmu_mte1_busy, result.pmu_mte2_busy,
             result.pmu_mte3_busy, result.pmu_icache_requests, result.pmu_icache_misses,
-            result.pmu_fix_busy, status, status, trusted ? "true" : "false",
+            result.pmu_fix_busy, static_cast<unsigned long long>(result.pmu_window_ticks),
+            static_cast<unsigned long long>(result.pmu_warm_total_cycles),
+            static_cast<unsigned long long>(result.pmu_warm_window_ticks),
+            result.pmu_warm_icache_requests, result.pmu_warm_icache_misses,
+            status, status, trusted ? "true" : "false",
             (status & kStatusCoreIdValid) != 0 ? "true" : "false",
             (status & (kStatusCnt0Selector | kStatusCnt1Selector | kStatusCnt2Selector |
                        kStatusCnt3Selector | kStatusCnt4Selector | kStatusCnt5Selector |
@@ -754,15 +949,16 @@ bool ExportPmuJson(
                 : "false",
             owner_bitmap_member ? "true" : "false", worker_slot_exact ? "true" : "false",
             physical_role_matches ? "true" : "false",
+            icache_pair_observed ? "true" : "false",
             (status & kStatusPriorSnapshotLarger) != 0 ? "true" : "false"
         );
     }
     std::fputs("\n],\n\"summary\":{\"all\":", output);
-    WritePmuAggregateJson(output, all);
+    WritePmuAggregateJson(output, all, icache_single);
     std::fputs(",\"aic\":", output);
-    WritePmuAggregateJson(output, aic);
+    WritePmuAggregateJson(output, aic, icache_single);
     std::fputs(",\"aiv\":", output);
-    WritePmuAggregateJson(output, aiv);
+    WritePmuAggregateJson(output, aiv, icache_single);
     std::fputs("}\n}\n", output);
 
     bool success = std::ferror(output) == 0;
@@ -828,8 +1024,8 @@ int main(int argc, char **argv) {
             std::fprintf(
                 stderr,
                 "CCEC PMU options: [--pmu-window "
-                "off|empty|scalar|scalar-double|submit-all] [--pmu-scalar-nops N] "
-                "[--pmu-json FILE]\n"
+                "off|empty|scalar|scalar-double|icache-single|submit-all] "
+                "[--pmu-scalar-nops N] [--pmu-icache-trials N] [--pmu-json FILE]\n"
             );
         }
         return parse_status == pa_scheduler::host::ParseStatus::Help ? EXIT_SUCCESS : EXIT_FAILURE;
@@ -870,9 +1066,9 @@ int main(int argc, char **argv) {
     }
     pa_scheduler::host::PrintBanner("CCEC", options);
     std::printf(
-        "[PMU-CONFIG] window=%s calibration_scalar_nops=%u source=direct-per-core "
+        "[PMU-CONFIG] window=%s calibration_scalar_nops=%u icache_trials=%u source=direct-per-core "
         "owner=main-aicpu-path-a\n",
-        PmuModeName(pmu_options.mode), pmu_options.scalar_nops
+        PmuModeName(pmu_options.mode), pmu_options.scalar_nops, pmu_options.icache_trials
     );
 
     // 正常及后处理路径依次完成 ACL 初始化、选卡、stream/ELF/设备区创建、launch/D2H

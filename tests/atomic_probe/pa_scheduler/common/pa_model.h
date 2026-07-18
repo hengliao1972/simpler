@@ -550,7 +550,7 @@ struct alignas(64) WorkerResult {
     uint64_t max_occupied;
     uint64_t final_occupied;
 
-    // CCEC 标量 PMU 取证复用 WorkerResult 原有的 24B 尾部 padding，不增加结果区大小。
+    // CCEC 标量 PMU 取证使用 WorkerResult 的诊断 sidecar，不改变生产 DistCore ABI。
     // 该诊断只在显式开启时有效；CNT2/CNT6/CNT7 分别对应 scalar busy、I-cache req/miss。
     uint64_t pmu_total_cycles;
     uint32_t pmu_scalar_busy;
@@ -569,8 +569,17 @@ struct alignas(64) WorkerResult {
     // host 用它与 Atomic span 数逐 worker 闭合，禁止把丢记录的泳道当成完整结果。
     uint64_t atomic_trace_calls;
 
+    // I-cache 单 miss 探针把 cold 样本放在既有 PMU 字段中，并在扩展的诊断尾部
+    // 保存同核配对的 warm 样本与 1 GHz 系统计数器窗口；非该模式均写零。
+    uint64_t pmu_window_ticks;
+    uint64_t pmu_warm_total_cycles;
+    uint64_t pmu_warm_window_ticks;
+    uint32_t pmu_warm_icache_requests;
+    uint32_t pmu_warm_icache_misses;
+
     // PIPE_UTILIZATION 已同时配置 CNT0/1/3/4/5/8；与上面的 scalar/I-cache
     // 一样只保存每核原始累计值，AIC/AIV 汇总与比率统一在 host sidecar 中计算。
+    // 六个 32-bit 值复用本结构扩展到 832B 后的尾部空间，不再增加 cache line。
     uint32_t pmu_vector_busy;
     uint32_t pmu_cube_busy;
     uint32_t pmu_mte1_busy;
@@ -580,12 +589,13 @@ struct alignas(64) WorkerResult {
 };
 // WorkerResult 是 standalone 尾部的诊断 sidecar，不属于真实 DistCore ABI；按
 // cache line 隔离后，各 worker 发布统计不会相互覆盖或污染被测共享状态。
-static_assert(sizeof(WorkerResult) == 768, "WorkerResult diagnostics must occupy whole cache lines");
+static_assert(sizeof(WorkerResult) == 832, "WorkerResult diagnostics must occupy whole cache lines");
 static_assert(offsetof(WorkerResult, pmu_total_cycles) == 680, "WorkerResult PMU offset mismatch");
 static_assert(offsetof(WorkerResult, pmu_status) == 700, "WorkerResult PMU status offset mismatch");
 static_assert(offsetof(WorkerResult, fanin_not_ready_loads) == 704, "WorkerResult atomic diagnostic offset mismatch");
 static_assert(offsetof(WorkerResult, atomic_trace_calls) == 736, "WorkerResult atomic trace offset mismatch");
-static_assert(offsetof(WorkerResult, pmu_vector_busy) == 744, "WorkerResult extended PMU offset mismatch");
+static_assert(offsetof(WorkerResult, pmu_window_ticks) == 744, "WorkerResult PMU timing offset mismatch");
+static_assert(offsetof(WorkerResult, pmu_vector_busy) == 776, "WorkerResult extended PMU offset mismatch");
 
 // 从 cube_cursor 到 workers 结束保留关键字段 offset、DistCore ABI 和生产总字节跨度，
 // 并非字段级完整镜像。RunConfig、输入 context_lens 与校验结果追加在该跨度之后，

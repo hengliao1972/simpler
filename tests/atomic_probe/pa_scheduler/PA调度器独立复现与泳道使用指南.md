@@ -28,8 +28,10 @@ frontier 和 worker 状态，任一不符都会返回失败。
 
 有意保留的替代只有两类：
 
-1. QK/SF/PV/UP 的真实计算体由可控 NOP 数模拟，使每个 task 的占用时间接近
-   真实 PA；调度前后路径没有用 NOP 补时。
+1. QK/SF/PV/UP 的真实计算体由可控 NOP 数做时长标定，使每个 task 的
+   占用时间接近真实 PA；调度前后路径没有用 NOP 补时。NOP 实际由
+   scalar 执行，只校准了时长，没有复现真实 Vector/Cube 计算单元及其间
+   scalar 等待状态。
 2. simpler 的 AICPU/runtime 装载链路由本目录 host runner 代替；测试关注的
    首个 Submit 到最后一个 Submit 区间不含 AICPU 初始化和最终回收。
 
@@ -401,13 +403,26 @@ Path-A owner 配置 selector、保存并恢复 PMU 状态；kernel 在每个物�
 | `icache_misses` | `CNT7 = 0x035` | I-cache miss |
 | `fix_busy` | `CNT8 = 0x714` | Fix pipe busy |
 
+`icache-single` 还在同一 worker 的诊断 sidecar 中保留下列配对字段；其他窗口
+将它们写零，不应解读为额外的 Submit 计数：
+
+| `WorkerResult` 原始字段 | 来源 | 含义 |
+| --- | --- | --- |
+| `pmu_window_ticks` | 1 GHz sys counter | cold 目标调用窗口，1 tick = 1 ns |
+| `pmu_warm_total_cycles` | 64-bit PMU total | 同核 warm 对照窗口原始 total |
+| `pmu_warm_window_ticks` | 1 GHz sys counter | warm 目标调用窗口 |
+| `pmu_warm_icache_requests` | `CNT6 = 0x034` | 同核 warm 对照 request |
+| `pmu_warm_icache_misses` | `CNT7 = 0x035` | 同核 warm 对照 miss |
+
 #### Main AICPU Path-A owner
 
 owner 已自包含在 `ccec/`：构建会同时产出 dispatcher 和 owner AArch64 SO。host
 通过 CANN 9.1 已验证的 Main AICPU Path-A 完成 bootstrap 和 mode-0 注册，运行时
 调用 `simpler_aicpu_exec` 执行 Configure/Restore；不要求用户另行启动 PMU 配置进程。
 owner 对本轮会话独占的 PMU 状态先保存、再配置并读回，结束时只按成功 bitmap 从
-107 到 0 逆序恢复。
+107 到 0 逆序恢复。owner 当前没有跨进程互斥锁；同一设备上不得并发运行
+另一个 PMU owner 会话或 `msprof` PMU 会话，否则 selector 和保存态可能互相覆盖，
+本轮 Restore 也不再能代表恢复了启动前的状态。
 
 host 对同一 stream 调用 `aclrtGetStreamResLimit`，当前 A5 实报
 `AIC=32/AIV=64/total=96`。owner 扫描 108 个物理 MMIO slot，只对完整读回一致的
@@ -423,14 +438,15 @@ kernel 用真实 `get_coreid()` 查 host 通过 `halResMap` 建立的 MMIO 表�
 可信且物理核 id 唯一、worker slot/role 与物理 triplet 对应、96 个核都实际执行过
 start/stop、`miss <= request`，以及 owner Restore 成功。
 
-`off` 是默认值，不建立 PMU owner 会话。四种非 off 模式中，前三种只用于观察链路
-校准；`submit-all` 是唯一正式的 Submit 取数窗口：
+`off` 是默认值，不建立 PMU owner 会话。五种非 off 模式中，前四种只用于
+观察链路校准；`submit-all` 是唯一正式的 Submit 取数窗口：
 
 | `--pmu-window` | 位置与窗口边界 | 用途 |
 | --- | --- | --- |
 | `empty` | `RunScheduler` 完成后，baseline read-clear → start → stop → 末尾 snapshot | 量一段空 gate 底噪 |
 | `scalar` | `RunScheduler` 完成后，一个 gate 中执行 `--pmu-scalar-nops N` | 验证 scalar/I-cache 正向敏感性 |
 | `scalar-double` | `RunScheduler` 完成后，两段相同 NOP 中间只 stop/start、不读 counter | 验证暂停后继续累计 |
+| `icache-single` | `RunScheduler` 完成后，每 worker 做 cold/warm 配对试验；64 KiB sweep 或目标预热在目标 gate 外 | 标定受控单次 CNT7 miss 的一阶等效时间 |
 | `submit-all` | 每 worker 通过启动屏障后，在首次 PA 参数构造前 start，最后一次 Submit 返回后 stop | 累计 orchestration、Submit 和模拟 kernel NOP |
 
 `submit-all` 不含启动屏障，也不含 `replay_done`、最终 drain、末尾 ClockBaseline
@@ -443,6 +459,26 @@ start/stop、`miss <= request`，以及 owner Restore 成功。
 的 NOP 循环实际在 scalar 上执行，`submit-all` 会把它计入 scalar 相关事件；这与真实
 Vector/Cube task 运行时 scalar 等待的状态并不等价，所以 sidecar 不声称是绝对的
 真实 PA profile。
+
+`icache-single` 的可执行标定命令为：
+
+```bash
+./run.sh run ccec \
+  --device 0 --batches 1 --runs 1 --nop-count 0 --no-swimlane \
+  --pmu-window icache-single --pmu-icache-trials 64
+```
+
+该命令用于校准并输出控制台结果，不生成正式 `submit-all` JSON。除通用
+PMU/owner 断言外，每轮还必须看到：
+
+```text
+icache_pairs=96/96 calibrated_cores=96/96
+[ASSERT] each cold trial adds exactly one CNT7 I-cache miss PASS
+```
+
+门禁逐核要求 cold 的 `CNT7 == trials`、warm 的 `CNT7 == 0`，并要求 cold-warm
+时间差为正。也就是说，最终系数的分母不是推测的循环次数，而是严格闭合的
+`CNT7` miss 差值。
 
 #### 生成正式 PMU-only JSON
 
@@ -520,9 +556,52 @@ PMU-only 验收。Submit span 为 3,688.236/4,089.057/4,673.237 us，中位数
 同配置 PMU 取数可重复；由于 gate 包含 `PIPE_ALL` 且未与无 PMU 样本交错配对，
 不应将它们与约 5 ms 无诊断基线直接相减。
 
+#### 单次 CNT7 I-cache miss 的 scalar 一阶估算标尺
+
+2026-07-18 的 96 核并发 cold/warm 配对中，15/15 轮均精确满足
+`cold CNT7 == trials`、`warm CNT7 == 0`和 `calibrated_cores=96/96`。按每轮
+`sum(cold_ticks-warm_ticks) / sum(cold_miss-warm_miss)` 计算，实测为：
+
+| 规模 | ALL median（range） | AIC median（range） | AIV median（range） |
+| --- | ---: | ---: | ---: |
+| 64 trials/core × 10 | 86.596（86.532～86.792）ns/miss | 85.913（85.848～86.202）ns/miss | 86.938（86.861～87.086）ns/miss |
+| 128 trials/core × 5 | 89.629（89.615～89.648）ns/miss | 92.100（91.984～92.267）ns/miss | 88.410（88.310～88.440）ns/miss |
+
+同一时段重跑 64 与 128 trials 时，ALL 都约为 89.6 ns/miss。64-trial 样本中
+AIV 略高，128-trial 样本中则 AIC 更高；角色差值方向并不稳定，不建立
+AIC/AIV 精确常数。只做总量级归因时，统一取整为：
+
+```text
+估算的 scalar I-cache miss 时间(ns) = CNT7_I-cache_miss_total × 90
+估算的 scalar I-cache miss 时间(us) = CNT7_I-cache_miss_total × 0.09
+```
+
+例如 1,000 次 miss 约为 90 us，10,000 次约为 0.9 ms。若确实需要按角色
+计算，应使用同一时段、同一运行中打印的 `[ICACHE-FORMULA-AIC/AIV]`，
+不能跨时段套用上表的角色中位数。
+
+`CNT7` 只报告 I-cache miss 总数，不区分 compulsory、capacity 和 conflict 原因；
+三类都应计入上式。本探针用 64 KiB sweep 明确制造 capacity eviction，因此得到的
+是 96 核并发条件下、cold 相对 warm 的一阶等效 miss penalty。它适合回答“这些
+miss 大约能解释多少 scalar 时间”，不是硬件逐次给出的可加 stall；真实代码
+中的预取、miss 重叠、不同下级命中位置和并发排队都会使实际关键路径偏离简单乘积。
+
+本机未入库的原始输出保留在：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/pmu_validation/
+  icache_single_64x10_20260718_085929_3232836_console.log
+  icache_single_128x5_20260718_090151_3235468_console.log
+```
+
+这里验证的是观察手段，不是 PA 优化本身。`submit-all` 仍是正式调度取数的
+唯一窗口；上述 90 ns/miss 只用于对其 CNT7 总量做一阶等效估算，不把校准
+模式扩展成 Claim、EfDrain 等多个正式局部窗口。性能 A/B 仍要保持观察布局一致，
+最终端到端收益以关闭 PMU 和泳道的独立进程结果为准。
+
 ## 6. 当前 A5 结果与真实 PA 的差异
 
-2026-07-17 当前源码的一轮代表性结果如下。所有严格校验均为 PASS，kernel
+2026-07-17 当时版本的一轮代表性结果如下。所有严格校验均为 PASS，kernel
 时间使用上表附近的校准 NOP：
 
 | 实现 | 首轮 `submit_span_us` | EfDrain/RingBp/FinalDrain |
@@ -543,8 +622,9 @@ PMU-only 验收。Submit span 为 3,688.236/4,089.057/4,673.237 us，中位数
 | AIC 每 worker 累计中位数 | 470.503 us | 711.005 us | 234.063 us，43 次等待 | 21.349 us，约 1 次等待 |
 | AIV 每 worker 累计中位数 | 533.755 us | 401.962 us | 0.067 us，0 次等待 | 3.723 us，约 1 次等待 |
 
-这里的“等待次数”是三轮中对应角色的全局中位数，不是每 worker 次数。Claim
-和 EfDrain 已与真实 PA 同量级；HeapGuard 只有 0 至 3 次偶发等待。当前主要
+表中阶段时长来自一轮代表值；括号内的“等待次数”则是三轮中对应角色的
+全局中位数，不是每 worker 次数。Claim 和 EfDrain 已与真实 PA 同量级；
+HeapGuard 只有 0 至 3 次偶发等待。当前主要
 残差来自编译边界：
 真实 orchestration 和 `dist_submit_impl` 位于不同翻译单元，TaskArgs 对 Submit
 编译器是运行时数据；standalone 为了保持可复制构建，共享实现会与固定 PA
@@ -560,7 +640,8 @@ PMU-only 验收。Submit span 为 3,688.236/4,089.057/4,673.237 us，中位数
 ## 7. 内存占用和脱仓复制
 
 为保持真实 DistGlobal/DistCore 偏移、65,536 个 task cell、每 worker payload
-和 TensorMap，`SchedulerState` 为 1,007,092,544 bytes。默认泳道缓冲区另占
+和 TensorMap，当前 `WorkerResult` 为 832 bytes，用当前头文件实际编译得到的
+`SchedulerState` 为 1,007,104,832 bytes。默认泳道缓冲区另占
 402,660,160 bytes，所以 A5 device 侧总计约 1.31 GiB，host 侧也需分配相近
 内存。`smoke` 不缩小 State；只有 `--no-swimlane` 能省去泳道缓冲区。
 256 batch 的正常采集约有 86 万条事件；原始 JSON 和 merged JSON 都可能达到

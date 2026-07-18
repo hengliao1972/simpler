@@ -46,6 +46,30 @@ __aicore__ inline void RuntimeNop(uint32_t count) {
     __builtin_cce_pipe_barrier(PIPE_ALL);
 }
 
+#if defined(PA_BUILD_AIC)
+#define PA_ICACHE_TARGET_NAME pa_icache_target_aic
+#define PA_ICACHE_MEASURE_NAME pa_icache_measure_aic
+#define PA_ICACHE_THRASH_NAME pa_icache_thrash_aic
+#elif defined(PA_BUILD_AIV)
+#define PA_ICACHE_TARGET_NAME pa_icache_target_aiv
+#define PA_ICACHE_MEASURE_NAME pa_icache_measure_aiv
+#define PA_ICACHE_THRASH_NAME pa_icache_thrash_aiv
+#endif
+
+// cold/warm 两条路径调用同一个 8B 目标函数。入口按 128B I-cache line
+// 对齐，构建脚本还会核对符号尺寸、对齐和 target -> harness -> thrash 布局。
+__aicore__ static __attribute__((noinline, used, aligned(128), section(".text.pa_icache_target")))
+void PA_ICACHE_TARGET_NAME() {
+    asm volatile(
+        ".rept 1\n"
+        "nop\n"
+        ".endr\n"
+    );
+}
+
+__aicore__ static __attribute__((noinline, used, aligned(128), section(".text.pa_icache_thrash")))
+void PA_ICACHE_THRASH_NAME();
+
 struct CcecOps {
     static constexpr bool kAtomicReturnReadyObserved = true;
 
@@ -175,6 +199,13 @@ struct PmuSnapshot {
     uint32_t status = 0;
 };
 
+struct IcachePairSnapshot {
+    PmuSnapshot cold;
+    PmuSnapshot warm;
+    uint64_t cold_window_ticks = 0;
+    uint64_t warm_window_ticks = 0;
+};
+
 template <uint32_t BlockOffset, uint32_t RegisterOffset>
 __aicore__ inline uint32_t ReadPmuRegister(uint64_t reg_base) {
     // 传给 ld_dev 的是重基址后的 __gm__ 指针；相对 offset 均落在编译器允许的 [-2048, 2047]。
@@ -208,6 +239,81 @@ __aicore__ inline PmuSnapshot ReadObservedCounters(uint64_t reg_base) {
                                           pa_scheduler::ccec_pmu::kTotalHighOffset>(reg_base);
     sample.total_cycles = low | (high << 32);
     return sample;
+}
+
+__aicore__ inline void AccumulateObserved(const PmuSnapshot &sample, PmuSnapshot *total) {
+    total->total_cycles += sample.total_cycles;
+    total->vector_busy += sample.vector_busy;
+    total->cube_busy += sample.cube_busy;
+    total->scalar_busy += sample.scalar_busy;
+    total->mte1_busy += sample.mte1_busy;
+    total->mte2_busy += sample.mte2_busy;
+    total->mte3_busy += sample.mte3_busy;
+    total->icache_requests += sample.icache_requests;
+    total->icache_misses += sample.icache_misses;
+    total->fix_busy += sample.fix_busy;
+}
+
+// 禁止内联，确保 cold/warm 经过同一函数体、同一 PMU gate 和同一目标
+// callsite；否则编译器复制 harness 后，两条路径的取指状态不再是单变量实验。
+__aicore__ static __attribute__((noinline, used, aligned(128), section(".text.pa_icache_harness")))
+void PA_ICACHE_MEASURE_NAME(
+    uint64_t reg_base, bool warm, PmuSnapshot *total, uint64_t *window_ticks
+) {
+    // 两条路径都先在窗口外执行 64 KiB capacity sweep。warm 只多一次窗外
+    // target 预取，并且发生在 read-clear 之前，避免把预热 miss 计入 warm 窗口。
+    bisheng::cce::metrics_prof_stop();
+    PA_ICACHE_THRASH_NAME();
+    if (warm) PA_ICACHE_TARGET_NAME();
+    (void)ReadObservedCounters(reg_base);
+
+    bisheng::cce::metrics_prof_start();
+    const uint64_t begin = static_cast<uint64_t>(get_sys_cnt());
+    PA_ICACHE_TARGET_NAME();
+    const uint64_t end = static_cast<uint64_t>(get_sys_cnt());
+    bisheng::cce::metrics_prof_stop();
+
+    AccumulateObserved(ReadObservedCounters(reg_base), total);
+    *window_ticks += end - begin;
+}
+
+// DAV_3510 scalar I-cache 最大为 32 KiB。thrash 放在 target/harness 之后，
+// 顺序执行 64 KiB 指令覆盖所有 set 多轮；返回低地址 harness 时不向前预取 target。
+__aicore__ static void PA_ICACHE_THRASH_NAME() {
+    asm volatile(
+        ".rept 16384\n"
+        "nop\n"
+        ".endr\n"
+    );
+}
+
+__aicore__ inline void RunIcachePhase(
+    uint64_t reg_base, bool warm, uint32_t trials, PmuSnapshot *total, uint64_t *window_ticks
+) {
+    // 每个 phase 先丢弃一次同分支训练样本，避免逐 trial 交替分支历史把
+    // false 路径的目标行提前取回。
+    PmuSnapshot discarded;
+    uint64_t discarded_ticks = 0;
+    PA_ICACHE_MEASURE_NAME(reg_base, warm, &discarded, &discarded_ticks);
+    for (uint32_t trial = 0; trial < trials; ++trial) {
+        PA_ICACHE_MEASURE_NAME(reg_base, warm, total, window_ticks);
+    }
+}
+
+__aicore__ inline IcachePairSnapshot RunSingleIcacheProbe(
+    uint64_t reg_base, uint32_t trials, uint32_t worker_id
+) {
+    IcachePairSnapshot pair;
+    // 每个 role 内各一半 worker 使用 cold-first/warm-first，抵消两个 phase
+    // 的固定时间顺序；phase 内保持相同分支历史。
+    if ((worker_id & 1U) == 0U) {
+        RunIcachePhase(reg_base, false, trials, &pair.cold, &pair.cold_window_ticks);
+        RunIcachePhase(reg_base, true, trials, &pair.warm, &pair.warm_window_ticks);
+    } else {
+        RunIcachePhase(reg_base, true, trials, &pair.warm, &pair.warm_window_ticks);
+        RunIcachePhase(reg_base, false, trials, &pair.cold, &pair.cold_window_ticks);
+    }
+    return pair;
 }
 
 struct PmuRegisterContext {
@@ -272,6 +378,24 @@ __aicore__ inline void PublishPmuSnapshot(
     CcecOps::Publish(&result.pmu_mte2_busy, sample.mte2_busy);
     CcecOps::Publish(&result.pmu_mte3_busy, sample.mte3_busy);
     CcecOps::Publish(&result.pmu_fix_busy, sample.fix_busy);
+    // 非 icache-single 模式也显式清零配对 sidecar，避免同一 device allocation
+    // 被后续 run 复用时把陈旧 warm 数据误当成本轮结果。
+    CcecOps::Publish(&result.pmu_window_ticks, static_cast<uint64_t>(0));
+    CcecOps::Publish(&result.pmu_warm_total_cycles, static_cast<uint64_t>(0));
+    CcecOps::Publish(&result.pmu_warm_window_ticks, static_cast<uint64_t>(0));
+    CcecOps::Publish(&result.pmu_warm_icache_requests, static_cast<uint32_t>(0));
+    CcecOps::Publish(&result.pmu_warm_icache_misses, static_cast<uint32_t>(0));
+}
+
+__aicore__ inline void PublishIcachePair(
+    __gm__ pa_scheduler::WorkerResult &result, const IcachePairSnapshot &pair
+) {
+    PublishPmuSnapshot(result, pair.cold);
+    CcecOps::Publish(&result.pmu_window_ticks, pair.cold_window_ticks);
+    CcecOps::Publish(&result.pmu_warm_total_cycles, pair.warm.total_cycles);
+    CcecOps::Publish(&result.pmu_warm_window_ticks, pair.warm_window_ticks);
+    CcecOps::Publish(&result.pmu_warm_icache_requests, pair.warm.icache_requests);
+    CcecOps::Publish(&result.pmu_warm_icache_misses, pair.warm.icache_misses);
 }
 
 __aicore__ inline bool CcecOps::PmuWindowStart(
@@ -314,8 +438,8 @@ __aicore__ inline void RunPmuProbe(__gm__ pa_scheduler::SchedulerState *state, u
     using namespace pa_scheduler::ccec_pmu;
     __gm__ pa_scheduler::WorkerResult &result = state->results[worker_id];
     const WindowMode mode = static_cast<WindowMode>(state->config.reserved[kConfigMode]);
-    // SubmitAll 已在公共调度器 hook 内完成 start/stop/read/publish；此处只保留
-    // empty/scalar/scalar-double 校准，保证校准链路与正式窗口可独立复验。
+    // SubmitAll 已在公共调度器 hook 内完成 start/stop/read/publish；此处保留
+    // empty/scalar/scalar-double/icache-single 校准，和正式窗口可独立复验。
     if (mode == WindowMode::SubmitAll) return;
 
     PmuSnapshot sample;
@@ -325,6 +449,19 @@ __aicore__ inline void RunPmuProbe(__gm__ pa_scheduler::SchedulerState *state, u
         if (context.reg_base != 0) {
             bisheng::cce::metrics_prof_stop();
             const PmuSnapshot prior = ReadObservedCounters(context.reg_base);
+            if (mode == WindowMode::IcacheSingle) {
+                IcachePairSnapshot pair = RunSingleIcacheProbe(
+                    context.reg_base, state->config.reserved[kConfigIcacheTrials], worker_id
+                );
+                pair.cold.status = context.status | kStatusWindowStarted | kStatusWindowStopped |
+                    kStatusIcachePairObserved;
+                if (pair.cold.total_cycles != 0U) pair.cold.status |= kStatusTotalNonzero;
+                if (pair.cold.total_cycles < prior.total_cycles) {
+                    pair.cold.status |= kStatusPriorSnapshotLarger;
+                }
+                PublishIcachePair(result, pair);
+                return;
+            }
             bisheng::cce::metrics_prof_start();
             if (mode == WindowMode::Scalar || mode == WindowMode::ScalarDouble) {
                 RuntimeNop(state->config.reserved[kConfigScalarNops]);

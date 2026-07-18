@@ -17,15 +17,19 @@
 namespace pa_scheduler::ccec_pmu {
 
 // Empty/Scalar/ScalarDouble 在调度结束后校准门控底噪和 scalar 正向响应；
-// SubmitAll 则在公共调度器 hook 内覆盖本 worker 的完整 Submit 回放窗口。
+// IcacheSingle 在每核上成对累计隔离的 cold/warm 目标调用；SubmitAll 则在
+// 公共调度器 hook 内覆盖本 worker 的完整 Submit 回放窗口。
 enum class WindowMode : uint32_t {
     Off = 0,
     Empty = 1,
     Scalar = 2,
     ScalarDouble = 3,
+    // 保留已落远端的 I-cache 校准模式值，避免 standalone host/kernel 混用旧产物时
+    // 把校准请求误解释成 Submit 窗口；新增模式只在枚举尾部扩展。
+    IcacheSingle = 4,
     // SubmitAll 从本 worker 的 orchestration/Submit 回放前开始，到最后一次
     // Submit 返回后停止。
-    SubmitAll = 4,
+    SubmitAll = 5,
 };
 
 inline bool IsSubmitWindow(WindowMode mode) {
@@ -34,7 +38,9 @@ inline bool IsSubmitWindow(WindowMode mode) {
 
 // RunConfig::reserved 保持既有 64B ABI；CCEC 独占解释以下五个槽位，其他后端仍看到全零。
 constexpr uint32_t kConfigMode = 0;
-constexpr uint32_t kConfigScalarNops = 1;
+constexpr uint32_t kConfigWorkAmount = 1;
+constexpr uint32_t kConfigScalarNops = kConfigWorkAmount;
+constexpr uint32_t kConfigIcacheTrials = kConfigWorkAmount;
 constexpr uint32_t kConfigRegTableLow = 2;
 constexpr uint32_t kConfigRegTableHigh = 3;
 constexpr uint32_t kConfigMagic = 4;
@@ -84,7 +90,8 @@ constexpr uint32_t kCnt6SelectorOffset = 0x2518U;
 constexpr uint32_t kCnt7SelectorOffset = 0x251cU;
 constexpr uint32_t kCnt8SelectorOffset = 0x2520U;
 
-// pmu_status 的低位描述本条记录是否可信，高 16 bit 保存 get_coreid()，便于 host 检查 96 核唯一性。
+// pmu_status 的 bits16..27 保存 get_coreid()；bits28..31 留给不参与 core id
+// 解码的模式诊断。其余低位描述本条记录是否可信。
 constexpr uint32_t kStatusRequested = 1U << 0;
 constexpr uint32_t kStatusRegMapped = 1U << 1;
 constexpr uint32_t kStatusCoreIdValid = 1U << 2;
@@ -101,6 +108,9 @@ constexpr uint32_t kStatusCnt4Selector = 1U << 12;
 constexpr uint32_t kStatusCnt5Selector = 1U << 13;
 constexpr uint32_t kStatusCnt8Selector = 1U << 14;
 constexpr uint32_t kStatusWindowStopped = 1U << 15;
+// I-cache 配对标志不能复用 Submit start bit；StatusCoreId 只取 12 bit，故将
+// 它放在 core-id 区间之上的独立诊断位。
+constexpr uint32_t kStatusIcachePairObserved = 1U << 28;
 constexpr uint32_t kStatusRequired = kStatusRequested | kStatusRegMapped | kStatusCoreIdValid |
                                      kStatusCnt2Selector | kStatusCnt6Selector | kStatusCnt7Selector |
                                      kStatusCnt0Selector | kStatusCnt1Selector | kStatusCnt3Selector |

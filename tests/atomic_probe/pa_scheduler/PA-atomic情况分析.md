@@ -831,9 +831,10 @@ ALL/AIC/AIV 的 `sum/mean/median/p95/max` 与 JSON summary 完全一致：
 门控会改变多核到达与争用时序。本三轮内，I-cache request/miss 总和及
 miss rate 比 total/scalar busy 更稳定；AIC/AIV 分组 miss rate 的三轮中位数
 分别约为 3.1138% 和 12.0556%。这只是当前同配置三轮的可重复现象，
-尚不能说明 miss 的来源，也不能换算成 stall 时间。三轮最大 programmable
+尚不能说明 miss 的来源，也不能直接换算成精确 stall 时间；可按 7.3.3 的
+90 ns/miss 标尺做一阶等效数量级估算。三轮最大 programmable
 counter 分别为 5,559,659、6,021,532 和 7,082,609，均低于 25% 风险门槛；
-这仍不构成“已证明未回卷”。本机证据文件位于：
+这仍不构成“已证明未回卷”。本机未入库证据文件位于：
 
 ~~~text
 outputs/scalar_observation_final_20260718/pmu_submit_all_ccec_b256_v2/pmu_submit_all.json
@@ -841,7 +842,62 @@ outputs/scalar_observation_final_20260718/pmu_submit_all_ccec_b256_v2_run2/pmu_s
 outputs/scalar_observation_final_20260718/pmu_submit_all_ccec_b256_v2_run3/pmu_submit_all.json
 ~~~
 
-#### 7.3.3 阶段决定与后续使用边界
+#### 7.3.3 单次 CNT7 I-cache miss 的时间标尺
+
+此前 100000 NOP 的 aggregate residual 只能证明 I-cache 事件会响应，不能把一段
+热循环里的多次 request/miss 直接除成“单次 miss 延迟”。为给 scalar 性能分析
+建立与“单次 atomic 约 160 ns”同样直观的数量级，CCEC 新增
+`--pmu-window icache-single` 配对校准：目标函数只有 8 B 并按 128 B I-cache line
+对齐；每个 cold trial 先在窗口外执行 64 KiB 指令 capacity sweep，warm trial 则在
+PMU read-clear 前额外调用一次相同目标。1 GHz sys counter 只包住最终目标调用，
+两条路径的 PMU gate、harness 和目标符号完全相同。
+
+64 trials/core × 10 轮以及 128 trials/core × 5 轮均满足：
+
+~~~text
+cold CNT7 miss == trials
+warm CNT7 miss == 0
+miss_delta == 96 * trials
+calibrated_cores == 96/96
+~~~
+
+按每轮 `sum(cold_ticks-warm_ticks) / sum(cold_miss-warm_miss)` 计算，
+完整分布为：
+
+| 规模 | ALL median（range） | AIC median（range） | AIV median（range） |
+| ---- | ------------------------: | ------------------------: | ------------------------: |
+| 64 trials/core × 10 | 86.596（86.532～86.792）ns/miss | 85.913（85.848～86.202）ns/miss | 86.938（86.861～87.086）ns/miss |
+| 128 trials/core × 5 | 89.629（89.615～89.648）ns/miss | 92.100（91.984～92.267）ns/miss | 88.410（88.310～88.440）ns/miss |
+
+总体系数观测范围为 86.532～89.648 ns/miss；同一时段重跑 64 和 128 trials
+都约为 89.6 ns/miss。AIC/AIV 差值的方向在两组规模间改变，不建立跨时段
+的角色精确常数。几 ns 的变化属于并发环境下的有效 miss penalty 波动，
+不应保留成伪精确常数。后续 scalar 分析使用下面的取整公式即可：
+
+~~~text
+T_icache_est_ns = CNT7_miss_total * 90
+T_icache_est_us = CNT7_miss_total * 0.09
+~~~
+
+即 1,000 个 miss 约解释 90 us，10,000 个约解释 0.9 ms；单次 I-cache miss 的
+量级约为当前 160 ns atomic 标尺的 56%。如果结果已经按角色拆开，也可以使用当次
+探针打印的 AIC/AIV 系数分别计算后相加；只有总 miss 时统一乘 90 ns。
+
+compulsory、capacity、conflict miss 都会进入 `CNT7` 总数，PMU 本身不提供原因
+分类，所以上式三类全算。本探针刻意制造的是 capacity eviction，测得的是 96 核
+并发、cold 相对 warm 的一阶等效时间。真实 scalar 路径可能存在预取、多个 miss
+重叠、不同下级命中位置或排队，因此乘积用于直观归因和数量级判断，不能宣称为
+逐次精确、完全可加的 stall 时间。
+
+本机未入库的原始日志为：
+
+~~~text
+tests/atomic_probe/pa_scheduler/outputs/pmu_validation/
+  icache_single_64x10_20260718_085929_3232836_console.log
+  icache_single_128x5_20260718_090151_3235468_console.log
+~~~
+
+#### 7.3.4 阶段决定与后续使用边界
 
 直接 owner、每核 selector/MMIO、实际 gate 状态、96 核拓扑和 Restore 已达到继续
 建设观察链路的正确性门槛。正式 Submit PMU 只保留一个窗口：`submit-all`。它从
@@ -866,9 +922,10 @@ D1 已在 standalone 公共调度器中增加 worker-local 软件计数，不新
 - 扫描遇到 not-ready flag 退出时递增 terminal load。
 
 计数先保存在本核 `LocalStats`，kernel 结束时才发布到独占 `WorkerResult`。
-`WorkerResult` 从 704 B 扩展到 768 B，但原 PMU 字段 offset、生产 DistGlobal/DistCore
-offset 和 `LocalSlot` ABI 都不变。三后端完整重建后，smoke 和 256 batch 默认 NOP
-均通过全部语义断言。
+`WorkerResult` 在 D1 从 704 B 扩展到 768 B；合入 atomic 泳道计数和 I-cache
+cold/warm 配对字段后，standalone 诊断 sidecar 按完整 cache line 扩展到 832 B。
+原 PMU 字段 offset、生产 DistGlobal/DistCore offset 和 `LocalSlot` ABI 都不变。
+三后端完整重建后，smoke 和 256 batch 默认 NOP 均通过全部语义断言。
 
 对任一 worker，若其完成数为 `Cw`、fanin 边数为 `Ew`、失败 load 为 `Fw`，则
 逐核检查：
@@ -945,8 +1002,10 @@ O2 先完成观察链路，不在同一阶段继续消减 atomic。它回答两�
 
 两类数据默认分开采集。逐 atomic trace 会增加两次 `get_sys_cnt()`、分支和一条
 64 B 私有 record 写入，进而改变代码布局、I-cache、worker 到达顺序、共享地址竞争
-和轮询次数；PMU-only 的扰动小于完整泳道，更适合取 AIC/AIV 平均和 PMU event
-A/B。正式 PMU JSON 强制 `--no-swimlane`，不与 atomic trace 或 phase profile 合并；
+和轮询次数。PMU-only 不写完整泳道记录，观察机制与扰动来源不同；由于
+`submit-all` gate 自带 `PIPE_ALL`，当前没有同配置 A/B 证明其总扰动一定更小。
+它用于取 AIC/AIV 平均和 PMU event A/B。正式 PMU JSON 强制
+`--no-swimlane`，不与 atomic trace 或 phase profile 合并；
 两套结果只按同一源码版本和各自明确的 scope 交叉解释，不能声称逐 tick 精确对齐。
 
 #### 7.5.2 十五个 site 与四种 op
@@ -1119,6 +1178,8 @@ PMU JSON sidecar 按 worker 保留 raw 记录，并分别汇总 32 AIC、64 AIV 
 owner 已收入 `pa_scheduler/ccec`，所有构建和运行文件均位于 standalone 目录内。
 构建产出 Path-A dispatcher 与 owner AArch64 SO；host 通过已验证的 bootstrap、mode-0
 注册和 `simpler_aicpu_exec` 执行 Configure/Restore，不需要另一个进程提供 selector。
+当前 owner 没有跨进程互斥锁；同一设备上不得并发运行另一个 PMU owner 会话或
+`msprof` PMU 会话，否则 selector、启动前保存态和 Restore 都可能被相互覆盖。
 本次上板闭环包括：
 
 - 对同一 stream 调用 `aclrtGetStreamResLimit`，A5 实报 AIC 32、AIV 64，活跃
@@ -1128,11 +1189,13 @@ owner 已收入 `pa_scheduler/ccec`，所有构建和运行文件均位于 stand
   `000003ff:fff3ff7f:f7cffcff:fffdf7ff`；
 - 第一个跳过项是 index 11，`CTRL0` 读回 `0xffffffff`，期望 `0x7`；这是
   不可配置 slot 的显式证据，不再泛化成 loader 失败；
-- restore 只按 bitmap 从 107 到 0 逆序还原；dependent-atomic 最小样本和 11 对
-  WARM/COLD I-cache 样本都位于成功 bitmap 的物理核 18，最终均为
-  `pmu_restore_and_cleanup=PASS`；
-- WARM/COLD 对照每轮均为 warm miss 0、cold miss 68，11/11 pair PASS，证明
-  `CNT6/CNT7` 对受控 I-cache 工作量有稳定方向性。
+- restore 只按 bitmap 从 107 到 0 逆序还原，standalone 本体的 owner 闭环以
+  96/96 物理子核、完整 triplet 和 Restore PASS 为准；
+- 另有一组独立基础微基准位于 `tests/atomic_probe/ccec`：dependent-atomic 最小样本
+  和 WARM/COLD I-cache 对照使用成功 bitmap 中的物理核 18，三个独立会话共
+  33 对均为 warm miss 0、cold miss 68，且每个会话都为
+  `pmu_restore_and_cleanup=PASS`。这只是旁路的 CNT6/CNT7 方向性证据，不代替
+  `pa_scheduler` 的 96 核 owner 验收或 7.3.3 的 `icache-single` 标定。
 
 standalone 本体还进一步通过 96/96 owner membership、精确 worker slot、物理 role、
 32 个完整 triplet、每核 window started/stopped 和 Restore 门禁。`batches=1,nop=0`
@@ -1154,7 +1217,7 @@ PMU hook 和 CNT0..8 sidecar 已实现。2026-07-18 已用干净重编的 CCEC A
 Claim raw schema v2 也已直接闭环为 `won=5/lost=283/not_attempted=192`，不再
 借助 Atomic 记录反推 role-filtered Claim。converter 的直接脚本与 `python -m unittest`
 两种入口均为 4/4 PASS。b1 的 Atomic 按边界闭环为
-`return_ready=1193/source_issue=202`。本轮产物为：
+`return_ready=1193/source_issue=202`。本轮未入库产物为：
 
 ~~~text
 outputs/scalar_observation_final_20260718/atomic_inlineasm_ccec_b1/raw.json
@@ -1169,7 +1232,7 @@ b1 用于确认边界、schema 和泳道布局，不用它的插桩后 Submit sp
 不存在旧 `AIC/AIV·atomic` 线程，atomic 全部位于对应 scalar lane。本轮
 边界计数为 `return_ready=97192/source_issue=2752`，与动态 site 计数之和一致；
 插桩 Submit span 为 5.209261 ms，只证明观察构建未把数量级打坏；正式
-性能仍以关闭 trace/PMU 的独立进程 A/B 为准。产物为：
+性能仍以关闭 trace/PMU 的独立进程 A/B 为准。本轮未入库产物为：
 
 ~~~text
 outputs/scalar_observation_final_20260718/atomic_inlineasm_ccec_b256/raw.json
@@ -1211,7 +1274,8 @@ frontier helping 和 winner 分布会带来明显轮间波动；一次 5.209261 
   一定能等量缩短墙钟时间；不同核 bracket 会重叠，poll 数也会随插桩改变；
 - `ClockBaseline` 可以逐事件相减并得到无偏的 atomic 硬件净耗时；
 - trace 开启后的 Submit span 可以直接与无 trace 基线比较并宣布性能收益；
-- `scalar_busy/total_cycles` 是墙钟时间，或 I-cache miss 数可以直接换算成 stall ns；
+- `scalar_busy/total_cycles` 是墙钟时间，或 I-cache miss 数可以直接换算成精确
+  stall ns；7.3.3 的 90 ns/miss 只是受控 cold/warm 探针得到的一阶等效估算；
 - standalone 的 scalar NOP 已经真实模拟了 vector/cube task 期间 scalar 的等待状态；
   NOP 本身在 scalar 上执行并被 `submit-all` 统计，`PIPE_ALL` gate 还会收口流水；
 - 最大 32-bit counter 低于 25% 风险门槛就证明本轮没有回卷；该门槛只降低风险，
