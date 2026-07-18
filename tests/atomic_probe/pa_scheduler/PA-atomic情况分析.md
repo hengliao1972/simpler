@@ -3,8 +3,8 @@
 ## 1. 范围与当前结论
 
 本文记录 `TestPagedAttentionUnroll::Case1` 在真实 A5 上的 FDWIC AICore
-Submit 路径，供后续继续优化。快照日期为 2026-07-17，当前代码提交为
-`e3b748b43c7f226c025c4dcdfc2eb2805cec7f21`。
+Submit 路径，供后续继续优化。快照日期更新至 2026-07-18；当前保留的生产
+优化基线为 `2c3dd1e2`，F1 负结果记录提交为 `c93c3666`。
 
 范围限定为：
 
@@ -26,9 +26,11 @@ Submit 路径，供后续继续优化。快照日期为 2026-07-17，当前代�
 - 三轮最终版本的首末 Submit 中位数为 5.115620 ms，相比
   5.642245 ms 基线下降 0.526625 ms，即 9.33%；最好单轮为
   5.096685 ms；
+- H1 又消除了默认 256 MiB heap 第一圈的 1024 次 frontier atomic load，
+  十对真实 A5 的配对变化中位数为 -0.324%，最好单轮为 5.098696 ms；
 - 优化没有改变通用 atomic 语义，也没有把任务推迟到最终 drain 来制造
-  表面收益；下一优先级应是 Claim 竞争，其次是 completion/frontier 和
-  fanin ready 轮询。
+  表面收益。F1 的 fanin 顺序重排已经证明性能回退并撤销；下一步先精确区分
+  fanin 成功/失败 load 与 frontier 重复前推，再进行单变量消减。
 
 环境安装、编译和基线复现过程见
 [A5 FDWIC Paged Attention 安装与复现指南](../A5_FDWIC_PAGED_ATTENTION_REPRO.md)。
@@ -98,12 +100,14 @@ worker 更同步，cursor 瞬时竞争反而变强。总时间仍然下降，但
 `output_bytes>0` 时进入检查；本 Case 每 batch 的 Alloc、QK、SF、PV 满足，
 UP 不满足，所以共有 1024 次有效调用。
 
-最好一轮没有 `RingBp` 事件，表示每次调用都在第一次循环检查后返回：
+H1 后最好一轮没有 `RingBp` 事件，且默认 256 MiB heap 的 1024 次有效调用都
+命中第一圈 fast path：
 
 - `fatal_set()`：固定 1024 次 `atomic_load(g_dist.fatal)`；
-- frontier：固定 1024 次 `atomic_load(g_dist.frontier)`；
-- `load_task_vend(F-H)`：当索引非负时执行 `atomic_load(cell.vend)`，本轮
-  次数介于 0 和 1024，现有 trace 不能给出精确值；
+- frontier：第一圈为 0 次；只有逻辑 heap 超过一整圈后才恢复原
+  `atomic_load(g_dist.frontier)`；
+- `load_task_vend(F-H)`：第一圈为 0 次；跨圈后仍按原 frontier/vend 容量
+  规则执行；
 - 如果未来出现 heap backpressure，上述三项会在循环中重复，耗时会归入
   `RingBp`。
 
@@ -133,8 +137,25 @@ Submit 的 `EfDrain`，有背压时可能在 `RingBp`，剩余任务则在最终
 | `task.vend` | `atomic_exchange` | 每 task 固定一次 | 1280 |
 | `task.flag` 发布 | `atomic_exchange` | 每 task 固定一次 | 1280 |
 | `frontier` 初始读取 | `atomic_load` | 每 task 固定一次 | 1280 |
-| 后续 `task.flag` ready | `atomic_load` | 下界 | >=1280 |
-| `frontier` 前推 | `atomic_fetch_max` | 下界，竞争时可重复 | >=1280 |
+| 后续 `task.flag` ready | `atomic_load` | 若前推次数为 A，则准确为 A+1280 | >=2560 |
+| `frontier` 前推 | `atomic_fetch_max` | 记为 A，竞争时可重复 | >=1280 |
+
+原因是每次 `advance_frontier()` 都以一次未就绪 flag load 结束；每次成功
+`atomic_fetch_max(frontier)` 前又恰有一次 ready flag load。因此完整成功运行中，
+该处 flag load 不是笼统的“至少 1280”，而是准确的 `A + 1280`。
+
+若把 fanin ready load 记为 `G`，H1 后完整 Submit + completion 路径的 atomic
+总数为：
+
+~~~text
+73728 Claim + 1024 HeapGuard fatal + G fanin
++ 1280 vend exchange + 1280 flag exchange + 1280 frontier initial load
++ A frontier atomicMax + (A + 1280) frontier flag load
+= 79872 + G + 2A
+~~~
+
+由于 `G>=1280`、`A>=1280`，硬下界为 83712 次。`G` 和 `A` 受真实调度时序
+影响，不能用静态下界代替动态样本。
 
 最终最好一轮的 1024 个 kernel 中，1011 个在某个 Submit 的 `EfDrain`
 中执行，0 个在 `RingBp` 中执行，13 个在本核最后一个 Submit 之后的最终
@@ -721,3 +742,64 @@ F1 在固定状态下的 atomic load 不增证明成立，三后端语义也全�
 standalone 的 Submit 中位数、均值和配对中心都没有改善。因此不将这个启发式
 重排迁移到真实 `dist_submit_collect_fanin()`，也不进行真实 PA A/B。standalone
 候选代码已撤回，本节保留负结果，防止后续重复同一实验。
+
+### 7.3 阶段 O1：建立 CCEC 每核 scalar PMU 观察链路
+
+#### 7.3.1 为什么不再使用 external task 汇总冒充局部数据
+
+控制实验已经证明：即使在 kernel 内调用 CANN 正式 `metrics_prof_stop()`，
+external task-based `msprof` 的整任务 raw cycles 仍不会随局部门控骤降。因此该
+汇总只能描述整个 task，不能作为 Claim、EfDrain、WaitForSlot 或 HeapGuard 的
+局部取数依据。
+
+O1 在 standalone CCEC 同一 runtime TU 内完成门控、读取和发布：host 复用正式
+A5 runtime 的 `halResMap(PROCESS_CP1, RES_AICORE)` 布局，将 36 个 AICore 展开为
+108 个物理子核 MMIO base；kernel 用真实 `get_coreid()` 索引，逐核核对
+PipeUtilization 的 `CNT2=0x1`、`CNT6=0x34`、`CNT7=0x35` selector，最后只读取
+一次 `CNT_TOTAL/CNT2/CNT6/CNT7` 并写入每 worker 独占结果区。
+
+这套 PMU 事件不直接给出 atomic 操作条数。atomic 条数继续由源码不变量和
+worker-local 软件计数精确核对；PMU 用于观察这些 atomic 及周边 scalar 指令造成
+的周期、I-cache request/miss 和竞争时序变化，两种证据不能相互冒充。
+
+#### 7.3.2 A5 动态验证结果
+
+在 CANN 9.1 task-based PipeUtilization 配置下，分别执行 10 轮 empty、单段
+100000 NOP 和双段 `2×100000` NOP。三组每轮都满足 96/96 selector/MMIO 记录
+可信、96/96 物理子核 id 唯一；CCEC、AscendC、CPU 原语义 smoke 也全部 PASS。
+
+| 窗口 | 96 核 total 中位数 | 稳定性与响应 |
+| ---- | -----------------: | ------------ |
+| empty | 预热后约 419 | 轮间约 ±1，给出空窗口 gate 固定开销 |
+| scalar 100000 | 预热后约 56775 | 轮间约 ±2，CNT2/req/miss 同步增加 |
+| scalar-double 2×100000 | 预热后约 113113 | 轮间约 ±8，扣除 empty 后为单段 1.9997 倍 |
+
+I-cache request 的每核量级约为 empty 22、单段 26245、双段 52476；miss 约为
+4、23、45。窗口前 snapshot 会消费/清除此前累计；双段中间只执行
+`stop/start`、不读取 MMIO，末尾一次 snapshot 仍得到近似精确的两倍响应。
+这证明多窗口续积机制成立，而不需要在每次 Submit 中插入高扰动 MMIO read；
+扩展到上千个真实小窗口仍需进一步核对 gate 次数、同次数 empty 对照和 counter
+是否溢出，不能由双段结果直接宣称已经精确覆盖任意窗口数。
+
+原始日志保留在：
+
+~~~text
+tests/atomic_probe/pa_scheduler/outputs/pmu_validation/
+  empty10_20260718_015533_console.log
+  scalar100k_10_20260718_015558_console.log
+  scalar2x100k_10_20260718_021035_console.log
+~~~
+
+#### 7.3.3 阶段决定与后续使用边界
+
+O1 已达到“可用”的门槛：物理核映射、事件 selector、正向敏感性、A/A 重复性
+和双 gate 累计全部在真实 A5 上得到动态验证。因此后续可以恢复 atomic 优化，
+但一次运行只选择一个阶段，A/B 两侧保持完全相同的 gate 次数和代码布局，并用
+同次数 empty gate 对照门控成本。真实 vector/cube kernel 不能跳过；测 EfDrain
+时应在唯一 kernel 调用点暂时 stop，返回后仅在原 gate 活跃时 resume，从而保留
+真实依赖时序而排除计算体计数。
+
+下一步先在 standalone 增加 `G` 的成功/失败分类、`A`、frontier ready/终止 load
+等 worker-local 诊断计数，不增加共享 atomic。得到动态规模后，首个低风险单变量
+候选是每个私有 slot 缓存已经观察为 ready 的 fanin 前缀；slot 重用时必须重置，
+且先完成 CCEC 交错 A/B，再决定是否迁移到真实 FDWIC。

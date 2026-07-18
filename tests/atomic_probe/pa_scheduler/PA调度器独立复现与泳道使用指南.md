@@ -266,6 +266,95 @@ CPU 完整协议回归建议关闭大泳道缓冲区：
 WaitForSlot 和 HeapGuard 的 `calls_total` 会按 winner 所在角色分布，AIC/AIV
 相加必须分别等于 1,024；等待事件则对应额外的 RingBp 泳道记录。
 
+### 5.6 CCEC 每核 scalar PMU 与 I-cache 诊断
+
+CCEC 后端提供一个显式诊断模式，用来验证局部 scalar 性能观察链路。它不读取
+`msprof` 导出的整任务 PMU 汇总作为局部结果，而是由 kernel 在每个物理子核上
+直接读取 `CNT_TOTAL/CNT2/CNT6/CNT7`，最后写入该 worker 独占的
+`WorkerResult`。对应含义为：
+
+| 字段 | PipeUtilization selector | 含义 |
+| --- | ---: | --- |
+| `pmu_total_cycles` | PMU total | gate 窗口累计周期 |
+| `pmu_scalar_busy` | `CNT2 = 0x1` | scalar 原始事件计数 |
+| `pmu_icache_requests` | `CNT6 = 0x34` | I-cache request |
+| `pmu_icache_misses` | `CNT7 = 0x35` | I-cache miss |
+
+selector 和 PMU framework 仍由 CANN 9.1 的 task-based profiler 配置；CCEC
+只做门控与读取。一次 snapshot 会消费/清除此前累计，因此窗口前先冻结并做一次
+baseline read-clear，窗口中间只切 gate，末尾再做唯一一次结果 snapshot。host
+按正式 A5 runtime 的方式调用 `halResMap`，构造 36 个
+物理 AICore展开后的 108 项子核 MMIO 表；kernel 使用真实 `get_coreid()` 索引，
+不能用逻辑 `worker_id` 猜物理核。
+
+在本目录先构建 CCEC，再直接让 `msprof` 包住 host runner：
+
+```bash
+./run.sh build ccec
+
+OUT="./outputs/pmu_validation/empty"
+msprof \
+  --output="$OUT" \
+  --type=db \
+  --ai-core=on \
+  --aic-mode=task-based \
+  --aic-metrics=PipeUtilization \
+  ./build/ccec/pa_scheduler_host \
+  --kernel ./build/ccec/pa_scheduler_kernel.o \
+  --device 0 --batches 1 --runs 10 --nop-count 0 --no-swimlane \
+  --pmu-window empty
+```
+
+三个诊断窗口的用途是：
+
+- `empty`：只执行一次 start/stop，量空窗口的 gate 固定开销；末尾 snapshot 在
+  stop 后执行，其 MMIO 读取开销不计入 total；
+- `scalar`：在同一窗口内执行 `--pmu-scalar-nops N` 个受控 NOP；
+- `scalar-double`：执行两段相同 NOP，中间只 stop/start、不读 counter，用于验证
+  多个局部窗口能否暂停后继续累计；
+- `off`：默认值，不申请 MMIO 表，也不要求由 `msprof` 启动。
+
+例如 10 万 NOP 的正向敏感性测试只需把末尾参数换成：
+
+```bash
+--pmu-window scalar --pmu-scalar-nops 100000
+```
+
+每轮必须同时看到：
+
+```text
+trusted=96/96 unique_coreids=96/96
+[ASSERT] all PMU records have configured selectors and data PASS
+[ASSERT] all 96 PMU physical subcore ids are unique PASS
+```
+
+`trusted` 会逐核检查 MMIO 映射、三个 selector 和非零 total；因此不能用“外部
+profiler 已经启动”代替实际 selector 读回。AIC 与 AIV 分开输出，I-cache miss
+rate 使用 `sum(miss) / sum(request)`，不平均逐核百分比。`pmu_scalar_busy` 是原始
+事件计数；empty 窗口中它可以大于 total，不能把两者比值直接宣传成利用率。
+
+2026-07-18 的 A5 验证结果为：
+
+| 窗口 | 轮次 | 96 核 total 中位数 | 结论 |
+| --- | ---: | ---: | --- |
+| empty | 10 | 预热后约 419，轮间约 ±1 | 空窗口 gate 开销稳定 |
+| scalar 100,000 | 10 | 预热后约 56,774，轮间约 ±2 | scalar/req/miss 均稳定响应 |
+| scalar-double 2×100,000 | 10 | 预热后约 113,113，轮间约 ±8 | 扣除 empty 后为单段的 1.9997 倍，多 gate 可续积 |
+
+同一轮中，I-cache request 从 empty 的每核约 22 增至单段的约 26,245，双段约
+52,476；miss 也从每核约 4 增至约 23/45。双段十轮中 96 核均满足
+`trusted=96/96` 和物理子核 id 唯一，说明本链路能直接看到 scalar 和 I-cache
+变化，也证明 stop/start 之间不读 counter 时，多段窗口会累计到末尾唯一一次
+snapshot。首次热身的 p95 偶有偏高，正式比较应丢弃首轮，并保留 A/A
+重复性数据。
+
+这里验证的是观察手段，不是 PA 优化本身。后续用于 Claim、EfDrain、
+WaitForSlot 或 HeapGuard 时，应先做一次 baseline read-clear，多个局部窗口之间只切
+gate，最后每核读取一次；禁止每个 Submit 都读 MMIO。当前双段只证明多窗口续积
+机制成立，扩展到上千个真实小窗口时仍要核对 gate 次数、empty 对照和 counter
+是否溢出。empty 开销和诊断代码布局必须在 A/B 两边完全相同，真实 PA 的最终
+结论仍需撤回诊断代码后再跑原始泳道与 golden。
+
 ## 6. 当前 A5 结果与真实 PA 的差异
 
 2026-07-17 当前源码的一轮代表性结果如下。所有严格校验均为 PASS，kernel

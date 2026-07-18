@@ -493,10 +493,20 @@ struct alignas(64) WorkerResult {
     uint64_t role;
     uint64_t max_occupied;
     uint64_t final_occupied;
+
+    // CCEC 标量 PMU 取证复用 WorkerResult 原有的 24B 尾部 padding，不增加结果区大小。
+    // 该诊断只在显式开启时有效；CNT2/CNT6/CNT7 分别对应 scalar busy、I-cache req/miss。
+    uint64_t pmu_total_cycles;
+    uint32_t pmu_scalar_busy;
+    uint32_t pmu_icache_requests;
+    uint32_t pmu_icache_misses;
+    uint32_t pmu_status;
 };
 // WorkerResult 是 standalone 尾部的诊断 sidecar，不属于真实 DistCore ABI；按
 // cache line 隔离后，各 worker 发布统计不会相互覆盖或污染被测共享状态。
-static_assert(sizeof(WorkerResult) % 64 == 0, "WorkerResult must not share cache lines");
+static_assert(sizeof(WorkerResult) == 704, "WorkerResult PMU fields must only consume existing tail padding");
+static_assert(offsetof(WorkerResult, pmu_total_cycles) == 680, "WorkerResult PMU offset mismatch");
+static_assert(offsetof(WorkerResult, pmu_status) == 700, "WorkerResult PMU status offset mismatch");
 
 // 从 cube_cursor 到 workers 结束保留关键字段 offset、DistCore ABI 和生产总字节跨度，
 // 并非字段级完整镜像。RunConfig、输入 context_lens 与校验结果追加在该跨度之后，

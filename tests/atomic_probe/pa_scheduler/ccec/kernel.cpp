@@ -12,6 +12,8 @@
 #include "cce_aicore_intrinsics.h"
 #include <pto/common/kernel_meta.hpp>
 
+#include "pmu_probe.h"
+
 #define PA_DEVICE __aicore__ inline
 #define PA_GM __gm__
 #include "../common/pa_scheduler_core.h"
@@ -127,7 +129,110 @@ struct CcecOps {
         // 每核独占的 WorkerResult 用 bypass-DCache store 发布，host 同步后可直接 D2H，无需共享原子竞争。
         __builtin_cce_st_dev(value, address, 0);
     }
+
+    __aicore__ static inline void Publish(__gm__ uint32_t *address, uint32_t value) {
+        __builtin_cce_st_dev(value, address, 0);
+    }
 };
+
+struct PmuSnapshot {
+    uint64_t total_cycles = 0;
+    uint32_t scalar_busy = 0;
+    uint32_t icache_requests = 0;
+    uint32_t icache_misses = 0;
+    uint32_t status = 0;
+};
+
+template <uint32_t BlockOffset, uint32_t RegisterOffset>
+__aicore__ inline uint32_t ReadPmuRegister(uint64_t reg_base) {
+    // 传给 ld_dev 的是重基址后的 __gm__ 指针；相对 offset 均落在编译器允许的 [-2048, 2047]。
+    int32_t *block = reinterpret_cast<int32_t *>(reg_base + BlockOffset);
+    return static_cast<uint32_t>(ld_dev(block, static_cast<int16_t>(RegisterOffset - BlockOffset)));
+}
+
+__aicore__ inline PmuSnapshot ReadObservedCounters(uint64_t reg_base) {
+    PmuSnapshot sample;
+    sample.scalar_busy = ReadPmuRegister<pa_scheduler::ccec_pmu::kCounterBlockOffset,
+                                         pa_scheduler::ccec_pmu::kCnt2Offset>(reg_base);
+    sample.icache_requests = ReadPmuRegister<pa_scheduler::ccec_pmu::kCounterBlockOffset,
+                                             pa_scheduler::ccec_pmu::kCnt6Offset>(reg_base);
+    sample.icache_misses = ReadPmuRegister<pa_scheduler::ccec_pmu::kCounterBlockOffset,
+                                           pa_scheduler::ccec_pmu::kCnt7Offset>(reg_base);
+    const uint64_t low = ReadPmuRegister<pa_scheduler::ccec_pmu::kCounterBlockOffset,
+                                         pa_scheduler::ccec_pmu::kTotalLowOffset>(reg_base);
+    const uint64_t high = ReadPmuRegister<pa_scheduler::ccec_pmu::kCounterBlockOffset,
+                                          pa_scheduler::ccec_pmu::kTotalHighOffset>(reg_base);
+    sample.total_cycles = low | (high << 32);
+    return sample;
+}
+
+__aicore__ inline void RunPmuProbe(__gm__ pa_scheduler::SchedulerState *state, uint32_t worker_id) {
+    using namespace pa_scheduler::ccec_pmu;
+    __gm__ pa_scheduler::WorkerResult &result = state->results[worker_id];
+    PmuSnapshot sample;
+
+    const WindowMode mode = static_cast<WindowMode>(state->config.reserved[kConfigMode]);
+    if (mode != WindowMode::Off) {
+        sample.status |= kStatusRequested;
+        const uint32_t physical_core_id = static_cast<uint32_t>(get_coreid()) & kStatusCoreIdMask;
+        sample.status |= physical_core_id << kStatusCoreIdShift;
+        const uint64_t table_address =
+            static_cast<uint64_t>(state->config.reserved[kConfigRegTableLow]) |
+            (static_cast<uint64_t>(state->config.reserved[kConfigRegTableHigh]) << 32);
+        if (state->config.reserved[kConfigMagic] == kConfigMagicValue && table_address != 0 &&
+            physical_core_id < kPhysicalSubcoreCount) {
+            sample.status |= kStatusCoreIdValid;
+            __gm__ const uint64_t *register_bases = reinterpret_cast<__gm__ const uint64_t *>(table_address);
+            const uint64_t reg_base = register_bases[physical_core_id];
+            if (reg_base != 0) {
+                sample.status |= kStatusRegMapped;
+                const uint32_t selector2 =
+                    ReadPmuRegister<kSelectorBlockOffset, kCnt2SelectorOffset>(reg_base);
+                const uint32_t selector6 =
+                    ReadPmuRegister<kSelectorBlockOffset, kCnt6SelectorOffset>(reg_base);
+                const uint32_t selector7 =
+                    ReadPmuRegister<kSelectorBlockOffset, kCnt7SelectorOffset>(reg_base);
+                if (selector2 == kScalarBusyEvent) sample.status |= kStatusCnt2Selector;
+                if (selector6 == kIcacheRequestEvent) sample.status |= kStatusCnt6Selector;
+                if (selector7 == kIcacheMissEvent) sample.status |= kStatusCnt7Selector;
+
+                // 外部 profiler 启动 task 时可能已经累计了 scheduler；先冻结并读取一次窗口前快照。
+                // A5 的 snapshot 会消费/清除当前累计；stop/start 只负责门控，中间不读取才能续积多段窗口。
+                bisheng::cce::metrics_prof_stop();
+                const PmuSnapshot prior = ReadObservedCounters(reg_base);
+                bisheng::cce::metrics_prof_start();
+                if (mode == WindowMode::Scalar || mode == WindowMode::ScalarDouble) {
+                    RuntimeNop(state->config.reserved[kConfigScalarNops]);
+                }
+                if (mode == WindowMode::ScalarDouble) {
+                    // 两段相同工作量之间只切 gate、不读取 counter，用于确认 resume 是累计还是重置。
+                    bisheng::cce::metrics_prof_stop();
+                    bisheng::cce::metrics_prof_start();
+                    RuntimeNop(state->config.reserved[kConfigScalarNops]);
+                }
+                bisheng::cce::metrics_prof_stop();
+                sample = ReadObservedCounters(reg_base);
+                sample.status |= kStatusRequested | kStatusRegMapped | kStatusCoreIdValid |
+                                 (physical_core_id << kStatusCoreIdShift);
+                if (selector2 == kScalarBusyEvent) sample.status |= kStatusCnt2Selector;
+                if (selector6 == kIcacheRequestEvent) sample.status |= kStatusCnt6Selector;
+                if (selector7 == kIcacheMissEvent) sample.status |= kStatusCnt7Selector;
+                if (sample.total_cycles != 0) sample.status |= kStatusTotalNonzero;
+
+                // 窗口前 read-clear 之后只做这一次最终 snapshot；重复读取会看到读取路径自身的残余。
+                // prior 更大只作为“已从此前 scheduler 累计中隔离”的辅助证据，不作为长负载通用门禁。
+                if (sample.total_cycles < prior.total_cycles) sample.status |= kStatusPriorSnapshotLarger;
+            }
+        }
+    }
+
+    // 结果位于每核独占 sidecar，五次 bypass store 不参与 Submit 时间口径。
+    CcecOps::Publish(&result.pmu_total_cycles, sample.total_cycles);
+    CcecOps::Publish(&result.pmu_scalar_busy, sample.scalar_busy);
+    CcecOps::Publish(&result.pmu_icache_requests, sample.icache_requests);
+    CcecOps::Publish(&result.pmu_icache_misses, sample.icache_misses);
+    CcecOps::Publish(&result.pmu_status, sample.status);
+}
 
 }  // namespace
 
@@ -139,6 +244,7 @@ extern "C" __global__ __aicore__ void pa_scheduler_0_mix_aic(__gm__ pa_scheduler
     // 32 个物理 block 的 AIC 直接使用 block_idx，形成连续 worker 0..31。
     const uint32_t worker_id = static_cast<uint32_t>(get_block_idx());
     pa_scheduler::RunScheduler<CcecOps>(state, worker_id, pa_scheduler::CoreRole::Aic);
+    RunPmuProbe(state, worker_id);
 }
 #elif defined(PA_BUILD_AIV)
 PTO_SYNCALL_MIX_AIC_KERNEL_META(pa_scheduler_0_mix_aiv, 1, 2);
@@ -148,6 +254,7 @@ extern "C" __global__ __aicore__ void pa_scheduler_0_mix_aiv(__gm__ pa_scheduler
     const uint32_t vector_id = static_cast<uint32_t>(get_block_idx() * get_subblockdim() + get_subblockid());
     const uint32_t worker_id = pa_scheduler::kAicWorkers + vector_id;
     pa_scheduler::RunScheduler<CcecOps>(state, worker_id, pa_scheduler::CoreRole::Aiv);
+    RunPmuProbe(state, worker_id);
 }
 #else
 #error "Compile with PA_BUILD_AIC or PA_BUILD_AIV"

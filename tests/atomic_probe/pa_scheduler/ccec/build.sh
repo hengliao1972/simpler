@@ -109,6 +109,7 @@ echo "[BUILD] CCEC host runner"
     -L"$ASCEND_HOME_PATH/x86_64-linux/lib64" \
     -Wl,-rpath,"$ASCEND_HOME_PATH/x86_64-linux/lib64" \
     -lascendcl -lruntime \
+    -ldl \
     -o "$BUILD_DIR/pa_scheduler_host"
 
 echo "[BUILD] complete: $BUILD_DIR"

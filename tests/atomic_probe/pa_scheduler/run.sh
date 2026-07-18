@@ -33,6 +33,10 @@ Benchmark options:
   --swimlane-json FILE
   --no-swimlane
 
+CCEC-only PMU probe options (the host must be launched by msprof PipeUtilization):
+  --pmu-window off|empty|scalar|scalar-double
+  --pmu-scalar-nops N
+
 The swimlane action performs exactly one run and writes both the raw capture
 and merged Perfetto JSON below this directory's outputs/ folder. It rejects
 --runs, --swimlane-json, and --no-swimlane because those are managed by the action.
