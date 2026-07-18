@@ -10,6 +10,7 @@
  */
 
 #include "../common/host_support.h"
+#include "../common/winner_workload_host.h"
 
 #define PA_DEVICE inline
 #define PA_GM
@@ -56,6 +57,81 @@ inline void RuntimeNop(uint32_t count) {
     if ((count & 4U) != 0) EmitNops<4>();
     if ((count & 2U) != 0) EmitNops<2>();
     if ((count & 1U) != 0) EmitNops<1>();
+}
+
+// CPU 后端用相同的 128x128 float 输入、输出布局执行真实算术，以便在不依赖
+// CANN 的环境中回归任务分派和输出闭环。这里的普通 CPU 浮点循环只与数学
+// 结果对等，不冒充 A5 Cube/Vector 指令、流水线或 PMU 数据。
+__attribute__((noinline)) void RunRealMatrixWorkload(
+    const float *input_a, const float *input_b, float *output, uint32_t repeats
+) {
+    using namespace pa_scheduler::winner_workload;
+    for (uint32_t iteration = 0; iteration < repeats; ++iteration) {
+        for (uint32_t row = 0; row < kTileRows; ++row) {
+            for (uint32_t column = 0; column < kTileCols; ++column) {
+                float accumulator = 0.0F;
+                for (uint32_t inner = 0; inner < kTileCols; ++inner) {
+                    accumulator += input_a[static_cast<size_t>(row) * kTileCols + inner] *
+                                   input_b[static_cast<size_t>(inner) * kTileCols + column];
+                }
+                output[static_cast<size_t>(row) * kTileCols + column] = accumulator;
+            }
+        }
+        // 每轮都必须把完整结果物化到输出 tile，不能让 O3 因后续轮次覆盖同一
+        // tile 而删除前一轮算术；这是编译器边界，不增加硬件 PMU 或 A5 屏障语义。
+        asm volatile("" : : "r"(output) : "memory");
+    }
+}
+
+template <bool Multiply>
+__attribute__((noinline)) void RunRealVectorWorkload(
+    const float *input_a, const float *input_b, float *output, uint32_t repeats
+) {
+    using namespace pa_scheduler::winner_workload;
+    for (uint32_t iteration = 0; iteration < repeats; ++iteration) {
+        for (size_t element = 0; element < kTileElements; ++element) {
+            output[element] = Multiply ? input_a[element] * input_b[element]
+                                       : input_a[element] + input_b[element];
+        }
+        // 与矩阵路径相同，明确保留每一次完整 elementwise 迭代。
+        asm volatile("" : : "r"(output) : "memory");
+    }
+}
+
+__attribute__((noinline)) void ExecuteRealWinnerWorkload(
+    pa_scheduler::SchedulerState *state, pa_scheduler::WorkerState &worker,
+    pa_scheduler::TaskKind kind
+) {
+    using namespace pa_scheduler;
+    using namespace pa_scheduler::winner_workload;
+    const WinnerWorkloadConfig &config = state->winner_workload;
+    const uint32_t repeats = WorkloadCountForKind(config.repeats, kind);
+    const bool role_matches =
+        (worker.role == CoreRole::Aic && (kind == TaskKind::Qk || kind == TaskKind::Pv)) ||
+        (worker.role == CoreRole::Aiv && (kind == TaskKind::Sf || kind == TaskKind::Up));
+    // 与设备实现采用同一组版本、范围和角色门禁；配置错误不解引用 workspace，
+    // host 的 active tile 数值/sentinel 校验会把本轮判为失败。
+    if (config.version != kWinnerWorkloadConfigVersion || config.workspace_base == 0 ||
+        config.workspace_bytes < kWorkspaceBytes || worker.core_idx < 0 ||
+        static_cast<uint32_t>(worker.core_idx) >= kWorkers || repeats == 0 ||
+        repeats > kMaxRealComputeCount || !role_matches) {
+        return;
+    }
+
+    float *workspace = reinterpret_cast<float *>(static_cast<uintptr_t>(config.workspace_base));
+    const uint32_t kind_slot = (kind == TaskKind::Pv || kind == TaskKind::Up) ? 1U : 0U;
+    const size_t output_tile =
+        kSharedInputTiles + static_cast<size_t>(worker.core_idx) * kOutputTilesPerWorker + kind_slot;
+    float *output = workspace + output_tile * kTileElements;
+    const float *input_a = workspace;
+    const float *input_b = workspace + kTileElements;
+    if (worker.role == CoreRole::Aic) {
+        RunRealMatrixWorkload(input_a, input_b, output, repeats);
+    } else if (kind == TaskKind::Sf) {
+        RunRealVectorWorkload<false>(input_a, input_b, output, repeats);
+    } else {
+        RunRealVectorWorkload<true>(input_a, input_b, output, repeats);
+    }
 }
 
 struct CpuOps {
@@ -130,9 +206,14 @@ struct CpuOps {
     }
 
     static inline void ExecuteKernel(
-        pa_scheduler::SchedulerState *, pa_scheduler::WorkerState &, pa_scheduler::TaskKind,
+        pa_scheduler::SchedulerState *state, pa_scheduler::WorkerState &worker, pa_scheduler::TaskKind kind,
         uint32_t nop_count
     ) {
+        if (state->winner_workload.mode ==
+            static_cast<uint32_t>(pa_scheduler::WinnerWorkloadMode::RealCompute)) {
+            ExecuteRealWinnerWorkload(state, worker, kind);
+            return;
+        }
         RuntimeNop(nop_count);
     }
 
@@ -163,12 +244,39 @@ struct CpuOps {
 // 可选泳道后处理，最后统一释放 trace buffer。
 int main(int argc, char **argv) {
     pa_scheduler::host::Options options;
-    const pa_scheduler::host::ParseStatus parse_status = pa_scheduler::host::ParseOptions(argc, argv, false, &options);
+    pa_scheduler::host::WinnerWorkloadOptions workload_options;
+    std::vector<char *> common_argv;
+    if (!pa_scheduler::host::ParseWinnerWorkloadOptions(
+            argc, argv, &workload_options, &common_argv
+        )) {
+        return EXIT_FAILURE;
+    }
+    const pa_scheduler::host::ParseStatus parse_status = pa_scheduler::host::ParseOptions(
+        static_cast<int>(common_argv.size()), common_argv.data(), false, &options
+    );
     if (parse_status != pa_scheduler::host::ParseStatus::Ok) {
+        if (parse_status == pa_scheduler::host::ParseStatus::Help) {
+            std::fprintf(
+                stderr,
+                "CPU winner workload options: [--winner-workload scalar-nop|real-compute] "
+                "[--real-compute-count N | --real-compute-counts QK,SF,PV,UP]\n"
+            );
+        }
         return parse_status == pa_scheduler::host::ParseStatus::Help ? EXIT_SUCCESS : EXIT_FAILURE;
     }
+    if (!pa_scheduler::host::ValidateWinnerWorkloadOptions(workload_options)) {
+        return EXIT_FAILURE;
+    }
+    const bool real_compute =
+        workload_options.mode == pa_scheduler::WinnerWorkloadMode::RealCompute;
+    std::vector<float> workload_image;
+    std::vector<float> workload_outputs;
     pa_scheduler::host::PrintBanner("CPU", options);
-    std::printf("[NOTE] CPU NOP counts preserve instruction count, not A5 microseconds.\n");
+    pa_scheduler::host::PrintWinnerWorkloadConfig(workload_options, options.nops);
+    std::printf(
+        "[NOTE] CPU scalar NOP preserves instruction count; real-compute preserves arithmetic "
+        "and workspace semantics. Neither represents A5 engine timing or PMU.\n"
+    );
 
     // SchedulerState 很大，放到 heap 而不是主线程栈；trace 继续保持独立的
     // 64 字节对齐区域，以复用设备端完全相同的二进制布局。
@@ -190,6 +298,16 @@ int main(int argc, char **argv) {
     for (uint32_t run = 1; run <= options.runs; ++run) {
         pa_scheduler::host::InitializeState(state.get(), options);
         pa_scheduler::host::ConfigureTrace(state.get(), options, trace_memory);
+        if (real_compute) {
+            // runs>1 必须恢复所有输出 sentinel，避免上一轮 winner 的 tile 被误认
+            // 为本轮结果；输入也由公共 helper 恢复成与设备后端相同的 2/3。
+            pa_scheduler::host::InitializeWinnerWorkloadBuffers(
+                &workload_image, &workload_outputs
+            );
+        }
+        pa_scheduler::host::ConfigureWinnerWorkload(
+            state.get(), workload_options, real_compute ? workload_image.data() : nullptr
+        );
         if (options.trace_enabled) {
             pa_scheduler::host::InitializeTraceHeader(trace_header);
         }
@@ -211,6 +329,15 @@ int main(int argc, char **argv) {
             worker.join();
         const auto wall_end = std::chrono::steady_clock::now();
         const double host_us = std::chrono::duration<double, std::micro>(wall_end - wall_begin).count();
+        if (real_compute) {
+            const size_t output_begin =
+                static_cast<size_t>(pa_scheduler::winner_workload::kSharedInputTiles) *
+                pa_scheduler::winner_workload::kTileElements;
+            std::copy_n(
+                workload_image.begin() + output_begin, workload_outputs.size(),
+                workload_outputs.begin()
+            );
+        }
         // host 内存沿用与 A5 相同的 TraceHeader + 每 worker 固定跨度 ABI；
         // 分析器和 raw JSON writer 因而可以与设备后端共用同一回调接口。
         const auto read_trace_records =
@@ -229,7 +356,11 @@ int main(int argc, char **argv) {
         const pa_scheduler::host::Metrics metrics = pa_scheduler::host::Validate(
             *state, run, host_us, options.trace_enabled ? trace_header : nullptr
         );
-        all_passed &= metrics.passed;
+        const bool workload_passed =
+            !real_compute || pa_scheduler::host::ValidateRealComputeOutputs(
+                *state, workload_outputs, run
+            );
+        all_passed &= metrics.passed && workload_passed;
         spans.push_back(metrics.submit_span_us);
         // 分析只打印统计，导出则写 raw JSON；两者失败都标记 postprocess，
         // 与调度语义失败分开报告，便于区分协议问题和产物问题。
@@ -239,17 +370,22 @@ int main(int argc, char **argv) {
             break;
         }
         if (!options.swimlane_json.empty()) {
-            if (!metrics.passed) {
-                std::fprintf(stderr, "Skipping swimlane export because semantic validation failed.\n");
+            if (!metrics.passed || !workload_passed) {
+                std::fprintf(
+                    stderr,
+                    "Skipping swimlane export because semantic or winner-workload validation failed.\n"
+                );
                 postprocess_ok = false;
                 break;
             }
             if (!pa_scheduler::host::ExportSwimlaneRecords(
                     *trace_header, options.swimlane_json,
-                    pa_scheduler::WinnerWorkloadMode::ScalarNop,
-                    pa_scheduler::WorkloadCounts{
-                        options.nops.qk, options.nops.sf, options.nops.pv, options.nops.up
-                    },
+                    workload_options.mode,
+                    real_compute
+                        ? workload_options.repeats
+                        : pa_scheduler::WorkloadCounts{
+                              options.nops.qk, options.nops.sf, options.nops.pv, options.nops.up
+                          },
                     read_trace_records
                 )) {
                 postprocess_ok = false;

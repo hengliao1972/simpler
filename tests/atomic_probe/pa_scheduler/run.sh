@@ -40,15 +40,16 @@ CCEC-only PMU probe options (selectors are owned by the standalone Main AICPU he
   --pmu-icache-trials N
   --pmu-json FILE
 
-CCEC-only winner workload options:
+Standalone winner workload options (CCEC, AscendC, and CPU):
   --winner-workload scalar-nop|real-compute
   --real-compute-count N
   --real-compute-counts QK,SF,PV,UP
 
-real-compute is opt-in. Its calibrated A5 defaults are QK/SF/PV/UP=6/28/4/1;
+real-compute is opt-in. Its CCEC-calibrated A5 defaults are QK/SF/PV/UP=6/28/4/1;
 one count is one complete 128x128 load/engine/store/completion-wait pipeline
 per winner task, not a scalar NOP count. Explicit count options override those
-four defaults.
+four defaults. AscendC must be calibrated independently; CPU only preserves
+the arithmetic and routing semantics and is not an A5 timing reference.
 
 The swimlane action enables atomic tracing by default. For the lower-level run
 action, --trace-atomics still requires swimlane tracing; add
@@ -132,21 +133,20 @@ reject_managed_swimlane_options() {
     done
 }
 
-reject_ccec_only_options_for_non_ccec() {
+reject_ccec_pmu_options_for_non_ccec() {
     local backend="$1"
     shift
     if [[ "$backend" == "ccec" ]]; then
         return
     fi
 
-    # PMU selector、校准 NOP、导出路径和真实 winner 负载都只由 CCEC 分支消费。
-    # 在顶层展开 all 之前拒绝，避免先启动 CCEC、再由其他后端迟到报错。
+    # PMU selector、校准 NOP 和导出路径只由 CCEC 分支消费；winner workload
+    # 已由三个后端共同解析。这里在展开 all 前拒绝 PMU，避免先启动 CCEC、
+    # 再由其他后端迟到报错。
     for argument in "$@"; do
         case "$argument" in
             --pmu-window|--pmu-window=*|--pmu-scalar-nops|--pmu-scalar-nops=*|\
-            --pmu-icache-trials|--pmu-icache-trials=*|--pmu-json|--pmu-json=*|\
-            --winner-workload|--winner-workload=*|--real-compute-count|--real-compute-count=*|\
-            --real-compute-counts|--real-compute-counts=*)
+            --pmu-icache-trials|--pmu-icache-trials=*|--pmu-json|--pmu-json=*)
                 echo "CCEC-only option $argument is not supported by backend '$backend'." >&2
                 exit 1
                 ;;
@@ -173,7 +173,7 @@ else
 fi
 
 # 后端约束必须早于 build/run/smoke/swimlane 的任何文件创建、构建或设备动作。
-reject_ccec_only_options_for_non_ccec "$BACKEND" "$@"
+reject_ccec_pmu_options_for_non_ccec "$BACKEND" "$@"
 
 case "$ACTION" in
     build)
@@ -203,7 +203,7 @@ case "$ACTION" in
                 --nop-counts|--nop-counts=*|--winner-workload|--winner-workload=*|\
                 --real-compute-count|--real-compute-count=*|--real-compute-counts|\
                 --real-compute-counts=*)
-                    echo "The smoke action fixes b1/r1/scalar-nop=0; use 'run ccec' for real-compute." >&2
+                    echo "The smoke action fixes b1/r1/scalar-nop=0; use the run action for real-compute." >&2
                     exit 1
                     ;;
             esac
