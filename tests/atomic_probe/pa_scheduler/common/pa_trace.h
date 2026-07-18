@@ -121,8 +121,8 @@ PA_DEVICE uint32_t TraceAtomicSiteMask(AtomicSite site) {
     return 1U << static_cast<uint32_t>(site);
 }
 
-// Attach 只缓存本 worker 的 header 状态、分区首址和物理 lane 信息。配置先做
-// cache invalidate，确保 A5 worker 看到 host 在 launch 前写入的 trace 开关、地址与 winner 负载配置。
+// Attach 只缓存本 worker 的 header 状态、分区首址和物理 lane 信息。控制区
+// cache invalidate 在公共调度入口完成，不能随 submit-pmu 编译掉泳道而消失。
 template <typename Ops>
 PA_DEVICE TraceContext AttachTrace(
     PA_GM SchedulerState *state, PA_GM const WorkerState &worker, uint32_t worker_id
@@ -131,9 +131,12 @@ PA_DEVICE TraceContext AttachTrace(
     trace.lane = worker.lane;
     trace.block_id = worker.block_id;
     trace.core_idx = static_cast<int32_t>(worker_id);
-    Ops::InvalidateRegion(
-        &state->config, sizeof(state->config) + sizeof(state->winner_workload)
-    );
+#if PA_BUILD_SUBMIT_PMU
+    // 诊断 ELF 不含 records 写入、atomic span 或 trace-only SYS_CNT；保留同一
+    // TraceContext 形状只是为了复用调度协议源码。
+    (void)state;
+    return trace;
+#else
     const uint64_t base = state->config.trace_base;
     const uint32_t capacity = state->config.trace_records_per_core;
     if ((state->config.trace_enabled & kTracePhasesEnabled) == 0 || base == 0 || capacity == 0 ||
@@ -159,6 +162,7 @@ PA_DEVICE TraceContext AttachTrace(
     trace.core->block_id = trace.block_id;
     trace.core->lane = trace.lane;
     return trace;
+#endif
 }
 
 template <bool Profile>
@@ -175,6 +179,16 @@ PA_DEVICE_NOINLINE bool WritePollBatchRecordRaw(
     PA_GM TraceCoreState *core, PA_GM TraceRecord *records, uint32_t capacity,
     uint64_t start_cycle, uint64_t end_cycle, uint32_t call_count, uint32_t site_id
 ) {
+#if PA_BUILD_SUBMIT_PMU
+    (void)core;
+    (void)records;
+    (void)capacity;
+    (void)start_cycle;
+    (void)end_cycle;
+    (void)call_count;
+    (void)site_id;
+    return false;
+#else
     if (core == nullptr || records == nullptr || capacity == 0) {
         return false;
     }
@@ -200,6 +214,7 @@ PA_DEVICE_NOINLINE bool WritePollBatchRecordRaw(
     // count 最后更新，使其始终指向下一空槽；单写者条件下无需 reserve/commit 两阶段。
     core->count = slot + 1;
     return true;
+#endif
 }
 
 PA_DEVICE uint32_t AtomicTraceFlags(
@@ -235,6 +250,10 @@ template <typename Ops>
 PA_DEVICE void AtomicPollBoundaryAt(
     TraceContext &trace, uint64_t end_cycle
 ) {
+#if PA_BUILD_SUBMIT_PMU
+    (void)trace;
+    (void)end_cycle;
+#else
     if (!trace.atomics_enabled || trace.poll_burst.active_mask == 0) return;
     const uint32_t active_mask = trace.poll_burst.active_mask;
     // CCEC 默认会把固定 6-site 循环完整展开，再随几十个 phase 边界复制。
@@ -264,13 +283,19 @@ PA_DEVICE void AtomicPollBoundaryAt(
         trace.poll_burst.call_count[index] = 0;
     }
     trace.poll_burst.active_mask = 0;
+#endif
 }
 
 template <typename Ops>
 PA_DEVICE void AtomicPollBoundary(TraceContext &trace, WorkerResult &result) {
+#if PA_BUILD_SUBMIT_PMU
+    (void)trace;
+    (void)result;
+#else
     (void)result;
     if (trace.poll_burst.active_mask == 0) return;
     AtomicPollBoundaryAt<Ops>(trace, Ops::Now());
+#endif
 }
 
 template <typename Ops>
@@ -278,9 +303,14 @@ PA_DEVICE uint32_t AtomicPollRegionBegin(
     TraceContext &trace, WorkerResult &result, uint32_t site_mask
 ) {
     const uint32_t previous_mask = trace.poll_burst.enabled_mask;
+#if PA_BUILD_SUBMIT_PMU
+    (void)result;
+    (void)site_mask;
+#else
     if (!trace.atomics_enabled) return previous_mask;
     AtomicPollBoundary<Ops>(trace, result);
     trace.poll_burst.enabled_mask = previous_mask | site_mask;
+#endif
     return previous_mask;
 }
 
@@ -288,9 +318,15 @@ template <typename Ops>
 PA_DEVICE void AtomicPollRegionEnd(
     TraceContext &trace, WorkerResult &result, uint32_t previous_mask
 ) {
+#if PA_BUILD_SUBMIT_PMU
+    (void)trace;
+    (void)result;
+    (void)previous_mask;
+#else
     if (!trace.atomics_enabled) return;
     AtomicPollBoundary<Ops>(trace, result);
     trace.poll_burst.enabled_mask = previous_mask;
+#endif
 }
 
 PA_DEVICE bool AtomicPollBatchEnabled(
@@ -346,6 +382,14 @@ PA_DEVICE T TraceAtomicLoad(
     TraceContext &trace, WorkerResult &result, int32_t task_id, AtomicSite site,
     PA_GM volatile T *address, bool result_used = true
 ) {
+#if PA_BUILD_SUBMIT_PMU
+    (void)trace;
+    (void)result;
+    (void)task_id;
+    (void)site;
+    (void)result_used;
+    return Ops::Load(address);
+#else
     if (!trace.atomics_enabled) return Ops::Load(address);
     const bool poll_batch = result_used && AtomicPollBatchEnabled(trace, site, AtomicOp::Load);
     const int32_t poll_index = poll_batch ? TraceAtomicPollBatchIndex(site) : -1;
@@ -367,6 +411,7 @@ PA_DEVICE T TraceAtomicLoad(
         old == static_cast<T>(0)
     );
     return old;
+#endif
 }
 
 template <typename Ops, typename T>
@@ -374,6 +419,14 @@ PA_DEVICE T TraceAtomicExchange(
     TraceContext &trace, WorkerResult &result, int32_t task_id, AtomicSite site,
     PA_GM volatile T *address, T value, bool result_used = false
 ) {
+#if PA_BUILD_SUBMIT_PMU
+    (void)trace;
+    (void)result;
+    (void)task_id;
+    (void)site;
+    (void)result_used;
+    return Ops::Exchange(address, value);
+#else
     if (!trace.atomics_enabled) return Ops::Exchange(address, value);
     const uint64_t begin = Ops::Now();
     const T old = Ops::Exchange(address, value);
@@ -383,6 +436,7 @@ PA_DEVICE T TraceAtomicExchange(
         trace, result, task_id, site, AtomicOp::Exchange, begin, end, result_used, return_ready
     );
     return old;
+#endif
 }
 
 template <typename Ops>
@@ -390,6 +444,14 @@ PA_DEVICE int64_t TraceAtomicFetchAdd(
     TraceContext &trace, WorkerResult &result, int32_t task_id, AtomicSite site,
     PA_GM volatile int64_t *address, int64_t value, bool result_used = false
 ) {
+#if PA_BUILD_SUBMIT_PMU
+    (void)trace;
+    (void)result;
+    (void)task_id;
+    (void)site;
+    (void)result_used;
+    return Ops::FetchAdd(address, value);
+#else
     if (!trace.atomics_enabled) return Ops::FetchAdd(address, value);
     const uint64_t begin = Ops::Now();
     const int64_t old = Ops::FetchAdd(address, value);
@@ -399,6 +461,7 @@ PA_DEVICE int64_t TraceAtomicFetchAdd(
         trace, result, task_id, site, AtomicOp::FetchAdd, begin, end, result_used, return_ready
     );
     return old;
+#endif
 }
 
 template <typename Ops>
@@ -406,6 +469,14 @@ PA_DEVICE int64_t TraceAtomicFetchMax(
     TraceContext &trace, WorkerResult &result, int32_t task_id, AtomicSite site,
     PA_GM volatile int64_t *address, int64_t value, uint64_t &retries, bool result_used = true
 ) {
+#if PA_BUILD_SUBMIT_PMU
+    (void)trace;
+    (void)result;
+    (void)task_id;
+    (void)site;
+    (void)result_used;
+    return Ops::FetchMax(address, value, retries);
+#else
     if (!trace.atomics_enabled) return Ops::FetchMax(address, value, retries);
     const uint64_t begin = Ops::Now();
     const int64_t old = Ops::FetchMax(address, value, retries);
@@ -416,12 +487,20 @@ PA_DEVICE int64_t TraceAtomicFetchMax(
         return_ready, false, retries
     );
     return old;
+#endif
 }
 
 template <bool Profile>
 PA_DEVICE void AccumulatePhase(
     WorkerResult &result, ProfilePhase phase, uint64_t start_cycle, uint64_t end_cycle
 ) {
+#if PA_BUILD_SUBMIT_PMU
+    (void)result;
+    (void)phase;
+    (void)start_cycle;
+    (void)end_cycle;
+    return;
+#else
     // phase profile 与完整泳道是两套正交机制：即使关闭 records，Profile=true
     // 仍会累计用户当前关注的 Claim/EfDrain/WaitForSlot/HeapGuard 四段。
     if constexpr (Profile) {
@@ -436,6 +515,7 @@ PA_DEVICE void AccumulatePhase(
         result.phase_cycles[index] += duration;
         ++result.phase_calls[index];
     }
+#endif
 }
 
 template <bool Profile>
@@ -444,6 +524,19 @@ PA_DEVICE void WriteTrace(
     ProfilePhase profile_phase, uint64_t start_cycle, uint64_t end_cycle, uint32_t flags,
     uint32_t auxiliary
 ) {
+#if PA_BUILD_SUBMIT_PMU
+    (void)trace;
+    (void)result;
+    (void)task_id;
+    (void)function_id;
+    (void)trace_phase;
+    (void)profile_phase;
+    (void)start_cycle;
+    (void)end_cycle;
+    (void)flags;
+    (void)auxiliary;
+    return;
+#else
     // 每段先更新轻量 phase 统计，再按需写 64-byte 原始记录。一个分区只有对应
     // worker 写入，因此 count/dropped 保持普通单写者更新，不额外引入 atomic。
     AccumulatePhase<Profile>(result, profile_phase, start_cycle, end_cycle);
@@ -470,6 +563,7 @@ PA_DEVICE void WriteTrace(
     // count 最后更新，使其始终指向下一空槽；单写者条件下无需 reserve/commit 两阶段。
     // 最终 FlushTraceCore 会把记录体先于该计数一并导出。
     core.count = slot + 1;
+#endif
 }
 
 template <typename Ops>
@@ -478,16 +572,27 @@ PA_DEVICE void ResetTraceLap(
 ) {
     // lap 是后续 Build/Replay/Alloc 等覆盖式阶段的共同起点，不代表新增嵌套 span。
     // 因此分析时不能把 lap 时长再与其中的 Materialize/Claim/Register 直接相加。
+#if PA_BUILD_SUBMIT_PMU
+    (void)trace;
+    (void)result;
+    (void)worker;
+#else
     (void)result;
     const uint64_t cycle = Ops::Now();
     // 与真实 FDWIC 的 TRACE_LAP_RESET 保持同一边界：等待区 PollBatch
     // 只能覆盖本次逻辑轮询 episode，不能跨进下一段 lap 或计算单元执行。
     AtomicPollBoundaryAt<Ops>(trace, cycle);
     worker.swimlane_last_cycle = cycle;
+#endif
 }
 
 template <typename Ops>
 PA_DEVICE void FlushTraceCore(TraceContext &trace, WorkerResult &result) {
+#if PA_BUILD_SUBMIT_PMU
+    (void)trace;
+    (void)result;
+    return;
+#else
     if (trace.core == nullptr || trace.records == nullptr || trace.capacity == 0) {
         return;
     }
@@ -509,6 +614,7 @@ PA_DEVICE void FlushTraceCore(TraceContext &trace, WorkerResult &result) {
         Ops::FlushRegion(trace.records, static_cast<uint64_t>(count) * sizeof(TraceRecord));
     }
     Ops::FlushRegion(&core, sizeof(core));
+#endif
 }
 
 template <typename Ops, bool Profile>
@@ -517,6 +623,18 @@ PA_DEVICE uint64_t WriteTraceLap(
     int32_t function_id, TracePhase trace_phase, ProfilePhase profile_phase,
     uint32_t flags = 0, uint32_t auxiliary = 0
 ) {
+#if PA_BUILD_SUBMIT_PMU
+    (void)trace;
+    (void)worker;
+    (void)result;
+    (void)task_id;
+    (void)function_id;
+    (void)trace_phase;
+    (void)profile_phase;
+    (void)flags;
+    (void)auxiliary;
+    return 0;
+#else
     // lap 记录区间 [上一次 Reset/WriteTraceLap, 当前时刻]，写完立即推进起点。
     // 显式 WriteTrace span 不会修改该起点，这正是生产泳道中阶段可重叠的原因。
     const uint64_t end_cycle = Ops::Now();
@@ -529,6 +647,7 @@ PA_DEVICE uint64_t WriteTraceLap(
     );
     worker.swimlane_last_cycle = end_cycle;
     return end_cycle;
+#endif
 }
 
 }  // namespace pa_scheduler

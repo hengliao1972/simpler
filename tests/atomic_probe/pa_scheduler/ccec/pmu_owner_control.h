@@ -38,8 +38,14 @@ static_assert(kExpectedAicCount + kExpectedAivCount == kExpectedSubcoreCount, "a
 static_assert(kAicPerDie * 2U == 36U, "physical AIC topology changed");
 static_assert(kSubcoresPerDie * 2U == kPhysicalSubcoreCount, "physical subcore topology changed");
 
-// A5 PIPE_UTILIZATION 的正式 counter 槽位布局。CNT9 的事件号为 0，明确
-// 表示本轮不消费该槽；仍保存并恢复其旧 selector，也仍读一次 counter 清零。
+// A5 PIPE_UTILIZATION 的正式 counter 槽位布局。submit-pmu 用 CNT8/CNT5
+// 重复配置 I-cache request/miss，作为允许中途 read-to-clear 的 shadow；
+// CNT6/7 始终不在阶段边界读取，保留为完整 Submit 的权威对照。
+//
+// 不能把 miss 放进 CNT9：A5 b1 实测表明 CNT9 selector 虽能回读 0x35，
+// 但计数恒为 0；正式 PIPE_UTIL 表也把 CNT9 标成 unused。0x35 在独立
+// I-cache 微基准的低位 counter 已验证可计数，因此诊断构建让 CNT5 承担
+// shadow miss，并明确放弃该构建中的 MTE3 busy。
 constexpr uint32_t kPmuCounterCount = 10U;
 constexpr uint32_t kConfiguredSelectors[kPmuCounterCount] = {
     0x501U,  // CNT0: vector busy
@@ -47,11 +53,19 @@ constexpr uint32_t kConfiguredSelectors[kPmuCounterCount] = {
     0x001U,  // CNT2: scalar busy
     0x701U,  // CNT3: MTE1 busy
     0x202U,  // CNT4: MTE2 busy
+#if PA_BUILD_SUBMIT_PMU
+    0x035U,  // CNT5: shadow I-cache miss
+    0x034U,  // CNT6: I-cache request（完整 Submit）
+    0x035U,  // CNT7: I-cache miss（完整 Submit）
+    0x034U,  // CNT8: shadow I-cache request
+    0x000U,  // CNT9: A5 PIPE_UTIL 正式未使用
+#else
     0x203U,  // CNT5: MTE3 busy
     0x034U,  // CNT6: I-cache request
     0x035U,  // CNT7: I-cache miss
     0x714U,  // CNT8: fix-pipe busy
     0x000U,  // CNT9: 未使用
+#endif
 };
 
 constexpr int32_t kStatusPending = 0x7fffffff;

@@ -182,6 +182,29 @@ enum class ProfilePhase : uint32_t {
     Count = 12,
 };
 
+// submit-pmu 每个 ELF 只编译一个局部归因阶段。none 不做中途 counter
+// 读取，是完整 Submit 的正式基线；claim 是首个连续、无提前返回的验证阶段。
+// 后续阶段只能在各自边界和闭环经过 A5 验证后向枚举尾部追加。
+enum class SubmitPmuPhase : uint32_t {
+    None = 0,
+    Claim = 1,
+    Count = 2,
+};
+
+#ifndef PA_SUBMIT_PMU_PHASE_ID
+#define PA_SUBMIT_PMU_PHASE_ID 0
+#endif
+
+constexpr SubmitPmuPhase kCompiledSubmitPmuPhase =
+    static_cast<SubmitPmuPhase>(PA_SUBMIT_PMU_PHASE_ID);
+constexpr uint32_t kBuildVariantSwimlane = 1U;
+constexpr uint32_t kBuildVariantSubmitPmu = 2U;
+static_assert(
+    PA_SUBMIT_PMU_PHASE_ID >= 0 &&
+        PA_SUBMIT_PMU_PHASE_ID < static_cast<int>(SubmitPmuPhase::Count),
+    "invalid compiled submit-pmu phase"
+);
+
 struct NopCounts {
     uint32_t qk;
     uint32_t sf;
@@ -727,8 +750,14 @@ struct alignas(64) WorkerResult {
     uint64_t pmu_window_ticks;
     uint64_t pmu_warm_total_cycles;
     uint64_t pmu_warm_window_ticks;
-    uint32_t pmu_warm_icache_requests;
-    uint32_t pmu_warm_icache_misses;
+    union {
+        uint32_t pmu_warm_icache_requests;
+        uint32_t pmu_phase_begin_reads;
+    };
+    union {
+        uint32_t pmu_warm_icache_misses;
+        uint32_t pmu_phase_end_reads;
+    };
 
     // PIPE_UTILIZATION 已同时配置 CNT0/1/3/4/5/8；与上面的 scalar/I-cache
     // 一样只保存每核原始累计值，AIC/AIV 汇总与比率统一在 host sidecar 中计算。
@@ -737,8 +766,23 @@ struct alignas(64) WorkerResult {
     uint32_t pmu_cube_busy;
     uint32_t pmu_mte1_busy;
     uint32_t pmu_mte2_busy;
+    // swimlane ABI 保留该槽；submit-pmu 将物理 CNT5 改作 shadow miss，
+    // 因而显式发布 0，并在 schema v4 标记 mte3_busy 不可用。
     uint32_t pmu_mte3_busy;
     uint32_t pmu_fix_busy;
+
+    // 复用 WorkerResult 原有的 32B cache-line 尾洞，不扩大 832B stride。
+    // CNT6/7 是从不中途读取的权威整窗，CNT8/CNT5 是 read-to-clear shadow；
+    // none 在 stop 后要求逐核精确相等；运行中切片的 phase 只允许 shadow
+    // 单向小于 primary，并显式导出差值形成局部观测区间。
+    uint32_t pmu_build_variant;
+    uint32_t pmu_phase_id;
+    uint32_t pmu_phase_calls;
+    uint32_t pmu_phase_status;
+    uint32_t pmu_phase_icache_requests;
+    uint32_t pmu_phase_icache_misses;
+    uint32_t pmu_shadow_icache_requests;
+    uint32_t pmu_shadow_icache_misses;
 };
 // WorkerResult 是 standalone 尾部的诊断 sidecar，不属于真实 DistCore ABI；按
 // cache line 隔离后，各 worker 发布统计不会相互覆盖或污染被测共享状态。
@@ -749,6 +793,8 @@ static_assert(offsetof(WorkerResult, fanin_not_ready_loads) == 704, "WorkerResul
 static_assert(offsetof(WorkerResult, atomic_trace_calls) == 736, "WorkerResult atomic trace offset mismatch");
 static_assert(offsetof(WorkerResult, pmu_window_ticks) == 744, "WorkerResult PMU timing offset mismatch");
 static_assert(offsetof(WorkerResult, pmu_vector_busy) == 776, "WorkerResult extended PMU offset mismatch");
+static_assert(offsetof(WorkerResult, pmu_build_variant) == 800, "WorkerResult submit-PMU offset mismatch");
+static_assert(offsetof(WorkerResult, pmu_shadow_icache_misses) == 828, "WorkerResult submit-PMU tail mismatch");
 
 // 从 cube_cursor 到 workers 结束保留关键字段 offset、DistCore ABI 和生产总字节跨度，
 // 并非字段级完整镜像。RunConfig、输入 context_lens 与校验结果追加在该跨度之后，

@@ -31,8 +31,37 @@ struct LocalStats {
     TraceContext trace;
 };
 
+// submit-pmu 的 phase 在编译期固定；非诊断构建完全不引用 Ops 的 phase
+// 接口。这样公共调度代码保持一份，swimlane/CPU/AscendC 也不会多出运行时分支。
+template <SubmitPmuPhase Phase, typename Ops, typename PmuContext>
+PA_DEVICE void BeginSubmitPmuPhase(PmuContext &context) {
+#if PA_BUILD_SUBMIT_PMU
+    if constexpr (kCompiledSubmitPmuPhase == Phase) {
+        Ops::PmuPhaseBegin(context);
+    }
+#else
+    (void)context;
+#endif
+}
+
+template <SubmitPmuPhase Phase, typename Ops, typename PmuContext>
+PA_DEVICE void EndSubmitPmuPhase(PmuContext &context) {
+#if PA_BUILD_SUBMIT_PMU
+    if constexpr (kCompiledSubmitPmuPhase == Phase) {
+        Ops::PmuPhaseEnd(context);
+    }
+#else
+    (void)context;
+#endif
+}
+
 template <typename Ops>
 PA_DEVICE uint64_t TraceTimestamp(TraceContext &trace, WorkerResult &result) {
+#if PA_BUILD_SUBMIT_PMU
+    (void)trace;
+    (void)result;
+    return 0;
+#else
     (void)result;
     // 对齐真实 FDWIC 的 TRACE_SPAN_BEGIN/END：取一次时间后立即以同一
     // cycle 关闭活跃 PollBatch。不能在 WriteTrace 中统一关闭，否则直接
@@ -40,6 +69,7 @@ PA_DEVICE uint64_t TraceTimestamp(TraceContext &trace, WorkerResult &result) {
     const uint64_t cycle = Ops::Now();
     AtomicPollBoundaryAt<Ops>(trace, cycle);
     return cycle;
+#endif
 }
 
 PA_DEVICE uint32_t KindIndex(TaskKind kind) { return static_cast<uint32_t>(kind); }
@@ -508,17 +538,23 @@ PA_DEVICE bool BuildWinner(
     return true;
 }
 
-template <typename Ops, bool Profile>
+template <typename Ops, bool Profile, typename PmuContext>
 PA_DEVICE bool SubmitTask(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_count, TaskKind kind,
-    const TaskArgs &args, SubmitContext &context, LocalStats &stats
+    const TaskArgs &args, SubmitContext &context, LocalStats &stats, PmuContext &pmu_context
 ) {
     // 每个 worker 都完整回放相同 task stream。主流程为：EfDrain -> materialize -> TensorMap retire
     // -> Claim -> winner 收集 fanin -> 全员 register -> winner Build / loser Replay。Alloc 在 Claim 前 register，
     // 且 winner 不入 kernel slot，而是在 heap guard 后直接发布完成。
     BeginSubmit(worker, args, context);
     const uint32_t task_id = static_cast<uint32_t>(context.task_id);
+#if PA_BUILD_SUBMIT_PMU
+    // PMU-only ELF 只保留首/末 Submit 的全局时间边界，不再为 1280 次调用
+    // 各执行两条 trace-only SYS_CNT。
+    const uint64_t submit_begin = task_id == 0 ? Ops::Now() : 0;
+#else
     const uint64_t submit_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
+#endif
     if (task_id == 0) {
         stats.result.submit_begin = submit_begin;
     }
@@ -571,7 +607,9 @@ PA_DEVICE bool SubmitTask(
         );
 
         const uint64_t claim_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
+        BeginSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
         const ClaimOutcome claim = Claim<Ops>(state, worker, task_id, kind, stats);
+        EndSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
         winner = claim.won;
         context.won = winner;
         context.kernel_id = claim.function_id;
@@ -602,7 +640,9 @@ PA_DEVICE bool SubmitTask(
         }
     } else {
         const uint64_t claim_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
+        BeginSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
         const ClaimOutcome claim = Claim<Ops>(state, worker, task_id, kind, stats);
+        EndSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
         winner = claim.won;
         function_id = claim.function_id;
         context.won = winner;
@@ -658,7 +698,11 @@ PA_DEVICE bool SubmitTask(
     }
 
     ++stats.result.submits;
+#if PA_BUILD_SUBMIT_PMU
+    const uint64_t submit_end = task_id + 1 == task_count ? Ops::Now() : 0;
+#else
     const uint64_t submit_end = TraceTimestamp<Ops>(stats.trace, stats.result);
+#endif
     WriteTrace<Profile>(
         stats.trace, stats.result, static_cast<int32_t>(task_id), function_id, TracePhase::Submit,
         ProfilePhase::Submit, submit_begin, submit_end, winner ? 1U : 0U, kind == TaskKind::Alloc ? 1U : 0U
@@ -779,6 +823,11 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     stats.result.worker_id = worker_id;
     stats.result.role = static_cast<uint32_t>(role);
     stats.result.checksum = 0xcbf29ce484222325ULL ^ worker_id;
+    // 该 invalidate 原先藏在 AttachTrace 中；它同时保护 PMU mode/register
+    // table 与 winner workload，必须在两个构建中都执行。
+    Ops::InvalidateRegion(
+        &state->config, sizeof(state->config) + sizeof(state->winner_workload)
+    );
     stats.trace = AttachTrace<Ops>(state, worker, worker_id);
 
     // 96 个参与者全部完成本地状态初始化后再进入 task 0，主要用于压低启动偏斜对
@@ -815,7 +864,9 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         // 窗口覆盖从首个参数构造到末次 Submit 返回，与全局“首 Submit.begin～末 Submit.end”
         // 口径接近但不相同，host sidecar 必须按 per-worker 累计解释。
         ResetTraceLap<Ops>(stats.trace, stats.result, worker);
-        const bool pmu_window_started = Ops::PmuWindowStart(state, worker_id);
+        // lap 重置属于泳道观察自身，不应污染 PMU-only 的 Submit 取数；窗口从
+        // orchestration 初始化（即首批参数构造）前一条边界开始。
+        auto pmu_context = Ops::PmuWindowStart(state, worker_id);
         InitPaOrchestration(orchestration, batches, &state->context_lens[0]);
         for (uint32_t batch = 0; batch < batches; ++batch) {
             BuildAllocArgs(orchestration, args, batch);
@@ -823,7 +874,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             stats.result.views_created += 2;
             stats.result.tensor_args_added += 3;
             if (!SubmitTask<Ops, Profile>(
-                    state, worker, task_count, TaskKind::Alloc, args, context, stats
+                    state, worker, task_count, TaskKind::Alloc, args, context, stats, pmu_context
                 )) {
                 break;
             }
@@ -835,7 +886,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             stats.result.tensor_args_added += 4;
             stats.result.scalar_args_added += 2;
             if (!SubmitTask<Ops, Profile>(
-                    state, worker, task_count, TaskKind::Qk, args, context, stats
+                    state, worker, task_count, TaskKind::Qk, args, context, stats, pmu_context
                 )) {
                 break;
             }
@@ -847,7 +898,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             stats.result.tensor_args_added += 4;
             stats.result.scalar_args_added += 3;
             if (!SubmitTask<Ops, Profile>(
-                    state, worker, task_count, TaskKind::Sf, args, context, stats
+                    state, worker, task_count, TaskKind::Sf, args, context, stats, pmu_context
                 )) {
                 break;
             }
@@ -858,7 +909,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             stats.result.tensor_args_added += 4;
             stats.result.scalar_args_added += 2;
             if (!SubmitTask<Ops, Profile>(
-                    state, worker, task_count, TaskKind::Pv, args, context, stats
+                    state, worker, task_count, TaskKind::Pv, args, context, stats, pmu_context
                 )) {
                 break;
             }
@@ -869,12 +920,12 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             stats.result.tensor_args_added += 7;
             stats.result.scalar_args_added += 2;
             if (!SubmitTask<Ops, Profile>(
-                    state, worker, task_count, TaskKind::Up, args, context, stats
+                    state, worker, task_count, TaskKind::Up, args, context, stats, pmu_context
                 )) {
                 break;
             }
         }
-        Ops::PmuWindowStop(state, worker_id, pmu_window_started);
+        Ops::PmuWindowStop(state, worker_id, pmu_context);
     }
 
     // replay_done 表示所有 worker 已退出回放循环（成功路径即完整提交）；之后仍需 drain 到本核 slot 为空。
@@ -902,6 +953,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     }
     AtomicPollRegionEnd<Ops>(stats.trace, stats.result, final_poll_region);
 
+#if !PA_BUILD_SUBMIT_PMU
     if (stats.trace.atomics_enabled) {
         // 两条基线都放在最终 drain 之后。第一条量连续
         // SYS_CNT，第二条量返回依赖钩子的固定成本；它们只描述计时底噪，不能
@@ -923,6 +975,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 (Ops::kAtomicReturnReadyObserved ? kClockAtomicDependencyApplied : 0U)
         );
     }
+#endif
 
     // PA writes swimlane records through the ordinary GM cache and explicitly
     // cleans each worker's record range before the kernel finishes.

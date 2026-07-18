@@ -14,6 +14,8 @@
 
 #include <stdint.h>
 
+#include "../common/pa_model.h"
+
 namespace pa_scheduler::ccec_pmu {
 
 // Empty/Scalar/ScalarDouble 在调度结束后校准门控底噪和 scalar 正向响应；
@@ -78,6 +80,7 @@ constexpr uint32_t kCnt5Offset = 0x4238U;
 constexpr uint32_t kCnt6Offset = 0x4240U;
 constexpr uint32_t kCnt7Offset = 0x4248U;
 constexpr uint32_t kCnt8Offset = 0x4250U;
+constexpr uint32_t kCnt9Offset = 0x4254U;
 constexpr uint32_t kTotalLowOffset = 0x4260U;
 constexpr uint32_t kTotalHighOffset = 0x4264U;
 constexpr uint32_t kCnt2SelectorOffset = 0x2508U;
@@ -89,6 +92,7 @@ constexpr uint32_t kCnt5SelectorOffset = 0x2514U;
 constexpr uint32_t kCnt6SelectorOffset = 0x2518U;
 constexpr uint32_t kCnt7SelectorOffset = 0x251cU;
 constexpr uint32_t kCnt8SelectorOffset = 0x2520U;
+constexpr uint32_t kCnt9SelectorOffset = 0x2524U;
 
 // pmu_status 的 bits16..27 保存 get_coreid()；bits28..31 留给不参与 core id
 // 解码的模式诊断。其余低位描述本条记录是否可信。
@@ -118,6 +122,39 @@ constexpr uint32_t kStatusRequired = kStatusRequested | kStatusRegMapped | kStat
                                      kStatusWindowStarted | kStatusWindowStopped | kStatusTotalNonzero;
 constexpr uint32_t kStatusCoreIdShift = 16;
 constexpr uint32_t kStatusCoreIdMask = 0x0fffU;
+
+// pmu_phase_status 独立于旧 pmu_status，避免与其中的物理 core-id 位域
+// 冲突。bits4/5 只记录 shadow 是否恰好等于 primary：phase=none 没有
+// 运行中 read-to-clear，host 会要求两位都成立；局部 phase 会在计数仍开启时
+// 读取 shadow，A5 实测存在同周期递增与读清竞争，因此不能把“逐次严格相等”
+// 作为可信记录的共同必选位。局部 phase 的方向和误差包络由 host/raw 独立校验。
+constexpr uint32_t kPhaseStatusRequested = 1U << 0;
+constexpr uint32_t kPhaseStatusShadowSelectors = 1U << 1;
+constexpr uint32_t kPhaseStatusWindowStarted = 1U << 2;
+constexpr uint32_t kPhaseStatusWindowStopped = 1U << 3;
+constexpr uint32_t kPhaseStatusShadowRequestsMatch = 1U << 4;
+constexpr uint32_t kPhaseStatusShadowMissesMatch = 1U << 5;
+constexpr uint32_t kPhaseStatusBoundariesBalanced = 1U << 6;
+constexpr uint32_t kPhaseStatusValuesOrdered = 1U << 7;
+constexpr uint32_t kPhaseStatusUint32Fit = 1U << 8;
+constexpr uint32_t kPhaseStatusPhaseShape = 1U << 9;
+constexpr uint32_t kPhaseStatusRequired =
+    kPhaseStatusRequested | kPhaseStatusShadowSelectors |
+    kPhaseStatusWindowStarted | kPhaseStatusWindowStopped |
+    kPhaseStatusBoundariesBalanced | kPhaseStatusValuesOrdered |
+    kPhaseStatusUint32Fit | kPhaseStatusPhaseShape;
+
+inline const char *SubmitPmuPhaseName(SubmitPmuPhase phase) {
+    switch (phase) {
+    case SubmitPmuPhase::None:
+        return "none";
+    case SubmitPmuPhase::Claim:
+        return "claim";
+    case SubmitPmuPhase::Count:
+        break;
+    }
+    return "invalid";
+}
 
 inline uint64_t PackPointer(const uint32_t *words) {
     return static_cast<uint64_t>(words[kConfigRegTableLow]) |

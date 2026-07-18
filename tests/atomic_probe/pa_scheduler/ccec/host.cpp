@@ -284,12 +284,16 @@ struct PmuAggregate {
     std::vector<uint64_t> scalar_busy;
     std::vector<uint64_t> mte1_busy;
     std::vector<uint64_t> mte2_busy;
-    std::vector<uint64_t> mte3_busy;
     std::vector<uint64_t> icache_requests;
     std::vector<uint64_t> icache_misses;
     std::vector<uint64_t> warm_icache_requests;
     std::vector<uint64_t> warm_icache_misses;
     std::vector<uint64_t> fix_busy;
+    std::vector<uint64_t> phase_calls;
+    std::vector<uint64_t> phase_icache_requests;
+    std::vector<uint64_t> phase_icache_misses;
+    std::vector<uint64_t> shadow_icache_requests;
+    std::vector<uint64_t> shadow_icache_misses;
     uint32_t trusted = 0;
 };
 
@@ -303,14 +307,21 @@ void AddPmuSample(const pa_scheduler::WorkerResult &result, PmuAggregate *aggreg
     aggregate->scalar_busy.push_back(result.pmu_scalar_busy);
     aggregate->mte1_busy.push_back(result.pmu_mte1_busy);
     aggregate->mte2_busy.push_back(result.pmu_mte2_busy);
-    aggregate->mte3_busy.push_back(result.pmu_mte3_busy);
     aggregate->icache_requests.push_back(result.pmu_icache_requests);
     aggregate->icache_misses.push_back(result.pmu_icache_misses);
     aggregate->warm_icache_requests.push_back(result.pmu_warm_icache_requests);
     aggregate->warm_icache_misses.push_back(result.pmu_warm_icache_misses);
     aggregate->fix_busy.push_back(result.pmu_fix_busy);
+    aggregate->phase_calls.push_back(result.pmu_phase_calls);
+    aggregate->phase_icache_requests.push_back(result.pmu_phase_icache_requests);
+    aggregate->phase_icache_misses.push_back(result.pmu_phase_icache_misses);
+    aggregate->shadow_icache_requests.push_back(result.pmu_shadow_icache_requests);
+    aggregate->shadow_icache_misses.push_back(result.pmu_shadow_icache_misses);
     aggregate->trusted +=
-        (result.pmu_status & pa_scheduler::ccec_pmu::kStatusRequired) == pa_scheduler::ccec_pmu::kStatusRequired;
+        (result.pmu_status & pa_scheduler::ccec_pmu::kStatusRequired) ==
+            pa_scheduler::ccec_pmu::kStatusRequired &&
+        (result.pmu_phase_status & pa_scheduler::ccec_pmu::kPhaseStatusRequired) ==
+            pa_scheduler::ccec_pmu::kPhaseStatusRequired;
 }
 
 bool PrintSingleIcacheAggregate(
@@ -379,8 +390,6 @@ void PrintPmuAggregate(const char *name, const PmuAggregate &aggregate) {
         pa_scheduler::host::SummarizeUint64(aggregate.mte1_busy);
     const pa_scheduler::host::Uint64Distribution mte2 =
         pa_scheduler::host::SummarizeUint64(aggregate.mte2_busy);
-    const pa_scheduler::host::Uint64Distribution mte3 =
-        pa_scheduler::host::SummarizeUint64(aggregate.mte3_busy);
     const pa_scheduler::host::Uint64Distribution requests =
         pa_scheduler::host::SummarizeUint64(aggregate.icache_requests);
     const pa_scheduler::host::Uint64Distribution misses =
@@ -389,13 +398,52 @@ void PrintPmuAggregate(const char *name, const PmuAggregate &aggregate) {
     std::printf(
         "[PMU-%s] cores=%zu total_sum=%llu total_median=%.1f total_p95=%llu "
         "scalar_busy=%llu vector_busy=%llu cube_busy=%llu mte1_busy=%llu mte2_busy=%llu "
-        "mte3_busy=%llu icache_req=%llu icache_miss=%llu miss_rate=%.4f%%\n",
+        "icache_req=%llu icache_miss=%llu miss_rate=%.4f%%\n",
         name, aggregate.total_cycles.size(), static_cast<unsigned long long>(total.total), total.median,
         static_cast<unsigned long long>(total.p95), static_cast<unsigned long long>(scalar.total),
         static_cast<unsigned long long>(vector.total), static_cast<unsigned long long>(cube.total),
         static_cast<unsigned long long>(mte1.total), static_cast<unsigned long long>(mte2.total),
-        static_cast<unsigned long long>(mte3.total),
         static_cast<unsigned long long>(requests.total), static_cast<unsigned long long>(misses.total), miss_rate
+    );
+}
+
+void PrintSubmitPmuPhaseAggregate(const char *name, const PmuAggregate &aggregate) {
+    const pa_scheduler::host::Uint64Distribution calls =
+        pa_scheduler::host::SummarizeUint64(aggregate.phase_calls);
+    const pa_scheduler::host::Uint64Distribution requests =
+        pa_scheduler::host::SummarizeUint64(aggregate.phase_icache_requests);
+    const pa_scheduler::host::Uint64Distribution misses =
+        pa_scheduler::host::SummarizeUint64(aggregate.phase_icache_misses);
+    const pa_scheduler::host::Uint64Distribution primary_requests =
+        pa_scheduler::host::SummarizeUint64(aggregate.icache_requests);
+    const pa_scheduler::host::Uint64Distribution primary_misses =
+        pa_scheduler::host::SummarizeUint64(aggregate.icache_misses);
+    const pa_scheduler::host::Uint64Distribution shadow_requests =
+        pa_scheduler::host::SummarizeUint64(aggregate.shadow_icache_requests);
+    const pa_scheduler::host::Uint64Distribution shadow_misses =
+        pa_scheduler::host::SummarizeUint64(aggregate.shadow_icache_misses);
+    const uint64_t request_loss = primary_requests.total >= shadow_requests.total
+        ? primary_requests.total - shadow_requests.total
+        : 0U;
+    const uint64_t miss_loss = primary_misses.total >= shadow_misses.total
+        ? primary_misses.total - shadow_misses.total
+        : 0U;
+    const double miss_rate = requests.total == 0U ? 0.0 : 100.0 * misses.total / requests.total;
+    std::printf(
+        "[PMU-PHASE-%s] phase=%s semantics=%s cores=%zu calls=%llu "
+        "icache_req=[%llu,%llu] icache_miss=[%llu,%llu] "
+        "observed_read_clear_ratio=%.4f%% shadow_loss=%llu/%llu\n",
+        name, pa_scheduler::ccec_pmu::SubmitPmuPhaseName(pa_scheduler::kCompiledSubmitPmuPhase),
+        pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
+            ? "disabled"
+            : "running_read_clear_lower_bound",
+        aggregate.phase_calls.size(), static_cast<unsigned long long>(calls.total),
+        static_cast<unsigned long long>(requests.total),
+        static_cast<unsigned long long>(requests.total + request_loss),
+        static_cast<unsigned long long>(misses.total),
+        static_cast<unsigned long long>(misses.total + miss_loss), miss_rate,
+        static_cast<unsigned long long>(request_loss),
+        static_cast<unsigned long long>(miss_loss)
     );
 }
 
@@ -414,10 +462,25 @@ struct PmuValidation {
     uint32_t submit_engine_workers_expected = 0;
     uint32_t submit_engine_workers_matched = 0;
     uint32_t maximum_programmable_counter = 0;
+    uint32_t build_variant_matches = 0;
+    uint32_t phase_id_matches = 0;
+    uint32_t phase_status_trusted = 0;
+    uint32_t shadow_primary_matches = 0;
+    uint32_t shadow_primary_bounded = 0;
+    uint32_t phase_boundary_matches = 0;
+    uint32_t phase_call_shape_matches = 0;
+    uint64_t phase_calls = 0;
+    uint64_t shadow_request_abs_delta_sum = 0;
+    uint64_t shadow_miss_abs_delta_sum = 0;
+    int64_t shadow_request_signed_delta_sum = 0;
+    int64_t shadow_miss_signed_delta_sum = 0;
+    uint32_t shadow_request_abs_delta_max = 0;
+    uint32_t shadow_miss_abs_delta_max = 0;
     bool icache_order_valid = true;
     bool icache_measurement_valid = true;
     bool submit_engine_observation_valid = true;
     bool counter_below_risk_threshold = true;
+    bool phase_measurement_valid = false;
     bool passed = true;
 };
 
@@ -450,19 +513,81 @@ bool ValidatePmu(
     uint32_t submit_engine_workers_expected = 0;
     uint32_t submit_engine_workers_matched = 0;
     uint32_t maximum_programmable_counter = 0;
+    uint32_t build_variant_matches = 0;
+    uint32_t phase_id_matches = 0;
+    uint32_t phase_status_trusted = 0;
+    uint32_t shadow_primary_matches = 0;
+    uint32_t shadow_primary_bounded = 0;
+    uint32_t phase_boundary_matches = 0;
+    uint32_t phase_call_shape_matches = 0;
+    uint64_t phase_calls = 0;
+    uint64_t shadow_request_abs_delta_sum = 0;
+    uint64_t shadow_miss_abs_delta_sum = 0;
+    int64_t shadow_request_signed_delta_sum = 0;
+    int64_t shadow_miss_signed_delta_sum = 0;
+    uint32_t shadow_request_abs_delta_max = 0;
+    uint32_t shadow_miss_abs_delta_max = 0;
     bool icache_order_valid = true;
     uint32_t bad_printed = 0;
     PmuAggregate all;
     PmuAggregate aic;
     PmuAggregate aiv;
+    const uint32_t expected_phase_calls_per_worker =
+        pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
+            ? 0U
+            : state.config.batches * pa_scheduler::kTasksPerBatch;
     for (uint32_t worker = 0; worker < pa_scheduler::kWorkers; ++worker) {
         const pa_scheduler::WorkerResult &result = state.results[worker];
         const uint32_t status = result.pmu_status;
         const uint32_t core_id = StatusCoreId(status);
         const bool record_trusted = (status & kStatusRequired) == kStatusRequired;
+        const bool variant_matches = result.pmu_build_variant == pa_scheduler::kBuildVariantSubmitPmu;
+        const bool phase_id_matches_record =
+            result.pmu_phase_id == static_cast<uint32_t>(pa_scheduler::kCompiledSubmitPmuPhase);
+        const bool phase_status_ok =
+            (result.pmu_phase_status & kPhaseStatusRequired) == kPhaseStatusRequired;
+        const bool shadow_matches =
+            result.pmu_shadow_icache_requests == result.pmu_icache_requests &&
+            result.pmu_shadow_icache_misses == result.pmu_icache_misses;
+        const bool shadow_bounded =
+            result.pmu_shadow_icache_requests <= result.pmu_icache_requests &&
+            result.pmu_shadow_icache_misses <= result.pmu_icache_misses;
+        const bool shadow_acceptable =
+            pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
+                ? shadow_matches
+                : shadow_bounded;
+        const uint32_t request_abs_delta =
+            result.pmu_shadow_icache_requests >= result.pmu_icache_requests
+                ? result.pmu_shadow_icache_requests - result.pmu_icache_requests
+                : result.pmu_icache_requests - result.pmu_shadow_icache_requests;
+        const uint32_t miss_abs_delta =
+            result.pmu_shadow_icache_misses >= result.pmu_icache_misses
+                ? result.pmu_shadow_icache_misses - result.pmu_icache_misses
+                : result.pmu_icache_misses - result.pmu_shadow_icache_misses;
+        const bool boundaries_match =
+            result.pmu_phase_begin_reads == result.pmu_phase_calls &&
+            result.pmu_phase_end_reads == result.pmu_phase_calls;
+        const bool phase_call_shape_matches_record =
+            result.pmu_phase_calls == expected_phase_calls_per_worker;
         const bool logical_aic = worker < pa_scheduler::kAicWorkers;
         const bool physical_aic = pa_scheduler::pmu_owner::IsAicPhysicalSlot(core_id);
         trusted += record_trusted;
+        build_variant_matches += variant_matches;
+        phase_id_matches += phase_id_matches_record;
+        phase_status_trusted += phase_status_ok;
+        shadow_primary_matches += shadow_matches;
+        shadow_primary_bounded += shadow_bounded;
+        phase_boundary_matches += boundaries_match;
+        phase_call_shape_matches += phase_call_shape_matches_record;
+        phase_calls += result.pmu_phase_calls;
+        shadow_request_abs_delta_sum += request_abs_delta;
+        shadow_miss_abs_delta_sum += miss_abs_delta;
+        shadow_request_signed_delta_sum +=
+            static_cast<int64_t>(result.pmu_shadow_icache_requests) - result.pmu_icache_requests;
+        shadow_miss_signed_delta_sum +=
+            static_cast<int64_t>(result.pmu_shadow_icache_misses) - result.pmu_icache_misses;
+        shadow_request_abs_delta_max = std::max(shadow_request_abs_delta_max, request_abs_delta);
+        shadow_miss_abs_delta_max = std::max(shadow_miss_abs_delta_max, miss_abs_delta);
         owner_members += owner != nullptr && pa_scheduler::pmu_owner::IsConfigured(*owner, core_id);
         exact_worker_slots += result.worker_id == worker;
         physical_role_matches += logical_aic == physical_aic;
@@ -481,8 +606,15 @@ bool ValidatePmu(
             submit_engine_workers_expected += submit_engine_tasks != 0U;
             submit_engine_workers_matched += engine_observation_matches;
         }
+        // phase 的 request/miss 由两条顺序 ld_dev 划界，局部窗口边界并不
+        // 完全重合；只要求它们各自不超过完整窗口，不把 phase miss<=request
+        // 误设成硬门槛。完整 Submit 的 miss<=request 仍必须成立。
         icache_order_valid &= result.pmu_icache_misses <= result.pmu_icache_requests &&
-            result.pmu_warm_icache_misses <= result.pmu_warm_icache_requests;
+            result.pmu_shadow_icache_misses <= result.pmu_shadow_icache_requests &&
+            result.pmu_shadow_icache_requests <= result.pmu_icache_requests &&
+            result.pmu_shadow_icache_misses <= result.pmu_icache_misses &&
+            result.pmu_phase_icache_requests <= result.pmu_shadow_icache_requests &&
+            result.pmu_phase_icache_misses <= result.pmu_shadow_icache_misses;
         if (pmu.mode == WindowMode::IcacheSingle) {
             const int64_t worker_cycle_delta = static_cast<int64_t>(result.pmu_total_cycles) -
                 static_cast<int64_t>(result.pmu_warm_total_cycles);
@@ -497,9 +629,10 @@ bool ValidatePmu(
         }
         const uint32_t programmable[] = {
             result.pmu_vector_busy, result.pmu_cube_busy, result.pmu_scalar_busy,
-            result.pmu_mte1_busy, result.pmu_mte2_busy, result.pmu_mte3_busy,
-            result.pmu_icache_requests, result.pmu_icache_misses, result.pmu_fix_busy,
-            result.pmu_warm_icache_requests, result.pmu_warm_icache_misses,
+            result.pmu_mte1_busy, result.pmu_mte2_busy,
+            result.pmu_icache_requests, result.pmu_icache_misses,
+            result.pmu_phase_icache_requests, result.pmu_phase_icache_misses,
+            result.pmu_shadow_icache_requests, result.pmu_shadow_icache_misses,
         };
         for (uint32_t value : programmable) {
             maximum_programmable_counter = std::max(maximum_programmable_counter, value);
@@ -508,15 +641,20 @@ bool ValidatePmu(
             seen[core_id] = true;
             ++unique;
         }
-        if (!record_trusted && bad_printed < 8) {
+        if ((!record_trusted || !variant_matches || !phase_id_matches_record ||
+             !phase_status_ok || !shadow_acceptable || !boundaries_match ||
+             !phase_call_shape_matches_record) && bad_printed < 8) {
             std::printf(
                 "[PMU-BAD] worker=%u role=%llu coreid=%u status=0x%08x total=%llu scalar=%u "
-                "req=%u miss=%u warm_total=%llu warm_req=%u warm_miss=%u\n",
+                "req=%u miss=%u phase_status=0x%08x phase=%u/%u calls=%u boundaries=%u/%u "
+                "shadow=%u/%u\n",
                 worker, static_cast<unsigned long long>(result.role), core_id, status,
                 static_cast<unsigned long long>(result.pmu_total_cycles), result.pmu_scalar_busy,
                 result.pmu_icache_requests, result.pmu_icache_misses,
-                static_cast<unsigned long long>(result.pmu_warm_total_cycles),
-                result.pmu_warm_icache_requests, result.pmu_warm_icache_misses
+                result.pmu_phase_status, result.pmu_phase_id,
+                static_cast<uint32_t>(pa_scheduler::kCompiledSubmitPmuPhase), result.pmu_phase_calls,
+                result.pmu_phase_begin_reads, result.pmu_phase_end_reads,
+                result.pmu_shadow_icache_requests, result.pmu_shadow_icache_misses
             );
             ++bad_printed;
         }
@@ -545,6 +683,9 @@ bool ValidatePmu(
     PrintPmuAggregate("ALL", all);
     PrintPmuAggregate("AIC", aic);
     PrintPmuAggregate("AIV", aiv);
+    PrintSubmitPmuPhaseAggregate("ALL", all);
+    PrintSubmitPmuPhaseAggregate("AIC", aic);
+    PrintSubmitPmuPhaseAggregate("AIV", aiv);
     bool icache_measurement_ok = true;
     if (pmu.mode == WindowMode::IcacheSingle) {
         const bool all_ok = PrintSingleIcacheAggregate("ALL", all, pmu.icache_trials);
@@ -562,6 +703,23 @@ bool ValidatePmu(
     const bool mixed_triplets_ok = mixed_triplet_matches == pa_scheduler::kAicWorkers;
     const bool windows_started_ok = window_started == pa_scheduler::kWorkers;
     const bool windows_stopped_ok = window_stopped == pa_scheduler::kWorkers;
+    const bool build_variant_ok = build_variant_matches == pa_scheduler::kWorkers;
+    const bool phase_id_ok = phase_id_matches == pa_scheduler::kWorkers;
+    const bool phase_status_ok = phase_status_trusted == pa_scheduler::kWorkers;
+    const bool shadow_primary_exact_ok = shadow_primary_matches == pa_scheduler::kWorkers;
+    const bool shadow_primary_bounded_ok = shadow_primary_bounded == pa_scheduler::kWorkers;
+    const bool shadow_partition_ok =
+        pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
+            ? shadow_primary_exact_ok
+            : shadow_primary_bounded_ok;
+    const bool phase_boundaries_ok = phase_boundary_matches == pa_scheduler::kWorkers;
+    const bool phase_call_shape_ok = phase_call_shape_matches == pa_scheduler::kWorkers;
+    const uint64_t expected_phase_calls =
+        pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
+            ? 0ULL
+            : static_cast<uint64_t>(state.config.batches) * pa_scheduler::kTasksPerBatch *
+                  pa_scheduler::kWorkers;
+    const bool phase_calls_ok = phase_calls == expected_phase_calls;
     const bool submit_engine_observation_ok =
         pmu.mode != WindowMode::SubmitAll ||
         workload.mode != pa_scheduler::WinnerWorkloadMode::RealCompute ||
@@ -577,6 +735,16 @@ bool ValidatePmu(
         icache_pairs, pa_scheduler::kWorkers, icache_calibrated_cores, pa_scheduler::kWorkers,
         maximum_programmable_counter,
         UINT32_MAX - maximum_programmable_counter
+    );
+    std::printf(
+        "[PMU-SHADOW-DELTA] exact=%u/%u bounded=%u/%u request_abs_sum=%llu request_abs_max=%u "
+        "request_signed_sum=%lld miss_abs_sum=%llu miss_abs_max=%u miss_signed_sum=%lld\n",
+        shadow_primary_matches, pa_scheduler::kWorkers,
+        shadow_primary_bounded, pa_scheduler::kWorkers,
+        static_cast<unsigned long long>(shadow_request_abs_delta_sum),
+        shadow_request_abs_delta_max, static_cast<long long>(shadow_request_signed_delta_sum),
+        static_cast<unsigned long long>(shadow_miss_abs_delta_sum),
+        shadow_miss_abs_delta_max, static_cast<long long>(shadow_miss_signed_delta_sum)
     );
     std::printf("[ASSERT] %-48s %s\n", "all PMU records have configured selectors and data",
                 records_ok ? "PASS" : "FAIL");
@@ -594,6 +762,18 @@ bool ValidatePmu(
                 windows_started_ok ? "PASS" : "FAIL");
     std::printf("[ASSERT] %-48s %s\n", "all 96 started PMU windows executed stop",
                 windows_stopped_ok ? "PASS" : "FAIL");
+    std::printf("[ASSERT] %-48s %s\n", "all records match submit-pmu build and phase ids",
+                build_variant_ok && phase_id_ok ? "PASS" : "FAIL");
+    std::printf(
+        "[ASSERT] %-48s %s\n",
+        pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
+            ? "disabled shadow counters exactly match primary"
+            : "running shadow partitions do not exceed primary",
+        shadow_partition_ok ? "PASS" : "FAIL"
+    );
+    std::printf("[ASSERT] %-48s %s\n", "all phase boundaries and per-worker calls are exact",
+                phase_status_ok && phase_boundaries_ok && phase_call_shape_ok && phase_calls_ok
+                    ? "PASS" : "FAIL");
     std::printf("[ASSERT] %-48s %s\n", "I-cache misses do not exceed requests",
                 icache_order_valid ? "PASS" : "FAIL");
     std::printf("[ASSERT] %-48s %s\n", "programmable counters stay below 25% risk threshold",
@@ -625,13 +805,31 @@ bool ValidatePmu(
     validation->submit_engine_workers_expected = submit_engine_workers_expected;
     validation->submit_engine_workers_matched = submit_engine_workers_matched;
     validation->maximum_programmable_counter = maximum_programmable_counter;
+    validation->build_variant_matches = build_variant_matches;
+    validation->phase_id_matches = phase_id_matches;
+    validation->phase_status_trusted = phase_status_trusted;
+    validation->shadow_primary_matches = shadow_primary_matches;
+    validation->shadow_primary_bounded = shadow_primary_bounded;
+    validation->phase_boundary_matches = phase_boundary_matches;
+    validation->phase_call_shape_matches = phase_call_shape_matches;
+    validation->phase_calls = phase_calls;
+    validation->shadow_request_abs_delta_sum = shadow_request_abs_delta_sum;
+    validation->shadow_miss_abs_delta_sum = shadow_miss_abs_delta_sum;
+    validation->shadow_request_signed_delta_sum = shadow_request_signed_delta_sum;
+    validation->shadow_miss_signed_delta_sum = shadow_miss_signed_delta_sum;
+    validation->shadow_request_abs_delta_max = shadow_request_abs_delta_max;
+    validation->shadow_miss_abs_delta_max = shadow_miss_abs_delta_max;
     validation->icache_order_valid = icache_order_valid;
     validation->icache_measurement_valid = icache_measurement_ok;
     validation->submit_engine_observation_valid = submit_engine_observation_ok;
     validation->counter_below_risk_threshold = counter_below_risk_threshold;
+    validation->phase_measurement_valid =
+        build_variant_ok && phase_id_ok && phase_status_ok && shadow_partition_ok &&
+        phase_boundaries_ok && phase_call_shape_ok && phase_calls_ok;
     validation->passed = records_ok && core_ids_ok && owner_members_ok && worker_slots_ok &&
         physical_roles_ok && mixed_triplets_ok && windows_started_ok && windows_stopped_ok &&
         icache_order_valid && icache_measurement_ok && submit_engine_observation_ok &&
+        validation->phase_measurement_valid &&
         counter_below_risk_threshold;
     return validation->passed;
 }
@@ -685,6 +883,7 @@ void WriteMetricDistribution(std::FILE *output, const std::vector<uint64_t> &val
 void WritePmuAggregateJson(
     std::FILE *output, const PmuAggregate &aggregate, bool icache_single
 ) {
+    (void)icache_single;
     const pa_scheduler::host::Uint64Distribution requests =
         pa_scheduler::host::SummarizeUint64(aggregate.icache_requests);
     const pa_scheduler::host::Uint64Distribution misses =
@@ -706,14 +905,20 @@ void WritePmuAggregateJson(
     WriteMetricDistribution(output, aggregate.mte1_busy);
     std::fputs(",\"mte2_busy\":", output);
     WriteMetricDistribution(output, aggregate.mte2_busy);
-    std::fputs(",\"mte3_busy\":", output);
-    WriteMetricDistribution(output, aggregate.mte3_busy);
     std::fputs(",\"icache_requests\":", output);
     WriteMetricDistribution(output, aggregate.icache_requests);
     std::fputs(",\"icache_misses\":", output);
     WriteMetricDistribution(output, aggregate.icache_misses);
-    std::fputs(",\"fix_busy\":", output);
-    WriteMetricDistribution(output, aggregate.fix_busy);
+    std::fputs(",\"shadow_whole_icache_requests\":", output);
+    WriteMetricDistribution(output, aggregate.shadow_icache_requests);
+    std::fputs(",\"shadow_whole_icache_misses\":", output);
+    WriteMetricDistribution(output, aggregate.shadow_icache_misses);
+    std::fputs(",\"phase_calls\":", output);
+    WriteMetricDistribution(output, aggregate.phase_calls);
+    std::fputs(",\"phase_icache_requests\":", output);
+    WriteMetricDistribution(output, aggregate.phase_icache_requests);
+    std::fputs(",\"phase_icache_misses\":", output);
+    WriteMetricDistribution(output, aggregate.phase_icache_misses);
     std::fputs(",\"icache_miss_rate\":", output);
     if (requests.total == 0) {
         std::fputs("null", output);
@@ -721,58 +926,19 @@ void WritePmuAggregateJson(
         // 全局 miss rate 必须以总 miss/总 request 计算，不能平均逐核百分比。
         std::fprintf(output, "%.17g", static_cast<double>(misses.total) / requests.total);
     }
-    if (icache_single) {
-        const pa_scheduler::host::Uint64Distribution cold_cycles =
-            pa_scheduler::host::SummarizeUint64(aggregate.total_cycles);
-        const pa_scheduler::host::Uint64Distribution warm_cycles =
-            pa_scheduler::host::SummarizeUint64(aggregate.warm_total_cycles);
-        const pa_scheduler::host::Uint64Distribution cold_ticks =
-            pa_scheduler::host::SummarizeUint64(aggregate.window_ticks);
-        const pa_scheduler::host::Uint64Distribution warm_ticks =
-            pa_scheduler::host::SummarizeUint64(aggregate.warm_window_ticks);
-        const pa_scheduler::host::Uint64Distribution warm_requests =
-            pa_scheduler::host::SummarizeUint64(aggregate.warm_icache_requests);
-        const pa_scheduler::host::Uint64Distribution warm_misses =
-            pa_scheduler::host::SummarizeUint64(aggregate.warm_icache_misses);
-        const int64_t cycle_delta = static_cast<int64_t>(cold_cycles.total) -
-            static_cast<int64_t>(warm_cycles.total);
-        const int64_t tick_delta = static_cast<int64_t>(cold_ticks.total) -
-            static_cast<int64_t>(warm_ticks.total);
-        const int64_t miss_delta = static_cast<int64_t>(misses.total) -
-            static_cast<int64_t>(warm_misses.total);
-        std::fputs(",\"icache_single_pair\":{\"cold_window_ticks\":", output);
-        WriteMetricDistribution(output, aggregate.window_ticks);
-        std::fputs(",\"warm_total_cycles\":", output);
-        WriteMetricDistribution(output, aggregate.warm_total_cycles);
-        std::fputs(",\"warm_window_ticks\":", output);
-        WriteMetricDistribution(output, aggregate.warm_window_ticks);
-        std::fputs(",\"warm_icache_requests\":", output);
-        WriteMetricDistribution(output, aggregate.warm_icache_requests);
-        std::fputs(",\"warm_icache_misses\":", output);
-        WriteMetricDistribution(output, aggregate.warm_icache_misses);
-        std::fprintf(
-            output,
-            ",\"cycle_delta\":%lld,\"tick_delta\":%lld,\"miss_delta\":%lld,"
-            "\"cold_request_sum\":%llu,\"warm_request_sum\":%llu,\"ns_per_miss\":",
-            static_cast<long long>(cycle_delta), static_cast<long long>(tick_delta),
-            static_cast<long long>(miss_delta), static_cast<unsigned long long>(requests.total),
-            static_cast<unsigned long long>(warm_requests.total)
-        );
-        if (miss_delta <= 0) {
-            std::fputs("null", output);
-        } else {
-            std::fprintf(output, "%.17g", static_cast<double>(tick_delta) / miss_delta);
-        }
-        std::fputc('}', output);
+    const pa_scheduler::host::Uint64Distribution phase_requests =
+        pa_scheduler::host::SummarizeUint64(aggregate.phase_icache_requests);
+    const pa_scheduler::host::Uint64Distribution phase_misses =
+        pa_scheduler::host::SummarizeUint64(aggregate.phase_icache_misses);
+    // 两个 phase counter 是顺序 read-to-clear，下界之比不是实际 miss rate
+    // 的数学下界；字段名只陈述它是本次 read-clear 观察值之比。
+    std::fputs(",\"phase_observed_read_clear_ratio\":", output);
+    if (phase_requests.total == 0U) {
+        std::fputs("null", output);
+    } else {
+        std::fprintf(output, "%.17g", static_cast<double>(phase_misses.total) / phase_requests.total);
     }
     std::fputc('}', output);
-}
-
-uint32_t PmuWindowSegments(const PmuOptions &pmu) {
-    const pa_scheduler::ccec_pmu::WindowMode mode = pmu.mode;
-    if (mode == pa_scheduler::ccec_pmu::WindowMode::ScalarDouble) return 2U;
-    if (mode == pa_scheduler::ccec_pmu::WindowMode::IcacheSingle) return pmu.icache_trials * 2U;
-    return 1U;
 }
 
 uint32_t CountConfiguredMixedTriplets(const pa_scheduler::pmu_owner::PmuOwnerControl &owner) {
@@ -863,7 +1029,7 @@ bool ExportPmuJson(
           };
     const uint32_t owner_bitmap_count = pa_scheduler::pmu_owner::CountConfigured(owner);
     const uint32_t owner_complete_triplets = CountConfiguredMixedTriplets(owner);
-    std::fputs("{\n\"schema\":{\"name\":\"pa_scheduler_pmu_phase_windows\",\"version\":3},\n", output);
+    std::fputs("{\n\"schema\":{\"name\":\"pa_scheduler_pmu_phase_windows\",\"version\":4},\n", output);
     std::fputs("\"capture\":{\"capture_id\":", output);
     WriteJsonString(output, capture_id);
     std::fprintf(
@@ -885,6 +1051,12 @@ bool ExportPmuJson(
     );
     std::fputs("\"configuration\":{\"kernel_path\":", output);
     WriteJsonString(output, options.kernel_path);
+    std::fputs(",\"build_variant\":\"submit-pmu\",\"build_variant_id\":2,\"compiled_phase\":", output);
+    WriteJsonString(output, SubmitPmuPhaseName(pa_scheduler::kCompiledSubmitPmuPhase));
+    std::fprintf(
+        output, ",\"compiled_phase_id\":%u",
+        static_cast<uint32_t>(pa_scheduler::kCompiledSubmitPmuPhase)
+    );
     std::fprintf(
         output,
         ",\"device\":%u,\"batches\":%u,\"workers\":%u,\"aic_workers\":%u,\"aiv_workers\":%u,"
@@ -959,26 +1131,43 @@ bool ExportPmuJson(
     }
     std::fprintf(
         output,
-        ",\"window_segments_are_mode_contract_per_record\":true,"
+        ",\"primary_window_segments_per_record\":1,"
         "\"icache_single_discarded_training_samples_per_core\":%u,"
         "\"icache_single_sys_counter_tick_ns\":%s,"
         "\"host_launch_to_sync_us\":%.17g,\"submit_span_us\":%.17g,"
         "\"selectors\":{\"cnt0_vector_busy\":%u,\"cnt1_cube_busy\":%u,"
         "\"cnt2_scalar_busy\":%u,\"cnt3_mte1_busy\":%u,\"cnt4_mte2_busy\":%u,"
-        "\"cnt5_mte3_busy\":%u,\"cnt6_icache_request\":%u,\"cnt7_icache_miss\":%u,"
-        "\"cnt8_fix_busy\":%u},\"counter_width_bits\":{\"total\":64,\"programmable\":32},"
+        "\"cnt5_shadow_icache_miss\":%u,\"cnt6_primary_icache_request\":%u,"
+        "\"cnt7_primary_icache_miss\":%u,\"cnt8_shadow_icache_request\":%u,"
+        "\"cnt9_unused\":0},\"unavailable_metrics\":[\"mte3_busy\"],"
+        "\"counter_width_bits\":{\"total\":64,\"programmable\":32},"
         "\"counter_wrap_not_directly_detectable\":true,\"counter_wrap_absence_proven\":false,"
         "\"programmable_counter_risk_threshold\":%u,"
         "\"gate_start_stop_have_pipe_all_barriers\":true,"
-        "\"phase_timestamp_calls_present\":true,\"phase_record_writes\":false,"
+        "\"phase_timestamp_calls_present\":false,\"phase_record_writes\":false,"
         "\"atomic_trace\":false,\"profile_accumulation\":false,"
+        "\"phase_boundary_observation_included\":%s,"
+        "\"phase_counter_pair_snapshot_atomic\":false,"
+        "\"primary_counters_read_at_phase_boundaries\":false,"
+        "\"phase_shadow_partition_exact_required\":%s,"
+        "\"phase_values_are_running_read_clear_lower_bounds\":%s,"
+        "\"cross_phase_elf_sums_valid\":false,"
         "\"simulated_task_nop_mechanism_executes_on_scalar\":%s,"
         "\"simulated_task_nops_nonzero\":%s,"
         "\"icache_miss_rate_definition\":\"sum(icache_misses)/sum(icache_requests)\"},\n",
         icache_single ? 2U : 0U, icache_single ? "1" : "null",
         host_us, submit_span_us, kVectorBusyEvent, kCubeBusyEvent, kScalarBusyEvent,
-        kMte1BusyEvent, kMte2BusyEvent, kMte3BusyEvent, kIcacheRequestEvent, kIcacheMissEvent,
-        kFixBusyEvent, kProgrammableCounterRiskThreshold,
+        kMte1BusyEvent, kMte2BusyEvent, kIcacheMissEvent, kIcacheRequestEvent, kIcacheMissEvent,
+        kIcacheRequestEvent, kProgrammableCounterRiskThreshold,
+        pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
+            ? "false"
+            : "true",
+        pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
+            ? "true"
+            : "false",
+        pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
+            ? "false"
+            : "true",
         real_compute ? "false" : "true",
         simulated_task_nops_nonzero ? "true" : "false"
     );
@@ -1006,7 +1195,17 @@ bool ExportPmuJson(
         "\"icache_measurement_valid\":%s,"
         "\"icache_miss_le_request\":%s,\"counter_below_risk_threshold\":%s,"
         "\"maximum_programmable_counter\":%u,\"programmable_counter_risk_threshold\":%u,"
-        "\"programmable_counter_headroom\":%u},\n",
+        "\"programmable_counter_headroom\":%u,"
+        "\"build_variant_match_records\":%u,\"phase_id_match_records\":%u,"
+        "\"phase_status_trusted_records\":%u,\"shadow_primary_match_records\":%u,"
+        "\"shadow_primary_bounded_records\":%u,"
+        "\"shadow_request_abs_delta_sum\":%llu,\"shadow_request_abs_delta_max\":%u,"
+        "\"shadow_request_signed_delta_sum\":%lld,"
+        "\"shadow_miss_abs_delta_sum\":%llu,\"shadow_miss_abs_delta_max\":%u,"
+        "\"shadow_miss_signed_delta_sum\":%lld,"
+        "\"phase_boundary_match_records\":%u,\"phase_call_shape_match_records\":%u,"
+        "\"phase_calls\":%llu,"
+        "\"phase_measurement_valid\":%s},\n",
         semantic_passed ? "true" : "false", validation.passed ? "true" : "false",
         real_compute ? "true" : "false",
         real_compute ? (workload_output_passed ? "true" : "false") : "null",
@@ -1032,7 +1231,20 @@ bool ExportPmuJson(
         validation.icache_order_valid ? "true" : "false",
         validation.counter_below_risk_threshold ? "true" : "false",
         validation.maximum_programmable_counter, kProgrammableCounterRiskThreshold,
-        UINT32_MAX - validation.maximum_programmable_counter
+        UINT32_MAX - validation.maximum_programmable_counter,
+        validation.build_variant_matches, validation.phase_id_matches,
+        validation.phase_status_trusted, validation.shadow_primary_matches,
+        validation.shadow_primary_bounded,
+        static_cast<unsigned long long>(validation.shadow_request_abs_delta_sum),
+        validation.shadow_request_abs_delta_max,
+        static_cast<long long>(validation.shadow_request_signed_delta_sum),
+        static_cast<unsigned long long>(validation.shadow_miss_abs_delta_sum),
+        validation.shadow_miss_abs_delta_max,
+        static_cast<long long>(validation.shadow_miss_signed_delta_sum),
+        validation.phase_boundary_matches,
+        validation.phase_call_shape_matches,
+        static_cast<unsigned long long>(validation.phase_calls),
+        validation.phase_measurement_valid ? "true" : "false"
     );
     std::fprintf(
         output,
@@ -1063,42 +1275,72 @@ bool ExportPmuJson(
         const pa_scheduler::WorkerResult &result = state.results[worker];
         const uint32_t status = result.pmu_status;
         const uint32_t physical_core_id = StatusCoreId(status);
-        const bool trusted = (status & kStatusRequired) == kStatusRequired;
+        const bool primary_trusted = (status & kStatusRequired) == kStatusRequired;
+        const bool phase_trusted =
+            (result.pmu_phase_status & kPhaseStatusRequired) == kPhaseStatusRequired;
+        const bool trusted = primary_trusted && phase_trusted;
         const bool is_aic = result.role == static_cast<uint32_t>(pa_scheduler::CoreRole::Aic);
         const uint32_t vector_id = is_aic ? 0U : worker - pa_scheduler::kAicWorkers;
         const uint32_t block_id = is_aic ? worker : vector_id / 2U;
         const uint32_t lane = is_aic ? 0U : 1U + vector_id % 2U;
-        const uint32_t segments = PmuWindowSegments(pmu);
+        const uint32_t shadow_read_segments = result.pmu_phase_calls * 2U + 1U;
         const bool owner_bitmap_member = pa_scheduler::pmu_owner::IsConfigured(owner, physical_core_id);
         const bool worker_slot_exact = result.worker_id == worker;
         const bool physical_role_matches =
             is_aic == pa_scheduler::pmu_owner::IsAicPhysicalSlot(physical_core_id);
         const bool window_started = (status & kStatusWindowStarted) != 0U;
         const bool window_stopped = (status & kStatusWindowStopped) != 0U;
-        const bool icache_pair_observed = (status & kStatusIcachePairObserved) != 0U;
+        const bool shadow_matches =
+            result.pmu_shadow_icache_requests == result.pmu_icache_requests &&
+            result.pmu_shadow_icache_misses == result.pmu_icache_misses;
+        const bool shadow_bounded =
+            result.pmu_shadow_icache_requests <= result.pmu_icache_requests &&
+            result.pmu_shadow_icache_misses <= result.pmu_icache_misses;
+        const uint32_t shadow_request_loss =
+            result.pmu_icache_requests - result.pmu_shadow_icache_requests;
+        const uint32_t shadow_miss_loss =
+            result.pmu_icache_misses - result.pmu_shadow_icache_misses;
+        const uint32_t phase_request_upper =
+            result.pmu_phase_icache_requests + shadow_request_loss;
+        const uint32_t phase_miss_upper =
+            result.pmu_phase_icache_misses + shadow_miss_loss;
+        const bool boundaries_balanced =
+            result.pmu_phase_begin_reads == result.pmu_phase_calls &&
+            result.pmu_phase_end_reads == result.pmu_phase_calls;
         std::fprintf(
             output,
             "%s{\"worker_id\":%u,\"physical_core_id\":%u,\"role\":\"%s\",\"block_id\":%u,"
-            "\"lane\":%u,\"window_segments\":%u,\"window_segment_count_source\":\"mode_contract\","
+            "\"lane\":%u,\"primary_window_segments\":1,\"shadow_read_segments\":%u,"
             "\"window_started\":%s,\"window_stopped\":%s,\"total_cycles\":%llu,\"vector_busy\":%u,"
             "\"cube_busy\":%u,\"scalar_busy\":%u,\"mte1_busy\":%u,\"mte2_busy\":%u,"
-            "\"mte3_busy\":%u,\"icache_requests\":%u,\"icache_misses\":%u,\"fix_busy\":%u,"
-            "\"window_ticks\":%llu,\"warm_total_cycles\":%llu,\"warm_window_ticks\":%llu,"
-            "\"warm_icache_requests\":%u,\"warm_icache_misses\":%u,"
+            "\"icache_requests\":%u,\"icache_misses\":%u,"
+            "\"build_variant_id\":%u,\"compiled_phase_id\":%u,\"phase_calls\":%u,"
+            "\"phase_begin_reads\":%u,\"phase_end_reads\":%u,"
+            "\"phase_icache_requests\":%u,\"phase_icache_misses\":%u,"
+            "\"phase_icache_requests_upper_bound\":%u,"
+            "\"phase_icache_misses_upper_bound\":%u,"
+            "\"shadow_whole_icache_requests\":%u,\"shadow_whole_icache_misses\":%u,"
+            "\"shadow_matches_primary\":%s,\"shadow_not_greater_than_primary\":%s,"
+            "\"shadow_request_loss\":%u,\"shadow_miss_loss\":%u,"
+            "\"phase_boundaries_balanced\":%s,"
+            "\"phase_status\":%u,\"phase_status_hex\":\"0x%08x\","
             "\"status\":%u,\"status_hex\":"
             "\"0x%08x\",\"trusted\":%s,\"physical_core_id_valid\":%s,\"selectors_match\":%s,"
             "\"owner_bitmap_member\":%s,\"worker_slot_exact\":%s,"
-            "\"physical_role_matches\":%s,\"icache_pair_observed\":%s,"
-            "\"prior_snapshot_larger\":%s}",
+            "\"physical_role_matches\":%s}",
             worker == 0 ? "" : ",\n", worker, physical_core_id, is_aic ? "aic" : "aiv", block_id,
-            lane, segments, window_started ? "true" : "false", window_stopped ? "true" : "false",
+            lane, shadow_read_segments, window_started ? "true" : "false", window_stopped ? "true" : "false",
             static_cast<unsigned long long>(result.pmu_total_cycles), result.pmu_vector_busy,
             result.pmu_cube_busy, result.pmu_scalar_busy, result.pmu_mte1_busy, result.pmu_mte2_busy,
-            result.pmu_mte3_busy, result.pmu_icache_requests, result.pmu_icache_misses,
-            result.pmu_fix_busy, static_cast<unsigned long long>(result.pmu_window_ticks),
-            static_cast<unsigned long long>(result.pmu_warm_total_cycles),
-            static_cast<unsigned long long>(result.pmu_warm_window_ticks),
-            result.pmu_warm_icache_requests, result.pmu_warm_icache_misses,
+            result.pmu_icache_requests, result.pmu_icache_misses,
+            result.pmu_build_variant, result.pmu_phase_id, result.pmu_phase_calls,
+            result.pmu_phase_begin_reads, result.pmu_phase_end_reads,
+            result.pmu_phase_icache_requests, result.pmu_phase_icache_misses,
+            phase_request_upper, phase_miss_upper,
+            result.pmu_shadow_icache_requests, result.pmu_shadow_icache_misses,
+            shadow_matches ? "true" : "false", shadow_bounded ? "true" : "false",
+            shadow_request_loss, shadow_miss_loss, boundaries_balanced ? "true" : "false",
+            result.pmu_phase_status, result.pmu_phase_status,
             status, status, trusted ? "true" : "false",
             (status & kStatusCoreIdValid) != 0 ? "true" : "false",
             (status & (kStatusCnt0Selector | kStatusCnt1Selector | kStatusCnt2Selector |
@@ -1110,9 +1352,7 @@ bool ExportPmuJson(
                 ? "true"
                 : "false",
             owner_bitmap_member ? "true" : "false", worker_slot_exact ? "true" : "false",
-            physical_role_matches ? "true" : "false",
-            icache_pair_observed ? "true" : "false",
-            (status & kStatusPriorSnapshotLarger) != 0 ? "true" : "false"
+            physical_role_matches ? "true" : "false"
         );
     }
     std::fputs("\n],\n\"summary\":{\"all\":", output);
@@ -1226,6 +1466,21 @@ int main(int argc, char **argv) {
         std::fprintf(
             stderr,
             "--profile-phases is not part of the swimlane build; use submit-pmu phase attribution.\n"
+        );
+        return EXIT_FAILURE;
+    }
+#elif PA_BUILD_SUBMIT_PMU
+    // submit-pmu 是编译期固定 phase 的单轮诊断产物；host、kernel 与 owner
+    // 必须共同拒绝旧校准窗口和任何泳道/phase-profile 观察代码。
+    if (pmu_options.mode != pa_scheduler::ccec_pmu::WindowMode::SubmitAll) {
+        std::fprintf(stderr, "The submit-pmu build requires --pmu-window submit-all.\n");
+        return EXIT_FAILURE;
+    }
+    if (options.runs != 1 || options.trace_enabled || options.trace_atomics ||
+        options.profile_phases || options.analyze_swimlane || !options.swimlane_json.empty()) {
+        std::fprintf(
+            stderr,
+            "submit-pmu requires one PMU-only run: --runs 1 --no-swimlane and no trace/profile options.\n"
         );
         return EXIT_FAILURE;
     }

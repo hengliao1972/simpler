@@ -185,8 +185,8 @@ void SaveOne(PmuOwnerControl *control, uint64_t base, uint32_t index)
 
 void ConfigureOne(uint64_t base)
 {
-    // 先冻结 PMU，再写完整 10 槽 selector。CNT9=0 是正式配置中的未用策略，
-    // 不是遗漏；它和另外九槽一样会在 Restore 时恢复旧值。
+    // 先冻结 PMU，再写完整 10 槽 selector。submit-pmu 的 CNT8/CNT5 是
+    // request/miss shadow；包括 unused CNT9 在内的所有槽都会在 Restore 恢复。
     WriteMmio(base, kCtrl0Offset, 0U);
     WriteMmio(base, kCtrl1Offset, 0U);
     for (uint32_t counter = 0U; counter < pa_scheduler::pmu_owner::kPmuCounterCount; ++counter) {

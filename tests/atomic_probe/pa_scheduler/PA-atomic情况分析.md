@@ -31,9 +31,15 @@ Submit 路径，供后续继续优化。快照日期更新至 2026-07-18；当�
 - 优化没有改变通用 atomic 语义，也没有把任务推迟到最终 drain 来制造
   表面收益。F1 的 fanin 顺序重排已经证明性能回退并撤销；下一步先精确区分
   fanin 成功/失败 load 与 frontier 重复前推，再进行单变量消减。
+- standalone 观察产物现已固定为两类：`swimlane` 合并普通阶段与 schema-v3
+  atomic（direct Atomic 加 PollBatch）泳道；`submit-pmu` 独立重编译完整 Submit PMU，当前只支持
+  `none|claim`。两者不在同一进程采集；`none` 提供完整 Submit 的严格
+  闭合计数，局部 phase 只提供 running read-clear 的下界/保守上界。
 
 环境安装、编译和基线复现过程见
 [A5 FDWIC Paged Attention 安装与复现指南](../a5_fdwic_atomic_swimlane_repo.md)。
+standalone I-cache 的当前构建、采集和解读见
+[`../icache_miss_usage_guide.md`](../icache_miss_usage_guide.md)。
 
 ## 2. Case1 工作量与 atomic 语义
 
@@ -1337,7 +1343,6 @@ outputs/pa_scheduler_swimlane_20260718_182725_4061524/ccec/merged_swimlane.json
 b1 是零 winner 负载的快速验收，b256 是开启 atomic 泳道的诊断运行；5.774295 ms
 只证明观察构建保持目标量级，不是关闭 trace 的正式性能基线，也不能与下列历史样本
 做单轮减法归因观察开销。
-
 以下是 2026-07-18 的**历史 schema-v2、逐调用、边界修复前**证据，保留用于追溯，
 不作为当前 schema-v3 的物理记录规模、逻辑调用数或边界闭合验收。历史 b1
 atomic-trace-only 上板中，全部协议断言 PASS，raw 共 4959 条、
@@ -1744,4 +1749,159 @@ PMU/泳道后的 `ΔSubmit span`；在该 A/B 完成前，本节把实际损失�
 outputs/pmu_submit_all_real_compute_b256_20260718T140539Z/run1.json ... run5.json
 outputs/pmu_empty_real_compute_b256_20260718T140908Z/run1.json ... run3.json
 outputs/pmu_submit_all_scalar_nop_b256_same_elf_20260718T141455Z/run1.json ... run3.json
+~~~
+
+#### 7.5.15 观察构建收敛为 `swimlane` 与 `submit-pmu`
+
+2026-07-18 在旧统一 ELF 完成 atomic 泳道、PMU owner 和 I-cache 取数
+可行性取证后，standalone 的最终观察产物收敛为两类：
+
+| 构建 | 正式内容 | 隔离要求 |
+| --- | --- | --- |
+| `swimlane` | 普通阶段和逐 atomic 记录合并在对应 AIC/AIV scalar lane | 不配置 PMU，不导出 PMU JSON |
+| `submit-pmu` | 每核完整 Submit PMU，可带一个编译期局部 phase | 编译掉泳道、逐 atomic、ClockBaseline、runtime phase-profile 和旧 I-cache 冲刷体 |
+
+旧 O1/O2 文字中的 `empty/scalar/scalar-double/icache-single`、CNT8 fix-busy、
+schema-v3 以及“`--no-swimlane` 仍保留 phase timestamp”都是观察链路建设过程。
+它们保留为历史证据，不再定义当前命令和当前 ELF 口径。
+
+当前 `submit-pmu` 仅白名单支持：
+
+- `none`：不执行局部 counter 边界读取，用于回答完整 Submit 的
+  AIC/AIV 每核 request/miss；
+- `claim`：在每次 `Claim()` 前后读取 read-to-clear shadow，累计每核
+  1,280 次 Claim 的观测下界，并用本核 primary-shadow residual 给出保守
+  上界；b256 全局期望 calls 为 `256 * 5 * 96 = 122880`。
+
+对应命令和产物为：
+
+~~~bash
+./run.sh build-submit-pmu ccec none
+./run.sh build-submit-pmu ccec claim
+
+./run.sh submit-pmu ccec none \
+  --device 0 --batches 256 \
+  --winner-workload real-compute --real-compute-counts 6,28,4,1 \
+  --pmu-json ./outputs/<unique-none>/run1.json
+
+./run.sh submit-pmu ccec claim \
+  --device 0 --batches 256 \
+  --winner-workload real-compute --real-compute-counts 6,28,4,1 \
+  --pmu-json ./outputs/<unique-claim>/run1.json
+~~~
+
+~~~text
+build/ccec/submit-pmu/none/
+build/ccec/submit-pmu/claim/
+~~~
+
+每个 phase 目录中的 host、mixed kernel、owner 与 dispatcher 是同一构建
+集，不能跨 phase 复用。`submit-pmu` action 固定单轮、关闭泳道且只打开
+完整 Submit 窗口；不接受 atomic trace、phase profile、泳道分析或泳道 JSON。
+
+完整 Submit 的权威 I-cache 计数为不在局部边界读取的
+`CNT6=0x34 primary request` 和 `CNT7=0x35 primary miss`。局部归因需要
+一对可中途 read-to-clear 的重复计数槽。首版将 miss 放在
+`CNT9=0x35`，但 A5 b1 上板中 CNT9 始终为 0，已反证该槽可用性。
+因此正式配置调整为：
+
+| 槽位 | 配置 | 用途 |
+| --- | --- | --- |
+| CNT5 | `0x35` | shadow miss；诊断 ELF 不再保留 MTE3 busy |
+| CNT6 | `0x34` | primary whole request |
+| CNT7 | `0x35` | primary whole miss |
+| CNT8 | `0x34` | shadow request |
+| CNT9 | `0x0` | 未使用 |
+
+这个取舍只影响 `submit-pmu` 诊断 ELF，不影响标准 `swimlane`。
+`claim` 在 begin/end 读 CNT8/CNT5，stop 后再读 tail；所有片段的软件
+累加构成 shadow whole。两种构建的接受条件不同：
+
+~~~text
+none（没有运行中 read-clear）：
+  shadow request == primary request
+  shadow miss    == primary miss
+
+claim（运行中反复 read-clear）：
+  shadow request <= primary request
+  shadow miss    <= primary miss
+
+  request loss = primary request - shadow request
+  miss loss    = primary miss - shadow miss
+
+  phase request ∈ [observed request, observed request + request loss]
+  phase miss    ∈ [observed miss,    observed miss    + miss loss]
+~~~
+
+上下界先按每核 raw 计算，再分别按 AIC/AIV 聚合，不能拿聚合后的 median
+相减拼区间。CNT8/CNT5 是两条顺序 `ld_dev`，不是原子配对快照，所以
+`phase miss <= phase request` 不是硬门禁；二者分别不得超过对应 shadow，
+上界分别不得超过对应 primary。
+
+除此之外，还必须闭合 build variant/phase id、每核 begin/end/calls、完整
+Submit 的 `miss <= request`、96 个唯一物理子核、owner bitmap/role/triplet、
+真计算输出、Submit placement/engine、counter 风险门槛和 Restore。`none`
+的 phase calls/begin/end/request/miss 必须全为 0，并要求 96/96 shadow 精确
+等于 primary；`claim` 要求 96/96 shadow 不大于 primary，exact 核数只作
+诊断，不再伪装成逐事件精确切片。
+
+局部 begin/end 读本身会增加 scalar 取指和改变多核时序，所以
+`claim` 是带观察边界扰动的归因 ELF。不同 phase 的局部 request/miss
+不可相加，也不能用 `claim - none` 宣称得到零扰动 Claim 净值。
+每个 ELF 的完整 Submit 始终以它自己的 CNT6/CNT7 primary whole 为准。
+当协议、数值输出和 placement/engine 门禁全部通过时，运行中 shadow 的
+单向负差只能描述为局部 PMU 分段误差，不能描述成 standalone 调度异常。
+
+schema-v4 JSON 保留 96 条 raw，并分别给出 ALL/AIC/AIV 的 authoritative
+whole、shadow loss 以及 phase lower/upper。raw 中显式保存
+`shadow_request_loss`、`shadow_miss_loss`、
+`phase_icache_requests_upper_bound` 和 `phase_icache_misses_upper_bound`。
+完整 Submit 的 miss rate 只按 `Σmiss/Σrequest` 计算，不平均逐核百分比；
+局部 lower miss/lower request 之比只叫 observed read-clear ratio，不是实际
+miss rate 的数学下界。已有隔离微基准的约
+90 ns/miss 只用于 `Σmiss * 0.09 us` 的 core-work 数量级感性估算；
+它不是可相加的 Submit stall 常数。真正暴露的墙钟收益必须通过同语义
+代码的交错 A/B，同时观察 `Δmiss/core` 和无 PMU/泳道的
+`ΔSubmit span`。完整操作和排错见
+[`../icache_miss_usage_guide.md`](../icache_miss_usage_guide.md)。
+
+#### 7.5.16 完整 Submit 精确闭合与局部 read-clear 边界取证
+
+2026-07-18 的四个独立 b256 `submit-pmu none` 进程均使用默认真负载
+`real-compute/6,28,4,1`，且 96/96 核 shadow 与 primary 逐值相等：
+
+| 轮次 | Submit span/us | request 总和 | miss 总和 | AIC miss/core | AIV miss/core |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 3825.420 | 40,020,837 | 4,748,592 | 38,702.656 | 54,845.422 |
+| 2 | 3600.091 | 40,035,347 | 4,726,896 | 38,466.438 | 54,624.531 |
+| 3 | 3610.648 | 39,977,052 | 4,728,552 | 38,481.000 | 54,643.125 |
+| 4 | 3731.247 | 39,787,176 | 4,715,096 | 38,583.875 | 54,381.438 |
+
+四轮中位数为：Submit span 3670.948 us、AIC miss/core 38,532.438、
+AIV miss/core 54,633.828。`none` 的严格精确仅指同 selector、同 gate 的完整
+Submit counter 逐核闭合；它不等于真实 PA 的绝对 profile，也不把 PMU
+进程的 Submit span 当成无诊断墙钟基线。
+
+补充 interval-schema 的单轮 b256 A5 复核：
+
+| 构建 | Submit span/us | exact/bounded 核 | shadow request loss | shadow miss loss | 语义与真计算 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `none` | 4584.835 | 96/96，96/96 | 0 | 0 | 全部 PASS |
+| `claim` | 4382.161 | 40/96，96/96 | 253 | 580 | 全部 PASS |
+
+`claim` 共执行 122,880 次 phase 调用；loss 随运行中边界读取次数放大，但
+untouched primary、PA 任务拓扑、atomic 协议、winner、输出和 engine 观察
+仍全部通过。这组证据把问题定位在运行中 read-to-clear 的局部分段能力，
+而不是 standalone scheduler。
+
+四轮 `none` 的约 90 ns/miss 感性标尺对应 AIC 约 3.468 ms/core-equivalent、
+AIV 约 4.917 ms/core-equivalent。它们不能相加，也不能叫 Submit 墙钟损失；
+实际暴露损失仍为 `UNMEASURED`，必须另做同语义优化前后交错 A/B。
+
+本机原始证据位于：
+
+~~~text
+outputs/submit_pmu_none_validation_20260718_b256_real/run1.json ... run4.json
+outputs/submit_pmu_final_gate_20260718/none_b256/run1.json
+outputs/submit_pmu_final_gate_20260718/claim_b256/run1.json
 ~~~

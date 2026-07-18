@@ -21,6 +21,8 @@ Usage:
   ./run.sh run    ccec|ascendc|cpu|all [benchmark options]
   ./run.sh smoke  ccec|ascendc|cpu|all [--device N]
   ./run.sh swimlane ccec|ascendc|cpu|all [benchmark options]
+  ./run.sh build-submit-pmu ccec none|claim
+  ./run.sh submit-pmu ccec none|claim [benchmark options]
 
 Benchmark options:
   --device N
@@ -59,6 +61,11 @@ action, --trace-atomics still requires swimlane tracing; add
 --analyze-swimlane to print the per-role/per-site timing distributions.
 --pmu-json requires --runs 1 and a non-off PMU window. PMU probe options are
 CCEC-only and cannot target all.
+
+The submit-pmu action is a separate CCEC-only build. It fixes one PMU-only run
+covering the complete Submit window. phase=none performs no internal snapshots;
+phase=claim reports running read-clear lower/loss-adjusted upper bounds for one
+compile-time phase while CNT6/7 retain the authoritative whole-window counters.
 
 The swimlane action performs exactly one run and writes both the raw capture
 and merged Perfetto JSON below this directory's outputs/ folder. It rejects
@@ -125,6 +132,119 @@ run_backend() {
             exit 1
             ;;
     esac
+}
+
+validate_submit_pmu_phase() {
+    case "$1" in
+        none|claim) ;;
+        *)
+            echo "Unknown submit-pmu phase: $1 (expected none|claim)" >&2
+            exit 1
+            ;;
+    esac
+}
+
+submit_pmu_artifact_failure() {
+    local phase="$1"
+    local reason="$2"
+    echo "Invalid submit-pmu artifact set for phase '$phase': $reason" >&2
+    echo "Run: $0 build-submit-pmu ccec $phase" >&2
+    return 1
+}
+
+validate_submit_pmu_artifacts() {
+    local phase="$1"
+    local build_dir="$2"
+    local phase_id
+    case "$phase" in
+        none) phase_id=0 ;;
+        claim) phase_id=1 ;;
+        *) submit_pmu_artifact_failure "$phase" "unsupported phase"; return 1 ;;
+    esac
+
+    local manifest_name="submit_pmu_artifacts.manifest"
+    local manifest="$build_dir/$manifest_name"
+    local artifacts=(
+        pa_scheduler_host
+        pa_scheduler_kernel.o
+        libpa_scheduler_pmu_owner_aicpu.so
+        libpa_scheduler_pmu_owner_dispatcher.so
+    )
+    if [[ ! -x "$build_dir/${artifacts[0]}" ]]; then
+        submit_pmu_artifact_failure "$phase" "host runner is missing, empty, or not executable"
+        return 1
+    fi
+    local artifact
+    for artifact in "${artifacts[@]:1}"; do
+        if [[ ! -s "$build_dir/$artifact" ]]; then
+            submit_pmu_artifact_failure "$phase" "artifact is missing or empty: $artifact"
+            return 1
+        fi
+    done
+    if [[ ! -s "$manifest" ]]; then
+        submit_pmu_artifact_failure "$phase" "ready manifest is missing or empty"
+        return 1
+    fi
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        submit_pmu_artifact_failure "$phase" "sha256sum is unavailable"
+        return 1
+    fi
+
+    # manifest 固定为四行身份头和四行校验和；既检查 phase/variant，也拒绝
+    # 漏项、增项、绝对路径或重复文件，避免 sha256sum 只校验到一个子集。
+    local manifest_lines=()
+    mapfile -t manifest_lines < "$manifest"
+    if [[ ${#manifest_lines[@]} -ne 8 ||
+          "${manifest_lines[0]}" != "# schema=pa_scheduler_submit_pmu_artifacts/v1" ||
+          "${manifest_lines[1]}" != "# variant=submit-pmu" ||
+          "${manifest_lines[2]}" != "# phase=$phase" ||
+          "${manifest_lines[3]}" != "# phase_id=$phase_id" ]]; then
+        submit_pmu_artifact_failure "$phase" "manifest schema, variant, or phase metadata does not match"
+        return 1
+    fi
+    local index digest filename extra
+    for index in "${!artifacts[@]}"; do
+        digest=""
+        filename=""
+        extra=""
+        read -r digest filename extra <<< "${manifest_lines[index + 4]}"
+        if [[ ! "$digest" =~ ^[[:xdigit:]]{64}$ ||
+              "$filename" != "${artifacts[index]}" || -n "$extra" ]]; then
+            submit_pmu_artifact_failure "$phase" "manifest checksum entry $((index + 1)) is malformed or out of order"
+            return 1
+        fi
+    done
+    if ! (cd "$build_dir" && sha256sum --check --strict --status "$manifest_name"); then
+        submit_pmu_artifact_failure "$phase" "one or more artifact SHA256 values do not match"
+        return 1
+    fi
+    echo "[CHECK] submit-pmu artifact manifest verified: $manifest"
+}
+
+reject_managed_submit_pmu_options() {
+    # 这些参数定义诊断 ELF 与窗口边界，必须由 action 独占；允许用户只传
+    # device/batches/workload 和可选的 --pmu-json。
+    for argument in "$@"; do
+        case "$argument" in
+            --kernel|--kernel=*|--runs|--runs=*|--pmu-window|--pmu-window=*|\
+            --no-swimlane|--profile-phases|--trace-atomics|--analyze-swimlane|\
+            --swimlane-json|--swimlane-json=*|--pmu-scalar-nops|--pmu-scalar-nops=*|\
+            --pmu-icache-trials|--pmu-icache-trials=*)
+                echo "The submit-pmu action manages or forbids $argument." >&2
+                exit 1
+                ;;
+        esac
+    done
+}
+
+run_submit_pmu() {
+    local phase="$1"
+    shift
+    local build_dir="$SCRIPT_DIR/build/ccec/submit-pmu/$phase"
+    local host="$build_dir/pa_scheduler_host"
+    local kernel="$build_dir/pa_scheduler_kernel.o"
+    validate_submit_pmu_artifacts "$phase" "$build_dir"
+    "$host" --kernel "$kernel" --runs 1 --no-swimlane --pmu-window submit-all "$@"
 }
 
 reject_managed_swimlane_options() {
@@ -254,6 +374,26 @@ case "$ACTION" in
             "$PYTHON_BIN" "$SCRIPT_DIR/swimlane_converter.py" "$RAW_JSON" -o "$MERGED_JSON"
         done
         echo "[SWIMLANE] output_root=$OUTPUT_ROOT"
+        ;;
+    build-submit-pmu)
+        if [[ "$BACKEND" != "ccec" || $# -ne 1 ]]; then
+            echo "Usage: $0 build-submit-pmu ccec none|claim" >&2
+            exit 1
+        fi
+        PHASE="$1"
+        validate_submit_pmu_phase "$PHASE"
+        "$SCRIPT_DIR/ccec/build.sh" submit-pmu "$PHASE"
+        ;;
+    submit-pmu)
+        if [[ "$BACKEND" != "ccec" || $# -lt 1 ]]; then
+            echo "Usage: $0 submit-pmu ccec none|claim [benchmark options]" >&2
+            exit 1
+        fi
+        PHASE="$1"
+        shift
+        validate_submit_pmu_phase "$PHASE"
+        reject_managed_submit_pmu_options "$@"
+        run_submit_pmu "$PHASE" "$@"
         ;;
     *)
         # 未知 action 不尝试推断用户意图，也不会触发任何构建或设备操作。

@@ -195,7 +195,7 @@ CCEC 与 AscendC 使用本用户安装的 CANN 9.1。非交互 shell 不保证�
 ```bash
 cd /path/to/pa_scheduler
 
-source /home/q00473782/Ascend/cann-9.1.0-weekly-20260708/cann/set_env.sh
+source /home/q00473782/Ascend/cann-9.1.0-weekly-20260708/cann-9.1.0/set_env.sh
 
 export GCC15_ROOT=/home/q00473782/.local/gcc-15/root
 export PATH="$GCC15_ROOT/usr/bin:$PATH"
@@ -211,10 +211,22 @@ export CXX="$GCC15_ROOT/usr/bin/g++-15"
 `include/pto/common/kernel_meta.hpp` 的目录；同一 include tree 还必须具有
 `pto/pto-inst.hpp`、`pto/common/constants.hpp` 和 `pto/common/pto_tile.hpp`。
 
+当前最终只保留两类正式观察构建，不再生成同时夹带泳道与 PMU
+诊断代码的统一 CCEC ELF：
+
+| 构建 | 后端 | 内容 | 构建命令 | 产物目录 |
+| --- | --- | --- | --- | --- |
+| `swimlane` | CCEC/AscendC/CPU | 普通阶段与 schema-v3 atomic（direct + PollBatch）合并采集；不配置 PMU | `./run.sh build ccec` 或 `./run.sh build all` | CCEC 为 `build/ccec/` |
+| `submit-pmu` | 仅 CCEC | 每核完整 Submit PMU，并在编译期可选一个局部阶段；当前只有 `none|claim` | `./run.sh build-submit-pmu ccec none|claim` | `build/ccec/submit-pmu/<phase>/` |
+
+`./run.sh build all` 只构建三后端的 `swimlane` 产物；`submit-pmu`
+必须按 phase 另行构建。`none` 是不做局部边界读取的完整 Submit
+基准，不是第三类构建。
+
 ## 5. 使用说明：运行、测量与泳道查看
 
 以下命令均在 `pa_scheduler` 目录执行。首次使用应先按第 4 节 source CANN
-环境并完成构建。四个 action 的用途如下：
+环境并完成构建。主要 action 的用途如下：
 
 | action | 用途 | 是否生成泳道文件 |
 | --- | --- | --- |
@@ -222,6 +234,8 @@ export CXX="$GCC15_ROOT/usr/bin/g++-15"
 | `smoke` | 固定 b1/r1/`scalar-nop=0` 的快速语义回归 | 否，只做内存记录校验 |
 | `run` | 自行控制 batch、run、winner 负载和诊断参数 | 仅显式传入 `--swimlane-json` 时生成 raw |
 | `swimlane` | 单轮运行并自动生成 raw 和 Perfetto merged JSON | 是 |
+| `build-submit-pmu` | 构建指定 `none|claim` 的 CCEC PMU-only ELF | 否 |
+| `submit-pmu` | 单轮采集完整 Submit PMU，可选导出 JSON | 否，与泳道隔离 |
 
 `ccec|ascendc|cpu|all` 用于选择后端；`all` 始终按 CCEC、AscendC、CPU
 的顺序执行。
@@ -255,7 +269,7 @@ semantic_status=PASS postprocess_status=PASS
 ```bash
 ./run.sh run ccec \
   --device 0 --batches 256 --runs 5 \
-  --profile-phases --analyze-swimlane
+  --analyze-swimlane
 
 ./run.sh run ascendc \
   --device 0 --batches 256 --runs 5 \
@@ -277,7 +291,7 @@ semantic_status=PASS postprocess_status=PASS
 
 ```bash
 ./run.sh swimlane ccec \
-  --device 0 --batches 256 --profile-phases --analyze-swimlane
+  --device 0 --batches 256 --analyze-swimlane
 
 ./run.sh swimlane ccec \
   --device 0 --batches 1 --winner-workload real-compute
@@ -337,8 +351,9 @@ runner 结束时会打印准确目录：
    字段和解读边界见 5.6 节。
 
 WaitForSlot 和 HeapGuard 没有可伪造的逐事件起止时间，因此不单独生成 Perfetto
-事件；它们由 `--profile-phases` 的 `[PHASE]` 累计统计呈现。实际发生等待时，
-泳道中会出现 RingBp 事件。
+事件；实际发生等待时，泳道中会出现 RingBp 事件。CCEC 的局部 PMU
+归因不复用运行时 `--profile-phases`，而是使用第 5.7 节的独立
+`submit-pmu` phase ELF。
 
 `outputs/` 已被 Git 忽略，生成的几十至数百 MiB 泳道文件不会被普通
 `git add` 意外纳入提交。
@@ -378,7 +393,9 @@ CPU 完整协议回归建议关闭大泳道缓冲区：
 
 主要选项：
 
-- `--profile-phases`：分别统计 Claim、EfDrain、WaitForSlot、HeapGuard；
+- `--profile-phases`：CPU/AscendC 兼容诊断中分别统计 Claim、EfDrain、
+  WaitForSlot、HeapGuard；最终 CCEC `swimlane` 构建不接受该选项，
+  CCEC 局部归因使用独立 `submit-pmu` phase；
 - `--analyze-swimlane`：读取完整记录，输出各阶段的 per-worker 累计分布以及
   EfDrain/Materialize/Claim/Register 的 per-role、per-task-kind 单事件分布；
 - `--trace-atomics`：在已开启的泳道中记录 atomic 逻辑调用；direct 调用逐条记录，
@@ -399,10 +416,11 @@ CPU 完整协议回归建议关闭大泳道缓冲区：
 ```
 
 它排除启动屏障和最终 drain。`host_launch_us` 另外包含 host launch、最终 drain
-和 stream/thread 同步。不同版本比较时，必须同时开启或同时关闭
-`--profile-phases` 和泳道，因为计时与记录本身会影响竞争时序。
+和 stream/thread 同步。不同版本比较时，必须使用相同构建、相同 phase
+和相同泳道/PMU 开关，因为计时、记录和 PMU 边界本身都会影响竞争时序。
 
-`[PHASE]` 的每个阶段都是每 worker 在 1,280 次 Submit 中的累计时间：
+CPU/AscendC 兼容诊断中，`[PHASE]` 的每个阶段都是每 worker 在
+1,280 次 Submit 中的累计时间：
 
 - Claim：当前 worker 实际参与或跳过对应 lane Claim 的完整 span；
 - EfDrain：每次 Submit 开头执行已就绪私有 slot 的时间；
@@ -643,7 +661,6 @@ b256 是开启 atomic 泳道的诊断运行；上表 Submit 只能证明当前�
 不能替代关闭 trace 的性能基线或与历史样本做单轮减法。
 
 #### 历史 schema-v2 样本（仅保留旧口径）
-
 2026-07-18 的旧 CCEC b256 文件
 `outputs/scalar_observation_final_20260718/atomic_inlineasm_ccec_b256/raw.json`
 记录了 963,368 条物理记录，其中逐条 Atomic 99,944 条、ClockBaseline 192 条，
@@ -651,7 +668,119 @@ b256 是开启 atomic 泳道的诊断运行；上表 Submit 只能证明当前�
 phase/lap/Kernel 边界修复之前的 schema-v2 逐调用模型，只能用于追溯旧版观察结果；
 不能拿 99,944 当作当前 schema-v3 的物理容量、逻辑调用数或闭合证据。
 
-### 5.7 CCEC 每核 PMU 与 I-cache sidecar
+### 5.7 两类正式构建与 CCEC Submit PMU
+
+`swimlane` 和 `submit-pmu` 是两个独立重编译的观察产物：
+
+- `swimlane` 编译普通阶段和逐 atomic record，把 atomic 画在对应
+  AIC/AIV scalar lane；不生成 PMU owner，也不输出 PMU JSON。
+- `submit-pmu` 编译掉泳道 record、逐 atomic wrapper、ClockBaseline、
+  runtime phase-profile 和旧 cold/warm 冲刷体，只保留完整 Submit PMU
+  与一个编译期 phase。
+
+两者不能在同一进程同时采集。这不只是 CLI 限制：泳道/逐 atomic
+代码会改变 scalar 指令布局和 I-cache 本身，将其保留在 PMU ELF 里即使
+运行时关闭 record，也会污染要观察的取指环境。
+
+当前 `submit-pmu` 只支持：
+
+| phase | 局部边界 | 用途 |
+| --- | --- | --- |
+| `none` | 不做任何中途 shadow counter 读取 | 完整 Submit 主基准，优先用于回答 AIC/AIV 每核 request/miss |
+| `claim` | 每次 `Claim()` 调用前后读取 shadow counter | 验证局部归因链路，输出带观察扰动的 running read-clear 下界和保守上界 |
+
+分别构建：
+
+```bash
+./run.sh build-submit-pmu ccec none
+./run.sh build-submit-pmu ccec claim
+```
+
+产物完全分开：
+
+```text
+build/ccec/submit-pmu/none/
+build/ccec/submit-pmu/claim/
+```
+
+每个目录都自包含同 phase 的 host、mixed kernel、PMU owner 和 dispatcher，
+不得跨 phase 拼装。构建完成后才会原子发布包含 phase 身份和四个 SHA256 的
+manifest；`submit-pmu` action 在启动 host 前逐项复核，缺件、串 phase 或内容
+变化都会直接拒绝。一次正式采集示例：
+
+```bash
+OUT="./outputs/submit_pmu_none_$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$OUT"
+./run.sh submit-pmu ccec none \
+  --device 0 --batches 256 \
+  --winner-workload real-compute --real-compute-counts 6,28,4,1 \
+  --pmu-json "$OUT/run1.json"
+```
+
+`submit-pmu` action 自己固定 `--runs 1 --no-swimlane --pmu-window submit-all`，
+不要重复传入这三项，也不能传入 `--profile-phases`、
+`--trace-atomics`、`--analyze-swimlane` 或 `--swimlane-json`。
+
+完整 Submit 的权威 I-cache 主计数是从不在局部边界读取的
+`CNT6=request` 和 `CNT7=miss`。A5 b1 实测已反证 `CNT9=0x35`
+可作有效计数槽：它始终为 0。因此正式 `submit-pmu` 用
+`CNT8=0x34` 作 shadow request、`CNT5=0x35` 作 shadow miss，`CNT9`
+保持未使用；这会牺牲 PMU 诊断版的 `mte3_busy`，不影响标准
+`swimlane` 构建。
+
+shadow 计数器是 read-to-clear：`claim` 在 begin/end 切分片段，stop 时再加
+tail，从而软件重建完整 Submit shadow whole。`none` 没有运行中读取，必须
+在每个物理子核精确满足：
+
+```text
+CNT8 shadow whole request == CNT6 primary whole request
+CNT5 shadow whole miss    == CNT7 primary whole miss
+```
+
+`claim` 在 A5 上运行中反复 read-clear 时，shadow 可能在边界处单向少计，
+因此接受条件改为逐核：
+
+```text
+shadow request <= primary request
+shadow miss    <= primary miss
+
+request loss = primary request - shadow request
+miss loss    = primary miss - shadow miss
+
+phase request ∈ [observed request, observed request + request loss]
+phase miss    ∈ [observed miss,    observed miss    + miss loss]
+```
+
+区间必须逐核构造后再聚合。CNT8/CNT5 是顺序 `ld_dev` 而非原子配对快照，
+不要求局部 `phase miss <= phase request`；只要求二者分别不超过对应 shadow，
+上界分别不超过对应 primary。`none` 中 phase calls/begin/end/request/miss 必须
+全为 0；`claim` 中每核 begin/end/calls 必须配对，且每核 calls 必须等于
+`batches * 5`，全局为 `batches * 5 * 96`。
+
+局部边界读取本身会增加 scalar 指令、改变 I-cache 布局和多核时序，
+因此 `claim` 是带边界扰动的归因结果。`none` 与 `claim` 是不同 ELF/
+不同进程；今后新增的不同 phase 也必须各自单独采集。不同 phase
+ELF 的局部 request/miss **不可相加**，也不能与 `none` 相减后宣称
+得到了零扰动的阶段净值。这个区间只约束同一插桩 ELF、当前边界定义下的
+局部事件；它不是无插桩 Claim 的真实区间。调度语义、真计算输出和
+placement/engine 门禁都通过时，running shadow 的负差属于观测边界行为，
+不得描述为 standalone scheduler 异常。
+
+JSON 保留 96 条 raw record，并按 ALL/AIC/AIV 输出 authoritative whole、
+shadow loss 和 phase lower/upper。raw 中包含 `shadow_request_loss`、
+`shadow_miss_loss`、`phase_icache_requests_upper_bound` 与
+`phase_icache_misses_upper_bound`；host 还分别报告 exact/bounded 核数。
+完整 Submit 的组内 miss rate 才按 `sum(misses)/sum(requests)` 计算，不平均
+逐核百分比；局部 lower miss/lower request 之比只是 observed read-clear
+ratio，不是实际 miss rate 的数学下界。更完整的 I-cache 采集、分析、估算与排错见
+[`../icache_miss_usage_guide.md`](../icache_miss_usage_guide.md)。
+
+#### 历史 PMU 校准资料（不属于当前两类正式构建）
+
+以下 `empty/scalar/scalar-double/icache-single`、CNT8 fix-busy 和 schema-v3
+文字保留为 2026-07-18 观察链路的建设过程与历史数据。当前
+`swimlane` 构建不提供 PMU，当前 `submit-pmu` 也只接受完整
+Submit 的 `none|claim`；不应继续照抄下文的历史校准命令作为当前用法。
 
 CCEC 后端提供与泳道分离的 PMU sidecar。正式取数由本目录自带的 Main AICPU
 Path-A owner 配置 selector、保存并恢复 PMU 状态；kernel 在每个物理子核内门控并
@@ -682,7 +811,7 @@ Path-A owner 配置 selector、保存并恢复 PMU 状态；kernel 在每个物�
 | `pmu_warm_icache_requests` | `CNT6 = 0x034` | 同核 warm 对照 request |
 | `pmu_warm_icache_misses` | `CNT7 = 0x035` | 同核 warm 对照 miss |
 
-#### Main AICPU Path-A owner
+#### 历史：Main AICPU Path-A owner
 
 owner 已自包含在 `ccec/`：构建会同时产出 dispatcher 和 owner AArch64 SO。host
 通过 CANN 9.1 已验证的 Main AICPU Path-A 完成 bootstrap 和 mode-0 注册，运行时
@@ -747,7 +876,7 @@ icache_pairs=96/96 calibrated_cores=96/96
 时间差为正。也就是说，最终系数的分母不是推测的循环次数，而是严格闭合的
 `CNT7` miss 差值。
 
-#### 生成正式 PMU-only JSON
+#### 历史：生成旧 PMU-only JSON
 
 正式 sidecar 使用单轮、独立进程和唯一输出路径：
 
@@ -812,7 +941,7 @@ JSON 包含：
 owner 配置，
 并用多个独立进程交错 A/B。
 
-#### 2026-07-18 上板验收样本
+#### 历史：2026-07-18 上板验收样本
 
 自包含 owner 的本次验收中，`empty`、`scalar 100,000` 和
 `scalar-double 2×100,000` 的 96 核 total 中位数分别约为 214、56,568 和
@@ -837,7 +966,7 @@ PMU-only 验收。该段保留的是切换默认模式之前的历史样本。Su
 同配置 PMU 取数可重复；由于 gate 包含 `PIPE_ALL` 且未与无 PMU 样本交错配对，
 不应将它们与约 5 ms 无诊断基线直接相减。
 
-#### 单次 CNT7 I-cache miss 的 scalar 一阶估算标尺
+#### 历史：单次 CNT7 I-cache miss 的 scalar 一阶估算标尺
 
 2026-07-18 的 96 核并发 cold/warm 配对中，15/15 轮均精确满足
 `cold CNT7 == trials`、`warm CNT7 == 0`和 `calibrated_cores=96/96`。按每轮
@@ -881,7 +1010,7 @@ tests/atomic_probe/pa_scheduler/outputs/pmu_validation/
 模式扩展成 Claim、EfDrain 等多个正式局部窗口。性能 A/B 仍要保持观察布局一致，
 最终端到端收益以关闭 PMU 和泳道的独立进程结果为准。
 
-#### 校验并聚合多轮 PMU sidecar
+#### 历史：校验并聚合多轮 PMU sidecar
 
 `pmu_sidecar_analyzer.py` 只读消费当前 schema-v3 JSON。它不信任单轮 host 已写好的
 summary，而是从每份文件的 worker raw 记录重新计算 ALL/AIC/AIV 的
