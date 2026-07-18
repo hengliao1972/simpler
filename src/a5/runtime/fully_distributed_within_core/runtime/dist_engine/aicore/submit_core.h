@@ -35,46 +35,76 @@ namespace {
 PTO_DEVICE_FUNC void publish_task_flag(int32_t task_id) {
     if (task_id < 0 || task_id >= kFlagCap) return;
     __gm__ DistTaskCell &cell = task_cell(task_id);
-    atomic_exchange(cell.flag, int64_t{1}, __ATOMIC_RELEASE);
+    (void)fdwic_trace_atomic_exchange(
+        task_id, FdwicAtomicSite::CompletionFlagExchange, cell.flag, int64_t{1}, /*result_used=*/false, __ATOMIC_RELEASE
+    );
 }
 
-PTO_DEVICE_FUNC bool task_flag_ready(int32_t task_id, int memorder) {
+PTO_DEVICE_FUNC bool task_flag_ready(int32_t task_id, int memorder, FdwicAtomicSite site) {
     if (task_id < 0 || task_id >= kFlagCap) return false;
     __gm__ DistTaskCell &cell = task_cell(task_id);
-    return atomic_load(cell.flag, memorder) != 0;
+    return fdwic_trace_atomic_load(task_id, site, cell.flag, /*result_used=*/true, memorder) != 0;
 }
 
 PTO_DEVICE_FUNC void store_task_vend(int32_t task_id, uint64_t vend) {
     if (task_id < 0 || task_id >= kFlagCap) return;
     __gm__ DistTaskCell &cell = task_cell(task_id);
-    atomic_exchange(cell.vend, vend, __ATOMIC_RELAXED);
+    (void)fdwic_trace_atomic_exchange(
+        task_id, FdwicAtomicSite::CompletionVendExchange, cell.vend, vend, /*result_used=*/false, __ATOMIC_RELAXED
+    );
 }
 
-PTO_DEVICE_FUNC void store_won_remaining(__gm__ WonSlot &w, int32_t count) {
-    atomic_exchange(w.remaining.v, static_cast<int64_t>(count), __ATOMIC_RELAXED);
+PTO_DEVICE_FUNC void store_won_remaining(__gm__ WonSlot &w, int32_t count, int32_t task_id) {
+    (void)fdwic_trace_atomic_exchange(
+        task_id, FdwicAtomicSite::WonRemainingExchange, w.remaining.v, static_cast<int64_t>(count),
+        /*result_used=*/false, __ATOMIC_RELAXED
+    );
 }
 
-PTO_DEVICE_FUNC void reset_won_lane(__gm__ WonSlot &w, int32_t lane) {
-    atomic_exchange(w.drained[lane].v, kDrainedClaimed);
+PTO_DEVICE_FUNC void reset_won_lane(__gm__ WonSlot &w, int32_t lane, int32_t task_id) {
+    (void)fdwic_trace_atomic_exchange(
+        task_id, FdwicAtomicSite::WonLaneResetExchange, w.drained[lane].v, kDrainedClaimed,
+        /*result_used=*/false
+    );
     w.lane[lane].present = false;
 }
 
 PTO_DEVICE_FUNC bool claim_won_lane(__gm__ WonSlot &w, int32_t lane) {
-    return atomic_exchange(w.drained[lane].v, kDrainedClaimed) == kDrainedFree;
+    return fdwic_trace_atomic_exchange(
+               -1, FdwicAtomicSite::WonLaneClaimExchange, w.drained[lane].v, kDrainedClaimed,
+               /*result_used=*/true
+           ) == kDrainedFree;
 }
 
-PTO_DEVICE_FUNC void publish_won_slot(__gm__ WonSlot &w) { atomic_exchange(w.state.v, kWonStatePublished); }
-
-PTO_DEVICE_FUNC bool decrement_won_remaining_is_last(__gm__ WonSlot &w) {
-    return atomic_fetch_sub<int64_t>(w.remaining.v, 1) == 1;
+PTO_DEVICE_FUNC void publish_won_slot(__gm__ WonSlot &w, int32_t task_id) {
+    (void)fdwic_trace_atomic_exchange(
+        task_id, FdwicAtomicSite::WonStatePublishExchange, w.state.v, kWonStatePublished,
+        /*result_used=*/false
+    );
 }
 
-PTO_DEVICE_FUNC void clear_won_slot_state(__gm__ WonSlot &w) { atomic_exchange(w.state.v, kWonStateFree); }
+PTO_DEVICE_FUNC bool decrement_won_remaining_is_last(__gm__ WonSlot &w, int32_t task_id) {
+    return fdwic_trace_atomic_fetch_sub<int64_t>(
+               task_id, FdwicAtomicSite::WonRemainingFetchSub, w.remaining.v, 1, /*result_used=*/true
+           ) == 1;
+}
 
-PTO_DEVICE_FUNC int64_t load_frontier_for_advance() { return atomic_load(g_dist.frontier); }
+PTO_DEVICE_FUNC void clear_won_slot_state(__gm__ WonSlot &w, int32_t task_id) {
+    (void)fdwic_trace_atomic_exchange(
+        task_id, FdwicAtomicSite::WonStateClearExchange, w.state.v, kWonStateFree, /*result_used=*/false
+    );
+}
+
+PTO_DEVICE_FUNC int64_t load_frontier_for_advance() {
+    // The first load reads global scan state, not a particular task cell.
+    return fdwic_trace_atomic_load(-1, FdwicAtomicSite::FrontierInitialLoad, g_dist.frontier);
+}
 
 PTO_DEVICE_FUNC bool try_advance_frontier_to(int64_t &frontier, int64_t next) {
-    const int64_t old = atomic_fetch_max<int64_t>(g_dist.frontier, next);
+    // Pair this update with the immediately preceding next-task flag load.
+    const int64_t old = fdwic_trace_atomic_fetch_max<int64_t>(
+        static_cast<int32_t>(next), FdwicAtomicSite::FrontierMax, g_dist.frontier, next, /*result_used=*/true
+    );
     frontier = old > next ? old : next;
     return next > old;
 }
@@ -87,7 +117,7 @@ PTO_DEVICE_FUNC void advance_frontier() {
     while (true) {
         const int64_t next = f + 1;
         if (next >= kFlagCap) break;
-        if (!task_flag_ready(static_cast<int32_t>(next), __ATOMIC_ACQUIRE)) break;
+        if (!task_flag_ready(static_cast<int32_t>(next), __ATOMIC_ACQUIRE, FdwicAtomicSite::FrontierFlagLoad)) break;
         try_advance_frontier_to(f, next);
     }
 }
@@ -138,8 +168,8 @@ PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] __gm__ DistCore *self, __gm__
     store_barrier();
     if (s.is_multicore) {
         __gm__ WonSlot &w = g_dist.blocks[s.won_block].slots[s.won_slot];
-        if (decrement_won_remaining_is_last(w)) {
-            clear_won_slot_state(w);
+        if (decrement_won_remaining_is_last(w, s.task_id)) {
+            clear_won_slot_state(w, s.task_id);
             complete_executed_task(self, s.task_id);
         }
     } else {
@@ -158,7 +188,7 @@ PTO_DEVICE_FUNC int32_t drain_phase_b(__gm__ DistCore *self) {
         if (!s.occupied || !s.built) continue;
         bool ready = true;
         for (int32_t f = 0; f < s.fanin_count; f++) {
-            if (!task_flag_ready(s.fanin[f], __ATOMIC_ACQUIRE)) {
+            if (!task_flag_ready(s.fanin[f], __ATOMIC_ACQUIRE, FdwicAtomicSite::FaninFlagLoad)) {
                 ready = false;
                 break;
             }
@@ -240,11 +270,11 @@ PTO_DEVICE_FUNC bool drain_block_won(__gm__ DistCore *self) {
     if (!g_fdwic_joint_submit_seen) return false;
     if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
     __gm__ BlockWon &bw = g_dist.blocks[self->block_id];
-    if (atomic_load(bw.any_pub) == 0) return false;
+    if (fdwic_trace_atomic_load(-1, FdwicAtomicSite::WonAnyLoad, bw.any_pub) == 0) return false;
     bool drained = false;
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         __gm__ WonSlot &w = bw.slots[i];
-        if (atomic_load(w.state.v) != kWonStatePublished) continue;
+        if (fdwic_trace_atomic_load(-1, FdwicAtomicSite::WonStateLoad, w.state.v) != kWonStatePublished) continue;
 #if defined(__CCE_AICORE__)
         dist_aicore_invalidate_region(&w.lane[self->lane].present, sizeof(w.lane[self->lane].present));
 #endif
@@ -252,7 +282,10 @@ PTO_DEVICE_FUNC bool drain_block_won(__gm__ DistCore *self) {
         if (!claim_won_lane(w, self->lane)) continue;
         int32_t si = alloc_ring_slot(self);
         if (si < 0) {
-            atomic_exchange(w.drained[self->lane].v, kDrainedFree);
+            (void)fdwic_trace_atomic_exchange(
+                -1, FdwicAtomicSite::WonLaneReleaseExchange, w.drained[self->lane].v, kDrainedFree,
+                /*result_used=*/false
+            );
             return drained;
         }
 #if defined(__CCE_AICORE__)
@@ -280,22 +313,23 @@ PTO_DEVICE_FUNC bool has_pending_won(__gm__ DistCore *self) {
     if (!g_fdwic_joint_submit_seen) return false;
     if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
     __gm__ BlockWon &bw = g_dist.blocks[self->block_id];
-    if (atomic_load(bw.any_pub) == 0) return false;
+    if (fdwic_trace_atomic_load(-1, FdwicAtomicSite::WonAnyLoad, bw.any_pub) == 0) return false;
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         __gm__ WonSlot &w = bw.slots[i];
-        if (atomic_load(w.state.v) != kWonStatePublished) continue;
+        if (fdwic_trace_atomic_load(-1, FdwicAtomicSite::WonStateLoad, w.state.v) != kWonStatePublished) continue;
 #if defined(__CCE_AICORE__)
         dist_aicore_invalidate_region(&w.lane[self->lane].present, sizeof(w.lane[self->lane].present));
 #endif
         if (!w.lane[self->lane].present) continue;
-        if (atomic_load(w.drained[self->lane].v) == kDrainedFree) return true;
+        if (fdwic_trace_atomic_load(-1, FdwicAtomicSite::WonDrainedLoad, w.drained[self->lane].v) == kDrainedFree)
+            return true;
     }
     return false;
 }
 
 PTO_DEVICE_FUNC void dist_submit_execute_first(__gm__ DistCore *self) {
     TRACE_LAP_RESET(self);
-    if (!fatal_set()) {
+    if (!fdwic_trace_is_fatal()) {
         drain_block_won(self);
         drain_phase_b(self);
     }
@@ -325,6 +359,7 @@ struct DistSubmitCtx {
     int32_t joint_block;
     int32_t joint_slot;
     int32_t joint_count;
+    bool claim_attempted;
 };
 
 PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &args, DistSubmitCtx &ctx) {
@@ -349,11 +384,12 @@ PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &
     ctx.joint_block = -1;
     ctx.joint_slot = -1;
     ctx.joint_count = 0;
+    ctx.claim_attempted = false;
 }
 
 PTO_DEVICE_FUNC bool dist_submit_check_task_cap(const DistSubmitCtx &ctx, DistSubmitKind kind) {
     if (ctx.task_id < kFlagCap) return true;
-    set_fatal();
+    fdwic_trace_set_fatal(ctx.task_id);
     if (kind == DistSubmitKind::Alloc) {
         DIST_ERRF("[dist_engine] alloc task id %d exceeds kFlagCap %d\n", ctx.task_id, kFlagCap);
     } else {
@@ -393,7 +429,7 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
     uint64_t task_base = PTO2_ALIGN_UP(ctx.self->heap_next, PTO2_PACKED_OUTPUT_ALIGN);
     if (total > 0 && g_dist.heap_base != nullptr) {
         if (total > ring) {
-            set_fatal();
+            fdwic_trace_set_fatal(ctx.task_id);
             if (kind == DistSubmitKind::Alloc) {
                 DIST_ERRF(
                     "[dist_engine] alloc task %d outputs %llu B exceed heap ring %zu B\n", ctx.task_id,
@@ -417,7 +453,7 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
         if ((output_mask & 1u) == 0) continue;
         const auto &ci = args.tensor(i).create_info();
         if (g_dist.heap_base == nullptr) {
-            set_fatal();
+            fdwic_trace_set_fatal(ctx.task_id);
             if (kind == DistSubmitKind::Alloc) {
                 DIST_ERRF("[dist_engine] GM output heap not allocated at alloc %d\n", ctx.task_id);
             } else {
@@ -573,7 +609,7 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_and_prepare_map(
     if (!dist_submit_materialize_args(args, ctx, kind)) return false;
     TRACE_SPAN_END(materialize_trace, self, ctx.task_id, -1, TracePhase::Materialize, 0, static_cast<uint32_t>(kind));
 #if !defined(__CCE_AICORE__)
-    if (fatal_set()) return false;
+    if (fdwic_trace_is_fatal(ctx.task_id)) return false;
 #endif
     TRACE_SPAN_BEGIN(prepare_map_trace);
     dist_submit_prepare_map(self, ctx.task_id);

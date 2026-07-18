@@ -56,7 +56,7 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_d
 }
 
 extern "C" __attribute__((weak)) int
-fdwic_swimlane_host_init(Runtime *runtime, int num_cores, int enabled, const char *output_prefix);
+fdwic_swimlane_host_init(Runtime *runtime, int num_cores, int level, const char *output_prefix);
 extern "C" __attribute__((weak)) int fdwic_swimlane_host_export(Runtime *runtime);
 extern "C" __attribute__((weak)) void fdwic_swimlane_host_finalize(Runtime *runtime);
 
@@ -262,8 +262,16 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         enable_l2_swimlane_ = original_enable_l2_swimlane;
     });
     bool fdwic_swimlane_active = false;
+    auto fdwic_swimlane_cleanup = RAIIScopeGuard([&runtime, &fdwic_swimlane_active]() {
+        if (fdwic_swimlane_active && fdwic_swimlane_host_finalize != nullptr) {
+            fdwic_swimlane_host_finalize(&runtime);
+            fdwic_swimlane_active = false;
+        }
+    });
     if (enable_l2_swimlane_ && fdwic_swimlane_host_init != nullptr) {
-        rc = fdwic_swimlane_host_init(&runtime, num_aicore, 1, output_prefix_.c_str());
+        rc = fdwic_swimlane_host_init(
+            &runtime, num_aicore, static_cast<int>(l2_swimlane_level_), output_prefix_.c_str()
+        );
         if (rc < 0) {
             LOG_ERROR("fdwic swimlane init failed: %d", rc);
             return rc;
@@ -271,6 +279,14 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         if (rc > 0) {
             fdwic_swimlane_active = true;
             enable_l2_swimlane_ = false;
+            // The FDWIC runtime owns its trace buffer and does not use the
+            // platform-generic L2 collector. Keep the launch bit and generic
+            // pointers consistent with that routing decision; these fields
+            // may otherwise retain a prior run's collector addresses.
+            CLEAR_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
+            kernel_args_.enable_profiling_flag = enable_profiling_flag;
+            kernel_args_.l2_swimlane_data_base = 0;
+            kernel_args_.l2_swimlane_aicore_rotation_table = 0;
         }
     }
 
@@ -325,12 +341,8 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // Cleanup guard for early returns: stops all started collectors so their
     // mgmt + poll threads exit cleanly. stop() is idempotent and a no-op on
     // collectors that never started.
-    auto perf_cleanup = RAIIScopeGuard([this, &runtime, &fdwic_swimlane_active]() {
+    auto perf_cleanup = RAIIScopeGuard([this]() {
         stop_collectors();
-        if (fdwic_swimlane_active && fdwic_swimlane_host_finalize != nullptr) {
-            fdwic_swimlane_host_finalize(&runtime);
-            fdwic_swimlane_active = false;
-        }
     });
 
     // Allocate simulated register blocks for all AICore cores. Uses sparse
@@ -472,7 +484,10 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (runtime_rc != 0) {
         LOG_ERROR("AICPU execution failed with rc=%d", runtime_rc);
         if (fdwic_swimlane_active && fdwic_swimlane_host_export != nullptr) {
-            fdwic_swimlane_host_export(&runtime);
+            const int export_rc = fdwic_swimlane_host_export(&runtime);
+            if (export_rc != 0) {
+                LOG_ERROR("fdwic swimlane export failed after runtime error: %d", export_rc);
+            }
         }
         return runtime_rc;
     }
@@ -485,8 +500,12 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         l2_swimlane_collector_.reconcile_counters();
         l2_swimlane_collector_.export_swimlane_json();
     }
+    int fdwic_swimlane_export_rc = 0;
     if (fdwic_swimlane_active && fdwic_swimlane_host_export != nullptr) {
-        fdwic_swimlane_host_export(&runtime);
+        fdwic_swimlane_export_rc = fdwic_swimlane_host_export(&runtime);
+        if (fdwic_swimlane_export_rc != 0) {
+            LOG_ERROR("fdwic swimlane export failed: %d", fdwic_swimlane_export_rc);
+        }
     }
 
     if (enable_dump_tensor_) {
@@ -530,7 +549,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         aicore_so_path_.clear();
     }
 
-    return 0;
+    return fdwic_swimlane_export_rc;
 }
 
 void DeviceRunner::unload_executor_binaries() {

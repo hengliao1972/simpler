@@ -97,6 +97,8 @@ enum class TracePhase : int32_t {
     Claim = 11,
     Fanin = 12,
     Register = 13,
+    Atomic = 14,
+    ClockBaseline = 15,
 };
 
 struct RingSlot {

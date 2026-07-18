@@ -40,13 +40,14 @@ Runtime::Runtime() {
     dist.shared_addr = 0;
     dist.num_workers = 0;
     dist.swimlane_base = 0;
-    dist.swimlane_enabled = 0;
+    dist.swimlane_level = 0;
     dist.swimlane_records_per_core = 0;
     dist.orch_args.reset();
     dist.ccec_orch_tensor_count = 0;
     dist.ccec_orch_scalar_count = 0;
     dist.done_count = 0;
     fdwic_swimlane_host_shadow_ = nullptr;
+    fdwic_swimlane_dev_allocation_ = 0;
     fdwic_swimlane_dev_base_ = 0;
     fdwic_swimlane_bytes_ = 0;
     fdwic_swimlane_num_cores_ = 0;

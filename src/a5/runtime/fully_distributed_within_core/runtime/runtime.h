@@ -254,7 +254,9 @@ public:
         volatile uint64_t shared_addr;
         volatile int32_t num_workers;  // number of AICore workers participating
         volatile uint64_t swimlane_base;
-        volatile uint32_t swimlane_enabled;
+        // Existing L2 swimlane perf level (0..4). FDWIC keeps phase spans at
+        // levels 1..3 and adds source-level atomic spans at level 4.
+        volatile uint32_t swimlane_level;
         volatile uint32_t swimlane_records_per_core;
         Tensor ccec_orch_tensors[CHIP_MAX_TENSOR_ARGS];
         uint64_t ccec_orch_scalars[CHIP_MAX_SCALAR_ARGS];
@@ -265,6 +267,7 @@ public:
     } dist;
 
     void *fdwic_swimlane_host_shadow_;
+    uint64_t fdwic_swimlane_dev_allocation_;
     uint64_t fdwic_swimlane_dev_base_;
     uint64_t fdwic_swimlane_bytes_;
     uint32_t fdwic_swimlane_num_cores_;

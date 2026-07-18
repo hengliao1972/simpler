@@ -20,13 +20,15 @@ test_paged_attention_unroll.py
 
 本文不覆盖其他测试目录、其他 runtime、A2/A3、L3 或整段 device wall time。
 A5Sim 用于功能和调度流程验证；5.6 ms 基线只从真实 A5 生成的
-l2_swimlane_records.json 中读取。
+l2_swimlane_records.json 中读取。直接 atomic 逐调用记录和等待区 poll 精确计数只在
+`--enable-l2-swimlane 4` 开启；它们用于定位真实 PA 的 scalar atomic 分布，
+不能替代 level 1 到 3 的 phase-only 性能基线。
 
 ### 已验证环境
 
 | 项目 | 本次验证值 |
 | --- | --- |
-| 验证日期 | 2026-07-17 |
+| 验证日期 | 2026-07-17（phase 基线）、2026-07-18（level-4 atomic） |
 | 芯片 | Ascend950PR_958b |
 | 设备 | /dev/davinci0 |
 | Driver | 7.0.t9.0.B798，ascendhal 7.35.23 |
@@ -40,8 +42,9 @@ l2_swimlane_records.json 中读取。
 | pytest | 7.4.4 |
 | GCC 15 | 15.0.1，Ubuntu 15-20250404-0ubuntu1 |
 | PTO-ISA | ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8 |
-| simpler 分支 | fdwic-swimlane-deps |
-| simpler 实测基准 HEAD | 52ca4f5eba343c2f7b7a3a743e575cb9308d128f |
+| simpler 分支 | real-pa-atomic-swimlane |
+| 历史 phase 实测 HEAD | 52ca4f5eba343c2f7b7a3a743e575cb9308d128f |
+| schema-v3 迁移基线 HEAD | 5274945b（迁移改动基于此展开） |
 
 系统的 /etc/os-release 标签为 Ubuntu 20.04.6，但实际
 getconf GNU_LIBC_VERSION 输出 glibc 2.39。判断 GCC 15 二进制兼容性时，
@@ -53,7 +56,8 @@ getconf GNU_LIBC_VERSION 输出 glibc 2.39。判断 GCC 15 二进制兼容性时
 | --- | --- |
 | A5Sim Case1 | PASSED，约 71.62 s |
 | A5 Case1 正确性 | PASSED |
-| A5 swimlane Case1 | PASSED，pytest 约 85.48 s |
+| A5 level-1 phase swimlane Case1 | PASSED，pytest 约 85.48 s |
+| A5 level-4 atomic swimlane Case1 | PASSED，pytest 81.90 s，96 核 schema v3 闭合 |
 | 每核 Submit | 1280 个，task id 为 0 到 1279 |
 | 全局首个至末个 Submit | 5.642245 ms |
 | 排除 task 0 分配后的 kernel Submit | 5.635263 ms |
@@ -580,7 +584,7 @@ test "$(git -C "$PTO_ISA_ROOT" rev-parse HEAD)" = \
 python -m pytest "$TEST_FILE" \
     --platform a5sim \
     --case Case1 \
-    --enable-l2-swimlane \
+    --enable-l2-swimlane 4 \
     --use-example-exec-time \
     --clone-protocol https \
     --pto-isa-commit "$PTO_ISA_COMMIT" \
@@ -590,7 +594,10 @@ python -m pytest "$TEST_FILE" \
 ~~~
 
 --use-example-exec-time 仅适用于 fully_distributed_within_core 的 sim。
-它不能用于真实 A5 命令。
+它不能用于真实 A5 命令。这里显式写出的 level 4 与裸参数
+`--enable-l2-swimlane` 等价；A5Sim 用于检查 schema v3、记录结构、加权计数闭合和
+转换结果，不提供真实 A5 atomic 完成时间。A5Sim 的直接 Atomic 只标记模拟执行的
+源码包围边界，PollBatch 只标记模拟调度中的 poll 窗口；两者都不能当作真实硬件时延。
 
 ### 运行 A5 正确性 smoke
 
@@ -611,7 +618,32 @@ python -m pytest "$TEST_FILE" \
     -s -v
 ~~~
 
-### 运行 A5 swimlane 性能复现
+### 运行 A5 phase 泳道性能复现
+
+~~~bash
+python -m pytest "$TEST_FILE" \
+    --platform a5 \
+    --device 0 \
+    --case Case1 \
+    --enable-l2-swimlane 1 \
+    --clone-protocol https \
+    --pto-isa-commit "$PTO_ISA_COMMIT" \
+    --pto-session-timeout 1200 \
+    --require-pto-isa \
+    -s -v
+~~~
+
+level 1 到 3 保留已有 FDWIC phase 记录，不增加 Atomic 和
+`ClockBaseline`。上面的 level 1 与历史 trace 的有效 level 一致，适合继续复现本文
+约 5.6 ms 的 Submit 性能口径。它们继续导出 schema 1 的 legacy Claim flags；
+level 4 导出 schema v3，其中 Claim 使用 `attempted/won` 三态，Atomic 同时支持
+逐调用直接记录和精确计数 PollBatch。源码 atomic 调用点现在统一经过 level 判断，
+因此不能声称新旧二进制指令级完全相同；做前后性能比较时，应使用同一版二进制分别采
+level 1 phase 基线和 level 4 诊断样本。
+
+### 运行 A5 level-4 atomic 泳道
+
+需要观察真实 PA 的直接 atomic 调用并统计等待区 poll 调用时，单独运行 level 4：
 
 ~~~bash
 python -m pytest "$TEST_FILE" \
@@ -626,40 +658,294 @@ python -m pytest "$TEST_FILE" \
     -s -v
 ~~~
 
-本次实测生成：
+level 4 在原有 phase 上增加真实 FDWIC PA 的 Atomic 记录：直接 atomic 保持一次
+源码调用一条记录；显式等待区内允许合并的 observation load，以及唯一一种已确认的
+幂等失败 exchange 重试，则用带精确调用次数的 PollBatch 表示。最终 drain 之后，每个
+AIC/AIV 还会写两条 `ClockBaseline`。该模式会增加记录写、改变代码布局，也可能改变
+多核到达和轮询次数，所以它是诊断样本，不是本文 5.6 ms 无 atomic 插桩基线。
+
+### raw、merged 产物与重新转换
+
+A5Sim 和 A5 的 Case1 都使用 SceneTest 的同一输出规则：
 
 ~~~text
-outputs/TestPagedAttentionUnroll_Case1_20260717_023809/
-l2_swimlane_records.json
+outputs/TestPagedAttentionUnroll_Case1_<YYYYMMDD_HHMMSS>/
+├── l2_swimlane_records.json
+└── merged_swimlane.json
 ~~~
 
-新的复现会生成不同时间戳目录。trace 约几十 MiB，pytest 结束后再读取，
+其中 `l2_swimlane_records.json` 是保留原始 cycle 的 raw 文件；pytest 在 case
+结束时调用仓内共享转换器，生成可直接载入 Perfetto 的
+`merged_swimlane.json`。历史 phase 基线 raw 与本次真实 A5 level-4 raw 分别为：
+
+~~~text
+outputs/TestPagedAttentionUnroll_Case1_20260717_023809/l2_swimlane_records.json
+outputs/TestPagedAttentionUnroll_Case1_20260718_161520/l2_swimlane_records.json
+~~~
+
+新的复现会生成不同时间戳目录。若需要重新转换已有 raw，执行：
+
+~~~bash
+python -m simpler_setup.tools.swimlane_converter \
+    outputs/TestPagedAttentionUnroll_Case1_YYYYMMDD_HHMMSS/l2_swimlane_records.json \
+    -v
+~~~
+
+未指定 `-o` 时，转换器仍写到 raw 同目录的 `merged_swimlane.json`。上面的历史
+phase-only raw 约几十 MiB；level 4 的 JSON 大小取决于直接 Atomic、PollBatch 和
+phase 的实际记录条数，不再随每一次连续 poll 线性增长。pytest 结束后再读取，
 不要用 pytest wall time 代替 Submit 指标。
+
+### level-4 atomic 数据契约
+
+当前生产端导出的 level 4 raw，其 `metadata.trace_schema_version` 必须为 3；共享
+converter 仍保留对历史 schema 的读取兼容。转换后的 `Atomic` 和
+`ClockBaseline` 都画在对应 AIC、AIV0 或 AIV1 的原 scalar lane；它们不是与
+scalar 并行的伪子轨。Kernel 仍画在独立的 `AIC/AIV·kernel` 轨。
+
+直接 Atomic 的名称明确给出终点语义：
+
+~~~text
+atomic.return_ready.<site>.<op>#<task_id>
+atomic.source_issue.<site>.<op>#<task_id>
+~~~
+
+真实 A5 上，返回值会被后续逻辑消费的直接调用使用 `return_ready`，表示返回旧值已
+可被本核 scalar 使用；返回值被丢弃的发布型直接调用使用 `source_issue`，只表示源码
+发射包围区间。两者都不表示跨核可见时刻，也不能直接称为 atomic retire 延迟。每条
+直接 Atomic 的 `args.call_count` 固定为 1。结束 cycle 在 atomic 返回后立即采样，
+本地调用计数更新、PollBatch 落盘和 direct 记录写入都发生在结束 cycle 之后，不能
+混入该条 direct span。
+
+以下九类 observation load 只有在对应的显式 scheduler 等待区内才允许聚合：
+
+- 通用等待：`startup_poll`、`fatal_poll`、`fanin_flag_load`、
+  `heap_frontier_load`、`heap_vend_load`、`replay_done_poll`；
+- BlockWon 等待：`won_any_load`、`won_state_load`、`won_drained_load`。
+
+BlockWon 三类 load 只在 slot-capacity、heap slow path、won-slot、sim producer-ready、
+final-drain 这些已有外层等待区中聚合；普通 Submit 中的一次性或 opportunistic
+BlockWon 扫描仍是直接 Atomic。
+
+唯一允许聚合的 RMW 是 `won_lane_claim_exchange`，并且必须同时满足：位于上述显式
+等待区、写入 `claimed(1)`、返回旧值也是 `claimed(1)`。这表示一次 1→1、没有改变
+协议状态的失败 claim 重试。返回 `free(0)` 的成功 claim 始终逐条记录；
+`won_slot_claim_max`、release、`fetch_sub`、state clear 以及其他 RMW 也全部逐条记录。
+
+每个聚合记录转换为：
+
+~~~text
+atomic.poll_batch.<site>.<op>×<call_count>
+~~~
+
+其 `args.call_count` 是该等待区内实际执行的源码 atomic wrapper 调用次数，不是采样值；
+`task_id=-1`、`func_id=-1` 表示它归属于 scheduler 等待区而非某个任务。一个等待区可
+同时累积多个 site，因此不同 site 的 PollBatch 时间窗可以重叠；等待区内的直接
+Atomic 也可能与该窗口交错。merged 用 `batch_semantics=observation_load_calls` 或
+`idempotent_failed_exchange_retries` 区分两种计数，并显式写出
+`may_contain_interleaved_direct_atomics=true`。
+
+PollBatch 的 `duration`/`poll_window_cycles` 只是 logical poll episode 的包络：它既
+不是纯 poll 时间或独占 scalar 时间，也不是其中任一次 atomic 的延迟，更不是
+`call_count` 次 atomic 串行延迟之和。raw 中的物理相邻顺序也不等于严格时间顺序；
+分析应以 cycle 字段为准，不能用 PollBatch duration 计算单次 atomic 的 median 或 p95。
+
+schema v3 用 Atomic flags 的 bit 7 标识 PollBatch，bits 8..31 保存无符号 24 bit
+`call_count`；低 4 bit 必须是该 site 的实际 op：九类 observation 是 `load(0)`，
+`won_lane_claim_exchange` 是 `exchange(1)`。bit 4 表示返回值被消费，bit 5/6 在
+PollBatch 中必须为 0。bit 7 为 0 的直接 Atomic 保留原有 flags 语义，不能把其高位
+按 poll 次数解析。
+
+site 0 到 14 与 standalone PA 的稳定编号完全一致；真实 FDWIC PA 只在末尾追加
+15 到 27，覆盖生产实现的 BlockWon 路径和 `FetchSub`，没有重排已有编号：
+
+| `site_id` | Perfetto `site` | `op` | 真实 PA 路径 |
+| --------: | --------------- | ---- | ------------ |
+| 0 | `startup_increment` | `fetch_add` | 启动屏障到达计数 |
+| 1 | `startup_poll` | `load` | 启动屏障轮询 |
+| 2 | `fatal_poll` | `load` | fatal 状态检查 |
+| 3 | `fatal_set` | `exchange` | fatal 状态发布 |
+| 4 | `claim_max` | `fetch_max` | Submit lane Claim |
+| 5 | `fanin_flag_load` | `load` | fanin 依赖 flag |
+| 6 | `completion_vend_exchange` | `exchange` | completion vend 发布 |
+| 7 | `completion_flag_exchange` | `exchange` | completion flag 发布 |
+| 8 | `frontier_initial_load` | `load` | completion frontier 首次读取 |
+| 9 | `frontier_flag_load` | `load` | frontier 扫描 flag |
+| 10 | `frontier_max` | `fetch_max` | frontier 推进 |
+| 11 | `heap_frontier_load` | `load` | HeapGuard frontier |
+| 12 | `heap_vend_load` | `load` | HeapGuard vend |
+| 13 | `replay_done_increment` | `fetch_add` | 回放完成屏障到达计数 |
+| 14 | `replay_done_poll` | `load` | 最终 drain 轮询回放完成 |
+| 15 | `won_slot_claim_max` | `fetch_max` | BlockWon slot 认领 |
+| 16 | `won_remaining_exchange` | `exchange` | BlockWon remaining 初始化 |
+| 17 | `won_lane_reset_exchange` | `exchange` | BlockWon lane 重置 |
+| 18 | `won_lane_deposit_exchange` | `exchange` | BlockWon lane 完成发布 |
+| 19 | `won_state_publish_exchange` | `exchange` | BlockWon state 发布 |
+| 20 | `won_any_publish_exchange` | `exchange` | BlockWon any 发布 |
+| 21 | `won_any_load` | `load` | BlockWon any 读取 |
+| 22 | `won_state_load` | `load` | BlockWon state 读取 |
+| 23 | `won_lane_claim_exchange` | `exchange` | BlockWon lane claim |
+| 24 | `won_lane_release_exchange` | `exchange` | BlockWon lane release |
+| 25 | `won_remaining_fetch_sub` | `fetch_sub` | BlockWon remaining 递减并判断最后一个 lane |
+| 26 | `won_state_clear_exchange` | `exchange` | BlockWon state 清理 |
+| 27 | `won_drained_load` | `load` | BlockWon drained 检查 |
+
+上表定义的是本文覆盖的真实 FDWIC PA / A5 hot path 可记录调用点集合，不包含
+CPU sim watchdog/debug 诊断原子，也不表示 Case1 每轮一定出现全部 28 类事件。
+Case1 的单 lane 图通常不进入 BlockWon 动态路径；某个 BlockWon site
+计数为零不能单独判定为漏插桩。`fetch_sub` 的 op id 为 4，不能按 standalone
+旧版只有 Load、Exchange、FetchAdd、FetchMax 四类 op 的假设解析。
+
+frontier 扫描沿用 standalone 的任务归因：读取全局扫描起点的
+`frontier_initial_load` 记为 `task_id=-1`；随后读取 `next` 完成 flag 的
+`frontier_flag_load` 与推进同一个 `next` 的 `frontier_max` 都记为
+`task_id=next`。因此两条扫描事件可以按 core、task_id 配对，不归到触发本轮
+completion 的另一个任务上。
+
+raw 的 `metadata.trace_schema_version=3` 中，Claim 的 flags 明确记录
+`attempted` 和 `won`，merged 中对应三种互斥状态：
+
+| Claim 状态 | `attempted` | `won` | Perfetto 名称 | Case1 预期数量（`N=metadata.num_cores`） |
+| ---------- | ----------: | ----: | ------------- | -------------: |
+| 未参与该 lane 的 Claim | 0 | 0 | `claim.not_attempted` | `N*512` |
+| 已尝试但失败 | 1 | 0 | `claim.lost` | `N*768-1280` |
+| 已尝试且获胜 | 1 | 1 | `claim.won` | `1280` |
+
+三者合计 `N*1280` 条 Claim，其中实际执行 `claim_max.fetch_max` 的数量为
+`N*768`。历史 96 核样本对应 49,152 / 72,448 / 1,280；108 核 A5Sim 对应
+55,296 / 81,664 / 1,280。`attempted=0, won=1` 是非法组合，不应出现在有效导出中。
+
+host 在发布 raw 前按核执行闭合校验：
+
+- `count` 不得超过该核分区容量，禁止截断后继续导出；
+- `dropped` 必须为 0；
+- 每条直接 Atomic 计为一次调用；每条 PollBatch 按 flags 高 24 bit 编码的
+  `call_count` 加权，且 `call_count` 必须大于 0；
+- `atomic_calls = atomic_records - poll_batch_records + batched_poll_calls`；
+- 所有 PollBatch 的 `call_count` 之和必须等于 `batched_poll_calls`，物理 PollBatch
+  条数必须等于 `poll_batch_records`；
+- level 4 每核必须恰有两条 `ClockBaseline`，总数必须为 `2*N`；
+- level 1 到 3 不应出现 `Atomic` 或 `ClockBaseline`。
+
+level 1 到 4 都使用每核 65,536 条（64K）分区。设备二进制 record version 3 不再
+逐条重复 `core_idx/block_id/lane`，而是在每核 state 中保存并校验一次，导出十列 raw
+JSON 时再补回；每条物理记录为 32 byte，JSON 列格式不变。仅计 record 分区时，96 个
+worker 约占 192 MiB，108 个 worker 约占 216 MiB，另有很小的 header；raw metadata
+中的 `records_per_core`、`record_size_bytes` 和 `device_trace_bytes` 给出本次运行的精确
+配置。host 只初始化 header，导出时先读取 header/core 计数，再按核搬运实际
+`count*32` byte 的有效记录，不常驻完整设备镜像。
+
+PollBatch 让大量连续轮询按等待区和 site 合并，同时保留精确调用次数，因此不再需要
+为每一次 poll 预留物理记录。若单个 batch 达到高 24 bit 可表示的最大次数，实现会
+先落盘并开启下一条 batch，不会饱和后丢失计数。物理记录容量仍不是理论无界；任何
+容量溢出都必须明确失败，不能截断后发布，也不能只放宽 `dropped` 校验。
+设备侧边界 GTest 直接从 `0xFFFFFE` 累加到 `0xFFFFFF`，确认第一条立即落盘；随后
+第 `0x1000000` 次调用以 `call_count=1` 重开第二条，并验证两条之和精确等于
+`0x1000000`。
+
+`batched_poll_calls` 包含上述九类 observation load 和幂等失败 exchange 重试，是
+本次启用 schema v3 插桩后真实执行的精确调用数。插桩本身会改变代码布局、核间到达
+时序和轮询节奏，因此不同插桩方案下的调用次数不能当作固定 workload 常量直接比较；
+计数换算和前后对比应使用同一观察模式。
+
+2026-07-18 最终 A5Sim 结构验证得到以下闭合结果；它们用于证明记录规模和计数契约，
+不表示真实 A5 atomic 时延，也不参与后文按 160 ns 对真机计数所做的归因估算。
+ReuseStress 只是十类规则与 BlockWon 路径的结构压力验收，不扩大本文只复现 PA Case1
+性能的范围：
+
+| 样本 | raw 大小 | 总记录 | 逻辑 `atomic_calls` | 物理 Atomic | PollBatch | 单核记录峰值 | dropped |
+| ---- | -------: | -----: | ---------------------: | ----------: | --------: | ------------: | ------: |
+| Case1 `20260718_152435` | 124,547,744 B（约 118.8 MiB） | 1,464,594 | 187,860,395 | 493,301 | 959 | 16,357 | 0 |
+| BlockWon ReuseStress `20260718_154229` | 2,055,624 B（约 1.96 MiB） | 24,442 | 243,357,709 | 10,505 | 572 | 519 | 0 |
+
+Case1 中 `batched_poll_calls=187,368,053`，满足
+`187,860,395 - 187,368,053 + 959 = 493,301`；108 核共有 216 条
+`ClockBaseline`。ReuseStress 中 `batched_poll_calls=243,347,776`，满足
+`243,357,709 - 243,347,776 + 572 = 10,505`；其中 22 条 site 23 PollBatch
+精确表示 625,394 次幂等失败 exchange 重试，另有 348 条 site 23 直接记录。这里的
+直接记录包含成功 claim、等待区外调用或其他非聚合情形，不能全部等同为成功次数。
+
+同一版 level-4 代码随后在真实 A5 device 0 上执行 Case1，得到以下实际 PA 记录：
+
+| 样本 | raw 大小 | merged 大小 | 核拓扑 | 总记录 | 逻辑 `atomic_calls` | 物理 Atomic | PollBatch | 单核记录峰值 | dropped |
+| ---- | -------: | ----------: | ------ | -----: | ---------------------: | ----------: | --------: | ------------: | ------: |
+| A5 Case1 `20260718_161520` | 77,128,944 B（约 73.6 MiB） | 333,581,552 B（约 318.1 MiB） | 32 AIC + 64 AIV | 973,430 | 115,200 | 110,006 | 340 | 10,751 | 0 |
+
+该真机样本中 `batched_poll_calls=5,534`，满足
+`115,200 - 5,534 + 340 = 110,006`；96 核共有 192 条 `ClockBaseline`。340 条
+PollBatch 分布在 `StartupPoll`、`FatalPoll`、`FaninFlagLoad` 和
+`ReplayDonePoll`，精确表示 5,534 次等待区调用。Case1 没有动态进入 BlockWon，
+因此没有出现 21/22/23/27 类 batch；这不影响十类 allowlist 的实现和独立
+BlockWon ReuseStress 覆盖。直接事件中 106,914 条使用真机 `return_ready` 边界，
+与 `result_used` 数量一致，可与 A5Sim 的 `source_issue` 边界明确区分。
+
+若只为形成直观的 scalar 归因依据，暂统一使用 160 ns/次，则这份真实 A5 Case1 的
+全核累计估计为 `115,200 × 160 ns = 18.432 ms core-work`。它是跨 96 核求和后的
+工作量，不是 PA 墙钟耗时；不能把 18.432 ms 与约 5.6 ms Submit 包络直接相加。
+
+任一条件不满足，export 返回非零；若 runtime 本身成功，该错误继续传播为本次运行
+失败，不能把旧文件或不完整文件当作有效样本。共享 converter 会按 raw 行重新计算
+`records`、`atomic_records`、`clock_baseline_records`、`atomic_calls`、
+`batched_poll_calls` 和 `poll_batch_records`，逐项核对 `metadata.fdwic_summary`；
+`dropped_records` 无法从已导出的有效行反推，因此 converter 要求 producer summary
+明确给出 0。正式分析还应确认 raw 与 merged 的物理 Atomic 条数相等，并以
+`atomic_calls` 而不是物理 Atomic 条数表示源码调用总数。
+
+两条 `ClockBaseline` 分别是连续两次 `SYS_CNT` 读取，以及 atomic 返回值依赖 hook
+的固定路径。它们用于观察计时分辨率和 hook 本身的分布，不是可以从每条 Atomic
+机械相减的校正常数。
+
+### atomic 性能解释边界
+
+单条直接 Atomic 是某一 AIC/AIV scalar lane 上的本地 span。可以按
+`core_type/site/op` 查看直接事件数、中位数、p95、最大值，也可以比较同一核上某个
+直接 site 的累计分布；这些数据适合回答“哪类直接 atomic 常见、哪类本核返回等待
+长”。PollBatch 只适合统计对应 site/op 的调用次数和等待 episode 分布；其窗口可能
+包含交错的直接 atomic，duration 不能混入单次 atomic 延迟的 median/p95。
+
+若已有独立 atomic probe 给出的标定开销，可把 schema v3 的精确调用数换算为直观的
+scalar 工作量估计：
+
+~~~text
+estimated_atomic_core_work_ns = Σ(event.call_count × calibrated_atomic_cost_ns(site, op))
+~~~
+
+直接 Atomic 的 `call_count=1`，PollBatch 使用其精确计数。若暂时对所有 site/op 统一
+采用约 160 ns 的单次标定值，公式简化为
+`estimated_atomic_core_work_ns ≈ atomic_calls × 160 ns`；若只归因某个 scalar
+阶段，则只对属于该阶段的事件求和。该数值是所有核累计的 scalar core-work 估计，
+不是 Submit wall time，也不是从 PollBatch duration 反推的单次硬件时延。
+
+不能把所有核的 Atomic span 简单求和后称为 Submit 墙钟开销：不同核并行执行，
+大量 span 相互重叠；Atomic 还嵌套在 Claim、Replay、Submit 等外层 phase 中，外层
+和内层也不能再次相加。全核求和只能解释为带观察的 aggregate core-work。若要判断
+对墙钟时间的影响，应结合关键 scalar lane、全局最早 Submit 到最晚 Submit 的包络，
+并对优化前后使用相同观察模式；最终端到端收益仍用关闭 atomic 诊断的独立运行确认。
 
 ### 提取首个到末个 Submit
 
-以下脚本自动选择最新 Case1 trace，校验 96 个 core、每核 1280 个 Submit
-以及完整 task id，并输出用户关注的全局 span：
+先把 `TRACE` 指向 level 1 到 3 的 phase-only Case1 raw。以下脚本拒绝 level 4，
+避免误把 Atomic 插桩后的诊断时间当成约 5.6 ms 基线；随后校验 96 个 core、
+每核 1280 个 Submit 以及完整 task id，并输出用户关注的全局 span：
 
 ~~~bash
+export TRACE=outputs/TestPagedAttentionUnroll_Case1_YYYYMMDD_HHMMSS/l2_swimlane_records.json
+
 python - <<'PY'
 import json
+import os
 import statistics
 from collections import defaultdict
 from pathlib import Path
 
-traces = list(
-    Path("outputs").glob(
-        "TestPagedAttentionUnroll_Case1_*/l2_swimlane_records.json"
-    )
-)
-if not traces:
-    raise SystemExit("no Case1 l2_swimlane_records.json found")
-
-trace = max(traces, key=lambda path: path.stat().st_mtime)
+trace = Path(os.environ["TRACE"])
+if not trace.is_file():
+    raise SystemExit(f"trace does not exist: {trace}")
 with trace.open() as stream:
     data = json.load(stream)
 
+level = int(data["l2_swimlane_level"])
+assert level in (1, 2, 3), f"phase baseline requires level 1..3, got {level}"
 hz = int(data["metadata"]["clock_freq_hz"])
 submits = [row for row in data["fdwic_events"] if row[5] == "Submit"]
 if not submits:

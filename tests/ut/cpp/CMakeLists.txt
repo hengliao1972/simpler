@@ -434,6 +434,18 @@ add_a2a3_runtime_test(test_a2a3_scope_stats_collector a2a3/test_scope_stats_coll
 # ---------------------------------------------------------------------------
 add_a5_test(test_a5_fatal a5/test_a5_fatal.cpp)
 
+# FDWIC's device-side PollBatch accumulator is header-only. Compile the exact
+# production implementation through the A5Sim target macros so the 24-bit
+# split boundary is exercised without introducing a second model.
+add_a5_test(test_fdwic_swimlane_poll_batch a5/test_fdwic_swimlane_poll_batch.cpp)
+target_compile_definitions(test_fdwic_swimlane_poll_batch PRIVATE __CPU_SIM=1)
+target_include_directories(test_fdwic_swimlane_poll_batch BEFORE PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
+)
+
 # A5 trb runtime UTs — mirror of a2a3 trb runtime UTs, link against a5_rt_objs.
 # Target names carry the a5_ prefix because hierarchical/test_tensormap (and
 # the unprefixed a2a3 runtime targets test_scheduler_state / test_ready_queue

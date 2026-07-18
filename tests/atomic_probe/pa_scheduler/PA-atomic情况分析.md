@@ -33,7 +33,7 @@ Submit 路径，供后续继续优化。快照日期更新至 2026-07-18；当�
   fanin 成功/失败 load 与 frontier 重复前推，再进行单变量消减。
 
 环境安装、编译和基线复现过程见
-[A5 FDWIC Paged Attention 安装与复现指南](../A5_FDWIC_PAGED_ATTENTION_REPRO.md)。
+[A5 FDWIC Paged Attention 安装与复现指南](../a5_fdwic_atomic_swimlane_repo.md)。
 
 ## 2. Case1 工作量与 atomic 语义
 

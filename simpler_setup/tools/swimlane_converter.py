@@ -31,6 +31,105 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+_FDWIC_PHASE_NAMES = {
+    "Kernel": "kernel",
+    "Alloc": "alloc",
+    "Build": "build",
+    "DrainWon": "drain_won",
+    "Replay": "replay",
+    "RingBp": "ringbp",
+    "EfDrain": "efdrain",
+    "Commit": "commit",
+    "Submit": "submit",
+    "Materialize": "materialize",
+    "PrepareMap": "prepare_map",
+    "Claim": "claim",
+    "Fanin": "fanin",
+    "Register": "register",
+    "Atomic": "atomic",
+    "ClockBaseline": "clock_baseline",
+}
+
+# IDs 0..14 are the standalone PA ABI. Real PA only appends IDs so archived
+# captures and the standalone calibration keep the same names.
+_FDWIC_ATOMIC_SITE_NAMES = {
+    0: "startup_increment",
+    1: "startup_poll",
+    2: "fatal_poll",
+    3: "fatal_set",
+    4: "claim_max",
+    5: "fanin_flag_load",
+    6: "completion_vend_exchange",
+    7: "completion_flag_exchange",
+    8: "frontier_initial_load",
+    9: "frontier_flag_load",
+    10: "frontier_max",
+    11: "heap_frontier_load",
+    12: "heap_vend_load",
+    13: "replay_done_increment",
+    14: "replay_done_poll",
+    15: "won_slot_claim_max",
+    16: "won_remaining_exchange",
+    17: "won_lane_reset_exchange",
+    18: "won_lane_deposit_exchange",
+    19: "won_state_publish_exchange",
+    20: "won_any_publish_exchange",
+    21: "won_any_load",
+    22: "won_state_load",
+    23: "won_lane_claim_exchange",
+    24: "won_lane_release_exchange",
+    25: "won_remaining_fetch_sub",
+    26: "won_state_clear_exchange",
+    27: "won_drained_load",
+}
+
+_FDWIC_ATOMIC_OP_NAMES = {
+    0: "load",
+    1: "exchange",
+    2: "fetch_add",
+    3: "fetch_max",
+    4: "fetch_sub",
+}
+
+_FDWIC_ATOMIC_SITE_OP_IDS = {
+    0: 2,
+    1: 0,
+    2: 0,
+    3: 1,
+    4: 3,
+    5: 0,
+    6: 1,
+    7: 1,
+    8: 0,
+    9: 0,
+    10: 3,
+    11: 0,
+    12: 0,
+    13: 2,
+    14: 0,
+    15: 3,
+    16: 1,
+    17: 1,
+    18: 1,
+    19: 1,
+    20: 1,
+    21: 0,
+    22: 0,
+    23: 1,
+    24: 1,
+    25: 4,
+    26: 1,
+    27: 0,
+}
+
+# These sites issue the atomic for its side effect and do not consume the old
+# value. All other production sites consume the result. A v3 converter must
+# mirror this ABI instead of trusting a self-consistent summary around a
+# malformed direct Atomic row.
+_FDWIC_ATOMIC_RESULT_UNUSED_SITE_IDS = {0, 3, 6, 7, 13, 16, 17, 18, 19, 20, 24, 26}
+
+_FDWIC_POLL_BATCH_SITE_OP_IDS = {1: 0, 2: 0, 5: 0, 11: 0, 12: 0, 14: 0, 21: 0, 22: 0, 23: 1, 27: 0}
+
 
 def _func_id_to_letter(func_id):
     """Map a non-negative integer func_id to a numeric+letter label.
@@ -70,7 +169,13 @@ def _task_display_name(func_id, func_id_to_name, tdisp):
     return f"func_{_func_id_to_letter(func_id)}({tdisp})"
 
 
-def _append_fdwic_dist_engine_events(events, fdwic_events, func_id_to_name=None):
+def _append_fdwic_dist_engine_events(  # noqa: PLR0912
+    events,
+    fdwic_events,
+    func_id_to_name=None,
+    trace_schema_version=1,
+    clock_freq_hz=0,
+):
     """Append fully_distributed_within_core AICore-runtime spans.
 
     The visual shape follows the a2a3 dist_engine swimlane where it applies on
@@ -84,22 +189,7 @@ def _append_fdwic_dist_engine_events(events, fdwic_events, func_id_to_name=None)
         return {0: "AIC", 1: "AIV0", 2: "AIV1"}.get(int(lane), "?")
 
     def phase_name(phase):
-        return {
-            "Kernel": "kernel",
-            "Alloc": "alloc",
-            "Build": "build",
-            "DrainWon": "drain_won",
-            "Replay": "replay",
-            "RingBp": "ringbp",
-            "EfDrain": "efdrain",
-            "Commit": "commit",
-            "Submit": "submit",
-            "Materialize": "materialize",
-            "PrepareMap": "prepare_map",
-            "Claim": "claim",
-            "Fanin": "fanin",
-            "Register": "register",
-        }.get(str(phase), str(phase).lower())
+        return _FDWIC_PHASE_NAMES.get(str(phase), str(phase).lower())
 
     def kernel_name(func_id):
         if func_id_to_name:
@@ -139,12 +229,66 @@ def _append_fdwic_dist_engine_events(events, fdwic_events, func_id_to_name=None)
                 }
             )
 
+    legacy_claim_max_spans = defaultdict(list)
+    has_atomic_trace = False
+    if trace_schema_version == 1:
+        for event in fdwic_events:
+            if phase_name(event["phase"]) != "atomic":
+                continue
+            has_atomic_trace = True
+            if int(event["aux"]) == 4:
+                key = (int(event["core_id"]), int(event["block_id"]), int(event["lane"]), int(event["task_id"]))
+                legacy_claim_max_spans[key].append((int(event["start_cycles"]), int(event["end_cycles"])))
+
     for e in fdwic_events:
         phase = phase_name(e["phase"])
         func_id = int(e["func_id"])
         task_id = int(e["task_id"])
         lane = int(e["lane"])
-        if phase == "kernel" and func_id >= 0:
+        flags = int(e["flags"])
+        aux = int(e["aux"])
+        if phase == "claim":
+            claim_won = bool(flags & 0x1)
+            if trace_schema_version >= 2:
+                claim_attempted = bool(flags & 0x2)
+                claim_attempted_source = "raw_flag"
+            elif has_atomic_trace:
+                key = (int(e["core_id"]), int(e["block_id"]), lane, task_id)
+                matched_claim_max = any(
+                    atomic_start >= int(e["start_cycles"]) and atomic_end <= int(e["end_cycles"])
+                    for atomic_start, atomic_end in legacy_claim_max_spans.get(key, [])
+                )
+                claim_attempted = True if matched_claim_max else None
+                claim_attempted_source = (
+                    "contained_claim_max" if matched_claim_max else "unknown_v1_without_matching_claim_max"
+                )
+            else:
+                claim_attempted = None
+                claim_attempted_source = "unknown_v1_without_atomic_trace"
+            if claim_attempted is False:
+                name = f"claim.not_attempted#{task_id}"
+            elif claim_attempted is True:
+                name = f"claim.{'won' if claim_won else 'lost'}#{task_id}"
+            else:
+                name = f"claim#{task_id}"
+            tid = lane
+        elif phase == "atomic":
+            atomic_site_id = aux
+            atomic_op_id = flags & 0xF
+            atomic_site = _FDWIC_ATOMIC_SITE_NAMES.get(atomic_site_id, f"site_{atomic_site_id}")
+            atomic_op = _FDWIC_ATOMIC_OP_NAMES.get(atomic_op_id, f"op_{atomic_op_id}")
+            atomic_poll_batch = trace_schema_version >= 3 and bool(flags & (1 << 7))
+            if atomic_poll_batch:
+                atomic_call_count = (flags >> 8) & 0xFFFFFF
+                name = f"atomic.poll_batch.{atomic_site}.{atomic_op}×{atomic_call_count}"
+            else:
+                atomic_boundary_tag = "return_ready" if flags & (1 << 6) else "source_issue"
+                name = f"atomic.{atomic_boundary_tag}.{atomic_site}.{atomic_op}#{task_id}"
+            tid = lane
+        elif phase == "clock_baseline":
+            name = "clock.atomic_return_dependency_hook" if flags & 1 else "clock.consecutive_sys_cnt_reads"
+            tid = lane
+        elif phase == "kernel" and func_id >= 0:
             name = f"{kernel_name(func_id)}#{task_id}"
             tid = lane + 3
         elif phase == "commit":
@@ -153,23 +297,97 @@ def _append_fdwic_dist_engine_events(events, fdwic_events, func_id_to_name=None)
         else:
             name = f"{phase}#{task_id}"
             tid = lane
-        events.append(
-            {
-                "ph": "X",
-                "name": name,
-                "pid": int(e["block_id"]),
-                "tid": tid,
-                "ts": round(float(e["start_time_us"]), 3),
-                "dur": round(float(e["duration_us"]), 3),
-                "args": {
+        event = {
+            "ph": "X",
+            "name": name,
+            "pid": int(e["block_id"]),
+            "tid": tid,
+            "ts": round(float(e["start_time_us"]), 3),
+            "dur": round(float(e["duration_us"]), 3),
+            "args": {
+                "phase": phase,
+                "task_id": task_id,
+                "func_id": func_id,
+                "core": int(e["core_id"]),
+                "mc": flags & 1,
+            },
+        }
+        if phase == "atomic":
+            if atomic_poll_batch:
+                event["args"] = {
+                    "phase": "atomic_poll_batch",
+                    "task_id": task_id,
+                    "func_id": func_id,
+                    "core": int(e["core_id"]),
+                    "site": atomic_site,
+                    "site_id": atomic_site_id,
+                    "op": atomic_op,
+                    "op_id": atomic_op_id,
+                    "call_count": atomic_call_count,
+                    "poll_window_cycles": int(e["end_cycles"]) - int(e["start_cycles"]),
+                    "estimate_formula": "call_count * calibrated_atomic_cost",
+                    "is_poll_batch": True,
+                    "batch_semantics": (
+                        "idempotent_failed_exchange_retries"
+                        if atomic_site_id == 23
+                        else "observation_load_calls"
+                    ),
+                    "duration_semantics": "logical_poll_episode_envelope_not_single_atomic_latency",
+                    "may_contain_interleaved_direct_atomics": True,
+                    "flags": flags,
+                    "execution_unit": "scalar",
+                }
+                event["cat"] = "atomic.poll_batch"
+            else:
+                event["args"] = {
                     "phase": phase,
                     "task_id": task_id,
                     "func_id": func_id,
                     "core": int(e["core_id"]),
-                    "mc": int(e["flags"]) & 1,
-                },
+                    "site": atomic_site,
+                    "site_id": atomic_site_id,
+                    "op": atomic_op,
+                    "op_id": atomic_op_id,
+                    "call_count": 1,
+                    "cycles": int(e["end_cycles"]) - int(e["start_cycles"]),
+                    "result_used": bool(flags & (1 << 4)),
+                    "return_ready_observed": bool(flags & (1 << 6)),
+                    "completion_boundary": "return_value_ready" if flags & (1 << 6) else "source_issue_bracket",
+                    "flags": flags,
+                    "execution_unit": "scalar",
+                }
+                event["cat"] = f"atomic.{atomic_boundary_tag}"
+                if atomic_op_id == 0:
+                    event["args"]["value_zero"] = bool(flags & (1 << 5))
+                if atomic_op_id == 3:
+                    event["args"]["retries"] = (flags >> 8) & 0xFFFFFF
+        elif phase == "claim":
+            event["args"] = {
+                "phase": phase,
+                "task_id": task_id,
+                "func_id": func_id,
+                "core": int(e["core_id"]),
+                "claim_attempted": claim_attempted,
+                "claim_won": claim_won,
+                "claim_attempted_source": claim_attempted_source,
+                "claim_path": "alloc" if aux == 1 else "kernel",
+                "execution_unit": "scalar",
+                "flags": flags,
             }
-        )
+            event["cat"] = "scalar_scheduler"
+        elif phase == "clock_baseline":
+            dependency_hook = bool(flags & 1)
+            event["args"] = {
+                "phase": phase,
+                "core": int(e["core_id"]),
+                "ticks": int(e["end_cycles"]) - int(e["start_cycles"]),
+                "clock_freq_hz": int(clock_freq_hz),
+                "definition": ("atomic-return-dependency-hook" if dependency_hook else "consecutive-sys-cnt-reads"),
+                "dependency_applied": bool(flags & 2) if dependency_hook else False,
+                "execution_unit": "scalar",
+            }
+            event["cat"] = "scalar_clock"
+        events.append(event)
 
 
 def normalize_pto2_task_id_int(v):
@@ -217,6 +435,7 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
           "l2_swimlane_level": <1..4>,
           "metadata": {
             "clock_freq_hz": <int>,
+            "trace_schema_version": <1|2|3>,     # optional; default 1
             "num_cores": <int>,
             "core_types": ["aic"|"aiv", ...],   # indexed by core_id
             "core_to_thread": [<int>, ...]      # optional (level >= 3)
@@ -274,6 +493,10 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
     clock_freq_hz = int(metadata.get("clock_freq_hz") or 0)
     if clock_freq_hz <= 0:
         raise ValueError(f"metadata missing/zero clock_freq_hz: {clock_freq_hz}")
+    trace_schema_version = int(metadata.get("trace_schema_version", 1))
+    if trace_schema_version not in (1, 2, 3):
+        raise ValueError(f"Unsupported metadata.trace_schema_version: {trace_schema_version} (expected 1, 2, or 3)")
+    num_cores = int(metadata.get("num_cores") or 0)
     core_types = list(metadata.get("core_types") or [])
     core_to_thread = list(metadata.get("core_to_thread") or [])
 
@@ -282,6 +505,14 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
     sched_phases_raw = data.get("aicpu_scheduler_phases") or []
     orch_phases_raw = data.get("aicpu_orchestrator_phases") or []
     fdwic_rows = data.get("fdwic_events") or []
+    fdwic_summary = metadata.get("fdwic_summary")
+    if trace_schema_version == 3 and level != 4:
+        raise ValueError("metadata.trace_schema_version=3 requires l2_swimlane_level=4")
+    if trace_schema_version == 3 and (num_cores <= 0 or len(core_types) != num_cores):
+        raise ValueError(
+            f"metadata.trace_schema_version=3 requires num_cores matching core_types: "
+            f"num_cores={num_cores} core_types={len(core_types)}"
+        )
 
     # AICore lookup keyed by (core_id, reg_task_id). Two dispatches of the
     # same PTO2 task_token_raw to the same core (SPMD over-subscription, MIX
@@ -465,28 +696,164 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
         aicpu_orchestrator_phases.append(converted)
 
     fdwic_events = []
-    for row in fdwic_rows:
+    observed_summary = {
+        "records": len(fdwic_rows),
+        "atomic_records": 0,
+        "clock_baseline_records": 0,
+        "atomic_calls": 0,
+        "batched_poll_calls": 0,
+        "poll_batch_records": 0,
+        "dropped_records": 0,
+    }
+    v3_clock_rows = defaultdict(lambda: {"plain": 0, "dependency": 0, "return_ready": None})
+    v3_result_used_direct_rows = []
+    for row_index, row in enumerate(fdwic_rows):
+        if not isinstance(row, (list, tuple)) or len(row) != 10:
+            raise ValueError(f"fdwic_events[{row_index}] must contain exactly 10 columns")
         core_id, block_id, lane, task_id, func_id, phase, start_cycles, end_cycles, flags, aux = row
-        start_us = _to_us(int(start_cycles))
-        end_us = _to_us(int(end_cycles))
+        core_id = int(core_id)
+        block_id = int(block_id)
+        lane = int(lane)
+        task_id = int(task_id)
+        func_id = int(func_id)
+        start_cycles = int(start_cycles)
+        end_cycles = int(end_cycles)
+        flags = int(flags)
+        aux = int(aux)
+        phase = str(phase)
+        if trace_schema_version == 3:
+            if not 0 <= core_id < num_cores:
+                raise ValueError(f"fdwic_events[{row_index}] has invalid core_id {core_id}")
+            if task_id < -1 or func_id < -1 or aux < 0 or phase not in _FDWIC_PHASE_NAMES:
+                raise ValueError(
+                    f"fdwic_events[{row_index}] has invalid base fields: "
+                    f"task={task_id} func={func_id} phase={phase!r} aux={aux}"
+                )
+            if not (0 <= start_cycles <= end_cycles <= 0xFFFFFFFFFFFFFFFF):
+                raise ValueError(
+                    f"fdwic_events[{row_index}] has invalid cycle range {start_cycles}..{end_cycles}"
+                )
+            if not 0 <= flags <= 0xFFFFFFFF:
+                raise ValueError(f"fdwic_events[{row_index}] has invalid uint32 flags {flags}")
+        if phase == "Claim" and trace_schema_version >= 2:
+            if flags & ~0x3 or (flags & 0x1 and not flags & 0x2):
+                raise ValueError(f"fdwic_events[{row_index}] has invalid Claim flags 0x{flags:x}")
+        if phase == "Atomic" and flags & (1 << 7):
+            call_count = (flags >> 8) & 0xFFFFFF
+            if (
+                trace_schema_version < 3
+                or call_count == 0
+                or not flags & (1 << 4)
+                or _FDWIC_POLL_BATCH_SITE_OP_IDS.get(aux) != (flags & 0xF)
+                or flags & ((1 << 5) | (1 << 6))
+                or task_id != -1
+                or func_id != -1
+            ):
+                raise ValueError(f"fdwic_events[{row_index}] has invalid Atomic PollBatch flags 0x{flags:x}")
+        elif phase == "Atomic" and trace_schema_version == 3:
+            op = flags & 0xF
+            result_used = bool(flags & (1 << 4))
+            value_zero = bool(flags & (1 << 5))
+            return_ready = bool(flags & (1 << 6))
+            payload = flags >> 8
+            expected_result_used = aux in _FDWIC_ATOMIC_SITE_OP_IDS and aux not in _FDWIC_ATOMIC_RESULT_UNUSED_SITE_IDS
+            if (
+                _FDWIC_ATOMIC_SITE_OP_IDS.get(aux) != op
+                or result_used != expected_result_used
+                or (return_ready and not result_used)
+                or (value_zero and op != 0)
+                or (payload and op != 3)
+                or func_id != -1
+            ):
+                raise ValueError(
+                    f"fdwic_events[{row_index}] has invalid direct Atomic site={aux} flags=0x{flags:x}"
+                )
+            if result_used:
+                v3_result_used_direct_rows.append((row_index, core_id, return_ready))
+        if phase == "ClockBaseline" and trace_schema_version == 3:
+            dependency = bool(flags & 0x1)
+            dependency_applied = bool(flags & 0x2)
+            if flags & ~0x3 or (dependency_applied and not dependency) or task_id != -1 or func_id != -1 or aux != 0:
+                raise ValueError(f"fdwic_events[{row_index}] has invalid ClockBaseline flags=0x{flags:x} aux={aux}")
+            clock_state = v3_clock_rows[core_id]
+            if dependency:
+                clock_state["dependency"] += 1
+                clock_state["return_ready"] = dependency_applied
+            else:
+                clock_state["plain"] += 1
+        if phase == "Claim" and trace_schema_version == 3 and aux > 1:
+            raise ValueError(f"fdwic_events[{row_index}] has invalid Claim aux {aux}")
+        if phase == "Atomic":
+            observed_summary["atomic_records"] += 1
+            if flags & (1 << 7):
+                call_count = (flags >> 8) & 0xFFFFFF
+                observed_summary["atomic_calls"] += call_count
+                observed_summary["batched_poll_calls"] += call_count
+                observed_summary["poll_batch_records"] += 1
+            else:
+                observed_summary["atomic_calls"] += 1
+        elif phase == "ClockBaseline":
+            observed_summary["clock_baseline_records"] += 1
+        start_us = _to_us(start_cycles)
+        end_us = _to_us(end_cycles)
         fdwic_events.append(
             {
-                "core_id": int(core_id),
-                "block_id": int(block_id),
-                "lane": int(lane),
-                "task_id": int(task_id),
-                "func_id": int(func_id),
-                "phase": str(phase),
+                "core_id": core_id,
+                "block_id": block_id,
+                "lane": lane,
+                "task_id": task_id,
+                "func_id": func_id,
+                "phase": phase,
+                "start_cycles": start_cycles,
+                "end_cycles": end_cycles,
                 "start_time_us": start_us,
                 "end_time_us": end_us,
                 "duration_us": end_us - start_us,
-                "flags": int(flags),
-                "aux": int(aux),
+                "flags": flags,
+                "aux": aux,
             }
         )
 
+    if trace_schema_version == 3:
+        for core_id in range(num_cores):
+            clock_state = v3_clock_rows[core_id]
+            if clock_state["plain"] != 1 or clock_state["dependency"] != 1:
+                raise ValueError(
+                    f"core {core_id} requires exactly one plain and one dependency ClockBaseline: "
+                    f"plain={clock_state['plain']} dependency={clock_state['dependency']}"
+                )
+        for row_index, core_id, return_ready in v3_result_used_direct_rows:
+            expected_return_ready = bool(v3_clock_rows[core_id]["return_ready"])
+            if return_ready != expected_return_ready:
+                raise ValueError(
+                    f"fdwic_events[{row_index}] direct Atomic return_ready={return_ready} does not match "
+                    f"core {core_id} ClockBaseline dependency_applied={expected_return_ready}"
+                )
+        if not isinstance(fdwic_summary, dict):
+            raise ValueError("metadata.fdwic_summary is required for trace_schema_version=3")
+        required_summary = {
+            "records": observed_summary["records"],
+            "atomic_records": observed_summary["atomic_records"],
+            "clock_baseline_records": observed_summary["clock_baseline_records"],
+            "atomic_calls": observed_summary["atomic_calls"],
+            "batched_poll_calls": observed_summary["batched_poll_calls"],
+            "poll_batch_records": observed_summary["poll_batch_records"],
+            "dropped_records": 0,
+        }
+        for key, observed_value in required_summary.items():
+            try:
+                producer_value = int(fdwic_summary[key])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"metadata.fdwic_summary.{key} is missing or invalid") from exc
+            if producer_value != observed_value:
+                raise ValueError(
+                    f"metadata.fdwic_summary.{key}={producer_value} does not match raw value {observed_value}"
+                )
+
     out = {
         "l2_swimlane_level": level,
+        "clock_freq_hz": clock_freq_hz,
+        "trace_schema_version": trace_schema_version,
         "tasks": tasks,
     }
     if aicpu_scheduler_phases:
@@ -497,6 +864,8 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
         out["core_to_thread"] = core_to_thread
     if fdwic_events:
         out["fdwic_events"] = fdwic_events
+    if trace_schema_version == 3:
+        out["fdwic_summary"] = dict(fdwic_summary)
     return out
 
 
@@ -998,6 +1367,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     deps_kernel_map=None,
     emit_overhead=False,
     fdwic_events=None,
+    trace_schema_version=1,
+    clock_freq_hz=0,
 ):
     """Generate Chrome Trace Event Format JSON from task data.
 
@@ -1013,6 +1384,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         scheduler_phases: Optional list of per-thread phase record lists (l2_swimlane_level >= 3)
         orchestrator_phases: Optional list of per-task orchestrator phase records (l2_swimlane_level >= 4)
         core_to_thread: Optional list mapping core_id (index) to scheduler thread index (-1 = unassigned)
+        trace_schema_version: FDWIC raw record schema (1 legacy, 2 explicit Claim flags,
+            3 exact-count Atomic PollBatch rows)
+        clock_freq_hz: Raw FDWIC cycle-counter frequency used by ClockBaseline event arguments
 
     Generates processes in the trace:
         - pid=4 "Worker View": start_time_us to end_time_us (kernel execution)
@@ -1057,7 +1431,13 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     events = []
 
     if fdwic_events and not tasks:
-        _append_fdwic_dist_engine_events(events, fdwic_events, func_id_to_name)
+        _append_fdwic_dist_engine_events(
+            events,
+            fdwic_events,
+            func_id_to_name,
+            trace_schema_version=trace_schema_version,
+            clock_freq_hz=clock_freq_hz,
+        )
         with open(output_path, "w") as f:
             json.dump({"displayTimeUnit": "ns", "traceEvents": events}, f, indent=2)
         if verbose:
@@ -2485,6 +2865,8 @@ def main():
             deps_kernel_map=deps_kernel_map,
             emit_overhead=args.overhead,
             fdwic_events=data.get("fdwic_events"),
+            trace_schema_version=data.get("trace_schema_version", 1),
+            clock_freq_hz=data.get("clock_freq_hz", 0),
         )
         if args.overhead and deps_edges is None:
             print(

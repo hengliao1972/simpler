@@ -50,6 +50,10 @@ PTO_DEVICE_FUNC inline FdwicSwimlanePhase trace_phase_to_swimlane_phase(TracePha
         return FdwicSwimlanePhase::Fanin;
     case TracePhase::Register:
         return FdwicSwimlanePhase::Register;
+    case TracePhase::Atomic:
+        return FdwicSwimlanePhase::Atomic;
+    case TracePhase::ClockBaseline:
+        return FdwicSwimlanePhase::ClockBaseline;
     }
     return FdwicSwimlanePhase::Kernel;
 }
@@ -85,10 +89,15 @@ PTO_DEVICE_FUNC inline void trace_span_impl(
 PTO_DEVICE_FUNC inline void
 trace_instant_impl(__gm__ DistCore *self, int32_t task_id, int32_t func_id, TracePhase phase, uint32_t flags = 0) {
     const uint64_t cycle = fdwic_swimlane_detail_now();
+    fdwic_atomic_poll_boundary_at(cycle);
     trace_span_impl(self, task_id, func_id, phase, cycle, cycle, flags, 0);
 }
 
-PTO_DEVICE_FUNC inline uint64_t trace_span_begin_impl() { return fdwic_swimlane_detail_now(); }
+PTO_DEVICE_FUNC inline uint64_t trace_span_begin_impl() {
+    const uint64_t cycle = fdwic_swimlane_detail_now();
+    fdwic_atomic_poll_boundary_at(cycle);
+    return cycle;
+}
 
 #define TRACE_LAP(self, task_id, func_id, phase) trace_lap_impl((self), (task_id), (func_id), (phase))
 #define TRACE_LAP_RESET(self) trace_lap_reset_impl((self))

@@ -18,7 +18,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC bool dist_is_fatal_query() {
 #if defined(__CCE_AICORE__)
     return false;
 #else
-    return fatal_set();
+    return fdwic_trace_is_fatal();
 #endif
 }
 

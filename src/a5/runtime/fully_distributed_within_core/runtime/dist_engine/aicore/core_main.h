@@ -19,19 +19,27 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
     fdwic_swimlane_attach(runtime);
     trace_reset_core(self);
 
-    if (!fatal_set()) {
-        atomic_fetch_add<int64_t>(g_dist.started_count, 1);
+    if (!fdwic_trace_is_fatal()) {
+        (void)fdwic_trace_atomic_fetch_add<int64_t>(
+            -1, FdwicAtomicSite::StartupIncrement, g_dist.started_count, 1, /*result_used=*/false
+        );
         uint64_t wd_start = 0;
-        while (atomic_load(g_dist.started_count) < g_dist.num_workers && !fatal_set()) {
+        const uint32_t startup_poll_region = fdwic_atomic_poll_region_begin(
+            fdwic_atomic_site_mask(FdwicAtomicSite::StartupPoll) | fdwic_atomic_site_mask(FdwicAtomicSite::FatalPoll)
+        );
+        while (fdwic_trace_atomic_load(-1, FdwicAtomicSite::StartupPoll, g_dist.started_count) < g_dist.num_workers &&
+               !fdwic_trace_is_fatal()) {
             SPIN_WAIT_HINT();
             watchdog(wd_start);
         }
+        fdwic_atomic_poll_region_end(startup_poll_region);
     }
 
     TRACE_LAP_RESET(self);  // origin for the first lap span (post-barrier, pre-replay)
     dist_submit_replay_orch(runtime);
 
     dist_submit_drain_to_completion(self);
+    fdwic_swimlane_record_clock_baselines(self, core_idx);
     TRACE_FLUSH_CORE(self);
     dist_aicore_finish_worker(runtime);
 }

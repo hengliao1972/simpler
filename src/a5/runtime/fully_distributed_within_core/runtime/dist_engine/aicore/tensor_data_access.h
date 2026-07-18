@@ -22,14 +22,19 @@ PTO_DEVICE_FUNC void wait_producer_ready(DistCore *self, const Tensor &t) {
     const int32_t p = dist_tensor_map_lookup(self->map, t);
     if (p < 0) return;
     uint64_t wd = 0;
-    while (!fatal_set()) {
-        if (task_flag_ready(p, __ATOMIC_ACQUIRE)) break;
+    const uint32_t producer_poll_region = fdwic_atomic_poll_region_begin(
+        fdwic_atomic_site_mask(FdwicAtomicSite::FatalPoll) | fdwic_atomic_site_mask(FdwicAtomicSite::FaninFlagLoad) |
+        fdwic_atomic_block_won_poll_mask()
+    );
+    while (!fdwic_trace_is_fatal(p)) {
+        if (task_flag_ready(p, __ATOMIC_ACQUIRE, FdwicAtomicSite::FaninFlagLoad)) break;
         drain_block_won(self);
         if (drain_phase_b(self) == 0) {
             SPIN_WAIT_HINT();
             watchdog(wd);
         }
     }
+    fdwic_atomic_poll_region_end(producer_poll_region);
 }
 #endif
 

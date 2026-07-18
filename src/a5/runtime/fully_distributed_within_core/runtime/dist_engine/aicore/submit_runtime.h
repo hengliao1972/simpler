@@ -42,6 +42,7 @@ PTO_DEVICE_FUNC bool dist_submit_claim_kernel(const MixedKernels &mixed, DistSub
         const int32_t anchor_lane = anchor_lane_for_mask(M);
         if (!dist_submit_self_is_lane(ctx.self, block, anchor_lane)) return false;
         __gm__ PaddedCursor *cursors = anchor_lane == LANE_AIC ? g_dist.cube_cursor : g_dist.vector_cursor;
+        ctx.claim_attempted = true;
         ctx.won = claim(cursors[ctx.task_id % kCursorShards].v, ctx.task_id);
         if (!ctx.won) return false;
         ctx.kernel_id = kernel_id_for_lane(mixed, anchor_lane);
@@ -50,6 +51,7 @@ PTO_DEVICE_FUNC bool dist_submit_claim_kernel(const MixedKernels &mixed, DistSub
     }
     if (lane_active(M, LANE_AIC)) {
         if (ctx.self->role != CoreType::AIC) return false;
+        ctx.claim_attempted = true;
         ctx.won = claim(g_dist.cube_cursor[ctx.task_id % kCursorShards].v, ctx.task_id);
         if (!ctx.won) return false;
         ctx.kernel_id = mixed.aic_kernel_id;
@@ -57,6 +59,7 @@ PTO_DEVICE_FUNC bool dist_submit_claim_kernel(const MixedKernels &mixed, DistSub
     }
     if (lane_active(M, LANE_AIV0) || lane_active(M, LANE_AIV1)) {
         if (ctx.self->role != CoreType::AIV) return false;
+        ctx.claim_attempted = true;
         ctx.won = claim(g_dist.vector_cursor[ctx.task_id % kCursorShards].v, ctx.task_id);
         if (!ctx.won) return false;
         const int32_t own_lane = lane_active(M, LANE_AIV0) ? LANE_AIV0 : LANE_AIV1;
@@ -69,6 +72,7 @@ PTO_DEVICE_FUNC bool dist_submit_claim_kernel(const MixedKernels &mixed, DistSub
 PTO_DEVICE_FUNC bool dist_submit_claim_alloc(DistSubmitCtx &ctx) {
     ctx.kernel_id = INVALID_KERNEL_ID;
     if (ctx.self == nullptr || ctx.task_id < 0 || ctx.task_id >= kFlagCap) return false;
+    ctx.claim_attempted = true;
     ctx.won = claim(g_dist.alloc_cursor[ctx.task_id % kCursorShards].v, ctx.task_id);
     return ctx.won;
 }
@@ -94,11 +98,15 @@ PTO_DEVICE_FUNC void dist_submit_wait_slot_capacity(__gm__ DistCore *self, int32
     if (self == nullptr) return;
     bool waited = false;
     TRACE_SPAN_BEGIN(ring_bp_trace);
+    const uint32_t slot_poll_region = fdwic_atomic_poll_region_begin(
+        fdwic_atomic_site_mask(FdwicAtomicSite::FaninFlagLoad) | fdwic_atomic_block_won_poll_mask()
+    );
     while (self->occupied_count >= kPrivateSlots - kWonReserve) {
         waited = true;
         drain_block_won(self);
         if (drain_phase_b(self) == 0) SPIN_WAIT_HINT();
     }
+    fdwic_atomic_poll_region_end(slot_poll_region);
     if (waited) {
         TRACE_SPAN_END(ring_bp_trace, self, task_id, -1, TracePhase::RingBp, 0, 0);
     }
@@ -109,21 +117,38 @@ PTO_DEVICE_FUNC bool dist_submit_wait_heap_capacity(DistSubmitCtx &ctx, DistSubm
     const size_t ring = g_dist.heap_size;
     bool waited = false;
     TRACE_SPAN_BEGIN(heap_bp_trace);
-    while (!fatal_set()) {
+    bool heap_poll_region_active = false;
+    uint32_t heap_poll_region = 0;
+    while (!fdwic_trace_is_fatal(ctx.task_id)) {
         // 逻辑 heap 尚未走完第一圈时，物理地址还没有发生环形复用；保留 fatal
         // 原子检查后，可直接跳过 frontier/vend 原子读取。
-        if (ctx.self->heap_next <= ring) return true;
-        const int32_t f = static_cast<int32_t>(atomic_load(g_dist.frontier));
+        if (ctx.self->heap_next <= ring) {
+            if (heap_poll_region_active) fdwic_atomic_poll_region_end(heap_poll_region);
+            return true;
+        }
+        if (!heap_poll_region_active) {
+            heap_poll_region = fdwic_atomic_poll_region_begin(
+                fdwic_atomic_site_mask(FdwicAtomicSite::FatalPoll) |
+                fdwic_atomic_site_mask(FdwicAtomicSite::HeapFrontierLoad) |
+                fdwic_atomic_site_mask(FdwicAtomicSite::HeapVendLoad) |
+                fdwic_atomic_site_mask(FdwicAtomicSite::FaninFlagLoad) | fdwic_atomic_block_won_poll_mask()
+            );
+            heap_poll_region_active = true;
+        }
+        const int32_t f = static_cast<int32_t>(fdwic_trace_atomic_load(
+            ctx.task_id, FdwicAtomicSite::HeapFrontierLoad, g_dist.frontier, /*result_used=*/true
+        ));
         const int32_t R = f - g_dist.H;
-        const uint64_t vstart_live = load_task_vend(R);
+        const uint64_t vstart_live = load_task_vend(ctx.task_id, R);
         if (ctx.self->heap_next - vstart_live <= ring) {
+            fdwic_atomic_poll_region_end(heap_poll_region);
             if (waited) {
                 TRACE_SPAN_END(heap_bp_trace, ctx.self, ctx.task_id, -1, TracePhase::RingBp, 0, 1);
             }
             return true;
         }
         if (f >= ctx.task_id - 1) {
-            set_fatal();
+            fdwic_trace_set_fatal(ctx.task_id);
             if (kind == DistSubmitKind::Alloc) {
                 DIST_ERRF(
                     "[dist_engine] heap ring %zu B too small for H=%d window at alloc %d (live=%llu B)\n", ring,
@@ -136,12 +161,14 @@ PTO_DEVICE_FUNC bool dist_submit_wait_heap_capacity(DistSubmitCtx &ctx, DistSubm
                     ring, g_dist.H, ctx.task_id, (unsigned long long)(ctx.self->heap_next - vstart_live)
                 );
             }
+            fdwic_atomic_poll_region_end(heap_poll_region);
             return false;
         }
         waited = true;
         drain_block_won(ctx.self);
         if (drain_phase_b(ctx.self) == 0) SPIN_WAIT_HINT();
     }
+    if (heap_poll_region_active) fdwic_atomic_poll_region_end(heap_poll_region);
     if (waited) {
         TRACE_SPAN_END(heap_bp_trace, ctx.self, ctx.task_id, -1, TracePhase::RingBp, 0, 1);
     }
@@ -165,18 +192,26 @@ PTO_DEVICE_FUNC void publish_joint_deposits(DistSubmitCtx &ctx, const MixedKerne
     dist_aicore_flush_region(&w.meta, sizeof(w.meta));
     dist_aicore_flush_region(w.lane, sizeof(w.lane));
 #endif
-    store_won_remaining(w, ctx.joint_count);
-    publish_won_slot(w);
-    atomic_exchange(g_dist.blocks[ctx.joint_block].any_pub, 1);
+    store_won_remaining(w, ctx.joint_count, ctx.task_id);
+    publish_won_slot(w, ctx.task_id);
+    (void)fdwic_trace_atomic_exchange(
+        ctx.task_id, FdwicAtomicSite::WonAnyPublishExchange, g_dist.blocks[ctx.joint_block].any_pub, int32_t{1},
+        /*result_used=*/false
+    );
 }
 
-PTO_DEVICE_FUNC int32_t wait_alloc_won_slot(__gm__ DistCore *self, int32_t block) {
-    int32_t won_slot = alloc_won_slot(block);
-    while (won_slot < 0 && !fatal_set()) {
+PTO_DEVICE_FUNC int32_t wait_alloc_won_slot(__gm__ DistCore *self, int32_t block, int32_t task_id) {
+    int32_t won_slot = alloc_won_slot(block, task_id);
+    const uint32_t won_slot_poll_region = fdwic_atomic_poll_region_begin(
+        fdwic_atomic_site_mask(FdwicAtomicSite::FatalPoll) | fdwic_atomic_site_mask(FdwicAtomicSite::FaninFlagLoad) |
+        fdwic_atomic_block_won_poll_mask()
+    );
+    while (won_slot < 0 && !fdwic_trace_is_fatal(task_id)) {
         drain_block_won(self);
         if (drain_phase_b(self) == 0) SPIN_WAIT_HINT();
-        won_slot = alloc_won_slot(block);
+        won_slot = alloc_won_slot(block, task_id);
     }
+    fdwic_atomic_poll_region_end(won_slot_poll_region);
     return won_slot;
 }
 
@@ -197,7 +232,7 @@ dist_submit_build_winner_task(DistSubmitCtx &ctx, const MixedKernels &mixed, con
     dist_submit_wait_slot_capacity(ctx.self, ctx.task_id);
     if (!dist_submit_wait_heap_capacity(ctx, DistSubmitKind::Kernel)) return;
     if (ctx.joint && ctx.joint_slot < 0) {
-        ctx.joint_slot = wait_alloc_won_slot(ctx.self, ctx.joint_block);
+        ctx.joint_slot = wait_alloc_won_slot(ctx.self, ctx.joint_block, ctx.task_id);
         if (ctx.joint_slot < 0) return;
     }
     __gm__ RingSlot *slot = dist_submit_alloc_slot(ctx.self);
@@ -218,16 +253,24 @@ PTO_DEVICE_FUNC void dist_submit_complete_alloc(DistSubmitCtx &ctx) {
 
 PTO_DEVICE_FUNC void dist_submit_drain_to_completion(__gm__ DistCore *self) {
     if (self == nullptr) return;
-    atomic_fetch_add<int64_t>(g_dist.replay_done, 1);
+    (void)fdwic_trace_atomic_fetch_add<int64_t>(
+        -1, FdwicAtomicSite::ReplayDoneIncrement, g_dist.replay_done, 1, /*result_used=*/false
+    );
+    const uint32_t final_poll_region = fdwic_atomic_poll_region_begin(
+        fdwic_atomic_site_mask(FdwicAtomicSite::ReplayDonePoll) |
+        fdwic_atomic_site_mask(FdwicAtomicSite::FaninFlagLoad) | fdwic_atomic_block_won_poll_mask()
+    );
     while (true) {
         drain_block_won(self);
         const int32_t freed = drain_phase_b(self);
-        const bool all_replayed = atomic_load(g_dist.replay_done) >= g_dist.num_workers;
+        const bool all_replayed =
+            fdwic_trace_atomic_load(-1, FdwicAtomicSite::ReplayDonePoll, g_dist.replay_done) >= g_dist.num_workers;
         const bool ring_empty = self->occupied_count == 0;
         const bool pending = has_pending_won(self);
         if (all_replayed && ring_empty && !pending) break;
         if (freed == 0) SPIN_WAIT_HINT();
     }
+    fdwic_atomic_poll_region_end(final_poll_region);
 }
 
 PTO_DEVICE_FUNC void dist_submit_replay_orch(__gm__ Runtime *runtime) {
@@ -255,7 +298,7 @@ PTO_DEVICE_FUNC void dist_submit_replay_orch(__gm__ Runtime *runtime) {
     aicpu_orchestration_entry(local_args);
 #else
     (void)runtime;
-    if (g_dist.orch_args != nullptr && !fatal_set()) {
+    if (g_dist.orch_args != nullptr && !fdwic_trace_is_fatal()) {
         aicpu_orchestration_entry(*g_dist.orch_args);
     }
 #endif
@@ -279,9 +322,11 @@ dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &arg
     if (!dist_submit_materialize_and_prepare_map(ctx.self, args, ctx, DistSubmitKind::Kernel)) return ctx.result;
     TRACE_SPAN_BEGIN(claim_trace);
     const bool is_winner = dist_submit_claim(DistSubmitKind::Kernel, &mixed, ctx);
-    TRACE_SPAN_END(
-        claim_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Claim, static_cast<uint32_t>(is_winner), 0
-    );
+    const uint32_t claim_flags =
+        fdwic_atomic_swimlane_enabled() ?
+            (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U) :
+            static_cast<uint32_t>(is_winner);
+    TRACE_SPAN_END(claim_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Claim, claim_flags, 0);
     if (is_winner) {
         TRACE_SPAN_BEGIN(fanin_trace);
         ctx.fanin_count = dist_submit_collect_fanin(args, ctx, ctx.fanin);
@@ -320,7 +365,11 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
     TRACE_SPAN_END(register_trace, ctx.self, ctx.task_id, -1, TracePhase::Register, 0, 0);
     TRACE_SPAN_BEGIN(claim_trace);
     const bool is_winner = dist_submit_claim(DistSubmitKind::Alloc, nullptr, ctx);
-    TRACE_SPAN_END(claim_trace, ctx.self, ctx.task_id, -1, TracePhase::Claim, static_cast<uint32_t>(is_winner), 1);
+    const uint32_t claim_flags =
+        fdwic_atomic_swimlane_enabled() ?
+            (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U) :
+            static_cast<uint32_t>(is_winner);
+    TRACE_SPAN_END(claim_trace, ctx.self, ctx.task_id, -1, TracePhase::Claim, claim_flags, 1);
     if (is_winner) {
         dist_submit_complete_alloc(ctx);
         TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::Alloc);
