@@ -36,6 +36,13 @@ DCCI、`st_dev` 与 atomic 的 API 功能、隔离规则和代码评审清单见
 - 2026-07-14：新增 CCEC `ld_dev_fanout_publish`。24 AIV 受控对照中，ordinary+DSB 为
   `0/4416` 可见，st_dev+DSB 与 AtomicExch 均为 `4416/4416`；72 AIV 持续读压力同时破坏独立
   control 对照，单列记录为高压力进展失败，不能外推为某个 data writer 的独立语义结论。
+- 2026-07-18：新增 CCEC 单 AIV `atomic_scalar_pmu`，以 EMPTY/SCALAR_CONTROL 扣除
+  gate 和同构标量递推开销。三个独立会话的 8192 次 dependent `atomicAdd` 均显示：
+  atomic 额外 PMU total 几乎 100% 同步增加到 `scalar_instr_busy(0x1)`。
+- 2026-07-18：新增 CCEC 单 AIV `icache_scalar_pmu`，在同一静态调用点配对执行
+  WARM/COLD 同一 target。三个独立会话共 33 对都是 `WARM miss=0`、
+  `COLD miss=68`；COLD-WARM 只增加 48 scalar busy cycle，但增加 `2309..2312`
+  total cycle，证明本场景中 I-cache refill 等待的绝大多数周期不计入 scalar busy。
 - 原始环境与定量结果记录在 `tests/ATOMIC_MINIBENCH_ONBOARD_LOG.md` 的 2026-07-11 与 2026-07-13 小节。
 
 ## 权威覆盖矩阵
@@ -356,6 +363,89 @@ ATOMIC_PROBE_AIVS=24 ATOMIC_PROBE_FANOUT_LAUNCHES=3 \
   tests/atomic_probe/ccec/run_all.sh ld_dev_fanout_publish
 ```
 
+## PMU 对 atomic 与 I-cache miss 等待周期的精确归类
+
+`ccec/atomic_scalar_pmu.cpp` 与 `ccec/icache_scalar_pmu.cpp` 是两个独立单 AIV 微基准。
+它们共用 `pmu_probe_control.h` / `pmu_probe_aicpu.cpp` 的 108 physical sub-core
+MMIO 表与 PMU 所有权协议；I-cache host 另用 `pmu_probe_host_support.h` 封装同一协议。
+AICPU helper 会保存并读回核验
+CTRL、slot 0/1/2 selector 和 START/STOP range，配置：
+
+| PMU 计数 | 事件 | 用途 |
+|---|---:|---|
+| slot 0 | `0x1` | `scalar_instr_busy` |
+| slot 1 | `0x34` | `icache_req` |
+| slot 2 | `0x35` | `icache_miss` |
+| total | 固定总周期计数器 | PMU gate 内的总 AICore cycle |
+
+每个用例在待测段前后只执行 `metrics_prof_start/stop`，关窗后才用
+`ld_dev` 读取 total/scalar/request/miss，最后恢复进程进入用例前的 PMU 配置。
+它们不依赖 `msprof task-based` 的整任务 context 计数，也不与另一个 PMU session
+并发执行。
+
+### dependent atomic 等待计入 scalar busy
+
+Atomic 用例对每个 rounds 依次执行：
+
+1. `EMPTY`：只量 gate/read 固定开销；
+2. `SCALAR_CONTROL`：使用 scalar 寄存器执行与 atomic 路径同构的
+   `old/delta/checksum` 递推；
+3. `DEPENDENT_ATOMIC_ADD`：`old` 改由 64-bit `atomicAdd` 返回，下一次 addend
+   依赖上一次返回值，强制测量 atomic 完成延迟而不是无依赖吞吐。
+
+Host 对 CONTROL/ATOMIC 复算完全相同的 checksum，并检查 atomic 终值、
+physical core id 和 `CTRL.bit0 == 0`。2026-07-18 在 A5 device 0 上的三个独立
+进程会话均执行 `8192 次 × 7 组`：
+
+| 会话 | `(ATOMIC-CONTROL)` 完成延迟 | PMU total cycle/op | scalar busy cycle/op | scalar / total |
+|---:|---:|---:|---:|---:|
+| 1 | 182.922729 ns | 301.804321 | 301.803955 | 0.999998787 |
+| 2 | 251.687622 ns | 415.253540 | 415.253174 | 0.999999119 |
+| 3 | 271.009888 ns | 447.110718 | 447.110352 | 0.999999181 |
+
+完成延迟在三个会话中处于不同档位，当前证据不足以归因；但计数归类完全一致：
+**dependent `atomicAdd` 增加的 PMU total 周期几乎 100% 同步计入
+`scalar_instr_busy(0x1)`。** `get_sys_cnt` 是 1 GHz 时基，表中 PMU total/scalar
+则是 AICore 核时钟 cycle，两者不能直接按同一单位比较。
+
+### I-cache miss 回填等待的绝大多数周期不计入 scalar busy
+
+I-cache 用例的 WARM/COLD 两条路径在 PMU 开窗前汇合，窗口内只从同一个
+静态调用点执行一次同一个 target：
+
+- WARM 在窗外先调用一次 target；
+- COLD 在窗外先执行超过 16 KiB AIV scalar I-cache 容量的 evictor；
+- 最终 ELF 硬校验 target 为 `8280 B @ 0x0`、evictor 为 `32836 B @ 0x2080`，
+  两者均按 128 B 对齐且区间不重叠；
+- Host 逐样本复算 target/prepare checksum，并要求每对 WARM/COLD 使用同一
+  physical AIV、`COLD miss > WARM miss`。
+
+2026-07-18 在 A5 device 0 执行三个独立进程会话，每个会话 11 对，
+交替使用 WARM,COLD 和 COLD,WARM 顺序。全部 33 对均为
+`WARM miss=0`、`COLD miss=68`，且 checksum、mode echo、PMU 关窗与恢复全部通过：
+
+| 会话 | WARM `total/scalar/req/miss` | COLD `total/scalar/req/miss` | total 增量 | scalar 增量 | miss 增量 | scalar / total 增量 |
+|---:|---|---|---:|---:|---:|---:|
+| 1 | `1068/1060/520/0` | `3377/1108/588/68` | 2309 | 48 | 68 | 2.078822% |
+| 2 | `1068/1060/520/0` | `3379/1108/588/68` | 2311 | 48 | 68 | 2.077023% |
+| 3 | `1068/1060/520/0` | `3380/1108/588/68` | 2312 | 48 | 68 | 2.076125% |
+
+因此准确结论是：**本场景中 I-cache miss 回填等待的绝大多数周期不计入
+scalar busy，但不是 scalar 增量严格为零。** 额外 68 次 miss 产生 `2309..2312`
+total cycle，scalar busy 只增加 48 cycle，其余 `2261..2264` cycle 形成
+scalar-busy gap。target 实际覆盖 65 条 cache line，另 3 次 miss 与顺序预取相符；
+因此 `total_delta / 68` 只能作为本窗口归一化值，不能称为单次阻塞
+I-cache miss 的精确延迟。
+
+两个用例均只使用本机 CANN/PTO-ISA，不下载外部 PTO-ISA：
+
+```bash
+source /home/q00473782/cann/cann-9.1.0/set_env.sh
+cd tests/atomic_probe/ccec
+./run_atomic_scalar_pmu.sh
+./run_icache_scalar_pmu.sh
+```
+
 ## 其余探针
 
 | 文件 | 类型 | 验证内容 |
@@ -371,6 +461,8 @@ ATOMIC_PROBE_AIVS=24 ATOMIC_PROBE_FANOUT_LAUNCHES=3 \
 | `ascendc/st_dev_separate_line_stress.asc` / `ccec/st_dev_separate_line_stress.cpp` | regression gating | 只含分-line 数据路径；四模式覆盖两组活跃 block 与两种 allocation 内 line offset，100000 次精确终值检查 |
 | `ascendc/atomic_exch_same_line.asc` / `ccec/atomic_exch_same_line.cpp` | gating + control | 与 st_dev 同构的 AtomicExch 末值顺序对照；三组路径均精确通过 |
 | `ccec/ld_dev_fanout_publish.cpp` | regression gating + timing | 唯一 writer 以 ordinary+DSB、st_dev+DSB、AtomicExch 三种方式逐轮发布；其余全部 AIV 只用 ld_dev 读取完整序列，并记录 writer/全读者周期 |
+| `ccec/atomic_scalar_pmu.cpp` | gating + PMU classification | 单 AIV dependent atomicAdd 完成延迟与同构 scalar control 对照；核实 atomic 等待是否计入 scalar busy |
+| `ccec/icache_scalar_pmu.cpp` | gating + PMU classification | 单 AIV 同一 target 的 WARM/COLD I-cache 对照；核实 miss 回填等待是否计入 scalar busy |
 | `ascendc/dcci_atomic_stress.asc` | legacy observation | 旧的混合 stress；不再作为 DCCI selector 语义证据 |
 | `ccec/dcci_clean_clobber.cpp` | gating | 有序 dirty/clean line 的 dcci clobber 与 control |
 | `ascendc/mb2_flags_clobber.asc` | gating + observation | AtomicMax flags 无丢失；store+dcci 仅统计 |
