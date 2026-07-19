@@ -197,8 +197,10 @@ PTO_DEVICE_FUNC inline void fdwic_swimlane_count_atomic_call(bool poll_batch) {
     g_fdwic_poll_calls++;
 }
 
-PTO_DEVICE_FUNC inline void fdwic_atomic_poll_boundary_at(uint64_t end_cycle) {
-    if (!fdwic_atomic_swimlane_enabled() || g_fdwic_atomic_poll_burst.active_mask == 0) return;
+// 调用方已经在边界处取得 end_cycle；十类 PollBatch 的遍历与落盘只在
+// level-4 且确有活动批次时需要。把慢体共享起来，避免它被每个 phase/lap
+// 边界重复内联，同时不让 level-1 快路径承担函数调用。
+PTO_DEVICE_FUNC __attribute__((noinline)) void fdwic_atomic_poll_boundary_slow(uint64_t end_cycle) {
     __gm__ DistCore *self = g_self;
     if (self == nullptr || g_fdwic_swimlane_core == nullptr) return;
     const uint32_t active_mask = g_fdwic_atomic_poll_burst.active_mask;
@@ -226,6 +228,11 @@ PTO_DEVICE_FUNC inline void fdwic_atomic_poll_boundary_at(uint64_t end_cycle) {
         g_fdwic_atomic_poll_burst.call_count[batch_index] = 0;
     }
     g_fdwic_atomic_poll_burst.active_mask = 0;
+}
+
+PTO_DEVICE_FUNC inline void fdwic_atomic_poll_boundary_at(uint64_t end_cycle) {
+    if (!fdwic_atomic_swimlane_enabled() || g_fdwic_atomic_poll_burst.active_mask == 0) return;
+    fdwic_atomic_poll_boundary_slow(end_cycle);
 }
 
 PTO_DEVICE_FUNC inline void fdwic_atomic_poll_boundary() {
@@ -286,7 +293,10 @@ PTO_DEVICE_FUNC inline void fdwic_swimlane_flush_core(__gm__ DistCore *self) {
     dist_aicore_flush_region(core, sizeof(FdwicSwimlaneCoreState));
 }
 
-PTO_DEVICE_FUNC inline void fdwic_swimlane_detail_record_atomic(
+// Atomic 记录落盘是 level-4 诊断冷路径。保持它为单一设备函数，避免完整的
+// GM 边界检查与记录写入被复制到每一个 atomic 调用点；level-1 快路径在各
+// wrapper 的首个分支已经返回，不会承担这里的 call/ret。
+PTO_DEVICE_FUNC __attribute__((noinline)) void fdwic_swimlane_detail_record_atomic(
     int32_t task_id, FdwicAtomicSite site, FdwicAtomicOp op, uint64_t start_cycle, uint64_t end_cycle, bool result_used,
     bool return_ready, bool value_zero = false, uint64_t retries = 0
 ) {

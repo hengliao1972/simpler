@@ -2293,3 +2293,46 @@ outputs/TestPagedAttentionUnroll_Case1_20260719_131116/merged_swimlane.json
 的前提下继续压缩 level-1 热路。若后续专门采集 I-cache miss，则使用独立诊断构建
 把普通泳道与 atomic 泳道整体编译去除，不能让待分析的 I-cache 数据继续包含这些
 观察代码自身的巨大代码足迹。
+
+#### 7.5.23 真实 PA atomic 冷代码外提与回退消除
+
+后续对象级审计找到了比冷分支概率更直接的复制源：
+`fdwic_swimlane_detail_record_atomic()` 没有独立符号，完整记录尾被复制进每类
+direct atomic；更大的 `fdwic_atomic_poll_boundary_at()` 也没有独立符号，其十类
+PollBatch 遍历被每个普通 phase/lap 边界反复内联。level 1 不执行这些 level-4
+慢体，但仍承受目标代码体积和基本块布局影响。
+
+第一步只把 direct atomic 的记录发布设为设备端 `noinline`。Atomic begin、真实
+atomic、返回值地址依赖和 end 都保持在原 wrapper，调用发生在 end 之后；未消费
+返回值的 Exchange/FetchAdd 也没有被改成返回型等待路径。真实 A5 三轮
+5.461806/5.077269/5.096506 ms，中位数 5.096506 ms。
+
+第二步保留 `fdwic_atomic_poll_boundary_at()` 的内联快速判断，把仅在
+`level >= 4 && active_mask != 0` 时执行的遍历外提为只接收 `end_cycle` 标量的
+设备冷函数。level 1 不新增函数调用；level 4 的边界时间戳仍在冷函数调用前取得。
+最终 AIC/AIV `dist_engine .text` 为 66,768/67,120 B，`dist_submit_impl` 为
+18,812/18,872 B；对照 7.5.22 的 winner 版本分别为
+347,536/357,112 B 和 100,860/103,676 B。
+
+level-1 暖测 4.816453 ms，正式三轮为
+4.821897/4.890447/4.752956 ms，中位数 4.821897 ms。相对 7.5.22 的
+5.192087 ms 下降 7.13%，相对历史 pre-atomic 5.115620 ms 低 5.74%。所有轮次
+保持 96 核、122,880 Submit 和固定 phase 计数闭合。权威正式 raw 为：
+
+~~~text
+outputs/TestPagedAttentionUnroll_Case1_20260719_135241/
+outputs/TestPagedAttentionUnroll_Case1_20260719_135340/
+outputs/TestPagedAttentionUnroll_Case1_20260719_135435/
+~~~
+
+level-4 真机门禁位于
+`outputs/TestPagedAttentionUnroll_Case1_20260719_135629/`：107,608 条
+Atomic 记录精确表示 115,309 次调用，其中 8,056 次轮询压缩成 355 条
+PollBatch，满足 `atomic_records = atomic_calls - batched_poll_calls +
+poll_batch_records`；192 条 ClockBaseline、全部 site/op/`result_used`/
+`return_ready` 和 raw/metadata 计数通过 converter 校验，`dropped_records=0`。
+
+因此本轮确认并消除了此前大部分非必要回退，同时保留 level-4 atomic 泳道能力。
+剩余运行时 level gate 是同一 ELF 动态切换观测级别的必要成本；专门做 I-cache PMU
+时另用编译期关闭普通/atomic 泳道的 `submit-pmu` ELF，不把这部分诊断代码带入
+待测指令流。

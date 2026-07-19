@@ -764,6 +764,60 @@ atomic 落盘或逐 atomic 时间戳的直接成本。但同一 ELF 必须允许
 完整候选泳道：outputs/TestPagedAttentionUnroll_Case1_20260719_131116/merged_swimlane.json
 ```
 
+### 6.7 外提 level-4 atomic 冷代码，消除 level-1 取指回退
+
+对象审计确认，atomic 接入后不只是五类 wrapper 被内联：每个普通 phase/lap
+边界还展开了 `fdwic_atomic_poll_boundary_at()` 的十类 PollBatch 遍历与记录写入。
+level 1 虽然在运行时快速返回，这些冷代码仍被复制进 Submit、Alloc、Materialize、
+Heap wait、drain 等函数，造成上一节记录的数倍 `.text` 膨胀。
+
+按单变量顺序做了两步外提，均不增加设备记录或字段：
+
+1. `fdwic_swimlane_detail_record_atomic()` 设为设备端 `noinline`。Atomic 的
+   `begin -> 指令 -> end` 仍留在原 wrapper，只有 `end` 之后的 GM 记录发布共享；
+   level 1 不调用它。AIC/AIV `.text` 由 347,536/357,112 B 降为
+   319,384/328,656 B，`dist_submit_impl` 由 100,860/103,676 B 降为
+   93,144/95,756 B。真实 A5 三轮为 5.461806/5.077269/5.096506 ms，
+   中位数 5.096506 ms，较 6.6 节候选下降 1.84%。
+2. `fdwic_atomic_poll_boundary_at()` 保留原内联快速门，只把已确认
+   `level >= 4 && active_mask != 0` 后的十类遍历外提到
+   `fdwic_atomic_poll_boundary_slow()`。因此 level 1 仍只执行原有条件判断，
+   不新增 call/ret；level 4 的 `end_cycle` 仍在调用前取得，PollBatch 时间边界
+   不包含记录发布。AIC/AIV `.text` 进一步降为 66,768/67,120 B，
+   `dist_submit_impl` 降为 18,812/18,872 B，实际 PA ELF `.text` 为
+   178,768 B。
+
+第二步的 level-1 暖测为 4.816453 ms；正式三轮为：
+
+| 样本 | 首末 Submit | Submit 数 | 结果 |
+| --- | ---: | ---: | --- |
+| `135241` | 4.821897 ms | 122,880 | PASS |
+| `135340` | 4.890447 ms | 122,880 | PASS |
+| `135435` | 4.752956 ms | 122,880 | PASS |
+
+三轮中位数 4.821897 ms，较两处 winner 冷路的 5.192087 ms 再下降 7.13%，
+较历史 pre-atomic 5.115620 ms 低 5.74%。每轮均为 96 核，固定 phase 数量、
+逐核 Submit 数和 task id 连续性通过；没有 Atomic/ClockBaseline level-4 记录混入
+level-1 结果。该收益来自减少冷诊断代码复制后形成的目标代码与布局变化，不能在
+没有 PMU 取证时进一步写成某个确定的 I-cache miss 数值。
+
+保留完整 atomic 能力的 level-4 真机门禁位于：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260719_135629/
+```
+
+该轮 971,044 条记录、107,608 条 Atomic、115,309 次 atomic 调用、8,056 次
+批处理轮询和 355 条 PollBatch，严格满足
+`107608 = 115309 - 8056 + 355`；96 核各有两条 ClockBaseline，
+`dropped_records=0`。生产 converter 对全部 site/op、`result_used`、
+`return_ready`、PollBatch flags 和 metadata/raw 计数完成逐条校验并通过。
+
+结论是：此前主要回退属于可消除的编译期复制与热路布局成本，不是开启普通泳道
+后必须支付的 atomic 落盘成本。专门分析 I-cache miss 时仍应使用独立
+`submit-pmu` 构建，把普通泳道和 atomic 泳道整体编译去除；这样测到的是调度源码
+本身，而不是本节虽已降温、但仍存在于 ELF 的诊断代码。
+
 ## 结论
 
 历史 schema-v3 泳道不闭合的根因不是缺少一次 duration 求和，而是
