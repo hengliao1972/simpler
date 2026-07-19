@@ -2,9 +2,10 @@
 
 ## 1. 目标与最终构建口径
 
-本指南面向
+本指南的命令和数据格式面向
 `tests/atomic_probe/pa_scheduler`
-的 standalone CCEC 分支，目标是回答：在 Submit-all 整个调度回放期，32 个 AIC
+的 standalone CCEC 分支；其中关于独立诊断构建、代码布局污染和冷路径外提的原则，
+也适用于 simpler 真实 FDWIC PA。目标是回答：在 Submit-all 整个调度回放期，32 个 AIC
 和 64 个 AIV 每核发生了多少 I-cache request/miss，其中哪些 miss
 值得继续优化。它不依赖 simpler 生产代码，也不将 standalone 结果
 冒充为真实 PA 的绝对 profile。
@@ -40,6 +41,46 @@ atomic wrapper、ClockBaseline、runtime phase-profile 和旧 cold/warm 冲刷�
 
 两份证据可以按同一源码版本交叉理解，不能做逐 tick 对齐，也不能
 把 PMU 的平均 miss 回填为某一条 atomic span 的属性。
+
+### 2.1 运行时关闭不等于编译期去除：真实 PA 回退案例
+
+真实 PA 已出现过一次完整反例：level 1 的 raw 中没有任何 Atomic 或
+ClockBaseline 记录，但同一 ELF 为了允许运行时切到 level 4，仍把 atomic
+wrapper、PollBatch 遍历和记录发布慢体大量内联进 Submit 热函数。结果不是
+“没有写 record 就没有代价”，而是未执行的诊断代码仍改变 `.text`、基本块布局
+和取指工作集。
+
+当时真实 A5 Case1 的证据链为：
+
+| 构建状态 | AIC/AIV `dist_engine .text` | AIC/AIV `dist_submit_impl` | 三轮首末 Submit 中位数 |
+| --- | ---: | ---: | ---: |
+| pre-atomic 历史构建 | 80,824 / 80,912 B | 42,136 / 42,152 B | 5.115620 ms |
+| atomic 观测接入、level 1 不落 Atomic | 347,360 / 355,968 B | 100,724 / 102,588 B | 5.631038 ms |
+| 两处低频 winner 调整为冷分支 | 347,536 / 357,112 B | 100,860 / 103,676 B | 5.192087 ms |
+| atomic 冷代码共享外提 | 66,768 / 67,120 B | 18,812 / 18,872 B | 4.821897 ms |
+
+最后一行正式三轮为 4.821897/4.890447/4.752956 ms。这里能证明的是
+“代码复制和布局回退已被消除”；没有同时采集 I-cache PMU，因此不能把恢复量
+进一步写成某个确定的 miss 降幅。
+
+冷代码外提遵守两条边界：
+
+1. direct atomic 的 begin、真实 atomic、返回值地址依赖和 end 仍留在原 wrapper，
+   只共享 end 之后的 record 发布。因此不把 source-issue 操作改成等待返回型，
+   atomic span 口径也不变。
+2. PollBatch 保留内联的 `level >= 4 && active_mask != 0` 快速判断，只把命中后的
+   十类遍历与落盘外提。level 1 不新增 call/ret，level 4 的 `end_cycle` 仍在
+   冷函数调用前取得。
+
+保留此类修改前应依次检查：AIC/AIV 对象的 `.text` 和独立符号、level-1 多轮
+Submit、level-4 logical/physical Atomic 公式、ClockBaseline 和
+`dropped_records=0`。上述真实 PA level-4 复核得到 115,309 次 atomic 调用、
+107,608 条 Atomic、8,056 次批处理轮询和 355 条 PollBatch，满足
+`107608 = 115309 - 8056 + 355`。
+
+这个案例同时说明为什么 `submit-pmu` 不能只传运行时 level=0：专门分析
+I-cache 时，普通泳道、atomic wrapper、ClockBaseline 和相关慢体必须在编译期从
+待测 AIC/AIV ELF 中剔除。运行时 gate 只控制“执行没有”，不能控制“代码存在没有”。
 
 ## 3. `none` 与局部 phase 如何选择
 
@@ -334,6 +375,12 @@ ELF PMU whole-gate primary 的比例区间。两类占比的分母边界不同�
 
 ### 6.1 计数器分工
 
+早期曾尝试用 external task-based `msprof` 汇总配合 kernel 内 start/stop 取得
+Submit 子窗口，实测 raw counter 不受该门控缩窗，因此不能用于局部归因。现行
+链路由 standalone 自带的 Main AICPU owner 保存、配置、读回并恢复每个物理子核
+PMU，kernel 只在同一 runtime TU 内控制 gate 和发布 worker 独占结果。任何
+owner membership、selector readback 或 Restore 失败都会拒绝最终 JSON。
+
 | 计数 | selector | 用途 |
 | --- | --- | --- |
 | PMU raw total | 固定 64-bit total low/high | PMU whole gate 内每个物理子核的累计周期；不是 96 核求和后的墙钟；HTML 另按实测频率显示等效时间 |
@@ -604,8 +651,31 @@ PYTHON=/home/q00473782/.venv/bin/python
 
 ## 9. 如何使用约 90 ns/miss 标尺
 
-当前约 `90 ns/miss` 来自已有隔离 cold/warm 微基准，只用于建立
-数量级感性。对某一角色，可以计算：
+当前约 `90 ns/miss` 来自隔离 cold/warm 微基准，只用于建立数量级感性。
+目标函数只有 8 B，并按 128 B I-cache line 对齐；cold trial 在窗口外先执行
+64 KiB 指令 capacity sweep，warm trial 在 PMU read-clear 前额外调用一次同一
+目标。1 ns/tick 的 SYS_CNT 只包围最终目标调用，两条路径的 gate、harness 和
+目标符号相同。
+
+64 trials/core × 10 轮和 128 trials/core × 5 轮都满足：
+
+```text
+cold CNT7 miss == trials
+warm CNT7 miss == 0
+miss_delta == 96 * trials
+calibrated_cores == 96/96
+```
+
+前者 ALL 中位数为 86.596 ns/miss，范围 86.532～86.792；后者中位数为
+89.629 ns/miss，范围 89.615～89.648。AIC/AIV 差值方向在两组规模间改变，
+因此不建立伪精确的角色常数，统一取 90 ns 只作一阶标尺。历史原始日志为：
+
+```text
+pa_scheduler/outputs/pmu_validation/icache_single_64x10_20260718_085929_3232836_console.log
+pa_scheduler/outputs/pmu_validation/icache_single_128x5_20260718_090151_3235468_console.log
+```
+
+对某一角色，可以计算：
 
 ```text
 角色总 core-work 串行等效量(us) = Σmiss * 0.09
@@ -716,6 +786,25 @@ HTML 位于：
 
 ```text
 pa_scheduler/outputs/submit_pmu_boundary_sync_b1_20260719/{none,claim,efdrain,materialize,register}/
+```
+
+### 9.4 历史 O1 owner/PMU bring-up 证据
+
+现行 `submit-pmu` schema 和 selector 分工建立前，直接 owner 曾用
+empty、100,000 scalar NOP、2×100,000 scalar NOP 验证 gate 可以闭合并继续累计；
+96 核 PMU raw total 中位数约为 214、56,568、112,994。它们只证明链路响应和
+近似倍增，不表示同数值的纳秒或硬件 cycle。
+
+同一历史版本还采过三个独立 b256 `submit-all` PMU-only 进程：Submit span 为
+3.688236/4.089057/4.673237 ms，I-cache request 总和约 69.45M～70.07M，
+miss 总和约 5.83M～5.85M，整体 miss rate 为 8.32%～8.42%。这些旧统一 ELF
+仍含当时的诊断代码，且 PMU gate 会改变多核时序；它们只保留为 owner、96 核
+拓扑和 raw→summary 演进证据，不覆盖 9.1～9.3 的现行构建口径。历史文件为：
+
+```text
+pa_scheduler/outputs/scalar_observation_final_20260718/pmu_submit_all_ccec_b256_v2/pmu_submit_all.json
+pa_scheduler/outputs/scalar_observation_final_20260718/pmu_submit_all_ccec_b256_v2_run2/pmu_submit_all.json
+pa_scheduler/outputs/scalar_observation_final_20260718/pmu_submit_all_ccec_b256_v2_run3/pmu_submit_all.json
 ```
 
 ## 10. 新增局部 phase 的修改清单
