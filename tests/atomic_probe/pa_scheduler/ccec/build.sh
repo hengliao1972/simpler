@@ -33,7 +33,7 @@ case "$BUILD_VARIANT" in
         ;;
     submit-pmu)
         if [[ $# -ne 2 ]]; then
-            echo "Usage: $0 submit-pmu none|claim|efdrain" >&2
+            echo "Usage: $0 submit-pmu none|claim|efdrain|materialize|register" >&2
             exit 1
         fi
         PHASE_NAME="$2"
@@ -41,8 +41,10 @@ case "$BUILD_VARIANT" in
             none) PHASE_ID=0 ;;
             claim) PHASE_ID=1 ;;
             efdrain) PHASE_ID=2 ;;
+            materialize) PHASE_ID=4 ;;
+            register) PHASE_ID=5 ;;
             *)
-                echo "Unknown submit-pmu phase: $PHASE_NAME (expected none|claim|efdrain)" >&2
+                echo "Unknown submit-pmu phase: $PHASE_NAME (expected none|claim|efdrain|materialize|register)" >&2
                 exit 1
                 ;;
         esac
@@ -50,7 +52,7 @@ case "$BUILD_VARIANT" in
         VARIANT_DEFINES=(-DPA_BUILD_SWIMLANE=0 -DPA_BUILD_SUBMIT_PMU=1 "-DPA_SUBMIT_PMU_PHASE_ID=$PHASE_ID")
         ;;
     *)
-        echo "Usage: $0 [swimlane] | $0 submit-pmu none|claim|efdrain" >&2
+        echo "Usage: $0 [swimlane] | $0 submit-pmu none|claim|efdrain|materialize|register" >&2
         exit 1
         ;;
 esac

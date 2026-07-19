@@ -577,7 +577,11 @@ PA_DEVICE bool SubmitTask(
     // Build/Replay 会从这个起点形成覆盖式 span。因此泳道上的这些阶段不能直接相加。
     ResetTraceLap<Ops>(stats.trace, stats.result, worker);
     const uint64_t materialize_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
-    if (!MaterializeTask(worker, task_id, args, context, state->heap_base, state->heap_size)) {
+    BeginSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
+    const bool materialized =
+        MaterializeTask(worker, task_id, args, context, state->heap_base, state->heap_size);
+    EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
+    if (!materialized) {
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
@@ -603,7 +607,9 @@ PA_DEVICE bool SubmitTask(
     if (kind == TaskKind::Alloc) {
         // Alloc 没有 kernel lane，96 个 worker 都维护本地物化/heap 状态，但只有 Claim winner 发布全局完成。
         const uint64_t register_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
+        BeginSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(pmu_context);
         RegisterOutputs(context, args, false);
+        EndSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(pmu_context);
         const uint64_t register_end = TraceTimestamp<Ops>(stats.trace, stats.result);
         WriteTrace<Profile>(
             stats.trace, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::Register,
@@ -671,7 +677,9 @@ PA_DEVICE bool SubmitTask(
         }
 
         const uint64_t register_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
+        BeginSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(pmu_context);
         RegisterOutputs(context, args, true);
+        EndSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(pmu_context);
         const uint64_t register_end = TraceTimestamp<Ops>(stats.trace, stats.result);
         WriteTrace<Profile>(
             stats.trace, stats.result, static_cast<int32_t>(task_id), function_id, TracePhase::Register,

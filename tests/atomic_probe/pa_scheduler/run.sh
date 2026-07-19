@@ -21,8 +21,8 @@ Usage:
   ./run.sh run    ccec|ascendc|cpu|all [benchmark options]
   ./run.sh smoke  ccec|ascendc|cpu|all [--device N]
   ./run.sh swimlane ccec|ascendc|cpu|all [benchmark options]
-  ./run.sh build-submit-pmu ccec none|claim|efdrain
-  ./run.sh submit-pmu ccec none|claim|efdrain [benchmark options]
+  ./run.sh build-submit-pmu ccec none|claim|efdrain|materialize|register
+  ./run.sh submit-pmu ccec none|claim|efdrain|materialize|register [benchmark options]
 
 Benchmark options:
   --device N
@@ -59,12 +59,14 @@ weighted diagonal A and asymmetric B to detect transpose/stride/reorder bugs.
 The swimlane action enables atomic tracing by default. For the lower-level run
 action, --trace-atomics still requires swimlane tracing; add
 --analyze-swimlane to print the per-role/per-site timing distributions.
---pmu-json requires --runs 1 and a non-off PMU window. PMU probe options are
+--pmu-json requires --runs 1 and a non-off PMU window. For submit-pmu, a
+successful raw capture also generates a self-contained HTML report beside it;
+submit_icache_raw.json maps to submit_icache_report.html. PMU probe options are
 CCEC-only and cannot target all.
 
 The submit-pmu action is a separate CCEC-only build. It fixes one PMU-only run
 covering the complete Submit window. phase=none performs no internal snapshots;
-phase=claim/efdrain reports running read-clear lower/loss-adjusted upper bounds
+phase=claim/efdrain/materialize/register reports running read-clear lower/loss-adjusted upper bounds
 for one compile-time phase while CNT6/7 retain the authoritative whole-window counters.
 
 The swimlane action performs exactly one run and writes both the raw capture
@@ -136,9 +138,9 @@ run_backend() {
 
 validate_submit_pmu_phase() {
     case "$1" in
-        none|claim|efdrain) ;;
+        none|claim|efdrain|materialize|register) ;;
         *)
-            echo "Unknown submit-pmu phase: $1 (expected none|claim|efdrain)" >&2
+            echo "Unknown submit-pmu phase: $1 (expected none|claim|efdrain|materialize|register)" >&2
             exit 1
             ;;
     esac
@@ -160,6 +162,8 @@ validate_submit_pmu_artifacts() {
         none) phase_id=0 ;;
         claim) phase_id=1 ;;
         efdrain) phase_id=2 ;;
+        materialize) phase_id=4 ;;
+        register) phase_id=5 ;;
         *) submit_pmu_artifact_failure "$phase" "unsupported phase"; return 1 ;;
     esac
 
@@ -244,8 +248,36 @@ run_submit_pmu() {
     local build_dir="$SCRIPT_DIR/build/ccec/submit-pmu/$phase"
     local host="$build_dir/pa_scheduler_host"
     local kernel="$build_dir/pa_scheduler_kernel.o"
+    local pmu_json=""
+    local expect_pmu_json_value=false
+    local argument
+    # host 仍是 raw 文件的唯一写入者；这里只提取同一个路径，在 host 成功且
+    # raw 已原子发布后调用独立分析器生成可视 HTML。原参数保持原样透传。
+    for argument in "$@"; do
+        if [[ "$expect_pmu_json_value" == true ]]; then
+            pmu_json="$argument"
+            expect_pmu_json_value=false
+            continue
+        fi
+        case "$argument" in
+            --pmu-json) expect_pmu_json_value=true ;;
+            --pmu-json=*) pmu_json="${argument#--pmu-json=}" ;;
+        esac
+    done
     validate_submit_pmu_artifacts "$phase" "$build_dir"
     "$host" --kernel "$kernel" --runs 1 --no-swimlane --pmu-window submit-all "$@"
+    if [[ -n "$pmu_json" ]]; then
+        local python_bin="${PYTHON:-python3}"
+        if ! command -v "$python_bin" >/dev/null 2>&1; then
+            echo "Python executable not found for PMU HTML report: $python_bin" >&2
+            return 1
+        fi
+        if [[ ! -f "$SCRIPT_DIR/pmu_html_report.py" ]]; then
+            echo "Missing local PMU HTML report generator: $SCRIPT_DIR/pmu_html_report.py" >&2
+            return 1
+        fi
+        "$python_bin" "$SCRIPT_DIR/pmu_html_report.py" "$pmu_json"
+    fi
 }
 
 reject_managed_swimlane_options() {
@@ -378,7 +410,7 @@ case "$ACTION" in
         ;;
     build-submit-pmu)
         if [[ "$BACKEND" != "ccec" || $# -ne 1 ]]; then
-            echo "Usage: $0 build-submit-pmu ccec none|claim|efdrain" >&2
+            echo "Usage: $0 build-submit-pmu ccec none|claim|efdrain|materialize|register" >&2
             exit 1
         fi
         PHASE="$1"
@@ -387,7 +419,7 @@ case "$ACTION" in
         ;;
     submit-pmu)
         if [[ "$BACKEND" != "ccec" || $# -lt 1 ]]; then
-            echo "Usage: $0 submit-pmu ccec none|claim|efdrain [benchmark options]" >&2
+            echo "Usage: $0 submit-pmu ccec none|claim|efdrain|materialize|register [benchmark options]" >&2
             exit 1
         fi
         PHASE="$1"

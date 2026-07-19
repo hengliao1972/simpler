@@ -31,6 +31,7 @@ try:
         A5_WORKERS,
         METRIC_NAMES,
         PHASE_STATUS_REQUIRED_MASK,
+        PROGRAMMABLE_COUNTER_RISK_THRESHOLD,
         SUBMIT_PMU_METRIC_NAMES,
         TASKS_PER_BATCH,
         analyze,
@@ -48,6 +49,7 @@ except ImportError:
         A5_WORKERS,
         METRIC_NAMES,
         PHASE_STATUS_REQUIRED_MASK,
+        PROGRAMMABLE_COUNTER_RISK_THRESHOLD,
         SUBMIT_PMU_METRIC_NAMES,
         TASKS_PER_BATCH,
         analyze,
@@ -140,6 +142,7 @@ def _capture(offset: int = 0, window: str = "submit-all") -> dict[str, Any]:
         }
         for metric_index, metric in enumerate(METRIC_NAMES):
             record[metric] = base + metric_index
+        record["total_cycles"] = base + len(METRIC_NAMES)
         # miss/request 取独立、直观的数值，便于断言聚合公式。
         record["icache_requests"] = 1000 + base
         record["icache_misses"] = 100 + base // 10
@@ -201,10 +204,15 @@ def _capture(offset: int = 0, window: str = "submit-all") -> dict[str, Any]:
 
 
 def _submit_pmu_capture(offset: int = 0, phase: str = "claim") -> dict[str, Any]:
-    phase_ids = {"none": 0, "claim": 1, "efdrain": 2}
+    phase_ids = {
+        "none": 0,
+        "claim": 1,
+        "efdrain": 2,
+        "materialize": 4,
+        "register": 5,
+    }
     phase_id = phase_ids[phase]
     batches = 2
-    calls_per_worker = 0 if phase == "none" else batches * TASKS_PER_BATCH
     records: list[dict[str, Any]] = []
     for worker_id in range(A5_WORKERS):
         role = "aic" if worker_id < A5_AIC_WORKERS else "aiv"
@@ -212,12 +220,13 @@ def _submit_pmu_capture(offset: int = 0, phase: str = "claim") -> dict[str, Any]
         block_id = worker_id if role == "aic" else vector_id // 2
         lane = 0 if role == "aic" else 1 + vector_id % 2
         base = 100 + worker_id * 10 + offset
+        calls_per_worker = 0 if phase == "none" else batches * TASKS_PER_BATCH
         primary_requests = 1000 + base
         primary_misses = 100 + base // 10
-        phase_requests = 0 if phase == "none" else 100 + worker_id * 10 + offset
-        phase_misses = 0 if phase == "none" else 10 + worker_id + offset // 10
-        request_loss = 0 if phase == "none" else 1 + worker_id % 3
-        miss_loss = 0 if phase == "none" else 1 + worker_id % 2
+        phase_requests = 0 if calls_per_worker == 0 else 100 + worker_id * 10 + offset
+        phase_misses = 0 if calls_per_worker == 0 else 10 + worker_id + offset // 10
+        request_loss = 0 if calls_per_worker == 0 else 1 + worker_id % 3
+        miss_loss = 0 if calls_per_worker == 0 else 1 + worker_id % 2
         shadow_requests = primary_requests - request_loss
         shadow_misses = primary_misses - miss_loss
         record: dict[str, Any] = {
@@ -236,8 +245,9 @@ def _submit_pmu_capture(offset: int = 0, phase: str = "claim") -> dict[str, Any]
             "window_stopped": True,
             "build_variant_id": 2,
             "compiled_phase_id": phase_id,
-            "phase_status": PHASE_STATUS_REQUIRED_MASK | (0x30 if phase == "none" else 0),
+            "phase_status": PHASE_STATUS_REQUIRED_MASK | (0x30 if calls_per_worker == 0 else 0),
             "phase_calls": calls_per_worker,
+            "phase_expected_calls": calls_per_worker,
             "phase_begin_reads": calls_per_worker,
             "phase_end_reads": calls_per_worker,
             "primary_window_segments": 1,
@@ -256,6 +266,8 @@ def _submit_pmu_capture(offset: int = 0, phase: str = "claim") -> dict[str, Any]
         }
         for metric_index, metric in enumerate(SUBMIT_PMU_METRIC_NAMES):
             record.setdefault(metric, base + metric_index)
+        # total 是同一窗口的包络，fixture 也必须满足 scalar_busy <= total_cycles。
+        record["total_cycles"] = base + len(SUBMIT_PMU_METRIC_NAMES)
         record["icache_requests"] = primary_requests
         record["icache_misses"] = primary_misses
         # setdefault 不覆盖上面按 phase 契约填写的五个扩展字段。
@@ -269,6 +281,12 @@ def _submit_pmu_capture(offset: int = 0, phase: str = "claim") -> dict[str, Any]
     workers = len(records)
     exact_records = sum(record["shadow_matches_primary"] for record in records)
     bounded_records = sum(record["shadow_not_greater_than_primary"] for record in records)
+    acceptable_records = sum(
+        record["shadow_matches_primary"]
+        if record["phase_expected_calls"] == 0
+        else record["shadow_not_greater_than_primary"]
+        for record in records
+    )
     request_losses = [record["shadow_request_loss"] for record in records]
     miss_losses = [record["shadow_miss_loss"] for record in records]
     return {
@@ -346,6 +364,7 @@ def _submit_pmu_capture(offset: int = 0, phase: str = "claim") -> dict[str, Any]
             "phase_status_trusted_records": workers,
             "shadow_primary_match_records": exact_records,
             "shadow_primary_bounded_records": bounded_records,
+            "phase_shadow_acceptable_records": acceptable_records,
             "shadow_request_abs_delta_sum": sum(request_losses),
             "shadow_request_abs_delta_max": max(request_losses),
             "shadow_request_signed_delta_sum": -sum(request_losses),
@@ -354,7 +373,8 @@ def _submit_pmu_capture(offset: int = 0, phase: str = "claim") -> dict[str, Any]
             "shadow_miss_signed_delta_sum": -sum(miss_losses),
             "phase_boundary_match_records": workers,
             "phase_call_shape_match_records": workers,
-            "phase_calls": workers * calls_per_worker,
+            "phase_calls": sum(record["phase_calls"] for record in records),
+            "phase_expected_calls": sum(record["phase_expected_calls"] for record in records),
             "expected_records": A5_WORKERS,
             "expected_unique_core_ids": A5_WORKERS,
             "expected_owner_bitmap_member_records": A5_WORKERS,
@@ -546,6 +566,24 @@ class PmuSidecarAnalyzerTest(unittest.TestCase):
                     group["phase_icache_misses_lower_bound_per_core_p95"],
                     group["phase_icache_misses_upper_bound_per_core_p95"],
                 )
+                self.assertEqual(
+                    group["phase_icache_request_lower_bound_share_of_submit"],
+                    group["phase_icache_requests_lower_bound_sum"]
+                    / group["icache_requests_sum"],
+                )
+                self.assertEqual(
+                    group["phase_icache_request_upper_bound_share_of_submit"],
+                    group["phase_icache_requests_upper_bound_sum"]
+                    / group["icache_requests_sum"],
+                )
+                self.assertEqual(
+                    group["phase_icache_miss_lower_bound_share_of_submit"],
+                    group["phase_icache_misses_lower_bound_sum"] / group["icache_misses_sum"],
+                )
+                self.assertEqual(
+                    group["phase_icache_miss_upper_bound_share_of_submit"],
+                    group["phase_icache_misses_upper_bound_sum"] / group["icache_misses_sum"],
+                )
         self.assertLess(
             _submit_pmu_capture()["validation"]["shadow_request_signed_delta_sum"], 0
         )
@@ -562,6 +600,9 @@ class PmuSidecarAnalyzerTest(unittest.TestCase):
         self.assertIsNone(phase["phase_observed_read_clear_ratio"]["median"])
         self.assertEqual(
             phase["phase_icache_miss_lower_bound_share_of_submit"]["median"], 0
+        )
+        self.assertEqual(
+            phase["phase_icache_miss_upper_bound_share_of_submit"]["median"], 0
         )
         self.assertEqual(
             phase["phase_icache_requests_lower_bound_per_core"]["median"],
@@ -686,7 +727,7 @@ class PmuSidecarAnalyzerTest(unittest.TestCase):
                 load_capture(path)
 
     def test_submit_pmu_fixed_phase_calls_are_exact_per_worker(self) -> None:
-        for phase in ("claim", "efdrain"):
+        for phase in ("claim", "efdrain", "materialize", "register"):
             with self.subTest(phase=phase):
                 capture = _submit_pmu_capture(phase=phase)
                 first = capture["records"][0]
@@ -737,7 +778,7 @@ class PmuSidecarAnalyzerTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             path = self._write(directory, "none-nonzero-phase.json", capture)
-            with self.assertRaisesRegex(ValueError, "phase=none must have zero"):
+            with self.assertRaisesRegex(ValueError, "zero calls must have zero"):
                 load_capture(path)
 
     def test_submit_pmu_shadow_greater_than_primary_is_rejected_from_raw(self) -> None:
@@ -748,6 +789,21 @@ class PmuSidecarAnalyzerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = self._write(directory, "shadow-greater-than-primary.json", capture)
             with self.assertRaisesRegex(ValueError, "shadow whole exceeds"):
+                load_capture(path)
+
+    def test_submit_pmu_shadow_miss_greater_than_request_is_rejected(self) -> None:
+        capture = _submit_pmu_capture()
+        record = capture["records"][0]
+        record["shadow_whole_icache_requests"] = record["shadow_whole_icache_misses"] - 1
+        records = capture["records"]
+        capture["summary"] = {
+            "all": _submit_pmu_summary(records),
+            "aic": _submit_pmu_summary(records[:A5_AIC_WORKERS]),
+            "aiv": _submit_pmu_summary(records[A5_AIC_WORKERS:]),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, "shadow-miss-greater-than-request.json", capture)
+            with self.assertRaisesRegex(ValueError, "shadow I-cache miss > request"):
                 load_capture(path)
 
     def test_submit_pmu_shadow_booleans_loss_and_upper_are_recomputed(self) -> None:
@@ -866,6 +922,20 @@ class PmuSidecarAnalyzerTest(unittest.TestCase):
                 load_capture(path)
 
         capture = _submit_pmu_capture()
+        capture["configuration"]["selectors"]["cnt2_scalar_busy"] = 0xDEAD
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, "bad-scalar-selector.json", capture)
+            with self.assertRaisesRegex(ValueError, "cnt2_scalar_busy"):
+                load_capture(path)
+
+        capture = _submit_pmu_capture()
+        capture["configuration"]["counter_width_bits"]["programmable"] = 64
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, "bad-programmable-counter-width.json", capture)
+            with self.assertRaisesRegex(ValueError, "programmable must be 32"):
+                load_capture(path)
+
+        capture = _submit_pmu_capture()
         capture["validation"]["phase_boundary_match_records"] -= 1
         with tempfile.TemporaryDirectory() as directory:
             path = self._write(directory, "bad-host-phase-gate.json", capture)
@@ -879,6 +949,74 @@ class PmuSidecarAnalyzerTest(unittest.TestCase):
             with self.assertRaisesRegex(
                 ValueError, "phase_call_shape_match_records is incomplete"
             ):
+                load_capture(path)
+
+    def test_submit_pmu_rejects_retired_phase_id_three(self) -> None:
+        capture = _submit_pmu_capture()
+        capture["configuration"]["compiled_phase"] = "wait-for-slot"
+        capture["configuration"]["compiled_phase_id"] = 3
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, "retired-phase-id-three.json", capture)
+            with self.assertRaisesRegex(ValueError, "unsupported configuration.compiled_phase"):
+                load_capture(path)
+
+    def test_submit_pmu_rejects_scalar_busy_above_total(self) -> None:
+        capture = _submit_pmu_capture()
+        capture["records"][0]["scalar_busy"] = capture["records"][0]["total_cycles"] + 1
+        records = capture["records"]
+        capture["summary"] = {
+            "all": _submit_pmu_summary(records),
+            "aic": _submit_pmu_summary(records[:A5_AIC_WORKERS]),
+            "aiv": _submit_pmu_summary(records[A5_AIC_WORKERS:]),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, "scalar-busy-above-total.json", capture)
+            with self.assertRaisesRegex(ValueError, "scalar_busy > total_cycles"):
+                load_capture(path)
+
+    def test_submit_pmu_rejects_zero_total_cycles(self) -> None:
+        capture = _submit_pmu_capture()
+        capture["records"][0]["total_cycles"] = 0
+        capture["records"][0]["scalar_busy"] = 0
+        records = capture["records"]
+        capture["summary"] = {
+            "all": _submit_pmu_summary(records),
+            "aic": _submit_pmu_summary(records[:A5_AIC_WORKERS]),
+            "aiv": _submit_pmu_summary(records[A5_AIC_WORKERS:]),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, "zero-total-cycles.json", capture)
+            with self.assertRaisesRegex(ValueError, "zero total_cycles"):
+                load_capture(path)
+
+    def test_submit_pmu_recomputes_programmable_counter_risk_threshold(self) -> None:
+        capture = _submit_pmu_capture()
+        capture["records"][0]["vector_busy"] = PROGRAMMABLE_COUNTER_RISK_THRESHOLD
+        records = capture["records"]
+        capture["summary"] = {
+            "all": _submit_pmu_summary(records),
+            "aic": _submit_pmu_summary(records[:A5_AIC_WORKERS]),
+            "aiv": _submit_pmu_summary(records[A5_AIC_WORKERS:]),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, "counter-risk-threshold.json", capture)
+            with self.assertRaisesRegex(ValueError, "32-bit counter risk threshold"):
+                load_capture(path)
+
+    def test_integer_summary_fields_require_exact_equality(self) -> None:
+        capture = _submit_pmu_capture()
+        for worker_id, record in enumerate(capture["records"]):
+            record["total_cycles"] = 10**12 + worker_id
+        records = capture["records"]
+        capture["summary"] = {
+            "all": _submit_pmu_summary(records),
+            "aic": _submit_pmu_summary(records[:A5_AIC_WORKERS]),
+            "aiv": _submit_pmu_summary(records[A5_AIC_WORKERS:]),
+        }
+        capture["summary"]["all"]["total_cycles"]["sum"] += 1
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, "inexact-large-integer-summary.json", capture)
+            with self.assertRaisesRegex(ValueError, "all.total_cycles.sum"):
                 load_capture(path)
 
     def test_submit_pmu_phase_counter_order_is_rechecked(self) -> None:

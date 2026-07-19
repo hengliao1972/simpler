@@ -41,27 +41,29 @@ atomic wrapper、ClockBaseline、runtime phase-profile 和旧 cold/warm 冲刷�
 两份证据可以按同一源码版本交叉理解，不能做逐 tick 对齐，也不能
 把 PMU 的平均 miss 回填为某一条 atomic span 的属性。
 
-## 3. `none` 与 `claim` 如何选择
+## 3. `none` 与局部 phase 如何选择
 
-当前已验证三个编译期 phase：
+当前正式支持五个编译期 phase：
 
 | phase | 边界 | 优先用途 |
 | --- | --- | --- |
 | `none` | 完整 Submit 中不读局部 shadow counter | 回答完整 Submit 的 AIC/AIV 每核 request/miss；这是默认选择 |
 | `claim` | 每次 `Claim()` 调用前后读局部 shadow counter | 当 `none` 已证明 miss 值得追踪时，试验 Claim 的 running read-clear 下界/上界归因链路 |
 | `efdrain` | 每次 Submit 开头唯一的 `DrainReady(...EfDrain...)` 前后 | 观察 opportunistic drain；不混入 RingBackpressure 或 FinalDrain |
+| `materialize` | 每次 `MaterializeTask()` 调用前后 | 观察输出 descriptor/layout、本地 register mask、输出字节数和 heap 游标等 scalar 工作；不包含后续 slot payload 拷贝 |
+| `register` | Alloc/non-Alloc 两个互斥的 `RegisterOutputs()` 调用点前后 | 观察输出注册；边界与普通泳道的 Register span 对齐 |
 
-`claim` 的 begin/end 读取本身会执行 scalar 指令、占用取指并改变多核
+running phase 的 begin/end 读取本身会执行 scalar 指令、占用取指并改变多核
 时序。因此：
 
-- `claim` 的 phase request/miss 是带局部边界扰动的观察值；
-- `claim` 的 raw 观察值是下界，上界为该核下界加 primary-shadow loss；
-- `none` 和 `claim` 是不同 ELF、不同进程，不能以两者相减声称得到
-  了零扰动 Claim 净值；
+- running phase 的 phase request/miss 是带局部边界扰动的观察值；
+- raw 观察值是下界，上界为该核下界加 primary-shadow loss；
+- `none` 和任一 running phase 是不同 ELF、不同进程，不能以两者相减声称
+  得到了零扰动的局部净值；
 - 未来不同 phase ELF 的局部 request/miss 不可相加成“完整 Submit”；
   完整 Submit 始终以每个 ELF 自己的 primary whole 为准。
 
-该区间只描述同一插桩 ELF、当前边界定义下的局部事件，不是无插桩 Claim
+该区间只描述同一插桩 ELF、当前边界定义下的局部事件，不是无插桩局部阶段
 的真实区间。完整 Submit `none` 没有运行中 read-clear，仍执行 96/96
 逐核严格闭合。
 
@@ -76,6 +78,7 @@ export GCC15_ROOT=/home/q00473782/.local/gcc-15/root
 export PATH="$GCC15_ROOT/usr/bin:$PATH"
 export LD_LIBRARY_PATH="$GCC15_ROOT/usr/lib/x86_64-linux-gnu:$GCC15_ROOT/usr/lib/gcc/x86_64-linux-gnu/15${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export CXX="$GCC15_ROOT/usr/bin/g++-15"
+export PYTHON=/home/q00473782/.venv/bin/python
 ```
 
 构建完整 Submit 基准：
@@ -96,12 +99,26 @@ export CXX="$GCC15_ROOT/usr/bin/g++-15"
 ./run.sh build-submit-pmu ccec efdrain
 ```
 
+需要 Materialize 局部归因时独立构建：
+
+```bash
+./run.sh build-submit-pmu ccec materialize
+```
+
+需要 Register 局部归因时独立构建：
+
+```bash
+./run.sh build-submit-pmu ccec register
+```
+
 产物分别位于：
 
 ```text
-pa_scheduler/build/ccec/submit-pmu/none/
-pa_scheduler/build/ccec/submit-pmu/claim/
-pa_scheduler/build/ccec/submit-pmu/efdrain/
+build/ccec/submit-pmu/none/
+build/ccec/submit-pmu/claim/
+build/ccec/submit-pmu/efdrain/
+build/ccec/submit-pmu/materialize/
+build/ccec/submit-pmu/register/
 ```
 
 每个 phase 目录中的 `pa_scheduler_host`、`pa_scheduler_kernel.o`、
@@ -112,10 +129,10 @@ pa_scheduler/build/ccec/submit-pmu/efdrain/
 `submit_pmu_artifacts.manifest`；`run.sh` 在启动 host 前核对 schema、phase、
 固定文件列表和四个 SHA256。
 
-`swimlane` 的 CCEC 产物仍在 `pa_scheduler/build/ccec/`，不是 PMU
+`swimlane` 的 CCEC 产物仍在 `build/ccec/`，不是 PMU
 产物。
 
-## 5. 采集完整 Submit 和 Claim
+## 5. 采集完整 Submit 与局部 phase
 
 ### 5.1 完整 Submit `none`
 
@@ -126,19 +143,22 @@ mkdir -p "$OUT"
 ./run.sh submit-pmu ccec none \
   --device 0 --batches 256 \
   --winner-workload real-compute --real-compute-counts 6,28,4,1 \
-  --pmu-json "$OUT/run1.json"
+  --pmu-json "$OUT/submit_icache_raw.json"
 ```
 
-多轮比较必须使用多个独立进程和唯一文件名：
+多轮比较必须使用多个独立进程和独立子目录；每个采集目录内部都保持
+同一组描述性文件名：
 
 ```bash
-./run.sh submit-pmu ccec none --device 0 --batches 256 \
-  --winner-workload real-compute --real-compute-counts 6,28,4,1 \
-  --pmu-json "$OUT/run2.json"
+mkdir -p "$OUT/capture_02" "$OUT/capture_03"
 
 ./run.sh submit-pmu ccec none --device 0 --batches 256 \
   --winner-workload real-compute --real-compute-counts 6,28,4,1 \
-  --pmu-json "$OUT/run3.json"
+  --pmu-json "$OUT/capture_02/submit_icache_raw.json"
+
+./run.sh submit-pmu ccec none --device 0 --batches 256 \
+  --winner-workload real-compute --real-compute-counts 6,28,4,1 \
+  --pmu-json "$OUT/capture_03/submit_icache_raw.json"
 ```
 
 ### 5.2 Claim 局部归因
@@ -150,7 +170,7 @@ mkdir -p "$OUT_CLAIM"
 ./run.sh submit-pmu ccec claim \
   --device 0 --batches 256 \
   --winner-workload real-compute --real-compute-counts 6,28,4,1 \
-  --pmu-json "$OUT_CLAIM/run1.json"
+  --pmu-json "$OUT_CLAIM/submit_icache_raw.json"
 ```
 
 ### 5.3 EfDrain 局部归因
@@ -162,12 +182,79 @@ mkdir -p "$OUT_EFDRAIN"
 ./run.sh submit-pmu ccec efdrain \
   --device 0 --batches 256 \
   --winner-workload real-compute --real-compute-counts 6,28,4,1 \
-  --pmu-json "$OUT_EFDRAIN/run1.json"
+  --pmu-json "$OUT_EFDRAIN/submit_icache_raw.json"
 ```
 
 `efdrain` 每核固定调用 `batches * 5` 次；b256 的 AIC/AIV/global calls
 分别为 40,960/81,920/122,880。插点只位于 Submit 开头的 EfDrain 专属
 call-site；复用的 `DrainReady()` 函数体不插桩。
+
+### 5.4 Materialize 局部归因
+
+先用 b1 验证边界和 96 核闭合，再跑 b256 正式负载：
+
+```bash
+OUT_MAT_B1="./outputs/submit_pmu_materialize_$(date -u +%Y%m%dT%H%M%SZ)_b1"
+OUT_MAT_B256="./outputs/submit_pmu_materialize_$(date -u +%Y%m%dT%H%M%SZ)_b256"
+mkdir -p "$OUT_MAT_B1" "$OUT_MAT_B256"
+
+./run.sh submit-pmu ccec materialize \
+  --device 0 --batches 1 \
+  --winner-workload real-compute --real-compute-counts 6,28,4,1 \
+  --pmu-json "$OUT_MAT_B1/submit_icache_raw.json"
+
+./run.sh submit-pmu ccec materialize \
+  --device 0 --batches 256 \
+  --winner-workload real-compute --real-compute-counts 6,28,4,1 \
+  --pmu-json "$OUT_MAT_B256/submit_icache_raw.json"
+```
+
+边界位于 `MaterializeTask()` 唯一调用点前后。实现必须先保存返回值、关闭
+phase，再处理失败返回，避免失败路径留下 begin/end 不平衡。每核固定
+`5 * batches` 次；b1 的 AIC/AIV/global calls 为 160/320/480，b256 为
+40,960/81,920/122,880。
+
+2026-07-19 A5 实测闭环如下；四轮均满足 capture accepted、语义、PMU 和
+phase measurement PASS：
+
+| phase | batches | calls/expected | begin/end 与 call shape | primary=shadow | shadow≤primary | request/miss loss |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `materialize` | 1 | 480/480 | 96/96 | 94/96 | 96/96 | 2/0 |
+| `materialize` | 256 | 122,880/122,880 | 96/96 | 74/96 | 96/96 | 160/8 |
+| `register` | 1 | 480/480 | 96/96 | 93/96 | 96/96 | 2/1 |
+| `register` | 256 | 122,880/122,880 | 96/96 | 36/96 | 96/96 | 2,834/654 |
+
+对应 raw/HTML 位于
+`outputs/submit_pmu_{materialize,register}_20260719_b{1,256}/`；raw 是权威
+取数件，HTML 是同目录的加工展示件。
+
+running read-clear 的硬门禁是 96/96 `shadow≤primary`，不是要求 96/96
+逐值相等；表中的 loss 已进入每核局部 lower/upper 区间，不能被静默忽略。
+
+### 5.5 Register 局部归因
+
+```bash
+OUT_REG_B1="./outputs/submit_pmu_register_$(date -u +%Y%m%dT%H%M%SZ)_b1"
+OUT_REG_B256="./outputs/submit_pmu_register_$(date -u +%Y%m%dT%H%M%SZ)_b256"
+mkdir -p "$OUT_REG_B1" "$OUT_REG_B256"
+
+./run.sh submit-pmu ccec register \
+  --device 0 --batches 1 \
+  --winner-workload real-compute --real-compute-counts 6,28,4,1 \
+  --pmu-json "$OUT_REG_B1/submit_icache_raw.json"
+
+./run.sh submit-pmu ccec register \
+  --device 0 --batches 256 \
+  --winner-workload real-compute --real-compute-counts 6,28,4,1 \
+  --pmu-json "$OUT_REG_B256/submit_icache_raw.json"
+```
+
+Register 有 Alloc 和 non-Alloc 两个互斥调用点，二者都使用同一 phase
+边界；winner/loser 均从其中一条路径通过，因此仍是每核固定
+`5 * batches`，调用规模与 Materialize 相同。该窗口与普通泳道 Register
+span 对齐；其中较短或未实际插入 map 的调用仍会放大 PMU begin/end
+边界扰动，解释结果时必须使用 lower/upper，而不能把 observed lower
+当成无扰动净开销。
 
 `submit-pmu` action 已固定：
 
@@ -177,8 +264,31 @@ call-site；复用的 `DrainReady()` 函数体不插桩。
 
 调用者不要重复传入这三项，也不能添加
 `--profile-phases`、`--trace-atomics`、`--analyze-swimlane` 或
-`--swimlane-json`。`--pmu-json` 可选；但要做 raw 复算和多轮汇总时必须
-使用它。host 拒绝覆盖已有 JSON 或同名 `.tmp`。
+`--swimlane-json`。`--pmu-json` 可选；但要做 raw 复算、HTML 可视报告和
+多轮汇总时必须使用它。host 拒绝覆盖已有 JSON 或同名 `.tmp`。
+
+raw 成功发布后，`run.sh` 会调用本目录的独立分析器并在同一目录生成：
+
+```text
+submit_icache_raw.json       # 96 核权威原始件及 host summary
+submit_icache_report.html    # 可离线浏览的加工件
+```
+
+HTML 使用内联 CSS/SVG，不访问网络，也不依赖外部前端库；浏览器直接打开即可。
+它包含完整 Submit 的 AIC/AIV 对比、逐物理核 request/miss/rate 分布、96 核
+明细和 90 ns core-equivalent 提示。报告同时展示 AIC/AIV/ALL 的 PMU raw
+`total_cycles`、CNT2 `scalar_busy`、`Σscalar/Σtotal` 以及
+“非 Scalar-busy 残余”。其中 total 是每个物理子核在 Submit gate 内的 PMU
+累计周期，96 核求和是 core-work，不是 Submit 墙钟；“非 Scalar-busy 残余”
+严格等于 `total−scalar_busy`，既不是 Scalar 空闲时间，也不是 I-cache stall，
+其中还包含同步等待、vector/cube engine 等待以及其他未归因周期。受控微基准中，依赖返回的 atomic 等待大部分进入
+scalar busy，而 I-cache refill 的额外周期大部分只进入 total；这个现象
+不能把二者之差提升为 I-cache 专属计数器。
+
+对于局部 phase，HTML 还会单列 calls、
+request/miss 下界—上界、shadow loss，以及局部事件占同一 ELF 完整 Submit
+primary 的比例区间，不把局部数据冒充可相加的精确分解。
+报告生成失败时 action 返回非零，但已成功发布的 raw 会保留用于排查。
 
 ## 6. Primary/shadow 计数和可信门禁
 
@@ -186,6 +296,8 @@ call-site；复用的 `DrainReady()` 函数体不插桩。
 
 | 计数 | selector | 用途 |
 | --- | --- | --- |
+| PMU raw total | 固定 64-bit total low/high | Submit gate 内每个物理子核的累计周期；不是 96 核求和后的墙钟 |
+| CNT2 | `0x001` | scalar instruction busy cycle；不包含全部等待周期 |
 | CNT6 | `0x34` | 完整 Submit primary I-cache request；局部边界从不读它 |
 | CNT7 | `0x35` | 完整 Submit primary I-cache miss；局部边界从不读它 |
 | CNT8 | `0x34` | read-to-clear shadow request |
@@ -196,9 +308,34 @@ A5 b1 实测已证明将 `0x35` 配置到 CNT9 时计数始终为 0，所以
 CNT9 不能作 shadow miss。这个变化只影响 `submit-pmu` 诊断构建，
 不影响 `swimlane` 构建。
 
-shadow PMU counter 是 read-to-clear。`claim` 在阶段 begin 读取 CNT8/CNT5，将
+#### A5 `scalar_wait_ib_time` 的支持边界
+
+2026-07-19 使用本机 CANN 9.1 在同一 A5/DAV3510 上对 standalone b1 依次验证了
+`PipeUtilization`、`PipeUtilization,MemoryDetail` 和 `Default` 三种正式
+`msopprof` 采集入口。三次均能生成 `PipeUtilization.csv`，但表头都不包含
+`aic/aiv_scalar_wait_ib_time`，也不包含 `aic/aiv_scalar_wait_time`。本机 CANN
+9.1 `CHIP_V6_MAP` 与本仓 DAV3510 正式事件表同样只给出已使用的
+`scalar_busy(0x001)`、I-cache request `0x34`、I-cache miss `0x35` 等事件，
+没有 wait-IB/wait 的 selector 或派生公式。
+
+三次原始证据分别保存在：
+
+```text
+outputs/wait_ib_official_msopprof_20260719_b1_probe2/
+outputs/wait_ib_official_msopprof_20260719_b1_probe3_memory_detail/
+outputs/wait_ib_official_msopprof_20260719_b1_probe4_default/
+```
+
+因此当前 A5 正式可编程路径的结论是：**不能采集这两个指标**。CANN 共享
+`msopprof` 二进制包含相应字段字符串、官方文档也在 A2/A3 产品章节解释其
+含义，但这些证据不能推出 DAV3510 selector。不得把旧架构或其他产品的事件号
+套到 A5。若后续 CANN/A5 正式事件表新增这两项，必须重新用 scalar NOP、
+I-cache warm/cold、真实 Vector/Cube `PIPE_* -> PIPE_S` wait 和依赖 atomic
+四组对照校准后再纳入报告。
+
+shadow PMU counter 是 read-to-clear。任一 running phase 在阶段 begin 读取 CNT8/CNT5，将
 之前的片段加入 shadow whole；在 end 再读一次，同时加入 shadow
-whole 和 Claim phase；完整 Submit stop 后读 tail。`none` 不做中途读取，
+whole 和所选 phase；完整 Submit stop 后读 tail。`none` 不做中途读取，
 只在 stop 后取 tail。
 
 `none` 对每个物理子核必须精确满足：
@@ -212,7 +349,7 @@ shadow_whole_icache_misses   == icache_misses
 这个 96/96 精确相等门禁验证完整 Submit 观察闭合；它不把 PMU 进程的
 Submit span 变成无诊断墙钟基线，也不把 standalone 数据冒充真实 PA profile。
 
-运行中切片的 `claim` 已在 A5 b1/b256 上证明可能发生单向少计，接受规则为：
+运行中切片已在 A5 b1/b256 上证明可能发生单向少计，接受规则为：
 
 ```text
 shadow_request <= primary_request
@@ -252,10 +389,12 @@ CNT8/CNT5 是顺序 `ld_dev`，不是同一时刻的原子配对快照，因此�
 - running phase 的 shadow whole 逐核不大于 primary，loss 与 upper-bound
   公式逐核闭合；exact 核数只作诊断；
 - `none` 的 phase calls/begin/end/request/miss 全部为 0；
-- `claim` 的 begin/end/calls 逐核平衡，每核 calls 为 `batches * 5`，
-  全局 calls 为 `batches * 5 * 96`；
-- `efdrain` 与 `claim` 具有相同的每核固定 calls 形状，但边界必须只覆盖
-  Submit 开头的 EfDrain call-site；
+- `claim`、`efdrain`、`materialize`、`register` 的 begin/end/calls 逐核
+  平衡，每核 calls 为 `batches * 5`，全局 calls 为
+  `batches * 5 * 96`；
+- 四个 running phase 必须分别命中自己的边界：Claim 调用、Submit 开头
+  EfDrain 专属 call-site、Materialize 唯一调用点，以及 Alloc/non-Alloc
+  两个互斥 Register 调用点；
 - phase request/miss 分别不超过对应 shadow/primary，且可编程 counter
   低于当前 25% 保守风险阈值。
 
@@ -275,6 +414,13 @@ sum / mean / median / p95 / max
 
 完整 Submit 优先查看：
 
+- `configuration.submit_span_us`：本轮从第一个 Submit 进入到最后一个
+  Submit 返回的整体 span；HTML 顶部换算成毫秒展示；
+- `total_cycles`：每核 Submit gate 内的 64-bit PMU raw total；按角色的
+  sum 是 core-work，mean/median/p95 才适合比较典型单核，均不等于 host
+  看到的 Submit 墙钟；
+- `scalar_busy`：CNT2 `scalar_instr_busy(0x001)`，表示 scalar instruction
+  busy cycle；依赖返回的 atomic 等待可进入此项，但它不是“纯算术指令数”；
 - `icache_requests` / `icache_misses`：CNT6/CNT7 primary whole；
 - `shadow_whole_icache_requests` / `shadow_whole_icache_misses`：闭合或分段
   loss 用 shadow whole；
@@ -289,12 +435,29 @@ sum / mean / median / p95 / max
 - `configuration.phase_values_are_running_read_clear_lower_bounds`：确认局部字段
   是否采用下界语义。
 
+HTML 中展示的“非 Scalar-busy 残余/core”严格等于
+`(total−scalar_busy)/core`，只用于观察未被 scalar busy 覆盖周期的数量级。
+它可能同时包含 I-cache refill、同步等待、vector/cube engine 等待和其他
+流水空隙，不能命名为 Scalar 空闲或 I-cache stall，也不能用它反推单次 miss
+代价。
+
+离线分析器与 HTML 会从这些 raw 字段继续派生
+`phase_icache_request_lower_bound_share_of_submit`、
+`phase_icache_request_upper_bound_share_of_submit`、
+`phase_icache_miss_lower_bound_share_of_submit` 和
+`phase_icache_miss_upper_bound_share_of_submit`：局部 lower/upper 分别除以
+同一角色、同一次采集的完整 Submit primary 总数。
+
 `phase_observed_read_clear_ratio` 只是 lower miss/lower request 的观测比值；
 分子和分母各有独立区间，因此它不是实际 phase miss rate 的数学下界。
 
 每核平均值按角色求：
 
 ```text
+AIC PMU total/core = summary.aic.total_cycles.sum / 32
+AIC scalar/core    = summary.aic.scalar_busy.sum / 32
+AIV PMU total/core = summary.aiv.total_cycles.sum / 64
+AIV scalar/core    = summary.aiv.scalar_busy.sum / 64
 AIC request/core = summary.aic.icache_requests.sum / 32
 AIC miss/core    = summary.aic.icache_misses.sum / 32
 AIV request/core = summary.aiv.icache_requests.sum / 64
@@ -312,7 +475,33 @@ AIV miss rate = Σ(AIV miss) / Σ(AIV request)
 不平均 32 或 64 个逐核百分比。AIC/AIV 核数不同，比较每核强度时
 使用 mean/median/p95 或 miss rate，不直接比较两组 sum。
 
-## 8. 分析命令与结果文件
+局部 phase 占完整 Submit 的比例同样使用组内总量：
+
+```text
+request share lower = Σphase_request_lower / Σprimary_request
+request share upper = Σphase_request_upper / Σprimary_request
+miss share lower    = Σphase_miss_lower / Σprimary_miss
+miss share upper    = Σphase_miss_upper / Σprimary_miss
+```
+
+分子与分母必须来自同一个 phase ELF、同一轮采集和同一角色。该比例回答“当前
+插桩 ELF 中局部窗口占自身完整 Submit 事件的多少”，不能拿 `claim` 分子除以
+另一份 `none` 的分母。
+
+## 8. HTML 报告与多轮分析命令
+
+单份 raw 的 HTML 已由 `submit-pmu` action 自动生成。需要手工重建时：
+
+```bash
+PYTHON=/home/q00473782/.venv/bin/python
+
+"$PYTHON" ./pmu_html_report.py \
+  "$OUT/submit_icache_raw.json"
+```
+
+默认输出为同目录的 `submit_icache_report.html`；也可用 `-o` 指定路径。
+生成器先调用 `pmu_sidecar_analyzer.py` 的完整 raw 门禁，只有 96 核拓扑、
+raw→summary、primary/shadow、采集接受状态和 owner Restore 全部通过才发布 HTML。
 
 使用本用户 Python 环境从 raw 重算 host summary，并聚合相同配置的
 多个独立进程：
@@ -321,20 +510,20 @@ AIV miss rate = Σ(AIV miss) / Σ(AIV request)
 PYTHON=/home/q00473782/.venv/bin/python
 
 "$PYTHON" ./pmu_sidecar_analyzer.py \
-  "$OUT/run1.json" "$OUT/run2.json" "$OUT/run3.json"
+  "$OUT/submit_icache_raw.json" "$OUT"/capture_*/submit_icache_raw.json
 ```
 
 需要机器可读汇总时：
 
 ```bash
 "$PYTHON" ./pmu_sidecar_analyzer.py --json \
-  "$OUT/run1.json" "$OUT/run2.json" "$OUT/run3.json" \
+  "$OUT/submit_icache_raw.json" "$OUT"/capture_*/submit_icache_raw.json \
   > "$OUT/summary.json"
 ```
 
 分析器会先逐份复算 96 条 raw 与 host summary，然后拒绝聚合下列混用：
 
-- `none` 与 `claim`；
+- 任意不同 phase，例如 `none` 与 `claim`，或 `materialize` 与 `register`；
 - 不同 schema/build variant；
 - 不同 batches、winner mode/count/pattern、selector 或观察开关。
 
@@ -369,12 +558,38 @@ core-work 等效总量，不是端到端 Submit 总损失。要测真正暴露�
 3. 只有第 2 项是实际暴露的墙钟收益；第 1 项用于证明收益与 I-cache
    变化同时出现，`90 ns` 仅提供一阶数量级解释。
 
+### 9.1 当前 b256 `none` 参考数据
+
+2026-07-19 用最终 `submit-pmu none` ELF、`real-compute/6,28,4,1`
+在 A5 上采集一轮，完整 Submit span 为 `4.750810 ms`。96 核 raw、owner
+Restore、selector、counter 阈值和离线复算全部通过。
+
+| 指标 | AIC（32 核） | AIV（64 核） |
+| --- | ---: | ---: |
+| request/core | 408,317.344 | 422,480.609 |
+| miss/core | 38,664.344 | 55,098.625 |
+| `Σmiss/Σrequest` | 9.4692% | 13.0417% |
+| total/core | 7,471,385.531 | 7,085,178.734 |
+| scalar busy/core | 5,944,751.250 | 5,603,587.469 |
+| `Σscalar/Σtotal` | 79.5669% | 79.0889% |
+| 非 Scalar-busy 残余/core | 1,526,634.281 | 1,481,591.266 |
+| `miss/core × 90 ns` | 3,479.791 us | 4,958.876 us |
+
+最后一行只是单核串行等效标尺，不能与 `4.750810 ms` 相减或解释成
+端到端损失；非 Scalar-busy 残余也不是空闲或 I-cache stall。原始件和
+自包含报告位于：
+
+```text
+outputs/submit_pmu_none_20260719_b256_final/submit_icache_raw.json
+outputs/submit_pmu_none_20260719_b256_final/submit_icache_report.html
+```
+
 ## 10. 新增局部 phase 的修改清单
 
 新 phase 不能只增加一个 CLI 字符串。最小完整修改包括：
 
 1. `pa_scheduler/common/pa_model.h`：在 `SubmitPmuPhase` 尾部追加稳定
-   id，不重排已有 `None=0/Claim=1/EfDrain=2`。
+   id，不重排已有 `None=0/Claim=1/EfDrain=2/Materialize=4/Register=5`。
 2. `pa_scheduler/ccec/pmu_probe.h`：为 `SubmitPmuPhaseName()` 增加名称映射，
    并核对 phase status/边界闭合定义。
 3. `pa_scheduler/ccec/build.sh`：在白名单中将 phase 名映射到稳定

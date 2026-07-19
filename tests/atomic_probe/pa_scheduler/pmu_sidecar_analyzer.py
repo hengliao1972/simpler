@@ -59,7 +59,15 @@ SUBMIT_PMU_METRIC_NAMES = (
 SUMMARY_FIELDS = ("sum", "mean", "median", "p95", "max")
 SUBMIT_PMU_BUILD_VARIANT = "submit-pmu"
 SUBMIT_PMU_BUILD_VARIANT_ID = 2
-SUBMIT_PMU_PHASE_IDS = {"none": 0, "claim": 1, "efdrain": 2}
+PROGRAMMABLE_COUNTER_BITS = 32
+PROGRAMMABLE_COUNTER_RISK_THRESHOLD = (1 << PROGRAMMABLE_COUNTER_BITS) // 4
+SUBMIT_PMU_PHASE_IDS = {
+    "none": 0,
+    "claim": 1,
+    "efdrain": 2,
+    "materialize": 4,
+    "register": 5,
+}
 TASKS_PER_BATCH = 5
 PHASE_STATUS_REQUIRED_MASK = 0x3CF
 
@@ -132,6 +140,7 @@ class PhasePartitionEvidence:
     request_signed_delta: int
     miss_abs_delta: int
     miss_signed_delta: int
+    expected_calls: int
 
 
 def _require(condition: bool, message: str) -> None:
@@ -216,6 +225,10 @@ def _validate_group_summary(
         expected.get("trusted_cores") == len(records),
         f"{path}: summary.{group_name}.trusted_cores is incomplete",
     )
+    _require(
+        expected.get("active_cores") == len(records),
+        f"{path}: summary.{group_name}.active_cores is incomplete",
+    )
 
     for metric in metric_names:
         values = [
@@ -229,8 +242,15 @@ def _validate_group_summary(
             f"{path}: summary.{group_name}.{metric} must be an object",
         )
         for field in SUMMARY_FIELDS:
+            if field in ("sum", "p95", "max"):
+                reported_value = _integer(
+                    reported.get(field), f"{path}: summary.{group_name}.{metric}.{field}"
+                )
+                matches = reported_value == actual[field]
+            else:
+                matches = _same_number(actual[field], reported.get(field))
             _require(
-                _same_number(actual[field], reported.get(field)),
+                matches,
                 f"{path}: raw summary mismatch at {group_name}.{metric}.{field}: "
                 f"raw={actual[field]!r} json={reported.get(field)!r}",
             )
@@ -314,6 +334,25 @@ def _validate_submit_pmu_configuration(path: Path, configuration: dict[str, Any]
         f"{path}: configuration.unavailable_metrics must identify mte3_busy",
     )
 
+    counter_widths = configuration.get("counter_width_bits")
+    _require(
+        isinstance(counter_widths, dict),
+        f"{path}: configuration.counter_width_bits must be an object",
+    )
+    _require(
+        _integer(counter_widths.get("total"), f"{path}: configuration.counter_width_bits.total")
+        == 64,
+        f"{path}: configuration.counter_width_bits.total must be 64",
+    )
+    _require(
+        _integer(
+            counter_widths.get("programmable"),
+            f"{path}: configuration.counter_width_bits.programmable",
+        )
+        == PROGRAMMABLE_COUNTER_BITS,
+        f"{path}: configuration.counter_width_bits.programmable must be 32",
+    )
+
     for field in (
         "trace_enabled",
         "trace_atomics",
@@ -352,6 +391,11 @@ def _validate_submit_pmu_configuration(path: Path, configuration: dict[str, Any]
     selectors = configuration.get("selectors")
     _require(isinstance(selectors, dict), f"{path}: configuration.selectors must be an object")
     expected_selectors = {
+        "cnt0_vector_busy": 0x501,
+        "cnt1_cube_busy": 0x301,
+        "cnt2_scalar_busy": 0x001,
+        "cnt3_mte1_busy": 0x701,
+        "cnt4_mte2_busy": 0x202,
         "cnt6_primary_icache_request": 0x034,
         "cnt7_primary_icache_miss": 0x035,
         "cnt5_shadow_icache_miss": 0x035,
@@ -527,6 +571,12 @@ def _validate_submit_pmu_owner(
     return configured_ids
 
 
+def _expected_submit_pmu_phase_calls(phase_name: str, batches: int) -> int:
+    """当前 running phase 都覆盖每核每次 Submit，调用次数固定为 5B。"""
+
+    return 0 if phase_name == "none" else batches * TASKS_PER_BATCH
+
+
 def _validate_submit_pmu_record(
     path: Path,
     index: int,
@@ -535,7 +585,7 @@ def _validate_submit_pmu_record(
     phase_id: int,
     batches: int,
 ) -> PhasePartitionEvidence:
-    """重验 raw phase 分区；claim 只形成 read-to-clear 的上下界。"""
+    """重验 raw phase 分区；运行中 read-clear 只形成上下界。"""
 
     prefix = f"{path}: records[{index}]"
     _require(
@@ -552,6 +602,13 @@ def _validate_submit_pmu_record(
         (phase_status & PHASE_STATUS_REQUIRED_MASK) == PHASE_STATUS_REQUIRED_MASK,
         f"{prefix} phase_status is incomplete",
     )
+    expected_calls = _expected_submit_pmu_phase_calls(phase_name, batches)
+    if "phase_expected_calls" in record:
+        _require(
+            _integer(record.get("phase_expected_calls"), f"{prefix}.phase_expected_calls")
+            == expected_calls,
+            f"{prefix}.phase_expected_calls disagrees with the fixed phase contract",
+        )
 
     primary_requests = _integer(record.get("icache_requests"), f"{prefix}.icache_requests")
     primary_misses = _integer(record.get("icache_misses"), f"{prefix}.icache_misses")
@@ -564,6 +621,10 @@ def _validate_submit_pmu_record(
     shadow_exact = shadow_requests == primary_requests and shadow_misses == primary_misses
     shadow_bounded = shadow_requests <= primary_requests and shadow_misses <= primary_misses
     _require(
+        shadow_misses <= shadow_requests,
+        f"{prefix} has shadow I-cache miss > request",
+    )
+    _require(
         record.get("shadow_matches_primary") is shadow_exact,
         f"{prefix}.shadow_matches_primary disagrees with raw counters",
     )
@@ -573,7 +634,10 @@ def _validate_submit_pmu_record(
     )
     _require(shadow_bounded, f"{prefix} shadow whole exceeds the authoritative primary whole")
     if phase_name == "none":
-        _require(shadow_exact, f"{prefix} phase=none requires shadow whole to equal primary")
+        _require(
+            shadow_exact,
+            f"{prefix} a phase with zero local calls requires shadow whole to equal primary",
+        )
 
     request_loss = primary_requests - shadow_requests
     miss_loss = primary_misses - shadow_misses
@@ -641,20 +705,15 @@ def _validate_submit_pmu_record(
         f"{prefix} phase upper bound exceeds the authoritative primary whole",
     )
 
-    expected_calls = (
-        0 if phase_name == "none"
-        else batches * TASKS_PER_BATCH if phase_name in ("claim", "efdrain")
-        else -1
-    )
     _require(calls == expected_calls, f"{prefix} phase_calls does not match the phase contract")
-    if phase_name == "none":
+    if expected_calls == 0:
         _require(
             phase_requests == 0 and phase_misses == 0,
-            f"{prefix} phase=none must have zero phase counters",
+            f"{prefix} a phase with zero calls must have zero phase counters",
         )
         _require(
             phase_request_upper == phase_requests and phase_miss_upper == phase_misses,
-            f"{prefix} phase=none lower and upper bounds must be equal",
+            f"{prefix} a phase with zero calls must have zero-width bounds",
         )
 
     return PhasePartitionEvidence(
@@ -664,6 +723,7 @@ def _validate_submit_pmu_record(
         request_signed_delta=shadow_requests - primary_requests,
         miss_abs_delta=abs(shadow_misses - primary_misses),
         miss_signed_delta=shadow_misses - primary_misses,
+        expected_calls=expected_calls,
     )
 
 
@@ -710,6 +770,27 @@ def load_capture(path: Path) -> Capture:
             f"{path}: schema-v4 requires the fixed 96/32/64 A5 topology",
         )
         phase_name, phase_id = _validate_submit_pmu_configuration(path, configuration)
+    else:
+        counter_widths = configuration.get("counter_width_bits")
+        _require(
+            isinstance(counter_widths, dict),
+            f"{path}: configuration.counter_width_bits must be an object",
+        )
+        _require(
+            _integer(
+                counter_widths.get("total"), f"{path}: configuration.counter_width_bits.total"
+            )
+            == 64,
+            f"{path}: configuration.counter_width_bits.total must be 64",
+        )
+        _require(
+            _integer(
+                counter_widths.get("programmable"),
+                f"{path}: configuration.counter_width_bits.programmable",
+            )
+            == PROGRAMMABLE_COUNTER_BITS,
+            f"{path}: configuration.counter_width_bits.programmable must be 32",
+        )
 
     # JSON 只有在运行、PMU、owner Restore 和 runtime cleanup 全部成功后才应发布。
     # 分析器仍逐项重验，防止手工复制或未来 schema 退化绕过发布门禁。
@@ -775,14 +856,6 @@ def load_capture(path: Path) -> Capture:
                 validation.get(field) == workers,
                 f"{path}: validation.{field} is incomplete",
             )
-        expected_phase_calls = (
-            0 if phase_name == "none" else workers * batches * TASKS_PER_BATCH
-        )
-        _require(
-            validation.get("phase_calls") == expected_phase_calls,
-            f"{path}: validation.phase_calls does not match the compiled phase contract",
-        )
-
     groups: dict[str, list[dict[str, Any]]] = {
         "all": records,
         "aic": [record for record in records if record.get("role") == "aic"],
@@ -859,7 +932,41 @@ def load_capture(path: Path) -> Capture:
         misses = _integer(
             record.get("icache_misses"), f"{path}: records[{index}].icache_misses"
         )
+        total_cycles = _integer(
+            record.get("total_cycles"), f"{path}: records[{index}].total_cycles"
+        )
+        scalar_busy = _integer(
+            record.get("scalar_busy"), f"{path}: records[{index}].scalar_busy"
+        )
         _require(misses <= requests, f"{path}: records[{index}] has miss > request")
+        _require(total_cycles > 0, f"{path}: records[{index}] has zero total_cycles")
+        _require(
+            scalar_busy <= total_cycles,
+            f"{path}: records[{index}] has scalar_busy > total_cycles",
+        )
+        programmable_fields = (
+            (
+                "vector_busy",
+                "cube_busy",
+                "scalar_busy",
+                "mte1_busy",
+                "mte2_busy",
+                "icache_requests",
+                "icache_misses",
+                "phase_icache_requests",
+                "phase_icache_misses",
+                "shadow_whole_icache_requests",
+                "shadow_whole_icache_misses",
+            )
+            if schema_version == 4
+            else tuple(metric for metric in METRIC_NAMES if metric != "total_cycles")
+        )
+        for field in programmable_fields:
+            value = _integer(record.get(field), f"{path}: records[{index}].{field}")
+            _require(
+                value < PROGRAMMABLE_COUNTER_RISK_THRESHOLD,
+                f"{path}: records[{index}].{field} reaches the 32-bit counter risk threshold",
+            )
         if schema_version == 4:
             # 上面的 configuration 校验已保证二者不是 None；显式 assert 只帮助
             # 类型收窄，不替代任何 JSON 运行时门禁。
@@ -886,15 +993,47 @@ def load_capture(path: Path) -> Capture:
 
         shadow_exact_records = sum(item.shadow_exact for item in phase_partition_evidence)
         shadow_bounded_records = sum(item.shadow_bounded for item in phase_partition_evidence)
+        phase_shadow_acceptable_records = sum(
+            item.shadow_exact if item.expected_calls == 0 else item.shadow_bounded
+            for item in phase_partition_evidence
+        )
+        expected_phase_calls = sum(item.expected_calls for item in phase_partition_evidence)
         _require(
             shadow_bounded_records == A5_WORKERS,
             f"{path}: not all shadow partitions are bounded by primary",
+        )
+        _require(
+            phase_shadow_acceptable_records == A5_WORKERS,
+            f"{path}: zero-call phase records are not exact or active records are unbounded",
         )
         assert phase_name is not None
         if phase_name == "none":
             _require(
                 shadow_exact_records == A5_WORKERS,
                 f"{path}: phase=none requires all shadow partitions to be exact",
+            )
+        _require(
+            _integer(validation.get("phase_calls"), f"{path}: validation.phase_calls")
+            == expected_phase_calls,
+            f"{path}: validation.phase_calls does not match raw per-worker contracts",
+        )
+        if "phase_expected_calls" in validation:
+            _require(
+                _integer(
+                    validation.get("phase_expected_calls"),
+                    f"{path}: validation.phase_expected_calls",
+                )
+                == expected_phase_calls,
+                f"{path}: validation.phase_expected_calls disagrees with raw evidence",
+            )
+        if "phase_shadow_acceptable_records" in validation:
+            _require(
+                _integer(
+                    validation.get("phase_shadow_acceptable_records"),
+                    f"{path}: validation.phase_shadow_acceptable_records",
+                )
+                == phase_shadow_acceptable_records,
+                f"{path}: validation.phase_shadow_acceptable_records disagrees with raw records",
             )
         _require(
             _integer(
@@ -1076,19 +1215,21 @@ def analyze(paths: Sequence[Path], miss_penalty_ns: float = 90.0) -> dict[str, A
                 )
                 request_loss_summary = _metric_summary(request_losses)
                 miss_loss_summary = _metric_summary(miss_losses)
+                phase_request_upper_sum = sum(phase_request_uppers)
+                phase_miss_upper_sum = sum(phase_miss_uppers)
                 row["groups"][group_name].update(
                     {
                         "phase_calls_sum": phase_calls,
                         "phase_calls_per_core": phase_calls / cores,
                         "phase_icache_requests_lower_bound_sum": phase_requests,
-                        "phase_icache_requests_upper_bound_sum": sum(phase_request_uppers),
+                        "phase_icache_requests_upper_bound_sum": phase_request_upper_sum,
                         "phase_icache_misses_lower_bound_sum": phase_misses,
-                        "phase_icache_misses_upper_bound_sum": sum(phase_miss_uppers),
+                        "phase_icache_misses_upper_bound_sum": phase_miss_upper_sum,
                         "phase_icache_requests_lower_bound_per_core": phase_requests / cores,
-                        "phase_icache_requests_upper_bound_per_core": sum(phase_request_uppers)
-                        / cores,
+                        "phase_icache_requests_upper_bound_per_core":
+                            phase_request_upper_sum / cores,
                         "phase_icache_misses_lower_bound_per_core": phase_misses / cores,
-                        "phase_icache_misses_upper_bound_per_core": sum(phase_miss_uppers) / cores,
+                        "phase_icache_misses_upper_bound_per_core": phase_miss_upper_sum / cores,
                         "phase_icache_requests_lower_bound_per_core_median":
                             phase_request_lower_summary["median"],
                         "phase_icache_requests_lower_bound_per_core_p95":
@@ -1118,8 +1259,12 @@ def analyze(paths: Sequence[Path], miss_penalty_ns: float = 90.0) -> dict[str, A
                         ),
                         "phase_icache_request_lower_bound_share_of_submit":
                             phase_requests / requests,
+                        "phase_icache_request_upper_bound_share_of_submit":
+                            phase_request_upper_sum / requests,
                         "phase_icache_miss_lower_bound_share_of_submit":
                             phase_misses / misses if misses != 0 else None,
+                        "phase_icache_miss_upper_bound_share_of_submit":
+                            phase_miss_upper_sum / misses if misses != 0 else None,
                     }
                 )
         per_run.append(row)
@@ -1176,7 +1321,9 @@ def analyze(paths: Sequence[Path], miss_penalty_ns: float = 90.0) -> dict[str, A
             "shadow_miss_loss_per_core_p95",
             "phase_observed_read_clear_ratio",
             "phase_icache_request_lower_bound_share_of_submit",
+            "phase_icache_request_upper_bound_share_of_submit",
             "phase_icache_miss_lower_bound_share_of_submit",
+            "phase_icache_miss_upper_bound_share_of_submit",
         )
     for group_name in GROUP_NAMES:
         aggregate["groups"][group_name] = {}

@@ -467,9 +467,11 @@ struct PmuValidation {
     uint32_t phase_status_trusted = 0;
     uint32_t shadow_primary_matches = 0;
     uint32_t shadow_primary_bounded = 0;
+    uint32_t phase_shadow_acceptable = 0;
     uint32_t phase_boundary_matches = 0;
     uint32_t phase_call_shape_matches = 0;
     uint64_t phase_calls = 0;
+    uint64_t expected_phase_calls = 0;
     uint64_t shadow_request_abs_delta_sum = 0;
     uint64_t shadow_miss_abs_delta_sum = 0;
     int64_t shadow_request_signed_delta_sum = 0;
@@ -488,17 +490,15 @@ struct PmuValidation {
 // 高水位作为保守拒绝阈值；它只降低风险，不把“未越线”表述成回卷证明。
 constexpr uint32_t kProgrammableCounterRiskThreshold = UINT32_MAX / 4U;
 
-uint32_t ExpectedSubmitPmuPhaseCallsPerWorker(
-    const pa_scheduler::WorkerResult &result, uint32_t batches
-) {
-    // 固定流阶段按每核完整回放次数闭合；保留 result 入参，后续 winner-only
-    // 阶段必须从本核真实 wins/heap_guards 推导，不能继续套用固定 5B。
-    (void)result;
+uint32_t ExpectedSubmitPmuPhaseCallsPerWorker(uint32_t batches) {
+    // 当前所有 running phase 都覆盖每个 worker 的每次 Submit，固定为 5B。
     switch (pa_scheduler::kCompiledSubmitPmuPhase) {
     case pa_scheduler::SubmitPmuPhase::None:
         return 0U;
     case pa_scheduler::SubmitPmuPhase::Claim:
     case pa_scheduler::SubmitPmuPhase::EfDrain:
+    case pa_scheduler::SubmitPmuPhase::Materialize:
+    case pa_scheduler::SubmitPmuPhase::Register:
         return batches * pa_scheduler::kTasksPerBatch;
     case pa_scheduler::SubmitPmuPhase::Count:
         break;
@@ -536,6 +536,7 @@ bool ValidatePmu(
     uint32_t phase_status_trusted = 0;
     uint32_t shadow_primary_matches = 0;
     uint32_t shadow_primary_bounded = 0;
+    uint32_t phase_shadow_acceptable = 0;
     uint32_t phase_boundary_matches = 0;
     uint32_t phase_call_shape_matches = 0;
     uint64_t phase_calls = 0;
@@ -554,7 +555,7 @@ bool ValidatePmu(
     for (uint32_t worker = 0; worker < pa_scheduler::kWorkers; ++worker) {
         const pa_scheduler::WorkerResult &result = state.results[worker];
         const uint32_t expected_phase_calls_per_worker =
-            ExpectedSubmitPmuPhaseCallsPerWorker(result, state.config.batches);
+            ExpectedSubmitPmuPhaseCallsPerWorker(state.config.batches);
         const uint32_t status = result.pmu_status;
         const uint32_t core_id = StatusCoreId(status);
         const bool record_trusted = (status & kStatusRequired) == kStatusRequired;
@@ -569,8 +570,10 @@ bool ValidatePmu(
         const bool shadow_bounded =
             result.pmu_shadow_icache_requests <= result.pmu_icache_requests &&
             result.pmu_shadow_icache_misses <= result.pmu_icache_misses;
+        const bool phase_requires_exact_shadow =
+            pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None;
         const bool shadow_acceptable =
-            pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
+            phase_requires_exact_shadow
                 ? shadow_matches
                 : shadow_bounded;
         const uint32_t request_abs_delta =
@@ -594,6 +597,7 @@ bool ValidatePmu(
         phase_status_trusted += phase_status_ok;
         shadow_primary_matches += shadow_matches;
         shadow_primary_bounded += shadow_bounded;
+        phase_shadow_acceptable += shadow_acceptable;
         phase_boundary_matches += boundaries_match;
         phase_call_shape_matches += phase_call_shape_matches_record;
         phase_calls += result.pmu_phase_calls;
@@ -725,12 +729,7 @@ bool ValidatePmu(
     const bool build_variant_ok = build_variant_matches == pa_scheduler::kWorkers;
     const bool phase_id_ok = phase_id_matches == pa_scheduler::kWorkers;
     const bool phase_status_ok = phase_status_trusted == pa_scheduler::kWorkers;
-    const bool shadow_primary_exact_ok = shadow_primary_matches == pa_scheduler::kWorkers;
-    const bool shadow_primary_bounded_ok = shadow_primary_bounded == pa_scheduler::kWorkers;
-    const bool shadow_partition_ok =
-        pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
-            ? shadow_primary_exact_ok
-            : shadow_primary_bounded_ok;
+    const bool shadow_partition_ok = phase_shadow_acceptable == pa_scheduler::kWorkers;
     const bool phase_boundaries_ok = phase_boundary_matches == pa_scheduler::kWorkers;
     const bool phase_call_shape_ok = phase_call_shape_matches == pa_scheduler::kWorkers;
     const bool phase_calls_ok = phase_calls == expected_phase_calls;
@@ -780,9 +779,7 @@ bool ValidatePmu(
                 build_variant_ok && phase_id_ok ? "PASS" : "FAIL");
     std::printf(
         "[ASSERT] %-48s %s\n",
-        pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
-            ? "disabled shadow counters exactly match primary"
-            : "running shadow partitions do not exceed primary",
+        "phase shadow partitions satisfy exact-or-bounded contract",
         shadow_partition_ok ? "PASS" : "FAIL"
     );
     std::printf("[ASSERT] %-48s %s\n", "all phase boundaries and per-worker calls are exact",
@@ -824,9 +821,11 @@ bool ValidatePmu(
     validation->phase_status_trusted = phase_status_trusted;
     validation->shadow_primary_matches = shadow_primary_matches;
     validation->shadow_primary_bounded = shadow_primary_bounded;
+    validation->phase_shadow_acceptable = phase_shadow_acceptable;
     validation->phase_boundary_matches = phase_boundary_matches;
     validation->phase_call_shape_matches = phase_call_shape_matches;
     validation->phase_calls = phase_calls;
+    validation->expected_phase_calls = expected_phase_calls;
     validation->shadow_request_abs_delta_sum = shadow_request_abs_delta_sum;
     validation->shadow_miss_abs_delta_sum = shadow_miss_abs_delta_sum;
     validation->shadow_request_signed_delta_sum = shadow_request_signed_delta_sum;
@@ -1213,12 +1212,13 @@ bool ExportPmuJson(
         "\"build_variant_match_records\":%u,\"phase_id_match_records\":%u,"
         "\"phase_status_trusted_records\":%u,\"shadow_primary_match_records\":%u,"
         "\"shadow_primary_bounded_records\":%u,"
+        "\"phase_shadow_acceptable_records\":%u,"
         "\"shadow_request_abs_delta_sum\":%llu,\"shadow_request_abs_delta_max\":%u,"
         "\"shadow_request_signed_delta_sum\":%lld,"
         "\"shadow_miss_abs_delta_sum\":%llu,\"shadow_miss_abs_delta_max\":%u,"
         "\"shadow_miss_signed_delta_sum\":%lld,"
         "\"phase_boundary_match_records\":%u,\"phase_call_shape_match_records\":%u,"
-        "\"phase_calls\":%llu,"
+        "\"phase_calls\":%llu,\"phase_expected_calls\":%llu,"
         "\"phase_measurement_valid\":%s},\n",
         semantic_passed ? "true" : "false", validation.passed ? "true" : "false",
         real_compute ? "true" : "false",
@@ -1248,7 +1248,7 @@ bool ExportPmuJson(
         UINT32_MAX - validation.maximum_programmable_counter,
         validation.build_variant_matches, validation.phase_id_matches,
         validation.phase_status_trusted, validation.shadow_primary_matches,
-        validation.shadow_primary_bounded,
+        validation.shadow_primary_bounded, validation.phase_shadow_acceptable,
         static_cast<unsigned long long>(validation.shadow_request_abs_delta_sum),
         validation.shadow_request_abs_delta_max,
         static_cast<long long>(validation.shadow_request_signed_delta_sum),
@@ -1258,6 +1258,7 @@ bool ExportPmuJson(
         validation.phase_boundary_matches,
         validation.phase_call_shape_matches,
         static_cast<unsigned long long>(validation.phase_calls),
+        static_cast<unsigned long long>(validation.expected_phase_calls),
         validation.phase_measurement_valid ? "true" : "false"
     );
     std::fprintf(
@@ -1321,6 +1322,8 @@ bool ExportPmuJson(
         const bool boundaries_balanced =
             result.pmu_phase_begin_reads == result.pmu_phase_calls &&
             result.pmu_phase_end_reads == result.pmu_phase_calls;
+        const uint32_t expected_phase_calls =
+            ExpectedSubmitPmuPhaseCallsPerWorker(state.config.batches);
         std::fprintf(
             output,
             "%s{\"worker_id\":%u,\"physical_core_id\":%u,\"role\":\"%s\",\"block_id\":%u,"
@@ -1329,6 +1332,7 @@ bool ExportPmuJson(
             "\"cube_busy\":%u,\"scalar_busy\":%u,\"mte1_busy\":%u,\"mte2_busy\":%u,"
             "\"icache_requests\":%u,\"icache_misses\":%u,"
             "\"build_variant_id\":%u,\"compiled_phase_id\":%u,\"phase_calls\":%u,"
+            "\"phase_expected_calls\":%u,"
             "\"phase_begin_reads\":%u,\"phase_end_reads\":%u,"
             "\"phase_icache_requests\":%u,\"phase_icache_misses\":%u,"
             "\"phase_icache_requests_upper_bound\":%u,"
@@ -1348,6 +1352,7 @@ bool ExportPmuJson(
             result.pmu_cube_busy, result.pmu_scalar_busy, result.pmu_mte1_busy, result.pmu_mte2_busy,
             result.pmu_icache_requests, result.pmu_icache_misses,
             result.pmu_build_variant, result.pmu_phase_id, result.pmu_phase_calls,
+            expected_phase_calls,
             result.pmu_phase_begin_reads, result.pmu_phase_end_reads,
             result.pmu_phase_icache_requests, result.pmu_phase_icache_misses,
             phase_request_upper, phase_miss_upper,

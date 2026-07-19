@@ -183,14 +183,16 @@ enum class ProfilePhase : uint32_t {
 };
 
 // submit-pmu 每个 ELF 只编译一个局部归因阶段。none 不做中途 counter
-// 读取，是完整 Submit 的正式基线；claim 是首个连续、无提前返回的验证阶段，
-// EfDrain 只包围每次 Submit 开头唯一的 opportunistic drain call-site。
-// 后续阶段只能在各自边界和闭环经过 A5 验证后向枚举尾部追加。
+// 读取，是完整 Submit 的正式基线；其余阶段都在每个 worker 的五次 Submit
+// 上各执行一次，因此统一按固定 5*batches 次数闭合。历史 ID=3 曾用于
+// winner-only WaitForSlot，现已退役且不复用，避免旧 raw 被误认成新阶段。
 enum class SubmitPmuPhase : uint32_t {
     None = 0,
     Claim = 1,
     EfDrain = 2,
-    Count = 3,
+    Materialize = 4,
+    Register = 5,
+    Count = 6,
 };
 
 #ifndef PA_SUBMIT_PMU_PHASE_ID
@@ -202,8 +204,11 @@ constexpr SubmitPmuPhase kCompiledSubmitPmuPhase =
 constexpr uint32_t kBuildVariantSwimlane = 1U;
 constexpr uint32_t kBuildVariantSubmitPmu = 2U;
 static_assert(
-    PA_SUBMIT_PMU_PHASE_ID >= 0 &&
-        PA_SUBMIT_PMU_PHASE_ID < static_cast<int>(SubmitPmuPhase::Count),
+    PA_SUBMIT_PMU_PHASE_ID == static_cast<int>(SubmitPmuPhase::None) ||
+        PA_SUBMIT_PMU_PHASE_ID == static_cast<int>(SubmitPmuPhase::Claim) ||
+        PA_SUBMIT_PMU_PHASE_ID == static_cast<int>(SubmitPmuPhase::EfDrain) ||
+        PA_SUBMIT_PMU_PHASE_ID == static_cast<int>(SubmitPmuPhase::Materialize) ||
+        PA_SUBMIT_PMU_PHASE_ID == static_cast<int>(SubmitPmuPhase::Register),
     "invalid compiled submit-pmu phase"
 );
 
