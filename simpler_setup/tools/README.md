@@ -10,6 +10,7 @@ no repo checkout required.
 ## Tool list
 
 - **[swimlane_converter](#swimlane_converter)** — perf JSON → Chrome Trace Event (Perfetto)
+- **[fdwic_swimlane_exclusive_analyzer](#fdwic_swimlane_exclusive_analyzer)** — strict FDWIC schema-v4 closure report
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
 - **[device_log_timing](#device_log_timing)** — Total / Orch / Sched from a CANN device log (no swimlane JSON)
 - **[dump_viewer](#dump_viewer)** — inspect / export args dumps (see [docs/tensor-dump.md](../../docs/dfx/tensor-dump.md) for full workflow)
@@ -94,7 +95,25 @@ A statistics summary grouped by function (printed to the console), including Exe
 - **Head/Tail OH**: scheduling head/tail overhead
 - **Exec_%**: Exec / Latency percentage (kernel utilization)
 
-#### 3. Scheduler Overhead Deep-Dive
+#### 3. FDWIC Exclusive Analysis
+
+When the input is an A5 fully-distributed-within-core schema-v4
+capture, the converter also writes
+`swimlane_exclusive_analysis.json` next to the raw input. The report
+validates the physical core topology, common contiguous Submit stream,
+parent/child containment, exclusive phase order, zero producer drops,
+and exact integer-cycle closure. It reports cross-core wall-clock
+makespans separately from summed per-core work and keeps nested
+`DrainWon`/atomic observations out of additive totals.
+
+The report can also be regenerated directly:
+
+```bash
+python -m simpler_setup.tools.fdwic_swimlane_exclusive_analyzer \
+    outputs/<case>_<ts>/l2_swimlane_records.json
+```
+
+#### 4. Scheduler Overhead Deep-Dive
 
 `swimlane_converter` no longer runs the deep-dive inline — it needs the task DAG
 (`deps.json`) from a *separate* `--enable-dep-gen` run, which can't be produced
@@ -119,7 +138,30 @@ After the test passes, the tool will:
 1. Auto-detect the latest `l2_swimlane_records_*.json` in outputs/
 2. Load function names from the kernel_config.py specified via `-k`
 3. Produce `merged_swimlane_*.json` for visualization
-4. Print the task statistics and scheduler overhead deep-dive report to the console
+4. Produce `swimlane_exclusive_analysis.json` for FDWIC schema-v4 captures
+5. Print the task statistics and scheduler overhead deep-dive report to the console
+
+---
+
+## fdwic_swimlane_exclusive_analyzer
+
+Validate and summarize the production FDWIC schema-v4 hierarchy using
+raw integer cycles. The accepted Submit sequences follow the production
+Kernel/Alloc and winner/loser paths; task type is read from `Submit.aux`
+and is never inferred from task-ID arithmetic. A Kernel may be nested in
+`EfDrain`, `WinnerBuild`, `AllocComplete`, an orchestration residual, or
+FinalDrain. It may not occupy a Submit residual or cross a partition
+boundary.
+
+The analyzer fails closed on incomplete topology, missing parents,
+producer drops, orphan/overlapping children, or a non-closing partition.
+Its output includes per-core and per-role metrics, residual boundary
+breakdowns, kernel containment counts, and non-additive overlay counts.
+
+```bash
+python -m simpler_setup.tools.fdwic_swimlane_exclusive_analyzer INPUT \
+    --output OUTPUT
+```
 
 ---
 

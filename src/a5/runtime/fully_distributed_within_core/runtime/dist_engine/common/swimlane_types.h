@@ -16,8 +16,8 @@
 #include "data_type.h"
 
 constexpr uint32_t kFdwicSwimlaneMagic = 0x4653574Cu;  // FSWL
-constexpr uint32_t kFdwicSwimlaneVersion = 3;
-constexpr uint32_t kFdwicSwimlaneTraceSchemaVersion = 3;
+constexpr uint32_t kFdwicSwimlaneVersion = 4;
+constexpr uint32_t kFdwicSwimlaneTraceSchemaVersion = 4;
 constexpr uint32_t kFdwicSwimlaneDefaultRecordsPerCore = 1u << 16;
 // Eligible wait-region atomic calls are aggregated into exact-count batches at
 // level 4. Reuse the existing 64K partition instead of reserving hundreds of
@@ -45,6 +45,17 @@ enum class FdwicSwimlanePhase : int32_t {
     Register = 13,
     Atomic = 14,
     ClockBaseline = 15,
+    // Schema-v4 parent intervals and true Submit-tail actions. The legacy
+    // Alloc/Build/Replay IDs stay reserved for archived captures but are no
+    // longer emitted by the production runtime.
+    OrchestrationReplay = 16,
+    FinalDrain = 17,
+    WinnerBuild = 18,
+    AllocComplete = 19,
+    // Unlike the single-lane standalone probe, a production kernel loser
+    // really calls drain_block_won(); keep that work as an exclusive child.
+    LoserReplay = 20,
+    Count = 21,
 };
 
 // Atomic/ClockBaseline extend the existing ten-column FDWIC raw record ABI.

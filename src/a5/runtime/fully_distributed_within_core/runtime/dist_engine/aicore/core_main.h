@@ -35,10 +35,18 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
         fdwic_atomic_poll_region_end(startup_poll_region);
     }
 
-    TRACE_LAP_RESET(self);  // origin for the first lap span (post-barrier, pre-replay)
+    // Schema-v4 observes the complete worker business window as two adjacent
+    // parents. Reuse the orchestration end as the final-drain start so their
+    // aggregate closes exactly in integer SYS_CNT cycles.
+    TRACE_TIMESTAMP(orchestration_begin);
     dist_submit_replay_orch(runtime);
-
+    TRACE_TIMESTAMP(orchestration_end);
     dist_submit_drain_to_completion(self);
+    TRACE_TIMESTAMP(final_drain_end);
+    // Publish both parent records after the measured work. Their own GM writes
+    // therefore belong to neither business interval.
+    TRACE_SPAN_RECORD(orchestration_begin, orchestration_end, self, -1, -1, TracePhase::OrchestrationReplay, 0, 0);
+    TRACE_SPAN_RECORD(orchestration_end, final_drain_end, self, -1, -1, TracePhase::FinalDrain, 0, 0);
     fdwic_swimlane_record_clock_baselines(self, core_idx);
     TRACE_FLUSH_CORE(self);
     dist_aicore_finish_worker(runtime);

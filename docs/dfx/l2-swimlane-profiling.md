@@ -127,9 +127,10 @@ runs):
 
 ```text
 <output_prefix>/
-├── l2_swimlane_records.json     # raw runtime output
-├── name_map_<case>.json     # optional func_id → name mapping
-└── merged_swimlane.json     # Perfetto trace (added by converter)
+├── l2_swimlane_records.json          # raw runtime output
+├── name_map_<case>.json              # optional func_id → name mapping
+├── merged_swimlane.json              # Perfetto trace (added by converter)
+└── swimlane_exclusive_analysis.json  # FDWIC schema-v4 only
 ```
 
 Filenames are fixed (no per-file timestamp) — the directory is the
@@ -189,6 +190,70 @@ join key between `aicore_tasks` and `aicpu_tasks` is
 `task_token_raw` to the same core multiple times. AICore is the
 canonical producer of `task_token_raw`; AICPU only stamps the
 dispatch / finish timestamps and the per-core join token.
+
+#### Fully-distributed-within-core schema-v4
+
+The A5 fully-distributed-within-core (FDWIC) executor adds a strict
+per-scalar-lane hierarchy at every enabled collection level. It does
+not infer task kind from the task ID: `Submit.aux` is the source of
+truth (`0` = kernel, `1` = allocation), and `Submit.flags & 1` records
+the winner state.
+
+The exact exclusive child order is:
+
+| Submit path | Exclusive children in timestamp order |
+| ----------- | ------------------------------------- |
+| Kernel winner | `EfDrain`, `Materialize`, `PrepareMap`, `Claim`, `Fanin`, `Register`, `WinnerBuild` |
+| Kernel loser | `EfDrain`, `Materialize`, `PrepareMap`, `Claim`, `Register`, `LoserReplay` |
+| Alloc winner | `EfDrain`, `Materialize`, `PrepareMap`, `Register`, `Claim`, `AllocComplete` |
+| Alloc loser | `EfDrain`, `Materialize`, `PrepareMap`, `Register`, `Claim` |
+
+The `Submit` timestamp starts after `dist_submit_begin()` and ends
+before publishing the Submit record and returning from the API. Its
+residual therefore includes unmarked control and intermediate trace
+record writes. Exact closure describes the instrumented observation
+window; it is not a claim that instrumentation has zero performance
+impact.
+
+`LoserReplay` measures the production kernel-loser
+`drain_block_won()` call. An allocation loser has no corresponding
+action, so its Claim-to-Submit-end suffix remains a measured residual;
+the tooling does not create a synthetic phase. `DrainWon`, `Atomic`,
+`ClockBaseline`, `Commit`, and `RingBp` are nested observations and are
+therefore reported as non-additive overlays.
+
+Each core emits exactly one adjacent pair of top-level parents:
+`OrchestrationReplay` followed by `FinalDrain`. This worker-completion
+window starts after the startup barrier and ends
+before clock baselines, trace flush, and finish publication. Those
+observation/lifecycle operations are deliberately outside the additive
+business partition.
+
+The analyzer validates the following identities with raw integer cycles
+before any cycle-to-µs conversion:
+
+```text
+Submit = exclusive Submit children + SubmitResidual
+SubmitEnvelope = SubmitUnion + BetweenSubmitResidual
+OrchestrationReplay = Setup + SubmitUnion + BetweenSubmitResidual + Tail
+FinalDrain = KernelUnion + FinalDrainResidual
+WorkerCompletion = OrchestrationReplay + FinalDrain
+```
+
+Production orchestration can execute ready kernels while tensor-data
+access waits between Submit calls. Such kernels are valid inside the
+orchestration residual. Inside a Submit they are valid only in
+`EfDrain`, `WinnerBuild`, or `AllocComplete`; a Kernel in Submit
+residual or crossing a partition boundary is invalid. The report keeps
+the cross-core wall-clock makespan separate from aggregate per-core
+work, because summing core cycles is not elapsed wall time.
+
+For schema-v4 input, `swimlane_converter` also writes
+`swimlane_exclusive_analysis.json`. The merged trace contains explicit
+`submit_residual`, `submit_tail_gap`, and
+`between_submit_residual` spans derived from the validated raw records.
+This schema change adds no I-cache/PMU metric; existing level-4 atomic
+records remain overlays.
 
 #### Reader output (µs domain)
 

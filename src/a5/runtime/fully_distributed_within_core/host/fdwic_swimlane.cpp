@@ -29,7 +29,7 @@
 namespace {
 
 constexpr uint32_t kFdwicSwimlaneMaxLevel = kFdwicAtomicSwimlaneLevel;
-constexpr int32_t kFdwicSwimlanePhaseCount = static_cast<int32_t>(FdwicSwimlanePhase::ClockBaseline) + 1;
+constexpr int32_t kFdwicSwimlanePhaseCount = static_cast<int32_t>(FdwicSwimlanePhase::Count);
 
 struct TraceSummary {
     uint64_t records = 0;
@@ -83,6 +83,18 @@ const char *phase_name(int32_t phase) {
         return "Atomic";
     case FdwicSwimlanePhase::ClockBaseline:
         return "ClockBaseline";
+    case FdwicSwimlanePhase::OrchestrationReplay:
+        return "OrchestrationReplay";
+    case FdwicSwimlanePhase::FinalDrain:
+        return "FinalDrain";
+    case FdwicSwimlanePhase::WinnerBuild:
+        return "WinnerBuild";
+    case FdwicSwimlanePhase::AllocComplete:
+        return "AllocComplete";
+    case FdwicSwimlanePhase::LoserReplay:
+        return "LoserReplay";
+    case FdwicSwimlanePhase::Count:
+        break;
     }
     return "Unknown";
 }
@@ -210,8 +222,7 @@ uint32_t atomic_record_call_count(const FdwicSwimlaneRecord &record) {
     return (record.flags & kFdwicAtomicPollBatch) != 0 ? record.flags >> kFdwicAtomicPollCountShift : 1U;
 }
 
-bool claim_record_schema_valid(const FdwicSwimlaneRecord &record, uint32_t level) {
-    if (level < kFdwicAtomicSwimlaneLevel) return record.flags <= 1 && record.aux <= 1;
+bool claim_record_schema_valid(const FdwicSwimlaneRecord &record) {
     if ((record.flags & ~(kFdwicClaimWon | kFdwicClaimAttempted)) != 0) return false;
     if ((record.flags & kFdwicClaimWon) != 0 && (record.flags & kFdwicClaimAttempted) == 0) return false;
     return record.aux <= 1;
@@ -248,12 +259,24 @@ bool ordinary_record_schema_valid(const FdwicSwimlaneRecord &record) {
     case FdwicSwimlanePhase::Alloc:
     case FdwicSwimlanePhase::Build:
     case FdwicSwimlanePhase::Replay:
+        // Schema-v4 reserves the legacy IDs for archived raw files but never
+        // accepts newly produced overlapping lap records.
+        return false;
     case FdwicSwimlanePhase::EfDrain:
         return record.flags == 0 && record.aux == 0;
+    case FdwicSwimlanePhase::WinnerBuild:
+    case FdwicSwimlanePhase::AllocComplete:
+    case FdwicSwimlanePhase::LoserReplay:
+        return record.flags == 0 && record.aux == 0;
+    case FdwicSwimlanePhase::OrchestrationReplay:
+    case FdwicSwimlanePhase::FinalDrain:
+        return record.task_id == -1 && record.func_id == -1 && record.flags == 0 && record.aux == 0;
     case FdwicSwimlanePhase::Claim:
     case FdwicSwimlanePhase::Atomic:
     case FdwicSwimlanePhase::ClockBaseline:
         return true;
+    case FdwicSwimlanePhase::Count:
+        return false;
     }
     return false;
 }
@@ -360,6 +383,8 @@ bool validate_and_write_core(
     uint32_t core_clock_records = 0;
     uint32_t core_plain_clock_records = 0;
     uint32_t core_dependency_clock_records = 0;
+    uint32_t core_orchestration_records = 0;
+    uint32_t core_final_drain_records = 0;
     for (uint32_t index = 0; index < core_state.count; ++index) {
         const FdwicSwimlaneRecord &record = records[index];
         const bool base_valid = record.end_cycle >= record.start_cycle && record.phase < kFdwicSwimlanePhaseCount &&
@@ -375,7 +400,7 @@ bool validate_and_write_core(
                 ++core_poll_batch_records;
             }
         } else if (record.phase == static_cast<int32_t>(FdwicSwimlanePhase::Claim)) {
-            schema_valid = schema_valid && claim_record_schema_valid(record, level);
+            schema_valid = schema_valid && claim_record_schema_valid(record);
         } else if (record.phase == static_cast<int32_t>(FdwicSwimlanePhase::ClockBaseline)) {
             schema_valid = schema_valid && clock_record_schema_valid(record);
             ++core_clock_records;
@@ -386,6 +411,11 @@ bool validate_and_write_core(
             }
         } else {
             schema_valid = schema_valid && ordinary_record_schema_valid(record);
+            if (record.phase == static_cast<int32_t>(FdwicSwimlanePhase::OrchestrationReplay)) {
+                ++core_orchestration_records;
+            } else if (record.phase == static_cast<int32_t>(FdwicSwimlanePhase::FinalDrain)) {
+                ++core_final_drain_records;
+            }
         }
         if (!schema_valid) {
             const uint32_t op = record.flags & kFdwicAtomicOpMask;
@@ -404,6 +434,14 @@ bool validate_and_write_core(
             << record.task_id << ", " << record.func_id << ", \"" << phase_name(record.phase) << "\", "
             << record.start_cycle << ", " << record.end_cycle << ", " << record.flags << ", " << record.aux << "]";
         first = false;
+    }
+
+    if (core_orchestration_records != 1 || core_final_drain_records != 1) {
+        LOG_ERROR(
+            "fdwic swimlane schema-v4 parent closure failed on core %u: orchestration=%u final_drain=%u", core,
+            core_orchestration_records, core_final_drain_records
+        );
+        return false;
     }
 
     if (level >= kFdwicAtomicSwimlaneLevel) {
@@ -452,7 +490,7 @@ std::string output_path(const Runtime *runtime) {
 }
 
 bool prepare_output_directory(const std::string &prefix) {
-    struct stat info {};
+    struct stat info{};
     if (stat(prefix.c_str(), &info) == 0) {
         if (S_ISDIR(info.st_mode)) return true;
         LOG_ERROR("fdwic swimlane output prefix is not a directory: %s", prefix.c_str());
@@ -629,8 +667,7 @@ extern "C" int fdwic_swimlane_host_export(Runtime *runtime) {
     out << "  \"metadata\": {\n";
     out << "    \"clock_freq_hz\": " << header->freq_hz << ",\n";
     out << "    \"num_cores\": " << header->num_cores << ",\n";
-    const uint32_t trace_schema_version = level >= kFdwicAtomicSwimlaneLevel ? kFdwicSwimlaneTraceSchemaVersion : 1;
-    out << "    \"trace_schema_version\": " << trace_schema_version << ",\n";
+    out << "    \"trace_schema_version\": " << kFdwicSwimlaneTraceSchemaVersion << ",\n";
     out << "    \"raw_trace_version\": " << header->version << ",\n";
     out << "    \"records_per_core\": " << header->records_per_core << ",\n";
     out << "    \"record_size_bytes\": " << sizeof(FdwicSwimlaneRecord) << ",\n";

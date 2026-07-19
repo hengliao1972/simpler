@@ -327,15 +327,6 @@ PTO_DEVICE_FUNC bool has_pending_won(__gm__ DistCore *self) {
     return false;
 }
 
-PTO_DEVICE_FUNC void dist_submit_execute_first(__gm__ DistCore *self) {
-    TRACE_LAP_RESET(self);
-    if (!fdwic_trace_is_fatal()) {
-        drain_block_won(self);
-        drain_phase_b(self);
-    }
-    TRACE_LAP(self, self->local_index, -1, TracePhase::EfDrain);
-}
-
 enum class DistSubmitKind : int32_t {
     Kernel = 0,
     Alloc = 1,
@@ -601,19 +592,26 @@ PTO_DEVICE_FUNC void dist_submit_register_outputs(DistSubmitCtx &ctx, const L0Ta
 }
 
 PTO_DEVICE_FUNC bool dist_submit_materialize_and_prepare_map(
-    __gm__ DistCore *self, const L0TaskArgs &args, DistSubmitCtx &ctx, DistSubmitKind kind
+    __gm__ DistCore *self, const L0TaskArgs &args, DistSubmitCtx &ctx, DistSubmitKind kind, uint64_t materialize_begin,
+    uint64_t &prepare_map_end
 ) {
-    TRACE_LAP_RESET(self);
     if (!dist_submit_check_task_cap(ctx, kind)) return false;
-    TRACE_SPAN_BEGIN(materialize_trace);
     if (!dist_submit_materialize_args(args, ctx, kind)) return false;
-    TRACE_SPAN_END(materialize_trace, self, ctx.task_id, -1, TracePhase::Materialize, 0, static_cast<uint32_t>(kind));
+    TRACE_TIMESTAMP(materialize_end);
+    TRACE_SPAN_RECORD(
+        materialize_begin, materialize_end, self, ctx.task_id, -1, TracePhase::Materialize, 0,
+        static_cast<uint32_t>(kind)
+    );
 #if !defined(__CCE_AICORE__)
     if (fdwic_trace_is_fatal(ctx.task_id)) return false;
 #endif
-    TRACE_SPAN_BEGIN(prepare_map_trace);
     dist_submit_prepare_map(self, ctx.task_id);
-    TRACE_SPAN_END(prepare_map_trace, self, ctx.task_id, -1, TracePhase::PrepareMap, 0, static_cast<uint32_t>(kind));
+    TRACE_TIMESTAMP(prepare_map_finish);
+    TRACE_SPAN_RECORD(
+        materialize_end, prepare_map_finish, self, ctx.task_id, -1, TracePhase::PrepareMap, 0,
+        static_cast<uint32_t>(kind)
+    );
+    prepare_map_end = prepare_map_finish;
     return true;
 }
 

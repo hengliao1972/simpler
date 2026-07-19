@@ -314,39 +314,54 @@ dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &arg
     if (__builtin_popcount(active.core_mask()) >= 2) g_fdwic_joint_submit_seen = true;
     DistSubmitCtx ctx;
     dist_submit_begin(nullptr, args, ctx);
-    TRACE_SPAN_BEGIN(submit_trace);
-    TRACE_LAP_RESET(ctx.self);
+    TRACE_TIMESTAMP(submit_begin);
     drain_block_won(ctx.self);
     drain_phase_b(ctx.self);
-    TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::EfDrain);
-    if (!dist_submit_materialize_and_prepare_map(ctx.self, args, ctx, DistSubmitKind::Kernel)) return ctx.result;
-    TRACE_SPAN_BEGIN(claim_trace);
+    TRACE_TIMESTAMP(efdrain_end);
+    TRACE_SPAN_RECORD(submit_begin, efdrain_end, ctx.self, ctx.task_id, -1, TracePhase::EfDrain, 0, 0);
+    uint64_t prepare_map_end = efdrain_end;
+    if (!dist_submit_materialize_and_prepare_map(
+            ctx.self, args, ctx, DistSubmitKind::Kernel, efdrain_end, prepare_map_end
+        )) {
+        return ctx.result;
+    }
+    const uint64_t claim_begin = prepare_map_end;
     const bool is_winner = dist_submit_claim(DistSubmitKind::Kernel, &mixed, ctx);
-    const uint32_t claim_flags =
-        fdwic_atomic_swimlane_enabled() ?
-            (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U) :
-            static_cast<uint32_t>(is_winner);
-    TRACE_SPAN_END(claim_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Claim, claim_flags, 0);
+    const uint32_t claim_flags = (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U);
+    TRACE_TIMESTAMP(claim_end);
+    TRACE_SPAN_RECORD(claim_begin, claim_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Claim, claim_flags, 0);
+    uint64_t register_begin = claim_end;
     if (is_winner) {
-        TRACE_SPAN_BEGIN(fanin_trace);
         ctx.fanin_count = dist_submit_collect_fanin(args, ctx, ctx.fanin);
-        TRACE_SPAN_END(
-            fanin_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Fanin, 0,
+        TRACE_TIMESTAMP(fanin_end);
+        TRACE_SPAN_RECORD(
+            claim_end, fanin_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Fanin, 0,
             static_cast<uint32_t>(ctx.fanin_count)
         );
+        register_begin = fanin_end;
     }
-    TRACE_SPAN_BEGIN(register_trace);
     dist_submit_register_outputs(ctx, args, /*include_existing=*/true);
-    TRACE_SPAN_END(register_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Register, 0, 1);
+    TRACE_TIMESTAMP(register_end);
+    TRACE_SPAN_RECORD(register_begin, register_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Register, 0, 1);
     if (__builtin_expect(is_winner, 0)) {
-        TRACE_LAP(ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Build);
         dist_submit_build_winner_task(ctx, mixed, args);
+        TRACE_TIMESTAMP(winner_build_end);
+        TRACE_SPAN_RECORD(
+            register_end, winner_build_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::WinnerBuild, 0, 0
+        );
     } else {
-        TRACE_LAP(ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Replay);
+        // Production losers perform real BlockWon progress. This is not the
+        // empty loser path used by the standalone single-lane probe.
         drain_block_won(ctx.self);
+        TRACE_TIMESTAMP(loser_replay_end);
+        TRACE_SPAN_RECORD(
+            register_end, loser_replay_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::LoserReplay, 0, 0
+        );
     }
-    TRACE_SPAN_END(
-        submit_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Submit, static_cast<uint32_t>(is_winner), 0
+    TRACE_TIMESTAMP(submit_end);
+    TRACE_SPAN_RECORD(
+        submit_begin, submit_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Submit,
+        static_cast<uint32_t>(is_winner), 0
     );
     return ctx.result;
 }
@@ -354,28 +369,36 @@ dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &arg
 DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
     DistSubmitCtx ctx;
     dist_submit_begin(nullptr, args, ctx);
-    TRACE_SPAN_BEGIN(submit_trace);
-    TRACE_LAP_RESET(ctx.self);
+    TRACE_TIMESTAMP(submit_begin);
     drain_block_won(ctx.self);
     drain_phase_b(ctx.self);
-    TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::EfDrain);
-    if (!dist_submit_materialize_and_prepare_map(ctx.self, args, ctx, DistSubmitKind::Alloc)) return ctx.result;
-    TRACE_SPAN_BEGIN(register_trace);
+    TRACE_TIMESTAMP(efdrain_end);
+    TRACE_SPAN_RECORD(submit_begin, efdrain_end, ctx.self, ctx.task_id, -1, TracePhase::EfDrain, 0, 0);
+    uint64_t prepare_map_end = efdrain_end;
+    if (!dist_submit_materialize_and_prepare_map(
+            ctx.self, args, ctx, DistSubmitKind::Alloc, efdrain_end, prepare_map_end
+        )) {
+        return ctx.result;
+    }
+    const uint64_t register_begin = prepare_map_end;
     dist_submit_register_outputs(ctx, args, /*include_existing=*/false);
-    TRACE_SPAN_END(register_trace, ctx.self, ctx.task_id, -1, TracePhase::Register, 0, 0);
-    TRACE_SPAN_BEGIN(claim_trace);
+    TRACE_TIMESTAMP(register_end);
+    TRACE_SPAN_RECORD(register_begin, register_end, ctx.self, ctx.task_id, -1, TracePhase::Register, 0, 0);
+    const uint64_t claim_begin = register_end;
     const bool is_winner = dist_submit_claim(DistSubmitKind::Alloc, nullptr, ctx);
-    const uint32_t claim_flags =
-        fdwic_atomic_swimlane_enabled() ?
-            (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U) :
-            static_cast<uint32_t>(is_winner);
-    TRACE_SPAN_END(claim_trace, ctx.self, ctx.task_id, -1, TracePhase::Claim, claim_flags, 1);
+    const uint32_t claim_flags = (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U);
+    TRACE_TIMESTAMP(claim_end);
+    TRACE_SPAN_RECORD(claim_begin, claim_end, ctx.self, ctx.task_id, -1, TracePhase::Claim, claim_flags, 1);
     if (__builtin_expect(is_winner, 0)) {
         dist_submit_complete_alloc(ctx);
-        TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::Alloc);
-    } else {
-        TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::Replay);
+        TRACE_TIMESTAMP(alloc_complete_end);
+        TRACE_SPAN_RECORD(claim_end, alloc_complete_end, ctx.self, ctx.task_id, -1, TracePhase::AllocComplete, 0, 0);
     }
-    TRACE_SPAN_END(submit_trace, ctx.self, ctx.task_id, -1, TracePhase::Submit, static_cast<uint32_t>(is_winner), 1);
+    // Alloc losers have no corresponding replay action. Their Claim-to-end
+    // suffix remains an offline Submit tail residual instead of a fake phase.
+    TRACE_TIMESTAMP(submit_end);
+    TRACE_SPAN_RECORD(
+        submit_begin, submit_end, ctx.self, ctx.task_id, -1, TracePhase::Submit, static_cast<uint32_t>(is_winner), 1
+    );
     return ctx.result;
 }

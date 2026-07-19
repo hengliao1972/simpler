@@ -232,6 +232,43 @@ header just like on onboard.
 
 Bare `--enable-l2-swimlane` = level 4 (backward compatible).
 
+### FDWIC schema-v4 partition semantics
+
+When FDWIC swimlane collection is enabled, every scalar core records
+two adjacent top-level business windows:
+`OrchestrationReplay` and `FinalDrain`. Each `Submit` inside the first
+window has non-overlapping children with a path-specific order:
+
+- Kernel winner: `EfDrain` → `Materialize` → `PrepareMap` →
+  `Claim` → `Fanin` → `Register` → `WinnerBuild`.
+- Kernel loser: `EfDrain` → `Materialize` → `PrepareMap` →
+  `Claim` → `Register` → `LoserReplay`.
+- Alloc winner: `EfDrain` → `Materialize` → `PrepareMap` →
+  `Register` → `Claim` → `AllocComplete`.
+- Alloc loser: `EfDrain` → `Materialize` → `PrepareMap` →
+  `Register` → `Claim`; its remaining tail is a residual because
+  production performs no loser action there.
+
+The `Submit` record encodes winner state in `flags & 1` and task kind
+in `aux`; tooling must not derive either from task-ID patterns.
+`LoserReplay` is the real kernel-loser `drain_block_won()` call.
+`DrainWon` remains a real nested observation, but it and other overlay
+phases must not be added to an exclusive parent total.
+
+The Submit window starts after `dist_submit_begin()` and ends before
+the final Submit-record write and API return. Residual time can include
+unmarked control and trace-record publication overhead, so exact closure
+is an integrity property of the instrumented capture rather than proof
+of zero observer effect.
+
+The Python converter validates schema-v4 and emits
+`swimlane_exclusive_analysis.json`, whose integer-cycle closures cover
+Submit, the inter-Submit envelope, orchestration, final drain, and the
+complete worker window. The report distinguishes summed per-core work
+from cross-core elapsed makespan. This partition work does not add an
+I-cache/PMU metric; level-4 atomic observations remain independent
+overlays.
+
 ### Level gating in AICPU code
 
 Use the strongly-typed `L2SwimlaneLevel` enum so each gate names the

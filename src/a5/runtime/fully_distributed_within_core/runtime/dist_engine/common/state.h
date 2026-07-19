@@ -99,6 +99,11 @@ enum class TracePhase : int32_t {
     Register = 13,
     Atomic = 14,
     ClockBaseline = 15,
+    OrchestrationReplay = 16,
+    FinalDrain = 17,
+    WinnerBuild = 18,
+    AllocComplete = 19,
+    LoserReplay = 20,
 };
 
 struct RingSlot {

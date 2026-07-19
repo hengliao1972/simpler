@@ -54,6 +54,16 @@ PTO_DEVICE_FUNC inline FdwicSwimlanePhase trace_phase_to_swimlane_phase(TracePha
         return FdwicSwimlanePhase::Atomic;
     case TracePhase::ClockBaseline:
         return FdwicSwimlanePhase::ClockBaseline;
+    case TracePhase::OrchestrationReplay:
+        return FdwicSwimlanePhase::OrchestrationReplay;
+    case TracePhase::FinalDrain:
+        return FdwicSwimlanePhase::FinalDrain;
+    case TracePhase::WinnerBuild:
+        return FdwicSwimlanePhase::WinnerBuild;
+    case TracePhase::AllocComplete:
+        return FdwicSwimlanePhase::AllocComplete;
+    case TracePhase::LoserReplay:
+        return FdwicSwimlanePhase::LoserReplay;
     }
     return FdwicSwimlanePhase::Kernel;
 }
@@ -101,6 +111,9 @@ PTO_DEVICE_FUNC inline uint64_t trace_span_begin_impl() {
 
 #define TRACE_LAP(self, task_id, func_id, phase) trace_lap_impl((self), (task_id), (func_id), (phase))
 #define TRACE_LAP_RESET(self) trace_lap_reset_impl((self))
+#define TRACE_TIMESTAMP(name) const uint64_t name = trace_span_begin_impl()
+#define TRACE_SPAN_RECORD(start, end, self, task_id, func_id, phase, flags, aux) \
+    trace_span_impl((self), (task_id), (func_id), (phase), (start), (end), (flags), (aux))
 #define TRACE_SPAN_BEGIN(name) const uint64_t name = trace_span_begin_impl()
 #define TRACE_SPAN_END(name, self, task_id, func_id, phase, flags, aux) \
     trace_span_impl((self), (task_id), (func_id), (phase), (name), trace_span_begin_impl(), (flags), (aux))
@@ -114,6 +127,12 @@ PTO_DEVICE_FUNC inline void trace_reset_core(__gm__ DistCore *) {}
 
 #define TRACE_LAP(self, task_id, func_id, phase) ((void)0)
 #define TRACE_LAP_RESET(self) ((void)0)
+#define TRACE_TIMESTAMP(name) const uint64_t name = 0
+#define TRACE_SPAN_RECORD(start, end, self, task_id, func_id, phase, flags, aux) \
+    do {                                                                         \
+        (void)(start);                                                           \
+        (void)(end);                                                             \
+    } while (0)
 #define TRACE_SPAN_BEGIN(name) ((void)0)
 #define TRACE_SPAN_END(name, self, task_id, func_id, phase, flags, aux) ((void)0)
 #define TRACE_INSTANT(self, task_id, func_id, phase, flags) ((void)0)

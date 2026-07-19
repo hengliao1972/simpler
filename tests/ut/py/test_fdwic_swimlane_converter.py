@@ -12,6 +12,7 @@ import json
 
 import pytest
 
+from simpler_setup.tools.fdwic_swimlane_exclusive_analyzer import analyze_data, write_analysis_data
 from simpler_setup.tools.swimlane_converter import generate_chrome_trace_json, read_perf_data
 
 
@@ -22,9 +23,12 @@ def _capture(
     num_cores=1,
     add_clock_baselines=True,
     clock_dependency_applied=True,
+    level=None,
 ):
     rows = list(rows)
-    if trace_schema_version == 3 and add_clock_baselines:
+    if level is None:
+        level = 4 if trace_schema_version == 3 else 1
+    if trace_schema_version in (3, 4) and level == 4 and add_clock_baselines:
         dependency_flags = 0x3 if clock_dependency_applied else 0x1
         for core_id in range(num_cores):
             block_id, lane = divmod(core_id, 3)
@@ -42,7 +46,7 @@ def _capture(
     }
     if trace_schema_version is not None:
         metadata["trace_schema_version"] = trace_schema_version
-    if trace_schema_version == 3:
+    if trace_schema_version in (3, 4):
         atomic_rows = [row for row in rows if row[5] == "Atomic"]
         batch_rows = [row for row in atomic_rows if int(row[8]) & (1 << 7)]
         batch_calls = sum((int(row[8]) >> 8) & 0xFFFFFF for row in batch_rows)
@@ -56,7 +60,7 @@ def _capture(
             "dropped_records": 0,
         }
     return {
-        "l2_swimlane_level": 4 if trace_schema_version == 3 else 1,
+        "l2_swimlane_level": level,
         "metadata": metadata,
         "aicore_tasks": [],
         "aicpu_tasks": [],
@@ -71,14 +75,56 @@ def _convert(tmp_path, capture, *, pass_metadata=True):
     merged_path = tmp_path / "merged_swimlane.json"
     raw_path.write_text(json.dumps(capture), encoding="utf-8")
     data = read_perf_data(raw_path)
-    kwargs = {"fdwic_events": data.get("fdwic_events")}
     if pass_metadata:
-        kwargs.update(
+        generate_chrome_trace_json(
+            data["tasks"],
+            merged_path,
+            fdwic_events=data.get("fdwic_events"),
             trace_schema_version=data["trace_schema_version"],
             clock_freq_hz=data["clock_freq_hz"],
+            fdwic_num_cores=data.get("num_cores", 0),
+            fdwic_core_types=data.get("core_types"),
         )
-    generate_chrome_trace_json(data["tasks"], merged_path, **kwargs)
+    else:
+        generate_chrome_trace_json(data["tasks"], merged_path, fdwic_events=data.get("fdwic_events"))
     return data, json.loads(merged_path.read_text(encoding="utf-8"))["traceEvents"]
+
+
+def _v4_rows(num_cores=3):
+    rows = []
+    for core_id in range(num_cores):
+        block_id, lane = divmod(core_id, 3)
+        offset = core_id * 1_000
+        rows.extend(
+            [
+                [core_id, block_id, lane, -1, -1, "OrchestrationReplay", 100 + offset, 300 + offset, 0, 0],
+                [core_id, block_id, lane, -1, -1, "FinalDrain", 300 + offset, 360 + offset, 0, 0],
+                # task 0 is deliberately a kernel (not standalone's task_id % 5 Alloc rule).
+                [core_id, block_id, lane, 0, 7, "Submit", 110 + offset, 190 + offset, 1, 0],
+                [core_id, block_id, lane, 0, -1, "EfDrain", 110 + offset, 120 + offset, 0, 0],
+                [core_id, block_id, lane, 99, 7, "Kernel", 112 + offset, 116 + offset, 0, 0],
+                [core_id, block_id, lane, 0, -1, "Materialize", 120 + offset, 130 + offset, 0, 0],
+                [core_id, block_id, lane, 0, -1, "PrepareMap", 130 + offset, 140 + offset, 0, 0],
+                [core_id, block_id, lane, 0, 7, "Claim", 140 + offset, 150 + offset, 3, 0],
+                [core_id, block_id, lane, 0, 7, "Fanin", 150 + offset, 160 + offset, 0, 2],
+                [core_id, block_id, lane, 0, 7, "Register", 160 + offset, 170 + offset, 0, 1],
+                [core_id, block_id, lane, 0, 7, "WinnerBuild", 170 + offset, 185 + offset, 0, 0],
+                # DrainWon is real in production and remains a nested overlay.
+                [core_id, block_id, lane, 0, 7, "DrainWon", 172 + offset, 174 + offset, 1, 1],
+                [core_id, block_id, lane, 0, 7, "Kernel", 175 + offset, 180 + offset, 0, 0],
+                # task 1 is deliberately Alloc; kind comes from aux, never task_id modulo arithmetic.
+                [core_id, block_id, lane, 1, -1, "Submit", 200 + offset, 270 + offset, 0, 1],
+                [core_id, block_id, lane, 1, -1, "EfDrain", 200 + offset, 210 + offset, 0, 0],
+                [core_id, block_id, lane, 1, -1, "Materialize", 210 + offset, 220 + offset, 0, 1],
+                [core_id, block_id, lane, 1, -1, "PrepareMap", 220 + offset, 230 + offset, 0, 1],
+                [core_id, block_id, lane, 1, -1, "Register", 230 + offset, 240 + offset, 0, 0],
+                [core_id, block_id, lane, 1, -1, "Claim", 240 + offset, 250 + offset, 2, 1],
+                # Tensor-data waits may execute a kernel between Submit calls in production.
+                [core_id, block_id, lane, 88, 8, "Kernel", 280 + offset, 290 + offset, 0, 0],
+                [core_id, block_id, lane, 77, 9, "Kernel", 310 + offset, 330 + offset, 0, 0],
+            ]
+        )
+    return rows
 
 
 def test_atomic_and_clock_stay_on_scalar_lane_and_preserve_atomic_count(tmp_path):
@@ -282,9 +328,7 @@ def test_v3_rejects_non_uint32_flags(tmp_path, flags):
         (False, 0x13),  # A5Sim: source bracket only.
     ],
 )
-def test_v3_direct_return_boundary_matches_per_core_clock_baseline(
-    tmp_path, clock_dependency_applied, direct_flags
-):
+def test_v3_direct_return_boundary_matches_per_core_clock_baseline(tmp_path, clock_dependency_applied, direct_flags):
     capture = _capture(
         [[0, 0, 0, 7, -1, "Atomic", 100, 110, direct_flags, 4]],
         trace_schema_version=3,
@@ -409,3 +453,169 @@ def test_v1_claim_attempt_requires_contained_claim_max_evidence(tmp_path):
     assert by_name["claim.lost#1"]["args"]["claim_attempted_source"] == "contained_claim_max"
     assert by_name["claim#2"]["args"]["claim_attempted"] is None
     assert by_name["claim#2"]["args"]["claim_attempted_source"] == "unknown_v1_without_matching_claim_max"
+
+
+def test_v4_production_hierarchy_generates_thin_events_and_exact_residuals(tmp_path):
+    data, events = _convert(tmp_path, _capture(_v4_rows(), trace_schema_version=4, num_cores=3))
+
+    assert data["trace_schema_version"] == 4
+    duration_events = [event for event in events if event.get("ph") == "X"]
+    assert all("args" not in event and "cat" not in event for event in duration_events)
+    assert any(event["name"] == "orchestration_replay" for event in duration_events)
+    assert any(event["name"] == "final_drain" for event in duration_events)
+    assert any(event["name"] == "winner_build#0" for event in duration_events)
+    assert any(event["name"] == "drain_won#0" for event in duration_events)
+    assert not any(event["name"].startswith(("build#", "replay#", "alloc#")) for event in duration_events)
+
+    residuals = [
+        event
+        for event in duration_events
+        if event["name"] in {"submit_residual", "submit_tail_gap", "between_submit_residual"}
+    ]
+    assert not any(event["name"] == "submit_residual" for event in residuals)
+    assert sum(event["name"] == "submit_tail_gap" for event in residuals) == 6
+    assert sum(event["name"] == "between_submit_residual" for event in residuals) == 3
+
+
+def test_v4_residuals_reuse_the_combined_reader_time_origin(tmp_path):
+    capture = _capture(_v4_rows(), trace_schema_version=4, num_cores=3)
+    capture["aicore_tasks"] = [[0, 123, 0, 50, 60]]
+    raw_path = tmp_path / "l2_swimlane_records.json"
+    merged_path = tmp_path / "merged_swimlane.json"
+    raw_path.write_text(json.dumps(capture), encoding="utf-8")
+    data = read_perf_data(raw_path)
+
+    generate_chrome_trace_json(
+        [],
+        merged_path,
+        fdwic_events=data["fdwic_events"],
+        trace_schema_version=4,
+        clock_freq_hz=data["clock_freq_hz"],
+        fdwic_num_cores=data["num_cores"],
+        fdwic_core_types=data["core_types"],
+    )
+    events = json.loads(merged_path.read_text(encoding="utf-8"))["traceEvents"]
+
+    between = next(
+        event
+        for event in events
+        if event.get("name") == "between_submit_residual" and event["pid"] == 0 and event["tid"] == 0
+    )
+    assert between["ts"] == pytest.approx(0.14)
+    assert between["dur"] == pytest.approx(0.01)
+
+
+def test_v4_exclusive_report_closes_production_parents_and_kernel_containment(tmp_path):
+    capture = _capture(_v4_rows(), trace_schema_version=4, num_cores=3)
+    raw_path = tmp_path / "l2_swimlane_records.json"
+    report_path = tmp_path / "swimlane_exclusive_analysis.json"
+    raw_path.write_text(json.dumps(capture), encoding="utf-8")
+    data = read_perf_data(raw_path)
+
+    report = analyze_data(data, raw_path)
+    written = write_analysis_data(data, raw_path, report_path)
+
+    assert written == report_path
+    assert json.loads(report_path.read_text(encoding="utf-8"))["validation"]["status"] == "PASS"
+    assert report["capture"]["task_count_per_core"] == 2
+    assert report["aggregate_core_work"]["closure"]["submit_partition"]["exact"] is True
+    assert report["aggregate_core_work"]["closure"]["orchestration_replay"]["exact"] is True
+    assert report["aggregate_core_work"]["closure"]["final_drain"]["exact"] is True
+    assert report["kernel_containment"]["inside_efdrain_events"] == 3
+    assert report["kernel_containment"]["inside_winner_build_events"] == 3
+    assert report["kernel_containment"]["inside_orchestration_residual_events"] == 3
+    assert report["kernel_containment"]["inside_final_drain_events"] == 3
+    assert report["overlays"]["DrainWon"]["event_count"] == 3
+    assert report["overlays"]["DrainWon"]["included_in_additive_totals"] is False
+
+
+def test_v4_reader_rejects_kernel_crossing_exclusive_boundary(tmp_path):
+    rows = _v4_rows()
+    kernel = next(row for row in rows if row[0] == 0 and row[3] == 99 and row[5] == "Kernel")
+    kernel[6:8] = [115, 125]
+    raw_path = tmp_path / "l2_swimlane_records.json"
+    raw_path.write_text(
+        json.dumps(_capture(rows, trace_schema_version=4, num_cores=3)),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Kernel crosses exclusive child"):
+        read_perf_data(raw_path)
+
+
+def test_v4_reader_rejects_kernel_inside_submit_residual(tmp_path):
+    rows = _v4_rows()
+    kernel = next(row for row in rows if row[0] == 0 and row[3] == 99 and row[5] == "Kernel")
+    kernel[6:8] = [186, 189]
+    raw_path = tmp_path / "l2_swimlane_records.json"
+    raw_path.write_text(
+        json.dumps(_capture(rows, trace_schema_version=4, num_cores=3)),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Kernel is inside Submit residual"):
+        read_perf_data(raw_path)
+
+
+def test_v4_supports_all_existing_fdwic_collection_levels(tmp_path):
+    for level in (1, 2, 3):
+        capture = _capture(_v4_rows(), trace_schema_version=4, num_cores=3, level=level)
+        raw_path = tmp_path / f"l2_swimlane_records_level{level}.json"
+        raw_path.write_text(json.dumps(capture), encoding="utf-8")
+        assert read_perf_data(raw_path)["l2_swimlane_level"] == level
+
+
+def test_v4_uses_dynamic_two_block_core_topology(tmp_path):
+    capture = _capture(_v4_rows(num_cores=6), trace_schema_version=4, num_cores=6)
+    raw_path = tmp_path / "l2_swimlane_records.json"
+    raw_path.write_text(json.dumps(capture), encoding="utf-8")
+
+    report = analyze_data(read_perf_data(raw_path), raw_path)
+
+    assert report["capture"]["core_count"] == 6
+    assert report["per_role_core_statistics"]["aic"]["core_count"] == 2
+    assert report["per_role_core_statistics"]["aiv"]["core_count"] == 4
+
+
+@pytest.mark.parametrize("legacy_phase", ["Alloc", "Build", "Replay"])
+def test_v4_rejects_legacy_overlapping_lap_phases(tmp_path, legacy_phase):
+    rows = _v4_rows()
+    rows.append([0, 0, 0, 0, 7, legacy_phase, 170, 185, 0, 0])
+    capture = _capture(rows, trace_schema_version=4, num_cores=3)
+    raw_path = tmp_path / "l2_swimlane_records.json"
+    raw_path.write_text(json.dumps(capture), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="forbids legacy lap phase"):
+        read_perf_data(raw_path)
+
+
+def test_v4_rejects_missing_parent_wrong_tail_and_overlapping_children(tmp_path):
+    mutations = []
+
+    missing_parent = [row for row in _v4_rows() if not (row[0] == 1 and row[5] == "FinalDrain")]
+    mutations.append((missing_parent, "exactly one OrchestrationReplay and FinalDrain"))
+
+    wrong_tail = _v4_rows()
+    next(row for row in wrong_tail if row[0] == 0 and row[5] == "WinnerBuild")[5] = "AllocComplete"
+    mutations.append((wrong_tail, "invalid exclusive sequence"))
+
+    overlapping = _v4_rows()
+    next(row for row in overlapping if row[0] == 0 and row[5] == "Materialize")[6] = 119
+    mutations.append((overlapping, "overlapping exclusive children"))
+
+    for index, (rows, message) in enumerate(mutations):
+        capture = _capture(rows, trace_schema_version=4, num_cores=3)
+        raw_path = tmp_path / f"invalid_{index}.json"
+        raw_path.write_text(json.dumps(capture), encoding="utf-8")
+        with pytest.raises(ValueError, match=message):
+            read_perf_data(raw_path)
+
+
+def test_v4_requires_zero_drop_producer_summary_even_without_atomic_rows(tmp_path):
+    capture = _capture(_v4_rows(), trace_schema_version=4, num_cores=3)
+    capture["metadata"]["fdwic_summary"]["dropped_records"] = 1
+    raw_path = tmp_path / "l2_swimlane_records.json"
+    raw_path.write_text(json.dumps(capture), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"fdwic_summary\.dropped_records"):
+        read_perf_data(raw_path)

@@ -31,6 +31,24 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+try:
+    from .fdwic_swimlane_exclusive_analyzer import write_analysis_data
+    from .fdwic_swimlane_schema import (
+        LEGACY_LAP_PHASES,
+        V4_PHASES,
+        iter_v4_residual_spans,
+        validate_and_partition_v4,
+    )
+except ImportError:
+    # Preserve direct-script use from the tools directory.
+    from fdwic_swimlane_exclusive_analyzer import write_analysis_data  # type: ignore[no-redef]
+    from fdwic_swimlane_schema import (  # type: ignore[no-redef]
+        LEGACY_LAP_PHASES,
+        V4_PHASES,
+        iter_v4_residual_spans,
+        validate_and_partition_v4,
+    )
+
 _FDWIC_PHASE_NAMES = {
     "Kernel": "kernel",
     "Alloc": "alloc",
@@ -48,6 +66,11 @@ _FDWIC_PHASE_NAMES = {
     "Register": "register",
     "Atomic": "atomic",
     "ClockBaseline": "clock_baseline",
+    "OrchestrationReplay": "orchestration_replay",
+    "FinalDrain": "final_drain",
+    "WinnerBuild": "winner_build",
+    "AllocComplete": "alloc_complete",
+    "LoserReplay": "loser_replay",
 }
 
 # IDs 0..14 are the standalone PA ABI. Real PA only appends IDs so archived
@@ -131,6 +154,35 @@ _FDWIC_ATOMIC_RESULT_UNUSED_SITE_IDS = {0, 3, 6, 7, 13, 16, 17, 18, 19, 20, 24, 
 _FDWIC_POLL_BATCH_SITE_OP_IDS = {1: 0, 2: 0, 5: 0, 11: 0, 12: 0, 14: 0, 21: 0, 22: 0, 23: 1, 27: 0}
 
 
+def _validate_fdwic_v4_phase_fields(row_index, task_id, func_id, phase, flags, aux):
+    """Mirror the production host's non-atomic schema-v4 row contract."""
+
+    if phase in {"Kernel", "Commit"}:
+        valid = flags <= 1 and aux == 0
+    elif phase == "DrainWon":
+        valid = flags == 1 and aux < 4
+    elif phase == "RingBp":
+        valid = flags == 0 and aux <= 1
+    elif phase == "Submit":
+        valid = task_id >= 0 and flags <= 1 and aux <= 1
+    elif phase in {"Materialize", "PrepareMap", "Register"}:
+        valid = task_id >= 0 and flags == 0 and aux <= 1
+    elif phase == "Fanin":
+        valid = task_id >= 0 and flags == 0 and aux <= 16
+    elif phase in {"EfDrain", "WinnerBuild", "AllocComplete", "LoserReplay"}:
+        valid = task_id >= 0 and flags == 0 and aux == 0
+    elif phase in {"OrchestrationReplay", "FinalDrain"}:
+        valid = task_id == -1 and func_id == -1 and flags == 0 and aux == 0
+    else:
+        # Claim, Atomic, and ClockBaseline have dedicated validation below.
+        return
+    if not valid:
+        raise ValueError(
+            f"fdwic_events[{row_index}] has invalid schema-v4 {phase} fields: "
+            f"task={task_id} func={func_id} flags=0x{flags:x} aux={aux}"
+        )
+
+
 def _func_id_to_letter(func_id):
     """Map a non-negative integer func_id to a numeric+letter label.
 
@@ -169,12 +221,14 @@ def _task_display_name(func_id, func_id_to_name, tdisp):
     return f"func_{_func_id_to_letter(func_id)}({tdisp})"
 
 
-def _append_fdwic_dist_engine_events(  # noqa: PLR0912
+def _append_fdwic_dist_engine_events(  # noqa: PLR0912, PLR0915
     events,
     fdwic_events,
     func_id_to_name=None,
     trace_schema_version=1,
     clock_freq_hz=0,
+    num_cores=0,
+    core_types=None,
 ):
     """Append fully_distributed_within_core AICore-runtime spans.
 
@@ -195,6 +249,26 @@ def _append_fdwic_dist_engine_events(  # noqa: PLR0912
         if func_id_to_name:
             return func_id_to_name.get(str(func_id), func_id_to_name.get(func_id, f"f{func_id}"))
         return f"f{func_id}"
+
+    v4_model = None
+    residual_factor = 0.0
+    cycle_time_us = {}
+    if trace_schema_version == 4:
+        if clock_freq_hz <= 0:
+            raise ValueError("schema-v4 FDWIC conversion requires a positive clock frequency")
+        if not num_cores:
+            core_ids = {int(event["core_id"]) for event in fdwic_events}
+            num_cores = max(core_ids, default=-1) + 1
+        if core_types is None:
+            inferred_roles = {}
+            for event in fdwic_events:
+                inferred_roles.setdefault(int(event["core_id"]), "aic" if int(event["lane"]) == 0 else "aiv")
+            core_types = [inferred_roles.get(core_id, "unknown") for core_id in range(num_cores)]
+        v4_model = validate_and_partition_v4(fdwic_events, int(num_cores), list(core_types))
+        residual_factor = 1_000_000.0 / float(clock_freq_hz)
+        for event in fdwic_events:
+            cycle_time_us.setdefault(int(event["start_cycles"]), float(event["start_time_us"]))
+            cycle_time_us.setdefault(int(event["end_cycles"]), float(event["end_time_us"]))
 
     blocks = sorted({int(e["block_id"]) for e in fdwic_events if int(e["block_id"]) >= 0})
     core_by_block_lane = {}
@@ -294,6 +368,9 @@ def _append_fdwic_dist_engine_events(  # noqa: PLR0912
         elif phase == "commit":
             name = f"{phase}#{task_id}"
             tid = lane + 3
+        elif phase in ("orchestration_replay", "final_drain"):
+            name = phase
+            tid = lane
         else:
             name = f"{phase}#{task_id}"
             tid = lane
@@ -328,9 +405,7 @@ def _append_fdwic_dist_engine_events(  # noqa: PLR0912
                     "estimate_formula": "call_count * calibrated_atomic_cost",
                     "is_poll_batch": True,
                     "batch_semantics": (
-                        "idempotent_failed_exchange_retries"
-                        if atomic_site_id == 23
-                        else "observation_load_calls"
+                        "idempotent_failed_exchange_retries" if atomic_site_id == 23 else "observation_load_calls"
                     ),
                     "duration_semantics": "logical_poll_episode_envelope_not_single_atomic_latency",
                     "may_contain_interleaved_direct_atomics": True,
@@ -387,7 +462,26 @@ def _append_fdwic_dist_engine_events(  # noqa: PLR0912
                 "execution_unit": "scalar",
             }
             event["cat"] = "scalar_clock"
+        if trace_schema_version == 4:
+            # Schema-v4 keeps the ten-column raw file as the authority. The
+            # merged trace carries only the fields Perfetto needs; phase/task
+            # identity is already encoded in the event name.
+            event.pop("args", None)
+            event.pop("cat", None)
         events.append(event)
+
+    if v4_model is not None:
+        for residual in iter_v4_residual_spans(v4_model):
+            events.append(
+                {
+                    "ph": "X",
+                    "name": residual.name,
+                    "pid": residual.block_id,
+                    "tid": residual.lane,
+                    "ts": round(cycle_time_us[residual.start_cycle], 3),
+                    "dur": round((residual.end_cycle - residual.start_cycle) * residual_factor, 3),
+                }
+            )
 
 
 def normalize_pto2_task_id_int(v):
@@ -435,7 +529,7 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
           "l2_swimlane_level": <1..4>,
           "metadata": {
             "clock_freq_hz": <int>,
-            "trace_schema_version": <1|2|3>,     # optional; default 1
+            "trace_schema_version": <1|2|3|4>,   # optional; default 1
             "num_cores": <int>,
             "core_types": ["aic"|"aiv", ...],   # indexed by core_id
             "core_to_thread": [<int>, ...]      # optional (level >= 3)
@@ -494,8 +588,8 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
     if clock_freq_hz <= 0:
         raise ValueError(f"metadata missing/zero clock_freq_hz: {clock_freq_hz}")
     trace_schema_version = int(metadata.get("trace_schema_version", 1))
-    if trace_schema_version not in (1, 2, 3):
-        raise ValueError(f"Unsupported metadata.trace_schema_version: {trace_schema_version} (expected 1, 2, or 3)")
+    if trace_schema_version not in (1, 2, 3, 4):
+        raise ValueError(f"Unsupported metadata.trace_schema_version: {trace_schema_version} (expected 1, 2, 3, or 4)")
     num_cores = int(metadata.get("num_cores") or 0)
     core_types = list(metadata.get("core_types") or [])
     core_to_thread = list(metadata.get("core_to_thread") or [])
@@ -508,11 +602,13 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
     fdwic_summary = metadata.get("fdwic_summary")
     if trace_schema_version == 3 and level != 4:
         raise ValueError("metadata.trace_schema_version=3 requires l2_swimlane_level=4")
-    if trace_schema_version == 3 and (num_cores <= 0 or len(core_types) != num_cores):
+    if trace_schema_version >= 3 and (num_cores <= 0 or len(core_types) != num_cores):
         raise ValueError(
-            f"metadata.trace_schema_version=3 requires num_cores matching core_types: "
+            f"metadata.trace_schema_version>=3 requires num_cores matching core_types: "
             f"num_cores={num_cores} core_types={len(core_types)}"
         )
+    if trace_schema_version == 4 and not fdwic_rows:
+        raise ValueError("metadata.trace_schema_version=4 requires non-empty fdwic_events")
 
     # AICore lookup keyed by (core_id, reg_task_id). Two dispatches of the
     # same PTO2 task_token_raw to the same core (SPMD over-subscription, MIX
@@ -721,7 +817,7 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
         flags = int(flags)
         aux = int(aux)
         phase = str(phase)
-        if trace_schema_version == 3:
+        if trace_schema_version >= 3:
             if not 0 <= core_id < num_cores:
                 raise ValueError(f"fdwic_events[{row_index}] has invalid core_id {core_id}")
             if task_id < -1 or func_id < -1 or aux < 0 or phase not in _FDWIC_PHASE_NAMES:
@@ -730,11 +826,15 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
                     f"task={task_id} func={func_id} phase={phase!r} aux={aux}"
                 )
             if not (0 <= start_cycles <= end_cycles <= 0xFFFFFFFFFFFFFFFF):
-                raise ValueError(
-                    f"fdwic_events[{row_index}] has invalid cycle range {start_cycles}..{end_cycles}"
-                )
+                raise ValueError(f"fdwic_events[{row_index}] has invalid cycle range {start_cycles}..{end_cycles}")
             if not 0 <= flags <= 0xFFFFFFFF:
                 raise ValueError(f"fdwic_events[{row_index}] has invalid uint32 flags {flags}")
+        if trace_schema_version == 4 and phase in LEGACY_LAP_PHASES:
+            raise ValueError(f"fdwic_events[{row_index}] schema-v4 forbids legacy lap phase {phase!r}")
+        if trace_schema_version < 4 and phase in V4_PHASES:
+            raise ValueError(f"fdwic_events[{row_index}] phase {phase!r} requires trace_schema_version=4")
+        if trace_schema_version == 4:
+            _validate_fdwic_v4_phase_fields(row_index, task_id, func_id, phase, flags, aux)
         if phase == "Claim" and trace_schema_version >= 2:
             if flags & ~0x3 or (flags & 0x1 and not flags & 0x2):
                 raise ValueError(f"fdwic_events[{row_index}] has invalid Claim flags 0x{flags:x}")
@@ -742,6 +842,7 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
             call_count = (flags >> 8) & 0xFFFFFF
             if (
                 trace_schema_version < 3
+                or (trace_schema_version == 4 and level != 4)
                 or call_count == 0
                 or not flags & (1 << 4)
                 or _FDWIC_POLL_BATCH_SITE_OP_IDS.get(aux) != (flags & 0xF)
@@ -750,7 +851,9 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
                 or func_id != -1
             ):
                 raise ValueError(f"fdwic_events[{row_index}] has invalid Atomic PollBatch flags 0x{flags:x}")
-        elif phase == "Atomic" and trace_schema_version == 3:
+        elif phase == "Atomic" and trace_schema_version in (3, 4):
+            if level != 4:
+                raise ValueError(f"fdwic_events[{row_index}] Atomic requires l2_swimlane_level=4")
             op = flags & 0xF
             result_used = bool(flags & (1 << 4))
             value_zero = bool(flags & (1 << 5))
@@ -765,12 +868,12 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
                 or (payload and op != 3)
                 or func_id != -1
             ):
-                raise ValueError(
-                    f"fdwic_events[{row_index}] has invalid direct Atomic site={aux} flags=0x{flags:x}"
-                )
+                raise ValueError(f"fdwic_events[{row_index}] has invalid direct Atomic site={aux} flags=0x{flags:x}")
             if result_used:
                 v3_result_used_direct_rows.append((row_index, core_id, return_ready))
-        if phase == "ClockBaseline" and trace_schema_version == 3:
+        if phase == "ClockBaseline" and trace_schema_version in (3, 4):
+            if level != 4:
+                raise ValueError(f"fdwic_events[{row_index}] ClockBaseline requires l2_swimlane_level=4")
             dependency = bool(flags & 0x1)
             dependency_applied = bool(flags & 0x2)
             if flags & ~0x3 or (dependency_applied and not dependency) or task_id != -1 or func_id != -1 or aux != 0:
@@ -781,7 +884,7 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
                 clock_state["return_ready"] = dependency_applied
             else:
                 clock_state["plain"] += 1
-        if phase == "Claim" and trace_schema_version == 3 and aux > 1:
+        if phase == "Claim" and trace_schema_version >= 3 and aux > 1:
             raise ValueError(f"fdwic_events[{row_index}] has invalid Claim aux {aux}")
         if phase == "Atomic":
             observed_summary["atomic_records"] += 1
@@ -814,7 +917,7 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
             }
         )
 
-    if trace_schema_version == 3:
+    if trace_schema_version in (3, 4) and level == 4:
         for core_id in range(num_cores):
             clock_state = v3_clock_rows[core_id]
             if clock_state["plain"] != 1 or clock_state["dependency"] != 1:
@@ -829,8 +932,9 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
                     f"fdwic_events[{row_index}] direct Atomic return_ready={return_ready} does not match "
                     f"core {core_id} ClockBaseline dependency_applied={expected_return_ready}"
                 )
+    if trace_schema_version >= 3:
         if not isinstance(fdwic_summary, dict):
-            raise ValueError("metadata.fdwic_summary is required for trace_schema_version=3")
+            raise ValueError("metadata.fdwic_summary is required for trace_schema_version>=3")
         required_summary = {
             "records": observed_summary["records"],
             "atomic_records": observed_summary["atomic_records"],
@@ -850,6 +954,9 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
                     f"metadata.fdwic_summary.{key}={producer_value} does not match raw value {observed_value}"
                 )
 
+    if trace_schema_version == 4:
+        validate_and_partition_v4(fdwic_events, num_cores, core_types)
+
     out = {
         "l2_swimlane_level": level,
         "clock_freq_hz": clock_freq_hz,
@@ -864,8 +971,12 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
         out["core_to_thread"] = core_to_thread
     if fdwic_events:
         out["fdwic_events"] = fdwic_events
-    if trace_schema_version == 3:
+    if trace_schema_version >= 3:
+        assert isinstance(fdwic_summary, dict)
         out["fdwic_summary"] = dict(fdwic_summary)
+    if trace_schema_version == 4:
+        out["num_cores"] = num_cores
+        out["core_types"] = core_types
     return out
 
 
@@ -1369,6 +1480,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     fdwic_events=None,
     trace_schema_version=1,
     clock_freq_hz=0,
+    fdwic_num_cores=0,
+    fdwic_core_types=None,
 ):
     """Generate Chrome Trace Event Format JSON from task data.
 
@@ -1385,7 +1498,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         orchestrator_phases: Optional list of per-task orchestrator phase records (l2_swimlane_level >= 4)
         core_to_thread: Optional list mapping core_id (index) to scheduler thread index (-1 = unassigned)
         trace_schema_version: FDWIC raw record schema (1 legacy, 2 explicit Claim flags,
-            3 exact-count Atomic PollBatch rows)
+            3 exact-count Atomic PollBatch rows, 4 exclusive hierarchy)
         clock_freq_hz: Raw FDWIC cycle-counter frequency used by ClockBaseline event arguments
 
     Generates processes in the trace:
@@ -1437,6 +1550,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             func_id_to_name,
             trace_schema_version=trace_schema_version,
             clock_freq_hz=clock_freq_hz,
+            num_cores=fdwic_num_cores,
+            core_types=fdwic_core_types,
         )
         with open(output_path, "w") as f:
             json.dump({"displayTimeUnit": "ns", "traceEvents": events}, f, indent=2)
@@ -2867,7 +2982,13 @@ def main():
             fdwic_events=data.get("fdwic_events"),
             trace_schema_version=data.get("trace_schema_version", 1),
             clock_freq_hz=data.get("clock_freq_hz", 0),
+            fdwic_num_cores=data.get("num_cores", 0),
+            fdwic_core_types=data.get("core_types"),
         )
+        exclusive_output = None
+        if data.get("trace_schema_version") == 4 and data.get("fdwic_events"):
+            exclusive_output = input_path.parent / "swimlane_exclusive_analysis.json"
+            write_analysis_data(data, input_path, exclusive_output)
         if args.overhead and deps_edges is None:
             print(
                 "Warning: --overhead needs deps.json for task readiness; no deps found, "
@@ -2878,6 +2999,8 @@ def main():
         print("\n✓ Conversion complete")
         print(f"  Input:  {input_path}")
         print(f"  Output: {output_path}")
+        if exclusive_output is not None:
+            print(f"  Exclusive analysis: {exclusive_output}")
         print(f"\nTo visualize: Open https://ui.perfetto.dev/ and drag in {output_path}")
 
         print_task_statistics(data["tasks"], func_names)
