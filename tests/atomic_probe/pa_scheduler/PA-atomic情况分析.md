@@ -2258,3 +2258,38 @@ outputs/pa_scheduler_swimlane_20260719_114815_617346/ccec/
 为 0，尾部 residual 为 41,008,786/433,383,588 cycle（9.4625%），Submit
 间 residual 为 67,065,321/500,448,909 cycle（13.4010%）。这些数值是
 相同观测口径下的归因基线，不把边界重分类宣称为 atomic 或调度性能收益。
+
+#### 7.5.22 真实 PA level-1 的 atomic 观测代码布局回退
+
+2026-07-19 在把 standalone 的低频 winner 布局提示同步到真实 PA 前，先用当前
+源码重建 host/AICPU/AICore runtime 并重采 level-1 基线。重建是必要条件：旧 host
+runtime 不能解释当前 phase 枚举，产生过一轮没有 Submit 的错误 raw，该轮没有进入
+统计。有效基线三轮首末 Submit 为 5.774073/5.596633/5.631038 ms，中位数
+5.631038 ms，明显慢于 7 月 17 日 pre-atomic 中位数 5.115620 ms。
+
+level 1 的有效 raw 中没有 Atomic/ClockBaseline 记录，所以这不是 level-4 atomic
+记录写或逐 atomic SYS_CNT 的直接开销。但 atomic 接入后的单一 runtime ELF 仍保留
+所有 runtime-gated level-4 慢路：AIC/AIV `dist_engine .text` 已由历史
+`0x13bb8/0x13c10` 增至 `0x54ce0/0x56e80`，`dist_submit_impl` 由
+42,136/42,152 B 增至 100,724/102,588 B。level 1 每个 wrapper 虽直接走
+`g_fdwic_swimlane_level < 4` 返回，完整诊断分支仍参与内联和基本块布局。
+
+只把真实 BuildWinner 和 AllocComplete 两个 1/96 winner 分支标为冷路，不改
+Fanin、atomic 调用、phase 边界或记录格式后，三轮变为
+5.165473/5.198404/5.192087 ms，中位数 5.192087 ms；相对当前观测版下降
+0.438951 ms（7.80%），但仍比历史 5.115620 ms 慢 1.49%。AIV loser 单次均值
+中位数由 3,558.067 降至 3,261.205 cycles，AIC 仅由 2,864.829 降至
+2,839.587 cycles，说明主要修复的是诊断代码膨胀后的 AIV 热路布局/取指回退，
+不能把它描述为在旧 5.1 ms 基线上新增 7.8% 性能。
+
+本轮真实 A5 所有样本均为 96 核、122,880 Submit，固定 phase 数量和逐核 task id
+连续性通过；完整候选泳道位于：
+
+~~~text
+outputs/TestPagedAttentionUnroll_Case1_20260719_131116/merged_swimlane.json
+~~~
+
+下一步先单独验证 level-4 enable 路径的冷分支概率，尝试在保留完整 atomic 泳道能力
+的前提下继续压缩 level-1 热路。若后续专门采集 I-cache miss，则使用独立诊断构建
+把普通泳道与 atomic 泳道整体编译去除，不能让待分析的 I-cache 数据继续包含这些
+观察代码自身的巨大代码足迹。

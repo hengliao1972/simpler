@@ -698,6 +698,72 @@ outputs/pa_scheduler_swimlane_20260719_123520_660296/ccec/
 frontier helping、kernel 长尾和 winner 分布影响，因此后续迭代继续以原始
 逐核 cycle 闭合作为主证据，以关闭泳道的 Submit span 作为实际性能门禁。
 
+### 6.6 同步真实 PA：恢复 atomic 观测接入后的布局回退
+
+standalone 的两处低概率 winner 分支严格映射到真实
+`submit_runtime.h` 的 kernel BuildWinner 和 AllocComplete 分支。winner-only
+Fanin 分支保持不动；真实 kernel loser 仍执行既有 Replay lap 和
+`drain_block_won()`。补丁只把这两处改为
+`__builtin_expect(is_winner, 0)`，没有增删 trace/atomic 调用，也没有移动
+Submit 或子阶段边界。
+
+正式 A/B 使用真实 A5 Case1、256 batch、level-1 phase 泳道和当前 CANN 9.1。
+首先重建当前源码的 host/AICPU/AICore runtime；早先 7 月 17 日的通用 runtime
+缓存无法解释当前新增 phase 枚举，曾产生一轮只有 `Kernel/Alloc` 名称的无效 raw，
+该轮已排除。有效样本均满足 96 核、每核 1,280 Submit、全局 122,880 Submit，
+固定 phase 数量与 task id 连续性全部通过。正式轮次对称关闭 case 结束后的 merged
+转换，只省去离线 221 MB 可视化文件，不改变设备采集；基线和候选各另留一轮完整
+merged warmup。
+
+| 构建 | warmup | 正式三轮首末 Submit | 中位数 |
+| --- | ---: | --- | ---: |
+| 当前 atomic 观测版基线 | 5.621733 ms | 5.774073 / 5.596633 / 5.631038 ms | 5.631038 ms |
+| 两处 winner 冷路布局 | 5.171619 ms | 5.165473 / 5.198404 / 5.192087 ms | 5.192087 ms |
+
+当前源码内的相对下降为 0.438951 ms，即 7.80%。逐核 Submit span 中位数也由
+5.530236 ms 降为 5.094550 ms，说明变化不是单个全局长尾造成。三个指标分别取
+三轮中位数时，Submit 累计由 439,990,736 降为 403,166,351 cycles，Submit 间
+累计由 81,293,671 降为 76,481,692 cycles，逐核首末 Submit 区间累计由
+520,995,184 降为 479,761,953 cycles；每一轮内部都满足
+`Submit + between = envelope` 整数闭合，不能把三个独立中位数再次相加。
+
+收益主要落在 AIV loser：AIC/AIV loser 单次均值的三轮中位数分别由
+2,864.829/3,558.067 降为 2,839.587/3,261.205 cycles。按 task 类型，QK/SF/PV/UP
+loser 分别下降约 289/306/376/194 cycles，Alloc loser 则增加约 128 cycles；
+高频路径的净收益覆盖了低频路径回退。
+
+这项结果必须放回历史基线解释。7 月 17 日 pre-atomic 三轮中位数为
+5.115620 ms；当前候选 5.192087 ms 仍慢约 1.49%，因此本节是**恢复观测接入后的
+布局回退**，不是在旧 5.1 ms 上新增 7.8% 收益。编译产物提供了对应证据：
+
+| 产物 | pre-atomic 缓存 | 当前基线 | winner 冷路布局 |
+| --- | ---: | ---: | ---: |
+| AIC `dist_engine .text` | `0x13bb8` | `0x54ce0` | `0x54d90` |
+| AIV `dist_engine .text` | `0x13c10` | `0x56e80` | `0x572f8` |
+| 最终 PA ELF `.text` | `0x3e518` | `0xb6b50` | `0xb7050` |
+| AIC/AIV `dist_submit_impl` | 42,136 / 42,152 B | 100,724 / 102,588 B | 100,860 / 103,676 B |
+
+level 1 的 raw 没有 Atomic 或 ClockBaseline 记录，说明本轮约 0.44 ms 回退不是
+atomic 落盘或逐 atomic 时间戳的直接成本。但同一 ELF 必须允许运行时切到 level 4，
+完整 atomic 慢路仍被编译并大量内联；level 1 只走
+`g_fdwic_swimlane_level < 4` 快速返回。两条概率提示在不删除观察能力的情况下恢复
+大部分性能，结合 AIV loser 的变化，当前证据最支持“诊断代码膨胀后热控制流布局/
+取指恶化”为主要原因。尚余约 1.5% 历史差值，继续按单变量方式优化 level-4 冷路；
+专门采 I-cache miss 的诊断构建则应整体编译去除泳道与 atomic，避免观察代码污染
+待测 ELF。
+
+权威样本为：
+
+```text
+基线：outputs/TestPagedAttentionUnroll_Case1_20260719_130443/
+      outputs/TestPagedAttentionUnroll_Case1_20260719_130608/
+      outputs/TestPagedAttentionUnroll_Case1_20260719_130728/
+候选：outputs/TestPagedAttentionUnroll_Case1_20260719_131319/
+      outputs/TestPagedAttentionUnroll_Case1_20260719_131435/
+      outputs/TestPagedAttentionUnroll_Case1_20260719_131551/
+完整候选泳道：outputs/TestPagedAttentionUnroll_Case1_20260719_131116/merged_swimlane.json
+```
+
 ## 结论
 
 历史 schema-v3 泳道不闭合的根因不是缺少一次 duration 求和，而是

@@ -338,7 +338,7 @@ dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &arg
     TRACE_SPAN_BEGIN(register_trace);
     dist_submit_register_outputs(ctx, args, /*include_existing=*/true);
     TRACE_SPAN_END(register_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Register, 0, 1);
-    if (is_winner) {
+    if (__builtin_expect(is_winner, 0)) {
         TRACE_LAP(ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Build);
         dist_submit_build_winner_task(ctx, mixed, args);
     } else {
@@ -370,7 +370,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
             (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U) :
             static_cast<uint32_t>(is_winner);
     TRACE_SPAN_END(claim_trace, ctx.self, ctx.task_id, -1, TracePhase::Claim, claim_flags, 1);
-    if (is_winner) {
+    if (__builtin_expect(is_winner, 0)) {
         dist_submit_complete_alloc(ctx);
         TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::Alloc);
     } else {
