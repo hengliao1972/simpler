@@ -643,6 +643,61 @@ Perfetto 中恰有 122,880 条 `submit_tail_gap` 和 122,784 条
 `between_submit_residual`，分别对应 `96*1280` 个 Submit 尾段和
 `96*(1280-1)` 个相邻 Submit 间段；重分类未增加设备记录或逐事件字段。
 
+### 6.5 第一项真实消减：winner 冷路布局
+
+对基线优化后 IR 的核对表明，Alloc loser 在 Claim 记录发布后要跨过约
+2,200 个 IR 编号的 winner 重块，其他四类 loser 在 Register 记录发布后要
+跨过约 3,300 个 IR 编号的 winner 重块，才能进入公共 Submit 尾部。两个分支
+原先都没有概率信息，而每个 task 实际只有 1/96 worker 为 winner。B256 基线
+中 121,600 次 loser 占尾部 cycle 的 99.62%，因此先做只改变基本块布局的
+单变量实验：在 Alloc 和非 Alloc 的两个重型 winner 分支上使用
+`__builtin_expect(winner, 0)`。该改动不移动时间边界，不增删记录，也不改变
+Claim、完成发布、失败返回或 winner 计算语义。
+
+CCEC 产物的 `.text` 由 AIC/AIV 的 `0x5d708/0x5ec38` 增至
+`0x5eb18/0x5fc38`，分别增加 5,136/4,096 bytes。这个体积代价不能忽略；
+后续若继续叠加布局改动，必须同时检查代码尺寸和 Submit PMU 的 I-cache 指标。
+
+B1 采用“基线重编译三轮 → 候选重编译三轮”的复测，所有轮次均保持 96 核、
+每核 5 Submit、`dropped=0`、phase/atomic 记录闭合和两类整数闭合：
+
+| 口径 | 基线三轮 | 候选三轮 | 中位数变化 |
+| --- | --- | --- | --- |
+| `submit_tail_residual` | 193,292 / 184,214 / 191,029 cycles | 124,758 / 121,064 / 117,931 cycles | 191,029 → 121,064，-36.63% |
+| `submit_envelope` | 2,426,417 / 2,289,891 / 2,540,203 cycles | 2,273,874 / 2,251,771 / 2,322,538 cycles | 2,426,417 → 2,273,874，-6.29% |
+
+尾部变化集中在高频 loser：Register→SubmitEnd 的单次均值由约
+405～422 cycles 降至 251～268 cycles，Claim→SubmitEnd 由约 304～361
+cycles 降至 173～286 cycles。低频 winner 的 WinnerBuild/AllocComplete 尾部
+变长，但 B1 每轮仅有 4/1 次，未抵消 loser 收益。
+
+阶段性 B256 规模门禁使用：
+
+```text
+outputs/pa_scheduler_swimlane_20260719_123520_660296/ccec/
+```
+
+与 6.4 节基线相比：
+
+| 指标 | 基线 | winner 冷路布局 | 变化 |
+| --- | ---: | ---: | ---: |
+| 全局首末 Submit | 5,360.061 us | 5,278.401 us | -81.660 us，-1.52% |
+| Submit 尾部 residual | 41,008,786 | 27,155,661 cycles | -33.78% |
+| Submit union | 433,383,588 | 414,313,448 cycles | -4.40% |
+| Submit 间 residual | 67,065,321 | 69,022,235 cycles | +2.92% |
+| Submit envelope | 500,448,909 | 483,335,683 cycles | -3.42% |
+
+因此尾部下降没有被等量搬到 Submit 间：即使计入间隙，逐核完整 Submit 区间
+仍净减 17,113,226 cycles。候选 raw 为 839,465 条、`dropped=0`，所有语义
+断言和整数闭合通过；raw/merged 分别为 55,787,614/88,758,522 bytes，未因
+该优化增加观察数据量。
+
+关闭泳道记录后又做了候选—基线—候选的 ABA 验证，每组 5 轮：候选两组
+中位数分别为 3.665017/3.715385 ms，夹在中间的基线为 3.988115 ms，候选
+分别快 8.10%/6.84%。这说明收益并非只存在于 trace 发布路径。墙钟仍受
+frontier helping、kernel 长尾和 winner 分布影响，因此后续迭代继续以原始
+逐核 cycle 闭合作为主证据，以关闭泳道的 Submit span 作为实际性能门禁。
+
 ## 结论
 
 历史 schema-v3 泳道不闭合的根因不是缺少一次 duration 求和，而是

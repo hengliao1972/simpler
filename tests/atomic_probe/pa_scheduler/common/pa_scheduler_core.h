@@ -634,7 +634,10 @@ PA_DEVICE bool SubmitTask(
             ProfilePhase::Claim, claim_begin, claim_end,
             (winner ? kClaimWon : 0U) | (claim.attempted ? kClaimAttempted : 0U), 1
         );
-        if (winner) {
+        // 每个 task 只有 1/96 worker 进入 winner 重型路径。把该分支标成冷路
+        // 只影响基本块布局，使占绝大多数的 loser 尽量顺序进入 Submit 公共
+        // 尾部；不改变 Claim 结果、完成发布或泳道边界。
+        if (__builtin_expect(winner, 0)) {
             const uint64_t alloc_complete_begin = claim_end;
             if (!HeapGuard<Ops, Profile>(
                     state, worker, task_id, context.output_bytes, stats
@@ -694,7 +697,9 @@ PA_DEVICE bool SubmitTask(
             stats.trace, stats.result, static_cast<int32_t>(task_id), function_id, TracePhase::Register,
             ProfilePhase::Register, register_begin, register_end, 0, 1
         );
-        if (winner) {
+        // BuildWinner 会内联 ring、heap 和真计算提交逻辑；提示其为 1/96
+        // 冷路，避免 loser 为跳过大块代码付出额外取指代价。
+        if (__builtin_expect(winner, 0)) {
             const uint64_t winner_build_begin = register_end;
             if (!BuildWinner<Ops, Profile>(
                     state, worker, task_id, kind, args, context, context.fanin,
