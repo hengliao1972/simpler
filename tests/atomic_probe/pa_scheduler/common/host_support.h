@@ -224,11 +224,11 @@ inline void ConfigureTrace(SchedulerState *state, const Options &options, const 
 }
 
 inline void InitializeTraceHeader(TraceHeader *header) {
-    // version=3 表示 core state 已携带 weighted atomic/PollBatch 计数和权威拓扑；
-    // JSON 的 trace_schema_version 则仍按是否启用 atomic 分别导出 v2/v3。
+    // version=4 表示 phase ABI 已追加父区间和真实 Submit 尾动作；core state
+    // 继续携带 weighted atomic/PollBatch 计数和权威拓扑。
     std::memset(header, 0, sizeof(*header));
     header->magic = 0x4653574cU;
-    header->version = 3;
+    header->version = 4;
     header->num_cores = kWorkers;
     header->records_per_core = kTraceRecordsPerCore;
     header->frequency_hz = kSystemCounterHz;
@@ -343,8 +343,13 @@ inline const char *TracePhaseName(uint32_t phase) {
     const char *names[] = {
         "Kernel", "Alloc", "Build", "DrainWon", "Replay", "RingBp", "EfDrain", "Commit",
         "Submit", "Materialize", "PrepareMap", "Claim", "Fanin", "Register", "Atomic",
-        "ClockBaseline",
+        "ClockBaseline", "OrchestrationReplay", "FinalDrain", "WinnerBuild",
+        "AllocComplete",
     };
+    static_assert(
+        sizeof(names) / sizeof(names[0]) == static_cast<uint32_t>(TracePhase::Count),
+        "TracePhaseName must cover every trace phase"
+    );
     return phase < sizeof(names) / sizeof(names[0]) ? names[phase] : "Unknown";
 }
 
@@ -371,7 +376,7 @@ inline AtomicOp AtomicSiteOp(AtomicSite site) {
 inline bool ValidateTraceHeader(const TraceHeader &header, const char *operation) {
     // 在任何 D2H record 搬运前先验证容量和 dropped，防止损坏 header 导致 scratch 越界或导出残缺泳道。
     // 频率也要求精确为 1 GHz，否则后续 ns/us 换算即使 JSON 合法也没有性能意义。
-    const bool valid = header.magic == 0x4653574cU && header.version == 3 &&
+    const bool valid = header.magic == 0x4653574cU && header.version == 4 &&
                        header.num_cores == kWorkers && header.records_per_core == kTraceRecordsPerCore &&
                        header.frequency_hz == kSystemCounterHz;
     bool core_states_valid = true;
@@ -557,7 +562,7 @@ inline bool ExportSwimlaneRecords(
         "\"engine_mapping\":%s},\"core_types\":[",
         atomic_trace_enabled ? 4U : 1U,
         static_cast<unsigned long long>(header.frequency_hz), kWorkers,
-        atomic_trace_enabled ? 3U : 2U,
+        4U,
         workload_mode == WinnerWorkloadMode::RealCompute ? "real-compute" : "scalar-nop",
         workload_counts.qk, workload_counts.sf, workload_counts.pv, workload_counts.up,
         workload_mode == WinnerWorkloadMode::RealCompute
@@ -572,24 +577,22 @@ inline bool ExportSwimlaneRecords(
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
         std::fprintf(output, "%s\"%s\"", worker == 0 ? "" : ",", worker < kAicWorkers ? "aic" : "aiv");
     }
-    if (atomic_trace_enabled) {
-        std::fprintf(
-            output,
-            "],\"fdwic_summary\":{\"records\":%llu,\"atomic_records\":%llu,"
-            "\"clock_baseline_records\":%llu,\"atomic_calls\":%llu,"
-            "\"batched_poll_calls\":%llu,\"poll_batch_records\":%llu,"
-            "\"dropped_records\":%llu}",
-            static_cast<unsigned long long>(producer_summary.records),
-            static_cast<unsigned long long>(producer_summary.atomic_records),
-            static_cast<unsigned long long>(producer_summary.clock_baseline_records),
-            static_cast<unsigned long long>(producer_summary.atomic_calls),
-            static_cast<unsigned long long>(producer_summary.poll_calls),
-            static_cast<unsigned long long>(producer_summary.poll_batch_records),
-            static_cast<unsigned long long>(producer_summary.dropped_records)
-        );
-    } else {
-        std::fprintf(output, "]");
-    }
+    // schema-v4 无论是否开启 atomic 都导出 producer summary；phase-only 的
+    // atomic/clock 字段为零，离线分析仍可独立证明 records 与 dropped 闭合。
+    std::fprintf(
+        output,
+        "],\"fdwic_summary\":{\"records\":%llu,\"atomic_records\":%llu,"
+        "\"clock_baseline_records\":%llu,\"atomic_calls\":%llu,"
+        "\"batched_poll_calls\":%llu,\"poll_batch_records\":%llu,"
+        "\"dropped_records\":%llu}",
+        static_cast<unsigned long long>(producer_summary.records),
+        static_cast<unsigned long long>(producer_summary.atomic_records),
+        static_cast<unsigned long long>(producer_summary.clock_baseline_records),
+        static_cast<unsigned long long>(producer_summary.atomic_calls),
+        static_cast<unsigned long long>(producer_summary.poll_calls),
+        static_cast<unsigned long long>(producer_summary.poll_batch_records),
+        static_cast<unsigned long long>(producer_summary.dropped_records)
+    );
     std::fprintf(
         output,
         "},\n\"aicore_tasks\":[],\n\"aicpu_tasks\":[],\n"
@@ -602,7 +605,7 @@ inline bool ExportSwimlaneRecords(
     uint64_t exported_records = 0;
     TraceExportSummary observed_summary;
     std::vector<TraceRecord> scratch(kTraceRecordsPerCore);
-    constexpr int32_t kTracePhaseCount = static_cast<int32_t>(TracePhase::ClockBaseline) + 1;
+    constexpr int32_t kTracePhaseCount = static_cast<int32_t>(TracePhase::Count);
     for (uint32_t worker = 0; worker < kWorkers && success; ++worker) {
         // 每次只读取一个 worker 的有效区间；完整 384 MiB trace 缓冲无需整体回拷。
         const uint32_t available = header.cores[worker].count;
@@ -786,7 +789,7 @@ inline bool AnalyzeSwimlaneRecords(
     if (!ValidateTraceHeader(header, "swimlane analysis")) return false;
 
     // 第一组数组统计“每个 worker 在某阶段的累计时间”；task_durations 则保留重点阶段的单事件分布。
-    constexpr uint32_t kTracePhaseCount = static_cast<uint32_t>(TracePhase::ClockBaseline) + 1;
+    constexpr uint32_t kTracePhaseCount = static_cast<uint32_t>(TracePhase::Count);
     constexpr TracePhase kDetailedPhases[] = {
         TracePhase::EfDrain, TracePhase::Materialize, TracePhase::Claim, TracePhase::Register,
     };
@@ -1294,7 +1297,7 @@ inline Metrics Validate(
         bool per_worker_trace_counts_ok = true;
         if (trace_header != nullptr) {
             trace_shape_ok &= trace_header->magic == 0x4653574cU;
-            trace_shape_ok &= trace_header->version == 3;
+            trace_shape_ok &= trace_header->version == 4;
             trace_shape_ok &= trace_header->num_cores == kWorkers;
             trace_shape_ok &= trace_header->records_per_core == kTraceRecordsPerCore;
             trace_shape_ok &= trace_header->frequency_hz == kSystemCounterHz;
@@ -1327,8 +1330,8 @@ inline Metrics Validate(
                                       core.poll_batch_records == 0;
                 }
                 const uint64_t worker_expected =
-                    7 * result.submits + result.claim_wins - result.wins[0] +
-                    2 * worker_kernels + result.wait_events[0] + result.wait_events[1] +
+                    6 * result.submits + 2 * result.claim_wins - result.wins[0] +
+                    2 * worker_kernels + result.wait_events[0] + result.wait_events[1] + 2 +
                     (((state.config.trace_enabled & kTraceAtomicsEnabled) != 0)
                          ? worker_physical_atomic + 2
                          : 0);
@@ -1336,12 +1339,15 @@ inline Metrics Validate(
             }
         }
         const uint64_t expected_trace_records =
-            static_cast<uint64_t>(batches) * (static_cast<uint64_t>(kWorkers) * 35 + 12) +
-            trace_wait_records +
+            static_cast<uint64_t>(batches) * (static_cast<uint64_t>(kWorkers) * 30 + 17) +
+            trace_wait_records + 2 * kWorkers +
             (((state.config.trace_enabled & kTraceAtomicsEnabled) != 0)
                  ? physical_atomic_records + 2 * kWorkers
                  : 0);
-        // 每 batch 固定记录为 96*35+12；RingBp 等真实等待按运行时次数额外加入。
+        // 每 batch 的 96*30 是六条每 Submit 固定记录；17 条是
+        // 5 条 winner tail、4 条 Fanin 和 8 条 Kernel/Commit。loser 不再写
+        // 零时长 marker。两个父 span 再各核固定增加 2 条；
+        // RingBp 等真实等待按运行时次数额外加入。
         Expect(trace_shape_ok, "swimlane header and per-worker capacities are valid", &metrics);
         Expect(trace_dropped == 0, "swimlane records fit without drops", &metrics);
         Expect(trace_records == expected_trace_records, "swimlane record count matches PA phase flow", &metrics);

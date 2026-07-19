@@ -277,6 +277,8 @@ void ConfigurePmu(pa_scheduler::SchedulerState *state, const PmuOptions &pmu, co
 struct PmuAggregate {
     std::vector<uint64_t> total_cycles;
     std::vector<uint64_t> window_ticks;
+    std::vector<uint64_t> submit_elapsed_ticks;
+    std::vector<uint64_t> phase_elapsed_ticks;
     std::vector<uint64_t> warm_total_cycles;
     std::vector<uint64_t> warm_window_ticks;
     std::vector<uint64_t> vector_busy;
@@ -300,6 +302,10 @@ struct PmuAggregate {
 void AddPmuSample(const pa_scheduler::WorkerResult &result, PmuAggregate *aggregate) {
     aggregate->total_cycles.push_back(result.pmu_total_cycles);
     aggregate->window_ticks.push_back(result.pmu_window_ticks);
+    aggregate->submit_elapsed_ticks.push_back(
+        result.submit_end >= result.submit_begin ? result.submit_end - result.submit_begin : 0U
+    );
+    aggregate->phase_elapsed_ticks.push_back(result.pmu_phase_elapsed_ticks);
     aggregate->warm_total_cycles.push_back(result.pmu_warm_total_cycles);
     aggregate->warm_window_ticks.push_back(result.pmu_warm_window_ticks);
     aggregate->vector_busy.push_back(result.pmu_vector_busy);
@@ -422,6 +428,10 @@ void PrintSubmitPmuPhaseAggregate(const char *name, const PmuAggregate &aggregat
         pa_scheduler::host::SummarizeUint64(aggregate.shadow_icache_requests);
     const pa_scheduler::host::Uint64Distribution shadow_misses =
         pa_scheduler::host::SummarizeUint64(aggregate.shadow_icache_misses);
+    const pa_scheduler::host::Uint64Distribution submit_ticks =
+        pa_scheduler::host::SummarizeUint64(aggregate.submit_elapsed_ticks);
+    const pa_scheduler::host::Uint64Distribution phase_ticks =
+        pa_scheduler::host::SummarizeUint64(aggregate.phase_elapsed_ticks);
     const uint64_t request_loss = primary_requests.total >= shadow_requests.total
         ? primary_requests.total - shadow_requests.total
         : 0U;
@@ -429,10 +439,14 @@ void PrintSubmitPmuPhaseAggregate(const char *name, const PmuAggregate &aggregat
         ? primary_misses.total - shadow_misses.total
         : 0U;
     const double miss_rate = requests.total == 0U ? 0.0 : 100.0 * misses.total / requests.total;
+    const double phase_time_share = submit_ticks.total == 0U
+        ? 0.0
+        : 100.0 * phase_ticks.total / submit_ticks.total;
     std::printf(
         "[PMU-PHASE-%s] phase=%s semantics=%s cores=%zu calls=%llu "
         "icache_req=[%llu,%llu] icache_miss=[%llu,%llu] "
-        "observed_read_clear_ratio=%.4f%% shadow_loss=%llu/%llu\n",
+        "observed_read_clear_ratio=%.4f%% phase_ticks=%llu submit_ticks=%llu "
+        "phase_time_share=%.4f%% shadow_loss=%llu/%llu\n",
         name, pa_scheduler::ccec_pmu::SubmitPmuPhaseName(pa_scheduler::kCompiledSubmitPmuPhase),
         pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
             ? "disabled"
@@ -442,6 +456,8 @@ void PrintSubmitPmuPhaseAggregate(const char *name, const PmuAggregate &aggregat
         static_cast<unsigned long long>(requests.total + request_loss),
         static_cast<unsigned long long>(misses.total),
         static_cast<unsigned long long>(misses.total + miss_loss), miss_rate,
+        static_cast<unsigned long long>(phase_ticks.total),
+        static_cast<unsigned long long>(submit_ticks.total), phase_time_share,
         static_cast<unsigned long long>(request_loss),
         static_cast<unsigned long long>(miss_loss)
     );
@@ -470,6 +486,7 @@ struct PmuValidation {
     uint32_t phase_shadow_acceptable = 0;
     uint32_t phase_boundary_matches = 0;
     uint32_t phase_call_shape_matches = 0;
+    uint32_t phase_time_valid_records = 0;
     uint64_t phase_calls = 0;
     uint64_t expected_phase_calls = 0;
     uint64_t shadow_request_abs_delta_sum = 0;
@@ -539,6 +556,7 @@ bool ValidatePmu(
     uint32_t phase_shadow_acceptable = 0;
     uint32_t phase_boundary_matches = 0;
     uint32_t phase_call_shape_matches = 0;
+    uint32_t phase_time_valid_records = 0;
     uint64_t phase_calls = 0;
     uint64_t expected_phase_calls = 0;
     uint64_t shadow_request_abs_delta_sum = 0;
@@ -589,6 +607,15 @@ bool ValidatePmu(
             result.pmu_phase_end_reads == result.pmu_phase_calls;
         const bool phase_call_shape_matches_record =
             result.pmu_phase_calls == expected_phase_calls_per_worker;
+        const uint64_t submit_elapsed_ticks = result.submit_end >= result.submit_begin
+            ? result.submit_end - result.submit_begin
+            : 0U;
+        const bool phase_time_valid_record =
+            submit_elapsed_ticks != 0U &&
+            result.pmu_phase_elapsed_ticks <= submit_elapsed_ticks &&
+            (pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
+                 ? result.pmu_phase_elapsed_ticks == 0U
+                 : result.pmu_phase_elapsed_ticks != 0U);
         const bool logical_aic = worker < pa_scheduler::kAicWorkers;
         const bool physical_aic = pa_scheduler::pmu_owner::IsAicPhysicalSlot(core_id);
         trusted += record_trusted;
@@ -600,6 +627,7 @@ bool ValidatePmu(
         phase_shadow_acceptable += shadow_acceptable;
         phase_boundary_matches += boundaries_match;
         phase_call_shape_matches += phase_call_shape_matches_record;
+        phase_time_valid_records += phase_time_valid_record;
         phase_calls += result.pmu_phase_calls;
         expected_phase_calls += expected_phase_calls_per_worker;
         shadow_request_abs_delta_sum += request_abs_delta;
@@ -665,11 +693,11 @@ bool ValidatePmu(
         }
         if ((!record_trusted || !variant_matches || !phase_id_matches_record ||
              !phase_status_ok || !shadow_acceptable || !boundaries_match ||
-             !phase_call_shape_matches_record) && bad_printed < 8) {
+             !phase_call_shape_matches_record || !phase_time_valid_record) && bad_printed < 8) {
             std::printf(
                 "[PMU-BAD] worker=%u role=%llu coreid=%u status=0x%08x total=%llu scalar=%u "
                 "req=%u miss=%u phase_status=0x%08x phase=%u/%u calls=%u/%u boundaries=%u/%u "
-                "shadow=%u/%u\n",
+                "phase_ticks=%llu submit_ticks=%llu shadow=%u/%u\n",
                 worker, static_cast<unsigned long long>(result.role), core_id, status,
                 static_cast<unsigned long long>(result.pmu_total_cycles), result.pmu_scalar_busy,
                 result.pmu_icache_requests, result.pmu_icache_misses,
@@ -677,6 +705,8 @@ bool ValidatePmu(
                 static_cast<uint32_t>(pa_scheduler::kCompiledSubmitPmuPhase), result.pmu_phase_calls,
                 expected_phase_calls_per_worker,
                 result.pmu_phase_begin_reads, result.pmu_phase_end_reads,
+                static_cast<unsigned long long>(result.pmu_phase_elapsed_ticks),
+                static_cast<unsigned long long>(submit_elapsed_ticks),
                 result.pmu_shadow_icache_requests, result.pmu_shadow_icache_misses
             );
             ++bad_printed;
@@ -732,6 +762,7 @@ bool ValidatePmu(
     const bool shadow_partition_ok = phase_shadow_acceptable == pa_scheduler::kWorkers;
     const bool phase_boundaries_ok = phase_boundary_matches == pa_scheduler::kWorkers;
     const bool phase_call_shape_ok = phase_call_shape_matches == pa_scheduler::kWorkers;
+    const bool phase_time_ok = phase_time_valid_records == pa_scheduler::kWorkers;
     const bool phase_calls_ok = phase_calls == expected_phase_calls;
     const bool submit_engine_observation_ok =
         pmu.mode != WindowMode::SubmitAll ||
@@ -785,6 +816,8 @@ bool ValidatePmu(
     std::printf("[ASSERT] %-48s %s\n", "all phase boundaries and per-worker calls are exact",
                 phase_status_ok && phase_boundaries_ok && phase_call_shape_ok && phase_calls_ok
                     ? "PASS" : "FAIL");
+    std::printf("[ASSERT] %-48s %s\n", "all phase times fit their per-worker Submit windows",
+                phase_time_ok ? "PASS" : "FAIL");
     std::printf("[ASSERT] %-48s %s\n", "I-cache misses do not exceed requests",
                 icache_order_valid ? "PASS" : "FAIL");
     std::printf("[ASSERT] %-48s %s\n", "programmable counters stay below 25% risk threshold",
@@ -824,6 +857,7 @@ bool ValidatePmu(
     validation->phase_shadow_acceptable = phase_shadow_acceptable;
     validation->phase_boundary_matches = phase_boundary_matches;
     validation->phase_call_shape_matches = phase_call_shape_matches;
+    validation->phase_time_valid_records = phase_time_valid_records;
     validation->phase_calls = phase_calls;
     validation->expected_phase_calls = expected_phase_calls;
     validation->shadow_request_abs_delta_sum = shadow_request_abs_delta_sum;
@@ -838,7 +872,7 @@ bool ValidatePmu(
     validation->counter_below_risk_threshold = counter_below_risk_threshold;
     validation->phase_measurement_valid =
         build_variant_ok && phase_id_ok && phase_status_ok && shadow_partition_ok &&
-        phase_boundaries_ok && phase_call_shape_ok && phase_calls_ok;
+        phase_boundaries_ok && phase_call_shape_ok && phase_calls_ok && phase_time_ok;
     validation->passed = records_ok && core_ids_ok && owner_members_ok && worker_slots_ok &&
         physical_roles_ok && mixed_triplets_ok && windows_started_ok && windows_stopped_ok &&
         icache_order_valid && icache_measurement_ok && submit_engine_observation_ok &&
@@ -928,6 +962,10 @@ void WritePmuAggregateJson(
     WriteMetricDistribution(output, aggregate.shadow_icache_misses);
     std::fputs(",\"phase_calls\":", output);
     WriteMetricDistribution(output, aggregate.phase_calls);
+    std::fputs(",\"submit_elapsed_ticks\":", output);
+    WriteMetricDistribution(output, aggregate.submit_elapsed_ticks);
+    std::fputs(",\"phase_elapsed_ticks\":", output);
+    WriteMetricDistribution(output, aggregate.phase_elapsed_ticks);
     std::fputs(",\"phase_icache_requests\":", output);
     WriteMetricDistribution(output, aggregate.phase_icache_requests);
     std::fputs(",\"phase_icache_misses\":", output);
@@ -1042,7 +1080,7 @@ bool ExportPmuJson(
           };
     const uint32_t owner_bitmap_count = pa_scheduler::pmu_owner::CountConfigured(owner);
     const uint32_t owner_complete_triplets = CountConfiguredMixedTriplets(owner);
-    std::fputs("{\n\"schema\":{\"name\":\"pa_scheduler_pmu_phase_windows\",\"version\":4},\n", output);
+    std::fputs("{\n\"schema\":{\"name\":\"pa_scheduler_pmu_phase_windows\",\"version\":5},\n", output);
     std::fputs("\"capture\":{\"capture_id\":", output);
     WriteJsonString(output, capture_id);
     std::fprintf(
@@ -1157,9 +1195,18 @@ bool ExportPmuJson(
         "\"counter_wrap_not_directly_detectable\":true,\"counter_wrap_absence_proven\":false,"
         "\"programmable_counter_risk_threshold\":%u,"
         "\"gate_start_stop_have_pipe_all_barriers\":true,"
-        "\"phase_timestamp_calls_present\":false,\"phase_record_writes\":false,"
+        "\"phase_timestamp_calls_present\":%s,\"phase_record_writes\":false,"
         "\"atomic_trace\":false,\"profile_accumulation\":false,"
         "\"phase_boundary_observation_included\":%s,"
+        "\"phase_time_observation_included\":%s,"
+        "\"phase_time_sys_counter_tick_ns\":1,"
+        "\"phase_time_boundary\":\"after_begin_read_clear_to_before_end_read_clear\","
+        "\"phase_time_excludes_shadow_read_overhead\":true,"
+        "\"phase_time_includes_timestamp_overhead\":true,"
+        "\"phase_time_share_definition\":"
+        "\"sum(phase_elapsed_ticks)/sum(submit_elapsed_ticks)\","
+        "\"phase_time_denominator_scope\":"
+        "\"per_worker_first_submit_begin_to_last_submit_end\","
         "\"phase_counter_pair_snapshot_atomic\":false,"
         "\"primary_counters_read_at_phase_boundaries\":false,"
         "\"phase_shadow_partition_exact_required\":%s,"
@@ -1172,6 +1219,12 @@ bool ExportPmuJson(
         host_us, submit_span_us, kVectorBusyEvent, kCubeBusyEvent, kScalarBusyEvent,
         kMte1BusyEvent, kMte2BusyEvent, kIcacheMissEvent, kIcacheRequestEvent, kIcacheMissEvent,
         kIcacheRequestEvent, kProgrammableCounterRiskThreshold,
+        pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
+            ? "false"
+            : "true",
+        pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
+            ? "false"
+            : "true",
         pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
             ? "false"
             : "true",
@@ -1218,6 +1271,7 @@ bool ExportPmuJson(
         "\"shadow_miss_abs_delta_sum\":%llu,\"shadow_miss_abs_delta_max\":%u,"
         "\"shadow_miss_signed_delta_sum\":%lld,"
         "\"phase_boundary_match_records\":%u,\"phase_call_shape_match_records\":%u,"
+        "\"phase_time_valid_records\":%u,\"phase_time_measurement_valid\":%s,"
         "\"phase_calls\":%llu,\"phase_expected_calls\":%llu,"
         "\"phase_measurement_valid\":%s},\n",
         semantic_passed ? "true" : "false", validation.passed ? "true" : "false",
@@ -1257,6 +1311,8 @@ bool ExportPmuJson(
         static_cast<long long>(validation.shadow_miss_signed_delta_sum),
         validation.phase_boundary_matches,
         validation.phase_call_shape_matches,
+        validation.phase_time_valid_records,
+        validation.phase_time_valid_records == pa_scheduler::kWorkers ? "true" : "false",
         static_cast<unsigned long long>(validation.phase_calls),
         static_cast<unsigned long long>(validation.expected_phase_calls),
         validation.phase_measurement_valid ? "true" : "false"
@@ -1293,7 +1349,16 @@ bool ExportPmuJson(
         const bool primary_trusted = (status & kStatusRequired) == kStatusRequired;
         const bool phase_trusted =
             (result.pmu_phase_status & kPhaseStatusRequired) == kPhaseStatusRequired;
-        const bool trusted = primary_trusted && phase_trusted;
+        const uint64_t submit_elapsed_ticks = result.submit_end >= result.submit_begin
+            ? result.submit_end - result.submit_begin
+            : 0U;
+        const bool phase_time_valid =
+            submit_elapsed_ticks != 0U &&
+            result.pmu_phase_elapsed_ticks <= submit_elapsed_ticks &&
+            (pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
+                 ? result.pmu_phase_elapsed_ticks == 0U
+                 : result.pmu_phase_elapsed_ticks != 0U);
+        const bool trusted = primary_trusted && phase_trusted && phase_time_valid;
         const bool is_aic = result.role == static_cast<uint32_t>(pa_scheduler::CoreRole::Aic);
         const uint32_t vector_id = is_aic ? 0U : worker - pa_scheduler::kAicWorkers;
         const uint32_t block_id = is_aic ? worker : vector_id / 2U;
@@ -1334,6 +1399,8 @@ bool ExportPmuJson(
             "\"build_variant_id\":%u,\"compiled_phase_id\":%u,\"phase_calls\":%u,"
             "\"phase_expected_calls\":%u,"
             "\"phase_begin_reads\":%u,\"phase_end_reads\":%u,"
+            "\"submit_elapsed_ticks\":%llu,\"phase_elapsed_ticks\":%llu,"
+            "\"phase_time_valid\":%s,"
             "\"phase_icache_requests\":%u,\"phase_icache_misses\":%u,"
             "\"phase_icache_requests_upper_bound\":%u,"
             "\"phase_icache_misses_upper_bound\":%u,"
@@ -1354,6 +1421,9 @@ bool ExportPmuJson(
             result.pmu_build_variant, result.pmu_phase_id, result.pmu_phase_calls,
             expected_phase_calls,
             result.pmu_phase_begin_reads, result.pmu_phase_end_reads,
+            static_cast<unsigned long long>(submit_elapsed_ticks),
+            static_cast<unsigned long long>(result.pmu_phase_elapsed_ticks),
+            phase_time_valid ? "true" : "false",
             result.pmu_phase_icache_requests, result.pmu_phase_icache_misses,
             phase_request_upper, phase_miss_upper,
             result.pmu_shadow_icache_requests, result.pmu_shadow_icache_misses,

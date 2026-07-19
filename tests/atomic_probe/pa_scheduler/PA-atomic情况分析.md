@@ -32,8 +32,10 @@ standalone 观察链路的最新状态更新至 2026-07-19。
 - 优化没有改变通用 atomic 语义，也没有把任务推迟到最终 drain 来制造
   表面收益。F1 的 fanin 顺序重排已经证明性能回退并撤销；下一步先精确区分
   fanin 成功/失败 load 与 frontier 重复前推，再进行单变量消减。
-- standalone 观察产物现已固定为两类：`swimlane` 合并普通阶段与 schema-v3
-  atomic（direct Atomic 加 PollBatch）泳道；`submit-pmu` 独立重编译完整 Submit PMU，现行
+- standalone 观察产物现已固定为两类：`swimlane` 使用 schema-v4 合并
+  排他业务阶段与 atomic（direct Atomic 加 PollBatch）泳道；atomic flags、
+  weighted call 和 PollBatch ABI 沿用已验证的 schema-v3 语义。`submit-pmu`
+  独立重编译完整 Submit PMU，现行
   白名单为 `none|claim|efdrain|materialize|register`。两者不在同一进程采集；
   `none` 提供完整 Submit 的严格闭合计数，局部 phase 只提供 running
   read-clear 的下界/保守上界。
@@ -327,10 +329,12 @@ Submit 调度而非 kernel 计算变快。
 - `DrainWon`、`RingBp`、kernel placement 和最终 drain 数量没有异常漂移；
 - 同时报告中位数、离散度、最好/最差值，并记录设备是否独占。
 
-泳道统计时，`Build` 和 `Replay` 是 lap marker，会覆盖前面的阶段，不能与
-`Materialize/PrepareMap/Claim/Fanin/Register` 相加。可加总的是显式互斥
-span，或单独定义 `Submit.end - Build/Replay/Alloc.end` 为 action tail。
-后续文档和脚本都应沿用这一口径。
+真实 PA 与历史 standalone schema-v3 泳道中的 `Build` 和 `Replay` 是 lap
+marker，会覆盖前面的阶段，不能与
+`Materialize/PrepareMap/Claim/Fanin/Register` 相加。当前 standalone
+schema-v4 已改为显式互斥的 `WinnerBuild/LoserReplay/AllocComplete` 尾 span；
+后续文档和脚本必须先按 capture schema 选择口径，不能把历史 lap 与 v4 尾 span
+混为一类。
 
 ## 6. 独立 PA 调度复现的对应关系
 
@@ -1024,6 +1028,11 @@ frontier helping 的额外 FetchMax 中位数为 `A-T=14085` 次。ready-prefix 
 
 ### 7.5 阶段 O2：atomic schema-v3 泳道与 Submit scalar PMU
 
+本节保留 atomic ABI 在 schema-v3 中建立和验收的完整过程。当前 raw 已
+升为 schema-v4，atomic site/op/flags、PollBatch 与 weighted summary 语义不变；
+atomic ABI 没有重定义。phase schema 则新增排他父区间，以真实 Submit 尾 span
+替换旧 lap，将 EfDrain 改为显式 span，并禁止未使用的 `DrainWon`。
+
 #### 7.5.1 观察目标与证据拆分
 
 O2 先完成观察链路，不在同一阶段继续消减 atomic。它回答两个不同问题：
@@ -1178,7 +1187,9 @@ PollBatch 使用另一种时间语义：`duration`/`poll_window_cycles` 是从�
 不同 site 的窗口可以重叠，窗口内还可能包含 direct Atomic，不能把 PollBatch 混入
 direct 单次延迟的 median/p95。
 
-边界实现复用真实 PA 已验证的规则，并让 phase/lap 与 batch 使用同一次 cycle 采样：
+以下是历史 schema-v3 边界实现复用真实 PA 规则时的约束；其中 lap helper 仍保留
+历史兼容能力，但当前 standalone schema-v4 producer 已不再调用
+`ResetTraceLap/WriteTraceLap`：
 
 1. 显式等待区退出时关闭与该 region 匹配的 PollBatch；
 2. `TraceTimestamp` 先采 cycle，再以该 cycle 关闭全部活跃 batch，然后写 phase
@@ -1241,8 +1252,8 @@ trace 容量不足时必须明确报 overflow 并判该轮观察无效，不能�
 #### 7.5.5 Submit PMU 窗口与平均口径
 
 CCEC 只保留一个正式逐 worker Submit 窗口，CPU/AscendC 对应 hook 是空实现，不伪造
-PMU 数据：`submit-all` 在本 worker 通过启动屏障、完成 `ResetTraceLap` 后，于
-orchestration 初始化前打开 gate，在该 worker 最后一次 Submit 返回后关闭。窗口包含
+PMU 数据：`submit-all` 在本 worker 通过启动屏障后，于 orchestration 初始化前
+直接调用 `PmuWindowStart`，在该 worker 最后一次 Submit 返回后关闭。窗口包含
 参数构造、全部 Submit 调度，以及本 worker 在窗口内执行的 winner 计算体：当前
 无参数默认的 `real-compute` 是真实 Cube/Vector 与对应搬运流水；显式
 `scalar-nop` 校准样本的 NOP 则在 scalar 上执行并计入窗口。
@@ -1260,9 +1271,12 @@ worker 到达与争用时序。这个开销属于观察配置本身；只能比�
 PMU JSON sidecar 按 worker 保留 raw 记录，并分别汇总 32 AIC、64 AIV 和全部 96 核。
 各字段严格按下面口径解释：
 
-- `total_cycles`：gate 活跃期间的每核 64 bit PMU raw total；除非平台时钟/事件语义
-  另有正式证明，不直接按 1 GHz 换算成微秒；96 核求和是 core-work raw count，
-  不是 Submit 墙钟时间。墙钟只看 host 记录的 `submit_span_us`；
+- `total_cycles`：gate 活跃期间的每核 64 bit PMU raw total；本机受控同窗校准为
+  `1,817,457 PMU cycles / 1,101,593 ns = 1.649844 cycles/ns`，AIC/AIV
+  分别约为 `1.650062/1.649731 cycles/ns`。因此可按
+  `time_us = cycles / cycles_per_ns / 1000` 换算每核 cycle-equivalent；96 核
+  求和仍是 core-work，不是 Submit 墙钟时间。墙钟只看 host 记录的
+  `submit_span_us`；
 - `scalar_busy`：`CNT2 scalar_instr_busy` 的事件累计，不等于窗口内全部时间，
   也不等于“纯调度耗时”。atomic 由 scalar 发射，其发射、返回值依赖或资源
   阻塞可能在该事件中有所体现，但不能据此认定某条 atomic 的全部执行完成延迟
@@ -1281,7 +1295,12 @@ PMU JSON sidecar 按 worker 保留 raw 记录，并分别汇总 32 AIC、64 AIV 
 
 raw JSON 与自包含 HTML 都必须同时保留完整 Submit 的 `submit_span_us`、
 `total_cycles` 和 `scalar_busy`，并按 ALL/AIC/AIV 显示每核分布；不得只展示
-I-cache request/miss。当前局部 phase 边界仅中途 read-clear shadow request/miss，
+I-cache request/miss。HTML 在保留 raw cycle 的同时按上述角色频率显示等效 µs；
+顶部“完整 Submit（最早开始 → 最晚结束）”单列 96 核整体耗时，ALL/AIC/AIV
+角色卡片则只用逐核 mean 表示典型值，并补充 min/max 显示核间范围，二者不是
+同一个统计量；total 与 scalar 的极值也不保证来自同一物理核。
+SYS_CNT 的 1 ns tick 和 `90 ns/miss` 一阶标尺不受这一 PMU 频率换算影响。当前局部
+phase 边界仅中途 read-clear shadow request/miss，
 没有局部 `total_cycles` 或 `scalar_busy`。文档和 HTML 中的 total/scalar 因此都是
 该 phase ELF 的完整 Submit 窗口，不能当成 Materialize、Register 等局部阶段的独占时间。
 90 ns/miss 仍只是受控 cold/warm 探针的一阶 core-equivalent 标尺，既不加入
@@ -1324,9 +1343,9 @@ JSON/同名 `.tmp`，并只在协议、PMU/owner 门禁、Restore 和 runtime �
 
 #### 7.5.6 当前实现状态、历史证据与正式重采矩阵
 
-当前源码已经实现 schema-v3 的六类 PollBatch、精确 `call_count`、七项 summary
-闭环、两条 ClockBaseline、scalar lane converter，以及 phase/lap/Kernel 共 cycle
-边界关闭。2026-07-18 已用边界修复版 CCEC 完成 b1 与 b256 真机重测，当前证据为：
+当前 schema-v4 源码完整沿用 schema-v3 建立的六类 PollBatch、精确
+`call_count`、七项 summary 闭环、两条 ClockBaseline 和 scalar lane converter。
+以下先保留 2026-07-18 schema-v3 边界修复版 CCEC b1/b256 的历史证据：
 
 | 样本 | winner 负载 | 总 `records` | 逻辑 `atomic_calls` | direct | 物理 Atomic | `batched_poll_calls` | PollBatch | ClockBaseline | dropped | 首末 Submit |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -1360,8 +1379,39 @@ outputs/pa_scheduler_swimlane_20260718_182725_4061524/ccec/merged_swimlane.json
 b1 是零 winner 负载的快速验收，b256 是开启 atomic 泳道的诊断运行；5.774295 ms
 只证明观察构建保持目标量级，不是关闭 trace 的正式性能基线，也不能与下列历史样本
 做单轮减法归因观察开销。
+
+schema-v4 于 2026-07-19 用同一 atomic ABI 完成 CCEC b1、AscendC b1 与
+CCEC b256 真机验收。v4 新增 `OrchestrationReplay/FinalDrain` 父 span，并用
+`WinnerBuild/LoserReplay/AllocComplete` 替代旧 lap；Atomic 仍由原 direct 与
+PollBatch 规则产生。三轮均为 96 核、192 条 ClockBaseline、
+`dropped=0`，Atomic weighted summary 和 raw 行逐项闭合：
+
+| 样本 | 总 `records` | 逻辑 `atomic_calls` | 物理 Atomic | `batched_poll_calls` | PollBatch | 首末 Submit |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| CCEC b1 | 4,602 | 1,403 | 846 | 790 | 233 | 90.741 us |
+| AscendC b1 | 4,597 | 1,338 | 841 | 725 | 228 | 86.037 us |
+| CCEC b256 | 964,724 | 102,324 | 101,108 | 1,471 | 255 | 5,680.749 us |
+
+CCEC b256 还验证了每核 1,280 个 Submit、1,024 个 Kernel 全部落入
+EfDrain 或 FinalDrain：前者 1,011 个、后者 13 个，孤儿和越界均为 0；
+Submit/EfDrain/Orchestration/FinalDrain/WorkerCompletion 排他闭合。最终分析器
+还逐条验证 exclusive child 的 task 身份，以及 Alloc loser=`Claim.end`、
+非 Alloc loser=`Register.end` 的零时长锚点。完整产物为：
+
+~~~text
+outputs/pa_scheduler_swimlane_20260719_055449_334552/ccec/
+outputs/pa_scheduler_swimlane_20260719_060409_345364/ascendc/
+outputs/pa_scheduler_swimlane_20260719_060634_347455/ccec/
+~~~
+
+最终源码和相同 v4 level-4 配置连续三轮 CCEC b256 为
+5.785939/5.503109/5.381844 ms，中位数 5.503109 ms，极差
+0.404095 ms；完整导出轮比上文 v3 导出轮低 1.62%，仍小于当前自身
+轮间波动。因此当前只记录为“未观察到明显回退”，不把这个单轮差值
+当成优化收益。
+
 以下是 2026-07-18 的**历史 schema-v2、逐调用、边界修复前**证据，保留用于追溯，
-不作为当前 schema-v3 的物理记录规模、逻辑调用数或边界闭合验收。历史 b1
+不作为当前 schema-v4 的物理记录规模、逻辑调用数或边界闭合验收。历史 b1
 atomic-trace-only 上板中，全部协议断言 PASS，raw 共 4959 条、
 `expected=4959`、`dropped=0`，其中逐条 Atomic 1395 条、ClockBaseline 192 条。
 Claim 当时已按 schema-v2 闭合为 `won=5/lost=283/not_attempted=192`。当时 converter
@@ -1401,8 +1451,10 @@ frontier helping 和 winner 分布会带来明显轮间波动；一次 5.209261 
 | schema-v3 六类 PollBatch、flags、logical/physical 公式与拓扑的 converter 静态回归 | **19/19 PASS；不替代真机验收** |
 | schema-v3 b1 的七项 summary、逐核/全局公式与 dropped | **96/96 闭合，dropped=0** |
 | schema-v3 256 batch 的 direct/PollBatch raw→merged 与容量 | **已闭合，单核峰值 10,252/65,536** |
-| 15-site schema 与六类 PollBatch allowlist | **两轮 flags 全合法；实际四类有事件、HeapGuard 两类为 0** |
-| 当前版本 192 条 ClockBaseline 与 Kernel 边界 | **两轮均闭合；严格 overlap=0** |
+| schema-v4 排他父区间、真实 Submit 尾动作与 atomic ABI | **CCEC/AscendC b1 均通过；旧 lap=0** |
+| schema-v4 CCEC b256 raw→merged→exclusive report | **964,724 条，dropped=0，六组整数 cycle 闭合** |
+| 15-site schema 与六类 PollBatch allowlist | **历史 schema-v3 b1/b256 两轮 flags 全合法；实际四类有事件、HeapGuard 两类为 0** |
+| 192 条 ClockBaseline 与 Kernel 边界 | **历史 schema-v3 b1/b256 两轮均闭合；严格 overlap=0** |
 | `submit-all` 的 owner/gate/CNT0..8/total 闭环 | **b1、零 NOP 单次上板已通过** |
 | 256 batch `submit-all` 的 I-cache 与 pipe 分组分布 | **3 个 PMU-only 独立进程已采并完成 raw→summary 重算** |
 | real-compute 引擎 PMU 与 placement | **b8 count1/count2 精确倍增并逐 worker 闭合** |
@@ -1410,9 +1462,10 @@ frontier helping 和 winner 分布会带来明显轮间波动；一次 5.209261 
 此前开发过程中的探索性输出不在这里引用为正式结论。最终按同一源码依次执行：
 
 1. 三后端全量重建及 no-trace/no-PMU 语义回归；
-2. CCEC schema-v3 atomic-trace-only 已按 b1、b256 顺序完成，六类 allowlist、flags、
-   七项 summary、逐核/全局三条公式、ClockBaseline、Kernel overlap 和 raw→merged
-   均已检查；后续改动仍按同一门禁复测；
+2. 历史 schema-v3 atomic-trace-only 已按 b1、b256 完成；当前 schema-v4
+   又按 CCEC b1、AscendC b1、CCEC b256 完成六类 allowlist、flags、七项
+   summary、ClockBaseline、Kernel 包含、raw→merged 与排他报告闭合；
+   后续改动仍按同一门禁复测；
 3. CCEC PMU-only 的 `submit-all` 已完成 3 个独立进程 A/A；后续每轮仍使用
    唯一 JSON 路径，并检查 96 核、owner bitmap/triplet、start/stop、25% 风险门槛和 Restore；
 4. real-compute b8 count1/count2 已完成 Cube/Vector busy 精确倍增与
@@ -1835,8 +1888,9 @@ Claim/EfDrain/Materialize 一样可以用固定 `5*batches` 闭合。这个窗�
 ~~~
 
 成功采集后同目录自动生成 `submit_icache_report.html`。raw 继续作为权威证据，
-HTML 只提供 AIC/AIV 汇总、逐核分布和 running phase lower/upper 的离线可视化，
-不改变原始统计和可信门禁。
+HTML 只提供 ALL/AIC/AIV 汇总、逐核分布和 running phase lower/upper 的离线
+可视化；顶部单列完整 Submit（最早开始 → 最晚结束）的整体耗时，PMU
+total/scalar 角色卡片只显示逐核 min/mean/max。HTML 不改变原始统计和可信门禁。
 
 ~~~text
 build/ccec/submit-pmu/none/
@@ -1904,7 +1958,7 @@ request/miss 不可相加，也不能用 `phase - none` 宣称得到零扰动净
 当协议、数值输出和 placement/engine 门禁全部通过时，运行中 shadow 的
 单向负差只能描述为局部 PMU 分段误差，不能描述成 standalone 调度异常。
 
-schema-v4 JSON 保留 96 条 raw，并分别给出 ALL/AIC/AIV 的 authoritative
+submit-pmu schema-v5 JSON 保留 96 条 raw，并分别给出 ALL/AIC/AIV 的 authoritative
 whole、shadow loss 以及 phase lower/upper。raw 中显式保存
 `shadow_request_loss`、`shadow_miss_loss`、
 `phase_icache_requests_upper_bound` 和 `phase_icache_misses_upper_bound`。
@@ -2006,17 +2060,19 @@ submit_icache_report.html    # 自包含 HTML 加工件
 | `materialize` | 4195.642 | 434706.750 | 20468.656 | 4.7086% | 445711.047 | 56744.156 | 12.7312% |
 | `register` | 4960.087 | 431990.906 | 26459.562 | 6.1250% | 438417.688 | 50043.422 | 11.4146% |
 
-同一批 raw 中的完整 Submit PMU total/scalar busy 如下。这些是每核 raw event
-的均值，不是微秒；`scalar/total` 仅是两个同窗口事件求和的描述性比值，
-不得称为 scalar 利用率或局部 phase 耗时占比。
+同一批 raw 中的完整 Submit PMU total/scalar busy 如下。上表 `Submit/us` 是
+96 核完整 Submit 的整体耗时；下表 raw 列是每核 event 均值，二者不是同一
+统计量。等效时间列按 ALL 的 `1.649844 cycles/ns` 换算，只表示每核
+cycle-equivalent。`scalar/total` 仅是两个同窗口事件求和的描述性比值，
+不得称为 scalar 利用率、局部 phase 耗时占比或 96 核墙钟。
 
-| phase | ALL total/core | ALL scalar/core | scalar/total |
-| --- | ---: | ---: | ---: |
-| `none` | 7,213,914.333 | 5,717,308.729 | 79.2539% |
-| `claim` | 6,878,355.458 | 5,371,850.677 | 78.0979% |
-| `efdrain` | 6,910,059.479 | 5,499,963.656 | 79.5936% |
-| `materialize` | 6,577,155.385 | 5,119,585.177 | 77.8389% |
-| `register` | 6,913,673.615 | 5,524,170.406 | 79.9021% |
+| phase | ALL total/core raw | total 等效 us/core | ALL scalar/core raw | scalar 等效 us/core | scalar/total |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `none` | 7,213,914.333 | 4,372.483 | 5,717,308.729 | 3,465.363 | 79.2539% |
+| `claim` | 6,878,355.458 | 4,169.094 | 5,371,850.677 | 3,255.975 | 78.0979% |
+| `efdrain` | 6,910,059.479 | 4,188.311 | 5,499,963.656 | 3,333.626 | 79.5936% |
+| `materialize` | 6,577,155.385 | 3,986.532 | 5,119,585.177 | 3,103.072 | 77.8389% |
+| `register` | 6,913,673.615 | 4,190.501 | 5,524,170.406 | 3,348.299 | 79.9021% |
 
 局部 running read-clear 结果为：
 
@@ -2093,3 +2149,112 @@ outputs/submit_pmu_materialize_20260719_b256/{submit_icache_raw.json,submit_icac
 outputs/submit_pmu_register_20260719_b1/{submit_icache_raw.json,submit_icache_report.html}
 outputs/submit_pmu_register_20260719_b256/{submit_icache_raw.json,submit_icache_report.html}
 ~~~
+
+#### 7.5.20 schema-v5 局部阶段时间取证
+
+2026-07-19 在不增加新 phase、不改业务调用点的前提下，
+`submit-pmu` 从 schema-v4 升到 schema-v5，给既有
+`claim|efdrain|materialize|register` 边界补充 SYS_CNT 时间累计。设备侧复用
+`WorkerResult` offset 744 的 64-bit 诊断槽，结构仍为 832B，没有改变
+worker stride 或相邻字段 offset。
+
+时间边界严格定义为：
+
+~~~text
+begin: shadow request/miss read-clear -> phase_begin = SYS_CNT
+end:   phase_end = SYS_CNT -> shadow request/miss read-clear
+
+phase_elapsed += phase_end - phase_begin
+~~~
+
+因此阶段时间不包含两侧顺序 `ld_dev`，但包含每次调用两次
+SYS_CNT 和相关边界 bookkeeping 对被观察 ELF 的扰动。没有加 DSB/ISB。
+当前 CANN `llvm-objdump` 对 `elf64-hiipu` 只能列符号而不能解码指令，
+所以这里只声明已由源码顺序、device status 和真机逐核时间门禁闭环，
+不冒充已完成 ISA 反汇编证明。
+
+raw 对 96 个 worker 新增 `submit_elapsed_ticks`、`phase_elapsed_ticks`和
+`phase_time_valid`；host 和离线分析器都要求 running phase 满足
+`0 < phase_elapsed_ticks <= submit_elapsed_ticks`，`none` 则必须为 0。当前 v5
+required status mask 为 `0x7cf`；历史 v4 仍以 `0x3cf` 只读兼容，且明确
+标记阶段时间不可用，不从 PMU total 或 request/miss 反推。
+
+ALL/AIC/AIV 的时间占比统一按同一 SYS_CNT 口径计算：
+
+~~~text
+时间占比 = Σ本组 phase_elapsed_ticks / Σ本组 submit_elapsed_ticks
+~~~
+
+这是逐核累计 core-time 构成，不是局部阶段占全局约 5 ms 墙钟的时间片；
+不能把分子改除 `submit_span_us`，也不能平均 96 个逐核百分比。
+HTML 已把 ALL/AIC/AIV 的时间、request、miss 三类占比移到页面最前；
+时间是直接观察单值，request/miss 继续显示 lower..upper。
+
+同一 A5、`real-compute/6,28,4,1`、b256 下的首轮 v5 取证如下。五个
+独立进程均通过 96/96 记录、phase shape、`phase<=submit`、owner Restore、
+真计算输出与 placement/engine 门禁：
+
+| phase | Submit span | ALL 时间/core | ALL 占比 | AIC 占比 | AIV 占比 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `none` | 3.711584 ms | 不适用 | 不适用 | 不适用 | 不适用 |
+| `claim` | 4.401747 ms | 470.641 us | 12.0845% | 7.7096% | 14.2972% |
+| `efdrain` | 3.592376 ms | 536.279 us | 15.5068% | 20.2974% | 13.1974% |
+| `materialize` | 6.770266 ms | 1,026.859 us | 16.7186% | 15.4860% | 17.3556% |
+| `register` | 4.086936 ms | 158.728 us | 4.3089% | 3.6256% | 4.6568% |
+
+`ALL 时间/core` 等于本轮 `Σphase_elapsed_ticks / 96`，不是全局墙钟。
+Materialize 诊断 ELF 的 Submit span 增至 6.77 ms，直接说明高频边界观察本身
+会改变取指和多核争用。所以表中比例只解释同一行的诊断 ELF；四行
+不能相加，也不能与 `none` 相减得到无扰动阶段净时间。
+
+本机权威 raw 和页面最前已带时间占比的 HTML 位于：
+
+~~~text
+outputs/submit_pmu_phase_time_v5_20260719/none_b256/
+outputs/submit_pmu_phase_time_v5_20260719/claim_b256/
+outputs/submit_pmu_phase_time_v5_20260719/efdrain_b256/
+outputs/submit_pmu_phase_time_v5_20260719/materialize_b256/
+outputs/submit_pmu_phase_time_v5_20260719/register_b256/
+~~~
+
+#### 7.5.21 排他泳道边界收敛对 atomic 口径的影响
+
+2026-07-19 的后续改动只收敛普通 phase 边界和离线 residual，
+没有增删 Atomic site，也没有改变 direct/PollBatch、`return_ready`/
+`source_issue` 或 logical/physical weighted 计数公式。
+
+standalone loser 没有真实 Replay 计算，因此已删除每个 loser 一条的
+`LoserReplay` 过程态 phase 记录。这不是 atomic 消减：相关 Claim
+FetchMax、fanin/completion/frontier 等 atomic 仍按实际调用采集；只是不再
+用一条零工作 phase 伪装 loser 尾动作。最后一个真实 child 到
+`SubmitEnd` 的时间在 Perfetto 中由离线 `submit_tail_gap` 展示，在排他
+报告中汇总为 `submit_tail_residual`；它不被命名为 loser 业务阶段。
+
+schema-v4 merged 中 direct atomic 名仍编码
+`boundary/site/op/task_id`，PollBatch 名仍编码 `site/op/call_count`；
+为控制数百 MiB 产物，duration 事件不再逐条复制 raw 的 `args/cat`。
+精确 flags、cycle、retry、value-zero 和 weighted 计数仍以同目录
+`l2_swimlane_records.json` 为准，不因 merged 瘦身丢失。
+
+当前最新 CCEC A5 b1 为：
+
+~~~text
+outputs/pa_scheduler_swimlane_20260719_110756_584549/ccec/
+~~~
+
+该轮 4,118 条 raw 事件、`dropped=0`，全部 atomic 闭合与六类排他
+时间闭合均通过；当前 converter 生成的 merged 为 428,455 bytes。
+后续 atomic/边界迭代默认只跑 A5 b1；b256 仅用于阶段性规模/容量
+收口或明确要求的长负载结论。
+
+按明确要求完成的当前生产者 CCEC b256 规模复核位于：
+
+~~~text
+outputs/pa_scheduler_swimlane_20260719_114815_617346/ccec/
+~~~
+
+该轮 839,526 条 raw、97,510 条物理 Atomic、`dropped=0`，全局 Submit
+为 5,360.061 us；全部 atomic 与排他闭合通过。Submit 内部阶段间 residual
+为 0，尾部 residual 为 41,008,786/433,383,588 cycle（9.4625%），Submit
+间 residual 为 67,065,321/500,448,909 cycle（13.4010%）。这些数值是
+相同观测口径下的归因基线，不把边界重分类宣称为 atomic 或调度性能收益。

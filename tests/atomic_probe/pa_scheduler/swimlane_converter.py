@@ -19,9 +19,9 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, TextIO
-
 
 # 与真实 PA swimlane converter 使用同一套阶段命名。这里保留 ringbp、
 # efdrain 等既有拼写，避免同一阶段在两类泳道中被 Perfetto 分成不同名称。
@@ -42,6 +42,29 @@ PHASE_NAMES = {
     "Register": "register",
     "Atomic": "atomic",
     "ClockBaseline": "clock_baseline",
+    "OrchestrationReplay": "orchestration_replay",
+    "FinalDrain": "final_drain",
+    "WinnerBuild": "winner_build",
+    "AllocComplete": "alloc_complete",
+}
+LEGACY_LAP_PHASES = {"Alloc", "Build", "Replay"}
+V4_PHASES = {
+    "OrchestrationReplay",
+    "FinalDrain",
+    "WinnerBuild",
+    "AllocComplete",
+}
+# schema-v4 已有区间足以在离线侧取补集；这些 phase 之外的
+# Atomic、Kernel、RingBp 等是嵌套或 Overlay，不能再从 Submit 扣一次。
+V4_EXCLUSIVE_SUBMIT_PHASES = {
+    "EfDrain",
+    "Materialize",
+    "PrepareMap",
+    "Claim",
+    "Fanin",
+    "Register",
+    "WinnerBuild",
+    "AllocComplete",
 }
 KERNEL_NAMES = {0: "QK", 1: "SF", 2: "PV", 3: "UP"}
 # 一个物理 mixed block 的三条 runtime lane：AIC、AIV0、AIV1。
@@ -151,22 +174,27 @@ def _load_and_validate(
     if frequency_hz <= 0:
         raise ValueError("metadata.clock_freq_hz must be positive")
     # v1 是旧 raw，Claim flags 只有 winner bit；v2 追加 attempted bit；
-    # v3 再加入精确计数 PollBatch 与 producer summary 闭合。
+    # v3 再加入精确计数 PollBatch；v4 追加排他父区间与真实尾动作 span，
+    # 并要求 phase-only/atomic 两种观察级别都带 producer summary。
     # 不认识的新版本直接拒绝，避免把新 flags 按旧语义误读。
     trace_schema_version = _integer(metadata.get("trace_schema_version", 1), "metadata.trace_schema_version")
-    if trace_schema_version not in (1, 2, 3):
+    if trace_schema_version not in (1, 2, 3, 4):
         raise ValueError(f"unsupported metadata.trace_schema_version: {trace_schema_version}")
     if trace_schema_version == 3 and level != 4:
         raise ValueError("metadata.trace_schema_version=3 requires l2_swimlane_level=4")
+    if trace_schema_version == 4 and level not in (1, 4):
+        raise ValueError(
+            "metadata.trace_schema_version=4 requires l2_swimlane_level=1 or 4"
+        )
     num_cores = _integer(metadata.get("num_cores"), "metadata.num_cores")
     if num_cores <= 0:
         raise ValueError("metadata.num_cores must be positive")
     core_types = metadata.get("core_types")
     if not isinstance(core_types, list) or len(core_types) != num_cores:
         raise ValueError("metadata.core_types length must equal metadata.num_cores")
-    if trace_schema_version == 3:
+    if trace_schema_version >= 3:
         if num_cores > 96:
-            raise ValueError("schema-v3 standalone metadata.num_cores must not exceed 96")
+            raise ValueError("schema-v3+ standalone metadata.num_cores must not exceed 96")
         for core_id, core_type in enumerate(core_types):
             expected_type = _standalone_topology(core_id)[2]
             if core_type != expected_type:
@@ -247,7 +275,7 @@ def _load_and_validate(
         "atomic_calls": 0,
         "batched_poll_calls": 0,
         "poll_batch_records": 0,
-        # dropped 无法从已经导出的有效行反推；v3 必须由 producer summary
+        # dropped 无法从已经导出的有效行反推；v3+ 必须由 producer summary
         # 明确承诺为零，下面再逐字段核对。
         "dropped_records": 0,
     }
@@ -256,6 +284,14 @@ def _load_and_validate(
         for core_id in range(num_cores)
     }
     v3_result_used_direct_rows: list[tuple[int, int, bool]] = []
+    v4_parent_counts: dict[int, dict[str, int]] = {
+        core_id: {"OrchestrationReplay": 0, "FinalDrain": 0}
+        for core_id in range(num_cores)
+    }
+    v4_claims: dict[tuple[int, int], tuple[bool, bool, bool]] = {}
+    v4_submits: set[tuple[int, int]] = set()
+    v4_submit_semantics: dict[tuple[int, int], tuple[bool, bool]] = {}
+    v4_tails: dict[tuple[int, int], str] = {}
     # 逐行在写输出前检查列数、范围和可转整数的字段。任一行不满足这些约束
     # 都会整体拒绝输入，不生成缺少关键阶段的“部分可看”泳道。
     for index, row in enumerate(rows):
@@ -279,10 +315,22 @@ def _load_and_validate(
             raise ValueError(f"fdwic_events[{index}] has invalid lane {lane}")
         if phase not in PHASE_NAMES:
             raise ValueError(f"fdwic_events[{index}] has unknown phase {phase!r}")
-        if trace_schema_version == 3:
+        if trace_schema_version == 4 and phase in LEGACY_LAP_PHASES:
+            raise ValueError(
+                f"fdwic_events[{index}] schema-v4 forbids legacy lap phase {phase!r}"
+            )
+        if trace_schema_version == 4 and phase == "DrainWon":
+            raise ValueError(
+                f"fdwic_events[{index}] schema-v4 forbids unused legacy phase 'DrainWon'"
+            )
+        if trace_schema_version < 4 and phase in V4_PHASES:
+            raise ValueError(
+                f"fdwic_events[{index}] phase {phase!r} requires trace_schema_version=4"
+            )
+        if trace_schema_version >= 3:
             if task_id < -1 or function_id < -1 or auxiliary < 0:
                 raise ValueError(
-                    f"fdwic_events[{index}] has invalid v3 base fields: "
+                    f"fdwic_events[{index}] has invalid v3+ base fields: "
                     f"task={task_id} func={function_id} aux={auxiliary}"
                 )
             if not 0 <= flags <= 0xFFFFFFFF:
@@ -300,7 +348,7 @@ def _load_and_validate(
                 raise ValueError(
                     f"fdwic_events[{index}] has invalid Claim flags 0x{flags:x}"
                 )
-            if trace_schema_version == 3 and auxiliary > 1:
+            if trace_schema_version >= 3 and auxiliary > 1:
                 raise ValueError(
                     f"fdwic_events[{index}] has invalid Claim auxiliary {auxiliary}"
                 )
@@ -313,7 +361,8 @@ def _load_and_validate(
             payload = (flags >> ATOMIC_PAYLOAD_SHIFT) & ATOMIC_PAYLOAD_MASK
             if poll_batch:
                 if (
-                    trace_schema_version != 3
+                    trace_schema_version not in (3, 4)
+                    or level != 4
                     or payload == 0
                     or POLL_BATCH_SITE_OP_IDS.get(auxiliary) != atomic_op
                     or not result_used
@@ -326,7 +375,11 @@ def _load_and_validate(
                         f"fdwic_events[{index}] has invalid Atomic PollBatch "
                         f"site={auxiliary} flags=0x{flags:x}"
                     )
-            elif trace_schema_version == 3:
+            elif trace_schema_version in (3, 4):
+                if level != 4:
+                    raise ValueError(
+                        f"fdwic_events[{index}] Atomic requires l2_swimlane_level=4"
+                    )
                 expected_result_used = (
                     auxiliary in ATOMIC_SITE_OP_IDS
                     and auxiliary not in ATOMIC_RESULT_UNUSED_SITE_IDS
@@ -354,7 +407,11 @@ def _load_and_validate(
                 observed_summary["atomic_calls"] += 1
         elif phase == "ClockBaseline":
             observed_summary["clock_baseline_records"] += 1
-            if trace_schema_version == 3:
+            if trace_schema_version in (3, 4):
+                if level != 4:
+                    raise ValueError(
+                        f"fdwic_events[{index}] ClockBaseline requires l2_swimlane_level=4"
+                    )
                 dependency = bool(flags & 0x1)
                 dependency_applied = bool(flags & 0x2)
                 if (
@@ -374,6 +431,53 @@ def _load_and_validate(
                     clock_state["return_ready"] = dependency_applied
                 else:
                     clock_state["plain"] = int(clock_state["plain"]) + 1
+        if trace_schema_version == 4:
+            task_key = (core_id, task_id)
+            if phase in ("OrchestrationReplay", "FinalDrain"):
+                if task_id != -1 or function_id != -1 or flags != 0 or auxiliary != 0:
+                    raise ValueError(
+                        f"fdwic_events[{index}] has invalid schema-v4 parent {phase} fields"
+                    )
+                v4_parent_counts[core_id][phase] += 1
+            elif phase == "Submit":
+                if task_id < 0 or flags > 1 or auxiliary > 1:
+                    raise ValueError(
+                        f"fdwic_events[{index}] has invalid schema-v4 Submit fields"
+                    )
+                if task_key in v4_submits:
+                    raise ValueError(
+                        f"core {core_id} has duplicate schema-v4 Submit for task {task_id}"
+                    )
+                v4_submits.add(task_key)
+                v4_submit_semantics[task_key] = (bool(flags & 1), bool(auxiliary))
+            elif phase == "Claim":
+                if task_id < 0 or task_key in v4_claims:
+                    raise ValueError(
+                        f"core {core_id} has invalid or duplicate schema-v4 Claim for task {task_id}"
+                    )
+                v4_claims[task_key] = (
+                    bool(flags & 0x2), bool(flags & 0x1), bool(auxiliary)
+                )
+            elif phase in ("WinnerBuild", "AllocComplete"):
+                if task_id < 0 or flags != 0 or auxiliary != 0:
+                    raise ValueError(
+                        f"fdwic_events[{index}] has invalid schema-v4 tail {phase} fields"
+                    )
+                if task_key in v4_tails:
+                    raise ValueError(
+                        f"core {core_id} has duplicate schema-v4 tail for task {task_id}"
+                    )
+                if phase == "WinnerBuild":
+                    expected_function = task_id % 5 - 1
+                    if task_id % 5 == 0 or function_id != expected_function:
+                        raise ValueError(
+                            f"fdwic_events[{index}] WinnerBuild function/task mismatch"
+                        )
+                elif function_id != -1 or task_id % 5 != 0:
+                    raise ValueError(
+                        f"fdwic_events[{index}] AllocComplete must belong to an Alloc task"
+                    )
+                v4_tails[task_key] = phase
         if start_cycle <= 0 or end_cycle < start_cycle:
             raise ValueError(
                 f"fdwic_events[{index}] has invalid cycles start={start_cycle} end={end_cycle}"
@@ -401,7 +505,7 @@ def _load_and_validate(
         )
 
     assert base_cycle is not None
-    if trace_schema_version == 3:
+    if trace_schema_version in (3, 4) and level == 4:
         # 每核两条基线同时证明采集完整性和该后端是否真正应用了
         # atomic 返回值依赖；所有消费返回值的直接记录必须与本核证据一致。
         for core_id, clock_state in v3_clock_rows.items():
@@ -420,10 +524,43 @@ def _load_and_validate(
                     f"dependency_applied={expected_return_ready}"
                 )
 
+    if trace_schema_version == 4:
+        for core_id, counts in v4_parent_counts.items():
+            for phase, count in counts.items():
+                if count != 1:
+                    raise ValueError(
+                        f"core {core_id} requires exactly one schema-v4 {phase}: count={count}"
+                    )
+        if set(v4_claims) != v4_submits:
+            raise ValueError("schema-v4 Claim keys do not match Submit keys")
+        for task_key, (attempted, won, is_alloc) in v4_claims.items():
+            submit_won, submit_alloc = v4_submit_semantics[task_key]
+            expected_alloc = task_key[1] % 5 == 0
+            if is_alloc != expected_alloc or submit_alloc != expected_alloc:
+                raise ValueError(
+                    f"schema-v4 task-kind mismatch at {task_key}: "
+                    f"expected_alloc={expected_alloc}"
+                )
+            if won and not attempted:
+                raise ValueError(f"schema-v4 Claim won without attempt at {task_key}")
+            if submit_won != won or submit_alloc != is_alloc:
+                raise ValueError(f"schema-v4 Submit/Claim semantics mismatch at {task_key}")
+            expected_tail = "AllocComplete" if is_alloc else "WinnerBuild"
+            actual_tail = v4_tails.get(task_key)
+            # 只为 winner 记录真实尾动作；loser 没有尾记录，其剩余时间
+            # 由 Submit 的离线补集表示。
+            tail_valid = actual_tail == expected_tail if won else actual_tail is None
+            if not tail_valid:
+                raise ValueError(
+                    f"schema-v4 tail mismatch at {task_key}: "
+                    f"expected {expected_tail if won else 'no winner tail'}, got {actual_tail}"
+                )
+
+    if trace_schema_version >= 3:
         producer_summary = metadata.get("fdwic_summary")
         if not isinstance(producer_summary, dict):
             raise ValueError(
-                "metadata.fdwic_summary is required for trace_schema_version=3"
+                "metadata.fdwic_summary is required for trace_schema_version>=3"
             )
         for key, observed_value in observed_summary.items():
             producer_value = _integer(
@@ -444,6 +581,99 @@ def _emit_event(output: TextIO, event: dict[str, Any], first: bool) -> bool:
         output.write(",\n")
     json.dump(event, output, ensure_ascii=False, separators=(",", ":"))
     return False
+
+
+def _iter_v4_residual_spans(
+    rows: list[tuple[Any, ...]],
+) -> Iterator[tuple[int, int, int, int, int, str]]:
+    """只用既有 Submit/child 边界生成逐段补集，不改 raw ABI。"""
+
+    submits_by_lane: dict[tuple[int, int], list[tuple[Any, ...]]] = {}
+    submit_by_task: dict[tuple[int, int, int], tuple[Any, ...]] = {}
+    children_by_task: dict[tuple[int, int, int], list[tuple[Any, ...]]] = {}
+    for row in rows:
+        core_id, _block_id, lane, task_id, _function_id, phase, *_rest = row
+        lane_key = (int(core_id), int(lane))
+        task_key = (int(core_id), int(lane), int(task_id))
+        if phase == "Submit":
+            submits_by_lane.setdefault(lane_key, []).append(row)
+            if task_key in submit_by_task:
+                raise ValueError(f"schema-v4 residual synthesis found duplicate Submit {task_key}")
+            submit_by_task[task_key] = row
+        elif phase in V4_EXCLUSIVE_SUBMIT_PHASES:
+            children_by_task.setdefault(task_key, []).append(row)
+
+    orphan_child_keys = set(children_by_task) - set(submit_by_task)
+    if orphan_child_keys:
+        raise ValueError(
+            "schema-v4 residual synthesis found children without matching Submit: "
+            f"{sorted(orphan_child_keys)[:8]}"
+        )
+
+    # 先按每个 scalar lane 标记相邻 Submit 之间的真实空白。
+    for lane_key in sorted(submits_by_lane):
+        submits = sorted(
+            submits_by_lane[lane_key], key=lambda row: (int(row[6]), int(row[7]))
+        )
+        for previous, current in zip(submits, submits[1:]):
+            previous_end = int(previous[7])
+            current_start = int(current[6])
+            if current_start < previous_end:
+                raise ValueError(f"schema-v4 Submit spans overlap on core/lane {lane_key}")
+            if current_start > previous_end:
+                yield (
+                    int(previous[0]),
+                    int(previous[1]),
+                    int(previous[2]),
+                    previous_end,
+                    current_start,
+                    "between_submit_residual",
+                )
+
+    # Submit 内部只扣除同 task 的互斥 child；每个不连续补集段
+    # 单独生成一条最小 Perfetto X event，不伪造跨空白的连续区间。
+    # 只有“最后一个已知 child.end -> Submit.end”使用 tail 名称；
+    # 前缀和 child-to-child gap 继续保留中性 residual，不冒充业务阶段。
+    for task_key in sorted(submit_by_task):
+        submit = submit_by_task[task_key]
+        submit_start = int(submit[6])
+        submit_end = int(submit[7])
+        cursor = submit_start
+        children = sorted(
+            children_by_task.get(task_key, []),
+            key=lambda row: (int(row[6]), int(row[7]), str(row[5])),
+        )
+        for child in children:
+            child_start = int(child[6])
+            child_end = int(child[7])
+            if child_start < submit_start or child_end > submit_end:
+                raise ValueError(
+                    f"schema-v4 {child[5]} child is outside Submit {task_key}"
+                )
+            if child_start < cursor:
+                raise ValueError(
+                    f"schema-v4 exclusive children overlap in Submit {task_key}"
+                )
+            if child_start > cursor:
+                yield (
+                    int(submit[0]),
+                    int(submit[1]),
+                    int(submit[2]),
+                    cursor,
+                    child_start,
+                    "submit_residual",
+                )
+            cursor = max(cursor, child_end)
+        if submit_end > cursor:
+            yield (
+                int(submit[0]),
+                int(submit[1]),
+                int(submit[2]),
+                cursor,
+                submit_end,
+                # 与旧 "submit_residual" 等长，重分类后不增加 merged 字节。
+                "submit_tail_gap",
+            )
 
 
 # 完成一次 raw 到 merged 的转换，成功时返回事件数、block 数和基准 cycle。
@@ -625,6 +855,9 @@ def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
                 elif phase == "commit":
                     name = f"commit#{task_id}"
                     thread_id = lane + 3
+                elif phase in ("orchestration_replay", "final_drain"):
+                    name = phase
+                    thread_id = lane
                 else:
                     name = f"{phase}#{task_id}"
                     thread_id = lane
@@ -742,8 +975,33 @@ def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
                         "execution_unit": "scalar",
                     }
                     event["cat"] = "scalar_clock"
+                if trace_schema_version == 4:
+                    # schema-v4 的 merged 只承担可视化：阶段、atomic site/op/
+                    # boundary、task 和 poll 次数均已编码在 name，轨道与时间由
+                    # pid/tid/ts/dur 给出。十列权威字段完整保留在同目录 raw，
+                    # 不再逐事件复制近 100 MiB 的 args/cat。
+                    event.pop("args", None)
+                    event.pop("cat", None)
                 first = _emit_event(output, event, first)
                 emitted += 1
+            if trace_schema_version == 4:
+                # 补集是纯离线合成件：不增加设备 trace record、SYS_CNT
+                # 或 raw 字段。事件只保留 Perfetto X 必需的 6 个字段，
+                # 不复制每条 raw 已有的 args，控制 merged 体积增量。
+                for _core_id, block_id, lane, start, end, name in _iter_v4_residual_spans(rows):
+                    first = _emit_event(
+                        output,
+                        {
+                            "ph": "X",
+                            "name": name,
+                            "pid": block_id,
+                            "tid": lane,
+                            "ts": round((start - base_cycle) * factor, 3),
+                            "dur": round((end - start) * factor, 3),
+                        },
+                        first,
+                    )
+                    emitted += 1
             output.write("\n]}\n")
             output.flush()
             os.fsync(output.fileno())

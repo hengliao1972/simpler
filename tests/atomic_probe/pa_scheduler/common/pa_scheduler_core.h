@@ -559,41 +559,43 @@ PA_DEVICE bool SubmitTask(
         stats.result.submit_begin = submit_begin;
     }
 
-    ResetTraceLap<Ops>(stats.trace, stats.result, worker);
     // EfDrain 在当前 Submit 的参数物化前执行上一批已就绪 slot，是绝大多数 kernel 的正常落点。
     // 只在这个唯一 call-site 划 PMU 边界；DrainReady 还被 ring 背压和最终 drain
     // 复用，不能把 phase 插入函数体后按 place 混合累计。
+    // EfDrain 是 Submit 的第一个真实阶段，直接复用父区间起点；这样每次
+    // Submit 少一次 trace-only SYS_CNT，也不会留下人为的 prefix residual。
+    const uint64_t efdrain_begin = submit_begin;
     BeginSubmitPmuPhase<SubmitPmuPhase::EfDrain, Ops>(pmu_context);
     DrainReady<Ops>(state, worker, DrainPlace::EfDrain, stats);
     EndSubmitPmuPhase<SubmitPmuPhase::EfDrain, Ops>(pmu_context);
-    WriteTraceLap<Ops, Profile>(
-        stats.trace, worker, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::EfDrain,
-        ProfilePhase::EfDrain
+    const uint64_t efdrain_end = TraceTimestamp<Ops>(stats.trace, stats.result);
+    WriteTrace<Profile>(
+        stats.trace, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::EfDrain,
+        ProfilePhase::EfDrain, efdrain_begin, efdrain_end
     );
 
-    // dist_submit_materialize_and_prepare_map resets the lap origin before its
-    // two independently traced spans. Build/Replay later consumes this origin.
-    // lap 起点在 materialize 前重置；Materialize/PrepareMap 各自取独立绝对区间，而后续
-    // Build/Replay 会从这个起点形成覆盖式 span。因此泳道上的这些阶段不能直接相加。
-    ResetTraceLap<Ops>(stats.trace, stats.result, worker);
-    const uint64_t materialize_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
+    // schema-v4 的所有 Submit 子阶段都使用显式 start/end；不再通过共同 lap
+    // 起点生成相互覆盖的 Build/Replay/Alloc 区间。
+    // 后继 segment 复用前一阶段 end：既少一次 SYS_CNT，也把前一条 trace
+    // 发布和阶段间胶水明确归入 Materialize，而不是留成无名 residual。
+    const uint64_t materialize_begin = efdrain_end;
     BeginSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
     const bool materialized =
         MaterializeTask(worker, task_id, args, context, state->heap_base, state->heap_size);
-    EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
     if (!materialized) {
+        EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
+    stats.result.materialized_outputs += context.result.count;
+    EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
     const uint64_t materialize_end = TraceTimestamp<Ops>(stats.trace, stats.result);
     WriteTrace<Profile>(
         stats.trace, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::Materialize,
         ProfilePhase::Materialize, materialize_begin, materialize_end, 0,
         kind == TaskKind::Alloc ? 1U : 0U
     );
-    stats.result.materialized_outputs += context.result.count;
-
-    const uint64_t prepare_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
+    const uint64_t prepare_begin = materialize_end;
     AdvanceTensorMap(worker.map, task_id, static_cast<int32_t>(state->heap_window));
     const uint64_t prepare_end = TraceTimestamp<Ops>(stats.trace, stats.result);
     WriteTrace<Profile>(
@@ -606,7 +608,7 @@ PA_DEVICE bool SubmitTask(
 
     if (kind == TaskKind::Alloc) {
         // Alloc 没有 kernel lane，96 个 worker 都维护本地物化/heap 状态，但只有 Claim winner 发布全局完成。
-        const uint64_t register_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
+        const uint64_t register_begin = prepare_end;
         BeginSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(pmu_context);
         RegisterOutputs(context, args, false);
         EndSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(pmu_context);
@@ -616,96 +618,101 @@ PA_DEVICE bool SubmitTask(
             ProfilePhase::Register, register_begin, register_end, 0, 0
         );
 
-        const uint64_t claim_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
+        const uint64_t claim_begin = register_end;
         BeginSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
         const ClaimOutcome claim = Claim<Ops>(state, worker, task_id, kind, stats);
-        EndSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
         winner = claim.won;
         context.won = winner;
         context.kernel_id = claim.function_id;
+        // Claim 的本地结果归档属于同一阶段；放在共同 end 边界内，避免把
+        // winner/context/stat bookkeeping 留成无法归因的 Submit residual。
+        RecordClaimOutcome(stats, kind, claim);
+        EndSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
         const uint64_t claim_end = TraceTimestamp<Ops>(stats.trace, stats.result);
         WriteTrace<Profile>(
             stats.trace, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::Claim,
             ProfilePhase::Claim, claim_begin, claim_end,
             (winner ? kClaimWon : 0U) | (claim.attempted ? kClaimAttempted : 0U), 1
         );
-        RecordClaimOutcome(stats, kind, claim);
         if (winner) {
+            const uint64_t alloc_complete_begin = claim_end;
             if (!HeapGuard<Ops, Profile>(
                     state, worker, task_id, context.output_bytes, stats
                 )) {
                 return false;
             }
             CompleteTask<Ops>(state, worker, task_id, stats);
-            WriteTraceLap<Ops, false>(
-                stats.trace, worker, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::Alloc,
-                ProfilePhase::ReplayTail
+            const uint64_t alloc_complete_end = TraceTimestamp<Ops>(stats.trace, stats.result);
+            WriteTrace<false>(
+                stats.trace, stats.result, static_cast<int32_t>(task_id), -1,
+                TracePhase::AllocComplete, ProfilePhase::ReplayTail,
+                alloc_complete_begin, alloc_complete_end
             );
         } else {
-            // Replay 表示该 worker 输掉 Claim；前面的物化、TensorMap 和 register 仍已执行，以保持本地状态同步。
-            WriteTraceLap<Ops, false>(
-                stats.trace, worker, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::Replay,
-                ProfilePhase::ReplayTail
-            );
+            // standalone 的 Alloc loser 没有真实 GM/Replay 动作，不再为业务
+            // 路径名字写一条零时长记录。Claim 后到 Submit.end 的真实
+            // scalar 时间由离线 submit_tail_gap 补集展示；排他报告将其汇总为
+            // submit_tail_residual，避免伪装成 Alloc loser 业务阶段。
         }
     } else {
-        const uint64_t claim_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
+        const uint64_t claim_begin = prepare_end;
         BeginSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
         const ClaimOutcome claim = Claim<Ops>(state, worker, task_id, kind, stats);
-        EndSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
         winner = claim.won;
         function_id = claim.function_id;
         context.won = winner;
         context.kernel_id = function_id;
+        RecordClaimOutcome(stats, kind, claim);
+        EndSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
         const uint64_t claim_end = TraceTimestamp<Ops>(stats.trace, stats.result);
         WriteTrace<Profile>(
             stats.trace, stats.result, static_cast<int32_t>(task_id), function_id, TracePhase::Claim,
             ProfilePhase::Claim, claim_begin, claim_end,
             (winner ? kClaimWon : 0U) | (claim.attempted ? kClaimAttempted : 0U), 0
         );
-        RecordClaimOutcome(stats, kind, claim);
-
+        uint64_t register_begin = claim_end;
         if (winner) {
-            const uint64_t fanin_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
+            const uint64_t fanin_begin = claim_end;
             context.fanin_count = static_cast<int32_t>(CollectFanin(worker.map, args, context.fanin));
+            stats.result.map_lookups += static_cast<uint32_t>(args.tensor_count) - context.result.count;
             const uint64_t fanin_end = TraceTimestamp<Ops>(stats.trace, stats.result);
             WriteTrace<Profile>(
                 stats.trace, stats.result, static_cast<int32_t>(task_id), function_id, TracePhase::Fanin,
                 ProfilePhase::Fanin, fanin_begin, fanin_end, 0, static_cast<uint32_t>(context.fanin_count)
             );
-            stats.result.map_lookups += static_cast<uint32_t>(args.tensor_count) - context.result.count;
+            register_begin = fanin_end;
         }
 
-        const uint64_t register_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
+        // loser 直接承接 Claim.end；winner 则承接 Fanin.end。两条路径都
+        // 复用已有边界，不再为 Register 单独读取 SYS_CNT。
         BeginSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(pmu_context);
         RegisterOutputs(context, args, true);
+        stats.result.map_inserts += CountBits(context.register_mask);
         EndSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(pmu_context);
         const uint64_t register_end = TraceTimestamp<Ops>(stats.trace, stats.result);
         WriteTrace<Profile>(
             stats.trace, stats.result, static_cast<int32_t>(task_id), function_id, TracePhase::Register,
             ProfilePhase::Register, register_begin, register_end, 0, 1
         );
-        stats.result.map_inserts += CountBits(context.register_mask);
-
         if (winner) {
-            WriteTraceLap<Ops, false>(
-                stats.trace, worker, stats.result, static_cast<int32_t>(task_id), function_id, TracePhase::Build,
-                ProfilePhase::ReplayTail
-            );
+            const uint64_t winner_build_begin = register_end;
             if (!BuildWinner<Ops, Profile>(
                     state, worker, task_id, kind, args, context, context.fanin,
                     static_cast<uint32_t>(context.fanin_count), stats
                 )) {
                 return false;
             }
-        } else {
-            // 非 winner 不占用私有 ring slot，也不执行 kernel；Replay marker 覆盖本次前端回放的尾段。
-            WriteTraceLap<Ops, false>(
-                stats.trace, worker, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::Replay,
-                ProfilePhase::ReplayTail
+            const uint64_t winner_build_end = TraceTimestamp<Ops>(stats.trace, stats.result);
+            WriteTrace<false>(
+                stats.trace, stats.result, static_cast<int32_t>(task_id), function_id,
+                TracePhase::WinnerBuild, ProfilePhase::ReplayTail,
+                winner_build_begin, winner_build_end
             );
-            // drain_block_won() is a local boolean early-return for this
-            // single-lane PA graph, so it intentionally performs no GM access.
+        } else {
+            // 非 winner 不占用私有 ring slot，也没有可单列的 Replay 计算。
+            // Register 后到 Submit.end 由离线 submit_tail_gap 补集展示；排他
+            // 报告汇总为 submit_tail_residual，避免零时长 marker 增加 raw
+            // 体积和 trace-buffer 写开销。
         }
     }
 
@@ -870,15 +877,17 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     PaOrchestrationState orchestration;
     TaskArgs args;
     SubmitContext context;
+    uint64_t orchestration_begin = 0;
+    uint64_t orchestration_end = 0;
     if (!IsFatal<Ops>(state, stats)) {
         // Case1 每个 batch 固定回放 Alloc/QK/SF/PV/UP 五个 task；所有 worker 顺序相同，执行 lane 由 Claim 筛选。
         // CCEC 可在这里开启本 worker 私有 PMU 窗口；CPU/AscendC 适配层是空实现。
         // 窗口覆盖从首个参数构造到末次 Submit 返回，与全局“首 Submit.begin～末 Submit.end”
         // 口径接近但不相同，host sidecar 必须按 per-worker 累计解释。
-        ResetTraceLap<Ops>(stats.trace, stats.result, worker);
-        // lap 重置属于泳道观察自身，不应污染 PMU-only 的 Submit 取数；窗口从
+        // 泳道父边界在 PMU-only 构建中会被编译为空，不应污染 Submit 取数；窗口从
         // orchestration 初始化（即首批参数构造）前一条边界开始。
         auto pmu_context = Ops::PmuWindowStart(state, worker_id);
+        orchestration_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
         InitPaOrchestration(orchestration, batches, &state->context_lens[0]);
         for (uint32_t batch = 0; batch < batches; ++batch) {
             BuildAllocArgs(orchestration, args, batch);
@@ -938,9 +947,15 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             }
         }
         Ops::PmuWindowStop(state, worker_id, pmu_context);
+        orchestration_end = TraceTimestamp<Ops>(stats.trace, stats.result);
     }
 
     // replay_done 表示所有 worker 已退出回放循环（成功路径即完整提交）；之后仍需 drain 到本核 slot 为空。
+    // 成功路径复用 orchestration end 作为 final drain start，使两个业务父区间
+    // 首尾相接；父记录延后到 final drain 结束再写，避免记录自身落进任一业务 span。
+    const uint64_t final_drain_begin = orchestration_end != 0
+        ? orchestration_end
+        : TraceTimestamp<Ops>(stats.trace, stats.result);
     TraceAtomicFetchAdd<Ops>(
         stats.trace, stats.result, -1, AtomicSite::ReplayDoneIncrement,
         &state->replay_done.value, 1
@@ -964,6 +979,17 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         }
     }
     AtomicPollRegionEnd<Ops>(stats.trace, stats.result, final_poll_region);
+    const uint64_t final_drain_end = TraceTimestamp<Ops>(stats.trace, stats.result);
+    if (orchestration_begin != 0 && orchestration_end >= orchestration_begin) {
+        WriteTrace<false>(
+            stats.trace, stats.result, -1, -1, TracePhase::OrchestrationReplay,
+            ProfilePhase::Orchestration, orchestration_begin, orchestration_end
+        );
+    }
+    WriteTrace<false>(
+        stats.trace, stats.result, -1, -1, TracePhase::FinalDrain,
+        ProfilePhase::ReplayTail, final_drain_begin, final_drain_end
+    );
 
 #if !PA_BUILD_SUBMIT_PMU
     if (stats.trace.atomics_enabled) {

@@ -216,7 +216,7 @@ export CXX="$GCC15_ROOT/usr/bin/g++-15"
 
 | 构建 | 后端 | 内容 | 构建命令 | 产物目录 |
 | --- | --- | --- | --- | --- |
-| `swimlane` | CCEC/AscendC/CPU | 普通阶段与 schema-v3 atomic（direct + PollBatch）合并采集；不配置 PMU | `./run.sh build ccec` 或 `./run.sh build all` | CCEC 为 `build/ccec/` |
+| `swimlane` | CCEC/AscendC/CPU | schema-v4 普通阶段、业务父区间、真实 Submit 尾动作与 atomic（direct + PollBatch）合并采集；不配置 PMU | `./run.sh build ccec` 或 `./run.sh build all` | CCEC 为 `build/ccec/` |
 | `submit-pmu` | 仅 CCEC | 每核完整 Submit PMU，并在编译期可选一个局部阶段；当前有 `none|claim|efdrain|materialize|register` | `./run.sh build-submit-pmu ccec <phase>` | `build/ccec/submit-pmu/<phase>/` |
 
 `./run.sh build all` 只构建三后端的 `swimlane` 产物；`submit-pmu`
@@ -233,7 +233,7 @@ export CXX="$GCC15_ROOT/usr/bin/g++-15"
 | `build` | 构建指定后端 | 否 |
 | `smoke` | 固定 b1/r1/`scalar-nop=0` 的快速语义回归 | 否，只做内存记录校验 |
 | `run` | 自行控制 batch、run、winner 负载和诊断参数 | 仅显式传入 `--swimlane-json` 时生成 raw |
-| `swimlane` | 单轮运行并自动生成 raw 和 Perfetto merged JSON | 是 |
+| `swimlane` | 单轮运行并自动生成 raw、Perfetto merged JSON 和排他闭合分析 JSON | 是 |
 | `build-submit-pmu` | 构建指定 `none|claim|efdrain|materialize|register` 的 CCEC PMU-only ELF | 否 |
 | `submit-pmu` | 单轮采集完整 Submit PMU，可选导出 JSON | 否，与泳道隔离 |
 
@@ -291,9 +291,6 @@ semantic_status=PASS postprocess_status=PASS
 
 ```bash
 ./run.sh swimlane ccec \
-  --device 0 --batches 256 --analyze-swimlane
-
-./run.sh swimlane ccec \
   --device 0 --batches 1 --winner-workload real-compute
 
 ./run.sh swimlane ascendc \
@@ -301,8 +298,9 @@ semantic_status=PASS postprocess_status=PASS
   --real-compute-count 1
 ```
 
-`swimlane` 是唯一的正式泳道构建口径，固定合并普通阶段与 schema-v3 atomic
-记录（direct Atomic 加 PollBatch）；
+`swimlane` 是唯一的正式泳道构建口径，固定合并 schema-v4
+普通阶段、业务父区间、真实 Submit 尾动作与 atomic 记录（direct
+Atomic 加 PollBatch）；
 无需再显式传 `--trace-atomics`。该 action 会管理 `--runs 1` 和输出路径，因此不要再传
 `--runs`、`--swimlane-json` 或 `--no-swimlane`。转换器默认使用 `python3`；如需
 固定到用户自己的 Python，可在命令前设置：
@@ -311,15 +309,37 @@ semantic_status=PASS postprocess_status=PASS
 export PYTHON=/path/to/venv/bin/python
 ```
 
-转换器只使用 Python 标准库，不需要 PyTorch，也不需要安装 simpler Python 包。
+转换器和排他分析器都只使用 Python 标准库，不需要 PyTorch，
+也不需要安装 simpler Python 包。`--analyze-swimlane` 仍只控制 runner
+终端中的传统分组文字统计；无论是否传它，`swimlane` action 都会生成
+排他闭合报告。
+
+修改 C++ 头文件或 kernel 后必须先执行 `./run.sh build ccec`，
+`swimlane` action 只消费已有构建件，不会隐式重编译。日常边界迭代默认只跑
+A5 b1；b256 只用于阶段性规模/容量收口或明确指定的长负载结论。
 
 该 action 固定执行一轮，产物全部位于本目录的
 `outputs/pa_scheduler_swimlane_<UTC时间>_<PID>/<backend>/`。选择 `all` 时，
 同一 output root 下会按顺序建立 `ccec/`、`ascendc/` 和 `cpu/` 三个子目录：
 
-- `l2_swimlane_records.json`：与真实 PA 相同的十列 `fdwic_events` 原始格式；
-- `merged_swimlane.json`：Chrome Trace Event 格式，拖入
-  <https://ui.perfetto.dev/> 即可查看泳道。
+- `l2_swimlane_records.json`：与真实 PA 相同的十列 `fdwic_events`
+  权威原始件，所有字段复算以它为准；
+- `merged_swimlane.json`：只用于 Perfetto 可视化。schema-v4 的 duration
+  事件只保留 `ph/name/pid/tid/ts/dur` 六个必需字段，不再逐事件
+  复制 raw 中的 `args/cat`；拖入 <https://ui.perfetto.dev/> 即可查看；
+- `swimlane_exclusive_analysis.json`：以原始整数 cycle 校验并汇总
+  Submit、EfDrain、OrchestrationReplay、FinalDrain 和 WorkerCompletion
+  排他闭合关系，并将 Submit 内和 Submit 间的 residual 按相邻边界小表
+  聚合。完整父子层级、排他角色和数值统计以该报告为准，不再逐事件
+  塞入 merged。
+
+schema-v4 禁止产生历史 `Alloc/Build/Replay` lap 与未使用的
+`DrainWon`，只用 `AllocComplete/WinnerBuild` 表达真实 Submit winner
+尾动作。loser 没有可单独计时的业务动作，不生成 `LoserReplay`
+伪阶段；其未归因尾段只由离线 residual 展示。每个 Kernel 还必须唯一归入 EfDrain、WinnerBuild、AllocComplete 或
+FinalDrain；孤儿、越界或多重归属都会使排他分析失败。
+除 Kernel 可以执行前序 task 外，所有 Submit 前端和尾动作的 `task_id` 必须与
+包含它的 Submit 一致。
 
 runner 结束时会打印准确目录：
 
@@ -341,14 +361,16 @@ runner 结束时会打印准确目录：
 2. 将 `merged_swimlane.json` 拖入页面，不要拖原始的
    `l2_swimlane_records.json`；
 3. 每个 `block0` 至 `block31` 是一个物理 1AIC+2AIV block；
-4. `AIC`、`AIV0`、`AIV1` 轨展示 Submit、Claim、EfDrain、Replay、RingBp 等
-   runtime 阶段，带 `·kernel` 的轨展示 QK、SF、PV、UP；
+4. `AIC`、`AIV0`、`AIV1` 轨展示 OrchestrationReplay、Submit、Claim、
+   EfDrain、WinnerBuild、AllocComplete、FinalDrain、Residual 和 RingBp
+   等 runtime 阶段，带 `·kernel` 的轨展示 QK、SF、PV、UP；
 5. direct Atomic、PollBatch 及 ClockBaseline 固定画在对应
-   `AIC/AIV` scalar lane；direct 名称与 category 显式区分 `return_ready` 和
+   `AIC/AIV` scalar lane；direct 名称显式区分 `return_ready` 和
    `source_issue`，PollBatch 单独标识逻辑轮询 episode；不生成带 `·atomic` 的
    伪并行子轨；
-6. 普通事件可查看 `task_id`、`func_id`、`core`、`mc` 和 `aux`；Atomic 的
-   字段和解读边界见 5.6 节。
+6. merged 事件名保留 phase/task，atomic 名还保留
+   `site/op/boundary/call_count`；需要 `func_id/core/flags/aux` 等精确字段时
+   查同目录 raw，Atomic 的解读边界见 5.6 节。
 
 WaitForSlot 和 HeapGuard 没有可伪造的逐事件起止时间，因此不单独生成 Perfetto
 事件；实际发生等待时，泳道中会出现 RingBp 事件。现行 CCEC 局部 PMU
@@ -367,6 +389,10 @@ WaitForSlot 和 HeapGuard 没有可伪造的逐事件起止时间，因此不单
 python3 ./swimlane_converter.py \
   ./outputs/<capture>/ccec/l2_swimlane_records.json \
   -o ./outputs/<capture>/ccec/merged_swimlane.json
+
+python3 ./swimlane_exclusive_analyzer.py \
+  ./outputs/<capture>/ccec/l2_swimlane_records.json \
+  -o ./outputs/<capture>/ccec/swimlane_exclusive_analysis.json
 ```
 
 若只需要原始记录，可通过通用 `run` action 显式指定文件；导出为避免多轮覆盖
@@ -378,8 +404,12 @@ mkdir -p ./outputs/manual
   --swimlane-json ./outputs/manual/l2_swimlane_records.json
 ```
 
-手工 `--swimlane-json` 只生成 raw，不会自动生成 merged；需要随后调用上面的
-`swimlane_converter.py`。该参数强制要求 `--runs 1`，避免多轮静默覆盖同一文件。
+手工 `--swimlane-json` 只生成 raw，不会自动生成 merged 或排他报告；
+需要随后调用上面两个脚本。该参数强制要求 `--runs 1`，避免多轮
+静默覆盖同一文件。runner、converter 和 analyzer 都只在单件写完后
+原子替换各自目标；这是逐文件发布而不是三件整体事务：runner 失败时
+不启动后处理，converter 失败时保留已完成的 raw，analyzer 失败时保留
+已完成的 raw 与 merged，任何阶段都不会把半截 JSON 冒充完整产物。
 
 ### 5.5 CPU 回归、参数与测量口径
 
@@ -453,7 +483,7 @@ frontier_initial=... frontier_flag=... frontier_ready_fetch_max=... frontier_ter
 结果区，不为诊断新增共享 atomic。它们仍会增加少量 scalar 指令，因此优化 A/B
 必须使用相同的计数布局；不能把启用分类后的绝对时间直接与旧二进制比较。
 
-### 5.6 合并泳道中的 atomic schema-v3 语义边界
+### 5.6 合并泳道中的 atomic schema-v4 语义边界
 
 正式 `swimlane` action 固定记录 standalone 调度器中的 atomic **逻辑调用**，
 不只记录 winner 或慢样本。普通 direct Atomic 仍是一条源码调用对应一条物理记录；
@@ -462,15 +492,15 @@ frontier_initial=... frontier_flag=... frontier_ready_fetch_max=... frontier_ter
 
 ```bash
 ./run.sh swimlane ccec \
-  --device 0 --batches 256 \
+  --device 0 --batches 1 \
   --analyze-swimlane
 ```
 
 只有使用低层 `run` action 手工导出 raw 时，才需要显式传入
 `--trace-atomics`；该兼容入口不代表存在第二种 atomic-swimlane 构建。
 
-schema-v3 raw 的 `metadata.trace_schema_version` 必须为 3，且
-`metadata.l2_swimlane_level` 必须为 4。转换后 direct Atomic、PollBatch 和
+schema-v4 raw 的 `metadata.trace_schema_version` 必须为 4，且顶层
+`l2_swimlane_level` 必须为 4。转换后 direct Atomic、PollBatch 和
 ClockBaseline 都放在对应 AIC/AIV 的原 scalar lane；它们属于 scalar
 调度观察，不再伪装成与 scalar 并行的独立子轨。Kernel 仍放在独立计算单元轨。
 direct Atomic 事件名显式区分两种边界：
@@ -480,8 +510,8 @@ atomic.return_ready.<site>.<op>#<task_id>
 atomic.source_issue.<site>.<op>#<task_id>
 ```
 
-category 也分别为 `atomic.return_ready` 与 `atomic.source_issue`，可在
-Perfetto 中直接过滤，无需逐条点开 args 才能区分。
+边界已编码在事件名中，可在 Perfetto 中按名称搜索或过滤，
+无需为每条事件保留 category/args。
 
 PollBatch 转换为：
 
@@ -489,8 +519,8 @@ PollBatch 转换为：
 atomic.poll_batch.<site>.load×<call_count>
 ```
 
-其 category 为 `atomic.poll_batch`；`args.call_count` 是实际执行的源码 wrapper
-调用次数，不是采样或估算值。
+名称中的 `call_count` 是实际执行的源码 wrapper 调用次数，
+不是采样或估算值。
 
 当前固定 schema 共有 15 个调用点：
 
@@ -545,13 +575,11 @@ PollBatch；同一 site 在等待区外的一次性或 opportunistic 读取仍�
   `1..0xFFFFFF`。达到上限时先落盘，再从 1 开启下一条 batch，不允许饱和后
   丢失调用数；`task_id=-1`、`function_id=-1`。
 
-merged direct 事件的 `args` 显式导出 `call_count=1`、`site/site_id`、
-`op/op_id`、原始整数 `cycles`、`result_used`、`return_ready_observed`、
-`completion_boundary`，以及适用时的 `value_zero` 或 `retries`。PollBatch 则导出
-精确 `call_count`、`poll_window_cycles`、
-`batch_semantics=observation_load_calls`、
-`duration_semantics=logical_poll_episode_envelope_not_single_atomic_latency` 和
-`may_contain_interleaved_direct_atomics=true`。
+schema-v4 merged 只保留可视化必需的六个 duration 字段。direct 的
+`site/op/boundary/task_id` 和 PollBatch 的 `site/op/call_count` 均在名称中；
+`site_id/op_id`、原始整数 cycle、flags、retry 和 value-zero 等精确值从同目录
+raw 十列记录复算。不把这些重复复制到 merged，是为了控制数百万
+事件时的文件大小和观察工具内存。
 
 边界必须按源码调用点语义解读：
 
@@ -576,8 +604,8 @@ PollBatch 的 `duration`/`poll_window_cycles` 是从该 site 在显式等待区�
 
 - 显式等待区退出时关闭匹配的 PollBatch；
 - `TraceTimestamp` 在写 phase begin/end 前关闭全部活跃 batch；
-- `ResetTraceLap` 在推进 lap 起点前关闭，`WriteTraceLap` 在写 lap 前以同一结束
-  cycle 关闭；
+- schema-v4 producer 不再生成旧 `Alloc/Build/Replay` lap；历史 helper
+  仍有自身关闭规则，但不得出现在当前 raw 中；
 - Kernel begin/end 也通过 `TraceTimestamp`，所以 PollBatch 不能跨入或跨出 Kernel；
 - 最终 flush 只作防御性兜底，不能替代上述语义边界。
 
@@ -590,7 +618,7 @@ PollBatch 的 `duration`/`poll_window_cycles` 是从该 site 在显式等待区�
 `[TRACE_ATOMIC_POLL]` 单独输出 PollBatch 的 episode 数、精确逻辑调用数和等待包络
 分布，二者不会混算。
 
-schema-v3 必须按逻辑调用与物理记录两套口径闭合。设 direct 物理记录数为
+schema-v4 level-4 raw 必须按逻辑调用与物理记录两套口径闭合。设 direct 物理记录数为
 `direct_atomic_records`，则逐核和全局都必须满足：
 
 ```text
@@ -612,9 +640,67 @@ raw 行重算和 converter 重算逐项一致；`dropped_records` 必须为 0，
 也不能用它们计算 atomic 对 golden 的绝对占比。每核分区固定容纳 65,536 条记录；
 任何容量溢出或闭合失败都使该轮 trace 无效，不能截断后继续分析。
 
-#### schema-v3 边界修复版 A5 验收
+#### schema-v4 排他闭合版 A5 验收
 
-2026-07-18 已用边界修复后的同一版 standalone CCEC 依次完成 b1 与 b256 真机重测：
+2026-07-19 早期曾完成 CPU/CCEC/AscendC b1 语义门禁，但该过程态
+raw 仍含现已删除的 `LoserReplay`，当前 converter 会拒绝它们。下面
+只列当前无 loser 记录的 CCEC 证据。删除无业务实体的 loser 标记后，
+b256 规模样本位于：
+
+```text
+outputs/pa_scheduler_swimlane_20260719_103435_542368/ccec/l2_swimlane_records.json
+outputs/pa_scheduler_swimlane_20260719_103435_542368/ccec/merged_swimlane_thin.json
+outputs/pa_scheduler_swimlane_20260719_103435_542368/ccec/swimlane_exclusive_analysis.json
+```
+
+该轮使用 `real-compute/6,28,4,1`，每核 1,280 个 Submit，raw
+845,813 条事件、`dropped=0`，首末 Submit 为 5,326.055 us，六类整数
+cycle 闭合全部精确相等。raw 为 56,212,672 bytes；旧格式 merged 为
+248,767,986 bytes，同一 raw 经当前六字段 converter 生成的
+`merged_swimlane_thin.json` 为 138,349,686 bytes，减少 44.4%。这是离线
+可视化瘦身，不改变该轮设备采集。同目录的
+`merged_swimlane.json` 是旧胖版，查看该规模样本时应打开上述 thin 文件。
+该轮早于最终相邻边界复用，只作规模/容量门禁，不代表当前 residual
+构成。
+
+边界收敛后的最新日常验证只跑 CCEC b1：
+
+```text
+outputs/pa_scheduler_swimlane_20260719_110756_584549/ccec/
+```
+
+该轮 raw 4,118 条事件、`dropped=0`，全局 Submit 89.313 us，merged
+428,455 bytes，六类闭合全部通过。Submit 内所有 child-to-child
+gap 已为零，即 `submit_internal_residual=0`；最后一个真实 child 到
+`SubmitEnd` 的 `submit_tail_residual` 为 184,788/2,241,892 cycle
+（8.2425%）。Submit 间 residual 为 155,679/2,397,571 cycle（首末
+Submit 包络的 6.493%）。Perfetto 分别用 `submit_tail_gap` 与
+`between_submit_residual` 展示两类补集，不新增 raw 记录或字段。
+
+按明确要求完成的当前 CCEC b256 规模复核位于：
+
+```text
+outputs/pa_scheduler_swimlane_20260719_114815_617346/ccec/
+```
+
+该轮使用 `real-compute/6,28,4,1`，全局 Submit 为 5,360.061 us；raw
+839,526 条、`dropped=0`，merged 1,085,191 条事件。raw/merged 分别为
+55,791,947/88,775,668 bytes，全部语义断言与整数闭合通过。
+Submit aggregate core-work 为 433,383,588 cycle：内部 residual 为 0，
+尾部 residual 为 41,008,786 cycle（9.4625%）；逐核首末 Submit 包络为
+500,448,909 cycle，Submit 间 residual 为 67,065,321 cycle（13.4010%）。
+122,880 条 `submit_tail_gap` 与 122,784 条 `between_submit_residual`
+分别精确对应 `96*1280` 和 `96*(1280-1)`，没有增加设备事件。
+
+后续边界迭代默认只跑 A5 b1；b256 仅在阶段性规模/容量收口或
+明确要求时重跑。历史 level-4 b256 多轮波动证据仍保留在本文后续
+章节，不将 b1 单轮时间宣称为性能改善。
+
+#### 历史：schema-v3 边界修复版 A5 验收
+
+2026-07-18 已用边界修复后的同一版 standalone CCEC 依次完成 b1 与 b256
+真机重测。下列是升级到当前 schema-v4 之前的历史样本，不应修改其
+metadata 或用当前父区间口径强行解释：
 
 ```text
 outputs/pa_scheduler_swimlane_20260718_182649_4060527/ccec/
@@ -666,7 +752,7 @@ b256 是开启 atomic 泳道的诊断运行；上表 Submit 只能证明当前�
 记录了 963,368 条物理记录，其中逐条 Atomic 99,944 条、ClockBaseline 192 条，
 逐核峰值 10,308/65,536，且当轮 `dropped=0`。这些数字来自引入 PollBatch 与上述
 phase/lap/Kernel 边界修复之前的 schema-v2 逐调用模型，只能用于追溯旧版观察结果；
-不能拿 99,944 当作当前 schema-v3 的物理容量、逻辑调用数或闭合证据。
+不能拿 99,944 当作当前 schema-v4 的物理容量、逻辑调用数或闭合证据。
 
 ### 5.7 两类正式构建与 CCEC Submit PMU
 
@@ -722,7 +808,7 @@ export PYTHON=/home/q00473782/.venv/bin/python
 OUT="./outputs/submit_pmu_none_$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$OUT"
 ./run.sh submit-pmu ccec none \
-  --device 0 --batches 256 \
+  --device 0 --batches 1 \
   --winner-workload real-compute --real-compute-counts 6,28,4,1 \
   --pmu-json "$OUT/submit_icache_raw.json"
 ```
@@ -735,11 +821,24 @@ submit_icache_report.html    # 浏览器直接打开的离线图表和汇总
 ```
 
 HTML 中包含 AIC/AIV 的每核 request、miss、miss rate、p95、96 核散点和
-局部 phase 的 lower/upper 区间，以及局部 request/miss 占同一 ELF 完整
-Submit primary 的比例区间。报告也展示 ALL/AIC/AIV 的逐核 PMU `total_cycles`
-与 `scalar_busy` 的 mean/median/p95、scalar/total 比例和逐核散点。报告将
+局部 phase 的 lower/upper 区间。schema-v5 的 running phase 还在页面
+最前面按 ALL/AIC/AIV 并列阶段时间、request 和 miss 占比；阶段时间
+是 `Σphase_elapsed_ticks / Σsubmit_elapsed_ticks`，request/miss 是占同一
+ELF PMU whole-gate primary 的比例区间。两者分母边界不同，不是同一
+精确分区。`none` 显示“不适用”，历史
+schema-v4 因没有阶段时间 raw 字段而显示“不可用”。报告也展示
+ALL/AIC/AIV 的逐核 PMU `total_cycles`
+与 `scalar_busy`：三个响应式角色卡只选 mean 作为典型值，并补充逐核
+min/max 显示核间范围；PMU total 与 scalar busy 的极值分别独立计算，不保证
+来自同一个物理核。顶部“完整 Submit（最早开始 → 最晚结束）”是 96 核整体
+墙钟范围，不能与逐核 PMU mean 混为一个统计量。报告还展示 scalar/total 比例
+和逐核散点，并同时保留 raw cycle 与本机校准后的每核等效时间；宽表只在表格
+内部横向滚动。受控 cold/warm 同窗实测
+`1,817,457 PMU cycles / 1,101,593 ns = 1.649844 cycles/ns`；AIC/AIV
+分别使用 `1.650062/1.649731 cycles/ns`，换算式为
+`time_us = cycles / cycles_per_ns / 1000`。报告将
 `total_cycles-scalar_busy` 明确标为“非 Scalar-busy 残余”。`total_cycles`
-是每个物理子核在 Submit gate 内的 64-bit PMU raw total，96 核求和是 core-work，
+是每个物理子核在 PMU whole gate 内的 64-bit raw total，96 核求和是 core-work，
 不是约 5 ms 的 Submit 墙钟；`scalar_busy` 是 CNT2 的
 `scalar_instr_busy(0x001)`。依赖返回值的 atomic 等待可以落入 scalar busy，
 而 I-cache refill 的额外周期可能主要只增加 total，但
@@ -756,6 +855,23 @@ I-cache stall**：差值还混有同步等待、Cube/Vector/MTE 等 engine 等�
 报告只复用 `pmu_sidecar_analyzer.py` 已校验的统计口径；生成失败不会删除已经发布
 的 raw，但本次 action 会返回非零。
 
+这里的 PMU whole gate 从 orchestration 初始化/首次构参前开始，到末次
+Submit 返回后停止，包含 Submit 间构参和 `AcceptTaskOutputs()`，排除
+FinalDrain。`submit_elapsed_ticks` 是每核首末 Submit 时间；顶部
+`submit_span_us` 则是 96 核共同墙钟范围。三者不能混用，详细定义见
+`../icache_miss_usage_guide.md`。
+
+当前边界联动版已对 `none|claim|efdrain|materialize|register` 五个独立
+ELF 完成 A5 b1 门禁，五轮均为 96/96 有效记录并通过语义、真计算、
+phase call/time、primary/shadow 和 owner Restore。产物位于：
+
+```text
+outputs/submit_pmu_boundary_sync_b1_20260719/{none,claim,efdrain,materialize,register}/
+```
+
+该 b1 只作源码边界与工具闭合证据，不用不同 phase ELF 的单轮时间差
+宣称性能改善。
+
 两类新增局部 phase 可按与 `none` 相同的参数分别运行；输出文件名应体现 phase，
 避免误把不同 ELF 的结果放进同一组：
 
@@ -764,7 +880,7 @@ for phase in materialize register; do
   OUT="./outputs/submit_pmu_${phase}_$(date -u +%Y%m%dT%H%M%SZ)"
   mkdir -p "$OUT"
   ./run.sh submit-pmu ccec "$phase" \
-    --device 0 --batches 256 \
+    --device 0 --batches 1 \
     --winner-workload real-compute --real-compute-counts 6,28,4,1 \
     --pmu-json "$OUT/submit_icache_raw.json"
 done
@@ -774,7 +890,10 @@ done
 不要重复传入这三项，也不能传入 `--profile-phases`、
 `--trace-atomics`、`--analyze-swimlane` 或 `--swimlane-json`。
 
-完整 Submit 的权威 I-cache 主计数是从不在局部边界读取的
+后续 submit-pmu 构建、门禁和边界迭代默认只跑 A5 b1；b256 只用于
+阶段性规模/容量收口或明确要求的长负载结论。
+
+Submit-all PMU 整窗的权威 I-cache 主计数是从不在局部边界读取的
 `CNT6=request` 和 `CNT7=miss`。A5 b1 实测已反证 `CNT9=0x35`
 可作有效计数槽：它始终为 0。因此正式 `submit-pmu` 用
 `CNT8=0x34` 作 shadow request、`CNT5=0x35` 作 shadow miss，`CNT9`
@@ -782,7 +901,10 @@ done
 `swimlane` 构建。
 
 shadow 计数器是 read-to-clear：选中的局部 phase 在 begin/end 切分片段，stop 时
-再加 tail，从而软件重建完整 Submit shadow whole。`none` 没有运行中读取，必须
+再加 tail，从而软件重建 PMU whole-gate shadow whole。schema-v5 同时在
+begin read-clear 之后取阶段起点，在 end read-clear 之前先取终点；因此
+阶段时间不包含两侧 `ld_dev`，但包含每次调用两次 SYS_CNT 的观察
+扰动。`none` 没有运行中读取，必须
 在每个物理子核精确满足：
 
 ```text
@@ -814,7 +936,12 @@ Alloc/QK/SF/PV/UP 五个 task，每次 Submit 都恰好执行一次 Claim、开�
 Materialize 和 Register 边界。`efdrain` 插点只允许包围 Submit 开头的专属调用，
 不能插入复用的 `DrainReady()` 函数体；`materialize` 必须先保存真实返回值再关闭
 边界，保证失败出口也闭合；`register` 的 Alloc 与非 Alloc 两个源码调用点互斥，
-不能误算成每次 Submit 两次。当前 Case1 中真实 TensorMap insert 工作主要发生在
+不能误算成每次 Submit 两次。每个 running phase 还要求每核
+`phase_elapsed_ticks > 0`且不超过同核从首个 `submit_begin` 计时点
+到末个 `submit_end` 计时点的 `submit_elapsed_ticks`；前者位于首个
+`BeginSubmit()` 上下文初始化之后，后者位于末个 Submit 返回之前。
+`none` 的 phase elapsed 必须精确为 0。
+当前 Case1 中真实 TensorMap insert 工作主要发生在
 UP 的输出注册，其他 task 的 Register 可能很短或没有 insert；因此该 phase 的
 固定调用数只证明边界覆盖完整，不能解释为五类 task 拥有等量注册工作。
 
@@ -830,7 +957,16 @@ placement/engine 门禁都通过时，running shadow 的负差属于观测边界
 JSON 保留 96 条 raw record，并按 ALL/AIC/AIV 输出 authoritative whole、
 shadow loss 和 phase lower/upper。raw 中包含 `shadow_request_loss`、
 `shadow_miss_loss`、`phase_icache_requests_upper_bound` 与
-`phase_icache_misses_upper_bound`；host 还分别报告 exact/bounded 核数。
+`phase_icache_misses_upper_bound`；schema-v5 还包含逐核
+`submit_elapsed_ticks`、`phase_elapsed_ticks`和 `phase_time_valid`。host 还分别
+报告 exact/bounded 核数。时间占比必须在 ALL/AIC/AIV 各自范围内按
+
+```text
+Σphase_elapsed_ticks / Σsubmit_elapsed_ticks
+```
+
+计算；分子、分母都是 1 ns/tick 的逐核 SYS_CNT core-time，不能改用
+96 核整体 `submit_span_us`，也不能平均 96 个逐核百分比。
 完整 Submit 的组内 miss rate 才按 `sum(misses)/sum(requests)` 计算，不平均
 逐核百分比；局部 lower miss/lower request 之比只是 observed read-clear
 ratio，不是实际 miss rate 的数学下界。更完整的 I-cache 采集、分析、估算与排错见
@@ -990,7 +1126,9 @@ JSON 包含：
 `sum(icache_misses) / sum(icache_requests)` 计算，不平均逐核百分比。AIC 与 AIV
 核数不同，比较每核强度时应看 mean/median 或 miss rate，不能直接比较两组 sum。
 `total_cycles` 是 PMU total 的原始值；96 核求和是 core-work，不是 Submit 墙钟
-时间，在没有额外核实其时钟/事件语义前不应直接换算成微秒。CNT0..CNT8 是
+时间。本机现已通过 PMU/SYS_CNT 同窗校准核实其频率，HTML 可按
+ALL/AIC/AIV 的 `1.649844/1.650062/1.649731 cycles/ns` 显示每核
+cycle-equivalent；该换算仍不能把 96 核 core-work 冒充墙钟。CNT0..CNT8 是
 32 bit，total 是 64 bit。正式门禁要求本轮最大可编程 counter 小于 `UINT32_MAX/4`
 （25% 高水位），这只是缩短窗口后采用的保守风险阈值；最终 32-bit 值无法证明
 计数器没有恰好回卷一圈或多圈，因此通过该门禁也不能声称“已证明无回卷”。
@@ -1073,7 +1211,7 @@ tests/atomic_probe/pa_scheduler/outputs/pmu_validation/
 
 #### 历史：校验并聚合多轮 PMU sidecar
 
-`pmu_sidecar_analyzer.py` 只读消费当前 schema-v3 JSON。它不信任单轮 host 已写好的
+`pmu_sidecar_analyzer.py` 在该历史流程中只读消费当时的 schema-v3 JSON。它不信任单轮 host 已写好的
 summary，而是从每份文件的 worker raw 记录重新计算 ALL/AIC/AIV 的
 `sum/mean/median/p95/max` 与 `sum(miss)/sum(request)`；同时检查 accepted、
 96 核 start/stop、物理核唯一性、owner membership、角色、counter 门槛和 Restore。
@@ -1300,9 +1438,15 @@ winner workload 配置 cache line，生产 DistGlobal/DistCore 关键偏移保�
 1.313 GiB，real-compute+trace 约 1.325 GiB，host 侧也需分配相近内存。
 CPU 后端只在 host 侧分配相同 workspace，不存在 device 内存口径。
 `smoke` 不缩小 State；只有 `--no-swimlane` 能省去泳道缓冲区。
-256 batch 的正常采集约有 86 万条事件；原始 JSON 和 merged JSON 都可能达到
-数十至数百 MiB。writer 与 converter 都使用临时文件后原子替换，失败时不会把
-半截文件冒充完整产物。
+256 batch 的历史 phase-only 采集约有 86.3 万条事件。删除
+`LoserReplay` 过程态后，当前 schema-v4 level-4 b256 规模门禁为
+845,813 条 raw 事件、56,212,672 bytes；同一 raw 使用旧 merged
+字段布局为 248,767,986 bytes，使用当前六字段 duration 布局为
+138,349,686 bytes，减少 44.4%。按 96 核聚合而不复制每个 gap
+属性的排他报告约 117 KiB。文件瘦身不改变 raw 记录写入数，
+也不改变固定 trace buffer 分配；三者是独立口径。
+runner、converter 与 analyzer 都使用临时文件后原子替换自己的目标，失败时
+不会把半截文件冒充完整产物。
 
 脱离 simpler 时必须复制整个目录，因为三个后端共用 `common/`：
 
@@ -1314,6 +1458,6 @@ cd /tmp/pa_scheduler
 ```
 
 CCEC/AscendC 只需再 source CANN 环境。本目录的构建脚本不会搜索 Git 根目录，
-也不会引用 `simpler/src`、`simpler/examples` 或其他仓内文件。泳道转换只需
-Python 3 标准库；复制后的 `./run.sh swimlane ...` 仍使用当前目录内的
-`swimlane_converter.py`。
+也不会引用 `simpler/src`、`simpler/examples` 或其他仓内文件。泳道转换与排他
+分析都只需 Python 3 标准库；复制后的 `./run.sh swimlane ...` 仍使用当前目录内的
+`swimlane_converter.py` 和 `swimlane_exclusive_analyzer.py`。

@@ -103,7 +103,226 @@ def _v3_capture(
     }
 
 
+def _v4_capture(
+    rows: list[list[object]],
+    *,
+    num_cores: int = 1,
+    add_parents: bool = True,
+) -> dict[str, object]:
+    """构造 phase-only schema-v4 raw；调用者显式提供 Claim/Submit/尾动作。"""
+    all_rows = [list(row) for row in rows]
+    if add_parents:
+        for core_id in range(num_cores):
+            block_id, lane, _ = _standalone_topology(core_id)
+            all_rows.extend(
+                [
+                    [core_id, block_id, lane, -1, -1, "OrchestrationReplay", 90, 200, 0, 0],
+                    [core_id, block_id, lane, -1, -1, "FinalDrain", 200, 220, 0, 0],
+                ]
+            )
+    return {
+        "l2_swimlane_level": 1,
+        "metadata": {
+            "clock_freq_hz": 1_000_000_000,
+            "num_cores": num_cores,
+            "trace_schema_version": 4,
+            "core_types": [
+                _standalone_topology(core_id)[2] for core_id in range(num_cores)
+            ],
+            "fdwic_summary": {
+                "records": len(all_rows),
+                "atomic_records": 0,
+                "clock_baseline_records": 0,
+                "atomic_calls": 0,
+                "batched_poll_calls": 0,
+                "poll_batch_records": 0,
+                "dropped_records": 0,
+            },
+        },
+        "fdwic_events": all_rows,
+    }
+
+
 class SwimlaneConverterLayoutTest(unittest.TestCase):
+    def test_v4_splits_internal_and_tail_residual_without_repeated_fields(self) -> None:
+        capture = _v4_capture(
+            [
+                [0, 0, 0, 0, -1, "Claim", 110, 120, 0x3, 1],
+                [0, 0, 0, 0, -1, "AllocComplete", 120, 130, 0, 0],
+                [0, 0, 0, 0, -1, "Submit", 100, 140, 1, 1],
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            convert(input_path, output_path)
+            merged = json.loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(merged["metadata"]["trace_schema_version"], 4)
+        events = merged["traceEvents"]
+        orchestration = next(
+            event for event in events if event.get("name") == "orchestration_replay"
+        )
+        self.assertNotIn("args", orchestration)
+        self.assertNotIn("cat", orchestration)
+        residuals = [event for event in events if event.get("name") == "submit_residual"]
+        tails = [
+            event for event in events if event.get("name") == "submit_tail_gap"
+        ]
+        self.assertEqual(
+            residuals,
+            [
+                {"ph": "X", "name": "submit_residual", "pid": 0, "tid": 0, "ts": 0.01, "dur": 0.01},
+            ],
+        )
+        self.assertEqual(
+            tails,
+            [
+                {
+                    "ph": "X",
+                    "name": "submit_tail_gap",
+                    "pid": 0,
+                    "tid": 0,
+                    "ts": 0.04,
+                    "dur": 0.01,
+                }
+            ],
+        )
+        for event in (*residuals, *tails):
+            self.assertEqual(set(event), {"ph", "name", "pid", "tid", "ts", "dur"})
+
+    def test_v4_marks_between_submit_gap_without_loser_marker(self) -> None:
+        capture = _v4_capture(
+            [
+                [0, 0, 0, 0, -1, "Claim", 110, 120, 0x2, 1],
+                [0, 0, 0, 0, -1, "Submit", 100, 140, 0, 1],
+                [0, 0, 0, 1, -1, "Claim", 170, 180, 0x2, 0],
+                [0, 0, 0, 1, -1, "Submit", 160, 200, 0, 0],
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            convert(input_path, output_path)
+            events = json.loads(output_path.read_text(encoding="utf-8"))["traceEvents"]
+
+        internal = [event for event in events if event.get("name") == "submit_residual"]
+        tails = [
+            event for event in events if event.get("name") == "submit_tail_gap"
+        ]
+        between = [
+            event for event in events if event.get("name") == "between_submit_residual"
+        ]
+        self.assertEqual(len(internal), 2)
+        self.assertEqual(len(tails), 2)
+        self.assertEqual(
+            between,
+            [
+                {
+                    "ph": "X",
+                    "name": "between_submit_residual",
+                    "pid": 0,
+                    "tid": 0,
+                    "ts": 0.05,
+                    "dur": 0.02,
+                }
+            ],
+        )
+        # 前缀/尾段只是重分类：合成事件总数仍为 5，没有扩大 merged。
+        self.assertEqual(len(internal) + len(tails) + len(between), 5)
+        for event in (*internal, *tails, *between):
+            self.assertEqual(set(event), {"ph", "name", "pid", "tid", "ts", "dur"})
+
+    def test_v4_rejects_legacy_lap_phase(self) -> None:
+        capture = _v4_capture(
+            [
+                [0, 0, 0, 0, -1, "Claim", 110, 120, 0, 0],
+                [0, 0, 0, 0, -1, "Submit", 100, 140, 0, 1],
+                [0, 0, 0, 0, -1, "Replay", 100, 120, 0, 0],
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "forbids legacy lap phase"):
+                convert(input_path, output_path)
+
+    def test_v4_rejects_unused_drain_won_phase(self) -> None:
+        capture = _v4_capture(
+            [
+                [0, 0, 0, 0, -1, "Claim", 110, 120, 0, 0],
+                [0, 0, 0, 0, -1, "Submit", 100, 140, 0, 0],
+                [0, 0, 0, 0, -1, "DrainWon", 121, 122, 0, 0],
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "forbids unused legacy phase"):
+                convert(input_path, output_path)
+
+    def test_v4_rejects_missing_winner_tail(self) -> None:
+        capture = _v4_capture(
+            [
+                [0, 0, 0, 0, -1, "Claim", 110, 120, 0x3, 1],
+                [0, 0, 0, 0, -1, "Submit", 100, 140, 1, 1],
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "tail mismatch"):
+                convert(input_path, output_path)
+
+    def test_v4_rejects_task_kind_that_disagrees_with_task_id(self) -> None:
+        capture = _v4_capture(
+            [
+                [0, 0, 0, 1, -1, "Claim", 110, 120, 0, 1],
+                [0, 0, 0, 1, -1, "Submit", 100, 140, 0, 1],
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "task-kind mismatch"):
+                convert(input_path, output_path)
+
+    def test_v4_requires_both_parent_spans(self) -> None:
+        capture = _v4_capture(
+            [
+                [0, 0, 0, 0, -1, "Claim", 110, 120, 0, 0],
+                [0, 0, 0, 0, -1, "Submit", 100, 140, 0, 1],
+            ],
+            add_parents=False,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "requires exactly one schema-v4"):
+                convert(input_path, output_path)
+
+    def test_v4_rejects_removed_loser_replay_phase(self) -> None:
+        capture = _v4_capture(
+            [
+                [0, 0, 0, 0, -1, "Claim", 110, 120, 0x2, 1],
+                [0, 0, 0, 0, -1, "LoserReplay", 120, 120, 0, 0],
+                [0, 0, 0, 0, -1, "Submit", 100, 140, 0, 1],
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "unknown phase 'LoserReplay'"):
+                convert(input_path, output_path)
+
     def test_real_compute_metadata_is_preserved_and_visible(self) -> None:
         # raw 与 merged 都必须自描述真实 engine 负载；否则同名 QK/SF/PV/UP
         # span 无法与历史 scalar-NOP 泳道区分。

@@ -69,9 +69,10 @@ covering the complete Submit window. phase=none performs no internal snapshots;
 phase=claim/efdrain/materialize/register reports running read-clear lower/loss-adjusted upper bounds
 for one compile-time phase while CNT6/7 retain the authoritative whole-window counters.
 
-The swimlane action performs exactly one run and writes both the raw capture
-and merged Perfetto JSON below this directory's outputs/ folder. It rejects
---runs, --swimlane-json, and --no-swimlane because those are managed by the action.
+The swimlane action performs exactly one run and writes the raw capture,
+merged Perfetto JSON, and exclusive timing analysis below this directory's
+outputs/ folder. It rejects --runs, --swimlane-json, and --no-swimlane because
+those are managed by the action.
 
 The all target always uses the requested implementation order:
 CCEC, AscendC, then CPU.
@@ -374,11 +375,12 @@ case "$ACTION" in
         done
         ;;
     swimlane)
-        # swimlane 是“采集 + 转换”的事务边界：runner 失败则不转换，converter
-        # 失败则 action 非零退出；已成功写完的 raw 会保留用于排查转换问题。
+        # swimlane 是“采集 + Perfetto 转换 + 排他闭合分析”的流水线边界：
+        # runner 失败则不做后处理；任一后处理失败都非零退出，但保留此前
+        # 已原子发布的完整文件，便于定位失败边界。
         reject_managed_swimlane_options "$@"
         # 仅需要 Python 标准库；允许用户用 PYTHON 指向自己的虚拟环境，
-        # 但转换脚本始终取自当前 pa_scheduler 目录。
+        # 但转换和排他分析脚本始终取自当前 pa_scheduler 目录。
         PYTHON_BIN="${PYTHON:-python3}"
         if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
             echo "Python executable not found: $PYTHON_BIN" >&2
@@ -386,6 +388,10 @@ case "$ACTION" in
         fi
         if [[ ! -f "$SCRIPT_DIR/swimlane_converter.py" ]]; then
             echo "Missing local converter: $SCRIPT_DIR/swimlane_converter.py" >&2
+            exit 1
+        fi
+        if [[ ! -f "$SCRIPT_DIR/swimlane_exclusive_analyzer.py" ]]; then
+            echo "Missing local analyzer: $SCRIPT_DIR/swimlane_exclusive_analyzer.py" >&2
             exit 1
         fi
         # UTC 秒级时间加当前 shell PID 避免并行采集目录冲突；所有产物保持
@@ -398,13 +404,16 @@ case "$ACTION" in
             BACKEND_OUTPUT="$OUTPUT_ROOT/$backend"
             RAW_JSON="$BACKEND_OUTPUT/l2_swimlane_records.json"
             MERGED_JSON="$BACKEND_OUTPUT/merged_swimlane.json"
+            EXCLUSIVE_JSON="$BACKEND_OUTPUT/swimlane_exclusive_analysis.json"
             mkdir -p "$BACKEND_OUTPUT"
-            # runner 先执行单轮严格语义校验并流式写 raw；成功后才调用本地
-            # converter 生成 Perfetto 文件。set -e 保证任一步失败即停止。
+            # runner 先执行单轮严格语义校验并流式写 raw；成功后才依次调用
+            # converter 和 analyzer。set -e 保证任一步失败即停止。
             # 用户要求泳道默认带齐逐 atomic 性能。重复传入 --trace-atomics
             # 只是幂等布尔开关，不会产生两份记录；直接 run 仍可选择 phase-only。
             run_backend "$backend" --runs 1 --trace-atomics --swimlane-json "$RAW_JSON" "$@"
             "$PYTHON_BIN" "$SCRIPT_DIR/swimlane_converter.py" "$RAW_JSON" -o "$MERGED_JSON"
+            "$PYTHON_BIN" "$SCRIPT_DIR/swimlane_exclusive_analyzer.py" \
+                "$RAW_JSON" -o "$EXCLUSIVE_JSON"
         done
         echo "[SWIMLANE] output_root=$OUTPUT_ROOT"
         ;;

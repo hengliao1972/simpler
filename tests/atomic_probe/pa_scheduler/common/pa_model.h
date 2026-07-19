@@ -287,6 +287,13 @@ enum class TracePhase : int32_t {
     // 逐 atomic 诊断构建中，每个 worker 只记录一次连续两次 SYS_CNT 的
     // 空括号，用来给出同一二进制、同一物理核上的计时分辨率下限。
     ClockBaseline = 15,
+    // schema-v4 追加的父区间与真实动作区间。loser 没有可单列的真实动作，
+    // 其时间直接归入离线计算的 Submit residual，不占用 raw 记录。
+    OrchestrationReplay = 16,
+    FinalDrain = 17,
+    WinnerBuild = 18,
+    AllocComplete = 19,
+    Count = 20,
 };
 
 // AtomicSite 按 standalone PA 中真实出现的源码调用点分类。编号写入 TraceRecord::auxiliary，
@@ -752,9 +759,13 @@ struct alignas(64) WorkerResult {
     // host 用它与 Atomic span 数逐 worker 闭合，禁止把丢记录的泳道当成完整结果。
     uint64_t atomic_trace_calls;
 
-    // I-cache 单 miss 探针把 cold 样本放在既有 PMU 字段中，并在扩展的诊断尾部
-    // 保存同核配对的 warm 样本与 1 GHz 系统计数器窗口；非该模式均写零。
-    uint64_t pmu_window_ticks;
+    // I-cache 单 miss 探针用该槽保存 cold 窗口的 1 GHz SYS_CNT；submit-pmu
+    // 复用同一 64-bit 槽保存所选局部阶段的逐调用累计时间。两种构建互斥，
+    // 因而无需扩大 832B WorkerResult，也不会改变相邻 worker 的 cache-line 布局。
+    union {
+        uint64_t pmu_window_ticks;
+        uint64_t pmu_phase_elapsed_ticks;
+    };
     uint64_t pmu_warm_total_cycles;
     uint64_t pmu_warm_window_ticks;
     union {
@@ -774,7 +785,7 @@ struct alignas(64) WorkerResult {
     uint32_t pmu_mte1_busy;
     uint32_t pmu_mte2_busy;
     // swimlane ABI 保留该槽；submit-pmu 将物理 CNT5 改作 shadow miss，
-    // 因而显式发布 0，并在 schema v4 标记 mte3_busy 不可用。
+    // 因而显式发布 0，并在当前 submit-pmu schema-v5 标记 mte3_busy 不可用。
     uint32_t pmu_mte3_busy;
     uint32_t pmu_fix_busy;
 

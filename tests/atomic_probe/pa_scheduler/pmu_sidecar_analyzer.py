@@ -25,9 +25,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-
 SCHEMA_NAME = "pa_scheduler_pmu_phase_windows"
-SCHEMA_VERSIONS = (3, 4)
+SCHEMA_VERSIONS = (3, 4, 5)
+SUBMIT_PMU_SCHEMA_VERSIONS = (4, 5)
 GROUP_NAMES = ("all", "aic", "aiv")
 METRIC_NAMES = (
     "total_cycles",
@@ -56,6 +56,10 @@ SUBMIT_PMU_METRIC_NAMES = (
     "phase_icache_requests",
     "phase_icache_misses",
 )
+SUBMIT_PMU_V5_METRIC_NAMES = SUBMIT_PMU_METRIC_NAMES + (
+    "submit_elapsed_ticks",
+    "phase_elapsed_ticks",
+)
 SUMMARY_FIELDS = ("sum", "mean", "median", "p95", "max")
 SUBMIT_PMU_BUILD_VARIANT = "submit-pmu"
 SUBMIT_PMU_BUILD_VARIANT_ID = 2
@@ -69,9 +73,10 @@ SUBMIT_PMU_PHASE_IDS = {
     "register": 5,
 }
 TASKS_PER_BATCH = 5
-PHASE_STATUS_REQUIRED_MASK = 0x3CF
+PHASE_STATUS_REQUIRED_MASK_V4 = 0x3CF
+PHASE_STATUS_REQUIRED_MASK_V5 = 0x7CF
 
-# schema-v4 只描述 A5 standalone submit-pmu 正式采集，不接受由 JSON 自报的
+# schema-v4/v5 只描述 A5 standalone submit-pmu 正式采集，不接受由 JSON 自报的
 # 任意缩小拓扑。物理槽按每 die 18 AIC + 36 AIV 排列；当前 runtime 实际开放
 # 32 个 AIC 与 64 个 AIV，共组成 32 组 1:2 mixed triplet。
 A5_WORKERS = 96
@@ -116,6 +121,13 @@ SUBMIT_PMU_FINGERPRINT_FIELDS = CONFIG_FINGERPRINT_FIELDS + (
     "phase_shadow_partition_exact_required",
     "phase_values_are_running_read_clear_lower_bounds",
     "cross_phase_elf_sums_valid",
+    "phase_time_observation_included",
+    "phase_time_sys_counter_tick_ns",
+    "phase_time_boundary",
+    "phase_time_excludes_shadow_read_overhead",
+    "phase_time_includes_timestamp_overhead",
+    "phase_time_share_definition",
+    "phase_time_denominator_scope",
 )
 
 
@@ -199,7 +211,9 @@ def _same_number(lhs: int | float, rhs: Any) -> bool:
 
 def _configuration_fingerprint(configuration: dict[str, Any], schema_version: int) -> str:
     fields = (
-        SUBMIT_PMU_FINGERPRINT_FIELDS if schema_version == 4 else CONFIG_FINGERPRINT_FIELDS
+        SUBMIT_PMU_FINGERPRINT_FIELDS
+        if schema_version in SUBMIT_PMU_SCHEMA_VERSIONS
+        else CONFIG_FINGERPRINT_FIELDS
     )
     selected = {field: configuration.get(field) for field in fields}
     # schema version 不是 configuration 字段，但必须进入指纹，防止 v3 历史文件与
@@ -265,7 +279,7 @@ def _validate_group_summary(
         f"raw={actual_rate!r} json={expected.get('icache_miss_rate')!r}",
     )
 
-    if schema_version == 4:
+    if schema_version in SUBMIT_PMU_SCHEMA_VERSIONS:
         phase_requests = sum(
             _integer(record["phase_icache_requests"], "phase_icache_requests")
             for record in records
@@ -291,8 +305,10 @@ def _validate_group_summary(
             )
 
 
-def _validate_submit_pmu_configuration(path: Path, configuration: dict[str, Any]) -> tuple[str, int]:
-    """校验 v4 的编译期构建身份、局部阶段和重复 selector 契约。"""
+def _validate_submit_pmu_configuration(
+    path: Path, configuration: dict[str, Any], schema_version: int
+) -> tuple[str, int]:
+    """校验 submit-pmu 的编译期身份、局部阶段和观察能力契约。"""
 
     _require(
         configuration.get("build_variant") == SUBMIT_PMU_BUILD_VARIANT,
@@ -319,7 +335,7 @@ def _validate_submit_pmu_configuration(path: Path, configuration: dict[str, Any]
     )
     _require(
         configuration.get("pmu_window") == "submit-all",
-        f"{path}: schema-v4 submit-pmu requires pmu_window='submit-all'",
+        f"{path}: submit-pmu requires pmu_window='submit-all'",
     )
     _require(
         _integer(
@@ -357,7 +373,6 @@ def _validate_submit_pmu_configuration(path: Path, configuration: dict[str, Any]
         "trace_enabled",
         "trace_atomics",
         "profile_phases",
-        "phase_timestamp_calls_present",
         "phase_record_writes",
         "atomic_trace",
         "profile_accumulation",
@@ -366,6 +381,11 @@ def _validate_submit_pmu_configuration(path: Path, configuration: dict[str, Any]
     ):
         _require(configuration.get(field) is False, f"{path}: configuration.{field} is not false")
     expected_boundary_observation = phase_name != "none"
+    expected_phase_timestamps = schema_version == 5 and expected_boundary_observation
+    _require(
+        configuration.get("phase_timestamp_calls_present") is expected_phase_timestamps,
+        f"{path}: configuration.phase_timestamp_calls_present does not match schema/phase",
+    )
     _require(
         configuration.get("phase_boundary_observation_included")
         is expected_boundary_observation,
@@ -387,6 +407,43 @@ def _validate_submit_pmu_configuration(path: Path, configuration: dict[str, Any]
         is running_lower_bounds,
         f"{path}: configuration.phase_values_are_running_read_clear_lower_bounds does not match the phase",
     )
+    if schema_version == 5:
+        _require(
+            configuration.get("phase_time_observation_included")
+            is expected_boundary_observation,
+            f"{path}: configuration.phase_time_observation_included does not match the phase",
+        )
+        _require(
+            _number(
+                configuration.get("phase_time_sys_counter_tick_ns"),
+                f"{path}: configuration.phase_time_sys_counter_tick_ns",
+            )
+            == 1.0,
+            f"{path}: phase_time_sys_counter_tick_ns must be one",
+        )
+        _require(
+            configuration.get("phase_time_boundary")
+            == "after_begin_read_clear_to_before_end_read_clear",
+            f"{path}: unexpected phase_time_boundary",
+        )
+        _require(
+            configuration.get("phase_time_excludes_shadow_read_overhead") is True,
+            f"{path}: phase_time_excludes_shadow_read_overhead is not true",
+        )
+        _require(
+            configuration.get("phase_time_includes_timestamp_overhead") is True,
+            f"{path}: phase_time_includes_timestamp_overhead is not true",
+        )
+        _require(
+            configuration.get("phase_time_share_definition")
+            == "sum(phase_elapsed_ticks)/sum(submit_elapsed_ticks)",
+            f"{path}: unexpected phase_time_share_definition",
+        )
+        _require(
+            configuration.get("phase_time_denominator_scope")
+            == "per_worker_first_submit_begin_to_last_submit_end",
+            f"{path}: unexpected phase_time_denominator_scope",
+        )
 
     selectors = configuration.get("selectors")
     _require(isinstance(selectors, dict), f"{path}: configuration.selectors must be an object")
@@ -452,7 +509,7 @@ def _validate_submit_pmu_owner(
 ) -> set[int]:
     """独立重验 configure 后、restore 前保存的 PMU owner 快照。"""
 
-    _require(isinstance(owner, dict), f"{path}: schema-v4 owner must be an object")
+    _require(isinstance(owner, dict), f"{path}: submit-pmu owner must be an object")
     _require(owner.get("mode") == "main_aicpu_path_a", f"{path}: unexpected owner.mode")
     _require(
         owner.get("snapshot_phase") == "after_configure_before_restore",
@@ -584,6 +641,7 @@ def _validate_submit_pmu_record(
     phase_name: str,
     phase_id: int,
     batches: int,
+    schema_version: int,
 ) -> PhasePartitionEvidence:
     """重验 raw phase 分区；运行中 read-clear 只形成上下界。"""
 
@@ -598,8 +656,11 @@ def _validate_submit_pmu_record(
         f"{prefix} compiled_phase_id mismatch",
     )
     phase_status = _integer(record.get("phase_status"), f"{prefix}.phase_status")
+    phase_status_required = (
+        PHASE_STATUS_REQUIRED_MASK_V5 if schema_version == 5 else PHASE_STATUS_REQUIRED_MASK_V4
+    )
     _require(
-        (phase_status & PHASE_STATUS_REQUIRED_MASK) == PHASE_STATUS_REQUIRED_MASK,
+        (phase_status & phase_status_required) == phase_status_required,
         f"{prefix} phase_status is incomplete",
     )
     expected_calls = _expected_submit_pmu_phase_calls(phase_name, batches)
@@ -715,6 +776,23 @@ def _validate_submit_pmu_record(
             phase_request_upper == phase_requests and phase_miss_upper == phase_misses,
             f"{prefix} a phase with zero calls must have zero-width bounds",
         )
+    if schema_version == 5:
+        submit_elapsed_ticks = _integer(
+            record.get("submit_elapsed_ticks"), f"{prefix}.submit_elapsed_ticks"
+        )
+        phase_elapsed_ticks = _integer(
+            record.get("phase_elapsed_ticks"), f"{prefix}.phase_elapsed_ticks"
+        )
+        _require(submit_elapsed_ticks > 0, f"{prefix}.submit_elapsed_ticks must be positive")
+        _require(
+            phase_elapsed_ticks <= submit_elapsed_ticks,
+            f"{prefix}.phase_elapsed_ticks exceeds its Submit interval",
+        )
+        _require(
+            phase_elapsed_ticks == 0 if expected_calls == 0 else phase_elapsed_ticks > 0,
+            f"{prefix}.phase_elapsed_ticks does not match enabled phase calls",
+        )
+        _require(record.get("phase_time_valid") is True, f"{prefix}.phase_time_valid is not true")
 
     return PhasePartitionEvidence(
         shadow_exact=shadow_exact,
@@ -728,7 +806,7 @@ def _validate_submit_pmu_record(
 
 
 def load_capture(path: Path) -> Capture:
-    """读取并完整校验一份历史 v3 或 submit-pmu v4 sidecar。"""
+    """读取并完整校验历史 v3 或 submit-pmu v4/v5 sidecar。"""
 
     with path.open("r", encoding="utf-8") as input_file:
         data = json.load(input_file)
@@ -741,7 +819,7 @@ def load_capture(path: Path) -> Capture:
     schema_version = _integer(schema.get("version"), f"{path}: schema.version")
     _require(
         schema_version in SCHEMA_VERSIONS,
-        f"{path}: expected {SCHEMA_NAME} schema v3 or v4",
+        f"{path}: expected {SCHEMA_NAME} schema v3, v4 or v5",
     )
 
     capture = data.get("capture")
@@ -763,13 +841,15 @@ def load_capture(path: Path) -> Capture:
     _require(len(records) == workers, f"{path}: record count does not match configuration.workers")
     phase_name: str | None = None
     phase_id: int | None = None
-    if schema_version == 4:
+    if schema_version in SUBMIT_PMU_SCHEMA_VERSIONS:
         _require(
             (workers, aic_workers, aiv_workers)
             == (A5_WORKERS, A5_AIC_WORKERS, A5_AIV_WORKERS),
-            f"{path}: schema-v4 requires the fixed 96/32/64 A5 topology",
+            f"{path}: submit-pmu schema requires the fixed 96/32/64 A5 topology",
         )
-        phase_name, phase_id = _validate_submit_pmu_configuration(path, configuration)
+        phase_name, phase_id = _validate_submit_pmu_configuration(
+            path, configuration, schema_version
+        )
     else:
         counter_widths = configuration.get("counter_width_bits")
         _require(
@@ -808,7 +888,7 @@ def load_capture(path: Path) -> Capture:
     for owner, field in required_true:
         _require(owner.get(field) is True, f"{path}: {field} is not true")
     configured_physical_ids: set[int] | None = None
-    if schema_version == 4:
+    if schema_version in SUBMIT_PMU_SCHEMA_VERSIONS:
         _require(
             validation.get("phase_measurement_valid") is True,
             f"{path}: phase_measurement_valid is not true",
@@ -829,7 +909,7 @@ def load_capture(path: Path) -> Capture:
             validation.get(field) == workers,
             f"{path}: validation.{field} is incomplete",
         )
-    if schema_version == 4:
+    if schema_version in SUBMIT_PMU_SCHEMA_VERSIONS:
         expected_host_counts = {
             "expected_records": A5_WORKERS,
             "expected_unique_core_ids": A5_WORKERS,
@@ -880,7 +960,7 @@ def load_capture(path: Path) -> Capture:
         worker_ids.add(worker_id)
         physical_core_ids.add(physical_id)
         ordered_physical_ids.append(physical_id)
-        if schema_version == 4:
+        if schema_version in SUBMIT_PMU_SCHEMA_VERSIONS:
             _require(
                 worker_id == index,
                 f"{path}: records[{index}].worker_id does not match its exact worker slot",
@@ -958,7 +1038,7 @@ def load_capture(path: Path) -> Capture:
                 "shadow_whole_icache_requests",
                 "shadow_whole_icache_misses",
             )
-            if schema_version == 4
+            if schema_version in SUBMIT_PMU_SCHEMA_VERSIONS
             else tuple(metric for metric in METRIC_NAMES if metric != "total_cycles")
         )
         for field in programmable_fields:
@@ -967,15 +1047,17 @@ def load_capture(path: Path) -> Capture:
                 value < PROGRAMMABLE_COUNTER_RISK_THRESHOLD,
                 f"{path}: records[{index}].{field} reaches the 32-bit counter risk threshold",
             )
-        if schema_version == 4:
+        if schema_version in SUBMIT_PMU_SCHEMA_VERSIONS:
             # 上面的 configuration 校验已保证二者不是 None；显式 assert 只帮助
             # 类型收窄，不替代任何 JSON 运行时门禁。
             assert phase_name is not None and phase_id is not None
             phase_partition_evidence.append(
-                _validate_submit_pmu_record(path, index, record, phase_name, phase_id, batches)
+                _validate_submit_pmu_record(
+                    path, index, record, phase_name, phase_id, batches, schema_version
+                )
             )
 
-    if schema_version == 4:
+    if schema_version in SUBMIT_PMU_SCHEMA_VERSIONS:
         assert configured_physical_ids is not None
         _require(
             physical_core_ids == configured_physical_ids,
@@ -1084,11 +1166,30 @@ def load_capture(path: Path) -> Capture:
                 == expected,
                 f"{path}: validation.{field} disagrees with raw records",
             )
+        if schema_version == 5:
+            _require(
+                _integer(
+                    validation.get("phase_time_valid_records"),
+                    f"{path}: validation.phase_time_valid_records",
+                )
+                == A5_WORKERS,
+                f"{path}: validation.phase_time_valid_records is incomplete",
+            )
+            _require(
+                validation.get("phase_time_measurement_valid") is True,
+                f"{path}: validation.phase_time_measurement_valid is not true",
+            )
 
     _require(len(groups["aic"]) == aic_workers, f"{path}: AIC raw record count mismatch")
     _require(len(groups["aiv"]) == aiv_workers, f"{path}: AIV raw record count mismatch")
 
-    metric_names = SUBMIT_PMU_METRIC_NAMES if schema_version == 4 else METRIC_NAMES
+    metric_names = (
+        SUBMIT_PMU_V5_METRIC_NAMES
+        if schema_version == 5
+        else SUBMIT_PMU_METRIC_NAMES
+        if schema_version == 4
+        else METRIC_NAMES
+    )
     for group_name in GROUP_NAMES:
         _validate_group_summary(
             path,
@@ -1162,7 +1263,7 @@ def analyze(paths: Sequence[Path], miss_penalty_ns: float = 90.0) -> dict[str, A
                 "scalar_busy_sum": group["scalar_busy"]["sum"],
                 "total_cycles_sum": group["total_cycles"]["sum"],
             }
-            if schema_version == 4:
+            if schema_version in SUBMIT_PMU_SCHEMA_VERSIONS:
                 raw_group = capture.groups[group_name]
                 phase_requests = _integer(
                     group["phase_icache_requests"].get("sum"), "phase I-cache request sum"
@@ -1267,6 +1368,37 @@ def analyze(paths: Sequence[Path], miss_penalty_ns: float = 90.0) -> dict[str, A
                             phase_miss_upper_sum / misses if misses != 0 else None,
                     }
                 )
+                if schema_version == 5:
+                    submit_elapsed_ticks = _integer(
+                        group["submit_elapsed_ticks"].get("sum"),
+                        "Submit elapsed tick sum",
+                    )
+                    phase_elapsed_ticks = _integer(
+                        group["phase_elapsed_ticks"].get("sum"),
+                        "phase elapsed tick sum",
+                    )
+                    tick_ns = _number(
+                        configuration.get("phase_time_sys_counter_tick_ns"),
+                        "phase SYS_CNT tick ns",
+                    )
+                    _require(submit_elapsed_ticks > 0, "Submit elapsed tick sum is zero")
+                    row["groups"][group_name].update(
+                        {
+                            "submit_elapsed_ticks_sum": submit_elapsed_ticks,
+                            "submit_elapsed_per_core_us":
+                                submit_elapsed_ticks * tick_ns / cores / 1000.0,
+                            "phase_elapsed_ticks_sum": phase_elapsed_ticks,
+                            "phase_elapsed_per_core_us":
+                                phase_elapsed_ticks * tick_ns / cores / 1000.0,
+                            "phase_elapsed_per_call_ns": (
+                                None
+                                if phase_calls == 0
+                                else phase_elapsed_ticks * tick_ns / phase_calls
+                            ),
+                            "phase_time_share_of_submit":
+                                phase_elapsed_ticks / submit_elapsed_ticks,
+                        }
+                    )
         per_run.append(row)
 
     aggregate: dict[str, Any] = {
@@ -1291,7 +1423,7 @@ def analyze(paths: Sequence[Path], miss_penalty_ns: float = 90.0) -> dict[str, A
         "scalar_busy_sum",
         "total_cycles_sum",
     )
-    if schema_version == 4:
+    if schema_version in SUBMIT_PMU_SCHEMA_VERSIONS:
         aggregate_fields += (
             "phase_calls_sum",
             "phase_calls_per_core",
@@ -1325,6 +1457,15 @@ def analyze(paths: Sequence[Path], miss_penalty_ns: float = 90.0) -> dict[str, A
             "phase_icache_miss_lower_bound_share_of_submit",
             "phase_icache_miss_upper_bound_share_of_submit",
         )
+    if schema_version == 5:
+        aggregate_fields += (
+            "submit_elapsed_ticks_sum",
+            "submit_elapsed_per_core_us",
+            "phase_elapsed_ticks_sum",
+            "phase_elapsed_per_core_us",
+            "phase_elapsed_per_call_ns",
+            "phase_time_share_of_submit",
+        )
     for group_name in GROUP_NAMES:
         aggregate["groups"][group_name] = {}
         for field in aggregate_fields:
@@ -1345,12 +1486,14 @@ def analyze(paths: Sequence[Path], miss_penalty_ns: float = 90.0) -> dict[str, A
 
     configuration = captures[0].data["configuration"]
     fingerprint_fields = (
-        SUBMIT_PMU_FINGERPRINT_FIELDS if schema_version == 4 else CONFIG_FINGERPRINT_FIELDS
+        SUBMIT_PMU_FINGERPRINT_FIELDS
+        if schema_version in SUBMIT_PMU_SCHEMA_VERSIONS
+        else CONFIG_FINGERPRINT_FIELDS
     )
     result: dict[str, Any] = {
         "schema": {
             "name": "pa_scheduler_pmu_multi_run_summary",
-            "version": 2 if schema_version == 4 else 1,
+            "version": 3 if schema_version == 5 else 2 if schema_version == 4 else 1,
         },
         "input_schema": {"name": SCHEMA_NAME, "version": schema_version},
         "configuration": {
@@ -1375,7 +1518,7 @@ def analyze(paths: Sequence[Path], miss_penalty_ns: float = 90.0) -> dict[str, A
         "per_run": per_run,
         "aggregate": aggregate,
     }
-    if schema_version == 4:
+    if schema_version in SUBMIT_PMU_SCHEMA_VERSIONS:
         phase_enabled = configuration["compiled_phase"] != "none"
         result["phase_observation"] = {
             "compiled_phase": configuration["compiled_phase"],
@@ -1397,6 +1540,12 @@ def analyze(paths: Sequence[Path], miss_penalty_ns: float = 90.0) -> dict[str, A
                 else "running_read_clear_lower_to_loss_adjusted_upper_bound"
             ),
             "cross_phase_elf_sums_valid": False,
+            "phase_time_available": schema_version == 5,
+            "phase_time_semantics": (
+                "unavailable_in_schema_v4"
+                if schema_version == 4
+                else "sum_per_call_sys_cnt_inside_shadow_read_clear_boundaries"
+            ),
         }
     return result
 
@@ -1406,7 +1555,7 @@ def _print_text(result: dict[str, Any]) -> None:
     workload = configuration.get("winner_workload") or {}
     counts = workload.get("counts") or {}
     build_phase = ""
-    if result["input_schema"]["version"] == 4:
+    if result["input_schema"]["version"] in SUBMIT_PMU_SCHEMA_VERSIONS:
         build_phase = (
             f" build={configuration.get('build_variant')}"
             f" phase={configuration.get('compiled_phase')}"
@@ -1449,7 +1598,7 @@ def _print_text(result: dict[str, Any]) -> None:
         f"AIV_core_miss_p95={aiv['icache_misses_per_core_p95']['median']:.3f} "
         f"AIV_miss_rate={aiv['icache_miss_rate']['median'] * 100:.4f}%"
     )
-    if result["input_schema"]["version"] == 4:
+    if result["input_schema"]["version"] in SUBMIT_PMU_SCHEMA_VERSIONS:
         phase = result["phase_observation"]
         if not phase["enabled"]:
             print(
@@ -1479,6 +1628,14 @@ def _print_text(result: dict[str, Any]) -> None:
                 f"miss:{aiv['shadow_miss_loss_per_core']['median']:.3f} "
                 "shadow_partition=BOUNDED_NOT_EXACT_REQUIRED"
             )
+            if phase["phase_time_available"]:
+                print(
+                    "[PHASE-TIME] "
+                    f"selected={phase['compiled_phase']} "
+                    f"ALL_core_time_share={all_group['phase_time_share_of_submit']['median'] * 100:.4f}% "
+                    f"AIC_core_time_share={aic['phase_time_share_of_submit']['median'] * 100:.4f}% "
+                    f"AIV_core_time_share={aiv['phase_time_share_of_submit']['median'] * 100:.4f}%"
+                )
         boundary_state = "PERTURBED" if phase["enabled"] else "DISABLED"
         pair_state = "FALSE" if phase["enabled"] else "NOT_APPLICABLE"
         print(
@@ -1502,7 +1659,8 @@ def _print_text(result: dict[str, Any]) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "inputs", nargs="+", type=Path, help="历史 schema-v3 或 submit-pmu schema-v4 JSON sidecars"
+        "inputs", nargs="+", type=Path,
+        help="历史 schema-v3 或 submit-pmu schema-v4/v5 JSON sidecars"
     )
     parser.add_argument(
         "--icache-miss-ns",

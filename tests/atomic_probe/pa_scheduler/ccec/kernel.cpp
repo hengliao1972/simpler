@@ -387,6 +387,10 @@ struct SubmitPmuContext {
     uint64_t shadow_misses = 0;
     uint64_t phase_requests = 0;
     uint64_t phase_misses = 0;
+    // begin 的 shadow read-clear 完成后取起点，end 的 shadow read-clear 之前
+    // 取终点；累计值因此不包含两次 PMU 寄存器读取本身。
+    uint64_t phase_elapsed_ticks = 0;
+    uint64_t phase_begin_tick = 0;
     uint32_t selector_status = 0;
     uint32_t phase_status = pa_scheduler::ccec_pmu::kPhaseStatusRequested;
     uint32_t phase_calls = 0;
@@ -511,7 +515,6 @@ __aicore__ inline void PublishPmuSnapshot(
     CcecOps::Publish(&result.pmu_mte3_busy, sample.mte3_busy);
     // CNT8 已改作 shadow request，submit-pmu 不再发布 fix-busy。
     CcecOps::Publish(&result.pmu_fix_busy, static_cast<uint32_t>(0));
-    CcecOps::Publish(&result.pmu_window_ticks, static_cast<uint64_t>(0));
     CcecOps::Publish(&result.pmu_warm_total_cycles, static_cast<uint64_t>(0));
     CcecOps::Publish(&result.pmu_warm_window_ticks, static_cast<uint64_t>(0));
 }
@@ -532,6 +535,7 @@ __aicore__ inline void PublishSubmitPmuContext(
     CcecOps::Publish(&result.pmu_phase_status, context.phase_status);
     CcecOps::Publish(&result.pmu_phase_begin_reads, context.begin_reads);
     CcecOps::Publish(&result.pmu_phase_end_reads, context.end_reads);
+    CcecOps::Publish(&result.pmu_phase_elapsed_ticks, context.phase_elapsed_ticks);
     CcecOps::Publish(&result.pmu_phase_icache_requests, static_cast<uint32_t>(context.phase_requests));
     CcecOps::Publish(&result.pmu_phase_icache_misses, static_cast<uint32_t>(context.phase_misses));
     CcecOps::Publish(&result.pmu_shadow_icache_requests, static_cast<uint32_t>(context.shadow_requests));
@@ -575,12 +579,22 @@ __aicore__ inline void CcecOps::PmuPhaseBegin(PmuContext &context) {
     context.shadow_misses += sample.misses;
     ++context.begin_reads;
     context.phase_armed = true;
+    // get_sys_cnt() 是本机已校准为 1 ns/tick 的 A5 系统计数器。该读取位于
+    // begin 的两条 ld_dev 之后，因此不会把 read-clear 成本算进阶段时间。
+    context.phase_begin_tick = CcecOps::Now();
 }
 
 __aicore__ inline void CcecOps::PmuPhaseEnd(PmuContext &context) {
+    // 先取终点再读取 shadow counter，使 end 的两条 ld_dev 同样位于阶段之外。
+    const uint64_t phase_end_tick = CcecOps::Now();
     if (!context.started || context.reg_base == 0 || !context.phase_armed) {
         context.boundary_error = true;
         return;
+    }
+    if (phase_end_tick < context.phase_begin_tick) {
+        context.boundary_error = true;
+    } else {
+        context.phase_elapsed_ticks += phase_end_tick - context.phase_begin_tick;
     }
     // end 读出的片段同时属于完整 shadow 重建与被选中的局部阶段。
     const IcacheShadowSnapshot sample = ReadShadowCounters(context.reg_base);
@@ -591,6 +605,7 @@ __aicore__ inline void CcecOps::PmuPhaseEnd(PmuContext &context) {
     ++context.end_reads;
     ++context.phase_calls;
     context.phase_armed = false;
+    context.phase_begin_tick = 0;
 }
 
 __aicore__ inline void CcecOps::PmuWindowStop(
@@ -639,7 +654,8 @@ __aicore__ inline void CcecOps::PmuWindowStop(
     const bool none_shape =
         pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None &&
         context.phase_calls == 0 && context.begin_reads == 0 && context.end_reads == 0 &&
-        context.phase_requests == 0 && context.phase_misses == 0;
+        context.phase_requests == 0 && context.phase_misses == 0 &&
+        context.phase_elapsed_ticks == 0;
     const bool running_shape =
         pa_scheduler::kCompiledSubmitPmuPhase != pa_scheduler::SubmitPmuPhase::None &&
         context.phase_calls == state->config.batches * pa_scheduler::kTasksPerBatch &&
@@ -647,6 +663,12 @@ __aicore__ inline void CcecOps::PmuWindowStop(
         context.end_reads == context.phase_calls;
     if (none_shape || running_shape)
         context.phase_status |= kPhaseStatusPhaseShape;
+    const bool phase_time_valid =
+        pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
+            ? context.phase_elapsed_ticks == 0
+            : context.phase_calls != 0 && context.phase_elapsed_ticks != 0;
+    if (phase_time_valid)
+        context.phase_status |= kPhaseStatusTimeValid;
 
     PublishPmuSnapshot(result, sample);
     PublishSubmitPmuContext(result, context);

@@ -138,11 +138,14 @@ constexpr uint32_t kPhaseStatusBoundariesBalanced = 1U << 6;
 constexpr uint32_t kPhaseStatusValuesOrdered = 1U << 7;
 constexpr uint32_t kPhaseStatusUint32Fit = 1U << 8;
 constexpr uint32_t kPhaseStatusPhaseShape = 1U << 9;
+// none 必须保持 0 tick；运行阶段则必须确实累计到非零 SYS_CNT。阶段时间是否
+// 不超过同核首 Submit 到末 Submit 的完整区间，由拿到两端结果的 host 再校验。
+constexpr uint32_t kPhaseStatusTimeValid = 1U << 10;
 constexpr uint32_t kPhaseStatusRequired =
     kPhaseStatusRequested | kPhaseStatusShadowSelectors |
     kPhaseStatusWindowStarted | kPhaseStatusWindowStopped |
     kPhaseStatusBoundariesBalanced | kPhaseStatusValuesOrdered |
-    kPhaseStatusUint32Fit | kPhaseStatusPhaseShape;
+    kPhaseStatusUint32Fit | kPhaseStatusPhaseShape | kPhaseStatusTimeValid;
 
 inline const char *SubmitPmuPhaseName(SubmitPmuPhase phase) {
     switch (phase) {

@@ -30,9 +30,11 @@ try:
         A5_SUBCORES_PER_DIE,
         A5_WORKERS,
         METRIC_NAMES,
-        PHASE_STATUS_REQUIRED_MASK,
+        PHASE_STATUS_REQUIRED_MASK_V4,
+        PHASE_STATUS_REQUIRED_MASK_V5,
         PROGRAMMABLE_COUNTER_RISK_THRESHOLD,
         SUBMIT_PMU_METRIC_NAMES,
+        SUBMIT_PMU_V5_METRIC_NAMES,
         TASKS_PER_BATCH,
         analyze,
         load_capture,
@@ -48,9 +50,11 @@ except ImportError:
         A5_SUBCORES_PER_DIE,
         A5_WORKERS,
         METRIC_NAMES,
-        PHASE_STATUS_REQUIRED_MASK,
+        PHASE_STATUS_REQUIRED_MASK_V4,
+        PHASE_STATUS_REQUIRED_MASK_V5,
         PROGRAMMABLE_COUNTER_RISK_THRESHOLD,
         SUBMIT_PMU_METRIC_NAMES,
+        SUBMIT_PMU_V5_METRIC_NAMES,
         TASKS_PER_BATCH,
         analyze,
         load_capture,
@@ -91,8 +95,13 @@ def _summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     return _summary_for_metrics(records, METRIC_NAMES)
 
 
-def _submit_pmu_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
-    result = _summary_for_metrics(records, SUBMIT_PMU_METRIC_NAMES)
+def _submit_pmu_summary(
+    records: list[dict[str, Any]], schema_version: int = 5
+) -> dict[str, Any]:
+    result = _summary_for_metrics(
+        records,
+        SUBMIT_PMU_V5_METRIC_NAMES if schema_version == 5 else SUBMIT_PMU_METRIC_NAMES,
+    )
     phase_requests = result["phase_icache_requests"]["sum"]
     phase_misses = result["phase_icache_misses"]["sum"]
     result["phase_observed_read_clear_ratio"] = (
@@ -203,7 +212,9 @@ def _capture(offset: int = 0, window: str = "submit-all") -> dict[str, Any]:
     }
 
 
-def _submit_pmu_capture(offset: int = 0, phase: str = "claim") -> dict[str, Any]:
+def _submit_pmu_capture(
+    offset: int = 0, phase: str = "claim", schema_version: int = 5
+) -> dict[str, Any]:
     phase_ids = {
         "none": 0,
         "claim": 1,
@@ -229,6 +240,15 @@ def _submit_pmu_capture(offset: int = 0, phase: str = "claim") -> dict[str, Any]
         miss_loss = 0 if calls_per_worker == 0 else 1 + worker_id % 2
         shadow_requests = primary_requests - request_loss
         shadow_misses = primary_misses - miss_loss
+        submit_elapsed_ticks = 4_000_000 + worker_id * 1000 + offset
+        phase_elapsed_ticks = (
+            0 if calls_per_worker == 0 else 200_000 + worker_id * 3000 + offset
+        )
+        phase_status_mask = (
+            PHASE_STATUS_REQUIRED_MASK_V5
+            if schema_version == 5
+            else PHASE_STATUS_REQUIRED_MASK_V4
+        )
         record: dict[str, Any] = {
             "worker_id": worker_id,
             "physical_core_id": _submit_pmu_physical_id(worker_id),
@@ -245,7 +265,7 @@ def _submit_pmu_capture(offset: int = 0, phase: str = "claim") -> dict[str, Any]
             "window_stopped": True,
             "build_variant_id": 2,
             "compiled_phase_id": phase_id,
-            "phase_status": PHASE_STATUS_REQUIRED_MASK | (0x30 if calls_per_worker == 0 else 0),
+            "phase_status": phase_status_mask | (0x30 if calls_per_worker == 0 else 0),
             "phase_calls": calls_per_worker,
             "phase_expected_calls": calls_per_worker,
             "phase_begin_reads": calls_per_worker,
@@ -264,6 +284,14 @@ def _submit_pmu_capture(offset: int = 0, phase: str = "claim") -> dict[str, Any]
             "shadow_miss_loss": miss_loss,
             "phase_boundaries_balanced": True,
         }
+        if schema_version == 5:
+            record.update(
+                {
+                    "submit_elapsed_ticks": submit_elapsed_ticks,
+                    "phase_elapsed_ticks": phase_elapsed_ticks,
+                    "phase_time_valid": True,
+                }
+            )
         for metric_index, metric in enumerate(SUBMIT_PMU_METRIC_NAMES):
             record.setdefault(metric, base + metric_index)
         # total 是同一窗口的包络，fixture 也必须满足 scalar_busy <= total_cycles。
@@ -290,7 +318,7 @@ def _submit_pmu_capture(offset: int = 0, phase: str = "claim") -> dict[str, Any]
     request_losses = [record["shadow_request_loss"] for record in records]
     miss_losses = [record["shadow_miss_loss"] for record in records]
     return {
-        "schema": {"name": "pa_scheduler_pmu_phase_windows", "version": 4},
+        "schema": {"name": "pa_scheduler_pmu_phase_windows", "version": schema_version},
         "capture": {
             "capture_id": f"submit-pmu-{phase}-{offset}",
             "accepted": True,
@@ -325,7 +353,7 @@ def _submit_pmu_capture(offset: int = 0, phase: str = "claim") -> dict[str, Any]
                 "cnt9_unused": 0x000,
             },
             "counter_width_bits": {"total": 64, "programmable": 32},
-            "phase_timestamp_calls_present": False,
+            "phase_timestamp_calls_present": schema_version == 5 and phase != "none",
             "phase_record_writes": False,
             "profile_accumulation": False,
             "trace_enabled": False,
@@ -339,6 +367,15 @@ def _submit_pmu_capture(offset: int = 0, phase: str = "claim") -> dict[str, Any]
             "phase_shadow_partition_exact_required": phase == "none",
             "phase_values_are_running_read_clear_lower_bounds": phase != "none",
             "cross_phase_elf_sums_valid": False,
+            "phase_time_observation_included": schema_version == 5 and phase != "none",
+            "phase_time_sys_counter_tick_ns": 1,
+            "phase_time_boundary": "after_begin_read_clear_to_before_end_read_clear",
+            "phase_time_excludes_shadow_read_overhead": True,
+            "phase_time_includes_timestamp_overhead": True,
+            "phase_time_share_definition":
+                "sum(phase_elapsed_ticks)/sum(submit_elapsed_ticks)",
+            "phase_time_denominator_scope":
+                "per_worker_first_submit_begin_to_last_submit_end",
             "winner_workload": {
                 "mode": "real-compute",
                 "counts": {"qk": 6, "sf": 28, "pv": 4, "up": 1},
@@ -373,6 +410,8 @@ def _submit_pmu_capture(offset: int = 0, phase: str = "claim") -> dict[str, Any]
             "shadow_miss_signed_delta_sum": -sum(miss_losses),
             "phase_boundary_match_records": workers,
             "phase_call_shape_match_records": workers,
+            "phase_time_valid_records": workers,
+            "phase_time_measurement_valid": True,
             "phase_calls": sum(record["phase_calls"] for record in records),
             "phase_expected_calls": sum(record["phase_expected_calls"] for record in records),
             "expected_records": A5_WORKERS,
@@ -417,7 +456,9 @@ def _submit_pmu_capture(offset: int = 0, phase: str = "claim") -> dict[str, Any]
             "restore_passed": True,
         },
         "records": records,
-        "summary": {name: _submit_pmu_summary(group) for name, group in groups.items()},
+        "summary": {
+            name: _submit_pmu_summary(group, schema_version) for name, group in groups.items()
+        },
     }
 
 
@@ -505,14 +546,14 @@ class PmuSidecarAnalyzerTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "miss > request"):
                 load_capture(path)
 
-    def test_submit_pmu_v4_claim_is_recomputed_and_aggregated(self) -> None:
+    def test_submit_pmu_v5_claim_is_recomputed_and_aggregated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             first = self._write(directory, "claim-first.json", _submit_pmu_capture(0, "claim"))
             second = self._write(directory, "claim-second.json", _submit_pmu_capture(10, "claim"))
             result = analyze([first, second])
 
-        self.assertEqual(result["input_schema"]["version"], 4)
-        self.assertEqual(result["schema"]["version"], 2)
+        self.assertEqual(result["input_schema"]["version"], 5)
+        self.assertEqual(result["schema"]["version"], 3)
         self.assertEqual(result["phase_observation"]["compiled_phase"], "claim")
         self.assertTrue(result["phase_observation"]["enabled"])
         self.assertFalse(result["phase_observation"]["cross_phase_elf_sums_valid"])
@@ -584,11 +625,31 @@ class PmuSidecarAnalyzerTest(unittest.TestCase):
                     group["phase_icache_miss_upper_bound_share_of_submit"],
                     group["phase_icache_misses_upper_bound_sum"] / group["icache_misses_sum"],
                 )
+                self.assertEqual(
+                    group["phase_time_share_of_submit"],
+                    group["phase_elapsed_ticks_sum"] / group["submit_elapsed_ticks_sum"],
+                )
+                self.assertEqual(
+                    group["phase_elapsed_per_core_us"],
+                    group["phase_elapsed_ticks_sum"] / group["cores"] / 1000.0,
+                )
+        first_capture = _submit_pmu_capture(0, "claim")
+        per_core_shares = [
+            record["phase_elapsed_ticks"] / record["submit_elapsed_ticks"]
+            for record in first_capture["records"]
+        ]
+        weighted_share = (
+            sum(record["phase_elapsed_ticks"] for record in first_capture["records"])
+            / sum(record["submit_elapsed_ticks"] for record in first_capture["records"])
+        )
+        self.assertNotAlmostEqual(
+            weighted_share, sum(per_core_shares) / len(per_core_shares), places=12
+        )
         self.assertLess(
             _submit_pmu_capture()["validation"]["shadow_request_signed_delta_sum"], 0
         )
 
-    def test_submit_pmu_v4_none_has_zero_disabled_phase(self) -> None:
+    def test_submit_pmu_v5_none_has_zero_disabled_phase(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = self._write(directory, "none.json", _submit_pmu_capture(0, "none"))
             result = analyze([path])
@@ -609,10 +670,70 @@ class PmuSidecarAnalyzerTest(unittest.TestCase):
             phase["phase_icache_requests_upper_bound_per_core"]["median"],
         )
         self.assertEqual(phase["shadow_request_loss_sum"]["median"], 0)
+        self.assertEqual(phase["phase_elapsed_ticks_sum"]["median"], 0)
+        self.assertEqual(phase["phase_time_share_of_submit"]["median"], 0)
+        self.assertFalse(result["phase_observation"]["enabled"])
+        self.assertTrue(result["phase_observation"]["phase_time_available"])
 
-    def test_submit_pmu_v4_requires_fixed_a5_topology(self) -> None:
+    def test_submit_pmu_v5_rejects_invalid_phase_time_evidence(self) -> None:
+        cases = (
+            (
+                lambda capture: capture["records"][0].__setitem__(
+                    "phase_elapsed_ticks", capture["records"][0]["submit_elapsed_ticks"] + 1
+                ),
+                "phase_elapsed_ticks exceeds",
+            ),
+            (
+                lambda capture: capture["records"][0].pop("phase_elapsed_ticks"),
+                "phase_elapsed_ticks must be an integer",
+            ),
+            (
+                lambda capture: capture["records"][0].__setitem__("phase_time_valid", False),
+                "phase_time_valid is not true",
+            ),
+        )
+        for mutate, message in cases:
+            with self.subTest(message=message):
+                capture = _submit_pmu_capture(0, "claim")
+                mutate(capture)
+                with tempfile.TemporaryDirectory() as directory:
+                    path = self._write(directory, "invalid-time.json", capture)
+                    with self.assertRaisesRegex(ValueError, message):
+                        load_capture(path)
+
+    def test_submit_pmu_v5_rejects_nonzero_none_phase_time(self) -> None:
+        capture = _submit_pmu_capture(0, "none")
+        capture["records"][0]["phase_elapsed_ticks"] = 1
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, "none-time.json", capture)
+            with self.assertRaisesRegex(ValueError, "does not match enabled phase calls"):
+                load_capture(path)
+
+    def test_submit_pmu_v4_without_phase_time_remains_readable(self) -> None:
+        capture = _submit_pmu_capture(0, "claim", schema_version=4)
+        for field in (
+            "phase_time_observation_included",
+            "phase_time_sys_counter_tick_ns",
+            "phase_time_boundary",
+            "phase_time_excludes_shadow_read_overhead",
+            "phase_time_includes_timestamp_overhead",
+            "phase_time_share_definition",
+            "phase_time_denominator_scope",
+        ):
+            capture["configuration"].pop(field)
+        capture["validation"].pop("phase_time_valid_records")
+        capture["validation"].pop("phase_time_measurement_valid")
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, "legacy-v4.json", capture)
+            result = analyze([path])
+
+        self.assertEqual(result["input_schema"]["version"], 4)
+        self.assertFalse(result["phase_observation"]["phase_time_available"])
+        self.assertNotIn("phase_time_share_of_submit", result["per_run"][0]["groups"]["all"])
+
+    def test_submit_pmu_v5_requires_fixed_a5_topology(self) -> None:
         capture = _submit_pmu_capture()
-        # 仍保持 workers=aic+aiv，证明拒绝原因是 schema-v4 的固定 A5 拓扑，
+        # 仍保持 workers=aic+aiv，证明拒绝原因是 submit-pmu 的固定 A5 拓扑，
         # 不是原有的自报计数加和检查。
         capture["configuration"]["aic_workers"] = A5_AIC_WORKERS - 1
         capture["configuration"]["aiv_workers"] = A5_AIV_WORKERS + 1
@@ -621,7 +742,7 @@ class PmuSidecarAnalyzerTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "fixed 96/32/64 A5 topology"):
                 load_capture(path)
 
-    def test_submit_pmu_v4_logical_worker_triplet_is_recomputed(self) -> None:
+    def test_submit_pmu_v5_logical_worker_triplet_is_recomputed(self) -> None:
         mutations = (
             (0, "worker_id", A5_WORKERS, "exact worker slot"),
             (0, "role", "aiv", "logical worker topology"),
@@ -638,7 +759,7 @@ class PmuSidecarAnalyzerTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, message):
                         load_capture(path)
 
-    def test_submit_pmu_v4_physical_range_and_triplets_are_recomputed(self) -> None:
+    def test_submit_pmu_v5_physical_range_and_triplets_are_recomputed(self) -> None:
         capture = _submit_pmu_capture()
         capture["records"][0]["physical_core_id"] = A5_PHYSICAL_SUBCORES
         with tempfile.TemporaryDirectory() as directory:
@@ -662,7 +783,7 @@ class PmuSidecarAnalyzerTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "mixed block 0"):
                 load_capture(path)
 
-    def test_submit_pmu_v4_owner_control_fields_are_rechecked(self) -> None:
+    def test_submit_pmu_v5_owner_control_fields_are_rechecked(self) -> None:
         mutations = (
             (("control_magic",), 0, "control_magic mismatch"),
             (("control_version",), A5_OWNER_VERSION + 1, "control_version mismatch"),
@@ -690,12 +811,12 @@ class PmuSidecarAnalyzerTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, message):
                         load_capture(path)
 
-    def test_submit_pmu_v4_owner_object_and_bitmap_are_rechecked(self) -> None:
+    def test_submit_pmu_v5_owner_object_and_bitmap_are_rechecked(self) -> None:
         capture = _submit_pmu_capture()
         del capture["owner"]
         with tempfile.TemporaryDirectory() as directory:
             path = self._write(directory, "missing-owner.json", capture)
-            with self.assertRaisesRegex(ValueError, "schema-v4 owner must be an object"):
+            with self.assertRaisesRegex(ValueError, "submit-pmu owner must be an object"):
                 load_capture(path)
 
         capture = _submit_pmu_capture()
@@ -718,7 +839,7 @@ class PmuSidecarAnalyzerTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "absent from the owner bitmap"):
                 load_capture(path)
 
-    def test_submit_pmu_v4_host_triplet_count_is_not_blindly_trusted(self) -> None:
+    def test_submit_pmu_v5_host_triplet_count_is_not_blindly_trusted(self) -> None:
         capture = _submit_pmu_capture()
         capture["validation"]["mixed_triplet_matches"] -= 1
         with tempfile.TemporaryDirectory() as directory:
@@ -1070,6 +1191,13 @@ class PmuSidecarAnalyzerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = self._write(directory, "phase-ratio-tampered.json", capture)
             with self.assertRaisesRegex(ValueError, "phase_observed_read_clear_ratio"):
+                load_capture(path)
+
+        capture = _submit_pmu_capture()
+        capture["summary"]["aiv"]["phase_elapsed_ticks"]["sum"] += 1
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, "phase-time-summary-tampered.json", capture)
+            with self.assertRaisesRegex(ValueError, "phase_elapsed_ticks.sum"):
                 load_capture(path)
 
     def test_different_schema_or_submit_pmu_phase_cannot_be_merged(self) -> None:
