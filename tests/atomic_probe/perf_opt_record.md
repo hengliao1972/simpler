@@ -811,7 +811,7 @@ A/B 的起点，不能只挑 4489 us 的最好值作为稳定基线。
 
 ### 8.2 `swimlane`
 
-**[观察工具，当前已具备]**
+**[观察工具，已实现]**
 
 保留普通阶段和 atomic 合并泳道，用于回答：
 
@@ -820,6 +820,57 @@ A/B 的起点，不能只挑 4489 us 的最好值作为稳定基线。
 - Kernel 落点、父子区间、逐核 task 连续性和记录容量是否正常。
 
 它不决定候选的净性能，不与 perf-clock 的绝对时间相减。
+
+本阶段没有调整设备端 span、atomic wrapper、raw ABI 或记录容量。审查发现原先
+SceneTest 在 converter/analyzer 返回失败时只记录 warning，pytest 仍可能显示
+PASS；而阶段序列、Kernel 唯一归属和六类整数闭合正是在该离线步骤中完成。现已将
+真实 A5 FDWIC level-4 成功用例改为 fail-closed：raw 缺失、converter 失败、
+`merged_swimlane.json` 或 `swimlane_exclusive_analysis.json` 缺失/为空都会使该用例
+失败；若设备执行本身已经失败，则保留原始异常，离线转换不覆盖根因。
+
+普通 trace-capable AICore ELF 也增加了正向身份门禁：必须含
+`fdwic_atomic_poll_boundary_slow` 与 `fdwic_swimlane_detail_record_atomic` 两个已定义
+观察慢体，并且不得含 `dist_perf_clock_expect_submits`。这没有新增一套等价的
+swimlane profile：普通 level-0 与 level-4 仍共享同一个 trace-capable ELF，采集
+模式由运行时 level 决定；门禁只防止误拿 perf-clock 或不完整产物。raw 中的
+`trace_schema_version=4`、`l2_swimlane_level=4` 和 atomic 元数据继续证明运行模式。
+
+当前源码先用真实 B1 验证结构门禁：
+
+```text
+outputs/TestPagedAttentionUnroll_CaseB1_20260720_234158/
+```
+
+该轮为 96 核、每核 5 个 Submit、4,559 条记录、`dropped=0`，所有父子关系、
+Kernel 归属和整数闭合均 PASS。它的完整 Submit 为 302.072 us，明显受本轮冷启动/
+轮询状态影响，只作为结构门禁，不替代 perf-clock 性能基线。
+
+随后只运行一次当前 HEAD 的完整 Case1 并保留 golden 校验，权威第二证据链产物为：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260720_234305/
+  l2_swimlane_records.json             75,397,613 B
+  merged_swimlane.json                182,110,972 B
+  swimlane_exclusive_analysis.json        121,264 B
+```
+
+该轮为 32 AIC + 64 AIV、每核 1,280 个 Submit、全局 122,880 个 Submit，
+944,874 条 raw 记录且 `dropped=0`；全局首末 Submit 为 **5,095.821 us**。Submit、
+Submit envelope、EfDrain、OrchestrationReplay、FinalDrain 和 WorkerCompletion
+六类整数分区全部精确闭合。Atomic 物理记录、批处理轮询与逻辑调用满足：
+
+```text
+105577 - 330 + 3899 = 109146
+```
+
+其中 merged 中 `return_ready/source_issue/PollBatch` 分别为
+102,495/2,752/330。Atomic 仍是不可加的 overlay；PollBatch 表示完整等待区及其
+精确调用次数，不能用 duration 反推单次 atomic 延迟。
+
+本轮设备端仍预留固定 **201,333,568 B** trace buffer。实际 raw 没有再增加字段，
+但该固定容量和约 182 MB merged 进一步说明：swimlane 只在需要业务/atomic 定位时
+采集，不能作为权威性能基线，也不应为普通 A/B 反复生成。生产 converter/analyzer
+回归与新增 fail-closed/ELF 门禁共 86 项通过。
 
 ### 8.3 `submit-pmu-none` 与真实 span 单阶段 PMU
 
@@ -942,7 +993,7 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
 | winner 冷路完整泳道 | `outputs/TestPagedAttentionUnroll_Case1_20260719_131116/merged_swimlane.json` | 恢复 atomic 观察接入后的布局 |
 | atomic 冷路径 level-4 | `outputs/TestPagedAttentionUnroll_Case1_20260719_135629/` | Atomic/PollBatch/ClockBaseline 闭合 |
 | compete-first level-1 三轮 | `outputs/TestPagedAttentionUnroll_Case1_20260720_095456/`、`..._095724/`、`..._095929/` | 真实路径三轮 A/B |
-| compete-first level-4 | `outputs/TestPagedAttentionUnroll_Case1_20260720_104406/merged_swimlane.json` | 当前真实布局、阶段与 atomic 闭合 |
+| compete-first level-4 历史样本 | `outputs/TestPagedAttentionUnroll_Case1_20260720_104406/merged_swimlane.json` | 早期真实布局、阶段与 atomic 闭合，不代表当前 HEAD |
 | compete-first A5Sim | `outputs/TestPagedAttentionUnroll_Case1_20260720_104649/` | 108 核模拟回归 |
 | perf-clock B1 首轮 | `outputs/TestPagedAttentionUnroll_CaseB1_20260720_172436/fdwic_perf_clock_summary.json` | 96 核、5 Submit/core，75.347 us |
 | perf-clock B1 复验 | `outputs/TestPagedAttentionUnroll_CaseB1_20260720_172615/fdwic_perf_clock_summary.json` | 96 核、5 Submit/core，73.716 us |
@@ -950,6 +1001,8 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
 | perf-clock Case1 五轮基线 | `outputs/TestPagedAttentionUnroll_Case1_20260720_173140/`、`..._173224/`、`..._173307/`、`..._173350/`、`..._173433/` | 中位 4823.114 us，范围 4495.677～5808.500 us |
 | perf-clock Case2 负测试 | `outputs/TestPagedAttentionUnroll_Case2_20260720_173035/` | 576/core 与期望 320 不符；拒绝结果，无成功 summary |
 | 同源普通 level-4 B1 | `outputs/TestPagedAttentionUnroll_CaseB1_20260720_173738/` | 480 Submit、85.653 us、dropped=0、排他 PASS；不与 perf-clock 相减 |
+| 当前 HEAD level-4 B1 门禁 | `outputs/TestPagedAttentionUnroll_CaseB1_20260720_234158/` | 新 fail-closed/ELF 门禁上板 PASS；仅作结构证据 |
+| 当前 HEAD level-4 Case1 | `outputs/TestPagedAttentionUnroll_Case1_20260720_234305/` | 96×1280 Submit、5095.821 us、944874 records、dropped=0、全部闭合 |
 
 ### 10.3 standalone
 
@@ -1071,10 +1124,10 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
    编译期去除 FDWIC 泳道、atomic 观察和平台 PMU；首尾 Submit、96 核逐核调用数、
    6976 B header、ELF 双向身份、B1、Case1 五轮基线、Case2 fail-closed 和普通
    level-4 同源边界均已验证，作为后续候选保留/撤销的权威低扰动 A/B 口径；
-2. **[观察工具，已有基础] 真实 PA `swimlane`**：普通业务 span 与 atomic 合并
-   采集，继续复用当前父子、overlay、记录容量和整数闭合门禁；只用于定位业务区域
-   和 atomic 变化，不与 perf-clock 绝对时间相减；如需为三证据链补构建隔离或身份
-   门禁，单独形成提交；
+2. **[观察工具，已实现] 真实 PA `swimlane`**：普通业务 span 与 atomic 合并采集，
+   已补最终 ELF 正向身份、schema-v4 fail-closed、父子/Kernel/整数闭合门禁，并由
+   当前 HEAD 的 B1 与完整 Case1 上板验证；只用于定位业务区域和 atomic 变化，
+   不与 perf-clock 绝对时间相减；
 3. **[设计中] 真实 PA `submit-pmu-none`**：编译期去除泳道和 atomic，每核完整
    Submit 期只开关 PMU 一次，先闭合 96 核 primary、owner Restore、AIC/AIV raw
    和 HTML，形成独立详细提交；

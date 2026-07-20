@@ -671,12 +671,17 @@ A5Sim 和 A5 的 Case1 都使用 SceneTest 的同一输出规则：
 ~~~text
 outputs/TestPagedAttentionUnroll_Case1_<YYYYMMDD_HHMMSS>/
 ├── l2_swimlane_records.json
-└── merged_swimlane.json
+├── merged_swimlane.json
+└── swimlane_exclusive_analysis.json
 ~~~
 
 其中 `l2_swimlane_records.json` 是保留原始 cycle 的 raw 文件；pytest 在 case
 结束时调用仓内共享转换器，生成可直接载入 Perfetto 的
-`merged_swimlane.json`。历史 phase 基线 raw 与本次真实 A5 level-4 raw 分别为：
+`merged_swimlane.json`。当前真实 A5 FDWIC level-4 还必须生成严格父子/Kernel/
+整数闭合报告 `swimlane_exclusive_analysis.json`；raw 缺失、转换失败或任一加工件
+缺失/为空都会使成功的 pytest 用例失败。若设备执行本身已经失败，则仍保留设备侧
+原始异常，不用离线转换错误覆盖根因。历史 phase 基线 raw 与本次真实 A5 level-4
+raw 分别为：
 
 ~~~text
 outputs/TestPagedAttentionUnroll_Case1_20260717_023809/l2_swimlane_records.json
@@ -698,8 +703,9 @@ phase 的实际记录条数，不再随每一次连续 poll 线性增长。pytes
 
 ### level-4 atomic 数据契约
 
-当前生产端导出的 level 4 raw，其 `metadata.trace_schema_version` 必须为 3；共享
-converter 仍保留对历史 schema 的读取兼容。转换后的 `Atomic` 和
+当前生产端导出的 level 4 raw，其 `metadata.trace_schema_version` 必须为 4；共享
+converter 仍保留对历史 schema-v3 的读取兼容，但只有 schema-v4 生成当前排他闭合
+报告。转换后的 `Atomic` 和
 `ClockBaseline` 都画在对应 AIC、AIV0 或 AIV1 的原 scalar lane；它们不是与
 scalar 并行的伪子轨。Kernel 仍画在独立的 `AIC/AIV·kernel` 轨。
 

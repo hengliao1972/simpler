@@ -21,6 +21,7 @@ instances die while the extension is still live.
 from __future__ import annotations
 
 import importlib
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,10 +34,14 @@ from _task_interface import ArgDirection, ChipCallable  # pyright: ignore[report
 from simpler_setup.scene_test import (
     _aicore_override_cache,
     _assert_fdwic_perf_clock_elf,
+    _assert_fdwic_swimlane_elf,
     _compile_cache,
+    _convert_case_swimlane,
     _fdwic_profile,
     _profiled_cache_key,
+    _run_swimlane_converter,
     clear_compile_cache,
+    run_class_cases,
 )
 
 _scene_test_module = importlib.import_module("simpler_setup.scene_test")
@@ -148,3 +153,114 @@ def test_perf_clock_elf_gate_reports_readelf_failure(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError, match="readelf failed.*not an ELF"):
         _assert_fdwic_perf_clock_elf(tmp_path / "aicore_kernel.o")
+
+
+def test_swimlane_elf_gate_accepts_merged_phase_atomic_observer(monkeypatch, tmp_path):
+    symbol_table = (
+        "2796: 0000000000012d8c 4080 FUNC LOCAL DEFAULT 1 "
+        "_ZN12_GLOBAL__N_131fdwic_atomic_poll_boundary_slowEm\n"
+        "3010: 0000000000013d7c 344 FUNC LOCAL DEFAULT 1 "
+        "_ZN12_GLOBAL__N_135fdwic_swimlane_detail_record_atomicEv\n"
+    )
+    monkeypatch.setattr(
+        _scene_test_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=symbol_table, stderr=""),
+    )
+
+    _assert_fdwic_swimlane_elf(tmp_path / "aicore_kernel.o")
+
+
+@pytest.mark.parametrize(
+    ("symbol_table", "message"),
+    [
+        ("", "missing defined swimlane observer"),
+        (
+            "1: 0 1 FUNC LOCAL DEFAULT 1 fdwic_atomic_poll_boundary_slow\n"
+            "2: 0 1 FUNC LOCAL DEFAULT 1 fdwic_swimlane_detail_record_atomic\n"
+            "3: 0 1 FUNC WEAK DEFAULT 1 dist_perf_clock_expect_submits\n",
+            "perf-clock symbol.*leaked",
+        ),
+    ],
+)
+def test_swimlane_elf_gate_rejects_wrong_image(monkeypatch, tmp_path, symbol_table, message):
+    monkeypatch.setattr(
+        _scene_test_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=symbol_table, stderr=""),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        _assert_fdwic_swimlane_elf(tmp_path / "aicore_kernel.o")
+
+
+def test_strict_fdwic_v4_converter_requires_closure_artifacts(monkeypatch, tmp_path):
+    raw = tmp_path / "l2_swimlane_records.json"
+    raw.write_text("{}")
+    monkeypatch.setattr(
+        _scene_test_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="converted", stderr=""),
+    )
+
+    with pytest.raises(RuntimeError, match="did not publish required artifact"):
+        _run_swimlane_converter(input_path=raw, strict_fdwic_v4=True)
+
+    (tmp_path / "merged_swimlane.json").write_text("{}")
+    (tmp_path / "swimlane_exclusive_analysis.json").write_text("{}")
+    _run_swimlane_converter(input_path=raw, strict_fdwic_v4=True)
+
+
+def test_strict_fdwic_v4_converter_propagates_validation_failure(monkeypatch, tmp_path):
+    raw = tmp_path / "l2_swimlane_records.json"
+    raw.write_text("{}")
+
+    def fail(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, args[0], stderr="integer closure failed")
+
+    monkeypatch.setattr(_scene_test_module.subprocess, "run", fail)
+
+    with pytest.raises(RuntimeError, match="closure validation failed.*integer closure failed"):
+        _run_swimlane_converter(input_path=raw, strict_fdwic_v4=True)
+
+
+def test_strict_fdwic_v4_case_requires_raw_artifact(tmp_path):
+    with pytest.raises(RuntimeError, match="required FDWIC schema-v4 raw artifact was not produced"):
+        _convert_case_swimlane("Case", tmp_path, strict_fdwic_v4=True)
+
+
+def test_device_failure_keeps_original_error_and_disables_strict_conversion(monkeypatch, tmp_path):
+    class FailingCase:
+        _st_level = 2
+        _st_runtime = "fully_distributed_within_core"
+
+        @staticmethod
+        def _run_and_validate(*args, **kwargs):
+            raise ValueError("device execution failed")
+
+    worker = SimpleNamespace(_config={"platform": "a5", "device_id": 0})
+    strict_values = []
+    monkeypatch.setattr(_scene_test_module, "_build_output_prefix", lambda _label: tmp_path)
+    monkeypatch.setattr(
+        _scene_test_module,
+        "_convert_case_swimlane",
+        lambda *args, strict_fdwic_v4=False, **kwargs: strict_values.append(strict_fdwic_v4),
+    )
+
+    with pytest.raises(ValueError, match="device execution failed"):
+        run_class_cases(
+            worker,
+            FailingCase(),
+            [{"name": "Case1", "config": {}, "params": {}}],
+            callable_obj=None,
+            sub_handles={},
+            rounds=1,
+            skip_golden=False,
+            enable_l2_swimlane=4,
+            enable_dump_args=False,
+            enable_pmu=0,
+            enable_dep_gen=False,
+            enable_scope_stats=False,
+        )
+
+    assert strict_values == [False]

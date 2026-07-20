@@ -137,8 +137,8 @@ def get_aicore_path_override(cache_key) -> Path | None:
     return _aicore_override_cache.get(_profiled_cache_key(cache_key))
 
 
-def _assert_fdwic_perf_clock_elf(binary: Path) -> None:
-    """Prove the final CCEC image excludes FDWIC trace/atomic and platform PMU code."""
+def _fdwic_elf_symbol_rows(binary: Path) -> list[tuple[str, str, str]]:
+    """Return ``(kind, section, name)`` rows from the final CCEC image."""
     try:
         result = subprocess.run(
             ["readelf", "-Ws", "-W", str(binary)],
@@ -147,9 +147,9 @@ def _assert_fdwic_perf_clock_elf(binary: Path) -> None:
             text=True,
         )
     except FileNotFoundError as exc:
-        raise RuntimeError("readelf is required to validate the perf-clock AICore image") from exc
+        raise RuntimeError("readelf is required to validate the FDWIC AICore image") from exc
     if result.returncode != 0:
-        raise RuntimeError(f"readelf failed for perf-clock image {binary}: {result.stderr.strip()}")
+        raise RuntimeError(f"readelf failed for FDWIC AICore image {binary}: {result.stderr.strip()}")
 
     symbol_rows = []
     for line in result.stdout.splitlines():
@@ -157,6 +157,12 @@ def _assert_fdwic_perf_clock_elf(binary: Path) -> None:
         if len(fields) < 8 or not fields[0].endswith(":"):
             continue
         symbol_rows.append((fields[3], fields[6], fields[7]))
+    return symbol_rows
+
+
+def _assert_fdwic_perf_clock_elf(binary: Path) -> None:
+    """Prove the final CCEC image excludes FDWIC trace/atomic and platform PMU code."""
+    symbol_rows = _fdwic_elf_symbol_rows(binary)
 
     required = ("dist_perf_clock_expect_submits",)
     forbidden = (
@@ -187,6 +193,26 @@ def _assert_fdwic_perf_clock_elf(binary: Path) -> None:
         if present:
             details.append(f"profiling symbol(s) still present: {', '.join(present)}")
         raise RuntimeError(f"Invalid perf-clock AICore image {binary}: {'; '.join(details)}")
+
+
+def _assert_fdwic_swimlane_elf(binary: Path) -> None:
+    """Prove the normal real-A5 FDWIC image carries the merged phase/atomic observer."""
+    symbol_rows = _fdwic_elf_symbol_rows(binary)
+    required = ("fdwic_atomic_poll_boundary_slow", "fdwic_swimlane_detail_record_atomic")
+    forbidden = ("dist_perf_clock_expect_submits",)
+    missing = [
+        symbol
+        for symbol in required
+        if not any(kind == "FUNC" and ndx != "UND" and symbol in name for kind, ndx, name in symbol_rows)
+    ]
+    present = [symbol for symbol in forbidden if any(symbol in name for _kind, _ndx, name in symbol_rows)]
+    if missing or present:
+        details = []
+        if missing:
+            details.append(f"missing defined swimlane observer(s): {', '.join(missing)}")
+        if present:
+            details.append(f"perf-clock symbol(s) leaked into normal image: {', '.join(present)}")
+        raise RuntimeError(f"Invalid FDWIC swimlane AICore image {binary}: {'; '.join(details)}")
 
 
 def maybe_build_aicore_override(
@@ -232,6 +258,8 @@ def maybe_build_aicore_override(
     )
     if profile == _FDWIC_PROFILE_PERF_CLOCK:
         _assert_fdwic_perf_clock_elf(binary)
+    elif platform == "a5" and runtime == "fully_distributed_within_core":
+        _assert_fdwic_swimlane_elf(binary)
     return binary
 
 
@@ -909,6 +937,8 @@ def _run_swimlane_converter(
     input_path: Path | None = None,
     func_names_path: Path | None = None,
     enable_overhead: bool = False,
+    *,
+    strict_fdwic_v4: bool = False,
 ) -> None:
     """Invoke the bundled swimlane converter as a subprocess.
 
@@ -936,8 +966,23 @@ def _run_swimlane_converter(
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
         if result.stdout:
             logger.info(result.stdout)
+        if strict_fdwic_v4:
+            if input_path is None:
+                raise RuntimeError("strict FDWIC schema-v4 conversion requires an explicit raw input path")
+            required_outputs = (
+                input_path.parent / "merged_swimlane.json",
+                input_path.parent / "swimlane_exclusive_analysis.json",
+            )
+            missing_outputs = [str(path) for path in required_outputs if not path.is_file() or path.stat().st_size == 0]
+            if missing_outputs:
+                raise RuntimeError(
+                    "FDWIC schema-v4 conversion did not publish required artifact(s): " + ", ".join(missing_outputs)
+                )
         logger.info("Swimlane JSON generation completed")
     except subprocess.CalledProcessError as e:
+        if strict_fdwic_v4:
+            details = e.stderr.strip() or e.stdout.strip() or str(e)
+            raise RuntimeError(f"FDWIC schema-v4 conversion/closure validation failed: {details}") from e
         logger.warning(f"Failed to generate swimlane JSON: {e}")
         if e.stdout:
             logger.debug(f"stdout: {e.stdout}")
@@ -954,6 +999,8 @@ def _convert_case_swimlane(
     output_prefix: Path,
     callable_spec: dict | None = None,
     enable_overhead: bool = False,
+    *,
+    strict_fdwic_v4: bool = False,
 ) -> None:
     """Post-case: invoke the swimlane converter on the perf file the runtime
     just wrote into ``<output_prefix>/l2_swimlane_records.json``. No diff/rename
@@ -964,6 +1011,8 @@ def _convert_case_swimlane(
     logger = logging.getLogger(__name__)
     perf_file = output_prefix / "l2_swimlane_records.json"
     if not perf_file.exists():
+        if strict_fdwic_v4:
+            raise RuntimeError(f"[{case_label}] required FDWIC schema-v4 raw artifact was not produced: {perf_file}")
         logger.warning(f"[{case_label}] {perf_file} not produced; skipping conversion")
         return
 
@@ -974,7 +1023,12 @@ def _convert_case_swimlane(
         safe_label = _sanitize_for_filename(case_label)
         func_names_path = _dump_name_map(mapping, output_prefix / f"name_map_{safe_label}.json")
 
-    _run_swimlane_converter(input_path=perf_file, func_names_path=func_names_path, enable_overhead=enable_overhead)
+    _run_swimlane_converter(
+        input_path=perf_file,
+        func_names_path=func_names_path,
+        enable_overhead=enable_overhead,
+        strict_fdwic_v4=strict_fdwic_v4,
+    )
 
 
 def _run_deps_viewer(
@@ -1126,6 +1180,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
         prefix = _build_output_prefix(case_label) if diagnostics_on else Path("")
         dlt_baseline = _snapshot_time() if dlt_on else None
         dlt_offsets = _snapshot_log_offsets(_get_device_log_dir(dlt_device_id)) if dlt_on else None
+        case_succeeded = False
         try:
             cls_inst._run_and_validate(
                 worker,
@@ -1141,16 +1196,24 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 enable_scope_stats=enable_scope_stats,
                 output_prefix=str(prefix) if diagnostics_on else "",
             )
+            case_succeeded = True
         except BaseException as exc:
             exc.add_note(f"SceneTest case context: {case_context}")
             raise
         finally:
             if enable_l2_swimlane:
+                strict_fdwic_v4 = (
+                    case_succeeded
+                    and enable_l2_swimlane == 4
+                    and getattr(cls_inst, "_st_runtime", None) == "fully_distributed_within_core"
+                    and worker._config.get("platform") == "a5"
+                )
                 _convert_case_swimlane(
                     case_label,
                     prefix,
                     callable_spec=callable_spec,
                     enable_overhead=enable_swimlane_overhead,
+                    strict_fdwic_v4=strict_fdwic_v4,
                 )
             if enable_dep_gen:
                 _graph_case_dep_gen(case_label, prefix, callable_spec=callable_spec)
