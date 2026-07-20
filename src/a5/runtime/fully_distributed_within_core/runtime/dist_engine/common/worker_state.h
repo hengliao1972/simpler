@@ -30,6 +30,7 @@
 [[block_local]] static int32_t g_ccec_ordinal;
 [[block_local]] static bool g_ccec_valid_worker;
 [[block_local]] static bool g_fdwic_joint_submit_seen;
+#if DIST_TRACE_ENABLED
 [[block_local]] static uint32_t g_fdwic_swimlane_level;
 [[block_local]] static __gm__ FdwicSwimlaneHeader *g_fdwic_swimlane_header;
 [[block_local]] static __gm__ FdwicSwimlaneCoreState *g_fdwic_swimlane_core;
@@ -40,12 +41,20 @@
 [[block_local]] static uint32_t g_fdwic_poll_calls;
 [[block_local]] static uint32_t g_fdwic_poll_batch_records;
 [[block_local]] static bool g_fdwic_atomic_counter_overflow;
+#endif
+#if PTO_FDWIC_PERF_CLOCK
+[[block_local]] static __gm__ FdwicSwimlaneCoreState *g_fdwic_perf_clock_core;
+[[block_local]] static uint64_t g_fdwic_perf_clock_first_submit;
+[[block_local]] static uint64_t g_fdwic_perf_clock_last_submit;
+[[block_local]] static uint32_t g_fdwic_perf_clock_expected_submits;
+#endif
 #define g_dist (*g_dist_ptr)
 #elif defined(__CPU_SIM)
 static DistGlobal g_dist_fallback;
 static DistGlobal *g_dist_ptr = nullptr;
 thread_local DistCore *g_self = nullptr;
 thread_local bool g_fdwic_joint_submit_seen = false;
+#if DIST_TRACE_ENABLED
 thread_local uint32_t g_fdwic_swimlane_level = 0;
 thread_local FdwicSwimlaneHeader *g_fdwic_swimlane_header = nullptr;
 thread_local FdwicSwimlaneCoreState *g_fdwic_swimlane_core = nullptr;
@@ -56,12 +65,20 @@ thread_local uint32_t g_fdwic_atomic_calls = 0;
 thread_local uint32_t g_fdwic_poll_calls = 0;
 thread_local uint32_t g_fdwic_poll_batch_records = 0;
 thread_local bool g_fdwic_atomic_counter_overflow = false;
+#endif
+#if PTO_FDWIC_PERF_CLOCK
+thread_local FdwicSwimlaneCoreState *g_fdwic_perf_clock_core = nullptr;
+thread_local uint64_t g_fdwic_perf_clock_first_submit = 0;
+thread_local uint64_t g_fdwic_perf_clock_last_submit = 0;
+thread_local uint32_t g_fdwic_perf_clock_expected_submits = 0;
+#endif
 #define g_dist (*g_dist_ptr)
 #else
 static DistGlobal g_dist_fallback;
 static DistGlobal *g_dist_ptr = &g_dist_fallback;
 thread_local DistCore *g_self = nullptr;
 thread_local bool g_fdwic_joint_submit_seen = false;
+#if DIST_TRACE_ENABLED
 thread_local uint32_t g_fdwic_swimlane_level = 0;
 thread_local FdwicSwimlaneHeader *g_fdwic_swimlane_header = nullptr;
 thread_local FdwicSwimlaneCoreState *g_fdwic_swimlane_core = nullptr;
@@ -72,5 +89,12 @@ thread_local uint32_t g_fdwic_atomic_calls = 0;
 thread_local uint32_t g_fdwic_poll_calls = 0;
 thread_local uint32_t g_fdwic_poll_batch_records = 0;
 thread_local bool g_fdwic_atomic_counter_overflow = false;
+#endif
+#if PTO_FDWIC_PERF_CLOCK
+thread_local FdwicSwimlaneCoreState *g_fdwic_perf_clock_core = nullptr;
+thread_local uint64_t g_fdwic_perf_clock_first_submit = 0;
+thread_local uint64_t g_fdwic_perf_clock_last_submit = 0;
+thread_local uint32_t g_fdwic_perf_clock_expected_submits = 0;
+#endif
 #define g_dist (*g_dist_ptr)
 #endif

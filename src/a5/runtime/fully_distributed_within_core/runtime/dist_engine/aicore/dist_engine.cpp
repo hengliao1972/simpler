@@ -45,6 +45,7 @@ extern "C" PTO_DEVICE_FUNC void aicpu_orchestration_entry(const L2TaskArgs &orch
 #endif
 
 #include "dist_engine/aicore/primitive.h"           // NOLINT(build/include_subdir)
+#include "dist_engine/common/perf_clock.h"          // NOLINT(build/include_subdir)
 #include "dist_engine/aicore/api_glue.h"            // NOLINT(build/include_subdir)
 #include "dist_engine/aicore/log.h"                 // NOLINT(build/include_subdir)
 #include "dist_engine/aicore/tensor_map.h"          // NOLINT(build/include_subdir)

@@ -104,6 +104,10 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_compete_first_finish(
     PTO2Runtime *rt, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args
 );
 
+// perf-clock 专用构建由具体 orchestration 显式声明本核应重放的 Submit
+// 总数。普通构建中该接口编译为空操作，不改变公开 submit ABI。
+PTO_DEVICE_FUNC void dist_perf_clock_expect_submits(uint32_t expected_submits);
+
 // Fatal-state helpers. dist_engine.cpp already exposes fatal_set() /
 // set_fatal(); these are the CCEC-safe wrappers orchestration reaches.
 PTO_DEVICE_FUNC bool dist_is_fatal_query();

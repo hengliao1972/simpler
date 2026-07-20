@@ -360,6 +360,43 @@ class TestInvalidateCacheIfStale:
         assert cache_dir.is_dir()
 
 
+# --- Per-callable compile-definition tests ---
+
+
+class TestBuildTargetCompileDefinitions:
+    """Per-callable CCEC profiles must reach CMake as one stable list."""
+
+    class _Toolchain:
+        is_host = False
+
+        @staticmethod
+        def get_cmake_args():
+            return []
+
+    def test_forwards_compile_definitions_to_cmake(self, tmp_path):
+        from simpler_setup.runtime_compiler import BuildTarget  # noqa: PLC0415
+
+        target = BuildTarget(self._Toolchain(), str(tmp_path), "aicore_kernel.o")
+        args = target.gen_cmake_args(
+            [str(tmp_path / "include")],
+            [str(tmp_path / "src")],
+            compile_definitions=["PTO_FDWIC_PERF_CLOCK=1", "PTO_FDWIC_TRACE_ENABLED=0"],
+        )
+
+        assert (
+            "-DCUSTOM_COMPILE_DEFINITIONS="
+            "PTO_FDWIC_PERF_CLOCK=1;PTO_FDWIC_TRACE_ENABLED=0"
+        ) in args
+
+    def test_omits_empty_compile_definitions(self, tmp_path):
+        from simpler_setup.runtime_compiler import BuildTarget  # noqa: PLC0415
+
+        target = BuildTarget(self._Toolchain(), str(tmp_path), "aicore_kernel.o")
+        args = target.gen_cmake_args([str(tmp_path / "include")], [str(tmp_path / "src")])
+
+        assert not any(arg.startswith("-DCUSTOM_COMPILE_DEFINITIONS=") for arg in args)
+
+
 # --- Full integration tests (real compilation) ---
 
 

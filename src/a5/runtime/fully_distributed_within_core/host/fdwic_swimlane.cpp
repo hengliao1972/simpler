@@ -489,6 +489,16 @@ std::string output_path(const Runtime *runtime) {
     return output_path_from_prefix(runtime->fdwic_swimlane_output_prefix_);
 }
 
+std::string perf_clock_output_path_from_prefix(const std::string &prefix) {
+    if (!prefix.empty() && prefix.back() == '/') return prefix + "fdwic_perf_clock_summary.json";
+    return prefix + "/fdwic_perf_clock_summary.json";
+}
+
+bool perf_clock_requested() {
+    const char *mode = std::getenv("PTO_FDWIC_PROFILE");
+    return mode != nullptr && std::strcmp(mode, "perf-clock") == 0;
+}
+
 bool prepare_output_directory(const std::string &prefix) {
     struct stat info{};
     if (stat(prefix.c_str(), &info) == 0) {
@@ -803,3 +813,257 @@ extern "C" void fdwic_swimlane_host_finalize(Runtime *runtime) {
     runtime->dist.swimlane_base = 0;
     runtime->dist.swimlane_records_per_core = 0;
 }
+
+extern "C" int fdwic_perf_clock_host_init(Runtime *runtime, int num_cores, const char *output_prefix) {
+    if (!perf_clock_requested()) return 0;
+    if (runtime == nullptr) return -1;
+    const bool storage_empty =
+        runtime->fdwic_swimlane_host_shadow_ == nullptr && runtime->fdwic_swimlane_dev_allocation_ == 0 &&
+        runtime->fdwic_swimlane_dev_base_ == 0 && runtime->fdwic_swimlane_bytes_ == 0 &&
+        runtime->fdwic_swimlane_num_cores_ == 0 && runtime->fdwic_swimlane_records_per_core_ == 0 &&
+        runtime->dist.swimlane_base == 0 && runtime->dist.swimlane_level == 0 &&
+        runtime->dist.swimlane_records_per_core == 0;
+    if (!storage_empty) {
+        LOG_ERROR("fdwic perf-clock found non-empty diagnostic storage; refusing to overwrite a live allocation");
+        return -1;
+    }
+    runtime->fdwic_swimlane_output_prefix_[0] = '\0';
+    // 当前证据链只服务真实 PA 的 32 AIC + 64 AIV 全核 Case1/B1。
+    // 其他拓扑直接拒绝，避免把部分核数据包装成“每核基线”。
+    constexpr int kExpectedAic = 32;
+    constexpr int kExpectedAiv = 64;
+    constexpr int kExpectedCores = kExpectedAic + kExpectedAiv;
+    if (num_cores != kExpectedCores || runtime->worker_count != kExpectedCores) {
+        LOG_ERROR(
+            "fdwic perf-clock requires 96 workers (32 AIC + 64 AIV): num_cores=%d worker_count=%d", num_cores,
+            runtime->worker_count
+        );
+        return -1;
+    }
+    if (runtime->host_api.device_malloc == nullptr || runtime->host_api.device_free == nullptr ||
+        runtime->host_api.copy_to_device == nullptr || runtime->host_api.copy_from_device == nullptr) {
+        return -1;
+    }
+
+    const std::string prefix = output_prefix == nullptr || output_prefix[0] == '\0' ? "." : output_prefix;
+    if (prefix.size() >= sizeof(runtime->fdwic_swimlane_output_prefix_)) {
+        LOG_ERROR("fdwic perf-clock output prefix is too long: %zu bytes", prefix.size());
+        return -1;
+    }
+    if (!prepare_output_directory(prefix)) return -1;
+    const std::string path = perf_clock_output_path_from_prefix(prefix);
+    if (!remove_output_if_present(path) || !remove_output_if_present(path + ".tmp")) return -1;
+
+    constexpr uint64_t kDeviceAlignment = 64;
+    constexpr uint64_t bytes = sizeof(FdwicSwimlaneHeader);
+    void *host_shadow = std::aligned_alloc(64, sizeof(FdwicSwimlaneHeader));
+    if (host_shadow == nullptr) return -1;
+    std::memset(host_shadow, 0, sizeof(FdwicSwimlaneHeader));
+    auto *header = reinterpret_cast<FdwicSwimlaneHeader *>(host_shadow);
+    header->magic = kFdwicSwimlaneMagic;
+    header->version = kFdwicSwimlaneVersion;
+    header->num_cores = kExpectedCores;
+    header->records_per_core = 0;
+    header->freq_hz = PLATFORM_PROF_SYS_CNT_FREQ;
+
+    void *dev_allocation = runtime->host_api.device_malloc(static_cast<size_t>(bytes + (kDeviceAlignment - 1)));
+    if (dev_allocation == nullptr) {
+        std::free(host_shadow);
+        return -1;
+    }
+    const uintptr_t dev_base =
+        (reinterpret_cast<uintptr_t>(dev_allocation) + (kDeviceAlignment - 1)) & ~(kDeviceAlignment - 1);
+    if (runtime->host_api.copy_to_device(reinterpret_cast<void *>(dev_base), host_shadow, sizeof(FdwicSwimlaneHeader)) !=
+        0) {
+        runtime->host_api.device_free(dev_allocation);
+        std::free(host_shadow);
+        return -1;
+    }
+
+    runtime->fdwic_swimlane_host_shadow_ = host_shadow;
+    runtime->fdwic_swimlane_dev_allocation_ = reinterpret_cast<uint64_t>(dev_allocation);
+    runtime->fdwic_swimlane_dev_base_ = dev_base;
+    runtime->fdwic_swimlane_bytes_ = bytes;
+    runtime->fdwic_swimlane_num_cores_ = kExpectedCores;
+    runtime->fdwic_swimlane_records_per_core_ = 0;
+    std::memcpy(runtime->fdwic_swimlane_output_prefix_, prefix.c_str(), prefix.size() + 1);
+    // 只借用已有 handoff 地址传输固定 header；level/records 保持 0，明确
+    // 表示这不是 1..4 任一级泳道。
+    runtime->dist.swimlane_base = dev_base;
+    runtime->dist.swimlane_level = 0;
+    runtime->dist.swimlane_records_per_core = 0;
+    return 1;
+}
+
+extern "C" int fdwic_perf_clock_host_export(Runtime *runtime) {
+    if (runtime == nullptr || runtime->fdwic_swimlane_host_shadow_ == nullptr ||
+        runtime->fdwic_swimlane_dev_base_ == 0) {
+        return 0;
+    }
+    if (runtime->host_api.copy_from_device(
+            runtime->fdwic_swimlane_host_shadow_, reinterpret_cast<void *>(runtime->fdwic_swimlane_dev_base_),
+            sizeof(FdwicSwimlaneHeader)
+        ) != 0) {
+        LOG_ERROR("fdwic perf-clock header D2H copy failed");
+        return -1;
+    }
+
+    const auto *header = reinterpret_cast<const FdwicSwimlaneHeader *>(runtime->fdwic_swimlane_host_shadow_);
+    constexpr uint32_t kExpectedAic = 32;
+    constexpr uint32_t kExpectedAiv = 64;
+    constexpr uint32_t kExpectedCores = kExpectedAic + kExpectedAiv;
+    const bool header_valid =
+        header->magic == kFdwicSwimlaneMagic && header->version == kFdwicSwimlaneVersion &&
+        header->num_cores == kExpectedCores && header->records_per_core == 0 &&
+        header->freq_hz == PLATFORM_PROF_SYS_CNT_FREQ && runtime->worker_count == static_cast<int>(kExpectedCores) &&
+        runtime->fdwic_swimlane_bytes_ == sizeof(FdwicSwimlaneHeader) && runtime->dist.swimlane_level == 0 &&
+        runtime->dist.swimlane_records_per_core == 0 &&
+        runtime->dist.swimlane_base == runtime->fdwic_swimlane_dev_base_;
+    if (!header_valid) {
+        LOG_ERROR(
+            "fdwic perf-clock invalid header/state: magic=0x%08x version=%u cores=%u records=%u freq=%llu bytes=%llu",
+            header->magic, header->version, header->num_cores, header->records_per_core,
+            static_cast<unsigned long long>(header->freq_hz),
+            static_cast<unsigned long long>(runtime->fdwic_swimlane_bytes_)
+        );
+        return -1;
+    }
+
+    int32_t expected_blocks[RUNTIME_MAX_WORKER] = {};
+    int32_t expected_lanes[RUNTIME_MAX_WORKER] = {};
+    if (!build_expected_core_layout(runtime, header->num_cores, expected_blocks, expected_lanes)) return -1;
+
+    uint32_t aic_count = 0;
+    uint32_t aiv_count = 0;
+    uint32_t expected_submits = 0;
+    uint64_t global_start = std::numeric_limits<uint64_t>::max();
+    uint64_t global_end = 0;
+    uint64_t aic_elapsed_sum = 0;
+    uint64_t aiv_elapsed_sum = 0;
+    uint64_t aic_elapsed_min = std::numeric_limits<uint64_t>::max();
+    uint64_t aiv_elapsed_min = std::numeric_limits<uint64_t>::max();
+    uint64_t aic_elapsed_max = 0;
+    uint64_t aiv_elapsed_max = 0;
+
+    for (uint32_t core_id = 0; core_id < header->num_cores; ++core_id) {
+        const FdwicSwimlaneCoreState &core = header->cores[core_id];
+        const FdwicPerfClockCoreData &clock = core.perf_clock;
+        const bool identity_valid =
+            core.core_idx == static_cast<int32_t>(core_id) && core.block_id == expected_blocks[core_id] &&
+            core.lane == expected_lanes[core_id];
+        const bool counters_clean = core.count == 0 && core.dropped == 0 && core.atomic_calls == 0 &&
+                                    core.poll_calls == 0 && core.poll_batch_records == 0;
+        const bool clock_valid =
+            clock.mode == kFdwicPerfClockMode && clock.final_seen == 1 && clock.expected_submit_count != 0 &&
+            clock.submit_count == clock.expected_submit_count && clock.first_submit_start != 0 &&
+            clock.last_submit_end >= clock.first_submit_start;
+        if (!identity_valid || !counters_clean || !clock_valid) {
+            LOG_ERROR(
+                "fdwic perf-clock core %u failed closure: core=%d block=%d/%d lane=%d/%d count=%u/%u "
+                "start=%llu end=%llu mode=%u final=%u trace_count=%u atomic=%u",
+                core_id, core.core_idx, core.block_id, expected_blocks[core_id], core.lane, expected_lanes[core_id],
+                clock.submit_count, clock.expected_submit_count,
+                static_cast<unsigned long long>(clock.first_submit_start),
+                static_cast<unsigned long long>(clock.last_submit_end), clock.mode, clock.final_seen, core.count,
+                core.atomic_calls
+            );
+            return -1;
+        }
+        if (expected_submits == 0) expected_submits = clock.expected_submit_count;
+        if (clock.expected_submit_count != expected_submits) {
+            LOG_ERROR(
+                "fdwic perf-clock expected Submit count differs across cores: core=%u expected=%u reference=%u",
+                core_id, clock.expected_submit_count, expected_submits
+            );
+            return -1;
+        }
+        if (clock.first_submit_start < global_start) global_start = clock.first_submit_start;
+        if (clock.last_submit_end > global_end) global_end = clock.last_submit_end;
+        const uint64_t elapsed = clock.last_submit_end - clock.first_submit_start;
+        if (runtime->workers[core_id].core_type == CoreType::AIC) {
+            ++aic_count;
+            aic_elapsed_sum += elapsed;
+            if (elapsed < aic_elapsed_min) aic_elapsed_min = elapsed;
+            if (elapsed > aic_elapsed_max) aic_elapsed_max = elapsed;
+        } else if (runtime->workers[core_id].core_type == CoreType::AIV) {
+            ++aiv_count;
+            aiv_elapsed_sum += elapsed;
+            if (elapsed < aiv_elapsed_min) aiv_elapsed_min = elapsed;
+            if (elapsed > aiv_elapsed_max) aiv_elapsed_max = elapsed;
+        } else {
+            LOG_ERROR("fdwic perf-clock core %u has invalid core type", core_id);
+            return -1;
+        }
+    }
+    if (aic_count != kExpectedAic || aiv_count != kExpectedAiv || global_start == std::numeric_limits<uint64_t>::max() ||
+        global_end < global_start) {
+        LOG_ERROR(
+            "fdwic perf-clock topology/global closure failed: AIC=%u/%u AIV=%u/%u start=%llu end=%llu", aic_count,
+            kExpectedAic, aiv_count, kExpectedAiv, static_cast<unsigned long long>(global_start),
+            static_cast<unsigned long long>(global_end)
+        );
+        return -1;
+    }
+
+    const std::string path = perf_clock_output_path_from_prefix(runtime->fdwic_swimlane_output_prefix_);
+    const std::string temporary_path = path + ".tmp";
+    if (!remove_output_if_present(temporary_path)) return -1;
+    std::ofstream out(temporary_path, std::ios::out | std::ios::trunc);
+    if (!out.is_open()) {
+        LOG_ERROR("cannot open fdwic perf-clock output %s: %s", temporary_path.c_str(), std::strerror(errno));
+        return -1;
+    }
+    const uint64_t global_elapsed = global_end - global_start;
+    out << "{\n";
+    out << "  \"schema\": \"fdwic-perf-clock-v1\",\n";
+    out << "  \"mode\": \"perf-clock\",\n";
+    out << "  \"clock_freq_hz\": " << header->freq_hz << ",\n";
+    out << "  \"device_header_bytes\": " << sizeof(FdwicSwimlaneHeader) << ",\n";
+    out << "  \"num_cores\": " << header->num_cores << ",\n";
+    out << "  \"aic_cores\": " << aic_count << ",\n";
+    out << "  \"aiv_cores\": " << aiv_count << ",\n";
+    out << "  \"expected_submits_per_core\": " << expected_submits << ",\n";
+    out << "  \"global_first_submit_start\": " << global_start << ",\n";
+    out << "  \"global_last_submit_end\": " << global_end << ",\n";
+    out << "  \"global_submit_span_ticks\": " << global_elapsed << ",\n";
+    out << "  \"global_submit_span_us\": "
+        << static_cast<double>(global_elapsed) * 1000000.0 / static_cast<double>(header->freq_hz) << ",\n";
+    out << "  \"groups\": {\n";
+    out << "    \"aic\": {\"min_ticks\": " << aic_elapsed_min << ", \"max_ticks\": " << aic_elapsed_max
+        << ", \"mean_ticks\": " << static_cast<double>(aic_elapsed_sum) / aic_count << "},\n";
+    out << "    \"aiv\": {\"min_ticks\": " << aiv_elapsed_min << ", \"max_ticks\": " << aiv_elapsed_max
+        << ", \"mean_ticks\": " << static_cast<double>(aiv_elapsed_sum) / aiv_count << "}\n";
+    out << "  },\n";
+    out << "  \"cores\": [\n";
+    for (uint32_t core_id = 0; core_id < header->num_cores; ++core_id) {
+        const FdwicSwimlaneCoreState &core = header->cores[core_id];
+        const FdwicPerfClockCoreData &clock = core.perf_clock;
+        const uint64_t elapsed = clock.last_submit_end - clock.first_submit_start;
+        out << "    {\"core_id\": " << core_id << ", \"core_type\": \""
+            << core_type_name(runtime->workers[core_id].core_type) << "\", \"block_id\": " << core.block_id
+            << ", \"lane\": " << core.lane << ", \"submit_count\": " << clock.submit_count
+            << ", \"first_submit_start\": " << clock.first_submit_start << ", \"last_submit_end\": "
+            << clock.last_submit_end << ", \"elapsed_ticks\": " << elapsed << "}"
+            << (core_id + 1 == header->num_cores ? "\n" : ",\n");
+    }
+    out << "  ]\n}\n";
+    out.close();
+    if (!out) {
+        LOG_ERROR("failed while writing fdwic perf-clock output %s", temporary_path.c_str());
+        std::remove(temporary_path.c_str());
+        return -1;
+    }
+    if (std::rename(temporary_path.c_str(), path.c_str()) != 0) {
+        LOG_ERROR("cannot finalize fdwic perf-clock output %s: %s", path.c_str(), std::strerror(errno));
+        std::remove(temporary_path.c_str());
+        return -1;
+    }
+    LOG_INFO_V0(
+        "fdwic perf-clock written to %s: cores=%u AIC=%u AIV=%u submits/core=%u span=%.3fus", path.c_str(),
+        header->num_cores, aic_count, aiv_count, expected_submits,
+        static_cast<double>(global_elapsed) * 1000000.0 / static_cast<double>(header->freq_hz)
+    );
+    return 0;
+}
+
+extern "C" void fdwic_perf_clock_host_finalize(Runtime *runtime) { fdwic_swimlane_host_finalize(runtime); }

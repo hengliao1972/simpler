@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #include "data_type.h"
@@ -24,6 +25,7 @@ constexpr uint32_t kFdwicSwimlaneDefaultRecordsPerCore = 1u << 16;
 // thousands of rows per worker for individual spin iterations.
 constexpr uint32_t kFdwicAtomicSwimlaneRecordsPerCore = kFdwicSwimlaneDefaultRecordsPerCore;
 constexpr uint32_t kFdwicAtomicSwimlaneLevel = 4;
+constexpr uint32_t kFdwicPerfClockMode = 1;
 static_assert(
     kFdwicAtomicSwimlaneRecordsPerCore % 2 == 0, "32B record partitions must keep every worker base on a 64B boundary"
 );
@@ -258,6 +260,24 @@ struct FdwicAtomicPollBurst {
     uint32_t enabled_mask;
 };
 
+// perf-clock 只复用每核固定 64B 状态中的既有 32B pad，不分配逐事件
+// record。expected_submit_count 由 PA orchestration 明确声明；设备与 host
+// 都用它校验最后一个 Submit 的边界，而不是把任意一次 Submit 当作末次。
+struct FdwicPerfClockCoreData {
+    uint64_t first_submit_start;
+    uint64_t last_submit_end;
+    uint32_t submit_count;
+    uint32_t expected_submit_count;
+    uint32_t mode;
+    uint32_t final_seen;
+};
+
+static_assert(sizeof(FdwicPerfClockCoreData) == 32, "perf-clock data must fit the existing core-state pad");
+static_assert(offsetof(FdwicPerfClockCoreData, first_submit_start) == 0, "perf-clock start offset changed");
+static_assert(offsetof(FdwicPerfClockCoreData, last_submit_end) == 8, "perf-clock end offset changed");
+static_assert(offsetof(FdwicPerfClockCoreData, submit_count) == 16, "perf-clock count offset changed");
+static_assert(offsetof(FdwicPerfClockCoreData, expected_submit_count) == 20, "perf-clock expected offset changed");
+
 struct FdwicSwimlaneCoreState {
     volatile uint32_t count;
     volatile uint32_t dropped;
@@ -275,10 +295,14 @@ struct FdwicSwimlaneCoreState {
     volatile int32_t core_idx;
     volatile int32_t block_id;
     volatile int32_t lane;
-    uint32_t pad[8];
+    union {
+        uint32_t pad[8];
+        FdwicPerfClockCoreData perf_clock;
+    };
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(FdwicSwimlaneCoreState) == 64, "FdwicSwimlaneCoreState must occupy one cacheline");
+static_assert(offsetof(FdwicSwimlaneCoreState, perf_clock) == 32, "perf-clock must reuse the existing 32B tail");
 
 struct FdwicSwimlaneHeader {
     uint32_t magic;
@@ -290,6 +314,7 @@ struct FdwicSwimlaneHeader {
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(FdwicSwimlaneHeader) % 64 == 0, "FdwicSwimlaneHeader must be cacheline aligned");
+static_assert(offsetof(FdwicSwimlaneHeader, cores) == 64, "per-core state must start at the second cacheline");
 
 struct FdwicSwimlaneRecord {
     uint64_t start_cycle;

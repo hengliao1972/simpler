@@ -27,6 +27,7 @@ import hashlib
 import inspect
 import logging
 import os
+import subprocess
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -37,8 +38,24 @@ from .pto_isa import ensure_pto_isa_root
 
 logger = logging.getLogger(__name__)
 
-_compile_cache: dict[tuple[str, str, str], object] = {}
-_aicore_override_cache: dict[tuple[str, str, str], Path] = {}
+_compile_cache: dict[tuple[Any, ...], object] = {}
+_aicore_override_cache: dict[tuple[Any, ...], Path] = {}
+
+_FDWIC_PROFILE_ENV = "PTO_FDWIC_PROFILE"
+_FDWIC_PROFILE_NONE = "none"
+_FDWIC_PROFILE_PERF_CLOCK = "perf-clock"
+
+
+def _fdwic_profile() -> str:
+    profile = os.environ.get(_FDWIC_PROFILE_ENV, _FDWIC_PROFILE_NONE) or _FDWIC_PROFILE_NONE
+    if profile not in {_FDWIC_PROFILE_NONE, _FDWIC_PROFILE_PERF_CLOCK}:
+        raise ValueError(f"Unsupported {_FDWIC_PROFILE_ENV}={profile!r}")
+    return profile
+
+
+def _profiled_cache_key(cache_key) -> tuple[Any, ...]:
+    base = cache_key if isinstance(cache_key, tuple) else (cache_key,)
+    return (*base, _fdwic_profile())
 
 
 def clear_compile_cache() -> None:
@@ -117,7 +134,59 @@ def _write_aicore_incore_wrapper(cache_key: str, incores: list[dict]) -> Path | 
 
 
 def get_aicore_path_override(cache_key) -> Path | None:
-    return _aicore_override_cache.get(cache_key)
+    return _aicore_override_cache.get(_profiled_cache_key(cache_key))
+
+
+def _assert_fdwic_perf_clock_elf(binary: Path) -> None:
+    """Prove the final CCEC image excludes FDWIC trace/atomic and platform PMU code."""
+    try:
+        result = subprocess.run(
+            ["readelf", "-Ws", "-W", str(binary)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("readelf is required to validate the perf-clock AICore image") from exc
+    if result.returncode != 0:
+        raise RuntimeError(f"readelf failed for perf-clock image {binary}: {result.stderr.strip()}")
+
+    symbol_rows = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 8 or not fields[0].endswith(":"):
+            continue
+        symbol_rows.append((fields[3], fields[6], fields[7]))
+
+    required = ("dist_perf_clock_expect_submits",)
+    forbidden = (
+        "fdwic_atomic_poll_boundary_slow",
+        "fdwic_swimlane_detail_record_atomic",
+        "g_fdwic_swimlane_",
+        "g_fdwic_atomic_",
+        "g_fdwic_poll_",
+        "set_aicore_profiling_flag",
+        "get_aicore_profiling_flag",
+        "set_l2_swimlane_aicore_head_slot",
+        "get_l2_swimlane_aicore_head",
+        "set_aicore_pmu_ring",
+        "get_aicore_pmu_ring",
+        "set_aicore_pmu_reg_base",
+        "get_aicore_pmu_reg_base",
+    )
+    missing = [
+        symbol
+        for symbol in required
+        if not any(kind == "FUNC" and ndx != "UND" and symbol in name for kind, ndx, name in symbol_rows)
+    ]
+    present = [symbol for symbol in forbidden if any(symbol in name for _kind, _ndx, name in symbol_rows)]
+    if missing or present:
+        details = []
+        if missing:
+            details.append(f"missing defined perf-clock marker(s): {', '.join(missing)}")
+        if present:
+            details.append(f"profiling symbol(s) still present: {', '.join(present)}")
+        raise RuntimeError(f"Invalid perf-clock AICore image {binary}: {'; '.join(details)}")
 
 
 def maybe_build_aicore_override(
@@ -128,6 +197,11 @@ def maybe_build_aicore_override(
     incores: list[dict],
     pto_isa_root: str | None = None,
 ) -> Path | None:
+    profile = _fdwic_profile()
+    if profile == _FDWIC_PROFILE_PERF_CLOCK and (
+        platform != "a5" or runtime != "fully_distributed_within_core"
+    ):
+        raise ValueError("perf-clock is only supported by the real a5 fully_distributed_within_core runtime")
     if platform not in {"a5", "a5sim"} or runtime != "fully_distributed_within_core":
         return None
 
@@ -141,8 +215,24 @@ def maybe_build_aicore_override(
         if wrapper_path is not None:
             source_paths.append(wrapper_path)
     key = _aicore_extra_cache_key(cache_key, source_paths)
+    compile_definitions = None
+    if profile == _FDWIC_PROFILE_PERF_CLOCK:
+        # Keep PTO2_PROFILING at its normal value because it also owns the
+        # public Arg layout. PTO_FDWIC_PERF_CLOCK independently removes the
+        # dist swimlane/atomic path and the platform PMU state without changing
+        # the orchestration/incore ABI.
+        compile_definitions = ["PTO_FDWIC_PERF_CLOCK=1", "PTO_FDWIC_TRACE_ENABLED=0"]
     builder = RuntimeBuilder(platform)
-    return builder.build_aicore_with_extra_sources(runtime, source_paths, key, pto_isa_root=pto_isa_root)
+    binary = builder.build_aicore_with_extra_sources(
+        runtime,
+        source_paths,
+        key,
+        pto_isa_root=pto_isa_root,
+        compile_definitions=compile_definitions,
+    )
+    if profile == _FDWIC_PROFILE_PERF_CLOCK:
+        _assert_fdwic_perf_clock_elf(binary)
+    return binary
 
 
 # ---------------------------------------------------------------------------
@@ -1002,7 +1092,15 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     """
     cls_name = type(cls_inst).__name__
     callable_spec = getattr(type(cls_inst), "CALLABLE", None)
-    diagnostics_on = enable_l2_swimlane or enable_dump_args or enable_pmu or enable_dep_gen or enable_scope_stats
+    perf_clock_on = _fdwic_profile() == _FDWIC_PROFILE_PERF_CLOCK
+    diagnostics_on = (
+        enable_l2_swimlane
+        or enable_dump_args
+        or enable_pmu
+        or enable_dep_gen
+        or enable_scope_stats
+        or perf_clock_on
+    )
     # device-log timing wraps each case here (not inside _run_and_validate*),
     # the same way swimlane conversion does — _run_and_validate_l2 is overridden
     # by some SceneTestCase subclasses, so threading a kwarg through it would
@@ -1082,6 +1180,7 @@ def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
 
 def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
     """Compile a chip entry spec (orchestration + incores) -> ChipCallable. Session-cached."""
+    cache_key = _profiled_cache_key(cache_key)
     if cache_key in _compile_cache:
         return _compile_cache[cache_key]
 

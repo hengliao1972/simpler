@@ -66,6 +66,22 @@ class TestPagedAttentionUnroll(SceneTestCase):
 
     CASES = [
         {
+            "name": "CaseB1",
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4},
+            "manual": True,
+            "params": {
+                "batch": 1,
+                "num_heads": 16,
+                "kv_head_num": 1,
+                "head_dim": 128,
+                "block_size": 128,
+                "context_len": 8192,
+                "max_model_len": 32768,
+                "dtype": "bfloat16",
+            },
+        },
+        {
             "name": "Case1",
             "platforms": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 4},

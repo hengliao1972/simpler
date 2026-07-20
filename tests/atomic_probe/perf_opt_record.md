@@ -714,18 +714,100 @@ SF、PV；每 batch fanin 边数为 5，b256 全局为 1280。
 
 ### 8.1 `perf-clock`
 
-**[设计中，尚未形成提交和性能结论]**
+**[观察工具，已实现]**
 
-目标是建立权威无诊断性能基线：
+该阶段已经建立真实 PA 的权威低扰动性能基线。最终构建只额外定义：
 
-- 编译期去除普通泳道、逐 atomic 观察和 PMU；
-- 每核只保留第一个 Submit 的起点、最后一个 Submit 的终点和必要计数；
+```text
+PTO_FDWIC_PERF_CLOCK=1
+PTO_FDWIC_TRACE_ENABLED=0
+```
+
+实现口径为：
+
+- **保留 `PTO2_PROFILING` 及其拥有的公开 Arg 布局/ABI**；
+- 编译期去除 FDWIC 普通泳道、逐 atomic 观察和平台 PMU 路径；
+- 每核只保留第一个 Submit 起点、最后一个 Submit 终点和 Submit 次数；
 - 不为每个 Submit 写 record；
-- 用相同源码和 ELF 形状做独立进程、交错顺序 A/B；
+- 继续复用现有 host/device header 传输，但 device header 固定只有 **6976 B**，
+  `records_per_core=0`，没有逐事件记录；
+- host hook 随该构建重新编译并导出，不复用普通诊断构建的旧 host 产物；
 - 候选保留或撤回最终由该构建决定。
 
-当前还没有可引用的 perf-clock commit、A5 数据或产物。不得把已有
-`--no-swimlane`、level-1 或 submit-pmu 样本改名为 perf-clock 结论。
+第一版曾尝试设置 `PTO2_PROFILING=0`，在编译期触发 Arg 布局/cacheline
+`static_assert`，没有进入设备执行。该尝试已经完整撤回；这证明
+`PTO2_PROFILING` 不只是可随意关闭的观察开关，不能为了减少诊断代码破坏公开 ABI。
+最终方案只关闭上述 FDWIC 观察路径，不能表述为“所有 PTO2 profiling 已移除”。
+
+构建身份也已做双向 ELF 审计：perf ELF 含
+`dist_perf_clock_expect_submits` 标记，并且不含 FDWIC swimlane、atomic 观察和平台
+PMU 符号；普通 level-4 ELF 含正常泳道/atomic 符号，但不含 perf-clock 设备符号。
+普通构建还做了前后布局复核：旧 AICore cache 身份 `6c55004bc91e15f0` 与新
+AICore cache 身份 `110ff0c62a3adcf7` 的 `.text` 均为 `0x31a50` B，两个 ELF 中 `.text` 的 96 条
+FUNC symbol 记录在地址、尺寸、绑定、可见性和名称上完全一致；`.text` 仅有 AIC/AIV
+两份 `aicpu_orchestration_entry` 各一处单字节从 `0xa2` 变为 `0xa9`，对应
+`PTO2_SCOPE` 源码行号从 162 移到 169，原因是前置新增 7 行。没有观察到普通构建
+新增函数或代码尺寸膨胀；这里也不声称工具已经给出完整指令反汇编一致性。
+
+在完成第 2.2 节环境准备后，最小复现命令为：
+
+```bash
+source /home/q00473782/.venv/bin/activate
+python -m pytest examples/a5/fully_distributed_within_core/paged_attention_unroll/test_paged_attention_unroll.py \
+  --platform a5 --case CaseB1 --manual include \
+  --fdwic-profile perf-clock --rounds 1 -s -v
+
+python -m pytest examples/a5/fully_distributed_within_core/paged_attention_unroll/test_paged_attention_unroll.py \
+  --platform a5 --case Case1 \
+  --fdwic-profile perf-clock --rounds 1 -s -v
+```
+
+该 profile 必须独占：不要同时传 `--enable-l2-swimlane`、`--enable-pmu`、
+`--use-example-exec-time` 或其他诊断开关；命令行门禁会直接拒绝混用。每次只允许
+`--rounds 1`，多轮基线必须由独立 pytest 进程取得。该 profile 会按源码指纹自动
+重编 AICore override，但不会代替安装流程重编 host runtime；新环境首次复现前必须
+先重建 `libhost_runtime.so`，并确认三个 `fdwic_perf_clock_host_*` hook 已导出。
+
+最小 B1 两次有效 A5 闭合如下；两次都是 96 个物理子核、每核恰好 5 次 Submit：
+
+| 产物时间戳 | 完整 Submit |
+| --- | ---: |
+| `20260720_172436` | 75.347 us |
+| `20260720_172615` | 73.716 us |
+
+Case1 golden 在 `20260720_172820` 通过，96 核均为 1280 Submit，原始
+`SYS_CNT` 为 **4,489,247 ticks = 4489.247 us**。JSON 浮点输出采用默认 6 位有效
+数字，因此 Case1 量级显示为 `4489.25`，而 B1 仍可显示 `73.716`；后续精确分析
+应以 raw tick 除以 1000 为准。
+
+Case1 golden 通过后，另起五个独立进程并使用 `--skip-golden` 得到本阶段干净基线；
+**以下五次不包含上述 golden 样本**：
+
+| 产物时间戳 | raw ticks | 完整 Submit |
+| --- | ---: | ---: |
+| `20260720_173140` | 4,495,677 | 4495.677 us |
+| `20260720_173224` | 5,808,500 | 5808.500 us |
+| `20260720_173307` | 5,342,774 | 5342.774 us |
+| `20260720_173350` | 4,752,765 | 4752.765 us |
+| `20260720_173433` | 4,823,114 | 4823.114 us |
+
+五次均为 96 核、每核 1280 Submit；中位数 **4823.114 us**，最小值
+**4495.677 us**，最大值 **5808.500 us**。该分布是后续候选做独立进程、交错
+A/B 的起点，不能只挑 4489 us 的最好值作为稳定基线。
+
+还完成两项边界门禁：
+
+- Case2 负测试实际得到每核 576 Submit，而当前期望值为 320；host 按 fail-closed
+  拒绝结果且不生成成功 summary。它只证明计数不符时不会产出伪成功结论，不能用于
+  评价 Case2 性能；
+- 同一真实源码的普通 level-4 B1（`20260720_173738`）得到 480 个 Submit、完整
+  Submit **85.653 us**、`dropped=0`，排他闭合 `PASS`。它证明 perf-clock 的首尾
+  边界和逐核计数与普通泳道来自同一执行语义；由于两者是不同 ELF，不能用
+  `85.653 - 73.716` 计算观察开销。
+
+本阶段的源码、构建身份、B1、Case1、负测试和普通泳道同源边界已经闭合，并已完成
+独立源码审阅。后续进入真实 `swimlane` 构建复核与 `submit-pmu-none`，不在该工具
+阶段顺带铺开 PMU 代码。
 
 ### 8.2 `swimlane`
 
@@ -820,6 +902,10 @@ selector 必须独立编译、独立运行、独立发布，不能在一个 ELF 
 - `FullCore36` 在 Heavy 基线失败后未继续运行；
 - 上述缺口没有通过顺手修改测试契约或生产协议来掩盖。
 
+perf-clock 的 Case2 负测试不属于上述缺口：其每核实际 576 次与期望 320 次不符，
+host 已按设计拒绝并且没有输出成功 summary。这个结果只覆盖 fail-closed 门禁，
+不能被改写成 Case2 正确性或性能 PASS。
+
 ### 9.3 被证明不适合的观察路线
 
 - external task-based `msprof` 的 raw counter 不受 kernel 内 start/stop 缩窗控制，
@@ -832,6 +918,9 @@ selector 必须独立编译、独立运行、独立发布，不能在一个 ELF 
   不能作为有效基线；
 - running phase 的 PMU read-clear 会改变布局和时序，不能将局部 ELF 与 `none`
   相减得到无扰动净时间。
+- perf-clock 不能通过 `PTO2_PROFILING=0` 实现：该宏拥有公开 Arg 布局/ABI，首版
+  尝试在 Arg cacheline `static_assert` 处失败、从未上板，并已撤回。最终实现保留
+  该 ABI，只编译期移除 FDWIC 泳道/atomic 和平台 PMU 路径。
 
 ## 10. 本机证据产物索引
 
@@ -855,6 +944,12 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
 | compete-first level-1 三轮 | `outputs/TestPagedAttentionUnroll_Case1_20260720_095456/`、`..._095724/`、`..._095929/` | 真实路径三轮 A/B |
 | compete-first level-4 | `outputs/TestPagedAttentionUnroll_Case1_20260720_104406/merged_swimlane.json` | 当前真实布局、阶段与 atomic 闭合 |
 | compete-first A5Sim | `outputs/TestPagedAttentionUnroll_Case1_20260720_104649/` | 108 核模拟回归 |
+| perf-clock B1 首轮 | `outputs/TestPagedAttentionUnroll_CaseB1_20260720_172436/fdwic_perf_clock_summary.json` | 96 核、5 Submit/core，75.347 us |
+| perf-clock B1 复验 | `outputs/TestPagedAttentionUnroll_CaseB1_20260720_172615/fdwic_perf_clock_summary.json` | 96 核、5 Submit/core，73.716 us |
+| perf-clock Case1 golden | `outputs/TestPagedAttentionUnroll_Case1_20260720_172820/fdwic_perf_clock_summary.json` | golden PASS；4,489,247 ticks，不计入五轮基线 |
+| perf-clock Case1 五轮基线 | `outputs/TestPagedAttentionUnroll_Case1_20260720_173140/`、`..._173224/`、`..._173307/`、`..._173350/`、`..._173433/` | 中位 4823.114 us，范围 4495.677～5808.500 us |
+| perf-clock Case2 负测试 | `outputs/TestPagedAttentionUnroll_Case2_20260720_173035/` | 576/core 与期望 320 不符；拒绝结果，无成功 summary |
+| 同源普通 level-4 B1 | `outputs/TestPagedAttentionUnroll_CaseB1_20260720_173738/` | 480 Submit、85.653 us、dropped=0、排他 PASS；不与 perf-clock 相减 |
 
 ### 10.3 standalone
 
@@ -972,9 +1067,10 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
 当前只进入真实 PA 观察基础设施阶段，不继续修改 standalone，也不立即猜测新的
 业务优化：
 
-1. **[设计中] 真实 PA `perf-clock`**：建立编译期无泳道、无 atomic、无 PMU 的
-   权威计时构建；先验证精确的首 Submit 起点、末 Submit 终点和每核调用数，再以
-   它承担后续候选的交错 A/B，形成第一条独立详细提交；
+1. **[观察工具，已实现] 真实 PA `perf-clock`**：保留 PTO2 公开 Arg ABI，
+   编译期去除 FDWIC 泳道、atomic 观察和平台 PMU；首尾 Submit、96 核逐核调用数、
+   6976 B header、ELF 双向身份、B1、Case1 五轮基线、Case2 fail-closed 和普通
+   level-4 同源边界均已验证，作为后续候选保留/撤销的权威低扰动 A/B 口径；
 2. **[观察工具，已有基础] 真实 PA `swimlane`**：普通业务 span 与 atomic 合并
    采集，继续复用当前父子、overlay、记录容量和整数闭合门禁；只用于定位业务区域
    和 atomic 变化，不与 perf-clock 绝对时间相减；如需为三证据链补构建隔离或身份

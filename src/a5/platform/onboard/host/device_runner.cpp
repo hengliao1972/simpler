@@ -26,6 +26,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -59,6 +60,10 @@ extern "C" __attribute__((weak)) int
 fdwic_swimlane_host_init(Runtime *runtime, int num_cores, int level, const char *output_prefix);
 extern "C" __attribute__((weak)) int fdwic_swimlane_host_export(Runtime *runtime);
 extern "C" __attribute__((weak)) void fdwic_swimlane_host_finalize(Runtime *runtime);
+extern "C" __attribute__((weak)) int
+fdwic_perf_clock_host_init(Runtime *runtime, int num_cores, const char *output_prefix);
+extern "C" __attribute__((weak)) int fdwic_perf_clock_host_export(Runtime *runtime);
+extern "C" __attribute__((weak)) void fdwic_perf_clock_host_finalize(Runtime *runtime);
 
 // =============================================================================
 // DeviceRunner Implementation
@@ -274,6 +279,40 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
             fdwic_swimlane_active = false;
         }
     });
+    bool fdwic_perf_clock_active = false;
+    auto fdwic_perf_clock_cleanup = RAIIScopeGuard([&runtime, &fdwic_perf_clock_active]() {
+        if (fdwic_perf_clock_active && fdwic_perf_clock_host_finalize != nullptr) {
+            fdwic_perf_clock_host_finalize(&runtime);
+            fdwic_perf_clock_active = false;
+        }
+    });
+    const char *fdwic_profile = std::getenv("PTO_FDWIC_PROFILE");
+    const bool fdwic_perf_clock_requested =
+        fdwic_profile != nullptr && std::strcmp(fdwic_profile, "perf-clock") == 0;
+    if (fdwic_perf_clock_requested) {
+        if (enable_profiling_flag != PROFILING_FLAG_NONE) {
+            LOG_ERROR("fdwic perf-clock cannot be combined with another runtime diagnostic");
+            return -1;
+        }
+        if (fdwic_perf_clock_host_init == nullptr || fdwic_perf_clock_host_export == nullptr ||
+            fdwic_perf_clock_host_finalize == nullptr) {
+            LOG_ERROR("fdwic perf-clock was requested but the selected runtime does not provide its host hooks");
+            return -1;
+        }
+        rc = fdwic_perf_clock_host_init(&runtime, num_aicore, output_prefix_.c_str());
+        if (rc <= 0) {
+            LOG_ERROR("fdwic perf-clock init failed: %d", rc);
+            return rc < 0 ? rc : -1;
+        }
+        fdwic_perf_clock_active = true;
+        // perf-clock is an independent header-only evidence path. Generic
+        // L2/PMU pointers and the umbrella launch flag must remain empty.
+        kernel_args_.args.enable_profiling_flag = PROFILING_FLAG_NONE;
+        kernel_args_.args.l2_swimlane_data_base = 0;
+        kernel_args_.args.l2_swimlane_aicore_rotation_table = 0;
+        kernel_args_.args.aicore_pmu_ring_addrs = 0;
+        kernel_args_.args.pmu_data_base = 0;
+    }
     if (enable_l2_swimlane_ && fdwic_swimlane_host_init != nullptr) {
         rc = fdwic_swimlane_host_init(
             &runtime, num_aicore, static_cast<int>(l2_swimlane_level_), output_prefix_.c_str()
@@ -448,6 +487,12 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
                 LOG_ERROR("fdwic swimlane export failed after runtime error: %d", export_rc);
             }
         }
+        if (fdwic_perf_clock_active) {
+            const int export_rc = fdwic_perf_clock_host_export(&runtime);
+            if (export_rc != 0) {
+                LOG_ERROR("fdwic perf-clock export failed after runtime error: %d", export_rc);
+            }
+        }
         return rc;
     }
 
@@ -459,6 +504,13 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         fdwic_swimlane_export_rc = fdwic_swimlane_host_export(&runtime);
         if (fdwic_swimlane_export_rc != 0) {
             LOG_ERROR("fdwic swimlane export failed: %d", fdwic_swimlane_export_rc);
+        }
+    }
+    int fdwic_perf_clock_export_rc = 0;
+    if (fdwic_perf_clock_active) {
+        fdwic_perf_clock_export_rc = fdwic_perf_clock_host_export(&runtime);
+        if (fdwic_perf_clock_export_rc != 0) {
+            LOG_ERROR("fdwic perf-clock export failed: %d", fdwic_perf_clock_export_rc);
         }
     }
 
@@ -478,7 +530,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // Print handshake results (reads from device memory, must be before free)
     print_handshake_results();
 
-    return fdwic_swimlane_export_rc;
+    return fdwic_swimlane_export_rc != 0 ? fdwic_swimlane_export_rc : fdwic_perf_clock_export_rc;
 }
 
 void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {

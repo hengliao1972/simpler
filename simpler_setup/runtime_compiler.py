@@ -46,8 +46,9 @@ class BuildTarget:
         source_dirs: list[str],
         sanitizers: str = "",
         source_files: Optional[list[str]] = None,
+        compile_definitions: Optional[list[str]] = None,
     ) -> list[str]:
-        """Generate CMake arguments list from toolchain args + custom directories."""
+        """Generate CMake arguments from toolchain, source and per-build definitions."""
         inc = ";".join(os.path.abspath(d) for d in include_dirs)
         src = ";".join(os.path.abspath(d) for d in source_dirs)
         args = self.toolchain.get_cmake_args() + [
@@ -57,6 +58,9 @@ class BuildTarget:
         if source_files:
             files = ";".join(os.path.abspath(f) for f in source_files)
             args.append(f"-DCUSTOM_SOURCE_FILES={files}")
+        if compile_definitions:
+            definitions = ";".join(compile_definitions)
+            args.append(f"-DCUSTOM_COMPILE_DEFINITIONS={definitions}")
         # Sanitizers only apply to host-compiled targets — device toolchains
         # (ccec, aarch64 cross) run on the NPU and can't carry a host sanitizer
         # runtime. cmake/sanitizers.cmake reads both defines.
@@ -231,6 +235,7 @@ class RuntimeCompiler:
         output_dir: Optional[Union[str, Path]] = None,
         dispatcher_dest: Optional[Union[str, Path]] = None,
         source_files: Optional[list[str]] = None,
+        compile_definitions: Optional[list[str]] = None,
     ) -> Union[bytes, Path]:
         """
         Compile binary for the specified target platform.
@@ -248,6 +253,9 @@ class RuntimeCompiler:
                         When None, the dispatcher SO is not exported. Used by
                         runtime_builder to share one dispatcher SO across all
                         runtimes for a given arch.
+            source_files: Additional translation units outside source_dirs.
+            compile_definitions: Definitions forwarded to every translation unit
+                        of this CMake target, without a leading ``-D``.
 
         Returns:
             If output_dir is set: Path to the compiled binary in output_dir.
@@ -272,6 +280,7 @@ class RuntimeCompiler:
             source_dirs,
             sanitizers=self._sanitizers,
             source_files=source_files,
+            compile_definitions=compile_definitions,
         )
         cmake_source_dir = target.get_root_dir()
         binary_name = target.get_binary_name()

@@ -150,6 +150,14 @@ def pytest_addoption(parser):
         "1=AICore timing, 2=+dispatch/fanout, 3=+sched phases, 4=+orch phases",
     )
     parser.addoption(
+        "--fdwic-profile",
+        action="store",
+        choices=["none", "perf-clock"],
+        default="none",
+        help="Select a private fully_distributed_within_core evidence build. "
+        "perf-clock keeps only the first/last Submit device clock per core.",
+    )
+    parser.addoption(
         "--use-example-exec-time",
         action="store_true",
         default=False,
@@ -433,6 +441,46 @@ def _configure_sanitizer(config):
         )
 
 
+def _configure_fdwic_profile(config):
+    """Validate and publish the private real-A5 FDWIC evidence profile."""
+    fdwic_profile = config.getoption("--fdwic-profile", default="none")
+    if fdwic_profile != "perf-clock":
+        os.environ.pop("PTO_FDWIC_PROFILE", None)
+        return
+
+    platform = config.getoption("--platform", default=None)
+    runtime = config.getoption("--runtime", default=None)
+    level = config.getoption("--level", default=None)
+    if platform != "a5":
+        raise pytest.UsageError("--fdwic-profile perf-clock requires --platform a5")
+    if runtime not in {None, "fully_distributed_within_core"}:
+        raise pytest.UsageError("--fdwic-profile perf-clock only supports runtime fully_distributed_within_core")
+    if level not in {None, 2}:
+        raise pytest.UsageError("--fdwic-profile perf-clock only supports SceneTest level 2")
+    if config.getoption("--rounds", default=1) != 1:
+        raise pytest.UsageError(
+            "--fdwic-profile perf-clock requires --rounds 1 because its per-case artifact is single-run"
+        )
+    conflicting = []
+    for option, label in (
+        ("--enable-l2-swimlane", "--enable-l2-swimlane"),
+        ("--dump-args", "--dump-args"),
+        ("--enable-pmu", "--enable-pmu"),
+        ("--enable-dep-gen", "--enable-dep-gen"),
+        ("--enable-scope-stats", "--enable-scope-stats"),
+        ("--enable-device-log-timing", "--enable-device-log-timing"),
+        ("--enable-swimlane-overhead", "--enable-swimlane-overhead"),
+        ("--use-example-exec-time", "--use-example-exec-time"),
+    ):
+        if config.getoption(option, default=0):
+            conflicting.append(label)
+    if conflicting:
+        raise pytest.UsageError(
+            "--fdwic-profile perf-clock must run without other diagnostics: " + ", ".join(conflicting)
+        )
+    os.environ["PTO_FDWIC_PROFILE"] = "perf-clock"
+
+
 def pytest_configure(config):
     """Register custom markers and apply global config."""
     config.addinivalue_line("markers", "platforms(list): supported platforms for standalone ST functions")
@@ -445,6 +493,7 @@ def pytest_configure(config):
     )
 
     _configure_sanitizer(config)
+    _configure_fdwic_profile(config)
 
     # Configure logging unconditionally (not only when --log-level is passed) so
     # simpler's own WARNINGs — e.g. the device-log-timing "no device log written"
@@ -612,6 +661,27 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
         return (0 if level >= 3 else 1, item.nodeid)
 
     items.sort(key=sort_key)
+
+    if config.getoption("--fdwic-profile", default="none") == "perf-clock":
+        incompatible = []
+        for item in items:
+            if any(m.name == "skip" for m in item.iter_markers()):
+                continue
+            cls = getattr(item, "cls", None)
+            if cls is None:
+                incompatible.append(item.nodeid)
+                continue
+            if getattr(cls, "_st_level", None) != 2 or getattr(cls, "_st_runtime", None) != (
+                "fully_distributed_within_core"
+            ):
+                incompatible.append(item.nodeid)
+        if incompatible:
+            sample = ", ".join(incompatible[:3])
+            more = "" if len(incompatible) <= 3 else f" (+{len(incompatible) - 3} more)"
+            raise pytest.UsageError(
+                "--fdwic-profile perf-clock only accepts level-2 fully_distributed_within_core tests; "
+                f"incompatible item(s): {sample}{more}"
+            )
 
     # L3 perf collection is not supported yet: a single L3 case forks N chip-processes
     # that all write l2_swimlane_records_<ts>.json to the same directory with

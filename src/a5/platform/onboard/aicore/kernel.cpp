@@ -12,12 +12,16 @@
  * Minimal AICore Kernel
  */
 #include "aicore/aicore.h"
+#if !defined(PTO_FDWIC_PERF_CLOCK) || !PTO_FDWIC_PERF_CLOCK
 #include "aicore/aicore_profiling_state.h"
+#endif
 #include "common/core_type.h"
 #include "common/kernel_args.h"
+#if !defined(PTO_FDWIC_PERF_CLOCK) || !PTO_FDWIC_PERF_CLOCK
 #include "common/l2_swimlane_profiling.h"
-#include "common/platform_config.h"
 #include "common/pmu_profiling.h"
+#endif
+#include "common/platform_config.h"
 #include "simt_anchor.h"
 
 class Runtime;
@@ -37,6 +41,7 @@ class Runtime;
 [[block_local]] int block_idx;
 [[block_local]] CoreType core_type;
 
+#if !defined(PTO_FDWIC_PERF_CLOCK) || !PTO_FDWIC_PERF_CLOCK
 // Per-core profiling state. Populated once by KERNEL_ENTRY from KernelArgs;
 // read by aicore_execute and profiling helpers via the getters below. This
 // mirrors the AICPU-side set_l2_swimlane_enabled / set_pmu_enabled pattern,
@@ -78,6 +83,7 @@ __attribute__((weak)) __aicore__ __gm__ PmuAicoreRing *get_aicore_pmu_ring() { r
 
 __attribute__((weak)) __aicore__ void set_aicore_pmu_reg_base(uint64_t reg_base) { s_aicore_pmu_reg_base = reg_base; }
 __attribute__((weak)) __aicore__ uint64_t get_aicore_pmu_reg_base() { return s_aicore_pmu_reg_base; }
+#endif
 
 extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type);
 
@@ -111,6 +117,7 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
     core_type = CoreType::AIC;
 #endif
 
+#if !defined(PTO_FDWIC_PERF_CLOCK) || !PTO_FDWIC_PERF_CLOCK
     // Publish per-core profiling state into platform-owned slots before the
     // executor runs. AICore reads via get_aicore_*() — never touches Handshake
     // for profiling. The PMU MMIO base is resolved here from
@@ -154,6 +161,7 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
         set_aicore_pmu_ring(nullptr);
         set_aicore_pmu_reg_base(0);
     }
+#endif
 
 #ifdef __DAV_VEC__
     // SIMT classification anchor (AIV only). Never executes —

@@ -369,13 +369,16 @@ class RuntimeBuilder:
         extra_sources: list[Path],
         cache_key: str,
         pto_isa_root: Optional[str] = None,
+        compile_definitions: Optional[list[str]] = None,
     ) -> Path:
         """Build a per-callable AICore image with additional source files.
 
         This is used by fully_distributed_within_core while moving per-example
         orchestration into the AICore image. It intentionally stages the result
         outside the baseline runtime output directory so `build_runtimes.py`
-        remains a per-runtime prebuild.
+        remains a per-runtime prebuild. ``compile_definitions`` is part of both
+        the CMake command and cache fingerprint, so evidence profiles cannot
+        silently reuse an image built with different preprocessor gates.
         """
         self._validate_runtime(name)
         config_path = self._runtimes[name]
@@ -408,7 +411,16 @@ class RuntimeBuilder:
 
         current_commit = _get_git_head(PROJECT_ROOT)
         fingerprint_paths = [*(Path(p) for p in include_dirs), *(Path(p) for p in source_dirs), *extra_sources]
-        current_state = _SOURCE_STATE_VERSION + ":" + current_commit + ":" + _source_fingerprint(fingerprint_paths)
+        definitions_state = hashlib.sha256(repr(compile_definitions or []).encode("utf-8")).hexdigest()
+        current_state = (
+            _SOURCE_STATE_VERSION
+            + ":"
+            + current_commit
+            + ":"
+            + _source_fingerprint(fingerprint_paths)
+            + ":"
+            + definitions_state
+        )
         lock_path = cache_dir / ".aicore-extra.lock"
         with open(lock_path, "w") as lock_fd:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -420,6 +432,7 @@ class RuntimeBuilder:
                 build_dir=str(cache_dir),
                 output_dir=output_dir,
                 source_files=[str(p) for p in extra_sources],
+                compile_definitions=compile_definitions,
             )
 
     def _resolve_dispatcher_path(self) -> Optional[Path]:

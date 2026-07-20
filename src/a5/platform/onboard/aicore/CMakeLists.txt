@@ -42,6 +42,16 @@ if(DEFINED CUSTOM_SOURCE_FILES)
         list(APPEND ALL_SOURCES "${SRC_FILE}")
     endforeach()
 endif()
+
+# Per-callable diagnostic profiles pass compile definitions here. Keep them on
+# every CCEC translation unit (platform entry, dist engine, orchestration and
+# linked incore wrapper), otherwise one TU can silently retain profiling code.
+set(CMAKE_CUSTOM_COMPILE_DEFINITION_FLAGS "")
+if(DEFINED CUSTOM_COMPILE_DEFINITIONS)
+    foreach(DEFINITION ${CUSTOM_COMPILE_DEFINITIONS})
+        list(APPEND CMAKE_CUSTOM_COMPILE_DEFINITION_FLAGS "-D${DEFINITION}")
+    endforeach()
+endif()
 list(LENGTH ALL_SOURCES NUM_SOURCES)
 message(STATUS "AICore kernel: ${NUM_SOURCES} source files")
 message(VERBOSE "AICore kernel sources: ${ALL_SOURCES}")
@@ -84,6 +94,7 @@ foreach(SRC_FILE ${ALL_SOURCES})
     add_custom_command(
         OUTPUT ${OBJ_AIC}
         COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS} --cce-aicore-arch=dav-c310-cube
+                ${CMAKE_CUSTOM_COMPILE_DEFINITION_FLAGS}
                 -o ${OBJ_AIC} ${SRC_FILE}
         DEPENDS ${SRC_FILE}
         COMMENT "Compiling ${SRC_NAME} for AIC"
@@ -93,6 +104,7 @@ foreach(SRC_FILE ${ALL_SOURCES})
     add_custom_command(
         OUTPUT ${OBJ_AIV}
         COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS} --cce-aicore-arch=dav-c310-vec
+                ${CMAKE_CUSTOM_COMPILE_DEFINITION_FLAGS}
                 -o ${OBJ_AIV} ${SRC_FILE}
         DEPENDS ${SRC_FILE}
         COMMENT "Compiling ${SRC_NAME} for AIV"

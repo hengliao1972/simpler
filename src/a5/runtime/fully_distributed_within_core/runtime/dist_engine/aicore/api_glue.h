@@ -43,6 +43,12 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_scope_end_impl(PTO2Runtime *) {}
 DIST_API_ATTR PTO_DEVICE_FUNC void dist_orchestration_done_impl(PTO2Runtime *) {}
 DIST_API_ATTR PTO_DEVICE_FUNC void dist_scope_set_site_impl(const char *, int) {}
 
+#if PTO_FDWIC_PERF_CLOCK
+DIST_API_ATTR PTO_DEVICE_FUNC void dist_perf_clock_expect_submits(uint32_t expected_submits) {
+    fdwic_perf_clock_expect_submits(expected_submits);
+}
+#endif
+
 DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_dummy_impl(PTO2Runtime *, const L0TaskArgs &) {
     return TaskOutputTensors{};
 }

@@ -23,6 +23,8 @@
 
 namespace {
 
+#if DIST_TRACE_ENABLED
+
 PTO_DEVICE_FUNC inline uint64_t fdwic_swimlane_detail_now() {
 #if defined(__CCE_AICORE__) || defined(__CPU_SIM)
     return get_sys_cnt_aicore();
@@ -456,5 +458,68 @@ fdwic_swimlane_lap(__gm__ DistCore *self, int32_t task_id, int32_t func_id, Fdwi
     fdwic_swimlane_detail_record(self, task_id, func_id, phase, start_cycle, end_cycle);
     self->swimlane_last_cycle = end_cycle;
 }
+
+#else
+
+// 无泳道构建必须在编译期回到原始 atomic，而不是只让运行时 level=0。
+// 这样 perf-clock / submit-pmu ELF 不携带 record 分支、轮询聚合状态或
+// atomic 观察慢体，避免诊断代码布局反过来污染权威性能基线。
+PTO_DEVICE_FUNC inline void fdwic_swimlane_attach(__gm__ Runtime *) {}
+
+PTO_DEVICE_FUNC constexpr uint32_t fdwic_atomic_site_mask(FdwicAtomicSite site) {
+    return 1U << static_cast<uint32_t>(site);
+}
+
+PTO_DEVICE_FUNC inline uint32_t fdwic_atomic_block_won_poll_mask() { return 0; }
+PTO_DEVICE_FUNC inline uint32_t fdwic_atomic_poll_region_begin(uint32_t) { return 0; }
+PTO_DEVICE_FUNC inline void fdwic_atomic_poll_region_end(uint32_t) {}
+PTO_DEVICE_FUNC inline void fdwic_atomic_poll_boundary() {}
+
+template <typename T>
+PTO_DEVICE_FUNC inline T fdwic_trace_atomic_load(
+    int32_t, FdwicAtomicSite, __gm__ volatile T &value, bool = true, int memorder = __ATOMIC_ACQUIRE
+) {
+    return atomic_load(value, memorder);
+}
+
+template <typename T, typename V>
+PTO_DEVICE_FUNC inline T fdwic_trace_atomic_exchange(
+    int32_t, FdwicAtomicSite, __gm__ volatile T &value, V desired, bool = false, int memorder = __ATOMIC_ACQ_REL
+) {
+    return atomic_exchange(value, static_cast<T>(desired), memorder);
+}
+
+template <typename T>
+PTO_DEVICE_FUNC inline T fdwic_trace_atomic_fetch_add(
+    int32_t, FdwicAtomicSite, __gm__ volatile T &value, T delta, bool = false, int memorder = __ATOMIC_ACQ_REL
+) {
+    return atomic_fetch_add(value, delta, memorder);
+}
+
+template <typename T>
+PTO_DEVICE_FUNC inline T fdwic_trace_atomic_fetch_sub(
+    int32_t, FdwicAtomicSite, __gm__ volatile T &value, T delta, bool = false, int memorder = __ATOMIC_ACQ_REL
+) {
+    return atomic_fetch_sub(value, delta, memorder);
+}
+
+template <typename T>
+PTO_DEVICE_FUNC inline T fdwic_trace_atomic_fetch_max(
+    int32_t, FdwicAtomicSite, __gm__ volatile T &value, T desired, bool = true, int memorder = __ATOMIC_ACQ_REL
+) {
+    return atomic_fetch_max(value, desired, memorder);
+}
+
+PTO_DEVICE_FUNC inline bool fdwic_trace_is_fatal(int32_t = -1) {
+    return atomic_load(g_dist.fatal, __ATOMIC_ACQUIRE) != 0;
+}
+
+PTO_DEVICE_FUNC inline void fdwic_trace_set_fatal(int32_t = -1) {
+    (void)atomic_exchange(g_dist.fatal, int32_t{1}, __ATOMIC_ACQ_REL);
+}
+
+PTO_DEVICE_FUNC inline void fdwic_swimlane_record_clock_baselines(__gm__ DistCore *, int32_t) {}
+
+#endif
 
 }  // namespace
