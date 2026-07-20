@@ -1,0 +1,25 @@
+variant	block	order	position	submit_span_us	included	exclusion_reason	source
+compete-first-lazy	1	ABC	3	4084.775	False	hampel_3_scaled_mad	block_01_ABC_pos3_compete-first-lazy.txt
+compete-first-lazy	2	BCA	2	3845.228	True		block_02_BCA_pos2_compete-first-lazy.txt
+compete-first-lazy	3	CAB	1	3655.535	True		block_03_CAB_pos1_compete-first-lazy.txt
+compete-first-lazy	4	ACB	2	3815.964	True		block_04_ACB_pos2_compete-first-lazy.txt
+compete-first-lazy	5	BAC	3	3645.710	True		block_05_BAC_pos3_compete-first-lazy.txt
+compete-first-lazy	6	CBA	1	3836.215	True		block_06_CBA_pos1_compete-first-lazy.txt
+compete-first-lazy	7	CBA	1	3751.926	True		block_07_CBA_pos1_compete-first-lazy.txt
+compete-first-lazy	8	BAC	3	3849.866	True		block_08_BAC_pos3_compete-first-lazy.txt
+compete-first-lazy	9	ACB	2	4370.394	False	hampel_3_scaled_mad	block_09_ACB_pos2_compete-first-lazy.txt
+compete-first-lazy	10	CAB	1	3821.598	True		block_10_CAB_pos1_compete-first-lazy.txt
+compete-first-lazy	11	BCA	2	3950.280	True		block_11_BCA_pos2_compete-first-lazy.txt
+compete-first-lazy	12	ABC	3	3869.958	True		block_12_ABC_pos3_compete-first-lazy.txt
+compete-first-lazy	13	BCA	2	3751.215	True		block_13_BCA_pos2_compete-first-lazy.txt
+compete-first-lazy	14	ACB	2	3848.951	True		block_14_ACB_pos2_compete-first-lazy.txt
+compete-first-lazy	15	CBA	1	3858.263	True		block_15_CBA_pos1_compete-first-lazy.txt
+compete-first-lazy	16	ABC	3	3834.485	True		block_16_ABC_pos3_compete-first-lazy.txt
+compete-first-lazy	17	CAB	1	3742.848	True		block_17_CAB_pos1_compete-first-lazy.txt
+compete-first-lazy	18	BAC	3	3838.856	True		block_18_BAC_pos3_compete-first-lazy.txt
+compete-first-lazy	19	BAC	3	3705.379	True		block_19_BAC_pos3_compete-first-lazy.txt
+compete-first-lazy	20	CAB	1	3762.927	True		block_20_CAB_pos1_compete-first-lazy.txt
+compete-first-lazy	21	ABC	3	3810.508	True		block_21_ABC_pos3_compete-first-lazy.txt
+compete-first-lazy	22	CBA	1	3643.199	True		block_22_CBA_pos1_compete-first-lazy.txt
+compete-first-lazy	23	ACB	2	3861.894	True		block_23_ACB_pos2_compete-first-lazy.txt
+compete-first-lazy	24	BCA	2	3646.270	True		block_24_BCA_pos2_compete-first-lazy.txt

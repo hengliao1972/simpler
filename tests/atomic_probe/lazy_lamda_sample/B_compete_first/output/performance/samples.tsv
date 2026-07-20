@@ -1,0 +1,25 @@
+variant	block	order	position	submit_span_us	included	exclusion_reason	source
+compete-first	1	ABC	2	3635.160	True		block_01_ABC_pos2_compete-first.txt
+compete-first	2	BCA	1	3650.095	True		block_02_BCA_pos1_compete-first.txt
+compete-first	3	CAB	3	3652.166	True		block_03_CAB_pos3_compete-first.txt
+compete-first	4	ACB	3	3656.991	True		block_04_ACB_pos3_compete-first.txt
+compete-first	5	BAC	1	3730.272	True		block_05_BAC_pos1_compete-first.txt
+compete-first	6	CBA	2	3847.468	True		block_06_CBA_pos2_compete-first.txt
+compete-first	7	CBA	2	3706.997	True		block_07_CBA_pos2_compete-first.txt
+compete-first	8	BAC	1	3837.104	True		block_08_BAC_pos1_compete-first.txt
+compete-first	9	ACB	3	3625.727	True		block_09_ACB_pos3_compete-first.txt
+compete-first	10	CAB	3	3823.817	True		block_10_CAB_pos3_compete-first.txt
+compete-first	11	BCA	1	3679.901	True		block_11_BCA_pos1_compete-first.txt
+compete-first	12	ABC	2	3637.016	True		block_12_ABC_pos2_compete-first.txt
+compete-first	13	BCA	1	3753.752	True		block_13_BCA_pos1_compete-first.txt
+compete-first	14	ACB	3	3866.154	True		block_14_ACB_pos3_compete-first.txt
+compete-first	15	CBA	2	3766.289	True		block_15_CBA_pos2_compete-first.txt
+compete-first	16	ABC	2	3834.848	True		block_16_ABC_pos2_compete-first.txt
+compete-first	17	CAB	3	3649.524	True		block_17_CAB_pos3_compete-first.txt
+compete-first	18	BAC	1	3848.497	True		block_18_BAC_pos1_compete-first.txt
+compete-first	19	BAC	1	3807.280	True		block_19_BAC_pos1_compete-first.txt
+compete-first	20	CAB	3	3836.932	True		block_20_CAB_pos3_compete-first.txt
+compete-first	21	ABC	2	3734.900	True		block_21_ABC_pos2_compete-first.txt
+compete-first	22	CBA	2	3769.223	True		block_22_CBA_pos2_compete-first.txt
+compete-first	23	ACB	3	3847.947	True		block_23_ACB_pos3_compete-first.txt
+compete-first	24	BCA	1	3735.082	True		block_24_BCA_pos1_compete-first.txt

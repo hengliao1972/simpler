@@ -1,0 +1,25 @@
+variant	block	order	position	submit_span_us	included	exclusion_reason	source
+original	1	ABC	1	3963.375	True		block_01_ABC_pos1_original.txt
+original	2	BCA	3	3856.072	True		block_02_BCA_pos3_original.txt
+original	3	CAB	2	3870.407	True		block_03_CAB_pos2_original.txt
+original	4	ACB	1	3956.964	True		block_04_ACB_pos1_original.txt
+original	5	BAC	2	3989.566	True		block_05_BAC_pos2_original.txt
+original	6	CBA	3	4000.058	True		block_06_CBA_pos3_original.txt
+original	7	CBA	3	3930.496	True		block_07_CBA_pos3_original.txt
+original	8	BAC	2	3903.443	True		block_08_BAC_pos2_original.txt
+original	9	ACB	1	3901.414	True		block_09_ACB_pos1_original.txt
+original	10	CAB	2	3948.008	True		block_10_CAB_pos2_original.txt
+original	11	BCA	3	3832.087	False	hampel_3_scaled_mad	block_11_BCA_pos3_original.txt
+original	12	ABC	1	3971.406	True		block_12_ABC_pos1_original.txt
+original	13	BCA	3	3953.491	True		block_13_BCA_pos3_original.txt
+original	14	ACB	1	3961.384	True		block_14_ACB_pos1_original.txt
+original	15	CBA	3	3926.037	True		block_15_CBA_pos3_original.txt
+original	16	ABC	1	3972.611	True		block_16_ABC_pos1_original.txt
+original	17	CAB	2	3956.200	True		block_17_CAB_pos2_original.txt
+original	18	BAC	2	3918.430	True		block_18_BAC_pos2_original.txt
+original	19	BAC	2	3960.714	True		block_19_BAC_pos2_original.txt
+original	20	CAB	2	3876.067	True		block_20_CAB_pos2_original.txt
+original	21	ABC	1	3959.145	True		block_21_ABC_pos1_original.txt
+original	22	CBA	3	3975.785	True		block_22_CBA_pos3_original.txt
+original	23	ACB	1	3788.296	False	hampel_3_scaled_mad	block_23_ACB_pos1_original.txt
+original	24	BCA	3	3956.396	True		block_24_BCA_pos3_original.txt

@@ -7,6 +7,10 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+# This self-contained probe intentionally carries generated binaries, Chinese
+# source annotations, and performance outputs for offline comparison.
+exclude: ^tests/atomic_probe/lazy_lamda_sample/
+
 repos:
 
     # Common

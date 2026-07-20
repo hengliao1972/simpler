@@ -1,0 +1,64 @@
+{
+  "configuration": {
+    "batches": 256,
+    "device": 0,
+    "launch_orders": "all six permutations, each repeated four times",
+    "launch_positions": {
+      "1": 8,
+      "2": 8,
+      "3": 8
+    },
+    "pmu_window": "off",
+    "runs_per_host_launch": 1,
+    "samples": 24,
+    "swimlane": "off-runtime",
+    "winner_workload": "real-compute",
+    "workers": 96
+  },
+  "excluded_samples": [
+    {
+      "block": 1,
+      "exclusion_reason": "hampel_3_scaled_mad",
+      "included": false,
+      "order": "ABC",
+      "position": 3,
+      "source": "block_01_ABC_pos3_compete-first-lazy.txt",
+      "submit_span_us": 4084.775
+    },
+    {
+      "block": 9,
+      "exclusion_reason": "hampel_3_scaled_mad",
+      "included": false,
+      "order": "ACB",
+      "position": 2,
+      "source": "block_09_ACB_pos2_compete-first-lazy.txt",
+      "submit_span_us": 4370.394
+    }
+  ],
+  "outlier_filtered": {
+    "count": 22,
+    "max_submit_span_us": 3950.28,
+    "mean_submit_span_us": 3788.503409090909,
+    "median_submit_span_us": 3818.781,
+    "min_submit_span_us": 3643.199,
+    "population_stdev_us": 83.86854308036808
+  },
+  "outlier_rule": {
+    "lower_us": 3590.0152591000005,
+    "mad_us": 53.515499999999975,
+    "median_us": 3828.0415000000003,
+    "name": "Hampel",
+    "raw_logs_retained": true,
+    "upper_us": 4066.0677409
+  },
+  "raw": {
+    "count": 24,
+    "max_submit_span_us": 4370.394,
+    "mean_submit_span_us": 3825.0935000000004,
+    "median_submit_span_us": 3828.0415000000003,
+    "min_submit_span_us": 3643.199,
+    "population_stdev_us": 151.24318121103295
+  },
+  "schema": "pa_lazy_lambda_variant_independent_performance/v1",
+  "variant": "compete-first-lazy"
+}

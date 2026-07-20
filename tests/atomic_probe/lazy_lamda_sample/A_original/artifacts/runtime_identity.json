@@ -1,0 +1,51 @@
+{
+  "full_elf_equal": true,
+  "host_equal": true,
+  "host_sha256": "97cf327377857bcab61cbca10357a90bc49cd5c389c919873c2f3209d5b01188",
+  "measured_elf_sha256": "76c961f846c7efc89b40942c3a8113530a6da2c7bfbdc601615852f8c5b79cfc",
+  "nobits_layout": [],
+  "note": "Measured is the exact performance binary; full ELF and runtime identities are checked explicitly.",
+  "rebuilt_elf_sha256": "76c961f846c7efc89b40942c3a8113530a6da2c7bfbdc601615852f8c5b79cfc",
+  "runtime_content_sections": [
+    {
+      "content_equal": true,
+      "metadata_equal": true,
+      "name": ".text",
+      "sha256": "018ae7dc29ce78249b2e3bff84b0faa2e671e2448c9316719fb48bc59139d2fc",
+      "size": 780344
+    },
+    {
+      "content_equal": true,
+      "metadata_equal": true,
+      "name": ".rodata",
+      "sha256": "a3aab0297c4ff5ee3592c078b30f69bdfd6ad5e637115b21063589bd2e310164",
+      "size": 512
+    },
+    {
+      "content_equal": true,
+      "metadata_equal": true,
+      "name": ".ascend.meta.pa_scheduler_0_mix_aic",
+      "sha256": "21d5aa86fefde2c6c9264a0ddde378b67951e3c0932a81c1eaa38e52659aa40f",
+      "size": 24
+    },
+    {
+      "content_equal": true,
+      "metadata_equal": true,
+      "name": "__CCE_KernelArgSize",
+      "sha256": "c0cdbb6e45249a718e7e605f801cf43f673a22fcf0347034da71f6be2e4f4d5e",
+      "size": 8
+    },
+    {
+      "content_equal": true,
+      "metadata_equal": true,
+      "name": ".ascend.meta.pa_scheduler_0_mix_aiv",
+      "sha256": "71dbf120b5acf5cb4b7ba8be62e1c558c80a1627f2d1f9d93380b7e87536a1c9",
+      "size": 56
+    }
+  ],
+  "runtime_symbol_count": 14,
+  "runtime_symbols_equal": true,
+  "schema": "pa_lazy_lambda_runtime_identity/v1",
+  "status": "PASS",
+  "variant": "original"
+}

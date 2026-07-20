@@ -1,0 +1,7 @@
+{
+  global:
+    pa_scheduler_0_mix_aic;
+    pa_scheduler_0_mix_aiv;
+  local:
+    *;
+};

@@ -1,0 +1,44 @@
+=== Standalone PA Scheduler Benchmark: CCEC ===
+device=0 batches=1 tasks=5 workers=96 runs=1 nops=129600,157900,79950,2400 state_bytes=1007104896 swimlane=off trace_atomics=off trace_bytes=0
+[WINNER-WORKLOAD] mode=real-compute pattern=constant counts=6,28,4,1 unit=complete_128x128_engine_pipeline_iteration workspace_bytes=12713984
+[PMU-CONFIG] window=off calibration_scalar_nops=100000 icache_trials=64 source=direct-per-core owner=main-aicpu-path-a
+[ASSERT] participant topology is 32 AIC + 64 AIV          PASS
+[ASSERT] all 96 worker markers and private rings are valid PASS
+[ASSERT] all Submit timing markers are valid              PASS
+[ASSERT] started_count is 96                              PASS
+[ASSERT] replay count is workers * tasks                  PASS
+[ASSERT] Claim attempt count matches PA topology          PASS
+[ASSERT] exactly one winner per task                      PASS
+[ASSERT] Alloc/QK/SF/PV/UP winners are one per batch      PASS
+[ASSERT] kernel count is four per batch                   PASS
+[ASSERT] each kernel kind executes once per batch         PASS
+[ASSERT] AIC executes only QK/PV and AIV executes only SF/UP PASS
+[ASSERT] heap guard count matches output winners          PASS
+[ASSERT] fanin ready/failure load classification is complete PASS
+[ASSERT] frontier initial loads match completed tasks     PASS
+[ASSERT] frontier ready/update/terminal load identity is exact PASS
+[ASSERT] completion flags are published once              PASS
+[ASSERT] all task flags are ready                         PASS
+[ASSERT] all published vend values are nonzero and aligned PASS
+[ASSERT] every task vend is within PA worker heap progress bounds PASS
+[ASSERT] frontier reaches the final task                  PASS
+[ASSERT] replay_done is 96                                PASS
+[ASSERT] fatal remains clear                              PASS
+[ASSERT] EfDrain + RingBp + final placement covers every kernel PASS
+[ASSERT] single-lane PA performs no BlockWon polling      PASS
+[ASSERT] every worker replays the exact PA frontend operation counts PASS
+[ASSERT] global PA frontend operation totals are exact    PASS
+[ASSERT] winner-only map, slot-copy, and fanin totals are exact PASS
+[ASSERT] every worker final heap and TensorMap state is exact PASS
+[ASSERT] all frontend registration checksums remain clean PASS
+[ASSERT] all sharded Claim cursors reach their exact final task PASS
+[METRIC] run=1 submit_span_us=73.191 host_launch_us=1079.893 claims=288 fanin_loads=235 cas_retries=0
+[ATOMIC] submit_completion_ops=557 fanin_ready=43 fanin_not_ready=192 frontier_initial=5 frontier_flag=10 frontier_ready_fetch_max=5 frontier_terminal=5
+[WINNERS] active_workers=5 max_wins_per_worker=1
+[PLACEMENT] EfDrain=1 RingBp=0 FinalDrain=3
+[KERNEL] QK count=1 mean_us=42.738 min_us=42.738 max_us=42.738 target_us=44.170
+[KERNEL] SF count=1 mean_us=77.629 min_us=77.629 max_us=77.629 target_us=53.729
+[KERNEL] PV count=1 mean_us=28.522 min_us=28.522 max_us=28.522 target_us=27.626
+[KERNEL] UP count=1 mean_us=2.614 min_us=2.614 max_us=2.614 target_us=1.565
+[ASSERT] real-compute output tiles match role-specific engine results PASS (active_tiles=4 inactive_sentinel_tiles=188)
+[SUMMARY] runs=1 completed_runs=1 median_submit_span_us=73.191 execution_status=PASS semantic_status=PASS postprocess_status=PASS

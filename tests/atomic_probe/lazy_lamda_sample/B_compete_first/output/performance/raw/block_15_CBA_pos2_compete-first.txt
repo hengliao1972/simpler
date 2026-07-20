@@ -1,0 +1,47 @@
+=== Standalone PA Scheduler Benchmark: CCEC ===
+device=0 batches=256 tasks=1280 workers=96 runs=1 nops=129600,157900,79950,2400 state_bytes=1007111040 swimlane=off trace_atomics=off trace_bytes=0
+lazy_sample_shape=compete-first lazy_sample_shape_id=1 observation=split-combination-semantic finish=noinline-cross-tu control_family=all-task-compete-first-callback
+[WINNER-WORKLOAD] mode=real-compute pattern=constant counts=6,28,4,1 unit=complete_128x128_engine_pipeline_iteration workspace_bytes=12713984
+[PMU-CONFIG] window=off calibration_scalar_nops=100000 icache_trials=64 source=direct-per-core owner=main-aicpu-path-a
+[ASSERT] participant topology is 32 AIC + 64 AIV          PASS
+[ASSERT] all 96 worker markers and private rings are valid PASS
+[ASSERT] split caller/finish share one role-specific block-local state and finish every task once PASS
+[ASSERT] all Submit timing markers are valid              PASS
+[ASSERT] started_count is 96                              PASS
+[ASSERT] replay count is workers * tasks                  PASS
+[ASSERT] Claim attempt count matches PA topology          PASS
+[ASSERT] exactly one winner per task                      PASS
+[ASSERT] Alloc/QK/SF/PV/UP winners are one per batch      PASS
+[ASSERT] kernel count is four per batch                   PASS
+[ASSERT] each kernel kind executes once per batch         PASS
+[ASSERT] AIC executes only QK/PV and AIV executes only SF/UP PASS
+[ASSERT] heap guard count matches output winners          PASS
+[ASSERT] fanin ready/failure load classification is complete PASS
+[ASSERT] frontier initial loads match completed tasks     PASS
+[ASSERT] frontier ready/update/terminal load identity is exact PASS
+[ASSERT] completion flags are published once              PASS
+[ASSERT] all task flags are ready                         PASS
+[ASSERT] all published vend values are nonzero and aligned PASS
+[ASSERT] every task vend is within PA worker heap progress bounds PASS
+[ASSERT] frontier reaches the final task                  PASS
+[ASSERT] replay_done is 96                                PASS
+[ASSERT] fatal remains clear                              PASS
+[ASSERT] EfDrain + RingBp + final placement covers every kernel PASS
+[ASSERT] single-lane PA performs no BlockWon polling      PASS
+[ASSERT] every worker replays the exact PA frontend operation counts PASS
+[ASSERT] global PA frontend operation totals are exact    PASS
+[LAZY_SAMPLE_FRONTEND] shape=compete-first views=49152/49152 tensor_args=540672/540672 scalar_args=221184/221184 resets=98304/98304
+[ASSERT] winner-only map, slot-copy, and fanin totals are exact PASS
+[ASSERT] every worker final heap and TensorMap state is exact PASS
+[ASSERT] all frontend registration checksums remain clean PASS
+[ASSERT] all sharded Claim cursors reach their exact final task PASS
+[METRIC] run=1 submit_span_us=3766.289 host_launch_us=4678.773 claims=73728 fanin_loads=26932 cas_retries=0
+[ATOMIC] submit_completion_ops=110970 fanin_ready=3489 fanin_not_ready=23443 frontier_initial=1280 frontier_flag=3363 frontier_ready_fetch_max=2083 frontier_terminal=1280
+[WINNERS] active_workers=96 max_wins_per_worker=30
+[PLACEMENT] EfDrain=998 RingBp=3 FinalDrain=23
+[KERNEL] QK count=256 mean_us=41.503 min_us=40.677 max_us=45.946 target_us=44.170
+[KERNEL] SF count=256 mean_us=53.882 min_us=52.371 max_us=160.846 target_us=53.729
+[KERNEL] PV count=256 mean_us=28.128 min_us=27.025 max_us=60.510 target_us=27.626
+[KERNEL] UP count=256 mean_us=2.626 min_us=2.345 max_us=14.670 target_us=1.565
+[ASSERT] real-compute output tiles match role-specific engine results PASS (active_tiles=189 inactive_sentinel_tiles=3)
+[SUMMARY] runs=1 completed_runs=1 median_submit_span_us=3766.289 execution_status=PASS semantic_status=PASS postprocess_status=PASS
