@@ -53,6 +53,53 @@ PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_aiv_task(int32_t kernel_id, c
     return rt_submit_task(mk, args);
 }
 
+/**
+ * Compete-first eager wrappers.
+ *
+ * `args` is owned by the caller and is deliberately not reset here.  The
+ * callback runs synchronously after EfDrain/Claim and before Finish; neither
+ * the closure nor an internal thunk is retained by the runtime.  Device
+ * orchestration must therefore give its lambda an AICore-callable operator
+ * (for example, append `__aicore__` in a CCEC source).  The callback must not
+ * submit another task or mutate the `MixedKernels` object used by the matching
+ * Begin/Finish pair.
+ */
+template <typename BuildArgs>
+PTO_DEVICE_FUNC inline TaskOutputTensors alloc_tensors_compete_first(L0TaskArgs &args, BuildArgs &&build_args) {
+    if (dist_is_fatal_query()) return TaskOutputTensors{};
+    const DistCompeteFirstTicket ticket = dist_alloc_compete_first_begin(nullptr);
+    if (ticket.ready != 0) build_args(args);
+    return dist_alloc_compete_first_finish(nullptr, ticket, args);
+}
+
+template <typename BuildArgs>
+PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_task_compete_first(
+    const MixedKernels &mixed_kernels, L0TaskArgs &args, BuildArgs &&build_args
+) {
+    if (dist_is_fatal_query()) return TaskOutputTensors{};
+    const DistCompeteFirstTicket ticket = dist_submit_compete_first_begin(nullptr, mixed_kernels);
+    if (ticket.ready != 0) build_args(args);
+    return dist_submit_compete_first_finish(nullptr, mixed_kernels, ticket, args);
+}
+
+template <typename BuildArgs>
+PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_aic_task_compete_first(
+    int32_t kernel_id, L0TaskArgs &args, BuildArgs &&build_args
+) {
+    MixedKernels mk;
+    mk.aic_kernel_id = kernel_id;
+    return rt_submit_task_compete_first(mk, args, static_cast<BuildArgs &&>(build_args));
+}
+
+template <typename BuildArgs>
+PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_aiv_task_compete_first(
+    int32_t kernel_id, L0TaskArgs &args, BuildArgs &&build_args
+) {
+    MixedKernels mk;
+    mk.aiv0_kernel_id = kernel_id;
+    return rt_submit_task_compete_first(mk, args, static_cast<BuildArgs &&>(build_args));
+}
+
 PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_dummy_task(const L0TaskArgs &args) {
     if (dist_is_fatal_query()) return TaskOutputTensors{};
     return dist_submit_dummy_impl(nullptr, args);

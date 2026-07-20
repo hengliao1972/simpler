@@ -353,7 +353,7 @@ struct DistSubmitCtx {
     bool claim_attempted;
 };
 
-PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &args, DistSubmitCtx &ctx) {
+PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, DistSubmitCtx &ctx) {
     ctx.self = self != nullptr ? self : g_self;
     if (ctx.self == nullptr) {
         ctx.task_id = kFlagCap;
@@ -363,8 +363,10 @@ PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &
         ctx.payload = &ctx.self->task_payloads[ctx.task_id & kTaskPayloadMask];
     }
     ctx.result.set_task_id(PTO2TaskId::make(0, static_cast<uint32_t>(ctx.task_id)));
-    ctx.tensor_count = args.tensor_count();
-    ctx.scalar_count = args.scalar_count();
+    // The compete-first Begin deliberately has no L0TaskArgs.  Finish fills
+    // these two counts after the synchronous caller-side argument callback.
+    ctx.tensor_count = 0;
+    ctx.scalar_count = 0;
     ctx.register_mask = 0;
     ctx.output_bytes = 0;
     ctx.fanin_count = 0;
@@ -376,6 +378,12 @@ PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &
     ctx.joint_slot = -1;
     ctx.joint_count = 0;
     ctx.claim_attempted = false;
+}
+
+PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &args, DistSubmitCtx &ctx) {
+    dist_submit_begin(self, ctx);
+    ctx.tensor_count = args.tensor_count();
+    ctx.scalar_count = args.scalar_count();
 }
 
 PTO_DEVICE_FUNC bool dist_submit_check_task_cap(const DistSubmitCtx &ctx, DistSubmitKind kind) {

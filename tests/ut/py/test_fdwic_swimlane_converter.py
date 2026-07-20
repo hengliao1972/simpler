@@ -13,6 +13,7 @@ import json
 import pytest
 
 from simpler_setup.tools.fdwic_swimlane_exclusive_analyzer import analyze_data, write_analysis_data
+from simpler_setup.tools.fdwic_swimlane_schema import validate_and_partition_v4
 from simpler_setup.tools.swimlane_converter import generate_chrome_trace_json, read_perf_data
 
 
@@ -103,10 +104,11 @@ def _v4_rows(num_cores=3):
                 [core_id, block_id, lane, 0, 7, "Submit", 110 + offset, 190 + offset, 1, 0],
                 [core_id, block_id, lane, 0, -1, "EfDrain", 110 + offset, 120 + offset, 0, 0],
                 [core_id, block_id, lane, 99, 7, "Kernel", 112 + offset, 116 + offset, 0, 0],
-                [core_id, block_id, lane, 0, -1, "Materialize", 120 + offset, 130 + offset, 0, 0],
-                [core_id, block_id, lane, 0, -1, "PrepareMap", 130 + offset, 140 + offset, 0, 0],
-                [core_id, block_id, lane, 0, 7, "Claim", 140 + offset, 150 + offset, 3, 0],
-                [core_id, block_id, lane, 0, 7, "Fanin", 150 + offset, 160 + offset, 0, 2],
+                [core_id, block_id, lane, 0, 7, "Claim", 120 + offset, 130 + offset, 3, 0],
+                # The callback builds eager arguments without adding a raw phase.
+                [core_id, block_id, lane, 0, -1, "Materialize", 135 + offset, 145 + offset, 0, 0],
+                [core_id, block_id, lane, 0, -1, "PrepareMap", 145 + offset, 155 + offset, 0, 0],
+                [core_id, block_id, lane, 0, 7, "Fanin", 155 + offset, 160 + offset, 0, 2],
                 [core_id, block_id, lane, 0, 7, "Register", 160 + offset, 170 + offset, 0, 1],
                 [core_id, block_id, lane, 0, 7, "WinnerBuild", 170 + offset, 185 + offset, 0, 0],
                 # DrainWon is real in production and remains a nested overlay.
@@ -115,15 +117,93 @@ def _v4_rows(num_cores=3):
                 # task 1 is deliberately Alloc; kind comes from aux, never task_id modulo arithmetic.
                 [core_id, block_id, lane, 1, -1, "Submit", 200 + offset, 270 + offset, 0, 1],
                 [core_id, block_id, lane, 1, -1, "EfDrain", 200 + offset, 210 + offset, 0, 0],
-                [core_id, block_id, lane, 1, -1, "Materialize", 210 + offset, 220 + offset, 0, 1],
-                [core_id, block_id, lane, 1, -1, "PrepareMap", 220 + offset, 230 + offset, 0, 1],
-                [core_id, block_id, lane, 1, -1, "Register", 230 + offset, 240 + offset, 0, 0],
-                [core_id, block_id, lane, 1, -1, "Claim", 240 + offset, 250 + offset, 2, 1],
+                [core_id, block_id, lane, 1, -1, "Claim", 210 + offset, 220 + offset, 2, 1],
+                # Alloc uses the same Claim-first callback gap as kernel Submit.
+                [core_id, block_id, lane, 1, -1, "Materialize", 225 + offset, 235 + offset, 0, 1],
+                [core_id, block_id, lane, 1, -1, "PrepareMap", 235 + offset, 240 + offset, 0, 1],
+                [core_id, block_id, lane, 1, -1, "Register", 240 + offset, 250 + offset, 0, 0],
                 # Tensor-data waits may execute a kernel between Submit calls in production.
                 [core_id, block_id, lane, 88, 8, "Kernel", 280 + offset, 290 + offset, 0, 0],
                 [core_id, block_id, lane, 77, 9, "Kernel", 310 + offset, 330 + offset, 0, 0],
             ]
         )
+    return rows
+
+
+def _v4_single_path_rows(*, is_alloc, is_winner, claim_first=True, num_cores=3):
+    """Build one Submit per core for an exact path-order contract test."""
+
+    rows = []
+    for core_id in range(num_cores):
+        block_id, lane = divmod(core_id, 3)
+        offset = core_id * 1_000
+        function_id = -1 if is_alloc or not is_winner else 7
+        submit_flags = 1 if is_winner else 0
+        claim_flags = 0x2 | submit_flags
+        rows.extend(
+            [
+                [core_id, block_id, lane, -1, -1, "OrchestrationReplay", 100 + offset, 300 + offset, 0, 0],
+                [core_id, block_id, lane, -1, -1, "FinalDrain", 300 + offset, 340 + offset, 0, 0],
+                [
+                    core_id,
+                    block_id,
+                    lane,
+                    0,
+                    function_id,
+                    "Submit",
+                    110 + offset,
+                    250 + offset,
+                    submit_flags,
+                    int(is_alloc),
+                ],
+            ]
+        )
+
+        cursor = 110
+
+        def add_phase(phase, *, func_id=-1, flags=0, aux=0):
+            nonlocal cursor
+            rows.append(
+                [
+                    core_id,
+                    block_id,
+                    lane,
+                    0,
+                    func_id,
+                    phase,
+                    cursor + offset,
+                    cursor + 10 + offset,
+                    flags,
+                    aux,
+                ]
+            )
+            cursor += 10
+
+        add_phase("EfDrain")
+        if claim_first:
+            add_phase("Claim", func_id=function_id, flags=claim_flags, aux=int(is_alloc))
+            cursor += 5  # Existing Claim/Materialize boundaries expose eager callback work as residual.
+            add_phase("Materialize", aux=int(is_alloc))
+            add_phase("PrepareMap", aux=int(is_alloc))
+        else:
+            # The live one-shot API deliberately retains its original order.
+            add_phase("Materialize", aux=int(is_alloc))
+            add_phase("PrepareMap", aux=int(is_alloc))
+            if is_alloc:
+                add_phase("Register")
+            add_phase("Claim", func_id=function_id, flags=claim_flags, aux=int(is_alloc))
+
+        if not is_alloc:
+            if is_winner:
+                add_phase("Fanin", func_id=function_id, aux=2)
+            add_phase("Register", func_id=function_id, aux=1)
+            add_phase("WinnerBuild" if is_winner else "LoserReplay", func_id=function_id)
+        elif claim_first:
+            add_phase("Register")
+            if is_winner:
+                add_phase("AllocComplete")
+        elif is_winner:
+            add_phase("AllocComplete")
     return rows
 
 
@@ -455,6 +535,74 @@ def test_v1_claim_attempt_requires_contained_claim_max_evidence(tmp_path):
     assert by_name["claim#2"]["args"]["claim_attempted_source"] == "unknown_v1_without_matching_claim_max"
 
 
+@pytest.mark.parametrize(
+    ("is_alloc", "is_winner", "expected_sequence"),
+    [
+        (
+            False,
+            True,
+            ("EfDrain", "Claim", "Materialize", "PrepareMap", "Fanin", "Register", "WinnerBuild"),
+        ),
+        (False, False, ("EfDrain", "Claim", "Materialize", "PrepareMap", "Register", "LoserReplay")),
+        (True, True, ("EfDrain", "Claim", "Materialize", "PrepareMap", "Register", "AllocComplete")),
+        (True, False, ("EfDrain", "Claim", "Materialize", "PrepareMap", "Register")),
+    ],
+)
+def test_v4_accepts_claim_first_submit_paths(tmp_path, is_alloc, is_winner, expected_sequence):
+    capture = _capture(
+        _v4_single_path_rows(is_alloc=is_alloc, is_winner=is_winner),
+        trace_schema_version=4,
+        num_cores=3,
+    )
+    raw_path = tmp_path / f"claim_first_{int(is_alloc)}_{int(is_winner)}.json"
+    raw_path.write_text(json.dumps(capture), encoding="utf-8")
+    data = read_perf_data(raw_path)
+
+    model = validate_and_partition_v4(data["fdwic_events"], data["num_cores"], data["core_types"])
+    assert all(
+        tuple(child.phase for child in core.submits[0].children) == expected_sequence for core in model.cores
+    )
+
+    report = analyze_data(data, raw_path)
+    internal = report["residual_breakdown"]["submit_internal_residual"]
+    assert internal["total_cycles"] == 15
+    assert internal["segments"] == [
+        {
+            "boundary": "Claim->Materialize",
+            "event_count": 3,
+            "cycles": 15,
+            "aic_cycles": 5,
+            "aiv_cycles": 10,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("is_alloc", "expected_sequence"),
+    [
+        (
+            False,
+            ("EfDrain", "Materialize", "PrepareMap", "Claim", "Fanin", "Register", "WinnerBuild"),
+        ),
+        (True, ("EfDrain", "Materialize", "PrepareMap", "Register", "Claim", "AllocComplete")),
+    ],
+    ids=["kernel", "alloc"],
+)
+def test_v4_accepts_live_one_shot_submit_order(tmp_path, is_alloc, expected_sequence):
+    capture = _capture(
+        _v4_single_path_rows(is_alloc=is_alloc, is_winner=True, claim_first=False),
+        trace_schema_version=4,
+        num_cores=3,
+    )
+    raw_path = tmp_path / f"one_shot_order_{int(is_alloc)}.json"
+    raw_path.write_text(json.dumps(capture), encoding="utf-8")
+    data = read_perf_data(raw_path)
+    model = validate_and_partition_v4(data["fdwic_events"], data["num_cores"], data["core_types"])
+    assert all(
+        tuple(child.phase for child in core.submits[0].children) == expected_sequence for core in model.cores
+    )
+
+
 def test_v4_production_hierarchy_generates_thin_events_and_exact_residuals(tmp_path):
     data, events = _convert(tmp_path, _capture(_v4_rows(), trace_schema_version=4, num_cores=3))
 
@@ -472,7 +620,7 @@ def test_v4_production_hierarchy_generates_thin_events_and_exact_residuals(tmp_p
         for event in duration_events
         if event["name"] in {"submit_residual", "submit_tail_gap", "between_submit_residual"}
     ]
-    assert not any(event["name"] == "submit_residual" for event in residuals)
+    assert sum(event["name"] == "submit_residual" for event in residuals) == 6
     assert sum(event["name"] == "submit_tail_gap" for event in residuals) == 6
     assert sum(event["name"] == "between_submit_residual" for event in residuals) == 3
 
@@ -521,6 +669,17 @@ def test_v4_exclusive_report_closes_production_parents_and_kernel_containment(tm
     assert report["aggregate_core_work"]["closure"]["submit_partition"]["exact"] is True
     assert report["aggregate_core_work"]["closure"]["orchestration_replay"]["exact"] is True
     assert report["aggregate_core_work"]["closure"]["final_drain"]["exact"] is True
+    internal = report["residual_breakdown"]["submit_internal_residual"]
+    assert internal["total_cycles"] == 30
+    assert internal["segments"] == [
+        {
+            "boundary": "Claim->Materialize",
+            "event_count": 6,
+            "cycles": 30,
+            "aic_cycles": 10,
+            "aiv_cycles": 20,
+        }
+    ]
     assert report["kernel_containment"]["inside_efdrain_events"] == 3
     assert report["kernel_containment"]["inside_winner_build_events"] == 3
     assert report["kernel_containment"]["inside_orchestration_residual_events"] == 3
@@ -600,7 +759,7 @@ def test_v4_rejects_missing_parent_wrong_tail_and_overlapping_children(tmp_path)
     mutations.append((wrong_tail, "invalid exclusive sequence"))
 
     overlapping = _v4_rows()
-    next(row for row in overlapping if row[0] == 0 and row[5] == "Materialize")[6] = 119
+    next(row for row in overlapping if row[0] == 0 and row[5] == "Materialize")[6] = 129
     mutations.append((overlapping, "overlapping exclusive children"))
 
     for index, (rows, message) in enumerate(mutations):

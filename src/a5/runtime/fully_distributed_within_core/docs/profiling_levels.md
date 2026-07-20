@@ -237,17 +237,25 @@ Bare `--enable-l2-swimlane` = level 4 (backward compatible).
 When FDWIC swimlane collection is enabled, every scalar core records
 two adjacent top-level business windows:
 `OrchestrationReplay` and `FinalDrain`. Each `Submit` inside the first
-window has non-overlapping children with a path-specific order:
+window has non-overlapping children with a path-specific order. Compete-first
+paths use:
 
-- Kernel winner: `EfDrain` → `Materialize` → `PrepareMap` →
-  `Claim` → `Fanin` → `Register` → `WinnerBuild`.
-- Kernel loser: `EfDrain` → `Materialize` → `PrepareMap` →
-  `Claim` → `Register` → `LoserReplay`.
-- Alloc winner: `EfDrain` → `Materialize` → `PrepareMap` →
-  `Register` → `Claim` → `AllocComplete`.
-- Alloc loser: `EfDrain` → `Materialize` → `PrepareMap` →
-  `Register` → `Claim`; its remaining tail is a residual because
+- Kernel winner: `EfDrain` → `Claim` → `Materialize` → `PrepareMap` →
+  `Fanin` → `Register` → `WinnerBuild`.
+- Kernel loser: `EfDrain` → `Claim` → `Materialize` → `PrepareMap` →
+  `Register` → `LoserReplay`.
+- Alloc winner: `EfDrain` → `Claim` → `Materialize` → `PrepareMap` →
+  `Register` → `AllocComplete`.
+- Alloc loser: `EfDrain` → `Claim` → `Materialize` → `PrepareMap` →
+  `Register`; its remaining tail is a residual because
   production performs no loser action there.
+
+The still-supported one-shot APIs keep their original strict order:
+
+- Kernel: `EfDrain` → `Materialize` → `PrepareMap` → `Claim` →
+  optional `Fanin` → `Register` → winner/loser tail.
+- Alloc: `EfDrain` → `Materialize` → `PrepareMap` → `Register` →
+  `Claim` → optional `AllocComplete`.
 
 The `Submit` record encodes winner state in `flags & 1` and task kind
 in `aux`; tooling must not derive either from task-ID patterns.
@@ -257,9 +265,14 @@ phases must not be added to an exclusive parent total.
 
 The Submit window starts after `dist_submit_begin()` and ends before
 the final Submit-record write and API return. Residual time can include
-unmarked control and trace-record publication overhead, so exact closure
-is an integrity property of the instrumented capture rather than proof
-of zero observer effect.
+unmarked control and trace-record publication overhead. In the Claim-first
+path, the existing `Claim.end` to `Materialize.begin` residual includes
+Claim-record publication, synchronous eager callback argument construction,
+and the handoff into the finish path. No callback phase, timestamp, or raw
+field is added. Exact closure is therefore an integrity property of the
+instrumented capture rather than proof of zero observer effect. Schema-v4
+tooling validates both live API families against their exact sequence; it
+does not accept arbitrary phase permutations.
 
 The Python converter validates schema-v4 and emits
 `swimlane_exclusive_analysis.json`, whose integer-cycle closures cover

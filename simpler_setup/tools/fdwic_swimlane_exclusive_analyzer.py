@@ -410,7 +410,9 @@ def analyze_data(  # noqa: PLR0912, PLR0915
             ),
             "submit_residual": "Submit minus its non-overlapping exclusive children",
             "submit_residual_contents": (
-                "unmarked control and trace-record publication overhead; Kernel execution is forbidden"
+                "on compete-first paths, the Claim-to-Materialize gap includes Claim-record publication, synchronous "
+                "eager callback argument construction, and call handoff; one-shot paths retain their Materialize-first "
+                "order; other gaps are unmarked control/record overhead; Kernel execution is forbidden"
             ),
             "orchestration_setup": (
                 "OrchestrationReplay.begin to first Submit.begin; includes setup and first dist_submit_begin"

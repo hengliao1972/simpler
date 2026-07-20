@@ -46,12 +46,63 @@
 
 struct PTO2Runtime;
 
+/**
+ * Fixed-size hand-off between the two synchronous halves of a compete-first
+ * submit.  Begin never retains an argument-builder closure: orchestration
+ * receives this POD, builds its caller-owned L0TaskArgs, then immediately
+ * passes both objects to Finish.
+ *
+ * Byte fields are intentional.  Besides keeping the cross-TU ABI explicit,
+ * they avoid relying on the target compiler's bool layout.  `reserved` must
+ * remain zero and is checked by Finish together with `kind` and the per-core
+ * task sequence.
+ */
+enum class DistCompeteFirstKind : uint8_t {
+    Kernel = 0,
+    Alloc = 1,
+};
+
+struct DistCompeteFirstTicket {
+    uint64_t submit_begin;
+    int32_t task_id;
+    int32_t kernel_id;
+    int32_t joint_block;
+    int32_t joint_count;
+    uint8_t won;
+    uint8_t joint;
+    uint8_t joint_init;
+    uint8_t claim_attempted;
+    uint8_t ready;
+    uint8_t kind;
+    uint16_t reserved;
+};
+
+static_assert(sizeof(DistCompeteFirstTicket) == 32, "compete-first ticket ABI must remain 32 bytes");
+static_assert(offsetof(DistCompeteFirstTicket, submit_begin) == 0, "compete-first timestamp ABI mismatch");
+static_assert(offsetof(DistCompeteFirstTicket, task_id) == 8, "compete-first task ABI mismatch");
+static_assert(offsetof(DistCompeteFirstTicket, won) == 24, "compete-first state ABI mismatch");
+static_assert(offsetof(DistCompeteFirstTicket, reserved) == 30, "compete-first reserved ABI mismatch");
+
 // Task submission and allocation. Host/sim definitions use the per-core g_self
 // stashed by dist_core_main / thread_local sim. CCEC definitions use the same
 // materialize/map/fanin/register stages, then dispatch through the current
 // direct AICore execution backend.
 PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *rt, const MixedKernels &mixed, const L0TaskArgs &args);
 PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *rt, const L0TaskArgs &args);
+
+// Explicit compete-first eager path. Begin performs argument-independent
+// progress and Claim; Finish consumes the synchronously built args. The same
+// MixedKernels object must remain unchanged until Finish returns. The old
+// one-shot APIs above remain available unchanged for all existing examples.
+PTO_DEVICE_FUNC DistCompeteFirstTicket
+dist_submit_compete_first_begin(PTO2Runtime *rt, const MixedKernels &mixed);
+PTO_DEVICE_FUNC TaskOutputTensors dist_submit_compete_first_finish(
+    PTO2Runtime *rt, const MixedKernels &mixed, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args
+);
+PTO_DEVICE_FUNC DistCompeteFirstTicket dist_alloc_compete_first_begin(PTO2Runtime *rt);
+PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_compete_first_finish(
+    PTO2Runtime *rt, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args
+);
 
 // Fatal-state helpers. dist_engine.cpp already exposes fatal_set() /
 // set_fatal(); these are the CCEC-safe wrappers orchestration reaches.

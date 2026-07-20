@@ -82,6 +82,37 @@ Submit、level-4 logical/physical Atomic 公式、ClockBaseline 和
 I-cache 时，普通泳道、atomic wrapper、ClockBaseline 和相关慢体必须在编译期从
 待测 AIC/AIV ELF 中剔除。运行时 gate 只控制“执行没有”，不能控制“代码存在没有”。
 
+### 2.2 Claim-first eager 重编后的观察结论
+
+真实 PA 切换到 compete-first eager 后，Submit 的阶段顺序变为
+`EfDrain -> Claim -> Materialize -> PrepareMap -> Fanin/Register -> 尾阶段`。
+这类热路径重排会同时改变基本块与跨 TU 的代码布局，因此它的性能结论
+应记录在 I-cache 观察指南中，不归因为某个 atomic 本身的收益。
+
+迁移后的 atomic 观察仍包围原位置的真实指令：消费返回值的调用
+继续使用 `return_ready` 边界，不消费返回值的 Exchange/FetchAdd
+继续使用 `source_issue` 边界，PollBatch 的逻辑调用与物理压缩记录口径
+也没有改变。Claim 前移只改变业务阶段顺序，没有把 atomic 记录
+提前、延后或改写成另一种完成语义。
+
+最终真实 A5 level-4 复核位于：
+
+~~~text
+outputs/TestPagedAttentionUnroll_Case1_20260720_104406/
+~~~
+
+该轮包含 122,880 个 Submit、945,653 条事件，`dropped_records=0`。Atomic
+物理记录、逻辑调用、轮询调用和 PollBatch 记录满足：
+
+~~~text
+106355 = 109392 - 3361 + 324
+~~~
+
+raw 转换、阶段顺序和整数闭合均通过，schema 能完整解析
+site/op、`result_used` 与 `return_ready`。这些结果只用于证明热路径
+重排后的观察能力和计数口径仍然正确；该轮没有同时采集专用
+I-cache PMU，不能据此推导 I-cache miss 降幅或某个 atomic 的独立收益。
+
 ## 3. `none` 与局部 phase 如何选择
 
 当前正式支持五个编译期 phase：

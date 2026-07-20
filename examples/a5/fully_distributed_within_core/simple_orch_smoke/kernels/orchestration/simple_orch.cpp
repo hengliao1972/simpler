@@ -37,6 +37,23 @@ __attribute__((visibility("default"), weak)) PTO_DEVICE_FUNC void aicpu_orchestr
     uint64_t mixed = orch_args.scalar(2);
 
     for (uint64_t i = 0; i < n; i++) {
+        if (mixed == 3) {
+            MixedKernels mk;
+            mk.aic_kernel_id = FUNC_MARK_AIC;
+            mk.aiv0_kernel_id = FUNC_MARK_AIV;
+            L0TaskArgs eager_args;
+            rt_submit_task_compete_first(
+                mk, eager_args,
+                [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+                    submit_args.add_input(input);
+                    submit_args.add_inout(output);
+                    submit_args.add_scalar(n);
+                    submit_args.add_scalar(delta);
+                    submit_args.add_scalar(i);
+                }
+            );
+            continue;
+        }
         L0TaskArgs args;
         args.add_input(input);
         args.add_inout(output);

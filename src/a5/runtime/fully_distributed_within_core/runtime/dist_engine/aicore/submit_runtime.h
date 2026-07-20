@@ -249,6 +249,133 @@ PTO_DEVICE_FUNC void dist_submit_complete_alloc(DistSubmitCtx &ctx) {
     }
 }
 
+PTO_DEVICE_FUNC DistCompeteFirstTicket dist_submit_make_ticket(
+    const DistSubmitCtx &ctx, DistSubmitKind kind, uint64_t submit_begin, bool ready
+) {
+    DistCompeteFirstTicket ticket;
+    ticket.submit_begin = submit_begin;
+    ticket.task_id = ctx.task_id;
+    ticket.kernel_id = ctx.kernel_id;
+    ticket.joint_block = ctx.joint_block;
+    ticket.joint_count = ctx.joint_count;
+    ticket.won = static_cast<uint8_t>(ctx.won);
+    ticket.joint = static_cast<uint8_t>(ctx.joint);
+    ticket.joint_init = static_cast<uint8_t>(ctx.joint_init);
+    ticket.claim_attempted = static_cast<uint8_t>(ctx.claim_attempted);
+    ticket.ready = static_cast<uint8_t>(ready);
+    ticket.kind = static_cast<uint8_t>(
+        kind == DistSubmitKind::Alloc ? DistCompeteFirstKind::Alloc : DistCompeteFirstKind::Kernel
+    );
+    ticket.reserved = 0;
+    return ticket;
+}
+
+PTO_DEVICE_FUNC void dist_submit_restore_from_ticket(
+    const DistCompeteFirstTicket &ticket, const L0TaskArgs &args, DistSubmitCtx &ctx
+) {
+    ctx.self = g_self;
+    ctx.task_id = ticket.task_id;
+    ctx.payload =
+        ctx.self != nullptr && ctx.task_id >= 0 && ctx.task_id < kFlagCap ?
+            &ctx.self->task_payloads[ctx.task_id & kTaskPayloadMask] :
+            nullptr;
+    ctx.result.set_task_id(PTO2TaskId::make(0, static_cast<uint32_t>(ctx.task_id)));
+    ctx.tensor_count = args.tensor_count();
+    ctx.scalar_count = args.scalar_count();
+    ctx.register_mask = 0;
+    ctx.output_bytes = 0;
+    ctx.fanin_count = 0;
+    ctx.kernel_id = ticket.kernel_id;
+    ctx.won = ticket.won != 0;
+    ctx.joint = ticket.joint != 0;
+    ctx.joint_init = ticket.joint_init != 0;
+    ctx.joint_block = ticket.joint_block;
+    // Begin cannot reserve a WonSlot because that can block and requires the
+    // materialized task. The winner allocates it later in the existing tail.
+    ctx.joint_slot = -1;
+    ctx.joint_count = ticket.joint_count;
+    ctx.claim_attempted = ticket.claim_attempted != 0;
+}
+
+PTO_DEVICE_FUNC bool dist_submit_validate_ticket(
+    const DistCompeteFirstTicket &ticket, DistSubmitKind expected_kind, const DistSubmitCtx &ctx
+) {
+    const uint8_t expected = static_cast<uint8_t>(
+        expected_kind == DistSubmitKind::Alloc ? DistCompeteFirstKind::Alloc : DistCompeteFirstKind::Kernel
+    );
+    const bool sequence_ok =
+        ctx.self != nullptr && ticket.task_id >= 0 && ticket.task_id < kFlagCap &&
+        ctx.self->local_index == ticket.task_id + 1;
+    const bool fields_ok =
+        ticket.ready != 0 && ticket.kind == expected && ticket.reserved == 0 && ticket.won <= 1 &&
+        ticket.joint <= 1 && ticket.joint_init <= 1 && ticket.claim_attempted <= 1;
+    if (__builtin_expect(sequence_ok && fields_ok, 1)) return true;
+    // A callback must be synchronous and may not submit another task before
+    // its matching Finish. Treat a stale/malformed ticket as a protocol error
+    // instead of reconstructing a context for the wrong per-core payload.
+    fdwic_trace_set_fatal(ticket.task_id);
+    return false;
+}
+
+PTO_DEVICE_FUNC TaskOutputTensors dist_submit_finish_kernel_tail(
+    DistSubmitCtx &ctx, const MixedKernels &mixed, const L0TaskArgs &args, uint64_t tail_begin,
+    uint64_t submit_begin
+) {
+    uint64_t register_begin = tail_begin;
+    if (ctx.won) {
+        ctx.fanin_count = dist_submit_collect_fanin(args, ctx, ctx.fanin);
+        TRACE_TIMESTAMP(fanin_end);
+        TRACE_SPAN_RECORD(
+            tail_begin, fanin_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Fanin, 0,
+            static_cast<uint32_t>(ctx.fanin_count)
+        );
+        register_begin = fanin_end;
+    }
+    dist_submit_register_outputs(ctx, args, /*include_existing=*/true);
+    TRACE_TIMESTAMP(register_end);
+    TRACE_SPAN_RECORD(register_begin, register_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Register, 0, 1);
+    if (__builtin_expect(ctx.won, 0)) {
+        dist_submit_build_winner_task(ctx, mixed, args);
+        TRACE_TIMESTAMP(winner_build_end);
+        TRACE_SPAN_RECORD(
+            register_end, winner_build_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::WinnerBuild, 0, 0
+        );
+    } else {
+        // Production losers perform real BlockWon progress. This is not the
+        // empty loser path used by the standalone single-lane probe.
+        drain_block_won(ctx.self);
+        TRACE_TIMESTAMP(loser_replay_end);
+        TRACE_SPAN_RECORD(
+            register_end, loser_replay_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::LoserReplay, 0, 0
+        );
+    }
+    TRACE_TIMESTAMP(submit_end);
+    TRACE_SPAN_RECORD(
+        submit_begin, submit_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Submit,
+        static_cast<uint32_t>(ctx.won), 0
+    );
+    return ctx.result;
+}
+
+PTO_DEVICE_FUNC TaskOutputTensors
+dist_submit_finish_alloc_tail(DistSubmitCtx &ctx, uint64_t completion_begin, uint64_t submit_begin) {
+    if (__builtin_expect(ctx.won, 0)) {
+        dist_submit_complete_alloc(ctx);
+        TRACE_TIMESTAMP(alloc_complete_end);
+        TRACE_SPAN_RECORD(
+            completion_begin, alloc_complete_end, ctx.self, ctx.task_id, -1, TracePhase::AllocComplete, 0, 0
+        );
+    }
+    // Alloc losers have no corresponding replay action. Their final suffix is
+    // intentionally left as an offline Submit residual, not a fake phase.
+    TRACE_TIMESTAMP(submit_end);
+    TRACE_SPAN_RECORD(
+        submit_begin, submit_end, ctx.self, ctx.task_id, -1, TracePhase::Submit,
+        static_cast<uint32_t>(ctx.won), 1
+    );
+    return ctx.result;
+}
+
 #include "dist_engine/aicore/run_state.h"
 
 PTO_DEVICE_FUNC void dist_submit_drain_to_completion(__gm__ DistCore *self) {
@@ -330,40 +457,7 @@ dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &arg
     const uint32_t claim_flags = (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U);
     TRACE_TIMESTAMP(claim_end);
     TRACE_SPAN_RECORD(claim_begin, claim_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Claim, claim_flags, 0);
-    uint64_t register_begin = claim_end;
-    if (is_winner) {
-        ctx.fanin_count = dist_submit_collect_fanin(args, ctx, ctx.fanin);
-        TRACE_TIMESTAMP(fanin_end);
-        TRACE_SPAN_RECORD(
-            claim_end, fanin_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Fanin, 0,
-            static_cast<uint32_t>(ctx.fanin_count)
-        );
-        register_begin = fanin_end;
-    }
-    dist_submit_register_outputs(ctx, args, /*include_existing=*/true);
-    TRACE_TIMESTAMP(register_end);
-    TRACE_SPAN_RECORD(register_begin, register_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Register, 0, 1);
-    if (__builtin_expect(is_winner, 0)) {
-        dist_submit_build_winner_task(ctx, mixed, args);
-        TRACE_TIMESTAMP(winner_build_end);
-        TRACE_SPAN_RECORD(
-            register_end, winner_build_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::WinnerBuild, 0, 0
-        );
-    } else {
-        // Production losers perform real BlockWon progress. This is not the
-        // empty loser path used by the standalone single-lane probe.
-        drain_block_won(ctx.self);
-        TRACE_TIMESTAMP(loser_replay_end);
-        TRACE_SPAN_RECORD(
-            register_end, loser_replay_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::LoserReplay, 0, 0
-        );
-    }
-    TRACE_TIMESTAMP(submit_end);
-    TRACE_SPAN_RECORD(
-        submit_begin, submit_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Submit,
-        static_cast<uint32_t>(is_winner), 0
-    );
-    return ctx.result;
+    return dist_submit_finish_kernel_tail(ctx, mixed, args, claim_end, submit_begin);
 }
 
 DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
@@ -389,16 +483,84 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
     const uint32_t claim_flags = (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U);
     TRACE_TIMESTAMP(claim_end);
     TRACE_SPAN_RECORD(claim_begin, claim_end, ctx.self, ctx.task_id, -1, TracePhase::Claim, claim_flags, 1);
-    if (__builtin_expect(is_winner, 0)) {
-        dist_submit_complete_alloc(ctx);
-        TRACE_TIMESTAMP(alloc_complete_end);
-        TRACE_SPAN_RECORD(claim_end, alloc_complete_end, ctx.self, ctx.task_id, -1, TracePhase::AllocComplete, 0, 0);
+    return dist_submit_finish_alloc_tail(ctx, claim_end, submit_begin);
+}
+
+DIST_API_ATTR PTO_DEVICE_FUNC DistCompeteFirstTicket
+dist_submit_compete_first_begin(PTO2Runtime *, const MixedKernels &mixed) {
+    const ActiveMask active = mixed.to_active_mask();
+    if (__builtin_popcount(active.core_mask()) >= 2) g_fdwic_joint_submit_seen = true;
+
+    DistSubmitCtx ctx;
+    dist_submit_begin(nullptr, ctx);
+    TRACE_TIMESTAMP(submit_begin);
+    drain_block_won(ctx.self);
+    drain_phase_b(ctx.self);
+    TRACE_TIMESTAMP(efdrain_end);
+    TRACE_SPAN_RECORD(submit_begin, efdrain_end, ctx.self, ctx.task_id, -1, TracePhase::EfDrain, 0, 0);
+
+    const bool ready = dist_submit_check_task_cap(ctx, DistSubmitKind::Kernel);
+    const uint64_t claim_begin = efdrain_end;
+    const bool is_winner = ready && dist_submit_claim(DistSubmitKind::Kernel, &mixed, ctx);
+    const uint32_t claim_flags =
+        (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U);
+    TRACE_TIMESTAMP(claim_end);
+    TRACE_SPAN_RECORD(claim_begin, claim_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Claim, claim_flags, 0);
+    return dist_submit_make_ticket(ctx, DistSubmitKind::Kernel, submit_begin, ready);
+}
+
+DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_compete_first_finish(
+    PTO2Runtime *, const MixedKernels &mixed, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args
+) {
+    DistSubmitCtx ctx;
+    dist_submit_restore_from_ticket(ticket, args, ctx);
+    if (!dist_submit_validate_ticket(ticket, DistSubmitKind::Kernel, ctx)) return ctx.result;
+
+    TRACE_TIMESTAMP(materialize_begin);
+    uint64_t prepare_map_end = materialize_begin;
+    if (!dist_submit_materialize_and_prepare_map(
+            ctx.self, args, ctx, DistSubmitKind::Kernel, materialize_begin, prepare_map_end
+        )) {
+        return ctx.result;
     }
-    // Alloc losers have no corresponding replay action. Their Claim-to-end
-    // suffix remains an offline Submit tail residual instead of a fake phase.
-    TRACE_TIMESTAMP(submit_end);
-    TRACE_SPAN_RECORD(
-        submit_begin, submit_end, ctx.self, ctx.task_id, -1, TracePhase::Submit, static_cast<uint32_t>(is_winner), 1
-    );
-    return ctx.result;
+    return dist_submit_finish_kernel_tail(ctx, mixed, args, prepare_map_end, ticket.submit_begin);
+}
+
+DIST_API_ATTR PTO_DEVICE_FUNC DistCompeteFirstTicket dist_alloc_compete_first_begin(PTO2Runtime *) {
+    DistSubmitCtx ctx;
+    dist_submit_begin(nullptr, ctx);
+    TRACE_TIMESTAMP(submit_begin);
+    drain_block_won(ctx.self);
+    drain_phase_b(ctx.self);
+    TRACE_TIMESTAMP(efdrain_end);
+    TRACE_SPAN_RECORD(submit_begin, efdrain_end, ctx.self, ctx.task_id, -1, TracePhase::EfDrain, 0, 0);
+
+    const bool ready = dist_submit_check_task_cap(ctx, DistSubmitKind::Alloc);
+    const uint64_t claim_begin = efdrain_end;
+    const bool is_winner = ready && dist_submit_claim(DistSubmitKind::Alloc, nullptr, ctx);
+    const uint32_t claim_flags =
+        (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U);
+    TRACE_TIMESTAMP(claim_end);
+    TRACE_SPAN_RECORD(claim_begin, claim_end, ctx.self, ctx.task_id, -1, TracePhase::Claim, claim_flags, 1);
+    return dist_submit_make_ticket(ctx, DistSubmitKind::Alloc, submit_begin, ready);
+}
+
+DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_compete_first_finish(
+    PTO2Runtime *, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args
+) {
+    DistSubmitCtx ctx;
+    dist_submit_restore_from_ticket(ticket, args, ctx);
+    if (!dist_submit_validate_ticket(ticket, DistSubmitKind::Alloc, ctx)) return ctx.result;
+
+    TRACE_TIMESTAMP(materialize_begin);
+    uint64_t prepare_map_end = materialize_begin;
+    if (!dist_submit_materialize_and_prepare_map(
+            ctx.self, args, ctx, DistSubmitKind::Alloc, materialize_begin, prepare_map_end
+        )) {
+        return ctx.result;
+    }
+    dist_submit_register_outputs(ctx, args, /*include_existing=*/false);
+    TRACE_TIMESTAMP(register_end);
+    TRACE_SPAN_RECORD(prepare_map_end, register_end, ctx.self, ctx.task_id, -1, TracePhase::Register, 0, 0);
+    return dist_submit_finish_alloc_tail(ctx, register_end, ticket.submit_begin);
 }

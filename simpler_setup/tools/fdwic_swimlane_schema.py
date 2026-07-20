@@ -206,22 +206,30 @@ def _validate_submit_semantics(partition: SubmitPartition) -> None:  # noqa: PLR
 
     is_winner = bool(submit.flags & 1)
     is_alloc = bool(submit.auxiliary)
-    expected_sequence: list[str]
+    expected_sequences: list[list[str]]
     if is_alloc:
-        expected_sequence = ["EfDrain", "Materialize", "PrepareMap", "Register", "Claim"]
+        compete_first = ["EfDrain", "Claim", "Materialize", "PrepareMap", "Register"]
+        one_shot = ["EfDrain", "Materialize", "PrepareMap", "Register", "Claim"]
         if is_winner:
-            expected_sequence.append("AllocComplete")
+            compete_first.append("AllocComplete")
+            one_shot.append("AllocComplete")
     else:
-        expected_sequence = ["EfDrain", "Materialize", "PrepareMap", "Claim"]
+        compete_first = ["EfDrain", "Claim", "Materialize", "PrepareMap"]
+        one_shot = ["EfDrain", "Materialize", "PrepareMap", "Claim"]
         if is_winner:
-            expected_sequence.append("Fanin")
-        expected_sequence.append("Register")
-        expected_sequence.append("WinnerBuild" if is_winner else "LoserReplay")
+            compete_first.append("Fanin")
+            one_shot.append("Fanin")
+        compete_first.append("Register")
+        one_shot.append("Register")
+        tail = "WinnerBuild" if is_winner else "LoserReplay"
+        compete_first.append(tail)
+        one_shot.append(tail)
+    expected_sequences = [compete_first, one_shot]
     actual_sequence = [child.phase for child in children]
-    if actual_sequence != expected_sequence:
+    if actual_sequence not in expected_sequences:
         raise ValueError(
             f"core {submit.core_id} task {submit.task_id} has invalid exclusive sequence: "
-            f"expected={expected_sequence} actual={actual_sequence}"
+            f"expected_one_of={expected_sequences} actual={actual_sequence}"
         )
 
     claim = next(child for child in children if child.phase == "Claim")

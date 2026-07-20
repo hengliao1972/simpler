@@ -148,7 +148,16 @@ After the test passes, the tool will:
 Validate and summarize the production FDWIC schema-v4 hierarchy using
 raw integer cycles. The accepted Submit sequences follow the production
 Kernel/Alloc and winner/loser paths; task type is read from `Submit.aux`
-and is never inferred from task-ID arithmetic. A Kernel may be nested in
+and is never inferred from task-ID arithmetic. Compete-first paths start with
+`EfDrain -> Claim -> Materialize -> PrepareMap`; a kernel winner then uses
+`Fanin -> Register -> WinnerBuild`, a kernel loser uses
+`Register -> LoserReplay`, an Alloc winner uses
+`Register -> AllocComplete`, and an Alloc loser ends after `Register`.
+The synchronous eager callback that constructs arguments is represented by
+the existing `Claim.end -> Materialize.begin` residual; it adds no raw phase
+or field. The still-supported one-shot APIs retain their strict
+Materialize-first Kernel/Alloc sequences; the validator accepts these two
+live API families but no arbitrary phase permutation. A Kernel may be nested in
 `EfDrain`, `WinnerBuild`, `AllocComplete`, an orchestration residual, or
 FinalDrain. It may not occupy a Submit residual or cross a partition
 boundary.

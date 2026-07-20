@@ -1601,6 +1601,75 @@ outputs/pa_scheduler_swimlane_20260720_092021_1729726/ccec/
 全部快于旧基线的最快一轮 3,825.697 us。该结果证明收益已在
 standalone 主路复现；它不直接承诺 simpler 真实 PA 也有相同比例。
 
+### 6.13 真实 simpler PA 移植验证
+
+2026-07-20 已按 6.12 的 Claim-first eager 语义完成 simpler 真实 PA
+移植。真实路径新增显式的 compete-first begin/finish API，同时保留旧 Submit/
+Alloc API 及其原有顺序，未把尚未验证的新语义强加给其他调用方。begin 返回
+32-byte 同步 ticket，精确保留 finish 重建本次 Submit 所需的 task、kernel、joint
+和 Claim 状态；finish 在同一次同步调用内消费该 ticket，不引入跨 Submit 的隐藏
+共享状态。
+
+与 standalone 一致，本次只改变 Claim 与构参的先后关系，没有采用 lazy
+跳过构参：所有 worker 在 Claim 后仍完整构造参数。真实 PA 当前阶段顺序为：
+
+```text
+EfDrain -> Claim -> 同步 eager callback 完整构参
+        -> Materialize -> PrepareMap
+        -> winner non-Alloc Fanin -> Register
+        -> WinnerBuild / AllocComplete / LoserReplay -> Submit.end
+```
+
+其中 `Claim.end -> Materialize.begin` 继续作为现有边界离线复算出的构参
+residual，不增加设备记录字段。旧 API 仍复用原有 Materialize-first 路径，
+因此新旧调用约定在接口上明确分离。
+
+最终 32-byte ticket 关闭逐 atomic、保留 level-1 阶段观察的真实
+A/B 独立进程结果为：
+
+| 路径 | 三轮首末 Submit | 中位数 |
+| --- | --- | ---: |
+| compete-first 最终版 | 4.843652 / 4.809211 / 4.805443 ms | 4.809211 ms |
+| 6.7 原路径基线 | 4.821897 / 4.890447 / 4.752956 ms | 4.821897 ms |
+
+最终版三轮分别位于 `outputs/TestPagedAttentionUnroll_Case1_20260720_095456/`、
+`..._095724/` 和 `..._095929/`；原路径三轮的产物编号已在 6.7 列出。
+
+最终版相对原路径中位数减少 12.686 us，约 0.263%，两组三轮的波动
+区间重叠。因此真实 PA 没有复现 standalone 的 3.9635% 收益，但也没有
+证据表明存在性能回退；该结果按当前测量精度应视为性能基本持平，不能
+包装成真实 PA 稳定收益。
+
+迁移中还逐步验证了更小 ticket 的可行性。16-byte 按值 ticket 的三轮为
+5.055142/4.994567/4.949788 ms，同时段独立 worktree 原路径为
+4.972963/5.026234/4.842937 ms；中位数反向差 21.604 us（+0.434%）且波动
+重叠，不能证明缩小 ticket 有益。显式 pointer ticket 又出现首份 5.331474 ms 样本，
+因此不再继续堆叠该方向，并完整撤回两个过程态。最终保留 32-byte 精确
+ticket，避免为追求结构尺寸而引入不可证明的状态重建或跨调用生命周期约束。
+
+最终真实 A5 level-4 权威产物为：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260720_104406/
+```
+
+该轮包含 122,880 个 Submit、945,653 条事件，`dropped_records=0`，全局首末
+Submit 为 5.066862 ms。父子关系、阶段顺序、排他整数分区和 atomic 计数等全部
+闭合门禁通过；`Claim -> Materialize` 构参 residual 为 46,260,081 cycles，
+占 SubmitUnion 的 11.5536%。Atomic 物理记录与逻辑调用闭合为：
+
+```text
+106355 = 109392 - 3361 + 324
+```
+
+这份 level-4 结果证明 Claim-first 后的真实布局、观察边界和离线加工一致；它不
+改变前述 A/B 结论，也不把带观察运行的 5.066862 ms 当成关闭观察后的净收益。
+最终 A5Sim PA 也在 `outputs/TestPagedAttentionUnroll_Case1_20260720_104649/`
+通过：108 核、每核 1,280 个 Submit、1,422,842 条事件、`dropped_records=0`，
+全部整数闭合通过。另外用现有 simple-orch smoke 补了 AIC+AIV0 joint
+compete-first 分支；`outputs/TestSimpleOrchSmoke_A5SimBd36CompeteFirstMixedDelta47_20260720_105945/`
+包含 108 核、每核 3 个 Submit、4,950 条事件，同样 `dropped_records=0` 且全部闭合通过。
+
 ## 结论
 
 历史 schema-v3 泳道不闭合的根因不是缺少一次 duration 求和，而是
@@ -1618,8 +1687,9 @@ compete-first eager 移植后的 CCEC A5 b1 重新验证。Submit 内部当前�
 当前 b1 带观察的 aggregate 分布中，Claim、Materialize、同步构参
 residual、Register 和 EfDrain 是主要区域；泳道仍只能给出完整观察窗口，
 不能独立分出纯业务、Atomic、I-cache、GM stall 与 DFX 记录成本。
-关闭泳道的五轮 b256 已证明 standalone 主路收益可复现；下一步是按
-同一 compete-first eager 语义移植到 simpler 真实 PA，并在真实路径重新完成
-正确性、泳道闭合和性能 A/B，不直接套用 standalone 收益比例。
+关闭泳道的五轮 b256 已证明 standalone 主路收益可复现；同一语义移植到
+simpler 真实 PA 后，阶段顺序、记录完整性和闭合门禁均已通过，但三轮 A/B
+只显示约 0.263% 的正向中位数差且波动重叠。当前应保留其更清晰的业务布局，
+同时把真实性能结论限定为基本持平，不直接套用 standalone 收益比例。
 
-[pa-orch]: ../../st/a5/tensormap_and_ringbuffer/paged_attention_unroll/kernels/orchestration/paged_attention_orch.cpp
+[pa-orch]: ../../../examples/a5/fully_distributed_within_core/paged_attention_unroll/kernels/orchestration/paged_attention_orch.cpp
