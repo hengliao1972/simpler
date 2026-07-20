@@ -1,0 +1,993 @@
+# A5 PA Submit 性能优化全过程记录
+
+## 1. 文档目的与状态约定
+
+本文持续记录 A5 FDWIC Paged Attention `Case1` 的 Submit 调度性能优化过程。
+**当前性能优化目标只包含真实 simpler PA 路径**；
+`tests/atomic_probe/pa_scheduler` standalone 只保留为已经完成的历史方法验证、
+负结果和模型边界证据，不再作为当前待办或下一阶段优化对象。目标是让后续真实
+PA 优化能够从可复核的源码、提交、实测数据和产物继续推进，而不是仅保留最终
+结论。
+
+本文使用以下状态标签：
+
+| 标签 | 含义 |
+| --- | --- |
+| **[已保留]** | 已进入当前代码路径，并完成与风险相称的正确性和性能验证 |
+| **[已撤回]** | 做过实现或实验，但因语义不成立、性能回退或证据不足而不再保留 |
+| **[观察工具]** | 用于建立测量能力，本身不是业务性能优化 |
+| **[历史证据]** | 对当时源码和构建有效，不能自动代表当前 HEAD |
+| **[受限]** | 已确认存在平台、模型或验证覆盖边界 |
+| **[设计中]** | 只有经过源码核对的方案，尚无完成提交或性能结论 |
+
+记录更新至 2026-07-20。创建本文时的分支为
+`fdwic-swimlane-exclusive`，HEAD 为 `2899cc35`，跟踪
+`origin/fdwic-swimlane-deps`。后续每完成一个合理阶段，都应按第 12 节模板更新
+本文并形成一条带详细中文说明的本地提交。
+
+更细的专题资料分别见：
+
+- [A5 FDWIC Paged Attention 安装与复现指南](a5_fdwic_atomic_swimlane_repo.md)；
+- [PA 原子操作与优化记录](pa_scheduler/PA-atomic情况分析.md)；
+- [PA 调度器独立复现与泳道使用指南](pa_scheduler/PA调度器独立复现与泳道使用指南.md)；
+- [FDWIC 泳道排他分区与闭合分析](pa_scheduler/swimlane_opt_anal.md)；
+- [I-cache Miss 采集与分析指南](icache_miss_usage_guide.md)。
+
+## 2. 固定范围、环境与权威性能口径
+
+### 2.1 本轮范围
+
+- 真实用例：
+  `examples/a5/fully_distributed_within_core/paged_attention_unroll/test_paged_attention_unroll.py`；
+- Case：`Case1`；
+- runtime：`fully_distributed_within_core`；
+- 平台：A5Sim 用于功能和控制流回归，真实 A5 用于性能结论；
+- A5 工作核：32 个 AIC、64 个 AIV，共 96 个 worker；
+- 工作量：256 batch，每 batch 依次包含 Alloc、QK、SF、PV、UP 五个 task；
+- 每核 Submit：`256 * 5 = 1280`，全局 Submit：`96 * 1280 = 122880`。
+
+本文不把其他 runtime、其他 PA Case、A2/A3、整段 pytest wall time 或整个 device
+任务耗时混入 Submit 性能结论。
+
+### 2.2 已验证环境
+
+| 项目 | 固定值 |
+| --- | --- |
+| 设备 | `/dev/davinci0`，Ascend950PR_958b |
+| Driver | `7.0.t9.0.B798`，ascendhal `7.35.23` |
+| CANN | 用户目录下 9.1.0 weekly 20260708 |
+| CCEC | clang 15.0.5 |
+| Python | `/home/q00473782/.venv`，Python 3.12.3 |
+| PyTorch | 2.6.0+cpu |
+| pytest | 7.4.4 |
+| GCC 15 | `/home/q00473782/.local/gcc-15/root`，15.0.1 |
+| PTO-ISA | `ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8` |
+
+非交互 shell 不能假设自动读取 `.bashrc`。正式复测应显式 source 用户 CANN，
+激活本用户 `.venv`，并显式设置用户 GCC 15 的 `PATH`、`LD_LIBRARY_PATH` 和
+`CXX`。完整命令以安装复现指南为准。
+
+### 2.3 权威性能定义
+
+本文所说的“完整 Submit 时间”默认指：
+
+```text
+全部 worker 中最早的第一个 Submit 开始
+    到
+全部 worker 中最晚的最后一个 Submit 结束
+```
+
+它排除启动屏障和 FinalDrain，不等于 pytest wall time，也不等于整个 kernel
+launch 的 device wall time。必须同时区分三类时间：
+
+1. **跨核完整 Submit 时间**：上述约 5 ms 的全局墙钟范围，是候选是否保留的最终
+   性能口径；
+2. **逐核或全核累计工作量**：某个 span 在 96 核上的时长求和，用于描述工作分布，
+   不是 96 核共同形成的墙钟；
+3. **PMU total/core**：每个物理子核 PMU gate 内的周期数，是单核周期工作量，
+   也不是跨核完整 Submit 时间。
+
+泳道原始时间使用 1 ns/tick 的 `SYS_CNT`。本机 cold/warm 校准得到 PMU 频率约
+1.65 cycles/ns：ALL/AIC/AIV 分别为 1.649844/1.650062/1.649731。PMU cycle
+换算不能反过来改变 `SYS_CNT` 的 1 ns/tick 定义。
+
+## 3. 起始基线
+
+### 3.1 环境打通与 5.6 ms 基线
+
+**[已保留] `657313c9` — `fix(a5): enable paged attention on legacy drivers`**
+
+该提交完成 A5 平台 block 数解析和经过双重校验的 flat OCCUPY 回退，使当前旧
+Driver 环境能够运行目标 PA。A5Sim 和 A5 Case1 均通过，真实 A5 level-1
+泳道复现的首末 Submit 为 **5.642245 ms**；仓库更早的历史参考为
+5.577570 ms。
+
+基线产物：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260717_023809/
+  merged_swimlane_atomic_load.json
+  l2_swimlane_records.json
+```
+
+这是第一轮业务优化的比较起点，不代表后续加入观察代码后的 ELF。
+
+## 4. 提交时间线与阶段结论
+
+下表按当前分支中的逻辑推进顺序列出与本轮工作直接相关的提交。详细证据和适用
+边界见后续各节；纯文档重命名没有单独列项。
+
+| 日期 | 提交 | 类型 | 阶段摘要 |
+| --- | --- | --- | --- |
+| 2026-07-17 | `657313c9` | 正确性基础 | 打通旧 Driver 上的 A5 PA |
+| 2026-07-17 | `ce89fae2` | 编译探针 | 建立嵌套 lambda 与跨 TU 基线 |
+| 2026-07-17 | `e3b748b4` | 真实 PA 优化 | 跳过 BlockWon 无效轮询并复用参数 mask |
+| 2026-07-17 | `a3f5ecc2` | 编译探针 | 隔离 inline/noinline Submit 边界 |
+| 2026-07-17 | `290dbda0` | standalone | 建立 CCEC/AscendC/CPU 独立 PA 模型 |
+| 2026-07-18 | `76df85ce` | 观察工具 | 隔离验证 atomic 与 I-cache PMU 归类 |
+| 2026-07-18 | `04ec9b95` | 真实 PA/standalone 优化 | HeapGuard 首圈跳过冗余 atomic load |
+| 2026-07-18 | `3d174a08` | 负结果 | 记录并撤回 fanin 顺序实验 |
+| 2026-07-18 | `3d0aaea7` | 观察工具 | 建立 standalone 每核 scalar PMU |
+| 2026-07-18 | `67407cc4` | 观察工具 | 细分 fanin/frontier 动态 atomic 次数 |
+| 2026-07-18 | `8deefdef` | 观察工具 | 修正 PMU owner 活跃子核与恢复闭环 |
+| 2026-07-18 | `13431a23` | 观察工具 | 建立 standalone 逐 atomic 泳道 |
+| 2026-07-18 | `c93bd65d` | 观察工具 | 接通 standalone 自包含 PMU owner |
+| 2026-07-18 | `640efe50` | 观察工具 | 建立单次 I-cache miss 标尺 |
+| 2026-07-18 | `99971ac1` | 观察工具 | 建立 standalone Submit 全区间 PMU |
+| 2026-07-18 | `c6daaeb7` | 文档证据 | 固化当时 atomic/PMU 观察口径 |
+| 2026-07-18 | `5274945b` | 合并 | 吸纳 I-cache miss 标尺改动 |
+| 2026-07-18 | `e66001ff` | standalone | CCEC 接入真实 Cube/Vector 负载 |
+| 2026-07-18 | `9aeda0dd` | standalone | AscendC 接入真实 Cube/Vector 负载 |
+| 2026-07-18 | `1d3a374a` | standalone | CPU 补齐对等算术负载 |
+| 2026-07-18 | `0c9cebc3` | standalone | 增加非均匀布局诊断 |
+| 2026-07-18 | `7bb118a8` | standalone | 默认切换为 `real-compute/6,28,4,1` |
+| 2026-07-18 | `cbaf7c60` | 观察工具 | 真实 PA 接入 atomic/PollBatch 泳道 |
+| 2026-07-18 | `44199a54` | 观察工具 | 固化 96 核 I-cache 分组分析 |
+| 2026-07-18 | `187e54bc` | 观察工具 | 完善 standalone atomic 合并泳道 |
+| 2026-07-18 | `5c2d39b8` | 观察工具 | 拆分 standalone `swimlane/submit-pmu` 构建 |
+| 2026-07-18 | `8430f418` | 观察工具 | 增加历史 EfDrain 局部 PMU |
+| 2026-07-19 | `7466e6f5` | 观察工具 | 完善局部 PMU、HTML 并退役 WaitForSlot phase |
+| 2026-07-19 | `6caa269c` | 观察工具 | 收敛 standalone 排他 span 与分析器 |
+| 2026-07-19 | `d2d8ce25` | standalone 优化 | 将低频 winner 调整为冷分支 |
+| 2026-07-19 | `cafa9ca5` | 真实 PA 优化 | 恢复真实 PA loser 热路布局 |
+| 2026-07-19 | `44367971` | 观察代码优化 | 外提 atomic 冷路径，消除取指布局回退 |
+| 2026-07-19 | `14c2429f` | 文档证据 | 分离 atomic 与 I-cache 专题记录 |
+| 2026-07-19 | `dbb95bb5` | 观察工具 | 将排他泳道迁入真实 FDWIC |
+| 2026-07-19 | `911ecf9a` | 文档证据 | 固化排他 span 和性能分布分析 |
+| 2026-07-20 | `ba4334d1` | 独立对照 | 交付 A/B/C compete-first/lazy 对照 |
+| 2026-07-20 | `0d08c437` | standalone 优化 | 主路采用 compete-first eager |
+| 2026-07-20 | `2899cc35` | 真实 PA 重构 | 接入 compete-first eager begin/finish |
+
+### 4.1 真实 PA 第一轮 atomic 与前端优化
+
+#### 4.1.1 跳过单 lane 图无效 BlockWon 轮询并复用参数掩码
+
+**[已保留] `e3b748b4` — `Update: 优化 A5 FDWIC Submit 热路径`**
+
+该阶段包含两类改动：
+
+1. 在本 worker 第一次见到 joint submit 之前，跳过无意义的 BlockWon 轮询；
+2. 复用一次 tensor tag 扫描生成的 output/register mask，减少重复前端扫描。
+
+PA Case1 全部 task 都是单 lane，因此第一项确定删除 Submit 内 **146944 次**
+无效 `atomic_load(any_pub)`；A5 上该封装实际为 `atomicAdd(addr, 0)`，并非普通
+load。删除位置主要落在每次 Submit 开头的 EfDrain 和高频 loser 的公共尾部，
+没有删除 Claim。
+
+实测结果：
+
+| 版本 | 首末 Submit |
+| --- | ---: |
+| 初始基线 | 5.642245 ms |
+| joint polling skip 三轮中位数 | 5.171330 ms |
+| 加 register mask 三轮中位数 | 5.186679 ms |
+| 加 output/register masks 三轮中位数 | **5.115620 ms** |
+
+最终相对初始基线减少 **0.526625 ms，约 9.33%**；最好单轮为
+**5.096685 ms**。kernel 累计时长没有随之缩短，证据支持收益来自调度前端，
+而不是计算 kernel 变快。
+
+最终最好产物：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260717_055638/
+  merged_swimlane_best_joint_poll_skip_arg_masks_5.096685ms.json
+```
+
+mask 的独立收益只有三轮方向性证据，不能从组合版本中严格拆出因果比例；当前保留
+的是经过整体正确性回归的组合改动。
+
+#### 4.1.2 用普通 load 和 NOP 替换 atomic 的定位实验
+
+**[已撤回] 未形成保留提交**
+
+为确认 `atomic_load` 的成本量级，曾临时替换为 `ld_dev()+nop(100)` 和
+`ld_dev()+nop(10)`：
+
+| 诊断变体 | 首末 Submit | 产物 |
+| --- | ---: | --- |
+| `ld_dev()+nop(100)` | 5.343592 ms | `outputs/TestPagedAttentionUnroll_Case1_20260717_035341/merged_swimlane_nop100.json` |
+| `ld_dev()+nop(10)` | 5.401034 ms | `outputs/TestPagedAttentionUnroll_Case1_20260717_035954/merged_swimlane_nop10.json` |
+
+普通 device load 加固定 NOP 不具备 atomic RMW 的同步、可见性和顺序语义，
+因此这些样本只用于定位成本，源码修改已经撤回，不能作为可用优化方案。
+
+#### 4.1.3 HeapGuard 首圈 fast path
+
+**[已保留] `04ec9b95` — `perf(a5): 跳过HeapGuard首圈冗余原子读取`**
+
+历史文档也使用同内容提交号 `2c3dd1e2`；当前分支可达 hash 为
+`04ec9b95`。默认 256 MiB heap 下，逻辑 heap 尚未走完第一圈时不可能覆盖旧输出，
+因此在原 fatal 检查之内直接返回，不读取 frontier/vend。PA Case1 的 Alloc、QK、
+SF、PV 共确定消减 **1024 次 frontier atomic load**；跨圈 slow path 保持原协议。
+
+真实 A5 十对结果：
+
+| 指标 | 基线 | H1 | 相对变化 |
+| --- | ---: | ---: | ---: |
+| 中位数 | 5.142168 ms | 5.122320 ms | -0.386% |
+| 均值 | 5.167064 ms | 5.146984 ms | -0.389% |
+| p90 | 5.274224 ms | 5.229773 ms | -0.843% |
+
+十对中 8 胜 2 负，配对变化中位数为 **-0.324%**。因此只能称为“确定减少
+atomic，真实 PA 中心趋势小幅正向”，不能把 standalone 的大幅波动外推到真实
+PA。最好样本为 5.098696 ms：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260717_173313/
+  merged_swimlane_heapguard_first_lap_fastpath_5.098696ms.json
+```
+
+#### 4.1.4 fanin 检查顺序实验
+
+**[已撤回] `3d174a08` — `文档(a5): 记录fanin顺序实验与回退结论`**
+
+F1 在 standalone 中把有效 fanin producer 按 task id 降序排列。静态分析证明固定
+调度状态下不会增加 ready load，实测 fanin load 也下降；但十对交错 A/B 中：
+
+```text
+Submit 中位数：4290.401 -> 4623.944 us，+7.774%
+Submit 配对变化中位数：+6.439%
+```
+
+fanin load 减少没有转化为 Submit 收益，说明指令布局和 worker 到达时序的间接
+变化不能忽略。候选代码已撤回，未迁移到真实 FDWIC。
+
+### 4.2 standalone 建立与动态 atomic 取证
+
+#### 4.2.1 建立三后端独立 PA 模型
+
+**[观察工具] `290dbda0` — `test(a5): 增加独立 PA 调度性能复现用例`**
+
+在 `tests/atomic_probe/pa_scheduler` 下建立 CCEC、AscendC、CPU 三后端，保留
+Case1 五 task 拓扑、96 worker 回放、四分片 Claim、TensorMap、fanin、私有 ring、
+WaitForSlot、HeapGuard、completion flag/vend/frontier 和最终 drain。此时 winner
+计算仍以可控 NOP 为主，目标首先是闭合调度协议与 atomic 次数。
+
+`ce89fae2` 和 `a3f5ecc2` 还建立了嵌套 lambda、跨 TU caller context 和 inline/
+noinline 边界探针。这些是后续拆分 callback/finish 时的编译行为依据，不是 PA
+本身的性能收益。
+
+#### 4.2.2 HeapGuard 对等修改与压力回归
+
+**[已保留] `04ec9b95` 同时修改 standalone 与真实 PA**
+
+standalone 默认 256 MiB 配置、16 MiB 多圈压力和恢复默认值后的三后端回归均经过
+语义检查。16 MiB CCEC/AscendC b256 确实进入 slow path；CPU b256 在 fast 版和
+临时撤销 fast path 的原版中都超过观察时限，不能记为 H1 PASS 或 FAIL，详见
+第 9 节。
+
+#### 4.2.3 fanin/frontier 软件计数
+
+**[观察工具] `67407cc4` — `测试(a5): 细分PA依赖与frontier原子计数`**
+
+计数只写 worker 私有 `LocalStats`，结束时一次发布，不增加共享 atomic。b256
+十轮动态基线为：
+
+| 指标 | 中位数 |
+| --- | ---: |
+| fanin 总 load | 93201.5 |
+| fanin not-ready load | 86675.5 |
+| frontier FetchMax | 15365 |
+| Submit+completion atomic ops | 203803.5 |
+
+该结果确认主要动态项是 not-ready 重试和 frontier helping，而不是 ready 前缀。
+软件计数扩大了 sidecar 并增加私有 scalar 增量，因此这一版的绝对 Submit 时间不能
+与无计数 ELF 直接归因比较。原始日志：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/atomic_diagnostics/
+  ccec_baseline_10_20260718_023551.log
+```
+
+### 4.3 scalar、atomic 与 I-cache 观察工具
+
+以下提交建立证据链，但不应被写成业务性能优化：
+
+| 提交 | 状态 | 主要内容 |
+| --- | --- | --- |
+| `76df85ce` | [观察工具] | 用隔离 probe 验证 atomic 与 I-cache 等待周期的 PMU 归类 |
+| `3d0aaea7` | [观察工具] | 在 standalone 建立每核 scalar PMU 读取链路 |
+| `8deefdef` | [观察工具] | 修正 PMU owner 的活跃物理子核配置和恢复闭环 |
+| `c93bd65d` | [观察工具] | 接入自包含 Main AICPU Path-A owner，保存、配置并恢复 32 AIC+64 AIV 状态 |
+| `13431a23` | [观察工具] | 给 standalone 增加逐 atomic 泳道、调用点和边界语义 |
+| `640efe50` | [观察工具] | 建立隔离 cold/warm 单次 I-cache miss 一阶标尺 |
+| `99971ac1` | [观察工具] | 建立每核完整 Submit PMU gate 和 PMU-only JSON |
+| `c6daaeb7` | [历史证据] | 固化当时 atomic 与 Submit PMU 的边界和使用限制 |
+| `5274945b` | [观察工具] | 合并单次 I-cache miss 标尺相关改动 |
+| `44199a54` | [观察工具] | 固化 96 核 raw 复算、AIC/AIV 分组和多轮分析口径 |
+| `187e54bc` | [观察工具] | 合并普通阶段与 atomic 泳道，并用 PollBatch 压缩等待轮询 |
+| `5c2d39b8` | [观察工具] | 将 `swimlane` 与 `submit-pmu` 拆成独立重编译产物 |
+| `8430f418` | [观察工具] | 增加历史 EfDrain 局部 PMU 归因 |
+| `7466e6f5` | [观察工具] | 增加 Materialize/Register、HTML 报告，退役 WaitForSlot 局部 PMU |
+
+#### 4.3.1 atomic 时间边界
+
+逐 atomic 观察不插入 DSB，也不强制原本不消费返回值的 Exchange/FetchAdd 变成
+等待返回型操作：
+
+- 真正消费返回值的 FetchMax、claim exchange 使用 `return_ready`；CCEC 通过
+  返回值地址依赖后再读取 `SYS_CNT`，尽力使结束点晚于返回值可用；
+- 不消费返回值的 Exchange/FetchAdd 使用 `source_issue`，只表示源码发射包围区间，
+  不能解释成 atomic 已在全局完成；
+- PollBatch 表示一个等待区间内多次逻辑轮询的整体时间和精确调用数，不能把其
+  duration 除成单次 atomic latency。
+
+#### 4.3.2 PMU owner 的响应校准
+
+自包含 owner 的 empty、100000 scalar NOP、2×100000 scalar NOP 三组，96 核
+PMU total 中位数约为 214、56568、112994 cycles。这只证明 gate 响应和工作量
+近似倍增，不表示同数值的纳秒，也不是 PA Submit 基线。
+
+#### 4.3.3 单次 I-cache miss 标尺
+
+隔离微基准的结果为：
+
+| 规模 | ALL 中位数 | 轮间范围 |
+| --- | ---: | ---: |
+| 64 trials/core × 10 轮 | 86.596 ns/miss | 86.532～86.792 |
+| 128 trials/core × 5 轮 | 89.629 ns/miss | 89.615～89.648 |
+
+统一使用 **90 ns/miss** 作为单核串行等效的一阶感性标尺。它不是实际 Submit
+墙钟损失，不能把 `miss * 90 ns` 从约 5 ms 中直接减掉。
+
+### 4.4 standalone winner 负载迁移到真实 Cube/Vector
+
+| 提交 | 状态 | 主要内容 |
+| --- | --- | --- |
+| `e66001ff` | [已保留] | CCEC QK/PV 接入真实 Cube matmul，SF/UP 接入真实 Vector add/mul |
+| `9aeda0dd` | [已保留] | AscendC 接入对等 Cube/Vector 负载并修正布局 |
+| `1d3a374a` | [已保留] | CPU 增加对等算术和统一路由，用于功能对照 |
+| `0c9cebc3` | [已保留] | 增加非均匀输入，验证转置、ND/NZ、stride 和输出布局 |
+| `7bb118a8` | [已保留] | 三后端默认切到 `real-compute/6,28,4,1`，NOP 只保留显式兼容入口 |
+
+最终同泳道口径下，standalone CCEC b256 五轮为：
+
+```text
+5.002413 / 4.875193 / 4.968894 / 4.992477 / 4.876282 ms
+中位数 4.968894 ms
+```
+
+当时真实 PA 三轮中位数为 5.115620 ms，同口径差 146.726 us，约 2.87%。
+这说明 standalone 达到“独立复现约 5 ms 调度”的目标，不证明两份实现的代码布局、
+数据流和跨核时序完全一致。历史 raw：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/performance_gap_20260718/
+  standalone_ccec_real_b256_raw.json
+```
+
+### 4.5 真实 PA atomic 泳道与 PollBatch
+
+**[观察工具] `cbaf7c60` — `工具(a5): 接通真实PA atomic泳道与精确轮询聚合`**
+
+该提交把 standalone 验证过的边界迁入真实 FDWIC，schema-v3 使用 32 B 紧凑
+record、28 个稳定 site 和五类 atomic op，并只在允许的等待区聚合 PollBatch。
+当时真实 A5 PA Case1 level-4 通过：
+
+```text
+115200 次逻辑 atomic
+110006 条物理 Atomic
+340 条 PollBatch
+dropped_records = 0
+```
+
+逻辑调用、物理记录和 PollBatch 必须满足 producer 定义的闭合公式。level-4
+结果用于观察 atomic 分布，不能替代关闭诊断后的性能基线。
+
+### 4.6 schema-v4 排他 span 与 raw 规模控制
+
+#### 4.6.1 standalone 排他 span
+
+**[观察工具] `6caa269c` — `工具(a5): 收敛Submit观测边界与排他泳道分析`**
+
+主要变化：
+
+- 增加 OrchestrationReplay、FinalDrain 等父区间；
+- 旧 Build/Replay/Alloc lap 改为真实 WinnerBuild/AllocComplete 尾动作；
+- standalone loser 没有真实计算动作，不再为 121600 个 loser 生成伪
+  `LoserReplay` record；
+- Submit 内和 Submit 间未覆盖时间由 converter/analyzer 使用已有边界离线求差，
+  不增加设备 record、字段或时间戳；
+- merged 只保留 Perfetto 必需字段，raw 仍是权威数据；
+- Kernel 必须唯一落入 EfDrain、WinnerBuild、AllocComplete 或 FinalDrain，越界、
+  多重归属、孤儿 Kernel 或 dropped 非零都拒绝结果。
+
+阶段性 b256：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_swimlane_20260719_114815_617346/ccec/
+```
+
+该轮首末 Submit 为 5.360061 ms，raw 839526 条、`dropped=0`；raw/merged
+分别约 55.79/88.78 MB，全部父子关系和整数闭合通过。
+
+#### 4.6.2 standalone winner 冷分支
+
+**[已保留] `d2d8ce25` — `优化(a5): 将低频winner调整为冷分支`**
+
+每个 task 只有一个 winner，绝大多数 worker 都走 loser。给 Alloc 和普通 Submit
+的重型 winner 分支增加低概率布局提示，不移动边界、不改变协议。b256 同观察口径：
+
+| 指标 | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| 全局首末 Submit | 5.360061 ms | 5.278401 ms | -1.52% |
+| Submit 尾部未覆盖时间 | 41008786 cycles | 27155661 cycles | -33.78% |
+| 完整逐核 Submit 区间累计 | 500448909 cycles | 483335683 cycles | -3.42% |
+
+关闭泳道后又做候选—基线—候选 ABA，每组五轮：候选中位数分别为
+3.665017/3.715385 ms，基线为 3.988115 ms，分别快 8.10%/6.84%。同时记录
+了 `.text` 体积增长，避免只看速度不看取指代价。候选泳道：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_swimlane_20260719_123520_660296/ccec/
+```
+
+#### 4.6.3 真实 PA loser 热路布局恢复
+
+**[已保留] `cafa9ca5` — `优化(a5): 恢复真实PA的loser热路布局`**
+
+真实 PA 对等标记两处低频 winner 分支。当前 atomic 观察版基线三轮中位数从
+5.631038 ms 降为 5.192087 ms，减少 0.438951 ms，约 7.80%。但历史
+pre-atomic 中位数已经是 5.115620 ms，因此这一步的准确含义是：
+
+> 恢复 atomic 观察代码接入后发生的热路布局回退，而不是在旧 5.1 ms 基线上
+> 新增 7.8% 业务收益。
+
+#### 4.6.4 外提 atomic 观察冷路径
+
+**[已保留] `44367971` — `优化(a5): 外提atomic泳道冷路径消除取指回退`**
+
+分两步推进：
+
+1. 将 direct Atomic 的 record 发布外提为设备端共享 `noinline` 冷函数，保留
+   `begin -> atomic -> end` 在原 wrapper；三轮中位数为 5.096506 ms；
+2. 保留 PollBatch 的内联 level 快速门，只把 level-4 命中后的十类遍历和落盘
+   外提到共享 slow 函数。
+
+最终代码尺寸变化：
+
+| 产物 | winner 冷路后 | atomic 冷路径外提后 |
+| --- | ---: | ---: |
+| AIC/AIV `dist_engine .text` | 347536 / 357112 B | 66768 / 67120 B |
+| AIC/AIV `dist_submit_impl` | 100860 / 103676 B | 18812 / 18872 B |
+
+真实 A5 level-1 正式三轮：
+
+```text
+4.821897 / 4.890447 / 4.752956 ms
+中位数 4.821897 ms
+```
+
+相对 5.192087 ms 再下降 7.13%。该结论只能归为“消除未执行诊断代码的大量复制和
+热路布局回退”；当时没有同时采集专用 I-cache PMU，不能继续写成确定的 miss
+降幅。
+
+level-4 能力复核：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260719_135629/
+
+Atomic 物理记录闭合：107608 = 115309 - 8056 + 355
+dropped_records = 0
+```
+
+`14c2429f` 随后把 I-cache、代码布局和 PMU 经验集中到 I-cache 指南，PA atomic
+文档只保留 atomic 语义、次数和边界。
+
+#### 4.6.5 排他泳道迁入真实 FDWIC
+
+**[观察工具] `dbb95bb5` — `Support: 将 Submit 排他泳道分析移植到 FDWIC`**
+
+真实路径获得与 standalone 同类的父区间、真实尾动作、离线未覆盖时间和整数闭合
+分析，Atomic、Kernel 等 overlay 不参与排他加和。`911ecf9a` 进一步固定各 span 的
+业务含义、AIC/AIV 分布和全核工作量与墙钟末端的区别。
+
+### 4.7 compete-first eager
+
+#### 4.7.1 A/B/C 三份独立 standalone 对照
+
+**[历史证据] `ba4334d1` — `验证(pa): 交付 compete-first/lazy 三版独立对照`**
+
+三版分别为：
+
+- A：原始 Materialize-first、Submit 外 eager 构参；
+- B：EfDrain、Claim 前移，全体 worker 在 Claim 后同步 eager 构造完整参数；
+- C：与 B 相同控制流，仅让 loser 跳过 input/scalar thunk。
+
+72 次独立 host 启动中 A/B/C 各 24 个样本，均通过语义与后处理门禁。去异常的
+相邻配对结果：
+
+| 比较 | 配对变化 | 结论 |
+| --- | ---: | --- |
+| B 相对 A | -206.270 us，-5.214% | 22/22 有效块更快；收益是 compete-first、split/outlining 与布局的组合 |
+| C 相对 B | +1.503 us，+0.040% | 双方各 11/22；低于 5% 门槛，不支持 lazy 收益或回退 |
+
+因此只推进 B 的 compete-first eager，不把 C 的 lazy 视为优化，也没有为 C 启动
+I-cache PMU 对比。
+
+#### 4.7.2 standalone 主路采用 compete-first eager
+
+**[已保留] `0d08c437` — `优化(pa): standalone采用compete-first eager提交流程`**
+
+当前时间线变为：
+
+```text
+EfDrain -> Claim -> 同步 eager callback 构参
+        -> Materialize -> PrepareMap
+        -> Fanin/Register -> WinnerBuild或AllocComplete -> Submit结束
+```
+
+Claim 与 Materialize 之间的构参时间使用现有边界离线求差，不新增 raw 字段。
+关闭泳道的 b256 五轮中位数从 3889.180 us 降到 3735.032 us，减少
+154.148 us，约 **3.9635%**。这证明收益在 standalone 主路复现，不承诺真实
+PA 有同一比例。
+
+compete-first 移植阶段的 standalone b1 历史布局证据：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_swimlane_20260720_092021_1729726/ccec/
+    l2_swimlane_records.json
+    merged_swimlane.json
+    swimlane_exclusive_analysis.json
+```
+
+#### 4.7.3 真实 PA 接入 compete-first eager
+
+**[已保留] `2899cc35` — `重构(pa): 真实路径接入compete-first eager提交流程`**
+
+真实路径新增显式 begin/finish API 和 32 B 同步 ticket，同时保留旧 one-shot API
+及原顺序，未把新语义强加给其他调用方。所有 worker 在 Claim 后仍完整构参，未采用
+lazy 跳过。
+
+真实 A5 level-1 三轮：
+
+| 路径 | 三轮 | 中位数 |
+| --- | --- | ---: |
+| compete-first 最终版 | 4.843652 / 4.809211 / 4.805443 ms | 4.809211 ms |
+| 原路径历史基线 | 4.821897 / 4.890447 / 4.752956 ms | 4.821897 ms |
+
+中位数减少 12.686 us，约 0.263%，两组三轮波动区间重叠。因此当前结论是
+**真实性能基本持平**，不是稳定的 0.263% 收益。保留该接口是因为阶段顺序和业务
+边界更清晰，并为后续精确取证提供基础。
+
+真实 level-4 权威件：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260720_104406/
+  l2_swimlane_records.json
+  merged_swimlane.json
+```
+
+该轮包含 122880 个 Submit、945653 条事件、`dropped_records=0`，首末 Submit
+为 5.066862 ms；atomic 闭合为：
+
+```text
+106355 = 109392 - 3361 + 324
+```
+
+它证明 compete-first 后的阶段、atomic 和离线加工一致，不是关闭观察后的净性能
+样本。
+
+## 5. 当前保留优化汇总
+
+| 优化 | 真实 PA 状态 | 当前可成立的效果结论 |
+| --- | --- | --- |
+| 首个 joint 前跳过 BlockWon 轮询 | [已保留] | PA 单 lane Case1 确定删除 146944 次无效 RMW；与参数 mask 的组合将 5.642245 ms 降至 5.115620 ms 中位数 |
+| output/register mask 复用 | [已保留] | 组合结果正向；独立收益只具方向性，不作精确拆分 |
+| HeapGuard 首圈 fast path | [已保留] | 确定删除 1024 次 frontier atomic load；真实十对配对中位 -0.324% |
+| 低频 winner 冷分支 | [已保留] | 主要恢复 atomic 观察接入后的 loser 热路布局回退 |
+| atomic record/PollBatch 冷路径外提 | [已保留] | 大幅缩小热函数和 `.text`，level-1 三轮中位恢复到 4.821897 ms，同时保持 level-4 闭合 |
+| compete-first eager begin/finish | [已保留] | standalone -3.9635%；真实 PA 三轮只能判为基本持平 |
+
+这些结果来自不同历史阶段，不能把表中百分比相加得到“总收益”。当前真实路径已经
+同时包含这些改动，后续基线必须从当前 HEAD 重新建立。
+
+## 6. 当前观察能力
+
+### 6.1 真实 PA `swimlane`：业务 span 与 atomic 合并观察
+
+**[观察工具，已具备]**
+
+- 普通业务阶段和 Atomic/PollBatch 位于同一 AIC/AIV scalar lane；
+- schema-v4 以父区间和互斥子区间闭合，Kernel、Atomic 是不可加和 overlay；
+- residual/未覆盖时间由离线工具使用已有相邻边界计算，不新增设备 record；
+- raw 是权威数据，merged 只负责 Perfetto 可视化，exclusive analysis 负责整数闭合；
+- `dropped_records != 0`、父子越界、Kernel 孤儿或 atomic 公式不闭合时，整轮无效。
+
+`swimlane` 用于回答“时间落在哪个业务区域、atomic 调用次数和边界是否改变”，
+不作为无观察性能基线，也不直接给出 I-cache stall。
+
+### 6.2 standalone `submit-pmu`：历史能力
+
+**[观察工具，历史版本已具备；不是当前待办]**
+
+现有历史版本能在独立 CCEC ELF 中编译掉泳道和逐 atomic 记录，采集每物理子核
+PMU total、scalar busy、I-cache request/miss，并生成 96 核 raw 和自包含 HTML。
+历史 `none/claim/efdrain/materialize/register` 数据只对当时边界和各自 ELF 有效。
+
+历史 b256 `none` 一轮记录：
+
+| 指标 | AIC 每核 | AIV 每核 |
+| --- | ---: | ---: |
+| request | 408317.344 | 422480.609 |
+| miss | 38664.344 | 55098.625 |
+| 加权 miss/request | 9.4692% | 13.0417% |
+| PMU total 等效时间 | 4527.942 us | 4294.748 us |
+| scalar busy 等效时间 | 3602.744 us | 3396.667 us |
+
+历史产物：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  submit_pmu_none_20260719_b256_final/
+    submit_icache_raw.json
+    submit_icache_report.html
+```
+
+该目录可能不在当前机器保留，且从不随 Git 提交。上述数据只用于说明已经验证过的
+PMU owner、逐核 raw、AIC/AIV 分组和 HTML 方法，不是当前重采 standalone 的要求，
+也不能把旧绝对值当成真实 PA 数据。当前工作只在真实 PA 上按当前 compete-first
+代码和最新真实 span 建立新证据。
+
+### 6.3 A5 当前不可获得的 `scalar_wait_ib_time`
+
+**[受限]**
+
+在本机 CANN 9.1、A5/DAV3510 上分别尝试 `PipeUtilization`、
+`PipeUtilization,MemoryDetail` 和 `Default` 三种正式 `msopprof` 入口，生成的
+CSV 和 A5 正式事件表均没有 `scalar_wait_ib_time` 或
+`scalar_wait_time`。当前不能套用 A2/A3 的事件号或字段含义。
+
+对应历史目录：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/wait_ib_official_msopprof_20260719_b1_probe2/
+tests/atomic_probe/pa_scheduler/outputs/wait_ib_official_msopprof_20260719_b1_probe3_memory_detail/
+tests/atomic_probe/pa_scheduler/outputs/wait_ib_official_msopprof_20260719_b1_probe4_default/
+```
+
+因此 `PMU total - scalar_busy` 只能叫“非 Scalar-busy 残余”，不能命名为 scalar
+空闲、wait vector 或 I-cache stall。
+
+## 7. standalone 历史证据与真实 PA 的边界
+
+**[历史证据，不是当前待办]**
+
+standalone 已完成其方法验证职责：证明多后端调度模型、真 Cube/Vector 负载、
+atomic 泳道、PMU owner、I-cache 标尺和排他区间工具可以工作。当前不再继续优化、
+扩充或重采 standalone；下列对等关系只用于解释为什么历史经验可以作为真实 PA
+实施时的参考，以及哪些结论绝不能外推。
+
+### 7.1 已对等部分
+
+- 256 batch、Alloc/QK/SF/PV/UP 五 task 拓扑；
+- 32 AIC + 64 AIV、每核完整回放 1280 次 Submit；
+- 四分片 Claim 和固定 73728 次 Claim atomicMax；
+- TaskArgs、Tensor、TaskPayload、DistSubmitCtx 的关键布局和 tag 扫描；
+- TensorMap materialize、retire、lookup、insert、register mask；
+- fanin、winner/loser、私有 ring slot、WaitForSlot、HeapGuard；
+- completion flag、vend、frontier 和最终 drain；
+- QK/PV 真 Cube、SF/UP 真 Vector 的受控计算工作量；
+- 普通阶段、Atomic/PollBatch、Kernel placement 和最终状态闭合。
+
+依赖不是按 task 名硬编码跳过：SF 依赖 QK，PV 依赖 SF，UP 去重后依赖 Alloc、
+SF、PV；每 batch fanin 边数为 5，b256 全局为 1280。
+
+### 7.2 尚未对等部分
+
+- 真计算 workspace 使用统一受控输入，数值没有按真实 QK→SF→PV→UP 数据流串接；
+- 该历史模型只覆盖 Case1 单 block group、`q_loop=1` 和全单-lane 图；
+- joint/mixed、多 group、多 q-loop 和跨迭代更新没有被完整模拟；
+- synthetic heap、独立 ELF 布局和 host 启动状态与真实 simpler 不同；
+- Kernel span 包含 engine launch/completion wait wrapper，不等于纯 Cube/Vector 指令时间；
+- standalone 没有真实 PA 的 loser replay 业务动作，不应为追求图形对称而伪造该 span。
+
+历史推进中，standalone 曾用于先验证接口、边界、计数、控制协议和候选方向，再迁
+真实 PA 做同构正确性与性能 A/B；它的收益比例始终不能直接外推。当前这些方法能力
+已经完成验证，后续真实 PA 三证据链不再把新增 standalone 实现或复测设为前置门禁。
+
+## 8. 当前真实 PA 的三条互不混算证据链
+
+### 8.1 `perf-clock`
+
+**[设计中，尚未形成提交和性能结论]**
+
+目标是建立权威无诊断性能基线：
+
+- 编译期去除普通泳道、逐 atomic 观察和 PMU；
+- 每核只保留第一个 Submit 的起点、最后一个 Submit 的终点和必要计数；
+- 不为每个 Submit 写 record；
+- 用相同源码和 ELF 形状做独立进程、交错顺序 A/B；
+- 候选保留或撤回最终由该构建决定。
+
+当前还没有可引用的 perf-clock commit、A5 数据或产物。不得把已有
+`--no-swimlane`、level-1 或 submit-pmu 样本改名为 perf-clock 结论。
+
+### 8.2 `swimlane`
+
+**[观察工具，当前已具备]**
+
+保留普通阶段和 atomic 合并泳道，用于回答：
+
+- 收益或回退可能落在哪个业务 span；
+- atomic 逻辑调用、物理记录和 PollBatch 是否变化；
+- Kernel 落点、父子区间、逐核 task 连续性和记录容量是否正常。
+
+它不决定候选的净性能，不与 perf-clock 的绝对时间相减。
+
+### 8.3 `submit-pmu-none` 与真实 span 单阶段 PMU
+
+**[真实 PA 设计中，尚未形成提交和性能结论]**
+
+当前目标不是继续修改 standalone，而是给真实 PA 建立独立诊断构建。该构建应在
+编译期去除普通泳道和 atomic 观察，分为两种运行方式：
+
+1. **`submit-pmu-none`**：每物理子核在完整 Submit 调度期只 start/stop 一次，
+   不做中途 shadow read-clear；输出 96 核 PMU total、scalar busy、I-cache
+   request/miss，并按 AIC/AIV 生成 raw 与 HTML；
+2. **真实 span 单阶段 PMU**：一次 ELF 只选择一个当前真实泳道区域做局部累计，
+   仍同时保留本 ELF 自己的完整 Submit primary，局部只与本 ELF、本轮、本角色的
+   primary 和时间分母比较。
+
+单阶段 selector 必须直接跟随当前真实 PA compete-first 泳道和离线排他定义，候选
+区域包括：
+
+```text
+efdrain              包含 opportunistic drain 中的 Kernel
+efdrain-control      EfDrain 去除其中 Kernel 后的排他控制区域
+claim
+arg-build            Claim.end 到 Materialize.begin 的同步 eager 构参
+materialize
+prepare-map
+fanin
+register
+winner-build
+alloc-complete
+loser-replay         真实 PA loser 的实际尾动作
+submit-finalize      最后业务 child 到本次 Submit.end 的公共收尾
+submit-transition    相邻 Submit 之间的输出接收、下一任务准备与调用衔接
+kernel               真实计算区间 overlay
+```
+
+以上只是根据真实源码和最新泳道语义形成的 selector 设计清单，不表示全部区域已经
+实现。`efdrain` 包含 `kernel`，而 `efdrain-control` 是去除 Kernel 后的排他控制，
+三者不能相加。`kernel` 也是 overlay；`submit-finalize` 和
+`submit-transition` 应复用现有真实边界，不为方便取数继续扩大泳道 raw。每个局部
+selector 必须独立编译、独立运行、独立发布，不能在一个 ELF 中同时打开多段。
+
+目前真实 PA 的 `submit-pmu-none` 和单阶段 PMU 都没有最终提交、A5 raw、HTML
+或性能结论。standalone 历史实现只提供 owner、门禁和报告加工方法参考，不是该阶段
+的前置优化任务，也不能作为真实结果代替品。
+
+三条证据链最终分工为：
+
+| 构建 | 回答的问题 | 不能回答的问题 |
+| --- | --- | --- |
+| `perf-clock` | 候选是否真正缩短完整 Submit 墙钟 | 具体业务区域和 PMU 原因 |
+| `swimlane` | 业务区域、atomic 次数、时序与闭合 | 无观察净性能、I-cache miss |
+| `submit-pmu-none` / 单阶段 PMU | AIC/AIV 每核 total/scalar/request/miss，以及一个真实 span 的同 ELF 比例 | 跨 ELF 净阶段成本、最终墙钟收益 |
+
+还应单独比较一次 perf-clock 与诊断构建的完整时间，量出保留观察能力的剩余代价；
+若差距已经很小，不继续为了观察代码做无目标的冷路径调整。
+
+## 9. 已撤回、失败或不能外推的路线
+
+### 9.1 已撤回的优化候选
+
+| 路线 | 结果 | 决定 |
+| --- | --- | --- |
+| `ld_dev()+nop10/100` 替换 atomic | 性能用于定位，但同步语义不成立 | 撤回，不得作为优化 |
+| fanin producer 降序 | fanin load 下降，Submit 中位反而 +7.774% | 撤回，不迁真实 PA |
+| compete-first lazy C 版 | 相对 eager B 为 +0.040%，各 11/22 胜 | 不进入主路，不做 PMU |
+| 16 B compete-first ticket | 相对同时段基线中位反向约 +0.434%，波动重叠 | 撤回 |
+| pointer ticket | 首份真实 PA 样本 5.331474 ms，且引入生命周期约束 | 撤回 |
+| standalone 伪 LoserReplay | loser 没有真实动作，却显著扩大 raw | 删除，改为离线未覆盖时间 |
+
+仓库历史中没有可追溯的 `fanin-prefix` 提交或源码痕迹；该未提交过程态已经按要求
+去除，本文不为它杜撰 hash、数据或收益。
+
+### 9.2 正确性或平台验证的已知缺口
+
+- standalone 16 MiB tiny-ring 的 CPU b256，H1 与临时恢复原实现都在观察窗口内
+  未结束；只能认定模型存在既有长程活性或 host 调度问题，不能把它记为 H1 的
+  PASS/FAIL；
+- MB6 `Normal` 因当前 runtime 没有测试期望的 DEPSIG 而失败；
+- MB6 `Heavy` 在 H1 和基线中走同一调用路径 abort，不能归因于 H1，也不能记 PASS；
+- `FullCore36` 在 Heavy 基线失败后未继续运行；
+- 上述缺口没有通过顺手修改测试契约或生产协议来掩盖。
+
+### 9.3 被证明不适合的观察路线
+
+- external task-based `msprof` 的 raw counter 不受 kernel 内 start/stop 缩窗控制，
+  不能用于 Claim、EfDrain 等局部取数；
+- A5 上把 I-cache miss selector `0x35` 复制到 CNT9 时计数恒为 0，因此现行
+  shadow miss 使用 CNT5，并明确牺牲诊断 ELF 的 MTE3 busy；
+- A5 CANN 9.1 没有 `scalar_wait_ib_time` 的正式事件或派生字段；
+- 只在运行时把泳道 level 设为 0/1，不能移除 ELF 中的冷诊断代码和布局污染；
+- 旧 runtime cache 不理解新增 phase 时曾只生成 Kernel/Alloc 名称，该轮已排除，
+  不能作为有效基线；
+- running phase 的 PMU read-clear 会改变布局和时序，不能将局部 ELF 与 `none`
+  相减得到无扰动净时间。
+
+## 10. 本机证据产物索引
+
+### 10.1 重要说明
+
+`outputs/` 已被 Git 忽略。下列路径是本机采集证据索引，不属于源码提交，也不保证
+fresh clone、其他 worktree 或后续清理后仍存在。文档中的数值必须与对应历史
+commit 和采集配置一起理解，不能因为文件名存在就当作当前 HEAD 结果。
+
+### 10.2 真实 PA
+
+| 阶段 | 路径 | 主要用途 |
+| --- | --- | --- |
+| 初始 atomic-load 基线 | `outputs/TestPagedAttentionUnroll_Case1_20260717_023809/merged_swimlane_atomic_load.json` | 5.642245 ms 起点 |
+| NOP100 诊断 | `outputs/TestPagedAttentionUnroll_Case1_20260717_035341/merged_swimlane_nop100.json` | atomic 成本定位，已撤回 |
+| NOP10 诊断 | `outputs/TestPagedAttentionUnroll_Case1_20260717_035954/merged_swimlane_nop10.json` | atomic 成本定位，已撤回 |
+| 第一轮最好结果 | `outputs/TestPagedAttentionUnroll_Case1_20260717_055638/merged_swimlane_best_joint_poll_skip_arg_masks_5.096685ms.json` | joint skip + masks |
+| H1 最好结果 | `outputs/TestPagedAttentionUnroll_Case1_20260717_173313/merged_swimlane_heapguard_first_lap_fastpath_5.098696ms.json` | HeapGuard 首圈 fast path |
+| winner 冷路完整泳道 | `outputs/TestPagedAttentionUnroll_Case1_20260719_131116/merged_swimlane.json` | 恢复 atomic 观察接入后的布局 |
+| atomic 冷路径 level-4 | `outputs/TestPagedAttentionUnroll_Case1_20260719_135629/` | Atomic/PollBatch/ClockBaseline 闭合 |
+| compete-first level-1 三轮 | `outputs/TestPagedAttentionUnroll_Case1_20260720_095456/`、`..._095724/`、`..._095929/` | 真实路径三轮 A/B |
+| compete-first level-4 | `outputs/TestPagedAttentionUnroll_Case1_20260720_104406/merged_swimlane.json` | 当前真实布局、阶段与 atomic 闭合 |
+| compete-first A5Sim | `outputs/TestPagedAttentionUnroll_Case1_20260720_104649/` | 108 核模拟回归 |
+
+### 10.3 standalone
+
+| 阶段 | 路径 | 主要用途 |
+| --- | --- | --- |
+| D1 dynamic atomic | `tests/atomic_probe/pa_scheduler/outputs/atomic_diagnostics/ccec_baseline_10_20260718_023551.log` | fanin/frontier 次数分布 |
+| 历史 schema-v3 b256 | `tests/atomic_probe/pa_scheduler/outputs/pa_scheduler_swimlane_20260718_182725_4061524/ccec/` | atomic 合并泳道 5.774295 ms |
+| 约 5 ms 对等样本 | `tests/atomic_probe/pa_scheduler/outputs/performance_gap_20260718/standalone_ccec_real_b256_raw.json` | 真计算同泳道比较 |
+| schema-v4 b256 | `tests/atomic_probe/pa_scheduler/outputs/pa_scheduler_swimlane_20260719_114815_617346/ccec/` | 排他边界、raw 规模和整数闭合 |
+| winner 冷分支 | `tests/atomic_probe/pa_scheduler/outputs/pa_scheduler_swimlane_20260719_123520_660296/ccec/` | 尾部下降和 b256 门禁 |
+| compete-first b1 | `tests/atomic_probe/pa_scheduler/outputs/pa_scheduler_swimlane_20260720_092021_1729726/ccec/` | 当前 standalone 业务布局 |
+| 历史 submit-pmu none | `tests/atomic_probe/pa_scheduler/outputs/submit_pmu_none_20260719_b256_final/` | 96 核 I-cache raw/HTML |
+| 历史五 phase PMU | `tests/atomic_probe/pa_scheduler/outputs/submit_pmu_phase_time_v5_20260719/` | 旧边界同 ELF 比例，仅作历史 |
+| 单 miss 标尺 | `tests/atomic_probe/pa_scheduler/outputs/pmu_validation/icache_single_64x10_20260718_085929_3232836_console.log`、`icache_single_128x5_20260718_090151_3235468_console.log` | 90 ns/miss 一阶标尺 |
+
+## 11. 禁止混算和过度解释
+
+1. **不同 ELF 不相减。** `perf-clock`、`swimlane`、不同 selector 的
+   `submit-pmu` 都会改变代码布局；绝对时间不能机械相减。
+2. **不同观察 level 不混用。** level-4 atomic 泳道、level-1 phase 泳道和
+   `--no-swimlane` 不是同一性能口径。
+3. **跨核墙钟不等于累计工作量。** 96 核 span 求和、每核 PMU mean 和最早到最晚
+   Submit 都是不同量。
+4. **PMU cycle 不等于 SYS_CNT tick。** 前者约 1.65 cycles/ns，后者 1 ns/tick。
+5. **局部 phase 只能在本 ELF 内解释。** phase 时间、request、miss 只能除以同一
+   进程、同一角色、同一 ELF 的完整区间；不同 phase 不相加，不与 `none` 相减。
+6. **Atomic 边界按语义解释。** `return_ready` 不是全系统可见性屏障；
+   `source_issue` 更不能解释为完成延迟。PollBatch 是等待区间，不是单次 atomic。
+7. **90 ns/miss 不是墙钟损失。** `miss * 90 ns` 只给单核串行等效数量级；多核、
+   预取、流水和等待会重叠。
+8. **`total - scalar_busy` 不是 scalar 空闲。** 它还可能包含 I-cache refill、
+   atomic 等待、Vector/Cube engine 等待和其他非 scalar-busy 周期。
+9. **standalone 收益不外推真实 PA。** standalone compete-first 为 -3.9635%，
+   真实 PA 只有波动重叠的 -0.263%，当前真实结论是基本持平。
+10. **b1 与 b256 分工不同。** b1 用于结构、边界、调用次数和快速正确性门禁；
+    b256 只在阶段性收口时用于规模和性能结论。
+11. **不同 schema 的同名区域不直接相加。** schema-v2/v3 的 Build/Replay lap
+    与 schema-v4 的排他尾动作定义不同。
+12. **观察构建不能冒充净性能。** 带观察的 5.066862、5.278401、5.774295 ms
+    都只能解释对应观察 ELF。
+13. **中位数差不能脱离样本波动。** 三轮区间重叠时应写“基本持平”，不能只取
+    小数点后的正向差宣布收益。
+14. **固定次数与动态次数要分开。** Claim、H1 消减等可由拓扑推出；fanin retry、
+    frontier helping 和 barrier poll 必须以动态记录为准。
+
+## 12. 后续阶段更新与提交模板
+
+每个合理阶段只验证一个主要变量。完成该阶段的源码、正确性门禁、性能取数和本文
+记录后，再形成一条详细中文提交；不得把多个无法拆因果的候选堆进同一个性能结论。
+
+建议复制以下模板：
+
+```markdown
+### YYYY-MM-DD / 阶段代号：简短名称
+
+状态：[设计中|观察工具|已保留|已撤回|受限]
+
+目标：
+- 要回答的唯一问题；
+- 预期影响的现有 span 或计数。
+
+源码与构建身份：
+- 基线 commit：
+- 候选 commit/工作树：
+- 分支：
+- 构建类型：perf-clock / swimlane / submit-pmu-<selector>；
+- AIC/AIV ELF 或 manifest 身份：
+
+单变量改动：
+- 修改文件和代码语义；
+- 明确未改变的协议、边界和 ABI。
+
+环境与命令：
+- CANN/PTO-ISA/GCC/Python；
+- A5Sim/A5；
+- batch、负载、观察 level、runs、timeout；
+- A/B 顺序和预热规则。
+
+正确性门禁：
+- 语义/golden；
+- 96 核、每核 Submit、task 连续性；
+- winner、fanin、TensorMap、heap、frontier、placement；
+- dropped、父子区间、atomic 或 PMU 闭合。
+
+性能结果：
+- 全部原始样本；
+- 中心值、范围、timeout/失败数；
+- 同构 A/B 变化；
+- 不能解释的波动。
+
+辅助观察：
+- swimlane 变化；
+- atomic 逻辑/物理次数；
+- PMU total/scalar/request/miss；
+- `.text` 和关键符号尺寸。
+
+本机产物：
+- raw：
+- merged/HTML/analysis：
+- 日志：
+
+决定：
+- 保留、撤回或继续取证；
+- 结论适用范围；
+- 未关闭风险。
+
+提交：
+- hash：
+- 中文主题：
+- 详细正文摘要：
+```
+
+### 12.1 当前下一阶段：只推进真实 simpler PA
+
+当前只进入真实 PA 观察基础设施阶段，不继续修改 standalone，也不立即猜测新的
+业务优化：
+
+1. **[设计中] 真实 PA `perf-clock`**：建立编译期无泳道、无 atomic、无 PMU 的
+   权威计时构建；先验证精确的首 Submit 起点、末 Submit 终点和每核调用数，再以
+   它承担后续候选的交错 A/B，形成第一条独立详细提交；
+2. **[观察工具，已有基础] 真实 PA `swimlane`**：普通业务 span 与 atomic 合并
+   采集，继续复用当前父子、overlay、记录容量和整数闭合门禁；只用于定位业务区域
+   和 atomic 变化，不与 perf-clock 绝对时间相减；如需为三证据链补构建隔离或身份
+   门禁，单独形成提交；
+3. **[设计中] 真实 PA `submit-pmu-none`**：编译期去除泳道和 atomic，每核完整
+   Submit 期只开关 PMU 一次，先闭合 96 核 primary、owner Restore、AIC/AIV raw
+   和 HTML，形成独立详细提交；
+4. **[设计中] 真实 PA 单阶段 PMU**：`none` 闭合后，再按第 8.3 节的最新真实 span
+   一次只实现和验证一个 selector；不同 selector 分别编译、分别采集，不在同一
+   提交中批量铺开，也不依赖新的 standalone 实现；
+5. 结构和边界迭代先使用最小有效真实 PA 用例完成正确性门禁；只有构建身份、容量、
+   业务边界和统计闭合后，才运行完整 Case1 b256 性能样本，避免反复生成数百 MiB
+   profiling 文件。
+
+在以上真实 PA 三条证据链完成前，不从当前飘动的 I-cache 数据直接提出新的生产
+优化，也不用 standalone 的绝对数替代真实 PA 的当前干净基线。
