@@ -791,7 +791,7 @@ inline bool AnalyzeSwimlaneRecords(
     // 第一组数组统计“每个 worker 在某阶段的累计时间”；task_durations 则保留重点阶段的单事件分布。
     constexpr uint32_t kTracePhaseCount = static_cast<uint32_t>(TracePhase::Count);
     constexpr TracePhase kDetailedPhases[] = {
-        TracePhase::EfDrain, TracePhase::Materialize, TracePhase::Claim, TracePhase::Register,
+        TracePhase::EfDrain, TracePhase::Claim, TracePhase::Materialize, TracePhase::Register,
     };
     uint64_t cycles[kWorkers][kTracePhaseCount] = {};
     uint64_t counts[kWorkers][kTracePhaseCount] = {};
@@ -1039,6 +1039,11 @@ inline Metrics Validate(
     bool fanin_worker_counts_ok = true;
     bool frontier_worker_counts_ok = true;
     bool role_kernel_routing_ok = true;
+#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+    bool compete_first_split_runtime_oracle_ok = true;
+    const uint64_t expected_split_task_id_sum =
+        static_cast<uint64_t>(task_count) * (task_count - 1U) / 2U;
+#endif
 
     // 按真实输出大小、1 KiB 对齐和 256 MiB 环回规则重算每个 task 可接受的最小 vend。
     uint64_t expected_heap_next = 0;
@@ -1120,6 +1125,29 @@ inline Metrics Validate(
         slot_tensor_copies += result.slot_tensor_copies;
         slot_scalar_copies += result.slot_scalar_copies;
         fanin_edges += result.fanin_edges;
+#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+        const CoreRole expected_role = index < kAicWorkers ? CoreRole::Aic : CoreRole::Aiv;
+        compete_first_split_runtime_oracle_ok &= result.worker_id == index;
+        compete_first_split_runtime_oracle_ok &=
+            result.compete_first_split_caller_state_address != 0;
+        compete_first_split_runtime_oracle_ok &=
+            result.compete_first_split_finish_state_address ==
+                result.compete_first_split_caller_state_address;
+        compete_first_split_runtime_oracle_ok &=
+            result.compete_first_split_finish_calls == task_count;
+        compete_first_split_runtime_oracle_ok &=
+            result.compete_first_split_protocol_errors == 0;
+        compete_first_split_runtime_oracle_ok &=
+            result.compete_first_split_state_cookie ==
+                (kCompeteFirstSplitStateCookieBase ^ static_cast<uint64_t>(index) ^
+                 (static_cast<uint64_t>(static_cast<uint32_t>(expected_role)) << 32U));
+        compete_first_split_runtime_oracle_ok &=
+            result.compete_first_split_task_id_sum == expected_split_task_id_sum;
+        compete_first_split_runtime_oracle_ok &=
+            result.compete_first_split_owner_worker_id == index;
+        compete_first_split_runtime_oracle_ok &=
+            result.compete_first_split_reserved == 0;
+#endif
         frontend_worker_counts_ok &= result.context_reads == batches;
         frontend_worker_counts_ok &= result.views_created == static_cast<uint64_t>(batches) * 2;
         frontend_worker_counts_ok &= result.dynamic_create_infos == static_cast<uint64_t>(batches) * 2;
@@ -1186,6 +1214,13 @@ inline Metrics Validate(
     // 第一组断言覆盖参与者拓扑、Claim/winner、completion 和最终 drain 等调度主协议。
     Expect(aic_count == kAicWorkers && aiv_count == kAivWorkers, "participant topology is 32 AIC + 64 AIV", &metrics);
     Expect(worker_shape_ok, "all 96 worker markers and private rings are valid", &metrics);
+#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+    Expect(
+        compete_first_split_runtime_oracle_ok,
+        "compete-first caller/finish share one role-specific block-local state",
+        &metrics
+    );
+#endif
     Expect(submit_timestamps_ok, "all Submit timing markers are valid", &metrics);
     Expect(state.started_count.value == kWorkers, "started_count is 96", &metrics);
     Expect(submits == expected_submits, "replay count is workers * tasks", &metrics);

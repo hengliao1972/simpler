@@ -208,16 +208,44 @@ def _v4_capture() -> dict[str, object]:
             continue
         if phase == "Fanin" and (not winner or task_id == 0):
             continue
+        base = 1000 + core_id
+        submit_start = base + (0 if task_id == 0 else 120)
         if phase == "Claim":
-            if task_id == 0:
-                # v4 Alloc 的真实顺序是 Register -> Claim；v3 通用 fixture
-                # 相反，这里把两个显式区间换回 producer 的实际边界。
-                base = 1000 + core_id
-                row[6:8] = [base + 56, base + 63]
+            # schema-v4 跟随 compete-first eager 生产路径：Claim 先于
+            # callback 构参与 Materialize。两类 task 都保留 v3 fixture
+            # 的 Claim 时长，只调整边界顺序。
+            row[6:8] = (
+                [submit_start + 25, submit_start + 33]
+                if task_id == 0
+                else [submit_start + 14, submit_start + 20]
+            )
             row[8] = 0x3 if winner else 0x2
-        elif phase == "Register" and task_id == 0:
-            base = 1000 + core_id
-            row[6:8] = [base + 43, base + 51]
+        elif phase == "Materialize":
+            row[6:8] = (
+                [submit_start + 36, submit_start + 46]
+                if task_id == 0
+                else [submit_start + 24, submit_start + 32]
+            )
+        elif phase == "PrepareMap":
+            row[6:8] = (
+                [submit_start + 47, submit_start + 52]
+                if task_id == 0
+                else [submit_start + 33, submit_start + 37]
+            )
+        elif phase == "Fanin":
+            row[6:8] = [submit_start + 40, submit_start + 42]
+        elif phase == "Register":
+            row[6:8] = (
+                [submit_start + 56, submit_start + 63]
+                if task_id == 0
+                else [submit_start + 43, submit_start + 49]
+            )
+        elif phase == "Atomic":
+            row[6:8] = (
+                [submit_start + 26, submit_start + 28]
+                if task_id == 0
+                else [submit_start + 15, submit_start + 17]
+            )
         elif phase == "Submit":
             row[8] = 1 if winner else 0
             row[9] = 1 if task_id == 0 else 0
@@ -363,16 +391,16 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
         self.assertEqual(metrics["final_drain_residual"], 2_880)
         self.assertEqual(metrics["worker_completion"], 24_960)
         residual = report["residual_breakdown"]
-        self.assertEqual(residual["submit_internal_residual"]["total_cycles"], 2_404)
-        self.assertEqual(residual["submit_tail_residual"]["total_cycles"], 6_790)
+        self.assertEqual(residual["submit_internal_residual"]["total_cycles"], 2_689)
+        self.assertEqual(residual["submit_tail_residual"]["total_cycles"], 6_505)
         self.assertEqual(residual["between_submit_residual"]["total_cycles"], 1_920)
         self.assertAlmostEqual(
             residual["submit_internal_residual"]["share_of_submit_union"],
-            2_404 / 17_280,
+            2_689 / 17_280,
         )
         self.assertAlmostEqual(
             residual["submit_tail_residual"]["share_of_submit_union"],
-            6_790 / 17_280,
+            6_505 / 17_280,
         )
         self.assertAlmostEqual(
             residual["between_submit_residual"]["share_of_submit_envelope"],
@@ -382,7 +410,6 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
             segment["boundary"]
             for segment in residual["submit_tail_residual"]["segments"]
         }
-        self.assertIn("Claim->SubmitEnd", tail_boundaries)
         self.assertIn("Register->SubmitEnd", tail_boundaries)
         self.assertIn("AllocComplete->SubmitEnd", tail_boundaries)
         self.assertIn("WinnerBuild->SubmitEnd", tail_boundaries)
@@ -395,6 +422,11 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
                 for segment in residual["submit_internal_residual"]["segments"]
             )
         )
+        internal_boundaries = {
+            segment["boundary"]
+            for segment in residual["submit_internal_residual"]["segments"]
+        }
+        self.assertIn("Claim->Materialize", internal_boundaries)
 
         closure = report["aggregate_core_work"]["closure"]
         for name in (

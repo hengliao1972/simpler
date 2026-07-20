@@ -92,7 +92,7 @@ I-cache 时，普通泳道、atomic wrapper、ClockBaseline 和相关慢体必�
 | `claim` | `Claim()`、结果写回 context 及 claim 本地统计前后读局部 shadow counter | 当 `none` 已证明 miss 值得追踪时，试验 Claim 的 running read-clear 下界/上界归因链路 |
 | `efdrain` | 每次 Submit 开头唯一的 `DrainReady(...EfDrain...)` 前后 | 观察 opportunistic drain；不混入 RingBackpressure 或 FinalDrain |
 | `materialize` | `MaterializeTask()` 及成功路径 `materialized_outputs` 本地统计前后 | 观察输出 descriptor/layout、本地 register mask、输出字节数和 heap 游标等 scalar 工作；不包含后续 slot payload 拷贝 |
-| `register` | Alloc/non-Alloc 两个互斥的 `RegisterOutputs()`，non-Alloc 还包含 `map_inserts` 本地统计 | 观察输出注册语义体 |
+| `register` | 每次 Submit 统一的 `RegisterOutputs()`，非 Alloc 还包含 `map_inserts` 本地统计 | 观察输出注册语义体 |
 
 普通泳道为了减少观察扰动，会让相邻阶段复用同一个
 `SYS_CNT` 边界。PMU-only ELF 不生成这些泳道时间戳；局部 PMU bracket
@@ -113,6 +113,13 @@ running phase 的 begin/end 读取本身会执行 scalar 指令、占用取指�
 - 未来不同 phase ELF 的局部 request/miss 不可相加成 whole gate；
   Submit-all 整窗始终以每个 ELF 自己的 primary whole 为准。
 
+`none`/`claim`/`efdrain` 与正式 swimlane 使用 block-local runtime
+state 和跨 TU noinline finish；Claim/EfDrain 边界在 finish 之前已闭合。
+`materialize`/`register` 为了在 finish 内继续操作同一份真实
+`PmuContext`，当前使用 inline-finish 诊断 ELF。后两者与
+`none` 不具备字节级相同的指令布局，它们的局部结果只能在各自
+ELF 内解释。
+
 该区间只描述同一插桩 ELF、当前边界定义下的局部事件，不是无插桩局部阶段
 的真实区间。Submit-all `none` 没有运行中 read-clear，仍执行 96/96
 逐核严格闭合。
@@ -120,12 +127,13 @@ running phase 的 begin/end 读取本身会执行 scalar 指令、占用取指�
 报告中有三个相关但不相同的时间窗，不能都简称为“完整
 Submit”：
 
-1. **PMU whole gate**：每核在 `InitPaOrchestration()` 和首次构参之前
-   `metrics_prof_start()`，在末次 UP `SubmitTask()` 返回后立即 stop。它包含
-   orchestration 初始化、`Build*Args()`、`AcceptTaskOutputs()` 和 Submit 间衔接，
+1. **PMU whole gate**：每核在 `InitPaOrchestration()` 之前
+   `metrics_prof_start()`，在末次 UP `SubmitCallbackTask()` 返回后立即 stop。它包含
+   orchestration 初始化、`EfDrain`、`Claim`、同步 eager 构参、finish、
+   `AcceptTaskOutputs()` 和 Submit 间输出接收/调用衔接，
    排除 FinalDrain；与泳道 `OrchestrationReplay` 父区间接近但不做逐 tick
    对齐。CNT6/CNT7 primary 和 PMU total/scalar-busy 都使用这个窗。
-2. **`submit_elapsed_ticks`**：每核从首个 `BeginSubmit()` 之后到最后一个
+2. **`submit_elapsed_ticks`**：每核从首个 `BeginCallbackSubmit()` 之后到最后一个
    Submit 的 `submits++` 之后，包含两端之间的 Submit 间衔接，但不包含
    whole gate 首尾的 orchestration 外围。局部 phase 时间占比以它为分母。
 3. **`configuration.submit_span_us`**：96 核中最早 `submit_begin` 到最晚
@@ -301,8 +309,9 @@ mkdir -p "$OUT_REG_B1"
   --pmu-json "$OUT_REG_B1/submit_icache_raw.json"
 ```
 
-Register 有 Alloc 和 non-Alloc 两个互斥调用点，二者都使用同一 phase
-边界；winner/loser 均从其中一条路径通过，因此仍是每核固定
+Register 已合并为每次 Submit 唯一的 `RegisterOutputs()` 调用点；
+Alloc 通过 `include_existing=false` 保留语义差异，winner/loser 都经过该边界。
+因此仍是每核固定
 `5 * batches`，调用规模与 Materialize 相同。它与普通泳道包围
 同一 Register 语义体，但两个 ELF 各自取时，不做逐 tick 对齐；其中
 较短或未实际插入 map 的调用仍会放大 PMU begin/end
@@ -480,8 +489,8 @@ CNT8/CNT5 是顺序 `ld_dev`，不是同一时刻的原子配对快照，因此�
   平衡，每核 calls 为 `batches * 5`，全局 calls 为
   `batches * 5 * 96`；
 - 四个 running phase 必须分别命中自己的边界：Claim 调用、Submit 开头
-  EfDrain 专属 call-site、Materialize 唯一调用点，以及 Alloc/non-Alloc
-  两个互斥 Register 调用点；
+  EfDrain 专属 call-site、Materialize 唯一调用点，以及每次 Submit
+  统一的 Register 调用点；
 - phase request/miss 分别不超过对应 shadow/primary，且可编程 counter
   低于当前 25% 保守风险阈值。
 - 96 个核的 `submit_elapsed_ticks` 都大于 0；running phase 的
@@ -523,7 +532,7 @@ Submit-all 整窗优先查看：
   的 running read-clear lower；
 - `submit_elapsed_ticks`：本 worker 从首个 `submit_begin` 计时点到末个
   `submit_end` 计时点的 SYS_CNT 差值；起点位于首个
-  `BeginSubmit()` 上下文初始化之后，终点位于末个 Submit 返回之前；
+  `BeginCallbackSubmit()` 上下文初始化之后，终点位于末个 Submit 返回之前；
   1 tick = 1 ns；
 - `phase_elapsed_ticks`：所选 phase 所有调用的 SYS_CNT 差值累计；running
   phase 必须非零且不超过同核 `submit_elapsed_ticks`，`none` 必须为 0；

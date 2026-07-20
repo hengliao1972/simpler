@@ -31,6 +31,35 @@ struct LocalStats {
     TraceContext trace;
 };
 
+#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+// runtime-entry TU 按核型各自拥有一份 external [[block_local]] 实例。
+// orchestration caller 与 noinline finish 只交换固定 ticket/TaskArgs，Submit
+// 内部的 context、统计与状态指针全部留在这份每核状态里。
+struct alignas(64) CompeteFirstSplitRuntimeState {
+    PA_GM SchedulerState *scheduler;
+    PA_GM WorkerState *worker;
+    uint32_t task_count;
+    uint32_t worker_id;
+    SubmitContext context;
+    LocalStats stats;
+    uint64_t caller_state_address;
+    uint64_t finish_state_address;
+    uint64_t finish_calls;
+    uint64_t protocol_errors;
+    uint64_t state_cookie;
+    uint64_t task_id_sum;
+    uint64_t owner_worker_id;
+    uint64_t reserved;
+};
+static_assert(sizeof(CompeteFirstSplitRuntimeState) % 64 == 0,
+              "split runtime state must occupy whole cache lines");
+
+PA_DEVICE uint64_t CompeteFirstSplitStateCookie(uint32_t worker_id, CoreRole role) {
+    return kCompeteFirstSplitStateCookieBase ^ static_cast<uint64_t>(worker_id) ^
+           (static_cast<uint64_t>(static_cast<uint32_t>(role)) << 32U);
+}
+#endif
+
 // submit-pmu 的 phase 在编译期固定；非诊断构建完全不引用 Ops 的 phase
 // 接口。这样公共调度代码保持一份，swimlane/CPU/AscendC 也不会多出运行时分支。
 template <SubmitPmuPhase Phase, typename Ops, typename PmuContext>
@@ -538,47 +567,206 @@ PA_DEVICE bool BuildWinner(
     return true;
 }
 
-template <typename Ops, bool Profile, typename PmuContext>
-PA_DEVICE bool SubmitTask(
-    PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_count, TaskKind kind,
-    const TaskArgs &args, SubmitContext &context, LocalStats &stats, PmuContext &pmu_context
-) {
-    // 每个 worker 都完整回放相同 task stream。主流程为：EfDrain -> materialize -> TensorMap retire
-    // -> Claim -> winner 收集 fanin -> 全员 register -> winner Build / loser Replay。Alloc 在 Claim 前 register，
-    // 且 winner 不入 kernel slot，而是在 heap guard 后直接发布完成。
-    BeginSubmit(worker, args, context);
-    const uint32_t task_id = static_cast<uint32_t>(context.task_id);
-#if PA_BUILD_SUBMIT_PMU
-    // PMU-only ELF 只保留首/末 Submit 的全局时间边界，不再为 1280 次调用
-    // 各执行两条 trace-only SYS_CNT。
-    const uint64_t submit_begin = task_id == 0 ? Ops::Now() : 0;
+// compete-first callback 跨 split finish 边界只传递这个固定 16B POD。
+// callback closure 与内部 thunk 都在 caller 中同步结束，绝不跨 TU 保存。
+struct CallbackSubmitTicket {
+    uint64_t submit_begin;
+    uint32_t task_id;
+    int16_t function_id;
+    uint8_t won;
+    uint8_t reserved;
+};
+static_assert(sizeof(CallbackSubmitTicket) == 16, "callback ticket must remain a 16-byte POD");
+static_assert(offsetof(CallbackSubmitTicket, submit_begin) == 0, "callback ticket timestamp offset mismatch");
+static_assert(offsetof(CallbackSubmitTicket, task_id) == 8, "callback ticket task offset mismatch");
+static_assert(offsetof(CallbackSubmitTicket, function_id) == 12, "callback ticket function offset mismatch");
+static_assert(offsetof(CallbackSubmitTicket, won) == 14, "callback ticket winner offset mismatch");
+
+PA_DEVICE void BeginCallbackSubmit(PA_GM WorkerState &worker, SubmitContext &context) {
+    // Claim 必须先于 TaskArgs 构造，因此这里只建立与参数无关的 Submit 上下文；
+    // tensor/scalar 数量由 callback 完成后在 MaterializeTask 内写入。
+    const uint32_t task_id = static_cast<uint32_t>(worker.local_index++);
+    context.self = &worker;
+    context.payload = &worker.payloads[task_id & kPayloadMask];
+    context.task_id = static_cast<int32_t>(task_id);
+    context.tensor_count = 0;
+    context.scalar_count = 0;
+    context.result.task_id = task_id;
+    context.result.count = 0;
+    context.register_mask = 0;
+    context.output_bytes = 0;
+    context.fanin_count = 0;
+    context.kernel_id = -1;
+    context.won = false;
+    context.joint = false;
+    context.joint_init = false;
+    context.joint_block = -1;
+    context.joint_slot = -1;
+    context.joint_count = 0;
+}
+
+#if defined(__CCE_AICORE__) || defined(__NPU_ARCH__)
+#define PA_CALLBACK_LAMBDA_DEVICE __aicore__
 #else
-    const uint64_t submit_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
+#define PA_CALLBACK_LAMBDA_DEVICE
 #endif
-    if (task_id == 0) {
-        stats.result.submit_begin = submit_begin;
-    }
 
-    // EfDrain 在当前 Submit 的参数物化前执行上一批已就绪 slot，是绝大多数 kernel 的正常落点。
-    // 只在这个唯一 call-site 划 PMU 边界；DrainReady 还被 ring 背压和最终 drain
-    // 复用，不能把 phase 插入函数体后按 place 混合累计。
-    // EfDrain 是 Submit 的第一个真实阶段，直接复用父区间起点；这样每次
-    // Submit 少一次 trace-only SYS_CNT，也不会留下人为的 prefix residual。
-    const uint64_t efdrain_begin = submit_begin;
-    BeginSubmitPmuPhase<SubmitPmuPhase::EfDrain, Ops>(pmu_context);
-    DrainReady<Ops>(state, worker, DrainPlace::EfDrain, stats);
-    EndSubmitPmuPhase<SubmitPmuPhase::EfDrain, Ops>(pmu_context);
-    const uint64_t efdrain_end = TraceTimestamp<Ops>(stats.trace, stats.result);
-    WriteTrace<Profile>(
-        stats.trace, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::EfDrain,
-        ProfilePhase::EfDrain, efdrain_begin, efdrain_end
-    );
+template <TaskKind Kind>
+PA_DEVICE bool BuildCallbackSubmitArgs(
+    PaOrchestrationState &orch, TaskArgs &args, uint32_t batch, LocalStats &stats
+) {
+    CallbackSubmitArgsBuilder builder(args, Kind);
+    // 外层 callback 和所有参数 thunk 都只在这一调用点同步执行。eager
+    // 语义没有 winner 条件：96 个 worker 的前端构参次数保持完全一致。
+    auto callback = [&](CallbackSubmitArgsBuilder &out) PA_CALLBACK_LAMBDA_DEVICE {
+        out.Begin();
+        if constexpr (Kind == TaskKind::Alloc) {
+            out.AddOutput([&]() PA_CALLBACK_LAMBDA_DEVICE -> const TensorCreateInfo & {
+                return orch.tile_create_info;
+            });
+            out.AddOutput([&]() PA_CALLBACK_LAMBDA_DEVICE -> const TensorCreateInfo & {
+                return orch.scalar_create_info;
+            });
+            out.AddOutput([&]() PA_CALLBACK_LAMBDA_DEVICE -> const TensorCreateInfo & {
+                return orch.scalar_create_info;
+            });
+        } else if constexpr (Kind == TaskKind::Qk) {
+            out.AddLocalInput([&]() PA_CALLBACK_LAMBDA_DEVICE -> const TensorDesc & {
+                MakeCallbackQueryView(orch, batch);
+                out.RecordView();
+                return orch.query_view;
+            });
+            out.AddLocalInput([&]() PA_CALLBACK_LAMBDA_DEVICE -> const TensorDesc & {
+                return orch.key_cache;
+            });
+            out.AddLocalInput([&]() PA_CALLBACK_LAMBDA_DEVICE -> const TensorDesc & {
+                return orch.block_table;
+            });
+            out.AddOutput([&]() PA_CALLBACK_LAMBDA_DEVICE -> const TensorCreateInfo & {
+                const uint32_t score_shape[kMaxTensorDims] = {
+                    kPaHeads,
+                    static_cast<uint32_t>(orch.current_nblocks * kPaBlockSize),
+                    0, 0, 0
+                };
+                InitCreateInfo(orch.qk_create_info, score_shape, 2, DataType::Float32);
+                out.RecordDynamicCreateInfo();
+                return orch.qk_create_info;
+            });
+            out.AddScalar([&]() PA_CALLBACK_LAMBDA_DEVICE -> uint64_t {
+                return orch.current_nblocks;
+            });
+            out.AddScalar([&]() PA_CALLBACK_LAMBDA_DEVICE -> uint64_t {
+                return static_cast<uint64_t>(orch.current_batch) * kPaMaxBlocksPerRequest +
+                       orch.current_block_offset;
+            });
+        } else if constexpr (Kind == TaskKind::Sf) {
+            out.AddGmInput([&]() PA_CALLBACK_LAMBDA_DEVICE -> PA_GM const TensorDesc & {
+                return *orch.qk_scores;
+            });
+            out.AddOutput([&]() PA_CALLBACK_LAMBDA_DEVICE -> const TensorCreateInfo & {
+                const uint32_t probability_shape[kMaxTensorDims] = {
+                    kPaHeads,
+                    static_cast<uint32_t>(orch.current_nblocks * kPaBlockSize),
+                    0, 0, 0
+                };
+                InitCreateInfo(orch.sf_create_info, probability_shape, 2, DataType::Bfloat16);
+                out.RecordDynamicCreateInfo();
+                return orch.sf_create_info;
+            });
+            out.AddOutput([&]() PA_CALLBACK_LAMBDA_DEVICE -> const TensorCreateInfo & {
+                return orch.scalar_create_info;
+            });
+            out.AddOutput([&]() PA_CALLBACK_LAMBDA_DEVICE -> const TensorCreateInfo & {
+                return orch.scalar_create_info;
+            });
+            out.AddScalar([&]() PA_CALLBACK_LAMBDA_DEVICE -> uint64_t { return orch.scale_bits; });
+            out.AddScalar([&]() PA_CALLBACK_LAMBDA_DEVICE -> uint64_t {
+                return orch.current_nblocks;
+            });
+            out.AddScalar([&]() PA_CALLBACK_LAMBDA_DEVICE -> uint64_t {
+                return orch.current_valid_len;
+            });
+        } else if constexpr (Kind == TaskKind::Pv) {
+            out.AddGmInput([&]() PA_CALLBACK_LAMBDA_DEVICE -> PA_GM const TensorDesc & {
+                return *orch.sf_probs;
+            });
+            out.AddLocalInput([&]() PA_CALLBACK_LAMBDA_DEVICE -> const TensorDesc & {
+                return orch.value_cache;
+            });
+            out.AddLocalInput([&]() PA_CALLBACK_LAMBDA_DEVICE -> const TensorDesc & {
+                return orch.block_table;
+            });
+            out.AddOutput([&]() PA_CALLBACK_LAMBDA_DEVICE -> const TensorCreateInfo & {
+                return orch.tile_create_info;
+            });
+            out.AddScalar([&]() PA_CALLBACK_LAMBDA_DEVICE -> uint64_t {
+                return orch.current_nblocks;
+            });
+            out.AddScalar([&]() PA_CALLBACK_LAMBDA_DEVICE -> uint64_t {
+                return static_cast<uint64_t>(orch.current_batch) * kPaMaxBlocksPerRequest +
+                       orch.current_block_offset;
+            });
+        } else {
+            static_assert(Kind == TaskKind::Up, "unsupported PA task kind");
+            out.AddGmInput([&]() PA_CALLBACK_LAMBDA_DEVICE -> PA_GM const TensorDesc & {
+                return *orch.sf_max;
+            });
+            out.AddGmInput([&]() PA_CALLBACK_LAMBDA_DEVICE -> PA_GM const TensorDesc & {
+                return *orch.sf_sum;
+            });
+            out.AddGmInput([&]() PA_CALLBACK_LAMBDA_DEVICE -> PA_GM const TensorDesc & {
+                return *orch.pv_output;
+            });
+            out.AddGmInout([&]() PA_CALLBACK_LAMBDA_DEVICE -> PA_GM const TensorDesc & {
+                return *orch.accumulated_max;
+            });
+            out.AddGmInout([&]() PA_CALLBACK_LAMBDA_DEVICE -> PA_GM const TensorDesc & {
+                return *orch.accumulated_sum;
+            });
+            out.AddGmInout([&]() PA_CALLBACK_LAMBDA_DEVICE -> PA_GM const TensorDesc & {
+                return *orch.accumulated_output;
+            });
+            out.AddLocalInout([&]() PA_CALLBACK_LAMBDA_DEVICE -> const TensorDesc & {
+                MakeCallbackOutputView(orch, batch);
+                out.RecordView();
+                return orch.output_view;
+            });
+            out.AddScalar([&]() PA_CALLBACK_LAMBDA_DEVICE -> uint64_t {
+                return orch.current_block_offset == 0 ? 1 : 0;
+            });
+            out.AddScalar([&]() PA_CALLBACK_LAMBDA_DEVICE -> uint64_t {
+                return orch.current_block_offset + orch.current_nblocks >= orch.current_blocks ? 1 : 0;
+            });
+        }
+    };
 
-    // schema-v4 的所有 Submit 子阶段都使用显式 start/end；不再通过共同 lap
-    // 起点生成相互覆盖的 Build/Replay/Alloc 区间。
-    // 后继 segment 复用前一阶段 end：既少一次 SYS_CNT，也把前一条 trace
-    // 发布和阶段间胶水明确归入 Materialize，而不是留成无名 residual。
-    const uint64_t materialize_begin = efdrain_end;
+    callback(builder);
+    if (!builder.Valid()) return false;
+    const CallbackSubmitBuildCounts &counts = builder.Counts();
+    stats.result.arg_resets += counts.reset_calls;
+    stats.result.views_created += counts.views_created;
+    stats.result.dynamic_create_infos += counts.dynamic_create_infos;
+    stats.result.tensor_args_added += counts.tensor_args_added;
+    stats.result.scalar_args_added += counts.scalar_args_added;
+    return true;
+}
+
+#undef PA_CALLBACK_LAMBDA_DEVICE
+
+template <typename Ops, bool Profile, typename PmuContext>
+PA_DEVICE bool FinishCallbackSubmitBody(
+    PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_count,
+    const TaskArgs &args, SubmitContext &context, LocalStats &stats,
+    PmuContext &pmu_context, const CallbackSubmitTicket &ticket
+) {
+    const uint32_t task_id = ticket.task_id;
+    const TaskKind kind = GetTaskKind(task_id);
+    const int32_t function_id = static_cast<int32_t>(ticket.function_id);
+    const bool winner = ticket.won != 0;
+
+    // callback 已经返回，finish 只消费稳定的 TaskArgs。该函数既可被
+    // CPU/AscendC/局部 PMU 内联，也可在正式 CCEC 路径由独立 TU 实例化。
+    const uint64_t materialize_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
     BeginSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
     const bool materialized =
         MaterializeTask(worker, task_id, args, context, state->heap_base, state->heap_size);
@@ -591,134 +779,66 @@ PA_DEVICE bool SubmitTask(
     EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
     const uint64_t materialize_end = TraceTimestamp<Ops>(stats.trace, stats.result);
     WriteTrace<Profile>(
-        stats.trace, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::Materialize,
-        ProfilePhase::Materialize, materialize_begin, materialize_end, 0,
-        kind == TaskKind::Alloc ? 1U : 0U
+        stats.trace, stats.result, static_cast<int32_t>(task_id), function_id,
+        TracePhase::Materialize, ProfilePhase::Materialize,
+        materialize_begin, materialize_end, 0, kind == TaskKind::Alloc ? 1U : 0U
     );
+
     const uint64_t prepare_begin = materialize_end;
     AdvanceTensorMap(worker.map, task_id, static_cast<int32_t>(state->heap_window));
     const uint64_t prepare_end = TraceTimestamp<Ops>(stats.trace, stats.result);
     WriteTrace<Profile>(
-        stats.trace, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::PrepareMap,
-        ProfilePhase::PrepareMap, prepare_begin, prepare_end, 0, kind == TaskKind::Alloc ? 1U : 0U
+        stats.trace, stats.result, static_cast<int32_t>(task_id), function_id,
+        TracePhase::PrepareMap, ProfilePhase::PrepareMap,
+        prepare_begin, prepare_end, 0, kind == TaskKind::Alloc ? 1U : 0U
     );
 
-    bool winner = false;
-    int32_t function_id = -1;
-
-    if (kind == TaskKind::Alloc) {
-        // Alloc 没有 kernel lane，96 个 worker 都维护本地物化/heap 状态，但只有 Claim winner 发布全局完成。
-        const uint64_t register_begin = prepare_end;
-        BeginSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(pmu_context);
-        RegisterOutputs(context, args, false);
-        EndSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(pmu_context);
-        const uint64_t register_end = TraceTimestamp<Ops>(stats.trace, stats.result);
+    uint64_t register_begin = prepare_end;
+    if (kind != TaskKind::Alloc && __builtin_expect(winner, 0)) {
+        const uint64_t fanin_begin = prepare_end;
+        context.fanin_count = static_cast<int32_t>(CollectFanin(worker.map, args, context.fanin));
+        stats.result.map_lookups += static_cast<uint32_t>(args.tensor_count) - context.result.count;
+        const uint64_t fanin_end = TraceTimestamp<Ops>(stats.trace, stats.result);
         WriteTrace<Profile>(
-            stats.trace, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::Register,
-            ProfilePhase::Register, register_begin, register_end, 0, 0
+            stats.trace, stats.result, static_cast<int32_t>(task_id), function_id,
+            TracePhase::Fanin, ProfilePhase::Fanin,
+            fanin_begin, fanin_end, 0, static_cast<uint32_t>(context.fanin_count)
         );
+        register_begin = fanin_end;
+    }
 
-        const uint64_t claim_begin = register_end;
-        BeginSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
-        const ClaimOutcome claim = Claim<Ops>(state, worker, task_id, kind, stats);
-        winner = claim.won;
-        context.won = winner;
-        context.kernel_id = claim.function_id;
-        // Claim 的本地结果归档属于同一阶段；放在共同 end 边界内，避免把
-        // winner/context/stat bookkeeping 留成无法归因的 Submit residual。
-        RecordClaimOutcome(stats, kind, claim);
-        EndSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
-        const uint64_t claim_end = TraceTimestamp<Ops>(stats.trace, stats.result);
-        WriteTrace<Profile>(
-            stats.trace, stats.result, static_cast<int32_t>(task_id), -1, TracePhase::Claim,
-            ProfilePhase::Claim, claim_begin, claim_end,
-            (winner ? kClaimWon : 0U) | (claim.attempted ? kClaimAttempted : 0U), 1
-        );
-        // 每个 task 只有 1/96 worker 进入 winner 重型路径。把该分支标成冷路
-        // 只影响基本块布局，使占绝大多数的 loser 尽量顺序进入 Submit 公共
-        // 尾部；不改变 Claim 结果、完成发布或泳道边界。
-        if (__builtin_expect(winner, 0)) {
-            const uint64_t alloc_complete_begin = claim_end;
-            if (!HeapGuard<Ops, Profile>(
-                    state, worker, task_id, context.output_bytes, stats
-                )) {
+    BeginSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(pmu_context);
+    RegisterOutputs(context, args, kind != TaskKind::Alloc);
+    if (kind != TaskKind::Alloc) stats.result.map_inserts += CountBits(context.register_mask);
+    EndSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(pmu_context);
+    const uint64_t register_end = TraceTimestamp<Ops>(stats.trace, stats.result);
+    WriteTrace<Profile>(
+        stats.trace, stats.result, static_cast<int32_t>(task_id), function_id,
+        TracePhase::Register, ProfilePhase::Register,
+        register_begin, register_end, 0, kind == TaskKind::Alloc ? 0U : 1U
+    );
+
+    if (__builtin_expect(winner, 0)) {
+        const uint64_t winner_build_begin = register_end;
+        if (kind == TaskKind::Alloc) {
+            if (!HeapGuard<Ops, Profile>(state, worker, task_id, context.output_bytes, stats)) {
                 return false;
             }
             CompleteTask<Ops>(state, worker, task_id, stats);
-            const uint64_t alloc_complete_end = TraceTimestamp<Ops>(stats.trace, stats.result);
-            WriteTrace<false>(
-                stats.trace, stats.result, static_cast<int32_t>(task_id), -1,
-                TracePhase::AllocComplete, ProfilePhase::ReplayTail,
-                alloc_complete_begin, alloc_complete_end
-            );
         } else {
-            // standalone 的 Alloc loser 没有真实 GM/Replay 动作，不再为业务
-            // 路径名字写一条零时长记录。Claim 后到 Submit.end 的真实
-            // scalar 时间由离线 submit_tail_gap 补集展示；排他报告将其汇总为
-            // submit_tail_residual，避免伪装成 Alloc loser 业务阶段。
-        }
-    } else {
-        const uint64_t claim_begin = prepare_end;
-        BeginSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
-        const ClaimOutcome claim = Claim<Ops>(state, worker, task_id, kind, stats);
-        winner = claim.won;
-        function_id = claim.function_id;
-        context.won = winner;
-        context.kernel_id = function_id;
-        RecordClaimOutcome(stats, kind, claim);
-        EndSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
-        const uint64_t claim_end = TraceTimestamp<Ops>(stats.trace, stats.result);
-        WriteTrace<Profile>(
-            stats.trace, stats.result, static_cast<int32_t>(task_id), function_id, TracePhase::Claim,
-            ProfilePhase::Claim, claim_begin, claim_end,
-            (winner ? kClaimWon : 0U) | (claim.attempted ? kClaimAttempted : 0U), 0
-        );
-        uint64_t register_begin = claim_end;
-        if (winner) {
-            const uint64_t fanin_begin = claim_end;
-            context.fanin_count = static_cast<int32_t>(CollectFanin(worker.map, args, context.fanin));
-            stats.result.map_lookups += static_cast<uint32_t>(args.tensor_count) - context.result.count;
-            const uint64_t fanin_end = TraceTimestamp<Ops>(stats.trace, stats.result);
-            WriteTrace<Profile>(
-                stats.trace, stats.result, static_cast<int32_t>(task_id), function_id, TracePhase::Fanin,
-                ProfilePhase::Fanin, fanin_begin, fanin_end, 0, static_cast<uint32_t>(context.fanin_count)
-            );
-            register_begin = fanin_end;
-        }
-
-        // loser 直接承接 Claim.end；winner 则承接 Fanin.end。两条路径都
-        // 复用已有边界，不再为 Register 单独读取 SYS_CNT。
-        BeginSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(pmu_context);
-        RegisterOutputs(context, args, true);
-        stats.result.map_inserts += CountBits(context.register_mask);
-        EndSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(pmu_context);
-        const uint64_t register_end = TraceTimestamp<Ops>(stats.trace, stats.result);
-        WriteTrace<Profile>(
-            stats.trace, stats.result, static_cast<int32_t>(task_id), function_id, TracePhase::Register,
-            ProfilePhase::Register, register_begin, register_end, 0, 1
-        );
-        // BuildWinner 会内联 ring、heap 和真计算提交逻辑；提示其为 1/96
-        // 冷路，避免 loser 为跳过大块代码付出额外取指代价。
-        if (__builtin_expect(winner, 0)) {
-            const uint64_t winner_build_begin = register_end;
             if (!BuildWinner<Ops, Profile>(
                     state, worker, task_id, kind, args, context, context.fanin,
                     static_cast<uint32_t>(context.fanin_count), stats
                 )) {
                 return false;
             }
-            const uint64_t winner_build_end = TraceTimestamp<Ops>(stats.trace, stats.result);
-            WriteTrace<false>(
-                stats.trace, stats.result, static_cast<int32_t>(task_id), function_id,
-                TracePhase::WinnerBuild, ProfilePhase::ReplayTail,
-                winner_build_begin, winner_build_end
-            );
-        } else {
-            // 非 winner 不占用私有 ring slot，也没有可单列的 Replay 计算。
-            // Register 后到 Submit.end 由离线 submit_tail_gap 补集展示；排他
-            // 报告汇总为 submit_tail_residual，避免零时长 marker 增加 raw
-            // 体积和 trace-buffer 写开销。
         }
+        const uint64_t winner_build_end = TraceTimestamp<Ops>(stats.trace, stats.result);
+        WriteTrace<false>(
+            stats.trace, stats.result, static_cast<int32_t>(task_id), function_id,
+            kind == TaskKind::Alloc ? TracePhase::AllocComplete : TracePhase::WinnerBuild,
+            ProfilePhase::ReplayTail, winner_build_begin, winner_build_end
+        );
     }
 
     ++stats.result.submits;
@@ -728,13 +848,133 @@ PA_DEVICE bool SubmitTask(
     const uint64_t submit_end = TraceTimestamp<Ops>(stats.trace, stats.result);
 #endif
     WriteTrace<Profile>(
-        stats.trace, stats.result, static_cast<int32_t>(task_id), function_id, TracePhase::Submit,
-        ProfilePhase::Submit, submit_begin, submit_end, winner ? 1U : 0U, kind == TaskKind::Alloc ? 1U : 0U
+        stats.trace, stats.result, static_cast<int32_t>(task_id), function_id,
+        TracePhase::Submit, ProfilePhase::Submit,
+        ticket.submit_begin, submit_end, winner ? 1U : 0U, kind == TaskKind::Alloc ? 1U : 0U
     );
-    if (task_id + 1 == task_count) {
-        stats.result.submit_end = submit_end;
-    }
+    if (task_id + 1 == task_count) stats.result.submit_end = submit_end;
     return true;
+}
+
+#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+template <typename Ops>
+PA_DEVICE uint32_t FinishSplitCallbackSubmitFromRuntime(
+    const CallbackSubmitTicket *ticket, const TaskArgs *args
+) {
+    CompeteFirstSplitRuntimeState &runtime = Ops::CompeteFirstSplitState();
+    const uint64_t state_address = reinterpret_cast<uint64_t>(&runtime);
+    runtime.finish_state_address = state_address;
+
+    bool valid = ticket != nullptr && args != nullptr && runtime.scheduler != nullptr &&
+                 runtime.worker != nullptr && runtime.task_count != 0 &&
+                 runtime.worker_id < kWorkers && runtime.owner_worker_id == runtime.worker_id &&
+                 runtime.worker->core_idx == static_cast<int32_t>(runtime.worker_id) &&
+                 runtime.caller_state_address == state_address &&
+                 runtime.state_cookie == CompeteFirstSplitStateCookie(
+                     runtime.worker_id, runtime.worker->role
+                 ) && runtime.reserved == 0;
+    if (valid) {
+        valid = ticket->reserved == 0 && ticket->task_id < runtime.task_count &&
+                runtime.context.task_id == static_cast<int32_t>(ticket->task_id) &&
+                runtime.context.kernel_id == static_cast<int32_t>(ticket->function_id) &&
+                runtime.context.won == (ticket->won != 0);
+    }
+    ++runtime.finish_calls;
+    if (ticket != nullptr) runtime.task_id_sum += ticket->task_id;
+    if (!valid) {
+        ++runtime.protocol_errors;
+        if (runtime.scheduler != nullptr) {
+            SetFatal<Ops>(
+                runtime.scheduler, runtime.stats,
+                ticket == nullptr ? -1 : static_cast<int32_t>(ticket->task_id)
+            );
+        }
+        return 0;
+    }
+
+#if PA_BUILD_SUBMIT_PMU
+    // none 不需要 finish 内的局部 PMU context；Claim/EfDrain 的起止点都在
+    // callback 与 finish 之前，因此也能保持 split 形状。Materialize/Register
+    // 边界在 finish 内，仍由构建脚本选择 inline finish 以复用同一 PmuContext。
+    static_assert(
+        kCompiledSubmitPmuPhase == SubmitPmuPhase::None ||
+            kCompiledSubmitPmuPhase == SubmitPmuPhase::Claim ||
+            kCompiledSubmitPmuPhase == SubmitPmuPhase::EfDrain,
+        "split callback submit-PMU supports none/claim/efdrain only"
+    );
+#endif
+    bool pmu_context = false;
+    return FinishCallbackSubmitBody<Ops, false>(
+        runtime.scheduler, *runtime.worker, runtime.task_count, *args,
+        runtime.context, runtime.stats, pmu_context, *ticket
+    ) ? 1U : 0U;
+}
+#endif
+
+template <TaskKind Kind, typename Ops, bool Profile, typename PmuContext>
+PA_DEVICE bool SubmitCallbackTask(
+    PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_count,
+    PaOrchestrationState &orch, TaskArgs &args, uint32_t batch,
+    SubmitContext &context, LocalStats &stats, PmuContext &pmu_context
+) {
+    BeginCallbackSubmit(worker, context);
+    const uint32_t task_id = static_cast<uint32_t>(context.task_id);
+#if PA_BUILD_SUBMIT_PMU
+    const uint64_t submit_begin = task_id == 0 ? Ops::Now() : 0;
+#else
+    const uint64_t submit_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
+#endif
+    if (task_id == 0) stats.result.submit_begin = submit_begin;
+
+    const uint64_t efdrain_begin = submit_begin;
+    BeginSubmitPmuPhase<SubmitPmuPhase::EfDrain, Ops>(pmu_context);
+    DrainReady<Ops>(state, worker, DrainPlace::EfDrain, stats);
+    EndSubmitPmuPhase<SubmitPmuPhase::EfDrain, Ops>(pmu_context);
+    const uint64_t efdrain_end = TraceTimestamp<Ops>(stats.trace, stats.result);
+    WriteTrace<Profile>(
+        stats.trace, stats.result, static_cast<int32_t>(task_id), -1,
+        TracePhase::EfDrain, ProfilePhase::EfDrain, efdrain_begin, efdrain_end
+    );
+
+    const uint64_t claim_begin = efdrain_end;
+    BeginSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
+    const ClaimOutcome claim = Claim<Ops>(state, worker, task_id, Kind, stats);
+    context.won = claim.won;
+    context.kernel_id = claim.function_id;
+    RecordClaimOutcome(stats, Kind, claim);
+    EndSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
+    const uint64_t claim_end = TraceTimestamp<Ops>(stats.trace, stats.result);
+    WriteTrace<Profile>(
+        stats.trace, stats.result, static_cast<int32_t>(task_id), claim.function_id,
+        TracePhase::Claim, ProfilePhase::Claim, claim_begin, claim_end,
+        (claim.won ? kClaimWon : 0U) | (claim.attempted ? kClaimAttempted : 0U),
+        Kind == TaskKind::Alloc ? 1U : 0U
+    );
+
+    if (!BuildCallbackSubmitArgs<Kind>(orch, args, batch, stats)) {
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
+    const CallbackSubmitTicket ticket{
+        submit_begin,
+        task_id,
+        static_cast<int16_t>(claim.function_id),
+        static_cast<uint8_t>(claim.won ? 1 : 0),
+        0,
+    };
+#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+    (void)state;
+    (void)worker;
+    (void)task_count;
+    (void)context;
+    (void)stats;
+    (void)pmu_context;
+    return Ops::FinishCompeteFirstCallback(&ticket, &args);
+#else
+    return FinishCallbackSubmitBody<Ops, Profile>(
+        state, worker, task_count, args, context, stats, pmu_context, ticket
+    );
+#endif
 }
 
 PA_DEVICE uint32_t CountLiveMapEntries(PA_GM const TensorMap &map) {
@@ -808,6 +1048,16 @@ PA_DEVICE void PublishResult(PA_GM WorkerResult &destination, const WorkerResult
     PA_PUBLISH_FIELD(frontier_updates);
     PA_PUBLISH_FIELD(frontier_terminal_loads);
     PA_PUBLISH_FIELD(atomic_trace_calls);
+#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+    PA_PUBLISH_FIELD(compete_first_split_caller_state_address);
+    PA_PUBLISH_FIELD(compete_first_split_finish_state_address);
+    PA_PUBLISH_FIELD(compete_first_split_finish_calls);
+    PA_PUBLISH_FIELD(compete_first_split_protocol_errors);
+    PA_PUBLISH_FIELD(compete_first_split_state_cookie);
+    PA_PUBLISH_FIELD(compete_first_split_task_id_sum);
+    PA_PUBLISH_FIELD(compete_first_split_owner_worker_id);
+    PA_PUBLISH_FIELD(compete_first_split_reserved);
+#endif
 #undef PA_PUBLISH_FIELD
     Ops::StoreBarrier();
 }
@@ -843,7 +1093,26 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         worker.slots[index].built = false;
     }
 
+#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+    CompeteFirstSplitRuntimeState &split_runtime = Ops::CompeteFirstSplitState();
+    split_runtime.context = SubmitContext{};
+    split_runtime.stats = LocalStats{};
+    split_runtime.scheduler = state;
+    split_runtime.worker = &worker;
+    split_runtime.task_count = 0;
+    split_runtime.worker_id = worker_id;
+    split_runtime.caller_state_address = reinterpret_cast<uint64_t>(&split_runtime);
+    split_runtime.finish_state_address = 0;
+    split_runtime.finish_calls = 0;
+    split_runtime.protocol_errors = 0;
+    split_runtime.state_cookie = CompeteFirstSplitStateCookie(worker_id, role);
+    split_runtime.task_id_sum = 0;
+    split_runtime.owner_worker_id = worker_id;
+    split_runtime.reserved = 0;
+    LocalStats &stats = split_runtime.stats;
+#else
     LocalStats stats{};
+#endif
     stats.result.worker_id = worker_id;
     stats.result.role = static_cast<uint32_t>(role);
     stats.result.checksum = 0xcbf29ce484222325ULL ^ worker_id;
@@ -879,74 +1148,68 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 
     const uint32_t batches = state->config.batches;
     const uint32_t task_count = batches * kTasksPerBatch;
+#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+    split_runtime.task_count = task_count;
+#endif
     PaOrchestrationState orchestration;
     TaskArgs args;
+#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+    SubmitContext &context = split_runtime.context;
+#else
     SubmitContext context;
+#endif
     uint64_t orchestration_begin = 0;
     uint64_t orchestration_end = 0;
     if (!IsFatal<Ops>(state, stats)) {
         // Case1 每个 batch 固定回放 Alloc/QK/SF/PV/UP 五个 task；所有 worker 顺序相同，执行 lane 由 Claim 筛选。
         // CCEC 可在这里开启本 worker 私有 PMU 窗口；CPU/AscendC 适配层是空实现。
-        // 窗口覆盖从首个参数构造到末次 Submit 返回，与全局“首 Submit.begin～末 Submit.end”
-        // 口径接近但不相同，host sidecar 必须按 per-worker 累计解释。
-        // 泳道父边界在 PMU-only 构建中会被编译为空，不应污染 Submit 取数；窗口从
-        // orchestration 初始化（即首批参数构造）前一条边界开始。
+        // 窗口覆盖本 worker 的全部调度期：从 orchestration 初始化前开始，
+        // 依次包含 EfDrain、Claim、同步 eager 参数构造与后续 Submit 阶段，到末次 Submit 返回。
+        // 它与全局“首 Submit.begin～末 Submit.end”口径接近但不相同，host sidecar
+        // 必须按 per-worker 累计解释。泳道父边界在 PMU-only 构建中会被编译为空，
+        // 不应污染 Submit 取数。
         auto pmu_context = Ops::PmuWindowStart(state, worker_id);
         orchestration_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
         InitPaOrchestration(orchestration, batches, &state->context_lens[0]);
         for (uint32_t batch = 0; batch < batches; ++batch) {
-            BuildAllocArgs(orchestration, args, batch);
+            BeginPaBatchForCallback(orchestration, batch);
             ++stats.result.context_reads;
-            stats.result.views_created += 2;
-            stats.result.tensor_args_added += 3;
-            if (!SubmitTask<Ops, Profile>(
-                    state, worker, task_count, TaskKind::Alloc, args, context, stats, pmu_context
+            if (!SubmitCallbackTask<TaskKind::Alloc, Ops, Profile>(
+                    state, worker, task_count, orchestration, args, batch, context, stats,
+                    pmu_context
                 )) {
                 break;
             }
             AcceptTaskOutputs(orchestration, TaskKind::Alloc, context.result);
 
-            BuildQkArgs(orchestration, args, batch);
-            ++stats.result.dynamic_create_infos;
-            ++stats.result.arg_resets;
-            stats.result.tensor_args_added += 4;
-            stats.result.scalar_args_added += 2;
-            if (!SubmitTask<Ops, Profile>(
-                    state, worker, task_count, TaskKind::Qk, args, context, stats, pmu_context
+            PreparePaBlockGroup(orchestration, 0);
+            if (!SubmitCallbackTask<TaskKind::Qk, Ops, Profile>(
+                    state, worker, task_count, orchestration, args, batch, context, stats,
+                    pmu_context
                 )) {
                 break;
             }
             AcceptTaskOutputs(orchestration, TaskKind::Qk, context.result);
 
-            BuildSfArgs(orchestration, args);
-            ++stats.result.dynamic_create_infos;
-            ++stats.result.arg_resets;
-            stats.result.tensor_args_added += 4;
-            stats.result.scalar_args_added += 3;
-            if (!SubmitTask<Ops, Profile>(
-                    state, worker, task_count, TaskKind::Sf, args, context, stats, pmu_context
+            if (!SubmitCallbackTask<TaskKind::Sf, Ops, Profile>(
+                    state, worker, task_count, orchestration, args, batch, context, stats,
+                    pmu_context
                 )) {
                 break;
             }
             AcceptTaskOutputs(orchestration, TaskKind::Sf, context.result);
 
-            BuildPvArgs(orchestration, args, batch);
-            ++stats.result.arg_resets;
-            stats.result.tensor_args_added += 4;
-            stats.result.scalar_args_added += 2;
-            if (!SubmitTask<Ops, Profile>(
-                    state, worker, task_count, TaskKind::Pv, args, context, stats, pmu_context
+            if (!SubmitCallbackTask<TaskKind::Pv, Ops, Profile>(
+                    state, worker, task_count, orchestration, args, batch, context, stats,
+                    pmu_context
                 )) {
                 break;
             }
             AcceptTaskOutputs(orchestration, TaskKind::Pv, context.result);
 
-            BuildUpdateArgs(orchestration, args);
-            ++stats.result.arg_resets;
-            stats.result.tensor_args_added += 7;
-            stats.result.scalar_args_added += 2;
-            if (!SubmitTask<Ops, Profile>(
-                    state, worker, task_count, TaskKind::Up, args, context, stats, pmu_context
+            if (!SubmitCallbackTask<TaskKind::Up, Ops, Profile>(
+                    state, worker, task_count, orchestration, args, batch, context, stats,
+                    pmu_context
                 )) {
                 break;
             }
@@ -1018,6 +1281,31 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 (Ops::kAtomicReturnReadyObserved ? kClockAtomicDependencyApplied : 0U)
         );
     }
+#endif
+
+#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+    const uint64_t expected_task_id_sum =
+        static_cast<uint64_t>(task_count) * (task_count - 1U) / 2U;
+    const bool split_protocol_ok =
+        split_runtime.scheduler == state && split_runtime.worker == &worker &&
+        split_runtime.task_count == task_count && split_runtime.worker_id == worker_id &&
+        split_runtime.owner_worker_id == worker_id && split_runtime.caller_state_address != 0 &&
+        split_runtime.finish_state_address == split_runtime.caller_state_address &&
+        split_runtime.finish_calls == task_count && split_runtime.task_id_sum == expected_task_id_sum &&
+        split_runtime.state_cookie == CompeteFirstSplitStateCookie(worker_id, role) &&
+        split_runtime.reserved == 0;
+    if (!split_protocol_ok) {
+        ++split_runtime.protocol_errors;
+        SetFatal<Ops>(state, stats);
+    }
+    stats.result.compete_first_split_caller_state_address = split_runtime.caller_state_address;
+    stats.result.compete_first_split_finish_state_address = split_runtime.finish_state_address;
+    stats.result.compete_first_split_finish_calls = split_runtime.finish_calls;
+    stats.result.compete_first_split_protocol_errors = split_runtime.protocol_errors;
+    stats.result.compete_first_split_state_cookie = split_runtime.state_cookie;
+    stats.result.compete_first_split_task_id_sum = split_runtime.task_id_sum;
+    stats.result.compete_first_split_owner_worker_id = split_runtime.owner_worker_id;
+    stats.result.compete_first_split_reserved = split_runtime.reserved;
 #endif
 
     // PA writes swimlane records through the ordinary GM cache and explicitly

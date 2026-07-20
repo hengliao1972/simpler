@@ -546,7 +546,7 @@ sum(exclusive_children(parent)) == duration(parent)
 校验，用原始整数 cycle 完成：
 
 ```text
-Submit = EfDrain + Materialize + PrepareMap + Claim + Fanin + Register
+Submit = EfDrain + Claim + Materialize + PrepareMap + Fanin + Register
        + WinnerBuild + AllocComplete + SubmitResidual
 
 SubmitEnvelope = SubmitUnion + BetweenSubmitResidual
@@ -561,6 +561,11 @@ WorkerCompletion = OrchestrationReplay + FinalDrain
 孤儿 Kernel、父 span 数量错误、逐核 task id 不连续、角色拓扑不全或 dropped
 非零都直接失败。报告分开输出 global Submit makespan、aggregate core-work 和 AIC/AIV
 每核分布，不再用 96 核累加值除以全局墙钟包络。
+
+当前 compete-first eager 实现把 Claim 移到同步 callback 构参之前。
+callback 构参没有新增 raw 字段或设备记录，其耗时由现有
+`Claim.end -> Materialize.begin` 内部 residual 表达；这与
+submit-PMU 的 Claim/Materialize 边界保持同一业务顺序，同时不扩大 profiling raw。
 
 `run.sh swimlane` 已串起三份产物，每个 writer 都在单件完成后再原子
 发布自己的文件；这是 raw → merged → exclusive report 的逐件流水线，
@@ -615,7 +620,12 @@ schema-v3 同负载 level-4 导出轮为 5774.295 us，二者单轮差为
 404.095 us 极差，所以只能作为历史观察扰动证据，不能外推为
 当前最终边界版本的性能改善或不回退结论。
 
-### 6.4 residual 的当前收敛状态
+### 6.4 compete-first 前历史快照：residual 的当时收敛状态
+
+> 本节至 6.11 的数值、布局图与“当前源码”表述，都是
+> compete-first eager 移植前的历史快照。它们保留作为边界收敛与
+> 旧样本的取证记录，不得用来解释移植后的阶段顺序或绝对耗时。
+> 移植后的权威布局与实测数据见 6.12。
 
 设备端不为 residual 增加记录。converter 与 analyzer 分别从同一
 raw 独立求补集：前者在 Perfetto 中以 `submit_residual` 表示 Submit
@@ -1523,23 +1533,93 @@ FinalDrain 在两轮中都是同步补偿区域：其 start 跨核偏斜为
 Submit begin 到末个 Submit end。前者比后者多 Setup/最后返回等小段；报告必须
 明确分母，不能把二者静默当成同一完整区间。
 
+### 6.12 compete-first eager 移植后的当前权威布局
+
+2026-07-20 已将受控 B 版的稳定收益形状移植回 standalone 主路，
+但没有移植 C 版 lazy 跳过构参。当前 96 个 worker 仍全部同步构造
+完整 `TaskArgs`；改变的是 Claim 与构参的先后关系，以及 CCEC
+caller/runtime-state/noinline-finish 的编译布局。当前业务时间线为：
+
+```text
+OrchestrationSetup
+  InitPaOrchestration / BeginPaBatchForCallback / context read / BeginCallbackSubmit
+
+Submit
+  EfDrain
+  Claim
+  Claim.end -> Materialize.begin residual
+    Claim record 发布 + 同步 eager callback 构造完整 TaskArgs + 调用衔接
+  Materialize
+  PrepareMap
+  winner non-Alloc: Fanin
+  Register
+  winner: WinnerBuild 或 AllocComplete
+  loser/winner 公共收尾 -> Submit.end
+
+SubmitTransition
+  前一 Submit record 发布/返回 + AcceptTaskOutputs + block-group/batch 准备
+  + 下一次 BeginCallbackSubmit
+```
+
+Materialize 之后的相邻 child 继续复用已有 end 边界，只有
+`Claim -> Materialize` 因真实 callback 构参而保留非零内部 residual。
+这个 residual 不新增 raw 字段、记录或 `SYS_CNT` 读取，由 converter/
+analyzer 使用现有 Claim.end 和 Materialize.begin 离线复算。旧 6.4～6.11
+中“构参全部属于 SubmitTransition”、Alloc `Register -> Claim` 和
+“Submit 内无 child-to-child gap”都只属于移植前历史样本。
+
+当前 CCEC A5 b1 权威产物为：
+
+```text
+outputs/pa_scheduler_swimlane_20260720_092021_1729726/ccec/
+  l2_swimlane_records.json
+  merged_swimlane.json
+  swimlane_exclusive_analysis.json
+```
+
+该轮使用 `real-compute/6,28,4,1`，共 480 个 Submit、4,146 条 raw
+记录，`dropped_records=0`；atomic 闭合为
+`865 = 1475 - 862 + 252`，全部语义、角色、split state、Kernel 唯一归属与
+整数分区门禁通过。Submit aggregate core-work 为 2,345,639 SYS_CNT ticks：
+
+| 区域 | aggregate ticks | SubmitUnion 占比 |
+| --- | ---: | ---: |
+| Claim | 778,137 | 33.1738% |
+| Materialize | 446,670 | 19.0426% |
+| Claim→Materialize 构参 residual | 354,842 | 15.1277% |
+| Register | 228,377 | 9.7362% |
+| EfDrain | 222,825 | 9.4995% |
+| PrepareMap | 145,613 | 6.2078% |
+| Submit tail residual | 115,514 | 4.9246% |
+| WinnerBuild / AllocComplete / Fanin | 53,661 | 2.2877% |
+
+上表是带泳道/atomic 观察的 b1 aggregate core-work，用于验证新边界
+分类，不用来宣称关闭观察后的局部净耗时。关闭泳道的 b256
+独立进程样本为 `3706.483 / 3778.698 / 3735.032 / 3741.987 /
+3595.101 us`，中位数 3,735.032 us。移植前同口径五轮中位数为
+3,889.180 us，本轮中位数减少 154.148 us，约 3.9635%；候选五轮
+全部快于旧基线的最快一轮 3,825.697 us。该结果证明收益已在
+standalone 主路复现；它不直接承诺 simpler 真实 PA 也有相同比例。
+
 ## 结论
 
 历史 schema-v3 泳道不闭合的根因不是缺少一次 duration 求和，而是
 Submit 父区间、Kernel 嵌套、Atomic/Clock/lap Overlay 和缺失的 orchestration/final
 drain 外层边界被混在同一加和口径中。
 
-当前 schema-v4 的父子关系、事件数量、Kernel 归属和整数闭合已经通过 B256
-验证。Submit 内部不再存在 child-to-child 空洞；仍显示为 residual 的部分也已
-通过现有边界给出可复算的源码语义：`SubmitFinalize` 是最后 record 与公共收尾，
-`SubmitTransition` 是记录发布、返回和下一任务构参，`FinalDrainControlWait` 是
-Kernel 之外的最终同步与清空。它们仍保留数学补集属性，不能仅靠改名伪装成
-性能消减。
+当前 schema-v4 的父子关系、事件数量、Kernel 归属和整数闭合已在
+compete-first eager 移植后的 CCEC A5 b1 重新验证。Submit 内部当前只有
+`Claim.end -> Materialize.begin` 保留有意义的 child-to-child residual，
+它对应 Claim record 发布、同步 eager callback 构参和调用衔接。
+`SubmitFinalize` 仍是最后 record 与公共收尾；`SubmitTransition` 改为记录发布、
+返回、输出接收和下一次 Submit 上下文初始化，不再包含完整参数构造。
+这些 residual 仍保留数学补集属性，不能仅靠改名伪装成性能消减。
 
-当前先完成所有 span 的分布合理性和观测边界审计。已知总量热点依次集中在
-Materialize、Claim、EfDrain、SubmitTransition、Register 和 PrepareMap，但泳道
-只能给出完整观察窗口，尚不能独立分出纯业务、Atomic、I-cache、GM stall 与
-DFX 记录成本。下一步按 6.11 节先补微观证据，再提出单变量优化，不根据阶段名
-或单轮排名盲猜代码改法。
+当前 b1 带观察的 aggregate 分布中，Claim、Materialize、同步构参
+residual、Register 和 EfDrain 是主要区域；泳道仍只能给出完整观察窗口，
+不能独立分出纯业务、Atomic、I-cache、GM stall 与 DFX 记录成本。
+关闭泳道的五轮 b256 已证明 standalone 主路收益可复现；下一步是按
+同一 compete-first eager 语义移植到 simpler 真实 PA，并在真实路径重新完成
+正确性、泳道闭合和性能 A/B，不直接套用 standalone 收益比例。
 
 [pa-orch]: ../../st/a5/tensormap_and_ringbuffer/paged_attention_unroll/kernels/orchestration/paged_attention_orch.cpp

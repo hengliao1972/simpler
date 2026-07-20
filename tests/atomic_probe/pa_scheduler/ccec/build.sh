@@ -20,6 +20,7 @@ SUBMIT_PMU_MANIFEST_NAME="submit_pmu_artifacts.manifest"
 # swimlane；submit-pmu 的 phase 必须先由白名单映射为稳定数值，不能把任意
 # 字符串直接用于目录或三套编译器的宏。
 BUILD_VARIANT="${1:-swimlane}"
+SPLIT_FINISH=0
 case "$BUILD_VARIANT" in
     swimlane)
         if [[ $# -gt 1 ]]; then
@@ -30,6 +31,7 @@ case "$BUILD_VARIANT" in
         PHASE_ID=0
         BUILD_DIR="$ROOT_DIR/build/ccec"
         VARIANT_DEFINES=(-DPA_BUILD_SWIMLANE=1 -DPA_BUILD_SUBMIT_PMU=0 -DPA_SUBMIT_PMU_PHASE_ID=0)
+        SPLIT_FINISH=1
         ;;
     submit-pmu)
         if [[ $# -ne 2 ]]; then
@@ -50,12 +52,22 @@ case "$BUILD_VARIANT" in
         esac
         BUILD_DIR="$ROOT_DIR/build/ccec/submit-pmu/$PHASE_NAME"
         VARIANT_DEFINES=(-DPA_BUILD_SWIMLANE=0 -DPA_BUILD_SUBMIT_PMU=1 "-DPA_SUBMIT_PMU_PHASE_ID=$PHASE_ID")
+        # none/Claim/EfDrain 的 PMU 窗口在 finish 之前已经闭合，可以复用泳道版
+        # 的跨 TU noinline finish；Materialize/Register 的窗口跨入 finish，必须
+        # 保持 inline，确保边界继续操作同一份真实 PmuContext。
+        if [[ "$PHASE_NAME" == "none" || "$PHASE_NAME" == "claim" ||
+              "$PHASE_NAME" == "efdrain" ]]; then
+            SPLIT_FINISH=1
+        fi
         ;;
     *)
         echo "Usage: $0 [swimlane] | $0 submit-pmu none|claim|efdrain|materialize|register" >&2
         exit 1
         ;;
 esac
+if [[ "$SPLIT_FINISH" -eq 1 ]]; then
+    VARIANT_DEFINES+=(-DPA_COMPETE_FIRST_SPLIT_FINISH=1)
+fi
 
 # 编译只依赖本目录源码与用户安装的 CANN/PTO 头，不引用 pa_scheduler 目录外的 simpler 构建产物。
 if [[ -z "${ASCEND_HOME_PATH:-}" ]]; then
@@ -127,6 +139,17 @@ COMMON_FLAGS=(
     "${VARIANT_DEFINES[@]}"
 )
 
+# CompeteFirstSplitRuntimeState 当前 ABI 为 1600B。只给 split 产物开启
+# block-local relocation，并按精确尺寸预留，避免影响局部 PMU 的 inline ELF。
+SPLIT_STATE_BYTES=1600
+SPLIT_FINISH_CALL_SITES=5
+if [[ "$SPLIT_FINISH" -eq 1 ]]; then
+    COMMON_FLAGS+=(
+        -mllvm -cce-block-local-relocate=true
+        -mllvm "-cce-block-local-reserve-size=$SPLIT_STATE_BYTES"
+    )
+fi
+
 # 同一入口源码分别面向 cube 与 vector ISA 编译，宏只选择各自的全局入口和 mixed metadata。
 echo "[BUILD] CCEC AIC entry (dav-c310-cube)"
 "$CCEC" "${COMMON_FLAGS[@]}" \
@@ -142,12 +165,278 @@ echo "[BUILD] CCEC AIV entry (dav-c310-vec)"
     -o "$BUILD_DIR/pa_scheduler_aiv.o" \
     "$SCRIPT_DIR/kernel.cpp"
 
+check_workload_dispatcher_object() {
+    local object_path="$1"
+    local expected_symbol="$2"
+    local wrong_role_symbol="$3"
+    local object_symbols
+    object_symbols="$("$READELF_BIN" --symbols --wide --sym-base=10 "$object_path")"
+    if ! awk -v name="$expected_symbol" \
+        '$4 == "FUNC" && $5 == "GLOBAL" && $7 != "UND" && $NF == name && $3 + 0 > 0 {count++}
+         END {exit count != 1}' <<<"$object_symbols"; then
+        echo "Expected exactly one non-empty strong workload dispatcher in $object_path: $expected_symbol" >&2
+        exit 1
+    fi
+    if awk -v name="$wrong_role_symbol" \
+        '$NF == name {found = 1} END {exit !found}' <<<"$object_symbols"; then
+        echo "Wrong-role workload dispatcher leaked into $object_path: $wrong_role_symbol" >&2
+        exit 1
+    fi
+}
+check_workload_dispatcher_object \
+    "$BUILD_DIR/pa_scheduler_aic.o" \
+    pa_execute_real_winner_workload_aic \
+    pa_execute_real_winner_workload_aiv
+check_workload_dispatcher_object \
+    "$BUILD_DIR/pa_scheduler_aiv.o" \
+    pa_execute_real_winner_workload_aiv \
+    pa_execute_real_winner_workload_aic
+echo "[CHECK] role-specific real-compute dispatchers are strong and do not cross roles"
+
+text_relocation_count_for_symbol() {
+    local object_path="$1"
+    local symbol_name="$2"
+    "$READELF_BIN" --relocs --wide "$object_path" | awk -v name="$symbol_name" '
+        /^Relocation section '\''\.rela\.text'\''/ {in_text = 1; next}
+        /^Relocation section / {in_text = 0}
+        in_text {
+            for (column = 1; column <= NF; ++column) {
+                if ($column == name) {
+                    count++
+                    next
+                }
+            }
+        }
+        END {print count + 0}
+    '
+}
+
+check_split_role_objects() {
+    local role="$1"
+    local wrong_role="$2"
+    local caller="$BUILD_DIR/pa_scheduler_${role}.o"
+    local runtime="$BUILD_DIR/pa_scheduler_compete_first_callback_runtime_${role}.o"
+    local finish="$BUILD_DIR/pa_scheduler_compete_first_callback_finish_${role}.o"
+    local state_symbol="pa_scheduler_compete_first_callback_state_${role}"
+    local finish_symbol="pa_scheduler_compete_first_callback_finish_${role}"
+    local orchestration_symbol="pa_scheduler_compete_first_callback_orchestration_${role}"
+    local entry_symbol="pa_scheduler_0_mix_${role}"
+    local dispatcher_symbol="pa_execute_real_winner_workload_${role}"
+    local caller_symbols runtime_symbols finish_symbols
+    caller_symbols="$("$READELF_BIN" --symbols --wide --sym-base=10 "$caller")"
+    runtime_symbols="$("$READELF_BIN" --symbols --wide --sym-base=10 "$runtime")"
+    finish_symbols="$("$READELF_BIN" --symbols --wide --sym-base=10 "$finish")"
+
+    if ! awk -v name="$orchestration_symbol" \
+        '$4 == "FUNC" && $5 == "GLOBAL" && $7 != "UND" && $NF == name && $3 + 0 > 0 {count++}
+         END {exit count != 1}' <<<"$caller_symbols"; then
+        echo "Missing unique strong compete-first orchestration in caller: $caller ($orchestration_symbol)" >&2
+        exit 1
+    fi
+    for imported in "$state_symbol" "$finish_symbol"; do
+        if ! awk -v name="$imported" \
+            '$5 == "GLOBAL" && $7 == "UND" && $NF == name {count++} END {exit count != 1}' \
+            <<<"$caller_symbols"; then
+            echo "Caller must import exactly one matching split symbol: $caller ($imported)" >&2
+            exit 1
+        fi
+    done
+    if [[ "$(text_relocation_count_for_symbol "$caller" "$finish_symbol")" -ne \
+          "$SPLIT_FINISH_CALL_SITES" ]]; then
+        echo "Caller must contain exactly $SPLIT_FINISH_CALL_SITES all-task finish .rela.text relocations: $caller" >&2
+        exit 1
+    fi
+    if [[ "$(text_relocation_count_for_symbol "$caller" "$state_symbol")" -eq 0 ]]; then
+        echo "Caller must access its matching external block-local state: $caller" >&2
+        exit 1
+    fi
+    if "$READELF_BIN" --sections --wide "$caller" | awk \
+        'index($0, ".ascend.meta.") != 0 {found = 1} END {exit !found}'; then
+        echo "Compete-first caller object must not define launch metadata: $caller" >&2
+        exit 1
+    fi
+
+    if ! awk -v name="$state_symbol" -v bytes="$SPLIT_STATE_BYTES" \
+        '$4 == "OBJECT" && $5 == "GLOBAL" && $7 != "UND" && $NF == name && $3 + 0 == bytes {count++}
+         END {exit count != 1}' <<<"$runtime_symbols"; then
+        echo "Runtime must own one exact-size block-local state: $runtime ($state_symbol)" >&2
+        exit 1
+    fi
+    if ! awk -v name="$entry_symbol" \
+        '$4 == "FUNC" && $5 == "GLOBAL" && $7 != "UND" && $NF == name && $3 + 0 > 0 {count++}
+         END {exit count != 1}' <<<"$runtime_symbols"; then
+        echo "Runtime must own one non-empty mixed entry: $runtime ($entry_symbol)" >&2
+        exit 1
+    fi
+    if ! awk -v name="$orchestration_symbol" \
+        '$5 == "GLOBAL" && $7 == "UND" && $NF == name {count++} END {exit count != 1}' \
+        <<<"$runtime_symbols"; then
+        echo "Runtime must import one role-specific orchestration: $runtime ($orchestration_symbol)" >&2
+        exit 1
+    fi
+    if [[ "$(text_relocation_count_for_symbol "$runtime" "$orchestration_symbol")" -ne 1 ]]; then
+        echo "Runtime entry must contain exactly one orchestration call relocation: $runtime" >&2
+        exit 1
+    fi
+    local block_local_record block_local_section_index block_local_size_hex block_local_alignment
+    block_local_record="$(
+        "$READELF_BIN" --sections --wide "$runtime" | awk '
+            {for (column = 1; column <= NF; ++column) {
+                if ($column == ".bl.uninit") {
+                    section_index = $(column - 1)
+                    gsub(/\[/, "", section_index)
+                    gsub(/\]/, "", section_index)
+                    print section_index, $(column + 4), $NF
+                    exit
+                }
+            }}
+        '
+    )"
+    read -r block_local_section_index block_local_size_hex block_local_alignment \
+        <<<"$block_local_record"
+    if [[ -z "$block_local_section_index" || -z "$block_local_size_hex" ||
+          $((16#$block_local_size_hex)) -ne "$SPLIT_STATE_BYTES" ||
+          "$block_local_alignment" -ne 64 ]]; then
+        echo "Runtime .bl.uninit must be exactly ${SPLIT_STATE_BYTES}B and 64B aligned: $runtime" >&2
+        exit 1
+    fi
+    if ! awk -v name="$state_symbol" -v section="$block_local_section_index" \
+        '$4 == "OBJECT" && $7 == section && $NF == name {count++}
+         END {exit count != 1}' <<<"$runtime_symbols"; then
+        echo "Runtime state must be defined in its exact .bl.uninit section: $runtime" >&2
+        exit 1
+    fi
+    local runtime_sections
+    runtime_sections="$("$READELF_BIN" --sections --wide "$runtime")"
+    if ! awk -v name=".ascend.meta.$entry_symbol" '
+        {for (column = 1; column <= NF; ++column) {
+            if ($column == name) found = 1
+        }}
+        END {exit !found}
+    ' <<<"$runtime_sections"; then
+        echo "Runtime object is missing matching mixed-entry metadata: $runtime" >&2
+        exit 1
+    fi
+    if awk -v name=".ascend.meta.pa_scheduler_0_mix_${wrong_role}" '
+        {for (column = 1; column <= NF; ++column) {
+            if ($column == name) found = 1
+        }}
+        END {exit !found}
+    ' <<<"$runtime_sections"; then
+        echo "Wrong-role mixed-entry metadata leaked into runtime object: $runtime" >&2
+        exit 1
+    fi
+
+    if ! awk -v name="$finish_symbol" \
+        '$4 == "FUNC" && $5 == "GLOBAL" && $7 != "UND" && $NF == name && $3 + 0 > 0 {count++}
+         END {exit count != 1}' <<<"$finish_symbols"; then
+        echo "Finish object must define one non-empty strong finish: $finish ($finish_symbol)" >&2
+        exit 1
+    fi
+    for imported in "$state_symbol" "$dispatcher_symbol"; do
+        if ! awk -v name="$imported" \
+            '$5 == "GLOBAL" && $7 == "UND" && $NF == name {count++} END {exit count != 1}' \
+            <<<"$finish_symbols"; then
+            echo "Finish object must import exactly one matching symbol: $finish ($imported)" >&2
+            exit 1
+        fi
+        if [[ "$(text_relocation_count_for_symbol "$finish" "$imported")" -eq 0 ]]; then
+            echo "Finish object must reference its matching imported symbol: $finish ($imported)" >&2
+            exit 1
+        fi
+    done
+    if "$READELF_BIN" --sections --wide "$finish" | awk \
+        'index($0, ".ascend.meta.") != 0 {found = 1} END {exit !found}'; then
+        echo "Compete-first finish object must not define launch metadata: $finish" >&2
+        exit 1
+    fi
+
+    local forbidden symbol_table object_path
+    for object_path in "$caller" "$runtime" "$finish"; do
+        case "$object_path" in
+            "$caller") symbol_table="$caller_symbols" ;;
+            "$runtime") symbol_table="$runtime_symbols" ;;
+            *) symbol_table="$finish_symbols" ;;
+        esac
+        for forbidden in \
+            "pa_scheduler_compete_first_callback_state_${wrong_role}" \
+            "pa_scheduler_compete_first_callback_finish_${wrong_role}" \
+            "pa_scheduler_compete_first_callback_orchestration_${wrong_role}" \
+            "pa_execute_real_winner_workload_${wrong_role}" \
+            "pa_scheduler_0_mix_${wrong_role}"; do
+            if awk -v name="$forbidden" \
+                '$NF == name {found = 1} END {exit !found}' <<<"$symbol_table"; then
+                echo "Wrong-role compete-first symbol leaked into $object_path: $forbidden" >&2
+                exit 1
+            fi
+        done
+    done
+
+    if awk -v name="$entry_symbol" '$NF == name {found = 1} END {exit !found}' \
+        <<<"$caller_symbols"; then
+        echo "Compete-first caller must not own a launch entry: $caller ($entry_symbol)" >&2
+        exit 1
+    fi
+    if awk -v name="$entry_symbol" '$NF == name {found = 1} END {exit !found}' \
+        <<<"$finish_symbols"; then
+        echo "Compete-first finish must not own a launch entry: $finish ($entry_symbol)" >&2
+        exit 1
+    fi
+    for forbidden in "$finish_symbol" "$dispatcher_symbol"; do
+        if awk -v name="$forbidden" '$NF == name {found = 1} END {exit !found}' \
+            <<<"$runtime_symbols"; then
+            echo "Runtime entry/state owner contains an unexpected helper: $runtime ($forbidden)" >&2
+            exit 1
+        fi
+    done
+    if awk -v name="$orchestration_symbol" '$NF == name {found = 1} END {exit !found}' \
+        <<<"$finish_symbols"; then
+        echo "Compete-first finish must not contain orchestration: $finish ($orchestration_symbol)" >&2
+        exit 1
+    fi
+}
+
+if [[ "$SPLIT_FINISH" -eq 1 ]]; then
+    echo "[BUILD] CCEC AIC compete-first runtime/state owner"
+    "$CCEC" "${COMMON_FLAGS[@]}" --cce-aicore-arch=dav-c310-cube -DPA_BUILD_AIC \
+        -o "$BUILD_DIR/pa_scheduler_compete_first_callback_runtime_aic.o" \
+        "$SCRIPT_DIR/callback_runtime_entry.cpp"
+    echo "[BUILD] CCEC AIC compete-first noinline finish"
+    "$CCEC" "${COMMON_FLAGS[@]}" --cce-aicore-arch=dav-c310-cube -DPA_BUILD_AIC \
+        -o "$BUILD_DIR/pa_scheduler_compete_first_callback_finish_aic.o" \
+        "$SCRIPT_DIR/callback_finish.cpp"
+    echo "[BUILD] CCEC AIV compete-first runtime/state owner"
+    "$CCEC" "${COMMON_FLAGS[@]}" --cce-aicore-arch=dav-c310-vec -DPA_BUILD_AIV \
+        -o "$BUILD_DIR/pa_scheduler_compete_first_callback_runtime_aiv.o" \
+        "$SCRIPT_DIR/callback_runtime_entry.cpp"
+    echo "[BUILD] CCEC AIV compete-first noinline finish"
+    "$CCEC" "${COMMON_FLAGS[@]}" --cce-aicore-arch=dav-c310-vec -DPA_BUILD_AIV \
+        -o "$BUILD_DIR/pa_scheduler_compete_first_callback_finish_aiv.o" \
+        "$SCRIPT_DIR/callback_finish.cpp"
+    check_split_role_objects aic aiv
+    check_split_role_objects aiv aic
+    DEVICE_OBJECTS=(
+        "$BUILD_DIR/pa_scheduler_compete_first_callback_runtime_aic.o"
+        "$BUILD_DIR/pa_scheduler_aic.o"
+        "$BUILD_DIR/pa_scheduler_compete_first_callback_finish_aic.o"
+        "$BUILD_DIR/pa_scheduler_compete_first_callback_runtime_aiv.o"
+        "$BUILD_DIR/pa_scheduler_aiv.o"
+        "$BUILD_DIR/pa_scheduler_compete_first_callback_finish_aiv.o"
+    )
+    echo "[CHECK] compete-first caller/runtime/finish role and state symbols are complete"
+else
+    DEVICE_OBJECTS=(
+        "$BUILD_DIR/pa_scheduler_aic.o"
+        "$BUILD_DIR/pa_scheduler_aiv.o"
+    )
+fi
+
 # 静态链接把两个 device object 合成一个可由 runtime 按 1:2 比例启动的 mixed AICore ELF。
 echo "[BUILD] Static 1:2 mixed AICore ELF"
 "$LD" -m aicorelinux -Ttext=0 -static \
+    --version-script="$SCRIPT_DIR/pa_scheduler_device_exports.map" \
     -o "$BUILD_DIR/pa_scheduler_kernel.o" \
-    "$BUILD_DIR/pa_scheduler_aic.o" \
-    "$BUILD_DIR/pa_scheduler_aiv.o"
+    "${DEVICE_OBJECTS[@]}"
 
 SYMBOL_TABLE="$("$READELF_BIN" --symbols --wide --sym-base=10 "$BUILD_DIR/pa_scheduler_kernel.o")"
 SECTION_TABLE="$("$READELF_BIN" --sections --wide "$BUILD_DIR/pa_scheduler_kernel.o")"
@@ -180,11 +469,11 @@ while IFS= read -r global_func; do
 done < <(awk '$4 == "FUNC" && $5 == "GLOBAL" && $7 != "UND" {print $NF}' <<<"$SYMBOL_TABLE")
 echo "[CHECK] only the two mixed entries are exported as GLOBAL device functions"
 
-# noinline/used 的三个本地函数是 CCEC 真计算模式的构建期证据；它们不得导出为
-# GLOBAL，否则 runtime 可能把 helper 误识别成可启动 kernel。运行期还必须用
-# 数值闭环和 PMU 的 AIC cube_busy/AIV vector_busy 共同证明它们确实执行。
+# finish TU 需要调用按核型区分的真计算 dispatcher；version script 将其与
+# 底层 Cube/Vector 实体全部局部化，最终只保留两个 mixed kernel 入口。
 for workload_symbol in \
-    pa_execute_real_winner_workload \
+    pa_execute_real_winner_workload_aic \
+    pa_execute_real_winner_workload_aiv \
     pa_real_cube_workload_aic \
     pa_real_vector_add_workload_aiv \
     pa_real_vector_mul_workload_aiv; do
@@ -205,6 +494,70 @@ for workload_symbol in \
     fi
 done
 echo "[CHECK] CCEC cube/vector real-compute helpers are non-empty LOCAL functions"
+
+if [[ "$SPLIT_FINISH" -eq 1 ]]; then
+    for role in aic aiv; do
+        finish_symbol="pa_scheduler_compete_first_callback_finish_${role}"
+        orchestration_symbol="pa_scheduler_compete_first_callback_orchestration_${role}"
+        state_symbol="pa_scheduler_compete_first_callback_state_${role}"
+        for local_function in "$finish_symbol" "$orchestration_symbol"; do
+            if ! awk -v name="$local_function" \
+                '$4 == "FUNC" && $5 == "LOCAL" && $7 != "UND" && $NF == name && $3 + 0 > 0 {count++}
+                 END {exit count != 1}' <<<"$SYMBOL_TABLE"; then
+                echo "Missing unique LOCAL compete-first function: $local_function" >&2
+                exit 1
+            fi
+        done
+        if ! awk -v name="$state_symbol" -v bytes="$SPLIT_STATE_BYTES" \
+            '$4 == "OBJECT" && $5 == "LOCAL" && $7 != "UND" && $NF == name && $3 + 0 == bytes {count++}
+             END {exit count != 1}' <<<"$SYMBOL_TABLE"; then
+            echo "Missing exact-size LOCAL compete-first state: $state_symbol" >&2
+            exit 1
+        fi
+    done
+    aic_state_hex="$(awk '$NF == "pa_scheduler_compete_first_callback_state_aic" {print $2; exit}' \
+        <<<"$SYMBOL_TABLE")"
+    aiv_state_hex="$(awk '$NF == "pa_scheduler_compete_first_callback_state_aiv" {print $2; exit}' \
+        <<<"$SYMBOL_TABLE")"
+    final_block_local_record="$(
+        awk '{for (column = 1; column <= NF; ++column) {
+            if ($column == ".bl_uninit") {
+                section_index = $(column - 1)
+                gsub(/\[/, "", section_index)
+                gsub(/\]/, "", section_index)
+                print section_index, $(column + 4), $NF
+                exit
+            }
+        }}' <<<"$SECTION_TABLE"
+    )"
+    read -r final_block_local_section_index final_block_local_size_hex \
+        final_block_local_alignment <<<"$final_block_local_record"
+    if [[ -z "$aic_state_hex" || -z "$aiv_state_hex" ||
+          $((16#$aic_state_hex)) -ne 0 ||
+          $((16#$aiv_state_hex)) -ne "$SPLIT_STATE_BYTES" ||
+          -z "$final_block_local_section_index" || -z "$final_block_local_size_hex" ||
+          $((16#$final_block_local_size_hex)) -ne $((2 * SPLIT_STATE_BYTES)) ||
+          "$final_block_local_alignment" -ne 64 ]]; then
+        echo "Final block-local layout must be two exact, non-overlapping 64B-aligned compete-first states." >&2
+        exit 1
+    fi
+    for state_symbol in \
+        pa_scheduler_compete_first_callback_state_aic \
+        pa_scheduler_compete_first_callback_state_aiv; do
+        if ! awk -v name="$state_symbol" -v section="$final_block_local_section_index" \
+            '$4 == "OBJECT" && $7 == section && $NF == name {count++}
+             END {exit count != 1}' <<<"$SYMBOL_TABLE"; then
+            echo "Final compete-first state must be bound to the exact .bl_uninit section: $state_symbol" >&2
+            exit 1
+        fi
+    done
+    if [[ -n "$("$READELF_BIN" --relocs --wide "$BUILD_DIR/pa_scheduler_kernel.o" |
+          sed -n '/Relocation section/p')" ]]; then
+        echo "Final compete-first mixed ELF must not retain relocations." >&2
+        exit 1
+    fi
+    echo "[CHECK] final ELF keeps helpers LOCAL, binds two exact states, and has no relocations"
+fi
 
 check_icache_probe_layout() {
     local role="$1"

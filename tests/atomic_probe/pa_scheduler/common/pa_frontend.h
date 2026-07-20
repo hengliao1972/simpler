@@ -345,19 +345,6 @@ PA_DEVICE void AddScalar(TaskArgs &args, uint64_t value) {
     if (ReserveScalarArgs(args, 1)) AppendScalar(args, value);
 }
 
-PA_DEVICE void AddTwoScalars(TaskArgs &args, uint64_t value0, uint64_t value1) {
-    if (!ReserveScalarArgs(args, 2)) return;
-    AppendScalar(args, value0);
-    AppendScalar(args, value1);
-}
-
-PA_DEVICE void AddThreeScalars(TaskArgs &args, uint64_t value0, uint64_t value1, uint64_t value2) {
-    if (!ReserveScalarArgs(args, 3)) return;
-    AppendScalar(args, value0);
-    AppendScalar(args, value1);
-    AppendScalar(args, value2);
-}
-
 PA_DEVICE void InitCreateInfo(
     TensorCreateInfo &info, const uint32_t shapes[kMaxTensorDims], uint32_t ndims, DataType dtype
 ) {
@@ -474,18 +461,7 @@ PA_DEVICE void CopyTensorLine1(TensorDesc &destination, const Source &source) {
     }
 }
 
-PA_DEVICE void MakeBatchViews(PaOrchestrationState &orch, uint32_t batch) {
-    // query/output view 共享原 backing buffer，仅通过 start_offset 切出当前 batch。
-    // output_view 保留真实 manual_dep 标记；UP 的生产者依赖由 Alloc、SF、PV 返回 descriptor 的 owner 闭合。
-    CopyTensorLine1(orch.query_view, orch.query);
-    orch.query_view.start_offset = static_cast<uint64_t>(batch) * kPaHeads * kPaHeadDim;
-    orch.query_view.ndims = 2;
-    orch.query_view.shapes[0] = kPaHeads;
-    orch.query_view.shapes[1] = kPaHeadDim;
-    orch.query_view.strides[0] = kPaHeadDim;
-    orch.query_view.strides[1] = 1;
-    orch.query_view.extent_elem_cache = kPaHeads * kPaHeadDim;
-
+PA_DEVICE void MakeCallbackOutputView(PaOrchestrationState &orch, uint32_t batch) {
     CopyTensorLine1(orch.output_view, orch.output);
     orch.output_view.start_offset = static_cast<uint64_t>(batch) * kPaHeads * kPaHeadDim;
     orch.output_view.ndims = 2;
@@ -495,6 +471,17 @@ PA_DEVICE void MakeBatchViews(PaOrchestrationState &orch, uint32_t batch) {
     orch.output_view.strides[0] = kPaHeadDim;
     orch.output_view.strides[1] = 1;
     orch.output_view.extent_elem_cache = kPaHeads * kPaHeadDim;
+}
+
+PA_DEVICE void MakeCallbackQueryView(PaOrchestrationState &orch, uint32_t batch) {
+    CopyTensorLine1(orch.query_view, orch.query);
+    orch.query_view.start_offset = static_cast<uint64_t>(batch) * kPaHeads * kPaHeadDim;
+    orch.query_view.ndims = 2;
+    orch.query_view.shapes[0] = kPaHeads;
+    orch.query_view.shapes[1] = kPaHeadDim;
+    orch.query_view.strides[0] = kPaHeadDim;
+    orch.query_view.strides[1] = 1;
+    orch.query_view.extent_elem_cache = kPaHeads * kPaHeadDim;
 }
 
 PA_DEVICE uint64_t MinU64(uint64_t lhs, uint64_t rhs) { return lhs < rhs ? lhs : rhs; }
@@ -525,14 +512,12 @@ PA_DEVICE void PreparePaBlockGroup(PaOrchestrationState &orch, uint64_t block_of
     orch.current_valid_len = MinU64(kPaBlockSize, orch.current_sequence - last_block_sequence_start);
 }
 
-PA_DEVICE void BeginPaBatch(PaOrchestrationState &orch, uint32_t batch) {
-    // Match paged_attention_orch.cpp: context GM load and block arithmetic
-    // happen before entering the q scope and before constructing either view.
-    // 该顺序会影响 Submit 前的指令与访存间隔，故不把长度读取挪进 QK 构参。
+PA_DEVICE void BeginPaBatchForCallback(PaOrchestrationState &orch, uint32_t batch) {
+    // context GM load 与跨 task 共用算术仍在 Submit 之前；只把最终 descriptor
+    // 打包延后到 Claim 后的同步 callback，避免把业务数据流挪入运行时 finish。
     orch.current_batch = batch;
     orch.current_sequence = ReadPaContextLength(orch, batch);
     orch.current_blocks = (orch.current_sequence + kPaBlockSize - 1) / kPaBlockSize;
-    MakeBatchViews(orch, batch);
 }
 
 PA_DEVICE void InitPaOrchestration(
@@ -592,92 +577,99 @@ PA_DEVICE void InitPaOrchestration(PaOrchestrationState &orch, uint32_t batches)
     InitPaOrchestration(orch, batches, nullptr);
 }
 
-PA_DEVICE void BuildAllocArgs(PaOrchestrationState &orch, TaskArgs &args, uint32_t batch) {
-    BeginPaBatch(orch, batch);
-    // PA constructs a fresh L0TaskArgs after its two views; Alloc is populated
-    // without calling reset().
-    // 三个 Output 分别成为累计 output/sum/max；Alloc 无 kernel slot，winner 在
-    // HeapGuard 后直接发布 task completion。
-    ConstructTaskArgs(args);
-    if (!ReserveTensorArgs(args, 3)) return;
-    AppendOutput(args, orch.tile_create_info);
-    AppendOutput(args, orch.scalar_create_info);
-    AppendOutput(args, orch.scalar_create_info);
-}
+struct CallbackSubmitBuildCounts {
+    uint32_t reset_calls;
+    uint32_t views_created;
+    uint32_t dynamic_create_infos;
+    uint32_t tensor_args_added;
+    uint32_t scalar_args_added;
+};
 
-PA_DEVICE void BuildQkArgs(PaOrchestrationState &orch, TaskArgs &args, uint32_t batch) {
-    (void)batch;
-    // PA computes the block group after Alloc returns, immediately before it
-    // constructs the dynamic QK output create-info.
-    // QK 消费 query/key/block-table，产出 score；其 active role 为 AIC。
-    PreparePaBlockGroup(orch, 0);
-    const uint32_t score_shape[kMaxTensorDims] = {
-        kPaHeads, static_cast<uint32_t>(orch.current_nblocks * kPaBlockSize), 0, 0, 0
-    };
-    // Constructed after Alloc submit and immediately before QK reset/adds.
-    InitCreateInfo(orch.qk_create_info, score_shape, 2, DataType::Float32);
-    ResetTaskArgs(args);
-    if (!ReserveTensorArgs(args, 3)) return;
-    AppendLocalTensor(args, orch.query_view, TensorArgType::Input);
-    AppendLocalTensor(args, orch.key_cache, TensorArgType::Input);
-    AppendLocalTensor(args, orch.block_table, TensorArgType::Input);
-    AddOutput(args, orch.qk_create_info);
-    AddTwoScalars(
-        args, orch.current_nblocks,
-        static_cast<uint64_t>(orch.current_batch) * kPaMaxBlocksPerRequest + orch.current_block_offset
-    );
-}
+// builder 只在当前 Submit 栈帧内被同步调用，任何 thunk 都不会被保存或跨 TU。
+// 所有 Add* 均无 winner 分支，明确保持 compete-first eager 的全员构参语义。
+class CallbackSubmitArgsBuilder {
+public:
+    PA_DEVICE CallbackSubmitArgsBuilder(TaskArgs &args, TaskKind kind)
+        : args_(args), kind_(kind), begin_calls_(0), counts_{} {}
 
-PA_DEVICE void BuildSfArgs(PaOrchestrationState &orch, TaskArgs &args) {
-    const uint32_t probability_shape[kMaxTensorDims] = {
-        kPaHeads, static_cast<uint32_t>(orch.current_nblocks * kPaBlockSize), 0, 0, 0
-    };
-    // Constructed only after QK submit returns its sij descriptor.
-    // SF 通过 qk_scores.owner 得到 QK fanin，产出 probability/max/sum；active role 为 AIV。
-    InitCreateInfo(orch.sf_create_info, probability_shape, 2, DataType::Bfloat16);
-    ResetTaskArgs(args);
-    AddGmTensor(args, *orch.qk_scores, TensorArgType::Input);
-    if (!ReserveTensorArgs(args, 3)) return;
-    AppendOutput(args, orch.sf_create_info);
-    AppendOutput(args, orch.scalar_create_info);
-    AppendOutput(args, orch.scalar_create_info);
-    AddThreeScalars(args, orch.scale_bits, orch.current_nblocks, orch.current_valid_len);
-}
+    PA_DEVICE void Begin() {
+        if (++begin_calls_ != 1) {
+            args_.has_error = true;
+            return;
+        }
+        if (kind_ == TaskKind::Alloc) {
+            ConstructTaskArgs(args_);
+        } else {
+            ResetTaskArgs(args_);
+            ++counts_.reset_calls;
+        }
+    }
 
-PA_DEVICE void BuildPvArgs(PaOrchestrationState &orch, TaskArgs &args, uint32_t batch) {
-    (void)batch;
-    // PV 消费 SF probability 与 value/block-table，owner 形成一条 SF->PV 依赖；
-    // 结果 pv_output 供最后的 UP 使用，active role 回到 AIC。
-    ResetTaskArgs(args);
-    if (!ReserveTensorArgs(args, 3)) return;
-    AppendGmTensor(args, *orch.sf_probs, TensorArgType::Input);
-    AppendLocalTensor(args, orch.value_cache, TensorArgType::Input);
-    AppendLocalTensor(args, orch.block_table, TensorArgType::Input);
-    AddOutput(args, orch.tile_create_info);
-    AddTwoScalars(
-        args, orch.current_nblocks,
-        static_cast<uint64_t>(orch.current_batch) * kPaMaxBlocksPerRequest + orch.current_block_offset
-    );
-}
+    PA_DEVICE void RecordView() { ++counts_.views_created; }
+    PA_DEVICE void RecordDynamicCreateInfo() { ++counts_.dynamic_create_infos; }
 
-PA_DEVICE void BuildUpdateArgs(PaOrchestrationState &orch, TaskArgs &args) {
-    // UP 的 SF max/sum 共享一个 SF owner，PV output 提供一个 PV owner，三个累计
-    // Inout 共享 Alloc owner，去重后共 3 条 fanin；output_view 把更新写回当前 batch。
-    ResetTaskArgs(args);
-    if (!ReserveTensorArgs(args, 3)) return;
-    AppendGmTensor(args, *orch.sf_max, TensorArgType::Input);
-    AppendGmTensor(args, *orch.sf_sum, TensorArgType::Input);
-    AppendGmTensor(args, *orch.pv_output, TensorArgType::Input);
-    if (!ReserveTensorArgs(args, 4)) return;
-    AppendGmTensor(args, *orch.accumulated_max, TensorArgType::Inout);
-    AppendGmTensor(args, *orch.accumulated_sum, TensorArgType::Inout);
-    AppendGmTensor(args, *orch.accumulated_output, TensorArgType::Inout);
-    AppendLocalTensor(args, orch.output_view, TensorArgType::Inout);
-    AddTwoScalars(
-        args, orch.current_block_offset == 0 ? 1 : 0,
-        orch.current_block_offset + orch.current_nblocks >= orch.current_blocks ? 1 : 0
-    );
-}
+    template <typename Thunk>
+    PA_DEVICE void AddLocalInput(Thunk thunk) {
+        if (!Ready()) return;
+        const TensorDesc &tensor = thunk();
+        AddLocalTensor(args_, tensor, TensorArgType::Input);
+        if (!args_.has_error) ++counts_.tensor_args_added;
+    }
+
+    template <typename Thunk>
+    PA_DEVICE void AddGmInput(Thunk thunk) {
+        if (!Ready()) return;
+        PA_GM const TensorDesc &tensor = thunk();
+        AddGmTensor(args_, tensor, TensorArgType::Input);
+        if (!args_.has_error) ++counts_.tensor_args_added;
+    }
+
+    template <typename Thunk>
+    PA_DEVICE void AddOutput(Thunk thunk) {
+        if (!Ready()) return;
+        const TensorCreateInfo &create_info = thunk();
+        pa_scheduler::AddOutput(args_, create_info);
+        if (!args_.has_error) ++counts_.tensor_args_added;
+    }
+
+    template <typename Thunk>
+    PA_DEVICE void AddLocalInout(Thunk thunk) {
+        if (!Ready()) return;
+        const TensorDesc &tensor = thunk();
+        AddLocalTensor(args_, tensor, TensorArgType::Inout);
+        if (!args_.has_error) ++counts_.tensor_args_added;
+    }
+
+    template <typename Thunk>
+    PA_DEVICE void AddGmInout(Thunk thunk) {
+        if (!Ready()) return;
+        PA_GM const TensorDesc &tensor = thunk();
+        AddGmTensor(args_, tensor, TensorArgType::Inout);
+        if (!args_.has_error) ++counts_.tensor_args_added;
+    }
+
+    template <typename Thunk>
+    PA_DEVICE void AddScalar(Thunk thunk) {
+        if (!Ready()) return;
+        pa_scheduler::AddScalar(args_, thunk());
+        if (!args_.has_error) ++counts_.scalar_args_added;
+    }
+
+    PA_DEVICE bool Valid() const { return begin_calls_ == 1 && !args_.has_error; }
+    PA_DEVICE const CallbackSubmitBuildCounts &Counts() const { return counts_; }
+
+private:
+    PA_DEVICE bool Ready() {
+        if (begin_calls_ == 1 && !args_.has_error) return true;
+        args_.has_error = true;
+        return false;
+    }
+
+    TaskArgs &args_;
+    TaskKind kind_;
+    uint32_t begin_calls_;
+    CallbackSubmitBuildCounts counts_;
+};
 
 PA_DEVICE void AcceptTaskOutputs(PaOrchestrationState &orch, TaskKind kind, const TaskOutputs &outputs) {
     // 每个 worker 都完整回放并接收自己 materialize 的 descriptor；只有 Claim winner
@@ -776,7 +768,7 @@ PA_DEVICE void FreeMapEntry(PA_GM TensorMap &map, int32_t index) {
 }
 
 PA_DEVICE void AdvanceTensorMap(PA_GM TensorMap &map, uint32_t task_id, int32_t heap_window) {
-    // PrepareMap 在 Claim 前把存活下界推进到 task_id-H。离开窗口的 producer 先按
+    // PrepareMap 在 Claim 后把存活下界推进到 task_id-H。离开窗口的 producer 先按
     // task_heads 找到其全部 entry，再从 bucket 链摘除并进入 free list。TensorMap 与
     // heap 共享窗口宽度 H，但前者按本 worker 的 task_id 推进，后者按跨核连续
     // frontier 推进，二者并不要求同步到达同一位置。
@@ -956,40 +948,15 @@ PA_DEVICE uint64_t FrontendAlignUp(uint64_t value, uint64_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
-PA_DEVICE void BeginSubmit(
-    PA_GM WorkerState &worker, const TaskArgs &args, SubmitContext &context
-) {
-    // Mirrors dist_submit_begin(). The production Submit and Materialize spans
-    // both start after this per-call context initialization.
-    // local_index 在所有 worker 上按同一 orchestration 顺序递增，因此
-    // task_id 一致；该初始化位于 Submit 计时起点之前，不能误计进阶段耗时。
-    const uint32_t task_id = static_cast<uint32_t>(worker.local_index++);
-    context.self = &worker;
-    context.payload = &worker.payloads[task_id & kPayloadMask];
-    context.task_id = static_cast<int32_t>(task_id);
-    context.tensor_count = args.tensor_count;
-    context.scalar_count = args.scalar_count;
-    context.result.task_id = task_id;
-    context.result.count = 0;
-    context.register_mask = 0;
-    context.output_bytes = 0;
-    context.fanin_count = 0;
-    context.kernel_id = -1;
-    context.won = false;
-    context.joint = false;
-    context.joint_init = false;
-    context.joint_block = -1;
-    context.joint_slot = -1;
-    context.joint_count = 0;
-}
-
 PA_DEVICE bool MaterializeTask(
     PA_GM WorkerState &worker, uint32_t task_id, const TaskArgs &args, SubmitContext &context,
     uint64_t heap_base, uint64_t heap_size
 ) {
-    // 输入是 BeginSubmit 已绑定的 payload/context 与当前 worker.heap_next；成功输出
+    // 输入是 BeginCallbackSubmit 已绑定的 payload/context 与当前 worker.heap_next；成功输出
     // 包括本 task 的 GM TensorDesc 指针、output_bytes 和推进后的单调 heap_next。
-    // 失败不得进入 Claim/slot 流程，由上层设置 fatal 并终止该 worker 回放。
+    // 失败不得进入 slot/build 流程，由上层设置 fatal 并终止该 worker 回放。
+    // compete-first 路径在这里已完成 Claim，因此不能再把“尚未 Claim”当作
+    // 这个共用 helper 的前置条件。
     if (context.payload == nullptr) {
         return false;
     }

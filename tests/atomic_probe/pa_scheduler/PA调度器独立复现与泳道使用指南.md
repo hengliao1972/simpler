@@ -26,6 +26,14 @@
 执行。每次运行都会校验这些数量以及最终 TensorMap、heap、cursor、flag、vend、
 frontier 和 worker 状态，任一不符都会返回失败。
 
+当前提交顺序是 compete-first eager：每核先执行 `EfDrain` 和
+`Claim`，再同步构造完整 `TaskArgs`，然后进入 `Materialize`、
+`PrepareMap`、winner `Fanin`、`Register` 与 winner 尾流程。eager 语义保持
+不变：loser 也构造全部参数并执行后续前端逻辑，不存在按
+winner 跳过构参的 lazy 快路。CCEC 正式泳道构建将 orchestration caller、
+每核 runtime state 和 noinline finish 拆分为独立 TU；CPU/AscendC 保持
+同一业务顺序，但 finish 在当前 TU 内联。
+
 Case1 的 task 不是五个彼此独立的占位符。standalone 会从 Tensor descriptor 的
 owner 和本 worker 的 TensorMap 收集 producer，去重后构造下列 fanin 图：
 
@@ -768,6 +776,13 @@ phase/lap/Kernel 边界修复之前的 schema-v2 逐调用模型，只能用于�
 代码会改变 scalar 指令布局和 I-cache 本身，将其保留在 PMU ELF 里即使
 运行时关闭 record，也会污染要观察的取指环境。
 
+`none`/`claim`/`efdrain` 保持与泳道版一致的跨 TU split-finish
+形状；这两个局部阶段的边界都在 finish 之前。`materialize`/
+`register` 边界位于 finish 内，当前为了使用同一份真实
+PMU context 而采用 inline-finish 诊断 ELF。因此后两者与 `none`
+的代码布局并不相同，只能解释各自 ELF 内的观测结果，不能与
+`none` 机械相减或当作无扰动的阶段净值。
+
 当前 `submit-pmu` 只支持：
 
 | phase | 编译期 ID | 局部边界 | 用途 |
@@ -820,6 +835,12 @@ submit_icache_raw.json       # 96 核权威原始数据
 submit_icache_report.html    # 浏览器直接打开的离线图表和汇总
 ```
 
+compete-first eager 移植后的五种 CCEC A5 b1 回归位于
+`outputs/compete_first_submit_pmu_b1_20260720/{none,claim,efdrain,materialize,register}/`。
+五轮均为 96/96 trusted，语义、真计算输出、role/triplet、owner Restore、
+phase status/time 与 primary/shadow 门禁全部通过；`none` 的 phase calls
+为 0，四个局部 phase 均精确为 `96 * 5 = 480` 次。
+
 HTML 中包含 AIC/AIV 的每核 request、miss、miss rate、p95、96 核散点和
 局部 phase 的 lower/upper 区间。schema-v5 的 running phase 还在页面
 最前面按 ALL/AIC/AIV 并列阶段时间、request 和 miss 占比；阶段时间
@@ -855,8 +876,9 @@ I-cache stall**：差值还混有同步等待、Cube/Vector/MTE 等 engine 等�
 报告只复用 `pmu_sidecar_analyzer.py` 已校验的统计口径；生成失败不会删除已经发布
 的 raw，但本次 action 会返回非零。
 
-这里的 PMU whole gate 从 orchestration 初始化/首次构参前开始，到末次
-Submit 返回后停止，包含 Submit 间构参和 `AcceptTaskOutputs()`，排除
+这里的 PMU whole gate 从 orchestration 初始化前开始，到末次
+Submit 返回后停止，包含 Submit 内的 EfDrain、Claim、同步 eager
+构参和 finish，也包含 Submit 间的 `AcceptTaskOutputs()`/调用衔接，排除
 FinalDrain。`submit_elapsed_ticks` 是每核首末 Submit 时间；顶部
 `submit_span_us` 则是 96 核共同墙钟范围。三者不能混用，详细定义见
 `../icache_miss_usage_guide.md`。
@@ -939,7 +961,7 @@ Materialize 和 Register 边界。`efdrain` 插点只允许包围 Submit 开头�
 不能误算成每次 Submit 两次。每个 running phase 还要求每核
 `phase_elapsed_ticks > 0`且不超过同核从首个 `submit_begin` 计时点
 到末个 `submit_end` 计时点的 `submit_elapsed_ticks`；前者位于首个
-`BeginSubmit()` 上下文初始化之后，后者位于末个 Submit 返回之前。
+`BeginCallbackSubmit()` 上下文初始化之后，后者位于末个 Submit 返回之前。
 `none` 的 phase elapsed 必须精确为 0。
 当前 Case1 中真实 TensorMap insert 工作主要发生在
 UP 的输出注册，其他 task 的 Register 可能很短或没有 insert；因此该 phase 的
@@ -1430,9 +1452,15 @@ ClockBaseline，并继续以逐核容量、调用数、总记录数和 `dropped=
 ## 7. 内存占用和脱仓复制
 
 为保持真实 DistGlobal/DistCore 偏移、65,536 个 task cell、每 worker payload
-和 TensorMap，当前 `WorkerResult` 为 832 bytes，用当前头文件实际编译得到的
-`SchedulerState` 为 1,007,104,896 bytes。新增的 64 bytes 是独立、对齐的
-winner workload 配置 cache line，生产 DistGlobal/DistCore 关键偏移保持不变。
+和 TensorMap，非 split 的 CPU/AscendC 构建中 `WorkerResult` 为 832 bytes、
+`SchedulerState` 为 1,007,104,896 bytes。CCEC swimlane 以及使用 split-finish
+的 submit-PMU 构建为了发布跨 TU 正确性诊断，`WorkerResult` 为
+896 bytes、`SchedulerState` 为 1,007,111,040 bytes，增量精确为
+`64 * 96 = 6,144` bytes。split ELF 另预留 AIC/AIV 两个 role-specific
+block-local runtime state，每个精确 1,600 bytes、最终 section 合计
+3,200 bytes；它们不属于 GM `SchedulerState`。
+独立的 64 bytes winner workload 配置 cache line 与生产 DistGlobal/
+DistCore 关键偏移保持不变。
 默认泳道缓冲区另占 402,660,160 bytes；CCEC/AscendC `real-compute` 还在 device 分配
 12,713,984 bytes workspace。因此 scalar-nop+trace 的 A5 device 占用约
 1.313 GiB，real-compute+trace 约 1.325 GiB，host 侧也需分配相近内存。

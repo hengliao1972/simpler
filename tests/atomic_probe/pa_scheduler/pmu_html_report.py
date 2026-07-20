@@ -626,7 +626,7 @@ def render_report(
         phase_front_section = f"""
   <section class="panel phase-overview-front" aria-label="局部阶段总览">
     <h2>局部阶段总览：{_escape(phase)}</h2>
-    <p class="phase-share-note">时间占比是 <code>Σ阶段 SYS_CNT / Σ同核首个 submit_begin 计时点到末个 submit_end 计时点 SYS_CNT</code>，分别在 ALL/AIC/AIV 内先求和再相除。首个 submit_begin 位于 BeginSubmit 上下文初始化之后，末个 submit_end 位于返回之前。它是逐核累计 core-time 构成，不是该阶段占全局约 5 ms 墙钟的切片。request/miss 仍显示同一 ELF primary-shadow 形成的下界..上界；阶段时间是单点观察值。</p>
+    <p class="phase-share-note">时间占比是 <code>Σ阶段 SYS_CNT / Σ同核首个 submit_begin 计时点到末个 submit_end 计时点 SYS_CNT</code>，分别在 ALL/AIC/AIV 内先求和再相除。首个 submit_begin 位于 BeginCallbackSubmit 上下文初始化之后，末个 submit_end 位于返回之前。它是逐核累计 core-time 构成，不是该阶段占全局约 5 ms 墙钟的切片。request/miss 仍显示同一 ELF primary-shadow 形成的下界..上界；阶段时间是单点观察值。</p>
     <div class="phase-share-grid">{phase_share_cards}</div>
   </section>
 """

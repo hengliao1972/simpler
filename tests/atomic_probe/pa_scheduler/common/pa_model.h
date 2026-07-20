@@ -117,6 +117,12 @@ enum class CoreRole : uint32_t {
     Aiv = 1,
 };
 
+#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+// split caller 与 finish 通过同一份 block-local 状态协作。cookie 只用于
+// 正确性闭环：它同时编码 worker 与核型，防止 AIC/AIV 或相邻 worker 串用状态。
+constexpr uint64_t kCompeteFirstSplitStateCookieBase = 0x434653504c495400ULL;
+#endif
+
 // task_id % 5 即 kind；该周期性是不变量，既决定 Claim cursor/active role，
 // 也决定输出大小、fanin 拓扑和 winner workload 的选择。
 enum class TaskKind : uint32_t {
@@ -801,10 +807,30 @@ struct alignas(64) WorkerResult {
     uint32_t pmu_phase_icache_misses;
     uint32_t pmu_shadow_icache_requests;
     uint32_t pmu_shadow_icache_misses;
+#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+    // split 协议诊断独占一条 cache line。普通 CPU/AscendC 与局部 PMU
+    // 构建不带这些字段，不改变它们的 WorkerResult ABI。
+    uint64_t compete_first_split_caller_state_address;
+    uint64_t compete_first_split_finish_state_address;
+    uint64_t compete_first_split_finish_calls;
+    uint64_t compete_first_split_protocol_errors;
+    uint64_t compete_first_split_state_cookie;
+    uint64_t compete_first_split_task_id_sum;
+    uint64_t compete_first_split_owner_worker_id;
+    uint64_t compete_first_split_reserved;
+#endif
 };
 // WorkerResult 是 standalone 尾部的诊断 sidecar，不属于真实 DistCore ABI；按
 // cache line 隔离后，各 worker 发布统计不会相互覆盖或污染被测共享状态。
+#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+static_assert(sizeof(WorkerResult) == 896, "split WorkerResult diagnostics must occupy whole cache lines");
+static_assert(offsetof(WorkerResult, compete_first_split_caller_state_address) == 832,
+              "split WorkerResult oracle offset mismatch");
+static_assert(offsetof(WorkerResult, compete_first_split_reserved) == 888,
+              "split WorkerResult oracle tail mismatch");
+#else
 static_assert(sizeof(WorkerResult) == 832, "WorkerResult diagnostics must occupy whole cache lines");
+#endif
 static_assert(offsetof(WorkerResult, pmu_total_cycles) == 680, "WorkerResult PMU offset mismatch");
 static_assert(offsetof(WorkerResult, pmu_status) == 700, "WorkerResult PMU status offset mismatch");
 static_assert(offsetof(WorkerResult, fanin_not_ready_loads) == 704, "WorkerResult atomic diagnostic offset mismatch");
