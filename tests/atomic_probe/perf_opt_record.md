@@ -171,7 +171,9 @@ outputs/TestPagedAttentionUnroll_Case1_20260717_023809/
 | 2026-07-21 | `40bd6602` | 波动分析 | 收口独占设备上的 P 构建波动来源 |
 | 2026-07-21 | `a58ee868` | PMU 分析 | 收口 N 构建的 Scalar/I-cache 波动载体 |
 | 2026-07-21 | `a17c188a` | 观察工具 | 建立真实 PA Submit 窗内 Kernel 低容量聚合 |
-| 2026-07-21 | 本阶段提交 | 波动分析 | 收口 K 构建的 Kernel/residual 波动载体 |
+| 2026-07-21 | `05397cd7` | 波动分析 | 收口 K 构建的 Kernel/residual 波动载体 |
+| 2026-07-21 | `6acebc8f` | 环境取证 | 记录设备状态、低功耗接口及并发边界 |
+| 2026-07-21 | 本阶段提交 | 阶段归因 | 排除 Materialize 为同 ELF 波动主载体 |
 
 ### 4.1 真实 PA 第一轮 atomic 与前端优化
 
@@ -2496,7 +2498,7 @@ Scalar busy、atomic、I-cache miss 或频率问题。下一阶段先对 K resid
 
 ### 8.9 独立设备状态与低功耗定性取证
 
-**[取证进行中；idle 链路和原始字段已闭合，持续负载探针等待排除并发 A5 任务后执行]**
+**[取证已完成；排除约 10.24 ms 粒度的持续 DVFS/EDP 主导，不外推到更短瞬态]**
 
 第 8.5～8.8 节已经把 P、N、K 各自的同 ELF 波动形态摸清，但仍不能回答设备内部
 频率、EDP 降频或外部任务是否参与了某一批次。这里增加一次**独立、限时、只作定性
@@ -2592,6 +2594,159 @@ P/N 的尾部形态不同提供了一个必须排除的环境变量，但**不�
 稳定在目标频率且 EDP 计数不增长，只能排除“粗粒度持续 DVFS/EDP”为主因，仍不能
 排除短于一个采样周期的瞬态。随后立即回到 Materialize 同 ELF 单阶段 PMU，不把
 低功耗采样扩张成长期路线。
+
+#### 8.9.5 持续真实 PA 负载探针与路线收口
+
+root 级系统评测在 `09:07 UTC` 退出。后续每个正式样本前后均未再发现该进程；本机
+又没有契约完整且已安装的 device-PID 枚举 CLI，所以这里准确表述为“已排除已知
+并发评测”，不把普通用户无法查看 root 文件描述符包装成更强的设备独占证明。
+
+第一次主动负载尝试保留为失败记录：`/tmp/fdwic_power_probe_20260721_090907.log`
+中的 100 轮真实 PA 本身 PASS，但探测脚本错误地只等待 `/dev/davinci0`；实际 Python
+进程只持有 `/dev/davinci_manager`，所以脚本没有启动 power 采集。随后手工启动的
+`/tmp/asys_power_pa_active_20260721_091152/` 已落在负载结束之后，不进入负载结论。
+没有用这份错位数据凑数。
+
+第二次改为复用真实 PA 日志中已经存在的 AICPU 初始化标志，不再猜设备文件。20 轮
+无泳道、无 PMU 的 Case1 在 `09:13:14.721` 出现初始化标志，power 采集于
+`09:13:15.191` 开始并持续约 3 s；测试随后完成 20/20 轮，单轮 device 时间为
+77.206～84.442 ms，因此采集窗口与真实负载明确重叠。PA 时间因与 `msprof` 同场而
+全部作废，只保留低功耗字段：
+
+```text
+/tmp/fdwic_power_probe_aligned_20260721_091233.log
+/tmp/asys_power_pa_aligned_20260721_091233/
+  asys_profiling_result_20260721091315170/
+    PROF_000001_20260721091315186_03293075NQEEOOGB/
+      device_0/sqlite/lowpower.db
+```
+
+die 0/1 各有 291 个点，290 个间隔全部为 10.240002 ms，覆盖 2.969600580 s；两 die
+的 `data7_hard` 和 `data0_soft` 每一点均为 1650 MHz，POWERBRAKE 与
+IWARNING2/1/0 每一点均为 0。由此可以排除该 3 s 负载窗内可被 10.24 ms 采样解析的
+持续频率阶跃和 EDP 计数增长。它仍不能排除单个约 5 ms Submit 内更短的瞬态，也不
+能证明当前 SLLC Major/module-error 告警与波动无关。至此停止扩展 power 路线，后续
+性能样本不再与 `asys/msprof` 同场。
+
+### 8.10 同一 Materialize ELF 的阶段与其余 Submit 波动分解
+
+**[阶段归因已完成；Materialize 不通过主载体门禁，波动落在同核其余 Submit]**
+
+#### 8.10.1 冻结对象与采样协议
+
+本阶段直接复用已经闭合的 `submit-pmu-materialize`，不增加 selector、raw 字段或
+逐事件记录。它精确覆盖 task-cap 检查和 `dist_submit_materialize_args()`，排除后继
+PrepareMap；Case1 每核固定 1,280 次 begin/end。正式取数前后身份完全一致：
+
+| 对象 | 固定值 |
+| --- | --- |
+| commit | `6acebc8fca0b053a2c014cf40ffed0dced17d1fa` |
+| AICore cache | `b28cf51da4d4f547` |
+| AICore 定义 | `PTO_FDWIC_SUBMIT_PMU=1;PTO_FDWIC_SUBMIT_PMU_PHASE_ID=3;PTO_FDWIC_TRACE_ENABLED=0` |
+| `aicore_kernel.o` | 2,499,680 B / SHA256 `6fea16b12c3f3dd46fa8417969042fa5114e0d06ddb3c3dea0efe3d30254a8b0` |
+| AIC/AIV combined | `afa5206a2a5f8cb9a7f6fa9992f8531bb04b92b21791bbdd0c8599bc1bd42584` / `31a1ef188cb27718cbba3aab7f939a7dc823975049b49c57ea05c39c5fef0061` |
+| `libhost_runtime.so` | SHA256 `5f2e9af0892f64f28aded87e013a5b32425d86940b2e08cd34dad49cab0c0f9d` |
+
+power 探针结束后先运行一轮同参数 Case1 重新预热：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260721_091623/
+```
+
+该轮明确排除出统计。随后连续运行 12 个彼此独立的 pytest 进程，每个进程固定
+`--case Case1 --fdwic-profile submit-pmu-materialize --rounds 1 --skip-golden`；没有
+单进程多轮、人工 sleep 或极值删除。12/12 均 PASS：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260721_091706/
+outputs/TestPagedAttentionUnroll_Case1_20260721_091750/
+outputs/TestPagedAttentionUnroll_Case1_20260721_091835/
+outputs/TestPagedAttentionUnroll_Case1_20260721_091919/
+outputs/TestPagedAttentionUnroll_Case1_20260721_092002/
+outputs/TestPagedAttentionUnroll_Case1_20260721_092045/
+outputs/TestPagedAttentionUnroll_Case1_20260721_092128/
+outputs/TestPagedAttentionUnroll_Case1_20260721_092213/
+outputs/TestPagedAttentionUnroll_Case1_20260721_092258/
+outputs/TestPagedAttentionUnroll_Case1_20260721_092342/
+outputs/TestPagedAttentionUnroll_Case1_20260721_092425/
+outputs/TestPagedAttentionUnroll_Case1_20260721_092508/
+```
+
+生产 `load_capture()` 逐份复验通过：12 份均为 96 核、32 AIC + 64 AIV、每核
+1,280 次 Submit 和 Materialize begin/end，1,152 条逐核记录全部满足
+status `0x7ff`、phase status `0x3f`、owner 配置/恢复、拓扑、计数顺序和风险阈值；
+primary/shadow request/miss 1,152/1,152 精确相等。12 份 HTML 也与当前
+`render_report(raw)` 逐字节一致。总计覆盖 1,474,560 次 Submit/Materialize 调用。
+
+#### 8.10.2 整数分解与 12 轮原始结果
+
+继续沿用第 8.5 节定义。对每轮最晚结束核 `z`，再把它自己的 body 拆为：
+
+```text
+Pz = phase_elapsed_ticks[z]
+Rz = submit_elapsed_ticks[z] - Pz
+G  = A + Pz + Rz
+```
+
+`Pz/Rz` 只在同一 Materialize ELF、同一核、同一轮中相加；不会把 phase core-time
+或其他 ELF 的时间拿来扣墙钟。下表时间均为 us：
+
+| 轮次 | 时间戳 | G | M | X | A | Pz | Rz | 最晚核 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | `091706` | 5129.351 | 4584.886 | 534.023 | 10.442 | 1020.215 | 4098.694 | c18/AIC/b18/l0 |
+| 2 | `091750` | 4890.960 | 4575.058 | 311.516 | 4.386 | 1005.842 | 3880.732 | c22/AIC/b22/l0 |
+| 3 | `091835` | 4927.376 | 4596.597 | 330.618 | 0.161 | 970.163 | 3957.052 | c25/AIC/b25/l0 |
+| 4 | `091919` | 4733.656 | 4594.046 | 129.707 | 9.904 | 1002.399 | 3721.353 | c16/AIC/b16/l0 |
+| 5 | `092002` | 4665.849 | 4577.212 | 84.337 | 4.300 | 1020.395 | 3641.154 | c71/AIV/b19/l2 |
+| 6 | `092045` | 4659.749 | 4579.614 | 72.424 | 7.711 | 1022.620 | 3629.418 | c41/AIV/b4/l2 |
+| 7 | `092128` | 5088.129 | 4831.484 | 256.510 | 0.136 | 1032.260 | 4055.733 | c45/AIV/b6/l2 |
+| 8 | `092213` | 4943.694 | 4593.721 | 344.279 | 5.693 | 1002.572 | 3935.429 | c27/AIC/b27/l0 |
+| 9 | `092258` | 4653.506 | 4586.275 | 58.016 | 9.215 | 1056.466 | 3587.825 | c70/AIV/b19/l1 |
+| 10 | `092342` | 4708.335 | 4595.176 | 103.877 | 9.281 | 1022.974 | 3676.080 | c72/AIV/b20/l1 |
+| 11 | `092425` | 4731.198 | 4595.085 | 127.303 | 8.810 | 991.187 | 3731.201 | c11/AIC/b11/l0 |
+| 12 | `092508` | 4755.224 | 4583.503 | 161.814 | 9.907 | 1010.032 | 3735.285 | c28/AIC/b28/l0 |
+
+12 轮最晚核分散在 12 个不同 core，AIC/AIV 为 7/5，不支持固定坏核解释。分布使用
+整数 tick 派生，MAD 为未缩放中位绝对偏差，P10/P90 采用线性插值：
+
+| 指标 | 最小值 | 中位数 | 最大值 | MAD | P10 | P90 | P90-P10 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| G | 4653.506 | 4744.440 | 5129.351 | 87.813 | 4660.359 | 5073.686 | 413.327 |
+| M | 4575.058 | 4589.998 | 4831.484 | 5.836 | 4577.452 | 4596.455 | 19.003 |
+| X | 58.016 | 145.760 | 534.023 | 80.540 | 73.616 | 342.913 | 269.298 |
+| A | 0.136 | 8.261 | 10.442 | 1.914 | 0.575 | 9.907 | 9.332 |
+| Pz | 970.163 | 1015.124 | 1056.466 | 10.917 | 992.308 | 1031.331 | 39.023 |
+| Rz | 3587.825 | 3733.243 | 4098.694 | 124.621 | 3630.592 | 4045.865 | 415.273 |
+| Materialize mean/core | 1020.461 | 1021.320 | 1022.028 | 0.234 | 1020.962 | 1021.957 | 0.994 |
+| 其余 Submit mean/core | 3500.079 | 3523.462 | 3834.918 | 9.251 | 3506.308 | 3539.937 | 33.629 |
+
+#### 8.10.3 主载体门禁与结论边界
+
+沿用预先固定的双门禁：`abs(Spearman(G, component)) >= 0.7`，且 component 的
+`P90-P10 >= 50% * G(P90-P10)`：
+
+| 分量 | Spearman(G, ·) | P90-P10 | 占 G 波幅 | 判定 |
+| --- | ---: | ---: | ---: | --- |
+| M | +0.287 | 19.003 us | 4.60% | FAIL |
+| X | +0.958 | 269.298 us | 65.15% | PASS：该 ELF 为慢尾形态 |
+| A | -0.105 | 9.332 us | 2.26% | FAIL |
+| Pz | -0.343 | 39.023 us | 9.44% | **FAIL：Materialize 不是主载体** |
+| Rz | +0.986 | 415.273 us | 100.47% | **PASS：变化落在同核其余 Submit** |
+| Materialize mean/core | +0.091 | 0.994 us | 0.24% | FAIL |
+| 其余 Submit mean/core | +0.720 | 33.629 us | 8.14% | FAIL：相关但整体幅度不足 |
+
+因此本阶段成立的结论是：**在当前 Materialize 诊断 ELF 中，最晚核的波动不由
+Materialize 携带，而由该核其余 Submit 路径携带。** Materialize 每核平均 core-time
+几乎不动，12 轮 P90-P10 只有 0.994 us；每次 request 中位 233.061、范围
+232.911～233.243，每次 miss 中位 1.438、范围 1.424～1.447，同样没有随 G 同向的
+大幅变化。它在同 ELF 中仍占约 22.47% core-time，说明绝对成本重要，但“占比大”
+不能替代波动门禁，也不能据此先改固定扫描逻辑。
+
+本组 G 的 P90-P10 为 413.327 us，已有可分辨波形，而 Pz 的相关性和幅度都远离
+门槛，因此不扩到 20 轮。更重要的是，本组由 X 而不是 M 通过门禁，没有复现权威 P
+的多数核 body 共同伸缩形态；所以 Rz 结论只限定于 Materialize ELF，不能直接外推
+成 P 的根因或可兑现收益。下一阶段按既定顺序切换到现有 `submit-pmu-claim`，优先
+检查包含 return-ready atomic 的 Claim 是否携带同 ELF 波动；仍不修改业务代码。
 
 ## 9. 已撤回、失败或不能外推的路线
 
@@ -2912,11 +3067,22 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
     虽相关但幅度只有 G 的 0.65%，calls 仅 998～1011 且与 G 负相关。由此只在 K
     内部排除 Kernel 总数量或 mean/core 变化幅度主导，不能外推 P 根因；residual
     也还不能未经细分就命名为 Scalar、atomic、I-cache、flag 等待或频率问题。
+11. **[环境取证，已完成] 持续真实 PA 负载 power probe**：在已知 root A5 评测退出
+    后，用日志初始化标志对齐 20 轮真实 PA 和 3 s `asys --sys-lp`。die 0/1 各 291
+    个点均为 hard/soft 1650 MHz，POWERBRAKE 与三级 IWARNING 均为 0；只排除
+    10.24 ms 粒度的持续 DVFS/EDP，不外推到一个 Submit 内的更短瞬态。第一次错误
+    等待 `/dev/davinci0` 的错位样本已明确作废。
+12. **[Materialize 波动归因，已完成] 同一诊断 ELF 的 12 轮独立 Case1**：12/12
+    生产消费者和 HTML 闭合，最晚核 Materialize `Pz` 的 `rho=-0.343`、波幅只占 G
+    的 9.44%，不通过；同核其余 Submit `Rz` 的 `rho=+0.986`、波幅 100.47%，通过。
+    Materialize mean/core 的 P90-P10 仅 0.994 us。本组由 X 慢尾而不是 M 共同伸缩
+    通过门禁，因此只排除 Materialize 为该 ELF 的波动主载体，不外推 P 根因。
 
-下一步不再扩充 N，也不跨 ELF 扣减。冻结的 K 已证明 residual 是波动载体，先用
-现有业务/atomic 泳道与独立设备状态取证缩小 residual 的原因范围；如果需要新增
-观察，只允许固定容量的每核聚合或一次只选一个既有最新 span，不能恢复逐 Submit/
-逐等待的大 raw。原因层级闭合后，再由原 perf-clock 交错 A/B 决定真实 Scalar 候选
-保留或撤销。
+下一步不再扩充 N、K 或 Materialize，也不跨 ELF 扣减。直接复用现有
+`submit-pmu-claim` 做同样的一次预热加 12 个独立 Case1，优先判断包含 return-ready
+atomic 的 Claim 是否携带同 ELF 波动；随后才按 `SubmitTransition -> ArgBuild ->
+Register` 继续。只有既有 selector 全部不能覆盖动态部分时，才设计固定容量的
+EfDrain-control/poll 聚合观察，不能恢复逐 Submit/逐等待的大 raw。原因层级闭合后，
+再由原 perf-clock 交错 A/B 决定真实 Scalar 候选保留或撤销。
 单阶段 observed 不机械扣除 empty，也不从单轮 I-cache 数直接提出生产优化；
 standalone 的绝对数继续不替代真实 PA 当前结果。
