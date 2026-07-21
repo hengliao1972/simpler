@@ -551,6 +551,9 @@ dist_submit_compete_first_begin(PTO2Runtime *, const MixedKernels &mixed) {
     // 与泳道 Claim.end 使用同一源码边界。局部 PMU 从这里跨过 Begin 返回、
     // 同步 eager callback 构参，直到匹配 Finish 的 Materialize 入口。
     fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::ArgBuild>();
+    // 校准 ELF 在相同 Claim.end 调用点紧邻执行一对 begin/end；其他 ELF
+    // 编译成空 wrapper。该窗口只量化观察器自身，不包业务体。
+    fdwic_submit_pmu_empty_bracket_calibrate();
     TRACE_SPAN_RECORD(claim_begin, claim_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Claim, claim_flags, 0);
     return dist_submit_make_ticket(ctx, DistSubmitKind::Kernel, submit_begin, ready);
 }
@@ -590,6 +593,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC DistCompeteFirstTicket dist_alloc_compete_first_be
     const uint32_t claim_flags = (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U);
     TRACE_TIMESTAMP(claim_end);
     fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::ArgBuild>();
+    fdwic_submit_pmu_empty_bracket_calibrate();
     TRACE_SPAN_RECORD(claim_begin, claim_end, ctx.self, ctx.task_id, -1, TracePhase::Claim, claim_flags, 1);
     return dist_submit_make_ticket(ctx, DistSubmitKind::Alloc, submit_begin, ready);
 }

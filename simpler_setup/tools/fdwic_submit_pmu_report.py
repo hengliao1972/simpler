@@ -40,8 +40,28 @@ PROGRAMMABLE_COUNTER_RISK_THRESHOLD = 0x3FFFFFFF
 
 NONE_CAPTURE_MODE = "submit-pmu-none"
 ARG_BUILD_CAPTURE_MODE = "submit-pmu-arg-build"
-SUPPORTED_CAPTURE_MODES = {NONE_CAPTURE_MODE, ARG_BUILD_CAPTURE_MODE}
+EMPTY_BRACKET_CAPTURE_MODE = "submit-pmu-empty-bracket"
 ARG_BUILD_PHASE_ID = 1
+EMPTY_BRACKET_PHASE_ID = 2
+PHASE_CONFIG_BY_MODE = {
+    ARG_BUILD_CAPTURE_MODE: {
+        "id": ARG_BUILD_PHASE_ID,
+        "name": "arg-build",
+        "boundary": "claim_end_to_materialize_begin",
+        "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+        "counter_semantics": "running_read_clear_observed_bracket",
+        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+    },
+    EMPTY_BRACKET_CAPTURE_MODE: {
+        "id": EMPTY_BRACKET_PHASE_ID,
+        "name": "empty-bracket",
+        "boundary": "claim_end_adjacent_empty_bracket",
+        "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+        "counter_semantics": "running_read_clear_empty_bracket_calibration",
+        "time_semantics": "outer_sys_cnt_around_adjacent_begin_end_pair",
+    },
+}
+SUPPORTED_CAPTURE_MODES = {NONE_CAPTURE_MODE, *PHASE_CONFIG_BY_MODE}
 PHASE_RECORD_FIELDS = (
     "phase_id",
     "phase_elapsed_ticks",
@@ -161,16 +181,13 @@ def _validate_capture_header(data: dict[str, Any]) -> tuple[str, dict[str, Any],
         if "phase" in configuration:
             _fail(f"configuration must not contain phase in {NONE_CAPTURE_MODE}")
     else:
+        expected_phase = {
+            **PHASE_CONFIG_BY_MODE[mode],
+            "expected_calls_per_core": expected_submits,
+        }
         _require_equal(
             configuration.get("phase"),
-            {
-                "id": ARG_BUILD_PHASE_ID,
-                "name": "arg-build",
-                "boundary": "claim_end_to_materialize_begin",
-                "expected_calls_per_core": expected_submits,
-                "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
-                "counter_semantics": "running_read_clear_observed_bracket",
-            },
+            expected_phase,
             "configuration.phase",
         )
     _require_equal(configuration.get("sys_counter_tick_ns"), 1, "configuration.sys_counter_tick_ns")
@@ -199,8 +216,14 @@ def _validate_capture_header(data: dict[str, Any]) -> tuple[str, dict[str, Any],
     return mode, configuration, expected_submits, frequencies
 
 
-def _validate_phase_record(record: dict[str, Any], prefix: str, expected_submits: int, submit_elapsed: int) -> None:
-    _require_equal(record.get("phase_id"), ARG_BUILD_PHASE_ID, f"{prefix}.phase_id")
+def _validate_phase_record(
+    record: dict[str, Any],
+    prefix: str,
+    expected_submits: int,
+    submit_elapsed: int,
+    expected_phase_id: int,
+) -> None:
+    _require_equal(record.get("phase_id"), expected_phase_id, f"{prefix}.phase_id")
     phase_elapsed = _integer(record.get("phase_elapsed_ticks"), f"{prefix}.phase_elapsed_ticks", minimum=1)
     phase_requests_observed = _integer(
         record.get("phase_icache_requests_observed"),
@@ -289,7 +312,7 @@ def _validate_record(
             _fail(f"{prefix}.shadow_icache_requests exceeds icache_requests")
         if shadow_misses > misses:
             _fail(f"{prefix}.shadow_icache_misses exceeds icache_misses")
-        _validate_phase_record(record, prefix, expected_submits, elapsed)
+        _validate_phase_record(record, prefix, expected_submits, elapsed, PHASE_CONFIG_BY_MODE[mode]["id"])
     programmable = (scalar, requests, misses, shadow_requests, shadow_misses)
     if any(value >= PROGRAMMABLE_COUNTER_RISK_THRESHOLD for value in programmable):
         _fail(f"{prefix} programmable counter reaches the risk threshold 0x3fffffff")
@@ -446,6 +469,7 @@ def _phase_group_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
     }
     primary_requests = sum(record["icache_requests"] for record in records)
     primary_misses = sum(record["icache_misses"] for record in records)
+    phase_calls = sum(record["phase_end_reads"] for record in records)
     return {
         "cores": len(records),
         "submit_elapsed_ticks": submit_elapsed,
@@ -463,8 +487,11 @@ def _phase_group_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "phase_miss_observed_plus_capture_gap_share_of_primary": (
             misses_observed_plus_gap["sum"] / primary_misses if primary_misses else 0.0
         ),
+        "phase_elapsed_ticks_per_call": phase_elapsed["sum"] / phase_calls,
+        "phase_icache_requests_observed_per_call": requests_observed["sum"] / phase_calls,
+        "phase_icache_misses_observed_per_call": misses_observed["sum"] / phase_calls,
         "phase_begin_reads": sum(record["phase_begin_reads"] for record in records),
-        "phase_end_reads": sum(record["phase_end_reads"] for record in records),
+        "phase_end_reads": phase_calls,
         "phase_max_shadow_request_chunk": max(record["phase_max_shadow_request_chunk"] for record in records),
         "phase_max_shadow_miss_chunk": max(record["phase_max_shadow_miss_chunk"] for record in records),
     }
@@ -709,6 +736,20 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
     if capture.phase_summary is None:
         return ""
 
+    phase = capture.data["configuration"]["phase"]
+    phase_name = html.escape(phase["name"])
+    phase_boundary = html.escape(phase["boundary"])
+    counter_semantics = html.escape(phase["counter_semantics"])
+    time_semantics = html.escape(phase["time_semantics"])
+    calibration_note = ""
+    if phase["id"] == EMPTY_BRACKET_PHASE_ID:
+        calibration_note = """
+    <p class="notice"><strong>empty-bracket 是每次 begin/end 紧邻执行的观察器自成本量尺，不是业务 phase。</strong>
+      phase_elapsed 是紧邻 begin+end 对的外层 SYS_CNT 经验耗时（含计时边界底噪）；request/miss observed
+      仍只覆盖两次 shadow read-clear 之间，并不包含 begin 读取前/end 读取后的全部 observer 取指。
+      两者都只是量级参照，不能跨 ELF 精确扣减。</p>
+        """
+
     rows = []
     for group_name in GROUP_NAMES:
         group = capture.phase_summary[group_name]
@@ -731,6 +772,9 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
             f"<td><strong>{_format_number(group['phase_elapsed_ticks']['sum'] / 1_000)} µs</strong><br>"
             f"<small>Submit core-time {_format_number(group['submit_elapsed_ticks']['sum'] / 1_000)} µs</small></td>"
             f"<td><strong>{group['phase_time_share_of_submit']:.3%}</strong></td>"
+            f"<td><strong>{_format_number(group['phase_elapsed_ticks_per_call'])} ns</strong><br>"
+            f"<small>request {_format_number(group['phase_icache_requests_observed_per_call'])} / "
+            f"miss {_format_number(group['phase_icache_misses_observed_per_call'])}</small></td>"
             f"<td>{request_observed}</td><td>{miss_observed}</td>"
             f"<td>{_format_integer(group['phase_begin_reads'])} / {_format_integer(group['phase_end_reads'])}</td>"
             f"<td>{_format_integer(group['phase_max_shadow_request_chunk'])} / "
@@ -739,8 +783,11 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
         )
     return f"""
   <section class="phase-overview">
-    <h2>Arg-build 局部归因（phase_id=1）</h2>
-    <p><strong>这是 running read-clear observed bracket，不是可与其他构建直接相减的独立计时。</strong>
+    <h2><code>{phase_name}</code> 阶段观察（phase_id={phase["id"]}）</h2>
+    <p class="fine">边界 <code>{phase_boundary}</code> · 计数语义 <code>{counter_semantics}</code> ·
+      时间语义 <code>{time_semantics}</code></p>
+    {calibration_note}
+    <p><strong>这是 running read-clear 观察区间，不是可与其他构建直接相减的独立计时。</strong>
       时间占比的分母是同一 ELF 的 Σ每核 Submit elapsed；request/miss 百分比的分母才是同一 ELF、
       同一次采集的 Submit 整窗 primary。<code>observed_plus_capture_gap = observed + (primary − shadow)</code>；
       边界读数和插桩 bookkeeping 会进入 sample，因此“观测值”和“加全窗 capture gap”都不是原业务
@@ -748,6 +795,7 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
     <div class="table-wrap phase-table"><table>
       <thead><tr>
         <th>核组</th><th>Phase / Submit core-time</th><th>时间占比</th>
+        <th>每次调用 elapsed / request / miss observed</th>
         <th>Request 观测值 / 加全窗 capture gap</th><th>Miss 观测值 / 加全窗 capture gap</th>
         <th>Begin / End reads</th><th>最大 request / miss chunk</th>
       </tr></thead>

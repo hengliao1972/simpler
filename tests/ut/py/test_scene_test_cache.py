@@ -104,6 +104,10 @@ def test_fdwic_profile_partitions_compile_cache(monkeypatch):
     assert _fdwic_profile() == "submit-pmu-arg-build"
     assert _profiled_cache_key(base) == (*base, "submit-pmu-arg-build")
 
+    monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-empty-bracket")
+    assert _fdwic_profile() == "submit-pmu-empty-bracket"
+    assert _profiled_cache_key(base) == (*base, "submit-pmu-empty-bracket")
+
 
 def test_fdwic_private_profiles_have_isolated_compile_definitions():
     assert _fdwic_compile_definitions("none") is None
@@ -118,6 +122,11 @@ def test_fdwic_private_profiles_have_isolated_compile_definitions():
     assert _fdwic_compile_definitions("submit-pmu-arg-build") == [
         "PTO_FDWIC_SUBMIT_PMU=1",
         "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=1",
+        "PTO_FDWIC_TRACE_ENABLED=0",
+    ]
+    assert _fdwic_compile_definitions("submit-pmu-empty-bracket") == [
+        "PTO_FDWIC_SUBMIT_PMU=1",
+        "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=2",
         "PTO_FDWIC_TRACE_ENABLED=0",
     ]
 
@@ -206,7 +215,8 @@ def test_submit_pmu_elf_gate_accepts_only_whole_window_observer(monkeypatch, tmp
     _assert_fdwic_submit_pmu_elf(tmp_path / "aicore_kernel.o", "submit-pmu-none")
 
 
-def test_submit_pmu_phase_elf_gate_requires_running_shadow_reader(monkeypatch, tmp_path):
+@pytest.mark.parametrize("profile", ["submit-pmu-arg-build", "submit-pmu-empty-bracket"])
+def test_submit_pmu_phase_elf_gate_requires_running_shadow_reader(monkeypatch, tmp_path, profile):
     symbol_table = (
         "10: 0000000000001000 64 FUNC WEAK DEFAULT 1 dist_submit_pmu_expect_submits\n"
         "11: 0000000000001040 96 FUNC LOCAL DEFAULT 1 fdwic_submit_pmu_read_counters\n"
@@ -218,7 +228,7 @@ def test_submit_pmu_phase_elf_gate_requires_running_shadow_reader(monkeypatch, t
         lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=symbol_table, stderr=""),
     )
 
-    _assert_fdwic_submit_pmu_elf(tmp_path / "aicore_kernel.o", "submit-pmu-arg-build")
+    _assert_fdwic_submit_pmu_elf(tmp_path / "aicore_kernel.o", profile)
 
 
 @pytest.mark.parametrize(
@@ -267,7 +277,8 @@ def test_submit_pmu_elf_gate_rejects_incomplete_or_mixed_image(monkeypatch, tmp_
         _assert_fdwic_submit_pmu_elf(tmp_path / "aicore_kernel.o", "submit-pmu-none")
 
 
-def test_submit_pmu_phase_elf_gate_rejects_missing_running_shadow_reader(monkeypatch, tmp_path):
+@pytest.mark.parametrize("profile", ["submit-pmu-arg-build", "submit-pmu-empty-bracket"])
+def test_submit_pmu_phase_elf_gate_rejects_missing_running_shadow_reader(monkeypatch, tmp_path, profile):
     symbol_table = (
         "10: 0000000000001000 64 FUNC WEAK DEFAULT 1 dist_submit_pmu_expect_submits\n"
         "11: 0000000000001040 96 FUNC LOCAL DEFAULT 1 fdwic_submit_pmu_read_counters\n"
@@ -279,7 +290,7 @@ def test_submit_pmu_phase_elf_gate_rejects_missing_running_shadow_reader(monkeyp
     )
 
     with pytest.raises(RuntimeError, match="missing defined submit-pmu marker"):
-        _assert_fdwic_submit_pmu_elf(tmp_path / "aicore_kernel.o", "submit-pmu-arg-build")
+        _assert_fdwic_submit_pmu_elf(tmp_path / "aicore_kernel.o", profile)
 
 
 def test_swimlane_elf_gate_accepts_merged_phase_atomic_observer(monkeypatch, tmp_path):

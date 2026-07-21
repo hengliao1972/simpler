@@ -21,6 +21,7 @@ constexpr uint32_t kFdwicSubmitPmuMagic = 0x554d5053U;  // little-endian "SPMU"
 constexpr uint16_t kFdwicSubmitPmuVersion = 1;
 constexpr uint16_t kFdwicSubmitPmuModeNone = 1;
 constexpr uint16_t kFdwicSubmitPmuModeArgBuild = 2;
+constexpr uint16_t kFdwicSubmitPmuModeEmptyBracket = 3;
 constexpr uint32_t kFdwicSubmitPmuExpectedAic = 32;
 constexpr uint32_t kFdwicSubmitPmuExpectedAiv = 64;
 constexpr uint32_t kFdwicSubmitPmuExpectedCores = kFdwicSubmitPmuExpectedAic + kFdwicSubmitPmuExpectedAiv;
@@ -33,7 +34,10 @@ enum class FdwicSubmitPmuPhase : uint16_t {
     // compete-first Claim 完成到匹配 Finish 的 Materialize 入口；包含同步
     // eager callback 构参、Begin 返回和 Finish 重入。
     ArgBuild = 1,
-    Count = 2,
+    // Claim.end 同一调用点的紧邻 begin/end；只提供 running bracket 自身
+    // 引入的空区间经验观察指纹，不代表任何业务 phase 或数学最小值。
+    EmptyBracket = 2,
+    Count = 3,
 };
 
 constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
@@ -42,13 +46,17 @@ constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
         return kFdwicSubmitPmuModeNone;
     case FdwicSubmitPmuPhase::ArgBuild:
         return kFdwicSubmitPmuModeArgBuild;
+    case FdwicSubmitPmuPhase::EmptyBracket:
+        return kFdwicSubmitPmuModeEmptyBracket;
     case FdwicSubmitPmuPhase::Count:
         break;
     }
     return 0;
 }
 
-constexpr bool fdwic_submit_pmu_mode_has_phase(uint16_t mode) { return mode == kFdwicSubmitPmuModeArgBuild; }
+constexpr bool fdwic_submit_pmu_mode_has_phase(uint16_t mode) {
+    return mode == kFdwicSubmitPmuModeArgBuild || mode == kFdwicSubmitPmuModeEmptyBracket;
+}
 
 // A5 PIPE_UTIL 事件布局。CNT6/CNT7 是权威值；CNT8/CNT5 使用相同事件作
 // 同窗副本。none 构建没有中途 read-clear，故两组必须逐核精确相等。

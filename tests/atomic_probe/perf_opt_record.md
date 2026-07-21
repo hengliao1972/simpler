@@ -161,7 +161,8 @@ outputs/TestPagedAttentionUnroll_Case1_20260717_023809/
 | 2026-07-20 | `8d5aa686` | 观察工具 | 建立真实 PA 低扰动 perf-clock 基线 |
 | 2026-07-20 | `9f6140c1` | 观察工具 | 收口真实 PA 业务与 atomic 合并泳道 |
 | 2026-07-21 | `faa370d9` | 观察工具 | 建立真实 PA `submit-pmu-none` 全窗证据链 |
-| 2026-07-21 | 本阶段提交 | 观察工具 | 建立真实 PA `arg-build` 单阶段 PMU |
+| 2026-07-21 | `2a7dccee` | 观察工具 | 建立真实 PA `arg-build` 单阶段 PMU |
+| 2026-07-21 | 本阶段提交 | 观察工具 | 量化真实 PA running bracket 的空区间观察指纹 |
 
 ### 4.1 真实 PA 第一轮 atomic 与前端优化
 
@@ -879,7 +880,7 @@ Submit envelope、EfDrain、OrchestrationReplay、FinalDrain 和 WorkerCompletio
 
 ### 8.3 `submit-pmu-none` 与真实 span 单阶段 PMU
 
-**[`submit-pmu-none` 与首个真实 span `arg-build` 均已完成 A5 收口]**
+**[`submit-pmu-none`、首个真实 span `arg-build` 和空 bracket 校准均已完成 A5 收口]**
 
 本阶段没有修改或复测 standalone，而是在真实 PA 中建立独立诊断构建。该构建在
 编译期去除普通泳道、atomic 观察和通用逐 task PMU ring，分为两种运行方式：
@@ -1038,6 +1039,119 @@ B1 `20260721_014715` 为 96×5 Submit、73.029 us；普通 level-4 B1
 这些结果证明 phase sidecar、reader 和状态只进入选中的 `arg-build` ELF；三轮绝对
 时间仍不互相相减。
 
+#### 8.3.3 running bracket 空区间校准：`submit-pmu-empty-bracket`
+
+**[观察工具，已完成两轮 B1 与两轮 Case1 实测闭合]**
+
+`arg-build` 的 running read-clear 会在每次阶段 begin/end 各读一次 shadow counter。
+在继续扩展业务 selector 前，本阶段先回答一个基础问题：同一套 begin/end 观察器
+紧邻执行、其中不包任何业务体时，会在真实 A5 PA 中形成怎样的稳定时间和 I-cache
+观察指纹。入口为 `--fdwic-profile submit-pmu-empty-bracket`，编译身份固定为：
+
+```text
+PTO_FDWIC_SUBMIT_PMU=1
+PTO_FDWIC_SUBMIT_PMU_PHASE_ID=2
+PTO_FDWIC_TRACE_ENABLED=0
+```
+
+host/runtime 契约使用独立 mode `3`、phase id `2`，phase 名称和边界分别为
+`empty-bracket`、`claim_end_adjacent_empty_bracket`。真实 hook 没有另造调用拓扑：
+Kernel 与 Alloc 的 compete-first Begin 都在现有 Claim 完成、`claim_end` 已取到的
+同一源码调用点，紧邻执行一次原样 generic phase begin/end；每个 Submit 恰好一对，
+B1 每核 5 对，Case1 每核 1,280 对。其他 profile 中该 wrapper 编译为空。
+
+时间和 PMU 计数必须按两种不同边界解释：
+
+- generic begin 在第一次 shadow read-clear 与 begin bookkeeping 之后读取内部
+  `SYS_CNT`，generic end 在第二次 shadow read-clear 之前读取内部 `SYS_CNT`；若只看
+  这两个内部 tick，空区间并没有覆盖完整的观察器调用成本；
+- empty wrapper 因此保存旧累计值和 begin/end 次数，用外层两个 `SYS_CNT` 包住完整
+  generic begin/end 对，校验次数各恰好增加 1、状态平衡且时间无溢出，再用外层
+  delta 覆盖本次内部 elapsed 增量。raw 明示
+  `time_semantics=outer_sys_cnt_around_adjacent_begin_end_pair`；
+- request/miss 仍保持原 running read-clear 口径：begin 样本只进入 whole shadow，
+  end 样本同时进入 whole shadow 与 phase observed。外层 `SYS_CNT` 不改变这组读清
+  边界，raw 明示
+  `counter_semantics=running_read_clear_empty_bracket_calibration`。
+
+所以 elapsed 是“外层时间戳包住完整相邻 begin/end 对”的经验耗时，request/miss
+是“两次 shadow read-clear 之间”的观察值；二者不是同一个精确指令边界。外层时间
+也包含两个 `SYS_CNT` 自身的底噪，不能称为观察器数学最小成本。
+
+该 profile 复用 `arg-build` 已有的 phase sidecar，没有增加设备 raw 字段、逐事件
+record 或泳道 ring。`submit-pmu-none` 仍为 128 B header 加 `96 × 64 B` whole record，
+共 6,272 B；`empty-bracket` 与其他单阶段 profile 同为再追加 `96 × 64 B` sidecar，
+共 12,416 B。每个 worker 最终仍只发布一份 whole 汇总和一份 phase 汇总，因此本次
+校准没有继续放大约 200 MB 的泳道数据。
+
+正式发布继续 fail-closed：96 核必须满足 owner 配置/恢复、唯一物理核与 32 个 mixed
+triplet 闭合；逐核 begin/end 次数都等于预期 Submit 数，phase status 为 `0x3f`，
+边界平衡、shape、数值顺序、时间落在本核 Submit 内和 tail read 全部成立；phase
+observed 不超过 shadow，shadow 不超过 primary，计数不越风险阈值。以下四轮均为
+32 AIC + 64 AIV、status `0x3f`、primary/shadow 96/96 精确相等，因而 capture gap
+为 0。
+
+两轮 B1 先用于结构与冷启动观察：
+
+| 产物 | 全局 Submit | ALL 每对 elapsed | ALL 每对 request | ALL 每对 miss |
+| --- | ---: | ---: | ---: | ---: |
+| `..._020932` | 257.430 us | 725.192 ns | 84.844 | 1.956 |
+| `..._021100` | 303.032 us | 719.304 ns | 69.194 | 2.444 |
+
+两轮完整 Case1 用于稳态经验尺度：
+
+| 产物 | 全局 Submit | 角色 | 每对 elapsed | 每对 request | 每对 miss |
+| --- | ---: | --- | ---: | ---: | ---: |
+| `..._021158` | 4,972.718 us | ALL | 640.465 ns | 49.340 | 1.342 |
+| 同上 | 同上 | AIC | 567.962 ns | 48.919 | 0.008 |
+| 同上 | 同上 | AIV | 676.717 ns | 49.550 | 2.009 |
+| `..._021311` | 4,866.126 us | ALL | 639.272 ns | 49.337 | 1.356 |
+| 同上 | 同上 | AIC | 567.619 ns | 48.870 | 0.008 |
+| 同上 | 同上 | AIV | 675.099 ns | 49.570 | 2.030 |
+
+B1 只有每核 5 对，首次进入 reader、对应调用点和相关代码布局时的冷取指占比很高；
+其 request 为 69.194～84.844/对，明显高于 Case1 稳定的约 49.34/对，elapsed 也从
+Case1 的约 639～640 ns/对升至约 719～725 ns/对。因此 B1 继续只作为结构、次数和
+冷启动门禁，不能替代 Case1 的稳态观察尺度。
+
+Case1 两轮还复现了稳定的角色差异：AIC 约 568 ns、48.9 request、0.008 miss/对，
+AIV 约 675～677 ns、49.6 request、2.01～2.03 miss/对。当前证据只证明同一观察
+实现对 AIC/AIV 形成不同且可复验的自扰动指纹；它没有证明差异必然来自 reader
+跨 I-cache line、某个固定冲突或 PMU 事件定义，后续若归因必须另做同构单变量证据。
+
+为决定是否应在本阶段调整 reader，另对 empty 最终 ELF 做了只读核验。AIC/AIV 的
+`fdwic_submit_pmu_phase_read_shadow_counters` 都只有一份、均为 92 B；两个 relocatable
+object 中该函数机器码逐字节相同，最终 ELF 仅因 block-local relocation 出现一个立即数
+字节差异。128 B line 下，AIC reader 起址行内偏移 76 B，AIV 为 120 B，两者都跨两行，
+所以“跨行”不能单独解释只有 AIV 约 2 miss/对。本机 CANN 9.1 的 DAV3510 模型配置
+显示 scalar I-cache 均为 4-way，但 AIC 为 32 KiB/64 sets、AIV 为 16 KiB/32 sets；
+对应 combined `.text` 又分别为 68,024 B 和 82,000 B。这些证据支持容量、角色代码和
+具体布局共同形成自扰动指纹，但聚合 PMU 仍不能定位到 reader 的某一条 cache line。
+因此本阶段保留单份 noinline reader：不为追求较小数字而 inline 复制热路径，也不以
+强制对齐改变整份诊断 ELF 的冲突集合。若以后局部信号确实被该量级淹没，应另做只改
+reader 对齐的 empty A/B，而不是混入本次校准提交。
+
+该校准不能直接从 `arg-build` 中扣除。首先，两者的时间边界不同：`arg-build`
+elapsed 是两侧 observer 之间的内部业务区间，而 empty elapsed 用外层 tick 包住完整
+begin/end 对；二者相减会把不同对象当成同一加法模型。其次，即使 request/miss 都
+来自 running read-clear，两个 profile 仍是不同 ELF，代码布局、冷暖状态和前端竞争
+都可能改变事件数。方向上，Case1 empty 约 49 request/对，相当于同一时期
+`arg-build` AIC/AIV 约 118.31/121.36 request/对的四成；AIV empty 约 2.02
+miss/对，相当于 `arg-build` 约 3.80 miss/对的一半。这只说明观察器污染不可忽略，
+不是允许产出“扣除 empty 后的业务净 request/miss”。报告和后续结论都只保留原始
+observed、capture gap 与这份经验尺度。
+
+空 bracket 代码落定后又在同一工作树上串行回归了四种互斥构建：`arg-build` B1
+`20260721_021930` 为 96×5 对、status `0x3f`、primary/shadow 96/96 精确相等，
+并带有新增的 `time_semantics`，全局 Submit 为 249.064 us；`submit-pmu-none` B1
+`20260721_022026` 不含 phase 字段、primary/shadow 96/96 精确相等，全局 Submit 为
+265.977 us；perf-clock B1 `20260721_022115` 为 96×5 Submit、78.230 us；普通
+level-4 B1 `20260721_022221` 为 4,546 条事件、88.595 us、`dropped=0`、排他闭合
+PASS。四轮只证明新增 mode、元数据和公共 Claim.end 空 wrapper 没有破坏既有证据链，
+B1 冷启动绝对时间仍不得跨 ELF 相减。
+
+#### 8.3.4 后续真实 selector 与三条证据链分工
+
 单阶段 selector 必须直接跟随当前真实 PA compete-first 泳道和离线排他定义，候选
 区域包括：
 
@@ -1064,7 +1178,9 @@ kernel               真实计算区间 overlay
 `submit-transition` 应复用现有真实边界，不为方便取数继续扩大泳道 raw。每个局部
 selector 必须独立编译、独立运行、独立发布，不能在一个 ELF 中同时打开多段。
 
-首个 `arg-build` 已经实现；其余 selector 仍按上述清单逐个推进。standalone 历史
+首个业务 selector `arg-build` 和 running bracket 空区间校准已经实现；其余
+selector 仍按上述清单逐个推进。后续每个业务 phase 都必须同时报告自己的原始
+observed 与 empty 的经验尺度，但不得跨 ELF 扣减出伪精确净值。standalone 历史
 实现只提供 owner、门禁和报告加工方法参考，不是该阶段的前置优化任务，也不能
 作为真实结果代替品。
 
@@ -1166,6 +1282,14 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
 | arg-build 后 none B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_014602/` | 无 phase 字段、primary=shadow 96/96 |
 | arg-build 后 perf-clock B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_014715/` | 96×5 Submit、73.029 us、ELF 隔离 PASS |
 | arg-build 后 level-4 B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_014841/` | 4560 records、90.275 us、dropped=0、排他闭合 PASS |
+| empty-bracket PMU B1 首轮 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_020932/` | 96×5 对、257.430 us；冷启动观察指纹闭合 |
+| empty-bracket PMU B1 复验 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_021100/` | 96×5 对、303.032 us；冷启动观察指纹闭合 |
+| empty-bracket PMU Case1 首轮 | `outputs/TestPagedAttentionUnroll_Case1_20260721_021158/` | 96×1280 对、4972.718 us；ALL 640.465 ns/对 |
+| empty-bracket PMU Case1 复验 | `outputs/TestPagedAttentionUnroll_Case1_20260721_021311/` | 96×1280 对、4866.126 us；ALL 639.272 ns/对，稳态尺度复现 |
+| empty 后 arg-build B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_021930/` | 96×5 对、249.064 us；新旧 phase 契约闭合 |
+| empty 后 none B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_022026/` | 无 phase 字段、primary=shadow 96/96 |
+| empty 后 perf-clock B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_022115/` | 96×5 Submit、78.230 us、ELF 隔离 PASS |
+| empty 后 level-4 B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_022221/` | 4546 records、88.595 us、dropped=0、排他闭合 PASS |
 
 ### 10.3 standalone
 
@@ -1210,6 +1334,9 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
     小数点后的正向差宣布收益。
 14. **固定次数与动态次数要分开。** Claim、H1 消减等可由拓扑推出；fanin retry、
     frontier helping 和 barrier poll 必须以动态记录为准。
+15. **empty-bracket 不是可直接扣除的常数。** 它的 elapsed 使用外层 SYS_CNT，
+    request/miss 使用 running read-clear 内边界，并且与业务 selector 属于不同 ELF；
+    只能作为观察器自扰动的经验尺度，不能生成数学修正后的业务净值。
 
 ## 12. 后续阶段更新与提交模板
 
@@ -1294,15 +1421,17 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
 3. **[观察工具，已实现] 真实 PA `submit-pmu-none`**：编译期去除泳道、atomic 和
    通用逐 task PMU，每核完整 Submit 期只开关 PMU 一次；96 核 primary/shadow、
    owner Restore、AIC/AIV raw/HTML、两轮 B1 和一次 Case1 均已闭合；
-4. **[观察工具，首个 selector 已实现] 真实 PA 单阶段 PMU**：`arg-build` 已按
-   第 8.3 节完成两轮 B1 与一次 Case1 的边界、ABI、owner、计数和报告闭合；其余
-   selector 继续分别编译、分别采集，不在同一提交中批量铺开，也不依赖新的
-   standalone 实现；
+4. **[观察工具，首个 selector 与空 bracket 均已实现] 真实 PA 单阶段 PMU**：
+   `arg-build` 已完成两轮 B1 与一次 Case1；`empty-bracket` 复用同一 12,416 B ABI，
+   已完成两轮 B1 与两轮 Case1，量出 running begin/end 的稳态自扰动指纹并明确
+   外层 elapsed 与 read-clear request/miss 的不同边界。其余 selector 继续分别
+   编译、分别采集，不在同一提交中批量铺开，也不依赖新的 standalone 实现；
 5. 结构和边界迭代先使用最小有效真实 PA 用例完成正确性门禁；只有构建身份、容量、
    业务边界和统计闭合后，才运行完整 Case1 b256 性能样本，避免反复生成数百 MiB
    profiling 文件。
 
-下一步继续按真实排他 span 建立单阶段 PMU，并为 running bracket 补观察开销量尺；
-随后量化三种构建的观察代价并专项归因独占设备上的运行波动。这些前置数据闭合前，
-不从单轮 I-cache 数直接提出生产优化，也不用 standalone 的绝对数替代真实 PA
-当前结果。
+下一步以已经闭合的 empty 经验尺度为解释约束，按真实排他 span 逐个建立其余业务
+selector；不从业务 observed 中机械扣除 empty。真实 span 的边界、调用 shape 和
+完整 Case1 数据闭合后，再量化三种构建的观察代价并专项归因独占设备上的运行波动。
+这些前置数据闭合前，不从单轮 I-cache 数直接提出生产优化，也不用 standalone 的
+绝对数替代真实 PA 当前结果。

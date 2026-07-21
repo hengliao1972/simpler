@@ -46,7 +46,11 @@ _FDWIC_PROFILE_NONE = "none"
 _FDWIC_PROFILE_PERF_CLOCK = "perf-clock"
 _FDWIC_PROFILE_SUBMIT_PMU_NONE = "submit-pmu-none"
 _FDWIC_PROFILE_SUBMIT_PMU_ARG_BUILD = "submit-pmu-arg-build"
-_FDWIC_SUBMIT_PMU_PROFILES = frozenset({_FDWIC_PROFILE_SUBMIT_PMU_NONE, _FDWIC_PROFILE_SUBMIT_PMU_ARG_BUILD})
+_FDWIC_PROFILE_SUBMIT_PMU_EMPTY_BRACKET = "submit-pmu-empty-bracket"
+_FDWIC_SUBMIT_PMU_PHASE_PROFILES = frozenset(
+    {_FDWIC_PROFILE_SUBMIT_PMU_ARG_BUILD, _FDWIC_PROFILE_SUBMIT_PMU_EMPTY_BRACKET}
+)
+_FDWIC_SUBMIT_PMU_PROFILES = frozenset({_FDWIC_PROFILE_SUBMIT_PMU_NONE, *_FDWIC_SUBMIT_PMU_PHASE_PROFILES})
 _FDWIC_PRIVATE_PROFILES = frozenset({_FDWIC_PROFILE_PERF_CLOCK, *_FDWIC_SUBMIT_PMU_PROFILES})
 _FDWIC_PROFILES = frozenset({_FDWIC_PROFILE_NONE, *_FDWIC_PRIVATE_PROFILES})
 
@@ -68,6 +72,12 @@ def _fdwic_compile_definitions(profile: str) -> list[str] | None:
         return [
             "PTO_FDWIC_SUBMIT_PMU=1",
             "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=1",
+            "PTO_FDWIC_TRACE_ENABLED=0",
+        ]
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_EMPTY_BRACKET:
+        return [
+            "PTO_FDWIC_SUBMIT_PMU=1",
+            "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=2",
             "PTO_FDWIC_TRACE_ENABLED=0",
         ]
     return None
@@ -226,7 +236,7 @@ def _assert_fdwic_submit_pmu_elf(binary: Path, profile: str) -> None:
 
     phase_reader = "fdwic_submit_pmu_phase_read_shadow_counters"
     required = ["dist_submit_pmu_expect_submits", "fdwic_submit_pmu_read_counters"]
-    if profile == _FDWIC_PROFILE_SUBMIT_PMU_ARG_BUILD:
+    if profile in _FDWIC_SUBMIT_PMU_PHASE_PROFILES:
         required.append(phase_reader)
     forbidden = (
         "dist_perf_clock_expect_submits",

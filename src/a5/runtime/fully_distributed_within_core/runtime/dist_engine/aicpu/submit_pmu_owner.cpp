@@ -402,7 +402,8 @@ bool HeaderConfigurationMatches(const FdwicSubmitPmuHeader &header) {
         kFdwicSubmitPmuCnt2ScalarBusy, kFdwicSubmitPmuCnt5ShadowIcacheMiss,    kFdwicSubmitPmuCnt6IcacheRequest,
         kFdwicSubmitPmuCnt7IcacheMiss, kFdwicSubmitPmuCnt8ShadowIcacheRequest,
     };
-    const bool mode_valid = header.mode == kFdwicSubmitPmuModeNone || header.mode == kFdwicSubmitPmuModeArgBuild;
+    const bool mode_valid = header.mode == kFdwicSubmitPmuModeNone || header.mode == kFdwicSubmitPmuModeArgBuild ||
+                            header.mode == kFdwicSubmitPmuModeEmptyBracket;
     if (header.magic != kFdwicSubmitPmuMagic || header.version != kFdwicSubmitPmuVersion || !mode_valid ||
         header.header_bytes != fdwic_submit_pmu_bytes_for_mode(header.mode) ||
         header.record_bytes != sizeof(FdwicSubmitPmuCoreData) || header.num_cores != kFdwicSubmitPmuExpectedCores ||

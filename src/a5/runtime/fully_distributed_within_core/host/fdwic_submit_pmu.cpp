@@ -38,11 +38,21 @@ struct SubmitPmuProfile {
     uint16_t mode;
     FdwicSubmitPmuPhase phase;
     size_t bytes;
+    const char *phase_name;
+    const char *phase_boundary;
+    const char *counter_semantics;
+    const char *time_semantics;
 };
 
 constexpr SubmitPmuProfile kSubmitPmuProfiles[] = {
-    {"submit-pmu-none", kFdwicSubmitPmuModeNone, FdwicSubmitPmuPhase::None, kFdwicSubmitPmuNoneBytes},
-    {"submit-pmu-arg-build", kFdwicSubmitPmuModeArgBuild, FdwicSubmitPmuPhase::ArgBuild, kFdwicSubmitPmuPhaseBytes},
+    {"submit-pmu-none", kFdwicSubmitPmuModeNone, FdwicSubmitPmuPhase::None, kFdwicSubmitPmuNoneBytes, nullptr, nullptr,
+     nullptr, nullptr},
+    {"submit-pmu-arg-build", kFdwicSubmitPmuModeArgBuild, FdwicSubmitPmuPhase::ArgBuild, kFdwicSubmitPmuPhaseBytes,
+     "arg-build", "claim_end_to_materialize_begin", "running_read_clear_observed_bracket",
+     "inner_sys_cnt_between_boundary_observers"},
+    {"submit-pmu-empty-bracket", kFdwicSubmitPmuModeEmptyBracket, FdwicSubmitPmuPhase::EmptyBracket,
+     kFdwicSubmitPmuPhaseBytes, "empty-bracket", "claim_end_adjacent_empty_bracket",
+     "running_read_clear_empty_bracket_calibration", "outer_sys_cnt_around_adjacent_begin_end_pair"},
 };
 
 const SubmitPmuProfile *requested_profile() {
@@ -425,12 +435,11 @@ extern "C" int fdwic_submit_pmu_host_export(Runtime *runtime) {
     out << "    \"counter_width_bits\": {\"total\": 64, \"programmable\": 32},\n";
     out << "    \"programmable_counter_risk_threshold\": " << kFdwicSubmitPmuCounterRiskThreshold << ",\n";
     if (phase_mode) {
-        out << "    \"phase\": {\"id\": " << static_cast<uint32_t>(profile->phase)
-            << ", \"name\": \"arg-build\", "
-               "\"boundary\": \"claim_end_to_materialize_begin\", "
-               "\"expected_calls_per_core\": "
-            << data.expected_submits << ", \"status_required_mask\": " << kFdwicSubmitPmuRequiredPhaseStatus
-            << ", \"counter_semantics\": \"running_read_clear_observed_bracket\"},\n";
+        out << "    \"phase\": {\"id\": " << static_cast<uint32_t>(profile->phase) << ", \"name\": \""
+            << profile->phase_name << "\", " << "\"boundary\": \"" << profile->phase_boundary << "\", "
+            << "\"expected_calls_per_core\": " << data.expected_submits
+            << ", \"status_required_mask\": " << kFdwicSubmitPmuRequiredPhaseStatus << ", \"counter_semantics\": \""
+            << profile->counter_semantics << "\", " << "\"time_semantics\": \"" << profile->time_semantics << "\"},\n";
     }
     out << "    \"pmu_cycles_per_ns\": {\"all\": " << kPmuCyclesPerNsAll << ", \"aic\": " << kPmuCyclesPerNsAic
         << ", \"aiv\": " << kPmuCyclesPerNsAiv << "}\n";

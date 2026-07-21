@@ -120,6 +120,150 @@ observed 和 miss observed 份额分别为 5.557%、20.716% 和 21.334%。该数
 后续 selector 必须继续跟随真实泳道的排他 span，一次 ELF 只测一个区域，并保留
 该 ELF 自己的完整 Submit primary 作为比例分母。
 
+### 1.3 真实 PA 空区间校准：`submit-pmu-empty-bracket`
+
+局部 phase 的 begin/end 本身会执行 shadow counter read-clear、状态检查和累计
+bookkeeping。为了先量出这套观察器在真实 simpler A5 PA 热路径上的经验指纹，已增加
+独立诊断 profile：
+
+```text
+PTO_FDWIC_SUBMIT_PMU=1
+PTO_FDWIC_SUBMIT_PMU_PHASE_ID=2
+PTO_FDWIC_TRACE_ENABLED=0
+```
+
+它不包围任何业务代码。在 Kernel/Alloc compete-first 路径的 Claim 结束处，每次
+Submit 紧邻执行一次 phase begin 和 phase end；Case1/B256 每核固定 1,280 次，B1
+每核固定 5 次。raw 中必须同时匹配：
+
+```text
+capture.mode                    = submit-pmu-empty-bracket
+configuration.phase.id          = 2
+configuration.phase.name        = empty-bracket
+configuration.phase.boundary    = claim_end_adjacent_empty_bracket
+configuration.phase.counter_semantics
+                                = running_read_clear_empty_bracket_calibration
+configuration.phase.time_semantics
+                                = outer_sys_cnt_around_adjacent_begin_end_pair
+```
+
+真实 Case1 的构建和运行仍通过 pytest profile 入口完成；构建缓存会按 profile 宏生成
+独立 AIC/AIV ELF，不能拿其他 phase 的旧 ELF 拼接：
+
+```bash
+source /home/q00473782/Ascend/cann-9.1.0-weekly-20260708/cann/set_env.sh
+source /home/q00473782/.venv/bin/activate
+export PTO_ISA_ROOT=/home/q00473782/atomic/private/gpt/pto-isa-ddafa
+export PYTHONPATH="$PWD:$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
+
+python -m pytest \
+  examples/a5/fully_distributed_within_core/paged_attention_unroll/test_paged_attention_unroll.py \
+  --platform a5 --runtime fully_distributed_within_core --level 2 \
+  --case Case1 --manual include --fdwic-profile submit-pmu-empty-bracket \
+  --rounds 1 -s -v
+```
+
+用例成功后，会在本轮 `outputs/TestPagedAttentionUnroll_Case1_<timestamp>/` 中自动
+生成并严格校验：
+
+```text
+fdwic_submit_pmu_raw.json
+fdwic_submit_pmu_report.html
+```
+
+HTML 可直接用浏览器打开。若只需对已存在的 raw 重新生成报告，可在仓库根目录执行：
+
+```bash
+python -m simpler_setup.tools.fdwic_submit_pmu_report \
+  outputs/TestPagedAttentionUnroll_Case1_<timestamp>/fdwic_submit_pmu_raw.json
+```
+
+输出文件名固定为同目录下的 `fdwic_submit_pmu_report.html`。分析器会重新核对
+profile、phase 元数据、32 AIC + 64 AIV、每核调用次数、begin/end 闭合、状态位、
+primary/shadow 和 owner restore；不能把手工摘出的局部数字绕过这些门禁后当正式结果。
+
+#### 两套边界必须分开解释
+
+empty-bracket 的时间与 I-cache 事件故意使用两套不同边界：
+
+1. `phase_elapsed_ticks` 由一对外层 SYS_CNT 包围相邻的完整 begin/end 调用，包含
+   shadow read-clear、begin/end 内部 SYS_CNT、状态检查和累计等观察器路径；它还带有
+   外层时间戳自身的测量粒度，是“完整观察器调用对”的经验耗时，不是某段业务时间。
+2. `phase_icache_requests_observed` 与 `phase_icache_misses_observed` 只统计 begin 的
+   shadow read-clear 到 end 的 shadow read-clear 之间被 CNT8/CNT5 读出的事件。它没有
+   覆盖完整 begin/end 调用对，尤其不能把外层 SYS_CNT 时间边界等同为 I-cache
+   request/miss 边界。
+
+因此报告中的每 call 指标分别按同一角色聚合后计算：
+
+```text
+time/call    = Σphase_elapsed_ticks / Σphase_end_reads
+request/call = Σphase_icache_requests_observed / Σphase_end_reads
+miss/call    = Σphase_icache_misses_observed / Σphase_end_reads
+```
+
+它们是 ALL/AIC/AIV 各自的加权每次调用均值，不是 raw 为每次调用保存了一条记录。
+empty-bracket 继续复用每核 64 B phase sidecar，phase ABI 总大小仍为 12,416 B，没有
+为了逐调用校准扩充 raw。
+
+#### Case1 稳态校准结果
+
+两轮 Case1/B256 正式闭合件位于：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260721_021158/
+outputs/TestPagedAttentionUnroll_Case1_20260721_021311/
+```
+
+两轮均为 96 核每核 1,280 次、phase status `0x3f`、primary/shadow 96/96 精确
+相等，request/miss capture gap 均为 0。每 call 结果如下：
+
+| 轮次 | 角色 | 外层时间 ns/call | request observed/call | miss observed/call |
+| --- | --- | ---: | ---: | ---: |
+| `021158` | ALL | 640.465 | 49.340 | 1.342 |
+| `021158` | AIC | 567.962 | 48.919 | 0.008 |
+| `021158` | AIV | 676.717 | 49.550 | 2.009 |
+| `021311` | ALL | 639.272 | 49.337 | 1.356 |
+| `021311` | AIC | 567.619 | 48.870 | 0.008 |
+| `021311` | AIV | 675.099 | 49.570 | 2.030 |
+
+两轮全局 Submit 时间范围分别为 4,972.718 us 和 4,866.126 us。Case1 的每 call
+校准值高度接近，可作为当前源码和工具版本下解释局部 phase 观察污染的稳态经验量尺。
+AIV 稳定出现约 2 次 miss/call，而 AIC 接近 0；这是观察器在不同 scalar 角色上的
+实测指纹，尚不能在没有进一步代码布局证据时归因为某一条具体指令。
+
+当前 ELF 核验也不支持直接改 reader 来“压低校准值”：AIC/AIV reader 都是同一份
+92 B noinline 实现，且在 128 B line 下都跨两行；本机 DAV3510 模型配置中的 AIV
+scalar I-cache 容量和 set 数只有 AIC 一半，而 AIV 角色代码更大。现阶段只能把约
+2 miss/call 视为容量、角色代码与具体布局共同形成的稳定观察指纹，聚合 PMU 不能
+定位到某一条 cache line。因而保留当前 reader 和布局；若该底噪妨碍后续 selector，
+应另做只改对齐的 empty A/B，不能把布局变化夹带进业务 phase。
+
+B1 闭合件位于：
+
+```text
+outputs/TestPagedAttentionUnroll_CaseB1_20260721_020932/
+outputs/TestPagedAttentionUnroll_CaseB1_20260721_021100/
+```
+
+这两轮只有每核 5 次调用，ALL 分别为 725.192/719.304 ns、
+84.844/69.194 request 和 1.956/2.444 miss 每 call；AIC 的 request/miss 也明显
+比 Case1 稳态更易波动。B1 适合快速验证接口、次数和闭合，不适合代替 Case1 判断
+稳态观察器成本；少量调用会把 ELF 首次进入、取指预热和启动时序放大到每 call。
+
+#### 使用边界
+
+- empty-bracket 是观察器的**经验校准 profile**，不是观察成本的数学下界，也不是
+  可以从业务 phase 中直接扣除的固定常数。
+- `submit-pmu-empty-bracket` 与 `submit-pmu-arg-build` 使用不同诊断 ELF；phase 宏、
+  代码布局、I-cache 状态和跨核到达时序都会改变。可以用 empty 的量级判断局部 observed
+  是否主要由观察器构成，不能逐项相减生成所谓“修正后的 arg-build”。
+- 即使同一轮 capture gap 为 0，也只证明 primary/shadow 整窗重建闭合，不会把上述
+  两套边界变成同一个区间。
+- 受控微基准给出的约 90 ns/miss 只是一把 core-latency 直觉量尺。miss 可在单核内
+  重叠、被流水隐藏，96 核之间也并行；其中还可能包含观察器自身带来的 miss。因此
+  `miss × 90 ns` 不能解释为 Submit 墙钟损失，更不能当成候选优化的可兑现收益。
+
 ## 2. 为什么 I-cache miss 必须独立重编译
 
 I-cache 数据对代码布局极其敏感。泳道和逐 atomic 观察会增加：
@@ -217,8 +361,9 @@ I-cache PMU，不能据此推导 I-cache miss 降幅或某个 atomic 的独立�
 
 从本节到第 11 节主要描述 `tests/atomic_probe/pa_scheduler` standalone 的历史
 schema-v5、构建目录、命令和字段；不能套用到上面的真实 PA profile。真实 PA
-当前只有 `submit-pmu-none` 与 `submit-pmu-arg-build`，raw schema 为
-`fdwic-submit-pmu-v1`。
+当前有 `submit-pmu-none`、`submit-pmu-arg-build` 与
+`submit-pmu-empty-bracket`，raw schema 均为 `fdwic-submit-pmu-v1`。其中
+empty-bracket 只是第 1.3 节定义的真实 PA 观察器校准，不是业务 phase。
 
 standalone 历史 schema 中的 `lower/upper` 是已经固化的字段名，只表达
 read-clear observed 与 `primary-shadow` capture gap；由于 bracket 两侧也有观察

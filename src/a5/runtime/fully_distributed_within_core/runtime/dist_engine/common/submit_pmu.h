@@ -32,6 +32,10 @@ constexpr size_t kFdwicSubmitPmuCompiledBytes = kFdwicSubmitPmuNoneBytes;
 constexpr FdwicSubmitPmuPhase kFdwicSubmitPmuCompiledPhase = FdwicSubmitPmuPhase::ArgBuild;
 constexpr uint16_t kFdwicSubmitPmuCompiledMode = kFdwicSubmitPmuModeArgBuild;
 constexpr size_t kFdwicSubmitPmuCompiledBytes = kFdwicSubmitPmuPhaseBytes;
+#elif PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 2
+constexpr FdwicSubmitPmuPhase kFdwicSubmitPmuCompiledPhase = FdwicSubmitPmuPhase::EmptyBracket;
+constexpr uint16_t kFdwicSubmitPmuCompiledMode = kFdwicSubmitPmuModeEmptyBracket;
+constexpr size_t kFdwicSubmitPmuCompiledBytes = kFdwicSubmitPmuPhaseBytes;
 #else
 #error "invalid real FDWIC submit-PMU phase"
 #endif
@@ -236,7 +240,8 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_phase_begin() {
         }
         ++phase.begin_reads;
         phase.armed = true;
-        // 起点位于两次 read-clear 之后，阶段时间不包含 begin 读取开销。
+        // 起点位于 begin read-clear/bookkeeping 之后。empty-bracket wrapper
+        // 会在外层另行覆盖为完整 begin/end 对的经验耗时。
         phase.phase_begin_tick = get_sys_cnt_aicore();
     }
 #endif
@@ -268,6 +273,29 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_phase_end() {
         phase.armed = false;
         phase.phase_begin_tick = 0;
     }
+#endif
+}
+
+// 在 Claim.end 调用点量化一对原样 running begin/end observer。外层 SYS_CNT
+// 位于两次 shadow read-clear 之外，因此不会主动进入局部 request/miss
+// observed；它自身仍是计时边界底噪，结果只能作经验量尺。
+PTO_DEVICE_FUNC inline void fdwic_submit_pmu_empty_bracket_calibrate() {
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 2
+    FdwicSubmitPmuPhaseAccumulator &phase = g_fdwic_submit_pmu_phase;
+    const uint64_t old_elapsed = phase.phase_elapsed_ticks;
+    const uint32_t old_begin_reads = phase.begin_reads;
+    const uint32_t old_end_reads = phase.end_reads;
+    const uint64_t outer_begin = get_sys_cnt_aicore();
+    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::EmptyBracket>();
+    fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::EmptyBracket>();
+    const uint64_t outer_end = get_sys_cnt_aicore();
+    if (phase.boundary_error || phase.armed || phase.begin_reads != old_begin_reads + 1U ||
+        phase.end_reads != old_end_reads + 1U || outer_end < outer_begin ||
+        old_elapsed > UINT64_MAX - (outer_end - outer_begin)) {
+        phase.boundary_error = true;
+        return;
+    }
+    phase.phase_elapsed_ticks = old_elapsed + outer_end - outer_begin;
 #endif
 }
 
@@ -376,6 +404,7 @@ template <FdwicSubmitPmuPhase Phase>
 PTO_DEVICE_FUNC inline void fdwic_submit_pmu_phase_begin() {}
 template <FdwicSubmitPmuPhase Phase>
 PTO_DEVICE_FUNC inline void fdwic_submit_pmu_phase_end() {}
+PTO_DEVICE_FUNC inline void fdwic_submit_pmu_empty_bracket_calibrate() {}
 }  // namespace
 
 #endif

@@ -22,6 +22,7 @@ from simpler_setup.tools.fdwic_submit_pmu_report import (
     ARG_BUILD_CAPTURE_MODE,
     DEFAULT_INPUT_NAME,
     DEFAULT_OUTPUT_NAME,
+    EMPTY_BRACKET_CAPTURE_MODE,
     PHASE_REQUIRED_STATUS_MASK,
     REQUIRED_STATUS_MASK,
     load_capture,
@@ -199,6 +200,7 @@ def _valid_arg_build_capture() -> dict[str, Any]:
         "expected_calls_per_core": 5,
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_observed_bracket",
+        "time_semantics": "inner_sys_cnt_between_boundary_observers",
     }
     for logical_core_id, record in enumerate(capture["records"]):
         record["shadow_icache_requests"] = record["icache_requests"] - 20 - logical_core_id % 3
@@ -229,6 +231,26 @@ def _valid_arg_build_capture() -> dict[str, Any]:
     return capture
 
 
+def _valid_empty_bracket_capture() -> dict[str, Any]:
+    capture = _valid_arg_build_capture()
+    capture["capture"]["mode"] = EMPTY_BRACKET_CAPTURE_MODE
+    capture["configuration"]["phase"] = {
+        "id": 2,
+        "name": "empty-bracket",
+        "boundary": "claim_end_adjacent_empty_bracket",
+        "expected_calls_per_core": 5,
+        "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+        "counter_semantics": "running_read_clear_empty_bracket_calibration",
+        "time_semantics": "outer_sys_cnt_around_adjacent_begin_end_pair",
+    }
+    for logical_core_id, record in enumerate(capture["records"]):
+        record["phase_id"] = 2
+        record["phase_elapsed_ticks"] = 200 + logical_core_id
+        record["phase_icache_requests_observed"] = 30 + logical_core_id % 5
+        record["phase_icache_misses_observed"] = 3 + logical_core_id % 2
+    return capture
+
+
 def _write_capture(directory: Path, capture: dict[str, Any]) -> Path:
     path = directory / DEFAULT_INPUT_NAME
     path.write_text(json.dumps(capture, indent=2), encoding="utf-8")
@@ -250,7 +272,7 @@ def test_valid_capture_is_recomputed_and_rendered(tmp_path: Path) -> None:
     assert "90.000 ns" in document
     assert "不是 Submit 墙钟损失" in document
     assert "非 Scalar-busy 残余不是空闲时间，也不是 I-cache stall" in document
-    assert "Arg-build 局部归因" not in document
+    assert "阶段观察（phase_id=" not in document
     assert "均值 16,047.5；最小 16,000；最大 16,095" in document
     for group_name in ("all", "aic", "aiv"):
         assert f"{capture.summary[group_name]['icache_miss_rate']:.3%}" in document
@@ -273,8 +295,10 @@ def test_valid_arg_build_capture_renders_same_elf_phase_observation_first(tmp_pa
     ]["sum"] + sum(record["icache_requests"] - record["shadow_icache_requests"] for record in capture.records)
 
     document = render_report(raw_path)
-    assert document.index("Arg-build 局部归因") < document.index("全局 Submit 时间范围")
-    assert "running read-clear observed bracket" in document
+    assert document.index("<code>arg-build</code> 阶段观察") < document.index("全局 Submit 时间范围")
+    assert "claim_end_to_materialize_begin" in document
+    assert "running_read_clear_observed_bracket" in document
+    assert "inner_sys_cnt_between_boundary_observers" in document
     assert "时间占比" in document
     assert "Request 观测值 / 加全窗 capture gap" in document
     assert "Miss 观测值 / 加全窗 capture gap" in document
@@ -284,6 +308,7 @@ def test_valid_arg_build_capture_renders_same_elf_phase_observation_first(tmp_pa
     assert "事件数的数学上下界" in document
     assert "时间占比的分母是同一 ELF 的 Σ每核 Submit elapsed" in document
     assert "request/miss 百分比的分母才是同一 ELF" in document
+    assert "每次调用 elapsed / request / miss observed" in document
     assert "不能跨 ELF 相减" in document
     assert "shadow 是 begin/end/final 全部 running read-clear 返回值之和" in document
     for group_name in ("all", "aic", "aiv"):
@@ -293,6 +318,60 @@ def test_valid_arg_build_capture_renders_same_elf_phase_observation_first(tmp_pa
         assert f"{phase['phase_request_observed_plus_capture_gap_share_of_primary']:.3%}" in document
         assert f"{phase['phase_miss_observed_share_of_primary']:.3%}" in document
         assert f"{phase['phase_miss_observed_plus_capture_gap_share_of_primary']:.3%}" in document
+        assert f"{phase['phase_elapsed_ticks_per_call']:,.3f} ns" in document
+        assert f"request {phase['phase_icache_requests_observed_per_call']:,.3f}" in document
+        assert f"miss {phase['phase_icache_misses_observed_per_call']:,.3f}" in document
+
+
+def test_valid_empty_bracket_capture_is_reported_as_observer_calibration(tmp_path: Path) -> None:
+    raw_path = _write_capture(tmp_path, _valid_empty_bracket_capture())
+
+    capture = load_capture(raw_path)
+
+    assert capture.phase_summary is not None
+    document = render_report(raw_path)
+    assert document.index("<code>empty-bracket</code> 阶段观察") < document.index("全局 Submit 时间范围")
+    assert "phase_id=2" in document
+    assert "claim_end_adjacent_empty_bracket" in document
+    assert "running_read_clear_empty_bracket_calibration" in document
+    assert "outer_sys_cnt_around_adjacent_begin_end_pair" in document
+    assert "观察器自成本量尺，不是业务 phase" in document
+    assert "phase_elapsed 是紧邻 begin+end 对的外层 SYS_CNT 经验耗时" in document
+    assert "含计时边界底噪" in document
+    assert "仍只覆盖两次 shadow read-clear 之间" in document
+    assert "并不包含 begin 读取前/end 读取后的全部 observer 取指" in document
+    assert "两者都只是量级参照，不能跨 ELF 精确扣减" in document
+    for group_name in ("all", "aic", "aiv"):
+        phase = capture.phase_summary[group_name]
+        assert f"{phase['phase_elapsed_ticks_per_call']:,.3f} ns" in document
+        assert f"request {phase['phase_icache_requests_observed_per_call']:,.3f}" in document
+        assert f"miss {phase['phase_icache_misses_observed_per_call']:,.3f}" in document
+
+
+def test_empty_bracket_rejects_arg_build_phase_id(tmp_path: Path) -> None:
+    capture = _valid_empty_bracket_capture()
+    capture["records"][0]["phase_id"] = 1
+
+    with pytest.raises(ValueError, match=r"records\[0\]\.phase_id must equal 2"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("name", "arg-build"),
+        ("boundary", "claim_end_to_materialize_begin"),
+        ("expected_calls_per_core", 4),
+        ("counter_semantics", "running_read_clear_observed_bracket"),
+        ("time_semantics", "inner_sys_cnt_between_boundary_observers"),
+    ),
+)
+def test_empty_bracket_rejects_mismatched_phase_configuration(tmp_path: Path, field: str, value: Any) -> None:
+    capture = _valid_empty_bracket_capture()
+    capture["configuration"]["phase"][field] = value
+
+    with pytest.raises(ValueError, match=r"configuration\.phase"):
+        load_capture(_write_capture(tmp_path, capture))
 
 
 def test_arg_build_rejects_unclosed_phase_boundaries(tmp_path: Path) -> None:
