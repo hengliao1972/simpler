@@ -23,6 +23,7 @@ from simpler_setup.tools.fdwic_submit_pmu_report import (
     DEFAULT_INPUT_NAME,
     DEFAULT_OUTPUT_NAME,
     EMPTY_BRACKET_CAPTURE_MODE,
+    MATERIALIZE_CAPTURE_MODE,
     PHASE_REQUIRED_STATUS_MASK,
     REQUIRED_STATUS_MASK,
     load_capture,
@@ -251,6 +252,26 @@ def _valid_empty_bracket_capture() -> dict[str, Any]:
     return capture
 
 
+def _valid_materialize_capture() -> dict[str, Any]:
+    capture = _valid_arg_build_capture()
+    capture["capture"]["mode"] = MATERIALIZE_CAPTURE_MODE
+    capture["configuration"]["phase"] = {
+        "id": 3,
+        "name": "materialize",
+        "boundary": "materialize_begin_to_materialize_end",
+        "expected_calls_per_core": 5,
+        "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+        "counter_semantics": "running_read_clear_observed_bracket",
+        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+    }
+    for logical_core_id, record in enumerate(capture["records"]):
+        record["phase_id"] = 3
+        record["phase_elapsed_ticks"] = 800 + logical_core_id
+        record["phase_icache_requests_observed"] = 500 + logical_core_id
+        record["phase_icache_misses_observed"] = 50 + logical_core_id % 5
+    return capture
+
+
 def _write_capture(directory: Path, capture: dict[str, Any]) -> Path:
     path = directory / DEFAULT_INPUT_NAME
     path.write_text(json.dumps(capture, indent=2), encoding="utf-8")
@@ -353,6 +374,49 @@ def test_empty_bracket_rejects_arg_build_phase_id(tmp_path: Path) -> None:
     capture["records"][0]["phase_id"] = 1
 
     with pytest.raises(ValueError, match=r"records\[0\]\.phase_id must equal 2"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_valid_materialize_capture_tracks_current_business_boundary(tmp_path: Path) -> None:
+    raw_path = _write_capture(tmp_path, _valid_materialize_capture())
+
+    capture = load_capture(raw_path)
+
+    assert capture.phase_summary is not None
+    assert capture.phase_summary["all"]["phase_begin_reads"] == 96 * 5
+    document = render_report(raw_path)
+    assert document.index("<code>materialize</code> 阶段观察") < document.index("全局 Submit 时间范围")
+    assert "phase_id=3" in document
+    assert "materialize_begin_to_materialize_end" in document
+    assert "running_read_clear_observed_bracket" in document
+    assert "inner_sys_cnt_between_boundary_observers" in document
+    assert "观察器自成本量尺，不是业务 phase" not in document
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("id", 1),
+        ("name", "arg-build"),
+        ("boundary", "claim_end_to_materialize_begin"),
+        ("expected_calls_per_core", 4),
+        ("counter_semantics", "running_read_clear_empty_bracket_calibration"),
+        ("time_semantics", "outer_sys_cnt_around_adjacent_begin_end_pair"),
+    ),
+)
+def test_materialize_rejects_mismatched_phase_configuration(tmp_path: Path, field: str, value: Any) -> None:
+    capture = _valid_materialize_capture()
+    capture["configuration"]["phase"][field] = value
+
+    with pytest.raises(ValueError, match=r"configuration\.phase"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_materialize_rejects_wrong_record_phase_id(tmp_path: Path) -> None:
+    capture = _valid_materialize_capture()
+    capture["records"][0]["phase_id"] = 2
+
+    with pytest.raises(ValueError, match=r"records\[0\]\.phase_id must equal 3"):
         load_capture(_write_capture(tmp_path, capture))
 
 

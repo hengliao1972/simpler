@@ -22,6 +22,7 @@ constexpr uint16_t kFdwicSubmitPmuVersion = 1;
 constexpr uint16_t kFdwicSubmitPmuModeNone = 1;
 constexpr uint16_t kFdwicSubmitPmuModeArgBuild = 2;
 constexpr uint16_t kFdwicSubmitPmuModeEmptyBracket = 3;
+constexpr uint16_t kFdwicSubmitPmuModeMaterialize = 4;
 constexpr uint32_t kFdwicSubmitPmuExpectedAic = 32;
 constexpr uint32_t kFdwicSubmitPmuExpectedAiv = 64;
 constexpr uint32_t kFdwicSubmitPmuExpectedCores = kFdwicSubmitPmuExpectedAic + kFdwicSubmitPmuExpectedAiv;
@@ -37,7 +38,10 @@ enum class FdwicSubmitPmuPhase : uint16_t {
     // Claim.end 同一调用点的紧邻 begin/end；只提供 running bracket 自身
     // 引入的空区间经验观察指纹，不代表任何业务 phase 或数学最小值。
     EmptyBracket = 2,
-    Count = 3,
+    // 当前泳道 Materialize.begin 到 Materialize.end：task-cap 检查与
+    // dist_submit_materialize_args 主体；每个 Submit 固定调用一次。
+    Materialize = 3,
+    Count = 4,
 };
 
 constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
@@ -48,6 +52,8 @@ constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
         return kFdwicSubmitPmuModeArgBuild;
     case FdwicSubmitPmuPhase::EmptyBracket:
         return kFdwicSubmitPmuModeEmptyBracket;
+    case FdwicSubmitPmuPhase::Materialize:
+        return kFdwicSubmitPmuModeMaterialize;
     case FdwicSubmitPmuPhase::Count:
         break;
     }
@@ -55,7 +61,8 @@ constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
 }
 
 constexpr bool fdwic_submit_pmu_mode_has_phase(uint16_t mode) {
-    return mode == kFdwicSubmitPmuModeArgBuild || mode == kFdwicSubmitPmuModeEmptyBracket;
+    return mode == kFdwicSubmitPmuModeArgBuild || mode == kFdwicSubmitPmuModeEmptyBracket ||
+           mode == kFdwicSubmitPmuModeMaterialize;
 }
 
 // A5 PIPE_UTIL 事件布局。CNT6/CNT7 是权威值；CNT8/CNT5 使用相同事件作

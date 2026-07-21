@@ -605,6 +605,9 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_and_prepare_map(
 ) {
     if (!dist_submit_check_task_cap(ctx, kind)) return false;
     if (!dist_submit_materialize_args(args, ctx, kind)) return false;
+    // end 与泳道 materialize_end 取时前的业务边界一致。失败路径不伪造
+    // end，最终由 phase shape/平衡门禁拒绝 raw。
+    fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Materialize>();
     TRACE_TIMESTAMP(materialize_end);
     TRACE_SPAN_RECORD(
         materialize_begin, materialize_end, self, ctx.task_id, -1, TracePhase::Materialize, 0,

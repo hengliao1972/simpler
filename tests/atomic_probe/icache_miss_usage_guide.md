@@ -264,6 +264,121 @@ outputs/TestPagedAttentionUnroll_CaseB1_20260721_021100/
   重叠、被流水隐藏，96 核之间也并行；其中还可能包含观察器自身带来的 miss。因此
   `miss × 90 ns` 不能解释为 Submit 墙钟损失，更不能当成候选优化的可兑现收益。
 
+### 1.4 真实 PA `submit-pmu-materialize`
+
+`submit-pmu-materialize` 是首个经过 empty-bracket 校准后落到真实业务 span 的
+局部 profile。它继续保留该 ELF 自己的完整 Submit primary，只把 running
+read-clear bracket 放到泳道 `Materialize` 的同一业务边界。编译宏为：
+
+```text
+PTO_FDWIC_SUBMIT_PMU=1
+PTO_FDWIC_SUBMIT_PMU_PHASE_ID=3
+PTO_FDWIC_TRACE_ENABLED=0
+```
+
+raw 中的 profile 元数据必须精确匹配：
+
+```text
+capture.mode                    = submit-pmu-materialize
+configuration.phase.id          = 3
+configuration.phase.name        = materialize
+configuration.phase.boundary    = materialize_begin_to_materialize_end
+configuration.phase.counter_semantics
+                                = running_read_clear_observed_bracket
+configuration.phase.time_semantics
+                                = inner_sys_cnt_between_boundary_observers
+```
+
+当前真实 PA 使用 compete-first 路径：Kernel/Alloc 的 Finish 完成 ticket 恢复与校验、
+结束 arg-build 后，在泳道 `Materialize.begin` 对应位置打开 bracket；
+`dist_submit_materialize_and_prepare_map()` 内完成 task-cap 检查和
+`dist_submit_materialize_args()` 后立即关闭，再进入 `PrepareMap`。因此该 profile
+覆盖 Materialize 自身，不包含 Claim-to-Materialize 构参区间，也不包含后续
+`dist_submit_prepare_map()`。仍受支持的 one-shot 入口使用相同的 Materialize
+业务首尾边界。
+
+每个成功 Submit 恰好执行一次 Materialize bracket，所以调用 shape 与每核 Submit
+数完全一致：Case1/B256 为每核 1,280 次、全局 122,880 次，B1 为每核 5 次、全局
+480 次。失败路径不会伪造 phase end；只要某核 begin/end 不平衡、次数不符或状态位
+不完整，host/分析器就拒绝发布受信结果。
+
+真实 Case1 命令为：
+
+```bash
+source /home/q00473782/Ascend/cann-9.1.0-weekly-20260708/cann/set_env.sh
+source /home/q00473782/.venv/bin/activate
+export PTO_ISA_ROOT=/home/q00473782/atomic/private/gpt/pto-isa-ddafa
+export PYTHONPATH="$PWD:$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
+
+python -m pytest \
+  examples/a5/fully_distributed_within_core/paged_attention_unroll/test_paged_attention_unroll.py \
+  --platform a5 --runtime fully_distributed_within_core --level 2 \
+  --case Case1 --manual include --fdwic-profile submit-pmu-materialize \
+  --rounds 1 -s -v
+```
+
+每轮测试会在对应输出目录自动生成并校验：
+
+```text
+fdwic_submit_pmu_raw.json       # 逐核权威原始数据
+fdwic_submit_pmu_report.html    # 已加工的 ALL/AIC/AIV 报告
+```
+
+HTML 可直接用浏览器打开。需要从已有 raw 重建时，在仓库根目录执行：
+
+```bash
+python -m simpler_setup.tools.fdwic_submit_pmu_report \
+  outputs/TestPagedAttentionUnroll_Case1_<timestamp>/fdwic_submit_pmu_raw.json
+```
+
+#### 两轮 Case1 稳态结果
+
+两轮正式闭合件位于：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260721_024748/
+outputs/TestPagedAttentionUnroll_Case1_20260721_024909/
+```
+
+两轮均为 96/96 受信记录、每核 1,280 次、begin/end
+122,880/122,880、phase status `0x3f`，primary/shadow 的 request/miss capture gap
+均为 0。下表的三个占比都只使用**本轮同一个 Materialize ELF** 的分母：时间以
+`Σsubmit_elapsed_ticks` 为分母，request/miss 以各角色的完整 Submit primary 为
+分母。
+
+| 轮次 | 角色 | 时间 ns/call | request observed/call | miss observed/call | 时间占比 | request 占比 | miss 占比 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `024748` | ALL | 797.814 | 233.197 | 1.474 | 22.560% | 37.688% | 12.056% |
+| `024748` | AIC | 776.265 | 228.942 | 0.022 | 22.540% | 36.532% | 10.487% |
+| `024748` | AIV | 808.588 | 235.325 | 2.201 | 22.570% | 38.278% | 12.065% |
+| `024909` | ALL | 797.061 | 233.238 | 1.418 | 22.105% | 37.741% | 11.681% |
+| `024909` | AIC | 775.653 | 228.170 | 0.021 | 21.882% | 36.442% | 10.997% |
+| `024909` | AIV | 807.765 | 235.772 | 2.116 | 22.214% | 38.404% | 11.685% |
+
+两轮全局 Submit 时间范围分别为 4,922.142 us 和 4,851.282 us。Materialize 的
+ALL request observed 稳定在约 233.2 次/call，AIC/AIV 也都稳定在约
+228～236 次/call；相对 empty-bracket 的约 49 次/call 经验指纹，这个 request
+信号在量级上更明显。但两者来自不同诊断 ELF，代码布局、缓存状态和到达时序不同，
+这里只能作方向性判断，不能执行 `materialize - empty`。
+
+AIV 的 Materialize miss observed 为约 2.20/2.12 次/call，与 empty-bracket
+两轮约 2.01/2.03 次/call 处于同一量级。这说明当前数据尚不能证明 Materialize
+业务体本身带来明显的 AIV miss 增量；也绝不能跨 ELF 相减后把约 0.1 次/call
+冒充业务净 miss。AIC 的 miss observed 同样很小。现阶段可受信的结论是：
+Materialize 时间和 request 信号两轮稳定，而 miss 归因仍受到观察器经验指纹限制。
+
+B1 只用于结构与 cold-path 核验：
+
+```text
+outputs/TestPagedAttentionUnroll_CaseB1_20260721_024533/
+outputs/TestPagedAttentionUnroll_CaseB1_20260721_024641/
+```
+
+两轮都满足 96/96 记录、每核 5 次、480/480 begin/end、`0x3f` 状态和零 capture
+gap，证明 profile 选择、边界次数、ABI 与报告链路闭合。由于每核只有 5 次调用，
+首次进入 ELF、取指预热和启动时序会被放大到每 call；B1 的 per-call 值只作 cold
+证据，不用于替代上述 Case1 稳态归因。
+
 ## 2. 为什么 I-cache miss 必须独立重编译
 
 I-cache 数据对代码布局极其敏感。泳道和逐 atomic 观察会增加：
@@ -361,9 +476,15 @@ I-cache PMU，不能据此推导 I-cache miss 降幅或某个 atomic 的独立�
 
 从本节到第 11 节主要描述 `tests/atomic_probe/pa_scheduler` standalone 的历史
 schema-v5、构建目录、命令和字段；不能套用到上面的真实 PA profile。真实 PA
-当前有 `submit-pmu-none`、`submit-pmu-arg-build` 与
-`submit-pmu-empty-bracket`，raw schema 均为 `fdwic-submit-pmu-v1`。其中
-empty-bracket 只是第 1.3 节定义的真实 PA 观察器校准，不是业务 phase。
+当前 profile 为：
+
+- `submit-pmu-none`：完整 Submit 整窗；
+- `submit-pmu-arg-build`：Claim.end 到 Materialize.begin 的同步构参区间；
+- `submit-pmu-empty-bracket`：第 1.3 节定义的观察器经验校准，不是业务 phase；
+- `submit-pmu-materialize`：第 1.4 节定义的真实 Materialize 业务 span。
+
+四者 raw schema 均为 `fdwic-submit-pmu-v1`，但分别来自独立诊断 ELF，不能跨
+profile 相减或拼接。
 
 standalone 历史 schema 中的 `lower/upper` 是已经固化的字段名，只表达
 read-clear observed 与 `primary-shadow` capture gap；由于 bracket 两侧也有观察

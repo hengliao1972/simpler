@@ -53,6 +53,9 @@ constexpr SubmitPmuProfile kSubmitPmuProfiles[] = {
     {"submit-pmu-empty-bracket", kFdwicSubmitPmuModeEmptyBracket, FdwicSubmitPmuPhase::EmptyBracket,
      kFdwicSubmitPmuPhaseBytes, "empty-bracket", "claim_end_adjacent_empty_bracket",
      "running_read_clear_empty_bracket_calibration", "outer_sys_cnt_around_adjacent_begin_end_pair"},
+    {"submit-pmu-materialize", kFdwicSubmitPmuModeMaterialize, FdwicSubmitPmuPhase::Materialize,
+     kFdwicSubmitPmuPhaseBytes, "materialize", "materialize_begin_to_materialize_end",
+     "running_read_clear_observed_bracket", "inner_sys_cnt_between_boundary_observers"},
 };
 
 const SubmitPmuProfile *requested_profile() {

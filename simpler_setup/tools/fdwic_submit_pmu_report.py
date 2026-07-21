@@ -41,8 +41,10 @@ PROGRAMMABLE_COUNTER_RISK_THRESHOLD = 0x3FFFFFFF
 NONE_CAPTURE_MODE = "submit-pmu-none"
 ARG_BUILD_CAPTURE_MODE = "submit-pmu-arg-build"
 EMPTY_BRACKET_CAPTURE_MODE = "submit-pmu-empty-bracket"
+MATERIALIZE_CAPTURE_MODE = "submit-pmu-materialize"
 ARG_BUILD_PHASE_ID = 1
 EMPTY_BRACKET_PHASE_ID = 2
+MATERIALIZE_PHASE_ID = 3
 PHASE_CONFIG_BY_MODE = {
     ARG_BUILD_CAPTURE_MODE: {
         "id": ARG_BUILD_PHASE_ID,
@@ -59,6 +61,14 @@ PHASE_CONFIG_BY_MODE = {
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_empty_bracket_calibration",
         "time_semantics": "outer_sys_cnt_around_adjacent_begin_end_pair",
+    },
+    MATERIALIZE_CAPTURE_MODE: {
+        "id": MATERIALIZE_PHASE_ID,
+        "name": "materialize",
+        "boundary": "materialize_begin_to_materialize_end",
+        "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+        "counter_semantics": "running_read_clear_observed_bracket",
+        "time_semantics": "inner_sys_cnt_between_boundary_observers",
     },
 }
 SUPPORTED_CAPTURE_MODES = {NONE_CAPTURE_MODE, *PHASE_CONFIG_BY_MODE}

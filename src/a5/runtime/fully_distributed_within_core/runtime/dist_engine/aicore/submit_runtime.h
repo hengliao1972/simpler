@@ -485,6 +485,9 @@ dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &arg
     drain_block_won(ctx.self);
     drain_phase_b(ctx.self);
     TRACE_TIMESTAMP(efdrain_end);
+    // 旧 API 的 Materialize.start 复用 efdrain_end；在同一源码边界打开
+    // selected phase。submit-PMU ELF 中泳道 record 已编译去除。
+    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Materialize>();
     TRACE_SPAN_RECORD(submit_begin, efdrain_end, ctx.self, ctx.task_id, -1, TracePhase::EfDrain, 0, 0);
     uint64_t prepare_map_end = efdrain_end;
     if (!dist_submit_materialize_and_prepare_map(
@@ -509,6 +512,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
     drain_block_won(ctx.self);
     drain_phase_b(ctx.self);
     TRACE_TIMESTAMP(efdrain_end);
+    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Materialize>();
     TRACE_SPAN_RECORD(submit_begin, efdrain_end, ctx.self, ctx.task_id, -1, TracePhase::EfDrain, 0, 0);
     uint64_t prepare_map_end = efdrain_end;
     if (!dist_submit_materialize_and_prepare_map(
@@ -567,6 +571,9 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_compete_first_finish
 
     fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::ArgBuild>();
     TRACE_TIMESTAMP(materialize_begin);
+    // compete-first 的 selected phase 与当前泳道 Materialize.begin 共用
+    // 同一业务边界，PrepareMap 由 helper 中的 end 排除。
+    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Materialize>();
     uint64_t prepare_map_end = materialize_begin;
     if (!dist_submit_materialize_and_prepare_map(
             ctx.self, args, ctx, DistSubmitKind::Kernel, materialize_begin, prepare_map_end
@@ -606,6 +613,7 @@ dist_alloc_compete_first_finish(PTO2Runtime *, const DistCompeteFirstTicket &tic
 
     fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::ArgBuild>();
     TRACE_TIMESTAMP(materialize_begin);
+    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Materialize>();
     uint64_t prepare_map_end = materialize_begin;
     if (!dist_submit_materialize_and_prepare_map(
             ctx.self, args, ctx, DistSubmitKind::Alloc, materialize_begin, prepare_map_end

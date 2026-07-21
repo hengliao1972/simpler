@@ -162,7 +162,8 @@ outputs/TestPagedAttentionUnroll_Case1_20260717_023809/
 | 2026-07-20 | `9f6140c1` | 观察工具 | 收口真实 PA 业务与 atomic 合并泳道 |
 | 2026-07-21 | `faa370d9` | 观察工具 | 建立真实 PA `submit-pmu-none` 全窗证据链 |
 | 2026-07-21 | `2a7dccee` | 观察工具 | 建立真实 PA `arg-build` 单阶段 PMU |
-| 2026-07-21 | 本阶段提交 | 观察工具 | 量化真实 PA running bracket 的空区间观察指纹 |
+| 2026-07-21 | `81a1f382` | 观察工具 | 量化真实 PA running bracket 的空区间观察指纹 |
+| 2026-07-21 | 本阶段提交 | 观察工具 | 建立真实 PA `materialize` 单阶段 PMU |
 
 ### 4.1 真实 PA 第一轮 atomic 与前端优化
 
@@ -880,7 +881,7 @@ Submit envelope、EfDrain、OrchestrationReplay、FinalDrain 和 WorkerCompletio
 
 ### 8.3 `submit-pmu-none` 与真实 span 单阶段 PMU
 
-**[`submit-pmu-none`、首个真实 span `arg-build` 和空 bracket 校准均已完成 A5 收口]**
+**[`submit-pmu-none`、`arg-build`、空 bracket 校准和 `materialize` 均已完成 A5 收口]**
 
 本阶段没有修改或复测 standalone，而是在真实 PA 中建立独立诊断构建。该构建在
 编译期去除普通泳道、atomic 观察和通用逐 task PMU ring，分为两种运行方式：
@@ -1150,7 +1151,149 @@ level-4 B1 `20260721_022221` 为 4,546 条事件、88.595 us、`dropped=0`、排
 PASS。四轮只证明新增 mode、元数据和公共 Claim.end 空 wrapper 没有破坏既有证据链，
 B1 冷启动绝对时间仍不得跨 ELF 相减。
 
-#### 8.3.4 后续真实 selector 与三条证据链分工
+#### 8.3.4 第二个真实业务 selector：`submit-pmu-materialize`
+
+**[观察工具，已完成两轮 B1 与两轮 Case1 实测闭合]**
+
+本阶段不是从历史 `claim/efdrain/materialize/register` 名单中顺次取一个旧 phase，
+而是重新查看当前 compete-first 真实 PA 的最新 Case1 排他结果
+`outputs/TestPagedAttentionUnroll_Case1_20260720_234305/` 后再决定。该轮
+`Materialize` 为 97,467,035 aggregate core-ticks，占 `SubmitUnion`
+399,604,449 ticks 的 **24.391%**，是已具备明确源码起止边界的最大业务 span；同轮
+`Claim`、`EfDrain`、`Register` 分别占 19.887%、15.853% 和 12.010%。已经完成的
+`arg-build` 则覆盖 `Claim.end -> Materialize.begin`，二者首尾相接但不重叠。
+因此这一轮选择来自最新真实布局和可复用边界，不是复活 standalone 或旧 schema
+中的 selector 顺序。
+
+入口为 `--fdwic-profile submit-pmu-materialize`，编译身份固定为：
+
+```text
+PTO_FDWIC_SUBMIT_PMU=1
+PTO_FDWIC_SUBMIT_PMU_PHASE_ID=3
+PTO_FDWIC_TRACE_ENABLED=0
+```
+
+host/runtime 使用独立 mode `4`、phase id `3`，phase 名称和边界分别为
+`materialize`、`materialize_begin_to_materialize_end`；counter/time 口径分别为
+`running_read_clear_observed_bracket` 和
+`inner_sys_cnt_between_boundary_observers`。这仍是一轮只打开一个业务 phase 的诊断
+ELF，不同时采 Claim、EfDrain 或 Register。
+
+设备端没有另造一条近似路径，而是在四个真实入口精确打开同一个 phase：
+
+1. 旧 Kernel `dist_submit_impl()` 在 EfDrain 完成、进入 Materialize 前 begin；
+2. 旧 Alloc `dist_alloc_tensors()` 在相同业务边界 begin；
+3. compete-first Kernel finish 在 ticket 恢复和校验成功、`materialize_begin`
+   取时后 begin；
+4. compete-first Alloc finish 在相同业务边界 begin。
+
+四条入口统一调用 `dist_submit_materialize_and_prepare_map()`；唯一成功 end 位于该
+helper 内部，在 `dist_submit_check_task_cap()` 和
+`dist_submit_materialize_args()` 均成功返回后、泳道 `materialize_end` 取时前。
+因此观测区间包含 task-cap 检查、tag/output/register-mask 扫描、heap ring 布局、
+输出 Tensor 初始化及 `heap_next` 推进，但不包含后继 `PrepareMap`。submit-PMU 构建
+已编译掉泳道 record，所以旧入口 begin 与 helper 之间的 trace 宏不会给本 ELF
+增加一条实际记录。
+
+失败路径刻意不伪造 end：task-cap 或参数、heap、输出物化任一检查失败时，helper
+直接返回，遗留的 armed phase 会使 begin/end 不平衡、调用 shape 或最终 status
+闭合失败；设备发布、host 校验和 HTML 加工据此 fail-closed，不能把一个被截断的
+Materialize 当成有效短样本。正常 PA Case1 中 Materialize 每个 Submit 固定执行
+一次，所以正式 shape 必须严格为 96 核、每核 1,280 次 begin 和 1,280 次 end，
+全局各 122,880 次；B1 则固定为每核 5 次、全局各 480 次。
+
+该 profile 复用已有 phase sidecar，没有扩展 raw ABI：`submit-pmu-none` 仍为
+128 B header 加 `96 × 64 B` whole record，共 6,272 B；`materialize` 与
+`arg-build/empty-bracket` 一样只再追加 `96 × 64 B` phase record，总计 12,416 B。
+没有增加逐 Submit 记录、泳道字段或约 200 MB 的 trace ring。
+
+两轮 B1 先验证真实挂点、固定 shape 和冷启动下的数值闭合：
+
+| 产物 | 全局 Submit | ALL 每次 elapsed | ALL 每次 request | ALL 每次 miss | 同 ELF 时间/request/miss 占比 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `..._024533` | 82.091 us | 912.846 ns | 333.183 | 8.225 | 20.432% / 45.075% / 21.321% |
+| `..._024641` | 81.741 us | 896.398 ns | 267.810 | 7.369 | 20.932% / 42.404% / 20.485% |
+
+两轮都是 32 AIC + 64 AIV、每核 5 次 begin/end、phase status `0x3f`，96/96
+primary/shadow 精确相等，最大单段 shadow request/miss 分别为 3,068/85 和
+3,040/78。B1 仍只用于结构、次数、冷启动和快速门禁，其每次 request/miss 不外推
+Case1 稳态。
+
+两轮完整 Case1 产物为：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260721_024748/
+outputs/TestPagedAttentionUnroll_Case1_20260721_024909/
+```
+
+两轮均为 96 核、每核 1,280 次 begin/end、phase status `0x3f`，owner 配置/恢复、
+32 个 mixed triplet、固定 shape、数值顺序、phase 时间和风险阈值全部闭合；
+primary/shadow 96/96 精确相等，capture gap 为 0。第一轮 raw/HTML 为
+72,947/80,049 B，第二轮为 72,958/80,049 B。逐角色每次调用的原始 observed 为：
+
+| 产物 | 全局 Submit | 角色 | 每次 elapsed | 每次 request | 每次 miss |
+| --- | ---: | --- | ---: | ---: | ---: |
+| `..._024748` | 4,922.142 us | ALL | 797.814 ns | 233.197 | 1.474 |
+| 同上 | 同上 | AIC | 776.265 ns | 228.942 | 0.022 |
+| 同上 | 同上 | AIV | 808.588 ns | 235.325 | 2.201 |
+| `..._024909` | 4,851.282 us | ALL | 797.061 ns | 233.238 | 1.418 |
+| 同上 | 同上 | AIC | 775.653 ns | 228.170 | 0.021 |
+| 同上 | 同上 | AIV | 807.765 ns | 235.772 | 2.116 |
+
+“阶段占比”只使用同一 ELF、同一轮、同一角色的数据：时间分子为 phase elapsed
+core-time、分母为逐核首末 Submit elapsed core-time；request/miss 分子为 phase
+observed、分母为本轮整窗 primary。两轮结果为：
+
+| 产物 | 角色 | 时间占比 | request observed 占比 | miss observed 占比 |
+| --- | --- | ---: | ---: | ---: |
+| `..._024748` | ALL | 22.560% | 37.688% | 12.056% |
+| 同上 | AIC | 22.540% | 36.532% | 10.487% |
+| 同上 | AIV | 22.570% | 38.278% | 12.065% |
+| `..._024909` | ALL | 22.105% | 37.741% | 11.681% |
+| 同上 | AIC | 21.882% | 36.442% | 10.997% |
+| 同上 | AIV | 22.214% | 38.404% | 11.685% |
+
+两轮约 22.1%～22.6% 的同 ELF 时间份额和约 37.7% 的 request 份额可以说明
+Materialize 是当前诊断布局中的重要取指区域；它们不能直接等同于关闭插桩后的净
+业务成本。尤其 empty-bracket 的两轮 Case1 经验指纹约为 ALL 639～640 ns、
+49.34 request、1.34～1.36 miss/对，而 materialize 约为 797 ns、233.2 request、
+1.42～1.47 miss/次。empty elapsed 用外层 tick 包住完整 observer 对，materialize
+elapsed 是两个 observer 内侧的业务时间；request/miss 即使都来自 running
+read-clear，也属于不同 ELF、不同布局和不同缓存状态。故 empty 只能提示观察器的
+自扰动量级不可忽略，绝不能从 materialize 中相减得到“净时间”或“净 miss”。
+按角色看，AIV Materialize 为 2.20/2.12 miss/次，empty-bracket 为 2.01/2.03
+miss/对，也仍处在同一量级；当前结果不能证明 Materialize 业务体带来了明确的 AIV
+miss 增量。AIC Materialize 只有约 0.022/0.021 miss/次，同样只保留原始观测，不作
+跨 ELF 扣减。
+
+代码落定后串行回归了五类互斥 B1 构建：
+
+| 构建 | 产物 | 结果 |
+| --- | --- | --- |
+| `submit-pmu-arg-build` | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_025027/` | 96×5、status `0x3f`、primary/shadow 96/96 精确相等；257.392 us |
+| `submit-pmu-empty-bracket` | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_025125/` | 96×5、status `0x3f`、primary/shadow 96/96 精确相等；230.313 us |
+| `submit-pmu-none` | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_025214/` | 无 phase 字段、primary/shadow 96/96 精确相等；298.298 us |
+| `perf-clock` | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_025305/` | 96×5 Submit、ELF 身份和调用 shape 闭合；274.997 us |
+| 普通 level-4 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_025353/` | 4,550 条事件、89.109 us、`dropped=0`、排他整数闭合 PASS |
+
+这些回归只证明新增 mode、四个 begin 挂点和统一成功 end 没有破坏既有构建身份、
+phase 契约或泳道加工；B1 的跨核到达/等待波动很大，五种 ELF 的绝对时间仍不得
+互相相减。
+
+最后将 AICPU header 校验从逐个枚举旧 phase mode 等价收敛为复用
+`fdwic_submit_pmu_mode_has_phase()`，使 mode 判定与公共 phase/字节数契约只有一个
+事实来源。该重构没有修改计数器配置、业务边界或设备 ABI；最终源码再次运行
+`submit-pmu-materialize` B1：
+
+```text
+outputs/TestPagedAttentionUnroll_CaseB1_20260721_025856/
+```
+
+结果为全局 Submit **281.494 us**、96 核各 5 次，begin/end 全局 480/480、status
+`0x3f`、primary/shadow 96/96 精确相等。它是最终源码状态的 materialize 回归；
+前两轮 B1 仍保留为最初四挂点实现的独立结构样本。
+
+#### 8.3.5 后续真实 selector 与三条证据链分工
 
 单阶段 selector 必须直接跟随当前真实 PA compete-first 泳道和离线排他定义，候选
 区域包括：
@@ -1178,11 +1321,11 @@ kernel               真实计算区间 overlay
 `submit-transition` 应复用现有真实边界，不为方便取数继续扩大泳道 raw。每个局部
 selector 必须独立编译、独立运行、独立发布，不能在一个 ELF 中同时打开多段。
 
-首个业务 selector `arg-build` 和 running bracket 空区间校准已经实现；其余
-selector 仍按上述清单逐个推进。后续每个业务 phase 都必须同时报告自己的原始
-observed 与 empty 的经验尺度，但不得跨 ELF 扣减出伪精确净值。standalone 历史
-实现只提供 owner、门禁和报告加工方法参考，不是该阶段的前置优化任务，也不能
-作为真实结果代替品。
+`arg-build`、running bracket 空区间校准和第二个业务 selector `materialize` 已经
+实现；其余 selector 仍按最新真实 Case1 排他分布和可证明源码边界逐个推进，不按
+旧名单批量复刻。后续每个业务 phase 都必须同时报告自己的原始 observed 与 empty
+的经验尺度，但不得跨 ELF 扣减出伪精确净值。standalone 历史实现只提供 owner、
+门禁和报告加工方法参考，不是该阶段的前置优化任务，也不能作为真实结果代替品。
 
 三条证据链最终分工为：
 
@@ -1290,6 +1433,16 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
 | empty 后 none B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_022026/` | 无 phase 字段、primary=shadow 96/96 |
 | empty 后 perf-clock B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_022115/` | 96×5 Submit、78.230 us、ELF 隔离 PASS |
 | empty 后 level-4 B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_022221/` | 4546 records、88.595 us、dropped=0、排他闭合 PASS |
+| materialize PMU B1 首轮 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_024533/` | 96×5 bracket、82.091 us、固定 shape/observed 闭合 |
+| materialize PMU B1 复验 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_024641/` | 96×5 bracket、81.741 us、固定 shape/observed 闭合 |
+| materialize PMU Case1 首轮 | `outputs/TestPagedAttentionUnroll_Case1_20260721_024748/` | 96×1280 bracket、4922.142 us；ALL 797.814 ns/次 |
+| materialize PMU Case1 复验 | `outputs/TestPagedAttentionUnroll_Case1_20260721_024909/` | 96×1280 bracket、4851.282 us；ALL 797.061 ns/次 |
+| materialize 后 arg-build B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_025027/` | 96×5、status 0x3f、primary=shadow 96/96 |
+| materialize 后 empty B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_025125/` | 96×5、status 0x3f、primary=shadow 96/96 |
+| materialize 后 none B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_025214/` | 无 phase 字段、primary=shadow 96/96 |
+| materialize 后 perf-clock B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_025305/` | 96×5 Submit、274.997 us、ELF 隔离 PASS |
+| materialize 后 level-4 B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_025353/` | 4550 records、89.109 us、dropped=0、排他闭合 PASS |
+| AICPU mode 重构后 materialize B1 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_025856/` | 最终源码 480/480、status 0x3f、primary=shadow 96/96 |
 
 ### 10.3 standalone
 
@@ -1421,17 +1574,20 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
 3. **[观察工具，已实现] 真实 PA `submit-pmu-none`**：编译期去除泳道、atomic 和
    通用逐 task PMU，每核完整 Submit 期只开关 PMU 一次；96 核 primary/shadow、
    owner Restore、AIC/AIV raw/HTML、两轮 B1 和一次 Case1 均已闭合；
-4. **[观察工具，首个 selector 与空 bracket 均已实现] 真实 PA 单阶段 PMU**：
+4. **[观察工具，两个业务 selector 与空 bracket 均已实现] 真实 PA 单阶段 PMU**：
    `arg-build` 已完成两轮 B1 与一次 Case1；`empty-bracket` 复用同一 12,416 B ABI，
    已完成两轮 B1 与两轮 Case1，量出 running begin/end 的稳态自扰动指纹并明确
-   外层 elapsed 与 read-clear request/miss 的不同边界。其余 selector 继续分别
+   外层 elapsed 与 read-clear request/miss 的不同边界；`materialize` 又按最新真实
+   Case1 最大明确业务 span 建立 mode 4/phase 3，完成两轮 B1、两轮 Case1、五类
+   互斥 B1 回归和最终 AICPU mode 重构回归，仍未扩展 ABI。其余 selector 继续分别
    编译、分别采集，不在同一提交中批量铺开，也不依赖新的 standalone 实现；
 5. 结构和边界迭代先使用最小有效真实 PA 用例完成正确性门禁；只有构建身份、容量、
    业务边界和统计闭合后，才运行完整 Case1 b256 性能样本，避免反复生成数百 MiB
    profiling 文件。
 
-下一步以已经闭合的 empty 经验尺度为解释约束，按真实排他 span 逐个建立其余业务
-selector；不从业务 observed 中机械扣除 empty。真实 span 的边界、调用 shape 和
-完整 Case1 数据闭合后，再量化三种构建的观察代价并专项归因独占设备上的运行波动。
+下一步继续以已经闭合的 empty 经验尺度为解释约束，根据最新真实 Case1 排他占比和
+可证明源码边界逐个选择其余业务 selector；不从 `arg-build/materialize` observed
+中机械扣除 empty，也不按旧 selector 名单批量实现。真实 span 的边界、调用 shape
+和完整 Case1 数据闭合后，再量化三种构建的观察代价并专项归因独占设备上的运行波动。
 这些前置数据闭合前，不从单轮 I-cache 数直接提出生产优化，也不用 standalone 的
 绝对数替代真实 PA 当前结果。

@@ -152,13 +152,21 @@ def pytest_addoption(parser):
     parser.addoption(
         "--fdwic-profile",
         action="store",
-        choices=["none", "perf-clock", "submit-pmu-none", "submit-pmu-arg-build", "submit-pmu-empty-bracket"],
+        choices=[
+            "none",
+            "perf-clock",
+            "submit-pmu-none",
+            "submit-pmu-arg-build",
+            "submit-pmu-empty-bracket",
+            "submit-pmu-materialize",
+        ],
         default="none",
         help="Select a private fully_distributed_within_core evidence build. "
         "perf-clock keeps only the first/last Submit device clock per core; "
         "submit-pmu-none keeps one full Submit-sequence scalar/I-cache PMU window per core; "
         "submit-pmu-arg-build attributes the Claim-to-Materialize eager-build interval; "
-        "submit-pmu-empty-bracket calibrates the adjacent begin/end observer cost at Claim.end.",
+        "submit-pmu-empty-bracket calibrates the adjacent begin/end observer cost at Claim.end; "
+        "submit-pmu-materialize attributes the current Materialize business span.",
     )
     parser.addoption(
         "--use-example-exec-time",
@@ -455,6 +463,7 @@ def _configure_fdwic_profile(config):
         "submit-pmu-none",
         "submit-pmu-arg-build",
         "submit-pmu-empty-bracket",
+        "submit-pmu-materialize",
     }:
         raise pytest.UsageError(f"unsupported --fdwic-profile {fdwic_profile!r}")
 
@@ -678,6 +687,7 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
         "submit-pmu-none",
         "submit-pmu-arg-build",
         "submit-pmu-empty-bracket",
+        "submit-pmu-materialize",
     }:
         incompatible = []
         for item in items:
