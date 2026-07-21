@@ -446,6 +446,19 @@ target_include_directories(test_fdwic_swimlane_poll_batch BEFORE PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
 )
 
+# DistTensorMap 的 retire 实现同样是 header-only。直接包含真实 FDWIC
+# `tensor_map.h`，避免用另一份 host 模型替代生产代码的 task-head/free-list
+# 语义。该测试只使用普通内存，不需要设备或 CANN runtime。
+add_a5_test(test_fdwic_tensor_map_retire a5/test_fdwic_tensor_map_retire.cpp)
+target_compile_definitions(test_fdwic_tensor_map_retire PRIVATE __CPU_SIM=1)
+target_include_directories(test_fdwic_tensor_map_retire BEFORE PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
+)
+set_tests_properties(test_fdwic_tensor_map_retire PROPERTIES LABELS "no_hardware")
+
 # A5 trb runtime UTs — mirror of a2a3 trb runtime UTs, link against a5_rt_objs.
 # Target names carry the a5_ prefix because hierarchical/test_tensormap (and
 # the unprefixed a2a3 runtime targets test_scheduler_state / test_ready_queue
