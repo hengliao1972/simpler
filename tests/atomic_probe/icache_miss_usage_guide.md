@@ -982,6 +982,46 @@ profile marker；旧 host 现在会在设备执行前明确要求重建，而不
 目录。重建后本轮 host SHA256 为
 `441e54ac3d997e110de792d6597b8cf47d31a764ccf9bc63551387b9a597b919`。
 
+#### Case1 首轮稳态原因数据
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260721_115559/
+```
+
+该轮 golden 通过，完整 Submit 为 4,840.463 us。96 核均为 1,280 次 Submit；
+EfDrain 内实际排除 936 次 linked Kernel，逐核 `K` 为 3～19，AIC/AIV 分别累计
+429/507 次。全局 begin/end 都是 `96×1280+936=123816`，96/96 primary/shadow
+request 与 miss 逐核完全相等，其他 producer/consumer/provenance 门禁也全部闭合。
+
+同一 ELF 内的局部归因如下；时间占比的分母是各角色逐核 Submit elapsed 之和，
+request/miss 占比的分母是各角色完整 Submit primary：
+
+| 角色 | control 时间/call | 时间占比 | request/call | request 占比 | miss/call | miss 占比 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ALL | 162.654 ns | 4.5920% | 82.110 | 14.0406% | 2.258 | 17.0455% |
+| AIC | 199.792 ns | 5.7719% | 83.945 | 14.0450% | 0.110 | 28.6828% |
+| AIV | 144.085 ns | 4.0219% | 81.193 | 14.0383% | 3.332 | 16.9316% |
+
+完整 Submit 的 AIC/AIV 每核平均 request 为 765,037/740,310，平均 miss 为
+493/25,187.344，miss rate 为 0.06444%/3.40227%。AIV 的 EfDrain-control 每核平均
+miss 为 4,264.625，也就是它贡献本轮 AIV 完整 Submit miss 的 16.93%。这回答的是
+“平均每个 AIV 在本诊断 ELF 的完整 Submit 期看到多少 miss”，不是零观察构建的
+墙钟损失。
+
+按 90 ns/miss 只作串行直觉量尺，AIV 完整窗约为 2,266.861 us/core，局部 control
+约为 383.816 us/core；但局部实际 elapsed 只有 184.428 us/core。量尺大于被观察
+阶段时间本身，直接反证了把 `miss×90ns` 当作可相减停顿的做法：miss 可重叠、被
+流水隐藏，标尺也来自另一个隔离微基准。另一个重要现象是 AIC control 时间/call
+反而高于 AIV，而 AIC miss/call 低两个数量级；因此当前单轮不支持“I-cache miss
+主导 EfDrain-control 时间”，后续应把 atomic/同步等待和纯控制指令一并纳入解释。
+
+Case1 三件套大小为 76,269/3,124/86,600 B，SHA256 分别为
+`6d6aa06fbf972f36fbb9260485bb5ee41f5cbb97e9246cb15a398ba2497201ce`、
+`b4a535ec671f7416945b5205e11268308068759e75ecc324a10ea2a57fb3fa03`、
+`f5751e86f503273d1b8f8e386301d1d84dfdc49ee6de45d7372199ce90a68841`；provenance
+Git head 为 `77df395941f86b3b546a6f50d6288fb88acb7078`，实际 ELF SHA 与 B1 相同，
+离线重渲染也逐字节一致。
+
 ## 2. 为什么 I-cache miss 必须独立重编译
 
 I-cache 数据对代码布局极其敏感。泳道和逐 atomic 观察会增加：
@@ -1087,13 +1127,15 @@ schema-v5、构建目录、命令和字段；不能套用到上面的真实 PA p
 - `submit-pmu-materialize`：第 1.4 节定义的真实 Materialize 业务 span；
 - `submit-pmu-claim`：第 1.5 节定义的真实 Claim 业务 span；
 - `submit-pmu-register`：第 1.6 节定义的 RegisterOutputs 调用体；
-- `submit-pmu-submit-transition`：第 1.7 节定义的所有相邻 Submit 间隙聚合。
+- `submit-pmu-submit-transition`：第 1.7 节定义的所有相邻 Submit 间隙聚合；
+- `submit-pmu-efdrain-control`：第 1.8 节定义的排除 linked Kernel 的不连续 Scalar 控制段。
 
 真实 phase id 依次为 ArgBuild `1`、EmptyBracket `2`、Materialize `3`、Claim `4`、
-Register `5` 和 SubmitTransition `6`；`none` 不含 phase。前五个 phase 每核预期
-calls 等于 Submit 数，只有 SubmitTransition 按 `N-1` 校验。
+Register `5`、SubmitTransition `6` 和 EfDrainControl `7`；`none` 不含 phase。
+除 SubmitTransition 的 outer calls 为 `N-1` 外，其余业务/校准 phase 都为 `N`；
+EfDrainControl 的实际 begin/end 读数还要加被排除 Kernel 数 `K`。
 
-七者 raw schema 均为 `fdwic-submit-pmu-v1`，但分别来自独立诊断 ELF，不能跨
+八者 raw schema 均为 `fdwic-submit-pmu-v1`，但分别来自独立诊断 ELF，不能跨
 profile 相减或拼接。
 
 standalone 历史 schema 中的 `lower/upper` 是已经固化的字段名，只表达

@@ -182,7 +182,8 @@ outputs/TestPagedAttentionUnroll_Case1_20260717_023809/
 | 2026-07-21 | `15c54b33` | 观察工具 | 为真实 PA PMU 产物绑定构建 provenance |
 | 2026-07-21 | `36547252` | 上板验证 | 闭合完整 Submit 与 Register 分段三件套 |
 | 2026-07-21 | `21e0414c` | 观察工具 | 建立排除 linked Kernel 的 EfDrain-control 固定容量 PMU |
-| 2026-07-21 | 本阶段提交 | 上板验证 | 闭合 EfDrain-control 的实际 K、N+K 与构建三件套 |
+| 2026-07-21 | `77df3959` | 上板验证 | 闭合 EfDrain-control 的实际 K、N+K 与构建三件套 |
+| 2026-07-21 | 本阶段提交 | 原因取数 | 形成 EfDrain-control 的首轮 Case1 AIC/AIV 稳态数据 |
 
 ### 4.1 真实 PA 第一轮 atomic 与前端优化
 
@@ -3324,7 +3325,7 @@ report/cache 两组共 174 项 PASS，ruff 和 diff 检查通过；另用
 
 ### 8.17 EfDrain 控制段的固定容量 I-cache 归因
 
-**[观察工具与真实 A5 B1 已闭合；Case1 稳态原因取数待下一阶段]**
+**[观察工具、真实 A5 B1 与首轮 Case1 稳态原因取数均已闭合]**
 
 最新权威泳道中，完整 EfDrain 占 SubmitUnion 的 15.734%，但其中真实 KernelUnion
 占 8.019%；直接包围整个 EfDrain 会把 Kernel 执行期间混入 Scalar 归因。扣除嵌套
@@ -3378,6 +3379,35 @@ provenance Git head 为 `21e0414c35ae7738a89f8994bfaf6870b733dea3`，extra key �
 `88075a1848686623`，host SHA 为
 `441e54ac3d997e110de792d6597b8cf47d31a764ccf9bc63551387b9a597b919`；离线重载
 raw+sidecar 后的 HTML 与正式文件逐字节一致。
+
+随后从验证提交 `77df3959` 构建并运行首轮真实 Case1：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260721_115559/
+```
+
+golden 与全部门禁通过，完整 Submit 为 4,840.463 us。96 核均为 1,280 Submit；
+实际 `ΣK=936`，逐核 3～19，AIC/AIV 分别为 429/507。begin/end 精确闭合为
+123,816/123,816，即 `96×1280+936`，primary/shadow 仍为 96/96 exact。
+
+| 角色 | control ns/call | 时间占比 | request/call | request 占比 | miss/call | miss 占比 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ALL | 162.654 | 4.5920% | 82.110 | 14.0406% | 2.258 | 17.0455% |
+| AIC | 199.792 | 5.7719% | 83.945 | 14.0450% | 0.110 | 28.6828% |
+| AIV | 144.085 | 4.0219% | 81.193 | 14.0383% | 3.332 | 16.9316% |
+
+完整 Submit 的 AIC/AIV 每核平均 miss 为 493/25,187.344，miss rate 为
+0.06444%/3.40227%；AIV control 每核平均 miss 为 4,264.625。按 90 ns 标尺，后者
+是 383.816 us/core，却高于该角色实际 control elapsed 的 184.428 us/core；因此不能
+把标尺当成可相减的 stall。AIC 的 control 时间又高于 AIV，而 miss/call 低两个数量级，
+本轮同样不支持“I-cache miss 单独主导 EfDrain-control 时间”。下一步应结合既有 atomic
+泳道和控制流证据选候选，不能仅按 miss 排名改代码。
+
+Case1 raw/provenance/HTML 大小为 76,269/3,124/86,600 B，SHA256 为
+`6d6aa06fbf972f36fbb9260485bb5ee41f5cbb97e9246cb15a398ba2497201ce`、
+`b4a535ec671f7416945b5205e11268308068759e75ecc324a10ea2a57fb3fa03`、
+`f5751e86f503273d1b8f8e386301d1d84dfdc49ee6de45d7372199ce90a68841`；provenance
+Git head 为 `77df395941f86b3b546a6f50d6288fb88acb7078`，离线重渲染逐字节一致。
 
 ## 9. 已撤回、失败或不能外推的路线
 
@@ -3524,6 +3554,7 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
 | perf-clock-kernel 同 ELF 20 轮 | `outputs/TestPagedAttentionUnroll_Case1_20260721_075049/` 至 `..._080901/` | K 复现 P 的共同伸缩；波动主要落在 residual |
 | EfDrain-control 首次旧 host 失败 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_114357/` | host 缺新 profile marker，init 前拒绝；无 raw，不作性能样本 |
 | EfDrain-control 正式 B1 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_115019/` | 96×5、`ΣK=1`、481/481、primary=shadow、三件套闭合 |
+| EfDrain-control Case1 | `outputs/TestPagedAttentionUnroll_Case1_20260721_115559/` | 4,840.463 us、`ΣK=936`、123816/123816、AIC/AIV 稳态原因数据 |
 
 ### 10.3 standalone
 
@@ -3669,7 +3700,8 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
    Case1 和四类互斥构建回归均已闭合；`efdrain-control` 最后建立 mode 8/phase 7，
    用四条 Submit 外层边界和 Kernel 前后 pause/resume 聚合排除 linked Kernel 的
    不连续 Scalar 控制片段；真实 A5 B1 已闭合 `ΣK=1`、481/481 read、96 核状态与
-   provenance 三件套，Case1 稳态原因取数待下一阶段。六个
+   provenance 三件套，Case1 又闭合 `ΣK=936`、123816/123816 read 和首轮 AIC/AIV
+   时间/request/miss 原因数据。六个
    selector 都复用 12,416 B ABI，没有增加逐调用记录；至此停止继续增加 phase，
    也不依赖新的 standalone 实现；
 5. 结构和边界迭代先使用最小有效真实 PA 用例完成正确性门禁；只有构建身份、容量、
@@ -3745,11 +3777,15 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
     绑定或文件变化均 fail-closed；成组发布失败会恢复旧产物。相关 174 项通过；
     `submit-pmu-none` 与 `submit-pmu-register` 各一轮真实 A5 B1 三件套均闭合，且使用
     不同 profiled/extra cache key。
+19. **[EfDrain-control，B1 与首轮 Case1 已闭合]**：固定容量排除真实 linked Kernel，
+    B1 实际 `ΣK=1`，Case1 实际 `ΣK=936`；后者完整 Submit 为 4,840.463 us，AIC/AIV
+    control 分别为 199.792/144.085 ns/call、0.110/3.332 miss/call。AIC 时间更长但
+    miss 低两个数量级，因此当前证据不支持单独按 I-cache miss 选择生产优化。
 
 下一步不再扩充 N、K 或已经完成归因的既有 selector，也不跨 ELF 扣减。独立构建
-provenance 已完成；固定容量 EfDrain-control 已按排除真实 linked-Kernel 的语义实现，
-先以 B1 闭合实际 `K`、`N+K` 与三件套，再决定是否需要一轮 Case1 原因取数。不得恢复
-逐 Submit/逐等待的大 raw，也不在此基础上继续堆叠依赖就绪 selector。原因层级闭合后，
-再由 perf-clock 交错 A/B 决定真实 Scalar 候选保留或撤销。
+provenance 与 EfDrain-control 的 B1/Case1 已完成。不得恢复逐 Submit/逐等待的大 raw，
+也不在此基础上继续堆叠依赖就绪 selector。下一阶段只从现有泳道 atomic、排他 span、
+全窗 PMU 与六个 selector 的交叉证据中选择一个真实 Scalar 候选，再由 perf-clock
+交错 A/B 决定保留或撤销。
 单阶段 observed 不机械扣除 empty，也不从单轮 I-cache 数直接提出生产优化；
 standalone 的绝对数继续不替代真实 PA 当前结果。
