@@ -946,9 +946,41 @@ python -m pytest \
   --rounds 1 -s -v
 ```
 
-实现提交前的 host 回归已覆盖 mode/phase/provenance、`N+K` 读数闭合、旧 profile
-拒绝专属字段、外层 `N` 分母和 HTML 语义；真实 A5 B1 的实际 `K`、构建身份与
-三件套路径在上板闭合后再记录，不预填推测值。
+host 回归覆盖 mode/phase/provenance、`N+K` 读数闭合、旧 profile 拒绝专属字段、
+外层 `N` 分母和 HTML 语义。实现提交 `21e0414c` 后的真实 A5 B1 位于：
+
+```text
+outputs/TestPagedAttentionUnroll_CaseB1_20260721_115019/
+  fdwic_submit_pmu_raw.json
+  fdwic_submit_pmu_provenance.json
+  fdwic_submit_pmu_report.html
+```
+
+该轮 96 核均为 5 次 Submit。实际只回收执行 1 次 linked Kernel：95 核 `K=0`，
+logical/physical core 9 的 AIC 为 `K=1`；所以全局 begin/end 均为
+`96×5+1=481`，每核都满足 `N+K`。96/96 phase status 为 `0x3f`，primary/shadow
+request 与 miss 也逐核完全相等；owner Restore、数值顺序、风险阈值和专属
+`phase_kernel_exclusion_closed_records=96` 全部通过。完整 B1 Submit 为
+279.551 us，只作冷启动结构证据，不作为稳态性能。
+
+本轮局部累计 elapsed/request/miss 分别为 64,751 ticks、56,187、3,414；相对同一
+ELF 的逐核 Submit 累计值为 2.7441%/16.3993%/19.4021%。它证明不连续 control
+segments 已能采集且真实 Kernel 被单独排除，不证明这些 B1 比例能代表 Case1。
+
+三件套大小为 72,951/3,124/84,377 B，SHA256 分别为
+`79d6014e892b20823da039e3a2bea6c9761946b6c24444db71d7c61d16caca02`、
+`24be202086e9fda893012ca999073ceffa160aa9abba12861cee95414006e4d4`、
+`d8b2b4b77c243ac90e71fbb99084e7f5be7205f5d2a28ee224d4e56b9ed6c892`；重新加载
+raw+sidecar 后渲染的 HTML 与正式文件逐字节一致。provenance 的 Git head 精确为
+`21e0414c35ae7738a89f8994bfaf6870b733dea3`，extra cache key 为
+`88075a1848686623`。
+
+首次上板尝试 `..._114357/` 还暴露了一个必须保留的复现门禁：AICore 已按新 profile
+重编，但预装 `libhost_runtime.so` 仍是只认识到 submit-transition 的旧缓存，host init
+返回 0。最终实现因此在冻结 provenance 前先核验实际 host ELF 的三个 hook 和精确
+profile marker；旧 host 现在会在设备执行前明确要求重建，而不是留下无 raw 的失败
+目录。重建后本轮 host SHA256 为
+`441e54ac3d997e110de792d6597b8cf47d31a764ccf9bc63551387b9a597b919`。
 
 ## 2. 为什么 I-cache miss 必须独立重编译
 

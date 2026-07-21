@@ -181,7 +181,8 @@ outputs/TestPagedAttentionUnroll_Case1_20260717_023809/
 | 2026-07-21 | `443a0bb3` | 观察工具 | 完善真实 PA I-cache 逐核时间加工口径 |
 | 2026-07-21 | `15c54b33` | 观察工具 | 为真实 PA PMU 产物绑定构建 provenance |
 | 2026-07-21 | `36547252` | 上板验证 | 闭合完整 Submit 与 Register 分段三件套 |
-| 2026-07-21 | 本阶段提交 | 观察工具 | 建立排除 linked Kernel 的 EfDrain-control 固定容量 PMU |
+| 2026-07-21 | `21e0414c` | 观察工具 | 建立排除 linked Kernel 的 EfDrain-control 固定容量 PMU |
+| 2026-07-21 | 本阶段提交 | 上板验证 | 闭合 EfDrain-control 的实际 K、N+K 与构建三件套 |
 
 ### 4.1 真实 PA 第一轮 atomic 与前端优化
 
@@ -3323,7 +3324,7 @@ report/cache 两组共 174 项 PASS，ruff 和 diff 检查通过；另用
 
 ### 8.17 EfDrain 控制段的固定容量 I-cache 归因
 
-**[观察工具已实现；真实 A5 B1 待本提交后按构建 provenance 闭合]**
+**[观察工具与真实 A5 B1 已闭合；Case1 稳态原因取数待下一阶段]**
 
 最新权威泳道中，完整 EfDrain 占 SubmitUnion 的 15.734%，但其中真实 KernelUnion
 占 8.019%；直接包围整个 EfDrain 会把 Kernel 执行期间混入 Scalar 归因。扣除嵌套
@@ -3353,9 +3354,30 @@ bookkeeping。完整 primary/shadow whole 会重建并包含 Kernel，局部 ela
 字段拒绝回归；同时在冻结 provenance 前核验实际 host ELF 的三个 hook 与精确 profile
 marker，旧 `libhost_runtime.so` 会在上板前直接报出重建要求，不再等到设备 init 返回 0。
 report/cache 共 209 项 PASS，ruff、clang-format 与
-`git diff --check` 通过。真实 A5 B1 将在实现提交后重建，确保 provenance 中的 Git
-head 指向本提交，并实际验证 `K>0`、96 核 `N+K`、primary/shadow、owner Restore
-和三件套；未上板前不填实际次数或性能数值。
+`git diff --check` 通过。
+
+第一次上板在 `outputs/TestPagedAttentionUnroll_CaseB1_20260721_114357/` 于设备执行前
+失败：AICore override 已重编，但实际 host SO 是不含新 profile marker 的旧缓存，
+`fdwic_submit_pmu_host_init()` 返回 0，因此没有 raw。该失败没有被包装成设备或 Kernel
+问题；补上 host ELF 能力门禁并按 `21e0414c` 重建完整 A5 FDWIC runtime 后，正式 B1
+位于 `outputs/TestPagedAttentionUnroll_CaseB1_20260721_115019/`。
+
+正式轮 96 核均为 5 次 Submit，实际 `ΣK=1`：95 核为 0，logical/physical core 9 的
+AIC 为 1。全局 begin/end 恰为 481/481，等于 `96×5+1`；逐核也全部满足 `N+K`。
+phase status、专属 Kernel 排除、primary/shadow、owner Restore、拓扑、数值顺序与风险
+阈值均为 96/96。完整 B1 Submit 为 279.551 us；局部累计 elapsed/request/miss 为
+64,751/56,187/3,414，相对本 ELF 逐核完整 Submit 累计值为
+2.7441%/16.3993%/19.4021%。这些比例只证明真实不连续区间能闭合，不用于代替 Case1
+稳态归因。
+
+raw/provenance/HTML 大小为 72,951/3,124/84,377 B，SHA256 分别为
+`79d6014e892b20823da039e3a2bea6c9761946b6c24444db71d7c61d16caca02`、
+`24be202086e9fda893012ca999073ceffa160aa9abba12861cee95414006e4d4`、
+`d8b2b4b77c243ac90e71fbb99084e7f5be7205f5d2a28ee224d4e56b9ed6c892`。
+provenance Git head 为 `21e0414c35ae7738a89f8994bfaf6870b733dea3`，extra key 为
+`88075a1848686623`，host SHA 为
+`441e54ac3d997e110de792d6597b8cf47d31a764ccf9bc63551387b9a597b919`；离线重载
+raw+sidecar 后的 HTML 与正式文件逐字节一致。
 
 ## 9. 已撤回、失败或不能外推的路线
 
@@ -3500,6 +3522,8 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
 | 最终 perf-clock-kernel Case1 | `outputs/TestPagedAttentionUnroll_Case1_20260721_073849/` | 1013 个窗口内 Kernel；逐核/分组/顶层整数闭合 |
 | perf-clock-kernel 预热 | `outputs/TestPagedAttentionUnroll_Case1_20260721_074831/` | 4.480978 ms；明确排除出统计 |
 | perf-clock-kernel 同 ELF 20 轮 | `outputs/TestPagedAttentionUnroll_Case1_20260721_075049/` 至 `..._080901/` | K 复现 P 的共同伸缩；波动主要落在 residual |
+| EfDrain-control 首次旧 host 失败 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_114357/` | host 缺新 profile marker，init 前拒绝；无 raw，不作性能样本 |
+| EfDrain-control 正式 B1 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_115019/` | 96×5、`ΣK=1`、481/481、primary=shadow、三件套闭合 |
 
 ### 10.3 standalone
 
@@ -3644,7 +3668,8 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
    Submit hook，以每核 `N-1` 独立 shape 聚合相邻 Submit 间隙，两轮 B1、两轮
    Case1 和四类互斥构建回归均已闭合；`efdrain-control` 最后建立 mode 8/phase 7，
    用四条 Submit 外层边界和 Kernel 前后 pause/resume 聚合排除 linked Kernel 的
-   不连续 Scalar 控制片段，host 回归已闭合，真实 A5 B1 待实现提交后重建。六个
+   不连续 Scalar 控制片段；真实 A5 B1 已闭合 `ΣK=1`、481/481 read、96 核状态与
+   provenance 三件套，Case1 稳态原因取数待下一阶段。六个
    selector 都复用 12,416 B ABI，没有增加逐调用记录；至此停止继续增加 phase，
    也不依赖新的 standalone 实现；
 5. 结构和边界迭代先使用最小有效真实 PA 用例完成正确性门禁；只有构建身份、容量、
