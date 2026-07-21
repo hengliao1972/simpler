@@ -2494,6 +2494,105 @@ Scalar busy、atomic、I-cache miss 或频率问题。下一阶段先对 K resid
 侵入归因，并最终由原 P 的候选交错 A/B 决策；不能因为本轮在 K 中排除了 Kernel
 变化幅度主导，就直接修改业务协议或把结论外推到 P。
 
+### 8.9 独立设备状态与低功耗定性取证
+
+**[取证进行中；idle 链路和原始字段已闭合，持续负载探针等待排除并发 A5 任务后执行]**
+
+第 8.5～8.8 节已经把 P、N、K 各自的同 ELF 波动形态摸清，但仍不能回答设备内部
+频率、EDP 降频或外部任务是否参与了某一批次。这里增加一次**独立、限时、只作定性
+判断**的设备状态取证；它不成为第四条性能证据链，也不与任何权威 perf-clock、
+Submit-PMU 或泳道采样同场比较。`msprof` 运行期间取得的 PA 时间一律作废。
+
+#### 8.9.1 正式接口与字段语义
+
+本机 CANN 9.1 的正式入口为：
+
+```bash
+asys info -r status -d 0
+asys health -d 0
+asys profiling -r power -p <seconds> -d 0 --output <dir>
+```
+
+本机实现确认 `asys profiling -r power` 最终调用
+`msprof --sys-lp=on`。低功耗原始数据落在
+`device_0/sqlite/lowpower.db` 的 `LowPower` 表；字段含义由本机
+`tools/profiler/profiler_tool/analysis/viewer/stars/low_power_viewer.py` 核验：
+
+| 字段 | 正式含义 | 本阶段用途 |
+| --- | --- | --- |
+| `data7_hard` | PPU 上报的 AIC 平均频率 | 看持续频率阶跃或硬件/目标分离 |
+| `data0_soft` | 软件 DVFS 下发的 AIC 频率 | 看目标频率 |
+| `data2_soft` | EDP POWERBRAKE 计数 | 只看同一采样期首末增量 |
+| `data3_soft`～`data5_soft` | EDP IWARNING2/1/0 计数 | 只看同一采样期首末增量 |
+
+该表没有 Scalar 独立频率；公开 HAL 头文件也没有 `MODULE_TYPE_SCALAR`。因此不能把
+AIC 平均频率称为 Scalar 独立时钟，也不能臆造一个 Scalar 动态频率接口。N 构建中
+PMU cycle 与 sys-counter 的比例仍只表示该工作负载窗口的有效 cycle/time，不是独立
+硬件频率读数。
+
+#### 8.9.2 状态快照与告警边界
+
+2026-07-21 的只读状态快照显示：设备为 `Ascend 950PR_958b V100`，功耗约
+290.3～290.4 W、温度 40 C、采样时 AI Core usage 为 0%；idle 瞬时 AIC 频率为
+`100, 100 MHz`。设备 health 同时为 `Alarm`，`asys health -d 0` 报告一个：
+
+```text
+0x80b78000 | node type=SLLC | sensor type=RAS State | event state=module error
+```
+
+这只证明采样时存在该设备状态；当前没有证据证明 SLLC 告警导致 Submit 波动，也没有
+执行清告警、复位或任何配置修改。后续性能结论若仍在该状态下取得，必须保留这个环境
+事实，不能把它隐去或提前归因。
+
+#### 8.9.3 两秒 idle probe 的原始结果
+
+独立 idle 产物为：
+
+```text
+/tmp/asys_power_idle_20260721_0815/
+  asys_profiling_result_20260721082558007/
+    PROF_000001_20260721082558023_03217614RIFDHMDG/
+      device_0/sqlite/lowpower.db
+```
+
+数据库共 776 行，die 0/1/2/3 各 194 行；每个时间点四个 die 齐全。相邻时间戳的
+193 个差值全部严格为 **10.240002 ms**，覆盖 **1.976320386 s**。有效 D-die 0/1
+完全一致：
+
+| 指标 | die 0 | die 1 |
+| --- | ---: | ---: |
+| `data7_hard` | 首点 100 MHz，后续 193 点全为 1650 MHz | 同左 |
+| `data0_soft` | 首点 100 MHz，后续 193 点全为 1650 MHz | 同左 |
+| POWERBRAKE 首末增量 | 0 | 0 |
+| IWARNING2/1/0 首末增量 | 0/0/0 | 0/0/0 |
+
+因此这条链路能看约 10 ms 以上的持续频率变化以及 EDP 计数增长，但不能解析单次约
+5 ms Submit。更重要的是，纯 idle 采样也在第二个点后维持 1650 MHz，说明采集器
+本身或同期系统活动足以把频率拉高；不能把“采样期间为 1650 MHz”写成 PA 的独立
+频率结论。idle probe 只证明接口、粒度和字段可用，并且该两秒内未观察到 EDP 计数
+增长。
+
+#### 8.9.4 K 分布存在潜在并发污染，不能继续假定独占
+
+准备持续负载探针前的进程核验发现，一项 root 级系统评测从
+`2026-07-21 07:17:38 UTC` 起持续运行：
+
+```text
+python3 -m pytest test_team_evals.py ... --ascend-platform A5 ... -n 10
+```
+
+它的生命周期完整覆盖 K 正式 20 轮的 `07:50:49`～`08:09:01`，其沙箱任务也在
+`07:47`、`07:58`、`08:10` 等时刻陆续落盘。当前用户没有权限检查该 root 进程的
+设备文件描述符，因此尚未证明它实际占用 device 0；但在它退出或由外部确认不触碰
+device 0 以前，同一时间段不能再写成“经过进程核验的设备独占”。这也为 K 与较早
+P/N 的尾部形态不同提供了一个必须排除的环境变量，但**不是已经成立的根因**。
+
+因此本阶段暂不启动新的 PA、power probe 或 phase-PMU：先等待这项潜在 A5 任务
+退出，再完成一次持续真实 PA 负载下的独立 power 取证。若负载期 10.24 ms 采样仍
+稳定在目标频率且 EDP 计数不增长，只能排除“粗粒度持续 DVFS/EDP”为主因，仍不能
+排除短于一个采样周期的瞬态。随后立即回到 Materialize 同 ELF 单阶段 PMU，不把
+低功耗采样扩张成长期路线。
+
 ## 9. 已撤回、失败或不能外推的路线
 
 ### 9.1 已撤回的优化候选
