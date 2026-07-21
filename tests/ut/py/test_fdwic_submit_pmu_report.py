@@ -1393,6 +1393,48 @@ def test_efdrain_control_build_identity_uses_phase_id_7(
     )
 
 
+@pytest.mark.parametrize(
+    ("profile", "capture_factory", "phase_id"),
+    (
+        (ARG_BUILD_CAPTURE_MODE, _valid_arg_build_capture, 1),
+        (EMPTY_BRACKET_CAPTURE_MODE, _valid_empty_bracket_capture, 2),
+        (MATERIALIZE_CAPTURE_MODE, _valid_materialize_capture, 3),
+        (CLAIM_CAPTURE_MODE, _valid_claim_capture, 4),
+        (REGISTER_CAPTURE_MODE, _valid_register_capture, 5),
+        (SUBMIT_TRANSITION_CAPTURE_MODE, _valid_submit_transition_capture, 6),
+        (EFDRAIN_CONTROL_CAPTURE_MODE, _valid_efdrain_control_capture, 7),
+    ),
+)
+def test_each_phase_profile_closes_raw_identity_provenance_and_html(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    profile: str,
+    capture_factory: Callable[[], dict[str, Any]],
+    phase_id: int,
+) -> None:
+    raw_path = _write_capture(tmp_path, capture_factory())
+    raw_before = raw_path.read_bytes()
+    identity = _fake_build_identity(tmp_path, monkeypatch, profile=profile)
+
+    output_path, provenance_path = write_report_with_provenance(raw_path, identity)
+
+    capture = load_capture(raw_path)
+    provenance, provenance_sha256 = load_provenance(provenance_path, capture)
+    assert raw_path.read_bytes() == raw_before
+    assert capture.data["capture"]["mode"] == profile
+    assert provenance["binding"]["capture_mode"] == profile
+    assert provenance["build"]["profile"] == profile
+    assert provenance["build"]["compile_definitions"] == [
+        "PTO_FDWIC_SUBMIT_PMU=1",
+        f"PTO_FDWIC_SUBMIT_PMU_PHASE_ID={phase_id}",
+        "PTO_FDWIC_TRACE_ENABLED=0",
+    ]
+    document = output_path.read_text(encoding="utf-8")
+    assert provenance_sha256 in document
+    assert f"phase_id={phase_id}" in document
+    assert profile in document
+
+
 @pytest.mark.parametrize("fail_on_final_replace", (1, 2))
 @pytest.mark.parametrize("old_pair_exists", (False, True))
 def test_provenance_pair_publish_failure_restores_the_exact_previous_pair(

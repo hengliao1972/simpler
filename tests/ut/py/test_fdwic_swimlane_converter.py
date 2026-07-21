@@ -130,6 +130,22 @@ def _v4_rows(num_cores=3):
     return rows
 
 
+@pytest.fixture
+def v4_business_and_atomic_capture():
+    """Combine production business spans with direct and batched-poll atomic overlays."""
+
+    rows = _v4_rows()
+    rows.extend(
+        [
+            # ClaimMax consumes the FetchMax result, so its end is a return-ready boundary.
+            [0, 0, 0, 0, -1, "Atomic", 121, 128, 0x53, 4],
+            # Fanin polling keeps its exact logical call count without becoming exclusive work.
+            [0, 0, 0, -1, -1, "Atomic", 156, 159, (7 << 8) | 0x90, 5],
+        ]
+    )
+    return _capture(rows, trace_schema_version=4, num_cores=3, level=4)
+
+
 def _v4_single_path_rows(*, is_alloc, is_winner, claim_first=True, num_cores=3):
     """Build one Submit per core for an exact path-order contract test."""
 
@@ -623,6 +639,40 @@ def test_v4_production_hierarchy_generates_thin_events_and_exact_residuals(tmp_p
     assert sum(event["name"] == "submit_residual" for event in residuals) == 6
     assert sum(event["name"] == "submit_tail_gap" for event in residuals) == 6
     assert sum(event["name"] == "between_submit_residual" for event in residuals) == 3
+
+
+def test_v4_business_and_atomic_overlays_merge_without_changing_exclusive_partition(
+    tmp_path, v4_business_and_atomic_capture
+):
+    data, events = _convert(tmp_path, v4_business_and_atomic_capture)
+
+    claim = next(event for event in events if event.get("name") == "claim.won#0" and event["tid"] == 0)
+    direct = next(event for event in events if event.get("name") == "atomic.return_ready.claim_max.fetch_max#0")
+    poll = next(event for event in events if event.get("name") == "atomic.poll_batch.fanin_flag_load.load×7")
+    assert claim["pid"] == direct["pid"] == poll["pid"] == 0
+    assert claim["tid"] == direct["tid"] == poll["tid"] == 0
+    assert claim["ts"] <= direct["ts"] < direct["ts"] + direct["dur"] <= claim["ts"] + claim["dur"]
+    assert data["fdwic_summary"]["atomic_records"] == 2
+    assert data["fdwic_summary"]["atomic_calls"] == 8
+    assert data["fdwic_summary"]["poll_batch_records"] == 1
+
+    report = analyze_data(data, tmp_path / "l2_swimlane_records.json")
+    baseline_path = tmp_path / "business_only.json"
+    baseline_path.write_text(
+        json.dumps(_capture(_v4_rows(), trace_schema_version=4, num_cores=3, level=4)),
+        encoding="utf-8",
+    )
+    baseline_report = analyze_data(read_perf_data(baseline_path), baseline_path)
+
+    assert report["validation"]["status"] == "PASS"
+    assert report["aggregate_core_work"] == baseline_report["aggregate_core_work"]
+    assert report["residual_breakdown"] == baseline_report["residual_breakdown"]
+    assert report["overlays"]["Atomic"] == {
+        "event_count": 2,
+        "aggregate_duration_cycles": 10,
+        "included_in_additive_totals": False,
+    }
+    assert report["aggregate_core_work"]["closure"]["submit_partition"]["exact"] is True
 
 
 def test_v4_residuals_reuse_the_combined_reader_time_origin(tmp_path):

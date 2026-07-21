@@ -3855,3 +3855,69 @@ A/B 组中位数分别为 4,883.659/5,117.292 us；逐对差值中位数为
 继续扩样。保留本节负结果，避免后续重复进行相同的 BlockWon 冷外提。下一候选仍
 只改一个已由源码证明的 Scalar 冗余，并继续由完整 Submit perf-clock A/B 决定
 保留或撤销。
+
+### 2026-07-21 / O8：补齐观察链离线组合回归
+
+状态：**[观察工具，离线闭合]**
+
+本阶段遵守“暂停上板”的要求，没有启动 A5，也没有修改 device/host 生产代码、
+PMU ABI 或 raw 字段。目标是复核当前三条证据链的现有正式产物，并补上仅靠单模块
+合成 raw 无法覆盖的组合门禁。
+
+#### 正式产物复核
+
+- `outputs/TestPagedAttentionUnroll_Case1_20260721_053003/` 的 schema-v4 泳道为
+  96 核、每核 1,280 个 Submit、945,264 个事件且 `dropped=0`；atomic 物理记录
+  105,963 条、PollBatch 337 条、折叠调用 4,481 次，逻辑调用严格闭合为
+  `105963 - 337 + 4481 = 110107`。当前 analyzer 重算的拓扑、父区间、Kernel
+  containment、排他分区和整数 cycle closure 全部通过。
+- Materialize、Claim、SubmitTransition、ArgBuild、Register 和 EfDrain-control
+  六份正式 phase raw 均通过当前严格 reader：96 个唯一物理核、32 AIC + 64 AIV、
+  每核 1,280 个 Submit、owner 配置/恢复、primary/shadow、selector/status、风险阈值
+  和 phase 时间/次数全部闭合；Transition 为 1,279 次/核，其他普通 phase 为
+  1,280 次/核，EfDrain-control 为 `N+K`，其中 `ΣK=936`、全局 begin/end 均为
+  123,816。
+- 历史目录中只有 Register `..._103131` 和 EfDrain-control `..._115559` 具有
+  provenance sidecar；Materialize `..._092508`、Claim `..._094203`、Transition
+  `..._095712` 和 ArgBuild `..._101249` 只能证明 raw 数据闭合，不能追溯当时实际
+  ELF/编译宏。`..._053003` 泳道同样没有构建 sidecar。该限制如实保留，不使用
+  后来的二进制身份反向填充历史产物。
+
+#### 新增离线门禁
+
+1. `test_fdwic_submit_pmu_report.py` 对 phase 1～7 参数化执行完整
+   raw→build identity→provenance→HTML 发布链，逐项核对 capture mode、phase ID、
+   三个编译宏、raw 不变性、provenance SHA 和 HTML 身份展示。这样可以离线拒绝
+   profile/phase/cache 身份串线，不再只由 none 和 EfDrain 两个特例间接代表其余
+   selector。
+2. `test_fdwic_swimlane_converter.py` 在同一 schema-v4 业务 raw 中加入 ClaimMax
+   `return_ready` direct 与 7 次 Fanin poll-batch。测试确认两类 atomic 与 Claim/
+   Fanin 同处对应 Scalar lane，2 条物理记录加权为 8 次调用；atomic 保持非加和
+   overlay，加入前后的 aggregate core-work、residual breakdown 和 Submit 整数
+   分区完全不变。
+
+离线验证结果：
+
+```text
+tests/ut/py/test_fdwic_submit_pmu_report.py
+tests/ut/py/test_fdwic_swimlane_converter.py
+tests/ut/py/test_scene_test_cache.py
+    288 passed
+
+ruff check
+    All checks passed
+
+git diff --check
+    PASS
+```
+
+#### 下一单变量候选
+
+源码与现有泳道交叉审计后，下一候选收敛为 PrepareMap 的空 task-head 快路，而不再
+继续 ActiveMask 复用或重复增加 `drain_phase_b()` caller gate。Case1 每核 1,280
+个 Submit、`H=64`，会清退 1,215 个历史 task id；五任务序列中只有 UP 的四个
+INOUT 建立 map 链，因而每核可静态得到 243 个非空 head 和 972 个空 head。若只在
+`cur == -1` 时跳过原本再次写入 `-1` 的 GM store，96 核理论上删除 93,312 次
+冗余写，且影响严格落在 PrepareMap（现有 aggregate 24,512,711 ticks、占
+SubmitUnion 6.1493%）。该候选尚未写入生产源码、没有性能结论；恢复上板后仍须先
+做编译/反汇编，再依次通过 B1、perf-clock 交错 A/B 和泳道 PrepareMap 归因。
