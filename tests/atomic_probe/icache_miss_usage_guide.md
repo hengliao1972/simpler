@@ -63,6 +63,19 @@ outputs/TestPagedAttentionUnroll_Case1_20260721_003335/
 同一物理核、同一首末 Submit 窗口的数据；仍不能把 `miss * 90 ns` 当作可直接消除的
 跨核墙钟损失。
 
+真实 PA raw 顶部的“完整 Submit”表示**全部 worker 中最早的首个 Submit 起点到
+最晚的末个 Submit 终点**，是 96 核共同形成的全局 `SYS_CNT` 墙钟范围，不等于
+逐核 PMU gate 的平均值。对单个 worker，源码先读取 `first_submit_start_tick` 再调用
+`metrics_prof_start()`，末次 Submit 则先调用 `metrics_prof_stop()` 再读取
+`last_submit_end_tick`；因此该核的 `SYS_CNT` 首尾区间在两侧包住 PMU gate，并包含
+start/stop 及其 `PIPE_ALL` 边界成本。PMU total 按本机约 1.65 cycles/ns 的长窗
+校准值换算，`SYS_CNT` 为 1 ns/tick；两者的边界、时钟口径和聚合对象均不同，只能
+在同一 ELF 内校验数量级和跨轮方向，不能直接相减来归因观察成本或业务耗时。
+
+现行真实 PA raw summary 包含 `sum/min/mean/max`，生产 HTML 还会从通过 96 核门禁
+的 records 重新校验这些聚合。PMU total 与 scalar busy 各自独立取极值，不保证
+来自同一个物理核。
+
 ### 1.2 真实 PA 首个单阶段 profile：`submit-pmu-arg-build`
 
 真实 PA 已完成首个跟随最新泳道业务边界的单阶段 profile：
