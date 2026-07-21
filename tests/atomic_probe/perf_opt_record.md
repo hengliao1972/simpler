@@ -179,7 +179,8 @@ outputs/TestPagedAttentionUnroll_Case1_20260717_023809/
 | 2026-07-21 | `57aedfee` | 阶段归因 | 排除 ArgBuild 为同 ELF 波动主载体 |
 | 2026-07-21 | `660bbff4` | 阶段归因 | 排除 Register 为同 ELF 波动主载体 |
 | 2026-07-21 | `443a0bb3` | 观察工具 | 完善真实 PA I-cache 逐核时间加工口径 |
-| 2026-07-21 | 本阶段提交 | 观察工具 | 为真实 PA PMU 产物绑定构建 provenance |
+| 2026-07-21 | `15c54b33` | 观察工具 | 为真实 PA PMU 产物绑定构建 provenance |
+| 2026-07-21 | 本阶段提交 | 上板验证 | 闭合完整 Submit 与 Register 分段三件套 |
 
 ### 4.1 真实 PA 第一轮 atomic 与前端优化
 
@@ -3245,7 +3246,7 @@ ArgBuild、Claim、EmptyBracket、Materialize、Register、SubmitTransition 各�
 
 ### 8.16 诊断 raw 与实际构建实物的 provenance 绑定
 
-**[观察工具已完成 host 闭合；不回写 raw，不给 AICore 增加指令]**
+**[观察工具与真实 A5 B1 已闭合；不回写 raw，不给 AICore 增加指令]**
 
 此前正式多轮依赖文档手工冻结 ELF SHA，raw 自身不能证明“这些轮次确实使用同一
 构建”。本阶段没有把身份字段塞进 C++ producer 或 AICore ELF，也没有在 consumer
@@ -3295,6 +3296,29 @@ report/cache 两组共 174 项 PASS，ruff 和 diff 检查通过；另用
 本机现存 Register 实物验证实际 `readelf` 路径，可得到 final/AIC/AIV/host `.text`
 分别为 150,608/68,352/82,256/443,315 B。该工具全部运行在编译完成或 case 返回后，
 不会进入 Submit 性能窗口。
+
+提交 `15c54b33` 后又依次完成两条真实 A5 B1：
+
+1. `submit-pmu-none` 位于
+   `outputs/TestPagedAttentionUnroll_CaseB1_20260721_111118/`。96 核均为 5 次 Submit，
+   primary/shadow request 与 miss 逐核完全相等。raw/provenance/HTML 大小为
+   44,339/3,050/80,808 B，SHA256 分别为
+   `dbdc10c7d9cc00b79d62f96600a8a91c07470dd402677de9758eb3653572ff57`、
+   `ebeef32f7ef26de78dcdc0d8f49d2711863adc71c28ada00341d0d26951ee235`、
+   `9bea11a9b58e7e8af47381808687c8a5afc168e23c37d270389aa9d38282214f`；
+2. `submit-pmu-register` 位于
+   `outputs/TestPagedAttentionUnroll_CaseB1_20260721_111427/`。96 核均闭合 5 次 Submit
+   和 5 对 Register begin/end，primary/shadow 逐核完全相等。三件套大小为
+   69,638/3,103/83,714 B，SHA256 分别为
+   `be122416742c28ab138db04acf23165d9c73fd90851fd7121eb0c8e303ed2d3a`、
+   `d943be4b76c719b3513b5d030b9eaaf8a223badfb46107b74bbcda016c32db14`、
+   `7e5e40695b529671682dc8d493bd234df2a4870bab361a67e18116be49e85896`。
+
+两轮 source-v2 的 Git head 都精确指向 `15c54b33`；完整窗与 Register 的 profiled key
+末项分别为 `submit-pmu-none`、`submit-pmu-register`，AICore extra key 分别为
+`aa43623282e2a7db`、`32c26e06ad76d186`。因此同一进程框架下的 profile/cache 隔离已由
+真实 ELF 和产物旁证，而不是仅由 host mock 证明。两轮 pytest 均为 1 PASS；报告重载
+与重新渲染逐字节一致。
 
 ## 9. 已撤回、失败或不能外推的路线
 
@@ -3650,15 +3674,16 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
     派生 Submit SYS_CNT、PMU total、Scalar busy、逐核非 busy 残余和 PMU/SYS
     长窗有效比的 mean/min/max；角色校准只生成当前 ELF 等效时间。测试专门拒绝
     difference-of-extrema、ratio-of-sums 和零分母，相关 152 项及 ruff 通过。
-18. **[构建 provenance，host 闭合已完成] raw 保持只读**：新增 raw SHA 绑定的
+18. **[构建 provenance，真实 A5 B1 已闭合] raw 保持只读**：新增 raw SHA 绑定的
     独立 sidecar，记录构建时 source-v2、profile/cache/宏，以及实际 final、AIC/AIV
     combined 和 host 的 whole/.text 身份；构建后与 case 后双重实物检查。缺 identity、
-    绑定或文件变化均 fail-closed；成组发布失败会恢复旧产物。相关 174 项通过，尚待
-    A5 B1 三件套最终回归。
+    绑定或文件变化均 fail-closed；成组发布失败会恢复旧产物。相关 174 项通过；
+    `submit-pmu-none` 与 `submit-pmu-register` 各一轮真实 A5 B1 三件套均闭合，且使用
+    不同 profiled/extra cache key。
 
 下一步不再扩充 N、K 或已经完成归因的既有 selector，也不跨 ELF 扣减。先补齐独立
-构建 provenance 的 A5 B1 回归；随后
-只允许设计固定容量的 EfDrain-control/依赖就绪检查聚合，不能恢复逐 Submit/逐等待
+构建 provenance 的工作已完成；随后只允许设计固定容量的
+EfDrain-control/依赖就绪检查聚合，不能恢复逐 Submit/逐等待
 的大 raw。局部 I-cache 是否排除真实 linked-kernel，必须先通过接口与观测语义核验
 再决定。原因层级闭合后，再由 perf-clock 交错 A/B 决定真实 Scalar 候选保留或撤销。
 单阶段 observed 不机械扣除 empty，也不从单轮 I-cache 数直接提出生产优化；

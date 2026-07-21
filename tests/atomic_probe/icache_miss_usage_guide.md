@@ -140,6 +140,22 @@ GM 或 raw ABI。历史无 sidecar 的 raw 仍可离线生成基础 HTML，但�
 新正式采集若缺少 provenance，应视为产物不完整，不能再靠采集时的当前 HEAD 或文档
 手工猜测 ELF 身份。
 
+真实 A5 B1 已验证完整窗和分段窗两种 profile：
+
+- `submit-pmu-none`：
+  `outputs/TestPagedAttentionUnroll_CaseB1_20260721_111118/`，96 核均为 5 次 Submit，
+  primary/shadow request 与 miss 逐核完全相等；raw/provenance/HTML 分别为
+  44,339/3,050/80,808 B；
+- `submit-pmu-register`：
+  `outputs/TestPagedAttentionUnroll_CaseB1_20260721_111427/`，96 核均为 5 次 Submit、
+  5 对 Register begin/end，primary/shadow 同样逐核相等；三件套分别为
+  69,638/3,103/83,714 B。
+
+两轮 provenance 都绑定构建提交 `15c54b33`，但 profiled cache key 和 AICore extra
+cache key 分别落到 `submit-pmu-none`/`aa43623282e2a7db` 与
+`submit-pmu-register`/`32c26e06ad76d186`，据此确认完整窗与分段窗没有复用错误 ELF。
+报告可被 loader 重新严格解析，并与重新渲染的 HTML 逐字节一致。
+
 ### 1.2 真实 PA 首个单阶段 profile：`submit-pmu-arg-build`
 
 真实 PA 已完成首个跟随最新泳道业务边界的单阶段 profile：
