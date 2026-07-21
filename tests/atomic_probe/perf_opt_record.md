@@ -173,7 +173,8 @@ outputs/TestPagedAttentionUnroll_Case1_20260717_023809/
 | 2026-07-21 | `a17c188a` | 观察工具 | 建立真实 PA Submit 窗内 Kernel 低容量聚合 |
 | 2026-07-21 | `05397cd7` | 波动分析 | 收口 K 构建的 Kernel/residual 波动载体 |
 | 2026-07-21 | `6acebc8f` | 环境取证 | 记录设备状态、低功耗接口及并发边界 |
-| 2026-07-21 | 本阶段提交 | 阶段归因 | 排除 Materialize 为同 ELF 波动主载体 |
+| 2026-07-21 | `52dc04c7` | 阶段归因 | 排除 Materialize 为同 ELF 波动主载体 |
+| 2026-07-21 | 本阶段提交 | 阶段归因 | 排除 Claim 为同 ELF 波动主载体 |
 
 ### 4.1 真实 PA 第一轮 atomic 与前端优化
 
@@ -2748,6 +2749,120 @@ Materialize 携带，而由该核其余 Submit 路径携带。** Materialize 每
 成 P 的根因或可兑现收益。下一阶段按既定顺序切换到现有 `submit-pmu-claim`，优先
 检查包含 return-ready atomic 的 Claim 是否携带同 ELF 波动；仍不修改业务代码。
 
+### 8.11 同一 Claim ELF 的阶段与其余 Submit 波动分解
+
+**[阶段归因已完成；Claim 不通过主载体门禁，角色差异不能冒充跨轮波动]**
+
+#### 8.11.1 B1、冻结对象与正式样本
+
+本阶段复用第 8.3.5 节的 `submit-pmu-claim`，边界为
+`claim_begin_to_claim_end`。它包含 task-cap 检查、实际 Claim 和 flags 构造；真实
+FetchMax 返回等待位于该业务区间内，但诊断 ELF 编译掉 atomic 泳道观察代码。每个
+Submit 固定进入一次外层 Claim，所以 Case1 shape 仍为每核 1,280 对 begin/end，
+不增加 winner 或 atomic 动态字段。
+
+文档提交改变 source-v2 HEAD 后，先在新构建上运行 B1：
+
+```text
+outputs/TestPagedAttentionUnroll_CaseB1_20260721_093141/
+```
+
+结果为 96 核各 5 次 Submit/Claim、phase id `4`、status `0x3f`、primary/shadow
+96/96 精确相等，HTML 与当前 renderer 字节一致；全局 243.386 us 仍只作结构证据。
+随后冻结：
+
+| 对象 | 固定值 |
+| --- | --- |
+| commit | `52dc04c792cd5f6982fe7a6d1272dcc4f43231bc` |
+| AICore cache | `88d4ef05843d4904` |
+| AICore 定义 | `PTO_FDWIC_SUBMIT_PMU=1;PTO_FDWIC_SUBMIT_PMU_PHASE_ID=4;PTO_FDWIC_TRACE_ENABLED=0` |
+| `aicore_kernel.o` | 2,590,880 B / `.text` 154,192 B / SHA256 `05f0c6e8edff1319770f9117ea17efb8c81a8822d6cbdaa199ebd339fb039703` |
+| AIC/AIV combined | `fd0fa24ac1b117d4705f6405dc60497992efef17f71f268d46326e5fc2a1ac29` / `6a7bdf0221e15d750e9b531e3083caf728ad0527779e642bef41ef7f388e68f7` |
+| `libhost_runtime.so` | SHA256 `5f2e9af0892f64f28aded87e013a5b32425d86940b2e08cd34dad49cab0c0f9d` |
+
+Case1 预热件 `..._093327` 明确排除。12 个独立正式进程仍固定
+`--rounds 1 --skip-golden`，没有 sleep、极值删除或其他 profile 穿插：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260721_093412/
+outputs/TestPagedAttentionUnroll_Case1_20260721_093454/
+outputs/TestPagedAttentionUnroll_Case1_20260721_093536/
+outputs/TestPagedAttentionUnroll_Case1_20260721_093620/
+outputs/TestPagedAttentionUnroll_Case1_20260721_093703/
+outputs/TestPagedAttentionUnroll_Case1_20260721_093746/
+outputs/TestPagedAttentionUnroll_Case1_20260721_093829/
+outputs/TestPagedAttentionUnroll_Case1_20260721_093912/
+outputs/TestPagedAttentionUnroll_Case1_20260721_093954/
+outputs/TestPagedAttentionUnroll_Case1_20260721_094037/
+outputs/TestPagedAttentionUnroll_Case1_20260721_094121/
+outputs/TestPagedAttentionUnroll_Case1_20260721_094203/
+```
+
+12/12 pytest、生产 `load_capture()` 与 HTML 精确重建全部 PASS；1,152 条逐核记录均
+为 96×1280、phase id `4`、phase status `0x3f`、primary=shadow，owner、拓扑、
+计数顺序、phase 时间和风险阈值闭合。采样前后上述 AIC/AIV/host SHA 不变，已知
+root A5 评测也未重新出现。
+
+#### 8.11.2 原始分解与角色差异
+
+继续定义 `Pz=Claim[z]`、`Rz=body[z]-Pz`，逐轮精确满足
+`G=A+Pz+Rz=A+M+X`。下表单位均为 us：
+
+| 轮次 | 时间戳 | G | M | X | A | Pz | Rz | 最晚核 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | `093412` | 4620.233 | 4556.721 | 59.596 | 3.915 | 1024.912 | 3591.406 | c79/AIV/b23/l2 |
+| 2 | `093454` | 4719.079 | 4524.864 | 181.847 | 12.368 | 415.432 | 4291.279 | c2/AIC/b2/l0 |
+| 3 | `093536` | 4676.573 | 4535.911 | 140.432 | 0.230 | 370.210 | 4306.133 | c28/AIC/b28/l0 |
+| 4 | `093620` | 4605.915 | 4542.673 | 62.686 | 0.556 | 1011.722 | 3593.637 | c66/AIV/b17/l1 |
+| 5 | `093703` | 5015.477 | 4536.442 | 477.636 | 1.399 | 384.459 | 4629.619 | c24/AIC/b24/l0 |
+| 6 | `093746` | 4952.543 | 4697.900 | 249.944 | 4.699 | 979.619 | 3968.225 | c39/AIV/b3/l2 |
+| 7 | `093829` | 4657.082 | 4534.479 | 122.496 | 0.107 | 397.740 | 4259.235 | c22/AIC/b22/l0 |
+| 8 | `093912` | 4676.111 | 4554.137 | 111.189 | 10.785 | 386.509 | 4278.817 | c26/AIC/b26/l0 |
+| 9 | `093954` | 4726.002 | 4533.742 | 188.481 | 3.780 | 386.908 | 4335.314 | c24/AIC/b24/l0 |
+| 10 | `094037` | 5238.567 | 4702.629 | 535.607 | 0.331 | 401.741 | 4836.495 | c23/AIC/b23/l0 |
+| 11 | `094121` | 4725.767 | 4554.668 | 161.607 | 9.492 | 394.837 | 4321.438 | c0/AIC/b0/l0 |
+| 12 | `094203` | 4633.868 | 4546.530 | 87.018 | 0.320 | 382.272 | 4251.276 | c31/AIC/b31/l0 |
+
+最晚核分散到 11 个 core，AIC/AIV 为 9/3。`Pz` 的 370～1,025 us 大范围主要来自
+最晚核角色切换：三轮 AIV 均约 980～1,025 us，九轮 AIC 均约 370～415 us。这是
+同一 Claim ELF 内真实存在的角色成本差异，但它不随 G 单调变化；不能因数值范围大
+就称 Claim 携带跨轮波动。完整分布为：
+
+| 指标 | 最小值 | 中位数 | 最大值 | MAD | P10 | P90 | P90-P10 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| G | 4605.915 | 4697.826 | 5238.567 | 52.351 | 4621.596 | 5009.184 | 387.587 |
+| M | 4524.864 | 4544.601 | 4702.629 | 10.095 | 4533.815 | 4683.782 | 149.967 |
+| X | 59.596 | 151.019 | 535.607 | 51.916 | 65.119 | 454.867 | 389.748 |
+| A | 0.107 | 2.590 | 12.368 | 2.264 | 0.239 | 10.656 | 10.417 |
+| Pz | 370.210 | 396.288 | 1024.912 | 12.923 | 382.491 | 1008.512 | 626.021 |
+| Rz | 3591.406 | 4285.048 | 4836.495 | 43.328 | 3631.096 | 4600.189 | 969.093 |
+| Claim mean/core | 778.854 | 830.892 | 856.279 | 7.354 | 813.978 | 842.240 | 28.262 |
+| 其余 Submit mean/core | 3627.936 | 3676.057 | 3924.426 | 23.765 | 3642.722 | 3902.263 | 259.541 |
+
+#### 8.11.3 主载体门禁与阶段决定
+
+| 分量 | Spearman(G, ·) | P90-P10 | 占 G 波幅 | 判定 |
+| --- | ---: | ---: | ---: | --- |
+| M | +0.154 | 149.967 us | 38.69% | FAIL |
+| X | +0.979 | 389.748 us | 100.56% | PASS：仍为慢尾形态 |
+| A | +0.175 | 10.417 us | 2.69% | FAIL |
+| Pz | -0.189 | 626.021 us | 161.52% | **FAIL：幅度大但方向不相关** |
+| Rz | +0.790 | 969.093 us | 250.03% | **PASS：同核其余 Submit 携带变化** |
+| Claim mean/core | -0.476 | 28.262 us | 7.29% | FAIL |
+| 其余 Submit mean/core | +0.448 | 259.541 us | 66.96% | FAIL：幅度够、相关性不足 |
+
+`Pz/Rz` 因 AIC/AIV 角色成本相反补偿，单个分量波幅可以大于 G；二者仍只按每轮同核
+整数关系闭合，不能把 161.52% 与 250.03% 相加。主门禁要求相关性和幅度同时成立，
+因此 Claim 明确失败，不能把 ClaimMax/return-ready atomic 当作本组慢轮原因。
+
+Claim 在同 ELF 中的 core-time 份额中位为 18.40%，每次 request 中位 80.171、范围
+80.097～80.236，每次 miss 中位 1.950、范围 1.948～1.951；这些稳定值说明 Claim
+仍是绝对成本区域，但没有提供“慢轮执行了更多 Claim 取指或 miss”的证据。本组 G
+有 387.587 us 的可分辨波形，Pz 相关性又远离阈值，所以不扩到 20 轮。其 M 仍未
+复现权威 P 的共同伸缩，结论继续严格限定在 Claim ELF。下一阶段切换到已经存在的
+`submit-pmu-submit-transition`，检查相邻 Submit 之间的动态控制/回放间隙；不修改
+Claim 或 atomic 业务逻辑。
+
 ## 9. 已撤回、失败或不能外推的路线
 
 ### 9.1 已撤回的优化候选
@@ -3077,12 +3192,17 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
     的 9.44%，不通过；同核其余 Submit `Rz` 的 `rho=+0.986`、波幅 100.47%，通过。
     Materialize mean/core 的 P90-P10 仅 0.994 us。本组由 X 慢尾而不是 M 共同伸缩
     通过门禁，因此只排除 Materialize 为该 ELF 的波动主载体，不外推 P 根因。
+13. **[Claim 波动归因，已完成] 同一诊断 ELF 的 12 轮独立 Case1**：12/12 闭合；
+    最晚核 Claim 因 AIC/AIV 角色切换形成 370～1,025 us 的大范围，但与 G 的
+    `rho=-0.189`，相关性失败；同核其余 Submit 的 `rho=+0.790` 并通过。Claim
+    mean/core 波幅只占 G 的 7.29%，request/miss 也稳定。本组仍由 X 慢尾通过，
+    因此不把 ClaimMax/return-ready atomic 包装成权威 P 的波动根因。
 
-下一步不再扩充 N、K 或 Materialize，也不跨 ELF 扣减。直接复用现有
-`submit-pmu-claim` 做同样的一次预热加 12 个独立 Case1，优先判断包含 return-ready
-atomic 的 Claim 是否携带同 ELF 波动；随后才按 `SubmitTransition -> ArgBuild ->
-Register` 继续。只有既有 selector 全部不能覆盖动态部分时，才设计固定容量的
-EfDrain-control/poll 聚合观察，不能恢复逐 Submit/逐等待的大 raw。原因层级闭合后，
-再由原 perf-clock 交错 A/B 决定真实 Scalar 候选保留或撤销。
+下一步不再扩充 N、K、Materialize 或 Claim，也不跨 ELF 扣减。直接复用现有
+`submit-pmu-submit-transition` 做同样的 B1、预热和 12 个独立 Case1，检查相邻
+Submit 之间的动态控制/回放间隙；随后才按 `ArgBuild -> Register` 继续。只有既有
+selector 全部不能覆盖动态部分时，才设计固定容量的 EfDrain-control/poll 聚合观察，
+不能恢复逐 Submit/逐等待的大 raw。原因层级闭合后，再由原 perf-clock 交错 A/B
+决定真实 Scalar 候选保留或撤销。
 单阶段 observed 不机械扣除 empty，也不从单轮 I-cache 数直接提出生产优化；
 standalone 的绝对数继续不替代真实 PA 当前结果。
