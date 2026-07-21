@@ -33,7 +33,7 @@ struct Options {
     uint32_t batches = kDefaultBatches;
     uint32_t runs = 5;
     NopCounts nops{kDefaultQkNops, kDefaultSfNops, kDefaultPvNops, kDefaultUpNops};
-    FinalBarrierShape final_barrier_shape = FinalBarrierShape::Flat;
+    FinalBarrierShape final_barrier_shape = FinalBarrierShape::TwoLevel16;
     bool profile_phases = false;
     bool trace_enabled = true;
     bool trace_atomics = false;
@@ -124,7 +124,7 @@ inline void PrintUsage(const char *program, bool require_kernel) {
         stderr,
         "[--nop-count N | --nop-counts QK,SF,PV,UP] [--profile-phases] [--analyze-swimlane] "
         "[--trace-atomics] [--swimlane-json FILE] [--no-swimlane] "
-        "[--final-barrier flat|two-4|two-8|two-16|three-6x4x4]\n"
+        "[--final-barrier flat|two-4|two-8|two-16|three-6x4x4] (default: two-16)\n"
     );
 }
 
