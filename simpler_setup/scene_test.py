@@ -25,6 +25,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import inspect
+import json
 import logging
 import os
 import subprocess
@@ -44,6 +45,7 @@ _aicore_override_cache: dict[tuple[Any, ...], Path] = {}
 _FDWIC_PROFILE_ENV = "PTO_FDWIC_PROFILE"
 _FDWIC_PROFILE_NONE = "none"
 _FDWIC_PROFILE_PERF_CLOCK = "perf-clock"
+_FDWIC_PROFILE_PERF_CLOCK_KERNEL = "perf-clock-kernel"
 _FDWIC_PROFILE_SUBMIT_PMU_NONE = "submit-pmu-none"
 _FDWIC_PROFILE_SUBMIT_PMU_ARG_BUILD = "submit-pmu-arg-build"
 _FDWIC_PROFILE_SUBMIT_PMU_EMPTY_BRACKET = "submit-pmu-empty-bracket"
@@ -51,6 +53,13 @@ _FDWIC_PROFILE_SUBMIT_PMU_MATERIALIZE = "submit-pmu-materialize"
 _FDWIC_PROFILE_SUBMIT_PMU_CLAIM = "submit-pmu-claim"
 _FDWIC_PROFILE_SUBMIT_PMU_REGISTER = "submit-pmu-register"
 _FDWIC_PROFILE_SUBMIT_PMU_SUBMIT_TRANSITION = "submit-pmu-submit-transition"
+_FDWIC_PERF_CLOCK_ARTIFACTS = {
+    _FDWIC_PROFILE_PERF_CLOCK: ("fdwic_perf_clock_summary.json", "fdwic-perf-clock-v1"),
+    _FDWIC_PROFILE_PERF_CLOCK_KERNEL: (
+        "fdwic_perf_clock_kernel_summary.json",
+        "fdwic-perf-clock-kernel-v1",
+    ),
+}
 _FDWIC_SUBMIT_PMU_PHASE_PROFILES = frozenset(
     {
         _FDWIC_PROFILE_SUBMIT_PMU_ARG_BUILD,
@@ -62,7 +71,8 @@ _FDWIC_SUBMIT_PMU_PHASE_PROFILES = frozenset(
     }
 )
 _FDWIC_SUBMIT_PMU_PROFILES = frozenset({_FDWIC_PROFILE_SUBMIT_PMU_NONE, *_FDWIC_SUBMIT_PMU_PHASE_PROFILES})
-_FDWIC_PRIVATE_PROFILES = frozenset({_FDWIC_PROFILE_PERF_CLOCK, *_FDWIC_SUBMIT_PMU_PROFILES})
+_FDWIC_PERF_CLOCK_PROFILES = frozenset(_FDWIC_PERF_CLOCK_ARTIFACTS)
+_FDWIC_PRIVATE_PROFILES = frozenset({*_FDWIC_PERF_CLOCK_PROFILES, *_FDWIC_SUBMIT_PMU_PROFILES})
 _FDWIC_PROFILES = frozenset({_FDWIC_PROFILE_NONE, *_FDWIC_PRIVATE_PROFILES})
 
 
@@ -77,6 +87,12 @@ def _fdwic_compile_definitions(profile: str) -> list[str] | None:
     """Return the ABI-preserving compile gates for one private FDWIC image."""
     if profile == _FDWIC_PROFILE_PERF_CLOCK:
         return ["PTO_FDWIC_PERF_CLOCK=1", "PTO_FDWIC_TRACE_ENABLED=0"]
+    if profile == _FDWIC_PROFILE_PERF_CLOCK_KERNEL:
+        return [
+            "PTO_FDWIC_PERF_CLOCK=1",
+            "PTO_FDWIC_PERF_CLOCK_KERNEL=1",
+            "PTO_FDWIC_TRACE_ENABLED=0",
+        ]
     if profile == _FDWIC_PROFILE_SUBMIT_PMU_NONE:
         return ["PTO_FDWIC_SUBMIT_PMU=1", "PTO_FDWIC_TRACE_ENABLED=0"]
     if profile == _FDWIC_PROFILE_SUBMIT_PMU_ARG_BUILD:
@@ -225,12 +241,16 @@ def _fdwic_elf_symbol_rows(binary: Path) -> list[tuple[str, str, str]]:
     return symbol_rows
 
 
-def _assert_fdwic_perf_clock_elf(binary: Path) -> None:
+def _assert_fdwic_perf_clock_elf(binary: Path, profile: str = _FDWIC_PROFILE_PERF_CLOCK) -> None:
     """Prove the final CCEC image excludes FDWIC trace/atomic and platform PMU code."""
+    if profile not in _FDWIC_PERF_CLOCK_PROFILES:
+        raise ValueError(f"Unsupported perf-clock ELF profile {profile!r}")
     symbol_rows = _fdwic_elf_symbol_rows(binary)
 
-    required = ("dist_perf_clock_expect_submits",)
-    forbidden = (
+    required = ["dist_perf_clock_expect_submits"]
+    if profile == _FDWIC_PROFILE_PERF_CLOCK_KERNEL:
+        required.append("dist_perf_clock_kernel_profile_marker")
+    forbidden = [
         "fdwic_atomic_poll_boundary_slow",
         "fdwic_swimlane_detail_record_atomic",
         "g_fdwic_swimlane_",
@@ -249,7 +269,9 @@ def _assert_fdwic_perf_clock_elf(binary: Path) -> None:
         "set_fdwic_submit_pmu_reg_base",
         "get_fdwic_submit_pmu_reg_base",
         "g_fdwic_submit_pmu_",
-    )
+    ]
+    if profile == _FDWIC_PROFILE_PERF_CLOCK:
+        forbidden.extend(("dist_perf_clock_kernel_profile_marker", "g_fdwic_perf_clock_kernel_"))
     missing = [
         symbol
         for symbol in required
@@ -371,8 +393,8 @@ def maybe_build_aicore_override(
         pto_isa_root=pto_isa_root,
         compile_definitions=compile_definitions,
     )
-    if profile == _FDWIC_PROFILE_PERF_CLOCK:
-        _assert_fdwic_perf_clock_elf(binary)
+    if profile in _FDWIC_PERF_CLOCK_PROFILES:
+        _assert_fdwic_perf_clock_elf(binary, profile)
     elif profile in _FDWIC_SUBMIT_PMU_PROFILES:
         _assert_fdwic_submit_pmu_elf(binary, profile)
     elif platform == "a5" and runtime == "fully_distributed_within_core":
@@ -1249,6 +1271,175 @@ def _render_case_fdwic_submit_pmu(case_label: str, output_prefix: Path) -> Path:
     return report
 
 
+def _validate_case_fdwic_perf_clock(  # noqa: PLR0912 -- fail-closed artifact contract is intentionally explicit
+    case_label: str, output_prefix: Path, profile: str
+) -> Path:
+    """Validate the exact artifact contract of one successful perf-clock case."""
+    try:
+        output_name, schema = _FDWIC_PERF_CLOCK_ARTIFACTS[profile]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported perf-clock artifact profile {profile!r}") from exc
+
+    artifact = output_prefix / output_name
+    if not artifact.is_file() or artifact.stat().st_size == 0:
+        raise RuntimeError(f"[{case_label}] {profile} did not publish a non-empty {artifact}")
+    try:
+        payload = json.loads(artifact.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"[{case_label}] {artifact} is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"[{case_label}] {artifact} root must be a JSON object")
+
+    expected_scalars = {
+        "schema": schema,
+        "mode": profile,
+        "num_cores": 96,
+        "aic_cores": 32,
+        "aiv_cores": 64,
+    }
+    mismatches = [
+        f"{name}={payload.get(name)!r}, expected {expected!r}"
+        for name, expected in expected_scalars.items()
+        if payload.get(name) != expected
+    ]
+    if mismatches:
+        raise RuntimeError(f"[{case_label}] invalid {profile} artifact contract: {'; '.join(mismatches)}")
+
+    expected_submits = payload.get("expected_submits_per_core")
+    cores = payload.get("cores")
+    if type(expected_submits) is not int or expected_submits <= 0:
+        raise RuntimeError(f"[{case_label}] {profile} expected_submits_per_core must be a positive integer")
+    if not isinstance(cores, list) or len(cores) != 96 or not all(isinstance(core, dict) for core in cores):
+        raise RuntimeError(f"[{case_label}] {profile} cores must contain exactly 96 objects")
+
+    core_ids = [core.get("core_id") for core in cores]
+    core_types = [core.get("core_type") for core in cores]
+    if set(core_ids) != set(range(96)) or len(core_ids) != len(set(core_ids)):
+        raise RuntimeError(f"[{case_label}] {profile} core_id topology is not exactly 0..95")
+    if core_types.count("aic") != 32 or core_types.count("aiv") != 64:
+        raise RuntimeError(f"[{case_label}] {profile} core_type topology is not 32 AIC + 64 AIV")
+
+    for core in cores:
+        if core.get("submit_count") != expected_submits:
+            raise RuntimeError(
+                f"[{case_label}] {profile} core {core.get('core_id')} submit_count does not match "
+                "expected_submits_per_core"
+            )
+        start = core.get("first_submit_start")
+        end = core.get("last_submit_end")
+        elapsed = core.get("elapsed_ticks")
+        ordered_window = (
+            type(start) is int
+            and type(end) is int
+            and type(elapsed) is int
+            and start > 0
+            and end - start == elapsed
+            and (end > start if profile == _FDWIC_PROFILE_PERF_CLOCK_KERNEL else end >= start)
+        )
+        if not ordered_window:
+            raise RuntimeError(f"[{case_label}] {profile} core {core.get('core_id')} elapsed tick closure failed")
+
+    global_start = min(core["first_submit_start"] for core in cores)
+    global_end = max(core["last_submit_end"] for core in cores)
+    if (
+        payload.get("global_first_submit_start") != global_start
+        or payload.get("global_last_submit_end") != global_end
+        or payload.get("global_submit_span_ticks") != global_end - global_start
+    ):
+        raise RuntimeError(f"[{case_label}] {profile} global Submit tick closure failed")
+
+    kernel_ticks: list[int] = []
+    kernel_calls: list[int] = []
+    residual_ticks: list[int] = []
+    if profile == _FDWIC_PROFILE_PERF_CLOCK_KERNEL:
+        kernel_ticks = [core.get("kernel_elapsed_ticks") for core in cores]
+        kernel_calls = [core.get("kernel_calls") for core in cores]
+        residual_ticks = [core.get("non_kernel_residual_ticks") for core in cores]
+        if not all(type(value) is int and value >= 0 for value in (*kernel_ticks, *kernel_calls, *residual_ticks)):
+            raise RuntimeError(f"[{case_label}] {profile} per-core Kernel aggregates must be non-negative integers")
+
+    groups = payload.get("groups")
+    if not isinstance(groups, dict):
+        raise RuntimeError(f"[{case_label}] {profile} groups must be a JSON object")
+    for core_type in ("aic", "aiv"):
+        group = groups.get(core_type)
+        typed_cores = [core for core in cores if core["core_type"] == core_type]
+        elapsed_values = [core["elapsed_ticks"] for core in typed_cores]
+        if not isinstance(group, dict):
+            raise RuntimeError(f"[{case_label}] {profile} groups.{core_type} must be a JSON object")
+        expected_group = (
+            {
+                "min_ticks": min(elapsed_values),
+                "max_ticks": max(elapsed_values),
+            }
+            if profile == _FDWIC_PROFILE_PERF_CLOCK
+            else {
+                "cores": len(typed_cores),
+                "elapsed_min_ticks": min(elapsed_values),
+                "elapsed_max_ticks": max(elapsed_values),
+                "elapsed_sum_ticks": sum(elapsed_values),
+                "kernel_min_ticks": min(core["kernel_elapsed_ticks"] for core in typed_cores),
+                "kernel_max_ticks": max(core["kernel_elapsed_ticks"] for core in typed_cores),
+                "kernel_sum_ticks": sum(core["kernel_elapsed_ticks"] for core in typed_cores),
+                "kernel_calls_min": min(core["kernel_calls"] for core in typed_cores),
+                "kernel_calls_max": max(core["kernel_calls"] for core in typed_cores),
+                "kernel_calls_sum": sum(core["kernel_calls"] for core in typed_cores),
+                "residual_min_ticks": min(core["non_kernel_residual_ticks"] for core in typed_cores),
+                "residual_max_ticks": max(core["non_kernel_residual_ticks"] for core in typed_cores),
+                "residual_sum_ticks": sum(core["non_kernel_residual_ticks"] for core in typed_cores),
+            }
+        )
+        group_mismatches = [
+            f"{name}={group.get(name)!r}, recomputed {expected}"
+            for name, expected in expected_group.items()
+            if type(group.get(name)) is not int or group.get(name) != expected
+        ]
+        if group_mismatches:
+            raise RuntimeError(
+                f"[{case_label}] invalid {profile} groups.{core_type} integer aggregates: {'; '.join(group_mismatches)}"
+            )
+
+    if profile == _FDWIC_PROFILE_PERF_CLOCK_KERNEL:
+        if any(
+            kernel + residual != core["elapsed_ticks"]
+            for core, kernel, residual in zip(cores, kernel_ticks, residual_ticks, strict=True)
+        ):
+            raise RuntimeError(f"[{case_label}] {profile} per-core Kernel/residual tick closure failed")
+        if any((calls == 0) != (ticks == 0) for calls, ticks in zip(kernel_calls, kernel_ticks, strict=True)):
+            raise RuntimeError(f"[{case_label}] {profile} per-core Kernel call/tick presence closure failed")
+        exact_aggregates = {
+            "kernel_calls": sum(kernel_calls),
+            "kernel_elapsed_ticks_sum": sum(kernel_ticks),
+            "non_kernel_residual_ticks_sum": sum(residual_ticks),
+        }
+        aggregate_mismatches = [
+            f"{name}={payload.get(name)!r}, recomputed {expected}"
+            for name, expected in exact_aggregates.items()
+            if payload.get(name) != expected
+        ]
+        if aggregate_mismatches:
+            raise RuntimeError(
+                f"[{case_label}] invalid {profile} integer aggregates: {'; '.join(aggregate_mismatches)}"
+            )
+        min_calls = payload.get("min_kernel_calls_in_window")
+        max_calls = payload.get("max_kernel_calls_in_window")
+        batches, remainder = divmod(expected_submits, 5)
+        aic_calls = sum(core["kernel_calls"] for core in cores if core["core_type"] == "aic")
+        aiv_calls = sum(core["kernel_calls"] for core in cores if core["core_type"] == "aiv")
+        if (
+            remainder != 0
+            or type(min_calls) is not int
+            or type(max_calls) is not int
+            or min_calls != batches
+            or max_calls != 4 * batches
+            or not batches <= aic_calls <= 2 * batches
+            or not 0 <= aiv_calls <= 2 * batches
+            or not batches <= exact_aggregates["kernel_calls"] <= 4 * batches
+        ):
+            raise RuntimeError(f"[{case_label}] {profile} global Kernel call range closure failed")
+    return artifact
+
+
 def _format_case_context(cls_name: str, case: dict, worker) -> str:
     platform = worker._config.get("platform", "<unknown>")
     config = case.get("config", {})
@@ -1357,6 +1548,8 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 _plot_case_scope_stats(case_label, prefix)
             if case_succeeded and fdwic_profile in _FDWIC_SUBMIT_PMU_PROFILES:
                 _render_case_fdwic_submit_pmu(case_label, prefix)
+            if case_succeeded and fdwic_profile in _FDWIC_PERF_CLOCK_PROFILES:
+                _validate_case_fdwic_perf_clock(case_label, prefix, fdwic_profile)
             if dlt_baseline is not None:
                 _print_device_log_timing(dlt_device_id, dlt_baseline, dlt_offsets, rounds)
 

@@ -167,7 +167,10 @@ outputs/TestPagedAttentionUnroll_Case1_20260717_023809/
 | 2026-07-21 | `d96f5a5a` | 观察工具 | 建立真实 PA `claim` 单阶段 PMU |
 | 2026-07-21 | `2929b21e` | 观察工具 | 建立真实 PA `register` 单阶段 PMU |
 | 2026-07-21 | `d1572c33` | 观察工具 | 建立真实 PA `submit-transition` 单阶段 PMU |
-| 2026-07-21 | 本阶段提交 | 观察校准 | 交错量化三类真实 PA 观察构建的整体影响 |
+| 2026-07-21 | `53088c48` | 观察校准 | 交错量化三类真实 PA 观察构建的整体影响 |
+| 2026-07-21 | `40bd6602` | 波动分析 | 收口独占设备上的 P 构建波动来源 |
+| 2026-07-21 | `a58ee868` | PMU 分析 | 收口 N 构建的 Scalar/I-cache 波动载体 |
+| 2026-07-21 | 本阶段提交 | 观察工具 | 建立真实 PA Submit 窗内 Kernel 低容量聚合 |
 
 ### 4.1 真实 PA 第一轮 atomic 与前端优化
 
@@ -2174,6 +2177,180 @@ Vector/Cube Kernel（包含内部 PIPE wait）的墙钟，还是其余 Scalar sc
 若 Kernel 聚合稳定而其余部分继续拉长，再进入最新真实业务 span 的 Scalar 候选分析。
 该变体必须独立命名和闭合，不能冒充原 P，也不能与 P 绝对时间相减。
 
+### 8.7 真实 PA 的低容量 `perf-clock-kernel` 聚合变体
+
+**[工具实现与 B1/Case1 结构闭合已完成；波动分布采样待下一阶段冻结提交后进行]**
+
+#### 8.7.1 为什么必须是独立变体
+
+权威 P 只在每核首个 Submit 起点和末个 Submit 终点各读取一次 `SYS_CNT`。第 8.5、
+8.6 节已经证明，不能靠跨 ELF 时间差把泳道或 PMU 中看到的现象硬扣回 P；但 P 自身
+又没有字段可以区分真实 Kernel 与其余调度路径。为此新增独立 profile：
+
+```text
+--fdwic-profile perf-clock-kernel
+PTO_FDWIC_PERF_CLOCK=1
+PTO_FDWIC_PERF_CLOCK_KERNEL=1
+PTO_FDWIC_TRACE_ENABLED=0
+```
+
+本文简称它为 K。K 使用独立 cache key、最终 ELF marker、文件名和 schema，不能覆盖
+或冒充 P：
+
+```text
+fdwic_perf_clock_kernel_summary.json
+schema = fdwic-perf-clock-kernel-v1
+mode   = perf-clock-kernel
+```
+
+P 继续输出原来的 `fdwic_perf_clock_summary.json` / `fdwic-perf-clock-v1`。后续首先比较
+P、K 各自同 ELF 内的波动形态；只有 K 能复现 P 的 A/M/X 结构，才允许在 K 内部用
+Kernel 与剩余调度区间做二分，绝不以 K-P 绝对时间差声称观察成本或业务收益。
+
+#### 8.7.2 Kernel 边界与固定 64 B 布局
+
+K 沿现有泳道的真实 Kernel 边界，在 `execute_slot()` 中紧贴
+`dist_aicore_call_slot_kernel(s)` 前后各读取一次 `SYS_CNT`。该区间不包含函数返回后的
+`store_barrier()`、完成标志发布、frontier 推进和 Commit。它包含 linked kernel
+函数内部真实执行及其显式 `wait_flag` / pipe 同步，但不能命名为“纯 Vector/Cube
+指令时间”，也不能证明函数返回后不存在仍在途的异步写回。
+
+计时还受逐核 perf-clock 窗口约束：只有 `first_submit_start != 0` 且
+`last_submit_end == 0` 时才累计。因此，本核末个 Submit 返回后的 FinalDrain Kernel
+被有意排除。这样每核才能保持精确整数关系：
+
+```text
+elapsed_ticks
+= kernel_elapsed_ticks
+ + non_kernel_residual_ticks
+```
+
+这里的 `non_kernel_residual` 只是上述同核窗口的算术剩余，包含调度、同步及观察边界
+等尚未细分的时间，不能直接重命名为 Scalar 或空闲。
+
+没有新增 sidecar，也没有逐 Kernel record。`FdwicSwimlaneCoreState` 继续保持每核独占
+64 B，整个固定 header 仍为 6,976 B：
+
+- 原 tail 的 32 B 增加 K 专属 union 视图，保存首末 Submit、实际/期望 Submit 数和
+  64-bit Kernel 累计 tick；
+- trace 关闭后原前 20 B 中的 `count` 保存 Kernel 调用数，`dropped` 保存聚合错误状态，
+  `poll_batch_records` 保存 K mode=2，另外两个字段必须为 0；
+- tick 逆序、64-bit 累加溢出或 32-bit 调用数溢出都会设置状态，host 拒绝发布 raw；
+- P 仍要求这五个外层字段全部为 0，并要求原 mode=1/final_seen=1。P/K 互相误载时不能
+  静默通过。
+
+#### 8.7.3 Host 发布前的闭合门禁
+
+K 复用原 perf-clock 的 header-only 分配和一次 64 B/core flush，不打开普通泳道、
+atomic 或 PMU。host 只有在以下条件全部满足后才以 `.tmp` 原子发布正式 JSON：
+
+1. 固定 32 AIC + 64 AIV、96 个 core 的 block/lane 拓扑完全一致；
+2. `records_per_core=0`、header=6,976 B、时钟为 1 ns/tick；
+3. 每核实际 Submit 数等于 orchestration 声明值，B1 为 5、Case1 为 1,280，且 K 的
+   每核首末 tick 必须形成严格正区间；
+4. K mode=2、聚合状态为 0、保留字段为 0；
+5. 每核 `kernel_ticks <= elapsed`，calls/ticks 同为 0 或同为非 0；
+6. 全局起止严格等于 96 核首 tick 最小值和末 tick 最大值；
+7. 当前 PA 固定每 batch 一次 Alloc 和四次 Kernel Submit；无 fanin 的 QK 最迟会在
+   后继 SF Submit 的 EfDrain 执行，所以 AIC 调用数至少为 `batch`，AIC/AIV 分别
+   不超过 `2*batch`，总数不超过 `4*batch`。
+
+第 7 条的最大值不是等式：末个 Submit 后才执行的任务属于 FinalDrain，必须从 K 中
+排除；QK 下界则防止 hook 失效后全零报告仍被发布。输出保留逐核整数、AIC/AIV 的
+min/max/sum/mean、调用数以及
+`sum(kernel_ticks)/sum(elapsed_ticks)`。最后一个比例只能称“聚合 core-time 份额”，
+不能当作跨核墙钟占比，也不能用全局 Submit span 减去跨核 Kernel tick 求调度时间。
+顶层 `min_kernel_calls_in_window` / `max_kernel_calls_in_window` 表示按 batch 推导的
+**全局总调用合法范围**，不是逐核极值；逐核实际极值只在
+`groups.*.kernel_calls_min/max` 中表达。
+
+#### 8.7.4 B1 边界取证与 P 回归
+
+最终源码的 K B1 闭合件为：
+
+```text
+outputs/TestPagedAttentionUnroll_CaseB1_20260721_073602/
+  fdwic_perf_clock_kernel_summary.json
+```
+
+golden、host 门禁和 Python 末端产物契约均 PASS。96 核每核 5 次 Submit，完整 span
+为 84.816 us；窗口内只出现 1 个 Kernel 调用（合法范围 1～4），位于 AIC，累计
+61.289 us。AIV 的窗口内 Kernel
+调用为 0。这个结果不是“漏采”：它与最近泳道中 B1 只有一个 Kernel 落在 Submit、
+其余任务进入 FinalDrain 的结构一致，直接证明 K 的窗口过滤生效。
+
+随后用原 P 做 B1 回归：
+
+```text
+outputs/TestPagedAttentionUnroll_CaseB1_20260721_073736/
+  fdwic_perf_clock_summary.json
+```
+
+该轮同样 PASS，仍输出原 schema、原字段和原文件名，不含任何 Kernel 聚合字段。P 的
+最终 `.text` 仍为 132,688 B，K 的 `.text` 为 138,320 B；P 只含
+`dist_perf_clock_expect_submits`，K 还必须含
+`dist_perf_clock_kernel_profile_marker`，两者均不含泳道、atomic 或 Submit-PMU
+观察器符号。P 的完整 ELF 因调试行号变化不能只凭 SHA 断言字节相同，所以这里只把
+`.text` 大小、宏门禁和最终符号表作为“热路径未编入 K hook”的证据。
+
+最终构建身份如下，后续 K 分布采样必须保持不变：
+
+| 对象 | cache / 大小 / SHA256 |
+| --- | --- |
+| P AICore | `138ce601ea506665` / 2,468,896 B / `98f4e3978cd145477be1865b489f6475545ed1dce6dda9d145768894438b57d1` |
+| K AICore | `e9cebfc34cbed0e7` / 2,495,544 B / `8d23407aa0062534812846b7da03f5078a4843a261f134812c95f5dbc5155060` |
+| 共用 host SO | 11,644,136 B / `5f2e9af0892f64f28aded87e013a5b32425d86940b2e08cd34dad49cab0c0f9d` |
+
+#### 8.7.5 Case1/B256 首轮结构闭合
+
+最终源码的 K Case1 闭合件为：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260721_073849/
+  fdwic_perf_clock_kernel_summary.json
+```
+
+golden PASS，96×1280 Submit 与所有整数聚合均闭合：
+
+| 指标 | ALL | AIC | AIV |
+| --- | ---: | ---: | ---: |
+| 完整 Submit span | 5079.557 us（整数 tick） | - | - |
+| 窗口内 Kernel calls / 合法范围 | 1013 / [256,1024] | 509 / [256,512] | 504 / [0,512] |
+| Kernel core-time sum | 32.905240 ms | 18.740346 ms | 14.164894 ms |
+| 非 Kernel residual core-time sum | 413.683894 ms | 132.130850 ms | 281.553044 ms |
+| Kernel core-time 份额 | 7.36812% | 12.4214% | 4.7900% |
+| calls/core 范围 | 3～21 | 12～21 | 3～14 |
+
+1013 而非 1024 表示该轮还有 11 个真实 Kernel 在对应 worker 的末次 Submit 结束后
+进入 FinalDrain；不能把它们补进 K 来追求“任务总数好看”。96 核均至少执行一次
+窗口内 Kernel，逐核 `elapsed = kernel + residual`、分组 sum 与顶层 sum 已独立从 JSON
+复算通过。
+
+这一轮只证明数据结构、边界和数量级可用，不能凭单样本断言 7.37% 就是权威 P 的
+Kernel 墙钟比例，更不能据此直接提出 Scalar 优化。下一阶段需在冻结 K 提交后排除
+一次预热并连续采集足量独立 Case1，先判断 K 是否复现 P 的 M 主导、X 次要形态；
+同时比较 Kernel ticks、calls 和 ticks/call，避免把“更多任务迁入 Submit 窗口”误判
+成“单次 Kernel 变慢”。
+
+K 每个已计入的 Kernel 都会新增两次 `SYS_CNT` 读取；门控判断、计数累加等开销还会
+落入同一 K ELF 的 residual。它们不从单轮结果中机械扣除，K 只用于同 ELF 波动载体
+分析，不能与 P 的字段逐项相减。
+
+#### 8.7.6 当前验证记录
+
+- profile/cache/compile definitions、ELF 正反门禁及 P/K JSON 末端契约定向单测：
+  65/65 PASS；
+- K B1、P B1、K Case1：golden、host raw 门禁和 Python 产物契约全部 PASS；
+- Case1 JSON 的 96 核、起止、calls、Kernel tick、residual 及 AIC/AIV sum 独立复算
+  全部闭合；
+- 一次 K B1 在只重编 CMake cache、尚未通过 RuntimeBuilder 同步 `build/lib` 时仍加载
+  旧 host SO，旧 JSON 缺少新增的全局调用下界字段，Python 末端契约按预期拒绝；
+  该轮 `..._073315` 明确不计入有效结果。随后确认 cache 与 `build/lib` 的 host SO
+  SHA256 同为上表值后才取得三份最终闭合件；
+- 一次顺带触发的全平台 `test_runtime_builder.py` 运行中，A5 无本阶段失败，但 5 个
+  A2A3/A2A3sim 集成构建被该分支既有的 payload ABI 静态断言挡住；该结果不包装成
+  本阶段 PASS，也不扩展到与真实 A5 PA 无关的修复。
+
 ## 9. 已撤回、失败或不能外推的路线
 
 ### 9.1 已撤回的优化候选
@@ -2311,6 +2488,10 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
 | 观察代价 B1 预检 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_044523/`、`..._044616/`、`..._044712/` | P/N/S 三类身份与结构门禁闭合；不进入时间统计 |
 | 观察代价首组六排列 | `outputs/TestPagedAttentionUnroll_Case1_20260721_044943/` 至 `..._050807/` | 18 个独立进程、每构建 6 样本；方向 3/6，触发扩样 |
 | 观察代价反序扩样 | `outputs/TestPagedAttentionUnroll_Case1_20260721_051317/` 至 `..._053148/` | 再增 18 个独立进程；合计每构建 12 样本，差异仍不可分辨 |
+| perf-clock 同 ELF 20 轮 | `outputs/TestPagedAttentionUnroll_Case1_20260721_055106/` 至 `..._060447/` | P 的 M 主导、X 次要波动证据 |
+| submit-PMU-none 同 ELF 20 轮 | 历史 12 轮加 `outputs/TestPagedAttentionUnroll_Case1_20260721_062430/` 至 `..._062936/` | 仅限 N ELF 的 Scalar/I-cache 波动证据 |
+| 最终 K B1 / P B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_073602/`、`..._073736/` | K 边界与 P 未污染回归 |
+| 最终 perf-clock-kernel Case1 | `outputs/TestPagedAttentionUnroll_Case1_20260721_073849/` | 1013 个窗口内 Kernel；逐核/分组/顶层整数闭合 |
 
 ### 10.3 standalone
 
@@ -2470,16 +2651,20 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
 8. **[PMU 波动定位，已完成且限制为 N ELF] 同一 submit-pmu-none ELF 的 20 轮**：
    复用历史 12 轮并在一次排除预热后补 8 轮连续 N-only，20/20 通过生产消费者
    全量闭合。N 的 Scalar-busy 是其自身每轮 ALL mean/core 波动的主要观察载体，
-   非 Scalar-busy
-   残余幅度很小，全窗平均有效 cycle/time 比例只有 21.35 ppm 的 P90-P10，
+   非 Scalar-busy 残余幅度很小，全窗平均有效 cycle/time 比例只有 21.35 ppm 的
+   P90-P10，
    I-cache miss 次数不随慢轮同向；但 N 的 A/M/X 由 X 通过门禁，未复现 P 的 M
-   主导形态，因此没有把 N 的 Scalar/I-cache 结论外推成 P 的根因。
+   主导形态，因此没有把 N 的 Scalar/I-cache 结论外推成 P 的根因；
+9. **[低容量 Kernel 聚合，结构闭合已完成] 独立 perf-clock-kernel 变体**：保持
+   6,976 B 固定 header 和每核 64 B，只在真实 linked-kernel 调用前后读取 SYS_CNT，
+   并用逐核首末 Submit 状态排除 FinalDrain。K B1、P B1 和 K Case1 均通过 golden
+   与 host/Python 双层产物门禁；Case1 窗口内记录 1013 个 Kernel，合法总范围为
+   `[256,1024]`，逐核 Kernel 与 residual 整数闭合。该单轮只证明工具可用，尚未
+   证明 K 复现 P 的波动形态。
 
-下一步不再扩充 N，也不跨 ELF 扣减。在接近权威低扰动路径的独立诊断变体中，只沿
-真实 `execute_slot()` Kernel 首尾边界增加每核 Kernel 累计 SYS tick 与调用次数，
-不生成逐事件 record、不启用泳道或 PMU。该变体完成 B1 结构门禁后，先用足量
-Case1 同 ELF 数据判断其是否复现 P 的波动形态；只有复现后，才在变体内部区分真实
-Vector/Cube Kernel 墙钟与其余 Scalar scheduler，再决定是否进入最新真实业务 span
-的 Scalar 候选优化。
+下一步不再扩充 N，也不跨 ELF 扣减。冻结 K 的提交、ELF 和 host 身份，排除一次
+预热后连续采集足量独立 Case1，先判断 K 是否复现 P 的波动形态；只有复现后，才在
+K 内部比较真实 Kernel、调用迁移和非 Kernel residual，再决定是否进入最新真实业务
+span 的 Scalar 候选优化。
 单阶段 observed 不机械扣除 empty，也不从单轮 I-cache 数直接提出生产优化；
 standalone 的绝对数继续不替代真实 PA 当前结果。

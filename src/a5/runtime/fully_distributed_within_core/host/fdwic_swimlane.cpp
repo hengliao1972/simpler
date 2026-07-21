@@ -15,6 +15,7 @@
 #include <inttypes.h>
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -490,14 +491,55 @@ std::string output_path(const Runtime *runtime) {
 }
 
 std::string perf_clock_output_path_from_prefix(const std::string &prefix) {
-    if (!prefix.empty() && prefix.back() == '/') return prefix + "fdwic_perf_clock_summary.json";
-    return prefix + "/fdwic_perf_clock_summary.json";
+    const char *mode = std::getenv("PTO_FDWIC_PROFILE");
+    const bool kernel = mode != nullptr && std::strcmp(mode, "perf-clock-kernel") == 0;
+    const char *name = kernel ? "fdwic_perf_clock_kernel_summary.json" : "fdwic_perf_clock_summary.json";
+    if (!prefix.empty() && prefix.back() == '/') return prefix + name;
+    return prefix + "/" + name;
+}
+
+bool perf_clock_kernel_requested() {
+    const char *mode = std::getenv("PTO_FDWIC_PROFILE");
+    return mode != nullptr && std::strcmp(mode, "perf-clock-kernel") == 0;
 }
 
 bool perf_clock_requested() {
     const char *mode = std::getenv("PTO_FDWIC_PROFILE");
-    return mode != nullptr && std::strcmp(mode, "perf-clock") == 0;
+    return mode != nullptr && (std::strcmp(mode, "perf-clock") == 0 || std::strcmp(mode, "perf-clock-kernel") == 0);
 }
+
+struct PerfClockGroupAggregate {
+    uint32_t cores = 0;
+    uint64_t elapsed_sum = 0;
+    uint64_t elapsed_min = std::numeric_limits<uint64_t>::max();
+    uint64_t elapsed_max = 0;
+    uint64_t kernel_sum = 0;
+    uint64_t kernel_min = std::numeric_limits<uint64_t>::max();
+    uint64_t kernel_max = 0;
+    uint64_t residual_sum = 0;
+    uint64_t residual_min = std::numeric_limits<uint64_t>::max();
+    uint64_t residual_max = 0;
+    uint64_t kernel_calls_sum = 0;
+    uint32_t kernel_calls_min = std::numeric_limits<uint32_t>::max();
+    uint32_t kernel_calls_max = 0;
+
+    void add(uint64_t elapsed, uint64_t kernel, uint32_t calls) {
+        const uint64_t residual = elapsed - kernel;
+        ++cores;
+        elapsed_sum += elapsed;
+        elapsed_min = std::min(elapsed_min, elapsed);
+        elapsed_max = std::max(elapsed_max, elapsed);
+        kernel_sum += kernel;
+        kernel_min = std::min(kernel_min, kernel);
+        kernel_max = std::max(kernel_max, kernel);
+        residual_sum += residual;
+        residual_min = std::min(residual_min, residual);
+        residual_max = std::max(residual_max, residual);
+        kernel_calls_sum += calls;
+        kernel_calls_min = std::min(kernel_calls_min, calls);
+        kernel_calls_max = std::max(kernel_calls_max, calls);
+    }
+};
 
 bool prepare_output_directory(const std::string &prefix) {
     struct stat info{};
@@ -929,80 +971,139 @@ extern "C" int fdwic_perf_clock_host_export(Runtime *runtime) {
         return -1;
     }
 
+    const bool kernel_profile = perf_clock_kernel_requested();
+    const char *profile_name = kernel_profile ? "perf-clock-kernel" : "perf-clock";
     int32_t expected_blocks[RUNTIME_MAX_WORKER] = {};
     int32_t expected_lanes[RUNTIME_MAX_WORKER] = {};
     if (!build_expected_core_layout(runtime, header->num_cores, expected_blocks, expected_lanes)) return -1;
 
-    uint32_t aic_count = 0;
-    uint32_t aiv_count = 0;
     uint32_t expected_submits = 0;
     uint64_t global_start = std::numeric_limits<uint64_t>::max();
     uint64_t global_end = 0;
-    uint64_t aic_elapsed_sum = 0;
-    uint64_t aiv_elapsed_sum = 0;
-    uint64_t aic_elapsed_min = std::numeric_limits<uint64_t>::max();
-    uint64_t aiv_elapsed_min = std::numeric_limits<uint64_t>::max();
-    uint64_t aic_elapsed_max = 0;
-    uint64_t aiv_elapsed_max = 0;
+    PerfClockGroupAggregate aic;
+    PerfClockGroupAggregate aiv;
 
     for (uint32_t core_id = 0; core_id < header->num_cores; ++core_id) {
         const FdwicSwimlaneCoreState &core = header->cores[core_id];
-        const FdwicPerfClockCoreData &clock = core.perf_clock;
-        const bool identity_valid =
-            core.core_idx == static_cast<int32_t>(core_id) && core.block_id == expected_blocks[core_id] &&
-            core.lane == expected_lanes[core_id];
-        const bool counters_clean = core.count == 0 && core.dropped == 0 && core.atomic_calls == 0 &&
-                                    core.poll_calls == 0 && core.poll_batch_records == 0;
-        const bool clock_valid =
-            clock.mode == kFdwicPerfClockMode && clock.final_seen == 1 && clock.expected_submit_count != 0 &&
-            clock.submit_count == clock.expected_submit_count && clock.first_submit_start != 0 &&
-            clock.last_submit_end >= clock.first_submit_start;
-        if (!identity_valid || !counters_clean || !clock_valid) {
-            LOG_ERROR(
-                "fdwic perf-clock core %u failed closure: core=%d block=%d/%d lane=%d/%d count=%u/%u "
-                "start=%llu end=%llu mode=%u final=%u trace_count=%u atomic=%u",
-                core_id, core.core_idx, core.block_id, expected_blocks[core_id], core.lane, expected_lanes[core_id],
-                clock.submit_count, clock.expected_submit_count,
-                static_cast<unsigned long long>(clock.first_submit_start),
-                static_cast<unsigned long long>(clock.last_submit_end), clock.mode, clock.final_seen, core.count,
-                core.atomic_calls
-            );
-            return -1;
-        }
-        if (expected_submits == 0) expected_submits = clock.expected_submit_count;
-        if (clock.expected_submit_count != expected_submits) {
-            LOG_ERROR(
-                "fdwic perf-clock expected Submit count differs across cores: core=%u expected=%u reference=%u",
-                core_id, clock.expected_submit_count, expected_submits
-            );
-            return -1;
-        }
-        if (clock.first_submit_start < global_start) global_start = clock.first_submit_start;
-        if (clock.last_submit_end > global_end) global_end = clock.last_submit_end;
-        const uint64_t elapsed = clock.last_submit_end - clock.first_submit_start;
-        if (runtime->workers[core_id].core_type == CoreType::AIC) {
-            ++aic_count;
-            aic_elapsed_sum += elapsed;
-            if (elapsed < aic_elapsed_min) aic_elapsed_min = elapsed;
-            if (elapsed > aic_elapsed_max) aic_elapsed_max = elapsed;
-        } else if (runtime->workers[core_id].core_type == CoreType::AIV) {
-            ++aiv_count;
-            aiv_elapsed_sum += elapsed;
-            if (elapsed < aiv_elapsed_min) aiv_elapsed_min = elapsed;
-            if (elapsed > aiv_elapsed_max) aiv_elapsed_max = elapsed;
+        uint64_t first_submit_start = 0;
+        uint64_t last_submit_end = 0;
+        uint64_t kernel_elapsed_ticks = 0;
+        uint32_t submit_count = 0;
+        uint32_t expected_submit_count = 0;
+        uint32_t kernel_calls = 0;
+        uint32_t stored_mode = 0;
+        uint32_t final_seen = 0;
+        bool diagnostic_fields_valid = false;
+        if (kernel_profile) {
+            const FdwicPerfClockKernelCoreData &clock = core.perf_clock_kernel;
+            first_submit_start = clock.first_submit_start;
+            last_submit_end = clock.last_submit_end;
+            submit_count = clock.submit_count;
+            expected_submit_count = clock.expected_submit_count;
+            kernel_elapsed_ticks = clock.kernel_elapsed_ticks;
+            kernel_calls = core.count;
+            stored_mode = core.poll_batch_records;
+            final_seen = last_submit_end != 0 ? 1U : 0U;
+            const bool call_time_shape =
+                (kernel_calls == 0 && kernel_elapsed_ticks == 0) || (kernel_calls != 0 && kernel_elapsed_ticks != 0);
+            diagnostic_fields_valid = core.dropped == 0 && core.atomic_calls == 0 && core.poll_calls == 0 &&
+                                      stored_mode == kFdwicPerfClockKernelMode && call_time_shape;
         } else {
-            LOG_ERROR("fdwic perf-clock core %u has invalid core type", core_id);
+            const FdwicPerfClockCoreData &clock = core.perf_clock;
+            first_submit_start = clock.first_submit_start;
+            last_submit_end = clock.last_submit_end;
+            submit_count = clock.submit_count;
+            expected_submit_count = clock.expected_submit_count;
+            stored_mode = clock.mode;
+            final_seen = clock.final_seen;
+            diagnostic_fields_valid = core.count == 0 && core.dropped == 0 && core.atomic_calls == 0 &&
+                                      core.poll_calls == 0 && core.poll_batch_records == 0 &&
+                                      stored_mode == kFdwicPerfClockMode && final_seen == 1;
+        }
+
+        const bool identity_valid = core.core_idx == static_cast<int32_t>(core_id) &&
+                                    core.block_id == expected_blocks[core_id] && core.lane == expected_lanes[core_id];
+        const bool window_order_valid =
+            kernel_profile ? last_submit_end > first_submit_start : last_submit_end >= first_submit_start;
+        const bool clock_valid = expected_submit_count != 0 && submit_count == expected_submit_count &&
+                                 first_submit_start != 0 && window_order_valid &&
+                                 kernel_elapsed_ticks <= last_submit_end - first_submit_start;
+        if (!identity_valid || !diagnostic_fields_valid || !clock_valid) {
+            LOG_ERROR(
+                "fdwic %s core %u failed closure: core=%d block=%d/%d lane=%d/%d count=%u/%u "
+                "start=%llu end=%llu mode=%u final=%u kernel_calls=%u kernel_ticks=%llu status=%u reserved=%u/%u",
+                profile_name, core_id, core.core_idx, core.block_id, expected_blocks[core_id], core.lane,
+                expected_lanes[core_id], submit_count, expected_submit_count,
+                static_cast<unsigned long long>(first_submit_start), static_cast<unsigned long long>(last_submit_end),
+                stored_mode, final_seen, kernel_calls, static_cast<unsigned long long>(kernel_elapsed_ticks),
+                core.dropped, core.atomic_calls, core.poll_calls
+            );
+            return -1;
+        }
+        if (expected_submits == 0) expected_submits = expected_submit_count;
+        if (expected_submit_count != expected_submits) {
+            LOG_ERROR(
+                "fdwic %s expected Submit count differs across cores: core=%u expected=%u reference=%u", profile_name,
+                core_id, expected_submit_count, expected_submits
+            );
+            return -1;
+        }
+        global_start = std::min(global_start, first_submit_start);
+        global_end = std::max(global_end, last_submit_end);
+        const uint64_t elapsed = last_submit_end - first_submit_start;
+        if (runtime->workers[core_id].core_type == CoreType::AIC) {
+            aic.add(elapsed, kernel_elapsed_ticks, kernel_calls);
+        } else if (runtime->workers[core_id].core_type == CoreType::AIV) {
+            aiv.add(elapsed, kernel_elapsed_ticks, kernel_calls);
+        } else {
+            LOG_ERROR("fdwic %s core %u has invalid core type", profile_name, core_id);
             return -1;
         }
     }
-    if (aic_count != kExpectedAic || aiv_count != kExpectedAiv || global_start == std::numeric_limits<uint64_t>::max() ||
-        global_end < global_start) {
+    if (aic.cores != kExpectedAic || aiv.cores != kExpectedAiv ||
+        global_start == std::numeric_limits<uint64_t>::max() || global_end < global_start) {
         LOG_ERROR(
-            "fdwic perf-clock topology/global closure failed: AIC=%u/%u AIV=%u/%u start=%llu end=%llu", aic_count,
-            kExpectedAic, aiv_count, kExpectedAiv, static_cast<unsigned long long>(global_start),
+            "fdwic %s topology/global closure failed: AIC=%u/%u AIV=%u/%u start=%llu end=%llu", profile_name, aic.cores,
+            kExpectedAic, aiv.cores, kExpectedAiv, static_cast<unsigned long long>(global_start),
             static_cast<unsigned long long>(global_end)
         );
         return -1;
+    }
+
+    uint64_t min_kernel_calls = 0;
+    uint64_t max_kernel_calls = 0;
+    if (kernel_profile) {
+        if (aic.elapsed_sum == 0 || aiv.elapsed_sum == 0) {
+            LOG_ERROR(
+                "fdwic perf-clock-kernel requires non-zero role elapsed sums: AIC=%llu AIV=%llu",
+                static_cast<unsigned long long>(aic.elapsed_sum), static_cast<unsigned long long>(aiv.elapsed_sum)
+            );
+            return -1;
+        }
+        if (expected_submits % 5U != 0) {
+            LOG_ERROR("fdwic perf-clock-kernel requires 5*batch Submit shape: expected=%u", expected_submits);
+            return -1;
+        }
+        const uint64_t batches = expected_submits / 5U;
+        const uint64_t max_role_calls = 2U * batches;
+        min_kernel_calls = batches;
+        max_kernel_calls = 4U * batches;
+        // 当前 PA 每个 batch 的 QK 无 fanin，最迟会在后继 SF Submit 的 EfDrain
+        // 执行，因此 AIC 至少应观测到 batches 次；其余 Kernel 可能落入
+        // FinalDrain，只能校验角色/总调用数上界，不能强求 4*batches 等式。
+        if (aic.kernel_calls_sum < batches || aic.kernel_calls_sum > max_role_calls ||
+            aiv.kernel_calls_sum > max_role_calls || aic.kernel_calls_sum + aiv.kernel_calls_sum > max_kernel_calls) {
+            LOG_ERROR(
+                "fdwic perf-clock-kernel call closure failed: AIC=%llu/[%llu,%llu] AIV=%llu/[0,%llu] ALL=%llu/["
+                "%llu,%llu]",
+                static_cast<unsigned long long>(aic.kernel_calls_sum), static_cast<unsigned long long>(batches),
+                static_cast<unsigned long long>(max_role_calls), static_cast<unsigned long long>(aiv.kernel_calls_sum),
+                static_cast<unsigned long long>(max_role_calls),
+                static_cast<unsigned long long>(aic.kernel_calls_sum + aiv.kernel_calls_sum),
+                static_cast<unsigned long long>(batches), static_cast<unsigned long long>(max_kernel_calls)
+            );
+            return -1;
+        }
     }
 
     const std::string path = perf_clock_output_path_from_prefix(runtime->fdwic_swimlane_output_prefix_);
@@ -1015,36 +1116,82 @@ extern "C" int fdwic_perf_clock_host_export(Runtime *runtime) {
     }
     const uint64_t global_elapsed = global_end - global_start;
     out << "{\n";
-    out << "  \"schema\": \"fdwic-perf-clock-v1\",\n";
-    out << "  \"mode\": \"perf-clock\",\n";
+    out << "  \"schema\": \"" << (kernel_profile ? "fdwic-perf-clock-kernel-v1" : "fdwic-perf-clock-v1") << "\",\n";
+    out << "  \"mode\": \"" << profile_name << "\",\n";
     out << "  \"clock_freq_hz\": " << header->freq_hz << ",\n";
     out << "  \"device_header_bytes\": " << sizeof(FdwicSwimlaneHeader) << ",\n";
     out << "  \"num_cores\": " << header->num_cores << ",\n";
-    out << "  \"aic_cores\": " << aic_count << ",\n";
-    out << "  \"aiv_cores\": " << aiv_count << ",\n";
+    out << "  \"aic_cores\": " << aic.cores << ",\n";
+    out << "  \"aiv_cores\": " << aiv.cores << ",\n";
     out << "  \"expected_submits_per_core\": " << expected_submits << ",\n";
     out << "  \"global_first_submit_start\": " << global_start << ",\n";
     out << "  \"global_last_submit_end\": " << global_end << ",\n";
     out << "  \"global_submit_span_ticks\": " << global_elapsed << ",\n";
     out << "  \"global_submit_span_us\": "
         << static_cast<double>(global_elapsed) * 1000000.0 / static_cast<double>(header->freq_hz) << ",\n";
+    if (kernel_profile) {
+        const uint64_t elapsed_sum = aic.elapsed_sum + aiv.elapsed_sum;
+        const uint64_t kernel_sum = aic.kernel_sum + aiv.kernel_sum;
+        out << "  \"kernel_boundary\": \"linked_kernel_call_within_per_core_submit_window\",\n";
+        out << "  \"kernel_calls\": " << aic.kernel_calls_sum + aiv.kernel_calls_sum << ",\n";
+        out << "  \"min_kernel_calls_in_window\": " << min_kernel_calls << ",\n";
+        out << "  \"max_kernel_calls_in_window\": " << max_kernel_calls << ",\n";
+        out << "  \"kernel_elapsed_ticks_sum\": " << kernel_sum << ",\n";
+        out << "  \"non_kernel_residual_ticks_sum\": " << elapsed_sum - kernel_sum << ",\n";
+        out << "  \"kernel_core_time_share\": " << static_cast<double>(kernel_sum) / elapsed_sum << ",\n";
+    }
     out << "  \"groups\": {\n";
-    out << "    \"aic\": {\"min_ticks\": " << aic_elapsed_min << ", \"max_ticks\": " << aic_elapsed_max
-        << ", \"mean_ticks\": " << static_cast<double>(aic_elapsed_sum) / aic_count << "},\n";
-    out << "    \"aiv\": {\"min_ticks\": " << aiv_elapsed_min << ", \"max_ticks\": " << aiv_elapsed_max
-        << ", \"mean_ticks\": " << static_cast<double>(aiv_elapsed_sum) / aiv_count << "}\n";
+    if (kernel_profile) {
+        out << "    \"aic\": {\"cores\": " << aic.cores << ", \"elapsed_min_ticks\": " << aic.elapsed_min
+            << ", \"elapsed_max_ticks\": " << aic.elapsed_max << ", \"elapsed_sum_ticks\": " << aic.elapsed_sum
+            << ", \"elapsed_mean_ticks\": " << static_cast<double>(aic.elapsed_sum) / aic.cores
+            << ", \"kernel_min_ticks\": " << aic.kernel_min << ", \"kernel_max_ticks\": " << aic.kernel_max
+            << ", \"kernel_sum_ticks\": " << aic.kernel_sum
+            << ", \"kernel_mean_ticks\": " << static_cast<double>(aic.kernel_sum) / aic.cores
+            << ", \"kernel_calls_min\": " << aic.kernel_calls_min << ", \"kernel_calls_max\": " << aic.kernel_calls_max
+            << ", \"kernel_calls_sum\": " << aic.kernel_calls_sum << ", \"residual_min_ticks\": " << aic.residual_min
+            << ", \"residual_max_ticks\": " << aic.residual_max << ", \"residual_sum_ticks\": " << aic.residual_sum
+            << ", \"residual_mean_ticks\": " << static_cast<double>(aic.residual_sum) / aic.cores
+            << ", \"kernel_core_time_share\": " << static_cast<double>(aic.kernel_sum) / aic.elapsed_sum << "},\n";
+        out << "    \"aiv\": {\"cores\": " << aiv.cores << ", \"elapsed_min_ticks\": " << aiv.elapsed_min
+            << ", \"elapsed_max_ticks\": " << aiv.elapsed_max << ", \"elapsed_sum_ticks\": " << aiv.elapsed_sum
+            << ", \"elapsed_mean_ticks\": " << static_cast<double>(aiv.elapsed_sum) / aiv.cores
+            << ", \"kernel_min_ticks\": " << aiv.kernel_min << ", \"kernel_max_ticks\": " << aiv.kernel_max
+            << ", \"kernel_sum_ticks\": " << aiv.kernel_sum
+            << ", \"kernel_mean_ticks\": " << static_cast<double>(aiv.kernel_sum) / aiv.cores
+            << ", \"kernel_calls_min\": " << aiv.kernel_calls_min << ", \"kernel_calls_max\": " << aiv.kernel_calls_max
+            << ", \"kernel_calls_sum\": " << aiv.kernel_calls_sum << ", \"residual_min_ticks\": " << aiv.residual_min
+            << ", \"residual_max_ticks\": " << aiv.residual_max << ", \"residual_sum_ticks\": " << aiv.residual_sum
+            << ", \"residual_mean_ticks\": " << static_cast<double>(aiv.residual_sum) / aiv.cores
+            << ", \"kernel_core_time_share\": " << static_cast<double>(aiv.kernel_sum) / aiv.elapsed_sum << "}\n";
+    } else {
+        out << "    \"aic\": {\"min_ticks\": " << aic.elapsed_min << ", \"max_ticks\": " << aic.elapsed_max
+            << ", \"mean_ticks\": " << static_cast<double>(aic.elapsed_sum) / aic.cores << "},\n";
+        out << "    \"aiv\": {\"min_ticks\": " << aiv.elapsed_min << ", \"max_ticks\": " << aiv.elapsed_max
+            << ", \"mean_ticks\": " << static_cast<double>(aiv.elapsed_sum) / aiv.cores << "}\n";
+    }
     out << "  },\n";
     out << "  \"cores\": [\n";
     for (uint32_t core_id = 0; core_id < header->num_cores; ++core_id) {
         const FdwicSwimlaneCoreState &core = header->cores[core_id];
-        const FdwicPerfClockCoreData &clock = core.perf_clock;
-        const uint64_t elapsed = clock.last_submit_end - clock.first_submit_start;
+        const uint64_t first_submit_start =
+            kernel_profile ? core.perf_clock_kernel.first_submit_start : core.perf_clock.first_submit_start;
+        const uint64_t last_submit_end =
+            kernel_profile ? core.perf_clock_kernel.last_submit_end : core.perf_clock.last_submit_end;
+        const uint32_t submit_count =
+            kernel_profile ? core.perf_clock_kernel.submit_count : core.perf_clock.submit_count;
+        const uint64_t elapsed = last_submit_end - first_submit_start;
         out << "    {\"core_id\": " << core_id << ", \"core_type\": \""
             << core_type_name(runtime->workers[core_id].core_type) << "\", \"block_id\": " << core.block_id
-            << ", \"lane\": " << core.lane << ", \"submit_count\": " << clock.submit_count
-            << ", \"first_submit_start\": " << clock.first_submit_start << ", \"last_submit_end\": "
-            << clock.last_submit_end << ", \"elapsed_ticks\": " << elapsed << "}"
-            << (core_id + 1 == header->num_cores ? "\n" : ",\n");
+            << ", \"lane\": " << core.lane << ", \"submit_count\": " << submit_count
+            << ", \"first_submit_start\": " << first_submit_start << ", \"last_submit_end\": " << last_submit_end
+            << ", \"elapsed_ticks\": " << elapsed;
+        if (kernel_profile) {
+            const uint64_t kernel_elapsed_ticks = core.perf_clock_kernel.kernel_elapsed_ticks;
+            out << ", \"kernel_elapsed_ticks\": " << kernel_elapsed_ticks << ", \"kernel_calls\": " << core.count
+                << ", \"non_kernel_residual_ticks\": " << elapsed - kernel_elapsed_ticks;
+        }
+        out << "}" << (core_id + 1 == header->num_cores ? "\n" : ",\n");
     }
     out << "  ]\n}\n";
     out.close();
@@ -1058,11 +1205,23 @@ extern "C" int fdwic_perf_clock_host_export(Runtime *runtime) {
         std::remove(temporary_path.c_str());
         return -1;
     }
-    LOG_INFO_V0(
-        "fdwic perf-clock written to %s: cores=%u AIC=%u AIV=%u submits/core=%u span=%.3fus", path.c_str(),
-        header->num_cores, aic_count, aiv_count, expected_submits,
-        static_cast<double>(global_elapsed) * 1000000.0 / static_cast<double>(header->freq_hz)
-    );
+    if (kernel_profile) {
+        LOG_INFO_V0(
+            "fdwic perf-clock-kernel written to %s: cores=%u AIC=%u AIV=%u submits/core=%u span=%.3fus "
+            "kernel_calls=%llu/[%llu,%llu] kernel_ticks=%llu",
+            path.c_str(), header->num_cores, aic.cores, aiv.cores, expected_submits,
+            static_cast<double>(global_elapsed) * 1000000.0 / static_cast<double>(header->freq_hz),
+            static_cast<unsigned long long>(aic.kernel_calls_sum + aiv.kernel_calls_sum),
+            static_cast<unsigned long long>(min_kernel_calls), static_cast<unsigned long long>(max_kernel_calls),
+            static_cast<unsigned long long>(aic.kernel_sum + aiv.kernel_sum)
+        );
+    } else {
+        LOG_INFO_V0(
+            "fdwic perf-clock written to %s: cores=%u AIC=%u AIV=%u submits/core=%u span=%.3fus", path.c_str(),
+            header->num_cores, aic.cores, aiv.cores, expected_submits,
+            static_cast<double>(global_elapsed) * 1000000.0 / static_cast<double>(header->freq_hz)
+        );
+    }
     return 0;
 }
 

@@ -21,6 +21,7 @@ instances die while the extension is still live.
 from __future__ import annotations
 
 import importlib
+import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,6 +45,7 @@ from simpler_setup.scene_test import (
     _fdwic_profile,
     _profiled_cache_key,
     _run_swimlane_converter,
+    _validate_case_fdwic_perf_clock,
     clear_compile_cache,
     run_class_cases,
 )
@@ -96,6 +98,10 @@ def test_fdwic_profile_partitions_compile_cache(monkeypatch):
     assert _fdwic_profile() == "perf-clock"
     assert _profiled_cache_key(base) == (*base, "perf-clock")
 
+    monkeypatch.setenv("PTO_FDWIC_PROFILE", "perf-clock-kernel")
+    assert _fdwic_profile() == "perf-clock-kernel"
+    assert _profiled_cache_key(base) == (*base, "perf-clock-kernel")
+
     monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-none")
     assert _fdwic_profile() == "submit-pmu-none"
     assert _profiled_cache_key(base) == (*base, "submit-pmu-none")
@@ -129,6 +135,11 @@ def test_fdwic_private_profiles_have_isolated_compile_definitions():
     assert _fdwic_compile_definitions("none") is None
     assert _fdwic_compile_definitions("perf-clock") == [
         "PTO_FDWIC_PERF_CLOCK=1",
+        "PTO_FDWIC_TRACE_ENABLED=0",
+    ]
+    assert _fdwic_compile_definitions("perf-clock-kernel") == [
+        "PTO_FDWIC_PERF_CLOCK=1",
+        "PTO_FDWIC_PERF_CLOCK_KERNEL=1",
         "PTO_FDWIC_TRACE_ENABLED=0",
     ]
     assert _fdwic_compile_definitions("submit-pmu-none") == [
@@ -186,6 +197,181 @@ def test_perf_clock_elf_gate_accepts_required_symbol_without_observers(monkeypat
     _assert_fdwic_perf_clock_elf(tmp_path / "aicore_kernel.o")
 
 
+def test_perf_clock_kernel_elf_gate_requires_its_dedicated_marker(monkeypatch, tmp_path):
+    symbol_table = (
+        "37410: 0000000000001b54 68 FUNC WEAK DEFAULT 1 _Z30dist_perf_clock_expect_submitsj\n"
+        "37411: 0000000000001b98 8 FUNC WEAK DEFAULT 1 dist_perf_clock_kernel_profile_marker\n"
+    )
+    monkeypatch.setattr(
+        _scene_test_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=symbol_table, stderr=""),
+    )
+
+    _assert_fdwic_perf_clock_elf(tmp_path / "aicore_kernel.o", "perf-clock-kernel")
+
+
+def test_perf_clock_kernel_elf_gate_rejects_plain_perf_clock_image(monkeypatch, tmp_path):
+    symbol_table = "37410: 0000000000001b54 68 FUNC WEAK DEFAULT 1 _Z30dist_perf_clock_expect_submitsj\n"
+    monkeypatch.setattr(
+        _scene_test_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=symbol_table, stderr=""),
+    )
+
+    with pytest.raises(RuntimeError, match="missing defined perf-clock marker"):
+        _assert_fdwic_perf_clock_elf(tmp_path / "aicore_kernel.o", "perf-clock-kernel")
+
+
+def _write_perf_clock_artifact(tmp_path: Path, profile: str) -> Path:
+    is_kernel = profile == "perf-clock-kernel"
+    output_name = "fdwic_perf_clock_kernel_summary.json" if is_kernel else "fdwic_perf_clock_summary.json"
+    cores = []
+    for core_id in range(96):
+        core = {
+            "core_id": core_id,
+            "core_type": "aic" if core_id < 32 else "aiv",
+            "submit_count": 5,
+            "first_submit_start": 100 + core_id,
+            "last_submit_end": 200 + core_id,
+            "elapsed_ticks": 100,
+        }
+        if is_kernel:
+            has_kernel = core_id == 0
+            core.update(
+                kernel_elapsed_ticks=10 if has_kernel else 0,
+                kernel_calls=1 if has_kernel else 0,
+                non_kernel_residual_ticks=90 if has_kernel else 100,
+            )
+        cores.append(core)
+    payload = {
+        "schema": "fdwic-perf-clock-kernel-v1" if is_kernel else "fdwic-perf-clock-v1",
+        "mode": profile,
+        "num_cores": 96,
+        "aic_cores": 32,
+        "aiv_cores": 64,
+        "expected_submits_per_core": 5,
+        "global_first_submit_start": 100,
+        "global_last_submit_end": 295,
+        "global_submit_span_ticks": 195,
+        "cores": cores,
+    }
+    if is_kernel:
+        payload.update(
+            kernel_calls=1,
+            min_kernel_calls_in_window=1,
+            max_kernel_calls_in_window=4,
+            kernel_elapsed_ticks_sum=10,
+            non_kernel_residual_ticks_sum=9590,
+            groups={
+                "aic": {
+                    "cores": 32,
+                    "elapsed_min_ticks": 100,
+                    "elapsed_max_ticks": 100,
+                    "elapsed_sum_ticks": 3200,
+                    "kernel_min_ticks": 0,
+                    "kernel_max_ticks": 10,
+                    "kernel_sum_ticks": 10,
+                    "kernel_calls_min": 0,
+                    "kernel_calls_max": 1,
+                    "kernel_calls_sum": 1,
+                    "residual_min_ticks": 90,
+                    "residual_max_ticks": 100,
+                    "residual_sum_ticks": 3190,
+                },
+                "aiv": {
+                    "cores": 64,
+                    "elapsed_min_ticks": 100,
+                    "elapsed_max_ticks": 100,
+                    "elapsed_sum_ticks": 6400,
+                    "kernel_min_ticks": 0,
+                    "kernel_max_ticks": 0,
+                    "kernel_sum_ticks": 0,
+                    "kernel_calls_min": 0,
+                    "kernel_calls_max": 0,
+                    "kernel_calls_sum": 0,
+                    "residual_min_ticks": 100,
+                    "residual_max_ticks": 100,
+                    "residual_sum_ticks": 6400,
+                },
+            },
+        )
+    else:
+        payload["groups"] = {
+            "aic": {"min_ticks": 100, "max_ticks": 100},
+            "aiv": {"min_ticks": 100, "max_ticks": 100},
+        }
+    artifact = tmp_path / output_name
+    artifact.write_text(json.dumps(payload))
+    return artifact
+
+
+@pytest.mark.parametrize("profile", ["perf-clock", "perf-clock-kernel"])
+def test_perf_clock_case_artifact_contract_accepts_exact_closure(tmp_path, profile):
+    artifact = _write_perf_clock_artifact(tmp_path, profile)
+
+    assert _validate_case_fdwic_perf_clock("Case", tmp_path, profile) == artifact
+
+
+def test_perf_clock_kernel_case_artifact_contract_rejects_wrong_integer_aggregate(tmp_path):
+    artifact = _write_perf_clock_artifact(tmp_path, "perf-clock-kernel")
+    payload = json.loads(artifact.read_text())
+    payload["kernel_elapsed_ticks_sum"] += 1
+    artifact.write_text(json.dumps(payload))
+
+    with pytest.raises(RuntimeError, match="invalid perf-clock-kernel integer aggregates"):
+        _validate_case_fdwic_perf_clock("Case", tmp_path, "perf-clock-kernel")
+
+
+def test_perf_clock_case_artifact_contract_rejects_wrong_schema(tmp_path):
+    artifact = _write_perf_clock_artifact(tmp_path, "perf-clock")
+    payload = json.loads(artifact.read_text())
+    payload["schema"] = "wrong"
+    artifact.write_text(json.dumps(payload))
+
+    with pytest.raises(RuntimeError, match="invalid perf-clock artifact contract"):
+        _validate_case_fdwic_perf_clock("Case", tmp_path, "perf-clock")
+
+
+def test_perf_clock_kernel_case_artifact_contract_rejects_zero_length_core_window(tmp_path):
+    artifact = _write_perf_clock_artifact(tmp_path, "perf-clock-kernel")
+    payload = json.loads(artifact.read_text())
+    core = payload["cores"][1]
+    core["last_submit_end"] = core["first_submit_start"]
+    core["elapsed_ticks"] = 0
+    core["non_kernel_residual_ticks"] = 0
+    artifact.write_text(json.dumps(payload))
+
+    with pytest.raises(RuntimeError, match="elapsed tick closure failed"):
+        _validate_case_fdwic_perf_clock("Case", tmp_path, "perf-clock-kernel")
+
+
+def test_perf_clock_kernel_case_artifact_contract_recomputes_pa_call_range(tmp_path):
+    artifact = _write_perf_clock_artifact(tmp_path, "perf-clock-kernel")
+    payload = json.loads(artifact.read_text())
+    payload["expected_submits_per_core"] = 1280
+    for core in payload["cores"]:
+        core["submit_count"] = 1280
+    artifact.write_text(json.dumps(payload))
+
+    with pytest.raises(RuntimeError, match="global Kernel call range closure failed"):
+        _validate_case_fdwic_perf_clock("Case", tmp_path, "perf-clock-kernel")
+
+
+def test_perf_clock_kernel_case_artifact_contract_rejects_too_few_actual_calls(tmp_path):
+    artifact = _write_perf_clock_artifact(tmp_path, "perf-clock-kernel")
+    payload = json.loads(artifact.read_text())
+    payload["expected_submits_per_core"] = 1280
+    payload["min_kernel_calls_in_window"] = 256
+    payload["max_kernel_calls_in_window"] = 1024
+    for core in payload["cores"]:
+        core["submit_count"] = 1280
+    artifact.write_text(json.dumps(payload))
+
+    with pytest.raises(RuntimeError, match="global Kernel call range closure failed"):
+        _validate_case_fdwic_perf_clock("Case", tmp_path, "perf-clock-kernel")
+
+
 @pytest.mark.parametrize(
     ("symbol_table", "message"),
     [
@@ -210,6 +396,12 @@ def test_perf_clock_elf_gate_accepts_required_symbol_without_observers(monkeypat
             "37410: 0000000000001b54 68 FUNC WEAK DEFAULT 1 "
             "_Z30dist_perf_clock_expect_submitsj\n"
             "44: 0000000000000088 8 OBJECT LOCAL DEFAULT 17 g_fdwic_submit_pmu_reg_base\n",
+            r"profiling symbol\(s\) still present",
+        ),
+        (
+            "37410: 0000000000001b54 68 FUNC WEAK DEFAULT 1 "
+            "_Z30dist_perf_clock_expect_submitsj\n"
+            "37411: 0000000000001b98 8 FUNC WEAK DEFAULT 1 dist_perf_clock_kernel_profile_marker\n",
             r"profiling symbol\(s\) still present",
         ),
     ],
@@ -421,6 +613,14 @@ def test_submit_pmu_profile_publishes_environment(monkeypatch):
     _configure_fdwic_profile(_FakePytestConfig())
 
     assert _fdwic_profile() == "submit-pmu-none"
+
+
+def test_perf_clock_kernel_profile_publishes_environment(monkeypatch):
+    monkeypatch.delenv("PTO_FDWIC_PROFILE", raising=False)
+
+    _configure_fdwic_profile(_FakePytestConfig(**{"--fdwic-profile": "perf-clock-kernel"}))
+
+    assert _fdwic_profile() == "perf-clock-kernel"
 
 
 @pytest.mark.parametrize(

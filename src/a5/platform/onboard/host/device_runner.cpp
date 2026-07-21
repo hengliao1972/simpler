@@ -298,7 +298,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         }
     });
     const char *fdwic_profile = std::getenv("PTO_FDWIC_PROFILE");
-    const bool fdwic_perf_clock_requested = fdwic_profile != nullptr && std::strcmp(fdwic_profile, "perf-clock") == 0;
+    const bool fdwic_perf_clock_requested =
+        fdwic_profile != nullptr &&
+        (std::strcmp(fdwic_profile, "perf-clock") == 0 || std::strcmp(fdwic_profile, "perf-clock-kernel") == 0);
     const bool fdwic_submit_pmu_requested =
         fdwic_profile != nullptr && std::strncmp(fdwic_profile, "submit-pmu-", 11) == 0;
     if (fdwic_perf_clock_requested) {

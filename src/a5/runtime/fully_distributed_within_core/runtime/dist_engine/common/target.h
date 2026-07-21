@@ -25,6 +25,12 @@
 #define PTO_FDWIC_PERF_CLOCK 0
 #endif
 
+// perf-clock-kernel 是独立的低容量诊断 ELF：保留首末 Submit 时钟，
+// 并额外累计落在同一逐核窗口内的 linked-kernel 时间与调用次数。
+#ifndef PTO_FDWIC_PERF_CLOCK_KERNEL
+#define PTO_FDWIC_PERF_CLOCK_KERNEL 0
+#endif
+
 #ifndef PTO_FDWIC_SUBMIT_PMU
 #define PTO_FDWIC_SUBMIT_PMU 0
 #endif
@@ -41,6 +47,10 @@
 
 #if PTO_FDWIC_PERF_CLOCK && PTO_FDWIC_TRACE_ENABLED
 #error "PTO_FDWIC_PERF_CLOCK requires PTO_FDWIC_TRACE_ENABLED=0"
+#endif
+
+#if PTO_FDWIC_PERF_CLOCK_KERNEL && !PTO_FDWIC_PERF_CLOCK
+#error "PTO_FDWIC_PERF_CLOCK_KERNEL requires PTO_FDWIC_PERF_CLOCK=1"
 #endif
 
 #if PTO_FDWIC_SUBMIT_PMU && PTO_FDWIC_TRACE_ENABLED

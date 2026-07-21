@@ -155,6 +155,7 @@ def pytest_addoption(parser):
         choices=[
             "none",
             "perf-clock",
+            "perf-clock-kernel",
             "submit-pmu-none",
             "submit-pmu-arg-build",
             "submit-pmu-empty-bracket",
@@ -166,6 +167,7 @@ def pytest_addoption(parser):
         default="none",
         help="Select a private fully_distributed_within_core evidence build. "
         "perf-clock keeps only the first/last Submit device clock per core; "
+        "perf-clock-kernel additionally aggregates linked-kernel time/calls inside that per-core window; "
         "submit-pmu-none keeps one full Submit-sequence scalar/I-cache PMU window per core; "
         "submit-pmu-arg-build attributes the Claim-to-Materialize eager-build interval; "
         "submit-pmu-empty-bracket calibrates the adjacent begin/end observer cost at Claim.end; "
@@ -466,6 +468,7 @@ def _configure_fdwic_profile(config):
         return
     if fdwic_profile not in {
         "perf-clock",
+        "perf-clock-kernel",
         "submit-pmu-none",
         "submit-pmu-arg-build",
         "submit-pmu-empty-bracket",
@@ -693,6 +696,7 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
     fdwic_profile = config.getoption("--fdwic-profile", default="none")
     if fdwic_profile in {
         "perf-clock",
+        "perf-clock-kernel",
         "submit-pmu-none",
         "submit-pmu-arg-build",
         "submit-pmu-empty-bracket",

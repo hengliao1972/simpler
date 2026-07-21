@@ -159,11 +159,17 @@ PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] __gm__ DistCore *self, __gm__
         );
     }
 #else
+#if PTO_FDWIC_PERF_CLOCK_KERNEL
+    const uint64_t perf_clock_kernel_begin = fdwic_perf_clock_kernel_begin();
+#endif
     TRACE_SPAN_BEGIN(kernel_trace);
     dist_aicore_call_slot_kernel(s);
     TRACE_SPAN_END(
         kernel_trace, self, s.task_id, s.func_id, TracePhase::Kernel, static_cast<uint32_t>(s.is_multicore ? 1 : 0), 0
     );
+#if PTO_FDWIC_PERF_CLOCK_KERNEL
+    fdwic_perf_clock_kernel_end(perf_clock_kernel_begin);
+#endif
 #endif
     store_barrier();
     if (s.is_multicore) {

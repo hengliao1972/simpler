@@ -47,6 +47,10 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_scope_set_site_impl(const char *, int) {
 DIST_API_ATTR PTO_DEVICE_FUNC void dist_perf_clock_expect_submits(uint32_t expected_submits) {
     fdwic_perf_clock_expect_submits(expected_submits);
 }
+#if PTO_FDWIC_PERF_CLOCK_KERNEL
+// 只作为最终 ELF 的构建身份标记，不进入热路径。
+DIST_API_ATTR PTO_DEVICE_FUNC uint32_t dist_perf_clock_kernel_profile_marker() { return kFdwicPerfClockKernelMode; }
+#endif
 #endif
 
 #if PTO_FDWIC_SUBMIT_PMU

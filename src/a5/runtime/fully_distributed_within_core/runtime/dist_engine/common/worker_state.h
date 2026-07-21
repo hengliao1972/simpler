@@ -48,6 +48,11 @@
 [[block_local]] static uint64_t g_fdwic_perf_clock_first_submit;
 [[block_local]] static uint64_t g_fdwic_perf_clock_last_submit;
 [[block_local]] static uint32_t g_fdwic_perf_clock_expected_submits;
+#if PTO_FDWIC_PERF_CLOCK_KERNEL
+[[block_local]] static uint64_t g_fdwic_perf_clock_kernel_ticks;
+[[block_local]] static uint32_t g_fdwic_perf_clock_kernel_calls;
+[[block_local]] static uint32_t g_fdwic_perf_clock_kernel_status;
+#endif
 #endif
 #if PTO_FDWIC_SUBMIT_PMU
 [[block_local]] static __gm__ FdwicSubmitPmuCoreData *g_fdwic_submit_pmu_core;
@@ -90,6 +95,11 @@ thread_local FdwicSwimlaneCoreState *g_fdwic_perf_clock_core = nullptr;
 thread_local uint64_t g_fdwic_perf_clock_first_submit = 0;
 thread_local uint64_t g_fdwic_perf_clock_last_submit = 0;
 thread_local uint32_t g_fdwic_perf_clock_expected_submits = 0;
+#if PTO_FDWIC_PERF_CLOCK_KERNEL
+thread_local uint64_t g_fdwic_perf_clock_kernel_ticks = 0;
+thread_local uint32_t g_fdwic_perf_clock_kernel_calls = 0;
+thread_local uint32_t g_fdwic_perf_clock_kernel_status = 0;
+#endif
 #endif
 #if PTO_FDWIC_SUBMIT_PMU
 thread_local FdwicSubmitPmuCoreData *g_fdwic_submit_pmu_core = nullptr;
@@ -132,6 +142,11 @@ thread_local FdwicSwimlaneCoreState *g_fdwic_perf_clock_core = nullptr;
 thread_local uint64_t g_fdwic_perf_clock_first_submit = 0;
 thread_local uint64_t g_fdwic_perf_clock_last_submit = 0;
 thread_local uint32_t g_fdwic_perf_clock_expected_submits = 0;
+#if PTO_FDWIC_PERF_CLOCK_KERNEL
+thread_local uint64_t g_fdwic_perf_clock_kernel_ticks = 0;
+thread_local uint32_t g_fdwic_perf_clock_kernel_calls = 0;
+thread_local uint32_t g_fdwic_perf_clock_kernel_status = 0;
+#endif
 #endif
 #if PTO_FDWIC_SUBMIT_PMU
 thread_local FdwicSubmitPmuCoreData *g_fdwic_submit_pmu_core = nullptr;

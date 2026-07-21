@@ -26,6 +26,7 @@ constexpr uint32_t kFdwicSwimlaneDefaultRecordsPerCore = 1u << 16;
 constexpr uint32_t kFdwicAtomicSwimlaneRecordsPerCore = kFdwicSwimlaneDefaultRecordsPerCore;
 constexpr uint32_t kFdwicAtomicSwimlaneLevel = 4;
 constexpr uint32_t kFdwicPerfClockMode = 1;
+constexpr uint32_t kFdwicPerfClockKernelMode = 2;
 static_assert(
     kFdwicAtomicSwimlaneRecordsPerCore % 2 == 0, "32B record partitions must keep every worker base on a 64B boundary"
 );
@@ -278,7 +279,29 @@ static_assert(offsetof(FdwicPerfClockCoreData, last_submit_end) == 8, "perf-cloc
 static_assert(offsetof(FdwicPerfClockCoreData, submit_count) == 16, "perf-clock count offset changed");
 static_assert(offsetof(FdwicPerfClockCoreData, expected_submit_count) == 20, "perf-clock expected offset changed");
 
+// perf-clock-kernel 与普通 perf-clock 共用同一个 32B tail，但把末尾 8B
+// 用于逐核 Kernel 累计时间。构建 profile 和外层 mode 字段负责区分两种
+// 解释，避免扩大每核 64B cacheline 或增加多核共享 sidecar。
+struct FdwicPerfClockKernelCoreData {
+    uint64_t first_submit_start;
+    uint64_t last_submit_end;
+    uint32_t submit_count;
+    uint32_t expected_submit_count;
+    uint64_t kernel_elapsed_ticks;
+};
+
+static_assert(
+    sizeof(FdwicPerfClockKernelCoreData) == 32, "perf-clock-kernel data must fit the existing core-state tail"
+);
+static_assert(
+    offsetof(FdwicPerfClockKernelCoreData, kernel_elapsed_ticks) == 24, "perf-clock-kernel elapsed offset changed"
+);
+
 struct FdwicSwimlaneCoreState {
+    // perf-clock-kernel 关闭 trace 后复用前 20B：count=Kernel 调用数，
+    // dropped=聚合错误状态，atomic_calls/poll_calls=0，
+    // poll_batch_records=kFdwicPerfClockKernelMode。普通 perf-clock 仍要求
+    // 五个字段全零；两种解释不会静默混用。
     volatile uint32_t count;
     volatile uint32_t dropped;
     // Exact number of source-level atomic wrapper calls made by this worker
@@ -298,11 +321,15 @@ struct FdwicSwimlaneCoreState {
     union {
         uint32_t pad[8];
         FdwicPerfClockCoreData perf_clock;
+        FdwicPerfClockKernelCoreData perf_clock_kernel;
     };
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(FdwicSwimlaneCoreState) == 64, "FdwicSwimlaneCoreState must occupy one cacheline");
 static_assert(offsetof(FdwicSwimlaneCoreState, perf_clock) == 32, "perf-clock must reuse the existing 32B tail");
+static_assert(
+    offsetof(FdwicSwimlaneCoreState, perf_clock_kernel) == 32, "perf-clock-kernel must reuse the existing 32B tail"
+);
 
 struct FdwicSwimlaneHeader {
     uint32_t magic;
