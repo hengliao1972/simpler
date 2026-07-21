@@ -180,7 +180,8 @@ outputs/TestPagedAttentionUnroll_Case1_20260717_023809/
 | 2026-07-21 | `660bbff4` | 阶段归因 | 排除 Register 为同 ELF 波动主载体 |
 | 2026-07-21 | `443a0bb3` | 观察工具 | 完善真实 PA I-cache 逐核时间加工口径 |
 | 2026-07-21 | `15c54b33` | 观察工具 | 为真实 PA PMU 产物绑定构建 provenance |
-| 2026-07-21 | 本阶段提交 | 上板验证 | 闭合完整 Submit 与 Register 分段三件套 |
+| 2026-07-21 | `36547252` | 上板验证 | 闭合完整 Submit 与 Register 分段三件套 |
+| 2026-07-21 | 本阶段提交 | 观察工具 | 建立排除 linked Kernel 的 EfDrain-control 固定容量 PMU |
 
 ### 4.1 真实 PA 第一轮 atomic 与前端优化
 
@@ -3320,6 +3321,42 @@ report/cache 两组共 174 项 PASS，ruff 和 diff 检查通过；另用
 真实 ELF 和产物旁证，而不是仅由 host mock 证明。两轮 pytest 均为 1 PASS；报告重载
 与重新渲染逐字节一致。
 
+### 8.17 EfDrain 控制段的固定容量 I-cache 归因
+
+**[观察工具已实现；真实 A5 B1 待本提交后按构建 provenance 闭合]**
+
+最新权威泳道中，完整 EfDrain 占 SubmitUnion 的 15.734%，但其中真实 KernelUnion
+占 8.019%；直接包围整个 EfDrain 会把 Kernel 执行期间混入 Scalar 归因。扣除嵌套
+Kernel 后的最大明确空缺是 EfDrain-control：30,754,207 aggregate core-ticks，占
+SubmitUnion 的 7.715%。因此本阶段只实现这一项，不继续增加逐等待或逐事件记录。
+
+四条真实 Submit 入口都在 `drain_block_won()` 前打开 phase，在
+`drain_phase_b()` 后关闭。`execute_slot()` 只在
+`dist_aicore_call_slot_kernel()` 紧邻前后 pause/resume；Kernel 返回后的 barrier、
+完成发布、frontier 和 slot 清理仍属于 control。背压与 FinalDrain 没有外层 phase，
+同一 helper 不会采集它们。
+
+设逐核 Submit 数为 `N`、被排除的 linked-Kernel 调用数为 `K`，三层闭合公式是
+`begin_reads=end_reads=N+K`，而报告 per-call 始终以外层 `N` 为分母。`K` 复用
+phase record 的 `reserved[0]`，其余保留字保持 0；每核 record 继续是 64 B，总设备
+容量继续是 12,416 B。为避免污染其他 PMU profile，`K` 的 block-local 状态和清零
+写入只在 `PTO_FDWIC_SUBMIT_PMU_PHASE_ID=7` 编译；普通泳道、perf-clock、none 和
+其余 selector 不获得这份状态。
+
+每次排除 Kernel 仍会产生四次 shadow MMIO read、两次 SYS_CNT 和少量 observer
+bookkeeping。完整 primary/shadow whole 会重建并包含 Kernel，局部 elapsed/request/miss
+才排除 Kernel；所以它是同一诊断 ELF 内的控制段方向证据，不是零扰动业务净值，也
+不能跨 ELF 相减。生产 raw 新增的只是每核既有保留字对应的 `K` 字段与一项 96 核闭合
+结果，没有扩大设备 ABI 或改为逐事件 raw。
+
+实现阶段已完成 C++ producer/consumer、CLI/profile/cache/provenance、HTML 和专属
+字段拒绝回归；同时在冻结 provenance 前核验实际 host ELF 的三个 hook 与精确 profile
+marker，旧 `libhost_runtime.so` 会在上板前直接报出重建要求，不再等到设备 init 返回 0。
+report/cache 共 209 项 PASS，ruff、clang-format 与
+`git diff --check` 通过。真实 A5 B1 将在实现提交后重建，确保 provenance 中的 Git
+head 指向本提交，并实际验证 `K>0`、96 核 `N+K`、primary/shadow、owner Restore
+和三件套；未上板前不填实际次数或性能数值。
+
 ## 9. 已撤回、失败或不能外推的路线
 
 ### 9.1 已撤回的优化候选
@@ -3594,7 +3631,7 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
 3. **[观察工具，已实现] 真实 PA `submit-pmu-none`**：编译期去除泳道、atomic 和
    通用逐 task PMU，每核完整 Submit 期只开关 PMU 一次；96 核 primary/shadow、
    owner Restore、AIC/AIV raw/HTML、两轮 B1 和一次 Case1 均已闭合；
-4. **[观察工具，五个真实 selector 与空 bracket 均已实现] 真实 PA 单阶段 PMU**：
+4. **[观察工具，六个真实 selector 与空 bracket 均已实现] 真实 PA 单阶段 PMU**：
    `arg-build` 已完成两轮 B1 与一次 Case1；`empty-bracket` 复用同一 12,416 B ABI，
    已完成两轮 B1 与两轮 Case1，量出 running begin/end 的稳态自扰动指纹并明确
    外层 elapsed 与 read-clear request/miss 的不同边界；`materialize` 又按最新真实
@@ -3605,8 +3642,11 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
    在三个真实 RegisterOutputs 调用点固定采集 96×1280 shape，完成两轮 B1、两轮
    Case1 和七类互斥 B1 回归；`submit-transition` 最后建立 mode 7/phase 6，复用统一
    Submit hook，以每核 `N-1` 独立 shape 聚合相邻 Submit 间隙，两轮 B1、两轮
-   Case1 和四类互斥构建回归均已闭合。五个 selector 都复用 12,416 B ABI，没有扩展
-   逐调用字段；至此停止继续增加 phase，也不依赖新的 standalone 实现；
+   Case1 和四类互斥构建回归均已闭合；`efdrain-control` 最后建立 mode 8/phase 7，
+   用四条 Submit 外层边界和 Kernel 前后 pause/resume 聚合排除 linked Kernel 的
+   不连续 Scalar 控制片段，host 回归已闭合，真实 A5 B1 待实现提交后重建。六个
+   selector 都复用 12,416 B ABI，没有增加逐调用记录；至此停止继续增加 phase，
+   也不依赖新的 standalone 实现；
 5. 结构和边界迭代先使用最小有效真实 PA 用例完成正确性门禁；只有构建身份、容量、
    业务边界和统计闭合后，才运行完整 Case1 b256 性能样本，避免反复生成数百 MiB
    profiling 文件；
@@ -3681,10 +3721,10 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
     `submit-pmu-none` 与 `submit-pmu-register` 各一轮真实 A5 B1 三件套均闭合，且使用
     不同 profiled/extra cache key。
 
-下一步不再扩充 N、K 或已经完成归因的既有 selector，也不跨 ELF 扣减。先补齐独立
-构建 provenance 的工作已完成；随后只允许设计固定容量的
-EfDrain-control/依赖就绪检查聚合，不能恢复逐 Submit/逐等待
-的大 raw。局部 I-cache 是否排除真实 linked-kernel，必须先通过接口与观测语义核验
-再决定。原因层级闭合后，再由 perf-clock 交错 A/B 决定真实 Scalar 候选保留或撤销。
+下一步不再扩充 N、K 或已经完成归因的既有 selector，也不跨 ELF 扣减。独立构建
+provenance 已完成；固定容量 EfDrain-control 已按排除真实 linked-Kernel 的语义实现，
+先以 B1 闭合实际 `K`、`N+K` 与三件套，再决定是否需要一轮 Case1 原因取数。不得恢复
+逐 Submit/逐等待的大 raw，也不在此基础上继续堆叠依赖就绪 selector。原因层级闭合后，
+再由 perf-clock 交错 A/B 决定真实 Scalar 候选保留或撤销。
 单阶段 observed 不机械扣除 empty，也不从单轮 I-cache 数直接提出生产优化；
 standalone 的绝对数继续不替代真实 PA 当前结果。

@@ -25,6 +25,7 @@ from simpler_setup.tools.fdwic_submit_pmu_report import (
     DEFAULT_INPUT_NAME,
     DEFAULT_OUTPUT_NAME,
     DEFAULT_PROVENANCE_NAME,
+    EFDRAIN_CONTROL_CAPTURE_MODE,
     EMPTY_BRACKET_CAPTURE_MODE,
     MATERIALIZE_CAPTURE_MODE,
     PHASE_REQUIRED_STATUS_MASK,
@@ -360,6 +361,31 @@ def _valid_submit_transition_capture() -> dict[str, Any]:
         record["phase_icache_misses_observed"] = 18 + logical_core_id % 5
         record["phase_begin_reads"] = 4
         record["phase_end_reads"] = 4
+    return capture
+
+
+def _valid_efdrain_control_capture() -> dict[str, Any]:
+    capture = _valid_arg_build_capture()
+    capture["capture"]["mode"] = EFDRAIN_CONTROL_CAPTURE_MODE
+    capture["configuration"]["phase"] = {
+        "id": 7,
+        "name": "efdrain-control",
+        "boundary": "efdrain_begin_to_end_excluding_linked_kernel_calls",
+        "expected_calls_per_core": 5,
+        "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+        "counter_semantics": "discontinuous_running_read_clear_excluding_linked_kernel_calls",
+        "time_semantics": "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls",
+    }
+    capture["validation"]["phase_kernel_exclusion_closed_records"] = 96
+    for logical_core_id, record in enumerate(capture["records"]):
+        excluded_kernel_calls = logical_core_id % 3
+        record["phase_id"] = 7
+        record["phase_elapsed_ticks"] = 900 + logical_core_id
+        record["phase_icache_requests_observed"] = 250 + logical_core_id
+        record["phase_icache_misses_observed"] = 25 + logical_core_id % 5
+        record["phase_excluded_kernel_calls"] = excluded_kernel_calls
+        record["phase_begin_reads"] = 5 + excluded_kernel_calls
+        record["phase_end_reads"] = 5 + excluded_kernel_calls
     return capture
 
 
@@ -963,6 +989,177 @@ def test_submit_transition_rejects_single_submit_capture(tmp_path: Path) -> None
         load_capture(_write_capture(tmp_path, capture))
 
 
+def test_valid_efdrain_control_capture_excludes_linked_kernel_segments(tmp_path: Path) -> None:
+    raw_path = _write_capture(tmp_path, _valid_efdrain_control_capture())
+
+    capture = load_capture(raw_path)
+
+    assert capture.phase_summary is not None
+    all_phase = capture.phase_summary["all"]
+    outer_calls = 96 * 5
+    excluded_kernel_calls = sum(record["phase_excluded_kernel_calls"] for record in capture.records)
+    total_elapsed = sum(record["phase_elapsed_ticks"] for record in capture.records)
+    total_requests = sum(record["phase_icache_requests_observed"] for record in capture.records)
+    total_misses = sum(record["phase_icache_misses_observed"] for record in capture.records)
+    assert capture.data["validation"]["phase_kernel_exclusion_closed_records"] == 96
+    assert all_phase["phase_excluded_kernel_calls"] == excluded_kernel_calls
+    assert all_phase["phase_begin_reads"] == outer_calls + excluded_kernel_calls
+    assert all_phase["phase_end_reads"] == outer_calls + excluded_kernel_calls
+    assert all_phase["phase_elapsed_ticks_per_call"] == pytest.approx(total_elapsed / outer_calls)
+    assert all_phase["phase_elapsed_ticks_per_call"] != pytest.approx(
+        total_elapsed / all_phase["phase_end_reads"]
+    )
+    assert all_phase["phase_icache_requests_observed_per_call"] == pytest.approx(total_requests / outer_calls)
+    assert all_phase["phase_icache_misses_observed_per_call"] == pytest.approx(total_misses / outer_calls)
+
+    document = render_report(raw_path)
+    assert "<code>efdrain-control</code> 阶段观察" in document
+    assert "phase_id=7" in document
+    assert "efdrain_begin_to_end_excluding_linked_kernel_calls" in document
+    assert "discontinuous_running_read_clear_excluding_linked_kernel_calls" in document
+    assert "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls" in document
+    assert "elapsed、request 和 miss 都是排除 linked Kernel 后" in document
+    assert "多段 EfDrain control segments 的累计值" in document
+    assert "每次调用的分母仍是外层 EfDrain 调用次数" in document
+    assert "<th>Begin / End reads</th>" in document
+    assert f"<small>排除 linked Kernel 调用 {excluded_kernel_calls} 次</small>" in document
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("id", 6),
+        ("name", "submit-transition"),
+        ("boundary", "efdrain_begin_to_end"),
+        ("expected_calls_per_core", 4),
+        ("counter_semantics", "running_read_clear_observed_bracket"),
+        ("time_semantics", "inner_sys_cnt_between_boundary_observers"),
+    ),
+)
+def test_efdrain_control_rejects_mismatched_phase_configuration(
+    tmp_path: Path,
+    field: str,
+    value: Any,
+) -> None:
+    capture = _valid_efdrain_control_capture()
+    capture["configuration"]["phase"][field] = value
+
+    with pytest.raises(ValueError, match=r"configuration\.phase"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_efdrain_control_requires_excluded_kernel_call_count(tmp_path: Path) -> None:
+    capture = _valid_efdrain_control_capture()
+    capture["records"][0].pop("phase_excluded_kernel_calls")
+
+    with pytest.raises(
+        ValueError,
+        match=r"records\[0\]\.phase_excluded_kernel_calls must be an integer >= 0",
+    ):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_efdrain_control_rejects_negative_excluded_kernel_call_count(tmp_path: Path) -> None:
+    capture = _valid_efdrain_control_capture()
+    capture["records"][0]["phase_excluded_kernel_calls"] = -1
+
+    with pytest.raises(
+        ValueError,
+        match=r"records\[0\]\.phase_excluded_kernel_calls must be an integer >= 0",
+    ):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+@pytest.mark.parametrize("field", ("phase_begin_reads", "phase_end_reads"))
+def test_efdrain_control_rejects_reads_not_closed_against_excluded_kernel_calls(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    capture = _valid_efdrain_control_capture()
+    capture["records"][1][field] -= 1
+
+    with pytest.raises(
+        ValueError,
+        match=r"records\[1\] phase begin/end reads must both equal expected calls 5 "
+        r"\+ excluded Kernel calls 1 = 6",
+    ):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_efdrain_control_rejects_wrong_record_phase_id(tmp_path: Path) -> None:
+    capture = _valid_efdrain_control_capture()
+    capture["records"][0]["phase_id"] = 6
+
+    with pytest.raises(ValueError, match=r"records\[0\]\.phase_id must equal 7"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+@pytest.mark.parametrize("value", (None, 95))
+def test_efdrain_control_requires_closed_kernel_exclusion_validation(
+    tmp_path: Path,
+    value: int | None,
+) -> None:
+    capture = _valid_efdrain_control_capture()
+    if value is None:
+        capture["validation"].pop("phase_kernel_exclusion_closed_records")
+    else:
+        capture["validation"]["phase_kernel_exclusion_closed_records"] = value
+
+    with pytest.raises(ValueError, match=r"validation\.phase_kernel_exclusion_closed_records"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+@pytest.mark.parametrize(
+    "capture_factory",
+    (
+        _valid_arg_build_capture,
+        _valid_empty_bracket_capture,
+        _valid_materialize_capture,
+        _valid_claim_capture,
+        _valid_register_capture,
+        _valid_submit_transition_capture,
+    ),
+)
+def test_other_phase_modes_forbid_excluded_kernel_call_count(
+    tmp_path: Path,
+    capture_factory: Callable[[], dict[str, Any]],
+) -> None:
+    capture = capture_factory()
+    capture["records"][0]["phase_excluded_kernel_calls"] = 0
+
+    with pytest.raises(
+        ValueError,
+        match=rf"phase_excluded_kernel_calls is only valid in {EFDRAIN_CONTROL_CAPTURE_MODE}",
+    ):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+@pytest.mark.parametrize(
+    "capture_factory",
+    (
+        _valid_capture,
+        _valid_arg_build_capture,
+        _valid_empty_bracket_capture,
+        _valid_materialize_capture,
+        _valid_claim_capture,
+        _valid_register_capture,
+        _valid_submit_transition_capture,
+    ),
+)
+def test_other_modes_forbid_kernel_exclusion_validation(
+    tmp_path: Path,
+    capture_factory: Callable[[], dict[str, Any]],
+) -> None:
+    capture = capture_factory()
+    capture["validation"]["phase_kernel_exclusion_closed_records"] = 96
+
+    with pytest.raises(
+        ValueError,
+        match=rf"phase_kernel_exclusion_closed_records is only valid in {EFDRAIN_CONTROL_CAPTURE_MODE}",
+    ):
+        load_capture(_write_capture(tmp_path, capture))
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     (
@@ -1176,6 +1373,24 @@ def test_provenance_publish_preserves_raw_and_closes_sidecar_and_html(
 
     assert not list(tmp_path.glob(".*.pending.*.tmp"))
     assert not list(tmp_path.glob(".*.rollback.*.tmp"))
+
+
+def test_efdrain_control_build_identity_uses_phase_id_7(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = _fake_build_identity(
+        tmp_path,
+        monkeypatch,
+        profile=EFDRAIN_CONTROL_CAPTURE_MODE,
+    )
+
+    assert identity.profile == EFDRAIN_CONTROL_CAPTURE_MODE
+    assert identity.compile_definitions == (
+        "PTO_FDWIC_SUBMIT_PMU=1",
+        "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=7",
+        "PTO_FDWIC_TRACE_ENABLED=0",
+    )
 
 
 @pytest.mark.parametrize("fail_on_final_replace", (1, 2))

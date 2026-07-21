@@ -38,6 +38,7 @@ from simpler_setup.scene_test import (
     _aicore_override_cache,
     _assert_fdwic_perf_clock_elf,
     _assert_fdwic_submit_pmu_elf,
+    _assert_fdwic_submit_pmu_host_elf,
     _assert_fdwic_swimlane_elf,
     _compile_cache,
     _convert_case_swimlane,
@@ -137,6 +138,10 @@ def test_fdwic_profile_partitions_compile_cache(monkeypatch):
     assert _fdwic_profile() == "submit-pmu-submit-transition"
     assert _profiled_cache_key(base) == (*base, "submit-pmu-submit-transition")
 
+    monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-efdrain-control")
+    assert _fdwic_profile() == "submit-pmu-efdrain-control"
+    assert _profiled_cache_key(base) == (*base, "submit-pmu-efdrain-control")
+
 
 def test_fdwic_private_profiles_have_isolated_compile_definitions():
     assert _fdwic_compile_definitions("none") is None
@@ -183,11 +188,31 @@ def test_fdwic_private_profiles_have_isolated_compile_definitions():
         "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=6",
         "PTO_FDWIC_TRACE_ENABLED=0",
     ]
+    assert _fdwic_compile_definitions("submit-pmu-efdrain-control") == [
+        "PTO_FDWIC_SUBMIT_PMU=1",
+        "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=7",
+        "PTO_FDWIC_TRACE_ENABLED=0",
+    ]
 
 
-def test_submit_pmu_override_registers_build_identity_after_elf_gate(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("profile", "expected_compile_definitions"),
+    [
+        ("submit-pmu-none", ["PTO_FDWIC_SUBMIT_PMU=1", "PTO_FDWIC_TRACE_ENABLED=0"]),
+        (
+            "submit-pmu-efdrain-control",
+            [
+                "PTO_FDWIC_SUBMIT_PMU=1",
+                "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=7",
+                "PTO_FDWIC_TRACE_ENABLED=0",
+            ],
+        ),
+    ],
+)
+def test_submit_pmu_override_registers_build_identity_after_elf_gate(
+    monkeypatch, tmp_path, profile, expected_compile_definitions
+):
     """The profiled cache key must own one identity frozen from the built files."""
-    profile = "submit-pmu-none"
     runtime = "fully_distributed_within_core"
     profiled_key = ("QualifiedCase", "a5", runtime, profile)
     orch = tmp_path / "orch.cpp"
@@ -230,6 +255,11 @@ def test_submit_pmu_override_registers_build_identity_after_elf_gate(monkeypatch
         assert selected_profile == profile
         order.append("elf-gate")
 
+    def fake_host_elf_gate(binary, selected_profile):
+        assert binary == host
+        assert selected_profile == profile
+        order.append("host-elf-gate")
+
     def fake_capture_build_identity(**kwargs):
         order.append("capture")
         captured.update(kwargs)
@@ -240,6 +270,7 @@ def test_submit_pmu_override_registers_build_identity_after_elf_gate(monkeypatch
     monkeypatch.setenv("PTO_FDWIC_PROFILE", profile)
     monkeypatch.setattr(runtime_builder_module, "RuntimeBuilder", FakeRuntimeBuilder)
     monkeypatch.setattr(_scene_test_module, "_assert_fdwic_submit_pmu_elf", fake_elf_gate)
+    monkeypatch.setattr(_scene_test_module, "_assert_fdwic_submit_pmu_host_elf", fake_host_elf_gate)
     monkeypatch.setattr(report_module, "capture_build_identity", fake_capture_build_identity)
     _fdwic_build_identity_cache.clear()
 
@@ -249,12 +280,12 @@ def test_submit_pmu_override_registers_build_identity_after_elf_gate(monkeypatch
     expected_build_dir = (
         FakeRuntimeBuilder._CACHE_DIR / "a5" / "onboard" / runtime / "aicore-extra" / extra_key / "aicore"
     )
-    assert order == ["build", "elf-gate", "capture"]
+    assert order == ["build", "elf-gate", "host-elf-gate", "capture"]
     assert captured == {
         "profile": profile,
         "profiled_cache_key": profiled_key,
         "aicore_extra_cache_key": extra_key,
-        "compile_definitions": ["PTO_FDWIC_SUBMIT_PMU=1", "PTO_FDWIC_TRACE_ENABLED=0"],
+        "compile_definitions": expected_compile_definitions,
         "aicore_kernel": binary,
         "aicore_build_dir": expected_build_dir,
         "host_runtime": host,
@@ -637,6 +668,7 @@ def test_submit_pmu_elf_gate_accepts_only_whole_window_observer(monkeypatch, tmp
         "submit-pmu-claim",
         "submit-pmu-register",
         "submit-pmu-submit-transition",
+        "submit-pmu-efdrain-control",
     ],
 )
 def test_submit_pmu_phase_elf_gate_requires_running_shadow_reader(monkeypatch, tmp_path, profile):
@@ -709,6 +741,7 @@ def test_submit_pmu_elf_gate_rejects_incomplete_or_mixed_image(monkeypatch, tmp_
         "submit-pmu-claim",
         "submit-pmu-register",
         "submit-pmu-submit-transition",
+        "submit-pmu-efdrain-control",
     ],
 )
 def test_submit_pmu_phase_elf_gate_rejects_missing_running_shadow_reader(monkeypatch, tmp_path, profile):
@@ -724,6 +757,55 @@ def test_submit_pmu_phase_elf_gate_rejects_missing_running_shadow_reader(monkeyp
 
     with pytest.raises(RuntimeError, match="missing defined submit-pmu marker"):
         _assert_fdwic_submit_pmu_elf(tmp_path / "aicore_kernel.o", profile)
+
+
+def test_submit_pmu_host_elf_gate_accepts_exact_profile_and_hooks(monkeypatch, tmp_path):
+    host_runtime = tmp_path / "libhost_runtime.so"
+    host_runtime.write_bytes(b"prefix\0submit-pmu-efdrain-control\0suffix")
+    symbol_table = (
+        "10: 0000000000001000 64 FUNC GLOBAL DEFAULT 1 fdwic_submit_pmu_host_init\n"
+        "11: 0000000000001040 64 FUNC GLOBAL DEFAULT 1 fdwic_submit_pmu_host_export\n"
+        "12: 0000000000001080 64 FUNC GLOBAL DEFAULT 1 fdwic_submit_pmu_host_finalize\n"
+    )
+    monkeypatch.setattr(
+        _scene_test_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=symbol_table, stderr=""),
+    )
+
+    _assert_fdwic_submit_pmu_host_elf(host_runtime, "submit-pmu-efdrain-control")
+
+
+@pytest.mark.parametrize(
+    ("image", "symbol_table", "message"),
+    (
+        (
+            b"submit-pmu-submit-transition\0",
+            "10: 0 1 FUNC GLOBAL DEFAULT 1 fdwic_submit_pmu_host_init\n"
+            "11: 0 1 FUNC GLOBAL DEFAULT 1 fdwic_submit_pmu_host_export\n"
+            "12: 0 1 FUNC GLOBAL DEFAULT 1 fdwic_submit_pmu_host_finalize\n",
+            "missing exact profile marker",
+        ),
+        (
+            b"submit-pmu-efdrain-control\0",
+            "10: 0 1 FUNC GLOBAL DEFAULT 1 fdwic_submit_pmu_host_init\n",
+            "missing defined host hook",
+        ),
+    ),
+)
+def test_submit_pmu_host_elf_gate_rejects_stale_or_incomplete_runtime(
+    monkeypatch, tmp_path, image, symbol_table, message
+):
+    host_runtime = tmp_path / "libhost_runtime.so"
+    host_runtime.write_bytes(image)
+    monkeypatch.setattr(
+        _scene_test_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=symbol_table, stderr=""),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        _assert_fdwic_submit_pmu_host_elf(host_runtime, "submit-pmu-efdrain-control")
 
 
 def test_swimlane_elf_gate_accepts_merged_phase_atomic_observer(monkeypatch, tmp_path):
@@ -792,12 +874,16 @@ class _FakePytestConfig:
         return self.options.get(option, default)
 
 
-def test_submit_pmu_profile_publishes_environment(monkeypatch):
+@pytest.mark.parametrize(
+    "profile",
+    ("submit-pmu-none", "submit-pmu-efdrain-control"),
+)
+def test_submit_pmu_profile_publishes_environment(monkeypatch, profile):
     monkeypatch.delenv("PTO_FDWIC_PROFILE", raising=False)
 
-    _configure_fdwic_profile(_FakePytestConfig())
+    _configure_fdwic_profile(_FakePytestConfig(**{"--fdwic-profile": profile}))
 
-    assert _fdwic_profile() == "submit-pmu-none"
+    assert _fdwic_profile() == profile
 
 
 def test_perf_clock_kernel_profile_publishes_environment(monkeypatch):

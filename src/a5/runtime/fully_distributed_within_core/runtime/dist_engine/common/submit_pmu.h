@@ -52,6 +52,10 @@ constexpr size_t kFdwicSubmitPmuCompiledBytes = kFdwicSubmitPmuPhaseBytes;
 constexpr FdwicSubmitPmuPhase kFdwicSubmitPmuCompiledPhase = FdwicSubmitPmuPhase::SubmitTransition;
 constexpr uint16_t kFdwicSubmitPmuCompiledMode = kFdwicSubmitPmuModeSubmitTransition;
 constexpr size_t kFdwicSubmitPmuCompiledBytes = kFdwicSubmitPmuPhaseBytes;
+#elif PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 7
+constexpr FdwicSubmitPmuPhase kFdwicSubmitPmuCompiledPhase = FdwicSubmitPmuPhase::EfDrainControl;
+constexpr uint16_t kFdwicSubmitPmuCompiledMode = kFdwicSubmitPmuModeEfDrainControl;
+constexpr size_t kFdwicSubmitPmuCompiledBytes = kFdwicSubmitPmuPhaseBytes;
 #else
 #error "invalid real FDWIC submit-PMU phase"
 #endif
@@ -197,6 +201,9 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_reset_local() {
     g_fdwic_submit_pmu_phase.status = 0;
     g_fdwic_submit_pmu_phase.armed = false;
     g_fdwic_submit_pmu_phase.boundary_error = false;
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 7
+    g_fdwic_submit_pmu_efdrain_excluded_kernel_calls = 0;
+#endif
 }
 
 PTO_DEVICE_FUNC inline void fdwic_submit_pmu_attach(__gm__ Runtime *runtime, __gm__ DistCore *self) {
@@ -292,6 +299,49 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_phase_end() {
 #endif
 }
 
+// execute_slot() 也会被背压等待和 FinalDrain 调用。只有 EfDrainControl
+// outer phase 当前处于 armed 状态时才真正 pause；返回 token 由紧邻 kernel
+// call 后的 resume 消费，避免把 EfDrain 之外的 Kernel 混入该 profile。
+PTO_DEVICE_FUNC inline bool fdwic_submit_pmu_efdrain_kernel_pause() {
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 7
+    FdwicSubmitPmuPhaseAccumulator &phase = g_fdwic_submit_pmu_phase;
+    if (!phase.armed) return false;
+    const uint32_t old_end_reads = phase.end_reads;
+    fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::EfDrainControl>();
+    if (phase.boundary_error || phase.armed || phase.end_reads != old_end_reads + 1U) {
+        phase.boundary_error = true;
+        return false;
+    }
+    if (g_fdwic_submit_pmu_efdrain_excluded_kernel_calls == UINT32_MAX) {
+        phase.boundary_error = true;
+    } else {
+        ++g_fdwic_submit_pmu_efdrain_excluded_kernel_calls;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+PTO_DEVICE_FUNC inline void fdwic_submit_pmu_efdrain_kernel_resume(bool paused) {
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 7
+    if (!paused) return;
+    FdwicSubmitPmuPhaseAccumulator &phase = g_fdwic_submit_pmu_phase;
+    if (phase.armed) {
+        phase.boundary_error = true;
+        return;
+    }
+    const uint32_t old_begin_reads = phase.begin_reads;
+    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::EfDrainControl>();
+    if (phase.boundary_error || !phase.armed || phase.begin_reads != old_begin_reads + 1U) {
+        phase.boundary_error = true;
+        return;
+    }
+#else
+    (void)paused;
+#endif
+}
+
 // 在 Claim.end 调用点量化一对原样 running begin/end observer。外层 SYS_CNT
 // 位于两次 shadow read-clear 之外，因此不会主动进入局部 request/miss
 // observed；它自身仍是计时边界底噪，结果只能作经验量尺。
@@ -358,11 +408,21 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_submit_end(int32_t task_id) {
     if (!phase.boundary_error && !phase.armed && phase.begin_reads == phase.end_reads) {
         phase.status |= kFdwicSubmitPmuPhaseBoundaryBalanced;
     }
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 7
+    const uint64_t expected_boundary_reads = fdwic_submit_pmu_expected_phase_boundary_reads(
+        kFdwicSubmitPmuCompiledPhase, g_fdwic_submit_pmu_expected_submits,
+        g_fdwic_submit_pmu_efdrain_excluded_kernel_calls
+    );
+    if (phase.begin_reads == expected_boundary_reads && phase.end_reads == expected_boundary_reads) {
+        phase.status |= kFdwicSubmitPmuPhaseShapeValid;
+    }
+#else
     const uint32_t expected_phase_calls =
         fdwic_submit_pmu_expected_phase_calls(kFdwicSubmitPmuCompiledPhase, g_fdwic_submit_pmu_expected_submits);
     if (phase.begin_reads == expected_phase_calls && phase.end_reads == expected_phase_calls) {
         phase.status |= kFdwicSubmitPmuPhaseShapeValid;
     }
+#endif
     if (phase.phase_requests <= phase.shadow_requests && phase.phase_misses <= phase.shadow_misses &&
         phase.shadow_misses <= phase.shadow_requests && phase.shadow_requests <= g_fdwic_submit_pmu_icache_requests &&
         phase.shadow_misses <= g_fdwic_submit_pmu_icache_misses) {
@@ -417,8 +477,14 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_flush(__gm__ DistCore *self) {
     phase_core->max_shadow_request_chunk = phase.max_shadow_request_chunk;
     phase_core->max_shadow_miss_chunk = phase.max_shadow_miss_chunk;
     phase_core->status = phase.status;
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 7
+    phase_core->reserved[0] = g_fdwic_submit_pmu_efdrain_excluded_kernel_calls;
+    for (uint32_t index = 1; index < 4U; ++index)
+        phase_core->reserved[index] = 0;
+#else
     for (uint32_t index = 0; index < 4U; ++index)
         phase_core->reserved[index] = 0;
+#endif
     dist_aicore_flush_region(phase_core, sizeof(FdwicSubmitPmuPhaseCoreData));
 #endif
 }
@@ -438,6 +504,8 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_phase_begin() {}
 template <FdwicSubmitPmuPhase Phase>
 PTO_DEVICE_FUNC inline void fdwic_submit_pmu_phase_end() {}
 PTO_DEVICE_FUNC inline void fdwic_submit_pmu_empty_bracket_calibrate() {}
+PTO_DEVICE_FUNC inline bool fdwic_submit_pmu_efdrain_kernel_pause() { return false; }
+PTO_DEVICE_FUNC inline void fdwic_submit_pmu_efdrain_kernel_resume(bool) {}
 }  // namespace
 
 #endif

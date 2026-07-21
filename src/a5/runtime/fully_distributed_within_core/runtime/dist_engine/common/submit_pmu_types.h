@@ -28,6 +28,7 @@ constexpr uint16_t kFdwicSubmitPmuModeMaterialize = 4;
 constexpr uint16_t kFdwicSubmitPmuModeClaim = 5;
 constexpr uint16_t kFdwicSubmitPmuModeRegister = 6;
 constexpr uint16_t kFdwicSubmitPmuModeSubmitTransition = 7;
+constexpr uint16_t kFdwicSubmitPmuModeEfDrainControl = 8;
 constexpr uint32_t kFdwicSubmitPmuExpectedAic = 32;
 constexpr uint32_t kFdwicSubmitPmuExpectedAiv = 64;
 constexpr uint32_t kFdwicSubmitPmuExpectedCores = kFdwicSubmitPmuExpectedAic + kFdwicSubmitPmuExpectedAiv;
@@ -55,7 +56,11 @@ enum class FdwicSubmitPmuPhase : uint16_t {
     // 上一次 Submit 返回前到下一次 dist_submit_begin() 完成。首个 Submit
     // 没有前驱、末个 Submit 没有后继，因此每核固定 expected_submits - 1 次。
     SubmitTransition = 6,
-    Count = 7,
+    // 每次 Submit 开头的 EfDrain 控制段。execute_slot() 中的真实 linked-kernel
+    // 调用通过成对 pause/resume 排除，barrier、完成发布和 frontier 等 scalar
+    // 后处理仍保留在控制段内。
+    EfDrainControl = 7,
+    Count = 8,
 };
 
 constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
@@ -74,6 +79,8 @@ constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
         return kFdwicSubmitPmuModeRegister;
     case FdwicSubmitPmuPhase::SubmitTransition:
         return kFdwicSubmitPmuModeSubmitTransition;
+    case FdwicSubmitPmuPhase::EfDrainControl:
+        return kFdwicSubmitPmuModeEfDrainControl;
     case FdwicSubmitPmuPhase::Count:
         break;
     }
@@ -89,10 +96,18 @@ fdwic_submit_pmu_expected_phase_calls(FdwicSubmitPmuPhase phase, uint32_t expect
     return expected_submits;
 }
 
+PTO_DEVICE_FUNC constexpr uint64_t fdwic_submit_pmu_expected_phase_boundary_reads(
+    FdwicSubmitPmuPhase phase, uint32_t expected_submits, uint32_t excluded_kernel_calls
+) {
+    const uint64_t outer_calls = fdwic_submit_pmu_expected_phase_calls(phase, expected_submits);
+    return outer_calls + (phase == FdwicSubmitPmuPhase::EfDrainControl ? excluded_kernel_calls : 0U);
+}
+
 constexpr bool fdwic_submit_pmu_mode_has_phase(uint16_t mode) {
     return mode == kFdwicSubmitPmuModeArgBuild || mode == kFdwicSubmitPmuModeEmptyBracket ||
            mode == kFdwicSubmitPmuModeMaterialize || mode == kFdwicSubmitPmuModeClaim ||
-           mode == kFdwicSubmitPmuModeRegister || mode == kFdwicSubmitPmuModeSubmitTransition;
+           mode == kFdwicSubmitPmuModeRegister || mode == kFdwicSubmitPmuModeSubmitTransition ||
+           mode == kFdwicSubmitPmuModeEfDrainControl;
 }
 
 // A5 PIPE_UTIL 事件布局。CNT6/CNT7 是权威值；CNT8/CNT5 使用相同事件作
@@ -192,6 +207,9 @@ struct FdwicSubmitPmuPhaseCoreData {
     uint32_t max_shadow_request_chunk;
     uint32_t max_shadow_miss_chunk;
     uint32_t status;
+    // EfDrainControl 专属：reserved[0] 保存被 pause/resume 排除的 linked-kernel
+    // 调用数；其他 phase 以及 reserved[1..3] 必须保持 0。复用保留字可维持
+    // 每核 64B 与总 GM 容量不变。
     uint32_t reserved[4];
 } __attribute__((aligned(64)));
 

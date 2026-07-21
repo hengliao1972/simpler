@@ -870,6 +870,86 @@ SubmitTransition ELF**；每 gap 是按该角色累计 calls 加权的均值。
   和 AIV 约 6.4～7.0 miss/gap 都是当前诊断 ELF 的原始聚合 observed，不能改写成
   零插桩业务净成本或可兑现的墙钟收益。
 
+### 1.8 真实 PA `submit-pmu-efdrain-control`
+
+#### 控制段定义与实现边界
+
+最新排他泳道中，完整 EfDrain 同时包含 Scalar 调度控制与可能被回收执行的真实
+linked Kernel。为了避免把 Kernel 执行期间混入 Scalar I-cache 归因，
+`submit-pmu-efdrain-control` 在四条真实 Submit 入口统一采用以下边界：
+
+```text
+drain_block_won() 前开始
+    -> drain_block_won() + drain_phase_b()
+drain_phase_b() 返回后结束
+```
+
+当 `drain_phase_b()` 进入 `execute_slot()` 时，观察器在
+`dist_aicore_call_slot_kernel()` 紧邻前暂停、返回后恢复。因此局部结果是多个不连续
+控制片段之和：
+
+```text
+EfDrain-control = EfDrain 外层区间 - 真实 linked-Kernel 调用区间
+```
+
+它仍保留 fanin 检查、ring 扫描、atomic、完成发布、frontier 推进、slot 清理等
+Scalar 控制逻辑。背压和 FinalDrain 也会调用 `execute_slot()`，但它们不在
+EfDrain 外层 phase 内，pause helper 会在编译后的当前状态下直接返回 false，不会
+混入本 selector。
+
+#### 固定容量与闭合公式
+
+该 profile 的身份为：
+
+```text
+PTO_FDWIC_SUBMIT_PMU=1
+PTO_FDWIC_SUBMIT_PMU_PHASE_ID=7
+PTO_FDWIC_TRACE_ENABLED=0
+
+capture.mode                    = submit-pmu-efdrain-control
+configuration.phase.id          = 7
+configuration.phase.name        = efdrain-control
+configuration.phase.boundary    = efdrain_begin_to_end_excluding_linked_kernel_calls
+```
+
+公共 C++ capture mode 为 `8`，phase id 为 `7`，两者不能混用。设某核有 `N` 次
+Submit，并在这些 EfDrain 中排除 `K` 次 linked-Kernel 调用，则设备、host 与报告端
+共同要求：
+
+```text
+phase_begin_reads = phase_end_reads = N + K
+报告中的 phase per-call 分母 = N
+```
+
+`K` 只保存在既有 phase record 的 `reserved[0]`，`reserved[1..3]` 必须为零；
+专属 block-local 计数只在 phase 7 编译。每核 phase record 仍为 64 B，设备总容量
+仍为 `128 + 96 × 64 + 96 × 64 = 12,416 B`，没有增加逐 Submit、逐 Kernel 或
+逐事件 raw。正式结果还必须同时闭合 96 核 phase boundary/shape/value/time/status 和
+`phase_kernel_exclusion_closed_records=96`。
+
+#### 观察效应与使用方式
+
+每排除一次 Kernel，会额外执行一次 pause-end 和一次 resume-begin，也就是四次
+shadow counter MMIO 读取、两次 `SYS_CNT` 读取和少量 bookkeeping。linked Kernel
+仍进入完整 Submit primary 以及 shadow whole 的软件重建，但不进入局部 phase 的
+elapsed/request/miss。这个切分会改变诊断 ELF 布局和多核到达，只能在本 ELF 内
+分析同次采集的占比和方向；不能与 `none`、泳道或 perf-clock 绝对相减，也不能
+机械扣除 empty-bracket 后声称零观察开销下的业务净值。
+
+运行命令沿用其他真实 phase，只替换 profile：
+
+```bash
+python -m pytest \
+  examples/a5/fully_distributed_within_core/paged_attention_unroll/test_paged_attention_unroll.py \
+  --platform a5 --runtime fully_distributed_within_core --level 2 \
+  --case CaseB1 --manual include --fdwic-profile submit-pmu-efdrain-control \
+  --rounds 1 -s -v
+```
+
+实现提交前的 host 回归已覆盖 mode/phase/provenance、`N+K` 读数闭合、旧 profile
+拒绝专属字段、外层 `N` 分母和 HTML 语义；真实 A5 B1 的实际 `K`、构建身份与
+三件套路径在上板闭合后再记录，不预填推测值。
+
 ## 2. 为什么 I-cache miss 必须独立重编译
 
 I-cache 数据对代码布局极其敏感。泳道和逐 atomic 观察会增加：

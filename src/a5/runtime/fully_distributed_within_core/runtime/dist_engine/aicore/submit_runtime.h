@@ -486,8 +486,10 @@ dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &arg
     TRACE_TIMESTAMP(submit_begin);
     fdwic_perf_clock_submit_begin(ctx.task_id);
     fdwic_submit_pmu_submit_begin(ctx.task_id);
+    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::EfDrainControl>();
     drain_block_won(ctx.self);
     drain_phase_b(ctx.self);
+    fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::EfDrainControl>();
     TRACE_TIMESTAMP(efdrain_end);
     // 旧 API 的 Materialize.start 复用 efdrain_end；在同一源码边界打开
     // selected phase。submit-PMU ELF 中泳道 record 已编译去除。
@@ -515,8 +517,10 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
     TRACE_TIMESTAMP(submit_begin);
     fdwic_perf_clock_submit_begin(ctx.task_id);
     fdwic_submit_pmu_submit_begin(ctx.task_id);
+    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::EfDrainControl>();
     drain_block_won(ctx.self);
     drain_phase_b(ctx.self);
+    fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::EfDrainControl>();
     TRACE_TIMESTAMP(efdrain_end);
     fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Materialize>();
     TRACE_SPAN_RECORD(submit_begin, efdrain_end, ctx.self, ctx.task_id, -1, TracePhase::EfDrain, 0, 0);
@@ -552,8 +556,10 @@ dist_submit_compete_first_begin(PTO2Runtime *, const MixedKernels &mixed) {
     TRACE_TIMESTAMP(submit_begin);
     fdwic_perf_clock_submit_begin(ctx.task_id);
     fdwic_submit_pmu_submit_begin(ctx.task_id);
+    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::EfDrainControl>();
     drain_block_won(ctx.self);
     drain_phase_b(ctx.self);
+    fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::EfDrainControl>();
     TRACE_TIMESTAMP(efdrain_end);
     TRACE_SPAN_RECORD(submit_begin, efdrain_end, ctx.self, ctx.task_id, -1, TracePhase::EfDrain, 0, 0);
 
@@ -601,8 +607,10 @@ DIST_API_ATTR PTO_DEVICE_FUNC DistCompeteFirstTicket dist_alloc_compete_first_be
     TRACE_TIMESTAMP(submit_begin);
     fdwic_perf_clock_submit_begin(ctx.task_id);
     fdwic_submit_pmu_submit_begin(ctx.task_id);
+    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::EfDrainControl>();
     drain_block_won(ctx.self);
     drain_phase_b(ctx.self);
+    fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::EfDrainControl>();
     TRACE_TIMESTAMP(efdrain_end);
     TRACE_SPAN_RECORD(submit_begin, efdrain_end, ctx.self, ctx.task_id, -1, TracePhase::EfDrain, 0, 0);
 

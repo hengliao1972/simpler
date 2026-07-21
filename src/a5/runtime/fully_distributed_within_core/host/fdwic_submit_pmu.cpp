@@ -64,6 +64,10 @@ constexpr SubmitPmuProfile kSubmitPmuProfiles[] = {
     {"submit-pmu-submit-transition", kFdwicSubmitPmuModeSubmitTransition, FdwicSubmitPmuPhase::SubmitTransition,
      kFdwicSubmitPmuPhaseBytes, "submit-transition", "previous_submit_end_to_next_submit_begin",
      "running_read_clear_observed_bracket", "inner_sys_cnt_between_boundary_observers"},
+    {"submit-pmu-efdrain-control", kFdwicSubmitPmuModeEfDrainControl, FdwicSubmitPmuPhase::EfDrainControl,
+     kFdwicSubmitPmuPhaseBytes, "efdrain-control", "efdrain_begin_to_end_excluding_linked_kernel_calls",
+     "discontinuous_running_read_clear_excluding_linked_kernel_calls",
+     "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls"},
 };
 
 const SubmitPmuProfile *requested_profile() {
@@ -279,29 +283,36 @@ bool validate(
             const FdwicSubmitPmuPhaseCoreData &phase = phases[logical];
             const uint32_t expected_phase_calls =
                 fdwic_submit_pmu_expected_phase_calls(profile.phase, core.expected_submit_count);
-            bool reserved_zero = true;
-            for (uint32_t value : phase.reserved)
-                reserved_zero = reserved_zero && value == 0U;
+            const bool efdrain_control = profile.phase == FdwicSubmitPmuPhase::EfDrainControl;
+            const uint32_t excluded_kernel_calls = efdrain_control ? phase.reserved[0] : 0U;
+            const uint64_t expected_boundary_reads = fdwic_submit_pmu_expected_phase_boundary_reads(
+                profile.phase, core.expected_submit_count, excluded_kernel_calls
+            );
+            bool reserved_valid = true;
+            for (uint32_t index = efdrain_control ? 1U : 0U; index < 4U; ++index)
+                reserved_valid = reserved_valid && phase.reserved[index] == 0U;
             const bool phase_valid =
                 expected_phase_calls != 0 && phase.phase_id == static_cast<uint32_t>(profile.phase) &&
-                phase.phase_begin_reads == expected_phase_calls && phase.phase_end_reads == expected_phase_calls &&
-                phase.phase_elapsed_ticks != 0 &&
+                phase.phase_begin_reads == expected_boundary_reads &&
+                phase.phase_end_reads == expected_boundary_reads && phase.phase_elapsed_ticks != 0 &&
                 phase.phase_elapsed_ticks <= core.last_submit_end_tick - core.first_submit_start_tick &&
                 phase.phase_icache_requests_observed <= core.shadow_icache_requests &&
                 phase.phase_icache_misses_observed <= core.shadow_icache_misses &&
                 phase.max_shadow_request_chunk < kFdwicSubmitPmuCounterRiskThreshold &&
                 phase.max_shadow_miss_chunk < kFdwicSubmitPmuCounterRiskThreshold &&
-                phase.status == kFdwicSubmitPmuRequiredPhaseStatus && reserved_zero;
+                phase.status == kFdwicSubmitPmuRequiredPhaseStatus && reserved_valid;
             if (!phase_valid) {
                 LOG_ERROR(
-                    "fdwic submit-PMU phase core %u closure failed: id=%u reads=%u/%u expected=%u "
-                    "ticks=%llu/%llu observed=%llu/%u,%llu/%u max_chunk=%u/%u status=0x%x reserved=%u",
-                    logical, phase.phase_id, phase.phase_begin_reads, phase.phase_end_reads, expected_phase_calls,
+                    "fdwic submit-PMU phase core %u closure failed: id=%u reads=%u/%u expected=%llu "
+                    "excluded_kernel=%u ticks=%llu/%llu observed=%llu/%u,%llu/%u max_chunk=%u/%u "
+                    "status=0x%x reserved=%u",
+                    logical, phase.phase_id, phase.phase_begin_reads, phase.phase_end_reads,
+                    static_cast<unsigned long long>(expected_boundary_reads), excluded_kernel_calls,
                     static_cast<unsigned long long>(phase.phase_elapsed_ticks),
                     static_cast<unsigned long long>(core.last_submit_end_tick - core.first_submit_start_tick),
                     static_cast<unsigned long long>(phase.phase_icache_requests_observed), core.shadow_icache_requests,
                     static_cast<unsigned long long>(phase.phase_icache_misses_observed), core.shadow_icache_misses,
-                    phase.max_shadow_request_chunk, phase.max_shadow_miss_chunk, phase.status, reserved_zero
+                    phase.max_shadow_request_chunk, phase.max_shadow_miss_chunk, phase.status, reserved_valid
                 );
                 return false;
             }
@@ -497,6 +508,9 @@ extern "C" int fdwic_submit_pmu_host_export(Runtime *runtime) {
                 << ", \"phase_max_shadow_request_chunk\": " << phase.max_shadow_request_chunk
                 << ", \"phase_max_shadow_miss_chunk\": " << phase.max_shadow_miss_chunk
                 << ", \"phase_status\": " << phase.status;
+            if (profile->phase == FdwicSubmitPmuPhase::EfDrainControl) {
+                out << ", \"phase_excluded_kernel_calls\": " << phase.reserved[0];
+            }
         }
         out << "}" << (logical + 1U == kFdwicSubmitPmuExpectedCores ? "\n" : ",\n");
     }
@@ -511,6 +525,9 @@ extern "C" int fdwic_submit_pmu_host_export(Runtime *runtime) {
         out << "\"shadow_primary_bounded_records\": 96, \"phase_boundary_closed_records\": 96, "
                "\"phase_shape_match_records\": 96, \"phase_values_ordered_records\": 96, "
                "\"phase_time_within_submit_records\": 96, ";
+        if (profile->phase == FdwicSubmitPmuPhase::EfDrainControl) {
+            out << "\"phase_kernel_exclusion_closed_records\": 96, ";
+        }
     } else {
         out << "\"shadow_primary_match_records\": 96, ";
     }

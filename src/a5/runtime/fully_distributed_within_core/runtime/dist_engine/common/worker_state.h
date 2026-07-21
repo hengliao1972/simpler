@@ -71,6 +71,11 @@
 [[block_local]] static bool g_fdwic_submit_pmu_started;
 [[block_local]] static bool g_fdwic_submit_pmu_stopped;
 [[block_local]] static FdwicSubmitPmuPhaseAccumulator g_fdwic_submit_pmu_phase;
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 7
+// EfDrain-control 独占的 block-local 计数。放在 profile 条件下，避免给
+// none 和其他局部 PMU ELF 增加状态、清零写入或布局扰动。
+[[block_local]] static uint32_t g_fdwic_submit_pmu_efdrain_excluded_kernel_calls;
+#endif
 #endif
 #define g_dist (*g_dist_ptr)
 #elif defined(__CPU_SIM)
@@ -118,6 +123,9 @@ thread_local uint32_t g_fdwic_submit_pmu_status = 0;
 thread_local bool g_fdwic_submit_pmu_started = false;
 thread_local bool g_fdwic_submit_pmu_stopped = false;
 thread_local FdwicSubmitPmuPhaseAccumulator g_fdwic_submit_pmu_phase = {};
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 7
+thread_local uint32_t g_fdwic_submit_pmu_efdrain_excluded_kernel_calls = 0;
+#endif
 #endif
 #define g_dist (*g_dist_ptr)
 #else
@@ -165,6 +173,9 @@ thread_local uint32_t g_fdwic_submit_pmu_status = 0;
 thread_local bool g_fdwic_submit_pmu_started = false;
 thread_local bool g_fdwic_submit_pmu_stopped = false;
 thread_local FdwicSubmitPmuPhaseAccumulator g_fdwic_submit_pmu_phase = {};
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 7
+thread_local uint32_t g_fdwic_submit_pmu_efdrain_excluded_kernel_calls = 0;
+#endif
 #endif
 #define g_dist (*g_dist_ptr)
 #endif

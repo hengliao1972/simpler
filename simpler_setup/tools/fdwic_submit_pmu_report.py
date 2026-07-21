@@ -50,12 +50,14 @@ MATERIALIZE_CAPTURE_MODE = "submit-pmu-materialize"
 CLAIM_CAPTURE_MODE = "submit-pmu-claim"
 REGISTER_CAPTURE_MODE = "submit-pmu-register"
 SUBMIT_TRANSITION_CAPTURE_MODE = "submit-pmu-submit-transition"
+EFDRAIN_CONTROL_CAPTURE_MODE = "submit-pmu-efdrain-control"
 ARG_BUILD_PHASE_ID = 1
 EMPTY_BRACKET_PHASE_ID = 2
 MATERIALIZE_PHASE_ID = 3
 CLAIM_PHASE_ID = 4
 REGISTER_PHASE_ID = 5
 SUBMIT_TRANSITION_PHASE_ID = 6
+EFDRAIN_CONTROL_PHASE_ID = 7
 PHASE_CONFIG_BY_MODE = {
     ARG_BUILD_CAPTURE_MODE: {
         "id": ARG_BUILD_PHASE_ID,
@@ -105,6 +107,14 @@ PHASE_CONFIG_BY_MODE = {
         "counter_semantics": "running_read_clear_observed_bracket",
         "time_semantics": "inner_sys_cnt_between_boundary_observers",
     },
+    EFDRAIN_CONTROL_CAPTURE_MODE: {
+        "id": EFDRAIN_CONTROL_PHASE_ID,
+        "name": "efdrain-control",
+        "boundary": "efdrain_begin_to_end_excluding_linked_kernel_calls",
+        "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+        "counter_semantics": "discontinuous_running_read_clear_excluding_linked_kernel_calls",
+        "time_semantics": "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls",
+    },
 }
 
 
@@ -124,6 +134,7 @@ PHASE_RECORD_FIELDS = (
     "phase_icache_misses_observed",
     "phase_begin_reads",
     "phase_end_reads",
+    "phase_excluded_kernel_calls",
     "phase_max_shadow_request_chunk",
     "phase_max_shadow_miss_chunk",
     "phase_status",
@@ -417,6 +428,7 @@ def _validate_capture_header(data: dict[str, Any]) -> tuple[str, dict[str, Any],
 def _validate_phase_record(
     record: dict[str, Any],
     prefix: str,
+    mode: str,
     expected_calls: int,
     submit_elapsed: int,
     expected_phase_id: int,
@@ -433,6 +445,19 @@ def _validate_phase_record(
     )
     begin_reads = _integer(record.get("phase_begin_reads"), f"{prefix}.phase_begin_reads")
     end_reads = _integer(record.get("phase_end_reads"), f"{prefix}.phase_end_reads")
+    if mode == EFDRAIN_CONTROL_CAPTURE_MODE:
+        excluded_kernel_calls = _integer(
+            record.get("phase_excluded_kernel_calls"),
+            f"{prefix}.phase_excluded_kernel_calls",
+        )
+        expected_reads = expected_calls + excluded_kernel_calls
+    else:
+        if "phase_excluded_kernel_calls" in record:
+            _fail(
+                f"{prefix}.phase_excluded_kernel_calls is only valid in "
+                f"{EFDRAIN_CONTROL_CAPTURE_MODE}"
+            )
+        expected_reads = expected_calls
     max_request_chunk = _integer(
         record.get("phase_max_shadow_request_chunk"),
         f"{prefix}.phase_max_shadow_request_chunk",
@@ -442,8 +467,13 @@ def _validate_phase_record(
         f"{prefix}.phase_max_shadow_miss_chunk",
     )
 
-    if begin_reads != expected_calls or end_reads != expected_calls:
-        _fail(f"{prefix} phase begin/end reads must both equal {expected_calls}")
+    if begin_reads != expected_reads or end_reads != expected_reads:
+        if mode == EFDRAIN_CONTROL_CAPTURE_MODE:
+            _fail(
+                f"{prefix} phase begin/end reads must both equal expected calls "
+                f"{expected_calls} + excluded Kernel calls {excluded_kernel_calls} = {expected_reads}"
+            )
+        _fail(f"{prefix} phase begin/end reads must both equal {expected_reads}")
     if phase_elapsed > submit_elapsed:
         _fail(f"{prefix}.phase_elapsed_ticks exceeds submit_elapsed_ticks")
     if phase_requests_observed > record["shadow_icache_requests"]:
@@ -511,7 +541,7 @@ def _validate_record(
         if shadow_misses > misses:
             _fail(f"{prefix}.shadow_icache_misses exceeds icache_misses")
         expected_calls = _expected_phase_calls(mode, expected_submits)
-        _validate_phase_record(record, prefix, expected_calls, elapsed, PHASE_CONFIG_BY_MODE[mode]["id"])
+        _validate_phase_record(record, prefix, mode, expected_calls, elapsed, PHASE_CONFIG_BY_MODE[mode]["id"])
     programmable = (scalar, requests, misses, shadow_requests, shadow_misses)
     if any(value >= PROGRAMMABLE_COUNTER_RISK_THRESHOLD for value in programmable):
         _fail(f"{prefix} programmable counter reaches the risk threshold 0x3fffffff")
@@ -655,7 +685,7 @@ def _group_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _phase_group_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
+def _phase_group_summary(records: Sequence[dict[str, Any]], mode: str) -> dict[str, Any]:
     submit_elapsed = _metric_summary(records, "submit_elapsed_ticks")
     phase_elapsed = _metric_summary(records, "phase_elapsed_ticks")
     requests_observed = _metric_summary(records, "phase_icache_requests_observed")
@@ -683,8 +713,8 @@ def _phase_group_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
     }
     primary_requests = sum(record["icache_requests"] for record in records)
     primary_misses = sum(record["icache_misses"] for record in records)
-    phase_calls = sum(record["phase_end_reads"] for record in records)
-    return {
+    phase_calls = sum(_expected_phase_calls(mode, record["expected_submit_count"]) for record in records)
+    summary = {
         "cores": len(records),
         "submit_elapsed_ticks": submit_elapsed,
         "phase_elapsed_ticks": phase_elapsed,
@@ -705,10 +735,13 @@ def _phase_group_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "phase_icache_requests_observed_per_call": requests_observed["sum"] / phase_calls,
         "phase_icache_misses_observed_per_call": misses_observed["sum"] / phase_calls,
         "phase_begin_reads": sum(record["phase_begin_reads"] for record in records),
-        "phase_end_reads": phase_calls,
+        "phase_end_reads": sum(record["phase_end_reads"] for record in records),
         "phase_max_shadow_request_chunk": max(record["phase_max_shadow_request_chunk"] for record in records),
         "phase_max_shadow_miss_chunk": max(record["phase_max_shadow_miss_chunk"] for record in records),
     }
+    if mode == EFDRAIN_CONTROL_CAPTURE_MODE:
+        summary["phase_excluded_kernel_calls"] = sum(record["phase_excluded_kernel_calls"] for record in records)
+    return summary
 
 
 def _validate_summary_number(actual: Any, expected: int | float, path: str) -> None:
@@ -748,6 +781,7 @@ def _validate_host_summary(data: dict[str, Any], computed: Mapping[str, dict[str
 
 def _validate_producer_summary(data: dict[str, Any], mode: str) -> None:
     validation = _object(data.get("validation"), "validation")
+    kernel_exclusion_validation = "phase_kernel_exclusion_closed_records"
     required = {
         "passed": True,
         "trusted_records": EXPECTED_CORES,
@@ -778,6 +812,13 @@ def _validate_producer_summary(data: dict[str, Any], mode: str) -> None:
                 "phase_time_within_submit_records": EXPECTED_CORES,
                 "shadow_primary_bounded_records": EXPECTED_CORES,
             }
+        )
+    if mode == EFDRAIN_CONTROL_CAPTURE_MODE:
+        required[kernel_exclusion_validation] = EXPECTED_CORES
+    elif kernel_exclusion_validation in validation:
+        _fail(
+            f"validation.{kernel_exclusion_validation} is only valid in "
+            f"{EFDRAIN_CONTROL_CAPTURE_MODE}"
         )
     for field, expected in required.items():
         _require_equal(validation.get(field), expected, f"validation.{field}")
@@ -817,7 +858,9 @@ def load_capture(input_path: Path | str) -> SubmitPmuCapture:
     }
     summary = {name: _group_summary(group) for name, group in groups.items()}
     phase_summary = (
-        None if mode == NONE_CAPTURE_MODE else {name: _phase_group_summary(group) for name, group in groups.items()}
+        None
+        if mode == NONE_CAPTURE_MODE
+        else {name: _phase_group_summary(group, mode) for name, group in groups.items()}
     )
     _validate_host_summary(data, summary)
     return SubmitPmuCapture(
@@ -1168,6 +1211,13 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
       仍只覆盖两次 shadow read-clear 之间，并不包含 begin 读取前/end 读取后的全部 observer 取指。
       两者都只是量级参照，不能跨 ELF 精确扣减。</p>
         """
+    efdrain_control_note = ""
+    if phase["id"] == EFDRAIN_CONTROL_PHASE_ID:
+        efdrain_control_note = """
+    <p class="notice"><strong>本阶段的 elapsed、request 和 miss 都是排除 linked Kernel 后，
+      多段 EfDrain control segments 的累计值。</strong>暂停/恢复观察器只切分计数区间；
+      每次调用的分母仍是外层 EfDrain 调用次数，不是 Begin/End 读数，也不是排除的 Kernel 调用数。</p>
+        """
 
     rows = []
     for group_name in GROUP_NAMES:
@@ -1185,6 +1235,15 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
             group["phase_miss_observed_share_of_primary"],
             group["phase_miss_observed_plus_capture_gap_share_of_primary"],
         )
+        reads = (
+            f"{_format_integer(group['phase_begin_reads'])} / "
+            f"{_format_integer(group['phase_end_reads'])}"
+        )
+        if phase["id"] == EFDRAIN_CONTROL_PHASE_ID:
+            reads += (
+                "<br><small>排除 linked Kernel 调用 "
+                f"{_format_integer(group['phase_excluded_kernel_calls'])} 次</small>"
+            )
         rows.append(
             "<tr>"
             f"<th>{title}<small>{group['cores']} 核</small></th>"
@@ -1195,7 +1254,7 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
             f"<small>request {_format_number(group['phase_icache_requests_observed_per_call'])} / "
             f"miss {_format_number(group['phase_icache_misses_observed_per_call'])}</small></td>"
             f"<td>{request_observed}</td><td>{miss_observed}</td>"
-            f"<td>{_format_integer(group['phase_begin_reads'])} / {_format_integer(group['phase_end_reads'])}</td>"
+            f"<td>{reads}</td>"
             f"<td>{_format_integer(group['phase_max_shadow_request_chunk'])} / "
             f"{_format_integer(group['phase_max_shadow_miss_chunk'])}</td>"
             "</tr>"
@@ -1207,6 +1266,7 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
       时间语义 <code>{time_semantics}</code> ·
       <code>expected_calls_per_core={expected_calls}</code></p>
     {calibration_note}
+    {efdrain_control_note}
     <p><strong>这是 running read-clear 观察区间，不是可与其他构建直接相减的独立计时。</strong>
       时间占比的分母是同一 ELF 的 Σ每核 Submit elapsed；request/miss 百分比的分母才是同一 ELF、
       同一次采集的 Submit 整窗 primary。<code>observed_plus_capture_gap = observed + (primary − shadow)</code>；

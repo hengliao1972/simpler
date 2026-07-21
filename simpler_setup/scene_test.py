@@ -57,6 +57,7 @@ _FDWIC_PROFILE_SUBMIT_PMU_MATERIALIZE = "submit-pmu-materialize"
 _FDWIC_PROFILE_SUBMIT_PMU_CLAIM = "submit-pmu-claim"
 _FDWIC_PROFILE_SUBMIT_PMU_REGISTER = "submit-pmu-register"
 _FDWIC_PROFILE_SUBMIT_PMU_SUBMIT_TRANSITION = "submit-pmu-submit-transition"
+_FDWIC_PROFILE_SUBMIT_PMU_EFDRAIN_CONTROL = "submit-pmu-efdrain-control"
 _FDWIC_PERF_CLOCK_ARTIFACTS = {
     _FDWIC_PROFILE_PERF_CLOCK: ("fdwic_perf_clock_summary.json", "fdwic-perf-clock-v1"),
     _FDWIC_PROFILE_PERF_CLOCK_KERNEL: (
@@ -72,6 +73,7 @@ _FDWIC_SUBMIT_PMU_PHASE_PROFILES = frozenset(
         _FDWIC_PROFILE_SUBMIT_PMU_CLAIM,
         _FDWIC_PROFILE_SUBMIT_PMU_REGISTER,
         _FDWIC_PROFILE_SUBMIT_PMU_SUBMIT_TRANSITION,
+        _FDWIC_PROFILE_SUBMIT_PMU_EFDRAIN_CONTROL,
     }
 )
 _FDWIC_SUBMIT_PMU_PROFILES = frozenset({_FDWIC_PROFILE_SUBMIT_PMU_NONE, *_FDWIC_SUBMIT_PMU_PHASE_PROFILES})
@@ -133,6 +135,12 @@ def _fdwic_compile_definitions(profile: str) -> list[str] | None:
         return [
             "PTO_FDWIC_SUBMIT_PMU=1",
             "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=6",
+            "PTO_FDWIC_TRACE_ENABLED=0",
+        ]
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_EFDRAIN_CONTROL:
+        return [
+            "PTO_FDWIC_SUBMIT_PMU=1",
+            "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=7",
             "PTO_FDWIC_TRACE_ENABLED=0",
         ]
     return None
@@ -224,7 +232,7 @@ def get_aicore_path_override(cache_key) -> Path | None:
 
 
 def _fdwic_elf_symbol_rows(binary: Path) -> list[tuple[str, str, str]]:
-    """Return ``(kind, section, name)`` rows from the final CCEC image."""
+    """Return ``(kind, section, name)`` rows from one final FDWIC ELF."""
     try:
         result = subprocess.run(
             ["readelf", "-Ws", "-W", str(binary)],
@@ -233,9 +241,9 @@ def _fdwic_elf_symbol_rows(binary: Path) -> list[tuple[str, str, str]]:
             text=True,
         )
     except FileNotFoundError as exc:
-        raise RuntimeError("readelf is required to validate the FDWIC AICore image") from exc
+        raise RuntimeError("readelf is required to validate the FDWIC ELF") from exc
     if result.returncode != 0:
-        raise RuntimeError(f"readelf failed for FDWIC AICore image {binary}: {result.stderr.strip()}")
+        raise RuntimeError(f"readelf failed for FDWIC ELF {binary}: {result.stderr.strip()}")
 
     symbol_rows = []
     for line in result.stdout.splitlines():
@@ -335,6 +343,35 @@ def _assert_fdwic_submit_pmu_elf(binary: Path, profile: str) -> None:
         raise RuntimeError(f"Invalid {profile} AICore image {binary}: {'; '.join(details)}")
 
 
+def _assert_fdwic_submit_pmu_host_elf(binary: Path, profile: str) -> None:
+    """Reject a stale host runtime before it can launch a profiled device case."""
+    if profile not in _FDWIC_SUBMIT_PMU_PROFILES:
+        raise ValueError(f"Unsupported submit-PMU host profile {profile!r}")
+    symbol_rows = _fdwic_elf_symbol_rows(binary)
+    required = (
+        "fdwic_submit_pmu_host_init",
+        "fdwic_submit_pmu_host_export",
+        "fdwic_submit_pmu_host_finalize",
+    )
+    missing = [
+        symbol
+        for symbol in required
+        if not any(kind == "FUNC" and ndx != "UND" and symbol in name for kind, ndx, name in symbol_rows)
+    ]
+    try:
+        image = Path(binary).read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"Cannot read submit-PMU host runtime {binary}: {exc}") from exc
+    profile_marker = profile.encode("utf-8") + b"\0"
+    if missing or profile_marker not in image:
+        details = []
+        if missing:
+            details.append(f"missing defined host hook(s): {', '.join(missing)}")
+        if profile_marker not in image:
+            details.append(f"missing exact profile marker {profile!r}; rebuild the a5 FDWIC host runtime")
+        raise RuntimeError(f"Invalid {profile} host runtime {binary}: {'; '.join(details)}")
+
+
 def _assert_fdwic_swimlane_elf(binary: Path) -> None:
     """Prove the normal real-A5 FDWIC image carries the merged phase/atomic observer."""
     symbol_rows = _fdwic_elf_symbol_rows(binary)
@@ -405,6 +442,7 @@ def maybe_build_aicore_override(
         from .tools.fdwic_submit_pmu_report import capture_build_identity  # noqa: PLC0415
 
         host_runtime = builder.get_binaries(runtime).host_path
+        _assert_fdwic_submit_pmu_host_elf(host_runtime, profile)
         output_key_dir = Path(binary).resolve().parent
         aicore_build_dir = builder._CACHE_DIR / output_key_dir.relative_to(builder._LIB_DIR) / "aicore"
         _fdwic_build_identity_cache[cache_key] = capture_build_identity(
