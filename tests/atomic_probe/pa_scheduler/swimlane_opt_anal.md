@@ -1,1695 +1,1106 @@
-# FDWIC 泳道排他分区与闭合可行性分析
+# PA Scheduler standalone 主执行流程与泳道全景
 
-本文分析当前 FDWIC 泳道中各阶段为什么不能直接相加，并给出一套具有明确
-业务语义的排他分区。目标是让同一父区间下的互斥子区间尽可能严格闭合，
-同时保留 Atomic、lap marker 等非加和诊断信息。
+本文面向第一次接触 FDWIC PA 调度器的开发者，解释
+`tests/atomic_probe/pa_scheduler` 这条 standalone 路径从 Host 启动到任务完成的
+完整业务流程，以及每一层泳道区间究竟表示什么。
 
-本文前半部保留原始可行性分析；第 6 节持续记录 standalone 中已落地的
-代码、观测口径和分级验证结果。只关心当前实现时，应直接阅读 6.8～6.11 节；
-前文定量结果来自真实 A5 level-4
-诊断样本：
+本文的主语始终是 **standalone PA Case1**。它复刻真实 PA 调度协议中的关键
+结构，但不是 `simpler` 主场景本身。两者差异集中列在第 9 节；除该节外，不能把
+“standalone 当前行为”自动外推成所有 `simpler` 场景的通用行为。
+
+本文只使用当前源码能够证明的事实，不把历史样本数值作为业务定义，也不讨论
+I-cache、PMU 或某次性能波动。性能数据会随编译布局和运行环境变化，而这里描述的
+执行顺序、状态转移和闭合关系才是新人理解代码的稳定入口。
+
+## 1. 一页看懂全流程
+
+### 1.1 Host、worker 与后处理的总览
 
 ```text
-outputs/TestPagedAttentionUnroll_Case1_20260718_161520/
-    l2_swimlane_records.json
+Host
+  │
+  ├─ 解析参数、加载 mixed ELF
+  ├─ 分配并初始化 SchedulerState / workload / trace
+  ├─ H2D：共享状态前缀、standalone 控制区、可选 workload/trace header
+  │
+  ├─ launch 32 个 mixed block
+  │      └─ 每个 block 启动 1 AIC + 2 AIV，共 96 个 worker
+  │
+  │   每个 worker
+  │      ├─ 初始化自己的 WorkerState
+  │      ├─ StartupBarrier：等待 96 个 worker 到齐
+  │      ├─ OrchestrationReplay
+  │      │    ├─ 初始化整轮 PA descriptor/template
+  │      │    └─ 对每个 batch 回放 Alloc → QK → SF → PV → UP
+  │      ├─ FinalDrain：等所有 worker 结束回放，并清空本核私有 slot
+  │      └─ DFXFinalize：flush trace、汇总并发布 WorkerResult
+  │
+  ├─ stream synchronize
+  ├─ D2H：共享完成状态、WorkerResult、trace header/有效 records
+  ├─ 校验拓扑、计数、依赖、完成状态与 workload 输出
+  └─ 校验通过后发布 raw JSON，再由脚本生成 Perfetto 和排他分析 JSON
 ```
 
-该样本为 schema v3、96 个物理子核、按 1 ns/tick 解释的 `SYS_CNT`
-时间戳域，共 973,430 条记录，`dropped_records=0`。样本中的 Atomic 和
-ClockBaseline 来自带逐
-atomic 观察的诊断分支；数值只描述该次采集，不应外推成所有分支或无插桩
-性能基线。
+这里最重要的三个认识是：
 
-阅读时请区分时间快照：第 1～5 节中的“当前”指 2026-07-18 的历史
-schema-v3 样本与当时源码；当前工作树的 schema-v4 实施和实测结果以第 6
-节为准。
+1. 96 个 worker 都按相同顺序回放全部 Submit，不是把五类 Submit 预先静态分给
+   某几个核。
+2. `Claim` 只为每个全局 task 选出一个 winner；loser 仍会完成参数构造、
+   descriptor 物化和本核私有依赖状态维护。
+3. kernel winner 在 Submit 内只把任务放进私有 slot。真正的 QK/SF/PV/UP
+   计算通常由后续 drain 执行，因此“Submit 返回”不等于“kernel 已完成”。
 
-计时域必须区分：本机同一轮 CANN 9.1 profiler 的 DeviceInfo 同时报告
-`hwts_frequency=1000 MHz`、`aic_frequency=1650 MHz` 和
-`aiv_frequency=1650 MHz`。因此泳道 `start/end` 的 `SYS_CNT` 按
-1 ns/tick 解释；这不表示 AIC/AIV 执行频率是 1 GHz，也不外推为
-其他芯片型号的通用规格。分析 JSON 中 `*_cycles` 是
-沿用的字段名，物理单位实际是整数 SYS_CNT tick；跨核求和应称为
-core-ns。PMU total/scalar 等事件才是执行 cycle，本机同窗比值约为
-1.65 cycles/ns，换算时间必须除以对应的 cycles/ns，不能把两个
-计时域混用。
+### 1.2 一个 batch 的业务链
 
-上述设备频率证据位于
-`outputs/pmu_validation/icache_single_128x5_20260718_090151_3235468/`
-`PROF_000001_20260718090151604_03235516CDDPPJLE/device_0/info.json.0`。真实
-本机 CANN 9.1 的 `info_conf_reader.py` 也明确使用 HWTS frequency 换算
-`sys_cnt/delta_syscnt`，DAV3510 的 `GetSystemCycleImpl()` 则直接读
-`SYS_CNT`。真实 PA orchestration 中 AICPU 使用的 50 MHz `cntvct_el0`
-是第三个计时域，不属于本文的 AIC/AIV `SYS_CNT` 泳道时间戳。
-
-## 1. 目标、范围与口径边界
-
-### 1.1 目标
-
-本分析回答三个问题：
-
-1. 当前泳道阶段为什么不能直接相加为总耗时；
-2. 哪些区间已经有明确业务语义，哪些目前只能标为 residual；
-3. 是否能以较小改动形成可验证、可闭合的分区。
-
-本文讨论的是观测口径优化，不是 FDWIC 调度器性能优化。任何后续实现仍需
-用相同观察模式做性能 A/B，不能把泳道插桩样本直接当作无诊断性能基线。
-
-### 1.2 必须区分的三个“总耗时”
-
-#### 单核 Submit replay 包络
+standalone 固定每个 batch 只有一个 q-loop、一个 block group，严格提交五个
+task：
 
 ```text
-T_core_submit_envelope(i)
-    = last_submit_end(i) - first_submit_start(i)
+BeginPaBatch
+    │ 读取本 batch 的 context length，计算 block 数
+    ▼
+Submit Alloc ── Accept ── PreparePaBlockGroup
+    │                          │
+    │                          ▼
+    │                     Submit QK ── Accept
+    │                          │
+    │                          ▼
+    │                     Submit SF ── Accept
+    │                          │
+    │                          ▼
+    │                     Submit PV ── Accept
+    │                          │
+    └──────────────────────────┴──► Submit UP
 ```
 
-它可以在单核上精确分解为 Submit 并集与相邻 Submit 之间的 gap：
+从数据依赖看，五个 task 形成下面的调度图：
 
 ```text
-T_core_submit_envelope(i)
-    = union(Submit(i, *)) + InterSubmitResidual(i)
+Alloc ───────────────────────────────┐
+                                     │
+QK ──► SF ──► PV ───────────────────┼──► UP
+       └─────────────────────────────┘
 ```
 
-这是最容易形成严格加和关系的现有口径。
+显式 fanin 边分别是：
 
-#### 单核 completion window
+- QK：0 条，输入都是外部 tensor；
+- SF：依赖 QK；
+- PV：依赖 SF；
+- UP：依赖 Alloc、SF 和 PV，共 3 条。
 
-推荐将完整业务窗口定义为启动屏障结束后，到本核 final drain 完成为止：
+所以每个 batch 有 5 个 fanin edge。descriptor 会在 Submit 阶段先返回给
+orchestration，真正的数据可用性由 producer task 的 completion flag 保证。
+这使 orchestration 能继续提交后继任务，而不必在每个 Submit 后同步等待计算完成。
+
+### 1.3 一次 Submit 的当前顺序
+
+当前 standalone 使用 compete-first eager 顺序：先做与参数无关的进度推进和
+Claim，再让所有 worker 同步构造完整参数，最后消费参数完成 Submit。
 
 ```text
-T_core_completion(i)
-    = OrchestrationReplay(i) + FinalDrain(i)
+Submit API call
+  ├─ BeginCallbackSubmit       分配 task_id；位于记录的 Submit.start 之前
+  ├─ recorded Submit parent
+  │  ├─ EfDrain                尝试执行以前已 ready 的 slot
+  │  ├─ Claim                  按 task role 竞争唯一 winner
+  │  ├─ [ArgBuild residual]    所有 worker 同步构造完整 TaskArgs
+  │  ├─ Materialize            生成输出 descriptor 和 register mask
+  │  ├─ PrepareMap             退休超出 H 窗口的 TensorMap 条目
+  │  ├─ Fanin                  仅非 Alloc winner 收集 producer task
+  │  ├─ Register               更新本核的 hazard producer 视图
+  │  ├─ WinnerBuild/AllocComplete（仅 winner）
+  │  └─ [tail residual]        公共计数和 Submit.end 取时
+  └─ 发布 Submit record 并返回 位于记录的 Submit.end 之后
 ```
 
-如果还需要描述启动偏斜和 DFX 落盘，应在其外层另建
-`WorkerObservedWindow`，而不是混入业务阶段。
+方括号中的 `ArgBuild residual` 是业务解释，不是当前 schema-v4 的独立 raw
+phase。泳道只知道它位于 `Claim.end` 与 `Materialize.begin` 之间；该空白还包含
+Claim record 发布、Begin/Finish 衔接等成本，所以不能把整个区间都宣称为
+“纯参数构造耗时”。
 
-#### 全局 makespan
+## 2. 先认识参与者与状态
+
+### 2.1 物理拓扑和 worker 编号
+
+CCEC Host launch 32 个 mixed block。每个 block 产生三条运行 lane：
+
+| 运行 lane | worker 编号 | block/lane 映射 | 主要 task |
+| --------- | ----------- | --------------- | --------- |
+| AIC | `0..31` | `block=worker, lane=0` | QK、PV |
+| AIV0/AIV1 | `32..95` | 两个 AIV 对应一个 block，lane 为 1/2 | SF、UP |
+
+因此固定拓扑是 32 AIC + 64 AIV，共 96 个 worker。所有 worker 都有自己的
+scalar 控制流、TensorMap、ring slot、heap cursor 和 task payload arena。
+
+每个 task 的 Claim 参与范围不同：
+
+| task | 真正执行 atomicMax 的 worker | 每个 task 的 winner 数 |
+| ---- | ---------------------------: | ---------------------: |
+| Alloc | 全部 96 个 worker | 1 |
+| QK、PV | 32 个 AIC | 各 1 |
+| SF、UP | 64 个 AIV | 各 1 |
+
+不符合 role 的 worker 仍有一条 `Claim` span，但 `attempted=false`，不会执行
+该 task 的 `atomicMax`。
+
+### 2.2 四类状态及其业务职责
+
+| 状态 | 所有权 | 保存内容 | 业务作用 |
+| ---- | ------ | -------- | -------- |
+| `SchedulerState` 共享前缀 | 96 核共享 | Claim cursor、task cell、frontier、屏障、fatal | 建立全局唯一 winner、完成可见性和生命周期同步 |
+| `WorkerState` | 每个 worker 私有 | heap cursor、TensorMap、slot、payload | 让每核独立回放同一图，并暂存自己赢得的任务 |
+| `TaskCell` | 每个全局 task 一份 | `vend`、`flag` | 发布 heap 水位和完成状态，供 fanin/回收读取 |
+| `PaOrchestrationState`/`TaskArgs` | 当前 worker 回放栈 | PA descriptor、动态 shape、参数列表 | 把前一 Submit 的输出接到后一 Submit 的输入 |
+
+共享与私有的边界非常重要：
+
+- Claim cursor、completion flag、frontier 是跨核协议，访问需要原子语义；
+- TensorMap 和 slot 只属于本 worker，维护它们不需要跨核原子；
+- 每个 worker 都维护同一 task stream 的私有 descriptor/producer 视图；
+- kernel 的完成通过共享 `TaskCell::flag` 对所有 worker 可见。
+
+### 2.3 `vend`、`flag` 和 `frontier` 分别表示什么
+
+任务完成时按固定顺序发布：
+
+1. 把 winner 当前的单调 `heap_next` 写入 task 的 `vend`；
+2. 执行 store barrier；
+3. 把 task 的 `flag` 发布为 ready；
+4. 从当前 `frontier + 1` 开始扫描连续 ready 的 task，并用 `FetchMax`
+   单调推进共享 frontier。
+
+三者不能混为一个概念：
+
+- `flag(task)` 回答“这个 task 是否完成”；
+- `vend(task)` 回答“完成该 task 时，该 worker 的逻辑 heap 走到了哪里”；
+- `frontier` 回答“从 task 0 起连续完成到了哪里”，不能跨过中间未完成的空洞。
+
+`HeapGuard` 使用 `frontier - H` 对应 task 的 `vend` 判断旧物理 heap 区间是否
+已经允许复用。`H=64` 同时也是 TensorMap producer 的存活窗口，但 TensorMap
+退休进度和共享 frontier 并不要求在同一时刻相等。
+
+## 3. 五类 task 分别做什么
+
+### 3.1 Alloc：建立本轮累计状态
+
+Alloc 构造三个 `Output`：
+
+- accumulated output tile；
+- accumulated sum；
+- accumulated max。
+
+所有 worker 都会为这三个输出物化 descriptor。唯一 winner 不构建 kernel
+slot，而是在 `AllocComplete` 中通过 `HeapGuard` 后立即发布 task 完成。
+orchestration 随即用 `AcceptTaskOutputs` 保存三个 descriptor，供同 batch 的
+UP 使用。
+
+业务效果是“为本次 q/group 链建立累计结果的逻辑存储和 producer 身份”，不是
+执行一次计算 kernel。
+
+### 3.2 QK：产生 score descriptor 和 AIC 任务
+
+QK 参数包括：
+
+- 当前 batch/query 的 view；
+- key cache 和 block table；
+- 一个动态 shape 的 score `Output`；
+- block 数和 block-table offset 两个 scalar。
+
+32 个 AIC 竞争一个 winner。QK 输入都是外部 tensor，没有前序 task owner，
+所以 winner 收集到 0 条 fanin。winner 在 `WinnerBuild` 中构造私有 slot，
+score descriptor 则立即返回并被 SF 引用。
+
+### 3.3 SF：等待 QK，产生 probability 和统计量
+
+SF 参数包括 QK score，一个 probability `Output`、max/sum 两个 `Output`，
+以及 scale、block 数和末 block 有效长度三个 scalar。
+
+64 个 AIV 竞争一个 winner。score descriptor 的 owner 是 QK task，所以 SF
+有 1 条 fanin。SF slot 可以先构建，但只有 QK 的 completion flag ready 后，
+drain 才会执行它。
+
+### 3.4 PV：等待 SF，产生新的 output tile
+
+PV 参数包括 SF probability、value cache、block table，一个 tile `Output`，
+以及 block 数和 block-table offset 两个 scalar。
+
+32 个 AIC 竞争一个 winner。PV 对 SF 有 1 条 fanin。返回的 tile descriptor
+会作为 UP 的输入之一。
+
+### 3.5 UP：合并本组结果并登记写 hazard
+
+UP 参数包括：
+
+- SF 的 max、sum 和 PV 的 output，三项 `Input`；
+- accumulated max/sum/output 和最终 output view，四项 `Inout`；
+- first-group、last-group 两个边界 scalar。
+
+64 个 AIV 竞争一个 winner。UP 的显式依赖去重后是 Alloc、SF、PV 三个 task。
+它没有新的 `Output` descriptor，但四个 `Inout` 会形成 `register_mask`，并由
+每个 worker 登记到自己的 TensorMap，表示“当前 UP 是这些 backing range 的
+最新写者”。
+
+### 3.6 默认 256 batch 时应看到的固定规模
+
+设 batch 数为 `B`：
+
+| 计数 | 公式 | `B=256` |
+| ---- | ---: | ------: |
+| 每 worker 的 Submit | `5B` | 1,280 |
+| 96 核 Submit 总记录 | `96 × 5B` | 122,880 |
+| 实际 Claim atomicMax | `288B` | 73,728 |
+| 全局 winner task | `5B` | 1,280 |
+| AllocComplete | `B` | 256 |
+| WinnerBuild / Kernel | `4B` | 1,024 |
+| fanin edge | `5B` | 1,280 |
+
+这些是协议不变量，不是某次运行的经验均值。若这些计数不成立，应先判断为
+回放、路由、丢记录或完成协议异常，而不是直接分析性能分布。
+
+## 4. Worker 的完整生命周期
+
+### 4.1 Host 准备和 launch
+
+CCEC Host 的主要工作顺序是：
+
+1. 在创建 ACL 资源前解析公共参数、winner workload 参数和构建变体约束；
+2. 读取 mixed AICore ELF，并完成 ACL/stream/kernel 注册；
+3. 分配 `SchedulerState`、真实计算 workspace 和可选 trace 区；
+4. 每轮调用 `InitializeState`，配置 trace 和 winner workload；
+5. H2D 只传共享状态前缀、standalone 控制区和必要输入，不搬运每个 worker
+   的完整私有 arena；
+6. 以 32 个 mixed block launch，并同步等待设备完成。
+
+Host 的 launch-to-sync 墙钟包含设备 launch、worker 启动、全部回放、最终
+drain、DFX 收尾和 stream 同步。它不包含 launch 前的 H2D，也不包含同步后的
+D2H/JSON。因此它不能由 `OrchestrationReplay + FinalDrain` 直接闭合。
+
+### 4.2 Worker 私有状态初始化
+
+每个 worker 在进入 task 0 前会：
+
+- 写入 role、core、block、lane、sub-block 身份；
+- 把 `local_index` 和 `heap_next` 归零；
+- 重置私有 TensorMap；
+- 清空四个物理 slot；
+- 附着当前 worker 的 trace/统计上下文。
+
+四个物理 slot 中有两个保留给生产 BlockWon ABI，因此 standalone 单 lane
+任务仍只有两个普通可用 slot。这个容量会触发真实的 ring backpressure，不能
+因为 standalone 不执行 joint task 就把四个 slot 全部当成普通容量。
+
+### 4.3 StartupBarrier：统一回放起点
+
+每个 worker 对共享 `started_count` 做一次增量，然后轮询到配置的 worker 数。
+等待期间同时检查 fatal，并由 watchdog 防止参与者缺失造成永久挂死。
+
+该屏障的业务效果是压低各核进入 task 0 的启动偏斜。Claim 唯一性本身依赖
+atomicMax，不依赖屏障来保证正确性。
+
+`StartupBarrier` 位于 `OrchestrationReplay` 之前，当前没有完整父 span。它可以
+作为 Atomic 发生位置观察，但不能被塞进 WorkerCompletion 的加和公式。
+
+### 4.4 OrchestrationReplay：所有 worker 重放同一 PA 图
+
+`OrchestrationReplay` 从 `InitPaOrchestration` 之前开始，到最后一个 Submit
+返回并退出回放循环之后结束。它包含：
+
+1. 建立整轮共用的外部 tensor descriptor 和固定 create-info；
+2. 对每个 batch 读取 context length，并计算 block 数；
+3. 依次执行五个 compete-first Submit；
+4. 接收每个 Submit 返回的 output descriptor，更新后继 task 的输入；
+5. 执行 Submit 间的循环、view、分组和返回控制逻辑。
+
+所有 worker 都走这段代码，所以每核 `task_id` 都是连续的 `0..5B-1`，且
+`task_id % 5` 固定映射为 Alloc/QK/SF/PV/UP。
+
+### 4.5 FinalDrain：停止生产后清空在途任务
+
+回放结束并不保证本核 slot 已空。每个 worker 先增加共享 `replay_done`，然后
+循环执行 `DrainReady(FinalDrain)`，直到同时满足：
+
+- `replay_done` 表明所有 worker 都已退出 orchestration replay；
+- 当前 worker 的 `occupied_count == 0`。
+
+第一个条件保证不会再产生新 slot，第二个条件保证本核已经执行完自己拥有的
+旧 slot。循环若没有释放任何 slot就执行 spin hint，之后继续检查 fanin 和全局
+完成状态。
+
+standalone 没有 BlockWon，所以这里没有生产路径的 `has_pending_won()` 条件。
+这是与 `simpler` 主运行时的重要差异之一。
+
+### 4.6 DFXFinalize：发布证据，不再属于业务完成窗口
+
+FinalDrain 结束后，worker 才执行：
+
+- 延后写出 `OrchestrationReplay` 和 `FinalDrain` 两条父记录；
+- atomic 观察构建中记录两条 `ClockBaseline`；
+- flush 本核有效 trace 区；
+- 汇总计数、最大 slot 占用、TensorMap 状态等；
+- 把 `WorkerResult` 发布到独占的结果分区。
+
+父记录故意在被测区间之后写出，避免它们自己的 GM 写入落入任一父区间。
+`DFXFinalize` 当前没有完整父 span，因此 WorkerCompletion 闭合不等于整个 worker
+函数从入口到返回的闭合。
+
+## 5. 一次 Submit 的逐阶段业务语义
+
+### 5.1 `BeginCallbackSubmit`：建立本次提交身份
+
+每个 worker 都用自己的 `local_index++` 得到 task id，并把 context 绑定到：
+
+- 当前 `WorkerState`；
+- `task_id & payload_mask` 对应的私有 `TaskPayload`；
+- 空的 result、fanin、register mask 和 kernel id。
+
+这里不读取 `TaskArgs`。这是 Claim 能先于参数构造的前提，也是 Begin/Finish
+之间只能同步衔接、不能嵌套另一次 Submit 的协议约束。
+
+源码在 `BeginCallbackSubmit` 返回后才采集 `submit_begin`。所以这段 prologue
+属于 OrchestrationReplay，却不属于 raw `Submit` 父 span：首个 task 落在
+OrchestrationSetup，其余 task 落在 BetweenSubmitResidual。
+
+### 5.2 `EfDrain`：用本次 Submit 的前沿推进旧任务
+
+`EfDrain` 调用 `DrainReady` 扫描本 worker 的私有 slot。对于全部 fanin flag
+已 ready 的 slot，它会：
+
+1. 执行该 slot 对应的 winner workload；
+2. 记录 `Kernel`；
+3. 按 vend → flag → frontier 顺序完成任务；
+4. 记录零时长 `Commit`；
+5. 清空 slot 并降低 `occupied_count`。
+
+因此 task `N` 的 `EfDrain` 可能执行 task `N-1` 或更早的 kernel。按外层
+Submit 的 task kind 给其中 Kernel 归类会得到错误结论，必须使用 Kernel
+自己的 `task_id/function_id`。
+
+如果本核没有占用 slot，`EfDrain` 是快速空路径；如果有 ready slot，它可能
+包含完整 engine workload 和完成发布。
+
+### 5.3 `Claim`：决定谁负责本 task 的真实尾动作
+
+Claim 先根据 task kind 生成 active role，再选择四个 cursor shard 之一：
+
+- Alloc 使用 `alloc_cursor`；
+- QK/PV 使用 `cube_cursor`；
+- SF/UP 使用 `vector_cursor`。
+
+符合 role 的 worker 对 cursor 执行 `atomicMax(task_id)`。返回旧值小于当前
+task id 的唯一竞争者获胜；其他参与者是 attempted loser，不符合 role 的核是
+not-attempted loser。
+
+Claim 的输出包括：
+
+- `won`：是否是唯一 winner；
+- `attempted`：是否真正执行了 atomicMax；
+- `function_id`：winner 应构建的 QK/SF/PV/UP 负载类型。
+
+standalone 固定 task 都是单 lane；若 active mask 同时要求两条及以上 lane，
+Claim 会显式拒绝，因为本用例没有实现 BlockWon/joint 协议。
+
+### 5.4 eager 参数构造：所有 worker 构建相同参数
+
+Claim 返回后，同步 callback 才构造 `TaskArgs`：
+
+- Alloc 新建参数对象；
+- QK/SF/PV/UP 复用并 reset 同一个参数对象；
+- view、动态 create-info、tensor/scalar 参数都在 callback 中立即求值；
+- callback 和内部 thunk 不被保存，也不会跨 Submit 生命周期执行。
+
+winner 和 loser 都走完整构参路径。这保证所有 worker 的 descriptor、heap
+cursor 和私有 dependency map 按相同 task stream 演进；compete-first 只改变
+Claim 与构参的先后顺序，没有改成 winner-only lazy 构参。
+
+CCEC standalone 的 Begin/Finish 之间传递固定 16-byte ticket，finish 通过同一
+role-specific block-local state恢复 context，并校验 worker、task 顺序和 cookie。
+CPU/AscendC 复用相同业务函数，但不需要这条 CCEC split ABI。
+
+### 5.5 `Materialize`：把逻辑 Output 变成可引用 descriptor
+
+`MaterializeTask` 完成四件事：
+
+1. 扫描参数 tag，形成 `output_mask` 和 `register_mask`；
+2. 计算每个新 Output 的大小及 1 KiB 对齐后的总空间；
+3. 在单调逻辑 heap 上安排连续区间，跨物理 ring 尾时跳到下一圈；
+4. 在本 worker 的 task payload 中初始化 GM `TensorDesc`，写入
+   `owner_task_id`，并推进 `heap_next`。
+
+其输出是后继 orchestration 立即可引用的 descriptor，以及本 task 的
+`output_bytes`。它只分配和描述逻辑输出，不代表其中的数据已经由 kernel 写好。
+
+所有 worker 都执行 Materialize，包括 loser。这样后续回放可以在任何 worker
+上用同一个 task id 和 owner 拓扑继续构图。
+
+### 5.6 `PrepareMap`：退休不再参与依赖查询的历史写者
+
+`AdvanceTensorMap` 把本 worker 的 producer 存活下界推进到 `task_id - H`。
+超出窗口的 producer entry 会沿 task 链批量从地址 bucket 摘除，再放回 free
+list。
+
+其业务效果是限制依赖表的生命周期和容量，同时保留窗口内“同一 backing
+buffer、字节区间重叠、task id 最新”的 producer 查询语义。
+
+TensorMap 是 worker 私有结构，所以这个阶段不做跨核同步。它也不等价于 heap
+已经可复用；物理 heap 安全仍由共享 frontier/vend 的 `HeapGuard` 判断。
+
+### 5.7 `Fanin`：winner 建立执行前置条件
+
+只有非 Alloc winner 执行 `CollectFanin`。它对每个非纯 Output 参数：
+
+1. 读取 descriptor 的显式 `owner_task_id`；
+2. 对 Input/Inout 查询 TensorMap 中最新的重叠写者；
+3. 对两种来源得到的 producer task id 去重。
+
+最终 fanin 数组随 winner slot 保存。slot 执行前逐项读取共享 task flag，只要
+有一项未 ready，就保留该 slot 等待下次 drain。
+
+QK winner 即使最终 fanin 为 0，也会有一条真实 `Fanin` span；Alloc 不执行
+该阶段；所有 loser 都不收集 fanin。
+
+### 5.8 `Register`：更新后继任务看到的 hazard 版本
+
+Register 使用 Materialize 生成的 `register_mask`，把 Inout 或
+OutputExisting 登记为“由当前 task 写入”。
+
+当前固定图中：
+
+- Alloc 以 `include_existing=false` 调用，实际不插入；
+- QK/SF/PV 只有新 Output，register mask 为空；
+- UP 有四个 Inout，因此每个 worker 都插入四个 producer entry。
+
+Register 不是 winner-only。它维护的是每个 worker 自己的未来依赖视图，而不是
+宣告 kernel 已完成。
+
+### 5.9 winner 和 loser 的尾部分支
+
+非 Alloc winner 进入 `WinnerBuild`：
+
+1. 若两个普通 slot 已满，`WaitForSlot` 循环 drain 直到有空间；
+2. 对有新 Output 的任务运行 `HeapGuard`，避免覆盖仍存活的 ring 区间；
+3. 预留一个私有 slot；
+4. 把 active descriptor、scalar、dispatch context 和 fanin 快照复制进 slot。
+
+`WinnerBuild` 的产物是一个 `occupied && built` 的待执行 slot，不是已完成
+kernel。
+
+Alloc winner 进入 `AllocComplete`：它不创建 slot，在 `HeapGuard` 通过后直接
+发布 vend/flag/frontier，使本次逻辑分配成为已完成 producer。
+
+standalone loser 没有额外业务动作。它只走公共 Submit 收尾，因此不能为了让
+图看起来完整而虚构 `Replay` 或 `LoserReplay` phase；剩余后缀归入
+`SubmitResidual`。
+
+### 5.10 Submit 返回时已经保证了什么
+
+成功路径的 Submit 返回只保证：
+
+- 本 worker 已完成本 task 的 descriptor 和私有依赖状态更新；
+- 全局唯一 winner 已选出；
+- Alloc winner 已完成，或 kernel winner 已把任务构造成待执行 slot；
+- 后继 orchestration 拿到了可携带 owner 的输出 descriptor。
+
+它不保证：
+
+- QK/SF/PV/UP kernel 已执行；
+- 后继 task 的 fanin 已 ready；
+- 所有 worker 已完成同一 task 的 Submit；
+- heap 对更老逻辑区间已经可回收。
+
+## 6. 延迟执行、背压与完成协议
+
+### 6.1 `DrainReady` 有三个调用位置
+
+同一套 drain 逻辑会在三个位置推进任务：
+
+| 位置 | 触发原因 | 泳道父位置 |
+| ---- | -------- | ---------- |
+| `EfDrain` | 每次新 Submit 开头顺手推进旧任务 | 当前 Submit 的 `EfDrain` |
+| Ring backpressure | slot 满或 heap 暂不可复用 | `WinnerBuild`/`AllocComplete` 内部 |
+| `FinalDrain` | 所有 Submit 结束后清空尾部在途任务 | `FinalDrain` |
+
+所以一条 Kernel 必须按实际时间包含关系归入上述唯一父位置，不能假设所有
+Kernel 都在 EfDrain，也不能把 `Kernel` 再与已包含它的父 span相加。
+
+### 6.2 slot 容量为什么会形成背压
+
+每个 worker 只有两个普通可用 slot。如果 winner 连续产生任务，而旧 slot 因
+fanin 未 ready 尚未释放，`WaitForSlot` 会主动调用 `DrainReady`。只有本核占用
+数降到容量以下，新的 winner payload 才能入队。
+
+等待不是纯自旋：只要有依赖已满足的旧 slot，本核会执行其 kernel并推进全局
+完成状态。这保证 backpressure 路径本身也能帮助系统取得进展。
+
+### 6.3 heap ring 为什么还需要另一层保护
+
+slot 有空不代表输出 heap 可以安全覆盖。`heap_next` 是单调逻辑地址，真正落到
+256 MiB 物理 ring 时才取模。第一圈内不会覆盖旧区间；发生回绕后，
+`HeapGuard` 读取共享 frontier 和退休 task 的 vend，确保当前 live window 不
+超过一圈。
+
+若暂时不安全，`HeapGuard` 同样会 drain 本核 ready slot；若 frontier 已经追到
+当前 task 前仍无法满足容量，则发布 fatal，而不是静默覆盖数据。
+
+### 6.4 为什么 FinalDrain 是完整业务的一部分
+
+最后一个 Submit 返回时，最后几条 winner task 可能仍在 slot 中。若只统计首个
+Submit 到最后一个 Submit，就会漏掉这些 kernel、完成发布和跨核等待。
+
+因此完整的 per-worker 业务口径必须是：
 
 ```text
-T_global_submit
-    = max_i(last_submit_end(i)) - min_i(first_submit_start(i))
-```
-
-这是跨核墙钟包络。它的起点和终点可能属于不同物理核，不能用某个单核的
-阶段和，也不能用 96 核 core-work 之和解释。
-
-该样本的全局首末 Submit 包络为 6,088.433 us：起点来自 core 15，终点
-来自 core 74。若要对它做可加业务归因，需要依赖图和可跨核的关键路径模型；
-当前样本目录没有 `deps.json`，因此本文不声称已经得到全局关键路径分解。
-
-### 1.3 当前分析器的口径
-
-[分析脚本](../../../scripts/analyze_fdwic_swimlane_critical_path.py)
-当前使用所有事件的最早 start 和最晚 end 形成 `global_span`，并按 phase
-直接累计每条记录的 duration。
-
-这会同时遇到两个问题：
-
-- 分母是墙钟包络，分子可能是多核 aggregate core-work；
-- `Submit`、Kernel、Atomic 和 lap marker 存在父子或重叠关系。
-
-因此 `phase_rows()` 的结果适合观察各类事件规模，不是可加的时间预算。
-分析器已有 `SubmitChildren + SubmitExclusive = Submit` 的区间并集逻辑，
-但还没有构造 Submit 之外的顶层排他分区。
-
-脚本中的 `child_intervals_by_core_task` 实际使用十列 ABI 的第 0、2 列，
-即 `core_id` 和 `lane`，不是 `task_id`。当前行为等价于按同一 scalar lane
-做时间包含判断，这对排他墙钟是合理的：Submit 开头可能执行前序 task 的
-Kernel，不能因 task id 不同而漏减。但变量名容易误导，后续实现时应明确其
-lane-temporal 语义。
-
-## 2. 历史 schema-v3 阶段建议
-
-当时建议把时间事件分成“父区间、互斥子区间、Overlay”三种角色：
-
-```text
-WorkerObservedWindow（单核观察窗口）
-├─ StartupBarrier
-├─ WorkerCompletionWindow（业务完成窗口）
-│  ├─ OrchestrationReplay
-│  │  ├─ OrchestrationSetup
-│  │  ├─ SubmitRuntimeEnvelope × N
-│  │  │  ├─ EfDrain
-│  │  │  │  ├─ PreviousTaskKernel
-│  │  │  │  └─ DrainControl
-│  │  │  ├─ Materialize
-│  │  │  ├─ PrepareMap
-│  │  │  ├─ Claim
-│  │  │  ├─ Fanin
-│  │  │  ├─ Register
-│  │  │  └─ SubmitTail
-│  │  │     ├─ WinnerBuild
-│  │  │     ├─ LoserReplay
-│  │  │     └─ AllocComplete
-│  │  ├─ BetweenSubmitResidual × (N - 1)
-│  │  └─ OrchestrationTail
-│  └─ FinalDrain
-└─ DFXFinalize
-
-Overlay：Atomic、ClockBaseline、Commit、旧 Replay/Build/Alloc lap marker
-```
-
-这里严格沿用 1.2 节的口径：`WorkerCompletionWindow` 只包含
-`OrchestrationReplay + FinalDrain`；`StartupBarrier` 与 `DFXFinalize` 属于更外层
-的 `WorkerObservedWindow`，不能混进业务完成窗口。
-
-同一层的 sibling 必须互斥；父区间不能与子区间再次相加。Overlay 可以画在
-相同 lane 上，但不进入 stacked sum。
-
-### 2.1 顶层分区
-
-#### `StartupBarrier`
-
-业务边界是 worker 初始化完成后，到所有 worker 到达启动屏障。
-
-它包含：
-
-- `started_count` 到达计数；
-- 等待其他 worker；
-- fatal 检查和 watchdog。
-
-代码位于
-[core_main.h](../../../src/a5/runtime/fully_distributed_within_core/runtime/dist_engine/aicore/core_main.h)。
-如果主指标仍是“全局首个 Submit 到末个 Submit”，该阶段应排除；如果查看
-完整 worker 生命周期，则应单列。
-
-#### `OrchestrationReplay`
-
-它是每个 worker 重放整个 PA orchestration 的父区间，对应
-`dist_submit_replay_orch(runtime)` 的完整调用。
-
-业务内容包括：
-
-- CCEC orchestration 参数 invalidate 和本地复制；
-- PA tensor、shape、view 和参数对象构造；
-- 全部 Submit；
-- Submit 之间的 scalar 控制逻辑；
-- orchestration 返回前的尾部逻辑。
-
-当前代码只在调用前做 `TRACE_LAP_RESET`，没有记录该父区间。后续若补充
-边界，应覆盖 `dist_submit_replay_orch()` 的调用前后，而不是用首末 Submit
-近似整个 orchestration。
-
-#### `OrchestrationSetup`
-
-它是 `OrchestrationReplay.start` 到首个 Submit API 进入之间的排他部分。
-
-PA Case1 中主要包括：
-
-- 读取 batch、head、block 等 tensor metadata；
-- 构造外部 Tensor wrapper；
-- 创建循环不变量 `TensorCreateInfo`；
-- 进入 batch/q-loop 前的控制逻辑。
-
-当前 raw 没有 orchestration 父边界，所以它与 StartupBarrier 混合在
-`PreFirstSubmitResidual` 中，尚不能可靠分离。
-
-#### `BetweenSubmitResidual`
-
-当前可证明的定义是：
-
-> 同一物理 scalar lane 上，上一个 `Submit.end` 到下一个
-> `Submit.start` 之间的全部时间。
-
-PA Case1 中可能包括：
-
-- `TensorCreateInfo`、tensor view；
-- `L0TaskArgs::reset()` 和各类 `add_*()`；
-- 循环、索引、条件和 `std::min` 等 scalar 控制；
-- `TaskOutputTensors::get_ref()`；
-- `rt_submit_*` 包装层的 fatal 查询和 `MixedKernels` 构造；
-- 当前 Submit span 未覆盖的 prologue、epilogue 和返回开销；
-- Submit 结束记录的 DFX 写入开销。
-
-所以在没有更细边界前，应使用中性的 `BetweenSubmitResidual` 或
-`OrchestrationExclusive`，不能直接命名为“参数构造耗时”。
-
-PA orchestration 源码已有 `param_extract`、`create_info`、`tensor_view`、
-`param_setup`、`scope_and_loop` 等聚合分类，可参考
-[paged_attention_orch.cpp][pa-orch]。
-但该实现受 `ENABLE_PROFILING` 控制并读取 AICPU `cntvct_el0`，不能原样
-搬到 CCEC/AICore replay 路径。
-
-#### `OrchestrationTail`
-
-它是最后一个 Submit 返回后，到 `aicpu_orchestration_entry()` 返回之间的
-排他时间，包括循环退出、scope 退出和函数返回逻辑。
-
-当前 raw 没有 orchestration end 边界，因此它与 FinalDrain、
-ClockBaseline 混合在 `PostLastSubmitResidual` 中。
-
-#### `FinalDrain`
-
-它对应 `dist_submit_drain_to_completion()` 的完整调用。结束条件是：
-
-- 所有 worker 已完成 orchestration replay；
-- 本核 private ring 为空；
-- 没有待处理的 BlockWon lane。
-
-业务内容包括：
-
-- 继续导入和执行 ready task；
-- 等待 fanin、`replay_done` 和其他 worker；
-- 发布 completion flag 和 vend；
-- 推进 frontier；
-- 清理 joint task 状态。
-
-第一版只需要一个完整 `FinalDrain` 父 span，再用已有 Kernel 区间得到：
-
-```text
-FinalDrain = FinalDrainKernel + FinalDrainResidual
-```
-
-其中 `FinalDrainResidual` 仍是控制、完成发布和等待的混合时间。没有更细的
-互斥边界前，不能直接命名为“atomic wait”。
-
-#### `DFXFinalize`
-
-该分区包括 ClockBaseline、trace buffer flush 和 worker finish publication。
-它是观察系统自身的尾部，不属于 PA 调度业务时间。
-
-如果总口径是完整带插桩 worker wall，它必须单列；如果总口径是业务
-completion window，应显式排除。
-
-### 2.2 `SubmitRuntimeEnvelope` 的准确语义
-
-当前 `Submit` 不是完整 `rt_submit_*` API 时间。它的起点位于
-`ActiveMask`、joint 判断和 `dist_submit_begin()` 之后，终点是结束时间戳
-采样时刻，早于 trace record 真正写入和函数返回。
-
-因此建议把当前事件称为 `SubmitRuntimeEnvelope`：
-
-> 一次 orchestration submit 调用中，DistSubmitCtx 初始化完成后，runtime
-> frontend、机会式 progress 和可能的前序 Kernel 执行所形成的包络。
-
-它不仅是“把当前 task 放入队列”的时间。尤其是 Submit 开头的 `EfDrain`
-可能执行之前 task 的 Kernel。
-
-### 2.3 Submit 子分区
-
-| 分区 | 当前 task 归属 | 业务语义 |
-| --- | --- | --- |
-| `EfDrain` | 否/混合 | Submit 开头机会式推进已有任务，可能执行前序 Kernel |
-| `Materialize` | 是 | 计算输出布局、处理 heap ring、构造输出 Tensor、推进 `heap_next` |
-| `PrepareMap` | 是 | 按 task id 和窗口 `H` 清退 TensorMap 历史项 |
-| `Claim` | 是 | 判断 lane 资格并通过 cursor atomic 竞争唯一 winner |
-| `Fanin` | 是，winner-only | 从 owner 和 TensorMap 查找、去重依赖生产者 |
-| `Register` | 是 | 将 INOUT/OUTPUT_EXISTING 注册到 TensorMap |
-| `WinnerBuild` | 是，winner-only | 等待容量、申请 slot、复制 payload、发布 joint deposit |
-| `LoserReplay` | 否/混合 | loser 退出前再次机会式处理 BlockWon |
-| `AllocComplete` | 是，alloc winner | 检查 heap 并发布 allocation task 完成状态 |
-
-`EfDrain` 应继续分为：
-
-```text
-EfDrain = PreviousTaskKernel + DrainControl
-```
-
-Kernel 在时间层级上属于包含它的 EfDrain 或 FinalDrain，但在任务归因上必须
-保留 Kernel 自己的 task id，不能归给外层当前 Submit。
-
-### 2.4 当前 lap marker 的语义问题
-
-当前 `Build`、`Replay`、`Alloc` 使用 `TRACE_LAP`：
-
-- `Build` marker 写在 `dist_submit_build_winner_task()` 之前；
-- `Replay` marker 写在 loser 的 `drain_block_won()` 之前；
-- `Alloc` marker 写在 `dist_submit_complete_alloc()` 之后，但其起点仍是较早的
-  lap reset。
-
-因此它们是累计边界，不是对应动作的独占耗时，会覆盖 Materialize、Claim、
-Register 等已有阶段。它们必须作为历史 Overlay，不能进入加和分区。
-
-若后续实施，应让 `Build`、`Replay`、`Alloc` 分别围绕实际动作形成显式
-start/end span；这是 `SubmitResidual` 获得清晰业务语义的前提。
-
-### 2.5 非加和 Overlay
-
-以下事件应继续展示，但不得进入互斥时间预算：
-
-| Overlay | 原因 |
-| --- | --- |
-| `Atomic` direct | 嵌套在 Claim、EfDrain、completion 等业务阶段内 |
-| `Atomic` PollBatch | 是等待 episode 包络，可能包含交错的 direct atomic |
-| `ClockBaseline` | DFX 计时与返回依赖校准，不是业务阶段 |
-| `Commit` | 零时长 instant |
-| 旧 `Build/Replay/Alloc` | lap 累计区间，与显式阶段重叠 |
-
-Atomic 可用于调用次数、站点分布和局部等待诊断，但不能把其 duration 再加到
-父阶段上。
-
-## 3. 样本区间复算
-
-### 3.1 顶层闭合
-
-真实 A5 level-4 样本中，事件包络最长的 core 5 为 6,213.433 us。
-按当前可观测边界可严格分成：
-
-| 顶层分区 | 时间 |
-| --- | ---: |
-| `PreFirstSubmitResidual` | 97.498 us |
-| `SubmitRuntimeEnvelope` 并集 | 4,730.084 us |
-| `BetweenSubmitResidual` | 698.937 us |
-| `PostLastSubmitResidual` | 686.914 us |
-| 合计 | **6,213.433 us** |
-
-这里的闭合是数学事实，但前后 residual 尚没有纯业务语义：
-
-- `PreFirstSubmitResidual` 混合 StartupBarrier 和 OrchestrationSetup；
-- `PostLastSubmitResidual` 混合 OrchestrationTail、FinalDrain 和
-  ClockBaseline。
-
-这正是补 `OrchestrationReplay` 与 `FinalDrain` 外层边界的主要理由。
-
-### 3.2 Inter-submit 规模
-
-按每个物理核的首末 Submit 包络统计：
-
-| 角色 | `InterSubmitResidual` 中位数 | 占 Submit 包络中位比例 |
-| --- | ---: | ---: |
-| AIC，32 核 | 720.179 us | 13.18% |
-| AIV，64 核 | 907.114 us | 15.09% |
-
-因此 inter-submit 不是可以忽略的计时缝隙。优先补其排他口径，比继续增加
-Submit 内部重叠事件更能提高总时间覆盖率。
-
-### 3.3 Submit 内部排他分解
-
-对 core 5 的 4,730.084 us Submit 并集，暂时可以形成：
-
-| Submit 子分区 | 时间 |
-| --- | ---: |
-| `PreviousTaskKernel in EfDrain` | 550.853 us |
-| `EfDrainControl` | 722.489 us |
-| `Materialize` | 1,010.177 us |
-| `PrepareMap` | 206.058 us |
-| `Claim` | 656.820 us |
-| `Fanin` | 20.026 us |
-| `Register` | 274.385 us |
-| `SubmitResidual` | 1,289.276 us |
-| 合计 | **4,730.084 us** |
-
-`SubmitResidual` 当前混合：
-
-- 实际 WinnerBuild、LoserReplay、AllocComplete；
-- 子阶段之间未打点的条件和调用逻辑；
-- 子阶段结束记录写入等 DFX 开销；
-- 不在现有显式业务 span 中的 Atomic 时间。
-
-所以该数值能用于判断“还有多大未归因空间”，不能直接命名为某个业务热点。
-
-### 3.4 全核 phase sum 的解释边界
-
-样本中全核 `Submit` duration 总和约为 477.585 ms，而全局事件包络只有约
-6.215 ms。前者是 96 核并行执行形成的 aggregate core-work，后者是墙钟。
-
-因此分析器中的 all-core `span%` 可以超过 100%，这不是硬件时间异常，而是
-维度不一致。报告应分别展示：
-
-- global makespan；
-- AIC/AIV 每核排他分区的 median、p95、max；
-- aggregate core-work，并明确单位语义。
-
-三者不能放在同一加和柱中。
-
-## 4. 可行性分级与建议边界
-
-### 4.1 仅修改分析器：高可行性
-
-不增加设备插桩即可完成：
-
-- 按 core/lane 对 Submit 区间求并集；
-- 从首末 Submit 包络中取补集，生成 `BetweenSubmitResidual`；
-- 把 lap marker、Atomic、ClockBaseline、Commit 标为 Overlay；
-- 将 `SubmitExclusive` 改称 `SubmitResidual`；
-- 对每个父区间执行整数 cycle 闭合断言；
-- 分开报告 per-core、aggregate core-work 和 global makespan。
-
-这一层可以精确闭合已有边界，但不能把 residual 自动归因成具体业务动作。
-
-### 4.2 增加最小外层边界：中高可行性
-
-最有价值的新增边界只有：
-
-- `OrchestrationReplay`；
-- `FinalDrain`；
-- 可选的 `StartupBarrier` 和 `DFXFinalize`。
-
-它们每核每轮只需少量记录，远小于逐 Submit 或逐 Atomic 事件规模。若新增
-phase id 或改变既有 phase 语义，应同步更新 schema version、host 导出、
-converter、测试和文档，禁止让新旧 raw 静默混用。
-
-### 4.3 修正 Build/Replay/Alloc：中等可行性
-
-将三个 lap marker 替换为真实动作 span，不必增加同数量级的记录，但会改变
-阶段语义和指令布局。应先完成 schema/version 迁移，再对 A5Sim 和真实 A5 做
-相同观察模式的验证。
-
-### 4.4 细拆 orchestration residual：条件可行
-
-PA 源码已有一套聚合分类设计，可以复用其业务分类，不应再发明另一套名字。
-但其现有计时实现面向 AICPU，若要用于 CCEC/AICore，需要使用 FDWIC 已有
-cycle 读取路径，并评估每次 lap 对 I-cache、worker 到达和竞争时序的扰动。
-
-只有在补完顶层区间后，`OrchestrationExclusive` 仍是显著热点时，才值得增加
-这一级细分。
-
-## 5. 验收标准
-
-后续若实施，至少满足以下条件。
-
-### 5.1 语义验收
-
-- 每种事件明确标为 parent、exclusive child 或 Overlay；
-- 同一父区间下的 child 互斥；
-- Kernel 保留自身 task id，不因嵌套在另一个 Submit 而改归属；
-- residual 使用中性命名，不把补集直接解释成参数、atomic 或 I-cache 时间；
-- global makespan 与 per-core/core-work 指标分开。
-
-### 5.2 数学验收
-
-所有计算使用原始整数 cycle：
-
-```text
-sum(exclusive_children(parent)) == duration(parent)
-```
-
-如果存在截断或边界裁剪，误差上限必须显式定义，不能依赖浮点 us 舍入掩盖
-差值。还应验证：
-
-- exclusive duration 不为负；
-- Submit 区间在同一 core/lane 上不重叠；
-- Overlay 不进入加和；
-- 所有未归因时间只出现一次，并统一落入 residual。
-
-### 5.3 数据完整性验收
-
-- `dropped_records == 0`；
-- PA Case1 每核恰有 1280 个 Submit，task id 为 0 到 1279；
-- 96 核角色和物理 id 完整；
-- schema version 与 phase 语义匹配；
-- raw 到报告的记录数和关键汇总保持一致。
-
-### 5.4 性能与扰动验收
-
-- 新旧方案必须使用相同硬件、负载、构建布局和观察级别比较；
-- 分别报告带插桩的时间闭合质量与关闭诊断后的业务性能；
-- 不把 level-4 Atomic 样本与 phase-only 或 no-swimlane 样本直接相减；
-- 若新增插桩显著改变 Submit span、fanin 重试或 RingBp，应先处理观察扰动，
-  不能仅以“分区已经闭合”作为验收通过。
-
-## 6. standalone 实施进展（2026-07-19）
-
-### 6.1 已落地的最小 schema-v4
-
-当前实施严格限定在 `tests/atomic_probe/pa_scheduler` 独立目录，
-没有依赖 simpler runtime 源码或外部分析脚本。
-
-- 每个 worker 新增一条 `OrchestrationReplay` 和一条 `FinalDrain`
-  父 span，两者在原始 cycle 上首尾相接；
-- 旧 `Build/Replay/Alloc` lap 不再产生，改用围住实际动作的
-  `WinnerBuild/AllocComplete`；standalone loser 没有可单独计时的真实动作，
-  因此 producer 不生成 `LoserReplay` 记录，converter 也拒绝旧记录；
-- `EfDrain` 从历史 lap 改为明确 start/end span；
-- raw `trace_schema_version` 升为 4，phase-only level-1 与 atomic level-4
-  都携带 `fdwic_summary`，分析器可以独立验证 records 和
-  `dropped_records=0`；
-- `SubmitResidual` 和 `BetweenSubmitResidual` 由 converter/analyzer 根据已有
-  span 的补集离线生成，不增加设备记录、字段或 `SYS_CNT` 读取；
-- v4 merged 的 duration 事件只保留 Chrome Trace 必需的六个字段，业务语义
-  编码在稳定名称中，不再逐事件复制 `args` 和 `cat`。raw 仍是权威取数件，
-  merged 只负责可视化，排他统计只进入小型 analysis 报告；
-- schema-v4 禁止未使用的历史 `DrainWon`；每个 Kernel 必须唯一包含于
-  `EfDrain`、`WinnerBuild`、`AllocComplete` 或 `FinalDrain`，越界、多重归属和
-  孤儿 Kernel 都使该轮分析失败。
-- 除允许执行前序 task 的 Kernel 外，每个 exclusive child 的 task id 必须与
-  包含它的 Submit 一致。
-
-设备侧每 worker 固定新增 `OrchestrationReplay/FinalDrain` 两条父记录。
-默认 b256 全局只有 1,024 条 `WinnerBuild` 和 256 条
-`AllocComplete`；121,600 个 loser 不生成 tail。相对“每个 loser 一条
-`LoserReplay`”的过程态，phase 记录固定减少 121,600；总 raw 事件差
-还会受 Atomic/PollBatch 运行时次数影响。residual 只在离线产物中出现，
-不消耗 trace buffer。
-
-这里的 Kernel 门禁只证明它在时间上唯一落入上述四类支持的父区间；
-不再额外建立 `WinnerBuild ↔ Kernel ↔ Commit` 的
-`(core, task, function)` 身份链。完整 PA 协议正确性仍由 raw 导出前的 host
-`Validate()` 断言负责；排他分析器保持聚焦时间容器、整数闭合和丢记录门禁，
-不为了重复 host 已有的协议校验而继续膨胀记录或报告。
-
-### 6.2 排他分析器与闭合门禁
-
-`swimlane_exclusive_analyzer.py` 直接复用本目录 converter 的 raw/schema
-校验，用原始整数 cycle 完成：
-
-```text
-Submit = EfDrain + Claim + Materialize + PrepareMap + Fanin + Register
-       + WinnerBuild + AllocComplete + SubmitResidual
-
-SubmitEnvelope = SubmitUnion + BetweenSubmitResidual
-EfDrain = contained Kernel union + EfDrainControl
-
-OrchestrationReplay = Setup + Submit union + BetweenSubmitResidual + Tail
-FinalDrain = contained Kernel union + FinalDrainResidual
 WorkerCompletion = OrchestrationReplay + FinalDrain
 ```
 
-分析器不用 `max(0, residual)` 吞掉越界；子区间重叠、Kernel 穿越父边界、
-孤儿 Kernel、父 span 数量错误、逐核 task id 不连续、角色拓扑不全或 dropped
-非零都直接失败。报告分开输出 global Submit makespan、aggregate core-work 和 AIC/AIV
-每核分布，不再用 96 核累加值除以全局墙钟包络。
+这也是泳道 schema-v4 新增顶层父区间的根本原因。
 
-当前 compete-first eager 实现把 Claim 移到同步 callback 构参之前。
-callback 构参没有新增 raw 字段或设备记录，其耗时由现有
-`Claim.end -> Materialize.begin` 内部 residual 表达；这与
-submit-PMU 的 Claim/Materialize 边界保持同一业务顺序，同时不扩大 profiling raw。
+## 7. 泳道分区与“总耗时”口径
 
-`run.sh swimlane` 已串起三份产物，每个 writer 都在单件完成后再原子
-发布自己的文件；这是 raw → merged → exclusive report 的逐件流水线，
-不是三件整体的目录级事务：
+### 7.1 三种事件角色
 
-```text
-l2_swimlane_records.json
-merged_swimlane.json
-swimlane_exclusive_analysis.json
-```
+泳道事件必须先按角色分类，才能讨论加和：
 
-### 6.3 已完成的分级验证
+1. **父区间**：例如 `Submit`、`OrchestrationReplay`、`FinalDrain`；
+2. **排他子区间**：同一父区间内互不重叠，可与 residual 一起闭合父区间；
+3. **嵌套或 Overlay**：例如 Kernel、Atomic、RingBp、Commit、ClockBaseline，
+   用于定位，不得再次加到已经包含它的父区间。
 
-- Python 完整回归：PMU HTML、PMU sidecar、converter 和 exclusive analyzer
-  共 100 项全部通过；`git diff --check` 通过；
-- 历史 schema-v3 真机百万行样本：967,307 条事件通过，
-  Submit、EfDrain 和 Submit envelope 均精确闭合，全局 Submit makespan
-  为 5,774,295 cycle；
-- 删除 loser 标记后的 CCEC A5 b256 规模门禁：845,813 条 raw 事件、零丢记录，
-  全局 Submit makespan 为 5,326.055 us，六组闭合全部通过。raw 为
-  56,212,672 bytes；旧 merged 为 248,767,986 bytes；同一 raw 经当前瘦身
-  converter 得到 138,349,686 bytes，减少 44.4%，且不改变设备采集。
-  该轮早于最终相邻边界复用，只作规模/容量证据；
-- 当前边界迭代只跑 CCEC A5 b1。最新一轮为 4,118 条 raw 事件、零丢记录，
-  全局 Submit makespan 为 89.313 us，六组闭合全部通过；当前 converter 直接
-  生成的 merged 为 428,455 bytes。
+“把所有 duration 再求和一次”会同时重复计算父子事件、多核并行时间和 Atomic
+重叠观察窗口，因此没有明确的业务意义。
 
-当前可直接使用的产物：
+### 7.2 schema-v4 的严格层级
 
 ```text
-outputs/pa_scheduler_swimlane_20260719_103435_542368/ccec/l2_swimlane_records.json
-outputs/pa_scheduler_swimlane_20260719_103435_542368/ccec/merged_swimlane_thin.json
-outputs/pa_scheduler_swimlane_20260719_103435_542368/ccec/swimlane_exclusive_analysis.json
-outputs/pa_scheduler_swimlane_20260719_110756_584549/ccec/
+WorkerCompletion                         离线派生的每核业务父口径
+├─ OrchestrationReplay                   raw 父 span
+│  ├─ OrchestrationSetup                 父起点到首个 Submit
+│  ├─ SubmitUnion                        本核全部 Submit 的并集
+│  │  └─ 每个 Submit
+│  │     ├─ EfDrain
+│  │     ├─ Claim
+│  │     ├─ Materialize
+│  │     ├─ PrepareMap
+│  │     ├─ Fanin（条件存在）
+│  │     ├─ Register
+│  │     ├─ WinnerBuild/AllocComplete（winner 条件存在）
+│  │     ├─ SubmitInternalResidual（merged: submit_residual）
+│  │     └─ SubmitTailResidual（merged: submit_tail_gap）
+│  ├─ BetweenSubmitResidual              相邻 Submit 之间的精确空白
+│  └─ OrchestrationTail                  最后 Submit 到父终点
+└─ FinalDrain                            raw 父 span
+   ├─ KernelUnion
+   └─ FinalDrainResidual
+
+嵌套定位：Kernel、RingBp
+非加和 Overlay：Atomic、ClockBaseline、Commit 等
 ```
 
-早期 CPU/CCEC/AscendC b1 及 CCEC b256 schema-v4 过程态样本曾用于建立
-父区间和闭合门禁，但 raw 仍含 `LoserReplay`；当前 converter 会直接
-拒绝它们。上述无 loser 的规模门禁和最新 b1 证明当前 standalone
-的 schema-v4 数据完整性、语义和数学闭合成立；
-它仍不是完整 PA Case1 依赖图的性能结论。插桩扰动还需用相同 level-4
-观察口径解释，不用单轮差值宣称性能改善。含
-`LoserReplay` 的历史过程态曾在相同 level-4 配置连续跑三轮 b256：
+其中 `EfDrain` 还能严格分成：
 
 ```text
-5785.939 / 5503.109 / 5381.844 us，中位数 5503.109 us
+EfDrain = EfDrain.KernelUnion + EfDrainControl
 ```
 
-过程态的完整 raw + merged + exclusive 导出轮为 5680.749 us；历史
-schema-v3 同负载 level-4 导出轮为 5774.295 us，二者单轮差为
-93.546 us（v4 约低 1.62%）。这个差值显著小于 v4 自身三轮的
-404.095 us 极差，所以只能作为历史观察扰动证据，不能外推为
-当前最终边界版本的性能改善或不回退结论。
+`WinnerBuild` 或 `AllocComplete` 内若发生背压 drain，也可能包含 Kernel。当前
+排他报告会验证 Kernel 的唯一父位置，但不能把这些 Kernel 额外加到 Submit 上。
 
-### 6.4 compete-first 前历史快照：residual 的当时收敛状态
+### 7.3 每核可以严格闭合的公式
 
-> 本节至 6.11 的数值、布局图与“当前源码”表述，都是
-> compete-first eager 移植前的历史快照。它们保留作为边界收敛与
-> 旧样本的取证记录，不得用来解释移植后的阶段顺序或绝对耗时。
-> 移植后的权威布局与实测数据见 6.12。
-
-设备端不为 residual 增加记录。converter 与 analyzer 分别从同一
-raw 独立求补集：前者在 Perfetto 中以 `submit_residual` 表示 Submit
-内部 child-to-child gap，以等长名称 `submit_tail_gap` 表示最后一个
-child 到 `SubmitEnd` 的尾段，并绘制 `between_submit_residual`；后者不读
-merged，分别汇总 `submit_internal_residual`、`submit_tail_residual` 和
-`between_submit_residual`，直接按“前一边界 → 后一边界”校验闭合，避免
-给每个 gap 增加属性。
-
-边界迭代复用已有相邻 phase 的 end 作为后继 begin：`EfDrain → Materialize
-→ PrepareMap`，以及按分支连接 `Claim/Fanin/Register/WinnerBuild/
-AllocComplete`。这不会新增时间戳，并使最新 b1 的全部 child-to-child gap
-归零。该轮 Submit aggregate core-work 为 2,241,892 cycle，其中
-`submit_internal_residual=0`；最后一个真实 child 到 `SubmitEnd` 的
-`submit_tail_residual` 为 184,788 cycle，占 8.2425%：
+所有计算先使用 raw 整数 tick，闭合后才按 metadata 中的频率换算时间：
 
 ```text
-Register → SubmitEnd       155,827 cycle / 380 次 loser
-Claim → SubmitEnd           27,305 cycle / 95 次 Alloc loser
-WinnerBuild → SubmitEnd      1,430 cycle / 4 次 winner
-AllocComplete → SubmitEnd      226 cycle / 1 次 Alloc winner
+Submit
+  = EfDrain + Claim + Materialize + PrepareMap
+  + optional(Fanin) + Register
+  + optional(WinnerBuild or AllocComplete)
+  + SubmitInternalResidual + SubmitTailResidual
+
+SubmitEnvelope
+  = SubmitUnion + BetweenSubmitResidual
+
+OrchestrationReplay
+  = OrchestrationSetup + SubmitUnion
+  + BetweenSubmitResidual + OrchestrationTail
+
+FinalDrain
+  = FinalDrain.KernelUnion + FinalDrainResidual
+
+WorkerCompletion
+  = OrchestrationReplay + FinalDrain
 ```
 
-这些尾段主要包含最后一条 phase 记录发布、分支收束、`submits++` 和读取
-`SubmitEnd`。当前不把它伪装成 loser 业务阶段。同轮 Submit 间 residual 为
-155,679 cycle，占逐核首末 Submit 包络的 6.493%；它明确覆盖上一个 Submit
-尾记录发布、`AcceptTaskOutputs()`、下一个 `Build*Args()` 以及调用衔接。
-
-后续边界迭代默认只跑 A5 b1；b256 仅在阶段性规模/容量收口或明确要求时运行，
-避免用大样本反复验证纯结构改动。
-
-2026-07-19 按明确要求完成一次当前生产者的 CCEC b256 规模复核：
+exclusive JSON 为兼容聚合口径，仍把两者之和记作 `submit_residual`：
 
 ```text
-outputs/pa_scheduler_swimlane_20260719_114815_617346/ccec/
+submit_residual
+  = submit_internal_residual + submit_tail_residual
 ```
-
-该轮使用 `real-compute/6,28,4,1`，全局 Submit 为 5,360.061 us；raw
-839,526 条、`dropped=0`，merged 1,085,191 条事件。raw/merged 分别为
-55,791,947/88,775,668 bytes，所有语义断言和六类整数闭合通过。
-Submit aggregate core-work 为 433,383,588 cycle：内部 residual 仍为 0，
-尾部 residual 为 41,008,786 cycle（9.4625%）；逐核首末 Submit 包络为
-500,448,909 cycle，Submit 间 residual 为 67,065,321 cycle（13.4010%）。
-Perfetto 中恰有 122,880 条 `submit_tail_gap` 和 122,784 条
-`between_submit_residual`，分别对应 `96*1280` 个 Submit 尾段和
-`96*(1280-1)` 个相邻 Submit 间段；重分类未增加设备记录或逐事件字段。
-
-### 6.5 第一项真实消减：winner 冷路布局
-
-对基线优化后 IR 的核对表明，Alloc loser 在 Claim 记录发布后要跨过约
-2,200 个 IR 编号的 winner 重块，其他四类 loser 在 Register 记录发布后要
-跨过约 3,300 个 IR 编号的 winner 重块，才能进入公共 Submit 尾部。两个分支
-原先都没有概率信息，而每个 task 实际只有 1/96 worker 为 winner。B256 基线
-中 121,600 次 loser 占尾部 cycle 的 99.62%，因此先做只改变基本块布局的
-单变量实验：在 Alloc 和非 Alloc 的两个重型 winner 分支上使用
-`__builtin_expect(winner, 0)`。该改动不移动时间边界，不增删记录，也不改变
-Claim、完成发布、失败返回或 winner 计算语义。
-
-CCEC 产物的 `.text` 由 AIC/AIV 的 `0x5d708/0x5ec38` 增至
-`0x5eb18/0x5fc38`，分别增加 5,136/4,096 bytes。这个体积代价不能忽略；
-后续若继续叠加布局改动，必须同时检查代码尺寸和 Submit PMU 的 I-cache 指标。
-
-B1 采用“基线重编译三轮 → 候选重编译三轮”的复测，所有轮次均保持 96 核、
-每核 5 Submit、`dropped=0`、phase/atomic 记录闭合和两类整数闭合：
-
-| 口径 | 基线三轮 | 候选三轮 | 中位数变化 |
-| --- | --- | --- | --- |
-| `submit_tail_residual` | 193,292 / 184,214 / 191,029 cycles | 124,758 / 121,064 / 117,931 cycles | 191,029 → 121,064，-36.63% |
-| `submit_envelope` | 2,426,417 / 2,289,891 / 2,540,203 cycles | 2,273,874 / 2,251,771 / 2,322,538 cycles | 2,426,417 → 2,273,874，-6.29% |
-
-尾部变化集中在高频 loser：Register→SubmitEnd 的单次均值由约
-405～422 cycles 降至 251～268 cycles，Claim→SubmitEnd 由约 304～361
-cycles 降至 173～286 cycles。低频 winner 的 WinnerBuild/AllocComplete 尾部
-变长，但 B1 每轮仅有 4/1 次，未抵消 loser 收益。
-
-阶段性 B256 规模门禁使用：
-
-```text
-outputs/pa_scheduler_swimlane_20260719_123520_660296/ccec/
-```
-
-与 6.4 节基线相比：
-
-| 指标 | 基线 | winner 冷路布局 | 变化 |
-| --- | ---: | ---: | ---: |
-| 全局首末 Submit | 5,360.061 us | 5,278.401 us | -81.660 us，-1.52% |
-| Submit 尾部 residual | 41,008,786 | 27,155,661 cycles | -33.78% |
-| Submit union | 433,383,588 | 414,313,448 cycles | -4.40% |
-| Submit 间 residual | 67,065,321 | 69,022,235 cycles | +2.92% |
-| Submit envelope | 500,448,909 | 483,335,683 cycles | -3.42% |
-
-因此尾部下降没有被等量搬到 Submit 间：即使计入间隙，逐核完整 Submit 区间
-仍净减 17,113,226 cycles。候选 raw 为 839,465 条、`dropped=0`，所有语义
-断言和整数闭合通过；raw/merged 分别为 55,787,614/88,758,522 bytes，未因
-该优化增加观察数据量。
-
-关闭泳道记录后又做了候选—基线—候选的 ABA 验证，每组 5 轮：候选两组
-中位数分别为 3.665017/3.715385 ms，夹在中间的基线为 3.988115 ms，候选
-分别快 8.10%/6.84%。这说明收益并非只存在于 trace 发布路径。墙钟仍受
-frontier helping、kernel 长尾和 winner 分布影响，因此后续迭代继续以原始
-逐核 cycle 闭合作为主证据，以关闭泳道的 Submit span 作为实际性能门禁。
-
-### 6.6 同步真实 PA：恢复 atomic 观测接入后的布局回退
-
-standalone 的两处低概率 winner 分支严格映射到真实
-`submit_runtime.h` 的 kernel BuildWinner 和 AllocComplete 分支。winner-only
-Fanin 分支保持不动；真实 kernel loser 仍执行既有 Replay lap 和
-`drain_block_won()`。补丁只把这两处改为
-`__builtin_expect(is_winner, 0)`，没有增删 trace/atomic 调用，也没有移动
-Submit 或子阶段边界。
-
-正式 A/B 使用真实 A5 Case1、256 batch、level-1 phase 泳道和当前 CANN 9.1。
-首先重建当前源码的 host/AICPU/AICore runtime；早先 7 月 17 日的通用 runtime
-缓存无法解释当前新增 phase 枚举，曾产生一轮只有 `Kernel/Alloc` 名称的无效 raw，
-该轮已排除。有效样本均满足 96 核、每核 1,280 Submit、全局 122,880 Submit，
-固定 phase 数量与 task id 连续性全部通过。正式轮次对称关闭 case 结束后的 merged
-转换，只省去离线 221 MB 可视化文件，不改变设备采集；基线和候选各另留一轮完整
-merged warmup。
-
-| 构建 | warmup | 正式三轮首末 Submit | 中位数 |
-| --- | ---: | --- | ---: |
-| 当前 atomic 观测版基线 | 5.621733 ms | 5.774073 / 5.596633 / 5.631038 ms | 5.631038 ms |
-| 两处 winner 冷路布局 | 5.171619 ms | 5.165473 / 5.198404 / 5.192087 ms | 5.192087 ms |
-
-当前源码内的相对下降为 0.438951 ms，即 7.80%。逐核 Submit span 中位数也由
-5.530236 ms 降为 5.094550 ms，说明变化不是单个全局长尾造成。三个指标分别取
-三轮中位数时，Submit 累计由 439,990,736 降为 403,166,351 cycles，Submit 间
-累计由 81,293,671 降为 76,481,692 cycles，逐核首末 Submit 区间累计由
-520,995,184 降为 479,761,953 cycles；每一轮内部都满足
-`Submit + between = envelope` 整数闭合，不能把三个独立中位数再次相加。
-
-收益主要落在 AIV loser：AIC/AIV loser 单次均值的三轮中位数分别由
-2,864.829/3,558.067 降为 2,839.587/3,261.205 cycles。按 task 类型，QK/SF/PV/UP
-loser 分别下降约 289/306/376/194 cycles，Alloc loser 则增加约 128 cycles；
-高频路径的净收益覆盖了低频路径回退。
-
-这项结果必须放回历史基线解释。7 月 17 日 pre-atomic 三轮中位数为
-5.115620 ms；当前候选 5.192087 ms 仍慢约 1.49%，因此本节是**恢复观测接入后的
-布局回退**，不是在旧 5.1 ms 上新增 7.8% 收益。编译产物提供了对应证据：
-
-| 产物 | pre-atomic 缓存 | 当前基线 | winner 冷路布局 |
-| --- | ---: | ---: | ---: |
-| AIC `dist_engine .text` | `0x13bb8` | `0x54ce0` | `0x54d90` |
-| AIV `dist_engine .text` | `0x13c10` | `0x56e80` | `0x572f8` |
-| 最终 PA ELF `.text` | `0x3e518` | `0xb6b50` | `0xb7050` |
-| AIC/AIV `dist_submit_impl` | 42,136 / 42,152 B | 100,724 / 102,588 B | 100,860 / 103,676 B |
-
-level 1 的 raw 没有 Atomic 或 ClockBaseline 记录，说明本轮约 0.44 ms 回退不是
-atomic 落盘或逐 atomic 时间戳的直接成本。但同一 ELF 必须允许运行时切到 level 4，
-完整 atomic 慢路仍被编译并大量内联；level 1 只走
-`g_fdwic_swimlane_level < 4` 快速返回。两条概率提示在不删除观察能力的情况下恢复
-大部分性能，结合 AIV loser 的变化，当前证据最支持“诊断代码膨胀后热控制流布局/
-取指恶化”为主要原因。尚余约 1.5% 历史差值，继续按单变量方式优化 level-4 冷路；
-专门采 I-cache miss 的诊断构建则应整体编译去除泳道与 atomic，避免观察代码污染
-待测 ELF。
-
-权威样本为：
-
-```text
-基线：outputs/TestPagedAttentionUnroll_Case1_20260719_130443/
-      outputs/TestPagedAttentionUnroll_Case1_20260719_130608/
-      outputs/TestPagedAttentionUnroll_Case1_20260719_130728/
-候选：outputs/TestPagedAttentionUnroll_Case1_20260719_131319/
-      outputs/TestPagedAttentionUnroll_Case1_20260719_131435/
-      outputs/TestPagedAttentionUnroll_Case1_20260719_131551/
-完整候选泳道：outputs/TestPagedAttentionUnroll_Case1_20260719_131116/merged_swimlane.json
-```
-
-### 6.7 外提 level-4 atomic 冷代码，消除 level-1 取指回退
-
-对象审计确认，atomic 接入后不只是五类 wrapper 被内联：每个普通 phase/lap
-边界还展开了 `fdwic_atomic_poll_boundary_at()` 的十类 PollBatch 遍历与记录写入。
-level 1 虽然在运行时快速返回，这些冷代码仍被复制进 Submit、Alloc、Materialize、
-Heap wait、drain 等函数，造成上一节记录的数倍 `.text` 膨胀。
-
-按单变量顺序做了两步外提，均不增加设备记录或字段：
-
-1. `fdwic_swimlane_detail_record_atomic()` 设为设备端 `noinline`。Atomic 的
-   `begin -> 指令 -> end` 仍留在原 wrapper，只有 `end` 之后的 GM 记录发布共享；
-   level 1 不调用它。AIC/AIV `.text` 由 347,536/357,112 B 降为
-   319,384/328,656 B，`dist_submit_impl` 由 100,860/103,676 B 降为
-   93,144/95,756 B。真实 A5 三轮为 5.461806/5.077269/5.096506 ms，
-   中位数 5.096506 ms，较 6.6 节候选下降 1.84%。
-2. `fdwic_atomic_poll_boundary_at()` 保留原内联快速门，只把已确认
-   `level >= 4 && active_mask != 0` 后的十类遍历外提到
-   `fdwic_atomic_poll_boundary_slow()`。因此 level 1 仍只执行原有条件判断，
-   不新增 call/ret；level 4 的 `end_cycle` 仍在调用前取得，PollBatch 时间边界
-   不包含记录发布。AIC/AIV `.text` 进一步降为 66,768/67,120 B，
-   `dist_submit_impl` 降为 18,812/18,872 B，实际 PA ELF `.text` 为
-   178,768 B。
-
-第二步的 level-1 暖测为 4.816453 ms；正式三轮为：
-
-| 样本 | 首末 Submit | Submit 数 | 结果 |
-| --- | ---: | ---: | --- |
-| `135241` | 4.821897 ms | 122,880 | PASS |
-| `135340` | 4.890447 ms | 122,880 | PASS |
-| `135435` | 4.752956 ms | 122,880 | PASS |
-
-三轮中位数 4.821897 ms，较两处 winner 冷路的 5.192087 ms 再下降 7.13%，
-较历史 pre-atomic 5.115620 ms 低 5.74%。每轮均为 96 核，固定 phase 数量、
-逐核 Submit 数和 task id 连续性通过；没有 Atomic/ClockBaseline level-4 记录混入
-level-1 结果。该收益来自减少冷诊断代码复制后形成的目标代码与布局变化，不能在
-没有 PMU 取证时进一步写成某个确定的 I-cache miss 数值。
-
-保留完整 atomic 能力的 level-4 真机门禁位于：
-
-```text
-outputs/TestPagedAttentionUnroll_Case1_20260719_135629/
-```
-
-该轮 971,044 条记录、107,608 条 Atomic、115,309 次 atomic 调用、8,056 次
-批处理轮询和 355 条 PollBatch，严格满足
-`107608 = 115309 - 8056 + 355`；96 核各有两条 ClockBaseline，
-`dropped_records=0`。生产 converter 对全部 site/op、`result_used`、
-`return_ready`、PollBatch flags 和 metadata/raw 计数完成逐条校验并通过。
-
-结论是：此前主要回退属于可消除的编译期复制与热路布局成本，不是开启普通泳道
-后必须支付的 atomic 落盘成本。专门分析 I-cache miss 时仍应使用独立
-`submit-pmu` 构建，把普通泳道和 atomic 泳道整体编译去除；这样测到的是调度源码
-本身，而不是本节虽已降温、但仍存在于 ELF 的诊断代码。
-
-### 6.8 schema-v4 权威完整性样本的布局
-
-本节冻结 schema-v4 的布局、边界归属与整数闭合，作为后续瓶颈
-取证的共同参照。性能优化在这些语义解释清楚之前暂停。权威
-完整性输入为：
-
-```text
-outputs/pa_scheduler_swimlane_20260719_123520_660296/ccec/
-    l2_swimlane_records.json
-    merged_swimlane.json
-    swimlane_exclusive_analysis.json
-```
-
-该轮为 CCEC A5、`real-compute/6,28,4,1`、256 batch：
-
-- schema v4，32 个 AIC 与 64 个 AIV；
-- 每核 1,280 个 Submit，共 122,880 个；
-- raw 共 839,465 条记录，`dropped_records=0`；
-- 本机 profiler 元数据报告 HWTS/SYS_CNT 时间戳域为 1000 MHz，
-  因此本文将泳道 `start/end` 的单段差值按 1 ns/tick 解释；
-  这不是 AIC/AIV 的执行频率。PMU cycle 域经本机同窗比值约为
-  1.65 GHz（ALL/AIC/AIV 分别为 1.649844/1.650062/1.649731 cycles/ns）；
-- 全局首个 Submit 开始到最后一个 Submit 结束为 5.278401 ms；
-- 下文的 aggregate core-work 是 96 核各自时间的总和，不是 5.278401 ms
-  墙钟的切片。
-
-该 raw 产生于 12:35，早于 12:55 提交的 standalone winner 冷分支
-布局提示。后者不改变 span 边界、事件数和闭合公式，因此本节仍是
-语义与完整性的权威样本；但本节的绝对时间不冒充当前源码性能。
-当前工作树重编后的两轮 B256 分布见 6.10.6。
-
-该样本的实际布局如下，当前源码仍使用同一套边界。
-`WorkerCompletion`、`OrchestrationSetup`、
-`SubmitTransition`、`SubmitFinalize` 和父区间内的 Kernel 补集均由已有边界
-离线推导，不增加设备字段、记录或 `SYS_CNT` 读取：
-
-```text
-StartupBarrier                                      窗口前；无完整父边界，未量化
-
-WorkerCompletion                                   离线推导
-├─ OrchestrationReplay                             每核 1 条 raw 父区间
-│  ├─ OrchestrationSetup                           初始化/首批 Alloc 构参 → 首个 Submit.start
-│  ├─ Submit × 1280/core
-│  │  ├─ EfDrain
-│  │  │  ├─ Kernel                                 嵌套，不重复相加
-│  │  │  └─ DrainReady 的 scalar 控制/完成发布
-│  │  ├─ Materialize
-│  │  ├─ PrepareMap
-│  │  ├─ Alloc 路径：Register → Claim → AllocComplete（条件执行）
-│  │  ├─ 非 Alloc：Claim → Fanin（条件执行）→ Register
-│  │  │                         → WinnerBuild（条件执行）
-│  │  └─ SubmitFinalize                            最后 child.end → Submit.end
-│  ├─ SubmitTransition × 1279/core                 相邻 Submit.end → start
-│  └─ OrchestrationTail                            最后 Submit.end → 父区间结束
-└─ FinalDrain                                      每核 1 条 raw 父区间
-   ├─ Kernel                                       嵌套，不重复相加
-   └─ FinalDrainControlWait                        Kernel 之外的控制/同步/清空
-
-DFXFinalize                                        窗口后；无完整父边界，未量化
-Atomic / RingBp / ClockBaseline / Commit           Overlay，不进入加和
-```
-
-当前可视化和分析 JSON 尚保留原字段名：Perfetto 中的 `submit_tail_gap` 对应
-本文 `SubmitFinalize`，`between_submit_residual` 对应
-`SubmitTransition.<前一类→后一类>`；分析 JSON 中分别为
-`submit_tail_residual` 和 `between_submit_residual`。本文给出的是由现有边界
-可证明的显示语义，不代表新增了一类设备记录。
-
-顶层 aggregate core-work 严格闭合为：
-
-| 当前区域 | aggregate core-ns | 占 WorkerCompletion | 次数 | 每次/每核平均 |
-| --- | ---: | ---: | ---: | ---: |
-| OrchestrationSetup | 133,971 | 0.0264% | 96 | 1.396 us/核 |
-| Submit 内部并集 | 414,313,448 | 81.5424% | 122,880 | 3.372 us/次 |
-| SubmitTransition | 69,022,235 | 13.5845% | 122,784 | 562.1 ns/次 |
-| OrchestrationTail | 53,303 | 0.0105% | 96 | 555.2 ns/核 |
-| FinalDrain | 24,572,973 | 4.8363% | 96 | 255.968 us/核 |
-| **WorkerCompletion** | **508,095,930** | **100%** | 96 | 5.293 ms/核 |
 
 其中：
 
+- Submit 前缀及相邻 child 之间的 internal residual；
+- 最后一个 child 到 Submit.end 的 tail residual。
+
+residual 是“当前边界尚未单列的真实时间”，不是一个可以随意命名的业务函数。
+
+### 7.4 打点边界与 record 发布归属
+
+raw span 记录的是两个时间戳的差，不等于同名 helper 的无扰动净耗时。当前实现
+有意复用相邻边界以保证整数闭合，但 `WriteTrace` 本身发生在边界取时之后：
+
+| 区间 | start 边界 | end 边界 | 紧邻的观测归属 |
+| ---- | ---------- | -------- | -------------- |
+| `Submit` | `BeginCallbackSubmit` 之后 | 公共计数之后、发布父 record 之前 | prologue 在父外；父 record 写入下一段 gap |
+| `EfDrain` | 与 Submit.start 相同 | `DrainReady` 返回后 | 自己的 record 写入落入后续 Claim 观察区 |
+| `Claim` | 复用 EfDrain.end | atomicMax/role 路由完成后 | Claim record 和 eager 构参位于随后 residual |
+| `Materialize` | callback 完成、进入 Finish 后 | `MaterializeTask` 返回后 | 自己的 record 写入落入 PrepareMap 观察区 |
+| `PrepareMap` | 复用 Materialize.end | `AdvanceTensorMap` 返回后 | record 写入落入 Fanin 或 Register 观察区 |
+| `Fanin`/`Register` | 复用前一业务边界 | 对应 helper 返回后 | record 写入落入下一 child 或 tail residual |
+| winner tail | 复用 Register.end | build/complete 返回后 | tail record 写入落入 Submit tail residual |
+
+`OrchestrationReplay.end` 同时复用为 `FinalDrain.start`，两条父 record 都在
+FinalDrain 结束后才发布，因此父记录写入不属于任一业务父区间。
+
+这种布局的优点是父子区间可以无浮点误差地闭合；代价是阶段值应解释为“当前
+源码边界下的观察区”，不能直接当成单个 helper 的纯函数耗时。若将来调整 mark，
+必须同时验证业务边界、record 写入归属、闭合关系和插桩扰动，不能只移动标签。
+
+### 7.5 三个 merged residual span 的具体业务内容
+
+`between_submit_residual`、`submit_residual` 和 `submit_tail_gap` 都由
+`swimlane_converter.py` 对 schema-v4 的现有父子区间取补集生成。设备端不写
+这三个 phase，converter 也不增加新时间：三类 span 只是把原来未命名的区间按
+位置显示出来。
+
+converter 只为 `end > start` 的正区间生成 Perfetto X event；若两个边界相等，
+该段数学贡献为 0，merged 中不会出现一条零时长 residual。
+
+exclusive analyzer 使用的名称略有不同：
+
+- merged `submit_residual` 对应 `submit_internal_residual`；
+- merged `submit_tail_gap` 对应 `submit_tail_residual`；
+- `between_submit_residual` 在两份产物中同名。
+
+#### 7.5.1 `between_submit_residual`：两个 Submit 父区间之间
+
+精确边界是同一物理 scalar lane 上：
+
+```text
+previous Submit.end → next Submit.start
+```
+
+当前 standalone 成功路径中的公共动作顺序是：
+
+```text
+previous Submit.end
+  ├─ 写 previous Submit 的 TraceRecord
+  ├─ 检查它是否为本核最后一个 task，并从 Finish 返回
+  ├─ 回到 batch orchestration，处理前一 task 的返回结果/循环控制
+  ├─ 调用下一个 SubmitCallbackTask
+  ├─ BeginCallbackSubmit：local_index++、绑定 payload、清 context
+  └─ 读取 next Submit.start
+```
+
+`BeginCallbackSubmit` 明确在 `Submit.start` 之前，因此属于这个 gap，而不是下一
+个 Submit。下一 Submit 的 EfDrain、Claim 和 eager 构参都在 `Submit.start`
+之后，不属于 `between_submit_residual`。
+
+五种 transition 的业务内容并不相同：
+
+- **Alloc → QK**：保存 accumulated output/sum/max 三个返回 descriptor；执行
+  `PreparePaBlockGroup(0)`，计算当前 group 的 block offset、block 数和末 block
+  有效长度；然后进入 QK Submit prologue。
+- **QK → SF**：保存 QK score descriptor，然后进入 SF Submit prologue。
+  SF 的动态 probability create-info 和完整参数列表仍在下一 Submit 的
+  Claim 后构造，不在这个 gap。
+- **SF → PV**：保存 probability、max、sum 三个 descriptor，然后进入 PV
+  Submit prologue。
+- **PV → UP**：保存 PV output descriptor，然后进入 UP Submit prologue。
+  first/last scalar 和 output view 也在 UP Submit 内的 eager callback 构造。
+- **UP → 下一 batch 的 Alloc**：UP 没有新 Output 需要 Accept；代码退出本轮
+  五 task 顺序，递增 batch，执行 `BeginPaBatchForCallback`。这里会从 GM
+  `context_lens` 读取下一 batch 的真实 sequence length，计算 block 数，增加
+  `context_reads` 统计，再进入 Alloc Submit prologue。
+
+设 batch 数为 `B`，每核依次有 `B` 个 Alloc→QK、QK→SF、SF→PV 和 PV→UP
+候选 gap，以及 `B-1` 个 UP→Alloc 候选 gap，总计 `5B-1` 个相邻 Submit
+边界。当前路径有实际控制工作，通常都会形成正区间；严格的 merged event 数仍以
+`next.start > previous.end` 为准。最后一个 UP 到 `OrchestrationReplay.end`
+不属于此类，而是 `OrchestrationTail`。
+
+因此 `between_submit_residual` 是一个有明确边界、但内容随 transition 变化的
+orchestration 区域。它不能整体命名成“参数构造”：当前主要参数构造已经移动到
+下一 Submit 内的 compete-first eager callback。
+
+#### 7.5.2 `submit_residual`：Submit 内显式 child 之间
+
+converter 从 `Submit.start` 开始，按时间排序 EfDrain、Claim、Materialize、
+PrepareMap、可选 Fanin、Register 和可选 winner tail。每遇到
+`previous_child.end < next_child.start`，就为这个空白生成一条
+`submit_residual`。因此一个 Submit 理论上可以有多条同名 span，必须结合两侧
+child 名称解释。
+
+按当前打点布局，成功路径中主要的正区间是：
+
+```text
+Claim.end → Materialize.begin
+```
+
+它按源码顺序包含：
+
+1. 发布当前 `Claim` 的 TraceRecord；
+2. 所有 96 个 worker 同步执行 `BuildCallbackSubmitArgs<Kind>`；
+3. 检查 builder 是否有效，并累计 reset/view/create-info/参数个数统计；
+4. 构造固定 16-byte `CallbackSubmitTicket`；
+5. CCEC 路径跨入 noinline split-finish TU，恢复对应 role 的 block-local
+   runtime state，校验 worker、task id、winner、cookie 和 ticket；
+6. 进入 `FinishCallbackSubmitBody`，读取 `Materialize.begin`。
+
+第 2 步是 compete-first eager 的主体，而且 winner、attempted loser、
+not-attempted loser 都完整执行：
+
+- Alloc：构造新的 `TaskArgs`，加入三个 Output；
+- QK：reset，构造 query view 和动态 score create-info，加入三个 Input、一个
+  Output 和两个 scalar；
+- SF：reset，构造动态 probability create-info，加入一个 Input、三个 Output
+  和三个 scalar；
+- PV：reset，加入三个 Input、一个 Output 和两个 scalar；
+- UP：reset，构造 output view，加入三个 Input、四个 Inout 和两个 scalar。
+
+CPU/AscendC 不经过 CCEC 的 cross-TU ABI，但仍执行同一 builder、ticket 语义和
+Finish 入口衔接。因此这个 residual 可以描述为“Claim record + 全员 eager
+ArgBuild + Begin/Finish bridge”，不能缩写成纯 `BuildCallbackSubmitArgs()`
+函数耗时。
+
+它不包含 Claim 的 role 路由/atomicMax，也不包含 `MaterializeTask`：前者已经在
+`Claim` child 内结束，后者从 `Materialize.begin` 才开始。若未来出现其他
+`A.end → B.start` 空白，converter 也会使用 `submit_residual` 名称，exclusive
+JSON 中的 boundary 字段才是区分来源的依据。
+
+#### 7.5.3 `submit_tail_gap`：最后一个 child 到 Submit.end
+
+converter 对每个 Submit 只把最后一个显式 child 之后的后缀命名为
+`submit_tail_gap`：
+
+```text
+last exclusive child.end → Submit.end
+```
+
+起点取决于 Claim 结果：
+
+- 非 Alloc winner：从 `WinnerBuild.end` 开始；
+- Alloc winner：从 `AllocComplete.end` 开始；
+- 任意 loser：没有 winner tail，从 `Register.end` 开始。
+
+三类路径的实际内容是：
+
+- **非 Alloc winner**：发布 `WinnerBuild` TraceRecord，增加本核 Submit 计数，
+  读取 `Submit.end`；slot 等待、HeapGuard 和 payload build 已经位于
+  `WinnerBuild` child 内。
+- **Alloc winner**：发布 `AllocComplete` TraceRecord，增加 Submit 计数，读取
+  `Submit.end`；HeapGuard、vend/flag 发布和 frontier 推进已经位于
+  `AllocComplete` child 内。
+- **loser**：发布 `Register` TraceRecord，增加 Submit 计数，读取
+  `Submit.end`。standalone loser 在 Register 后没有 Replay/LoserReplay 或
+  其他调度动作，所以这段不能解释为“loser replay”。
+
+winner 路径的 Register record 写入发生在 `Register.end` 之后，但由于 winner
+tail 复用 `Register.end` 作为 start，它在数值上属于 WinnerBuild/AllocComplete，
+不属于 `submit_tail_gap`。loser 没有该 tail child，所以同一笔 Register record
+写入才落入 loser 的 `submit_tail_gap`。
+
+`WriteTrace(Submit)` 发生在 `Submit.end` 取时之后，也不属于
+`submit_tail_gap`：非末次 Submit 时它落入随后的 `between_submit_residual`；
+最后一个 Submit 时落入 `OrchestrationTail`。
+
+所以 `submit_tail_gap` 的业务语义是“最后一个已记录 child 之后、Submit 父区间
+结束前的公共观测与 epilogue”，不是独立调度阶段。它仍必须保留，才能使每个
+Submit 在整数 tick 上严格闭合。
+
+#### 7.5.4 三者在层级和加和中的关系
+
 ```text
 OrchestrationReplay
-  = 133,971 + 414,313,448 + 69,022,235 + 53,303
-  = 483,522,957 SYS_CNT ticks
-
-WorkerCompletion
-  = 483,522,957 + 24,572,973
-  = 508,095,930 SYS_CNT ticks
+  ├─ Submit
+  │    ├─ explicit exclusive children
+  │    ├─ submit_residual       内部前缀/child 间空白，可有多段
+  │    └─ submit_tail_gap       最后 child 后缀，至多一段
+  └─ between_submit_residual    相邻 Submit 之间，不属于任一 Submit
 ```
 
-所有等式都在原始整数 SYS_CNT tick 上精确成立。分析器还验证了：同核 Submit 不重叠、
-子阶段不重叠、task id 连续、父区间每核恰好一条、相邻父区间首尾相接，以及
-Kernel 具有唯一受支持的时间父区间。
-
-事件数也与 Case1 的结构精确一致：
-
-| 事件 | 实际次数 | 结构预期 |
-| --- | ---: | ---: |
-| Submit / EfDrain / Materialize / PrepareMap / Claim / Register | 各 122,880 | `96 × 256 × 5` |
-| Fanin / WinnerBuild | 各 1,024 | `256 × 4` |
-| AllocComplete | 256 | `256 × 1` |
-| Kernel / Commit | 各 1,024 | `256 × 4` |
-| OrchestrationReplay / FinalDrain | 各 96 | 每核各 1 条 |
-| ClockBaseline | 192 | 每核 2 条 |
-| RingBp | 0 | 本轮未发生 ring/heap 背压 |
-
-1,024 个 Kernel 中，1,015 个唯一落在 EfDrain，9 个唯一落在 FinalDrain，
-没有孤儿、跨界或多重归属。Kernel 通常不在 `WinnerBuild` 内执行：
-`WinnerBuild` 只构造私有 slot，实际 engine 工作等依赖 ready 后由
-`DrainReady()` 执行。
-
-Atomic 记录的身份同样闭合，但它是 Overlay：97,449 条记录代表 99,302 次
-源码调用，其中 2,093 次轮询调用被压成 240 条 PollBatch，满足：
+排他闭合时只能这样加：
 
 ```text
-97,449 = 99,302 - 2,093 + 240
-```
-
-Atomic 记录 duration 的 aggregate 为 59,250,773 SYS_CNT ticks；direct 与 PollBatch
-可能互相嵌套，因此该值既不能与排他阶段相加，也不能当成 Atomic 的区间并集。
-
-### 6.9 每个 span 的边界、业务语义与源码
-
-#### 6.9.1 相邻边界复用的真实含义
-
-当前为减少 `SYS_CNT` 读取和 raw 体积，让后一个阶段直接复用前一个阶段的
-`end`。`TraceTimestamp()` 先采样，前一阶段的 `WriteTrace()` 随后才向 GM
-写 64-byte record。因此 `submit_internal_residual=0` 证明的是时间轴连续，
-不代表各 span 已经剥离观测代码，也不代表阶段间没有 scalar 胶水。
-
-当前记录成本的实际归属为：
-
-| 报告中的 span | 除同名业务动作外，还实际覆盖 |
-| --- | --- |
-| EfDrain | 直接从 Submit.start 开始；不吸收上一条 child record |
-| Materialize | EfDrain record 发布和进入 `MaterializeTask()` 前的衔接 |
-| PrepareMap | Materialize record 发布 |
-| Alloc Register / 非 Alloc Claim | PrepareMap record 发布 |
-| Alloc Claim | Alloc Register record 发布 |
-| 非 Alloc Fanin 或 Register | Claim record 发布 |
-| 非 Alloc 且执行 Fanin 后的 Register | Fanin record 发布 |
-| WinnerBuild | Register record 发布 |
-| AllocComplete | Claim record 发布 |
-| SubmitFinalize | 最后一条 child record、分支汇合、`++submits` 和 SubmitEnd 取时 |
-| SubmitTransition | 前一条 Submit record、返回控制、下一任务构参和下一次 `BeginSubmit()` |
-| OrchestrationTail | 最后一条 Submit record、最后一次返回和循环退出 |
-
-Atomic span 自身都在对应 Atomic record 写入前结束，但 record 成本的父阶段
-归属不能一概而论：direct Atomic 的 record 在外围 phase.end 之前发布，通常仍
-算入当前排他 span；PollBatch 若由 phase.end 的 `TraceTimestamp()` 关闭，其
-record 在已采样的 end 后写入，通常由后一个 span 吸收；若在 Kernel.begin 被
-关闭，record 会进入随后 Kernel 完整区间；若由 `AtomicPollRegionEnd()` 在
-普通控制流中关闭，则仍留在当时的外围父区间。权威 B256 的 9 个 FinalDrain
-Kernel 中有 17 条这类 begin-boundary PollBatch，EfDrain 的 1,015 个 Kernel
-未发现该情况。由此，泳道 span 表示“以业务动作命名的完整观察窗口”，不是
-去掉 DFX 后的纯函数微基准。后续若判断具体函数体是否是瓶颈，必须与去掉泳道的
-`submit-pmu` 诊断构建交叉验证，不能直接按同名 span 机械相减。
-
-关键实现位于：
-
-- `TraceTimestamp()`：`common/pa_scheduler_core.h:58-72`；
-- `WriteTrace()`：`common/pa_trace.h:521-567`；
-- 完整 Submit：`common/pa_scheduler_core.h:541-737`；
-- orchestration 与 FinalDrain：`common/pa_scheduler_core.h:880-997`。
-
-#### 6.9.2 Submit 内部 span
-
-以 `SubmitUnion=414,313,448 core-ns` 为 100%，当前完整分布为：
-
-| Span | aggregate core-ns | Submit 占比 | 次数 | 单次平均 |
-| --- | ---: | ---: | ---: | ---: |
-| Materialize | 136,717,945 | 32.9987% | 122,880 | 1,112.6 ns |
-| Claim | 79,359,417 | 19.1544% | 122,880 | 645.8 ns |
-| EfDrain | 75,838,419 | 18.3046% | 122,880 | 617.2 ns |
-| Register | 49,140,768 | 11.8608% | 122,880 | 399.9 ns |
-| PrepareMap | 37,104,949 | 8.9558% | 122,880 | 302.0 ns |
-| SubmitFinalize | 27,155,661 | 6.5544% | 122,880 | 221.0 ns |
-| WinnerBuild | 6,403,823 | 1.5456% | 1,024 | 6,253.7 ns |
-| AllocComplete | 1,422,201 | 0.3433% | 256 | 5,555.5 ns |
-| Fanin | 1,170,265 | 0.2825% | 1,024 | 1,142.8 ns |
-| **合计** | **414,313,448** | **100%** | — | — |
-
-这些 span 的主要业务语义和实现入口是：
-
-- **EfDrain**：`DrainReady()` 扫描本核私有 slot；对 fanin flag 做 ready
-  判断，执行已就绪的前序 Kernel，随后发布 vend/flag、推进 frontier、写
-  Commit 并释放 slot。源码为 `common/pa_scheduler_core.h:243-280`。
-- **Materialize**：`MaterializeTask()` 扫描 tag，形成 output/register mask，
-  计算输出布局与 heap ring 连续区间，构造 GM TensorDesc，最后推进
-  `heap_next`。源码为 `common/pa_frontend.h:986-1051`。
-- **PrepareMap**：`AdvanceTensorMap()` 按 `task_id-H` 推进存活下界，把过期
-  producer 从 bucket 链摘除并放回 free list。源码为
-  `common/pa_frontend.h:778-801`。
-- **Claim**：先做 active-mask、role 与 lane 路由，再按 task id 选择四分片
-  cursor 并执行 `atomicMax` 竞争，把返回结果写入 SubmitContext/统计。源码为
-  `common/pa_scheduler_core.h:435-497`。
-- **Fanin**：只在需要构建 slot 的路径上调用 `CollectFanin()`；扫描 owner 和
-  TensorMap，选择最新重叠 producer 并去重。源码为
-  `common/pa_frontend.h:873-927`。
-- **Register**：`RegisterOutputs()` 依据 register mask，把已有 Inout/
-  OutputExisting 作为当前 task 的新 hazard 版本插入本核 TensorMap。源码为
-  `common/pa_frontend.h:929-951`。
-- **WinnerBuild**：`WaitForSlot()`、`HeapGuard()`、私有 slot 分配，以及
-  descriptor/scalar/fanin payload 复制；这里只发布待执行 slot，不执行当前
-  Kernel。源码为 `common/pa_scheduler_core.h:499-538`。
-- **AllocComplete**：Alloc 路径执行 `HeapGuard()` 后，以 vend、flag、
-  frontier 的顺序发布完成。源码为 `common/pa_scheduler_core.h:640-653` 和
-  `common/pa_scheduler_core.h:197-212`。
-- **SubmitFinalize**：这是已有边界的离线语义名称，不是新设备 phase。它覆盖
-  最后 child.end 到 Submit.end；分析器字段仍叫 `submit_tail_residual`，避免
-  把尚未细拆的指令冒充成一个独立业务 API。
-
-`SubmitFinalize` 可继续按最后一个业务动作解释，而不是只显示一个无意义的
-residual：
-
-| 最后动作 → SubmitEnd | 次数 | aggregate core-ns | 单次平均 | 占 SubmitFinalize |
-| --- | ---: | ---: | ---: | ---: |
-| Register → SubmitEnd | 97,280 | 21,318,053 | 219.1 ns | 78.50% |
-| Claim → SubmitEnd | 24,320 | 5,442,753 | 223.8 ns | 20.04% |
-| WinnerBuild → SubmitEnd | 1,024 | 316,153 | 308.7 ns | 1.16% |
-| AllocComplete → SubmitEnd | 256 | 78,702 | 307.4 ns | 0.29% |
-
-这里没有缺失的 standalone loser 计算。高频两类尾段主要是最后 record 发布、
-公共统计、分支汇合和返回前时间戳；低频两类的单次尾段更长，但当前
-边界还不足以把差值归因到某一条冷路指令。
-
-#### 6.9.3 SubmitTransition 的五种业务含义
-
-`between_submit_residual` 在数学上仍是相邻 Submit 的补集；在布局解释中应按
-task 顺序显示为 `SubmitTransition.<前一类→后一类>`。这些名称完全可以由
-现有 task id 和边界离线推导，不需要新增 raw 字段。
-
-| 过渡 | 次数 | aggregate core-ns | 占全部过渡 | 单次平均 |
-| --- | ---: | ---: | ---: | ---: |
-| UP → 下一批 Alloc | 24,480 | 33,515,127 | 48.56% | 1,369.1 ns |
-| QK → SF | 24,576 | 9,768,832 | 14.15% | 397.5 ns |
-| Alloc → QK | 24,576 | 9,576,128 | 13.87% | 389.7 ns |
-| SF → PV | 24,576 | 8,649,604 | 12.53% | 352.0 ns |
-| PV → UP | 24,576 | 7,512,544 | 10.88% | 305.7 ns |
-
-每段都包含前一 Submit record 发布、前一调用返回、本地统计和下一次
-`BeginSubmit()`；其间真正的 orchestration 工作分别是：
-
-- **Alloc → QK**：接收三个 Alloc 输出，计算 block group，创建动态 QK
-  CreateInfo，reset TaskArgs，加入 query/key/table、QK 输出和两个 scalar；
-- **QK → SF**：接收 QK score，创建 SF CreateInfo，reset，加入 score、三个
-  output 和三个 scalar；
-- **SF → PV**：接收 SF 的 probability/max/sum，reset，加入三个 input、一个
-  output 和两个 scalar；
-- **PV → UP**：接收 PV output，reset，加入三个 input、四个 Inout 和两个
-  scalar；
-- **UP → Alloc**：推进 batch 循环，读取下一 batch 的 context length，计算
-  block 数，构造 query/output view，重新构造 TaskArgs 并初始化 tag/
-  dump-selection，再加入三个 Alloc output。
-
-对应源码为 `common/pa_scheduler_core.h:897-953` 和
-`common/pa_frontend.h:477-705`。UP→Alloc 少 96 次，是因为最后一批 UP 后
-不再进入下一批；其余四类均为 `256 × 96` 次。
-
-#### 6.9.4 EfDrain、FinalDrain 与 Kernel
-
-EfDrain 的排他拆分为：
-
-| 子区域 | aggregate core-ns | 占 EfDrain | 说明 |
-| --- | ---: | ---: | --- |
-| KernelUnion | 32,039,768 | 42.2474% | 1,015 个观测到的 Kernel 调用完整区间并集 |
-| DrainReady scalar 控制 | 43,798,651 | 57.7526% | slot 扫描、fanin、完成发布、frontier、清槽和观测 |
-| **EfDrain** | **75,838,419** | **100%** | 精确闭合 |
-
-全部 1,024 个 Kernel 的分布为：
-
-| Kernel kind | 次数 | aggregate core-ns | 单次平均 | engine role |
-| --- | ---: | ---: | ---: | --- |
-| QK | 256 | 10,613,638 | 41.460 us | AIC |
-| SF | 256 | 13,744,506 | 53.689 us | AIV |
-| PV | 256 | 7,245,005 | 28.301 us | AIC |
-| UP | 256 | 692,060 | 2.703 us | AIV |
-
-其中 1,015 个 Kernel 在 Submit 期间由 EfDrain 执行，剩余 9 个在 FinalDrain
-执行。EfDrain 所属的当前 Submit task kind 与其中 Kernel 的 task kind 不必相同，
-所以不能按外层 Submit 名称把 Kernel 错归给当前任务。`Kernel` 边界包围的是
-`ExecuteKernel()` 调用，包含 engine launch/completion wait wrapper；若 Kernel
-begin 恰好关闭 PollBatch，还会吸收该 batch record 发布，因此不是纯计算单元
-指令的净时间。
-
-FinalDrain 精确拆分为：
-
-| 子区域 | aggregate core-ns | 占 FinalDrain |
-| --- | ---: | ---: |
-| KernelUnion（9 个） | 255,441 | 1.0395% |
-| FinalDrainControlWait | 24,317,532 | 98.9605% |
-| **FinalDrain** | **24,572,973** | **100%** |
-
-`FinalDrainControlWait` 是已有父区间减去 Kernel 并集后的源码语义名称，包含
-replay_done 发布/轮询、fanin 检查、`SpinHint()`、完成发布、frontier、清槽和
-观测成本。该区域内 Atomic 去重并集为 23,401,154 core-ns，占 FinalDrain
-95.23%，主要来自 PollBatch 轮询窗口。这支持“最终阶段主要在同步与等待”，
-但 PollBatch 覆盖完整轮询 episode，不能把 95.23% 解释成 isolated atomic
-指令延迟。
-
-#### 6.9.5 AIC/AIV 的完整区间分布
-
-以下只保留每核平均这一种统计量，以便与 aggregate 整数总量对应：
-
-| 区域 | AIC 每核平均 | AIV 每核平均 | 当前可直接读出的差异 |
-| --- | ---: | ---: | --- |
-| WorkerCompletion | 5.293429 ms | 5.292285 ms | 最终完成时间基本一致 |
-| OrchestrationReplay | 4.990676 ms | 5.059708 ms | AIV replay 较长 |
-| 首末 Submit 完整区间 | 4.988870 ms | 5.057685 ms | 与 replay 差异方向一致 |
-| SubmitUnion | 4.305289 ms | 4.321003 ms | 两类核接近 |
-| SubmitTransition | 683.581 us | 736.682 us | AIV 主要多在 Submit 间 |
-| FinalDrain | 302.753 us | 232.576 us | AIC 较长，抵消 replay 差异 |
-
-这组数据说明 AIV 的额外 replay 时间主要落在 SubmitTransition，而 AIC 在
-FinalDrain 停留更久，最终使两类核的 WorkerCompletion 接近。它只说明负载
-分布，不证明 AIV transition 或 AIC final drain 的某条指令就是根因。
-
-#### 6.9.6 OrchestrationSetup、OrchestrationTail 与窗口外 DFX
-
-- **OrchestrationSetup** 从 `orchestration_begin` 到首个 Submit.start，覆盖
-  `InitPaOrchestration()`、首批 `BuildAllocArgs()`、相应统计，以及首个
-  `BeginSubmit()`。它是可复算的初始化区间，不与 StartupBarrier 混合。
-- **OrchestrationTail** 从最后一个 Submit.end 到 `orchestration_end`，覆盖
-  最后一条 Submit record 发布、`SubmitTask()` 返回、循环退出和结束时间戳；
-  swimlane 构建中的 `PmuWindowStop()` 是空实现。它不包含 FinalDrain。
-- **StartupBarrier** 位于 `orchestration_begin` 之前；**DFXFinalize** 位于
-  `final_drain_end` 之后。`OrchestrationReplay` 与 `FinalDrain` 两条父记录也
-  在 `final_drain_end` 之后才写出，所以记录发布本身不落入
-  `WorkerCompletion` 的两个父区间。当前 raw 没有这两段的完整父边界，
-  因此只能确认它们位于已量化窗口两侧，不能计算完整耗时。
-
-对应实现为 `common/pa_scheduler_core.h:880-1010`。这三个边界把初始化、业务
-完成和诊断落盘分开，避免再用首末 Submit 近似完整 worker 生命周期。
-
-### 6.10 分布合理性与当前瓶颈证据
-
-本节只记录数据和源码共同支持的结论；尚未由微观数据证明的部分明确保留为
-待验证问题，不据此直接修改代码。
-
-#### 6.10.1 task kind 分布是否符合业务工作量
-
-下表是排他 span 的单次平均 ns（即 SYS_CNT tick）。EfDrain 执行的是前序 ready task，按当前
-Submit kind 聚合会产生错误归因，因此不放进本表：
-
-| 阶段 | Alloc | QK | SF | PV | UP |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Materialize | 1,566.6 | 830.9 | 1,580.2 | 983.2 | 602.2 |
-| PrepareMap | 275.9 | 280.8 | 212.9 | 252.2 | 488.0 |
-| Claim | 924.2 | 453.5 | 734.8 | 439.3 | 677.4 |
-| Register | 65.8 | 239.0 | 397.4 | 300.4 | 997.1 |
-| Fanin（条件执行） | — | 773.1 | 553.8 | 619.1 | 2,625.3 |
-| WinnerBuild（条件执行） | — | 6,088.0 | 6,043.1 | 5,777.0 | 7,106.9 |
-
-当前能由实现直接解释的趋势有：
-
-- Alloc/SF 各物化三个新输出，QK/PV 各一个，UP 没有新 Output；
-  Materialize 的高低与 descriptor 数量基本一致。该 span 同时包含前一条
-  EfDrain record，因此还不能把全部差值归给 `MaterializeTask()`。
-- Claim 的 atomic 参与核数按业务为 Alloc 96、QK/PV 32、SF/UP 64；因此
-  Alloc 最高、SF/UP 居中、QK/PV 较低，与 `Claim()` 的 active-role 路由相符。
-- 只有 UP 的 Register 真正插入四个 Inout，其他类型的 register mask 为空；
-  UP 显著较高符合 TensorMap 插入工作量。
-- 本轮 `H=64`；稳态 `AdvanceTensorMap()` 每次清理 `task_id-H-1`，即
-  `task_id-65`。65 恰好是五任务周期的整数倍，所以 UP 阶段会清理较早 UP
-  插入的四个条目；PrepareMap 的 UP 均值最高与这一实现相符。
-- Fanin 的固定依赖数为 QK 0、SF/PV 各 1、UP 3；UP 还扫描最多的 tensor，
-  其 Fanin 和 WinnerBuild 最高符合查找、去重和 payload 拷贝量。
-
-这些相关性支持当前 span 路由暂未见明显错位，但“相关”仍不等于
-已经量出某条 scalar 指令、I-cache miss 或 GM 访问的净成本。
-
-#### 6.10.2 aggregate core-work 分布与调查优先级
-
-下列排序反映 96 核累计的 scalar/core-work 观察区域，不是全局
-5.278401 ms 的关键路径分解。总量较小的 winner-only 阶段仍可能串住
-后继依赖；是否优先处理还需要关键路径和依赖到达证据。
-
-1. **Materialize 是当前最大排他区域（Submit 的 33.00%）**。源码上它同时
-   做 tag 扫描、输出布局、heap ring 处理和 128-byte TensorDesc 初始化；
-   task-kind 趋势支持输出数量是重要变量。尚需用独立 `submit-pmu materialize`
-   区分同名调用主体与前一条 record 发布、取指和 GM 访问。
-2. **Claim 占 Submit 的 19.15%**。73,728 条 ClaimMax `return_ready` Atomic
-   合计 25,878,336 core-ns，全部落在 Claim 内，相当于 Claim 观察区间总量的
-   32.61%。这证明返回型 Atomic 是 Claim 的重要组成，但不能把该比例直接当成
-   “删除 Atomic 可获得的收益”，因为竞争协议、记录扰动和其他 scalar 工作仍
-   叠加在父区间中。
-3. **EfDrain 占 Submit 的 18.30%**。现有边界已经把其中 42.25% 精确归为
-   KernelUnion，57.75% 归为 DrainReady scalar 控制。下一步分析应只针对后者，
-   再按无 slot、fanin 未就绪、完成发布三类路径取证，不能把 engine 计算当作
-   scalar 调度瓶颈。
-4. **SubmitTransition 占 WorkerCompletion 的 13.58%**。UP→Alloc 一项占
-   全部 transition 的 48.56%，其源码确实包含换 batch、context GM load、
-   view 与完整 TaskArgs 构造。泳道目前只能确定热点落在这段完整代码范围，
-   尚未区分 Submit record、GM load、清对象和 add 参数各自成本。
-5. **Register 占 Submit 的 11.86%**。UP 的真实四次 TensorMap 插入有明确
-   工作量证据；QK/SF/PV/Alloc 的非零基础成本则混有前一 record 发布、空
-   register 调用和统计，应结合 `submit-pmu register` 判断可优化比例。
-6. **PrepareMap 占 Submit 的 8.96%**。UP 清理旧 UP 条目是已知重路径；其余
-   时间需要按 map entry 数量和清理/无清理调用分层，当前没有 Atomic，可优先
-   查 scalar load/store 与 I-cache，而不是猜测同步成本。
-7. **SubmitFinalize 占 Submit 的 6.55%**。98.55% 的总量来自两类高频公共
-   返回路径，主要是最后 record 发布和 epilogue。它不是遗漏的业务阶段；后续
-   只应把它作为泳道观测成本/控制流布局门禁，不通过移动边界伪装成消减。
-8. **FinalDrain 占 WorkerCompletion 的 4.84%**。其中 98.96% 是非 Kernel
-   控制/等待，Atomic/PollBatch 去重并集又覆盖 95.23%。这已经足以把调查重点
-   放到 replay_done/fanin 到达偏斜和轮询 episode，而不是最后 9 个 Kernel；
-   但不能把 PollBatch 时间除以 atomic calls 当作单次 Atomic 延迟。
-9. **Fanin、WinnerBuild、AllocComplete 总量较小**，分别只占 Submit 的
-   0.28%、1.55%、0.34%。其单次成本不低、调用次数少；这些数字只能
-   说明它们不是 aggregate core-work 主体，不能单凭总量决定是否优先
-   改动协议。
-
-#### 6.10.3 Atomic 的位置只作 Overlay 归因
-
-97,449 条 Atomic record 全部可以找到业务位置，没有落在未解释的空白：
-
-| 位置 | records | aggregate core-ns | 解释边界 |
-| --- | ---: | ---: | --- |
-| Claim | 73,728 | 25,878,336 | 直接 ClaimMax，`return_ready` |
-| FinalDrain | 281 | 24,061,516 | direct 与 PollBatch 混合，不能直接相加解释 |
-| EfDrain | 20,563 | 5,036,049 | fanin/frontier/completion 等 |
-| AllocComplete | 1,790 | 441,083 | 完成发布与 frontier |
-| WinnerBuild | 768 | 224,899 | `HeapGuard` 首圈 fast path 的 `FatalPoll`；本轮无 frontier/vend load |
-| StartupBarrier | 319 | 3,608,890 | WorkerCompletion 之前的启动同步；父区间未完整量化 |
-
-这张表只回答“Atomic 发生在哪个业务区域”。Atomic duration 已包含在父 span
-中，禁止把表中数值再次加到 Submit/FinalDrain；PollBatch 还会与 direct 记录
-重叠，表内 aggregate 也不等于位置的 Atomic 区间并集。
-
-#### 6.10.4 当前数据尚不能支持的结论
-
-- 不能把 `Materialize=33%` 解释成 `MaterializeTask()` 纯函数体占 33%；
-- 不能把 Atomic aggregate 与父阶段相减，或把 PollBatch 当单条 Atomic 延迟；
-- 不能由泳道直接量出 I-cache miss、GM stall、scalar busy 各自损失的时间；
-- 不能把 span 边界移动后的重新归类称为性能提升；
-- 不能用单轮 B256 排名直接决定代码改法；
-- 不能把 standalone 的 FinalDrain、loser 或 Kernel 模拟直接等同于真实 PA。
-
-standalone 与真实 PA 的当前差异必须单列，不能把本节绝对占比直接迁移：
-
-- 真实 Submit 的 EfDrain 还先执行 `drain_block_won()`，kernel loser 也会执行
-  一次该逻辑，FinalDrain 还检查 pending won；standalone 不实现 joint/
-  BlockWon，loser 没有这部分业务动作。
-- standalone `TraceRecord` 为 64 B，并让相邻 child 复用前一 end；真实
-  `FdwicSwimlaneRecord` 为 32 B，Materialize/PrepareMap/Claim/Fanin/Register
-  等显式 child 当前用独立 `TRACE_SPAN_BEGIN/END` 取时，EfDrain 仍是 lap。
-  因此 phase record 和间隙成本在两条路径中的归属不同，不能照搬 standalone
-  的相邻 span 数值解释真实 PA residual。
-- standalone 复用一个 `TaskArgs` 并直接调用 `SubmitTask()`；真实 orchestration
-  还有各 scope 的 L0TaskArgs、`TaskOutputTensors::get_ref()`、`rt_submit_*`
-  wrapper、MixedKernels 和 fatal 路径，SubmitTransition 的绝对成本不完全对等。
-- standalone `real-compute` 只提供固定 128×128 synthetic engine 工作量，
-  不是实际 QK/SF/PV/UP kernel；当前真实路径也还没有 standalone 这两条
-  `OrchestrationReplay/FinalDrain` raw 父记录。
-
-Case1 当前 task 均为单 lane，依赖拓扑仍可用于调度观察，但以上 scalar 控制、
-DFX 和计算体差异必须在迁移到真实 PA 时重新取证。真实入口见
-`src/a5/runtime/fully_distributed_within_core/runtime/dist_engine/aicore/submit_runtime.h:254-380`
-及 `examples/a5/fully_distributed_within_core/paged_attention_unroll/kernels/orchestration/paged_attention_orch.cpp:156-278`。
-
-#### 6.10.5 复用已有 submit-pmu 的微观证据
-
-已有五份 B256 `submit-pmu` 结果可以直接复用，不需要为本轮布局审计重新上板：
-
-```text
-outputs/submit_pmu_b256_for_swimlane_20260719_114815_617346/
-    none/
-    claim/
-    efdrain/
-    materialize/
-    register/
-```
-
-这组数据与 11:48 的 schema-v4 泳道基线配套，也早于 12:35 的
-完整性样本。两者 span 语义相同，但 ELF 布局不同，因此本节只复用 PMU
-对阶段性质的取证，不把它与 12:35 泳道 tick 逐项相减，也不把旧
-PMU 数值冒充成当前源码的精确性能。调度落点也已变化：12:35
-泳道的 Kernel 在
-EfDrain/RingBp/FinalDrain 分别为 `1015/0/9`，而 none/claim/efdrain/
-materialize/register 五个旧 PMU ELF 分别为 `817/188/19`、`935/68/21`、
-`870/140/14`、`897/105/22`、`917/76/31`。因此两组比例只能定性
-并列，不能当作同一执行分布。
-
-`none` 变体只开一次完整 Submit PMU gate，不插入局部 read-clear。其每核平均为：
-
-| 角色 | PMU total（校准） | scalar busy（校准） | scalar/total | I-cache request | I-cache miss | miss/request |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| AIC | 5,249.211 us | 4,302.579 us | 81.9662% | 408,521.2 | 39,264.8 | 9.6114% |
-| AIV | 5,080.418 us | 4,198.206 us | 82.6350% | 445,515.7 | 54,738.3 | 12.2865% |
-
-这说明该诊断 ELF 的完整 Submit 中约 82% PMU cycle 被 `scalar_instr_busy`
-覆盖；其余约 18% 不能直接命名为 scalar 空闲，仍混有 engine 等待、取指/
-访存 stall 和其他未被 CNT2 覆盖的周期。AIV 每核比 AIC 多约 37.0k request、
-15.5k miss，且 miss rate 高 2.675 个百分点，I-cache 的角色差异确实值得继续
-定位。
-
-按已有 cold/warm 标尺 90 ns 做最简单的串行等效换算，AIC/AIV 分别约为
-3.534/4.926 ms 每核。它只回答“若所有 miss 延迟完全串行会有多大”，已经接近
-甚至覆盖整个 Submit，因此不能当成实际损失时间；miss 延迟会与流水、其他请求、
-Atomic 等待和 engine 工作重叠。要得到可优化的净损失，仍需同一源码的布局 A/B
-或更直接的 stall 证据。
-
-四个单阶段 ELF 的局部结果如下。时间占比以各自 ELF 的首末 Submit 完整区间为
-分母；request/miss 占比以各自 ELF 的完整 Submit primary 为分母。上下界差异
-很小，表中保留到能表达结论的精度：
-
-| 局部阶段 | SYS_CNT/调用 | 阶段时间占比 | request 占比 | miss 占比 | 局部 observed miss/request |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Claim | 349.8 ns | 11.88% | 6.674% | 7.990%～7.995% | 12.172% |
-| EfDrain | 941.7 ns | 26.03% | 8.265%～8.273% | 11.391% | 14.006% |
-| Materialize | 859.6 ns | 23.82% | 38.771% | 36.857% | 9.773% |
-| Register | 136.9 ns | 4.20% | 15.700%～15.702% | 9.121%～9.124% | 4.756% |
-
-每个局部调用仍新增 begin/end 两次 SYS_CNT 和 running read-clear；阶段时间不含
-两侧 `ld_dev`，但包含时间戳边界及紧邻 context/stat 归档的观察扰动。它比普通
-泳道更接近同名调用主体，但不是无扰动函数净耗时。表中局部
-`miss/request` 是 shadow 直接观测的下界比率，不是加上 residual 后的上界。
-
-这些独立 PMU 结果把 6.10.2 的判断进一步收紧为：
-
-- **Materialize 是已测阶段中最明显的取指热点**：时间占 23.82%，却覆盖
-  38.77% request 和 36.86% miss；AIC/AIV 的局部 miss 分别为
-  11,550.0/19,233.8 次每核，占各自完整 Submit miss 的 67.45%/32.44%。
-- **EfDrain 的主要问题不只是取指**：时间占 26.03%，request/miss 只占
-  8.27%/11.39%；旧 PMU ELF 与当前泳道的 Kernel 落点不同，因此只能
-  定性地与当前 42.25% EfDrain KernelUnion 并列。这些证据更支持 engine
-  工作、一次 fanin 依赖检查/Atomic load 和完成控制共同构成，而不是
-  单纯 I-cache 主导；standalone 这里不会对 fanin 轮询等待。
-- **Claim 的时间占比高于取指活动占比**：时间占 11.88%，request 只占
-  6.67%；这与 ClaimMax 返回等待占父阶段相当比例的 Atomic 证据一致。
-- **Register 的取指请求占比不低，但 miss 密度较低**：request 占 15.70%，miss 只占
-  9.12%，局部 miss/request 为 4.76%。AIC 每核局部仅约 49.6 miss，而 AIV
-  约 4,847.3；但两类核都会完整回放 UP 并插入同样四个 TensorMap 条目，不能把
-  角色差值归因成插入次数不同。现有数据还不能区分角色 ELF 布局、前后控制流
-  或其他硬件行为，需保持同源码后继续取证。
-
-四个 phase ELF 的完整 Submit 时间本身并不相同，说明编译期局部观测会改变
-代码布局；这些局部值不能跨 ELF 相加，也不能与 `none` 相减得到“净阶段成本”。
-但上述时间/request/miss 的同 ELF 内比例、角色方向和与源码工作量的一致性，
-足以用于确定下一轮微观调查顺序。
-
-#### 6.10.6 当前源码重编后的两轮 B256 与末端路径
-
-为避免用 12:35 的旧 ELF 替当前源码下性能结论，本机使用用户
-`/home/q00473782/.venv`、当前 CANN 9.1 和当前工作树重编 CCEC，然后用
-同一份 mixed ELF 连续采集两轮：
-
-本节的“当前”特指 **standalone CCEC、level-4 atomic 合并泳道**。它不等于
-真实 PA Case1 的 level-1 正式基线；后者三轮中位数为 4.821897 ms。当前两轮
-应与同口径 standalone 历史值 5.278401 ms 比较，不能据此宣称真实 PA 从
-4.8 ms 回退到 5.2 ms。
-
-```text
-outputs/pa_scheduler_swimlane_20260719_162653_1031549/ccec/
-outputs/pa_scheduler_swimlane_20260719_162930_1038954/ccec/
-```
-
-两轮均通过全部语义断言、父子关系与整数闭合，`dropped_records=0`：
-
-| 指标 | 当前轮 1 | 当前轮 2 |
-| --- | ---: | ---: |
-| raw records | 839,933 | 839,093 |
-| 跨核首末 Submit 完整区间 | 5.313009 ms | 5.245894 ms |
-| SubmitUnion aggregate core-work | 414.827631 ms | 412.993668 ms |
-| SubmitTransition aggregate core-work | 69.600295 ms | 69.193462 ms |
-| FinalDrain aggregate core-work | 27.072400 ms | 22.717534 ms |
-| Kernel 落点 EfDrain/RingBp/FinalDrain | 1016/0/8 | 1015/0/9 |
-| 最后 Submit 所在核 | core89/AIV | core65/AIV |
-| 最长 SF Kernel 完整区间 | 255.201 us | 207.998 us |
-
-两轮的非 Atomic 记录数都固定为 742,016；raw 总数的 840 条差异全部来自
-运行时轮询次数变化带来的 Atomic 记录数差异。这进一步说明 span 布局和固定
-工作量事件数稳定，不能把 raw 总数的小幅波动误解成边界遗漏或重复记录。
-
-高频 scalar 区域的 aggregate core-work 在两轮间很稳定：Materialize、
-PrepareMap、Claim、Register、SubmitFinalize 和 Fanin 的差值分别为
-`-0.007%`、`+0.149%`、`-0.246%`、`-0.836%`、`-0.139%` 和
-`-0.301%`。EfDrain 相差 1.565%，但它包含下述不稳定 Kernel 长尾；
-FinalDrain 相差 16.09%，反映的主要是跨核到达偏斜。因此当前能证明的
-是“高频前端工作量总体稳定”，不是“全局末端也由这些 aggregate
-排名决定”。
-
-按两轮 aggregate core-work 的平均占比，当前大致布局为：
-
-| WorkerCompletion 分区 | 两轮平均占比 | 主要语义 |
-| --- | ---: | --- |
-| Submit 内部并集 | 81.42% | 每次 Submit 内已有排他子阶段之和 |
-| SubmitTransition | 13.65% | 前一 Submit 发布/返回与下一任务构参 |
-| FinalDrain | 4.89% | replay_done/fanin 同步、剩余 slot 清空；不在首末 Submit 墙钟内 |
-| Setup + Tail | 0.04% | 首批构参与最后一次返回 |
-
-Submit 内部再按两轮平均分布为：
-
-| Submit 内 span | 两轮平均占比 | 当前两轮典型单次 | 分布解释 |
-| --- | ---: | ---: | --- |
-| Materialize | 32.95% | 约 1.0 us | 随输出 descriptor 数量分层 |
-| Claim | 19.13% | 约 0.72 us | attempted 与未参与核分层；包含 ClaimMax 返回等待 |
-| EfDrain | 18.33% | empty fast path 约 0.18 us | 稀疏的 ready/Kernel 路径抬高总量，不能只看中位数 |
-| Register | 11.76% | 约 0.30 us | UP 的四次 TensorMap 插入形成重路径 |
-| PrepareMap | 9.05% | 约 0.26 us | UP 清理旧条目形成重路径 |
-| SubmitFinalize | 6.59% | 约 0.17 us | 最后一条 record、公共收尾与 SubmitEnd 取时 |
-| WinnerBuild | 1.54% | 约 5.9 us | 每 task 仅一个非 Alloc winner |
-| AllocComplete | 0.36% | 约 4.8～5.2 us | 每 batch 仅一个 Alloc winner |
-| Fanin | 0.28% | 约 0.71 us | 条件执行；UP 因三路依赖约 2.67 us |
-
-这里的“典型单次”只用于描述常见路径，不参与 aggregate 闭合。特别是 EfDrain
-把大量 empty fast path 与少量 Kernel/完成发布混在同一分布中；两轮中其
-KernelUnion 平均占 EfDrain 42.40%，其余 scalar 控制占 57.60%。五类
-SubmitTransition 中，UP→Alloc 的典型值约 1.38 us，其他四类约
-0.28～0.37 us，符合换 batch 和重建 Alloc 参数的额外业务量。
-
-Kernel 自身按 task kind 的两轮合并中位数为 QK 41.095 us、SF 53.269 us、
-PV 27.638 us、UP 2.586 us；这说明默认 synthetic engine 工作量整体稳定。
-当前墙钟末端异常来自 SF 的 207.998/255.201 us 完整区间长尾，而不是 SF
-常态负载整体增大。
-
-跨核首末 Submit 完整区间也不是一条已证明因果关系的 96 核关键路径。
-它在两轮中分别闭合为：
-
-```text
-5.313009 ms = core89 的首次 Submit 起点偏移 0.009434 ms
-            + core89 自身 Submit 完整区间 5.303575 ms
-
-5.245894 ms = core65 的首次 Submit 起点偏移 0.000365 ms
-            + core65 自身 Submit 完整区间 5.245529 ms
-```
-
-两轮末端都被同一个业务 task 的长尾串住，但物理核和具体
-EfDrain 落点不同：
-
-- 轮 1 的 core89 构建 task1277/SF，其 255.201 us Kernel 在 task1279
-  的 EfDrain 执行；对应 EfDrain/Submit 为 262.196/270.986 us；
-- 轮 2 的 core65 构建 task1277/SF，其 207.998 us Kernel 在 task1278
-  的 EfDrain 执行；对应 EfDrain/Submit 为 221.231/223.673 us。
-
-这证明当前两轮的最后 Submit 主要被 `ExecuteKernel()` 完整区间拖长，
-不是该 Submit 内的 Claim Atomic。Kernel 区间包含 engine launch/completion-wait
-wrapper，不能进一步说成纯 TADD 指令执行净耗时。12:35 样本中的
-core89/task1277～1279 多个普通 scalar span 同时变长没有在当前两轮
-原样复现，因此不把旧单轮现象归因为 Atomic、I-cache 或 GM。
-
-两轮仍显示明确的两端效应：在 Materialize/PrepareMap/Claim/Register
-这四个通常为亚微秒到约 1～2 us 的前端 span 中，大于 3 us 的
-样本几乎只出现在前 20 个 task 或最后 10 个 task；两轮只各有 1 条
-AIC 稳态例外。这支持将冷启动和末端干扰与稳态单次分布分开，
-但 3 us 只是用于查询尾部样本的阈值，不是性能规格。
-
-FinalDrain 在两轮中都是同步补偿区域：其 start 跨核偏斜为
-312.070/276.616 us，start 与 duration 的相关系数为
-`-0.9892/-0.9925`，而 end 只分散 33.208/25.218 us。它不在用户关注的
-首末 Submit 窗口内；较大的 aggregate 主要表示早到核等待晚到核，不能
-当成 96 个可独立消除的本地算法瓶颈。
-
-### 6.11 后续取证顺序：先确认瓶颈，再讨论优化
-
-下一阶段不先写优化补丁，也不继续扩张设备记录。先按以下顺序把现有 span
-能够回答和不能回答的问题分开；每一步仍以当前完整布局和整数闭合作为
-正确性门禁：
-
-1. **固定权威基线**：后续结构迭代用 b1，阶段性结论才跑 b256；保留
-   `dropped=0`、事件数、父子关系、Kernel 唯一归属和六类整数闭合。
-2. **分开总体工作量与墙钟末端**：Materialize、Claim、EfDrain、
-   SubmitTransition、Register、PrepareMap 的 aggregate core-work 用于描述 96 核
-   总体工作量；最后 Submit 所在核及其串行 span 才用于解释本轮墙钟终点。
-   两者排名不能相互替代。
-3. **先解释现有 Kernel 长尾**：当前两轮都出现 task1277/SF 的
-   `ExecuteKernel()` 完整区间长尾，但物理核和承接它的 EfDrain 会漂移。先沿
-   现有 synthetic engine、完成 flag 和 `DrainReady()` 调用链核对
-   `ExecuteKernel()` 区间内的 engine launch/completion wait，并单独核对区间
-   结束后仍属于 EfDrain/FinalDrain control 的完成发布与 Commit；在没有进一步
-   证据前，不把它命名为纯 TADD、scalar、Atomic 或 I-cache 瓶颈。
-4. **微观计数按问题复用**：只有需要区分 scalar busy 与 I-cache 时，才复用
-   独立 `submit-pmu none`；Materialize、Claim、EfDrain、Register 的局部 PMU
-   只作为已有定性证据。不同 ELF 的阶段值不相减，也不为继续细分而默认新增
-   设备字段或扩大 raw。
-5. **形成单变量候选清单**：每个候选必须明确预期影响哪个现有 span，并
-   检查成本是否转移到相邻 span，同时检查 `.text`、I-cache PMU、泳道 core-work 和
-   关闭诊断后的实际 Submit 时间；完成这些取证后才开始性能修改。
-
-还需特别区分 `submit-pmu` 的两个时间口径：primary PMU counter 覆盖
-`PmuWindowStart()` 到 `PmuWindowStop()`，而当前阶段时间占比的分母是每核首个
-Submit begin 到末个 Submit end。前者比后者多 Setup/最后返回等小段；报告必须
-明确分母，不能把二者静默当成同一完整区间。
-
-### 6.12 compete-first eager 移植后的当前权威布局
-
-2026-07-20 已将受控 B 版的稳定收益形状移植回 standalone 主路，
-但没有移植 C 版 lazy 跳过构参。当前 96 个 worker 仍全部同步构造
-完整 `TaskArgs`；改变的是 Claim 与构参的先后关系，以及 CCEC
-caller/runtime-state/noinline-finish 的编译布局。当前业务时间线为：
-
-```text
-OrchestrationSetup
-  InitPaOrchestration / BeginPaBatchForCallback / context read / BeginCallbackSubmit
-
 Submit
-  EfDrain
-  Claim
-  Claim.end -> Materialize.begin residual
-    Claim record 发布 + 同步 eager callback 构造完整 TaskArgs + 调用衔接
-  Materialize
-  PrepareMap
-  winner non-Alloc: Fanin
-  Register
-  winner: WinnerBuild 或 AllocComplete
-  loser/winner 公共收尾 -> Submit.end
+  = explicit children
+  + submit_internal_residual
+  + submit_tail_residual
 
-SubmitTransition
-  前一 Submit record 发布/返回 + AcceptTaskOutputs + block-group/batch 准备
-  + 下一次 BeginCallbackSubmit
+OrchestrationReplay
+  = setup + SubmitUnion
+  + between_submit_residual + tail
 ```
 
-Materialize 之后的相邻 child 继续复用已有 end 边界，只有
-`Claim -> Materialize` 因真实 callback 构参而保留非零内部 residual。
-这个 residual 不新增 raw 字段、记录或 `SYS_CNT` 读取，由 converter/
-analyzer 使用现有 Claim.end 和 Materialize.begin 离线复算。旧 6.4～6.11
-中“构参全部属于 SubmitTransition”、Alloc `Register -> Claim` 和
-“Submit 内无 child-to-child gap”都只属于移植前历史样本。
+不能把 `between_submit_residual` 再加进某个 Submit，也不能把 merged 中的
+`submit_residual` 和 exclusive JSON 聚合层的总 `submit_residual` 当成两个不同
+区域重复相加。
 
-当前 CCEC A5 b1 权威产物为：
+### 7.6 必须区分的四个“总时间”
+
+#### 单核 Submit envelope
 
 ```text
-outputs/pa_scheduler_swimlane_20260720_092021_1729726/ccec/
-  l2_swimlane_records.json
-  merged_swimlane.json
-  swimlane_exclusive_analysis.json
+last_submit_end(core) - first_submit_start(core)
 ```
 
-该轮使用 `real-compute/6,28,4,1`，共 480 个 Submit、4,146 条 raw
-记录，`dropped_records=0`；atomic 闭合为
-`865 = 1475 - 862 + 252`，全部语义、角色、split state、Kernel 唯一归属与
-整数分区门禁通过。Submit aggregate core-work 为 2,345,639 SYS_CNT ticks：
+它只覆盖该核的首末 Submit，不含 OrchestrationSetup/Tail 和 FinalDrain。
 
-| 区域 | aggregate ticks | SubmitUnion 占比 |
-| --- | ---: | ---: |
-| Claim | 778,137 | 33.1738% |
-| Materialize | 446,670 | 19.0426% |
-| Claim→Materialize 构参 residual | 354,842 | 15.1277% |
-| Register | 228,377 | 9.7362% |
-| EfDrain | 222,825 | 9.4995% |
-| PrepareMap | 145,613 | 6.2078% |
-| Submit tail residual | 115,514 | 4.9246% |
-| WinnerBuild / AllocComplete / Fanin | 53,661 | 2.2877% |
-
-上表是带泳道/atomic 观察的 b1 aggregate core-work，用于验证新边界
-分类，不用来宣称关闭观察后的局部净耗时。关闭泳道的 b256
-独立进程样本为 `3706.483 / 3778.698 / 3735.032 / 3741.987 /
-3595.101 us`，中位数 3,735.032 us。移植前同口径五轮中位数为
-3,889.180 us，本轮中位数减少 154.148 us，约 3.9635%；候选五轮
-全部快于旧基线的最快一轮 3,825.697 us。该结果证明收益已在
-standalone 主路复现；它不直接承诺 simpler 真实 PA 也有相同比例。
-
-### 6.13 真实 simpler PA 移植验证
-
-2026-07-20 已按 6.12 的 Claim-first eager 语义完成 simpler 真实 PA
-移植。真实路径新增显式的 compete-first begin/finish API，同时保留旧 Submit/
-Alloc API 及其原有顺序，未把尚未验证的新语义强加给其他调用方。begin 返回
-32-byte 同步 ticket，精确保留 finish 重建本次 Submit 所需的 task、kernel、joint
-和 Claim 状态；finish 在同一次同步调用内消费该 ticket，不引入跨 Submit 的隐藏
-共享状态。
-
-与 standalone 一致，本次只改变 Claim 与构参的先后关系，没有采用 lazy
-跳过构参：所有 worker 在 Claim 后仍完整构造参数。真实 PA 当前阶段顺序为：
+#### 单核 WorkerCompletion
 
 ```text
-EfDrain -> Claim -> 同步 eager callback 完整构参
-        -> Materialize -> PrepareMap
-        -> winner non-Alloc Fanin -> Register
-        -> WinnerBuild / AllocComplete / LoserReplay -> Submit.end
+final_drain_end(core) - orchestration_begin(core)
 ```
 
-其中 `Claim.end -> Materialize.begin` 继续作为现有边界离线复算出的构参
-residual，不增加设备记录字段。旧 API 仍复用原有 Materialize-first 路径，
-因此新旧调用约定在接口上明确分离。
+它是本文最完整、可严格闭合的设备业务口径，但仍不含 StartupBarrier 和
+DFXFinalize。
 
-最终 32-byte ticket 关闭逐 atomic、保留 level-1 阶段观察的真实
-A/B 独立进程结果为：
-
-| 路径 | 三轮首末 Submit | 中位数 |
-| --- | --- | ---: |
-| compete-first 最终版 | 4.843652 / 4.809211 / 4.805443 ms | 4.809211 ms |
-| 6.7 原路径基线 | 4.821897 / 4.890447 / 4.752956 ms | 4.821897 ms |
-
-最终版三轮分别位于 `outputs/TestPagedAttentionUnroll_Case1_20260720_095456/`、
-`..._095724/` 和 `..._095929/`；原路径三轮的产物编号已在 6.7 列出。
-
-最终版相对原路径中位数减少 12.686 us，约 0.263%，两组三轮的波动
-区间重叠。因此真实 PA 没有复现 standalone 的 3.9635% 收益，但也没有
-证据表明存在性能回退；该结果按当前测量精度应视为性能基本持平，不能
-包装成真实 PA 稳定收益。
-
-迁移中还逐步验证了更小 ticket 的可行性。16-byte 按值 ticket 的三轮为
-5.055142/4.994567/4.949788 ms，同时段独立 worktree 原路径为
-4.972963/5.026234/4.842937 ms；中位数反向差 21.604 us（+0.434%）且波动
-重叠，不能证明缩小 ticket 有益。显式 pointer ticket 又出现首份 5.331474 ms 样本，
-因此不再继续堆叠该方向，并完整撤回两个过程态。最终保留 32-byte 精确
-ticket，避免为追求结构尺寸而引入不可证明的状态重建或跨调用生命周期约束。
-
-最终真实 A5 level-4 权威产物为：
+#### 跨核 Submit makespan
 
 ```text
-outputs/TestPagedAttentionUnroll_Case1_20260720_104406/
+max(last_submit_end) - min(first_submit_start)
 ```
 
-该轮包含 122,880 个 Submit、945,653 条事件，`dropped_records=0`，全局首末
-Submit 为 5.066862 ms。父子关系、阶段顺序、排他整数分区和 atomic 计数等全部
-闭合门禁通过；`Claim -> Materialize` 构参 residual 为 46,260,081 cycles，
-占 SubmitUnion 的 11.5536%。Atomic 物理记录与逻辑调用闭合为：
+起点和终点可能来自不同核。它是墙钟包络，不等于任一核的阶段和，也不等于
+96 核 duration 总和。
+
+#### aggregate core-work
 
 ```text
-106355 = 109392 - 3361 + 324
+sum(per_core_metric)
 ```
 
-这份 level-4 结果证明 Claim-first 后的真实布局、观察边界和离线加工一致；它不
-改变前述 A/B 结论，也不把带观察运行的 5.066862 ms 当成关闭观察后的净收益。
-最终 A5Sim PA 也在 `outputs/TestPagedAttentionUnroll_Case1_20260720_104649/`
-通过：108 核、每核 1,280 个 Submit、1,422,842 条事件、`dropped_records=0`，
-全部整数闭合通过。另外用现有 simple-orch smoke 补了 AIC+AIV0 joint
-compete-first 分支；`outputs/TestSimpleOrchSmoke_A5SimBd36CompeteFirstMixedDelta47_20260720_105945/`
-包含 108 核、每核 3 个 Submit、4,950 条事件，同样 `dropped_records=0` 且全部闭合通过。
+它回答“所有 scalar lane 累计投入了多少核时间”，适合比较阶段工作量分布，
+不回答用户等待了多久。排他分析 JSON 明确把它与 global makespan 分开输出。
+
+### 7.7 Atomic 为什么只能作为 Overlay
+
+Atomic span 已经位于 Claim、EfDrain、FinalDrain、AllocComplete 等父区间内。
+PollBatch 还可能用一条记录覆盖一个完整轮询 episode，而不是一条指令。
+
+因此 Atomic 只能回答“原子访问发生在哪个业务区域、规模如何”，不能：
+
+- 再加到父阶段上；
+- 从父阶段机械相减得到纯 scalar 时间；
+- 用 aggregate Atomic duration 除以调用数得到单条硬件延迟；
+- 直接解释全局 makespan 的关键路径。
+
+## 8. 从设备记录到可验收泳道
+
+### 8.1 `run.sh swimlane` 的三份产物
+
+```text
+device trace
+   │
+   ▼
+l2_swimlane_records.json          raw，业务证据和十列整数 ABI
+   ├─ swimlane_converter.py
+   │      └─ merged_swimlane.json Perfetto/Chrome Trace 可视化
+   └─ swimlane_exclusive_analyzer.py
+          └─ swimlane_exclusive_analysis.json 排他闭合与统计
+```
+
+`swimlane` action 固定执行一轮，并默认打开逐 Atomic 观察。它按 backend 建立
+独立输出目录，先让 runner 完成语义校验和 raw 发布，再顺序运行 converter 和
+exclusive analyzer；任一步失败都会返回非零。
+
+排他分析器直接读取 raw，不以 merged 文件作为数值输入。merged 的职责是展示；
+exclusive JSON 的职责是用整数区间验证加和关系。
+
+### 8.2 raw 记录表达什么
+
+raw 的 `fdwic_events` 每行固定十列：
+
+```text
+core, block, lane, task, function, phase, start, end, flags, auxiliary
+```
+
+时间戳单位不能按平台名称猜测，只能使用同一 raw metadata 中的
+`clock_freq_hz`。当前 standalone schema-v4 支持 phase-only level 1 和带 Atomic
+的 level 4；二者业务 phase 相同，观察扰动不同。
+
+### 8.3 converter 做的事情
+
+converter 会：
+
+- 校验 schema、时钟、32 AIC + 64 AIV 拓扑和 producer summary；
+- 把每个 mixed block 建成一个 Perfetto process；
+- 为每条硬件 lane 拆出 runtime 和 kernel 子泳道；
+- 根据 raw flags 标注 claim won/lost/not-attempted；
+- 只用已有父子边界合成 `between_submit_residual`、`submit_residual` 和
+  `submit_tail_gap`；
+- 完整写入临时文件并同步后再原子替换 merged 输出。
+
+合成 residual 不改变 raw ABI，也不凭空创造业务阶段。
+
+### 8.4 exclusive analyzer 的 fail-closed 门禁
+
+排他报告只有在以下条件全部满足时才生成：
+
+- 96 个 core id、32/64 role map 和 block/lane 映射完整；
+- `dropped_records == 0`；
+- 每核 Submit task id 连续且 task stream 完全一致；
+- 每个 Submit 恰有 EfDrain、Materialize、PrepareMap、Claim、Register；
+- Fanin 和 winner tail 的条件数量与 Claim winner/Alloc 标记一致；
+- 同一父区间的排他 child 不重叠，且 task id 与父 Submit 一致；
+- 每核恰有一个 OrchestrationReplay 和一个 FinalDrain，二者边界相邻；
+- 每条 Kernel 唯一归入 EfDrain、winner tail 或 FinalDrain；
+- 所有闭合式在 raw 整数 tick 上精确相等。
+
+Host 在 raw 发布前还会校验共享 flag/vend/frontier、Claim/winner 计数、每核
+结果、trace header 和真实 workload 输出。也就是说，“能打开 JSON”不是验收
+标准；producer、Host 和离线分析三层都通过才是一份可用证据。
+
+### 8.5 最小复现入口
+
+```bash
+cd tests/atomic_probe/pa_scheduler
+./run.sh build ccec
+./run.sh swimlane ccec --batches 256
+```
+
+CCEC 才是本文 A5 mixed-core 路径的性能证据入口。CPU backend 用于协议和算术
+语义检查，不是 A5 时序基线；不同 backend 的绝对 duration 不应互相代替。
+
+## 9. 与 `simpler` 主场景的差异
+
+下面比较 standalone 与当前
+`examples/a5/fully_distributed_within_core/paged_attention_unroll` 加通用
+dist runtime。这里区分“生产 runtime 具备的能力”和“PA Case1 本次实际会走的
+分支”，避免把能力差异误写成每轮必然发生的动作。
+
+| 维度 | standalone PA scheduler | `simpler` 主场景 |
+| ---- | ----------------------- | ---------------- |
+| 目标 | 独立复现 PA Case1 的 Submit/依赖/完成协议 | 通用 dist runtime 执行真实 example orchestration 和 kernel |
+| Host/入口 | 专用 Host 准备 `SchedulerState` 并 launch mixed ELF | Runtime 准备 L2 参数，各 AICore 回放 orchestration entry |
+| 图规模 | 每 batch 固定一组 `Alloc+QK+SF+PV+UP` | 可有多个 q-loop 和 block group；Case1 才退化为每 batch 5 task |
+| 参数与数据 | PA 形状/descriptor 拓扑接近真实路径，地址与计算 workspace 为 standalone 输入 | descriptor 指向真实输入输出，kernel 结果构成真实数值数据流 |
+| 当前 PA API | compete-first eager，所有 worker 构参 | 该 PA example 也使用 compete-first eager；旧 one-shot API 仍供其他 example 使用 |
+| Begin/Finish ABI | 16-byte ticket，只携带单 lane winner 所需状态 | 32-byte ticket，还携带 joint、ready、kind 等生产状态 |
+| Claim 能力 | 只允许单 lane，`active_count >= 2` 显式拒绝 | 通用 runtime 支持 joint task 和 BlockWon 发布/领取 |
+| loser 尾动作 | kernel loser 无额外动作，只形成 residual | 调用 `drain_block_won()` 并记录 `LoserReplay`；Case1 可快速返回 |
+| EfDrain | 只 drain 本核普通私有 slot | 先处理 BlockWon，再 drain phase-B 私有 slot |
+| FinalDrain | 等 all-replayed 且本核 slot 为空 | 还必须确认没有 pending BlockWon lane |
+| 数值 workload | 默认用独立 workspace 运行合成的 Cube/Vector 完整流水 | 执行 example 的真实 QK/SF/PV/UP kernel 与真实 tensor |
+| trace record | standalone `TraceRecord` 为 64 B | `FdwicSwimlaneRecord` 为 32 B，且多 `LoserReplay` 等生产 phase |
+| 拓扑假设 | analyzer 固定验证 32 AIC + 64 AIV | worker/block 数来自 Runtime 配置，通用代码不能假设永远为 96 |
+
+### 9.1 图规模的具体差异
+
+真实 unroll orchestration 的一轮 q-scope 是：
+
+```text
+Alloc × 1
+for each block group:
+    QK → SF → PV → UP
+```
+
+所以一般 task 数取决于 batch、`q_loop` 和 block group 数，并不总是 `5B`。
+standalone 固定 `q_loop=1` 且每 batch 只有一个 group，才得到本文的五 task
+周期。本文第 3.6 节的计数门禁只适用于这个固定输入边界。
+
+### 9.2 “aicpu_orchestration_entry” 名称不能按字面误读
+
+在当前 CCEC dist replay 中，每个有效 AICore worker 从 Runtime 复制
+orchestration tensor/scalar 参数，再直接调用链接进设备镜像的
+`aicpu_orchestration_entry`。这个符号名沿用 API 历史，不表示本文泳道中的
+OrchestrationReplay 是 Host/AICPU 墙钟。
+
+standalone 不经过这套通用 Runtime 参数装载，而是直接在
+`RunSchedulerImpl` 中构造固定的 `PaOrchestrationState`。
+
+### 9.3 数据依赖相似，但数值计算不能等同
+
+standalone 对 descriptor owner、TensorMap overlap、fanin flag 和
+vend/frontier 的调度依赖是实的；QK→SF→PV→UP 的顺序也是真实 PA Case1
+拓扑。
+
+但默认 `real-compute` 的 engine workload 使用独立 workspace，目的在于提供
+稳定的 AIC/AIV 计算负载和完成等待，不会把 QK 的数值输出真正送入 SF，再送入
+PV/UP。因此可以用它研究调度和取时布局，不能用它验证 PA 数值正确性或把其
+kernel duration 直接当成主场景 kernel duration。
+
+### 9.4 泳道数值不能跨两条路径直接横比
+
+两条路径的 record 大小、BlockWon/loser 动作、Host 入口、计算体和编译布局都
+不同。即使 phase 名相同，absolute duration 也不具备天然可比性。
+
+可以复用的是：
+
+- `OrchestrationReplay + FinalDrain` 的顶层业务口径；
+- compete-first 的 EfDrain → Claim → eager ArgBuild → Finish 顺序；
+- Materialize、PrepareMap、Fanin、Register 的业务定义；
+- parent/child/residual/overlay 的排他建模方法。
+
+必须重新验证的是：
+
+- 实际 task 数和 dependency graph；
+- joint/BlockWon 与 `LoserReplay` 的条件分支；
+- 每条 Kernel 的唯一父位置；
+- Host 端完整 makespan 的起止边界；
+- 观察插桩对真实 ELF 布局和性能的影响。
+
+## 10. 源码阅读地图
+
+建议按以下顺序阅读，先建立业务图，再进入平台细节：
+
+1. [common/pa_model.h](common/pa_model.h)
+
+   查看拓扑常量、TaskKind、共享/私有状态、TracePhase 和 raw ABI。
+
+2. [common/pa_frontend.h](common/pa_frontend.h)
+
+   查看 descriptor、TensorMap、Materialize、Fanin、Register 和 slot payload。
+
+3. [common/pa_scheduler_core.h](common/pa_scheduler_core.h)
+
+   从 `RunSchedulerImpl` 进入，再读 `SubmitCallbackTask`、
+   `FinishCallbackSubmitBody`、`DrainReady`、`CompleteTask`。
+
+4. [ccec/callback_runtime_entry.cpp](ccec/callback_runtime_entry.cpp) 与
+   [ccec/callback_finish.cpp](ccec/callback_finish.cpp)
+
+   查看 CCEC worker 入口和 compete-first split finish 边界。
+
+5. [ccec/host.cpp](ccec/host.cpp) 与 [run.sh](run.sh)
+
+   查看 Host launch、D2H 校验、raw 发布和三段后处理流水线。
+
+6. [swimlane_converter.py](swimlane_converter.py) 与
+   [swimlane_exclusive_analyzer.py](swimlane_exclusive_analyzer.py)
+
+   查看 Perfetto 映射、residual 合成和整数闭合门禁。
+
+对照 `simpler` 主场景时，再阅读：
+
+- [生产 Submit runtime](../../../src/a5/runtime/fully_distributed_within_core/runtime/dist_engine/aicore/submit_runtime.h)
+- [生产 core main](../../../src/a5/runtime/fully_distributed_within_core/runtime/dist_engine/aicore/core_main.h)
+- [compete-first API](../../../src/a5/runtime/fully_distributed_within_core/orchestration/pto_orchestration_api.h)
+- [PA unroll orchestration](../../../examples/a5/fully_distributed_within_core/paged_attention_unroll/kernels/orchestration/paged_attention_orch.cpp)
 
 ## 结论
 
-历史 schema-v3 泳道不闭合的根因不是缺少一次 duration 求和，而是
-Submit 父区间、Kernel 嵌套、Atomic/Clock/lap Overlay 和缺失的 orchestration/final
-drain 外层边界被混在同一加和口径中。
+standalone PA scheduler 的主执行模型可以压缩为一句话：
 
-当前 schema-v4 的父子关系、事件数量、Kernel 归属和整数闭合已在
-compete-first eager 移植后的 CCEC A5 b1 重新验证。Submit 内部当前只有
-`Claim.end -> Materialize.begin` 保留有意义的 child-to-child residual，
-它对应 Claim record 发布、同步 eager callback 构参和调用衔接。
-`SubmitFinalize` 仍是最后 record 与公共收尾；`SubmitTransition` 改为记录发布、
-返回、输出接收和下一次 Submit 上下文初始化，不再包含完整参数构造。
-这些 residual 仍保留数学补集属性，不能仅靠改名伪装成性能消减。
+> 96 个 worker 同步重放同一条 PA task stream；每个 Submit 先推进旧任务、竞争
+> 唯一 winner，再由所有 worker 完成 eager 构参与私有依赖建模；winner 只把
+> kernel 放入 slot，后续 drain 在 fanin ready 后执行并发布全局完成，最后由
+> FinalDrain 清空尾部在途任务。
 
-当前 b1 带观察的 aggregate 分布中，Claim、Materialize、同步构参
-residual、Register 和 EfDrain 是主要区域；泳道仍只能给出完整观察窗口，
-不能独立分出纯业务、Atomic、I-cache、GM stall 与 DFX 记录成本。
-关闭泳道的五轮 b256 已证明 standalone 主路收益可复现；同一语义移植到
-simpler 真实 PA 后，阶段顺序、记录完整性和闭合门禁均已通过，但三轮 A/B
-只显示约 0.263% 的正向中位数差且波动重叠。当前应保留其更清晰的业务布局，
-同时把真实性能结论限定为基本持平，不直接套用 standalone 收益比例。
+泳道的正确加和方式也可以压缩为一句话：
 
-[pa-orch]: ../../../examples/a5/fully_distributed_within_core/paged_attention_unroll/kernels/orchestration/paged_attention_orch.cpp
+> 只在同一物理 lane、同一父区间内，对互斥 child 与 residual 做整数闭合；
+> Kernel、Atomic 和多核 aggregate 不能再次加到墙钟父区间上。
+
+掌握这两句话后，再去看某个 phase 的时间分布，才能区分“业务工作发生在哪里”、
+“任务何时真正完成”和“观察器把时间记到了哪里”。
