@@ -139,9 +139,9 @@ COMMON_FLAGS=(
     "${VARIANT_DEFINES[@]}"
 )
 
-# CompeteFirstSplitRuntimeState 当前 ABI 为 1600B。只给 split 产物开启
+# CompeteFirstSplitRuntimeState 当前 ABI 为 1664B。只给 split 产物开启
 # block-local relocation，并按精确尺寸预留，避免影响局部 PMU 的 inline ELF。
-SPLIT_STATE_BYTES=1600
+SPLIT_STATE_BYTES=1664
 SPLIT_FINISH_CALL_SITES=5
 if [[ "$SPLIT_FINISH" -eq 1 ]]; then
     COMMON_FLAGS+=(

@@ -1111,10 +1111,13 @@ bool ExportPmuJson(
     std::fprintf(
         output,
         ",\"device\":%u,\"batches\":%u,\"workers\":%u,\"aic_workers\":%u,\"aiv_workers\":%u,"
+        "\"final_barrier\":\"%s\","
         "\"trace_enabled\":%s,\"trace_atomics\":%s,\"profile_phases\":%s,"
         "\"winner_workload\":{\"mode\":",
         options.device, options.batches, pa_scheduler::kWorkers, pa_scheduler::kAicWorkers,
-        pa_scheduler::kAivWorkers, options.trace_enabled ? "true" : "false",
+        pa_scheduler::kAivWorkers,
+        pa_scheduler::host::FinalBarrierShapeName(options.final_barrier_shape),
+        options.trace_enabled ? "true" : "false",
         options.trace_atomics ? "true" : "false",
         options.profile_phases ? "true" : "false"
     );
@@ -1725,6 +1728,10 @@ int main(int argc, char **argv) {
     std::unique_ptr<pa_scheduler::SchedulerState> state(new pa_scheduler::SchedulerState);
     pa_scheduler::TraceHeader trace_header{};
     std::vector<double> spans;
+    std::vector<double> startup_barrier_spans;
+    std::vector<double> final_barrier_spans;
+    std::vector<double> final_drain_spans;
+    std::vector<double> lifecycle_spans;
     bool execution_ok = true;
     bool all_passed = true;
     bool postprocess_ok = true;
@@ -1817,6 +1824,14 @@ int main(int argc, char **argv) {
             ) ||
             !CheckAcl(
                 aclrtMemcpy(
+                    &state->final_barrier, pa_scheduler::host::FinalBarrierStateBytes(),
+                    &static_cast<pa_scheduler::SchedulerState *>(state_device)->final_barrier,
+                    pa_scheduler::host::FinalBarrierStateBytes(), ACL_MEMCPY_DEVICE_TO_HOST
+                ),
+                "aclrtMemcpy(D2H final barrier)"
+            ) ||
+            !CheckAcl(
+                aclrtMemcpy(
                     state->results, pa_scheduler::host::ResultBytes(),
                     &static_cast<pa_scheduler::SchedulerState *>(state_device)->results[0],
                     pa_scheduler::host::ResultBytes(), ACL_MEMCPY_DEVICE_TO_HOST
@@ -1890,6 +1905,10 @@ int main(int argc, char **argv) {
         );
         all_passed &= pmu_passed;
         spans.push_back(metrics.submit_span_us);
+        startup_barrier_spans.push_back(metrics.startup_barrier_span_us);
+        final_barrier_spans.push_back(metrics.final_barrier_span_us);
+        final_drain_spans.push_back(metrics.final_drain_span_us);
+        lifecycle_spans.push_back(metrics.lifecycle_span_us);
         if (!pmu_options.json_path.empty()) {
             if (!metrics.passed || !workload_passed || !pmu_passed || !pmu_owner_evidence_valid) {
                 std::fprintf(stderr, "PMU JSON rejected because semantic, PMU, or owner validation failed.\n");
@@ -1928,7 +1947,7 @@ int main(int argc, char **argv) {
                     real_compute
                         ? pa_scheduler::host::RealComputePatternName(workload_options.pattern)
                         : "none",
-                    options.trace_atomics,
+                    options.final_barrier_shape, options.trace_atomics,
                     read_trace_records
                 )) {
                 postprocess_ok = false;
@@ -1938,11 +1957,22 @@ int main(int argc, char **argv) {
     }
 
     const double median_submit_span_us = spans.empty() ? 0.0 : pa_scheduler::host::Median(spans);
+    const double median_startup_barrier_us =
+        startup_barrier_spans.empty() ? 0.0 : pa_scheduler::host::Median(startup_barrier_spans);
+    const double median_final_barrier_us =
+        final_barrier_spans.empty() ? 0.0 : pa_scheduler::host::Median(final_barrier_spans);
+    const double median_final_drain_us =
+        final_drain_spans.empty() ? 0.0 : pa_scheduler::host::Median(final_drain_spans);
+    const double median_lifecycle_us = lifecycle_spans.empty() ? 0.0 : pa_scheduler::host::Median(lifecycle_spans);
     std::printf(
-        "[SUMMARY] runs=%u completed_runs=%zu median_submit_span_us=%.3f "
+        "[SUMMARY] runs=%u completed_runs=%zu final_shape=%s median_submit_span_us=%.3f "
+        "median_startup_barrier_us=%.3f median_final_barrier_us=%.3f "
+        "median_final_drain_us=%.3f median_lifecycle_us=%.3f "
         "execution_status=%s semantic_status=%s postprocess_status=%s\n",
-        options.runs, spans.size(), median_submit_span_us, execution_ok ? "PASS" : "FAIL",
-        all_passed ? "PASS" : "FAIL", postprocess_ok ? "PASS" : "FAIL"
+        options.runs, spans.size(), pa_scheduler::host::FinalBarrierShapeName(options.final_barrier_shape),
+        median_submit_span_us, median_startup_barrier_us, median_final_barrier_us, median_final_drain_us,
+        median_lifecycle_us, execution_ok ? "PASS" : "FAIL", all_passed ? "PASS" : "FAIL",
+        postprocess_ok ? "PASS" : "FAIL"
     );
 
     // 后处理失败也统一走设备资源释放、ELF 卸载和 ACL 收尾，避免文件系统错误遗留运行时上下文。

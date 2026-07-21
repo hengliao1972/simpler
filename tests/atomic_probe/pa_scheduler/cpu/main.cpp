@@ -299,6 +299,10 @@ int main(int argc, char **argv) {
     }
     auto *trace_header = static_cast<pa_scheduler::TraceHeader *>(trace_memory);
     std::vector<double> spans;
+    std::vector<double> startup_barrier_spans;
+    std::vector<double> final_barrier_spans;
+    std::vector<double> final_drain_spans;
+    std::vector<double> lifecycle_spans;
     bool all_passed = true;
     bool postprocess_ok = true;
     // 每轮复用大块 host 分配，只重置公共状态和 trace header。与设备后端一样，
@@ -370,6 +374,10 @@ int main(int argc, char **argv) {
             );
         all_passed &= metrics.passed && workload_passed;
         spans.push_back(metrics.submit_span_us);
+        startup_barrier_spans.push_back(metrics.startup_barrier_span_us);
+        final_barrier_spans.push_back(metrics.final_barrier_span_us);
+        final_drain_spans.push_back(metrics.final_drain_span_us);
+        lifecycle_spans.push_back(metrics.lifecycle_span_us);
         // 分析只打印统计，导出则写 raw JSON；两者失败都标记 postprocess，
         // 与调度语义失败分开报告，便于区分协议问题和产物问题。
         if (options.analyze_swimlane &&
@@ -397,7 +405,7 @@ int main(int argc, char **argv) {
                     real_compute
                         ? pa_scheduler::host::RealComputePatternName(workload_options.pattern)
                         : "none",
-                    options.trace_atomics,
+                    options.final_barrier_shape, options.trace_atomics,
                     read_trace_records
                 )) {
                 postprocess_ok = false;
@@ -407,8 +415,13 @@ int main(int argc, char **argv) {
     }
 
     std::printf(
-        "[SUMMARY] runs=%u median_submit_span_us=%.3f semantic_status=%s postprocess_status=%s\n", options.runs,
-        pa_scheduler::host::Median(spans), all_passed ? "PASS" : "FAIL", postprocess_ok ? "PASS" : "FAIL"
+        "[SUMMARY] runs=%u final_shape=%s median_submit_span_us=%.3f median_startup_barrier_us=%.3f "
+        "median_final_barrier_us=%.3f median_final_drain_us=%.3f median_lifecycle_us=%.3f "
+        "semantic_status=%s postprocess_status=%s\n",
+        options.runs, pa_scheduler::host::FinalBarrierShapeName(options.final_barrier_shape),
+        pa_scheduler::host::Median(spans), pa_scheduler::host::Median(startup_barrier_spans),
+        pa_scheduler::host::Median(final_barrier_spans), pa_scheduler::host::Median(final_drain_spans),
+        pa_scheduler::host::Median(lifecycle_spans), all_passed ? "PASS" : "FAIL", postprocess_ok ? "PASS" : "FAIL"
     );
     // std::free(nullptr) 合法，因此关闭泳道时也走同一条收尾路径。
     std::free(trace_memory);

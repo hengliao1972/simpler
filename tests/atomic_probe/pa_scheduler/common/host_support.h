@@ -33,6 +33,7 @@ struct Options {
     uint32_t batches = kDefaultBatches;
     uint32_t runs = 5;
     NopCounts nops{kDefaultQkNops, kDefaultSfNops, kDefaultPvNops, kDefaultUpNops};
+    FinalBarrierShape final_barrier_shape = FinalBarrierShape::Flat;
     bool profile_phases = false;
     bool trace_enabled = true;
     bool trace_atomics = false;
@@ -76,6 +77,43 @@ inline bool ParseNopCounts(const char *raw, NopCounts *counts) {
     return true;
 }
 
+inline const char *FinalBarrierShapeName(FinalBarrierShape shape) {
+    switch (shape) {
+    case FinalBarrierShape::Flat:
+        return "flat";
+    case FinalBarrierShape::TwoLevel4:
+        return "two-4";
+    case FinalBarrierShape::TwoLevel8:
+        return "two-8";
+    case FinalBarrierShape::TwoLevel16:
+        return "two-16";
+    case FinalBarrierShape::ThreeLevel6x4x4:
+        return "three-6x4x4";
+    }
+    return "invalid";
+}
+
+inline bool ParseFinalBarrierShape(const char *raw, FinalBarrierShape *shape) {
+    struct Entry {
+        const char *name;
+        FinalBarrierShape shape;
+    };
+    constexpr Entry kEntries[] = {
+        {"flat", FinalBarrierShape::Flat},
+        {"two-4", FinalBarrierShape::TwoLevel4},
+        {"two-8", FinalBarrierShape::TwoLevel8},
+        {"two-16", FinalBarrierShape::TwoLevel16},
+        {"three-6x4x4", FinalBarrierShape::ThreeLevel6x4x4},
+    };
+    for (const Entry &entry : kEntries) {
+        if (std::strcmp(raw, entry.name) == 0) {
+            *shape = entry.shape;
+            return true;
+        }
+    }
+    return false;
+}
+
 inline void PrintUsage(const char *program, bool require_kernel) {
     // require_kernel 只影响 CCEC host 的用法文本，其余 benchmark 参数在三后端完全一致。
     std::fprintf(
@@ -85,7 +123,8 @@ inline void PrintUsage(const char *program, bool require_kernel) {
     std::fprintf(
         stderr,
         "[--nop-count N | --nop-counts QK,SF,PV,UP] [--profile-phases] [--analyze-swimlane] "
-        "[--trace-atomics] [--swimlane-json FILE] [--no-swimlane]\n"
+        "[--trace-atomics] [--swimlane-json FILE] [--no-swimlane] "
+        "[--final-barrier flat|two-4|two-8|two-16|three-6x4x4]\n"
     );
 }
 
@@ -129,6 +168,11 @@ inline ParseStatus ParseOptions(int argc, char **argv, bool require_kernel, Opti
             if (!ParseUint(value, 1, kMaxBatches, &options->batches)) return ParseStatus::Error;
         } else if (argument == "--runs") {
             if (!ParseUint(value, 1, 1000, &options->runs)) return ParseStatus::Error;
+        } else if (argument == "--final-barrier") {
+            if (!ParseFinalBarrierShape(value, &options->final_barrier_shape)) {
+                std::fprintf(stderr, "Unknown final barrier shape: %s\n", value);
+                return ParseStatus::Error;
+            }
         } else if (argument == "--swimlane-json") {
             if (swimlane_json_seen) {
                 std::fprintf(stderr, "Specify --swimlane-json only once.\n");
@@ -202,6 +246,7 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     state->config.workers = kWorkers;
     state->config.nops = options.nops;
     state->config.profile_phases = options.profile_phases ? 1U : 0U;
+    state->config.final_barrier_shape = static_cast<uint32_t>(options.final_barrier_shape);
     for (uint32_t batch = 0; batch < options.batches; ++batch) {
         state->context_lens[batch] = 8192;
     }
@@ -244,16 +289,73 @@ inline constexpr size_t ControlBytes() {
 
 inline constexpr size_t ResultBytes() { return sizeof(WorkerResult) * kWorkers; }
 
+inline constexpr size_t FinalBarrierStateBytes() { return sizeof(FinalBarrierState); }
+
 struct Metrics {
-    // passed 是全部语义断言的合取；submit_span_us 是本用例唯一用于对比 PA 的性能口径。
+    // lifecycle_* 来自跨核一致的 1 GHz SYS_CNT；host_launch_us 仍只作为包含
+    // launch/synchronize 的外层参考，不与设备内分段时间混算。
     bool passed = true;
     double submit_span_us = 0;
+    double startup_barrier_span_us = 0;
+    double final_barrier_span_us = 0;
+    double final_drain_span_us = 0;
+    double lifecycle_span_us = 0;
 };
 
 inline void Expect(bool condition, const char *label, Metrics *metrics) {
     // 所有断言都继续执行，以便一次失败运行尽可能暴露完整状态，而不是遇到首错立即退出。
     std::printf("[ASSERT] %-48s %s\n", label, condition ? "PASS" : "FAIL");
     if (!condition) metrics->passed = false;
+}
+
+inline bool FinalBarrierStateMatches(const FinalBarrierState &barrier, FinalBarrierShape shape) {
+    uint32_t leaf_groups = 0;
+    int64_t leaf_arrivals = 0;
+    uint32_t middle_groups = 0;
+    int64_t middle_arrivals = 0;
+    int64_t root_arrivals = 0;
+    switch (shape) {
+    case FinalBarrierShape::Flat:
+        break;
+    case FinalBarrierShape::TwoLevel4:
+        leaf_groups = 4;
+        leaf_arrivals = 24;
+        root_arrivals = 4;
+        break;
+    case FinalBarrierShape::TwoLevel8:
+        leaf_groups = 8;
+        leaf_arrivals = 12;
+        root_arrivals = 8;
+        break;
+    case FinalBarrierShape::TwoLevel16:
+        leaf_groups = 16;
+        leaf_arrivals = 6;
+        root_arrivals = 16;
+        break;
+    case FinalBarrierShape::ThreeLevel6x4x4:
+        leaf_groups = 16;
+        leaf_arrivals = 6;
+        middle_groups = 4;
+        middle_arrivals = 4;
+        root_arrivals = 4;
+        break;
+    default:
+        return false;
+    }
+    bool matches = true;
+    for (uint32_t group = 0; group < kFinalBarrierMaxLeafGroups; ++group) {
+        const bool active = group < leaf_groups;
+        matches &= barrier.leaf_arrivals[group].value == (active ? leaf_arrivals : 0);
+        matches &= barrier.leaf_releases[group].value == (active ? 1 : 0);
+    }
+    for (uint32_t group = 0; group < kFinalBarrierMaxMiddleGroups; ++group) {
+        const bool active = group < middle_groups;
+        matches &= barrier.middle_arrivals[group].value == (active ? middle_arrivals : 0);
+        matches &= barrier.middle_releases[group].value == (active ? 1 : 0);
+    }
+    matches &= barrier.root_arrival.value == root_arrivals;
+    matches &= barrier.root_release.value == (root_arrivals == 0 ? 0 : 1);
+    return matches;
 }
 
 struct Uint64Distribution {
@@ -472,7 +574,8 @@ template <typename ReadRecords>
 inline bool ExportSwimlaneRecords(
     const TraceHeader &header, const std::string &output_path,
     WinnerWorkloadMode workload_mode, const WorkloadCounts &workload_counts,
-    const char *workload_pattern, bool atomic_trace_enabled, ReadRecords read_records
+    const char *workload_pattern, FinalBarrierShape final_barrier_shape,
+    bool atomic_trace_enabled, ReadRecords read_records
 ) {
     if (!ValidateTraceHeader(header, "swimlane export")) return false;
     if (workload_mode != WinnerWorkloadMode::ScalarNop &&
@@ -555,14 +658,14 @@ inline bool ExportSwimlaneRecords(
         output,
         "{\n\"l2_swimlane_level\":%u,\n"
         "\"metadata\":{\"clock_freq_hz\":%llu,\"num_cores\":%u,"
-        "\"trace_schema_version\":%u,"
+        "\"trace_schema_version\":%u,\"final_barrier\":\"%s\","
         "\"winner_workload\":{\"mode\":\"%s\","
         "\"counts\":{\"qk\":%u,\"sf\":%u,\"pv\":%u,\"up\":%u},"
         "\"unit\":\"%s\",\"input_pattern\":\"%s\","
         "\"engine_mapping\":%s},\"core_types\":[",
         atomic_trace_enabled ? 4U : 1U,
-        static_cast<unsigned long long>(header.frequency_hz), kWorkers,
-        4U,
+        static_cast<unsigned long long>(header.frequency_hz), kWorkers, 4U,
+        FinalBarrierShapeName(final_barrier_shape),
         workload_mode == WinnerWorkloadMode::RealCompute ? "real-compute" : "scalar-nop",
         workload_counts.qk, workload_counts.sf, workload_counts.pv, workload_counts.up,
         workload_mode == WinnerWorkloadMode::RealCompute
@@ -984,6 +1087,9 @@ inline Metrics Validate(
     // 其余 kernel task 只有与 active role 匹配的 AIC 或 AIV 参与 Claim。
     const uint32_t batches = state.config.batches;
     const uint32_t task_count = batches * kTasksPerBatch;
+    const bool final_barrier_shape_valid =
+        state.config.final_barrier_shape <= static_cast<uint32_t>(FinalBarrierShape::ThreeLevel6x4x4);
+    const auto final_barrier_shape = static_cast<FinalBarrierShape>(state.config.final_barrier_shape);
     const uint64_t expected_submits = static_cast<uint64_t>(kWorkers) * task_count;
     const uint64_t expected_claims =
         static_cast<uint64_t>(batches) * (kWorkers + kAicWorkers + kAivWorkers + kAicWorkers + kAivWorkers);
@@ -992,6 +1098,14 @@ inline Metrics Validate(
     // 聚合量分为调度核心计数、kernel 分布、前端操作数和最终状态四组，便于定位语义偏差。
     uint64_t first_submit = UINT64_MAX;
     uint64_t last_submit = 0;
+    uint64_t first_startup_begin = UINT64_MAX;
+    uint64_t last_startup_end = 0;
+    uint64_t first_final_begin = UINT64_MAX;
+    uint64_t last_final_release = 0;
+    uint64_t last_final_end = 0;
+    std::vector<uint64_t> startup_wait_ticks;
+    std::vector<uint64_t> final_release_wait_ticks;
+    std::vector<uint64_t> post_release_drain_ticks;
     uint64_t submits = 0;
     uint64_t claims = 0;
     uint64_t wins = 0;
@@ -1032,6 +1146,7 @@ inline Metrics Validate(
     uint64_t max_worker_wins = 0;
     bool worker_shape_ok = true;
     bool submit_timestamps_ok = true;
+    bool lifecycle_timestamps_ok = true;
     bool vend_values_ok = true;
     bool frontend_worker_counts_ok = true;
     bool final_worker_state_ok = true;
@@ -1095,8 +1210,25 @@ inline Metrics Validate(
         submit_timestamps_ok &= result.submit_begin != 0;
         submit_timestamps_ok &= result.submit_end >= result.submit_begin;
         submit_timestamps_ok &= result.finish_cycle >= result.submit_end;
+        lifecycle_timestamps_ok &= result.startup_barrier_begin != 0;
+        lifecycle_timestamps_ok &= result.startup_barrier_end >= result.startup_barrier_begin;
+        lifecycle_timestamps_ok &= result.submit_begin >= result.startup_barrier_end;
+        lifecycle_timestamps_ok &= result.final_barrier_begin >= result.submit_end;
+        lifecycle_timestamps_ok &= result.final_barrier_release >= result.final_barrier_begin;
+        lifecycle_timestamps_ok &= result.final_barrier_end >= result.final_barrier_release;
+        lifecycle_timestamps_ok &= result.finish_cycle >= result.final_barrier_end;
+        for (uint64_t reserved : result.barrier_reserved)
+            lifecycle_timestamps_ok &= reserved == 0;
         first_submit = std::min(first_submit, result.submit_begin);
         last_submit = std::max(last_submit, result.submit_end);
+        first_startup_begin = std::min(first_startup_begin, result.startup_barrier_begin);
+        last_startup_end = std::max(last_startup_end, result.startup_barrier_end);
+        first_final_begin = std::min(first_final_begin, result.final_barrier_begin);
+        last_final_release = std::max(last_final_release, result.final_barrier_release);
+        last_final_end = std::max(last_final_end, result.final_barrier_end);
+        startup_wait_ticks.push_back(result.startup_barrier_end - result.startup_barrier_begin);
+        final_release_wait_ticks.push_back(result.final_barrier_release - result.final_barrier_begin);
+        post_release_drain_ticks.push_back(result.final_barrier_end - result.final_barrier_release);
         submits += result.submits;
         claims += result.claim_attempts;
         wins += result.claim_wins;
@@ -1222,7 +1354,13 @@ inline Metrics Validate(
     );
 #endif
     Expect(submit_timestamps_ok, "all Submit timing markers are valid", &metrics);
-    Expect(state.started_count.value == kWorkers, "started_count is 96", &metrics);
+    Expect(lifecycle_timestamps_ok, "all lifecycle timing markers are valid", &metrics);
+    Expect(final_barrier_shape_valid, "final barrier selector is valid", &metrics);
+    const bool flat_final_barrier = final_barrier_shape == FinalBarrierShape::Flat;
+    Expect(
+        state.started_count.value == static_cast<int64_t>(kWorkers),
+        "startup barrier remains flat and reaches all workers", &metrics
+    );
     Expect(submits == expected_submits, "replay count is workers * tasks", &metrics);
     Expect(claims == expected_claims, "Claim attempt count matches PA topology", &metrics);
     Expect(wins == task_count, "exactly one winner per task", &metrics);
@@ -1260,7 +1398,11 @@ inline Metrics Validate(
     Expect(vend_values_ok, "all published vend values are nonzero and aligned", &metrics);
     Expect(vend_progress_bounds_ok, "every task vend is within PA worker heap progress bounds", &metrics);
     Expect(state.frontier.value == static_cast<int64_t>(task_count) - 1, "frontier reaches the final task", &metrics);
-    Expect(state.replay_done.value == kWorkers, "replay_done is 96", &metrics);
+    Expect(
+        state.replay_done.value == (flat_final_barrier ? static_cast<int64_t>(kWorkers) : 0) &&
+            FinalBarrierStateMatches(state.final_barrier, final_barrier_shape),
+        "final barrier counters match selected tree", &metrics
+    );
     Expect(state.fatal.value == 0, "fatal remains clear", &metrics);
     Expect(placement_total == kernel_total, "EfDrain + RingBp + final placement covers every kernel", &metrics);
     // joint_polls 是为未来 BlockWon 模拟预留的结果字段，当前调度路径没有递增点；
@@ -1414,6 +1556,29 @@ inline Metrics Validate(
         // 性能口径只覆盖最早 Submit.begin 到最晚 Submit.end，不含启动屏障、最终 drain 和 host 同步。
         metrics.submit_span_us = static_cast<double>(last_submit - first_submit) / 1000.0;
     }
+    if (first_startup_begin != UINT64_MAX && last_startup_end >= first_startup_begin &&
+        first_final_begin != UINT64_MAX && last_final_release >= first_final_begin &&
+        last_final_end >= first_final_begin && last_final_end >= first_startup_begin) {
+        metrics.startup_barrier_span_us = static_cast<double>(last_startup_end - first_startup_begin) / 1000.0;
+        metrics.final_barrier_span_us = static_cast<double>(last_final_release - first_final_begin) / 1000.0;
+        metrics.final_drain_span_us = static_cast<double>(last_final_end - first_final_begin) / 1000.0;
+        metrics.lifecycle_span_us = static_cast<double>(last_final_end - first_startup_begin) / 1000.0;
+    }
+    const Uint64Distribution startup_wait = SummarizeUint64(startup_wait_ticks);
+    const Uint64Distribution final_release_wait = SummarizeUint64(final_release_wait_ticks);
+    const Uint64Distribution post_release_drain = SummarizeUint64(post_release_drain_ticks);
+    std::printf(
+        "[LIFECYCLE] run=%u final_shape=%s startup_span_us=%.3f final_barrier_span_us=%.3f "
+        "final_drain_span_us=%.3f lifecycle_span_us=%.3f "
+        "worker_startup_wait_median_us=%.3f worker_startup_wait_p95_us=%.3f "
+        "worker_final_wait_median_us=%.3f worker_final_wait_p95_us=%.3f "
+        "worker_post_release_drain_median_us=%.3f worker_post_release_drain_p95_us=%.3f\n",
+        run, FinalBarrierShapeName(final_barrier_shape), metrics.startup_barrier_span_us,
+        metrics.final_barrier_span_us, metrics.final_drain_span_us, metrics.lifecycle_span_us,
+        startup_wait.median / 1000.0, static_cast<double>(startup_wait.p95) / 1000.0,
+        final_release_wait.median / 1000.0, static_cast<double>(final_release_wait.p95) / 1000.0,
+        post_release_drain.median / 1000.0, static_cast<double>(post_release_drain.p95) / 1000.0
+    );
     std::printf(
         "[METRIC] run=%u submit_span_us=%.3f host_launch_us=%.3f claims=%llu fanin_loads=%llu cas_retries=%llu\n", run,
         metrics.submit_span_us, host_us, static_cast<unsigned long long>(claims),
@@ -1511,9 +1676,10 @@ inline void PrintBanner(const char *backend, const Options &options) {
     std::printf("=== Standalone PA Scheduler Benchmark: %s ===\n", backend);
     std::printf(
         "device=%u batches=%u tasks=%u workers=%u runs=%u nops=%u,%u,%u,%u state_bytes=%zu "
-        "swimlane=%s trace_atomics=%s trace_bytes=%zu\n", options.device,
+        "final_barrier=%s swimlane=%s trace_atomics=%s trace_bytes=%zu\n", options.device,
         options.batches, options.batches * kTasksPerBatch, kWorkers, options.runs, options.nops.qk, options.nops.sf,
-        options.nops.pv, options.nops.up, sizeof(SchedulerState), options.trace_enabled ? "on" : "off",
+        options.nops.pv, options.nops.up, sizeof(SchedulerState),
+        FinalBarrierShapeName(options.final_barrier_shape), options.trace_enabled ? "on" : "off",
         options.trace_atomics ? "on" : "off",
         options.trace_enabled ? kTraceBytes : 0
     );

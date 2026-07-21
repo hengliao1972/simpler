@@ -35,6 +35,7 @@ Benchmark options:
   --trace-atomics
   --swimlane-json FILE
   --no-swimlane
+  --final-barrier flat|two-4|two-8|two-16|three-6x4x4
 
 CCEC-only PMU probe options (selectors are owned by the standalone Main AICPU helper):
   --pmu-window off|empty|scalar|scalar-double|icache-single|submit-all

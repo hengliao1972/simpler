@@ -1637,3 +1637,161 @@ A5 standalone 数据支持把 G=8 视为后续候选：G=4→8 配对改善稳�
 按本次收口要求只提交测试记录，A5 production、A5 standalone 与 A2A3 的
 `kCursorShards` 均保持现状。若后续决定修改默认值，应在独立代码提交中重新完成
 静态构建的 ABI、功能和性能门禁。
+
+#### 7.5.17 只改 final 的分层全局汇合实验
+
+2026-07-21 在 standalone 中比较原始单计数器、三种二级分组和一种三级分组。
+本节最终只改 replay 尾部的 final 汇合；startup 严格恢复原始 `started_count`
+flat 屏障。所有候选仍经过唯一全局根节点，分组不是取消全局同步，也不允许某组
+在其他 worker 仍可能生产 slot 时提前退出。
+
+##### 7.5.17.1 为什么不改 startup
+
+前置探索曾同时替换 startup 和 final。清洗样本里 startup span 如下：
+
+| 形态 | startup span | 相对 flat |
+| ---- | -----------: | --------: |
+| flat | 53.125 us | - |
+| two-4 | 73.000 us | +19.875 us / +37.411% |
+| two-8 | 78.200 us | +25.075 us / +47.200% |
+| two-16 | 84.856 us | +31.731 us / +59.730% |
+| three-6x4x4 | 97.182 us | +44.057 us / +82.930% |
+
+startup 的工作只有“一次到达 + 等到 96”，期间没有可与等待重叠的 completion
+drain。分层反而新增叶代表向 root 转发以及 root 向叶 release 的串行传播，因此
+四种分层形态全部回退。final 不同：worker 等待全局“无人继续生产 slot”时仍会
+执行 `FinalDrain`，降低单一 `replay_done` cache line 的争用有机会缩短真正的尾部。
+所以正式版本只保留 final 实验，startup 代码和计数语义固定为原始 flat；五种
+形态的 `started_count` 终值都必须是 96。
+
+##### 7.5.17.2 final 的五种拓扑
+
+命令行 selector 改名为 `--final-barrier`，避免继续暗示 startup 也会变化：
+
+| selector | 到达拓扑 | 向下放行拓扑 |
+| -------- | -------- | ------------ |
+| `flat` | 96 workers → 原 `replay_done` | 同一计数器达到 96 即全局放行 |
+| `two-4` | 4 叶组 × 24 workers → root(4) | root → 4 个叶 release |
+| `two-8` | 8 叶组 × 12 workers → root(8) | root → 8 个叶 release |
+| `two-16` | 16 叶组 × 6 workers → root(16) | root → 16 个叶 release |
+| `three-6x4x4` | 16 叶组 × 6 workers → 4 middle × 4 leaves → root(4) | root → 4 middle release → 16 leaf release |
+
+叶组使用 `block_id % G`，同一物理 block 的 1 个 AIC 和 2 个 AIV 始终在同组。
+静态 lane0 AIC 代表叶组：二级形态由 `block_id == leaf_id` 的核把叶计数转发到
+root；三级形态再由 `leaf_id == middle_id` 的四个代表继续向上转发。这里不依赖
+FetchAdd 返回值临时选 leader，避免增加另一套“谁是最后一个”的协议。
+
+arrival、release、middle 和 root 各自独占 64 B；arrival 与 release 分离，等待
+release 的 add-zero 不和仍在到达的 FetchAdd 争同一 cache line。等待期间仍调用
+`FinalDrain`；每个 worker 只有同时看到本叶收到全局 release 且本核
+`occupied_count == 0` 才退出。host 精确检查 active/unused 节点终值，未使用节点
+必须保持零。
+
+每个 worker 的 standalone 诊断 sidecar 新增 startup begin/end、final begin、
+global release 和 final end 五个 SYS_CNT 时间点。它们分别构造 startup span、
+final barrier span、final drain span 和完整 lifecycle span，不进入生产 DistCore ABI。
+
+##### 7.5.17.3 功能和观察链路门禁
+
+CPU 五种形态的 b1 功能测试全部通过。CCEC 在 device0 上逐种执行 b1，96-worker
+拓扑、winner、cursor、fanin/frontier、heap/TensorMap、输出数学结果、startup=96、
+final 树计数和时间戳门禁均 PASS。AscendC 全量构建通过，并在 device0 上完成
+G=8 b1 的同一组语义与数学输出门禁。四个 standalone 泳道/PMU 分析脚本的 100 项
+`unittest` 全部通过；顶层 pytest 入口因当前环境的 `simpler_setup.parallel_scheduler`
+缺失而未进入测试收集，没有将该环境问题冒充为 pytest 通过。最深的
+`three-6x4x4` 又开启逐 atomic 泳道：
+
+~~~text
+records=4207 expected=4207 dropped=0
+logical_calls=4537 physical_records=926
+batched_poll_calls=3883 poll_batch_records=272
+926 = 4537 - 3883 + 272
+~~~
+
+新增树访问全部复用正式 `ReplayDoneIncrement`/`ReplayDonePoll` site，没有藏成不可见
+普通 load/store。raw metadata 和 submit-PMU configuration 均记录 `final_barrier`。
+
+##### 7.5.17.4 A5 独立进程五形态对照
+
+正式口径为 96 workers、Case1/b256、real-compute `6,28,4,1`、PMU off、运行时
+`--no-swimlane`。每个样本使用全新进程且 `--runs 1`；五种形态共用同一 CCEC ELF。
+10 个 block 使用正向/反向 Latin 顺序，保证每个形态在每个执行位置恰好出现两次。
+50 次运行全部通过 execution/semantic/postprocess 门禁。
+
+机器没有 `task-submit` 和 `npu-smi` 命令；设备节点和 `ascend_950_*` 驱动文件
+存在。本轮按明确许可直接串行使用 device0，不能描述成队列隔离或 `npu-smi`
+预检通过。
+
+50 个原始样本按形态取中位数：
+
+| 形态 | startup | final barrier | final drain | Submit span | lifecycle |
+| ---- | ------: | ------------: | ----------: | ----------: | --------: |
+| flat | 44.803 us | 389.249 us | 398.089 us | 3913.195 us | 3992.759 us |
+| two-4 | 46.982 us | 330.368 us | 331.964 us | 3727.890 us | 3802.227 us |
+| two-8 | 43.759 us | 325.938 us | 329.303 us | 3715.343 us | 3791.836 us |
+| two-16 | 45.200 us | 314.792 us | 317.776 us | 3703.511 us | 3767.131 us |
+| three-6x4x4 | 47.945 us | 326.264 us | 329.603 us | 3725.657 us | 3798.103 us |
+
+直接受代码改动覆盖的 `final drain` 中，G=16 原始中位数最低：相对 flat 减少
+80.313 us（-20.175%），相对 G=8/三级分别低 11.527/11.827 us。但不能把原始
+lifecycle 的 `-225.628 us / -5.651%` 直接解释成 final 收益，因为 final selector
+直到最后一次 Submit 后才读取，理论上不可能改变之前的 Submit；表中 Submit 中位数
+仍相差约 210 us，已经构成明确的外部漂移负对照。
+
+为剔除“明显异常”而不按最终结论挑点，对 50 个因果上应相同的 Submit span 统一使用
+`[Q1 - 3*IQR, Q3 + 3*IQR] = [3516.321, 3954.964] us` 极端异常界限。越界的 7 个
+样本为 block1/two-8、block3/flat、block3/two-16、block4/flat、block5/flat、
+block9/two-8、block10/two-4。该规则只作为敏感性检查，不伪装成完整配对统计：
+
+| 形态 | 保留样本 | final drain 中位数 | lifecycle 中位数 |
+| ---- | -------: | -----------------: | ----------------: |
+| flat | 7 | 445.491 us | 3900.457 us |
+| two-4 | 9 | 334.576 us | 3801.472 us |
+| two-8 | 8 | 329.303 us | 3779.048 us |
+| two-16 | 9 | 321.878 us | 3766.568 us |
+| three-6x4x4 | 10 | 329.603 us | 3798.103 us |
+
+异常敏感性检查中 G=16 的中位数最低；清洗后的完整 lifecycle 相对 flat 为
+`-133.889 us / -3.433%`，低于 5% 门槛。
+
+##### 7.5.17.5 G=16 与三级树、G=8 与 G=16 复核
+
+五形态数据里 G=16 方向最好，但与三级树只有约 12 us。为避免用单轮噪声选型，
+又做了两轮均衡 AB/BA 复核：
+
+| 复核 | G=16 final drain | 三级 final drain | paired 中位差 | G=16 更快次数 |
+| ---- | ----------------: | --------------: | ------------: | -------------: |
+| 8 对独立进程、每进程 1 run | 323.348 us | 326.063 us | -2.715 us | 4/8 |
+| 6 对独立进程、每进程 5 runs 后取中位数 | 387.857 us | 389.672 us | -1.979 us | 3/6 |
+
+复核只能说明 G=16 与三级树基本打平，不能证明三级层级有收益。为进一步
+判断 G=8 与 G=16，又做了 8 对均衡 AB/BA：每个独立进程运行 5 轮，先取
+进程内中位数，再做进程间对照。16 个进程均通过全部门禁。
+
+| 口径 | G=8 final drain | G=16 final drain | G=16 - G=8 |
+| ---- | ----------------: | -----------------: | ----------: |
+| 8 个进程中位数的总体中位数 | 395.171 us | 389.113 us | -6.058 us / -1.533% |
+| 8 组成对差值的中位数 | - | - | -3.885 us / -0.988% |
+
+G=16 只在 8 组中赢 5 组；单组差值从 `-67.374 us / -15.095%` 到
+`+64.697 us / +16.367%`，方向并不稳定。虽然两组各自取总体中位数时 G=16
+方向快 1.533%，但成对中位改善只有 0.988%，未达到“稳定快至少 1%”的收口
+选择门槛。
+
+因此最终 standalone 候选选择 **二级 G=8**。G=16 没有证明稳定优势，却需要
+双倍的叶节点数、更多状态 cache line，并使 root 等待 16 个代表而不是 8 个。
+三级树同样没有证明比二级树更好。这个选择不否定 G=16 在若干中位数口径上
+方向略好，只是不把未达稳定性门槛的差异当成选型依据。
+
+##### 7.5.17.6 `.text` 和结论边界
+
+修改前同一 swimlane 构建的 device `.text` 为 547,896 B；只改 final、容纳五种
+runtime selector 的实验 ELF 为 590,648 B，增加 42,752 B（+7.803%）。`.rodata`
+从 576 B 增至 620 B（+7.639%）。五种形态共用同一个 ELF，因此相互比较没有
+“五份 `.text` 大小不同”的直接混杂；但新增分支仍改变热函数布局，所以不能拿
+实验 ELF 的绝对时间与旧 547,896 B ELF 直接归因比较。
+
+异常处理后的完整 lifecycle 差异低于 5%，按既定门槛不启动 I-cache PMU 对比。
+迁移到 simpler 时只实现固定二级 G=8，不把五路 runtime selector 和 standalone
+时间诊断带进生产热路径；必须重新记录 production `.text`、功能门禁和同口径性能，
+再决定是否保留。standalone 多形态实验与 simpler 固定实现分两个 commit。

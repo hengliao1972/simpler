@@ -46,6 +46,8 @@ constexpr uint32_t kAivWorkers = 64;
 constexpr uint32_t kWorkers = kAicWorkers + kAivWorkers;
 constexpr uint32_t kRuntimeMaxWorkers = 108;
 constexpr uint32_t kCursorShards = 4;
+constexpr uint32_t kFinalBarrierMaxLeafGroups = 16;
+constexpr uint32_t kFinalBarrierMaxMiddleGroups = 4;
 // 每个 worker 私有 ring 有 4 个物理 slot，其中 2 个为 BlockWon 协议预留；
 // 单 lane Case1 虽不进入 BlockWon，普通 kernel 仍只能占用剩余 2 个 slot。
 constexpr uint32_t kPrivateSlots = 4;
@@ -115,6 +117,14 @@ constexpr uint32_t kDefaultUpNops = 2400;
 enum class CoreRole : uint32_t {
     Aic = 0,
     Aiv = 1,
+};
+
+enum class FinalBarrierShape : uint32_t {
+    Flat = 0,
+    TwoLevel4 = 1,
+    TwoLevel8 = 2,
+    TwoLevel16 = 3,
+    ThreeLevel6x4x4 = 4,
 };
 
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
@@ -270,7 +280,8 @@ struct alignas(64) RunConfig {
     uint32_t trace_enabled;
     uint64_t trace_base;
     uint32_t trace_records_per_core;
-    uint32_t reserved[5];
+    uint32_t final_barrier_shape;
+    uint32_t reserved[4];
 };
 static_assert(sizeof(RunConfig) == 64, "RunConfig must occupy one cache line");
 
@@ -492,6 +503,19 @@ struct alignas(64) AtomicLine {
 // 热点共享量各占一个 cache line，保持生产代码的地址隔离，避免 standalone
 // 因伪共享额外放大 Claim/frontier/start barrier 的竞争。
 static_assert(sizeof(AtomicLine) == 64, "AtomicLine must occupy one cache line");
+
+// final 分层汇合把 arrival 与 release 分到不同 cache line：等待 release
+// 的 add-zero 不会反向堵塞尚未到达的 worker。最多 16 个叶组、4 个中间组；
+// 未被当前形态使用的节点必须保持零并由 host 校验。startup 仍使用生产 flat 屏障。
+struct alignas(64) FinalBarrierState {
+    AtomicLine leaf_arrivals[kFinalBarrierMaxLeafGroups];
+    AtomicLine leaf_releases[kFinalBarrierMaxLeafGroups];
+    AtomicLine middle_arrivals[kFinalBarrierMaxMiddleGroups];
+    AtomicLine middle_releases[kFinalBarrierMaxMiddleGroups];
+    AtomicLine root_arrival;
+    AtomicLine root_release;
+};
+static_assert(sizeof(FinalBarrierState) == 2688, "final barrier state size changed");
 
 struct alignas(64) AtomicFlagLine {
     volatile int32_t value;
@@ -807,6 +831,16 @@ struct alignas(64) WorkerResult {
     uint32_t pmu_phase_icache_misses;
     uint32_t pmu_shadow_icache_requests;
     uint32_t pmu_shadow_icache_misses;
+
+    // 生命周期屏障的 SYS_CNT 边界属于 standalone 诊断 sidecar，不进入生产
+    // DistCore ABI。final release 与 final end 分开，保留“全局停止生产”和
+    // “本核 drain 完成”两个不同事件。
+    uint64_t startup_barrier_begin;
+    uint64_t startup_barrier_end;
+    uint64_t final_barrier_begin;
+    uint64_t final_barrier_release;
+    uint64_t final_barrier_end;
+    uint64_t barrier_reserved[3];
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
     // split 协议诊断独占一条 cache line。普通 CPU/AscendC 与局部 PMU
     // 构建不带这些字段，不改变它们的 WorkerResult ABI。
@@ -823,13 +857,13 @@ struct alignas(64) WorkerResult {
 // WorkerResult 是 standalone 尾部的诊断 sidecar，不属于真实 DistCore ABI；按
 // cache line 隔离后，各 worker 发布统计不会相互覆盖或污染被测共享状态。
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
-static_assert(sizeof(WorkerResult) == 896, "split WorkerResult diagnostics must occupy whole cache lines");
-static_assert(offsetof(WorkerResult, compete_first_split_caller_state_address) == 832,
+static_assert(sizeof(WorkerResult) == 960, "split WorkerResult diagnostics must occupy whole cache lines");
+static_assert(offsetof(WorkerResult, compete_first_split_caller_state_address) == 896,
               "split WorkerResult oracle offset mismatch");
-static_assert(offsetof(WorkerResult, compete_first_split_reserved) == 888,
+static_assert(offsetof(WorkerResult, compete_first_split_reserved) == 952,
               "split WorkerResult oracle tail mismatch");
 #else
-static_assert(sizeof(WorkerResult) == 832, "WorkerResult diagnostics must occupy whole cache lines");
+static_assert(sizeof(WorkerResult) == 896, "WorkerResult diagnostics must occupy whole cache lines");
 #endif
 static_assert(offsetof(WorkerResult, pmu_total_cycles) == 680, "WorkerResult PMU offset mismatch");
 static_assert(offsetof(WorkerResult, pmu_status) == 700, "WorkerResult PMU status offset mismatch");
@@ -883,6 +917,9 @@ struct alignas(64) SchedulerState {
     // 除这 256 个长度值外，其余 tensor 仅需稳定的合成地址来复现
     // descriptor、依赖和 heap 行为，不会解引用成真实计算数据。
     volatile int32_t context_lens[kMaxBatches];
+    // standalone 的 final 分层实验状态位于完整生产 DistGlobal 镜像之后，
+    // 不移动任何被测生产字段；startup 继续使用生产 started_count。
+    FinalBarrierState final_barrier;
     WorkerResult results[kWorkers];
 };
 static_assert(offsetof(SchedulerState, cube_cursor) == 0, "cube cursor offset must match PA DistGlobal");
@@ -913,6 +950,7 @@ static_assert(
         kRealDistGlobalBytes + sizeof(RunConfig) + sizeof(WinnerWorkloadConfig),
     "context lengths must follow standalone controls"
 );
+static_assert(offsetof(SchedulerState, final_barrier) % 64 == 0, "final barrier must be cache-line aligned");
 
 }  // namespace pa_scheduler
 

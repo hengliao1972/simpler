@@ -190,6 +190,109 @@ PA_DEVICE bool WatchdogExpired(
     return true;
 }
 
+PA_DEVICE uint32_t TwoLevelFinalBarrierGroupCount(FinalBarrierShape shape) {
+    switch (shape) {
+    case FinalBarrierShape::TwoLevel4:
+        return 4;
+    case FinalBarrierShape::TwoLevel8:
+        return 8;
+    case FinalBarrierShape::TwoLevel16:
+        return 16;
+    default:
+        return 0;
+    }
+}
+
+PA_DEVICE uint32_t FinalBarrierLeafGroup(FinalBarrierShape shape, PA_GM const WorkerState &worker) {
+    const uint32_t block = static_cast<uint32_t>(worker.block_id);
+    if (shape == FinalBarrierShape::ThreeLevel6x4x4) {
+        return block % kFinalBarrierMaxLeafGroups;
+    }
+    return block % TwoLevelFinalBarrierGroupCount(shape);
+}
+
+template <typename Ops>
+PA_DEVICE void PublishFinalBarrierLine(PA_GM AtomicLine &line, LocalStats &stats, AtomicSite increment_site) {
+    (void)TraceAtomicFetchAdd<Ops>(
+        stats.trace, stats.result, -1, increment_site, &line.value, 1,
+        /*result_used=*/false
+    );
+}
+
+template <typename Ops>
+PA_DEVICE void ArriveHierarchicalFinalBarrier(
+    PA_GM FinalBarrierState &barrier, FinalBarrierShape shape, PA_GM const WorkerState &worker,
+    LocalStats &stats, AtomicSite increment_site
+) {
+    const uint32_t leaf = FinalBarrierLeafGroup(shape, worker);
+    PublishFinalBarrierLine<Ops>(barrier.leaf_arrivals[leaf], stats, increment_site);
+}
+
+template <typename Ops>
+PA_DEVICE bool ProgressHierarchicalFinalBarrier(
+    PA_GM FinalBarrierState &barrier, FinalBarrierShape shape, PA_GM const WorkerState &worker,
+    LocalStats &stats, AtomicSite increment_site, AtomicSite poll_site, bool &leaf_forwarded, bool &middle_forwarded,
+    bool &root_released, bool &middle_released, bool &leaf_released
+) {
+    const uint32_t block = static_cast<uint32_t>(worker.block_id);
+    const uint32_t leaf = FinalBarrierLeafGroup(shape, worker);
+    const bool leaf_leader = worker.lane == 0 && block == leaf;
+    if (shape != FinalBarrierShape::ThreeLevel6x4x4) {
+        const uint32_t groups = TwoLevelFinalBarrierGroupCount(shape);
+        const int64_t workers_per_group = static_cast<int64_t>(kWorkers / groups);
+        if (leaf_leader && !leaf_forwarded &&
+            LoadLine<Ops>(barrier.leaf_arrivals[leaf], stats, poll_site) >= workers_per_group) {
+            PublishFinalBarrierLine<Ops>(barrier.root_arrival, stats, increment_site);
+            leaf_forwarded = true;
+        }
+        const bool root_leader = leaf_leader && leaf == 0;
+        if (root_leader && !root_released &&
+            LoadLine<Ops>(barrier.root_arrival, stats, poll_site) >= static_cast<int64_t>(groups)) {
+            PublishFinalBarrierLine<Ops>(barrier.root_release, stats, increment_site);
+            root_released = true;
+        }
+        if (leaf_leader && leaf_forwarded && !leaf_released &&
+            LoadLine<Ops>(barrier.root_release, stats, poll_site) >= 1) {
+            PublishFinalBarrierLine<Ops>(barrier.leaf_releases[leaf], stats, increment_site);
+            leaf_released = true;
+        }
+        return LoadLine<Ops>(barrier.leaf_releases[leaf], stats, poll_site) >= 1;
+    }
+
+    constexpr int64_t kWorkersPerLeaf = 6;
+    constexpr int64_t kLeavesPerMiddle = 4;
+    constexpr int64_t kMiddleGroups = 4;
+    const uint32_t middle = leaf % kFinalBarrierMaxMiddleGroups;
+    const bool middle_leader = leaf_leader && leaf == middle;
+    if (leaf_leader && !leaf_forwarded &&
+        LoadLine<Ops>(barrier.leaf_arrivals[leaf], stats, poll_site) >= kWorkersPerLeaf) {
+        PublishFinalBarrierLine<Ops>(barrier.middle_arrivals[middle], stats, increment_site);
+        leaf_forwarded = true;
+    }
+    if (middle_leader && leaf_forwarded && !middle_forwarded &&
+        LoadLine<Ops>(barrier.middle_arrivals[middle], stats, poll_site) >= kLeavesPerMiddle) {
+        PublishFinalBarrierLine<Ops>(barrier.root_arrival, stats, increment_site);
+        middle_forwarded = true;
+    }
+    const bool global_leader = middle_leader && middle == 0;
+    if (global_leader && middle_forwarded && !root_released &&
+        LoadLine<Ops>(barrier.root_arrival, stats, poll_site) >= kMiddleGroups) {
+        PublishFinalBarrierLine<Ops>(barrier.root_release, stats, increment_site);
+        root_released = true;
+    }
+    if (middle_leader && middle_forwarded && !middle_released &&
+        LoadLine<Ops>(barrier.root_release, stats, poll_site) >= 1) {
+        PublishFinalBarrierLine<Ops>(barrier.middle_releases[middle], stats, increment_site);
+        middle_released = true;
+    }
+    if (leaf_leader && leaf_forwarded && !leaf_released &&
+        LoadLine<Ops>(barrier.middle_releases[middle], stats, poll_site) >= 1) {
+        PublishFinalBarrierLine<Ops>(barrier.leaf_releases[leaf], stats, increment_site);
+        leaf_released = true;
+    }
+    return LoadLine<Ops>(barrier.leaf_releases[leaf], stats, poll_site) >= 1;
+}
+
 template <typename Ops>
 PA_DEVICE void AdvanceFrontier(PA_GM SchedulerState *state, LocalStats &stats) {
     // frontier 只表示“从 task 0 开始已经连续完成”的最高 task id，不能越过尚未发布 flag 的空洞。
@@ -1048,6 +1151,14 @@ PA_DEVICE void PublishResult(PA_GM WorkerResult &destination, const WorkerResult
     PA_PUBLISH_FIELD(frontier_updates);
     PA_PUBLISH_FIELD(frontier_terminal_loads);
     PA_PUBLISH_FIELD(atomic_trace_calls);
+    PA_PUBLISH_FIELD(startup_barrier_begin);
+    PA_PUBLISH_FIELD(startup_barrier_end);
+    PA_PUBLISH_FIELD(final_barrier_begin);
+    PA_PUBLISH_FIELD(final_barrier_release);
+    PA_PUBLISH_FIELD(final_barrier_end);
+    for (uint32_t index = 0; index < 3; ++index) {
+        Ops::Publish(&destination.barrier_reserved[index], source.barrier_reserved[index]);
+    }
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
     PA_PUBLISH_FIELD(compete_first_split_caller_state_address);
     PA_PUBLISH_FIELD(compete_first_split_finish_state_address);
@@ -1123,8 +1234,10 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     );
     stats.trace = AttachTrace<Ops>(state, worker, worker_id);
 
+    // startup 严格保持生产 flat 语义；本实验只改变 replay 尾部的 final 汇合。
     // 96 个参与者全部完成本地状态初始化后再进入 task 0，主要用于压低启动偏斜对
     // winner 分布和 Submit 时序的干扰；atomicMax 的唯一 winner 正确性本身不依赖该屏障。
+    stats.result.startup_barrier_begin = Ops::Now();
     TraceAtomicFetchAdd<Ops>(
         stats.trace, stats.result, -1, AtomicSite::StartupIncrement,
         &state->started_count.value, 1
@@ -1145,6 +1258,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         }
     }
     AtomicPollRegionEnd<Ops>(stats.trace, stats.result, startup_poll_region);
+    stats.result.startup_barrier_end = Ops::Now();
 
     const uint32_t batches = state->config.batches;
     const uint32_t task_count = batches * kTasksPerBatch;
@@ -1224,22 +1338,45 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     const uint64_t final_drain_begin = orchestration_end != 0
         ? orchestration_end
         : TraceTimestamp<Ops>(stats.trace, stats.result);
-    TraceAtomicFetchAdd<Ops>(
-        stats.trace, stats.result, -1, AtomicSite::ReplayDoneIncrement,
-        &state->replay_done.value, 1
-    );
+    stats.result.final_barrier_begin = Ops::Now();
+    const auto final_barrier_shape = static_cast<FinalBarrierShape>(state->config.final_barrier_shape);
+    const uint32_t final_two_level_groups = TwoLevelFinalBarrierGroupCount(final_barrier_shape);
+    const bool hierarchical_final_barrier =
+        final_barrier_shape == FinalBarrierShape::ThreeLevel6x4x4 || final_two_level_groups != 0;
+    if (hierarchical_final_barrier) {
+        ArriveHierarchicalFinalBarrier<Ops>(
+            state->final_barrier, final_barrier_shape, worker, stats, AtomicSite::ReplayDoneIncrement
+        );
+    } else {
+        PublishFinalBarrierLine<Ops>(state->replay_done, stats, AtomicSite::ReplayDoneIncrement);
+    }
     const uint32_t final_poll_region = AtomicPollRegionBegin<Ops>(
         stats.trace, stats.result,
         TraceAtomicSiteMask(AtomicSite::ReplayDonePoll) | TraceAtomicSiteMask(AtomicSite::FaninFlagLoad)
     );
+    bool leaf_forwarded = false;
+    bool middle_forwarded = false;
+    bool root_released = false;
+    bool middle_released = false;
+    bool leaf_released = false;
+    bool global_release_observed = false;
     while (true) {
         const uint32_t freed =
             DrainReady<Ops>(state, worker, DrainPlace::FinalDrain, stats);
-        const bool all_replayed =
-            LoadLine<Ops>(state->replay_done, stats, AtomicSite::ReplayDonePoll) >=
-            static_cast<int64_t>(state->config.workers);
+        const bool all_replayed = hierarchical_final_barrier ?
+                                      ProgressHierarchicalFinalBarrier<Ops>(
+                                          state->final_barrier, final_barrier_shape, worker, stats,
+                                          AtomicSite::ReplayDoneIncrement, AtomicSite::ReplayDonePoll, leaf_forwarded,
+                                          middle_forwarded, root_released, middle_released, leaf_released
+                                      ) :
+                                      LoadLine<Ops>(state->replay_done, stats, AtomicSite::ReplayDonePoll) >=
+                                          static_cast<int64_t>(state->config.workers);
+        if (all_replayed && !global_release_observed) {
+            stats.result.final_barrier_release = Ops::Now();
+            global_release_observed = true;
+        }
         // 必须同时满足“无人再生产新 slot”和“本核旧 slot 全部完成”，否则继续帮助系统推进 completion。
-        if (all_replayed && worker.occupied_count == 0) {
+        if (global_release_observed && worker.occupied_count == 0) {
             break;
         }
         if (freed == 0) {
@@ -1247,6 +1384,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         }
     }
     AtomicPollRegionEnd<Ops>(stats.trace, stats.result, final_poll_region);
+    stats.result.final_barrier_end = Ops::Now();
     const uint64_t final_drain_end = TraceTimestamp<Ops>(stats.trace, stats.result);
     if (orchestration_begin != 0 && orchestration_end >= orchestration_begin) {
         WriteTrace<false>(
