@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import struct
 from pathlib import Path
 from typing import Any, Callable
 
@@ -23,15 +24,19 @@ from simpler_setup.tools.fdwic_submit_pmu_report import (
     CLAIM_CAPTURE_MODE,
     DEFAULT_INPUT_NAME,
     DEFAULT_OUTPUT_NAME,
+    DEFAULT_PROVENANCE_NAME,
     EMPTY_BRACKET_CAPTURE_MODE,
     MATERIALIZE_CAPTURE_MODE,
     PHASE_REQUIRED_STATUS_MASK,
     REGISTER_CAPTURE_MODE,
     REQUIRED_STATUS_MASK,
     SUBMIT_TRANSITION_CAPTURE_MODE,
+    capture_build_identity,
     load_capture,
+    load_provenance,
     render_report,
     write_report,
+    write_report_with_provenance,
 )
 
 
@@ -362,6 +367,172 @@ def _write_capture(directory: Path, capture: dict[str, Any]) -> Path:
     path = directory / DEFAULT_INPUT_NAME
     path.write_text(json.dumps(capture, indent=2), encoding="utf-8")
     return path
+
+
+def _write_minimal_elf(
+    path: Path,
+    *,
+    code_section_name: str = ".text",
+    code: bytes = b"\x90\x90\xc3",
+) -> bytes:
+    """Write a minimal ELF64 relocatable object accepted by the host readelf."""
+
+    elf_header_size = 64
+    section_header_size = 64
+    code_offset = elf_header_size
+    section_names = b"\0" + code_section_name.encode("ascii") + b"\0.shstrtab\0"
+    section_names_offset = code_offset + len(code)
+    section_headers_offset = (section_names_offset + len(section_names) + 7) & ~7
+    section_names_name_offset = len(code_section_name) + 2
+
+    ident = b"\x7fELF" + bytes((2, 1, 1, 0, 0)) + b"\0" * 7
+    header = struct.pack(
+        "<16sHHIQQQIHHHHHH",
+        ident,
+        1,  # ET_REL
+        62,  # EM_X86_64
+        1,
+        0,
+        0,
+        section_headers_offset,
+        0,
+        elf_header_size,
+        0,
+        0,
+        section_header_size,
+        3,
+        2,
+    )
+    null_section = bytes(section_header_size)
+    code_section = struct.pack(
+        "<IIQQQQIIQQ",
+        1,
+        1,  # SHT_PROGBITS
+        0x6,  # SHF_ALLOC | SHF_EXECINSTR
+        0,
+        code_offset,
+        len(code),
+        0,
+        0,
+        16,
+        0,
+    )
+    section_names_section = struct.pack(
+        "<IIQQQQIIQQ",
+        section_names_name_offset,
+        3,  # SHT_STRTAB
+        0,
+        0,
+        section_names_offset,
+        len(section_names),
+        0,
+        0,
+        1,
+        0,
+    )
+
+    image = bytearray(header)
+    image.extend(code)
+    image.extend(section_names)
+    image.extend(b"\0" * (section_headers_offset - len(image)))
+    image.extend(null_section)
+    image.extend(code_section)
+    image.extend(section_names_section)
+    contents = bytes(image)
+    path.write_bytes(contents)
+    return contents
+
+
+def _fake_build_identity(
+    directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    profile: str = "submit-pmu-none",
+) -> report_module.SubmitPmuBuildIdentity:
+    """Create a source-v2 identity without depending on real ELF tooling."""
+
+    extra_cache_key = "0123456789abcdef"
+    cache_directory = directory / "build" / extra_cache_key
+    aicore_build_directory = cache_directory / "aicore_build"
+    aicore_build_directory.mkdir(parents=True)
+    kernel = cache_directory / "aicore_kernel.o"
+    artifact_paths = (
+        kernel,
+        aicore_build_directory / "aicore_aic_combined.o",
+        aicore_build_directory / "aicore_aiv_combined.o",
+        directory / "build" / "libfdwic_runtime.so",
+    )
+    for ordinal, artifact in enumerate(artifact_paths, start=1):
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_bytes(f"artifact-{ordinal}-header:text-{ordinal}-payload".encode())
+
+    compile_definitions = ["PTO_FDWIC_SUBMIT_PMU=1"]
+    if profile != "submit-pmu-none":
+        compile_definitions.append(f"PTO_FDWIC_SUBMIT_PMU_PHASE_ID={report_module.PHASE_CONFIG_BY_MODE[profile]['id']}")
+    compile_definitions.append("PTO_FDWIC_TRACE_ENABLED=0")
+    frozen_compile_definitions = tuple(compile_definitions)
+    definitions_sha256 = hashlib.sha256(repr(compile_definitions).encode()).hexdigest()
+    source_state = f"source-v2:{'1' * 40}:{'2' * 64}:{definitions_sha256}"
+    (aicore_build_directory / ".git_commit").write_text(source_state, encoding="utf-8")
+
+    def inspect_fake_artifact(path: Path | str) -> report_module.BuildArtifactIdentity:
+        artifact = Path(path).resolve()
+        data = artifact.read_bytes()
+        literal_text = data[data.index(b":") + 1 :]
+        return report_module.BuildArtifactIdentity(
+            path=artifact,
+            sha256=hashlib.sha256(data).hexdigest(),
+            size_bytes=len(data),
+            text_sha256=hashlib.sha256(literal_text).hexdigest(),
+            text_size_bytes=len(literal_text),
+        )
+
+    monkeypatch.setattr(report_module, "_inspect_build_artifact", inspect_fake_artifact)
+    return capture_build_identity(
+        profile=profile,
+        profiled_cache_key=("a5", "fdwic", profile),
+        aicore_extra_cache_key=extra_cache_key,
+        compile_definitions=frozen_compile_definitions,
+        aicore_kernel=kernel,
+        aicore_build_dir=aicore_build_directory,
+        host_runtime=artifact_paths[-1],
+    )
+
+
+def _publish_fake_provenance(
+    directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, Path, report_module.SubmitPmuBuildIdentity]:
+    raw_path = _write_capture(directory, _valid_capture())
+    identity = _fake_build_identity(directory, monkeypatch)
+    output_path, provenance_path = write_report_with_provenance(raw_path, identity)
+    return output_path, provenance_path, identity
+
+
+def test_inspect_build_artifact_uses_real_readelf_and_hashes_literal_text(tmp_path: Path) -> None:
+    literal_text = b"\x90\x66\x90\xc3\x00\xff"
+    artifact = tmp_path / "minimal.o"
+    contents = _write_minimal_elf(artifact, code=literal_text)
+
+    identity = report_module._inspect_build_artifact(artifact)
+
+    assert identity.path == artifact.resolve()
+    assert identity.size_bytes == len(contents)
+    assert identity.sha256 == hashlib.sha256(contents).hexdigest()
+    assert identity.text_size_bytes == len(literal_text)
+    assert identity.text_sha256 == hashlib.sha256(literal_text).hexdigest()
+
+
+def test_inspect_build_artifact_rejects_real_elf_without_text_and_invalid_file(tmp_path: Path) -> None:
+    no_text = tmp_path / "no-text.o"
+    _write_minimal_elf(no_text, code_section_name=".code")
+    with pytest.raises(ValueError, match="has no literal .text section"):
+        report_module._inspect_build_artifact(no_text)
+
+    invalid = tmp_path / "invalid.o"
+    invalid.write_bytes(b"not an ELF object")
+    with pytest.raises(ValueError, match="readelf failed for build artifact"):
+        report_module._inspect_build_artifact(invalid)
 
 
 def test_valid_capture_is_recomputed_and_rendered(tmp_path: Path) -> None:
@@ -934,6 +1105,301 @@ def test_write_report_publishes_tmp_with_replace(tmp_path: Path, monkeypatch: py
     output = write_report(raw_path)
 
     assert calls == [(tmp_path / f"{DEFAULT_OUTPUT_NAME}.tmp", output)]
+
+
+def test_provenance_publish_preserves_raw_and_closes_sidecar_and_html(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_path = _write_capture(tmp_path, _valid_capture())
+    raw_before = raw_path.read_bytes()
+    identity = _fake_build_identity(tmp_path, monkeypatch)
+
+    output_path, provenance_path = write_report_with_provenance(raw_path, identity)
+
+    assert output_path == tmp_path / DEFAULT_OUTPUT_NAME
+    assert provenance_path == tmp_path / DEFAULT_PROVENANCE_NAME
+    assert raw_path.read_bytes() == raw_before
+    assert provenance_path.read_text(encoding="utf-8").endswith("}\n")
+    assert output_path.read_text(encoding="utf-8").endswith("</html>\n")
+    assert not (tmp_path / f"{DEFAULT_PROVENANCE_NAME}.tmp").exists()
+    assert not (tmp_path / f"{DEFAULT_OUTPUT_NAME}.tmp").exists()
+
+    capture = load_capture(raw_path)
+    provenance, provenance_sha256 = load_provenance(provenance_path, capture)
+    assert provenance["binding"] == {
+        "raw_name": DEFAULT_INPUT_NAME,
+        "raw_size": len(raw_before),
+        "raw_sha256": hashlib.sha256(raw_before).hexdigest(),
+        "capture_mode": "submit-pmu-none",
+    }
+    build = provenance["build"]
+    assert build["profile"] == "submit-pmu-none"
+    assert build["profiled_cache_key"][-1] == build["profile"]
+    assert build["aicore_extra_cache_key"] == "0123456789abcdef"
+    assert build["source_state"].startswith("source-v2:")
+    assert build["source_state_version"] == "source-v2"
+    assert build["source_state_path"] == str(identity.source_state_path)
+    assert build["compile_definitions"] == list(identity.compile_definitions)
+    assert build["definitions_sha256"] == hashlib.sha256(
+        repr(build["compile_definitions"]).encode()
+    ).hexdigest()
+
+    frozen_artifacts = dict(identity.artifacts)
+    assert set(provenance["artifacts"]) == {
+        "aicore_kernel",
+        "aic_combined",
+        "aiv_combined",
+        "host_runtime",
+    }
+    for name, frozen in frozen_artifacts.items():
+        artifact = provenance["artifacts"][name]
+        assert artifact == {
+            "path": str(frozen.path),
+            "sha256": frozen.sha256,
+            "size_bytes": frozen.size_bytes,
+            "text": {
+                "sha256": frozen.text_sha256,
+                "size_bytes": frozen.text_size_bytes,
+            },
+        }
+
+    document = output_path.read_text(encoding="utf-8")
+    assert document == render_report(raw_path)
+    assert provenance_sha256 in document
+    assert "诊断构建身份" in document
+    for label in ("AICore final", "AIC combined", "AIV combined", "Host runtime"):
+        assert label in document
+    for frozen in frozen_artifacts.values():
+        assert frozen.sha256 in document
+        assert frozen.text_sha256 in document
+
+    assert not list(tmp_path.glob(".*.pending.*.tmp"))
+    assert not list(tmp_path.glob(".*.rollback.*.tmp"))
+
+
+@pytest.mark.parametrize("fail_on_final_replace", (1, 2))
+@pytest.mark.parametrize("old_pair_exists", (False, True))
+def test_provenance_pair_publish_failure_restores_the_exact_previous_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fail_on_final_replace: int,
+    old_pair_exists: bool,
+) -> None:
+    raw_path = _write_capture(tmp_path, _valid_capture())
+    raw_before = raw_path.read_bytes()
+    identity = _fake_build_identity(tmp_path, monkeypatch)
+    output_path = tmp_path / DEFAULT_OUTPUT_NAME
+    provenance_path = tmp_path / DEFAULT_PROVENANCE_NAME
+    old_output = b"old-report" if old_pair_exists else None
+    old_provenance = b"old-provenance" if old_pair_exists else None
+    if old_pair_exists:
+        output_path.write_bytes(old_output)
+        provenance_path.write_bytes(old_provenance)
+
+    real_replace = report_module.os.replace
+    final_replaces = 0
+
+    def fail_selected_final_replace(source: str | Path, destination: str | Path) -> None:
+        nonlocal final_replaces
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if ".pending." in source_path.name and destination_path in {provenance_path, output_path}:
+            final_replaces += 1
+            if final_replaces == fail_on_final_replace:
+                raise OSError("injected paired publication failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(report_module.os, "replace", fail_selected_final_replace)
+
+    with pytest.raises(OSError, match="injected paired publication failure"):
+        write_report_with_provenance(raw_path, identity)
+
+    assert raw_path.read_bytes() == raw_before
+    if old_pair_exists:
+        assert output_path.read_bytes() == old_output
+        assert provenance_path.read_bytes() == old_provenance
+    else:
+        assert not output_path.exists()
+        assert not provenance_path.exists()
+    assert not list(tmp_path.glob(".*.pending.*.tmp"))
+    assert not list(tmp_path.glob(".*.rollback.*.tmp"))
+
+
+@pytest.mark.parametrize("change_on_check", (2, 3))
+def test_provenance_pair_rejects_raw_change_before_or_after_final_replaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change_on_check: int,
+) -> None:
+    raw_path = _write_capture(tmp_path, _valid_capture())
+    identity = _fake_build_identity(tmp_path, monkeypatch)
+    real_assert_unchanged = report_module._assert_capture_raw_unchanged
+    checks = 0
+
+    def change_raw_on_selected_check(capture: report_module.SubmitPmuCapture) -> bytes:
+        nonlocal checks
+        checks += 1
+        if checks == change_on_check:
+            changed = bytearray(raw_path.read_bytes())
+            changed[-2] = ord(" ") if changed[-2] != ord(" ") else ord("\n")
+            raw_path.write_bytes(changed)
+        return real_assert_unchanged(capture)
+
+    monkeypatch.setattr(report_module, "_assert_capture_raw_unchanged", change_raw_on_selected_check)
+
+    with pytest.raises(ValueError, match="raw changed after the validated capture snapshot"):
+        write_report_with_provenance(raw_path, identity)
+
+    assert not (tmp_path / DEFAULT_OUTPUT_NAME).exists()
+    assert not (tmp_path / DEFAULT_PROVENANCE_NAME).exists()
+    assert not list(tmp_path.glob(".*.pending.*.tmp"))
+    assert not list(tmp_path.glob(".*.rollback.*.tmp"))
+
+
+def test_render_without_provenance_keeps_the_legacy_raw_only_path(tmp_path: Path) -> None:
+    raw_path = _write_capture(tmp_path, _valid_capture())
+
+    document = render_report(raw_path)
+
+    assert "真实 FDWIC Submit PMU" in document
+    assert "诊断构建身份" not in document
+    assert "Provenance SHA-256" not in document
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("raw_sha256", "0" * 64),
+        ("capture_mode", ARG_BUILD_CAPTURE_MODE),
+    ),
+)
+def test_provenance_rejects_raw_binding_tamper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    replacement: str,
+) -> None:
+    _output_path, provenance_path, _identity = _publish_fake_provenance(tmp_path, monkeypatch)
+    capture = load_capture(tmp_path / DEFAULT_INPUT_NAME)
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["binding"][field] = replacement
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="provenance.binding does not match"):
+        load_provenance(provenance_path, capture)
+
+
+def _change_provenance_source_state(provenance: dict[str, Any]) -> None:
+    fields = provenance["build"]["source_state"].split(":")
+    fields[1] = "3" * 40
+    provenance["build"]["source_state"] = ":".join(fields)
+
+
+def _change_provenance_definition_hash(provenance: dict[str, Any]) -> None:
+    mismatched_hash = "f" * 64
+    fields = provenance["build"]["source_state"].split(":")
+    fields[3] = mismatched_hash
+    provenance["build"]["source_state"] = ":".join(fields)
+    provenance["build"]["definitions_sha256"] = mismatched_hash
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        (_change_provenance_source_state, "does not close against its profile/source state"),
+        (_change_provenance_definition_hash, "compile definitions do not match definitions_sha256"),
+    ),
+)
+def test_provenance_rejects_source_state_or_definition_hash_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: Callable[[dict[str, Any]], None],
+    message: str,
+) -> None:
+    _output_path, provenance_path, _identity = _publish_fake_provenance(tmp_path, monkeypatch)
+    capture = load_capture(tmp_path / DEFAULT_INPUT_NAME)
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    mutation(provenance)
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_provenance(provenance_path, capture)
+
+
+def test_provenance_rejects_artifact_change_after_identity_freeze_without_publishing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_path = _write_capture(tmp_path, _valid_capture())
+    raw_before = raw_path.read_bytes()
+    identity = _fake_build_identity(tmp_path, monkeypatch)
+    changed_artifact = dict(identity.artifacts)["aiv_combined"].path
+    changed_artifact.write_bytes(changed_artifact.read_bytes() + b"-changed-after-freeze")
+
+    with pytest.raises(ValueError, match="build artifact changed after identity freeze: aiv_combined"):
+        write_report_with_provenance(raw_path, identity)
+
+    assert raw_path.read_bytes() == raw_before
+    assert not (tmp_path / DEFAULT_OUTPUT_NAME).exists()
+    assert not (tmp_path / DEFAULT_PROVENANCE_NAME).exists()
+    assert not (tmp_path / f"{DEFAULT_OUTPUT_NAME}.tmp").exists()
+    assert not (tmp_path / f"{DEFAULT_PROVENANCE_NAME}.tmp").exists()
+
+
+def _remove_required_provenance_field(provenance: dict[str, Any]) -> None:
+    provenance["build"].pop("source_state_path")
+
+
+def _add_unexpected_provenance_field(provenance: dict[str, Any]) -> None:
+    provenance["artifacts"]["unexpected"] = {}
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        (_remove_required_provenance_field, "provenance.build fields do not match"),
+        (_add_unexpected_provenance_field, "provenance.artifacts fields do not match"),
+    ),
+)
+def test_provenance_rejects_missing_or_extra_schema_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: Callable[[dict[str, Any]], None],
+    message: str,
+) -> None:
+    _output_path, provenance_path, _identity = _publish_fake_provenance(tmp_path, monkeypatch)
+    capture = load_capture(tmp_path / DEFAULT_INPUT_NAME)
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    mutation(provenance)
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_provenance(provenance_path, capture)
+
+
+def test_provenance_apis_reject_wrong_output_filenames(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_path = _write_capture(tmp_path, _valid_capture())
+    capture = load_capture(raw_path)
+    identity = _fake_build_identity(tmp_path, monkeypatch)
+    wrong_provenance = tmp_path / "provenance.json"
+    wrong_provenance.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=DEFAULT_PROVENANCE_NAME):
+        load_provenance(wrong_provenance, capture)
+    wrong_provenance.unlink()
+
+    with pytest.raises(ValueError, match=DEFAULT_PROVENANCE_NAME):
+        write_report_with_provenance(raw_path, identity, provenance_path=wrong_provenance)
+    with pytest.raises(ValueError, match=DEFAULT_OUTPUT_NAME):
+        write_report_with_provenance(raw_path, identity, output_path=tmp_path / "report.html")
+
+    assert not wrong_provenance.exists()
+    assert not (tmp_path / DEFAULT_PROVENANCE_NAME).exists()
+    assert not (tmp_path / DEFAULT_OUTPUT_NAME).exists()
 
 
 def test_float_summary_accepts_the_cpp_emitters_twelve_significant_digits(tmp_path: Path) -> None:

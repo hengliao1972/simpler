@@ -178,7 +178,8 @@ outputs/TestPagedAttentionUnroll_Case1_20260717_023809/
 | 2026-07-21 | `afeb515a` | 阶段归因 | 排除 SubmitTransition 为同 ELF 波动主载体 |
 | 2026-07-21 | `57aedfee` | 阶段归因 | 排除 ArgBuild 为同 ELF 波动主载体 |
 | 2026-07-21 | `660bbff4` | 阶段归因 | 排除 Register 为同 ELF 波动主载体 |
-| 2026-07-21 | 本阶段提交 | 观察工具 | 完善真实 PA I-cache 逐核时间加工口径 |
+| 2026-07-21 | `443a0bb3` | 观察工具 | 完善真实 PA I-cache 逐核时间加工口径 |
+| 2026-07-21 | 本阶段提交 | 观察工具 | 为真实 PA PMU 产物绑定构建 provenance |
 
 ### 4.1 真实 PA 第一轮 atomic 与前端优化
 
@@ -3242,6 +3243,59 @@ ArgBuild、Claim、EmptyBracket、Materialize、Register、SubmitTransition 各�
 重建 HTML，七份全部 PASS，大小为 79,838～82,812 B。该阶段完全发生在 case 返回后
 的 host 加工层，对 Submit 热路是零新增指令。
 
+### 8.16 诊断 raw 与实际构建实物的 provenance 绑定
+
+**[观察工具已完成 host 闭合；不回写 raw，不给 AICore 增加指令]**
+
+此前正式多轮依赖文档手工冻结 ELF SHA，raw 自身不能证明“这些轮次确实使用同一
+构建”。本阶段没有把身份字段塞进 C++ producer 或 AICore ELF，也没有在 consumer
+校验后回写权威 raw，而是增加固定第三件产物：
+
+```text
+fdwic_submit_pmu_raw.json          # C++ producer 原子发布；始终只读
+fdwic_submit_pmu_provenance.json   # case 返回后由实际构建路径生成并绑定 raw SHA
+fdwic_submit_pmu_report.html       # 同次加载 raw + sidecar 后生成
+```
+
+provenance schema 为 `fdwic-submit-pmu-provenance-v1`，至少闭合：
+
+1. 同一次 raw 读取冻结的固定文件名、字节数、SHA256 和 `capture.mode`；
+2. 已 profile 化的 callable cache key、16 位 AICore extra cache key、严格匹配 profile
+   的编译宏；
+3. 构建时 `.git_commit` 中的完整
+   `source-v2:<git-head>:<source-fingerprint>:<definitions-sha256>`，不拿采集后当前
+   HEAD 冒充构建身份；
+4. worker 实际加载的 `build/lib/.../aicore_kernel.o`，以及
+   `build/cache/.../aicore/` 中的 AIC/AIV combined 和 source-state stamp；两类路径
+   不能混用；
+5. final AICore、AIC combined、AIV combined、host runtime 四件实物各自的完整文件
+   SHA/大小与 literal `.text` SHA/大小。
+
+身份在 Submit-PMU ELF 符号门禁通过后、设备 case 开始前冻结；case 返回后再次从四个
+实际路径重算，任一文件或 source-state stamp 变化都拒绝发布 sidecar/HTML。scene test
+按 `(class, platform, runtime, profile)` 严格查找同一 identity，缺失时在上板前拒绝，
+不会从 raw 自报字段反推。sidecar 自身再用 raw SHA 绑定；HTML 展示 provenance SHA、
+source-v2、宏和四件实物。已有无 sidecar 的历史 raw 仍可离线生成旧式报告，但新的
+正式采集必须自动产生三件套。
+
+sidecar 与 HTML 先在同目录完整暂存，发布前后再次验证 raw 与已接受快照逐字节一致；
+首个/第二个最终替换失败或末次 raw 检查失败时，均恢复调用前的整对产物，不遗留半套
+或失配的正式文件。
+
+实现中专门核实了 RuntimeBuilder 的真实目录结构：final ELF 只位于 `build/lib` 的
+extra cache 目录；combined 和 `.git_commit` 位于对应的 `build/cache/.../aicore`。
+使用后一目录的 final 缓存文件冒充 worker 实际加载文件会造成证据错位，因此接口显式
+接收 output ELF 和 build directory 两条路径。`.text` 读取复用本机正式 `readelf -SW`
+对 literal `.text` 的 offset/size，并单独 hash 字节范围，不把 `.rela.text` 当成正文。
+
+纯 host 测试覆盖 raw 字节前后不变、sidecar/HTML 成组发布、四件实物与 `.text`、无
+sidecar 历史路径，以及 raw binding、source-state/宏、schema、文件名和冻结后实物
+变化的 fail-closed；并覆盖首个/第二个最终替换失败、末次 raw 变化和旧产物整对恢复。
+report/cache 两组共 174 项 PASS，ruff 和 diff 检查通过；另用
+本机现存 Register 实物验证实际 `readelf` 路径，可得到 final/AIC/AIV/host `.text`
+分别为 150,608/68,352/82,256/443,315 B。该工具全部运行在编译完成或 case 返回后，
+不会进入 Submit 性能窗口。
+
 ## 9. 已撤回、失败或不能外推的路线
 
 ### 9.1 已撤回的优化候选
@@ -3596,9 +3650,14 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
     派生 Submit SYS_CNT、PMU total、Scalar busy、逐核非 busy 残余和 PMU/SYS
     长窗有效比的 mean/min/max；角色校准只生成当前 ELF 等效时间。测试专门拒绝
     difference-of-extrema、ratio-of-sums 和零分母，相关 152 项及 ruff 通过。
+18. **[构建 provenance，host 闭合已完成] raw 保持只读**：新增 raw SHA 绑定的
+    独立 sidecar，记录构建时 source-v2、profile/cache/宏，以及实际 final、AIC/AIV
+    combined 和 host 的 whole/.text 身份；构建后与 case 后双重实物检查。缺 identity、
+    绑定或文件变化均 fail-closed；成组发布失败会恢复旧产物。相关 174 项通过，尚待
+    A5 B1 三件套最终回归。
 
 下一步不再扩充 N、K 或已经完成归因的既有 selector，也不跨 ELF 扣减。先补齐独立
-构建 provenance；随后
+构建 provenance 的 A5 B1 回归；随后
 只允许设计固定容量的 EfDrain-control/依赖就绪检查聚合，不能恢复逐 Submit/逐等待
 的大 raw。局部 I-cache 是否排除真实 linked-kernel，必须先通过接口与观测语义核验
 再决定。原因层级闭合后，再由 perf-clock 交错 A/B 决定真实 Scalar 候选保留或撤销。

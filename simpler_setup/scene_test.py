@@ -32,15 +32,19 @@ import subprocess
 import sys
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from .log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, configure_logging
 from .pto_isa import ensure_pto_isa_root
+
+if TYPE_CHECKING:
+    from .tools.fdwic_submit_pmu_report import SubmitPmuBuildIdentity
 
 logger = logging.getLogger(__name__)
 
 _compile_cache: dict[tuple[Any, ...], object] = {}
 _aicore_override_cache: dict[tuple[Any, ...], Path] = {}
+_fdwic_build_identity_cache: dict[tuple[Any, ...], SubmitPmuBuildIdentity] = {}
 
 _FDWIC_PROFILE_ENV = "PTO_FDWIC_PROFILE"
 _FDWIC_PROFILE_NONE = "none"
@@ -152,6 +156,7 @@ def clear_compile_cache() -> None:
     """
     _compile_cache.clear()
     _aicore_override_cache.clear()
+    _fdwic_build_identity_cache.clear()
     gc.collect()
 
 
@@ -397,6 +402,20 @@ def maybe_build_aicore_override(
         _assert_fdwic_perf_clock_elf(binary, profile)
     elif profile in _FDWIC_SUBMIT_PMU_PROFILES:
         _assert_fdwic_submit_pmu_elf(binary, profile)
+        from .tools.fdwic_submit_pmu_report import capture_build_identity  # noqa: PLC0415
+
+        host_runtime = builder.get_binaries(runtime).host_path
+        output_key_dir = Path(binary).resolve().parent
+        aicore_build_dir = builder._CACHE_DIR / output_key_dir.relative_to(builder._LIB_DIR) / "aicore"
+        _fdwic_build_identity_cache[cache_key] = capture_build_identity(
+            profile=profile,
+            profiled_cache_key=cache_key,
+            aicore_extra_cache_key=key,
+            compile_definitions=compile_definitions or (),
+            aicore_kernel=binary,
+            aicore_build_dir=aicore_build_dir,
+            host_runtime=host_runtime,
+        )
     elif platform == "a5" and runtime == "fully_distributed_within_core":
         _assert_fdwic_swimlane_elf(binary)
     return binary
@@ -1253,21 +1272,27 @@ def _plot_case_scope_stats(case_label: str, output_prefix: Path) -> None:
         sys.path.remove(str(tools_dir))
 
 
-def _render_case_fdwic_submit_pmu(case_label: str, output_prefix: Path) -> Path:
+def _render_case_fdwic_submit_pmu(
+    case_label: str, output_prefix: Path, build_identity: SubmitPmuBuildIdentity
+) -> Path:
     """Strictly validate the real-PA Submit-PMU raw and publish its HTML."""
     from .tools.fdwic_submit_pmu_report import (  # noqa: PLC0415
         DEFAULT_INPUT_NAME,
         DEFAULT_OUTPUT_NAME,
-        write_report,
+        write_report_with_provenance,
     )
 
     raw = output_prefix / DEFAULT_INPUT_NAME
     if not raw.is_file() or raw.stat().st_size == 0:
         raise RuntimeError(f"[{case_label}] submit-PMU did not publish a non-empty {raw}")
     report = output_prefix / DEFAULT_OUTPUT_NAME
-    write_report(raw, report)
+    published_report, provenance = write_report_with_provenance(raw, build_identity, report)
+    if published_report != report:
+        raise RuntimeError(f"[{case_label}] submit-PMU published an unexpected report path {published_report}")
     if not report.is_file() or report.stat().st_size == 0:
         raise RuntimeError(f"[{case_label}] submit-PMU did not publish a non-empty {report}")
+    if not provenance.is_file() or provenance.stat().st_size == 0:
+        raise RuntimeError(f"[{case_label}] submit-PMU did not publish a non-empty {provenance}")
     return report
 
 
@@ -1474,6 +1499,17 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     callable_spec = getattr(type(cls_inst), "CALLABLE", None)
     fdwic_profile = _fdwic_profile()
     private_profile_on = fdwic_profile in _FDWIC_PRIVATE_PROFILES
+    submit_pmu_build_identity = None
+    if fdwic_profile in _FDWIC_SUBMIT_PMU_PROFILES:
+        platform = worker._config.get("platform")
+        runtime = getattr(type(cls_inst), "_st_runtime", None)
+        build_identity_key = _profiled_cache_key((type(cls_inst).__qualname__, platform, runtime))
+        submit_pmu_build_identity = _fdwic_build_identity_cache.get(build_identity_key)
+        if submit_pmu_build_identity is None:
+            raise RuntimeError(
+                "Submit-PMU build identity is missing for "
+                f"profiled cache key {build_identity_key!r}; refusing to run without build provenance"
+            )
     diagnostics_on = (
         enable_l2_swimlane
         or enable_dump_args
@@ -1547,7 +1583,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
             if enable_scope_stats:
                 _plot_case_scope_stats(case_label, prefix)
             if case_succeeded and fdwic_profile in _FDWIC_SUBMIT_PMU_PROFILES:
-                _render_case_fdwic_submit_pmu(case_label, prefix)
+                _render_case_fdwic_submit_pmu(case_label, prefix, submit_pmu_build_identity)
             if case_succeeded and fdwic_profile in _FDWIC_PERF_CLOCK_PROFILES:
                 _validate_case_fdwic_perf_clock(case_label, prefix, fdwic_profile)
             if dlt_baseline is not None:

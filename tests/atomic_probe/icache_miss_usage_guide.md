@@ -106,6 +106,40 @@ vector/cube wait。Register 的 12 轮正式样本还出现过 primary=shadow �
 但 AIV miss/call 中途跃迁而阶段时间保持稳定的状态，说明报告必须把时间与 I-cache
 计数并列展示；单轮 miss 或 miss rate 不能独立决定优化结论。
 
+#### 1.1.2 新采集的构建 provenance 三件套
+
+新的正式 Submit-PMU case 成功后应同时出现：
+
+```text
+fdwic_submit_pmu_raw.json
+fdwic_submit_pmu_provenance.json
+fdwic_submit_pmu_report.html
+```
+
+`raw` 仍由 C++ producer 原子发布，Python 只读，不允许为了加入构建信息而回写。
+`provenance` 使用固定 schema `fdwic-submit-pmu-provenance-v1`，通过同一次 raw 读取
+冻结的文件名、字节数、SHA256 和 capture mode 与该轮数据绑定。HTML 在同次闭合后展示 sidecar
+SHA、构建时 source-v2、profile 宏/cache key，以及下列四件实物的完整文件与
+literal `.text` SHA/大小：
+
+- worker 实际加载的 `build/lib/.../aicore_kernel.o`；
+- 对应 `build/cache/.../aicore/aicore_aic_combined.o`；
+- 对应 `build/cache/.../aicore/aicore_aiv_combined.o`；
+- worker 使用的 `libhost_runtime.so`。
+
+final ELF 与 AIC/AIV combined 不在同一目录。前者必须从实际 output path 取证，
+后两者和 `.git_commit` source-state stamp 必须从对应 build cache 取证，不能拿
+cache 中间件冒充实际加载 ELF。身份在 ELF profile 符号门禁通过后、case 开始前
+冻结，case 返回后发布报告前再次重算；任一文件、stamp、raw binding、profile 宏
+或 cache key 不一致都会拒绝三件套闭合。sidecar 与 HTML 先完整生成到临时文件，
+发布前后都复核 raw 快照；任一步失败会恢复调用前的整对产物，不能留下只有一件更新
+或绑定旧 raw 的“正式”文件。
+
+这条机制只在编译完成或 case 返回后运行，不进入 Submit/AICore 热路径，也不扩设备
+GM 或 raw ABI。历史无 sidecar 的 raw 仍可离线生成基础 HTML，但从该机制落地后的
+新正式采集若缺少 provenance，应视为产物不完整，不能再靠采集时的当前 HEAD 或文档
+手工猜测 ELF 身份。
+
 ### 1.2 真实 PA 首个单阶段 profile：`submit-pmu-arg-build`
 
 真实 PA 已完成首个跟随最新泳道业务边界的单阶段 profile：

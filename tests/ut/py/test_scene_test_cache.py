@@ -41,12 +41,15 @@ from simpler_setup.scene_test import (
     _assert_fdwic_swimlane_elf,
     _compile_cache,
     _convert_case_swimlane,
+    _fdwic_build_identity_cache,
     _fdwic_compile_definitions,
     _fdwic_profile,
     _profiled_cache_key,
+    _render_case_fdwic_submit_pmu,
     _run_swimlane_converter,
     _validate_case_fdwic_perf_clock,
     clear_compile_cache,
+    maybe_build_aicore_override,
     run_class_cases,
 )
 
@@ -74,16 +77,20 @@ def test_clear_compile_cache_drops_cached_chip_callables():
     """
     _compile_cache.clear()
     _aicore_override_cache.clear()
+    _fdwic_build_identity_cache.clear()
     for i in range(3):
         _compile_cache[("t", "plat", f"rt{i}")] = _build_chip_callable(f"n{i}")
     _aicore_override_cache[("t", "plat", "rt0", "none")] = Path("/tmp/fake-aicore.o")
+    _fdwic_build_identity_cache[("t", "plat", "rt0", "submit-pmu-none")] = object()
     assert len(_compile_cache) == 3
     assert len(_aicore_override_cache) == 1
+    assert len(_fdwic_build_identity_cache) == 1
 
     clear_compile_cache()
 
     assert _compile_cache == {}
     assert _aicore_override_cache == {}
+    assert _fdwic_build_identity_cache == {}
 
 
 def test_fdwic_profile_partitions_compile_cache(monkeypatch):
@@ -176,6 +183,184 @@ def test_fdwic_private_profiles_have_isolated_compile_definitions():
         "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=6",
         "PTO_FDWIC_TRACE_ENABLED=0",
     ]
+
+
+def test_submit_pmu_override_registers_build_identity_after_elf_gate(monkeypatch, tmp_path):
+    """The profiled cache key must own one identity frozen from the built files."""
+    profile = "submit-pmu-none"
+    runtime = "fully_distributed_within_core"
+    profiled_key = ("QualifiedCase", "a5", runtime, profile)
+    orch = tmp_path / "orch.cpp"
+    orch.write_text("// orchestration\n")
+    host = tmp_path / "libhost_runtime.so"
+    host.write_bytes(b"host")
+    order = []
+    captured = {}
+    identity = object()
+
+    class FakeRuntimeBuilder:
+        _CACHE_DIR = tmp_path / "build" / "cache"
+        _LIB_DIR = tmp_path / "build" / "lib"
+
+        def __init__(self, platform):
+            assert platform == "a5"
+
+        def build_aicore_with_extra_sources(
+            self,
+            name,
+            extra_sources,
+            cache_key,
+            pto_isa_root=None,
+            compile_definitions=None,
+        ):
+            assert name == runtime
+            assert extra_sources == [orch.resolve()]
+            order.append("build")
+            binary = self._LIB_DIR / "a5" / "onboard" / runtime / "aicore-extra" / cache_key / "aicore_kernel.o"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"aicore")
+            return binary
+
+        def get_binaries(self, name):
+            assert name == runtime
+            return SimpleNamespace(host_path=host)
+
+    def fake_elf_gate(binary, selected_profile):
+        assert binary.is_file()
+        assert selected_profile == profile
+        order.append("elf-gate")
+
+    def fake_capture_build_identity(**kwargs):
+        order.append("capture")
+        captured.update(kwargs)
+        return identity
+
+    runtime_builder_module = importlib.import_module("simpler_setup.runtime_builder")
+    report_module = importlib.import_module("simpler_setup.tools.fdwic_submit_pmu_report")
+    monkeypatch.setenv("PTO_FDWIC_PROFILE", profile)
+    monkeypatch.setattr(runtime_builder_module, "RuntimeBuilder", FakeRuntimeBuilder)
+    monkeypatch.setattr(_scene_test_module, "_assert_fdwic_submit_pmu_elf", fake_elf_gate)
+    monkeypatch.setattr(report_module, "capture_build_identity", fake_capture_build_identity)
+    _fdwic_build_identity_cache.clear()
+
+    binary = maybe_build_aicore_override(profiled_key, "a5", runtime, str(orch), [], pto_isa_root="/pto")
+
+    extra_key = binary.parent.name
+    expected_build_dir = (
+        FakeRuntimeBuilder._CACHE_DIR / "a5" / "onboard" / runtime / "aicore-extra" / extra_key / "aicore"
+    )
+    assert order == ["build", "elf-gate", "capture"]
+    assert captured == {
+        "profile": profile,
+        "profiled_cache_key": profiled_key,
+        "aicore_extra_cache_key": extra_key,
+        "compile_definitions": ["PTO_FDWIC_SUBMIT_PMU=1", "PTO_FDWIC_TRACE_ENABLED=0"],
+        "aicore_kernel": binary,
+        "aicore_build_dir": expected_build_dir,
+        "host_runtime": host,
+    }
+    assert _fdwic_build_identity_cache == {profiled_key: identity}
+    _fdwic_build_identity_cache.clear()
+
+
+def test_submit_pmu_render_publishes_bound_provenance_and_html(monkeypatch, tmp_path):
+    report_module = importlib.import_module("simpler_setup.tools.fdwic_submit_pmu_report")
+    raw = tmp_path / report_module.DEFAULT_INPUT_NAME
+    raw.write_text("{}")
+    identity = object()
+    called = []
+
+    def fake_write_report_with_provenance(input_path, build_identity, output_path):
+        called.append((input_path, build_identity, output_path))
+        output_path.write_text("<html></html>")
+        provenance = tmp_path / report_module.DEFAULT_PROVENANCE_NAME
+        provenance.write_text("{}")
+        return output_path, provenance
+
+    monkeypatch.setattr(report_module, "write_report_with_provenance", fake_write_report_with_provenance)
+
+    report = _render_case_fdwic_submit_pmu("Case", tmp_path, identity)
+
+    assert report == tmp_path / report_module.DEFAULT_OUTPUT_NAME
+    assert called == [(raw, identity, report)]
+
+
+def test_submit_pmu_run_rejects_missing_build_identity_before_case(monkeypatch):
+    class MissingIdentityCase:
+        _st_level = 2
+        _st_runtime = "fully_distributed_within_core"
+        called = False
+
+        @classmethod
+        def _run_and_validate(cls, *args, **kwargs):
+            cls.called = True
+
+    monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-none")
+    _fdwic_build_identity_cache.clear()
+    worker = SimpleNamespace(_config={"platform": "a5", "device_id": 0})
+
+    with pytest.raises(RuntimeError, match="build identity is missing"):
+        run_class_cases(
+            worker,
+            MissingIdentityCase(),
+            [{"name": "Case1", "config": {}, "params": {}}],
+            callable_obj=None,
+            sub_handles={},
+            rounds=1,
+            skip_golden=False,
+            enable_l2_swimlane=0,
+            enable_dump_args=False,
+            enable_pmu=0,
+            enable_dep_gen=False,
+            enable_scope_stats=False,
+        )
+
+    assert not MissingIdentityCase.called
+
+
+def test_submit_pmu_run_resolves_profiled_identity_for_render(monkeypatch, tmp_path):
+    class IdentityCase:
+        _st_level = 2
+        _st_runtime = "fully_distributed_within_core"
+
+        @staticmethod
+        def _run_and_validate(*args, **kwargs):
+            return None
+
+    profile = "submit-pmu-none"
+    key = (IdentityCase.__qualname__, "a5", IdentityCase._st_runtime, profile)
+    identity = object()
+    rendered = []
+    monkeypatch.setenv("PTO_FDWIC_PROFILE", profile)
+    monkeypatch.setattr(_scene_test_module, "_build_output_prefix", lambda _label: tmp_path)
+    monkeypatch.setattr(
+        _scene_test_module,
+        "_render_case_fdwic_submit_pmu",
+        lambda case_label, output_prefix, build_identity: rendered.append(
+            (case_label, output_prefix, build_identity)
+        ),
+    )
+    _fdwic_build_identity_cache.clear()
+    _fdwic_build_identity_cache[key] = identity
+    worker = SimpleNamespace(_config={"platform": "a5", "device_id": 0})
+
+    run_class_cases(
+        worker,
+        IdentityCase(),
+        [{"name": "Case1", "config": {}, "params": {}}],
+        callable_obj=None,
+        sub_handles={},
+        rounds=1,
+        skip_golden=False,
+        enable_l2_swimlane=0,
+        enable_dump_args=False,
+        enable_pmu=0,
+        enable_dep_gen=False,
+        enable_scope_stats=False,
+    )
+
+    assert rendered == [("IdentityCase_Case1", tmp_path, identity)]
+    _fdwic_build_identity_cache.clear()
 
 
 def test_fdwic_profile_rejects_unknown_value(monkeypatch):

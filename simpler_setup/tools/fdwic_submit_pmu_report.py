@@ -17,7 +17,10 @@ import html
 import json
 import math
 import os
+import re
+import subprocess
 import sys
+import tempfile
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -27,6 +30,8 @@ from typing import Any
 SCHEMA_NAME = "fdwic-submit-pmu-v1"
 DEFAULT_INPUT_NAME = "fdwic_submit_pmu_raw.json"
 DEFAULT_OUTPUT_NAME = "fdwic_submit_pmu_report.html"
+PROVENANCE_SCHEMA_NAME = "fdwic-submit-pmu-provenance-v1"
+DEFAULT_PROVENANCE_NAME = "fdwic_submit_pmu_provenance.json"
 
 EXPECTED_CORES = 96
 EXPECTED_AIC_CORES = 32
@@ -101,6 +106,16 @@ PHASE_CONFIG_BY_MODE = {
         "time_semantics": "inner_sys_cnt_between_boundary_observers",
     },
 }
+
+
+def _expected_compile_definitions(profile: str) -> tuple[str, ...]:
+    definitions = ["PTO_FDWIC_SUBMIT_PMU=1"]
+    if profile != NONE_CAPTURE_MODE:
+        definitions.append(f"PTO_FDWIC_SUBMIT_PMU_PHASE_ID={PHASE_CONFIG_BY_MODE[profile]['id']}")
+    definitions.append("PTO_FDWIC_TRACE_ENABLED=0")
+    return tuple(definitions)
+
+
 SUPPORTED_CAPTURE_MODES = {NONE_CAPTURE_MODE, *PHASE_CONFIG_BY_MODE}
 PHASE_RECORD_FIELDS = (
     "phase_id",
@@ -135,6 +150,7 @@ class SubmitPmuCapture:
     """A capture that passed all producer/consumer closure checks."""
 
     input_path: Path
+    raw_size: int
     raw_sha256: str
     data: dict[str, Any]
     records: tuple[dict[str, Any], ...]
@@ -143,8 +159,141 @@ class SubmitPmuCapture:
     phase_summary: dict[str, dict[str, Any]] | None
 
 
+@dataclass(frozen=True)
+class BuildArtifactIdentity:
+    """Frozen identity of one executable artifact used by the diagnostic run."""
+
+    path: Path
+    sha256: str
+    size_bytes: int
+    text_sha256: str
+    text_size_bytes: int
+
+
+@dataclass(frozen=True)
+class SubmitPmuBuildIdentity:
+    """Build-time identity captured before the A5 case starts."""
+
+    profile: str
+    profiled_cache_key: tuple[str, ...]
+    aicore_extra_cache_key: str
+    compile_definitions: tuple[str, ...]
+    source_state: str
+    source_state_path: Path
+    artifacts: tuple[tuple[str, BuildArtifactIdentity], ...]
+
+
 def _fail(message: str) -> None:
     raise ValueError(message)
+
+
+_TEXT_SECTION_PATTERN = re.compile(
+    r"^\s*\[\s*\d+\]\s+\.text\s+\S+\s+[0-9a-fA-F]+\s+"
+    r"([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s",
+    re.MULTILINE,
+)
+_HEX_16_PATTERN = re.compile(r"^[0-9a-f]{16}$")
+_HEX_40_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+_HEX_64_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _inspect_build_artifact(path: Path | str) -> BuildArtifactIdentity:
+    artifact = Path(path).resolve()
+    if not artifact.is_file():
+        _fail(f"build artifact does not exist: {artifact}")
+    data = artifact.read_bytes()
+    try:
+        result = subprocess.run(
+            ["readelf", "-SW", str(artifact)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise ValueError("readelf is required to inspect Submit-PMU build provenance") from exc
+    if result.returncode != 0:
+        _fail(f"readelf failed for build artifact {artifact}: {result.stderr.strip()}")
+    match = _TEXT_SECTION_PATTERN.search(result.stdout)
+    if match is None:
+        _fail(f"build artifact has no literal .text section: {artifact}")
+    text_offset, text_size = (int(value, 16) for value in match.groups())
+    text_end = text_offset + text_size
+    if text_size <= 0 or text_end > len(data):
+        _fail(f"build artifact has an invalid .text range: {artifact}")
+    text_data = data[text_offset:text_end]
+    return BuildArtifactIdentity(
+        path=artifact,
+        sha256=hashlib.sha256(data).hexdigest(),
+        size_bytes=len(data),
+        text_sha256=hashlib.sha256(text_data).hexdigest(),
+        text_size_bytes=text_size,
+    )
+
+
+def _parse_source_state(source_state: str) -> tuple[str, str, str, str]:
+    fields = source_state.split(":")
+    if (
+        len(fields) != 4
+        or fields[0] != "source-v2"
+        or _HEX_40_PATTERN.fullmatch(fields[1]) is None
+        or _HEX_64_PATTERN.fullmatch(fields[2]) is None
+        or _HEX_64_PATTERN.fullmatch(fields[3]) is None
+    ):
+        _fail("Submit-PMU source state must be source-v2:<git-head>:<source-fingerprint>:<definitions-sha256>")
+    return fields[0], fields[1], fields[2], fields[3]
+
+
+def capture_build_identity(
+    *,
+    profile: str,
+    profiled_cache_key: Sequence[Any],
+    aicore_extra_cache_key: str,
+    compile_definitions: Sequence[str],
+    aicore_kernel: Path | str,
+    aicore_build_dir: Path | str,
+    host_runtime: Path | str,
+) -> SubmitPmuBuildIdentity:
+    """Freeze the exact diagnostic ELF/SO identity before running a case."""
+
+    if profile not in {NONE_CAPTURE_MODE, *PHASE_CONFIG_BY_MODE}:
+        _fail(f"unsupported Submit-PMU provenance profile {profile!r}")
+    if _HEX_16_PATTERN.fullmatch(aicore_extra_cache_key) is None:
+        _fail("AICore extra cache key must contain exactly 16 lowercase hex digits")
+    definitions = tuple(compile_definitions)
+    if definitions != _expected_compile_definitions(profile):
+        _fail("Submit-PMU provenance compile definitions do not match the selected profile")
+    kernel = Path(aicore_kernel).resolve()
+    build_dir = Path(aicore_build_dir).resolve()
+    stamp = build_dir / ".git_commit"
+    if not stamp.is_file():
+        _fail(f"Submit-PMU AICore source-state stamp is missing: {stamp}")
+    source_state = stamp.read_text(encoding="utf-8").strip()
+    _version, _git_head, _source_fingerprint, definitions_sha256 = _parse_source_state(source_state)
+    expected_definitions_sha256 = hashlib.sha256(repr(list(definitions)).encode("utf-8")).hexdigest()
+    if definitions_sha256 != expected_definitions_sha256:
+        _fail("Submit-PMU source-state definition hash does not match the selected compile definitions")
+    if kernel.parent.name != aicore_extra_cache_key or build_dir.parent.name != aicore_extra_cache_key:
+        _fail("Submit-PMU AICore output/build paths do not match the selected extra cache key")
+
+    artifact_paths = (
+        ("aicore_kernel", kernel),
+        ("aic_combined", build_dir / "aicore_aic_combined.o"),
+        ("aiv_combined", build_dir / "aicore_aiv_combined.o"),
+        ("host_runtime", Path(host_runtime).resolve()),
+    )
+    artifacts = tuple((name, _inspect_build_artifact(path)) for name, path in artifact_paths)
+    cache_key = tuple(str(value) for value in profiled_cache_key)
+    if not cache_key or cache_key[-1] != profile:
+        _fail("profiled cache key must end with the selected Submit-PMU profile")
+    return SubmitPmuBuildIdentity(
+        profile=profile,
+        profiled_cache_key=cache_key,
+        aicore_extra_cache_key=aicore_extra_cache_key,
+        compile_definitions=definitions,
+        source_state=source_state,
+        source_state_path=stamp,
+        artifacts=artifacts,
+    )
 
 
 def _object(value: Any, path: str) -> dict[str, Any]:
@@ -672,14 +821,191 @@ def load_capture(input_path: Path | str) -> SubmitPmuCapture:
     )
     _validate_host_summary(data, summary)
     return SubmitPmuCapture(
-        path,
-        hashlib.sha256(raw_bytes).hexdigest(),
-        data,
-        records,
-        groups,
-        summary,
-        phase_summary,
+        input_path=path,
+        raw_size=len(raw_bytes),
+        raw_sha256=hashlib.sha256(raw_bytes).hexdigest(),
+        data=data,
+        records=records,
+        groups=groups,
+        summary=summary,
+        phase_summary=phase_summary,
     )
+
+
+def _assert_capture_raw_unchanged(capture: SubmitPmuCapture) -> bytes:
+    """Re-read one raw and prove it still equals the snapshot accepted by the loader."""
+
+    raw_bytes = capture.input_path.read_bytes()
+    if len(raw_bytes) != capture.raw_size or hashlib.sha256(raw_bytes).hexdigest() != capture.raw_sha256:
+        _fail("Submit-PMU raw changed after the validated capture snapshot")
+    return raw_bytes
+
+
+def _artifact_payload(identity: BuildArtifactIdentity) -> dict[str, Any]:
+    return {
+        "path": str(identity.path),
+        "sha256": identity.sha256,
+        "size_bytes": identity.size_bytes,
+        "text": {"sha256": identity.text_sha256, "size_bytes": identity.text_size_bytes},
+    }
+
+
+def _build_provenance_payload(
+    capture: SubmitPmuCapture,
+    identity: SubmitPmuBuildIdentity,
+) -> dict[str, Any]:
+    if capture.data["capture"]["mode"] != identity.profile:
+        _fail("Submit-PMU build identity profile does not match the raw capture mode")
+    source_version, git_head, source_fingerprint, definitions_sha256 = _parse_source_state(identity.source_state)
+    stamp = identity.source_state_path
+    if not stamp.is_file() or stamp.read_text(encoding="utf-8").strip() != identity.source_state:
+        _fail("Submit-PMU AICore source-state stamp changed after the build identity was frozen")
+
+    artifacts: dict[str, Any] = {}
+    for name, frozen in identity.artifacts:
+        current = _inspect_build_artifact(frozen.path)
+        if current != frozen:
+            _fail(f"Submit-PMU build artifact changed after identity freeze: {name}")
+        artifacts[name] = _artifact_payload(frozen)
+    return {
+        "schema": PROVENANCE_SCHEMA_NAME,
+        "binding": {
+            "raw_name": capture.input_path.name,
+            "raw_size": capture.raw_size,
+            "raw_sha256": capture.raw_sha256,
+            "capture_mode": identity.profile,
+        },
+        "build": {
+            "profile": identity.profile,
+            "profiled_cache_key": list(identity.profiled_cache_key),
+            "aicore_extra_cache_key": identity.aicore_extra_cache_key,
+            "compile_definitions": list(identity.compile_definitions),
+            "source_state": identity.source_state,
+            "source_state_path": str(identity.source_state_path),
+            "source_state_version": source_version,
+            "git_head": git_head,
+            "source_fingerprint": source_fingerprint,
+            "definitions_sha256": definitions_sha256,
+        },
+        "artifacts": artifacts,
+    }
+
+
+def _json_document(data: Mapping[str, Any]) -> str:
+    return json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+def _exact_keys(data: Mapping[str, Any], expected: set[str], path: str) -> None:
+    actual = set(data)
+    if actual != expected:
+        _fail(
+            f"{path} fields do not match the fixed provenance schema: "
+            f"expected {sorted(expected)}, got {sorted(actual)}"
+        )
+
+
+def _validate_provenance_artifact(value: Any, path: str) -> None:
+    artifact = _object(value, path)
+    _exact_keys(artifact, {"path", "sha256", "size_bytes", "text"}, path)
+    if not isinstance(artifact["path"], str) or not artifact["path"]:
+        _fail(f"{path}.path must be a non-empty string")
+    if not isinstance(artifact["sha256"], str) or _HEX_64_PATTERN.fullmatch(artifact["sha256"]) is None:
+        _fail(f"{path}.sha256 must contain 64 lowercase hex digits")
+    _integer(artifact["size_bytes"], f"{path}.size_bytes", minimum=1)
+    text = _object(artifact["text"], f"{path}.text")
+    _exact_keys(text, {"sha256", "size_bytes"}, f"{path}.text")
+    if not isinstance(text["sha256"], str) or _HEX_64_PATTERN.fullmatch(text["sha256"]) is None:
+        _fail(f"{path}.text.sha256 must contain 64 lowercase hex digits")
+    _integer(text["size_bytes"], f"{path}.text.size_bytes", minimum=1)
+    if text["size_bytes"] > artifact["size_bytes"]:
+        _fail(f"{path}.text.size_bytes exceeds the whole artifact size")
+
+
+def _validate_provenance_data(data: dict[str, Any], capture: SubmitPmuCapture) -> dict[str, Any]:
+    """Validate one decoded sidecar against a single accepted raw snapshot."""
+
+    _exact_keys(data, {"schema", "binding", "build", "artifacts"}, "provenance")
+    if data["schema"] != PROVENANCE_SCHEMA_NAME:
+        _fail(f"provenance.schema must equal {PROVENANCE_SCHEMA_NAME!r}")
+
+    binding = _object(data["binding"], "provenance.binding")
+    _exact_keys(binding, {"raw_name", "raw_size", "raw_sha256", "capture_mode"}, "provenance.binding")
+    expected_binding = {
+        "raw_name": capture.input_path.name,
+        "raw_size": capture.raw_size,
+        "raw_sha256": capture.raw_sha256,
+        "capture_mode": capture.data["capture"]["mode"],
+    }
+    if binding != expected_binding:
+        _fail("provenance.binding does not match the validated Submit-PMU raw")
+
+    build = _object(data["build"], "provenance.build")
+    _exact_keys(
+        build,
+        {
+            "profile",
+            "profiled_cache_key",
+            "aicore_extra_cache_key",
+            "compile_definitions",
+            "source_state",
+            "source_state_path",
+            "source_state_version",
+            "git_head",
+            "source_fingerprint",
+            "definitions_sha256",
+        },
+        "provenance.build",
+    )
+    if not isinstance(build["source_state"], str):
+        _fail("provenance.build.source_state must be a string")
+    if not isinstance(build["source_state_path"], str) or not build["source_state_path"]:
+        _fail("provenance.build.source_state_path must be a non-empty string")
+    source_version, git_head, source_fingerprint, definitions_sha256 = _parse_source_state(build["source_state"])
+    if (
+        build["profile"] != binding["capture_mode"]
+        or build["source_state_version"] != source_version
+        or build["git_head"] != git_head
+        or build["source_fingerprint"] != source_fingerprint
+        or build["definitions_sha256"] != definitions_sha256
+    ):
+        _fail("provenance.build does not close against its profile/source state")
+    cache_key = build["profiled_cache_key"]
+    if not isinstance(cache_key, list) or not cache_key or not all(isinstance(value, str) for value in cache_key):
+        _fail("provenance.build.profiled_cache_key must be a non-empty string array")
+    if cache_key[-1] != build["profile"]:
+        _fail("provenance.build.profiled_cache_key must end with the selected profile")
+    if not isinstance(build["aicore_extra_cache_key"], str) or _HEX_16_PATTERN.fullmatch(
+        build["aicore_extra_cache_key"]
+    ) is None:
+        _fail("provenance.build.aicore_extra_cache_key must contain 16 lowercase hex digits")
+    definitions = build["compile_definitions"]
+    if not isinstance(definitions, list) or not definitions or not all(isinstance(value, str) for value in definitions):
+        _fail("provenance.build.compile_definitions must be a non-empty string array")
+    if tuple(definitions) != _expected_compile_definitions(build["profile"]):
+        _fail("provenance.build compile definitions do not match the selected profile")
+    if hashlib.sha256(repr(definitions).encode("utf-8")).hexdigest() != definitions_sha256:
+        _fail("provenance.build compile definitions do not match definitions_sha256")
+
+    artifacts = _object(data["artifacts"], "provenance.artifacts")
+    expected_artifacts = {"aicore_kernel", "aic_combined", "aiv_combined", "host_runtime"}
+    _exact_keys(artifacts, expected_artifacts, "provenance.artifacts")
+    for name in sorted(expected_artifacts):
+        _validate_provenance_artifact(artifacts[name], f"provenance.artifacts.{name}")
+    return data
+
+
+def load_provenance(
+    provenance_path: Path | str,
+    capture: SubmitPmuCapture,
+) -> tuple[dict[str, Any], str]:
+    """Validate a provenance sidecar and its immutable binding to one raw capture."""
+
+    path = Path(provenance_path)
+    if path.name != DEFAULT_PROVENANCE_NAME:
+        _fail(f"Submit-PMU provenance filename must be {DEFAULT_PROVENANCE_NAME!r}")
+    raw_bytes = path.read_bytes()
+    data = _validate_provenance_data(_object(json.loads(raw_bytes), "provenance"), capture)
+    return data, hashlib.sha256(raw_bytes).hexdigest()
 
 
 def _format_integer(value: int | float) -> str:
@@ -899,7 +1225,61 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
     """
 
 
-def _document(capture: SubmitPmuCapture, miss_penalty_ns: float) -> str:
+def _provenance_overview(provenance: Mapping[str, Any] | None, provenance_sha256: str | None) -> str:
+    if provenance is None:
+        return ""
+    build = provenance["build"]
+    artifacts = provenance["artifacts"]
+    labels = {
+        "aicore_kernel": "AICore final",
+        "aic_combined": "AIC combined",
+        "aiv_combined": "AIV combined",
+        "host_runtime": "Host runtime",
+    }
+    rows = []
+    for name in ("aicore_kernel", "aic_combined", "aiv_combined", "host_runtime"):
+        artifact = artifacts[name]
+        rows.append(
+            "<tr>"
+            f"<th>{labels[name]}</th>"
+            f"<td>{_format_integer(artifact['size_bytes'])}</td>"
+            f"<td><code>{artifact['sha256']}</code></td>"
+            f"<td>{_format_integer(artifact['text']['size_bytes'])}</td>"
+            f"<td><code>{artifact['text']['sha256']}</code></td>"
+            f"<td><code>{html.escape(artifact['path'])}</code></td>"
+            "</tr>"
+        )
+    definitions = "<br>".join(f"<code>{html.escape(value)}</code>" for value in build["compile_definitions"])
+    cache_key = " / ".join(html.escape(value) for value in build["profiled_cache_key"])
+    return f"""
+  <section class="provenance-overview">
+    <h2>诊断构建身份</h2>
+    <p><strong>该 sidecar 在 case 返回后由实际加载路径冻结，并用 raw SHA 绑定；不会改写 raw，
+      也不会给 AICore 热路径增加指令。</strong></p>
+    <dl class="provenance-meta">
+      <dt>Provenance SHA-256</dt><dd><code>{provenance_sha256}</code></dd>
+      <dt>Profile / extra cache</dt><dd><code>{html.escape(build['profile'])}</code> /
+        <code>{build['aicore_extra_cache_key']}</code></dd>
+      <dt>Profiled cache key</dt><dd><code>{cache_key}</code></dd>
+      <dt>Source state</dt><dd><code>{build['source_state']}</code></dd>
+      <dt>Source-state stamp</dt><dd><code>{html.escape(build['source_state_path'])}</code></dd>
+      <dt>Compile definitions</dt><dd>{definitions}</dd>
+    </dl>
+    <div class="table-wrap"><table>
+      <thead><tr><th>实物</th><th>文件大小</th><th>文件 SHA-256</th>
+        <th>.text 大小</th><th>.text SHA-256</th><th>采集时路径</th></tr></thead>
+      <tbody>{"".join(rows)}</tbody>
+    </table></div>
+  </section>
+    """
+
+
+def _document(
+    capture: SubmitPmuCapture,
+    miss_penalty_ns: float,
+    provenance: Mapping[str, Any] | None = None,
+    provenance_sha256: str | None = None,
+) -> str:
     configuration = capture.data["configuration"]
     frequencies = configuration["pmu_cycles_per_ns"]
     window = capture.data["window"]
@@ -916,6 +1296,7 @@ def _document(capture: SubmitPmuCapture, miss_penalty_ns: float) -> str:
     )
     rows = _per_core_rows(capture.records, miss_penalty_ns)
     phase_overview = _phase_overview(capture)
+    provenance_overview = _provenance_overview(provenance, provenance_sha256)
     shadow_note = (
         "phase 模式的 shadow 是 begin/end/final 全部 running read-clear 返回值之和，只用于标记全窗 "
         "capture gap，不作为第二份性能数据展示。"
@@ -947,6 +1328,8 @@ def _document(capture: SubmitPmuCapture, miss_penalty_ns: float) -> str:
     .headline div {{ padding:14px 16px; }} .headline strong {{ display:block; font-size:22px; }}
     .phase-overview {{ background:#eff6ff; border:1px solid #bfdbfe; border-radius:10px; padding:4px 16px 16px; }}
     .phase-overview h2 {{ margin-top:14px; }} .phase-overview p {{ max-width:1200px; }}
+    .provenance-overview {{ background:#f0fdf4; border:1px solid #bbf7d0; border-radius:10px; padding:4px 16px 16px; }}
+    .provenance-overview h2 {{ margin-top:14px; }} .provenance-meta {{ max-width:1200px; }}
     .phase-table {{ box-shadow:none; }} .phase-table th:first-child {{ text-align:left; }}
     .phase-table th small {{ display:block; font-weight:400; color:var(--muted); }}
     .groups {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(310px,1fr)); gap:14px; }}
@@ -975,6 +1358,7 @@ def _document(capture: SubmitPmuCapture, miss_penalty_ns: float) -> str:
   <h1>真实 FDWIC Submit PMU I-cache 报告</h1>
   <p class="subtitle">固定输入 <code>{source_name}</code> · schema <code>{SCHEMA_NAME}</code> · 32 AIC + 64 AIV</p>
   {phase_overview}
+  {provenance_overview}
   <section class="headline">
     <div><span>全局 Submit 时间范围</span>
       <strong>{_format_number(window["global_submit_span_us"])} µs</strong>
@@ -1015,7 +1399,126 @@ def render_report(input_path: Path | str, *, miss_penalty_ns: float = 90.0) -> s
     """Return a self-contained HTML report after validating and recomputing the raw capture."""
 
     penalty = _number(miss_penalty_ns, "miss_penalty_ns", positive=True)
-    return _document(load_capture(input_path), penalty)
+    capture = load_capture(input_path)
+    provenance_path = capture.input_path.with_name(DEFAULT_PROVENANCE_NAME)
+    provenance = None
+    provenance_sha256 = None
+    if provenance_path.is_file():
+        provenance, provenance_sha256 = load_provenance(provenance_path, capture)
+    document = _document(capture, penalty, provenance, provenance_sha256)
+    _assert_capture_raw_unchanged(capture)
+    return document
+
+
+def _atomic_write_text(output_file: Path, document: str) -> None:
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_file.with_name(f"{output_file.name}.tmp")
+    temporary.unlink(missing_ok=True)
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            stream.write(document)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output_file)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _stage_text(output_file: Path, document: str, *, purpose: str) -> Path:
+    """Durably stage text beside its final path without making it official."""
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output_file.name}.{purpose}.",
+        suffix=".tmp",
+        dir=output_file.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(document)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return temporary
+
+
+def _restore_file_snapshot(output_file: Path, previous: bytes | None) -> None:
+    """Restore exactly the file state observed before a paired publication."""
+
+    if previous is None:
+        output_file.unlink(missing_ok=True)
+        return
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output_file.name}.rollback.",
+        suffix=".tmp",
+        dir=output_file.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(previous)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output_file)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _publish_provenance_report_pair(
+    *,
+    capture: SubmitPmuCapture,
+    raw_snapshot: bytes,
+    provenance_file: Path,
+    provenance_document: str,
+    output_file: Path,
+    report_document: str,
+) -> None:
+    """Publish the sidecar/report pair or restore the exact previous pair."""
+
+    raw_parent = capture.input_path.resolve().parent
+    if provenance_file.resolve().parent != raw_parent or output_file.resolve().parent != raw_parent:
+        _fail("Submit-PMU raw, provenance and report must share one output directory")
+    if provenance_file == output_file:
+        _fail("Submit-PMU provenance and report paths must be distinct")
+
+    previous = {
+        provenance_file: provenance_file.read_bytes() if provenance_file.is_file() else None,
+        output_file: output_file.read_bytes() if output_file.is_file() else None,
+    }
+    staged: list[Path] = []
+    published = False
+    try:
+        staged_provenance = _stage_text(provenance_file, provenance_document, purpose="pending")
+        staged.append(staged_provenance)
+        staged_report = _stage_text(output_file, report_document, purpose="pending")
+        staged.append(staged_report)
+        if _assert_capture_raw_unchanged(capture) != raw_snapshot:
+            _fail("Submit-PMU raw changed while preparing provenance/report artifacts")
+
+        os.replace(staged_provenance, provenance_file)
+        published = True
+        os.replace(staged_report, output_file)
+        if _assert_capture_raw_unchanged(capture) != raw_snapshot:
+            _fail("Submit-PMU raw changed while publishing provenance/report artifacts")
+    except BaseException as original_error:
+        rollback_errors: list[str] = []
+        if published:
+            for final_path, old_bytes in previous.items():
+                try:
+                    _restore_file_snapshot(final_path, old_bytes)
+                except BaseException as rollback_error:  # pragma: no cover - catastrophic filesystem failure
+                    rollback_errors.append(f"{final_path}: {rollback_error}")
+        if rollback_errors:
+            raise RuntimeError(
+                "Submit-PMU paired publication failed and rollback was incomplete: " + "; ".join(rollback_errors)
+            ) from original_error
+        raise
+    finally:
+        for temporary in staged:
+            temporary.unlink(missing_ok=True)
 
 
 def write_report(
@@ -1031,18 +1534,51 @@ def write_report(
     if output_file.name != DEFAULT_OUTPUT_NAME:
         _fail(f"Submit-PMU output filename must be {DEFAULT_OUTPUT_NAME!r}")
     document = render_report(input_file, miss_penalty_ns=miss_penalty_ns)
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output_file.with_name(f"{output_file.name}.tmp")
-    temporary.unlink(missing_ok=True)
-    try:
-        with temporary.open("x", encoding="utf-8") as stream:
-            stream.write(document)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, output_file)
-    finally:
-        temporary.unlink(missing_ok=True)
+    _atomic_write_text(output_file, document)
     return output_file
+
+
+def write_report_with_provenance(
+    input_path: Path | str,
+    identity: SubmitPmuBuildIdentity,
+    output_path: Path | str | None = None,
+    provenance_path: Path | str | None = None,
+    *,
+    miss_penalty_ns: float = 90.0,
+) -> tuple[Path, Path]:
+    """Publish provenance and HTML while preserving the C++ producer's raw bytes."""
+
+    penalty = _number(miss_penalty_ns, "miss_penalty_ns", positive=True)
+    capture = load_capture(input_path)
+    output_file = Path(output_path) if output_path is not None else capture.input_path.with_name(DEFAULT_OUTPUT_NAME)
+    provenance_file = (
+        Path(provenance_path)
+        if provenance_path is not None
+        else capture.input_path.with_name(DEFAULT_PROVENANCE_NAME)
+    )
+    if output_file.name != DEFAULT_OUTPUT_NAME:
+        _fail(f"Submit-PMU output filename must be {DEFAULT_OUTPUT_NAME!r}")
+    if provenance_file.name != DEFAULT_PROVENANCE_NAME:
+        _fail(f"Submit-PMU provenance filename must be {DEFAULT_PROVENANCE_NAME!r}")
+
+    raw_snapshot = _assert_capture_raw_unchanged(capture)
+    payload = _build_provenance_payload(capture, identity)
+    provenance_document = _json_document(payload)
+    validated_provenance = _validate_provenance_data(
+        _object(json.loads(provenance_document), "provenance"),
+        capture,
+    )
+    provenance_sha256 = hashlib.sha256(provenance_document.encode("utf-8")).hexdigest()
+    document = _document(capture, penalty, validated_provenance, provenance_sha256)
+    _publish_provenance_report_pair(
+        capture=capture,
+        raw_snapshot=raw_snapshot,
+        provenance_file=provenance_file,
+        provenance_document=provenance_document,
+        output_file=output_file,
+        report_document=document,
+    )
+    return output_file, provenance_file
 
 
 def main(argv: Sequence[str] | None = None) -> int:
