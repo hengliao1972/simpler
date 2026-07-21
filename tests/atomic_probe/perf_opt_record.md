@@ -176,7 +176,8 @@ outputs/TestPagedAttentionUnroll_Case1_20260717_023809/
 | 2026-07-21 | `52dc04c7` | 阶段归因 | 排除 Materialize 为同 ELF 波动主载体 |
 | 2026-07-21 | `7fa7399f` | 阶段归因 | 排除 Claim 为同 ELF 波动主载体 |
 | 2026-07-21 | `afeb515a` | 阶段归因 | 排除 SubmitTransition 为同 ELF 波动主载体 |
-| 2026-07-21 | 本阶段提交 | 阶段归因 | 排除 ArgBuild 为同 ELF 波动主载体 |
+| 2026-07-21 | `57aedfee` | 阶段归因 | 排除 ArgBuild 为同 ELF 波动主载体 |
+| 2026-07-21 | 本阶段提交 | 阶段归因 | 排除 Register 为同 ELF 波动主载体 |
 
 ### 4.1 真实 PA 第一轮 atomic 与前端优化
 
@@ -3087,6 +3088,124 @@ atomic、flag wait、I-cache 或其他业务段。Pz 相关性和幅度都不临
 波幅也只有 G 的 0.76%，所以不扩到 20 轮。下一阶段按既定顺序切换到现有
 `submit-pmu-register`，完成最后一个存量 selector 的同 ELF 归因。
 
+### 8.14 同一 Register ELF 的阶段与其余 Submit 波动分解
+
+**[阶段归因已完成；Register 不通过主载体门禁]**
+
+#### 8.14.1 真实契约、冻结对象与正式样本
+
+Register observer 有三个互斥源码挂点，但每个正常 Submit 只命中其中一个，因此
+固定 shape 是每核 `N` 对而不是 `3N` 对：B1 为 5，Case1 为 1,280。边界从真实
+`dist_submit_register_outputs()` 调用入口到返回，排除普通泳道 Register 的前序
+记录发布、结束 timestamp 与 caller 衔接；它只能命名为 RegisterOutputs 调用体，
+不能冒充完整 Register timestamp-to-timestamp span 或单次 TensorMap insert。
+
+新 HEAD 上先运行 B1：
+
+```text
+outputs/TestPagedAttentionUnroll_CaseB1_20260721_102100/
+```
+
+96 核各 5 次 Submit/Register，phase id `5`、status `0x3f`、primary/shadow 96/96
+精确相等，HTML 精确重建；83.517 us 只作结构证据。随后冻结：
+
+| 对象 | 固定值 |
+| --- | --- |
+| commit | `57aedfee51883a5840e618037b49ac9c630d1cb6` |
+| AICore cache | `32c26e06ad76d186` |
+| source state | `source-v2:57aedfee51883a5840e618037b49ac9c630d1cb6:a799850ce15b3a0fcb6cd9dc6d89cc81a67f08c6d2a9a7afeb4c76b24ab75bea:ff85282e42fc1b03ba04d010a0b3b793349657e8b1e321fd7b31017015f1dee9` |
+| AICore 定义 | `PTO_FDWIC_SUBMIT_PMU=1;PTO_FDWIC_SUBMIT_PMU_PHASE_ID=5;PTO_FDWIC_TRACE_ENABLED=0` |
+| `aicore_kernel.o` | 2,573,816 B / `.text` 150,608 B / SHA256 `39760b286b14a3ec7a078a0d0a60981ce86ba3a58be68626df02bab056c107f1` |
+| AIC/AIV combined | `78677b168454de544a708531781f00bcb1d3a2f65518affae262955f5f585933` / `8566136503bf6d7a60290a6f8776d515b13ec7469de4d4a084ced38d1ad24102` |
+| `libhost_runtime.so` | SHA256 `5f2e9af0892f64f28aded87e013a5b32425d86940b2e08cd34dad49cab0c0f9d` |
+
+Case1 预热 `..._102246` 排除后，12 个独立正式进程全部 PASS：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260721_102330/
+outputs/TestPagedAttentionUnroll_Case1_20260721_102413/
+outputs/TestPagedAttentionUnroll_Case1_20260721_102458/
+outputs/TestPagedAttentionUnroll_Case1_20260721_102543/
+outputs/TestPagedAttentionUnroll_Case1_20260721_102626/
+outputs/TestPagedAttentionUnroll_Case1_20260721_102711/
+outputs/TestPagedAttentionUnroll_Case1_20260721_102754/
+outputs/TestPagedAttentionUnroll_Case1_20260721_102839/
+outputs/TestPagedAttentionUnroll_Case1_20260721_102923/
+outputs/TestPagedAttentionUnroll_Case1_20260721_103005/
+outputs/TestPagedAttentionUnroll_Case1_20260721_103049/
+outputs/TestPagedAttentionUnroll_Case1_20260721_103131/
+```
+
+12/12 生产 `load_capture()` 和 HTML 重建通过；1,152 条逐核记录全部满足 96×1,280、
+phase id `5`、phase status `0x3f`、owner 配置/恢复、拓扑、风险阈值和计数顺序，
+primary/shadow 1,152/1,152 精确相等。共覆盖 1,474,560 次真实 RegisterOutputs
+调用体。采样前后上述实物 SHA 和 source state 不变，已知外部评测未出现。
+
+#### 8.14.2 整数分解与 12 轮结果
+
+继续定义 `Pz=Register[z]`、`Rz=body[z]-Pz`，12/12 精确满足
+`G=A+M+X=A+Pz+Rz`。下表单位均为 us：
+
+| 轮次 | 时间戳 | G | M | X | A | Pz | Rz | 最晚核 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | `102330` | 5053.021 | 4784.164 | 268.581 | 0.276 | 233.630 | 4819.115 | c92/AIV/b30/l1 |
+| 2 | `102413` | 4708.077 | 4587.936 | 116.475 | 3.666 | 231.358 | 4473.053 | c55/AIV/b11/l2 |
+| 3 | `102458` | 4737.712 | 4593.329 | 136.797 | 7.586 | 250.913 | 4479.213 | c91/AIV/b29/l2 |
+| 4 | `102543` | 4679.146 | 4594.077 | 77.060 | 8.009 | 231.034 | 4440.103 | c94/AIV/b31/l1 |
+| 5 | `102626` | 4964.744 | 4608.269 | 354.148 | 2.327 | 212.237 | 4750.180 | c24/AIC/b24/l0 |
+| 6 | `102711` | 5201.300 | 4590.639 | 606.702 | 3.960 | 232.572 | 4964.768 | c23/AIC/b23/l0 |
+| 7 | `102754` | 5097.611 | 4818.618 | 278.777 | 0.216 | 245.937 | 4851.458 | c34/AIV/b1/l1 |
+| 8 | `102839` | 4689.188 | 4604.074 | 78.356 | 6.757 | 236.377 | 4446.054 | c31/AIC/b31/l0 |
+| 9 | `102923` | 4948.061 | 4612.592 | 329.669 | 5.800 | 244.657 | 4697.604 | c28/AIC/b28/l0 |
+| 10 | `103005` | 4698.544 | 4598.600 | 98.540 | 1.404 | 244.352 | 4452.788 | c60/AIV/b14/l1 |
+| 11 | `103049` | 4724.767 | 4595.187 | 126.730 | 2.850 | 265.833 | 4456.084 | c20/AIC/b20/l0 |
+| 12 | `103131` | 4735.855 | 4604.962 | 123.287 | 7.606 | 241.715 | 4486.534 | c48/AIV/b8/l1 |
+
+最晚核 12 轮落在 12 个不同 core，AIC/AIV 为 5/7。完整分布为：
+
+| 指标 | 最小值 | 中位数 | 最大值 | MAD | P10 | P90 | P90-P10 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| G | 4679.146 | 4736.784 | 5201.300 | 52.617 | 4690.124 | 5093.152 | 403.028 |
+| M | 4587.936 | 4601.337 | 4818.618 | 7.634 | 4590.908 | 4767.007 | 176.099 |
+| X | 77.060 | 131.763 | 606.702 | 54.055 | 80.375 | 351.700 | 271.325 |
+| A | 0.216 | 3.813 | 8.009 | 2.677 | 0.389 | 7.604 | 7.215 |
+| Pz | 212.237 | 239.046 | 265.833 | 6.683 | 231.066 | 250.415 | 19.349 |
+| Rz | 4440.103 | 4482.874 | 4964.768 | 39.795 | 4446.727 | 4848.224 | 401.496 |
+| Register mean/core | 238.911 | 240.199 | 242.323 | 0.458 | 239.413 | 241.717 | 2.304 |
+| 其余 Submit mean/core | 4297.259 | 4321.268 | 4572.133 | 20.016 | 4300.027 | 4549.033 | 249.006 |
+
+#### 8.14.3 门禁、AIV miss 跃迁与结论边界
+
+| 分量 | Spearman(G, ·) | P90-P10 | 占 G 波幅 | 判定 |
+| --- | ---: | ---: | ---: | --- |
+| M | +0.378 | 176.099 us | 43.69% | FAIL |
+| X | +0.937 | 271.325 us | 67.32% | PASS：迁移慢尾 |
+| A | -0.476 | 7.215 us | 1.79% | FAIL |
+| Pz | +0.077 | 19.349 us | 4.80% | **FAIL：Register 不是主载体** |
+| Rz | +0.986 | 401.496 us | 99.62% | **PASS：同核其余 Submit 携带变化** |
+| Register mean/core | +0.462 | 2.304 us | 0.57% | FAIL |
+| 其余 Submit mean/core | +0.720 | 249.006 us | 61.78% | PASS：辅助 core-work 序列 |
+
+按最晚核角色复算，AIC/AIV 的 `Spearman(G,Pz)` 为 `-0.600/+0.571`，波幅只占各自
+G 的 9.17%/4.39%；对应 Rz 为 `+1.000/+0.964`。Register 在角色内同样不携带
+波动。remaining mean/core 的通过说明本组除末核 X 外还存在部分多数核剩余工作联动，
+但它是辅助序列，不能与 X 相加成墙钟贡献，也不能继续命名为某个未测 phase。
+
+Register core-time 份额中位为 5.267%，范围 5.025%～5.287%；request/call 中位
+86.587，范围 86.414～86.709。miss/call 出现一个值得保留的 AIV 状态跃迁：前四轮
+ALL 为 1.34～1.46、AIV 为 1.99～2.16，从第 5 轮起变为 ALL 约 1.79、AIV 约
+2.66；AIC 始终约 0.047～0.053。该变化逐核 primary=shadow、构建身份和所有门禁
+闭合，因此不是 capture gap；但它与 G 的相关性只有 `+0.252`，Register phase 时间
+仍稳定，不能把 I-cache 状态变化包装成本组时延载体。这也说明正式报告必须同时展示
+同 ELF 的时间、request/miss 和逐核范围，而不能只看单轮 miss rate。
+
+本阶段只排除当前 Register ELF 的 403.028 us 波形由 Register 主导；本组仍由 X 而
+不是权威 P 中的 M 主导，没有复现 P 的约 1.408 ms 宽波动。`Rz`/remaining 仍是
+算术剩余，不能改名为 atomic、flag wait 或 I-cache。Pz 与 mean/core 均远离门槛，
+所以不扩到 20 轮。至此所有存量 selector 的同 ELF 归因结束，下一步先完善报告端
+逐核 Submit/PMU/Scalar/非 busy 残余时间与构建 provenance，再实现固定容量的
+EfDrain-control/依赖就绪观察；都不得扩展逐事件 raw。
+
 ## 9. 已撤回、失败或不能外推的路线
 
 ### 9.1 已撤回的优化候选
@@ -3431,12 +3550,17 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
     29.94%，角色内也不通过；ArgBuild mean/core 波幅仅占 0.76%。同核非 ArgBuild
     的 Rz 与迁移慢尾 X 通过。本组没有复现 P 的多数核共同伸缩，因此只排除当前
     ArgBuild ELF 的实际波形由该 phase 主导。
+16. **[Register 波动归因，已完成] 同一诊断 ELF 的 12 轮独立 Case1**：每个
+    Submit 只命中三个互斥挂点之一，1,152 条逐核记录和 1,474,560 次调用体全部
+    闭合。Register Pz 的 `rho=+0.077`、波幅只占 G 的 4.80%，mean/core 波幅仅
+    0.57%；同核 Rz、迁移慢尾 X 和辅助 remaining mean/core 通过。AIV miss/call
+    在第 5 轮发生闭合但与 G 弱相关的状态跃迁，进一步证明单轮 miss 不能替代同
+    ELF 时间关联。结论仍不外推到权威 P 的宽波动。
 
-下一步不再扩充 N、K、Materialize、Claim、SubmitTransition 或 ArgBuild，也不跨
-ELF 扣减。直接复用现有 `submit-pmu-register` 做 B1、预热和 12 个独立 Case1。
-存量 selector 完成后，只允许设计固定容量的 EfDrain-control/依赖就绪检查聚合，
-不能恢复逐 Submit/逐等待的大 raw；局部 I-cache 是否排除真实 linked-kernel，必须
-先通过接口与观测语义核验再决定。原因层级闭合后，再由原 perf-clock 交错 A/B 决定
-真实 Scalar 候选保留或撤销。
+下一步不再扩充 N、K 或已经完成归因的既有 selector，也不跨 ELF 扣减。先在纯 Python
+加工层补齐逐核 Submit/PMU/Scalar/非 busy 残余的时间范围和构建 provenance；随后
+只允许设计固定容量的 EfDrain-control/依赖就绪检查聚合，不能恢复逐 Submit/逐等待
+的大 raw。局部 I-cache 是否排除真实 linked-kernel，必须先通过接口与观测语义核验
+再决定。原因层级闭合后，再由 perf-clock 交错 A/B 决定真实 Scalar 候选保留或撤销。
 单阶段 observed 不机械扣除 empty，也不从单轮 I-cache 数直接提出生产优化；
 standalone 的绝对数继续不替代真实 PA 当前结果。
