@@ -14,6 +14,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "data_type.h"
+
 // 真实 A5 PA 的 submit-PMU 不复用普通泳道的逐事件 record，也不复用通用
 // PMU 的逐 kernel task ring。none 每核只发布一个 64B 整窗结果；局部阶段
 // 在相同整窗结果之后追加一个 64B sidecar，仍然没有逐事件记录。
@@ -25,6 +27,7 @@ constexpr uint16_t kFdwicSubmitPmuModeEmptyBracket = 3;
 constexpr uint16_t kFdwicSubmitPmuModeMaterialize = 4;
 constexpr uint16_t kFdwicSubmitPmuModeClaim = 5;
 constexpr uint16_t kFdwicSubmitPmuModeRegister = 6;
+constexpr uint16_t kFdwicSubmitPmuModeSubmitTransition = 7;
 constexpr uint32_t kFdwicSubmitPmuExpectedAic = 32;
 constexpr uint32_t kFdwicSubmitPmuExpectedAiv = 64;
 constexpr uint32_t kFdwicSubmitPmuExpectedCores = kFdwicSubmitPmuExpectedAic + kFdwicSubmitPmuExpectedAiv;
@@ -49,7 +52,10 @@ enum class FdwicSubmitPmuPhase : uint16_t {
     // dist_submit_register_outputs() 调用入口到返回。刻意排除前一阶段
     // record 发布和 caller 衔接；每个 Submit 固定调用一次。
     Register = 5,
-    Count = 6,
+    // 上一次 Submit 返回前到下一次 dist_submit_begin() 完成。首个 Submit
+    // 没有前驱、末个 Submit 没有后继，因此每核固定 expected_submits - 1 次。
+    SubmitTransition = 6,
+    Count = 7,
 };
 
 constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
@@ -66,16 +72,27 @@ constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
         return kFdwicSubmitPmuModeClaim;
     case FdwicSubmitPmuPhase::Register:
         return kFdwicSubmitPmuModeRegister;
+    case FdwicSubmitPmuPhase::SubmitTransition:
+        return kFdwicSubmitPmuModeSubmitTransition;
     case FdwicSubmitPmuPhase::Count:
         break;
     }
     return 0;
 }
 
+PTO_DEVICE_FUNC constexpr uint32_t
+fdwic_submit_pmu_expected_phase_calls(FdwicSubmitPmuPhase phase, uint32_t expected_submits) {
+    if (phase == FdwicSubmitPmuPhase::None) return 0;
+    if (phase == FdwicSubmitPmuPhase::SubmitTransition) {
+        return expected_submits == 0 ? 0 : expected_submits - 1U;
+    }
+    return expected_submits;
+}
+
 constexpr bool fdwic_submit_pmu_mode_has_phase(uint16_t mode) {
     return mode == kFdwicSubmitPmuModeArgBuild || mode == kFdwicSubmitPmuModeEmptyBracket ||
            mode == kFdwicSubmitPmuModeMaterialize || mode == kFdwicSubmitPmuModeClaim ||
-           mode == kFdwicSubmitPmuModeRegister;
+           mode == kFdwicSubmitPmuModeRegister || mode == kFdwicSubmitPmuModeSubmitTransition;
 }
 
 // A5 PIPE_UTIL 事件布局。CNT6/CNT7 是权威值；CNT8/CNT5 使用相同事件作

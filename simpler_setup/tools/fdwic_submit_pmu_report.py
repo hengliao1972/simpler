@@ -44,11 +44,13 @@ EMPTY_BRACKET_CAPTURE_MODE = "submit-pmu-empty-bracket"
 MATERIALIZE_CAPTURE_MODE = "submit-pmu-materialize"
 CLAIM_CAPTURE_MODE = "submit-pmu-claim"
 REGISTER_CAPTURE_MODE = "submit-pmu-register"
+SUBMIT_TRANSITION_CAPTURE_MODE = "submit-pmu-submit-transition"
 ARG_BUILD_PHASE_ID = 1
 EMPTY_BRACKET_PHASE_ID = 2
 MATERIALIZE_PHASE_ID = 3
 CLAIM_PHASE_ID = 4
 REGISTER_PHASE_ID = 5
+SUBMIT_TRANSITION_PHASE_ID = 6
 PHASE_CONFIG_BY_MODE = {
     ARG_BUILD_CAPTURE_MODE: {
         "id": ARG_BUILD_PHASE_ID,
@@ -86,6 +88,14 @@ PHASE_CONFIG_BY_MODE = {
         "id": REGISTER_PHASE_ID,
         "name": "register",
         "boundary": "register_outputs_call_entry_to_return",
+        "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+        "counter_semantics": "running_read_clear_observed_bracket",
+        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+    },
+    SUBMIT_TRANSITION_CAPTURE_MODE: {
+        "id": SUBMIT_TRANSITION_PHASE_ID,
+        "name": "submit-transition",
+        "boundary": "previous_submit_end_to_next_submit_begin",
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_observed_bracket",
         "time_semantics": "inner_sys_cnt_between_boundary_observers",
@@ -184,6 +194,14 @@ def _require_equal(actual: Any, expected: Any, path: str) -> None:
         _fail(f"{path} must equal {expected!r}, got {actual!r}")
 
 
+def _expected_phase_calls(mode: str, expected_submits: int) -> int:
+    if mode == SUBMIT_TRANSITION_CAPTURE_MODE:
+        if expected_submits <= 1:
+            _fail("submit-pmu-submit-transition requires at least two submits per core")
+        return expected_submits - 1
+    return expected_submits
+
+
 def _validate_capture_header(data: dict[str, Any]) -> tuple[str, dict[str, Any], int, dict[str, float]]:
     _require_equal(data.get("schema"), SCHEMA_NAME, "schema")
     capture = _object(data.get("capture"), "capture")
@@ -211,9 +229,10 @@ def _validate_capture_header(data: dict[str, Any]) -> tuple[str, dict[str, Any],
         if "phase" in configuration:
             _fail(f"configuration must not contain phase in {NONE_CAPTURE_MODE}")
     else:
+        expected_calls = _expected_phase_calls(mode, expected_submits)
         expected_phase = {
             **PHASE_CONFIG_BY_MODE[mode],
-            "expected_calls_per_core": expected_submits,
+            "expected_calls_per_core": expected_calls,
         }
         _require_equal(
             configuration.get("phase"),
@@ -249,7 +268,7 @@ def _validate_capture_header(data: dict[str, Any]) -> tuple[str, dict[str, Any],
 def _validate_phase_record(
     record: dict[str, Any],
     prefix: str,
-    expected_submits: int,
+    expected_calls: int,
     submit_elapsed: int,
     expected_phase_id: int,
 ) -> None:
@@ -274,8 +293,8 @@ def _validate_phase_record(
         f"{prefix}.phase_max_shadow_miss_chunk",
     )
 
-    if begin_reads != expected_submits or end_reads != expected_submits:
-        _fail(f"{prefix} phase begin/end reads must both equal {expected_submits}")
+    if begin_reads != expected_calls or end_reads != expected_calls:
+        _fail(f"{prefix} phase begin/end reads must both equal {expected_calls}")
     if phase_elapsed > submit_elapsed:
         _fail(f"{prefix}.phase_elapsed_ticks exceeds submit_elapsed_ticks")
     if phase_requests_observed > record["shadow_icache_requests"]:
@@ -342,7 +361,8 @@ def _validate_record(
             _fail(f"{prefix}.shadow_icache_requests exceeds icache_requests")
         if shadow_misses > misses:
             _fail(f"{prefix}.shadow_icache_misses exceeds icache_misses")
-        _validate_phase_record(record, prefix, expected_submits, elapsed, PHASE_CONFIG_BY_MODE[mode]["id"])
+        expected_calls = _expected_phase_calls(mode, expected_submits)
+        _validate_phase_record(record, prefix, expected_calls, elapsed, PHASE_CONFIG_BY_MODE[mode]["id"])
     programmable = (scalar, requests, misses, shadow_requests, shadow_misses)
     if any(value >= PROGRAMMABLE_COUNTER_RISK_THRESHOLD for value in programmable):
         _fail(f"{prefix} programmable counter reaches the risk threshold 0x3fffffff")
@@ -771,6 +791,7 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
     phase_boundary = html.escape(phase["boundary"])
     counter_semantics = html.escape(phase["counter_semantics"])
     time_semantics = html.escape(phase["time_semantics"])
+    expected_calls = phase["expected_calls_per_core"]
     calibration_note = ""
     if phase["id"] == EMPTY_BRACKET_PHASE_ID:
         calibration_note = """
@@ -815,7 +836,8 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
   <section class="phase-overview">
     <h2><code>{phase_name}</code> 阶段观察（phase_id={phase["id"]}）</h2>
     <p class="fine">边界 <code>{phase_boundary}</code> · 计数语义 <code>{counter_semantics}</code> ·
-      时间语义 <code>{time_semantics}</code></p>
+      时间语义 <code>{time_semantics}</code> ·
+      <code>expected_calls_per_core={expected_calls}</code></p>
     {calibration_note}
     <p><strong>这是 running read-clear 观察区间，不是可与其他构建直接相减的独立计时。</strong>
       时间占比的分母是同一 ELF 的 Σ每核 Submit elapsed；request/miss 百分比的分母才是同一 ELF、

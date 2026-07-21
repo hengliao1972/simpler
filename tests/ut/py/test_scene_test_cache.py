@@ -120,6 +120,10 @@ def test_fdwic_profile_partitions_compile_cache(monkeypatch):
     assert _fdwic_profile() == "submit-pmu-register"
     assert _profiled_cache_key(base) == (*base, "submit-pmu-register")
 
+    monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-submit-transition")
+    assert _fdwic_profile() == "submit-pmu-submit-transition"
+    assert _profiled_cache_key(base) == (*base, "submit-pmu-submit-transition")
+
 
 def test_fdwic_private_profiles_have_isolated_compile_definitions():
     assert _fdwic_compile_definitions("none") is None
@@ -154,6 +158,11 @@ def test_fdwic_private_profiles_have_isolated_compile_definitions():
     assert _fdwic_compile_definitions("submit-pmu-register") == [
         "PTO_FDWIC_SUBMIT_PMU=1",
         "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=5",
+        "PTO_FDWIC_TRACE_ENABLED=0",
+    ]
+    assert _fdwic_compile_definitions("submit-pmu-submit-transition") == [
+        "PTO_FDWIC_SUBMIT_PMU=1",
+        "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=6",
         "PTO_FDWIC_TRACE_ENABLED=0",
     ]
 
@@ -250,6 +259,7 @@ def test_submit_pmu_elf_gate_accepts_only_whole_window_observer(monkeypatch, tmp
         "submit-pmu-materialize",
         "submit-pmu-claim",
         "submit-pmu-register",
+        "submit-pmu-submit-transition",
     ],
 )
 def test_submit_pmu_phase_elf_gate_requires_running_shadow_reader(monkeypatch, tmp_path, profile):
@@ -321,6 +331,7 @@ def test_submit_pmu_elf_gate_rejects_incomplete_or_mixed_image(monkeypatch, tmp_
         "submit-pmu-materialize",
         "submit-pmu-claim",
         "submit-pmu-register",
+        "submit-pmu-submit-transition",
     ],
 )
 def test_submit_pmu_phase_elf_gate_rejects_missing_running_shadow_reader(monkeypatch, tmp_path, profile):

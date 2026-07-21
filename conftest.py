@@ -161,6 +161,7 @@ def pytest_addoption(parser):
             "submit-pmu-materialize",
             "submit-pmu-claim",
             "submit-pmu-register",
+            "submit-pmu-submit-transition",
         ],
         default="none",
         help="Select a private fully_distributed_within_core evidence build. "
@@ -170,7 +171,8 @@ def pytest_addoption(parser):
         "submit-pmu-empty-bracket calibrates the adjacent begin/end observer cost at Claim.end; "
         "submit-pmu-materialize attributes the current Materialize business span; "
         "submit-pmu-claim attributes the current Claim business span; "
-        "submit-pmu-register attributes the RegisterOutputs call body.",
+        "submit-pmu-register attributes the RegisterOutputs call body; "
+        "submit-pmu-submit-transition attributes adjacent Submit gaps.",
     )
     parser.addoption(
         "--use-example-exec-time",
@@ -470,6 +472,7 @@ def _configure_fdwic_profile(config):
         "submit-pmu-materialize",
         "submit-pmu-claim",
         "submit-pmu-register",
+        "submit-pmu-submit-transition",
     }:
         raise pytest.UsageError(f"unsupported --fdwic-profile {fdwic_profile!r}")
 
@@ -696,6 +699,7 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
         "submit-pmu-materialize",
         "submit-pmu-claim",
         "submit-pmu-register",
+        "submit-pmu-submit-transition",
     }:
         incompatible = []
         for item in items:

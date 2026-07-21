@@ -650,6 +650,133 @@ per-call、request 和角色差异保持稳定。当前证据支持“该调用�
 - phase 没有局部 scalar busy，`miss × 90 ns` 只能作单核串行量级感知，不能当作
   可兑现的 Submit 墙钟收益。
 
+### 1.7 真实 PA `submit-pmu-submit-transition`
+
+#### 选型依据与 profile 身份
+
+`submit-pmu-submit-transition` 对应最新泳道中相邻 Submit 之间的真实业务衔接：
+从上一次 Submit 的统一 end hook 打开，到下一次 `dist_submit_begin()` 完成并到达
+统一 begin hook 后关闭。它继续保留本 ELF 自己的完整 Submit primary，同时只用
+既有 begin/end hook 控制 running read-clear bracket；没有在各条业务 Submit 路径
+重复增加挂点。
+
+该 profile 的编译与设备身份固定为：
+
+```text
+PTO_FDWIC_SUBMIT_PMU=1
+PTO_FDWIC_SUBMIT_PMU_PHASE_ID=6
+PTO_FDWIC_TRACE_ENABLED=0
+
+capture.mode                    = submit-pmu-submit-transition
+configuration.phase.id          = 6
+configuration.phase.name        = submit-transition
+configuration.phase.boundary    = previous_submit_end_to_next_submit_begin
+configuration.phase.counter_semantics
+                                = running_read_clear_observed_bracket
+configuration.phase.time_semantics
+                                = inner_sys_cnt_between_boundary_observers
+```
+
+公共二进制协议中的 mode 为 `7`、phase enum 为 `6`，两者不能混用。该构建仍复用
+12,416 B 设备 ABI：128 B header、`96 × 64 B` whole record 和
+`96 × 64 B` phase record；没有增加逐间隙记录、transition 类型或 task-kind 字段。
+
+#### `N-1` 次数契约与聚合语义
+
+首个 Submit 没有前驱，末个 Submit 没有后继，因此每核 `N` 次 Submit 只产生
+`N-1` 个 transition bracket：
+
+- task 0 的 begin 只启动完整 Submit PMU 整窗，不关闭不存在的前驱区间；
+- 每个非末次 Submit 的 end 打开一个 transition bracket；
+- 下一次非首个 Submit 完成 `dist_submit_begin()` 后，在统一 begin hook 关闭 bracket；
+- 末次 Submit 的 end 只停止完整 PMU 整窗，不制造没有后继 Submit 的悬空区间。
+
+设备 shape 状态、host 导出和 Python 分析器共用相同的预期次数口径。B1 每核
+`N=5`，所以要求 4 次、全局 384/384 begin/end；Case1 每核 `N=1280`，所以要求
+1,279 次、全局 122,784/122,784 begin/end。任一核仍按 `N` 次、少一次、多一次、
+begin/end 不平衡或 phase id 不是 6，整份结果都会被拒绝；每核少于 2 次 Submit
+也不会发布 transition 结果。
+
+当前 PA 编排中的 Kernel→Kernel、Kernel→Alloc 和 Alloc→Kernel 间隙都进入同一
+累计值。raw 只保存每核总 elapsed/request/miss 与总调用次数，因此报告中的
+ns/request/miss per gap 是**所有相邻 Submit 间隙的加权均值**，不能进一步解释为
+上述任一种 transition 的独立成本。
+
+#### 运行与产物
+
+```bash
+source /home/q00473782/Ascend/cann-9.1.0-weekly-20260708/cann/set_env.sh
+source /home/q00473782/.venv/bin/activate
+export PTO_ISA_ROOT=/home/q00473782/atomic/private/gpt/pto-isa-ddafa
+export PYTHONPATH="$PWD:$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
+
+python -m pytest \
+  examples/a5/fully_distributed_within_core/paged_attention_unroll/test_paged_attention_unroll.py \
+  --platform a5 --runtime fully_distributed_within_core --level 2 \
+  --case Case1 --manual include --fdwic-profile submit-pmu-submit-transition \
+  --rounds 1 -s -v
+```
+
+每轮仍在对应输出目录自动生成并校验：
+
+```text
+fdwic_submit_pmu_raw.json       # 96 核整窗 primary 与 transition 聚合原始数据
+fdwic_submit_pmu_report.html    # 同一 ELF 的 ALL/AIC/AIV 加工报告
+```
+
+已有 raw 的 HTML 重建命令与第 1.5 节相同。
+
+#### B1 只作结构证据
+
+```text
+outputs/TestPagedAttentionUnroll_CaseB1_20260721_042627/
+outputs/TestPagedAttentionUnroll_CaseB1_20260721_042750/
+```
+
+两轮均为 96/96 受信记录、每核 5 次 Submit/4 次 gap、384/384 begin/end、phase
+id `6`、phase status `0x3f`，primary/shadow request/miss 逐核精确相等，owner
+Restore 与风险阈值全部闭合。B1 调用次数太少，会放大首次进入、取指预热和跨核
+到达差异；这两轮只证明 profile、`N-1` shape、ABI 和 raw→HTML 链路闭合，不用于
+判断 transition 的稳态性能。
+
+#### 两轮 Case1 稳态结果
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260721_042914/
+outputs/TestPagedAttentionUnroll_Case1_20260721_043036/
+```
+
+两轮均为 96 核每核 1,280 次 Submit/1,279 次 gap、122,784/122,784 begin/end、
+phase status `0x3f`，32 AIC + 64 AIV、owner Restore、mixed triplet、
+primary/shadow、数值顺序和计数器风险阈值全部闭合。完整 Submit 分别为
+4,708.545 us 和 4,649.434 us。下表所有数据和占比都只来自**本轮同一个
+SubmitTransition ELF**；每 gap 是按该角色累计 calls 加权的均值。
+
+| 轮次 | 角色 | 时间 ns/gap | request observed/gap | miss observed/gap | 时间占比 | request 占比 | miss 占比 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `042914` | ALL | 354.560 | 134.101 | 4.815 | 10.046% | 23.349% | 28.624% |
+| `042914` | AIC | 303.374 | 133.426 | 0.503 | 8.881% | 23.098% | 17.115% |
+| `042914` | AIV | 380.153 | 134.438 | 6.972 | 10.601% | 23.475% | 29.337% |
+| `043036` | ALL | 350.516 | 134.145 | 4.459 | 9.933% | 23.378% | 27.560% |
+| `043036` | AIC | 303.185 | 134.200 | 0.494 | 8.843% | 23.214% | 16.889% |
+| `043036` | AIV | 374.181 | 134.118 | 6.441 | 10.456% | 23.462% | 28.244% |
+
+两轮的 per-gap 时间和 request 方向稳定；AIV 的时间与 miss 均高于 AIC，可作为
+后续核对跨 Submit scalar 衔接的观察信号。但该 phase 是三类 transition 的聚合，
+并且 bracket 本身会改变取指与多核到达，不能据此把 AIV/AIC 差值归给某一条业务
+调用或某一种间隙。
+
+该 profile 还受以下解释边界约束：
+
+- PMU phase 与泳道取自同源源码边界，但使用不同 ELF 和不同内部观察口径。泳道在
+  trace-on 构建中记录阶段时间戳，PMU 在 trace-off 构建中读取、清零 shadow counter，
+  并累计两侧 observer 之间的内层 SYS_CNT；二者不能逐 tick 对齐或相减；
+- empty-bracket 的 elapsed 是外层 SYS_CNT 包围相邻 begin/end 调用对，且来自另一个
+  诊断 ELF；不能从 SubmitTransition 的内层 elapsed/request/miss 中扣除 empty；
+- 本 phase 不提供局部 scalar busy，也不区分三种 transition。约 350～355 ns/gap
+  和 AIV 约 6.4～7.0 miss/gap 都是当前诊断 ELF 的原始聚合 observed，不能改写成
+  零插桩业务净成本或可兑现的墙钟收益。
+
 ## 2. 为什么 I-cache miss 必须独立重编译
 
 I-cache 数据对代码布局极其敏感。泳道和逐 atomic 观察会增加：
@@ -754,9 +881,14 @@ schema-v5、构建目录、命令和字段；不能套用到上面的真实 PA p
 - `submit-pmu-empty-bracket`：第 1.3 节定义的观察器经验校准，不是业务 phase；
 - `submit-pmu-materialize`：第 1.4 节定义的真实 Materialize 业务 span；
 - `submit-pmu-claim`：第 1.5 节定义的真实 Claim 业务 span；
-- `submit-pmu-register`：第 1.6 节定义的 RegisterOutputs 调用体。
+- `submit-pmu-register`：第 1.6 节定义的 RegisterOutputs 调用体；
+- `submit-pmu-submit-transition`：第 1.7 节定义的所有相邻 Submit 间隙聚合。
 
-六者 raw schema 均为 `fdwic-submit-pmu-v1`，但分别来自独立诊断 ELF，不能跨
+真实 phase id 依次为 ArgBuild `1`、EmptyBracket `2`、Materialize `3`、Claim `4`、
+Register `5` 和 SubmitTransition `6`；`none` 不含 phase。前五个 phase 每核预期
+calls 等于 Submit 数，只有 SubmitTransition 按 `N-1` 校验。
+
+七者 raw schema 均为 `fdwic-submit-pmu-v1`，但分别来自独立诊断 ELF，不能跨
 profile 相减或拼接。
 
 standalone 历史 schema 中的 `lower/upper` 是已经固化的字段名，只表达

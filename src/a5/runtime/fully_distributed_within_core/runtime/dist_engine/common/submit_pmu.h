@@ -48,6 +48,10 @@ constexpr size_t kFdwicSubmitPmuCompiledBytes = kFdwicSubmitPmuPhaseBytes;
 constexpr FdwicSubmitPmuPhase kFdwicSubmitPmuCompiledPhase = FdwicSubmitPmuPhase::Register;
 constexpr uint16_t kFdwicSubmitPmuCompiledMode = kFdwicSubmitPmuModeRegister;
 constexpr size_t kFdwicSubmitPmuCompiledBytes = kFdwicSubmitPmuPhaseBytes;
+#elif PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 6
+constexpr FdwicSubmitPmuPhase kFdwicSubmitPmuCompiledPhase = FdwicSubmitPmuPhase::SubmitTransition;
+constexpr uint16_t kFdwicSubmitPmuCompiledMode = kFdwicSubmitPmuModeSubmitTransition;
+constexpr size_t kFdwicSubmitPmuCompiledBytes = kFdwicSubmitPmuPhaseBytes;
 #else
 #error "invalid real FDWIC submit-PMU phase"
 #endif
@@ -313,6 +317,13 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_empty_bracket_calibrate() {
 
 PTO_DEVICE_FUNC inline void fdwic_submit_pmu_submit_begin(int32_t task_id) {
     constexpr uint32_t kReadyMask = (1U << 8) - 1U;
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 6
+    // 非首个 Submit 已完成 dist_submit_begin()，在统一 begin hook 关闭
+    // 上一次 tail 打开的跨 Submit 区间。
+    if (task_id > 0 && static_cast<uint32_t>(task_id) < g_fdwic_submit_pmu_expected_submits) {
+        fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::SubmitTransition>();
+    }
+#endif
     if (task_id != 0 || g_fdwic_submit_pmu_core == nullptr || g_fdwic_submit_pmu_expected_submits == 0 ||
         (g_fdwic_submit_pmu_status & kReadyMask) != kReadyMask) {
         return;
@@ -326,10 +337,19 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_submit_begin(int32_t task_id) {
 }
 
 PTO_DEVICE_FUNC inline void fdwic_submit_pmu_submit_end(int32_t task_id) {
-    if (!g_fdwic_submit_pmu_started || g_fdwic_submit_pmu_stopped || task_id < 0 ||
-        static_cast<uint32_t>(task_id + 1) != g_fdwic_submit_pmu_expected_submits) {
+    if (!g_fdwic_submit_pmu_started || g_fdwic_submit_pmu_stopped || task_id < 0) {
         return;
     }
+    const uint32_t submit_ordinal = static_cast<uint32_t>(task_id) + 1U;
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 6
+    // 每个非末次 Submit 在统一 end hook 打开 transition；末次只负责关闭
+    // 整窗，避免制造一个没有后继 Submit 的悬空区间。
+    if (submit_ordinal < g_fdwic_submit_pmu_expected_submits) {
+        fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::SubmitTransition>();
+        return;
+    }
+#endif
+    if (submit_ordinal != g_fdwic_submit_pmu_expected_submits) return;
     bisheng::cce::metrics_prof_stop();
     g_fdwic_submit_pmu_end_tick = get_sys_cnt_aicore();
     fdwic_submit_pmu_read_counters();
@@ -338,8 +358,9 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_submit_end(int32_t task_id) {
     if (!phase.boundary_error && !phase.armed && phase.begin_reads == phase.end_reads) {
         phase.status |= kFdwicSubmitPmuPhaseBoundaryBalanced;
     }
-    if (phase.begin_reads == g_fdwic_submit_pmu_expected_submits &&
-        phase.end_reads == g_fdwic_submit_pmu_expected_submits) {
+    const uint32_t expected_phase_calls =
+        fdwic_submit_pmu_expected_phase_calls(kFdwicSubmitPmuCompiledPhase, g_fdwic_submit_pmu_expected_submits);
+    if (phase.begin_reads == expected_phase_calls && phase.end_reads == expected_phase_calls) {
         phase.status |= kFdwicSubmitPmuPhaseShapeValid;
     }
     if (phase.phase_requests <= phase.shadow_requests && phase.phase_misses <= phase.shadow_misses &&

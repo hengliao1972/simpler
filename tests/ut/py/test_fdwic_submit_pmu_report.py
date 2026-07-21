@@ -28,6 +28,7 @@ from simpler_setup.tools.fdwic_submit_pmu_report import (
     PHASE_REQUIRED_STATUS_MASK,
     REGISTER_CAPTURE_MODE,
     REQUIRED_STATUS_MASK,
+    SUBMIT_TRANSITION_CAPTURE_MODE,
     load_capture,
     render_report,
     write_report,
@@ -314,6 +315,28 @@ def _valid_register_capture() -> dict[str, Any]:
     return capture
 
 
+def _valid_submit_transition_capture() -> dict[str, Any]:
+    capture = _valid_arg_build_capture()
+    capture["capture"]["mode"] = SUBMIT_TRANSITION_CAPTURE_MODE
+    capture["configuration"]["phase"] = {
+        "id": 6,
+        "name": "submit-transition",
+        "boundary": "previous_submit_end_to_next_submit_begin",
+        "expected_calls_per_core": 4,
+        "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+        "counter_semantics": "running_read_clear_observed_bracket",
+        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+    }
+    for logical_core_id, record in enumerate(capture["records"]):
+        record["phase_id"] = 6
+        record["phase_elapsed_ticks"] = 600 + logical_core_id
+        record["phase_icache_requests_observed"] = 180 + logical_core_id
+        record["phase_icache_misses_observed"] = 18 + logical_core_id % 5
+        record["phase_begin_reads"] = 4
+        record["phase_end_reads"] = 4
+    return capture
+
+
 def _write_capture(directory: Path, capture: dict[str, Any]) -> Path:
     path = directory / DEFAULT_INPUT_NAME
     path.write_text(json.dumps(capture, indent=2), encoding="utf-8")
@@ -545,6 +568,85 @@ def test_register_rejects_wrong_record_phase_id(tmp_path: Path) -> None:
     capture["records"][0]["phase_id"] = 4
 
     with pytest.raises(ValueError, match=r"records\[0\]\.phase_id must equal 5"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_valid_submit_transition_capture_uses_submit_count_minus_one(tmp_path: Path) -> None:
+    raw_path = _write_capture(tmp_path, _valid_submit_transition_capture())
+
+    capture = load_capture(raw_path)
+
+    assert capture.phase_summary is not None
+    assert capture.phase_summary["all"]["phase_begin_reads"] == 96 * 4
+    assert capture.phase_summary["all"]["phase_end_reads"] == 96 * 4
+    document = render_report(raw_path)
+    assert document.index("<code>submit-transition</code> 阶段观察") < document.index("全局 Submit 时间范围")
+    assert "phase_id=6" in document
+    assert "previous_submit_end_to_next_submit_begin" in document
+    assert "expected_calls_per_core=4" in document
+
+
+def test_submit_transition_accepts_minimum_two_submit_shape(tmp_path: Path) -> None:
+    capture = _valid_submit_transition_capture()
+    capture["configuration"]["expected_submits_per_core"] = 2
+    capture["configuration"]["phase"]["expected_calls_per_core"] = 1
+    for record in capture["records"]:
+        record["submit_count"] = 2
+        record["expected_submit_count"] = 2
+        record["phase_begin_reads"] = 1
+        record["phase_end_reads"] = 1
+
+    loaded = load_capture(_write_capture(tmp_path, capture))
+
+    assert loaded.phase_summary is not None
+    assert loaded.phase_summary["all"]["phase_begin_reads"] == 96
+    assert loaded.phase_summary["all"]["phase_end_reads"] == 96
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("id", 5),
+        ("name", "register"),
+        ("boundary", "register_outputs_call_entry_to_return"),
+        ("expected_calls_per_core", 5),
+        ("expected_calls_per_core", 3),
+        ("counter_semantics", "running_read_clear_empty_bracket_calibration"),
+        ("time_semantics", "outer_sys_cnt_around_adjacent_begin_end_pair"),
+    ),
+)
+def test_submit_transition_rejects_mismatched_phase_configuration(tmp_path: Path, field: str, value: Any) -> None:
+    capture = _valid_submit_transition_capture()
+    capture["configuration"]["phase"][field] = value
+
+    with pytest.raises(ValueError, match=r"configuration\.phase"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+@pytest.mark.parametrize("reads", [3, 5])
+def test_submit_transition_rejects_wrong_phase_call_count(tmp_path: Path, reads: int) -> None:
+    capture = _valid_submit_transition_capture()
+    capture["records"][0]["phase_begin_reads"] = reads
+    capture["records"][0]["phase_end_reads"] = reads
+
+    with pytest.raises(ValueError, match="phase begin/end reads must both equal 4"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_submit_transition_rejects_wrong_record_phase_id(tmp_path: Path) -> None:
+    capture = _valid_submit_transition_capture()
+    capture["records"][0]["phase_id"] = 5
+
+    with pytest.raises(ValueError, match=r"records\[0\]\.phase_id must equal 6"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_submit_transition_rejects_single_submit_capture(tmp_path: Path) -> None:
+    capture = _valid_submit_transition_capture()
+    capture["configuration"]["expected_submits_per_core"] = 1
+    capture["configuration"]["phase"]["expected_calls_per_core"] = 0
+
+    with pytest.raises(ValueError, match="requires at least two submits per core"):
         load_capture(_write_capture(tmp_path, capture))
 
 

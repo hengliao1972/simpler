@@ -61,6 +61,9 @@ constexpr SubmitPmuProfile kSubmitPmuProfiles[] = {
     {"submit-pmu-register", kFdwicSubmitPmuModeRegister, FdwicSubmitPmuPhase::Register, kFdwicSubmitPmuPhaseBytes,
      "register", "register_outputs_call_entry_to_return", "running_read_clear_observed_bracket",
      "inner_sys_cnt_between_boundary_observers"},
+    {"submit-pmu-submit-transition", kFdwicSubmitPmuModeSubmitTransition, FdwicSubmitPmuPhase::SubmitTransition,
+     kFdwicSubmitPmuPhaseBytes, "submit-transition", "previous_submit_end_to_next_submit_begin",
+     "running_read_clear_observed_bracket", "inner_sys_cnt_between_boundary_observers"},
 };
 
 const SubmitPmuProfile *requested_profile() {
@@ -274,13 +277,15 @@ bool validate(
         }
         if (phase_mode) {
             const FdwicSubmitPmuPhaseCoreData &phase = phases[logical];
+            const uint32_t expected_phase_calls =
+                fdwic_submit_pmu_expected_phase_calls(profile.phase, core.expected_submit_count);
             bool reserved_zero = true;
             for (uint32_t value : phase.reserved)
                 reserved_zero = reserved_zero && value == 0U;
             const bool phase_valid =
-                phase.phase_id == static_cast<uint32_t>(profile.phase) &&
-                phase.phase_begin_reads == core.expected_submit_count &&
-                phase.phase_end_reads == core.expected_submit_count && phase.phase_elapsed_ticks != 0 &&
+                expected_phase_calls != 0 && phase.phase_id == static_cast<uint32_t>(profile.phase) &&
+                phase.phase_begin_reads == expected_phase_calls && phase.phase_end_reads == expected_phase_calls &&
+                phase.phase_elapsed_ticks != 0 &&
                 phase.phase_elapsed_ticks <= core.last_submit_end_tick - core.first_submit_start_tick &&
                 phase.phase_icache_requests_observed <= core.shadow_icache_requests &&
                 phase.phase_icache_misses_observed <= core.shadow_icache_misses &&
@@ -291,7 +296,7 @@ bool validate(
                 LOG_ERROR(
                     "fdwic submit-PMU phase core %u closure failed: id=%u reads=%u/%u expected=%u "
                     "ticks=%llu/%llu observed=%llu/%u,%llu/%u max_chunk=%u/%u status=0x%x reserved=%u",
-                    logical, phase.phase_id, phase.phase_begin_reads, phase.phase_end_reads, core.expected_submit_count,
+                    logical, phase.phase_id, phase.phase_begin_reads, phase.phase_end_reads, expected_phase_calls,
                     static_cast<unsigned long long>(phase.phase_elapsed_ticks),
                     static_cast<unsigned long long>(core.last_submit_end_tick - core.first_submit_start_tick),
                     static_cast<unsigned long long>(phase.phase_icache_requests_observed), core.shadow_icache_requests,
@@ -443,9 +448,11 @@ extern "C" int fdwic_submit_pmu_host_export(Runtime *runtime) {
     out << "    \"counter_width_bits\": {\"total\": 64, \"programmable\": 32},\n";
     out << "    \"programmable_counter_risk_threshold\": " << kFdwicSubmitPmuCounterRiskThreshold << ",\n";
     if (phase_mode) {
+        const uint32_t expected_phase_calls =
+            fdwic_submit_pmu_expected_phase_calls(profile->phase, data.expected_submits);
         out << "    \"phase\": {\"id\": " << static_cast<uint32_t>(profile->phase) << ", \"name\": \""
             << profile->phase_name << "\", " << "\"boundary\": \"" << profile->phase_boundary << "\", "
-            << "\"expected_calls_per_core\": " << data.expected_submits
+            << "\"expected_calls_per_core\": " << expected_phase_calls
             << ", \"status_required_mask\": " << kFdwicSubmitPmuRequiredPhaseStatus << ", \"counter_semantics\": \""
             << profile->counter_semantics << "\", " << "\"time_semantics\": \"" << profile->time_semantics << "\"},\n";
     }
