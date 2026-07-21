@@ -379,6 +379,147 @@ gap，证明 profile 选择、边界次数、ABI 与报告链路闭合。由于�
 首次进入 ELF、取指预热和启动时序会被放大到每 call；B1 的 per-call 值只作 cold
 证据，不用于替代上述 Case1 稳态归因。
 
+### 1.5 真实 PA `submit-pmu-claim`
+
+#### 选型依据与 profile 身份
+
+`submit-pmu-claim` 不是按历史 standalone phase 名单顺次补齐，而是从最新权威
+Case1 泳道
+`outputs/TestPagedAttentionUnroll_Case1_20260720_234305/` 的当前真实布局重新选型。
+该轮 Claim 为 **79,470,788 SYS_CNT ticks**，占 SubmitUnion 399,604,449 ticks
+的 **19.887%**；在已经采集 arg-build 和 Materialize 后，它是剩余最大的明确
+Submit 排他业务 span。该泳道中 Claim 同时为 96 核固定 1,280 次、全局 122,880
+次，适合用严格固定 shape 验证局部 PMU 边界。
+
+该 profile 的编译与设备身份固定为：
+
+```text
+PTO_FDWIC_SUBMIT_PMU=1
+PTO_FDWIC_SUBMIT_PMU_PHASE_ID=4
+PTO_FDWIC_TRACE_ENABLED=0
+
+capture.mode                    = submit-pmu-claim
+configuration.phase.id          = 4
+configuration.phase.name        = claim
+configuration.phase.boundary    = claim_begin_to_claim_end
+configuration.phase.counter_semantics
+                                = running_read_clear_observed_bracket
+configuration.phase.time_semantics
+                                = inner_sys_cnt_between_boundary_observers
+```
+
+公共二进制协议中的 mode 为 `5`、phase enum 为 `4`。它继续复用既有 phase
+sidecar：128 B header、`96 × 64 B` whole record 和 `96 × 64 B` phase record，
+总计 **12,416 B**；没有增加逐 Claim 记录、逐核字段或新的设备 raw 容量。
+
+#### 四个真实边界
+
+设备端直接在四条现存 Submit 入口上复用泳道 Claim 的业务首尾边界，没有另造
+近似调用：
+
+1. 旧 Kernel `dist_submit_impl()`：在 PrepareMap 完成后的 `claim_begin` 打开，
+   包围 `dist_submit_claim(Kernel, ...)`，在 `claim_end` 取时前关闭；
+2. 旧 Alloc `dist_alloc_tensors()`：在 Register 完成后的 `claim_begin` 打开，
+   包围 `dist_submit_claim(Alloc, ...)`，在 `claim_end` 取时前关闭；
+3. compete-first Kernel begin：在 EfDrain 结束后的 `claim_begin` 打开，先执行
+   `dist_submit_check_task_cap()`，再执行条件 Claim，最后关闭；
+4. compete-first Alloc begin：使用相同的 EfDrain.end 到 Claim.end 边界，同样
+   包含 task-cap 检查与条件 Claim。
+
+因此，当前真实 PA 使用的 compete-first 区间明确包含 **task-cap + Claim**；仍受
+支持的两个旧 API 区间只包含 Claim 主体，不应把两类入口的源码范围描述成完全相同。
+四条路径在正常 Case1 中都为每个 Submit 产生一次平衡的 begin/end；任一核次数、
+状态或边界不闭合都会被 host/分析器拒绝。
+
+#### 运行与产物
+
+真实 Case1 命令为：
+
+```bash
+source /home/q00473782/Ascend/cann-9.1.0-weekly-20260708/cann/set_env.sh
+source /home/q00473782/.venv/bin/activate
+export PTO_ISA_ROOT=/home/q00473782/atomic/private/gpt/pto-isa-ddafa
+export PYTHONPATH="$PWD:$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
+
+python -m pytest \
+  examples/a5/fully_distributed_within_core/paged_attention_unroll/test_paged_attention_unroll.py \
+  --platform a5 --runtime fully_distributed_within_core --level 2 \
+  --case Case1 --manual include --fdwic-profile submit-pmu-claim \
+  --rounds 1 -s -v
+```
+
+每轮仍自动生成并校验：
+
+```text
+fdwic_submit_pmu_raw.json       # 逐核权威原始数据
+fdwic_submit_pmu_report.html    # 同一 ELF 的阶段与整窗加工报告
+```
+
+从已有 raw 手工重建 HTML 时执行：
+
+```bash
+python -m simpler_setup.tools.fdwic_submit_pmu_report \
+  outputs/TestPagedAttentionUnroll_Case1_<timestamp>/fdwic_submit_pmu_raw.json
+```
+
+#### B1 只作结构证据
+
+两轮 B1 闭合件位于：
+
+```text
+outputs/TestPagedAttentionUnroll_CaseB1_20260721_031756/
+outputs/TestPagedAttentionUnroll_CaseB1_20260721_031954/
+```
+
+两轮均为 96/96 受信记录、每核 5 次、480/480 begin/end、phase status `0x3f`，
+primary/shadow request/miss 精确相等、capture gap 为 0。全局 Submit 分别为
+82.413 us 和 264.184 us，绝对时间明显波动；本阶段没有单独控制冷启动、取指预热
+和跨核到达，因此不对这段差值作原因归因。两轮只证明 mode/phase、四个挂点、固定
+shape、ABI 与报告链路闭合，不作为 Claim 稳态性能结论。
+
+#### 两轮 Case1 稳态结果
+
+两轮完整 Case1 产物为：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260721_032101/
+outputs/TestPagedAttentionUnroll_Case1_20260721_032244/
+```
+
+两轮均为 96 核每核 1,280 次、122,880/122,880 begin/end、phase status
+`0x3f`，owner 恢复、32 AIC + 64 AIV、固定 shape、数值顺序和风险阈值全部闭合；
+primary/shadow 96/96 精确相等，request/miss capture gap 均为 0。全局 Submit
+时间范围分别为 4,994.863 us 和 4,704.936 us。
+
+下表的时间、request、miss 都是原始 observed；三个占比只使用**同一轮、同一个
+Claim ELF、同一角色**的分母。时间以 `Σsubmit_elapsed_ticks` 为分母，request/miss
+分别以完整 Submit primary request/miss 为分母。
+
+| 轮次 | 角色 | 时间 ns/call | request observed/call | miss observed/call | 时间占比 | request 占比 | miss 占比 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `032101` | ALL | 641.816 | 80.219 | 1.957 | 17.942% | 14.188% | 16.870% |
+| `032101` | AIC | 311.706 | 79.437 | 0.025 | 8.862% | 13.636% | 4.324% |
+| `032101` | AIV | 806.871 | 80.609 | 2.922 | 22.368% | 14.476% | 17.086% |
+| `032244` | ALL | 646.708 | 80.202 | 1.951 | 18.493% | 14.182% | 16.917% |
+| `032244` | AIC | 313.109 | 79.465 | 0.026 | 9.213% | 13.627% | 4.436% |
+| `032244` | AIV | 813.507 | 80.571 | 2.914 | 22.940% | 14.473% | 17.133% |
+
+两轮结果的角色差异稳定：AIV 为约 807～814 ns/call，AIC 为约
+312～313 ns/call，而两者 request/call 都约为 79～81。结合独立泳道中 Claim
+固定出现的 73,728 条返回型 ClaimMax Atomic，这一现象支持后续把 **AIV 角色和
+atomic 等待**作为 Claim 时间重心继续核对，而不是先把差值归因于取指请求量。
+
+这里仍有三条不可越过的解释边界：
+
+- phase elapsed 还包含 task-cap、角色路由、条件控制、结果整理和 running bracket
+  的观察影响，不能把约 807 ns 或 AIC/AIV 差值命名为“纯 atomic 延迟”；
+- Claim、swimlane、empty-bracket 分属不同 ELF。empty 的外层 elapsed 与 Claim
+  的内层 elapsed 本来也不是同一时间边界；即使 request/miss 都用 running
+  read-clear，也受不同代码布局和缓存状态影响，绝不能跨 ELF 扣减；
+- I-cache 结果只能报告本 Claim ELF 内的原始 observed、同角色占比和两轮方向性。
+  AIV 的约 2.92 miss/call 不能减去 empty 的约 2.01～2.03 后冒充业务净 miss，
+  `miss × 90 ns` 也仍然不是可兑现的 Submit 墙钟收益。
+
 ## 2. 为什么 I-cache miss 必须独立重编译
 
 I-cache 数据对代码布局极其敏感。泳道和逐 atomic 观察会增加：
@@ -481,9 +622,10 @@ schema-v5、构建目录、命令和字段；不能套用到上面的真实 PA p
 - `submit-pmu-none`：完整 Submit 整窗；
 - `submit-pmu-arg-build`：Claim.end 到 Materialize.begin 的同步构参区间；
 - `submit-pmu-empty-bracket`：第 1.3 节定义的观察器经验校准，不是业务 phase；
-- `submit-pmu-materialize`：第 1.4 节定义的真实 Materialize 业务 span。
+- `submit-pmu-materialize`：第 1.4 节定义的真实 Materialize 业务 span；
+- `submit-pmu-claim`：第 1.5 节定义的真实 Claim 业务 span。
 
-四者 raw schema 均为 `fdwic-submit-pmu-v1`，但分别来自独立诊断 ELF，不能跨
+五者 raw schema 均为 `fdwic-submit-pmu-v1`，但分别来自独立诊断 ELF，不能跨
 profile 相减或拼接。
 
 standalone 历史 schema 中的 `lower/upper` 是已经固化的字段名，只表达

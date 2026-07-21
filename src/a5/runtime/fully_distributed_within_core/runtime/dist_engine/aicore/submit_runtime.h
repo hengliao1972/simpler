@@ -496,8 +496,10 @@ dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &arg
         return ctx.result;
     }
     const uint64_t claim_begin = prepare_map_end;
+    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Claim>();
     const bool is_winner = dist_submit_claim(DistSubmitKind::Kernel, &mixed, ctx);
     const uint32_t claim_flags = (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U);
+    fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Claim>();
     TRACE_TIMESTAMP(claim_end);
     TRACE_SPAN_RECORD(claim_begin, claim_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Claim, claim_flags, 0);
     return dist_submit_finish_kernel_tail(ctx, mixed, args, claim_end, submit_begin);
@@ -525,8 +527,10 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
     TRACE_TIMESTAMP(register_end);
     TRACE_SPAN_RECORD(register_begin, register_end, ctx.self, ctx.task_id, -1, TracePhase::Register, 0, 0);
     const uint64_t claim_begin = register_end;
+    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Claim>();
     const bool is_winner = dist_submit_claim(DistSubmitKind::Alloc, nullptr, ctx);
     const uint32_t claim_flags = (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U);
+    fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Claim>();
     TRACE_TIMESTAMP(claim_end);
     TRACE_SPAN_RECORD(claim_begin, claim_end, ctx.self, ctx.task_id, -1, TracePhase::Claim, claim_flags, 1);
     return dist_submit_finish_alloc_tail(ctx, claim_end, submit_begin);
@@ -547,10 +551,12 @@ dist_submit_compete_first_begin(PTO2Runtime *, const MixedKernels &mixed) {
     TRACE_TIMESTAMP(efdrain_end);
     TRACE_SPAN_RECORD(submit_begin, efdrain_end, ctx.self, ctx.task_id, -1, TracePhase::EfDrain, 0, 0);
 
-    const bool ready = dist_submit_check_task_cap(ctx, DistSubmitKind::Kernel);
     const uint64_t claim_begin = efdrain_end;
+    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Claim>();
+    const bool ready = dist_submit_check_task_cap(ctx, DistSubmitKind::Kernel);
     const bool is_winner = ready && dist_submit_claim(DistSubmitKind::Kernel, &mixed, ctx);
     const uint32_t claim_flags = (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U);
+    fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Claim>();
     TRACE_TIMESTAMP(claim_end);
     // 与泳道 Claim.end 使用同一源码边界。局部 PMU 从这里跨过 Begin 返回、
     // 同步 eager callback 构参，直到匹配 Finish 的 Materialize 入口。
@@ -594,10 +600,12 @@ DIST_API_ATTR PTO_DEVICE_FUNC DistCompeteFirstTicket dist_alloc_compete_first_be
     TRACE_TIMESTAMP(efdrain_end);
     TRACE_SPAN_RECORD(submit_begin, efdrain_end, ctx.self, ctx.task_id, -1, TracePhase::EfDrain, 0, 0);
 
-    const bool ready = dist_submit_check_task_cap(ctx, DistSubmitKind::Alloc);
     const uint64_t claim_begin = efdrain_end;
+    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Claim>();
+    const bool ready = dist_submit_check_task_cap(ctx, DistSubmitKind::Alloc);
     const bool is_winner = ready && dist_submit_claim(DistSubmitKind::Alloc, nullptr, ctx);
     const uint32_t claim_flags = (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U);
+    fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Claim>();
     TRACE_TIMESTAMP(claim_end);
     fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::ArgBuild>();
     fdwic_submit_pmu_empty_bracket_calibrate();

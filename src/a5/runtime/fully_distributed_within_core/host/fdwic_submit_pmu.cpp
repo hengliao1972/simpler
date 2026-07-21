@@ -56,6 +56,8 @@ constexpr SubmitPmuProfile kSubmitPmuProfiles[] = {
     {"submit-pmu-materialize", kFdwicSubmitPmuModeMaterialize, FdwicSubmitPmuPhase::Materialize,
      kFdwicSubmitPmuPhaseBytes, "materialize", "materialize_begin_to_materialize_end",
      "running_read_clear_observed_bracket", "inner_sys_cnt_between_boundary_observers"},
+    {"submit-pmu-claim", kFdwicSubmitPmuModeClaim, FdwicSubmitPmuPhase::Claim, kFdwicSubmitPmuPhaseBytes, "claim",
+     "claim_begin_to_claim_end", "running_read_clear_observed_bracket", "inner_sys_cnt_between_boundary_observers"},
 };
 
 const SubmitPmuProfile *requested_profile() {

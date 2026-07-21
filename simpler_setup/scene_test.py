@@ -48,11 +48,13 @@ _FDWIC_PROFILE_SUBMIT_PMU_NONE = "submit-pmu-none"
 _FDWIC_PROFILE_SUBMIT_PMU_ARG_BUILD = "submit-pmu-arg-build"
 _FDWIC_PROFILE_SUBMIT_PMU_EMPTY_BRACKET = "submit-pmu-empty-bracket"
 _FDWIC_PROFILE_SUBMIT_PMU_MATERIALIZE = "submit-pmu-materialize"
+_FDWIC_PROFILE_SUBMIT_PMU_CLAIM = "submit-pmu-claim"
 _FDWIC_SUBMIT_PMU_PHASE_PROFILES = frozenset(
     {
         _FDWIC_PROFILE_SUBMIT_PMU_ARG_BUILD,
         _FDWIC_PROFILE_SUBMIT_PMU_EMPTY_BRACKET,
         _FDWIC_PROFILE_SUBMIT_PMU_MATERIALIZE,
+        _FDWIC_PROFILE_SUBMIT_PMU_CLAIM,
     }
 )
 _FDWIC_SUBMIT_PMU_PROFILES = frozenset({_FDWIC_PROFILE_SUBMIT_PMU_NONE, *_FDWIC_SUBMIT_PMU_PHASE_PROFILES})
@@ -89,6 +91,12 @@ def _fdwic_compile_definitions(profile: str) -> list[str] | None:
         return [
             "PTO_FDWIC_SUBMIT_PMU=1",
             "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=3",
+            "PTO_FDWIC_TRACE_ENABLED=0",
+        ]
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_CLAIM:
+        return [
+            "PTO_FDWIC_SUBMIT_PMU=1",
+            "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=4",
             "PTO_FDWIC_TRACE_ENABLED=0",
         ]
     return None
