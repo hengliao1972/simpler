@@ -307,8 +307,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 FdwicSubmitPmuHeader *submit_pmu_header = nullptr;
                 const bool submit_pmu_requested = fdwic_submit_pmu_requested(runtime, &submit_pmu_header);
                 bool dispatch_dist_run = true;
-                if (submit_pmu_requested &&
-                    fdwic_submit_pmu_owner_configure(runtime, submit_pmu_header) != 0) {
+                if (submit_pmu_requested && fdwic_submit_pmu_owner_configure(runtime, submit_pmu_header) != 0) {
                     LOG_ERROR("Thread %d: FDWIC submit-PMU owner configure failed; aborting dist replay", thread_idx);
                     // Configure 已经执行一次回滚；这里再做一次幂等恢复，优先
                     // 避免失败诊断给后续本地设备运行留下 PMU 配置。
@@ -327,8 +326,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     write_reg(regs[physical_core_id], RegId::COND, AICORE_IDLE_VALUE);
                 }
                 for (int32_t i = 0; i < num_workers; i++) {
-                    runtime->workers[i].aicpu_ready =
-                        dispatch_dist_run ? AICPU_READY_DIST_RUN : AICPU_READY_DIST_ABORT;
+                    runtime->workers[i].aicpu_ready = dispatch_dist_run ? AICPU_READY_DIST_RUN : AICPU_READY_DIST_ABORT;
                     cache_flush_range(const_cast<const uint32_t *>(&runtime->workers[i].aicpu_ready), sizeof(uint32_t));
                 }
                 if (dispatch_dist_run) {
@@ -349,7 +347,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     }
                     if (submit_pmu_requested) {
                         // 每个 worker 在发布 done 前已经 stop/read/flush 自己的
-                        // 64B 结果。所有 worker 完成后才恢复共享 PMU 配置。
+                        // 整窗记录及可选 phase sidecar。所有 worker 完成后才
+                        // 恢复共享 PMU 配置。
                         const int restore_rc = fdwic_submit_pmu_owner_restore(submit_pmu_header);
                         if (restore_rc != 0) {
                             // ownership bitmap 保留失败槽，允许一次幂等重试；

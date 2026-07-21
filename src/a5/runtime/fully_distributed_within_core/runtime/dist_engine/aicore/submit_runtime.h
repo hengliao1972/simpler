@@ -249,9 +249,8 @@ PTO_DEVICE_FUNC void dist_submit_complete_alloc(DistSubmitCtx &ctx) {
     }
 }
 
-PTO_DEVICE_FUNC DistCompeteFirstTicket dist_submit_make_ticket(
-    const DistSubmitCtx &ctx, DistSubmitKind kind, uint64_t submit_begin, bool ready
-) {
+PTO_DEVICE_FUNC DistCompeteFirstTicket
+dist_submit_make_ticket(const DistSubmitCtx &ctx, DistSubmitKind kind, uint64_t submit_begin, bool ready) {
     DistCompeteFirstTicket ticket;
     ticket.submit_begin = submit_begin;
     ticket.task_id = ctx.task_id;
@@ -270,15 +269,13 @@ PTO_DEVICE_FUNC DistCompeteFirstTicket dist_submit_make_ticket(
     return ticket;
 }
 
-PTO_DEVICE_FUNC void dist_submit_restore_from_ticket(
-    const DistCompeteFirstTicket &ticket, const L0TaskArgs &args, DistSubmitCtx &ctx
-) {
+PTO_DEVICE_FUNC void
+dist_submit_restore_from_ticket(const DistCompeteFirstTicket &ticket, const L0TaskArgs &args, DistSubmitCtx &ctx) {
     ctx.self = g_self;
     ctx.task_id = ticket.task_id;
-    ctx.payload =
-        ctx.self != nullptr && ctx.task_id >= 0 && ctx.task_id < kFlagCap ?
-            &ctx.self->task_payloads[ctx.task_id & kTaskPayloadMask] :
-            nullptr;
+    ctx.payload = ctx.self != nullptr && ctx.task_id >= 0 && ctx.task_id < kFlagCap ?
+                      &ctx.self->task_payloads[ctx.task_id & kTaskPayloadMask] :
+                      nullptr;
     ctx.result.set_task_id(PTO2TaskId::make(0, static_cast<uint32_t>(ctx.task_id)));
     ctx.tensor_count = args.tensor_count();
     ctx.scalar_count = args.scalar_count();
@@ -303,12 +300,10 @@ PTO_DEVICE_FUNC bool dist_submit_validate_ticket(
     const uint8_t expected = static_cast<uint8_t>(
         expected_kind == DistSubmitKind::Alloc ? DistCompeteFirstKind::Alloc : DistCompeteFirstKind::Kernel
     );
-    const bool sequence_ok =
-        ctx.self != nullptr && ticket.task_id >= 0 && ticket.task_id < kFlagCap &&
-        ctx.self->local_index == ticket.task_id + 1;
-    const bool fields_ok =
-        ticket.ready != 0 && ticket.kind == expected && ticket.reserved == 0 && ticket.won <= 1 &&
-        ticket.joint <= 1 && ticket.joint_init <= 1 && ticket.claim_attempted <= 1;
+    const bool sequence_ok = ctx.self != nullptr && ticket.task_id >= 0 && ticket.task_id < kFlagCap &&
+                             ctx.self->local_index == ticket.task_id + 1;
+    const bool fields_ok = ticket.ready != 0 && ticket.kind == expected && ticket.reserved == 0 && ticket.won <= 1 &&
+                           ticket.joint <= 1 && ticket.joint_init <= 1 && ticket.claim_attempted <= 1;
     if (__builtin_expect(sequence_ok && fields_ok, 1)) return true;
     // A callback must be synchronous and may not submit another task before
     // its matching Finish. Treat a stale/malformed ticket as a protocol error
@@ -318,8 +313,7 @@ PTO_DEVICE_FUNC bool dist_submit_validate_ticket(
 }
 
 PTO_DEVICE_FUNC TaskOutputTensors dist_submit_finish_kernel_tail(
-    DistSubmitCtx &ctx, const MixedKernels &mixed, const L0TaskArgs &args, uint64_t tail_begin,
-    uint64_t submit_begin
+    DistSubmitCtx &ctx, const MixedKernels &mixed, const L0TaskArgs &args, uint64_t tail_begin, uint64_t submit_begin
 ) {
     uint64_t register_begin = tail_begin;
     if (ctx.won) {
@@ -374,8 +368,7 @@ dist_submit_finish_alloc_tail(DistSubmitCtx &ctx, uint64_t completion_begin, uin
     fdwic_perf_clock_submit_end(ctx.task_id);
     fdwic_submit_pmu_submit_end(ctx.task_id);
     TRACE_SPAN_RECORD(
-        submit_begin, submit_end, ctx.self, ctx.task_id, -1, TracePhase::Submit,
-        static_cast<uint32_t>(ctx.won), 1
+        submit_begin, submit_end, ctx.self, ctx.task_id, -1, TracePhase::Submit, static_cast<uint32_t>(ctx.won), 1
     );
     return ctx.result;
 }
@@ -553,9 +546,11 @@ dist_submit_compete_first_begin(PTO2Runtime *, const MixedKernels &mixed) {
     const bool ready = dist_submit_check_task_cap(ctx, DistSubmitKind::Kernel);
     const uint64_t claim_begin = efdrain_end;
     const bool is_winner = ready && dist_submit_claim(DistSubmitKind::Kernel, &mixed, ctx);
-    const uint32_t claim_flags =
-        (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U);
+    const uint32_t claim_flags = (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U);
     TRACE_TIMESTAMP(claim_end);
+    // 与泳道 Claim.end 使用同一源码边界。局部 PMU 从这里跨过 Begin 返回、
+    // 同步 eager callback 构参，直到匹配 Finish 的 Materialize 入口。
+    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::ArgBuild>();
     TRACE_SPAN_RECORD(claim_begin, claim_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Claim, claim_flags, 0);
     return dist_submit_make_ticket(ctx, DistSubmitKind::Kernel, submit_begin, ready);
 }
@@ -567,6 +562,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_compete_first_finish
     dist_submit_restore_from_ticket(ticket, args, ctx);
     if (!dist_submit_validate_ticket(ticket, DistSubmitKind::Kernel, ctx)) return ctx.result;
 
+    fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::ArgBuild>();
     TRACE_TIMESTAMP(materialize_begin);
     uint64_t prepare_map_end = materialize_begin;
     if (!dist_submit_materialize_and_prepare_map(
@@ -591,20 +587,20 @@ DIST_API_ATTR PTO_DEVICE_FUNC DistCompeteFirstTicket dist_alloc_compete_first_be
     const bool ready = dist_submit_check_task_cap(ctx, DistSubmitKind::Alloc);
     const uint64_t claim_begin = efdrain_end;
     const bool is_winner = ready && dist_submit_claim(DistSubmitKind::Alloc, nullptr, ctx);
-    const uint32_t claim_flags =
-        (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U);
+    const uint32_t claim_flags = (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U);
     TRACE_TIMESTAMP(claim_end);
+    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::ArgBuild>();
     TRACE_SPAN_RECORD(claim_begin, claim_end, ctx.self, ctx.task_id, -1, TracePhase::Claim, claim_flags, 1);
     return dist_submit_make_ticket(ctx, DistSubmitKind::Alloc, submit_begin, ready);
 }
 
-DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_compete_first_finish(
-    PTO2Runtime *, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args
-) {
+DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors
+dist_alloc_compete_first_finish(PTO2Runtime *, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args) {
     DistSubmitCtx ctx;
     dist_submit_restore_from_ticket(ticket, args, ctx);
     if (!dist_submit_validate_ticket(ticket, DistSubmitKind::Alloc, ctx)) return ctx.result;
 
+    fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::ArgBuild>();
     TRACE_TIMESTAMP(materialize_begin);
     uint64_t prepare_map_end = materialize_begin;
     if (!dist_submit_materialize_and_prepare_map(

@@ -45,8 +45,10 @@ _FDWIC_PROFILE_ENV = "PTO_FDWIC_PROFILE"
 _FDWIC_PROFILE_NONE = "none"
 _FDWIC_PROFILE_PERF_CLOCK = "perf-clock"
 _FDWIC_PROFILE_SUBMIT_PMU_NONE = "submit-pmu-none"
-_FDWIC_PRIVATE_PROFILES = frozenset({_FDWIC_PROFILE_PERF_CLOCK, _FDWIC_PROFILE_SUBMIT_PMU_NONE})
-_FDWIC_PROFILES = frozenset({_FDWIC_PROFILE_NONE, _FDWIC_PROFILE_PERF_CLOCK, _FDWIC_PROFILE_SUBMIT_PMU_NONE})
+_FDWIC_PROFILE_SUBMIT_PMU_ARG_BUILD = "submit-pmu-arg-build"
+_FDWIC_SUBMIT_PMU_PROFILES = frozenset({_FDWIC_PROFILE_SUBMIT_PMU_NONE, _FDWIC_PROFILE_SUBMIT_PMU_ARG_BUILD})
+_FDWIC_PRIVATE_PROFILES = frozenset({_FDWIC_PROFILE_PERF_CLOCK, *_FDWIC_SUBMIT_PMU_PROFILES})
+_FDWIC_PROFILES = frozenset({_FDWIC_PROFILE_NONE, *_FDWIC_PRIVATE_PROFILES})
 
 
 def _fdwic_profile() -> str:
@@ -62,6 +64,12 @@ def _fdwic_compile_definitions(profile: str) -> list[str] | None:
         return ["PTO_FDWIC_PERF_CLOCK=1", "PTO_FDWIC_TRACE_ENABLED=0"]
     if profile == _FDWIC_PROFILE_SUBMIT_PMU_NONE:
         return ["PTO_FDWIC_SUBMIT_PMU=1", "PTO_FDWIC_TRACE_ENABLED=0"]
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_ARG_BUILD:
+        return [
+            "PTO_FDWIC_SUBMIT_PMU=1",
+            "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=1",
+            "PTO_FDWIC_TRACE_ENABLED=0",
+        ]
     return None
 
 
@@ -212,11 +220,14 @@ def _assert_fdwic_perf_clock_elf(binary: Path) -> None:
         raise RuntimeError(f"Invalid perf-clock AICore image {binary}: {'; '.join(details)}")
 
 
-def _assert_fdwic_submit_pmu_elf(binary: Path) -> None:
-    """Prove submit-pmu-none keeps only its whole-window PMU observer."""
+def _assert_fdwic_submit_pmu_elf(binary: Path, profile: str) -> None:
+    """Prove one submit-PMU image contains exactly its selected observer."""
     symbol_rows = _fdwic_elf_symbol_rows(binary)
 
-    required = ("dist_submit_pmu_expect_submits", "fdwic_submit_pmu_read_counters")
+    phase_reader = "fdwic_submit_pmu_phase_read_shadow_counters"
+    required = ["dist_submit_pmu_expect_submits", "fdwic_submit_pmu_read_counters"]
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_ARG_BUILD:
+        required.append(phase_reader)
     forbidden = (
         "dist_perf_clock_expect_submits",
         "g_fdwic_perf_clock_",
@@ -235,6 +246,8 @@ def _assert_fdwic_submit_pmu_elf(binary: Path) -> None:
         "get_aicore_pmu_reg_base",
         "pmu_aicore_record_task",
     )
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_NONE:
+        forbidden = (*forbidden, phase_reader)
     missing = [
         symbol
         for symbol in required
@@ -247,7 +260,7 @@ def _assert_fdwic_submit_pmu_elf(binary: Path) -> None:
             details.append(f"missing defined submit-pmu marker(s): {', '.join(missing)}")
         if present:
             details.append(f"unrelated profiling symbol(s) still present: {', '.join(present)}")
-        raise RuntimeError(f"Invalid submit-pmu-none AICore image {binary}: {'; '.join(details)}")
+        raise RuntimeError(f"Invalid {profile} AICore image {binary}: {'; '.join(details)}")
 
 
 def _assert_fdwic_swimlane_elf(binary: Path) -> None:
@@ -315,8 +328,8 @@ def maybe_build_aicore_override(
     )
     if profile == _FDWIC_PROFILE_PERF_CLOCK:
         _assert_fdwic_perf_clock_elf(binary)
-    elif profile == _FDWIC_PROFILE_SUBMIT_PMU_NONE:
-        _assert_fdwic_submit_pmu_elf(binary)
+    elif profile in _FDWIC_SUBMIT_PMU_PROFILES:
+        _assert_fdwic_submit_pmu_elf(binary, profile)
     elif platform == "a5" and runtime == "fully_distributed_within_core":
         _assert_fdwic_swimlane_elf(binary)
     return binary
@@ -1183,11 +1196,11 @@ def _render_case_fdwic_submit_pmu(case_label: str, output_prefix: Path) -> Path:
 
     raw = output_prefix / DEFAULT_INPUT_NAME
     if not raw.is_file() or raw.stat().st_size == 0:
-        raise RuntimeError(f"[{case_label}] submit-pmu-none did not publish a non-empty {raw}")
+        raise RuntimeError(f"[{case_label}] submit-PMU did not publish a non-empty {raw}")
     report = output_prefix / DEFAULT_OUTPUT_NAME
     write_report(raw, report)
     if not report.is_file() or report.stat().st_size == 0:
-        raise RuntimeError(f"[{case_label}] submit-pmu-none did not publish a non-empty {report}")
+        raise RuntimeError(f"[{case_label}] submit-PMU did not publish a non-empty {report}")
     return report
 
 
@@ -1297,7 +1310,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 _graph_case_dep_gen(case_label, prefix, callable_spec=callable_spec)
             if enable_scope_stats:
                 _plot_case_scope_stats(case_label, prefix)
-            if case_succeeded and fdwic_profile == _FDWIC_PROFILE_SUBMIT_PMU_NONE:
+            if case_succeeded and fdwic_profile in _FDWIC_SUBMIT_PMU_PROFILES:
                 _render_case_fdwic_submit_pmu(case_label, prefix)
             if dlt_baseline is not None:
                 _print_device_log_timing(dlt_device_id, dlt_baseline, dlt_offsets, rounds)

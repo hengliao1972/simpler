@@ -28,9 +28,9 @@ constexpr uint32_t kAicPerDie = 18U;
 constexpr uint32_t kDies = kFdwicSubmitPmuPhysicalSubcores / kPhysicalSubcoresPerDie;
 constexpr uint32_t kUnsetCore = UINT32_MAX;
 
-// submit-pmu-none 保留 CNT6/CNT7 作为不在窗口中途读取的权威计数，并用
-// CNT8/CNT5 复制同一 request/miss 事件。窗口结束时两组逐核精确相等，
-// 是验证 read-to-clear 链路没有漏读或越界读的硬门禁。
+// submit-PMU 保留 CNT6/CNT7 作为不在窗口中途读取的权威计数，并用
+// CNT8/CNT5 复制同一 request/miss 事件。none 要求两组逐核精确相等；
+// running phase 则重建 shadow whole 并要求不超过 primary。
 constexpr uint32_t kConfiguredSelectors[kCounterCount] = {
     0x501U,  // CNT0: vector busy
     0x301U,  // CNT1: cube busy
@@ -402,8 +402,9 @@ bool HeaderConfigurationMatches(const FdwicSubmitPmuHeader &header) {
         kFdwicSubmitPmuCnt2ScalarBusy, kFdwicSubmitPmuCnt5ShadowIcacheMiss,    kFdwicSubmitPmuCnt6IcacheRequest,
         kFdwicSubmitPmuCnt7IcacheMiss, kFdwicSubmitPmuCnt8ShadowIcacheRequest,
     };
-    if (header.magic != kFdwicSubmitPmuMagic || header.version != kFdwicSubmitPmuVersion ||
-        header.mode != kFdwicSubmitPmuModeNone || header.header_bytes != sizeof(FdwicSubmitPmuHeader) ||
+    const bool mode_valid = header.mode == kFdwicSubmitPmuModeNone || header.mode == kFdwicSubmitPmuModeArgBuild;
+    if (header.magic != kFdwicSubmitPmuMagic || header.version != kFdwicSubmitPmuVersion || !mode_valid ||
+        header.header_bytes != fdwic_submit_pmu_bytes_for_mode(header.mode) ||
         header.record_bytes != sizeof(FdwicSubmitPmuCoreData) || header.num_cores != kFdwicSubmitPmuExpectedCores ||
         header.expected_aic != kFdwicSubmitPmuExpectedAic || header.expected_aiv != kFdwicSubmitPmuExpectedAiv ||
         header.sys_cnt_freq_hz != PLATFORM_PROF_SYS_CNT_FREQ) {

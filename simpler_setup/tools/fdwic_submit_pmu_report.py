@@ -35,7 +35,28 @@ PHYSICAL_CORES = 108
 PHYSICAL_CORES_PER_DIE = 54
 AIC_CORES_PER_DIE = 18
 REQUIRED_STATUS_MASK = (1 << 11) - 1
+PHASE_REQUIRED_STATUS_MASK = (1 << 6) - 1
 PROGRAMMABLE_COUNTER_RISK_THRESHOLD = 0x3FFFFFFF
+
+NONE_CAPTURE_MODE = "submit-pmu-none"
+ARG_BUILD_CAPTURE_MODE = "submit-pmu-arg-build"
+SUPPORTED_CAPTURE_MODES = {NONE_CAPTURE_MODE, ARG_BUILD_CAPTURE_MODE}
+ARG_BUILD_PHASE_ID = 1
+PHASE_RECORD_FIELDS = (
+    "phase_id",
+    "phase_elapsed_ticks",
+    "phase_icache_requests_observed",
+    "phase_icache_misses_observed",
+    "phase_begin_reads",
+    "phase_end_reads",
+    "phase_max_shadow_request_chunk",
+    "phase_max_shadow_miss_chunk",
+    "phase_status",
+)
+DEPRECATED_PHASE_BOUND_FIELDS = (
+    "phase_icache_requests_lower_bound",
+    "phase_icache_misses_lower_bound",
+)
 
 EXPECTED_SELECTORS = {
     "cnt2_scalar_busy": 0x001,
@@ -59,6 +80,7 @@ class SubmitPmuCapture:
     records: tuple[dict[str, Any], ...]
     groups: dict[str, tuple[dict[str, Any], ...]]
     summary: dict[str, dict[str, Any]]
+    phase_summary: dict[str, dict[str, Any]] | None
 
 
 def _fail(message: str) -> None:
@@ -112,10 +134,12 @@ def _require_equal(actual: Any, expected: Any, path: str) -> None:
         _fail(f"{path} must equal {expected!r}, got {actual!r}")
 
 
-def _validate_capture_header(data: dict[str, Any]) -> tuple[dict[str, Any], int, dict[str, float]]:
+def _validate_capture_header(data: dict[str, Any]) -> tuple[str, dict[str, Any], int, dict[str, float]]:
     _require_equal(data.get("schema"), SCHEMA_NAME, "schema")
     capture = _object(data.get("capture"), "capture")
-    _require_equal(capture.get("mode"), "submit-pmu-none", "capture.mode")
+    mode = capture.get("mode")
+    if not isinstance(mode, str) or mode not in SUPPORTED_CAPTURE_MODES:
+        _fail(f"capture.mode must be one of {sorted(SUPPORTED_CAPTURE_MODES)!r}, got {mode!r}")
     _require_equal(
         capture.get("window_scope"),
         "per_core_first_submit_begin_to_last_submit_end",
@@ -133,6 +157,22 @@ def _validate_capture_header(data: dict[str, Any]) -> tuple[dict[str, Any], int,
         "configuration.expected_submits_per_core",
         minimum=1,
     )
+    if mode == NONE_CAPTURE_MODE:
+        if "phase" in configuration:
+            _fail(f"configuration must not contain phase in {NONE_CAPTURE_MODE}")
+    else:
+        _require_equal(
+            configuration.get("phase"),
+            {
+                "id": ARG_BUILD_PHASE_ID,
+                "name": "arg-build",
+                "boundary": "claim_end_to_materialize_begin",
+                "expected_calls_per_core": expected_submits,
+                "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+                "counter_semantics": "running_read_clear_observed_bracket",
+            },
+            "configuration.phase",
+        )
     _require_equal(configuration.get("sys_counter_tick_ns"), 1, "configuration.sys_counter_tick_ns")
     _require_equal(configuration.get("selectors"), EXPECTED_SELECTORS, "configuration.selectors")
     _require_equal(
@@ -156,10 +196,55 @@ def _validate_capture_header(data: dict[str, Any]) -> tuple[dict[str, Any], int,
         name: _number(frequency_data.get(name), f"configuration.pmu_cycles_per_ns.{name}", positive=True)
         for name in GROUP_NAMES
     }
-    return configuration, expected_submits, frequencies
+    return mode, configuration, expected_submits, frequencies
 
 
-def _validate_record(record_data: Any, logical_core_id: int, expected_submits: int) -> dict[str, Any]:
+def _validate_phase_record(record: dict[str, Any], prefix: str, expected_submits: int, submit_elapsed: int) -> None:
+    _require_equal(record.get("phase_id"), ARG_BUILD_PHASE_ID, f"{prefix}.phase_id")
+    phase_elapsed = _integer(record.get("phase_elapsed_ticks"), f"{prefix}.phase_elapsed_ticks", minimum=1)
+    phase_requests_observed = _integer(
+        record.get("phase_icache_requests_observed"),
+        f"{prefix}.phase_icache_requests_observed",
+    )
+    phase_misses_observed = _integer(
+        record.get("phase_icache_misses_observed"),
+        f"{prefix}.phase_icache_misses_observed",
+    )
+    begin_reads = _integer(record.get("phase_begin_reads"), f"{prefix}.phase_begin_reads")
+    end_reads = _integer(record.get("phase_end_reads"), f"{prefix}.phase_end_reads")
+    max_request_chunk = _integer(
+        record.get("phase_max_shadow_request_chunk"),
+        f"{prefix}.phase_max_shadow_request_chunk",
+    )
+    max_miss_chunk = _integer(
+        record.get("phase_max_shadow_miss_chunk"),
+        f"{prefix}.phase_max_shadow_miss_chunk",
+    )
+
+    if begin_reads != expected_submits or end_reads != expected_submits:
+        _fail(f"{prefix} phase begin/end reads must both equal {expected_submits}")
+    if phase_elapsed > submit_elapsed:
+        _fail(f"{prefix}.phase_elapsed_ticks exceeds submit_elapsed_ticks")
+    if phase_requests_observed > record["shadow_icache_requests"]:
+        _fail(f"{prefix}.phase_icache_requests_observed exceeds shadow_icache_requests")
+    if phase_misses_observed > record["shadow_icache_misses"]:
+        _fail(f"{prefix}.phase_icache_misses_observed exceeds shadow_icache_misses")
+    if max_request_chunk >= PROGRAMMABLE_COUNTER_RISK_THRESHOLD:
+        _fail(f"{prefix}.phase_max_shadow_request_chunk reaches the risk threshold 0x3fffffff")
+    if max_miss_chunk >= PROGRAMMABLE_COUNTER_RISK_THRESHOLD:
+        _fail(f"{prefix}.phase_max_shadow_miss_chunk reaches the risk threshold 0x3fffffff")
+
+    phase_status = _integer(record.get("phase_status"), f"{prefix}.phase_status")
+    if phase_status != PHASE_REQUIRED_STATUS_MASK:
+        _fail(f"{prefix}.phase_status must equal 0x{PHASE_REQUIRED_STATUS_MASK:x}, got 0x{phase_status:x}")
+
+
+def _validate_record(
+    record_data: Any,
+    logical_core_id: int,
+    expected_submits: int,
+    mode: str,
+) -> dict[str, Any]:
     record = _object(record_data, f"records[{logical_core_id}]")
     prefix = f"records[{logical_core_id}]"
     _require_equal(record.get("logical_core_id"), logical_core_id, f"{prefix}.logical_core_id")
@@ -190,8 +275,21 @@ def _validate_record(record_data: Any, logical_core_id: int, expected_submits: i
         _fail(f"{prefix}.scalar_busy exceeds total_cycles")
     if misses > requests:
         _fail(f"{prefix}.icache_misses exceeds icache_requests")
-    if (requests, misses) != (shadow_requests, shadow_misses):
-        _fail(f"{prefix} shadow I-cache counters differ from primary counters")
+    if shadow_misses > shadow_requests:
+        _fail(f"{prefix}.shadow_icache_misses exceeds shadow_icache_requests")
+    if mode == NONE_CAPTURE_MODE:
+        if any(field in record for field in (*PHASE_RECORD_FIELDS, *DEPRECATED_PHASE_BOUND_FIELDS)):
+            _fail(f"{prefix} must not contain phase fields in {NONE_CAPTURE_MODE}")
+        if (requests, misses) != (shadow_requests, shadow_misses):
+            _fail(f"{prefix} shadow I-cache counters differ from primary counters")
+    else:
+        if any(field in record for field in DEPRECATED_PHASE_BOUND_FIELDS):
+            _fail(f"{prefix} must use observed phase fields, not lower/upper-bound names")
+        if shadow_requests > requests:
+            _fail(f"{prefix}.shadow_icache_requests exceeds icache_requests")
+        if shadow_misses > misses:
+            _fail(f"{prefix}.shadow_icache_misses exceeds icache_misses")
+        _validate_phase_record(record, prefix, expected_submits, elapsed)
     programmable = (scalar, requests, misses, shadow_requests, shadow_misses)
     if any(value >= PROGRAMMABLE_COUNTER_RISK_THRESHOLD for value in programmable):
         _fail(f"{prefix} programmable counter reaches the risk threshold 0x3fffffff")
@@ -320,6 +418,58 @@ def _group_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _phase_group_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    submit_elapsed = _metric_summary(records, "submit_elapsed_ticks")
+    phase_elapsed = _metric_summary(records, "phase_elapsed_ticks")
+    requests_observed = _metric_summary(records, "phase_icache_requests_observed")
+    misses_observed = _metric_summary(records, "phase_icache_misses_observed")
+
+    requests_observed_plus_gap_values = [
+        record["phase_icache_requests_observed"] + record["icache_requests"] - record["shadow_icache_requests"]
+        for record in records
+    ]
+    misses_observed_plus_gap_values = [
+        record["phase_icache_misses_observed"] + record["icache_misses"] - record["shadow_icache_misses"]
+        for record in records
+    ]
+    requests_observed_plus_gap = {
+        "sum": sum(requests_observed_plus_gap_values),
+        "min": min(requests_observed_plus_gap_values),
+        "mean": sum(requests_observed_plus_gap_values) / len(requests_observed_plus_gap_values),
+        "max": max(requests_observed_plus_gap_values),
+    }
+    misses_observed_plus_gap = {
+        "sum": sum(misses_observed_plus_gap_values),
+        "min": min(misses_observed_plus_gap_values),
+        "mean": sum(misses_observed_plus_gap_values) / len(misses_observed_plus_gap_values),
+        "max": max(misses_observed_plus_gap_values),
+    }
+    primary_requests = sum(record["icache_requests"] for record in records)
+    primary_misses = sum(record["icache_misses"] for record in records)
+    return {
+        "cores": len(records),
+        "submit_elapsed_ticks": submit_elapsed,
+        "phase_elapsed_ticks": phase_elapsed,
+        "phase_icache_requests_observed": requests_observed,
+        "phase_icache_requests_observed_plus_capture_gap": requests_observed_plus_gap,
+        "phase_icache_misses_observed": misses_observed,
+        "phase_icache_misses_observed_plus_capture_gap": misses_observed_plus_gap,
+        "phase_time_share_of_submit": phase_elapsed["sum"] / submit_elapsed["sum"],
+        "phase_request_observed_share_of_primary": requests_observed["sum"] / primary_requests,
+        "phase_request_observed_plus_capture_gap_share_of_primary": (
+            requests_observed_plus_gap["sum"] / primary_requests
+        ),
+        "phase_miss_observed_share_of_primary": misses_observed["sum"] / primary_misses if primary_misses else 0.0,
+        "phase_miss_observed_plus_capture_gap_share_of_primary": (
+            misses_observed_plus_gap["sum"] / primary_misses if primary_misses else 0.0
+        ),
+        "phase_begin_reads": sum(record["phase_begin_reads"] for record in records),
+        "phase_end_reads": sum(record["phase_end_reads"] for record in records),
+        "phase_max_shadow_request_chunk": max(record["phase_max_shadow_request_chunk"] for record in records),
+        "phase_max_shadow_miss_chunk": max(record["phase_max_shadow_miss_chunk"] for record in records),
+    }
+
+
 def _validate_summary_number(actual: Any, expected: int | float, path: str) -> None:
     if isinstance(expected, int):
         if isinstance(actual, bool) or not isinstance(actual, int) or actual != expected:
@@ -355,7 +505,7 @@ def _validate_host_summary(data: dict[str, Any], computed: Mapping[str, dict[str
             )
 
 
-def _validate_producer_summary(data: dict[str, Any]) -> None:
+def _validate_producer_summary(data: dict[str, Any], mode: str) -> None:
     validation = _object(data.get("validation"), "validation")
     required = {
         "passed": True,
@@ -371,10 +521,23 @@ def _validate_producer_summary(data: dict[str, Any]) -> None:
         "window_stopped_records": EXPECTED_CORES,
         "submit_count_closed_records": EXPECTED_CORES,
         "scalar_le_total_records": EXPECTED_CORES,
-        "shadow_primary_match_records": EXPECTED_CORES,
         "icache_miss_le_request_records": EXPECTED_CORES,
         "counter_below_risk_threshold_records": EXPECTED_CORES,
     }
+    if mode == NONE_CAPTURE_MODE:
+        required["shadow_primary_match_records"] = EXPECTED_CORES
+    else:
+        if "phase_time_bounded_records" in validation:
+            _fail("validation must use phase_time_within_submit_records, not phase_time_bounded_records")
+        required.update(
+            {
+                "phase_boundary_closed_records": EXPECTED_CORES,
+                "phase_shape_match_records": EXPECTED_CORES,
+                "phase_values_ordered_records": EXPECTED_CORES,
+                "phase_time_within_submit_records": EXPECTED_CORES,
+                "shadow_primary_bounded_records": EXPECTED_CORES,
+            }
+        )
     for field, expected in required.items():
         _require_equal(validation.get(field), expected, f"validation.{field}")
 
@@ -388,13 +551,13 @@ def load_capture(input_path: Path | str) -> SubmitPmuCapture:
     raw_bytes = path.read_bytes()
     decoded = json.loads(raw_bytes)
     data = _object(decoded, "root")
-    _, expected_submits, _ = _validate_capture_header(data)
+    mode, _, expected_submits, _ = _validate_capture_header(data)
 
     record_data = _array(data.get("records"), "records")
     if len(record_data) != EXPECTED_CORES:
         _fail("records must contain exactly 96 cores")
     records = tuple(
-        _validate_record(value, logical_id, expected_submits) for logical_id, value in enumerate(record_data)
+        _validate_record(value, logical_id, expected_submits, mode) for logical_id, value in enumerate(record_data)
     )
     role_counts = Counter(record["role"] for record in records)
     if role_counts != Counter({"aic": EXPECTED_AIC_CORES, "aiv": EXPECTED_AIV_CORES}):
@@ -404,7 +567,7 @@ def load_capture(input_path: Path | str) -> SubmitPmuCapture:
     _validate_logical_layout(records)
     _validate_owner(data, physical_ids)
     _validate_window(data, records)
-    _validate_producer_summary(data)
+    _validate_producer_summary(data, mode)
 
     groups = {
         "all": records,
@@ -412,8 +575,19 @@ def load_capture(input_path: Path | str) -> SubmitPmuCapture:
         "aiv": tuple(record for record in records if record["role"] == "aiv"),
     }
     summary = {name: _group_summary(group) for name, group in groups.items()}
+    phase_summary = (
+        None if mode == NONE_CAPTURE_MODE else {name: _phase_group_summary(group) for name, group in groups.items()}
+    )
     _validate_host_summary(data, summary)
-    return SubmitPmuCapture(path, hashlib.sha256(raw_bytes).hexdigest(), data, records, groups, summary)
+    return SubmitPmuCapture(
+        path,
+        hashlib.sha256(raw_bytes).hexdigest(),
+        data,
+        records,
+        groups,
+        summary,
+        phase_summary,
+    )
 
 
 def _format_integer(value: int | float) -> str:
@@ -518,6 +692,71 @@ def _per_core_rows(records: Sequence[dict[str, Any]], miss_penalty_ns: float) ->
     return "".join(rows)
 
 
+def _phase_observed_cell(
+    observed: Mapping[str, int | float],
+    observed_plus_capture_gap: Mapping[str, int | float],
+    observed_share: float,
+    observed_plus_capture_gap_share: float,
+) -> str:
+    return (
+        f"<strong>{_format_integer(observed['sum'])} / "
+        f"{_format_integer(observed_plus_capture_gap['sum'])}</strong><br>"
+        f"<small>{observed_share:.3%} / {observed_plus_capture_gap_share:.3%} of primary</small>"
+    )
+
+
+def _phase_overview(capture: SubmitPmuCapture) -> str:
+    if capture.phase_summary is None:
+        return ""
+
+    rows = []
+    for group_name in GROUP_NAMES:
+        group = capture.phase_summary[group_name]
+        title = {"all": "ALL", "aic": "AIC", "aiv": "AIV"}[group_name]
+        request_observed = _phase_observed_cell(
+            group["phase_icache_requests_observed"],
+            group["phase_icache_requests_observed_plus_capture_gap"],
+            group["phase_request_observed_share_of_primary"],
+            group["phase_request_observed_plus_capture_gap_share_of_primary"],
+        )
+        miss_observed = _phase_observed_cell(
+            group["phase_icache_misses_observed"],
+            group["phase_icache_misses_observed_plus_capture_gap"],
+            group["phase_miss_observed_share_of_primary"],
+            group["phase_miss_observed_plus_capture_gap_share_of_primary"],
+        )
+        rows.append(
+            "<tr>"
+            f"<th>{title}<small>{group['cores']} 核</small></th>"
+            f"<td><strong>{_format_number(group['phase_elapsed_ticks']['sum'] / 1_000)} µs</strong><br>"
+            f"<small>Submit core-time {_format_number(group['submit_elapsed_ticks']['sum'] / 1_000)} µs</small></td>"
+            f"<td><strong>{group['phase_time_share_of_submit']:.3%}</strong></td>"
+            f"<td>{request_observed}</td><td>{miss_observed}</td>"
+            f"<td>{_format_integer(group['phase_begin_reads'])} / {_format_integer(group['phase_end_reads'])}</td>"
+            f"<td>{_format_integer(group['phase_max_shadow_request_chunk'])} / "
+            f"{_format_integer(group['phase_max_shadow_miss_chunk'])}</td>"
+            "</tr>"
+        )
+    return f"""
+  <section class="phase-overview">
+    <h2>Arg-build 局部归因（phase_id=1）</h2>
+    <p><strong>这是 running read-clear observed bracket，不是可与其他构建直接相减的独立计时。</strong>
+      时间占比的分母是同一 ELF 的 Σ每核 Submit elapsed；request/miss 百分比的分母才是同一 ELF、
+      同一次采集的 Submit 整窗 primary。<code>observed_plus_capture_gap = observed + (primary − shadow)</code>；
+      边界读数和插桩 bookkeeping 会进入 sample，因此“观测值”和“加全窗 capture gap”都不是原业务
+      事件数的数学上下界，也不能跨 ELF 相减。</p>
+    <div class="table-wrap phase-table"><table>
+      <thead><tr>
+        <th>核组</th><th>Phase / Submit core-time</th><th>时间占比</th>
+        <th>Request 观测值 / 加全窗 capture gap</th><th>Miss 观测值 / 加全窗 capture gap</th>
+        <th>Begin / End reads</th><th>最大 request / miss chunk</th>
+      </tr></thead>
+      <tbody>{"".join(rows)}</tbody>
+    </table></div>
+  </section>
+    """
+
+
 def _document(capture: SubmitPmuCapture, miss_penalty_ns: float) -> str:
     configuration = capture.data["configuration"]
     frequencies = configuration["pmu_cycles_per_ns"]
@@ -534,6 +773,13 @@ def _document(capture: SubmitPmuCapture, miss_penalty_ns: float) -> str:
         )
     )
     rows = _per_core_rows(capture.records, miss_penalty_ns)
+    phase_overview = _phase_overview(capture)
+    shadow_note = (
+        "phase 模式的 shadow 是 begin/end/final 全部 running read-clear 返回值之和，只用于标记全窗 "
+        "capture gap，不作为第二份性能数据展示。"
+        if capture.phase_summary is not None
+        else "shadow 只承担逐核同值闭环，不作为第二份性能数据展示。"
+    )
     source_name = html.escape(capture.input_path.name)
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -557,6 +803,10 @@ def _document(capture: SubmitPmuCapture, miss_penalty_ns: float) -> str:
       background:white; border:1px solid var(--line); border-radius:10px; box-shadow:0 2px 10px #1e293b0a;
     }}
     .headline div {{ padding:14px 16px; }} .headline strong {{ display:block; font-size:22px; }}
+    .phase-overview {{ background:#eff6ff; border:1px solid #bfdbfe; border-radius:10px; padding:4px 16px 16px; }}
+    .phase-overview h2 {{ margin-top:14px; }} .phase-overview p {{ max-width:1200px; }}
+    .phase-table {{ box-shadow:none; }} .phase-table th:first-child {{ text-align:left; }}
+    .phase-table th small {{ display:block; font-weight:400; color:var(--muted); }}
     .groups {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(310px,1fr)); gap:14px; }}
     .group-card {{ padding:16px; min-width:0; }} .group-card h3 {{ margin:0 0 12px; }}
     dl {{ display:grid; grid-template-columns:minmax(120px,.75fr) minmax(0,1.25fr); gap:8px 12px; margin:0; }}
@@ -582,6 +832,7 @@ def _document(capture: SubmitPmuCapture, miss_penalty_ns: float) -> str:
 <body><main>
   <h1>真实 FDWIC Submit PMU I-cache 报告</h1>
   <p class="subtitle">固定输入 <code>{source_name}</code> · schema <code>{SCHEMA_NAME}</code> · 32 AIC + 64 AIV</p>
+  {phase_overview}
   <section class="headline">
     <div><span>全局 Submit 时间范围</span>
       <strong>{_format_number(window["global_submit_span_us"])} µs</strong>
@@ -603,7 +854,7 @@ def _document(capture: SubmitPmuCapture, miss_penalty_ns: float) -> str:
   <p class="legend"><span class="dot aic">AIC</span><span class="dot aiv">AIV</span></p>
   <div class="charts">{charts}</div>
   <h2>逐核原始主计数</h2>
-  <p class="fine">报告展示 primary request/miss；shadow 只承担逐核同值闭环，不作为第二份性能数据展示。</p>
+  <p class="fine">报告展示 primary request/miss；{shadow_note}</p>
   <div class="table-wrap"><table>
     <thead><tr>
       <th>Physical</th><th>Logical</th><th>Role</th><th>Block</th><th>Lane</th><th>Submit µs</th>

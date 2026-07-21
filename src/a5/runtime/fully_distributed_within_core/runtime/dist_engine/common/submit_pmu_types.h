@@ -14,18 +14,41 @@
 #include <cstddef>
 #include <cstdint>
 
-// submit-pmu-none 是真实 A5 PA 的独立诊断 ABI。它不复用普通泳道的逐事件
-// record，也不复用通用 PMU 的逐 kernel task ring；每个 worker 只在完整
-// Submit 窗口结束后发布一个固定 64B 结果。
+// 真实 A5 PA 的 submit-PMU 不复用普通泳道的逐事件 record，也不复用通用
+// PMU 的逐 kernel task ring。none 每核只发布一个 64B 整窗结果；局部阶段
+// 在相同整窗结果之后追加一个 64B sidecar，仍然没有逐事件记录。
 constexpr uint32_t kFdwicSubmitPmuMagic = 0x554d5053U;  // little-endian "SPMU"
 constexpr uint16_t kFdwicSubmitPmuVersion = 1;
 constexpr uint16_t kFdwicSubmitPmuModeNone = 1;
+constexpr uint16_t kFdwicSubmitPmuModeArgBuild = 2;
 constexpr uint32_t kFdwicSubmitPmuExpectedAic = 32;
 constexpr uint32_t kFdwicSubmitPmuExpectedAiv = 64;
 constexpr uint32_t kFdwicSubmitPmuExpectedCores = kFdwicSubmitPmuExpectedAic + kFdwicSubmitPmuExpectedAiv;
 constexpr uint32_t kFdwicSubmitPmuPhysicalSubcores = 108;
 constexpr uint32_t kFdwicSubmitPmuBitmapWords = 4;
 constexpr uint32_t kFdwicSubmitPmuCounterRiskThreshold = 0x3fffffffU;
+
+enum class FdwicSubmitPmuPhase : uint16_t {
+    None = 0,
+    // compete-first Claim 完成到匹配 Finish 的 Materialize 入口；包含同步
+    // eager callback 构参、Begin 返回和 Finish 重入。
+    ArgBuild = 1,
+    Count = 2,
+};
+
+constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
+    switch (phase) {
+    case FdwicSubmitPmuPhase::None:
+        return kFdwicSubmitPmuModeNone;
+    case FdwicSubmitPmuPhase::ArgBuild:
+        return kFdwicSubmitPmuModeArgBuild;
+    case FdwicSubmitPmuPhase::Count:
+        break;
+    }
+    return 0;
+}
+
+constexpr bool fdwic_submit_pmu_mode_has_phase(uint16_t mode) { return mode == kFdwicSubmitPmuModeArgBuild; }
 
 // A5 PIPE_UTIL 事件布局。CNT6/CNT7 是权威值；CNT8/CNT5 使用相同事件作
 // 同窗副本。none 构建没有中途 read-clear，故两组必须逐核精确相等。
@@ -49,6 +72,16 @@ enum FdwicSubmitPmuCoreStatus : uint32_t {
     kFdwicSubmitPmuTotalNonzero = 1U << 10,
 };
 constexpr uint32_t kFdwicSubmitPmuRequiredCoreStatus = (1U << 11) - 1U;
+
+enum FdwicSubmitPmuPhaseStatus : uint32_t {
+    kFdwicSubmitPmuPhaseRequested = 1U << 0,
+    kFdwicSubmitPmuPhaseBoundaryBalanced = 1U << 1,
+    kFdwicSubmitPmuPhaseShapeValid = 1U << 2,
+    kFdwicSubmitPmuPhaseValuesOrdered = 1U << 3,
+    kFdwicSubmitPmuPhaseTimeValid = 1U << 4,
+    kFdwicSubmitPmuPhaseTailRead = 1U << 5,
+};
+constexpr uint32_t kFdwicSubmitPmuRequiredPhaseStatus = (1U << 6) - 1U;
 
 enum FdwicSubmitPmuOwnerStatus : uint32_t {
     kFdwicSubmitPmuOwnerRequested = 1U << 0,
@@ -99,6 +132,43 @@ struct FdwicSubmitPmuCoreData {
 static_assert(sizeof(FdwicSubmitPmuCoreData) == 64, "submit-PMU core record must occupy one cacheline");
 static_assert(offsetof(FdwicSubmitPmuCoreData, status) == 60, "submit-PMU status offset changed");
 
+// phase sidecar 只在局部阶段 mode 中分配。每个 worker 独占一条 cacheline，
+// 避免相邻 worker 发布结果时产生伪共享。CNT6/7 的整窗 primary 仍保存在
+// FdwicSubmitPmuCoreData；这里的 request/miss 是运行中 read-clear 观测值。
+// begin/end 两侧的少量 bookkeeping 取指也会进入该样本，因此它不是原始
+// 业务区间事件数的数学下界。
+struct FdwicSubmitPmuPhaseCoreData {
+    uint64_t phase_elapsed_ticks;
+    uint64_t phase_icache_requests_observed;
+    uint64_t phase_icache_misses_observed;
+    uint32_t phase_id;
+    uint32_t phase_begin_reads;
+    uint32_t phase_end_reads;
+    uint32_t max_shadow_request_chunk;
+    uint32_t max_shadow_miss_chunk;
+    uint32_t status;
+    uint32_t reserved[4];
+} __attribute__((aligned(64)));
+
+static_assert(sizeof(FdwicSubmitPmuPhaseCoreData) == 64, "submit-PMU phase record must occupy one cacheline");
+static_assert(offsetof(FdwicSubmitPmuPhaseCoreData, status) == 44, "submit-PMU phase status offset changed");
+
+struct FdwicSubmitPmuPhaseAccumulator {
+    uint64_t shadow_requests;
+    uint64_t shadow_misses;
+    uint64_t phase_requests;
+    uint64_t phase_misses;
+    uint64_t phase_elapsed_ticks;
+    uint64_t phase_begin_tick;
+    uint32_t begin_reads;
+    uint32_t end_reads;
+    uint32_t max_shadow_request_chunk;
+    uint32_t max_shadow_miss_chunk;
+    uint32_t status;
+    bool armed;
+    bool boundary_error;
+};
+
 struct FdwicSubmitPmuHeader {
     // Host 初始化的只读配置 cacheline。
     uint32_t magic;
@@ -134,3 +204,11 @@ struct FdwicSubmitPmuHeader {
 static_assert(offsetof(FdwicSubmitPmuHeader, owner_status) == 64, "owner state must occupy cacheline two");
 static_assert(offsetof(FdwicSubmitPmuHeader, cores) == 128, "per-core records must start after two cachelines");
 static_assert(sizeof(FdwicSubmitPmuHeader) == 128 + 64 * kFdwicSubmitPmuExpectedCores, "submit-PMU ABI size changed");
+
+constexpr size_t kFdwicSubmitPmuNoneBytes = sizeof(FdwicSubmitPmuHeader);
+constexpr size_t kFdwicSubmitPmuPhaseBytes =
+    sizeof(FdwicSubmitPmuHeader) + sizeof(FdwicSubmitPmuPhaseCoreData) * kFdwicSubmitPmuExpectedCores;
+
+constexpr size_t fdwic_submit_pmu_bytes_for_mode(uint16_t mode) {
+    return fdwic_submit_pmu_mode_has_phase(mode) ? kFdwicSubmitPmuPhaseBytes : kFdwicSubmitPmuNoneBytes;
+}

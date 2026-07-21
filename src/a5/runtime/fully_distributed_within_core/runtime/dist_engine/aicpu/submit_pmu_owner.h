@@ -17,7 +17,7 @@
 class Runtime;
 
 /**
- * 判断本轮是否携带合法的 submit-pmu-none 共享头。
+ * 判断本轮是否携带合法的 submit-PMU 共享头。
  *
  * submit-pmu 与 perf-clock 一样复用 Runtime::dist.swimlane_base，但使用独立
  * magic/version/mode 判型，并要求普通泳道 level/capacity 都为零。返回 true

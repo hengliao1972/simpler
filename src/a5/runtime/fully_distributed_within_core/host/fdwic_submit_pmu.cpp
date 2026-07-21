@@ -33,9 +33,31 @@ constexpr double kPmuCyclesPerNsAll = 1.649844;
 constexpr double kPmuCyclesPerNsAic = 1.650062;
 constexpr double kPmuCyclesPerNsAiv = 1.649731;
 
-bool submit_pmu_requested() {
-    const char *mode = std::getenv("PTO_FDWIC_PROFILE");
-    return mode != nullptr && std::strcmp(mode, "submit-pmu-none") == 0;
+struct SubmitPmuProfile {
+    const char *name;
+    uint16_t mode;
+    FdwicSubmitPmuPhase phase;
+    size_t bytes;
+};
+
+constexpr SubmitPmuProfile kSubmitPmuProfiles[] = {
+    {"submit-pmu-none", kFdwicSubmitPmuModeNone, FdwicSubmitPmuPhase::None, kFdwicSubmitPmuNoneBytes},
+    {"submit-pmu-arg-build", kFdwicSubmitPmuModeArgBuild, FdwicSubmitPmuPhase::ArgBuild, kFdwicSubmitPmuPhaseBytes},
+};
+
+const SubmitPmuProfile *requested_profile() {
+    const char *name = std::getenv("PTO_FDWIC_PROFILE");
+    if (name == nullptr) return nullptr;
+    for (const SubmitPmuProfile &profile : kSubmitPmuProfiles) {
+        if (std::strcmp(name, profile.name) == 0) return &profile;
+    }
+    return nullptr;
+}
+
+const FdwicSubmitPmuPhaseCoreData *phase_records(const FdwicSubmitPmuHeader &header) {
+    return reinterpret_cast<const FdwicSubmitPmuPhaseCoreData *>(
+        reinterpret_cast<const uint8_t *>(&header) + sizeof(FdwicSubmitPmuHeader)
+    );
 }
 
 std::string raw_path(const char *prefix) {
@@ -128,10 +150,12 @@ struct ValidatedData {
     GroupStats aiv;
 };
 
-bool validate(Runtime *runtime, const FdwicSubmitPmuHeader &header, ValidatedData &data) {
+bool validate(
+    Runtime *runtime, const FdwicSubmitPmuHeader &header, const SubmitPmuProfile &profile, ValidatedData &data
+) {
     const bool fixed_header =
         header.magic == kFdwicSubmitPmuMagic && header.version == kFdwicSubmitPmuVersion &&
-        header.mode == kFdwicSubmitPmuModeNone && header.header_bytes == sizeof(FdwicSubmitPmuHeader) &&
+        header.mode == profile.mode && header.header_bytes == profile.bytes &&
         header.record_bytes == sizeof(FdwicSubmitPmuCoreData) && header.num_cores == kFdwicSubmitPmuExpectedCores &&
         header.expected_aic == kFdwicSubmitPmuExpectedAic && header.expected_aiv == kFdwicSubmitPmuExpectedAiv &&
         header.sys_cnt_freq_hz == PLATFORM_PROF_SYS_CNT_FREQ && header.selectors[0] == kFdwicSubmitPmuCnt2ScalarBusy &&
@@ -140,7 +164,7 @@ bool validate(Runtime *runtime, const FdwicSubmitPmuHeader &header, ValidatedDat
         header.selectors[3] == kFdwicSubmitPmuCnt7IcacheMiss &&
         header.selectors[4] == kFdwicSubmitPmuCnt8ShadowIcacheRequest && runtime != nullptr &&
         runtime->worker_count == static_cast<int32_t>(kFdwicSubmitPmuExpectedCores) &&
-        runtime->fdwic_swimlane_bytes_ == sizeof(FdwicSubmitPmuHeader) &&
+        runtime->fdwic_swimlane_bytes_ == profile.bytes &&
         runtime->dist.swimlane_base == runtime->fdwic_swimlane_dev_base_ && runtime->dist.swimlane_level == 0 &&
         runtime->dist.swimlane_records_per_core == 0;
     if (!fixed_header) {
@@ -170,6 +194,8 @@ bool validate(Runtime *runtime, const FdwicSubmitPmuHeader &header, ValidatedDat
         return false;
     }
 
+    const bool phase_mode = fdwic_submit_pmu_mode_has_phase(profile.mode);
+    const FdwicSubmitPmuPhaseCoreData *phases = phase_mode ? phase_records(header) : nullptr;
     bool physical_seen[kFdwicSubmitPmuPhysicalSubcores]{};
     uint32_t aic_count = 0;
     uint32_t aiv_count = 0;
@@ -198,14 +224,18 @@ bool validate(Runtime *runtime, const FdwicSubmitPmuHeader &header, ValidatedDat
                                  (data.expected_submits == 0 || core.expected_submit_count == data.expected_submits);
         const bool window_valid = core.first_submit_start_tick != 0 &&
                                   core.last_submit_end_tick >= core.first_submit_start_tick && core.total_cycles != 0;
-        const bool counters_valid =
-            core.scalar_busy <= core.total_cycles && core.icache_requests != 0 &&
-            core.icache_misses <= core.icache_requests && core.shadow_icache_requests == core.icache_requests &&
-            core.shadow_icache_misses == core.icache_misses && core.scalar_busy < kFdwicSubmitPmuCounterRiskThreshold &&
-            core.icache_requests < kFdwicSubmitPmuCounterRiskThreshold &&
-            core.icache_misses < kFdwicSubmitPmuCounterRiskThreshold &&
-            core.shadow_icache_requests < kFdwicSubmitPmuCounterRiskThreshold &&
-            core.shadow_icache_misses < kFdwicSubmitPmuCounterRiskThreshold;
+        const bool shadow_valid =
+            phase_mode ?
+                core.shadow_icache_requests <= core.icache_requests && core.shadow_icache_misses <= core.icache_misses :
+                core.shadow_icache_requests == core.icache_requests && core.shadow_icache_misses == core.icache_misses;
+        const bool counters_valid = core.scalar_busy <= core.total_cycles && core.icache_requests != 0 &&
+                                    core.icache_misses <= core.icache_requests &&
+                                    core.shadow_icache_misses <= core.shadow_icache_requests && shadow_valid &&
+                                    core.scalar_busy < kFdwicSubmitPmuCounterRiskThreshold &&
+                                    core.icache_requests < kFdwicSubmitPmuCounterRiskThreshold &&
+                                    core.icache_misses < kFdwicSubmitPmuCounterRiskThreshold &&
+                                    core.shadow_icache_requests < kFdwicSubmitPmuCounterRiskThreshold &&
+                                    core.shadow_icache_misses < kFdwicSubmitPmuCounterRiskThreshold;
         if (!identity_valid || !count_valid || !window_valid || !counters_valid ||
             core.status != kFdwicSubmitPmuRequiredCoreStatus) {
             LOG_ERROR(
@@ -223,6 +253,35 @@ bool validate(Runtime *runtime, const FdwicSubmitPmuHeader &header, ValidatedDat
                 owner_configured
             );
             return false;
+        }
+        if (phase_mode) {
+            const FdwicSubmitPmuPhaseCoreData &phase = phases[logical];
+            bool reserved_zero = true;
+            for (uint32_t value : phase.reserved)
+                reserved_zero = reserved_zero && value == 0U;
+            const bool phase_valid =
+                phase.phase_id == static_cast<uint32_t>(profile.phase) &&
+                phase.phase_begin_reads == core.expected_submit_count &&
+                phase.phase_end_reads == core.expected_submit_count && phase.phase_elapsed_ticks != 0 &&
+                phase.phase_elapsed_ticks <= core.last_submit_end_tick - core.first_submit_start_tick &&
+                phase.phase_icache_requests_observed <= core.shadow_icache_requests &&
+                phase.phase_icache_misses_observed <= core.shadow_icache_misses &&
+                phase.max_shadow_request_chunk < kFdwicSubmitPmuCounterRiskThreshold &&
+                phase.max_shadow_miss_chunk < kFdwicSubmitPmuCounterRiskThreshold &&
+                phase.status == kFdwicSubmitPmuRequiredPhaseStatus && reserved_zero;
+            if (!phase_valid) {
+                LOG_ERROR(
+                    "fdwic submit-PMU phase core %u closure failed: id=%u reads=%u/%u expected=%u "
+                    "ticks=%llu/%llu observed=%llu/%u,%llu/%u max_chunk=%u/%u status=0x%x reserved=%u",
+                    logical, phase.phase_id, phase.phase_begin_reads, phase.phase_end_reads, core.expected_submit_count,
+                    static_cast<unsigned long long>(phase.phase_elapsed_ticks),
+                    static_cast<unsigned long long>(core.last_submit_end_tick - core.first_submit_start_tick),
+                    static_cast<unsigned long long>(phase.phase_icache_requests_observed), core.shadow_icache_requests,
+                    static_cast<unsigned long long>(phase.phase_icache_misses_observed), core.shadow_icache_misses,
+                    phase.max_shadow_request_chunk, phase.max_shadow_miss_chunk, phase.status, reserved_zero
+                );
+                return false;
+            }
         }
         physical_seen[physical] = true;
         if (data.expected_submits == 0) data.expected_submits = core.expected_submit_count;
@@ -260,7 +319,8 @@ bool validate(Runtime *runtime, const FdwicSubmitPmuHeader &header, ValidatedDat
 }  // namespace
 
 extern "C" int fdwic_submit_pmu_host_init(Runtime *runtime, int num_cores, const char *output_prefix) {
-    if (!submit_pmu_requested()) return 0;
+    const SubmitPmuProfile *profile = requested_profile();
+    if (profile == nullptr) return 0;
     if (runtime == nullptr || num_cores != static_cast<int>(kFdwicSubmitPmuExpectedCores) ||
         runtime->worker_count != static_cast<int>(kFdwicSubmitPmuExpectedCores)) {
         return -1;
@@ -278,14 +338,14 @@ extern "C" int fdwic_submit_pmu_host_init(Runtime *runtime, int num_cores, const
     const std::string path = raw_path(prefix.c_str());
     if (!remove_if_present(path) || !remove_if_present(path + ".tmp")) return -1;
 
-    void *shadow = std::aligned_alloc(64, sizeof(FdwicSubmitPmuHeader));
+    void *shadow = std::aligned_alloc(64, profile->bytes);
     if (shadow == nullptr) return -1;
-    std::memset(shadow, 0, sizeof(FdwicSubmitPmuHeader));
+    std::memset(shadow, 0, profile->bytes);
     auto *header = reinterpret_cast<FdwicSubmitPmuHeader *>(shadow);
     header->magic = kFdwicSubmitPmuMagic;
     header->version = kFdwicSubmitPmuVersion;
-    header->mode = kFdwicSubmitPmuModeNone;
-    header->header_bytes = sizeof(FdwicSubmitPmuHeader);
+    header->mode = profile->mode;
+    header->header_bytes = static_cast<uint32_t>(profile->bytes);
     header->record_bytes = sizeof(FdwicSubmitPmuCoreData);
     header->num_cores = kFdwicSubmitPmuExpectedCores;
     header->expected_aic = kFdwicSubmitPmuExpectedAic;
@@ -298,13 +358,13 @@ extern "C" int fdwic_submit_pmu_host_init(Runtime *runtime, int num_cores, const
     header->selectors[4] = kFdwicSubmitPmuCnt8ShadowIcacheRequest;
 
     constexpr uintptr_t kAlignment = 64;
-    void *allocation = runtime->host_api.device_malloc(sizeof(FdwicSubmitPmuHeader) + kAlignment - 1);
+    void *allocation = runtime->host_api.device_malloc(profile->bytes + kAlignment - 1);
     if (allocation == nullptr) {
         std::free(shadow);
         return -1;
     }
     const uintptr_t base = (reinterpret_cast<uintptr_t>(allocation) + kAlignment - 1) & ~(kAlignment - 1);
-    if (runtime->host_api.copy_to_device(reinterpret_cast<void *>(base), shadow, sizeof(FdwicSubmitPmuHeader)) != 0) {
+    if (runtime->host_api.copy_to_device(reinterpret_cast<void *>(base), shadow, profile->bytes) != 0) {
         runtime->host_api.device_free(allocation);
         std::free(shadow);
         return -1;
@@ -312,7 +372,7 @@ extern "C" int fdwic_submit_pmu_host_init(Runtime *runtime, int num_cores, const
     runtime->fdwic_swimlane_host_shadow_ = shadow;
     runtime->fdwic_swimlane_dev_allocation_ = reinterpret_cast<uint64_t>(allocation);
     runtime->fdwic_swimlane_dev_base_ = base;
-    runtime->fdwic_swimlane_bytes_ = sizeof(FdwicSubmitPmuHeader);
+    runtime->fdwic_swimlane_bytes_ = profile->bytes;
     runtime->fdwic_swimlane_num_cores_ = kFdwicSubmitPmuExpectedCores;
     runtime->fdwic_swimlane_records_per_core_ = 0;
     std::memcpy(runtime->fdwic_swimlane_output_prefix_, prefix.c_str(), prefix.size() + 1);
@@ -323,20 +383,21 @@ extern "C" int fdwic_submit_pmu_host_init(Runtime *runtime, int num_cores, const
 }
 
 extern "C" int fdwic_submit_pmu_host_export(Runtime *runtime) {
-    if (!submit_pmu_requested() || runtime == nullptr || runtime->fdwic_swimlane_host_shadow_ == nullptr ||
+    const SubmitPmuProfile *profile = requested_profile();
+    if (profile == nullptr || runtime == nullptr || runtime->fdwic_swimlane_host_shadow_ == nullptr ||
         runtime->fdwic_swimlane_dev_base_ == 0) {
         return 0;
     }
     if (runtime->host_api.copy_from_device(
             runtime->fdwic_swimlane_host_shadow_, reinterpret_cast<void *>(runtime->fdwic_swimlane_dev_base_),
-            sizeof(FdwicSubmitPmuHeader)
+            profile->bytes
         ) != 0) {
         LOG_ERROR("fdwic submit-PMU D2H copy failed");
         return -1;
     }
     const auto &header = *reinterpret_cast<const FdwicSubmitPmuHeader *>(runtime->fdwic_swimlane_host_shadow_);
     ValidatedData data;
-    if (!validate(runtime, header, data)) return -1;
+    if (!validate(runtime, header, *profile, data)) return -1;
 
     const std::string path = raw_path(runtime->fdwic_swimlane_output_prefix_);
     const std::string temporary = path + ".tmp";
@@ -345,9 +406,12 @@ extern "C" int fdwic_submit_pmu_host_export(Runtime *runtime) {
     if (!out.is_open()) return -1;
     out << std::setprecision(12);
     const uint64_t global_span = data.global_end - data.global_start;
+    const bool phase_mode = fdwic_submit_pmu_mode_has_phase(profile->mode);
+    const FdwicSubmitPmuPhaseCoreData *phases = phase_mode ? phase_records(header) : nullptr;
     out << "{\n";
     out << "  \"schema\": \"fdwic-submit-pmu-v1\",\n";
-    out << "  \"capture\": {\"mode\": \"submit-pmu-none\", "
+    out << "  \"capture\": {\"mode\": \"" << profile->name
+        << "\", "
            "\"window_scope\": \"per_core_first_submit_begin_to_last_submit_end\", "
            "\"accepted\": true, \"owner_restore_passed\": true},\n";
     out << "  \"configuration\": {\n";
@@ -360,6 +424,14 @@ extern "C" int fdwic_submit_pmu_host_export(Runtime *runtime) {
     out << "    \"status_required_mask\": " << kFdwicSubmitPmuRequiredCoreStatus << ",\n";
     out << "    \"counter_width_bits\": {\"total\": 64, \"programmable\": 32},\n";
     out << "    \"programmable_counter_risk_threshold\": " << kFdwicSubmitPmuCounterRiskThreshold << ",\n";
+    if (phase_mode) {
+        out << "    \"phase\": {\"id\": " << static_cast<uint32_t>(profile->phase)
+            << ", \"name\": \"arg-build\", "
+               "\"boundary\": \"claim_end_to_materialize_begin\", "
+               "\"expected_calls_per_core\": "
+            << data.expected_submits << ", \"status_required_mask\": " << kFdwicSubmitPmuRequiredPhaseStatus
+            << ", \"counter_semantics\": \"running_read_clear_observed_bracket\"},\n";
+    }
     out << "    \"pmu_cycles_per_ns\": {\"all\": " << kPmuCyclesPerNsAll << ", \"aic\": " << kPmuCyclesPerNsAic
         << ", \"aiv\": " << kPmuCyclesPerNsAiv << "}\n";
     out << "  },\n";
@@ -390,8 +462,19 @@ extern "C" int fdwic_submit_pmu_host_export(Runtime *runtime) {
             << ", \"total_cycles\": " << core.total_cycles << ", \"scalar_busy\": " << core.scalar_busy
             << ", \"icache_requests\": " << core.icache_requests << ", \"icache_misses\": " << core.icache_misses
             << ", \"shadow_icache_requests\": " << core.shadow_icache_requests
-            << ", \"shadow_icache_misses\": " << core.shadow_icache_misses << ", \"status\": " << core.status << "}"
-            << (logical + 1U == kFdwicSubmitPmuExpectedCores ? "\n" : ",\n");
+            << ", \"shadow_icache_misses\": " << core.shadow_icache_misses << ", \"status\": " << core.status;
+        if (phase_mode) {
+            const FdwicSubmitPmuPhaseCoreData &phase = phases[logical];
+            out << ", \"phase_id\": " << phase.phase_id << ", \"phase_elapsed_ticks\": " << phase.phase_elapsed_ticks
+                << ", \"phase_icache_requests_observed\": " << phase.phase_icache_requests_observed
+                << ", \"phase_icache_misses_observed\": " << phase.phase_icache_misses_observed
+                << ", \"phase_begin_reads\": " << phase.phase_begin_reads
+                << ", \"phase_end_reads\": " << phase.phase_end_reads
+                << ", \"phase_max_shadow_request_chunk\": " << phase.max_shadow_request_chunk
+                << ", \"phase_max_shadow_miss_chunk\": " << phase.max_shadow_miss_chunk
+                << ", \"phase_status\": " << phase.status;
+        }
+        out << "}" << (logical + 1U == kFdwicSubmitPmuExpectedCores ? "\n" : ",\n");
     }
     out << "  ],\n";
     out << "  \"validation\": {\"passed\": true, \"trusted_records\": 96, "
@@ -399,8 +482,15 @@ extern "C" int fdwic_submit_pmu_host_export(Runtime *runtime) {
            "\"mixed_triplets\": 32, \"owner_bitmap_member_records\": 96, \"status_match_records\": 96, "
            "\"selector_match_records\": 96, \"window_started_records\": 96, "
            "\"window_stopped_records\": 96, \"submit_count_closed_records\": 96, "
-           "\"scalar_le_total_records\": 96, \"shadow_primary_match_records\": 96, "
-           "\"icache_miss_le_request_records\": 96, \"counter_below_risk_threshold_records\": 96},\n";
+           "\"scalar_le_total_records\": 96, ";
+    if (phase_mode) {
+        out << "\"shadow_primary_bounded_records\": 96, \"phase_boundary_closed_records\": 96, "
+               "\"phase_shape_match_records\": 96, \"phase_values_ordered_records\": 96, "
+               "\"phase_time_within_submit_records\": 96, ";
+    } else {
+        out << "\"shadow_primary_match_records\": 96, ";
+    }
+    out << "\"icache_miss_le_request_records\": 96, \"counter_below_risk_threshold_records\": 96},\n";
     out << "  \"summary\": {\n";
     write_group(out, "all", data.all, true);
     write_group(out, "aic", data.aic, true);

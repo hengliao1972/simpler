@@ -51,6 +51,7 @@
 #endif
 #if PTO_FDWIC_SUBMIT_PMU
 [[block_local]] static __gm__ FdwicSubmitPmuCoreData *g_fdwic_submit_pmu_core;
+[[block_local]] static __gm__ FdwicSubmitPmuPhaseCoreData *g_fdwic_submit_pmu_phase_core;
 [[block_local]] static uint64_t g_fdwic_submit_pmu_reg_base;
 [[block_local]] static uint64_t g_fdwic_submit_pmu_start_tick;
 [[block_local]] static uint64_t g_fdwic_submit_pmu_end_tick;
@@ -64,6 +65,7 @@
 [[block_local]] static uint32_t g_fdwic_submit_pmu_status;
 [[block_local]] static bool g_fdwic_submit_pmu_started;
 [[block_local]] static bool g_fdwic_submit_pmu_stopped;
+[[block_local]] static FdwicSubmitPmuPhaseAccumulator g_fdwic_submit_pmu_phase;
 #endif
 #define g_dist (*g_dist_ptr)
 #elif defined(__CPU_SIM)
@@ -91,6 +93,7 @@ thread_local uint32_t g_fdwic_perf_clock_expected_submits = 0;
 #endif
 #if PTO_FDWIC_SUBMIT_PMU
 thread_local FdwicSubmitPmuCoreData *g_fdwic_submit_pmu_core = nullptr;
+thread_local FdwicSubmitPmuPhaseCoreData *g_fdwic_submit_pmu_phase_core = nullptr;
 thread_local uint64_t g_fdwic_submit_pmu_reg_base = 0;
 thread_local uint64_t g_fdwic_submit_pmu_start_tick = 0;
 thread_local uint64_t g_fdwic_submit_pmu_end_tick = 0;
@@ -104,6 +107,7 @@ thread_local uint32_t g_fdwic_submit_pmu_expected_submits = 0;
 thread_local uint32_t g_fdwic_submit_pmu_status = 0;
 thread_local bool g_fdwic_submit_pmu_started = false;
 thread_local bool g_fdwic_submit_pmu_stopped = false;
+thread_local FdwicSubmitPmuPhaseAccumulator g_fdwic_submit_pmu_phase = {};
 #endif
 #define g_dist (*g_dist_ptr)
 #else
@@ -131,6 +135,7 @@ thread_local uint32_t g_fdwic_perf_clock_expected_submits = 0;
 #endif
 #if PTO_FDWIC_SUBMIT_PMU
 thread_local FdwicSubmitPmuCoreData *g_fdwic_submit_pmu_core = nullptr;
+thread_local FdwicSubmitPmuPhaseCoreData *g_fdwic_submit_pmu_phase_core = nullptr;
 thread_local uint64_t g_fdwic_submit_pmu_reg_base = 0;
 thread_local uint64_t g_fdwic_submit_pmu_start_tick = 0;
 thread_local uint64_t g_fdwic_submit_pmu_end_tick = 0;
@@ -144,6 +149,7 @@ thread_local uint32_t g_fdwic_submit_pmu_expected_submits = 0;
 thread_local uint32_t g_fdwic_submit_pmu_status = 0;
 thread_local bool g_fdwic_submit_pmu_started = false;
 thread_local bool g_fdwic_submit_pmu_stopped = false;
+thread_local FdwicSubmitPmuPhaseAccumulator g_fdwic_submit_pmu_phase = {};
 #endif
 #define g_dist (*g_dist_ptr)
 #endif

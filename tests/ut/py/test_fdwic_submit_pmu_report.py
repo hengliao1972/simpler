@@ -19,8 +19,10 @@ import pytest
 
 import simpler_setup.tools.fdwic_submit_pmu_report as report_module
 from simpler_setup.tools.fdwic_submit_pmu_report import (
+    ARG_BUILD_CAPTURE_MODE,
     DEFAULT_INPUT_NAME,
     DEFAULT_OUTPUT_NAME,
+    PHASE_REQUIRED_STATUS_MASK,
     REQUIRED_STATUS_MASK,
     load_capture,
     render_report,
@@ -187,6 +189,46 @@ def _valid_capture() -> dict[str, Any]:
     }
 
 
+def _valid_arg_build_capture() -> dict[str, Any]:
+    capture = _valid_capture()
+    capture["capture"]["mode"] = ARG_BUILD_CAPTURE_MODE
+    capture["configuration"]["phase"] = {
+        "id": 1,
+        "name": "arg-build",
+        "boundary": "claim_end_to_materialize_begin",
+        "expected_calls_per_core": 5,
+        "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+        "counter_semantics": "running_read_clear_observed_bracket",
+    }
+    for logical_core_id, record in enumerate(capture["records"]):
+        record["shadow_icache_requests"] = record["icache_requests"] - 20 - logical_core_id % 3
+        record["shadow_icache_misses"] = record["icache_misses"] - 5
+        record.update(
+            {
+                "phase_id": 1,
+                "phase_elapsed_ticks": 1_500 + logical_core_id,
+                "phase_icache_requests_observed": 400 + logical_core_id,
+                "phase_icache_misses_observed": 40 + logical_core_id % 5,
+                "phase_begin_reads": 5,
+                "phase_end_reads": 5,
+                "phase_max_shadow_request_chunk": 120 + logical_core_id % 7,
+                "phase_max_shadow_miss_chunk": 15 + logical_core_id % 3,
+                "phase_status": PHASE_REQUIRED_STATUS_MASK,
+            }
+        )
+    capture["validation"].pop("shadow_primary_match_records")
+    capture["validation"].update(
+        {
+            "phase_boundary_closed_records": 96,
+            "phase_shape_match_records": 96,
+            "phase_values_ordered_records": 96,
+            "phase_time_within_submit_records": 96,
+            "shadow_primary_bounded_records": 96,
+        }
+    )
+    return capture
+
+
 def _write_capture(directory: Path, capture: dict[str, Any]) -> Path:
     path = directory / DEFAULT_INPUT_NAME
     path.write_text(json.dumps(capture, indent=2), encoding="utf-8")
@@ -208,12 +250,149 @@ def test_valid_capture_is_recomputed_and_rendered(tmp_path: Path) -> None:
     assert "90.000 ns" in document
     assert "不是 Submit 墙钟损失" in document
     assert "非 Scalar-busy 残余不是空闲时间，也不是 I-cache stall" in document
+    assert "Arg-build 局部归因" not in document
     assert "均值 16,047.5；最小 16,000；最大 16,095" in document
     for group_name in ("all", "aic", "aiv"):
         assert f"{capture.summary[group_name]['icache_miss_rate']:.3%}" in document
     assert document.count("<svg") == 4
     assert document.count("<circle") == 4 * 96
     assert hashlib.sha256(raw_path.read_bytes()).hexdigest() in document
+
+
+def test_valid_arg_build_capture_renders_same_elf_phase_observation_first(tmp_path: Path) -> None:
+    raw_path = _write_capture(tmp_path, _valid_arg_build_capture())
+
+    capture = load_capture(raw_path)
+
+    assert capture.phase_summary is not None
+    all_phase = capture.phase_summary["all"]
+    assert all_phase["phase_begin_reads"] == 96 * 5
+    assert all_phase["phase_end_reads"] == 96 * 5
+    assert all_phase["phase_icache_requests_observed_plus_capture_gap"]["sum"] == all_phase[
+        "phase_icache_requests_observed"
+    ]["sum"] + sum(record["icache_requests"] - record["shadow_icache_requests"] for record in capture.records)
+
+    document = render_report(raw_path)
+    assert document.index("Arg-build 局部归因") < document.index("全局 Submit 时间范围")
+    assert "running read-clear observed bracket" in document
+    assert "时间占比" in document
+    assert "Request 观测值 / 加全窗 capture gap" in document
+    assert "Miss 观测值 / 加全窗 capture gap" in document
+    assert "observed_plus_capture_gap = observed + (primary − shadow)" in document
+    assert "插桩 bookkeeping 会进入 sample" in document
+    assert "不是原业务" in document
+    assert "事件数的数学上下界" in document
+    assert "时间占比的分母是同一 ELF 的 Σ每核 Submit elapsed" in document
+    assert "request/miss 百分比的分母才是同一 ELF" in document
+    assert "不能跨 ELF 相减" in document
+    assert "shadow 是 begin/end/final 全部 running read-clear 返回值之和" in document
+    for group_name in ("all", "aic", "aiv"):
+        phase = capture.phase_summary[group_name]
+        assert f"{phase['phase_time_share_of_submit']:.3%}" in document
+        assert f"{phase['phase_request_observed_share_of_primary']:.3%}" in document
+        assert f"{phase['phase_request_observed_plus_capture_gap_share_of_primary']:.3%}" in document
+        assert f"{phase['phase_miss_observed_share_of_primary']:.3%}" in document
+        assert f"{phase['phase_miss_observed_plus_capture_gap_share_of_primary']:.3%}" in document
+
+
+def test_arg_build_rejects_unclosed_phase_boundaries(tmp_path: Path) -> None:
+    capture = _valid_arg_build_capture()
+    capture["records"][0]["phase_end_reads"] = 4
+
+    with pytest.raises(ValueError, match="phase begin/end reads must both equal 5"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_arg_build_rejects_shadow_counter_above_primary(tmp_path: Path) -> None:
+    capture = _valid_arg_build_capture()
+    capture["records"][0]["shadow_icache_requests"] = capture["records"][0]["icache_requests"] + 1
+
+    with pytest.raises(ValueError, match="shadow_icache_requests exceeds icache_requests"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_arg_build_rejects_observed_counter_above_shadow(tmp_path: Path) -> None:
+    capture = _valid_arg_build_capture()
+    capture["records"][0]["phase_icache_requests_observed"] = capture["records"][0]["shadow_icache_requests"] + 1
+
+    with pytest.raises(ValueError, match="phase_icache_requests_observed exceeds shadow_icache_requests"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_arg_build_rejects_phase_time_beyond_submit(tmp_path: Path) -> None:
+    capture = _valid_arg_build_capture()
+    capture["records"][0]["phase_elapsed_ticks"] = capture["records"][0]["submit_elapsed_ticks"] + 1
+
+    with pytest.raises(ValueError, match="phase_elapsed_ticks exceeds submit_elapsed_ticks"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_arg_build_rejects_incomplete_phase_status(tmp_path: Path) -> None:
+    capture = _valid_arg_build_capture()
+    capture["records"][0]["phase_status"] &= ~(1 << 5)
+
+    with pytest.raises(ValueError, match="phase_status must equal 0x3f"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_arg_build_rejects_mismatched_phase_configuration(tmp_path: Path) -> None:
+    capture = _valid_arg_build_capture()
+    capture["configuration"]["phase"]["boundary"] = "claim_begin_to_claim_end"
+
+    with pytest.raises(ValueError, match=r"configuration\.phase"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_arg_build_rejects_deprecated_lower_bound_raw_field(tmp_path: Path) -> None:
+    capture = _valid_arg_build_capture()
+    record = capture["records"][0]
+    record["phase_icache_requests_lower_bound"] = record.pop("phase_icache_requests_observed")
+
+    with pytest.raises(ValueError, match="must use observed phase fields"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_arg_build_rejects_deprecated_phase_time_validation_name(tmp_path: Path) -> None:
+    capture = _valid_arg_build_capture()
+    validation = capture["validation"]
+    validation["phase_time_bounded_records"] = validation.pop("phase_time_within_submit_records")
+
+    with pytest.raises(ValueError, match="must use phase_time_within_submit_records"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "phase_boundary_closed_records",
+        "phase_shape_match_records",
+        "phase_values_ordered_records",
+        "phase_time_within_submit_records",
+        "shadow_primary_bounded_records",
+    ),
+)
+def test_arg_build_requires_all_producer_phase_validations(tmp_path: Path, field: str) -> None:
+    capture = _valid_arg_build_capture()
+    capture["validation"][field] = 95
+
+    with pytest.raises(ValueError, match=rf"validation\.{field}"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_none_rejects_phase_record_fields(tmp_path: Path) -> None:
+    capture = _valid_capture()
+    capture["records"][0]["phase_id"] = 1
+
+    with pytest.raises(ValueError, match="must not contain phase fields"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_none_rejects_phase_configuration(tmp_path: Path) -> None:
+    capture = _valid_capture()
+    capture["configuration"]["phase"] = {}
+
+    with pytest.raises(ValueError, match="must not contain phase"):
+        load_capture(_write_capture(tmp_path, capture))
 
 
 def test_write_report_uses_fixed_default_name_and_atomic_publish(tmp_path: Path) -> None:

@@ -63,9 +63,62 @@ outputs/TestPagedAttentionUnroll_Case1_20260721_003335/
 同一物理核、同一首末 Submit 窗口的数据；仍不能把 `miss * 90 ns` 当作可直接消除的
 跨核墙钟损失。
 
-当前真实 PA 只完成 `none` 全窗，真实 span 单阶段 PMU 尚未实现。后续 selector
-必须跟随真实泳道的排他 span，一次 ELF 只测一个区域，并保留该 ELF 自己的完整
-Submit primary 作为比例分母。
+### 1.2 真实 PA 首个单阶段 profile：`submit-pmu-arg-build`
+
+真实 PA 已完成首个跟随最新泳道业务边界的单阶段 profile：
+
+```bash
+python -m pytest \
+  examples/a5/fully_distributed_within_core/paged_attention_unroll/test_paged_attention_unroll.py \
+  --platform a5 --runtime fully_distributed_within_core --level 2 \
+  --case Case1 --manual include --fdwic-profile submit-pmu-arg-build \
+  --rounds 1 -s -v
+```
+
+它仍保留本 ELF 的完整 Submit primary，只在 Kernel/Alloc 的 compete-first
+Claim 完成后开启局部 bracket，在匹配 Finish 恢复并校验 ticket 后、Materialize
+入口前结束。实际覆盖 Begin 返回、同步 eager callback 构参和 Finish 重入，不包含
+Claim 与 Materialize 本体。编译宏为：
+
+```text
+PTO_FDWIC_SUBMIT_PMU=1
+PTO_FDWIC_SUBMIT_PMU_PHASE_ID=1
+PTO_FDWIC_TRACE_ENABLED=0
+```
+
+none 的 ABI 仍为 6,272 B；arg-build 在相同 96 份整窗 64 B 记录后追加
+96 份 64 B phase sidecar，总计 12,416 B。raw schema 仍为
+`fdwic-submit-pmu-v1`，通过 `capture.mode` 区分：
+
+- `submit-pmu-none` 不含 `configuration.phase`，每条 record 也不含 phase 字段；
+- `submit-pmu-arg-build` 增加 `phase_elapsed_ticks`、
+  `phase_icache_requests_observed`、`phase_icache_misses_observed`、begin/end 次数、
+  最大 shadow 分段和 `phase_status`；
+- phase 时间只与同一 ELF 的 `Σsubmit_elapsed_ticks` 比较；request/miss observed
+  只与同一 ELF、同一角色的 primary 比较；
+- 不提供 phase-local PMU total、scalar busy 或 I-cache stall 时间。
+
+CNT6/CNT7 在完整窗口中不读取，继续作为 primary；CNT8/CNT5 运行中
+read-clear 并软件重建 shadow whole。`primary - shadow` 是分段重建的 capture gap。
+phase observed 会包含 counter 边界附近少量观测 bookkeeping 的取指，因此它不是
+原业务事件数的数学下界；`observed + capture gap` 也不是数学上界。HTML 同时展示
+两者，只用于判断结论对 capture gap 是否敏感。不同 profile 的 ELF 绝对时间、
+request 和 miss 都不能相减。
+
+首轮 Case1/B256 闭合件为：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260721_014355/
+```
+
+该轮 96 核每核 1,280 次 bracket 全部闭合，phase status 为 `0x3f`，
+primary/shadow 96/96 精确相等；同一 ELF 内 ALL 的 phase core-time、request
+observed 和 miss observed 份额分别为 5.557%、20.716% 和 21.334%。该数据首先
+证明采集链闭合，并提示后续需要空 bracket 校准观察 bookkeeping；不能直接把约
+21% 写成零插桩业务区间的真实 I-cache 比例。
+
+后续 selector 必须继续跟随真实泳道的排他 span，一次 ELF 只测一个区域，并保留
+该 ELF 自己的完整 Submit primary 作为比例分母。
 
 ## 2. 为什么 I-cache miss 必须独立重编译
 
@@ -160,9 +213,18 @@ site/op、`result_used` 与 `return_ready`。这些结果只用于证明热路�
 重排后的观察能力和计数口径仍然正确；该轮没有同时采集专用
 I-cache PMU，不能据此推导 I-cache miss 降幅或某个 atomic 的独立收益。
 
-## 3. `none` 与局部 phase 如何选择
+## 3. Standalone 历史 `none` 与局部 phase 如何选择
 
-当前正式支持五个编译期 phase：
+从本节到第 11 节主要描述 `tests/atomic_probe/pa_scheduler` standalone 的历史
+schema-v5、构建目录、命令和字段；不能套用到上面的真实 PA profile。真实 PA
+当前只有 `submit-pmu-none` 与 `submit-pmu-arg-build`，raw schema 为
+`fdwic-submit-pmu-v1`。
+
+standalone 历史 schema 中的 `lower/upper` 是已经固化的字段名，只表达
+read-clear observed 与 `primary-shadow` capture gap；由于 bracket 两侧也有观察
+bookkeeping，它们同样不能解释为零插桩业务事件数的数学上下界。
+
+standalone 当前保留五个编译期 phase：
 
 | phase | 边界 | 优先用途 |
 | --- | --- | --- |

@@ -298,10 +298,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         }
     });
     const char *fdwic_profile = std::getenv("PTO_FDWIC_PROFILE");
-    const bool fdwic_perf_clock_requested =
-        fdwic_profile != nullptr && std::strcmp(fdwic_profile, "perf-clock") == 0;
+    const bool fdwic_perf_clock_requested = fdwic_profile != nullptr && std::strcmp(fdwic_profile, "perf-clock") == 0;
     const bool fdwic_submit_pmu_requested =
-        fdwic_profile != nullptr && std::strcmp(fdwic_profile, "submit-pmu-none") == 0;
+        fdwic_profile != nullptr && std::strncmp(fdwic_profile, "submit-pmu-", 11) == 0;
     if (fdwic_perf_clock_requested) {
         if (enable_profiling_flag != PROFILING_FLAG_NONE) {
             LOG_ERROR("fdwic perf-clock cannot be combined with another runtime diagnostic");
@@ -328,17 +327,18 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     }
     if (fdwic_submit_pmu_requested) {
         if (enable_profiling_flag != PROFILING_FLAG_NONE) {
-            LOG_ERROR("fdwic submit-pmu-none cannot be combined with another runtime diagnostic");
+            LOG_ERROR("fdwic submit-PMU profile cannot be combined with another runtime diagnostic");
             return -1;
         }
         if (fdwic_submit_pmu_host_init == nullptr || fdwic_submit_pmu_host_export == nullptr ||
             fdwic_submit_pmu_host_finalize == nullptr) {
-            LOG_ERROR("fdwic submit-pmu-none was requested but the selected runtime does not provide its host hooks");
+            LOG_ERROR("fdwic submit-PMU profile was requested but the selected runtime does not provide its host hooks"
+            );
             return -1;
         }
         rc = fdwic_submit_pmu_host_init(&runtime, num_aicore, output_prefix_.c_str());
         if (rc <= 0) {
-            LOG_ERROR("fdwic submit-pmu-none init failed: %d", rc);
+            LOG_ERROR("fdwic submit-PMU profile init failed: %d", rc);
             return rc < 0 ? rc : -1;
         }
         fdwic_submit_pmu_active = true;
@@ -531,7 +531,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         if (fdwic_submit_pmu_active) {
             const int export_rc = fdwic_submit_pmu_host_export(&runtime);
             if (export_rc != 0) {
-                LOG_ERROR("fdwic submit-pmu-none export rejected after runtime error: %d", export_rc);
+                LOG_ERROR("fdwic submit-PMU export rejected after runtime error: %d", export_rc);
             }
         }
         return rc;
@@ -558,7 +558,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (fdwic_submit_pmu_active) {
         fdwic_submit_pmu_export_rc = fdwic_submit_pmu_host_export(&runtime);
         if (fdwic_submit_pmu_export_rc != 0) {
-            LOG_ERROR("fdwic submit-pmu-none export failed: %d", fdwic_submit_pmu_export_rc);
+            LOG_ERROR("fdwic submit-PMU export failed: %d", fdwic_submit_pmu_export_rc);
         }
     }
 

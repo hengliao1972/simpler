@@ -29,6 +29,12 @@
 #define PTO_FDWIC_SUBMIT_PMU 0
 #endif
 
+// 每个 submit-PMU 诊断 ELF 只允许编译一个局部阶段。0 表示整窗 none；
+// 其余编号由 submit_pmu_types.h 的 FdwicSubmitPmuPhase 定义。
+#ifndef PTO_FDWIC_SUBMIT_PMU_PHASE_ID
+#define PTO_FDWIC_SUBMIT_PMU_PHASE_ID 0
+#endif
+
 #ifndef PTO_FDWIC_TRACE_ENABLED
 #define PTO_FDWIC_TRACE_ENABLED PTO2_PROFILING
 #endif
@@ -43,6 +49,10 @@
 
 #if PTO_FDWIC_SUBMIT_PMU && PTO_FDWIC_PERF_CLOCK
 #error "PTO_FDWIC_SUBMIT_PMU and PTO_FDWIC_PERF_CLOCK are mutually exclusive"
+#endif
+
+#if !PTO_FDWIC_SUBMIT_PMU && PTO_FDWIC_SUBMIT_PMU_PHASE_ID != 0
+#error "PTO_FDWIC_SUBMIT_PMU_PHASE_ID requires PTO_FDWIC_SUBMIT_PMU=1"
 #endif
 
 #if PTO_FDWIC_TRACE_ENABLED

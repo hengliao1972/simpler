@@ -152,11 +152,12 @@ def pytest_addoption(parser):
     parser.addoption(
         "--fdwic-profile",
         action="store",
-        choices=["none", "perf-clock", "submit-pmu-none"],
+        choices=["none", "perf-clock", "submit-pmu-none", "submit-pmu-arg-build"],
         default="none",
         help="Select a private fully_distributed_within_core evidence build. "
         "perf-clock keeps only the first/last Submit device clock per core; "
-        "submit-pmu-none keeps one full Submit-sequence scalar/I-cache PMU window per core.",
+        "submit-pmu-none keeps one full Submit-sequence scalar/I-cache PMU window per core; "
+        "submit-pmu-arg-build additionally attributes the Claim-to-Materialize eager-build interval.",
     )
     parser.addoption(
         "--use-example-exec-time",
@@ -448,7 +449,7 @@ def _configure_fdwic_profile(config):
     if fdwic_profile == "none":
         os.environ.pop("PTO_FDWIC_PROFILE", None)
         return
-    if fdwic_profile not in {"perf-clock", "submit-pmu-none"}:
+    if fdwic_profile not in {"perf-clock", "submit-pmu-none", "submit-pmu-arg-build"}:
         raise pytest.UsageError(f"unsupported --fdwic-profile {fdwic_profile!r}")
 
     platform = config.getoption("--platform", default=None)
@@ -666,7 +667,7 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
     items.sort(key=sort_key)
 
     fdwic_profile = config.getoption("--fdwic-profile", default="none")
-    if fdwic_profile in {"perf-clock", "submit-pmu-none"}:
+    if fdwic_profile in {"perf-clock", "submit-pmu-none", "submit-pmu-arg-build"}:
         incompatible = []
         for item in items:
             if any(m.name == "skip" for m in item.iter_markers()):
