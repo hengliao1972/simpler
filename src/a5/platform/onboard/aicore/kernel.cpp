@@ -12,14 +12,18 @@
  * Minimal AICore Kernel
  */
 #include "aicore/aicore.h"
-#if !defined(PTO_FDWIC_PERF_CLOCK) || !PTO_FDWIC_PERF_CLOCK
+#if defined(PTO_FDWIC_SUBMIT_PMU) && PTO_FDWIC_SUBMIT_PMU
+#include "aicore/fdwic_submit_pmu_state.h"
+#elif !defined(PTO_FDWIC_PERF_CLOCK) || !PTO_FDWIC_PERF_CLOCK
 #include "aicore/aicore_profiling_state.h"
 #endif
 #include "common/core_type.h"
 #include "common/kernel_args.h"
 #if !defined(PTO_FDWIC_PERF_CLOCK) || !PTO_FDWIC_PERF_CLOCK
+#if !defined(PTO_FDWIC_SUBMIT_PMU) || !PTO_FDWIC_SUBMIT_PMU
 #include "common/l2_swimlane_profiling.h"
 #include "common/pmu_profiling.h"
+#endif
 #endif
 #include "common/platform_config.h"
 #include "simt_anchor.h"
@@ -41,7 +45,16 @@ class Runtime;
 [[block_local]] int block_idx;
 [[block_local]] CoreType core_type;
 
-#if !defined(PTO_FDWIC_PERF_CLOCK) || !PTO_FDWIC_PERF_CLOCK
+#if defined(PTO_FDWIC_SUBMIT_PMU) && PTO_FDWIC_SUBMIT_PMU
+[[block_local]] static uint64_t s_fdwic_submit_pmu_reg_base;
+
+__attribute__((weak)) __aicore__ void set_fdwic_submit_pmu_reg_base(uint64_t reg_base) {
+    s_fdwic_submit_pmu_reg_base = reg_base;
+}
+__attribute__((weak)) __aicore__ uint64_t get_fdwic_submit_pmu_reg_base() {
+    return s_fdwic_submit_pmu_reg_base;
+}
+#elif !defined(PTO_FDWIC_PERF_CLOCK) || !PTO_FDWIC_PERF_CLOCK
 // Per-core profiling state. Populated once by KERNEL_ENTRY from KernelArgs;
 // read by aicore_execute and profiling helpers via the getters below. This
 // mirrors the AICPU-side set_l2_swimlane_enabled / set_pmu_enabled pattern,
@@ -117,7 +130,14 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
     core_type = CoreType::AIC;
 #endif
 
-#if !defined(PTO_FDWIC_PERF_CLOCK) || !PTO_FDWIC_PERF_CLOCK
+#if defined(PTO_FDWIC_SUBMIT_PMU) && PTO_FDWIC_SUBMIT_PMU
+    // 独立整窗 PMU 构建不打开 generic PROFILING_FLAG_PMU，也不创建逐 task
+    // ring。这里仅从 host 已发布的物理寄存器表解析本核 MMIO 基址。
+    __gm__ uint64_t *regs_array = reinterpret_cast<__gm__ uint64_t *>(k_args->regs);
+    set_fdwic_submit_pmu_reg_base(
+        regs_array == nullptr ? 0 : regs_array[get_physical_core_id()]
+    );
+#elif !defined(PTO_FDWIC_PERF_CLOCK) || !PTO_FDWIC_PERF_CLOCK
     // Publish per-core profiling state into platform-owned slots before the
     // executor runs. AICore reads via get_aicore_*() — never touches Handshake
     // for profiling. The PMU MMIO base is resolved here from

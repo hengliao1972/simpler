@@ -28,15 +28,19 @@ from types import SimpleNamespace
 import pytest
 from _task_interface import ArgDirection, ChipCallable  # pyright: ignore[reportMissingImports]
 
+from conftest import _configure_fdwic_profile
+
 # ``simpler_setup/__init__.py`` re-exports the ``scene_test`` *decorator*,
 # which shadows the submodule attribute when accessed via ``simpler_setup``.
 # Importing the names directly from the submodule avoids that ambiguity.
 from simpler_setup.scene_test import (
     _aicore_override_cache,
     _assert_fdwic_perf_clock_elf,
+    _assert_fdwic_submit_pmu_elf,
     _assert_fdwic_swimlane_elf,
     _compile_cache,
     _convert_case_swimlane,
+    _fdwic_compile_definitions,
     _fdwic_profile,
     _profiled_cache_key,
     _run_swimlane_converter,
@@ -81,7 +85,7 @@ def test_clear_compile_cache_drops_cached_chip_callables():
 
 
 def test_fdwic_profile_partitions_compile_cache(monkeypatch):
-    """Normal and perf-clock builds must never reuse one AICore override."""
+    """Normal and both private profiles must use distinct AICore overrides."""
     base = ("Case", "a5", "fully_distributed_within_core")
 
     monkeypatch.delenv("PTO_FDWIC_PROFILE", raising=False)
@@ -91,6 +95,22 @@ def test_fdwic_profile_partitions_compile_cache(monkeypatch):
     monkeypatch.setenv("PTO_FDWIC_PROFILE", "perf-clock")
     assert _fdwic_profile() == "perf-clock"
     assert _profiled_cache_key(base) == (*base, "perf-clock")
+
+    monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-none")
+    assert _fdwic_profile() == "submit-pmu-none"
+    assert _profiled_cache_key(base) == (*base, "submit-pmu-none")
+
+
+def test_fdwic_private_profiles_have_isolated_compile_definitions():
+    assert _fdwic_compile_definitions("none") is None
+    assert _fdwic_compile_definitions("perf-clock") == [
+        "PTO_FDWIC_PERF_CLOCK=1",
+        "PTO_FDWIC_TRACE_ENABLED=0",
+    ]
+    assert _fdwic_compile_definitions("submit-pmu-none") == [
+        "PTO_FDWIC_SUBMIT_PMU=1",
+        "PTO_FDWIC_TRACE_ENABLED=0",
+    ]
 
 
 def test_fdwic_profile_rejects_unknown_value(monkeypatch):
@@ -102,10 +122,7 @@ def test_fdwic_profile_rejects_unknown_value(monkeypatch):
 
 def test_perf_clock_elf_gate_accepts_required_symbol_without_observers(monkeypatch, tmp_path):
     """The final image must keep its marker and remove observer slow paths."""
-    symbol_table = (
-        "37410: 0000000000001b54 68 FUNC WEAK DEFAULT 1 "
-        "_Z30dist_perf_clock_expect_submitsj\n"
-    )
+    symbol_table = "37410: 0000000000001b54 68 FUNC WEAK DEFAULT 1 _Z30dist_perf_clock_expect_submitsj\n"
     monkeypatch.setattr(
         _scene_test_module.subprocess,
         "run",
@@ -120,14 +137,25 @@ def test_perf_clock_elf_gate_accepts_required_symbol_without_observers(monkeypat
     [
         ("", "missing defined perf-clock marker"),
         (
-            "12: 0000000000000000 0 FUNC GLOBAL DEFAULT UND "
-            "_Z30dist_perf_clock_expect_submitsj\n",
+            "12: 0000000000000000 0 FUNC GLOBAL DEFAULT UND _Z30dist_perf_clock_expect_submitsj\n",
             "missing defined perf-clock marker",
         ),
         (
             "37410: 0000000000001b54 68 FUNC WEAK DEFAULT 1 "
             "_Z30dist_perf_clock_expect_submitsj\n"
             "42: 0000000000000048 8 OBJECT LOCAL DEFAULT 17 g_fdwic_atomic_record_index\n",
+            r"profiling symbol\(s\) still present",
+        ),
+        (
+            "37410: 0000000000001b54 68 FUNC WEAK DEFAULT 1 "
+            "_Z30dist_perf_clock_expect_submitsj\n"
+            "43: 0000000000000080 8 FUNC LOCAL DEFAULT 1 fdwic_submit_pmu_read_counters\n",
+            r"profiling symbol\(s\) still present",
+        ),
+        (
+            "37410: 0000000000001b54 68 FUNC WEAK DEFAULT 1 "
+            "_Z30dist_perf_clock_expect_submitsj\n"
+            "44: 0000000000000088 8 OBJECT LOCAL DEFAULT 17 g_fdwic_submit_pmu_reg_base\n",
             r"profiling symbol\(s\) still present",
         ),
     ],
@@ -155,6 +183,66 @@ def test_perf_clock_elf_gate_reports_readelf_failure(monkeypatch, tmp_path):
         _assert_fdwic_perf_clock_elf(tmp_path / "aicore_kernel.o")
 
 
+def test_submit_pmu_elf_gate_accepts_only_whole_window_observer(monkeypatch, tmp_path):
+    symbol_table = (
+        "10: 0000000000001000 64 FUNC WEAK DEFAULT 1 dist_submit_pmu_expect_submits\n"
+        "11: 0000000000001040 96 FUNC LOCAL DEFAULT 1 fdwic_submit_pmu_read_counters\n"
+    )
+    monkeypatch.setattr(
+        _scene_test_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=symbol_table, stderr=""),
+    )
+
+    _assert_fdwic_submit_pmu_elf(tmp_path / "aicore_kernel.o")
+
+
+@pytest.mark.parametrize(
+    ("symbol_table", "message"),
+    [
+        ("", "missing defined submit-pmu marker"),
+        (
+            "1: 0 0 FUNC GLOBAL DEFAULT UND dist_submit_pmu_expect_submits\n"
+            "2: 0 1 FUNC LOCAL DEFAULT 1 fdwic_submit_pmu_read_counters\n",
+            "missing defined submit-pmu marker",
+        ),
+        (
+            "1: 0 1 FUNC WEAK DEFAULT 1 dist_submit_pmu_expect_submits\n"
+            "2: 0 1 FUNC LOCAL DEFAULT 1 fdwic_submit_pmu_read_counters\n"
+            "3: 0 1 FUNC LOCAL DEFAULT 1 fdwic_swimlane_detail_record_atomic\n",
+            r"unrelated profiling symbol\(s\) still present",
+        ),
+        (
+            "1: 0 1 FUNC WEAK DEFAULT 1 dist_submit_pmu_expect_submits\n"
+            "2: 0 1 FUNC LOCAL DEFAULT 1 fdwic_submit_pmu_read_counters\n"
+            "3: 0 1 FUNC WEAK DEFAULT 1 get_aicore_pmu_ring\n",
+            r"unrelated profiling symbol\(s\) still present",
+        ),
+        (
+            "1: 0 1 FUNC WEAK DEFAULT 1 dist_submit_pmu_expect_submits\n"
+            "2: 0 1 FUNC LOCAL DEFAULT 1 fdwic_submit_pmu_read_counters\n"
+            "3: 0 1 FUNC WEAK DEFAULT 1 get_aicore_pmu_reg_base\n",
+            r"unrelated profiling symbol\(s\) still present",
+        ),
+        (
+            "1: 0 1 FUNC WEAK DEFAULT 1 dist_submit_pmu_expect_submits\n"
+            "2: 0 1 FUNC LOCAL DEFAULT 1 fdwic_submit_pmu_read_counters\n"
+            "3: 0 1 FUNC WEAK DEFAULT 1 dist_perf_clock_expect_submits\n",
+            r"unrelated profiling symbol\(s\) still present",
+        ),
+    ],
+)
+def test_submit_pmu_elf_gate_rejects_incomplete_or_mixed_image(monkeypatch, tmp_path, symbol_table, message):
+    monkeypatch.setattr(
+        _scene_test_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=symbol_table, stderr=""),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        _assert_fdwic_submit_pmu_elf(tmp_path / "aicore_kernel.o")
+
+
 def test_swimlane_elf_gate_accepts_merged_phase_atomic_observer(monkeypatch, tmp_path):
     symbol_table = (
         "2796: 0000000000012d8c 4080 FUNC LOCAL DEFAULT 1 "
@@ -179,7 +267,19 @@ def test_swimlane_elf_gate_accepts_merged_phase_atomic_observer(monkeypatch, tmp
             "1: 0 1 FUNC LOCAL DEFAULT 1 fdwic_atomic_poll_boundary_slow\n"
             "2: 0 1 FUNC LOCAL DEFAULT 1 fdwic_swimlane_detail_record_atomic\n"
             "3: 0 1 FUNC WEAK DEFAULT 1 dist_perf_clock_expect_submits\n",
-            "perf-clock symbol.*leaked",
+            "private-profile symbol.*leaked",
+        ),
+        (
+            "1: 0 1 FUNC LOCAL DEFAULT 1 fdwic_atomic_poll_boundary_slow\n"
+            "2: 0 1 FUNC LOCAL DEFAULT 1 fdwic_swimlane_detail_record_atomic\n"
+            "3: 0 1 FUNC WEAK DEFAULT 1 dist_submit_pmu_expect_submits\n",
+            "private-profile symbol.*leaked",
+        ),
+        (
+            "1: 0 1 FUNC LOCAL DEFAULT 1 fdwic_atomic_poll_boundary_slow\n"
+            "2: 0 1 FUNC LOCAL DEFAULT 1 fdwic_swimlane_detail_record_atomic\n"
+            "3: 0 1 FUNC WEAK DEFAULT 1 get_fdwic_submit_pmu_reg_base\n",
+            "private-profile symbol.*leaked",
         ),
     ],
 )
@@ -192,6 +292,61 @@ def test_swimlane_elf_gate_rejects_wrong_image(monkeypatch, tmp_path, symbol_tab
 
     with pytest.raises(RuntimeError, match=message):
         _assert_fdwic_swimlane_elf(tmp_path / "aicore_kernel.o")
+
+
+class _FakePytestConfig:
+    def __init__(self, **options):
+        self.options = {
+            "--fdwic-profile": "submit-pmu-none",
+            "--platform": "a5",
+            "--runtime": "fully_distributed_within_core",
+            "--level": 2,
+            "--rounds": 1,
+            **options,
+        }
+
+    def getoption(self, option, default=None):
+        return self.options.get(option, default)
+
+
+def test_submit_pmu_profile_publishes_environment(monkeypatch):
+    monkeypatch.delenv("PTO_FDWIC_PROFILE", raising=False)
+
+    _configure_fdwic_profile(_FakePytestConfig())
+
+    assert _fdwic_profile() == "submit-pmu-none"
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"--platform": "a5sim"}, "requires --platform a5"),
+        ({"--runtime": "tensormap_and_ringbuffer"}, "only supports runtime fully_distributed_within_core"),
+        ({"--level": 3}, "only supports SceneTest level 2"),
+        ({"--rounds": 2}, "requires --rounds 1"),
+    ],
+)
+def test_submit_pmu_profile_rejects_wrong_execution_scope(options, message):
+    with pytest.raises(pytest.UsageError, match=message):
+        _configure_fdwic_profile(_FakePytestConfig(**options))
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "--enable-l2-swimlane",
+        "--dump-args",
+        "--enable-pmu",
+        "--enable-dep-gen",
+        "--enable-scope-stats",
+        "--enable-device-log-timing",
+        "--enable-swimlane-overhead",
+        "--use-example-exec-time",
+    ],
+)
+def test_submit_pmu_profile_rejects_other_diagnostics(option):
+    with pytest.raises(pytest.UsageError, match=option):
+        _configure_fdwic_profile(_FakePytestConfig(**{option: 1}))
 
 
 def test_strict_fdwic_v4_converter_requires_closure_artifacts(monkeypatch, tmp_path):

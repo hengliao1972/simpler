@@ -94,8 +94,8 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     // Read dimensions from tensor metadata
     // query: shape=[batch, num_heads, head_dim]
     uint64_t batch = orch_args.tensor(0).ref().shapes[0];
-#if PTO_FDWIC_PERF_CLOCK
-    // perf-clock 当前只服务与 Case1 同构的 PA：每个 batch 恰好一次
+#if PTO_FDWIC_PERF_CLOCK || PTO_FDWIC_SUBMIT_PMU
+    // perf-clock 与 submit-pmu-none 当前只服务与 Case1 同构的 PA：每个 batch 恰好一次
     // Alloc 和一组 QK/SF/PV/UP，共 5 次 Submit。Case2/3 的 block 分组数
     // 不同；若误用该诊断构建，最终实际 count 会超过 expected，host 必须
     // fail closed，不能把中途第 5*batch 次 Submit 冒充为末次。

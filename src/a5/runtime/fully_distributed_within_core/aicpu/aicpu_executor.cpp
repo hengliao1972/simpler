@@ -20,6 +20,7 @@
 // Runtime headers
 #include "pto_runtime2.h"
 #include "dist_engine/dist_engine.h"
+#include "dist_engine/aicpu/submit_pmu_owner.h"
 
 // Performance profiling headers
 #include "aicpu/l2_swimlane_collector_aicpu.h"
@@ -303,6 +304,18 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 cache_flush_range(&runtime->dist, sizeof(runtime->dist));
                 cache_flush_range(const_cast<const int32_t *>(&runtime->dist.num_workers), sizeof(int32_t));
                 cache_flush_range(const_cast<const int64_t *>(&runtime->dist.done_count), sizeof(int64_t));
+                FdwicSubmitPmuHeader *submit_pmu_header = nullptr;
+                const bool submit_pmu_requested = fdwic_submit_pmu_requested(runtime, &submit_pmu_header);
+                bool dispatch_dist_run = true;
+                if (submit_pmu_requested &&
+                    fdwic_submit_pmu_owner_configure(runtime, submit_pmu_header) != 0) {
+                    LOG_ERROR("Thread %d: FDWIC submit-PMU owner configure failed; aborting dist replay", thread_idx);
+                    // Configure 已经执行一次回滚；这里再做一次幂等恢复，优先
+                    // 避免失败诊断给后续本地设备运行留下 PMU 配置。
+                    (void)fdwic_submit_pmu_owner_restore(submit_pmu_header);
+                    dispatch_dist_run = false;
+                    run_rc = -1;
+                }
                 uint64_t *regs = reinterpret_cast<uint64_t *>(get_platform_regs());
                 if (regs == nullptr) {
                     LOG_ERROR("Thread %d: platform regs unavailable", thread_idx);
@@ -314,23 +327,38 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     write_reg(regs[physical_core_id], RegId::COND, AICORE_IDLE_VALUE);
                 }
                 for (int32_t i = 0; i < num_workers; i++) {
-                    runtime->workers[i].aicpu_ready = AICPU_READY_DIST_RUN;
+                    runtime->workers[i].aicpu_ready =
+                        dispatch_dist_run ? AICPU_READY_DIST_RUN : AICPU_READY_DIST_ABORT;
                     cache_flush_range(const_cast<const uint32_t *>(&runtime->workers[i].aicpu_ready), sizeof(uint32_t));
                 }
-                while (true) {
-                    if (__atomic_load_n(&runtime->dist.done_count, __ATOMIC_ACQUIRE) >= num_workers) break;
-                    bool all_cond_done = true;
-                    for (int32_t i = 0; i < num_workers; i++) {
-                        const uint32_t physical_core_id = runtime->workers[i].physical_core_id;
-                        const uint64_t cond = read_reg(regs[physical_core_id], RegId::COND);
-                        const bool done = cond == MAKE_FIN_VALUE(0);
-                        all_cond_done = all_cond_done && done;
+                if (dispatch_dist_run) {
+                    while (true) {
+                        if (__atomic_load_n(&runtime->dist.done_count, __ATOMIC_ACQUIRE) >= num_workers) break;
+                        bool all_cond_done = true;
+                        for (int32_t i = 0; i < num_workers; i++) {
+                            const uint32_t physical_core_id = runtime->workers[i].physical_core_id;
+                            const uint64_t cond = read_reg(regs[physical_core_id], RegId::COND);
+                            const bool done = cond == MAKE_FIN_VALUE(0);
+                            all_cond_done = all_cond_done && done;
+                        }
+                        if (all_cond_done) {
+                            __atomic_store_n(&runtime->dist.done_count, num_workers, __ATOMIC_RELEASE);
+                            break;
+                        }
+                        SPIN_WAIT_HINT();
                     }
-                    if (all_cond_done) {
-                        __atomic_store_n(&runtime->dist.done_count, num_workers, __ATOMIC_RELEASE);
-                        break;
+                    if (submit_pmu_requested) {
+                        // 每个 worker 在发布 done 前已经 stop/read/flush 自己的
+                        // 64B 结果。所有 worker 完成后才恢复共享 PMU 配置。
+                        const int restore_rc = fdwic_submit_pmu_owner_restore(submit_pmu_header);
+                        if (restore_rc != 0) {
+                            // ownership bitmap 保留失败槽，允许一次幂等重试；
+                            // 即使重试恢复，首次失败也会留在 header，正式 raw
+                            // 仍被 host 拒绝。
+                            (void)fdwic_submit_pmu_owner_restore(submit_pmu_header);
+                            run_rc = -1;
+                        }
                     }
-                    SPIN_WAIT_HINT();
                 }
             }
             runtime_done_.store(true, std::memory_order_release);

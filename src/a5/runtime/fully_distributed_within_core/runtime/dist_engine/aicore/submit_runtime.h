@@ -351,6 +351,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_finish_kernel_tail(
     }
     TRACE_TIMESTAMP(submit_end);
     fdwic_perf_clock_submit_end(ctx.task_id);
+    fdwic_submit_pmu_submit_end(ctx.task_id);
     TRACE_SPAN_RECORD(
         submit_begin, submit_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Submit,
         static_cast<uint32_t>(ctx.won), 0
@@ -371,6 +372,7 @@ dist_submit_finish_alloc_tail(DistSubmitCtx &ctx, uint64_t completion_begin, uin
     // intentionally left as an offline Submit residual, not a fake phase.
     TRACE_TIMESTAMP(submit_end);
     fdwic_perf_clock_submit_end(ctx.task_id);
+    fdwic_submit_pmu_submit_end(ctx.task_id);
     TRACE_SPAN_RECORD(
         submit_begin, submit_end, ctx.self, ctx.task_id, -1, TracePhase::Submit,
         static_cast<uint32_t>(ctx.won), 1
@@ -486,6 +488,7 @@ dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &arg
     dist_submit_begin(nullptr, args, ctx);
     TRACE_TIMESTAMP(submit_begin);
     fdwic_perf_clock_submit_begin(ctx.task_id);
+    fdwic_submit_pmu_submit_begin(ctx.task_id);
     drain_block_won(ctx.self);
     drain_phase_b(ctx.self);
     TRACE_TIMESTAMP(efdrain_end);
@@ -509,6 +512,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
     dist_submit_begin(nullptr, args, ctx);
     TRACE_TIMESTAMP(submit_begin);
     fdwic_perf_clock_submit_begin(ctx.task_id);
+    fdwic_submit_pmu_submit_begin(ctx.task_id);
     drain_block_won(ctx.self);
     drain_phase_b(ctx.self);
     TRACE_TIMESTAMP(efdrain_end);
@@ -540,6 +544,7 @@ dist_submit_compete_first_begin(PTO2Runtime *, const MixedKernels &mixed) {
     dist_submit_begin(nullptr, ctx);
     TRACE_TIMESTAMP(submit_begin);
     fdwic_perf_clock_submit_begin(ctx.task_id);
+    fdwic_submit_pmu_submit_begin(ctx.task_id);
     drain_block_won(ctx.self);
     drain_phase_b(ctx.self);
     TRACE_TIMESTAMP(efdrain_end);
@@ -577,6 +582,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC DistCompeteFirstTicket dist_alloc_compete_first_be
     dist_submit_begin(nullptr, ctx);
     TRACE_TIMESTAMP(submit_begin);
     fdwic_perf_clock_submit_begin(ctx.task_id);
+    fdwic_submit_pmu_submit_begin(ctx.task_id);
     drain_block_won(ctx.self);
     drain_phase_b(ctx.self);
     TRACE_TIMESTAMP(efdrain_end);

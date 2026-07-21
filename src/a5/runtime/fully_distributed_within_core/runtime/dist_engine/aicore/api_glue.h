@@ -49,6 +49,12 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_perf_clock_expect_submits(uint32_t expec
 }
 #endif
 
+#if PTO_FDWIC_SUBMIT_PMU
+DIST_API_ATTR PTO_DEVICE_FUNC void dist_submit_pmu_expect_submits(uint32_t expected_submits) {
+    fdwic_submit_pmu_expect_submits(expected_submits);
+}
+#endif
+
 DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_dummy_impl(PTO2Runtime *, const L0TaskArgs &) {
     return TaskOutputTensors{};
 }

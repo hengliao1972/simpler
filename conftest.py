@@ -152,10 +152,11 @@ def pytest_addoption(parser):
     parser.addoption(
         "--fdwic-profile",
         action="store",
-        choices=["none", "perf-clock"],
+        choices=["none", "perf-clock", "submit-pmu-none"],
         default="none",
         help="Select a private fully_distributed_within_core evidence build. "
-        "perf-clock keeps only the first/last Submit device clock per core.",
+        "perf-clock keeps only the first/last Submit device clock per core; "
+        "submit-pmu-none keeps one full Submit-sequence scalar/I-cache PMU window per core.",
     )
     parser.addoption(
         "--use-example-exec-time",
@@ -444,22 +445,24 @@ def _configure_sanitizer(config):
 def _configure_fdwic_profile(config):
     """Validate and publish the private real-A5 FDWIC evidence profile."""
     fdwic_profile = config.getoption("--fdwic-profile", default="none")
-    if fdwic_profile != "perf-clock":
+    if fdwic_profile == "none":
         os.environ.pop("PTO_FDWIC_PROFILE", None)
         return
+    if fdwic_profile not in {"perf-clock", "submit-pmu-none"}:
+        raise pytest.UsageError(f"unsupported --fdwic-profile {fdwic_profile!r}")
 
     platform = config.getoption("--platform", default=None)
     runtime = config.getoption("--runtime", default=None)
     level = config.getoption("--level", default=None)
     if platform != "a5":
-        raise pytest.UsageError("--fdwic-profile perf-clock requires --platform a5")
+        raise pytest.UsageError(f"--fdwic-profile {fdwic_profile} requires --platform a5")
     if runtime not in {None, "fully_distributed_within_core"}:
-        raise pytest.UsageError("--fdwic-profile perf-clock only supports runtime fully_distributed_within_core")
+        raise pytest.UsageError(f"--fdwic-profile {fdwic_profile} only supports runtime fully_distributed_within_core")
     if level not in {None, 2}:
-        raise pytest.UsageError("--fdwic-profile perf-clock only supports SceneTest level 2")
+        raise pytest.UsageError(f"--fdwic-profile {fdwic_profile} only supports SceneTest level 2")
     if config.getoption("--rounds", default=1) != 1:
         raise pytest.UsageError(
-            "--fdwic-profile perf-clock requires --rounds 1 because its per-case artifact is single-run"
+            f"--fdwic-profile {fdwic_profile} requires --rounds 1 because its per-case artifact is single-run"
         )
     conflicting = []
     for option, label in (
@@ -476,9 +479,9 @@ def _configure_fdwic_profile(config):
             conflicting.append(label)
     if conflicting:
         raise pytest.UsageError(
-            "--fdwic-profile perf-clock must run without other diagnostics: " + ", ".join(conflicting)
+            f"--fdwic-profile {fdwic_profile} must run without other diagnostics: " + ", ".join(conflicting)
         )
-    os.environ["PTO_FDWIC_PROFILE"] = "perf-clock"
+    os.environ["PTO_FDWIC_PROFILE"] = fdwic_profile
 
 
 def pytest_configure(config):
@@ -662,7 +665,8 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
 
     items.sort(key=sort_key)
 
-    if config.getoption("--fdwic-profile", default="none") == "perf-clock":
+    fdwic_profile = config.getoption("--fdwic-profile", default="none")
+    if fdwic_profile in {"perf-clock", "submit-pmu-none"}:
         incompatible = []
         for item in items:
             if any(m.name == "skip" for m in item.iter_markers()):
@@ -679,7 +683,7 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
             sample = ", ".join(incompatible[:3])
             more = "" if len(incompatible) <= 3 else f" (+{len(incompatible) - 3} more)"
             raise pytest.UsageError(
-                "--fdwic-profile perf-clock only accepts level-2 fully_distributed_within_core tests; "
+                f"--fdwic-profile {fdwic_profile} only accepts level-2 fully_distributed_within_core tests; "
                 f"incompatible item(s): {sample}{more}"
             )
 

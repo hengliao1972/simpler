@@ -58,6 +58,7 @@
 constexpr uint32_t AICPU_READY_NONE = 0;
 constexpr uint32_t AICPU_READY_HANDSHAKE = 1;
 constexpr uint32_t AICPU_READY_DIST_RUN = 2;
+constexpr uint32_t AICPU_READY_DIST_ABORT = 3;
 
 /**
  * Handshake Structure - Shared between Host, AICPU, and AICore
@@ -70,6 +71,7 @@ constexpr uint32_t AICPU_READY_DIST_RUN = 2;
  * 2. Acknowledgment: AICore sets aicore_done=core_id+1
  * 3. Dist Run: AICPU sets aicpu_ready=AICPU_READY_DIST_RUN after publishing
  *    shared runtime state
+ *    (or AICPU_READY_DIST_ABORT when a cold-path diagnostic setup failed)
  * 4. Task Completion: AICore writes FIN to COND; AICPU observes completion
  * 5. Shutdown: AICPU sets control=1, AICore exits
  *

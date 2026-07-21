@@ -44,13 +44,25 @@ _aicore_override_cache: dict[tuple[Any, ...], Path] = {}
 _FDWIC_PROFILE_ENV = "PTO_FDWIC_PROFILE"
 _FDWIC_PROFILE_NONE = "none"
 _FDWIC_PROFILE_PERF_CLOCK = "perf-clock"
+_FDWIC_PROFILE_SUBMIT_PMU_NONE = "submit-pmu-none"
+_FDWIC_PRIVATE_PROFILES = frozenset({_FDWIC_PROFILE_PERF_CLOCK, _FDWIC_PROFILE_SUBMIT_PMU_NONE})
+_FDWIC_PROFILES = frozenset({_FDWIC_PROFILE_NONE, _FDWIC_PROFILE_PERF_CLOCK, _FDWIC_PROFILE_SUBMIT_PMU_NONE})
 
 
 def _fdwic_profile() -> str:
     profile = os.environ.get(_FDWIC_PROFILE_ENV, _FDWIC_PROFILE_NONE) or _FDWIC_PROFILE_NONE
-    if profile not in {_FDWIC_PROFILE_NONE, _FDWIC_PROFILE_PERF_CLOCK}:
+    if profile not in _FDWIC_PROFILES:
         raise ValueError(f"Unsupported {_FDWIC_PROFILE_ENV}={profile!r}")
     return profile
+
+
+def _fdwic_compile_definitions(profile: str) -> list[str] | None:
+    """Return the ABI-preserving compile gates for one private FDWIC image."""
+    if profile == _FDWIC_PROFILE_PERF_CLOCK:
+        return ["PTO_FDWIC_PERF_CLOCK=1", "PTO_FDWIC_TRACE_ENABLED=0"]
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_NONE:
+        return ["PTO_FDWIC_SUBMIT_PMU=1", "PTO_FDWIC_TRACE_ENABLED=0"]
+    return None
 
 
 def _profiled_cache_key(cache_key) -> tuple[Any, ...]:
@@ -179,6 +191,11 @@ def _assert_fdwic_perf_clock_elf(binary: Path) -> None:
         "get_aicore_pmu_ring",
         "set_aicore_pmu_reg_base",
         "get_aicore_pmu_reg_base",
+        "dist_submit_pmu_expect_submits",
+        "fdwic_submit_pmu_read_counters",
+        "set_fdwic_submit_pmu_reg_base",
+        "get_fdwic_submit_pmu_reg_base",
+        "g_fdwic_submit_pmu_",
     )
     missing = [
         symbol
@@ -195,11 +212,56 @@ def _assert_fdwic_perf_clock_elf(binary: Path) -> None:
         raise RuntimeError(f"Invalid perf-clock AICore image {binary}: {'; '.join(details)}")
 
 
+def _assert_fdwic_submit_pmu_elf(binary: Path) -> None:
+    """Prove submit-pmu-none keeps only its whole-window PMU observer."""
+    symbol_rows = _fdwic_elf_symbol_rows(binary)
+
+    required = ("dist_submit_pmu_expect_submits", "fdwic_submit_pmu_read_counters")
+    forbidden = (
+        "dist_perf_clock_expect_submits",
+        "g_fdwic_perf_clock_",
+        "fdwic_atomic_poll_boundary_slow",
+        "fdwic_swimlane_detail_record_atomic",
+        "g_fdwic_swimlane_",
+        "g_fdwic_atomic_",
+        "g_fdwic_poll_",
+        "set_aicore_profiling_flag",
+        "get_aicore_profiling_flag",
+        "set_l2_swimlane_aicore_head_slot",
+        "get_l2_swimlane_aicore_head",
+        "set_aicore_pmu_ring",
+        "get_aicore_pmu_ring",
+        "set_aicore_pmu_reg_base",
+        "get_aicore_pmu_reg_base",
+        "pmu_aicore_record_task",
+    )
+    missing = [
+        symbol
+        for symbol in required
+        if not any(kind == "FUNC" and ndx != "UND" and symbol in name for kind, ndx, name in symbol_rows)
+    ]
+    present = [symbol for symbol in forbidden if any(symbol in name for _kind, _ndx, name in symbol_rows)]
+    if missing or present:
+        details = []
+        if missing:
+            details.append(f"missing defined submit-pmu marker(s): {', '.join(missing)}")
+        if present:
+            details.append(f"unrelated profiling symbol(s) still present: {', '.join(present)}")
+        raise RuntimeError(f"Invalid submit-pmu-none AICore image {binary}: {'; '.join(details)}")
+
+
 def _assert_fdwic_swimlane_elf(binary: Path) -> None:
     """Prove the normal real-A5 FDWIC image carries the merged phase/atomic observer."""
     symbol_rows = _fdwic_elf_symbol_rows(binary)
     required = ("fdwic_atomic_poll_boundary_slow", "fdwic_swimlane_detail_record_atomic")
-    forbidden = ("dist_perf_clock_expect_submits",)
+    forbidden = (
+        "dist_perf_clock_expect_submits",
+        "dist_submit_pmu_expect_submits",
+        "fdwic_submit_pmu_read_counters",
+        "set_fdwic_submit_pmu_reg_base",
+        "get_fdwic_submit_pmu_reg_base",
+        "g_fdwic_submit_pmu_",
+    )
     missing = [
         symbol
         for symbol in required
@@ -211,7 +273,7 @@ def _assert_fdwic_swimlane_elf(binary: Path) -> None:
         if missing:
             details.append(f"missing defined swimlane observer(s): {', '.join(missing)}")
         if present:
-            details.append(f"perf-clock symbol(s) leaked into normal image: {', '.join(present)}")
+            details.append(f"private-profile symbol(s) leaked into normal image: {', '.join(present)}")
         raise RuntimeError(f"Invalid FDWIC swimlane AICore image {binary}: {'; '.join(details)}")
 
 
@@ -224,10 +286,8 @@ def maybe_build_aicore_override(
     pto_isa_root: str | None = None,
 ) -> Path | None:
     profile = _fdwic_profile()
-    if profile == _FDWIC_PROFILE_PERF_CLOCK and (
-        platform != "a5" or runtime != "fully_distributed_within_core"
-    ):
-        raise ValueError("perf-clock is only supported by the real a5 fully_distributed_within_core runtime")
+    if profile in _FDWIC_PRIVATE_PROFILES and (platform != "a5" or runtime != "fully_distributed_within_core"):
+        raise ValueError(f"{profile} is only supported by the real a5 fully_distributed_within_core runtime")
     if platform not in {"a5", "a5sim"} or runtime != "fully_distributed_within_core":
         return None
 
@@ -241,13 +301,10 @@ def maybe_build_aicore_override(
         if wrapper_path is not None:
             source_paths.append(wrapper_path)
     key = _aicore_extra_cache_key(cache_key, source_paths)
-    compile_definitions = None
-    if profile == _FDWIC_PROFILE_PERF_CLOCK:
-        # Keep PTO2_PROFILING at its normal value because it also owns the
-        # public Arg layout. PTO_FDWIC_PERF_CLOCK independently removes the
-        # dist swimlane/atomic path and the platform PMU state without changing
-        # the orchestration/incore ABI.
-        compile_definitions = ["PTO_FDWIC_PERF_CLOCK=1", "PTO_FDWIC_TRACE_ENABLED=0"]
+    # Keep PTO2_PROFILING at its normal value because it also owns the public
+    # Arg layout. Each private profile independently removes the dist
+    # swimlane/atomic path without changing orchestration/incore ABI.
+    compile_definitions = _fdwic_compile_definitions(profile)
     builder = RuntimeBuilder(platform)
     binary = builder.build_aicore_with_extra_sources(
         runtime,
@@ -258,6 +315,8 @@ def maybe_build_aicore_override(
     )
     if profile == _FDWIC_PROFILE_PERF_CLOCK:
         _assert_fdwic_perf_clock_elf(binary)
+    elif profile == _FDWIC_PROFILE_SUBMIT_PMU_NONE:
+        _assert_fdwic_submit_pmu_elf(binary)
     elif platform == "a5" and runtime == "fully_distributed_within_core":
         _assert_fdwic_swimlane_elf(binary)
     return binary
@@ -1114,6 +1173,24 @@ def _plot_case_scope_stats(case_label: str, output_prefix: Path) -> None:
         sys.path.remove(str(tools_dir))
 
 
+def _render_case_fdwic_submit_pmu(case_label: str, output_prefix: Path) -> Path:
+    """Strictly validate the real-PA Submit-PMU raw and publish its HTML."""
+    from .tools.fdwic_submit_pmu_report import (  # noqa: PLC0415
+        DEFAULT_INPUT_NAME,
+        DEFAULT_OUTPUT_NAME,
+        write_report,
+    )
+
+    raw = output_prefix / DEFAULT_INPUT_NAME
+    if not raw.is_file() or raw.stat().st_size == 0:
+        raise RuntimeError(f"[{case_label}] submit-pmu-none did not publish a non-empty {raw}")
+    report = output_prefix / DEFAULT_OUTPUT_NAME
+    write_report(raw, report)
+    if not report.is_file() or report.stat().st_size == 0:
+        raise RuntimeError(f"[{case_label}] submit-pmu-none did not publish a non-empty {report}")
+    return report
+
+
 def _format_case_context(cls_name: str, case: dict, worker) -> str:
     platform = worker._config.get("platform", "<unknown>")
     config = case.get("config", {})
@@ -1146,14 +1223,15 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     """
     cls_name = type(cls_inst).__name__
     callable_spec = getattr(type(cls_inst), "CALLABLE", None)
-    perf_clock_on = _fdwic_profile() == _FDWIC_PROFILE_PERF_CLOCK
+    fdwic_profile = _fdwic_profile()
+    private_profile_on = fdwic_profile in _FDWIC_PRIVATE_PROFILES
     diagnostics_on = (
         enable_l2_swimlane
         or enable_dump_args
         or enable_pmu
         or enable_dep_gen
         or enable_scope_stats
-        or perf_clock_on
+        or private_profile_on
     )
     # device-log timing wraps each case here (not inside _run_and_validate*),
     # the same way swimlane conversion does — _run_and_validate_l2 is overridden
@@ -1219,6 +1297,8 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 _graph_case_dep_gen(case_label, prefix, callable_spec=callable_spec)
             if enable_scope_stats:
                 _plot_case_scope_stats(case_label, prefix)
+            if case_succeeded and fdwic_profile == _FDWIC_PROFILE_SUBMIT_PMU_NONE:
+                _render_case_fdwic_submit_pmu(case_label, prefix)
             if dlt_baseline is not None:
                 _print_device_log_timing(dlt_device_id, dlt_baseline, dlt_offsets, rounds)
 

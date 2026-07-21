@@ -2,15 +2,13 @@
 
 ## 1. 目标与最终构建口径
 
-本指南的命令和数据格式面向
-`tests/atomic_probe/pa_scheduler`
-的 standalone CCEC 分支；其中关于独立诊断构建、代码布局污染和冷路径外提的原则，
-也适用于 simpler 真实 FDWIC PA。目标是回答：在 Submit-all 整个调度回放期，32 个 AIC
-和 64 个 AIV 每核发生了多少 I-cache request/miss，其中哪些 miss
-值得继续优化。它不依赖 simpler 生产代码，也不将 standalone 结果
-冒充为真实 PA 的绝对 profile。
+本指南同时记录真实 simpler FDWIC PA 与
+`tests/atomic_probe/pa_scheduler` standalone CCEC 的 I-cache 观察方法。目标是回答：
+在 Submit-all 整个调度回放期，32 个 AIC 和 64 个 AIV 每核发生了多少 I-cache
+request/miss，其中哪些 miss 值得继续优化。真实 PA 结论以真实 PA 独立诊断 ELF 为准；
+standalone 只保留历史方法、接口校准和模型边界证据，不能替代真实 PA profile。
 
-当前最终只保留两类正式观察构建：
+standalone 当前保留两类正式观察构建：
 
 | 构建 | 内容 | 是否包含 PMU |
 | --- | --- | --- |
@@ -19,6 +17,55 @@
 
 `run` 、`smoke` 和 phase 名是运行或编译选择，不是额外的第三类
 构建。
+
+### 1.1 真实 PA `submit-pmu-none`
+
+真实 PA 已建立第三条独立证据链 `--fdwic-profile submit-pmu-none`。它不是
+standalone 的 `submit-pmu` 产物，也不与泳道 ELF 共用 I-cache 结论：
+
+- 编译期固定 `PTO_FDWIC_TRACE_ENABLED=0`，去除普通泳道和逐 atomic 观察；
+- 去除通用逐 task PMU ring，只保留每核首个 Submit 到末个 Submit 的一次 gate；
+- CNT2 采集 scalar busy，CNT6/CNT7 采集 primary request/miss，CNT8/CNT5 做
+  逐核 shadow 复核；
+- AICPU owner 在 96 个物理子核上保存、配置、读回并恢复 PMU 寄存器；
+- host 只有在 32 AIC、64 AIV、96 个唯一物理 ID、32 个 1:2 mixed triplet、
+  每核实际 Submit 数与 orchestration 声明值一致（Case1 为 1280、B1 为 5）、
+  主影子一致和 Restore 96/96 全部闭合时才发布正式 raw；
+- 固定输出 `fdwic_submit_pmu_raw.json` 和 `fdwic_submit_pmu_report.html`，先写临时文件
+  再原子替换正式文件。
+
+真实 Case1/B256 命令为：
+
+```bash
+source /home/q00473782/Ascend/cann-9.1.0-weekly-20260708/cann/set_env.sh
+source /home/q00473782/.venv/bin/activate
+export PTO_ISA_ROOT=/home/q00473782/atomic/private/gpt/pto-isa-ddafa
+export PYTHONPATH="$PWD:$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
+
+python -m pytest \
+  examples/a5/fully_distributed_within_core/paged_attention_unroll/test_paged_attention_unroll.py \
+  --platform a5 --runtime fully_distributed_within_core --level 2 \
+  --case Case1 --manual include --fdwic-profile submit-pmu-none \
+  --rounds 1 -s -v
+```
+
+2026-07-21 的正式产物位于：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260721_003335/
+  fdwic_submit_pmu_raw.json       46,274 B
+  fdwic_submit_pmu_report.html    76,933 B
+```
+
+该轮全局 Submit 为 **5,075.360 us**。AIC/AIV 的 request/core mean 分别为
+646,963.94/594,542.61，miss/core mean 分别为 1,196.88/16,943.17，聚合 miss 率
+分别为 0.1850%/2.8498%。PMU total、scalar busy、request、miss 都是同一 ELF、
+同一物理核、同一首末 Submit 窗口的数据；仍不能把 `miss * 90 ns` 当作可直接消除的
+跨核墙钟损失。
+
+当前真实 PA 只完成 `none` 全窗，真实 span 单阶段 PMU 尚未实现。后续 selector
+必须跟随真实泳道的排他 span，一次 ELF 只测一个区域，并保留该 ELF 自己的完整
+Submit primary 作为比例分母。
 
 ## 2. 为什么 I-cache miss 必须独立重编译
 

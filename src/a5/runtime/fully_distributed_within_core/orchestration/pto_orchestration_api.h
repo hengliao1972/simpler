@@ -122,6 +122,8 @@ PTO_DEVICE_FUNC inline bool rt_is_fatal() { return dist_is_fatal_query(); }
 PTO_DEVICE_FUNC inline void rt_perf_clock_expect_submits(uint32_t expected_submits) {
 #if PTO_FDWIC_PERF_CLOCK
     dist_perf_clock_expect_submits(expected_submits);
+#elif PTO_FDWIC_SUBMIT_PMU
+    dist_submit_pmu_expect_submits(expected_submits);
 #else
     (void)expected_submits;
 #endif

@@ -17,6 +17,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
     if (self == nullptr) return;
     g_fdwic_joint_submit_seen = false;
     fdwic_perf_clock_attach(runtime, self);
+    fdwic_submit_pmu_attach(runtime, self);
     fdwic_swimlane_attach(runtime);
     trace_reset_core(self);
 
@@ -51,5 +52,6 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
     fdwic_swimlane_record_clock_baselines(self, core_idx);
     TRACE_FLUSH_CORE(self);
     fdwic_perf_clock_flush(self);
+    fdwic_submit_pmu_flush(self);
     dist_aicore_finish_worker(runtime);
 }

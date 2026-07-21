@@ -12,6 +12,7 @@
 #pragma once
 
 #include "dist_engine/common/target.h"
+#include "dist_engine/common/submit_pmu_types.h"
 #include "dist_engine/common/swimlane_types.h"
 
 // g_dist / g_self storage. The AICPU build owns the BSS DistGlobal and
@@ -48,6 +49,22 @@
 [[block_local]] static uint64_t g_fdwic_perf_clock_last_submit;
 [[block_local]] static uint32_t g_fdwic_perf_clock_expected_submits;
 #endif
+#if PTO_FDWIC_SUBMIT_PMU
+[[block_local]] static __gm__ FdwicSubmitPmuCoreData *g_fdwic_submit_pmu_core;
+[[block_local]] static uint64_t g_fdwic_submit_pmu_reg_base;
+[[block_local]] static uint64_t g_fdwic_submit_pmu_start_tick;
+[[block_local]] static uint64_t g_fdwic_submit_pmu_end_tick;
+[[block_local]] static uint64_t g_fdwic_submit_pmu_total_cycles;
+[[block_local]] static uint32_t g_fdwic_submit_pmu_scalar_busy;
+[[block_local]] static uint32_t g_fdwic_submit_pmu_icache_requests;
+[[block_local]] static uint32_t g_fdwic_submit_pmu_icache_misses;
+[[block_local]] static uint32_t g_fdwic_submit_pmu_shadow_requests;
+[[block_local]] static uint32_t g_fdwic_submit_pmu_shadow_misses;
+[[block_local]] static uint32_t g_fdwic_submit_pmu_expected_submits;
+[[block_local]] static uint32_t g_fdwic_submit_pmu_status;
+[[block_local]] static bool g_fdwic_submit_pmu_started;
+[[block_local]] static bool g_fdwic_submit_pmu_stopped;
+#endif
 #define g_dist (*g_dist_ptr)
 #elif defined(__CPU_SIM)
 static DistGlobal g_dist_fallback;
@@ -72,6 +89,22 @@ thread_local uint64_t g_fdwic_perf_clock_first_submit = 0;
 thread_local uint64_t g_fdwic_perf_clock_last_submit = 0;
 thread_local uint32_t g_fdwic_perf_clock_expected_submits = 0;
 #endif
+#if PTO_FDWIC_SUBMIT_PMU
+thread_local FdwicSubmitPmuCoreData *g_fdwic_submit_pmu_core = nullptr;
+thread_local uint64_t g_fdwic_submit_pmu_reg_base = 0;
+thread_local uint64_t g_fdwic_submit_pmu_start_tick = 0;
+thread_local uint64_t g_fdwic_submit_pmu_end_tick = 0;
+thread_local uint64_t g_fdwic_submit_pmu_total_cycles = 0;
+thread_local uint32_t g_fdwic_submit_pmu_scalar_busy = 0;
+thread_local uint32_t g_fdwic_submit_pmu_icache_requests = 0;
+thread_local uint32_t g_fdwic_submit_pmu_icache_misses = 0;
+thread_local uint32_t g_fdwic_submit_pmu_shadow_requests = 0;
+thread_local uint32_t g_fdwic_submit_pmu_shadow_misses = 0;
+thread_local uint32_t g_fdwic_submit_pmu_expected_submits = 0;
+thread_local uint32_t g_fdwic_submit_pmu_status = 0;
+thread_local bool g_fdwic_submit_pmu_started = false;
+thread_local bool g_fdwic_submit_pmu_stopped = false;
+#endif
 #define g_dist (*g_dist_ptr)
 #else
 static DistGlobal g_dist_fallback;
@@ -95,6 +128,22 @@ thread_local FdwicSwimlaneCoreState *g_fdwic_perf_clock_core = nullptr;
 thread_local uint64_t g_fdwic_perf_clock_first_submit = 0;
 thread_local uint64_t g_fdwic_perf_clock_last_submit = 0;
 thread_local uint32_t g_fdwic_perf_clock_expected_submits = 0;
+#endif
+#if PTO_FDWIC_SUBMIT_PMU
+thread_local FdwicSubmitPmuCoreData *g_fdwic_submit_pmu_core = nullptr;
+thread_local uint64_t g_fdwic_submit_pmu_reg_base = 0;
+thread_local uint64_t g_fdwic_submit_pmu_start_tick = 0;
+thread_local uint64_t g_fdwic_submit_pmu_end_tick = 0;
+thread_local uint64_t g_fdwic_submit_pmu_total_cycles = 0;
+thread_local uint32_t g_fdwic_submit_pmu_scalar_busy = 0;
+thread_local uint32_t g_fdwic_submit_pmu_icache_requests = 0;
+thread_local uint32_t g_fdwic_submit_pmu_icache_misses = 0;
+thread_local uint32_t g_fdwic_submit_pmu_shadow_requests = 0;
+thread_local uint32_t g_fdwic_submit_pmu_shadow_misses = 0;
+thread_local uint32_t g_fdwic_submit_pmu_expected_submits = 0;
+thread_local uint32_t g_fdwic_submit_pmu_status = 0;
+thread_local bool g_fdwic_submit_pmu_started = false;
+thread_local bool g_fdwic_submit_pmu_stopped = false;
 #endif
 #define g_dist (*g_dist_ptr)
 #endif

@@ -104,11 +104,14 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // task claim/build/execute, and completion flag publication internally;
     // there is no per-task register handshake.
     // ===========================================================================
-    while (my_hank->aicpu_ready != AICPU_READY_DIST_RUN) {
+    while (my_hank->aicpu_ready != AICPU_READY_DIST_RUN &&
+           my_hank->aicpu_ready != AICPU_READY_DIST_ABORT) {
         dcci(my_hank, SINGLE_CACHE_LINE);
         SPIN_WAIT_HINT();
     }
-    dist_core_main(runtime, s_block_idx, static_cast<int>(core_type));
+    if (my_hank->aicpu_ready == AICPU_READY_DIST_RUN) {
+        dist_core_main(runtime, s_block_idx, static_cast<int>(core_type));
+    }
     // Teardown: wait for the AICPU EXIT signal on DATA_MAIN_BASE and ack.
     while (true) {
         uint32_t reg_val = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
