@@ -73,6 +73,8 @@ PTO_DEVICE_FUNC void dist_tensor_map_advance_retire(__gm__ DistTensorMap &self, 
     }
     for (int32_t id = self.cleaned_upto; id < new_floor; id++) {
         int32_t cur = self.task_heads[id & kTaskWindowMask];
+        // Empty heads are already normalized; avoid writing -1 back to GM.
+        if (cur == -1) continue;
         while (cur >= 0) {
             const int32_t nxt = self.entries[cur].next_in_task;
             debug_assert(self.entries[cur].producer == id);
