@@ -3789,3 +3789,69 @@ provenance 与 EfDrain-control 的 B1/Case1 已完成。不得恢复逐 Submit/�
 交错 A/B 决定保留或撤销。
 单阶段 observed 不机械扣除 empty，也不从单轮 I-cache 数直接提出生产优化；
 standalone 的绝对数继续不替代真实 PA 当前结果。
+
+### 2026-07-21 / P1：BlockWon 慢路冷外提
+
+状态：**[已撤回]**
+
+#### 目标与观察前提
+
+本阶段先复核现有 I-cache 观察覆盖，再验证一个不改变 BlockWon 协议的代码布局
+候选。最新真实 PA 排他泳道
+`outputs/TestPagedAttentionUnroll_Case1_20260721_053003/` 中，五个 Submit 内业务
+selector 已覆盖 SubmitUnion 的 75.4379%；扣除 EfDrain 内真实 Kernel 后，约覆盖
+82.02% 的 Scalar/control core-work。尚未直接覆盖的最大纯 Scalar 区域是
+PrepareMap（6.1493%）。当前完整 Submit、六个业务 selector、empty-bracket、
+primary/shadow、96 核 AIC/AIV raw、构建 provenance 和 HTML 已闭合，因而不为本
+候选继续增加设备字段或 selector；PrepareMap 只在后续候选明确落入该区时按需补齐。
+
+Case1 是单 lane 图，权威泳道中 `DrainWon=0`，但 `drain_block_won()` 仍从
+EfDrain、kernel loser replay 和背压路径被高频调用。候选只把
+`g_fdwic_joint_submit_seen` 门闩保留在 inline wrapper，把原 BlockWon 扫描原样放入
+`noinline` 冷函数；不删除 joint 路径，不改变 atomic、slot、fanin、完成发布或
+FinalDrain 语义。
+
+#### 正确性与布局证据
+
+候选真实 A5 B1 位于
+`outputs/TestPagedAttentionUnroll_CaseB1_20260721_121714/`，golden 通过，96 核
+均为 5 次 Submit，完整 Submit 为 80.746 us。该轮只作结构门禁，不进入 Case1
+性能统计。
+
+同一 perf-clock 构建下，候选确实形成独立
+`drain_block_won_joint_slow()` 符号，布局变化如下：
+
+| 对象 | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| AIC combined `.text` | 59,288 B | 52,960 B | -6,328 B |
+| AIV combined `.text` | 73,296 B | 66,896 B | -6,400 B |
+| AIC combined whole | 1,773,136 B | 1,659,096 B | -114,040 B |
+| AIV combined whole | 2,032,584 B | 1,919,512 B | -113,072 B |
+| final `aicore_kernel.o` | 2,469,600 B | 2,358,784 B | -110,816 B |
+
+这只证明冷外提减少了热调用方的重复代码，不能自动推出 I-cache 或墙钟收益。
+
+#### perf-clock 五对交错 A/B
+
+基线 A 与候选 B 均使用独立 pytest 进程、`Case1 --fdwic-profile perf-clock
+--rounds 1 --skip-golden`。候选预热
+`outputs/TestPagedAttentionUnroll_Case1_20260721_121858/` 明确排除。正式五对为：
+
+| 对次 | A 基线产物 | A/us | B 候选产物 | B/us | B-A/us |
+| ---: | --- | ---: | --- | ---: | ---: |
+| 1 | `..._122032` | 4,883.659 | `..._122151` | 4,460.575 | -423.084 |
+| 2 | `..._122319` | 4,886.473 | `..._122439` | 5,299.185 | +412.712 |
+| 3 | `..._122611` | 4,488.058 | `..._122732` | 4,489.416 | +1.358 |
+| 4 | `..._122905` | 4,553.267 | `..._123040` | 5,117.292 | +564.025 |
+| 5 | `..._123229` | 6,139.517 | `..._123345` | 5,377.480 | -762.037 |
+
+A/B 组中位数分别为 4,883.659/5,117.292 us；逐对差值中位数为
+**+1.358 us（+0.0278%）**，候选 2 对更快、3 对更慢。布局缩小没有稳定兑现成
+完整 Submit 收益，结果仍被已知的多数核共同伸缩波动覆盖。
+
+#### 决定
+
+候选业务代码完整撤回，不以“ELF 更小”替代 perf-clock 结论，也不为证明预期收益
+继续扩样。保留本节负结果，避免后续重复进行相同的 BlockWon 冷外提。下一候选仍
+只改一个已由源码证明的 Scalar 冗余，并继续由完整 Submit perf-clock A/B 决定
+保留或撤销。
