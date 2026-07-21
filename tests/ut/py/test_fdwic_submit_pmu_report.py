@@ -26,6 +26,7 @@ from simpler_setup.tools.fdwic_submit_pmu_report import (
     EMPTY_BRACKET_CAPTURE_MODE,
     MATERIALIZE_CAPTURE_MODE,
     PHASE_REQUIRED_STATUS_MASK,
+    REGISTER_CAPTURE_MODE,
     REQUIRED_STATUS_MASK,
     load_capture,
     render_report,
@@ -293,6 +294,26 @@ def _valid_claim_capture() -> dict[str, Any]:
     return capture
 
 
+def _valid_register_capture() -> dict[str, Any]:
+    capture = _valid_arg_build_capture()
+    capture["capture"]["mode"] = REGISTER_CAPTURE_MODE
+    capture["configuration"]["phase"] = {
+        "id": 5,
+        "name": "register",
+        "boundary": "register_outputs_call_entry_to_return",
+        "expected_calls_per_core": 5,
+        "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+        "counter_semantics": "running_read_clear_observed_bracket",
+        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+    }
+    for logical_core_id, record in enumerate(capture["records"]):
+        record["phase_id"] = 5
+        record["phase_elapsed_ticks"] = 400 + logical_core_id
+        record["phase_icache_requests_observed"] = 150 + logical_core_id
+        record["phase_icache_misses_observed"] = 15 + logical_core_id % 5
+    return capture
+
+
 def _write_capture(directory: Path, capture: dict[str, Any]) -> Path:
     path = directory / DEFAULT_INPUT_NAME
     path.write_text(json.dumps(capture, indent=2), encoding="utf-8")
@@ -481,6 +502,49 @@ def test_claim_rejects_wrong_record_phase_id(tmp_path: Path) -> None:
     capture["records"][0]["phase_id"] = 3
 
     with pytest.raises(ValueError, match=r"records\[0\]\.phase_id must equal 4"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_valid_register_capture_tracks_call_body_boundary(tmp_path: Path) -> None:
+    raw_path = _write_capture(tmp_path, _valid_register_capture())
+
+    capture = load_capture(raw_path)
+
+    assert capture.phase_summary is not None
+    assert capture.phase_summary["all"]["phase_begin_reads"] == 96 * 5
+    document = render_report(raw_path)
+    assert document.index("<code>register</code> 阶段观察") < document.index("全局 Submit 时间范围")
+    assert "phase_id=5" in document
+    assert "register_outputs_call_entry_to_return" in document
+    assert "running_read_clear_observed_bracket" in document
+    assert "inner_sys_cnt_between_boundary_observers" in document
+    assert "观察器自成本量尺，不是业务 phase" not in document
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("id", 4),
+        ("name", "claim"),
+        ("boundary", "claim_begin_to_claim_end"),
+        ("expected_calls_per_core", 4),
+        ("counter_semantics", "running_read_clear_empty_bracket_calibration"),
+        ("time_semantics", "outer_sys_cnt_around_adjacent_begin_end_pair"),
+    ),
+)
+def test_register_rejects_mismatched_phase_configuration(tmp_path: Path, field: str, value: Any) -> None:
+    capture = _valid_register_capture()
+    capture["configuration"]["phase"][field] = value
+
+    with pytest.raises(ValueError, match=r"configuration\.phase"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_register_rejects_wrong_record_phase_id(tmp_path: Path) -> None:
+    capture = _valid_register_capture()
+    capture["records"][0]["phase_id"] = 4
+
+    with pytest.raises(ValueError, match=r"records\[0\]\.phase_id must equal 5"):
         load_capture(_write_capture(tmp_path, capture))
 
 

@@ -58,6 +58,9 @@ constexpr SubmitPmuProfile kSubmitPmuProfiles[] = {
      "running_read_clear_observed_bracket", "inner_sys_cnt_between_boundary_observers"},
     {"submit-pmu-claim", kFdwicSubmitPmuModeClaim, FdwicSubmitPmuPhase::Claim, kFdwicSubmitPmuPhaseBytes, "claim",
      "claim_begin_to_claim_end", "running_read_clear_observed_bracket", "inner_sys_cnt_between_boundary_observers"},
+    {"submit-pmu-register", kFdwicSubmitPmuModeRegister, FdwicSubmitPmuPhase::Register, kFdwicSubmitPmuPhaseBytes,
+     "register", "register_outputs_call_entry_to_return", "running_read_clear_observed_bracket",
+     "inner_sys_cnt_between_boundary_observers"},
 };
 
 const SubmitPmuProfile *requested_profile() {

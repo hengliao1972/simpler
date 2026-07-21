@@ -43,10 +43,12 @@ ARG_BUILD_CAPTURE_MODE = "submit-pmu-arg-build"
 EMPTY_BRACKET_CAPTURE_MODE = "submit-pmu-empty-bracket"
 MATERIALIZE_CAPTURE_MODE = "submit-pmu-materialize"
 CLAIM_CAPTURE_MODE = "submit-pmu-claim"
+REGISTER_CAPTURE_MODE = "submit-pmu-register"
 ARG_BUILD_PHASE_ID = 1
 EMPTY_BRACKET_PHASE_ID = 2
 MATERIALIZE_PHASE_ID = 3
 CLAIM_PHASE_ID = 4
+REGISTER_PHASE_ID = 5
 PHASE_CONFIG_BY_MODE = {
     ARG_BUILD_CAPTURE_MODE: {
         "id": ARG_BUILD_PHASE_ID,
@@ -76,6 +78,14 @@ PHASE_CONFIG_BY_MODE = {
         "id": CLAIM_PHASE_ID,
         "name": "claim",
         "boundary": "claim_begin_to_claim_end",
+        "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+        "counter_semantics": "running_read_clear_observed_bracket",
+        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+    },
+    REGISTER_CAPTURE_MODE: {
+        "id": REGISTER_PHASE_ID,
+        "name": "register",
+        "boundary": "register_outputs_call_entry_to_return",
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_observed_bracket",
         "time_semantics": "inner_sys_cnt_between_boundary_observers",

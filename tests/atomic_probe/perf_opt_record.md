@@ -164,7 +164,8 @@ outputs/TestPagedAttentionUnroll_Case1_20260717_023809/
 | 2026-07-21 | `2a7dccee` | 观察工具 | 建立真实 PA `arg-build` 单阶段 PMU |
 | 2026-07-21 | `81a1f382` | 观察工具 | 量化真实 PA running bracket 的空区间观察指纹 |
 | 2026-07-21 | `26cbece6` | 观察工具 | 建立真实 PA `materialize` 单阶段 PMU |
-| 2026-07-21 | 本阶段提交 | 观察工具 | 建立真实 PA `claim` 单阶段 PMU |
+| 2026-07-21 | `d96f5a5a` | 观察工具 | 建立真实 PA `claim` 单阶段 PMU |
+| 2026-07-21 | 本阶段提交 | 观察工具 | 建立真实 PA `register` 单阶段 PMU |
 
 ### 4.1 真实 PA 第一轮 atomic 与前端优化
 
@@ -882,7 +883,7 @@ Submit envelope、EfDrain、OrchestrationReplay、FinalDrain 和 WorkerCompletio
 
 ### 8.3 `submit-pmu-none` 与真实 span 单阶段 PMU
 
-**[`submit-pmu-none`、`arg-build`、空 bracket 校准、`materialize` 和 `claim` 均已完成 A5 收口]**
+**[`submit-pmu-none`、`arg-build`、空 bracket 校准、`materialize`、`claim` 和 `register` 均已完成 A5 收口]**
 
 本阶段没有修改或复测 standalone，而是在真实 PA 中建立独立诊断构建。该构建在
 编译期去除普通泳道、atomic 观察和通用逐 task PMU ring，分为两种运行方式：
@@ -1439,39 +1440,154 @@ Claim 代码落定后串行回归了六类互斥 B1 构建：
 B1 的 74～277 us 绝对时间明显波动，且冷启动与跨核到达均未被单独控制，所以只作
 结构回归，不对差值归因，也不参与候选保留/撤销或观察代价计算。
 
-#### 8.3.6 后续真实 selector 与三条证据链分工
+#### 8.3.6 第四个真实业务 selector：`submit-pmu-register`
 
-单阶段 selector 必须直接跟随当前真实 PA compete-first 泳道和离线排他定义，候选
-区域包括：
+**[观察工具，已完成两轮 B1、两轮 Case1 与互斥构建回归]**
+
+最新权威 Case1 泳道 `outputs/TestPagedAttentionUnroll_Case1_20260720_234305/`
+中，Register 为 47,991,560 aggregate core-ticks，占 SubmitUnion 的 12.010%，
+固定 122,880 次。它是 Claim 之后仍超过约 10%、shape 固定且能映射到连续真实调用
+体的下一区域，因而进入单阶段 PMU；不是按 standalone 的旧 phase 清单机械补齐。
+
+编译期固定：
 
 ```text
-efdrain              包含 opportunistic drain 中的 Kernel
-efdrain-control      EfDrain 去除其中 Kernel 后的排他控制区域
-claim
-arg-build            Claim.end 到 Materialize.begin 的同步 eager 构参
-materialize
-prepare-map
-fanin
-register
-winner-build
-alloc-complete
-loser-replay         真实 PA loser 的实际尾动作
-submit-finalize      最后业务 child 到本次 Submit.end 的公共收尾
-submit-transition    相邻 Submit 之间的输出接收、下一任务准备与调用衔接
-kernel               真实计算区间 overlay
+PTO_FDWIC_SUBMIT_PMU=1
+PTO_FDWIC_SUBMIT_PMU_PHASE_ID=5
+PTO_FDWIC_TRACE_ENABLED=0
 ```
 
-以上只是根据真实源码和最新泳道语义形成的 selector 设计清单，不表示全部区域已经
-实现。`efdrain` 包含 `kernel`，而 `efdrain-control` 是去除 Kernel 后的排他控制，
-三者不能相加。`kernel` 也是 overlay；`submit-finalize` 和
-`submit-transition` 应复用现有真实边界，不为方便取数继续扩大泳道 raw。每个局部
-selector 必须独立编译、独立运行、独立发布，不能在一个 ELF 中同时打开多段。
+公共协议 mode 为 `6`，phase id 为 `5`，raw name/boundary 为
+`register/register_outputs_call_entry_to_return`，counter/time semantics 仍为
+`running_read_clear_observed_bracket` 和
+`inner_sys_cnt_between_boundary_observers`。设备继续复用 12,416 B phase ABI，
+没有增加逐调用、task-kind 或 insert 数字段。
 
-`arg-build`、running bracket 空区间校准、`materialize` 和 `claim` 已经实现；其余
-selector 仍按最新真实 Case1 排他分布和可证明源码边界逐个推进，不按旧名单批量
-复刻。后续每个业务 phase 都必须同时报告自己的原始 observed 与 empty 的经验尺度，
-但不得跨 ELF 扣减出伪精确净值。standalone 历史实现只提供 owner、门禁和报告加工
-方法参考，不是该阶段的前置优化任务，也不能作为真实结果代替品。
+当前最终 AICore 缓存为 `aicore-extra/32c26e06ad76d186`：
+
+| 文件 | SHA256 | `.text` |
+| --- | --- | ---: |
+| `aicore_kernel.o` | `8264a6afd39815c825e0630dcbb69d9a3492d2e26989a61136f06d5e371fb750` | 150,608 B |
+| `aicore_aic_combined.o` | `fd542b9ffdb33ea480ac91527c3e361cf44ae27604d2fd9ec90fc66e1ef53306` | 68,352 B |
+| `aicore_aiv_combined.o` | `9a1eeca6fc06f370c02ff3acc8d1546820a910e7272b866f3b743b91be6ce9bb` | 82,256 B |
+
+AIC/AIV `.text` 之和与最终 ELF 的 150,608 B 精确相等。最终 ELF 含
+`dist_submit_pmu_expect_submits`、整窗 counter reader 和 AIC/AIV phase reader；
+perf-clock、普通泳道、逐 atomic 与通用逐 task PMU 符号均不存在。现有 raw 未内嵌
+ELF SHA，上表只记录最终缓存身份，不把前几轮产物包装成逐字节 ELF 存档。
+
+真实边界没有复制一条新的 Register 近似实现，而是紧贴现有三个
+`dist_submit_register_outputs()` 调用点：
+
+1. 统一 `dist_submit_finish_kernel_tail()`，覆盖旧 Kernel 与 compete-first Kernel
+   Finish，位于可选 Fanin 后，传 `include_existing=true`；
+2. 旧 `dist_alloc_tensors()`，传 `include_existing=false`；
+3. compete-first `dist_alloc_compete_first_finish()`，同样传
+   `include_existing=false`。
+
+begin 在调用入口，end 在返回后、`TRACE_TIMESTAMP(register_end)` 前；因此刻意排除
+前一条 record 发布、Register 结束时间戳和 caller 衔接。它是普通泳道 Register 的
+核心调用体，不是 timestamp-to-timestamp span 的逐 tick 复制。三条路径在正常成功
+Submit 中均恰好一次；固定 shape 和 phase status 会 fail-closed 拒绝提前返回造成的
+缺失边界。
+
+该调用体存在重要业务混合：Kernel 的 `include_existing=true` 会按
+`ctx.register_mask` 扫描并插入 existing tensor，Alloc 的 `false` 路径在 helper
+入口直接返回；`register_mask=0` 的 Kernel 也可能接近空调用。当前 PA 每 batch 为
+1 Alloc + 4 Kernel，但为控制观察扰动没有增加 task-kind 或逐 insert raw 字段。
+因此结果只能解释为 RegisterOutputs 调用体聚合，不能命名为单次 TensorMap insert
+净成本。
+
+两轮 B1 先闭合模式、三挂点、固定次数与数据门禁：
+
+| 产物 | 全局 Submit | ALL elapsed/call | ALL request/call | ALL miss/call | 结果 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `..._034517` | 80.904 us | 231.281 ns | 140.208 | 4.446 | 96×5、480/480、`0x3f`、primary=shadow |
+| `..._034904` | 267.167 us | 236.838 ns | 123.869 | 3.956 | 96×5、480/480、`0x3f`、primary=shadow |
+
+B1 全局时间再次明显变化，而局部 per-call 量级相近；本阶段没有分别控制冷暖态、
+跨核到达或非 scalar-busy 等待，因此不把差值归给其中任何一项。这两轮只作结构
+证据，不用于 Register 稳态判断。
+
+两轮完整 Case1 为：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260721_035025/
+outputs/TestPagedAttentionUnroll_Case1_20260721_035136/
+```
+
+两轮都通过 96 核、每核 1,280 次、122,880/122,880 begin/end、phase status
+`0x3f`、owner Restore、32 个 mixed triplet、primary/shadow 精确相等、数值顺序和
+风险阈值门禁。逐角色原始 observed 为：
+
+| 产物 | 全局 Submit | 角色 | elapsed/call | request/call | miss/call |
+| --- | ---: | --- | ---: | ---: | ---: |
+| `..._035025` | 4,688.752 us | ALL | 187.688 ns | 86.699 | 1.352 |
+| 同上 | 同上 | AIC | 187.833 ns | 88.301 | 0.045 |
+| 同上 | 同上 | AIV | 187.615 ns | 85.898 | 2.005 |
+| `..._035136` | 5,136.513 us | ALL | 187.879 ns | 86.517 | 1.392 |
+| 同上 | 同上 | AIC | 188.787 ns | 88.166 | 0.050 |
+| 同上 | 同上 | AIV | 187.425 ns | 85.692 | 2.063 |
+
+阶段与完整 Submit 的比率仍只在同一 raw、同一角色内计算：
+
+| 产物 | 角色 | 时间占比 | request observed 占比 | miss observed 占比 |
+| --- | --- | ---: | ---: | ---: |
+| `..._035025` | ALL | 5.249% | 14.889% | 7.132% |
+| 同上 | AIC | 5.390% | 14.902% | 9.492% |
+| 同上 | AIV | 5.181% | 14.882% | 7.112% |
+| `..._035136` | ALL | 5.055% | 14.884% | 7.335% |
+| 同上 | AIC | 5.120% | 14.844% | 10.510% |
+| 同上 | AIV | 5.023% | 14.905% | 7.308% |
+
+两轮约 188 ns/call、86.6 request/call 的方向稳定，AIV miss 约 2.0/call、AIC
+约 0.05/call。但这不支持把普通泳道 Register 的 12.010% 全部归给该调用体：泳道
+边界更宽且属于另一 ELF。empty-bracket 的约 639～640 ns/对也只能说明观察器自扰动
+不可忽略；它的外层时间口径与 Register 的内层时间不同，更不能跨 ELF 相减。当前
+phase 没有局部 scalar busy，`miss × 90 ns` 也只作单核串行量级感知。
+
+代码落定后串行回归了七类互斥 B1 构建：
+
+| 构建 | 产物 | 结果 |
+| --- | --- | --- |
+| `submit-pmu-claim` | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_035425/` | 96×5、480/480、`0x3f`、primary=shadow；254.094 us |
+| `submit-pmu-materialize` | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_035505/` | 96×5、480/480、`0x3f`、primary=shadow；84.021 us |
+| `submit-pmu-arg-build` | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_035545/` | 96×5、480/480、`0x3f`、primary=shadow；73.728 us |
+| `submit-pmu-empty-bracket` | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_035625/` | 96×5、480/480、`0x3f`、primary=shadow；77.925 us |
+| `submit-pmu-none` | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_035703/` | 无 phase 字段、primary=shadow；259.429 us |
+| `perf-clock` | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_035744/` | 96×5 Submit、ELF 身份/shape 闭合；74.282 us |
+| 普通 level-4 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_035843/` | 4,550 条事件、292.159 us、`dropped=0`、排他整数闭合 PASS |
+
+七轮只证明新增 mode、三个挂点和报告链没有破坏旧 phase、整窗、权威基线与合并
+泳道构建。B1 绝对时间不参与跨 ELF 比较。Python 的 profile/report/cache/ELF 门禁
+共 121 项通过。
+
+#### 8.3.7 selector 停止线与三条证据链分工
+
+`arg-build`、`materialize`、`claim` 和 `register` 已经实现，四个真实业务区域在最新
+权威泳道中合计约占 SubmitUnion 的 **67.877%**；empty-bracket 只提供 running
+观察器经验尺度，不计入业务覆盖。完成 Register 后重新按占比、调用 shape、边界连续
+性和约 640 ns/对的 empty 经验尺度筛选，没有理由继续把所有短 span 批量做成 profile：
+
+- EfDrain 总量为 63,350,314 core-ticks，但其中 32,102,416 ticks 是 Kernel
+  overlay；剩余 control 约 254 ns/Submit，又混有 atomic，当前局部 PMU 指标不能
+  把三者可靠拆开；
+- PrepareMap 为 22,673,322 ticks、约 184.5 ns/次，SubmitFinalize 为 19,944,392
+  ticks、约 162.3 ns/次且有四类尾边界；二者都短于 empty 经验尺度；
+- Fanin、WinnerBuild、AllocComplete 和真实 loser 尾动作占比更小或 shape 非统一，
+  继续增加 profile 更可能放大观察器影响，而不是提高归因能力。
+
+当前只保留一个待决候选 `submit-transition`：最新泳道中相邻 Submit 之间未被业务
+span 覆盖的区间为 72,362,428 ticks，占 SubmitEnvelope 的 **15.332%**，每核固定
+1,279 次、全局 122,784 次，约 589.3 ns/次。它回答“上一次 Submit 返回到下一次
+Submit 入口之间的输出接收、下一任务准备与调用衔接”这一具体问题；但它是跨 Submit
+边界，若实现必须使用 `expected_submits - 1` 的独立 shape 契约，不能伪装成每 Submit
+一次。该候选完成或被门禁判定不可分辨后，停止扩张 phase，转入三类构建观察代价、
+独占设备波动和 perf-clock 候选优化。
+
+后续若实现该唯一候选，仍必须独立编译、独立运行、独立发布；只报告本 raw 内的原始
+observed 和占比，不与 empty 或任何其他 selector 相减。standalone 历史实现只提供
+owner、门禁和报告加工方法参考，不是当前真实 PA 的前置任务，也不能替代真实结果。
 
 三条证据链最终分工为：
 
@@ -1599,6 +1715,17 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
 | claim 后 none B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_032712/` | 无 phase 字段、primary=shadow 96/96 |
 | claim 后 perf-clock B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_032802/` | 96×5 Submit、74.512 us、ELF 隔离 PASS |
 | claim 后 level-4 B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_032914/` | 4552 records、87.664 us、dropped=0、排他闭合 PASS |
+| register PMU B1 首轮 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_034517/` | 96×5 bracket、80.904 us、三挂点/固定 shape 闭合 |
+| register PMU B1 复验 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_034904/` | 96×5 bracket、267.167 us；只作结构与波动样本 |
+| register PMU Case1 首轮 | `outputs/TestPagedAttentionUnroll_Case1_20260721_035025/` | 96×1280 bracket、4688.752 us；ALL 187.688 ns/次 |
+| register PMU Case1 复验 | `outputs/TestPagedAttentionUnroll_Case1_20260721_035136/` | 96×1280 bracket、5136.513 us；ALL 187.879 ns/次 |
+| register 后 claim B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_035425/` | 96×5、status 0x3f、primary=shadow 96/96 |
+| register 后 materialize B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_035505/` | 96×5、status 0x3f、primary=shadow 96/96 |
+| register 后 arg-build B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_035545/` | 96×5、status 0x3f、primary=shadow 96/96 |
+| register 后 empty B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_035625/` | 96×5、status 0x3f、primary=shadow 96/96 |
+| register 后 none B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_035703/` | 无 phase 字段、primary=shadow 96/96 |
+| register 后 perf-clock B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_035744/` | 96×5 Submit、74.282 us、ELF 隔离 PASS |
+| register 后 level-4 B1 回归 | `outputs/TestPagedAttentionUnroll_CaseB1_20260721_035843/` | 4550 records、292.159 us、dropped=0、排他闭合 PASS |
 
 ### 10.3 standalone
 
@@ -1730,21 +1857,25 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
 3. **[观察工具，已实现] 真实 PA `submit-pmu-none`**：编译期去除泳道、atomic 和
    通用逐 task PMU，每核完整 Submit 期只开关 PMU 一次；96 核 primary/shadow、
    owner Restore、AIC/AIV raw/HTML、两轮 B1 和一次 Case1 均已闭合；
-4. **[观察工具，三个业务 selector 与空 bracket 均已实现] 真实 PA 单阶段 PMU**：
+4. **[观察工具，四个业务 selector 与空 bracket 均已实现] 真实 PA 单阶段 PMU**：
    `arg-build` 已完成两轮 B1 与一次 Case1；`empty-bracket` 复用同一 12,416 B ABI，
    已完成两轮 B1 与两轮 Case1，量出 running begin/end 的稳态自扰动指纹并明确
    外层 elapsed 与 read-clear request/miss 的不同边界；`materialize` 又按最新真实
    Case1 最大明确业务 span 建立 mode 4/phase 3，完成两轮 B1、两轮 Case1、五类
    互斥 B1 回归和最终 AICPU mode 重构回归；`claim` 按同一真实布局的下一明确热点
    建立 mode 5/phase 4，四条旧/新 Kernel/Alloc 边界、固定 96×1280 shape、两轮
-   B1、两轮 Case1 和六类互斥 B1 回归均已闭合，仍未扩展 ABI。其余 selector 继续
-   分别编译、分别采集，不在同一提交中批量铺开，也不依赖新的 standalone 实现；
+   B1、两轮 Case1 和六类互斥 B1 回归均已闭合；`register` 又建立 mode 6/phase 5，
+   在三个真实 RegisterOutputs 调用点固定采集 96×1280 shape，完成两轮 B1、两轮
+   Case1 和七类互斥 B1 回归。四个 selector 都复用 12,416 B ABI，没有扩展逐调用
+   字段。其余 selector 继续分别编译、分别采集，不在同一提交中批量铺开，也不依赖
+   新的 standalone 实现；
 5. 结构和边界迭代先使用最小有效真实 PA 用例完成正确性门禁；只有构建身份、容量、
    业务边界和统计闭合后，才运行完整 Case1 b256 性能样本，避免反复生成数百 MiB
    profiling 文件。
 
 下一步继续以已经闭合的 empty 经验尺度为解释约束，根据最新真实 Case1 排他占比和
-可证明源码边界逐个选择其余业务 selector；不从 `arg-build/materialize/claim`
+可证明源码边界逐个选择其余业务 selector；不从
+`arg-build/materialize/claim/register`
 observed 中机械扣除 empty，也不按旧 selector 名单批量实现。真实 span 的边界、
 调用 shape 和完整 Case1 数据闭合后，再量化三种构建的观察代价并专项归因独占设备
 上的运行波动。

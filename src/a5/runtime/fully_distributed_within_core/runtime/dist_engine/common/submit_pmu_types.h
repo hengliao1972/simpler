@@ -24,6 +24,7 @@ constexpr uint16_t kFdwicSubmitPmuModeArgBuild = 2;
 constexpr uint16_t kFdwicSubmitPmuModeEmptyBracket = 3;
 constexpr uint16_t kFdwicSubmitPmuModeMaterialize = 4;
 constexpr uint16_t kFdwicSubmitPmuModeClaim = 5;
+constexpr uint16_t kFdwicSubmitPmuModeRegister = 6;
 constexpr uint32_t kFdwicSubmitPmuExpectedAic = 32;
 constexpr uint32_t kFdwicSubmitPmuExpectedAiv = 64;
 constexpr uint32_t kFdwicSubmitPmuExpectedCores = kFdwicSubmitPmuExpectedAic + kFdwicSubmitPmuExpectedAiv;
@@ -45,7 +46,10 @@ enum class FdwicSubmitPmuPhase : uint16_t {
     // 当前泳道 Claim.begin 到 Claim.end：compete-first 还包含 Claim 前的
     // task-cap 检查；每个 Submit 固定调用一次。
     Claim = 4,
-    Count = 5,
+    // dist_submit_register_outputs() 调用入口到返回。刻意排除前一阶段
+    // record 发布和 caller 衔接；每个 Submit 固定调用一次。
+    Register = 5,
+    Count = 6,
 };
 
 constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
@@ -60,6 +64,8 @@ constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
         return kFdwicSubmitPmuModeMaterialize;
     case FdwicSubmitPmuPhase::Claim:
         return kFdwicSubmitPmuModeClaim;
+    case FdwicSubmitPmuPhase::Register:
+        return kFdwicSubmitPmuModeRegister;
     case FdwicSubmitPmuPhase::Count:
         break;
     }
@@ -68,7 +74,8 @@ constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
 
 constexpr bool fdwic_submit_pmu_mode_has_phase(uint16_t mode) {
     return mode == kFdwicSubmitPmuModeArgBuild || mode == kFdwicSubmitPmuModeEmptyBracket ||
-           mode == kFdwicSubmitPmuModeMaterialize || mode == kFdwicSubmitPmuModeClaim;
+           mode == kFdwicSubmitPmuModeMaterialize || mode == kFdwicSubmitPmuModeClaim ||
+           mode == kFdwicSubmitPmuModeRegister;
 }
 
 // A5 PIPE_UTIL 事件布局。CNT6/CNT7 是权威值；CNT8/CNT5 使用相同事件作

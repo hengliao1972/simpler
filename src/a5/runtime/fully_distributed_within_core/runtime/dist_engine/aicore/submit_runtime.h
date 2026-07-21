@@ -325,7 +325,11 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_finish_kernel_tail(
         );
         register_begin = fanin_end;
     }
+    // Register 的局部 PMU 只包围真实 RegisterOutputs 调用体，不吸收前一条
+    // Fanin/Claim record 发布或 caller 衔接。
+    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Register>();
     dist_submit_register_outputs(ctx, args, /*include_existing=*/true);
+    fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Register>();
     TRACE_TIMESTAMP(register_end);
     TRACE_SPAN_RECORD(register_begin, register_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Register, 0, 1);
     if (__builtin_expect(ctx.won, 0)) {
@@ -523,7 +527,9 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
         return ctx.result;
     }
     const uint64_t register_begin = prepare_map_end;
+    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Register>();
     dist_submit_register_outputs(ctx, args, /*include_existing=*/false);
+    fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Register>();
     TRACE_TIMESTAMP(register_end);
     TRACE_SPAN_RECORD(register_begin, register_end, ctx.self, ctx.task_id, -1, TracePhase::Register, 0, 0);
     const uint64_t claim_begin = register_end;
@@ -628,7 +634,9 @@ dist_alloc_compete_first_finish(PTO2Runtime *, const DistCompeteFirstTicket &tic
         )) {
         return ctx.result;
     }
+    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Register>();
     dist_submit_register_outputs(ctx, args, /*include_existing=*/false);
+    fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Register>();
     TRACE_TIMESTAMP(register_end);
     TRACE_SPAN_RECORD(prepare_map_end, register_end, ctx.self, ctx.task_id, -1, TracePhase::Register, 0, 0);
     return dist_submit_finish_alloc_tail(ctx, register_end, ticket.submit_begin);

@@ -520,6 +520,136 @@ atomic 等待**作为 Claim 时间重心继续核对，而不是先把差值归�
   AIV 的约 2.92 miss/call 不能减去 empty 的约 2.01～2.03 后冒充业务净 miss，
   `miss × 90 ns` 也仍然不是可兑现的 Submit 墙钟收益。
 
+### 1.6 真实 PA `submit-pmu-register`
+
+#### 选型依据与 profile 身份
+
+`submit-pmu-register` 继续以最新权威 Case1 泳道
+`outputs/TestPagedAttentionUnroll_Case1_20260720_234305/` 为选型依据。该轮普通泳道
+Register 为 **47,991,560 SYS_CNT ticks**，占 SubmitUnion 399,604,449 ticks 的
+**12.010%**，固定出现 122,880 次。在已经采集 arg-build、Materialize 和 Claim
+后，它是下一个占比超过 10%、shape 固定且能映射到连续真实调用体的区域。
+
+该 profile 的编译与设备身份固定为：
+
+```text
+PTO_FDWIC_SUBMIT_PMU=1
+PTO_FDWIC_SUBMIT_PMU_PHASE_ID=5
+PTO_FDWIC_TRACE_ENABLED=0
+
+capture.mode                    = submit-pmu-register
+configuration.phase.id          = 5
+configuration.phase.name        = register
+configuration.phase.boundary    = register_outputs_call_entry_to_return
+configuration.phase.counter_semantics
+                                = running_read_clear_observed_bracket
+configuration.phase.time_semantics
+                                = inner_sys_cnt_between_boundary_observers
+```
+
+公共二进制协议中的 mode 为 `6`，phase enum 为 `5`，两者不能混用。该构建仍复用
+12,416 B 设备 ABI：128 B header、`96 × 64 B` whole record 和
+`96 × 64 B` phase record；没有新增逐调用记录或 task-kind 字段。当前缓存身份为
+`aicore-extra/32c26e06ad76d186`，最终 `aicore_kernel.o` 的 SHA256 为
+`8264a6afd39815c825e0630dcbb69d9a3492d2e26989a61136f06d5e371fb750`，
+`.text` 为 150,608 B。最终 ELF 含 Submit PMU 整窗与 phase reader，且不含
+perf-clock、普通泳道、逐 atomic 或通用逐 task PMU 符号。raw 当前不内嵌 ELF
+SHA，因此该 SHA 只证明最终缓存构建身份，不把历史四轮产物表述为逐字节留档。
+
+#### 三个真实挂点与调用体边界
+
+设备端只在现有 `dist_submit_register_outputs()` 三个调用点的入口和返回处复用通用
+phase begin/end：
+
+1. `dist_submit_finish_kernel_tail()`：统一覆盖旧 Kernel 和 compete-first Kernel
+   Finish，位于可选 Fanin 之后，传入 `include_existing=true`；
+2. 旧 Alloc `dist_alloc_tensors()`：传入 `include_existing=false`；
+3. compete-first Alloc `dist_alloc_compete_first_finish()`：同样传入
+   `include_existing=false`。
+
+三处 end 都在 `TRACE_TIMESTAMP(register_end)` 之前。因此该边界只观察
+`dist_submit_register_outputs()` 调用入口到返回，刻意排除前一阶段的记录发布、
+Register 结束时间戳和 caller 衔接；它对应普通泳道 Register 的核心调用体，**不是**
+普通泳道 timestamp-to-timestamp span 的逐 tick 复制。
+
+业务上，Kernel 的 `include_existing=true` 会按 `ctx.register_mask` 扫描 existing
+tensor 并插入 TensorMap；Alloc 的 `include_existing=false` 会在 helper 入口直接
+返回。当前 PA 每 batch 包含 1 个 Alloc 和 4 个 Kernel，所以固定 shape 中混合了
+Alloc 空调用体、`register_mask=0` 的近空 Kernel 调用和真正的 TensorMap 工作。
+当前 raw 没有为此新增 task-kind 或逐 insert 字段，聚合结果不能命名为“单次
+TensorMap insert 净成本”。
+
+正常成功路径中，每个 Submit 恰好执行一次该 bracket：B1 为每核 5 次、全局 480
+次；Case1 为每核 1,280 次、全局 122,880 次。若 ticket 或上游 Materialize 失败而
+提前返回，固定 calls、begin/end 和 phase status 门禁会拒绝整份 raw，不会静默发布
+缺边界的结果。
+
+#### 运行与产物
+
+```bash
+source /home/q00473782/Ascend/cann-9.1.0-weekly-20260708/cann/set_env.sh
+source /home/q00473782/.venv/bin/activate
+export PTO_ISA_ROOT=/home/q00473782/atomic/private/gpt/pto-isa-ddafa
+export PYTHONPATH="$PWD:$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
+
+python -m pytest \
+  examples/a5/fully_distributed_within_core/paged_attention_unroll/test_paged_attention_unroll.py \
+  --platform a5 --runtime fully_distributed_within_core --level 2 \
+  --case Case1 --manual include --fdwic-profile submit-pmu-register \
+  --rounds 1 -s -v
+```
+
+每轮自动生成并校验 `fdwic_submit_pmu_raw.json` 和
+`fdwic_submit_pmu_report.html`；重建 HTML 的命令与第 1.5 节相同。
+
+#### B1 只作结构证据
+
+```text
+outputs/TestPagedAttentionUnroll_CaseB1_20260721_034517/
+outputs/TestPagedAttentionUnroll_CaseB1_20260721_034904/
+```
+
+两轮均为 96/96 受信记录、480/480 begin/end、phase id `5`、phase status
+`0x3f`，primary/shadow request/miss 逐核精确相等，owner Restore 和风险阈值全部
+闭合。全局 Submit 分别为 80.904 us 和 267.167 us；本阶段没有分别控制冷启动、
+跨核到达或非 scalar-busy 等待，因而只记录 B1 绝对时间不稳定，不对差值作原因
+归因，也不用于 Register 稳态性能判断。
+
+#### 两轮 Case1 稳态结果
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260721_035025/
+outputs/TestPagedAttentionUnroll_Case1_20260721_035136/
+```
+
+两轮均为 96 核每核 1,280 次、122,880/122,880 begin/end、phase status
+`0x3f`，32 AIC + 64 AIV、owner Restore、mixed triplet、primary/shadow、数值顺序
+和计数器风险阈值全部闭合。下表所有占比只在**同一轮 Register ELF 内**计算：时间
+以逐核完整 Submit elapsed 为分母，request/miss 以本轮整窗 primary 为分母。
+
+| 轮次 | 角色 | 时间 ns/call | request observed/call | miss observed/call | 时间占比 | request 占比 | miss 占比 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `035025` | ALL | 187.688 | 86.699 | 1.352 | 5.249% | 14.889% | 7.132% |
+| `035025` | AIC | 187.833 | 88.301 | 0.045 | 5.390% | 14.902% | 9.492% |
+| `035025` | AIV | 187.615 | 85.898 | 2.005 | 5.181% | 14.882% | 7.112% |
+| `035136` | ALL | 187.879 | 86.517 | 1.392 | 5.055% | 14.884% | 7.335% |
+| `035136` | AIC | 188.787 | 88.166 | 0.050 | 5.120% | 14.844% | 10.510% |
+| `035136` | AIV | 187.425 | 85.692 | 2.063 | 5.023% | 14.905% | 7.308% |
+
+两轮完整 Submit 分别为 4,688.752 us 和 5,136.513 us，而 Register 调用体的
+per-call、request 和角色差异保持稳定。当前证据支持“该调用体在本诊断构建中约占
+逐核 Submit 时间 5.1%～5.2%，AIV 约 2.0 miss/call、AIC 约 0.05 miss/call”；
+不支持把普通泳道较宽 Register 的 12.010% 全部归给 RegisterOutputs。
+
+该 profile 仍受三条解释边界约束：
+
+- 普通泳道 Register 与本调用体边界不同，而且来自另一 ELF，不能逐 tick 对齐或
+  相减；
+- empty-bracket、Claim、Materialize 和 Register 均为独立诊断 ELF，不能用 empty
+  扣出“净 Register 时间/事件”；
+- phase 没有局部 scalar busy，`miss × 90 ns` 只能作单核串行量级感知，不能当作
+  可兑现的 Submit 墙钟收益。
+
 ## 2. 为什么 I-cache miss 必须独立重编译
 
 I-cache 数据对代码布局极其敏感。泳道和逐 atomic 观察会增加：
@@ -623,9 +753,10 @@ schema-v5、构建目录、命令和字段；不能套用到上面的真实 PA p
 - `submit-pmu-arg-build`：Claim.end 到 Materialize.begin 的同步构参区间；
 - `submit-pmu-empty-bracket`：第 1.3 节定义的观察器经验校准，不是业务 phase；
 - `submit-pmu-materialize`：第 1.4 节定义的真实 Materialize 业务 span；
-- `submit-pmu-claim`：第 1.5 节定义的真实 Claim 业务 span。
+- `submit-pmu-claim`：第 1.5 节定义的真实 Claim 业务 span；
+- `submit-pmu-register`：第 1.6 节定义的 RegisterOutputs 调用体。
 
-五者 raw schema 均为 `fdwic-submit-pmu-v1`，但分别来自独立诊断 ELF，不能跨
+六者 raw schema 均为 `fdwic-submit-pmu-v1`，但分别来自独立诊断 ELF，不能跨
 profile 相减或拼接。
 
 standalone 历史 schema 中的 `lower/upper` 是已经固化的字段名，只表达

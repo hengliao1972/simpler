@@ -116,6 +116,10 @@ def test_fdwic_profile_partitions_compile_cache(monkeypatch):
     assert _fdwic_profile() == "submit-pmu-claim"
     assert _profiled_cache_key(base) == (*base, "submit-pmu-claim")
 
+    monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-register")
+    assert _fdwic_profile() == "submit-pmu-register"
+    assert _profiled_cache_key(base) == (*base, "submit-pmu-register")
+
 
 def test_fdwic_private_profiles_have_isolated_compile_definitions():
     assert _fdwic_compile_definitions("none") is None
@@ -145,6 +149,11 @@ def test_fdwic_private_profiles_have_isolated_compile_definitions():
     assert _fdwic_compile_definitions("submit-pmu-claim") == [
         "PTO_FDWIC_SUBMIT_PMU=1",
         "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=4",
+        "PTO_FDWIC_TRACE_ENABLED=0",
+    ]
+    assert _fdwic_compile_definitions("submit-pmu-register") == [
+        "PTO_FDWIC_SUBMIT_PMU=1",
+        "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=5",
         "PTO_FDWIC_TRACE_ENABLED=0",
     ]
 
@@ -235,7 +244,13 @@ def test_submit_pmu_elf_gate_accepts_only_whole_window_observer(monkeypatch, tmp
 
 @pytest.mark.parametrize(
     "profile",
-    ["submit-pmu-arg-build", "submit-pmu-empty-bracket", "submit-pmu-materialize", "submit-pmu-claim"],
+    [
+        "submit-pmu-arg-build",
+        "submit-pmu-empty-bracket",
+        "submit-pmu-materialize",
+        "submit-pmu-claim",
+        "submit-pmu-register",
+    ],
 )
 def test_submit_pmu_phase_elf_gate_requires_running_shadow_reader(monkeypatch, tmp_path, profile):
     symbol_table = (
@@ -300,7 +315,13 @@ def test_submit_pmu_elf_gate_rejects_incomplete_or_mixed_image(monkeypatch, tmp_
 
 @pytest.mark.parametrize(
     "profile",
-    ["submit-pmu-arg-build", "submit-pmu-empty-bracket", "submit-pmu-materialize", "submit-pmu-claim"],
+    [
+        "submit-pmu-arg-build",
+        "submit-pmu-empty-bracket",
+        "submit-pmu-materialize",
+        "submit-pmu-claim",
+        "submit-pmu-register",
+    ],
 )
 def test_submit_pmu_phase_elf_gate_rejects_missing_running_shadow_reader(monkeypatch, tmp_path, profile):
     symbol_table = (
