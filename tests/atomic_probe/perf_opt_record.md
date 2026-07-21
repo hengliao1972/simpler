@@ -177,7 +177,8 @@ outputs/TestPagedAttentionUnroll_Case1_20260717_023809/
 | 2026-07-21 | `7fa7399f` | 阶段归因 | 排除 Claim 为同 ELF 波动主载体 |
 | 2026-07-21 | `afeb515a` | 阶段归因 | 排除 SubmitTransition 为同 ELF 波动主载体 |
 | 2026-07-21 | `57aedfee` | 阶段归因 | 排除 ArgBuild 为同 ELF 波动主载体 |
-| 2026-07-21 | 本阶段提交 | 阶段归因 | 排除 Register 为同 ELF 波动主载体 |
+| 2026-07-21 | `660bbff4` | 阶段归因 | 排除 Register 为同 ELF 波动主载体 |
+| 2026-07-21 | 本阶段提交 | 观察工具 | 完善真实 PA I-cache 逐核时间加工口径 |
 
 ### 4.1 真实 PA 第一轮 atomic 与前端优化
 
@@ -3206,6 +3207,41 @@ ALL 为 1.34～1.46、AIV 为 1.99～2.16，从第 5 轮起变为 ALL 约 1.79�
 逐核 Submit/PMU/Scalar/非 busy 残余时间与构建 provenance，再实现固定容量的
 EfDrain-control/依赖就绪观察；都不得扩展逐事件 raw。
 
+### 8.15 真实 PA I-cache 报告的逐核时间闭合
+
+**[观察工具已完成；不改 C++ producer、设备 ABI 或 raw schema]**
+
+Register 正式样本出现了“primary=shadow 全部闭合，但 AIV miss/call 中途跃迁而
+phase 时间不动”的真实反例。为了避免后续继续用单轮 miss rate 或不同聚合对象解释
+性能，本阶段只增强生产 Python consumer 和 HTML，不修改任何 AICore/host C++：
+
+1. ALL/AIC/AIV 新增每核 `submit_elapsed_ticks` 的 mean/min/max，并按 1 ns/tick
+   显示为 us；它与顶部跨核 `global_submit_span` 明确分开；
+2. PMU total、Scalar busy 和非 Scalar-busy 残余同时显示 cycles 与按各角色
+   1.649844/1.650062/1.649731 cycles/ns 校准的等效时间范围；
+3. 残余严格先逐核计算 `total_cycles-scalar_busy` 再汇总，禁止拿来自不同核的
+   total/scalar 极值相减；
+4. 新增逐核 `total_cycles/submit_elapsed_ticks` 的 mean/min/max，只命名为“同 ELF
+   长窗有效比”，不命名为瞬时频率或利用率；其典型值在最新 Register raw 中约为
+   ALL 1.649617、AIC 1.649614、AIV 1.649619 cycles/ns，与校准量级一致；
+5. raw producer summary、`METRICS`、每核记录和 phase sidecar 全部保持不变，三个
+   derived summary 只存在于通过门禁后的 `SubmitPmuCapture`/HTML。
+
+逐核 ratio 采用 arithmetic mean of ratios，不使用 `Σtotal/Σelapsed`；卡片纵向增加
+信息，不给已较宽的 phase/逐核表继续加列，原四张 SVG 也保持不变。全局说明继续强调
+等效时间不能与 perf-clock、swimlane 或另一个 phase ELF 相减，`total-scalar` 也不是
+Scalar 空闲、I-cache stall 或 vector/cube wait。
+
+单测新增专门的错法防线：让 total/scalar 极值落在不同核、构造
+`mean(total_i/elapsed_i) != Σtotal/Σelapsed`、拒绝零 Submit elapsed、核对三种角色
+校准和 raw summary 未扩字段。生产报告 89 项、连同 profile/cache 合计 152 项
+PASS，`ruff` 与 `git diff --check` 通过；最新 Register raw
+`outputs/TestPagedAttentionUnroll_Case1_20260721_103131/fdwic_submit_pmu_raw.json`
+也已由增强后的生产 consumer 重新闭合并生成 82,656 B HTML。另从现存 raw 为 none、
+ArgBuild、Claim、EmptyBracket、Materialize、Register、SubmitTransition 各选最新一份
+重建 HTML，七份全部 PASS，大小为 79,838～82,812 B。该阶段完全发生在 case 返回后
+的 host 加工层，对 Submit 热路是零新增指令。
+
 ## 9. 已撤回、失败或不能外推的路线
 
 ### 9.1 已撤回的优化候选
@@ -3556,9 +3592,13 @@ commit 和采集配置一起理解，不能因为文件名存在就当作当前 
     0.57%；同核 Rz、迁移慢尾 X 和辅助 remaining mean/core 通过。AIV miss/call
     在第 5 轮发生闭合但与 G 弱相关的状态跃迁，进一步证明单轮 miss 不能替代同
     ELF 时间关联。结论仍不外推到权威 P 的宽波动。
+17. **[I-cache 报告加工，已完成] 不改 raw/ABI 的逐核时间闭合**：从受信 records
+    派生 Submit SYS_CNT、PMU total、Scalar busy、逐核非 busy 残余和 PMU/SYS
+    长窗有效比的 mean/min/max；角色校准只生成当前 ELF 等效时间。测试专门拒绝
+    difference-of-extrema、ratio-of-sums 和零分母，相关 152 项及 ruff 通过。
 
-下一步不再扩充 N、K 或已经完成归因的既有 selector，也不跨 ELF 扣减。先在纯 Python
-加工层补齐逐核 Submit/PMU/Scalar/非 busy 残余的时间范围和构建 provenance；随后
+下一步不再扩充 N、K 或已经完成归因的既有 selector，也不跨 ELF 扣减。先补齐独立
+构建 provenance；随后
 只允许设计固定容量的 EfDrain-control/依赖就绪检查聚合，不能恢复逐 Submit/逐等待
 的大 raw。局部 I-cache 是否排除真实 linked-kernel，必须先通过接口与观测语义核验
 再决定。原因层级闭合后，再由 perf-clock 交错 A/B 决定真实 Scalar 候选保留或撤销。

@@ -333,7 +333,7 @@ def _validate_record(
 
     start = _integer(record.get("first_submit_start_tick"), f"{prefix}.first_submit_start_tick", minimum=1)
     end = _integer(record.get("last_submit_end_tick"), f"{prefix}.last_submit_end_tick", minimum=1)
-    elapsed = _integer(record.get("submit_elapsed_ticks"), f"{prefix}.submit_elapsed_ticks")
+    elapsed = _integer(record.get("submit_elapsed_ticks"), f"{prefix}.submit_elapsed_ticks", minimum=1)
     if end < start or elapsed != end - start:
         _fail(f"{prefix} Submit tick window is not closed")
 
@@ -471,10 +471,15 @@ def _validate_window(data: dict[str, Any], records: Sequence[dict[str, Any]]) ->
         _fail("window.global_submit_span_us does not match the raw Submit ticks")
 
 
-def _metric_summary(records: Sequence[dict[str, Any]], metric: str) -> dict[str, int | float]:
-    values = [record[metric] for record in records]
+def _value_summary(values: Sequence[int | float]) -> dict[str, int | float]:
+    """Summarize already-derived per-core values without changing their aggregation order."""
+
     total = sum(values)
     return {"sum": total, "min": min(values), "mean": total / len(values), "max": max(values)}
+
+
+def _metric_summary(records: Sequence[dict[str, Any]], metric: str) -> dict[str, int | float]:
+    return _value_summary([record[metric] for record in records])
 
 
 def _group_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -483,9 +488,19 @@ def _group_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
     scalar_busy = metrics["scalar_busy"]["sum"]
     requests = metrics["icache_requests"]["sum"]
     misses = metrics["icache_misses"]["sum"]
+    submit_elapsed_ticks = _metric_summary(records, "submit_elapsed_ticks")
+    non_scalar_busy_cycles = _value_summary(
+        [record["total_cycles"] - record["scalar_busy"] for record in records]
+    )
+    pmu_total_cycles_per_submit_tick = _value_summary(
+        [record["total_cycles"] / record["submit_elapsed_ticks"] for record in records]
+    )
     return {
         "cores": len(records),
         **metrics,
+        "submit_elapsed_ticks": submit_elapsed_ticks,
+        "non_scalar_busy_cycles": non_scalar_busy_cycles,
+        "pmu_total_cycles_per_submit_tick": pmu_total_cycles_per_submit_tick,
         "scalar_busy_share": scalar_busy / total_cycles,
         "icache_miss_rate": misses / requests if requests else 0.0,
     }
@@ -675,10 +690,6 @@ def _format_number(value: int | float, digits: int = 3) -> str:
     return f"{float(value):,.{digits}f}"
 
 
-def _cycles_to_us(cycles: int | float, cycles_per_ns: float) -> float:
-    return float(cycles) / cycles_per_ns / 1_000
-
-
 def _metric_range(summary: Mapping[str, int | float], *, digits: int = 1) -> str:
     return (
         f"均值 {_format_number(summary['mean'], digits)}；"
@@ -686,28 +697,59 @@ def _metric_range(summary: Mapping[str, int | float], *, digits: int = 1) -> str
     )
 
 
+def _scaled_metric_range(
+    summary: Mapping[str, int | float],
+    scale: float,
+    *,
+    digits: int = 3,
+) -> str:
+    """Format mean/min/max after a monotonic unit conversion."""
+
+    return (
+        f"均值 {_format_number(float(summary['mean']) * scale, digits)}；"
+        f"最小 {_format_number(float(summary['min']) * scale, digits)}；"
+        f"最大 {_format_number(float(summary['max']) * scale, digits)}"
+    )
+
+
 def _group_card(name: str, summary: Mapping[str, Any], cycles_per_ns: float, miss_penalty_ns: float) -> str:
+    submit_elapsed = summary["submit_elapsed_ticks"]
     total = summary["total_cycles"]
     scalar = summary["scalar_busy"]
+    non_scalar_busy = summary["non_scalar_busy_cycles"]
+    effective_cycles_per_tick = summary["pmu_total_cycles_per_submit_tick"]
     requests = summary["icache_requests"]
     misses = summary["icache_misses"]
-    residual_mean = float(total["mean"]) - float(scalar["mean"])
     penalty_mean_us = float(misses["mean"]) * miss_penalty_ns / 1_000
+    cycles_to_us = 1.0 / cycles_per_ns / 1_000
     title = {"all": "ALL", "aic": "AIC", "aiv": "AIV"}[name]
     return f"""
       <article class="group-card">
         <h3>{title} · {summary["cores"]} 核</h3>
         <dl>
+          <dt>Submit SYS_CNT/core</dt>
+          <dd>{_scaled_metric_range(submit_elapsed, 1 / 1_000)} µs<br>
+            <small>逐核首末 Submit 窗，不是顶部的跨核全局时间范围</small>
+          </dd>
           <dt>PMU total/core</dt>
           <dd>{_metric_range(total)} cycles<br>
-            <small>均值 {_format_number(_cycles_to_us(total["mean"], cycles_per_ns))} µs
+            <small>等效时间 {_scaled_metric_range(total, cycles_to_us)} µs
               （按 {cycles_per_ns:.6f} cycles/ns 校准）</small>
           </dd>
           <dt>Scalar busy/core</dt>
           <dd>{_metric_range(scalar)} cycles<br>
-            <small>加权占比 {float(summary["scalar_busy_share"]):.3%}</small>
+            <small>等效时间 {_scaled_metric_range(scalar, cycles_to_us)} µs；
+              加权占比 {float(summary["scalar_busy_share"]):.3%}</small>
           </dd>
-          <dt>非 Scalar-busy 残余/core</dt><dd>均值 {_format_number(residual_mean, 1)} cycles</dd>
+          <dt>非 Scalar-busy 残余/core</dt>
+          <dd>{_metric_range(non_scalar_busy)} cycles<br>
+            <small>逐核先算 total−scalar；等效时间
+              {_scaled_metric_range(non_scalar_busy, cycles_to_us)} µs</small>
+          </dd>
+          <dt>PMU-total / SYS-window/core</dt>
+          <dd>{_scaled_metric_range(effective_cycles_per_tick, 1.0, digits=6)} cycles/ns<br>
+            <small>同 ELF 长窗有效比；不是瞬时 AICore 频率，也不是利用率</small>
+          </dd>
           <dt>Primary I-cache request/core</dt><dd>{_metric_range(requests)}</dd>
           <dt>Primary I-cache miss/core</dt><dd>{_metric_range(misses)}</dd>
           <dt>加权 miss rate</dt><dd>{float(summary["icache_miss_rate"]):.3%}（Σmiss/Σrequest）</dd>
@@ -947,7 +989,8 @@ def _document(capture: SubmitPmuCapture, miss_penalty_ns: float) -> str:
   <p class="notice"><strong>{miss_penalty_ns:.3f} ns 仅作 I-cache miss 的直觉量尺，不是 Submit 墙钟损失。</strong>
     miss 可能重叠、被流水隐藏，也可能与其他停顿共同出现；不能把 miss×{miss_penalty_ns:g} ns
     当成可直接相减的优化收益。
-    非 Scalar-busy 残余不是空闲时间，也不是 I-cache stall。</p>
+    非 Scalar-busy 残余不是空闲时间，也不是 I-cache stall。卡片中的逐核 PMU 等效时间只解释
+    当前 ELF 的采集窗，不能与 perf-clock、swimlane 或另一个 phase ELF 相减。</p>
   <h2>ALL / AIC / AIV 汇总</h2>
   <div class="groups">{cards}</div>
   <h2>逐物理核分布</h2>

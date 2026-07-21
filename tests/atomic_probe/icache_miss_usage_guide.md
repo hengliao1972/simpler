@@ -76,6 +76,36 @@ start/stop 及其 `PIPE_ALL` 边界成本。PMU total 按本机约 1.65 cycles/n
 的 records 重新校验这些聚合。PMU total 与 scalar busy 各自独立取极值，不保证
 来自同一个物理核。
 
+#### 1.1.1 HTML 的逐核时间与 PMU 加工口径
+
+2026-07-21 的报告增强保持 `fdwic-submit-pmu-v1`、C++ producer 和设备 ABI 不变，
+只在通过全部 raw 门禁后的 Python 加工层追加三个逐核派生组。ALL/AIC/AIV 卡片现在
+同时展示：
+
+- `Submit SYS_CNT/core`：每核 `last_submit_end_tick-first_submit_start_tick` 的
+  mean/min/max，按 1 ns/tick 显示为 us；它不是顶部“最早核起点到最晚核终点”的
+  跨核全局时间范围；
+- PMU total、Scalar busy 与非 Scalar-busy 残余的 cycles mean/min/max，以及按
+  ALL/AIC/AIV 各自 1.649844/1.650062/1.649731 cycles/ns 换算的等效时间范围；
+- `PMU-total / SYS-window/core`：先逐核计算
+  `total_cycles/submit_elapsed_ticks`，再展示 mean/min/max。它只表示当前 ELF 两套
+  相近长窗的有效比，不是瞬时 AICore 频率，也不是利用率；
+- primary I-cache request/miss 的 mean/min/max、`Σmiss/Σrequest` 和 90 ns 直觉
+  量尺。
+
+非 Scalar-busy 残余必须先对每条 record 计算 `total_cycles-scalar_busy`，再求
+min/mean/max；不能用 `min(total)-min(scalar)` 或 `max(total)-max(scalar)` 拼接，
+因为两个极值可能来自不同物理核。有效 cycle 比同样采用逐核 ratio 的算术均值，
+不是 `Σtotal/Σelapsed`。这些派生字段只存在于受信 `SubmitPmuCapture` 和 HTML，raw
+summary 仍保持 producer 原有字段，因此没有给设备热路径、GM 容量或 raw 合同增加
+成本。
+
+上述等效时间都只解释当前诊断 ELF。不得拿它们与 perf-clock、swimlane 或另一个
+phase ELF 相减，也不得把 `total-scalar` 改名为 Scalar 空闲、I-cache stall 或
+vector/cube wait。Register 的 12 轮正式样本还出现过 primary=shadow 完整闭合、
+但 AIV miss/call 中途跃迁而阶段时间保持稳定的状态，说明报告必须把时间与 I-cache
+计数并列展示；单轮 miss 或 miss rate 不能独立决定优化结论。
+
 ### 1.2 真实 PA 首个单阶段 profile：`submit-pmu-arg-build`
 
 真实 PA 已完成首个跟随最新泳道业务边界的单阶段 profile：

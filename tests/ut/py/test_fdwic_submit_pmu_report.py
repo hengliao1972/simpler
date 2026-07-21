@@ -77,6 +77,27 @@ def _group_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _refresh_host_aggregates(capture: dict[str, Any]) -> None:
+    """Refresh only producer-owned fields after a test mutates records."""
+
+    records = capture["records"]
+    capture["summary"] = {
+        "all": _group_summary(records),
+        "aic": _group_summary(records[:32]),
+        "aiv": _group_summary(records[32:]),
+    }
+    first_tick = min(record["first_submit_start_tick"] for record in records)
+    last_tick = max(record["last_submit_end_tick"] for record in records)
+    capture["window"].update(
+        {
+            "global_first_submit_start_tick": first_tick,
+            "global_last_submit_end_tick": last_tick,
+            "global_submit_span_ticks": last_tick - first_tick,
+            "global_submit_span_us": (last_tick - first_tick) / 1_000,
+        }
+    )
+
+
 def _valid_capture() -> dict[str, Any]:
     aic_physical, aiv_physical = _physical_layout()
     records: list[dict[str, Any]] = []
@@ -350,6 +371,23 @@ def test_valid_capture_is_recomputed_and_rendered(tmp_path: Path) -> None:
     assert len(capture.records) == 96
     assert len(capture.groups["aic"]) == 32
     assert len(capture.groups["aiv"]) == 64
+    expected_ratios = {
+        "all": (1.6000, 1.60475, 1.6095),
+        "aic": (1.6000, 1.60155, 1.6031),
+        "aiv": (1.6032, 1.60635, 1.6095),
+    }
+    for group_name, (minimum, mean, maximum) in expected_ratios.items():
+        summary = capture.summary[group_name]
+        assert summary["submit_elapsed_ticks"]["min"] == 10_000
+        assert summary["submit_elapsed_ticks"]["mean"] == 10_000
+        assert summary["submit_elapsed_ticks"]["max"] == 10_000
+        assert summary["non_scalar_busy_cycles"]["min"] == 4_000
+        assert summary["non_scalar_busy_cycles"]["mean"] == 4_000
+        assert summary["non_scalar_busy_cycles"]["max"] == 4_000
+        ratio = summary["pmu_total_cycles_per_submit_tick"]
+        assert ratio["min"] == pytest.approx(minimum)
+        assert ratio["mean"] == pytest.approx(mean)
+        assert ratio["max"] == pytest.approx(maximum)
 
     document = render_report(raw_path)
     assert "真实 FDWIC Submit PMU" in document
@@ -358,6 +396,12 @@ def test_valid_capture_is_recomputed_and_rendered(tmp_path: Path) -> None:
     assert "90.000 ns" in document
     assert "不是 Submit 墙钟损失" in document
     assert "非 Scalar-busy 残余不是空闲时间，也不是 I-cache stall" in document
+    assert "Submit SYS_CNT/core" in document
+    assert "PMU-total / SYS-window/core" in document
+    assert "不是瞬时 AICore 频率" in document
+    assert "不能与 perf-clock、swimlane 或另一个 phase ELF 相减" in document
+    for cycles_per_ns in (1.649844, 1.650062, 1.649731):
+        assert f"按 {cycles_per_ns:.6f} cycles/ns 校准" in document
     assert "阶段观察（phase_id=" not in document
     assert "均值 16,047.5；最小 16,000；最大 16,095" in document
     for group_name in ("all", "aic", "aiv"):
@@ -365,6 +409,104 @@ def test_valid_capture_is_recomputed_and_rendered(tmp_path: Path) -> None:
     assert document.count("<svg") == 4
     assert document.count("<circle") == 4 * 96
     assert hashlib.sha256(raw_path.read_bytes()).hexdigest() in document
+
+
+def test_python_only_derived_metrics_do_not_expand_raw_summary(tmp_path: Path) -> None:
+    capture_data = _valid_capture()
+    producer_keys = {
+        "cores",
+        "total_cycles",
+        "scalar_busy",
+        "icache_requests",
+        "icache_misses",
+        "scalar_busy_share",
+        "icache_miss_rate",
+    }
+    for group in capture_data["summary"].values():
+        assert set(group) == producer_keys
+
+    capture = load_capture(_write_capture(tmp_path, capture_data))
+
+    for group in capture.summary.values():
+        assert {
+            "submit_elapsed_ticks",
+            "non_scalar_busy_cycles",
+            "pmu_total_cycles_per_submit_tick",
+        } <= set(group)
+
+
+def test_non_scalar_busy_extrema_are_computed_per_record(tmp_path: Path) -> None:
+    capture_data = _valid_capture()
+    records = capture_data["records"]
+    records[0]["total_cycles"] = 20_000
+    records[0]["scalar_busy"] = 19_000
+    records[1]["total_cycles"] = 19_000
+    records[1]["scalar_busy"] = 1_000
+    _refresh_host_aggregates(capture_data)
+
+    capture = load_capture(_write_capture(tmp_path, capture_data))
+
+    residual = capture.summary["all"]["non_scalar_busy_cycles"]
+    assert residual["min"] == 1_000
+    assert residual["max"] == 18_000
+    assert residual["min"] != (
+        capture.summary["all"]["total_cycles"]["min"]
+        - capture.summary["all"]["scalar_busy"]["min"]
+    )
+    assert residual["max"] != (
+        capture.summary["all"]["total_cycles"]["max"]
+        - capture.summary["all"]["scalar_busy"]["max"]
+    )
+
+
+def test_effective_ratio_is_mean_of_per_core_ratios(tmp_path: Path) -> None:
+    capture_data = _valid_capture()
+    for logical_core_id, record in enumerate(capture_data["records"]):
+        elapsed = 10_000 if logical_core_id % 2 == 0 else 20_000
+        record["last_submit_end_tick"] = record["first_submit_start_tick"] + elapsed
+        record["submit_elapsed_ticks"] = elapsed
+        record["total_cycles"] = 10_000 if logical_core_id % 2 == 0 else 40_000
+        record["scalar_busy"] = 8_000
+    _refresh_host_aggregates(capture_data)
+
+    capture = load_capture(_write_capture(tmp_path, capture_data))
+
+    for group_name in ("all", "aic", "aiv"):
+        ratio = capture.summary[group_name]["pmu_total_cycles_per_submit_tick"]
+        assert ratio["min"] == pytest.approx(1.0)
+        assert ratio["mean"] == pytest.approx(1.5)
+        assert ratio["max"] == pytest.approx(2.0)
+        group = capture.groups[group_name]
+        ratio_of_sums = sum(record["total_cycles"] for record in group) / sum(
+            record["submit_elapsed_ticks"] for record in group
+        )
+        assert ratio["mean"] != pytest.approx(ratio_of_sums)
+
+
+def test_zero_submit_elapsed_is_rejected_before_derived_ratio(tmp_path: Path) -> None:
+    capture_data = _valid_capture()
+    record = capture_data["records"][0]
+    record["last_submit_end_tick"] = record["first_submit_start_tick"]
+    record["submit_elapsed_ticks"] = 0
+
+    with pytest.raises(ValueError, match=r"records\[0\]\.submit_elapsed_ticks must be an integer >= 1"):
+        load_capture(_write_capture(tmp_path, capture_data))
+
+
+def test_group_cards_use_role_specific_cycle_calibration(tmp_path: Path) -> None:
+    capture = load_capture(_write_capture(tmp_path, _valid_capture()))
+
+    document = render_report(capture.input_path)
+
+    expected_mean_us = {
+        "all": 16_047.5 / 1.649844 / 1_000,
+        "aic": 16_015.5 / 1.650062 / 1_000,
+        "aiv": 16_063.5 / 1.649731 / 1_000,
+    }
+    for group_name, mean_us in expected_mean_us.items():
+        cycles_per_ns = capture.data["configuration"]["pmu_cycles_per_ns"][group_name]
+        assert f"按 {cycles_per_ns:.6f} cycles/ns 校准" in document
+        assert f"等效时间 均值 {mean_us:,.3f}；" in document
 
 
 def test_valid_arg_build_capture_renders_same_elf_phase_observation_first(tmp_path: Path) -> None:
