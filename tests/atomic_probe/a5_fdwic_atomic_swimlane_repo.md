@@ -774,8 +774,8 @@ site 0 到 14 与 standalone PA 的稳定编号完全一致；真实 FDWIC PA �
 | 10 | `frontier_max` | `fetch_max` | frontier 推进 |
 | 11 | `heap_frontier_load` | `load` | HeapGuard frontier |
 | 12 | `heap_vend_load` | `load` | HeapGuard vend |
-| 13 | `replay_done_increment` | `fetch_add` | 回放完成屏障到达计数 |
-| 14 | `replay_done_poll` | `load` | 最终 drain 轮询回放完成 |
+| 13 | `replay_done_increment` | `fetch_add` | final 树的 leaf/root arrival 和 release 发布 |
+| 14 | `replay_done_poll` | `load` | 最终 drain 轮询 leaf/root arrival 和 release |
 | 15 | `won_slot_claim_max` | `fetch_max` | BlockWon slot 认领 |
 | 16 | `won_remaining_exchange` | `exchange` | BlockWon remaining 初始化 |
 | 17 | `won_lane_reset_exchange` | `exchange` | BlockWon lane 重置 |

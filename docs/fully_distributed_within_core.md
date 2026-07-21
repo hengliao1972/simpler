@@ -914,7 +914,11 @@ cursor 的 CAS 竞争摊到 4 条 cache line 确实压低了 §6.5 所述的访�
 anchor 推送最后的多核子任务。这不是 per-task 串行阻塞，只发生在收尾，且 cube 领先时不出现。
 
 所有核都结束时达到全局完成；最终的图输出位置被发布以供 host 拷回（见 §8 的
-`graph_output_ptr`）。一个全局“所有核完成”屏障替代了旧的单一 `orchestrator_done` 标志。
+`graph_output_ptr`）。终止检测使用固定 G=16 二级树：worker 按 `block_id % 16`
+到达 leaf，每组一个静态 AIC 代表在本组到齐后向唯一 root 转发，root 到齐再向
+所有活跃叶组发布 release。各 leaf 的期望 worker 数由本轮 `layout[]` 动态生成，
+因此 `block_dim=1…36` 共用同一协议。唯一 root 保证认领效果与单计数器等价；
+分组仅减少单一 cache line 上的争用，没有取消全局汇合。
 
 ---
 
@@ -958,7 +962,7 @@ anchor 推送最后的多核子任务。这不是 per-task 串行阻塞，只发
 | `func_id_to_addr_`（kernel id → GM 地址） | **全局共享，只读** | 把 `kernel_id` 解析为要调用的 incore 函数 | init 时一次性设置，之后只读 |
 | `graph_output_ptr` / `graph_output_size` | **全局共享** | 供 host 拷回的最终输出位置 | 产出核做原子发布 |
 | 全局错误字（原 `orch_error_code`） | **全局共享** | 任意核的致命错误 → 所有核 + host | 原子；首个写者胜出 |
-| “所有核完成”屏障（原 `orchestrator_done`） | **全局共享** | 全局终止检测（§7） | 原子计数器 / 屏障 |
+| “所有核完成”屏障（原 `orchestrator_done`） | **全局共享** | 全局终止检测（§7） | 固定 G=16 leaf/root arrival + release |
 
 ### 8.4 每核私有的编排状态
 

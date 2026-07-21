@@ -378,23 +378,64 @@ dist_submit_finish_alloc_tail(DistSubmitCtx &ctx, uint64_t completion_begin, uin
 
 #include "dist_engine/aicore/run_state.h"
 
+PTO_DEVICE_FUNC inline void dist_final_barrier_publish(__gm__ volatile int64_t &value) {
+    (void)fdwic_trace_atomic_fetch_add<int64_t>(
+        -1, FdwicAtomicSite::ReplayDoneIncrement, value, 1, /*result_used=*/false
+    );
+}
+
+PTO_DEVICE_FUNC inline bool dist_final_barrier_progress(
+    __gm__ DistCore *self, bool &leaf_forwarded, bool &root_released, bool &leaf_released
+) {
+    const int32_t group = self->block_id % kFinalBarrierGroups;
+    __gm__ FinalBarrierArrival &leaf_arrival = g_dist.final_barrier.leaf_arrivals[group];
+    const bool leaf_leader = self->lane == LANE_AIC && self->block_id == group;
+    if (leaf_leader && !leaf_forwarded &&
+        fdwic_trace_atomic_load(-1, FdwicAtomicSite::ReplayDonePoll, leaf_arrival.v) >= leaf_arrival.expected) {
+        dist_final_barrier_publish(g_dist.final_barrier.root_arrival.v);
+        leaf_forwarded = true;
+    }
+
+    const bool root_leader = leaf_leader && group == 0;
+    if (root_leader && !root_released &&
+        fdwic_trace_atomic_load(-1, FdwicAtomicSite::ReplayDonePoll, g_dist.final_barrier.root_arrival.v) >=
+            g_dist.final_barrier.root_arrival.expected) {
+        dist_final_barrier_publish(g_dist.final_barrier.root_release.v);
+        root_released = true;
+    }
+
+    if (leaf_leader && leaf_forwarded && !leaf_released &&
+        fdwic_trace_atomic_load(-1, FdwicAtomicSite::ReplayDonePoll, g_dist.final_barrier.root_release.v) >= 1) {
+        dist_final_barrier_publish(g_dist.final_barrier.leaf_releases[group].v);
+        leaf_released = true;
+    }
+    return fdwic_trace_atomic_load(
+               -1, FdwicAtomicSite::ReplayDonePoll, g_dist.final_barrier.leaf_releases[group].v
+           ) >= 1;
+}
+
 PTO_DEVICE_FUNC void dist_submit_drain_to_completion(__gm__ DistCore *self) {
     if (self == nullptr) return;
-    (void)fdwic_trace_atomic_fetch_add<int64_t>(
-        -1, FdwicAtomicSite::ReplayDoneIncrement, g_dist.replay_done, 1, /*result_used=*/false
-    );
+    const int32_t final_group = self->block_id % kFinalBarrierGroups;
+    dist_final_barrier_publish(g_dist.final_barrier.leaf_arrivals[final_group].v);
     const uint32_t final_poll_region = fdwic_atomic_poll_region_begin(
         fdwic_atomic_site_mask(FdwicAtomicSite::ReplayDonePoll) |
         fdwic_atomic_site_mask(FdwicAtomicSite::FaninFlagLoad) | fdwic_atomic_block_won_poll_mask()
     );
+    bool leaf_forwarded = false;
+    bool root_released = false;
+    bool leaf_released = false;
+    bool global_release_observed = false;
     while (true) {
         drain_block_won(self);
         const int32_t freed = drain_phase_b(self);
-        const bool all_replayed =
-            fdwic_trace_atomic_load(-1, FdwicAtomicSite::ReplayDonePoll, g_dist.replay_done) >= g_dist.num_workers;
+        if (!global_release_observed) {
+            global_release_observed =
+                dist_final_barrier_progress(self, leaf_forwarded, root_released, leaf_released);
+        }
         const bool ring_empty = self->occupied_count == 0;
         const bool pending = has_pending_won(self);
-        if (all_replayed && ring_empty && !pending) break;
+        if (global_release_observed && ring_empty && !pending) break;
         if (freed == 0) SPIN_WAIT_HINT();
     }
     fdwic_atomic_poll_region_end(final_poll_region);

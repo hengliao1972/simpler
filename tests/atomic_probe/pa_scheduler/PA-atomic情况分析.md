@@ -1817,3 +1817,76 @@ two-16 少 176 cycle / 1.07%，当前只能视为同一档，不能断言三级�
 因此选择协议更简单、层数更少的 **two-16**：standalone 的默认
 `--final-barrier` 改为 `two-16`，`flat/two-4/two-8/three-6x4x4` 仍保留为
 明确对照选项；simpler 生产路径使用固定 G=16 二级 final 树。
+
+#### 7.5.18 simpler 固定 G=16 迁移与复测
+
+2026-07-21 按 §7.5.17.7 的新选型将 simpler final 汇合实现为固定
+G=16 二级树。这里没有把 standalone 的五路 selector 带进生产热路径：
+
+- worker 按 `block_id % 16` 到达 leaf；
+- `block_id == group` 的静态 AIC 代表在本组到齐后向唯一 root 转发；
+- group 0 代表在 root 到齐后发布 root release，各组代表再发布
+  leaf release；
+- 每组期望 worker 数和活跃组数由本轮 `layout[]` 动态推导；
+- 等待全局 release 时仍执行 `drain_block_won()` 和 `drain_phase_b()`，
+  退出条件仍是“全局已 release + 本核 ring 空 + 无 pending won”。
+
+旧 `replay_done` cache line 原位保留，新树追加在 `DistCore[]` 之后，
+不改变已有热字段和每核状态偏移。G=16 树包含 16 条 leaf arrival、
+16 条 leaf release、1 条 root arrival 和 1 条 root release，共
+34 条独立 64 B cache line / 2176 B。`DistGlobal` 总跨度从
+1007023872 B 增至 1007026048 B，standalone 的生产 ABI 镜像同步更新。
+
+##### 7.5.18.1 功能和原子观察门禁
+
+针对性 A5Sim/A5 runtime 构建均成功。A5Sim 的 `block_dim=1` 和
+`block_dim=36` mixed 用例均 PASS；36 blocks 会产生 108 workers，覆盖
+16 个活跃叶组以及 9/6 workers 的不均匀组大小。同一 36-block
+用例开启 level-4 原子记录后 PASS，且：
+
+~~~text
+records=5005 atomic_records=2287 dropped=0
+atomic_calls=240054009 batched_poll_calls=240052141 poll_batch_records=419
+2287 = 240054009 - 240052141 + 419
+ReplayDoneIncrement publications=141
+~~~
+
+141 次发布与协议精确一致：108 次 worker leaf arrival + 16 次 leaf
+代表 root arrival + 1 次 root release + 16 次 leaf release。逐核分布为
+92 个非代表核各1次、15个普通叶代表各3次、root 代表 4 次。
+
+device0 的真实上限为 32 cube blocks / 64 vector blocks，所以 36-block
+真机 smoke 在启动 kernel 前被 runtime 明确拒绝，没有把它记成协议样本。
+真机覆盖由下述 Case1/b256 的 32 blocks / 96 workers 完成；5 轮均
+PASS，每轮恰有 96 条 `FinalDrain` 父记录，`dropped_records=0`，
+schema-v4 全部整数 cycle 闭合。
+
+##### 7.5.18.2 simpler G=8 与 G=16 性能
+
+口径为 A5 device0、Case1/b256、96 workers、PMU off、level-1 泳道；
+G=8 和 G=16 各用 5 个独立进程。每轮的 raw `FinalDrain` 口径为
+96 条父区间的 `max(end)-min(begin)`：
+
+| 形态 | Submit 中位数 | worker completion 中位数 | FinalDrain 中位数 |
+| ---- | -------------: | --------------------------: | --------------------: |
+| 原 flat | 4865.112 us | 4929.698 us | 458.143 us |
+| G=8 | 4731.252 us | 4778.583 us | 358.038 us |
+| **G=16** | **4727.264 us** | **4764.885 us** | **345.774 us** |
+
+G=16 相对 G=8 的 Submit 只差 `-3.988 us / -0.084%`，负对照基本重合；
+FinalDrain 减少 `12.264 us / 3.425%`，完整 worker completion 减少
+`13.698 us / 0.287%`。对这 10 个 G=8/G=16 Submit span 统一使用极端
+Tukey 界限，`[Q1-3*IQR, Q3+3*IQR] = [4706.716, 4753.742] us`，
+没有剔除任何样本。
+
+G=16 相对原 flat 的 FinalDrain 中位数为 `-112.369 us / -24.527%`，
+完整 completion 为 `-164.813 us / -3.343%`。但 flat 与分层实现使用不同
+`.text` 且未交错，其 Submit 也相差 2.833%，所以不把完整墙钟差异全部
+归因于 final 树。G=8 和 G=16 的 PA 链接产物 `.text` 都是
+216912 B，`.rodata` 都是 500 B；相对原 flat 的 203344 B，
+`.text` 增加 13568 B / 6.672%。
+
+选型的主证据仍是 §7.5.17.7 的 200 次交错屏障微基准；本节证明
+G=16 在 simpler 完整 PA 中功能正确，且 FinalDrain 相对 G=8 继续向好。
+完整 worker completion 差异仅 0.287%，低于 5% 门槛，因此不启动
+I-cache PMU 对比。

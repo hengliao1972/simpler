@@ -19,9 +19,11 @@
 void dist_dump_state(int) {
     fprintf(stderr, "\n===== DIST STATE DUMP =====\n");
     fprintf(
-        stderr, "frontier=%ld H=%d ring=%zuB replay_done=%ld/%d num_blocks=%d fatal=%d\n",
+        stderr, "frontier=%ld H=%d ring=%zuB final_root=%ld/%d release=%ld num_blocks=%d fatal=%d\n",
         static_cast<long>(atomic_load(g_dist.frontier, __ATOMIC_RELAXED)), g_dist.H, g_dist.heap_size,
-        static_cast<long>(atomic_load(g_dist.replay_done, __ATOMIC_RELAXED)), g_dist.num_workers, g_dist.num_blocks,
+        static_cast<long>(atomic_load(g_dist.final_barrier.root_arrival.v, __ATOMIC_RELAXED)),
+        g_dist.final_barrier.root_arrival.expected,
+        static_cast<long>(atomic_load(g_dist.final_barrier.root_release.v, __ATOMIC_RELAXED)), g_dist.num_blocks,
         atomic_load(g_dist.fatal, __ATOMIC_RELAXED)
     );
     fprintf(stderr, "cube_cursor[%d]=", kCursorShards);

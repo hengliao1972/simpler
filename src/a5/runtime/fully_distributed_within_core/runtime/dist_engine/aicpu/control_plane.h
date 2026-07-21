@@ -49,6 +49,14 @@ void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_
     atomic_exchange(g_dist.fatal, int32_t{0}, __ATOMIC_RELAXED);
     atomic_exchange(g_dist.replay_done, int64_t{0}, __ATOMIC_RELAXED);
     atomic_exchange(g_dist.started_count, int64_t{0}, __ATOMIC_RELAXED);
+    for (int32_t group = 0; group < kFinalBarrierGroups; group++) {
+        atomic_exchange(g_dist.final_barrier.leaf_arrivals[group].v, int64_t{0}, __ATOMIC_RELAXED);
+        g_dist.final_barrier.leaf_arrivals[group].expected = 0;
+        atomic_exchange(g_dist.final_barrier.leaf_releases[group].v, int64_t{0}, __ATOMIC_RELAXED);
+    }
+    atomic_exchange(g_dist.final_barrier.root_arrival.v, int64_t{0}, __ATOMIC_RELAXED);
+    g_dist.final_barrier.root_arrival.expected = 0;
+    atomic_exchange(g_dist.final_barrier.root_release.v, int64_t{0}, __ATOMIC_RELAXED);
     g_dist.orch_args = orch_args;
     g_dist.rt = rt;
     g_dist.runtime = runtime;
@@ -80,6 +88,17 @@ void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_
             atomic_exchange(g_dist.blocks[b].slots[s].state.v, int64_t{0}, __ATOMIC_RELAXED);
         }
     }
+    int32_t active_final_groups = 0;
+    for (int32_t i = 0; i < num_workers && i < RUNTIME_MAX_WORKER; i++) {
+        const int32_t block_id = g_dist.layout[i].block_id;
+        if (block_id < 0) continue;
+        const int32_t group = block_id % kFinalBarrierGroups;
+        ++g_dist.final_barrier.leaf_arrivals[group].expected;
+    }
+    for (int32_t group = 0; group < kFinalBarrierGroups; group++) {
+        if (g_dist.final_barrier.leaf_arrivals[group].expected != 0) ++active_final_groups;
+    }
+    g_dist.final_barrier.root_arrival.expected = active_final_groups;
 
 #if DIST_SIM_HOST_CLOCK
     fprintf(

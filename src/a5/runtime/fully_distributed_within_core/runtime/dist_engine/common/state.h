@@ -229,6 +229,7 @@ static_assert(offsetof(DistCore, slots) % 64 == 0, "DistCore slots must be cache
 static_assert(offsetof(DistCore, task_payloads) % 64 == 0, "DistCore task_payloads must be cacheline-aligned");
 
 constexpr int32_t kCursorShards = 4;
+constexpr int32_t kFinalBarrierGroups = 16;
 constexpr size_t kCacheLine = 64;
 static_assert(PTO2_PACKED_OUTPUT_ALIGN >= kCacheLine);
 static_assert((PTO2_PACKED_OUTPUT_ALIGN % kCacheLine) == 0);
@@ -245,6 +246,27 @@ struct DistTaskCell {
     uint8_t pad[kCacheLine - sizeof(int64_t) - sizeof(uint64_t)];
 };
 static_assert(sizeof(DistTaskCell) == kCacheLine);
+
+struct alignas(kCacheLine) FinalBarrierArrival {
+    volatile int64_t v;
+    volatile int32_t expected;
+    uint8_t pad[kCacheLine - sizeof(int64_t) - sizeof(int32_t)];
+};
+static_assert(sizeof(FinalBarrierArrival) == kCacheLine, "final barrier arrival must occupy one cacheline");
+
+struct alignas(kCacheLine) FinalBarrierRelease {
+    volatile int64_t v;
+    uint8_t pad[kCacheLine - sizeof(int64_t)];
+};
+static_assert(sizeof(FinalBarrierRelease) == kCacheLine, "final barrier release must occupy one cacheline");
+
+struct alignas(kCacheLine) FinalBarrierState {
+    FinalBarrierArrival leaf_arrivals[kFinalBarrierGroups];
+    FinalBarrierRelease leaf_releases[kFinalBarrierGroups];
+    FinalBarrierArrival root_arrival;
+    FinalBarrierRelease root_release;
+};
+static_assert(sizeof(FinalBarrierState) == 34 * kCacheLine, "final barrier state size changed");
 
 struct DistGlobal {
     PaddedCursor cube_cursor[kCursorShards];
@@ -274,6 +296,8 @@ struct DistGlobal {
     uint8_t blocks_pad[24];
     BlockWon blocks[kDistRuntimeMaxWorker];
 
+    // Retained in place for the existing DistGlobal hot-field ABI. Final
+    // completion now uses final_barrier after cores instead of this flat line.
     volatile int64_t replay_done;
     uint8_t replay_done_pad[kCacheLine - sizeof(int64_t)];
 
@@ -281,6 +305,10 @@ struct DistGlobal {
     uint8_t started_count_pad[kCacheLine - sizeof(int64_t)];
 
     DistCore cores[kDistRuntimeMaxWorker];
+
+    // Keep all existing hot-field and DistCore offsets stable. Only the tail
+    // grows for the fixed two-level G=16 final barrier.
+    FinalBarrierState final_barrier;
 };
 static_assert(offsetof(DistGlobal, frontier) % 64 == 0, "DistGlobal frontier must be cacheline-aligned");
 static_assert(offsetof(DistGlobal, tasks) % 64 == 0, "DistGlobal tasks must be cacheline-aligned");
@@ -289,6 +317,9 @@ static_assert(offsetof(DistGlobal, blocks) % 64 == 0, "DistGlobal blocks must be
 static_assert(offsetof(DistGlobal, replay_done) % 64 == 0, "DistGlobal replay_done must be cacheline-aligned");
 static_assert(offsetof(DistGlobal, started_count) % 64 == 0, "DistGlobal started_count must be cacheline-aligned");
 static_assert(offsetof(DistGlobal, cores) % 64 == 0, "DistGlobal cores must be cacheline-aligned");
+static_assert(
+    offsetof(DistGlobal, final_barrier) % 64 == 0, "DistGlobal final barrier must be cacheline-aligned"
+);
 
 static_assert(sizeof(DistGlobal) <= kDistEngineGlobalStateSize, "DistGlobal exceeds the reserved runtime arena size");
 static_assert(

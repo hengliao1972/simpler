@@ -392,21 +392,25 @@ AICPU 调用 `dist_engine_register()` 时，会为本轮运行写入或重置：
 - `orch_args`：本轮 orchestration 的输入参数入口；
 - 三组 claim cursor：重置为 `-1`；
 - task cell、frontier、fatal：重置为未完成状态；
-- `started_count/replay_done`：重置为 0。
+- `started_count/replay_done`：重置为 0；`replay_done` 仅保留原有 ABI 位置；
+- 固定 G=16 final 树：重置 leaf/root arrival 和 release，并根据本轮
+  `layout[]` 写入每个活跃叶组的 worker 数与活跃组数。
 
 这些数据不是每个 task 都重新生成，但它们是每次算子运行的动态上下文。例如同一个程序
 用不同 worker 数运行时，`layout[]` 和 `num_blocks` 会随本轮资源重新推导。
 
 worker 进入 `dist_core_main()` 后，先原子增加 `started_count`。所有 worker 到齐后才开始
 重放，避免一部分核已经提交很远、另一部分核尚未启动。每个 worker 重放完 orchestration
-后增加 `replay_done`，但仍会继续 drain 已经排队的 slot；只有全部 worker 重放结束且本核
-没有待执行 slot/`block.won` 时，才退出。
+后原子增加 `final_barrier.leaf_arrivals[block_id % 16]`。每组的静态 AIC 代表在本组
+到齐后向 root 转发一次；root 收到全部活跃组后发布全局 release，各组代表
+再发布本组 release。等待过程中 worker 仍继续 drain 已经排队的 slot；只有观察到
+本组的全局 release，且本核没有待执行 slot/`block.won` 时，才退出。
 
 因此：
 
 ```text
 started_count 表示“多少 worker 已进入本轮”
-replay_done   表示“多少 worker 已生成完全部逻辑 task”
+final leaf/root/release 表示“所有 worker 是否已生成完全部逻辑 task”
 task flags    表示“具体 kernel task 是否执行完成”
 ```
 
@@ -1597,7 +1601,7 @@ dist_core_main(runtime, core_idx, core_type)
 3. reset 本核 `DistCore`；
 4. 参与 `started_count` 启动屏障；
 5. 重放完整 orchestration；
-6. 发布 `replay_done`；
+6. 到达固定 G=16 final 树，并等待全局 release；
 7. drain 本核和 `block.won` 的剩余任务；
 8. 发布 worker done；
 9. 返回 AICore executor，等待 AICPU EXIT。
@@ -1934,14 +1938,14 @@ AICore: 进入 dist_core_main
 | `frontier` | 从 0 开始连续完成到哪个 task？ |
 | `WonSlot.remaining` | 某 MIX task 还有几个 lane 未完成？ |
 | `DistCore.occupied_count` | 本核还有几个 private slot？ |
-| `replay_done` | 有多少 worker 已生成完全部 task？ |
+| final leaf/root/release | 所有 worker 是否已生成完全部 task？ |
 | `Runtime::dist.done_count`/COND | 有多少 worker 已退出 dist engine？ |
 | `runtime_done_` | AICPU setup thread 是否结束等待？ |
 | host stream sync | 整个 device operation 是否已结束？ |
 
-例如 `replay_done == num_workers` 只表示所有核都走完 orchestration 源码，不能立刻退出；
-private ring 中可能仍有等待 producer 的任务。每核还要 drain 到 ring 空且没有待收取的
-`block.won`。
+例如观察到 final leaf release 只表示所有核都走完 orchestration 源码，不能立刻
+退出；private ring 中可能仍有等待 producer 的任务。每核还要 drain 到 ring 空且
+没有待收取的 `block.won`。
 
 ### 17.3 Task completion 的发布顺序
 
@@ -2160,11 +2164,11 @@ completion 和 AICPU handoff 都属于这一类。
 
 - 等某个 producer：看 task flag；
 - 回收连续历史：看 frontier；
-- 判断所有核生成完图：看 replay_done；
+- 判断所有核生成完图：看 final 树的本组 release；
 - 判断本核可退出：还要 ring 空、无 pending won；
 - 判断 host 可回收本轮：等 stream 完成。
 
-拿 `replay_done` 代替 task completion，或拿 frontier 代替最慢 core progress，都会在并发
+拿 final release 代替 task completion，或拿 frontier 代替最慢 core progress，都会在并发
 速度变化后出错。
 
 ### 20.5 所有有界结构都需要反压或失败语义
@@ -2242,7 +2246,7 @@ post-kernel flush 前必须证明不会写回陈旧控制 cacheline，也不能�
 | `block.won` | MIX follower 不执行 | state/payload/drained/remaining |
 | kernel call | 进入 slot 后 hang/mismatch | func id、args ABI、输入可见性 |
 | completion | kernel 返回但后继不跑 | data flush、flag、frontier |
-| drain/exit | task 完成但 host timeout | replay_done、ring、COND/EXIT |
+| drain/exit | task 完成但 host timeout | final leaf/root/release、ring、COND/EXIT |
 | validate | device 对、host 错 | D2H 和 top-level direction |
 
 ### 21.2 不同改动从哪里下手

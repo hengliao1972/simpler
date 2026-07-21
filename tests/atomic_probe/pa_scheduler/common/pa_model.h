@@ -87,7 +87,8 @@ constexpr uint32_t kClaimAttempted = 1U << 1;
 // offset、DistCore ABI 和 kRealDistGlobalBytes 总跨度；其余区域可用 opaque padding，
 // 并不是对生产结构全部字段的逐一镜像。
 constexpr size_t kRealDistCoreOffset = 10043904;
-constexpr size_t kRealDistGlobalBytes = 1007023872;
+constexpr size_t kRealDistGlobalBytes = 1007026048;
+constexpr size_t kRealFinalBarrierBytes = 2176;
 constexpr size_t kRealTasksOffset = 896;
 constexpr size_t kRealFatalOffset = 4195264;
 constexpr size_t kRealReplayDoneOffset = 10043776;
@@ -905,9 +906,12 @@ struct alignas(64) SchedulerState {
     uint8_t layout_and_block_won[5848440];
     AtomicLine replay_done;
     AtomicLine started_count;
-    // started_count 形成 launch 屏障；replay_done 只用于最终 drain 判定所有 worker
-    // 已不再产生新 slot。两者都位于 Submit 性能口径之外，但属于完整协议。
+    // started_count 形成 launch 屏障。生产路径已将 final 汇合迁移到
+    // DistGlobal 尾部的固定 G=16 树，replay_done 原位保留以维持后续字段 ABI。
     WorkerState workers[kRuntimeMaxWorkers];
+    // 生产 DistGlobal 在 cores 后追加的固定 G=16 final 树。standalone
+    // 自己的五形态实验状态仍放在 controls 之后，两者不混用。
+    uint8_t production_final_barrier[kRealFinalBarrierBytes];
     // Standalone-only controls live after the complete DistGlobal image. They
     // therefore do not shift any cursor/task/fatal/worker address under test.
     RunConfig config;
