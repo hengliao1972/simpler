@@ -19,6 +19,7 @@ PA 优化能够从可复核的源码、提交、实测数据和产物继续推�
 | **[历史证据]** | 对当时源码和构建有效，不能自动代表当前 HEAD |
 | **[受限]** | 已确认存在平台、模型或验证覆盖边界 |
 | **[设计中]** | 只有经过源码核对的方案，尚无完成提交或性能结论 |
+| **[验证中]** | 候选已落盘并通过部分门禁，但尚未完成真实 A5 正确性或性能裁决 |
 
 记录更新至 2026-07-21。当前分支为
 `fdwic-swimlane-exclusive`，本阶段开始时 HEAD 为 `9f6140c1`，跟踪
@@ -183,7 +184,11 @@ outputs/TestPagedAttentionUnroll_Case1_20260717_023809/
 | 2026-07-21 | `36547252` | 上板验证 | 闭合完整 Submit 与 Register 分段三件套 |
 | 2026-07-21 | `21e0414c` | 观察工具 | 建立排除 linked Kernel 的 EfDrain-control 固定容量 PMU |
 | 2026-07-21 | `77df3959` | 上板验证 | 闭合 EfDrain-control 的实际 K、N+K 与构建三件套 |
-| 2026-07-21 | 本阶段提交 | 原因取数 | 形成 EfDrain-control 的首轮 Case1 AIC/AIV 稳态数据 |
+| 2026-07-21 | `159f3c4c` | 原因取数 | 形成 EfDrain-control 的首轮 Case1 AIC/AIV 稳态数据 |
+| 2026-07-21 | `7131bdf5` | 负结果 | 记录并撤回 BlockWon 慢路冷外提 |
+| 2026-07-21 | `0d6547b9` | 观察回归 | 补齐 I-cache 观察链与 schema-v4 atomic 组合门禁 |
+| 2026-07-21 | `970e4fad` | 正确性门禁 | 直接覆盖真实 FDWIC TensorMap 清退语义 |
+| 2026-07-21 | `2dc49a13` | 优化候选 | 跳过 PrepareMap 空 task-head 的冗余 GM 写回 |
 
 ### 4.1 真实 PA 第一轮 atomic 与前端优化
 
@@ -3919,5 +3924,114 @@ git diff --check
 INOUT 建立 map 链，因而每核可静态得到 243 个非空 head 和 972 个空 head。若只在
 `cur == -1` 时跳过原本再次写入 `-1` 的 GM store，96 核理论上删除 93,312 次
 冗余写，且影响严格落在 PrepareMap（现有 aggregate 24,512,711 ticks、占
-SubmitUnion 6.1493%）。该候选尚未写入生产源码、没有性能结论；恢复上板后仍须先
-做编译/反汇编，再依次通过 B1、perf-clock 交错 A/B 和泳道 PrepareMap 归因。
+SubmitUnion 6.1493%）。截至 O8，该候选尚未写入生产源码、没有性能结论；其后续
+实现、离线门禁和真实 A5 待办由 P2 单独记录。
+
+### 2026-07-21 / P2：PrepareMap 空 task-head 快路
+
+状态：**[验证中：离线门禁完成，待真实 A5 裁决]**
+
+#### 候选边界与机会量
+
+真实实现位于
+`src/a5/runtime/fully_distributed_within_core/runtime/dist_engine/aicore/tensor_map.h`
+的 `dist_tensor_map_advance_retire()`。原逻辑读取每个已退休 task 对应的
+`task_heads[slot]`；即使值已经是空链哨兵 `-1`，也会在不进入释放循环后再次向同一
+GM 地址写入 `-1`。
+
+提交 `2dc49a13` 只增加以下精确快路：
+
+```cpp
+int32_t cur = self.task_heads[id & kTaskWindowMask];
+if (cur == -1) continue;
+```
+
+这里不能写成 `cur < 0`：原实现会把小于 `-1` 的异常负值归一为 `-1`，精确比较才
+保持该防御行为。`continue` 只结束当前 id；循环后的 `cleaned_upto` 和
+`alive_floor` 仍统一推进，非空 task 链、bucket 双向链和 free-list 完全走原路径。
+每个 worker 独占自己的 `DistCore::map`，真实路径也没有第二个执行流依赖“把已经是
+`-1` 的普通字段再写一次”这个物理写事件。
+
+Case1 每核 1,280 次 Submit，`H=64`，实际清退 task id `0..1214`。五任务序列中
+只有 UP 的四个 INOUT 建立 map 链，因此清退范围内有 243 个非空 head、972 个空
+head；96 核静态机会量为 **93,312 次冗余 GM store**。该数字只证明候选有真实
+命中机会，不等于已经取得 93,312 次写延迟之和，更不是墙钟收益。
+
+#### 直接生产语义单测
+
+提交 `970e4fad` 新增 no-hardware C++ 测试，直接包含生产 `tensor_map.h`，没有复用
+standalone 或旧 ring-per-bucket 模型。测试将生产 retire 与优化前控制流做完整状态
+差分，覆盖：
+
+- 正常 `-1` 空 head 与异常 `-2` 归一化；
+- 同 task 多 entry、bucket 头/中间摘链和 free-list 顺序；
+- `kTaskWindow` 槽复用、重复 floor 和回退 floor；
+- 所有未触及 entry/相邻字段的逐字节一致性。测试使用显式 `memcpy` 克隆并要求
+  `DistTensorMap` 可平凡复制，避免结构体 padding 导致跨编译器假失败。
+
+本用户 GCC 15 的验证结果为：
+
+```text
+test_fdwic_swimlane_poll_batch
+test_fdwic_tensor_map_retire
+    2/2 passed
+```
+
+其中 CaseB1 不能替代这项门禁：它每核只有 5 次 Submit，而 `H=64`，不会进入 retire
+循环。后续真实 A5 的 CaseB1 只可作为构建冒烟；候选正确性必须至少包含一次不跳过
+golden 的 Case1。
+
+#### 真实 CCEC 代码生成
+
+基线和候选均通过真实 PA 的
+`TestPagedAttentionUnroll.compile_chip_callable("a5")`、`perf-clock` 编译门构建；
+该入口只编译 orchestration、四个子 kernel 和 FDWIC AICore override，没有创建
+Worker、调用 ACL 或连接设备。基线绑定提交 `970e4fad`，候选使用同一提交加单文件
+工作树差异；source-v2 指纹分别为：
+
+```text
+baseline  2732d4ad0ee67e920d24cc5c66d6a300c86fc9904c7ba65dc53168e8694f841d
+candidate fae3c47f0bbf7562b3b1cbd264ef80b2df2c7f6750580327a64fa61a30f9c751
+```
+
+使用 CANN 9.1 `dav_3510` PEM decoder 检查 AIC/AIV 合并对象中的四类真实内联入口，
+八处结果全部闭合：
+
+| 入口 | AIC 函数体 | AIV 函数体 | 控制流结论 |
+| --- | ---: | ---: | --- |
+| `dist_submit_impl` | 5,656→5,664 B | 5,660→5,668 B | `-1` 跳到 id 递增；其他负值跳到 reset store |
+| `dist_alloc_tensors` | 5,344→5,352 B | 5,404→5,412 B | 同上 |
+| `dist_submit_compete_first_finish` | 2,572→2,580 B | 2,608→2,620 B | 同上 |
+| `dist_alloc_compete_first_finish` | 3,008→3,016 B | 3,024→3,044 B | 同上 |
+
+基线中负值分支先落到 id 递增，随后仍顺序执行 reset store；候选把 reset store 移到
+递增之前，并增加精确 sentinel 比较：相等分支直接落到递增，非 `-1` 的负值分支仍
+落到 store。由此可以确认编译器没有把源码快路重新折叠回旧行为。
+
+这项改动也有可见代码布局代价：AIC combined `.text` 增加 32 B；AIV combined 和
+最终 ELF 的 `.text` 因对齐保持不变，但各内联函数体仍有上述增加。布局变化只证明
+机器码形态，不能替代 perf-clock 性能结论。
+
+#### A5Sim Case1
+
+候选使用本用户 `.venv`、GCC 15 和当前 PTO-ISA 跑通真实 simpler PA 的 A5Sim
+Case1，完整执行 256 batch 和 golden：
+
+```text
+TestPagedAttentionUnroll::test_run
+    1 passed in 81.02s
+```
+
+该结果证明模拟路径的 1,280 次 Submit、retire 和 TensorMap 最终输出没有回归；它不
+是 A5 性能数据。
+
+#### 待完成的真实 A5 裁决
+
+当前按要求停在上板之前，不把离线结果写成“已保留”。恢复上板后的固定顺序为：
+
+1. Case1 不带 `--skip-golden`，闭合真实设备正确性；B1 仅作构建冒烟；
+2. 同一环境交错运行基线 A / 候选 B 的 `perf-clock` Case1，由完整 Submit 墙钟决定
+   保留或撤回；
+3. 仅当 perf-clock 有稳定收益时，再用合并泳道确认变化落在 PrepareMap，业务 span、
+   Submit 数和 atomic 次数不变；
+4. 只有仍需解释 I-cache 方向时，才增加 PrepareMap 单阶段 PMU，不预先扩张观察面。
