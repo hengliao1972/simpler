@@ -1055,6 +1055,101 @@ outputs/wait_ib_official_msopprof_20260719_b1_probe4_default/
 
 因此当前 A5 正式可编程路径的结论是：**不能采集这两个指标**。CANN 共享 `msopprof` 二进制包含相应字段字符串、官方文档也在 A2/A3 产品章节解释其含义，但这些证据不能推出 DAV3510 selector。不得把旧架构或其他产品的事件号套到 A5。若后续 CANN/A5 正式事件表新增这两项，必须重新用 scalar NOP、I-cache warm/cold、真实 Vector/Cube `PIPE_* -> PIPE_S` wait 和依赖 atomic 四组对照校准后再纳入报告。
 
+#### A5 真实 Vector 流水的 `scalar_busy` 归类验证
+
+2026-07-22 在同一台 A5/DAV3510、CANN 9.1 weekly 20260708 上新增了单 AIV
+受控探针，专门回答“执行真实 Vector 计算时，PMU total 中是否以
+`scalar_instr_busy(0x001)` 为主”。探针源码和独立 runner 为：
+
+```text
+tests/atomic_probe/ccec/vector_scalar_pmu.cpp
+tests/atomic_probe/ccec/vector_scalar_pmu_host.cpp
+tests/atomic_probe/ccec/vector_scalar_pmu_shared.h
+tests/atomic_probe/ccec/run_vector_scalar_pmu.sh
+```
+
+运行命令为：
+
+```bash
+cd tests/atomic_probe/ccec
+./run_vector_scalar_pmu.sh
+```
+
+测试基线是 `fdwic-swimlane-deps@7bd59a8f`。被测 `VECTOR_ADD` 循环与
+`pa_scheduler/ccec/ccec_ops.h` 的 `RunRealVectorWorkload<false>` 保持相同
+流水顺序，tile 为 `128 x 128 x float`：
+
+```text
+TLOAD(A) + TLOAD(B)
+MTE2 -> V set/wait
+TADD
+V -> MTE3 set/wait
+TSTORE
+MTE3 -> S set/wait
+```
+
+每轮从 GM 读取 128 KiB、写回 64 KiB；最后的 `MTE3 -> S wait_flag`
+保证本轮写回完成后才进入下一轮。PMU gate 只包住三种可替换工作负载：
+
+- `EMPTY`：空窗口，用于确认 gate 固有成本；
+- `LOOP_CONTROL`：相同运行时循环次数，每轮只有一个 scalar NOP，不向
+  Vector/MTE 发工作；
+- `VECTOR_ADD`：上面的完整真实流水。
+
+探针直接复用 standalone 已验证的 10-slot PMU owner，而不是新增一套寄存器
+协议。该构建固定 `PA_BUILD_SUBMIT_PMU=0`，所以同一窗口内的 selector 是
+`CNT0=vector(0x501)`、`CNT2=scalar(0x001)`、`CNT4=MTE2(0x202)`、
+`CNT5=MTE3(0x203)`、`CNT6=request(0x034)`、`CNT7=miss(0x035)`；kernel
+逐项回读得到 `selector_status=0x3f` 后才接受样本。每个工作量先各模式预热
+一次，再采 5 个 `EMPTY -> LOOP_CONTROL -> VECTOR_ADD` 配对样本。五轮都落在
+同一物理 AIV 18，16,384 个输出元素都严格等于 `2.0 + 3.0 = 5.0`，I-cache
+miss 都为 0，96 个 active owner slot、32 个完整 `1 AIC + 2 AIV` triplet
+和最终 Restore 全部通过。
+
+本机 `task-submit` 与 `npu-smi` 均不在 `PATH`，本轮按用户明确给出的
+“没有 `npu-smi` 直接运行”许可执行，因此属于 unlocked 采样。五轮同窗计数
+高度稳定，足以回答本节的 PMU 状态归类问题；这些绝对耗时不作为跨进程或跨设备
+性能基线。
+
+5 轮中位数如下。`non-scalar residual` 只按定义计算
+`total - scalar_busy`：
+
+| rounds | mode | SYS_CNT | PMU total | scalar busy | non-scalar residual | scalar/total | vector busy | MTE2 busy | MTE3 busy |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | `EMPTY` | 45 ns | 66 | 62 | 4 | 93.9394% | 0 | 0 | 0 |
+| 16 | `LOOP_CONTROL` | 186 ns | 299 | 299 | 0 | 100.0000% | 0 | 0 | 0 |
+| 16 | `VECTOR_ADD` | 31,312 ns | 51,659 | 262 | 51,397 | **0.5072%** | 14,976 | 23,233 | 12,869 |
+| 128 | `EMPTY` | 45 ns | 66 | 62 | 4 | 93.9394% | 0 | 0 | 0 |
+| 128 | `LOOP_CONTROL` | 1,212 ns | 1,993 | 1,993 | 0 | 100.0000% | 0 | 0 | 0 |
+| 128 | `VECTOR_ADD` | 239,067 ns | 394,488 | 1,718 | 392,770 | **0.4355%** | 119,808 | 185,881 | 84,519 |
+
+两个工作量的 `VECTOR_ADD - LOOP_CONTROL` 配对中位数斜率也一致：
+
+| rounds | PMU total/轮 | scalar busy/轮 | vector busy/轮 | MTE2 busy/轮 | MTE3 busy/轮 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | 3,210.0000 | -2.3125 | 936.0000 | 1,452.0625 | 804.3125 |
+| 128 | 3,066.3672 | -2.1484 | 936.0000 | 1,452.1953 | 660.3047 |
+
+这里的负 `scalar busy/轮` 不是“Vector 产生负周期”，而是
+`LOOP_CONTROL` 的 scalar 循环在几乎整个短窗口内都 busy；真实 Vector 循环发出
+异步指令后大部分时间不满足 `scalar_instr_busy` 条件，所以其 scalar 增量反而
+略低。频率也得到独立交叉检查：16 轮的 `51,659 / 1.65 = 31,308.5 ns`，
+128 轮的 `394,488 / 1.65 = 239,083.6 ns`，分别与 1 GHz SYS_CNT 的
+31,312 ns 和 239,067 ns 对齐。
+
+本次可以下的结论是：**对这条带每轮最终 `MTE3 -> S wait_flag` 的 TADD
+真实流水，Scalar 并非大部分时间处于 `scalar_busy`；`scalar_busy` 只占
+0.44%～0.51%，`total - scalar_busy` 占 99.49% 以上。** 因而该路径上的
+Vector/MTE 执行和等待没有被 `0x001` 大量记入 scalar busy。完整 Submit 曾观察到
+的约 70% AIV scalar ratio 不能外推到这个 Vector 循环，更不能据此判断 I-cache
+miss；它还包含 PA 调度、atomic、轮询和其他 scalar 控制路径。
+
+边界同样必须保留：本轮只验证了 TADD 分支，没有验证 TMUL/Cube；
+`vector_busy`、`MTE2 busy`、`MTE3 busy` 可能彼此或与 scalar 状态重叠，不能求和
+还原 total；`total - scalar_busy` 仍只能叫“非 Scalar-busy 残余”，其中同时包含
+Vector/MTE 执行、DMA/存储等待、同步等待和流水空隙，不能进一步改名为
+`wait_flag` 时间、Scalar idle 或 I-cache stall。
+
 shadow PMU counter 是 read-to-clear。任一 running phase 在阶段 begin 读取 CNT8/CNT5，将之前的片段加入 shadow whole；在 end 再读一次，同时加入 shadow whole 和所选 phase；PMU whole gate stop 后读 tail。`none` 不做中途读取，只在 stop 后取 tail。
 
 `none` 对每个物理子核必须精确满足：
