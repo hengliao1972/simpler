@@ -60,6 +60,10 @@ constexpr size_t kFdwicSubmitPmuCompiledBytes = kFdwicSubmitPmuPhaseBytes;
 constexpr FdwicSubmitPmuPhase kFdwicSubmitPmuCompiledPhase = FdwicSubmitPmuPhase::PrepareMap;
 constexpr uint16_t kFdwicSubmitPmuCompiledMode = kFdwicSubmitPmuModePrepareMap;
 constexpr size_t kFdwicSubmitPmuCompiledBytes = kFdwicSubmitPmuPhaseBytes;
+#elif PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 9
+constexpr FdwicSubmitPmuPhase kFdwicSubmitPmuCompiledPhase = FdwicSubmitPmuPhase::Fanin;
+constexpr uint16_t kFdwicSubmitPmuCompiledMode = kFdwicSubmitPmuModeFanin;
+constexpr size_t kFdwicSubmitPmuCompiledBytes = kFdwicSubmitPmuPhaseBytes;
 #else
 #error "invalid real FDWIC submit-PMU phase"
 #endif
@@ -423,7 +427,14 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_submit_end(int32_t task_id) {
 #else
     const uint32_t expected_phase_calls =
         fdwic_submit_pmu_expected_phase_calls(kFdwicSubmitPmuCompiledPhase, g_fdwic_submit_pmu_expected_submits);
-    if (phase.begin_reads == expected_phase_calls && phase.end_reads == expected_phase_calls) {
+    const bool shape_valid = fdwic_submit_pmu_phase_has_dynamic_calls(kFdwicSubmitPmuCompiledPhase) ?
+                                 phase.begin_reads == phase.end_reads &&
+                                     phase.begin_reads <= fdwic_submit_pmu_dynamic_calls_max_per_core(
+                                                              kFdwicSubmitPmuCompiledPhase,
+                                                              g_fdwic_submit_pmu_expected_submits
+                                                          ) :
+                                 phase.begin_reads == expected_phase_calls && phase.end_reads == expected_phase_calls;
+    if (shape_valid) {
         phase.status |= kFdwicSubmitPmuPhaseShapeValid;
     }
 #endif
@@ -432,8 +443,11 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_submit_end(int32_t task_id) {
         phase.shadow_misses <= g_fdwic_submit_pmu_icache_misses) {
         phase.status |= kFdwicSubmitPmuPhaseValuesOrdered;
     }
-    if (phase.phase_elapsed_ticks != 0 &&
-        phase.phase_elapsed_ticks <= g_fdwic_submit_pmu_end_tick - g_fdwic_submit_pmu_start_tick) {
+    const bool zero_call_dynamic = fdwic_submit_pmu_phase_has_dynamic_calls(kFdwicSubmitPmuCompiledPhase) &&
+                                   phase.begin_reads == 0 && phase.end_reads == 0;
+    if ((zero_call_dynamic && phase.phase_elapsed_ticks == 0) ||
+        (!zero_call_dynamic && phase.phase_elapsed_ticks != 0 &&
+         phase.phase_elapsed_ticks <= g_fdwic_submit_pmu_end_tick - g_fdwic_submit_pmu_start_tick)) {
         phase.status |= kFdwicSubmitPmuPhaseTimeValid;
     }
 #endif

@@ -52,6 +52,7 @@ REGISTER_CAPTURE_MODE = "submit-pmu-register"
 SUBMIT_TRANSITION_CAPTURE_MODE = "submit-pmu-submit-transition"
 EFDRAIN_CONTROL_CAPTURE_MODE = "submit-pmu-efdrain-control"
 PREPARE_MAP_CAPTURE_MODE = "submit-pmu-prepare-map"
+FANIN_CAPTURE_MODE = "submit-pmu-fanin"
 ARG_BUILD_PHASE_ID = 1
 EMPTY_BRACKET_PHASE_ID = 2
 MATERIALIZE_PHASE_ID = 3
@@ -60,6 +61,7 @@ REGISTER_PHASE_ID = 5
 SUBMIT_TRANSITION_PHASE_ID = 6
 EFDRAIN_CONTROL_PHASE_ID = 7
 PREPARE_MAP_PHASE_ID = 8
+FANIN_PHASE_ID = 9
 PHASE_CONFIG_BY_MODE = {
     ARG_BUILD_CAPTURE_MODE: {
         "id": ARG_BUILD_PHASE_ID,
@@ -125,7 +127,16 @@ PHASE_CONFIG_BY_MODE = {
         "counter_semantics": "running_read_clear_observed_bracket",
         "time_semantics": "inner_sys_cnt_between_boundary_observers",
     },
+    FANIN_CAPTURE_MODE: {
+        "id": FANIN_PHASE_ID,
+        "name": "fanin",
+        "boundary": "fanin_begin_to_fanin_end",
+        "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+        "counter_semantics": "running_read_clear_observed_bracket",
+        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+    },
 }
+DYNAMIC_PHASE_CAPTURE_MODES = frozenset({FANIN_CAPTURE_MODE})
 
 
 def _expected_compile_definitions(profile: str) -> tuple[str, ...]:
@@ -372,6 +383,15 @@ def _expected_phase_calls(mode: str, expected_submits: int) -> int:
     return expected_submits
 
 
+def _expected_dynamic_phase_calls(mode: str, expected_submits: int) -> dict[str, int]:
+    if expected_submits % 5:
+        _fail(f"{mode} requires expected_submits_per_core divisible by 5")
+    batches = expected_submits // 5
+    if mode == FANIN_CAPTURE_MODE:
+        return {"all": 4 * batches, "aic": 2 * batches, "aiv": 2 * batches}
+    _fail(f"{mode} has no dynamic phase call formula")
+
+
 def _validate_capture_header(data: dict[str, Any]) -> tuple[str, dict[str, Any], int, dict[str, float]]:
     _require_equal(data.get("schema"), SCHEMA_NAME, "schema")
     capture = _object(data.get("capture"), "capture")
@@ -399,11 +419,17 @@ def _validate_capture_header(data: dict[str, Any]) -> tuple[str, dict[str, Any],
         if "phase" in configuration:
             _fail(f"configuration must not contain phase in {NONE_CAPTURE_MODE}")
     else:
-        expected_calls = _expected_phase_calls(mode, expected_submits)
-        expected_phase = {
-            **PHASE_CONFIG_BY_MODE[mode],
-            "expected_calls_per_core": expected_calls,
-        }
+        if mode in DYNAMIC_PHASE_CAPTURE_MODES:
+            expected_phase = {
+                **PHASE_CONFIG_BY_MODE[mode],
+                "call_shape": "dynamic_balanced",
+                "expected_calls": _expected_dynamic_phase_calls(mode, expected_submits),
+            }
+        else:
+            expected_phase = {
+                **PHASE_CONFIG_BY_MODE[mode],
+                "expected_calls_per_core": _expected_phase_calls(mode, expected_submits),
+            }
         _require_equal(
             configuration.get("phase"),
             expected_phase,
@@ -435,16 +461,36 @@ def _validate_capture_header(data: dict[str, Any]) -> tuple[str, dict[str, Any],
     return mode, configuration, expected_submits, frequencies
 
 
+def _validate_phase_elapsed_shape(
+    *,
+    prefix: str,
+    dynamic_calls: bool,
+    begin_reads: int,
+    phase_elapsed: int,
+    phase_requests_observed: int,
+    phase_misses_observed: int,
+) -> None:
+    if not dynamic_calls:
+        if phase_elapsed == 0:
+            _fail(f"{prefix}.phase_elapsed_ticks must be an integer >= 1")
+        return
+    if begin_reads == 0:
+        if phase_elapsed != 0 or phase_requests_observed != 0 or phase_misses_observed != 0:
+            _fail(f"{prefix} zero-call dynamic phase must have zero elapsed/request/miss")
+    elif phase_elapsed == 0:
+        _fail(f"{prefix} non-empty dynamic phase must have positive elapsed")
+
+
 def _validate_phase_record(
     record: dict[str, Any],
     prefix: str,
     mode: str,
-    expected_calls: int,
+    expected_calls: int | None,
     submit_elapsed: int,
     expected_phase_id: int,
 ) -> None:
     _require_equal(record.get("phase_id"), expected_phase_id, f"{prefix}.phase_id")
-    phase_elapsed = _integer(record.get("phase_elapsed_ticks"), f"{prefix}.phase_elapsed_ticks", minimum=1)
+    phase_elapsed = _integer(record.get("phase_elapsed_ticks"), f"{prefix}.phase_elapsed_ticks")
     phase_requests_observed = _integer(
         record.get("phase_icache_requests_observed"),
         f"{prefix}.phase_icache_requests_observed",
@@ -455,6 +501,7 @@ def _validate_phase_record(
     )
     begin_reads = _integer(record.get("phase_begin_reads"), f"{prefix}.phase_begin_reads")
     end_reads = _integer(record.get("phase_end_reads"), f"{prefix}.phase_end_reads")
+    dynamic_calls = mode in DYNAMIC_PHASE_CAPTURE_MODES
     if mode == EFDRAIN_CONTROL_CAPTURE_MODE:
         excluded_kernel_calls = _integer(
             record.get("phase_excluded_kernel_calls"),
@@ -467,7 +514,7 @@ def _validate_phase_record(
                 f"{prefix}.phase_excluded_kernel_calls is only valid in "
                 f"{EFDRAIN_CONTROL_CAPTURE_MODE}"
             )
-        expected_reads = expected_calls
+        expected_reads = begin_reads if dynamic_calls else expected_calls
     max_request_chunk = _integer(
         record.get("phase_max_shadow_request_chunk"),
         f"{prefix}.phase_max_shadow_request_chunk",
@@ -483,7 +530,17 @@ def _validate_phase_record(
                 f"{prefix} phase begin/end reads must both equal expected calls "
                 f"{expected_calls} + excluded Kernel calls {excluded_kernel_calls} = {expected_reads}"
             )
+        if dynamic_calls:
+            _fail(f"{prefix} dynamic phase begin/end reads must be balanced")
         _fail(f"{prefix} phase begin/end reads must both equal {expected_reads}")
+    _validate_phase_elapsed_shape(
+        prefix=prefix,
+        dynamic_calls=dynamic_calls,
+        begin_reads=begin_reads,
+        phase_elapsed=phase_elapsed,
+        phase_requests_observed=phase_requests_observed,
+        phase_misses_observed=phase_misses_observed,
+    )
     if phase_elapsed > submit_elapsed:
         _fail(f"{prefix}.phase_elapsed_ticks exceeds submit_elapsed_ticks")
     if phase_requests_observed > record["shadow_icache_requests"]:
@@ -550,7 +607,7 @@ def _validate_record(
             _fail(f"{prefix}.shadow_icache_requests exceeds icache_requests")
         if shadow_misses > misses:
             _fail(f"{prefix}.shadow_icache_misses exceeds icache_misses")
-        expected_calls = _expected_phase_calls(mode, expected_submits)
+        expected_calls = None if mode in DYNAMIC_PHASE_CAPTURE_MODES else _expected_phase_calls(mode, expected_submits)
         _validate_phase_record(record, prefix, mode, expected_calls, elapsed, PHASE_CONFIG_BY_MODE[mode]["id"])
     programmable = (scalar, requests, misses, shadow_requests, shadow_misses)
     if any(value >= PROGRAMMABLE_COUNTER_RISK_THRESHOLD for value in programmable):
@@ -723,7 +780,11 @@ def _phase_group_summary(records: Sequence[dict[str, Any]], mode: str) -> dict[s
     }
     primary_requests = sum(record["icache_requests"] for record in records)
     primary_misses = sum(record["icache_misses"] for record in records)
-    phase_calls = sum(_expected_phase_calls(mode, record["expected_submit_count"]) for record in records)
+    phase_calls = (
+        sum(record["phase_begin_reads"] for record in records)
+        if mode in DYNAMIC_PHASE_CAPTURE_MODES
+        else sum(_expected_phase_calls(mode, record["expected_submit_count"]) for record in records)
+    )
     summary = {
         "cores": len(records),
         "submit_elapsed_ticks": submit_elapsed,
@@ -743,11 +804,13 @@ def _phase_group_summary(records: Sequence[dict[str, Any]], mode: str) -> dict[s
         "phase_miss_observed_plus_capture_gap_share_of_primary": (
             misses_observed_plus_gap["sum"] / primary_misses if primary_misses else 0.0
         ),
-        "phase_elapsed_ticks_per_call": phase_elapsed["sum"] / phase_calls,
-        "phase_icache_requests_observed_per_call": requests_observed["sum"] / phase_calls,
-        "phase_icache_misses_observed_per_call": misses_observed["sum"] / phase_calls,
+        "phase_elapsed_ticks_per_call": phase_elapsed["sum"] / phase_calls if phase_calls else None,
+        "phase_icache_requests_observed_per_call": requests_observed["sum"] / phase_calls if phase_calls else None,
+        "phase_icache_misses_observed_per_call": misses_observed["sum"] / phase_calls if phase_calls else None,
         "phase_begin_reads": sum(record["phase_begin_reads"] for record in records),
         "phase_end_reads": sum(record["phase_end_reads"] for record in records),
+        "phase_calls_per_core": _metric_summary(records, "phase_begin_reads"),
+        "phase_zero_call_cores": sum(record["phase_begin_reads"] == 0 for record in records),
         "phase_max_shadow_request_chunk": max(record["phase_max_shadow_request_chunk"] for record in records),
         "phase_max_shadow_miss_chunk": max(record["phase_max_shadow_miss_chunk"] for record in records),
     }
@@ -794,6 +857,7 @@ def _validate_host_summary(data: dict[str, Any], computed: Mapping[str, dict[str
 def _validate_producer_summary(data: dict[str, Any], mode: str) -> None:
     validation = _object(data.get("validation"), "validation")
     kernel_exclusion_validation = "phase_kernel_exclusion_closed_records"
+    dynamic_call_validation = "phase_global_call_count_closed"
     required = {
         "passed": True,
         "trusted_records": EXPECTED_CORES,
@@ -832,8 +896,36 @@ def _validate_producer_summary(data: dict[str, Any], mode: str) -> None:
             f"validation.{kernel_exclusion_validation} is only valid in "
             f"{EFDRAIN_CONTROL_CAPTURE_MODE}"
         )
+    if mode in DYNAMIC_PHASE_CAPTURE_MODES:
+        required[dynamic_call_validation] = True
+    elif dynamic_call_validation in validation:
+        _fail(f"validation.{dynamic_call_validation} is only valid in dynamic phase profiles")
     for field, expected in required.items():
         _require_equal(validation.get(field), expected, f"validation.{field}")
+
+
+def _validate_dynamic_phase_call_totals(
+    records: Sequence[dict[str, Any]],
+    mode: str,
+    expected_submits: int,
+) -> None:
+    if mode not in DYNAMIC_PHASE_CAPTURE_MODES:
+        return
+    expected = _expected_dynamic_phase_calls(mode, expected_submits)
+    actual = {
+        "all": sum(record["phase_begin_reads"] for record in records),
+        "aic": sum(record["phase_begin_reads"] for record in records if record["role"] == "aic"),
+        "aiv": sum(record["phase_begin_reads"] for record in records if record["role"] == "aiv"),
+    }
+    if actual != expected:
+        _fail(f"dynamic phase call totals must equal {expected!r}, got {actual!r}")
+    max_calls_per_core = 2 * (expected_submits // 5)
+    for logical_core_id, record in enumerate(records):
+        if record["phase_begin_reads"] > max_calls_per_core:
+            _fail(
+                f"records[{logical_core_id}].phase_begin_reads exceeds dynamic per-core maximum "
+                f"{max_calls_per_core}"
+            )
 
 
 def load_capture(input_path: Path | str) -> SubmitPmuCapture:
@@ -862,6 +954,7 @@ def load_capture(input_path: Path | str) -> SubmitPmuCapture:
     _validate_owner(data, physical_ids)
     _validate_window(data, records)
     _validate_producer_summary(data, mode)
+    _validate_dynamic_phase_call_totals(records, mode, expected_submits)
 
     groups = {
         "all": records,
@@ -1238,7 +1331,14 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
     phase_boundary = html.escape(phase["boundary"])
     counter_semantics = html.escape(phase["counter_semantics"])
     time_semantics = html.escape(phase["time_semantics"])
-    expected_calls = phase["expected_calls_per_core"]
+    if "expected_calls_per_core" in phase:
+        call_shape_text = f"expected_calls_per_core={phase['expected_calls_per_core']}"
+    else:
+        expected = phase["expected_calls"]
+        call_shape_text = (
+            f"call_shape={phase['call_shape']} · expected_calls="
+            f"ALL {expected['all']} / AIC {expected['aic']} / AIV {expected['aiv']}"
+        )
     calibration_note = ""
     if phase["id"] == EMPTY_BRACKET_PHASE_ID:
         calibration_note = """
@@ -1282,13 +1382,21 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
                 "<br><small>排除 linked Kernel 调用 "
                 f"{_format_integer(group['phase_excluded_kernel_calls'])} 次</small>"
             )
+        if phase["id"] in {FANIN_PHASE_ID}:
+            calls = group["phase_calls_per_core"]
+            reads += (
+                f"<br><small>逐核 {_format_integer(calls['min'])}–{_format_integer(calls['max'])}；"
+                f"零调用核 {_format_integer(group['phase_zero_call_cores'])}</small>"
+            )
+        per_call = group["phase_elapsed_ticks_per_call"]
+        per_call_text = "—" if per_call is None else f"{_format_number(per_call)} ns"
         rows.append(
             "<tr>"
             f"<th>{title}<small>{group['cores']} 核</small></th>"
             f"<td><strong>{_format_number(group['phase_elapsed_ticks']['sum'] / 1_000)} µs</strong><br>"
             f"<small>Submit core-time {_format_number(group['submit_elapsed_ticks']['sum'] / 1_000)} µs</small></td>"
             f"<td><strong>{group['phase_time_share_of_submit']:.3%}</strong></td>"
-            f"<td><strong>{_format_number(group['phase_elapsed_ticks_per_call'])} ns</strong></td>"
+            f"<td><strong>{per_call_text}</strong></td>"
             f"<td>{request_observed}</td><td>{miss_observed}</td>"
             f"<td>{reads}</td>"
             f"<td>{_format_integer(group['phase_max_shadow_request_chunk'])} / "
@@ -1300,7 +1408,7 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
     <h2><code>{phase_name}</code> 阶段观察（phase_id={phase["id"]}）</h2>
     <p class="fine">边界 <code>{phase_boundary}</code> · 计数语义 <code>{counter_semantics}</code> ·
       时间语义 <code>{time_semantics}</code> ·
-      <code>expected_calls_per_core={expected_calls}</code></p>
+      <code>{html.escape(call_shape_text)}</code></p>
     {calibration_note}
     {efdrain_control_note}
     <p><strong>这是 running read-clear 观察区间，不是可与其他构建直接相减的独立计时。</strong>

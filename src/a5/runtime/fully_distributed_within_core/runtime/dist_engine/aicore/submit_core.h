@@ -630,6 +630,11 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_and_prepare_map(
     dist_submit_prepare_map(self, ctx.task_id);
     fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::PrepareMap>();
     TRACE_TIMESTAMP(prepare_map_finish);
+    // compete-first Kernel winner 的泳道 Fanin 从 PrepareMap 结束边界开始；
+    // legacy 路径此时尚未 Claim，ctx.won 为 false，不会提前打开。
+    if (kind == DistSubmitKind::Kernel && ctx.won) {
+        fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Fanin>();
+    }
     TRACE_SPAN_RECORD(
         materialize_end, prepare_map_finish, self, ctx.task_id, -1, TracePhase::PrepareMap, 0,
         static_cast<uint32_t>(kind)

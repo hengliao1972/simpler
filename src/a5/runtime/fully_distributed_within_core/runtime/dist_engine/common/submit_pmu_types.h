@@ -30,6 +30,7 @@ constexpr uint16_t kFdwicSubmitPmuModeRegister = 6;
 constexpr uint16_t kFdwicSubmitPmuModeSubmitTransition = 7;
 constexpr uint16_t kFdwicSubmitPmuModeEfDrainControl = 8;
 constexpr uint16_t kFdwicSubmitPmuModePrepareMap = 9;
+constexpr uint16_t kFdwicSubmitPmuModeFanin = 10;
 constexpr uint32_t kFdwicSubmitPmuExpectedAic = 32;
 constexpr uint32_t kFdwicSubmitPmuExpectedAiv = 64;
 constexpr uint32_t kFdwicSubmitPmuExpectedCores = kFdwicSubmitPmuExpectedAic + kFdwicSubmitPmuExpectedAiv;
@@ -64,7 +65,10 @@ enum class FdwicSubmitPmuPhase : uint16_t {
     // dist_submit_prepare_map() 调用入口到返回；与泳道 PrepareMap 的业务
     // 主体边界一致，每个 Submit 固定调用一次。
     PrepareMap = 8,
-    Count = 9,
+    // Kernel winner 的 dist_submit_collect_fanin() 调用体。winner 分布由
+    // 多核竞争决定，因此只要求逐核边界平衡与全局调用数闭合。
+    Fanin = 9,
+    Count = 10,
 };
 
 constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
@@ -87,15 +91,57 @@ constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
         return kFdwicSubmitPmuModeEfDrainControl;
     case FdwicSubmitPmuPhase::PrepareMap:
         return kFdwicSubmitPmuModePrepareMap;
+    case FdwicSubmitPmuPhase::Fanin:
+        return kFdwicSubmitPmuModeFanin;
     case FdwicSubmitPmuPhase::Count:
         break;
     }
     return 0;
 }
 
+PTO_DEVICE_FUNC constexpr bool fdwic_submit_pmu_phase_has_dynamic_calls(FdwicSubmitPmuPhase phase) {
+    return phase == FdwicSubmitPmuPhase::Fanin;
+}
+
+// 当前 PA 每个 batch 固定提交四个 Kernel task 和一个 Alloc task。动态
+// winner/loser phase 不伪造“每核固定次数”，只在 96 核聚合后按业务形状闭合。
+constexpr uint32_t fdwic_submit_pmu_batch_count(uint32_t expected_submits) {
+    return expected_submits != 0 && expected_submits % 5U == 0 ? expected_submits / 5U : 0U;
+}
+
+constexpr uint64_t fdwic_submit_pmu_expected_dynamic_calls_all(
+    FdwicSubmitPmuPhase phase, uint32_t expected_submits
+) {
+    const uint64_t batches = fdwic_submit_pmu_batch_count(expected_submits);
+    return phase == FdwicSubmitPmuPhase::Fanin ? 4U * batches : 0U;
+}
+
+constexpr uint64_t fdwic_submit_pmu_expected_dynamic_calls_aic(
+    FdwicSubmitPmuPhase phase, uint32_t expected_submits
+) {
+    const uint64_t batches = fdwic_submit_pmu_batch_count(expected_submits);
+    return phase == FdwicSubmitPmuPhase::Fanin ? 2U * batches : 0U;
+}
+
+constexpr uint64_t fdwic_submit_pmu_expected_dynamic_calls_aiv(
+    FdwicSubmitPmuPhase phase, uint32_t expected_submits
+) {
+    const uint64_t batches = fdwic_submit_pmu_batch_count(expected_submits);
+    return phase == FdwicSubmitPmuPhase::Fanin ? 2U * batches : 0U;
+}
+
+PTO_DEVICE_FUNC constexpr uint32_t fdwic_submit_pmu_dynamic_calls_max_per_core(
+    FdwicSubmitPmuPhase phase, uint32_t expected_submits
+) {
+    const uint32_t batches =
+        expected_submits != 0 && expected_submits % 5U == 0 ? expected_submits / 5U : 0U;
+    return phase == FdwicSubmitPmuPhase::Fanin ? 2U * batches : 0U;
+}
+
 PTO_DEVICE_FUNC constexpr uint32_t
 fdwic_submit_pmu_expected_phase_calls(FdwicSubmitPmuPhase phase, uint32_t expected_submits) {
     if (phase == FdwicSubmitPmuPhase::None) return 0;
+    if (fdwic_submit_pmu_phase_has_dynamic_calls(phase)) return 0;
     if (phase == FdwicSubmitPmuPhase::SubmitTransition) {
         return expected_submits == 0 ? 0 : expected_submits - 1U;
     }
@@ -113,7 +159,8 @@ constexpr bool fdwic_submit_pmu_mode_has_phase(uint16_t mode) {
     return mode == kFdwicSubmitPmuModeArgBuild || mode == kFdwicSubmitPmuModeEmptyBracket ||
            mode == kFdwicSubmitPmuModeMaterialize || mode == kFdwicSubmitPmuModeClaim ||
            mode == kFdwicSubmitPmuModeRegister || mode == kFdwicSubmitPmuModeSubmitTransition ||
-           mode == kFdwicSubmitPmuModeEfDrainControl || mode == kFdwicSubmitPmuModePrepareMap;
+           mode == kFdwicSubmitPmuModeEfDrainControl || mode == kFdwicSubmitPmuModePrepareMap ||
+           mode == kFdwicSubmitPmuModeFanin;
 }
 
 // A5 PIPE_UTIL 事件布局。CNT6/CNT7 是权威值；CNT8/CNT5 使用相同事件作

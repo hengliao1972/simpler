@@ -318,6 +318,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_finish_kernel_tail(
     uint64_t register_begin = tail_begin;
     if (ctx.won) {
         ctx.fanin_count = dist_submit_collect_fanin(args, ctx, ctx.fanin);
+        fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Fanin>();
         TRACE_TIMESTAMP(fanin_end);
         TRACE_SPAN_RECORD(
             tail_begin, fanin_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Fanin, 0,
@@ -507,6 +508,8 @@ dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &arg
     const uint32_t claim_flags = (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U);
     fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Claim>();
     TRACE_TIMESTAMP(claim_end);
+    // legacy Kernel winner 的泳道 Fanin 继承 Claim.end 作为起点。
+    if (ctx.won) fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Fanin>();
     TRACE_SPAN_RECORD(claim_begin, claim_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Claim, claim_flags, 0);
     return dist_submit_finish_kernel_tail(ctx, mixed, args, claim_end, submit_begin);
 }

@@ -146,6 +146,10 @@ def test_fdwic_profile_partitions_compile_cache(monkeypatch):
     assert _fdwic_profile() == "submit-pmu-prepare-map"
     assert _profiled_cache_key(base) == (*base, "submit-pmu-prepare-map")
 
+    monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-fanin")
+    assert _fdwic_profile() == "submit-pmu-fanin"
+    assert _profiled_cache_key(base) == (*base, "submit-pmu-fanin")
+
 
 def test_fdwic_private_profiles_have_isolated_compile_definitions():
     assert _fdwic_compile_definitions("none") is None
@@ -202,6 +206,11 @@ def test_fdwic_private_profiles_have_isolated_compile_definitions():
         "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=8",
         "PTO_FDWIC_TRACE_ENABLED=0",
     ]
+    assert _fdwic_compile_definitions("submit-pmu-fanin") == [
+        "PTO_FDWIC_SUBMIT_PMU=1",
+        "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=9",
+        "PTO_FDWIC_TRACE_ENABLED=0",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -221,6 +230,14 @@ def test_fdwic_private_profiles_have_isolated_compile_definitions():
             [
                 "PTO_FDWIC_SUBMIT_PMU=1",
                 "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=8",
+                "PTO_FDWIC_TRACE_ENABLED=0",
+            ],
+        ),
+        (
+            "submit-pmu-fanin",
+            [
+                "PTO_FDWIC_SUBMIT_PMU=1",
+                "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=9",
                 "PTO_FDWIC_TRACE_ENABLED=0",
             ],
         ),
@@ -687,6 +704,7 @@ def test_submit_pmu_elf_gate_accepts_only_whole_window_observer(monkeypatch, tmp
         "submit-pmu-submit-transition",
         "submit-pmu-efdrain-control",
         "submit-pmu-prepare-map",
+        "submit-pmu-fanin",
     ],
 )
 def test_submit_pmu_phase_elf_gate_requires_running_shadow_reader(monkeypatch, tmp_path, profile):
@@ -761,6 +779,7 @@ def test_submit_pmu_elf_gate_rejects_incomplete_or_mixed_image(monkeypatch, tmp_
         "submit-pmu-submit-transition",
         "submit-pmu-efdrain-control",
         "submit-pmu-prepare-map",
+        "submit-pmu-fanin",
     ],
 )
 def test_submit_pmu_phase_elf_gate_rejects_missing_running_shadow_reader(monkeypatch, tmp_path, profile):
@@ -778,7 +797,10 @@ def test_submit_pmu_phase_elf_gate_rejects_missing_running_shadow_reader(monkeyp
         _assert_fdwic_submit_pmu_elf(tmp_path / "aicore_kernel.o", profile)
 
 
-@pytest.mark.parametrize("profile", ("submit-pmu-efdrain-control", "submit-pmu-prepare-map"))
+@pytest.mark.parametrize(
+    "profile",
+    ("submit-pmu-efdrain-control", "submit-pmu-prepare-map", "submit-pmu-fanin"),
+)
 def test_submit_pmu_host_elf_gate_accepts_exact_profile_and_hooks(monkeypatch, tmp_path, profile):
     host_runtime = tmp_path / "libhost_runtime.so"
     host_runtime.write_bytes(b"prefix\0" + profile.encode() + b"\0suffix")
@@ -896,7 +918,7 @@ class _FakePytestConfig:
 
 @pytest.mark.parametrize(
     "profile",
-    ("submit-pmu-none", "submit-pmu-efdrain-control", "submit-pmu-prepare-map"),
+    ("submit-pmu-none", "submit-pmu-efdrain-control", "submit-pmu-prepare-map", "submit-pmu-fanin"),
 )
 def test_submit_pmu_profile_publishes_environment(monkeypatch, profile):
     monkeypatch.delenv("PTO_FDWIC_PROFILE", raising=False)

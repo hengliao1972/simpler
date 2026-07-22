@@ -71,6 +71,9 @@ constexpr SubmitPmuProfile kSubmitPmuProfiles[] = {
     {"submit-pmu-prepare-map", kFdwicSubmitPmuModePrepareMap, FdwicSubmitPmuPhase::PrepareMap,
      kFdwicSubmitPmuPhaseBytes, "prepare-map", "dist_submit_prepare_map_call_entry_to_return",
      "running_read_clear_observed_bracket", "inner_sys_cnt_between_boundary_observers"},
+    {"submit-pmu-fanin", kFdwicSubmitPmuModeFanin, FdwicSubmitPmuPhase::Fanin, kFdwicSubmitPmuPhaseBytes,
+     "fanin", "fanin_begin_to_fanin_end", "running_read_clear_observed_bracket",
+     "inner_sys_cnt_between_boundary_observers"},
 };
 
 const SubmitPmuProfile *requested_profile() {
@@ -170,6 +173,9 @@ void write_group(std::ofstream &out, const char *name, const GroupStats &group, 
 
 struct ValidatedData {
     uint32_t expected_submits{0};
+    uint64_t phase_calls_all{0};
+    uint64_t phase_calls_aic{0};
+    uint64_t phase_calls_aiv{0};
     uint64_t global_start{std::numeric_limits<uint64_t>::max()};
     uint64_t global_end{0};
     uint32_t bitmap_words[kFdwicSubmitPmuBitmapWords]{};
@@ -286,6 +292,7 @@ bool validate(
             const FdwicSubmitPmuPhaseCoreData &phase = phases[logical];
             const uint32_t expected_phase_calls =
                 fdwic_submit_pmu_expected_phase_calls(profile.phase, core.expected_submit_count);
+            const bool dynamic_calls = fdwic_submit_pmu_phase_has_dynamic_calls(profile.phase);
             const bool efdrain_control = profile.phase == FdwicSubmitPmuPhase::EfDrainControl;
             const uint32_t excluded_kernel_calls = efdrain_control ? phase.reserved[0] : 0U;
             const uint64_t expected_boundary_reads = fdwic_submit_pmu_expected_phase_boundary_reads(
@@ -294,11 +301,26 @@ bool validate(
             bool reserved_valid = true;
             for (uint32_t index = efdrain_control ? 1U : 0U; index < 4U; ++index)
                 reserved_valid = reserved_valid && phase.reserved[index] == 0U;
+            const bool boundary_shape_valid = dynamic_calls ? phase.phase_begin_reads == phase.phase_end_reads :
+                                                              expected_phase_calls != 0 &&
+                                                                  phase.phase_begin_reads == expected_boundary_reads &&
+                                                                  phase.phase_end_reads == expected_boundary_reads;
+            const bool dynamic_count_valid =
+                !dynamic_calls ||
+                phase.phase_begin_reads <=
+                    fdwic_submit_pmu_dynamic_calls_max_per_core(profile.phase, core.expected_submit_count);
+            const bool zero_call_dynamic = dynamic_calls && phase.phase_begin_reads == 0;
+            const bool elapsed_valid = zero_call_dynamic ? phase.phase_elapsed_ticks == 0 :
+                                                           phase.phase_elapsed_ticks != 0 &&
+                                                               phase.phase_elapsed_ticks <=
+                                                                   core.last_submit_end_tick -
+                                                                       core.first_submit_start_tick;
+            const bool zero_values_valid =
+                !zero_call_dynamic ||
+                (phase.phase_icache_requests_observed == 0 && phase.phase_icache_misses_observed == 0);
             const bool phase_valid =
-                expected_phase_calls != 0 && phase.phase_id == static_cast<uint32_t>(profile.phase) &&
-                phase.phase_begin_reads == expected_boundary_reads &&
-                phase.phase_end_reads == expected_boundary_reads && phase.phase_elapsed_ticks != 0 &&
-                phase.phase_elapsed_ticks <= core.last_submit_end_tick - core.first_submit_start_tick &&
+                phase.phase_id == static_cast<uint32_t>(profile.phase) && boundary_shape_valid && dynamic_count_valid &&
+                elapsed_valid && zero_values_valid &&
                 phase.phase_icache_requests_observed <= core.shadow_icache_requests &&
                 phase.phase_icache_misses_observed <= core.shadow_icache_misses &&
                 phase.max_shadow_request_chunk < kFdwicSubmitPmuCounterRiskThreshold &&
@@ -319,6 +341,10 @@ bool validate(
                 );
                 return false;
             }
+            if (dynamic_calls) {
+                data.phase_calls_all += phase.phase_begin_reads;
+                (role == CoreType::AIC ? data.phase_calls_aic : data.phase_calls_aiv) += phase.phase_begin_reads;
+            }
         }
         physical_seen[physical] = true;
         if (data.expected_submits == 0) data.expected_submits = core.expected_submit_count;
@@ -331,6 +357,23 @@ bool validate(
         data.global_start == std::numeric_limits<uint64_t>::max() || data.global_end < data.global_start) {
         LOG_ERROR("fdwic submit-PMU topology/window aggregate closure failed");
         return false;
+    }
+    if (fdwic_submit_pmu_phase_has_dynamic_calls(profile.phase)) {
+        const uint64_t expected_all = fdwic_submit_pmu_expected_dynamic_calls_all(profile.phase, data.expected_submits);
+        const uint64_t expected_aic = fdwic_submit_pmu_expected_dynamic_calls_aic(profile.phase, data.expected_submits);
+        const uint64_t expected_aiv = fdwic_submit_pmu_expected_dynamic_calls_aiv(profile.phase, data.expected_submits);
+        if (expected_all == 0 || data.phase_calls_all != expected_all || data.phase_calls_aic != expected_aic ||
+            data.phase_calls_aiv != expected_aiv) {
+            LOG_ERROR(
+                "fdwic submit-PMU dynamic phase call closure failed: actual(all/aic/aiv)=%llu/%llu/%llu "
+                "expected=%llu/%llu/%llu",
+                static_cast<unsigned long long>(data.phase_calls_all),
+                static_cast<unsigned long long>(data.phase_calls_aic),
+                static_cast<unsigned long long>(data.phase_calls_aiv), static_cast<unsigned long long>(expected_all),
+                static_cast<unsigned long long>(expected_aic), static_cast<unsigned long long>(expected_aiv)
+            );
+            return false;
+        }
     }
 
     uint32_t complete_triplets = 0;
@@ -462,12 +505,23 @@ extern "C" int fdwic_submit_pmu_host_export(Runtime *runtime) {
     out << "    \"counter_width_bits\": {\"total\": 64, \"programmable\": 32},\n";
     out << "    \"programmable_counter_risk_threshold\": " << kFdwicSubmitPmuCounterRiskThreshold << ",\n";
     if (phase_mode) {
-        const uint32_t expected_phase_calls =
-            fdwic_submit_pmu_expected_phase_calls(profile->phase, data.expected_submits);
         out << "    \"phase\": {\"id\": " << static_cast<uint32_t>(profile->phase) << ", \"name\": \""
-            << profile->phase_name << "\", " << "\"boundary\": \"" << profile->phase_boundary << "\", "
-            << "\"expected_calls_per_core\": " << expected_phase_calls
-            << ", \"status_required_mask\": " << kFdwicSubmitPmuRequiredPhaseStatus << ", \"counter_semantics\": \""
+            << profile->phase_name << "\", " << "\"boundary\": \"" << profile->phase_boundary << "\", ";
+        if (fdwic_submit_pmu_phase_has_dynamic_calls(profile->phase)) {
+            const uint64_t expected_all =
+                fdwic_submit_pmu_expected_dynamic_calls_all(profile->phase, data.expected_submits);
+            const uint64_t expected_aic =
+                fdwic_submit_pmu_expected_dynamic_calls_aic(profile->phase, data.expected_submits);
+            const uint64_t expected_aiv =
+                fdwic_submit_pmu_expected_dynamic_calls_aiv(profile->phase, data.expected_submits);
+            out << "\"call_shape\": \"dynamic_balanced\", \"expected_calls\": {\"all\": "
+                << expected_all << ", \"aic\": " << expected_aic << ", \"aiv\": " << expected_aiv << "}, ";
+        } else {
+            const uint32_t expected_phase_calls =
+                fdwic_submit_pmu_expected_phase_calls(profile->phase, data.expected_submits);
+            out << "\"expected_calls_per_core\": " << expected_phase_calls << ", ";
+        }
+        out << "\"status_required_mask\": " << kFdwicSubmitPmuRequiredPhaseStatus << ", \"counter_semantics\": \""
             << profile->counter_semantics << "\", " << "\"time_semantics\": \"" << profile->time_semantics << "\"},\n";
     }
     out << "    \"pmu_cycles_per_ns\": {\"all\": " << kPmuCyclesPerNsAll << ", \"aic\": " << kPmuCyclesPerNsAic
@@ -530,6 +584,9 @@ extern "C" int fdwic_submit_pmu_host_export(Runtime *runtime) {
                "\"phase_time_within_submit_records\": 96, ";
         if (profile->phase == FdwicSubmitPmuPhase::EfDrainControl) {
             out << "\"phase_kernel_exclusion_closed_records\": 96, ";
+        }
+        if (fdwic_submit_pmu_phase_has_dynamic_calls(profile->phase)) {
+            out << "\"phase_global_call_count_closed\": true, ";
         }
     } else {
         out << "\"shadow_primary_match_records\": 96, ";

@@ -773,6 +773,49 @@ Case1 同一 ELF 内的直接观察结果如下。时间占比以各角色 `Σsu
 
 三件套 raw/provenance/HTML 的 SHA256 分别为 `62aa8f74aaa439f088963e4e3a768bbac4053ab292f392fc8c39a49b81995ae8`、`2fe946082ffbc9f4a91f9f5d1cdda38398be19e2c3a2f607df1a48f268b0c365`、`288cfc4238290ba11558f26f6e4798d43d13b2cca583e65002ca5a50a5dc2ebf`。
 
+### 1.10 真实 PA `submit-pmu-fanin` 与动态调用闭合
+
+Fanin 只在 Kernel winner 路径执行，winner 落在哪个 worker 由多核竞争决定，不能继续套用“每核固定 N 次”的 phase shape。该 profile 的源码边界与泳道继承边界一致：legacy Kernel winner 从 Claim.end 打开；compete-first Kernel winner 从 PrepareMap.end 打开；二者都在 `dist_submit_collect_fanin()` 返回、取得 fanin_end 前关闭。PMU ELF 编译掉中间 trace record，但仍保留同一业务起止位置。
+
+身份为：
+
+```text
+PTO_FDWIC_SUBMIT_PMU=1
+PTO_FDWIC_SUBMIT_PMU_PHASE_ID=9
+PTO_FDWIC_TRACE_ENABLED=0
+
+capture.mode                 = submit-pmu-fanin
+configuration.phase.id       = 9
+configuration.phase.name     = fanin
+configuration.phase.boundary = fanin_begin_to_fanin_end
+configuration.phase.call_shape = dynamic_balanced
+```
+
+设每核 Submit 数为 `N=5B`。当前 PA 每 batch 固定一个 Alloc 和四个 Kernel task，四个 Kernel task 的唯一 winner 分别有两个落在 AIC、两个落在 AIV。因此 producer、consumer 与报告端分别复算：
+
+```text
+逐核：begin_reads == end_reads，允许为 0，且不超过 2B
+全局：Σcalls = 4B
+AIC： Σcalls = 2B
+AIV： Σcalls = 2B
+```
+
+零调用核必须满足 elapsed/request/miss observed 都为 0，但完整 Submit 末尾的 shadow tail read 仍可能更新 max chunk，因此不能错误要求 max chunk 为 0。实际调用数继续使用已有 `phase_begin_reads/end_reads`，没有新增 GM/header/record/reserved 字段；phase 构建仍为 12,416 B。host 只有在逐核平衡、逐核上界和全局/角色公式全部闭合后，才发布 `phase_global_call_count_closed=true` 的 raw。
+
+B1 结构回归位于 `outputs/TestPagedAttentionUnroll_CaseB1_20260722_145237/`：golden 通过，实际 `4=2(AIC)+2(AIV)`，92 个 worker 为零调用，逐核 0～1 次，所有 96 核 phase status 为 `0x3f`。完整 Case1 位于 `outputs/TestPagedAttentionUnroll_Case1_20260722_145338/`：golden 通过，实际 `1024=512+512`，AIC 逐核 11～23 次、AIV 逐核 3～15 次，所有门禁闭合。
+
+Case1 同一 ELF 内的观察结果为：
+
+| 角色 | 调用数 | elapsed/call | 时间占比 | request observed | request 占比 | miss observed | miss 占比 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ALL | 1,024 | 990.228 ns | 0.2438% | 354,845 | 0.5837% | 8,284 | 1.2911% |
+| AIC | 512 | 552.570 ns | 0.2122% | 126,334 | 0.6004% | 437 | 5.4212% |
+| AIV | 512 | 1,427.885 ns | 0.2588% | 228,511 | 0.5749% | 7,847 | 1.2386% |
+
+这里的百分比仍只使用 Fanin 这一独立 ELF 自己的 Submit elapsed/primary 作为分母。它不能与 PrepareMap、Claim 等其他 profile 横向求和；AIV per-call 明显高于 AIC 也只是当前诊断 ELF 的直接现象，尚不能仅凭单轮归因为 I-cache miss。
+
+Case1 三件套 raw/provenance/HTML 的 SHA256 分别为 `0df28acdd7a429b92736447d25344e697cced0bb486de6b26518ce784c92a563`、`9d2d907d3225236e0c1645fe892a4030ed9929027e8a644983cf47a8068e75ab`、`48d5cb8f0781eedd43f55e437fbe340d68428531416f18da1d8dde8a19f1ef50`。
+
 ## 2. 为什么 I-cache miss 必须独立重编译
 
 I-cache 数据对代码布局极其敏感。泳道和逐 atomic 观察会增加：
@@ -847,11 +890,12 @@ raw 转换、阶段顺序和整数闭合均通过，schema 能完整解析 site/
 - `submit-pmu-register`：第 1.6 节定义的 RegisterOutputs 调用体；
 - `submit-pmu-submit-transition`：第 1.7 节定义的所有相邻 Submit 间隙聚合；
 - `submit-pmu-efdrain-control`：第 1.8 节定义的排除 linked Kernel 的不连续 Scalar 控制段；
-- `submit-pmu-prepare-map`：第 1.9 节定义的 `dist_submit_prepare_map()` 调用体。
+- `submit-pmu-prepare-map`：第 1.9 节定义的 `dist_submit_prepare_map()` 调用体；
+- `submit-pmu-fanin`：第 1.10 节定义的 Kernel winner 动态 Fanin 区间。
 
-真实 phase id 依次为 ArgBuild `1`、EmptyBracket `2`、Materialize `3`、Claim `4`、Register `5`、SubmitTransition `6`、EfDrainControl `7` 和 PrepareMap `8`；`none` 不含 phase。除 SubmitTransition 的 outer calls 为 `N-1` 外，其余业务/校准 phase 都为 `N`；EfDrainControl 的实际 begin/end 读数还要加被排除 Kernel 数 `K`。
+真实 phase id 依次为 ArgBuild `1`、EmptyBracket `2`、Materialize `3`、Claim `4`、Register `5`、SubmitTransition `6`、EfDrainControl `7`、PrepareMap `8` 和 Fanin `9`；`none` 不含 phase。SubmitTransition 的 outer calls 为 `N-1`，EfDrainControl 的实际 begin/end 读数还要加被排除 Kernel 数 `K`，Fanin 使用第 1.10 节的动态全局公式，其余业务/校准 phase 都为每核 `N`。
 
-九者 raw schema 均为 `fdwic-submit-pmu-v1`，但分别来自独立诊断 ELF，不能跨 profile 相减或拼接。
+十者 raw schema 均为 `fdwic-submit-pmu-v1`，但分别来自独立诊断 ELF，不能跨 profile 相减或拼接。
 
 standalone 历史 schema 中的 `lower/upper` 是已经固化的字段名，只表达 read-clear observed 与 `primary-shadow` capture gap；由于 bracket 两侧也有观察 bookkeeping，它们同样不能解释为零插桩业务事件数的数学上下界。
 

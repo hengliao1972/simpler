@@ -27,6 +27,7 @@ from simpler_setup.tools.fdwic_submit_pmu_report import (
     DEFAULT_PROVENANCE_NAME,
     EFDRAIN_CONTROL_CAPTURE_MODE,
     EMPTY_BRACKET_CAPTURE_MODE,
+    FANIN_CAPTURE_MODE,
     MATERIALIZE_CAPTURE_MODE,
     PHASE_REQUIRED_STATUS_MASK,
     PREPARE_MAP_CAPTURE_MODE,
@@ -320,6 +321,32 @@ def _valid_prepare_map_capture() -> dict[str, Any]:
         record["phase_elapsed_ticks"] = 300 + logical_core_id
         record["phase_icache_requests_observed"] = 120 + logical_core_id
         record["phase_icache_misses_observed"] = 12 + logical_core_id % 5
+    return capture
+
+
+def _valid_fanin_capture() -> dict[str, Any]:
+    capture = _valid_arg_build_capture()
+    capture["capture"]["mode"] = FANIN_CAPTURE_MODE
+    capture["configuration"]["phase"] = {
+        "id": 9,
+        "name": "fanin",
+        "boundary": "fanin_begin_to_fanin_end",
+        "call_shape": "dynamic_balanced",
+        "expected_calls": {"all": 4, "aic": 2, "aiv": 2},
+        "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+        "counter_semantics": "running_read_clear_observed_bracket",
+        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+    }
+    capture["validation"]["phase_global_call_count_closed"] = True
+    active_calls = {0: 1, 1: 1, 32: 1, 33: 1}
+    for logical_core_id, record in enumerate(capture["records"]):
+        calls = active_calls.get(logical_core_id, 0)
+        record["phase_id"] = 9
+        record["phase_elapsed_ticks"] = 75 * calls
+        record["phase_icache_requests_observed"] = 40 * calls
+        record["phase_icache_misses_observed"] = 2 * calls
+        record["phase_begin_reads"] = calls
+        record["phase_end_reads"] = calls
     return capture
 
 
@@ -915,6 +942,57 @@ def test_prepare_map_rejects_wrong_record_phase_id(tmp_path: Path) -> None:
         load_capture(_write_capture(tmp_path, capture))
 
 
+def test_valid_fanin_capture_accepts_dynamic_zero_call_cores(tmp_path: Path) -> None:
+    raw_path = _write_capture(tmp_path, _valid_fanin_capture())
+
+    capture = load_capture(raw_path)
+
+    assert capture.phase_summary is not None
+    assert capture.phase_summary["all"]["phase_begin_reads"] == 4
+    assert capture.phase_summary["aic"]["phase_begin_reads"] == 2
+    assert capture.phase_summary["aiv"]["phase_begin_reads"] == 2
+    assert capture.phase_summary["all"]["phase_zero_call_cores"] == 92
+    document = render_report(raw_path)
+    assert "<code>fanin</code> 阶段观察" in document
+    assert "phase_id=9" in document
+    assert "fanin_begin_to_fanin_end" in document
+    assert "call_shape=dynamic_balanced" in document
+    assert "expected_calls=ALL 4 / AIC 2 / AIV 2" in document
+    assert "零调用核 92" in document
+
+
+def test_fanin_rejects_unbalanced_per_core_boundaries(tmp_path: Path) -> None:
+    capture = _valid_fanin_capture()
+    capture["records"][0]["phase_end_reads"] = 0
+
+    with pytest.raises(ValueError, match="dynamic phase begin/end reads must be balanced"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_fanin_rejects_wrong_global_role_call_totals(tmp_path: Path) -> None:
+    capture = _valid_fanin_capture()
+    for field in ("phase_begin_reads", "phase_end_reads"):
+        capture["records"][1][field] = 0
+        capture["records"][34][field] = 1
+    capture["records"][1]["phase_elapsed_ticks"] = 0
+    capture["records"][1]["phase_icache_requests_observed"] = 0
+    capture["records"][1]["phase_icache_misses_observed"] = 0
+    capture["records"][34]["phase_elapsed_ticks"] = 75
+    capture["records"][34]["phase_icache_requests_observed"] = 40
+    capture["records"][34]["phase_icache_misses_observed"] = 2
+
+    with pytest.raises(ValueError, match="dynamic phase call totals"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_fanin_rejects_nonzero_values_on_zero_call_core(tmp_path: Path) -> None:
+    capture = _valid_fanin_capture()
+    capture["records"][2]["phase_elapsed_ticks"] = 1
+
+    with pytest.raises(ValueError, match="zero-call dynamic phase must have zero"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
 def test_valid_claim_capture_tracks_current_business_boundary(tmp_path: Path) -> None:
     raw_path = _write_capture(tmp_path, _valid_claim_capture())
 
@@ -1210,6 +1288,7 @@ def test_efdrain_control_requires_closed_kernel_exclusion_validation(
         _valid_register_capture,
         _valid_submit_transition_capture,
         _valid_prepare_map_capture,
+        _valid_fanin_capture,
     ),
 )
 def test_other_phase_modes_forbid_excluded_kernel_call_count(
@@ -1237,6 +1316,7 @@ def test_other_phase_modes_forbid_excluded_kernel_call_count(
         _valid_register_capture,
         _valid_submit_transition_capture,
         _valid_prepare_map_capture,
+        _valid_fanin_capture,
     ),
 )
 def test_other_modes_forbid_kernel_exclusion_validation(
@@ -1497,6 +1577,7 @@ def test_efdrain_control_build_identity_uses_phase_id_7(
         (SUBMIT_TRANSITION_CAPTURE_MODE, _valid_submit_transition_capture, 6),
         (EFDRAIN_CONTROL_CAPTURE_MODE, _valid_efdrain_control_capture, 7),
         (PREPARE_MAP_CAPTURE_MODE, _valid_prepare_map_capture, 8),
+        (FANIN_CAPTURE_MODE, _valid_fanin_capture, 9),
     ),
 )
 def test_each_phase_profile_closes_raw_identity_provenance_and_html(
