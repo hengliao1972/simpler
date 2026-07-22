@@ -26,6 +26,32 @@ standalone 当前保留两类正式观察构建：
 > 本章现存 v1 HTML 与数值只作历史记录；采用 v2 做新分析时必须重新上板采集，不能与旧结果
 > 合并、相减或拼接比例。
 
+#### 2026-07-22 Case1 v2 全量 HTML 索引
+
+下表是同一轮 v2 口径下的完整入口。每个目录均包含
+`fdwic_submit_pmu_raw.json`、`fdwic_submit_pmu_provenance.json` 和
+`fdwic_submit_pmu_report.html`：
+
+| profile | Case1 产物目录 |
+| --- | --- |
+| `submit-pmu-none` | `outputs/TestPagedAttentionUnroll_Case1_20260722_211333/` |
+| `submit-pmu-arg-build` | `outputs/TestPagedAttentionUnroll_Case1_20260722_212608/` |
+| `submit-pmu-empty-bracket` | `outputs/TestPagedAttentionUnroll_Case1_20260722_212653/` |
+| `submit-pmu-materialize` | `outputs/TestPagedAttentionUnroll_Case1_20260722_212739/` |
+| `submit-pmu-claim` | `outputs/TestPagedAttentionUnroll_Case1_20260722_212857/` |
+| `submit-pmu-register` | `outputs/TestPagedAttentionUnroll_Case1_20260722_212943/` |
+| `submit-pmu-submit-transition` | `outputs/TestPagedAttentionUnroll_Case1_20260722_213030/` |
+| `submit-pmu-efdrain-control` | `outputs/TestPagedAttentionUnroll_Case1_20260722_213152/` |
+| `submit-pmu-prepare-map` | `outputs/TestPagedAttentionUnroll_Case1_20260722_213240/` |
+| `submit-pmu-fanin` | `outputs/TestPagedAttentionUnroll_Case1_20260722_213326/` |
+| `submit-pmu-winner-build-control` | `outputs/TestPagedAttentionUnroll_Case1_20260722_211624/` |
+
+严格 loader 已复验每个 profile 的 96/96 trusted、linked-Kernel gate 和 return-ready atomic
+时间门禁；所有 HTML 的 I-cache 卡片只显示逐核 `min/max`。旧 v1 各章节中的数表继续作为历史记录，
+新的分析结论应以本索引中的 v2 三件套为入口。不同 profile 来自不同诊断 ELF 和独立进程，
+时间及计数不得跨 profile 相加或相减；`submit-pmu-empty-bracket` 只用于校准观察器本身，不能解释为
+业务阶段占比。
+
 真实 PA 已建立第三条独立证据链 `--fdwic-profile submit-pmu-none`。它不是 standalone 的 `submit-pmu` 产物，也不与泳道 ELF 共用 I-cache 结论：
 
 - 编译期固定 `PTO_FDWIC_TRACE_ENABLED=0`，去除普通泳道和逐 atomic 泳道记录；ABI v2 仍保留

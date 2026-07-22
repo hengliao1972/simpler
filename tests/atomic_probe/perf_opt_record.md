@@ -2954,3 +2954,21 @@ linked Kernel 继续由调用前的 `metrics_prof_stop` 和返回后的 `metrics
 四轮的 trusted record、linked Kernel gate 闭合、return-ready atomic 扣时有效、vector busy 为零和 cube busy 为零等正式门禁均为 `96/96`。Winner Case1 的业务 phase calls 为 `1024 = 512 AIC + 512 AIV`，排除的 53 次 linked Kernel 调用全部位于 AIC。在该 Winner Case1 的同一 ELF 内，phase scalar-code core-time 占完整 Submit 分母的比例为 ALL/AIC/AIV `3.47% / 7.93% / 1.42%`。
 
 none Case1 的 `4.982069 ms` 与 Winner Case1 的 `4.599385 ms` 来自不同 ELF，不能相减或解读为优化收益，本轮不写收益结论。旧 v1 下的其余 profile 和 scalar I-cache HTML 仍需按 v2 口径全量重跑；在此之前不恢复旧数据结论。
+
+#### v2 既有 profile 全量重采
+
+在已记录的 none 和 Winner Case1 之外，补齐了下列 9 个 Case1 v2 产物：
+
+- arg：`outputs/TestPagedAttentionUnroll_Case1_20260722_212608`
+- empty：`outputs/TestPagedAttentionUnroll_Case1_20260722_212653`
+- materialize：`outputs/TestPagedAttentionUnroll_Case1_20260722_212739`
+- claim：`outputs/TestPagedAttentionUnroll_Case1_20260722_212857`
+- register：`outputs/TestPagedAttentionUnroll_Case1_20260722_212943`
+- transition：`outputs/TestPagedAttentionUnroll_Case1_20260722_213030`
+- efdrain：`outputs/TestPagedAttentionUnroll_Case1_20260722_213152`
+- prepare：`outputs/TestPagedAttentionUnroll_Case1_20260722_213240`
+- fanin：`outputs/TestPagedAttentionUnroll_Case1_20260722_213326`
+
+上述 9 种与 none、Winner 合计 11 种既有 Case1 profile。使用报告链本身的 `load_capture` + `load_provenance` 做机器化复验，`11/11` 全部通过；每轮 trusted record、linked Kernel gate 闭合和 return-ready atomic 扣时有效均为 `96/96`。`11/11` 的 HTML 均存在，其 I-cache 逐核摘要只显示最小值/最大值。
+
+EfDrain 轮闭合了 962 次 linked Kernel 排除；Fanin 轮的动态业务 calls 为 1,024，全局 call-count 门禁闭合。每个 profile 的 phase 百分比都只属于自己的独立 ELF 及其本轮 Submit 分母，不在跨 ELF 之间求和；empty 仅用作 bracket 标定，不当作业务 phase。至此旧 v1 数据不再用于当前结论，当前口径只认 v2 全量重采产物。
