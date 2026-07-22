@@ -29,6 +29,7 @@ from simpler_setup.tools.fdwic_submit_pmu_report import (
     EMPTY_BRACKET_CAPTURE_MODE,
     MATERIALIZE_CAPTURE_MODE,
     PHASE_REQUIRED_STATUS_MASK,
+    PREPARE_MAP_CAPTURE_MODE,
     REGISTER_CAPTURE_MODE,
     REQUIRED_STATUS_MASK,
     SUBMIT_TRANSITION_CAPTURE_MODE,
@@ -299,6 +300,26 @@ def _valid_materialize_capture() -> dict[str, Any]:
         record["phase_elapsed_ticks"] = 800 + logical_core_id
         record["phase_icache_requests_observed"] = 500 + logical_core_id
         record["phase_icache_misses_observed"] = 50 + logical_core_id % 5
+    return capture
+
+
+def _valid_prepare_map_capture() -> dict[str, Any]:
+    capture = _valid_arg_build_capture()
+    capture["capture"]["mode"] = PREPARE_MAP_CAPTURE_MODE
+    capture["configuration"]["phase"] = {
+        "id": 8,
+        "name": "prepare-map",
+        "boundary": "dist_submit_prepare_map_call_entry_to_return",
+        "expected_calls_per_core": 5,
+        "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+        "counter_semantics": "running_read_clear_observed_bracket",
+        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+    }
+    for logical_core_id, record in enumerate(capture["records"]):
+        record["phase_id"] = 8
+        record["phase_elapsed_ticks"] = 300 + logical_core_id
+        record["phase_icache_requests_observed"] = 120 + logical_core_id
+        record["phase_icache_misses_observed"] = 12 + logical_core_id % 5
     return capture
 
 
@@ -602,7 +623,23 @@ def test_valid_capture_is_recomputed_and_rendered(tmp_path: Path) -> None:
     assert "阶段观察（phase_id=" not in document
     assert "均值 16,047.5；最小 16,000；最大 16,095" in document
     for group_name in ("all", "aic", "aiv"):
-        assert f"{capture.summary[group_name]['icache_miss_rate']:.3%}" in document
+        summary = capture.summary[group_name]
+        requests = summary["icache_requests"]
+        misses = summary["icache_misses"]
+        assert (
+            f"<dt>Primary I-cache request/core</dt><dd>"
+            f"最小 {requests['min']:,}；最大 {requests['max']:,}</dd>"
+        ) in document
+        assert (
+            f"<dt>Primary I-cache miss/core</dt><dd>"
+            f"最小 {misses['min']:,}；最大 {misses['max']:,}</dd>"
+        ) in document
+        assert (
+            f"<dt>90 ns 直觉量尺/core</dt>\n"
+            f"          <dd>最小 {misses['min'] * 90 / 1_000:,.3f}；"
+            f"最大 {misses['max'] * 90 / 1_000:,.3f} µs</dd>"
+        ) in document
+        assert f"{summary['icache_miss_rate']:.3%}" in document
     assert document.count("<svg") == 4
     assert document.count("<circle") == 4 * 96
     assert hashlib.sha256(raw_path.read_bytes()).hexdigest() in document
@@ -725,27 +762,37 @@ def test_valid_arg_build_capture_renders_same_elf_phase_observation_first(tmp_pa
     assert "running_read_clear_observed_bracket" in document
     assert "inner_sys_cnt_between_boundary_observers" in document
     assert "时间占比" in document
-    assert "Request 观测值 / 加全窗 capture gap" in document
-    assert "Miss 观测值 / 加全窗 capture gap" in document
+    assert "Request observed（总数 / 逐核 min–max / Primary）" in document
+    assert "Miss observed（总数 / 逐核 min–max / Primary）" in document
     assert "observed_plus_capture_gap = observed + (primary − shadow)" in document
     assert "插桩 bookkeeping 会进入 sample" in document
     assert "不是原业务" in document
     assert "事件数的数学上下界" in document
     assert "时间占比的分母是同一 ELF 的 Σ每核 Submit elapsed" in document
     assert "request/miss 百分比的分母才是同一 ELF" in document
-    assert "每次调用 elapsed / request / miss observed" in document
+    assert "每次调用 elapsed" in document
+    assert "每次调用 elapsed / request / miss observed" not in document
+    assert "是每核累计" in document
+    assert "不是逐调用极值" in document
     assert "不能跨 ELF 相减" in document
     assert "shadow 是 begin/end/final 全部 running read-clear 返回值之和" in document
     for group_name in ("all", "aic", "aiv"):
         phase = capture.phase_summary[group_name]
+        group_records = capture.groups[group_name]
+        requests = phase["phase_icache_requests_observed"]
+        misses = phase["phase_icache_misses_observed"]
+        assert phase["primary_icache_requests"] == sum(record["icache_requests"] for record in group_records)
+        assert phase["primary_icache_misses"] == sum(record["icache_misses"] for record in group_records)
         assert f"{phase['phase_time_share_of_submit']:.3%}" in document
         assert f"{phase['phase_request_observed_share_of_primary']:.3%}" in document
         assert f"{phase['phase_request_observed_plus_capture_gap_share_of_primary']:.3%}" in document
         assert f"{phase['phase_miss_observed_share_of_primary']:.3%}" in document
         assert f"{phase['phase_miss_observed_plus_capture_gap_share_of_primary']:.3%}" in document
         assert f"{phase['phase_elapsed_ticks_per_call']:,.3f} ns" in document
-        assert f"request {phase['phase_icache_requests_observed_per_call']:,.3f}" in document
-        assert f"miss {phase['phase_icache_misses_observed_per_call']:,.3f}" in document
+        assert f"逐核 最小 {requests['min']:,}；最大 {requests['max']:,}" in document
+        assert f"逐核 最小 {misses['min']:,}；最大 {misses['max']:,}" in document
+        assert f"Primary {phase['primary_icache_requests']:,}" in document
+        assert f"Primary {phase['primary_icache_misses']:,}" in document
 
 
 def test_valid_empty_bracket_capture_is_reported_as_observer_calibration(tmp_path: Path) -> None:
@@ -768,9 +815,11 @@ def test_valid_empty_bracket_capture_is_reported_as_observer_calibration(tmp_pat
     assert "两者都只是量级参照，不能跨 ELF 精确扣减" in document
     for group_name in ("all", "aic", "aiv"):
         phase = capture.phase_summary[group_name]
+        requests = phase["phase_icache_requests_observed"]
+        misses = phase["phase_icache_misses_observed"]
         assert f"{phase['phase_elapsed_ticks_per_call']:,.3f} ns" in document
-        assert f"request {phase['phase_icache_requests_observed_per_call']:,.3f}" in document
-        assert f"miss {phase['phase_icache_misses_observed_per_call']:,.3f}" in document
+        assert f"逐核 最小 {requests['min']:,}；最大 {requests['max']:,}" in document
+        assert f"逐核 最小 {misses['min']:,}；最大 {misses['max']:,}" in document
 
 
 def test_empty_bracket_rejects_arg_build_phase_id(tmp_path: Path) -> None:
@@ -821,6 +870,48 @@ def test_materialize_rejects_wrong_record_phase_id(tmp_path: Path) -> None:
     capture["records"][0]["phase_id"] = 2
 
     with pytest.raises(ValueError, match=r"records\[0\]\.phase_id must equal 3"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_valid_prepare_map_capture_tracks_call_body_boundary(tmp_path: Path) -> None:
+    raw_path = _write_capture(tmp_path, _valid_prepare_map_capture())
+
+    capture = load_capture(raw_path)
+
+    assert capture.phase_summary is not None
+    assert capture.phase_summary["all"]["phase_begin_reads"] == 96 * 5
+    document = render_report(raw_path)
+    assert document.index("<code>prepare-map</code> 阶段观察") < document.index("全局 Submit 时间范围")
+    assert "phase_id=8" in document
+    assert "dist_submit_prepare_map_call_entry_to_return" in document
+    assert "running_read_clear_observed_bracket" in document
+    assert "inner_sys_cnt_between_boundary_observers" in document
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("id", 3),
+        ("name", "materialize"),
+        ("boundary", "materialize_begin_to_materialize_end"),
+        ("expected_calls_per_core", 4),
+        ("counter_semantics", "running_read_clear_empty_bracket_calibration"),
+        ("time_semantics", "outer_sys_cnt_around_adjacent_begin_end_pair"),
+    ),
+)
+def test_prepare_map_rejects_mismatched_phase_configuration(tmp_path: Path, field: str, value: Any) -> None:
+    capture = _valid_prepare_map_capture()
+    capture["configuration"]["phase"][field] = value
+
+    with pytest.raises(ValueError, match=r"configuration\.phase"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_prepare_map_rejects_wrong_record_phase_id(tmp_path: Path) -> None:
+    capture = _valid_prepare_map_capture()
+    capture["records"][0]["phase_id"] = 3
+
+    with pytest.raises(ValueError, match=r"records\[0\]\.phase_id must equal 8"):
         load_capture(_write_capture(tmp_path, capture))
 
 
@@ -1118,6 +1209,7 @@ def test_efdrain_control_requires_closed_kernel_exclusion_validation(
         _valid_claim_capture,
         _valid_register_capture,
         _valid_submit_transition_capture,
+        _valid_prepare_map_capture,
     ),
 )
 def test_other_phase_modes_forbid_excluded_kernel_call_count(
@@ -1144,6 +1236,7 @@ def test_other_phase_modes_forbid_excluded_kernel_call_count(
         _valid_claim_capture,
         _valid_register_capture,
         _valid_submit_transition_capture,
+        _valid_prepare_map_capture,
     ),
 )
 def test_other_modes_forbid_kernel_exclusion_validation(
@@ -1403,6 +1496,7 @@ def test_efdrain_control_build_identity_uses_phase_id_7(
         (REGISTER_CAPTURE_MODE, _valid_register_capture, 5),
         (SUBMIT_TRANSITION_CAPTURE_MODE, _valid_submit_transition_capture, 6),
         (EFDRAIN_CONTROL_CAPTURE_MODE, _valid_efdrain_control_capture, 7),
+        (PREPARE_MAP_CAPTURE_MODE, _valid_prepare_map_capture, 8),
     ),
 )
 def test_each_phase_profile_closes_raw_identity_provenance_and_html(

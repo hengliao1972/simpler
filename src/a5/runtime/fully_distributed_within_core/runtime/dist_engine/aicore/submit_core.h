@@ -624,7 +624,11 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_and_prepare_map(
 #if !defined(__CCE_AICORE__)
     if (fdwic_trace_is_fatal(ctx.task_id)) return false;
 #endif
+    // 与泳道 PrepareMap 的业务主体共用同一调用边界；PMU 变体只累计
+    // dist_submit_prepare_map()，不把前一阶段的 trace 发布算入该阶段。
+    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::PrepareMap>();
     dist_submit_prepare_map(self, ctx.task_id);
+    fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::PrepareMap>();
     TRACE_TIMESTAMP(prepare_map_finish);
     TRACE_SPAN_RECORD(
         materialize_end, prepare_map_finish, self, ctx.task_id, -1, TracePhase::PrepareMap, 0,

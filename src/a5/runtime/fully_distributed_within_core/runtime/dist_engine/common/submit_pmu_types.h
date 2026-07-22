@@ -29,6 +29,7 @@ constexpr uint16_t kFdwicSubmitPmuModeClaim = 5;
 constexpr uint16_t kFdwicSubmitPmuModeRegister = 6;
 constexpr uint16_t kFdwicSubmitPmuModeSubmitTransition = 7;
 constexpr uint16_t kFdwicSubmitPmuModeEfDrainControl = 8;
+constexpr uint16_t kFdwicSubmitPmuModePrepareMap = 9;
 constexpr uint32_t kFdwicSubmitPmuExpectedAic = 32;
 constexpr uint32_t kFdwicSubmitPmuExpectedAiv = 64;
 constexpr uint32_t kFdwicSubmitPmuExpectedCores = kFdwicSubmitPmuExpectedAic + kFdwicSubmitPmuExpectedAiv;
@@ -60,7 +61,10 @@ enum class FdwicSubmitPmuPhase : uint16_t {
     // 调用通过成对 pause/resume 排除，barrier、完成发布和 frontier 等 scalar
     // 后处理仍保留在控制段内。
     EfDrainControl = 7,
-    Count = 8,
+    // dist_submit_prepare_map() 调用入口到返回；与泳道 PrepareMap 的业务
+    // 主体边界一致，每个 Submit 固定调用一次。
+    PrepareMap = 8,
+    Count = 9,
 };
 
 constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
@@ -81,6 +85,8 @@ constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
         return kFdwicSubmitPmuModeSubmitTransition;
     case FdwicSubmitPmuPhase::EfDrainControl:
         return kFdwicSubmitPmuModeEfDrainControl;
+    case FdwicSubmitPmuPhase::PrepareMap:
+        return kFdwicSubmitPmuModePrepareMap;
     case FdwicSubmitPmuPhase::Count:
         break;
     }
@@ -107,7 +113,7 @@ constexpr bool fdwic_submit_pmu_mode_has_phase(uint16_t mode) {
     return mode == kFdwicSubmitPmuModeArgBuild || mode == kFdwicSubmitPmuModeEmptyBracket ||
            mode == kFdwicSubmitPmuModeMaterialize || mode == kFdwicSubmitPmuModeClaim ||
            mode == kFdwicSubmitPmuModeRegister || mode == kFdwicSubmitPmuModeSubmitTransition ||
-           mode == kFdwicSubmitPmuModeEfDrainControl;
+           mode == kFdwicSubmitPmuModeEfDrainControl || mode == kFdwicSubmitPmuModePrepareMap;
 }
 
 // A5 PIPE_UTIL 事件布局。CNT6/CNT7 是权威值；CNT8/CNT5 使用相同事件作

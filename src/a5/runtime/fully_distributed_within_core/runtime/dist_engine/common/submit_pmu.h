@@ -56,6 +56,10 @@ constexpr size_t kFdwicSubmitPmuCompiledBytes = kFdwicSubmitPmuPhaseBytes;
 constexpr FdwicSubmitPmuPhase kFdwicSubmitPmuCompiledPhase = FdwicSubmitPmuPhase::EfDrainControl;
 constexpr uint16_t kFdwicSubmitPmuCompiledMode = kFdwicSubmitPmuModeEfDrainControl;
 constexpr size_t kFdwicSubmitPmuCompiledBytes = kFdwicSubmitPmuPhaseBytes;
+#elif PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 8
+constexpr FdwicSubmitPmuPhase kFdwicSubmitPmuCompiledPhase = FdwicSubmitPmuPhase::PrepareMap;
+constexpr uint16_t kFdwicSubmitPmuCompiledMode = kFdwicSubmitPmuModePrepareMap;
+constexpr size_t kFdwicSubmitPmuCompiledBytes = kFdwicSubmitPmuPhaseBytes;
 #else
 #error "invalid real FDWIC submit-PMU phase"
 #endif

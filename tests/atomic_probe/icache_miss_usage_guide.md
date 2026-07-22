@@ -51,7 +51,7 @@ outputs/TestPagedAttentionUnroll_Case1_20260721_003335/
 
 真实 PA raw 顶部的“完整 Submit”表示**全部 worker 中最早的首个 Submit 起点到最晚的末个 Submit 终点**，是 96 核共同形成的全局 `SYS_CNT` 墙钟范围，不等于逐核 PMU gate 的平均值。对单个 worker，源码先读取 `first_submit_start_tick` 再调用 `metrics_prof_start()`，末次 Submit 则先调用 `metrics_prof_stop()` 再读取 `last_submit_end_tick`；因此该核的 `SYS_CNT` 首尾区间在两侧包住 PMU gate，并包含 start/stop 及其 `PIPE_ALL` 边界成本。PMU total 按本机约 1.65 cycles/ns 的长窗校准值换算，`SYS_CNT` 为 1 ns/tick；两者的边界、时钟口径和聚合对象均不同，只能在同一 ELF 内校验数量级和跨轮方向，不能直接相减来归因观察成本或业务耗时。
 
-现行真实 PA raw summary 包含 `sum/min/mean/max`，生产 HTML 还会从通过 96 核门禁的 records 重新校验这些聚合。PMU total 与 scalar busy 各自独立取极值，不保证来自同一个物理核。
+现行真实 PA raw summary 包含 `sum/min/mean/max`，生产 HTML 还会从通过 96 核门禁的 records 重新校验这些聚合。I-cache request/miss 在 HTML 中只展示逐核 `min/max`，不再展示 mean；raw 聚合口径保持不变。PMU total 与 scalar busy 各自独立取极值，不保证来自同一个物理核。
 
 #### 1.1.1 HTML 的逐核时间与 PMU 加工口径
 
@@ -60,7 +60,7 @@ outputs/TestPagedAttentionUnroll_Case1_20260721_003335/
 - `Submit SYS_CNT/core`：每核 `last_submit_end_tick-first_submit_start_tick` 的 mean/min/max，按 1 ns/tick 显示为 us；它不是顶部“最早核起点到最晚核终点”的跨核全局时间范围；
 - PMU total、Scalar busy 与非 Scalar-busy 残余的 cycles mean/min/max，以及按 ALL/AIC/AIV 各自 1.649844/1.650062/1.649731 cycles/ns 换算的等效时间范围；
 - `PMU-total / SYS-window/core`：先逐核计算 `total_cycles/submit_elapsed_ticks`，再展示 mean/min/max。它只表示当前 ELF 两套相近长窗的有效比，不是瞬时 AICore 频率，也不是利用率；
-- primary I-cache request/miss 的 mean/min/max、`Σmiss/Σrequest` 和 90 ns 直觉量尺。
+- primary I-cache request/miss 的 min/max、`Σmiss/Σrequest` 和按 miss 极值换算的 90 ns 直觉量尺。
 
 非 Scalar-busy 残余必须先对每条 record 计算 `total_cycles-scalar_busy`，再求 min/mean/max；不能用 `min(total)-min(scalar)` 或 `max(total)-max(scalar)` 拼接，因为两个极值可能来自不同物理核。有效 cycle 比同样采用逐核 ratio 的算术均值，不是 `Σtotal/Σelapsed`。这些派生字段只存在于受信 `SubmitPmuCapture` 和 HTML，raw summary 仍保持 producer 原有字段，因此没有给设备热路径、GM 容量或 raw 合同增加成本。
 
@@ -121,7 +121,7 @@ none 的 ABI 仍为 6,272 B；arg-build 在相同 96 份整窗 64 B 记录后追
 - phase 时间只与同一 ELF 的 `Σsubmit_elapsed_ticks` 比较；request/miss observed 只与同一 ELF、同一角色的 primary 比较；
 - 不提供 phase-local PMU total、scalar busy 或 I-cache stall 时间。
 
-CNT6/CNT7 在完整窗口中不读取，继续作为 primary；CNT8/CNT5 运行中 read-clear 并软件重建 shadow whole。`primary - shadow` 是分段重建的 capture gap。phase observed 会包含 counter 边界附近少量观测 bookkeeping 的取指，因此它不是原业务事件数的数学下界；`observed + capture gap` 也不是数学上界。HTML 同时展示两者，只用于判断结论对 capture gap 是否敏感。不同 profile 的 ELF 绝对时间、request 和 miss 都不能相减。
+CNT6/CNT7 在完整窗口中不读取，继续作为 primary；CNT8/CNT5 运行中 read-clear 并软件重建 shadow whole。`primary - shadow` 是分段重建的 capture gap。phase observed 会包含 counter 边界附近少量观测 bookkeeping 的取指，因此它不是原业务事件数的数学下界；`observed + capture gap` 也不是数学上界。HTML 对 ALL/AIC/AIV 各自展示 phase core-time 与时间占比；request/miss 展示 observed 总数、逐核 min/max、同 ELF primary 分母与占比，并明示 capture gap 敏感性量尺。I-cache per-call 加权均值仍保留在 Python 派生数据中，不再作为 HTML 主统计展示。不同 profile 的 ELF 绝对时间、request 和 miss 都不能相减。
 
 首轮 Case1/B256 闭合件为：
 
@@ -726,6 +726,53 @@ outputs/TestPagedAttentionUnroll_Case1_20260721_115559/
 
 Case1 三件套大小为 76,269/3,124/86,600 B，SHA256 分别为 `6d6aa06fbf972f36fbb9260485bb5ee41f5cbb97e9246cb15a398ba2497201ce`、`b4a535ec671f7416945b5205e11268308068759e75ecc324a10ea2a57fb3fa03`、`f5751e86f503273d1b8f8e386301d1d84dfdc49ee6de45d7372199ce90a68841`；provenance Git head 为 `77df395941f86b3b546a6f50d6288fb88acb7078`，实际 ELF SHA 与 B1 相同，离线重渲染也逐字节一致。
 
+### 1.9 真实 PA `submit-pmu-prepare-map`
+
+最新排他泳道把 PrepareMap 定义为 Materialize 结束后到 `dist_submit_prepare_map()` 返回并取得 `prepare_map_finish` 的区间。四条 Submit 入口都汇聚到 `dist_submit_materialize_and_prepare_map()`，因此 PMU profile 在该 helper 内只包围真实调用体：
+
+```text
+fdwic_submit_pmu_phase_begin<PrepareMap>()
+dist_submit_prepare_map(self, task_id)
+fdwic_submit_pmu_phase_end<PrepareMap>()
+```
+
+profile 身份为：
+
+```text
+PTO_FDWIC_SUBMIT_PMU=1
+PTO_FDWIC_SUBMIT_PMU_PHASE_ID=8
+PTO_FDWIC_TRACE_ENABLED=0
+
+capture.mode                 = submit-pmu-prepare-map
+configuration.phase.id       = 8
+configuration.phase.name     = prepare-map
+configuration.phase.boundary = dist_submit_prepare_map_call_entry_to_return
+```
+
+PrepareMap 每个 Submit 固定调用一次，因此 CaseB1 每核严格 5 对、Case1 每核严格 1,280 对 begin/end。它继续复用 64 B phase sidecar 和 12,416 B 固定总容量，没有增加 GM 字段、逐 Submit record 或逐事件 raw。运行方式为：
+
+```bash
+python -m pytest \
+  examples/a5/fully_distributed_within_core/paged_attention_unroll/test_paged_attention_unroll.py \
+  --platform a5 --runtime fully_distributed_within_core --level 2 \
+  --case Case1 --manual include --fdwic-profile submit-pmu-prepare-map \
+  --rounds 1 -s -v
+```
+
+B1 结构回归位于 `outputs/TestPagedAttentionUnroll_CaseB1_20260722_143131/`：golden 通过，96 核共 480 对边界，所有 phase status 为 `0x3f`，raw/provenance/HTML 闭合。完整 Case1 位于 `outputs/TestPagedAttentionUnroll_Case1_20260722_143242/`：golden 通过，96 核共 122,880 对边界，所有 producer/consumer/provenance 门禁通过。
+
+Case1 同一 ELF 内的直接观察结果如下。时间占比以各角色 `Σsubmit_elapsed_ticks` 为分母；request/miss 占比以同次采集、同角色的 primary 为分母：
+
+| 角色 | elapsed/call | 时间占比 | request observed 总数 | 逐核 request min–max | request 占比 | miss observed 总数 | 逐核 miss min–max | miss 占比 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ALL | 80.603 ns | 2.3078% | 10,095,628 | 103,633–106,941 | 13.9869% | 1,636 | 7–39 | 0.1767% |
+| AIC | 81.468 ns | 2.3930% | 3,365,879 | 103,752–106,338 | 13.6735% | 314 | 7–15 | 4.0391% |
+| AIV | 80.171 ns | 2.2668% | 6,729,749 | 103,633–106,941 | 14.1491% | 1,322 | 10–39 | 0.1440% |
+
+这组数只说明独立 PMU ELF 中 `dist_submit_prepare_map()` 调用体的观察结果。泳道 PrepareMap 还包含相邻取时与 trace record 边界，而 submit-PMU 编译期去除了 trace；两类 ELF 的代码布局和多核时序也不同。因此不能拿本轮 2.3078% 与泳道占比直接相减来声称某段 record 成本，也不能把各 phase 的 request/miss 跨 ELF 相加成完整 Submit。
+
+三件套 raw/provenance/HTML 的 SHA256 分别为 `62aa8f74aaa439f088963e4e3a768bbac4053ab292f392fc8c39a49b81995ae8`、`2fe946082ffbc9f4a91f9f5d1cdda38398be19e2c3a2f607df1a48f268b0c365`、`288cfc4238290ba11558f26f6e4798d43d13b2cca583e65002ca5a50a5dc2ebf`。
+
 ## 2. 为什么 I-cache miss 必须独立重编译
 
 I-cache 数据对代码布局极其敏感。泳道和逐 atomic 观察会增加：
@@ -799,11 +846,12 @@ raw 转换、阶段顺序和整数闭合均通过，schema 能完整解析 site/
 - `submit-pmu-claim`：第 1.5 节定义的真实 Claim 业务 span；
 - `submit-pmu-register`：第 1.6 节定义的 RegisterOutputs 调用体；
 - `submit-pmu-submit-transition`：第 1.7 节定义的所有相邻 Submit 间隙聚合；
-- `submit-pmu-efdrain-control`：第 1.8 节定义的排除 linked Kernel 的不连续 Scalar 控制段。
+- `submit-pmu-efdrain-control`：第 1.8 节定义的排除 linked Kernel 的不连续 Scalar 控制段；
+- `submit-pmu-prepare-map`：第 1.9 节定义的 `dist_submit_prepare_map()` 调用体。
 
-真实 phase id 依次为 ArgBuild `1`、EmptyBracket `2`、Materialize `3`、Claim `4`、Register `5`、SubmitTransition `6` 和 EfDrainControl `7`；`none` 不含 phase。除 SubmitTransition 的 outer calls 为 `N-1` 外，其余业务/校准 phase 都为 `N`；EfDrainControl 的实际 begin/end 读数还要加被排除 Kernel 数 `K`。
+真实 phase id 依次为 ArgBuild `1`、EmptyBracket `2`、Materialize `3`、Claim `4`、Register `5`、SubmitTransition `6`、EfDrainControl `7` 和 PrepareMap `8`；`none` 不含 phase。除 SubmitTransition 的 outer calls 为 `N-1` 外，其余业务/校准 phase 都为 `N`；EfDrainControl 的实际 begin/end 读数还要加被排除 Kernel 数 `K`。
 
-八者 raw schema 均为 `fdwic-submit-pmu-v1`，但分别来自独立诊断 ELF，不能跨 profile 相减或拼接。
+九者 raw schema 均为 `fdwic-submit-pmu-v1`，但分别来自独立诊断 ELF，不能跨 profile 相减或拼接。
 
 standalone 历史 schema 中的 `lower/upper` 是已经固化的字段名，只表达 read-clear observed 与 `primary-shadow` capture gap；由于 bracket 两侧也有观察 bookkeeping，它们同样不能解释为零插桩业务事件数的数学上下界。
 
@@ -1006,7 +1054,7 @@ submit_icache_raw.json       # 96 核权威原始件及 host summary
 submit_icache_report.html    # 可离线浏览的加工件
 ```
 
-HTML 使用内联 CSS/SVG，不依赖外部前端库；浏览器直接打开即可。它包含 Submit-all PMU 整窗的 AIC/AIV 对比、逐物理核 request/miss/rate 分布、96 核明细和 90 ns core-equivalent 提示。报告同时展示 AIC/AIV/ALL 的 PMU raw `total_cycles`、CNT2 `scalar_busy`、`Σscalar/Σtotal` 以及 “非 Scalar-busy 残余”，并在保留 raw cycle 的同时给出校准后的每核等效时间。顶部的“完整 Submit”固定表示**最早一次 Submit 进入到最晚一次 Submit 返回**；它是 96 核共同形成的整体墙钟范围，不等于逐核 PMU whole gate 的平均值；对应到每个 worker，首末 Submit 边界也窄于该核的 PMU whole gate。ALL/AIC/AIV 分别用响应式卡片展示逐核 `min/mean/max`：`mean` 作为唯一的典型值，`min/max` 只用于呈现核间范围。raw summary 没有 `min` 字段，HTML 从通过 96 核门禁的 `records` 对称推导 `min/max`；PMU total 与 scalar busy 各自独立取极值，不保证来自同一个物理核。较宽的 I-cache 对比表和 96 核明细只在表格内部横向滚动，不再撑宽整页。
+HTML 使用内联 CSS/SVG，不依赖外部前端库；浏览器直接打开即可。它包含 Submit-all PMU 整窗的 AIC/AIV 对比、逐物理核 request/miss/rate 分布、96 核明细和 90 ns core-equivalent 提示。报告同时展示 AIC/AIV/ALL 的 PMU raw `total_cycles`、CNT2 `scalar_busy`、`Σscalar/Σtotal` 以及 “非 Scalar-busy 残余”，并在保留 raw cycle 的同时给出校准后的每核等效时间。顶部的“完整 Submit”固定表示**最早一次 Submit 进入到最晚一次 Submit 返回**；它是 96 核共同形成的整体墙钟范围，不等于逐核 PMU whole gate 的平均值；对应到每个 worker，首末 Submit 边界也窄于该核的 PMU whole gate。ALL/AIC/AIV 响应式卡片中，I-cache request/miss 与 90 ns 直觉量尺只展示逐核 `min/max`，不展示 mean；其他 PMU 时间类字段仍保留现有聚合口径。HTML 从通过 96 核门禁的 `records` 对称推导 `min/max`；PMU total 与 scalar busy 各自独立取极值，不保证来自同一个物理核。较宽的 I-cache 对比表和 96 核明细只在表格内部横向滚动，不再撑宽整页。
 
 本机 A5 受控 cold/warm 同窗校准得到：
 

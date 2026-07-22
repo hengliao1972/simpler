@@ -51,6 +51,7 @@ CLAIM_CAPTURE_MODE = "submit-pmu-claim"
 REGISTER_CAPTURE_MODE = "submit-pmu-register"
 SUBMIT_TRANSITION_CAPTURE_MODE = "submit-pmu-submit-transition"
 EFDRAIN_CONTROL_CAPTURE_MODE = "submit-pmu-efdrain-control"
+PREPARE_MAP_CAPTURE_MODE = "submit-pmu-prepare-map"
 ARG_BUILD_PHASE_ID = 1
 EMPTY_BRACKET_PHASE_ID = 2
 MATERIALIZE_PHASE_ID = 3
@@ -58,6 +59,7 @@ CLAIM_PHASE_ID = 4
 REGISTER_PHASE_ID = 5
 SUBMIT_TRANSITION_PHASE_ID = 6
 EFDRAIN_CONTROL_PHASE_ID = 7
+PREPARE_MAP_PHASE_ID = 8
 PHASE_CONFIG_BY_MODE = {
     ARG_BUILD_CAPTURE_MODE: {
         "id": ARG_BUILD_PHASE_ID,
@@ -114,6 +116,14 @@ PHASE_CONFIG_BY_MODE = {
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "discontinuous_running_read_clear_excluding_linked_kernel_calls",
         "time_semantics": "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls",
+    },
+    PREPARE_MAP_CAPTURE_MODE: {
+        "id": PREPARE_MAP_PHASE_ID,
+        "name": "prepare-map",
+        "boundary": "dist_submit_prepare_map_call_entry_to_return",
+        "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+        "counter_semantics": "running_read_clear_observed_bracket",
+        "time_semantics": "inner_sys_cnt_between_boundary_observers",
     },
 }
 
@@ -717,6 +727,8 @@ def _phase_group_summary(records: Sequence[dict[str, Any]], mode: str) -> dict[s
     summary = {
         "cores": len(records),
         "submit_elapsed_ticks": submit_elapsed,
+        "primary_icache_requests": primary_requests,
+        "primary_icache_misses": primary_misses,
         "phase_elapsed_ticks": phase_elapsed,
         "phase_icache_requests_observed": requests_observed,
         "phase_icache_requests_observed_plus_capture_gap": requests_observed_plus_gap,
@@ -1066,6 +1078,12 @@ def _metric_range(summary: Mapping[str, int | float], *, digits: int = 1) -> str
     )
 
 
+def _metric_extrema(summary: Mapping[str, int | float]) -> str:
+    """Format only the per-core minimum and maximum for I-cache counters."""
+
+    return f"最小 {_format_integer(summary['min'])}；最大 {_format_integer(summary['max'])}"
+
+
 def _scaled_metric_range(
     summary: Mapping[str, int | float],
     scale: float,
@@ -1081,6 +1099,20 @@ def _scaled_metric_range(
     )
 
 
+def _scaled_metric_extrema(
+    summary: Mapping[str, int | float],
+    scale: float,
+    *,
+    digits: int = 3,
+) -> str:
+    """Format only scaled per-core extrema for an I-cache-derived quantity."""
+
+    return (
+        f"最小 {_format_number(float(summary['min']) * scale, digits)}；"
+        f"最大 {_format_number(float(summary['max']) * scale, digits)}"
+    )
+
+
 def _group_card(name: str, summary: Mapping[str, Any], cycles_per_ns: float, miss_penalty_ns: float) -> str:
     submit_elapsed = summary["submit_elapsed_ticks"]
     total = summary["total_cycles"]
@@ -1089,7 +1121,6 @@ def _group_card(name: str, summary: Mapping[str, Any], cycles_per_ns: float, mis
     effective_cycles_per_tick = summary["pmu_total_cycles_per_submit_tick"]
     requests = summary["icache_requests"]
     misses = summary["icache_misses"]
-    penalty_mean_us = float(misses["mean"]) * miss_penalty_ns / 1_000
     cycles_to_us = 1.0 / cycles_per_ns / 1_000
     title = {"all": "ALL", "aic": "AIC", "aiv": "AIV"}[name]
     return f"""
@@ -1119,10 +1150,11 @@ def _group_card(name: str, summary: Mapping[str, Any], cycles_per_ns: float, mis
           <dd>{_scaled_metric_range(effective_cycles_per_tick, 1.0, digits=6)} cycles/ns<br>
             <small>同 ELF 长窗有效比；不是瞬时 AICore 频率，也不是利用率</small>
           </dd>
-          <dt>Primary I-cache request/core</dt><dd>{_metric_range(requests)}</dd>
-          <dt>Primary I-cache miss/core</dt><dd>{_metric_range(misses)}</dd>
+          <dt>Primary I-cache request/core</dt><dd>{_metric_extrema(requests)}</dd>
+          <dt>Primary I-cache miss/core</dt><dd>{_metric_extrema(misses)}</dd>
           <dt>加权 miss rate</dt><dd>{float(summary["icache_miss_rate"]):.3%}（Σmiss/Σrequest）</dd>
-          <dt>{miss_penalty_ns:g} ns 直觉量尺/core</dt><dd>均值 {_format_number(penalty_mean_us)} µs</dd>
+          <dt>{miss_penalty_ns:g} ns 直觉量尺/core</dt>
+          <dd>{_scaled_metric_extrema(misses, miss_penalty_ns / 1_000)} µs</dd>
         </dl>
       </article>
     """
@@ -1183,13 +1215,17 @@ def _per_core_rows(records: Sequence[dict[str, Any]], miss_penalty_ns: float) ->
 def _phase_observed_cell(
     observed: Mapping[str, int | float],
     observed_plus_capture_gap: Mapping[str, int | float],
+    primary: int,
     observed_share: float,
     observed_plus_capture_gap_share: float,
 ) -> str:
+    capture_gap = int(observed_plus_capture_gap["sum"]) - int(observed["sum"])
     return (
-        f"<strong>{_format_integer(observed['sum'])} / "
-        f"{_format_integer(observed_plus_capture_gap['sum'])}</strong><br>"
-        f"<small>{observed_share:.3%} / {observed_plus_capture_gap_share:.3%} of primary</small>"
+        f"<strong>{_format_integer(observed['sum'])}</strong><br>"
+        f"<small>逐核 {_metric_extrema(observed)}</small><br>"
+        f"<small>Primary {_format_integer(primary)}；占比 {observed_share:.3%}</small><br>"
+        f"<small>capture gap +{_format_integer(capture_gap)}；加 gap 后 "
+        f"{_format_integer(observed_plus_capture_gap['sum'])}（{observed_plus_capture_gap_share:.3%}）</small>"
     )
 
 
@@ -1226,12 +1262,14 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
         request_observed = _phase_observed_cell(
             group["phase_icache_requests_observed"],
             group["phase_icache_requests_observed_plus_capture_gap"],
+            group["primary_icache_requests"],
             group["phase_request_observed_share_of_primary"],
             group["phase_request_observed_plus_capture_gap_share_of_primary"],
         )
         miss_observed = _phase_observed_cell(
             group["phase_icache_misses_observed"],
             group["phase_icache_misses_observed_plus_capture_gap"],
+            group["primary_icache_misses"],
             group["phase_miss_observed_share_of_primary"],
             group["phase_miss_observed_plus_capture_gap_share_of_primary"],
         )
@@ -1250,9 +1288,7 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
             f"<td><strong>{_format_number(group['phase_elapsed_ticks']['sum'] / 1_000)} µs</strong><br>"
             f"<small>Submit core-time {_format_number(group['submit_elapsed_ticks']['sum'] / 1_000)} µs</small></td>"
             f"<td><strong>{group['phase_time_share_of_submit']:.3%}</strong></td>"
-            f"<td><strong>{_format_number(group['phase_elapsed_ticks_per_call'])} ns</strong><br>"
-            f"<small>request {_format_number(group['phase_icache_requests_observed_per_call'])} / "
-            f"miss {_format_number(group['phase_icache_misses_observed_per_call'])}</small></td>"
+            f"<td><strong>{_format_number(group['phase_elapsed_ticks_per_call'])} ns</strong></td>"
             f"<td>{request_observed}</td><td>{miss_observed}</td>"
             f"<td>{reads}</td>"
             f"<td>{_format_integer(group['phase_max_shadow_request_chunk'])} / "
@@ -1271,12 +1307,14 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
       时间占比的分母是同一 ELF 的 Σ每核 Submit elapsed；request/miss 百分比的分母才是同一 ELF、
       同一次采集的 Submit 整窗 primary。<code>observed_plus_capture_gap = observed + (primary − shadow)</code>；
       边界读数和插桩 bookkeeping 会进入 sample，因此“观测值”和“加全窗 capture gap”都不是原业务
-      事件数的数学上下界，也不能跨 ELF 相减。</p>
+      事件数的数学上下界，也不能跨 ELF 相减。request/miss 的逐核 min/max 是每核累计
+      整个 phase 的极值，不是逐调用极值。</p>
     <div class="table-wrap phase-table"><table>
       <thead><tr>
         <th>核组</th><th>Phase / Submit core-time</th><th>时间占比</th>
-        <th>每次调用 elapsed / request / miss observed</th>
-        <th>Request 观测值 / 加全窗 capture gap</th><th>Miss 观测值 / 加全窗 capture gap</th>
+        <th>每次调用 elapsed</th>
+        <th>Request observed（总数 / 逐核 min–max / Primary）</th>
+        <th>Miss observed（总数 / 逐核 min–max / Primary）</th>
         <th>Begin / End reads</th><th>最大 request / miss chunk</th>
       </tr></thead>
       <tbody>{"".join(rows)}</tbody>

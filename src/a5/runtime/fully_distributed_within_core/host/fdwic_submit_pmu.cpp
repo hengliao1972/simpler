@@ -68,6 +68,9 @@ constexpr SubmitPmuProfile kSubmitPmuProfiles[] = {
      kFdwicSubmitPmuPhaseBytes, "efdrain-control", "efdrain_begin_to_end_excluding_linked_kernel_calls",
      "discontinuous_running_read_clear_excluding_linked_kernel_calls",
      "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls"},
+    {"submit-pmu-prepare-map", kFdwicSubmitPmuModePrepareMap, FdwicSubmitPmuPhase::PrepareMap,
+     kFdwicSubmitPmuPhaseBytes, "prepare-map", "dist_submit_prepare_map_call_entry_to_return",
+     "running_read_clear_observed_bracket", "inner_sys_cnt_between_boundary_observers"},
 };
 
 const SubmitPmuProfile *requested_profile() {
