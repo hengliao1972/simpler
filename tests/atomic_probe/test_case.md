@@ -363,6 +363,79 @@ ATOMIC_PROBE_AIVS=24 ATOMIC_PROBE_FANOUT_LAUNCHES=3 \
   tests/atomic_probe/ccec/run_all.sh ld_dev_fanout_publish
 ```
 
+## 裸 `st_dev` / `ld_dev` 单次多核同步
+
+`ccec/st_dev_ld_dev_sync.cpp` 隔离测量一次一写多读同步，不复用前述 fanout
+用例的 ready/control/ack 原子协议，也不执行多轮 replay。启动 `N=2..20` 个
+AIV，固定 block0 为 writer，其余 `N-1` 个 block 为 reader：writer 只对独占
+64 B line 的 signal word 执行一次裸 `st_dev`，其后不显式执行 DSB；reader
+持续用 `ld_dev` 读取同一地址，直到精确观察到 `0x53594e43`。reader 使用
+20 ms 的设备侧有限超时，失败后仍参加末尾 SyncAll，避免错误路径死锁。
+
+每次 launch 的执行和计时边界为：
+
+```text
+N 个 AIV 执行初始 SyncAll（不计时）
+  -> 每核记录 begin
+  -> block0: raw st_dev(signal)
+     其余核: ld_dev(signal) 直到精确命中或超时
+  -> 每核记录 observe 和 final_arrive
+  -> N 个 AIV 执行末尾 SyncAll
+  -> 每核记录 end（计时结束）
+  -> 各核发布结果（不计时）
+```
+
+host 以 `overall = max(end) - min(begin)` 报告完整同步跨度，因此包含裸
+`st_dev`、所有 reader 的等待以及末尾 SyncAll，但不包含初始 SyncAll 和结果回写。
+其余诊断口径为：
+
+- `writer_st_dev_span = writer.observe - writer.begin`，只包围裸 `st_dev` 和取时开销；
+- `last_reader_observe = max(reader.observe) - writer.begin`；
+- `final_arrival_skew = max(final_arrive) - min(final_arrive)`，表示先到核等待慢核的跨度；
+- `final_sync_release = max(end) - max(final_arrive)`，表示最后一个核到达后直到所有核
+  被放行并完成取时的尾部，不是 SyncAll 单条指令的纯硬件延迟；
+- 末尾屏障从第一个核到达到全部放行的完整跨度为
+  `max(end) - min(final_arrive)`。
+
+signal 独占一条 64 B cache line，这是本协议的硬约束；其余 60 B padding 不得复用为
+flag、counter、结果或任何活跃对象，否则额外访问会改变同址 fanout 模型。每核结果和
+tail guard 也分别从后续独立 64 B line 开始。该布局由 `sizeof`、`alignof` 和 `offsetof`
+静态断言约束，host 还要求 signal padding 全部保持为零。host 对每个 launch
+精确检查实际 block 数、唯一 `(core_id, subblock_id)`、writer/reader 角色、目标值、
+timeout flag、时间顺序、未使用结果槽和 guard。结果槽在 `end` 之后用 `st_dev`
+写回并完成发布，因此结果回写不影响被测 signal 的“裸 `st_dev`、无显式 DSB”口径。
+
+2026-07-22 在 A5 device 0 直接执行；每组先预热 10 次，再采集 200 个样本。
+环境中没有 `task-submit` 和 `npu-smi`，所以两组都是未经设备锁隔离的直跑，不能
+确认采样期间不存在外部负载。两组共 400 个计量样本全部通过精确值和时间边界校验，
+没有 reader timeout：
+
+| AIV 拓扑 | overall min / p50 / p95 / max（SYS_CNT ticks） | writer span p50 | last reader p50 / p95 | final arrival skew p50 | final release p50 / p95 | 最大 reader polls p50 / p95 |
+|---|---:|---:|---:|---:|---:|---:|
+| 3 核：1 写 + 2 读 | 609 / 612 / 620 / 746 | 9 | 488 / 495 | 478 | 125 / 127 | 2 / 2 |
+| 20 核：1 写 + 19 读 | 722 / 2070 / 6349 / 10471 | 9 | 1912 / 6186 | 1903 | 156 / 161 | 11 / 46 |
+
+表中所有时间列的原始单位都是 A5 1 GHz `get_sys_cnt()` tick；数值除以 1000
+即为 μs。约 1.65 GHz 是当前 AICore PMU/core-cycle 频率，只用于换算 PMU
+cycle，不能用来换算本表的 SYS_CNT tick。3 核组
+`overall` p50 为 0.612 μs，20 核组为 2.070 μs，本次配对样本中前者约为后者的
+`0.296x`，即约快 3.38 倍。裸 `st_dev` 记录跨度两组同为 9 SYS_CNT ticks，差值主要出现
+在最后一个 reader 的观察时间；这只能说明本微基准中同址 reader fanout 增加时
+等待和长尾上升，不能仅凭两组未隔离样本推导任意核数的缩放曲线或生产同步上限。
+同日相同裸写数据路径的另外两次 20 核、各 200 样本运行得到 `overall` p50
+2.659 μs 和 2.818 μs；这进一步表明无设备锁条件下存在明显会话级波动，不能把
+表中的 3.38 倍当作稳定缩放系数。
+
+复现入口：
+
+```bash
+# 默认 20 AIV
+tests/atomic_probe/ccec/run_all.sh st_dev_ld_dev_sync
+
+# 3 AIV：1 writer + 2 readers
+ATOMIC_PROBE_AIVS=3 tests/atomic_probe/ccec/run_all.sh st_dev_ld_dev_sync
+```
+
 ## PMU 对 atomic 与 I-cache miss 等待周期的精确归类
 
 `ccec/atomic_scalar_pmu.cpp` 与 `ccec/icache_scalar_pmu.cpp` 是两个独立单 AIV 微基准。

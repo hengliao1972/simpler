@@ -68,6 +68,7 @@ RUN_TIMEOUT="${ATOMIC_PROBE_TIMEOUT:-120}"
 PROBES=(
     "nested_lambda.cpp:nested_lambda_kernel.o:nested_lambda_host.cpp:nested_lambda_host"
     "atomic_cas_probe.cpp:atomic_cas_kernel.o:atomic_cas_host.cpp:atomic_cas_host"
+    "st_dev_ld_dev_sync.cpp:st_dev_ld_dev_sync_kernel.o:st_dev_ld_dev_sync_host.cpp:st_dev_ld_dev_sync_host"
     "entire_flush_clobber.cpp:entire_flush_clobber_kernel.o:entire_flush_clobber_host.cpp:entire_flush_clobber_host"
     "bypass_dcache_ccec.cpp:bypass_dcache_kernel.o:bypass_dcache_ccec_host.cpp:bypass_dcache_ccec_host"
     "dcci_clean_clobber.cpp:dcci_clean_kernel.o:dcci_clean_clobber_host.cpp:dcci_clean_host"
