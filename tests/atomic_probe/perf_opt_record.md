@@ -3028,3 +3028,141 @@ LoserReplay 只存在于真实 Kernel loser 分支：它与 schema-v4 泳道共�
 两轮的 v2 严格校验、`96/96` trusted/linked-kernel/return-ready atomic 门禁和动态全局/角色 call-count 均闭合。B1 的逐核调用数为 `3–4`，Case1 的调用数为 `97,280 = 32,256 AIC + 65,024 AIV`，逐核 `1,005–1,020`（AIC `1,005–1,013`，AIV `1,014–1,020`），excluded Kernel 为 0。Case1 的阶段 scalar-code 时间为 5,021,979 ticks，I-cache request 为 8,218,072，miss 为 453,234；在同一 ELF 内，它占完整 Submit scalar-code core-time 分母的 `5,021,979 / 394,817,462 = 1.2719749%`。
 
 Case1 执行了 97,280 对 begin/end observer，每对都含 shadow counter read-clear 和边界 bookkeeping，因此这是高频观察 ELF，不是无扰动业务 ELF。局部 SYS 时间边界故意位于 begin 读取之后、end 读取之前，但观察器仍会改变整体指令流、I-cache 和墙钟。该轮全局 Submit 墙钟 `5.256747 ms` 只用于证明采集闭合，不与 none、empty 或其他 phase 的独立 ELF 相减，不把跨 ELF 百分比求和，也不写任何收益结论。
+
+### 2026-07-22 / O12：真实 PA 全 span 双证据链汇总
+
+状态：**[观察工具：纯离线重算与现有 13 份 v2 产物闭合；未上板]**
+
+#### 目标与实现边界
+
+本阶段不再增加 device phase、record 字段或 raw 容量，也没有重新运行 A5。新增
+`simpler_setup/tools/fdwic_submit_span_overview.py`，把现有泳道业务时间树与 13 份独立
+Submit-PMU ELF 放进同一份离线报告，但从数据结构上禁止两条证据链混算。
+
+泳道输入固定为 producer 的 `l2_swimlane_records.json`，不使用含 Perfetto 显示轨道和合成显示事件的
+`merged_swimlane.json`，也不直接信任旁边已经生成的 analysis。工具先后读取 raw SHA，并复用现有
+schema-v4 analyzer 当场重算：96 核物理拓扑、每核 1,280 个连续 Submit、父子包含、Kernel 唯一归属、
+`dropped_records=0` 以及六组整数闭合全部通过后，才生成紧凑摘要。
+
+PMU 输入固定为 13 个目录中的 raw/provenance 对。每份先通过现有 `load_capture()` 的 owner、selector、
+status、拓扑、调用 shape、linked-Kernel gate 与 return-ready atomic 时间门禁，再用
+`load_provenance()` 闭合 raw SHA、profile、编译宏和构建身份；缺 mode、重复 mode、场景键不一致或输入
+生成期间变化都会拒绝发布。JSON/HTML 先成对暂存，再在输出目录独占锁下替换；第二份发布失败会恢复
+旧 pair，不留下半新半旧的正式件。
+
+本次没有给最新泳道反向伪造 provenance。13 份 PMU 实际来自四组 revision：
+
+```text
+9d3acca8  908f9adf  94172c64  d67f3f5e
+```
+
+13 个 `aicore_kernel` SHA 均不同；泳道 raw 又没有 build sidecar。因此 overview 明确发布
+`swimlane_to_pmu_identity_bound=false`，只证明两条证据链各自严格闭合，并仅对齐 96 核拓扑和每核
+Submit 数。mixed revision 可以并列展示，不能跨 ELF 相减、拼接或求和。
+
+#### 时间与 PMU 的精确口径
+
+真实源码的首末关系重新按 `submit_pmu.h` 核实：首个 Submit 先取 start tick、再启动 PMU；末个 Submit
+先关闭 scalar segment、停止 PMU，再取 end tick。PMU gate 因而嵌在首末 SYS closure 内，不是比该
+closure 更宽。每次 linked Kernel 又会成对 stop/start；`scalar_submit_elapsed_ticks` 是 gate-running
+SYS 段的累计，再扣 result-used return-ready atomic 等待。PMU total/scalar-busy/primary I-cache 只在
+gate 打开时计数，不含 linked Kernel，但不会为 return-ready atomic 停表，所以仍含 atomic 指令和最小
+观察 hook 的事件；source-issue atomic 继续保留在时间与 counter 中。
+
+泳道 `clock_freq_hz=1,000,000,000` 是 SYS counter 的换算频率，即 1 tick=1 ns；它与 AIC/AIV 约
+1.65 GHz 的 PMU cycle 频率不是同一个量。泳道百分比只在同一 ELF 的排他 core-work 树中闭合；每张
+PMU phase 卡则直接展示 `本 ELF 分子 / 本 ELF 分母 = 占比`。页面没有跨 PMU profile 的合计字段或
+堆叠图。动态 phase 额外显示逐核 calls min/max 与零调用核数，避免把 AllocComplete AIV 的零值误读为
+一次业务调用的零耗时。
+
+#### 当前泳道同 ELF 分布
+
+输入为：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260722_104657/l2_swimlane_records.json
+```
+
+schema-v4 重算得到全局 Submit 墙钟 4.844066 ms。96 核累计的 SubmitEnvelope 精确分成 SubmitUnion
+`85.3839%` 与 BetweenSubmitResidual `14.6161%`；SubmitUnion 进一步精确闭合为：
+
+| 区域 | 同一 SubmitUnion 占比 |
+| --- | ---: |
+| EfDrain | 16.1853% |
+| Materialize | 25.3230% |
+| PrepareMap | 5.3936% |
+| Claim | 20.4422% |
+| Fanin | 0.3989% |
+| Register | 12.5173% |
+| WinnerBuild | 1.6655% |
+| AllocComplete | 0.2154% |
+| LoserReplay | 3.1810% |
+| SubmitInternalResidual | 10.8563% |
+| SubmitTailResidual | 3.8217% |
+
+EfDrain 内部又闭合为 KernelUnion `51.2020%` 与 control `48.7980%`。当前泳道还有 2 个 Kernel event
+落在 WinnerBuild，但 analysis 没有发布该 child 的 Kernel union 时长；所以泳道表保持“原始业务
+elapsed”名称，不假装为纯 Scalar。纯 Scalar 的 EfDrain/WinnerBuild/AllocComplete 归因只看分别排除
+linked Kernel 的 PMU control ELF。
+
+SubmitInternalResidual 本轮只有 `Claim->Materialize`，与 ArgBuild PMU 边界对应；SubmitTailResidual
+按 LoserReplay/Register/WinnerBuild/AllocComplete 四种结尾列出，但当前没有独立 PMU phase。覆盖矩阵
+同时列出 WorkerCompletion、OrchestrationReplay、Setup/Tail、FinalDrain 及其 Kernel/Residual 子项；
+未覆盖项保持未覆盖，不以 residual 名称替代业务数据。Atomic、ClockBaseline、Commit、RingBp、DrainWon
+均保持非加和 overlay。
+
+#### 当前 PMU 独立 ELF 结果
+
+13 份 Case1 v2 raw/provenance 全部重新严格加载。`none` 的完整 Scalar 时间分母、PMU total、
+scalar-busy、primary request/miss 单列；empty-bracket 单列为 observer 校准。11 个业务 phase 的同 ELF
+ALL 比例为：
+
+| PMU phase | Scalar 时间 | request observed | miss observed |
+| --- | ---: | ---: | ---: |
+| ArgBuild | 5.927% | 19.119% | 27.021% |
+| Materialize | 25.044% | 32.352% | 12.503% |
+| Claim | 10.626% | 20.996% | 20.683% |
+| Register | 6.028% | 14.119% | 14.486% |
+| SubmitTransition | 14.231% | 22.198% | 27.843% |
+| EfDrainControl | 7.092% | 16.735% | 12.784% |
+| PrepareMap | 3.016% | 11.785% | 1.480% |
+| Fanin | 0.358% | 0.486% | 1.027% |
+| WinnerBuildControl | 3.472% | 5.047% | 1.815% |
+| AllocCompleteControl | 0.197% | 0.244% | 0.403% |
+| LoserReplay | 1.272% | 9.723% | 11.619% |
+
+每一行的三个百分比只属于该行自己的 ELF。局部 request/miss 是 running read-clear observed，仍包含
+边界附近 observer/bookkeeping；即使标出 capture gap，也不是无插桩业务事件的数学上下界。上述表只
+用于找下一步应深入的区域，不是可相加的整窗解释，也不是性能收益。
+
+#### 产物与离线门禁
+
+正式离线加工件位于：
+
+```text
+outputs/down/fdwic_submit_span_overview_20260722_v2/
+  fdwic_submit_span_overview.json
+  fdwic_submit_span_overview.html
+```
+
+新增合成测试覆盖 schema-v4 分区闭合、13 profile 完整 cohort、缺失/重复 profile、泳道/PMU Submit
+数不一致、mixed git head、所有 exclusive/residual/外围区域覆盖、零 miss 分母、HTML 只显示 min/max、
+本 ELF 分母直显、成对发布回滚和并发发布锁。真实产物则完整执行一次 75 MB 泳道 raw 重算与 13 份
+raw/provenance 加载；最终 HTML/JSON 约 46 KB/122 KB，只是离线加工件，不进入设备热路径或性能采集。
+
+最终离线回归为：
+
+```text
+test_fdwic_submit_span_overview.py
+test_fdwic_submit_pmu_report.py
+test_fdwic_swimlane_converter.py
+test_scene_test_cache.py
+    386 passed
+
+test_fdwic_swimlane_poll_batch
+    2 passed
+
+ruff check / format --check（本轮新增 Python 文件）
+git diff --check
+    PASS
+```
