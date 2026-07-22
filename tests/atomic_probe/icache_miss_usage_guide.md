@@ -242,7 +242,7 @@ outputs/TestPagedAttentionUnroll_CaseB1_20260721_021100/
 - empty-bracket 是观察器的**经验校准 profile**，不是观察成本的数学下界，也不是可以从业务 phase 中直接扣除的固定常数。
 - `submit-pmu-empty-bracket` 与 `submit-pmu-arg-build` 使用不同诊断 ELF；phase 宏、代码布局、I-cache 状态和跨核到达时序都会改变。可以用 empty 的量级判断局部 observed 是否主要由观察器构成，不能逐项相减生成所谓“修正后的 arg-build”。
 - 即使同一轮 capture gap 为 0，也只证明 primary/shadow 整窗重建闭合，不会把上述两套边界变成同一个区间。
-- 受控微基准给出的约 90 ns/miss 只是一把 core-latency 直觉量尺。miss 可在单核内重叠、被流水隐藏，96 核之间也并行；其中还可能包含观察器自身带来的 miss。因此 `miss × 90 ns` 不能解释为 Submit 墙钟损失，更不能当成候选优化的可兑现收益。
+- 现行单子核受控微基准给出的 AIC `77.376 ns/miss`、AIV `94.030 ns/miss` 只是一把 core-latency 直觉量尺；既有报告中的 90 ns 则是历史兼容口径。miss 可在单核内重叠、被流水隐藏，96 核之间也并行，其中还可能包含观察器自身带来的 miss。因此无论采用分角色标尺还是旧 `miss × 90 ns`，都不能解释为 Submit 墙钟损失，更不能当成候选优化的可兑现收益。
 
 ### 1.4 真实 PA `submit-pmu-materialize`
 
@@ -1223,11 +1223,45 @@ PYTHON=/home/q00473782/.venv/bin/python
 
 建议将每次采集的 JSON 和分析器生成的 summary 放在同一唯一目录；`outputs/` 为本机证据目录，不作为源码提交的一部分。
 
-## 9. 如何使用约 90 ns/miss 标尺
+## 9. 如何使用分角色的单次 I-cache miss 标尺
 
-当前约 `90 ns/miss` 来自隔离 cold/warm 微基准，只用于建立数量级感性。目标函数只有 8 B，并按 128 B I-cache line 对齐；cold trial 在窗口外先执行 64 KiB 指令 capacity sweep，warm trial 在 PMU read-clear 前额外调用一次同一目标。1 ns/tick 的 SYS_CNT 只包围最终目标调用，两条路径的 gate、harness 和目标符号相同。
+### 现行参考：2026-07-22 单子核严格 cold/warm 校准
 
-64 trials/core × 10 轮和 128 trials/core × 5 轮都满足：
+此前统一使用的约 `90 ns/miss` 来自 96-worker mixed launch 的聚合试验。为消除各核同时执行 64 KiB capacity sweep 带来的取指争用，并区分 AIC/AIV 角色，2026-07-22 在提交 `b04f592b` 的干净 detached worktree 中复用 `tests/atomic_probe/ccec/icache_scalar_pmu` 的 PMU owner、host 校验和 cold/warm 配对框架，做了单物理子核校准。该校准没有修改真实 PA 热路，也没有把临时探针接入正式 `submit-pmu` 构建。
+
+最终 AIC/AIV ELF 都通过以下运行前硬门禁：
+
+- target 固定为 `8 B @ 0x0`，按 128 B I-cache line 对齐，只占一个 16 B fetch block；
+- 布局固定为 `target -> prepare -> warm harness -> evictor`。AIC/AIV 的 harness 均为 `172 B @ 0x180`，evictor 均为 `65,604 B @ 0x280`；
+- 64 KiB 以上的 evictor 同时超过本机模型配置中的 AIC 32 KiB、AIV 16 KiB scalar I-cache 容量；
+- warm/cold 交替采用 `WARM,COLD` 和 `COLD,WARM` 顺序，每一对必须落在同一 physical subcore；任何一对不满足 `warm CNT7=0 && cold CNT7=1` 都立即判失败，不进入统计。
+
+AIC 与 AIV 各执行一次 101 对试验，合计 404/404 个 cold/warm 样本的 checksum、mode echo、PMU 关窗、physical subcore 和 owner Restore 全部通过；两组都是 101/101 对严格增加一次 CNT7 miss。结果如下：
+
+| 角色 | physical subcore | 有效配对 | SYS_CNT cold-warm 均值 | SYS_CNT 中位数 / 范围 | PMU total cold-warm 均值 | PMU total 中位数 / 范围 | PMU cycle 按 1.65 GHz 换算 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| AIC | 0 | 101/101 | **77.376 ns** | 77 ns / 76～79 ns | **127.733 cycles** | 128 / 127～130 cycles | 77.414 ns |
+| AIV | 18 | 101/101 | **94.030 ns** | 94 ns / 93～96 ns | **155.287 cycles** | 155 / 154～157 cycles | 94.113 ns |
+
+1 ns/tick 的 SYS_CNT 原始分布为：AIC `76:5, 77:58, 78:33, 79:5`，AIV `93:15, 94:69, 95:16, 96:1`。PMU total cycle 分布为：AIC `127:34, 128:61, 129:5, 130:1`，AIV `154:7, 155:61, 156:30, 157:3`。两套时基换算后的差异均小于 0.1 ns，互相验证了约 1.65 cycles/ns 的当前频率口径。
+
+每一对的额外 request 都严格为 4、额外 miss 严格为 1；额外 `scalar_instr_busy(0x1)` 则严格为 0。它证明本试验中的单次回填等待形成 PMU total/scalar-busy gap，而不是增加 scalar busy。request 的 `+4` 与本机模型配置的取指加三条顺序预取相符，但只有 target 所在行产生 CNT7 miss，后续 warm harness 行没有再 miss。
+
+因此，当前受控口径不应再把 AIC/AIV 折成同一个 90 ns 常数。对真实 PA 已分别聚合出的角色 miss 数，应计算：
+
+```text
+隔离串行 core-work 等效量(ns) = 77.376 * M_AIC + 94.030 * M_AIV
+分角色加权标尺(ns/miss) =
+    (77.376 * M_AIC + 94.030 * M_AIV) / (M_AIC + M_AIV)
+```
+
+若仅为了与旧校准比较，假设 32 个 AIC 和 64 个 AIV 每核 miss 数相同，则 worker 加权结果为 `88.479 ns/miss`；对应 PMU 加权均值为 `146.102 cycles/miss`，按 1.65 GHz 为 `88.547 ns/miss`。旧 `90 ns` 相对此口径高 `1.521 ns`，约 `1.72%`。如果真实 PA 的 AIC/AIV miss 比例不是 1:2，就必须使用实际 `M_AIC/M_AIV`，不能套用 `88.5 ns`。
+
+这里的“单次 miss 时间”严格限定为：**一个物理子核、容量驱逐后、CNT7 恰好增加 1 的 target 完成时间 cold-warm 增量**。本轮固定采样 physical AIC 0 和 AIV 18，没有轮转全部 96 个活跃子核，因此表中范围是同一子核的时间分布，不是核间 min/max。它也没有控制下一级 refill 命中位置，不等于连续顺序取指的 miss 吞吐，更不是 Submit 已经暴露的墙钟 stall。真实热路中的 compulsory/capacity/conflict miss、预取、同核流水重叠和跨核并行仍可能改变可见代价。
+
+### 历史参考：96-worker 聚合得到的约 90 ns
+
+2026-07-18 的旧 `icache-single` 在同一个 mixed launch 中让 32 个 AIC 和 64 个 AIV 各自执行 64 KiB sweep，再聚合全部 worker。64 trials/core × 10 轮和 128 trials/core × 5 轮都满足：
 
 ```text
 cold CNT7 miss == trials
@@ -1236,34 +1270,27 @@ miss_delta == 96 * trials
 calibrated_cores == 96/96
 ```
 
-前者 ALL 中位数为 86.596 ns/miss，范围 86.532～86.792；后者中位数为 89.629 ns/miss，范围 89.615～89.648。AIC/AIV 差值方向在两组规模间改变，因此不建立伪精确的角色常数，统一取 90 ns 只作一阶标尺。历史原始日志为：
+前者 ALL 中位数为 86.596 ns/miss，范围 86.532～86.792；后者中位数为 89.629 ns/miss，范围 89.615～89.648。AIC/AIV 差值方向还随 trials 规模改变，所以这组数据只保留为“96 核并发驱逐条件下”的历史数量级证据，不再用来建立现行角色常数。历史原始日志为：
 
 ```text
 pa_scheduler/outputs/pmu_validation/icache_single_64x10_20260718_085929_3232836_console.log
 pa_scheduler/outputs/pmu_validation/icache_single_128x5_20260718_090151_3235468_console.log
 ```
 
-对某一角色，可以计算：
+当前 `pmu_sidecar_analyzer.py` 和 `pmu_html_report.py` 的单一 `--icache-miss-ns` 默认值仍为 `90.0`，用于保持已生成历史报告和命令接口的口径。本节只记录更严格的分角色校准结果，不静默回填旧 HTML、旧表格或旧 JSON，也不把单一 CLI 参数伪装成已经支持 AIC/AIV 两套常数。
 
-```text
-角色总 core-work 串行等效量(us) = Σmiss * 0.09
-该角色平均每核等效量(us/core) = (Σmiss / core_count) * 0.09
-```
+无论使用历史 90 ns 还是现行分角色标尺，所得结果都只能称为隔离串行 core-work 等效量。不得从 Submit 墙钟中直接扣除，原因包括：
 
-约 1.65 GHz 的频率只用于换算 PMU cycle 事件；它不改变由 1 ns SYS_CNT cold/warm delta 得到的 `90 ns/miss` 标尺。
-
-例如 AIV 平均 70,000 miss/核，感性等效量是约 6,300 us/核。这不表示 Submit 墙钟真的损失了 6.3 ms，原因包括：
-
-- 64 个 AIV 之间并行；
+- 64 个 AIV、32 个 AIC 之间并行；
 - 同一核的 miss、预取、其他流水和等待可能重叠；
 - 隔离 cold miss 与真实热路 capacity/conflict/compulsory miss 不一定同价；
 - 当前已核实的 A5 事件中没有可直接换算墙钟损失的 I-cache stall-cycle counter。
 
-把 AIC 和 AIV 的 `Σmiss * 90 ns` 相加，只能得到全部核的感性 core-work 等效总量，不是端到端 Submit 总损失。要测真正暴露的性能损失，必须对同语义代码做交错 A/B：
+要测真正暴露的性能损失，必须对同语义代码做交错 A/B：
 
 1. 用相同 `submit-pmu none` 口径确认 `ΔAIC/AIV miss/core`；
 2. 另用不开 PMU/泳道的性能构建测 `ΔSubmit span`；
-3. 只有第 2 项是实际暴露的墙钟收益；第 1 项用于证明收益与 I-cache 变化同时出现，`90 ns` 仅提供一阶数量级解释。
+3. 只有第 2 项是实际暴露的墙钟收益；第 1 项只用于证明收益与 I-cache 变化同时出现，分角色单 miss 标尺仅提供数量级解释。
 
 ### 9.1 历史 b256 `none` 参考数据
 
