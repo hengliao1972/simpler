@@ -2921,3 +2921,36 @@ TestPagedAttentionUnroll::test_run
 2. 同一环境交错运行基线 A / 候选 B 的 `perf-clock` Case1，由完整 Submit 墙钟决定保留或撤回；
 3. 仅当 perf-clock 有稳定收益时，再用合并泳道确认变化落在 PrepareMap，业务 span、Submit 数和 atomic 次数不变；
 4. 只有仍需解释 I-cache 方向时，才增加 PrepareMap 单阶段 PMU，不预先扩张观察面。
+
+### 2026-07-22 / O9：纯 scalar-code Submit-PMU ABI/schema v2 口径重建
+
+状态：**[观察工具：离线、CCEC 与首轮真实 A5 v2 门禁已闭合]**
+
+#### 旧数据结论暂停
+
+新口径要回答的是 scalar 代码本身的开销：Submit 时间分母既不含 linked Kernel，也不含已发出 atomic 后等待返回值可用的时间。旧采集和旧 scalar I-cache HTML 使用的分母与 v2 不同，因此暂停引用其绝对结论和阶段比例，不与 v2 混用。
+
+linked Kernel 继续由调用前的 `metrics_prof_stop` 和返回后的 `metrics_prof_start` 排除，对应的 scalar SYS 时间段也在边界处闭合和重开；所以 linked Cube/Vector Kernel 既不进 PMU counter，也不进 scalar 时间分母。
+
+#### atomic 分类与扣时方式
+
+对 28 个 atomic site 做穷举分类：16 个使用返回值的 return-ready site 进入扣时，12 个只发出操作的 source-issue site 保留在 scalar 开销内。return-ready 边界是 atomic 前的 SYS_CNT 到结果数据依赖落实后的 SYS_CNT；v2 只从完整 Submit 和所属 active phase 的 scalar 时间中扣除这段 SYS bracket。
+
+不在每个 atomic 周围 stop/start PMU，因为那会向每次采样注入 PMU 控制开销并扰动 PIPE_ALL；也不加 DSB，因为本地结果数据依赖已经给出 return-ready 边界，额外屏障会改写被观测路径。因此 PMU counter 仍然包含 atomic 指令及其观察钩子，v2 的“纯 scalar-code”仅指时间分母口径，不表示 counter 已排除 atomic。
+
+#### 门禁与当前证据
+
+核心记录 ABI 保持 64 B，没有增长；raw JSON 因必选字段、状态位和时间语义都已不兼容旧文件，同步升级为 `fdwic-submit-pmu-v2`，不伪装成旧 schema。bit 17 是 return-ready atomic 扣时有效性的 fail-closed 门禁，状态异常或 bracket 未闭合时不允许生成正式产物。当前已通过 263 项 Python 离线用例和 2 项 C++ 用例，并闭合 phase 0/10 在 AIC/AIV 下的 CCEC 编译；同一 CCEC 优化 IR 还证明 atomic 返回值进入 `MOV -> SYS_CNT` 的显式数据依赖。CANN 当前的 `llvm-objdump` 不能解码 HIIPU，因此这里不把 IR 证据误称为机器指令反汇编。这些都是离线正确性与代码生成证据，不是性能结论。
+
+#### 首轮真实 A5 闭合
+
+已产生四个 v2 产物：
+
+- none B1：`outputs/TestPagedAttentionUnroll_CaseB1_20260722_211055`
+- Winner B1：`outputs/TestPagedAttentionUnroll_CaseB1_20260722_211158`
+- none Case1：`outputs/TestPagedAttentionUnroll_Case1_20260722_211333`
+- Winner Case1：`outputs/TestPagedAttentionUnroll_Case1_20260722_211624`
+
+四轮的 trusted record、linked Kernel gate 闭合、return-ready atomic 扣时有效、vector busy 为零和 cube busy 为零等正式门禁均为 `96/96`。Winner Case1 的业务 phase calls 为 `1024 = 512 AIC + 512 AIV`，排除的 53 次 linked Kernel 调用全部位于 AIC。在该 Winner Case1 的同一 ELF 内，phase scalar-code core-time 占完整 Submit 分母的比例为 ALL/AIC/AIV `3.47% / 7.93% / 1.42%`。
+
+none Case1 的 `4.982069 ms` 与 Winner Case1 的 `4.599385 ms` 来自不同 ELF，不能相减或解读为优化收益，本轮不写收益结论。旧 v1 下的其余 profile 和 scalar I-cache HTML 仍需按 v2 口径全量重跑；在此之前不恢复旧数据结论。

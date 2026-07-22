@@ -332,9 +332,11 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_finish_kernel_tail(
     dist_submit_register_outputs(ctx, args, /*include_existing=*/true);
     fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Register>();
     TRACE_TIMESTAMP(register_end);
+    if (ctx.won) fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::WinnerBuild>();
     TRACE_SPAN_RECORD(register_begin, register_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Register, 0, 1);
     if (__builtin_expect(ctx.won, 0)) {
         dist_submit_build_winner_task(ctx, mixed, args);
+        fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::WinnerBuild>();
         TRACE_TIMESTAMP(winner_build_end);
         TRACE_SPAN_RECORD(
             register_end, winner_build_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::WinnerBuild, 0, 0

@@ -20,7 +20,10 @@
 // PMU 的逐 kernel task ring。none 每核只发布一个 64B 整窗结果；局部阶段
 // 在相同整窗结果之后追加一个 64B sidecar，仍然没有逐事件记录。
 constexpr uint32_t kFdwicSubmitPmuMagic = 0x554d5053U;  // little-endian "SPMU"
-constexpr uint16_t kFdwicSubmitPmuVersion = 1;
+// v2 将整窗口径收敛为 scalar 代码时间：所有 linked vector/cube Kernel
+// 在 gate 之外执行，result-used atomic 的 return-ready 依赖区间再从
+// SYS_CNT 累计值中扣除；PMU counter 仍保留 atomic 指令事件。
+constexpr uint16_t kFdwicSubmitPmuVersion = 2;
 constexpr uint16_t kFdwicSubmitPmuModeNone = 1;
 constexpr uint16_t kFdwicSubmitPmuModeArgBuild = 2;
 constexpr uint16_t kFdwicSubmitPmuModeEmptyBracket = 3;
@@ -31,6 +34,7 @@ constexpr uint16_t kFdwicSubmitPmuModeSubmitTransition = 7;
 constexpr uint16_t kFdwicSubmitPmuModeEfDrainControl = 8;
 constexpr uint16_t kFdwicSubmitPmuModePrepareMap = 9;
 constexpr uint16_t kFdwicSubmitPmuModeFanin = 10;
+constexpr uint16_t kFdwicSubmitPmuModeWinnerBuild = 11;
 constexpr uint32_t kFdwicSubmitPmuExpectedAic = 32;
 constexpr uint32_t kFdwicSubmitPmuExpectedAiv = 64;
 constexpr uint32_t kFdwicSubmitPmuExpectedCores = kFdwicSubmitPmuExpectedAic + kFdwicSubmitPmuExpectedAiv;
@@ -68,7 +72,10 @@ enum class FdwicSubmitPmuPhase : uint16_t {
     // Kernel winner 的 dist_submit_collect_fanin() 调用体。winner 分布由
     // 多核竞争决定，因此只要求逐核边界平衡与全局调用数闭合。
     Fanin = 9,
-    Count = 10,
+    // Kernel winner 的 WinnerBuild 完整业务边界内的 scalar control；等待
+    // 期间回收执行的 linked Kernel 通过成对 pause/resume 从计数和时间中排除。
+    WinnerBuild = 10,
+    Count = 11,
 };
 
 constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
@@ -93,6 +100,8 @@ constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
         return kFdwicSubmitPmuModePrepareMap;
     case FdwicSubmitPmuPhase::Fanin:
         return kFdwicSubmitPmuModeFanin;
+    case FdwicSubmitPmuPhase::WinnerBuild:
+        return kFdwicSubmitPmuModeWinnerBuild;
     case FdwicSubmitPmuPhase::Count:
         break;
     }
@@ -100,7 +109,13 @@ constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
 }
 
 PTO_DEVICE_FUNC constexpr bool fdwic_submit_pmu_phase_has_dynamic_calls(FdwicSubmitPmuPhase phase) {
-    return phase == FdwicSubmitPmuPhase::Fanin;
+    return phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild;
+}
+
+PTO_DEVICE_FUNC constexpr bool fdwic_submit_pmu_phase_excludes_linked_kernel(FdwicSubmitPmuPhase phase) {
+    // 当前每个 phase ELF 只编译一个选中阶段。无论 linked Kernel 将来落入
+    // 哪个阶段，begin/end 都统一扣除 pause/resume 生成的附加边界。
+    return phase != FdwicSubmitPmuPhase::None;
 }
 
 // 当前 PA 每个 batch 固定提交四个 Kernel task 和一个 Alloc task。动态
@@ -109,33 +124,25 @@ constexpr uint32_t fdwic_submit_pmu_batch_count(uint32_t expected_submits) {
     return expected_submits != 0 && expected_submits % 5U == 0 ? expected_submits / 5U : 0U;
 }
 
-constexpr uint64_t fdwic_submit_pmu_expected_dynamic_calls_all(
-    FdwicSubmitPmuPhase phase, uint32_t expected_submits
-) {
+constexpr uint64_t fdwic_submit_pmu_expected_dynamic_calls_all(FdwicSubmitPmuPhase phase, uint32_t expected_submits) {
     const uint64_t batches = fdwic_submit_pmu_batch_count(expected_submits);
-    return phase == FdwicSubmitPmuPhase::Fanin ? 4U * batches : 0U;
+    return phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild ? 4U * batches : 0U;
 }
 
-constexpr uint64_t fdwic_submit_pmu_expected_dynamic_calls_aic(
-    FdwicSubmitPmuPhase phase, uint32_t expected_submits
-) {
+constexpr uint64_t fdwic_submit_pmu_expected_dynamic_calls_aic(FdwicSubmitPmuPhase phase, uint32_t expected_submits) {
     const uint64_t batches = fdwic_submit_pmu_batch_count(expected_submits);
-    return phase == FdwicSubmitPmuPhase::Fanin ? 2U * batches : 0U;
+    return phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild ? 2U * batches : 0U;
 }
 
-constexpr uint64_t fdwic_submit_pmu_expected_dynamic_calls_aiv(
-    FdwicSubmitPmuPhase phase, uint32_t expected_submits
-) {
+constexpr uint64_t fdwic_submit_pmu_expected_dynamic_calls_aiv(FdwicSubmitPmuPhase phase, uint32_t expected_submits) {
     const uint64_t batches = fdwic_submit_pmu_batch_count(expected_submits);
-    return phase == FdwicSubmitPmuPhase::Fanin ? 2U * batches : 0U;
+    return phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild ? 2U * batches : 0U;
 }
 
-PTO_DEVICE_FUNC constexpr uint32_t fdwic_submit_pmu_dynamic_calls_max_per_core(
-    FdwicSubmitPmuPhase phase, uint32_t expected_submits
-) {
-    const uint32_t batches =
-        expected_submits != 0 && expected_submits % 5U == 0 ? expected_submits / 5U : 0U;
-    return phase == FdwicSubmitPmuPhase::Fanin ? 2U * batches : 0U;
+PTO_DEVICE_FUNC constexpr uint32_t
+fdwic_submit_pmu_dynamic_calls_max_per_core(FdwicSubmitPmuPhase phase, uint32_t expected_submits) {
+    const uint32_t batches = expected_submits != 0 && expected_submits % 5U == 0 ? expected_submits / 5U : 0U;
+    return phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild ? 2U * batches : 0U;
 }
 
 PTO_DEVICE_FUNC constexpr uint32_t
@@ -152,7 +159,7 @@ PTO_DEVICE_FUNC constexpr uint64_t fdwic_submit_pmu_expected_phase_boundary_read
     FdwicSubmitPmuPhase phase, uint32_t expected_submits, uint32_t excluded_kernel_calls
 ) {
     const uint64_t outer_calls = fdwic_submit_pmu_expected_phase_calls(phase, expected_submits);
-    return outer_calls + (phase == FdwicSubmitPmuPhase::EfDrainControl ? excluded_kernel_calls : 0U);
+    return outer_calls + (fdwic_submit_pmu_phase_excludes_linked_kernel(phase) ? excluded_kernel_calls : 0U);
 }
 
 constexpr bool fdwic_submit_pmu_mode_has_phase(uint16_t mode) {
@@ -160,11 +167,13 @@ constexpr bool fdwic_submit_pmu_mode_has_phase(uint16_t mode) {
            mode == kFdwicSubmitPmuModeMaterialize || mode == kFdwicSubmitPmuModeClaim ||
            mode == kFdwicSubmitPmuModeRegister || mode == kFdwicSubmitPmuModeSubmitTransition ||
            mode == kFdwicSubmitPmuModeEfDrainControl || mode == kFdwicSubmitPmuModePrepareMap ||
-           mode == kFdwicSubmitPmuModeFanin;
+           mode == kFdwicSubmitPmuModeFanin || mode == kFdwicSubmitPmuModeWinnerBuild;
 }
 
 // A5 PIPE_UTIL 事件布局。CNT6/CNT7 是权威值；CNT8/CNT5 使用相同事件作
 // 同窗副本。none 构建没有中途 read-clear，故两组必须逐核精确相等。
+constexpr uint32_t kFdwicSubmitPmuCnt0VectorBusy = 0x501U;
+constexpr uint32_t kFdwicSubmitPmuCnt1CubeBusy = 0x301U;
 constexpr uint32_t kFdwicSubmitPmuCnt2ScalarBusy = 0x001U;
 constexpr uint32_t kFdwicSubmitPmuCnt5ShadowIcacheMiss = 0x035U;
 constexpr uint32_t kFdwicSubmitPmuCnt6IcacheRequest = 0x034U;
@@ -183,8 +192,27 @@ enum FdwicSubmitPmuCoreStatus : uint32_t {
     kFdwicSubmitPmuWindowStarted = 1U << 8,
     kFdwicSubmitPmuWindowStopped = 1U << 9,
     kFdwicSubmitPmuTotalNonzero = 1U << 10,
+    kFdwicSubmitPmuCnt0SelectorValid = 1U << 11,
+    kFdwicSubmitPmuCnt1SelectorValid = 1U << 12,
+    kFdwicSubmitPmuLinkedKernelGateBalanced = 1U << 13,
+    kFdwicSubmitPmuScalarElapsedValid = 1U << 14,
+    kFdwicSubmitPmuVectorBusyZero = 1U << 15,
+    kFdwicSubmitPmuCubeBusyZero = 1U << 16,
+    // 所有 result-used atomic 的 return-ready 依赖区间都已成对闭合，且已
+    // 从 scalar SYS_CNT 分母和命中的 phase 时间中扣除。该位不改变 PMU
+    // gate，避免 PIPE_ALL 反过来改写 atomic 热路径。
+    kFdwicSubmitPmuReturnReadyAtomicTimeValid = 1U << 17,
+    // none 没有 phase sidecar，故用独立状态位证明一次性读取的 CNT8/CNT5
+    // 与 CNT6/CNT7 权威整窗逐核精确相等。
+    kFdwicSubmitPmuNoneShadowPrimaryMatch = 1U << 18,
 };
-constexpr uint32_t kFdwicSubmitPmuRequiredCoreStatus = (1U << 11) - 1U;
+constexpr uint32_t kFdwicSubmitPmuRequiredCoreStatus = (1U << 18) - 1U;
+constexpr uint32_t kFdwicSubmitPmuRequiredNoneCoreStatus = (1U << 19) - 1U;
+
+PTO_DEVICE_FUNC constexpr uint32_t fdwic_submit_pmu_required_core_status(FdwicSubmitPmuPhase phase) {
+    return phase == FdwicSubmitPmuPhase::None ? kFdwicSubmitPmuRequiredNoneCoreStatus :
+                                                kFdwicSubmitPmuRequiredCoreStatus;
+}
 
 enum FdwicSubmitPmuPhaseStatus : uint32_t {
     kFdwicSubmitPmuPhaseRequested = 1U << 0,
@@ -228,11 +256,13 @@ struct FdwicSubmitPmuCoreData {
     uint64_t first_submit_start_tick;
     uint64_t last_submit_end_tick;
     uint64_t total_cycles;
+    // 多段 SYS_CNT 累计，只覆盖 PMU gate 开启的 scalar 调度区间；linked
+    // Kernel、两侧 metrics_prof_stop/start 边界及 result-used atomic 的
+    // return-ready 依赖区间均不进入该时间分母。
+    uint64_t scalar_submit_elapsed_ticks;
     uint32_t scalar_busy;
     uint32_t icache_requests;
     uint32_t icache_misses;
-    uint32_t shadow_icache_requests;
-    uint32_t shadow_icache_misses;
     uint32_t submit_count;
     uint32_t expected_submit_count;
     uint16_t logical_core_id;
@@ -243,6 +273,9 @@ struct FdwicSubmitPmuCoreData {
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(FdwicSubmitPmuCoreData) == 64, "submit-PMU core record must occupy one cacheline");
+static_assert(
+    offsetof(FdwicSubmitPmuCoreData, scalar_submit_elapsed_ticks) == 24, "submit-PMU scalar elapsed offset changed"
+);
 static_assert(offsetof(FdwicSubmitPmuCoreData, status) == 60, "submit-PMU status offset changed");
 
 // phase sidecar 只在局部阶段 mode 中分配。每个 worker 独占一条 cacheline，
@@ -260,9 +293,10 @@ struct FdwicSubmitPmuPhaseCoreData {
     uint32_t max_shadow_request_chunk;
     uint32_t max_shadow_miss_chunk;
     uint32_t status;
-    // EfDrainControl 专属：reserved[0] 保存被 pause/resume 排除的 linked-kernel
-    // 调用数；其他 phase 以及 reserved[1..3] 必须保持 0。复用保留字可维持
-    // 每核 64B 与总 GM 容量不变。
+    // 所有 phase 共用：reserved[0] 保存 phase 内被 pause/resume 排除的
+    // linked-kernel 调用数；reserved[1]/[2] 保存 CNT8/CNT5 重建出的整窗
+    // shadow request/miss；reserved[3] 必须为 0。复用保留字维持每核 64B
+    // 和总 GM 容量不变。
     uint32_t reserved[4];
 } __attribute__((aligned(64)));
 
@@ -276,6 +310,9 @@ struct FdwicSubmitPmuPhaseAccumulator {
     uint64_t phase_misses;
     uint64_t phase_elapsed_ticks;
     uint64_t phase_begin_tick;
+    // 当前一次 phase invocation 内已经闭合的 return-ready atomic 等待。
+    // phase_end() 从原始 SYS_CNT delta 中扣除后立即清零。
+    uint64_t phase_excluded_atomic_ticks;
     uint32_t begin_reads;
     uint32_t end_reads;
     uint32_t max_shadow_request_chunk;

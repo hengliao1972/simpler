@@ -22,6 +22,7 @@ import simpler_setup.tools.fdwic_submit_pmu_report as report_module
 from simpler_setup.tools.fdwic_submit_pmu_report import (
     ARG_BUILD_CAPTURE_MODE,
     CLAIM_CAPTURE_MODE,
+    COMMON_REQUIRED_STATUS_MASK,
     DEFAULT_INPUT_NAME,
     DEFAULT_OUTPUT_NAME,
     DEFAULT_PROVENANCE_NAME,
@@ -29,11 +30,12 @@ from simpler_setup.tools.fdwic_submit_pmu_report import (
     EMPTY_BRACKET_CAPTURE_MODE,
     FANIN_CAPTURE_MODE,
     MATERIALIZE_CAPTURE_MODE,
+    NONE_REQUIRED_STATUS_MASK,
     PHASE_REQUIRED_STATUS_MASK,
     PREPARE_MAP_CAPTURE_MODE,
     REGISTER_CAPTURE_MODE,
-    REQUIRED_STATUS_MASK,
     SUBMIT_TRANSITION_CAPTURE_MODE,
+    WINNER_BUILD_CAPTURE_MODE,
     capture_build_identity,
     load_capture,
     load_provenance,
@@ -71,12 +73,14 @@ def _metric(values: list[int]) -> dict[str, int | float]:
 
 def _group_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     total = [record["total_cycles"] for record in records]
+    scalar_elapsed = [record["scalar_submit_elapsed_ticks"] for record in records]
     scalar = [record["scalar_busy"] for record in records]
     requests = [record["icache_requests"] for record in records]
     misses = [record["icache_misses"] for record in records]
     return {
         "cores": len(records),
         "total_cycles": _metric(total),
+        "scalar_submit_elapsed_ticks": _metric(scalar_elapsed),
         "scalar_busy": _metric(scalar),
         "icache_requests": _metric(requests),
         "icache_misses": _metric(misses),
@@ -138,13 +142,12 @@ def _valid_capture() -> dict[str, Any]:
                 "first_submit_start_tick": start,
                 "last_submit_end_tick": end,
                 "submit_elapsed_ticks": end - start,
+                "scalar_submit_elapsed_ticks": end - start - 1_000,
                 "total_cycles": 16_000 + logical_core_id,
                 "scalar_busy": 12_000 + logical_core_id,
                 "icache_requests": requests,
                 "icache_misses": misses,
-                "shadow_icache_requests": requests,
-                "shadow_icache_misses": misses,
-                "status": REQUIRED_STATUS_MASK,
+                "status": NONE_REQUIRED_STATUS_MASK,
             }
         )
 
@@ -157,7 +160,7 @@ def _valid_capture() -> dict[str, Any]:
     first_tick = min(record["first_submit_start_tick"] for record in records)
     last_tick = max(record["last_submit_end_tick"] for record in records)
     return {
-        "schema": "fdwic-submit-pmu-v1",
+        "schema": "fdwic-submit-pmu-v2",
         "capture": {
             "mode": "submit-pmu-none",
             "window_scope": "per_core_first_submit_begin_to_last_submit_end",
@@ -171,15 +174,31 @@ def _valid_capture() -> dict[str, Any]:
             "expected_submits_per_core": 5,
             "sys_counter_tick_ns": 1,
             "selectors": {
+                "cnt0_vector_busy": 0x501,
+                "cnt1_cube_busy": 0x301,
                 "cnt2_scalar_busy": 0x001,
                 "cnt5_shadow_icache_miss": 0x035,
                 "cnt6_primary_icache_request": 0x034,
                 "cnt7_primary_icache_miss": 0x035,
                 "cnt8_shadow_icache_request": 0x034,
             },
-            "status_required_mask": REQUIRED_STATUS_MASK,
+            "status_required_mask": NONE_REQUIRED_STATUS_MASK,
             "counter_width_bits": {"total": 64, "programmable": 32},
             "programmable_counter_risk_threshold": (1 << 30) - 1,
+            "linked_kernel_exclusion": {
+                "enabled": True,
+                "boundary": "dist_aicore_call_slot_kernel_entry_to_return",
+                "gate_semantics": "metrics_prof_stop_before_call_and_start_after_return",
+                "time_denominator": "scalar_submit_elapsed_ticks",
+                "wall_tick_semantics": "first_submit_start_to_last_submit_end_closure_only",
+            },
+            "return_ready_atomic_exclusion": {
+                "enabled": True,
+                "classification": "result_used_atomic_only",
+                "time_boundary": "sys_cnt_before_atomic_to_result_dependent_sys_cnt_after_return",
+                "counter_semantics": "pmu_counters_include_atomic_instruction_events",
+                "time_denominator_effect": "subtract_return_ready_atomic_elapsed",
+            },
             "pmu_cycles_per_ns": {"all": 1.649844, "aic": 1.650062, "aiv": 1.649731},
         },
         "owner": {
@@ -217,6 +236,11 @@ def _valid_capture() -> dict[str, Any]:
             "shadow_primary_match_records": 96,
             "icache_miss_le_request_records": 96,
             "counter_below_risk_threshold_records": 96,
+            "linked_kernel_gate_closed_records": 96,
+            "scalar_submit_elapsed_valid_records": 96,
+            "vector_busy_zero_records": 96,
+            "cube_busy_zero_records": 96,
+            "return_ready_atomic_time_valid_records": 96,
         },
         "records": records,
         "summary": {name: _group_summary(group) for name, group in grouped.items()},
@@ -226,6 +250,7 @@ def _valid_capture() -> dict[str, Any]:
 def _valid_arg_build_capture() -> dict[str, Any]:
     capture = _valid_capture()
     capture["capture"]["mode"] = ARG_BUILD_CAPTURE_MODE
+    capture["configuration"]["status_required_mask"] = COMMON_REQUIRED_STATUS_MASK
     capture["configuration"]["phase"] = {
         "id": 1,
         "name": "arg-build",
@@ -236,6 +261,7 @@ def _valid_arg_build_capture() -> dict[str, Any]:
         "time_semantics": "inner_sys_cnt_between_boundary_observers",
     }
     for logical_core_id, record in enumerate(capture["records"]):
+        record["status"] = COMMON_REQUIRED_STATUS_MASK
         record["shadow_icache_requests"] = record["icache_requests"] - 20 - logical_core_id % 3
         record["shadow_icache_misses"] = record["icache_misses"] - 5
         record.update(
@@ -246,6 +272,7 @@ def _valid_arg_build_capture() -> dict[str, Any]:
                 "phase_icache_misses_observed": 40 + logical_core_id % 5,
                 "phase_begin_reads": 5,
                 "phase_end_reads": 5,
+                "phase_excluded_kernel_calls": 0,
                 "phase_max_shadow_request_chunk": 120 + logical_core_id % 7,
                 "phase_max_shadow_miss_chunk": 15 + logical_core_id % 3,
                 "phase_status": PHASE_REQUIRED_STATUS_MASK,
@@ -259,6 +286,7 @@ def _valid_arg_build_capture() -> dict[str, Any]:
             "phase_values_ordered_records": 96,
             "phase_time_within_submit_records": 96,
             "shadow_primary_bounded_records": 96,
+            "phase_kernel_exclusion_closed_records": 96,
         }
     )
     return capture
@@ -347,6 +375,28 @@ def _valid_fanin_capture() -> dict[str, Any]:
         record["phase_icache_misses_observed"] = 2 * calls
         record["phase_begin_reads"] = calls
         record["phase_end_reads"] = calls
+    return capture
+
+
+def _valid_winner_build_capture() -> dict[str, Any]:
+    capture = _valid_fanin_capture()
+    capture["capture"]["mode"] = WINNER_BUILD_CAPTURE_MODE
+    capture["configuration"]["phase"].update(
+        {
+            "id": 10,
+            "name": "winner-build-control",
+            "boundary": "winner_build_begin_to_end_excluding_linked_kernel_calls",
+            "counter_semantics": "discontinuous_running_read_clear_excluding_linked_kernel_calls",
+            "time_semantics": "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls",
+        }
+    )
+    capture["validation"]["phase_kernel_exclusion_closed_records"] = 96
+    for logical_core_id, record in enumerate(capture["records"]):
+        excluded_kernel_calls = int(logical_core_id in {0, 32})
+        record["phase_id"] = 10
+        record["phase_excluded_kernel_calls"] = excluded_kernel_calls
+        record["phase_begin_reads"] += excluded_kernel_calls
+        record["phase_end_reads"] += excluded_kernel_calls
     return capture
 
 
@@ -616,34 +666,46 @@ def test_valid_capture_is_recomputed_and_rendered(tmp_path: Path) -> None:
     assert len(capture.records) == 96
     assert len(capture.groups["aic"]) == 32
     assert len(capture.groups["aiv"]) == 64
+    assert all("shadow_icache_requests" not in record for record in capture.records)
+    assert all("shadow_icache_misses" not in record for record in capture.records)
     expected_ratios = {
-        "all": (1.6000, 1.60475, 1.6095),
-        "aic": (1.6000, 1.60155, 1.6031),
-        "aiv": (1.6032, 1.60635, 1.6095),
+        "all": (16_000 / 9_000, 16_047.5 / 9_000, 16_095 / 9_000),
+        "aic": (16_000 / 9_000, 16_015.5 / 9_000, 16_031 / 9_000),
+        "aiv": (16_032 / 9_000, 16_063.5 / 9_000, 16_095 / 9_000),
     }
     for group_name, (minimum, mean, maximum) in expected_ratios.items():
         summary = capture.summary[group_name]
         assert summary["submit_elapsed_ticks"]["min"] == 10_000
         assert summary["submit_elapsed_ticks"]["mean"] == 10_000
         assert summary["submit_elapsed_ticks"]["max"] == 10_000
+        assert summary["scalar_submit_elapsed_ticks"]["min"] == 9_000
+        assert summary["scalar_submit_elapsed_ticks"]["mean"] == 9_000
+        assert summary["scalar_submit_elapsed_ticks"]["max"] == 9_000
+        assert summary["scalar_denominator_excluded_wall_ticks"]["min"] == 1_000
+        assert summary["scalar_denominator_excluded_wall_ticks"]["mean"] == 1_000
+        assert summary["scalar_denominator_excluded_wall_ticks"]["max"] == 1_000
         assert summary["non_scalar_busy_cycles"]["min"] == 4_000
         assert summary["non_scalar_busy_cycles"]["mean"] == 4_000
         assert summary["non_scalar_busy_cycles"]["max"] == 4_000
-        ratio = summary["pmu_total_cycles_per_submit_tick"]
+        ratio = summary["pmu_total_cycles_per_scalar_tick"]
         assert ratio["min"] == pytest.approx(minimum)
         assert ratio["mean"] == pytest.approx(mean)
         assert ratio["max"] == pytest.approx(maximum)
 
     document = render_report(raw_path)
-    assert "真实 FDWIC Submit PMU" in document
+    assert "真实 FDWIC Scalar Submit PMU" in document
     assert "32 AIC + 64 AIV" in document
     assert "Σmiss/Σrequest" in document
     assert "90.000 ns" in document
     assert "不是 Submit 墙钟损失" in document
     assert "非 Scalar-busy 残余不是空闲时间，也不是 I-cache stall" in document
-    assert "Submit SYS_CNT/core" in document
-    assert "PMU-total / SYS-window/core" in document
-    assert "不是瞬时 AICore 频率" in document
+    assert "Scalar Submit 时间分母/core" in document
+    assert "PMU-total / Scalar SYS/core" in document
+    assert "不要求精确等于校准频率" in document
+    assert "result-used return-ready atomic 的依赖区间只从 Scalar SYS 时间分母" in document
+    assert "I-cache/PMU counter 仍包含其指令事件" in document
+    assert "source-issue atomic" in document
+    assert "不能称为纯 Kernel 时间" in document
     assert "不能与 perf-clock、swimlane 或另一个 phase ELF 相减" in document
     for cycles_per_ns in (1.649844, 1.650062, 1.649731):
         assert f"按 {cycles_per_ns:.6f} cycles/ns 校准" in document
@@ -667,8 +729,8 @@ def test_valid_capture_is_recomputed_and_rendered(tmp_path: Path) -> None:
             f"最大 {misses['max'] * 90 / 1_000:,.3f} µs</dd>"
         ) in document
         assert f"{summary['icache_miss_rate']:.3%}" in document
-    assert document.count("<svg") == 4
-    assert document.count("<circle") == 4 * 96
+    assert document.count("<svg") == 5
+    assert document.count("<circle") == 5 * 96
     assert hashlib.sha256(raw_path.read_bytes()).hexdigest() in document
 
 
@@ -677,6 +739,7 @@ def test_python_only_derived_metrics_do_not_expand_raw_summary(tmp_path: Path) -
     producer_keys = {
         "cores",
         "total_cycles",
+        "scalar_submit_elapsed_ticks",
         "scalar_busy",
         "icache_requests",
         "icache_misses",
@@ -691,8 +754,10 @@ def test_python_only_derived_metrics_do_not_expand_raw_summary(tmp_path: Path) -
     for group in capture.summary.values():
         assert {
             "submit_elapsed_ticks",
+            "scalar_submit_elapsed_ticks",
+            "scalar_denominator_excluded_wall_ticks",
             "non_scalar_busy_cycles",
-            "pmu_total_cycles_per_submit_tick",
+            "pmu_total_cycles_per_scalar_tick",
         } <= set(group)
 
 
@@ -726,6 +791,7 @@ def test_effective_ratio_is_mean_of_per_core_ratios(tmp_path: Path) -> None:
         elapsed = 10_000 if logical_core_id % 2 == 0 else 20_000
         record["last_submit_end_tick"] = record["first_submit_start_tick"] + elapsed
         record["submit_elapsed_ticks"] = elapsed
+        record["scalar_submit_elapsed_ticks"] = elapsed
         record["total_cycles"] = 10_000 if logical_core_id % 2 == 0 else 40_000
         record["scalar_busy"] = 8_000
     _refresh_host_aggregates(capture_data)
@@ -733,13 +799,13 @@ def test_effective_ratio_is_mean_of_per_core_ratios(tmp_path: Path) -> None:
     capture = load_capture(_write_capture(tmp_path, capture_data))
 
     for group_name in ("all", "aic", "aiv"):
-        ratio = capture.summary[group_name]["pmu_total_cycles_per_submit_tick"]
+        ratio = capture.summary[group_name]["pmu_total_cycles_per_scalar_tick"]
         assert ratio["min"] == pytest.approx(1.0)
         assert ratio["mean"] == pytest.approx(1.5)
         assert ratio["max"] == pytest.approx(2.0)
         group = capture.groups[group_name]
         ratio_of_sums = sum(record["total_cycles"] for record in group) / sum(
-            record["submit_elapsed_ticks"] for record in group
+            record["scalar_submit_elapsed_ticks"] for record in group
         )
         assert ratio["mean"] != pytest.approx(ratio_of_sums)
 
@@ -776,6 +842,8 @@ def test_valid_arg_build_capture_renders_same_elf_phase_observation_first(tmp_pa
     capture = load_capture(raw_path)
 
     assert capture.phase_summary is not None
+    assert all("shadow_icache_requests" in record for record in capture.records)
+    assert all("shadow_icache_misses" in record for record in capture.records)
     all_phase = capture.phase_summary["all"]
     assert all_phase["phase_begin_reads"] == 96 * 5
     assert all_phase["phase_end_reads"] == 96 * 5
@@ -795,8 +863,12 @@ def test_valid_arg_build_capture_renders_same_elf_phase_observation_first(tmp_pa
     assert "插桩 bookkeeping 会进入 sample" in document
     assert "不是原业务" in document
     assert "事件数的数学上下界" in document
-    assert "时间占比的分母是同一 ELF 的 Σ每核 Submit elapsed" in document
-    assert "request/miss 百分比的分母才是同一 ELF" in document
+    assert "时间占比的分母是同一 ELF 的 Σ每核 Scalar Submit elapsed" in document
+    assert "result-used return-ready atomic 依赖区间只从时间扣除" in document
+    assert "I-cache/PMU counter 仍含其指令事件" in document
+    assert "source-issue atomic 保留" in document
+    assert "request/miss 百分比的分母才是" in document
+    assert "同一次采集的 Submit 整窗 primary" in document
     assert "每次调用 elapsed" in document
     assert "每次调用 elapsed / request / miss observed" not in document
     assert "是每核累计" in document
@@ -810,7 +882,7 @@ def test_valid_arg_build_capture_renders_same_elf_phase_observation_first(tmp_pa
         misses = phase["phase_icache_misses_observed"]
         assert phase["primary_icache_requests"] == sum(record["icache_requests"] for record in group_records)
         assert phase["primary_icache_misses"] == sum(record["icache_misses"] for record in group_records)
-        assert f"{phase['phase_time_share_of_submit']:.3%}" in document
+        assert f"{phase['phase_time_share_of_scalar_submit']:.3%}" in document
         assert f"{phase['phase_request_observed_share_of_primary']:.3%}" in document
         assert f"{phase['phase_request_observed_plus_capture_gap_share_of_primary']:.3%}" in document
         assert f"{phase['phase_miss_observed_share_of_primary']:.3%}" in document
@@ -990,6 +1062,98 @@ def test_fanin_rejects_nonzero_values_on_zero_call_core(tmp_path: Path) -> None:
     capture["records"][2]["phase_elapsed_ticks"] = 1
 
     with pytest.raises(ValueError, match="zero-call dynamic phase must have zero"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_valid_winner_build_control_capture_excludes_linked_kernel_segments(tmp_path: Path) -> None:
+    raw_path = _write_capture(tmp_path, _valid_winner_build_capture())
+
+    capture = load_capture(raw_path)
+
+    assert capture.phase_summary is not None
+    all_phase = capture.phase_summary["all"]
+    assert all_phase["phase_business_calls"] == 4
+    assert capture.phase_summary["aic"]["phase_business_calls"] == 2
+    assert capture.phase_summary["aiv"]["phase_business_calls"] == 2
+    assert all_phase["phase_begin_reads"] == 6
+    assert all_phase["phase_end_reads"] == 6
+    assert all_phase["phase_excluded_kernel_calls"] == 2
+    assert all_phase["phase_elapsed_ticks_per_call"] == pytest.approx(75)
+    assert all_phase["phase_elapsed_ticks_per_call"] != pytest.approx(
+        all_phase["phase_elapsed_ticks"]["sum"] / all_phase["phase_begin_reads"]
+    )
+    assert all_phase["phase_icache_requests_observed_per_call"] == pytest.approx(40)
+    assert all_phase["phase_icache_misses_observed_per_call"] == pytest.approx(2)
+    assert all_phase["phase_calls_per_core"]["min"] == 0
+    assert all_phase["phase_calls_per_core"]["max"] == 1
+    assert all_phase["phase_zero_call_cores"] == 92
+    document = render_report(raw_path)
+    assert "<code>winner-build-control</code> 阶段观察" in document
+    assert "phase_id=10" in document
+    assert "winner_build_begin_to_end_excluding_linked_kernel_calls" in document
+    assert "discontinuous_running_read_clear_excluding_linked_kernel_calls" in document
+    assert "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls" in document
+    assert "call_shape=dynamic_balanced" in document
+    assert "expected_calls=ALL 4 / AIC 2 / AIV 2" in document
+    assert "业务调用 4 次；排除 linked Kernel 调用 2 次" in document
+    assert "零调用核 92" in document
+
+
+def test_winner_build_control_global_shape_uses_business_calls_not_boundary_reads(tmp_path: Path) -> None:
+    capture = _valid_winner_build_capture()
+    capture["records"][0]["phase_excluded_kernel_calls"] += 1
+    capture["records"][0]["phase_elapsed_ticks"] = 0
+    capture["records"][0]["phase_icache_requests_observed"] = 0
+    capture["records"][0]["phase_icache_misses_observed"] = 0
+
+    with pytest.raises(ValueError, match="dynamic phase call totals"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+@pytest.mark.parametrize("value", (None, -1))
+def test_winner_build_control_requires_nonnegative_excluded_kernel_calls(
+    tmp_path: Path,
+    value: int | None,
+) -> None:
+    capture = _valid_winner_build_capture()
+    if value is None:
+        capture["records"][0].pop("phase_excluded_kernel_calls")
+    else:
+        capture["records"][0]["phase_excluded_kernel_calls"] = value
+
+    with pytest.raises(ValueError, match=r"records\[0\]\.phase_excluded_kernel_calls must be an integer >= 0"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_winner_build_control_rejects_excluded_count_above_boundary_reads(tmp_path: Path) -> None:
+    capture = _valid_winner_build_capture()
+    capture["records"][0]["phase_excluded_kernel_calls"] = 3
+
+    with pytest.raises(ValueError, match="excluded Kernel calls exceed phase begin/end reads"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_winner_build_control_rejects_unbalanced_business_boundaries(tmp_path: Path) -> None:
+    capture = _valid_winner_build_capture()
+    capture["records"][0]["phase_end_reads"] -= 1
+
+    with pytest.raises(ValueError, match="must remain balanced after subtracting"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_winner_build_control_zero_business_calls_require_zero_observed_values(tmp_path: Path) -> None:
+    capture = _valid_winner_build_capture()
+    capture["records"][0]["phase_excluded_kernel_calls"] = capture["records"][0]["phase_begin_reads"]
+
+    with pytest.raises(ValueError, match="zero-call dynamic phase must have zero"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_winner_build_control_requires_kernel_exclusion_validation(tmp_path: Path) -> None:
+    capture = _valid_winner_build_capture()
+    capture["validation"].pop("phase_kernel_exclusion_closed_records")
+
+    with pytest.raises(ValueError, match=r"validation\.phase_kernel_exclusion_closed_records"):
         load_capture(_write_capture(tmp_path, capture))
 
 
@@ -1187,11 +1351,16 @@ def test_valid_efdrain_control_capture_excludes_linked_kernel_segments(tmp_path:
     assert "efdrain_begin_to_end_excluding_linked_kernel_calls" in document
     assert "discontinuous_running_read_clear_excluding_linked_kernel_calls" in document
     assert "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls" in document
-    assert "elapsed、request 和 miss 都是排除 linked Kernel 后" in document
-    assert "多段 EfDrain control segments 的累计值" in document
-    assert "每次调用的分母仍是外层 EfDrain 调用次数" in document
+    assert "elapsed、request 和 miss 都排除该 Kernel 整段" in document
+    assert "result-used return-ready atomic" in document
+    assert "request/miss 仍含 atomic 指令事件" in document
+    assert "source-issue atomic" in document
+    assert "每次调用的分母仍是外层业务调用次数" in document
     assert "<th>Begin / End reads</th>" in document
-    assert f"<small>排除 linked Kernel 调用 {excluded_kernel_calls} 次</small>" in document
+    assert (
+        f"<small>业务调用 {outer_calls} 次；排除 linked Kernel 调用 {excluded_kernel_calls} 次</small>"
+        in document
+    )
 
 
 @pytest.mark.parametrize(
@@ -1289,46 +1458,31 @@ def test_efdrain_control_requires_closed_kernel_exclusion_validation(
         _valid_submit_transition_capture,
         _valid_prepare_map_capture,
         _valid_fanin_capture,
+        _valid_efdrain_control_capture,
+        _valid_winner_build_capture,
     ),
 )
-def test_other_phase_modes_forbid_excluded_kernel_call_count(
+def test_all_phase_modes_require_excluded_kernel_call_count(
     tmp_path: Path,
     capture_factory: Callable[[], dict[str, Any]],
 ) -> None:
     capture = capture_factory()
-    capture["records"][0]["phase_excluded_kernel_calls"] = 0
+    capture["records"][0].pop("phase_excluded_kernel_calls")
 
     with pytest.raises(
         ValueError,
-        match=rf"phase_excluded_kernel_calls is only valid in {EFDRAIN_CONTROL_CAPTURE_MODE}",
+        match=r"records\[0\]\.phase_excluded_kernel_calls must be an integer >= 0",
     ):
         load_capture(_write_capture(tmp_path, capture))
 
 
-@pytest.mark.parametrize(
-    "capture_factory",
-    (
-        _valid_capture,
-        _valid_arg_build_capture,
-        _valid_empty_bracket_capture,
-        _valid_materialize_capture,
-        _valid_claim_capture,
-        _valid_register_capture,
-        _valid_submit_transition_capture,
-        _valid_prepare_map_capture,
-        _valid_fanin_capture,
-    ),
-)
-def test_other_modes_forbid_kernel_exclusion_validation(
-    tmp_path: Path,
-    capture_factory: Callable[[], dict[str, Any]],
-) -> None:
-    capture = capture_factory()
+def test_none_forbids_kernel_exclusion_validation(tmp_path: Path) -> None:
+    capture = _valid_capture()
     capture["validation"]["phase_kernel_exclusion_closed_records"] = 96
 
     with pytest.raises(
         ValueError,
-        match=rf"phase_kernel_exclusion_closed_records is only valid in {EFDRAIN_CONTROL_CAPTURE_MODE}",
+        match=r"phase_kernel_exclusion_closed_records is only valid in",
     ):
         load_capture(_write_capture(tmp_path, capture))
 
@@ -1375,11 +1529,11 @@ def test_arg_build_rejects_observed_counter_above_shadow(tmp_path: Path) -> None
         load_capture(_write_capture(tmp_path, capture))
 
 
-def test_arg_build_rejects_phase_time_beyond_submit(tmp_path: Path) -> None:
+def test_arg_build_rejects_phase_time_beyond_scalar_denominator(tmp_path: Path) -> None:
     capture = _valid_arg_build_capture()
-    capture["records"][0]["phase_elapsed_ticks"] = capture["records"][0]["submit_elapsed_ticks"] + 1
+    capture["records"][0]["phase_elapsed_ticks"] = capture["records"][0]["scalar_submit_elapsed_ticks"] + 1
 
-    with pytest.raises(ValueError, match="phase_elapsed_ticks exceeds submit_elapsed_ticks"):
+    with pytest.raises(ValueError, match="phase_elapsed_ticks exceeds scalar_submit_elapsed_ticks"):
         load_capture(_write_capture(tmp_path, capture))
 
 
@@ -1448,6 +1602,78 @@ def test_none_rejects_phase_configuration(tmp_path: Path) -> None:
     capture["configuration"]["phase"] = {}
 
     with pytest.raises(ValueError, match="must not contain phase"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("enabled", False),
+        ("classification", "all_atomic"),
+        ("time_boundary", "atomic_issue_only"),
+        ("counter_semantics", "pmu_counters_exclude_atomic_instruction_events"),
+        ("time_denominator_effect", "retain_return_ready_atomic_elapsed"),
+    ),
+)
+def test_return_ready_atomic_metadata_is_exact(
+    tmp_path: Path,
+    field: str,
+    value: Any,
+) -> None:
+    capture = _valid_capture()
+    capture["configuration"]["return_ready_atomic_exclusion"][field] = value
+
+    with pytest.raises(ValueError, match=r"configuration\.return_ready_atomic_exclusion"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+@pytest.mark.parametrize("value", (None, 95))
+def test_return_ready_atomic_time_validation_requires_all_cores(
+    tmp_path: Path,
+    value: int | None,
+) -> None:
+    capture = _valid_capture()
+    if value is None:
+        capture["validation"].pop("return_ready_atomic_time_valid_records")
+    else:
+        capture["validation"]["return_ready_atomic_time_valid_records"] = value
+
+    with pytest.raises(ValueError, match=r"validation\.return_ready_atomic_time_valid_records"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_none_status_requires_shadow_match_bit(tmp_path: Path) -> None:
+    capture = _valid_capture()
+    capture["records"][0]["status"] &= ~(1 << 18)
+
+    with pytest.raises(ValueError, match=r"records\[0\]\.status must equal"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_phase_status_requires_return_ready_atomic_time_bit(tmp_path: Path) -> None:
+    capture = _valid_arg_build_capture()
+    capture["records"][0]["status"] &= ~(1 << 17)
+
+    with pytest.raises(ValueError, match=r"records\[0\]\.status must equal"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_scalar_submit_elapsed_must_be_positive(tmp_path: Path) -> None:
+    capture = _valid_capture()
+    capture["records"][0]["scalar_submit_elapsed_ticks"] = 0
+
+    with pytest.raises(
+        ValueError,
+        match=r"records\[0\]\.scalar_submit_elapsed_ticks must be an integer >= 1",
+    ):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_scalar_submit_elapsed_must_not_exceed_wall(tmp_path: Path) -> None:
+    capture = _valid_capture()
+    capture["records"][0]["scalar_submit_elapsed_ticks"] = capture["records"][0]["submit_elapsed_ticks"] + 1
+
+    with pytest.raises(ValueError, match=r"scalar_submit_elapsed_ticks exceeds submit_elapsed_ticks"):
         load_capture(_write_capture(tmp_path, capture))
 
 
@@ -1578,6 +1804,7 @@ def test_efdrain_control_build_identity_uses_phase_id_7(
         (EFDRAIN_CONTROL_CAPTURE_MODE, _valid_efdrain_control_capture, 7),
         (PREPARE_MAP_CAPTURE_MODE, _valid_prepare_map_capture, 8),
         (FANIN_CAPTURE_MODE, _valid_fanin_capture, 9),
+        (WINNER_BUILD_CAPTURE_MODE, _valid_winner_build_capture, 10),
     ),
 )
 def test_each_phase_profile_closes_raw_identity_provenance_and_html(
@@ -1694,7 +1921,7 @@ def test_render_without_provenance_keeps_the_legacy_raw_only_path(tmp_path: Path
 
     document = render_report(raw_path)
 
-    assert "真实 FDWIC Submit PMU" in document
+    assert "真实 FDWIC Scalar Submit PMU" in document
     assert "诊断构建身份" not in document
     assert "Provenance SHA-256" not in document
 
@@ -1851,7 +2078,6 @@ def test_counter_immediately_below_risk_threshold_is_accepted(tmp_path: Path) ->
     capture = _valid_capture()
     accepted_value = (1 << 30) - 2
     capture["records"][0]["icache_requests"] = accepted_value
-    capture["records"][0]["shadow_icache_requests"] = accepted_value
     records = capture["records"]
     capture["summary"] = {
         "all": _group_summary(records),
@@ -1899,7 +2125,7 @@ def _frequency_changed(capture: dict[str, Any]) -> None:
 
 
 def _schema_changed(capture: dict[str, Any]) -> None:
-    capture["schema"] = "fdwic-submit-pmu-v2"
+    capture["schema"] = "fdwic-submit-pmu-v1"
 
 
 def _status_missing(capture: dict[str, Any]) -> None:
@@ -1916,23 +2142,19 @@ def _scalar_exceeds_total(capture: dict[str, Any]) -> None:
 
 def _miss_exceeds_request(capture: dict[str, Any]) -> None:
     capture["records"][0]["icache_misses"] = capture["records"][0]["icache_requests"] + 1
-    capture["records"][0]["shadow_icache_misses"] = capture["records"][0]["icache_misses"]
 
 
 def _request_is_zero(capture: dict[str, Any]) -> None:
     capture["records"][0]["icache_requests"] = 0
     capture["records"][0]["icache_misses"] = 0
-    capture["records"][0]["shadow_icache_requests"] = 0
-    capture["records"][0]["shadow_icache_misses"] = 0
 
 
-def _shadow_mismatch(capture: dict[str, Any]) -> None:
-    capture["records"][0]["shadow_icache_requests"] += 1
+def _none_publishes_shadow(capture: dict[str, Any]) -> None:
+    capture["records"][0]["shadow_icache_requests"] = capture["records"][0]["icache_requests"]
 
 
 def _counter_reaches_threshold(capture: dict[str, Any]) -> None:
     capture["records"][0]["icache_requests"] = (1 << 30) - 1
-    capture["records"][0]["shadow_icache_requests"] = (1 << 30) - 1
 
 
 def _summary_tampered(capture: dict[str, Any]) -> None:
@@ -1959,7 +2181,7 @@ def _producer_validation_failed(capture: dict[str, Any]) -> None:
         (_scalar_exceeds_total, "scalar_busy exceeds total_cycles"),
         (_miss_exceeds_request, "icache_misses exceeds icache_requests"),
         (_request_is_zero, "icache_requests must be an integer >= 1"),
-        (_shadow_mismatch, "shadow I-cache counters differ"),
+        (_none_publishes_shadow, "must not publish redundant shadow counters"),
         (_counter_reaches_threshold, "programmable counter reaches the risk threshold"),
         (_summary_tampered, "summary.aiv.icache_misses.sum"),
         (_producer_validation_failed, "validation.passed"),

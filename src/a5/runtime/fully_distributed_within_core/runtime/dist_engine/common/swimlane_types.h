@@ -157,6 +157,23 @@ PTO_DEVICE_FUNC constexpr FdwicAtomicOp fdwic_atomic_site_op(FdwicAtomicSite sit
 
 PTO_DEVICE_FUNC constexpr bool fdwic_atomic_site_result_used(FdwicAtomicSite site) {
     switch (site) {
+    case FdwicAtomicSite::StartupPoll:
+    case FdwicAtomicSite::FatalPoll:
+    case FdwicAtomicSite::ClaimMax:
+    case FdwicAtomicSite::FaninFlagLoad:
+    case FdwicAtomicSite::FrontierInitialLoad:
+    case FdwicAtomicSite::FrontierFlagLoad:
+    case FdwicAtomicSite::FrontierMax:
+    case FdwicAtomicSite::HeapFrontierLoad:
+    case FdwicAtomicSite::HeapVendLoad:
+    case FdwicAtomicSite::ReplayDonePoll:
+    case FdwicAtomicSite::WonSlotClaimMax:
+    case FdwicAtomicSite::WonAnyLoad:
+    case FdwicAtomicSite::WonStateLoad:
+    case FdwicAtomicSite::WonLaneClaimExchange:
+    case FdwicAtomicSite::WonRemainingFetchSub:
+    case FdwicAtomicSite::WonDrainedLoad:
+        return true;
     case FdwicAtomicSite::StartupIncrement:
     case FdwicAtomicSite::FatalSet:
     case FdwicAtomicSite::CompletionVendExchange:
@@ -169,11 +186,19 @@ PTO_DEVICE_FUNC constexpr bool fdwic_atomic_site_result_used(FdwicAtomicSite sit
     case FdwicAtomicSite::WonAnyPublishExchange:
     case FdwicAtomicSite::WonLaneReleaseExchange:
     case FdwicAtomicSite::WonStateClearExchange:
+    case FdwicAtomicSite::Count:
         return false;
-    default:
-        return true;
     }
+    return false;
 }
+
+constexpr uint32_t kFdwicAtomicReturnReadySiteCount = 16;
+constexpr uint32_t kFdwicAtomicSourceIssueSiteCount = 12;
+static_assert(
+    kFdwicAtomicReturnReadySiteCount + kFdwicAtomicSourceIssueSiteCount ==
+        static_cast<uint32_t>(FdwicAtomicSite::Count),
+    "every atomic site must have one explicit completion classification"
+);
 
 // Observation loads used by explicit scheduler wait regions are batchable.
 // WonLaneClaimExchange is the sole RMW exception: only its idempotent failed

@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-SCHEMA_NAME = "fdwic-submit-pmu-v1"
+SCHEMA_NAME = "fdwic-submit-pmu-v2"
 DEFAULT_INPUT_NAME = "fdwic_submit_pmu_raw.json"
 DEFAULT_OUTPUT_NAME = "fdwic_submit_pmu_report.html"
 PROVENANCE_SCHEMA_NAME = "fdwic-submit-pmu-provenance-v1"
@@ -39,7 +39,8 @@ EXPECTED_AIV_CORES = 64
 PHYSICAL_CORES = 108
 PHYSICAL_CORES_PER_DIE = 54
 AIC_CORES_PER_DIE = 18
-REQUIRED_STATUS_MASK = (1 << 11) - 1
+COMMON_REQUIRED_STATUS_MASK = (1 << 18) - 1
+NONE_REQUIRED_STATUS_MASK = (1 << 19) - 1
 PHASE_REQUIRED_STATUS_MASK = (1 << 6) - 1
 PROGRAMMABLE_COUNTER_RISK_THRESHOLD = 0x3FFFFFFF
 
@@ -53,6 +54,7 @@ SUBMIT_TRANSITION_CAPTURE_MODE = "submit-pmu-submit-transition"
 EFDRAIN_CONTROL_CAPTURE_MODE = "submit-pmu-efdrain-control"
 PREPARE_MAP_CAPTURE_MODE = "submit-pmu-prepare-map"
 FANIN_CAPTURE_MODE = "submit-pmu-fanin"
+WINNER_BUILD_CAPTURE_MODE = "submit-pmu-winner-build-control"
 ARG_BUILD_PHASE_ID = 1
 EMPTY_BRACKET_PHASE_ID = 2
 MATERIALIZE_PHASE_ID = 3
@@ -62,6 +64,7 @@ SUBMIT_TRANSITION_PHASE_ID = 6
 EFDRAIN_CONTROL_PHASE_ID = 7
 PREPARE_MAP_PHASE_ID = 8
 FANIN_PHASE_ID = 9
+WINNER_BUILD_PHASE_ID = 10
 PHASE_CONFIG_BY_MODE = {
     ARG_BUILD_CAPTURE_MODE: {
         "id": ARG_BUILD_PHASE_ID,
@@ -135,8 +138,17 @@ PHASE_CONFIG_BY_MODE = {
         "counter_semantics": "running_read_clear_observed_bracket",
         "time_semantics": "inner_sys_cnt_between_boundary_observers",
     },
+    WINNER_BUILD_CAPTURE_MODE: {
+        "id": WINNER_BUILD_PHASE_ID,
+        "name": "winner-build-control",
+        "boundary": "winner_build_begin_to_end_excluding_linked_kernel_calls",
+        "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+        "counter_semantics": "discontinuous_running_read_clear_excluding_linked_kernel_calls",
+        "time_semantics": "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls",
+    },
 }
-DYNAMIC_PHASE_CAPTURE_MODES = frozenset({FANIN_CAPTURE_MODE})
+DYNAMIC_PHASE_CAPTURE_MODES = frozenset({FANIN_CAPTURE_MODE, WINNER_BUILD_CAPTURE_MODE})
+KERNEL_EXCLUDING_PHASE_CAPTURE_MODES = frozenset(PHASE_CONFIG_BY_MODE)
 
 
 def _expected_compile_definitions(profile: str) -> tuple[str, ...]:
@@ -145,6 +157,10 @@ def _expected_compile_definitions(profile: str) -> tuple[str, ...]:
         definitions.append(f"PTO_FDWIC_SUBMIT_PMU_PHASE_ID={PHASE_CONFIG_BY_MODE[profile]['id']}")
     definitions.append("PTO_FDWIC_TRACE_ENABLED=0")
     return tuple(definitions)
+
+
+def _expected_core_status_mask(mode: str) -> int:
+    return NONE_REQUIRED_STATUS_MASK if mode == NONE_CAPTURE_MODE else COMMON_REQUIRED_STATUS_MASK
 
 
 SUPPORTED_CAPTURE_MODES = {NONE_CAPTURE_MODE, *PHASE_CONFIG_BY_MODE}
@@ -166,11 +182,27 @@ DEPRECATED_PHASE_BOUND_FIELDS = (
 )
 
 EXPECTED_SELECTORS = {
+    "cnt0_vector_busy": 0x501,
+    "cnt1_cube_busy": 0x301,
     "cnt2_scalar_busy": 0x001,
     "cnt5_shadow_icache_miss": 0x035,
     "cnt6_primary_icache_request": 0x034,
     "cnt7_primary_icache_miss": 0x035,
     "cnt8_shadow_icache_request": 0x034,
+}
+EXPECTED_LINKED_KERNEL_EXCLUSION = {
+    "enabled": True,
+    "boundary": "dist_aicore_call_slot_kernel_entry_to_return",
+    "gate_semantics": "metrics_prof_stop_before_call_and_start_after_return",
+    "time_denominator": "scalar_submit_elapsed_ticks",
+    "wall_tick_semantics": "first_submit_start_to_last_submit_end_closure_only",
+}
+EXPECTED_RETURN_READY_ATOMIC_EXCLUSION = {
+    "enabled": True,
+    "classification": "result_used_atomic_only",
+    "time_boundary": "sys_cnt_before_atomic_to_result_dependent_sys_cnt_after_return",
+    "counter_semantics": "pmu_counters_include_atomic_instruction_events",
+    "time_denominator_effect": "subtract_return_ready_atomic_elapsed",
 }
 EXPECTED_PMU_CYCLES_PER_NS = {"all": 1.649844, "aic": 1.650062, "aiv": 1.649731}
 METRICS = ("total_cycles", "scalar_busy", "icache_requests", "icache_misses")
@@ -387,9 +419,18 @@ def _expected_dynamic_phase_calls(mode: str, expected_submits: int) -> dict[str,
     if expected_submits % 5:
         _fail(f"{mode} requires expected_submits_per_core divisible by 5")
     batches = expected_submits // 5
-    if mode == FANIN_CAPTURE_MODE:
+    if mode in {FANIN_CAPTURE_MODE, WINNER_BUILD_CAPTURE_MODE}:
         return {"all": 4 * batches, "aic": 2 * batches, "aiv": 2 * batches}
     _fail(f"{mode} has no dynamic phase call formula")
+
+
+def _phase_business_calls(record: Mapping[str, Any], mode: str) -> int:
+    """Return outer business calls, excluding pause/resume boundary pairs."""
+
+    begin_reads = int(record["phase_begin_reads"])
+    if mode not in KERNEL_EXCLUDING_PHASE_CAPTURE_MODES:
+        return begin_reads
+    return begin_reads - int(record["phase_excluded_kernel_calls"])
 
 
 def _validate_capture_header(data: dict[str, Any]) -> tuple[str, dict[str, Any], int, dict[str, float]]:
@@ -439,8 +480,18 @@ def _validate_capture_header(data: dict[str, Any]) -> tuple[str, dict[str, Any],
     _require_equal(configuration.get("selectors"), EXPECTED_SELECTORS, "configuration.selectors")
     _require_equal(
         configuration.get("status_required_mask"),
-        REQUIRED_STATUS_MASK,
+        _expected_core_status_mask(mode),
         "configuration.status_required_mask",
+    )
+    _require_equal(
+        configuration.get("linked_kernel_exclusion"),
+        EXPECTED_LINKED_KERNEL_EXCLUSION,
+        "configuration.linked_kernel_exclusion",
+    )
+    _require_equal(
+        configuration.get("return_ready_atomic_exclusion"),
+        EXPECTED_RETURN_READY_ATOMIC_EXCLUSION,
+        "configuration.return_ready_atomic_exclusion",
     )
     _require_equal(
         configuration.get("counter_width_bits"),
@@ -481,12 +532,60 @@ def _validate_phase_elapsed_shape(
         _fail(f"{prefix} non-empty dynamic phase must have positive elapsed")
 
 
+def _validate_phase_read_shape(
+    *,
+    record: Mapping[str, Any],
+    prefix: str,
+    mode: str,
+    dynamic_calls: bool,
+    expected_calls: int | None,
+    begin_reads: int,
+    end_reads: int,
+) -> int:
+    kernel_excluding = mode in KERNEL_EXCLUDING_PHASE_CAPTURE_MODES
+    if kernel_excluding:
+        excluded_kernel_calls = _integer(
+            record.get("phase_excluded_kernel_calls"),
+            f"{prefix}.phase_excluded_kernel_calls",
+        )
+    else:
+        if "phase_excluded_kernel_calls" in record:
+            _fail(
+                f"{prefix}.phase_excluded_kernel_calls is only valid in "
+                f"{sorted(KERNEL_EXCLUDING_PHASE_CAPTURE_MODES)!r}"
+            )
+        excluded_kernel_calls = 0
+    if begin_reads < excluded_kernel_calls or end_reads < excluded_kernel_calls:
+        _fail(f"{prefix} excluded Kernel calls exceed phase begin/end reads")
+    business_begin_calls = begin_reads - excluded_kernel_calls
+    business_end_calls = end_reads - excluded_kernel_calls
+    if dynamic_calls:
+        if business_begin_calls != business_end_calls:
+            if excluded_kernel_calls:
+                _fail(
+                    f"{prefix} phase begin/end reads must remain balanced after subtracting "
+                    f"{excluded_kernel_calls} excluded Kernel calls"
+                )
+            _fail(f"{prefix} dynamic phase begin/end reads must be balanced")
+        return business_begin_calls
+
+    expected_reads = expected_calls + excluded_kernel_calls
+    if begin_reads != expected_reads or end_reads != expected_reads:
+        if excluded_kernel_calls:
+            _fail(
+                f"{prefix} phase begin/end reads must both equal expected calls "
+                f"{expected_calls} + excluded Kernel calls {excluded_kernel_calls} = {expected_reads}"
+            )
+        _fail(f"{prefix} phase begin/end reads must both equal {expected_reads}")
+    return business_begin_calls
+
+
 def _validate_phase_record(
     record: dict[str, Any],
     prefix: str,
     mode: str,
     expected_calls: int | None,
-    submit_elapsed: int,
+    scalar_submit_elapsed: int,
     expected_phase_id: int,
 ) -> None:
     _require_equal(record.get("phase_id"), expected_phase_id, f"{prefix}.phase_id")
@@ -502,19 +601,15 @@ def _validate_phase_record(
     begin_reads = _integer(record.get("phase_begin_reads"), f"{prefix}.phase_begin_reads")
     end_reads = _integer(record.get("phase_end_reads"), f"{prefix}.phase_end_reads")
     dynamic_calls = mode in DYNAMIC_PHASE_CAPTURE_MODES
-    if mode == EFDRAIN_CONTROL_CAPTURE_MODE:
-        excluded_kernel_calls = _integer(
-            record.get("phase_excluded_kernel_calls"),
-            f"{prefix}.phase_excluded_kernel_calls",
-        )
-        expected_reads = expected_calls + excluded_kernel_calls
-    else:
-        if "phase_excluded_kernel_calls" in record:
-            _fail(
-                f"{prefix}.phase_excluded_kernel_calls is only valid in "
-                f"{EFDRAIN_CONTROL_CAPTURE_MODE}"
-            )
-        expected_reads = begin_reads if dynamic_calls else expected_calls
+    business_begin_calls = _validate_phase_read_shape(
+        record=record,
+        prefix=prefix,
+        mode=mode,
+        dynamic_calls=dynamic_calls,
+        expected_calls=expected_calls,
+        begin_reads=begin_reads,
+        end_reads=end_reads,
+    )
     max_request_chunk = _integer(
         record.get("phase_max_shadow_request_chunk"),
         f"{prefix}.phase_max_shadow_request_chunk",
@@ -524,25 +619,16 @@ def _validate_phase_record(
         f"{prefix}.phase_max_shadow_miss_chunk",
     )
 
-    if begin_reads != expected_reads or end_reads != expected_reads:
-        if mode == EFDRAIN_CONTROL_CAPTURE_MODE:
-            _fail(
-                f"{prefix} phase begin/end reads must both equal expected calls "
-                f"{expected_calls} + excluded Kernel calls {excluded_kernel_calls} = {expected_reads}"
-            )
-        if dynamic_calls:
-            _fail(f"{prefix} dynamic phase begin/end reads must be balanced")
-        _fail(f"{prefix} phase begin/end reads must both equal {expected_reads}")
     _validate_phase_elapsed_shape(
         prefix=prefix,
         dynamic_calls=dynamic_calls,
-        begin_reads=begin_reads,
+        begin_reads=business_begin_calls,
         phase_elapsed=phase_elapsed,
         phase_requests_observed=phase_requests_observed,
         phase_misses_observed=phase_misses_observed,
     )
-    if phase_elapsed > submit_elapsed:
-        _fail(f"{prefix}.phase_elapsed_ticks exceeds submit_elapsed_ticks")
+    if phase_elapsed > scalar_submit_elapsed:
+        _fail(f"{prefix}.phase_elapsed_ticks exceeds scalar_submit_elapsed_ticks")
     if phase_requests_observed > record["shadow_icache_requests"]:
         _fail(f"{prefix}.phase_icache_requests_observed exceeds shadow_icache_requests")
     if phase_misses_observed > record["shadow_icache_misses"]:
@@ -582,25 +668,33 @@ def _validate_record(
     elapsed = _integer(record.get("submit_elapsed_ticks"), f"{prefix}.submit_elapsed_ticks", minimum=1)
     if end < start or elapsed != end - start:
         _fail(f"{prefix} Submit tick window is not closed")
+    scalar_elapsed = _integer(
+        record.get("scalar_submit_elapsed_ticks"),
+        f"{prefix}.scalar_submit_elapsed_ticks",
+        minimum=1,
+    )
+    if scalar_elapsed > elapsed:
+        _fail(f"{prefix}.scalar_submit_elapsed_ticks exceeds submit_elapsed_ticks")
 
     total = _integer(record.get("total_cycles"), f"{prefix}.total_cycles", minimum=1)
     scalar = _integer(record.get("scalar_busy"), f"{prefix}.scalar_busy")
     requests = _integer(record.get("icache_requests"), f"{prefix}.icache_requests", minimum=1)
     misses = _integer(record.get("icache_misses"), f"{prefix}.icache_misses")
-    shadow_requests = _integer(record.get("shadow_icache_requests"), f"{prefix}.shadow_icache_requests")
-    shadow_misses = _integer(record.get("shadow_icache_misses"), f"{prefix}.shadow_icache_misses")
     if scalar > total:
         _fail(f"{prefix}.scalar_busy exceeds total_cycles")
     if misses > requests:
         _fail(f"{prefix}.icache_misses exceeds icache_requests")
-    if shadow_misses > shadow_requests:
-        _fail(f"{prefix}.shadow_icache_misses exceeds shadow_icache_requests")
     if mode == NONE_CAPTURE_MODE:
         if any(field in record for field in (*PHASE_RECORD_FIELDS, *DEPRECATED_PHASE_BOUND_FIELDS)):
             _fail(f"{prefix} must not contain phase fields in {NONE_CAPTURE_MODE}")
-        if (requests, misses) != (shadow_requests, shadow_misses):
-            _fail(f"{prefix} shadow I-cache counters differ from primary counters")
+        if "shadow_icache_requests" in record or "shadow_icache_misses" in record:
+            _fail(f"{prefix} must not publish redundant shadow counters in {NONE_CAPTURE_MODE}")
+        programmable = (scalar, requests, misses)
     else:
+        shadow_requests = _integer(record.get("shadow_icache_requests"), f"{prefix}.shadow_icache_requests")
+        shadow_misses = _integer(record.get("shadow_icache_misses"), f"{prefix}.shadow_icache_misses")
+        if shadow_misses > shadow_requests:
+            _fail(f"{prefix}.shadow_icache_misses exceeds shadow_icache_requests")
         if any(field in record for field in DEPRECATED_PHASE_BOUND_FIELDS):
             _fail(f"{prefix} must use observed phase fields, not lower/upper-bound names")
         if shadow_requests > requests:
@@ -608,14 +702,22 @@ def _validate_record(
         if shadow_misses > misses:
             _fail(f"{prefix}.shadow_icache_misses exceeds icache_misses")
         expected_calls = None if mode in DYNAMIC_PHASE_CAPTURE_MODES else _expected_phase_calls(mode, expected_submits)
-        _validate_phase_record(record, prefix, mode, expected_calls, elapsed, PHASE_CONFIG_BY_MODE[mode]["id"])
-    programmable = (scalar, requests, misses, shadow_requests, shadow_misses)
+        _validate_phase_record(
+            record,
+            prefix,
+            mode,
+            expected_calls,
+            scalar_elapsed,
+            PHASE_CONFIG_BY_MODE[mode]["id"],
+        )
+        programmable = (scalar, requests, misses, shadow_requests, shadow_misses)
     if any(value >= PROGRAMMABLE_COUNTER_RISK_THRESHOLD for value in programmable):
         _fail(f"{prefix} programmable counter reaches the risk threshold 0x3fffffff")
 
     status = _integer(record.get("status"), f"{prefix}.status")
-    if status != REQUIRED_STATUS_MASK:
-        _fail(f"{prefix}.status must equal 0x{REQUIRED_STATUS_MASK:x}, got 0x{status:x}")
+    expected_status = _expected_core_status_mask(mode)
+    if status != expected_status:
+        _fail(f"{prefix}.status must equal 0x{expected_status:x}, got 0x{status:x}")
     return record
 
 
@@ -735,18 +837,25 @@ def _group_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
     requests = metrics["icache_requests"]["sum"]
     misses = metrics["icache_misses"]["sum"]
     submit_elapsed_ticks = _metric_summary(records, "submit_elapsed_ticks")
+    scalar_submit_elapsed_ticks = _metric_summary(records, "scalar_submit_elapsed_ticks")
+    scalar_denominator_excluded_wall_ticks = _value_summary(
+        [record["submit_elapsed_ticks"] - record["scalar_submit_elapsed_ticks"] for record in records]
+    )
     non_scalar_busy_cycles = _value_summary(
         [record["total_cycles"] - record["scalar_busy"] for record in records]
     )
-    pmu_total_cycles_per_submit_tick = _value_summary(
-        [record["total_cycles"] / record["submit_elapsed_ticks"] for record in records]
+    pmu_total_cycles_per_scalar_tick = _value_summary(
+        [record["total_cycles"] / record["scalar_submit_elapsed_ticks"] for record in records]
     )
     return {
         "cores": len(records),
         **metrics,
         "submit_elapsed_ticks": submit_elapsed_ticks,
+        "scalar_submit_elapsed_ticks": scalar_submit_elapsed_ticks,
+        "scalar_denominator_excluded_wall_ticks": scalar_denominator_excluded_wall_ticks,
         "non_scalar_busy_cycles": non_scalar_busy_cycles,
-        "pmu_total_cycles_per_submit_tick": pmu_total_cycles_per_submit_tick,
+        "pmu_total_cycles_per_scalar_tick": pmu_total_cycles_per_scalar_tick,
+        "scalar_window_share_of_wall": scalar_submit_elapsed_ticks["sum"] / submit_elapsed_ticks["sum"],
         "scalar_busy_share": scalar_busy / total_cycles,
         "icache_miss_rate": misses / requests if requests else 0.0,
     }
@@ -754,6 +863,7 @@ def _group_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 def _phase_group_summary(records: Sequence[dict[str, Any]], mode: str) -> dict[str, Any]:
     submit_elapsed = _metric_summary(records, "submit_elapsed_ticks")
+    scalar_submit_elapsed = _metric_summary(records, "scalar_submit_elapsed_ticks")
     phase_elapsed = _metric_summary(records, "phase_elapsed_ticks")
     requests_observed = _metric_summary(records, "phase_icache_requests_observed")
     misses_observed = _metric_summary(records, "phase_icache_misses_observed")
@@ -780,14 +890,12 @@ def _phase_group_summary(records: Sequence[dict[str, Any]], mode: str) -> dict[s
     }
     primary_requests = sum(record["icache_requests"] for record in records)
     primary_misses = sum(record["icache_misses"] for record in records)
-    phase_calls = (
-        sum(record["phase_begin_reads"] for record in records)
-        if mode in DYNAMIC_PHASE_CAPTURE_MODES
-        else sum(_expected_phase_calls(mode, record["expected_submit_count"]) for record in records)
-    )
+    phase_calls_per_core = [_phase_business_calls(record, mode) for record in records]
+    phase_calls = sum(phase_calls_per_core)
     summary = {
         "cores": len(records),
         "submit_elapsed_ticks": submit_elapsed,
+        "scalar_submit_elapsed_ticks": scalar_submit_elapsed,
         "primary_icache_requests": primary_requests,
         "primary_icache_misses": primary_misses,
         "phase_elapsed_ticks": phase_elapsed,
@@ -795,7 +903,7 @@ def _phase_group_summary(records: Sequence[dict[str, Any]], mode: str) -> dict[s
         "phase_icache_requests_observed_plus_capture_gap": requests_observed_plus_gap,
         "phase_icache_misses_observed": misses_observed,
         "phase_icache_misses_observed_plus_capture_gap": misses_observed_plus_gap,
-        "phase_time_share_of_submit": phase_elapsed["sum"] / submit_elapsed["sum"],
+        "phase_time_share_of_scalar_submit": phase_elapsed["sum"] / scalar_submit_elapsed["sum"],
         "phase_request_observed_share_of_primary": requests_observed["sum"] / primary_requests,
         "phase_request_observed_plus_capture_gap_share_of_primary": (
             requests_observed_plus_gap["sum"] / primary_requests
@@ -809,12 +917,13 @@ def _phase_group_summary(records: Sequence[dict[str, Any]], mode: str) -> dict[s
         "phase_icache_misses_observed_per_call": misses_observed["sum"] / phase_calls if phase_calls else None,
         "phase_begin_reads": sum(record["phase_begin_reads"] for record in records),
         "phase_end_reads": sum(record["phase_end_reads"] for record in records),
-        "phase_calls_per_core": _metric_summary(records, "phase_begin_reads"),
-        "phase_zero_call_cores": sum(record["phase_begin_reads"] == 0 for record in records),
+        "phase_business_calls": phase_calls,
+        "phase_calls_per_core": _value_summary(phase_calls_per_core),
+        "phase_zero_call_cores": sum(calls == 0 for calls in phase_calls_per_core),
         "phase_max_shadow_request_chunk": max(record["phase_max_shadow_request_chunk"] for record in records),
         "phase_max_shadow_miss_chunk": max(record["phase_max_shadow_miss_chunk"] for record in records),
     }
-    if mode == EFDRAIN_CONTROL_CAPTURE_MODE:
+    if mode in KERNEL_EXCLUDING_PHASE_CAPTURE_MODES:
         summary["phase_excluded_kernel_calls"] = sum(record["phase_excluded_kernel_calls"] for record in records)
     return summary
 
@@ -874,6 +983,11 @@ def _validate_producer_summary(data: dict[str, Any], mode: str) -> None:
         "scalar_le_total_records": EXPECTED_CORES,
         "icache_miss_le_request_records": EXPECTED_CORES,
         "counter_below_risk_threshold_records": EXPECTED_CORES,
+        "linked_kernel_gate_closed_records": EXPECTED_CORES,
+        "scalar_submit_elapsed_valid_records": EXPECTED_CORES,
+        "vector_busy_zero_records": EXPECTED_CORES,
+        "cube_busy_zero_records": EXPECTED_CORES,
+        "return_ready_atomic_time_valid_records": EXPECTED_CORES,
     }
     if mode == NONE_CAPTURE_MODE:
         required["shadow_primary_match_records"] = EXPECTED_CORES
@@ -889,12 +1003,12 @@ def _validate_producer_summary(data: dict[str, Any], mode: str) -> None:
                 "shadow_primary_bounded_records": EXPECTED_CORES,
             }
         )
-    if mode == EFDRAIN_CONTROL_CAPTURE_MODE:
+    if mode in KERNEL_EXCLUDING_PHASE_CAPTURE_MODES:
         required[kernel_exclusion_validation] = EXPECTED_CORES
     elif kernel_exclusion_validation in validation:
         _fail(
             f"validation.{kernel_exclusion_validation} is only valid in "
-            f"{EFDRAIN_CONTROL_CAPTURE_MODE}"
+            f"{sorted(KERNEL_EXCLUDING_PHASE_CAPTURE_MODES)!r}"
         )
     if mode in DYNAMIC_PHASE_CAPTURE_MODES:
         required[dynamic_call_validation] = True
@@ -913,17 +1027,18 @@ def _validate_dynamic_phase_call_totals(
         return
     expected = _expected_dynamic_phase_calls(mode, expected_submits)
     actual = {
-        "all": sum(record["phase_begin_reads"] for record in records),
-        "aic": sum(record["phase_begin_reads"] for record in records if record["role"] == "aic"),
-        "aiv": sum(record["phase_begin_reads"] for record in records if record["role"] == "aiv"),
+        "all": sum(_phase_business_calls(record, mode) for record in records),
+        "aic": sum(_phase_business_calls(record, mode) for record in records if record["role"] == "aic"),
+        "aiv": sum(_phase_business_calls(record, mode) for record in records if record["role"] == "aiv"),
     }
     if actual != expected:
         _fail(f"dynamic phase call totals must equal {expected!r}, got {actual!r}")
     max_calls_per_core = 2 * (expected_submits // 5)
     for logical_core_id, record in enumerate(records):
-        if record["phase_begin_reads"] > max_calls_per_core:
+        business_calls = _phase_business_calls(record, mode)
+        if business_calls > max_calls_per_core:
             _fail(
-                f"records[{logical_core_id}].phase_begin_reads exceeds dynamic per-core maximum "
+                f"records[{logical_core_id}] business phase calls exceed dynamic per-core maximum "
                 f"{max_calls_per_core}"
             )
 
@@ -1207,11 +1322,13 @@ def _scaled_metric_extrema(
 
 
 def _group_card(name: str, summary: Mapping[str, Any], cycles_per_ns: float, miss_penalty_ns: float) -> str:
-    submit_elapsed = summary["submit_elapsed_ticks"]
+    wall_elapsed = summary["submit_elapsed_ticks"]
+    scalar_elapsed = summary["scalar_submit_elapsed_ticks"]
+    excluded_wall = summary["scalar_denominator_excluded_wall_ticks"]
     total = summary["total_cycles"]
     scalar = summary["scalar_busy"]
     non_scalar_busy = summary["non_scalar_busy_cycles"]
-    effective_cycles_per_tick = summary["pmu_total_cycles_per_submit_tick"]
+    effective_cycles_per_tick = summary["pmu_total_cycles_per_scalar_tick"]
     requests = summary["icache_requests"]
     misses = summary["icache_misses"]
     cycles_to_us = 1.0 / cycles_per_ns / 1_000
@@ -1220,14 +1337,25 @@ def _group_card(name: str, summary: Mapping[str, Any], cycles_per_ns: float, mis
       <article class="group-card">
         <h3>{title} · {summary["cores"]} 核</h3>
         <dl>
-          <dt>Submit SYS_CNT/core</dt>
-          <dd>{_scaled_metric_range(submit_elapsed, 1 / 1_000)} µs<br>
-            <small>逐核首末 Submit 窗，不是顶部的跨核全局时间范围</small>
+          <dt>Scalar Submit 时间分母/core</dt>
+          <dd>{_scaled_metric_range(scalar_elapsed, 1 / 1_000)} µs<br>
+            <small>逐核累计 Scalar SYS_CNT；linked vector/cube Kernel 从时间和 PMU counter
+              一并门控排除，result-used return-ready atomic 依赖区间只从时间扣除</small>
           </dd>
-          <dt>PMU total/core</dt>
+          <dt>原始 Submit 墙钟/core</dt>
+          <dd>{_scaled_metric_range(wall_elapsed, 1 / 1_000)} µs<br>
+            <small>逐核首末 Submit 闭合证据；含 Kernel，不参与 Scalar 时间占比</small>
+          </dd>
+          <dt>未进入 Scalar 分母/core</dt>
+          <dd>{_scaled_metric_range(excluded_wall, 1 / 1_000)} µs<br>
+            <small>逐核 wall−scalar；混合了 linked Kernel、return-ready atomic 被扣时间
+              和门控边界间隙，不能解释成纯 Kernel 耗时；Scalar/墙钟加权比
+              {float(summary["scalar_window_share_of_wall"]):.3%}</small>
+          </dd>
+          <dt>Submit PMU total/core</dt>
           <dd>{_metric_range(total)} cycles<br>
             <small>等效时间 {_scaled_metric_range(total, cycles_to_us)} µs
-              （按 {cycles_per_ns:.6f} cycles/ns 校准）</small>
+              （按 {cycles_per_ns:.6f} cycles/ns 校准）；仍包含 atomic 指令事件</small>
           </dd>
           <dt>Scalar busy/core</dt>
           <dd>{_metric_range(scalar)} cycles<br>
@@ -1239,9 +1367,10 @@ def _group_card(name: str, summary: Mapping[str, Any], cycles_per_ns: float, mis
             <small>逐核先算 total−scalar；等效时间
               {_scaled_metric_range(non_scalar_busy, cycles_to_us)} µs</small>
           </dd>
-          <dt>PMU-total / SYS-window/core</dt>
+          <dt>PMU-total / Scalar SYS/core</dt>
           <dd>{_scaled_metric_range(effective_cycles_per_tick, 1.0, digits=6)} cycles/ns<br>
-            <small>同 ELF 长窗有效比；不是瞬时 AICore 频率，也不是利用率</small>
+            <small>仅作当前 ELF 的诊断比值；return-ready atomic 只扣 SYS 时间、
+              不扣 PMU counter，因此不要求精确等于校准频率，也不是利用率</small>
           </dd>
           <dt>Primary I-cache request/core</dt><dd>{_metric_extrema(requests)}</dd>
           <dt>Primary I-cache miss/core</dt><dd>{_metric_extrema(misses)}</dd>
@@ -1296,6 +1425,7 @@ def _per_core_rows(records: Sequence[dict[str, Any]], miss_penalty_ns: float) ->
             "<tr>"
             f"<td>{record['physical_core_id']}</td><td>{record['logical_core_id']}</td>"
             f"<td>{record['role'].upper()}</td><td>{record['block_id']}</td><td>{record['lane']}</td>"
+            f"<td>{_format_number(record['scalar_submit_elapsed_ticks'] / 1_000)}</td>"
             f"<td>{_format_number(record['submit_elapsed_ticks'] / 1_000)}</td>"
             f"<td>{_format_integer(record['total_cycles'])}</td><td>{_format_integer(record['scalar_busy'])}</td>"
             f"<td>{_format_integer(request)}</td><td>{_format_integer(miss)}</td><td>{miss_rate:.3%}</td>"
@@ -1347,12 +1477,14 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
       仍只覆盖两次 shadow read-clear 之间，并不包含 begin 读取前/end 读取后的全部 observer 取指。
       两者都只是量级参照，不能跨 ELF 精确扣减。</p>
         """
-    efdrain_control_note = ""
-    if phase["id"] == EFDRAIN_CONTROL_PHASE_ID:
-        efdrain_control_note = """
-    <p class="notice"><strong>本阶段的 elapsed、request 和 miss 都是排除 linked Kernel 后，
-      多段 EfDrain control segments 的累计值。</strong>暂停/恢复观察器只切分计数区间；
-      每次调用的分母仍是外层 EfDrain 调用次数，不是 Begin/End 读数，也不是排除的 Kernel 调用数。</p>
+    control_exclusion_note = ""
+    if capture.data["capture"]["mode"] in KERNEL_EXCLUDING_PHASE_CAPTURE_MODES:
+        control_exclusion_note = """
+    <p class="notice"><strong>本阶段若跨过 linked Kernel，会同时门控 SYS 时间与 PMU counter，
+      因而 elapsed、request 和 miss 都排除该 Kernel 整段。</strong>result-used return-ready atomic
+      依赖区间只从 elapsed 扣除，request/miss 仍含 atomic 指令事件；source-issue atomic
+      保留在时间和计数口径内。没有 linked Kernel 的阶段不触发 PMU 停/开表；
+      每次调用的分母仍是外层业务调用次数，不是 Begin/End 读数，也不是排除的 Kernel 调用数。</p>
         """
 
     rows = []
@@ -1377,12 +1509,13 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
             f"{_format_integer(group['phase_begin_reads'])} / "
             f"{_format_integer(group['phase_end_reads'])}"
         )
-        if phase["id"] == EFDRAIN_CONTROL_PHASE_ID:
+        if capture.data["capture"]["mode"] in KERNEL_EXCLUDING_PHASE_CAPTURE_MODES:
             reads += (
-                "<br><small>排除 linked Kernel 调用 "
+                "<br><small>业务调用 "
+                f"{_format_integer(group['phase_business_calls'])} 次；排除 linked Kernel 调用 "
                 f"{_format_integer(group['phase_excluded_kernel_calls'])} 次</small>"
             )
-        if phase["id"] in {FANIN_PHASE_ID}:
+        if phase["id"] in {FANIN_PHASE_ID, WINNER_BUILD_PHASE_ID}:
             calls = group["phase_calls_per_core"]
             reads += (
                 f"<br><small>逐核 {_format_integer(calls['min'])}–{_format_integer(calls['max'])}；"
@@ -1394,8 +1527,9 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
             "<tr>"
             f"<th>{title}<small>{group['cores']} 核</small></th>"
             f"<td><strong>{_format_number(group['phase_elapsed_ticks']['sum'] / 1_000)} µs</strong><br>"
-            f"<small>Submit core-time {_format_number(group['submit_elapsed_ticks']['sum'] / 1_000)} µs</small></td>"
-            f"<td><strong>{group['phase_time_share_of_submit']:.3%}</strong></td>"
+            f"<small>Scalar Submit 时间分母 core-time "
+            f"{_format_number(group['scalar_submit_elapsed_ticks']['sum'] / 1_000)} µs</small></td>"
+            f"<td><strong>{group['phase_time_share_of_scalar_submit']:.3%}</strong></td>"
             f"<td><strong>{per_call_text}</strong></td>"
             f"<td>{request_observed}</td><td>{miss_observed}</td>"
             f"<td>{reads}</td>"
@@ -1410,16 +1544,19 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
       时间语义 <code>{time_semantics}</code> ·
       <code>{html.escape(call_shape_text)}</code></p>
     {calibration_note}
-    {efdrain_control_note}
+    {control_exclusion_note}
     <p><strong>这是 running read-clear 观察区间，不是可与其他构建直接相减的独立计时。</strong>
-      时间占比的分母是同一 ELF 的 Σ每核 Submit elapsed；request/miss 百分比的分母才是同一 ELF、
-      同一次采集的 Submit 整窗 primary。<code>observed_plus_capture_gap = observed + (primary − shadow)</code>；
+      时间占比的分母是同一 ELF 的 Σ每核 Scalar Submit elapsed：linked vector/cube Kernel
+      从时间与 PMU counter 一并门控排除；result-used return-ready atomic 依赖区间只从时间扣除，
+      I-cache/PMU counter 仍含其指令事件；source-issue atomic 保留。request/miss 百分比的分母才是
+      同一 ELF、同一次采集的 Submit 整窗 primary。
+      <code>observed_plus_capture_gap = observed + (primary − shadow)</code>；
       边界读数和插桩 bookkeeping 会进入 sample，因此“观测值”和“加全窗 capture gap”都不是原业务
       事件数的数学上下界，也不能跨 ELF 相减。request/miss 的逐核 min/max 是每核累计
       整个 phase 的极值，不是逐调用极值。</p>
     <div class="table-wrap phase-table"><table>
       <thead><tr>
-        <th>核组</th><th>Phase / Submit core-time</th><th>时间占比</th>
+        <th>核组</th><th>Phase / Scalar Submit 时间分母</th><th>Scalar 时间占比</th>
         <th>每次调用 elapsed</th>
         <th>Request observed（总数 / 逐核 min–max / Primary）</th>
         <th>Miss observed（总数 / 逐核 min–max / Primary）</th>
@@ -1494,6 +1631,7 @@ def _document(
     )
     charts = "".join(
         (
+            _chart_svg(capture.records, "scalar_submit_elapsed_ticks", "Scalar Submit time-denominator ticks/core"),
             _chart_svg(capture.records, "total_cycles", "PMU total cycles/core"),
             _chart_svg(capture.records, "scalar_busy", "Scalar busy cycles/core"),
             _chart_svg(capture.records, "icache_requests", "Primary I-cache requests/core"),
@@ -1507,7 +1645,7 @@ def _document(
         "phase 模式的 shadow 是 begin/end/final 全部 running read-clear 返回值之和，只用于标记全窗 "
         "capture gap，不作为第二份性能数据展示。"
         if capture.phase_summary is not None
-        else "shadow 只承担逐核同值闭环，不作为第二份性能数据展示。"
+        else "none 模式不重复发布 shadow 原值；逐核 primary/shadow 同值由必选 status 闭环。"
     )
     source_name = html.escape(capture.input_path.name)
     return f"""<!doctype html>
@@ -1515,7 +1653,7 @@ def _document(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>真实 FDWIC Submit PMU I-cache 报告</title>
+  <title>真实 FDWIC Scalar Submit PMU I-cache 报告</title>
   <style>
     :root {{ color-scheme: light; --ink:#172033; --muted:#5b6475; --line:#d9dfeb; --panel:#f7f9fc; }}
     * {{ box-sizing:border-box; }}
@@ -1561,12 +1699,12 @@ def _document(
   </style>
 </head>
 <body><main>
-  <h1>真实 FDWIC Submit PMU I-cache 报告</h1>
+  <h1>真实 FDWIC Scalar Submit PMU I-cache 报告</h1>
   <p class="subtitle">固定输入 <code>{source_name}</code> · schema <code>{SCHEMA_NAME}</code> · 32 AIC + 64 AIV</p>
   {phase_overview}
   {provenance_overview}
   <section class="headline">
-    <div><span>全局 Submit 时间范围</span>
+    <div><span>原始全局 Submit 时间范围（墙钟）</span>
       <strong>{_format_number(window["global_submit_span_us"])} µs</strong>
       <small>最早一核首个 Submit 至最晚一核末个 Submit</small>
     </div>
@@ -1576,7 +1714,12 @@ def _document(
     <div><span>受信记录</span><strong>96 / 96</strong><small>owner、selector、status、拓扑均通过</small></div>
     <div><span>raw SHA-256</span><code>{capture.raw_sha256}</code></div>
   </section>
-  <p class="notice"><strong>{miss_penalty_ns:.3f} ns 仅作 I-cache miss 的直觉量尺，不是 Submit 墙钟损失。</strong>
+  <p class="notice"><strong>linked vector/cube Kernel 整段从 Scalar SYS 时间与 PMU counter
+    一并门控排除。</strong>result-used return-ready atomic 的依赖区间只从 Scalar SYS 时间分母
+    及命中的 phase 时间扣除，I-cache/PMU counter 仍包含其指令事件；source-issue atomic
+    保留在时间和计数口径内。轮询和等待 flag 也仍是调度器实际开销。原始首末 SYS_CNT
+    只证明窗口闭合，不参与时间占比；wall−scalar 是多种排除项与边界间隙的混合，不能称为纯 Kernel 时间。
+    <strong>{miss_penalty_ns:.3f} ns 仅作 I-cache miss 的直觉量尺，不是 Submit 墙钟损失。</strong>
     miss 可能重叠、被流水隐藏，也可能与其他停顿共同出现；不能把 miss×{miss_penalty_ns:g} ns
     当成可直接相减的优化收益。
     非 Scalar-busy 残余不是空闲时间，也不是 I-cache stall。卡片中的逐核 PMU 等效时间只解释
@@ -1590,7 +1733,8 @@ def _document(
   <p class="fine">报告展示 primary request/miss；{shadow_note}</p>
   <div class="table-wrap"><table>
     <thead><tr>
-      <th>Physical</th><th>Logical</th><th>Role</th><th>Block</th><th>Lane</th><th>Submit µs</th>
+      <th>Physical</th><th>Logical</th><th>Role</th><th>Block</th><th>Lane</th>
+      <th>Scalar 时间分母 µs</th><th>原始墙钟 µs</th>
       <th>Total cycles</th><th>Scalar busy</th><th>I$ request</th><th>I$ miss</th>
       <th>Miss rate</th><th>{miss_penalty_ns:g}ns量尺 µs</th>
     </tr></thead>

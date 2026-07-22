@@ -16,12 +16,33 @@
 #include "dist_engine/common/worker_state.h"
 #include "dist_engine/common/atomic.h"
 #include "dist_engine/aicore/primitive.h"
+#include "dist_engine/common/submit_pmu.h"
 
 #if defined(__CCE_AICORE__) || defined(__CPU_SIM)
 #include "inner_kernel.h"
 #endif
 
 namespace {
+
+template <typename T>
+PTO_DEVICE_FUNC inline uint64_t fdwic_atomic_result_ready_tick(T value) {
+#if defined(__CCE_AICORE__)
+    static_assert(sizeof(T) == 4 || sizeof(T) == 8, "atomic dependency expects a scalar result");
+    uint64_t cycle = 0;
+    // 在读取 SYS_CNT 的同一汇编块中消费 atomic 返回值，形成局部
+    // return-ready 边界；这不是跨核可见性屏障，也不会引入 DSB。
+    asm volatile("MOV %0, %0\n"
+                 "MOV %1, SYS_CNT\n"
+                 : "+l"(value), "=&l"(cycle));
+    return cycle;
+#elif defined(__CPU_SIM)
+    (void)value;
+    return get_sys_cnt_aicore();
+#else
+    (void)value;
+    return 0;
+#endif
+}
 
 #if DIST_TRACE_ENABLED
 
@@ -46,23 +67,6 @@ PTO_DEVICE_FUNC inline bool fdwic_atomic_return_ready_observed() {
     // CPU simulation validates the scheduler and raw schema, not A5 atomic
     // completion timing. Do not claim a hardware return-ready boundary there.
     return false;
-#endif
-}
-
-template <typename T>
-PTO_DEVICE_FUNC inline uint64_t fdwic_swimlane_detail_now_after_atomic_result(T value) {
-#if defined(__CCE_AICORE__)
-    static_assert(sizeof(T) == 4 || sizeof(T) == 8, "atomic dependency expects a scalar result");
-    uint64_t cycle = 0;
-    // Consume the returned scalar in the same asm block as SYS_CNT. This is a
-    // local return-value-ready boundary, not a cross-core visibility fence.
-    asm volatile("MOV %0, %0\n"
-                 "MOV %1, SYS_CNT\n"
-                 : "+l"(value), "=&l"(cycle));
-    return cycle;
-#else
-    (void)value;
-    return fdwic_swimlane_detail_now();
 #endif
 }
 
@@ -333,7 +337,7 @@ PTO_DEVICE_FUNC inline T fdwic_trace_atomic_load(
         return old;
     }
     const bool return_ready = result_used && fdwic_atomic_return_ready_observed();
-    const uint64_t end = result_used ? fdwic_swimlane_detail_now_after_atomic_result(old) : fdwic_swimlane_detail_now();
+    const uint64_t end = result_used ? fdwic_atomic_result_ready_tick(old) : fdwic_swimlane_detail_now();
     // Keep tracing bookkeeping outside the measured direct-atomic boundary.
     fdwic_swimlane_count_atomic_call(false);
     fdwic_swimlane_detail_record_atomic(
@@ -361,7 +365,7 @@ PTO_DEVICE_FUNC inline T fdwic_trace_atomic_exchange(
         return old;
     }
     const bool return_ready = result_used && fdwic_atomic_return_ready_observed();
-    const uint64_t end = result_used ? fdwic_swimlane_detail_now_after_atomic_result(old) : fdwic_swimlane_detail_now();
+    const uint64_t end = result_used ? fdwic_atomic_result_ready_tick(old) : fdwic_swimlane_detail_now();
     fdwic_swimlane_count_atomic_call(false);
     // Close failed retries at the successful transition's issue boundary. The
     // successful claim itself remains an exact direct row. Capture its end
@@ -380,7 +384,7 @@ PTO_DEVICE_FUNC inline T fdwic_trace_atomic_fetch_add(
     const uint64_t begin = fdwic_swimlane_detail_now();
     const T old = atomic_fetch_add(value, delta, memorder);
     const bool return_ready = result_used && fdwic_atomic_return_ready_observed();
-    const uint64_t end = result_used ? fdwic_swimlane_detail_now_after_atomic_result(old) : fdwic_swimlane_detail_now();
+    const uint64_t end = result_used ? fdwic_atomic_result_ready_tick(old) : fdwic_swimlane_detail_now();
     fdwic_swimlane_count_atomic_call(false);
     fdwic_swimlane_detail_record_atomic(task_id, site, FdwicAtomicOp::FetchAdd, begin, end, result_used, return_ready);
     return old;
@@ -395,7 +399,7 @@ PTO_DEVICE_FUNC inline T fdwic_trace_atomic_fetch_sub(
     const uint64_t begin = fdwic_swimlane_detail_now();
     const T old = atomic_fetch_sub(value, delta, memorder);
     const bool return_ready = result_used && fdwic_atomic_return_ready_observed();
-    const uint64_t end = result_used ? fdwic_swimlane_detail_now_after_atomic_result(old) : fdwic_swimlane_detail_now();
+    const uint64_t end = result_used ? fdwic_atomic_result_ready_tick(old) : fdwic_swimlane_detail_now();
     fdwic_swimlane_count_atomic_call(false);
     fdwic_swimlane_detail_record_atomic(task_id, site, FdwicAtomicOp::FetchSub, begin, end, result_used, return_ready);
     return old;
@@ -410,7 +414,7 @@ PTO_DEVICE_FUNC inline T fdwic_trace_atomic_fetch_max(
     const uint64_t begin = fdwic_swimlane_detail_now();
     const T old = atomic_fetch_max(value, desired, memorder);
     const bool return_ready = result_used && fdwic_atomic_return_ready_observed();
-    const uint64_t end = result_used ? fdwic_swimlane_detail_now_after_atomic_result(old) : fdwic_swimlane_detail_now();
+    const uint64_t end = result_used ? fdwic_atomic_result_ready_tick(old) : fdwic_swimlane_detail_now();
     fdwic_swimlane_count_atomic_call(false);
     fdwic_swimlane_detail_record_atomic(task_id, site, FdwicAtomicOp::FetchMax, begin, end, result_used, return_ready);
     return old;
@@ -434,7 +438,7 @@ PTO_DEVICE_FUNC inline void fdwic_swimlane_record_clock_baselines(__gm__ DistCor
     const uint64_t clock_end = fdwic_swimlane_detail_now();
     fdwic_swimlane_detail_record(self, -1, -1, FdwicSwimlanePhase::ClockBaseline, clock_begin, clock_end);
     const uint64_t dependency_begin = fdwic_swimlane_detail_now();
-    const uint64_t dependency_end = fdwic_swimlane_detail_now_after_atomic_result(dependency_value);
+    const uint64_t dependency_end = fdwic_atomic_result_ready_tick(dependency_value);
     const uint32_t flags =
         kFdwicClockAtomicDependency | (fdwic_atomic_return_ready_observed() ? kFdwicClockAtomicDependencyApplied : 0U);
     fdwic_swimlane_detail_record(
@@ -477,45 +481,71 @@ PTO_DEVICE_FUNC inline void fdwic_atomic_poll_boundary() {}
 
 template <typename T>
 PTO_DEVICE_FUNC inline T fdwic_trace_atomic_load(
-    int32_t, FdwicAtomicSite, __gm__ volatile T &value, bool = true, int memorder = __ATOMIC_ACQUIRE
+    int32_t, FdwicAtomicSite site, __gm__ volatile T &value, bool result_used = true, int memorder = __ATOMIC_ACQUIRE
 ) {
-    return atomic_load(value, memorder);
+    const bool observe_return_ready = result_used && fdwic_atomic_site_result_used(site);
+    const uint32_t token = observe_return_ready ? fdwic_submit_pmu_return_ready_atomic_begin() : 0;
+    const T old = atomic_load(value, memorder);
+    if (token != 0) fdwic_submit_pmu_return_ready_atomic_end(token, fdwic_atomic_result_ready_tick(old));
+    return old;
 }
 
 template <typename T, typename V>
 PTO_DEVICE_FUNC inline T fdwic_trace_atomic_exchange(
-    int32_t, FdwicAtomicSite, __gm__ volatile T &value, V desired, bool = false, int memorder = __ATOMIC_ACQ_REL
+    int32_t, FdwicAtomicSite site, __gm__ volatile T &value, V desired, bool result_used = false,
+    int memorder = __ATOMIC_ACQ_REL
 ) {
-    return atomic_exchange(value, static_cast<T>(desired), memorder);
+    const bool observe_return_ready = result_used && fdwic_atomic_site_result_used(site);
+    const uint32_t token = observe_return_ready ? fdwic_submit_pmu_return_ready_atomic_begin() : 0;
+    const T old = atomic_exchange(value, static_cast<T>(desired), memorder);
+    if (token != 0) fdwic_submit_pmu_return_ready_atomic_end(token, fdwic_atomic_result_ready_tick(old));
+    return old;
 }
 
 template <typename T>
 PTO_DEVICE_FUNC inline T fdwic_trace_atomic_fetch_add(
-    int32_t, FdwicAtomicSite, __gm__ volatile T &value, T delta, bool = false, int memorder = __ATOMIC_ACQ_REL
+    int32_t, FdwicAtomicSite site, __gm__ volatile T &value, T delta, bool result_used = false,
+    int memorder = __ATOMIC_ACQ_REL
 ) {
-    return atomic_fetch_add(value, delta, memorder);
+    const bool observe_return_ready = result_used && fdwic_atomic_site_result_used(site);
+    const uint32_t token = observe_return_ready ? fdwic_submit_pmu_return_ready_atomic_begin() : 0;
+    const T old = atomic_fetch_add(value, delta, memorder);
+    if (token != 0) fdwic_submit_pmu_return_ready_atomic_end(token, fdwic_atomic_result_ready_tick(old));
+    return old;
 }
 
 template <typename T>
 PTO_DEVICE_FUNC inline T fdwic_trace_atomic_fetch_sub(
-    int32_t, FdwicAtomicSite, __gm__ volatile T &value, T delta, bool = false, int memorder = __ATOMIC_ACQ_REL
+    int32_t, FdwicAtomicSite site, __gm__ volatile T &value, T delta, bool result_used = false,
+    int memorder = __ATOMIC_ACQ_REL
 ) {
-    return atomic_fetch_sub(value, delta, memorder);
+    const bool observe_return_ready = result_used && fdwic_atomic_site_result_used(site);
+    const uint32_t token = observe_return_ready ? fdwic_submit_pmu_return_ready_atomic_begin() : 0;
+    const T old = atomic_fetch_sub(value, delta, memorder);
+    if (token != 0) fdwic_submit_pmu_return_ready_atomic_end(token, fdwic_atomic_result_ready_tick(old));
+    return old;
 }
 
 template <typename T>
 PTO_DEVICE_FUNC inline T fdwic_trace_atomic_fetch_max(
-    int32_t, FdwicAtomicSite, __gm__ volatile T &value, T desired, bool = true, int memorder = __ATOMIC_ACQ_REL
+    int32_t, FdwicAtomicSite site, __gm__ volatile T &value, T desired, bool result_used = true,
+    int memorder = __ATOMIC_ACQ_REL
 ) {
-    return atomic_fetch_max(value, desired, memorder);
+    const bool observe_return_ready = result_used && fdwic_atomic_site_result_used(site);
+    const uint32_t token = observe_return_ready ? fdwic_submit_pmu_return_ready_atomic_begin() : 0;
+    const T old = atomic_fetch_max(value, desired, memorder);
+    if (token != 0) fdwic_submit_pmu_return_ready_atomic_end(token, fdwic_atomic_result_ready_tick(old));
+    return old;
 }
 
 PTO_DEVICE_FUNC inline bool fdwic_trace_is_fatal(int32_t = -1) {
-    return atomic_load(g_dist.fatal, __ATOMIC_ACQUIRE) != 0;
+    return fdwic_trace_atomic_load(-1, FdwicAtomicSite::FatalPoll, g_dist.fatal) != 0;
 }
 
 PTO_DEVICE_FUNC inline void fdwic_trace_set_fatal(int32_t = -1) {
-    (void)atomic_exchange(g_dist.fatal, int32_t{1}, __ATOMIC_ACQ_REL);
+    (void)fdwic_trace_atomic_exchange(
+        -1, FdwicAtomicSite::FatalSet, g_dist.fatal, int32_t{1}, /*result_used=*/false, __ATOMIC_ACQ_REL
+    );
 }
 
 PTO_DEVICE_FUNC inline void fdwic_swimlane_record_clock_baselines(__gm__ DistCore *, int32_t) {}

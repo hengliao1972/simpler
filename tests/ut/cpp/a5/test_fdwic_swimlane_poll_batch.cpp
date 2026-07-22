@@ -19,6 +19,29 @@
 
 namespace {
 
+TEST(FdwicAtomicSiteClassificationTest, ResultUsedBitmapIsExactlySixteenOfTwentyEightSites) {
+    constexpr bool kExpectedResultUsed[] = {
+        false, true,  true,  false, true,  true,  false, false,  // 0..7
+        true,  true,  true,  true,  true,  false, true,  true,   // 8..15
+        false, false, false, false, false, true,  true,  true,   // 16..23
+        false, true,  false, true,                               // 24..27
+    };
+    constexpr uint32_t kSiteCount = static_cast<uint32_t>(FdwicAtomicSite::Count);
+    constexpr uint32_t kExpectedSiteCount = sizeof(kExpectedResultUsed) / sizeof(kExpectedResultUsed[0]);
+    static_assert(kSiteCount == 28U, "FDWIC atomic site count changed");
+    static_assert(kExpectedSiteCount == kSiteCount, "result-used expectation must cover every atomic site");
+
+    uint32_t result_used_count = 0;
+    for (uint32_t site_index = 0; site_index < kSiteCount; ++site_index) {
+        const bool result_used = fdwic_atomic_site_result_used(static_cast<FdwicAtomicSite>(site_index));
+        EXPECT_EQ(result_used, kExpectedResultUsed[site_index]) << "site_index=" << site_index;
+        result_used_count += result_used ? 1U : 0U;
+    }
+
+    EXPECT_EQ(result_used_count, 16U);
+    EXPECT_EQ(kSiteCount - result_used_count, 12U);
+}
+
 class FdwicPollBatchTest : public ::testing::Test {
 protected:
     void SetUp() override {

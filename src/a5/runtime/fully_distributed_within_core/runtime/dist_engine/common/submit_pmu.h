@@ -64,6 +64,10 @@ constexpr size_t kFdwicSubmitPmuCompiledBytes = kFdwicSubmitPmuPhaseBytes;
 constexpr FdwicSubmitPmuPhase kFdwicSubmitPmuCompiledPhase = FdwicSubmitPmuPhase::Fanin;
 constexpr uint16_t kFdwicSubmitPmuCompiledMode = kFdwicSubmitPmuModeFanin;
 constexpr size_t kFdwicSubmitPmuCompiledBytes = kFdwicSubmitPmuPhaseBytes;
+#elif PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 10
+constexpr FdwicSubmitPmuPhase kFdwicSubmitPmuCompiledPhase = FdwicSubmitPmuPhase::WinnerBuild;
+constexpr uint16_t kFdwicSubmitPmuCompiledMode = kFdwicSubmitPmuModeWinnerBuild;
+constexpr size_t kFdwicSubmitPmuCompiledBytes = kFdwicSubmitPmuPhaseBytes;
 #else
 #error "invalid real FDWIC submit-PMU phase"
 #endif
@@ -93,6 +97,12 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_clear_counters(uint64_t reg_base) {
 PTO_DEVICE_FUNC inline uint32_t fdwic_submit_pmu_selector_status(uint64_t reg_base) {
     constexpr uint32_t kSelectorBlock = REG_MMIO_PMU_CTRL_1_OFFSET;
     uint32_t status = 0;
+    if (fdwic_submit_pmu_ld<kSelectorBlock, REG_MMIO_PMU_CNT0_IDX_OFFSET>(reg_base) == kFdwicSubmitPmuCnt0VectorBusy) {
+        status |= kFdwicSubmitPmuCnt0SelectorValid;
+    }
+    if (fdwic_submit_pmu_ld<kSelectorBlock, REG_MMIO_PMU_CNT1_IDX_OFFSET>(reg_base) == kFdwicSubmitPmuCnt1CubeBusy) {
+        status |= kFdwicSubmitPmuCnt1SelectorValid;
+    }
     if (fdwic_submit_pmu_ld<kSelectorBlock, REG_MMIO_PMU_CNT2_IDX_OFFSET>(reg_base) == kFdwicSubmitPmuCnt2ScalarBusy) {
         status |= kFdwicSubmitPmuCnt2SelectorValid;
     }
@@ -157,14 +167,21 @@ PTO_DEVICE_FUNC __attribute__((noinline)) void fdwic_submit_pmu_read_counters() 
     const uint64_t reg_base = g_fdwic_submit_pmu_reg_base;
     if (reg_base == 0) return;
     constexpr uint32_t kCounterBlock = REG_MMIO_PMU_CTRL_0_OFFSET;
+    const uint32_t vector_busy = fdwic_submit_pmu_ld<kCounterBlock, REG_MMIO_PMU_CNT0_OFFSET>(reg_base);
+    const uint32_t cube_busy = fdwic_submit_pmu_ld<kCounterBlock, REG_MMIO_PMU_CNT1_OFFSET>(reg_base);
+    if (vector_busy == 0) g_fdwic_submit_pmu_status |= kFdwicSubmitPmuVectorBusyZero;
+    if (cube_busy == 0) g_fdwic_submit_pmu_status |= kFdwicSubmitPmuCubeBusyZero;
     g_fdwic_submit_pmu_scalar_busy = fdwic_submit_pmu_ld<kCounterBlock, REG_MMIO_PMU_CNT2_OFFSET>(reg_base);
     g_fdwic_submit_pmu_icache_requests = fdwic_submit_pmu_ld<kCounterBlock, REG_MMIO_PMU_CNT6_OFFSET>(reg_base);
     g_fdwic_submit_pmu_icache_misses = fdwic_submit_pmu_ld<kCounterBlock, REG_MMIO_PMU_CNT7_OFFSET>(reg_base);
     // primary 必须先读且窗口中从不 read-clear。none 随后直接读取一次
     // shadow；phase 则在这里补最后一个 tail segment，软件重建完整 shadow。
 #if PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 0
-    g_fdwic_submit_pmu_shadow_requests = fdwic_submit_pmu_ld<kCounterBlock, REG_MMIO_PMU_CNT8_OFFSET>(reg_base);
-    g_fdwic_submit_pmu_shadow_misses = fdwic_submit_pmu_ld<kCounterBlock, REG_MMIO_PMU_CNT5_OFFSET>(reg_base);
+    const uint32_t shadow_requests = fdwic_submit_pmu_ld<kCounterBlock, REG_MMIO_PMU_CNT8_OFFSET>(reg_base);
+    const uint32_t shadow_misses = fdwic_submit_pmu_ld<kCounterBlock, REG_MMIO_PMU_CNT5_OFFSET>(reg_base);
+    if (shadow_requests == g_fdwic_submit_pmu_icache_requests && shadow_misses == g_fdwic_submit_pmu_icache_misses) {
+        g_fdwic_submit_pmu_status |= kFdwicSubmitPmuNoneShadowPrimaryMatch;
+    }
 #else
     const FdwicSubmitPmuShadowSnapshot tail = fdwic_submit_pmu_phase_read_shadow_counters();
     if (fdwic_submit_pmu_add_shadow(tail, /*include_in_phase=*/false)) {
@@ -172,8 +189,6 @@ PTO_DEVICE_FUNC __attribute__((noinline)) void fdwic_submit_pmu_read_counters() 
     } else {
         g_fdwic_submit_pmu_phase.boundary_error = true;
     }
-    g_fdwic_submit_pmu_shadow_requests = static_cast<uint32_t>(g_fdwic_submit_pmu_phase.shadow_requests);
-    g_fdwic_submit_pmu_shadow_misses = static_cast<uint32_t>(g_fdwic_submit_pmu_phase.shadow_misses);
 #endif
     const uint64_t low = fdwic_submit_pmu_ld<kCounterBlock, REG_MMIO_PMU_CNT_TOTAL0_OFFSET>(reg_base);
     const uint64_t high = fdwic_submit_pmu_ld<kCounterBlock, REG_MMIO_PMU_CNT_TOTAL1_OFFSET>(reg_base);
@@ -186,22 +201,31 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_reset_local() {
     g_fdwic_submit_pmu_reg_base = 0;
     g_fdwic_submit_pmu_start_tick = 0;
     g_fdwic_submit_pmu_end_tick = 0;
+    g_fdwic_submit_pmu_scalar_elapsed_ticks = 0;
+    g_fdwic_submit_pmu_scalar_segment_begin_tick = 0;
+    g_fdwic_submit_pmu_scalar_segment_excluded_atomic_ticks = 0;
+    g_fdwic_submit_pmu_return_ready_atomic_begin_tick = 0;
     g_fdwic_submit_pmu_total_cycles = 0;
     g_fdwic_submit_pmu_scalar_busy = 0;
     g_fdwic_submit_pmu_icache_requests = 0;
     g_fdwic_submit_pmu_icache_misses = 0;
-    g_fdwic_submit_pmu_shadow_requests = 0;
-    g_fdwic_submit_pmu_shadow_misses = 0;
     g_fdwic_submit_pmu_expected_submits = 0;
     g_fdwic_submit_pmu_status = 0;
     g_fdwic_submit_pmu_started = false;
     g_fdwic_submit_pmu_stopped = false;
+    g_fdwic_submit_pmu_gate_running = false;
+    g_fdwic_submit_pmu_gate_error = false;
+    g_fdwic_submit_pmu_return_ready_atomic_active = false;
+    g_fdwic_submit_pmu_return_ready_atomic_phase_armed = false;
+    g_fdwic_submit_pmu_return_ready_atomic_seen = false;
+    g_fdwic_submit_pmu_return_ready_atomic_time_error = false;
     g_fdwic_submit_pmu_phase.shadow_requests = 0;
     g_fdwic_submit_pmu_phase.shadow_misses = 0;
     g_fdwic_submit_pmu_phase.phase_requests = 0;
     g_fdwic_submit_pmu_phase.phase_misses = 0;
     g_fdwic_submit_pmu_phase.phase_elapsed_ticks = 0;
     g_fdwic_submit_pmu_phase.phase_begin_tick = 0;
+    g_fdwic_submit_pmu_phase.phase_excluded_atomic_ticks = 0;
     g_fdwic_submit_pmu_phase.begin_reads = 0;
     g_fdwic_submit_pmu_phase.end_reads = 0;
     g_fdwic_submit_pmu_phase.max_shadow_request_chunk = 0;
@@ -209,8 +233,8 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_reset_local() {
     g_fdwic_submit_pmu_phase.status = 0;
     g_fdwic_submit_pmu_phase.armed = false;
     g_fdwic_submit_pmu_phase.boundary_error = false;
-#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 7
-    g_fdwic_submit_pmu_efdrain_excluded_kernel_calls = 0;
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID != 0
+    g_fdwic_submit_pmu_excluded_kernel_calls = 0;
 #endif
 }
 
@@ -259,9 +283,13 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_phase_begin() {
 #if PTO_FDWIC_SUBMIT_PMU_PHASE_ID != 0
     if constexpr (Phase == kFdwicSubmitPmuCompiledPhase) {
         FdwicSubmitPmuPhaseAccumulator &phase = g_fdwic_submit_pmu_phase;
-        if (!g_fdwic_submit_pmu_started || g_fdwic_submit_pmu_stopped || g_fdwic_submit_pmu_phase_core == nullptr ||
-            g_fdwic_submit_pmu_reg_base == 0 || phase.armed) {
+        if (!g_fdwic_submit_pmu_started || g_fdwic_submit_pmu_stopped || !g_fdwic_submit_pmu_gate_running ||
+            g_fdwic_submit_pmu_phase_core == nullptr || g_fdwic_submit_pmu_reg_base == 0 || phase.armed ||
+            g_fdwic_submit_pmu_return_ready_atomic_active) {
             phase.boundary_error = true;
+            if (g_fdwic_submit_pmu_return_ready_atomic_active) {
+                g_fdwic_submit_pmu_return_ready_atomic_time_error = true;
+            }
             return;
         }
         const FdwicSubmitPmuShadowSnapshot sample = fdwic_submit_pmu_phase_read_shadow_counters();
@@ -271,6 +299,7 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_phase_begin() {
         }
         ++phase.begin_reads;
         phase.armed = true;
+        phase.phase_excluded_atomic_ticks = 0;
         // 起点位于 begin read-clear/bookkeeping 之后。empty-bracket wrapper
         // 会在外层另行覆盖为完整 begin/end 对的经验耗时。
         phase.phase_begin_tick = get_sys_cnt_aicore();
@@ -284,13 +313,23 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_phase_end() {
     if constexpr (Phase == kFdwicSubmitPmuCompiledPhase) {
         const uint64_t phase_end_tick = get_sys_cnt_aicore();
         FdwicSubmitPmuPhaseAccumulator &phase = g_fdwic_submit_pmu_phase;
-        if (!g_fdwic_submit_pmu_started || g_fdwic_submit_pmu_stopped || g_fdwic_submit_pmu_phase_core == nullptr ||
-            g_fdwic_submit_pmu_reg_base == 0 || !phase.armed || phase_end_tick < phase.phase_begin_tick ||
-            phase.phase_elapsed_ticks > UINT64_MAX - (phase_end_tick - phase.phase_begin_tick)) {
+        if (!g_fdwic_submit_pmu_started || g_fdwic_submit_pmu_stopped || !g_fdwic_submit_pmu_gate_running ||
+            g_fdwic_submit_pmu_phase_core == nullptr || g_fdwic_submit_pmu_reg_base == 0 || !phase.armed ||
+            phase_end_tick < phase.phase_begin_tick || g_fdwic_submit_pmu_return_ready_atomic_active) {
             phase.boundary_error = true;
+            if (g_fdwic_submit_pmu_return_ready_atomic_active) {
+                g_fdwic_submit_pmu_return_ready_atomic_time_error = true;
+            }
             return;
         }
-        phase.phase_elapsed_ticks += phase_end_tick - phase.phase_begin_tick;
+        const uint64_t raw_phase_ticks = phase_end_tick - phase.phase_begin_tick;
+        if (phase.phase_excluded_atomic_ticks > raw_phase_ticks ||
+            phase.phase_elapsed_ticks > UINT64_MAX - (raw_phase_ticks - phase.phase_excluded_atomic_ticks)) {
+            phase.boundary_error = true;
+            g_fdwic_submit_pmu_return_ready_atomic_time_error = true;
+            return;
+        }
+        phase.phase_elapsed_ticks += raw_phase_ticks - phase.phase_excluded_atomic_ticks;
         // 终点位于两次 read-clear 之前，阶段时间不包含 end 读取开销；end
         // segment 同时进入完整 shadow 软件重建与局部阶段观测值。begin/end
         // 两侧还存在少量观测 bookkeeping，不能把它解释成原业务事件数的
@@ -303,50 +342,166 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_phase_end() {
         ++phase.end_reads;
         phase.armed = false;
         phase.phase_begin_tick = 0;
+        phase.phase_excluded_atomic_ticks = 0;
     }
 #endif
 }
 
-// execute_slot() 也会被背压等待和 FinalDrain 调用。只有 EfDrainControl
-// outer phase 当前处于 armed 状态时才真正 pause；返回 token 由紧邻 kernel
-// call 后的 resume 消费，避免把 EfDrain 之外的 Kernel 混入该 profile。
-PTO_DEVICE_FUNC inline bool fdwic_submit_pmu_efdrain_kernel_pause() {
-#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 7
-    FdwicSubmitPmuPhaseAccumulator &phase = g_fdwic_submit_pmu_phase;
-    if (!phase.armed) return false;
-    const uint32_t old_end_reads = phase.end_reads;
-    fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::EfDrainControl>();
-    if (phase.boundary_error || phase.armed || phase.end_reads != old_end_reads + 1U) {
-        phase.boundary_error = true;
+constexpr uint32_t kFdwicSubmitPmuKernelTokenWhole = 1U << 0;
+constexpr uint32_t kFdwicSubmitPmuKernelTokenPhase = 1U << 1;
+
+// scalar 分母只累计 gate 真正运行的离散片段。调用点位于 stop 之前、start
+// 之后，因此 linked Kernel 和两侧 PIPE_ALL 门控成本都不进入该 SYS_CNT 值。
+PTO_DEVICE_FUNC inline bool fdwic_submit_pmu_close_scalar_segment() {
+    const uint64_t segment_end = get_sys_cnt_aicore();
+    if (!g_fdwic_submit_pmu_gate_running || g_fdwic_submit_pmu_scalar_segment_begin_tick == 0 ||
+        segment_end < g_fdwic_submit_pmu_scalar_segment_begin_tick) {
+        g_fdwic_submit_pmu_gate_error = true;
+        g_fdwic_submit_pmu_scalar_segment_begin_tick = 0;
+        g_fdwic_submit_pmu_scalar_segment_excluded_atomic_ticks = 0;
         return false;
     }
-    if (g_fdwic_submit_pmu_efdrain_excluded_kernel_calls == UINT32_MAX) {
-        phase.boundary_error = true;
-    } else {
-        ++g_fdwic_submit_pmu_efdrain_excluded_kernel_calls;
+    const uint64_t raw_segment_ticks = segment_end - g_fdwic_submit_pmu_scalar_segment_begin_tick;
+    if (g_fdwic_submit_pmu_return_ready_atomic_active ||
+        g_fdwic_submit_pmu_scalar_segment_excluded_atomic_ticks > raw_segment_ticks ||
+        g_fdwic_submit_pmu_scalar_elapsed_ticks >
+            UINT64_MAX - (raw_segment_ticks - g_fdwic_submit_pmu_scalar_segment_excluded_atomic_ticks)) {
+        g_fdwic_submit_pmu_return_ready_atomic_time_error = true;
+        g_fdwic_submit_pmu_scalar_segment_begin_tick = 0;
+        g_fdwic_submit_pmu_scalar_segment_excluded_atomic_ticks = 0;
+        return false;
     }
+    g_fdwic_submit_pmu_scalar_elapsed_ticks +=
+        raw_segment_ticks - g_fdwic_submit_pmu_scalar_segment_excluded_atomic_ticks;
+    g_fdwic_submit_pmu_scalar_segment_begin_tick = 0;
+    g_fdwic_submit_pmu_scalar_segment_excluded_atomic_ticks = 0;
     return true;
-#else
-    return false;
-#endif
 }
 
-PTO_DEVICE_FUNC inline void fdwic_submit_pmu_efdrain_kernel_resume(bool paused) {
-#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 7
-    if (!paused) return;
+// return-ready atomic 不停 PMU gate：begin 只在有效 scalar segment 内保存
+// SYS_CNT，end 由 atomic wrapper 在消费返回值的数据依赖 SYS_CNT 后回填。
+// 这样只从时间分母扣除本地完成等待，不引入 PIPE_ALL，也不声称跨核可见。
+constexpr uint32_t kFdwicSubmitPmuReturnReadyAtomicToken = 1U;
+
+PTO_DEVICE_FUNC inline uint32_t fdwic_submit_pmu_return_ready_atomic_begin() {
+    if (!g_fdwic_submit_pmu_started || g_fdwic_submit_pmu_stopped || !g_fdwic_submit_pmu_gate_running) return 0;
+    // 嵌套 wrapper 复用外层 bracket：内层拿到 token=0，end(0) 也完全
+    // no-op。只有没有外层可覆盖却缺失有效 scalar segment 才算异常。
+    if (g_fdwic_submit_pmu_return_ready_atomic_active) return 0;
+    if (g_fdwic_submit_pmu_scalar_segment_begin_tick == 0) {
+        g_fdwic_submit_pmu_return_ready_atomic_time_error = true;
+        return 0;
+    }
+    g_fdwic_submit_pmu_return_ready_atomic_begin_tick = get_sys_cnt_aicore();
+    g_fdwic_submit_pmu_return_ready_atomic_active = true;
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID != 0
+    g_fdwic_submit_pmu_return_ready_atomic_phase_armed = g_fdwic_submit_pmu_phase.armed;
+#else
+    g_fdwic_submit_pmu_return_ready_atomic_phase_armed = false;
+#endif
+    return kFdwicSubmitPmuReturnReadyAtomicToken;
+}
+
+PTO_DEVICE_FUNC inline void fdwic_submit_pmu_return_ready_atomic_end(uint32_t token, uint64_t dependency_end_tick) {
+    if (token == 0) return;
+    if (token != kFdwicSubmitPmuReturnReadyAtomicToken || !g_fdwic_submit_pmu_started || g_fdwic_submit_pmu_stopped ||
+        !g_fdwic_submit_pmu_gate_running || !g_fdwic_submit_pmu_return_ready_atomic_active ||
+        dependency_end_tick < g_fdwic_submit_pmu_return_ready_atomic_begin_tick) {
+        g_fdwic_submit_pmu_return_ready_atomic_time_error = true;
+        g_fdwic_submit_pmu_return_ready_atomic_active = false;
+        g_fdwic_submit_pmu_return_ready_atomic_begin_tick = 0;
+        g_fdwic_submit_pmu_return_ready_atomic_phase_armed = false;
+        return;
+    }
+
+    const uint64_t elapsed = dependency_end_tick - g_fdwic_submit_pmu_return_ready_atomic_begin_tick;
+    bool valid = g_fdwic_submit_pmu_scalar_segment_excluded_atomic_ticks <= UINT64_MAX - elapsed;
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID != 0
+    FdwicSubmitPmuPhaseAccumulator &phase = g_fdwic_submit_pmu_phase;
+    valid = valid && phase.armed == g_fdwic_submit_pmu_return_ready_atomic_phase_armed;
+    if (valid && phase.armed) {
+        valid = phase.phase_excluded_atomic_ticks <= UINT64_MAX - elapsed;
+    }
+#endif
+    if (!valid) {
+        g_fdwic_submit_pmu_return_ready_atomic_time_error = true;
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID != 0
+        phase.boundary_error = true;
+#endif
+    } else {
+        g_fdwic_submit_pmu_scalar_segment_excluded_atomic_ticks += elapsed;
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID != 0
+        if (phase.armed) phase.phase_excluded_atomic_ticks += elapsed;
+#endif
+        g_fdwic_submit_pmu_return_ready_atomic_seen = true;
+    }
+    g_fdwic_submit_pmu_return_ready_atomic_active = false;
+    g_fdwic_submit_pmu_return_ready_atomic_begin_tick = 0;
+    g_fdwic_submit_pmu_return_ready_atomic_phase_armed = false;
+}
+
+// execute_slot() 也会被背压等待和 FinalDrain 调用。窗口外返回 0，不触碰
+// PMU；窗口内每个真实 linked Kernel 都先暂停 whole gate。若选中 phase 正在
+// armed，则先将其闭合并把额外边界数编码进 token，供紧邻调用后的 resume 恢复。
+PTO_DEVICE_FUNC inline uint32_t fdwic_submit_pmu_linked_kernel_pause() {
+    if (!g_fdwic_submit_pmu_started || g_fdwic_submit_pmu_stopped) return 0;
+    if (!g_fdwic_submit_pmu_gate_running) {
+        // 不允许嵌套 pause 或丢失 resume 后继续操作 gate。外层若仍持有 token，
+        // 保持关窗可确保 Kernel 不污染计数；本轮最终由 core status 拒绝。
+        g_fdwic_submit_pmu_gate_error = true;
+        return 0;
+    }
+
+    uint32_t token = kFdwicSubmitPmuKernelTokenWhole;
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID != 0
     FdwicSubmitPmuPhaseAccumulator &phase = g_fdwic_submit_pmu_phase;
     if (phase.armed) {
-        phase.boundary_error = true;
+        const uint32_t old_end_reads = phase.end_reads;
+        fdwic_submit_pmu_phase_end<kFdwicSubmitPmuCompiledPhase>();
+        if (phase.boundary_error || phase.armed || phase.end_reads != old_end_reads + 1U ||
+            g_fdwic_submit_pmu_excluded_kernel_calls == UINT32_MAX) {
+            phase.boundary_error = true;
+        } else {
+            ++g_fdwic_submit_pmu_excluded_kernel_calls;
+            token |= kFdwicSubmitPmuKernelTokenPhase;
+        }
+    }
+#endif
+
+    (void)fdwic_submit_pmu_close_scalar_segment();
+    bisheng::cce::metrics_prof_stop();
+    g_fdwic_submit_pmu_gate_running = false;
+    return token;
+}
+
+PTO_DEVICE_FUNC inline void fdwic_submit_pmu_linked_kernel_resume(uint32_t token) {
+    if (token == 0) return;
+    if ((token & kFdwicSubmitPmuKernelTokenWhole) == 0 || !g_fdwic_submit_pmu_started || g_fdwic_submit_pmu_stopped ||
+        g_fdwic_submit_pmu_gate_running) {
+        g_fdwic_submit_pmu_gate_error = true;
         return;
     }
-    const uint32_t old_begin_reads = phase.begin_reads;
-    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::EfDrainControl>();
-    if (phase.boundary_error || !phase.armed || phase.begin_reads != old_begin_reads + 1U) {
-        phase.boundary_error = true;
-        return;
+
+    bisheng::cce::metrics_prof_start();
+    g_fdwic_submit_pmu_gate_running = true;
+    g_fdwic_submit_pmu_scalar_segment_begin_tick = get_sys_cnt_aicore();
+    g_fdwic_submit_pmu_scalar_segment_excluded_atomic_ticks = 0;
+
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID != 0
+    if ((token & kFdwicSubmitPmuKernelTokenPhase) != 0) {
+        FdwicSubmitPmuPhaseAccumulator &phase = g_fdwic_submit_pmu_phase;
+        if (phase.armed) {
+            phase.boundary_error = true;
+            return;
+        }
+        const uint32_t old_begin_reads = phase.begin_reads;
+        fdwic_submit_pmu_phase_begin<kFdwicSubmitPmuCompiledPhase>();
+        if (phase.boundary_error || !phase.armed || phase.begin_reads != old_begin_reads + 1U) {
+            phase.boundary_error = true;
+        }
     }
 #else
-    (void)paused;
+    if ((token & kFdwicSubmitPmuKernelTokenPhase) != 0) g_fdwic_submit_pmu_gate_error = true;
 #endif
 }
 
@@ -374,7 +529,8 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_empty_bracket_calibrate() {
 }
 
 PTO_DEVICE_FUNC inline void fdwic_submit_pmu_submit_begin(int32_t task_id) {
-    constexpr uint32_t kReadyMask = (1U << 8) - 1U;
+    constexpr uint32_t kReadyMask =
+        ((1U << 8) - 1U) | kFdwicSubmitPmuCnt0SelectorValid | kFdwicSubmitPmuCnt1SelectorValid;
 #if PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 6
     // 非首个 Submit 已完成 dist_submit_begin()，在统一 begin hook 关闭
     // 上一次 tail 打开的跨 Submit 区间。
@@ -390,6 +546,9 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_submit_begin(int32_t task_id) {
     // window 外，不能把该 tick 区间与另一 ELF 的绝对时间直接相减。
     g_fdwic_submit_pmu_start_tick = get_sys_cnt_aicore();
     bisheng::cce::metrics_prof_start();
+    g_fdwic_submit_pmu_gate_running = true;
+    g_fdwic_submit_pmu_scalar_segment_begin_tick = get_sys_cnt_aicore();
+    g_fdwic_submit_pmu_scalar_segment_excluded_atomic_ticks = 0;
     g_fdwic_submit_pmu_started = true;
     g_fdwic_submit_pmu_status |= kFdwicSubmitPmuWindowStarted;
 }
@@ -408,7 +567,14 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_submit_end(int32_t task_id) {
     }
 #endif
     if (submit_ordinal != g_fdwic_submit_pmu_expected_submits) return;
-    bisheng::cce::metrics_prof_stop();
+    const bool gate_was_running = g_fdwic_submit_pmu_gate_running;
+    const bool scalar_segment_closed = gate_was_running && fdwic_submit_pmu_close_scalar_segment();
+    if (gate_was_running) {
+        bisheng::cce::metrics_prof_stop();
+    } else {
+        g_fdwic_submit_pmu_gate_error = true;
+    }
+    g_fdwic_submit_pmu_gate_running = false;
     g_fdwic_submit_pmu_end_tick = get_sys_cnt_aicore();
     fdwic_submit_pmu_read_counters();
 #if PTO_FDWIC_SUBMIT_PMU_PHASE_ID != 0
@@ -416,64 +582,83 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_submit_end(int32_t task_id) {
     if (!phase.boundary_error && !phase.armed && phase.begin_reads == phase.end_reads) {
         phase.status |= kFdwicSubmitPmuPhaseBoundaryBalanced;
     }
-#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 7
     const uint64_t expected_boundary_reads = fdwic_submit_pmu_expected_phase_boundary_reads(
-        kFdwicSubmitPmuCompiledPhase, g_fdwic_submit_pmu_expected_submits,
-        g_fdwic_submit_pmu_efdrain_excluded_kernel_calls
+        kFdwicSubmitPmuCompiledPhase, g_fdwic_submit_pmu_expected_submits, g_fdwic_submit_pmu_excluded_kernel_calls
     );
-    if (phase.begin_reads == expected_boundary_reads && phase.end_reads == expected_boundary_reads) {
-        phase.status |= kFdwicSubmitPmuPhaseShapeValid;
-    }
-#else
-    const uint32_t expected_phase_calls =
-        fdwic_submit_pmu_expected_phase_calls(kFdwicSubmitPmuCompiledPhase, g_fdwic_submit_pmu_expected_submits);
-    const bool shape_valid = fdwic_submit_pmu_phase_has_dynamic_calls(kFdwicSubmitPmuCompiledPhase) ?
-                                 phase.begin_reads == phase.end_reads &&
-                                     phase.begin_reads <= fdwic_submit_pmu_dynamic_calls_max_per_core(
-                                                              kFdwicSubmitPmuCompiledPhase,
-                                                              g_fdwic_submit_pmu_expected_submits
-                                                          ) :
-                                 phase.begin_reads == expected_phase_calls && phase.end_reads == expected_phase_calls;
+    const bool dynamic_calls = fdwic_submit_pmu_phase_has_dynamic_calls(kFdwicSubmitPmuCompiledPhase);
+    const bool outer_reads_valid = phase.begin_reads >= g_fdwic_submit_pmu_excluded_kernel_calls &&
+                                   phase.end_reads >= g_fdwic_submit_pmu_excluded_kernel_calls;
+    const uint64_t outer_begin_calls =
+        outer_reads_valid ? phase.begin_reads - g_fdwic_submit_pmu_excluded_kernel_calls : UINT64_MAX;
+    const uint64_t outer_end_calls =
+        outer_reads_valid ? phase.end_reads - g_fdwic_submit_pmu_excluded_kernel_calls : UINT64_MAX;
+    const bool shape_valid =
+        dynamic_calls ? outer_reads_valid && outer_begin_calls == outer_end_calls &&
+                            outer_begin_calls <= fdwic_submit_pmu_dynamic_calls_max_per_core(
+                                                     kFdwicSubmitPmuCompiledPhase, g_fdwic_submit_pmu_expected_submits
+                                                 ) :
+                        phase.begin_reads == expected_boundary_reads && phase.end_reads == expected_boundary_reads;
     if (shape_valid) {
         phase.status |= kFdwicSubmitPmuPhaseShapeValid;
     }
-#endif
     if (phase.phase_requests <= phase.shadow_requests && phase.phase_misses <= phase.shadow_misses &&
         phase.shadow_misses <= phase.shadow_requests && phase.shadow_requests <= g_fdwic_submit_pmu_icache_requests &&
         phase.shadow_misses <= g_fdwic_submit_pmu_icache_misses) {
         phase.status |= kFdwicSubmitPmuPhaseValuesOrdered;
     }
+    const uint32_t excluded_kernel_calls = g_fdwic_submit_pmu_excluded_kernel_calls;
     const bool zero_call_dynamic = fdwic_submit_pmu_phase_has_dynamic_calls(kFdwicSubmitPmuCompiledPhase) &&
-                                   phase.begin_reads == 0 && phase.end_reads == 0;
-    if ((zero_call_dynamic && phase.phase_elapsed_ticks == 0) ||
-        (!zero_call_dynamic && phase.phase_elapsed_ticks != 0 &&
-         phase.phase_elapsed_ticks <= g_fdwic_submit_pmu_end_tick - g_fdwic_submit_pmu_start_tick)) {
+                                   phase.begin_reads == excluded_kernel_calls &&
+                                   phase.end_reads == excluded_kernel_calls;
+    if (!g_fdwic_submit_pmu_return_ready_atomic_time_error &&
+        ((zero_call_dynamic && phase.phase_elapsed_ticks == 0) ||
+         (!zero_call_dynamic && phase.phase_elapsed_ticks != 0 &&
+          phase.phase_elapsed_ticks <= g_fdwic_submit_pmu_scalar_elapsed_ticks))) {
         phase.status |= kFdwicSubmitPmuPhaseTimeValid;
     }
 #endif
     g_fdwic_submit_pmu_stopped = true;
     g_fdwic_submit_pmu_status |= kFdwicSubmitPmuWindowStopped;
+    if (!g_fdwic_submit_pmu_gate_error && gate_was_running) {
+        g_fdwic_submit_pmu_status |= kFdwicSubmitPmuLinkedKernelGateBalanced;
+    }
+    if (!g_fdwic_submit_pmu_gate_error && !g_fdwic_submit_pmu_return_ready_atomic_time_error && scalar_segment_closed &&
+        g_fdwic_submit_pmu_scalar_elapsed_ticks != 0 && g_fdwic_submit_pmu_end_tick >= g_fdwic_submit_pmu_start_tick &&
+        g_fdwic_submit_pmu_scalar_elapsed_ticks <= g_fdwic_submit_pmu_end_tick - g_fdwic_submit_pmu_start_tick) {
+        g_fdwic_submit_pmu_status |= kFdwicSubmitPmuScalarElapsedValid;
+    }
+    bool return_ready_atomic_time_closed =
+        g_fdwic_submit_pmu_return_ready_atomic_seen && !g_fdwic_submit_pmu_return_ready_atomic_time_error &&
+        !g_fdwic_submit_pmu_return_ready_atomic_active && g_fdwic_submit_pmu_return_ready_atomic_begin_tick == 0 &&
+        g_fdwic_submit_pmu_scalar_segment_excluded_atomic_ticks == 0;
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID != 0
+    return_ready_atomic_time_closed =
+        return_ready_atomic_time_closed && g_fdwic_submit_pmu_phase.phase_excluded_atomic_ticks == 0;
+#endif
+    if (return_ready_atomic_time_closed) {
+        g_fdwic_submit_pmu_status |= kFdwicSubmitPmuReturnReadyAtomicTimeValid;
+    }
     if (g_fdwic_submit_pmu_total_cycles != 0) {
         g_fdwic_submit_pmu_status |= kFdwicSubmitPmuTotalNonzero;
     }
 }
 
 PTO_DEVICE_FUNC inline void fdwic_submit_pmu_flush(__gm__ DistCore *self) {
-    if (g_fdwic_submit_pmu_started && !g_fdwic_submit_pmu_stopped) {
+    if (g_fdwic_submit_pmu_started && !g_fdwic_submit_pmu_stopped && g_fdwic_submit_pmu_gate_running) {
         // 只负责关闭遗留 gate，故意不伪造 WindowStopped。host 会因闭合失败
         // 拒绝正式 raw；FinalDrain 也不会被包装成有效 Submit 样本。
         bisheng::cce::metrics_prof_stop();
+        g_fdwic_submit_pmu_gate_running = false;
     }
     __gm__ FdwicSubmitPmuCoreData *core = g_fdwic_submit_pmu_core;
     if (core == nullptr || self == nullptr) return;
     core->first_submit_start_tick = g_fdwic_submit_pmu_start_tick;
     core->last_submit_end_tick = g_fdwic_submit_pmu_end_tick;
     core->total_cycles = g_fdwic_submit_pmu_total_cycles;
+    core->scalar_submit_elapsed_ticks = g_fdwic_submit_pmu_scalar_elapsed_ticks;
     core->scalar_busy = g_fdwic_submit_pmu_scalar_busy;
     core->icache_requests = g_fdwic_submit_pmu_icache_requests;
     core->icache_misses = g_fdwic_submit_pmu_icache_misses;
-    core->shadow_icache_requests = g_fdwic_submit_pmu_shadow_requests;
-    core->shadow_icache_misses = g_fdwic_submit_pmu_shadow_misses;
     core->submit_count = static_cast<uint32_t>(self->local_index);
     core->expected_submit_count = g_fdwic_submit_pmu_expected_submits;
     core->logical_core_id = static_cast<uint16_t>(self->core_idx);
@@ -495,14 +680,10 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_flush(__gm__ DistCore *self) {
     phase_core->max_shadow_request_chunk = phase.max_shadow_request_chunk;
     phase_core->max_shadow_miss_chunk = phase.max_shadow_miss_chunk;
     phase_core->status = phase.status;
-#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID == 7
-    phase_core->reserved[0] = g_fdwic_submit_pmu_efdrain_excluded_kernel_calls;
-    for (uint32_t index = 1; index < 4U; ++index)
-        phase_core->reserved[index] = 0;
-#else
-    for (uint32_t index = 0; index < 4U; ++index)
-        phase_core->reserved[index] = 0;
-#endif
+    phase_core->reserved[0] = g_fdwic_submit_pmu_excluded_kernel_calls;
+    phase_core->reserved[1] = static_cast<uint32_t>(phase.shadow_requests);
+    phase_core->reserved[2] = static_cast<uint32_t>(phase.shadow_misses);
+    phase_core->reserved[3] = 0;
     dist_aicore_flush_region(phase_core, sizeof(FdwicSubmitPmuPhaseCoreData));
 #endif
 }
@@ -522,8 +703,10 @@ PTO_DEVICE_FUNC inline void fdwic_submit_pmu_phase_begin() {}
 template <FdwicSubmitPmuPhase Phase>
 PTO_DEVICE_FUNC inline void fdwic_submit_pmu_phase_end() {}
 PTO_DEVICE_FUNC inline void fdwic_submit_pmu_empty_bracket_calibrate() {}
-PTO_DEVICE_FUNC inline bool fdwic_submit_pmu_efdrain_kernel_pause() { return false; }
-PTO_DEVICE_FUNC inline void fdwic_submit_pmu_efdrain_kernel_resume(bool) {}
+PTO_DEVICE_FUNC inline uint32_t fdwic_submit_pmu_linked_kernel_pause() { return 0; }
+PTO_DEVICE_FUNC inline void fdwic_submit_pmu_linked_kernel_resume(uint32_t) {}
+PTO_DEVICE_FUNC inline uint32_t fdwic_submit_pmu_return_ready_atomic_begin() { return 0; }
+PTO_DEVICE_FUNC inline void fdwic_submit_pmu_return_ready_atomic_end(uint32_t, uint64_t) {}
 }  // namespace
 
 #endif

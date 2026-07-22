@@ -15,9 +15,21 @@ standalone 当前保留两类正式观察构建：
 
 ### 1.1 真实 PA `submit-pmu-none`
 
+> **2026-07-22 ABI/schema v2 口径提示**：当前设备 ABI 与 raw JSON schema 已同步升级为
+> `fdwic-submit-pmu-v2`。所有真实 PA submit-PMU profile
+> 都在 linked vector/cube Kernel 调用前后统一门控，完整窗的 PMU counter 与
+> `scalar_submit_elapsed_ticks`、以及命中的 phase 时间都排除 Kernel 整段。仅消费返回值的
+> return-ready/result-used atomic 依赖区间从 Scalar SYS 时间分母及命中的 phase 时间中扣除，
+> 不停 PMU；source-issue atomic 保留。因而 PMU total、scalar busy、I-cache request/miss
+> 仍包含 atomic 指令及最小时间 hook 的指令事件。`wall - scalar_submit_elapsed_ticks` 同时混有
+> linked Kernel、被扣除的 return-ready atomic 时间和门控边界间隙，不能命名为纯 Kernel 时间。
+> 本章现存 v1 HTML 与数值只作历史记录；采用 v2 做新分析时必须重新上板采集，不能与旧结果
+> 合并、相减或拼接比例。
+
 真实 PA 已建立第三条独立证据链 `--fdwic-profile submit-pmu-none`。它不是 standalone 的 `submit-pmu` 产物，也不与泳道 ELF 共用 I-cache 结论：
 
-- 编译期固定 `PTO_FDWIC_TRACE_ENABLED=0`，去除普通泳道和逐 atomic 观察；
+- 编译期固定 `PTO_FDWIC_TRACE_ENABLED=0`，去除普通泳道和逐 atomic 泳道记录；ABI v2 仍保留
+  return-ready atomic 的最小 SYS 时间扣除 hook，该 hook 不生成 atomic 泳道记录，也不停止 PMU；
 - 去除通用逐 task PMU ring，只保留每核首个 Submit 到末个 Submit 的一次 gate；
 - CNT2 采集 scalar busy，CNT6/CNT7 采集 primary request/miss，CNT8/CNT5 做逐核 shadow 复核；
 - AICPU owner 在 96 个物理子核上保存、配置、读回并恢复 PMU 寄存器；
@@ -55,7 +67,7 @@ outputs/TestPagedAttentionUnroll_Case1_20260721_003335/
 
 #### 1.1.1 HTML 的逐核时间与 PMU 加工口径
 
-2026-07-21 的报告增强保持 `fdwic-submit-pmu-v1`、C++ producer 和设备 ABI 不变，只在通过全部 raw 门禁后的 Python 加工层追加三个逐核派生组。ALL/AIC/AIV 卡片现在同时展示：
+下述 2026-07-21 报告增强在**当时的 v1 producer/设备 ABI**上只改了 Python 加工层；“ABI 不变”仅描述那次历史提交，不适用于 2026-07-22 的 ABI v2。该版 ALL/AIC/AIV 卡片展示：
 
 - `Submit SYS_CNT/core`：每核 `last_submit_end_tick-first_submit_start_tick` 的 mean/min/max，按 1 ns/tick 显示为 us；它不是顶部“最早核起点到最晚核终点”的跨核全局时间范围；
 - PMU total、Scalar busy 与非 Scalar-busy 残余的 cycles mean/min/max，以及按 ALL/AIC/AIV 各自 1.649844/1.650062/1.649731 cycles/ns 换算的等效时间范围；
@@ -464,7 +476,7 @@ configuration.phase.time_semantics
                                 = inner_sys_cnt_between_boundary_observers
 ```
 
-公共二进制协议中的 mode 为 `6`，phase enum 为 `5`，两者不能混用。该构建仍复用 12,416 B 设备 ABI：128 B header、`96 × 64 B` whole record 和 `96 × 64 B` phase record；没有新增逐调用记录或 task-kind 字段。当前缓存身份为 `aicore-extra/32c26e06ad76d186`，最终 `aicore_kernel.o` 的 SHA256 为 `8264a6afd39815c825e0630dcbb69d9a3492d2e26989a61136f06d5e371fb750`，`.text` 为 150,608 B。最终 ELF 含 Submit PMU 整窗与 phase reader，且不含 perf-clock、普通泳道、逐 atomic 或通用逐 task PMU 符号。raw 当前不内嵌 ELF SHA，因此该 SHA 只证明最终缓存构建身份，不把历史四轮产物表述为逐字节留档。
+公共二进制协议中的 mode 为 `6`，phase enum 为 `5`，两者不能混用。该构建仍复用 12,416 B 设备容量：128 B header、`96 × 64 B` whole record 和 `96 × 64 B` phase record；没有新增逐调用记录或 task-kind 字段。当前缓存身份为 `aicore-extra/32c26e06ad76d186`，最终 `aicore_kernel.o` 的 SHA256 为 `8264a6afd39815c825e0630dcbb69d9a3492d2e26989a61136f06d5e371fb750`，`.text` 为 150,608 B。该历史 v1 ELF 含 Submit PMU 整窗与 phase reader，且不含 perf-clock、普通泳道、逐 atomic 泳道记录或通用逐 task PMU 符号；这不能外推为 ABI v2 也删除了 return-ready atomic 的最小 SYS 时间 hook。raw 当前不内嵌 ELF SHA，因此该 SHA 只证明最终缓存构建身份，不把历史四轮产物表述为逐字节留档。
 
 #### 三个真实挂点与调用体边界
 
@@ -671,11 +683,11 @@ phase_begin_reads = phase_end_reads = N + K
 报告中的 phase per-call 分母 = N
 ```
 
-`K` 只保存在既有 phase record 的 `reserved[0]`，`reserved[1..3]` 必须为零；专属 block-local 计数只在 phase 7 编译。每核 phase record 仍为 64 B，设备总容量仍为 `128 + 96 × 64 + 96 × 64 = 12,416 B`，没有增加逐 Submit、逐 Kernel 或逐事件 raw。正式结果还必须同时闭合 96 核 phase boundary/shape/value/time/status 和 `phase_kernel_exclusion_closed_records=96`。
+历史 v1 中 `K` 保存在 phase record 的 `reserved[0]`，当时 `reserved[1..3]` 为零。ABI v2 继续用 `reserved[0]` 保存排除次数，同时用 `reserved[1]/[2]` 发布重建的 shadow request/miss，仅 `reserved[3]` 必须为零；每核 phase record 仍为 64 B，没有增加逐 Submit、逐 Kernel 或逐事件 raw。正式结果还必须同时闭合 96 核 phase boundary/shape/value/time/status 和 `phase_kernel_exclusion_closed_records=96`。
 
 #### 观察效应与使用方式
 
-每排除一次 Kernel，会额外执行一次 pause-end 和一次 resume-begin，也就是四次 shadow counter MMIO 读取、两次 `SYS_CNT` 读取和少量 bookkeeping。linked Kernel 仍进入完整 Submit primary 以及 shadow whole 的软件重建，但不进入局部 phase 的 elapsed/request/miss。这个切分会改变诊断 ELF 布局和多核到达，只能在本 ELF 内分析同次采集的占比和方向；不能与 `none`、泳道或 perf-clock 绝对相减，也不能机械扣除 empty-bracket 后声称零观察开销下的业务净值。
+每排除一次 Kernel，phase 外层会多一对 pause/resume 边界及相应 bookkeeping。ABI v2 的统一 gate 使 linked Kernel 不进入完整 Submit primary/shadow、`scalar_submit_elapsed_ticks`，也不进入命中的 phase elapsed/request/miss；return-ready atomic 则只扣 SYS 时间，不能把两种排除混为一谈。这个切分会改变诊断 ELF 布局和多核到达，只能在本 ELF 内分析同次采集的占比和方向；不能与 `none`、泳道或 perf-clock 绝对相减，也不能机械扣除 empty-bracket 后声称零观察开销下的业务净值。
 
 运行命令沿用其他真实 phase，只替换 profile：
 
@@ -816,6 +828,67 @@ Case1 同一 ELF 内的观察结果为：
 
 Case1 三件套 raw/provenance/HTML 的 SHA256 分别为 `0df28acdd7a429b92736447d25344e697cced0bb486de6b26518ce784c92a563`、`9d2d907d3225236e0c1645fe892a4030ed9929027e8a644983cf47a8068e75ab`、`48d5cb8f0781eedd43f55e437fbe340d68428531416f18da1d8dde8a19f1ef50`。
 
+### 1.11 真实 PA `submit-pmu-winner-build-control`
+
+WinnerBuild 只在 Kernel winner 路径执行。该 profile 在 Register 结束后、进入 winner 尾段前打开，
+在 `dist_submit_build_winner_task()` 返回后关闭，对应完整 WinnerBuild 业务边界：
+
+```text
+capture.mode                    = submit-pmu-winner-build-control
+configuration.phase.id          = 10
+configuration.phase.name        = winner-build-control
+configuration.phase.boundary    = winner_build_begin_to_end_excluding_linked_kernel_calls
+configuration.phase.call_shape  = dynamic_balanced
+```
+
+设每核 Submit 数为 `N=5B`。它与 Fanin 使用同一组 Kernel winner 动态公式，但逐核不能伪造固定次数：
+
+```text
+逐核：outer_calls = phase_begin_reads - phase_excluded_kernel_calls
+      outer_calls = phase_end_reads - phase_excluded_kernel_calls
+      两侧相等，允许为 0，且不超过 2B
+全局：Σouter_calls = 4B
+AIC： Σouter_calls = 2B
+AIV： Σouter_calls = 2B
+```
+
+WinnerBuild 内回收执行的 linked vector/cube Kernel 通过统一 gate 从 phase 时间和 PMU counter
+同时排除，`phase_excluded_kernel_calls` 记录相应的 `K`。消费返回值的 return-ready/result-used
+atomic 依赖区间只从 `scalar_submit_elapsed_ticks` 及命中的 phase elapsed 扣除，不停止 PMU；
+I-cache/PMU counter 仍包含 atomic 与最小 hook 的指令事件，source-issue atomic 也继续保留。
+
+B1 结构回归位于：
+
+```text
+outputs/TestPagedAttentionUnroll_CaseB1_20260722_211158/
+```
+
+该轮业务调用严格闭合为 `4=2(AIC)+2(AIV)`，排除 linked Kernel 为 `0`。96/96 记录的
+owner/selector/status、linked-Kernel gate、return-ready atomic 时间、phase boundary/shape/value/time、
+shadow-primary bounded 和动态全局调用数全部闭合；它只提供动态 shape 的上板结构证据。
+
+完整 Case1 位于：
+
+```text
+outputs/TestPagedAttentionUnroll_Case1_20260722_211624/
+```
+
+该轮业务调用为 `1024=512(AIC)+512(AIV)`；phase 内共排除 53 次 linked Kernel，全部落在
+AIC，AIV 为 0。严格 producer/consumer/provenance 门禁与 B1 相同，均已闭合。同一 ELF 内的
+直接观察如下；时间列是 96 核累计 core-time，时间占比的分母是同角色
+`Σscalar_submit_elapsed_ticks`，request/miss 占比的分母是同次采集、同角色的完整 primary：
+
+| 角色 | calls | 排除 Kernel | phase core-time sum | Scalar 时间占比 | request observed / 占比 | miss observed / 占比 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ALL | 1,024 | 53 | 10,031.073 us | 3.4716228% | 3,561,057 / 5.0471511% | 33,047 / 1.8154869% |
+| AIC | 512 | 53 | 7,213.506 us | 7.9254424% | 2,611,337 / 10.4338074% | 11,544 / 11.8110478% |
+| AIV | 512 | 0 | 2,817.567 us | 1.4235334% | 949,720 / 2.0860070% | 21,503 / 1.2483281% |
+
+`10,031.073 us` 是跨核累计的 phase core-time，不是 Submit 墙钟。该 WinnerBuild ELF 的全局
+Submit 墙钟为 4.599385 ms；另一次 `submit-pmu-none` 为 4.982069 ms，但两者来自不同诊断
+ELF 和独立进程，不能相减成 0.382684 ms 的 WinnerBuild 收益，也不能据此杜撰任何优化收益。
+本节两轮均为 ABI/schema v2；旧 v1 HTML 和数值只能作为历史记录，不能与这里的计数或比例混用。
+
 ## 2. 为什么 I-cache miss 必须独立重编译
 
 I-cache 数据对代码布局极其敏感。泳道和逐 atomic 观察会增加：
@@ -825,7 +898,7 @@ I-cache 数据对代码布局极其敏感。泳道和逐 atomic 观察会增加�
 - 更大的 scalar `.text` 和不同的函数/对齐布局；
 - 由此引起的 worker 到达、轮询和跨核竞争时序变化。
 
-因此，“代码仍在 ELF 中，只在运行时关闭 record”不足以得到干净的 I-cache 观察。`submit-pmu` 会独立重编译，编译掉泳道 record、逐 atomic wrapper、ClockBaseline、runtime phase-profile 和旧 cold/warm 冲刷体。`swimlane` 则不构建 PMU owner。
+因此，“代码仍在 ELF 中，只在运行时关闭 record”不足以得到干净的 I-cache 观察。`submit-pmu` 会独立重编译，编译掉泳道 record、逐 atomic 泳道记录慢体、ClockBaseline、runtime phase-profile 和旧 cold/warm 冲刷体。ABI v2 仍保留 return-ready/result-used atomic 的最小 SYS 时间扣除 hook；它不落泳道记录，也不门控 PMU counter。`swimlane` 则不构建 PMU owner。
 
 两种数据不在同一进程采集：
 
@@ -856,7 +929,7 @@ I-cache 数据对代码布局极其敏感。泳道和逐 atomic 观察会增加�
 
 保留此类修改前应依次检查：AIC/AIV 对象的 `.text` 和独立符号、level-1 多轮 Submit、level-4 logical/physical Atomic 公式、ClockBaseline 和 `dropped_records=0`。上述真实 PA level-4 复核得到 115,309 次 atomic 调用、107,608 条 Atomic、8,056 次批处理轮询和 355 条 PollBatch，满足 `107608 = 115309 - 8056 + 355`。
 
-这个案例同时说明为什么 `submit-pmu` 不能只传运行时 level=0：专门分析 I-cache 时，普通泳道、atomic wrapper、ClockBaseline 和相关慢体必须在编译期从待测 AIC/AIV ELF 中剔除。运行时 gate 只控制“执行没有”，不能控制“代码存在没有”。
+这个案例同时说明为什么 `submit-pmu` 不能只传运行时 level=0：专门分析 I-cache 时，普通泳道、atomic 泳道记录 wrapper、ClockBaseline 和相关慢体必须在编译期从待测 AIC/AIV ELF 中剔除；ABI v2 的最小 return-ready 时间 hook 是当前测量合同的一部分，不属于应删除的泳道慢体。运行时 gate 只控制“执行没有”，不能控制“代码存在没有”。
 
 ### 2.2 Claim-first eager 重编后的观察结论
 
@@ -891,11 +964,12 @@ raw 转换、阶段顺序和整数闭合均通过，schema 能完整解析 site/
 - `submit-pmu-submit-transition`：第 1.7 节定义的所有相邻 Submit 间隙聚合；
 - `submit-pmu-efdrain-control`：第 1.8 节定义的排除 linked Kernel 的不连续 Scalar 控制段；
 - `submit-pmu-prepare-map`：第 1.9 节定义的 `dist_submit_prepare_map()` 调用体；
-- `submit-pmu-fanin`：第 1.10 节定义的 Kernel winner 动态 Fanin 区间。
+- `submit-pmu-fanin`：第 1.10 节定义的 Kernel winner 动态 Fanin 区间；
+- `submit-pmu-winner-build-control`：第 1.11 节定义的完整 WinnerBuild 业务边界内、排除 linked Kernel 的 Scalar 控制段。
 
-真实 phase id 依次为 ArgBuild `1`、EmptyBracket `2`、Materialize `3`、Claim `4`、Register `5`、SubmitTransition `6`、EfDrainControl `7`、PrepareMap `8` 和 Fanin `9`；`none` 不含 phase。SubmitTransition 的 outer calls 为 `N-1`，EfDrainControl 的实际 begin/end 读数还要加被排除 Kernel 数 `K`，Fanin 使用第 1.10 节的动态全局公式，其余业务/校准 phase 都为每核 `N`。
+真实 phase id 依次为 ArgBuild `1`、EmptyBracket `2`、Materialize `3`、Claim `4`、Register `5`、SubmitTransition `6`、EfDrainControl `7`、PrepareMap `8`、Fanin `9` 和 WinnerBuild `10`；`none` 不含 phase。SubmitTransition 的 outer calls 为 `N-1`，所有 phase 的实际 begin/end 读数都要加本阶段内被统一排除的 linked Kernel 数 `K`；Fanin 与 WinnerBuild 使用动态全局公式，其余业务/校准 phase 都为每核 `N`。
 
-十者 raw schema 均为 `fdwic-submit-pmu-v1`，但分别来自独立诊断 ELF，不能跨 profile 相减或拼接。
+当前十一种 profile 的新 raw schema 均为 `fdwic-submit-pmu-v2`，但分别来自独立诊断 ELF，不能跨 profile 相减或拼接。此前已经生成的 `fdwic-submit-pmu-v1` 文件只作历史记录，新 loader 不兼容读取。
 
 standalone 历史 schema 中的 `lower/upper` 是已经固化的字段名，只表达 read-clear observed 与 `primary-shadow` capture gap；由于 bracket 两侧也有观察 bookkeeping，它们同样不能解释为零插桩业务事件数的数学上下界。
 

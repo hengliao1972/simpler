@@ -166,6 +166,7 @@ def pytest_addoption(parser):
             "submit-pmu-efdrain-control",
             "submit-pmu-prepare-map",
             "submit-pmu-fanin",
+            "submit-pmu-winner-build-control",
         ],
         default="none",
         help="Select a private fully_distributed_within_core evidence build. "
@@ -180,7 +181,9 @@ def pytest_addoption(parser):
         "submit-pmu-submit-transition attributes adjacent Submit gaps; "
         "submit-pmu-efdrain-control attributes EfDrain scalar control while excluding linked Kernel calls; "
         "submit-pmu-prepare-map attributes the dist_submit_prepare_map call body; "
-        "submit-pmu-fanin attributes the dynamic Kernel-winner Fanin span.",
+        "submit-pmu-fanin attributes the dynamic Kernel-winner Fanin span; "
+        "submit-pmu-winner-build-control attributes scalar control inside the complete WinnerBuild time boundary "
+        "while excluding linked Kernel calls.",
     )
     parser.addoption(
         "--use-example-exec-time",
@@ -485,6 +488,7 @@ def _configure_fdwic_profile(config):
         "submit-pmu-efdrain-control",
         "submit-pmu-prepare-map",
         "submit-pmu-fanin",
+        "submit-pmu-winner-build-control",
     }:
         raise pytest.UsageError(f"unsupported --fdwic-profile {fdwic_profile!r}")
 
@@ -716,6 +720,7 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
         "submit-pmu-efdrain-control",
         "submit-pmu-prepare-map",
         "submit-pmu-fanin",
+        "submit-pmu-winner-build-control",
     }:
         incompatible = []
         for item in items:

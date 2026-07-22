@@ -163,9 +163,9 @@ PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] __gm__ DistCore *self, __gm__
     const uint64_t perf_clock_kernel_begin = fdwic_perf_clock_kernel_begin();
 #endif
     TRACE_SPAN_BEGIN(kernel_trace);
-    const bool submit_pmu_efdrain_paused = fdwic_submit_pmu_efdrain_kernel_pause();
+    const uint32_t submit_pmu_kernel_token = fdwic_submit_pmu_linked_kernel_pause();
     dist_aicore_call_slot_kernel(s);
-    fdwic_submit_pmu_efdrain_kernel_resume(submit_pmu_efdrain_paused);
+    fdwic_submit_pmu_linked_kernel_resume(submit_pmu_kernel_token);
     TRACE_SPAN_END(
         kernel_trace, self, s.task_id, s.func_id, TracePhase::Kernel, static_cast<uint32_t>(s.is_multicore ? 1 : 0), 0
     );
