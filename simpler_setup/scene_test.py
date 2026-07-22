@@ -61,6 +61,7 @@ _FDWIC_PROFILE_SUBMIT_PMU_EFDRAIN_CONTROL = "submit-pmu-efdrain-control"
 _FDWIC_PROFILE_SUBMIT_PMU_PREPARE_MAP = "submit-pmu-prepare-map"
 _FDWIC_PROFILE_SUBMIT_PMU_FANIN = "submit-pmu-fanin"
 _FDWIC_PROFILE_SUBMIT_PMU_WINNER_BUILD_CONTROL = "submit-pmu-winner-build-control"
+_FDWIC_PROFILE_SUBMIT_PMU_ALLOC_COMPLETE_CONTROL = "submit-pmu-alloc-complete-control"
 _FDWIC_PERF_CLOCK_ARTIFACTS = {
     _FDWIC_PROFILE_PERF_CLOCK: ("fdwic_perf_clock_summary.json", "fdwic-perf-clock-v1"),
     _FDWIC_PROFILE_PERF_CLOCK_KERNEL: (
@@ -80,6 +81,7 @@ _FDWIC_SUBMIT_PMU_PHASE_PROFILES = frozenset(
         _FDWIC_PROFILE_SUBMIT_PMU_PREPARE_MAP,
         _FDWIC_PROFILE_SUBMIT_PMU_FANIN,
         _FDWIC_PROFILE_SUBMIT_PMU_WINNER_BUILD_CONTROL,
+        _FDWIC_PROFILE_SUBMIT_PMU_ALLOC_COMPLETE_CONTROL,
     }
 )
 _FDWIC_SUBMIT_PMU_PROFILES = frozenset({_FDWIC_PROFILE_SUBMIT_PMU_NONE, *_FDWIC_SUBMIT_PMU_PHASE_PROFILES})
@@ -165,6 +167,12 @@ def _fdwic_compile_definitions(profile: str) -> list[str] | None:
         return [
             "PTO_FDWIC_SUBMIT_PMU=1",
             "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=10",
+            "PTO_FDWIC_TRACE_ENABLED=0",
+        ]
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_ALLOC_COMPLETE_CONTROL:
+        return [
+            "PTO_FDWIC_SUBMIT_PMU=1",
+            "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=11",
             "PTO_FDWIC_TRACE_ENABLED=0",
         ]
     return None

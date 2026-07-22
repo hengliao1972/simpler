@@ -55,6 +55,7 @@ EFDRAIN_CONTROL_CAPTURE_MODE = "submit-pmu-efdrain-control"
 PREPARE_MAP_CAPTURE_MODE = "submit-pmu-prepare-map"
 FANIN_CAPTURE_MODE = "submit-pmu-fanin"
 WINNER_BUILD_CAPTURE_MODE = "submit-pmu-winner-build-control"
+ALLOC_COMPLETE_CAPTURE_MODE = "submit-pmu-alloc-complete-control"
 ARG_BUILD_PHASE_ID = 1
 EMPTY_BRACKET_PHASE_ID = 2
 MATERIALIZE_PHASE_ID = 3
@@ -65,6 +66,7 @@ EFDRAIN_CONTROL_PHASE_ID = 7
 PREPARE_MAP_PHASE_ID = 8
 FANIN_PHASE_ID = 9
 WINNER_BUILD_PHASE_ID = 10
+ALLOC_COMPLETE_PHASE_ID = 11
 PHASE_CONFIG_BY_MODE = {
     ARG_BUILD_CAPTURE_MODE: {
         "id": ARG_BUILD_PHASE_ID,
@@ -146,8 +148,19 @@ PHASE_CONFIG_BY_MODE = {
         "counter_semantics": "discontinuous_running_read_clear_excluding_linked_kernel_calls",
         "time_semantics": "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls",
     },
+    ALLOC_COMPLETE_CAPTURE_MODE: {
+        "id": ALLOC_COMPLETE_PHASE_ID,
+        "name": "alloc-complete-control",
+        "boundary": "alloc_complete_begin_to_end_excluding_linked_kernel_calls",
+        "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+        "counter_semantics": "discontinuous_running_read_clear_excluding_linked_kernel_calls",
+        "time_semantics": "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls",
+    },
 }
-DYNAMIC_PHASE_CAPTURE_MODES = frozenset({FANIN_CAPTURE_MODE, WINNER_BUILD_CAPTURE_MODE})
+DYNAMIC_PHASE_CAPTURE_MODES = frozenset(
+    {FANIN_CAPTURE_MODE, WINNER_BUILD_CAPTURE_MODE, ALLOC_COMPLETE_CAPTURE_MODE}
+)
+FIXED_ROLE_DYNAMIC_PHASE_CAPTURE_MODES = frozenset({FANIN_CAPTURE_MODE, WINNER_BUILD_CAPTURE_MODE})
 KERNEL_EXCLUDING_PHASE_CAPTURE_MODES = frozenset(PHASE_CONFIG_BY_MODE)
 
 
@@ -421,7 +434,14 @@ def _expected_dynamic_phase_calls(mode: str, expected_submits: int) -> dict[str,
     batches = expected_submits // 5
     if mode in {FANIN_CAPTURE_MODE, WINNER_BUILD_CAPTURE_MODE}:
         return {"all": 4 * batches, "aic": 2 * batches, "aiv": 2 * batches}
+    if mode == ALLOC_COMPLETE_CAPTURE_MODE:
+        return {"all": batches}
     _fail(f"{mode} has no dynamic phase call formula")
+
+
+def _dynamic_phase_max_calls_per_core(mode: str, expected_submits: int) -> int:
+    batches = expected_submits // 5
+    return 2 * batches if mode in FIXED_ROLE_DYNAMIC_PHASE_CAPTURE_MODES else batches
 
 
 def _phase_business_calls(record: Mapping[str, Any], mode: str) -> int:
@@ -461,9 +481,10 @@ def _validate_capture_header(data: dict[str, Any]) -> tuple[str, dict[str, Any],
             _fail(f"configuration must not contain phase in {NONE_CAPTURE_MODE}")
     else:
         if mode in DYNAMIC_PHASE_CAPTURE_MODES:
+            call_shape = "dynamic_balanced" if mode in FIXED_ROLE_DYNAMIC_PHASE_CAPTURE_MODES else "dynamic_global"
             expected_phase = {
                 **PHASE_CONFIG_BY_MODE[mode],
-                "call_shape": "dynamic_balanced",
+                "call_shape": call_shape,
                 "expected_calls": _expected_dynamic_phase_calls(mode, expected_submits),
             }
         else:
@@ -1031,9 +1052,7 @@ def _validate_dynamic_phase_call_totals(
         "aic": sum(_phase_business_calls(record, mode) for record in records if record["role"] == "aic"),
         "aiv": sum(_phase_business_calls(record, mode) for record in records if record["role"] == "aiv"),
     }
-    if actual != expected:
-        _fail(f"dynamic phase call totals must equal {expected!r}, got {actual!r}")
-    max_calls_per_core = 2 * (expected_submits // 5)
+    max_calls_per_core = _dynamic_phase_max_calls_per_core(mode, expected_submits)
     for logical_core_id, record in enumerate(records):
         business_calls = _phase_business_calls(record, mode)
         if business_calls > max_calls_per_core:
@@ -1041,6 +1060,10 @@ def _validate_dynamic_phase_call_totals(
                 f"records[{logical_core_id}] business phase calls exceed dynamic per-core maximum "
                 f"{max_calls_per_core}"
             )
+    if actual["all"] != expected["all"] or actual["aic"] + actual["aiv"] != actual["all"]:
+        _fail(f"dynamic phase call totals: global call total must equal {expected['all']}, got {actual!r}")
+    if mode in FIXED_ROLE_DYNAMIC_PHASE_CAPTURE_MODES and actual != expected:
+        _fail(f"dynamic phase call totals must equal {expected!r}, got {actual!r}")
 
 
 def load_capture(input_path: Path | str) -> SubmitPmuCapture:
@@ -1465,10 +1488,13 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
         call_shape_text = f"expected_calls_per_core={phase['expected_calls_per_core']}"
     else:
         expected = phase["expected_calls"]
-        call_shape_text = (
-            f"call_shape={phase['call_shape']} · expected_calls="
-            f"ALL {expected['all']} / AIC {expected['aic']} / AIV {expected['aiv']}"
-        )
+        if phase["call_shape"] == "dynamic_global":
+            call_shape_text = f"call_shape=dynamic_global · expected_calls=ALL {expected['all']}（角色不锁定）"
+        else:
+            call_shape_text = (
+                f"call_shape={phase['call_shape']} · expected_calls="
+                f"ALL {expected['all']} / AIC {expected['aic']} / AIV {expected['aiv']}"
+            )
     calibration_note = ""
     if phase["id"] == EMPTY_BRACKET_PHASE_ID:
         calibration_note = """
@@ -1515,7 +1541,7 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
                 f"{_format_integer(group['phase_business_calls'])} 次；排除 linked Kernel 调用 "
                 f"{_format_integer(group['phase_excluded_kernel_calls'])} 次</small>"
             )
-        if phase["id"] in {FANIN_PHASE_ID, WINNER_BUILD_PHASE_ID}:
+        if capture.data["capture"]["mode"] in DYNAMIC_PHASE_CAPTURE_MODES:
             calls = group["phase_calls_per_core"]
             reads += (
                 f"<br><small>逐核 {_format_integer(calls['min'])}–{_format_integer(calls['max'])}；"

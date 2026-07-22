@@ -364,6 +364,7 @@ PTO_DEVICE_FUNC TaskOutputTensors
 dist_submit_finish_alloc_tail(DistSubmitCtx &ctx, uint64_t completion_begin, uint64_t submit_begin) {
     if (__builtin_expect(ctx.won, 0)) {
         dist_submit_complete_alloc(ctx);
+        fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::AllocComplete>();
         TRACE_TIMESTAMP(alloc_complete_end);
         TRACE_SPAN_RECORD(
             completion_begin, alloc_complete_end, ctx.self, ctx.task_id, -1, TracePhase::AllocComplete, 0, 0
@@ -547,6 +548,8 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
     const uint32_t claim_flags = (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U);
     fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Claim>();
     TRACE_TIMESTAMP(claim_end);
+    // AllocComplete 与泳道共用 Claim.end 起点；只在真实 Alloc winner 上开窗。
+    if (ctx.won) fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::AllocComplete>();
     TRACE_SPAN_RECORD(claim_begin, claim_end, ctx.self, ctx.task_id, -1, TracePhase::Claim, claim_flags, 1);
     return dist_submit_finish_alloc_tail(ctx, claim_end, submit_begin);
 }
@@ -651,6 +654,9 @@ dist_alloc_compete_first_finish(PTO2Runtime *, const DistCompeteFirstTicket &tic
     dist_submit_register_outputs(ctx, args, /*include_existing=*/false);
     fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Register>();
     TRACE_TIMESTAMP(register_end);
+    // compete-first AllocComplete 与泳道共用 Register.end 起点；公共 tail
+    // 负责在 dist_submit_complete_alloc() 返回后闭合。
+    if (ctx.won) fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::AllocComplete>();
     TRACE_SPAN_RECORD(prepare_map_end, register_end, ctx.self, ctx.task_id, -1, TracePhase::Register, 0, 0);
     return dist_submit_finish_alloc_tail(ctx, register_end, ticket.submit_begin);
 }

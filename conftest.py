@@ -167,6 +167,7 @@ def pytest_addoption(parser):
             "submit-pmu-prepare-map",
             "submit-pmu-fanin",
             "submit-pmu-winner-build-control",
+            "submit-pmu-alloc-complete-control",
         ],
         default="none",
         help="Select a private fully_distributed_within_core evidence build. "
@@ -183,6 +184,8 @@ def pytest_addoption(parser):
         "submit-pmu-prepare-map attributes the dist_submit_prepare_map call body; "
         "submit-pmu-fanin attributes the dynamic Kernel-winner Fanin span; "
         "submit-pmu-winner-build-control attributes scalar control inside the complete WinnerBuild time boundary "
+        "while excluding linked Kernel calls; "
+        "submit-pmu-alloc-complete-control attributes scalar control inside the complete AllocComplete time boundary "
         "while excluding linked Kernel calls.",
     )
     parser.addoption(
@@ -489,6 +492,7 @@ def _configure_fdwic_profile(config):
         "submit-pmu-prepare-map",
         "submit-pmu-fanin",
         "submit-pmu-winner-build-control",
+        "submit-pmu-alloc-complete-control",
     }:
         raise pytest.UsageError(f"unsupported --fdwic-profile {fdwic_profile!r}")
 
@@ -721,6 +725,7 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
         "submit-pmu-prepare-map",
         "submit-pmu-fanin",
         "submit-pmu-winner-build-control",
+        "submit-pmu-alloc-complete-control",
     }:
         incompatible = []
         for item in items:

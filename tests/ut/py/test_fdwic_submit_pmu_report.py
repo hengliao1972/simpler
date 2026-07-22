@@ -20,6 +20,7 @@ import pytest
 
 import simpler_setup.tools.fdwic_submit_pmu_report as report_module
 from simpler_setup.tools.fdwic_submit_pmu_report import (
+    ALLOC_COMPLETE_CAPTURE_MODE,
     ARG_BUILD_CAPTURE_MODE,
     CLAIM_CAPTURE_MODE,
     COMMON_REQUIRED_STATUS_MASK,
@@ -397,6 +398,43 @@ def _valid_winner_build_capture() -> dict[str, Any]:
         record["phase_excluded_kernel_calls"] = excluded_kernel_calls
         record["phase_begin_reads"] += excluded_kernel_calls
         record["phase_end_reads"] += excluded_kernel_calls
+    return capture
+
+
+def _valid_alloc_complete_capture(
+    *,
+    winner_core_id: int = 0,
+    excluded_kernel_calls: int = 2,
+) -> dict[str, Any]:
+    """Build one B1 AllocComplete call without constraining its AIC/AIV owner."""
+
+    capture = _valid_arg_build_capture()
+    capture["capture"]["mode"] = ALLOC_COMPLETE_CAPTURE_MODE
+    capture["configuration"]["phase"] = {
+        "id": 11,
+        "name": "alloc-complete-control",
+        "boundary": "alloc_complete_begin_to_end_excluding_linked_kernel_calls",
+        "call_shape": "dynamic_global",
+        "expected_calls": {"all": 1},
+        "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+        "counter_semantics": "discontinuous_running_read_clear_excluding_linked_kernel_calls",
+        "time_semantics": "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls",
+    }
+    capture["validation"]["phase_global_call_count_closed"] = True
+    for logical_core_id, record in enumerate(capture["records"]):
+        business_calls = int(logical_core_id == winner_core_id)
+        excluded_calls = excluded_kernel_calls if business_calls else 0
+        record.update(
+            {
+                "phase_id": 11,
+                "phase_elapsed_ticks": 75 * business_calls,
+                "phase_icache_requests_observed": 40 * business_calls,
+                "phase_icache_misses_observed": 2 * business_calls,
+                "phase_begin_reads": business_calls + excluded_calls,
+                "phase_end_reads": business_calls + excluded_calls,
+                "phase_excluded_kernel_calls": excluded_calls,
+            }
+        )
     return capture
 
 
@@ -1157,6 +1195,122 @@ def test_winner_build_control_requires_kernel_exclusion_validation(tmp_path: Pat
         load_capture(_write_capture(tmp_path, capture))
 
 
+@pytest.mark.parametrize(
+    ("winner_core_id", "winner_role", "other_role"),
+    ((0, "aic", "aiv"), (32, "aiv", "aic")),
+)
+def test_valid_alloc_complete_control_accepts_role_unlocked_b1_winner(
+    tmp_path: Path,
+    winner_core_id: int,
+    winner_role: str,
+    other_role: str,
+) -> None:
+    raw_path = _write_capture(
+        tmp_path,
+        _valid_alloc_complete_capture(winner_core_id=winner_core_id),
+    )
+
+    capture = load_capture(raw_path)
+
+    assert capture.records[winner_core_id]["role"] == winner_role
+    assert capture.phase_summary is not None
+    all_phase = capture.phase_summary["all"]
+    assert all_phase["phase_business_calls"] == 1
+    assert capture.phase_summary[winner_role]["phase_business_calls"] == 1
+    assert capture.phase_summary[other_role]["phase_business_calls"] == 0
+    assert all_phase["phase_begin_reads"] == 3
+    assert all_phase["phase_end_reads"] == 3
+    assert all_phase["phase_excluded_kernel_calls"] == 2
+    assert all_phase["phase_elapsed_ticks_per_call"] == pytest.approx(75)
+    assert all_phase["phase_icache_requests_observed_per_call"] == pytest.approx(40)
+    assert all_phase["phase_icache_misses_observed_per_call"] == pytest.approx(2)
+    assert all_phase["phase_calls_per_core"]["min"] == 0
+    assert all_phase["phase_calls_per_core"]["max"] == 1
+    assert all_phase["phase_zero_call_cores"] == 95
+
+    document = render_report(raw_path)
+    assert "<code>alloc-complete-control</code> 阶段观察" in document
+    assert "phase_id=11" in document
+    assert "alloc_complete_begin_to_end_excluding_linked_kernel_calls" in document
+    assert "discontinuous_running_read_clear_excluding_linked_kernel_calls" in document
+    assert "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls" in document
+    assert "call_shape=dynamic_global" in document
+    assert "expected_calls=ALL 1（角色不锁定）" in document
+    assert "业务调用 1 次；排除 linked Kernel 调用 2 次" in document
+    assert "零调用核 95" in document
+
+
+def test_alloc_complete_control_rejects_wrong_global_call_total(tmp_path: Path) -> None:
+    capture = _valid_alloc_complete_capture()
+    winner = capture["records"][0]
+    winner["phase_begin_reads"] = winner["phase_excluded_kernel_calls"]
+    winner["phase_end_reads"] = winner["phase_excluded_kernel_calls"]
+    winner["phase_elapsed_ticks"] = 0
+    winner["phase_icache_requests_observed"] = 0
+    winner["phase_icache_misses_observed"] = 0
+
+    with pytest.raises(ValueError, match="dynamic phase call totals: global call total must equal 1"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_alloc_complete_control_rejects_per_core_call_count_above_batch_limit(tmp_path: Path) -> None:
+    capture = _valid_alloc_complete_capture()
+    winner = capture["records"][0]
+    winner["phase_begin_reads"] += 1
+    winner["phase_end_reads"] += 1
+
+    with pytest.raises(ValueError, match=r"records\[0\] business phase calls exceed dynamic per-core maximum 1"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_alloc_complete_control_rejects_unbalanced_business_boundaries(tmp_path: Path) -> None:
+    capture = _valid_alloc_complete_capture()
+    capture["records"][0]["phase_end_reads"] -= 1
+
+    with pytest.raises(ValueError, match="must remain balanced after subtracting"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_alloc_complete_control_rejects_nonzero_values_on_zero_call_core(tmp_path: Path) -> None:
+    capture = _valid_alloc_complete_capture()
+    capture["records"][1]["phase_icache_requests_observed"] = 1
+
+    with pytest.raises(ValueError, match="zero-call dynamic phase must have zero"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("id", 10),
+        ("name", "winner-build-control"),
+        ("boundary", "winner_build_begin_to_end_excluding_linked_kernel_calls"),
+        ("call_shape", "dynamic_balanced"),
+        ("expected_calls", {"all": 2}),
+        ("counter_semantics", "running_read_clear_observed_bracket"),
+        ("time_semantics", "inner_sys_cnt_between_boundary_observers"),
+    ),
+)
+def test_alloc_complete_control_rejects_mismatched_phase_configuration(
+    tmp_path: Path,
+    field: str,
+    value: Any,
+) -> None:
+    capture = _valid_alloc_complete_capture()
+    capture["configuration"]["phase"][field] = value
+
+    with pytest.raises(ValueError, match=r"configuration\.phase"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_alloc_complete_control_rejects_wrong_record_phase_id(tmp_path: Path) -> None:
+    capture = _valid_alloc_complete_capture()
+    capture["records"][0]["phase_id"] = 10
+
+    with pytest.raises(ValueError, match=r"records\[0\]\.phase_id must equal 11"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
 def test_valid_claim_capture_tracks_current_business_boundary(tmp_path: Path) -> None:
     raw_path = _write_capture(tmp_path, _valid_claim_capture())
 
@@ -1460,6 +1614,7 @@ def test_efdrain_control_requires_closed_kernel_exclusion_validation(
         _valid_fanin_capture,
         _valid_efdrain_control_capture,
         _valid_winner_build_capture,
+        _valid_alloc_complete_capture,
     ),
 )
 def test_all_phase_modes_require_excluded_kernel_call_count(
@@ -1805,6 +1960,7 @@ def test_efdrain_control_build_identity_uses_phase_id_7(
         (PREPARE_MAP_CAPTURE_MODE, _valid_prepare_map_capture, 8),
         (FANIN_CAPTURE_MODE, _valid_fanin_capture, 9),
         (WINNER_BUILD_CAPTURE_MODE, _valid_winner_build_capture, 10),
+        (ALLOC_COMPLETE_CAPTURE_MODE, _valid_alloc_complete_capture, 11),
     ),
 )
 def test_each_phase_profile_closes_raw_identity_provenance_and_html(

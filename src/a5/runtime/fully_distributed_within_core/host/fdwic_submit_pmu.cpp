@@ -77,6 +77,10 @@ constexpr SubmitPmuProfile kSubmitPmuProfiles[] = {
      kFdwicSubmitPmuPhaseBytes, "winner-build-control", "winner_build_begin_to_end_excluding_linked_kernel_calls",
      "discontinuous_running_read_clear_excluding_linked_kernel_calls",
      "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls"},
+    {"submit-pmu-alloc-complete-control", kFdwicSubmitPmuModeAllocComplete, FdwicSubmitPmuPhase::AllocComplete,
+     kFdwicSubmitPmuPhaseBytes, "alloc-complete-control", "alloc_complete_begin_to_end_excluding_linked_kernel_calls",
+     "discontinuous_running_read_clear_excluding_linked_kernel_calls",
+     "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls"},
 };
 
 const SubmitPmuProfile *requested_profile() {
@@ -381,17 +385,24 @@ bool validate(
     }
     if (fdwic_submit_pmu_phase_has_dynamic_calls(profile.phase)) {
         const uint64_t expected_all = fdwic_submit_pmu_expected_dynamic_calls_all(profile.phase, data.expected_submits);
-        const uint64_t expected_aic = fdwic_submit_pmu_expected_dynamic_calls_aic(profile.phase, data.expected_submits);
-        const uint64_t expected_aiv = fdwic_submit_pmu_expected_dynamic_calls_aiv(profile.phase, data.expected_submits);
-        if (expected_all == 0 || data.phase_calls_all != expected_all || data.phase_calls_aic != expected_aic ||
-            data.phase_calls_aiv != expected_aiv) {
+        const bool role_calls_fixed = fdwic_submit_pmu_dynamic_calls_have_fixed_roles(profile.phase);
+        const uint64_t expected_aic =
+            role_calls_fixed ? fdwic_submit_pmu_expected_dynamic_calls_aic(profile.phase, data.expected_submits) : 0U;
+        const uint64_t expected_aiv =
+            role_calls_fixed ? fdwic_submit_pmu_expected_dynamic_calls_aiv(profile.phase, data.expected_submits) : 0U;
+        const bool global_closed = expected_all != 0 && data.phase_calls_all == expected_all &&
+                                   data.phase_calls_aic + data.phase_calls_aiv == data.phase_calls_all;
+        const bool roles_closed =
+            !role_calls_fixed || (data.phase_calls_aic == expected_aic && data.phase_calls_aiv == expected_aiv);
+        if (!global_closed || !roles_closed) {
             LOG_ERROR(
                 "fdwic submit-PMU dynamic phase call closure failed: actual(all/aic/aiv)=%llu/%llu/%llu "
-                "expected=%llu/%llu/%llu",
+                "expected_all=%llu fixed_roles=%u expected_aic/aiv=%llu/%llu",
                 static_cast<unsigned long long>(data.phase_calls_all),
                 static_cast<unsigned long long>(data.phase_calls_aic),
                 static_cast<unsigned long long>(data.phase_calls_aiv), static_cast<unsigned long long>(expected_all),
-                static_cast<unsigned long long>(expected_aic), static_cast<unsigned long long>(expected_aiv)
+                static_cast<unsigned>(role_calls_fixed), static_cast<unsigned long long>(expected_aic),
+                static_cast<unsigned long long>(expected_aiv)
             );
             return false;
         }
@@ -545,12 +556,16 @@ extern "C" int fdwic_submit_pmu_host_export(Runtime *runtime) {
         if (fdwic_submit_pmu_phase_has_dynamic_calls(profile->phase)) {
             const uint64_t expected_all =
                 fdwic_submit_pmu_expected_dynamic_calls_all(profile->phase, data.expected_submits);
-            const uint64_t expected_aic =
-                fdwic_submit_pmu_expected_dynamic_calls_aic(profile->phase, data.expected_submits);
-            const uint64_t expected_aiv =
-                fdwic_submit_pmu_expected_dynamic_calls_aiv(profile->phase, data.expected_submits);
-            out << "\"call_shape\": \"dynamic_balanced\", \"expected_calls\": {\"all\": " << expected_all
-                << ", \"aic\": " << expected_aic << ", \"aiv\": " << expected_aiv << "}, ";
+            if (fdwic_submit_pmu_dynamic_calls_have_fixed_roles(profile->phase)) {
+                const uint64_t expected_aic =
+                    fdwic_submit_pmu_expected_dynamic_calls_aic(profile->phase, data.expected_submits);
+                const uint64_t expected_aiv =
+                    fdwic_submit_pmu_expected_dynamic_calls_aiv(profile->phase, data.expected_submits);
+                out << "\"call_shape\": \"dynamic_balanced\", \"expected_calls\": {\"all\": " << expected_all
+                    << ", \"aic\": " << expected_aic << ", \"aiv\": " << expected_aiv << "}, ";
+            } else {
+                out << "\"call_shape\": \"dynamic_global\", \"expected_calls\": {\"all\": " << expected_all << "}, ";
+            }
         } else {
             const uint32_t expected_phase_calls =
                 fdwic_submit_pmu_expected_phase_calls(profile->phase, data.expected_submits);

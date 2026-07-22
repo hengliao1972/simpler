@@ -2972,3 +2972,26 @@ none Case1 的 `4.982069 ms` 与 Winner Case1 的 `4.599385 ms` 来自不同 ELF
 上述 9 种与 none、Winner 合计 11 种既有 Case1 profile。使用报告链本身的 `load_capture` + `load_provenance` 做机器化复验，`11/11` 全部通过；每轮 trusted record、linked Kernel gate 闭合和 return-ready atomic 扣时有效均为 `96/96`。`11/11` 的 HTML 均存在，其 I-cache 逐核摘要只显示最小值/最大值。
 
 EfDrain 轮闭合了 962 次 linked Kernel 排除；Fanin 轮的动态业务 calls 为 1,024，全局 call-count 门禁闭合。每个 profile 的 phase 百分比都只属于自己的独立 ELF 及其本轮 Submit 分母，不在跨 ELF 之间求和；empty 仅用作 bracket 标定，不当作业务 phase。至此旧 v1 数据不再用于当前结论，当前口径只认 v2 全量重采产物。
+
+### 2026-07-22 / O10：AllocComplete v2 阶段闭合
+
+状态：**[观察工具：284 项 UT 与真实 A5 B1/Case1 v2 门禁已闭合]**
+
+#### 真实业务边界
+
+AllocComplete 只在真实 Alloc winner 上开窗。legacy/one-shot 路径从 `Claim.end` 开始，compete-first 路径因 Claim 已在 Begin 中完成，从 Finish 内的 `Register.end` 开始；两者都在 `dist_submit_complete_alloc()` 返回后立即闭合，与 schema-v4 泳道的完整 AllocComplete 尾动作一致。
+
+该阶段使用 `dynamic_global`：协议只能确定全局调用数为 `B = expected_submits / 5`，Alloc winner 由多核竞争决定，不伪造 AIC/AIV 角色公式或逐核固定次数。B1 的唯一一次调用实际落在 AIV，Case1 也出现 1 次 AIV winner，直接证明角色必须保持动态。
+
+AllocComplete 内的 HeapGuard 慢路可能回收并执行 linked Kernel，因此继续复用成对 pause/resume 把这些 Kernel 从阶段时间和 counter 中排除，不把本轮观测到的零次写成协议不可能。阶段时间同时复用 O9 的 return-ready atomic SYS bracket 扣时链；PMU counter 仍含 atomic 指令事件。新模式只复用现有 phase 字段和状态门禁，核心记录与 phase sidecar 仍各为 64 B，ABI 不增长。
+
+#### 离线与真实 A5 证据
+
+增量后的离线回归共 284 项 UT 全部通过。真实 A5 产物为：
+
+- B1：`outputs/TestPagedAttentionUnroll_CaseB1_20260722_215826`
+- Case1：`outputs/TestPagedAttentionUnroll_Case1_20260722_220027`
+
+两轮都通过 v2 严格校验和 `96/96` trusted/kernel/return-ready atomic 门禁，全局动态 call-count 也闭合。Case1 的调用数为 `256 = 255 AIC + 1 AIV`，63 个核为零调用，排除的 linked Kernel 为 0 次；阶段 scalar-code 时间为 584,689 ticks，I-cache request 为 170,344，miss 为 8,790。同一 ELF 内，它占完整 Submit scalar-code core-time 分母的 `584,689 / 296,983,746 = 0.1968758%`；该轮全局 Submit 墙钟为 `4.648447 ms`。
+
+这个百分比只能在 Case1 `20260722_220027` 的同一 ELF 内解释。AllocComplete 与 none、Winner 及其他 phase 均是独立 ELF，不对其百分比求和，也不用 `4.648447 ms` 与他轮墙钟相减或写成优化收益。

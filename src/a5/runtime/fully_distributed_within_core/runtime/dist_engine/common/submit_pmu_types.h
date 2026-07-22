@@ -35,6 +35,7 @@ constexpr uint16_t kFdwicSubmitPmuModeEfDrainControl = 8;
 constexpr uint16_t kFdwicSubmitPmuModePrepareMap = 9;
 constexpr uint16_t kFdwicSubmitPmuModeFanin = 10;
 constexpr uint16_t kFdwicSubmitPmuModeWinnerBuild = 11;
+constexpr uint16_t kFdwicSubmitPmuModeAllocComplete = 12;
 constexpr uint32_t kFdwicSubmitPmuExpectedAic = 32;
 constexpr uint32_t kFdwicSubmitPmuExpectedAiv = 64;
 constexpr uint32_t kFdwicSubmitPmuExpectedCores = kFdwicSubmitPmuExpectedAic + kFdwicSubmitPmuExpectedAiv;
@@ -75,7 +76,10 @@ enum class FdwicSubmitPmuPhase : uint16_t {
     // Kernel winner 的 WinnerBuild 完整业务边界内的 scalar control；等待
     // 期间回收执行的 linked Kernel 通过成对 pause/resume 从计数和时间中排除。
     WinnerBuild = 10,
-    Count = 11,
+    // Alloc winner 的 AllocComplete 完整业务边界内的 scalar control；HeapGuard
+    // 慢路径回收执行的 linked Kernel 同样通过成对 pause/resume 排除。
+    AllocComplete = 11,
+    Count = 12,
 };
 
 constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
@@ -102,6 +106,8 @@ constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
         return kFdwicSubmitPmuModeFanin;
     case FdwicSubmitPmuPhase::WinnerBuild:
         return kFdwicSubmitPmuModeWinnerBuild;
+    case FdwicSubmitPmuPhase::AllocComplete:
+        return kFdwicSubmitPmuModeAllocComplete;
     case FdwicSubmitPmuPhase::Count:
         break;
     }
@@ -109,6 +115,13 @@ constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
 }
 
 PTO_DEVICE_FUNC constexpr bool fdwic_submit_pmu_phase_has_dynamic_calls(FdwicSubmitPmuPhase phase) {
+    return phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild ||
+           phase == FdwicSubmitPmuPhase::AllocComplete;
+}
+
+// Fanin/WinnerBuild 的 AIC/AIV 数量由 PA 的四个 Kernel 角色固定；AllocComplete
+// 只有全局 B 次可由协议确定，winner 落在哪类核取决于多核竞争，不能伪造角色公式。
+constexpr bool fdwic_submit_pmu_dynamic_calls_have_fixed_roles(FdwicSubmitPmuPhase phase) {
     return phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild;
 }
 
@@ -126,7 +139,8 @@ constexpr uint32_t fdwic_submit_pmu_batch_count(uint32_t expected_submits) {
 
 constexpr uint64_t fdwic_submit_pmu_expected_dynamic_calls_all(FdwicSubmitPmuPhase phase, uint32_t expected_submits) {
     const uint64_t batches = fdwic_submit_pmu_batch_count(expected_submits);
-    return phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild ? 4U * batches : 0U;
+    if (phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild) return 4U * batches;
+    return phase == FdwicSubmitPmuPhase::AllocComplete ? batches : 0U;
 }
 
 constexpr uint64_t fdwic_submit_pmu_expected_dynamic_calls_aic(FdwicSubmitPmuPhase phase, uint32_t expected_submits) {
@@ -142,7 +156,8 @@ constexpr uint64_t fdwic_submit_pmu_expected_dynamic_calls_aiv(FdwicSubmitPmuPha
 PTO_DEVICE_FUNC constexpr uint32_t
 fdwic_submit_pmu_dynamic_calls_max_per_core(FdwicSubmitPmuPhase phase, uint32_t expected_submits) {
     const uint32_t batches = expected_submits != 0 && expected_submits % 5U == 0 ? expected_submits / 5U : 0U;
-    return phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild ? 2U * batches : 0U;
+    if (phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild) return 2U * batches;
+    return phase == FdwicSubmitPmuPhase::AllocComplete ? batches : 0U;
 }
 
 PTO_DEVICE_FUNC constexpr uint32_t
@@ -167,7 +182,8 @@ constexpr bool fdwic_submit_pmu_mode_has_phase(uint16_t mode) {
            mode == kFdwicSubmitPmuModeMaterialize || mode == kFdwicSubmitPmuModeClaim ||
            mode == kFdwicSubmitPmuModeRegister || mode == kFdwicSubmitPmuModeSubmitTransition ||
            mode == kFdwicSubmitPmuModeEfDrainControl || mode == kFdwicSubmitPmuModePrepareMap ||
-           mode == kFdwicSubmitPmuModeFanin || mode == kFdwicSubmitPmuModeWinnerBuild;
+           mode == kFdwicSubmitPmuModeFanin || mode == kFdwicSubmitPmuModeWinnerBuild ||
+           mode == kFdwicSubmitPmuModeAllocComplete;
 }
 
 // A5 PIPE_UTIL 事件布局。CNT6/CNT7 是权威值；CNT8/CNT5 使用相同事件作

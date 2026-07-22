@@ -45,6 +45,7 @@ standalone 当前保留两类正式观察构建：
 | `submit-pmu-prepare-map` | `outputs/TestPagedAttentionUnroll_Case1_20260722_213240/` |
 | `submit-pmu-fanin` | `outputs/TestPagedAttentionUnroll_Case1_20260722_213326/` |
 | `submit-pmu-winner-build-control` | `outputs/TestPagedAttentionUnroll_Case1_20260722_211624/` |
+| `submit-pmu-alloc-complete-control` | `outputs/TestPagedAttentionUnroll_Case1_20260722_220027/` |
 
 严格 loader 已复验每个 profile 的 96/96 trusted、linked-Kernel gate 和 return-ready atomic
 时间门禁；所有 HTML 的 I-cache 卡片只显示逐核 `min/max`。旧 v1 各章节中的数表继续作为历史记录，
@@ -915,6 +916,64 @@ Submit 墙钟为 4.599385 ms；另一次 `submit-pmu-none` 为 4.982069 ms，但
 ELF 和独立进程，不能相减成 0.382684 ms 的 WinnerBuild 收益，也不能据此杜撰任何优化收益。
 本节两轮均为 ABI/schema v2；旧 v1 HTML 和数值只能作为历史记录，不能与这里的计数或比例混用。
 
+### 1.12 真实 PA `submit-pmu-alloc-complete-control`
+
+AllocComplete 只在 Alloc winner 路径执行。legacy API 从 Claim.end 打开，compete-first API 从
+Register.end 打开，均在 `dist_submit_complete_alloc()` 返回后关闭，对应完整 AllocComplete
+Scalar 控制边界：
+
+```text
+capture.mode                    = submit-pmu-alloc-complete-control
+configuration.phase.id          = 11
+configuration.phase.name        = alloc-complete-control
+configuration.phase.boundary    = alloc_complete_begin_to_end_excluding_linked_kernel_calls
+configuration.phase.call_shape  = dynamic_global
+```
+
+设每核 Submit 数为 `N=5B`。每 batch 只有一个 Alloc winner，但其核角色由竞争结果决定，不能把
+AIC/AIV 次数伪造成固定比例：
+
+```text
+逐核：outer_calls = phase_begin_reads - phase_excluded_kernel_calls
+      outer_calls = phase_end_reads - phase_excluded_kernel_calls
+      两侧相等，允许为 0，且不超过 B
+全局：Σouter_calls = B
+角色：AIC outer_calls + AIV outer_calls = B；两者分别不锁定
+```
+
+HeapGuard 慢路径若回收并执行 linked vector/cube Kernel，统一 gate 会同时从 phase elapsed 和
+PMU counter 排除 Kernel 整段，并用 `phase_excluded_kernel_calls` 记录额外边界对。消费返回值的
+return-ready/result-used atomic 依赖区间只从 `scalar_submit_elapsed_ticks` 和命中的 phase elapsed
+扣除，不停止 PMU；因此 request/miss 仍包含 atomic 指令及最小 hook 的取指事件，source-issue
+atomic 也继续保留。本次 B1 和 Case1 的 phase 内排除 Kernel 次数都为 0。
+
+B1 与完整 Case1 的三件套分别位于：
+
+```text
+outputs/TestPagedAttentionUnroll_CaseB1_20260722_215826/
+outputs/TestPagedAttentionUnroll_CaseB1_20260722_215826/fdwic_submit_pmu_report.html
+outputs/TestPagedAttentionUnroll_Case1_20260722_220027/
+outputs/TestPagedAttentionUnroll_Case1_20260722_220027/fdwic_submit_pmu_report.html
+```
+
+B1 严格闭合 `1=0(AIC)+1(AIV)`，95 个 worker 为零调用；这只是一次实际 winner 分布，不是角色
+公式。Case1 严格闭合 `256=255(AIC)+1(AIV)`，同样不能把 255/1 固化成后续运行的期望值。两轮
+96/96 trusted、linked-Kernel gate、return-ready atomic 时间、phase boundary/shape/value/time、
+shadow-primary bounded 和动态全局调用数门禁全部闭合。
+
+Case1 同一 ELF 内的直接观察如下。phase ticks 是跨核累计 core-time，Scalar 时间占比的分母是
+同角色 `Σscalar_submit_elapsed_ticks`，不是全局 Submit 墙钟：
+
+| 角色 | calls | phase elapsed ticks | request observed | miss observed | Scalar 时间占比 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ALL | 256 | 584,689 | 170,344 | 8,790 | 0.1968758%（约 0.197%） |
+| AIC | 255 | 580,355 | 169,762 | 8,724 | 0.6376930% |
+| AIV | 1 | 4,334 | 582 | 66 | 0.0021041% |
+
+`584,689 ticks` 即 96 核累计的 584.689 us，不是 AllocComplete 墙钟耗时；0.197% 也只描述该
+AllocComplete ELF 的 phase core-time 相对同一 ELF Scalar Submit 分母的比例。不得与 none、
+WinnerBuild 或其他独立诊断 ELF 的时间和计数相加、相减，也不能据此杜撰独立性能收益。
+
 ## 2. 为什么 I-cache miss 必须独立重编译
 
 I-cache 数据对代码布局极其敏感。泳道和逐 atomic 观察会增加：
@@ -991,11 +1050,12 @@ raw 转换、阶段顺序和整数闭合均通过，schema 能完整解析 site/
 - `submit-pmu-efdrain-control`：第 1.8 节定义的排除 linked Kernel 的不连续 Scalar 控制段；
 - `submit-pmu-prepare-map`：第 1.9 节定义的 `dist_submit_prepare_map()` 调用体；
 - `submit-pmu-fanin`：第 1.10 节定义的 Kernel winner 动态 Fanin 区间；
-- `submit-pmu-winner-build-control`：第 1.11 节定义的完整 WinnerBuild 业务边界内、排除 linked Kernel 的 Scalar 控制段。
+- `submit-pmu-winner-build-control`：第 1.11 节定义的完整 WinnerBuild 业务边界内、排除 linked Kernel 的 Scalar 控制段；
+- `submit-pmu-alloc-complete-control`：第 1.12 节定义的完整 AllocComplete 业务边界内、排除 linked Kernel 的 Scalar 控制段。
 
-真实 phase id 依次为 ArgBuild `1`、EmptyBracket `2`、Materialize `3`、Claim `4`、Register `5`、SubmitTransition `6`、EfDrainControl `7`、PrepareMap `8`、Fanin `9` 和 WinnerBuild `10`；`none` 不含 phase。SubmitTransition 的 outer calls 为 `N-1`，所有 phase 的实际 begin/end 读数都要加本阶段内被统一排除的 linked Kernel 数 `K`；Fanin 与 WinnerBuild 使用动态全局公式，其余业务/校准 phase 都为每核 `N`。
+真实 phase id 依次为 ArgBuild `1`、EmptyBracket `2`、Materialize `3`、Claim `4`、Register `5`、SubmitTransition `6`、EfDrainControl `7`、PrepareMap `8`、Fanin `9`、WinnerBuild `10` 和 AllocComplete `11`；`none` 不含 phase。SubmitTransition 的 outer calls 为 `N-1`，所有 phase 的实际 begin/end 读数都要加本阶段内被统一排除的 linked Kernel 数 `K`；Fanin 与 WinnerBuild 使用 `4B/2B/2B` 的角色平衡动态公式，AllocComplete 只锁定全局 `B` 次而不锁定 AIC/AIV 分布，其余业务/校准 phase 都为每核 `N`。
 
-当前十一种 profile 的新 raw schema 均为 `fdwic-submit-pmu-v2`，但分别来自独立诊断 ELF，不能跨 profile 相减或拼接。此前已经生成的 `fdwic-submit-pmu-v1` 文件只作历史记录，新 loader 不兼容读取。
+当前十二种 profile 的新 raw schema 均为 `fdwic-submit-pmu-v2`，但分别来自独立诊断 ELF，不能跨 profile 相减或拼接。此前已经生成的 `fdwic-submit-pmu-v1` 文件只作历史记录，新 loader 不兼容读取。
 
 standalone 历史 schema 中的 `lower/upper` 是已经固化的字段名，只表达 read-clear observed 与 `primary-shadow` capture gap；由于 bracket 两侧也有观察 bookkeeping，它们同样不能解释为零插桩业务事件数的数学上下界。
 
