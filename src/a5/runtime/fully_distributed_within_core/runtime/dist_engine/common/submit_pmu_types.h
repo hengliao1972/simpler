@@ -36,6 +36,7 @@ constexpr uint16_t kFdwicSubmitPmuModePrepareMap = 9;
 constexpr uint16_t kFdwicSubmitPmuModeFanin = 10;
 constexpr uint16_t kFdwicSubmitPmuModeWinnerBuild = 11;
 constexpr uint16_t kFdwicSubmitPmuModeAllocComplete = 12;
+constexpr uint16_t kFdwicSubmitPmuModeLoserReplay = 13;
 constexpr uint32_t kFdwicSubmitPmuExpectedAic = 32;
 constexpr uint32_t kFdwicSubmitPmuExpectedAiv = 64;
 constexpr uint32_t kFdwicSubmitPmuExpectedCores = kFdwicSubmitPmuExpectedAic + kFdwicSubmitPmuExpectedAiv;
@@ -79,7 +80,10 @@ enum class FdwicSubmitPmuPhase : uint16_t {
     // Alloc winner 的 AllocComplete 完整业务边界内的 scalar control；HeapGuard
     // 慢路径回收执行的 linked Kernel 同样通过成对 pause/resume 排除。
     AllocComplete = 11,
-    Count = 12,
+    // Kernel loser 的真实 drain_block_won() 调用体；每个 worker 都回放四个
+    // Kernel Submit，winner 之外的调用均进入该阶段。
+    LoserReplay = 12,
+    Count = 13,
 };
 
 constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
@@ -108,6 +112,8 @@ constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
         return kFdwicSubmitPmuModeWinnerBuild;
     case FdwicSubmitPmuPhase::AllocComplete:
         return kFdwicSubmitPmuModeAllocComplete;
+    case FdwicSubmitPmuPhase::LoserReplay:
+        return kFdwicSubmitPmuModeLoserReplay;
     case FdwicSubmitPmuPhase::Count:
         break;
     }
@@ -116,13 +122,15 @@ constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
 
 PTO_DEVICE_FUNC constexpr bool fdwic_submit_pmu_phase_has_dynamic_calls(FdwicSubmitPmuPhase phase) {
     return phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild ||
-           phase == FdwicSubmitPmuPhase::AllocComplete;
+           phase == FdwicSubmitPmuPhase::AllocComplete || phase == FdwicSubmitPmuPhase::LoserReplay;
 }
 
-// Fanin/WinnerBuild 的 AIC/AIV 数量由 PA 的四个 Kernel 角色固定；AllocComplete
-// 只有全局 B 次可由协议确定，winner 落在哪类核取决于多核竞争，不能伪造角色公式。
+// Fanin/WinnerBuild 的 AIC/AIV 数量由 PA 的四个 Kernel 角色固定；LoserReplay
+// 是 96 核回放总数扣除这些 winner 后的角色补集。AllocComplete 只有全局 B 次
+// 可由协议确定，winner 落在哪类核取决于多核竞争，不能伪造角色公式。
 constexpr bool fdwic_submit_pmu_dynamic_calls_have_fixed_roles(FdwicSubmitPmuPhase phase) {
-    return phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild;
+    return phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild ||
+           phase == FdwicSubmitPmuPhase::LoserReplay;
 }
 
 PTO_DEVICE_FUNC constexpr bool fdwic_submit_pmu_phase_excludes_linked_kernel(FdwicSubmitPmuPhase phase) {
@@ -140,23 +148,35 @@ constexpr uint32_t fdwic_submit_pmu_batch_count(uint32_t expected_submits) {
 constexpr uint64_t fdwic_submit_pmu_expected_dynamic_calls_all(FdwicSubmitPmuPhase phase, uint32_t expected_submits) {
     const uint64_t batches = fdwic_submit_pmu_batch_count(expected_submits);
     if (phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild) return 4U * batches;
+    if (phase == FdwicSubmitPmuPhase::LoserReplay) {
+        return (4U * kFdwicSubmitPmuExpectedCores - 4U) * batches;
+    }
     return phase == FdwicSubmitPmuPhase::AllocComplete ? batches : 0U;
 }
 
 constexpr uint64_t fdwic_submit_pmu_expected_dynamic_calls_aic(FdwicSubmitPmuPhase phase, uint32_t expected_submits) {
     const uint64_t batches = fdwic_submit_pmu_batch_count(expected_submits);
-    return phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild ? 2U * batches : 0U;
+    if (phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild) return 2U * batches;
+    if (phase == FdwicSubmitPmuPhase::LoserReplay) {
+        return (4U * kFdwicSubmitPmuExpectedAic - 2U) * batches;
+    }
+    return 0U;
 }
 
 constexpr uint64_t fdwic_submit_pmu_expected_dynamic_calls_aiv(FdwicSubmitPmuPhase phase, uint32_t expected_submits) {
     const uint64_t batches = fdwic_submit_pmu_batch_count(expected_submits);
-    return phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild ? 2U * batches : 0U;
+    if (phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild) return 2U * batches;
+    if (phase == FdwicSubmitPmuPhase::LoserReplay) {
+        return (4U * kFdwicSubmitPmuExpectedAiv - 2U) * batches;
+    }
+    return 0U;
 }
 
 PTO_DEVICE_FUNC constexpr uint32_t
 fdwic_submit_pmu_dynamic_calls_max_per_core(FdwicSubmitPmuPhase phase, uint32_t expected_submits) {
     const uint32_t batches = expected_submits != 0 && expected_submits % 5U == 0 ? expected_submits / 5U : 0U;
     if (phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild) return 2U * batches;
+    if (phase == FdwicSubmitPmuPhase::LoserReplay) return 4U * batches;
     return phase == FdwicSubmitPmuPhase::AllocComplete ? batches : 0U;
 }
 
@@ -183,7 +203,7 @@ constexpr bool fdwic_submit_pmu_mode_has_phase(uint16_t mode) {
            mode == kFdwicSubmitPmuModeRegister || mode == kFdwicSubmitPmuModeSubmitTransition ||
            mode == kFdwicSubmitPmuModeEfDrainControl || mode == kFdwicSubmitPmuModePrepareMap ||
            mode == kFdwicSubmitPmuModeFanin || mode == kFdwicSubmitPmuModeWinnerBuild ||
-           mode == kFdwicSubmitPmuModeAllocComplete;
+           mode == kFdwicSubmitPmuModeAllocComplete || mode == kFdwicSubmitPmuModeLoserReplay;
 }
 
 // A5 PIPE_UTIL 事件布局。CNT6/CNT7 是权威值；CNT8/CNT5 使用相同事件作

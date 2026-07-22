@@ -46,6 +46,7 @@ standalone 当前保留两类正式观察构建：
 | `submit-pmu-fanin` | `outputs/TestPagedAttentionUnroll_Case1_20260722_213326/` |
 | `submit-pmu-winner-build-control` | `outputs/TestPagedAttentionUnroll_Case1_20260722_211624/` |
 | `submit-pmu-alloc-complete-control` | `outputs/TestPagedAttentionUnroll_Case1_20260722_220027/` |
+| `submit-pmu-loser-replay` | `outputs/TestPagedAttentionUnroll_Case1_20260722_222533/` |
 
 严格 loader 已复验每个 profile 的 96/96 trusted、linked-Kernel gate 和 return-ready atomic
 时间门禁；所有 HTML 的 I-cache 卡片只显示逐核 `min/max`。旧 v1 各章节中的数表继续作为历史记录，
@@ -974,6 +975,80 @@ Case1 同一 ELF 内的直接观察如下。phase ticks 是跨核累计 core-tim
 AllocComplete ELF 的 phase core-time 相对同一 ELF Scalar Submit 分母的比例。不得与 none、
 WinnerBuild 或其他独立诊断 ELF 的时间和计数相加、相减，也不能据此杜撰独立性能收益。
 
+### 1.13 真实 PA `submit-pmu-loser-replay`
+
+LoserReplay 只在 Kernel loser 路径执行。legacy 与 compete-first Kernel Submit 最终共用同一个
+tail：在 Register 结束边界打开 bracket，调用 `drain_block_won()`，函数返回后立即关闭。因此该
+profile 的身份为：
+
+```text
+PTO_FDWIC_SUBMIT_PMU=1
+PTO_FDWIC_SUBMIT_PMU_PHASE_ID=12
+PTO_FDWIC_TRACE_ENABLED=0
+
+capture.mode                    = submit-pmu-loser-replay
+configuration.phase.id          = 12
+configuration.phase.name        = loser-replay
+configuration.phase.boundary    = register_end_to_drain_block_won_return
+configuration.phase.call_shape  = dynamic_balanced
+```
+
+设每核 Submit 数为 `N=5B`。当前 PA 每 batch 有四个 Kernel task；96 个 worker 都回放这四次
+Kernel Submit，每个 task 只有一个 winner，且四个 winner 中两个落在 AIC、两个落在 AIV。
+LoserReplay 是对应 Kernel winner 集合的补集，因此 producer、consumer 和分析器共同复算：
+
+```text
+逐核：outer_calls = phase_begin_reads - phase_excluded_kernel_calls
+      outer_calls = phase_end_reads - phase_excluded_kernel_calls
+      两侧相等，允许动态分布，且不超过 4B
+全局：Σouter_calls = (96 × 4 - 4)B = 380B
+AIC： Σouter_calls = (32 × 4 - 2)B = 126B
+AIV： Σouter_calls = (64 × 4 - 2)B = 254B
+```
+
+`drain_block_won()` 只把已经发布的 joint lane 搬入本核 RingSlot，不调用
+`drain_phase_b()`/`execute_slot()`，所以当前 LoserReplay 边界内不会执行 linked vector/cube
+Kernel，`phase_excluded_kernel_calls` 必须为 0。其通用 joint 路径仍可能执行消费返回值的
+`WonAnyLoad`、`WonStateLoad` 和 `WonLaneClaimExchange`：这些 return-ready atomic 的依赖等待时间
+沿 ABI v2 口径从 `phase_elapsed_ticks` 和 `scalar_submit_elapsed_ticks` 扣除，但 PMU gate 不停止，
+request/miss 仍包含 atomic 指令及最小时间 hook 的取指事件。返回值不消费的 source-issue atomic
+继续保留在 Scalar 控制口径中。
+
+B1 与完整 Case1 的 raw/provenance/HTML 三件套分别位于：
+
+```text
+outputs/TestPagedAttentionUnroll_CaseB1_20260722_222358/fdwic_submit_pmu_raw.json
+outputs/TestPagedAttentionUnroll_CaseB1_20260722_222358/fdwic_submit_pmu_provenance.json
+outputs/TestPagedAttentionUnroll_CaseB1_20260722_222358/fdwic_submit_pmu_report.html
+
+outputs/TestPagedAttentionUnroll_Case1_20260722_222533/fdwic_submit_pmu_raw.json
+outputs/TestPagedAttentionUnroll_Case1_20260722_222533/fdwic_submit_pmu_provenance.json
+outputs/TestPagedAttentionUnroll_Case1_20260722_222533/fdwic_submit_pmu_report.html
+```
+
+B1 严格闭合 `380=126(AIC)+254(AIV)`，逐核 3～4 次。Case1 严格闭合
+`97,280=32,256(AIC)+65,024(AIV)`，全体逐核 1,005～1,020 次。两轮均为 96/96
+trusted，owner/selector/status、linked-Kernel gate、return-ready atomic 时间、phase
+boundary/shape/value/time、shadow-primary bounded 和动态全局/角色调用数门禁全部闭合。
+
+Case1 同一 ELF 内的直接观察如下。phase ticks 是 96 核累计 core-time，Scalar 时间占比的分母是
+同角色 `Σscalar_submit_elapsed_ticks`：
+
+| 角色 | calls | phase elapsed ticks | request observed | miss observed | Scalar 时间占比 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ALL | 97,280 | 5,021,979 | 8,218,072 | 453,234 | 1.2719749% |
+| AIC | 32,256 | 1,696,385 | 2,539,793 | 4,148 | 1.5188385% |
+| AIV | 65,024 | 3,325,594 | 5,678,279 | 449,086 | 1.1745909% |
+
+这是高频 observer 边界：Case1 执行 97,280 对 begin/end read-clear。`phase_elapsed_ticks` 使用
+`inner_sys_cnt_between_boundary_observers`，不把两次 counter reader 自身当成业务时间；但
+`phase_icache_requests/misses_observed` 是 `running_read_clear_observed_bracket`，会包含边界附近的
+状态检查、累计 bookkeeping 和 observer 取指。高频固定开销会随调用次数累积，因此表中 request/miss
+不能解释成无观察器 LoserReplay 函数体的数学下界，也不能与其他 phase ELF 的 observed 相加。
+
+本轮全局首个 Submit 到末个 Submit 为 5.256747 ms，只用于证明该诊断运行的全局窗口闭合；它不是
+上述 96 核累计 phase ticks 的分母，也不能与 none 或其他独立 ELF 的墙钟相减成 LoserReplay 收益。
+
 ## 2. 为什么 I-cache miss 必须独立重编译
 
 I-cache 数据对代码布局极其敏感。泳道和逐 atomic 观察会增加：
@@ -1051,11 +1126,12 @@ raw 转换、阶段顺序和整数闭合均通过，schema 能完整解析 site/
 - `submit-pmu-prepare-map`：第 1.9 节定义的 `dist_submit_prepare_map()` 调用体；
 - `submit-pmu-fanin`：第 1.10 节定义的 Kernel winner 动态 Fanin 区间；
 - `submit-pmu-winner-build-control`：第 1.11 节定义的完整 WinnerBuild 业务边界内、排除 linked Kernel 的 Scalar 控制段；
-- `submit-pmu-alloc-complete-control`：第 1.12 节定义的完整 AllocComplete 业务边界内、排除 linked Kernel 的 Scalar 控制段。
+- `submit-pmu-alloc-complete-control`：第 1.12 节定义的完整 AllocComplete 业务边界内、排除 linked Kernel 的 Scalar 控制段；
+- `submit-pmu-loser-replay`：第 1.13 节定义的 Kernel loser `Register.end` 到 `drain_block_won()` 返回区间。
 
-真实 phase id 依次为 ArgBuild `1`、EmptyBracket `2`、Materialize `3`、Claim `4`、Register `5`、SubmitTransition `6`、EfDrainControl `7`、PrepareMap `8`、Fanin `9`、WinnerBuild `10` 和 AllocComplete `11`；`none` 不含 phase。SubmitTransition 的 outer calls 为 `N-1`，所有 phase 的实际 begin/end 读数都要加本阶段内被统一排除的 linked Kernel 数 `K`；Fanin 与 WinnerBuild 使用 `4B/2B/2B` 的角色平衡动态公式，AllocComplete 只锁定全局 `B` 次而不锁定 AIC/AIV 分布，其余业务/校准 phase 都为每核 `N`。
+真实 phase id 依次为 ArgBuild `1`、EmptyBracket `2`、Materialize `3`、Claim `4`、Register `5`、SubmitTransition `6`、EfDrainControl `7`、PrepareMap `8`、Fanin `9`、WinnerBuild `10`、AllocComplete `11` 和 LoserReplay `12`；`none` 不含 phase。SubmitTransition 的 outer calls 为 `N-1`，所有 phase 的实际 begin/end 读数都要加本阶段内被统一排除的 linked Kernel 数 `K`；Fanin 与 WinnerBuild 使用 `4B/2B/2B` 的角色平衡动态公式，AllocComplete 只锁定全局 `B` 次而不锁定 AIC/AIV 分布，LoserReplay 使用每 batch `380/126/254` 的全局/AIC/AIV 补集公式且逐核不超过 `4B`，其余业务/校准 phase 都为每核 `N`。
 
-当前十二种 profile 的新 raw schema 均为 `fdwic-submit-pmu-v2`，但分别来自独立诊断 ELF，不能跨 profile 相减或拼接。此前已经生成的 `fdwic-submit-pmu-v1` 文件只作历史记录，新 loader 不兼容读取。
+当前十三种 profile 的新 raw schema 均为 `fdwic-submit-pmu-v2`，但分别来自独立诊断 ELF，不能跨 profile 相减或拼接。此前已经生成的 `fdwic-submit-pmu-v1` 文件只作历史记录，新 loader 不兼容读取。
 
 standalone 历史 schema 中的 `lower/upper` 是已经固化的字段名，只表达 read-clear observed 与 `primary-shadow` capture gap；由于 bracket 两侧也有观察 bookkeeping，它们同样不能解释为零插桩业务事件数的数学上下界。
 

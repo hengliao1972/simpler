@@ -332,7 +332,12 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_finish_kernel_tail(
     dist_submit_register_outputs(ctx, args, /*include_existing=*/true);
     fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Register>();
     TRACE_TIMESTAMP(register_end);
-    if (ctx.won) fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::WinnerBuild>();
+    if (ctx.won) {
+        fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::WinnerBuild>();
+    } else {
+        // 与泳道共用 Register.end 起点，只包围真实 loser 的 drain_block_won()。
+        fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::LoserReplay>();
+    }
     TRACE_SPAN_RECORD(register_begin, register_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Register, 0, 1);
     if (__builtin_expect(ctx.won, 0)) {
         dist_submit_build_winner_task(ctx, mixed, args);
@@ -345,6 +350,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_finish_kernel_tail(
         // Production losers perform real BlockWon progress. This is not the
         // empty loser path used by the standalone single-lane probe.
         drain_block_won(ctx.self);
+        fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::LoserReplay>();
         TRACE_TIMESTAMP(loser_replay_end);
         TRACE_SPAN_RECORD(
             register_end, loser_replay_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::LoserReplay, 0, 0

@@ -2995,3 +2995,36 @@ AllocComplete 内的 HeapGuard 慢路可能回收并执行 linked Kernel，因�
 两轮都通过 v2 严格校验和 `96/96` trusted/kernel/return-ready atomic 门禁，全局动态 call-count 也闭合。Case1 的调用数为 `256 = 255 AIC + 1 AIV`，63 个核为零调用，排除的 linked Kernel 为 0 次；阶段 scalar-code 时间为 584,689 ticks，I-cache request 为 170,344，miss 为 8,790。同一 ELF 内，它占完整 Submit scalar-code core-time 分母的 `584,689 / 296,983,746 = 0.1968758%`；该轮全局 Submit 墙钟为 `4.648447 ms`。
 
 这个百分比只能在 Case1 `20260722_220027` 的同一 ELF 内解释。AllocComplete 与 none、Winner 及其他 phase 均是独立 ELF，不对其百分比求和，也不用 `4.648447 ms` 与他轮墙钟相减或写成优化收益。
+
+### 2026-07-22 / O11：LoserReplay v2 阶段闭合
+
+状态：**[观察工具：305 项 Python UT、2 项 C++ 用例与真实 A5 B1/Case1 v2 门禁已闭合]**
+
+#### 源码、泳道与动态 shape
+
+LoserReplay 只存在于真实 Kernel loser 分支：它与 schema-v4 泳道共用 `Register.end` 起点，在 `drain_block_won()` 返回后立即闭合，对应报告边界 `register_end_to_drain_block_won_return`。Kernel winner 进入 WinnerBuild，Alloc winner 进入 AllocComplete，Alloc loser 只留在 Submit residual，都不生成 LoserReplay。
+
+当前 PA 每个 batch 有 4 个 Kernel task，每个 task 由 96 核各回放一次并且全局只有 1 个 winner；其中每 `B` 的 Kernel winner 固定为 `2B AIC + 2B AIV`。因此 LoserReplay 的精确公式是：
+
+- ALL：`(4 × 96 - 4)B = 380B`
+- AIC：`(4 × 32 - 2)B = 126B`
+- AIV：`(4 × 64 - 2)B = 254B`
+
+这是全局和角色总数闭合，不伪造逐核固定次数；单核实际调用数为 `4B - 该核赢得的 Kernel task 数`。B1 闭合 `380 = 126 AIC + 254 AIV`，Case1 闭合 `97,280 = 32,256 AIC + 65,024 AIV`，与先前 schema-v4 泳道原始记录一致。
+
+#### atomic、Kernel 与 ABI 语义
+
+`drain_block_won()` 只做 BlockWon 状态轮询、lane claim 和本地 ring slot 构造，不调用 linked Kernel；取到待回放数据时也只由 `build_ring_slot()` 物化 slot，不在 LoserReplay 内执行该 slot 中的 linked Kernel。因此本阶段的 excluded Kernel 闭合值应为 0，而不是把业务 Kernel 时间算进 scalar control。
+
+函数内消费 atomic 返回值的等待继续复用 O9 的 return-ready SYS bracket 从阶段时间中扣除；不消费返回值的 source-issue atomic 仍属于 scalar 发出开销，保留在时间分母内。PMU counter 仍包含两类 atomic 指令事件。新 phase 只复用已有累加器、状态位和 sidecar 字段，核心记录与 phase sidecar 仍各为 64 B，ABI 不增长。
+
+#### 离线与真实 A5 证据
+
+离线回归通过 305 项 Python UT 和 2 项 C++ 用例。真实 A5 产物为：
+
+- B1：`outputs/TestPagedAttentionUnroll_CaseB1_20260722_222358`
+- Case1：`outputs/TestPagedAttentionUnroll_Case1_20260722_222533`
+
+两轮的 v2 严格校验、`96/96` trusted/linked-kernel/return-ready atomic 门禁和动态全局/角色 call-count 均闭合。B1 的逐核调用数为 `3–4`，Case1 的调用数为 `97,280 = 32,256 AIC + 65,024 AIV`，逐核 `1,005–1,020`（AIC `1,005–1,013`，AIV `1,014–1,020`），excluded Kernel 为 0。Case1 的阶段 scalar-code 时间为 5,021,979 ticks，I-cache request 为 8,218,072，miss 为 453,234；在同一 ELF 内，它占完整 Submit scalar-code core-time 分母的 `5,021,979 / 394,817,462 = 1.2719749%`。
+
+Case1 执行了 97,280 对 begin/end observer，每对都含 shadow counter read-clear 和边界 bookkeeping，因此这是高频观察 ELF，不是无扰动业务 ELF。局部 SYS 时间边界故意位于 begin 读取之后、end 读取之前，但观察器仍会改变整体指令流、I-cache 和墙钟。该轮全局 Submit 墙钟 `5.256747 ms` 只用于证明采集闭合，不与 none、empty 或其他 phase 的独立 ELF 相减，不把跨 ELF 百分比求和，也不写任何收益结论。

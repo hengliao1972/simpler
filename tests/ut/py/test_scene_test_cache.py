@@ -158,6 +158,10 @@ def test_fdwic_profile_partitions_compile_cache(monkeypatch):
     assert _fdwic_profile() == "submit-pmu-alloc-complete-control"
     assert _profiled_cache_key(base) == (*base, "submit-pmu-alloc-complete-control")
 
+    monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-loser-replay")
+    assert _fdwic_profile() == "submit-pmu-loser-replay"
+    assert _profiled_cache_key(base) == (*base, "submit-pmu-loser-replay")
+
 
 def test_fdwic_private_profiles_have_isolated_compile_definitions():
     assert _fdwic_compile_definitions("none") is None
@@ -229,6 +233,11 @@ def test_fdwic_private_profiles_have_isolated_compile_definitions():
         "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=11",
         "PTO_FDWIC_TRACE_ENABLED=0",
     ]
+    assert _fdwic_compile_definitions("submit-pmu-loser-replay") == [
+        "PTO_FDWIC_SUBMIT_PMU=1",
+        "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=12",
+        "PTO_FDWIC_TRACE_ENABLED=0",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -272,6 +281,14 @@ def test_fdwic_private_profiles_have_isolated_compile_definitions():
             [
                 "PTO_FDWIC_SUBMIT_PMU=1",
                 "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=11",
+                "PTO_FDWIC_TRACE_ENABLED=0",
+            ],
+        ),
+        (
+            "submit-pmu-loser-replay",
+            [
+                "PTO_FDWIC_SUBMIT_PMU=1",
+                "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=12",
                 "PTO_FDWIC_TRACE_ENABLED=0",
             ],
         ),
@@ -741,6 +758,7 @@ def test_submit_pmu_elf_gate_accepts_only_whole_window_observer(monkeypatch, tmp
         "submit-pmu-fanin",
         "submit-pmu-winner-build-control",
         "submit-pmu-alloc-complete-control",
+        "submit-pmu-loser-replay",
     ],
 )
 def test_submit_pmu_phase_elf_gate_requires_running_shadow_reader(monkeypatch, tmp_path, profile):
@@ -818,6 +836,7 @@ def test_submit_pmu_elf_gate_rejects_incomplete_or_mixed_image(monkeypatch, tmp_
         "submit-pmu-fanin",
         "submit-pmu-winner-build-control",
         "submit-pmu-alloc-complete-control",
+        "submit-pmu-loser-replay",
     ],
 )
 def test_submit_pmu_phase_elf_gate_rejects_missing_running_shadow_reader(monkeypatch, tmp_path, profile):
@@ -843,6 +862,7 @@ def test_submit_pmu_phase_elf_gate_rejects_missing_running_shadow_reader(monkeyp
         "submit-pmu-fanin",
         "submit-pmu-winner-build-control",
         "submit-pmu-alloc-complete-control",
+        "submit-pmu-loser-replay",
     ),
 )
 def test_submit_pmu_host_elf_gate_accepts_exact_profile_and_hooks(monkeypatch, tmp_path, profile):
@@ -969,6 +989,7 @@ class _FakePytestConfig:
         "submit-pmu-fanin",
         "submit-pmu-winner-build-control",
         "submit-pmu-alloc-complete-control",
+        "submit-pmu-loser-replay",
     ),
 )
 def test_submit_pmu_profile_publishes_environment(monkeypatch, profile):

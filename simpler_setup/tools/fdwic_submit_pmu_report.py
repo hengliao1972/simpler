@@ -56,6 +56,7 @@ PREPARE_MAP_CAPTURE_MODE = "submit-pmu-prepare-map"
 FANIN_CAPTURE_MODE = "submit-pmu-fanin"
 WINNER_BUILD_CAPTURE_MODE = "submit-pmu-winner-build-control"
 ALLOC_COMPLETE_CAPTURE_MODE = "submit-pmu-alloc-complete-control"
+LOSER_REPLAY_CAPTURE_MODE = "submit-pmu-loser-replay"
 ARG_BUILD_PHASE_ID = 1
 EMPTY_BRACKET_PHASE_ID = 2
 MATERIALIZE_PHASE_ID = 3
@@ -67,6 +68,7 @@ PREPARE_MAP_PHASE_ID = 8
 FANIN_PHASE_ID = 9
 WINNER_BUILD_PHASE_ID = 10
 ALLOC_COMPLETE_PHASE_ID = 11
+LOSER_REPLAY_PHASE_ID = 12
 PHASE_CONFIG_BY_MODE = {
     ARG_BUILD_CAPTURE_MODE: {
         "id": ARG_BUILD_PHASE_ID,
@@ -156,11 +158,21 @@ PHASE_CONFIG_BY_MODE = {
         "counter_semantics": "discontinuous_running_read_clear_excluding_linked_kernel_calls",
         "time_semantics": "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls",
     },
+    LOSER_REPLAY_CAPTURE_MODE: {
+        "id": LOSER_REPLAY_PHASE_ID,
+        "name": "loser-replay",
+        "boundary": "register_end_to_drain_block_won_return",
+        "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+        "counter_semantics": "running_read_clear_observed_bracket",
+        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+    },
 }
 DYNAMIC_PHASE_CAPTURE_MODES = frozenset(
-    {FANIN_CAPTURE_MODE, WINNER_BUILD_CAPTURE_MODE, ALLOC_COMPLETE_CAPTURE_MODE}
+    {FANIN_CAPTURE_MODE, WINNER_BUILD_CAPTURE_MODE, ALLOC_COMPLETE_CAPTURE_MODE, LOSER_REPLAY_CAPTURE_MODE}
 )
-FIXED_ROLE_DYNAMIC_PHASE_CAPTURE_MODES = frozenset({FANIN_CAPTURE_MODE, WINNER_BUILD_CAPTURE_MODE})
+FIXED_ROLE_DYNAMIC_PHASE_CAPTURE_MODES = frozenset(
+    {FANIN_CAPTURE_MODE, WINNER_BUILD_CAPTURE_MODE, LOSER_REPLAY_CAPTURE_MODE}
+)
 KERNEL_EXCLUDING_PHASE_CAPTURE_MODES = frozenset(PHASE_CONFIG_BY_MODE)
 
 
@@ -436,11 +448,19 @@ def _expected_dynamic_phase_calls(mode: str, expected_submits: int) -> dict[str,
         return {"all": 4 * batches, "aic": 2 * batches, "aiv": 2 * batches}
     if mode == ALLOC_COMPLETE_CAPTURE_MODE:
         return {"all": batches}
+    if mode == LOSER_REPLAY_CAPTURE_MODE:
+        return {
+            "all": (4 * EXPECTED_CORES - 4) * batches,
+            "aic": (4 * EXPECTED_AIC_CORES - 2) * batches,
+            "aiv": (4 * EXPECTED_AIV_CORES - 2) * batches,
+        }
     _fail(f"{mode} has no dynamic phase call formula")
 
 
 def _dynamic_phase_max_calls_per_core(mode: str, expected_submits: int) -> int:
     batches = expected_submits // 5
+    if mode == LOSER_REPLAY_CAPTURE_MODE:
+        return 4 * batches
     return 2 * batches if mode in FIXED_ROLE_DYNAMIC_PHASE_CAPTURE_MODES else batches
 
 

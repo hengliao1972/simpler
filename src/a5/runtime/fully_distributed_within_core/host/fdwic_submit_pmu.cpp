@@ -81,6 +81,9 @@ constexpr SubmitPmuProfile kSubmitPmuProfiles[] = {
      kFdwicSubmitPmuPhaseBytes, "alloc-complete-control", "alloc_complete_begin_to_end_excluding_linked_kernel_calls",
      "discontinuous_running_read_clear_excluding_linked_kernel_calls",
      "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls"},
+    {"submit-pmu-loser-replay", kFdwicSubmitPmuModeLoserReplay, FdwicSubmitPmuPhase::LoserReplay,
+     kFdwicSubmitPmuPhaseBytes, "loser-replay", "register_end_to_drain_block_won_return",
+     "running_read_clear_observed_bracket", "inner_sys_cnt_between_boundary_observers"},
 };
 
 const SubmitPmuProfile *requested_profile() {

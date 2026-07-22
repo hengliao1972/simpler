@@ -30,6 +30,7 @@ from simpler_setup.tools.fdwic_submit_pmu_report import (
     EFDRAIN_CONTROL_CAPTURE_MODE,
     EMPTY_BRACKET_CAPTURE_MODE,
     FANIN_CAPTURE_MODE,
+    LOSER_REPLAY_CAPTURE_MODE,
     MATERIALIZE_CAPTURE_MODE,
     NONE_REQUIRED_STATUS_MASK,
     PHASE_REQUIRED_STATUS_MASK,
@@ -433,6 +434,39 @@ def _valid_alloc_complete_capture(
                 "phase_begin_reads": business_calls + excluded_calls,
                 "phase_end_reads": business_calls + excluded_calls,
                 "phase_excluded_kernel_calls": excluded_calls,
+            }
+        )
+    return capture
+
+
+def _valid_loser_replay_capture() -> dict[str, Any]:
+    """Build the exact B1 loser complement: four Kernel winners among 96 workers."""
+
+    capture = _valid_arg_build_capture()
+    capture["capture"]["mode"] = LOSER_REPLAY_CAPTURE_MODE
+    capture["configuration"]["phase"] = {
+        "id": 12,
+        "name": "loser-replay",
+        "boundary": "register_end_to_drain_block_won_return",
+        "call_shape": "dynamic_balanced",
+        "expected_calls": {"all": 380, "aic": 126, "aiv": 254},
+        "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
+        "counter_semantics": "running_read_clear_observed_bracket",
+        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+    }
+    capture["validation"]["phase_global_call_count_closed"] = True
+    winner_cores = {0, 1, 32, 33}
+    for logical_core_id, record in enumerate(capture["records"]):
+        calls = 3 if logical_core_id in winner_cores else 4
+        record.update(
+            {
+                "phase_id": 12,
+                "phase_elapsed_ticks": 75 * calls,
+                "phase_icache_requests_observed": 40 * calls,
+                "phase_icache_misses_observed": 2 * calls,
+                "phase_begin_reads": calls,
+                "phase_end_reads": calls,
+                "phase_excluded_kernel_calls": 0,
             }
         )
     return capture
@@ -1311,6 +1345,116 @@ def test_alloc_complete_control_rejects_wrong_record_phase_id(tmp_path: Path) ->
         load_capture(_write_capture(tmp_path, capture))
 
 
+def test_valid_loser_replay_capture_closes_b1_role_totals_and_html(tmp_path: Path) -> None:
+    raw_path = _write_capture(tmp_path, _valid_loser_replay_capture())
+
+    capture = load_capture(raw_path)
+
+    assert capture.phase_summary is not None
+    all_phase = capture.phase_summary["all"]
+    assert all_phase["phase_business_calls"] == 380
+    assert capture.phase_summary["aic"]["phase_business_calls"] == 126
+    assert capture.phase_summary["aiv"]["phase_business_calls"] == 254
+    assert all_phase["phase_begin_reads"] == 380
+    assert all_phase["phase_end_reads"] == 380
+    assert all_phase["phase_excluded_kernel_calls"] == 0
+    assert all_phase["phase_elapsed_ticks_per_call"] == pytest.approx(75)
+    assert all_phase["phase_icache_requests_observed_per_call"] == pytest.approx(40)
+    assert all_phase["phase_icache_misses_observed_per_call"] == pytest.approx(2)
+    assert all_phase["phase_calls_per_core"]["min"] == 3
+    assert all_phase["phase_calls_per_core"]["max"] == 4
+    assert all_phase["phase_zero_call_cores"] == 0
+
+    document = render_report(raw_path)
+    assert "<code>loser-replay</code> 阶段观察" in document
+    assert "phase_id=12" in document
+    assert "register_end_to_drain_block_won_return" in document
+    assert "running_read_clear_observed_bracket" in document
+    assert "inner_sys_cnt_between_boundary_observers" in document
+    assert "call_shape=dynamic_balanced" in document
+    assert "expected_calls=ALL 380 / AIC 126 / AIV 254" in document
+    assert "业务调用 380 次；排除 linked Kernel 调用 0 次" in document
+    assert "逐核 3–4；零调用核 0" in document
+
+
+def test_loser_replay_dynamic_formula_scales_to_b2() -> None:
+    assert report_module._expected_dynamic_phase_calls(LOSER_REPLAY_CAPTURE_MODE, 10) == {
+        "all": 760,
+        "aic": 252,
+        "aiv": 508,
+    }
+    assert report_module._dynamic_phase_max_calls_per_core(LOSER_REPLAY_CAPTURE_MODE, 10) == 8
+
+
+def test_loser_replay_rejects_wrong_global_call_total(tmp_path: Path) -> None:
+    capture = _valid_loser_replay_capture()
+    capture["records"][0]["phase_begin_reads"] += 1
+    capture["records"][0]["phase_end_reads"] += 1
+
+    with pytest.raises(ValueError, match="dynamic phase call totals: global call total must equal 380"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_loser_replay_rejects_wrong_role_totals_with_closed_global_total(tmp_path: Path) -> None:
+    capture = _valid_loser_replay_capture()
+    capture["records"][2]["phase_begin_reads"] -= 1
+    capture["records"][2]["phase_end_reads"] -= 1
+    capture["records"][32]["phase_begin_reads"] += 1
+    capture["records"][32]["phase_end_reads"] += 1
+
+    with pytest.raises(ValueError, match="dynamic phase call totals must equal"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_loser_replay_rejects_per_core_call_count_above_four_per_batch(tmp_path: Path) -> None:
+    capture = _valid_loser_replay_capture()
+    capture["records"][0]["phase_begin_reads"] = 5
+    capture["records"][0]["phase_end_reads"] = 5
+
+    with pytest.raises(ValueError, match=r"records\[0\] business phase calls exceed dynamic per-core maximum 4"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_loser_replay_rejects_unbalanced_boundaries(tmp_path: Path) -> None:
+    capture = _valid_loser_replay_capture()
+    capture["records"][0]["phase_end_reads"] -= 1
+
+    with pytest.raises(ValueError, match="dynamic phase begin/end reads must be balanced"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("id", 11),
+        ("name", "alloc-complete-control"),
+        ("boundary", "alloc_complete_begin_to_end_excluding_linked_kernel_calls"),
+        ("call_shape", "dynamic_global"),
+        ("expected_calls", {"all": 380}),
+        ("counter_semantics", "discontinuous_running_read_clear_excluding_linked_kernel_calls"),
+        ("time_semantics", "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls"),
+    ),
+)
+def test_loser_replay_rejects_mismatched_phase_configuration(
+    tmp_path: Path,
+    field: str,
+    value: Any,
+) -> None:
+    capture = _valid_loser_replay_capture()
+    capture["configuration"]["phase"][field] = value
+
+    with pytest.raises(ValueError, match=r"configuration\.phase"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_loser_replay_rejects_wrong_record_phase_id(tmp_path: Path) -> None:
+    capture = _valid_loser_replay_capture()
+    capture["records"][0]["phase_id"] = 11
+
+    with pytest.raises(ValueError, match=r"records\[0\]\.phase_id must equal 12"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
 def test_valid_claim_capture_tracks_current_business_boundary(tmp_path: Path) -> None:
     raw_path = _write_capture(tmp_path, _valid_claim_capture())
 
@@ -1615,6 +1759,7 @@ def test_efdrain_control_requires_closed_kernel_exclusion_validation(
         _valid_efdrain_control_capture,
         _valid_winner_build_capture,
         _valid_alloc_complete_capture,
+        _valid_loser_replay_capture,
     ),
 )
 def test_all_phase_modes_require_excluded_kernel_call_count(
@@ -1961,6 +2106,7 @@ def test_efdrain_control_build_identity_uses_phase_id_7(
         (FANIN_CAPTURE_MODE, _valid_fanin_capture, 9),
         (WINNER_BUILD_CAPTURE_MODE, _valid_winner_build_capture, 10),
         (ALLOC_COMPLETE_CAPTURE_MODE, _valid_alloc_complete_capture, 11),
+        (LOSER_REPLAY_CAPTURE_MODE, _valid_loser_replay_capture, 12),
     ),
 )
 def test_each_phase_profile_closes_raw_identity_provenance_and_html(

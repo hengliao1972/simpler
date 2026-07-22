@@ -168,6 +168,7 @@ def pytest_addoption(parser):
             "submit-pmu-fanin",
             "submit-pmu-winner-build-control",
             "submit-pmu-alloc-complete-control",
+            "submit-pmu-loser-replay",
         ],
         default="none",
         help="Select a private fully_distributed_within_core evidence build. "
@@ -186,7 +187,8 @@ def pytest_addoption(parser):
         "submit-pmu-winner-build-control attributes scalar control inside the complete WinnerBuild time boundary "
         "while excluding linked Kernel calls; "
         "submit-pmu-alloc-complete-control attributes scalar control inside the complete AllocComplete time boundary "
-        "while excluding linked Kernel calls.",
+        "while excluding linked Kernel calls; "
+        "submit-pmu-loser-replay attributes the real Kernel-loser drain_block_won call body.",
     )
     parser.addoption(
         "--use-example-exec-time",
@@ -493,6 +495,7 @@ def _configure_fdwic_profile(config):
         "submit-pmu-fanin",
         "submit-pmu-winner-build-control",
         "submit-pmu-alloc-complete-control",
+        "submit-pmu-loser-replay",
     }:
         raise pytest.UsageError(f"unsupported --fdwic-profile {fdwic_profile!r}")
 
@@ -726,6 +729,7 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
         "submit-pmu-fanin",
         "submit-pmu-winner-build-control",
         "submit-pmu-alloc-complete-control",
+        "submit-pmu-loser-replay",
     }:
         incompatible = []
         for item in items:
