@@ -1995,7 +1995,8 @@ def _phase_overview(
         recording_cost_reference
     )
 
-    rows = []
+    group_cells: dict[str, dict[str, str]] = {}
+    group_headers: dict[str, str] = {}
     frequencies = capture.data["configuration"]["pmu_cycles_per_ns"]
     for group_name in GROUP_NAMES:
         group = capture.phase_summary[group_name]
@@ -2004,6 +2005,7 @@ def _phase_overview(
         )
         reference_metrics = None if reference_group is None else reference_group["metrics"]
         title = {"all": "ALL", "aic": "AIC", "aiv": "AIV"}[group_name]
+        group_headers[group_name] = f"{title}<small>{group['cores']} 核</small>"
         cycles_per_ns = float(frequencies[group_name])
         total_observed = _phase_cycle_cell(
             group["phase_total_cycles_observed"],
@@ -2039,7 +2041,11 @@ def _phase_overview(
             group["phase_miss_observed_plus_capture_gap_share_of_primary"],
             None if reference_metrics is None else reference_metrics["icache_misses"],
         )
-        reads = f"{_format_integer(group['phase_begin_reads'])} / {_format_integer(group['phase_end_reads'])}"
+        reads = (
+            "<small>Begin / End："
+            f"{_format_integer(group['phase_begin_reads'])} / "
+            f"{_format_integer(group['phase_end_reads'])}</small>"
+        )
         if capture.data["capture"]["mode"] in KERNEL_EXCLUDING_PHASE_CAPTURE_MODES:
             reads += (
                 "<br><small>业务调用 "
@@ -2100,15 +2106,33 @@ def _phase_overview(
             f"Σ {_format_integer(group['phase_elapsed_ticks']['sum'])} raw ticks<br>"
             f"<small>逐核 {_metric_extrema(group['phase_elapsed_ticks'])}；仅边界诊断</small>"
         )
-        rows.append(
-            "<tr>"
-            f"<th>{title}<small>{group['cores']} 核</small></th>"
-            f"<td>{total_observed}</td><td>{scalar_observed}</td><td>{non_scalar}</td>"
-            f"<td>{relationships}</td>"
-            f"<td>{request_observed}</td><td>{miss_observed}</td>"
-            f"<td>{sys_diagnostic}<br><small>{reads}</small></td>"
-            "</tr>"
-        )
+        group_cells[group_name] = {
+            "total": total_observed,
+            "scalar": scalar_observed,
+            "non_scalar": non_scalar,
+            "relationships": relationships,
+            "requests": request_observed,
+            "misses": miss_observed,
+            "sys": f"{sys_diagnostic}<br>{reads}",
+        }
+
+    phase_rows = (
+        ("Phase PMU total", "total"),
+        ("Phase scalar busy", "scalar"),
+        ("非 Scalar-busy 残余", "non_scalar"),
+        (relationship_header, "relationships"),
+        (request_header, "requests"),
+        (miss_header, "misses"),
+        ("SYS 边界诊断 / Begin-End", "sys"),
+    )
+    rows = "".join(
+        "<tr>"
+        f"<th>{html.escape(label)}</th>"
+        + "".join(f"<td>{group_cells[group_name][cell_key]}</td>" for group_name in GROUP_NAMES)
+        + "</tr>"
+        for label, cell_key in phase_rows
+    )
+    headers = "".join(f"<th>{group_headers[group_name]}</th>" for group_name in GROUP_NAMES)
     return f"""
   <section class="phase-overview">
     <h2><code>{phase_name}</code> 阶段观察（phase_id={phase["id"]}）</h2>
@@ -2134,13 +2158,9 @@ def _phase_overview(
       的极值，不是逐调用极值。</p>
     <div class="table-wrap phase-table"><table>
       <thead><tr>
-        <th>核组</th><th>Phase PMU total</th><th>Phase scalar busy</th>
-        <th>非 Scalar-busy 残余</th><th>{relationship_header}</th>
-        <th>{request_header}</th>
-        <th>{miss_header}</th>
-        <th>SYS 边界诊断 / Begin-End</th>
+        <th>指标</th>{headers}
       </tr></thead>
-      <tbody>{"".join(rows)}</tbody>
+      <tbody>{rows}</tbody>
     </table></div>
   </section>
     """
@@ -2254,7 +2274,14 @@ def _document(
     .phase-overview h2 {{ margin-top:14px; }} .phase-overview p {{ max-width:1200px; }}
     .provenance-overview {{ background:#f0fdf4; border:1px solid #bbf7d0; border-radius:10px; padding:4px 16px 16px; }}
     .provenance-overview h2 {{ margin-top:14px; }} .provenance-meta {{ max-width:1200px; }}
-    .phase-table {{ box-shadow:none; }} .phase-table th:first-child {{ text-align:left; }}
+    .phase-table {{ box-shadow:none; }}
+    .phase-table table {{ width:100%; min-width:900px; table-layout:fixed; white-space:normal; }}
+    .phase-table th,.phase-table td {{
+      text-align:left; white-space:normal; vertical-align:top; overflow-wrap:anywhere;
+    }}
+    .phase-table th:first-child {{
+      width:190px; position:sticky; left:0; z-index:2; text-align:left; background:var(--panel);
+    }}
     .phase-table th small {{ display:block; font-weight:400; color:var(--muted); }}
     .groups {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(310px,1fr)); gap:14px; }}
     .group-card {{ padding:16px; min-width:0; }} .group-card h3 {{ margin:0 0 12px; }}
@@ -2272,10 +2299,16 @@ def _document(
     .axis {{ stroke:#94a3b8; stroke-width:1; }}
     svg text {{ fill:#64748b; font-size:12px; }}
     .table-wrap {{ max-width:100%; overflow:auto; }}
-    table {{ border-collapse:collapse; width:max-content; min-width:100%; white-space:nowrap; }}
-    th,td {{ border-bottom:1px solid var(--line); padding:8px 10px; text-align:right; }}
-    th {{ position:sticky; top:0; background:var(--panel); }}
-    th:nth-child(3),td:nth-child(3) {{ text-align:center; }} code {{ overflow-wrap:anywhere; }}
+    table {{ border-collapse:collapse; width:100%; min-width:680px; }}
+    th,td {{
+      border-bottom:1px solid var(--line); padding:8px 10px; text-align:right;
+      white-space:normal; vertical-align:top; overflow-wrap:anywhere;
+    }}
+    .raw-core-table table {{ width:max-content; min-width:100%; white-space:nowrap; }}
+    .raw-core-table th,.raw-core-table td {{ white-space:nowrap; overflow-wrap:normal; }}
+    thead th {{ position:sticky; top:0; z-index:1; background:var(--panel); }}
+    .raw-core-table th:nth-child(3),.raw-core-table td:nth-child(3) {{ text-align:center; }}
+    code {{ overflow-wrap:anywhere; }}
   </style>
 </head>
 <body><main>
@@ -2311,7 +2344,7 @@ def _document(
   <div class="charts">{charts}</div>
   <h2>逐核原始主计数</h2>
   <p class="fine">报告展示 primary request/miss；{shadow_note}</p>
-  <div class="table-wrap"><table>
+  <div class="table-wrap raw-core-table"><table>
     <thead><tr>
       <th>Physical</th><th>Logical</th><th>Role</th><th>Block</th><th>Lane</th>
       <th>SYS gate 诊断 raw ticks</th><th>原始墙钟 µs</th>

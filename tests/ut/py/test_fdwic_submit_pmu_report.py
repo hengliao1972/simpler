@@ -940,6 +940,13 @@ def test_valid_arg_build_capture_renders_same_elf_phase_observation_first(tmp_pa
     assert "Phase PMU total" in document
     assert "Phase scalar busy" in document
     assert "非 Scalar-busy 残余" in document
+    assert "<th>指标</th><th>ALL<small>96 核</small></th>" in document
+    assert "<tr><th>Phase PMU total</th>" in document
+    assert "<tr><th>Phase scalar busy</th>" in document
+    assert "<tr><th>SYS 边界诊断 / Begin-End</th>" in document
+    assert ".phase-table table { width:100%; min-width:900px; table-layout:fixed; white-space:normal; }" in document
+    assert 'class="table-wrap raw-core-table"' in document
+    assert "<small><small>" not in document
     assert "原始阶段关系（非业务占比）" in document
     assert "本报告没有提供 empty-bracket 校准输入" in document
     assert "以下均为原始 observed，不能作为业务占比" in document

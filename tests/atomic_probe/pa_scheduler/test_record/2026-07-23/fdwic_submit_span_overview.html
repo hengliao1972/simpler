@@ -29,19 +29,27 @@
     }
     .stack span { min-width:1px; }
     .table-wrap { max-width:100%; overflow-x:auto; border:1px solid var(--line); border-radius:8px; }
-    table { width:100%; border-collapse:collapse; min-width:680px; }
-    th,td { padding:9px 11px; border-bottom:1px solid var(--line); text-align:left; white-space:nowrap; }
+    table { width:100%; border-collapse:collapse; min-width:0; }
+    th,td {
+      padding:9px 11px; border-bottom:1px solid var(--line); text-align:left;
+      white-space:normal; vertical-align:top; overflow-wrap:anywhere;
+    }
     th { background:#f8fafc; } tr:last-child td { border-bottom:0; }
     td i { display:inline-block; width:9px; height:9px; margin-right:7px; border-radius:2px; }
-    .partition table { min-width:1120px; }
-    .evidence-ratio { white-space:normal; min-width:145px; }
+    .partition table { min-width:920px; table-layout:fixed; }
+    .partition-region { width:14%; }
+    .partition-time { width:11%; }
+    .partition-share { width:10%; }
+    .partition-evidence { width:20%; }
+    .partition-range { width:12.5%; }
+    .evidence-ratio { white-space:normal; min-width:0; }
     .evidence-ratio strong,.evidence-ratio small { display:block; }
     .evidence-ratio small { color:var(--muted); }
     .evidence-na { color:var(--muted); text-align:center; }
     .partition-total-row > th { white-space:normal; }
     .partition-total-row strong,.partition-total-row small { display:block; }
     .partition-total-row small { color:var(--muted); }
-    .partition-comparison-row > th { vertical-align:top; white-space:normal; min-width:185px; }
+    .partition-comparison-row > th { vertical-align:top; white-space:normal; min-width:0; }
     .partition-comparison-row > th small { display:block; color:var(--muted); font-weight:400; }
     .partition-summary-grid {
       display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:8px;
@@ -71,18 +79,23 @@
       position:absolute; top:0; bottom:0; width:2px; background:#111827;
       box-shadow:0 0 0 1px #ffffffcc;
     }
-    .synthetic-table { min-width:980px; }
+    .synthetic-table { min-width:760px; table-layout:fixed; }
     .synthetic-table th,.synthetic-table td { white-space:normal; vertical-align:top; }
     .synthetic-table td strong,.synthetic-table td small { display:block; }
     .phase-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,560px),1fr)); gap:14px; }
+    .phase-card,.phase-card header > div { min-width:0; }
     .phase-card { margin:0; }
     .phase-card header { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }
     .phase-card h3 { margin:0; }
-    .tag { padding:3px 8px; background:#eef2ff; color:#4338ca; border-radius:999px; white-space:nowrap; }
+    .tag {
+      max-width:45%; padding:3px 8px; background:#eef2ff; color:#4338ca;
+      border-radius:999px; white-space:normal; overflow-wrap:anywhere;
+    }
     .metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:10px; margin:12px 0; }
     .metric { padding:11px 12px; background:#f8fafc; border:1px solid #e5e7eb; border-radius:8px; min-width:0; }
     .metric span,.metric small { display:block; color:var(--muted); }
     .metric strong { display:block; font-size:19px; margin:2px 0; overflow-wrap:anywhere; }
+    .boundary,.source,.metric small { overflow-wrap:anywhere; }
     .diagnostic { padding:8px 10px; border-left:3px solid #94a3b8; background:#f8fafc; color:var(--muted); }
     .source a { color:#1d4ed8; }
     @media (max-width:650px) {
@@ -141,6 +154,11 @@
         <h3>SubmitEnvelope</h3>
         <div class="stack"><span style="width:85.38393886%;background:#2563eb" title="SubmitUnion 85.384%"></span><span style="width:14.61606114%;background:#0d9488" title="BetweenSubmitResidual 14.616%"></span></div>
         <div class="table-wrap"><table>
+          <colgroup>
+            <col class="partition-region"><col class="partition-time"><col class="partition-share">
+            <col class="partition-evidence"><col class="partition-evidence">
+            <col class="partition-range"><col class="partition-range">
+          </colgroup>
           <thead>
             <tr><th rowspan="2">区域</th><th rowspan="2">Σ core-time</th>
               <th colspan="3">占比对照</th>
@@ -158,6 +176,11 @@
         <h3>SubmitUnion</h3>
         <div class="stack"><span style="width:16.18526257%;background:#2563eb" title="EfDrain 16.185%"></span><span style="width:25.32304661%;background:#0d9488" title="Materialize 25.323%"></span><span style="width:5.39356604%;background:#7c3aed" title="PrepareMap 5.394%"></span><span style="width:20.44218802%;background:#d97706" title="Claim 20.442%"></span><span style="width:0.39888713%;background:#dc2626" title="Fanin 0.399%"></span><span style="width:12.51725727%;background:#0891b2" title="Register 12.517%"></span><span style="width:1.66552057%;background:#65a30d" title="WinnerBuild 1.666%"></span><span style="width:0.21535821%;background:#2563eb" title="AllocComplete 0.215%"></span><span style="width:3.18095597%;background:#0d9488" title="LoserReplay 3.181%"></span><span style="width:10.85628747%;background:#7c3aed" title="SubmitInternalResidual 10.856%"></span><span style="width:3.82167014%;background:#d97706" title="SubmitTailResidual 3.822%"></span></div>
         <div class="table-wrap"><table>
+          <colgroup>
+            <col class="partition-region"><col class="partition-time"><col class="partition-share">
+            <col class="partition-evidence"><col class="partition-evidence">
+            <col class="partition-range"><col class="partition-range">
+          </colgroup>
           <thead>
             <tr><th rowspan="2">区域</th><th rowspan="2">平均每核时间</th>
               <th colspan="3">均值占比对照</th>
@@ -175,6 +198,11 @@
         <h3>EfDrain</h3>
         <div class="stack"><span style="width:51.20196720%;background:#2563eb" title="EfDrainKernelUnion 51.202%"></span><span style="width:48.79803280%;background:#0d9488" title="EfDrainControl 48.798%"></span></div>
         <div class="table-wrap"><table>
+          <colgroup>
+            <col class="partition-region"><col class="partition-time"><col class="partition-share">
+            <col class="partition-evidence"><col class="partition-evidence">
+            <col class="partition-range"><col class="partition-range">
+          </colgroup>
           <thead>
             <tr><th rowspan="2">区域</th><th rowspan="2">Σ core-time</th>
               <th colspan="3">占比对照</th>
@@ -194,6 +222,11 @@
         <h3>WorkerCompletion</h3>
         <div class="stack"><span style="width:99.34508051%;background:#2563eb" title="OrchestrationReplay 99.345%"></span><span style="width:0.65491949%;background:#0d9488" title="FinalDrain 0.655%"></span></div>
         <div class="table-wrap"><table>
+          <colgroup>
+            <col class="partition-region"><col class="partition-time"><col class="partition-share">
+            <col class="partition-evidence"><col class="partition-evidence">
+            <col class="partition-range"><col class="partition-range">
+          </colgroup>
           <thead>
             <tr><th rowspan="2">区域</th><th rowspan="2">Σ core-time</th>
               <th colspan="3">占比对照</th>
@@ -211,6 +244,11 @@
         <h3>OrchestrationReplay</h3>
         <div class="stack"><span style="width:0.23373045%;background:#2563eb" title="OrchestrationSetup 0.234%"></span><span style="width:85.16955224%;background:#0d9488" title="SubmitUnion 85.170%"></span><span style="width:14.57936235%;background:#7c3aed" title="BetweenSubmitResidual 14.579%"></span><span style="width:0.01735496%;background:#d97706" title="OrchestrationTail 0.017%"></span></div>
         <div class="table-wrap"><table>
+          <colgroup>
+            <col class="partition-region"><col class="partition-time"><col class="partition-share">
+            <col class="partition-evidence"><col class="partition-evidence">
+            <col class="partition-range"><col class="partition-range">
+          </colgroup>
           <thead>
             <tr><th rowspan="2">区域</th><th rowspan="2">Σ core-time</th>
               <th colspan="3">占比对照</th>
@@ -228,6 +266,11 @@
         <h3>FinalDrain</h3>
         <div class="stack"><span style="width:15.39508759%;background:#2563eb" title="FinalDrainKernelUnion 15.395%"></span><span style="width:84.60491241%;background:#0d9488" title="FinalDrainResidual 84.605%"></span></div>
         <div class="table-wrap"><table>
+          <colgroup>
+            <col class="partition-region"><col class="partition-time"><col class="partition-share">
+            <col class="partition-evidence"><col class="partition-evidence">
+            <col class="partition-range"><col class="partition-range">
+          </colgroup>
           <thead>
             <tr><th rowspan="2">区域</th><th rowspan="2">Σ core-time</th>
               <th colspan="3">占比对照</th>

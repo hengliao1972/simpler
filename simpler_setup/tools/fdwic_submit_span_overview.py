@@ -1616,6 +1616,11 @@ def _partition_html(
         <h3>{html.escape(str(partition["name"]))}</h3>
         <div class="stack">{"".join(bars)}</div>
         <div class="table-wrap"><table>
+          <colgroup>
+            <col class="partition-region"><col class="partition-time"><col class="partition-share">
+            <col class="partition-evidence"><col class="partition-evidence">
+            <col class="partition-range"><col class="partition-range">
+          </colgroup>
           <thead>
             <tr><th rowspan="2">区域</th><th rowspan="2">{core_time_header}</th>
               <th colspan="3">{comparison_header}</th>
@@ -2184,19 +2189,27 @@ def render_overview(payload: Mapping[str, Any]) -> str:
     }}
     .stack span {{ min-width:1px; }}
     .table-wrap {{ max-width:100%; overflow-x:auto; border:1px solid var(--line); border-radius:8px; }}
-    table {{ width:100%; border-collapse:collapse; min-width:680px; }}
-    th,td {{ padding:9px 11px; border-bottom:1px solid var(--line); text-align:left; white-space:nowrap; }}
+    table {{ width:100%; border-collapse:collapse; min-width:0; }}
+    th,td {{
+      padding:9px 11px; border-bottom:1px solid var(--line); text-align:left;
+      white-space:normal; vertical-align:top; overflow-wrap:anywhere;
+    }}
     th {{ background:#f8fafc; }} tr:last-child td {{ border-bottom:0; }}
     td i {{ display:inline-block; width:9px; height:9px; margin-right:7px; border-radius:2px; }}
-    .partition table {{ min-width:1120px; }}
-    .evidence-ratio {{ white-space:normal; min-width:145px; }}
+    .partition table {{ min-width:920px; table-layout:fixed; }}
+    .partition-region {{ width:14%; }}
+    .partition-time {{ width:11%; }}
+    .partition-share {{ width:10%; }}
+    .partition-evidence {{ width:20%; }}
+    .partition-range {{ width:12.5%; }}
+    .evidence-ratio {{ white-space:normal; min-width:0; }}
     .evidence-ratio strong,.evidence-ratio small {{ display:block; }}
     .evidence-ratio small {{ color:var(--muted); }}
     .evidence-na {{ color:var(--muted); text-align:center; }}
     .partition-total-row > th {{ white-space:normal; }}
     .partition-total-row strong,.partition-total-row small {{ display:block; }}
     .partition-total-row small {{ color:var(--muted); }}
-    .partition-comparison-row > th {{ vertical-align:top; white-space:normal; min-width:185px; }}
+    .partition-comparison-row > th {{ vertical-align:top; white-space:normal; min-width:0; }}
     .partition-comparison-row > th small {{ display:block; color:var(--muted); font-weight:400; }}
     .partition-summary-grid {{
       display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:8px;
@@ -2226,18 +2239,23 @@ def render_overview(payload: Mapping[str, Any]) -> str:
       position:absolute; top:0; bottom:0; width:2px; background:#111827;
       box-shadow:0 0 0 1px #ffffffcc;
     }}
-    .synthetic-table {{ min-width:980px; }}
+    .synthetic-table {{ min-width:760px; table-layout:fixed; }}
     .synthetic-table th,.synthetic-table td {{ white-space:normal; vertical-align:top; }}
     .synthetic-table td strong,.synthetic-table td small {{ display:block; }}
     .phase-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,560px),1fr)); gap:14px; }}
+    .phase-card,.phase-card header > div {{ min-width:0; }}
     .phase-card {{ margin:0; }}
     .phase-card header {{ display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }}
     .phase-card h3 {{ margin:0; }}
-    .tag {{ padding:3px 8px; background:#eef2ff; color:#4338ca; border-radius:999px; white-space:nowrap; }}
+    .tag {{
+      max-width:45%; padding:3px 8px; background:#eef2ff; color:#4338ca;
+      border-radius:999px; white-space:normal; overflow-wrap:anywhere;
+    }}
     .metrics {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:10px; margin:12px 0; }}
     .metric {{ padding:11px 12px; background:#f8fafc; border:1px solid #e5e7eb; border-radius:8px; min-width:0; }}
     .metric span,.metric small {{ display:block; color:var(--muted); }}
     .metric strong {{ display:block; font-size:19px; margin:2px 0; overflow-wrap:anywhere; }}
+    .boundary,.source,.metric small {{ overflow-wrap:anywhere; }}
     .diagnostic {{ padding:8px 10px; border-left:3px solid #94a3b8; background:#f8fafc; color:var(--muted); }}
     .source a {{ color:#1d4ed8; }}
     @media (max-width:650px) {{

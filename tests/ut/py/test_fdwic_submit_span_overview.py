@@ -465,6 +465,10 @@ def test_html_distinguishes_formal_ratios_from_synthetic_cross_elf_diagnostic(ev
     assert "Scalar 局部记录扣除参考" in document
     assert "扣局部记录估算后的 Phase scalar / raw whole scalar" in document
     assert "raw 比例同格保留" in document
+    assert '<col class="partition-region"><col class="partition-time"><col class="partition-share">' in document
+    assert ".partition table { min-width:920px; table-layout:fixed; }" in document
+    assert ".partition table { min-width:1120px; }" not in document
+    assert "white-space:normal; vertical-align:top; overflow-wrap:anywhere;" in document
     assert "并非泳道父区间，也不是" in document
     assert "AIC 每核 min–max" in document
     assert "AIV 每核 min–max" in document

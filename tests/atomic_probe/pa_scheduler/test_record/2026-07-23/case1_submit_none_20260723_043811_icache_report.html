@@ -24,7 +24,14 @@
     .phase-overview h2 { margin-top:14px; } .phase-overview p { max-width:1200px; }
     .provenance-overview { background:#f0fdf4; border:1px solid #bbf7d0; border-radius:10px; padding:4px 16px 16px; }
     .provenance-overview h2 { margin-top:14px; } .provenance-meta { max-width:1200px; }
-    .phase-table { box-shadow:none; } .phase-table th:first-child { text-align:left; }
+    .phase-table { box-shadow:none; }
+    .phase-table table { width:100%; min-width:900px; table-layout:fixed; white-space:normal; }
+    .phase-table th,.phase-table td {
+      text-align:left; white-space:normal; vertical-align:top; overflow-wrap:anywhere;
+    }
+    .phase-table th:first-child {
+      width:190px; position:sticky; left:0; z-index:2; text-align:left; background:var(--panel);
+    }
     .phase-table th small { display:block; font-weight:400; color:var(--muted); }
     .groups { display:grid; grid-template-columns:repeat(auto-fit,minmax(310px,1fr)); gap:14px; }
     .group-card { padding:16px; min-width:0; } .group-card h3 { margin:0 0 12px; }
@@ -42,10 +49,16 @@
     .axis { stroke:#94a3b8; stroke-width:1; }
     svg text { fill:#64748b; font-size:12px; }
     .table-wrap { max-width:100%; overflow:auto; }
-    table { border-collapse:collapse; width:max-content; min-width:100%; white-space:nowrap; }
-    th,td { border-bottom:1px solid var(--line); padding:8px 10px; text-align:right; }
-    th { position:sticky; top:0; background:var(--panel); }
-    th:nth-child(3),td:nth-child(3) { text-align:center; } code { overflow-wrap:anywhere; }
+    table { border-collapse:collapse; width:100%; min-width:680px; }
+    th,td {
+      border-bottom:1px solid var(--line); padding:8px 10px; text-align:right;
+      white-space:normal; vertical-align:top; overflow-wrap:anywhere;
+    }
+    .raw-core-table table { width:max-content; min-width:100%; white-space:nowrap; }
+    .raw-core-table th,.raw-core-table td { white-space:nowrap; overflow-wrap:normal; }
+    thead th { position:sticky; top:0; z-index:1; background:var(--panel); }
+    .raw-core-table th:nth-child(3),.raw-core-table td:nth-child(3) { text-align:center; }
+    code { overflow-wrap:anywhere; }
   </style>
 </head>
 <body><main>
@@ -289,7 +302,7 @@
     </div>
   <h2>逐核原始主计数</h2>
   <p class="fine">报告展示 primary request/miss；none 模式不重复发布 shadow 原值；逐核 primary/shadow 同值由必选 status 闭环。</p>
-  <div class="table-wrap"><table>
+  <div class="table-wrap raw-core-table"><table>
     <thead><tr>
       <th>Physical</th><th>Logical</th><th>Role</th><th>Block</th><th>Lane</th>
       <th>SYS gate 诊断 raw ticks</th><th>原始墙钟 µs</th>
