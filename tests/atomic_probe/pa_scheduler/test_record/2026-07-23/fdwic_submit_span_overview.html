@@ -33,6 +33,29 @@
     th,td { padding:9px 11px; border-bottom:1px solid var(--line); text-align:left; white-space:nowrap; }
     th { background:#f8fafc; } tr:last-child td { border-bottom:0; }
     td i { display:inline-block; width:9px; height:9px; margin-right:7px; border-radius:2px; }
+    .partition table { min-width:1120px; }
+    .evidence-ratio { white-space:normal; min-width:145px; }
+    .evidence-ratio strong,.evidence-ratio small { display:block; }
+    .evidence-ratio small { color:var(--muted); }
+    .evidence-na { color:var(--muted); text-align:center; }
+    .synthetic-chart { display:grid; gap:10px; margin:16px 0; }
+    .synthetic-row {
+      display:grid; grid-template-columns:150px minmax(220px,1fr) 92px 138px;
+      gap:10px; align-items:center;
+    }
+    .synthetic-row > span { font-weight:650; }
+    .synthetic-row > strong { text-align:right; font-size:17px; }
+    .synthetic-row > small { color:var(--muted); }
+    .synthetic-track {
+      position:relative; height:20px; overflow:hidden; border-radius:5px;
+      background:#e5e7eb;
+    }
+    .synthetic-track b { display:block; height:100%; min-width:1px; }
+    .synthetic-track i {
+      position:absolute; top:0; bottom:0; width:2px; background:#111827;
+      box-shadow:0 0 0 1px #ffffffcc;
+    }
+    .synthetic-table { min-width:980px; }
     .phase-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,560px),1fr)); gap:14px; }
     .phase-card { margin:0; }
     .phase-card header { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }
@@ -42,10 +65,13 @@
     .metric { padding:11px 12px; background:#f8fafc; border:1px solid #e5e7eb; border-radius:8px; min-width:0; }
     .metric span,.metric small { display:block; color:var(--muted); }
     .metric strong { display:block; font-size:19px; margin:2px 0; overflow-wrap:anywhere; }
+    .diagnostic { padding:8px 10px; border-left:3px solid #94a3b8; background:#f8fafc; color:var(--muted); }
     .source a { color:#1d4ed8; }
     @media (max-width:650px) {
       main { padding:18px 10px 40px; } h1 { font-size:24px; }
       .phase-card header { display:block; } .tag { display:inline-block; margin-top:8px; }
+      .synthetic-row { grid-template-columns:120px minmax(140px,1fr) 76px; }
+      .synthetic-row > small { grid-column:2 / 4; }
     }
   </style>
 </head>
@@ -56,21 +82,22 @@
     PASS 只表示两条证据链各自通过门禁，不表示它们已绑定到同一 ELF。</p>
   <div class="notice"><strong>这里有两条互不混算的证据链。</strong>
     泳道图的百分比只在同一个泳道 ELF 的排他时间树中相加；每个 Submit-PMU profile 都是独立 ELF，
-    phase 时间、request 和 miss 只能除以本 ELF 自己的 Scalar/primary 分母。不同 ELF 的绝对时间不能相减，
-    各 PMU 行的占比也不能相加成 100%。</div>
+    phase PMU total、Scalar busy、非 Scalar-busy 残余、request 和 miss 只能使用本 ELF 自己的分母。
+    不同 ELF 的绝对值不能相减，各 PMU 行的占比也不能相加成 100%。页面另设的“分段合计 vs none”
+    只是一项显式跨 ELF 合成诊断，用来观察插桩膨胀，不改变上述正式口径。</div>
 
   <section class="context">
     <h2>口径与来源</h2>
     <p>泳道 SYS counter 频率：<strong>1,000,000,000 Hz</strong>；它用于时间戳换算，
       不是约 1.65 GHz 的 PMU cycle 频率。泳道全局 Submit 墙钟范围：
       <strong>4844.066 µs</strong>。</p>
-    <p>PMU Scalar 时间已排除 linked Vector/Cube Kernel 和 result-used return-ready atomic 的等待区间；
-      source-issue atomic 保留。PMU total、Scalar busy 与 primary I-cache 来自嵌在首末 Submit SYS closure
-      内且遇 linked Kernel 会暂停的 PMU gate；Scalar phase 时间占比使用 gate-running SYS 段累计后再扣
-      return-ready 等待的独立时间分母。PMU/I-cache counter
-      仍含 atomic 指令及观察代码事件，
-      局部 observed 不是零插桩函数体的数学上下界。</p>
-    <p>本批 PMU 来自 4 组 revision：<code>908f9adf7c7f、94172c643474、9d3acca8d900、d67f3f5e2b74</code>；
+    <p>SYS 边界诊断排除了 linked Vector/Cube Kernel 和 result-used return-ready atomic 的等待区间；
+      PMU total、Scalar busy 与 primary I-cache 来自嵌在首末 Submit SYS closure 内且遇 linked Kernel
+      会暂停的 PMU gate，但 PMU counter 仍保留 atomic 指令及等待事件。阶段主时间使用 running read-clear PMU total；
+      Scalar busy 独立观测，非 Scalar-busy 残余逐核按 total−scalar 得到。SYS phase tick 只核验边界闭合。
+      PMU/I-cache counter 仍含 atomic 指令及观察代码事件，局部 observed
+      不是零插桩函数体的数学上下界。</p>
+    <p>本批 PMU 来自 1 组 revision：<code>8c6b6e3a412d</code>；
       mixed revisions 被如实保留，进一步禁止跨 ELF 数值运算。泳道 raw 没有 build provenance，
       页面只证明 raw SHA 与 schema-v4 重算闭合，
       不伪称已证明当时 ELF 身份；泳道与 PMU 之间仅对齐 96 核拓扑和每核 Submit 数。</p>
@@ -80,74 +107,114 @@
   <p class="notice">泳道分区展示原始业务 elapsed，不等同于纯 Scalar 时间。Kernel 是父 span 内的嵌套事件；
     当前 analyzer 能精确拆开 EfDrain 与 FinalDrain；其他 containment（本轮包括 WinnerBuild）只有事件数、
     没有独立 Kernel union 时长。因此纯 Scalar 归因只看下方相应 PMU control ELF，不从泳道父 span 猜减。</p>
-  
+  <p class="fine">分区表新增的 PMU 与 scalar-busy 两列来自对应 phase 自己的独立 ELF：
+    分母分别是该 ELF 的 whole PMU total 与 whole scalar busy，并非泳道父区间，也不是
+    <code>submit-pmu-none</code>。各行不得相加；<code>control-only</code> 只代表排除 linked Kernel
+    后的控制路径；没有等价 phase 的行显示“—”。</p>
+
       <div class="partition">
         <h3>SubmitEnvelope</h3>
         <div class="stack"><span style="width:85.38393886%;background:#2563eb" title="SubmitUnion 85.384%"></span><span style="width:14.61606114%;background:#0d9488" title="BetweenSubmitResidual 14.616%"></span></div>
         <div class="table-wrap"><table>
-          <thead><tr><th>区域</th><th>Σ core-time</th><th>同父区间占比</th>
-            <th>AIC 每核 min–max</th><th>AIV 每核 min–max</th></tr></thead>
-          <tbody><tr><td><i style="background:#2563eb"></i><code>SubmitUnion</code></td><td>387,187.472 µs</td><td>85.384%</td><td>3923.407–4019.264 µs</td><td>3988.838–4117.076 µs</td></tr><tr><td><i style="background:#0d9488"></i><code>BetweenSubmitResidual</code></td><td>66,278.926 µs</td><td>14.616%</td><td>555.018–639.839 µs</td><td>692.312–795.162 µs</td></tr></tbody>
+          <thead>
+            <tr><th rowspan="2">区域</th><th rowspan="2">Σ core-time</th>
+              <th colspan="3">占比对照</th>
+              <th rowspan="2">AIC 每核 min–max</th><th rowspan="2">AIV 每核 min–max</th></tr>
+            <tr><th>泳道同父区间</th>
+              <th>PMU 占比<br><small>Phase PMU / 同 ELF whole PMU</small></th>
+              <th>Scalar-busy 占比<br><small>Phase scalar / 同 ELF whole scalar</small></th></tr>
+          </thead>
+          <tbody><tr data-swimlane-metric="submit_union"><td><i style="background:#2563eb"></i><code>SubmitUnion</code></td><td>387,187.472 µs</td><td>85.384%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>3923.407–4019.264 µs</td><td>3988.838–4117.076 µs</td></tr><tr data-swimlane-metric="between_submit_residual" data-pmu-profile="submit-pmu-submit-transition" data-pmu-mapping="adjacent-submit-boundary"><td><i style="background:#0d9488"></i><code>BetweenSubmitResidual</code></td><td>66,278.926 µs</td><td>14.616%</td><td class="evidence-ratio" title="submit-pmu-submit-transition：314,497,428 / 875,104,857 = 35.938%"><strong>35.938%</strong><small>adjacent-submit-boundary</small></td><td class="evidence-ratio" title="submit-pmu-submit-transition：206,591,150 / 781,865,774 = 26.423%"><strong>26.423%</strong><small>adjacent-submit-boundary</small></td><td>555.018–639.839 µs</td><td>692.312–795.162 µs</td></tr></tbody>
         </table></div>
       </div>
-    
-  
+
+
       <div class="partition">
         <h3>SubmitUnion</h3>
         <div class="stack"><span style="width:16.18526257%;background:#2563eb" title="EfDrain 16.185%"></span><span style="width:25.32304661%;background:#0d9488" title="Materialize 25.323%"></span><span style="width:5.39356604%;background:#7c3aed" title="PrepareMap 5.394%"></span><span style="width:20.44218802%;background:#d97706" title="Claim 20.442%"></span><span style="width:0.39888713%;background:#dc2626" title="Fanin 0.399%"></span><span style="width:12.51725727%;background:#0891b2" title="Register 12.517%"></span><span style="width:1.66552057%;background:#65a30d" title="WinnerBuild 1.666%"></span><span style="width:0.21535821%;background:#2563eb" title="AllocComplete 0.215%"></span><span style="width:3.18095597%;background:#0d9488" title="LoserReplay 3.181%"></span><span style="width:10.85628747%;background:#7c3aed" title="SubmitInternalResidual 10.856%"></span><span style="width:3.82167014%;background:#d97706" title="SubmitTailResidual 3.822%"></span></div>
         <div class="table-wrap"><table>
-          <thead><tr><th>区域</th><th>Σ core-time</th><th>同父区间占比</th>
-            <th>AIC 每核 min–max</th><th>AIV 每核 min–max</th></tr></thead>
-          <tbody><tr><td><i style="background:#2563eb"></i><code>EfDrain</code></td><td>62,667.309 µs</td><td>16.185%</td><td>829.745–1043.623 µs</td><td>421.651–599.408 µs</td></tr><tr><td><i style="background:#0d9488"></i><code>Materialize</code></td><td>98,047.664 µs</td><td>25.323%</td><td>982.441–1044.824 µs</td><td>1007.761–1079.123 µs</td></tr><tr><td><i style="background:#7c3aed"></i><code>PrepareMap</code></td><td>20,883.212 µs</td><td>5.394%</td><td>175.588–248.810 µs</td><td>203.320–302.751 µs</td></tr><tr><td><i style="background:#d97706"></i><code>Claim</code></td><td>79,149.591 µs</td><td>20.442%</td><td>540.557–586.652 µs</td><td>906.563–1005.941 µs</td></tr><tr><td><i style="background:#dc2626"></i><code>Fanin</code></td><td>1,544.441 µs</td><td>0.399%</td><td>15.964–21.094 µs</td><td>3.393–24.326 µs</td></tr><tr><td><i style="background:#0891b2"></i><code>Register</code></td><td>48,465.252 µs</td><td>12.517%</td><td>407.881–514.917 µs</td><td>468.701–570.286 µs</td></tr><tr><td><i style="background:#65a30d"></i><code>WinnerBuild</code></td><td>6,448.687 µs</td><td>1.666%</td><td>73.077–145.321 µs</td><td>36.526–74.041 µs</td></tr><tr><td><i style="background:#2563eb"></i><code>AllocComplete</code></td><td>833.840 µs</td><td>0.215%</td><td>4.807–69.631 µs</td><td>0.000–0.000 µs</td></tr><tr><td><i style="background:#0d9488"></i><code>LoserReplay</code></td><td>12,316.263 µs</td><td>3.181%</td><td>118.306–142.011 µs</td><td>117.838–141.241 µs</td></tr><tr><td><i style="background:#7c3aed"></i><code>SubmitInternalResidual</code></td><td>42,034.185 µs</td><td>10.856%</td><td>—</td><td>—</td></tr><tr><td><i style="background:#d97706"></i><code>SubmitTailResidual</code></td><td>14,797.028 µs</td><td>3.822%</td><td>—</td><td>—</td></tr></tbody>
+          <thead>
+            <tr><th rowspan="2">区域</th><th rowspan="2">Σ core-time</th>
+              <th colspan="3">占比对照</th>
+              <th rowspan="2">AIC 每核 min–max</th><th rowspan="2">AIV 每核 min–max</th></tr>
+            <tr><th>泳道同父区间</th>
+              <th>PMU 占比<br><small>Phase PMU / 同 ELF whole PMU</small></th>
+              <th>Scalar-busy 占比<br><small>Phase scalar / 同 ELF whole scalar</small></th></tr>
+          </thead>
+          <tbody><tr data-swimlane-metric="efdrain" data-pmu-profile="submit-pmu-efdrain-control" data-pmu-mapping="control-only"><td><i style="background:#2563eb"></i><code>EfDrain</code></td><td>62,667.309 µs</td><td>16.185%</td><td class="evidence-ratio" title="submit-pmu-efdrain-control：259,240,439 / 825,372,063 = 31.409%"><strong>31.409%</strong><small>control-only</small></td><td class="evidence-ratio" title="submit-pmu-efdrain-control：177,538,191 / 752,424,257 = 23.595%"><strong>23.595%</strong><small>control-only</small></td><td>829.745–1043.623 µs</td><td>421.651–599.408 µs</td></tr><tr data-swimlane-metric="materialize" data-pmu-profile="submit-pmu-materialize" data-pmu-mapping="same-business-boundary"><td><i style="background:#0d9488"></i><code>Materialize</code></td><td>98,047.664 µs</td><td>25.323%</td><td class="evidence-ratio" title="submit-pmu-materialize：368,349,615 / 860,121,776 = 42.825%"><strong>42.825%</strong><small>same-business-boundary</small></td><td class="evidence-ratio" title="submit-pmu-materialize：293,943,610 / 759,586,910 = 38.698%"><strong>38.698%</strong><small>same-business-boundary</small></td><td>982.441–1044.824 µs</td><td>1007.761–1079.123 µs</td></tr><tr data-swimlane-metric="prepare_map" data-pmu-profile="submit-pmu-prepare-map" data-pmu-mapping="same-business-boundary"><td><i style="background:#7c3aed"></i><code>PrepareMap</code></td><td>20,883.212 µs</td><td>5.394%</td><td class="evidence-ratio" title="submit-pmu-prepare-map：210,127,915 / 784,604,857 = 26.781%"><strong>26.781%</strong><small>same-business-boundary</small></td><td class="evidence-ratio" title="submit-pmu-prepare-map：144,019,418 / 733,380,676 = 19.638%"><strong>19.638%</strong><small>same-business-boundary</small></td><td>175.588–248.810 µs</td><td>203.320–302.751 µs</td></tr><tr data-swimlane-metric="claim" data-pmu-profile="submit-pmu-claim" data-pmu-mapping="same-business-boundary"><td><i style="background:#d97706"></i><code>Claim</code></td><td>79,149.591 µs</td><td>20.442%</td><td class="evidence-ratio" title="submit-pmu-claim：321,951,929 / 827,188,042 = 38.921%"><strong>38.921%</strong><small>same-business-boundary</small></td><td class="evidence-ratio" title="submit-pmu-claim：230,884,809 / 751,514,132 = 30.723%"><strong>30.723%</strong><small>same-business-boundary</small></td><td>540.557–586.652 µs</td><td>906.563–1005.941 µs</td></tr><tr data-swimlane-metric="fanin" data-pmu-profile="submit-pmu-fanin" data-pmu-mapping="same-business-boundary"><td><i style="background:#dc2626"></i><code>Fanin</code></td><td>1,544.441 µs</td><td>0.399%</td><td class="evidence-ratio" title="submit-pmu-fanin：3,508,426 / 652,647,623 = 0.538%"><strong>0.538%</strong><small>same-business-boundary</small></td><td class="evidence-ratio" title="submit-pmu-fanin：2,709,457 / 602,690,743 = 0.450%"><strong>0.450%</strong><small>same-business-boundary</small></td><td>15.964–21.094 µs</td><td>3.393–24.326 µs</td></tr><tr data-swimlane-metric="register" data-pmu-profile="submit-pmu-register" data-pmu-mapping="same-business-boundary"><td><i style="background:#0891b2"></i><code>Register</code></td><td>48,465.252 µs</td><td>12.517%</td><td class="evidence-ratio" title="submit-pmu-register：248,694,483 / 833,286,281 = 29.845%"><strong>29.845%</strong><small>same-business-boundary</small></td><td class="evidence-ratio" title="submit-pmu-register：168,184,052 / 743,680,705 = 22.615%"><strong>22.615%</strong><small>same-business-boundary</small></td><td>407.881–514.917 µs</td><td>468.701–570.286 µs</td></tr><tr data-swimlane-metric="winner_build" data-pmu-profile="submit-pmu-winner-build-control" data-pmu-mapping="control-only"><td><i style="background:#65a30d"></i><code>WinnerBuild</code></td><td>6,448.687 µs</td><td>1.666%</td><td class="evidence-ratio" title="submit-pmu-winner-build-control：62,476,937 / 831,511,201 = 7.514%"><strong>7.514%</strong><small>control-only</small></td><td class="evidence-ratio" title="submit-pmu-winner-build-control：61,009,092 / 792,528,440 = 7.698%"><strong>7.698%</strong><small>control-only</small></td><td>73.077–145.321 µs</td><td>36.526–74.041 µs</td></tr><tr data-swimlane-metric="alloc_complete" data-pmu-profile="submit-pmu-alloc-complete-control" data-pmu-mapping="control-only"><td><i style="background:#2563eb"></i><code>AllocComplete</code></td><td>833.840 µs</td><td>0.215%</td><td class="evidence-ratio" title="submit-pmu-alloc-complete-control：57,216,108 / 832,640,742 = 6.872%"><strong>6.872%</strong><small>control-only</small></td><td class="evidence-ratio" title="submit-pmu-alloc-complete-control：56,630,433 / 798,628,250 = 7.091%"><strong>7.091%</strong><small>control-only</small></td><td>4.807–69.631 µs</td><td>0.000–0.000 µs</td></tr><tr data-swimlane-metric="loser_replay" data-pmu-profile="submit-pmu-loser-replay" data-pmu-mapping="same-business-boundary"><td><i style="background:#0d9488"></i><code>LoserReplay</code></td><td>12,316.263 µs</td><td>3.181%</td><td class="evidence-ratio" title="submit-pmu-loser-replay：170,777,758 / 778,354,672 = 21.941%"><strong>21.941%</strong><small>same-business-boundary</small></td><td class="evidence-ratio" title="submit-pmu-loser-replay：114,439,566 / 702,902,051 = 16.281%"><strong>16.281%</strong><small>same-business-boundary</small></td><td>118.306–142.011 µs</td><td>117.838–141.241 µs</td></tr><tr data-swimlane-metric="submit_internal_residual"><td><i style="background:#7c3aed"></i><code>SubmitInternalResidual</code></td><td>42,034.185 µs</td><td>10.856%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>—</td><td>—</td></tr><tr data-swimlane-metric="submit_tail_residual"><td><i style="background:#d97706"></i><code>SubmitTailResidual</code></td><td>14,797.028 µs</td><td>3.822%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>—</td><td>—</td></tr></tbody>
         </table></div>
       </div>
-    
-  
+
+
       <div class="partition">
         <h3>EfDrain</h3>
         <div class="stack"><span style="width:51.20196720%;background:#2563eb" title="EfDrainKernelUnion 51.202%"></span><span style="width:48.79803280%;background:#0d9488" title="EfDrainControl 48.798%"></span></div>
         <div class="table-wrap"><table>
-          <thead><tr><th>区域</th><th>Σ core-time</th><th>同父区间占比</th>
-            <th>AIC 每核 min–max</th><th>AIV 每核 min–max</th></tr></thead>
-          <tbody><tr><td><i style="background:#2563eb"></i><code>EfDrainKernelUnion</code></td><td>32,086.895 µs</td><td>51.202%</td><td>367.195–710.148 µs</td><td>113.969–326.572 µs</td></tr><tr><td><i style="background:#0d9488"></i><code>EfDrainControl</code></td><td>30,580.414 µs</td><td>48.798%</td><td>295.582–474.451 µs</td><td>210.889–361.879 µs</td></tr></tbody>
+          <thead>
+            <tr><th rowspan="2">区域</th><th rowspan="2">Σ core-time</th>
+              <th colspan="3">占比对照</th>
+              <th rowspan="2">AIC 每核 min–max</th><th rowspan="2">AIV 每核 min–max</th></tr>
+            <tr><th>泳道同父区间</th>
+              <th>PMU 占比<br><small>Phase PMU / 同 ELF whole PMU</small></th>
+              <th>Scalar-busy 占比<br><small>Phase scalar / 同 ELF whole scalar</small></th></tr>
+          </thead>
+          <tbody><tr data-swimlane-metric="efdrain_kernel_union"><td><i style="background:#2563eb"></i><code>EfDrainKernelUnion</code></td><td>32,086.895 µs</td><td>51.202%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>367.195–710.148 µs</td><td>113.969–326.572 µs</td></tr><tr data-swimlane-metric="efdrain_control" data-pmu-profile="submit-pmu-efdrain-control" data-pmu-mapping="control-only"><td><i style="background:#0d9488"></i><code>EfDrainControl</code></td><td>30,580.414 µs</td><td>48.798%</td><td class="evidence-ratio" title="submit-pmu-efdrain-control：259,240,439 / 825,372,063 = 31.409%"><strong>31.409%</strong><small>control-only</small></td><td class="evidence-ratio" title="submit-pmu-efdrain-control：177,538,191 / 752,424,257 = 23.595%"><strong>23.595%</strong><small>control-only</small></td><td>295.582–474.451 µs</td><td>210.889–361.879 µs</td></tr></tbody>
         </table></div>
       </div>
-    
+
 
   <details class="context"><summary><strong>外围 Worker / Orchestration / FinalDrain 闭合</strong></summary>
-    
+
       <div class="partition">
         <h3>WorkerCompletion</h3>
         <div class="stack"><span style="width:99.34508051%;background:#2563eb" title="OrchestrationReplay 99.345%"></span><span style="width:0.65491949%;background:#0d9488" title="FinalDrain 0.655%"></span></div>
         <div class="table-wrap"><table>
-          <thead><tr><th>区域</th><th>Σ core-time</th><th>同父区间占比</th>
-            <th>AIC 每核 min–max</th><th>AIV 每核 min–max</th></tr></thead>
-          <tbody><tr><td><i style="background:#2563eb"></i><code>OrchestrationReplay</code></td><td>454,607.852 µs</td><td>99.345%</td><td>4556.667–4620.691 µs</td><td>4778.712–4852.567 µs</td></tr><tr><td><i style="background:#0d9488"></i><code>FinalDrain</code></td><td>2,996.943 µs</td><td>0.655%</td><td>5.249–301.052 µs</td><td>2.535–81.451 µs</td></tr></tbody>
+          <thead>
+            <tr><th rowspan="2">区域</th><th rowspan="2">Σ core-time</th>
+              <th colspan="3">占比对照</th>
+              <th rowspan="2">AIC 每核 min–max</th><th rowspan="2">AIV 每核 min–max</th></tr>
+            <tr><th>泳道同父区间</th>
+              <th>PMU 占比<br><small>Phase PMU / 同 ELF whole PMU</small></th>
+              <th>Scalar-busy 占比<br><small>Phase scalar / 同 ELF whole scalar</small></th></tr>
+          </thead>
+          <tbody><tr data-swimlane-metric="orchestration_replay"><td><i style="background:#2563eb"></i><code>OrchestrationReplay</code></td><td>454,607.852 µs</td><td>99.345%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>4556.667–4620.691 µs</td><td>4778.712–4852.567 µs</td></tr><tr data-swimlane-metric="final_drain"><td><i style="background:#0d9488"></i><code>FinalDrain</code></td><td>2,996.943 µs</td><td>0.655%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>5.249–301.052 µs</td><td>2.535–81.451 µs</td></tr></tbody>
         </table></div>
       </div>
-    
-    
+
+
       <div class="partition">
         <h3>OrchestrationReplay</h3>
         <div class="stack"><span style="width:0.23373045%;background:#2563eb" title="OrchestrationSetup 0.234%"></span><span style="width:85.16955224%;background:#0d9488" title="SubmitUnion 85.170%"></span><span style="width:14.57936235%;background:#7c3aed" title="BetweenSubmitResidual 14.579%"></span><span style="width:0.01735496%;background:#d97706" title="OrchestrationTail 0.017%"></span></div>
         <div class="table-wrap"><table>
-          <thead><tr><th>区域</th><th>Σ core-time</th><th>同父区间占比</th>
-            <th>AIC 每核 min–max</th><th>AIV 每核 min–max</th></tr></thead>
-          <tbody><tr><td><i style="background:#2563eb"></i><code>OrchestrationSetup</code></td><td>1,062.557 µs</td><td>0.234%</td><td>10.035–13.323 µs</td><td>10.151–13.400 µs</td></tr><tr><td><i style="background:#0d9488"></i><code>SubmitUnion</code></td><td>387,187.472 µs</td><td>85.170%</td><td>3923.407–4019.264 µs</td><td>3988.838–4117.076 µs</td></tr><tr><td><i style="background:#7c3aed"></i><code>BetweenSubmitResidual</code></td><td>66,278.926 µs</td><td>14.579%</td><td>555.018–639.839 µs</td><td>692.312–795.162 µs</td></tr><tr><td><i style="background:#d97706"></i><code>OrchestrationTail</code></td><td>78.897 µs</td><td>0.017%</td><td>0.437–1.079 µs</td><td>0.671–1.167 µs</td></tr></tbody>
+          <thead>
+            <tr><th rowspan="2">区域</th><th rowspan="2">Σ core-time</th>
+              <th colspan="3">占比对照</th>
+              <th rowspan="2">AIC 每核 min–max</th><th rowspan="2">AIV 每核 min–max</th></tr>
+            <tr><th>泳道同父区间</th>
+              <th>PMU 占比<br><small>Phase PMU / 同 ELF whole PMU</small></th>
+              <th>Scalar-busy 占比<br><small>Phase scalar / 同 ELF whole scalar</small></th></tr>
+          </thead>
+          <tbody><tr data-swimlane-metric="orchestration_setup"><td><i style="background:#2563eb"></i><code>OrchestrationSetup</code></td><td>1,062.557 µs</td><td>0.234%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>10.035–13.323 µs</td><td>10.151–13.400 µs</td></tr><tr data-swimlane-metric="submit_union"><td><i style="background:#0d9488"></i><code>SubmitUnion</code></td><td>387,187.472 µs</td><td>85.170%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>3923.407–4019.264 µs</td><td>3988.838–4117.076 µs</td></tr><tr data-swimlane-metric="between_submit_residual" data-pmu-profile="submit-pmu-submit-transition" data-pmu-mapping="adjacent-submit-boundary"><td><i style="background:#7c3aed"></i><code>BetweenSubmitResidual</code></td><td>66,278.926 µs</td><td>14.579%</td><td class="evidence-ratio" title="submit-pmu-submit-transition：314,497,428 / 875,104,857 = 35.938%"><strong>35.938%</strong><small>adjacent-submit-boundary</small></td><td class="evidence-ratio" title="submit-pmu-submit-transition：206,591,150 / 781,865,774 = 26.423%"><strong>26.423%</strong><small>adjacent-submit-boundary</small></td><td>555.018–639.839 µs</td><td>692.312–795.162 µs</td></tr><tr data-swimlane-metric="orchestration_tail"><td><i style="background:#d97706"></i><code>OrchestrationTail</code></td><td>78.897 µs</td><td>0.017%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>0.437–1.079 µs</td><td>0.671–1.167 µs</td></tr></tbody>
         </table></div>
       </div>
-    
-    
+
+
       <div class="partition">
         <h3>FinalDrain</h3>
         <div class="stack"><span style="width:15.39508759%;background:#2563eb" title="FinalDrainKernelUnion 15.395%"></span><span style="width:84.60491241%;background:#0d9488" title="FinalDrainResidual 84.605%"></span></div>
         <div class="table-wrap"><table>
-          <thead><tr><th>区域</th><th>Σ core-time</th><th>同父区间占比</th>
-            <th>AIC 每核 min–max</th><th>AIV 每核 min–max</th></tr></thead>
-          <tbody><tr><td><i style="background:#2563eb"></i><code>FinalDrainKernelUnion</code></td><td>461.382 µs</td><td>15.395%</td><td>0.000–57.395 µs</td><td>0.000–3.029 µs</td></tr><tr><td><i style="background:#0d9488"></i><code>FinalDrainResidual</code></td><td>2,535.561 µs</td><td>84.605%</td><td>5.249–274.069 µs</td><td>2.535–78.641 µs</td></tr></tbody>
+          <thead>
+            <tr><th rowspan="2">区域</th><th rowspan="2">Σ core-time</th>
+              <th colspan="3">占比对照</th>
+              <th rowspan="2">AIC 每核 min–max</th><th rowspan="2">AIV 每核 min–max</th></tr>
+            <tr><th>泳道同父区间</th>
+              <th>PMU 占比<br><small>Phase PMU / 同 ELF whole PMU</small></th>
+              <th>Scalar-busy 占比<br><small>Phase scalar / 同 ELF whole scalar</small></th></tr>
+          </thead>
+          <tbody><tr data-swimlane-metric="final_drain_kernel_union"><td><i style="background:#2563eb"></i><code>FinalDrainKernelUnion</code></td><td>461.382 µs</td><td>15.395%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>0.000–57.395 µs</td><td>0.000–3.029 µs</td></tr><tr data-swimlane-metric="final_drain_residual"><td><i style="background:#0d9488"></i><code>FinalDrainResidual</code></td><td>2,535.561 µs</td><td>84.605%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>5.249–274.069 µs</td><td>2.535–78.641 µs</td></tr></tbody>
         </table></div>
       </div>
-    
+
   </details>
 
   <h2>泳道 residual 的业务边界</h2>
@@ -164,55 +231,90 @@
       <tbody><tr><td><code>Atomic</code></td><td>104,607</td><td>71,981,381</td><td>否</td></tr><tr><td><code>ClockBaseline</code></td><td>192</td><td>4,578</td><td>否</td></tr><tr><td><code>Commit</code></td><td>1,024</td><td>0</td><td>否</td></tr><tr><td><code>RingBp</code></td><td>2</td><td>99,668</td><td>否</td></tr><tr><td><code>DrainWon</code></td><td>0</td><td>0</td><td>否</td></tr></tbody></table></div>
   </div>
 
-  <h2>Submit-PMU ELF：whole gate 与 Scalar 时间分母</h2>
-  
+  <h2>Submit-PMU ELF：whole gate 与 SYS 边界诊断</h2>
+
     <div class="whole-card">
-      <h3><code>submit-pmu-none</code>：PMU whole gate 与 Scalar Submit 时间分母</h3>
-      <p>global 首末 Submit 仅作闭合：<strong>4982.069 µs</strong>；
+      <h3><code>submit-pmu-none</code>：PMU whole gate 与 SYS 边界诊断</h3>
+      <p>global 首末 Submit 仅作闭合：<strong>6812.094 µs</strong>；
         下列数值是 96 核各自累计，不是墙钟。每核先读首个 Submit start tick，再启动 PMU；末次 Submit
         先停止 PMU，再读 end tick，所以 PMU gate 嵌在首末 SYS closure 内。Scalar elapsed 累计 gate-running
         SYS 段，再扣 linked Kernel 与 return-ready atomic 等待；PMU cycle 与 SYS tick 口径不同，不能直接相减。</p>
       <div class="metrics">
-        
+
         <div class="metric">
-          <span>Scalar Submit elapsed (1 tick = 1 ns)</span><strong>255,727,387</strong>
-          <small>AIC 每核 2,333,153–2,812,776 ticks</small>
-          <small>AIV 每核 2,488,150–3,196,046 ticks</small>
+          <span>SYS 边界闭合诊断（raw ticks）</span><strong>282,120,570</strong>
+          <small>AIC 每核 2,381,818–3,331,744 ticks</small>
+          <small>AIV 每核 2,656,417–4,431,591 ticks</small>
+          <small>只核验首末 Submit 与门控边界；不参与 PMU 1.65 GHz 时间换算或阶段比例。</small>
         </div>
-        
+
         <div class="metric">
-          <span>PMU total cycles</span><strong>679,540,564</strong>
-          <small>AIC 每核 6,265,425–7,365,448 cycles</small>
-          <small>AIV 每核 6,739,505–7,831,031 cycles</small>
+          <span>PMU total cycles</span><strong>Σ 932,085,106 cycles · ≈ 564953.478 µs</strong>
+          <small>AIC 每核 9,128,939–9,952,568 cycles（5532.482–6031.633 µs）</small>
+          <small>AIV 每核 8,929,198–10,758,901 cycles（5412.518–6521.609 µs）</small>
+
         </div>
-        
+
         <div class="metric">
-          <span>Scalar busy cycles</span><strong>662,842,598</strong>
-          <small>AIC 每核 6,231,511–7,331,097 cycles</small>
-          <small>AIV 每核 6,489,968–7,605,987 cycles</small>
+          <span>Scalar busy cycles</span><strong>Σ 908,091,228 cycles · ≈ 550410.359 µs</strong>
+          <small>AIC 每核 9,088,377–9,913,392 cycles（5507.900–6007.891 µs）</small>
+          <small>AIV 每核 8,590,434–10,377,067 cycles（5207.173–6290.157 µs）</small>
+          <small>Scalar / PMU total：908,091,228 / 932,085,106 = 97.426%</small>
         </div>
-        
+
         <div class="metric">
-          <span>Primary I-cache request</span><strong>65,304,383</strong>
-          <small>AIC 每核 677,728–795,921</small>
-          <small>AIV 每核 624,424–708,509</small>
+          <span>非 Scalar-busy 残余</span><strong>Σ 23,993,878 cycles · ≈ 14543.119 µs</strong>
+          <small>AIC 每核 37,864–47,947 cycles（22.947–29.058 µs）</small>
+          <small>AIV 每核 277,440–455,825 cycles（168.173–276.303 µs）</small>
+          <small>逐核先算 total−scalar；残余 / PMU total：23,993,878 / 932,085,106 = 2.574%。不是空闲时间。</small>
         </div>
-        
+
         <div class="metric">
-          <span>Primary I-cache miss</span><strong>712,825</strong>
-          <small>AIC 每核 405–625</small>
-          <small>AIV 每核 9,643–12,228</small>
+          <span>Primary I-cache request</span><strong>69,179,112</strong>
+          <small>AIC 每核 662,570–765,234</small>
+          <small>AIV 每核 627,031–919,317</small>
+
+        </div>
+
+        <div class="metric">
+          <span>Primary I-cache miss</span><strong>782,333</strong>
+          <small>AIC 每核 573–900</small>
+          <small>AIV 每核 9,639–13,700</small>
+
         </div>
       </div>
-      <p class="source">git <code>9d3acca8d900</code> · AICore ELF
-        <code>0206e6c46955</code> ·
-        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260722_211333/fdwic_submit_pmu_report.html">单份报告</a></p>
+      <p class="fine">PMU 等效时间分别按 ALL/AIC/AIV
+        1.649844/1.650062/1.649731 cycles/ns 换算。</p>
+      <p class="source">git <code>8c6b6e3a412d</code> · AICore ELF
+        <code>ab25886c73db</code> ·
+        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260723_043811/fdwic_submit_pmu_report.html">单份报告</a></p>
     </div>
-    
+
+
+
+  <section class="context synthetic-diagnostic">
+    <h2>11 个业务分段合计 vs <code>submit-pmu-none</code></h2>
+    <p class="notice"><strong>这是跨 ELF 合成诊断比，不是一次运行的正式分区闭合，也不是净性能开销。</strong>
+      分子把 11 个业务 phase 各自独立 ELF 的 observed 指标求和，分母取
+      <code>submit-pmu-none</code> 的 whole 指标；empty-bracket 不参与。大于 100% 可以直观看到
+      分段插桩形成的观测膨胀，但“偏离 100%”还混有每段观察器成本、独立 ELF 布局、覆盖缺口或重叠、
+      多轮波动及 control-only 口径，不能直接解释为可消除的墙钟损失。</p>
+    <p class="fine">下图统一使用 0–600% 横轴，竖线为 100%；超过 600% 的项目只在图形上封顶，
+      表格始终保留精确比值。I-cache 分子使用 phase observed，分母使用 none primary。</p>
+    <div class="synthetic-chart"><div class="synthetic-row"><span>PMU total</span><div class="synthetic-track" title="PMU total：2,273,109,233 / 932,085,106 = 243.874%"><b style="width:40.645595%;background:#2563eb"></b><i style="left:16.666667%"></i></div><strong>243.874%</strong><small>偏离 100%：+143.874%</small></div><div class="synthetic-row"><span>Scalar busy</span><div class="synthetic-track" title="Scalar busy：1,626,827,429 / 908,091,228 = 179.148%"><b style="width:29.858003%;background:#0d9488"></b><i style="left:16.666667%"></i></div><strong>179.148%</strong><small>偏离 100%：+79.148%</small></div><div class="synthetic-row"><span>非 Scalar-busy 残余</span><div class="synthetic-track" title="非 Scalar-busy 残余：646,281,804 / 23,993,878 = 2693.528%"><b style="width:100.000000%;background:#7c3aed"></b><i style="left:16.666667%"></i></div><strong>2693.528%</strong><small>偏离 100%：+2593.528%</small><small>图形封顶 600%</small></div><div class="synthetic-row"><span>I-cache request</span><div class="synthetic-track" title="I-cache request：138,285,969 / 69,179,112 = 199.896%"><b style="width:33.315926%;background:#d97706"></b><i style="left:16.666667%"></i></div><strong>199.896%</strong><small>偏离 100%：+99.896%</small></div><div class="synthetic-row"><span>I-cache miss</span><div class="synthetic-track" title="I-cache miss：4,645,138 / 782,333 = 593.755%"><b style="width:98.959096%;background:#dc2626"></b><i style="left:16.666667%"></i></div><strong>593.755%</strong><small>偏离 100%：+493.755%</small></div></div>
+    <div class="table-wrap"><table class="synthetic-table">
+      <thead><tr><th>指标</th><th>Σ 11 phases</th><th>submit-none</th>
+        <th>ALL 合成比</th><th>相对 100% 偏离</th><th>AIC 合成比</th><th>AIV 合成比</th></tr></thead>
+      <tbody><tr><th>PMU total</th><td>2,273,109,233 cycles</td><td>932,085,106 cycles</td><td>243.874%</td><td>+143.874%</td><td>231.144%</td><td>250.012%</td></tr><tr><th>Scalar busy</th><td>1,626,827,429 cycles</td><td>908,091,228 cycles</td><td>179.148%</td><td>+79.148%</td><td>174.430%</td><td>181.497%</td></tr><tr><th>非 Scalar-busy 残余</th><td>646,281,804 cycles</td><td>23,993,878 cycles</td><td>2693.528%</td><td>+2593.528%</td><td>12989.660%</td><td>2083.561%</td></tr><tr><th>I-cache request</th><td>138,285,969 events</td><td>69,179,112 events</td><td>199.896%</td><td>+99.896%</td><td>203.526%</td><td>198.144%</td></tr><tr><th>I-cache miss</th><td>4,645,138 events</td><td>782,333 events</td><td>593.755%</td><td>+493.755%</td><td>1228.410%</td><td>574.480%</td></tr></tbody>
+    </table></div>
+  </section>
+
 
   <h2>Submit-PMU ELF：各阶段独立归因</h2>
-  <p>每张卡的三个百分比都只使用该卡所属 ELF 的 Scalar Submit、primary request、primary miss 分母；
-    页面没有也不会生成跨卡合计。</p>
+  <p>每张卡的 PMU total、Scalar busy、非 Scalar-busy 残余及 I-cache 百分比都只使用该卡所属 ELF
+    内的对应分母。各阶段 Scalar busy 来自不同 ELF，不能求和后与
+    <code>submit-pmu-none</code> 的 whole Scalar busy 做正式判等；上方合成诊断特意执行该运算，
+    仅用于呈现观察膨胀指纹。</p>
   <div class="phase-grid">
     <article class="phase-card">
       <header>
@@ -223,38 +325,74 @@
       <p class="boundary">efdrain_begin_to_end_excluding_linked_kernel_calls · calls ALL/AIC/AIV 122,880 / 40,960 / 81,920<br>
         calls/core AIC 1,280–1,280（零调用核 0）；AIV 1,280–1,280（零调用核 0）</p>
       <div class="metrics">
-        
+
       <div class="metric">
-        <span>Scalar phase core-time (1 tick = 1 ns)</span>
-        <strong>29,238,668</strong>
-        <small>本 ELF：29,238,668 / 412,258,213 = 7.092%</small>
-        <small>AIC 每核 198,352–366,617；AIV 每核 285,451–352,131</small>
+        <span>Phase PMU total</span>
+        <strong>Σ 259,240,439 cycles · ≈
+          157130.274 µs</strong>
+        <small>Phase total / 同 ELF whole total：259,240,439 / 825,372,063 = 31.409%</small>
+        <small>AIC 每核 2,530,342–2,814,967 cycles（1533.483–1705.977 µs）</small>
+        <small>AIV 每核 2,588,694–2,918,901 cycles（1569.161–1769.319 µs）</small>
+
       </div>
-    
-        
+
+
+      <div class="metric">
+        <span>Phase scalar busy</span>
+        <strong>Σ 177,538,191 cycles · ≈
+          107609.078 µs</strong>
+        <small>Scalar / Phase total：177,538,191 / 259,240,439 = 68.484%</small><small>Phase scalar / 同 ELF whole scalar：177,538,191 / 752,424,257 = 23.595%</small>
+        <small>AIC 每核 1,794,703–2,075,030 cycles（1087.658–1257.547 µs）</small>
+        <small>AIV 每核 1,697,975–1,992,002 cycles（1029.244–1207.471 µs）</small>
+
+      </div>
+
+
+      <div class="metric">
+        <span>非 Scalar-busy 残余</span>
+        <strong>Σ 81,702,248 cycles · ≈
+          49521.196 µs</strong>
+        <small>逐核先算 total−scalar；残余 / Phase total：81,702,248 / 259,240,439 = 31.516%</small>
+        <small>AIC 每核 725,726–748,044 cycles（439.817–453.343 µs）</small>
+        <small>AIV 每核 841,898–937,867 cycles（510.324–568.497 µs）</small>
+        <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
+      </div>
+
+
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>15,124,617</strong>
-        <small>本 ELF：15,124,617 / 90,377,009 = 16.735%</small>
-        <small>AIC 每核 148,039–201,218；AIV 每核 138,788–156,926</small>
+        <strong>14,936,953</strong>
+        <small>本 ELF：14,936,953 / 89,175,746 = 16.750%</small>
+        <small>AIC 每核 151,318–178,475；AIV 每核 140,297–166,456</small>
       </div>
-    
-        
+
+
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>535,668</strong>
-        <small>本 ELF：535,668 / 4,190,276 = 12.784%</small>
-        <small>AIC 每核 443–719；AIV 每核 7,679–8,515</small>
+        <strong>524,078</strong>
+        <small>本 ELF：524,078 / 3,209,861 = 16.327%</small>
+        <small>AIC 每核 1,948–2,377；AIV 每核 6,449–7,856</small>
       </div>
-    
+
       </div>
-      <p class="fine">分母只来自本 ELF；excluded linked Kernel calls=962；
-        global Submit closure=5376.040 µs（不作 phase 分母）。</p>
-      <p class="source">git <code>908f9adf7c7f</code> · AICore ELF
-        <code>dc3857aed51e</code> ·
-        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260722_213152/fdwic_submit_pmu_report.html">单份报告</a></p>
+      <p class="diagnostic"><strong>SYS 边界诊断：</strong>
+        Σ 20,863,410 raw ticks；
+        AIC 每核 196,647–278,930 ticks；
+        AIV 每核 174,276–265,361 ticks。
+        只核验 phase 边界闭合，不作为阶段主时间或占比分母。</p>
+      <p class="diagnostic"><strong>Scalar shadow 诊断：</strong>
+        whole CNT2 scalar − CNT3 shadow scalar Σ 247,768 cycles；
+        AIC 每核 2,586–2,596 cycles；
+        AIV 每核 2,570–2,586 cycles。</p>
+      <p class="fine">分母只来自本 ELF；excluded linked Kernel calls=1,004；
+        PMU 等效时间分别按 ALL/AIC/AIV
+        1.649844/1.650062/1.649731 cycles/ns 换算；
+        global Submit closure=5669.558 µs（不作 phase 分母）。</p>
+      <p class="source">git <code>8c6b6e3a412d</code> · AICore ELF
+        <code>49689ae673b3</code> ·
+        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260723_044202/fdwic_submit_pmu_report.html">单份报告</a></p>
     </article>
-    
+
     <article class="phase-card">
       <header>
         <div><h3>Claim</h3>
@@ -264,38 +402,74 @@
       <p class="boundary">claim_begin_to_claim_end · calls ALL/AIC/AIV 122,880 / 40,960 / 81,920<br>
         calls/core AIC 1,280–1,280（零调用核 0）；AIV 1,280–1,280（零调用核 0）</p>
       <div class="metrics">
-        
+
       <div class="metric">
-        <span>Scalar phase core-time (1 tick = 1 ns)</span>
-        <strong>42,771,966</strong>
-        <small>本 ELF：42,771,966 / 402,532,487 = 10.626%</small>
-        <small>AIC 每核 281,809–296,775；AIV 每核 495,903–555,388</small>
+        <span>Phase PMU total</span>
+        <strong>Σ 321,951,929 cycles · ≈
+          195140.831 µs</strong>
+        <small>Phase total / 同 ELF whole total：321,951,929 / 827,188,042 = 38.921%</small>
+        <small>AIC 每核 2,948,298–3,023,337 cycles（1786.780–1832.257 µs）</small>
+        <small>AIV 每核 3,465,659–3,599,082 cycles（2100.742–2181.617 µs）</small>
+
       </div>
-    
-        
+
+
+      <div class="metric">
+        <span>Phase scalar busy</span>
+        <strong>Σ 230,884,809 cycles · ≈
+          139943.418 µs</strong>
+        <small>Scalar / Phase total：230,884,809 / 321,951,929 = 71.714%</small><small>Phase scalar / 同 ELF whole scalar：230,884,809 / 751,514,132 = 30.723%</small>
+        <small>AIC 每核 2,209,220–2,273,774 cycles（1338.871–1377.993 µs）</small>
+        <small>AIV 每核 2,443,961–2,543,276 cycles（1481.430–1541.631 µs）</small>
+
+      </div>
+
+
+      <div class="metric">
+        <span>非 Scalar-busy 残余</span>
+        <strong>Σ 91,067,120 cycles · ≈
+          55197.413 µs</strong>
+        <small>逐核先算 total−scalar；残余 / Phase total：91,067,120 / 321,951,929 = 28.286%</small>
+        <small>AIC 每核 732,028–764,512 cycles（443.637–463.323 µs）</small>
+        <small>AIV 每核 1,017,626–1,077,936 cycles（616.844–653.401 µs）</small>
+        <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
+      </div>
+
+
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>18,543,176</strong>
-        <small>本 ELF：18,543,176 / 88,317,392 = 20.996%</small>
-        <small>AIC 每核 180,628–183,898；AIV 每核 197,526–200,121</small>
+        <strong>19,012,131</strong>
+        <small>本 ELF：19,012,131 / 92,323,235 = 20.593%</small>
+        <small>AIC 每核 192,561–198,445；AIV 每核 197,857–200,760</small>
       </div>
-    
-        
+
+
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>815,088</strong>
-        <small>本 ELF：815,088 / 3,940,916 = 20.683%</small>
-        <small>AIC 每核 1,174–1,707；AIV 每核 11,317–12,724</small>
+        <strong>829,077</strong>
+        <small>本 ELF：829,077 / 3,160,254 = 26.235%</small>
+        <small>AIC 每核 2,766–3,449；AIV 每核 11,004–12,116</small>
       </div>
-    
+
       </div>
+      <p class="diagnostic"><strong>SYS 边界诊断：</strong>
+        Σ 36,441,184 raw ticks；
+        AIC 每核 280,693–298,137 ticks；
+        AIV 每核 405,735–443,056 ticks。
+        只核验 phase 边界闭合，不作为阶段主时间或占比分母。</p>
+      <p class="diagnostic"><strong>Scalar shadow 诊断：</strong>
+        whole CNT2 scalar − CNT3 shadow scalar Σ 245,760 cycles；
+        AIC 每核 2,560–2,560 cycles；
+        AIV 每核 2,560–2,560 cycles。</p>
       <p class="fine">分母只来自本 ELF；excluded linked Kernel calls=0；
-        global Submit closure=5233.088 µs（不作 phase 分母）。</p>
-      <p class="source">git <code>908f9adf7c7f</code> · AICore ELF
-        <code>7db75b9fb5a3</code> ·
-        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260722_212857/fdwic_submit_pmu_report.html">单份报告</a></p>
+        PMU 等效时间分别按 ALL/AIC/AIV
+        1.649844/1.650062/1.649731 cycles/ns 换算；
+        global Submit closure=5696.233 µs（不作 phase 分母）。</p>
+      <p class="source">git <code>8c6b6e3a412d</code> · AICore ELF
+        <code>0538c8653fa7</code> ·
+        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260723_043639/fdwic_submit_pmu_report.html">单份报告</a></p>
     </article>
-    
+
     <article class="phase-card">
       <header>
         <div><h3>ArgBuild</h3>
@@ -305,38 +479,74 @@
       <p class="boundary">claim_end_to_materialize_begin · calls ALL/AIC/AIV 122,880 / 40,960 / 81,920<br>
         calls/core AIC 1,280–1,280（零调用核 0）；AIV 1,280–1,280（零调用核 0）</p>
       <div class="metrics">
-        
+
       <div class="metric">
-        <span>Scalar phase core-time (1 tick = 1 ns)</span>
-        <strong>23,460,110</strong>
-        <small>本 ELF：23,460,110 / 395,844,604 = 5.927%</small>
-        <small>AIC 每核 203,669–210,099；AIV 每核 239,104–280,869</small>
+        <span>Phase PMU total</span>
+        <strong>Σ 256,268,195 cycles · ≈
+          155328.743 µs</strong>
+        <small>Phase total / 同 ELF whole total：256,268,195 / 866,449,611 = 29.577%</small>
+        <small>AIC 每核 2,396,736–2,431,534 cycles（1452.513–1473.602 µs）</small>
+        <small>AIV 每核 2,744,631–2,857,155 cycles（1663.684–1731.891 µs）</small>
+
       </div>
-    
-        
+
+
+      <div class="metric">
+        <span>Phase scalar busy</span>
+        <strong>Σ 170,877,651 cycles · ≈
+          103572.005 µs</strong>
+        <small>Scalar / Phase total：170,877,651 / 256,268,195 = 66.679%</small><small>Phase scalar / 同 ELF whole scalar：170,877,651 / 764,708,510 = 22.345%</small>
+        <small>AIC 每核 1,702,639–1,717,426 cycles（1031.864–1040.825 µs）</small>
+        <small>AIV 每核 1,809,609–1,826,762 cycles（1096.912–1107.309 µs）</small>
+
+      </div>
+
+
+      <div class="metric">
+        <span>非 Scalar-busy 残余</span>
+        <strong>Σ 85,390,544 cycles · ≈
+          51756.738 µs</strong>
+        <small>逐核先算 total−scalar；残余 / Phase total：85,390,544 / 256,268,195 = 33.321%</small>
+        <small>AIC 每核 693,485–723,172 cycles（420.278–438.270 µs）</small>
+        <small>AIV 每核 932,601–1,038,153 cycles（565.305–629.286 µs）</small>
+        <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
+      </div>
+
+
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>17,049,326</strong>
-        <small>本 ELF：17,049,326 / 89,173,221 = 19.119%</small>
-        <small>AIC 每核 171,707–173,444；AIV 每核 178,797–181,526</small>
+        <strong>16,604,720</strong>
+        <small>本 ELF：16,604,720 / 91,911,048 = 18.066%</small>
+        <small>AIC 每核 169,690–170,777；AIV 每核 173,850–174,741</small>
       </div>
-    
-        
+
+
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>1,024,349</strong>
-        <small>本 ELF：1,024,349 / 3,790,938 = 27.021%</small>
-        <small>AIC 每核 2,023–2,506；AIV 每核 13,504–15,605</small>
+        <strong>589,413</strong>
+        <small>本 ELF：589,413 / 3,564,754 = 16.534%</small>
+        <small>AIC 每核 1,332–1,848；AIV 每核 8,252–8,752</small>
       </div>
-    
+
       </div>
+      <p class="diagnostic"><strong>SYS 边界诊断：</strong>
+        Σ 24,072,315 raw ticks；
+        AIC 每核 213,222–233,149 ticks；
+        AIV 每核 258,907–273,643 ticks。
+        只核验 phase 边界闭合，不作为阶段主时间或占比分母。</p>
+      <p class="diagnostic"><strong>Scalar shadow 诊断：</strong>
+        whole CNT2 scalar − CNT3 shadow scalar Σ 245,760 cycles；
+        AIC 每核 2,560–2,560 cycles；
+        AIV 每核 2,560–2,560 cycles。</p>
       <p class="fine">分母只来自本 ELF；excluded linked Kernel calls=0；
-        global Submit closure=5134.115 µs（不作 phase 分母）。</p>
-      <p class="source">git <code>908f9adf7c7f</code> · AICore ELF
-        <code>81914dd501dc</code> ·
-        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260722_212608/fdwic_submit_pmu_report.html">单份报告</a></p>
+        PMU 等效时间分别按 ALL/AIC/AIV
+        1.649844/1.650062/1.649731 cycles/ns 换算；
+        global Submit closure=5982.462 µs（不作 phase 分母）。</p>
+      <p class="source">git <code>8c6b6e3a412d</code> · AICore ELF
+        <code>cefb0e3bbfb7</code> ·
+        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260723_043857/fdwic_submit_pmu_report.html">单份报告</a></p>
     </article>
-    
+
     <article class="phase-card">
       <header>
         <div><h3>Materialize</h3>
@@ -346,38 +556,74 @@
       <p class="boundary">materialize_begin_to_materialize_end · calls ALL/AIC/AIV 122,880 / 40,960 / 81,920<br>
         calls/core AIC 1,280–1,280（零调用核 0）；AIV 1,280–1,280（零调用核 0）</p>
       <div class="metrics">
-        
+
       <div class="metric">
-        <span>Scalar phase core-time (1 tick = 1 ns)</span>
-        <strong>97,740,475</strong>
-        <small>本 ELF：97,740,475 / 390,275,711 = 25.044%</small>
-        <small>AIC 每核 954,703–1,105,782；AIV 每核 998,096–1,081,251</small>
+        <span>Phase PMU total</span>
+        <strong>Σ 368,349,615 cycles · ≈
+          223263.299 µs</strong>
+        <small>Phase total / 同 ELF whole total：368,349,615 / 860,121,776 = 42.825%</small>
+        <small>AIC 每核 3,601,905–3,683,070 cycles（2182.891–2232.080 µs）</small>
+        <small>AIV 每核 3,854,196–4,010,884 cycles（2336.257–2431.235 µs）</small>
+
       </div>
-    
-        
+
+
+      <div class="metric">
+        <span>Phase scalar busy</span>
+        <strong>Σ 293,943,610 cycles · ≈
+          178164.487 µs</strong>
+        <small>Scalar / Phase total：293,943,610 / 368,349,615 = 79.800%</small><small>Phase scalar / 同 ELF whole scalar：293,943,610 / 759,586,910 = 38.698%</small>
+        <small>AIC 每核 2,943,032–3,024,557 cycles（1783.589–1832.996 µs）</small>
+        <small>AIV 每核 3,063,783–3,164,251 cycles（1857.141–1918.041 µs）</small>
+
+      </div>
+
+
+      <div class="metric">
+        <span>非 Scalar-busy 残余</span>
+        <strong>Σ 74,406,005 cycles · ≈
+          45098.812 µs</strong>
+        <small>逐核先算 total−scalar；残余 / Phase total：74,406,005 / 368,349,615 = 20.200%</small>
+        <small>AIC 每核 656,662–659,424 cycles（397.962–399.636 µs）</small>
+        <small>AIV 每核 790,413–886,262 cycles（479.116–537.216 µs）</small>
+        <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
+      </div>
+
+
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>28,227,628</strong>
-        <small>本 ELF：28,227,628 / 87,252,443 = 32.352%</small>
-        <small>AIC 每核 286,129–289,849；AIV 每核 294,536–299,073</small>
+        <strong>30,124,105</strong>
+        <small>本 ELF：30,124,105 / 93,963,590 = 32.059%</small>
+        <small>AIC 每核 311,744–314,741；AIV 每核 311,332–316,405</small>
       </div>
-    
-        
+
+
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>338,715</strong>
-        <small>本 ELF：338,715 / 2,709,145 = 12.503%</small>
-        <small>AIC 每核 121–210；AIV 每核 4,964–5,473</small>
+        <strong>754,725</strong>
+        <small>本 ELF：754,725 / 3,216,252 = 23.466%</small>
+        <small>AIC 每核 42–66；AIV 每核 11,134–12,093</small>
       </div>
-    
+
       </div>
+      <p class="diagnostic"><strong>SYS 边界诊断：</strong>
+        Σ 99,479,891 raw ticks；
+        AIC 每核 963,084–1,011,789 ticks；
+        AIV 每核 1,025,730–1,106,791 ticks。
+        只核验 phase 边界闭合，不作为阶段主时间或占比分母。</p>
+      <p class="diagnostic"><strong>Scalar shadow 诊断：</strong>
+        whole CNT2 scalar − CNT3 shadow scalar Σ 245,760 cycles；
+        AIC 每核 2,560–2,560 cycles；
+        AIV 每核 2,560–2,560 cycles。</p>
       <p class="fine">分母只来自本 ELF；excluded linked Kernel calls=0；
-        global Submit closure=5112.374 µs（不作 phase 分母）。</p>
-      <p class="source">git <code>908f9adf7c7f</code> · AICore ELF
-        <code>5fc510143b12</code> ·
-        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260722_212739/fdwic_submit_pmu_report.html">单份报告</a></p>
+        PMU 等效时间分别按 ALL/AIC/AIV
+        1.649844/1.650062/1.649731 cycles/ns 换算；
+        global Submit closure=5970.339 µs（不作 phase 分母）。</p>
+      <p class="source">git <code>8c6b6e3a412d</code> · AICore ELF
+        <code>42c60b91163d</code> ·
+        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260723_043943/fdwic_submit_pmu_report.html">单份报告</a></p>
     </article>
-    
+
     <article class="phase-card">
       <header>
         <div><h3>PrepareMap</h3>
@@ -387,38 +633,74 @@
       <p class="boundary">dist_submit_prepare_map_call_entry_to_return · calls ALL/AIC/AIV 122,880 / 40,960 / 81,920<br>
         calls/core AIC 1,280–1,280（零调用核 0）；AIV 1,280–1,280（零调用核 0）</p>
       <div class="metrics">
-        
+
       <div class="metric">
-        <span>Scalar phase core-time (1 tick = 1 ns)</span>
-        <strong>11,507,845</strong>
-        <small>本 ELF：11,507,845 / 381,604,324 = 3.016%</small>
-        <small>AIC 每核 82,767–149,036；AIV 每核 102,598–219,382</small>
+        <span>Phase PMU total</span>
+        <strong>Σ 210,127,915 cycles · ≈
+          127362.293 µs</strong>
+        <small>Phase total / 同 ELF whole total：210,127,915 / 784,604,857 = 26.781%</small>
+        <small>AIC 每核 2,093,859–2,201,061 cycles（1268.958–1333.926 µs）</small>
+        <small>AIV 每核 2,177,815–2,368,000 cycles（1320.103–1435.386 µs）</small>
+
       </div>
-    
-        
+
+
+      <div class="metric">
+        <span>Phase scalar busy</span>
+        <strong>Σ 144,019,418 cycles · ≈
+          87292.749 µs</strong>
+        <small>Scalar / Phase total：144,019,418 / 210,127,915 = 68.539%</small><small>Phase scalar / 同 ELF whole scalar：144,019,418 / 733,380,676 = 19.638%</small>
+        <small>AIC 每核 1,441,782–1,548,097 cycles（873.774–938.205 µs）</small>
+        <small>AIV 每核 1,475,591–1,658,894 cycles（894.443–1005.554 µs）</small>
+
+      </div>
+
+
+      <div class="metric">
+        <span>非 Scalar-busy 残余</span>
+        <strong>Σ 66,108,497 cycles · ≈
+          40069.544 µs</strong>
+        <small>逐核先算 total−scalar；残余 / Phase total：66,108,497 / 210,127,915 = 31.461%</small>
+        <small>AIC 每核 650,360–654,764 cycles（394.143–396.812 µs）</small>
+        <small>AIV 每核 696,446–717,275 cycles（422.157–434.783 µs）</small>
+        <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
+      </div>
+
+
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>10,178,904</strong>
-        <small>本 ELF：10,178,904 / 86,369,130 = 11.785%</small>
-        <small>AIC 每核 102,769–103,763；AIV 每核 106,703–108,969</small>
+        <strong>10,989,011</strong>
+        <small>本 ELF：10,989,011 / 89,766,806 = 12.242%</small>
+        <small>AIC 每核 113,877–116,376；AIV 每核 114,110–116,638</small>
       </div>
-    
-        
+
+
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>42,420</strong>
-        <small>本 ELF：42,420 / 2,866,006 = 1.480%</small>
-        <small>AIC 每核 43–82；AIV 每核 373–911</small>
+        <strong>27,962</strong>
+        <small>本 ELF：27,962 / 1,699,987 = 1.645%</small>
+        <small>AIC 每核 20–41；AIV 每核 320–565</small>
       </div>
-    
+
       </div>
+      <p class="diagnostic"><strong>SYS 边界诊断：</strong>
+        Σ 11,407,548 raw ticks；
+        AIC 每核 83,391–148,176 ticks；
+        AIV 每核 101,383–212,381 ticks。
+        只核验 phase 边界闭合，不作为阶段主时间或占比分母。</p>
+      <p class="diagnostic"><strong>Scalar shadow 诊断：</strong>
+        whole CNT2 scalar − CNT3 shadow scalar Σ 245,760 cycles；
+        AIC 每核 2,560–2,560 cycles；
+        AIV 每核 2,560–2,560 cycles。</p>
       <p class="fine">分母只来自本 ELF；excluded linked Kernel calls=0；
-        global Submit closure=5026.676 µs（不作 phase 分母）。</p>
-      <p class="source">git <code>908f9adf7c7f</code> · AICore ELF
-        <code>bda2688a1aa6</code> ·
-        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260722_213240/fdwic_submit_pmu_report.html">单份报告</a></p>
+        PMU 等效时间分别按 ALL/AIC/AIV
+        1.649844/1.650062/1.649731 cycles/ns 换算；
+        global Submit closure=5399.543 µs（不作 phase 分母）。</p>
+      <p class="source">git <code>8c6b6e3a412d</code> · AICore ELF
+        <code>e09e766ee773</code> ·
+        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260723_044248/fdwic_submit_pmu_report.html">单份报告</a></p>
     </article>
-    
+
     <article class="phase-card">
       <header>
         <div><h3>Fanin</h3>
@@ -426,40 +708,76 @@
         <span class="tag">same-business-boundary</span>
       </header>
       <p class="boundary">fanin_begin_to_fanin_end · calls ALL/AIC/AIV 1,024 / 512 / 512<br>
-        calls/core AIC 12–20（零调用核 0）；AIV 3–12（零调用核 0）</p>
+        calls/core AIC 12–20（零调用核 0）；AIV 4–12（零调用核 0）</p>
       <div class="metrics">
-        
+
       <div class="metric">
-        <span>Scalar phase core-time (1 tick = 1 ns)</span>
-        <strong>1,030,527</strong>
-        <small>本 ELF：1,030,527 / 288,049,476 = 0.358%</small>
-        <small>AIC 每核 6,610–13,636；AIV 每核 1,535–22,174</small>
+        <span>Phase PMU total</span>
+        <strong>Σ 3,508,426 cycles · ≈
+          2126.520 µs</strong>
+        <small>Phase total / 同 ELF whole total：3,508,426 / 652,647,623 = 0.538%</small>
+        <small>AIC 每核 30,099–55,123 cycles（18.241–33.407 µs）</small>
+        <small>AIV 每核 13,075–55,245 cycles（7.926–33.487 µs）</small>
+
       </div>
-    
-        
+
+
+      <div class="metric">
+        <span>Phase scalar busy</span>
+        <strong>Σ 2,709,457 cycles · ≈
+          1642.250 µs</strong>
+        <small>Scalar / Phase total：2,709,457 / 3,508,426 = 77.227%</small><small>Phase scalar / 同 ELF whole scalar：2,709,457 / 602,690,743 = 0.450%</small>
+        <small>AIC 每核 22,790–41,690 cycles（13.812–25.266 µs）</small>
+        <small>AIV 每核 9,664–44,119 cycles（5.858–26.743 µs）</small>
+
+      </div>
+
+
+      <div class="metric">
+        <span>非 Scalar-busy 残余</span>
+        <strong>Σ 798,969 cycles · ≈
+          484.269 µs</strong>
+        <small>逐核先算 total−scalar；残余 / Phase total：798,969 / 3,508,426 = 22.773%</small>
+        <small>AIC 每核 7,309–13,433 cycles（4.430–8.141 µs）</small>
+        <small>AIV 每核 3,411–11,344 cycles（2.068–6.876 µs）</small>
+        <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
+      </div>
+
+
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>360,606</strong>
-        <small>本 ELF：360,606 / 74,185,536 = 0.486%</small>
-        <small>AIC 每核 3,229–5,405；AIV 每核 645–6,263</small>
+        <strong>342,033</strong>
+        <small>本 ELF：342,033 / 75,933,197 = 0.450%</small>
+        <small>AIC 每核 3,304–5,485；AIV 每核 1,315–5,375</small>
       </div>
-    
-        
+
+
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>12,817</strong>
-        <small>本 ELF：12,817 / 1,247,689 = 1.027%</small>
-        <small>AIC 每核 55–111；AIV 每核 58–230</small>
+        <strong>13,782</strong>
+        <small>本 ELF：13,782 / 2,331,934 = 0.591%</small>
+        <small>AIC 每核 37–120；AIV 每核 83–277</small>
       </div>
-    
+
       </div>
+      <p class="diagnostic"><strong>SYS 边界诊断：</strong>
+        Σ 1,016,201 raw ticks；
+        AIC 每核 6,327–13,581 ticks；
+        AIV 每核 3,253–19,441 ticks。
+        只核验 phase 边界闭合，不作为阶段主时间或占比分母。</p>
+      <p class="diagnostic"><strong>Scalar shadow 诊断：</strong>
+        whole CNT2 scalar − CNT3 shadow scalar Σ 2,048 cycles；
+        AIC 每核 24–40 cycles；
+        AIV 每核 8–24 cycles。</p>
       <p class="fine">分母只来自本 ELF；excluded linked Kernel calls=0；
-        global Submit closure=4585.083 µs（不作 phase 分母）。</p>
-      <p class="source">git <code>908f9adf7c7f</code> · AICore ELF
-        <code>9cd51886ad6b</code> ·
-        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260722_213326/fdwic_submit_pmu_report.html">单份报告</a></p>
+        PMU 等效时间分别按 ALL/AIC/AIV
+        1.649844/1.650062/1.649731 cycles/ns 换算；
+        global Submit closure=4642.811 µs（不作 phase 分母）。</p>
+      <p class="source">git <code>8c6b6e3a412d</code> · AICore ELF
+        <code>9eaef3d1d5cc</code> ·
+        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260723_044336/fdwic_submit_pmu_report.html">单份报告</a></p>
     </article>
-    
+
     <article class="phase-card">
       <header>
         <div><h3>Register</h3>
@@ -469,38 +787,74 @@
       <p class="boundary">register_outputs_call_entry_to_return · calls ALL/AIC/AIV 122,880 / 40,960 / 81,920<br>
         calls/core AIC 1,280–1,280（零调用核 0）；AIV 1,280–1,280（零调用核 0）</p>
       <div class="metrics">
-        
+
       <div class="metric">
-        <span>Scalar phase core-time (1 tick = 1 ns)</span>
-        <strong>25,469,610</strong>
-        <small>本 ELF：25,469,610 / 422,532,207 = 6.028%</small>
-        <small>AIC 每核 216,253–260,489；AIV 每核 244,504–310,068</small>
+        <span>Phase PMU total</span>
+        <strong>Σ 248,694,483 cycles · ≈
+          150738.181 µs</strong>
+        <small>Phase total / 同 ELF whole total：248,694,483 / 833,286,281 = 29.845%</small>
+        <small>AIC 每核 2,345,551–2,439,083 cycles（1421.493–1478.177 µs）</small>
+        <small>AIV 每核 2,635,187–2,732,437 cycles（1597.343–1656.292 µs）</small>
+
       </div>
-    
-        
+
+
+      <div class="metric">
+        <span>Phase scalar busy</span>
+        <strong>Σ 168,184,052 cycles · ≈
+          101939.366 µs</strong>
+        <small>Scalar / Phase total：168,184,052 / 248,694,483 = 67.627%</small><small>Phase scalar / 同 ELF whole scalar：168,184,052 / 743,680,705 = 22.615%</small>
+        <small>AIC 每核 1,658,575–1,740,706 cycles（1005.159–1054.934 µs）</small>
+        <small>AIV 每核 1,724,613–1,816,536 cycles（1045.390–1101.110 µs）</small>
+
+      </div>
+
+
+      <div class="metric">
+        <span>非 Scalar-busy 残余</span>
+        <strong>Σ 80,510,431 cycles · ≈
+          48798.814 µs</strong>
+        <small>逐核先算 total−scalar；残余 / Phase total：80,510,431 / 248,694,483 = 32.373%</small>
+        <small>AIC 每核 679,724–701,583 cycles（411.938–425.186 µs）</small>
+        <small>AIV 每核 895,222–929,750 cycles（542.647–563.577 µs）</small>
+        <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
+      </div>
+
+
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>12,823,932</strong>
-        <small>本 ELF：12,823,932 / 90,829,046 = 14.119%</small>
-        <small>AIC 每核 131,215–133,692；AIV 每核 132,527–136,517</small>
+        <strong>12,430,608</strong>
+        <small>本 ELF：12,430,608 / 90,091,095 = 13.798%</small>
+        <small>AIC 每核 126,587–132,112；AIV 每核 127,357–130,347</small>
       </div>
-    
-        
+
+
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>689,139</strong>
-        <small>本 ELF：689,139 / 4,757,374 = 14.486%</small>
-        <small>AIC 每核 758–1,153；AIV 每核 9,728–10,700</small>
+        <strong>450,294</strong>
+        <small>本 ELF：450,294 / 3,522,153 = 12.785%</small>
+        <small>AIC 每核 695–849；AIV 每核 6,523–6,811</small>
       </div>
-    
+
       </div>
+      <p class="diagnostic"><strong>SYS 边界诊断：</strong>
+        Σ 27,870,336 raw ticks；
+        AIC 每核 214,334–263,214 ticks；
+        AIV 每核 286,670–340,526 ticks。
+        只核验 phase 边界闭合，不作为阶段主时间或占比分母。</p>
+      <p class="diagnostic"><strong>Scalar shadow 诊断：</strong>
+        whole CNT2 scalar − CNT3 shadow scalar Σ 245,760 cycles；
+        AIC 每核 2,560–2,560 cycles；
+        AIV 每核 2,560–2,560 cycles。</p>
       <p class="fine">分母只来自本 ELF；excluded linked Kernel calls=0；
-        global Submit closure=5513.703 µs（不作 phase 分母）。</p>
-      <p class="source">git <code>908f9adf7c7f</code> · AICore ELF
-        <code>c7ab6dd628ed</code> ·
-        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260722_212943/fdwic_submit_pmu_report.html">单份报告</a></p>
+        PMU 等效时间分别按 ALL/AIC/AIV
+        1.649844/1.650062/1.649731 cycles/ns 换算；
+        global Submit closure=5788.451 µs（不作 phase 分母）。</p>
+      <p class="source">git <code>8c6b6e3a412d</code> · AICore ELF
+        <code>c870328ac6fe</code> ·
+        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260723_044029/fdwic_submit_pmu_report.html">单份报告</a></p>
     </article>
-    
+
     <article class="phase-card">
       <header>
         <div><h3>WinnerBuild Scalar control</h3>
@@ -508,81 +862,153 @@
         <span class="tag">control-only</span>
       </header>
       <p class="boundary">winner_build_begin_to_end_excluding_linked_kernel_calls · calls ALL/AIC/AIV 1,024 / 512 / 512<br>
-        calls/core AIC 13–21（零调用核 0）；AIV 4–12（零调用核 0）</p>
+        calls/core AIC 12–22（零调用核 0）；AIV 0–12（零调用核 1）</p>
       <div class="metrics">
-        
+
       <div class="metric">
-        <span>Scalar phase core-time (1 tick = 1 ns)</span>
-        <strong>10,031,073</strong>
-        <small>本 ELF：10,031,073 / 288,944,785 = 3.472%</small>
-        <small>AIC 每核 68,669–398,695；AIV 每核 22,914–69,182</small>
+        <span>Phase PMU total</span>
+        <strong>Σ 62,476,937 cycles · ≈
+          37868.391 µs</strong>
+        <small>Phase total / 同 ELF whole total：62,476,937 / 831,511,201 = 7.514%</small>
+        <small>AIC 每核 118,934–1,809,865 cycles（72.079–1096.847 µs）</small>
+        <small>AIV 每核 0–2,061,069 cycles（0.000–1249.336 µs）</small>
+
       </div>
-    
-        
+
+
+      <div class="metric">
+        <span>Phase scalar busy</span>
+        <strong>Σ 61,009,092 cycles · ≈
+          36978.703 µs</strong>
+        <small>Scalar / Phase total：61,009,092 / 62,476,937 = 97.651%</small><small>Phase scalar / 同 ELF whole scalar：61,009,092 / 792,528,440 = 7.698%</small>
+        <small>AIC 每核 107,836–1,777,133 cycles（65.353–1077.010 µs）</small>
+        <small>AIV 每核 0–2,039,969 cycles（0.000–1236.546 µs）</small>
+
+      </div>
+
+
+      <div class="metric">
+        <span>非 Scalar-busy 残余</span>
+        <strong>Σ 1,467,845 cycles · ≈
+          889.687 µs</strong>
+        <small>逐核先算 total−scalar；残余 / Phase total：1,467,845 / 62,476,937 = 2.349%</small>
+        <small>AIC 每核 11,098–32,732 cycles（6.726–19.837 µs）</small>
+        <small>AIV 每核 0–26,855 cycles（0.000–16.278 µs）</small>
+        <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
+      </div>
+
+
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>3,561,057</strong>
-        <small>本 ELF：3,561,057 / 70,555,784 = 5.047%</small>
-        <small>AIC 每核 21,884–146,292；AIV 每核 6,715–23,700</small>
+        <strong>4,863,968</strong>
+        <small>本 ELF：4,863,968 / 73,819,554 = 6.589%</small>
+        <small>AIC 每核 21,757–159,256；AIV 每核 0–147,353</small>
       </div>
-    
-        
+
+
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>33,047</strong>
-        <small>本 ELF：33,047 / 1,820,283 = 1.815%</small>
-        <small>AIC 每核 287–499；AIV 每核 188–480</small>
+        <strong>30,792</strong>
+        <small>本 ELF：30,792 / 1,544,977 = 1.993%</small>
+        <small>AIC 每核 154–371；AIV 每核 0–630</small>
       </div>
-    
+
       </div>
-      <p class="fine">分母只来自本 ELF；excluded linked Kernel calls=53；
-        global Submit closure=4599.385 µs（不作 phase 分母）。</p>
-      <p class="source">git <code>9d3acca8d900</code> · AICore ELF
-        <code>2fbca242565b</code> ·
-        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260722_211624/fdwic_submit_pmu_report.html">单份报告</a></p>
+      <p class="diagnostic"><strong>SYS 边界诊断：</strong>
+        Σ 12,953,578 raw ticks；
+        AIC 每核 53,632–422,692 ticks；
+        AIV 每核 0–399,825 ticks。
+        只核验 phase 边界闭合，不作为阶段主时间或占比分母。</p>
+      <p class="diagnostic"><strong>Scalar shadow 诊断：</strong>
+        whole CNT2 scalar − CNT3 shadow scalar Σ 2,354 cycles；
+        AIC 每核 26–56 cycles；
+        AIV 每核 0–30 cycles。</p>
+      <p class="fine">分母只来自本 ELF；excluded linked Kernel calls=153；
+        PMU 等效时间分别按 ALL/AIC/AIV
+        1.649844/1.650062/1.649731 cycles/ns 换算；
+        global Submit closure=5896.308 µs（不作 phase 分母）。</p>
+      <p class="source">git <code>8c6b6e3a412d</code> · AICore ELF
+        <code>4b59f5399df3</code> ·
+        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260723_044422/fdwic_submit_pmu_report.html">单份报告</a></p>
     </article>
-    
+
     <article class="phase-card">
       <header>
         <div><h3>AllocComplete Scalar control</h3>
           <code>submit-pmu-alloc-complete-control</code></div>
         <span class="tag">control-only</span>
       </header>
-      <p class="boundary">alloc_complete_begin_to_end_excluding_linked_kernel_calls · calls ALL/AIC/AIV 256 / 255 / 1<br>
-        calls/core AIC 3–14（零调用核 0）；AIV 0–1（零调用核 63）</p>
+      <p class="boundary">alloc_complete_begin_to_end_excluding_linked_kernel_calls · calls ALL/AIC/AIV 256 / 96 / 160<br>
+        calls/core AIC 0–10（零调用核 4）；AIV 0–6（零调用核 3）</p>
       <div class="metrics">
-        
+
       <div class="metric">
-        <span>Scalar phase core-time (1 tick = 1 ns)</span>
-        <strong>584,689</strong>
-        <small>本 ELF：584,689 / 296,983,746 = 0.197%</small>
-        <small>AIC 每核 6,034–34,208；AIV 每核 0–4,334</small>
+        <span>Phase PMU total</span>
+        <strong>Σ 57,216,108 cycles · ≈
+          34679.708 µs</strong>
+        <small>Phase total / 同 ELF whole total：57,216,108 / 832,640,742 = 6.872%</small>
+        <small>AIC 每核 0–1,349,309 cycles（0.000–817.732 µs）</small>
+        <small>AIV 每核 0–2,075,497 cycles（0.000–1258.082 µs）</small>
+
       </div>
-    
-        
+
+
+      <div class="metric">
+        <span>Phase scalar busy</span>
+        <strong>Σ 56,630,433 cycles · ≈
+          34324.720 µs</strong>
+        <small>Scalar / Phase total：56,630,433 / 57,216,108 = 98.976%</small><small>Phase scalar / 同 ELF whole scalar：56,630,433 / 798,628,250 = 7.091%</small>
+        <small>AIC 每核 0–1,342,719 cycles（0.000–813.739 µs）</small>
+        <small>AIV 每核 0–2,065,174 cycles（0.000–1251.825 µs）</small>
+
+      </div>
+
+
+      <div class="metric">
+        <span>非 Scalar-busy 残余</span>
+        <strong>Σ 585,675 cycles · ≈
+          354.988 µs</strong>
+        <small>逐核先算 total−scalar；残余 / Phase total：585,675 / 57,216,108 = 1.024%</small>
+        <small>AIC 每核 0–11,646 cycles（0.000–7.058 µs）</small>
+        <small>AIV 每核 0–23,288 cycles（0.000–14.116 µs）</small>
+        <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
+      </div>
+
+
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>170,344</strong>
-        <small>本 ELF：170,344 / 69,894,928 = 0.244%</small>
-        <small>AIC 每核 1,619–11,616；AIV 每核 0–582</small>
+        <strong>539,738</strong>
+        <small>本 ELF：539,738 / 72,212,561 = 0.747%</small>
+        <small>AIC 每核 0–12,416；AIV 每核 0–17,122</small>
       </div>
-    
-        
+
+
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>8,790</strong>
-        <small>本 ELF：8,790 / 2,183,053 = 0.403%</small>
-        <small>AIC 每核 137–427；AIV 每核 0–66</small>
+        <strong>12,829</strong>
+        <small>本 ELF：12,829 / 1,329,490 = 0.965%</small>
+        <small>AIC 每核 0–204；AIV 每核 0–344</small>
       </div>
-    
+
       </div>
+      <p class="diagnostic"><strong>SYS 边界诊断：</strong>
+        Σ 1,659,528 raw ticks；
+        AIC 每核 0–35,221 ticks；
+        AIV 每核 0–47,745 ticks。
+        只核验 phase 边界闭合，不作为阶段主时间或占比分母。</p>
+      <p class="diagnostic"><strong>Scalar shadow 诊断：</strong>
+        whole CNT2 scalar − CNT3 shadow scalar Σ 512 cycles；
+        AIC 每核 0–20 cycles；
+        AIV 每核 0–12 cycles。</p>
       <p class="fine">分母只来自本 ELF；excluded linked Kernel calls=0；
-        global Submit closure=4648.447 µs（不作 phase 分母）。</p>
-      <p class="source">git <code>94172c643474</code> · AICore ELF
-        <code>914f5c3d4dad</code> ·
-        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260722_220027/fdwic_submit_pmu_report.html">单份报告</a></p>
+        PMU 等效时间分别按 ALL/AIC/AIV
+        1.649844/1.650062/1.649731 cycles/ns 换算；
+        global Submit closure=5946.854 µs（不作 phase 分母）。</p>
+      <p class="source">git <code>8c6b6e3a412d</code> · AICore ELF
+        <code>b72aafb602e9</code> ·
+        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260723_044508/fdwic_submit_pmu_report.html">单份报告</a></p>
     </article>
-    
+
     <article class="phase-card">
       <header>
         <div><h3>LoserReplay</h3>
@@ -590,40 +1016,76 @@
         <span class="tag">same-business-boundary</span>
       </header>
       <p class="boundary">register_end_to_drain_block_won_return · calls ALL/AIC/AIV 97,280 / 32,256 / 65,024<br>
-        calls/core AIC 1,005–1,013（零调用核 0）；AIV 1,014–1,020（零调用核 0）</p>
+        calls/core AIC 1,006–1,011（零调用核 0）；AIV 1,013–1,020（零调用核 0）</p>
       <div class="metrics">
-        
+
       <div class="metric">
-        <span>Scalar phase core-time (1 tick = 1 ns)</span>
-        <strong>5,021,979</strong>
-        <small>本 ELF：5,021,979 / 394,817,462 = 1.272%</small>
-        <small>AIC 每核 52,276–53,955；AIV 每核 51,688–52,812</small>
+        <span>Phase PMU total</span>
+        <strong>Σ 170,777,758 cycles · ≈
+          103511.458 µs</strong>
+        <small>Phase total / 同 ELF whole total：170,777,758 / 778,354,672 = 21.941%</small>
+        <small>AIC 每核 1,670,343–1,678,979 cycles（1012.291–1017.525 µs）</small>
+        <small>AIV 每核 1,810,993–1,856,211 cycles（1097.750–1125.160 µs）</small>
+
       </div>
-    
-        
+
+
+      <div class="metric">
+        <span>Phase scalar busy</span>
+        <strong>Σ 114,439,566 cycles · ≈
+          69363.871 µs</strong>
+        <small>Scalar / Phase total：114,439,566 / 170,777,758 = 67.011%</small><small>Phase scalar / 同 ELF whole scalar：114,439,566 / 702,902,051 = 16.281%</small>
+        <small>AIC 每核 1,154,651–1,161,139 cycles（699.762–703.694 µs）</small>
+        <small>AIV 每核 1,203,214–1,214,047 cycles（729.340–735.906 µs）</small>
+
+      </div>
+
+
+      <div class="metric">
+        <span>非 Scalar-busy 残余</span>
+        <strong>Σ 56,338,192 cycles · ≈
+          34147.587 µs</strong>
+        <small>逐核先算 total−scalar；残余 / Phase total：56,338,192 / 170,777,758 = 32.989%</small>
+        <small>AIC 每核 515,632–517,886 cycles（312.493–313.859 µs）</small>
+        <small>AIV 每核 604,688–643,226 cycles（366.537–389.898 µs）</small>
+        <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
+      </div>
+
+
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>8,218,072</strong>
-        <small>本 ELF：8,218,072 / 84,519,864 = 9.723%</small>
-        <small>AIC 每核 78,937–79,655；AIV 每核 88,117–89,183</small>
+        <strong>8,396,456</strong>
+        <small>本 ELF：8,396,456 / 85,872,185 = 9.778%</small>
+        <small>AIC 每核 84,633–86,723；AIV 每核 88,210–88,833</small>
       </div>
-    
-        
+
+
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>453,234</strong>
-        <small>本 ELF：453,234 / 3,900,811 = 11.619%</small>
-        <small>AIC 每核 89–219；AIV 每核 6,519–7,410</small>
+        <strong>186,067</strong>
+        <small>本 ELF：186,067 / 2,540,177 = 7.325%</small>
+        <small>AIC 每核 34–84；AIV 每核 2,789–3,083</small>
       </div>
-    
+
       </div>
+      <p class="diagnostic"><strong>SYS 边界诊断：</strong>
+        Σ 6,926,924 raw ticks；
+        AIC 每核 58,534–59,712 ticks；
+        AIV 每核 74,960–82,670 ticks。
+        只核验 phase 边界闭合，不作为阶段主时间或占比分母。</p>
+      <p class="diagnostic"><strong>Scalar shadow 诊断：</strong>
+        whole CNT2 scalar − CNT3 shadow scalar Σ 194,560 cycles；
+        AIC 每核 2,012–2,022 cycles；
+        AIV 每核 2,026–2,040 cycles。</p>
       <p class="fine">分母只来自本 ELF；excluded linked Kernel calls=0；
-        global Submit closure=5256.747 µs（不作 phase 分母）。</p>
-      <p class="source">git <code>d67f3f5e2b74</code> · AICore ELF
-        <code>013e7a5ea620</code> ·
-        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260722_222533/fdwic_submit_pmu_report.html">单份报告</a></p>
+        PMU 等效时间分别按 ALL/AIC/AIV
+        1.649844/1.650062/1.649731 cycles/ns 换算；
+        global Submit closure=5407.661 µs（不作 phase 分母）。</p>
+      <p class="source">git <code>8c6b6e3a412d</code> · AICore ELF
+        <code>e182a40abdfe</code> ·
+        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260723_044555/fdwic_submit_pmu_report.html">单份报告</a></p>
     </article>
-    
+
     <article class="phase-card">
       <header>
         <div><h3>SubmitTransition</h3>
@@ -633,36 +1095,72 @@
       <p class="boundary">previous_submit_end_to_next_submit_begin · calls ALL/AIC/AIV 122,784 / 40,928 / 81,856<br>
         calls/core AIC 1,279–1,279（零调用核 0）；AIV 1,279–1,279（零调用核 0）</p>
       <div class="metrics">
-        
+
       <div class="metric">
-        <span>Scalar phase core-time (1 tick = 1 ns)</span>
-        <strong>54,894,506</strong>
-        <small>本 ELF：54,894,506 / 385,744,341 = 14.231%</small>
-        <small>AIC 每核 349,379–426,331；AIV 每核 627,270–720,933</small>
+        <span>Phase PMU total</span>
+        <strong>Σ 314,497,428 cycles · ≈
+          190622.524 µs</strong>
+        <small>Phase total / 同 ELF whole total：314,497,428 / 875,104,857 = 35.938%</small>
+        <small>AIC 每核 2,691,895–2,806,960 cycles（1631.390–1701.124 µs）</small>
+        <small>AIV 每核 3,446,371–3,631,754 cycles（2089.050–2201.422 µs）</small>
+
       </div>
-    
-        
+
+
+      <div class="metric">
+        <span>Phase scalar busy</span>
+        <strong>Σ 206,591,150 cycles · ≈
+          125218.596 µs</strong>
+        <small>Scalar / Phase total：206,591,150 / 314,497,428 = 65.689%</small><small>Phase scalar / 同 ELF whole scalar：206,591,150 / 781,865,774 = 26.423%</small>
+        <small>AIC 每核 1,982,935–2,076,648 cycles（1201.734–1258.527 µs）</small>
+        <small>AIV 每核 2,155,867–2,278,654 cycles（1306.799–1381.228 µs）</small>
+
+      </div>
+
+
+      <div class="metric">
+        <span>非 Scalar-busy 残余</span>
+        <strong>Σ 107,906,278 cycles · ≈
+          65403.928 µs</strong>
+        <small>逐核先算 total−scalar；残余 / Phase total：107,906,278 / 314,497,428 = 34.311%</small>
+        <small>AIC 每核 690,210–739,516 cycles（418.293–448.175 µs）</small>
+        <small>AIV 每核 1,231,357–1,411,878 cycles（746.399–855.823 µs）</small>
+        <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
+      </div>
+
+
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>18,916,712</strong>
-        <small>本 ELF：18,916,712 / 85,217,307 = 22.198%</small>
-        <small>AIC 每核 185,201–187,314；AIV 每核 200,675–204,575</small>
+        <strong>20,046,246</strong>
+        <small>本 ELF：20,046,246 / 92,089,124 = 21.768%</small>
+        <small>AIC 每核 191,239–192,627；AIV 每核 216,672–218,737</small>
       </div>
-    
-        
+
+
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>803,078</strong>
-        <small>本 ELF：803,078 / 2,884,282 = 27.843%</small>
-        <small>AIC 每核 194–294；AIV 每核 11,865–13,582</small>
+        <strong>1,226,119</strong>
+        <small>本 ELF：1,226,119 / 4,006,223 = 30.605%</small>
+        <small>AIC 每核 605–1,174；AIV 每核 17,966–19,639</small>
       </div>
-    
+
       </div>
+      <p class="diagnostic"><strong>SYS 边界诊断：</strong>
+        Σ 60,474,015 raw ticks；
+        AIC 每核 387,447–454,658 ticks；
+        AIV 每核 681,403–780,684 ticks。
+        只核验 phase 边界闭合，不作为阶段主时间或占比分母。</p>
+      <p class="diagnostic"><strong>Scalar shadow 诊断：</strong>
+        whole CNT2 scalar − CNT3 shadow scalar Σ 245,568 cycles；
+        AIC 每核 2,558–2,558 cycles；
+        AIV 每核 2,558–2,558 cycles。</p>
       <p class="fine">分母只来自本 ELF；excluded linked Kernel calls=0；
-        global Submit closure=5063.387 µs（不作 phase 分母）。</p>
-      <p class="source">git <code>908f9adf7c7f</code> · AICore ELF
-        <code>5b1744d5338c</code> ·
-        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260722_213030/fdwic_submit_pmu_report.html">单份报告</a></p>
+        PMU 等效时间分别按 ALL/AIC/AIV
+        1.649844/1.650062/1.649731 cycles/ns 换算；
+        global Submit closure=6052.808 µs（不作 phase 分母）。</p>
+      <p class="source">git <code>8c6b6e3a412d</code> · AICore ELF
+        <code>3f18e5075d99</code> ·
+        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260723_044115/fdwic_submit_pmu_report.html">单份报告</a></p>
     </article>
     </div>
 
@@ -677,36 +1175,72 @@
       <p class="boundary">claim_end_adjacent_empty_bracket · calls ALL/AIC/AIV 122,880 / 40,960 / 81,920<br>
         calls/core AIC 1,280–1,280（零调用核 0）；AIV 1,280–1,280（零调用核 0）</p>
       <div class="metrics">
-        
+
       <div class="metric">
-        <span>Observer pair empirical elapsed (1 tick = 1 ns)</span>
-        <strong>90,962,873</strong>
-        <small>本 ELF：90,962,873 / 397,739,262 = 22.870%</small>
-        <small>AIC 每核 781,217–795,402；AIV 每核 1,003,044–1,050,088</small>
+        <span>Phase PMU total</span>
+        <strong>Σ 192,288,336 cycles · ≈
+          116549.405 µs</strong>
+        <small>Phase total / 同 ELF whole total：192,288,336 / 831,856,934 = 23.116%</small>
+        <small>AIC 每核 1,898,234–1,904,578 cycles（1150.402–1154.246 µs）</small>
+        <small>AIV 每核 2,017,566–2,083,565 cycles（1222.967–1262.973 µs）</small>
+
       </div>
-    
-        
+
+
+      <div class="metric">
+        <span>Phase scalar busy</span>
+        <strong>Σ 123,845,938 cycles · ≈
+          75065.241 µs</strong>
+        <small>Scalar / Phase total：123,845,938 / 192,288,336 = 64.406%</small><small>Phase scalar / 同 ELF whole scalar：123,845,938 / 753,739,352 = 16.431%</small>
+        <small>AIC 每核 1,251,002–1,252,666 cycles（758.155–759.163 µs）</small>
+        <small>AIV 每核 1,296,538–1,315,457 cycles（785.909–797.377 µs）</small>
+
+      </div>
+
+
+      <div class="metric">
+        <span>非 Scalar-busy 残余</span>
+        <strong>Σ 68,442,398 cycles · ≈
+          41484.163 µs</strong>
+        <small>逐核先算 total−scalar；残余 / Phase total：68,442,398 / 192,288,336 = 35.594%</small>
+        <small>AIC 每核 647,232–652,073 cycles（392.247–395.181 µs）</small>
+        <small>AIV 每核 714,196–768,686 cycles（432.917–465.946 µs）</small>
+        <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
+      </div>
+
+
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>6,219,619</strong>
-        <small>本 ELF：6,219,619 / 86,678,172 = 7.176%</small>
-        <small>AIC 每核 62,011–62,482；AIV 每核 65,990–66,174</small>
+        <strong>6,869,618</strong>
+        <small>本 ELF：6,869,618 / 90,139,943 = 7.621%</small>
+        <small>AIC 每核 69,140–69,719；AIV 每核 70,952–73,661</small>
       </div>
-    
-        
+
+
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>236,266</strong>
-        <small>本 ELF：236,266 / 4,024,342 = 5.871%</small>
-        <small>AIC 每核 61–168；AIV 每核 3,606–3,714</small>
+        <strong>234,866</strong>
+        <small>本 ELF：234,866 / 3,190,462 = 7.362%</small>
+        <small>AIC 每核 41–113；AIV 每核 2,513–4,076</small>
       </div>
-    
+
       </div>
+      <p class="diagnostic"><strong>SYS 边界诊断：</strong>
+        Σ 160,209,998 raw ticks；
+        AIC 每核 1,555,583–1,560,383 ticks；
+        AIV 每核 1,708,058–1,736,354 ticks。
+        只核验 phase 边界闭合，不作为阶段主时间或占比分母。</p>
+      <p class="diagnostic"><strong>Scalar shadow 诊断：</strong>
+        whole CNT2 scalar − CNT3 shadow scalar Σ 245,760 cycles；
+        AIC 每核 2,560–2,560 cycles；
+        AIV 每核 2,560–2,560 cycles。</p>
       <p class="fine">分母只来自本 ELF；excluded linked Kernel calls=0；
-        global Submit closure=5184.207 µs（不作 phase 分母）。</p>
-      <p class="source">git <code>908f9adf7c7f</code> · AICore ELF
-        <code>9db3738c95ff</code> ·
-        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260722_212653/fdwic_submit_pmu_report.html">单份报告</a></p>
+        PMU 等效时间分别按 ALL/AIC/AIV
+        1.649844/1.650062/1.649731 cycles/ns 换算；
+        global Submit closure=5755.507 µs（不作 phase 分母）。</p>
+      <p class="source">git <code>8c6b6e3a412d</code> · AICore ELF
+        <code>71743c878d9a</code> ·
+        <a href="/home/q00473782/atomic/private/gpt/simpler/outputs/TestPagedAttentionUnroll_Case1_20260723_043533/fdwic_submit_pmu_report.html">单份报告</a></p>
     </article>
     </div>
 
