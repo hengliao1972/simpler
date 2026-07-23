@@ -22,8 +22,10 @@
 constexpr uint32_t kFdwicSubmitPmuMagic = 0x554d5053U;  // little-endian "SPMU"
 // v2 将整窗口径收敛为 scalar 代码时间：所有 linked vector/cube Kernel
 // 在 gate 之外执行，result-used atomic 的 return-ready 依赖区间再从
-// SYS_CNT 累计值中扣除；PMU counter 仍保留 atomic 指令事件。
-constexpr uint16_t kFdwicSubmitPmuVersion = 2;
+// SYS_CNT 累计值中扣除；PMU counter 仍保留 atomic 指令事件。v3 在局部
+// phase 中用 CNT3 复制 CNT2 scalar-busy，并对 CNT3 与 TOTAL 做 running
+// read-clear 软件重建，从而在同一 phase 窗口内比较 PMU total/scalar。
+constexpr uint16_t kFdwicSubmitPmuVersion = 3;
 constexpr uint16_t kFdwicSubmitPmuModeNone = 1;
 constexpr uint16_t kFdwicSubmitPmuModeArgBuild = 2;
 constexpr uint16_t kFdwicSubmitPmuModeEmptyBracket = 3;
@@ -211,6 +213,7 @@ constexpr bool fdwic_submit_pmu_mode_has_phase(uint16_t mode) {
 constexpr uint32_t kFdwicSubmitPmuCnt0VectorBusy = 0x501U;
 constexpr uint32_t kFdwicSubmitPmuCnt1CubeBusy = 0x301U;
 constexpr uint32_t kFdwicSubmitPmuCnt2ScalarBusy = 0x001U;
+constexpr uint32_t kFdwicSubmitPmuCnt3ShadowScalarBusy = 0x001U;
 constexpr uint32_t kFdwicSubmitPmuCnt5ShadowIcacheMiss = 0x035U;
 constexpr uint32_t kFdwicSubmitPmuCnt6IcacheRequest = 0x034U;
 constexpr uint32_t kFdwicSubmitPmuCnt7IcacheMiss = 0x035U;
@@ -238,12 +241,15 @@ enum FdwicSubmitPmuCoreStatus : uint32_t {
     // 从 scalar SYS_CNT 分母和命中的 phase 时间中扣除。该位不改变 PMU
     // gate，避免 PIPE_ALL 反过来改写 atomic 热路径。
     kFdwicSubmitPmuReturnReadyAtomicTimeValid = 1U << 17,
+    kFdwicSubmitPmuCnt3SelectorValid = 1U << 18,
     // none 没有 phase sidecar，故用独立状态位证明一次性读取的 CNT8/CNT5
     // 与 CNT6/CNT7 权威整窗逐核精确相等。
-    kFdwicSubmitPmuNoneShadowPrimaryMatch = 1U << 18,
+    kFdwicSubmitPmuNoneIcacheShadowPrimaryMatch = 1U << 19,
+    // none 不做中途 read-clear，CNT3/CNT2 的同事件计数必须逐核精确相等。
+    kFdwicSubmitPmuNoneScalarShadowPrimaryMatch = 1U << 20,
 };
-constexpr uint32_t kFdwicSubmitPmuRequiredCoreStatus = (1U << 18) - 1U;
-constexpr uint32_t kFdwicSubmitPmuRequiredNoneCoreStatus = (1U << 19) - 1U;
+constexpr uint32_t kFdwicSubmitPmuRequiredCoreStatus = (1U << 19) - 1U;
+constexpr uint32_t kFdwicSubmitPmuRequiredNoneCoreStatus = (1U << 21) - 1U;
 
 PTO_DEVICE_FUNC constexpr uint32_t fdwic_submit_pmu_required_core_status(FdwicSubmitPmuPhase phase) {
     return phase == FdwicSubmitPmuPhase::None ? kFdwicSubmitPmuRequiredNoneCoreStatus :
@@ -254,11 +260,15 @@ enum FdwicSubmitPmuPhaseStatus : uint32_t {
     kFdwicSubmitPmuPhaseRequested = 1U << 0,
     kFdwicSubmitPmuPhaseBoundaryBalanced = 1U << 1,
     kFdwicSubmitPmuPhaseShapeValid = 1U << 2,
-    kFdwicSubmitPmuPhaseValuesOrdered = 1U << 3,
+    kFdwicSubmitPmuPhaseIcacheValuesOrdered = 1U << 3,
     kFdwicSubmitPmuPhaseTimeValid = 1U << 4,
-    kFdwicSubmitPmuPhaseTailRead = 1U << 5,
+    kFdwicSubmitPmuPhaseIcacheTailRead = 1U << 5,
+    kFdwicSubmitPmuPhaseScalarTailRead = 1U << 6,
+    kFdwicSubmitPmuPhaseTotalTailRead = 1U << 7,
+    kFdwicSubmitPmuPhasePmuValuesOrdered = 1U << 8,
+    kFdwicSubmitPmuPhaseCounterReconstructionValid = 1U << 9,
 };
-constexpr uint32_t kFdwicSubmitPmuRequiredPhaseStatus = (1U << 6) - 1U;
+constexpr uint32_t kFdwicSubmitPmuRequiredPhaseStatus = (1U << 10) - 1U;
 
 enum FdwicSubmitPmuOwnerStatus : uint32_t {
     kFdwicSubmitPmuOwnerRequested = 1U << 0,
@@ -291,6 +301,8 @@ enum class FdwicSubmitPmuOwnerField : uint32_t {
 struct FdwicSubmitPmuCoreData {
     uint64_t first_submit_start_tick;
     uint64_t last_submit_end_tick;
+    // none 是 stop 后一次性读取的 TOTAL；局部 phase 是所有 running
+    // read-clear chunk 与 stop 后 tail 的软件重建 observed whole。
     uint64_t total_cycles;
     // 多段 SYS_CNT 累计，只覆盖 PMU gate 开启的 scalar 调度区间；linked
     // Kernel、两侧 metrics_prof_stop/start 边界及 result-used atomic 的
@@ -315,31 +327,44 @@ static_assert(
 static_assert(offsetof(FdwicSubmitPmuCoreData, status) == 60, "submit-PMU status offset changed");
 
 // phase sidecar 只在局部阶段 mode 中分配。每个 worker 独占一条 cacheline，
-// 避免相邻 worker 发布结果时产生伪共享。CNT6/7 的整窗 primary 仍保存在
-// FdwicSubmitPmuCoreData；这里的 request/miss 是运行中 read-clear 观测值。
-// begin/end 两侧的少量 bookkeeping 取指也会进入该样本，因此它不是原始
-// 业务区间事件数的数学下界。
+// 避免相邻 worker 发布结果时产生伪共享。CNT2/6/7 的整窗 primary 仍保存在
+// FdwicSubmitPmuCoreData；这里的 total/scalar/request/miss 是 running
+// read-clear 观测值。begin/end 两侧的少量 bookkeeping 也会进入该样本，
+// 因此它们只能用于同一 phase ELF 内的配对比较。
 struct FdwicSubmitPmuPhaseCoreData {
     uint64_t phase_elapsed_ticks;
+    uint64_t phase_total_cycles_observed;
     uint64_t phase_icache_requests_observed;
     uint64_t phase_icache_misses_observed;
-    uint32_t phase_id;
+    uint32_t phase_scalar_busy_observed;
+    uint32_t shadow_scalar_busy;
+    uint32_t shadow_icache_requests;
+    uint32_t shadow_icache_misses;
+    uint16_t phase_id;
+    uint16_t status;
     uint32_t phase_begin_reads;
     uint32_t phase_end_reads;
-    uint32_t max_shadow_request_chunk;
-    uint32_t max_shadow_miss_chunk;
-    uint32_t status;
-    // 所有 phase 共用：reserved[0] 保存 phase 内被 pause/resume 排除的
-    // linked-kernel 调用数；reserved[1]/[2] 保存 CNT8/CNT5 重建出的整窗
-    // shadow request/miss；reserved[3] 必须为 0。复用保留字维持每核 64B
-    // 和总 GM 容量不变。
-    uint32_t reserved[4];
+    uint32_t excluded_kernel_calls;
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(FdwicSubmitPmuPhaseCoreData) == 64, "submit-PMU phase record must occupy one cacheline");
-static_assert(offsetof(FdwicSubmitPmuPhaseCoreData, status) == 44, "submit-PMU phase status offset changed");
+static_assert(
+    offsetof(FdwicSubmitPmuPhaseCoreData, phase_total_cycles_observed) == 8, "submit-PMU phase total offset changed"
+);
+static_assert(
+    offsetof(FdwicSubmitPmuPhaseCoreData, phase_scalar_busy_observed) == 32, "submit-PMU phase scalar offset changed"
+);
+static_assert(offsetof(FdwicSubmitPmuPhaseCoreData, status) == 50, "submit-PMU phase status offset changed");
+static_assert(
+    offsetof(FdwicSubmitPmuPhaseCoreData, excluded_kernel_calls) == 60,
+    "submit-PMU phase excluded-kernel offset changed"
+);
 
 struct FdwicSubmitPmuPhaseAccumulator {
+    uint64_t shadow_total_cycles;
+    uint64_t phase_total_cycles;
+    uint64_t shadow_scalar_busy;
+    uint64_t phase_scalar_busy;
     uint64_t shadow_requests;
     uint64_t shadow_misses;
     uint64_t phase_requests;
@@ -351,11 +376,10 @@ struct FdwicSubmitPmuPhaseAccumulator {
     uint64_t phase_excluded_atomic_ticks;
     uint32_t begin_reads;
     uint32_t end_reads;
-    uint32_t max_shadow_request_chunk;
-    uint32_t max_shadow_miss_chunk;
     uint32_t status;
     bool armed;
     bool boundary_error;
+    bool counter_error;
 };
 
 struct FdwicSubmitPmuHeader {
@@ -369,8 +393,9 @@ struct FdwicSubmitPmuHeader {
     uint32_t expected_aic;
     uint32_t expected_aiv;
     uint64_t sys_cnt_freq_hz;
-    uint32_t selectors[5];
-    uint32_t reserved0;
+    // 依次为 CNT2 primary scalar、CNT3 shadow scalar、CNT5 shadow miss、
+    // CNT6 primary request、CNT7 primary miss、CNT8 shadow request。
+    uint32_t selectors[6];
 
     // AICPU owner 独占写入的状态 cacheline。
     volatile uint32_t owner_status;

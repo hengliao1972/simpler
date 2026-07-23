@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -161,6 +162,7 @@ def _denominator_summary(cores: int) -> dict[str, Any]:
         "scalar_submit_elapsed_ticks": _metric_summary(cores, 10_000),
         "total_cycles": _metric_summary(cores, 16_000),
         "scalar_busy": _metric_summary(cores, 12_000),
+        "non_scalar_busy_cycles": _metric_summary(cores, 4_000),
         "icache_requests": _metric_summary(cores, 2_000),
         "icache_misses": _metric_summary(cores, 200),
     }
@@ -169,10 +171,16 @@ def _denominator_summary(cores: int) -> dict[str, Any]:
 def _phase_summary(cores: int, calls_per_core: int) -> dict[str, Any]:
     return {
         "cores": cores,
+        "phase_total_cycles_observed": _metric_summary(cores, 1_000),
+        "phase_scalar_busy_observed": _metric_summary(cores, 600),
+        "phase_non_scalar_busy_cycles": _metric_summary(cores, 400),
+        "shadow_scalar_loss": _metric_summary(cores, 20),
         "phase_elapsed_ticks": _metric_summary(cores, 600),
         "phase_icache_requests_observed": _metric_summary(cores, 180),
         "phase_icache_misses_observed": _metric_summary(cores, 18),
-        "phase_time_share_of_scalar_submit": 0.06,
+        "phase_total_share_of_pmu_total": 0.0625,
+        "phase_scalar_share_of_whole_scalar": 0.05,
+        "phase_scalar_busy_share_of_phase_total": 0.6,
         "phase_request_observed_share_of_primary": 0.09,
         "phase_miss_observed_share_of_primary": 0.09,
         "phase_business_calls": calls_per_core * cores,
@@ -192,7 +200,7 @@ def _fake_capture(raw_path: Path, mode: str) -> SubmitPmuCapture:
             "name": mode.removeprefix("submit-pmu-"),
             "boundary": f"{mode}-begin-to-end",
             "counter_semantics": "running_read_clear_observed_bracket",
-            "time_semantics": "inner_sys_counter_ticks",
+            "time_semantics": "boundary_diagnostic_sys_cnt_between_observers",
         }
         phase_summary = {
             "all": _phase_summary(96, 5),
@@ -201,7 +209,12 @@ def _fake_capture(raw_path: Path, mode: str) -> SubmitPmuCapture:
         }
     data = {
         "capture": {"mode": mode},
-        "configuration": {"expected_submits_per_core": 5, "sys_counter_tick_ns": 1, "phase": phase},
+        "configuration": {
+            "expected_submits_per_core": 5,
+            "sys_counter_tick_ns": 1,
+            "pmu_cycles_per_ns": {"all": 1.649844, "aic": 1.650062, "aiv": 1.649731},
+            "phase": phase,
+        },
         "window": {"global_submit_span_us": 5_000.0},
     }
     return SubmitPmuCapture(
@@ -335,6 +348,22 @@ def test_complete_thirteen_profile_overview_and_mixed_git_heads_are_accepted(evi
     assert payload["submit_pmu_elfs"]["whole_window"]["capture_mode"] == overview_module.NONE_CAPTURE_MODE
     assert len(payload["submit_pmu_elfs"]["phase_profiles"]) == 11
     assert payload["submit_pmu_elfs"]["calibration"]["capture_mode"] == overview_module.EMPTY_BRACKET_CAPTURE_MODE
+    assert payload["schema"] == "fdwic-submit-span-overview-v3"
+    assert payload["semantics"]["cross_elf_phase_shares_additive"] is False
+    assert payload["semantics"]["cross_elf_synthetic_phase_sum_is_exact_overhead"] is False
+
+    phase_group = payload["submit_pmu_elfs"]["phase_profiles"][0]["phase"]["groups"]["all"]
+    assert phase_group["phase_total_cycles_observed"]["sum"] == 96_000
+    assert phase_group["phase_scalar_busy_observed"]["sum"] == 57_600
+    assert phase_group["phase_non_scalar_busy_cycles"]["sum"] == 38_400
+    assert phase_group["phase_total_share_of_pmu_total"] == 0.0625
+    assert phase_group["phase_scalar_share_of_whole_scalar"] == 0.05
+    assert phase_group["phase_scalar_busy_share_of_phase_total"] == 0.6
+    synthetic = payload["submit_pmu_elfs"]["synthetic_phase_sum_vs_none"]
+    assert synthetic["phase_profile_count"] == 11
+    assert synthetic["empty_bracket_excluded"] is True
+    assert synthetic["formal_partition_closure"] is False
+    assert synthetic["exact_observation_overhead"] is False
 
 
 def test_missing_and_duplicate_profiles_are_rejected(evidence: _Evidence) -> None:
@@ -382,19 +411,152 @@ def test_coverage_matrix_contains_all_exclusive_spans_and_residuals(evidence: _E
     } <= regions
 
 
-def test_html_forbids_cross_elf_totals_and_shows_only_min_max(evidence: _Evidence) -> None:
+def test_html_distinguishes_formal_ratios_from_synthetic_cross_elf_diagnostic(evidence: _Evidence) -> None:
     document = overview_module.render_overview(overview_module.build_overview(evidence.swimlane_raw, evidence.pmu_dirs))
 
+    assert all(line == line.rstrip() for line in document.splitlines())
     assert "各 PMU 行的占比也不能相加成 100%" in document
-    assert "页面没有也不会生成跨卡合计" in document
+    assert "只是一项显式跨 ELF 合成诊断" in document
+    assert "不是一次运行的正式分区闭合，也不是净性能开销" in document
+    assert "仅用于呈现观察膨胀指纹" in document
+    assert "泳道同父区间" in document
+    assert "PMU 占比" in document
+    assert "Phase PMU / 同 ELF whole PMU" in document
+    assert "Scalar-busy 占比" in document
+    assert "Phase scalar / 同 ELF whole scalar" in document
+    assert "并非泳道父区间，也不是" in document
     assert "AIC 每核 min–max" in document
     assert "AIV 每核 min–max" in document
-    assert "AIC 每核 600–601" in document
-    assert "AIV 每核 600–601" in document
-    assert "本 ELF：57,600 / 960,000 = 6.000%" in document
+    assert "Phase PMU total" in document
+    assert "Phase scalar busy" in document
+    assert "非 Scalar-busy 残余" in document
+    assert "Phase total / 同 ELF whole total：96,000 / 1,536,000 = 6.250%" in document
+    assert "Scalar / Phase total：57,600 / 96,000 = 60.000%" in document
+    assert "Phase scalar / 同 ELF whole scalar：57,600 / 1,152,000 = 5.000%" in document
+    assert "残余 / Phase total：38,400 / 96,000 = 40.000%" in document
+    assert "AIC 每核 1,000–1,001 cycles（0.606–0.607 µs）" in document
+    assert "SYS 边界诊断" in document
+    assert "只核验 phase 边界闭合，不作为阶段主时间或占比分母" in document
+    assert "1.649844/1.650062/1.649731 cycles/ns" in document
+    assert "SYS 边界闭合诊断（raw ticks）" in document
+    assert "不参与 PMU 1.65 GHz 时间换算或阶段比例" in document
+    assert "不能求和后与" in document
+    assert "whole Scalar busy 做正式判等" in document
+    assert "Scalar phase core-time" not in document
+    assert "Observer pair empirical elapsed" not in document
     assert "泳道与 PMU 之间仅对齐 96 核拓扑和每核 Submit 数" in document
-    for forbidden in ("均值", "median", "p95", "PMU phase 合计", "跨 ELF 合计"):
+    for forbidden in ("均值", "median", "p95", "净性能收益", "精确观察开销"):
         assert forbidden not in document
+
+
+def test_synthetic_phase_sum_vs_none_uses_raw_metrics_not_summed_phase_shares(evidence: _Evidence) -> None:
+    payload = overview_module.build_overview(evidence.swimlane_raw, evidence.pmu_dirs)
+    diagnostic = payload["submit_pmu_elfs"]["synthetic_phase_sum_vs_none"]
+    all_metrics = diagnostic["groups"]["all"]
+
+    assert diagnostic["included_profiles"] == [
+        mode
+        for mode in overview_module.PMU_MODE_ORDER
+        if mode not in {overview_module.NONE_CAPTURE_MODE, overview_module.EMPTY_BRACKET_CAPTURE_MODE}
+    ]
+    assert all_metrics["pmu_total_cycles"] == {
+        "label": "PMU total",
+        "unit": "cycles",
+        "phase_sum": 1_056_000,
+        "submit_none": 1_536_000,
+        "ratio": 0.6875,
+        "deviation_from_100_percent": -0.3125,
+        "phase_field": "phase_total_cycles_observed",
+        "submit_none_field": "pmu_total_cycles",
+    }
+    assert all_metrics["scalar_busy_cycles"]["phase_sum"] == 633_600
+    assert all_metrics["scalar_busy_cycles"]["submit_none"] == 1_152_000
+    assert all_metrics["scalar_busy_cycles"]["ratio"] == 0.55
+    assert all_metrics["non_scalar_busy_cycles"]["ratio"] == 1.1
+    assert all_metrics["icache_requests"]["ratio"] == pytest.approx(0.99)
+    assert all_metrics["icache_misses"]["ratio"] == pytest.approx(0.99)
+
+    document = overview_module.render_overview(payload)
+    assert "11 个业务分段合计 vs <code>submit-pmu-none</code>" in document
+    assert "1,056,000 / 1,536,000 = 68.750%" in document
+    assert "<td>68.750%</td>" in document
+    assert "<td>-31.250%</td>" in document
+    assert "empty-bracket 不参与" in document
+    assert "图形封顶 600%" not in document
+
+
+def test_partition_rows_join_only_semantically_matching_phase_profiles(evidence: _Evidence) -> None:
+    payload = overview_module.build_overview(evidence.swimlane_raw, evidence.pmu_dirs)
+    phases = {item["capture_mode"]: item for item in payload["submit_pmu_elfs"]["phase_profiles"]}
+    claim = phases[overview_module.CLAIM_CAPTURE_MODE]
+    claim_all = claim["phase"]["groups"]["all"]
+    claim_all["phase_total_cycles_observed"]["sum"] = 192_000
+    claim_all["phase_scalar_busy_observed"]["sum"] = 115_200
+    claim_all["phase_total_share_of_pmu_total"] = 0.125
+    claim_all["phase_scalar_share_of_whole_scalar"] = 0.1
+
+    efdrain = phases[overview_module.EFDRAIN_CONTROL_CAPTURE_MODE]
+    efdrain_all = efdrain["phase"]["groups"]["all"]
+    efdrain_all["phase_total_cycles_observed"]["sum"] = 384_000
+    efdrain_all["phase_scalar_busy_observed"]["sum"] = 230_400
+    efdrain_all["phase_total_share_of_pmu_total"] = 0.25
+    efdrain_all["phase_scalar_share_of_whole_scalar"] = 0.2
+
+    document = overview_module.render_overview(payload)
+
+    def row(metric: str) -> str:
+        match = re.search(
+            rf'<tr data-swimlane-metric="{re.escape(metric)}"[^>]*>.*?</tr>',
+            document,
+            flags=re.DOTALL,
+        )
+        assert match is not None
+        return match.group(0)
+
+    claim_row = row("claim")
+    assert f'data-pmu-profile="{overview_module.CLAIM_CAPTURE_MODE}"' in claim_row
+    assert 'data-pmu-mapping="same-business-boundary"' in claim_row
+    assert "<strong>12.500%</strong>" in claim_row
+    assert "<strong>10.000%</strong>" in claim_row
+
+    efdrain_row = row("efdrain")
+    assert f'data-pmu-profile="{overview_module.EFDRAIN_CONTROL_CAPTURE_MODE}"' in efdrain_row
+    assert 'data-pmu-mapping="control-only"' in efdrain_row
+    assert "<strong>25.000%</strong>" in efdrain_row
+    assert "<strong>20.000%</strong>" in efdrain_row
+
+    expected_links = {
+        "between_submit_residual": (
+            overview_module.SUBMIT_TRANSITION_CAPTURE_MODE,
+            "adjacent-submit-boundary",
+        ),
+        "efdrain": (overview_module.EFDRAIN_CONTROL_CAPTURE_MODE, "control-only"),
+        "efdrain_control": (overview_module.EFDRAIN_CONTROL_CAPTURE_MODE, "control-only"),
+        "materialize": (overview_module.MATERIALIZE_CAPTURE_MODE, "same-business-boundary"),
+        "prepare_map": (overview_module.PREPARE_MAP_CAPTURE_MODE, "same-business-boundary"),
+        "claim": (overview_module.CLAIM_CAPTURE_MODE, "same-business-boundary"),
+        "fanin": (overview_module.FANIN_CAPTURE_MODE, "same-business-boundary"),
+        "register": (overview_module.REGISTER_CAPTURE_MODE, "same-business-boundary"),
+        "winner_build": (overview_module.WINNER_BUILD_CAPTURE_MODE, "control-only"),
+        "alloc_complete": (overview_module.ALLOC_COMPLETE_CAPTURE_MODE, "control-only"),
+        "loser_replay": (overview_module.LOSER_REPLAY_CAPTURE_MODE, "same-business-boundary"),
+    }
+    for metric, (capture_mode, mapping) in expected_links.items():
+        linked_row = row(metric)
+        assert f'data-pmu-profile="{capture_mode}"' in linked_row
+        assert f'data-pmu-mapping="{mapping}"' in linked_row
+
+    for metric in (
+        "submit_union",
+        "submit_internal_residual",
+        "submit_tail_residual",
+        "efdrain_kernel_union",
+        "orchestration_replay",
+        "final_drain_kernel_union",
+    ):
+        unmapped_row = row(metric)
+        assert "data-pmu-profile" not in unmapped_row
+        assert unmapped_row.count('class="evidence-ratio evidence-na">—</td>') == 2
 
 
 def test_zero_primary_miss_denominator_is_rendered_as_not_applicable(evidence: _Evidence) -> None:

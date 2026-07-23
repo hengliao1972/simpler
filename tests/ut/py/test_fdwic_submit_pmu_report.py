@@ -162,7 +162,7 @@ def _valid_capture() -> dict[str, Any]:
     first_tick = min(record["first_submit_start_tick"] for record in records)
     last_tick = max(record["last_submit_end_tick"] for record in records)
     return {
-        "schema": "fdwic-submit-pmu-v2",
+        "schema": "fdwic-submit-pmu-v3",
         "capture": {
             "mode": "submit-pmu-none",
             "window_scope": "per_core_first_submit_begin_to_last_submit_end",
@@ -179,6 +179,7 @@ def _valid_capture() -> dict[str, Any]:
                 "cnt0_vector_busy": 0x501,
                 "cnt1_cube_busy": 0x301,
                 "cnt2_scalar_busy": 0x001,
+                "cnt3_shadow_scalar_busy": 0x001,
                 "cnt5_shadow_icache_miss": 0x035,
                 "cnt6_primary_icache_request": 0x034,
                 "cnt7_primary_icache_miss": 0x035,
@@ -235,7 +236,8 @@ def _valid_capture() -> dict[str, Any]:
             "window_stopped_records": 96,
             "submit_count_closed_records": 96,
             "scalar_le_total_records": 96,
-            "shadow_primary_match_records": 96,
+            "shadow_icache_primary_match_records": 96,
+            "shadow_scalar_primary_match_records": 96,
             "icache_miss_le_request_records": 96,
             "counter_below_risk_threshold_records": 96,
             "linked_kernel_gate_closed_records": 96,
@@ -260,34 +262,40 @@ def _valid_arg_build_capture() -> dict[str, Any]:
         "expected_calls_per_core": 5,
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_observed_bracket",
-        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+        "time_semantics": "boundary_diagnostic_sys_cnt_between_observers",
+        "pmu_observation": dict(report_module.PHASE_PMU_OBSERVATION),
     }
     for logical_core_id, record in enumerate(capture["records"]):
         record["status"] = COMMON_REQUIRED_STATUS_MASK
+        record["shadow_scalar_busy"] = record["scalar_busy"] - 20 - logical_core_id % 3
         record["shadow_icache_requests"] = record["icache_requests"] - 20 - logical_core_id % 3
         record["shadow_icache_misses"] = record["icache_misses"] - 5
         record.update(
             {
                 "phase_id": 1,
                 "phase_elapsed_ticks": 1_500 + logical_core_id,
+                "phase_total_cycles_observed": 3_000 + logical_core_id,
+                "phase_scalar_busy_observed": 2_100 + logical_core_id,
                 "phase_icache_requests_observed": 400 + logical_core_id,
                 "phase_icache_misses_observed": 40 + logical_core_id % 5,
                 "phase_begin_reads": 5,
                 "phase_end_reads": 5,
                 "phase_excluded_kernel_calls": 0,
-                "phase_max_shadow_request_chunk": 120 + logical_core_id % 7,
-                "phase_max_shadow_miss_chunk": 15 + logical_core_id % 3,
                 "phase_status": PHASE_REQUIRED_STATUS_MASK,
             }
         )
-    capture["validation"].pop("shadow_primary_match_records")
+    capture["validation"].pop("shadow_icache_primary_match_records")
+    capture["validation"].pop("shadow_scalar_primary_match_records")
     capture["validation"].update(
         {
             "phase_boundary_closed_records": 96,
             "phase_shape_match_records": 96,
-            "phase_values_ordered_records": 96,
+            "phase_icache_values_ordered_records": 96,
+            "phase_pmu_values_ordered_records": 96,
+            "phase_counter_reconstruction_valid_records": 96,
             "phase_time_within_submit_records": 96,
-            "shadow_primary_bounded_records": 96,
+            "shadow_icache_primary_bounded_records": 96,
+            "shadow_scalar_primary_bounded_records": 96,
             "phase_kernel_exclusion_closed_records": 96,
         }
     )
@@ -304,7 +312,8 @@ def _valid_empty_bracket_capture() -> dict[str, Any]:
         "expected_calls_per_core": 5,
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_empty_bracket_calibration",
-        "time_semantics": "outer_sys_cnt_around_adjacent_begin_end_pair",
+        "time_semantics": "boundary_diagnostic_outer_sys_cnt_around_adjacent_observer_pair",
+        "pmu_observation": dict(report_module.PHASE_PMU_OBSERVATION),
     }
     for logical_core_id, record in enumerate(capture["records"]):
         record["phase_id"] = 2
@@ -324,7 +333,8 @@ def _valid_materialize_capture() -> dict[str, Any]:
         "expected_calls_per_core": 5,
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_observed_bracket",
-        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+        "time_semantics": "boundary_diagnostic_sys_cnt_between_observers",
+        "pmu_observation": dict(report_module.PHASE_PMU_OBSERVATION),
     }
     for logical_core_id, record in enumerate(capture["records"]):
         record["phase_id"] = 3
@@ -344,7 +354,8 @@ def _valid_prepare_map_capture() -> dict[str, Any]:
         "expected_calls_per_core": 5,
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_observed_bracket",
-        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+        "time_semantics": "boundary_diagnostic_sys_cnt_between_observers",
+        "pmu_observation": dict(report_module.PHASE_PMU_OBSERVATION),
     }
     for logical_core_id, record in enumerate(capture["records"]):
         record["phase_id"] = 8
@@ -365,7 +376,8 @@ def _valid_fanin_capture() -> dict[str, Any]:
         "expected_calls": {"all": 4, "aic": 2, "aiv": 2},
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_observed_bracket",
-        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+        "time_semantics": "boundary_diagnostic_sys_cnt_between_observers",
+        "pmu_observation": dict(report_module.PHASE_PMU_OBSERVATION),
     }
     capture["validation"]["phase_global_call_count_closed"] = True
     active_calls = {0: 1, 1: 1, 32: 1, 33: 1}
@@ -373,6 +385,8 @@ def _valid_fanin_capture() -> dict[str, Any]:
         calls = active_calls.get(logical_core_id, 0)
         record["phase_id"] = 9
         record["phase_elapsed_ticks"] = 75 * calls
+        record["phase_total_cycles_observed"] = 300 * calls
+        record["phase_scalar_busy_observed"] = 180 * calls
         record["phase_icache_requests_observed"] = 40 * calls
         record["phase_icache_misses_observed"] = 2 * calls
         record["phase_begin_reads"] = calls
@@ -389,7 +403,8 @@ def _valid_winner_build_capture() -> dict[str, Any]:
             "name": "winner-build-control",
             "boundary": "winner_build_begin_to_end_excluding_linked_kernel_calls",
             "counter_semantics": "discontinuous_running_read_clear_excluding_linked_kernel_calls",
-            "time_semantics": "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls",
+            "time_semantics": "boundary_diagnostic_discontinuous_sys_cnt_segments_excluding_linked_kernel_calls",
+            "pmu_observation": dict(report_module.PHASE_PMU_OBSERVATION),
         }
     )
     capture["validation"]["phase_kernel_exclusion_closed_records"] = 96
@@ -419,7 +434,8 @@ def _valid_alloc_complete_capture(
         "expected_calls": {"all": 1},
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "discontinuous_running_read_clear_excluding_linked_kernel_calls",
-        "time_semantics": "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls",
+        "time_semantics": "boundary_diagnostic_discontinuous_sys_cnt_segments_excluding_linked_kernel_calls",
+        "pmu_observation": dict(report_module.PHASE_PMU_OBSERVATION),
     }
     capture["validation"]["phase_global_call_count_closed"] = True
     for logical_core_id, record in enumerate(capture["records"]):
@@ -429,6 +445,8 @@ def _valid_alloc_complete_capture(
             {
                 "phase_id": 11,
                 "phase_elapsed_ticks": 75 * business_calls,
+                "phase_total_cycles_observed": 300 * business_calls,
+                "phase_scalar_busy_observed": 180 * business_calls,
                 "phase_icache_requests_observed": 40 * business_calls,
                 "phase_icache_misses_observed": 2 * business_calls,
                 "phase_begin_reads": business_calls + excluded_calls,
@@ -452,7 +470,8 @@ def _valid_loser_replay_capture() -> dict[str, Any]:
         "expected_calls": {"all": 380, "aic": 126, "aiv": 254},
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_observed_bracket",
-        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+        "time_semantics": "boundary_diagnostic_sys_cnt_between_observers",
+        "pmu_observation": dict(report_module.PHASE_PMU_OBSERVATION),
     }
     capture["validation"]["phase_global_call_count_closed"] = True
     winner_cores = {0, 1, 32, 33}
@@ -462,6 +481,8 @@ def _valid_loser_replay_capture() -> dict[str, Any]:
             {
                 "phase_id": 12,
                 "phase_elapsed_ticks": 75 * calls,
+                "phase_total_cycles_observed": 300 * calls,
+                "phase_scalar_busy_observed": 180 * calls,
                 "phase_icache_requests_observed": 40 * calls,
                 "phase_icache_misses_observed": 2 * calls,
                 "phase_begin_reads": calls,
@@ -482,7 +503,8 @@ def _valid_claim_capture() -> dict[str, Any]:
         "expected_calls_per_core": 5,
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_observed_bracket",
-        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+        "time_semantics": "boundary_diagnostic_sys_cnt_between_observers",
+        "pmu_observation": dict(report_module.PHASE_PMU_OBSERVATION),
     }
     for logical_core_id, record in enumerate(capture["records"]):
         record["phase_id"] = 4
@@ -502,7 +524,8 @@ def _valid_register_capture() -> dict[str, Any]:
         "expected_calls_per_core": 5,
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_observed_bracket",
-        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+        "time_semantics": "boundary_diagnostic_sys_cnt_between_observers",
+        "pmu_observation": dict(report_module.PHASE_PMU_OBSERVATION),
     }
     for logical_core_id, record in enumerate(capture["records"]):
         record["phase_id"] = 5
@@ -522,7 +545,8 @@ def _valid_submit_transition_capture() -> dict[str, Any]:
         "expected_calls_per_core": 4,
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_observed_bracket",
-        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+        "time_semantics": "boundary_diagnostic_sys_cnt_between_observers",
+        "pmu_observation": dict(report_module.PHASE_PMU_OBSERVATION),
     }
     for logical_core_id, record in enumerate(capture["records"]):
         record["phase_id"] = 6
@@ -544,7 +568,8 @@ def _valid_efdrain_control_capture() -> dict[str, Any]:
         "expected_calls_per_core": 5,
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "discontinuous_running_read_clear_excluding_linked_kernel_calls",
-        "time_semantics": "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls",
+        "time_semantics": "boundary_diagnostic_discontinuous_sys_cnt_segments_excluding_linked_kernel_calls",
+        "pmu_observation": dict(report_module.PHASE_PMU_OBSERVATION),
     }
     capture["validation"]["phase_kernel_exclusion_closed_records"] = 96
     for logical_core_id, record in enumerate(capture["records"]):
@@ -740,12 +765,7 @@ def test_valid_capture_is_recomputed_and_rendered(tmp_path: Path) -> None:
     assert len(capture.groups["aiv"]) == 64
     assert all("shadow_icache_requests" not in record for record in capture.records)
     assert all("shadow_icache_misses" not in record for record in capture.records)
-    expected_ratios = {
-        "all": (16_000 / 9_000, 16_047.5 / 9_000, 16_095 / 9_000),
-        "aic": (16_000 / 9_000, 16_015.5 / 9_000, 16_031 / 9_000),
-        "aiv": (16_032 / 9_000, 16_063.5 / 9_000, 16_095 / 9_000),
-    }
-    for group_name, (minimum, mean, maximum) in expected_ratios.items():
+    for group_name in ("all", "aic", "aiv"):
         summary = capture.summary[group_name]
         assert summary["submit_elapsed_ticks"]["min"] == 10_000
         assert summary["submit_elapsed_ticks"]["mean"] == 10_000
@@ -759,11 +779,6 @@ def test_valid_capture_is_recomputed_and_rendered(tmp_path: Path) -> None:
         assert summary["non_scalar_busy_cycles"]["min"] == 4_000
         assert summary["non_scalar_busy_cycles"]["mean"] == 4_000
         assert summary["non_scalar_busy_cycles"]["max"] == 4_000
-        ratio = summary["pmu_total_cycles_per_scalar_tick"]
-        assert ratio["min"] == pytest.approx(minimum)
-        assert ratio["mean"] == pytest.approx(mean)
-        assert ratio["max"] == pytest.approx(maximum)
-
     document = render_report(raw_path)
     assert "真实 FDWIC Scalar Submit PMU" in document
     assert "32 AIC + 64 AIV" in document
@@ -771,10 +786,10 @@ def test_valid_capture_is_recomputed_and_rendered(tmp_path: Path) -> None:
     assert "90.000 ns" in document
     assert "不是 Submit 墙钟损失" in document
     assert "非 Scalar-busy 残余不是空闲时间，也不是 I-cache stall" in document
-    assert "Scalar Submit 时间分母/core" in document
-    assert "PMU-total / Scalar SYS/core" in document
-    assert "不要求精确等于校准频率" in document
-    assert "result-used return-ready atomic 的依赖区间只从 Scalar SYS 时间分母" in document
+    assert "SYS gate 边界诊断/core" in document
+    assert "它不是按 1.65 GHz 换算的 PMU 阶段时间" in document
+    assert "PMU-total / SYS gate/core" not in document
+    assert "result-used return-ready atomic 的依赖区间只从 SYS gate 边界累计值" in document
     assert "I-cache/PMU counter 仍包含其指令事件" in document
     assert "source-issue atomic" in document
     assert "不能称为纯 Kernel 时间" in document
@@ -788,12 +803,10 @@ def test_valid_capture_is_recomputed_and_rendered(tmp_path: Path) -> None:
         requests = summary["icache_requests"]
         misses = summary["icache_misses"]
         assert (
-            f"<dt>Primary I-cache request/core</dt><dd>"
-            f"最小 {requests['min']:,}；最大 {requests['max']:,}</dd>"
+            f"<dt>Primary I-cache request/core</dt><dd>最小 {requests['min']:,}；最大 {requests['max']:,}</dd>"
         ) in document
         assert (
-            f"<dt>Primary I-cache miss/core</dt><dd>"
-            f"最小 {misses['min']:,}；最大 {misses['max']:,}</dd>"
+            f"<dt>Primary I-cache miss/core</dt><dd>最小 {misses['min']:,}；最大 {misses['max']:,}</dd>"
         ) in document
         assert (
             f"<dt>90 ns 直觉量尺/core</dt>\n"
@@ -829,7 +842,6 @@ def test_python_only_derived_metrics_do_not_expand_raw_summary(tmp_path: Path) -
             "scalar_submit_elapsed_ticks",
             "scalar_denominator_excluded_wall_ticks",
             "non_scalar_busy_cycles",
-            "pmu_total_cycles_per_scalar_tick",
         } <= set(group)
 
 
@@ -848,16 +860,14 @@ def test_non_scalar_busy_extrema_are_computed_per_record(tmp_path: Path) -> None
     assert residual["min"] == 1_000
     assert residual["max"] == 18_000
     assert residual["min"] != (
-        capture.summary["all"]["total_cycles"]["min"]
-        - capture.summary["all"]["scalar_busy"]["min"]
+        capture.summary["all"]["total_cycles"]["min"] - capture.summary["all"]["scalar_busy"]["min"]
     )
     assert residual["max"] != (
-        capture.summary["all"]["total_cycles"]["max"]
-        - capture.summary["all"]["scalar_busy"]["max"]
+        capture.summary["all"]["total_cycles"]["max"] - capture.summary["all"]["scalar_busy"]["max"]
     )
 
 
-def test_effective_ratio_is_mean_of_per_core_ratios(tmp_path: Path) -> None:
+def test_summary_does_not_derive_a_frequency_from_sys_ticks(tmp_path: Path) -> None:
     capture_data = _valid_capture()
     for logical_core_id, record in enumerate(capture_data["records"]):
         elapsed = 10_000 if logical_core_id % 2 == 0 else 20_000
@@ -870,19 +880,11 @@ def test_effective_ratio_is_mean_of_per_core_ratios(tmp_path: Path) -> None:
 
     capture = load_capture(_write_capture(tmp_path, capture_data))
 
-    for group_name in ("all", "aic", "aiv"):
-        ratio = capture.summary[group_name]["pmu_total_cycles_per_scalar_tick"]
-        assert ratio["min"] == pytest.approx(1.0)
-        assert ratio["mean"] == pytest.approx(1.5)
-        assert ratio["max"] == pytest.approx(2.0)
-        group = capture.groups[group_name]
-        ratio_of_sums = sum(record["total_cycles"] for record in group) / sum(
-            record["scalar_submit_elapsed_ticks"] for record in group
-        )
-        assert ratio["mean"] != pytest.approx(ratio_of_sums)
+    assert all("pmu_total_cycles_per_scalar_tick" not in summary for summary in capture.summary.values())
+    assert "PMU-total / SYS gate/core" not in render_report(capture.input_path)
 
 
-def test_zero_submit_elapsed_is_rejected_before_derived_ratio(tmp_path: Path) -> None:
+def test_zero_submit_elapsed_is_rejected_before_summary(tmp_path: Path) -> None:
     capture_data = _valid_capture()
     record = capture_data["records"][0]
     record["last_submit_end_tick"] = record["first_submit_start_tick"]
@@ -922,31 +924,44 @@ def test_valid_arg_build_capture_renders_same_elf_phase_observation_first(tmp_pa
     assert all_phase["phase_icache_requests_observed_plus_capture_gap"]["sum"] == all_phase[
         "phase_icache_requests_observed"
     ]["sum"] + sum(record["icache_requests"] - record["shadow_icache_requests"] for record in capture.records)
+    assert all_phase["phase_non_scalar_busy_cycles"]["sum"] == sum(
+        record["phase_total_cycles_observed"] - record["phase_scalar_busy_observed"] for record in capture.records
+    )
+    assert all_phase["shadow_scalar_loss"]["sum"] == sum(
+        record["scalar_busy"] - record["shadow_scalar_busy"] for record in capture.records
+    )
 
     document = render_report(raw_path)
     assert document.index("<code>arg-build</code> 阶段观察") < document.index("全局 Submit 时间范围")
     assert "claim_end_to_materialize_begin" in document
     assert "running_read_clear_observed_bracket" in document
-    assert "inner_sys_cnt_between_boundary_observers" in document
-    assert "时间占比" in document
+    assert "boundary_diagnostic_sys_cnt_between_observers" in document
+    assert "Phase PMU total" in document
+    assert "Phase scalar busy" in document
+    assert "非 Scalar-busy 残余" in document
+    assert "阶段关系 / 同 ELF 整窗占比" in document
     assert "Request observed（总数 / 逐核 min–max / Primary）" in document
     assert "Miss observed（总数 / 逐核 min–max / Primary）" in document
     assert "observed_plus_capture_gap = observed + (primary − shadow)" in document
     assert "插桩 bookkeeping 会进入 sample" in document
     assert "不是原业务" in document
     assert "事件数的数学上下界" in document
-    assert "时间占比的分母是同一 ELF 的 Σ每核 Scalar Submit elapsed" in document
-    assert "result-used return-ready atomic 依赖区间只从时间扣除" in document
+    assert "阶段主时间来自 running read-clear 的 PMU total cycles" in document
+    assert "phase_elapsed_ticks 只是 SYS 边界闭合诊断" in document
+    assert "绝不按 1 GHz 当作阶段时间" in document
+    assert "result-used return-ready atomic" in document
+    assert "只从 SYS 边界累计值扣除" in document
     assert "I-cache/PMU counter 仍含其指令事件" in document
-    assert "source-issue atomic 保留" in document
-    assert "request/miss 百分比的分母才是" in document
+    assert "source-issue atomic" in document
+    assert "保留在时间和计数口径内" in document
+    assert "request/miss 百分比的分母是" in document
     assert "同一次采集的 Submit 整窗 primary" in document
-    assert "每次调用 elapsed" in document
-    assert "每次调用 elapsed / request / miss observed" not in document
+    assert "cycles/call" in document
     assert "是每核累计" in document
     assert "不是逐调用极值" in document
     assert "不能跨 ELF 相减" in document
-    assert "shadow 是 begin/end/final 全部 running read-clear 返回值之和" in document
+    assert "I-cache shadow 是 begin/end/final 全部 running read-clear 返回值之和" in document
+    assert "scalar shadow 同样用于核验 phase 读清重建" in document
     for group_name in ("all", "aic", "aiv"):
         phase = capture.phase_summary[group_name]
         group_records = capture.groups[group_name]
@@ -954,12 +969,32 @@ def test_valid_arg_build_capture_renders_same_elf_phase_observation_first(tmp_pa
         misses = phase["phase_icache_misses_observed"]
         assert phase["primary_icache_requests"] == sum(record["icache_requests"] for record in group_records)
         assert phase["primary_icache_misses"] == sum(record["icache_misses"] for record in group_records)
-        assert f"{phase['phase_time_share_of_scalar_submit']:.3%}" in document
+        assert phase["phase_total_share_of_pmu_total"] == pytest.approx(
+            sum(record["phase_total_cycles_observed"] for record in group_records)
+            / sum(record["total_cycles"] for record in group_records)
+        )
+        assert phase["phase_scalar_share_of_whole_scalar"] == pytest.approx(
+            sum(record["phase_scalar_busy_observed"] for record in group_records)
+            / sum(record["scalar_busy"] for record in group_records)
+        )
+        assert phase["phase_scalar_busy_share_of_phase_total"] == pytest.approx(
+            sum(record["phase_scalar_busy_observed"] for record in group_records)
+            / sum(record["phase_total_cycles_observed"] for record in group_records)
+        )
+        assert f"{phase['phase_total_share_of_pmu_total']:.3%}" in document
+        assert f"{phase['phase_scalar_share_of_whole_scalar']:.3%}" in document
+        assert f"{phase['phase_scalar_busy_share_of_phase_total']:.3%}" in document
         assert f"{phase['phase_request_observed_share_of_primary']:.3%}" in document
         assert f"{phase['phase_request_observed_plus_capture_gap_share_of_primary']:.3%}" in document
         assert f"{phase['phase_miss_observed_share_of_primary']:.3%}" in document
         assert f"{phase['phase_miss_observed_plus_capture_gap_share_of_primary']:.3%}" in document
-        assert f"{phase['phase_elapsed_ticks_per_call']:,.3f} ns" in document
+        assert f"{phase['phase_total_cycles_observed_per_call']:,.3f} cycles/call" in document
+        assert f"{phase['phase_scalar_busy_observed_per_call']:,.3f} cycles/call" in document
+        assert f"{phase['phase_non_scalar_busy_cycles_per_call']:,.3f} cycles/call" in document
+        cycles_per_ns = capture.data["configuration"]["pmu_cycles_per_ns"][group_name]
+        phase_time_us = phase["phase_total_cycles_observed"]["sum"] / cycles_per_ns / 1_000
+        assert f"≈ {phase_time_us:,.3f} µs（{cycles_per_ns:.6f} cycles/ns）" in document
+        assert f"Σ {phase['phase_elapsed_ticks']['sum']:,} raw ticks" in document
         assert f"逐核 最小 {requests['min']:,}；最大 {requests['max']:,}" in document
         assert f"逐核 最小 {misses['min']:,}；最大 {misses['max']:,}" in document
         assert f"Primary {phase['primary_icache_requests']:,}" in document
@@ -977,20 +1012,34 @@ def test_valid_empty_bracket_capture_is_reported_as_observer_calibration(tmp_pat
     assert "phase_id=2" in document
     assert "claim_end_adjacent_empty_bracket" in document
     assert "running_read_clear_empty_bracket_calibration" in document
-    assert "outer_sys_cnt_around_adjacent_begin_end_pair" in document
+    assert "boundary_diagnostic_outer_sys_cnt_around_adjacent_observer_pair" in document
     assert "观察器自成本量尺，不是业务 phase" in document
-    assert "phase_elapsed 是紧邻 begin+end 对的外层 SYS_CNT 经验耗时" in document
-    assert "含计时边界底噪" in document
+    assert "phase PMU total/scalar 是紧邻 begin/end 对本身带来的计数开销量尺" in document
     assert "仍只覆盖两次 shadow read-clear 之间" in document
-    assert "并不包含 begin 读取前/end 读取后的全部 observer 取指" in document
-    assert "两者都只是量级参照，不能跨 ELF 精确扣减" in document
+    assert "SYS tick 只用来核验边界是否闭合" in document
+    assert "这些量尺都不能跨 ELF 精确扣减" in document
     for group_name in ("all", "aic", "aiv"):
         phase = capture.phase_summary[group_name]
         requests = phase["phase_icache_requests_observed"]
         misses = phase["phase_icache_misses_observed"]
-        assert f"{phase['phase_elapsed_ticks_per_call']:,.3f} ns" in document
+        assert f"{phase['phase_total_cycles_observed_per_call']:,.3f} cycles/call" in document
         assert f"逐核 最小 {requests['min']:,}；最大 {requests['max']:,}" in document
         assert f"逐核 最小 {misses['min']:,}；最大 {misses['max']:,}" in document
+
+
+def test_phase_non_scalar_extrema_are_derived_per_core(tmp_path: Path) -> None:
+    capture_data = _valid_arg_build_capture()
+    capture_data["records"][0]["phase_total_cycles_observed"] = 5_000
+    capture_data["records"][0]["phase_scalar_busy_observed"] = 4_900
+    capture_data["records"][1]["phase_total_cycles_observed"] = 4_000
+    capture_data["records"][1]["phase_scalar_busy_observed"] = 1_000
+
+    capture = load_capture(_write_capture(tmp_path, capture_data))
+
+    assert capture.phase_summary is not None
+    residual = capture.phase_summary["all"]["phase_non_scalar_busy_cycles"]
+    assert residual["min"] == 100
+    assert residual["max"] == 3_000
 
 
 def test_empty_bracket_rejects_arg_build_phase_id(tmp_path: Path) -> None:
@@ -1013,7 +1062,7 @@ def test_valid_materialize_capture_tracks_current_business_boundary(tmp_path: Pa
     assert "phase_id=3" in document
     assert "materialize_begin_to_materialize_end" in document
     assert "running_read_clear_observed_bracket" in document
-    assert "inner_sys_cnt_between_boundary_observers" in document
+    assert "boundary_diagnostic_sys_cnt_between_observers" in document
     assert "观察器自成本量尺，不是业务 phase" not in document
 
 
@@ -1056,7 +1105,7 @@ def test_valid_prepare_map_capture_tracks_call_body_boundary(tmp_path: Path) -> 
     assert "phase_id=8" in document
     assert "dist_submit_prepare_map_call_entry_to_return" in document
     assert "running_read_clear_observed_bracket" in document
-    assert "inner_sys_cnt_between_boundary_observers" in document
+    assert "boundary_diagnostic_sys_cnt_between_observers" in document
 
 
 @pytest.mark.parametrize(
@@ -1119,9 +1168,13 @@ def test_fanin_rejects_wrong_global_role_call_totals(tmp_path: Path) -> None:
         capture["records"][1][field] = 0
         capture["records"][34][field] = 1
     capture["records"][1]["phase_elapsed_ticks"] = 0
+    capture["records"][1]["phase_total_cycles_observed"] = 0
+    capture["records"][1]["phase_scalar_busy_observed"] = 0
     capture["records"][1]["phase_icache_requests_observed"] = 0
     capture["records"][1]["phase_icache_misses_observed"] = 0
     capture["records"][34]["phase_elapsed_ticks"] = 75
+    capture["records"][34]["phase_total_cycles_observed"] = 300
+    capture["records"][34]["phase_scalar_busy_observed"] = 180
     capture["records"][34]["phase_icache_requests_observed"] = 40
     capture["records"][34]["phase_icache_misses_observed"] = 2
 
@@ -1129,11 +1182,24 @@ def test_fanin_rejects_wrong_global_role_call_totals(tmp_path: Path) -> None:
         load_capture(_write_capture(tmp_path, capture))
 
 
-def test_fanin_rejects_nonzero_values_on_zero_call_core(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "field",
+    (
+        "phase_elapsed_ticks",
+        "phase_total_cycles_observed",
+        "phase_scalar_busy_observed",
+        "phase_icache_requests_observed",
+        "phase_icache_misses_observed",
+    ),
+)
+def test_fanin_rejects_nonzero_values_on_zero_call_core(tmp_path: Path, field: str) -> None:
     capture = _valid_fanin_capture()
-    capture["records"][2]["phase_elapsed_ticks"] = 1
+    capture["records"][2][field] = 1
 
-    with pytest.raises(ValueError, match="zero-call dynamic phase must have zero"):
+    with pytest.raises(
+        ValueError,
+        match="zero-call dynamic phase must have zero elapsed/total/scalar/request/miss",
+    ):
         load_capture(_write_capture(tmp_path, capture))
 
 
@@ -1150,10 +1216,6 @@ def test_valid_winner_build_control_capture_excludes_linked_kernel_segments(tmp_
     assert all_phase["phase_begin_reads"] == 6
     assert all_phase["phase_end_reads"] == 6
     assert all_phase["phase_excluded_kernel_calls"] == 2
-    assert all_phase["phase_elapsed_ticks_per_call"] == pytest.approx(75)
-    assert all_phase["phase_elapsed_ticks_per_call"] != pytest.approx(
-        all_phase["phase_elapsed_ticks"]["sum"] / all_phase["phase_begin_reads"]
-    )
     assert all_phase["phase_icache_requests_observed_per_call"] == pytest.approx(40)
     assert all_phase["phase_icache_misses_observed_per_call"] == pytest.approx(2)
     assert all_phase["phase_calls_per_core"]["min"] == 0
@@ -1164,7 +1226,7 @@ def test_valid_winner_build_control_capture_excludes_linked_kernel_segments(tmp_
     assert "phase_id=10" in document
     assert "winner_build_begin_to_end_excluding_linked_kernel_calls" in document
     assert "discontinuous_running_read_clear_excluding_linked_kernel_calls" in document
-    assert "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls" in document
+    assert "boundary_diagnostic_discontinuous_sys_cnt_segments_excluding_linked_kernel_calls" in document
     assert "call_shape=dynamic_balanced" in document
     assert "expected_calls=ALL 4 / AIC 2 / AIV 2" in document
     assert "业务调用 4 次；排除 linked Kernel 调用 2 次" in document
@@ -1175,6 +1237,8 @@ def test_winner_build_control_global_shape_uses_business_calls_not_boundary_read
     capture = _valid_winner_build_capture()
     capture["records"][0]["phase_excluded_kernel_calls"] += 1
     capture["records"][0]["phase_elapsed_ticks"] = 0
+    capture["records"][0]["phase_total_cycles_observed"] = 0
+    capture["records"][0]["phase_scalar_busy_observed"] = 0
     capture["records"][0]["phase_icache_requests_observed"] = 0
     capture["records"][0]["phase_icache_misses_observed"] = 0
 
@@ -1255,7 +1319,6 @@ def test_valid_alloc_complete_control_accepts_role_unlocked_b1_winner(
     assert all_phase["phase_begin_reads"] == 3
     assert all_phase["phase_end_reads"] == 3
     assert all_phase["phase_excluded_kernel_calls"] == 2
-    assert all_phase["phase_elapsed_ticks_per_call"] == pytest.approx(75)
     assert all_phase["phase_icache_requests_observed_per_call"] == pytest.approx(40)
     assert all_phase["phase_icache_misses_observed_per_call"] == pytest.approx(2)
     assert all_phase["phase_calls_per_core"]["min"] == 0
@@ -1267,7 +1330,7 @@ def test_valid_alloc_complete_control_accepts_role_unlocked_b1_winner(
     assert "phase_id=11" in document
     assert "alloc_complete_begin_to_end_excluding_linked_kernel_calls" in document
     assert "discontinuous_running_read_clear_excluding_linked_kernel_calls" in document
-    assert "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls" in document
+    assert "boundary_diagnostic_discontinuous_sys_cnt_segments_excluding_linked_kernel_calls" in document
     assert "call_shape=dynamic_global" in document
     assert "expected_calls=ALL 1（角色不锁定）" in document
     assert "业务调用 1 次；排除 linked Kernel 调用 2 次" in document
@@ -1280,6 +1343,8 @@ def test_alloc_complete_control_rejects_wrong_global_call_total(tmp_path: Path) 
     winner["phase_begin_reads"] = winner["phase_excluded_kernel_calls"]
     winner["phase_end_reads"] = winner["phase_excluded_kernel_calls"]
     winner["phase_elapsed_ticks"] = 0
+    winner["phase_total_cycles_observed"] = 0
+    winner["phase_scalar_busy_observed"] = 0
     winner["phase_icache_requests_observed"] = 0
     winner["phase_icache_misses_observed"] = 0
 
@@ -1358,7 +1423,6 @@ def test_valid_loser_replay_capture_closes_b1_role_totals_and_html(tmp_path: Pat
     assert all_phase["phase_begin_reads"] == 380
     assert all_phase["phase_end_reads"] == 380
     assert all_phase["phase_excluded_kernel_calls"] == 0
-    assert all_phase["phase_elapsed_ticks_per_call"] == pytest.approx(75)
     assert all_phase["phase_icache_requests_observed_per_call"] == pytest.approx(40)
     assert all_phase["phase_icache_misses_observed_per_call"] == pytest.approx(2)
     assert all_phase["phase_calls_per_core"]["min"] == 3
@@ -1370,7 +1434,7 @@ def test_valid_loser_replay_capture_closes_b1_role_totals_and_html(tmp_path: Pat
     assert "phase_id=12" in document
     assert "register_end_to_drain_block_won_return" in document
     assert "running_read_clear_observed_bracket" in document
-    assert "inner_sys_cnt_between_boundary_observers" in document
+    assert "boundary_diagnostic_sys_cnt_between_observers" in document
     assert "call_shape=dynamic_balanced" in document
     assert "expected_calls=ALL 380 / AIC 126 / AIV 254" in document
     assert "业务调用 380 次；排除 linked Kernel 调用 0 次" in document
@@ -1467,7 +1531,7 @@ def test_valid_claim_capture_tracks_current_business_boundary(tmp_path: Path) ->
     assert "phase_id=4" in document
     assert "claim_begin_to_claim_end" in document
     assert "running_read_clear_observed_bracket" in document
-    assert "inner_sys_cnt_between_boundary_observers" in document
+    assert "boundary_diagnostic_sys_cnt_between_observers" in document
     assert "观察器自成本量尺，不是业务 phase" not in document
 
 
@@ -1510,7 +1574,7 @@ def test_valid_register_capture_tracks_call_body_boundary(tmp_path: Path) -> Non
     assert "phase_id=5" in document
     assert "register_outputs_call_entry_to_return" in document
     assert "running_read_clear_observed_bracket" in document
-    assert "inner_sys_cnt_between_boundary_observers" in document
+    assert "boundary_diagnostic_sys_cnt_between_observers" in document
     assert "观察器自成本量尺，不是业务 phase" not in document
 
 
@@ -1629,17 +1693,12 @@ def test_valid_efdrain_control_capture_excludes_linked_kernel_segments(tmp_path:
     all_phase = capture.phase_summary["all"]
     outer_calls = 96 * 5
     excluded_kernel_calls = sum(record["phase_excluded_kernel_calls"] for record in capture.records)
-    total_elapsed = sum(record["phase_elapsed_ticks"] for record in capture.records)
     total_requests = sum(record["phase_icache_requests_observed"] for record in capture.records)
     total_misses = sum(record["phase_icache_misses_observed"] for record in capture.records)
     assert capture.data["validation"]["phase_kernel_exclusion_closed_records"] == 96
     assert all_phase["phase_excluded_kernel_calls"] == excluded_kernel_calls
     assert all_phase["phase_begin_reads"] == outer_calls + excluded_kernel_calls
     assert all_phase["phase_end_reads"] == outer_calls + excluded_kernel_calls
-    assert all_phase["phase_elapsed_ticks_per_call"] == pytest.approx(total_elapsed / outer_calls)
-    assert all_phase["phase_elapsed_ticks_per_call"] != pytest.approx(
-        total_elapsed / all_phase["phase_end_reads"]
-    )
     assert all_phase["phase_icache_requests_observed_per_call"] == pytest.approx(total_requests / outer_calls)
     assert all_phase["phase_icache_misses_observed_per_call"] == pytest.approx(total_misses / outer_calls)
 
@@ -1648,17 +1707,15 @@ def test_valid_efdrain_control_capture_excludes_linked_kernel_segments(tmp_path:
     assert "phase_id=7" in document
     assert "efdrain_begin_to_end_excluding_linked_kernel_calls" in document
     assert "discontinuous_running_read_clear_excluding_linked_kernel_calls" in document
-    assert "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls" in document
-    assert "elapsed、request 和 miss 都排除该 Kernel 整段" in document
+    assert "boundary_diagnostic_discontinuous_sys_cnt_segments_excluding_linked_kernel_calls" in document
+    assert "total、scalar、request、miss 及 SYS 边界诊断都排除该 Kernel 整段" in document
     assert "result-used return-ready atomic" in document
-    assert "request/miss 仍含 atomic 指令事件" in document
+    assert "PMU counter" in document
+    assert "仍含 atomic 指令事件" in document
     assert "source-issue atomic" in document
     assert "每次调用的分母仍是外层业务调用次数" in document
-    assert "<th>Begin / End reads</th>" in document
-    assert (
-        f"<small>业务调用 {outer_calls} 次；排除 linked Kernel 调用 {excluded_kernel_calls} 次</small>"
-        in document
-    )
+    assert "<th>SYS 边界诊断 / Begin-End</th>" in document
+    assert f"<small>业务调用 {outer_calls} 次；排除 linked Kernel 调用 {excluded_kernel_calls} 次</small>" in document
 
 
 @pytest.mark.parametrize(
@@ -1829,6 +1886,71 @@ def test_arg_build_rejects_observed_counter_above_shadow(tmp_path: Path) -> None
         load_capture(_write_capture(tmp_path, capture))
 
 
+def test_arg_build_requires_phase_total_and_scalar_fields(tmp_path: Path) -> None:
+    for field in ("phase_total_cycles_observed", "phase_scalar_busy_observed", "shadow_scalar_busy"):
+        capture = _valid_arg_build_capture()
+        capture["records"][0].pop(field)
+
+        with pytest.raises(ValueError, match=rf"records\[0\]\.{field} must be an integer"):
+            load_capture(_write_capture(tmp_path, capture))
+
+
+def test_arg_build_rejects_zero_whole_shadow_scalar(tmp_path: Path) -> None:
+    capture = _valid_arg_build_capture()
+    capture["records"][0]["shadow_scalar_busy"] = 0
+
+    with pytest.raises(ValueError, match=r"records\[0\]\.shadow_scalar_busy must be an integer >= 1"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+@pytest.mark.parametrize(
+    ("field", "value_from_record", "message"),
+    (
+        (
+            "phase_scalar_busy_observed",
+            lambda record: record["phase_total_cycles_observed"] + 1,
+            "phase_scalar_busy_observed exceeds phase_total_cycles_observed",
+        ),
+        (
+            "phase_total_cycles_observed",
+            lambda record: record["total_cycles"] + 1,
+            "phase_total_cycles_observed exceeds total_cycles",
+        ),
+        (
+            "shadow_scalar_busy",
+            lambda record: record["phase_scalar_busy_observed"] - 1,
+            "phase_scalar_busy_observed exceeds shadow_scalar_busy",
+        ),
+        (
+            "shadow_scalar_busy",
+            lambda record: record["scalar_busy"] + 1,
+            "shadow_scalar_busy exceeds scalar_busy",
+        ),
+    ),
+)
+def test_arg_build_rejects_invalid_phase_pmu_ordering(
+    tmp_path: Path,
+    field: str,
+    value_from_record: Callable[[dict[str, Any]], int],
+    message: str,
+) -> None:
+    capture = _valid_arg_build_capture()
+    record = capture["records"][0]
+    record[field] = value_from_record(record)
+
+    with pytest.raises(ValueError, match=message):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_arg_build_requires_positive_phase_total_for_business_calls(tmp_path: Path) -> None:
+    capture = _valid_arg_build_capture()
+    capture["records"][0]["phase_total_cycles_observed"] = 0
+    capture["records"][0]["phase_scalar_busy_observed"] = 0
+
+    with pytest.raises(ValueError, match="non-empty phase must have positive phase_total_cycles_observed"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
 def test_arg_build_rejects_phase_time_beyond_scalar_denominator(tmp_path: Path) -> None:
     capture = _valid_arg_build_capture()
     capture["records"][0]["phase_elapsed_ticks"] = capture["records"][0]["scalar_submit_elapsed_ticks"] + 1
@@ -1841,7 +1963,15 @@ def test_arg_build_rejects_incomplete_phase_status(tmp_path: Path) -> None:
     capture = _valid_arg_build_capture()
     capture["records"][0]["phase_status"] &= ~(1 << 5)
 
-    with pytest.raises(ValueError, match="phase_status must equal 0x3f"):
+    with pytest.raises(ValueError, match=r"phase_status must equal 0x3ff, got 0x3df$"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_arg_build_rejects_mismatched_phase_pmu_observation_contract(tmp_path: Path) -> None:
+    capture = _valid_arg_build_capture()
+    capture["configuration"]["phase"]["pmu_observation"]["sys_cnt_role"] = "primary_phase_timing"
+
+    with pytest.raises(ValueError, match=r"configuration\.phase"):
         load_capture(_write_capture(tmp_path, capture))
 
 
@@ -1876,9 +2006,12 @@ def test_arg_build_rejects_deprecated_phase_time_validation_name(tmp_path: Path)
     (
         "phase_boundary_closed_records",
         "phase_shape_match_records",
-        "phase_values_ordered_records",
+        "phase_icache_values_ordered_records",
+        "phase_pmu_values_ordered_records",
+        "phase_counter_reconstruction_valid_records",
         "phase_time_within_submit_records",
-        "shadow_primary_bounded_records",
+        "shadow_icache_primary_bounded_records",
+        "shadow_scalar_primary_bounded_records",
     ),
 )
 def test_arg_build_requires_all_producer_phase_validations(tmp_path: Path, field: str) -> None:
@@ -2037,9 +2170,7 @@ def test_provenance_publish_preserves_raw_and_closes_sidecar_and_html(
     assert build["source_state_version"] == "source-v2"
     assert build["source_state_path"] == str(identity.source_state_path)
     assert build["compile_definitions"] == list(identity.compile_definitions)
-    assert build["definitions_sha256"] == hashlib.sha256(
-        repr(build["compile_definitions"]).encode()
-    ).hexdigest()
+    assert build["definitions_sha256"] == hashlib.sha256(repr(build["compile_definitions"]).encode()).hexdigest()
 
     frozen_artifacts = dict(identity.artifacts)
     assert set(provenance["artifacts"]) == {

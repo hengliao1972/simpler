@@ -3166,3 +3166,176 @@ ruff check / format --check（本轮新增 Python 文件）
 git diff --check
     PASS
 ```
+
+### 2026-07-23 / O13：阶段计时改为 PMU total 1.65 GHz 口径
+
+状态：**[观察工具：ABI/schema v3、335 项定向 UT、真实 A5 B1/Case1 及 13 个 profile 全部闭合]**
+
+#### 为什么不能继续用 SYS tick 冒充阶段耗时
+
+v2 的 `phase_elapsed_ticks` 是观察器边界内累计的 SYS_CNT：它适合确认 begin/end 是否闭合，
+但不是阶段 local PMU total，也不能回答阶段内 scalar-busy 与非 scalar-busy 周期的关系。把它按
+1 tick = 1 ns 直接呈现为阶段主时间，会把边界时间戳、观察器 bookkeeping 和 PMU 计数口径混在一起，
+也无法与 whole PMU total/scalar 正确闭合。
+
+v3 因此明确拆成两条数据：
+
+1. 阶段主时间使用 `phase_total_cycles_observed`，由唯一 TOTAL PMU counter running read-clear，
+   再在软件中重建 whole total；ALL/AIC/AIV 分别按
+   `1.649844/1.650062/1.649731 cycles/ns` 换算等效时间。
+2. `phase_elapsed_ticks` 只作为 raw SYS 边界闭合诊断保留。HTML 不把它换算成阶段时间，不用它做
+   phase 占比，也不再出现“1 GHz phase time”的解释。
+
+同一阶段还新增 `phase_scalar_busy_observed`。CNT3 配成与 CNT2 相同的 scalar selector `0x001`：
+CNT2 保留 whole primary，CNT3 负责运行中 read-clear 的 phase local scalar。begin 顺序为
+TOTAL → scalar → I-cache，end 按 I-cache → scalar → TOTAL 反序读取，使 scalar 观察窗嵌套在
+total 观察窗内。逐核必须满足：
+
+```text
+phase_scalar_busy_observed <= phase_total_cycles_observed <= whole_total_cycles
+phase_scalar_busy_observed <= shadow_scalar_busy <= whole_primary_scalar_busy
+```
+
+报告将逐核 `phase_total-phase_scalar` 后的结果命名为“非 Scalar-busy 残余”，不命名为空闲时间或
+I-cache stall。linked vector/cube Kernel 通过 phase pause/resume 从两类 PMU counter 和 SYS 诊断中
+共同排除；result-used return-ready atomic 只从 SYS 诊断扣除，仍进入 PMU total/scalar，因此 v3
+并未伪造“去 atomic 的纯 scalar PMU 时间”。
+
+#### ABI 与热路径边界
+
+设备侧 phase sidecar/GM 容量仍为 64 B/核，没有逐调用增长；host raw 只增加固定 96 核字段。
+v3 复用 sidecar 原空间，布局为：
+
+```text
+elapsed@0 u64
+total@8 u64
+request@16 u64
+miss@24 u64
+phase scalar@32 u32
+shadow scalar@36 u32
+shadow request@40 u32
+shadow miss@44 u32
+phase_id@48 u16
+status@50 u16
+begin@52 u32
+end@56 u32
+excluded_kernel_calls@60 u32
+```
+
+没有为阶段计数加入 DSB 或 phase-level `PIPE_ALL`。none ELF 禁止三个 phase reader 符号；phase ELF
+必须同时包含 total/scalar/I-cache 三个 reader，避免 cache 复用错误变体。host raw schema 升为
+`fdwic-submit-pmu-v3`，显式发布 PMU total、phase scalar、whole shadow scalar 和 SYS 边界诊断语义。
+
+#### 真机校准
+
+B1 正式闭合件：
+
+- none：`outputs/TestPagedAttentionUnroll_CaseB1_20260723_043155/`
+- empty：`outputs/TestPagedAttentionUnroll_CaseB1_20260723_043257/`
+- Claim：`outputs/TestPagedAttentionUnroll_CaseB1_20260723_043400/`
+
+none 的 96 个核均满足 CNT3 shadow scalar 与 CNT2 primary scalar 精确相等。phase 运行中
+read-clear 后，empty 与 Claim 的 CNT3 shadow 均相对 CNT2 primary 固定少 `2 cycles/call`；
+Case1 每核 1,280 次调用时正好少 2,560 cycles，证明误差随边界次数线性出现，raw 和 HTML 已显式
+展示，未把它隐去。
+
+Case1 empty：
+
+| 角色 | PMU total cycles/call | 按角色频率换算 |
+| --- | ---: | ---: |
+| ALL | 1564.846 | 948.481 ns/call |
+| AIC | 1485.029 | 899.984 ns/call |
+| AIV | 1604.755 | 972.737 ns/call |
+
+这说明当前 phase 观察器本身接近 0.95 us/call，并占 empty ELF whole PMU total 的 23.116%。
+它是当前代码布局下的观察器经验量尺，不是可跨 ELF 精确扣除的常数。
+
+#### Case1 v3 全量结果
+
+13 个 profile 的 raw/provenance/HTML 全部重新采集并通过严格 loader。其中 none 没有 phase，
+只提供 whole-window 分母；下表列出其余 12 个独立 phase ELF 的 ALL 聚合 96-core work。
+“whole 占比”只以本行同一 ELF 的 whole PMU total 为分母，所有行禁止求和：
+
+| phase | PMU total us | scalar us | 非 scalar 残余 us | whole total 占比 | scalar / phase total | request 占比 | miss 占比 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| EmptyBracket | 116549.405 | 75065.241 | 41484.163 | 23.116% | 64.406% | 7.621% | 7.362% |
+| EfDrainControl | 157130.274 | 107609.078 | 49521.196 | 31.409% | 68.484% | 16.750% | 16.327% |
+| Claim | 195140.831 | 139943.418 | 55197.413 | 38.921% | 71.714% | 20.593% | 26.235% |
+| ArgBuild | 155328.743 | 103572.005 | 51756.738 | 29.577% | 66.679% | 18.066% | 16.534% |
+| Materialize | 223263.299 | 178164.487 | 45098.812 | 42.825% | 79.800% | 32.059% | 23.466% |
+| PrepareMap | 127362.293 | 87292.749 | 40069.544 | 26.781% | 68.539% | 12.242% | 1.645% |
+| Fanin | 2126.520 | 1642.250 | 484.269 | 0.538% | 77.227% | 0.450% | 0.591% |
+| Register | 150738.181 | 101939.366 | 48798.814 | 29.845% | 67.627% | 13.798% | 12.785% |
+| WinnerBuildControl | 37868.391 | 36978.703 | 889.687 | 7.514% | 97.651% | 6.589% | 1.993% |
+| AllocCompleteControl | 34679.708 | 34324.720 | 354.988 | 6.872% | 98.976% | 0.747% | 0.965% |
+| LoserReplay | 103511.458 | 69363.871 | 34147.587 | 21.941% | 67.011% | 9.778% | 7.325% |
+| SubmitTransition | 190622.524 | 125218.596 | 65403.928 | 35.938% | 65.689% | 21.768% | 30.605% |
+
+产物目录：
+
+```text
+none              outputs/TestPagedAttentionUnroll_Case1_20260723_043811/
+arg-build         outputs/TestPagedAttentionUnroll_Case1_20260723_043857/
+empty-bracket     outputs/TestPagedAttentionUnroll_Case1_20260723_043533/
+materialize       outputs/TestPagedAttentionUnroll_Case1_20260723_043943/
+claim             outputs/TestPagedAttentionUnroll_Case1_20260723_043639/
+register          outputs/TestPagedAttentionUnroll_Case1_20260723_044029/
+submit-transition outputs/TestPagedAttentionUnroll_Case1_20260723_044115/
+efdrain-control   outputs/TestPagedAttentionUnroll_Case1_20260723_044202/
+prepare-map       outputs/TestPagedAttentionUnroll_Case1_20260723_044248/
+fanin             outputs/TestPagedAttentionUnroll_Case1_20260723_044336/
+winner-build      outputs/TestPagedAttentionUnroll_Case1_20260723_044422/
+alloc-complete    outputs/TestPagedAttentionUnroll_Case1_20260723_044508/
+loser-replay      outputs/TestPagedAttentionUnroll_Case1_20260723_044555/
+```
+
+最新汇总件为：
+
+```text
+outputs/fdwic_submit_span_overview_20260723_v3/
+  fdwic_submit_span_overview.json
+  fdwic_submit_span_overview.html
+```
+
+目录名 `_v3` 表示输入采用 Submit-PMU v3 cohort；overview JSON 自身的 schema 为
+`fdwic-submit-span-overview-v3`。
+
+总览中的泳道分区表新增 PMU 与 scalar-busy 两列。两列分别复用对应 phase ELF 已闭合的
+`phase_total_share_of_pmu_total` 和 `phase_scalar_share_of_whole_scalar`，没有复制或伪造新的设备
+计数。它们只与泳道同父区间比例并列展示，分母仍是本 phase ELF 的 whole PMU/whole scalar，
+不是泳道父区间或 `submit-pmu-none`。映射只覆盖同业务边界、相邻 Submit 边界或明确
+`control-only` 的行；SubmitInternalResidual 聚合、SubmitTailResidual 和 KernelUnion 等无等价
+profile 的行保持“—”。
+
+overview 同时增加一项显式标注的跨 ELF 合成诊断：排除 empty-bracket 后，将 11 个业务 phase
+ELF 的 raw observed 指标分别求和，再与 `submit-pmu-none` 的同名完整 Submit raw 指标作比。
+ALL 的 PMU total、Scalar busy、非 Scalar-busy 残余、I-cache request、I-cache miss 比例依次为
+`243.874%`、`179.148%`、`2693.528%`、`199.896%`、`593.755%`；相对 100% 的偏差依次为
+`+143.874%`、`+79.148%`、`+2593.528%`、`+99.896%`、`+493.755%`。它用于形象呈现分段观察
+带来的累计计数膨胀，但不是 formal partition closure，也不是可精确相减的插桩性能开销：11 个
+分段来自独立 ELF/进程，且包含边界覆盖空洞、交叠、运行波动和 control-only 语义。none 的非
+Scalar-busy 残余分母很小，故该项比例尤其容易放大。
+
+该 overview 使用最新已有泳道 raw
+`outputs/TestPagedAttentionUnroll_Case1_20260722_104657/l2_swimlane_records.json`，
+重新闭合 schema-v4 排他树；泳道没有 provenance，因此只声明拓扑和每核 Submit 数对齐，不声明与
+13 个 v3 PMU ELF 身份相同。
+
+#### 验证与构建产物教训
+
+Python 定向回归：
+
+```text
+test_fdwic_submit_pmu_report.py
+test_fdwic_submit_span_overview.py
+test_scene_test_cache.py
+    335 passed
+```
+
+AICPU、Claim phase AICore、none AICore 和 host runtime 都完成真实 CANN/A5 编译；C++ clang-format、
+`ruff check` 和 `git diff --check` 通过。`ruff format --check` 仍报告两处既有且与本轮无关的
+格式差异。首次 B1 none 曾出现 96 核记录全零，最终查明不是硬件 counter
+失效，而是 AICore cache 已为 v3、实际 `build/lib/.../libhost_runtime.so` 仍停留在 v2。通过正式
+`RuntimeBuilder("a5").get_binaries("fully_distributed_within_core", build=True)` 重建并落盘后，
+cache 与实际加载 host SO SHA 一致，所有真机门禁随即闭合。后续 ABI 变更必须核对实际加载件，
+不能只看 build cache 或把 host/device ABI 不一致误判成 PMU 行为。

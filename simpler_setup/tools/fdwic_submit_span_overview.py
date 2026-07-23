@@ -74,7 +74,7 @@ except ImportError:
     )
 
 
-OVERVIEW_SCHEMA = "fdwic-submit-span-overview-v1"
+OVERVIEW_SCHEMA = "fdwic-submit-span-overview-v3"
 DEFAULT_JSON_NAME = "fdwic_submit_span_overview.json"
 DEFAULT_HTML_NAME = "fdwic_submit_span_overview.html"
 OUTPUT_LOCK_NAME = ".fdwic_submit_span_overview.lock"
@@ -114,6 +114,60 @@ PHASE_PRESENTATION = {
     ),
     EMPTY_BRACKET_CAPTURE_MODE: ("EmptyBracket", "—", "observer-calibration"),
 }
+
+# 这里只连接泳道聚合行与语义明确的 PMU phase。ArgBuild 仅对应
+# Claim→Materialize 子段，不能冒充整个 SubmitInternalResidual，因此故意不映射。
+PARTITION_PMU_MODE_BY_METRIC = {
+    "between_submit_residual": SUBMIT_TRANSITION_CAPTURE_MODE,
+    "efdrain": EFDRAIN_CONTROL_CAPTURE_MODE,
+    "efdrain_control": EFDRAIN_CONTROL_CAPTURE_MODE,
+    "materialize": MATERIALIZE_CAPTURE_MODE,
+    "prepare_map": PREPARE_MAP_CAPTURE_MODE,
+    "claim": CLAIM_CAPTURE_MODE,
+    "fanin": FANIN_CAPTURE_MODE,
+    "register": REGISTER_CAPTURE_MODE,
+    "winner_build": WINNER_BUILD_CAPTURE_MODE,
+    "alloc_complete": ALLOC_COMPLETE_CAPTURE_MODE,
+    "loser_replay": LOSER_REPLAY_CAPTURE_MODE,
+}
+
+SYNTHETIC_PHASE_SUM_METRICS = (
+    (
+        "pmu_total_cycles",
+        "PMU total",
+        "phase_total_cycles_observed",
+        "pmu_total_cycles",
+        "cycles",
+    ),
+    (
+        "scalar_busy_cycles",
+        "Scalar busy",
+        "phase_scalar_busy_observed",
+        "scalar_busy_cycles",
+        "cycles",
+    ),
+    (
+        "non_scalar_busy_cycles",
+        "非 Scalar-busy 残余",
+        "phase_non_scalar_busy_cycles",
+        "non_scalar_busy_cycles",
+        "cycles",
+    ),
+    (
+        "icache_requests",
+        "I-cache request",
+        "phase_icache_requests_observed",
+        "primary_icache_requests",
+        "events",
+    ),
+    (
+        "icache_misses",
+        "I-cache miss",
+        "phase_icache_misses_observed",
+        "primary_icache_misses",
+        "events",
+    ),
+)
 
 SUBMIT_PHASES = (
     ("EfDrain", "efdrain"),
@@ -520,6 +574,10 @@ def _group_denominator(summary: Mapping[str, Any]) -> dict[str, Any]:
             "sum": int(summary["scalar_busy"]["sum"]),
             **_metric_range(summary["scalar_busy"]),
         },
+        "non_scalar_busy_cycles": {
+            "sum": int(summary["non_scalar_busy_cycles"]["sum"]),
+            **_metric_range(summary["non_scalar_busy_cycles"]),
+        },
         "primary_icache_requests": {
             "sum": int(summary["icache_requests"]["sum"]),
             **_metric_range(summary["icache_requests"]),
@@ -534,6 +592,22 @@ def _group_denominator(summary: Mapping[str, Any]) -> dict[str, Any]:
 def _phase_group_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "cores": int(summary["cores"]),
+        "phase_total_cycles_observed": {
+            "sum": int(summary["phase_total_cycles_observed"]["sum"]),
+            **_metric_range(summary["phase_total_cycles_observed"]),
+        },
+        "phase_scalar_busy_observed": {
+            "sum": int(summary["phase_scalar_busy_observed"]["sum"]),
+            **_metric_range(summary["phase_scalar_busy_observed"]),
+        },
+        "phase_non_scalar_busy_cycles": {
+            "sum": int(summary["phase_non_scalar_busy_cycles"]["sum"]),
+            **_metric_range(summary["phase_non_scalar_busy_cycles"]),
+        },
+        "shadow_scalar_loss": {
+            "sum": int(summary["shadow_scalar_loss"]["sum"]),
+            **_metric_range(summary["shadow_scalar_loss"]),
+        },
         "phase_elapsed_ticks": {
             "sum": int(summary["phase_elapsed_ticks"]["sum"]),
             **_metric_range(summary["phase_elapsed_ticks"]),
@@ -546,7 +620,9 @@ def _phase_group_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
             "sum": int(summary["phase_icache_misses_observed"]["sum"]),
             **_metric_range(summary["phase_icache_misses_observed"]),
         },
-        "phase_time_share_of_scalar_submit": float(summary["phase_time_share_of_scalar_submit"]),
+        "phase_total_share_of_pmu_total": float(summary["phase_total_share_of_pmu_total"]),
+        "phase_scalar_share_of_whole_scalar": float(summary["phase_scalar_share_of_whole_scalar"]),
+        "phase_scalar_busy_share_of_phase_total": float(summary["phase_scalar_busy_share_of_phase_total"]),
         "phase_request_observed_share_of_primary": float(summary["phase_request_observed_share_of_primary"]),
         "phase_miss_observed_share_of_primary": float(summary["phase_miss_observed_share_of_primary"]),
         "phase_business_calls": int(summary["phase_business_calls"]),
@@ -575,11 +651,13 @@ def _summarize_pmu_capture(
         "aicore_kernel_sha256": str(provenance["artifacts"]["aicore_kernel"]["sha256"]),
         "aicore_kernel_text_sha256": str(provenance["artifacts"]["aicore_kernel"]["text"]["sha256"]),
     }
+    frequency_data = capture.data["configuration"]["pmu_cycles_per_ns"]
     result = {
         "capture_mode": mode,
         "global_submit_span_us": float(capture.data["window"]["global_submit_span_us"]),
         "expected_submits_per_core": int(capture.data["configuration"]["expected_submits_per_core"]),
         "sys_counter_tick_ns": int(capture.data["configuration"]["sys_counter_tick_ns"]),
+        "pmu_cycles_per_ns": {name: float(frequency_data[name]) for name in ("all", "aic", "aiv")},
         "denominators": {name: _group_denominator(capture.summary[name]) for name in ("all", "aic", "aiv")},
         "measurement_scopes": {
             "scalar_submit_elapsed_ticks": (
@@ -590,6 +668,11 @@ def _summarize_pmu_capture(
                 "per-core PMU gate nested inside the first/last Submit SYS counter boundary; linked Kernel causes "
                 "paired gate pauses, while atomic instruction events remain"
             ),
+            "phase_pmu": (
+                "running read-clear PMU total and scalar-busy observations; non-scalar-busy is derived per core "
+                "as phase total minus phase scalar-busy"
+            ),
+            "phase_sys_counter": "boundary diagnostic only; not the primary phase timing source",
             "global_submit_span_us": "cross-core first/last Submit closure only",
         },
         "source": source,
@@ -598,7 +681,7 @@ def _summarize_pmu_capture(
         result.update(
             {
                 "kind": "whole-window",
-                "label": "PMU whole gate 与 Scalar Submit 时间分母",
+                "label": "PMU whole gate 与 SYS 边界诊断",
                 "boundary_reference": "SubmitEnvelope boundary only",
                 "mapping": "whole-window-boundary",
             }
@@ -624,6 +707,49 @@ def _summarize_pmu_capture(
         }
     )
     return result
+
+
+def _synthetic_phase_sum_vs_none(
+    phase_profiles: Sequence[Mapping[str, Any]],
+    whole_window: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Sum independent phase observations only as an explicit instrumentation-inflation diagnostic."""
+
+    groups = {}
+    for group_name in ("all", "aic", "aiv"):
+        group_metrics = {}
+        for metric_name, label, phase_field, whole_field, unit in SYNTHETIC_PHASE_SUM_METRICS:
+            phase_sum = sum(
+                int(profile["phase"]["groups"][group_name][phase_field]["sum"]) for profile in phase_profiles
+            )
+            none_value = int(whole_window["denominators"][group_name][whole_field]["sum"])
+            ratio = phase_sum / none_value if none_value else None
+            group_metrics[metric_name] = {
+                "label": label,
+                "unit": unit,
+                "phase_sum": phase_sum,
+                "submit_none": none_value,
+                "ratio": ratio,
+                "deviation_from_100_percent": ratio - 1.0 if ratio is not None else None,
+                "phase_field": phase_field,
+                "submit_none_field": whole_field,
+            }
+        groups[group_name] = group_metrics
+
+    return {
+        "kind": "cross-elf-synthetic-diagnostic",
+        "phase_profile_count": len(phase_profiles),
+        "included_profiles": [str(profile["capture_mode"]) for profile in phase_profiles],
+        "excluded_profiles": [NONE_CAPTURE_MODE, EMPTY_BRACKET_CAPTURE_MODE],
+        "empty_bracket_excluded": True,
+        "formal_partition_closure": False,
+        "exact_observation_overhead": False,
+        "semantics": (
+            "sum each business phase profile's observed metric, then divide by submit-pmu-none; "
+            "independent ELFs, observer cost, code layout, coverage gaps/overlap and run variance remain mixed"
+        ),
+        "groups": groups,
+    }
 
 
 def _coverage_matrix(swimlane: Mapping[str, Any]) -> list[dict[str, str]]:
@@ -880,18 +1006,26 @@ def build_overview(swimlane_raw: Path | str, pmu_dirs: Sequence[Path | str]) -> 
     git_heads = sorted({str(source["git_head"]) for source in sources})
     aicore_hashes = sorted({str(source["aicore_kernel_sha256"]) for source in sources})
     phase_profiles = [item for item in ordered if item["kind"] == "phase"]
+    synthetic_phase_sum = _synthetic_phase_sum_vs_none(
+        phase_profiles,
+        captures[NONE_CAPTURE_MODE],
+    )
     payload = {
         "schema": OVERVIEW_SCHEMA,
         "semantics": {
             "evidence_chains_are_independent": True,
             "cross_elf_absolute_subtraction_allowed": False,
             "cross_elf_phase_shares_additive": False,
+            "cross_elf_synthetic_phase_sum_is_exact_overhead": False,
             "swimlane_percentages": "same swimlane ELF aggregate core-work partitions",
-            "pmu_percentages": "each row divided only by that PMU ELF's own Scalar/primary denominator",
+            "pmu_percentages": (
+                "phase total/scalar/non-scalar-busy and I-cache ratios use only that PMU ELF's own "
+                "whole-window or phase-total denominator"
+            ),
             "swimlane_sys_counter": "capture frequency is a SYS counter conversion, not the 1.65 GHz PMU cycle rate",
-            "pmu_scalar_time": (
+            "sys_boundary_diagnostic": (
                 "linked vector/cube Kernel and result-used return-ready atomic waiting are excluded; "
-                "source-issue atomic is retained"
+                "this SYS counter value is not the primary phase timing source"
             ),
             "pmu_counter": (
                 "PMU whole gate excludes linked vector/cube Kernel; atomic instruction and observation events "
@@ -903,8 +1037,13 @@ def build_overview(swimlane_raw: Path | str, pmu_dirs: Sequence[Path | str]) -> 
                 "subtracts result-used return-ready atomic waiting"
             ),
             "phase_observed": (
-                "running read-clear observations include nearby observer/bookkeeping code and are not a "
-                "zero-instrumentation bound"
+                "phase PMU total/scalar use running read-clear observations; non-scalar-busy is derived per core "
+                "as total minus scalar; SYS ticks diagnose boundary closure only"
+            ),
+            "synthetic_phase_sum_vs_none": (
+                "an explicitly non-closing diagnostic that sums 11 independent business phase observations and "
+                "divides by submit-pmu-none; deviation from 100% is an instrumentation-inflation fingerprint, "
+                "not exact performance overhead"
             ),
         },
         "validation": {
@@ -929,6 +1068,7 @@ def build_overview(swimlane_raw: Path | str, pmu_dirs: Sequence[Path | str]) -> 
             "whole_window": captures[NONE_CAPTURE_MODE],
             "phase_profiles": phase_profiles,
             "calibration": captures[EMPTY_BRACKET_CAPTURE_MODE],
+            "synthetic_phase_sum_vs_none": synthetic_phase_sum,
         },
         "coverage_matrix": _coverage_matrix(swimlane),
     }
@@ -952,7 +1092,69 @@ def _range_text(data: Mapping[str, Any], *, unit: str = "") -> str:
     return f"{_fmt_int(data['min'])}–{_fmt_int(data['max'])}{suffix}"
 
 
-def _partition_html(partition: Mapping[str, Any], *, show_ranges: bool = True) -> str:
+def _cycles_to_us(cycles: int | float, cycles_per_ns: float) -> float:
+    return float(cycles) / cycles_per_ns / 1_000
+
+
+def _cycle_range_text(data: Mapping[str, Any], cycles_per_ns: float) -> str:
+    return (
+        f"{_range_text(data, unit='cycles')}"
+        f"（{_cycles_to_us(data['min'], cycles_per_ns):.3f}–"
+        f"{_cycles_to_us(data['max'], cycles_per_ns):.3f} µs）"
+    )
+
+
+def _same_elf_ratio(numerator: int, denominator: int, share: float) -> str:
+    if not denominator:
+        return "N/A（本 ELF 分母为 0）"
+    return f"{_fmt_int(numerator)} / {_fmt_int(denominator)} = {_fmt_pct(share)}"
+
+
+def _partition_pmu_ratio_cells(
+    row: Mapping[str, Any],
+    phase_by_metric: Mapping[str, Mapping[str, Any]],
+) -> tuple[str, str, str]:
+    metric = str(row["metric"])
+    phase = phase_by_metric.get(metric)
+    if phase is None:
+        return "", '<td class="evidence-ratio evidence-na">—</td>', '<td class="evidence-ratio evidence-na">—</td>'
+
+    capture_mode = str(phase["capture_mode"])
+    mapping = str(phase["mapping"])
+    all_group = phase["phase"]["groups"]["all"]
+    denominators = phase["denominators"]["all"]
+    total_metric = all_group["phase_total_cycles_observed"]
+    scalar_metric = all_group["phase_scalar_busy_observed"]
+    total_share = float(all_group["phase_total_share_of_pmu_total"])
+    scalar_share = float(all_group["phase_scalar_share_of_whole_scalar"])
+    total_ratio = _same_elf_ratio(
+        int(total_metric["sum"]),
+        int(denominators["pmu_total_cycles"]["sum"]),
+        total_share,
+    )
+    scalar_ratio = _same_elf_ratio(
+        int(scalar_metric["sum"]),
+        int(denominators["scalar_busy_cycles"]["sum"]),
+        scalar_share,
+    )
+    row_attributes = f' data-pmu-profile="{html.escape(capture_mode)}" data-pmu-mapping="{html.escape(mapping)}"'
+    total_cell = (
+        f'<td class="evidence-ratio" title="{html.escape(capture_mode)}：{html.escape(total_ratio)}">'
+        f"<strong>{_fmt_pct(total_share)}</strong><small>{html.escape(mapping)}</small></td>"
+    )
+    scalar_cell = (
+        f'<td class="evidence-ratio" title="{html.escape(capture_mode)}：{html.escape(scalar_ratio)}">'
+        f"<strong>{_fmt_pct(scalar_share)}</strong><small>{html.escape(mapping)}</small></td>"
+    )
+    return row_attributes, total_cell, scalar_cell
+
+
+def _partition_html(
+    partition: Mapping[str, Any],
+    phase_by_metric: Mapping[str, Mapping[str, Any]],
+    *,
+    show_ranges: bool = True,
+) -> str:
     colors = ("#2563eb", "#0d9488", "#7c3aed", "#d97706", "#dc2626", "#0891b2", "#65a30d")
     bars = []
     rows = []
@@ -968,10 +1170,12 @@ def _partition_html(partition: Mapping[str, Any], *, show_ranges: bool = True) -
             aiv = f"{row['aiv_per_core']['min_us']:.3f}–{row['aiv_per_core']['max_us']:.3f} µs"
         else:
             aic = aiv = "—"
+        row_attributes, pmu_total_cell, scalar_busy_cell = _partition_pmu_ratio_cells(row, phase_by_metric)
         rows.append(
-            "<tr>"
+            f'<tr data-swimlane-metric="{html.escape(str(row["metric"]))}"{row_attributes}>'
             f'<td><i style="background:{color}"></i><code>{html.escape(row["label"])}</code></td>'
             f"<td>{_fmt_us(row['core_time_us'])}</td><td>{_fmt_pct(share)}</td>"
+            f"{pmu_total_cell}{scalar_busy_cell}"
             f"<td>{aic}</td><td>{aiv}</td>"
             "</tr>"
         )
@@ -980,11 +1184,92 @@ def _partition_html(partition: Mapping[str, Any], *, show_ranges: bool = True) -
         <h3>{html.escape(str(partition["name"]))}</h3>
         <div class="stack">{"".join(bars)}</div>
         <div class="table-wrap"><table>
-          <thead><tr><th>区域</th><th>Σ core-time</th><th>同父区间占比</th>
-            <th>AIC 每核 min–max</th><th>AIV 每核 min–max</th></tr></thead>
+          <thead>
+            <tr><th rowspan="2">区域</th><th rowspan="2">Σ core-time</th>
+              <th colspan="3">占比对照</th>
+              <th rowspan="2">AIC 每核 min–max</th><th rowspan="2">AIV 每核 min–max</th></tr>
+            <tr><th>泳道同父区间</th>
+              <th>PMU 占比<br><small>Phase PMU / 同 ELF whole PMU</small></th>
+              <th>Scalar-busy 占比<br><small>Phase scalar / 同 ELF whole scalar</small></th></tr>
+          </thead>
           <tbody>{"".join(rows)}</tbody>
         </table></div>
       </div>
+    """
+
+
+def _synthetic_ratio_text(metric: Mapping[str, Any]) -> str:
+    ratio = metric["ratio"]
+    if ratio is None:
+        return "N/A"
+    return _fmt_pct(float(ratio))
+
+
+def _synthetic_deviation_text(metric: Mapping[str, Any]) -> str:
+    deviation = metric["deviation_from_100_percent"]
+    if deviation is None:
+        return "N/A"
+    return f"{float(deviation):+.3%}"
+
+
+def _synthetic_phase_sum_html(diagnostic: Mapping[str, Any]) -> str:
+    all_metrics = diagnostic["groups"]["all"]
+    aic_metrics = diagnostic["groups"]["aic"]
+    aiv_metrics = diagnostic["groups"]["aiv"]
+    colors = ("#2563eb", "#0d9488", "#7c3aed", "#d97706", "#dc2626")
+    chart_limit = 6.0
+    baseline_position = 1.0 / chart_limit * 100
+    chart_rows = []
+    table_rows = []
+    for index, (metric_name, label, _phase_field, _whole_field, unit) in enumerate(SYNTHETIC_PHASE_SUM_METRICS):
+        metric = all_metrics[metric_name]
+        ratio = metric["ratio"]
+        width = 0.0 if ratio is None else min(float(ratio), chart_limit) / chart_limit * 100
+        overflow = ratio is not None and float(ratio) > chart_limit
+        overflow_text = "<small>图形封顶 600%</small>" if overflow else ""
+        title = (
+            f"{label}：{_fmt_int(metric['phase_sum'])} / {_fmt_int(metric['submit_none'])} = "
+            f"{_synthetic_ratio_text(metric)}"
+        )
+        chart_rows.append(
+            '<div class="synthetic-row">'
+            f"<span>{html.escape(label)}</span>"
+            f'<div class="synthetic-track" title="{html.escape(title)}">'
+            f'<b style="width:{width:.6f}%;background:{colors[index]}"></b>'
+            f'<i style="left:{baseline_position:.6f}%"></i></div>'
+            f"<strong>{_synthetic_ratio_text(metric)}</strong>"
+            f"<small>偏离 100%：{_synthetic_deviation_text(metric)}</small>{overflow_text}"
+            "</div>"
+        )
+        table_rows.append(
+            "<tr>"
+            f"<th>{html.escape(label)}</th>"
+            f"<td>{_fmt_int(metric['phase_sum'])} {unit}</td>"
+            f"<td>{_fmt_int(metric['submit_none'])} {unit}</td>"
+            f"<td>{_synthetic_ratio_text(metric)}</td>"
+            f"<td>{_synthetic_deviation_text(metric)}</td>"
+            f"<td>{_synthetic_ratio_text(aic_metrics[metric_name])}</td>"
+            f"<td>{_synthetic_ratio_text(aiv_metrics[metric_name])}</td>"
+            "</tr>"
+        )
+    profile_count = int(diagnostic["phase_profile_count"])
+    return f"""
+  <section class="context synthetic-diagnostic">
+    <h2>{profile_count} 个业务分段合计 vs <code>{NONE_CAPTURE_MODE}</code></h2>
+    <p class="notice"><strong>这是跨 ELF 合成诊断比，不是一次运行的正式分区闭合，也不是净性能开销。</strong>
+      分子把 {profile_count} 个业务 phase 各自独立 ELF 的 observed 指标求和，分母取
+      <code>{NONE_CAPTURE_MODE}</code> 的 whole 指标；empty-bracket 不参与。大于 100% 可以直观看到
+      分段插桩形成的观测膨胀，但“偏离 100%”还混有每段观察器成本、独立 ELF 布局、覆盖缺口或重叠、
+      多轮波动及 control-only 口径，不能直接解释为可消除的墙钟损失。</p>
+    <p class="fine">下图统一使用 0–600% 横轴，竖线为 100%；超过 600% 的项目只在图形上封顶，
+      表格始终保留精确比值。I-cache 分子使用 phase observed，分母使用 none primary。</p>
+    <div class="synthetic-chart">{"".join(chart_rows)}</div>
+    <div class="table-wrap"><table class="synthetic-table">
+      <thead><tr><th>指标</th><th>Σ {profile_count} phases</th><th>submit-none</th>
+        <th>ALL 合成比</th><th>相对 100% 偏离</th><th>AIC 合成比</th><th>AIV 合成比</th></tr></thead>
+      <tbody>{"".join(table_rows)}</tbody>
+    </table></div>
+  </section>
     """
 
 
@@ -996,17 +1281,38 @@ def _phase_metric_html(
     aic: Mapping[str, Any],
     aiv: Mapping[str, Any],
 ) -> str:
-    ratio = (
-        f"{_fmt_int(metric['sum'])} / {_fmt_int(denominator)} = {_fmt_pct(share)}"
-        if denominator
-        else "N/A（本 ELF 分母为 0）"
-    )
+    ratio = _same_elf_ratio(int(metric["sum"]), denominator, share)
     return f"""
       <div class="metric">
         <span>{html.escape(label)}</span>
         <strong>{_fmt_int(metric["sum"])}</strong>
         <small>本 ELF：{ratio}</small>
         <small>AIC 每核 {_range_text(aic)}；AIV 每核 {_range_text(aiv)}</small>
+      </div>
+    """
+
+
+def _phase_cycle_metric_html(
+    label: str,
+    metric: Mapping[str, Any],
+    aic: Mapping[str, Any],
+    aiv: Mapping[str, Any],
+    frequencies: Mapping[str, float],
+    relationships: Sequence[str],
+    *,
+    note: str = "",
+) -> str:
+    relationship_html = "".join(f"<small>{html.escape(value)}</small>" for value in relationships)
+    note_html = f"<small>{html.escape(note)}</small>" if note else ""
+    return f"""
+      <div class="metric">
+        <span>{html.escape(label)}</span>
+        <strong>Σ {_fmt_int(metric["sum"])} cycles · ≈
+          {_cycles_to_us(metric["sum"], frequencies["all"]):.3f} µs</strong>
+        {relationship_html}
+        <small>AIC 每核 {_cycle_range_text(aic, frequencies["aic"])}</small>
+        <small>AIV 每核 {_cycle_range_text(aiv, frequencies["aiv"])}</small>
+        {note_html}
       </div>
     """
 
@@ -1025,9 +1331,15 @@ def _phase_card_html(item: Mapping[str, Any]) -> str:
         f"AIC {_range_text(aic['phase_calls_per_core'])}（零调用核 {aic['phase_zero_call_cores']}）；"
         f"AIV {_range_text(aiv['phase_calls_per_core'])}（零调用核 {aiv['phase_zero_call_cores']}）"
     )
-    time_metric = all_group["phase_elapsed_ticks"]
-    time_aic = aic["phase_elapsed_ticks"]
-    time_aiv = aiv["phase_elapsed_ticks"]
+    total_metric = all_group["phase_total_cycles_observed"]
+    total_aic = aic["phase_total_cycles_observed"]
+    total_aiv = aiv["phase_total_cycles_observed"]
+    scalar_metric = all_group["phase_scalar_busy_observed"]
+    scalar_aic = aic["phase_scalar_busy_observed"]
+    scalar_aiv = aiv["phase_scalar_busy_observed"]
+    residual_metric = all_group["phase_non_scalar_busy_cycles"]
+    residual_aic = aic["phase_non_scalar_busy_cycles"]
+    residual_aiv = aiv["phase_non_scalar_busy_cycles"]
     request_metric = all_group["phase_icache_requests_observed"]
     request_aic = aic["phase_icache_requests_observed"]
     request_aiv = aiv["phase_icache_requests_observed"]
@@ -1035,19 +1347,60 @@ def _phase_card_html(item: Mapping[str, Any]) -> str:
     miss_aic = aic["phase_icache_misses_observed"]
     miss_aiv = aiv["phase_icache_misses_observed"]
     denominators = item["denominators"]["all"]
+    frequencies = item["pmu_cycles_per_ns"]
     kernel_calls = all_group["phase_excluded_kernel_calls"]
-    elapsed_label = (
-        "Observer pair empirical elapsed (1 tick = 1 ns)"
-        if item["kind"] == "calibration"
-        else "Scalar phase core-time (1 tick = 1 ns)"
+    total_html = _phase_cycle_metric_html(
+        "Phase PMU total",
+        total_metric,
+        total_aic,
+        total_aiv,
+        frequencies,
+        (
+            "Phase total / 同 ELF whole total："
+            + _same_elf_ratio(
+                int(total_metric["sum"]),
+                int(denominators["pmu_total_cycles"]["sum"]),
+                all_group["phase_total_share_of_pmu_total"],
+            ),
+        ),
     )
-    time_html = _phase_metric_html(
-        elapsed_label,
-        time_metric,
-        denominators["scalar_submit_elapsed_ticks"]["sum"],
-        all_group["phase_time_share_of_scalar_submit"],
-        time_aic,
-        time_aiv,
+    scalar_html = _phase_cycle_metric_html(
+        "Phase scalar busy",
+        scalar_metric,
+        scalar_aic,
+        scalar_aiv,
+        frequencies,
+        (
+            "Scalar / Phase total："
+            + _same_elf_ratio(
+                int(scalar_metric["sum"]),
+                int(total_metric["sum"]),
+                all_group["phase_scalar_busy_share_of_phase_total"],
+            ),
+            "Phase scalar / 同 ELF whole scalar："
+            + _same_elf_ratio(
+                int(scalar_metric["sum"]),
+                int(denominators["scalar_busy_cycles"]["sum"]),
+                all_group["phase_scalar_share_of_whole_scalar"],
+            ),
+        ),
+    )
+    residual_share = float(residual_metric["sum"]) / float(total_metric["sum"]) if total_metric["sum"] else 0.0
+    residual_html = _phase_cycle_metric_html(
+        "非 Scalar-busy 残余",
+        residual_metric,
+        residual_aic,
+        residual_aiv,
+        frequencies,
+        (
+            "逐核先算 total−scalar；残余 / Phase total："
+            + _same_elf_ratio(
+                int(residual_metric["sum"]),
+                int(total_metric["sum"]),
+                residual_share,
+            ),
+        ),
+        note="它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。",
     )
     request_html = _phase_metric_html(
         "I-cache request observed",
@@ -1075,11 +1428,24 @@ def _phase_card_html(item: Mapping[str, Any]) -> str:
       <p class="boundary">{html.escape(str(item["phase"]["boundary"]))} · calls ALL/AIC/AIV {calls}<br>
         calls/core {calls_per_core}</p>
       <div class="metrics">
-        {time_html}
+        {total_html}
+        {scalar_html}
+        {residual_html}
         {request_html}
         {miss_html}
       </div>
+      <p class="diagnostic"><strong>SYS 边界诊断：</strong>
+        Σ {_fmt_int(all_group["phase_elapsed_ticks"]["sum"])} raw ticks；
+        AIC 每核 {_range_text(aic["phase_elapsed_ticks"], unit="ticks")}；
+        AIV 每核 {_range_text(aiv["phase_elapsed_ticks"], unit="ticks")}。
+        只核验 phase 边界闭合，不作为阶段主时间或占比分母。</p>
+      <p class="diagnostic"><strong>Scalar shadow 诊断：</strong>
+        whole CNT2 scalar − CNT3 shadow scalar Σ {_fmt_int(all_group["shadow_scalar_loss"]["sum"])} cycles；
+        AIC 每核 {_range_text(aic["shadow_scalar_loss"], unit="cycles")}；
+        AIV 每核 {_range_text(aiv["shadow_scalar_loss"], unit="cycles")}。</p>
       <p class="fine">分母只来自本 ELF；excluded linked Kernel calls={_fmt_int(kernel_calls)}；
+        PMU 等效时间分别按 ALL/AIC/AIV
+        {frequencies["all"]:.6f}/{frequencies["aic"]:.6f}/{frequencies["aiv"]:.6f} cycles/ns 换算；
         global Submit closure={item["global_submit_span_us"]:.3f} µs（不作 phase 分母）。</p>
       <p class="source">git <code>{html.escape(source["git_head"][:12])}</code> · AICore ELF
         <code>{html.escape(source["aicore_kernel_sha256"][:12])}</code> ·
@@ -1094,29 +1460,72 @@ def _whole_window_html(item: Mapping[str, Any]) -> str:
     aic = groups["aic"]
     aiv = groups["aiv"]
 
-    def card(label: str, key: str, unit: str = "") -> str:
+    frequencies = item["pmu_cycles_per_ns"]
+
+    def card(label: str, key: str, unit: str = "", *, cycles: bool = False, note: str = "") -> str:
+        if cycles:
+            all_value = (
+                f"Σ {_fmt_int(all_group[key]['sum'])} cycles · ≈ "
+                f"{_cycles_to_us(all_group[key]['sum'], frequencies['all']):.3f} µs"
+            )
+            aic_value = _cycle_range_text(aic[key], frequencies["aic"])
+            aiv_value = _cycle_range_text(aiv[key], frequencies["aiv"])
+        else:
+            all_value = _fmt_int(all_group[key]["sum"])
+            aic_value = _range_text(aic[key], unit=unit)
+            aiv_value = _range_text(aiv[key], unit=unit)
+        note_html = f"<small>{html.escape(note)}</small>" if note else ""
         return f"""
         <div class="metric">
-          <span>{html.escape(label)}</span><strong>{_fmt_int(all_group[key]["sum"])}</strong>
-          <small>AIC 每核 {_range_text(aic[key], unit=unit)}</small>
-          <small>AIV 每核 {_range_text(aiv[key], unit=unit)}</small>
+          <span>{html.escape(label)}</span><strong>{all_value}</strong>
+          <small>AIC 每核 {aic_value}</small>
+          <small>AIV 每核 {aiv_value}</small>
+          {note_html}
         </div>"""
 
     source = item["source"]
+    total_sum = int(all_group["pmu_total_cycles"]["sum"])
+    scalar_sum = int(all_group["scalar_busy_cycles"]["sum"])
+    residual_sum = int(all_group["non_scalar_busy_cycles"]["sum"])
+    sys_diagnostic_card = card(
+        "SYS 边界闭合诊断（raw ticks）",
+        "scalar_submit_elapsed_ticks",
+        "ticks",
+        note="只核验首末 Submit 与门控边界；不参与 PMU 1.65 GHz 时间换算或阶段比例。",
+    )
+    total_card = card("PMU total cycles", "pmu_total_cycles", cycles=True)
+    scalar_card = card(
+        "Scalar busy cycles",
+        "scalar_busy_cycles",
+        cycles=True,
+        note="Scalar / PMU total："
+        + _same_elf_ratio(scalar_sum, total_sum, scalar_sum / total_sum if total_sum else 0.0),
+    )
+    residual_card = card(
+        "非 Scalar-busy 残余",
+        "non_scalar_busy_cycles",
+        cycles=True,
+        note="逐核先算 total−scalar；残余 / PMU total："
+        + _same_elf_ratio(residual_sum, total_sum, residual_sum / total_sum if total_sum else 0.0)
+        + "。不是空闲时间。",
+    )
     return f"""
     <div class="whole-card">
-      <h3><code>{NONE_CAPTURE_MODE}</code>：PMU whole gate 与 Scalar Submit 时间分母</h3>
+      <h3><code>{NONE_CAPTURE_MODE}</code>：PMU whole gate 与 SYS 边界诊断</h3>
       <p>global 首末 Submit 仅作闭合：<strong>{item["global_submit_span_us"]:.3f} µs</strong>；
         下列数值是 96 核各自累计，不是墙钟。每核先读首个 Submit start tick，再启动 PMU；末次 Submit
         先停止 PMU，再读 end tick，所以 PMU gate 嵌在首末 SYS closure 内。Scalar elapsed 累计 gate-running
         SYS 段，再扣 linked Kernel 与 return-ready atomic 等待；PMU cycle 与 SYS tick 口径不同，不能直接相减。</p>
       <div class="metrics">
-        {card("Scalar Submit elapsed (1 tick = 1 ns)", "scalar_submit_elapsed_ticks", "ticks")}
-        {card("PMU total cycles", "pmu_total_cycles", "cycles")}
-        {card("Scalar busy cycles", "scalar_busy_cycles", "cycles")}
+        {sys_diagnostic_card}
+        {total_card}
+        {scalar_card}
+        {residual_card}
         {card("Primary I-cache request", "primary_icache_requests")}
         {card("Primary I-cache miss", "primary_icache_misses")}
       </div>
+      <p class="fine">PMU 等效时间分别按 ALL/AIC/AIV
+        {frequencies["all"]:.6f}/{frequencies["aic"]:.6f}/{frequencies["aiv"]:.6f} cycles/ns 换算。</p>
       <p class="source">git <code>{html.escape(source["git_head"][:12])}</code> · AICore ELF
         <code>{html.escape(source["aicore_kernel_sha256"][:12])}</code> ·
         <a href="{html.escape(source["html_report_path"])}">单份报告</a></p>
@@ -1130,6 +1539,12 @@ def render_overview(payload: Mapping[str, Any]) -> str:
     swimlane = payload["swimlane_elf"]
     pmu = payload["submit_pmu_elfs"]
     validation = payload["validation"]
+    phase_by_mode = {str(item["capture_mode"]): item for item in pmu["phase_profiles"]}
+    phase_by_metric = {}
+    for metric, mode in PARTITION_PMU_MODE_BY_METRIC.items():
+        if mode not in phase_by_mode:
+            _fail(f"partition PMU mapping requires missing capture mode {mode!r}")
+        phase_by_metric[metric] = phase_by_mode[mode]
     phase_cards = "".join(_phase_card_html(item) for item in pmu["phase_profiles"])
     calibration = _phase_card_html(pmu["calibration"])
     coverage_rows = "".join(
@@ -1166,7 +1581,7 @@ def render_overview(payload: Mapping[str, Any]) -> str:
         for name, value in sorted(swimlane["kernel_containment"].items())
     )
     head_list = "、".join(html.escape(head[:12]) for head in validation["git_heads"])
-    return f"""<!doctype html>
+    document = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
@@ -1201,6 +1616,29 @@ def render_overview(payload: Mapping[str, Any]) -> str:
     th,td {{ padding:9px 11px; border-bottom:1px solid var(--line); text-align:left; white-space:nowrap; }}
     th {{ background:#f8fafc; }} tr:last-child td {{ border-bottom:0; }}
     td i {{ display:inline-block; width:9px; height:9px; margin-right:7px; border-radius:2px; }}
+    .partition table {{ min-width:1120px; }}
+    .evidence-ratio {{ white-space:normal; min-width:145px; }}
+    .evidence-ratio strong,.evidence-ratio small {{ display:block; }}
+    .evidence-ratio small {{ color:var(--muted); }}
+    .evidence-na {{ color:var(--muted); text-align:center; }}
+    .synthetic-chart {{ display:grid; gap:10px; margin:16px 0; }}
+    .synthetic-row {{
+      display:grid; grid-template-columns:150px minmax(220px,1fr) 92px 138px;
+      gap:10px; align-items:center;
+    }}
+    .synthetic-row > span {{ font-weight:650; }}
+    .synthetic-row > strong {{ text-align:right; font-size:17px; }}
+    .synthetic-row > small {{ color:var(--muted); }}
+    .synthetic-track {{
+      position:relative; height:20px; overflow:hidden; border-radius:5px;
+      background:#e5e7eb;
+    }}
+    .synthetic-track b {{ display:block; height:100%; min-width:1px; }}
+    .synthetic-track i {{
+      position:absolute; top:0; bottom:0; width:2px; background:#111827;
+      box-shadow:0 0 0 1px #ffffffcc;
+    }}
+    .synthetic-table {{ min-width:980px; }}
     .phase-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,560px),1fr)); gap:14px; }}
     .phase-card {{ margin:0; }}
     .phase-card header {{ display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }}
@@ -1210,10 +1648,13 @@ def render_overview(payload: Mapping[str, Any]) -> str:
     .metric {{ padding:11px 12px; background:#f8fafc; border:1px solid #e5e7eb; border-radius:8px; min-width:0; }}
     .metric span,.metric small {{ display:block; color:var(--muted); }}
     .metric strong {{ display:block; font-size:19px; margin:2px 0; overflow-wrap:anywhere; }}
+    .diagnostic {{ padding:8px 10px; border-left:3px solid #94a3b8; background:#f8fafc; color:var(--muted); }}
     .source a {{ color:#1d4ed8; }}
     @media (max-width:650px) {{
       main {{ padding:18px 10px 40px; }} h1 {{ font-size:24px; }}
       .phase-card header {{ display:block; }} .tag {{ display:inline-block; margin-top:8px; }}
+      .synthetic-row {{ grid-template-columns:120px minmax(140px,1fr) 76px; }}
+      .synthetic-row > small {{ grid-column:2 / 4; }}
     }}
   </style>
 </head>
@@ -1224,20 +1665,21 @@ def render_overview(payload: Mapping[str, Any]) -> str:
     PASS 只表示两条证据链各自通过门禁，不表示它们已绑定到同一 ELF。</p>
   <div class="notice"><strong>这里有两条互不混算的证据链。</strong>
     泳道图的百分比只在同一个泳道 ELF 的排他时间树中相加；每个 Submit-PMU profile 都是独立 ELF，
-    phase 时间、request 和 miss 只能除以本 ELF 自己的 Scalar/primary 分母。不同 ELF 的绝对时间不能相减，
-    各 PMU 行的占比也不能相加成 100%。</div>
+    phase PMU total、Scalar busy、非 Scalar-busy 残余、request 和 miss 只能使用本 ELF 自己的分母。
+    不同 ELF 的绝对值不能相减，各 PMU 行的占比也不能相加成 100%。页面另设的“分段合计 vs none”
+    只是一项显式跨 ELF 合成诊断，用来观察插桩膨胀，不改变上述正式口径。</div>
 
   <section class="context">
     <h2>口径与来源</h2>
     <p>泳道 SYS counter 频率：<strong>{swimlane["sys_counter_frequency_hz"]:,} Hz</strong>；它用于时间戳换算，
       不是约 1.65 GHz 的 PMU cycle 频率。泳道全局 Submit 墙钟范围：
       <strong>{swimlane["global_submit_makespan"]["duration_us"]:.3f} µs</strong>。</p>
-    <p>PMU Scalar 时间已排除 linked Vector/Cube Kernel 和 result-used return-ready atomic 的等待区间；
-      source-issue atomic 保留。PMU total、Scalar busy 与 primary I-cache 来自嵌在首末 Submit SYS closure
-      内且遇 linked Kernel 会暂停的 PMU gate；Scalar phase 时间占比使用 gate-running SYS 段累计后再扣
-      return-ready 等待的独立时间分母。PMU/I-cache counter
-      仍含 atomic 指令及观察代码事件，
-      局部 observed 不是零插桩函数体的数学上下界。</p>
+    <p>SYS 边界诊断排除了 linked Vector/Cube Kernel 和 result-used return-ready atomic 的等待区间；
+      PMU total、Scalar busy 与 primary I-cache 来自嵌在首末 Submit SYS closure 内且遇 linked Kernel
+      会暂停的 PMU gate，但 PMU counter 仍保留 atomic 指令及等待事件。阶段主时间使用 running read-clear PMU total；
+      Scalar busy 独立观测，非 Scalar-busy 残余逐核按 total−scalar 得到。SYS phase tick 只核验边界闭合。
+      PMU/I-cache counter 仍含 atomic 指令及观察代码事件，局部 observed
+      不是零插桩函数体的数学上下界。</p>
     <p>本批 PMU 来自 {len(validation["git_heads"])} 组 revision：<code>{head_list}</code>；
       mixed revisions 被如实保留，进一步禁止跨 ELF 数值运算。泳道 raw 没有 build provenance，
       页面只证明 raw SHA 与 schema-v4 重算闭合，
@@ -1248,14 +1690,18 @@ def render_overview(payload: Mapping[str, Any]) -> str:
   <p class="notice">泳道分区展示原始业务 elapsed，不等同于纯 Scalar 时间。Kernel 是父 span 内的嵌套事件；
     当前 analyzer 能精确拆开 EfDrain 与 FinalDrain；其他 containment（本轮包括 WinnerBuild）只有事件数、
     没有独立 Kernel union 时长。因此纯 Scalar 归因只看下方相应 PMU control ELF，不从泳道父 span 猜减。</p>
-  {_partition_html(swimlane["submit_envelope_partition"])}
-  {_partition_html(swimlane["submit_union_partition"])}
-  {_partition_html(swimlane["efdrain_partition"])}
+  <p class="fine">分区表新增的 PMU 与 scalar-busy 两列来自对应 phase 自己的独立 ELF：
+    分母分别是该 ELF 的 whole PMU total 与 whole scalar busy，并非泳道父区间，也不是
+    <code>submit-pmu-none</code>。各行不得相加；<code>control-only</code> 只代表排除 linked Kernel
+    后的控制路径；没有等价 phase 的行显示“—”。</p>
+  {_partition_html(swimlane["submit_envelope_partition"], phase_by_metric)}
+  {_partition_html(swimlane["submit_union_partition"], phase_by_metric)}
+  {_partition_html(swimlane["efdrain_partition"], phase_by_metric)}
 
   <details class="context"><summary><strong>外围 Worker / Orchestration / FinalDrain 闭合</strong></summary>
-    {_partition_html(swimlane["worker_completion_partition"])}
-    {_partition_html(swimlane["orchestration_partition"])}
-    {_partition_html(swimlane["final_drain_partition"])}
+    {_partition_html(swimlane["worker_completion_partition"], phase_by_metric)}
+    {_partition_html(swimlane["orchestration_partition"], phase_by_metric)}
+    {_partition_html(swimlane["final_drain_partition"], phase_by_metric)}
   </details>
 
   <h2>泳道 residual 的业务边界</h2>
@@ -1272,12 +1718,16 @@ def render_overview(payload: Mapping[str, Any]) -> str:
       <tbody>{overlay_rows}</tbody></table></div>
   </div>
 
-  <h2>Submit-PMU ELF：whole gate 与 Scalar 时间分母</h2>
+  <h2>Submit-PMU ELF：whole gate 与 SYS 边界诊断</h2>
   {_whole_window_html(pmu["whole_window"])}
 
+  {_synthetic_phase_sum_html(pmu["synthetic_phase_sum_vs_none"])}
+
   <h2>Submit-PMU ELF：各阶段独立归因</h2>
-  <p>每张卡的三个百分比都只使用该卡所属 ELF 的 Scalar Submit、primary request、primary miss 分母；
-    页面没有也不会生成跨卡合计。</p>
+  <p>每张卡的 PMU total、Scalar busy、非 Scalar-busy 残余及 I-cache 百分比都只使用该卡所属 ELF
+    内的对应分母。各阶段 Scalar busy 来自不同 ELF，不能求和后与
+    <code>submit-pmu-none</code> 的 whole Scalar busy 做正式判等；上方合成诊断特意执行该运算，
+    仅用于呈现观察膨胀指纹。</p>
   <div class="phase-grid">{phase_cards}</div>
 
   <h2>观察器校准（不是业务阶段）</h2>
@@ -1291,6 +1741,7 @@ def render_overview(payload: Mapping[str, Any]) -> str:
     phase extrema 是每核累计完整 phase 的极值，不是单次调用极值。</p>
 </main></body></html>
 """
+    return "\n".join(line.rstrip() for line in document.splitlines()) + "\n"
 
 
 def _stage_text(path: Path, document: str) -> Path:

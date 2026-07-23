@@ -15,7 +15,100 @@ standalone 当前保留两类正式观察构建：
 
 ### 1.1 真实 PA `submit-pmu-none`
 
-> **2026-07-22 ABI/schema v2 口径提示**：当前设备 ABI 与 raw JSON schema 已同步升级为
+> **2026-07-23 当前 ABI/schema v3 口径**：当前设备 ABI 与 raw JSON schema 为
+> `fdwic-submit-pmu-v3`。阶段主时间不再使用 `phase_elapsed_ticks`，而是直接读取
+> running read-clear 的 PMU total cycle，并在软件中重建整窗 total。HTML 对 ALL/AIC/AIV
+> 分别按 `1.649844/1.650062/1.649731 cycles/ns` 换算等效时间。`phase_elapsed_ticks`
+> 只保留为未换算的 SYS 边界闭合诊断，不参与阶段时间、阶段占比或跨阶段比较；不能再把它按
+> 1 GHz 冒充阶段耗时。下文 2026-07-22 及更早的 v1/v2 `phase_elapsed_ticks` 时间表和比例均为
+> 历史采集口径，不能作为当前 v3 结果使用。
+>
+> v3 同时用 CNT3 采集阶段 local scalar-busy，并保留 CNT2 作为整窗 primary。阶段报告直接给出
+> PMU total、scalar-busy 和逐核先算 `total-scalar` 后聚合的非 Scalar-busy 残余。该残余不是
+> “空闲时间”，还可能混有等待、I-cache、atomic、观察器以及其他非 scalar-busy 周期。linked
+> vector/cube Kernel 仍从阶段 PMU 和 SYS 两类窗口中成对门控排除；result-used return-ready
+> atomic 只从 SYS 边界诊断扣除，仍会进入 PMU total/scalar，因此不能把 v3 阶段 PMU total
+> 解释为去除 atomic 后的纯 scalar 指令时间。
+
+#### 2026-07-23 Case1 v3 全量产物
+
+下列 13 个 profile 均通过 96 核拓扑、调用次数、begin/end、PMU selector、owner restore、
+linked-Kernel 排除、return-ready atomic SYS 扣时以及 v3 local/whole PMU 关系门禁。每个目录都包含
+raw、provenance 和 HTML：
+
+| profile | Case1 产物目录 |
+| --- | --- |
+| `submit-pmu-none` | `outputs/TestPagedAttentionUnroll_Case1_20260723_043811/` |
+| `submit-pmu-arg-build` | `outputs/TestPagedAttentionUnroll_Case1_20260723_043857/` |
+| `submit-pmu-empty-bracket` | `outputs/TestPagedAttentionUnroll_Case1_20260723_043533/` |
+| `submit-pmu-materialize` | `outputs/TestPagedAttentionUnroll_Case1_20260723_043943/` |
+| `submit-pmu-claim` | `outputs/TestPagedAttentionUnroll_Case1_20260723_043639/` |
+| `submit-pmu-register` | `outputs/TestPagedAttentionUnroll_Case1_20260723_044029/` |
+| `submit-pmu-submit-transition` | `outputs/TestPagedAttentionUnroll_Case1_20260723_044115/` |
+| `submit-pmu-efdrain-control` | `outputs/TestPagedAttentionUnroll_Case1_20260723_044202/` |
+| `submit-pmu-prepare-map` | `outputs/TestPagedAttentionUnroll_Case1_20260723_044248/` |
+| `submit-pmu-fanin` | `outputs/TestPagedAttentionUnroll_Case1_20260723_044336/` |
+| `submit-pmu-winner-build-control` | `outputs/TestPagedAttentionUnroll_Case1_20260723_044422/` |
+| `submit-pmu-alloc-complete-control` | `outputs/TestPagedAttentionUnroll_Case1_20260723_044508/` |
+| `submit-pmu-loser-replay` | `outputs/TestPagedAttentionUnroll_Case1_20260723_044555/` |
+
+最新全 span 汇总位于：
+
+```text
+outputs/fdwic_submit_span_overview_20260723_v3/
+  fdwic_submit_span_overview.json
+  fdwic_submit_span_overview.html
+```
+
+目录名 `_v3` 表示输入采用 Submit-PMU v3 cohort；overview JSON 自身的聚合 schema 为
+`fdwic-submit-span-overview-v3`。
+
+总览的每张泳道分区表同时给出三种占比：泳道同父区间、对应 phase 的
+`phase PMU total / 本 phase ELF whole PMU total`，以及
+`phase scalar busy / 本 phase ELF whole scalar busy`。后两列只是在同一行并列对照，不共享
+泳道父分母，也不使用 `submit-pmu-none`；各 phase 仍来自独立 ELF，禁止跨行求和。
+EfDrain、WinnerBuild、AllocComplete 显式标为 `control-only`，没有语义对等 phase 的聚合 residual
+或 Kernel 行显示“—”，不会用 ArgBuild 冒充整个 SubmitInternalResidual。
+
+总览还新增“11 个业务分段合计 vs submit-pmu-none”跨 ELF 合成诊断。它先对 11 个业务 phase
+ELF 的 raw observed 计数求和（不含 empty-bracket），再除以 `submit-pmu-none` 同角色、同指标的
+完整 Submit raw 计数；ALL 结果如下：
+
+| 指标 | 11 个分段合计 / none | 相对 100% 偏差 |
+| --- | ---: | ---: |
+| PMU total | 243.874% | +143.874% |
+| Scalar busy | 179.148% | +79.148% |
+| 非 Scalar-busy 残余 | 2693.528% | +2593.528% |
+| I-cache request | 199.896% | +99.896% |
+| I-cache miss | 593.755% | +493.755% |
+
+这组比例用于直观看出高频分段观察后，累计观测量相对 none 的膨胀程度；例如 Scalar busy 合计为
+none 的 179.148%，是很清晰的观察扰动指纹。但 11 个分段来自 11 个独立 ELF 和独立进程，业务
+边界还可能有覆盖空洞、交叠和 control-only 语义，因此 `比例 - 100%` 不是可精确相减的插桩成本，
+更不是可直接兑现的墙钟收益。尤其 none 的非 Scalar-busy 残余分母很小，该项百分比会被显著放大。
+
+汇总中的每张 phase 卡都以该 phase ELF 自己的 whole PMU total/scalar 和 primary I-cache
+作为分母；不同 phase 是不同 ELF、不同进程，比例不能求和。泳道输入与这些 PMU ELF 没有共同
+provenance，当前只对齐 96 核拓扑和每核 1,280 个 Submit，不能把泳道时间与 PMU cycle 逐值相减。
+
+v3 真机校准还得到三个直接证据：
+
+- `submit-pmu-none` B1 的 96 个核均精确满足 CNT3 shadow scalar = CNT2 primary scalar，证明重复
+  scalar selector 在不做运行中 read-clear 时一致；
+- phase 构建中 CNT3 shadow 相对 CNT2 primary 固定少 `2 cycles/call`，Case1 empty 和 Claim
+  均逐核严格符合该线性关系。raw 和 HTML 显式展示这项 shadow loss，不把它藏进阶段业务值；
+- Case1 empty-bracket 的 ALL phase PMU total 约 `1564.846 cycles/call`，按当前 ALL 校准频率
+  换算约 `948.481 ns/call`。这是观察器本身的当前 ELF 经验量尺，说明高频 phase 插桩不可当作
+  零开销观察，也不能从其他 ELF 精确相减。
+
+构建阶段还确认过一个容易造成假失败的产物问题：AICore cache 已更新但
+`build/lib/.../libhost_runtime.so` 仍为旧 ABI 时，设备 v3 与 host v2 会表现为 96 核记录全零。
+必须通过正式
+`RuntimeBuilder("a5").get_binaries("fully_distributed_within_core", build=True)`
+同步重建和落盘 host runtime，
+并核对 cache 与 `build/lib` 的实际加载 SO SHA 一致；不能把 ABI 不匹配误判成 PMU counter 不工作。
+
+> **2026-07-22 历史 ABI/schema v2 口径提示**：当时设备 ABI 与 raw JSON schema 同步升级为
 > `fdwic-submit-pmu-v2`。所有真实 PA submit-PMU profile
 > 都在 linked vector/cube Kernel 调用前后统一门控，完整窗的 PMU counter 与
 > `scalar_submit_elapsed_ticks`、以及命中的 phase 时间都排除 Kernel 整段。仅消费返回值的
@@ -23,7 +116,7 @@ standalone 当前保留两类正式观察构建：
 > 不停 PMU；source-issue atomic 保留。因而 PMU total、scalar busy、I-cache request/miss
 > 仍包含 atomic 指令及最小时间 hook 的指令事件。`wall - scalar_submit_elapsed_ticks` 同时混有
 > linked Kernel、被扣除的 return-ready atomic 时间和门控边界间隙，不能命名为纯 Kernel 时间。
-> 本章现存 v1 HTML 与数值只作历史记录；采用 v2 做新分析时必须重新上板采集，不能与旧结果
+> 本章现存 v1 HTML 与数值只作历史记录；当时采用 v2 做新分析时必须重新上板采集，不能与旧结果
 > 合并、相减或拼接比例。
 
 #### 2026-07-22 Case1 v2 全量 HTML 索引

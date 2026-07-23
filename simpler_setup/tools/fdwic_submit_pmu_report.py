@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-SCHEMA_NAME = "fdwic-submit-pmu-v2"
+SCHEMA_NAME = "fdwic-submit-pmu-v3"
 DEFAULT_INPUT_NAME = "fdwic_submit_pmu_raw.json"
 DEFAULT_OUTPUT_NAME = "fdwic_submit_pmu_report.html"
 PROVENANCE_SCHEMA_NAME = "fdwic-submit-pmu-provenance-v1"
@@ -39,9 +39,9 @@ EXPECTED_AIV_CORES = 64
 PHYSICAL_CORES = 108
 PHYSICAL_CORES_PER_DIE = 54
 AIC_CORES_PER_DIE = 18
-COMMON_REQUIRED_STATUS_MASK = (1 << 18) - 1
-NONE_REQUIRED_STATUS_MASK = (1 << 19) - 1
-PHASE_REQUIRED_STATUS_MASK = (1 << 6) - 1
+COMMON_REQUIRED_STATUS_MASK = (1 << 19) - 1
+NONE_REQUIRED_STATUS_MASK = (1 << 21) - 1
+PHASE_REQUIRED_STATUS_MASK = (1 << 10) - 1
 PROGRAMMABLE_COUNTER_RISK_THRESHOLD = 0x3FFFFFFF
 
 NONE_CAPTURE_MODE = "submit-pmu-none"
@@ -69,6 +69,12 @@ FANIN_PHASE_ID = 9
 WINNER_BUILD_PHASE_ID = 10
 ALLOC_COMPLETE_PHASE_ID = 11
 LOSER_REPLAY_PHASE_ID = 12
+PHASE_PMU_OBSERVATION = {
+    "total_cycles": "running_read_clear_observed_with_software_reconstructed_whole",
+    "scalar_busy": "cnt3_running_read_clear_observed_bounded_by_cnt2_primary",
+    "non_scalar_busy": "per_core_phase_total_cycles_observed_minus_phase_scalar_busy_observed",
+    "sys_cnt_role": "boundary_diagnostic_only_not_primary_phase_timing",
+}
 PHASE_CONFIG_BY_MODE = {
     ARG_BUILD_CAPTURE_MODE: {
         "id": ARG_BUILD_PHASE_ID,
@@ -76,7 +82,7 @@ PHASE_CONFIG_BY_MODE = {
         "boundary": "claim_end_to_materialize_begin",
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_observed_bracket",
-        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+        "time_semantics": "boundary_diagnostic_sys_cnt_between_observers",
     },
     EMPTY_BRACKET_CAPTURE_MODE: {
         "id": EMPTY_BRACKET_PHASE_ID,
@@ -84,7 +90,7 @@ PHASE_CONFIG_BY_MODE = {
         "boundary": "claim_end_adjacent_empty_bracket",
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_empty_bracket_calibration",
-        "time_semantics": "outer_sys_cnt_around_adjacent_begin_end_pair",
+        "time_semantics": "boundary_diagnostic_outer_sys_cnt_around_adjacent_observer_pair",
     },
     MATERIALIZE_CAPTURE_MODE: {
         "id": MATERIALIZE_PHASE_ID,
@@ -92,7 +98,7 @@ PHASE_CONFIG_BY_MODE = {
         "boundary": "materialize_begin_to_materialize_end",
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_observed_bracket",
-        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+        "time_semantics": "boundary_diagnostic_sys_cnt_between_observers",
     },
     CLAIM_CAPTURE_MODE: {
         "id": CLAIM_PHASE_ID,
@@ -100,7 +106,7 @@ PHASE_CONFIG_BY_MODE = {
         "boundary": "claim_begin_to_claim_end",
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_observed_bracket",
-        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+        "time_semantics": "boundary_diagnostic_sys_cnt_between_observers",
     },
     REGISTER_CAPTURE_MODE: {
         "id": REGISTER_PHASE_ID,
@@ -108,7 +114,7 @@ PHASE_CONFIG_BY_MODE = {
         "boundary": "register_outputs_call_entry_to_return",
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_observed_bracket",
-        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+        "time_semantics": "boundary_diagnostic_sys_cnt_between_observers",
     },
     SUBMIT_TRANSITION_CAPTURE_MODE: {
         "id": SUBMIT_TRANSITION_PHASE_ID,
@@ -116,7 +122,7 @@ PHASE_CONFIG_BY_MODE = {
         "boundary": "previous_submit_end_to_next_submit_begin",
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_observed_bracket",
-        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+        "time_semantics": "boundary_diagnostic_sys_cnt_between_observers",
     },
     EFDRAIN_CONTROL_CAPTURE_MODE: {
         "id": EFDRAIN_CONTROL_PHASE_ID,
@@ -124,7 +130,7 @@ PHASE_CONFIG_BY_MODE = {
         "boundary": "efdrain_begin_to_end_excluding_linked_kernel_calls",
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "discontinuous_running_read_clear_excluding_linked_kernel_calls",
-        "time_semantics": "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls",
+        "time_semantics": "boundary_diagnostic_discontinuous_sys_cnt_segments_excluding_linked_kernel_calls",
     },
     PREPARE_MAP_CAPTURE_MODE: {
         "id": PREPARE_MAP_PHASE_ID,
@@ -132,7 +138,7 @@ PHASE_CONFIG_BY_MODE = {
         "boundary": "dist_submit_prepare_map_call_entry_to_return",
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_observed_bracket",
-        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+        "time_semantics": "boundary_diagnostic_sys_cnt_between_observers",
     },
     FANIN_CAPTURE_MODE: {
         "id": FANIN_PHASE_ID,
@@ -140,7 +146,7 @@ PHASE_CONFIG_BY_MODE = {
         "boundary": "fanin_begin_to_fanin_end",
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_observed_bracket",
-        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+        "time_semantics": "boundary_diagnostic_sys_cnt_between_observers",
     },
     WINNER_BUILD_CAPTURE_MODE: {
         "id": WINNER_BUILD_PHASE_ID,
@@ -148,7 +154,7 @@ PHASE_CONFIG_BY_MODE = {
         "boundary": "winner_build_begin_to_end_excluding_linked_kernel_calls",
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "discontinuous_running_read_clear_excluding_linked_kernel_calls",
-        "time_semantics": "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls",
+        "time_semantics": "boundary_diagnostic_discontinuous_sys_cnt_segments_excluding_linked_kernel_calls",
     },
     ALLOC_COMPLETE_CAPTURE_MODE: {
         "id": ALLOC_COMPLETE_PHASE_ID,
@@ -156,7 +162,7 @@ PHASE_CONFIG_BY_MODE = {
         "boundary": "alloc_complete_begin_to_end_excluding_linked_kernel_calls",
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "discontinuous_running_read_clear_excluding_linked_kernel_calls",
-        "time_semantics": "discontinuous_sys_cnt_control_segments_excluding_linked_kernel_calls",
+        "time_semantics": "boundary_diagnostic_discontinuous_sys_cnt_segments_excluding_linked_kernel_calls",
     },
     LOSER_REPLAY_CAPTURE_MODE: {
         "id": LOSER_REPLAY_PHASE_ID,
@@ -164,7 +170,7 @@ PHASE_CONFIG_BY_MODE = {
         "boundary": "register_end_to_drain_block_won_return",
         "status_required_mask": PHASE_REQUIRED_STATUS_MASK,
         "counter_semantics": "running_read_clear_observed_bracket",
-        "time_semantics": "inner_sys_cnt_between_boundary_observers",
+        "time_semantics": "boundary_diagnostic_sys_cnt_between_observers",
     },
 }
 DYNAMIC_PHASE_CAPTURE_MODES = frozenset(
@@ -192,13 +198,13 @@ SUPPORTED_CAPTURE_MODES = {NONE_CAPTURE_MODE, *PHASE_CONFIG_BY_MODE}
 PHASE_RECORD_FIELDS = (
     "phase_id",
     "phase_elapsed_ticks",
+    "phase_total_cycles_observed",
+    "phase_scalar_busy_observed",
     "phase_icache_requests_observed",
     "phase_icache_misses_observed",
     "phase_begin_reads",
     "phase_end_reads",
     "phase_excluded_kernel_calls",
-    "phase_max_shadow_request_chunk",
-    "phase_max_shadow_miss_chunk",
     "phase_status",
 )
 DEPRECATED_PHASE_BOUND_FIELDS = (
@@ -210,6 +216,7 @@ EXPECTED_SELECTORS = {
     "cnt0_vector_busy": 0x501,
     "cnt1_cube_busy": 0x301,
     "cnt2_scalar_busy": 0x001,
+    "cnt3_shadow_scalar_busy": 0x001,
     "cnt5_shadow_icache_miss": 0x035,
     "cnt6_primary_icache_request": 0x034,
     "cnt7_primary_icache_miss": 0x035,
@@ -506,11 +513,13 @@ def _validate_capture_header(data: dict[str, Any]) -> tuple[str, dict[str, Any],
                 **PHASE_CONFIG_BY_MODE[mode],
                 "call_shape": call_shape,
                 "expected_calls": _expected_dynamic_phase_calls(mode, expected_submits),
+                "pmu_observation": PHASE_PMU_OBSERVATION,
             }
         else:
             expected_phase = {
                 **PHASE_CONFIG_BY_MODE[mode],
                 "expected_calls_per_core": _expected_phase_calls(mode, expected_submits),
+                "pmu_observation": PHASE_PMU_OBSERVATION,
             }
         _require_equal(
             configuration.get("phase"),
@@ -559,16 +568,27 @@ def _validate_phase_elapsed_shape(
     dynamic_calls: bool,
     begin_reads: int,
     phase_elapsed: int,
+    phase_total_observed: int,
+    phase_scalar_observed: int,
     phase_requests_observed: int,
     phase_misses_observed: int,
 ) -> None:
+    if begin_reads > 0 and phase_total_observed == 0:
+        _fail(f"{prefix} non-empty phase must have positive phase_total_cycles_observed")
     if not dynamic_calls:
         if phase_elapsed == 0:
             _fail(f"{prefix}.phase_elapsed_ticks must be an integer >= 1")
         return
     if begin_reads == 0:
-        if phase_elapsed != 0 or phase_requests_observed != 0 or phase_misses_observed != 0:
-            _fail(f"{prefix} zero-call dynamic phase must have zero elapsed/request/miss")
+        observed_values = (
+            phase_elapsed,
+            phase_total_observed,
+            phase_scalar_observed,
+            phase_requests_observed,
+            phase_misses_observed,
+        )
+        if any(observed_values):
+            _fail(f"{prefix} zero-call dynamic phase must have zero elapsed/total/scalar/request/miss")
     elif phase_elapsed == 0:
         _fail(f"{prefix} non-empty dynamic phase must have positive elapsed")
 
@@ -631,6 +651,14 @@ def _validate_phase_record(
 ) -> None:
     _require_equal(record.get("phase_id"), expected_phase_id, f"{prefix}.phase_id")
     phase_elapsed = _integer(record.get("phase_elapsed_ticks"), f"{prefix}.phase_elapsed_ticks")
+    phase_total_observed = _integer(
+        record.get("phase_total_cycles_observed"),
+        f"{prefix}.phase_total_cycles_observed",
+    )
+    phase_scalar_observed = _integer(
+        record.get("phase_scalar_busy_observed"),
+        f"{prefix}.phase_scalar_busy_observed",
+    )
     phase_requests_observed = _integer(
         record.get("phase_icache_requests_observed"),
         f"{prefix}.phase_icache_requests_observed",
@@ -651,37 +679,67 @@ def _validate_phase_record(
         begin_reads=begin_reads,
         end_reads=end_reads,
     )
-    max_request_chunk = _integer(
-        record.get("phase_max_shadow_request_chunk"),
-        f"{prefix}.phase_max_shadow_request_chunk",
-    )
-    max_miss_chunk = _integer(
-        record.get("phase_max_shadow_miss_chunk"),
-        f"{prefix}.phase_max_shadow_miss_chunk",
-    )
-
     _validate_phase_elapsed_shape(
         prefix=prefix,
         dynamic_calls=dynamic_calls,
         begin_reads=business_begin_calls,
         phase_elapsed=phase_elapsed,
+        phase_total_observed=phase_total_observed,
+        phase_scalar_observed=phase_scalar_observed,
         phase_requests_observed=phase_requests_observed,
         phase_misses_observed=phase_misses_observed,
     )
     if phase_elapsed > scalar_submit_elapsed:
         _fail(f"{prefix}.phase_elapsed_ticks exceeds scalar_submit_elapsed_ticks")
+    if phase_scalar_observed > phase_total_observed:
+        _fail(f"{prefix}.phase_scalar_busy_observed exceeds phase_total_cycles_observed")
+    if phase_total_observed > record["total_cycles"]:
+        _fail(f"{prefix}.phase_total_cycles_observed exceeds total_cycles")
+    if phase_scalar_observed > record["shadow_scalar_busy"]:
+        _fail(f"{prefix}.phase_scalar_busy_observed exceeds shadow_scalar_busy")
     if phase_requests_observed > record["shadow_icache_requests"]:
         _fail(f"{prefix}.phase_icache_requests_observed exceeds shadow_icache_requests")
     if phase_misses_observed > record["shadow_icache_misses"]:
         _fail(f"{prefix}.phase_icache_misses_observed exceeds shadow_icache_misses")
-    if max_request_chunk >= PROGRAMMABLE_COUNTER_RISK_THRESHOLD:
-        _fail(f"{prefix}.phase_max_shadow_request_chunk reaches the risk threshold 0x3fffffff")
-    if max_miss_chunk >= PROGRAMMABLE_COUNTER_RISK_THRESHOLD:
-        _fail(f"{prefix}.phase_max_shadow_miss_chunk reaches the risk threshold 0x3fffffff")
+    if phase_scalar_observed >= PROGRAMMABLE_COUNTER_RISK_THRESHOLD:
+        _fail(f"{prefix}.phase_scalar_busy_observed reaches the risk threshold 0x3fffffff")
 
     phase_status = _integer(record.get("phase_status"), f"{prefix}.phase_status")
     if phase_status != PHASE_REQUIRED_STATUS_MASK:
         _fail(f"{prefix}.phase_status must equal 0x{PHASE_REQUIRED_STATUS_MASK:x}, got 0x{phase_status:x}")
+
+
+def _validate_shadow_counters(
+    record: Mapping[str, Any],
+    prefix: str,
+    mode: str,
+    scalar: int,
+    requests: int,
+    misses: int,
+) -> tuple[int, ...]:
+    """Validate counters used only to close the primary running-read reconstruction."""
+
+    if mode == NONE_CAPTURE_MODE:
+        if any(field in record for field in ("shadow_scalar_busy", "shadow_icache_requests", "shadow_icache_misses")):
+            _fail(f"{prefix} must not publish redundant shadow counters in {NONE_CAPTURE_MODE}")
+        return ()
+
+    shadow_scalar = _integer(
+        record.get("shadow_scalar_busy"),
+        f"{prefix}.shadow_scalar_busy",
+        minimum=1,
+    )
+    shadow_requests = _integer(record.get("shadow_icache_requests"), f"{prefix}.shadow_icache_requests")
+    shadow_misses = _integer(record.get("shadow_icache_misses"), f"{prefix}.shadow_icache_misses")
+    if shadow_scalar > scalar:
+        _fail(f"{prefix}.shadow_scalar_busy exceeds scalar_busy")
+    if shadow_misses > shadow_requests:
+        _fail(f"{prefix}.shadow_icache_misses exceeds shadow_icache_requests")
+    if shadow_requests > requests:
+        _fail(f"{prefix}.shadow_icache_requests exceeds icache_requests")
+    if shadow_misses > misses:
+        _fail(f"{prefix}.shadow_icache_misses exceeds icache_misses")
+    return (shadow_scalar, shadow_requests, shadow_misses)
 
 
 def _validate_record(
@@ -725,23 +783,13 @@ def _validate_record(
         _fail(f"{prefix}.scalar_busy exceeds total_cycles")
     if misses > requests:
         _fail(f"{prefix}.icache_misses exceeds icache_requests")
+    shadow_programmable = _validate_shadow_counters(record, prefix, mode, scalar, requests, misses)
     if mode == NONE_CAPTURE_MODE:
         if any(field in record for field in (*PHASE_RECORD_FIELDS, *DEPRECATED_PHASE_BOUND_FIELDS)):
             _fail(f"{prefix} must not contain phase fields in {NONE_CAPTURE_MODE}")
-        if "shadow_icache_requests" in record or "shadow_icache_misses" in record:
-            _fail(f"{prefix} must not publish redundant shadow counters in {NONE_CAPTURE_MODE}")
-        programmable = (scalar, requests, misses)
     else:
-        shadow_requests = _integer(record.get("shadow_icache_requests"), f"{prefix}.shadow_icache_requests")
-        shadow_misses = _integer(record.get("shadow_icache_misses"), f"{prefix}.shadow_icache_misses")
-        if shadow_misses > shadow_requests:
-            _fail(f"{prefix}.shadow_icache_misses exceeds shadow_icache_requests")
         if any(field in record for field in DEPRECATED_PHASE_BOUND_FIELDS):
             _fail(f"{prefix} must use observed phase fields, not lower/upper-bound names")
-        if shadow_requests > requests:
-            _fail(f"{prefix}.shadow_icache_requests exceeds icache_requests")
-        if shadow_misses > misses:
-            _fail(f"{prefix}.shadow_icache_misses exceeds icache_misses")
         expected_calls = None if mode in DYNAMIC_PHASE_CAPTURE_MODES else _expected_phase_calls(mode, expected_submits)
         _validate_phase_record(
             record,
@@ -751,7 +799,7 @@ def _validate_record(
             scalar_elapsed,
             PHASE_CONFIG_BY_MODE[mode]["id"],
         )
-        programmable = (scalar, requests, misses, shadow_requests, shadow_misses)
+    programmable = (scalar, requests, misses, *shadow_programmable)
     if any(value >= PROGRAMMABLE_COUNTER_RISK_THRESHOLD for value in programmable):
         _fail(f"{prefix} programmable counter reaches the risk threshold 0x3fffffff")
 
@@ -882,12 +930,7 @@ def _group_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
     scalar_denominator_excluded_wall_ticks = _value_summary(
         [record["submit_elapsed_ticks"] - record["scalar_submit_elapsed_ticks"] for record in records]
     )
-    non_scalar_busy_cycles = _value_summary(
-        [record["total_cycles"] - record["scalar_busy"] for record in records]
-    )
-    pmu_total_cycles_per_scalar_tick = _value_summary(
-        [record["total_cycles"] / record["scalar_submit_elapsed_ticks"] for record in records]
-    )
+    non_scalar_busy_cycles = _value_summary([record["total_cycles"] - record["scalar_busy"] for record in records])
     return {
         "cores": len(records),
         **metrics,
@@ -895,7 +938,6 @@ def _group_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "scalar_submit_elapsed_ticks": scalar_submit_elapsed_ticks,
         "scalar_denominator_excluded_wall_ticks": scalar_denominator_excluded_wall_ticks,
         "non_scalar_busy_cycles": non_scalar_busy_cycles,
-        "pmu_total_cycles_per_scalar_tick": pmu_total_cycles_per_scalar_tick,
         "scalar_window_share_of_wall": scalar_submit_elapsed_ticks["sum"] / submit_elapsed_ticks["sum"],
         "scalar_busy_share": scalar_busy / total_cycles,
         "icache_miss_rate": misses / requests if requests else 0.0,
@@ -906,6 +948,12 @@ def _phase_group_summary(records: Sequence[dict[str, Any]], mode: str) -> dict[s
     submit_elapsed = _metric_summary(records, "submit_elapsed_ticks")
     scalar_submit_elapsed = _metric_summary(records, "scalar_submit_elapsed_ticks")
     phase_elapsed = _metric_summary(records, "phase_elapsed_ticks")
+    phase_total_observed = _metric_summary(records, "phase_total_cycles_observed")
+    phase_scalar_observed = _metric_summary(records, "phase_scalar_busy_observed")
+    phase_non_scalar = _value_summary(
+        [record["phase_total_cycles_observed"] - record["phase_scalar_busy_observed"] for record in records]
+    )
+    shadow_scalar_loss = _value_summary([record["scalar_busy"] - record["shadow_scalar_busy"] for record in records])
     requests_observed = _metric_summary(records, "phase_icache_requests_observed")
     misses_observed = _metric_summary(records, "phase_icache_misses_observed")
 
@@ -931,6 +979,8 @@ def _phase_group_summary(records: Sequence[dict[str, Any]], mode: str) -> dict[s
     }
     primary_requests = sum(record["icache_requests"] for record in records)
     primary_misses = sum(record["icache_misses"] for record in records)
+    primary_total = sum(record["total_cycles"] for record in records)
+    primary_scalar = sum(record["scalar_busy"] for record in records)
     phase_calls_per_core = [_phase_business_calls(record, mode) for record in records]
     phase_calls = sum(phase_calls_per_core)
     summary = {
@@ -940,11 +990,21 @@ def _phase_group_summary(records: Sequence[dict[str, Any]], mode: str) -> dict[s
         "primary_icache_requests": primary_requests,
         "primary_icache_misses": primary_misses,
         "phase_elapsed_ticks": phase_elapsed,
+        "phase_total_cycles_observed": phase_total_observed,
+        "phase_scalar_busy_observed": phase_scalar_observed,
+        "phase_non_scalar_busy_cycles": phase_non_scalar,
+        "shadow_scalar_loss": shadow_scalar_loss,
         "phase_icache_requests_observed": requests_observed,
         "phase_icache_requests_observed_plus_capture_gap": requests_observed_plus_gap,
         "phase_icache_misses_observed": misses_observed,
         "phase_icache_misses_observed_plus_capture_gap": misses_observed_plus_gap,
-        "phase_time_share_of_scalar_submit": phase_elapsed["sum"] / scalar_submit_elapsed["sum"],
+        "phase_total_share_of_pmu_total": phase_total_observed["sum"] / primary_total,
+        "phase_scalar_share_of_whole_scalar": (
+            phase_scalar_observed["sum"] / primary_scalar if primary_scalar else 0.0
+        ),
+        "phase_scalar_busy_share_of_phase_total": (
+            phase_scalar_observed["sum"] / phase_total_observed["sum"] if phase_total_observed["sum"] else 0.0
+        ),
         "phase_request_observed_share_of_primary": requests_observed["sum"] / primary_requests,
         "phase_request_observed_plus_capture_gap_share_of_primary": (
             requests_observed_plus_gap["sum"] / primary_requests
@@ -953,7 +1013,9 @@ def _phase_group_summary(records: Sequence[dict[str, Any]], mode: str) -> dict[s
         "phase_miss_observed_plus_capture_gap_share_of_primary": (
             misses_observed_plus_gap["sum"] / primary_misses if primary_misses else 0.0
         ),
-        "phase_elapsed_ticks_per_call": phase_elapsed["sum"] / phase_calls if phase_calls else None,
+        "phase_total_cycles_observed_per_call": (phase_total_observed["sum"] / phase_calls if phase_calls else None),
+        "phase_scalar_busy_observed_per_call": (phase_scalar_observed["sum"] / phase_calls if phase_calls else None),
+        "phase_non_scalar_busy_cycles_per_call": phase_non_scalar["sum"] / phase_calls if phase_calls else None,
         "phase_icache_requests_observed_per_call": requests_observed["sum"] / phase_calls if phase_calls else None,
         "phase_icache_misses_observed_per_call": misses_observed["sum"] / phase_calls if phase_calls else None,
         "phase_begin_reads": sum(record["phase_begin_reads"] for record in records),
@@ -961,8 +1023,6 @@ def _phase_group_summary(records: Sequence[dict[str, Any]], mode: str) -> dict[s
         "phase_business_calls": phase_calls,
         "phase_calls_per_core": _value_summary(phase_calls_per_core),
         "phase_zero_call_cores": sum(calls == 0 for calls in phase_calls_per_core),
-        "phase_max_shadow_request_chunk": max(record["phase_max_shadow_request_chunk"] for record in records),
-        "phase_max_shadow_miss_chunk": max(record["phase_max_shadow_miss_chunk"] for record in records),
     }
     if mode in KERNEL_EXCLUDING_PHASE_CAPTURE_MODES:
         summary["phase_excluded_kernel_calls"] = sum(record["phase_excluded_kernel_calls"] for record in records)
@@ -1031,7 +1091,12 @@ def _validate_producer_summary(data: dict[str, Any], mode: str) -> None:
         "return_ready_atomic_time_valid_records": EXPECTED_CORES,
     }
     if mode == NONE_CAPTURE_MODE:
-        required["shadow_primary_match_records"] = EXPECTED_CORES
+        required.update(
+            {
+                "shadow_icache_primary_match_records": EXPECTED_CORES,
+                "shadow_scalar_primary_match_records": EXPECTED_CORES,
+            }
+        )
     else:
         if "phase_time_bounded_records" in validation:
             _fail("validation must use phase_time_within_submit_records, not phase_time_bounded_records")
@@ -1039,9 +1104,12 @@ def _validate_producer_summary(data: dict[str, Any], mode: str) -> None:
             {
                 "phase_boundary_closed_records": EXPECTED_CORES,
                 "phase_shape_match_records": EXPECTED_CORES,
-                "phase_values_ordered_records": EXPECTED_CORES,
+                "phase_icache_values_ordered_records": EXPECTED_CORES,
+                "phase_pmu_values_ordered_records": EXPECTED_CORES,
+                "phase_counter_reconstruction_valid_records": EXPECTED_CORES,
                 "phase_time_within_submit_records": EXPECTED_CORES,
-                "shadow_primary_bounded_records": EXPECTED_CORES,
+                "shadow_icache_primary_bounded_records": EXPECTED_CORES,
+                "shadow_scalar_primary_bounded_records": EXPECTED_CORES,
             }
         )
     if mode in KERNEL_EXCLUDING_PHASE_CAPTURE_MODES:
@@ -1077,8 +1145,7 @@ def _validate_dynamic_phase_call_totals(
         business_calls = _phase_business_calls(record, mode)
         if business_calls > max_calls_per_core:
             _fail(
-                f"records[{logical_core_id}] business phase calls exceed dynamic per-core maximum "
-                f"{max_calls_per_core}"
+                f"records[{logical_core_id}] business phase calls exceed dynamic per-core maximum {max_calls_per_core}"
             )
     if actual["all"] != expected["all"] or actual["aic"] + actual["aiv"] != actual["all"]:
         _fail(f"dynamic phase call totals: global call total must equal {expected['all']}, got {actual!r}")
@@ -1205,8 +1272,7 @@ def _exact_keys(data: Mapping[str, Any], expected: set[str], path: str) -> None:
     actual = set(data)
     if actual != expected:
         _fail(
-            f"{path} fields do not match the fixed provenance schema: "
-            f"expected {sorted(expected)}, got {sorted(actual)}"
+            f"{path} fields do not match the fixed provenance schema: expected {sorted(expected)}, got {sorted(actual)}"
         )
 
 
@@ -1280,9 +1346,10 @@ def _validate_provenance_data(data: dict[str, Any], capture: SubmitPmuCapture) -
         _fail("provenance.build.profiled_cache_key must be a non-empty string array")
     if cache_key[-1] != build["profile"]:
         _fail("provenance.build.profiled_cache_key must end with the selected profile")
-    if not isinstance(build["aicore_extra_cache_key"], str) or _HEX_16_PATTERN.fullmatch(
-        build["aicore_extra_cache_key"]
-    ) is None:
+    if (
+        not isinstance(build["aicore_extra_cache_key"], str)
+        or _HEX_16_PATTERN.fullmatch(build["aicore_extra_cache_key"]) is None
+    ):
         _fail("provenance.build.aicore_extra_cache_key must contain 16 lowercase hex digits")
     definitions = build["compile_definitions"]
     if not isinstance(definitions, list) or not definitions or not all(isinstance(value, str) for value in definitions):
@@ -1371,7 +1438,6 @@ def _group_card(name: str, summary: Mapping[str, Any], cycles_per_ns: float, mis
     total = summary["total_cycles"]
     scalar = summary["scalar_busy"]
     non_scalar_busy = summary["non_scalar_busy_cycles"]
-    effective_cycles_per_tick = summary["pmu_total_cycles_per_scalar_tick"]
     requests = summary["icache_requests"]
     misses = summary["icache_misses"]
     cycles_to_us = 1.0 / cycles_per_ns / 1_000
@@ -1380,21 +1446,6 @@ def _group_card(name: str, summary: Mapping[str, Any], cycles_per_ns: float, mis
       <article class="group-card">
         <h3>{title} · {summary["cores"]} 核</h3>
         <dl>
-          <dt>Scalar Submit 时间分母/core</dt>
-          <dd>{_scaled_metric_range(scalar_elapsed, 1 / 1_000)} µs<br>
-            <small>逐核累计 Scalar SYS_CNT；linked vector/cube Kernel 从时间和 PMU counter
-              一并门控排除，result-used return-ready atomic 依赖区间只从时间扣除</small>
-          </dd>
-          <dt>原始 Submit 墙钟/core</dt>
-          <dd>{_scaled_metric_range(wall_elapsed, 1 / 1_000)} µs<br>
-            <small>逐核首末 Submit 闭合证据；含 Kernel，不参与 Scalar 时间占比</small>
-          </dd>
-          <dt>未进入 Scalar 分母/core</dt>
-          <dd>{_scaled_metric_range(excluded_wall, 1 / 1_000)} µs<br>
-            <small>逐核 wall−scalar；混合了 linked Kernel、return-ready atomic 被扣时间
-              和门控边界间隙，不能解释成纯 Kernel 耗时；Scalar/墙钟加权比
-              {float(summary["scalar_window_share_of_wall"]):.3%}</small>
-          </dd>
           <dt>Submit PMU total/core</dt>
           <dd>{_metric_range(total)} cycles<br>
             <small>等效时间 {_scaled_metric_range(total, cycles_to_us)} µs
@@ -1410,10 +1461,20 @@ def _group_card(name: str, summary: Mapping[str, Any], cycles_per_ns: float, mis
             <small>逐核先算 total−scalar；等效时间
               {_scaled_metric_range(non_scalar_busy, cycles_to_us)} µs</small>
           </dd>
-          <dt>PMU-total / Scalar SYS/core</dt>
-          <dd>{_scaled_metric_range(effective_cycles_per_tick, 1.0, digits=6)} cycles/ns<br>
-            <small>仅作当前 ELF 的诊断比值；return-ready atomic 只扣 SYS 时间、
-              不扣 PMU counter，因此不要求精确等于校准频率，也不是利用率</small>
+          <dt>SYS gate 边界诊断/core</dt>
+          <dd>{_metric_range(scalar_elapsed)} raw ticks<br>
+            <small>逐核累计 SYS_CNT gate 边界；linked vector/cube Kernel 与 result-used
+              return-ready atomic 依赖区间被扣除。它不是按 1.65 GHz 换算的 PMU 阶段时间。</small>
+          </dd>
+          <dt>原始 Submit 墙钟/core</dt>
+          <dd>{_scaled_metric_range(wall_elapsed, 1 / 1_000)} µs<br>
+            <small>逐核首末 Submit 的 SYS_CNT 闭合证据；含 Kernel，与 PMU 校准时间是不同量。</small>
+          </dd>
+          <dt>未进入 SYS gate/core</dt>
+          <dd>{_metric_range(excluded_wall)} raw ticks<br>
+            <small>逐核 wall−gate；混合了 linked Kernel、return-ready atomic 被扣区间
+              和门控边界间隙，不能解释成纯 Kernel 耗时；gate/墙钟加权比
+              {float(summary["scalar_window_share_of_wall"]):.3%}</small>
           </dd>
           <dt>Primary I-cache request/core</dt><dd>{_metric_extrema(requests)}</dd>
           <dt>Primary I-cache miss/core</dt><dd>{_metric_extrema(misses)}</dd>
@@ -1468,7 +1529,7 @@ def _per_core_rows(records: Sequence[dict[str, Any]], miss_penalty_ns: float) ->
             "<tr>"
             f"<td>{record['physical_core_id']}</td><td>{record['logical_core_id']}</td>"
             f"<td>{record['role'].upper()}</td><td>{record['block_id']}</td><td>{record['lane']}</td>"
-            f"<td>{_format_number(record['scalar_submit_elapsed_ticks'] / 1_000)}</td>"
+            f"<td>{_format_integer(record['scalar_submit_elapsed_ticks'])}</td>"
             f"<td>{_format_number(record['submit_elapsed_ticks'] / 1_000)}</td>"
             f"<td>{_format_integer(record['total_cycles'])}</td><td>{_format_integer(record['scalar_busy'])}</td>"
             f"<td>{_format_integer(request)}</td><td>{_format_integer(miss)}</td><td>{miss_rate:.3%}</td>"
@@ -1492,6 +1553,22 @@ def _phase_observed_cell(
         f"<small>Primary {_format_integer(primary)}；占比 {observed_share:.3%}</small><br>"
         f"<small>capture gap +{_format_integer(capture_gap)}；加 gap 后 "
         f"{_format_integer(observed_plus_capture_gap['sum'])}（{observed_plus_capture_gap_share:.3%}）</small>"
+    )
+
+
+def _phase_cycle_cell(
+    observed: Mapping[str, int | float],
+    cycles_per_ns: float,
+    per_call: float | None,
+) -> str:
+    """Render one role-calibrated phase PMU quantity without using SYS ticks as time."""
+
+    elapsed_us = float(observed["sum"]) / cycles_per_ns / 1_000
+    per_call_text = "—" if per_call is None else f"{_format_number(per_call)} cycles/call"
+    return (
+        f"<strong>Σ {_format_integer(observed['sum'])} cycles</strong><br>"
+        f"<small>≈ {_format_number(elapsed_us)} µs（{cycles_per_ns:.6f} cycles/ns）</small><br>"
+        f"<small>逐核 {_metric_extrema(observed)}；{per_call_text}</small>"
     )
 
 
@@ -1519,24 +1596,42 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
     if phase["id"] == EMPTY_BRACKET_PHASE_ID:
         calibration_note = """
     <p class="notice"><strong>empty-bracket 是每次 begin/end 紧邻执行的观察器自成本量尺，不是业务 phase。</strong>
-      phase_elapsed 是紧邻 begin+end 对的外层 SYS_CNT 经验耗时（含计时边界底噪）；request/miss observed
-      仍只覆盖两次 shadow read-clear 之间，并不包含 begin 读取前/end 读取后的全部 observer 取指。
-      两者都只是量级参照，不能跨 ELF 精确扣减。</p>
+      phase PMU total/scalar 是紧邻 begin/end 对本身带来的计数开销量尺；request/miss observed
+      仍只覆盖两次 shadow read-clear 之间。SYS tick 只用来核验边界是否闭合，不参与阶段主时间换算。
+      这些量尺都不能跨 ELF 精确扣减。</p>
         """
     control_exclusion_note = ""
     if capture.data["capture"]["mode"] in KERNEL_EXCLUDING_PHASE_CAPTURE_MODES:
         control_exclusion_note = """
     <p class="notice"><strong>本阶段若跨过 linked Kernel，会同时门控 SYS 时间与 PMU counter，
-      因而 elapsed、request 和 miss 都排除该 Kernel 整段。</strong>result-used return-ready atomic
-      依赖区间只从 elapsed 扣除，request/miss 仍含 atomic 指令事件；source-issue atomic
+      因而 total、scalar、request、miss 及 SYS 边界诊断都排除该 Kernel 整段。</strong>
+      result-used return-ready atomic 依赖区间只从 SYS 边界累计值扣除，PMU counter
+      仍含 atomic 指令事件；source-issue atomic
       保留在时间和计数口径内。没有 linked Kernel 的阶段不触发 PMU 停/开表；
       每次调用的分母仍是外层业务调用次数，不是 Begin/End 读数，也不是排除的 Kernel 调用数。</p>
         """
 
     rows = []
+    frequencies = capture.data["configuration"]["pmu_cycles_per_ns"]
     for group_name in GROUP_NAMES:
         group = capture.phase_summary[group_name]
         title = {"all": "ALL", "aic": "AIC", "aiv": "AIV"}[group_name]
+        cycles_per_ns = float(frequencies[group_name])
+        total_observed = _phase_cycle_cell(
+            group["phase_total_cycles_observed"],
+            cycles_per_ns,
+            group["phase_total_cycles_observed_per_call"],
+        )
+        scalar_observed = _phase_cycle_cell(
+            group["phase_scalar_busy_observed"],
+            cycles_per_ns,
+            group["phase_scalar_busy_observed_per_call"],
+        )
+        non_scalar = _phase_cycle_cell(
+            group["phase_non_scalar_busy_cycles"],
+            cycles_per_ns,
+            group["phase_non_scalar_busy_cycles_per_call"],
+        )
         request_observed = _phase_observed_cell(
             group["phase_icache_requests_observed"],
             group["phase_icache_requests_observed_plus_capture_gap"],
@@ -1551,10 +1646,7 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
             group["phase_miss_observed_share_of_primary"],
             group["phase_miss_observed_plus_capture_gap_share_of_primary"],
         )
-        reads = (
-            f"{_format_integer(group['phase_begin_reads'])} / "
-            f"{_format_integer(group['phase_end_reads'])}"
-        )
+        reads = f"{_format_integer(group['phase_begin_reads'])} / {_format_integer(group['phase_end_reads'])}"
         if capture.data["capture"]["mode"] in KERNEL_EXCLUDING_PHASE_CAPTURE_MODES:
             reads += (
                 "<br><small>业务调用 "
@@ -1567,20 +1659,29 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
                 f"<br><small>逐核 {_format_integer(calls['min'])}–{_format_integer(calls['max'])}；"
                 f"零调用核 {_format_integer(group['phase_zero_call_cores'])}</small>"
             )
-        per_call = group["phase_elapsed_ticks_per_call"]
-        per_call_text = "—" if per_call is None else f"{_format_number(per_call)} ns"
+        relationships = (
+            f"<strong>Scalar / Phase total {group['phase_scalar_busy_share_of_phase_total']:.3%}</strong><br>"
+            f"<small>Non-scalar / Phase total "
+            f"{1.0 - group['phase_scalar_busy_share_of_phase_total']:.3%}</small><br>"
+            f"<small>Phase total / 同 ELF whole total "
+            f"{group['phase_total_share_of_pmu_total']:.3%}</small><br>"
+            f"<small>Phase scalar / 同 ELF whole scalar "
+            f"{group['phase_scalar_share_of_whole_scalar']:.3%}</small><br>"
+            f"<small>whole scalar−shadow scalar：Σ "
+            f"{_format_integer(group['shadow_scalar_loss']['sum'])} cycles；逐核 "
+            f"{_metric_extrema(group['shadow_scalar_loss'])}</small>"
+        )
+        sys_diagnostic = (
+            f"Σ {_format_integer(group['phase_elapsed_ticks']['sum'])} raw ticks<br>"
+            f"<small>逐核 {_metric_extrema(group['phase_elapsed_ticks'])}；仅边界诊断</small>"
+        )
         rows.append(
             "<tr>"
             f"<th>{title}<small>{group['cores']} 核</small></th>"
-            f"<td><strong>{_format_number(group['phase_elapsed_ticks']['sum'] / 1_000)} µs</strong><br>"
-            f"<small>Scalar Submit 时间分母 core-time "
-            f"{_format_number(group['scalar_submit_elapsed_ticks']['sum'] / 1_000)} µs</small></td>"
-            f"<td><strong>{group['phase_time_share_of_scalar_submit']:.3%}</strong></td>"
-            f"<td><strong>{per_call_text}</strong></td>"
+            f"<td>{total_observed}</td><td>{scalar_observed}</td><td>{non_scalar}</td>"
+            f"<td>{relationships}</td>"
             f"<td>{request_observed}</td><td>{miss_observed}</td>"
-            f"<td>{reads}</td>"
-            f"<td>{_format_integer(group['phase_max_shadow_request_chunk'])} / "
-            f"{_format_integer(group['phase_max_shadow_miss_chunk'])}</td>"
+            f"<td>{sys_diagnostic}<br><small>{reads}</small></td>"
             "</tr>"
         )
     return f"""
@@ -1591,22 +1692,24 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
       <code>{html.escape(call_shape_text)}</code></p>
     {calibration_note}
     {control_exclusion_note}
-    <p><strong>这是 running read-clear 观察区间，不是可与其他构建直接相减的独立计时。</strong>
-      时间占比的分母是同一 ELF 的 Σ每核 Scalar Submit elapsed：linked vector/cube Kernel
-      从时间与 PMU counter 一并门控排除；result-used return-ready atomic 依赖区间只从时间扣除，
-      I-cache/PMU counter 仍含其指令事件；source-issue atomic 保留。request/miss 百分比的分母才是
-      同一 ELF、同一次采集的 Submit 整窗 primary。
+    <p><strong>阶段主时间来自 running read-clear 的 PMU total cycles，并按 AIC/AIV
+      各自校准频率换算；phase_elapsed_ticks 只是 SYS 边界闭合诊断，绝不按 1 GHz 当作阶段时间。</strong>
+      Scalar busy 与 non-scalar residual（逐核先算 total−scalar）共同解释阶段 PMU total；
+      三个占比分母均来自同一个 phase ELF 的整窗 primary，不能拿另一个构建作分母。
+      linked vector/cube Kernel 从 SYS 与 PMU counter 一并门控排除；result-used return-ready atomic
+      依赖区间只从 SYS 边界累计值扣除，I-cache/PMU counter 仍含其指令事件；source-issue atomic
+      保留。request/miss 百分比的分母是同一 ELF、同一次采集的 Submit 整窗 primary。
       <code>observed_plus_capture_gap = observed + (primary − shadow)</code>；
       边界读数和插桩 bookkeeping 会进入 sample，因此“观测值”和“加全窗 capture gap”都不是原业务
       事件数的数学上下界，也不能跨 ELF 相减。request/miss 的逐核 min/max 是每核累计
       整个 phase 的极值，不是逐调用极值。</p>
     <div class="table-wrap phase-table"><table>
       <thead><tr>
-        <th>核组</th><th>Phase / Scalar Submit 时间分母</th><th>Scalar 时间占比</th>
-        <th>每次调用 elapsed</th>
+        <th>核组</th><th>Phase PMU total</th><th>Phase scalar busy</th>
+        <th>非 Scalar-busy 残余</th><th>阶段关系 / 同 ELF 整窗占比</th>
         <th>Request observed（总数 / 逐核 min–max / Primary）</th>
         <th>Miss observed（总数 / 逐核 min–max / Primary）</th>
-        <th>Begin / End reads</th><th>最大 request / miss chunk</th>
+        <th>SYS 边界诊断 / Begin-End</th>
       </tr></thead>
       <tbody>{"".join(rows)}</tbody>
     </table></div>
@@ -1647,11 +1750,11 @@ def _provenance_overview(provenance: Mapping[str, Any] | None, provenance_sha256
       也不会给 AICore 热路径增加指令。</strong></p>
     <dl class="provenance-meta">
       <dt>Provenance SHA-256</dt><dd><code>{provenance_sha256}</code></dd>
-      <dt>Profile / extra cache</dt><dd><code>{html.escape(build['profile'])}</code> /
-        <code>{build['aicore_extra_cache_key']}</code></dd>
+      <dt>Profile / extra cache</dt><dd><code>{html.escape(build["profile"])}</code> /
+        <code>{build["aicore_extra_cache_key"]}</code></dd>
       <dt>Profiled cache key</dt><dd><code>{cache_key}</code></dd>
-      <dt>Source state</dt><dd><code>{build['source_state']}</code></dd>
-      <dt>Source-state stamp</dt><dd><code>{html.escape(build['source_state_path'])}</code></dd>
+      <dt>Source state</dt><dd><code>{build["source_state"]}</code></dd>
+      <dt>Source-state stamp</dt><dd><code>{html.escape(build["source_state_path"])}</code></dd>
       <dt>Compile definitions</dt><dd>{definitions}</dd>
     </dl>
     <div class="table-wrap"><table>
@@ -1677,7 +1780,7 @@ def _document(
     )
     charts = "".join(
         (
-            _chart_svg(capture.records, "scalar_submit_elapsed_ticks", "Scalar Submit time-denominator ticks/core"),
+            _chart_svg(capture.records, "scalar_submit_elapsed_ticks", "SYS gate boundary-diagnostic ticks/core"),
             _chart_svg(capture.records, "total_cycles", "PMU total cycles/core"),
             _chart_svg(capture.records, "scalar_busy", "Scalar busy cycles/core"),
             _chart_svg(capture.records, "icache_requests", "Primary I-cache requests/core"),
@@ -1688,8 +1791,9 @@ def _document(
     phase_overview = _phase_overview(capture)
     provenance_overview = _provenance_overview(provenance, provenance_sha256)
     shadow_note = (
-        "phase 模式的 shadow 是 begin/end/final 全部 running read-clear 返回值之和，只用于标记全窗 "
-        "capture gap，不作为第二份性能数据展示。"
+        "phase 模式的 I-cache shadow 是 begin/end/final 全部 running read-clear 返回值之和，"
+        "只用于标记全窗 capture gap；scalar shadow 同样用于核验 phase 读清重建，并显示其相对 "
+        "CNT2 primary 的 capture loss，不作为第二份性能数据展示。"
         if capture.phase_summary is not None
         else "none 模式不重复发布 shadow 原值；逐核 primary/shadow 同值由必选 status 闭环。"
     )
@@ -1760,9 +1864,9 @@ def _document(
     <div><span>受信记录</span><strong>96 / 96</strong><small>owner、selector、status、拓扑均通过</small></div>
     <div><span>raw SHA-256</span><code>{capture.raw_sha256}</code></div>
   </section>
-  <p class="notice"><strong>linked vector/cube Kernel 整段从 Scalar SYS 时间与 PMU counter
-    一并门控排除。</strong>result-used return-ready atomic 的依赖区间只从 Scalar SYS 时间分母
-    及命中的 phase 时间扣除，I-cache/PMU counter 仍包含其指令事件；source-issue atomic
+  <p class="notice"><strong>linked vector/cube Kernel 整段从 SYS gate 边界累计值与 PMU counter
+    一并门控排除。</strong>result-used return-ready atomic 的依赖区间只从 SYS gate 边界累计值
+    及命中的 phase SYS 边界诊断扣除，I-cache/PMU counter 仍包含其指令事件；source-issue atomic
     保留在时间和计数口径内。轮询和等待 flag 也仍是调度器实际开销。原始首末 SYS_CNT
     只证明窗口闭合，不参与时间占比；wall−scalar 是多种排除项与边界间隙的混合，不能称为纯 Kernel 时间。
     <strong>{miss_penalty_ns:.3f} ns 仅作 I-cache miss 的直觉量尺，不是 Submit 墙钟损失。</strong>
@@ -1780,7 +1884,7 @@ def _document(
   <div class="table-wrap"><table>
     <thead><tr>
       <th>Physical</th><th>Logical</th><th>Role</th><th>Block</th><th>Lane</th>
-      <th>Scalar 时间分母 µs</th><th>原始墙钟 µs</th>
+      <th>SYS gate 诊断 raw ticks</th><th>原始墙钟 µs</th>
       <th>Total cycles</th><th>Scalar busy</th><th>I$ request</th><th>I$ miss</th>
       <th>Miss rate</th><th>{miss_penalty_ns:g}ns量尺 µs</th>
     </tr></thead>
@@ -1948,9 +2052,7 @@ def write_report_with_provenance(
     capture = load_capture(input_path)
     output_file = Path(output_path) if output_path is not None else capture.input_path.with_name(DEFAULT_OUTPUT_NAME)
     provenance_file = (
-        Path(provenance_path)
-        if provenance_path is not None
-        else capture.input_path.with_name(DEFAULT_PROVENANCE_NAME)
+        Path(provenance_path) if provenance_path is not None else capture.input_path.with_name(DEFAULT_PROVENANCE_NAME)
     )
     if output_file.name != DEFAULT_OUTPUT_NAME:
         _fail(f"Submit-PMU output filename must be {DEFAULT_OUTPUT_NAME!r}")

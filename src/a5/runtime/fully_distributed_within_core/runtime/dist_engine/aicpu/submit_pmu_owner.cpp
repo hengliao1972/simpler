@@ -28,14 +28,16 @@ constexpr uint32_t kAicPerDie = 18U;
 constexpr uint32_t kDies = kFdwicSubmitPmuPhysicalSubcores / kPhysicalSubcoresPerDie;
 constexpr uint32_t kUnsetCore = UINT32_MAX;
 
-// submit-PMU 保留 CNT6/CNT7 作为不在窗口中途读取的权威计数，并用
-// CNT8/CNT5 复制同一 request/miss 事件。none 要求两组逐核精确相等；
-// running phase 则重建 shadow whole 并要求不超过 primary。
+// submit-PMU 保留 CNT2/CNT6/CNT7 作为不在窗口中途读取的权威计数，并用
+// CNT3/CNT8/CNT5 复制同一 scalar/request/miss 事件。none 要求副本与
+// primary 逐核精确相等；running phase 则重建 shadow whole 并要求不超过
+// primary。CNT3 原来的 MTE1 busy 没有进入 submit-PMU raw，因此替换它不会
+// 丢失既有对外指标。
 constexpr uint32_t kConfiguredSelectors[kCounterCount] = {
     0x501U,  // CNT0: vector busy
     0x301U,  // CNT1: cube busy
     0x001U,  // CNT2: scalar busy
-    0x701U,  // CNT3: MTE1 busy
+    0x001U,  // CNT3: shadow scalar busy
     0x202U,  // CNT4: MTE2 busy
     0x035U,  // CNT5: shadow I-cache miss
     0x034U,  // CNT6: primary I-cache request
@@ -45,6 +47,7 @@ constexpr uint32_t kConfiguredSelectors[kCounterCount] = {
 };
 
 static_assert(kConfiguredSelectors[2] == kFdwicSubmitPmuCnt2ScalarBusy, "CNT2 selector contract changed");
+static_assert(kConfiguredSelectors[3] == kFdwicSubmitPmuCnt3ShadowScalarBusy, "CNT3 shadow selector contract changed");
 static_assert(kConfiguredSelectors[5] == kFdwicSubmitPmuCnt5ShadowIcacheMiss, "CNT5 selector contract changed");
 static_assert(kConfiguredSelectors[6] == kFdwicSubmitPmuCnt6IcacheRequest, "CNT6 selector contract changed");
 static_assert(kConfiguredSelectors[7] == kFdwicSubmitPmuCnt7IcacheMiss, "CNT7 selector contract changed");
@@ -398,9 +401,9 @@ bool RestoreOwned(FdwicSubmitPmuHeader *header) {
 }
 
 bool HeaderConfigurationMatches(const FdwicSubmitPmuHeader &header) {
-    const uint32_t expected_selectors[5] = {
-        kFdwicSubmitPmuCnt2ScalarBusy, kFdwicSubmitPmuCnt5ShadowIcacheMiss,    kFdwicSubmitPmuCnt6IcacheRequest,
-        kFdwicSubmitPmuCnt7IcacheMiss, kFdwicSubmitPmuCnt8ShadowIcacheRequest,
+    const uint32_t expected_selectors[6] = {
+        kFdwicSubmitPmuCnt2ScalarBusy,    kFdwicSubmitPmuCnt3ShadowScalarBusy, kFdwicSubmitPmuCnt5ShadowIcacheMiss,
+        kFdwicSubmitPmuCnt6IcacheRequest, kFdwicSubmitPmuCnt7IcacheMiss,       kFdwicSubmitPmuCnt8ShadowIcacheRequest,
     };
     const bool mode_valid = header.mode == kFdwicSubmitPmuModeNone || fdwic_submit_pmu_mode_has_phase(header.mode);
     if (header.magic != kFdwicSubmitPmuMagic || header.version != kFdwicSubmitPmuVersion || !mode_valid ||
@@ -410,7 +413,7 @@ bool HeaderConfigurationMatches(const FdwicSubmitPmuHeader &header) {
         header.sys_cnt_freq_hz != PLATFORM_PROF_SYS_CNT_FREQ) {
         return false;
     }
-    for (uint32_t index = 0; index < 5U; ++index) {
+    for (uint32_t index = 0; index < 6U; ++index) {
         if (header.selectors[index] != expected_selectors[index]) return false;
     }
     return true;

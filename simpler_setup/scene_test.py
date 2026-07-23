@@ -344,10 +344,14 @@ def _assert_fdwic_submit_pmu_elf(binary: Path, profile: str) -> None:
     """Prove one submit-PMU image contains exactly its selected observer."""
     symbol_rows = _fdwic_elf_symbol_rows(binary)
 
-    phase_reader = "fdwic_submit_pmu_phase_read_shadow_counters"
+    phase_readers = (
+        "fdwic_submit_pmu_phase_read_shadow_counters",
+        "fdwic_submit_pmu_phase_read_scalar_shadow",
+        "fdwic_submit_pmu_phase_read_total_shadow",
+    )
     required = ["dist_submit_pmu_expect_submits", "fdwic_submit_pmu_read_counters"]
     if profile in _FDWIC_SUBMIT_PMU_PHASE_PROFILES:
-        required.append(phase_reader)
+        required.extend(phase_readers)
     forbidden = (
         "dist_perf_clock_expect_submits",
         "g_fdwic_perf_clock_",
@@ -367,7 +371,7 @@ def _assert_fdwic_submit_pmu_elf(binary: Path, profile: str) -> None:
         "pmu_aicore_record_task",
     )
     if profile == _FDWIC_PROFILE_SUBMIT_PMU_NONE:
-        forbidden = (*forbidden, phase_reader)
+        forbidden = (*forbidden, *phase_readers)
     missing = [
         symbol
         for symbol in required

@@ -761,11 +761,13 @@ def test_submit_pmu_elf_gate_accepts_only_whole_window_observer(monkeypatch, tmp
         "submit-pmu-loser-replay",
     ],
 )
-def test_submit_pmu_phase_elf_gate_requires_running_shadow_reader(monkeypatch, tmp_path, profile):
+def test_submit_pmu_phase_elf_gate_requires_all_running_phase_readers(monkeypatch, tmp_path, profile):
     symbol_table = (
         "10: 0000000000001000 64 FUNC WEAK DEFAULT 1 dist_submit_pmu_expect_submits\n"
         "11: 0000000000001040 96 FUNC LOCAL DEFAULT 1 fdwic_submit_pmu_read_counters\n"
         "12: 00000000000010a0 64 FUNC LOCAL DEFAULT 1 fdwic_submit_pmu_phase_read_shadow_counters\n"
+        "13: 00000000000010e0 64 FUNC LOCAL DEFAULT 1 fdwic_submit_pmu_phase_read_scalar_shadow\n"
+        "14: 0000000000001120 64 FUNC LOCAL DEFAULT 1 fdwic_submit_pmu_phase_read_total_shadow\n"
     )
     monkeypatch.setattr(
         _scene_test_module.subprocess,
@@ -839,10 +841,11 @@ def test_submit_pmu_elf_gate_rejects_incomplete_or_mixed_image(monkeypatch, tmp_
         "submit-pmu-loser-replay",
     ],
 )
-def test_submit_pmu_phase_elf_gate_rejects_missing_running_shadow_reader(monkeypatch, tmp_path, profile):
+def test_submit_pmu_phase_elf_gate_rejects_incomplete_running_phase_readers(monkeypatch, tmp_path, profile):
     symbol_table = (
         "10: 0000000000001000 64 FUNC WEAK DEFAULT 1 dist_submit_pmu_expect_submits\n"
         "11: 0000000000001040 96 FUNC LOCAL DEFAULT 1 fdwic_submit_pmu_read_counters\n"
+        "12: 00000000000010a0 64 FUNC LOCAL DEFAULT 1 fdwic_submit_pmu_phase_read_shadow_counters\n"
     )
     monkeypatch.setattr(
         _scene_test_module.subprocess,
@@ -852,6 +855,30 @@ def test_submit_pmu_phase_elf_gate_rejects_missing_running_shadow_reader(monkeyp
 
     with pytest.raises(RuntimeError, match="missing defined submit-pmu marker"):
         _assert_fdwic_submit_pmu_elf(tmp_path / "aicore_kernel.o", profile)
+
+
+@pytest.mark.parametrize(
+    "phase_reader",
+    (
+        "fdwic_submit_pmu_phase_read_shadow_counters",
+        "fdwic_submit_pmu_phase_read_scalar_shadow",
+        "fdwic_submit_pmu_phase_read_total_shadow",
+    ),
+)
+def test_submit_pmu_none_elf_gate_rejects_every_running_phase_reader(monkeypatch, tmp_path, phase_reader):
+    symbol_table = (
+        "10: 0000000000001000 64 FUNC WEAK DEFAULT 1 dist_submit_pmu_expect_submits\n"
+        "11: 0000000000001040 96 FUNC LOCAL DEFAULT 1 fdwic_submit_pmu_read_counters\n"
+        f"12: 00000000000010a0 64 FUNC LOCAL DEFAULT 1 {phase_reader}\n"
+    )
+    monkeypatch.setattr(
+        _scene_test_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=symbol_table, stderr=""),
+    )
+
+    with pytest.raises(RuntimeError, match=r"unrelated profiling symbol\(s\) still present"):
+        _assert_fdwic_submit_pmu_elf(tmp_path / "aicore_kernel.o", "submit-pmu-none")
 
 
 @pytest.mark.parametrize(
