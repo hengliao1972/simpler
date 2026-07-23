@@ -38,6 +38,20 @@
     .evidence-ratio strong,.evidence-ratio small { display:block; }
     .evidence-ratio small { color:var(--muted); }
     .evidence-na { color:var(--muted); text-align:center; }
+    .partition-total-row > th { white-space:normal; }
+    .partition-total-row strong,.partition-total-row small { display:block; }
+    .partition-total-row small { color:var(--muted); }
+    .partition-comparison-row > th { vertical-align:top; white-space:normal; min-width:185px; }
+    .partition-comparison-row > th small { display:block; color:var(--muted); font-weight:400; }
+    .partition-summary-grid {
+      display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:8px;
+    }
+    .partition-summary-metric {
+      min-width:0; padding:9px 10px; border:1px solid var(--line); border-radius:7px;
+      background:#f8fafc; white-space:normal;
+    }
+    .partition-summary-metric span,.partition-summary-metric small { display:block; color:var(--muted); }
+    .partition-summary-metric strong { display:block; margin:3px 0; overflow-wrap:anywhere; }
     .synthetic-chart { display:grid; gap:10px; margin:16px 0; }
     .synthetic-row {
       display:grid; grid-template-columns:150px minmax(220px,1fr) 92px 138px;
@@ -47,15 +61,19 @@
     .synthetic-row > strong { text-align:right; font-size:17px; }
     .synthetic-row > small { color:var(--muted); }
     .synthetic-track {
-      position:relative; height:20px; overflow:hidden; border-radius:5px;
+      position:relative; display:flex; height:20px; overflow:hidden; border-radius:5px;
       background:#e5e7eb;
     }
-    .synthetic-track b { display:block; height:100%; min-width:1px; }
+    .synthetic-track b { display:block; height:100%; min-width:0; }
+    .synthetic-track b.recording { background:#f59e0b; }
+    .synthetic-track b.reference { background:#2563eb; }
     .synthetic-track i {
       position:absolute; top:0; bottom:0; width:2px; background:#111827;
       box-shadow:0 0 0 1px #ffffffcc;
     }
     .synthetic-table { min-width:980px; }
+    .synthetic-table th,.synthetic-table td { white-space:normal; vertical-align:top; }
+    .synthetic-table td strong,.synthetic-table td small { display:block; }
     .phase-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,560px),1fr)); gap:14px; }
     .phase-card { margin:0; }
     .phase-card header { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }
@@ -83,8 +101,10 @@
   <div class="notice"><strong>这里有两条互不混算的证据链。</strong>
     泳道图的百分比只在同一个泳道 ELF 的排他时间树中相加；每个 Submit-PMU profile 都是独立 ELF，
     phase PMU total、Scalar busy、非 Scalar-busy 残余、request 和 miss 只能使用本 ELF 自己的分母。
-    不同 ELF 的绝对值不能相减，各 PMU 行的占比也不能相加成 100%。页面另设的“分段合计 vs none”
-    只是一项显式跨 ELF 合成诊断，用来观察插桩膨胀，不改变上述正式口径。</div>
+    不同 ELF 的绝对值不能直接相减，各 PMU 行的占比也不能相加成 100%。业务 phase 的主显示值
+    先从 raw observed 分子中扣除 empty-bracket 估算的局部记录代码开销，再除以本 ELF 的 raw whole；
+    raw observed / raw whole 同格保留。empty-bracket 没有测到 whole 窗口中的全部记录工作，因此这个
+    主显示值只是更接近业务量级的参考值，不是“纯业务阶段 / 纯业务整窗”的精确占比。</div>
 
   <section class="context">
     <h2>口径与来源</h2>
@@ -93,13 +113,15 @@
       <strong>4844.066 µs</strong>。</p>
     <p>SYS 边界诊断排除了 linked Vector/Cube Kernel 和 result-used return-ready atomic 的等待区间；
       PMU total、Scalar busy 与 primary I-cache 来自嵌在首末 Submit SYS closure 内且遇 linked Kernel
-      会暂停的 PMU gate，但 PMU counter 仍保留 atomic 指令及等待事件。阶段主时间使用 running read-clear PMU total；
-      Scalar busy 独立观测，非 Scalar-busy 残余逐核按 total−scalar 得到。SYS phase tick 只核验边界闭合。
-      PMU/I-cache counter 仍含 atomic 指令及观察代码事件，局部 observed
-      不是零插桩函数体的数学上下界。</p>
+      会暂停的 PMU gate，但 PMU counter 仍保留 atomic 指令及等待事件。阶段原始 PMU 观测使用
+      running read-clear total；Scalar busy 独立观测，非 Scalar-busy 残余逐核按 total−scalar 得到。
+      页面再用 empty-bracket 估算进入 phase 分子的局部记录代码并给出参考值；SYS phase tick 只核验
+      边界闭合。PMU/I-cache counter 仍含 atomic 指令及观察代码事件，局部 observed 不是零插桩
+      函数体的数学上下界。</p>
     <p>本批 PMU 来自 1 组 revision：<code>8c6b6e3a412d</code>；
-      mixed revisions 被如实保留，进一步禁止跨 ELF 数值运算。泳道 raw 没有 build provenance，
-      页面只证明 raw SHA 与 schema-v4 重算闭合，
+      每个业务 phase 与 empty-bracket 必须来自同一场景和同一 revision，才允许计算局部记录开销参考值；
+      其他跨 ELF 数值仍只作明示的数量级对照。泳道 raw 没有 build provenance，页面只证明 raw SHA
+      与 schema-v4 重算闭合，
       不伪称已证明当时 ELF 身份；泳道与 PMU 之间仅对齐 96 核拓扑和每核 Submit 数。</p>
   </section>
 
@@ -107,10 +129,13 @@
   <p class="notice">泳道分区展示原始业务 elapsed，不等同于纯 Scalar 时间。Kernel 是父 span 内的嵌套事件；
     当前 analyzer 能精确拆开 EfDrain 与 FinalDrain；其他 containment（本轮包括 WinnerBuild）只有事件数、
     没有独立 Kernel union 时长。因此纯 Scalar 归因只看下方相应 PMU control ELF，不从泳道父 span 猜减。</p>
-  <p class="fine">分区表新增的 PMU 与 scalar-busy 两列来自对应 phase 自己的独立 ELF：
-    分母分别是该 ELF 的 whole PMU total 与 whole scalar busy，并非泳道父区间，也不是
-    <code>submit-pmu-none</code>。各行不得相加；<code>control-only</code> 只代表排除 linked Kernel
-    后的控制路径；没有等价 phase 的行显示“—”。</p>
+  <p class="fine">分区表的 PMU 与 scalar 两列来自对应 phase 自己的独立 ELF。主值的分子是
+    “raw phase observed − 按 AIC/AIV 分别估算的局部记录代码开销”，分母仍是该 ELF 的 raw whole
+    PMU total 或 raw whole scalar；raw 比例作为次要信息保留。它们并非泳道父区间，也不是
+    <code>submit-pmu-none</code>，所以各行不得相加；<code>control-only</code> 只代表排除 linked
+    Kernel 后的控制路径；没有等价 phase 的行显示“—”。SubmitUnion 表专门改用每核均值：
+    时间列是平均每核时间，三个占比也分别由同口径的每核均值相除；表尾四层拆分只作跨 ELF
+    数量级诊断。</p>
 
       <div class="partition">
         <h3>SubmitEnvelope</h3>
@@ -121,10 +146,10 @@
               <th colspan="3">占比对照</th>
               <th rowspan="2">AIC 每核 min–max</th><th rowspan="2">AIV 每核 min–max</th></tr>
             <tr><th>泳道同父区间</th>
-              <th>PMU 占比<br><small>Phase PMU / 同 ELF whole PMU</small></th>
-              <th>Scalar-busy 占比<br><small>Phase scalar / 同 ELF whole scalar</small></th></tr>
+              <th>PMU 局部记录扣除参考<br><small>扣局部记录估算后的 Phase PMU / raw whole PMU；raw 比例同格保留</small></th>
+              <th>Scalar 局部记录扣除参考<br><small>扣局部记录估算后的 Phase scalar / raw whole scalar；raw 比例同格保留</small></th></tr>
           </thead>
-          <tbody><tr data-swimlane-metric="submit_union"><td><i style="background:#2563eb"></i><code>SubmitUnion</code></td><td>387,187.472 µs</td><td>85.384%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>3923.407–4019.264 µs</td><td>3988.838–4117.076 µs</td></tr><tr data-swimlane-metric="between_submit_residual" data-pmu-profile="submit-pmu-submit-transition" data-pmu-mapping="adjacent-submit-boundary"><td><i style="background:#0d9488"></i><code>BetweenSubmitResidual</code></td><td>66,278.926 µs</td><td>14.616%</td><td class="evidence-ratio" title="submit-pmu-submit-transition：314,497,428 / 875,104,857 = 35.938%"><strong>35.938%</strong><small>adjacent-submit-boundary</small></td><td class="evidence-ratio" title="submit-pmu-submit-transition：206,591,150 / 781,865,774 = 26.423%"><strong>26.423%</strong><small>adjacent-submit-boundary</small></td><td>555.018–639.839 µs</td><td>692.312–795.162 µs</td></tr></tbody>
+          <tbody><tr data-swimlane-metric="submit_union"><td><i style="background:#2563eb"></i><code>SubmitUnion</code></td><td>387,187.472 µs</td><td>85.384%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>3923.407–4019.264 µs</td><td>3988.838–4117.076 µs</td></tr><tr data-swimlane-metric="between_submit_residual" data-pmu-profile="submit-pmu-submit-transition" data-pmu-mapping="adjacent-submit-boundary" data-pmu-reference-share="13.982%" data-pmu-raw-share="35.938%" data-scalar-reference-share="10.595%" data-scalar-raw-share="26.423%"><td><i style="background:#0d9488"></i><code>BetweenSubmitResidual</code></td><td>66,278.926 µs</td><td>14.616%</td><td class="evidence-ratio" title="submit-pmu-submit-transition：参考 Σ 122,359,317.262 / raw whole 875,104,857.000 = 13.982%；raw Σ 314,497,428.000 / 875,104,857.000 = 35.938%"><strong>13.982%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 35.938% · 记录估算/raw 61.094%</small><small>中等依赖校准 · adjacent-submit-boundary</small></td><td class="evidence-ratio" title="submit-pmu-submit-transition：参考 Σ 82,841,966.639 / raw whole 781,865,774.000 = 10.595%；raw Σ 206,591,150.000 / 781,865,774.000 = 26.423%"><strong>10.595%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 26.423% · 记录估算/raw 59.901%</small><small>中等依赖校准 · adjacent-submit-boundary</small></td><td>555.018–639.839 µs</td><td>692.312–795.162 µs</td></tr></tbody>
         </table></div>
       </div>
 
@@ -134,14 +159,14 @@
         <div class="stack"><span style="width:16.18526257%;background:#2563eb" title="EfDrain 16.185%"></span><span style="width:25.32304661%;background:#0d9488" title="Materialize 25.323%"></span><span style="width:5.39356604%;background:#7c3aed" title="PrepareMap 5.394%"></span><span style="width:20.44218802%;background:#d97706" title="Claim 20.442%"></span><span style="width:0.39888713%;background:#dc2626" title="Fanin 0.399%"></span><span style="width:12.51725727%;background:#0891b2" title="Register 12.517%"></span><span style="width:1.66552057%;background:#65a30d" title="WinnerBuild 1.666%"></span><span style="width:0.21535821%;background:#2563eb" title="AllocComplete 0.215%"></span><span style="width:3.18095597%;background:#0d9488" title="LoserReplay 3.181%"></span><span style="width:10.85628747%;background:#7c3aed" title="SubmitInternalResidual 10.856%"></span><span style="width:3.82167014%;background:#d97706" title="SubmitTailResidual 3.822%"></span></div>
         <div class="table-wrap"><table>
           <thead>
-            <tr><th rowspan="2">区域</th><th rowspan="2">Σ core-time</th>
-              <th colspan="3">占比对照</th>
+            <tr><th rowspan="2">区域</th><th rowspan="2">平均每核时间</th>
+              <th colspan="3">均值占比对照</th>
               <th rowspan="2">AIC 每核 min–max</th><th rowspan="2">AIV 每核 min–max</th></tr>
-            <tr><th>泳道同父区间</th>
-              <th>PMU 占比<br><small>Phase PMU / 同 ELF whole PMU</small></th>
-              <th>Scalar-busy 占比<br><small>Phase scalar / 同 ELF whole scalar</small></th></tr>
+            <tr><th>泳道每核均值 / 同父区间每核均值</th>
+              <th>PMU 局部记录扣除参考<br><small>扣局部记录估算后的 Phase PMU 每核均值 / raw whole PMU 每核均值；raw 比例同格保留</small></th>
+              <th>Scalar 局部记录扣除参考<br><small>扣局部记录估算后的 Phase scalar 每核均值 / raw whole scalar 每核均值；raw 比例同格保留</small></th></tr>
           </thead>
-          <tbody><tr data-swimlane-metric="efdrain" data-pmu-profile="submit-pmu-efdrain-control" data-pmu-mapping="control-only"><td><i style="background:#2563eb"></i><code>EfDrain</code></td><td>62,667.309 µs</td><td>16.185%</td><td class="evidence-ratio" title="submit-pmu-efdrain-control：259,240,439 / 825,372,063 = 31.409%"><strong>31.409%</strong><small>control-only</small></td><td class="evidence-ratio" title="submit-pmu-efdrain-control：177,538,191 / 752,424,257 = 23.595%"><strong>23.595%</strong><small>control-only</small></td><td>829.745–1043.623 µs</td><td>421.651–599.408 µs</td></tr><tr data-swimlane-metric="materialize" data-pmu-profile="submit-pmu-materialize" data-pmu-mapping="same-business-boundary"><td><i style="background:#0d9488"></i><code>Materialize</code></td><td>98,047.664 µs</td><td>25.323%</td><td class="evidence-ratio" title="submit-pmu-materialize：368,349,615 / 860,121,776 = 42.825%"><strong>42.825%</strong><small>same-business-boundary</small></td><td class="evidence-ratio" title="submit-pmu-materialize：293,943,610 / 759,586,910 = 38.698%"><strong>38.698%</strong><small>same-business-boundary</small></td><td>982.441–1044.824 µs</td><td>1007.761–1079.123 µs</td></tr><tr data-swimlane-metric="prepare_map" data-pmu-profile="submit-pmu-prepare-map" data-pmu-mapping="same-business-boundary"><td><i style="background:#7c3aed"></i><code>PrepareMap</code></td><td>20,883.212 µs</td><td>5.394%</td><td class="evidence-ratio" title="submit-pmu-prepare-map：210,127,915 / 784,604,857 = 26.781%"><strong>26.781%</strong><small>same-business-boundary</small></td><td class="evidence-ratio" title="submit-pmu-prepare-map：144,019,418 / 733,380,676 = 19.638%"><strong>19.638%</strong><small>same-business-boundary</small></td><td>175.588–248.810 µs</td><td>203.320–302.751 µs</td></tr><tr data-swimlane-metric="claim" data-pmu-profile="submit-pmu-claim" data-pmu-mapping="same-business-boundary"><td><i style="background:#d97706"></i><code>Claim</code></td><td>79,149.591 µs</td><td>20.442%</td><td class="evidence-ratio" title="submit-pmu-claim：321,951,929 / 827,188,042 = 38.921%"><strong>38.921%</strong><small>same-business-boundary</small></td><td class="evidence-ratio" title="submit-pmu-claim：230,884,809 / 751,514,132 = 30.723%"><strong>30.723%</strong><small>same-business-boundary</small></td><td>540.557–586.652 µs</td><td>906.563–1005.941 µs</td></tr><tr data-swimlane-metric="fanin" data-pmu-profile="submit-pmu-fanin" data-pmu-mapping="same-business-boundary"><td><i style="background:#dc2626"></i><code>Fanin</code></td><td>1,544.441 µs</td><td>0.399%</td><td class="evidence-ratio" title="submit-pmu-fanin：3,508,426 / 652,647,623 = 0.538%"><strong>0.538%</strong><small>same-business-boundary</small></td><td class="evidence-ratio" title="submit-pmu-fanin：2,709,457 / 602,690,743 = 0.450%"><strong>0.450%</strong><small>same-business-boundary</small></td><td>15.964–21.094 µs</td><td>3.393–24.326 µs</td></tr><tr data-swimlane-metric="register" data-pmu-profile="submit-pmu-register" data-pmu-mapping="same-business-boundary"><td><i style="background:#0891b2"></i><code>Register</code></td><td>48,465.252 µs</td><td>12.517%</td><td class="evidence-ratio" title="submit-pmu-register：248,694,483 / 833,286,281 = 29.845%"><strong>29.845%</strong><small>same-business-boundary</small></td><td class="evidence-ratio" title="submit-pmu-register：168,184,052 / 743,680,705 = 22.615%"><strong>22.615%</strong><small>same-business-boundary</small></td><td>407.881–514.917 µs</td><td>468.701–570.286 µs</td></tr><tr data-swimlane-metric="winner_build" data-pmu-profile="submit-pmu-winner-build-control" data-pmu-mapping="control-only"><td><i style="background:#65a30d"></i><code>WinnerBuild</code></td><td>6,448.687 µs</td><td>1.666%</td><td class="evidence-ratio" title="submit-pmu-winner-build-control：62,476,937 / 831,511,201 = 7.514%"><strong>7.514%</strong><small>control-only</small></td><td class="evidence-ratio" title="submit-pmu-winner-build-control：61,009,092 / 792,528,440 = 7.698%"><strong>7.698%</strong><small>control-only</small></td><td>73.077–145.321 µs</td><td>36.526–74.041 µs</td></tr><tr data-swimlane-metric="alloc_complete" data-pmu-profile="submit-pmu-alloc-complete-control" data-pmu-mapping="control-only"><td><i style="background:#2563eb"></i><code>AllocComplete</code></td><td>833.840 µs</td><td>0.215%</td><td class="evidence-ratio" title="submit-pmu-alloc-complete-control：57,216,108 / 832,640,742 = 6.872%"><strong>6.872%</strong><small>control-only</small></td><td class="evidence-ratio" title="submit-pmu-alloc-complete-control：56,630,433 / 798,628,250 = 7.091%"><strong>7.091%</strong><small>control-only</small></td><td>4.807–69.631 µs</td><td>0.000–0.000 µs</td></tr><tr data-swimlane-metric="loser_replay" data-pmu-profile="submit-pmu-loser-replay" data-pmu-mapping="same-business-boundary"><td><i style="background:#0d9488"></i><code>LoserReplay</code></td><td>12,316.263 µs</td><td>3.181%</td><td class="evidence-ratio" title="submit-pmu-loser-replay：170,777,758 / 778,354,672 = 21.941%"><strong>21.941%</strong><small>same-business-boundary</small></td><td class="evidence-ratio" title="submit-pmu-loser-replay：114,439,566 / 702,902,051 = 16.281%"><strong>16.281%</strong><small>same-business-boundary</small></td><td>118.306–142.011 µs</td><td>117.838–141.241 µs</td></tr><tr data-swimlane-metric="submit_internal_residual"><td><i style="background:#7c3aed"></i><code>SubmitInternalResidual</code></td><td>42,034.185 µs</td><td>10.856%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>—</td><td>—</td></tr><tr data-swimlane-metric="submit_tail_residual"><td><i style="background:#d97706"></i><code>SubmitTailResidual</code></td><td>14,797.028 µs</td><td>3.822%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>—</td><td>—</td></tr></tbody>
+          <tbody><tr data-swimlane-metric="efdrain" data-pmu-profile="submit-pmu-efdrain-control" data-pmu-mapping="control-only" data-pmu-reference-share="7.924%" data-pmu-raw-share="31.409%" data-scalar-reference-share="7.002%" data-scalar-raw-share="23.595%"><td><i style="background:#2563eb"></i><code>EfDrain</code></td><td>652.784 µs</td><td title="652.784 / 4,033.203 = 16.185%">16.185%</td><td class="evidence-ratio" title="submit-pmu-efdrain-control：参考 每核均值 681,253.259 / raw whole 8,597,625.656 = 7.924%；raw 每核均值 2,700,421.240 / 8,597,625.656 = 31.409%"><strong>7.924%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 31.409% · 记录估算/raw 74.772%</small><small>较高依赖校准 · control-only</small></td><td class="evidence-ratio" title="submit-pmu-efdrain-control：参考 每核均值 548,828.981 / raw whole 7,837,752.677 = 7.002%；raw 每核均值 1,849,356.156 / 7,837,752.677 = 23.595%"><strong>7.002%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 23.595% · 记录估算/raw 70.323%</small><small>较高依赖校准 · control-only</small></td><td>829.745–1043.623 µs</td><td>421.651–599.408 µs</td></tr><tr data-swimlane-metric="materialize" data-pmu-profile="submit-pmu-materialize" data-pmu-mapping="same-business-boundary" data-pmu-reference-share="20.469%" data-pmu-raw-share="42.825%" data-scalar-reference-share="22.393%" data-scalar-raw-share="38.698%"><td><i style="background:#0d9488"></i><code>Materialize</code></td><td>1,021.330 µs</td><td title="1,021.330 / 4,033.203 = 25.323%">25.323%</td><td class="evidence-ratio" title="submit-pmu-materialize：参考 每核均值 1,833,971.656 / raw whole 8,959,601.833 = 20.469%；raw 每核均值 3,836,975.156 / 8,959,601.833 = 42.825%"><strong>20.469%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 42.825% · 记录估算/raw 52.203%</small><small>中等依赖校准 · same-business-boundary</small></td><td class="evidence-ratio" title="submit-pmu-materialize：参考 每核均值 1,771,850.750 / raw whole 7,912,363.646 = 22.393%；raw 每核均值 3,061,912.604 / 7,912,363.646 = 38.698%"><strong>22.393%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 38.698% · 记录估算/raw 42.133%</small><small>中等依赖校准 · same-business-boundary</small></td><td>982.441–1044.824 µs</td><td>1007.761–1079.123 µs</td></tr><tr data-swimlane-metric="prepare_map" data-pmu-profile="submit-pmu-prepare-map" data-pmu-mapping="same-business-boundary" data-pmu-reference-share="2.274%" data-pmu-raw-share="26.781%" data-scalar-reference-share="2.751%" data-scalar-raw-share="19.638%"><td><i style="background:#7c3aed"></i><code>PrepareMap</code></td><td>217.533 µs</td><td title="217.533 / 4,033.203 = 5.394%">5.394%</td><td class="evidence-ratio" title="submit-pmu-prepare-map：参考 每核均值 185,828.948 / raw whole 8,172,967.260 = 2.274%；raw 每核均值 2,188,832.448 / 8,172,967.260 = 26.781%"><strong>2.274%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 26.781% · 记录估算/raw 91.510%</small><small>高度依赖校准 · same-business-boundary</small></td><td class="evidence-ratio" title="submit-pmu-prepare-map：参考 每核均值 210,140.417 / raw whole 7,639,382.042 = 2.751%；raw 每核均值 1,500,202.271 / 7,639,382.042 = 19.638%"><strong>2.751%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 19.638% · 记录估算/raw 85.993%</small><small>高度依赖校准 · same-business-boundary</small></td><td>175.588–248.810 µs</td><td>203.320–302.751 µs</td></tr><tr data-swimlane-metric="claim" data-pmu-profile="submit-pmu-claim" data-pmu-mapping="same-business-boundary" data-pmu-reference-share="15.675%" data-pmu-raw-share="38.921%" data-scalar-reference-share="14.243%" data-scalar-raw-share="30.723%"><td><i style="background:#d97706"></i><code>Claim</code></td><td>824.475 µs</td><td title="824.475 / 4,033.203 = 20.442%">20.442%</td><td class="evidence-ratio" title="submit-pmu-claim：参考 每核均值 1,350,662.427 / raw whole 8,616,542.104 = 15.675%；raw 每核均值 3,353,665.927 / 8,616,542.104 = 38.921%"><strong>15.675%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 38.921% · 记录估算/raw 59.726%</small><small>中等依赖校准 · same-business-boundary</small></td><td class="evidence-ratio" title="submit-pmu-claim：参考 每核均值 1,114,988.240 / raw whole 7,828,272.208 = 14.243%；raw 每核均值 2,405,050.094 / 7,828,272.208 = 30.723%"><strong>14.243%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 30.723% · 记录估算/raw 53.640%</small><small>中等依赖校准 · same-business-boundary</small></td><td>540.557–586.652 µs</td><td>906.563–1005.941 µs</td></tr><tr data-swimlane-metric="fanin" data-pmu-profile="submit-pmu-fanin" data-pmu-mapping="same-business-boundary" data-pmu-reference-share="0.295%" data-pmu-raw-share="0.538%" data-scalar-reference-share="0.280%" data-scalar-raw-share="0.450%"><td><i style="background:#dc2626"></i><code>Fanin</code></td><td>16.088 µs</td><td title="16.088 / 4,033.203 = 0.399%">0.399%</td><td class="evidence-ratio" title="submit-pmu-fanin：参考 每核均值 20,067.254 / raw whole 6,798,412.740 = 0.295%；raw 每核均值 36,546.104 / 6,798,412.740 = 0.538%"><strong>0.295%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 0.538% · 记录估算/raw 45.091%</small><small>中等依赖校准 · same-business-boundary</small></td><td class="evidence-ratio" title="submit-pmu-fanin：参考 每核均值 17,552.570 / raw whole 6,278,028.573 = 0.280%；raw 每核均值 28,223.510 / 6,278,028.573 = 0.450%"><strong>0.280%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 0.450% · 记录估算/raw 37.809%</small><small>较低依赖校准 · same-business-boundary</small></td><td>15.964–21.094 µs</td><td>3.393–24.326 µs</td></tr><tr data-swimlane-metric="register" data-pmu-profile="submit-pmu-register" data-pmu-mapping="same-business-boundary" data-pmu-reference-share="6.769%" data-pmu-raw-share="29.845%" data-scalar-reference-share="5.962%" data-scalar-raw-share="22.615%"><td><i style="background:#0891b2"></i><code>Register</code></td><td>504.846 µs</td><td title="504.846 / 4,033.203 = 12.517%">12.517%</td><td class="evidence-ratio" title="submit-pmu-register：参考 每核均值 587,564.031 / raw whole 8,680,065.427 = 6.769%；raw 每核均值 2,590,567.531 / 8,680,065.427 = 29.845%"><strong>6.769%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 29.845% · 记录估算/raw 77.319%</small><small>较高依赖校准 · same-business-boundary</small></td><td class="evidence-ratio" title="submit-pmu-register：参考 每核均值 461,855.354 / raw whole 7,746,674.010 = 5.962%；raw 每核均值 1,751,917.208 / 7,746,674.010 = 22.615%"><strong>5.962%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 22.615% · 记录估算/raw 73.637%</small><small>较高依赖校准 · same-business-boundary</small></td><td>407.881–514.917 µs</td><td>468.701–570.286 µs</td></tr><tr data-swimlane-metric="winner_build" data-pmu-profile="submit-pmu-winner-build-control" data-pmu-mapping="control-only" data-pmu-reference-share="7.295%" data-pmu-raw-share="7.514%" data-scalar-reference-share="7.549%" data-scalar-raw-share="7.698%"><td><i style="background:#65a30d"></i><code>WinnerBuild</code></td><td>67.174 µs</td><td title="67.174 / 4,033.203 = 1.666%">1.666%</td><td class="evidence-ratio" title="submit-pmu-winner-build-control：参考 每核均值 631,858.534 / raw whole 8,661,575.010 = 7.295%；raw 每核均值 650,801.427 / 8,661,575.010 = 7.514%"><strong>7.295%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 7.514% · 记录估算/raw 2.911%</small><small>较低依赖校准 · control-only</small></td><td class="evidence-ratio" title="submit-pmu-winner-build-control：参考 每核均值 623,245.347 / raw whole 8,255,504.583 = 7.549%；raw 每核均值 635,511.375 / 8,255,504.583 = 7.698%"><strong>7.549%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 7.698% · 记录估算/raw 1.930%</small><small>较低依赖校准 · control-only</small></td><td>73.077–145.321 µs</td><td>36.526–74.041 µs</td></tr><tr data-swimlane-metric="alloc_complete" data-pmu-profile="submit-pmu-alloc-complete-control" data-pmu-mapping="control-only" data-pmu-reference-share="6.824%" data-pmu-raw-share="6.872%" data-scalar-reference-share="7.059%" data-scalar-raw-share="7.091%"><td><i style="background:#2563eb"></i><code>AllocComplete</code></td><td>8.686 µs</td><td title="8.686 / 4,033.203 = 0.215%">0.215%</td><td class="evidence-ratio" title="submit-pmu-alloc-complete-control：参考 每核均值 591,841.504 / raw whole 8,673,341.062 = 6.824%；raw 每核均值 596,001.125 / 8,673,341.062 = 6.872%"><strong>6.824%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 6.872% · 记录估算/raw 0.698%</small><small>较低依赖校准 · control-only</small></td><td class="evidence-ratio" title="submit-pmu-alloc-complete-control：参考 每核均值 587,217.688 / raw whole 8,319,044.271 = 7.059%；raw 每核均值 589,900.344 / 8,319,044.271 = 7.091%"><strong>7.059%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 7.091% · 记录估算/raw 0.455%</small><small>较低依赖校准 · control-only</small></td><td>4.807–69.631 µs</td><td>0.000–0.000 µs</td></tr><tr data-swimlane-metric="loser_replay" data-pmu-profile="submit-pmu-loser-replay" data-pmu-mapping="same-business-boundary" data-pmu-reference-share="2.381%" data-pmu-raw-share="21.941%" data-scalar-reference-share="2.331%" data-scalar-raw-share="16.281%"><td><i style="background:#0d9488"></i><code>LoserReplay</code></td><td>128.294 µs</td><td title="128.294 / 4,033.203 = 3.181%">3.181%</td><td class="evidence-ratio" title="submit-pmu-loser-replay：参考 每核均值 193,011.029 / raw whole 8,107,861.167 = 2.381%；raw 每核均值 1,778,934.979 / 8,107,861.167 = 21.941%"><strong>2.381%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 21.941% · 记录估算/raw 89.150%</small><small>高度依赖校准 · same-business-boundary</small></td><td class="evidence-ratio" title="submit-pmu-loser-replay：参考 每核均值 170,700.270 / raw whole 7,321,896.365 = 2.331%；raw 每核均值 1,192,078.812 / 7,321,896.365 = 16.281%"><strong>2.331%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 16.281% · 记录估算/raw 85.680%</small><small>高度依赖校准 · same-business-boundary</small></td><td>118.306–142.011 µs</td><td>117.838–141.241 µs</td></tr><tr data-swimlane-metric="submit_internal_residual"><td><i style="background:#7c3aed"></i><code>SubmitInternalResidual</code></td><td>437.856 µs</td><td title="437.856 / 4,033.203 = 10.856%">10.856%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>—</td><td>—</td></tr><tr data-swimlane-metric="submit_tail_residual"><td><i style="background:#d97706"></i><code>SubmitTailResidual</code></td><td>154.136 µs</td><td title="154.136 / 4,033.203 = 3.822%">3.822%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>—</td><td>—</td></tr><tr class="partition-total-row" data-partition-total="per-core-mean"><th>SubmitUnion 平均每核时间合计</th><td><strong>4,033.203 µs</strong><small>11 个分段每核均值之和</small></td><td><strong>100.000%</strong></td><td colspan="4"><span class="fine">同一泳道 ELF 的严格分区闭合；不与下方独立 PMU ELF 的时间直接相减。</span></td></tr><tr class="partition-comparison-row" data-partition-comparison="mapped-phase-mean-sum" data-phase-profile-count="10"><th>原始分段观测合计<small>10 个独立 phase ELF</small></th><td colspan="6"><div class="partition-summary-grid"><div class="partition-summary-metric"><span>取数范围</span><strong>10 个 phase 每核均值之和</strong><small>9 个直接表格行 + ArgBuild 精确子段</small><small>SubmitTransition 位于 SubmitUnion 外，不进入分子</small></div><div class="partition-summary-metric"><span>PMU total raw observed</span><strong>20,402,206.302 cycles/core</strong><small>按 1.649844 cycles/ns：≈ 12,366.143 µs/core</small><small>raw / none：210.132%</small><small>AIC 202.220% · AIV 213.948%</small></div><div class="partition-summary-metric"><span>Scalar busy raw observed</span><strong>14,794,127.906 cycles/core</strong><small>按 1.649844 cycles/ns：≈ 8,966.986 µs/core</small><small>raw / none：156.398%</small><small>AIC 152.913% · AIV 158.133%</small></div><div class="partition-summary-metric"><span>非 Scalar-busy 残余 raw observed</span><strong>5,608,078.396 cycles/core</strong><small>按 1.649844 cycles/ns：≈ 3,399.157 µs/core</small><small>raw / none：2243.804%</small><small>AIC 11294.549% · AIV 1707.616%</small></div><div class="partition-summary-metric"><span>I-cache request raw observed</span><strong>1,231,663.781 events/core</strong><small>raw / none：170.918%</small><small>AIC 176.247% · AIV 168.347%</small></div><div class="partition-summary-metric"><span>I-cache miss raw observed</span><strong>35,614.781 events/core</strong><small>raw / none：437.029%</small><small>AIC 1108.084% · AIV 416.649%</small></div></div><p class="fine">合计 9 个直接映射行和 ArgBuild 的 Claim→Materialize 精确子段；SubmitInternalResidual、SubmitTailResidual 的其余 residual 不进入分子。raw 含分段记录代码自身开销，不能直接拿来解释业务耗时。</p></td></tr><tr class="partition-comparison-row" data-partition-comparison="recording-cost-estimate"><th>空区间估算的记录代码开销<small>按 AIC/AIV 分开缩放后加权</small></th><td colspan="6"><div class="partition-summary-grid"><div class="partition-summary-metric"><span>估算方法</span><strong>空区间每次记录开销 × 本组记录次数</strong><small>ALL 8,729.385 组/core · AIC 8,740.844 · AIV 8,723.656</small><small>linked Kernel pause/resume 产生的额外记录也已计入</small></div><div class="partition-summary-metric"><span>PMU total 记录开销估算</span><strong>13,659,690.794 cycles/core</strong><small>按 1.649844 cycles/ns：≈ 8,279.383 µs/core</small><small>占 raw：66.952%；相对 none：140.688%</small><small>AIC 67.738% · AIV 66.594%</small></div><div class="partition-summary-metric"><span>Scalar busy 记录开销估算</span><strong>8,797,834.613 cycles/core</strong><small>按 1.649844 cycles/ns：≈ 5,332.525 µs/core</small><small>占 raw：59.468%；相对 none：93.007%</small><small>AIC 59.259% · AIV 59.569%</small></div><div class="partition-summary-metric"><span>非 Scalar-busy 残余 记录开销估算</span><strong>4,861,856.181 cycles/core</strong><small>按 1.649844 cycles/ns：≈ 2,946.858 µs/core</small><small>占 raw：86.694%；相对 none：1945.239%</small><small>AIC 93.565% · AIV 84.001%</small></div><div class="partition-summary-metric"><span>I-cache request 记录开销估算</span><strong>488,007.644 events/core</strong><small>占 raw：39.622%；相对 none：67.721%</small><small>AIC 38.243% · AIV 40.318%</small></div><div class="partition-summary-metric"><span>I-cache miss 记录开销估算</span><strong>16,674.260 events/core</strong><small>占 raw：46.818%；相对 none：204.610%</small><small>AIC 6.652% · AIV 50.063%</small></div></div><p class="fine">empty-bracket 只在固定调用点测量一对紧邻 begin/end；这里按每个 phase 实际 begin/end 记录组数缩放。调用点、I-cache 布局和运行轮次不同，所以只能作为估算。</p></td></tr><tr class="partition-comparison-row" data-partition-comparison="after-recording-cost-reference"><th>扣除上述估算后的参考值<small>raw − 记录开销估算</small></th><td colspan="6"><div class="partition-summary-grid"><div class="partition-summary-metric"><span>参考值口径</span><strong>原始观测 − 上述记录开销估算</strong><small>允许为负；负值表示估算或运行波动已超过 raw</small><small>它不是“真实业务值”，也不是精确校正结果</small></div><div class="partition-summary-metric"><span>PMU total 扣除后参考值</span><strong>6,742,515.508 cycles/core</strong><small>按 1.649844 cycles/ns：≈ 4,086.759 µs/core</small><small>参考值 / none：69.444%</small><small>AIC 65.239% · AIV 71.472%</small></div><div class="partition-summary-metric"><span>Scalar busy 扣除后参考值</span><strong>5,996,293.293 cycles/core</strong><small>按 1.649844 cycles/ns：≈ 3,634.461 µs/core</small><small>参考值 / none：63.391%</small><small>AIC 62.299% · AIV 63.934%</small></div><div class="partition-summary-metric"><span>非 Scalar-busy 残余 扣除后参考值</span><strong>746,222.215 cycles/core</strong><small>按 1.649844 cycles/ns：≈ 452.299 µs/core</small><small>参考值 / none：298.565%</small><small>AIC 726.815% · AIV 273.195%</small></div><div class="partition-summary-metric"><span>I-cache request 扣除后参考值</span><strong>743,656.138 events/core</strong><small>参考值 / none：103.197%</small><small>AIC 108.844% · AIV 100.473%</small></div><div class="partition-summary-metric"><span>I-cache miss 扣除后参考值</span><strong>18,940.522 events/core</strong><small>参考值 / none：232.419%</small><small>AIC 1034.373% · AIV 208.064%</small></div></div><p class="fine">该行用于判断此前 PMU/Scalar 合计膨胀主要来自哪里；它不是同一 ELF 的闭合，不能当成已精确恢复的业务值。</p></td></tr><tr class="partition-comparison-row" data-partition-comparison="submit-pmu-none-mean"><th><code>submit-pmu-none</code><small>每核均值对照</small></th><td colspan="6"><div class="partition-summary-grid"><div class="partition-summary-metric"><span>对照范围</span><strong>首个 Submit begin → 末个 Submit end</strong><small>包含 BetweenSubmitResidual / SubmitTransition</small><small>独立 ELF；不是与分子完全同范围的一次闭合</small></div><div class="partition-summary-metric"><span>PMU total 每核均值</span><strong>9,709,219.854 cycles/core</strong><small>按 1.649844 cycles/ns：≈ 5,884.932 µs/core</small><small>对照基准：100%</small><small>AIC 9,476,082.219 cycles/core · AIV 9,825,788.672 cycles/core</small></div><div class="partition-summary-metric"><span>Scalar busy 每核均值</span><strong>9,459,283.625 cycles/core</strong><small>按 1.649844 cycles/ns：≈ 5,733.441 µs/core</small><small>对照基准：100%</small><small>AIC 9,434,146.188 cycles/core · AIV 9,471,852.344 cycles/core</small></div><div class="partition-summary-metric"><span>非 Scalar-busy 残余 每核均值</span><strong>249,936.229 cycles/core</strong><small>按 1.649844 cycles/ns：≈ 151.491 µs/core</small><small>对照基准：100%</small><small>AIC 41,936.031 cycles/core · AIV 353,936.328 cycles/core</small></div><div class="partition-summary-metric"><span>I-cache request 每核均值</span><strong>720,615.750 events/core</strong><small>对照基准：100%</small><small>AIC 703,537.906 events/core · AIV 729,154.672 events/core</small></div><div class="partition-summary-metric"><span>I-cache miss 每核均值</span><strong>8,149.302 events/core</strong><small>对照基准：100%</small><small>AIC 720.594 events/core · AIV 11,863.656 events/core</small></div></div></td></tr></tbody>
         </table></div>
       </div>
 
@@ -155,10 +180,10 @@
               <th colspan="3">占比对照</th>
               <th rowspan="2">AIC 每核 min–max</th><th rowspan="2">AIV 每核 min–max</th></tr>
             <tr><th>泳道同父区间</th>
-              <th>PMU 占比<br><small>Phase PMU / 同 ELF whole PMU</small></th>
-              <th>Scalar-busy 占比<br><small>Phase scalar / 同 ELF whole scalar</small></th></tr>
+              <th>PMU 局部记录扣除参考<br><small>扣局部记录估算后的 Phase PMU / raw whole PMU；raw 比例同格保留</small></th>
+              <th>Scalar 局部记录扣除参考<br><small>扣局部记录估算后的 Phase scalar / raw whole scalar；raw 比例同格保留</small></th></tr>
           </thead>
-          <tbody><tr data-swimlane-metric="efdrain_kernel_union"><td><i style="background:#2563eb"></i><code>EfDrainKernelUnion</code></td><td>32,086.895 µs</td><td>51.202%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>367.195–710.148 µs</td><td>113.969–326.572 µs</td></tr><tr data-swimlane-metric="efdrain_control" data-pmu-profile="submit-pmu-efdrain-control" data-pmu-mapping="control-only"><td><i style="background:#0d9488"></i><code>EfDrainControl</code></td><td>30,580.414 µs</td><td>48.798%</td><td class="evidence-ratio" title="submit-pmu-efdrain-control：259,240,439 / 825,372,063 = 31.409%"><strong>31.409%</strong><small>control-only</small></td><td class="evidence-ratio" title="submit-pmu-efdrain-control：177,538,191 / 752,424,257 = 23.595%"><strong>23.595%</strong><small>control-only</small></td><td>295.582–474.451 µs</td><td>210.889–361.879 µs</td></tr></tbody>
+          <tbody><tr data-swimlane-metric="efdrain_kernel_union"><td><i style="background:#2563eb"></i><code>EfDrainKernelUnion</code></td><td>32,086.895 µs</td><td>51.202%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>367.195–710.148 µs</td><td>113.969–326.572 µs</td></tr><tr data-swimlane-metric="efdrain_control" data-pmu-profile="submit-pmu-efdrain-control" data-pmu-mapping="control-only" data-pmu-reference-share="7.924%" data-pmu-raw-share="31.409%" data-scalar-reference-share="7.002%" data-scalar-raw-share="23.595%"><td><i style="background:#0d9488"></i><code>EfDrainControl</code></td><td>30,580.414 µs</td><td>48.798%</td><td class="evidence-ratio" title="submit-pmu-efdrain-control：参考 Σ 65,400,312.871 / raw whole 825,372,063.000 = 7.924%；raw Σ 259,240,439.000 / 825,372,063.000 = 31.409%"><strong>7.924%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 31.409% · 记录估算/raw 74.772%</small><small>较高依赖校准 · control-only</small></td><td class="evidence-ratio" title="submit-pmu-efdrain-control：参考 Σ 52,687,582.172 / raw whole 752,424,257.000 = 7.002%；raw Σ 177,538,191.000 / 752,424,257.000 = 23.595%"><strong>7.002%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 23.595% · 记录估算/raw 70.323%</small><small>较高依赖校准 · control-only</small></td><td>295.582–474.451 µs</td><td>210.889–361.879 µs</td></tr></tbody>
         </table></div>
       </div>
 
@@ -174,8 +199,8 @@
               <th colspan="3">占比对照</th>
               <th rowspan="2">AIC 每核 min–max</th><th rowspan="2">AIV 每核 min–max</th></tr>
             <tr><th>泳道同父区间</th>
-              <th>PMU 占比<br><small>Phase PMU / 同 ELF whole PMU</small></th>
-              <th>Scalar-busy 占比<br><small>Phase scalar / 同 ELF whole scalar</small></th></tr>
+              <th>PMU 局部记录扣除参考<br><small>扣局部记录估算后的 Phase PMU / raw whole PMU；raw 比例同格保留</small></th>
+              <th>Scalar 局部记录扣除参考<br><small>扣局部记录估算后的 Phase scalar / raw whole scalar；raw 比例同格保留</small></th></tr>
           </thead>
           <tbody><tr data-swimlane-metric="orchestration_replay"><td><i style="background:#2563eb"></i><code>OrchestrationReplay</code></td><td>454,607.852 µs</td><td>99.345%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>4556.667–4620.691 µs</td><td>4778.712–4852.567 µs</td></tr><tr data-swimlane-metric="final_drain"><td><i style="background:#0d9488"></i><code>FinalDrain</code></td><td>2,996.943 µs</td><td>0.655%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>5.249–301.052 µs</td><td>2.535–81.451 µs</td></tr></tbody>
         </table></div>
@@ -191,10 +216,10 @@
               <th colspan="3">占比对照</th>
               <th rowspan="2">AIC 每核 min–max</th><th rowspan="2">AIV 每核 min–max</th></tr>
             <tr><th>泳道同父区间</th>
-              <th>PMU 占比<br><small>Phase PMU / 同 ELF whole PMU</small></th>
-              <th>Scalar-busy 占比<br><small>Phase scalar / 同 ELF whole scalar</small></th></tr>
+              <th>PMU 局部记录扣除参考<br><small>扣局部记录估算后的 Phase PMU / raw whole PMU；raw 比例同格保留</small></th>
+              <th>Scalar 局部记录扣除参考<br><small>扣局部记录估算后的 Phase scalar / raw whole scalar；raw 比例同格保留</small></th></tr>
           </thead>
-          <tbody><tr data-swimlane-metric="orchestration_setup"><td><i style="background:#2563eb"></i><code>OrchestrationSetup</code></td><td>1,062.557 µs</td><td>0.234%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>10.035–13.323 µs</td><td>10.151–13.400 µs</td></tr><tr data-swimlane-metric="submit_union"><td><i style="background:#0d9488"></i><code>SubmitUnion</code></td><td>387,187.472 µs</td><td>85.170%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>3923.407–4019.264 µs</td><td>3988.838–4117.076 µs</td></tr><tr data-swimlane-metric="between_submit_residual" data-pmu-profile="submit-pmu-submit-transition" data-pmu-mapping="adjacent-submit-boundary"><td><i style="background:#7c3aed"></i><code>BetweenSubmitResidual</code></td><td>66,278.926 µs</td><td>14.579%</td><td class="evidence-ratio" title="submit-pmu-submit-transition：314,497,428 / 875,104,857 = 35.938%"><strong>35.938%</strong><small>adjacent-submit-boundary</small></td><td class="evidence-ratio" title="submit-pmu-submit-transition：206,591,150 / 781,865,774 = 26.423%"><strong>26.423%</strong><small>adjacent-submit-boundary</small></td><td>555.018–639.839 µs</td><td>692.312–795.162 µs</td></tr><tr data-swimlane-metric="orchestration_tail"><td><i style="background:#d97706"></i><code>OrchestrationTail</code></td><td>78.897 µs</td><td>0.017%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>0.437–1.079 µs</td><td>0.671–1.167 µs</td></tr></tbody>
+          <tbody><tr data-swimlane-metric="orchestration_setup"><td><i style="background:#2563eb"></i><code>OrchestrationSetup</code></td><td>1,062.557 µs</td><td>0.234%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>10.035–13.323 µs</td><td>10.151–13.400 µs</td></tr><tr data-swimlane-metric="submit_union"><td><i style="background:#0d9488"></i><code>SubmitUnion</code></td><td>387,187.472 µs</td><td>85.170%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>3923.407–4019.264 µs</td><td>3988.838–4117.076 µs</td></tr><tr data-swimlane-metric="between_submit_residual" data-pmu-profile="submit-pmu-submit-transition" data-pmu-mapping="adjacent-submit-boundary" data-pmu-reference-share="13.982%" data-pmu-raw-share="35.938%" data-scalar-reference-share="10.595%" data-scalar-raw-share="26.423%"><td><i style="background:#7c3aed"></i><code>BetweenSubmitResidual</code></td><td>66,278.926 µs</td><td>14.579%</td><td class="evidence-ratio" title="submit-pmu-submit-transition：参考 Σ 122,359,317.262 / raw whole 875,104,857.000 = 13.982%；raw Σ 314,497,428.000 / 875,104,857.000 = 35.938%"><strong>13.982%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 35.938% · 记录估算/raw 61.094%</small><small>中等依赖校准 · adjacent-submit-boundary</small></td><td class="evidence-ratio" title="submit-pmu-submit-transition：参考 Σ 82,841,966.639 / raw whole 781,865,774.000 = 10.595%；raw Σ 206,591,150.000 / 781,865,774.000 = 26.423%"><strong>10.595%</strong><small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small><small>raw 26.423% · 记录估算/raw 59.901%</small><small>中等依赖校准 · adjacent-submit-boundary</small></td><td>555.018–639.839 µs</td><td>692.312–795.162 µs</td></tr><tr data-swimlane-metric="orchestration_tail"><td><i style="background:#d97706"></i><code>OrchestrationTail</code></td><td>78.897 µs</td><td>0.017%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>0.437–1.079 µs</td><td>0.671–1.167 µs</td></tr></tbody>
         </table></div>
       </div>
 
@@ -208,8 +233,8 @@
               <th colspan="3">占比对照</th>
               <th rowspan="2">AIC 每核 min–max</th><th rowspan="2">AIV 每核 min–max</th></tr>
             <tr><th>泳道同父区间</th>
-              <th>PMU 占比<br><small>Phase PMU / 同 ELF whole PMU</small></th>
-              <th>Scalar-busy 占比<br><small>Phase scalar / 同 ELF whole scalar</small></th></tr>
+              <th>PMU 局部记录扣除参考<br><small>扣局部记录估算后的 Phase PMU / raw whole PMU；raw 比例同格保留</small></th>
+              <th>Scalar 局部记录扣除参考<br><small>扣局部记录估算后的 Phase scalar / raw whole scalar；raw 比例同格保留</small></th></tr>
           </thead>
           <tbody><tr data-swimlane-metric="final_drain_kernel_union"><td><i style="background:#2563eb"></i><code>FinalDrainKernelUnion</code></td><td>461.382 µs</td><td>15.395%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>0.000–57.395 µs</td><td>0.000–3.029 µs</td></tr><tr data-swimlane-metric="final_drain_residual"><td><i style="background:#0d9488"></i><code>FinalDrainResidual</code></td><td>2,535.561 µs</td><td>84.605%</td><td class="evidence-ratio evidence-na">—</td><td class="evidence-ratio evidence-na">—</td><td>5.249–274.069 µs</td><td>2.535–78.641 µs</td></tr></tbody>
         </table></div>
@@ -293,28 +318,35 @@
 
 
   <section class="context synthetic-diagnostic">
-    <h2>11 个业务分段合计 vs <code>submit-pmu-none</code></h2>
-    <p class="notice"><strong>这是跨 ELF 合成诊断比，不是一次运行的正式分区闭合，也不是净性能开销。</strong>
-      分子把 11 个业务 phase 各自独立 ELF 的 observed 指标求和，分母取
-      <code>submit-pmu-none</code> 的 whole 指标；empty-bracket 不参与。大于 100% 可以直观看到
-      分段插桩形成的观测膨胀，但“偏离 100%”还混有每段观察器成本、独立 ELF 布局、覆盖缺口或重叠、
-      多轮波动及 control-only 口径，不能直接解释为可消除的墙钟损失。</p>
-    <p class="fine">下图统一使用 0–600% 横轴，竖线为 100%；超过 600% 的项目只在图形上封顶，
-      表格始终保留精确比值。I-cache 分子使用 phase observed，分母使用 none primary。</p>
-    <div class="synthetic-chart"><div class="synthetic-row"><span>PMU total</span><div class="synthetic-track" title="PMU total：2,273,109,233 / 932,085,106 = 243.874%"><b style="width:40.645595%;background:#2563eb"></b><i style="left:16.666667%"></i></div><strong>243.874%</strong><small>偏离 100%：+143.874%</small></div><div class="synthetic-row"><span>Scalar busy</span><div class="synthetic-track" title="Scalar busy：1,626,827,429 / 908,091,228 = 179.148%"><b style="width:29.858003%;background:#0d9488"></b><i style="left:16.666667%"></i></div><strong>179.148%</strong><small>偏离 100%：+79.148%</small></div><div class="synthetic-row"><span>非 Scalar-busy 残余</span><div class="synthetic-track" title="非 Scalar-busy 残余：646,281,804 / 23,993,878 = 2693.528%"><b style="width:100.000000%;background:#7c3aed"></b><i style="left:16.666667%"></i></div><strong>2693.528%</strong><small>偏离 100%：+2593.528%</small><small>图形封顶 600%</small></div><div class="synthetic-row"><span>I-cache request</span><div class="synthetic-track" title="I-cache request：138,285,969 / 69,179,112 = 199.896%"><b style="width:33.315926%;background:#d97706"></b><i style="left:16.666667%"></i></div><strong>199.896%</strong><small>偏离 100%：+99.896%</small></div><div class="synthetic-row"><span>I-cache miss</span><div class="synthetic-track" title="I-cache miss：4,645,138 / 782,333 = 593.755%"><b style="width:98.959096%;background:#dc2626"></b><i style="left:16.666667%"></i></div><strong>593.755%</strong><small>偏离 100%：+493.755%</small></div></div>
+    <h2>11 个业务分段的记录开销拆分（含 SubmitTransition）</h2>
+    <p class="notice"><strong>raw 合计包含分段记录代码自身开销，不能直接拿它和
+      <code>submit-pmu-none</code> 比出“业务变慢了多少”。</strong>
+      本节另外用 empty-bracket 测得“一组 begin/end 记录代码”的开销，再按每个 phase 实际记录组数估算；
+      AIC 与 AIV 分开计算后才合成 ALL。扣除后的数值只供定位量级，不是精确还原的业务值。</p>
+    <p class="fine">下图以 none 为 100%（黑色竖线），橙色为“空区间估算的记录代码开销”，
+      蓝色为“扣除上述估算后的参考值”；二者代数相加为 raw。横轴统一为 0–600%，超过部分只在图上封顶。
+      empty-bracket 的调用点、代码布局及采集轮次与各 phase 不同，所以该估算不能跨 ELF 当作精确扣除。
+      I-cache raw 使用 phase observed，none 使用 primary。</p>
+    <div class="synthetic-chart"><div class="synthetic-row"><span>PMU total</span><div class="synthetic-track" title="PMU total：raw 243.874%；记录开销估算 161.302%；扣除后参考值 82.572%"><b class="recording" style="width:26.883604%"></b><b class="reference" style="width:13.761991%"></b><i style="left:16.666667%"></i></div><strong>raw 243.874%</strong><small>记录估算 161.302% + 扣除后 82.572%</small></div><div class="synthetic-row"><span>Scalar busy</span><div class="synthetic-track" title="Scalar busy：raw 179.148%；记录开销估算 106.635%；扣除后参考值 72.513%"><b class="recording" style="width:17.772467%"></b><b class="reference" style="width:12.085535%"></b><i style="left:16.666667%"></i></div><strong>raw 179.148%</strong><small>记录估算 106.635% + 扣除后 72.513%</small></div><div class="synthetic-row"><span>非 Scalar-busy 残余</span><div class="synthetic-track" title="非 Scalar-busy 残余：raw 2693.528%；记录开销估算 2230.265%；扣除后参考值 463.263%"><b class="recording" style="width:100.000000%"></b><b class="reference" style="width:0.000000%"></b><i style="left:16.666667%"></i></div><strong>raw 2693.528%</strong><small>记录估算 2230.265% + 扣除后 463.263%</small><small>图形封顶 600%</small></div><div class="synthetic-row"><span>I-cache request</span><div class="synthetic-track" title="I-cache request：raw 199.896%；记录开销估算 77.643%；扣除后参考值 122.252%"><b class="recording" style="width:12.940559%"></b><b class="reference" style="width:20.375366%"></b><i style="left:16.666667%"></i></div><strong>raw 199.896%</strong><small>记录估算 77.643% + 扣除后 122.252%</small></div><div class="synthetic-row"><span>I-cache miss</span><div class="synthetic-track" title="I-cache miss：raw 593.755%；记录开销估算 234.607%；扣除后参考值 359.147%"><b class="recording" style="width:39.101240%"></b><b class="reference" style="width:59.857856%"></b><i style="left:16.666667%"></i></div><strong>raw 593.755%</strong><small>记录估算 234.607% + 扣除后 359.147%</small></div></div>
     <div class="table-wrap"><table class="synthetic-table">
-      <thead><tr><th>指标</th><th>Σ 11 phases</th><th>submit-none</th>
-        <th>ALL 合成比</th><th>相对 100% 偏离</th><th>AIC 合成比</th><th>AIV 合成比</th></tr></thead>
-      <tbody><tr><th>PMU total</th><td>2,273,109,233 cycles</td><td>932,085,106 cycles</td><td>243.874%</td><td>+143.874%</td><td>231.144%</td><td>250.012%</td></tr><tr><th>Scalar busy</th><td>1,626,827,429 cycles</td><td>908,091,228 cycles</td><td>179.148%</td><td>+79.148%</td><td>174.430%</td><td>181.497%</td></tr><tr><th>非 Scalar-busy 残余</th><td>646,281,804 cycles</td><td>23,993,878 cycles</td><td>2693.528%</td><td>+2593.528%</td><td>12989.660%</td><td>2083.561%</td></tr><tr><th>I-cache request</th><td>138,285,969 events</td><td>69,179,112 events</td><td>199.896%</td><td>+99.896%</td><td>203.526%</td><td>198.144%</td></tr><tr><th>I-cache miss</th><td>4,645,138 events</td><td>782,333 events</td><td>593.755%</td><td>+493.755%</td><td>1228.410%</td><td>574.480%</td></tr></tbody>
+      <thead><tr><th>指标</th><th>原始观测合计</th><th>记录代码开销估算</th>
+        <th>扣除后参考值</th><th>submit-pmu-none</th><th>AIC / AIV 分角色比例</th></tr></thead>
+      <tbody><tr><th>PMU total</th><td><strong>23,678,221.177 cycles/core</strong><small>≈ 14,351.794 µs/core</small><small>raw / none 243.874%</small></td><td><strong>15,661,129.448 cycles/core</strong><small>≈ 9,492.491 µs/core</small><small>占 raw 66.141%</small></td><td><strong>8,017,091.729 cycles/core</strong><small>≈ 4,859.303 µs/core</small><small>参考值 / none 82.572%</small></td><td><strong>9,709,219.854 cycles/core</strong><small>≈ 5,884.932 µs/core</small><small>基线 100%</small></td><td><small>AIC：raw 231.144% / 记录估算 157.024% / 扣除后 74.119%</small><small>AIV：raw 250.012% / 记录估算 163.364% / 扣除后 86.648%</small></td></tr><tr><th>Scalar busy</th><td><strong>16,946,119.052 cycles/core</strong><small>≈ 10,271.346 µs/core</small><small>raw / none 179.148%</small></td><td><strong>10,086,888.607 cycles/core</strong><small>≈ 6,113.844 µs/core</small><small>占 raw 59.523%</small></td><td><strong>6,859,230.446 cycles/core</strong><small>≈ 4,157.502 µs/core</small><small>参考值 / none 72.513%</small></td><td><strong>9,459,283.625 cycles/core</strong><small>≈ 5,733.441 µs/core</small><small>基线 100%</small></td><td><small>AIC：raw 174.430% / 记录估算 103.874% / 扣除后 70.557%</small><small>AIV：raw 181.497% / 记录估算 108.010% / 扣除后 73.488%</small></td></tr><tr><th>非 Scalar-busy 残余</th><td><strong>6,732,102.125 cycles/core</strong><small>≈ 4,080.448 µs/core</small><small>raw / none 2693.528%</small></td><td><strong>5,574,240.841 cycles/core</strong><small>≈ 3,378.647 µs/core</small><small>占 raw 82.801%</small></td><td><strong>1,157,861.284 cycles/core</strong><small>≈ 701.800 µs/core</small><small>参考值 / none 463.263%</small></td><td><strong>249,936.229 cycles/core</strong><small>≈ 151.491 µs/core</small><small>基线 100%</small></td><td><small>AIC：raw 12989.660% / 记录估算 12114.053% / 扣除后 875.607%</small><small>AIV：raw 2083.561% / 记录估算 1644.727% / 扣除后 438.834%</small></td></tr><tr><th>I-cache request</th><td><strong>1,440,478.844 events/core</strong><small>raw / none 199.896%</small></td><td><strong>559,510.259 events/core</strong><small>占 raw 38.842%</small></td><td><strong>880,968.584 events/core</strong><small>参考值 / none 122.252%</small></td><td><strong>720,615.750 events/core</strong><small>基线 100%</small></td><td><small>AIC：raw 203.526% / 记录估算 77.266% / 扣除后 126.260%</small><small>AIV：raw 198.144% / 记录估算 77.826% / 扣除后 120.319%</small></td></tr><tr><th>I-cache miss</th><td><strong>48,386.854 events/core</strong><small>raw / none 593.755%</small></td><td><strong>19,118.869 events/core</strong><small>占 raw 39.513%</small></td><td><strong>29,267.985 events/core</strong><small>参考值 / none 359.147%</small></td><td><strong>8,149.302 events/core</strong><small>基线 100%</small></td><td><small>AIC：raw 1228.410% / 记录估算 84.496% / 扣除后 1143.914%</small><small>AIV：raw 574.480% / 记录估算 239.166% / 扣除后 335.314%</small></td></tr></tbody>
     </table></div>
+    <p class="fine">本组合计 10,008.385 组记录/core；
+      AIC 10,019.844，AIV
+      10,002.656。记录组数包含 linked Kernel
+      pause/resume 产生的额外 begin/end；动态阶段的零调用核仍按完整 32/64 核总体计入均值。</p>
   </section>
 
 
   <h2>Submit-PMU ELF：各阶段独立归因</h2>
-  <p>每张卡的 PMU total、Scalar busy、非 Scalar-busy 残余及 I-cache 百分比都只使用该卡所属 ELF
-    内的对应分母。各阶段 Scalar busy 来自不同 ELF，不能求和后与
-    <code>submit-pmu-none</code> 的 whole Scalar busy 做正式判等；上方合成诊断特意执行该运算，
-    仅用于呈现观察膨胀指纹。</p>
+  <p>每张业务阶段卡都把“扣局部记录代码开销估算后的参考值”放在主位置，并同时列出 raw observed、
+    记录代码开销估算及 raw whole 分母。参考比例仍以该卡所属 ELF 的 raw whole 为分母；
+    empty-bracket 没有测到整窗全部观察代码，因此不能把它解释成精确业务占比。各阶段来自不同 ELF，
+    也不能求和后与 <code>submit-pmu-none</code> 做正式判等；上方合计只用于判断数量级。若某项参考值
+    为负，表示空区间记录估算已经超过 raw observed，只说明该信号低于当前校准分辨能力；页面不截成
+    零，也不把它解释成负的业务事件。</p>
   <div class="phase-grid">
     <article class="phase-card">
       <header>
@@ -328,50 +360,70 @@
 
       <div class="metric">
         <span>Phase PMU total</span>
-        <strong>Σ 259,240,439 cycles · ≈
-          157130.274 µs</strong>
-        <small>Phase total / 同 ELF whole total：259,240,439 / 825,372,063 = 31.409%</small>
-        <small>AIC 每核 2,530,342–2,814,967 cycles（1533.483–1705.977 µs）</small>
-        <small>AIV 每核 2,588,694–2,918,901 cycles（1569.161–1769.319 µs）</small>
+        <strong>扣局部记录估算参考 Σ 65,400,312.871 cycles · ≈
+          39640.301 µs</strong>
+        <small>参考值 / raw 整窗：7.924%；raw observed / raw 整窗：
+          31.409%</small>
+        <small>raw observed Σ 259,240,439 cycles − 记录代码开销估算
+          193,840,126.129 cycles；估算/raw 74.772%</small>
+        <small>raw Phase total / raw whole total：259,240,439 / 825,372,063 = 31.409%</small>
+        <small>raw AIC 每核 2,530,342–2,814,967 cycles（1533.483–1705.977 µs）</small>
+        <small>raw AIV 每核 2,588,694–2,918,901 cycles（1569.161–1769.319 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>Phase scalar busy</span>
-        <strong>Σ 177,538,191 cycles · ≈
-          107609.078 µs</strong>
-        <small>Scalar / Phase total：177,538,191 / 259,240,439 = 68.484%</small><small>Phase scalar / 同 ELF whole scalar：177,538,191 / 752,424,257 = 23.595%</small>
-        <small>AIC 每核 1,794,703–2,075,030 cycles（1087.658–1257.547 µs）</small>
-        <small>AIV 每核 1,697,975–1,992,002 cycles（1029.244–1207.471 µs）</small>
+        <strong>扣局部记录估算参考 Σ 52,687,582.172 cycles · ≈
+          31934.887 µs</strong>
+        <small>参考值 / raw 整窗：7.002%；raw observed / raw 整窗：
+          23.595%</small>
+        <small>raw observed Σ 177,538,191 cycles − 记录代码开销估算
+          124,850,608.828 cycles；估算/raw 70.323%</small>
+        <small>参考 Scalar / 参考 Phase total：80.562%；raw 68.484%</small><small>raw Phase scalar / raw whole scalar：177,538,191 / 752,424,257 = 23.595%</small>
+        <small>raw AIC 每核 1,794,703–2,075,030 cycles（1087.658–1257.547 µs）</small>
+        <small>raw AIV 每核 1,697,975–1,992,002 cycles（1029.244–1207.471 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>非 Scalar-busy 残余</span>
-        <strong>Σ 81,702,248 cycles · ≈
-          49521.196 µs</strong>
-        <small>逐核先算 total−scalar；残余 / Phase total：81,702,248 / 259,240,439 = 31.516%</small>
-        <small>AIC 每核 725,726–748,044 cycles（439.817–453.343 µs）</small>
-        <small>AIV 每核 841,898–937,867 cycles（510.324–568.497 µs）</small>
+        <strong>扣局部记录估算参考 Σ 12,712,730.699 cycles · ≈
+          7705.414 µs</strong>
+        <small>参考值 / raw 整窗：17.427%；raw observed / raw 整窗：
+          112.001%</small>
+        <small>raw observed Σ 81,702,248 cycles − 记录代码开销估算
+          68,989,517.301 cycles；估算/raw 84.440%</small>
+        <small>逐核先算 total−scalar；参考 residual / 参考 Phase total：19.438%；raw 31.516%</small>
+        <small>raw AIC 每核 725,726–748,044 cycles（439.817–453.343 µs）</small>
+        <small>raw AIV 每核 841,898–937,867 cycles（510.324–568.497 µs）</small>
         <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>14,936,953</strong>
-        <small>本 ELF：14,936,953 / 89,175,746 = 16.750%</small>
-        <small>AIC 每核 151,318–178,475；AIV 每核 140,297–166,456</small>
+        <strong>扣局部记录估算参考 8,011,606.393</strong>
+        <small>参考值 / raw 整窗：8.984%</small>
+        <small>raw observed 14,936,953 / raw 整窗 89,175,746
+          = 16.750%</small>
+        <small>raw observed − 记录代码开销估算 6,925,346.607；
+          估算/raw 46.364%</small>
+        <small>raw AIC 每核 151,318–178,475；raw AIV 每核 140,297–166,456</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>524,078</strong>
-        <small>本 ELF：524,078 / 3,209,861 = 16.327%</small>
-        <small>AIC 每核 1,948–2,377；AIV 每核 6,449–7,856</small>
+        <strong>扣局部记录估算参考 287,740.850</strong>
+        <small>参考值 / raw 整窗：8.964%</small>
+        <small>raw observed 524,078 / raw 整窗 3,209,861
+          = 16.327%</small>
+        <small>raw observed − 记录代码开销估算 236,337.150；
+          估算/raw 45.096%</small>
+        <small>raw AIC 每核 1,948–2,377；raw AIV 每核 6,449–7,856</small>
       </div>
 
       </div>
@@ -405,50 +457,70 @@
 
       <div class="metric">
         <span>Phase PMU total</span>
-        <strong>Σ 321,951,929 cycles · ≈
-          195140.831 µs</strong>
-        <small>Phase total / 同 ELF whole total：321,951,929 / 827,188,042 = 38.921%</small>
-        <small>AIC 每核 2,948,298–3,023,337 cycles（1786.780–1832.257 µs）</small>
-        <small>AIV 每核 3,465,659–3,599,082 cycles（2100.742–2181.617 µs）</small>
+        <strong>扣局部记录估算参考 Σ 129,663,593.000 cycles · ≈
+          78591.426 µs</strong>
+        <small>参考值 / raw 整窗：15.675%；raw observed / raw 整窗：
+          38.921%</small>
+        <small>raw observed Σ 321,951,929 cycles − 记录代码开销估算
+          192,288,336.000 cycles；估算/raw 59.726%</small>
+        <small>raw Phase total / raw whole total：321,951,929 / 827,188,042 = 38.921%</small>
+        <small>raw AIC 每核 2,948,298–3,023,337 cycles（1786.780–1832.257 µs）</small>
+        <small>raw AIV 每核 3,465,659–3,599,082 cycles（2100.742–2181.617 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>Phase scalar busy</span>
-        <strong>Σ 230,884,809 cycles · ≈
-          139943.418 µs</strong>
-        <small>Scalar / Phase total：230,884,809 / 321,951,929 = 71.714%</small><small>Phase scalar / 同 ELF whole scalar：230,884,809 / 751,514,132 = 30.723%</small>
-        <small>AIC 每核 2,209,220–2,273,774 cycles（1338.871–1377.993 µs）</small>
-        <small>AIV 每核 2,443,961–2,543,276 cycles（1481.430–1541.631 µs）</small>
+        <strong>扣局部记录估算参考 Σ 107,038,871.000 cycles · ≈
+          64878.177 µs</strong>
+        <small>参考值 / raw 整窗：14.243%；raw observed / raw 整窗：
+          30.723%</small>
+        <small>raw observed Σ 230,884,809 cycles − 记录代码开销估算
+          123,845,938.000 cycles；估算/raw 53.640%</small>
+        <small>参考 Scalar / 参考 Phase total：82.551%；raw 71.714%</small><small>raw Phase scalar / raw whole scalar：230,884,809 / 751,514,132 = 30.723%</small>
+        <small>raw AIC 每核 2,209,220–2,273,774 cycles（1338.871–1377.993 µs）</small>
+        <small>raw AIV 每核 2,443,961–2,543,276 cycles（1481.430–1541.631 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>非 Scalar-busy 残余</span>
-        <strong>Σ 91,067,120 cycles · ≈
-          55197.413 µs</strong>
-        <small>逐核先算 total−scalar；残余 / Phase total：91,067,120 / 321,951,929 = 28.286%</small>
-        <small>AIC 每核 732,028–764,512 cycles（443.637–463.323 µs）</small>
-        <small>AIV 每核 1,017,626–1,077,936 cycles（616.844–653.401 µs）</small>
+        <strong>扣局部记录估算参考 Σ 22,624,722.000 cycles · ≈
+          13713.249 µs</strong>
+        <small>参考值 / raw 整窗：29.898%；raw observed / raw 整窗：
+          120.342%</small>
+        <small>raw observed Σ 91,067,120 cycles − 记录代码开销估算
+          68,442,398.000 cycles；估算/raw 75.156%</small>
+        <small>逐核先算 total−scalar；参考 residual / 参考 Phase total：17.449%；raw 28.286%</small>
+        <small>raw AIC 每核 732,028–764,512 cycles（443.637–463.323 µs）</small>
+        <small>raw AIV 每核 1,017,626–1,077,936 cycles（616.844–653.401 µs）</small>
         <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>19,012,131</strong>
-        <small>本 ELF：19,012,131 / 92,323,235 = 20.593%</small>
-        <small>AIC 每核 192,561–198,445；AIV 每核 197,857–200,760</small>
+        <strong>扣局部记录估算参考 12,142,513.000</strong>
+        <small>参考值 / raw 整窗：13.152%</small>
+        <small>raw observed 19,012,131 / raw 整窗 92,323,235
+          = 20.593%</small>
+        <small>raw observed − 记录代码开销估算 6,869,618.000；
+          估算/raw 36.133%</small>
+        <small>raw AIC 每核 192,561–198,445；raw AIV 每核 197,857–200,760</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>829,077</strong>
-        <small>本 ELF：829,077 / 3,160,254 = 26.235%</small>
-        <small>AIC 每核 2,766–3,449；AIV 每核 11,004–12,116</small>
+        <strong>扣局部记录估算参考 594,211.000</strong>
+        <small>参考值 / raw 整窗：18.803%</small>
+        <small>raw observed 829,077 / raw 整窗 3,160,254
+          = 26.235%</small>
+        <small>raw observed − 记录代码开销估算 234,866.000；
+          估算/raw 28.329%</small>
+        <small>raw AIC 每核 2,766–3,449；raw AIV 每核 11,004–12,116</small>
       </div>
 
       </div>
@@ -482,50 +554,70 @@
 
       <div class="metric">
         <span>Phase PMU total</span>
-        <strong>Σ 256,268,195 cycles · ≈
-          155328.743 µs</strong>
-        <small>Phase total / 同 ELF whole total：256,268,195 / 866,449,611 = 29.577%</small>
-        <small>AIC 每核 2,396,736–2,431,534 cycles（1452.513–1473.602 µs）</small>
-        <small>AIV 每核 2,744,631–2,857,155 cycles（1663.684–1731.891 µs）</small>
+        <strong>扣局部记录估算参考 Σ 63,979,859.000 cycles · ≈
+          38779.339 µs</strong>
+        <small>参考值 / raw 整窗：7.384%；raw observed / raw 整窗：
+          29.577%</small>
+        <small>raw observed Σ 256,268,195 cycles − 记录代码开销估算
+          192,288,336.000 cycles；估算/raw 75.034%</small>
+        <small>raw Phase total / raw whole total：256,268,195 / 866,449,611 = 29.577%</small>
+        <small>raw AIC 每核 2,396,736–2,431,534 cycles（1452.513–1473.602 µs）</small>
+        <small>raw AIV 每核 2,744,631–2,857,155 cycles（1663.684–1731.891 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>Phase scalar busy</span>
-        <strong>Σ 170,877,651 cycles · ≈
-          103572.005 µs</strong>
-        <small>Scalar / Phase total：170,877,651 / 256,268,195 = 66.679%</small><small>Phase scalar / 同 ELF whole scalar：170,877,651 / 764,708,510 = 22.345%</small>
-        <small>AIC 每核 1,702,639–1,717,426 cycles（1031.864–1040.825 µs）</small>
-        <small>AIV 每核 1,809,609–1,826,762 cycles（1096.912–1107.309 µs）</small>
+        <strong>扣局部记录估算参考 Σ 47,031,713.000 cycles · ≈
+          28506.764 µs</strong>
+        <small>参考值 / raw 整窗：6.150%；raw observed / raw 整窗：
+          22.345%</small>
+        <small>raw observed Σ 170,877,651 cycles − 记录代码开销估算
+          123,845,938.000 cycles；估算/raw 72.476%</small>
+        <small>参考 Scalar / 参考 Phase total：73.510%；raw 66.679%</small><small>raw Phase scalar / raw whole scalar：170,877,651 / 764,708,510 = 22.345%</small>
+        <small>raw AIC 每核 1,702,639–1,717,426 cycles（1031.864–1040.825 µs）</small>
+        <small>raw AIV 每核 1,809,609–1,826,762 cycles（1096.912–1107.309 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>非 Scalar-busy 残余</span>
-        <strong>Σ 85,390,544 cycles · ≈
-          51756.738 µs</strong>
-        <small>逐核先算 total−scalar；残余 / Phase total：85,390,544 / 256,268,195 = 33.321%</small>
-        <small>AIC 每核 693,485–723,172 cycles（420.278–438.270 µs）</small>
-        <small>AIV 每核 932,601–1,038,153 cycles（565.305–629.286 µs）</small>
+        <strong>扣局部记录估算参考 Σ 16,948,146.000 cycles · ≈
+          10272.575 µs</strong>
+        <small>参考值 / raw 整窗：16.658%；raw observed / raw 整窗：
+          83.929%</small>
+        <small>raw observed Σ 85,390,544 cycles − 记录代码开销估算
+          68,442,398.000 cycles；估算/raw 80.152%</small>
+        <small>逐核先算 total−scalar；参考 residual / 参考 Phase total：26.490%；raw 33.321%</small>
+        <small>raw AIC 每核 693,485–723,172 cycles（420.278–438.270 µs）</small>
+        <small>raw AIV 每核 932,601–1,038,153 cycles（565.305–629.286 µs）</small>
         <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>16,604,720</strong>
-        <small>本 ELF：16,604,720 / 91,911,048 = 18.066%</small>
-        <small>AIC 每核 169,690–170,777；AIV 每核 173,850–174,741</small>
+        <strong>扣局部记录估算参考 9,735,102.000</strong>
+        <small>参考值 / raw 整窗：10.592%</small>
+        <small>raw observed 16,604,720 / raw 整窗 91,911,048
+          = 18.066%</small>
+        <small>raw observed − 记录代码开销估算 6,869,618.000；
+          估算/raw 41.371%</small>
+        <small>raw AIC 每核 169,690–170,777；raw AIV 每核 173,850–174,741</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>589,413</strong>
-        <small>本 ELF：589,413 / 3,564,754 = 16.534%</small>
-        <small>AIC 每核 1,332–1,848；AIV 每核 8,252–8,752</small>
+        <strong>扣局部记录估算参考 354,547.000</strong>
+        <small>参考值 / raw 整窗：9.946%</small>
+        <small>raw observed 589,413 / raw 整窗 3,564,754
+          = 16.534%</small>
+        <small>raw observed − 记录代码开销估算 234,866.000；
+          估算/raw 39.847%</small>
+        <small>raw AIC 每核 1,332–1,848；raw AIV 每核 8,252–8,752</small>
       </div>
 
       </div>
@@ -559,50 +651,70 @@
 
       <div class="metric">
         <span>Phase PMU total</span>
-        <strong>Σ 368,349,615 cycles · ≈
-          223263.299 µs</strong>
-        <small>Phase total / 同 ELF whole total：368,349,615 / 860,121,776 = 42.825%</small>
-        <small>AIC 每核 3,601,905–3,683,070 cycles（2182.891–2232.080 µs）</small>
-        <small>AIV 每核 3,854,196–4,010,884 cycles（2336.257–2431.235 µs）</small>
+        <strong>扣局部记录估算参考 Σ 176,061,279.000 cycles · ≈
+          106713.895 µs</strong>
+        <small>参考值 / raw 整窗：20.469%；raw observed / raw 整窗：
+          42.825%</small>
+        <small>raw observed Σ 368,349,615 cycles − 记录代码开销估算
+          192,288,336.000 cycles；估算/raw 52.203%</small>
+        <small>raw Phase total / raw whole total：368,349,615 / 860,121,776 = 42.825%</small>
+        <small>raw AIC 每核 3,601,905–3,683,070 cycles（2182.891–2232.080 µs）</small>
+        <small>raw AIV 每核 3,854,196–4,010,884 cycles（2336.257–2431.235 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>Phase scalar busy</span>
-        <strong>Σ 293,943,610 cycles · ≈
-          178164.487 µs</strong>
-        <small>Scalar / Phase total：293,943,610 / 368,349,615 = 79.800%</small><small>Phase scalar / 同 ELF whole scalar：293,943,610 / 759,586,910 = 38.698%</small>
-        <small>AIC 每核 2,943,032–3,024,557 cycles（1783.589–1832.996 µs）</small>
-        <small>AIV 每核 3,063,783–3,164,251 cycles（1857.141–1918.041 µs）</small>
+        <strong>扣局部记录估算参考 Σ 170,097,672.000 cycles · ≈
+          103099.246 µs</strong>
+        <small>参考值 / raw 整窗：22.393%；raw observed / raw 整窗：
+          38.698%</small>
+        <small>raw observed Σ 293,943,610 cycles − 记录代码开销估算
+          123,845,938.000 cycles；估算/raw 42.133%</small>
+        <small>参考 Scalar / 参考 Phase total：96.613%；raw 79.800%</small><small>raw Phase scalar / raw whole scalar：293,943,610 / 759,586,910 = 38.698%</small>
+        <small>raw AIC 每核 2,943,032–3,024,557 cycles（1783.589–1832.996 µs）</small>
+        <small>raw AIV 每核 3,063,783–3,164,251 cycles（1857.141–1918.041 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>非 Scalar-busy 残余</span>
-        <strong>Σ 74,406,005 cycles · ≈
-          45098.812 µs</strong>
-        <small>逐核先算 total−scalar；残余 / Phase total：74,406,005 / 368,349,615 = 20.200%</small>
-        <small>AIC 每核 656,662–659,424 cycles（397.962–399.636 µs）</small>
-        <small>AIV 每核 790,413–886,262 cycles（479.116–537.216 µs）</small>
+        <strong>扣局部记录估算参考 Σ 5,963,607.000 cycles · ≈
+          3614.649 µs</strong>
+        <small>参考值 / raw 整窗：5.932%；raw observed / raw 整窗：
+          74.010%</small>
+        <small>raw observed Σ 74,406,005 cycles − 记录代码开销估算
+          68,442,398.000 cycles；估算/raw 91.985%</small>
+        <small>逐核先算 total−scalar；参考 residual / 参考 Phase total：3.387%；raw 20.200%</small>
+        <small>raw AIC 每核 656,662–659,424 cycles（397.962–399.636 µs）</small>
+        <small>raw AIV 每核 790,413–886,262 cycles（479.116–537.216 µs）</small>
         <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>30,124,105</strong>
-        <small>本 ELF：30,124,105 / 93,963,590 = 32.059%</small>
-        <small>AIC 每核 311,744–314,741；AIV 每核 311,332–316,405</small>
+        <strong>扣局部记录估算参考 23,254,487.000</strong>
+        <small>参考值 / raw 整窗：24.748%</small>
+        <small>raw observed 30,124,105 / raw 整窗 93,963,590
+          = 32.059%</small>
+        <small>raw observed − 记录代码开销估算 6,869,618.000；
+          估算/raw 22.804%</small>
+        <small>raw AIC 每核 311,744–314,741；raw AIV 每核 311,332–316,405</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>754,725</strong>
-        <small>本 ELF：754,725 / 3,216,252 = 23.466%</small>
-        <small>AIC 每核 42–66；AIV 每核 11,134–12,093</small>
+        <strong>扣局部记录估算参考 519,859.000</strong>
+        <small>参考值 / raw 整窗：16.164%</small>
+        <small>raw observed 754,725 / raw 整窗 3,216,252
+          = 23.466%</small>
+        <small>raw observed − 记录代码开销估算 234,866.000；
+          估算/raw 31.119%</small>
+        <small>raw AIC 每核 42–66；raw AIV 每核 11,134–12,093</small>
       </div>
 
       </div>
@@ -636,50 +748,70 @@
 
       <div class="metric">
         <span>Phase PMU total</span>
-        <strong>Σ 210,127,915 cycles · ≈
-          127362.293 µs</strong>
-        <small>Phase total / 同 ELF whole total：210,127,915 / 784,604,857 = 26.781%</small>
-        <small>AIC 每核 2,093,859–2,201,061 cycles（1268.958–1333.926 µs）</small>
-        <small>AIV 每核 2,177,815–2,368,000 cycles（1320.103–1435.386 µs）</small>
+        <strong>扣局部记录估算参考 Σ 17,839,579.000 cycles · ≈
+          10812.888 µs</strong>
+        <small>参考值 / raw 整窗：2.274%；raw observed / raw 整窗：
+          26.781%</small>
+        <small>raw observed Σ 210,127,915 cycles − 记录代码开销估算
+          192,288,336.000 cycles；估算/raw 91.510%</small>
+        <small>raw Phase total / raw whole total：210,127,915 / 784,604,857 = 26.781%</small>
+        <small>raw AIC 每核 2,093,859–2,201,061 cycles（1268.958–1333.926 µs）</small>
+        <small>raw AIV 每核 2,177,815–2,368,000 cycles（1320.103–1435.386 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>Phase scalar busy</span>
-        <strong>Σ 144,019,418 cycles · ≈
-          87292.749 µs</strong>
-        <small>Scalar / Phase total：144,019,418 / 210,127,915 = 68.539%</small><small>Phase scalar / 同 ELF whole scalar：144,019,418 / 733,380,676 = 19.638%</small>
-        <small>AIC 每核 1,441,782–1,548,097 cycles（873.774–938.205 µs）</small>
-        <small>AIV 每核 1,475,591–1,658,894 cycles（894.443–1005.554 µs）</small>
+        <strong>扣局部记录估算参考 Σ 20,173,480.000 cycles · ≈
+          12227.508 µs</strong>
+        <small>参考值 / raw 整窗：2.751%；raw observed / raw 整窗：
+          19.638%</small>
+        <small>raw observed Σ 144,019,418 cycles − 记录代码开销估算
+          123,845,938.000 cycles；估算/raw 85.993%</small>
+        <small>参考 Scalar / 参考 Phase total：113.083%；raw 68.539%</small><small>raw Phase scalar / raw whole scalar：144,019,418 / 733,380,676 = 19.638%</small>
+        <small>raw AIC 每核 1,441,782–1,548,097 cycles（873.774–938.205 µs）</small>
+        <small>raw AIV 每核 1,475,591–1,658,894 cycles（894.443–1005.554 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>非 Scalar-busy 残余</span>
-        <strong>Σ 66,108,497 cycles · ≈
-          40069.544 µs</strong>
-        <small>逐核先算 total−scalar；残余 / Phase total：66,108,497 / 210,127,915 = 31.461%</small>
-        <small>AIC 每核 650,360–654,764 cycles（394.143–396.812 µs）</small>
-        <small>AIV 每核 696,446–717,275 cycles（422.157–434.783 µs）</small>
+        <strong>扣局部记录估算参考 Σ -2,333,901.000 cycles · ≈
+          -1414.619 µs</strong>
+        <small>参考值 / raw 整窗：-4.556%；raw observed / raw 整窗：
+          129.057%</small>
+        <small>raw observed Σ 66,108,497 cycles − 记录代码开销估算
+          68,442,398.000 cycles；估算/raw 103.530%</small>
+        <small>逐核先算 total−scalar；参考 residual / 参考 Phase total：-13.083%；raw 31.461%</small>
+        <small>raw AIC 每核 650,360–654,764 cycles（394.143–396.812 µs）</small>
+        <small>raw AIV 每核 696,446–717,275 cycles（422.157–434.783 µs）</small>
         <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>10,989,011</strong>
-        <small>本 ELF：10,989,011 / 89,766,806 = 12.242%</small>
-        <small>AIC 每核 113,877–116,376；AIV 每核 114,110–116,638</small>
+        <strong>扣局部记录估算参考 4,119,393.000</strong>
+        <small>参考值 / raw 整窗：4.589%</small>
+        <small>raw observed 10,989,011 / raw 整窗 89,766,806
+          = 12.242%</small>
+        <small>raw observed − 记录代码开销估算 6,869,618.000；
+          估算/raw 62.514%</small>
+        <small>raw AIC 每核 113,877–116,376；raw AIV 每核 114,110–116,638</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>27,962</strong>
-        <small>本 ELF：27,962 / 1,699,987 = 1.645%</small>
-        <small>AIC 每核 20–41；AIV 每核 320–565</small>
+        <strong>扣局部记录估算参考 -206,904.000</strong>
+        <small>参考值 / raw 整窗：-12.171%</small>
+        <small>raw observed 27,962 / raw 整窗 1,699,987
+          = 1.645%</small>
+        <small>raw observed − 记录代码开销估算 234,866.000；
+          估算/raw 839.947%</small>
+        <small>raw AIC 每核 20–41；raw AIV 每核 320–565</small>
       </div>
 
       </div>
@@ -713,50 +845,70 @@
 
       <div class="metric">
         <span>Phase PMU total</span>
-        <strong>Σ 3,508,426 cycles · ≈
-          2126.520 µs</strong>
-        <small>Phase total / 同 ELF whole total：3,508,426 / 652,647,623 = 0.538%</small>
-        <small>AIC 每核 30,099–55,123 cycles（18.241–33.407 µs）</small>
-        <small>AIV 每核 13,075–55,245 cycles（7.926–33.487 µs）</small>
+        <strong>扣局部记录估算参考 Σ 1,926,456.381 cycles · ≈
+          1167.660 µs</strong>
+        <small>参考值 / raw 整窗：0.295%；raw observed / raw 整窗：
+          0.538%</small>
+        <small>raw observed Σ 3,508,426 cycles − 记录代码开销估算
+          1,581,969.619 cycles；估算/raw 45.091%</small>
+        <small>raw Phase total / raw whole total：3,508,426 / 652,647,623 = 0.538%</small>
+        <small>raw AIC 每核 30,099–55,123 cycles（18.241–33.407 µs）</small>
+        <small>raw AIV 每核 13,075–55,245 cycles（7.926–33.487 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>Phase scalar busy</span>
-        <strong>Σ 2,709,457 cycles · ≈
-          1642.250 µs</strong>
-        <small>Scalar / Phase total：2,709,457 / 3,508,426 = 77.227%</small><small>Phase scalar / 同 ELF whole scalar：2,709,457 / 602,690,743 = 0.450%</small>
-        <small>AIC 每核 22,790–41,690 cycles（13.812–25.266 µs）</small>
-        <small>AIV 每核 9,664–44,119 cycles（5.858–26.743 µs）</small>
+        <strong>扣局部记录估算参考 Σ 1,685,046.725 cycles · ≈
+          1021.337 µs</strong>
+        <small>参考值 / raw 整窗：0.280%；raw observed / raw 整窗：
+          0.450%</small>
+        <small>raw observed Σ 2,709,457 cycles − 记录代码开销估算
+          1,024,410.275 cycles；估算/raw 37.809%</small>
+        <small>参考 Scalar / 参考 Phase total：87.469%；raw 77.227%</small><small>raw Phase scalar / raw whole scalar：2,709,457 / 602,690,743 = 0.450%</small>
+        <small>raw AIC 每核 22,790–41,690 cycles（13.812–25.266 µs）</small>
+        <small>raw AIV 每核 9,664–44,119 cycles（5.858–26.743 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>非 Scalar-busy 残余</span>
-        <strong>Σ 798,969 cycles · ≈
-          484.269 µs</strong>
-        <small>逐核先算 total−scalar；残余 / Phase total：798,969 / 3,508,426 = 22.773%</small>
-        <small>AIC 每核 7,309–13,433 cycles（4.430–8.141 µs）</small>
-        <small>AIV 每核 3,411–11,344 cycles（2.068–6.876 µs）</small>
+        <strong>扣局部记录估算参考 Σ 241,409.656 cycles · ≈
+          146.323 µs</strong>
+        <small>参考值 / raw 整窗：0.483%；raw observed / raw 整窗：
+          1.599%</small>
+        <small>raw observed Σ 798,969 cycles − 记录代码开销估算
+          557,559.344 cycles；估算/raw 69.785%</small>
+        <small>逐核先算 total−scalar；参考 residual / 参考 Phase total：12.531%；raw 22.773%</small>
+        <small>raw AIC 每核 7,309–13,433 cycles（4.430–8.141 µs）</small>
+        <small>raw AIV 每核 3,411–11,344 cycles（2.068–6.876 µs）</small>
         <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>342,033</strong>
-        <small>本 ELF：342,033 / 75,933,197 = 0.450%</small>
-        <small>AIC 每核 3,304–5,485；AIV 每核 1,315–5,375</small>
+        <strong>扣局部记录估算参考 285,209.438</strong>
+        <small>参考值 / raw 整窗：0.376%</small>
+        <small>raw observed 342,033 / raw 整窗 75,933,197
+          = 0.450%</small>
+        <small>raw observed − 记录代码开销估算 56,823.562；
+          估算/raw 16.613%</small>
+        <small>raw AIC 每核 3,304–5,485；raw AIV 每核 1,315–5,375</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>13,782</strong>
-        <small>本 ELF：13,782 / 2,331,934 = 0.591%</small>
-        <small>AIC 每核 37–120；AIV 每核 83–277</small>
+        <strong>扣局部记录估算参考 12,298.531</strong>
+        <small>参考值 / raw 整窗：0.527%</small>
+        <small>raw observed 13,782 / raw 整窗 2,331,934
+          = 0.591%</small>
+        <small>raw observed − 记录代码开销估算 1,483.469；
+          估算/raw 10.764%</small>
+        <small>raw AIC 每核 37–120；raw AIV 每核 83–277</small>
       </div>
 
       </div>
@@ -790,50 +942,70 @@
 
       <div class="metric">
         <span>Phase PMU total</span>
-        <strong>Σ 248,694,483 cycles · ≈
-          150738.181 µs</strong>
-        <small>Phase total / 同 ELF whole total：248,694,483 / 833,286,281 = 29.845%</small>
-        <small>AIC 每核 2,345,551–2,439,083 cycles（1421.493–1478.177 µs）</small>
-        <small>AIV 每核 2,635,187–2,732,437 cycles（1597.343–1656.292 µs）</small>
+        <strong>扣局部记录估算参考 Σ 56,406,147.000 cycles · ≈
+          34188.776 µs</strong>
+        <small>参考值 / raw 整窗：6.769%；raw observed / raw 整窗：
+          29.845%</small>
+        <small>raw observed Σ 248,694,483 cycles − 记录代码开销估算
+          192,288,336.000 cycles；估算/raw 77.319%</small>
+        <small>raw Phase total / raw whole total：248,694,483 / 833,286,281 = 29.845%</small>
+        <small>raw AIC 每核 2,345,551–2,439,083 cycles（1421.493–1478.177 µs）</small>
+        <small>raw AIV 每核 2,635,187–2,732,437 cycles（1597.343–1656.292 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>Phase scalar busy</span>
-        <strong>Σ 168,184,052 cycles · ≈
-          101939.366 µs</strong>
-        <small>Scalar / Phase total：168,184,052 / 248,694,483 = 67.627%</small><small>Phase scalar / 同 ELF whole scalar：168,184,052 / 743,680,705 = 22.615%</small>
-        <small>AIC 每核 1,658,575–1,740,706 cycles（1005.159–1054.934 µs）</small>
-        <small>AIV 每核 1,724,613–1,816,536 cycles（1045.390–1101.110 µs）</small>
+        <strong>扣局部记录估算参考 Σ 44,338,114.000 cycles · ≈
+          26874.125 µs</strong>
+        <small>参考值 / raw 整窗：5.962%；raw observed / raw 整窗：
+          22.615%</small>
+        <small>raw observed Σ 168,184,052 cycles − 记录代码开销估算
+          123,845,938.000 cycles；估算/raw 73.637%</small>
+        <small>参考 Scalar / 参考 Phase total：78.605%；raw 67.627%</small><small>raw Phase scalar / raw whole scalar：168,184,052 / 743,680,705 = 22.615%</small>
+        <small>raw AIC 每核 1,658,575–1,740,706 cycles（1005.159–1054.934 µs）</small>
+        <small>raw AIV 每核 1,724,613–1,816,536 cycles（1045.390–1101.110 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>非 Scalar-busy 残余</span>
-        <strong>Σ 80,510,431 cycles · ≈
-          48798.814 µs</strong>
-        <small>逐核先算 total−scalar；残余 / Phase total：80,510,431 / 248,694,483 = 32.373%</small>
-        <small>AIC 每核 679,724–701,583 cycles（411.938–425.186 µs）</small>
-        <small>AIV 每核 895,222–929,750 cycles（542.647–563.577 µs）</small>
+        <strong>扣局部记录估算参考 Σ 12,068,033.000 cycles · ≈
+          7314.651 µs</strong>
+        <small>参考值 / raw 整窗：13.468%；raw observed / raw 整窗：
+          89.850%</small>
+        <small>raw observed Σ 80,510,431 cycles − 记录代码开销估算
+          68,442,398.000 cycles；估算/raw 85.011%</small>
+        <small>逐核先算 total−scalar；参考 residual / 参考 Phase total：21.395%；raw 32.373%</small>
+        <small>raw AIC 每核 679,724–701,583 cycles（411.938–425.186 µs）</small>
+        <small>raw AIV 每核 895,222–929,750 cycles（542.647–563.577 µs）</small>
         <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>12,430,608</strong>
-        <small>本 ELF：12,430,608 / 90,091,095 = 13.798%</small>
-        <small>AIC 每核 126,587–132,112；AIV 每核 127,357–130,347</small>
+        <strong>扣局部记录估算参考 5,560,990.000</strong>
+        <small>参考值 / raw 整窗：6.173%</small>
+        <small>raw observed 12,430,608 / raw 整窗 90,091,095
+          = 13.798%</small>
+        <small>raw observed − 记录代码开销估算 6,869,618.000；
+          估算/raw 55.264%</small>
+        <small>raw AIC 每核 126,587–132,112；raw AIV 每核 127,357–130,347</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>450,294</strong>
-        <small>本 ELF：450,294 / 3,522,153 = 12.785%</small>
-        <small>AIC 每核 695–849；AIV 每核 6,523–6,811</small>
+        <strong>扣局部记录估算参考 215,428.000</strong>
+        <small>参考值 / raw 整窗：6.116%</small>
+        <small>raw observed 450,294 / raw 整窗 3,522,153
+          = 12.785%</small>
+        <small>raw observed − 记录代码开销估算 234,866.000；
+          估算/raw 52.158%</small>
+        <small>raw AIC 每核 695–849；raw AIV 每核 6,523–6,811</small>
       </div>
 
       </div>
@@ -867,50 +1039,70 @@
 
       <div class="metric">
         <span>Phase PMU total</span>
-        <strong>Σ 62,476,937 cycles · ≈
-          37868.391 µs</strong>
-        <small>Phase total / 同 ELF whole total：62,476,937 / 831,511,201 = 7.514%</small>
-        <small>AIC 每核 118,934–1,809,865 cycles（72.079–1096.847 µs）</small>
-        <small>AIV 每核 0–2,061,069 cycles（0.000–1249.336 µs）</small>
+        <strong>扣局部记录估算参考 Σ 60,658,419.285 cycles · ≈
+          36766.154 µs</strong>
+        <small>参考值 / raw 整窗：7.295%；raw observed / raw 整窗：
+          7.514%</small>
+        <small>raw observed Σ 62,476,937 cycles − 记录代码开销估算
+          1,818,517.715 cycles；估算/raw 2.911%</small>
+        <small>raw Phase total / raw whole total：62,476,937 / 831,511,201 = 7.514%</small>
+        <small>raw AIC 每核 118,934–1,809,865 cycles（72.079–1096.847 µs）</small>
+        <small>raw AIV 每核 0–2,061,069 cycles（0.000–1249.336 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>Phase scalar busy</span>
-        <strong>Σ 61,009,092 cycles · ≈
-          36978.703 µs</strong>
-        <small>Scalar / Phase total：61,009,092 / 62,476,937 = 97.651%</small><small>Phase scalar / 同 ELF whole scalar：61,009,092 / 792,528,440 = 7.698%</small>
-        <small>AIC 每核 107,836–1,777,133 cycles（65.353–1077.010 µs）</small>
-        <small>AIV 每核 0–2,039,969 cycles（0.000–1236.546 µs）</small>
+        <strong>扣局部记录估算参考 Σ 59,831,553.283 cycles · ≈
+          36264.976 µs</strong>
+        <small>参考值 / raw 整窗：7.549%；raw observed / raw 整窗：
+          7.698%</small>
+        <small>raw observed Σ 61,009,092 cycles − 记录代码开销估算
+          1,177,538.717 cycles；估算/raw 1.930%</small>
+        <small>参考 Scalar / 参考 Phase total：98.637%；raw 97.651%</small><small>raw Phase scalar / raw whole scalar：61,009,092 / 792,528,440 = 7.698%</small>
+        <small>raw AIC 每核 107,836–1,777,133 cycles（65.353–1077.010 µs）</small>
+        <small>raw AIV 每核 0–2,039,969 cycles（0.000–1236.546 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>非 Scalar-busy 残余</span>
-        <strong>Σ 1,467,845 cycles · ≈
-          889.687 µs</strong>
-        <small>逐核先算 total−scalar；残余 / Phase total：1,467,845 / 62,476,937 = 2.349%</small>
-        <small>AIC 每核 11,098–32,732 cycles（6.726–19.837 µs）</small>
-        <small>AIV 每核 0–26,855 cycles（0.000–16.278 µs）</small>
+        <strong>扣局部记录估算参考 Σ 826,866.003 cycles · ≈
+          501.178 µs</strong>
+        <small>参考值 / raw 整窗：2.121%；raw observed / raw 整窗：
+          3.765%</small>
+        <small>raw observed Σ 1,467,845 cycles − 记录代码开销估算
+          640,978.997 cycles；估算/raw 43.668%</small>
+        <small>逐核先算 total−scalar；参考 residual / 参考 Phase total：1.363%；raw 2.349%</small>
+        <small>raw AIC 每核 11,098–32,732 cycles（6.726–19.837 µs）</small>
+        <small>raw AIV 每核 0–26,855 cycles（0.000–16.278 µs）</small>
         <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>4,863,968</strong>
-        <small>本 ELF：4,863,968 / 73,819,554 = 6.589%</small>
-        <small>AIC 每核 21,757–159,256；AIV 每核 0–147,353</small>
+        <strong>扣局部记录估算参考 4,798,650.478</strong>
+        <small>参考值 / raw 整窗：6.501%</small>
+        <small>raw observed 4,863,968 / raw 整窗 73,819,554
+          = 6.589%</small>
+        <small>raw observed − 记录代码开销估算 65,317.522；
+          估算/raw 1.343%</small>
+        <small>raw AIC 每核 21,757–159,256；raw AIV 每核 0–147,353</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>30,792</strong>
-        <small>本 ELF：30,792 / 1,544,977 = 1.993%</small>
-        <small>AIC 每核 154–371；AIV 每核 0–630</small>
+        <strong>扣局部记录估算参考 29,082.716</strong>
+        <small>参考值 / raw 整窗：1.882%</small>
+        <small>raw observed 30,792 / raw 整窗 1,544,977
+          = 1.993%</small>
+        <small>raw observed − 记录代码开销估算 1,709.284；
+          估算/raw 5.551%</small>
+        <small>raw AIC 每核 154–371；raw AIV 每核 0–630</small>
       </div>
 
       </div>
@@ -944,50 +1136,70 @@
 
       <div class="metric">
         <span>Phase PMU total</span>
-        <strong>Σ 57,216,108 cycles · ≈
-          34679.708 µs</strong>
-        <small>Phase total / 同 ELF whole total：57,216,108 / 832,640,742 = 6.872%</small>
-        <small>AIC 每核 0–1,349,309 cycles（0.000–817.732 µs）</small>
-        <small>AIV 每核 0–2,075,497 cycles（0.000–1258.082 µs）</small>
+        <strong>扣局部记录估算参考 Σ 56,816,784.374 cycles · ≈
+          34437.671 µs</strong>
+        <small>参考值 / raw 整窗：6.824%；raw observed / raw 整窗：
+          6.872%</small>
+        <small>raw observed Σ 57,216,108 cycles − 记录代码开销估算
+          399,323.626 cycles；估算/raw 0.698%</small>
+        <small>raw Phase total / raw whole total：57,216,108 / 832,640,742 = 6.872%</small>
+        <small>raw AIC 每核 0–1,349,309 cycles（0.000–817.732 µs）</small>
+        <small>raw AIV 每核 0–2,075,497 cycles（0.000–1258.082 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>Phase scalar busy</span>
-        <strong>Σ 56,630,433 cycles · ≈
-          34324.720 µs</strong>
-        <small>Scalar / Phase total：56,630,433 / 57,216,108 = 98.976%</small><small>Phase scalar / 同 ELF whole scalar：56,630,433 / 798,628,250 = 7.091%</small>
-        <small>AIC 每核 0–1,342,719 cycles（0.000–813.739 µs）</small>
-        <small>AIV 每核 0–2,065,174 cycles（0.000–1251.825 µs）</small>
+        <strong>扣局部记录估算参考 Σ 56,372,898.080 cycles · ≈
+          34168.623 µs</strong>
+        <small>参考值 / raw 整窗：7.059%；raw observed / raw 整窗：
+          7.091%</small>
+        <small>raw observed Σ 56,630,433 cycles − 记录代码开销估算
+          257,534.920 cycles；估算/raw 0.455%</small>
+        <small>参考 Scalar / 参考 Phase total：99.219%；raw 98.976%</small><small>raw Phase scalar / raw whole scalar：56,630,433 / 798,628,250 = 7.091%</small>
+        <small>raw AIC 每核 0–1,342,719 cycles（0.000–813.739 µs）</small>
+        <small>raw AIV 每核 0–2,065,174 cycles（0.000–1251.825 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>非 Scalar-busy 残余</span>
-        <strong>Σ 585,675 cycles · ≈
-          354.988 µs</strong>
-        <small>逐核先算 total−scalar；残余 / Phase total：585,675 / 57,216,108 = 1.024%</small>
-        <small>AIC 每核 0–11,646 cycles（0.000–7.058 µs）</small>
-        <small>AIV 每核 0–23,288 cycles（0.000–14.116 µs）</small>
+        <strong>扣局部记录估算参考 Σ 443,886.294 cycles · ≈
+          269.047 µs</strong>
+        <small>参考值 / raw 整窗：1.305%；raw observed / raw 整窗：
+          1.722%</small>
+        <small>raw observed Σ 585,675 cycles − 记录代码开销估算
+          141,788.706 cycles；估算/raw 24.209%</small>
+        <small>逐核先算 total−scalar；参考 residual / 参考 Phase total：0.781%；raw 1.024%</small>
+        <small>raw AIC 每核 0–11,646 cycles（0.000–7.058 µs）</small>
+        <small>raw AIV 每核 0–23,288 cycles（0.000–14.116 µs）</small>
         <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>539,738</strong>
-        <small>本 ELF：539,738 / 72,212,561 = 0.747%</small>
-        <small>AIC 每核 0–12,416；AIV 每核 0–17,122</small>
+        <strong>扣局部记录估算参考 525,452.749</strong>
+        <small>参考值 / raw 整窗：0.728%</small>
+        <small>raw observed 539,738 / raw 整窗 72,212,561
+          = 0.747%</small>
+        <small>raw observed − 记录代码开销估算 14,285.251；
+          估算/raw 2.647%</small>
+        <small>raw AIC 每核 0–12,416；raw AIV 每核 0–17,122</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>12,829</strong>
-        <small>本 ELF：12,829 / 1,329,490 = 0.965%</small>
-        <small>AIC 每核 0–204；AIV 每核 0–344</small>
+        <strong>扣局部记录估算参考 12,369.305</strong>
+        <small>参考值 / raw 整窗：0.930%</small>
+        <small>raw observed 12,829 / raw 整窗 1,329,490
+          = 0.965%</small>
+        <small>raw observed − 记录代码开销估算 459.695；
+          估算/raw 3.583%</small>
+        <small>raw AIC 每核 0–204；raw AIV 每核 0–344</small>
       </div>
 
       </div>
@@ -1021,50 +1233,70 @@
 
       <div class="metric">
         <span>Phase PMU total</span>
-        <strong>Σ 170,777,758 cycles · ≈
-          103511.458 µs</strong>
-        <small>Phase total / 同 ELF whole total：170,777,758 / 778,354,672 = 21.941%</small>
-        <small>AIC 每核 1,670,343–1,678,979 cycles（1012.291–1017.525 µs）</small>
-        <small>AIV 每核 1,810,993–1,856,211 cycles（1097.750–1125.160 µs）</small>
+        <strong>扣局部记录估算参考 Σ 18,529,058.819 cycles · ≈
+          11230.794 µs</strong>
+        <small>参考值 / raw 整窗：2.381%；raw observed / raw 整窗：
+          21.941%</small>
+        <small>raw observed Σ 170,777,758 cycles − 记录代码开销估算
+          152,248,699.181 cycles；估算/raw 89.150%</small>
+        <small>raw Phase total / raw whole total：170,777,758 / 778,354,672 = 21.941%</small>
+        <small>raw AIC 每核 1,670,343–1,678,979 cycles（1012.291–1017.525 µs）</small>
+        <small>raw AIV 每核 1,810,993–1,856,211 cycles（1097.750–1125.160 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>Phase scalar busy</span>
-        <strong>Σ 114,439,566 cycles · ≈
-          69363.871 µs</strong>
-        <small>Scalar / Phase total：114,439,566 / 170,777,758 = 67.011%</small><small>Phase scalar / 同 ELF whole scalar：114,439,566 / 702,902,051 = 16.281%</small>
-        <small>AIC 每核 1,154,651–1,161,139 cycles（699.762–703.694 µs）</small>
-        <small>AIV 每核 1,203,214–1,214,047 cycles（729.340–735.906 µs）</small>
+        <strong>扣局部记录估算参考 Σ 16,387,225.875 cycles · ≈
+          9932.591 µs</strong>
+        <small>参考值 / raw 整窗：2.331%；raw observed / raw 整窗：
+          16.281%</small>
+        <small>raw observed Σ 114,439,566 cycles − 记录代码开销估算
+          98,052,340.125 cycles；估算/raw 85.680%</small>
+        <small>参考 Scalar / 参考 Phase total：88.441%；raw 67.011%</small><small>raw Phase scalar / raw whole scalar：114,439,566 / 702,902,051 = 16.281%</small>
+        <small>raw AIC 每核 1,154,651–1,161,139 cycles（699.762–703.694 µs）</small>
+        <small>raw AIV 每核 1,203,214–1,214,047 cycles（729.340–735.906 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>非 Scalar-busy 残余</span>
-        <strong>Σ 56,338,192 cycles · ≈
-          34147.587 µs</strong>
-        <small>逐核先算 total−scalar；残余 / Phase total：56,338,192 / 170,777,758 = 32.989%</small>
-        <small>AIC 每核 515,632–517,886 cycles（312.493–313.859 µs）</small>
-        <small>AIV 每核 604,688–643,226 cycles（366.537–389.898 µs）</small>
+        <strong>扣局部记录估算参考 Σ 2,141,832.944 cycles · ≈
+          1298.203 µs</strong>
+        <small>参考值 / raw 整窗：2.839%；raw observed / raw 整窗：
+          74.667%</small>
+        <small>raw observed Σ 56,338,192 cycles − 记录代码开销估算
+          54,196,359.056 cycles；估算/raw 96.198%</small>
+        <small>逐核先算 total−scalar；参考 residual / 参考 Phase total：11.559%；raw 32.989%</small>
+        <small>raw AIC 每核 515,632–517,886 cycles（312.493–313.859 µs）</small>
+        <small>raw AIV 每核 604,688–643,226 cycles（366.537–389.898 µs）</small>
         <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>8,396,456</strong>
-        <small>本 ELF：8,396,456 / 85,872,185 = 9.778%</small>
-        <small>AIC 每核 84,633–86,723；AIV 每核 88,210–88,833</small>
+        <strong>扣局部记录估算参考 2,957,585.162</strong>
+        <small>参考值 / raw 整窗：3.444%</small>
+        <small>raw observed 8,396,456 / raw 整窗 85,872,185
+          = 9.778%</small>
+        <small>raw observed − 记录代码开销估算 5,438,870.838；
+          估算/raw 64.776%</small>
+        <small>raw AIC 每核 84,633–86,723；raw AIV 每核 88,210–88,833</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>186,067</strong>
-        <small>本 ELF：186,067 / 2,540,177 = 7.325%</small>
-        <small>AIC 每核 34–84；AIV 每核 2,789–3,083</small>
+        <strong>扣局部记录估算参考 -342.331</strong>
+        <small>参考值 / raw 整窗：-0.013%</small>
+        <small>raw observed 186,067 / raw 整窗 2,540,177
+          = 7.325%</small>
+        <small>raw observed − 记录代码开销估算 186,409.331；
+          估算/raw 100.184%</small>
+        <small>raw AIC 每核 34–84；raw AIV 每核 2,789–3,083</small>
       </div>
 
       </div>
@@ -1098,50 +1330,70 @@
 
       <div class="metric">
         <span>Phase PMU total</span>
-        <strong>Σ 314,497,428 cycles · ≈
-          190622.524 µs</strong>
-        <small>Phase total / 同 ELF whole total：314,497,428 / 875,104,857 = 35.938%</small>
-        <small>AIC 每核 2,691,895–2,806,960 cycles（1631.390–1701.124 µs）</small>
-        <small>AIV 每核 3,446,371–3,631,754 cycles（2089.050–2201.422 µs）</small>
+        <strong>扣局部记录估算参考 Σ 122,359,317.262 cycles · ≈
+          74164.174 µs</strong>
+        <small>参考值 / raw 整窗：13.982%；raw observed / raw 整窗：
+          35.938%</small>
+        <small>raw observed Σ 314,497,428 cycles − 记录代码开销估算
+          192,138,110.738 cycles；估算/raw 61.094%</small>
+        <small>raw Phase total / raw whole total：314,497,428 / 875,104,857 = 35.938%</small>
+        <small>raw AIC 每核 2,691,895–2,806,960 cycles（1631.390–1701.124 µs）</small>
+        <small>raw AIV 每核 3,446,371–3,631,754 cycles（2089.050–2201.422 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>Phase scalar busy</span>
-        <strong>Σ 206,591,150 cycles · ≈
-          125218.596 µs</strong>
-        <small>Scalar / Phase total：206,591,150 / 314,497,428 = 65.689%</small><small>Phase scalar / 同 ELF whole scalar：206,591,150 / 781,865,774 = 26.423%</small>
-        <small>AIC 每核 1,982,935–2,076,648 cycles（1201.734–1258.527 µs）</small>
-        <small>AIV 每核 2,155,867–2,278,654 cycles（1306.799–1381.228 µs）</small>
+        <strong>扣局部记录估算参考 Σ 82,841,966.639 cycles · ≈
+          50212.000 µs</strong>
+        <small>参考值 / raw 整窗：10.595%；raw observed / raw 整窗：
+          26.423%</small>
+        <small>raw observed Σ 206,591,150 cycles − 记录代码开销估算
+          123,749,183.361 cycles；估算/raw 59.901%</small>
+        <small>参考 Scalar / 参考 Phase total：67.704%；raw 65.689%</small><small>raw Phase scalar / raw whole scalar：206,591,150 / 781,865,774 = 26.423%</small>
+        <small>raw AIC 每核 1,982,935–2,076,648 cycles（1201.734–1258.527 µs）</small>
+        <small>raw AIV 每核 2,155,867–2,278,654 cycles（1306.799–1381.228 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>非 Scalar-busy 残余</span>
-        <strong>Σ 107,906,278 cycles · ≈
-          65403.928 µs</strong>
-        <small>逐核先算 total−scalar；残余 / Phase total：107,906,278 / 314,497,428 = 34.311%</small>
-        <small>AIC 每核 690,210–739,516 cycles（418.293–448.175 µs）</small>
-        <small>AIV 每核 1,231,357–1,411,878 cycles（746.399–855.823 µs）</small>
+        <strong>扣局部记录估算参考 Σ 39,517,350.623 cycles · ≈
+          23952.174 µs</strong>
+        <small>参考值 / raw 整窗：42.383%；raw observed / raw 整窗：
+          115.731%</small>
+        <small>raw observed Σ 107,906,278 cycles − 记录代码开销估算
+          68,388,927.377 cycles；估算/raw 63.378%</small>
+        <small>逐核先算 total−scalar；参考 residual / 参考 Phase total：32.296%；raw 34.311%</small>
+        <small>raw AIC 每核 690,210–739,516 cycles（418.293–448.175 µs）</small>
+        <small>raw AIV 每核 1,231,357–1,411,878 cycles（746.399–855.823 µs）</small>
         <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>20,046,246</strong>
-        <small>本 ELF：20,046,246 / 92,089,124 = 21.768%</small>
-        <small>AIC 每核 191,239–192,627；AIV 每核 216,672–218,737</small>
+        <strong>扣局部记录估算参考 13,181,994.889</strong>
+        <small>参考值 / raw 整窗：14.314%</small>
+        <small>raw observed 20,046,246 / raw 整窗 92,089,124
+          = 21.768%</small>
+        <small>raw observed − 记录代码开销估算 6,864,251.111；
+          估算/raw 34.242%</small>
+        <small>raw AIC 每核 191,239–192,627；raw AIV 每核 216,672–218,737</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>1,226,119</strong>
-        <small>本 ELF：1,226,119 / 4,006,223 = 30.605%</small>
-        <small>AIC 每核 605–1,174；AIV 每核 17,966–19,639</small>
+        <strong>扣局部记录估算参考 991,436.489</strong>
+        <small>参考值 / raw 整窗：24.747%</small>
+        <small>raw observed 1,226,119 / raw 整窗 4,006,223
+          = 30.605%</small>
+        <small>raw observed − 记录代码开销估算 234,682.511；
+          估算/raw 19.140%</small>
+        <small>raw AIC 每核 605–1,174；raw AIV 每核 17,966–19,639</small>
       </div>
 
       </div>
@@ -1178,50 +1430,50 @@
 
       <div class="metric">
         <span>Phase PMU total</span>
-        <strong>Σ 192,288,336 cycles · ≈
+        <strong>raw observed Σ 192,288,336 cycles · ≈
           116549.405 µs</strong>
-        <small>Phase total / 同 ELF whole total：192,288,336 / 831,856,934 = 23.116%</small>
-        <small>AIC 每核 1,898,234–1,904,578 cycles（1150.402–1154.246 µs）</small>
-        <small>AIV 每核 2,017,566–2,083,565 cycles（1222.967–1262.973 µs）</small>
+        <small>raw Phase total / raw whole total：192,288,336 / 831,856,934 = 23.116%</small>
+        <small>raw AIC 每核 1,898,234–1,904,578 cycles（1150.402–1154.246 µs）</small>
+        <small>raw AIV 每核 2,017,566–2,083,565 cycles（1222.967–1262.973 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>Phase scalar busy</span>
-        <strong>Σ 123,845,938 cycles · ≈
+        <strong>raw observed Σ 123,845,938 cycles · ≈
           75065.241 µs</strong>
-        <small>Scalar / Phase total：123,845,938 / 192,288,336 = 64.406%</small><small>Phase scalar / 同 ELF whole scalar：123,845,938 / 753,739,352 = 16.431%</small>
-        <small>AIC 每核 1,251,002–1,252,666 cycles（758.155–759.163 µs）</small>
-        <small>AIV 每核 1,296,538–1,315,457 cycles（785.909–797.377 µs）</small>
+        <small>raw Scalar / raw Phase total：123,845,938 / 192,288,336 = 64.406%</small><small>raw Phase scalar / raw whole scalar：123,845,938 / 753,739,352 = 16.431%</small>
+        <small>raw AIC 每核 1,251,002–1,252,666 cycles（758.155–759.163 µs）</small>
+        <small>raw AIV 每核 1,296,538–1,315,457 cycles（785.909–797.377 µs）</small>
 
       </div>
 
 
       <div class="metric">
         <span>非 Scalar-busy 残余</span>
-        <strong>Σ 68,442,398 cycles · ≈
+        <strong>raw observed Σ 68,442,398 cycles · ≈
           41484.163 µs</strong>
-        <small>逐核先算 total−scalar；残余 / Phase total：68,442,398 / 192,288,336 = 35.594%</small>
-        <small>AIC 每核 647,232–652,073 cycles（392.247–395.181 µs）</small>
-        <small>AIV 每核 714,196–768,686 cycles（432.917–465.946 µs）</small>
+        <small>逐核先算 total−scalar；raw residual / raw Phase total：68,442,398 / 192,288,336 = 35.594%</small>
+        <small>raw AIC 每核 647,232–652,073 cycles（392.247–395.181 µs）</small>
+        <small>raw AIV 每核 714,196–768,686 cycles（432.917–465.946 µs）</small>
         <small>它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache request observed</span>
-        <strong>6,869,618</strong>
-        <small>本 ELF：6,869,618 / 90,139,943 = 7.621%</small>
-        <small>AIC 每核 69,140–69,719；AIV 每核 70,952–73,661</small>
+        <strong>raw observed 6,869,618</strong>
+        <small>raw observed / raw 整窗：6,869,618 / 90,139,943 = 7.621%</small>
+        <small>raw AIC 每核 69,140–69,719；raw AIV 每核 70,952–73,661</small>
       </div>
 
 
       <div class="metric">
         <span>I-cache miss observed</span>
-        <strong>234,866</strong>
-        <small>本 ELF：234,866 / 3,190,462 = 7.362%</small>
-        <small>AIC 每核 41–113；AIV 每核 2,513–4,076</small>
+        <strong>raw observed 234,866</strong>
+        <small>raw observed / raw 整窗：234,866 / 3,190,462 = 7.362%</small>
+        <small>raw AIC 每核 41–113；raw AIV 每核 2,513–4,076</small>
       </div>
 
       </div>

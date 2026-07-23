@@ -239,6 +239,50 @@ EXPECTED_RETURN_READY_ATOMIC_EXCLUSION = {
 EXPECTED_PMU_CYCLES_PER_NS = {"all": 1.649844, "aic": 1.650062, "aiv": 1.649731}
 METRICS = ("total_cycles", "scalar_busy", "icache_requests", "icache_misses")
 GROUP_NAMES = ("all", "aic", "aiv")
+PHASE_RECORDING_REFERENCE_METRICS = (
+    (
+        "pmu_total_cycles",
+        "cycles",
+        "phase_total_cycles_observed",
+        "total_cycles",
+    ),
+    (
+        "scalar_busy_cycles",
+        "cycles",
+        "phase_scalar_busy_observed",
+        "scalar_busy",
+    ),
+    (
+        "non_scalar_busy_cycles",
+        "cycles",
+        "phase_non_scalar_busy_cycles",
+        "non_scalar_busy_cycles",
+    ),
+    (
+        "icache_requests",
+        "events",
+        "phase_icache_requests_observed",
+        "icache_requests",
+    ),
+    (
+        "icache_misses",
+        "events",
+        "phase_icache_misses_observed",
+        "icache_misses",
+    ),
+)
+PHASE_CALIBRATION_STABLE_CONFIGURATION_FIELDS = (
+    "num_cores",
+    "aic_cores",
+    "aiv_cores",
+    "sys_counter_tick_ns",
+    "selectors",
+    "linked_kernel_exclusion",
+    "return_ready_atomic_exclusion",
+    "counter_width_bits",
+    "programmable_counter_risk_threshold",
+    "pmu_cycles_per_ns",
+)
 
 
 @dataclass(frozen=True)
@@ -1205,6 +1249,221 @@ def load_capture(input_path: Path | str) -> SubmitPmuCapture:
     )
 
 
+def _recording_reference_metric(
+    *,
+    unit: str,
+    phase_field: str,
+    whole_field: str,
+    target_group: Mapping[str, Any],
+    target_whole: Mapping[str, Any],
+    empty_group: Mapping[str, Any],
+    target_record_pairs: int,
+    empty_record_pairs: int,
+) -> dict[str, Any]:
+    raw_phase_sum = int(target_group[phase_field]["sum"])
+    raw_whole_sum = int(target_whole[whole_field]["sum"])
+    empty_cost_per_record_pair = int(empty_group[phase_field]["sum"]) / empty_record_pairs
+    recording_cost_estimate_sum = empty_cost_per_record_pair * target_record_pairs
+    reference_sum = raw_phase_sum - recording_cost_estimate_sum
+    return {
+        "unit": unit,
+        "phase_field": phase_field,
+        "whole_field": whole_field,
+        "raw_phase_observed_sum": raw_phase_sum,
+        "raw_whole_sum": raw_whole_sum,
+        "raw_phase_observed_ratio_to_raw_whole": (
+            raw_phase_sum / raw_whole_sum if raw_whole_sum else None
+        ),
+        "empty_cost_per_record_pair": empty_cost_per_record_pair,
+        "recording_cost_estimate_sum": recording_cost_estimate_sum,
+        "recording_cost_estimate_share_of_raw_phase": (
+            recording_cost_estimate_sum / raw_phase_sum if raw_phase_sum else None
+        ),
+        "after_recording_cost_reference_sum": reference_sum,
+        "after_recording_cost_reference_ratio_to_raw_whole": (
+            reference_sum / raw_whole_sum if raw_whole_sum else None
+        ),
+    }
+
+
+def _validate_phase_recording_cost_inputs(
+    target_capture: SubmitPmuCapture,
+    empty_capture: SubmitPmuCapture,
+) -> None:
+    target_mode = str(target_capture.data["capture"]["mode"])
+    empty_mode = str(empty_capture.data["capture"]["mode"])
+    if target_mode in {NONE_CAPTURE_MODE, EMPTY_BRACKET_CAPTURE_MODE} or target_capture.phase_summary is None:
+        _fail("recording-cost reference target must be one business phase capture")
+    if empty_mode != EMPTY_BRACKET_CAPTURE_MODE or empty_capture.phase_summary is None:
+        _fail(f"recording-cost calibration must use {EMPTY_BRACKET_CAPTURE_MODE}")
+
+    target_configuration = target_capture.data["configuration"]
+    empty_configuration = empty_capture.data["configuration"]
+    if target_configuration["expected_submits_per_core"] != empty_configuration["expected_submits_per_core"]:
+        _fail("recording-cost target and empty-bracket expected submits do not match")
+    for field in PHASE_CALIBRATION_STABLE_CONFIGURATION_FIELDS:
+        if target_configuration[field] != empty_configuration[field]:
+            _fail(f"recording-cost target and empty-bracket configuration.{field} do not match")
+    if (
+        target_configuration["phase"]["pmu_observation"]
+        != empty_configuration["phase"]["pmu_observation"]
+    ):
+        _fail("recording-cost target and empty-bracket phase PMU observation semantics do not match")
+    if target_capture.data["capture"]["window_scope"] != empty_capture.data["capture"]["window_scope"]:
+        _fail("recording-cost target and empty-bracket window scopes do not match")
+
+    target_topology = tuple(
+        (
+            record["logical_core_id"],
+            record["physical_core_id"],
+            record["role"],
+            record["block_id"],
+            record["lane"],
+        )
+        for record in target_capture.records
+    )
+    empty_topology = tuple(
+        (
+            record["logical_core_id"],
+            record["physical_core_id"],
+            record["role"],
+            record["block_id"],
+            record["lane"],
+        )
+        for record in empty_capture.records
+    )
+    if target_topology != empty_topology:
+        _fail("recording-cost target and empty-bracket core topology do not match")
+
+
+def build_phase_recording_cost_reference(
+    target_capture: SubmitPmuCapture,
+    empty_capture: SubmitPmuCapture,
+) -> dict[str, Any]:
+    """Estimate phase-local recording work without modifying the raw whole denominator.
+
+    The empty-bracket capture measures only code executed inside one phase
+    begin/end recording pair. It therefore supports a reference value for the
+    phase observed numerator, but it does not measure all recording work in the
+    whole Submit window. The raw whole denominator is deliberately left intact.
+    """
+
+    _validate_phase_recording_cost_inputs(target_capture, empty_capture)
+    assert target_capture.phase_summary is not None
+    assert empty_capture.phase_summary is not None
+
+    groups: dict[str, Any] = {}
+    for group_name in ("aic", "aiv"):
+        target_group = target_capture.phase_summary[group_name]
+        empty_group = empty_capture.phase_summary[group_name]
+        target_record_pairs = int(target_group["phase_end_reads"])
+        empty_record_pairs = int(empty_group["phase_end_reads"])
+        if empty_record_pairs <= 0:
+            _fail(f"empty-bracket {group_name} group has no complete begin/end record pair")
+        metrics = {
+            metric_name: _recording_reference_metric(
+                unit=unit,
+                phase_field=phase_field,
+                whole_field=whole_field,
+                target_group=target_group,
+                target_whole=target_capture.summary[group_name],
+                empty_group=empty_group,
+                target_record_pairs=target_record_pairs,
+                empty_record_pairs=empty_record_pairs,
+            )
+            for metric_name, unit, phase_field, whole_field in PHASE_RECORDING_REFERENCE_METRICS
+        }
+        groups[group_name] = {
+            "cores": int(target_capture.summary[group_name]["cores"]),
+            "target_record_pairs": target_record_pairs,
+            "empty_record_pairs": empty_record_pairs,
+            "metrics": metrics,
+        }
+
+    target_all = target_capture.phase_summary["all"]
+    empty_all = empty_capture.phase_summary["all"]
+    target_all_pairs = int(target_all["phase_end_reads"])
+    empty_all_pairs = int(empty_all["phase_end_reads"])
+    role_target_pairs = sum(int(groups[role]["target_record_pairs"]) for role in ("aic", "aiv"))
+    role_empty_pairs = sum(int(groups[role]["empty_record_pairs"]) for role in ("aic", "aiv"))
+    if target_all_pairs != role_target_pairs:
+        _fail("target ALL record-pair count does not equal AIC plus AIV")
+    if empty_all_pairs != role_empty_pairs:
+        _fail("empty-bracket ALL record-pair count does not equal AIC plus AIV")
+
+    all_metrics: dict[str, Any] = {}
+    for metric_name, unit, phase_field, whole_field in PHASE_RECORDING_REFERENCE_METRICS:
+        role_metrics = [groups[role]["metrics"][metric_name] for role in ("aic", "aiv")]
+        raw_phase_sum = sum(int(metric["raw_phase_observed_sum"]) for metric in role_metrics)
+        raw_whole_sum = sum(int(metric["raw_whole_sum"]) for metric in role_metrics)
+        direct_raw_phase_sum = int(target_all[phase_field]["sum"])
+        direct_raw_whole_sum = int(target_capture.summary["all"][whole_field]["sum"])
+        if raw_phase_sum != direct_raw_phase_sum:
+            _fail(f"{metric_name} target ALL phase sum does not equal AIC plus AIV")
+        if raw_whole_sum != direct_raw_whole_sum:
+            _fail(f"{metric_name} target ALL whole sum does not equal AIC plus AIV")
+        recording_cost_estimate_sum = sum(
+            float(metric["recording_cost_estimate_sum"]) for metric in role_metrics
+        )
+        reference_sum = raw_phase_sum - recording_cost_estimate_sum
+        all_metrics[metric_name] = {
+            "unit": unit,
+            "phase_field": phase_field,
+            "whole_field": whole_field,
+            "raw_phase_observed_sum": raw_phase_sum,
+            "raw_whole_sum": raw_whole_sum,
+            "raw_phase_observed_ratio_to_raw_whole": (
+                raw_phase_sum / raw_whole_sum if raw_whole_sum else None
+            ),
+            "empty_cost_per_record_pair": (
+                recording_cost_estimate_sum / target_all_pairs if target_all_pairs else None
+            ),
+            "recording_cost_estimate_sum": recording_cost_estimate_sum,
+            "recording_cost_estimate_share_of_raw_phase": (
+                recording_cost_estimate_sum / raw_phase_sum if raw_phase_sum else None
+            ),
+            "after_recording_cost_reference_sum": reference_sum,
+            "after_recording_cost_reference_ratio_to_raw_whole": (
+                reference_sum / raw_whole_sum if raw_whole_sum else None
+            ),
+        }
+    groups["all"] = {
+        "cores": int(target_capture.summary["all"]["cores"]),
+        "target_record_pairs": target_all_pairs,
+        "empty_record_pairs": empty_all_pairs,
+        "metrics": all_metrics,
+        "all_values_are_aic_aiv_sums": True,
+    }
+
+    total_metrics = groups["all"]["metrics"]
+    for field in (
+        "raw_phase_observed_sum",
+        "raw_whole_sum",
+        "recording_cost_estimate_sum",
+        "after_recording_cost_reference_sum",
+    ):
+        total_value = float(total_metrics["pmu_total_cycles"][field])
+        component_value = float(total_metrics["scalar_busy_cycles"][field]) + float(
+            total_metrics["non_scalar_busy_cycles"][field]
+        )
+        if not math.isclose(total_value, component_value, rel_tol=1e-12, abs_tol=1e-9):
+            _fail(f"recording-cost reference total does not equal scalar plus non-scalar for {field}")
+
+    return {
+        "kind": "phase-local-recording-cost-reference",
+        "target_capture_mode": str(target_capture.data["capture"]["mode"]),
+        "target_raw_path": str(target_capture.input_path.resolve()),
+        "target_raw_sha256": target_capture.raw_sha256,
+        "calibration_capture_mode": EMPTY_BRACKET_CAPTURE_MODE,
+        "calibration_raw_path": str(empty_capture.input_path.resolve()),
+        "calibration_raw_sha256": empty_capture.raw_sha256,
+        "exact_correction": False,
+        "raw_whole_denominator_is_unchanged": True,
+        "whole_recording_cost_is_not_measured": True,
+        "groups": groups,
+    }
+
+
 def _assert_capture_raw_unchanged(capture: SubmitPmuCapture) -> bytes:
     """Re-read one raw and prove it still equals the snapshot accepted by the loader."""
 
@@ -1381,12 +1640,40 @@ def load_provenance(
     return data, hashlib.sha256(raw_bytes).hexdigest()
 
 
+def _validate_recording_reference_provenance(
+    target: Mapping[str, Any],
+    calibration: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind one empty-bracket estimate to the same source revision and scenario."""
+
+    target_build = target["build"]
+    calibration_build = calibration["build"]
+    if target_build["git_head"] != calibration_build["git_head"]:
+        _fail("recording-cost target and empty-bracket provenance git heads do not match")
+    target_key = tuple(str(value) for value in target_build["profiled_cache_key"])
+    calibration_key = tuple(str(value) for value in calibration_build["profiled_cache_key"])
+    if len(target_key) < 2 or len(calibration_key) < 2 or target_key[:-1] != calibration_key[:-1]:
+        _fail("recording-cost target and empty-bracket provenance scenarios do not match")
+    if target_build["source_state_version"] != calibration_build["source_state_version"]:
+        _fail("recording-cost target and empty-bracket source-state versions do not match")
+    return {
+        "verified": True,
+        "git_head": str(target_build["git_head"]),
+        "source_state_version": str(target_build["source_state_version"]),
+        "profiled_cache_key_prefix": list(target_key[:-1]),
+    }
+
+
 def _format_integer(value: int | float) -> str:
     return f"{int(value):,}"
 
 
 def _format_number(value: int | float, digits: int = 3) -> str:
     return f"{float(value):,.{digits}f}"
+
+
+def _format_optional_percent(value: float | None) -> str:
+    return "N/A" if value is None else f"{value:.3%}"
 
 
 def _metric_range(summary: Mapping[str, int | float], *, digits: int = 1) -> str:
@@ -1545,13 +1832,32 @@ def _phase_observed_cell(
     primary: int,
     observed_share: float,
     observed_plus_capture_gap_share: float,
+    recording_reference: Mapping[str, Any] | None = None,
 ) -> str:
     capture_gap = int(observed_plus_capture_gap["sum"]) - int(observed["sum"])
+    if recording_reference is not None:
+        return (
+            "<strong>扣除记录代码开销估算后的参考值 "
+            f"{_format_number(recording_reference['after_recording_cost_reference_sum'])}</strong><br>"
+            f"<small>原始 observed {_format_integer(observed['sum'])} − 记录代码开销估算 "
+            f"{_format_number(recording_reference['recording_cost_estimate_sum'])}</small><br>"
+            f"<small>参考值 / 原始整窗 "
+            f"{_format_optional_percent(recording_reference['after_recording_cost_reference_ratio_to_raw_whole'])}；"
+            f"原始 observed / 原始整窗 "
+            f"{_format_optional_percent(recording_reference['raw_phase_observed_ratio_to_raw_whole'])}</small><br>"
+            f"<small>记录代码开销估算 / 原始 observed "
+            f"{_format_optional_percent(recording_reference['recording_cost_estimate_share_of_raw_phase'])}</small><br>"
+            f"<small>原始逐核 {_metric_extrema(observed)}；原始整窗 {_format_integer(primary)}</small><br>"
+            f"<small>原始 capture gap +{_format_integer(capture_gap)}；加 gap 后 "
+            f"{_format_integer(observed_plus_capture_gap['sum'])}"
+            f"（{observed_plus_capture_gap_share:.3%}）</small>"
+        )
     return (
-        f"<strong>{_format_integer(observed['sum'])}</strong><br>"
-        f"<small>逐核 {_metric_extrema(observed)}</small><br>"
-        f"<small>Primary {_format_integer(primary)}；占比 {observed_share:.3%}</small><br>"
-        f"<small>capture gap +{_format_integer(capture_gap)}；加 gap 后 "
+        f"<strong>原始 observed {_format_integer(observed['sum'])}</strong><br>"
+        f"<small>原始逐核 {_metric_extrema(observed)}</small><br>"
+        f"<small>原始整窗 {_format_integer(primary)}；原始 observed / 原始整窗 "
+        f"{observed_share:.3%}（非业务占比）</small><br>"
+        f"<small>原始 capture gap +{_format_integer(capture_gap)}；加 gap 后 "
         f"{_format_integer(observed_plus_capture_gap['sum'])}（{observed_plus_capture_gap_share:.3%}）</small>"
     )
 
@@ -1560,19 +1866,101 @@ def _phase_cycle_cell(
     observed: Mapping[str, int | float],
     cycles_per_ns: float,
     per_call: float | None,
+    recording_reference: Mapping[str, Any] | None = None,
 ) -> str:
     """Render one role-calibrated phase PMU quantity without using SYS ticks as time."""
 
     elapsed_us = float(observed["sum"]) / cycles_per_ns / 1_000
-    per_call_text = "—" if per_call is None else f"{_format_number(per_call)} cycles/call"
+    per_call_text = "—" if per_call is None else f"原始 {_format_number(per_call)} cycles/call"
+    if recording_reference is not None:
+        reference_sum = float(recording_reference["after_recording_cost_reference_sum"])
+        estimate_sum = float(recording_reference["recording_cost_estimate_sum"])
+        return (
+            "<strong>扣除记录代码开销估算后的参考值 Σ "
+            f"{_format_number(reference_sum)} cycles</strong><br>"
+            f"<small>≈ {_format_number(reference_sum / cycles_per_ns / 1_000)} µs"
+            f"（{cycles_per_ns:.6f} cycles/ns）</small><br>"
+            f"<small>原始 observed Σ {_format_integer(observed['sum'])} cycles"
+            f"（≈ {_format_number(elapsed_us)} µs）− 记录代码开销估算 "
+            f"{_format_number(estimate_sum)} cycles</small><br>"
+            f"<small>记录代码开销估算 / 原始 observed "
+            f"{_format_optional_percent(recording_reference['recording_cost_estimate_share_of_raw_phase'])}；"
+            f"原始逐核 {_metric_extrema(observed)}；{per_call_text}</small>"
+        )
     return (
-        f"<strong>Σ {_format_integer(observed['sum'])} cycles</strong><br>"
+        f"<strong>原始 observed Σ {_format_integer(observed['sum'])} cycles</strong><br>"
         f"<small>≈ {_format_number(elapsed_us)} µs（{cycles_per_ns:.6f} cycles/ns）</small><br>"
-        f"<small>逐核 {_metric_extrema(observed)}；{per_call_text}</small>"
+        f"<small>原始逐核 {_metric_extrema(observed)}；{per_call_text}</small>"
     )
 
 
-def _phase_overview(capture: SubmitPmuCapture) -> str:
+def _phase_recording_note(
+    phase: Mapping[str, Any],
+    recording_cost_reference: Mapping[str, Any] | None,
+) -> str:
+    if phase["id"] == EMPTY_BRACKET_PHASE_ID:
+        return """
+    <p class="notice"><strong>empty-bracket 用于估算每次 begin/end 紧邻执行的记录代码开销，
+      不是业务 phase。</strong>
+      phase PMU total/scalar 是紧邻 begin/end 对本身带来的计数开销；request/miss observed
+      仍只覆盖两次 shadow read-clear 之间。SYS tick 只用来核验边界是否闭合，不参与阶段主时间换算。
+      这些结果只能用于估算进入 phase observed 的局部记录代码，不能估算完整 whole
+      窗口中的全部记录开销。</p>
+        """
+    if recording_cost_reference is None:
+        return """
+    <p class="notice"><strong>本报告没有提供 empty-bracket 校准输入。</strong>
+      下表只能展示原始 phase observed 与本 ELF raw 整窗的比例；记录代码本身进入了 phase
+      observed，因此这些 raw 比例不能解释为业务阶段占比。若要生成扣除局部记录代码开销估算后的
+      参考值，请用 <code>--calibration-input</code> 指定对应的 empty-bracket raw。</p>
+        """
+
+    calibration_path = html.escape(str(recording_cost_reference["calibration_raw_path"]))
+    calibration_sha = html.escape(str(recording_cost_reference["calibration_raw_sha256"]))
+    provenance_binding = recording_cost_reference.get("provenance_binding")
+    if provenance_binding and provenance_binding["verified"]:
+        provenance_note = (
+            "两份 provenance 已核验为同一场景、同一 Git revision "
+            f"<code>{html.escape(str(provenance_binding['git_head'])[:12])}</code>。"
+        )
+    else:
+        provenance_note = (
+            "两份 raw 均未提供 provenance sidecar；当前只校验了 raw 配置、窗口语义和核拓扑，"
+            "没有证明它们来自同一代码 revision。"
+        )
+    return f"""
+    <p class="notice"><strong>本报告使用 empty-bracket 估算进入 phase observed
+      的局部记录代码开销。</strong>
+      AIC/AIV 分别按“空区间每组记录开销 × 本阶段实际 begin/end 记录组数”计算，ALL
+      再由两类核相加。参考值只从 phase observed 分子扣除该估算；原始 whole 分母保持不变，
+      因为空区间没有测量 whole 窗口中的全部记录开销。所以下表的参考比例不是完整业务
+      阶段占完整调度窗口的比例，也不是精确校正。若参考值为负，表示记录代码开销估算已经
+      超过原始 observed；这只能说明该信号低于当前校准的分辨能力，不能截成零或解释成负的
+      业务事件。校准 raw：<code>{calibration_path}</code> ·
+      SHA-256 <code>{calibration_sha}</code>。{provenance_note}</p>
+        """
+
+
+def _phase_table_headers(
+    recording_cost_reference: Mapping[str, Any] | None,
+) -> tuple[str, str, str]:
+    if recording_cost_reference is None:
+        return (
+            "原始阶段关系（非业务占比）",
+            "Request raw observed（总数 / 逐核 min–max / 原始整窗）",
+            "Miss raw observed（总数 / 逐核 min–max / 原始整窗）",
+        )
+    return (
+        "阶段参考关系（raw 同格保留）",
+        "Request（参考主值 / raw 明细）",
+        "Miss（参考主值 / raw 明细）",
+    )
+
+
+def _phase_overview(
+    capture: SubmitPmuCapture,
+    recording_cost_reference: Mapping[str, Any] | None = None,
+) -> str:
     if capture.phase_summary is None:
         return ""
 
@@ -1592,14 +1980,7 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
                 f"call_shape={phase['call_shape']} · expected_calls="
                 f"ALL {expected['all']} / AIC {expected['aic']} / AIV {expected['aiv']}"
             )
-    calibration_note = ""
-    if phase["id"] == EMPTY_BRACKET_PHASE_ID:
-        calibration_note = """
-    <p class="notice"><strong>empty-bracket 是每次 begin/end 紧邻执行的观察器自成本量尺，不是业务 phase。</strong>
-      phase PMU total/scalar 是紧邻 begin/end 对本身带来的计数开销量尺；request/miss observed
-      仍只覆盖两次 shadow read-clear 之间。SYS tick 只用来核验边界是否闭合，不参与阶段主时间换算。
-      这些量尺都不能跨 ELF 精确扣减。</p>
-        """
+    calibration_note = _phase_recording_note(phase, recording_cost_reference)
     control_exclusion_note = ""
     if capture.data["capture"]["mode"] in KERNEL_EXCLUDING_PHASE_CAPTURE_MODES:
         control_exclusion_note = """
@@ -1610,27 +1991,37 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
       保留在时间和计数口径内。没有 linked Kernel 的阶段不触发 PMU 停/开表；
       每次调用的分母仍是外层业务调用次数，不是 Begin/End 读数，也不是排除的 Kernel 调用数。</p>
         """
+    relationship_header, request_header, miss_header = _phase_table_headers(
+        recording_cost_reference
+    )
 
     rows = []
     frequencies = capture.data["configuration"]["pmu_cycles_per_ns"]
     for group_name in GROUP_NAMES:
         group = capture.phase_summary[group_name]
+        reference_group = (
+            None if recording_cost_reference is None else recording_cost_reference["groups"][group_name]
+        )
+        reference_metrics = None if reference_group is None else reference_group["metrics"]
         title = {"all": "ALL", "aic": "AIC", "aiv": "AIV"}[group_name]
         cycles_per_ns = float(frequencies[group_name])
         total_observed = _phase_cycle_cell(
             group["phase_total_cycles_observed"],
             cycles_per_ns,
             group["phase_total_cycles_observed_per_call"],
+            None if reference_metrics is None else reference_metrics["pmu_total_cycles"],
         )
         scalar_observed = _phase_cycle_cell(
             group["phase_scalar_busy_observed"],
             cycles_per_ns,
             group["phase_scalar_busy_observed_per_call"],
+            None if reference_metrics is None else reference_metrics["scalar_busy_cycles"],
         )
         non_scalar = _phase_cycle_cell(
             group["phase_non_scalar_busy_cycles"],
             cycles_per_ns,
             group["phase_non_scalar_busy_cycles_per_call"],
+            None if reference_metrics is None else reference_metrics["non_scalar_busy_cycles"],
         )
         request_observed = _phase_observed_cell(
             group["phase_icache_requests_observed"],
@@ -1638,6 +2029,7 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
             group["primary_icache_requests"],
             group["phase_request_observed_share_of_primary"],
             group["phase_request_observed_plus_capture_gap_share_of_primary"],
+            None if reference_metrics is None else reference_metrics["icache_requests"],
         )
         miss_observed = _phase_observed_cell(
             group["phase_icache_misses_observed"],
@@ -1645,6 +2037,7 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
             group["primary_icache_misses"],
             group["phase_miss_observed_share_of_primary"],
             group["phase_miss_observed_plus_capture_gap_share_of_primary"],
+            None if reference_metrics is None else reference_metrics["icache_misses"],
         )
         reads = f"{_format_integer(group['phase_begin_reads'])} / {_format_integer(group['phase_end_reads'])}"
         if capture.data["capture"]["mode"] in KERNEL_EXCLUDING_PHASE_CAPTURE_MODES:
@@ -1659,18 +2052,50 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
                 f"<br><small>逐核 {_format_integer(calls['min'])}–{_format_integer(calls['max'])}；"
                 f"零调用核 {_format_integer(group['phase_zero_call_cores'])}</small>"
             )
-        relationships = (
-            f"<strong>Scalar / Phase total {group['phase_scalar_busy_share_of_phase_total']:.3%}</strong><br>"
-            f"<small>Non-scalar / Phase total "
-            f"{1.0 - group['phase_scalar_busy_share_of_phase_total']:.3%}</small><br>"
-            f"<small>Phase total / 同 ELF whole total "
-            f"{group['phase_total_share_of_pmu_total']:.3%}</small><br>"
-            f"<small>Phase scalar / 同 ELF whole scalar "
-            f"{group['phase_scalar_share_of_whole_scalar']:.3%}</small><br>"
-            f"<small>whole scalar−shadow scalar：Σ "
-            f"{_format_integer(group['shadow_scalar_loss']['sum'])} cycles；逐核 "
-            f"{_metric_extrema(group['shadow_scalar_loss'])}</small>"
-        )
+        if reference_metrics is None:
+            relationships = (
+                "<strong>以下均为原始 observed，不能作为业务占比</strong><br>"
+                f"<small>原始 Scalar / 原始 Phase total "
+                f"{group['phase_scalar_busy_share_of_phase_total']:.3%}</small><br>"
+                f"<small>原始 Non-scalar / 原始 Phase total "
+                f"{1.0 - group['phase_scalar_busy_share_of_phase_total']:.3%}</small><br>"
+                f"<small>原始 Phase total / 原始 whole total "
+                f"{group['phase_total_share_of_pmu_total']:.3%}</small><br>"
+                f"<small>原始 Phase scalar / 原始 whole scalar "
+                f"{group['phase_scalar_share_of_whole_scalar']:.3%}</small><br>"
+                f"<small>whole scalar−shadow scalar：Σ "
+                f"{_format_integer(group['shadow_scalar_loss']['sum'])} cycles；逐核 "
+                f"{_metric_extrema(group['shadow_scalar_loss'])}</small>"
+            )
+        else:
+            total_reference = reference_metrics["pmu_total_cycles"]
+            scalar_reference = reference_metrics["scalar_busy_cycles"]
+            non_scalar_reference = reference_metrics["non_scalar_busy_cycles"]
+            total_reference_sum = float(total_reference["after_recording_cost_reference_sum"])
+            scalar_reference_sum = float(scalar_reference["after_recording_cost_reference_sum"])
+            non_scalar_reference_sum = float(non_scalar_reference["after_recording_cost_reference_sum"])
+            scalar_of_reference_total = (
+                scalar_reference_sum / total_reference_sum if total_reference_sum else None
+            )
+            non_scalar_of_reference_total = (
+                non_scalar_reference_sum / total_reference_sum if total_reference_sum else None
+            )
+            relationships = (
+                "<strong>扣除局部记录代码开销估算后的参考比例</strong><br>"
+                f"<small>参考 Scalar / 参考 Phase total "
+                f"{_format_optional_percent(scalar_of_reference_total)}</small><br>"
+                f"<small>参考 Non-scalar / 参考 Phase total "
+                f"{_format_optional_percent(non_scalar_of_reference_total)}</small><br>"
+                f"<small>参考 Phase total / 原始 whole total "
+                f"{_format_optional_percent(total_reference['after_recording_cost_reference_ratio_to_raw_whole'])}"
+                f"；原始 observed {group['phase_total_share_of_pmu_total']:.3%}</small><br>"
+                f"<small>参考 Phase scalar / 原始 whole scalar "
+                f"{_format_optional_percent(scalar_reference['after_recording_cost_reference_ratio_to_raw_whole'])}"
+                f"；原始 observed {group['phase_scalar_share_of_whole_scalar']:.3%}</small><br>"
+                f"<small>whole scalar−shadow scalar：Σ "
+                f"{_format_integer(group['shadow_scalar_loss']['sum'])} cycles；逐核 "
+                f"{_metric_extrema(group['shadow_scalar_loss'])}</small>"
+            )
         sys_diagnostic = (
             f"Σ {_format_integer(group['phase_elapsed_ticks']['sum'])} raw ticks<br>"
             f"<small>逐核 {_metric_extrema(group['phase_elapsed_ticks'])}；仅边界诊断</small>"
@@ -1692,23 +2117,27 @@ def _phase_overview(capture: SubmitPmuCapture) -> str:
       <code>{html.escape(call_shape_text)}</code></p>
     {calibration_note}
     {control_exclusion_note}
-    <p><strong>阶段主时间来自 running read-clear 的 PMU total cycles，并按 AIC/AIV
-      各自校准频率换算；phase_elapsed_ticks 只是 SYS 边界闭合诊断，绝不按 1 GHz 当作阶段时间。</strong>
+    <p><strong>阶段原始 PMU 观测来自 running read-clear 的 total cycles，并按 AIC/AIV
+      各自校准频率换算；提供 empty-bracket 时，页面主参考值再扣除局部记录代码开销估算。
+      phase_elapsed_ticks 只是 SYS 边界闭合诊断，绝不按 1 GHz 当作阶段时间。</strong>
       Scalar busy 与 non-scalar residual（逐核先算 total−scalar）共同解释阶段 PMU total；
-      三个占比分母均来自同一个 phase ELF 的整窗 primary，不能拿另一个构建作分母。
+      未校准时只能展示 raw observed；提供 empty-bracket 后，记录代码开销估算只从 phase
+      observed 分子扣除，原始 whole 分母保持不变。当前数据无法得到完整业务阶段占完整调度
+      窗口的精确比例。
       linked vector/cube Kernel 从 SYS 与 PMU counter 一并门控排除；result-used return-ready atomic
       依赖区间只从 SYS 边界累计值扣除，I-cache/PMU counter 仍含其指令事件；source-issue atomic
       保留。request/miss 百分比的分母是同一 ELF、同一次采集的 Submit 整窗 primary。
       <code>observed_plus_capture_gap = observed + (primary − shadow)</code>；
       边界读数和插桩 bookkeeping 会进入 sample，因此“观测值”和“加全窗 capture gap”都不是原业务
-      事件数的数学上下界，也不能跨 ELF 相减。request/miss 的逐核 min/max 是每核累计
-      整个 phase 的极值，不是逐调用极值。</p>
+      事件数的数学上下界。不同 ELF 不能直接相减后冒充业务真值；提供 empty-bracket 时只按上方
+      明示的公式估算局部记录代码开销。request/miss 的逐核 min/max 是每核累计整个 phase
+      的极值，不是逐调用极值。</p>
     <div class="table-wrap phase-table"><table>
       <thead><tr>
         <th>核组</th><th>Phase PMU total</th><th>Phase scalar busy</th>
-        <th>非 Scalar-busy 残余</th><th>阶段关系 / 同 ELF 整窗占比</th>
-        <th>Request observed（总数 / 逐核 min–max / Primary）</th>
-        <th>Miss observed（总数 / 逐核 min–max / Primary）</th>
+        <th>非 Scalar-busy 残余</th><th>{relationship_header}</th>
+        <th>{request_header}</th>
+        <th>{miss_header}</th>
         <th>SYS 边界诊断 / Begin-End</th>
       </tr></thead>
       <tbody>{"".join(rows)}</tbody>
@@ -1771,6 +2200,7 @@ def _document(
     miss_penalty_ns: float,
     provenance: Mapping[str, Any] | None = None,
     provenance_sha256: str | None = None,
+    recording_cost_reference: Mapping[str, Any] | None = None,
 ) -> str:
     configuration = capture.data["configuration"]
     frequencies = configuration["pmu_cycles_per_ns"]
@@ -1788,7 +2218,7 @@ def _document(
         )
     )
     rows = _per_core_rows(capture.records, miss_penalty_ns)
-    phase_overview = _phase_overview(capture)
+    phase_overview = _phase_overview(capture, recording_cost_reference)
     provenance_overview = _provenance_overview(provenance, provenance_sha256)
     shadow_note = (
         "phase 模式的 I-cache shadow 是 begin/end/final 全部 running read-clear 返回值之和，"
@@ -1895,7 +2325,18 @@ def _document(
 """
 
 
-def render_report(input_path: Path | str, *, miss_penalty_ns: float = 90.0) -> str:
+def _clean_html_document(document: str) -> str:
+    """Normalize generated HTML so published artifacts never retain indentation-only lines."""
+
+    return "\n".join(line.rstrip() for line in document.splitlines()) + "\n"
+
+
+def render_report(
+    input_path: Path | str,
+    *,
+    miss_penalty_ns: float = 90.0,
+    calibration_input_path: Path | str | None = None,
+) -> str:
     """Return a self-contained HTML report after validating and recomputing the raw capture."""
 
     penalty = _number(miss_penalty_ns, "miss_penalty_ns", positive=True)
@@ -1905,9 +2346,44 @@ def render_report(input_path: Path | str, *, miss_penalty_ns: float = 90.0) -> s
     provenance_sha256 = None
     if provenance_path.is_file():
         provenance, provenance_sha256 = load_provenance(provenance_path, capture)
-    document = _document(capture, penalty, provenance, provenance_sha256)
+
+    calibration_capture = None
+    recording_cost_reference = None
+    if calibration_input_path is not None:
+        calibration_capture = load_capture(calibration_input_path)
+        recording_cost_reference = build_phase_recording_cost_reference(capture, calibration_capture)
+        calibration_provenance_path = calibration_capture.input_path.with_name(DEFAULT_PROVENANCE_NAME)
+        if provenance_path.is_file() != calibration_provenance_path.is_file():
+            _fail(
+                "recording-cost target and empty-bracket must either both provide provenance sidecars "
+                "or both omit them"
+            )
+        if provenance is None:
+            recording_cost_reference["provenance_binding"] = {
+                "verified": False,
+                "reason": "both raw inputs omit provenance sidecars",
+            }
+        else:
+            calibration_provenance, calibration_provenance_sha256 = load_provenance(
+                calibration_provenance_path,
+                calibration_capture,
+            )
+            recording_cost_reference["provenance_binding"] = {
+                **_validate_recording_reference_provenance(provenance, calibration_provenance),
+                "target_provenance_sha256": provenance_sha256,
+                "calibration_provenance_sha256": calibration_provenance_sha256,
+            }
+    document = _document(
+        capture,
+        penalty,
+        provenance,
+        provenance_sha256,
+        recording_cost_reference,
+    )
     _assert_capture_raw_unchanged(capture)
-    return document
+    if calibration_capture is not None:
+        _assert_capture_raw_unchanged(calibration_capture)
+    return _clean_html_document(document)
 
 
 def _atomic_write_text(output_file: Path, document: str) -> None:
@@ -2026,6 +2502,7 @@ def write_report(
     output_path: Path | str | None = None,
     *,
     miss_penalty_ns: float = 90.0,
+    calibration_input_path: Path | str | None = None,
 ) -> Path:
     """Validate first, then atomically publish the fixed-name HTML artifact."""
 
@@ -2033,7 +2510,11 @@ def write_report(
     output_file = Path(output_path) if output_path is not None else input_file.with_name(DEFAULT_OUTPUT_NAME)
     if output_file.name != DEFAULT_OUTPUT_NAME:
         _fail(f"Submit-PMU output filename must be {DEFAULT_OUTPUT_NAME!r}")
-    document = render_report(input_file, miss_penalty_ns=miss_penalty_ns)
+    document = render_report(
+        input_file,
+        miss_penalty_ns=miss_penalty_ns,
+        calibration_input_path=calibration_input_path,
+    )
     _atomic_write_text(output_file, document)
     return output_file
 
@@ -2067,7 +2548,9 @@ def write_report_with_provenance(
         capture,
     )
     provenance_sha256 = hashlib.sha256(provenance_document.encode("utf-8")).hexdigest()
-    document = _document(capture, penalty, validated_provenance, provenance_sha256)
+    document = _clean_html_document(
+        _document(capture, penalty, validated_provenance, provenance_sha256)
+    )
     _publish_provenance_report_pair(
         capture=capture,
         raw_snapshot=raw_snapshot,
@@ -2094,9 +2577,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=90.0,
         help="intuitive miss-cost scale only; it is not wall-clock loss (default: 90)",
     )
+    parser.add_argument(
+        "--calibration-input",
+        type=Path,
+        help=(
+            f"{EMPTY_BRACKET_CAPTURE_MODE} {DEFAULT_INPUT_NAME}; estimates only phase-local "
+            "recording work and leaves the raw whole denominator unchanged"
+        ),
+    )
     args = parser.parse_args(argv)
     try:
-        output = write_report(args.input, args.output, miss_penalty_ns=args.miss_penalty_ns)
+        output = write_report(
+            args.input,
+            args.output,
+            miss_penalty_ns=args.miss_penalty_ns,
+            calibration_input_path=args.calibration_input,
+        )
     except (OSError, ValueError) as error:
         parser.exit(2, f"error: {error}\n")
     print(output)

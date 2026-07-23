@@ -42,6 +42,7 @@ try:
         SUBMIT_TRANSITION_CAPTURE_MODE,
         WINNER_BUILD_CAPTURE_MODE,
         SubmitPmuCapture,
+        build_phase_recording_cost_reference,
         load_capture,
         load_provenance,
     )
@@ -64,6 +65,7 @@ except ImportError:
         SUBMIT_TRANSITION_CAPTURE_MODE,
         WINNER_BUILD_CAPTURE_MODE,
         SubmitPmuCapture,
+        build_phase_recording_cost_reference,
         load_capture,
         load_provenance,
     )
@@ -74,7 +76,7 @@ except ImportError:
     )
 
 
-OVERVIEW_SCHEMA = "fdwic-submit-span-overview-v3"
+OVERVIEW_SCHEMA = "fdwic-submit-span-overview-v5"
 DEFAULT_JSON_NAME = "fdwic_submit_span_overview.json"
 DEFAULT_HTML_NAME = "fdwic_submit_span_overview.html"
 OUTPUT_LOCK_NAME = ".fdwic_submit_span_overview.lock"
@@ -130,6 +132,22 @@ PARTITION_PMU_MODE_BY_METRIC = {
     "alloc_complete": ALLOC_COMPLETE_CAPTURE_MODE,
     "loser_replay": LOSER_REPLAY_CAPTURE_MODE,
 }
+
+# SubmitUnion 的均值合计除 9 个直接对应表格行的 phase 外，还包含精确覆盖
+# Claim.end→Materialize.begin 子段的 ArgBuild。SubmitTransition 属于相邻 Submit 间隙，
+# 严格位于 SubmitUnion 之外，因此不进入这里的分子。
+SUBMIT_UNION_PMU_MODES = (
+    EFDRAIN_CONTROL_CAPTURE_MODE,
+    CLAIM_CAPTURE_MODE,
+    ARG_BUILD_CAPTURE_MODE,
+    MATERIALIZE_CAPTURE_MODE,
+    PREPARE_MAP_CAPTURE_MODE,
+    FANIN_CAPTURE_MODE,
+    REGISTER_CAPTURE_MODE,
+    WINNER_BUILD_CAPTURE_MODE,
+    ALLOC_COMPLETE_CAPTURE_MODE,
+    LOSER_REPLAY_CAPTURE_MODE,
+)
 
 SYNTHETIC_PHASE_SUM_METRICS = (
     (
@@ -533,6 +551,7 @@ def _summarize_swimlane(
                 "schema-v4 raw was strictly reanalyzed, but this capture has no build-provenance sidecar"
             ),
         },
+        "core_count": len(per_core),
         "sys_counter_frequency_hz": frequency_hz,
         "sys_counter_semantics": "SYS counter ticks; not PMU cycles",
         "global_submit_makespan": analysis["global_submit_makespan"],
@@ -626,6 +645,10 @@ def _phase_group_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
         "phase_request_observed_share_of_primary": float(summary["phase_request_observed_share_of_primary"]),
         "phase_miss_observed_share_of_primary": float(summary["phase_miss_observed_share_of_primary"]),
         "phase_business_calls": int(summary["phase_business_calls"]),
+        # 每个 end read 对应一组完整的 begin/end 记录边界。跨 linked Kernel
+        # 的 pause/resume 会额外产生一组，因此它比外层业务调用次数更适合
+        # 缩放 empty-bracket 测得的记录代码开销。
+        "phase_record_pairs": int(summary["phase_end_reads"]),
         "phase_calls_per_core": _metric_range(summary["phase_calls_per_core"]),
         "phase_zero_call_cores": int(summary["phase_zero_call_cores"]),
         "phase_excluded_kernel_calls": int(summary.get("phase_excluded_kernel_calls", 0)),
@@ -713,40 +736,153 @@ def _synthetic_phase_sum_vs_none(
     phase_profiles: Sequence[Mapping[str, Any]],
     whole_window: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Sum independent phase observations only as an explicit instrumentation-inflation diagnostic."""
+    """Estimate the phase recorder's contribution without presenting it as an exact correction."""
 
-    groups = {}
+    def metric_payload(
+        *,
+        label: str,
+        unit: str,
+        phase_field: str,
+        whole_field: str,
+        raw_sum: int,
+        none_sum: int,
+        cores: int,
+        empty_cost_per_record_pair: float,
+        recording_cost_estimate_sum: float,
+    ) -> dict[str, Any]:
+        raw_mean = raw_sum / cores
+        none_mean = none_sum / cores
+        recording_mean = recording_cost_estimate_sum / cores
+        reference_sum = raw_sum - recording_cost_estimate_sum
+        reference_mean = reference_sum / cores
+        return {
+            "label": label,
+            "unit": unit,
+            "raw_observed_sum": raw_sum,
+            "raw_observed_mean": raw_mean,
+            "submit_none_sum": none_sum,
+            "submit_none_mean": none_mean,
+            "raw_observed_ratio_to_submit_none": raw_mean / none_mean if none_mean else None,
+            "empty_cost_per_record_pair": empty_cost_per_record_pair,
+            "recording_cost_estimate_sum": recording_cost_estimate_sum,
+            "recording_cost_estimate_mean": recording_mean,
+            "recording_cost_estimate_share_of_raw": recording_mean / raw_mean if raw_mean else None,
+            "recording_cost_estimate_ratio_to_submit_none": (
+                recording_mean / none_mean if none_mean else None
+            ),
+            "after_recording_cost_reference_sum": reference_sum,
+            "after_recording_cost_reference_mean": reference_mean,
+            "after_recording_cost_reference_ratio_to_submit_none": (
+                reference_mean / none_mean if none_mean else None
+            ),
+            "phase_field": phase_field,
+            "submit_none_field": whole_field,
+        }
+
+    groups: dict[str, Any] = {}
     for group_name in ("all", "aic", "aiv"):
+        denominator = whole_window["denominators"][group_name]
+        cores = int(denominator["cores"])
+        phase_business_calls = sum(
+            int(profile["phase"]["groups"][group_name]["phase_business_calls"]) for profile in phase_profiles
+        )
+        phase_record_pairs = sum(
+            int(profile["phase"]["groups"][group_name]["phase_record_pairs"]) for profile in phase_profiles
+        )
+        calibration_pair_counts = {
+            int(profile["recording_cost_reference"]["groups"][group_name]["empty_record_pairs"])
+            for profile in phase_profiles
+        }
+        if len(calibration_pair_counts) != 1:
+            _fail(f"phase profiles do not share one {group_name} empty-bracket calibration pair count")
+        calibration_pairs = next(iter(calibration_pair_counts))
         group_metrics = {}
         for metric_name, label, phase_field, whole_field, unit in SYNTHETIC_PHASE_SUM_METRICS:
-            phase_sum = sum(
-                int(profile["phase"]["groups"][group_name][phase_field]["sum"]) for profile in phase_profiles
+            profile_metrics = [
+                profile["recording_cost_reference"]["groups"][group_name]["metrics"][metric_name]
+                for profile in phase_profiles
+            ]
+            raw_sum = sum(int(metric["raw_phase_observed_sum"]) for metric in profile_metrics)
+            recording_sum = sum(float(metric["recording_cost_estimate_sum"]) for metric in profile_metrics)
+            direct_reference_sum = sum(
+                float(metric["after_recording_cost_reference_sum"]) for metric in profile_metrics
             )
-            none_value = int(whole_window["denominators"][group_name][whole_field]["sum"])
-            ratio = phase_sum / none_value if none_value else None
-            group_metrics[metric_name] = {
-                "label": label,
-                "unit": unit,
-                "phase_sum": phase_sum,
-                "submit_none": none_value,
-                "ratio": ratio,
-                "deviation_from_100_percent": ratio - 1.0 if ratio is not None else None,
-                "phase_field": phase_field,
-                "submit_none_field": whole_field,
-            }
-        groups[group_name] = group_metrics
+            none_sum = int(denominator[whole_field]["sum"])
+            empty_cost_per_pair = recording_sum / phase_record_pairs if phase_record_pairs else 0.0
+            metric = metric_payload(
+                label=label,
+                unit=unit,
+                phase_field=phase_field,
+                whole_field=whole_field,
+                raw_sum=raw_sum,
+                none_sum=none_sum,
+                cores=cores,
+                empty_cost_per_record_pair=empty_cost_per_pair,
+                recording_cost_estimate_sum=recording_sum,
+            )
+            if not math.isclose(
+                float(metric["after_recording_cost_reference_sum"]),
+                direct_reference_sum,
+                rel_tol=1e-12,
+                abs_tol=1e-6,
+            ):
+                _fail(f"{metric_name} aggregate reference does not equal the phase-profile references")
+            group_metrics[metric_name] = metric
+        groups[group_name] = {
+            "cores": cores,
+            "phase_business_calls": phase_business_calls,
+            "phase_business_calls_per_core": phase_business_calls / cores,
+            "phase_record_pairs": phase_record_pairs,
+            "phase_record_pairs_per_core": phase_record_pairs / cores,
+            "empty_calibration_record_pairs": calibration_pairs,
+            "metrics": group_metrics,
+        }
+
+    if int(groups["all"]["cores"]) != int(groups["aic"]["cores"]) + int(groups["aiv"]["cores"]):
+        _fail("ALL core count does not equal AIC plus AIV core counts")
+    if int(groups["all"]["phase_business_calls"]) != int(groups["aic"]["phase_business_calls"]) + int(
+        groups["aiv"]["phase_business_calls"]
+    ):
+        _fail("ALL business calls do not equal AIC plus AIV")
+    if int(groups["all"]["phase_record_pairs"]) != int(groups["aic"]["phase_record_pairs"]) + int(
+        groups["aiv"]["phase_record_pairs"]
+    ):
+        _fail("ALL record pairs do not equal AIC plus AIV")
+    if int(groups["all"]["empty_calibration_record_pairs"]) != int(
+        groups["aic"]["empty_calibration_record_pairs"]
+    ) + int(groups["aiv"]["empty_calibration_record_pairs"]):
+        _fail("ALL empty-bracket record pairs do not equal AIC plus AIV")
+    groups["all"]["all_values_are_aic_aiv_weighted"] = True
+    groups["all"]["empty_cost_per_record_pair_is_phase_role_weighted_effective_rate"] = True
+    for metric_name, *_ in SYNTHETIC_PHASE_SUM_METRICS:
+        all_metric = groups["all"]["metrics"][metric_name]
+        for field in (
+            "raw_observed_sum",
+            "submit_none_sum",
+            "recording_cost_estimate_sum",
+            "after_recording_cost_reference_sum",
+        ):
+            role_sum = sum(float(groups[role]["metrics"][metric_name][field]) for role in ("aic", "aiv"))
+            if not math.isclose(float(all_metric[field]), role_sum, rel_tol=1e-12, abs_tol=1e-6):
+                _fail(f"{metric_name} {field} ALL does not equal AIC plus AIV")
 
     return {
-        "kind": "cross-elf-synthetic-diagnostic",
+        "kind": "cross-elf-recording-cost-decomposition",
         "phase_profile_count": len(phase_profiles),
         "included_profiles": [str(profile["capture_mode"]) for profile in phase_profiles],
         "excluded_profiles": [NONE_CAPTURE_MODE, EMPTY_BRACKET_CAPTURE_MODE],
-        "empty_bracket_excluded": True,
+        "empty_bracket_excluded_from_raw_phase_sum": True,
+        "empty_bracket_used_as_recording_cost_calibration": True,
         "formal_partition_closure": False,
-        "exact_observation_overhead": False,
+        "exact_recording_cost_correction": False,
+        "pmu_cycles_per_ns": {
+            name: float(whole_window["pmu_cycles_per_ns"][name]) for name in ("all", "aic", "aiv")
+        },
         "semantics": (
-            "sum each business phase profile's observed metric, then divide by submit-pmu-none; "
-            "independent ELFs, observer cost, code layout, coverage gaps/overlap and run variance remain mixed"
+            "raw observed sums independent phase ELFs; the recording-cost estimate multiplies each role's "
+            "empty-bracket cost per begin/end record pair by that role's selected phase record-pair count; "
+            "the post-subtraction value is only a reference because call-site context, code layout, "
+            "coverage gaps/overlap and run variance remain mixed"
         ),
         "groups": groups,
     }
@@ -972,6 +1108,7 @@ def build_overview(swimlane_raw: Path | str, pmu_dirs: Sequence[Path | str]) -> 
     if len(pmu_dirs) != len(EXPECTED_PMU_MODES):
         _fail(f"overview requires exactly {len(EXPECTED_PMU_MODES)} Submit-PMU directories")
     captures: dict[str, dict[str, Any]] = {}
+    capture_objects: dict[str, SubmitPmuCapture] = {}
     scenario_keys: set[tuple[str, ...]] = set()
     for raw_dir_value in pmu_dirs:
         raw_dir = Path(raw_dir_value)
@@ -992,6 +1129,7 @@ def build_overview(swimlane_raw: Path | str, pmu_dirs: Sequence[Path | str]) -> 
             _fail(f"Submit-PMU {mode} task count does not match the swimlane capture")
         profile_key = tuple(str(value) for value in provenance["build"]["profiled_cache_key"])
         scenario_keys.add(profile_key[:-1])
+        capture_objects[mode] = capture
         captures[mode] = _summarize_pmu_capture(capture, provenance, provenance_sha256, provenance_file)
 
     missing = EXPECTED_PMU_MODES - captures.keys()
@@ -999,6 +1137,19 @@ def build_overview(swimlane_raw: Path | str, pmu_dirs: Sequence[Path | str]) -> 
         _fail(f"missing Submit-PMU capture modes: {sorted(missing)!r}")
     if len(scenario_keys) != 1:
         _fail("Submit-PMU provenance entries do not describe one common test/platform/scene")
+    empty_capture = capture_objects[EMPTY_BRACKET_CAPTURE_MODE]
+    empty_git_head = str(captures[EMPTY_BRACKET_CAPTURE_MODE]["source"]["git_head"])
+    for mode, summarized in captures.items():
+        if summarized["kind"] != "phase":
+            continue
+        if str(summarized["source"]["git_head"]) != empty_git_head:
+            _fail(
+                f"Submit-PMU {mode} and {EMPTY_BRACKET_CAPTURE_MODE} provenance git heads do not match"
+            )
+        summarized["recording_cost_reference"] = build_phase_recording_cost_reference(
+            capture_objects[mode],
+            empty_capture,
+        )
     ordered = [captures[mode] for mode in PMU_MODE_ORDER]
     sources = [capture["source"] for capture in ordered]
     _assert_pmu_sources_unchanged(sources)
@@ -1017,10 +1168,17 @@ def build_overview(swimlane_raw: Path | str, pmu_dirs: Sequence[Path | str]) -> 
             "cross_elf_absolute_subtraction_allowed": False,
             "cross_elf_phase_shares_additive": False,
             "cross_elf_synthetic_phase_sum_is_exact_overhead": False,
+            "empty_bracket_recording_cost_is_exact_correction": False,
             "swimlane_percentages": "same swimlane ELF aggregate core-work partitions",
             "pmu_percentages": (
-                "phase total/scalar/non-scalar-busy and I-cache ratios use only that PMU ELF's own "
-                "whole-window or phase-total denominator"
+                "the main phase reference numerator is raw phase observed minus the AIC/AIV-weighted "
+                "empty-bracket local-recording estimate; its denominator remains that target PMU ELF's "
+                "raw whole-window value, and the raw phase/raw whole ratio is retained as secondary evidence"
+            ),
+            "phase_reference_is_exact_business_share": False,
+            "phase_reference_provenance": (
+                "target and empty-bracket provenance must share one scenario and git revision; the estimate "
+                "still crosses separately compiled ELFs and does not measure whole-window recording work"
             ),
             "swimlane_sys_counter": "capture frequency is a SYS counter conversion, not the 1.65 GHz PMU cycle rate",
             "sys_boundary_diagnostic": (
@@ -1041,9 +1199,9 @@ def build_overview(swimlane_raw: Path | str, pmu_dirs: Sequence[Path | str]) -> 
                 "as total minus scalar; SYS ticks diagnose boundary closure only"
             ),
             "synthetic_phase_sum_vs_none": (
-                "an explicitly non-closing diagnostic that sums 11 independent business phase observations and "
-                "divides by submit-pmu-none; deviation from 100% is an instrumentation-inflation fingerprint, "
-                "not exact performance overhead"
+                "a non-closing four-way comparison of raw observations, the empty-bracket-scaled recording-cost "
+                "estimate, the post-subtraction reference, and submit-pmu-none; each AIC/AIV role is scaled by its "
+                "actual begin/end record-pair count, and the result is not exact performance overhead"
             ),
         },
         "validation": {
@@ -1110,9 +1268,17 @@ def _same_elf_ratio(numerator: int, denominator: int, share: float) -> str:
     return f"{_fmt_int(numerator)} / {_fmt_int(denominator)} = {_fmt_pct(share)}"
 
 
+def _per_core_mean(metric: Mapping[str, Any], cores: int) -> float:
+    if cores <= 0:
+        _fail("per-core mean requires a positive core count")
+    return float(metric["sum"]) / cores
+
+
 def _partition_pmu_ratio_cells(
     row: Mapping[str, Any],
     phase_by_metric: Mapping[str, Mapping[str, Any]],
+    *,
+    use_per_core_means: bool = False,
 ) -> tuple[str, str, str]:
     metric = str(row["metric"])
     phase = phase_by_metric.get(metric)
@@ -1121,32 +1287,250 @@ def _partition_pmu_ratio_cells(
 
     capture_mode = str(phase["capture_mode"])
     mapping = str(phase["mapping"])
-    all_group = phase["phase"]["groups"]["all"]
-    denominators = phase["denominators"]["all"]
-    total_metric = all_group["phase_total_cycles_observed"]
-    scalar_metric = all_group["phase_scalar_busy_observed"]
-    total_share = float(all_group["phase_total_share_of_pmu_total"])
-    scalar_share = float(all_group["phase_scalar_share_of_whole_scalar"])
-    total_ratio = _same_elf_ratio(
-        int(total_metric["sum"]),
-        int(denominators["pmu_total_cycles"]["sum"]),
-        total_share,
-    )
-    scalar_ratio = _same_elf_ratio(
-        int(scalar_metric["sum"]),
-        int(denominators["scalar_busy_cycles"]["sum"]),
-        scalar_share,
-    )
-    row_attributes = f' data-pmu-profile="{html.escape(capture_mode)}" data-pmu-mapping="{html.escape(mapping)}"'
-    total_cell = (
-        f'<td class="evidence-ratio" title="{html.escape(capture_mode)}：{html.escape(total_ratio)}">'
-        f"<strong>{_fmt_pct(total_share)}</strong><small>{html.escape(mapping)}</small></td>"
-    )
-    scalar_cell = (
-        f'<td class="evidence-ratio" title="{html.escape(capture_mode)}：{html.escape(scalar_ratio)}">'
-        f"<strong>{_fmt_pct(scalar_share)}</strong><small>{html.escape(mapping)}</small></td>"
+    group = phase["recording_cost_reference"]["groups"]["all"]
+    cores = int(group["cores"])
+
+    def ratio_cell(metric_name: str) -> tuple[str, float | None, float | None]:
+        metric_data = group["metrics"][metric_name]
+        reference_share = metric_data["after_recording_cost_reference_ratio_to_raw_whole"]
+        raw_share = metric_data["raw_phase_observed_ratio_to_raw_whole"]
+        estimate_share = metric_data["recording_cost_estimate_share_of_raw_phase"]
+        scale = cores if use_per_core_means else 1
+        reference_value = float(metric_data["after_recording_cost_reference_sum"]) / scale
+        raw_value = float(metric_data["raw_phase_observed_sum"]) / scale
+        whole_value = float(metric_data["raw_whole_sum"]) / scale
+        unit = "每核均值" if use_per_core_means else "Σ"
+        reference_text = _ratio_value_text(reference_share)
+        raw_text = _ratio_value_text(raw_share)
+        estimate_text = _ratio_value_text(estimate_share)
+        if estimate_share is None:
+            sensitivity = "敏感度 N/A"
+        elif float(estimate_share) >= 0.85:
+            sensitivity = "高度依赖校准"
+        elif float(estimate_share) >= 0.70:
+            sensitivity = "较高依赖校准"
+        elif float(estimate_share) >= 0.40:
+            sensitivity = "中等依赖校准"
+        else:
+            sensitivity = "较低依赖校准"
+        title = (
+            f"{capture_mode}：参考 {unit} {reference_value:,.3f} / raw whole "
+            f"{whole_value:,.3f} = {reference_text}；raw {unit} {raw_value:,.3f} / "
+            f"{whole_value:,.3f} = {raw_text}"
+        )
+        cell = (
+            f'<td class="evidence-ratio" title="{html.escape(title)}">'
+            f"<strong>{reference_text}</strong>"
+            "<small>扣局部记录估算后的阶段值 / raw 整窗，仅参考</small>"
+            f"<small>raw {raw_text} · 记录估算/raw {estimate_text}</small>"
+            f"<small>{sensitivity} · {html.escape(mapping)}</small></td>"
+        )
+        return cell, reference_share, raw_share
+
+    total_cell, total_reference_share, total_raw_share = ratio_cell("pmu_total_cycles")
+    scalar_cell, scalar_reference_share, scalar_raw_share = ratio_cell("scalar_busy_cycles")
+    row_attributes = (
+        f' data-pmu-profile="{html.escape(capture_mode)}" data-pmu-mapping="{html.escape(mapping)}"'
+        f' data-pmu-reference-share="{html.escape(_ratio_value_text(total_reference_share))}"'
+        f' data-pmu-raw-share="{html.escape(_ratio_value_text(total_raw_share))}"'
+        f' data-scalar-reference-share="{html.escape(_ratio_value_text(scalar_reference_share))}"'
+        f' data-scalar-raw-share="{html.escape(_ratio_value_text(scalar_raw_share))}"'
     )
     return row_attributes, total_cell, scalar_cell
+
+
+def _partition_mean_diagnostic(
+    partition: Mapping[str, Any],
+    phase_by_metric: Mapping[str, Mapping[str, Any]],
+    phase_profiles: Sequence[Mapping[str, Any]],
+    whole_window: Mapping[str, Any],
+    core_count: int,
+) -> dict[str, Any]:
+    mapped_rows = []
+    unmapped_labels = []
+    for row in partition["rows"]:
+        phase = phase_by_metric.get(str(row["metric"]))
+        if phase is None:
+            unmapped_labels.append(str(row["label"]))
+            continue
+        mapped_rows.append(row)
+
+    profiles = list(phase_profiles)
+    if not profiles:
+        _fail(f"partition {partition['name']!r} has no PMU profiles for mean comparison")
+    profile_modes = [str(profile["capture_mode"]) for profile in profiles]
+    if len(profile_modes) != len(set(profile_modes)):
+        _fail(f"partition {partition['name']!r} mean comparison contains duplicate PMU profiles")
+    mapped_modes = {str(phase_by_metric[str(row["metric"])]["capture_mode"]) for row in mapped_rows}
+    if not mapped_modes <= set(profile_modes):
+        _fail(f"partition {partition['name']!r} mean comparison omits a directly mapped PMU profile")
+    decomposition = _synthetic_phase_sum_vs_none(profiles, whole_window)
+
+    return {
+        "profile_count": len(profiles),
+        "profiles": profile_modes,
+        "direct_mapped_profile_count": len(mapped_modes),
+        "unmapped_labels": unmapped_labels,
+        "partition_row_count": len(partition["rows"]),
+        "partition_core_time_mean_us": sum(float(row["core_time_us"]) for row in partition["rows"]) / core_count,
+        "pmu_cycles_per_ns": {
+            name: float(whole_window["pmu_cycles_per_ns"][name]) for name in ("all", "aic", "aiv")
+        },
+        "decomposition": decomposition,
+    }
+
+
+def _mean_metric_text(value: float, unit: str) -> str:
+    suffix = "cycles/core" if unit == "cycles" else "events/core"
+    return f"{value:,.3f} {suffix}"
+
+
+def _ratio_value_text(value: float | None) -> str:
+    return "N/A" if value is None else _fmt_pct(value)
+
+
+def _mean_equivalent_time(value: float, unit: str, cycles_per_ns: float) -> str:
+    if unit != "cycles":
+        return ""
+    return f"<small>按 {cycles_per_ns:.6f} cycles/ns：≈ {_cycles_to_us(value, cycles_per_ns):,.3f} µs/core</small>"
+
+
+def _partition_mean_comparison_rows(diagnostic: Mapping[str, Any]) -> str:
+    decomposition = diagnostic["decomposition"]
+    groups = decomposition["groups"]
+    all_group = groups["all"]
+    aic_group = groups["aic"]
+    aiv_group = groups["aiv"]
+    all_metrics = all_group["metrics"]
+    aic_metrics = aic_group["metrics"]
+    aiv_metrics = aiv_group["metrics"]
+    frequencies = diagnostic["pmu_cycles_per_ns"]
+    raw_cards = [
+        (
+            "<div class=\"partition-summary-metric\">"
+            "<span>取数范围</span>"
+            f"<strong>{int(diagnostic['profile_count'])} 个 phase 每核均值之和</strong>"
+            f"<small>{int(diagnostic['direct_mapped_profile_count'])} 个直接表格行 + "
+            "ArgBuild 精确子段</small>"
+            "<small>SubmitTransition 位于 SubmitUnion 外，不进入分子</small>"
+            "</div>"
+        )
+    ]
+    recording_cards = [
+        (
+            "<div class=\"partition-summary-metric\">"
+            "<span>估算方法</span><strong>空区间每次记录开销 × 本组记录次数</strong>"
+            f"<small>ALL {float(all_group['phase_record_pairs_per_core']):,.3f} 组/core · "
+            f"AIC {float(aic_group['phase_record_pairs_per_core']):,.3f} · "
+            f"AIV {float(aiv_group['phase_record_pairs_per_core']):,.3f}</small>"
+            "<small>linked Kernel pause/resume 产生的额外记录也已计入</small>"
+            "</div>"
+        )
+    ]
+    reference_cards = [
+        (
+            "<div class=\"partition-summary-metric\">"
+            "<span>参考值口径</span><strong>原始观测 − 上述记录开销估算</strong>"
+            "<small>允许为负；负值表示估算或运行波动已超过 raw</small>"
+            "<small>它不是“真实业务值”，也不是精确校正结果</small>"
+            "</div>"
+        )
+    ]
+    none_cards = [
+        (
+            "<div class=\"partition-summary-metric\">"
+            "<span>对照范围</span><strong>首个 Submit begin → 末个 Submit end</strong>"
+            "<small>包含 BetweenSubmitResidual / SubmitTransition</small>"
+            "<small>独立 ELF；不是与分子完全同范围的一次闭合</small>"
+            "</div>"
+        )
+    ]
+    for metric_name, label, _phase_field, _whole_field, unit in SYNTHETIC_PHASE_SUM_METRICS:
+        metric = all_metrics[metric_name]
+        aic_metric = aic_metrics[metric_name]
+        aiv_metric = aiv_metrics[metric_name]
+        raw_cards.append(
+            "<div class=\"partition-summary-metric\">"
+            f"<span>{html.escape(label)} raw observed</span>"
+            f"<strong>{_mean_metric_text(metric['raw_observed_mean'], unit)}</strong>"
+            f"{_mean_equivalent_time(metric['raw_observed_mean'], unit, frequencies['all'])}"
+            f"<small>raw / none：{_ratio_value_text(metric['raw_observed_ratio_to_submit_none'])}</small>"
+            f"<small>AIC {_ratio_value_text(aic_metric['raw_observed_ratio_to_submit_none'])} · "
+            f"AIV {_ratio_value_text(aiv_metric['raw_observed_ratio_to_submit_none'])}</small>"
+            "</div>"
+        )
+        recording_cards.append(
+            "<div class=\"partition-summary-metric\">"
+            f"<span>{html.escape(label)} 记录开销估算</span>"
+            f"<strong>{_mean_metric_text(metric['recording_cost_estimate_mean'], unit)}</strong>"
+            f"{_mean_equivalent_time(metric['recording_cost_estimate_mean'], unit, frequencies['all'])}"
+            f"<small>占 raw：{_ratio_value_text(metric['recording_cost_estimate_share_of_raw'])}；"
+            f"相对 none：{_ratio_value_text(metric['recording_cost_estimate_ratio_to_submit_none'])}</small>"
+            f"<small>AIC {_ratio_value_text(aic_metric['recording_cost_estimate_share_of_raw'])} · "
+            f"AIV {_ratio_value_text(aiv_metric['recording_cost_estimate_share_of_raw'])}</small>"
+            "</div>"
+        )
+        reference_cards.append(
+            "<div class=\"partition-summary-metric\">"
+            f"<span>{html.escape(label)} 扣除后参考值</span>"
+            f"<strong>{_mean_metric_text(metric['after_recording_cost_reference_mean'], unit)}</strong>"
+            f"{_mean_equivalent_time(metric['after_recording_cost_reference_mean'], unit, frequencies['all'])}"
+            f"<small>参考值 / none："
+            f"{_ratio_value_text(metric['after_recording_cost_reference_ratio_to_submit_none'])}</small>"
+            f"<small>AIC {_ratio_value_text(aic_metric['after_recording_cost_reference_ratio_to_submit_none'])} · "
+            f"AIV {_ratio_value_text(aiv_metric['after_recording_cost_reference_ratio_to_submit_none'])}</small>"
+            "</div>"
+        )
+        none_cards.append(
+            "<div class=\"partition-summary-metric\">"
+            f"<span>{html.escape(label)} 每核均值</span>"
+            f"<strong>{_mean_metric_text(metric['submit_none_mean'], unit)}</strong>"
+            f"{_mean_equivalent_time(metric['submit_none_mean'], unit, frequencies['all'])}"
+            "<small>对照基准：100%</small>"
+            f"<small>AIC {_mean_metric_text(aic_metric['submit_none_mean'], unit)} · "
+            f"AIV {_mean_metric_text(aiv_metric['submit_none_mean'], unit)}</small>"
+            "</div>"
+        )
+
+    unmapped = "、".join(html.escape(label) for label in diagnostic["unmapped_labels"])
+    profile_count = int(diagnostic["profile_count"])
+    return (
+        '<tr class="partition-total-row" data-partition-total="per-core-mean">'
+        "<th>SubmitUnion 平均每核时间合计</th>"
+        f"<td><strong>{_fmt_us(diagnostic['partition_core_time_mean_us'])}</strong>"
+        f"<small>{int(diagnostic['partition_row_count'])} 个分段每核均值之和</small></td>"
+        "<td><strong>100.000%</strong></td>"
+        '<td colspan="4"><span class="fine">同一泳道 ELF 的严格分区闭合；'
+        "不与下方独立 PMU ELF 的时间直接相减。</span></td></tr>"
+        f'<tr class="partition-comparison-row" data-partition-comparison="mapped-phase-mean-sum" '
+        f'data-phase-profile-count="{profile_count}">'
+        f"<th>原始分段观测合计<small>{profile_count} 个独立 phase ELF</small></th>"
+        '<td colspan="6">'
+        f'<div class="partition-summary-grid">{"".join(raw_cards)}</div>'
+        f'<p class="fine">合计 9 个直接映射行和 ArgBuild 的 Claim→Materialize 精确子段；'
+        f"{unmapped} 的其余 residual 不进入分子。"
+        "raw 含分段记录代码自身开销，不能直接拿来解释业务耗时。</p>"
+        "</td></tr>"
+        '<tr class="partition-comparison-row" data-partition-comparison="recording-cost-estimate">'
+        "<th>空区间估算的记录代码开销<small>按 AIC/AIV 分开缩放后加权</small></th>"
+        '<td colspan="6">'
+        f'<div class="partition-summary-grid">{"".join(recording_cards)}</div>'
+        '<p class="fine">empty-bracket 只在固定调用点测量一对紧邻 begin/end；这里按每个 phase 实际'
+        " begin/end 记录组数缩放。调用点、I-cache 布局和运行轮次不同，所以只能作为估算。</p>"
+        "</td></tr>"
+        '<tr class="partition-comparison-row" data-partition-comparison="after-recording-cost-reference">'
+        "<th>扣除上述估算后的参考值<small>raw − 记录开销估算</small></th>"
+        '<td colspan="6">'
+        f'<div class="partition-summary-grid">{"".join(reference_cards)}</div>'
+        '<p class="fine">该行用于判断此前 PMU/Scalar 合计膨胀主要来自哪里；它不是同一 ELF 的闭合，'
+        "不能当成已精确恢复的业务值。</p>"
+        "</td></tr>"
+        '<tr class="partition-comparison-row" data-partition-comparison="submit-pmu-none-mean">'
+        f"<th><code>{NONE_CAPTURE_MODE}</code><small>每核均值对照</small></th>"
+        '<td colspan="6">'
+        f'<div class="partition-summary-grid">{"".join(none_cards)}</div>'
+        "</td></tr>"
+    )
 
 
 def _partition_html(
@@ -1154,6 +1538,9 @@ def _partition_html(
     phase_by_metric: Mapping[str, Mapping[str, Any]],
     *,
     show_ranges: bool = True,
+    mean_core_count: int | None = None,
+    comparison_whole_window: Mapping[str, Any] | None = None,
+    comparison_phase_profiles: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
     colors = ("#2563eb", "#0d9488", "#7c3aed", "#d97706", "#dc2626", "#0891b2", "#65a30d")
     bars = []
@@ -1170,105 +1557,189 @@ def _partition_html(
             aiv = f"{row['aiv_per_core']['min_us']:.3f}–{row['aiv_per_core']['max_us']:.3f} µs"
         else:
             aic = aiv = "—"
-        row_attributes, pmu_total_cell, scalar_busy_cell = _partition_pmu_ratio_cells(row, phase_by_metric)
+        row_attributes, pmu_total_cell, scalar_busy_cell = _partition_pmu_ratio_cells(
+            row,
+            phase_by_metric,
+            use_per_core_means=mean_core_count is not None,
+        )
+        core_time_us = float(row["core_time_us"])
+        share_cell = f"<td>{_fmt_pct(share)}</td>"
+        if mean_core_count is not None:
+            core_time_us /= mean_core_count
+            parent_mean_us = sum(float(item["core_time_us"]) for item in partition["rows"]) / mean_core_count
+            mean_share = core_time_us / parent_mean_us if parent_mean_us else 0.0
+            if not math.isclose(mean_share, share, rel_tol=1e-12, abs_tol=1e-12):
+                _fail(f"partition {partition['name']!r} mean share disagrees with aggregate share")
+            share_cell = (
+                f'<td title="{core_time_us:,.3f} / {parent_mean_us:,.3f} = {_fmt_pct(mean_share)}">'
+                f"{_fmt_pct(mean_share)}</td>"
+            )
         rows.append(
             f'<tr data-swimlane-metric="{html.escape(str(row["metric"]))}"{row_attributes}>'
             f'<td><i style="background:{color}"></i><code>{html.escape(row["label"])}</code></td>'
-            f"<td>{_fmt_us(row['core_time_us'])}</td><td>{_fmt_pct(share)}</td>"
+            f"<td>{_fmt_us(core_time_us)}</td>{share_cell}"
             f"{pmu_total_cell}{scalar_busy_cell}"
             f"<td>{aic}</td><td>{aiv}</td>"
             "</tr>"
         )
+    comparison_rows = ""
+    if comparison_whole_window is not None:
+        if mean_core_count is None:
+            _fail("partition mean comparison requires mean_core_count")
+        if comparison_phase_profiles is None:
+            _fail("partition mean comparison requires explicit phase profiles")
+        diagnostic = _partition_mean_diagnostic(
+            partition,
+            phase_by_metric,
+            comparison_phase_profiles,
+            comparison_whole_window,
+            mean_core_count,
+        )
+        comparison_rows = _partition_mean_comparison_rows(diagnostic)
+    core_time_header = "平均每核时间" if mean_core_count is not None else "Σ core-time"
+    swimlane_share_header = (
+        "泳道每核均值 / 同父区间每核均值" if mean_core_count is not None else "泳道同父区间"
+    )
+    pmu_share_header = (
+        "扣局部记录估算后的 Phase PMU 每核均值 / raw whole PMU 每核均值"
+        if mean_core_count is not None
+        else "扣局部记录估算后的 Phase PMU / raw whole PMU"
+    )
+    scalar_share_header = (
+        "扣局部记录估算后的 Phase scalar 每核均值 / raw whole scalar 每核均值"
+        if mean_core_count is not None
+        else "扣局部记录估算后的 Phase scalar / raw whole scalar"
+    )
+    comparison_header = "均值占比对照" if mean_core_count is not None else "占比对照"
     return f"""
       <div class="partition">
         <h3>{html.escape(str(partition["name"]))}</h3>
         <div class="stack">{"".join(bars)}</div>
         <div class="table-wrap"><table>
           <thead>
-            <tr><th rowspan="2">区域</th><th rowspan="2">Σ core-time</th>
-              <th colspan="3">占比对照</th>
+            <tr><th rowspan="2">区域</th><th rowspan="2">{core_time_header}</th>
+              <th colspan="3">{comparison_header}</th>
               <th rowspan="2">AIC 每核 min–max</th><th rowspan="2">AIV 每核 min–max</th></tr>
-            <tr><th>泳道同父区间</th>
-              <th>PMU 占比<br><small>Phase PMU / 同 ELF whole PMU</small></th>
-              <th>Scalar-busy 占比<br><small>Phase scalar / 同 ELF whole scalar</small></th></tr>
+            <tr><th>{swimlane_share_header}</th>
+              <th>PMU 局部记录扣除参考<br><small>{pmu_share_header}；raw 比例同格保留</small></th>
+              <th>Scalar 局部记录扣除参考<br><small>{scalar_share_header}；raw 比例同格保留</small></th></tr>
           </thead>
-          <tbody>{"".join(rows)}</tbody>
+          <tbody>{"".join(rows)}{comparison_rows}</tbody>
         </table></div>
       </div>
     """
 
 
-def _synthetic_ratio_text(metric: Mapping[str, Any]) -> str:
-    ratio = metric["ratio"]
-    if ratio is None:
-        return "N/A"
-    return _fmt_pct(float(ratio))
-
-
-def _synthetic_deviation_text(metric: Mapping[str, Any]) -> str:
-    deviation = metric["deviation_from_100_percent"]
-    if deviation is None:
-        return "N/A"
-    return f"{float(deviation):+.3%}"
-
-
 def _synthetic_phase_sum_html(diagnostic: Mapping[str, Any]) -> str:
-    all_metrics = diagnostic["groups"]["all"]
-    aic_metrics = diagnostic["groups"]["aic"]
-    aiv_metrics = diagnostic["groups"]["aiv"]
-    colors = ("#2563eb", "#0d9488", "#7c3aed", "#d97706", "#dc2626")
+    all_group = diagnostic["groups"]["all"]
+    aic_group = diagnostic["groups"]["aic"]
+    aiv_group = diagnostic["groups"]["aiv"]
+    all_metrics = all_group["metrics"]
+    aic_metrics = aic_group["metrics"]
+    aiv_metrics = aiv_group["metrics"]
     chart_limit = 6.0
     baseline_position = 1.0 / chart_limit * 100
     chart_rows = []
     table_rows = []
-    for index, (metric_name, label, _phase_field, _whole_field, unit) in enumerate(SYNTHETIC_PHASE_SUM_METRICS):
+    for metric_name, label, _phase_field, _whole_field, unit in SYNTHETIC_PHASE_SUM_METRICS:
         metric = all_metrics[metric_name]
-        ratio = metric["ratio"]
-        width = 0.0 if ratio is None else min(float(ratio), chart_limit) / chart_limit * 100
-        overflow = ratio is not None and float(ratio) > chart_limit
+        raw_ratio = metric["raw_observed_ratio_to_submit_none"]
+        recording_ratio = metric["recording_cost_estimate_ratio_to_submit_none"]
+        reference_ratio = metric["after_recording_cost_reference_ratio_to_submit_none"]
+        recording_width = (
+            0.0 if recording_ratio is None else min(max(float(recording_ratio), 0.0), chart_limit) / chart_limit * 100
+        )
+        remaining_limit = max(0.0, 100.0 - recording_width)
+        reference_width = (
+            0.0
+            if reference_ratio is None
+            else min(max(float(reference_ratio), 0.0) / chart_limit * 100, remaining_limit)
+        )
+        overflow = raw_ratio is not None and float(raw_ratio) > chart_limit
         overflow_text = "<small>图形封顶 600%</small>" if overflow else ""
+        negative_text = (
+            "<small>扣除后参考值为负，图中不画负向部分；精确值见下表</small>"
+            if reference_ratio is not None and float(reference_ratio) < 0
+            else ""
+        )
         title = (
-            f"{label}：{_fmt_int(metric['phase_sum'])} / {_fmt_int(metric['submit_none'])} = "
-            f"{_synthetic_ratio_text(metric)}"
+            f"{label}：raw {_ratio_value_text(raw_ratio)}；记录开销估算 "
+            f"{_ratio_value_text(recording_ratio)}；扣除后参考值 {_ratio_value_text(reference_ratio)}"
         )
         chart_rows.append(
             '<div class="synthetic-row">'
             f"<span>{html.escape(label)}</span>"
             f'<div class="synthetic-track" title="{html.escape(title)}">'
-            f'<b style="width:{width:.6f}%;background:{colors[index]}"></b>'
+            f'<b class="recording" style="width:{recording_width:.6f}%"></b>'
+            f'<b class="reference" style="width:{reference_width:.6f}%"></b>'
             f'<i style="left:{baseline_position:.6f}%"></i></div>'
-            f"<strong>{_synthetic_ratio_text(metric)}</strong>"
-            f"<small>偏离 100%：{_synthetic_deviation_text(metric)}</small>{overflow_text}"
+            f"<strong>raw {_ratio_value_text(raw_ratio)}</strong>"
+            f"<small>记录估算 {_ratio_value_text(recording_ratio)} + "
+            f"扣除后 {_ratio_value_text(reference_ratio)}</small>{overflow_text}{negative_text}"
             "</div>"
+        )
+
+        def mean_cell(field: str) -> str:
+            value = float(metric[field])
+            time_text = (
+                f"<small>≈ {_cycles_to_us(value, float(diagnostic['pmu_cycles_per_ns']['all'])):,.3f} µs/core</small>"
+                if unit == "cycles"
+                else ""
+            )
+            return f"<strong>{_mean_metric_text(value, unit)}</strong>{time_text}"
+
+        aic_raw = _ratio_value_text(aic_metrics[metric_name]["raw_observed_ratio_to_submit_none"])
+        aic_recording = _ratio_value_text(
+            aic_metrics[metric_name]["recording_cost_estimate_ratio_to_submit_none"]
+        )
+        aic_reference = _ratio_value_text(
+            aic_metrics[metric_name]["after_recording_cost_reference_ratio_to_submit_none"]
+        )
+        aiv_raw = _ratio_value_text(aiv_metrics[metric_name]["raw_observed_ratio_to_submit_none"])
+        aiv_recording = _ratio_value_text(
+            aiv_metrics[metric_name]["recording_cost_estimate_ratio_to_submit_none"]
+        )
+        aiv_reference = _ratio_value_text(
+            aiv_metrics[metric_name]["after_recording_cost_reference_ratio_to_submit_none"]
         )
         table_rows.append(
             "<tr>"
             f"<th>{html.escape(label)}</th>"
-            f"<td>{_fmt_int(metric['phase_sum'])} {unit}</td>"
-            f"<td>{_fmt_int(metric['submit_none'])} {unit}</td>"
-            f"<td>{_synthetic_ratio_text(metric)}</td>"
-            f"<td>{_synthetic_deviation_text(metric)}</td>"
-            f"<td>{_synthetic_ratio_text(aic_metrics[metric_name])}</td>"
-            f"<td>{_synthetic_ratio_text(aiv_metrics[metric_name])}</td>"
+            f"<td>{mean_cell('raw_observed_mean')}"
+            f"<small>raw / none {_ratio_value_text(raw_ratio)}</small></td>"
+            f"<td>{mean_cell('recording_cost_estimate_mean')}"
+            f"<small>占 raw {_ratio_value_text(metric['recording_cost_estimate_share_of_raw'])}</small></td>"
+            f"<td>{mean_cell('after_recording_cost_reference_mean')}"
+            f"<small>参考值 / none {_ratio_value_text(reference_ratio)}</small></td>"
+            f"<td>{mean_cell('submit_none_mean')}<small>基线 100%</small></td>"
+            "<td>"
+            f"<small>AIC：raw {aic_raw} / 记录估算 {aic_recording} / 扣除后 {aic_reference}</small>"
+            f"<small>AIV：raw {aiv_raw} / 记录估算 {aiv_recording} / 扣除后 {aiv_reference}</small>"
+            "</td>"
             "</tr>"
         )
     profile_count = int(diagnostic["phase_profile_count"])
     return f"""
   <section class="context synthetic-diagnostic">
-    <h2>{profile_count} 个业务分段合计 vs <code>{NONE_CAPTURE_MODE}</code></h2>
-    <p class="notice"><strong>这是跨 ELF 合成诊断比，不是一次运行的正式分区闭合，也不是净性能开销。</strong>
-      分子把 {profile_count} 个业务 phase 各自独立 ELF 的 observed 指标求和，分母取
-      <code>{NONE_CAPTURE_MODE}</code> 的 whole 指标；empty-bracket 不参与。大于 100% 可以直观看到
-      分段插桩形成的观测膨胀，但“偏离 100%”还混有每段观察器成本、独立 ELF 布局、覆盖缺口或重叠、
-      多轮波动及 control-only 口径，不能直接解释为可消除的墙钟损失。</p>
-    <p class="fine">下图统一使用 0–600% 横轴，竖线为 100%；超过 600% 的项目只在图形上封顶，
-      表格始终保留精确比值。I-cache 分子使用 phase observed，分母使用 none primary。</p>
+    <h2>{profile_count} 个业务分段的记录开销拆分（含 SubmitTransition）</h2>
+    <p class="notice"><strong>raw 合计包含分段记录代码自身开销，不能直接拿它和
+      <code>{NONE_CAPTURE_MODE}</code> 比出“业务变慢了多少”。</strong>
+      本节另外用 empty-bracket 测得“一组 begin/end 记录代码”的开销，再按每个 phase 实际记录组数估算；
+      AIC 与 AIV 分开计算后才合成 ALL。扣除后的数值只供定位量级，不是精确还原的业务值。</p>
+    <p class="fine">下图以 none 为 100%（黑色竖线），橙色为“空区间估算的记录代码开销”，
+      蓝色为“扣除上述估算后的参考值”；二者代数相加为 raw。横轴统一为 0–600%，超过部分只在图上封顶。
+      empty-bracket 的调用点、代码布局及采集轮次与各 phase 不同，所以该估算不能跨 ELF 当作精确扣除。
+      I-cache raw 使用 phase observed，none 使用 primary。</p>
     <div class="synthetic-chart">{"".join(chart_rows)}</div>
     <div class="table-wrap"><table class="synthetic-table">
-      <thead><tr><th>指标</th><th>Σ {profile_count} phases</th><th>submit-none</th>
-        <th>ALL 合成比</th><th>相对 100% 偏离</th><th>AIC 合成比</th><th>AIV 合成比</th></tr></thead>
+      <thead><tr><th>指标</th><th>原始观测合计</th><th>记录代码开销估算</th>
+        <th>扣除后参考值</th><th>submit-pmu-none</th><th>AIC / AIV 分角色比例</th></tr></thead>
       <tbody>{"".join(table_rows)}</tbody>
     </table></div>
+    <p class="fine">本组合计 {float(all_group['phase_record_pairs_per_core']):,.3f} 组记录/core；
+      AIC {float(aic_group['phase_record_pairs_per_core']):,.3f}，AIV
+      {float(aiv_group['phase_record_pairs_per_core']):,.3f}。记录组数包含 linked Kernel
+      pause/resume 产生的额外 begin/end；动态阶段的零调用核仍按完整 32/64 核总体计入均值。</p>
   </section>
     """
 
@@ -1280,14 +1751,37 @@ def _phase_metric_html(
     share: float,
     aic: Mapping[str, Any],
     aiv: Mapping[str, Any],
+    recording_reference: Mapping[str, Any] | None = None,
 ) -> str:
     ratio = _same_elf_ratio(int(metric["sum"]), denominator, share)
+    if recording_reference is not None:
+        reference_sum = float(recording_reference["after_recording_cost_reference_sum"])
+        recording_sum = float(recording_reference["recording_cost_estimate_sum"])
+        reference_ratio = _ratio_value_text(
+            recording_reference["after_recording_cost_reference_ratio_to_raw_whole"]
+        )
+        raw_ratio = _ratio_value_text(recording_reference["raw_phase_observed_ratio_to_raw_whole"])
+        recording_share = _ratio_value_text(
+            recording_reference["recording_cost_estimate_share_of_raw_phase"]
+        )
+        return f"""
+      <div class="metric">
+        <span>{html.escape(label)}</span>
+        <strong>扣局部记录估算参考 {reference_sum:,.3f}</strong>
+        <small>参考值 / raw 整窗：{reference_ratio}</small>
+        <small>raw observed {_fmt_int(metric["sum"])} / raw 整窗 {_fmt_int(denominator)}
+          = {raw_ratio}</small>
+        <small>raw observed − 记录代码开销估算 {recording_sum:,.3f}；
+          估算/raw {recording_share}</small>
+        <small>raw AIC 每核 {_range_text(aic)}；raw AIV 每核 {_range_text(aiv)}</small>
+      </div>
+    """
     return f"""
       <div class="metric">
         <span>{html.escape(label)}</span>
-        <strong>{_fmt_int(metric["sum"])}</strong>
-        <small>本 ELF：{ratio}</small>
-        <small>AIC 每核 {_range_text(aic)}；AIV 每核 {_range_text(aiv)}</small>
+        <strong>raw observed {_fmt_int(metric["sum"])}</strong>
+        <small>raw observed / raw 整窗：{ratio}</small>
+        <small>raw AIC 每核 {_range_text(aic)}；raw AIV 每核 {_range_text(aiv)}</small>
       </div>
     """
 
@@ -1301,17 +1795,43 @@ def _phase_cycle_metric_html(
     relationships: Sequence[str],
     *,
     note: str = "",
+    recording_reference: Mapping[str, Any] | None = None,
 ) -> str:
     relationship_html = "".join(f"<small>{html.escape(value)}</small>" for value in relationships)
     note_html = f"<small>{html.escape(note)}</small>" if note else ""
+    if recording_reference is not None:
+        reference_sum = float(recording_reference["after_recording_cost_reference_sum"])
+        recording_sum = float(recording_reference["recording_cost_estimate_sum"])
+        reference_ratio = _ratio_value_text(
+            recording_reference["after_recording_cost_reference_ratio_to_raw_whole"]
+        )
+        raw_ratio = _ratio_value_text(recording_reference["raw_phase_observed_ratio_to_raw_whole"])
+        recording_share = _ratio_value_text(
+            recording_reference["recording_cost_estimate_share_of_raw_phase"]
+        )
+        return f"""
+      <div class="metric">
+        <span>{html.escape(label)}</span>
+        <strong>扣局部记录估算参考 Σ {reference_sum:,.3f} cycles · ≈
+          {_cycles_to_us(reference_sum, frequencies["all"]):.3f} µs</strong>
+        <small>参考值 / raw 整窗：{reference_ratio}；raw observed / raw 整窗：
+          {raw_ratio}</small>
+        <small>raw observed Σ {_fmt_int(metric["sum"])} cycles − 记录代码开销估算
+          {recording_sum:,.3f} cycles；估算/raw {recording_share}</small>
+        {relationship_html}
+        <small>raw AIC 每核 {_cycle_range_text(aic, frequencies["aic"])}</small>
+        <small>raw AIV 每核 {_cycle_range_text(aiv, frequencies["aiv"])}</small>
+        {note_html}
+      </div>
+    """
     return f"""
       <div class="metric">
         <span>{html.escape(label)}</span>
-        <strong>Σ {_fmt_int(metric["sum"])} cycles · ≈
+        <strong>raw observed Σ {_fmt_int(metric["sum"])} cycles · ≈
           {_cycles_to_us(metric["sum"], frequencies["all"]):.3f} µs</strong>
         {relationship_html}
-        <small>AIC 每核 {_cycle_range_text(aic, frequencies["aic"])}</small>
-        <small>AIV 每核 {_cycle_range_text(aiv, frequencies["aiv"])}</small>
+        <small>raw AIC 每核 {_cycle_range_text(aic, frequencies["aic"])}</small>
+        <small>raw AIV 每核 {_cycle_range_text(aiv, frequencies["aiv"])}</small>
         {note_html}
       </div>
     """
@@ -1349,6 +1869,16 @@ def _phase_card_html(item: Mapping[str, Any]) -> str:
     denominators = item["denominators"]["all"]
     frequencies = item["pmu_cycles_per_ns"]
     kernel_calls = all_group["phase_excluded_kernel_calls"]
+    recording_metrics = (
+        item["recording_cost_reference"]["groups"]["all"]["metrics"]
+        if "recording_cost_reference" in item
+        else None
+    )
+    total_reference = None if recording_metrics is None else recording_metrics["pmu_total_cycles"]
+    scalar_reference = None if recording_metrics is None else recording_metrics["scalar_busy_cycles"]
+    residual_reference = None if recording_metrics is None else recording_metrics["non_scalar_busy_cycles"]
+    request_reference = None if recording_metrics is None else recording_metrics["icache_requests"]
+    miss_reference = None if recording_metrics is None else recording_metrics["icache_misses"]
     total_html = _phase_cycle_metric_html(
         "Phase PMU total",
         total_metric,
@@ -1356,14 +1886,36 @@ def _phase_card_html(item: Mapping[str, Any]) -> str:
         total_aiv,
         frequencies,
         (
-            "Phase total / 同 ELF whole total："
+            "raw Phase total / raw whole total："
             + _same_elf_ratio(
                 int(total_metric["sum"]),
                 int(denominators["pmu_total_cycles"]["sum"]),
                 all_group["phase_total_share_of_pmu_total"],
             ),
         ),
+        recording_reference=total_reference,
     )
+    if total_reference is None or scalar_reference is None:
+        scalar_relationship = (
+            "raw Scalar / raw Phase total："
+            + _same_elf_ratio(
+                int(scalar_metric["sum"]),
+                int(total_metric["sum"]),
+                all_group["phase_scalar_busy_share_of_phase_total"],
+            )
+        )
+    else:
+        reference_total_sum = float(total_reference["after_recording_cost_reference_sum"])
+        reference_scalar_sum = float(scalar_reference["after_recording_cost_reference_sum"])
+        reference_scalar_share = (
+            reference_scalar_sum / reference_total_sum if reference_total_sum else None
+        )
+        scalar_relationship = (
+            "参考 Scalar / 参考 Phase total："
+            + _ratio_value_text(reference_scalar_share)
+            + "；raw "
+            + _fmt_pct(all_group["phase_scalar_busy_share_of_phase_total"])
+        )
     scalar_html = _phase_cycle_metric_html(
         "Phase scalar busy",
         scalar_metric,
@@ -1371,36 +1923,49 @@ def _phase_card_html(item: Mapping[str, Any]) -> str:
         scalar_aiv,
         frequencies,
         (
-            "Scalar / Phase total："
-            + _same_elf_ratio(
-                int(scalar_metric["sum"]),
-                int(total_metric["sum"]),
-                all_group["phase_scalar_busy_share_of_phase_total"],
-            ),
-            "Phase scalar / 同 ELF whole scalar："
+            scalar_relationship,
+            "raw Phase scalar / raw whole scalar："
             + _same_elf_ratio(
                 int(scalar_metric["sum"]),
                 int(denominators["scalar_busy_cycles"]["sum"]),
                 all_group["phase_scalar_share_of_whole_scalar"],
             ),
         ),
+        recording_reference=scalar_reference,
     )
-    residual_share = float(residual_metric["sum"]) / float(total_metric["sum"]) if total_metric["sum"] else 0.0
+    residual_share = (
+        float(residual_metric["sum"]) / float(total_metric["sum"]) if total_metric["sum"] else 0.0
+    )
+    if residual_reference is None or total_reference is None:
+        residual_relationship = (
+            "raw residual / raw Phase total："
+            + _same_elf_ratio(
+                int(residual_metric["sum"]),
+                int(total_metric["sum"]),
+                residual_share,
+            )
+        )
+    else:
+        reference_total_sum = float(total_reference["after_recording_cost_reference_sum"])
+        reference_residual_sum = float(residual_reference["after_recording_cost_reference_sum"])
+        reference_residual_share = (
+            reference_residual_sum / reference_total_sum if reference_total_sum else None
+        )
+        residual_relationship = (
+            "参考 residual / 参考 Phase total："
+            + _ratio_value_text(reference_residual_share)
+            + "；raw "
+            + _fmt_pct(residual_share)
+        )
     residual_html = _phase_cycle_metric_html(
         "非 Scalar-busy 残余",
         residual_metric,
         residual_aic,
         residual_aiv,
         frequencies,
-        (
-            "逐核先算 total−scalar；残余 / Phase total："
-            + _same_elf_ratio(
-                int(residual_metric["sum"]),
-                int(total_metric["sum"]),
-                residual_share,
-            ),
-        ),
+        (f"逐核先算 total−scalar；{residual_relationship}",),
         note="它不是“空闲时间”，可能包含等待、I-cache、atomic、观察器及其他非 scalar-busy 周期。",
+        recording_reference=residual_reference,
     )
     request_html = _phase_metric_html(
         "I-cache request observed",
@@ -1409,6 +1974,7 @@ def _phase_card_html(item: Mapping[str, Any]) -> str:
         all_group["phase_request_observed_share_of_primary"],
         request_aic,
         request_aiv,
+        request_reference,
     )
     miss_html = _phase_metric_html(
         "I-cache miss observed",
@@ -1417,6 +1983,7 @@ def _phase_card_html(item: Mapping[str, Any]) -> str:
         all_group["phase_miss_observed_share_of_primary"],
         miss_aic,
         miss_aiv,
+        miss_reference,
     )
     return f"""
     <article class="phase-card">
@@ -1545,6 +2112,11 @@ def render_overview(payload: Mapping[str, Any]) -> str:
         if mode not in phase_by_mode:
             _fail(f"partition PMU mapping requires missing capture mode {mode!r}")
         phase_by_metric[metric] = phase_by_mode[mode]
+    submit_union_core_count = int(swimlane["core_count"])
+    none_core_count = int(pmu["whole_window"]["denominators"]["all"]["cores"])
+    if submit_union_core_count != none_core_count:
+        _fail("SubmitUnion swimlane and submit-pmu-none must describe the same core count")
+    submit_union_phase_profiles = [phase_by_mode[mode] for mode in SUBMIT_UNION_PMU_MODES]
     phase_cards = "".join(_phase_card_html(item) for item in pmu["phase_profiles"])
     calibration = _phase_card_html(pmu["calibration"])
     coverage_rows = "".join(
@@ -1621,6 +2193,20 @@ def render_overview(payload: Mapping[str, Any]) -> str:
     .evidence-ratio strong,.evidence-ratio small {{ display:block; }}
     .evidence-ratio small {{ color:var(--muted); }}
     .evidence-na {{ color:var(--muted); text-align:center; }}
+    .partition-total-row > th {{ white-space:normal; }}
+    .partition-total-row strong,.partition-total-row small {{ display:block; }}
+    .partition-total-row small {{ color:var(--muted); }}
+    .partition-comparison-row > th {{ vertical-align:top; white-space:normal; min-width:185px; }}
+    .partition-comparison-row > th small {{ display:block; color:var(--muted); font-weight:400; }}
+    .partition-summary-grid {{
+      display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:8px;
+    }}
+    .partition-summary-metric {{
+      min-width:0; padding:9px 10px; border:1px solid var(--line); border-radius:7px;
+      background:#f8fafc; white-space:normal;
+    }}
+    .partition-summary-metric span,.partition-summary-metric small {{ display:block; color:var(--muted); }}
+    .partition-summary-metric strong {{ display:block; margin:3px 0; overflow-wrap:anywhere; }}
     .synthetic-chart {{ display:grid; gap:10px; margin:16px 0; }}
     .synthetic-row {{
       display:grid; grid-template-columns:150px minmax(220px,1fr) 92px 138px;
@@ -1630,15 +2216,19 @@ def render_overview(payload: Mapping[str, Any]) -> str:
     .synthetic-row > strong {{ text-align:right; font-size:17px; }}
     .synthetic-row > small {{ color:var(--muted); }}
     .synthetic-track {{
-      position:relative; height:20px; overflow:hidden; border-radius:5px;
+      position:relative; display:flex; height:20px; overflow:hidden; border-radius:5px;
       background:#e5e7eb;
     }}
-    .synthetic-track b {{ display:block; height:100%; min-width:1px; }}
+    .synthetic-track b {{ display:block; height:100%; min-width:0; }}
+    .synthetic-track b.recording {{ background:#f59e0b; }}
+    .synthetic-track b.reference {{ background:#2563eb; }}
     .synthetic-track i {{
       position:absolute; top:0; bottom:0; width:2px; background:#111827;
       box-shadow:0 0 0 1px #ffffffcc;
     }}
     .synthetic-table {{ min-width:980px; }}
+    .synthetic-table th,.synthetic-table td {{ white-space:normal; vertical-align:top; }}
+    .synthetic-table td strong,.synthetic-table td small {{ display:block; }}
     .phase-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,560px),1fr)); gap:14px; }}
     .phase-card {{ margin:0; }}
     .phase-card header {{ display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }}
@@ -1666,8 +2256,10 @@ def render_overview(payload: Mapping[str, Any]) -> str:
   <div class="notice"><strong>这里有两条互不混算的证据链。</strong>
     泳道图的百分比只在同一个泳道 ELF 的排他时间树中相加；每个 Submit-PMU profile 都是独立 ELF，
     phase PMU total、Scalar busy、非 Scalar-busy 残余、request 和 miss 只能使用本 ELF 自己的分母。
-    不同 ELF 的绝对值不能相减，各 PMU 行的占比也不能相加成 100%。页面另设的“分段合计 vs none”
-    只是一项显式跨 ELF 合成诊断，用来观察插桩膨胀，不改变上述正式口径。</div>
+    不同 ELF 的绝对值不能直接相减，各 PMU 行的占比也不能相加成 100%。业务 phase 的主显示值
+    先从 raw observed 分子中扣除 empty-bracket 估算的局部记录代码开销，再除以本 ELF 的 raw whole；
+    raw observed / raw whole 同格保留。empty-bracket 没有测到 whole 窗口中的全部记录工作，因此这个
+    主显示值只是更接近业务量级的参考值，不是“纯业务阶段 / 纯业务整窗”的精确占比。</div>
 
   <section class="context">
     <h2>口径与来源</h2>
@@ -1676,13 +2268,15 @@ def render_overview(payload: Mapping[str, Any]) -> str:
       <strong>{swimlane["global_submit_makespan"]["duration_us"]:.3f} µs</strong>。</p>
     <p>SYS 边界诊断排除了 linked Vector/Cube Kernel 和 result-used return-ready atomic 的等待区间；
       PMU total、Scalar busy 与 primary I-cache 来自嵌在首末 Submit SYS closure 内且遇 linked Kernel
-      会暂停的 PMU gate，但 PMU counter 仍保留 atomic 指令及等待事件。阶段主时间使用 running read-clear PMU total；
-      Scalar busy 独立观测，非 Scalar-busy 残余逐核按 total−scalar 得到。SYS phase tick 只核验边界闭合。
-      PMU/I-cache counter 仍含 atomic 指令及观察代码事件，局部 observed
-      不是零插桩函数体的数学上下界。</p>
+      会暂停的 PMU gate，但 PMU counter 仍保留 atomic 指令及等待事件。阶段原始 PMU 观测使用
+      running read-clear total；Scalar busy 独立观测，非 Scalar-busy 残余逐核按 total−scalar 得到。
+      页面再用 empty-bracket 估算进入 phase 分子的局部记录代码并给出参考值；SYS phase tick 只核验
+      边界闭合。PMU/I-cache counter 仍含 atomic 指令及观察代码事件，局部 observed 不是零插桩
+      函数体的数学上下界。</p>
     <p>本批 PMU 来自 {len(validation["git_heads"])} 组 revision：<code>{head_list}</code>；
-      mixed revisions 被如实保留，进一步禁止跨 ELF 数值运算。泳道 raw 没有 build provenance，
-      页面只证明 raw SHA 与 schema-v4 重算闭合，
+      每个业务 phase 与 empty-bracket 必须来自同一场景和同一 revision，才允许计算局部记录开销参考值；
+      其他跨 ELF 数值仍只作明示的数量级对照。泳道 raw 没有 build provenance，页面只证明 raw SHA
+      与 schema-v4 重算闭合，
       不伪称已证明当时 ELF 身份；泳道与 PMU 之间仅对齐 96 核拓扑和每核 Submit 数。</p>
   </section>
 
@@ -1690,12 +2284,21 @@ def render_overview(payload: Mapping[str, Any]) -> str:
   <p class="notice">泳道分区展示原始业务 elapsed，不等同于纯 Scalar 时间。Kernel 是父 span 内的嵌套事件；
     当前 analyzer 能精确拆开 EfDrain 与 FinalDrain；其他 containment（本轮包括 WinnerBuild）只有事件数、
     没有独立 Kernel union 时长。因此纯 Scalar 归因只看下方相应 PMU control ELF，不从泳道父 span 猜减。</p>
-  <p class="fine">分区表新增的 PMU 与 scalar-busy 两列来自对应 phase 自己的独立 ELF：
-    分母分别是该 ELF 的 whole PMU total 与 whole scalar busy，并非泳道父区间，也不是
-    <code>submit-pmu-none</code>。各行不得相加；<code>control-only</code> 只代表排除 linked Kernel
-    后的控制路径；没有等价 phase 的行显示“—”。</p>
+  <p class="fine">分区表的 PMU 与 scalar 两列来自对应 phase 自己的独立 ELF。主值的分子是
+    “raw phase observed − 按 AIC/AIV 分别估算的局部记录代码开销”，分母仍是该 ELF 的 raw whole
+    PMU total 或 raw whole scalar；raw 比例作为次要信息保留。它们并非泳道父区间，也不是
+    <code>submit-pmu-none</code>，所以各行不得相加；<code>control-only</code> 只代表排除 linked
+    Kernel 后的控制路径；没有等价 phase 的行显示“—”。SubmitUnion 表专门改用每核均值：
+    时间列是平均每核时间，三个占比也分别由同口径的每核均值相除；表尾四层拆分只作跨 ELF
+    数量级诊断。</p>
   {_partition_html(swimlane["submit_envelope_partition"], phase_by_metric)}
-  {_partition_html(swimlane["submit_union_partition"], phase_by_metric)}
+  {_partition_html(
+      swimlane["submit_union_partition"],
+      phase_by_metric,
+      mean_core_count=submit_union_core_count,
+      comparison_whole_window=pmu["whole_window"],
+      comparison_phase_profiles=submit_union_phase_profiles,
+  )}
   {_partition_html(swimlane["efdrain_partition"], phase_by_metric)}
 
   <details class="context"><summary><strong>外围 Worker / Orchestration / FinalDrain 闭合</strong></summary>
@@ -1724,10 +2327,12 @@ def render_overview(payload: Mapping[str, Any]) -> str:
   {_synthetic_phase_sum_html(pmu["synthetic_phase_sum_vs_none"])}
 
   <h2>Submit-PMU ELF：各阶段独立归因</h2>
-  <p>每张卡的 PMU total、Scalar busy、非 Scalar-busy 残余及 I-cache 百分比都只使用该卡所属 ELF
-    内的对应分母。各阶段 Scalar busy 来自不同 ELF，不能求和后与
-    <code>submit-pmu-none</code> 的 whole Scalar busy 做正式判等；上方合成诊断特意执行该运算，
-    仅用于呈现观察膨胀指纹。</p>
+  <p>每张业务阶段卡都把“扣局部记录代码开销估算后的参考值”放在主位置，并同时列出 raw observed、
+    记录代码开销估算及 raw whole 分母。参考比例仍以该卡所属 ELF 的 raw whole 为分母；
+    empty-bracket 没有测到整窗全部观察代码，因此不能把它解释成精确业务占比。各阶段来自不同 ELF，
+    也不能求和后与 <code>submit-pmu-none</code> 做正式判等；上方合计只用于判断数量级。若某项参考值
+    为负，表示空区间记录估算已经超过 raw observed，只说明该信号低于当前校准分辨能力；页面不截成
+    零，也不把它解释成负的业务事件。</p>
   <div class="phase-grid">{phase_cards}</div>
 
   <h2>观察器校准（不是业务阶段）</h2>

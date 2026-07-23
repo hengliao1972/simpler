@@ -38,6 +38,7 @@ from simpler_setup.tools.fdwic_submit_pmu_report import (
     REGISTER_CAPTURE_MODE,
     SUBMIT_TRANSITION_CAPTURE_MODE,
     WINNER_BUILD_CAPTURE_MODE,
+    build_phase_recording_cost_reference,
     capture_build_identity,
     load_capture,
     load_provenance,
@@ -939,14 +940,18 @@ def test_valid_arg_build_capture_renders_same_elf_phase_observation_first(tmp_pa
     assert "Phase PMU total" in document
     assert "Phase scalar busy" in document
     assert "非 Scalar-busy 残余" in document
-    assert "阶段关系 / 同 ELF 整窗占比" in document
-    assert "Request observed（总数 / 逐核 min–max / Primary）" in document
-    assert "Miss observed（总数 / 逐核 min–max / Primary）" in document
+    assert "原始阶段关系（非业务占比）" in document
+    assert "本报告没有提供 empty-bracket 校准输入" in document
+    assert "以下均为原始 observed，不能作为业务占比" in document
+    assert "原始 Phase total / 原始 whole total" in document
+    assert "原始 Phase scalar / 原始 whole scalar" in document
+    assert "Request raw observed（总数 / 逐核 min–max / 原始整窗）" in document
+    assert "Miss raw observed（总数 / 逐核 min–max / 原始整窗）" in document
     assert "observed_plus_capture_gap = observed + (primary − shadow)" in document
     assert "插桩 bookkeeping 会进入 sample" in document
     assert "不是原业务" in document
     assert "事件数的数学上下界" in document
-    assert "阶段主时间来自 running read-clear 的 PMU total cycles" in document
+    assert "阶段原始 PMU 观测来自 running read-clear 的 total cycles" in document
     assert "phase_elapsed_ticks 只是 SYS 边界闭合诊断" in document
     assert "绝不按 1 GHz 当作阶段时间" in document
     assert "result-used return-ready atomic" in document
@@ -959,7 +964,7 @@ def test_valid_arg_build_capture_renders_same_elf_phase_observation_first(tmp_pa
     assert "cycles/call" in document
     assert "是每核累计" in document
     assert "不是逐调用极值" in document
-    assert "不能跨 ELF 相减" in document
+    assert "不同 ELF 不能直接相减" in document
     assert "I-cache shadow 是 begin/end/final 全部 running read-clear 返回值之和" in document
     assert "scalar shadow 同样用于核验 phase 读清重建" in document
     for group_name in ("all", "aic", "aiv"):
@@ -997,8 +1002,8 @@ def test_valid_arg_build_capture_renders_same_elf_phase_observation_first(tmp_pa
         assert f"Σ {phase['phase_elapsed_ticks']['sum']:,} raw ticks" in document
         assert f"逐核 最小 {requests['min']:,}；最大 {requests['max']:,}" in document
         assert f"逐核 最小 {misses['min']:,}；最大 {misses['max']:,}" in document
-        assert f"Primary {phase['primary_icache_requests']:,}" in document
-        assert f"Primary {phase['primary_icache_misses']:,}" in document
+        assert f"原始整窗 {phase['primary_icache_requests']:,}" in document
+        assert f"原始整窗 {phase['primary_icache_misses']:,}" in document
 
 
 def test_valid_empty_bracket_capture_is_reported_as_observer_calibration(tmp_path: Path) -> None:
@@ -1013,11 +1018,12 @@ def test_valid_empty_bracket_capture_is_reported_as_observer_calibration(tmp_pat
     assert "claim_end_adjacent_empty_bracket" in document
     assert "running_read_clear_empty_bracket_calibration" in document
     assert "boundary_diagnostic_outer_sys_cnt_around_adjacent_observer_pair" in document
-    assert "观察器自成本量尺，不是业务 phase" in document
-    assert "phase PMU total/scalar 是紧邻 begin/end 对本身带来的计数开销量尺" in document
+    assert "用于估算每次 begin/end 紧邻执行的记录代码开销" in document
+    assert "不是业务 phase" in document
+    assert "phase PMU total/scalar 是紧邻 begin/end 对本身带来的计数开销" in document
     assert "仍只覆盖两次 shadow read-clear 之间" in document
     assert "SYS tick 只用来核验边界是否闭合" in document
-    assert "这些量尺都不能跨 ELF 精确扣减" in document
+    assert "不能估算完整 whole" in document
     for group_name in ("all", "aic", "aiv"):
         phase = capture.phase_summary[group_name]
         requests = phase["phase_icache_requests_observed"]
@@ -1025,6 +1031,138 @@ def test_valid_empty_bracket_capture_is_reported_as_observer_calibration(tmp_pat
         assert f"{phase['phase_total_cycles_observed_per_call']:,.3f} cycles/call" in document
         assert f"逐核 最小 {requests['min']:,}；最大 {requests['max']:,}" in document
         assert f"逐核 最小 {misses['min']:,}；最大 {misses['max']:,}" in document
+
+
+def test_phase_recording_reference_subtracts_only_the_phase_numerator_by_role(
+    tmp_path: Path,
+) -> None:
+    target_directory = tmp_path / "target"
+    empty_directory = tmp_path / "empty"
+    target_directory.mkdir()
+    empty_directory.mkdir()
+    target_path = _write_capture(target_directory, _valid_materialize_capture())
+    empty_data = _valid_empty_bracket_capture()
+    for record in empty_data["records"]:
+        is_aic = record["role"] == "aic"
+        logical_core_id = record["logical_core_id"]
+        record["phase_total_cycles_observed"] = (900 if is_aic else 1_300) + logical_core_id
+        record["phase_scalar_busy_observed"] = (500 if is_aic else 800) + logical_core_id
+        record["phase_icache_requests_observed"] = 120 if is_aic else 180
+        # Materialize 的原始 miss 是 50..54；校准值更大，用来证明参考值允许为负。
+        record["phase_icache_misses_observed"] = 60 + logical_core_id % 5
+    empty_path = _write_capture(empty_directory, empty_data)
+
+    target = load_capture(target_path)
+    empty = load_capture(empty_path)
+    reference = build_phase_recording_cost_reference(target, empty)
+
+    assert reference["exact_correction"] is False
+    assert reference["raw_whole_denominator_is_unchanged"] is True
+    assert reference["whole_recording_cost_is_not_measured"] is True
+    for group_name in ("aic", "aiv"):
+        group = reference["groups"][group_name]
+        target_phase = target.phase_summary[group_name]
+        empty_phase = empty.phase_summary[group_name]
+        assert target_phase is not None
+        assert empty_phase is not None
+        assert group["target_record_pairs"] == target_phase["phase_end_reads"]
+        assert group["empty_record_pairs"] == empty_phase["phase_end_reads"]
+        for metric_name, phase_field, whole_field in (
+            ("pmu_total_cycles", "phase_total_cycles_observed", "total_cycles"),
+            ("scalar_busy_cycles", "phase_scalar_busy_observed", "scalar_busy"),
+            ("non_scalar_busy_cycles", "phase_non_scalar_busy_cycles", "non_scalar_busy_cycles"),
+            ("icache_requests", "phase_icache_requests_observed", "icache_requests"),
+            ("icache_misses", "phase_icache_misses_observed", "icache_misses"),
+        ):
+            metric = group["metrics"][metric_name]
+            raw_phase = target_phase[phase_field]["sum"]
+            raw_whole = target.summary[group_name][whole_field]["sum"]
+            empty_per_pair = empty_phase[phase_field]["sum"] / empty_phase["phase_end_reads"]
+            expected_cost = empty_per_pair * target_phase["phase_end_reads"]
+            assert metric["raw_phase_observed_sum"] == raw_phase
+            assert metric["raw_whole_sum"] == raw_whole
+            assert metric["recording_cost_estimate_sum"] == pytest.approx(expected_cost)
+            assert metric["after_recording_cost_reference_sum"] == pytest.approx(raw_phase - expected_cost)
+            assert metric["raw_phase_observed_ratio_to_raw_whole"] == pytest.approx(raw_phase / raw_whole)
+            assert metric["after_recording_cost_reference_ratio_to_raw_whole"] == pytest.approx(
+                (raw_phase - expected_cost) / raw_whole
+            )
+
+    all_group = reference["groups"]["all"]
+    assert all_group["all_values_are_aic_aiv_sums"] is True
+    for metric_name, metric in all_group["metrics"].items():
+        for field in (
+            "raw_phase_observed_sum",
+            "raw_whole_sum",
+            "recording_cost_estimate_sum",
+            "after_recording_cost_reference_sum",
+        ):
+            assert metric[field] == pytest.approx(
+                reference["groups"]["aic"]["metrics"][metric_name][field]
+                + reference["groups"]["aiv"]["metrics"][metric_name][field]
+            )
+    miss_reference = all_group["metrics"]["icache_misses"]
+    assert miss_reference["after_recording_cost_reference_sum"] < 0
+    assert miss_reference["after_recording_cost_reference_ratio_to_raw_whole"] < 0
+
+    document = render_report(target_path, calibration_input_path=empty_path)
+    assert "扣除记录代码开销估算后的参考值" in document
+    assert "参考值只从 phase observed 分子扣除该估算；原始 whole 分母保持不变" in document
+    assert "参考 Phase total / 原始 whole total" in document
+    assert "原始 observed" in document
+    assert "不能截成零" in document
+    assert f"{miss_reference['after_recording_cost_reference_sum']:,.3f}" in document
+
+
+def test_phase_recording_reference_keeps_negative_values_and_none_for_zero_raw_whole() -> None:
+    metric = report_module._recording_reference_metric(
+        unit="events",
+        phase_field="phase_icache_misses_observed",
+        whole_field="icache_misses",
+        target_group={"phase_icache_misses_observed": {"sum": 3}},
+        target_whole={"icache_misses": {"sum": 0}},
+        empty_group={"phase_icache_misses_observed": {"sum": 5}},
+        target_record_pairs=1,
+        empty_record_pairs=1,
+    )
+
+    assert metric["after_recording_cost_reference_sum"] == -2
+    assert metric["raw_phase_observed_ratio_to_raw_whole"] is None
+    assert metric["after_recording_cost_reference_ratio_to_raw_whole"] is None
+    assert report_module._format_optional_percent(None) == "N/A"
+
+
+def test_phase_recording_reference_provenance_requires_one_revision_and_scenario() -> None:
+    target = {
+        "build": {
+            "git_head": "1" * 40,
+            "source_state_version": "source-v2",
+            "profiled_cache_key": ["Case1", "a5", "fdwic", MATERIALIZE_CAPTURE_MODE],
+        }
+    }
+    calibration = {
+        "build": {
+            "git_head": "1" * 40,
+            "source_state_version": "source-v2",
+            "profiled_cache_key": ["Case1", "a5", "fdwic", EMPTY_BRACKET_CAPTURE_MODE],
+        }
+    }
+
+    binding = report_module._validate_recording_reference_provenance(target, calibration)
+    assert binding == {
+        "verified": True,
+        "git_head": "1" * 40,
+        "source_state_version": "source-v2",
+        "profiled_cache_key_prefix": ["Case1", "a5", "fdwic"],
+    }
+
+    calibration["build"]["git_head"] = "2" * 40
+    with pytest.raises(ValueError, match="git heads do not match"):
+        report_module._validate_recording_reference_provenance(target, calibration)
+    calibration["build"]["git_head"] = "1" * 40
+    calibration["build"]["profiled_cache_key"][0] = "CaseB1"
+    with pytest.raises(ValueError, match="scenarios do not match"):
+        report_module._validate_recording_reference_provenance(target, calibration)
 
 
 def test_phase_non_scalar_extrema_are_derived_per_core(tmp_path: Path) -> None:
