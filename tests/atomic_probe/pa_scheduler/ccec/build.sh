@@ -17,8 +17,8 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ARTIFACT_MANIFEST_NAME="pa_scheduler_artifacts.manifest"
 
 # mode 是 artifact 身份的一部分。run.sh 总会显式传入；直接调用 build.sh
-# 未传 mode 时仍默认 private，保持原有命令可用。shared backend 接入前，
-# pa_model.h 会明确拒绝 shared 编译，绝不生成伪 shared 产物。
+# 未传 mode 时仍默认 private，保持原有命令可用。private/shared 分别实例化
+# 各自已接线的 TensorMap backend，manifest 会阻止两种产物交叉运行。
 TENSORMAP_MODE="private"
 if [[ "${1:-}" == "private" || "${1:-}" == "shared" ]]; then
     TENSORMAP_MODE="$1"

@@ -2,9 +2,10 @@
 
 本文审查
 [`poursoul/simpler:fdwic-shared-tensormap`](https://github.com/poursoul/simpler/tree/fdwic-shared-tensormap)
-在 A5 FDWIC runtime 中实现的 shared TensorMap 方案，并与当前分支准备采用的
+在 A5 FDWIC runtime 中实现的 shared TensorMap 方案，并与当前分支 standalone
 方案比较。本文用于后续开发决策，不表示目标分支已经合入，也不把分支文档中的
-实验记录自动当成当前分支的性能结论。
+实验记录自动当成当前分支的性能结论；当前分支 S0～S2 的实际实施证据另记于
+第 15 节。
 
 ## 1. 审查快照与证据口径
 
@@ -688,6 +689,8 @@ writer intent 的实现需要在开发前明确二选一：
 
 ### 阶段 S0：standalone 构建身份和 ABI
 
+**状态：已完成；当时的临时 shared fail-closed 门禁已在 S2 删除。**
+
 - `run.sh` 增加 first-class `--tensormap private|shared`，默认 private；
 - CCEC、AscendC、CPU 构建都显式传
   `PTO_FDWIC_SHARED_MAP=0/1`，产物目录包含 backend、mode 和诊断 variant；
@@ -697,8 +700,10 @@ writer intent 的实现需要在开发前明确二选一：
 - 修复 PMU 配置使用 `reserved[4]` 越过 `RunConfig`、覆盖
   `WinnerWorkloadConfig::mode` 的问题，改为独立 cache-line sidecar。
 
-**Gate**：默认 private 的 CPU b1 全断言不变；脚本语法检查通过；shared backend
-尚未接入时必须在编译期明确失败；故意混用模式或校验和必须在启动前失败。
+**Gate**：默认 private 的 CPU b1 全断言不变；脚本语法检查通过；S0 当时
+shared backend 尚未接入，必须在编译期明确失败；故意混用模式或校验和必须在
+启动前失败。S2 接入真实 shared sidecar 后只删除临时 fail-closed，模式隔离和
+混用拒绝继续保留。
 
 ### 阶段 S1：standalone private map 先同构为 ring
 
@@ -727,23 +732,34 @@ retire、容量耗尽和复用；容量不足必须显式失败，不能静默�
 
 ### 阶段 S2：standalone shared 有序 ring
 
+**状态：已完成正确性闭环；当前性能不可接受，尚不具备迁移条件。**
+
 第一版 shared 只切换 map 的副本数、写入主体和并发纪律，暂时保留 eager 构参和
 每核 private heap，避免在一个提交里同时改三个协议面：
 
-- 在完整 private DistGlobal 镜像之后增加 64B 对齐 shared sidecar，不移动生产
-  prefix 和 WorkerState offset；
-- shared 只有 winner 追加 region，零 insert task 也必须提交空 delta；
-- 所有 worker 按 task id 顺序观察同一个 append 前沿，loser 在本 task 发布后
-  才能继续；
-- lookup 只接受 `producer ∈ [N-H, N)`；
-- slot 带绝对 seq，覆写前先失效，写入后再发布 seq；
-- reclaim 由 `min(core_progress)-H-1` 推动；
-- overflow/fatal 对所有等待者可见，等待路径带 watchdog，并可协作 drain。
+- 在完整 production prefix、standalone controls 和 `results` 后追加 64B 对齐、
+  2,119,808 bytes 的 shared sidecar，不移动 WorkerState 或既有控制/结果 offset；
+- sidecar 保存连续 task commit 前沿、全局 reclaim 前沿、96 条每核 progress、
+  128 组分离 cache line 的 head/tail 和 16,384 个共享槽；
+- shared 只有 winner 追加 region，零 insert task 也必须提交空 delta；这里的
+  winner-only 不包括构参和 Materialize，它们在 S2 仍由所有 worker eager 执行；
+- task N lookup 前所有 worker 必须观察到前 N 个 task 连续 commit；winner 完成
+  整 task append 后发布 N+1，loser 等待 N+1，随后所有 worker 精确发布 progress=N；
+- lookup 只接受 `producer ∈ [max(0, N-H), N)`；
+- slot 的 payload 和绝对 `seq` 各占一条 cache line。writer 先失效旧 seq，
+  写 payload 并 DCache flush，再发布 seq/tail；reader 原子读 seq、invalidate
+  payload、拷贝快照、再次原子读 seq，双检失败即协议错误；
+- reclaim 由 `min(core_progress)-H-1` 单调推动；
+- 整 task 在任何写入前完成容量预检，普通容量不足保持 all-or-nothing；
+  overflow/fatal 对所有等待者可见，等待路径带 watchdog，并可协作 drain；
+- host D2H 后独立验证 commit/progress、bucket cursor、seq/payload/hash、
+  producer 和最终逻辑窗口，不依赖 device 汇总计数自证。
 
 **Gate**：每 task 恰好一次 commit，最终 sequencer 等于 task_count；逆序 winner、
 慢核 progress、零 entry task、seq wrap、future/stale 过滤、tiny-cap overflow
-全部通过；private/shared 的 sorted logical-map hash 和全局 dependency signature
-一致。
+全部通过；private/shared 的规范化 logical-map signature 和全局 dependency
+signature 一致。CPU b1/b256 与 CCEC A5 b1/b256 已通过该 Gate；详细证据和
+性能边界见第 15 节。
 
 ### 阶段 S3：standalone winner-only 与 fresh symbol
 
@@ -850,18 +866,19 @@ shared 组合再增加 `-DPTO_FDWIC_SHARED_MAP=1`。两次返回码均为 1，�
 
 ## 14. 后续决策摘要
 
-后续开发的第一目标不是马上把 PA 改成 shared，而是先在 standalone 回答四个
-问题：
+S0～S2 已先在 standalone 回答了构建身份、private/shared 同构逻辑结果和
+region writer 顺序三个问题；S3 仍需继续回答 symbol 与 heap 的有界复用问题：
 
 1. 三镜像如何证明自己属于同一个 map/profile ABI？
 2. private/shared 如何基于同构 ring 生成可比较的逻辑依赖结果？
 3. 任意 winner 到达顺序下，writer 链如何仍严格遵守 task 顺序？
 4. region、symbol 和 heap 如何在有界内存中安全复用并可靠终止？
 
-这四个问题和 standalone 三后端验收闭环后，目标分支的 winner-first 和符号
-快路径才适合进入真实代码。否则即使某次 PA 上板更快，也只能说明特定
-workload 没触发协议边界，不能说明 shared TensorMap 已经具备可维护、可扩展
-的架构。
+前三项已经由模式握手、ordered ring、host 独立验证和跨模式签名闭环；第四项
+不能拿当前 per-worker heap 冒充答案。四项和 standalone 三后端验收全部闭环
+后，目标分支的 winner-first 和符号快路径才适合进入真实代码。否则即使某次
+PA 上板更快，也只能说明特定 workload 没触发协议边界，不能说明 shared
+TensorMap 已经具备可维护、可扩展的架构。
 
 ## 15. 当前分支实施记录
 
@@ -882,7 +899,8 @@ workload 没触发协议边界，不能说明 shared TensorMap 已经具备可�
 - 发现并修复旧 PMU `reserved[4]` 越界：原数组只有四项，索引 4 实际落入
   相邻 `WinnerWorkloadConfig::mode`；现已迁到独立 64B
   `PmuProbeConfig`；
-- shared backend 尚未接入时保留编译期门禁，不生成伪 shared 产物。
+- S0 当时在 shared backend 尚未接入时保留编译期门禁，不生成伪 shared
+  产物；S2 已用真实 sidecar 替换该门禁，这不是当前运行限制。
 
 验证结果：
 
@@ -893,7 +911,7 @@ workload 没触发协议边界，不能说明 shared TensorMap 已经具备可�
 | CCEC private swimlane 编译 | PASS |
 | CCEC private submit-pmu none 编译 | PASS |
 | 两类 CCEC manifest/SHA256 启动前校验 | PASS |
-| shared CPU fail-closed，且无 executable | PASS |
+| S0 历史 shared CPU fail-closed，且无 executable | PASS；该门禁已在 S2 删除 |
 | 重复/非法 mode、缺失 shared 产物负测 | PASS |
 | standalone Python 回归（用户 `.venv`） | 100 passed |
 | 四个 shell 脚本 `bash -n` | PASS |
@@ -957,3 +975,110 @@ b1 只有小样本，2.507 us 差值不能解释成稳定性能收益；当前�
 private ring 没有表现出回退。b256 只作协议和规模回归记录，不是性能基线。
 后续是否保留性能结论仍由相同 ELF 口径的多轮配对测试决定，不能与带泳道、
 submit-pmu 或真实 PA 的绝对时间直接相减。
+
+### 2026-07-24：S2 standalone shared ordered ring
+
+本阶段仍严格限定在 `tests/atomic_probe/pa_scheduler`，没有修改
+`src/a5/runtime/fully_distributed_within_core`、真实 PA 或其他 simpler
+runtime 路径。S2 的目标是先得到可证明、可失败终止、可与 private 比较的
+shared region map 正确性基线，不在同一阶段同时改 winner-only 构参、fresh
+symbol 或 shared heap。
+
+#### 数据布局与发布协议
+
+shared 构建在完整 production prefix、standalone controls 和 `results` 之后
+追加 `SharedTensorMapSidecar`。它为 64B 对齐、2,119,808 bytes，既有
+`WorkerState`、`RunConfig` 和结果 offset 均不移动：
+
+| sidecar 项 | 数量与语义 |
+| ---- | ---- |
+| `committed_tasks` | 连续发布的 task 数；初始 0，task N 完成后为 N+1 |
+| `reclaim_upto` | 可回收 producer 的 inclusive 上界；初始 -1 |
+| `core_progress` | 96 条独占 atomic cache line；每核精确记录最后观察完的 task |
+| bucket state | 128 个桶；head/tail 各占独立 64B cache line |
+| region slot | 128×128=16,384 个；64B payload 与 64B 绝对 `seq` 分离 |
+
+S2 仍保留 compete-first eager 参数构造、所有核 Materialize 和 per-worker
+heap。“winner-only”只发生在共享 region 写入：每个 task 只有 winner 收集
+register entries 并追加，零 entry task 也必须发布一次空 commit。所有 worker
+遵守同一 task 顺序边界：
+
+1. task N 的 lookup 前等待 `committed_tasks >= N`，确认前 N 个 task
+   已连续发布；
+2. winner 在持有 N 的 append turn 时先预检整 task 容量，再追加全部 entry，
+   最后以返回值参与判断的 Exchange 把 commit 从 N 推进到 N+1；
+3. loser 等待 N+1，winner 直接使用自己的发布结果；随后每个 worker 都把
+   本核 progress 从 N-1 精确推进到 N。
+
+lookup 只接受 `producer ∈ [max(0, N-H), N)`，从协议上同时排除 stale 与
+future producer。slot 复用不只依赖环下标：writer 先把旧绝对 `seq` 失效，
+对 payload 执行 invalidate、普通字段写和 DCache flush，再发布新 `seq` 与
+tail；reader 执行“第一次原子读 `seq` → DCache invalidate payload → 拷贝
+本地快照 → 第二次原子读 `seq`”。CCEC/AscendC 的 region hook 逐 cache line
+执行 `dcci` 并以 `dsb` 收口；CPU hook 只模拟顺序。两次 seq 不等、payload
+非法或 cursor 破坏都属于协议错误，不能静默当成 lookup miss。
+
+reclaim candidate 按 `min(core_progress)-H-1` 计算并只允许单调推进。append
+在写任何槽之前检查本 task 的全部目标桶、容量和预期旧 seq；容量暂时不足时
+等待慢核 progress，并在循环中协作 drain。预检可以先推进已经满足 reclaim
+条件的 bucket head；这只清除已过期历史，不会发布当前 task 的部分 entry，
+所以普通容量不足仍保持当前 task 的 all-or-nothing。协议破坏、fatal 或
+watchdog 会让运行显式失败。
+
+#### host 独立校验与跨模式签名
+
+host 初始化 sidecar 后将它作为独立 H2D 区段传输；运行后再独立 D2H。最终
+校验不信任 device 汇总字段，而是直接遍历 sidecar，检查：
+
+- `committed_tasks == task_count`，且 96 条 progress 都等于最后一个 task；
+- reclaim 不回退且不越过由最终 progress 推导出的上界；
+- 每桶 `0 <= tail-head <= 128`，每个 live slot 的 `seq` 与绝对 cursor
+  一致；
+- payload 区间、producer、reserved 和地址 hash 都合法；
+- 最终逻辑窗口只保留预期 UP entries，entry 数和 producer 分布准确。
+
+private 与 shared 都按
+`(bucket, buffer_addr, lo, hi, producer)` 生成同一规范化逻辑 map 签名；
+每条 PA fanin 又按 `(consumer, producer)` 生成与存储布局无关的依赖边签名。
+签名不是替代逐字段断言，而是在上述独立校验之后锁定两种实现生成了同一逻辑
+结果。
+
+#### 验证证据
+
+| 场景 | 结果 | dependency signature | logical map signature |
+| ---- | ---- | ---- | ---- |
+| CPU private/shared b1 | 全部语义与终态断言 PASS | `5cb454393ed48dcb` | `3a3d526c9b23c3db` |
+| CPU private/shared b256 | 全部语义与终态断言 PASS | `b7d985d6edb07078` | `556bec7ec8d0f323` |
+| CCEC A5 private/shared b1 | 全部语义与终态断言 PASS | `5cb454393ed48dcb` | `3a3d526c9b23c3db` |
+| CCEC A5 private/shared b256 | 全部语义与终态断言 PASS | `b7d985d6edb07078` | `556bec7ec8d0f323` |
+| AscendC A5 shared b1 | 全部语义与终态断言 PASS；Submit `231.884 us` | `5cb454393ed48dcb` | `3a3d526c9b23c3db` |
+
+定向 shared ring 用例还覆盖零 entry ordered commit、同桶多 entry、多桶
+lookup、`[N-H,N)` 边界、慢核 reclaim、三圈 seq 复用、确定性 ABA 注入、
+满桶预检 all-or-nothing、逆序 actor 到达和逻辑 tuple differential，并通过
+ASan/UBSan。CPU 在这里证明的是原子调用顺序、状态机、容量和逻辑差分；
+它不具备 A5 非一致缓存，不能证明设备 DCache/DCCI 或 A5 原子竞争行为。
+CCEC 上板 b1/b256 与 AscendC shared b1 PASS 才是当前设备缓存协议的验证证据。
+
+#### 性能边界与已撤回实验
+
+同源 CCEC `--no-swimlane` 构建各取一个 b256 单进程单次诊断：
+
+| 模式 | `submit_span` |
+| ---- | ----: |
+| private | 3.816830 ms |
+| shared S2 | 68.796708 ms |
+
+这不是多轮性能统计，不能把 64.979878 ms 差值细分成某条指令的稳定成本；
+但数量级差异已经足以说明当前“96 核逐 task commit 前后强一致”只能作为
+正确性基线，性能不可接受，不能直接迁移到真实 simpler。
+
+曾做过一次过程实验：只让 winner 承担 commit 前等待，b1 得到 76.558 us；
+同一改法在 b256 只推进到 `committed_tasks=819` 就触发 watchdog。该结果证明
+简单删除 loser 的前置顺序边界会破坏长序列活性，不能当成性能优化。实验代码
+已完整撤回，不属于 S2 提交，也不改变上述 private/shared 正确性签名。
+
+当前 shared sidecar 的原子调用会落入既有 Submit 与业务阶段 span，但还没有
+逐条接入 atomic 泳道 wrapper。因此现阶段泳道不能用来声称“shared 协议原子
+已经全量可见”；这项观察能力留到后续独立小步补齐。本阶段的正确性证据来自
+host 对 sidecar 的逐字段校验、依赖边签名和规范化 logical-map 签名。

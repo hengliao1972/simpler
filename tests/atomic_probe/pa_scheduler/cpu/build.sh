@@ -37,7 +37,8 @@ mkdir -p "$BUILD_DIR"
 
 echo "[BUILD] CPU scheduler executable"
 # -pthread 同时提供编译期线程宏和链接期 pthread 支持；严格告警用于防止
-# CPU 等价层因类型或原子接口变化而静默偏离设备端公共协议。
+# CPU 等价层因类型或原子接口变化而静默偏离设备端公共协议。private/shared
+# 都实例化同一 scheduler，模式宏只选择各自已经接线的 TensorMap backend。
 "$CXX_BIN" -O3 -std=c++17 -pthread -Wall -Wextra -Werror \
     "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID" \
     -I"$ROOT_DIR/common" \
@@ -57,9 +58,9 @@ echo "[BUILD] atomic PollBatch boundary self-test"
 echo "[TEST] atomic PollBatch boundary self-test"
 "$BUILD_DIR/test_atomic_poll_batch"
 
-# private ring 的独立回归不启动 96 个 worker，也不运行模拟 kernel；它直接
-# 实例化 common/ 中的同一份 TensorMap API，覆盖每桶容量、回收回绕和逐操作
-# reference 差分。shared 模式后续有自己的并发/发布测试，不复用这套单线程纪律。
+# TensorMap 独立回归不启动 96 个 worker，也不运行模拟 kernel：private
+# 覆盖单线程 ring 的回收回绕与 reference 差分；shared 覆盖有序发布、
+# seq/ABA、慢核回收和整任务容量预检，两者不混用并发纪律。
 if [[ "$TENSORMAP_MODE" == "private" ]]; then
     echo "[BUILD] private TensorMap ring self-test"
     "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
@@ -71,6 +72,17 @@ if [[ "$TENSORMAP_MODE" == "private" ]]; then
 
     echo "[TEST] private TensorMap ring self-test"
     "$BUILD_DIR/test_private_tensor_map_ring"
+else
+    echo "[BUILD] shared TensorMap ordered-ring self-test"
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/common/test_shared_tensor_map_ring.cpp" \
+        -o "$BUILD_DIR/test_shared_tensor_map_ring"
+
+    echo "[TEST] shared TensorMap ordered-ring self-test"
+    "$BUILD_DIR/test_shared_tensor_map_ring"
 fi
 
 # set -e 保证编译或链接失败时不会打印 complete，也不会在组合构建中继续

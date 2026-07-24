@@ -221,8 +221,8 @@ struct CcecOps {
     // PA's A5 OUT_OF_ORDER_STORE_BARRIER is intentionally a no-op; cache
     // coherency is handled by the runtime's DCCI protocol.
     // 这是对生产 A5 契约的刻意复刻，不是遗漏 barrier；若在这里额外插入 dsb，
-    // 会改变待测 Submit 热路径。completion 使用 atomic，config/trace 的 cache
-    // 可见性则由各自既有的 DCCI 路径处理。
+    // 会改变待测 Submit 热路径。completion 使用 atomic；config、trace 与
+    // shared TensorMap payload 的 cache 可见性由下方既有 DCCI hook 处理。
     __aicore__ static inline void StoreBarrier() {}
 
     __aicore__ static inline uint64_t Now() { return static_cast<uint64_t>(get_sys_cnt()); }
@@ -310,7 +310,8 @@ struct CcecOps {
     __aicore__ static inline void SpinHint() {}
 
     __aicore__ static inline void InvalidateRegion(__gm__ const void *address, uint64_t bytes) {
-        // 逐 cache line 失效并以 dsb 收口，供 worker 在启动时读取 host 刚写入的 standalone 控制区。
+        // 逐 cache line 失效并以 dsb 收口：既供 worker 读取 host 写入的
+        // standalone 控制区，也供 shared TensorMap reader 观察跨核 payload。
         if (bytes == 0) return;
         const uint64_t start = reinterpret_cast<uint64_t>(address) & ~uint64_t{63};
         const uint64_t end = (reinterpret_cast<uint64_t>(address) + bytes + 63) & ~uint64_t{63};
@@ -321,7 +322,8 @@ struct CcecOps {
     }
 
     __aicore__ static inline void FlushRegion(__gm__ void *address, uint64_t bytes) {
-        // 泳道记录先写普通 GM cache，kernel 结束前显式 CACHELINE_OUT，确保 host D2H 能看到完整记录。
+        // 普通 GM cache 内容逐 line clean-out 并以 dsb 收口：泳道记录据此
+        // 对 host 可见，shared TensorMap writer 也复用同一 hook 发布 payload。
         if (bytes == 0) return;
         __asm__ volatile("" ::: "memory");
         const uint64_t start = reinterpret_cast<uint64_t>(address) & ~uint64_t{63};

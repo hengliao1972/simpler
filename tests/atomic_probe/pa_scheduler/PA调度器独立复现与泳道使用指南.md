@@ -16,8 +16,8 @@
 - Alloc 由 96 个 worker 竞争，QK/PV 由 32 个 AIC 竞争，SF/UP 由 64 个 AIV 竞争；
 - 4 路 Alloc/cube/vector Claim cursor，以及实际 `atomicMax` Claim；
 - PA 的 TaskArgs、Tensor、TaskPayload、DistSubmitCtx、DistCore/DistGlobal 关键 ABI 布局；
-- tensor tag 扫描、输出 layout、materialize、private TensorMap 有界桶环的
-  retire/lookup/insert、register mask；
+- tensor tag 扫描、输出 layout、materialize，以及按构建模式选择的 private
+  每核有界桶环或 shared 有序桶环的 retire/lookup/insert、register mask；
 - fanin 收集、winner/loser、Replay、私有 ring slot 构造和 tensor/scalar payload 拷贝；
 - EfDrain、WaitForSlot、HeapGuard、completion flag、vend、frontier、最终 drain；
 - 与真实 PA 相同的单 lane 优化：Case1 不执行 BlockWon 轮询；
@@ -36,7 +36,7 @@ winner 跳过构参的 lazy 快路。CCEC 正式泳道构建将 orchestration ca
 同一业务顺序，但 finish 在当前 TU 内联。
 
 Case1 的 task 不是五个彼此独立的占位符。standalone 会从 Tensor descriptor 的
-owner 和本 worker 的 TensorMap 收集 producer，去重后构造下列 fanin 图：
+owner 和当前构建模式的 TensorMap 收集 producer，去重后构造下列 fanin 图：
 
 | task | 直接 producer | fanin 数 |
 | --- | --- | ---: |
@@ -239,11 +239,10 @@ benchmark 运行时参数；省略时默认 `private`。它与 `swimlane`/
 swimlane 两件套和 submit-pmu 四件套都必须通过 manifest 的模式、变体、
 阶段和 SHA256 校验，才能启动 host。
 
-当前已完成 S0 构建身份和 S1 private ring；真正的 shared backend 尚未接入。
-此时显式构建
-`--tensormap shared` 会在编译期明确失败，且不会生成可执行文件；这是为了
-禁止“目录名为 shared、实际仍执行 private”的误导性结果。完成 shared
-协议的阶段会删除这道临时门禁，但保留相同的构建身份和产物隔离。
+当前已完成 S0 构建身份、S1 private ring 和 S2 shared ordered ring。
+`--tensormap private|shared` 都会生成对应模式的真实可执行文件；S0 用于禁止
+伪 shared 产物的临时编译门禁已在 S2 接入 shared sidecar 后删除。两种模式仍
+使用相互隔离的产物目录、manifest 和 host/device ABI 握手，不能混用镜像。
 
 S0 还修复了一处独立问题：旧 CCEC PMU 配置以
 `RunConfig::reserved[4]` 访问只有四项的数组，越界落入相邻 winner workload。
@@ -274,7 +273,7 @@ ring-per-bucket，但没有同时改构参、heap、output ref 或真实 simpler
 
 PA Case1 在 `H=64` 下全 map 最多保留 52 个 live entry，所以当前每桶 128
 槽有充分余量；这只证明当前 Case1，不是任意任务图的通用定容结论。shared
-模式仍需自己的并发发布、时序过滤、reclaim 与容量证明。
+模式使用独立的并发发布、时序过滤、reclaim 与容量协议，见 4.2 节。
 
 独立 ring 自测覆盖半开区间、最新 producer、`alive_floor` 边界、跨
 `task_entry_counts` 多次回绕、满桶不覆写以及固定种子 differential，并通过
@@ -284,6 +283,60 @@ ASan/UBSan。CPU b1、CPU b256 的完整调度断言和 CCEC private 三镜像�
 太小，只能说明没有观察到回退，不能声称 2.507 us 是稳定收益。S1 b256
 同口径单次为 3,862.246 us，只作协议和规模回归记录，不是性能基线，也不
 替代后续配对多轮性能验证。
+
+### 4.2 当前 shared TensorMap：全 task 有序共享桶环
+
+S2 在 `SchedulerState` 的完整生产前缀、standalone 控制区和 `results` 之后
+追加一个 64B 对齐、2,119,808 bytes 的 `SharedTensorMapSidecar`，不移动
+`WorkerState`、`RunConfig` 或既有结果字段。sidecar 包含连续 task commit
+前沿、全局 reclaim 前沿、96 条每核 progress、128 组分离 cache line 的
+head/tail，以及 16,384 个共享槽。每个槽的 64B payload 与 64B 绝对 `seq`
+分离，避免 payload 与发布标志共享 cache line。
+
+本阶段的“winner-only”只指 region entry：所有 worker 仍按 eager 路径构造
+参数和 Materialize，heap 仍是既有 per-worker 逻辑；只有 task winner 收集并
+追加该 task 的 region，零 entry task 也发布一次空 commit。顺序协议固定为：
+
+1. task N 的每个 worker 在 lookup 前等待 `committed_tasks >= N`，确认
+   前 N 个 task 已连续发布；
+2. winner 对整 task 做容量预检，写入全部 region 后把 commit 推进到 N+1；
+3. loser 等待 N+1，winner 直接消费自己的发布结果；随后 96 个 worker 都把
+   本核 progress 从 N-1 精确推进到 N。
+
+因此每个 worker 都跨过相同的 task commit 边界，不会把 future producer
+引入当前 fanin。lookup 只接受
+`producer ∈ [max(0, N-H), N)`。writer 先把旧 `seq` 失效，写 payload 并通过
+后端 `FlushRegion` 完成 DCache 写回，再发布绝对 `seq` 和 bucket tail；
+reader 执行“第一次原子读 `seq` → `InvalidateRegion` payload → 拷贝本地快照
+→ 第二次原子读同一 `seq`”，两次不一致即视为协议错误，不能解释成没有依赖。
+CCEC/AscendC 的两个 region hook 都逐 cache line 使用 `dcci`，并用 `dsb`
+收口；CPU hook 只模拟顺序，不能替代这项设备缓存语义。
+
+回收上界由 `min(core_progress)-H-1` 单调推进。整 task 预检保证普通容量不足
+时不发布当前 task 的任何 entry；预检可以先推进已经满足回收条件的 bucket
+head，这只是删除已过期历史，不属于当前 task 的部分写入。等待慢核期间可协作
+drain，并受既有 fatal/watchdog 约束。host 在 D2H 后独立遍历 sidecar，核对最终 commit、96 核 progress、
+bucket cursor/容量、每个 live 槽的 `seq`、payload、hash、producer 和逻辑
+窗口，不依赖 device 汇总计数替自己证明正确。
+
+private/shared 还会分别生成规范化逻辑 map 签名，并用与存储布局无关的依赖边
+签名核对 PA Case1。当前 CPU 与 CCEC A5 的 b1/b256 均通过；AscendC shared
+也已完成构建和 A5 b1 门禁。b1 的依赖/map 签名为
+`5cb454393ed48dcb`/`3a3d526c9b23c3db`，b256 为
+`b7d985d6edb07078`/`556bec7ec8d0f323`，两种 TensorMap 模式逐项一致。
+CPU 测试证明原子顺序、窗口、容量、回绕和差分逻辑，不证明 A5 的非一致缓存、
+DCache/DCCI 或设备原子行为；后两项只能以上板结果为证。
+
+S2 当前是正确性基线，不是性能可接受的终态。最终同源 CCEC、关闭泳道、单进程
+单次 b256 复测中，private 为 3.816830 ms，shared 为 68.796708 ms。两点不能
+当成稳定统计，但数量级已足以判定当前逐 task 强一致协议不可直接迁移。
+一次仅让 winner 承担 commit 前等待的过程实验在 b1 得到 76.558 us，却在
+b256 停在 `committed_tasks=819` 并触发 watchdog；该实验已完整撤回，不属于
+当前实现或提交。
+
+shared sidecar 的 atomic 当前会计入既有 Submit/业务阶段时间，但尚未逐条接入
+atomic 泳道 wrapper；所以这一版泳道不能声称完整列出了 shared 协议 atomic。
+这是下一阶段的观察能力欠账，不影响本节的终态字段校验与跨模式逻辑签名。
 
 ## 5. 使用说明：运行、测量与泳道查看
 
@@ -302,7 +355,7 @@ ASan/UBSan。CPU b1、CPU b256 的完整调度断言和 CCEC private 三镜像�
 `ccec|ascendc|cpu|all` 用于选择后端；`all` 始终按 CCEC、AscendC、CPU
 的顺序执行。所有 action 都接受一次
 `--tensormap private|shared`，位置可在 backend 后的其余参数中任意放置；
-当前可运行模式为默认的 `private`。
+两种模式均可运行，省略时仍默认 `private`。
 CCEC、AscendC 和 CPU 的 `run/swimlane` 都可使用
 `--winner-workload scalar-nop|real-compute`、
 `--real-compute-count N`、`--real-compute-counts QK,SF,PV,UP` 或
@@ -1516,13 +1569,16 @@ ClockBaseline，并继续以逐核容量、调用数、总记录数和 `dropped=
 ## 7. 内存占用和脱仓复制
 
 为保持真实 DistGlobal/DistCore 偏移、65,536 个 task cell、每 worker payload
-和 TensorMap，非 split 的 CPU/AscendC 构建中 `WorkerResult` 为 832 bytes、
-`SchedulerState` 为 1,007,104,896 bytes。CCEC swimlane 以及使用 split-finish
+和 TensorMap，非 split 的 CPU/AscendC 构建中 `WorkerResult` 为 896 bytes、
+`SchedulerState` 为 1,007,115,968 bytes。CCEC swimlane 以及使用 split-finish
 的 submit-PMU 构建为了发布跨 TU 正确性诊断，`WorkerResult` 为
-896 bytes、`SchedulerState` 为 1,007,111,040 bytes，增量精确为
+960 bytes、`SchedulerState` 为 1,007,122,112 bytes，增量精确为
 `64 * 96 = 6,144` bytes。split ELF 另预留 AIC/AIV 两个 role-specific
 block-local runtime state，每个精确 1,600 bytes、最终 section 合计
-3,200 bytes；它们不属于 GM `SchedulerState`。
+3,200 bytes；它们不属于 GM `SchedulerState`。以上 `SchedulerState` 数字
+是 private 模式；shared 模式在尾部另追加精确 2,119,808 bytes 的 sidecar，
+故 non-split/split 总大小分别为 1,009,235,776/1,009,241,920 bytes；既有
+生产和 standalone 字段 offset 不变。
 独立的 64 bytes PMU 配置和 64 bytes winner workload 配置各占一条
 cache line；二者都位于完整生产 DistGlobal 镜像之后，生产 DistGlobal/
 DistCore 关键偏移保持不变。
@@ -1551,8 +1607,9 @@ cd /tmp/pa_scheduler
 ```
 
 上面两条省略 `--tensormap private`，与显式写出 private 等价。shared
-backend 完成前，复制目录后执行 `./run.sh build cpu --tensormap shared`
-也会按同一门禁明确失败，不会回退到 private。
+模式可在复制目录后显式执行
+`./run.sh build cpu --tensormap shared`；构建身份和产物目录会保持 shared，
+不会回退到 private。
 
 CCEC/AscendC 只需再 source CANN 环境。本目录的构建脚本不会搜索 Git 根目录，
 也不会引用 `simpler/src`、`simpler/examples` 或其他仓内文件。泳道转换与排他

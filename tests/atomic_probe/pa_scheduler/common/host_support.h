@@ -237,6 +237,24 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     std::memset(state, 0, offsetof(SchedulerState, workers));
     std::memset(&state->config, 0, offsetof(SchedulerState, results) - offsetof(SchedulerState, config));
     std::memset(state->results, 0, sizeof(state->results));
+#if PTO_FDWIC_SHARED_MAP
+    // shared_map 位于 results 之后，不属于上面的 control/result 任一范围。
+    // 先把 payload、bucket 游标和保留字节清零，再建立协议要求的 -1
+    // sentinel；这样每轮复用同一 host/device 分配时不会继承上一轮 lap。
+    std::memset(&state->shared_map, 0, sizeof(state->shared_map));
+    state->shared_map.committed_tasks.value = 0;
+    state->shared_map.reclaim_upto.value = -1;
+    for (uint32_t worker = 0; worker < kWorkers; ++worker) {
+        state->shared_map.core_progress[worker].value = -1;
+    }
+    for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
+        state->shared_map.buckets[bucket].head.value = 0;
+        state->shared_map.buckets[bucket].tail.value = 0;
+    }
+    for (uint32_t slot = 0; slot < kMapCapacity; ++slot) {
+        state->shared_map.slots[slot].seq.value = -1;
+    }
+#endif
     state->heap_window = kHeapWindow;
     state->heap_base = kSyntheticHeapBase;
     state->heap_size = kHeapBytes;
@@ -283,7 +301,9 @@ inline void InitializeTraceHeader(TraceHeader *header) {
     header->frequency_hz = kSystemCounterHz;
 }
 
-// 巨大的 WorkerState 不参与每轮 H2D/D2H；以下三个范围只搬运运行所需的前缀、控制量和结果。
+// 巨大的 WorkerState 不参与每轮 H2D/D2H。private 仍只搬前缀、控制量和
+// 结果三个既有范围；shared 额外把 results 后的 map sidecar 作为第四个
+// 独立范围搬运，不能把约 2 MiB 状态混入 ControlBytes/ResultBytes。
 inline constexpr size_t StatePrefixBytes() { return offsetof(SchedulerState, workers); }
 
 inline constexpr size_t ControlBytes() {
@@ -293,6 +313,9 @@ inline constexpr size_t ControlBytes() {
 }
 
 inline constexpr size_t ResultBytes() { return sizeof(WorkerResult) * kWorkers; }
+
+inline constexpr size_t SharedSidecarBytes() { return sizeof(SharedTensorMapSidecar); }
+static_assert(SharedSidecarBytes() == 2119808, "shared TensorMap transfer size changed");
 
 inline constexpr size_t FinalBarrierStateBytes() { return sizeof(FinalBarrierState); }
 
@@ -1084,6 +1107,154 @@ inline bool AnalyzeSwimlaneRecords(
     return true;
 }
 
+inline uint64_t DependencyEdgeSignatureHost(
+    uint32_t consumer, uint32_t producer
+) {
+    uint64_t value =
+        (static_cast<uint64_t>(consumer) << 32U) | producer;
+    value ^= value >> 30U;
+    value *= 0xBF58476D1CE4E5B9ULL;
+    value ^= value >> 27U;
+    value *= 0x94D049BB133111EBULL;
+    value ^= value >> 31U;
+    return value;
+}
+
+inline uint64_t ExpectedPaDependencySignature(uint32_t batches) {
+    uint64_t signature = 0;
+    for (uint32_t batch = 0; batch < batches; ++batch) {
+        const uint32_t alloc = batch * kTasksPerBatch;
+        const uint32_t qk = alloc + 1;
+        const uint32_t sf = alloc + 2;
+        const uint32_t pv = alloc + 3;
+        const uint32_t up = alloc + 4;
+        // SF<-QK、PV<-SF；UP 的 SF max/sum 去重为 SF 一条，再依赖
+        // PV 和本 batch Alloc 建立的 accumulator。BeginPaBatch 后的 Alloc
+        // 会替换 orchestration 中三条累计输出引用，不跨 batch 沿用前一 UP。
+        signature ^= DependencyEdgeSignatureHost(sf, qk);
+        signature ^= DependencyEdgeSignatureHost(pv, sf);
+        signature ^= DependencyEdgeSignatureHost(up, sf);
+        signature ^= DependencyEdgeSignatureHost(up, pv);
+        signature ^= DependencyEdgeSignatureHost(up, alloc);
+    }
+    return signature;
+}
+
+#if PTO_FDWIC_SHARED_MAP
+struct SharedTensorMapValidation {
+    bool protocol_ok = true;
+    uint64_t total_appends = 0;
+    uint64_t physical_entries = 0;
+    uint64_t logical_entries = 0;
+    uint64_t logical_signature = 1469598103934665603ULL;
+};
+
+inline uint32_t SharedTensorMapHashHost(uint64_t address) {
+    address *= 0x9E3779B97F4A7C15ULL;
+    return static_cast<uint32_t>(
+        address >> (64 - kMapBucketShift)
+    ) & kMapBucketMask;
+}
+
+inline void SharedLogicalHashWord(uint64_t *hash, uint64_t value) {
+    // 固定按小端字节折叠，不依赖 host struct padding；private/shared 后续
+    // 都以 bucket、region 和 producer 的同一字段序列生成可比较签名。
+    for (uint32_t byte = 0; byte < 8; ++byte) {
+        *hash ^= (value >> (byte * 8U)) & 0xFFU;
+        *hash *= 1099511628211ULL;
+    }
+}
+
+inline SharedTensorMapValidation ValidateSharedTensorMap(
+    const SharedTensorMapSidecar &map, uint32_t task_count,
+    uint32_t logical_floor
+) {
+    SharedTensorMapValidation validation;
+    validation.protocol_ok &=
+        map.committed_tasks.value == static_cast<int64_t>(task_count);
+    const int64_t final_task = static_cast<int64_t>(task_count) - 1;
+    for (uint32_t worker = 0; worker < kWorkers; ++worker) {
+        validation.protocol_ok &=
+            map.core_progress[worker].value == final_task;
+    }
+    const int64_t maximum_reclaim =
+        final_task - static_cast<int64_t>(kHeapWindow) - 1;
+    validation.protocol_ok &= map.reclaim_upto.value >= -1;
+    validation.protocol_ok &=
+        map.reclaim_upto.value <=
+        (maximum_reclaim < -1 ? -1 : maximum_reclaim);
+
+    std::vector<uint32_t> logical_entries_by_task(task_count, 0);
+    for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
+        const int64_t head = map.buckets[bucket].head.value;
+        const int64_t tail = map.buckets[bucket].tail.value;
+        if (head < 0 || tail < head ||
+            static_cast<uint64_t>(tail - head) >
+                kMapBucketCapacity) {
+            validation.protocol_ok = false;
+            continue;
+        }
+        validation.total_appends += static_cast<uint64_t>(tail);
+        validation.physical_entries +=
+            static_cast<uint64_t>(tail - head);
+        for (int64_t cursor = head; cursor < tail; ++cursor) {
+            const uint32_t slot_index =
+                bucket * kMapBucketCapacity +
+                (static_cast<uint32_t>(cursor) &
+                 kMapBucketSlotMask);
+            const SharedRegionSlot &slot = map.slots[slot_index];
+            const SharedRegionValue &value = slot.payload.value;
+            const bool slot_ok =
+                slot.seq.value == cursor && value.reserved == 0 &&
+                value.lo < value.hi && value.producer >= 0 &&
+                value.producer < static_cast<int32_t>(task_count) &&
+                SharedTensorMapHashHost(value.buffer_addr) == bucket;
+            if (!slot_ok) {
+                validation.protocol_ok = false;
+                continue;
+            }
+            if (value.producer <
+                static_cast<int32_t>(logical_floor)) {
+                continue;
+            }
+            ++validation.logical_entries;
+            ++logical_entries_by_task[
+                static_cast<uint32_t>(value.producer)
+            ];
+            SharedLogicalHashWord(
+                &validation.logical_signature, bucket
+            );
+            SharedLogicalHashWord(
+                &validation.logical_signature, value.buffer_addr
+            );
+            SharedLogicalHashWord(
+                &validation.logical_signature, value.lo
+            );
+            SharedLogicalHashWord(
+                &validation.logical_signature, value.hi
+            );
+            SharedLogicalHashWord(
+                &validation.logical_signature,
+                static_cast<uint32_t>(value.producer)
+            );
+        }
+    }
+
+    for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
+        const uint32_t expected =
+            task_id >= logical_floor &&
+                    static_cast<TaskKind>(
+                        task_id % kTasksPerBatch
+                    ) == TaskKind::Up
+                ? kPaCase1MapEntriesPerBatch
+                : 0;
+        validation.protocol_ok &=
+            logical_entries_by_task[task_id] == expected;
+    }
+    return validation;
+}
+#endif
+
 inline Metrics Validate(
     const SchedulerState &state, uint32_t run, double host_us, const TraceHeader *trace_header = nullptr
 ) {
@@ -1144,6 +1315,7 @@ inline Metrics Validate(
     uint64_t slot_tensor_copies = 0;
     uint64_t slot_scalar_copies = 0;
     uint64_t fanin_edges = 0;
+    uint64_t dependency_signature = 0;
     bool worker_ids[kWorkers] = {};
     uint32_t aic_count = 0;
     uint32_t aiv_count = 0;
@@ -1156,6 +1328,9 @@ inline Metrics Validate(
     bool frontend_worker_counts_ok = true;
     bool final_worker_state_ok = true;
     bool worker_checksums_ok = true;
+#if !PTO_FDWIC_SHARED_MAP
+    uint64_t private_logical_map_signature = 0;
+#endif
     bool fanin_worker_counts_ok = true;
     bool frontier_worker_counts_ok = true;
     bool role_kernel_routing_ok = true;
@@ -1200,6 +1375,13 @@ inline Metrics Validate(
         static_cast<uint64_t>(kPaCase1MapEntriesPerBatch) *
         std::min<uint32_t>(batches, kPaCase1MaxLiveMapBatches);
     const uint64_t expected_map_floor = task_count > kHeapWindow + 1 ? task_count - kHeapWindow - 1 : 0;
+#if PTO_FDWIC_SHARED_MAP
+    const SharedTensorMapValidation shared_map_validation =
+        ValidateSharedTensorMap(
+            state.shared_map, task_count,
+            static_cast<uint32_t>(expected_map_floor)
+        );
+#endif
 
     for (uint32_t index = 0; index < kWorkers; ++index) {
         // 每核只写自己独占且按 cache line 隔离的 WorkerResult；host 在 kernel 完成后统一汇总，不引入额外 atomic。
@@ -1224,8 +1406,10 @@ inline Metrics Validate(
         lifecycle_timestamps_ok &= result.final_barrier_release >= result.final_barrier_begin;
         lifecycle_timestamps_ok &= result.final_barrier_end >= result.final_barrier_release;
         lifecycle_timestamps_ok &= result.finish_cycle >= result.final_barrier_end;
-        for (uint64_t reserved : result.barrier_reserved)
-            lifecycle_timestamps_ok &= reserved == 0;
+        dependency_signature ^= result.barrier_reserved[0];
+        lifecycle_timestamps_ok &=
+            result.barrier_reserved[1] == 0 &&
+            result.barrier_reserved[2] == 0;
         first_submit = std::min(first_submit, result.submit_begin);
         last_submit = std::max(last_submit, result.submit_end);
         first_startup_begin = std::min(first_startup_begin, result.startup_barrier_begin);
@@ -1294,13 +1478,35 @@ inline Metrics Validate(
         frontend_worker_counts_ok &= result.tensor_args_added == static_cast<uint64_t>(batches) * 22;
         frontend_worker_counts_ok &= result.scalar_args_added == static_cast<uint64_t>(batches) * 9;
         frontend_worker_counts_ok &= result.materialized_outputs == static_cast<uint64_t>(batches) * 8;
+#if PTO_FDWIC_SHARED_MAP
+        // eager S2 仍由每核构参/Materialize，但 region 只由每 task winner
+        // 追加；单核 insert 数取决于 winner 分布，只能在全局闭合。
+        frontend_worker_counts_ok &=
+            result.map_inserts <=
+            static_cast<uint64_t>(batches) *
+                kPaCase1MapEntriesPerBatch;
+#else
         frontend_worker_counts_ok &= result.map_inserts == static_cast<uint64_t>(batches) * 4;
+#endif
         final_worker_state_ok &= result.final_heap_next == expected_heap_next;
         final_worker_state_ok &= result.map_high_water == expected_map_live;
         final_worker_state_ok &= result.map_live_entries == expected_map_live;
         final_worker_state_ok &= result.map_alive_floor == expected_map_floor;
         final_worker_state_ok &= result.map_cleaned_upto == expected_map_floor;
-        worker_checksums_ok &= result.checksum == (0xcbf29ce484222325ULL ^ result.worker_id);
+#if PTO_FDWIC_SHARED_MAP
+        // shared 的权威签名由 host 对唯一 sidecar 逐槽生成，worker 不重复
+        // 扫描共享 GM，以免把验证 DCCI 成本加入 kernel 生命周期。
+        worker_checksums_ok &= result.checksum == 0;
+#else
+        if (index == 0) {
+            private_logical_map_signature = result.checksum;
+        } else {
+            worker_checksums_ok &=
+                result.checksum ==
+                private_logical_map_signature;
+        }
+        worker_checksums_ok &= result.checksum != 0;
+#endif
         const uint64_t worker_kernel_completions = result.kernel_counts[0] + result.kernel_counts[1] +
                                                    result.kernel_counts[2] + result.kernel_counts[3];
         if (result.role == static_cast<uint32_t>(CoreRole::Aic)) {
@@ -1352,7 +1558,13 @@ inline Metrics Validate(
 
     // 第一组断言覆盖参与者拓扑、Claim/winner、completion 和最终 drain 等调度主协议。
     Expect(aic_count == kAicWorkers && aiv_count == kAivWorkers, "participant topology is 32 AIC + 64 AIV", &metrics);
-    Expect(worker_shape_ok, "all 96 worker markers and private rings are valid", &metrics);
+    Expect(
+        worker_shape_ok,
+        kCompiledTensorMapMode == TensorMapBuildMode::Private
+            ? "all 96 worker markers and private rings are valid"
+            : "all 96 worker markers and shared-map clients are valid",
+        &metrics
+    );
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
     Expect(
         compete_first_split_runtime_oracle_ok,
@@ -1417,6 +1629,14 @@ inline Metrics Validate(
     Expect(joint_polls == 0, "single-lane PA performs no BlockWon polling", &metrics);
     // 第二组断言锁定 scalar 前端工作量，防止编译器优化或后续改动悄悄删掉 PA 模拟步骤。
     Expect(frontend_worker_counts_ok, "every worker replays the exact PA frontend operation counts", &metrics);
+    const uint64_t expected_global_map_inserts =
+#if PTO_FDWIC_SHARED_MAP
+        static_cast<uint64_t>(batches) *
+        kPaCase1MapEntriesPerBatch;
+#else
+        static_cast<uint64_t>(kWorkers) * batches *
+        kPaCase1MapEntriesPerBatch;
+#endif
     Expect(
         context_reads == static_cast<uint64_t>(kWorkers) * batches &&
             views_created == static_cast<uint64_t>(kWorkers) * batches * 2 &&
@@ -1425,7 +1645,7 @@ inline Metrics Validate(
             tensor_args_added == static_cast<uint64_t>(kWorkers) * batches * 22 &&
             scalar_args_added == static_cast<uint64_t>(kWorkers) * batches * 9 &&
             materialized_outputs == static_cast<uint64_t>(kWorkers) * batches * 8 &&
-            map_inserts == static_cast<uint64_t>(kWorkers) * batches * 4,
+            map_inserts == expected_global_map_inserts,
         "global PA frontend operation totals are exact", &metrics
     );
     Expect(
@@ -1435,8 +1655,71 @@ inline Metrics Validate(
             fanin_edges == static_cast<uint64_t>(batches) * 5,
         "winner-only map, slot-copy, and fanin totals are exact", &metrics
     );
+    const uint64_t expected_dependency_signature =
+        ExpectedPaDependencySignature(batches);
+    Expect(
+        dependency_signature == expected_dependency_signature,
+        "fanin dependency-edge signature matches PA Case1",
+        &metrics
+    );
+    std::printf(
+        "[DEPENDENCY] mode=%s edges=%llu signature=%016llx\n",
+        kCompiledTensorMapMode == TensorMapBuildMode::Private
+            ? "private"
+            : "shared",
+        static_cast<unsigned long long>(fanin_edges),
+        static_cast<unsigned long long>(dependency_signature)
+    );
     Expect(final_worker_state_ok, "every worker final heap and TensorMap state is exact", &metrics);
-    Expect(worker_checksums_ok, "all frontend registration checksums remain clean", &metrics);
+#if PTO_FDWIC_SHARED_MAP
+    Expect(
+        shared_map_validation.protocol_ok &&
+            shared_map_validation.total_appends ==
+                static_cast<uint64_t>(batches) *
+                    kPaCase1MapEntriesPerBatch &&
+            shared_map_validation.logical_entries ==
+                expected_map_live,
+        "shared ordered ring commit/progress/seq/logical window is exact",
+        &metrics
+    );
+    std::printf(
+        "[TENSORMAP] mode=shared committed=%lld reclaim_upto=%lld "
+        "total_appends=%llu physical_entries=%llu logical_entries=%llu "
+        "logical_floor=%llu logical_signature=%016llx\n",
+        static_cast<long long>(
+            state.shared_map.committed_tasks.value
+        ),
+        static_cast<long long>(state.shared_map.reclaim_upto.value),
+        static_cast<unsigned long long>(
+            shared_map_validation.total_appends
+        ),
+        static_cast<unsigned long long>(
+            shared_map_validation.physical_entries
+        ),
+        static_cast<unsigned long long>(
+            shared_map_validation.logical_entries
+        ),
+        static_cast<unsigned long long>(expected_map_floor),
+        static_cast<unsigned long long>(
+            shared_map_validation.logical_signature
+        )
+    );
+#else
+    std::printf(
+        "[TENSORMAP] mode=private logical_entries=%llu "
+        "logical_floor=%llu logical_signature=%016llx\n",
+        static_cast<unsigned long long>(expected_map_live),
+        static_cast<unsigned long long>(expected_map_floor),
+        static_cast<unsigned long long>(
+            private_logical_map_signature
+        )
+    );
+#endif
+    Expect(
+        worker_checksums_ok,
+        "logical TensorMap signature publication is consistent",
+        &metrics
+    );
 
     // 三类 Claim cursor 各有四个 shard；按 task_id 重新推导每个 shard 应停留的最后任务。
     int64_t expected_cube[kCursorShards] = {-1, -1, -1, -1};

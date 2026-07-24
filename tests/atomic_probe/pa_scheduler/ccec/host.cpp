@@ -1723,8 +1723,9 @@ int main(int argc, char **argv) {
         pmu_registers_device = reinterpret_cast<const void *>(pmu_owner.RegisterTableDeviceAddress());
     }
 
-    // host shadow 保留约 1 GiB 总跨度以便按关键 offset 寻址，但每轮传输只选择
-    // 共享前缀、控制区和结果区。
+    // host shadow 保留约 1 GiB 总跨度以便按关键 offset 寻址。private 每轮
+    // 只传共享前缀、控制区和结果区；shared 再单独传 results 后的 map
+    // sidecar，既有三个范围的大小和边界均不改变。
     std::unique_ptr<pa_scheduler::SchedulerState> state(new pa_scheduler::SchedulerState);
     pa_scheduler::TraceHeader trace_header{};
     std::vector<double> spans;
@@ -1794,6 +1795,21 @@ int main(int argc, char **argv) {
             execution_ok = false;
             break;
         }
+#if PTO_FDWIC_SHARED_MAP
+        // shared map 位于 results 之后，不能扩大 ControlBytes 或把它重复混入
+        // 每核结果范围；初始化搬运仍发生在 launch 计时开始之前。
+        if (!CheckAcl(
+                aclrtMemcpy(
+                    &static_cast<pa_scheduler::SchedulerState *>(state_device)->shared_map,
+                    pa_scheduler::host::SharedSidecarBytes(), &state->shared_map,
+                    pa_scheduler::host::SharedSidecarBytes(), ACL_MEMCPY_HOST_TO_DEVICE
+                ),
+                "aclrtMemcpy(H2D shared TensorMap sidecar)"
+            )) {
+            execution_ok = false;
+            break;
+        }
+#endif
         void *kernel_args[] = {state_device};
         rtArgsEx_t args_info{};
         args_info.args = kernel_args;
@@ -1814,7 +1830,9 @@ int main(int argc, char **argv) {
         }
         const auto wall_end = std::chrono::steady_clock::now();
         const double host_us = std::chrono::duration<double, std::micro>(wall_end - wall_begin).count();
-        // D2H 同样避开约 1 GiB 的 worker arena：共享前缀用于 flag/vend/frontier 校验，末尾 results 单独回传。
+        // D2H 同样避开约 1 GiB 的 worker arena：共享前缀用于
+        // flag/vend/frontier 校验，末尾 results 单独回传；shared sidecar
+        // 在 results 成功回读后再作为独立范围搬回。
         if (!CheckAcl(
                 aclrtMemcpy(
                     state.get(), pa_scheduler::host::StatePrefixBytes(), state_device,
@@ -1841,6 +1859,19 @@ int main(int argc, char **argv) {
             execution_ok = false;
             break;
         }
+#if PTO_FDWIC_SHARED_MAP
+        if (!CheckAcl(
+                aclrtMemcpy(
+                    &state->shared_map, pa_scheduler::host::SharedSidecarBytes(),
+                    &static_cast<pa_scheduler::SchedulerState *>(state_device)->shared_map,
+                    pa_scheduler::host::SharedSidecarBytes(), ACL_MEMCPY_DEVICE_TO_HOST
+                ),
+                "aclrtMemcpy(D2H shared TensorMap sidecar)"
+            )) {
+            execution_ok = false;
+            break;
+        }
+#endif
         if (real_compute &&
             !CheckAcl(
                 aclrtMemcpy(

@@ -26,12 +26,8 @@
 #error "PTO_FDWIC_SHARED_MAP must be 0 (private) or 1 (shared)"
 #endif
 
-// 阶段 S0 只建立可验证的构建身份与产物隔离。shared 数据结构和协议尚未接入
-// 公共调度器时必须明确拒绝，禁止生成名字叫 shared、实际仍执行 private map
-// 的误导性产物。接入真正 shared backend 的提交会删除这条门禁。
-#if PTO_FDWIC_SHARED_MAP
-#error "standalone shared TensorMap backend is not implemented yet; refusing to run the private backend"
-#endif
+// S0 的 fail-closed 门禁在 S2 接入真实 shared sidecar 后解除。模式仍由
+// 三镜像统一的构建身份与 manifest 锁定，不能把 shared 目录指向 private 实现。
 
 // CCEC 的正式产物只允许二选一：swimlane 保存普通阶段与 atomic 记录，
 // submit-pmu 则编译掉泳道观察代码。CPU/AscendC 未传这些宏时继续使用原有
@@ -702,6 +698,66 @@ static_assert(offsetof(TensorMap, high_water) == 823300, "TensorMap high-water o
 static_assert(offsetof(TensorMap, alive_floor) == 823304, "TensorMap alive-floor offset mismatch");
 static_assert(offsetof(TensorMap, cleaned_upto) == 823308, "TensorMap cleaned offset mismatch");
 
+// shared 模式只共享 region→producer 索引，不复用 private MapEntry 尾部的
+// ABI 保留字节。payload 与 seq 各占一条 cache line：普通字段写回完成后，
+// 再用独立的绝对 seq 发布该 lap，reader 以 seq 双检防止槽复用 ABA。
+struct SharedRegionValue {
+    uint64_t buffer_addr;
+    uint64_t lo;
+    uint64_t hi;
+    int32_t producer;
+    uint32_t reserved;
+};
+static_assert(sizeof(SharedRegionValue) == 32, "shared TensorMap logical value size changed");
+static_assert(offsetof(SharedRegionValue, producer) == 24, "shared producer offset mismatch");
+
+struct alignas(64) SharedRegionPayload {
+    SharedRegionValue value;
+    uint8_t cacheline_padding[32];
+};
+static_assert(sizeof(SharedRegionPayload) == 64, "shared TensorMap payload must occupy one cache line");
+static_assert(alignof(SharedRegionPayload) == 64, "shared TensorMap payload alignment changed");
+
+struct alignas(64) SharedRegionSlot {
+    SharedRegionPayload payload;
+    AtomicLine seq;
+};
+static_assert(sizeof(SharedRegionSlot) == 128, "shared TensorMap slot must occupy two cache lines");
+static_assert(offsetof(SharedRegionSlot, seq) == 64, "shared TensorMap seq must own the second cache line");
+
+struct alignas(64) SharedBucketState {
+    AtomicLine head;
+    AtomicLine tail;
+};
+static_assert(sizeof(SharedBucketState) == 128, "shared TensorMap bucket controls changed");
+static_assert(offsetof(SharedBucketState, tail) == 64, "shared head/tail must not share a cache line");
+
+struct alignas(64) SharedTensorMapSidecar {
+    // committed_tasks 是已按 task_id 连续发布的数量：初始 0，任务 N（即使
+    // 没有 region entry）发布完成后变为 N+1。
+    AtomicLine committed_tasks;
+    // reclaim_upto 是可回收 producer 的 inclusive 上界，初始 -1。
+    AtomicLine reclaim_upto;
+    // 每核发布自己已完成全部 map 观察的最后一个 task，初始 -1。
+    AtomicLine core_progress[kWorkers];
+    SharedBucketState buckets[kMapBuckets];
+    SharedRegionSlot slots[kMapCapacity];
+};
+static_assert(sizeof(SharedTensorMapSidecar) == 2119808, "shared TensorMap sidecar size changed");
+static_assert(alignof(SharedTensorMapSidecar) == 64, "shared TensorMap sidecar alignment changed");
+static_assert(
+    offsetof(SharedTensorMapSidecar, core_progress) == 128,
+    "shared TensorMap progress offset mismatch"
+);
+static_assert(
+    offsetof(SharedTensorMapSidecar, buckets) == 6272,
+    "shared TensorMap bucket offset mismatch"
+);
+static_assert(
+    offsetof(SharedTensorMapSidecar, slots) == 22656,
+    "shared TensorMap slot offset mismatch"
+);
+
 struct TaskPayload {
     TensorDesc tensors[kMaxTaskTensors];
 };
@@ -878,7 +934,7 @@ struct alignas(64) WorkerResult {
 
     // I-cache 单 miss 探针用该槽保存 cold 窗口的 1 GHz SYS_CNT；submit-pmu
     // 复用同一 64-bit 槽保存所选局部阶段的逐调用累计时间。两种构建互斥，
-    // 因而无需扩大 832B WorkerResult，也不会改变相邻 worker 的 cache-line 布局。
+    // 因而无需扩大当前 896B WorkerResult，也不会改变相邻 worker 的 cache-line 布局。
     union {
         uint64_t pmu_window_ticks;
         uint64_t pmu_phase_elapsed_ticks;
@@ -896,7 +952,7 @@ struct alignas(64) WorkerResult {
 
     // PIPE_UTILIZATION 已同时配置 CNT0/1/3/4/5/8；与上面的 scalar/I-cache
     // 一样只保存每核原始累计值，AIC/AIV 汇总与比率统一在 host sidecar 中计算。
-    // 六个 32-bit 值复用本结构扩展到 832B 后的尾部空间，不再增加 cache line。
+    // 六个 32-bit 值复用本结构既有 PMU 诊断区，不再增加 cache line。
     uint32_t pmu_vector_busy;
     uint32_t pmu_cube_busy;
     uint32_t pmu_mte1_busy;
@@ -906,7 +962,7 @@ struct alignas(64) WorkerResult {
     uint32_t pmu_mte3_busy;
     uint32_t pmu_fix_busy;
 
-    // 复用 WorkerResult 原有的 32B cache-line 尾洞，不扩大 832B stride。
+    // 复用 WorkerResult 原有的 32B cache-line 尾洞，不扩大 896B stride。
     // CNT6/7 是从不中途读取的权威整窗，CNT8/CNT5 是 read-to-clear shadow；
     // none 在 stop 后要求逐核精确相等；运行中切片的 phase 只允许 shadow
     // 单向小于 primary，并显式导出差值形成局部观测区间。
@@ -927,6 +983,8 @@ struct alignas(64) WorkerResult {
     uint64_t final_barrier_begin;
     uint64_t final_barrier_release;
     uint64_t final_barrier_end;
+    // 不扩大结果 ABI：首槽复用为本 worker 赢得任务的 fanin-edge XOR
+    // 签名，后两槽继续保留并必须为零。
     uint64_t barrier_reserved[3];
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
     // split 协议诊断独占一条 cache line。普通 CPU/AscendC 与局部 PMU
@@ -1012,6 +1070,11 @@ struct alignas(64) SchedulerState {
     // 不移动任何被测生产字段；startup 继续使用生产 started_count。
     FinalBarrierState final_barrier;
     WorkerResult results[kWorkers];
+#if PTO_FDWIC_SHARED_MAP
+    // shared 后端状态只追加在完整 production prefix、standalone controls
+    // 和 results 之后，不移动 RunConfig、WorkerState 或任何被测生产字段。
+    SharedTensorMapSidecar shared_map;
+#endif
 };
 static_assert(offsetof(SchedulerState, cube_cursor) == 0, "cube cursor offset must match PA DistGlobal");
 static_assert(offsetof(SchedulerState, vector_cursor) == 256, "vector cursor offset must match PA DistGlobal");
@@ -1048,6 +1111,13 @@ static_assert(
     "context lengths must follow standalone controls"
 );
 static_assert(offsetof(SchedulerState, final_barrier) % 64 == 0, "final barrier must be cache-line aligned");
+#if PTO_FDWIC_SHARED_MAP
+static_assert(
+    offsetof(SchedulerState, shared_map) ==
+        offsetof(SchedulerState, results) + sizeof(WorkerResult) * kWorkers,
+    "shared TensorMap sidecar must follow the complete result array"
+);
+#endif
 static_assert(sizeof(SchedulerState) <= UINT32_MAX, "SchedulerState size must fit build identity");
 
 }  // namespace pa_scheduler
