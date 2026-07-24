@@ -247,6 +247,10 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     state->config.nops = options.nops;
     state->config.profile_phases = options.profile_phases ? 1U : 0U;
     state->config.final_barrier_shape = static_cast<uint32_t>(options.final_barrier_shape);
+    state->config.build_identity_magic = kBuildIdentityMagic;
+    state->config.build_identity_abi_version = kBuildIdentityAbiVersion;
+    state->config.tensor_map_mode = static_cast<uint32_t>(kCompiledTensorMapMode);
+    state->config.scheduler_state_size = static_cast<uint32_t>(sizeof(SchedulerState));
     for (uint32_t batch = 0; batch < options.batches; ++batch) {
         state->context_lens[batch] = 8192;
     }
@@ -283,7 +287,8 @@ inline void InitializeTraceHeader(TraceHeader *header) {
 inline constexpr size_t StatePrefixBytes() { return offsetof(SchedulerState, workers); }
 
 inline constexpr size_t ControlBytes() {
-    // control sidecar 位于为生产 DistGlobal 保留的总跨度之后，到 results 之前为止。
+    // control sidecar 位于为生产 DistGlobal 保留的总跨度之后，依次覆盖
+    // RunConfig、独立 PMU 配置、winner workload、context 和 final barrier。
     return offsetof(SchedulerState, results) - offsetof(SchedulerState, config);
 }
 
@@ -1675,9 +1680,12 @@ inline void PrintBanner(const char *backend, const Options &options) {
     // 开始运行前完整打印工作量和大内存占用，便于确认比较口径没有混用。
     std::printf("=== Standalone PA Scheduler Benchmark: %s ===\n", backend);
     std::printf(
-        "device=%u batches=%u tasks=%u workers=%u runs=%u nops=%u,%u,%u,%u state_bytes=%zu "
+        "device=%u batches=%u tasks=%u workers=%u runs=%u tensormap=%s "
+        "nops=%u,%u,%u,%u state_bytes=%zu "
         "final_barrier=%s swimlane=%s trace_atomics=%s trace_bytes=%zu\n", options.device,
-        options.batches, options.batches * kTasksPerBatch, kWorkers, options.runs, options.nops.qk, options.nops.sf,
+        options.batches, options.batches * kTasksPerBatch, kWorkers, options.runs,
+        kCompiledTensorMapMode == TensorMapBuildMode::Private ? "private" : "shared",
+        options.nops.qk, options.nops.sf,
         options.nops.pv, options.nops.up, sizeof(SchedulerState),
         FinalBarrierShapeName(options.final_barrier_shape), options.trace_enabled ? "on" : "off",
         options.trace_atomics ? "on" : "off",

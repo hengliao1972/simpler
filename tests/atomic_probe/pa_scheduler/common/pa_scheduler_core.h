@@ -1179,6 +1179,23 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     if (worker_id >= kWorkers) {
         return;
     }
+    // RunConfig、PMU 配置与 winner workload 连续占据三条独立 cache line。
+    // 在解释任何可能随 TensorMap 模式变化的 WorkerState 之前，先失效 host
+    // 写入的控制区并核对稳定构建身份；混合 host/kernel 会置 fatal 后退出，
+    // 不允许继续用错误 sizeof 或模式解释 GM。
+    Ops::InvalidateRegion(
+        &state->config,
+        sizeof(state->config) + sizeof(state->pmu_probe) + sizeof(state->winner_workload)
+    );
+    const bool build_identity_matches =
+        state->config.build_identity_magic == kBuildIdentityMagic &&
+        state->config.build_identity_abi_version == kBuildIdentityAbiVersion &&
+        state->config.tensor_map_mode == static_cast<uint32_t>(kCompiledTensorMapMode) &&
+        state->config.scheduler_state_size == static_cast<uint32_t>(sizeof(SchedulerState));
+    if (!build_identity_matches) {
+        (void)Ops::Exchange(&state->fatal.value, static_cast<int32_t>(1));
+        return;
+    }
     PA_GM WorkerState &worker = state->workers[worker_id];
     worker.role = role;
     worker.core_idx = static_cast<int32_t>(worker_id);
@@ -1227,11 +1244,6 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     stats.result.worker_id = worker_id;
     stats.result.role = static_cast<uint32_t>(role);
     stats.result.checksum = 0xcbf29ce484222325ULL ^ worker_id;
-    // 该 invalidate 原先藏在 AttachTrace 中；它同时保护 PMU mode/register
-    // table 与 winner workload，必须在两个构建中都执行。
-    Ops::InvalidateRegion(
-        &state->config, sizeof(state->config) + sizeof(state->winner_workload)
-    );
     stats.trace = AttachTrace<Ops>(state, worker, worker_id);
 
     // startup 严格保持生产 flat 语义；本实验只改变 replay 尾部的 final 汇合。

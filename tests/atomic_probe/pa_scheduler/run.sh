@@ -17,12 +17,15 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 usage() {
     cat <<'EOF'
 Usage:
-  ./run.sh build  ccec|ascendc|cpu|all
-  ./run.sh run    ccec|ascendc|cpu|all [benchmark options]
-  ./run.sh smoke  ccec|ascendc|cpu|all [--device N]
-  ./run.sh swimlane ccec|ascendc|cpu|all [benchmark options]
-  ./run.sh build-submit-pmu ccec none|claim|efdrain|materialize|register
-  ./run.sh submit-pmu ccec none|claim|efdrain|materialize|register [benchmark options]
+  ./run.sh build  ccec|ascendc|cpu|all [--tensormap private|shared]
+  ./run.sh run    ccec|ascendc|cpu|all [--tensormap private|shared] [benchmark options]
+  ./run.sh smoke  ccec|ascendc|cpu|all [--tensormap private|shared] [--device N]
+  ./run.sh swimlane ccec|ascendc|cpu|all [--tensormap private|shared] [benchmark options]
+  ./run.sh build-submit-pmu ccec none|claim|efdrain|materialize|register [--tensormap private|shared]
+  ./run.sh submit-pmu ccec none|claim|efdrain|materialize|register [--tensormap private|shared] [benchmark options]
+
+Build identity option (consumed by run.sh and never forwarded to the benchmark):
+  --tensormap private|shared   (default: private)
 
 Benchmark options:
   --device N
@@ -85,7 +88,7 @@ require_file() {
     # 缺失时明确提示对应 build action，而不是临时猜测编译命令。
     if [[ ! -f "$1" ]]; then
         echo "Missing build artifact: $1" >&2
-        echo "Run: $0 build $2" >&2
+        echo "Run: $0 build $2 --tensormap $3" >&2
         exit 1
     fi
 }
@@ -93,12 +96,14 @@ require_file() {
 build_backend() {
     # 后端自己的 build.sh 是唯一构建入口；all 的先后顺序由下方 BACKENDS
     # 固定为 CCEC、AscendC、CPU，便于按用户要求分阶段复现。
-    case "$1" in
+    local backend="$1"
+    local tensormap_mode="$2"
+    case "$backend" in
         ccec|ascendc|cpu)
-            if [[ "$1" == "ccec" ]]; then
-                "$SCRIPT_DIR/ccec/build.sh" swimlane
+            if [[ "$backend" == "ccec" ]]; then
+                "$SCRIPT_DIR/ccec/build.sh" "$tensormap_mode" swimlane
             else
-                "$SCRIPT_DIR/$1/build.sh"
+                "$SCRIPT_DIR/$backend/build.sh" "$tensormap_mode"
             fi
             ;;
         *)
@@ -110,25 +115,26 @@ build_backend() {
 
 run_backend() {
     local backend="$1"
-    shift
+    local tensormap_mode="$2"
+    shift 2
     # 所有 benchmark 参数原样透传给同一套 host option parser。CCEC 额外
     # 传入本目录内的 mixed ELF，其余两个后端直接启动本地可执行文件。
     case "$backend" in
         ccec)
-            local host="$SCRIPT_DIR/build/ccec/pa_scheduler_host"
-            local kernel="$SCRIPT_DIR/build/ccec/pa_scheduler_kernel.o"
-            require_file "$host" ccec
-            require_file "$kernel" ccec
+            local build_dir="$SCRIPT_DIR/build/ccec/$tensormap_mode/swimlane"
+            local host="$build_dir/pa_scheduler_host"
+            local kernel="$build_dir/pa_scheduler_kernel.o"
+            validate_ccec_artifacts "$tensormap_mode" swimlane none "$build_dir"
             "$host" --kernel "$kernel" "$@"
             ;;
         ascendc)
-            local executable="$SCRIPT_DIR/build/ascendc/pa_scheduler_ascendc"
-            require_file "$executable" ascendc
+            local executable="$SCRIPT_DIR/build/ascendc/$tensormap_mode/swimlane/pa_scheduler_ascendc"
+            require_file "$executable" ascendc "$tensormap_mode"
             "$executable" "$@"
             ;;
         cpu)
-            local executable="$SCRIPT_DIR/build/cpu/pa_scheduler_cpu"
-            require_file "$executable" cpu
+            local executable="$SCRIPT_DIR/build/cpu/$tensormap_mode/swimlane/pa_scheduler_cpu"
+            require_file "$executable" cpu "$tensormap_mode"
             "$executable" "$@"
             ;;
         *)
@@ -148,17 +154,31 @@ validate_submit_pmu_phase() {
     esac
 }
 
-submit_pmu_artifact_failure() {
-    local phase="$1"
-    local reason="$2"
-    echo "Invalid submit-pmu artifact set for phase '$phase': $reason" >&2
-    echo "Run: $0 build-submit-pmu ccec $phase" >&2
+ccec_artifact_failure() {
+    local tensormap_mode="$1"
+    local variant="$2"
+    local phase="$3"
+    local reason="$4"
+    echo "Invalid CCEC artifact set for mode '$tensormap_mode', variant '$variant', phase '$phase': $reason" >&2
+    if [[ "$variant" == "submit-pmu" ]]; then
+        echo "Run: $0 build-submit-pmu ccec $phase --tensormap $tensormap_mode" >&2
+    else
+        echo "Run: $0 build ccec --tensormap $tensormap_mode" >&2
+    fi
     return 1
 }
 
-validate_submit_pmu_artifacts() {
-    local phase="$1"
-    local build_dir="$2"
+validate_ccec_artifacts() {
+    local tensormap_mode="$1"
+    local variant="$2"
+    local phase="$3"
+    local build_dir="$4"
+    local tensormap_mode_id
+    case "$tensormap_mode" in
+        private) tensormap_mode_id=0 ;;
+        shared) tensormap_mode_id=1 ;;
+        *) ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" "unsupported TensorMap mode"; return 1 ;;
+    esac
     local phase_id
     case "$phase" in
         none) phase_id=0 ;;
@@ -166,47 +186,63 @@ validate_submit_pmu_artifacts() {
         efdrain) phase_id=2 ;;
         materialize) phase_id=4 ;;
         register) phase_id=5 ;;
-        *) submit_pmu_artifact_failure "$phase" "unsupported phase"; return 1 ;;
+        *) ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" "unsupported phase"; return 1 ;;
     esac
 
-    local manifest_name="submit_pmu_artifacts.manifest"
+    local manifest_name="pa_scheduler_artifacts.manifest"
     local manifest="$build_dir/$manifest_name"
-    local artifacts=(
-        pa_scheduler_host
-        pa_scheduler_kernel.o
-        libpa_scheduler_pmu_owner_aicpu.so
-        libpa_scheduler_pmu_owner_dispatcher.so
-    )
+    local artifacts=(pa_scheduler_host pa_scheduler_kernel.o)
+    case "$variant" in
+        swimlane)
+            if [[ "$phase" != "none" ]]; then
+                ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" "swimlane phase must be none"
+                return 1
+            fi
+            ;;
+        submit-pmu)
+            artifacts+=(libpa_scheduler_pmu_owner_aicpu.so libpa_scheduler_pmu_owner_dispatcher.so)
+            ;;
+        *)
+            ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" "unsupported build variant"
+            return 1
+            ;;
+    esac
     if [[ ! -x "$build_dir/${artifacts[0]}" ]]; then
-        submit_pmu_artifact_failure "$phase" "host runner is missing, empty, or not executable"
+        ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" \
+            "host runner is missing, empty, or not executable"
         return 1
     fi
     local artifact
     for artifact in "${artifacts[@]:1}"; do
         if [[ ! -s "$build_dir/$artifact" ]]; then
-            submit_pmu_artifact_failure "$phase" "artifact is missing or empty: $artifact"
+            ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" \
+                "artifact is missing or empty: $artifact"
             return 1
         fi
     done
     if [[ ! -s "$manifest" ]]; then
-        submit_pmu_artifact_failure "$phase" "ready manifest is missing or empty"
+        ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" \
+            "ready manifest is missing or empty"
         return 1
     fi
     if ! command -v sha256sum >/dev/null 2>&1; then
-        submit_pmu_artifact_failure "$phase" "sha256sum is unavailable"
+        ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" "sha256sum is unavailable"
         return 1
     fi
 
-    # manifest 固定为四行身份头和四行校验和；既检查 phase/variant，也拒绝
-    # 漏项、增项、绝对路径或重复文件，避免 sha256sum 只校验到一个子集。
+    # 六行身份头固定 mode/variant/phase，后续校验和行按变体精确枚举。
+    # 既拒绝跨模式复用，也拒绝漏项、增项、绝对路径和重复文件。
     local manifest_lines=()
     mapfile -t manifest_lines < "$manifest"
-    if [[ ${#manifest_lines[@]} -ne 8 ||
-          "${manifest_lines[0]}" != "# schema=pa_scheduler_submit_pmu_artifacts/v1" ||
-          "${manifest_lines[1]}" != "# variant=submit-pmu" ||
-          "${manifest_lines[2]}" != "# phase=$phase" ||
-          "${manifest_lines[3]}" != "# phase_id=$phase_id" ]]; then
-        submit_pmu_artifact_failure "$phase" "manifest schema, variant, or phase metadata does not match"
+    if [[ ${#manifest_lines[@]} -ne $((6 + ${#artifacts[@]})) ||
+          "${manifest_lines[0]}" != "# schema=pa_scheduler_artifacts/v1" ||
+          "${manifest_lines[1]}" != "# tensormap_mode=$tensormap_mode" ||
+          "${manifest_lines[2]}" != "# tensormap_mode_id=$tensormap_mode_id" ||
+          "${manifest_lines[3]}" != "# variant=$variant" ||
+          "${manifest_lines[4]}" != "# phase=$phase" ||
+          "${manifest_lines[5]}" != "# phase_id=$phase_id" ]]; then
+        ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" \
+            "manifest schema, mode, variant, or phase metadata does not match"
         return 1
     fi
     local index digest filename extra
@@ -214,18 +250,20 @@ validate_submit_pmu_artifacts() {
         digest=""
         filename=""
         extra=""
-        read -r digest filename extra <<< "${manifest_lines[index + 4]}"
+        read -r digest filename extra <<< "${manifest_lines[index + 6]}"
         if [[ ! "$digest" =~ ^[[:xdigit:]]{64}$ ||
               "$filename" != "${artifacts[index]}" || -n "$extra" ]]; then
-            submit_pmu_artifact_failure "$phase" "manifest checksum entry $((index + 1)) is malformed or out of order"
+            ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" \
+                "manifest checksum entry $((index + 1)) is malformed or out of order"
             return 1
         fi
     done
     if ! (cd "$build_dir" && sha256sum --check --strict --status "$manifest_name"); then
-        submit_pmu_artifact_failure "$phase" "one or more artifact SHA256 values do not match"
+        ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" \
+            "one or more artifact SHA256 values do not match"
         return 1
     fi
-    echo "[CHECK] submit-pmu artifact manifest verified: $manifest"
+    echo "[CHECK] CCEC artifact manifest verified: $manifest"
 }
 
 reject_managed_submit_pmu_options() {
@@ -245,9 +283,10 @@ reject_managed_submit_pmu_options() {
 }
 
 run_submit_pmu() {
-    local phase="$1"
-    shift
-    local build_dir="$SCRIPT_DIR/build/ccec/submit-pmu/$phase"
+    local tensormap_mode="$1"
+    local phase="$2"
+    shift 2
+    local build_dir="$SCRIPT_DIR/build/ccec/$tensormap_mode/submit-pmu/$phase"
     local host="$build_dir/pa_scheduler_host"
     local kernel="$build_dir/pa_scheduler_kernel.o"
     local pmu_json=""
@@ -266,7 +305,7 @@ run_submit_pmu() {
             --pmu-json=*) pmu_json="${argument#--pmu-json=}" ;;
         esac
     done
-    validate_submit_pmu_artifacts "$phase" "$build_dir"
+    validate_ccec_artifacts "$tensormap_mode" submit-pmu "$phase" "$build_dir"
     "$host" --kernel "$kernel" --runs 1 --no-swimlane --pmu-window submit-all "$@"
     if [[ -n "$pmu_json" ]]; then
         local python_bin="${PYTHON:-python3}"
@@ -316,6 +355,46 @@ reject_ccec_pmu_options_for_non_ccec() {
     done
 }
 
+consume_tensormap_option() {
+    TENSORMAP_MODE="private"
+    TENSORMAP_OPTION_SEEN=0
+    TENSORMAP_REMAINING_ARGS=()
+    while [[ $# -gt 0 ]]; do
+        local value=""
+        case "$1" in
+            --tensormap)
+                if [[ $# -lt 2 ]]; then
+                    echo "--tensormap requires private or shared." >&2
+                    exit 1
+                fi
+                value="$2"
+                shift 2
+                ;;
+            --tensormap=*)
+                value="${1#--tensormap=}"
+                shift
+                ;;
+            *)
+                TENSORMAP_REMAINING_ARGS+=("$1")
+                shift
+                continue
+                ;;
+        esac
+        if [[ "$TENSORMAP_OPTION_SEEN" -ne 0 ]]; then
+            echo "Specify --tensormap only once." >&2
+            exit 1
+        fi
+        case "$value" in
+            private|shared) TENSORMAP_MODE="$value" ;;
+            *)
+                echo "Unknown TensorMap mode: $value (expected private|shared)" >&2
+                exit 1
+                ;;
+        esac
+        TENSORMAP_OPTION_SEEN=1
+    done
+}
+
 # 顶层先解释 action/backend；run 的其余参数交给共享 parser，build、smoke 和
 # swimlane 再分别处理自己的约束或默认注入项。参数不足会在创建目录前失败。
 if [[ $# -lt 2 ]]; then
@@ -326,6 +405,8 @@ fi
 ACTION="$1"
 BACKEND="$2"
 shift 2
+consume_tensormap_option "$@"
+set -- "${TENSORMAP_REMAINING_ARGS[@]}"
 
 if [[ "$BACKEND" == "all" ]]; then
     # 该顺序也是组合构建、运行和泳道采集的稳定对外约定。
@@ -346,13 +427,13 @@ case "$ACTION" in
             exit 1
         fi
         for backend in "${BACKENDS[@]}"; do
-            build_backend "$backend"
+            build_backend "$backend" "$TENSORMAP_MODE"
         done
         ;;
     run)
         # run 不替用户补默认覆盖项，完整参数校验交给各后端共享的 Options parser。
         for backend in "${BACKENDS[@]}"; do
-            run_backend "$backend" "$@"
+            run_backend "$backend" "$TENSORMAP_MODE" "$@"
         done
         ;;
     smoke)
@@ -371,7 +452,7 @@ case "$ACTION" in
             esac
         done
         for backend in "${BACKENDS[@]}"; do
-            run_backend "$backend" --batches 1 --runs 1 \
+            run_backend "$backend" "$TENSORMAP_MODE" --batches 1 --runs 1 \
                 --winner-workload scalar-nop --nop-count 0 "$@"
         done
         ;;
@@ -397,7 +478,7 @@ case "$ACTION" in
         fi
         # UTC 秒级时间加当前 shell PID 避免并行采集目录冲突；所有产物保持
         # 在本目录 outputs/ 下，复制 pa_scheduler 后仍可原样工作。
-        OUTPUT_ROOT="$SCRIPT_DIR/outputs/pa_scheduler_swimlane_$(date -u +%Y%m%d_%H%M%S)_$$"
+        OUTPUT_ROOT="$SCRIPT_DIR/outputs/pa_scheduler_${TENSORMAP_MODE}_swimlane_$(date -u +%Y%m%d_%H%M%S)_$$"
         mkdir -p "$OUTPUT_ROOT"
         # all 模式下每个 backend 使用独立子目录，避免同名 raw/merged 互相覆盖；
         # 某一后端失败后 set -e 停止，之前已完成后端的产物仍可单独检查。
@@ -411,7 +492,8 @@ case "$ACTION" in
             # converter 和 analyzer。set -e 保证任一步失败即停止。
             # 用户要求泳道默认带齐逐 atomic 性能。重复传入 --trace-atomics
             # 只是幂等布尔开关，不会产生两份记录；直接 run 仍可选择 phase-only。
-            run_backend "$backend" --runs 1 --trace-atomics --swimlane-json "$RAW_JSON" "$@"
+            run_backend "$backend" "$TENSORMAP_MODE" \
+                --runs 1 --trace-atomics --swimlane-json "$RAW_JSON" "$@"
             "$PYTHON_BIN" "$SCRIPT_DIR/swimlane_converter.py" "$RAW_JSON" -o "$MERGED_JSON"
             "$PYTHON_BIN" "$SCRIPT_DIR/swimlane_exclusive_analyzer.py" \
                 "$RAW_JSON" -o "$EXCLUSIVE_JSON"
@@ -425,7 +507,7 @@ case "$ACTION" in
         fi
         PHASE="$1"
         validate_submit_pmu_phase "$PHASE"
-        "$SCRIPT_DIR/ccec/build.sh" submit-pmu "$PHASE"
+        "$SCRIPT_DIR/ccec/build.sh" "$TENSORMAP_MODE" submit-pmu "$PHASE"
         ;;
     submit-pmu)
         if [[ "$BACKEND" != "ccec" || $# -lt 1 ]]; then
@@ -436,7 +518,7 @@ case "$ACTION" in
         shift
         validate_submit_pmu_phase "$PHASE"
         reject_managed_submit_pmu_options "$@"
-        run_submit_pmu "$PHASE" "$@"
+        run_submit_pmu "$TENSORMAP_MODE" "$PHASE" "$@"
         ;;
     *)
         # 未知 action 不尝试推断用户意图，也不会触发任何构建或设备操作。

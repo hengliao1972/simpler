@@ -12,7 +12,20 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BUILD_DIR="$ROOT_DIR/build/cpu"
+if [[ $# -gt 1 ]]; then
+    echo "Usage: $0 [private|shared]" >&2
+    exit 1
+fi
+TENSORMAP_MODE="${1:-private}"
+case "$TENSORMAP_MODE" in
+    private) TENSORMAP_MODE_ID=0 ;;
+    shared) TENSORMAP_MODE_ID=1 ;;
+    *)
+        echo "Unknown TensorMap mode: $TENSORMAP_MODE (expected private|shared)" >&2
+        exit 1
+        ;;
+esac
+BUILD_DIR="$ROOT_DIR/build/cpu/$TENSORMAP_MODE/swimlane"
 CXX_BIN="${CXX:-g++}"
 
 # CPU 后端只依赖 C++17、pthread 和本目录 common/，不需要 CANN。
@@ -26,6 +39,7 @@ echo "[BUILD] CPU scheduler executable"
 # -pthread 同时提供编译期线程宏和链接期 pthread 支持；严格告警用于防止
 # CPU 等价层因类型或原子接口变化而静默偏离设备端公共协议。
 "$CXX_BIN" -O3 -std=c++17 -pthread -Wall -Wextra -Werror \
+    "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID" \
     -I"$ROOT_DIR/common" \
     "$SCRIPT_DIR/main.cpp" \
     -o "$BUILD_DIR/pa_scheduler_cpu"
@@ -34,6 +48,7 @@ echo "[BUILD] CPU scheduler executable"
 # 直接实例化并执行边界自测；任一断言失败都会借助 set -e 阻止构建成功。
 echo "[BUILD] atomic PollBatch boundary self-test"
 "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+    "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID" \
     -DPA_BUILD_SWIMLANE=1 \
     -I"$ROOT_DIR/common" \
     "$ROOT_DIR/common/test_atomic_poll_batch.cpp" \

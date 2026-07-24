@@ -14,28 +14,49 @@ set -euo pipefail
 # 所有输入和产物都从脚本自身位置解析，调用者无需位于仓库根目录。
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-SUBMIT_PMU_MANIFEST_NAME="submit_pmu_artifacts.manifest"
+ARTIFACT_MANIFEST_NAME="pa_scheduler_artifacts.manifest"
 
-# CCEC 不再生成同时夹带泳道与 PMU 的统一 ELF。无参数保持兼容并明确等价于
-# swimlane；submit-pmu 的 phase 必须先由白名单映射为稳定数值，不能把任意
-# 字符串直接用于目录或三套编译器的宏。
+# mode 是 artifact 身份的一部分。run.sh 总会显式传入；直接调用 build.sh
+# 未传 mode 时仍默认 private，保持原有命令可用。shared backend 接入前，
+# pa_model.h 会明确拒绝 shared 编译，绝不生成伪 shared 产物。
+TENSORMAP_MODE="private"
+if [[ "${1:-}" == "private" || "${1:-}" == "shared" ]]; then
+    TENSORMAP_MODE="$1"
+    shift
+fi
+case "$TENSORMAP_MODE" in
+    private) TENSORMAP_MODE_ID=0 ;;
+    shared) TENSORMAP_MODE_ID=1 ;;
+    *)
+        echo "Unknown TensorMap mode: $TENSORMAP_MODE (expected private|shared)" >&2
+        exit 1
+        ;;
+esac
+
+# CCEC 不再生成同时夹带泳道与 PMU 的统一 ELF。无 variant 保持兼容并
+# 等价于 swimlane；submit-pmu phase 必须先由白名单映射为稳定数值。
 BUILD_VARIANT="${1:-swimlane}"
 SPLIT_FINISH=0
 case "$BUILD_VARIANT" in
     swimlane)
         if [[ $# -gt 1 ]]; then
-            echo "Usage: $0 [swimlane]" >&2
+            echo "Usage: $0 [private|shared] [swimlane]" >&2
             exit 1
         fi
         PHASE_NAME="none"
         PHASE_ID=0
-        BUILD_DIR="$ROOT_DIR/build/ccec"
-        VARIANT_DEFINES=(-DPA_BUILD_SWIMLANE=1 -DPA_BUILD_SUBMIT_PMU=0 -DPA_SUBMIT_PMU_PHASE_ID=0)
+        BUILD_DIR="$ROOT_DIR/build/ccec/$TENSORMAP_MODE/swimlane"
+        VARIANT_DEFINES=(
+            "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID"
+            -DPA_BUILD_SWIMLANE=1
+            -DPA_BUILD_SUBMIT_PMU=0
+            -DPA_SUBMIT_PMU_PHASE_ID=0
+        )
         SPLIT_FINISH=1
         ;;
     submit-pmu)
         if [[ $# -ne 2 ]]; then
-            echo "Usage: $0 submit-pmu none|claim|efdrain|materialize|register" >&2
+            echo "Usage: $0 [private|shared] submit-pmu none|claim|efdrain|materialize|register" >&2
             exit 1
         fi
         PHASE_NAME="$2"
@@ -50,8 +71,13 @@ case "$BUILD_VARIANT" in
                 exit 1
                 ;;
         esac
-        BUILD_DIR="$ROOT_DIR/build/ccec/submit-pmu/$PHASE_NAME"
-        VARIANT_DEFINES=(-DPA_BUILD_SWIMLANE=0 -DPA_BUILD_SUBMIT_PMU=1 "-DPA_SUBMIT_PMU_PHASE_ID=$PHASE_ID")
+        BUILD_DIR="$ROOT_DIR/build/ccec/$TENSORMAP_MODE/submit-pmu/$PHASE_NAME"
+        VARIANT_DEFINES=(
+            "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID"
+            -DPA_BUILD_SWIMLANE=0
+            -DPA_BUILD_SUBMIT_PMU=1
+            "-DPA_SUBMIT_PMU_PHASE_ID=$PHASE_ID"
+        )
         # none/Claim/EfDrain 的 PMU 窗口在 finish 之前已经闭合，可以复用泳道版
         # 的跨 TU noinline finish；Materialize/Register 的窗口跨入 finish，必须
         # 保持 inline，确保边界继续操作同一份真实 PmuContext。
@@ -61,7 +87,7 @@ case "$BUILD_VARIANT" in
         fi
         ;;
     *)
-        echo "Usage: $0 [swimlane] | $0 submit-pmu none|claim|efdrain|materialize|register" >&2
+        echo "Usage: $0 [private|shared] [swimlane] | $0 [private|shared] submit-pmu <phase>" >&2
         exit 1
         ;;
 esac
@@ -95,8 +121,8 @@ if ! command -v "$READELF_BIN" >/dev/null 2>&1; then
     echo "readelf is required to verify the mixed AICore ELF." >&2
     exit 1
 fi
-if [[ "$BUILD_VARIANT" == "submit-pmu" ]] && ! command -v sha256sum >/dev/null 2>&1; then
-    echo "sha256sum is required to publish the submit-pmu artifact manifest." >&2
+if ! command -v sha256sum >/dev/null 2>&1; then
+    echo "sha256sum is required to publish the CCEC artifact manifest." >&2
     exit 1
 fi
 if [[ ! -f "$PTO_INCLUDE_ROOT/include/pto/common/kernel_meta.hpp" ]]; then
@@ -111,16 +137,13 @@ for header in pto/pto-inst.hpp pto/common/constants.hpp pto/common/pto_tile.hpp;
 done
 
 mkdir -p "$BUILD_DIR"
+rm -f -- "$BUILD_DIR/$ARTIFACT_MANIFEST_NAME"
 if [[ "$BUILD_VARIANT" == "swimlane" ]]; then
     # 旧统一构建可能在根目录残留 PMU owner；swimlane 构建主动移除这两个
     # 不属于本变体的产物，避免 direct host 调用误加载上一版诊断 SO。
     rm -f \
         "$BUILD_DIR/libpa_scheduler_pmu_owner_dispatcher.so" \
         "$BUILD_DIR/libpa_scheduler_pmu_owner_aicpu.so"
-else
-    # manifest 是同一 phase 四件套唯一的“可运行”标记。重建一开始先使旧
-    # manifest 失效；即使后续编译中断，run.sh 也不会消费目录里的半成品。
-    rm -f -- "$BUILD_DIR/$SUBMIT_PMU_MANIFEST_NAME"
 fi
 
 # 关闭编译器自动插入的 scalar DCCI，由 kernel.cpp 中与 PA 对齐的显式失效/回写协议负责 cache 可见性。
@@ -663,46 +686,53 @@ echo "[BUILD] CCEC host runner"
     -ldl \
     -o "$BUILD_DIR/pa_scheduler_host"
 
+# host 和 kernel 全部成功后才发布统一 manifest。swimlane 的两件套与
+# submit-pmu 的四件套都由同一 schema 固化 mode/variant/phase 和 SHA256；
+# run.sh 只消费带完整 manifest 的目录，因此中断重编不会混用新旧镜像。
 if [[ "$BUILD_VARIANT" == "submit-pmu" ]]; then
-    # host、kernel、owner、dispatcher 全部成功后才生成 manifest；校验和使用
-    # 相对文件名，目录复制后仍可在 run 前原样复核。临时文件与最终文件位于
-    # 同一目录，mv 只承担单文件原子发布，不会暴露半写 manifest。
-    SUBMIT_PMU_ARTIFACTS=(
+    ARTIFACTS=(
         pa_scheduler_host
         pa_scheduler_kernel.o
         libpa_scheduler_pmu_owner_aicpu.so
         libpa_scheduler_pmu_owner_dispatcher.so
     )
-    for artifact in "${SUBMIT_PMU_ARTIFACTS[@]}"; do
-        if [[ ! -s "$BUILD_DIR/$artifact" ]]; then
-            echo "Cannot publish submit-pmu manifest; artifact is missing or empty: $artifact" >&2
-            exit 1
-        fi
-    done
-    if [[ ! -x "$BUILD_DIR/pa_scheduler_host" ]]; then
-        echo "Cannot publish submit-pmu manifest; host runner is not executable." >&2
+else
+    ARTIFACTS=(
+        pa_scheduler_host
+        pa_scheduler_kernel.o
+    )
+fi
+for artifact in "${ARTIFACTS[@]}"; do
+    if [[ ! -s "$BUILD_DIR/$artifact" ]]; then
+        echo "Cannot publish CCEC manifest; artifact is missing or empty: $artifact" >&2
         exit 1
     fi
-
-    MANIFEST_PATH="$BUILD_DIR/$SUBMIT_PMU_MANIFEST_NAME"
-    MANIFEST_TMP="$(mktemp "$BUILD_DIR/.${SUBMIT_PMU_MANIFEST_NAME}.tmp.XXXXXX")"
-    cleanup_manifest_tmp() {
-        if [[ -n "${MANIFEST_TMP:-}" ]]; then
-            rm -f -- "$MANIFEST_TMP"
-        fi
-    }
-    trap cleanup_manifest_tmp EXIT
-    {
-        printf '# schema=pa_scheduler_submit_pmu_artifacts/v1\n'
-        printf '# variant=submit-pmu\n'
-        printf '# phase=%s\n' "$PHASE_NAME"
-        printf '# phase_id=%u\n' "$PHASE_ID"
-        (cd "$BUILD_DIR" && sha256sum "${SUBMIT_PMU_ARTIFACTS[@]}")
-    } > "$MANIFEST_TMP"
-    mv -f -- "$MANIFEST_TMP" "$MANIFEST_PATH"
-    MANIFEST_TMP=""
-    trap - EXIT
-    echo "[CHECK] submit-pmu artifact manifest published: $MANIFEST_PATH"
+done
+if [[ ! -x "$BUILD_DIR/pa_scheduler_host" ]]; then
+    echo "Cannot publish CCEC manifest; host runner is not executable." >&2
+    exit 1
 fi
+
+MANIFEST_PATH="$BUILD_DIR/$ARTIFACT_MANIFEST_NAME"
+MANIFEST_TMP="$(mktemp "$BUILD_DIR/.${ARTIFACT_MANIFEST_NAME}.tmp.XXXXXX")"
+cleanup_manifest_tmp() {
+    if [[ -n "${MANIFEST_TMP:-}" ]]; then
+        rm -f -- "$MANIFEST_TMP"
+    fi
+}
+trap cleanup_manifest_tmp EXIT
+{
+    printf '# schema=pa_scheduler_artifacts/v1\n'
+    printf '# tensormap_mode=%s\n' "$TENSORMAP_MODE"
+    printf '# tensormap_mode_id=%u\n' "$TENSORMAP_MODE_ID"
+    printf '# variant=%s\n' "$BUILD_VARIANT"
+    printf '# phase=%s\n' "$PHASE_NAME"
+    printf '# phase_id=%u\n' "$PHASE_ID"
+    (cd "$BUILD_DIR" && sha256sum "${ARTIFACTS[@]}")
+} > "$MANIFEST_TMP"
+mv -f -- "$MANIFEST_TMP" "$MANIFEST_PATH"
+MANIFEST_TMP=""
+trap - EXIT
+echo "[CHECK] CCEC artifact manifest published: $MANIFEST_PATH"
 
 echo "[BUILD] complete: $BUILD_DIR"

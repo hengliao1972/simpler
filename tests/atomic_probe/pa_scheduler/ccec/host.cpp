@@ -267,11 +267,11 @@ bool MapPmuRegisters(uint32_t device, PmuRegisterMappings *mappings) {
 
 void ConfigurePmu(pa_scheduler::SchedulerState *state, const PmuOptions &pmu, const void *register_table) {
     using namespace pa_scheduler::ccec_pmu;
-    state->config.reserved[kConfigMode] = static_cast<uint32_t>(pmu.mode);
-    state->config.reserved[kConfigWorkAmount] =
+    state->pmu_probe.mode = static_cast<uint32_t>(pmu.mode);
+    state->pmu_probe.work_amount =
         pmu.mode == WindowMode::IcacheSingle ? pmu.icache_trials : pmu.scalar_nops;
-    StorePointer(state->config.reserved, register_table);
-    state->config.reserved[kConfigMagic] = pmu.mode == WindowMode::Off ? 0 : kConfigMagicValue;
+    state->pmu_probe.register_table = reinterpret_cast<uint64_t>(register_table);
+    state->pmu_probe.magic = pmu.mode == WindowMode::Off ? 0 : kConfigMagicValue;
 }
 
 struct PmuAggregate {

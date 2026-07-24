@@ -849,3 +849,43 @@ shared 组合再增加 `-DPTO_FDWIC_SHARED_MAP=1`。两次返回码均为 1，�
 快路径才适合进入真实代码。否则即使某次 PA 上板更快，也只能说明特定
 workload 没触发协议边界，不能说明 shared TensorMap 已经具备可维护、可扩展
 的架构。
+
+## 15. 当前分支实施记录
+
+### 2026-07-24：S0 模式身份与 ABI
+
+本阶段只修改 `tests/atomic_probe/pa_scheduler`，没有修改
+`src/a5/runtime/fully_distributed_within_core` 或真实 PA。
+
+已完成：
+
+- `run.sh` 增加 `--tensormap private|shared`，默认 private，并从 benchmark
+  参数中消费该选项；
+- 三后端产物按 `<backend>/<mode>/<variant>` 隔离；
+- CCEC swimlane 与 submit-pmu 使用同一 manifest schema，固定
+  mode、variant、phase 和完整运行件 SHA256；
+- `RunConfig` 在原有 16B 尾部写入 magic、ABI version、mode 和
+  `sizeof(SchedulerState)`，device 在解释 worker 状态前核对；
+- 发现并修复旧 PMU `reserved[4]` 越界：原数组只有四项，索引 4 实际落入
+  相邻 `WinnerWorkloadConfig::mode`；现已迁到独立 64B
+  `PmuProbeConfig`；
+- shared backend 尚未接入时保留编译期门禁，不生成伪 shared 产物。
+
+验证结果：
+
+| 检查 | 结果 |
+| ---- | ---- |
+| CPU private build + PollBatch 自测 | PASS |
+| CPU private b1 smoke | 全部语义断言 PASS |
+| CCEC private swimlane 编译 | PASS |
+| CCEC private submit-pmu none 编译 | PASS |
+| 两类 CCEC manifest/SHA256 启动前校验 | PASS |
+| shared CPU fail-closed，且无 executable | PASS |
+| 重复/非法 mode、缺失 shared 产物负测 | PASS |
+| standalone Python 回归（用户 `.venv`） | 100 passed |
+| 四个 shell 脚本 `bash -n` | PASS |
+| `git diff --check` | PASS |
+
+本阶段没有运行 A5/A5sim。S0 不改变 TensorMap 算法，也不声称有性能收益；
+CCEC 编译只证明三镜像能够用同一模式构建。下一阶段 S1 才会在 private
+standalone 中把 linked map 同构为 ring-per-bucket。

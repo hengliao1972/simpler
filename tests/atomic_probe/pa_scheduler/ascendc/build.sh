@@ -12,7 +12,20 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BUILD_DIR="$ROOT_DIR/build/ascendc"
+if [[ $# -gt 1 ]]; then
+    echo "Usage: $0 [private|shared]" >&2
+    exit 1
+fi
+TENSORMAP_MODE="${1:-private}"
+case "$TENSORMAP_MODE" in
+    private) TENSORMAP_MODE_ID=0 ;;
+    shared) TENSORMAP_MODE_ID=1 ;;
+    *)
+        echo "Unknown TensorMap mode: $TENSORMAP_MODE (expected private|shared)" >&2
+        exit 1
+        ;;
+esac
+BUILD_DIR="$ROOT_DIR/build/ascendc/$TENSORMAP_MODE/swimlane"
 
 # 所有源码和公共头都从 pa_scheduler 目录解析；外部只需要用户安装的
 # CANN 工具链和运行库，不搜索 simpler 仓库根目录。
@@ -44,6 +57,7 @@ echo "[BUILD] AscendC 1:2 mixed host + kernel executable"
 "$BISHENG" -O3 -xasc \
     "$SCRIPT_DIR/pa_scheduler.asc" \
     --npu-arch=dav-3510 \
+    "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID" \
     -D__MIX_CORE_AIC_RATION__=2 \
     -I"$ROOT_DIR/common" \
     -mllvm -cce-aicore-dcci-insert-for-scalar=false \

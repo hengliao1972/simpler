@@ -210,7 +210,7 @@ export PATH="$GCC15_ROOT/usr/bin:$PATH"
 export LD_LIBRARY_PATH="$GCC15_ROOT/usr/lib/x86_64-linux-gnu:$GCC15_ROOT/usr/lib/gcc/x86_64-linux-gnu/15${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export CXX="$GCC15_ROOT/usr/bin/g++-15"
 
-./run.sh build all
+./run.sh build all --tensormap private
 ```
 
 组合构建严格按 CCEC、AscendC、CPU 的顺序执行。CCEC 构建会检查 1:2 mixed
@@ -224,12 +224,29 @@ export CXX="$GCC15_ROOT/usr/bin/g++-15"
 
 | 构建 | 后端 | 内容 | 构建命令 | 产物目录 |
 | --- | --- | --- | --- | --- |
-| `swimlane` | CCEC/AscendC/CPU | schema-v4 普通阶段、业务父区间、真实 Submit 尾动作与 atomic（direct + PollBatch）合并采集；不配置 PMU | `./run.sh build ccec` 或 `./run.sh build all` | CCEC 为 `build/ccec/` |
-| `submit-pmu` | 仅 CCEC | 每核完整 Submit PMU，并在编译期可选一个局部阶段；当前有 `none|claim|efdrain|materialize|register` | `./run.sh build-submit-pmu ccec <phase>` | `build/ccec/submit-pmu/<phase>/` |
+| `swimlane` | CCEC/AscendC/CPU | schema-v4 普通阶段、业务父区间、真实 Submit 尾动作与 atomic（direct + PollBatch）合并采集；不配置 PMU | `./run.sh build ccec --tensormap <mode>` 或 `./run.sh build all --tensormap <mode>` | `build/<backend>/<mode>/swimlane/` |
+| `submit-pmu` | 仅 CCEC | 每核完整 Submit PMU，并在编译期可选一个局部阶段；当前有 `none|claim|efdrain|materialize|register` | `./run.sh build-submit-pmu ccec <phase> --tensormap <mode>` | `build/ccec/<mode>/submit-pmu/<phase>/` |
 
 `./run.sh build all` 只构建三后端的 `swimlane` 产物；`submit-pmu`
 必须按 phase 另行构建。`none` 是不做局部边界读取的完整 Submit
 基准，不是第三类构建。
+
+`--tensormap private|shared` 是由 `run.sh` 消费的构建身份，不会下传为
+benchmark 运行时参数；省略时默认 `private`。它与 `swimlane`/
+`submit-pmu` 正交，并进入产物目录、CCEC manifest 以及 host/device
+`magic + ABI version + mode + sizeof(SchedulerState)` 握手。CCEC 的
+swimlane 两件套和 submit-pmu 四件套都必须通过 manifest 的模式、变体、
+阶段和 SHA256 校验，才能启动 host。
+
+当前 S0 只完成模式边界，真正的 shared backend 尚未接入。此时显式构建
+`--tensormap shared` 会在编译期明确失败，且不会生成可执行文件；这是为了
+禁止“目录名为 shared、实际仍执行 private”的误导性结果。完成 shared
+协议的阶段会删除这道临时门禁，但保留相同的构建身份和产物隔离。
+
+S0 还修复了一处独立问题：旧 CCEC PMU 配置以
+`RunConfig::reserved[4]` 访问只有四项的数组，越界落入相邻 winner workload。
+现在 PMU mode、work amount、寄存器表地址和 magic 位于独立的 64B
+`PmuProbeConfig`，不再占用 `RunConfig` 尾部或覆盖业务配置。
 
 ## 5. 使用说明：运行、测量与泳道查看
 
@@ -246,7 +263,9 @@ export CXX="$GCC15_ROOT/usr/bin/g++-15"
 | `submit-pmu` | 单轮采集完整 Submit PMU，可选导出 JSON | 否，与泳道隔离 |
 
 `ccec|ascendc|cpu|all` 用于选择后端；`all` 始终按 CCEC、AscendC、CPU
-的顺序执行。
+的顺序执行。所有 action 都接受一次
+`--tensormap private|shared`，位置可在 backend 后的其余参数中任意放置；
+当前可运行模式为默认的 `private`。
 CCEC、AscendC 和 CPU 的 `run/swimlane` 都可使用
 `--winner-workload scalar-nop|real-compute`、
 `--real-compute-count N`、`--real-compute-counts QK,SF,PV,UP` 或
@@ -322,12 +341,13 @@ export PYTHON=/path/to/venv/bin/python
 终端中的传统分组文字统计；无论是否传它，`swimlane` action 都会生成
 排他闭合报告。
 
-修改 C++ 头文件或 kernel 后必须先执行 `./run.sh build ccec`，
+修改 C++ 头文件或 kernel 后必须先执行
+`./run.sh build ccec --tensormap private`，
 `swimlane` action 只消费已有构建件，不会隐式重编译。日常边界迭代默认只跑
 A5 b1；b256 只用于阶段性规模/容量收口或明确指定的长负载结论。
 
 该 action 固定执行一轮，产物全部位于本目录的
-`outputs/pa_scheduler_swimlane_<UTC时间>_<PID>/<backend>/`。选择 `all` 时，
+`outputs/pa_scheduler_<mode>_swimlane_<UTC时间>_<PID>/<backend>/`。选择 `all` 时，
 同一 output root 下会按顺序建立 `ccec/`、`ascendc/` 和 `cpu/` 三个子目录：
 
 - `l2_swimlane_records.json`：与真实 PA 相同的十列 `fdwic_events`
@@ -352,7 +372,7 @@ FinalDrain；孤儿、越界或多重归属都会使排他分析失败。
 runner 结束时会打印准确目录：
 
 ```text
-[SWIMLANE] output_root=.../outputs/pa_scheduler_swimlane_<UTC时间>_<PID>
+[SWIMLANE] output_root=.../outputs/pa_scheduler_private_swimlane_<UTC时间>_<PID>
 ```
 
 真计算泳道必须同时检查 raw/merged 顶层
@@ -803,26 +823,33 @@ PMU context 而采用 inline-finish 诊断 ELF。因此后两者与 `none`
 ./run.sh build-submit-pmu ccec register
 ```
 
+上面省略了默认的 `--tensormap private`；显式写法例如：
+
+```bash
+./run.sh build-submit-pmu ccec none --tensormap private
+```
+
 产物完全分开：
 
 ```text
-build/ccec/submit-pmu/none/
-build/ccec/submit-pmu/claim/
-build/ccec/submit-pmu/efdrain/
-build/ccec/submit-pmu/materialize/
-build/ccec/submit-pmu/register/
+build/ccec/private/submit-pmu/none/
+build/ccec/private/submit-pmu/claim/
+build/ccec/private/submit-pmu/efdrain/
+build/ccec/private/submit-pmu/materialize/
+build/ccec/private/submit-pmu/register/
 ```
 
 每个目录都自包含同 phase 的 host、mixed kernel、PMU owner 和 dispatcher，
-不得跨 phase 拼装。构建完成后才会原子发布包含 phase 身份和四个 SHA256 的
-manifest；`submit-pmu` action 在启动 host 前逐项复核，缺件、串 phase 或内容
-变化都会直接拒绝。一次正式采集示例：
+不得跨 mode 或 phase 拼装。构建完成后才会原子发布包含 mode、variant、phase
+身份和四个 SHA256 的统一 manifest；`submit-pmu` action 在启动 host 前逐项
+复核，缺件、串 mode/phase 或内容变化都会直接拒绝。一次正式采集示例：
 
 ```bash
 export PYTHON=/home/q00473782/.venv/bin/python
 OUT="./outputs/submit_pmu_none_$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$OUT"
 ./run.sh submit-pmu ccec none \
+  --tensormap private \
   --device 0 --batches 1 \
   --winner-workload real-compute --real-compute-counts 6,28,4,1 \
   --pmu-json "$OUT/submit_icache_raw.json"
@@ -1459,7 +1486,8 @@ ClockBaseline，并继续以逐核容量、调用数、总记录数和 `dropped=
 `64 * 96 = 6,144` bytes。split ELF 另预留 AIC/AIV 两个 role-specific
 block-local runtime state，每个精确 1,600 bytes、最终 section 合计
 3,200 bytes；它们不属于 GM `SchedulerState`。
-独立的 64 bytes winner workload 配置 cache line 与生产 DistGlobal/
+独立的 64 bytes PMU 配置和 64 bytes winner workload 配置各占一条
+cache line；二者都位于完整生产 DistGlobal 镜像之后，生产 DistGlobal/
 DistCore 关键偏移保持不变。
 默认泳道缓冲区另占 402,660,160 bytes；CCEC/AscendC `real-compute` 还在 device 分配
 12,713,984 bytes workspace。因此 scalar-nop+trace 的 A5 device 占用约
@@ -1484,6 +1512,10 @@ cd /tmp/pa_scheduler
 ./run.sh build cpu
 ./run.sh smoke cpu
 ```
+
+上面两条省略 `--tensormap private`，与显式写出 private 等价。shared
+backend 完成前，复制目录后执行 `./run.sh build cpu --tensormap shared`
+也会按同一门禁明确失败，不会回退到 private。
 
 CCEC/AscendC 只需再 source CANN 环境。本目录的构建脚本不会搜索 Git 根目录，
 也不会引用 `simpler/src`、`simpler/examples` 或其他仓内文件。泳道转换与排他

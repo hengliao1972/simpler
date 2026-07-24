@@ -15,6 +15,24 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// standalone 与真实 FDWIC 使用同一个模式宏，便于先在这里验证模式边界，
+// 再把已证明的机制迁移到 runtime。构建脚本始终显式传 0/1；头文件默认
+// private，保证原有命令和既有性能基线不变。
+#ifndef PTO_FDWIC_SHARED_MAP
+#define PTO_FDWIC_SHARED_MAP 0
+#endif
+
+#if PTO_FDWIC_SHARED_MAP != 0 && PTO_FDWIC_SHARED_MAP != 1
+#error "PTO_FDWIC_SHARED_MAP must be 0 (private) or 1 (shared)"
+#endif
+
+// 阶段 S0 只建立可验证的构建身份与产物隔离。shared 数据结构和协议尚未接入
+// 公共调度器时必须明确拒绝，禁止生成名字叫 shared、实际仍执行 private map
+// 的误导性产物。接入真正 shared backend 的提交会删除这条门禁。
+#if PTO_FDWIC_SHARED_MAP
+#error "standalone shared TensorMap backend is not implemented yet; refusing to run the private backend"
+#endif
+
 // CCEC 的正式产物只允许二选一：swimlane 保存普通阶段与 atomic 记录，
 // submit-pmu 则编译掉泳道观察代码。CPU/AscendC 未传这些宏时继续使用原有
 // 通用实现，避免公共模型反向依赖某个后端的构建脚本。
@@ -31,6 +49,16 @@
 #endif
 
 namespace pa_scheduler {
+
+enum class TensorMapBuildMode : uint32_t {
+    Private = 0,
+    Shared = 1,
+};
+
+constexpr TensorMapBuildMode kCompiledTensorMapMode =
+    static_cast<TensorMapBuildMode>(PTO_FDWIC_SHARED_MAP);
+constexpr uint32_t kBuildIdentityMagic = 0x50414249U;  // "PABI"
+constexpr uint32_t kBuildIdentityAbiVersion = 1;
 
 // 这里固定的是 PA Case1 的调度拓扑，而不是为了缩小 standalone 人为选择的规模：
 // 每个 batch 依次回放 Alloc/QK/SF/PV/UP 五个 task，32 个 AIC 与 64 个 AIV
@@ -282,9 +310,29 @@ struct alignas(64) RunConfig {
     uint64_t trace_base;
     uint32_t trace_records_per_core;
     uint32_t final_barrier_shape;
-    uint32_t reserved[4];
+    // host 与 device 分别按自己的编译常量写入/核对这四个字段。它们占用
+    // RunConfig 原有的 16B padding，不扩大热控制行，也不移动生产状态。
+    uint32_t build_identity_magic;
+    uint32_t build_identity_abi_version;
+    uint32_t tensor_map_mode;
+    uint32_t scheduler_state_size;
 };
 static_assert(sizeof(RunConfig) == 64, "RunConfig must occupy one cache line");
+static_assert(offsetof(RunConfig, build_identity_magic) == 48, "build identity offset changed");
+
+// CCEC PMU 的窗口选择与寄存器表是 standalone 诊断 sidecar，不属于
+// RunConfig，也不应占用 winner workload 的字段。独占 cache line 后，
+// host/kernel 可显式搬运和失效整个配置，而不会再发生 reserved[4] 越界。
+struct alignas(64) PmuProbeConfig {
+    uint32_t mode;
+    uint32_t work_amount;
+    uint64_t register_table;
+    uint32_t magic;
+    uint32_t reserved[11];
+};
+static_assert(sizeof(PmuProbeConfig) == 64, "PMU probe config must occupy one cache line");
+static_assert(offsetof(PmuProbeConfig, register_table) == 8, "PMU register-table offset changed");
+static_assert(offsetof(PmuProbeConfig, magic) == 16, "PMU magic offset changed");
 
 enum class TracePhase : int32_t {
     Kernel = 0,
@@ -915,6 +963,7 @@ struct alignas(64) SchedulerState {
     // Standalone-only controls live after the complete DistGlobal image. They
     // therefore do not shift any cursor/task/fatal/worker address under test.
     RunConfig config;
+    PmuProbeConfig pmu_probe;
     WinnerWorkloadConfig winner_workload;
     // Context lengths are the only PA input elements read by orchestration;
     // keeping them in GM preserves the per-batch descriptor-based load.
@@ -946,15 +995,22 @@ static_assert(offsetof(SchedulerState, results) % 64 == 0, "result table must be
 static_assert(offsetof(SchedulerState, workers) == kRealDistCoreOffset, "DistCore table offset must match PA");
 static_assert(offsetof(SchedulerState, config) == kRealDistGlobalBytes, "DistGlobal byte size must match PA");
 static_assert(
-    offsetof(SchedulerState, winner_workload) == kRealDistGlobalBytes + sizeof(RunConfig),
-    "winner workload sidecar must follow RunConfig"
+    offsetof(SchedulerState, pmu_probe) == kRealDistGlobalBytes + sizeof(RunConfig),
+    "PMU probe sidecar must follow RunConfig"
+);
+static_assert(
+    offsetof(SchedulerState, winner_workload) ==
+        kRealDistGlobalBytes + sizeof(RunConfig) + sizeof(PmuProbeConfig),
+    "winner workload sidecar offset mismatch"
 );
 static_assert(
     offsetof(SchedulerState, context_lens) ==
-        kRealDistGlobalBytes + sizeof(RunConfig) + sizeof(WinnerWorkloadConfig),
+        kRealDistGlobalBytes + sizeof(RunConfig) + sizeof(PmuProbeConfig) +
+            sizeof(WinnerWorkloadConfig),
     "context lengths must follow standalone controls"
 );
 static_assert(offsetof(SchedulerState, final_barrier) % 64 == 0, "final barrier must be cache-line aligned");
+static_assert(sizeof(SchedulerState) <= UINT32_MAX, "SchedulerState size must fit build identity");
 
 }  // namespace pa_scheduler
 

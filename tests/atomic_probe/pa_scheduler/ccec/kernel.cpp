@@ -135,10 +135,8 @@ __aicore__ inline PmuRegisterContext ResolvePmuRegisters(__gm__ pa_scheduler::Sc
     PmuRegisterContext context;
     const uint32_t physical_core_id = static_cast<uint32_t>(get_coreid()) & kStatusCoreIdMask;
     context.status = kStatusRequested | (physical_core_id << kStatusCoreIdShift);
-    const uint64_t table_address =
-        static_cast<uint64_t>(state->config.reserved[kConfigRegTableLow]) |
-        (static_cast<uint64_t>(state->config.reserved[kConfigRegTableHigh]) << 32);
-    if (state->config.reserved[kConfigMagic] != kConfigMagicValue || table_address == 0 ||
+    const uint64_t table_address = state->pmu_probe.register_table;
+    if (state->pmu_probe.magic != kConfigMagicValue || table_address == 0 ||
         physical_core_id >= kPhysicalSubcoreCount) {
         return context;
     }
@@ -232,7 +230,7 @@ __aicore__ inline CcecOps::PmuContext CcecOps::PmuWindowStart(
     using namespace pa_scheduler::ccec_pmu;
     (void)worker_id;
     SubmitPmuContext context;
-    const WindowMode mode = static_cast<WindowMode>(state->config.reserved[kConfigMode]);
+    const WindowMode mode = static_cast<WindowMode>(state->pmu_probe.mode);
     if (mode != WindowMode::SubmitAll) return context;
     // Main AICPU owner 已在 launch 前配置并开启计数；先 stop + snapshot/read-clear，
     // 再解析 selector，避免这些 ld_dev 污染完整 Submit 窗口。

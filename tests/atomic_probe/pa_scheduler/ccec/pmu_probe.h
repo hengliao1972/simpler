@@ -38,14 +38,9 @@ inline bool IsSubmitWindow(WindowMode mode) {
     return mode == WindowMode::SubmitAll;
 }
 
-// RunConfig::reserved 保持既有 64B ABI；CCEC 独占解释以下五个槽位，其他后端仍看到全零。
-constexpr uint32_t kConfigMode = 0;
-constexpr uint32_t kConfigWorkAmount = 1;
-constexpr uint32_t kConfigScalarNops = kConfigWorkAmount;
-constexpr uint32_t kConfigIcacheTrials = kConfigWorkAmount;
-constexpr uint32_t kConfigRegTableLow = 2;
-constexpr uint32_t kConfigRegTableHigh = 3;
-constexpr uint32_t kConfigMagic = 4;
+// PMU 控制已从 RunConfig 尾部拆到独立 PmuProbeConfig cache line。mode、
+// work_amount、64 位寄存器表地址和 magic 都有具名字段，避免用数组下标
+// 跨过 RunConfig 边界覆盖 winner workload。
 constexpr uint32_t kConfigMagicValue = 0x504d5531U;  // "PMU1"
 
 // DAV_3510 有 36 个物理 AICore，每个 AICore 展开为 1 AIC + 2 AIV，共 108 个物理子核编号。
@@ -163,17 +158,6 @@ inline const char *SubmitPmuPhaseName(SubmitPmuPhase phase) {
         break;
     }
     return "invalid";
-}
-
-inline uint64_t PackPointer(const uint32_t *words) {
-    return static_cast<uint64_t>(words[kConfigRegTableLow]) |
-           (static_cast<uint64_t>(words[kConfigRegTableHigh]) << 32);
-}
-
-inline void StorePointer(uint32_t *words, const void *pointer) {
-    const uint64_t raw = reinterpret_cast<uint64_t>(pointer);
-    words[kConfigRegTableLow] = static_cast<uint32_t>(raw);
-    words[kConfigRegTableHigh] = static_cast<uint32_t>(raw >> 32);
 }
 
 inline uint32_t StatusCoreId(uint32_t status) {
