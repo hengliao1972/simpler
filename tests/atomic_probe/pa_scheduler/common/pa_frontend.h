@@ -698,23 +698,24 @@ PA_DEVICE void AcceptTaskOutputs(PaOrchestrationState &orch, TaskKind kind, cons
 }
 
 PA_DEVICE void ResetTensorMap(PA_GM TensorMap &map) {
-    // TensorMap 完全属于当前 worker，初始化和后续增删都不需要 atomic。bucket 与
-    // task_heads 置空后，entry 存储按 high_water 首次分配、再经 free_head 复用。
-    map.free_head = -1;
-    map.high_water = 0;
+    // TensorMap 完全属于当前 worker，private ring 的游标和计数都不需要
+    // atomic。entry/ABI 保留区保持惰性，未落在 [head, tail) 的槽不可见。
     map.alive_floor = 0;
     map.cleaned_upto = 0;
+    map.live_count = 0;
+    map.high_water = 0;
     for (uint32_t index = 0; index < kMapBuckets; ++index) {
-        map.buckets[index] = -1;
+        map.bucket_heads[index] = 0;
+        map.bucket_tails[index] = 0;
     }
     for (uint32_t index = 0; index < kTaskWindow; ++index) {
-        map.task_heads[index] = -1;
+        map.task_entry_counts[index] = 0;
     }
 }
 
 PA_DEVICE uint32_t TensorMapHash(uint64_t address) {
     address *= 0x9E3779B97F4A7C15ULL;
-    return static_cast<uint32_t>(address >> (64 - kMapBucketShift));
+    return static_cast<uint32_t>(address >> (64 - kMapBucketShift)) & kMapBucketMask;
 }
 
 template <typename TensorReference>
@@ -736,42 +737,33 @@ PA_DEVICE void TensorByteRange(const TensorReference &tensor, uint64_t &address,
     hi = (tensor.start_offset + extent) * element_size;
 }
 
-PA_DEVICE int32_t AllocateMapEntry(PA_GM TensorMap &map) {
-    // 输出为可写 entry 下标：优先复用退休链，之后增长 high_water；返回 -1 表示
-    // 固定容量耗尽。分配动作尚未把 entry 接入任何 bucket/task 链。
-    if (map.free_head >= 0) {
-        const int32_t slot = map.free_head;
-        map.free_head = map.entries[slot].next_in_bucket;
-        return slot;
-    }
-    if (map.high_water < static_cast<int32_t>(kMapCapacity)) {
-        return map.high_water++;
-    }
-    return -1;
+PA_DEVICE uint32_t TensorMapSlotIndex(uint32_t bucket, uint64_t cursor) {
+    return bucket * kMapBucketCapacity +
+           (static_cast<uint32_t>(cursor) & kMapBucketSlotMask);
 }
 
-PA_DEVICE void FreeMapEntry(PA_GM TensorMap &map, int32_t index) {
-    // 输入 index 必须仍位于其 bucket 链。输出状态是从双向 bucket 链完整摘除，
-    // 再把 next_in_bucket 改作 free-list next；task 链由 AdvanceTensorMap 顺序遍历。
-    PA_GM MapEntry &entry = map.entries[index];
-    if (entry.prev_in_bucket < 0) {
-        map.buckets[entry.bucket] = entry.next_in_bucket;
-    } else {
-        map.entries[entry.prev_in_bucket].next_in_bucket = entry.next_in_bucket;
+PA_DEVICE void RetireBucket(PA_GM TensorMap &map, uint32_t bucket) {
+    // 同一 worker 按 task_id 单调 append，因此一个桶内的 producer 也单调
+    // 不降。只需从最旧槽开始推进到第一个仍在 alive_floor 内的条目。
+    // AdvanceTensorMap 不扫 128 个桶；lookup/insert 触达哪个桶，哪个桶才
+    // 物理退休。逻辑 live_count 已在 AdvanceTensorMap 中精确扣减。
+    uint64_t head = map.bucket_heads[bucket];
+    const uint64_t tail = map.bucket_tails[bucket];
+    while (head < tail) {
+        PA_GM const MapEntry &entry = map.entries[TensorMapSlotIndex(bucket, head)];
+        if (entry.producer >= map.alive_floor) {
+            break;
+        }
+        ++head;
     }
-    if (entry.next_in_bucket >= 0) {
-        map.entries[entry.next_in_bucket].prev_in_bucket = entry.prev_in_bucket;
-    }
-    entry.bucket = -1;
-    entry.next_in_bucket = map.free_head;
-    map.free_head = index;
+    map.bucket_heads[bucket] = head;
 }
 
 PA_DEVICE void AdvanceTensorMap(PA_GM TensorMap &map, uint32_t task_id, int32_t heap_window) {
-    // PrepareMap 在 Claim 后把存活下界推进到 task_id-H。离开窗口的 producer 先按
-    // task_heads 找到其全部 entry，再从 bucket 链摘除并进入 free list。TensorMap 与
-    // heap 共享窗口宽度 H，但前者按本 worker 的 task_id 推进，后者按跨核连续
-    // frontier 推进，二者并不要求同步到达同一位置。
+    // PrepareMap 在 Claim 后把存活下界推进到 task_id-H。这里按 producer
+    // 精确扣减 logical live_count 并清空循环计数槽；桶内物理 head 留给
+    // RetireBucket 惰性推进。TensorMap 与 heap 共享 H，但前者按本 worker
+    // task_id 推进，后者按跨核连续 frontier 推进，二者无需同步到同一位置。
     const int32_t new_floor = static_cast<int32_t>(task_id) - heap_window;
     if (new_floor <= map.cleaned_upto) {
         if (new_floor > map.alive_floor) {
@@ -780,60 +772,63 @@ PA_DEVICE void AdvanceTensorMap(PA_GM TensorMap &map, uint32_t task_id, int32_t 
         return;
     }
     for (int32_t id = map.cleaned_upto; id < new_floor; ++id) {
-        int32_t current = map.task_heads[static_cast<uint32_t>(id) & kTaskWindowMask];
-        while (current >= 0) {
-            const int32_t next = map.entries[current].next_in_task;
-            FreeMapEntry(map, current);
-            current = next;
-        }
-        map.task_heads[static_cast<uint32_t>(id) & kTaskWindowMask] = -1;
+        const uint32_t task_slot = static_cast<uint32_t>(id) & kTaskWindowMask;
+        const uint32_t retired = map.task_entry_counts[task_slot];
+        map.live_count -= retired;
+        map.task_entry_counts[task_slot] = 0;
     }
     map.cleaned_upto = new_floor;
     map.alive_floor = new_floor;
 }
 
 template <typename TensorReference>
-PA_DEVICE void InsertTensor(PA_GM TensorMap &map, const TensorReference &tensor, int32_t producer) {
-    // 新 producer 同时插入地址 bucket 的表头与 producer 对应 task 链的表头。
-    // map 满时生产语义是静默放弃登记；standalone 保持该行为，不新增异常分支。
+PA_DEVICE bool InsertTensor(PA_GM TensorMap &map, const TensorReference &tensor, int32_t producer) {
+    // 每桶独立 append。先惰性退休该桶，再检查固定容量；满时不覆写旧槽、
+    // 不推进 tail/计数，明确返回 false 交由 Submit 上层转成 fatal。
     uint64_t address = 0;
     uint64_t lo = 0;
     uint64_t hi = 0;
     TensorByteRange(tensor, address, lo, hi);
-    const int32_t slot = AllocateMapEntry(map);
-    if (slot < 0) {
-        return;
-    }
     const uint32_t bucket = TensorMapHash(address);
-    PA_GM MapEntry &entry = map.entries[slot];
+    RetireBucket(map, bucket);
+    const uint64_t head = map.bucket_heads[bucket];
+    const uint64_t tail = map.bucket_tails[bucket];
+    if (tail - head >= kMapBucketCapacity) {
+        return false;
+    }
+
+    PA_GM MapEntry &entry = map.entries[TensorMapSlotIndex(bucket, tail)];
     entry.buffer_addr = address;
     entry.lo = lo;
     entry.hi = hi;
     entry.producer = producer;
-    entry.bucket = static_cast<int32_t>(bucket);
-    entry.prev_in_bucket = -1;
-    entry.next_in_bucket = map.buckets[bucket];
-    if (map.buckets[bucket] >= 0) {
-        map.entries[map.buckets[bucket]].prev_in_bucket = slot;
-    }
-    map.buckets[bucket] = slot;
+    map.bucket_tails[bucket] = tail + 1;
+
     const uint32_t task_slot = static_cast<uint32_t>(producer) & kTaskWindowMask;
-    entry.next_in_task = map.task_heads[task_slot];
-    map.task_heads[task_slot] = slot;
+    ++map.task_entry_counts[task_slot];
+    ++map.live_count;
+    if (map.live_count > map.high_water) {
+        map.high_water = map.live_count;
+    }
+    return true;
 }
 
 template <typename TensorReference>
-PA_DEVICE int32_t LookupTensor(PA_GM const TensorMap &map, const TensorReference &tensor) {
+PA_DEVICE int32_t LookupTensor(PA_GM TensorMap &map, const TensorReference &tensor) {
     uint64_t address = 0;
     uint64_t lo = 0;
     uint64_t hi = 0;
     TensorByteRange(tensor, address, lo, hi);
+    const uint32_t bucket = TensorMapHash(address);
+    RetireBucket(map, bucket);
+    const uint64_t head = map.bucket_heads[bucket];
+    const uint64_t tail = map.bucket_tails[bucket];
     int32_t best = -1;
-    // 同一 buffer 可能存在多个历史写者；只考虑仍存活且区间重叠的 entry，并选择
-    // task_id 最大的最新 producer，防止依赖回退到更老版本。
-    for (int32_t current = map.buckets[TensorMapHash(address)]; current >= 0;
-         current = map.entries[current].next_in_bucket) {
-        PA_GM const MapEntry &entry = map.entries[current];
+    // 扫描 [head,tail) 的全部合法槽而非依赖 append 顺序提前返回；同一
+    // buffer 的多个历史写者中，只接受 producer>=alive_floor 的重叠条目，
+    // 并取 producer 最大者，避免依赖退回旧版本。
+    for (uint64_t cursor = head; cursor < tail; ++cursor) {
+        PA_GM const MapEntry &entry = map.entries[TensorMapSlotIndex(bucket, cursor)];
         if (entry.producer < map.alive_floor) {
             continue;
         }
@@ -853,7 +848,7 @@ PA_DEVICE uint64_t TensorOwner(const TaskTensorRef &reference) {
     return reference.pointer.local_tensor->owner_task_id;
 }
 
-PA_DEVICE int32_t LookupTensorRef(PA_GM const TensorMap &map, const TaskTensorRef &reference) {
+PA_DEVICE int32_t LookupTensorRef(PA_GM TensorMap &map, const TaskTensorRef &reference) {
     // 与 TensorOwner 相同，此辅助入口只接收已存在 descriptor；返回最新重叠 producer，
     // 未登记或已退休则返回 -1。
     if (reference.kind == TensorRefKind::GmTensor) {
@@ -879,7 +874,7 @@ PA_DEVICE void AddFanin(int32_t fanin[kMaxFanin], uint32_t &count, int32_t produ
 }
 
 PA_DEVICE uint32_t CollectFanin(
-    PA_GM const TensorMap &map, const TaskArgs &args, int32_t fanin[kMaxFanin]
+    PA_GM TensorMap &map, const TaskArgs &args, int32_t fanin[kMaxFanin]
 ) {
     // fanin 只由 winner 收集：先吸收 descriptor 的显式 owner，再对 Input/Inout
     // 查询最新重叠写者；纯 Output 尚未存在，不应成为本次 task 的输入依赖。
@@ -918,29 +913,31 @@ PA_DEVICE uint32_t CollectFanin(
     return count;
 }
 
-PA_DEVICE void InsertExistingTensor(SubmitContext &context, const TaskArgs &args, int32_t index) {
+PA_DEVICE bool InsertExistingTensor(SubmitContext &context, const TaskArgs &args, int32_t index) {
     // 输入 index 来自 register_mask，故必为已有 descriptor 而非 CreateInfo；写入结果
     // 只影响 context.self 对应 worker 的 map，并把当前 task_id 登记为新的 hazard 版本。
     const TaskTensorRef &reference = args.tensors[index];
     if (reference.kind == TensorRefKind::GmTensor) {
-        InsertTensor(context.self->map, *reference.pointer.gm_tensor, context.task_id);
-    } else {
-        InsertTensor(context.self->map, *reference.pointer.local_tensor, context.task_id);
+        return InsertTensor(context.self->map, *reference.pointer.gm_tensor, context.task_id);
     }
+    return InsertTensor(context.self->map, *reference.pointer.local_tensor, context.task_id);
 }
 
-PA_DEVICE void RegisterOutputs(SubmitContext &context, const TaskArgs &args, bool include_existing) {
+PA_DEVICE bool RegisterOutputs(SubmitContext &context, const TaskArgs &args, bool include_existing) {
     // register_mask 只覆盖 Inout/OutputExisting。新 Output 已带本次 owner；现有
     // backing buffer 的新写者则必须登记到本 worker TensorMap，供后继 task 查 hazard。
     if (!include_existing) {
-        return;
+        return true;
     }
     uint32_t register_mask = context.register_mask;
     for (uint32_t index = 0; register_mask != 0; ++index, register_mask >>= 1) {
         if ((register_mask & 1U) != 0) {
-            InsertExistingTensor(context, args, static_cast<int32_t>(index));
+            if (!InsertExistingTensor(context, args, static_cast<int32_t>(index))) {
+                return false;
+            }
         }
     }
+    return true;
 }
 
 PA_DEVICE uint64_t FrontendAlignUp(uint64_t value, uint64_t alignment) {

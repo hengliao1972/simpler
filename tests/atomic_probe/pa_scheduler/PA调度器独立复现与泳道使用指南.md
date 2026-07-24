@@ -16,7 +16,8 @@
 - Alloc 由 96 个 worker 竞争，QK/PV 由 32 个 AIC 竞争，SF/UP 由 64 个 AIV 竞争；
 - 4 路 Alloc/cube/vector Claim cursor，以及实际 `atomicMax` Claim；
 - PA 的 TaskArgs、Tensor、TaskPayload、DistSubmitCtx、DistCore/DistGlobal 关键 ABI 布局；
-- tensor tag 扫描、输出 layout、materialize、TensorMap retire/lookup/insert、register mask；
+- tensor tag 扫描、输出 layout、materialize、private TensorMap 有界桶环的
+  retire/lookup/insert、register mask；
 - fanin 收集、winner/loser、Replay、私有 ring slot 构造和 tensor/scalar payload 拷贝；
 - EfDrain、WaitForSlot、HeapGuard、completion flag、vend、frontier、最终 drain；
 - 与真实 PA 相同的单 lane 优化：Case1 不执行 BlockWon 轮询；
@@ -238,7 +239,8 @@ benchmark 运行时参数；省略时默认 `private`。它与 `swimlane`/
 swimlane 两件套和 submit-pmu 四件套都必须通过 manifest 的模式、变体、
 阶段和 SHA256 校验，才能启动 host。
 
-当前 S0 只完成模式边界，真正的 shared backend 尚未接入。此时显式构建
+当前已完成 S0 构建身份和 S1 private ring；真正的 shared backend 尚未接入。
+此时显式构建
 `--tensormap shared` 会在编译期明确失败，且不会生成可执行文件；这是为了
 禁止“目录名为 shared、实际仍执行 private”的误导性结果。完成 shared
 协议的阶段会删除这道临时门禁，但保留相同的构建身份和产物隔离。
@@ -247,6 +249,41 @@ S0 还修复了一处独立问题：旧 CCEC PMU 配置以
 `RunConfig::reserved[4]` 访问只有四项的数组，越界落入相邻 winner workload。
 现在 PMU mode、work amount、寄存器表地址和 magic 位于独立的 64B
 `PmuProbeConfig`，不再占用 `RunConfig` 尾部或覆盖业务配置。
+
+### 4.1 当前 private TensorMap：128×128 有界桶环
+
+S1 已把 standalone private TensorMap 从旧的 bucket linked map 同构为
+ring-per-bucket，但没有同时改构参、heap、output ref 或真实 simpler runtime：
+
+- 128 个 hash bucket，每桶 128 个连续 `MapEntry`，总容量仍为 16,384；
+- 每桶使用普通 `uint64_t head/tail`，因为 map 仍由单 worker 独占，不使用
+  atomic、per-slot `seq`、flush 或 invalidate；
+- `MapEntry` 仍为 48 bytes，前 32 bytes 保存
+  `(buffer_addr, lo, hi, producer)`，后 16 bytes 只保留 ABI，不提前塞入
+  shared 发布状态；
+- `TensorMap` 仍为 823,312 bytes，`WorkerState` 仍为 9,231,296 bytes；
+  `WorkerState::map`、后续 ring slot 以及 payload 的 size/offset 均未移动；
+- `AdvanceTensorMap()` 用 1,024 项 `task_entry_counts` 精确推进
+  `alive_floor/cleaned_upto` 并扣减 `live_count`；桶的物理 `head` 在下一次
+  lookup/insert 触达该桶时由 `RetireBucket()` 惰性推进，避免每个 task
+  固定扫描 128 个桶；
+- lookup 扫描该桶 `[head, tail)` 内全部合法槽，只接受
+  `producer >= alive_floor` 的重叠区间，并返回最大的 producer；
+- insert、existing insert 和 Register 均返回成功状态。满桶时不覆写 live
+  槽、不推进 tail，Submit 把失败发布为 fatal 并终止，不能静默漏掉依赖。
+
+PA Case1 在 `H=64` 下全 map 最多保留 52 个 live entry，所以当前每桶 128
+槽有充分余量；这只证明当前 Case1，不是任意任务图的通用定容结论。shared
+模式仍需自己的并发发布、时序过滤、reclaim 与容量证明。
+
+独立 ring 自测覆盖半开区间、最新 producer、`alive_floor` 边界、跨
+`task_entry_counts` 多次回绕、满桶不覆写以及固定种子 differential，并通过
+ASan/UBSan。CPU b1、CPU b256 的完整调度断言和 CCEC private 三镜像编译也已
+通过。A5 本轮使用 CCEC private、关闭泳道、`real-compute`；b1 的 S0/S1
+来自同一构建变体，Submit host span median 分别为 64.173/61.666 us。样本
+太小，只能说明没有观察到回退，不能声称 2.507 us 是稳定收益。S1 b256
+同口径单次为 3,862.246 us，只作协议和规模回归记录，不是性能基线，也不
+替代后续配对多轮性能验证。
 
 ## 5. 使用说明：运行、测量与泳道查看
 

@@ -911,8 +911,10 @@ PA_DEVICE bool FinishCallbackSubmitBody(
     }
 
     BeginSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(pmu_context);
-    RegisterOutputs(context, args, kind != TaskKind::Alloc);
-    if (kind != TaskKind::Alloc) stats.result.map_inserts += CountBits(context.register_mask);
+    const bool registered = RegisterOutputs(context, args, kind != TaskKind::Alloc);
+    if (registered && kind != TaskKind::Alloc) {
+        stats.result.map_inserts += CountBits(context.register_mask);
+    }
     EndSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(pmu_context);
     const uint64_t register_end = TraceTimestamp<Ops>(stats.trace, stats.result);
     WriteTrace<Profile>(
@@ -920,6 +922,13 @@ PA_DEVICE bool FinishCallbackSubmitBody(
         TracePhase::Register, ProfilePhase::Register,
         register_begin, register_end, 0, kind == TaskKind::Alloc ? 0U : 1U
     );
+    if (!registered) {
+        // 固定桶容量不足时，InsertTensor 没有覆写任何 live 槽。沿用现有
+        // fatal 广播终止所有 worker，禁止像旧 linked map 一样静默漏登记
+        // hazard、随后带着不完整 fanin 继续执行。
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
 
     if (__builtin_expect(winner, 0)) {
         const uint64_t winner_build_begin = register_end;
@@ -1081,11 +1090,9 @@ PA_DEVICE bool SubmitCallbackTask(
 }
 
 PA_DEVICE uint32_t CountLiveMapEntries(PA_GM const TensorMap &map) {
-    uint32_t free_entries = 0;
-    for (int32_t current = map.free_head; current >= 0; current = map.entries[current].next_in_bucket) {
-        ++free_entries;
-    }
-    return static_cast<uint32_t>(map.high_water) - free_entries;
+    // AdvanceTensorMap 按 producer 精确维护 logical live_count；各桶 head
+    // 允许惰性落后，不能再通过遍历物理槽推导逻辑存活数。
+    return map.live_count;
 }
 
 template <typename Ops>

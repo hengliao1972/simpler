@@ -94,9 +94,22 @@ constexpr uint32_t kMaxTaskScalars = 16;
 constexpr uint32_t kPayloadSlots = 2048;
 constexpr uint32_t kPayloadMask = kPayloadSlots - 1;
 constexpr uint32_t kPayloadStride = 4096;
-constexpr uint32_t kMapCapacity = 16384;
-constexpr uint32_t kMapBuckets = 1 << 13;
-constexpr uint32_t kMapBucketShift = 13;
+// private/shared 最终统一为 ring-per-bucket。S1 先在 private standalone
+// 验证无原子版本：128 个桶，每桶 128 个连续槽，容量仍与旧 linked map
+// 完全相同。PA Case1 在 H=64 的窗口内全 map 最多只有 52 个 live entry，
+// 因而单桶最坏聚集也小于 128；这个证明只适用于当前 Case1，不能据此
+// 把 128 当成任意任务图的通用容量。
+constexpr uint32_t kMapBuckets = 128;
+constexpr uint32_t kMapBucketCapacity = 128;
+constexpr uint32_t kMapCapacity = kMapBuckets * kMapBucketCapacity;
+constexpr uint32_t kMapBucketShift = 7;
+constexpr uint32_t kMapBucketMask = kMapBuckets - 1;
+constexpr uint32_t kMapBucketSlotMask = kMapBucketCapacity - 1;
+constexpr uint32_t kPaCase1MapEntriesPerBatch = 4;
+constexpr uint32_t kPaCase1MaxLiveMapBatches =
+    (kHeapWindow + 1 + kTasksPerBatch - 1) / kTasksPerBatch;
+constexpr uint32_t kPaCase1MaxLiveMapEntries =
+    kPaCase1MapEntriesPerBatch * kPaCase1MaxLiveMapBatches;
 constexpr uint32_t kTaskWindow = 1 << 10;
 constexpr uint32_t kTaskWindowMask = kTaskWindow - 1;
 constexpr uint64_t kSystemCounterHz = 1000000000ULL;
@@ -123,6 +136,17 @@ constexpr size_t kRealReplayDoneOffset = 10043776;
 constexpr size_t kRealStartedCountOffset = 10043840;
 constexpr uint32_t kTraceRecordsPerCore = 1U << 16;
 static_assert((kPayloadSlots & kPayloadMask) == 0, "payload slots must be a power of two");
+static_assert((kMapBuckets & kMapBucketMask) == 0, "map bucket count must be a power of two");
+static_assert(
+    (kMapBucketCapacity & kMapBucketSlotMask) == 0,
+    "map bucket capacity must be a power of two"
+);
+static_assert(kMapCapacity == 16384, "private ring must preserve the old map capacity");
+static_assert(
+    kPaCase1MaxLiveMapEntries <= kMapBucketCapacity,
+    "PA Case1 worst-case bucket occupancy exceeds private ring capacity"
+);
+static_assert(kTaskWindow > kHeapWindow, "task counters must retire before their slot is reused");
 static_assert(kMaxTasks < kTaskCellCapacity, "every frontier scan must terminate on an in-range not-ready flag");
 
 // These are the measured means from the best PA A5 trace, in 1 GHz ticks.
@@ -637,32 +661,46 @@ struct MapEntry {
     uint64_t lo;
     uint64_t hi;
     int32_t producer;
-    int32_t bucket;
-    int32_t next_in_bucket;
-    int32_t prev_in_bucket;
-    int32_t next_in_task;
+    uint32_t payload_padding;
+    // 末 16B 只为保持 standalone/真实 PA 的既有 48B entry ABI。本阶段
+    // private ring 不需要 seq，也不能提前把 shared 发布协议塞进保留区。
+    uint8_t abi_reserved[16];
 };
-// 同一 entry 同时挂在两条链上：bucket 链按 buffer 地址查询重叠区间，task 链按
-// producer 批量退休。next_in_bucket 在空闲状态下复用为 free-list 链接。
+// bucket 与槽下标都由外层 ring 的连续布局隐式给出，不再保存 next/prev 指针。
 static_assert(sizeof(MapEntry) == 48, "MapEntry must match the PA tensor-map entry ABI");
+static_assert(alignof(MapEntry) == 8, "MapEntry alignment changed");
 static_assert(offsetof(MapEntry, producer) == 24, "MapEntry producer offset mismatch");
-static_assert(offsetof(MapEntry, next_in_task) == 40, "MapEntry task-link offset mismatch");
+static_assert(offsetof(MapEntry, abi_reserved) == 32, "MapEntry ABI reserve offset mismatch");
 
 struct TensorMap {
     MapEntry entries[kMapCapacity];
-    int32_t buckets[kMapBuckets];
-    int32_t task_heads[kTaskWindow];
-    int32_t free_head;
-    int32_t high_water;
+    // private map 由单 worker 访问，head/tail 都是普通单调整数；槽地址为
+    // bucket*kMapBucketCapacity + (cursor & kMapBucketSlotMask)。
+    uint64_t bucket_heads[kMapBuckets];
+    uint64_t bucket_tails[kMapBuckets];
+    // 复用旧 buckets[8192] 所占的 32 KiB，使下方逐 task 计数与控制字
+    // 继续落在旧 task_heads/尾部控制区，减小 standalone ABI 扰动。
+    uint8_t abi_reserved[30720];
+    // producer 退休时据此精确扣减 logical live_count；物理 bucket head
+    // 则由访问该桶时的 RetireBucket 惰性推进。
+    uint32_t task_entry_counts[kTaskWindow];
+    uint32_t live_count;
+    uint32_t high_water;
     int32_t alive_floor;
     int32_t cleaned_upto;
 };
-// TensorMap 是 worker 私有状态，不在多核间共享。alive_floor 表达查询存活下界，
-// cleaned_upto 表达已物理摘链的进度；即使 Case1 中通常同步推进，也不能合并其 ABI 字段。
+// alive_floor 是 lookup 的权威存活下界；cleaned_upto 表示逐任务计数已
+// 精确扣减到哪里。桶头可以因惰性退休暂时落后，但不会改变逻辑 live 数。
 static_assert(sizeof(TensorMap) == 823312, "TensorMap must match the PA fixed-capacity layout");
-static_assert(offsetof(TensorMap, buckets) == 786432, "TensorMap bucket offset mismatch");
-static_assert(offsetof(TensorMap, task_heads) == 819200, "TensorMap task-head offset mismatch");
-static_assert(offsetof(TensorMap, free_head) == 823296, "TensorMap control offset mismatch");
+static_assert(alignof(TensorMap) == 8, "TensorMap alignment changed");
+static_assert(offsetof(TensorMap, bucket_heads) == 786432, "TensorMap head offset mismatch");
+static_assert(offsetof(TensorMap, bucket_tails) == 787456, "TensorMap tail offset mismatch");
+static_assert(offsetof(TensorMap, abi_reserved) == 788480, "TensorMap reserve offset mismatch");
+static_assert(offsetof(TensorMap, task_entry_counts) == 819200, "TensorMap task-count offset mismatch");
+static_assert(offsetof(TensorMap, live_count) == 823296, "TensorMap live-count offset mismatch");
+static_assert(offsetof(TensorMap, high_water) == 823300, "TensorMap high-water offset mismatch");
+static_assert(offsetof(TensorMap, alive_floor) == 823304, "TensorMap alive-floor offset mismatch");
+static_assert(offsetof(TensorMap, cleaned_upto) == 823308, "TensorMap cleaned offset mismatch");
 
 struct TaskPayload {
     TensorDesc tensors[kMaxTaskTensors];

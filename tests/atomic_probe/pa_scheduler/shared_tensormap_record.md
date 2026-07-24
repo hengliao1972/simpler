@@ -702,15 +702,28 @@ writer intent 的实现需要在开发前明确二选一：
 
 ### 阶段 S1：standalone private map 先同构为 ring
 
-- 保持 `TensorMap`、`WorkerState` 和真实 private DistCore 的既有 size/offset；
-- 把 private linked map 改为文档第 12 章的 ring-per-bucket；
+**状态：已完成。**
+
+- 保持 `TensorMap=823312 B`、`WorkerState=9231296 B`，并保持 standalone
+  private DistCore 中 map、ring slot 和 payload 的既有 size/offset；
+- 把 private linked map 改为 128 buckets × 128 slots 的
+  ring-per-bucket，总 entry 容量仍为 16,384；
+- `MapEntry` 保持 48 B，后 16 B 只作 ABI 保留，本阶段不引入 shared seq；
 - private 仍然每 worker 独占，不引入 atomic，不同时改构参、heap 或输出引用；
-- 用统一的逻辑记录
-  `(buffer_addr, lo, hi, producer)` 作为后续 private/shared 对比口径。
+- 每桶 `head/tail` 为普通 `uint64_t`；`AdvanceTensorMap` 用逐 task 精确计数
+  推进 logical live window，`RetireBucket` 在该桶下一次 lookup/insert 时
+  惰性推进物理 head；
+- lookup 扫描全部合法槽并取最大 producer，保留
+  `producer >= alive_floor` 边界；
+- 用统一的逻辑记录 `(buffer_addr, lo, hi, producer)` 作为后续
+  private/shared 对比口径；
+- insert/register 逐层返回 bool；满桶不覆写、不推进 tail，由 Submit 发布
+  fatal，禁止静默漏依赖。
 
 **Gate**：逐 task fanin 与旧 private 一致；Case1 保持每 batch 5 条 fanin、
 每 worker 每 batch 4 次 region insert；定向覆盖窗口边界、同地址区间重叠、
-retire、容量耗尽和复用；容量不足必须显式失败，不能静默漏依赖。
+retire、容量耗尽和复用；容量不足必须显式失败，不能静默漏依赖。当前这些
+检查均已通过，详细验证记录见第 15 节。
 
 ### 阶段 S2：standalone shared 有序 ring
 
@@ -887,5 +900,60 @@ workload 没触发协议边界，不能说明 shared TensorMap 已经具备可�
 | `git diff --check` | PASS |
 
 本阶段没有运行 A5/A5sim。S0 不改变 TensorMap 算法，也不声称有性能收益；
-CCEC 编译只证明三镜像能够用同一模式构建。下一阶段 S1 才会在 private
-standalone 中把 linked map 同构为 ring-per-bucket。
+CCEC 编译只证明三镜像能够用同一模式构建。S1 已在后续阶段中完成，
+见下节。
+
+### 2026-07-24：S1 standalone private ring-per-bucket
+
+本阶段仍只修改 `tests/atomic_probe/pa_scheduler`，没有修改
+`src/a5/runtime/fully_distributed_within_core`、真实 PA 或其他 simpler
+runtime 路径。
+
+实现布局：
+
+| 项目 | S1 布局或语义 |
+| ---- | ---- |
+| bucket / slot | 128 buckets × 128 slots，总容量 16,384 |
+| `MapEntry` | 48 B；前 32 B 为 region + producer，后 16 B 仅 ABI 保留 |
+| `TensorMap` | 823,312 B，保持原 size |
+| `WorkerState` | 9,231,296 B，map/slot/payload 后续 offset 不变 |
+| private 并发纪律 | 单 worker 独占；普通 `uint64_t head/tail`，无 atomic/seq |
+| 逻辑回收 | `task_entry_counts[1024]` 精确维护 `live_count`，同步推进 `alive_floor/cleaned_upto` |
+| 物理回收 | lookup/insert 访问桶时执行 lazy `RetireBucket` |
+| lookup | 扫描全部合法槽，过滤 `producer < alive_floor`，取最大重叠 producer |
+| overflow | bool 逐层返回；不覆写、不推进 tail，Submit 设置 fatal |
+
+保持整个 `TensorMap` 大小的同时，head/tail 放在旧 entries 后；30 KiB ABI
+保留区让 `task_entry_counts` 继续位于旧 `task_heads` offset，四个控制字仍
+位于原尾部 16 B。shared 所需的 per-slot seq 没有借用 `MapEntry` 保留区，
+避免尚未验证的并发协议污染 private 基线。
+
+`H=64` 的 PA Case1 最多只有 52 个 logical live entry，因此当前每桶 128
+槽不会溢出；这个上界只服务当前 Case1。通用图和 shared 模式仍必须根据活跃
+跨度单独证明容量，不能把本结论外推为固定配置。
+
+验证结果：
+
+| 检查 | 结果 |
+| ---- | ---- |
+| private ring 独立 ABI/区间/retire/wrap/overflow/differential | PASS |
+| 独立测试 ASan/UBSan | PASS |
+| CPU private build + PollBatch 自测 | PASS |
+| CPU private b1 smoke 全部调度语义断言 | PASS |
+| CPU private b256、零计算、关闭泳道的完整语义回归 | PASS |
+| CCEC private swimlane 三镜像、mixed ELF 与 manifest 编译 | PASS |
+| `git diff --check` | PASS |
+
+A5 本轮均使用 CCEC private、关闭泳道、`real-compute`。两组 b1 来自同一
+构建变体，比较 Submit host span；这些小样本只用于检查明显回退：
+
+| 样本 | `submit_span_us` |
+| ---- | ----: |
+| S0 b1 median | 64.173 |
+| S1 b1 median | 61.666 |
+| S1 b256 单次 | 3,862.246 |
+
+b1 只有小样本，2.507 us 差值不能解释成稳定性能收益；当前只能得出
+private ring 没有表现出回退。b256 只作协议和规模回归记录，不是性能基线。
+后续是否保留性能结论仍由相同 ELF 口径的多轮配对测试决定，不能与带泳道、
+submit-pmu 或真实 PA 的绝对时间直接相减。

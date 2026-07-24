@@ -1196,7 +1196,9 @@ inline Metrics Validate(
         }
     }
     // TensorMap 只保留 heap window 内仍可能被依赖的四类输出；floor 对应已安全退休的 task 边界。
-    const uint64_t expected_map_live = 4ULL * std::min<uint32_t>(batches, 13);
+    const uint64_t expected_map_live =
+        static_cast<uint64_t>(kPaCase1MapEntriesPerBatch) *
+        std::min<uint32_t>(batches, kPaCase1MaxLiveMapBatches);
     const uint64_t expected_map_floor = task_count > kHeapWindow + 1 ? task_count - kHeapWindow - 1 : 0;
 
     for (uint32_t index = 0; index < kWorkers; ++index) {

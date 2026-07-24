@@ -57,6 +57,22 @@ echo "[BUILD] atomic PollBatch boundary self-test"
 echo "[TEST] atomic PollBatch boundary self-test"
 "$BUILD_DIR/test_atomic_poll_batch"
 
+# private ring 的独立回归不启动 96 个 worker，也不运行模拟 kernel；它直接
+# 实例化 common/ 中的同一份 TensorMap API，覆盖每桶容量、回收回绕和逐操作
+# reference 差分。shared 模式后续有自己的并发/发布测试，不复用这套单线程纪律。
+if [[ "$TENSORMAP_MODE" == "private" ]]; then
+    echo "[BUILD] private TensorMap ring self-test"
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=0 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/common/test_private_tensor_map_ring.cpp" \
+        -o "$BUILD_DIR/test_private_tensor_map_ring"
+
+    echo "[TEST] private TensorMap ring self-test"
+    "$BUILD_DIR/test_private_tensor_map_ring"
+fi
+
 # set -e 保证编译或链接失败时不会打印 complete，也不会在组合构建中继续
 # 后续步骤；只有成功退出的构建才被本脚本声明为可运行产物。
 echo "[BUILD] complete: $BUILD_DIR/pa_scheduler_cpu"
