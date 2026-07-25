@@ -4,9 +4,9 @@
 [`poursoul/simpler:fdwic-shared-tensormap`](https://github.com/poursoul/simpler/tree/fdwic-shared-tensormap)
 在 A5 FDWIC runtime 中实现的 shared TensorMap 方案，并与当前分支 standalone
 方案比较。本文用于后续开发决策，不表示目标分支已经合入，也不把分支文档中的
-实验记录自动当成当前分支的性能结论；当前分支 S0～S4.14b 的实际实施证据及
-S4.15a 候选的测量前登记另记于第 15 节。当前继续开发和验收的后端范围固定为
-CPU/CCEC。
+实验记录自动当成当前分支的性能结论；当前分支 S0～S4.14b 的保留结果及
+S4.15a 的正确性成立、性能否决记录另记于第 15 节。当前有效 shared
+性能基线仍为 `ee42b8c1`，继续开发和验收的后端范围固定为 CPU/CCEC。
 
 后续每个实现小步都必须先对照参考提交：可直接复用的机制要说明复用位置；
 有意不同的顺序、ABI、失败语义或性能取舍要在本文记录证据和复核条件，不能只
@@ -3661,7 +3661,7 @@ Cube `4→8`，不能扩张 production-prefix `cube_cursor[4]` 并移动真实
 ABI；应先仿照 S4.14a 在 shared-only sidecar 追加容量 8、active 仍为 4
 的 Cube cursor 做迁址对照，再在同址下只改 active 4→8。
 
-### 2026-07-25：S4.15a shared Cube cursor 迁址对照预登记
+### 2026-07-25：S4.15a shared Cube cursor 迁址对照与性能否决
 
 #### 单一变量与布局边界
 
@@ -3798,6 +3798,71 @@ S4.15a 已按上述单一变量完成实现，提交前门禁结果如下：
 outputs/pa_scheduler_shared_swimlane_20260725_170632_2702522/ccec/
 ```
 
-至此正确性门禁闭合，可以形成独立实现提交并冻结 perf-clock ELF。
-S4.15a 是否保留仍只由预登记的 b256 六/十二区组配对决定；上述 b1
-数值和泳道记录不得提前充当性能结论。
+至此正确性门禁闭合，候选形成历史提交 `bab00e30` 并冻结 perf-clock
+ELF。上述 b1 数值和泳道记录只证明迁址候选正确、可运行；是否保留仍
+只由预登记的 b256 六/十二区组配对决定。
+
+#### 冻结配对结果与回退决定
+
+`bab00e30` 相对当前基线 `ee42b8c1` 各预热两次，再执行六个交替
+ABBA/BAAB 区组、每版 12 个独立正式进程。差值统一为候选减基线：
+
+| 区组 | 差值 | 百分差 |
+| ---: | ---: | ---: |
+| 1 | +18.115us | +0.767% |
+| 2 | +22.476us | +0.958% |
+| 3 | +8.667us | +0.367% |
+| 4 | +22.822us | +0.972% |
+| 5 | +7.505us | +0.319% |
+| 6 | -5.291us | -0.223% |
+| 配对中位数 | **+13.391us** | **+0.567%** |
+
+候选只有 1/6 区组更快，且配对百分差中位数 `>=+0.2%`。这精确命中
+测量前登记的首轮撤销条件“`0～2/6` 更快且中位数
+`>=+0.2%`”，因此不追加第二轮六区组，不在看到结果后放宽门槛。
+
+四个 warm-up 加 24 个正式样本共 28 个独立进程，每份日志均有 42 条
+PASS 断言，并统一满足：
+
+- ClaimMax=73,728、active workers=96、RingBp=0；
+- 依赖边 1,280、签名 `b7d985d6edb07078`，QK/SF/PV/UP 各 256；
+- `global_end_tick - global_start_tick == global_span_ticks`，SYS_CNT
+  与输出微秒值精确闭合；
+- execution、semantic、postprocess 和 real-compute 输出全部通过。
+
+候选没有通过少做后续工作制造差值。基线到候选的正式样本中位数变化为：
+
+| 辅助指标 | `ee42b8c1` | `bab00e30` | 变化 |
+| --- | ---: | ---: | ---: |
+| fanin loads | 38,522 | 39,012 | +490 / +1.272% |
+| fanin ready | 6,064 | 6,200 | +136 |
+| fanin not-ready | 32,460 | 32,814.5 | +354.5 |
+| CAS retries | 0 | 0 | 0 |
+| EfDrain / RingBp / FinalDrain | 996 / 0 / 28 | 996 / 0 / 28 | 中位数不变 |
+
+这些计数只说明任务量和 placement 没有缩减，不能单独解释
+`+13.391us`。两版 shared perf-clock 的 `.text` 同为 129,080B，
+但有 65,665 个字节位置不同；`.rodata` 同为 288B 且逐字节一致。
+尾部 state 增长、`scheduler_state_size` 常量和 CCEC 静态布局会共同
+改变执行节，因此本次只能评价“shared Cube 四分片迁址候选整体”，
+不能把回退或某一项 fanin 变化直接等同为 atomic 硬件延迟。
+
+完整证据位于：
+
+```text
+outputs/perf_clock_freeze_bab00e30_20260725_170929/
+outputs/perf_clock_pair_bab00e30_vs_ee42b8c1_20260725_171005/
+```
+
+`bab00e30` 作为正确但性能未过门槛的历史实现提交保留；随后撤销其
+source、ABI、测试和当前行为描述。当前有效 baseline 仍为 S4.14b
+`ee42b8c1`，当前布局恢复为：
+
+- sidecar 4,736,192B，CPU non-split `SchedulerState`
+  1,011,852,160B，CCEC split `SchedulerState` 1,011,858,304B；
+- Cube/Alloc 使用 production-prefix 四分片；
+- shared Vector 使用 sidecar 八分片，private 继续使用 prefix
+  Vector 四分片。
+
+由于迁址对照已经被首轮门槛否决，不再在其上叠加 Cube 同址
+`4→8`；后续若重启 Cube 方向，必须提出新的单变量方案并重新预登记。

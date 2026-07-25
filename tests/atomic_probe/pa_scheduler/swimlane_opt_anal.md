@@ -391,16 +391,15 @@ Submit 的 task kind 给其中 Kernel 归类会得到错误结论，必须使用
 Claim 先根据 task kind 生成 active role，再选择对应 cursor shard：
 
 - Alloc 使用 production-prefix `alloc_cursor[4]`；
-- private QK/PV 使用 production-prefix `cube_cursor[4]`；
-- 当前 S4.15a shared QK/PV 使用 sidecar 中容量 8、active 4 的
-  `shared_cube_cursor[8]`，仍按 `task_id%4` 路由；
+- QK/PV 使用 production-prefix `cube_cursor[4]`；
 - private SF/UP 使用 production-prefix `vector_cursor[4]`；
 - 当前 shared SF/UP 使用 sidecar 中全部 8 个 active shard：
   `shared_vector_cursor[8]`。
 
-S4.15a 只改变 shared Cube cursor 的物理位置，不改变 QK/PV 的
-32 核竞争面、四分片映射或 atomic 次数；旧 prefix Cube 在 shared
-模式不再访问，private、Vector8 和 Alloc4 路由保持不变。
+S4.15a 历史候选曾把 shared Cube 四分片迁到 sidecar，但六区组
+性能门槛未通过并已撤销；它不属于当前 Claim 路由。当前 private/shared
+的 Cube 和 Alloc 均继续使用 production prefix，只有 shared Vector
+使用 sidecar。
 
 符合 role 的 worker 对 cursor 执行 `atomicMax(task_id)`。返回旧值小于当前
 task id 的唯一竞争者获胜；其他参与者是 attempted loser，不符合 role 的核是

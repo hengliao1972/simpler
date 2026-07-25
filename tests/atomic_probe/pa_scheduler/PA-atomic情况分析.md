@@ -7,8 +7,8 @@ Submit 路径，供后续继续优化。真实 PA 生产快照日期为 2026-07-
 保留的生产优化基线为 `2c3dd1e2`，F1 负结果记录提交为 `c93c3666`。
 standalone 已完成 2026-07-25 的 S4.14b；shared Vector cursor
 四分片迁址和同址八分片均通过冻结 ELF 配对门槛，当前 standalone
-shared 性能基线为 `ee42b8c1`。S4.15a 正在以该基线预登记 shared
-Cube 四分片迁址对照，尚无性能结论。
+shared 性能基线为 `ee42b8c1`。S4.15a shared Cube 四分片迁址虽然
+正确性闭合，但配对中位数回退 `+0.567%`，已按预登记门槛撤销。
 
 范围限定为：
 
@@ -2257,7 +2257,7 @@ outputs/perf_clock_pair_ee42b8c1_vs_e24e579c_20260725_163800/
 outputs/perf_clock_pair_ee42b8c1_vs_e8320280_20260725_164329/
 ```
 
-#### 7.5.27 S4.15a shared Cube 四分片迁址对照预登记
+#### 7.5.27 S4.15a shared Cube 四分片迁址对照与性能否决
 
 S4.15a 不直接扩张 production-prefix `cube_cursor[4]`，而是在现有
 shared-only sidecar 尾部追加容量 8、active 仍为 4 的
@@ -2294,5 +2294,32 @@ S4.15a 节。本节不改写 S4.14a/S4.14b 的既有结果，也不提前把迁�
 A5 shared b1 perf-clock/合并 atomic 泳道。最新 b1 泳道 raw 为
 4,154 条、dropped=0；其中 ClaimMax 精确 288 次，AIC 的
 Alloc/QK/PV 与两个 AIV lane 的 Alloc/SF/UP 均各 32 次，全部
-`flags=0x53`。这些结果只证明迁址没有改变调用总量、role 分流和
-return-ready 语义；是否保留仍待冻结 b256 配对。
+`flags=0x53`。候选以历史提交 `bab00e30` 保留这些正确性证据。
+
+冻结 b256 配对的六个区组差值为
+`+18.115/+22.476/+8.667/+22.822/+7.505/-5.291us`，候选只有
+1/6 区组更快；配对中位数为 **+13.391us/+0.567%**。它命中预登记的
+首轮撤销条件“中位数 `>=+0.2%` 且仅 `0～2/6` 更快”，所以不追加
+第二轮，直接撤销 S4.15a。
+
+四个 warm-up 与 24 个正式样本共 28 个独立进程，每份均有 42 条
+PASS 断言；ClaimMax=73,728、active workers=96、RingBp=0、依赖签名
+`b7d985d6edb07078`、SYS_CNT 首末差和全部业务语义均闭合。基线到
+候选的 fanin loads 中位数为 `38,522→39,012`（`+490/+1.272%`），
+ready 为 `6,064→6,200`，not-ready 为 `32,460→32,814.5`；
+CAS retries 均为 0，EfDrain/RingBp/FinalDrain placement 中位数均为
+`996/0/28`，没有通过少做工作制造差值。
+
+两版 `.text` 同为 129,080B，但有 65,665 个字节位置不同；
+`.rodata` 同为 288B 且逐字节一致。state 大小常量和编译布局同时
+变化，因此只能否决“Cube 迁址候选整体”，不能把差值解释成单条
+atomic 的纯硬件延迟。证据位于：
+
+```text
+outputs/perf_clock_pair_bab00e30_vs_ee42b8c1_20260725_171005/
+```
+
+随后回退候选 source、ABI 和测试，当前 baseline 仍为 `ee42b8c1`：
+Cube/Alloc 使用 production-prefix 四分片，shared Vector 使用 sidecar
+八分片。S4.15a 正确性成立的历史提交和取证保留，但不得再描述成当前
+布局或性能收益。

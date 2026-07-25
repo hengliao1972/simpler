@@ -272,11 +272,6 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     for (uint32_t shard = 0; shard < kSharedVectorCursorCapacity; ++shard) {
         state->shared_map.shared_vector_cursor[shard].value = -1;
     }
-    // S4.15a 的 Cube cursor 与 Vector cursor 分处独立 cache line，
-    // 同样用 -1 表示尚未 Claim 任一 QK/PV task。
-    for (uint32_t shard = 0; shard < kSharedCubeCursorCapacity; ++shard) {
-        state->shared_map.shared_cube_cursor[shard].value = -1;
-    }
 #endif
     state->heap_window = kHeapWindow;
     state->heap_base = kSyntheticHeapBase;
@@ -340,7 +335,7 @@ inline constexpr size_t ResultBytes() { return sizeof(WorkerResult) * kWorkers; 
 
 inline constexpr size_t SharedSidecarBytes() { return sizeof(SharedTensorMapSidecar); }
 #if PTO_FDWIC_SHARED_MAP
-static_assert(SharedSidecarBytes() == 4736704, "shared TensorMap transfer size changed");
+static_assert(SharedSidecarBytes() == 4736192, "shared TensorMap transfer size changed");
 #else
 static_assert(SharedSidecarBytes() == 2113664, "private TensorMap transfer size changed");
 #endif
@@ -2623,17 +2618,10 @@ inline Metrics Validate(
         &metrics
     );
 
-    // private 三类 Claim cursor 均为 production-prefix 四分片。shared
-    // Vector 启用 sidecar 的全部八条物理线；S4.15a 将 Cube 迁到
-    // capacity=8、active=4 的 sidecar，Alloc 仍保留在 prefix。
-    // 逐 task 重新推导每条物理 cursor 的最终高水位。
-#if PTO_FDWIC_SHARED_MAP
-    int64_t expected_cube[kSharedCubeCursorCapacity] = {
-        -1, -1, -1, -1, -1, -1, -1, -1
-    };
-#else
+    // private 三类 Claim cursor 均为 production-prefix 四分片。S4.14b
+    // shared Vector 启用 sidecar 的全部八条物理线；Cube/Alloc 保持
+    // 不变。逐 task 重新推导每条物理 cursor 的最终高水位。
     int64_t expected_cube[kCursorShards] = {-1, -1, -1, -1};
-#endif
 #if PTO_FDWIC_SHARED_MAP
     int64_t expected_vector[kSharedVectorCursorCapacity] = {
         -1, -1, -1, -1, -1, -1, -1, -1
@@ -2647,11 +2635,7 @@ inline Metrics Validate(
         if (kind == TaskKind::Alloc) {
             expected_alloc[task_id % kCursorShards] = task_id;
         } else if (kind == TaskKind::Qk || kind == TaskKind::Pv) {
-#if PTO_FDWIC_SHARED_MAP
-            expected_cube[task_id % kSharedCubeCursorShards] = task_id;
-#else
             expected_cube[task_id % kCursorShards] = task_id;
-#endif
         } else {
 #if PTO_FDWIC_SHARED_MAP
             expected_vector[task_id % kSharedVectorCursorShards] =
@@ -2663,12 +2647,11 @@ inline Metrics Validate(
     }
     bool cursors_ok = true;
     for (uint32_t shard = 0; shard < kCursorShards; ++shard) {
+        cursors_ok &= state.cube_cursor[shard].value == expected_cube[shard];
 #if PTO_FDWIC_SHARED_MAP
-        // shared Cube/Vector 均不应再触碰旧 production-prefix cursor。
-        cursors_ok &= state.cube_cursor[shard].value == -1;
+        // shared Vector 不应再触碰旧 production-prefix vector cursor。
         cursors_ok &= state.vector_cursor[shard].value == -1;
 #else
-        cursors_ok &= state.cube_cursor[shard].value == expected_cube[shard];
         cursors_ok &= state.vector_cursor[shard].value == expected_vector[shard];
 #endif
         cursors_ok &= state.alloc_cursor[shard].value == expected_alloc[shard];
@@ -2678,11 +2661,6 @@ inline Metrics Validate(
         cursors_ok &=
             state.shared_map.shared_vector_cursor[shard].value ==
                 expected_vector[shard];
-    }
-    for (uint32_t shard = 0; shard < kSharedCubeCursorCapacity; ++shard) {
-        cursors_ok &=
-            state.shared_map.shared_cube_cursor[shard].value ==
-                expected_cube[shard];
     }
 #endif
     Expect(cursors_ok, "all sharded Claim cursors reach their exact final task", &metrics);
