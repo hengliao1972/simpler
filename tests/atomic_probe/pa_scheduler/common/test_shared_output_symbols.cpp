@@ -133,18 +133,6 @@ struct ExpiredWaitOps : SymbolTestOps {
 
 std::atomic<uint64_t> ExpiredWaitOps::calls{0};
 
-struct DrainFailureOps : SymbolTestOps {
-    static uint64_t kernel_calls;
-
-    static void ExecuteKernel(
-        SchedulerState *, WorkerState &, TaskKind, uint32_t
-    ) {
-        ++kernel_calls;
-    }
-};
-
-uint64_t DrainFailureOps::kernel_calls = 0;
-
 // 只在定向测试中模拟“预检后、atomic 执行前”出现的协议异常，覆盖正常
 // 单写者 Case1 不会命中的冷回滚分支。
 struct PublicationFaultOps : SymbolTestOps {
@@ -289,12 +277,6 @@ bool SameTensor(const TensorDesc &left, const TensorDesc &right) {
     return std::memcmp(&left, &right, sizeof(TensorDesc)) == 0;
 }
 
-bool SameOutputRef(
-    const FdwicOutputRef &left, const FdwicOutputRef &right
-) {
-    return std::memcmp(&left, &right, sizeof(FdwicOutputRef)) == 0;
-}
-
 bool AllBytesEqual(const void *object, size_t size, unsigned char expected) {
     const unsigned char *bytes =
         reinterpret_cast<const unsigned char *>(object);
@@ -304,33 +286,6 @@ bool AllBytesEqual(const void *object, size_t size, unsigned char expected) {
         }
     }
     return true;
-}
-
-void TestDeferredSharedOutputRefEncoding() {
-    const FdwicOutputRef references[] = {
-        FdwicOutputRef{0, 0, 0, 0, 0, 0},
-        FdwicOutputRef{1279, 7, 0, 0, 0, 0},
-        FdwicOutputRef{
-            INT32_MIN, INT16_MIN, UINT8_MAX, UINT8_MAX, UINT32_MAX,
-            0x89ABCDEFU
-        },
-    };
-    TensorDesc storage{};
-    for (const FdwicOutputRef &reference : references) {
-        // 每轮先写不同的脏字节，证明编码不依赖上一次 slot 内容。
-        std::memset(
-            &storage,
-            reference.producer_task_id == 0 ? 0xA5 : 0x5A,
-            sizeof(storage)
-        );
-        EncodeDeferredSharedOutputRef(storage, reference);
-        const FdwicOutputRef decoded =
-            DecodeDeferredSharedOutputRef(storage);
-        Check(
-            SameOutputRef(decoded, reference),
-            "deferred shared-output reference round-trips exactly"
-        );
-    }
 }
 
 void TestPublishAndResolve() {
@@ -414,10 +369,6 @@ void TestPublishAndResolve() {
     Check(
         SameTensor(input_slot.tensors[0], first),
         "validated INPUT descriptor lands directly in LocalSlot"
-    );
-    Check(
-        input_slot.function_padding == 0,
-        "ready INPUT leaves no deferred descriptor bit"
     );
     Check(
         input_slot.args[0] ==
@@ -1044,13 +995,8 @@ void TestPublicationCommitFaultsRollback() {
 }
 
 void TestConsumerWaitsForDelayedPublication() {
-    SchedulerState *state = MapSparseSchedulerState();
-    if (state == nullptr) {
-        ++g_failures;
-        return;
-    }
-    ResetSharedState(state->shared_map);
-    state->fatal.value = 0;
+    auto map = std::make_unique<SharedTensorMapSidecar>();
+    ResetSharedState(*map);
 
     TensorDesc output = MakeTensor(0x380000000ULL, 0);
     SubmitContext producer{};
@@ -1083,26 +1029,38 @@ void TestConsumerWaitsForDelayedPublication() {
     volatile int32_t fatal = 0;
     std::atomic<bool> publish_ok{false};
 
-    // Collect 只收集 producer fanin，未发布的纯 INPUT 不应在 Submit 热路
-    // 径等待，也不应要求 last_writer 已经由 producer 写入。
     SymbolTestOps::wait_address =
-        &state->shared_map.shared_outputs[0].published[0].value;
+        &map->shared_outputs[0].published[0].value;
     SymbolTestOps::wait_loads.store(0, std::memory_order_relaxed);
     SymbolTestOps::now_calls.store(0, std::memory_order_relaxed);
+    std::thread publisher([&] {
+        // 等 consumer 已经观察到未发布状态后再发布，避免把本测试退化成
+        // “进入 helper 前已经 ready”的普通快路径。
+        while (SymbolTestOps::wait_loads.load(std::memory_order_acquire) == 0) {
+            std::this_thread::yield();
+        }
+        publish_ok.store(
+            PublishSharedTaskOutputs<SymbolTestOps>(*map, producer, 0),
+            std::memory_order_release
+        );
+    });
+
     const uint32_t count = CollectSharedFanin<SymbolTestOps>(
-        state->shared_map, args, 1, kHeapWindow, stats, fanin,
+        *map, args, 1, kHeapWindow, stats, fanin,
         protocol_ok, ordinary_lookups, &fatal
     );
+    publisher.join();
     SymbolTestOps::wait_address = nullptr;
 
-    Check(protocol_ok && fatal == 0, "unpublished INPUT is accepted for deferred resolve");
+    Check(publish_ok.load(std::memory_order_acquire), "delayed publication succeeds");
+    Check(protocol_ok && fatal == 0, "consumer waits without protocol failure");
     Check(
-        SymbolTestOps::wait_loads.load(std::memory_order_acquire) == 0,
-        "fanin collection never waits for unpublished pure INPUT"
+        SymbolTestOps::wait_loads.load(std::memory_order_acquire) > 1,
+        "consumer performs at least one unpublished retry"
     );
     Check(
-        SymbolTestOps::now_calls.load(std::memory_order_relaxed) == 0,
-        "fanin collection opens no publication watchdog for pure INPUT"
+        SymbolTestOps::now_calls.load(std::memory_order_relaxed) >= 1,
+        "unpublished slow path establishes a watchdog window"
     );
     Check(count == 1 && fanin[0] == 0, "delayed INPUT closes producer fanin");
     Check(ordinary_lookups == 0, "delayed symbol never enters ordinary map");
@@ -1111,603 +1069,13 @@ void TestConsumerWaitsForDelayedPublication() {
         "delayed resolver leaves task payload scratch untouched"
     );
     LocalSlot slot{};
-    slot.function_padding = UINT32_MAX;
     BuildSlotPayload<SymbolTestOps, true>(
         slot, 1, static_cast<uint32_t>(FunctionId(TaskKind::Qk)), 0,
-        args, consumer, fanin, count, state->shared_map
-    );
-    Check(
-        slot.function_padding == 1U,
-        "build clears a dirty reused mask and marks only delayed INPUT"
-    );
-    Check(
-        SameOutputRef(
-            DecodeDeferredSharedOutputRef(slot.tensors[0]),
-            producer.shared_result.OutputRef(0)
-        ),
-        "delayed INPUT stores its exact symbolic reference in LocalSlot"
-    );
-
-    SymbolTestOps::wait_address =
-        &state->shared_map.shared_outputs[0].published[0].value;
-    SymbolTestOps::wait_loads.store(0, std::memory_order_relaxed);
-    SymbolTestOps::now_calls.store(0, std::memory_order_relaxed);
-    std::thread publisher([&] {
-        // 等 resolver 已经观察到未发布状态后再发布，避免测试退化成
-        // “执行前已经 ready”的普通快路径。
-        while (SymbolTestOps::wait_loads.load(std::memory_order_acquire) == 0) {
-            std::this_thread::yield();
-        }
-        publish_ok.store(
-            PublishSharedTaskOutputs<SymbolTestOps>(
-                state->shared_map, producer, 0
-            ),
-            std::memory_order_release
-        );
-    });
-    const bool resolve_ok =
-        ResolveDeferredSharedInputs<SymbolTestOps>(state, slot, stats);
-    publisher.join();
-    SymbolTestOps::wait_address = nullptr;
-
-    Check(publish_ok.load(std::memory_order_acquire), "delayed publication succeeds");
-    Check(resolve_ok && state->fatal.value == 0, "execution-time resolver accepts delayed publication");
-    Check(
-        SymbolTestOps::wait_loads.load(std::memory_order_acquire) > 1,
-        "execution-time resolver performs at least one unpublished retry"
-    );
-    Check(
-        SymbolTestOps::now_calls.load(std::memory_order_relaxed) >= 1,
-        "execution-time resolver establishes the publication watchdog"
-    );
-    Check(
-        slot.function_padding == 0,
-        "successful execution-time resolve clears the deferred bit"
+        args, consumer, fanin, count, *map
     );
     Check(
         SameTensor(slot.tensors[0], output),
-        "delayed descriptor replaces its encoded reference in LocalSlot"
-    );
-    UnmapSparseSchedulerState(state);
-}
-
-void TestMixedReadyAndDeferredSharedInputs() {
-    SchedulerState *state = MapSparseSchedulerState();
-    if (state == nullptr) {
-        ++g_failures;
-        return;
-    }
-    ResetSharedState(state->shared_map);
-    state->fatal.value = 0;
-
-    TensorDesc ready = MakeTensor(0x390000000ULL, 0);
-    TensorDesc local = MakeTensor(0x390001000ULL, 0);
-    local.manual_dep = true;
-    TensorDesc delayed_first = MakeTensor(0x390002000ULL, 1);
-    TensorDesc delayed_second = MakeTensor(0x390003000ULL, 2);
-
-    SubmitContext producers[3] = {};
-    TensorDesc *outputs[3] = {&ready, &delayed_first, &delayed_second};
-    for (int32_t producer_id = 0; producer_id < 3; ++producer_id) {
-        SubmitContext &producer = producers[producer_id];
-        producer.task_id = producer_id;
-        producer.result.task_id = producer_id;
-        producer.result.count = 1;
-        producer.result.tensors[0] = outputs[producer_id];
-        producer.shared_result.Reset(producer_id);
-        Check(
-            producer.shared_result.AddOutputRef(producer_id, 0),
-            "mixed producer accepts output slot"
-        );
-    }
-    Check(
-        PublishSharedTaskOutputs<SymbolTestOps>(
-            state->shared_map, producers[0], 0
-        ),
-        "mixed ready producer publishes before build"
-    );
-
-    TaskArgs args;
-    ConstructTaskArgs(args);
-    AppendSharedOutputRef(
-        args, producers[0].shared_result.OutputRef(0), TensorArgType::Input
-    );
-    AppendLocalTensor(args, local, TensorArgType::Input);
-    AppendSharedOutputRef(
-        args, producers[1].shared_result.OutputRef(0), TensorArgType::Input
-    );
-    AppendSharedOutputRef(
-        args, producers[2].shared_result.OutputRef(0), TensorArgType::Input
-    );
-    SubmitContext consumer{};
-    consumer.task_id = 3;
-    consumer.tensor_count = args.tensor_count;
-    consumer.scalar_count = args.scalar_count;
-    LocalStats stats{};
-    stats.result.shared_symbol_inout_commits = 29;
-    int32_t fanin[kMaxFanin] = {};
-    bool protocol_ok = false;
-    uint32_t ordinary_lookups = UINT32_MAX;
-
-    SymbolTestOps::wait_address =
-        &state->shared_map.shared_outputs[1].published[0].value;
-    SymbolTestOps::wait_loads.store(0, std::memory_order_relaxed);
-    SymbolTestOps::now_calls.store(0, std::memory_order_relaxed);
-    const uint32_t count = CollectSharedFanin<SymbolTestOps>(
-        state->shared_map, args, 3, kHeapWindow, stats, fanin,
-        protocol_ok, ordinary_lookups, &state->fatal.value
-    );
-    SymbolTestOps::wait_address = nullptr;
-    Check(protocol_ok, "mixed ready/deferred INPUT set passes fanin collection");
-    Check(
-        count == 3 && fanin[0] == 0 && fanin[1] == 1 && fanin[2] == 2,
-        "mixed INPUT set records every producer fanin in order"
-    );
-    Check(
-        SymbolTestOps::wait_loads.load(std::memory_order_acquire) == 0 &&
-            SymbolTestOps::now_calls.load(std::memory_order_relaxed) == 0,
-        "mixed fanin collection does not wait for either deferred INPUT"
-    );
-
-    LocalSlot slot{};
-    slot.function_padding = UINT32_MAX;
-    BuildSlotPayload<SymbolTestOps, true>(
-        slot, 3, static_cast<uint32_t>(FunctionId(TaskKind::Pv)), 0,
-        args, consumer, fanin, count, state->shared_map
-    );
-    const uint32_t expected_mask = (1U << 2U) | (1U << 3U);
-    Check(
-        slot.function_padding == expected_mask,
-        "mixed build replaces dirty mask with exactly two deferred bits"
-    );
-    Check(
-        SameTensor(slot.tensors[0], ready) &&
-            SameTensor(slot.tensors[1], local),
-        "mixed build copies ready shared and ordinary local descriptors"
-    );
-    Check(
-        SameOutputRef(
-            DecodeDeferredSharedOutputRef(slot.tensors[2]),
-            producers[1].shared_result.OutputRef(0)
-        ) &&
-            SameOutputRef(
-                DecodeDeferredSharedOutputRef(slot.tensors[3]),
-                producers[2].shared_result.OutputRef(0)
-            ),
-        "mixed build preserves both delayed symbolic references"
-    );
-
-    std::atomic<bool> first_publish_ok{false};
-    std::atomic<bool> second_publish_ok{false};
-    SymbolTestOps::wait_address =
-        &state->shared_map.shared_outputs[1].published[0].value;
-    SymbolTestOps::wait_loads.store(0, std::memory_order_relaxed);
-    std::thread publisher([&] {
-        while (SymbolTestOps::wait_loads.load(std::memory_order_acquire) == 0) {
-            std::this_thread::yield();
-        }
-        first_publish_ok.store(
-            PublishSharedTaskOutputs<SymbolTestOps>(
-                state->shared_map, producers[1], 1
-            ),
-            std::memory_order_release
-        );
-        second_publish_ok.store(
-            PublishSharedTaskOutputs<SymbolTestOps>(
-                state->shared_map, producers[2], 2
-            ),
-            std::memory_order_release
-        );
-    });
-    const bool resolve_ok =
-        ResolveDeferredSharedInputs<SymbolTestOps>(state, slot, stats);
-    publisher.join();
-    SymbolTestOps::wait_address = nullptr;
-
-    Check(
-        first_publish_ok.load(std::memory_order_acquire) &&
-            second_publish_ok.load(std::memory_order_acquire),
-        "mixed delayed producers both publish"
-    );
-    Check(resolve_ok, "mixed deferred mask resolves as one execution-time batch");
-    Check(slot.function_padding == 0, "mixed resolver clears every resolved bit");
-    Check(
-        SameTensor(slot.tensors[0], ready) &&
-            SameTensor(slot.tensors[1], local) &&
-            SameTensor(slot.tensors[2], delayed_first) &&
-            SameTensor(slot.tensors[3], delayed_second),
-        "mixed resolver produces four exact descriptor snapshots"
-    );
-    Check(
-        stats.result.shared_symbol_input_loads == 3 &&
-            stats.result.shared_symbol_inout_commits == 29,
-        "resolver does not double-count INPUT loads or disturb other statistics"
-    );
-    UnmapSparseSchedulerState(state);
-}
-
-void TestDeferredResolveFailuresPreservePendingState() {
-    SchedulerState *state = MapSparseSchedulerState();
-    if (state == nullptr) {
-        ++g_failures;
-        return;
-    }
-    ResetSharedState(state->shared_map);
-    state->fatal.value = 0;
-
-    const FdwicOutputRef first_ref{0, 0, 0, 0, 0, 0};
-    const FdwicOutputRef later_ref{2, 0, 0, 0, 0, 0};
-    TensorDesc first = MakeTensor(0x3A0000000ULL, 0);
-    TensorDesc later = MakeTensor(0x3A0001000ULL, 2);
-    LocalStats stats{};
-    stats.result.shared_symbol_input_loads = 41;
-    stats.result.shared_symbol_inout_commits = 43;
-    stats.result.map_lookups = 47;
-    stats.result.fanin_ready_loads = 53;
-
-    LocalSlot slot{};
-    slot.task_id = 3;
-    slot.tensor_count = 3;
-    slot.function_padding = (1U << 0U) | (1U << 2U);
-    EncodeDeferredSharedOutputRef(slot.tensors[0], first_ref);
-    EncodeDeferredSharedOutputRef(slot.tensors[2], later_ref);
-    state->shared_map.shared_outputs[0].published[0].value = 7;
-    state->shared_map.shared_outputs[2].tensors[0] = later;
-    state->shared_map.shared_outputs[2].last_writer[0].value = 2;
-    state->shared_map.shared_outputs[2].published[0].value = 2;
-
-    Check(
-        !ResolveDeferredSharedInputs<SymbolTestOps>(state, slot, stats),
-        "unexpected published value fails deferred resolve"
-    );
-    Check(
-        slot.function_padding == ((1U << 0U) | (1U << 2U)),
-        "early publication failure leaves failing and later bits pending"
-    );
-    Check(
-        SameOutputRef(
-            DecodeDeferredSharedOutputRef(slot.tensors[0]), first_ref
-        ) &&
-            SameOutputRef(
-                DecodeDeferredSharedOutputRef(slot.tensors[2]), later_ref
-            ),
-        "early publication failure does not overwrite encoded references"
-    );
-    Check(
-        stats.result.shared_symbol_input_loads == 41 &&
-            stats.result.shared_symbol_inout_commits == 43 &&
-            stats.result.map_lookups == 47 &&
-            stats.result.fanin_ready_loads == 53,
-        "failed resolver does not alter unrelated counters"
-    );
-
-    // 第二种失败发生在一个较早 bit 已成功解析之后：允许已完成 bit
-    // 提交，但失败 bit 及其 descriptor 必须保持可诊断状态。
-    ResetSharedState(state->shared_map);
-    state->fatal.value = 0;
-    slot = LocalSlot{};
-    slot.task_id = 3;
-    slot.tensor_count = 3;
-    slot.function_padding = (1U << 0U) | (1U << 2U);
-    EncodeDeferredSharedOutputRef(slot.tensors[0], first_ref);
-    EncodeDeferredSharedOutputRef(slot.tensors[2], later_ref);
-    state->shared_map.shared_outputs[0].tensors[0] = first;
-    state->shared_map.shared_outputs[0].last_writer[0].value = 0;
-    state->shared_map.shared_outputs[0].published[0].value = 0;
-    state->shared_map.shared_outputs[2].tensors[0] = later;
-    state->shared_map.shared_outputs[2].last_writer[0].value = 1;
-    state->shared_map.shared_outputs[2].published[0].value = 2;
-
-    Check(
-        !ResolveDeferredSharedInputs<SymbolTestOps>(state, slot, stats),
-        "published descriptor with mismatched writer fails resolve"
-    );
-    Check(
-        slot.function_padding == (1U << 2U),
-        "writer mismatch clears only the earlier successfully resolved bit"
-    );
-    Check(
-        SameTensor(slot.tensors[0], first) &&
-            SameOutputRef(
-                DecodeDeferredSharedOutputRef(slot.tensors[2]), later_ref
-            ),
-        "writer mismatch preserves the failing encoded reference"
-    );
-    Check(
-        stats.result.shared_symbol_input_loads == 41 &&
-            stats.result.shared_symbol_inout_commits == 43 &&
-            stats.result.map_lookups == 47 &&
-            stats.result.fanin_ready_loads == 53,
-        "late resolver failure also leaves unrelated counters unchanged"
-    );
-    UnmapSparseSchedulerState(state);
-}
-
-void TestDrainRejectsDeferredResolveFailure() {
-    SchedulerState *state = MapSparseSchedulerState();
-    if (state == nullptr) {
-        ++g_failures;
-        return;
-    }
-    ResetSharedState(state->shared_map);
-    state->fatal.value = 0;
-    state->tasks[0].flag = 1;
-
-    WorkerState &worker = state->workers[0];
-    worker.occupied_count = 1;
-    LocalSlot &slot = worker.slots[0];
-    slot.occupied = true;
-    slot.built = true;
-    slot.task_id = 1;
-    slot.kind = static_cast<uint32_t>(FunctionId(TaskKind::Qk));
-    slot.tensor_count = 1;
-    slot.fanin_count = 1;
-    slot.fanin[0] = 0;
-    slot.function_padding = 1;
-    EncodeDeferredSharedOutputRef(
-        slot.tensors[0], FdwicOutputRef{0, 0, 0, 0, 0, 0}
-    );
-    // producer flag 已 ready，但 publication 值损坏：Drain 必须在
-    // ExecuteKernel 前失败，并只撤销一次本 slot 的占用。
-    state->shared_map.shared_outputs[0].published[0].value = 7;
-    state->tasks[1].vend = 0;
-    state->tasks[1].flag = 0;
-    LocalStats stats{};
-    DrainFailureOps::kernel_calls = 0;
-
-    const uint32_t freed = DrainReady<DrainFailureOps>(
-        state, worker, DrainPlace::EfDrain, stats
-    );
-    Check(
-        freed == kDrainFatalResult,
-        "failed deferred resolve returns the terminal drain status"
-    );
-    Check(state->fatal.value == 1, "failed deferred resolve broadcasts fatal");
-    Check(
-        worker.occupied_count == 0 && !slot.occupied && !slot.built &&
-            slot.function_padding == 0,
-        "failed deferred resolve releases its slot and mask exactly once"
-    );
-    Check(
-        DrainFailureOps::kernel_calls == 0,
-        "failed deferred resolve never enters ExecuteKernel"
-    );
-    Check(
-        state->tasks[1].vend == 0 && state->tasks[1].flag == 0,
-        "failed deferred resolve never publishes task completion"
-    );
-    UnmapSparseSchedulerState(state);
-}
-
-void TestDrainExecutesResolvedDeferredInput() {
-    SchedulerState *state = MapSparseSchedulerState();
-    if (state == nullptr) {
-        ++g_failures;
-        return;
-    }
-    ResetSharedState(state->shared_map);
-    state->fatal.value = 0;
-    state->tasks[0].flag = 1;
-
-    const TensorDesc input = MakeTensor(0x3B0000000ULL, 0);
-    state->shared_map.shared_outputs[0].tensors[0] = input;
-    state->shared_map.shared_outputs[0].last_writer[0].value = 0;
-    state->shared_map.shared_outputs[0].published[0].value = 0;
-
-    WorkerState &worker = state->workers[0];
-    worker.heap_next = 0x3B0010000ULL;
-    worker.occupied_count = 1;
-    LocalSlot &slot = worker.slots[0];
-    slot.occupied = true;
-    slot.built = true;
-    slot.task_id = 1;
-    slot.kind = static_cast<uint32_t>(FunctionId(TaskKind::Qk));
-    slot.tensor_count = 1;
-    slot.fanin_count = 1;
-    slot.fanin[0] = 0;
-    slot.function_padding = 1;
-    EncodeDeferredSharedOutputRef(
-        slot.tensors[0], FdwicOutputRef{0, 0, 0, 0, 0, 0}
-    );
-    LocalStats stats{};
-    DrainFailureOps::kernel_calls = 0;
-
-    const uint32_t freed = DrainReady<DrainFailureOps>(
-        state, worker, DrainPlace::EfDrain, stats
-    );
-    Check(freed == 1, "ready deferred INPUT is counted as one executed slot");
-    Check(state->fatal.value == 0, "successful deferred drain keeps fatal clear");
-    Check(
-        worker.occupied_count == 0 && !slot.occupied && !slot.built &&
-            slot.function_padding == 0,
-        "successful deferred drain releases its slot and mask"
-    );
-    Check(
-        DrainFailureOps::kernel_calls == 1,
-        "successful deferred drain enters ExecuteKernel exactly once"
-    );
-    Check(
-        SameTensor(slot.tensors[0], input),
-        "DrainReady resolves the exact descriptor before ExecuteKernel"
-    );
-    Check(
-        state->tasks[1].vend == worker.heap_next &&
-            state->tasks[1].flag == 1,
-        "successful deferred drain publishes task completion"
-    );
-    UnmapSparseSchedulerState(state);
-}
-
-void TestDeferredMaskBounds() {
-    SchedulerState *state = MapSparseSchedulerState();
-    if (state == nullptr) {
-        ++g_failures;
-        return;
-    }
-    ResetSharedState(state->shared_map);
-    state->fatal.value = 0;
-    const TensorDesc input = MakeTensor(0x3C0000000ULL, 0);
-    state->shared_map.shared_outputs[0].tensors[0] = input;
-    state->shared_map.shared_outputs[0].last_writer[0].value = 0;
-    state->shared_map.shared_outputs[0].published[0].value = 0;
-    LocalStats stats{};
-
-    LocalSlot slot{};
-    slot.task_id = 1;
-    slot.tensor_count = kMaxTaskTensors;
-    slot.function_padding = 1U << 31U;
-    EncodeDeferredSharedOutputRef(
-        slot.tensors[31], FdwicOutputRef{0, 0, 0, 0, 0, 0}
-    );
-    Check(
-        ResolveDeferredSharedInputs<SymbolTestOps>(state, slot, stats),
-        "tensor index 31 resolves without shift-by-32"
-    );
-    Check(
-        slot.function_padding == 0 && SameTensor(slot.tensors[31], input),
-        "32-tensor mask clears its highest valid bit"
-    );
-
-    slot = LocalSlot{};
-    slot.task_id = 1;
-    slot.tensor_count = 1;
-    slot.function_padding = 1U << 1U;
-    Check(
-        !ResolveDeferredSharedInputs<SymbolTestOps>(state, slot, stats),
-        "mask bit outside tensor_count fails closed"
-    );
-    Check(
-        slot.function_padding == (1U << 1U),
-        "out-of-range mask remains available for failure diagnosis"
-    );
-
-    slot = LocalSlot{};
-    slot.task_id = 1;
-    slot.tensor_count = kMaxTaskTensors + 1U;
-    slot.function_padding = 1U;
-    Check(
-        !ResolveDeferredSharedInputs<SymbolTestOps>(state, slot, stats),
-        "tensor_count beyond the ABI maximum fails closed"
-    );
-    UnmapSparseSchedulerState(state);
-}
-
-void TestFatalFinalDrainDiscardsDependentSlots() {
-    SchedulerState *state = MapSparseSchedulerState();
-    if (state == nullptr) {
-        ++g_failures;
-        return;
-    }
-    state->fatal.value = 1;
-    WorkerState &worker = state->workers[0];
-    worker.occupied_count = 2;
-
-    LocalSlot &failed = worker.slots[0];
-    failed.occupied = true;
-    failed.built = true;
-    failed.task_id = 1;
-    failed.function_padding = 1U;
-    LocalSlot &dependent = worker.slots[1];
-    dependent.occupied = true;
-    dependent.built = true;
-    dependent.task_id = 2;
-    dependent.fanin_count = 1;
-    dependent.fanin[0] = 1;
-    dependent.function_padding = 2U;
-    state->tasks[1].flag = 0;
-    state->tasks[2].flag = 0;
-    LocalStats stats{};
-    uint32_t stalled_polls = 1023;
-
-    Check(
-        ConvergeFatalStall<SymbolTestOps>(
-            state, worker, stats, stalled_polls
-        ),
-        "low-frequency FinalDrain poll observes the global fatal"
-    );
-    Check(
-        worker.occupied_count == 0 &&
-            !failed.occupied && !failed.built &&
-            !dependent.occupied && !dependent.built,
-        "fatal convergence discards both failed and dependent slots"
-    );
-    Check(
-        failed.function_padding == 0 &&
-            dependent.function_padding == 0,
-        "fatal convergence clears every deferred mask"
-    );
-    Check(
-        state->tasks[1].flag == 0 && state->tasks[2].flag == 0,
-        "fatal convergence never fabricates task completion"
-    );
-    Check(
-        DiscardAllOccupiedSlots(worker) == 0 &&
-            worker.occupied_count == 0,
-        "repeated fatal cleanup is idempotent"
-    );
-
-    // 重新构造两个依赖失败 task 的满 slot，直接覆盖 FinalDrain 之前的
-    // RingBackpressure：WaitForSlot 必须低频看到 fatal、终止清槽，并
-    // 向 BuildWinner 返回失败，不能在空出的 slot 上继续构建当前 task。
-    worker.occupied_count = kUsableSlots;
-    for (uint32_t index = 0; index < kUsableSlots; ++index) {
-        LocalSlot &blocked = worker.slots[index];
-        blocked.occupied = true;
-        blocked.built = true;
-        blocked.task_id = index + 3U;
-        blocked.fanin_count = 1;
-        blocked.fanin[0] = 1;
-        blocked.function_padding = 1U << index;
-    }
-    Check(
-        !WaitForSlot<DrainFailureOps, false>(
-            state, worker, 5, stats
-        ),
-        "RingBackpressure stops instead of rebuilding after global fatal"
-    );
-    Check(
-        worker.occupied_count == 0 &&
-            !worker.slots[0].occupied &&
-            !worker.slots[1].occupied &&
-            worker.slots[0].function_padding == 0 &&
-            worker.slots[1].function_padding == 0,
-        "RingBackpressure fatal convergence clears all blocked slots"
-    );
-    UnmapSparseSchedulerState(state);
-}
-
-void TestInoutPublicationRemainsEager() {
-    auto map = std::make_unique<SharedTensorMapSidecar>();
-    ResetSharedState(*map);
-    TaskArgs args;
-    ConstructTaskArgs(args);
-    AppendSharedOutputRef(
-        args, FdwicOutputRef{0, 0, 0, 0, 0, 0},
-        TensorArgType::Inout
-    );
-    LocalStats stats{};
-    int32_t fanin[kMaxFanin] = {};
-    bool protocol_ok = true;
-    uint32_t ordinary_lookups = UINT32_MAX;
-    volatile int32_t fatal = 0;
-    ExpiredWaitOps::calls.store(0, std::memory_order_relaxed);
-
-    const uint32_t count = CollectSharedFanin<ExpiredWaitOps>(
-        *map, args, 1, kHeapWindow, stats, fanin,
-        protocol_ok, ordinary_lookups, &fatal
-    );
-    Check(
-        !protocol_ok && count == 0 && fatal == 1,
-        "unpublished INOUT remains eager and fails on publication timeout"
-    );
-    Check(
-        ExpiredWaitOps::calls.load(std::memory_order_relaxed) == 2,
-        "INOUT eager path opens and checks its publication watchdog"
-    );
-    Check(
-        stats.result.shared_symbol_input_loads == 0 &&
-            stats.result.shared_symbol_inout_commits == 0,
-        "failed eager INOUT publishes no symbol statistics"
+        "delayed descriptor lands directly in LocalSlot after publication"
     );
 }
 
@@ -1916,7 +1284,6 @@ void TestInvalidReferencesFailClosed() {
 
 int main() {
     TestSharedCompletionPublishesWithoutFrontier();
-    TestDeferredSharedOutputRefEncoding();
     TestPublishAndResolve();
     TestWriterCommitFailuresKeepTerminalEvidence();
     TestMultiWriterFailureKeepsPartialTerminalEvidence();
@@ -1926,13 +1293,6 @@ int main() {
     TestPublicationPreflightIsAllOrNothing();
     TestPublicationCommitFaultsRollback();
     TestConsumerWaitsForDelayedPublication();
-    TestMixedReadyAndDeferredSharedInputs();
-    TestDeferredResolveFailuresPreservePendingState();
-    TestDrainRejectsDeferredResolveFailure();
-    TestDrainExecutesResolvedDeferredInput();
-    TestDeferredMaskBounds();
-    TestFatalFinalDrainDiscardsDependentSlots();
-    TestInoutPublicationRemainsEager();
     TestPublicationWaitFailuresFailClosed();
     TestInvalidReferencesFailClosed();
     if (g_failures != 0) {

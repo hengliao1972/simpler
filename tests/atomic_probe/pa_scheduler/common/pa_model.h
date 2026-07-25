@@ -656,7 +656,6 @@ struct TensorDesc {
 };
 static_assert(sizeof(TensorDesc) == 128, "TensorDesc must match the PA Tensor ABI size");
 static_assert(offsetof(TensorDesc, buffer_addr) == 0, "TensorDesc buffer offset mismatch");
-static_assert(offsetof(TensorDesc, buffer_size) == 8, "TensorDesc deferred-ref second word offset mismatch");
 static_assert(offsetof(TensorDesc, owner_task_id) == 16, "TensorDesc owner offset mismatch");
 static_assert(offsetof(TensorDesc, start_offset) == 24, "TensorDesc view offset mismatch");
 static_assert(offsetof(TensorDesc, version) == 32, "TensorDesc version offset mismatch");
@@ -848,9 +847,6 @@ struct LocalSlot {
     uint8_t header_padding[2];
     uint32_t task_id;
     uint32_t kind;
-    // private 中仍是 ABI padding；shared deferred 实验复用这 32 bit 保存
-    // pure INPUT 的逐 tensor 待解析 mask，不扩大 LocalSlot/WorkerState。
-    // 每次 Build 必须先清零，Kernel 前 resolver 清完全部 bit。
     uint32_t function_padding;
     uint64_t function_address;
     uint32_t tensor_count;
@@ -887,7 +883,6 @@ static_assert(offsetof(LocalSlot, occupied) == 0, "LocalSlot occupied offset mis
 static_assert(offsetof(LocalSlot, built) == 1, "LocalSlot built offset mismatch");
 static_assert(offsetof(LocalSlot, task_id) == 4, "LocalSlot task offset mismatch");
 static_assert(offsetof(LocalSlot, kind) == 8, "LocalSlot function-id offset mismatch");
-static_assert(offsetof(LocalSlot, function_padding) == 12, "LocalSlot shared-ref mask offset mismatch");
 static_assert(offsetof(LocalSlot, function_address) == 16, "LocalSlot function address offset mismatch");
 static_assert(offsetof(LocalSlot, tensor_count) == 24, "LocalSlot tensor-count offset mismatch");
 static_assert(offsetof(LocalSlot, tensors) == 64, "LocalSlot tensor payload offset mismatch");

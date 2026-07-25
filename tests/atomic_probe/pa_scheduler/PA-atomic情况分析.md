@@ -2067,54 +2067,28 @@ b1/b256、private b1 均通过。重新构建的 shared perf-clock
 `max_wins_per_worker=35`。这条单轮只作为恢复身份与量级检查；S4.10
 撤销决定仍以此前 12+12 样本的冻结配对为依据。
 
-#### 7.5.22 S4.11 pure INPUT 延迟解析对 atomic 口径的影响
+#### 7.5.22 S4.11 pure INPUT publication 延迟实验
 
-S4.11a 只调整 shared fresh-output 的 pure INPUT publication 读取时机，
-没有删除 Claim、completion、fanin flag、INOUT writer 或 fatal 的协议
-atomic：
+S4.11 没有删除 ready INPUT 的固定 atomic，只把 publication 的一次读取
+从 Collect 移到 Build；只有未就绪 INPUT 的反复 publication polling 被
+移出 Submit，在 fanin completion ready 后、Kernel 前再次确认。
+INOUT/OutputExisting 的 eager publication 与 writer FetchMax 始终不变。
+`shared_symbol_input_loads=1,280` 是 logical INPUT 数，不能冒充 physical
+atomic 消减；`fanin_ready/not_ready` 也只统计 task flag。
 
-```text
-原路径：
-  CollectSharedFanin
-    → published atomicAdd(0)，未就绪则在 Submit 内轮询
-    → last_writer atomicAdd(0)
-  BuildWinner
-    → copy descriptor
+两版 clean 候选分别与 S4.9 做了 12+12 正式配对：
 
-候选路径：
-  CollectSharedFanin
-    → last_writer atomicAdd(0)，不等待 pure INPUT publication
-  BuildWinner
-    → published atomicAdd(0) 单次探测
-    → ready 则 copy；未就绪则保存 ref/mask
-  DrainReady（fanin task flag ready 后）
-    → 精确确认 published 与 last_writer
-    → copy descriptor，再执行 Kernel
-```
+| 候选 | `.text` | block 胜负 | 配对差中位数 |
+| --- | ---: | ---: | ---: |
+| `b516409e`，resolver 内联 14 份 | 157,496B | 2 快 / 4 慢 | `+11.105us / +0.342%` |
+| `6275e328`，resolver 收敛为 4 份 | 144,440B | 1 快 / 5 慢 | `+10.326us / +0.318%` |
 
-因此 ready INPUT 的物理读取数量没有被冒充成“已消减”：publication 的
-一次读取只是从 Collect 移到 Build；真正变化的是未就绪 INPUT 不再在
-Submit 内反复轮询，而是允许后续 Submit 继续推进，执行前再完成确认。
-INOUT/OutputExisting 仍完整保留原 eager publication wait 与 writer
-FetchMax。
+候选确实产生约 88～93 次 RingBp，说明提交超前实际发生；但两轮均未取得
+稳定净收益，因此不能把“轮询位置移动”写成 atomic 优化成功。本轮代码已
+完整撤销，恢复 S4.9 eager 路径。若以后在参考的 typed ref storage 和更深
+slot 容量上重试，仍需重新统计 physical atomic 与完整 Submit，不能复用
+本轮逻辑计数宣称收益。
 
-现有 `shared_symbol_input_loads` 是逻辑 INPUT 引用计数，不是 physical
-atomic 指令数；b256 仍严格为 1,280。`fanin_ready/not_ready` 只统计 task
-completion flag 的读取，也不能拿来代表 output publication polling。
-本实现继续复用既有 `Ops::Load`，没有为候选增加 raw/trace 字段；因此普通
-atomic 泳道不会把这次 untraced publication probe 伪装成可逐条归因的新
-站点。候选最终保留与否只由 clean perf-clock 配对决定，atomic 文档只记录
-协议位置和可解释边界。
-
-resolver 冷失败新增的 terminal sentinel 不是 atomic。为防失败 task 的
-后继 slot 永久等待，RingBackpressure/FinalDrain 在连续 1,024 次无进展时
-低频读取全局 fatal；该 `FatalPoll` 被纳入已有 poll-region 聚合，不增加
-raw 字段，零背压成功快路径也不增加该读取。
-
-clean `b516409e` 与 S4.9 `e8320280` 的 12+12 正式配对已经完成：
-6 个 block 为 2 快/4 慢，配对差中位数
-`+11.105us / +0.342%`。这与本节的口径一致：S4.11a 没有删除 ready
-INPUT 的固定 atomic，只把未就绪 publication 轮询移出 Submit；不能因为
-观察到提交超前就宣称 atomic 已消减或性能已提升。当前 shared perf-clock
-`.text` 同时增加 28,416B，下一小步只收敛 resolver 的重复内联；若重新
-配对仍无净收益，S4.11 整体撤销。
+撤销后 shared perf-clock host/kernel 与 `e8320280` 冻结件逐字节相同，
+b256 `RingBp` 恢复为 0；因此当前 atomic 与 publication 口径也已严格
+回到 S4.9，而不是仅在源码表面删除了实验分支。

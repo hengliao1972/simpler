@@ -1486,46 +1486,6 @@ PA_DEVICE void CopyGmTensor(PA_GM TensorDesc &destination, PA_GM const TensorDes
 }
 
 #if PTO_FDWIC_SHARED_MAP
-PA_DEVICE void EncodeDeferredSharedOutputRef(
-    PA_GM TensorDesc &storage, FdwicOutputRef reference
-) {
-    // 未解析的 tensor 尚无可供 Kernel 使用的 descriptor。复用其头两个
-    // uint64_t 保存完整 16B 句柄，既不扩 slot，也不通过跨类型指针制造
-    // strict-aliasing/对象生命周期问题。resolver 会先解码到局部变量，再
-    // 用完整 128B descriptor 覆盖这里。
-    storage.buffer_addr =
-        static_cast<uint64_t>(
-            static_cast<uint32_t>(reference.producer_task_id)
-        ) |
-        (static_cast<uint64_t>(
-             static_cast<uint16_t>(reference.output_slot)
-         ) << 32U) |
-        (static_cast<uint64_t>(reference.flags) << 48U) |
-        (static_cast<uint64_t>(reference.view_ndims) << 56U);
-    storage.buffer_size =
-        static_cast<uint64_t>(reference.view_shape0) |
-        (static_cast<uint64_t>(reference.view_offset0) << 32U);
-}
-
-PA_DEVICE FdwicOutputRef DecodeDeferredSharedOutputRef(
-    PA_GM const TensorDesc &storage
-) {
-    // 两个 word 必须先完整读入局部变量；随后 descriptor 原地覆盖时不能
-    // 再通过 storage 读取尚未消费的句柄字节。
-    const uint64_t header = storage.buffer_addr;
-    const uint64_t view = storage.buffer_size;
-    return FdwicOutputRef{
-        static_cast<int32_t>(static_cast<uint32_t>(header)),
-        static_cast<int16_t>(
-            static_cast<uint16_t>((header >> 32U) & 0xFFFFU)
-        ),
-        static_cast<uint8_t>((header >> 48U) & 0xFFU),
-        static_cast<uint8_t>((header >> 56U) & 0xFFU),
-        static_cast<uint32_t>(view),
-        static_cast<uint32_t>(view >> 32U),
-    };
-}
-
 template <typename SharedCopyOps, bool SharedDescriptorsDirect>
 PA_DEVICE void PopulateSlotPayloadImpl(
 #else
@@ -1543,57 +1503,27 @@ PA_DEVICE void PopulateSlotPayload(
     // 副本而非 orchestration 临时对象；fanin 随 slot 保存，kernel 执行前逐 flag 检查。
     slot.tensor_count = context.tensor_count;
     slot.scalar_count = context.scalar_count;
-#if PTO_FDWIC_SHARED_MAP
-    // function_padding 是 shared-only deferred mask 的 ABI 复用槽。即使
-    // LocalSlot 来自脏内存或上一 task 失败，每次 Build 都从空集合开始。
-    slot.function_padding = 0;
-#endif
     for (int32_t index = 0; index < context.tensor_count; ++index) {
         if (TaskTag(args, static_cast<uint32_t>(index)) == TensorArgType::Output) {
             CopyGmTensor(slot.tensors[index], context.payload->tensors[index]);
 #if PTO_FDWIC_SHARED_MAP
         } else if (IsSharedOutputReference(args.tensors[index])) {
             if constexpr (SharedDescriptorsDirect) {
+                // Materialize + Collect 已验证该 ready ref。把 invalidate/copy
+                // 融入既有 slot tensor 扫描，避免独立 helper 再遍历一遍
+                // args；shared_map 非空是生产 BuildWinner 的内部前置条件。
                 const FdwicOutputRef output_ref =
                     SharedOutputReference(args.tensors[index]);
-                PA_GM SharedOutputCell &cell =
+                PA_GM const TensorDesc &shared_tensor =
                     shared_map->shared_outputs[
-                        static_cast<uint32_t>(output_ref.producer_task_id)
-                    ];
-                const bool pure_input =
-                    TaskTag(args, static_cast<uint32_t>(index)) ==
-                    TensorArgType::Input;
-                const int64_t published =
-                    pure_input
-                        ? SharedCopyOps::Load(
-                              &cell.published[output_ref.output_slot].value
-                          )
-                        : static_cast<int64_t>(
-                              output_ref.producer_task_id
-                          );
-                if (pure_input &&
-                    published !=
-                        static_cast<int64_t>(
+                        static_cast<uint32_t>(
                             output_ref.producer_task_id
-                        )) {
-                    // Collect 已完成结构、producer 和 writer 初态校验。
-                    // Build 只做一次 non-blocking published 探测；未就绪或
-                    // 异常值都保存句柄，由执行前 resolver 统一确认/报错。
-                    EncodeDeferredSharedOutputRef(
-                        slot.tensors[index], output_ref
-                    );
-                    slot.function_padding |=
-                        1U << static_cast<uint32_t>(index);
-                } else {
-                    // ready INPUT 以及保持 eager 的 INOUT/OutputExisting
-                    // 继续直接落 slot，不经过 TaskPayload 中间搬运。
-                    PA_GM const TensorDesc &shared_tensor =
-                        cell.tensors[output_ref.output_slot];
-                    SharedCopyOps::InvalidateRegion(
-                        &shared_tensor, sizeof(shared_tensor)
-                    );
-                    CopyGmTensor(slot.tensors[index], shared_tensor);
-                }
+                        )
+                    ].tensors[output_ref.output_slot];
+                SharedCopyOps::InvalidateRegion(
+                    &shared_tensor, sizeof(shared_tensor)
+                );
+                CopyGmTensor(slot.tensors[index], shared_tensor);
             } else {
                 // 兼容入口仍允许调用方预先把 descriptor 放进 TaskPayload；
                 // 编译期布尔量保证生产 direct-to-slot 实例不产生该分支。

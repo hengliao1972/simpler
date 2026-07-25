@@ -2975,160 +2975,78 @@ perf-clock ELF，与 S4.9 `e8320280` 做相同 ABBA/BAAB 配对。
 若 Submit 变短但最终 drain 等量变长，只能记录为工作后移。只有正确性闭合且
 冻结配对取得净收益才保留；否则像 S4.10 一样完整撤销。
 
-#### S4.11a standalone 协议实现与正确性门禁
+#### S4.11 实现、两轮冻结配对与撤销结论
 
-本小步已经在 standalone 落地，但尚未宣告性能保留。实现严格维持上一节的
-单变量边界：
+S4.11a 曾按上述边界完整实现 pure INPUT deferred resolve：
 
-1. `CollectSharedFanin()` 对 plain pure INPUT 不再同步等待
-   `(producer,slot).published`，仍把句柄声明的 producer 加入 fanin；
-2. `PopulateSlotPayloadImpl()` 对 published 已就绪的 INPUT 直接
-   invalidate/copy descriptor；未就绪时把 16B `FdwicOutputRef` 显式
-   pack 到该 tensor 尚未生效的 `buffer_addr/buffer_size`，并在复用的
-   `function_padding` 中设置逐 tensor bit；
-3. `DrainReady()` 只有在全部 fanin flag ready 后、`ExecuteKernel()`
-   之前才解析 mask：等待精确 publication、复核
-   `last_writer==producer`、invalidate/copy 完整 128B descriptor；
-4. INOUT/OutputExisting 仍在 Submit 中 eager 等待 publication，writer
-   FetchMax 和 output publish 顺序没有移动；
-5. private、Claim、shared heap、ordinary region、slot 数、raw schema、
-   PMU 字段和 trace 字段均未改变。
+- `CollectSharedFanin()` 不再在 Submit 内同步等待 pure INPUT
+  publication，仍保留 producer fanin；
+- Build 对 ready descriptor 直接复制，对未发布引用复用
+  `LocalSlot.function_padding` 与 TensorDesc 前 16B 保存 mask/ref；
+- Drain 在 fanin ready 后、Kernel 前确认 publication/writer 并复制完整
+  descriptor；INOUT/OutputExisting 始终保持 eager；
+- `LocalSlot==4,824B`、WorkerState offset、slot 数、raw/PMU/trace ABI、
+  Claim、heap 和 ordinary region 均未改变。
 
-编码没有扩大状态体：`LocalSlot` 仍为 4,824B，`function_padding` 偏移
-仍为 12，`TensorDesc.buffer_size` 偏移仍为 8；每次 Build、成功解析、
-正常释放和失败释放都会清 mask。该 overlay 仍只用于 standalone 的隔离
-实验；真实 simpler 若迁移，应使用已有的 typed
-`shared_ref_mask/shared_refs[]`，不能照搬这种实验编码。
+定向审查还发现并修复了失败收敛缺口：resolver 终止状态必须同时被 EfDrain、
+RingBackpressure 和 FinalDrain 消费；远端 fatal 在持续无进展时低频检查，
+清槽后禁止 BuildWinner 继续建 slot。测试覆盖 ready/delayed 混合、bit31、
+越界 mask、脏 slot、非法 publication/writer、INOUT eager、成功/失败
+Drain，以及两个满 slot 依赖失败 task 的终止收敛。CPU shared/private、
+CCEC normal/perf-clock、A5 shared b1/b256 与 private b1 均通过；b256
+继续精确保持 2,048 次 output publication、1,280 个 logical INPUT、
+768 次 INOUT writer commit，以及依赖/heap/writer 签名。
 
-实现审查时发现了一个不能掩盖的终止性缺口：resolver 失败虽然会广播
-fatal，但原 FinalDrain 与 RingBackpressure 都可能持有依赖失败 task 的
-slot 并永久等待。修正后的内部协议为：
+第一版 clean 提交为 `b516409e`。它把 resolver 内联到 14 个调用点，使
+shared perf-clock mixed `.text` 从 S4.9 的 129,080B 增至 157,496B。
+与 `e8320280` 做同一 device 0、b256、`real-compute/6,28,4,1`、2 次
+warm-up/版本、6 个 ABBA/BAAB block 后：
 
-- `DrainReady()` 用 shared-only 的 `UINT32_MAX` 返回 resolver 终止状态，
-  与正常最多释放 4 个 slot 的返回域不冲突；
-- EfDrain 收到终止状态后清理本 worker 的全部 slot，并让当前 Submit
-  失败；
-- `WaitForSlot()` 改为返回 `bool`：本核终止状态立即失败；远端 fatal
-  只在连续 1,024 次无进展时低频观察；真正发生过等待并刚释放容量时再补
-  一次 fatal 检查，零背压快路径不增加 atomic；
-- FinalDrain 同样处理本核终止状态和远端 fatal，清理只复用单 slot
-  撤销入口，最后把终止态 `occupied_count` 归零，不伪造 completion；
-- 新增 FatalPoll 被并入已有背压/最终 drain atomic 聚合区，不增加 raw
-  字段，也避免低频检查放大泳道记录数。
+| 版本 | 中位数 | 均值 | 标准差 | block 胜负 | 配对差中位数 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| S4.9 `e8320280` | 3.247ms | 3.248ms | 0.010ms | - | - |
+| S4.11a `b516409e` | 3.259ms | 3.261ms | 0.034ms | 2 快 / 4 慢 | `+11.105us / +0.342%` |
 
-定向测试覆盖了 ref 逐字段编解码、ready/delayed 混合、多 bit、bit31、
-越界 mask、超限 tensor_count、脏 slot 复用、非法 publication/writer、
-INOUT 仍 eager、成功 Drain 在 Kernel 前解析、失败不执行
-Kernel/Completion，以及“两个满 slot 均依赖失败 task”的
-RingBackpressure 收敛。两轮只读审查在补齐 EfDrain、WaitForSlot 与
-FinalDrain 三个入口后未再发现 P0/P1。
+符号与 DWARF 审计证明四个大函数和四份
+`ConvergeFatalStall` 解释 99.68% 的 `.text` 增量，其中 14 份 resolver
+约占 14.6KB。S4.11b `6275e328` 因此只增加 mask guard 并把 resolver
+固定 noinline；重建后精确得到 AIC/AIV orchestration/finish 共 4 份
+904B helper，perf-clock `.text` 降至 144,440B。协议没有变化，CPU/CCEC/
+A5 门禁再次通过。第二轮同口径配对为：
 
-当前验证结果如下：
+| 版本 | 中位数 | 均值 | 标准差 | block 胜负 | 配对差中位数 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| S4.9 `e8320280` | 3.2452ms | 3.2436ms | 0.0150ms | - | - |
+| S4.11b `6275e328` | 3.2451ms | 3.2484ms | 0.0334ms | 1 快 / 5 慢 | `+10.326us / +0.318%` |
 
-| 门禁 | 结果 |
-| --- | --- |
-| CPU shared/private strict 构建与自测 | 全部 PASS |
-| CPU shared/private b256 | 全部语义、依赖、heap 与终态断言 PASS |
-| 用户 `.venv` 下 converter/PMU/HTML/exclusive 测试 | 100 项 PASS |
-| CCEC shared/private normal 与 perf-clock | 全部构建、mixed metadata、符号、relocation、manifest 门禁 PASS |
-| A5 shared b1/b256 real-compute | 全部断言 PASS；b256 1,280 task、192 active tile 正确 |
-| A5 private b1 real-compute | 全部断言 PASS |
-
-shared b256 继续精确保持：
-
-```text
-published_outputs      = 2048
-logical INPUT loads    = 1280
-INOUT writer commits   = 768
-dependency signature   = b7d985d6edb07078
-writer/map signature   = 556bec7ec8d0f323
-```
-
-private CCEC normal/perf-clock 的 `.text` 仍分别为 590,648B/125,752B；
-带 `-g` 的完整 device object 因公共头新增行号而改变，不能谎称整份 ELF
-bit-identical。shared perf-clock mixed `.text` 则从 S4.9 的
-129,080B 增至 **157,496B**，这是必须纳入配对判断的明确风险。
-
-A5 shared b256 普通构建单样本为 3.343ms，perf-clock scalar-nop0 单样本
-为 3.179ms；后者相对 S4.9 恢复身份时的 3.233ms 单样本呈正向迹象。
-与此同时，本候选普通/perf-clock 单样本分别出现 88/93 次 RingBp，而
-S4.9 冻结样本均为 0，说明 pure INPUT 延迟确实让提交推进得更早，也把
-更多尚未 ready 的 slot 推入两个可用执行槽。单次墙钟、代码尺寸和
-RingBp 都不能独立决定保留；下一步必须从 clean commit 冻结本候选，与
-`e8320280` 冻结件完成同一 ABBA/BAAB 配对，并同时核对完整 launch/final
-drain，防止把单纯工作后移写成净收益。
-
-#### S4.11a 冻结配对：协议正确，但当前代码形态小幅回退
-
-协议实现提交为 `b516409e`。从 clean commit 重新构建 shared perf-clock，
-冻结后再次校验 manifest 中的 host/kernel SHA；与 S4.9 `e8320280` 使用
-完全相同的 device 0、b256、`real-compute/6,28,4,1`、2 次 warm-up/版本和
-6 个 ABBA/BAAB block。每版 12 个正式独立进程全部通过 shared heap、
-symbol、依赖、输出 tile 与构建身份门禁。证据位于：
+冻结件与逐样本证据位于：
 
 ```text
 outputs/perf_clock_freeze_b516409e_20260725_123109/
 outputs/perf_clock_pair_b516409e_vs_e8320280_20260725_123124/
+outputs/perf_clock_freeze_6275e328_20260725_124242/
+outputs/perf_clock_pair_6275e328_vs_e8320280_20260725_124301/
 ```
 
-| 版本 | 最小值 | 中位数 | 均值 | 最大值 | 样本标准差 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| S4.9 `e8320280` | 3.233ms | 3.247ms | 3.248ms | 3.262ms | 0.010ms |
-| S4.11a `b516409e` | 3.207ms | 3.259ms | 3.261ms | 3.343ms | 0.034ms |
+两轮方向一致：代码体积收敛有效，但没有把 deferred 协议转化为稳定完整
+Submit 收益。候选 normal/perf-clock 单样本还稳定出现约 88～93 次 RingBp，
+而 S4.9 冻结样本为 0。这证明提交确实更早把未就绪任务放进两个可用 slot，
+同时把同步 publication 等待转化成了 slot 背压；它是已观测到的伴随机制，
+不能据此把约 10us 回退唯一归因给 RingBp、函数调用或 I-cache。
 
-6 个 block 中候选 2 个更快、4 个更慢；block 内各取两个样本均值后，候选
-减基线的配对差中位数为 **`+11.105us / +0.342%`**，范围为
-`-18.165～+45.535us`。候选还出现一个 3.343ms 长样本，使离散度高于
-基线；单轮不能把该尾部唯一归因于 deferred 或 RingBp，但足以说明当前证据
-没有达到稳定净收益门槛。
+按实施前声明的门槛，本提交完整撤销 S4.11 代码，恢复 S4.9 eager pure
+INPUT 路径；保留本节设计、正确性补强和失败证据。若未来重试，不能再把
+deferred 当作独立必胜优化：应在参考 typed ref storage 与更深执行 slot
+已经就位后，将“deferred + 容量”作为明确耦合的架构候选重新冻结配对；
+也不能因为参考使用 14 slot 就在当前 eager 基线上单独扩大状态。
 
-因此不能保留 S4.11a 的当前代码形态。与此同时，功能取证已经证明：
+撤销后四个实现/测试文件与 `e8320280` 逐字节一致。CPU shared/private
+strict 与 b256、用户 `.venv` 下 100 项观测工具测试、CCEC
+shared/private normal/perf-clock 4/4 构建，以及 A5 shared b1/b256、
+private b1 real-compute 均通过。shared b256 恢复 `RingBp=0`，1,280 task
+和 192 active tile 完整正确。
 
-- pure INPUT 延迟解析可保持全部逻辑/数值语义；
-- normal/perf-clock 单样本分别出现 88/93 次 RingBp，提交超前确实到达
-  两个可用 slot，而不是 dead code；
-- shared perf-clock `.text` 从 129,080B 增至 157,496B，增加
-  **28,416B / 22.01%**，是当前候选与协议变化同时存在的显著代码生成变量。
-
-下一步只做一项代码生成收敛：在 `DrainReady()` 先用既有 deferred mask
-判断是否需要解析，再把 resolver 固定为单份 noinline 冷/慢 helper，避免其
-随四个 DrainReady 调用点重复内联。协议、mask 编码、publication/writer
-顺序、slot 数和终止状态都不改变。收缩后的 clean ELF 必须重新做同一配对；
-若仍无净收益，则完整撤销 S4.11 实现，只保留本记录。
-
-#### S4.11b resolver 单份化
-
-对 S4.9 与 S4.11a frozen kernel 做符号和 DWARF 行表审计后，`.text`
-增加 28,416B 的来源已经闭合：
-
-| 组成 | 增量 |
-| --- | ---: |
-| AIC/AIV orchestration 两个大函数 | +21,532B |
-| AIC/AIV finish 两个大函数 | +4,840B |
-| 4 份 noinline `ConvergeFatalStall` | +1,952B |
-| 对齐 | +92B |
-
-前四个大函数与 `ConvergeFatalStall` 共解释 99.68% 的增长；`.rodata`
-仍为 288B。行表进一步证明 resolver 完整体在 S4.11a 被内联 14 次：
-AIC/AIV orchestration 各 6 份、AIC/AIV finish 各 1 份，累计约
-14,636B。
-
-本小步只把 `ResolveDeferredSharedInputs` 标为 noinline，并在
-`DrainReady()` 先判断既有 `function_padding != 0`。mask 为 0 时原
-resolver 本来也立即返回 true；非零非法 mask 仍进入 helper fail-closed，
-publication、writer、invalidate/copy、fatal sentinel 和 completion 顺序
-均未改变。重建后的 mixed ELF 用 `nm` 精确得到 4 份 TU-local resolver：
-AIC/AIV 的 orchestration/finish 各一份，每份 904B，不是 0 份或残留 14
-份内联体。
-
-| 构建 | S4.11a `.text` | S4.11b `.text` | 减少 |
-| --- | ---: | ---: | ---: |
-| shared normal mixed | 450,360B | 437,816B | 12,544B / 2.79% |
-| shared perf-clock mixed | 157,496B | 144,440B | 13,056B / 8.29% |
-
-相对 S4.9 的 129,080B，S4.11b 仍多 15,360B，不能仅凭体积下降宣告
-性能收益。CPU shared/private strict、CCEC shared normal/perf-clock、
-A5 shared b1/b256 real-compute 均通过；b256 依赖、heap、symbol 与数值
-门禁不变，普通构建仍实际出现 90 次 RingBp。perf-clock scalar-nop0 单样本
-为 3.184ms，只用于量级检查。下一步从 clean commit 冻结并重复 S4.11a
-完全相同的 ABBA/BAAB 配对。
+恢复后的 shared perf-clock `.text=129,080B`；当前 host/kernel 与 S4.9
+冻结件分别做 SHA256 和 `cmp`，两者均逐字节相同。A5 shared b256 普通
+构建单样本为 3.344ms，仅作恢复量级检查；S4.11 撤销依据仍是上面两轮
+12+12 冻结配对，而不是这一次运行。
