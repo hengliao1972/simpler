@@ -4,7 +4,7 @@
 [`poursoul/simpler:fdwic-shared-tensormap`](https://github.com/poursoul/simpler/tree/fdwic-shared-tensormap)
 在 A5 FDWIC runtime 中实现的 shared TensorMap 方案，并与当前分支 standalone
 方案比较。本文用于后续开发决策，不表示目标分支已经合入，也不把分支文档中的
-实验记录自动当成当前分支的性能结论；当前分支 S0～S4.6 的实际实施证据另记于
+实验记录自动当成当前分支的性能结论；当前分支 S0～S4.7 的实际实施证据另记于
 第 15 节。当前继续开发和验收的后端范围固定为 CPU/CCEC。
 
 后续每个实现小步都必须先对照参考提交：可直接复用的机制要说明复用位置；
@@ -1335,14 +1335,48 @@ CCEC b256 已证明 A5 DCache/DCCI、per-slot 等待、writer commit 和真实
 纯 sequencer 的稳定净收益；后续性能结论仍用冻结 ELF 做配对多轮。本阶段
 只覆盖 CPU 与 CCEC，不做 AscendC。
 
-##### 冻结 S4.6 后的参考机制验证顺序
+##### S4.7 冻结配对与后续参考机制验证顺序
 
-在冻结当前源码、private/shared perf-clock ELF 哈希和 ABBA 配对数据前，
-不再改变协议变量。最新 shared b1 诊断样本中，QK/SF/PV/UP 的 Fanin 约为
-`2.031/10.708/30.913/44.673 us`；它只能说明 Submit 内等待 publication
-值得优先研究，不能与 perf-clock ELF 做数值相减。当前每 batch 发布 8 个
-descriptor、消费 5 个纯 INPUT，并提交 3 个 UP INOUT writer；b256 对应
-2,048/1,280/768。
+S4.7 在 clean 提交 `dc22d076` 上连续构建 private/shared CCEC perf-clock，
+随后复制为只读冻结件；循环内没有重编译。private/shared mixed ELF 的
+`.text` 分别为 126,052B/133,208B，kernel SHA256 分别为
+`f64b87e...1c46a`/`a414beb...d7402`。冻结路径为：
+
+```text
+outputs/perf_clock_freeze_dc22d076_20260725_065902/
+```
+
+每个 batches 先运行不计入统计的 warm-up ABBA，再运行
+`ABBA/BAAB` 交替的 6 个正式 block；每个 block 各含两个 private 和 shared
+独立进程，所以每模式有 12 个正式样本。56 个进程全部闭合模式、负载、
+manifest 和语义断言，正式样本结果如下：
+
+| batches | 模式 | 最小值 | 中位数 | 最大值 |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | private | 62.923 us | 66.557 us | 70.749 us |
+| 1 | shared | 64.641 us | 65.361 us | 70.824 us |
+| 256 | private | 4,072.002 us | 5,003.790 us | 5,726.435 us |
+| 256 | shared | 6,050.200 us | 7,209.016 us | 7,622.198 us |
+
+配对差值以每 block 的
+`mean(shared 两样本) - mean(private 两样本)` 计算。b1 的差值中位数为
+`-0.458 us`，范围 `-1.414～+0.084 us`，没有固定成本退化；b256 六个
+block 全部是 shared 更慢，差值中位数 `+2,149.766 us`，范围
+`+1,491.463～+3,000.363 us`，相对差中位数 `+43.430%`。原始 56 份日志、
+逐样本 JSON 和配对摘要保存在冻结目录的
+`runs/paired_real_compute/`。
+
+因此 S4.6 的准确结论是：global convoy 和活性问题已经消失，但 shared
+consumer 在 Submit 内等待 producer `published` 的规模效应仍然显著。
+`[METRIC] fanin_loads` 只统计 task completion flag 轮询，不包含
+`WaitForSharedOutputPublished()` 的 direct `Ops::Load`；b256 shared 该字段
+更小不能解释成总等待更少。
+
+最新 shared b1 诊断样本中，QK/SF/PV/UP 的 Fanin 约为
+`2.031/10.708/30.913/44.673 us`。它与上述 perf-clock 使用不同 ELF，
+只能定性支持 publication 等待方向，不能做数值相减。当前每 batch 发布
+8 个 descriptor、消费 5 个纯 INPUT，并提交 3 个 UP INOUT writer；b256
+对应 2,048/1,280/768。
 
 冻结后的低风险到高风险顺序固定为：
 
@@ -1388,7 +1422,7 @@ deferred 还可能只是把工作从 Submit 移到执行/FinalDrain。后续配�
 
 ### 阶段 R0：迁移真实 simpler
 
-只有 S0～S4 全部闭环后，才按已验证结构依次迁移：
+只有 S0～S4.7 全部闭环后，才按已验证结构依次迁移：
 
 1. 真实构建身份、缓存隔离和 CPU/CCEC ABI 握手；
 2. private ring 同构化；
@@ -2181,3 +2215,26 @@ winner 路径已经 deferred。`RingSlot/BuiltSubtask` ABI 都保留
 和槽容量成本。当前不照搬的原因是隔离变量和补齐失败边界，不是认为参考代码
 没有价值；冻结 ELF 后应先确认实际命中的 slot 路径，再用数据决定复用并删除
 standalone 的保守过程态。
+
+### 2026-07-25：S4.7 冻结 S4.6 并完成 private/shared 配对
+
+提交 `dc22d076` 后工作树 clean；private/shared CCEC perf-clock 从同一 HEAD
+连续重建，manifest 和 host/kernel SHA256 在冻结前、运行前与 56 轮结束后
+均通过。冻结件、完整日志和机器可读汇总位于：
+
+```text
+outputs/perf_clock_freeze_dc22d076_20260725_065902/
+```
+
+正式口径为 b1、b256 各 6 个 ABBA/BAAB block，每模式 12 个独立进程样本；
+每个规模另有 4 个不计入统计的 warm-up。b1 配对差值中位数
+`-0.458 us`，没有稳定 fixed cost；b256 private/shared 样本中位数为
+`5,003.790/7,209.016 us`，六个 block 的 shared-private 差值全部为正，
+配对差中位数 `+2,149.766 us`（`+43.430%`）。
+
+这轮把先前不同 ELF 的单样本疑问收敛成了同一提交、冻结产物和固定负载的
+稳定结论：去 sequencer 修复了 convoy 和正确性活性，但 shared 的规模化
+Submit 仍有约 2.15ms 中位差。下一步先做不改变 atomic/slot ABI 的 ready-ref
+直落 slot，再只对纯 INPUT 验证 deferred resolve；不先改 writer intent，也
+不把参考 MIX `BuiltSubtask` 的同步 resolve 误写成普通 `RingSlot` 的
+deferred 行为。
