@@ -2974,3 +2974,86 @@ perf-clock ELF，与 S4.9 `e8320280` 做相同 ABBA/BAAB 配对。
 主判据仍是完整 Submit；同时用同口径正常构建检查最终 drain/完整 launch。
 若 Submit 变短但最终 drain 等量变长，只能记录为工作后移。只有正确性闭合且
 冻结配对取得净收益才保留；否则像 S4.10 一样完整撤销。
+
+#### S4.11a standalone 协议实现与正确性门禁
+
+本小步已经在 standalone 落地，但尚未宣告性能保留。实现严格维持上一节的
+单变量边界：
+
+1. `CollectSharedFanin()` 对 plain pure INPUT 不再同步等待
+   `(producer,slot).published`，仍把句柄声明的 producer 加入 fanin；
+2. `PopulateSlotPayloadImpl()` 对 published 已就绪的 INPUT 直接
+   invalidate/copy descriptor；未就绪时把 16B `FdwicOutputRef` 显式
+   pack 到该 tensor 尚未生效的 `buffer_addr/buffer_size`，并在复用的
+   `function_padding` 中设置逐 tensor bit；
+3. `DrainReady()` 只有在全部 fanin flag ready 后、`ExecuteKernel()`
+   之前才解析 mask：等待精确 publication、复核
+   `last_writer==producer`、invalidate/copy 完整 128B descriptor；
+4. INOUT/OutputExisting 仍在 Submit 中 eager 等待 publication，writer
+   FetchMax 和 output publish 顺序没有移动；
+5. private、Claim、shared heap、ordinary region、slot 数、raw schema、
+   PMU 字段和 trace 字段均未改变。
+
+编码没有扩大状态体：`LocalSlot` 仍为 4,824B，`function_padding` 偏移
+仍为 12，`TensorDesc.buffer_size` 偏移仍为 8；每次 Build、成功解析、
+正常释放和失败释放都会清 mask。该 overlay 仍只用于 standalone 的隔离
+实验；真实 simpler 若迁移，应使用已有的 typed
+`shared_ref_mask/shared_refs[]`，不能照搬这种实验编码。
+
+实现审查时发现了一个不能掩盖的终止性缺口：resolver 失败虽然会广播
+fatal，但原 FinalDrain 与 RingBackpressure 都可能持有依赖失败 task 的
+slot 并永久等待。修正后的内部协议为：
+
+- `DrainReady()` 用 shared-only 的 `UINT32_MAX` 返回 resolver 终止状态，
+  与正常最多释放 4 个 slot 的返回域不冲突；
+- EfDrain 收到终止状态后清理本 worker 的全部 slot，并让当前 Submit
+  失败；
+- `WaitForSlot()` 改为返回 `bool`：本核终止状态立即失败；远端 fatal
+  只在连续 1,024 次无进展时低频观察；真正发生过等待并刚释放容量时再补
+  一次 fatal 检查，零背压快路径不增加 atomic；
+- FinalDrain 同样处理本核终止状态和远端 fatal，清理只复用单 slot
+  撤销入口，最后把终止态 `occupied_count` 归零，不伪造 completion；
+- 新增 FatalPoll 被并入已有背压/最终 drain atomic 聚合区，不增加 raw
+  字段，也避免低频检查放大泳道记录数。
+
+定向测试覆盖了 ref 逐字段编解码、ready/delayed 混合、多 bit、bit31、
+越界 mask、超限 tensor_count、脏 slot 复用、非法 publication/writer、
+INOUT 仍 eager、成功 Drain 在 Kernel 前解析、失败不执行
+Kernel/Completion，以及“两个满 slot 均依赖失败 task”的
+RingBackpressure 收敛。两轮只读审查在补齐 EfDrain、WaitForSlot 与
+FinalDrain 三个入口后未再发现 P0/P1。
+
+当前验证结果如下：
+
+| 门禁 | 结果 |
+| --- | --- |
+| CPU shared/private strict 构建与自测 | 全部 PASS |
+| CPU shared/private b256 | 全部语义、依赖、heap 与终态断言 PASS |
+| 用户 `.venv` 下 converter/PMU/HTML/exclusive 测试 | 100 项 PASS |
+| CCEC shared/private normal 与 perf-clock | 全部构建、mixed metadata、符号、relocation、manifest 门禁 PASS |
+| A5 shared b1/b256 real-compute | 全部断言 PASS；b256 1,280 task、192 active tile 正确 |
+| A5 private b1 real-compute | 全部断言 PASS |
+
+shared b256 继续精确保持：
+
+```text
+published_outputs      = 2048
+logical INPUT loads    = 1280
+INOUT writer commits   = 768
+dependency signature   = b7d985d6edb07078
+writer/map signature   = 556bec7ec8d0f323
+```
+
+private CCEC normal/perf-clock 的 `.text` 仍分别为 590,648B/125,752B；
+带 `-g` 的完整 device object 因公共头新增行号而改变，不能谎称整份 ELF
+bit-identical。shared perf-clock mixed `.text` 则从 S4.9 的
+129,080B 增至 **157,496B**，这是必须纳入配对判断的明确风险。
+
+A5 shared b256 普通构建单样本为 3.343ms，perf-clock scalar-nop0 单样本
+为 3.179ms；后者相对 S4.9 恢复身份时的 3.233ms 单样本呈正向迹象。
+与此同时，本候选普通/perf-clock 单样本分别出现 88/93 次 RingBp，而
+S4.9 冻结样本均为 0，说明 pure INPUT 延迟确实让提交推进得更早，也把
+更多尚未 ready 的 slot 推入两个可用执行槽。单次墙钟、代码尺寸和
+RingBp 都不能独立决定保留；下一步必须从 clean commit 冻结本候选，与
+`e8320280` 冻结件完成同一 ABBA/BAAB 配对，并同时核对完整 launch/final
+drain，防止把单纯工作后移写成净收益。

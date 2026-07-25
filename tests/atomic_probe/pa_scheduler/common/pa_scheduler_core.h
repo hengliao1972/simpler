@@ -388,6 +388,67 @@ PA_DEVICE bool SlotReady(PA_GM SchedulerState *state, PA_GM LocalSlot &slot, Loc
     return true;
 }
 
+#if PTO_FDWIC_SHARED_MAP
+constexpr uint32_t kDrainFatalResult = UINT32_MAX;
+
+template <typename Ops>
+PA_DEVICE bool ResolveDeferredSharedInputs(
+    PA_GM SchedulerState *state, PA_GM LocalSlot &slot, LocalStats &stats
+);
+
+PA_DEVICE bool DiscardOccupiedSlot(
+    PA_GM WorkerState &worker, PA_GM LocalSlot &slot
+) {
+    if (!slot.occupied) {
+        return false;
+    }
+    const bool accounting_valid = worker.occupied_count != 0;
+    slot.function_padding = 0;
+    slot.built = false;
+    slot.occupied = false;
+    if (accounting_valid) {
+        --worker.occupied_count;
+    }
+    return accounting_valid;
+}
+
+PA_DEVICE uint32_t DiscardAllOccupiedSlots(PA_GM WorkerState &worker) {
+    // fatal 已经使整轮结果无效；这里的职责是让每个 worker 都能从
+    // FinalDrain 收敛退出，不能让失败 task 的后继 slot 永久等待一个
+    // 不会再发布的 completion。逐 slot 复用同一撤销入口，最后把可能
+    // 已损坏的计数归零，避免“槽已清空、计数非零”继续自旋。
+    uint32_t discarded = 0;
+    for (uint32_t index = 0; index < kPrivateSlots; ++index) {
+        PA_GM LocalSlot &slot = worker.slots[index];
+        if (!slot.occupied) {
+            continue;
+        }
+        ++discarded;
+        (void)DiscardOccupiedSlot(worker, slot);
+    }
+    worker.occupied_count = 0;
+    return discarded;
+}
+
+template <typename Ops>
+PA_DEVICE_NOINLINE bool ConvergeFatalStall(
+    PA_GM SchedulerState *state, PA_GM WorkerState &worker,
+    LocalStats &stats, uint32_t &stalled_polls
+) {
+    // 正常背压/FinalDrain 不应为每次空转再增加一个跨核 atomic。仅在
+    // 连续 1024 次没有释放 slot 时低频观察 fatal；一旦看见全局失败，
+    // 就清掉本 worker 的全部残留 slot。失败广播单调置 1，因此不会
+    // 永久漏检，也不改变成功路径的任务/completion 语义。
+    ++stalled_polls;
+    if ((stalled_polls & 1023U) != 0 ||
+        !IsFatal<Ops>(state, stats)) {
+        return false;
+    }
+    (void)DiscardAllOccupiedSlots(worker);
+    return true;
+}
+#endif
+
 PA_DEVICE void RecordKernelCycles(LocalStats &stats, TaskKind kind, uint64_t cycles) {
     const uint32_t index = KindIndex(kind) - 1;
     ++stats.result.kernel_counts[index];
@@ -422,6 +483,21 @@ PA_DEVICE uint32_t DrainReady(
         if (!slot.occupied || !slot.built || !SlotReady<Ops>(state, slot, stats)) {
             continue;
         }
+#if PTO_FDWIC_SHARED_MAP
+        // fanin flag ready 只证明 producer 数据完成；deferred INPUT 的
+        // descriptor 必须在 Kernel 前完成 acquire、invalidate 与原地复制。
+        // 失败 slot 只释放一次，且不得进入 ExecuteKernel/CompleteTask。
+        if (!ResolveDeferredSharedInputs<Ops>(state, slot, stats)) {
+            SetFatal<Ops>(
+                state, stats, static_cast<int32_t>(slot.task_id)
+            );
+            (void)DiscardOccupiedSlot(worker, slot);
+            // UINT32_MAX 是只在 shared 冷失败路径出现的内部状态；调用方
+            // 据此必须停止继续 Build/Submit，而不能把“恰好释放 0 个”
+            // 与 resolver 失败混为普通背压。
+            return kDrainFatalResult;
+        }
+#endif
         const TaskKind kind = static_cast<TaskKind>(slot.kind + 1);
         const uint64_t kernel_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
         Ops::ExecuteKernel(state, worker, kind, NopCountForKind(state->config.nops, kind));
@@ -439,6 +515,9 @@ PA_DEVICE uint32_t DrainReady(
         );
         slot.built = false;
         slot.occupied = false;
+#if PTO_FDWIC_SHARED_MAP
+        slot.function_padding = 0;
+#endif
         --worker.occupied_count;
         ++stats.result.placement[static_cast<uint32_t>(place)];
         ++freed;
@@ -456,7 +535,7 @@ PA_DEVICE int32_t FindFreeSlot(PA_GM WorkerState &worker) {
 }
 
 template <typename Ops, bool Profile>
-PA_DEVICE void WaitForSlot(
+PA_DEVICE bool WaitForSlot(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_id, LocalStats &stats
 ) {
     // 四个物理 slot 中预留两个 won slot 语义位，仅有 kUsableSlots 个可供本图使用；满时靠 drain 取得进展。
@@ -465,18 +544,55 @@ PA_DEVICE void WaitForSlot(
     // 只聚合这个显式背压等待区中的 fanin 观察；每次 Submit 开头的
     // opportunistic EfDrain 仍保留逐条 Atomic，不能仅凭 site 名称全局聚合。
     const uint32_t poll_region = AtomicPollRegionBegin<Ops>(
-        stats.trace, stats.result, TraceAtomicSiteMask(AtomicSite::FaninFlagLoad)
+        stats.trace, stats.result,
+        TraceAtomicSiteMask(AtomicSite::FaninFlagLoad) |
+            TraceAtomicSiteMask(AtomicSite::FatalPoll)
     );
+#if PTO_FDWIC_SHARED_MAP
+    uint32_t stalled_polls = 0;
+    bool failed = false;
+#endif
     // 退出条件只有 occupied_count 重新低于可用容量；依赖尚未 ready 时 SpinHint 后继续重试。
     while (worker.occupied_count >= kUsableSlots) {
         waited = true;
         ++stats.result.wait_iterations[0];
-        if (DrainReady<Ops>(
-                state, worker, DrainPlace::RingBackpressure, stats
-            ) == 0) {
+        const uint32_t drained = DrainReady<Ops>(
+            state, worker, DrainPlace::RingBackpressure, stats
+        );
+#if PTO_FDWIC_SHARED_MAP
+        if (drained == kDrainFatalResult) {
+            (void)DiscardAllOccupiedSlots(worker);
+            failed = true;
+            break;
+        }
+        if (drained == 0) {
+            if (ConvergeFatalStall<Ops>(
+                    state, worker, stats, stalled_polls
+                )) {
+                failed = true;
+                break;
+            }
+            Ops::SpinHint();
+        } else {
+            stalled_polls = 0;
+        }
+#else
+        if (drained == 0) {
             Ops::SpinHint();
         }
+#endif
     }
+#if PTO_FDWIC_SHARED_MAP
+    // 本核 resolver 可能在释放一个 slot 的同时置 fatal，使容量条件立即
+    // 变为可用；只有真正发生过等待时才补这一次检查，零背压快路径不增
+    // atomic。远端失败也会在此阻止当前 winner 继续建新 slot。
+    if (!failed && waited && IsFatal<Ops>(
+            state, stats, static_cast<int32_t>(task_id)
+        )) {
+        (void)DiscardAllOccupiedSlots(worker);
+        failed = true;
+    }
+#endif
     AtomicPollRegionEnd<Ops>(stats.trace, stats.result, poll_region);
     if (waited) {
         ++stats.result.wait_events[0];
@@ -491,6 +607,11 @@ PA_DEVICE void WaitForSlot(
             TraceTimestamp<Ops>(stats.trace, stats.result)
         );
     }
+#if PTO_FDWIC_SHARED_MAP
+    return !failed;
+#else
+    return true;
+#endif
 }
 
 template <typename Ops, bool Profile>
@@ -670,7 +791,11 @@ PA_DEVICE bool BuildWinner(
 ) {
     // kernel winner 不在 Submit 内立即执行计算，而是把完整 payload 和 fanin 存入自己的私有 ring slot。
     // 后续 EfDrain/背压 drain/最终 drain 在依赖满足后执行它，这正是 PA 的 Submit 与执行解耦点。
-    WaitForSlot<Ops, Profile>(state, worker, task_id, stats);
+    if (!WaitForSlot<Ops, Profile>(
+            state, worker, task_id, stats
+        )) {
+        return false;
+    }
 #if !PTO_FDWIC_SHARED_MAP
     // private heap_next 是单调 ring 坐标，必须通过 frontier/vend 防止覆盖。
     // shared S3.2 使用有界 shard cursor 且首版禁止回绕，两种坐标不能混用。
@@ -727,15 +852,10 @@ PA_DEVICE bool DiscardBuiltTask(
         if (!slot.occupied || slot.task_id != task_id) {
             continue;
         }
-        const bool accounting_valid = worker.occupied_count != 0;
-        slot.built = false;
-        slot.occupied = false;
-        if (accounting_valid) {
-            --worker.occupied_count;
-        }
         // 即使 occupied_count 本身已经损坏，终止路径也必须先清掉 slot，
-        // 避免 FinalDrain 执行未封口任务；返回 false 保留计数异常证据。
-        return accounting_valid;
+        // 避免 FinalDrain 执行未封口任务；共享 helper 还会清 deferred
+        // mask，防止该 slot 复用时继承旧句柄。
+        return DiscardOccupiedSlot(worker, slot);
     }
     return false;
 }
@@ -835,6 +955,67 @@ PA_DEVICE bool WaitForSharedOutputPublished(
 }
 
 template <typename Ops>
+PA_DEVICE bool ResolveDeferredSharedInputs(
+    PA_GM SchedulerState *state, PA_GM LocalSlot &slot, LocalStats &stats
+) {
+    // fatal 的统一 trace/计数仍由 DrainReady 调用点发布；保留 stats 参数
+    // 使 resolver 的设备/CPU 接口与该失败边界绑定，而不在内部重复写 fatal。
+    (void)stats;
+    uint32_t pending = slot.function_padding;
+    if (pending == 0) {
+        return true;
+    }
+    if (slot.tensor_count > kMaxTaskTensors) {
+        return false;
+    }
+    const uint32_t valid_mask =
+        slot.tensor_count == kMaxTaskTensors
+            ? UINT32_MAX
+            : ((1U << slot.tensor_count) - 1U);
+    if ((pending & ~valid_mask) != 0) {
+        return false;
+    }
+
+    for (uint32_t index = 0; index < slot.tensor_count; ++index) {
+        const uint32_t bit = 1U << index;
+        if ((pending & bit) == 0) {
+            continue;
+        }
+        // 先把两个编码 word 完整解码到局部变量；后面的 128B copy 会
+        // 原地覆盖 slot.tensors[index]，不能再从同一存储读取 ref。
+        const FdwicOutputRef output_ref =
+            DecodeDeferredSharedOutputRef(slot.tensors[index]);
+        if (!IsPlainSharedOutputRef(output_ref) ||
+            output_ref.producer_task_id < 0 ||
+            output_ref.producer_task_id >=
+                static_cast<int32_t>(slot.task_id)) {
+            return false;
+        }
+        if (!WaitForSharedOutputPublished<Ops>(
+                state->shared_map, output_ref, &state->fatal.value
+            )) {
+            return false;
+        }
+        PA_GM SharedOutputCell &cell =
+            state->shared_map.shared_outputs[
+                static_cast<uint32_t>(output_ref.producer_task_id)
+            ];
+        if (Ops::Load(
+                &cell.last_writer[output_ref.output_slot].value
+            ) != output_ref.producer_task_id) {
+            return false;
+        }
+        PA_GM const TensorDesc &shared_tensor =
+            cell.tensors[output_ref.output_slot];
+        Ops::InvalidateRegion(&shared_tensor, sizeof(shared_tensor));
+        CopyGmTensor(slot.tensors[index], shared_tensor);
+        slot.function_padding &= ~bit;
+        pending &= ~bit;
+    }
+    return pending == 0 && slot.function_padding == 0;
+}
+
+template <typename Ops>
 PA_DEVICE uint32_t CollectSharedFanin(
     PA_GM SharedTensorMapSidecar &map, const TaskArgs &args,
     int32_t task_id, int32_t heap_window, LocalStats &stats,
@@ -874,19 +1055,25 @@ PA_DEVICE uint32_t CollectSharedFanin(
                 protocol_ok = false;
                 return 0;
             }
-            PA_GM SharedOutputCell &cell =
-                map.shared_outputs[static_cast<uint32_t>(output_ref.producer_task_id)];
-            if (!WaitForSharedOutputPublished<Ops>(
-                    map, output_ref, fatal
-                )) {
-                protocol_ok = false;
-                return 0;
-            }
             if (tag != TensorArgType::Input &&
                 tag != TensorArgType::Inout &&
                 tag != TensorArgType::OutputExisting) {
                 protocol_ok = false;
                 return 0;
+            }
+            PA_GM SharedOutputCell &cell =
+                map.shared_outputs[static_cast<uint32_t>(output_ref.producer_task_id)];
+            const bool pure_input = tag == TensorArgType::Input;
+            if (!pure_input) {
+                // writer 型引用仍沿用 eager 协议：Submit 内必须等到
+                // descriptor 发布并确认旧 writer，不能与 pure INPUT 的
+                // deferred resolve 一起移动线性化时机。
+                if (!WaitForSharedOutputPublished<Ops>(
+                        map, output_ref, fatal
+                    )) {
+                    protocol_ok = false;
+                    return 0;
+                }
             }
             // 同一 task 对同一 symbol 最多只能有一个写引用，否则后面的
             // writer 提交会把本 task 自己误当成预期 producer。
@@ -916,10 +1103,14 @@ PA_DEVICE uint32_t CollectSharedFanin(
             }
             const int64_t writer =
                 Ops::Load(&cell.last_writer[output_ref.output_slot].value);
-            // PA Case1 中每个 fresh symbol 只有一个后继 writer；INPUT 与
-            // INOUT 都必须仍指向句柄声明的原 producer。解析阶段只读取，
-            // 不能提前把“准备执行”冒充成“writer 已提交”。
-            if (writer != output_ref.producer_task_id) {
+            // 未发布 pure INPUT 的 writer 初值允许为 -1；fanin 仍直接指向
+            // 句柄 producer，执行前 resolver 会在 published acquire 后再次
+            // 要求 writer==producer。ready INPUT 和所有 writer 型引用仍
+            // 必须指向原 producer，禁止把 Case1 脑补成多级 writer 链。
+            if ((!pure_input &&
+                 writer != output_ref.producer_task_id) ||
+                (pure_input && writer != -1 &&
+                 writer != output_ref.producer_task_id)) {
                 protocol_ok = false;
                 return 0;
             }
@@ -1683,13 +1874,22 @@ PA_DEVICE bool SubmitCallbackTask(
 
     const uint64_t efdrain_begin = submit_begin;
     BeginSubmitPmuPhase<SubmitPmuPhase::EfDrain, Ops>(pmu_context);
-    DrainReady<Ops>(state, worker, DrainPlace::EfDrain, stats);
+    const uint32_t efdrain_result =
+        DrainReady<Ops>(state, worker, DrainPlace::EfDrain, stats);
     EndSubmitPmuPhase<SubmitPmuPhase::EfDrain, Ops>(pmu_context);
     const uint64_t efdrain_end = TraceTimestamp<Ops>(stats.trace, stats.result);
     WriteTrace<Profile>(
         stats.trace, stats.result, static_cast<int32_t>(task_id), -1,
         TracePhase::EfDrain, ProfilePhase::EfDrain, efdrain_begin, efdrain_end
     );
+#if PTO_FDWIC_SHARED_MAP
+    if (efdrain_result == kDrainFatalResult) {
+        (void)DiscardAllOccupiedSlots(worker);
+        return false;
+    }
+#else
+    (void)efdrain_result;
+#endif
 
     const uint64_t claim_begin = efdrain_end;
     BeginSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
@@ -2107,7 +2307,9 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     }
     const uint32_t final_poll_region = AtomicPollRegionBegin<Ops>(
         stats.trace, stats.result,
-        TraceAtomicSiteMask(AtomicSite::ReplayDonePoll) | TraceAtomicSiteMask(AtomicSite::FaninFlagLoad)
+        TraceAtomicSiteMask(AtomicSite::ReplayDonePoll) |
+            TraceAtomicSiteMask(AtomicSite::FaninFlagLoad) |
+            TraceAtomicSiteMask(AtomicSite::FatalPoll)
     );
     bool leaf_forwarded = false;
     bool middle_forwarded = false;
@@ -2115,9 +2317,28 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     bool middle_released = false;
     bool leaf_released = false;
     bool global_release_observed = false;
+#if PTO_FDWIC_SHARED_MAP
+    uint32_t stalled_final_drain_polls = 0;
+#endif
     while (true) {
-        const uint32_t freed =
+        const uint32_t drain_result =
             DrainReady<Ops>(state, worker, DrainPlace::FinalDrain, stats);
+        const uint32_t freed =
+#if PTO_FDWIC_SHARED_MAP
+            drain_result == kDrainFatalResult ? 0U :
+#endif
+            drain_result;
+#if PTO_FDWIC_SHARED_MAP
+        if (drain_result == kDrainFatalResult) {
+            (void)DiscardAllOccupiedSlots(worker);
+        } else if (freed != 0) {
+            stalled_final_drain_polls = 0;
+        } else {
+            (void)ConvergeFatalStall<Ops>(
+                state, worker, stats, stalled_final_drain_polls
+            );
+        }
+#endif
         const bool all_replayed = hierarchical_final_barrier ?
                                       ProgressHierarchicalFinalBarrier<Ops>(
                                           state->final_barrier, final_barrier_shape, worker, stats,

@@ -2066,3 +2066,47 @@ b1/b256、private b1 均通过。重新构建的 shared perf-clock
 单轮为 3.233ms，Claim 恢复到 73,728，96 个 worker 均有 winner，
 `max_wins_per_worker=35`。这条单轮只作为恢复身份与量级检查；S4.10
 撤销决定仍以此前 12+12 样本的冻结配对为依据。
+
+#### 7.5.22 S4.11 pure INPUT 延迟解析对 atomic 口径的影响
+
+S4.11a 只调整 shared fresh-output 的 pure INPUT publication 读取时机，
+没有删除 Claim、completion、fanin flag、INOUT writer 或 fatal 的协议
+atomic：
+
+```text
+原路径：
+  CollectSharedFanin
+    → published atomicAdd(0)，未就绪则在 Submit 内轮询
+    → last_writer atomicAdd(0)
+  BuildWinner
+    → copy descriptor
+
+候选路径：
+  CollectSharedFanin
+    → last_writer atomicAdd(0)，不等待 pure INPUT publication
+  BuildWinner
+    → published atomicAdd(0) 单次探测
+    → ready 则 copy；未就绪则保存 ref/mask
+  DrainReady（fanin task flag ready 后）
+    → 精确确认 published 与 last_writer
+    → copy descriptor，再执行 Kernel
+```
+
+因此 ready INPUT 的物理读取数量没有被冒充成“已消减”：publication 的
+一次读取只是从 Collect 移到 Build；真正变化的是未就绪 INPUT 不再在
+Submit 内反复轮询，而是允许后续 Submit 继续推进，执行前再完成确认。
+INOUT/OutputExisting 仍完整保留原 eager publication wait 与 writer
+FetchMax。
+
+现有 `shared_symbol_input_loads` 是逻辑 INPUT 引用计数，不是 physical
+atomic 指令数；b256 仍严格为 1,280。`fanin_ready/not_ready` 只统计 task
+completion flag 的读取，也不能拿来代表 output publication polling。
+本实现继续复用既有 `Ops::Load`，没有为候选增加 raw/trace 字段；因此普通
+atomic 泳道不会把这次 untraced publication probe 伪装成可逐条归因的新
+站点。候选最终保留与否只由 clean perf-clock 配对决定，atomic 文档只记录
+协议位置和可解释边界。
+
+resolver 冷失败新增的 terminal sentinel 不是 atomic。为防失败 task 的
+后继 slot 永久等待，RingBackpressure/FinalDrain 在连续 1,024 次无进展时
+低频读取全局 fatal；该 `FatalPoll` 被纳入已有 poll-region 聚合，不增加
+raw 字段，零背压成功快路径也不增加该读取。
