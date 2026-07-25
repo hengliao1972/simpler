@@ -3050,3 +3050,122 @@ private b1 real-compute 均通过。shared b256 恢复 `RingBp=0`，1,280 task
 冻结件分别做 SHA256 和 `cmp`，两者均逐字节相同。A5 shared b256 普通
 构建单样本为 3.344ms，仅作恢复量级检查；S4.11 撤销依据仍是上面两轮
 12+12 冻结配对，而不是这一次运行。
+
+### 2026-07-25：S4.12 先裁掉 shared loser 的空 finish 外壳
+
+#### 重新核对参考调用链后的优先级修正
+
+S4.10 和 S4.11 撤销后，重新逐行核对参考提交 `2866ad73` 的
+`pto_orchestration_api.h` 与 `submit_runtime.h`。参考 shared 路径把一次
+kernel submit 拆为：
+
+```text
+rt_presubmit_task()
+  -> EfDrain
+  -> role/candidate 路由
+  -> Claim
+  -> SubmitToken
+
+winner -> rt_submit_winner(tok, args)
+          -> Materialize/Register/Fanin/Build
+loser  -> rt_submit_loser(tok, output_count)
+          -> 只按 (task_id, output_count) 返回 SharedTaskOutputs
+```
+
+参考源码在 shared 宏下根本不编译 `dist_submit_loser_impl()`；loser 不会
+为了闭合一个通用接口再进入 Materialize、Register 或 split finish。其稳定
+返回值来自 task/output-slot 符号，而不是 winner 的物理 descriptor。
+
+standalone 当前已经做到了“kernel winner 才构造重参数”，但 Claim loser
+在 `PrepareSharedTaskOutputs()` 之后仍构造 `CallbackSubmitTicket`，调用
+`FinishCallbackSubmitBody()`。在 perf-clock 构建里，大部分 trace/PMU
+模板会被编译删除，然而 generic finish 的控制流、跨 TU 调用和若干空阶段
+仍真实存在。b256 每核回放 1,280 个逻辑 task，96 核共有：
+
+```text
+逻辑 Submit       = 96 × 1,280 = 122,880
+唯一 winner       = 1,280
+当前 loser finish = 122,880 - 1,280 = 121,600
+```
+
+这项差异比下一步直接修改 cursor ABI 更适合作为独立候选：
+
+- 不改变 Claim 候选集合、winner 分布和任何 atomic 次数；
+- 不改变 shared heap、symbol、fanin、slot 或 WorkerState；
+- 不引入 S4.10 已观测到的 4-owner winner 集中；
+- 不重上 S4.11 的 deferred 协议，也不依赖尚未证明的 slot 深度。
+
+因此把原计划中的 `alloc_cursor[3][8]` 后移一阶段。这个调整来自参考源码
+调用链，而不是根据单次时间猜测。
+
+#### S4.12a 的固定边界
+
+本阶段只裁 shared loser 的 **Claim 之后、generic finish 之前** 的空路径：
+
+1. 所有 worker 仍执行现有 EfDrain 和 Claim；Alloc 仍由 96 核竞争，
+   QK/PV 仍由 32 个 AIC 竞争，SF/UP 仍由 64 个 AIV 竞争；
+2. 每个 actor 都先建立相同的 `SharedTaskOutputs`，保证后续 orchestration
+   得到完全一致的 `(task_id, output_slot)`；
+3. Alloc 的三个静态 Output 参数仍由所有 actor 构造，因为参考
+   `alloc_tensors(args)` 的参数构造发生在 inner submit 入口外；不能借
+   loser 早退偷删这部分调用方成本；
+4. kernel loser 不构重参数，并在稳定符号建立后直接做逻辑收尾；只有
+   1,280 个 winner 进入 `FinishCallbackSubmitBody()` 和 split finish；
+5. 每核 `submits` 仍必须等于 `5*batches`。若末个 UP 是本核 loser，
+   早退路径仍负责记录该核最后一个 Submit 的 perf-clock/PMU 结束边界；
+6. private 路径逐字节保持原控制流，不共享 shared 的早退分支。
+
+成功路径不为这项优化增加新的 fatal load，也不新增 raw 字段。异常路径
+仍是有限回放：任何 winner 或既有协议检查发布 fatal 后，本轮结果整体
+无效；loser 快返不能发布 descriptor、task flag 或 completion，因而不会
+把错误路径误提交为可执行任务。
+
+#### 观察口径必须跟真实路径一起收敛
+
+不能为了让旧工具继续看到整齐矩形而给 loser 伪造零时长
+Materialize/Register/Submit。S4.12a 的泳道应真实呈现：
+
+| 阶段 | b256 预计调用数 |
+| --- | ---: |
+| 逻辑 Submit | 122,880 |
+| EfDrain | 122,880 |
+| Claim span | 122,880 |
+| 实际 ClaimMax | 73,728 |
+| Materialize/PrepareMap/Register/Submit span | 1,280 |
+| split finish | 1,280 |
+
+`submit-pmu none` 仍覆盖每核完整 orchestration/Submit 窗口；`claim` 和
+`efdrain` 局部变体仍覆盖所有逻辑 task；`materialize` 和 `register`
+只覆盖 winner。converter/exclusive analyzer 根据已有 Claim winner
+信息接受这种稀疏主体，不新增 device 记录字段。泳道空白继续归入既有
+`BetweenSubmitResidual`，不能另造 loser replay 区域扩大 raw。
+
+#### 正确性、性能门禁和后续顺序
+
+实现后先用 CPU 定向锁定：
+
+- 五类 loser 都返回正确 output symbol，且不改变 heap、publication、
+  writer、slot、completion 和依赖状态；
+- Alloc loser 仍精确构造三项静态 Output 参数；
+- split finish 调用数和 task-id 和只等于本核 winner 集合，逻辑 submits
+  仍为完整 `5*batches`；
+- 末 task loser 仍闭合首末性能边界；
+- private 的 eager loser finish 与原计数不变。
+
+随后运行 Python converter/analyzer/PMU 测试、CPU shared/private b1/b256、
+CCEC shared/private normal/perf-clock/submit-PMU 构建以及 A5 shared
+b1/b256 和 private b1。clean 实现提交冻结后，与 S4.9 `e8320280` 使用
+同一 device、两次预热、六个 ABBA/BAAB block 做 12+12 正式配对。
+
+只有正确性闭合且完整 Submit 取得稳定净收益才保留 S4.12a。若无收益则
+完整撤销，不以“少了 121,600 次函数调用”替代墙钟结果。若保留，再分开
+验证：
+
+1. S4.12b：把 single-lane wrong-role 判断前移，减少无资格 actor 的
+   Claim/EfDrain 外壳；
+2. S4.13：参考的 `alloc_cursor[3 lanes][8 shards]` 与 24-owner 映射；
+3. 再比较 kernel cursor 8/16 分片；
+4. 最后用独立四格实验评估 eager/deferred 与 4/14 slot 的耦合关系。
+
+上述四项不能合成一个提交，否则无法判断收益来自 loser 裁剪、winner
+分布、cursor cacheline 冲突还是在途容量。
