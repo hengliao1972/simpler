@@ -79,12 +79,11 @@ constexpr uint32_t kAivWorkers = 64;
 constexpr uint32_t kWorkers = kAicWorkers + kAivWorkers;
 constexpr uint32_t kRuntimeMaxWorkers = 108;
 constexpr uint32_t kCursorShards = 4;
-// S4.16a 只把 shared Vector sidecar 的尾部物理容量从8扩到16，
-// active shards 仍保持 S4.14b 已验证的8。前八条地址与 device 热路径
-// 的取模表达式均不变；S4.16b 才会在相同地址和 state 大小下只改
-// active 8→16。
+// S4.16a 已把 shared Vector sidecar 的物理容量从8扩到16；S4.16b
+// 保持数组起点、物理容量、state 大小和初始化不变，只把 active
+// shards 从8改为16，用同址对照单独评价分片变化。
 constexpr uint32_t kSharedVectorCursorCapacity = 16;
-constexpr uint32_t kSharedVectorCursorShards = 8;
+constexpr uint32_t kSharedVectorCursorShards = 16;
 constexpr uint32_t kSharedVectorCursorShardMask =
     kSharedVectorCursorShards - 1;
 static_assert(
@@ -817,8 +816,8 @@ struct alignas(64) SharedTensorMapSidecar {
     // 与全局 aggregate vend 独占 cache line，避免不同 winner 的原子更新伪共享。
     AtomicLine shared_heap_cursor[kSharedHeapShards];
     AtomicLine shared_heap_vend;
-    // S4.16a 在既有 shared-only Vector cursor 尾部预留后八条物理线，
-    // 当前仍只启用前八条。production prefix 和已验证的
+    // S4.16a 在既有 shared-only Vector cursor 尾部预留后八条物理线；
+    // S4.16b 启用全部十六条。production prefix 和已验证的
     // region/output/heap 字段均不移动，也不宣称该地址与参考 DistGlobal
     // 具有相同字节 offset。
     AtomicLine shared_vector_cursor[kSharedVectorCursorCapacity];
@@ -1141,8 +1140,8 @@ static_assert(
 // 因此测试控制信息不会改变被测字段 offset。
 struct alignas(64) SchedulerState {
     // production prefix 的三组四分片 cursor 服务 AIC、private AIV 与
-    // Alloc；shared AIV 使用 sidecar 尾部 capacity16/active8 的
-    // Vector cursor，S4.16a 新增的后八条只作同址扩分片控制。
+    // Alloc；shared AIV 使用 sidecar 尾部 capacity16/active16 的
+    // Vector cursor。S4.16b 只启用 S4.16a 已预留的后八条物理线。
     // 同 task 的 eligible workers 仍竞争同一 shard，只有旧值小于
     // task_id 的调用成为 winner。
     AtomicLine cube_cursor[kCursorShards];

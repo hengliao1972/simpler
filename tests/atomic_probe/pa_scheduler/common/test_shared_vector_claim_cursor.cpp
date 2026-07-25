@@ -25,8 +25,8 @@ using namespace pa_scheduler;
 int g_failures = 0;
 static_assert(
     kSharedVectorCursorCapacity == 16 &&
-        kSharedVectorCursorShards == 8,
-    "S4.16a must keep capacity16/active8"
+        kSharedVectorCursorShards == 16,
+    "S4.16b must keep capacity16/active16"
 );
 
 // 只实现 Claim/atomic trace 会触及的最小 Ops 接口，同时记录 FetchMax
@@ -148,7 +148,7 @@ void TestSharedVectorRouting() {
         "SF Claim issues one FetchMax to the expected sidecar address"
     );
 
-    // S4.14b 在相同 sidecar 上把 active 4→8：task 14 改落 shard 6，
+    // S4.16b 在相同 sidecar 上把 active 8→16：task 14 改落 shard 14，
     // task 2 仍落 shard 2，正好锁定新增的取模范围。
     const ClaimOutcome up = Claim<ClaimTestOps>(
         state, *worker, 14, TaskKind::Up, stats
@@ -156,32 +156,32 @@ void TestSharedVectorRouting() {
     Check(
         up.attempted && up.won &&
             state->shared_map.shared_vector_cursor[2].value == 2 &&
-            state->shared_map.shared_vector_cursor[6].value == 14,
-        "active eight-shard routing separates task 2 and task 14"
+            state->shared_map.shared_vector_cursor[14].value == 14,
+        "active sixteen-shard routing separates task 2 and task 14"
     );
 
-    // task 4(UP) 与 task 12(SF) 在 %8 下同落 shard 4，在未来 %16
-    // 下才会分到 shard 4/12。S4.16a 用它们锁定“容量已扩展、active
-    // 仍为8”，并逐次验证后八条物理线尚未进入热路径。
-    const ClaimOutcome active8_first = Claim<ClaimTestOps>(
+    // task 4(UP) 与 task 12(SF) 在 S4.16a 的 %8 下同落 shard 4；
+    // S4.16b 的 %16 必须把它们分到 shard 4/12，逐次锁定后八条
+    // 物理线已真正进入 Claim 热路径。
+    const ClaimOutcome active16_first = Claim<ClaimTestOps>(
         state, *worker, 4, TaskKind::Up, stats
     );
     Check(
-        active8_first.attempted && active8_first.won &&
+        active16_first.attempted && active16_first.won &&
             ClaimTestOps::last_fetch_max_address ==
                 &state->shared_map.shared_vector_cursor[4].value,
         "task 4 issues FetchMax to active Vector shard 4"
     );
-    const ClaimOutcome active8_second = Claim<ClaimTestOps>(
+    const ClaimOutcome active16_second = Claim<ClaimTestOps>(
         state, *worker, 12, TaskKind::Sf, stats
     );
     Check(
-        active8_second.attempted && active8_second.won &&
+        active16_second.attempted && active16_second.won &&
             ClaimTestOps::last_fetch_max_address ==
-                &state->shared_map.shared_vector_cursor[4].value &&
-            state->shared_map.shared_vector_cursor[4].value == 12 &&
-            state->shared_map.shared_vector_cursor[12].value == -1,
-        "capacity16/active8 keeps task 4 and task 12 on shard 4"
+                &state->shared_map.shared_vector_cursor[12].value &&
+            state->shared_map.shared_vector_cursor[4].value == 4 &&
+            state->shared_map.shared_vector_cursor[12].value == 12,
+        "capacity16/active16 separates task 4 and task 12"
     );
 
     const ClaimOutcome same_shard = Claim<ClaimTestOps>(
@@ -315,7 +315,7 @@ void TestB256VectorCursorFinalState() {
     );
     Check(
         exact,
-        "b256 preserves 64 AIV candidates, one winner, 4096 attempts per active shard, eight inactive lines, and exact high watermarks"
+        "b256 preserves 64 AIV candidates, one winner, 2048 attempts on each of sixteen active lines, and exact high watermarks"
     );
 
     munmap(worker, sizeof(*worker));

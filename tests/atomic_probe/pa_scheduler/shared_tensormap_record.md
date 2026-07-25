@@ -4064,5 +4064,55 @@ S4.16a 与 S4.16b，恢复 `319077a9` 的 capacity 8、active 8 布局；
 S4.16b 的 active 常量变化会重新触发 CCEC 内联、常量传播和静态布局
 变化，因此其结果只能评价“静态 shared Vector16 构建整体”，不能仅凭
 墙钟进一步拆分为 atomic 竞争、I-cache、页映射或 winner 到达时序中的
-某一项。当前已完成预登记、S4.16a 正确性和静态布局成本配对；
-S4.16b 尚未实现或测量。
+某一项。以上是测量前规则；S4.16a 正确性和静态布局成本配对已经
+完成，S4.16b 的当前实现结果如下。
+
+#### S4.16b 正确性实测
+
+S4.16b 已按预登记的同址单变量实现：`kSharedVectorCursorCapacity`
+保持 16，只把 `kSharedVectorCursorShards` 从 8 改为 16。
+`shared_vector_cursor` 起点、sidecar/state 大小、初始化、传输长度、
+production prefix、Cube/Alloc 路由和所有观测字段均未改变。
+
+提交前正确性结果如下：
+
+- 用户目录 GCC 15 会生成当前系统汇编器不识别的 `.base64` 伪指令，
+  首次 CPU build 因此失败；其后误启动的旧 CPU 二进制结果全部作废。
+  有效 CPU 证据均由显式 `CXX=/usr/bin/g++`、`set -e` 的完整重建产生；
+- CPU shared 定向测试逐次证明 task 2/14 命中 shard 2/14、task 4/12
+  命中 shard 4/12；shared b1/b256 完整回放通过，b256 的 32,768 次
+  Vector Claim 精确摊到十六条线，每线 2,048 次；
+- CPU private b1 保持 1,007,115,968B、production-prefix
+  `vector_cursor[4]` 路由和全部业务断言；Python 独立测试 100 项通过；
+- CCEC private 的 7 个变体全部构建并通过 manifest，perf-clock
+  `.text` 仍为 125,752B、
+  `94017cdbeb758c0710aec30f238b396d217e648581cc5c67f2deaaa14bca79ef`，
+  `.rodata` 仍为 300B、
+  `31d12b9797d051f1529d1792055ac9f46449022118990ca65f458e41f09bbfea`，
+  与冻结 private 基线逐字节一致；
+- CCEC shared 的 7 个变体曾被误并发写入同一构建目录，因此那批产物
+  全部作废；随后按 swimlane、perf-clock、五种 submit-PMU 严格串行
+  重建，源码 diff 指纹前后均为
+  `4c2e9b54c594579fee2a0cafb792a054117e35168e85525f012434c32d0e13ae`，
+  7 份 manifest 均独立严格校验通过；
+- S4.16b shared perf-clock `.text` 仍为 129,080B，但 SHA256 变为
+  `331daafefa3dcb18c047a6333da797caafdfc48f7d1cc78ea3e33b0c39966a15`；
+  S4.16a 为 `53f53c4d...6888a64`。`.rodata` 仍为 288B、
+  `239e9977...22ded`。这证明 active 常量触发了新的 CCEC 执行代码，
+  但不能仅凭代码哈希推导性能方向；
+- A5 shared b1 perf-clock 在 1,011,858,816B state 上通过全部门禁，
+  功能烟测 Submit 为 `65.757us`；合并 atomic 泳道得到 4,117 条
+  raw 记录、0 丢失、288 条 `ClaimMax`，全部 flags 为 `0x53`，
+  exclusive validation 通过。
+
+A5 泳道证据位于：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260725_182035_2773375/ccec/
+```
+
+b1 的 Vector task 只有 2/4，它们在 `%8` 和 `%16` 下都命中 shard 2/4，
+所以这份 b1 raw 和终态不能单独证明后八条线已启用。active16 的地址
+语义由 CPU 定向测试和 b256 逐调用 oracle 证明；后续正式 b256 配对
+还必须再次通过十六条线终态和全部业务断言。当前只完成 S4.16b
+正确性，尚无冻结性能结果。
