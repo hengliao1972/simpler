@@ -258,9 +258,10 @@ TensorMap 与 no-sequencer 基线上，shared no-wrap 完成路径已移除无�
 loser 快返和 `3×8` cursor 均已完成独立实验并因没有稳定净收益而撤销。
 S4.14a 先把 shared Vector cursor 搬到物理容量 8、active 仍为 4 的
 sidecar；相对 S4.9 的冻结 ELF 配对为 6/6 区组更快、百分差中位数
-`-5.066%`，因此当前 standalone shared 性能基线为 `e24e579c`。
-S4.14b 正在相同地址、容量、state 大小和寻址骨架下单独验证 active
-`4→8`；详细证据见
+`-5.066%`。S4.14b 随后在相同地址、容量、state 大小和寻址骨架下
+只改 active `4→8`，相对 S4.14a 为 6/6 更快、配对中位数
+`-23.472%`；直接相对 S4.9 的净收益为 `-27.665%`。因此当前
+standalone shared 性能基线为 `ee42b8c1`；详细证据见
 `shared_tensormap_record.md`。后续 shared TensorMap 开发与阶段门禁固定
 覆盖 CPU/CCEC。
 `--tensormap private|shared` 都会生成对应模式的真实可执行文件；S0 用于禁止

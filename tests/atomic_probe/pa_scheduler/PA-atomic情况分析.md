@@ -5,9 +5,9 @@
 本文记录 `TestPagedAttentionUnroll::Case1` 在真实 A5 上的 FDWIC AICore
 Submit 路径，供后续继续优化。真实 PA 生产快照日期为 2026-07-18；当前
 保留的生产优化基线为 `2c3dd1e2`，F1 负结果记录提交为 `c93c3666`。
-standalone 实验记录更新至 2026-07-25 的 S4.14b 候选；shared Vector
-cursor 四分片迁址已通过冻结 ELF 配对门槛，当前有效性能基线仍为
-`e24e579c`，八分片尚待独立定案。
+standalone 实验记录更新至 2026-07-25 的 S4.14b；shared Vector
+cursor 四分片迁址和同址八分片均通过冻结 ELF 配对门槛，当前
+standalone shared 性能基线为 `ee42b8c1`。
 
 范围限定为：
 
@@ -2203,7 +2203,7 @@ outputs/perf_clock_pair_e24e579c_vs_e8320280_20260725_160507/
 
 详细源码历史、ABI 和门禁见 `shared_tensormap_record.md` 的 S4.14 节。
 
-#### 7.5.26 S4.14b shared Vector 同址八分片候选
+#### 7.5.26 S4.14b shared Vector 同址八分片结果
 
 S4.14b 以已保留的 `e24e579c` 为基线，只把
 `kSharedVectorCursorShards` 从 4 改为 8。sidecar 地址、物理容量、
@@ -2230,4 +2230,28 @@ b256 每条 Vector sidecar 线恰有 4,096 次 attempted；A5 b1 泳道 raw
 flags 全为 `0x53`。重建 S4.14a 可逐字节复现冻结执行节；S4.14b 与其
 `.rodata` 相同、`.text` 等长，但静态常量变化经 CCEC 优化后有 50,103
 个字节位置变化。因此后续只能把性能差归给“静态八分片构建”的整体效果，
-不能仅凭墙钟再拆成 atomic 竞争与代码布局两部分。当前尚无正式性能结果。
+不能仅凭墙钟再拆成 atomic 竞争与代码布局两部分。
+
+提交 `ee42b8c1` 后相对同址四分片 `e24e579c` 做正式配对，六区组
+候选全部更快，百分差依次为
+`-23.501%/-24.162%/-23.144%/-23.444%/-23.775%/-22.802%`，
+配对中位数为 **-722.037us/-23.472%**，满足直接保留门槛，不追加
+第二轮。
+
+当前版本再直接相对 S4.9 `e8320280` 复核净收益，六区组仍全部更快，
+配对中位数为 **-900.894us/-27.665%**。两轮每个正式样本都保持
+73,728 次 ClaimMax、96 active、RingBp=0、相同依赖签名和四类 kernel
+各 256 次，SYS_CNT 与全部语义断言闭合。
+
+八分片并没有减少 fanin 工作：相对同址四分片，fanin loads 中位数反而
+从 24,041.5 增至 38,458，fanin not-ready 从 19,953.5 增至 32,410；
+单核最大 winner 中位数则从 35.5 降至 18。它在更多轮询下仍明显更快，
+说明收益不是“少执行后续操作”的假象；但由于静态代码布局同时变化，仍
+不能把全部收益只写成 atomic 等待下降。
+
+证据目录：
+
+```text
+outputs/perf_clock_pair_ee42b8c1_vs_e24e579c_20260725_163800/
+outputs/perf_clock_pair_ee42b8c1_vs_e8320280_20260725_164329/
+```
