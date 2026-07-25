@@ -1339,7 +1339,7 @@ CCEC b256 已证明 A5 DCache/DCCI、per-slot 等待、writer commit 和真实
 
 S4.7 在 clean 提交 `dc22d076` 上连续构建 private/shared CCEC perf-clock，
 随后复制为只读冻结件；循环内没有重编译。private/shared mixed ELF 的
-`.text` 分别为 126,052B/133,208B，kernel SHA256 分别为
+`.text + .rodata` 分别为 126,052B/133,208B，kernel SHA256 分别为
 `f64b87e...1c46a`/`a414beb...d7402`。冻结路径为：
 
 ```text
@@ -2341,3 +2341,35 @@ shared heap、writer signature 和输出 tile 全部 PASS，Submit 单样本
 70.265us。该单样本只作为最终 ELF 正确性门禁；性能结论必须继续与冻结的
 S4.6 shared ELF 做同负载 ABBA/BAAB 配对，不能和 private 或历史单样本直接
 相减。
+
+#### 冻结配对结果与下一步收紧
+
+S4.8 代码提交为 `2514ef10`。从该 clean commit 重建 shared perf-clock，
+冻结 host/kernel/manifest 后，与 `dc22d076` 的 S4.6 shared 冻结件交错
+运行。b1、b256 各先跑 4 个不计入统计的 warm-up，再跑 6 个
+ABBA/BAAB block；每模式每规模 12 个正式样本，56 个独立进程全部通过
+负载身份和完整语义门禁。冻结信息、日志和机器可读汇总位于：
+
+```text
+outputs/perf_clock_freeze_2514ef10_20260725_074116/
+```
+
+| 规模 | S4.6 中位数 | S4.8 中位数 | block 配对差中位数 | 配对差范围 | S4.8 更慢 block |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| b1 | 66.214us | 66.332us | +0.825us（+1.244%） | -3.283～+2.418us | 4/6 |
+| b256 | 7,117.583us | 7,313.766us | -121.994us（-1.654%） | -1,462.169～+1,311.427us | 2/6 |
+
+b1 没有稳定 fixed-cost 方向。b256 虽有 4/6 block 为 S4.8 更快，配对差
+中位数约 -122us，但极差约 2.77ms；S4.8 样本中位数更高，而样本均值
+7,233.971us 又略低于 S4.6 的 7,249.306us。波动远大于候选差值，因此只能
+记为“没有证明稳定提速，也没有证明稳定回退”，不能把机械上少 256 KiB
+中转直接写成性能收益。
+
+统一用 `size -A` 核对后，S4.8 mixed ELF `.text=134,456B`，S4.6 为
+132,920B，纯代码增加 1,536B；两者 `.rodata` 均为 288B，所以
+`.text + .rodata` 也同样增加 1,536B。`nm -S` 将增量定位到 split finish
+AIC/AIV，分别 +752/+780B，合计 1,532B，剩余 4B 来自布局对齐。当前
+helper 在 BuildWinner 中另扫一次 tensor，随后
+`PopulateSlotPayload()` 又遍历全部 tensor。下一小步先在不改协议/ABI的
+前提下把 direct copy 折叠进既有 slot 填充扫描，单独核对 CCEC `.text` 和
+配对方向；解释这项代码布局成本后，再进入纯 INPUT deferred resolve。
