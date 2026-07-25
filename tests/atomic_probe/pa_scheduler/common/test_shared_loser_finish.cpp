@@ -124,8 +124,8 @@ struct LoserFinishTestOps {
 };
 
 // winner 封口故障注入只在指定 int64 控制字上生效。注入发生在真实
-// FinishCallbackSubmitBody 内，验证 Materialize、BuildWinner、turn、
-// writer commit、published 和失败 slot 撤销的整体顺序。
+// FinishCallbackSubmitBody 内，验证 Materialize、BuildWinner、writer
+// commit、published 和失败 slot 撤销的整体顺序。
 struct WinnerSealFaultOps : LoserFinishTestOps {
     using LoserFinishTestOps::Exchange;
 
@@ -286,6 +286,134 @@ bool RunProtectedArgsLoserTest() {
     return ok;
 }
 
+bool RunFutureTaskWithoutSequencerTest() {
+    SchedulerState *state = MapSchedulerState();
+    if (state == nullptr) {
+        return false;
+    }
+    state->fatal.value = 0;
+    state->heap_base = kSyntheticHeapBase;
+    state->heap_size = kHeapBytes;
+    state->heap_window = kHeapWindow;
+    state->shared_map.committed_tasks.value = 0;
+    state->shared_map.reclaim_upto.value = -1;
+    ResetOutputCell(state->shared_map.shared_outputs[6]);
+
+    WorkerState &worker = state->workers[0];
+    worker.role = CoreRole::Aic;
+    worker.core_idx = 0;
+    worker.lane = 0;
+    worker.local_index = 6;
+    worker.occupied_count = 0;
+
+    TaskArgs args;
+    ConstructTaskArgs(args);
+    TensorCreateInfo create_info{};
+    const uint32_t shape[kMaxTensorDims] = {16, 0, 0, 0, 0};
+    InitCreateInfo(create_info, shape, 1, DataType::Float32);
+    AddOutput(args, create_info);
+
+    SubmitContext context{};
+    BeginCallbackSubmit(worker, context);
+    bool ok =
+        context.task_id == 6 &&
+        PrepareSharedTaskOutputs(
+            context.shared_result, 6, TaskKind::Qk
+        );
+    LocalStats stats{};
+    bool pmu_context = false;
+    const CallbackSubmitTicket ticket{
+        1, 6, static_cast<int16_t>(FunctionId(TaskKind::Qk)), 1, 0
+    };
+    const bool finished =
+        FinishCallbackSubmitBody<LoserFinishTestOps, false>(
+            state, worker, 10, args, context, stats, pmu_context, ticket
+        );
+
+    ok &= finished;
+    ok &= state->fatal.value == 0;
+    ok &= state->shared_map.committed_tasks.value == 0;
+    ok &= state->shared_map.reclaim_upto.value == -1;
+    ok &= state->shared_map.buckets[0].head.value == 0;
+    ok &= state->shared_map.buckets[0].tail.value == 0;
+    ok &= state->shared_map.shared_outputs[6].published[0].value == 6;
+    ok &= state->shared_map.shared_outputs[6].last_writer[0].value == 6;
+    ok &= worker.occupied_count == 1;
+    ok &= worker.slots[0].occupied && worker.slots[0].built;
+    ok &= worker.slots[0].task_id == 6;
+    ok &= stats.result.submits == 1;
+    ok &= stats.result.materialized_outputs == 1;
+
+    (void)munmap(state, sizeof(SchedulerState));
+    return ok;
+}
+
+bool RunPreRaisedFatalStopsWinnerTest() {
+    SchedulerState *state = MapSchedulerState();
+    if (state == nullptr) {
+        return false;
+    }
+    state->fatal.value = 1;
+    state->heap_base = kSyntheticHeapBase;
+    state->heap_size = kHeapBytes;
+    state->heap_window = kHeapWindow;
+    state->shared_map.committed_tasks.value = 0;
+    state->shared_map.reclaim_upto.value = -1;
+    ResetOutputCell(state->shared_map.shared_outputs[6]);
+
+    WorkerState &worker = state->workers[0];
+    worker.role = CoreRole::Aic;
+    worker.core_idx = 0;
+    worker.lane = 0;
+    worker.local_index = 6;
+    worker.occupied_count = 0;
+
+    TaskArgs args;
+    ConstructTaskArgs(args);
+    TensorCreateInfo create_info{};
+    const uint32_t shape[kMaxTensorDims] = {16, 0, 0, 0, 0};
+    InitCreateInfo(create_info, shape, 1, DataType::Float32);
+    AddOutput(args, create_info);
+
+    SubmitContext context{};
+    BeginCallbackSubmit(worker, context);
+    bool ok =
+        context.task_id == 6 &&
+        PrepareSharedTaskOutputs(
+            context.shared_result, 6, TaskKind::Qk
+        );
+    LocalStats stats{};
+    bool pmu_context = false;
+    const CallbackSubmitTicket ticket{
+        1, 6, static_cast<int16_t>(FunctionId(TaskKind::Qk)), 1, 0
+    };
+    const bool finished =
+        FinishCallbackSubmitBody<LoserFinishTestOps, false>(
+            state, worker, 10, args, context, stats, pmu_context, ticket
+        );
+
+    // 这里模拟“另一核已广播 fatal，本核随后进入 finish”。终止态必须在
+    // shared heap/slot/completion/symbol 任何副作用之前被观察到。
+    ok &= !finished;
+    ok &= state->fatal.value == 1;
+    ok &=
+        state->shared_map
+            .shared_heap_cursor[6 % kSharedHeapShards].value == 0;
+    ok &= state->shared_map.shared_heap_vend.value == 0;
+    ok &= state->shared_map.shared_outputs[6]
+              .published[0].value == -1;
+    ok &= state->shared_map.shared_outputs[6]
+              .last_writer[0].value == -1;
+    ok &= state->tasks[6].flag == 0;
+    ok &= worker.occupied_count == 0;
+    ok &= !worker.slots[0].occupied && !worker.slots[0].built;
+    ok &= stats.result.materialized_outputs == 0;
+    ok &= stats.result.submits == 0;
+
+    (void)munmap(state, sizeof(SchedulerState));
+    return ok;
+}
+
 bool RunAllocPublicationFailureTest() {
     SchedulerState *state = MapSchedulerState();
     if (state == nullptr) {
@@ -339,7 +467,7 @@ bool RunAllocPublicationFailureTest() {
     ok &= !finished;
     ok &= WinnerSealFaultOps::exchange_race_address == nullptr;
     ok &= state->fatal.value == 1;
-    ok &= state->shared_map.committed_tasks.value == 1;
+    ok &= state->shared_map.committed_tasks.value == 0;
     // Alloc CompleteTask 已先发布 completion；final symbol publication 失败
     // 后不能伪装成可事务回滚，只能依靠 fatal 使整轮结果无效。
     ok &= state->tasks[0].flag == 1;
@@ -372,7 +500,7 @@ bool RunQkPublicationFailureTest() {
     state->heap_base = kSyntheticHeapBase;
     state->heap_size = kHeapBytes;
     state->heap_window = kHeapWindow;
-    state->shared_map.committed_tasks.value = 1;
+    state->shared_map.committed_tasks.value = 0;
     state->shared_map.reclaim_upto.value = -1;
     ResetOutputCell(state->shared_map.shared_outputs[1]);
 
@@ -414,7 +542,7 @@ bool RunQkPublicationFailureTest() {
     ok &= !finished;
     ok &= WinnerSealFaultOps::exchange_race_address == nullptr;
     ok &= state->fatal.value == 1;
-    ok &= state->shared_map.committed_tasks.value == 2;
+    ok &= state->shared_map.committed_tasks.value == 0;
     ok &= state->shared_map.shared_outputs[1].published[0].value == -1;
     ok &= state->shared_map.shared_outputs[1].last_writer[0].value == -1;
     ok &= std::memcmp(
@@ -444,7 +572,7 @@ bool RunUpWriterCommitFailureTest() {
     state->heap_base = kSyntheticHeapBase;
     state->heap_size = kHeapBytes;
     state->heap_window = kHeapWindow;
-    state->shared_map.committed_tasks.value = 4;
+    state->shared_map.committed_tasks.value = 0;
     state->shared_map.reclaim_upto.value = -1;
     ResetOutputCell(state->shared_map.shared_outputs[0]);
     ResetOutputCell(state->shared_map.shared_outputs[4]);
@@ -496,7 +624,7 @@ bool RunUpWriterCommitFailureTest() {
     ok &= !finished;
     ok &= WinnerSealFaultOps::fetch_race_address == nullptr;
     ok &= state->fatal.value == 1;
-    ok &= state->shared_map.committed_tasks.value == 4;
+    ok &= state->shared_map.committed_tasks.value == 0;
     ok &= state->shared_map.shared_outputs[0].last_writer[0].value == 4;
     ok &= state->shared_map.shared_outputs[0].last_writer[1].value == 4;
     ok &= state->shared_map.shared_outputs[0].published[0].value == 0;
@@ -517,10 +645,13 @@ bool RunUpWriterCommitFailureTest() {
 
 int main() {
     const bool loser_ok = RunProtectedArgsLoserTest();
+    const bool future_task_ok = RunFutureTaskWithoutSequencerTest();
+    const bool fatal_stop_ok = RunPreRaisedFatalStopsWinnerTest();
     const bool alloc_failure_ok = RunAllocPublicationFailureTest();
     const bool qk_failure_ok = RunQkPublicationFailureTest();
     const bool up_failure_ok = RunUpWriterCommitFailureTest();
-    if (!loser_ok || !alloc_failure_ok || !qk_failure_ok || !up_failure_ok) {
+    if (!loser_ok || !future_task_ok || !fatal_stop_ok ||
+        !alloc_failure_ok || !qk_failure_ok || !up_failure_ok) {
         std::fprintf(
             stderr,
             "[FAIL] shared split-finish loser or winner seal regression\n"

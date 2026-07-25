@@ -4,8 +4,13 @@
 [`poursoul/simpler:fdwic-shared-tensormap`](https://github.com/poursoul/simpler/tree/fdwic-shared-tensormap)
 在 A5 FDWIC runtime 中实现的 shared TensorMap 方案，并与当前分支 standalone
 方案比较。本文用于后续开发决策，不表示目标分支已经合入，也不把分支文档中的
-实验记录自动当成当前分支的性能结论；当前分支 S0～S4.5 的实际实施证据另记于
+实验记录自动当成当前分支的性能结论；当前分支 S0～S4.6 的实际实施证据另记于
 第 15 节。当前继续开发和验收的后端范围固定为 CPU/CCEC。
+
+后续每个实现小步都必须先对照参考提交：可直接复用的机制要说明复用位置；
+有意不同的顺序、ABI、失败语义或性能取舍要在本文记录证据和复核条件，不能只
+留在代码或会话里。参考代码“基本流程已跑通”本身是正向证据；暂不照搬某项
+机制只表示当前小步需要隔离变量，不表示否定其架构价值。
 
 ## 1. 审查快照与证据口径
 
@@ -148,6 +153,10 @@ consumer winner 的行为是：
   `atomic_exchange(current_task_id)`，返回旧 writer 作为 fanin；
 - resolve：等待指定 `published[slot]`，invalidate descriptor cacheline，
   再把 Tensor descriptor 拷入执行侧 `RingSlot` 或 `BuiltSubtask`。
+
+这里的两个目标槽只有 ABI 形状相似，resolve 时机并不相同：普通
+`RingSlot` 会先 try-resolve，并允许未就绪引用留到执行前；winner follower
+构造 `BuiltSubtask` 时则同步阻塞解析，当前 mask 固定为 0。
 
 相较统一 region lookup，这条路径的优势明确：
 
@@ -868,9 +877,10 @@ swimlane ELF 上运行时传 `--no-swimlane`：后者仍会保留各阶段
 专用 `PerfClockNow()`；末个 Submit 在 register/winner 或 loser 尾动作、
 `submits++` 之后、返回前调用第二次。结果继续复用既有
 `WorkerResult::submit_begin/submit_end/submits`，没有扩大 trace buffer 或
-增加逐 Submit 记录。shared exact-turn 与 startup 屏障的时间 watchdog
-仍保留：每个等待窗口会先读取一次超时起点，之后每 1024 次未完成轮询
-复查一次。它是正确性超时，不属于新增性能观察，因而本实现只声称
+增加逐 Submit 记录。S4.1 当时的 shared exact-turn 与 startup 屏障都保留
+时间 watchdog；S4.6 已删除前者，当前只剩 per-slot symbol 等实际等待和
+startup 屏障使用同类 watchdog。每个等待窗口先读取一次超时起点，之后每
+1024 次未完成轮询复查一次。它是正确性超时，不属于新增性能观察，因而只声称
 “每核两个专用性能边界”，不声称最终 ELF 物理上只会读取两次系统时钟。
 
 构建身份 ABI 从 3 升到 4，并复用 `PmuProbeConfig` 的一个保留槽加入
@@ -1055,8 +1065,9 @@ sum(expected Case1 aligned reserve span) == sum(cursor)
 ```
 
 shared `TaskCell::vend` 只要求覆盖本 task 自身非零 reserve、对齐且不超过最终
-vend；allocator helper 与未来去 turn 的零输出 UP 可为 0，当前 S4.5 完整
-exact-turn 流程实际为非零。worker 的 `final_heap_next` 不再与 task-id prefix
+vend；allocator helper 可为 0，S4.4～S4.5 的 exact-turn 完整流程实际为
+非零；S4.6 删除 turn 后，零输出 task 的 winner 快照也可合法为 0。worker
+的 `final_heap_next` 不再与 task-id prefix
 集合比较：纯 loser 必须为 0，赢过非零输出 task 的 worker 必须非零且至少
 覆盖本核自身 reserve 总量。跨 private/shared 的 normalized writer signature
 仍使用 canonical 连续地址，但只有实际 descriptor/cursor/vend 校验通过后
@@ -1119,9 +1130,10 @@ turn，也必须在自己实际依赖的 `(producer,slot).published` 上等待�
 writer 已完成提交，而不再只是“descriptor 已物化”。
 
 `CommitSharedFaninWriters()` 使用返回旧值的 FetchMax，并要求旧值精确等于
-producer。失败后不执行负向 RMW 回滚：FetchMax 可能已经覆盖了并发可见的
-终态，盲目写回旧值会抹掉其他合法进度。实现保留该现场、广播 fatal，并使
-整轮结果失效。多 INOUT task 若在后项失败，前项已成功的 commit 同样保留；
+producer。失败后不执行负向 RMW 回滚：该 RMW 已经线性化，且多 symbol
+提交不是事务；盲目写回旧值会伪造原子历史并抹掉终止现场。实现保留该现场、
+广播 fatal，并使整轮结果失效。多 INOUT task 若在后项失败，前项已成功的
+commit 同样保留；
 统计 `shared_symbol_inout_commits` 只计成功项，host 输出
 `inout_writer_commits`。`WorkerResult` 的 896B 大小和该字段 888 偏移不变。
 
@@ -1196,12 +1208,13 @@ CPU/CCEC b1/b256 证明 per-slot 依赖协议能够独立闭环。
 | 主题 | 参考提交的实际实现 | standalone 当前意见与边界 |
 | --- | --- | --- |
 | output 数量门禁 | `common/state.h:305-315` 的物理 cell 只有 8 个 slot，但 `runtime/pto_types.h:119-124` 的 `SharedTaskOutputs::add_output_ref()` 只按 `MAX_TENSOR_ARGS` 检查，`pto_orchestration_api.h:42-48` 又按调用方 count 循环。当前 PA 每 task 最多 3 个 output，基本流程不会触发不一致 | `pa_frontend.h:97-105` 在句柄追加时显式限制 `kSharedOutputMaxPerTask=8`，最终发布再次核对 count。迁移必须保留 API/存储同上限门禁，不能因参考 PA 当前规模没越界而照搬这一处接口缝隙 |
-| output 发布时机 | `submit_core.h:743-758` 在 Materialize 内复制/flush descriptor、初始化 writer 并发布；`submit_runtime.h:524-552` 随后才进入 Register/Fanin/Build | S4.5 在 Build/Complete 与 INOUT writer commit 成功后才最终发布，精确顺序为 Build/Complete → writer FetchMax → release turn → `published`。这样 `published` 直接表示可执行状态已建立，失败闭环更清楚；但它可能延迟 consumer，最终真实路径是否保持该顺序必须由 perf-clock 配对决定，不能仅凭 standalone 偏好否定参考快路径 |
+| output 发布时机 | `submit_core.h:743-758` 在 Materialize 内复制/flush descriptor、初始化 writer 并发布；`submit_runtime.h:524-552` 随后才进入 Register/Fanin/Build | S4.5 先采用 Build/Complete → writer FetchMax → release turn → `published`；S4.6 删除 turn 后为 Build/Complete → writer FetchMax → `published`。这样 `published` 直接表示可执行状态已建立，失败闭环更清楚；但它可能延迟 consumer，最终真实路径是否保持该顺序必须由 perf-clock 配对决定，不能仅凭 standalone 偏好否定参考快路径 |
+| 引用解析位置与执行槽 ABI | 参考 `common/state.h:126-140,153-167` 在 `RingSlot` 和 `BuiltSubtask` 的 ABI 中都保留 `shared_ref_mask/shared_refs`。但当前 HEAD 只有普通 `RingSlot` 路径真正延迟解析：`submit_core.h:990-1001` 先 try-resolve，未就绪引用由 `113-121,216-218` 在执行前等待。winner follower 自 `0f9862a2` 起在 `489-499` 构造 `BuiltSubtask` 时同步调用阻塞式 resolver，并把 mask 固定为 0；不能把字段存在误写成该路径也已 deferred。实测 `RingSlot` 因 shared 形态从 4,864B 增至 5,440B。presubmit 还复用 64B task cell 中的 `deps_prepared`，并在 `DistGlobal` 增加每 worker `prepared_deps`（`common/state.h:292-296,389`） | standalone 在 `CollectSharedFanin()` 内完成等待，把解析后的 descriptor 复制到既有 `TaskPayload`，`LocalSlot` 不保存 symbol ref。它保持较小的执行槽 ABI、失败点集中在 Submit，却让 Submit 阻塞 producer publication。PA Case1 是普通单-lane slot，参考 deferred resolve 仍是已跑通且很有价值的候选；但 standalone 不应为了表面对齐给未使用的 `BuiltSubtask` 增加冗余状态。迁移时还要同时量 Submit 缩短、GM slot 搬运/I-cache、slot 容量与执行前失败语义 |
 | writer intent | `submit_runtime.h:302-311` 在 fanin 收集时用 Exchange claim writer，旧值为负则以 producer 作为 fanin；producer 在 `submit_core.h:748-750` 用 FetchMax 初始化，因此不会把已经提前写入的更大 writer 倒退。`345-385,493-507` 还提供 presubmit intent，让唯一 winner 预备依赖、loser 等待。`submit_dependency_smoke` 会调用该 API，但真实 PA 的 `paged_attention_orch.cpp:345` 当前仍调用普通 `rt_presubmit_aiv_task` | “Exchange claim + producer FetchMax”是参考代码很有价值的通用机制，允许 writer intent 早于 descriptor 发布并表达多级 writer 链；不能把“intent API/烟测可用”误写成“参考 PA 已接入该 API”。当前固定 PA Case1 先等待 published、要求 `writer==producer`，再 post-build FetchMax，限制更保守也可能产生性能差。迁移真实 simpler 时应重点配对验证参考组合，并补齐发布后失败和多 writer 顺序证明，而不是把 Case1 限制推广成通用设计 |
 | symbol view | `submit_core.h:810-820,840-849` 已处理一维 view flags | standalone ABI 保留字段但 plain ref 之外显式失败；当前 Case1 的 output view 走 `manual_dep`，未提供足够业务用例证明 shared-symbol view。真实迁移需要复用参考 view 语义并增加边界测试 |
 | heap 复用 | `submit_core.h:630-651` 支持 shard 取模、等待 H 窗口和最多 64 次 wrap 调整 | standalone b256 有界容量足够，先使用绝对 no-wrap cursor，避免在 generation/复用条件未证明时覆盖旧 descriptor。参考的 wrap 思路应保留为长期方案，但不能只移植取模而省略复用证明 |
 | output cell 生命周期 | `runtime_state.h:78-80` 的地址计算带 `task_id & (kFlagCap-1)`，但 `submit_core.h:576-587` 拒绝单轮 `task_id >= kFlagCap`，`control_plane.h:62-68` 在每轮启动时重置全部 cell | 寻址形式不同，但参考与 standalone 当前都依赖“单轮 task id 有界”而不是 generation 实现跨代复用。standalone 直接按最多 1,280 个 task 寻址。真实长期 runtime 若要在同一轮跨 cap，双方都必须补 generation 或等价协议；不能把参考代码中的按位与本身解释成已经支持 ABA-safe 复用 |
-| ordinary region | 参考 `state.h:324-343` 和 `submit_core.h:861-929` 使用全局 high-water、bucket 链和 append-only entry，无 H reclaim/绝对 seq；presubmit intent 可提前登记非 symbol INOUT。standalone `pa_model.h:730-763`、`pa_shared_tensormap.h` 使用 per-bucket head/tail ring、绝对 seq 双检和 H reclaim | standalone PA Case1 的 region entry 被严格证明为 0，S4.6 只绕过这条用不到的热路径，不宣称后者已成为通用并发 region 算法。真实迁移仍应复用参考的 symbol/region 分流思想，再根据长期容量、回收、ABA 和并发登记证据选择或重构数据结构 |
+| ordinary region | 参考 `state.h:324-343` 和 `submit_core.h:861-929` 使用全局 high-water、bucket 链和 append-only entry，无 H reclaim/绝对 seq；presubmit intent 可提前登记非 symbol INOUT。standalone `pa_model.h:730-763`、`pa_shared_tensormap.h` 使用 per-bucket head/tail ring、绝对 seq 双检和 H reclaim | standalone PA Case1 的 region entry 被严格证明为 0；S4.6 已绕过这条用不到的热路径，但不宣称保留的 ring 原型已成为通用并发 region 算法。真实迁移仍应复用参考的 symbol/region 分流思想，再根据长期容量、回收、ABA 和并发登记证据选择或重构数据结构 |
 | 异常路径 | 参考 Materialize 依赖唯一 producer 等业务不变量，writer/published 原子返回值不逐项检查；且 `runtime_state.h:40-47` 在 shared 模式把 `fatal_set()` 固定为 false，即等待方不会消费已写入的 fatal | standalone 增加全量预检、terminal fatal、slot 撤销和故障注入，但不是全事务回滚：output publication 的 cell 可在冷失败清理，writer FetchMax 与 heap FetchAdd 则保留 terminal 现场。真实迁移必须先修复 fatal 广播可见性；诊断逻辑是否原样保留则应冷路径外提并由 perf-clock 判断成本 |
 
 因此当前结论不是“standalone 顺序优于参考实现”，而是：参考分支已经验证了
@@ -1211,13 +1224,176 @@ standalone 负责把当前 PA Case1 的成功/失败边界逐项证明清楚。�
 的提前发布或 intent 路径在同等正确性门禁下更快，应回收 standalone 的保守
 中间实现，而不是为了维护已写代码拒绝更优方案。
 
+#### S4.6 PA Case1 去除全局 sequencer
+
+本步只删除已经被证明恒为空的全局串行路径，不顺带重写 symbol writer、
+发布时机或普通 region 算法。源码变更边界为：
+
+- `FinishCallbackSubmitBody()` 不再调用 `WaitForSharedTaskTurn()`；
+- Register 用 `ValidateEmptySharedRegistration()` 只读核对
+  `SharedOutputRef` 和 `manual_dep`，发现任意非空 ordinary-region writer
+  立即 fail-closed，不再构造空 `SharedRegionValue[]`；
+- 删除 Case1 调用的 `PrepareSharedTaskOrdered()` /
+  `ReleaseSharedTaskTurn()`，构建后封口收敛为
+  `CommitSharedFaninWriters()` → `PublishSharedTaskOutputs()`；
+- `committed_tasks/reclaim_upto`、全部 region bucket/slot 必须保持初始化
+  状态；worker 的 map 摘要同样全部为 0；
+- 通用 ordered-ring 原语和隔离自测继续保留，供未来非空 ordinary region
+  研究，但不再把该自测当成 PA Case1 运行证据。
+
+这项删除由固定业务 DAG 支撑，而不是把全局顺序拍脑袋换成“没有顺序”：
+
+```text
+Alloc ────────────────┐
+QK -> SF -> PV ───────┼-> UP
+          └───────────┘
+```
+
+host oracle 固定核对每 batch 五条依赖：
+`SF←QK`、`PV←SF`、`UP←SF/PV/Alloc`；symbol resolver 又要求
+`producer_task_id < consumer_task_id`，所以当前图无环。descriptor 就绪由
+每个 `(producer,slot).published` 保证，真正 kernel 执行仍由 slot fanin
+对应的 task completion flag 保证。8-shard no-wrap allocator 不依赖 task
+顺序；UP 对三个 Alloc symbol 分别是唯一 writer，不需要全局 turn 排序多个
+writer。
+
+泳道暂时保留每 Submit 一条 `PrepareMap`，但它是
+`begin=end=materialize_end` 的零时长结构 marker：不额外读钟、不访问
+sidecar，只为复用当前 raw schema、固定记录数和 analyzer 的 required-phase
+契约。perf-clock 与 submit-PMU 不实例化该 trace 写入。若未来要彻底删除
+marker，必须同时模式化 raw metadata、host record oracle、converter 和
+analyzer；这不属于本次协议小步，不能为追求表面整洁扩大修改面。
+
+CPU 定向测试和提交前只读审查新增以下直接证据：
+
+- `committed_tasks=0` 时，future QK task 6 可直接完成完整 split-finish、
+  BuildWinner 和 output publication，task 0～5 无需先推进全局前沿；
+- shared symbol writer 与 `manual_dep` Local/GM writer 通过空 region 验证，
+  非 `manual_dep` Local/GM writer 和越界 register mask 在 ordinary-region
+  append 前失败；Materialize 和 fanin 仍可能在此前访问 shared heap 或读取
+  region bucket，因此不能把该门禁误写成 sidecar 零访问；
+- 预置 `fatal` 模拟另一核已经广播终止态，winner 在 heap reserve、slot、
+  completion 和 symbol 任一副作用前退出；这只保留旧 exact-turn 成功出口
+  原有的终止态检查，不恢复 global sequencer，也不新增 atomic 泳道记录；
+- host 复用既有 raw 扫描逐核闭合
+  `Claim -> Materialize -> PrepareMap -> Submit` 身份和严格递增 task
+  序列，要求 shared `PrepareMap` 的起止都锚定 matching
+  `Materialize.end`、flags/aux 合法且每 Submit 恰一条；尾部数量再由既有
+  逐核 Submit 数和精确记录数闭合，不增加 raw 字段。
+
+当前结果：
+
+| 门禁 | 结果 |
+| --- | --- |
+| shared 严格构建及 symbol/split-finish/ring/heap/materialize 自测 | PASS |
+| shared b1 scalar-nop0 / real-compute | 全部语义、descriptor、writer、heap 与计算结果 PASS |
+| shared b256 scalar-nop0 | 1,280 tasks 全部完成，原 2 秒 convoy 未复现 |
+| b256 symbol/依赖 | published 2,048，input loads 1,280，writer commits 768，fanin edges 1,280 |
+| b256 region 终态 | committed 0，reclaim -1，bucket/slot 全空 |
+| b256 heap | 8 shard 各 25,821,184B，总 vend 206,569,472B |
+| private b1/b256 宏隔离 | 全部断言 PASS |
+| shared b1 raw → converter → exclusive analyzer | 记录数精确、0 drop、转换与分析 PASS |
+| ASan/UBSan/leak | 最新 symbol 与完整 split-finish/故障路径均 PASS |
+| CCEC shared b1 real-compute | 最终 terminal-fatal 门禁 ELF 全部语义与 4 个 active tile PASS；perf-clock 单样本 70.279 us |
+| CCEC shared b256 scalar-nop0 | 提交前审查前的 S4.6 ELF：96 核全部活跃，1,280 tasks 完成；perf-clock 单样本 3,228.844 us |
+| CCEC shared b256 real-compute | 提交前审查前的 S4.6 ELF：192 个 active tile 全部 PASS；perf-clock 单样本 5,982.840 us |
+| CCEC private b1 real-compute / b256 scalar-nop0 | 全部断言 PASS；单样本 70.707 us / 3,300.478 us |
+| CCEC shared swimlane b1 | 最终 ELF 4,168 records，expected 4,168，0 drop；零时长 marker、converter/analyzer PASS |
+| CCEC shared submit-PMU register b1 | 480 calls 精确；phase time share 0.8020%；owner restore/cleanup PASS |
+
+最终 shared 泳道位于
+`outputs/pa_scheduler_shared_swimlane_20260725_062217_2130280/ccec/`。
+`PrepareMap` 记录仍在，但所有该 phase 的 begin/end 相同；host 总记录数、
+raw marker validator、converter 与 exclusive analyzer 均闭合。其中
+converter/analyzer 负责结构配对，host validator 额外保证 shared marker
+严格为零时长、匹配同 task 的 `Materialize.end`，并按每核 task 0..N-1
+顺序出现。
+
+##### 与参考分支的继续对齐和暂不照搬
+
+参考提交本身没有 PA 全局 exact-turn，因此 S4.6 是向参考架构靠拢：fresh
+symbol 只按 per-slot 状态同步，ordinary region 走另一套结构。以下两点是
+参考实现已经跑通、且可能比 standalone 更有性能价值的机制，但本步有意不
+混入：
+
+1. 参考 `submit_core.h:994-1001` 允许未就绪 ref 留在 ring slot，执行前再
+   resolve；standalone 当前仍在 `CollectSharedFanin()` 内阻塞 Submit。
+   deferred resolve 可能缩短 Submit，但会改变 slot payload 与执行前失败
+   边界，必须另做一小步和 perf-clock 配对。
+2. 参考 consumer 在 `submit_runtime.h:302-311` 用 Exchange 声明 writer，
+   producer 再在 `submit_core.h:748-750` 用 FetchMax 初始化，允许 writer
+   intent 先于 producer publish。standalone 当前只支持 Case1 单后继 writer
+   并在 Build 后提交。参考组合是通用多级 writer 链的重要候选，不能因为
+   standalone 当前故障闭环更保守就忽略；也不能在没有补齐多 writer 顺序、
+   fatal 可见性和发布后失败测试前直接照搬。
+
+所以本步的意见差异不是反对参考方案，而是把变量隔离：先证明删除 global
+sequencer 本身，再分别测 deferred resolve 和提前 writer intent。当前
+CCEC b256 已证明 A5 DCache/DCCI、per-slot 等待、writer commit 和真实
+计算能够在无全局前沿时闭合。3.229 ms/5.983 ms 与历史 exact-turn 数字来自
+不同阶段的独立 ELF，只能说明 convoy 已从结构和活性上消失，不能直接当成
+纯 sequencer 的稳定净收益；后续性能结论仍用冻结 ELF 做配对多轮。本阶段
+只覆盖 CPU 与 CCEC，不做 AscendC。
+
+##### 冻结 S4.6 后的参考机制验证顺序
+
+在冻结当前源码、private/shared perf-clock ELF 哈希和 ABBA 配对数据前，
+不再改变协议变量。最新 shared b1 诊断样本中，QK/SF/PV/UP 的 Fanin 约为
+`2.031/10.708/30.913/44.673 us`；它只能说明 Submit 内等待 publication
+值得优先研究，不能与 perf-clock ELF 做数值相减。当前每 batch 发布 8 个
+descriptor、消费 5 个纯 INPUT，并提交 3 个 UP INOUT writer；b256 对应
+2,048/1,280/768。
+
+冻结后的低风险到高风险顺序固定为：
+
+1. **ready ref 直接落 slot**：published 等待和 writer 语义不变，只把
+   descriptor 的搬运从
+   `shared cell -> TaskPayload -> LocalSlot` 缩成
+   `shared cell -> LocalSlot`。这一步不增加 slot ABI、不改 atomic，先单独
+   判断 2,048 个 shared ref 的 128B 中间复制是否值得删除。
+2. **只延迟纯 INPUT**：shared-only `LocalSlot` 增加 mask/ref；已经 published
+   的 ref 仍直接解析，未发布的纯 INPUT 才随 slot 进入执行前 resolver。
+   INOUT/OUTPUT_EXISTING 保持 eager 等待和 Build 后 FetchMax，避免把 resolve
+   时机与 writer 协议混成一个变量。
+3. **按数据调整在途容量**：只有 RingBackpressure 证明确有需要时才单独改变
+   slot 数。standalone 当前 4 slot、实际最多 2 个可用，参考 shared 为
+   14 slot；不能与 deferred resolve 同笔修改，否则无法归因。
+4. **迁移真实 simpler**：以上边界一旦在 standalone 闭合，就复用参考分支
+   已跑通的普通 `RingSlot` resolver 骨架进入真实路径，不继续在 standalone
+   扩展当前 PA 不使用的通用 MIX 或多 writer 能力。
+
+deferred 版本必须新增故障门禁：fanin flag 已 ready 但 published 缺失/错误
+时立即 fatal；resolver 失败后清空 slot 且 `occupied_count` 只减一次；不得
+执行 kernel 或发布 completion；多 ref mask、非法 ref、view、slot 复用和
+延迟 publisher 都要覆盖。参考 `submit_core.h:216-219` 的
+`execute_slot()` 在 resolver 返回 false 时直接返回，而后续 drain 仍会减少
+occupied 计数，slot 本体没有在该点清除；基本 PA 成功流程不会触发，但该冷
+失败路径不能原样照搬。
+
+提前 writer intent 暂不排在真实 PA 迁移之前。当前 Case1 没有多级 writer
+链，提前移动 b256 的 768 次 RMW 不会减少 atomic 数量，UP 后也没有新的
+consumer 可被提前解锁。将来研究时还必须把“winner fanin 阶段的
+Exchange(last_writer)”与可选 presubmit
+`deps_prepared/prepared_deps` barrier 分开；参考真实 PA 目前只用了前者，
+后者主要由 smoke 接入。逆序 writer、未来 writer 越过早期 reader、多 symbol
+部分提交、fatal 释放 loser 和 task-id 复用没有证明前，不能把 Case1 的单
+后继事实推广成通用协议。
+
+deferred 还可能只是把工作从 Submit 移到执行/FinalDrain。后续配对除了
+`first-submit-begin -> last-submit-end` 主值，还要用不含泳道/PMU 的独立
+干净边界核对 finish/最终 drain；若 Submit 降低而后者等量增加，只能记为
+工作后移，不能记成整体性能收益。参考 `RingSlot` 从 4,864B 增至 5,440B，
+每槽多 576B；相应 GM 搬运、slot 容量和 I-cache 代价都要实测，不能由源码
+大小推断。
+
 ### 阶段 R0：迁移真实 simpler
 
 只有 S0～S4 全部闭环后，才按已验证结构依次迁移：
 
 1. 真实构建身份、缓存隔离和 CPU/CCEC ABI 握手；
 2. private ring 同构化；
-3. shared ordered ring 与统一 facade；
+3. shared facade 与经独立证明的 ordinary-region backend；当前 ordered
+   ring 只是隔离原型，不能重新接成 PA 全局 sequencer；
 4. PA winner-only/fresh symbol/shared heap；
 5. MIX 与 A5 非一致缓存语义；
 6. PA Case1 a5sim golden；
@@ -1287,24 +1463,40 @@ printf '#include "pto_types.h"\n' |
 shared 组合再增加 `-DPTO_FDWIC_SHARED_MAP=1`。两次返回码均为 1，失败位置为
 `pto_types.h:906-908`，断言实际值均为 `(32 == 0)`。
 
-## 14. 后续决策摘要
+## 14. 当前决策摘要与尚未闭环问题
 
-S0～S3.1 已先在 standalone 回答了构建身份、private/shared 可比逻辑结果、
-region writer 顺序、ordered reclaim 和当前固定 task 上限内的 fresh symbol
-发布/消费问题；S3.2 仍需回答 winner-only Materialize 与 shared heap：
+截至 S4.6，standalone 已经证明：
 
-1. 三镜像如何证明自己属于同一个 map/profile ABI？
-2. private/shared 如何基于同构 ring 生成可比较的逻辑依赖结果？
-3. 任意 winner 到达顺序下，writer 链如何仍严格遵守 task 顺序？
-4. region、symbol 和 heap 如何在有界内存中安全复用并可靠终止？
+1. private/shared 构建身份、产物目录、manifest 和 host/device ABI 不能混用；
+2. private ring 以及 shared PA Case1 的 per-slot symbol、8-shard no-wrap
+   heap、winner-only 构参/物化能够生成可比较的依赖和 writer 签名；
+3. 固定 Case1 DAG 在没有 global sequencer 时可在 CPU/CCEC b1、b256 闭合；
+4. 构建后 writer commit 与 output publication 的正常/终止边界已由故障注入
+   固化。
 
-前三项已经由模式握手、ordered ring、plain symbol resolver、host 独立验证和
-跨模式签名闭环；第四项不能拿当前 per-worker heap 冒充答案。S3.1 的
-`shared_outputs[1280]` 不取模、不复用 task id，因而本阶段有意没有引入
-generation 或 deferred resolve。S3.2 与 standalone CPU/CCEC 验收全部闭环后，
-目标分支的 winner-first、符号快路径和 shared heap 才适合进入真实代码。否则
-即使某次 PA 上板更快，也只能说明特定 workload 没触发协议边界，不能说明
-shared TensorMap 已经具备可维护、可扩展的架构。
+这些结论只覆盖固定 PA Case1，尤其不能改写成“任意 winner 到达顺序下的通用
+多级 writer 链已解决”。进入真实 simpler 前仍有以下独立问题：
+
+1. **非空 ordinary region**：现有 ordered ring 只是隔离原型，PA 热路径没有
+   接入；需在参考 append-only map、当前绝对 seq ring 或新方案之间用真实
+   容量、回收、ABA 和并发登记证据做选择。
+2. **resolve 时机**：standalone 在 Submit 的 `CollectSharedFanin()` 阻塞，
+   参考实现把 shared ref 保留到 ring slot 并在执行前 resolve。后者可能更快，
+   但会扩大 slot ABI并改变执行前失败边界，必须独立验证。
+3. **通用 writer intent**：当前只支持 Case1 单后继 writer；参考的 consumer
+   Exchange + producer FetchMax 以及 presubmit intent 能表达多级链，但还需
+   补 fatal 可见性、多个 writer 顺序和 publication 失败测试。
+4. **跨代复用**：`shared_outputs[1280]` 和 no-wrap heap 只覆盖当前单轮上限，
+   没有 generation，也不能从参考代码的 task-id 取模推断已经 ABA-safe。
+5. **真实路径终止语义**：参考 shared `fatal_set()` 当前不会广播，迁移前必须
+   修正；standalone 的诊断与冷失败逻辑是否保留则由 perf-clock 判断成本。
+6. **性能定案**：先冻结 private/shared perf-clock ELF 做配对多轮，再决定
+   是否采用参考的提前发布、deferred resolve 与 writer intent；泳道和 PMU
+   只解释变化，不直接与 perf-clock 数字相减。
+
+因此迁移目标是复用参考分支已跑通的架构骨架，并把上述未证明部分拆成独立
+小步；不能重新接回已经被 S4.2/S4.6 否定的 PA 全局 sequencer，也不能因
+standalone 当前故障门禁更完整就排斥参考实现的高性能路径。
 
 ## 15. 当前分支实施记录
 
@@ -1782,10 +1974,11 @@ CCEC b256 `scalar-nop-count=1`，Submit 为 58.371217ms，8 个 cursor 均为
 reserve 前的拒绝条件和 host 断言，按只跑 b1 的约定未把该数字冒充最终
 ELF 复测值。
 
-当前 atomic 泳道不是 shared 协议全量清单：exact-turn 的 load，以及 shared
-heap cursor/vend 的 Load/FetchAdd/Exchange 直接调用 `Ops`，尚未进入既有
-`AtomicSite` wrapper。它们已经计入 Submit/阶段总时间和 host 终态校验，
-但现有 atomic trace 不能用于拆分这几项单指令成本。
+S3.2a 当时的 atomic 泳道不是 shared 协议全量清单：exact-turn 的 load，
+以及 shared heap cursor/vend 的 Load/FetchAdd/Exchange 直接调用 `Ops`，
+尚未进入既有 `AtomicSite` wrapper。S4.6 已删除 exact-turn load；heap、
+symbol writer/published 仍未进入 wrapper。它们已经计入 Submit/阶段总时间
+和 host 终态校验，但现有 atomic trace 不能用于拆分这些单指令成本。
 
 S3.2a 到此仍保留所有 worker eager 构参；随后由独立的 S3.2b 提交收敛
 QK/SF/PV/UP 重构参。
@@ -1907,3 +2100,84 @@ turn-release 故障、损坏计数和 Alloc completion 已不可逆的 publicati
 S4.5 的结论是封口基础协议已经可用，不是最终性能结论。下一提交只处理
 PA Case1 恒为空的全局 sequencer；非空 ordinary region 的通用并发算法仍未
 实现，不能借 S4.6 的 Case1 结果宣称已经支持。
+
+### 2026-07-25：S4.6 从 PA Case1 热路径移除全局 sequencer
+
+本阶段严格沿用 S4.5 已证明的 Build 后封口，不改发布时机、不引入参考分支
+的 deferred resolve，也不改 writer intent。唯一协议变量是删除每个 winner
+对 `committed_tasks==task_id` 的等待、空 region prepare 和 turn release。
+
+实现完成后，shared winner 的业务顺序为：
+
+```text
+Materialize shared descriptor
+  -> CollectSharedFanin 等待并读取实际 per-slot symbol
+  -> ValidateEmptySharedRegistration
+  -> CompleteTask / BuildWinner
+  -> CommitSharedFaninWriters
+  -> PublishSharedTaskOutputs
+```
+
+host 不再按 task 数推导 shared reclaim；它要求 sequencer、bucket 和 slot
+保持初始化状态。worker 的 `map_alive_floor/map_cleaned_upto` 也改为 0，
+而跨 private/shared 的 normalized writer signature 仍使用逻辑 floor 做
+规范化投影。两者在源码注释和断言中分开，避免再次把比较坐标冒充物理
+sidecar 状态。
+
+实现过程中查档发现现有 analyzer 把 `PrepareMap` 列为 required phase。
+本步没有为此新增 mode 字段或分叉 converter，而是在 shared swimlane 中
+复用 `materialize_end` 写零时长 marker。它不读取 SYS_CNT、不访问 region
+控制字；perf-clock/submit-PMU 中模板实例化为 false。这样维持原 raw schema
+和六条每 Submit 固定记录，也没有扩大约 400MB 的 trace buffer。
+
+新增或修正的定向门禁包括：
+
+- future task 6 在全局前沿为 0 时完成完整 QK finish 和 publication；
+- shared symbol、manual-dep Local/GM writer、非 manual-dep Local/GM
+  ordinary writer 与非法 register mask 的空 region 判断；
+- 预置 `fatal` 模拟另一核已广播终止态，winner 在 heap reserve、slot、
+  completion 和 symbol 任一副作用前退出；
+- writer failure、writer 成功后 publication failure、publication preflight
+  failure 和成功封口均证明 sequencer 不变；
+- Alloc/QK publication 与 UP 第二 writer 故障的完整 finish 继续核对
+  fatal、不可逆 ready、slot 撤销和 terminal writer 现场；
+- 最新 symbol 与 split-finish 用例通过 ASan/UBSan/leak。
+
+CPU 回归结果：
+
+| 构建/负载 | 结果 |
+| --- | --- |
+| shared/private perf-clock 严格构建 | 公共自测全部 PASS |
+| shared PrepareMap raw-marker 负向自测 | 非零时长、task 序列/身份/flags/aux 漂移、Materialize 锚点错误、缺失和重复记录均被拒绝 |
+| shared b1 scalar-nop0 / real-compute | 96 worker 全部语义、descriptor、writer、heap 与计算结果 PASS |
+| shared b256 scalar-nop0 | 1,280 task 完成，published/input/writer/fanin 为 2,048/1,280/768/1,280，region 保持初始化状态 |
+| private b1/b256 scalar-nop0 | 全部断言 PASS，证明 shared 宏分支未改写 private |
+| shared b1 raw 后处理 | 3,089/3,089 records，0 drop；零时长 PrepareMap 门禁、converter、exclusive analyzer PASS |
+
+A5 上板结果：
+
+| 构建/负载 | 结果 |
+| --- | --- |
+| shared perf-clock b1 real-compute | 最终 terminal-fatal 门禁 ELF 为 70.279 us，语义与 4 个 active tile PASS |
+| shared perf-clock b256 scalar-nop0 | 提交前审查前的 S4.6 ELF 为 3,228.844 us，96 核活跃，全部 1,280 task PASS |
+| shared perf-clock b256 real-compute | 提交前审查前的 S4.6 ELF 为 5,982.840 us，192 个 active tile PASS |
+| private perf-clock b1 real-compute | 70.707 us，全部断言 PASS |
+| private perf-clock b256 scalar-nop0 | 3,300.478 us，全部断言 PASS |
+| shared swimlane b1 real-compute | 最终 ELF 4,168/4,168 records，0 drop，零时长 marker、转换与排他分析 PASS |
+| shared submit-PMU register b1 | 480 calls，phase share 0.8020%，owner cleanup PASS |
+
+b256 shared 同时闭合 published 2,048、symbol input load 1,280、writer commit
+768、fanin edge 1,280、8 shard 各 25,821,184B、总 vend 206,569,472B，
+且 `committed=0/reclaim=-1/region=empty`。这些证据共同证明原 global
+convoy 已消失，不依赖某个固定毫秒阈值。
+
+参考提交没有 global sequencer，并采用 consumer Exchange + producer
+FetchMax 的 writer intent。它还在普通 `RingSlot` 路径把未 resolve 的 ref
+留到执行前；但当前 winner follower 会在构造 `BuiltSubtask` 时同步等待，
+`shared_ref_mask` 保持 0，所以不能把 ordinary-slot 的能力外推成参考 PA
+winner 路径已经 deferred。`RingSlot/BuiltSubtask` ABI 都保留
+`shared_ref_mask/shared_refs`，writer intent 另引入
+`deps_prepared/prepared_deps`；这些机制有明确性能价值，也有 GM 搬运、I-cache
+和槽容量成本。当前不照搬的原因是隔离变量和补齐失败边界，不是认为参考代码
+没有价值；冻结 ELF 后应先确认实际命中的 slot 路径，再用数据决定复用并删除
+standalone 的保守过程态。

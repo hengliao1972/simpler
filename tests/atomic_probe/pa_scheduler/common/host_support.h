@@ -605,6 +605,98 @@ inline bool ClockRecordSchemaValid(const TraceRecord &record) {
            record.function_id == -1 && record.auxiliary == 0;
 }
 
+// shared PA Case1 不再执行 ordinary-region PrepareMap，但为保持现有 raw
+// schema 仍写一条零时长 marker。这里直接在 host 已有 raw 扫描中闭合
+// Claim -> Materialize -> PrepareMap -> Submit 身份、顺序与次数，不增加任何
+// device 记录字段。private 的 PrepareMap 是真实动作，因此编译为无约束
+// validator。
+struct SharedPrepareMapTraceValidator {
+    bool Observe(const TraceRecord &record) {
+#if PTO_FDWIC_SHARED_MAP
+        const auto phase = static_cast<TracePhase>(record.phase);
+        if (phase == TracePhase::Claim) {
+            if (submit_pending_ || record.task_id != next_task_id_) return false;
+            submit_pending_ = true;
+            materialize_seen_ = false;
+            marker_seen_ = false;
+            task_id_ = record.task_id;
+            function_id_ = record.function_id;
+        } else if (phase == TracePhase::Materialize) {
+            if (!submit_pending_ || materialize_seen_ || marker_seen_ ||
+                record.task_id != task_id_ ||
+                record.function_id != function_id_) {
+                return false;
+            }
+            materialize_seen_ = true;
+            materialize_end_ = record.end_cycle;
+            ++materialize_count_;
+        } else if (phase == TracePhase::PrepareMap) {
+            if (!submit_pending_ || !materialize_seen_ || marker_seen_ ||
+                record.task_id != task_id_ ||
+                record.function_id != function_id_ ||
+                record.start_cycle != materialize_end_ ||
+                record.end_cycle != materialize_end_ ||
+                record.flags != 0 || record.task_id < 0) {
+                return false;
+            }
+            const uint32_t kind =
+                static_cast<uint32_t>(record.task_id) % kTasksPerBatch;
+            if (record.auxiliary != (kind == 0 ? 1U : 0U)) {
+                return false;
+            }
+            marker_seen_ = true;
+            ++marker_count_;
+        } else if (phase == TracePhase::Submit) {
+            if (!submit_pending_ || !materialize_seen_ || !marker_seen_ ||
+                record.task_id != task_id_ ||
+                record.function_id != function_id_) {
+                return false;
+            }
+            submit_pending_ = false;
+            ++next_task_id_;
+            ++submit_count_;
+        }
+#else
+        (void)record;
+#endif
+        return true;
+    }
+
+    bool Closed() const {
+#if PTO_FDWIC_SHARED_MAP
+        return !submit_pending_ &&
+               materialize_count_ == marker_count_ &&
+               marker_count_ == submit_count_;
+#else
+        return true;
+#endif
+    }
+
+    uint32_t MaterializeCount() const {
+        return materialize_count_;
+    }
+
+    uint32_t MarkerCount() const {
+        return marker_count_;
+    }
+
+    uint32_t SubmitCount() const {
+        return submit_count_;
+    }
+
+private:
+    bool submit_pending_ = false;
+    bool materialize_seen_ = false;
+    bool marker_seen_ = false;
+    int32_t next_task_id_ = 0;
+    int32_t task_id_ = -1;
+    int32_t function_id_ = -1;
+    uint64_t materialize_end_ = 0;
+    uint32_t materialize_count_ = 0;
+    uint32_t marker_count_ = 0;
+    uint32_t submit_count_ = 0;
+};
+
 inline void ExpectedTraceTopology(uint32_t worker, int32_t *block_id, int32_t *lane) {
     if (worker < kAicWorkers) {
         *block_id = static_cast<int32_t>(worker);
@@ -781,6 +873,7 @@ inline bool ExportSwimlaneRecords(
         bool dependency_applied = false;
         bool direct_result_used_return_ready = false;
         bool direct_result_used_source_issue = false;
+        SharedPrepareMapTraceValidator prepare_map_validator;
         for (uint32_t index = 0; index < available; ++index) {
             const TraceRecord &record = scratch[index];
             const bool atomic_record = record.phase == static_cast<int32_t>(TracePhase::Atomic);
@@ -794,12 +887,15 @@ inline bool ExportSwimlaneRecords(
                  record.auxiliary <= 1);
             const bool clock_schema_valid = !clock_record ||
                 (atomic_trace_enabled && ClockRecordSchemaValid(record));
-            const bool record_valid = record.end_cycle >= record.start_cycle && record.phase >= 0 &&
-                                      record.phase < kTracePhaseCount && record.task_id >= -1 &&
-                                      record.function_id >= -1 && record.lane == core.lane &&
-                                      record.block_id == core.block_id &&
-                                      record.core_idx == core.core_idx && atomic_schema_valid &&
-                                      claim_schema_valid && clock_schema_valid;
+            bool record_valid = record.end_cycle >= record.start_cycle && record.phase >= 0 &&
+                                record.phase < kTracePhaseCount && record.task_id >= -1 &&
+                                record.function_id >= -1 && record.lane == core.lane &&
+                                record.block_id == core.block_id &&
+                                record.core_idx == core.core_idx && atomic_schema_valid &&
+                                claim_schema_valid && clock_schema_valid;
+            if (record_valid && !prepare_map_validator.Observe(record)) {
+                record_valid = false;
+            }
             if (!record_valid) {
                 std::fprintf(
                     stderr,
@@ -861,18 +957,23 @@ inline bool ExportSwimlaneRecords(
             core_closed = core_atomic_records == 0 && core_atomic_calls == 0 && core_poll_calls == 0 &&
                           core_poll_batch_records == 0 && core_clock_records == 0;
         }
+        core_closed &= prepare_map_validator.Closed();
         if (!core_closed) {
             std::fprintf(
                 stderr,
                 "swimlane closure failed on worker=%u: physical_atomic=%u logical_atomic=%llu/%u "
                 "poll_calls=%llu/%u poll_batches=%u/%u clock=%u plain=%u dependency=%u "
-                "dependency_applied=%s direct_ready=%s direct_issue=%s\n",
+                "dependency_applied=%s direct_ready=%s direct_issue=%s "
+                "materializes=%u prepare_map_markers=%u submits=%u\n",
                 worker, core_atomic_records, static_cast<unsigned long long>(core_atomic_calls),
                 core.atomic_calls, static_cast<unsigned long long>(core_poll_calls), core.poll_calls,
                 core_poll_batch_records, core.poll_batch_records, core_clock_records,
                 core_plain_clock_records, core_dependency_clock_records,
                 dependency_applied ? "yes" : "no", direct_result_used_return_ready ? "yes" : "no",
-                direct_result_used_source_issue ? "yes" : "no"
+                direct_result_used_source_issue ? "yes" : "no",
+                prepare_map_validator.MaterializeCount(),
+                prepare_map_validator.MarkerCount(),
+                prepare_map_validator.SubmitCount()
             );
             success = false;
             break;
@@ -954,6 +1055,7 @@ inline bool AnalyzeSwimlaneRecords(
     uint64_t clock_dependency_applied[2] = {};
     std::vector<TraceRecord> scratch(kTraceRecordsPerCore);
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
+        SharedPrepareMapTraceValidator prepare_map_validator;
         const uint32_t available = header.cores[worker].count;
         const uint32_t count = std::min(available, header.records_per_core);
         if (count != 0 && !read_records(worker, count, scratch.data())) {
@@ -965,6 +1067,19 @@ inline bool AnalyzeSwimlaneRecords(
                 record.end_cycle < record.start_cycle) {
                 // 分析器面对单条坏记录选择跳过；严格导出路径会直接拒绝，二者服务于不同诊断目的。
                 continue;
+            }
+            if (!prepare_map_validator.Observe(record)) {
+                std::fprintf(
+                    stderr,
+                    "swimlane analysis rejected shared PrepareMap flow at "
+                    "worker=%u index=%u task=%d function=%d start=%llu end=%llu "
+                    "flags=0x%08x aux=%u\n",
+                    worker, index, record.task_id, record.function_id,
+                    static_cast<unsigned long long>(record.start_cycle),
+                    static_cast<unsigned long long>(record.end_cycle),
+                    record.flags, record.auxiliary
+                );
+                return false;
             }
             const uint32_t phase = static_cast<uint32_t>(record.phase);
             const uint64_t duration = record.end_cycle - record.start_cycle;
@@ -1012,6 +1127,17 @@ inline bool AnalyzeSwimlaneRecords(
                     }
                 }
             }
+        }
+        if (!prepare_map_validator.Closed()) {
+            std::fprintf(
+                stderr,
+                "swimlane analysis rejected unclosed shared PrepareMap flow on "
+                "worker=%u: materializes=%u markers=%u submits=%u\n",
+                worker, prepare_map_validator.MaterializeCount(),
+                prepare_map_validator.MarkerCount(),
+                prepare_map_validator.SubmitCount()
+            );
+            return false;
         }
     }
 
@@ -1184,24 +1310,16 @@ struct SharedTensorMapValidation {
 };
 
 inline SharedTensorMapValidation ValidateSharedTensorMap(
-    const SharedTensorMapSidecar &map, uint32_t task_count
+    const SharedTensorMapSidecar &map
 ) {
     SharedTensorMapValidation validation;
-    validation.protocol_ok &=
-        map.committed_tasks.value == static_cast<int64_t>(task_count);
-    int64_t expected_reclaim =
-        static_cast<int64_t>(task_count) -
-        static_cast<int64_t>(kHeapWindow) - 2;
-    if (expected_reclaim < -1) {
-        expected_reclaim = -1;
-    }
-    validation.protocol_ok &=
-        map.reclaim_upto.value == expected_reclaim;
+    validation.protocol_ok &= map.committed_tasks.value == 0;
+    validation.protocol_ok &= map.reclaim_upto.value == -1;
 
     // shared fresh Output 已改由 shared_outputs 直接按
     // (producer_task_id, output_slot) 定位；Case1 中的唯一 ordinary
-    // output_view 又是 manual_dep。因此 region ring 必须完全为空，但仍由
-    // 每个 ordered winner 提交空 delta 推进 committed/reclaim。
+    // output_view 又是 manual_dep。因此 PA Case1 完全绕过 region ring，
+    // committed/reclaim 与 bucket/slot 都必须保持初始化状态。
     const SharedRegionPayload zero_payload{};
     for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
         const int64_t head = map.buckets[bucket].head.value;
@@ -1841,8 +1959,9 @@ inline Metrics Validate(
         }
     }
     // private ring 仍保留 heap window 内的四类 writer。shared fresh
-    // Output 已迁出 region ring，因此它的 region live/high-water 为零；但
-    // ordered committed/reclaim 仍沿用同一 logical floor。
+    // Output 已迁出 region ring，因此它的 region 摘要和 sequencer 均保持
+    // 初值。expected_map_floor 只供跨模式规范化 writer 签名投影使用，
+    // 不能解释成 shared sidecar 实际发生过 reclaim。
 #if !PTO_FDWIC_SHARED_MAP
     const uint64_t expected_private_map_live =
         static_cast<uint64_t>(kPaCase1MapEntriesPerBatch) *
@@ -1851,7 +1970,7 @@ inline Metrics Validate(
     const uint64_t expected_map_floor = task_count > kHeapWindow + 1 ? task_count - kHeapWindow - 1 : 0;
 #if PTO_FDWIC_SHARED_MAP
     const SharedTensorMapValidation shared_map_validation =
-        ValidateSharedTensorMap(state.shared_map, task_count);
+        ValidateSharedTensorMap(state.shared_map);
     const SharedOutputValidation shared_output_validation =
         ValidateSharedOutputs(state.shared_map, task_count, state.heap_size);
     bool shared_output_heap_layout_ok =
@@ -2059,8 +2178,18 @@ inline Metrics Validate(
 #else
             expected_private_map_live;
 #endif
-        final_worker_state_ok &= result.map_alive_floor == expected_map_floor;
-        final_worker_state_ok &= result.map_cleaned_upto == expected_map_floor;
+        final_worker_state_ok &= result.map_alive_floor ==
+#if PTO_FDWIC_SHARED_MAP
+            0;
+#else
+            expected_map_floor;
+#endif
+        final_worker_state_ok &= result.map_cleaned_upto ==
+#if PTO_FDWIC_SHARED_MAP
+            0;
+#else
+            expected_map_floor;
+#endif
 #if PTO_FDWIC_SHARED_MAP
         // shared 的权威签名由 host 对唯一 sidecar 逐槽生成，worker 不重复
         // 扫描共享 GM，以免把验证 DCCI 成本加入 kernel 生命周期。
@@ -2119,10 +2248,9 @@ inline Metrics Validate(
         // ready flag 和 vend 是跨核 completion 的最终外部可见状态，不能只依赖 worker 私有计数判断完成。
         ready_flags += state.tasks[task_id].flag == 1;
 #if PTO_FDWIC_SHARED_MAP
-        // allocator helper 与后续去 exact-turn 结构允许零输出 UP 在 producer
-        // reserve 前观察到 aggregate vend=0；当前 S4.5 完整流程因仍持有
-        // exact turn 实际会得到非零值。shared 从不使用该值做 heap reclaim，
-        // 因而 oracle 保留更一般的 0；非零输出 task 的 reserve prefix 必须非零。
+        // 无全局 turn 时，零输出 UP 可能在任一非零 reserve 前观察到
+        // aggregate vend=0。shared 不使用该值做 heap reclaim，因此 oracle
+        // 允许 0；有实际 output reserve 的 task 仍必须发布非零 vend。
         vend_values_ok &=
             ExpectedTaskOutputBytes(task_id) == 0 ||
             state.tasks[task_id].vend != 0;
@@ -2384,7 +2512,7 @@ inline Metrics Validate(
             shared_map_validation.physical_entries == 0 &&
             shared_map_validation.logical_entries == 0 &&
             shared_map_validation.logical_signature == 1469598103934665603ULL,
-        "shared empty region ring keeps ordered commit/reclaim exact",
+        "shared PA Case1 bypass leaves region sequencer untouched",
         &metrics
     );
     Expect(
@@ -2405,7 +2533,7 @@ inline Metrics Validate(
         "[TENSORMAP] mode=shared committed=%lld reclaim_upto=%lld "
         "region_appends=%llu region_physical=%llu region_logical=%llu "
         "region_raw_signature=%016llx normalized_writer_signature=%016llx "
-        "published_outputs=%llu logical_floor=%llu\n",
+        "published_outputs=%llu normalized_projection_floor=%llu\n",
         static_cast<long long>(
             state.shared_map.committed_tasks.value
         ),
@@ -2552,9 +2680,10 @@ inline Metrics Validate(
             (((state.config.trace_enabled & kTraceAtomicsEnabled) != 0)
                  ? physical_atomic_records + 2 * kWorkers
                  : 0);
-        // 每 batch 的 96*30 是六条每 Submit 固定记录；17 条是
-        // 5 条 winner tail、4 条 Fanin 和 8 条 Kernel/Commit。loser 不再写
-        // 零时长 marker。两个父 span 再各核固定增加 2 条；
+        // 每 batch 的 96*30 是六条每 Submit 固定记录；shared 的
+        // PrepareMap 是零时长结构 marker，不代表 region 业务。17 条是
+        // winner/Fanin/Kernel/Commit 记录。loser 不再写额外零时长
+        // winner marker；两个父 span 再各核固定增加 2 条；
         // RingBp 等真实等待按运行时次数额外加入。
         Expect(trace_shape_ok, "swimlane header and per-worker capacities are valid", &metrics);
         Expect(trace_dropped == 0, "swimlane records fit without drops", &metrics);

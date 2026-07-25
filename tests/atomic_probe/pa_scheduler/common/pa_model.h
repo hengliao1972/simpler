@@ -780,14 +780,13 @@ static_assert(offsetof(SharedOutputCell, tensors) == 1024, "shared output tensor
 #endif
 
 struct alignas(64) SharedTensorMapSidecar {
-    // committed_tasks 是 ordered-region/writer 阶段已按 task_id 连续提交的
-    // 数量：初始 0，任务 N（即使没有 region entry）完成 region prepare 和
-    // INOUT writer commit 后变为 N+1。fresh output 由每个 cell 的 published
-    // 独立封口，不能把 committed_tasks=N+1 解释成 descriptor 已经发布。
+    // committed_tasks/reclaim_upto 只属于未来非空 ordinary-region 的有序
+    // ring 协议。PA Case1 的输入全部是 fresh symbol，唯一普通 output_view
+    // 又标记 manual_dep，因此运行期不再触碰这两个控制字。
     AtomicLine committed_tasks;
     // reclaim_upto 是可回收 producer 的 inclusive 上界，初始 -1。
-    // 只有持有 committed_tasks==current_task 的有序 winner 才能推进它，
-    // 因而无需再维护 96 份按核 progress。
+    // 通用 ring 定向测试仍验证 exact-turn/reclaim helper，但不能把该测试
+    // 解释成 PA Case1 热路径仍经过全局 sequencer。
     AtomicLine reclaim_upto;
     SharedBucketState buckets[kMapBuckets];
     SharedRegionSlot slots[kMapCapacity];

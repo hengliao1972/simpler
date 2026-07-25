@@ -729,60 +729,11 @@ PA_DEVICE bool DiscardBuiltTask(
     return false;
 }
 
-// shared TensorMap 的顺序前沿不借用 Claim cursor：后者按 role 分片且会被
-// 快核提前推进，不能证明更早 task 的 region 已经发布。只有当前 task 的
-// winner 等待 committed_tasks 精确等于 task_id；若已经越过该 task，说明
-// ordered append 协议被破坏，不能把“>=”误当成本 task 仍持有 turn。
-template <typename Ops>
-PA_DEVICE bool WaitForSharedTaskTurn(
-    PA_GM SchedulerState *state, PA_GM WorkerState &worker,
-    uint32_t task_count, uint32_t task_id,
-    LocalStats &stats
-) {
-    const uint64_t begin = Ops::Now();
-    uint32_t polls = 0;
-    while (true) {
-        const int64_t committed =
-            Ops::Load(&state->shared_map.committed_tasks.value);
-        if (committed < 0 ||
-            committed > static_cast<int64_t>(task_count)) {
-            SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
-            return false;
-        }
-        if (committed == static_cast<int64_t>(task_id)) {
-            // exact turn 已就绪时仍做一次终止态检查，避免其他 worker 已经
-            // 广播 fatal，而本 winner 继续 reserve/publish。直接走 Ops
-            // 保持这条协议检查不额外扩张 atomic 泳道记录。
-            if (Ops::Load(&state->fatal.value) != 0) {
-                return false;
-            }
-            return true;
-        }
-        if (committed > static_cast<int64_t>(task_id)) {
-            SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
-            return false;
-        }
-        if (IsFatal<Ops>(state, stats, static_cast<int32_t>(task_id))) {
-            return false;
-        }
-        if (DrainReady<Ops>(
-                state, worker, DrainPlace::RingBackpressure, stats
-            ) == 0) {
-            Ops::SpinHint();
-        }
-        if (WatchdogExpired<Ops>(state, stats, begin, polls)) {
-            return false;
-        }
-    }
-}
-
 // register_mask 只指向已经存在的 Local/GM descriptor。两个地址空间分支
 // 必须保持分离，避免 CCEC 把它们合并成不支持的 pointer phi。
-PA_DEVICE bool BuildSharedRegistrationEntries(
-    const TaskArgs &args, const SubmitContext &context,
-    SharedRegionValue entries[kMaxTaskTensors], uint32_t &count
+PA_DEVICE bool ValidateEmptySharedRegistration(
+    const TaskArgs &args, const SubmitContext &context
 ) {
-    count = 0;
     uint32_t register_mask = context.register_mask;
     for (int32_t index = 0; index < args.tensor_count; ++index) {
         const uint32_t bit = 1U << static_cast<uint32_t>(index);
@@ -800,19 +751,19 @@ PA_DEVICE bool BuildSharedRegistrationEntries(
         if (reference.kind == TensorRefKind::GmTensor) {
             PA_GM const TensorDesc &tensor = *reference.pointer.gm_tensor;
             if (!tensor.manual_dep) {
-                entries[count++] = MakeSharedRegionValue(tensor, context.task_id);
+                return false;
             }
         } else if (reference.kind == TensorRefKind::LocalTensor) {
             const TensorDesc &tensor = *reference.pointer.local_tensor;
             if (!tensor.manual_dep) {
-                entries[count++] = MakeSharedRegionValue(tensor, context.task_id);
+                return false;
             }
         } else {
             return false;
         }
         register_mask &= ~bit;
     }
-    return register_mask == 0 && count <= kMaxTaskTensors;
+    return register_mask == 0;
 }
 
 template <typename Ops>
@@ -1193,59 +1144,8 @@ PA_DEVICE bool PublishSharedTaskOutputs(
     return true;
 }
 
-// 当前 task 的唯一 winner 持有 append turn。Prepare 前再次核对 exact
-// turn，并按 task_id/H 精确推进 reclaim；容量不足与 seq/cursor/单调状态
-// 破坏都直接 fatal。此 helper 只准备 region delta，不释放下一 task；
-// writer 提交和本地执行状态建立完成后再单独推进 committed_tasks。
 template <typename Ops>
-PA_DEVICE bool PrepareSharedTaskOrdered(
-    PA_GM SchedulerState *state,
-    const SharedRegionValue *entries, uint32_t count,
-    uint32_t task_id, LocalStats &stats
-) {
-    int64_t reclaim_upto = -1;
-    // Refresh 的第一步就是 committed_tasks==task_id 的 exact-turn 检查；
-    // 不在热路径重复一次相同 atomic load。
-    if (!SharedRefreshReclaimForTask<Ops>(
-            state->shared_map, static_cast<int32_t>(task_id),
-            static_cast<int32_t>(state->heap_window), reclaim_upto
-        )) {
-        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
-        return false;
-    }
-    if (!SharedPreflightTaskAppend<Ops>(
-            state->shared_map, entries, count, reclaim_upto
-        )) {
-        // CapacityBlocked 在精确 task-order reclaim 后仍无空间，已没有可等待
-        // 的慢核进度；与 ProtocolError 一样立即广播 fatal。
-        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
-        return false;
-    }
-
-    if (!SharedAppendPreparedTask<Ops>(
-            state->shared_map, entries, count
-        )) {
-        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
-        return false;
-    }
-    return true;
-}
-
-template <typename Ops>
-PA_DEVICE bool ReleaseSharedTaskTurn(
-    PA_GM SchedulerState *state, uint32_t task_id, LocalStats &stats
-) {
-    if (!SharedPublishTaskCommit<Ops>(
-            state->shared_map, static_cast<int32_t>(task_id)
-        )) {
-        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
-        return false;
-    }
-    return true;
-}
-
-template <typename Ops>
-PA_DEVICE bool SealSharedWinnerAfterBuild(
+PA_DEVICE bool PublishSharedWinnerAfterBuild(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker,
     const TaskArgs &args, const SubmitContext &context,
     uint32_t task_id, TaskKind kind, LocalStats &stats
@@ -1254,11 +1154,8 @@ PA_DEVICE bool SealSharedWinnerAfterBuild(
         CommitSharedFaninWriters<Ops>(
             state->shared_map, args, static_cast<int32_t>(task_id), stats
         );
-    const bool turn_released =
-        writers_committed &&
-        ReleaseSharedTaskTurn<Ops>(state, task_id, stats);
     const bool outputs_published =
-        turn_released &&
+        writers_committed &&
         PublishSharedTaskOutputs<Ops>(
             state->shared_map, context, task_id
         );
@@ -1480,25 +1377,20 @@ PA_DEVICE bool FinishCallbackSubmitBody(
     const bool winner = ticket.won != 0;
 
 #if PTO_FDWIC_SHARED_MAP
-    // 本阶段仍用 committed_tasks==task_id 串行放行 writer/empty-region
-    // 提交；shared heap 已允许并发，因此 turn 不再承担物理地址映射。
-    // winner 建立可执行状态并提交 INOUT writer 后才释放 turn，loser 只
-    // 保留空边界，不读取 args 或 shared sidecar。
-    const uint64_t prepare_begin =
-        TraceTimestamp<Ops>(stats.trace, stats.result);
-    if (__builtin_expect(winner, 0) &&
-        !WaitForSharedTaskTurn<Ops>(
-            state, worker, task_count, task_id, stats
-        )) {
-        return false;
-    }
-    const uint64_t prepare_end =
-        TraceTimestamp<Ops>(stats.trace, stats.result);
-
     // callback 已经返回；只有 Claim winner 才把 CreateInfo 物化为 descriptor
     // 并预留 shared heap。所有 replay actor 都仍进入 split finish、闭合固定
     // span 和 Submit 计数，但不会推进 heap、写 payload 或读取 TaskArgs。
-    const uint64_t materialize_begin = prepare_end;
+    // PA Case1 的普通 region 恒为空，winner 不再等待全局 exact turn；
+    // 跨 task 顺序只由实际消费的 (producer,slot).published 建立。
+    // 删除 exact-turn 不能连带删除它成功出口的终止态检查：若其他核已经
+    // 广播 fatal，本 winner 不得继续预留 heap、构建 slot 或发布 symbol。
+    // 这里直接使用 Ops，不扩张 atomic 泳道记录，也不恢复任何全局前沿。
+    if (__builtin_expect(winner, 0) &&
+        Ops::Load(&state->fatal.value) != 0) {
+        return false;
+    }
+    const uint64_t materialize_begin =
+        TraceTimestamp<Ops>(stats.trace, stats.result);
     BeginSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
     bool materialized = true;
     if (__builtin_expect(winner, 0)) {
@@ -1527,10 +1419,13 @@ PA_DEVICE bool FinishCallbackSubmitBody(
         materialize_begin, materialize_end, 0,
         kind == TaskKind::Alloc ? 1U : 0U
     );
+    // 现有泳道 analyzer 要求每个 Submit 都有一条 PrepareMap。shared
+    // Case1 已无对应业务动作，因此复用 materialize_end 写零时长结构
+    // marker：不额外读钟、不触碰 region sidecar；非泳道构建会编译消除。
     WriteTrace<Profile>(
         stats.trace, stats.result, static_cast<int32_t>(task_id), function_id,
         TracePhase::PrepareMap, ProfilePhase::PrepareMap,
-        prepare_begin, prepare_end, 0,
+        materialize_end, materialize_end, 0,
         kind == TaskKind::Alloc ? 1U : 0U
     );
 #else
@@ -1614,23 +1509,10 @@ PA_DEVICE bool FinishCallbackSubmitBody(
 #if PTO_FDWIC_SHARED_MAP
     bool registered = true;
     if (__builtin_expect(winner, 0)) {
-        uint32_t shared_entry_count = 0;
-        SharedRegionValue shared_entries[kMaxTaskTensors];
-        registered = BuildSharedRegistrationEntries(
-            args, context, shared_entries, shared_entry_count
-        );
         // 当前 standalone 只模拟 PA Case1：fresh symbol 直接寻址，
         // output_view 又是 manual_dep，ordinary region 必须严格为空。
-        // 非零 entry 不能悄悄退回旧 ordered ring 掩盖拓扑偏差。
-        registered = registered && shared_entry_count == 0;
-        if (registered) {
-            registered = PrepareSharedTaskOrdered<Ops>(
-                state, shared_entries, shared_entry_count, task_id, stats
-            );
-        }
-        if (registered) {
-            stats.result.map_inserts += shared_entry_count;
-        }
+        // 这里只读验证，不构造空 delta，也不触碰 region sequencer。
+        registered = ValidateEmptySharedRegistration(args, context);
     }
 #else
     const bool registered = RegisterOutputs(context, args, kind != TaskKind::Alloc);
@@ -1646,9 +1528,15 @@ PA_DEVICE bool FinishCallbackSubmitBody(
         register_begin, register_end, 0, kind == TaskKind::Alloc ? 0U : 1U
     );
     if (!registered) {
+#if PTO_FDWIC_SHARED_MAP
+        // PA Case1 不接入 ordinary-region backend。非 manual-dep 的普通
+        // writer 或非法 register mask 会在 region append 前失败并广播
+        // fatal；此前 Materialize 和 fanin 仍可能读取 shared sidecar。
+#else
         // 固定桶容量不足时，InsertTensor 没有覆写任何 live 槽。沿用现有
         // fatal 广播终止所有 worker，禁止像旧 linked map 一样静默漏登记
         // hazard、随后带着不完整 fanin 继续执行。
+#endif
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
@@ -1670,12 +1558,12 @@ PA_DEVICE bool FinishCallbackSubmitBody(
                 return false;
             }
         }
-        // 先建立可执行状态，再在 exact turn 内提交 INOUT writer；随后
-        // 放行下一 task，最后发布本 task 的 fresh outputs。依赖本 task
-        // 的后继即使已经取得 turn，也只能在对应 published cell 等待。
+        // 先建立可执行状态，再提交本任务的唯一 INOUT writer，最后发布
+        // fresh outputs。PA Case1 没有多级 writer 链；后继只等待自己
+        // 实际依赖的 published cell，不再经过全局 committed_tasks。
         // published 成功之后只剩观察记录与 Submit 收尾。
 #if PTO_FDWIC_SHARED_MAP
-        if (!SealSharedWinnerAfterBuild<Ops>(
+        if (!PublishSharedWinnerAfterBuild<Ops>(
                 state, worker, args, context, task_id, kind, stats
             )) {
             return false;
@@ -2338,14 +2226,11 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     // bucket/head/tail/seq/payload 由 host 回读唯一 sidecar 后逐槽校验。
     // shared fresh Output 都由 shared-output table 直接寻址，manual_dep
     // 的 output_view 也不进入自动 region hazard；因此 Case1 region ring
-    // 严格为空。ordered reclaim 前沿仍照 task/H 计算，供 host 闭合回收状态。
-    const uint32_t shared_map_floor =
-        task_count > kHeapWindow + 1
-            ? task_count - kHeapWindow - 1
-            : 0;
+    // 严格为空；四个摘要都保持零，不能再用跨模式签名比较所需的逻辑
+    // floor 冒充 sidecar 实际发生过 ordered reclaim。
     stats.result.map_high_water = 0;
-    stats.result.map_alive_floor = shared_map_floor;
-    stats.result.map_cleaned_upto = shared_map_floor;
+    stats.result.map_alive_floor = 0;
+    stats.result.map_cleaned_upto = 0;
     stats.result.map_live_entries = 0;
 #else
     stats.result.map_high_water = static_cast<uint32_t>(worker.map.high_water);

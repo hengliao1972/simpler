@@ -130,7 +130,7 @@ struct ExpiredWaitOps : SymbolTestOps {
 std::atomic<uint64_t> ExpiredWaitOps::calls{0};
 
 // 只在定向测试中模拟“预检后、atomic 执行前”出现的协议异常，覆盖正常
-// exact-turn 不会命中的冷回滚分支。
+// 单写者 Case1 不会命中的冷回滚分支。
 struct PublicationFaultOps : SymbolTestOps {
     using SymbolTestOps::Exchange;
 
@@ -162,29 +162,13 @@ volatile int64_t *PublicationFaultOps::exchange_race_address = nullptr;
 struct SealOrderOps : SymbolTestOps {
     using SymbolTestOps::Exchange;
 
-    static volatile int64_t *committed_address;
     static volatile int64_t *output_writer_address;
     static volatile int64_t *published_address;
-    static int64_t expected_committed;
     static int64_t expected_writer;
     static bool order_ok;
 
-    static int64_t FetchMax(
-        volatile int64_t *address, int64_t value, uint64_t &retries
-    ) {
-        if (address == output_writer_address) {
-            order_ok &=
-                __atomic_load_n(committed_address, __ATOMIC_ACQUIRE) ==
-                    expected_committed;
-        }
-        return SymbolTestOps::FetchMax(address, value, retries);
-    }
-
     static int64_t Exchange(volatile int64_t *address, int64_t value) {
         if (address == published_address) {
-            order_ok &=
-                __atomic_load_n(committed_address, __ATOMIC_ACQUIRE) ==
-                    expected_committed;
             order_ok &=
                 __atomic_load_n(output_writer_address, __ATOMIC_ACQUIRE) ==
                     expected_writer;
@@ -193,10 +177,8 @@ struct SealOrderOps : SymbolTestOps {
     }
 };
 
-volatile int64_t *SealOrderOps::committed_address = nullptr;
 volatile int64_t *SealOrderOps::output_writer_address = nullptr;
 volatile int64_t *SealOrderOps::published_address = nullptr;
-int64_t SealOrderOps::expected_committed = 0;
 int64_t SealOrderOps::expected_writer = 0;
 bool SealOrderOps::order_ok = true;
 
@@ -512,6 +494,68 @@ void TestFailedSealDiscardsBuiltTask() {
     );
 }
 
+void TestCase1RegistrationBypassesRegionSequencer() {
+    SubmitContext context{};
+
+    TaskArgs shared_args;
+    ConstructTaskArgs(shared_args);
+    AppendSharedOutputRef(
+        shared_args, FdwicOutputRef{0, 0, 0, 0, 0, 0},
+        TensorArgType::Inout
+    );
+    context.register_mask = 1;
+    Check(
+        ValidateEmptySharedRegistration(shared_args, context),
+        "shared symbol writer bypasses ordinary region registration"
+    );
+
+    TensorDesc manual = MakeTensor(0x360000000ULL, 0);
+    manual.manual_dep = true;
+    TaskArgs manual_args;
+    ConstructTaskArgs(manual_args);
+    AddLocalTensor(manual_args, manual, TensorArgType::Inout);
+    context.register_mask = 1;
+    Check(
+        ValidateEmptySharedRegistration(manual_args, context),
+        "manual-dependency local writer leaves the region delta empty"
+    );
+
+    TaskArgs manual_gm_args;
+    ConstructTaskArgs(manual_gm_args);
+    AddGmTensor(manual_gm_args, manual, TensorArgType::Inout);
+    context.register_mask = 1;
+    Check(
+        ValidateEmptySharedRegistration(manual_gm_args, context),
+        "manual-dependency GM writer leaves the region delta empty"
+    );
+
+    TensorDesc ordinary = manual;
+    ordinary.manual_dep = false;
+    TaskArgs ordinary_args;
+    ConstructTaskArgs(ordinary_args);
+    AddLocalTensor(ordinary_args, ordinary, TensorArgType::Inout);
+    context.register_mask = 1;
+    Check(
+        !ValidateEmptySharedRegistration(ordinary_args, context),
+        "non-manual ordinary writer fails closed instead of entering the ring"
+    );
+
+    TaskArgs ordinary_gm_args;
+    ConstructTaskArgs(ordinary_gm_args);
+    AddGmTensor(ordinary_gm_args, ordinary, TensorArgType::Inout);
+    context.register_mask = 1;
+    Check(
+        !ValidateEmptySharedRegistration(ordinary_gm_args, context),
+        "non-manual ordinary GM writer fails closed before region append"
+    );
+
+    context.register_mask = 2;
+    Check(
+        !ValidateEmptySharedRegistration(shared_args, context),
+        "registration mask outside active arguments fails closed"
+    );
+}
+
 void TestPostBuildSealClosesSuccessAndFailurePaths() {
     {
         SchedulerState *state = MapSparseSchedulerState();
@@ -538,7 +582,7 @@ void TestPostBuildSealClosesSuccessAndFailurePaths() {
             LocalStats stats{};
 
             Check(
-                !SealSharedWinnerAfterBuild<SymbolTestOps>(
+                !PublishSharedWinnerAfterBuild<SymbolTestOps>(
                     state, worker, args, context, 4, TaskKind::Up, stats
                 ),
                 "writer invariant failure rejects post-build seal"
@@ -546,7 +590,7 @@ void TestPostBuildSealClosesSuccessAndFailurePaths() {
             Check(
                 state->fatal.value == 1 &&
                     state->shared_map.committed_tasks.value == 4,
-                "writer failure broadcasts fatal before releasing task turn"
+                "writer failure broadcasts fatal without touching region sequencer"
             );
             Check(
                 state->shared_map.shared_outputs[0]
@@ -565,10 +609,10 @@ void TestPostBuildSealClosesSuccessAndFailurePaths() {
 
     {
         SchedulerState *state = MapSparseSchedulerState();
-        Check(state != nullptr, "turn-release-failure seal state maps");
+        Check(state != nullptr, "writer-then-publication-failure state maps");
         if (state != nullptr) {
             ResetSharedState(state->shared_map);
-            state->shared_map.committed_tasks.value = 4;
+            state->shared_map.committed_tasks.value = 37;
             state->shared_map.shared_outputs[0]
                 .last_writer[0].value = 0;
             WorkerState &worker = state->workers[0];
@@ -586,37 +630,53 @@ void TestPostBuildSealClosesSuccessAndFailurePaths() {
             SubmitContext context{};
             context.task_id = 4;
             context.result.task_id = 4;
+            TensorDesc output = MakeTensor(0x380000000ULL, 4);
+            context.result.count = 1;
+            context.result.tensors[0] = &output;
             context.shared_result.Reset(4);
+            Check(
+                context.shared_result.AddOutputRef(4, 0),
+                "writer-publication-failure context declares output"
+            );
             LocalStats stats{};
 
             PublicationFaultOps::exchange_race_address =
-                &state->shared_map.committed_tasks.value;
+                &state->shared_map.shared_outputs[4]
+                     .published[0].value;
             Check(
-                !SealSharedWinnerAfterBuild<PublicationFaultOps>(
+                !PublishSharedWinnerAfterBuild<PublicationFaultOps>(
                     state, worker, args, context, 4, TaskKind::Up, stats
                 ),
-                "turn-release invariant failure rejects post-build seal"
+                "publication failure after writer commit rejects post-build seal"
             );
             Check(
                 PublicationFaultOps::exchange_race_address == nullptr &&
                     state->fatal.value == 1,
-                "turn-release failure consumes injection and broadcasts fatal"
+                "publication failure consumes injection and broadcasts fatal"
             );
             Check(
-                state->shared_map.committed_tasks.value == 7,
-                "turn-release failure restores the observed frontier"
+                state->shared_map.committed_tasks.value == 37 &&
+                    state->shared_map.reclaim_upto.value == -1,
+                "post-build seal leaves the unused region sequencer untouched"
             );
             Check(
                 state->shared_map.shared_outputs[0]
                         .last_writer[0].value == 4 &&
                     stats.result.shared_symbol_inout_commits == 1,
-                "turn-release failure retains the completed writer commit"
+                "publication failure retains the completed writer commit"
+            );
+            Check(
+                state->shared_map.shared_outputs[4]
+                        .published[0].value == -1 &&
+                    state->shared_map.shared_outputs[4]
+                        .last_writer[0].value == -1,
+                "publication failure rolls back only the producer output cell"
             );
             Check(
                 !worker.slots[0].occupied &&
                     !worker.slots[0].built &&
                     worker.occupied_count == 0,
-                "turn-release failure removes the failed winner slot"
+                "publication failure removes the failed winner slot"
             );
             UnmapSparseSchedulerState(state);
         }
@@ -627,7 +687,7 @@ void TestPostBuildSealClosesSuccessAndFailurePaths() {
         Check(state != nullptr, "publication-failure seal state maps");
         if (state != nullptr) {
             ResetSharedState(state->shared_map);
-            state->shared_map.committed_tasks.value = 1;
+            state->shared_map.committed_tasks.value = 19;
             state->shared_map.shared_outputs[1]
                 .last_writer[0].value = 7;
             WorkerState &worker = state->workers[0];
@@ -652,15 +712,15 @@ void TestPostBuildSealClosesSuccessAndFailurePaths() {
             LocalStats stats{};
 
             Check(
-                !SealSharedWinnerAfterBuild<SymbolTestOps>(
+                !PublishSharedWinnerAfterBuild<SymbolTestOps>(
                     state, worker, args, context, 1, TaskKind::Qk, stats
                 ),
                 "publication invariant failure rejects post-build seal"
             );
             Check(
                 state->fatal.value == 1 &&
-                    state->shared_map.committed_tasks.value == 2,
-                "publication failure is terminal after releasing the old turn"
+                    state->shared_map.committed_tasks.value == 19,
+                "publication failure is terminal without a global turn"
             );
             Check(
                 state->shared_map.shared_outputs[1]
@@ -683,7 +743,7 @@ void TestPostBuildSealClosesSuccessAndFailurePaths() {
         Check(state != nullptr, "successful seal state maps");
         if (state != nullptr) {
             ResetSharedState(state->shared_map);
-            state->shared_map.committed_tasks.value = 1;
+            state->shared_map.committed_tasks.value = 23;
             WorkerState &worker = state->workers[0];
             worker.occupied_count = 1;
             worker.slots[0].task_id = 1;
@@ -705,35 +765,32 @@ void TestPostBuildSealClosesSuccessAndFailurePaths() {
             );
             LocalStats stats{};
 
-            SealOrderOps::committed_address =
-                &state->shared_map.committed_tasks.value;
             SealOrderOps::output_writer_address =
                 &state->shared_map.shared_outputs[1]
                      .last_writer[0].value;
             SealOrderOps::published_address =
                 &state->shared_map.shared_outputs[1]
                      .published[0].value;
-            SealOrderOps::expected_committed = 2;
             SealOrderOps::expected_writer = 1;
             SealOrderOps::order_ok = true;
             Check(
-                SealSharedWinnerAfterBuild<SealOrderOps>(
+                PublishSharedWinnerAfterBuild<SealOrderOps>(
                     state, worker, args, context, 1, TaskKind::Qk, stats
                 ),
                 "valid post-build seal succeeds"
             );
             Check(
                 SealOrderOps::order_ok,
-                "turn release and writer initialization precede published"
+                "output writer initialization precedes published"
             );
             Check(
                 state->fatal.value == 0 &&
-                    state->shared_map.committed_tasks.value == 2 &&
+                    state->shared_map.committed_tasks.value == 23 &&
                     state->shared_map.shared_outputs[1]
                         .last_writer[0].value == 1 &&
                     state->shared_map.shared_outputs[1]
                         .published[0].value == 1,
-                "successful seal closes turn, writer, and publication state"
+                "successful seal publishes output without touching sequencer"
             );
             Check(
                 SameTensor(
@@ -748,7 +805,6 @@ void TestPostBuildSealClosesSuccessAndFailurePaths() {
                     worker.occupied_count == 1,
                 "successful seal preserves executable winner slot"
             );
-            SealOrderOps::committed_address = nullptr;
             SealOrderOps::output_writer_address = nullptr;
             SealOrderOps::published_address = nullptr;
             UnmapSparseSchedulerState(state);
@@ -1099,6 +1155,7 @@ int main() {
     TestWriterCommitFailuresKeepTerminalEvidence();
     TestMultiWriterFailureKeepsPartialTerminalEvidence();
     TestFailedSealDiscardsBuiltTask();
+    TestCase1RegistrationBypassesRegionSequencer();
     TestPostBuildSealClosesSuccessAndFailurePaths();
     TestPublicationPreflightIsAllOrNothing();
     TestPublicationCommitFaultsRollback();

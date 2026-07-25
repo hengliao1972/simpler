@@ -81,8 +81,9 @@ echo "[TEST] atomic PollBatch boundary self-test"
 "$BUILD_DIR/test_atomic_poll_batch"
 
 # TensorMap 独立回归不启动 96 个 worker，也不运行模拟 kernel：private
-# 覆盖单线程 ring 的回收回绕与 reference 差分；shared 覆盖有序发布、
-# seq/ABA、慢核回收和整任务容量预检，两者不混用并发纪律。
+# 覆盖单线程 ring 的回收回绕与 reference 差分；shared ordered ring 只作为
+# 未来非空 ordinary-region 的隔离原型，覆盖 seq/ABA、回收与容量预检。
+# 当前 shared PA Case1 已绕过该原型，不能用本测试冒充热路径证据。
 if [[ "$TENSORMAP_MODE" == "private" ]]; then
     echo "[BUILD] private TensorMap ring self-test"
     "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
@@ -95,7 +96,7 @@ if [[ "$TENSORMAP_MODE" == "private" ]]; then
     echo "[TEST] private TensorMap ring self-test"
     "$BUILD_DIR/test_private_tensor_map_ring"
 else
-    echo "[BUILD] shared TensorMap ordered-ring self-test"
+    echo "[BUILD] isolated shared ordinary-region ring self-test"
     "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \
         -DPA_BUILD_SWIMLANE=1 \
@@ -103,8 +104,21 @@ else
         "$ROOT_DIR/common/test_shared_tensor_map_ring.cpp" \
         -o "$BUILD_DIR/test_shared_tensor_map_ring"
 
-    echo "[TEST] shared TensorMap ordered-ring self-test"
+    echo "[TEST] isolated shared ordinary-region ring self-test"
     "$BUILD_DIR/test_shared_tensor_map_ring"
+
+    # PA Case1 为兼容既有 schema 保留零时长 PrepareMap marker。该 host
+    # 定向用例锁定 Claim/Materialize/marker/Submit 身份、逐 task 顺序、
+    # Materialize.end 锚点、flags/aux 与唯一性。
+    echo "[BUILD] shared PrepareMap raw-marker self-test"
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/common/test_shared_prepare_map_trace.cpp" \
+        -o "$BUILD_DIR/test_shared_prepare_map_trace"
+
+    echo "[TEST] shared PrepareMap raw-marker self-test"
+    "$BUILD_DIR/test_shared_prepare_map_trace"
 
     # fresh-output symbol 与 region ring 是两条独立协议。该用例单独锁定
     # descriptor 最终封口、只读 fanin、构建后 INOUT writer commit、

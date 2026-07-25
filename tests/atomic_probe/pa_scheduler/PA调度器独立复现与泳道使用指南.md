@@ -243,16 +243,17 @@ submit-pmu 四件套都必须通过 manifest 的模式、变体、阶段和 SHA2
 校验，才能启动 host。
 
 `perf-clock` 的“两个时间边界”专指新增的性能观察：task 0 在 EfDrain 前
-读取一次，末 task 完成 Submit 尾动作后读取一次。shared ordered 协议和
-startup 屏障仍保留时间型 watchdog；每个等待窗口先读取一次超时起点，
+读取一次，末 task 完成 Submit 尾动作后读取一次。shared per-slot symbol
+等待和 startup 屏障仍保留时间型 watchdog；每个等待窗口先读取一次超时起点，
 随后只在每 1024 次未完成轮询时复查系统计数器。它属于防止协议永久挂死
 的正确性机制，不应谎称整个 ELF 物理上只有两条 `SYS_CNT`。CPU 变体会
 逐线程断言专用性能接口恰好调用两次，但 CPU 时间只验证协议和算术，
 不能作为 A5 性能证据。
 
 当前已完成 S0 构建身份、S1 private ring、S2 shared ordered ring 正确性
-基线、S2.5 ordered-winner reclaim 和 S3.1 fresh-output symbol。后续
-shared TensorMap 开发与阶段门禁固定覆盖 CPU/CCEC。
+基线、S2.5 ordered-winner reclaim、S3 fresh-output symbol，以及 S4.6
+PA Case1 从全局 sequencer 解耦。后续 shared TensorMap 开发与阶段门禁固定
+覆盖 CPU/CCEC。
 `--tensormap private|shared` 都会生成对应模式的真实可执行文件；S0 用于禁止
 伪 shared 产物的临时编译门禁已在 S2 接入 shared sidecar 后删除。两种模式仍
 使用相互隔离的产物目录、manifest 和 host/device ABI 握手，不能混用镜像。
@@ -297,7 +298,7 @@ ASan/UBSan。CPU b1、CPU b256 的完整调度断言和 CCEC private 三镜像�
 同口径单次为 3,862.246 us，只作协议和规模回归记录，不是性能基线，也不
 替代后续配对多轮性能验证。
 
-### 4.2 当前 shared TensorMap：有序 ring、fresh symbol 与 shared heap
+### 4.2 当前 shared TensorMap：per-slot symbol、shared heap 与隔离的 region 原型
 
 S3.2a 在 S3.1 的 4,735,104B output table 尾部追加 8 条 cache-line
 heap cursor 和 1 条 aggregate vend，因此当前 `SharedTensorMapSidecar`
@@ -311,17 +312,25 @@ standalone 控制区和 `results` 之后，不移动 `WorkerState`、`RunConfig`
 当前 shared 已完成 winner-only 重构参与 Materialize：所有 worker 仍先
 Claim 并独立声明同一组 output symbol；Alloc 暂时保留每核三个静态 Output
 参数，以对齐参考 `alloc_tensors(args)` 的调用形状。QK/SF/PV/UP 只有 winner
-执行 reset、view/CreateInfo 构造以及 tensor/scalar 参数添加。持有
-`committed_tasks == N` exact turn 的 winner 随后预留 shared heap、生成
-descriptor、只读解析 fanin、建立本地执行状态，再提交 INOUT writer、释放
-turn 并最终发布 descriptor。loser 仍以非空地址把上一 task 的陈旧
+执行 reset、view/CreateInfo 构造以及 tensor/scalar 参数添加。winner 随后
+独立预留 shared heap、生成 descriptor，只在自己实际依赖的
+`(producer_task_id, output_slot).published` 上等待并只读解析 fanin；本地
+执行状态建立后再提交 INOUT writer，最后发布 descriptor。PA Case1 不再
+读取或推进全局 `committed_tasks/reclaim_upto`。loser 仍以非空地址把上一
+task 的陈旧
 `TaskArgs` 传过 split ABI，但 finish 只闭合固定泳道/Submit 边界，不读参数
 内容，也不触碰 heap/map/payload。
 
 CPU guard-page 定向测试会把 loser 的 `TaskArgs` 页改成 `PROT_NONE`，依次
 通过 Alloc/QK/SF/PV/UP 五次 split finish；任一字段读取都会立即失败。逐核
 host oracle 还按实际 wins 精确核对四类重构参次数，防止只看全局总数而漏掉
-某个 loser 回退。
+某个 loser 回退。S4.6 另有三组定向门禁：预置 terminal `fatal` 后 winner
+不得产生 heap/slot/completion/symbol 副作用；空 region 验证分别覆盖
+Local/GM 的 manual 与 ordinary writer；shared `PrepareMap` raw marker 的
+负向自测会拒绝非零时长、task 序列或身份漂移、未锚定 matching
+`Materialize.end`、非法 flags/aux、缺失和重复记录。后者复用 host 已有 raw
+扫描，并与既有逐核 Submit 数、精确记录数门禁共同闭合，不增加任何 device
+字段。
 
 shared heap 使用 `task_id % 8` 的有界绝对 cursor，物理 shard span 默认为
 32MiB；b256 每 shard 精确使用 25,821,184B，不 wrap、不复用 generation。
@@ -331,12 +340,12 @@ shared 不调用 private per-worker ring 的 HeapGuard。host 直接核对 8-sha
 normalized writer signature。
 
 Materialize 只在 winner 上预留 heap 并生成本地 descriptor，不再提前发布。
-本地 `CompleteTask`/`BuildWinner` 成功后，winner 仍在 exact turn 内用
-FetchMax 提交本 task 消费的 INOUT writer；随后推进连续 commit 前沿，再把
-本 task 的全部 output descriptor 复制到共享 cell，执行 `FlushRegion`、
-存储屏障并发布 `published`。后继即使已经取得 turn，也必须等待自己实际消费
-的 `(producer,slot).published`。因此当前 `published=N` 表示 producer
-Submit 已封口，而不只是 descriptor 已构造。
+本地 `CompleteTask`/`BuildWinner` 成功后，winner 用 FetchMax 提交本 task
+消费的唯一 INOUT writer，再把本 task 的全部 output descriptor 复制到共享
+cell，执行 `FlushRegion`、存储屏障并发布 `published`。因此当前
+`published=N` 表示 producer Submit 已封口，而不只是 descriptor 已构造。
+没有依赖关系的 future task 可以先行封口；有依赖的 task 只受自己的 per-slot
+发布位和执行期 task completion flag 约束。
 
 重复发布或后槽异常不会覆盖既有 descriptor，也不会留下前槽的部分发布；
 若发布位 Exchange 观察到异常旧值，冷路径会撤回本 producer cell 的全部
@@ -362,9 +371,11 @@ FetchMax 的返回旧值必须精确等于 producer；成功项计入
 失败，不能把它误写成通用能力。
 
 符号和 `manual_dep=true` 的 output view 都不进入 region lookup/register。
-因此 PA Case1 的 shared region raw ring 当前为空，但 S4.5 仍让每个 task
-通过空 delta 推进 ordered commit/reclaim；该 sequencer 是下一阶段要删除的
-过程态。host 将实际读取到的 fresh symbol 最终 writer
+因此 PA Case1 完全绕过 shared region raw ring；host 要求
+`committed_tasks=0`、`reclaim_upto=-1`，全部 bucket/slot 保持初始化状态。
+Register 仍逐项验证 ordinary region entry 必须为零，发现非
+`manual_dep` 的普通 writer 会 fail-closed，而不是悄悄回退到未接线的 ring。
+host 将实际读取到的 fresh symbol 最终 writer
 投影为与 private region 相同的规范化 writer 序列，并按 Case1 约定补入
 manual output view；所以 raw 存储不同不妨碍两种模式使用同一规范化签名
 核对已观测 fresh-symbol writer。manual view 是约定投影，不是从 shared
@@ -373,7 +384,7 @@ dependency/normalized writer 签名为
 `5cb454393ed48dcb`/`3a3d526c9b23c3db`，b256 为
 `b7d985d6edb07078`/`556bec7ec8d0f323`。
 
-以下是 S3.1 当时的历史门禁，不是当前 S4.5 的提交顺序或统计口径：
+以下是 S3.1 当时的历史门禁，不是当前 S4.6 的提交顺序或统计口径：
 
 | 门禁 | 结果 |
 | --- | --- |
@@ -385,7 +396,7 @@ dependency/normalized writer 签名为
 | CCEC shared b1/b256（fail-closed 修正后） | 86.552 us / 27.094219 ms |
 | S3.1 历史 symbol publish/INPUT-load/exchange，b1 | 8 / 5 / 3 |
 | S3.1 历史 symbol publish/INPUT-load/exchange，b256 | 2,048 / 1,280 / 768 |
-| shared b256 ordered 终态 | `committed_tasks=1280`，`reclaim_upto=1214` |
+| S3.1 历史 shared b256 ordered 终态 | `committed_tasks=1280`，`reclaim_upto=1214` |
 
 S2.5 shared b256 的同类单样本为 26.556193 ms。S3.1 在正确性审计前曾取得
 23.562916 ms，但当时重复发布和后置非法引用的失败路径可能留下部分共享
@@ -395,6 +406,15 @@ S2.5 shared b256 的同类单样本为 26.556193 ms。S3.1 在正确性审计前
 与 heap 收敛到 winner，S3.2b 又只收敛 QK/SF/PV/UP 重构参；两步分别提交，
 没有把分配主体和构参主体混成一个不可归因的性能变量。
 
+S4.6 提交前审查补回 winner 的 terminal-fatal 读取后，最终 CCEC
+shared b1 real-compute perf-clock 单样本为 `70.279 us`。同阶段较早 ELF
+的 shared b256 scalar-nop0 / real-compute 为 `3,228.844 us` /
+`5,982.840 us`；private b1 real-compute / b256 scalar-nop0 为
+`70.707 us` / `3,300.478 us`。所有模式均通过完整语义断言，shared b256
+的 96 核全部活跃且 region sequencer 保持初值。b256 数字不是补回 fatal
+读取后的最终 ELF，只作 convoy 消失和同量级证据；不同阶段、负载和 ELF
+不能直接相减，稳定收益仍需冻结最终 ELF 后配对多轮。
+
 实现中验证了一项 CCEC 约束：`[[block_local]]` runtime state 不能包含具有
 非平凡构造函数的类型。不能用 `block-local-init` 绕过该限制；当前
 `FdwicOutputRef`/`SharedTaskOutputs` 保持 trivial POD，非法引用由显式
@@ -403,17 +423,19 @@ S2.5 shared b256 的同类单样本为 26.556193 ms。S3.1 在正确性审计前
 
 S2 的 2,119,808B sidecar（含 96 条 per-core progress）和 S2.5 的
 2,113,664B sidecar（删除 progress）均只属于明确标注的历史阶段。S2.5
-确立的 ordered-winner reclaim 仍保留：winner N 完成本 task 读取后按
-`max(-1,N-H-1)` 推进回收；容量不足立即 fatal，不能等待不会再扩大边界的
-慢核。S2/S2.5 的历史结构、失败实验和上板结果见
+确立的 ordered-winner ring helper 与定向自测仍保留为未来非空
+ordinary-region 原型，但已经从 PA Case1 运行路径断开；它的测试结果不能
+冒充当前 PA 热路径证据。S2/S2.5 的历史结构、失败实验和上板结果见
 `shared_tensormap_record.md`。
 
-shared sidecar 的 atomic 当前会计入既有 Submit/业务阶段时间，但
-exact-turn load、heap cursor/vend 的 Load/FetchAdd/Exchange 等尚未逐条
-接入 atomic 泳道 wrapper；所以这一版泳道不能声称完整列出了 shared 协议
-atomic，也不能从现有 atomic 事件拆出 shared heap 单指令成本。这不影响
-host 对 cursor/vend、descriptor、输出符号、依赖边和规范化 writer 签名的
-独立校验。
+shared sidecar 的 atomic 当前会计入既有 Submit/业务阶段时间，但 heap
+cursor/vend、symbol writer/published 等尚未逐条接入 atomic 泳道 wrapper；
+所以这一版泳道不能声称完整列出了 shared 协议 atomic，也不能从现有事件拆出
+shared heap 或 symbol 单指令成本。这不影响 host 对 cursor/vend、descriptor、
+输出符号、依赖边和规范化 writer 签名的独立校验。为复用现有 analyzer，
+shared 泳道仍为每个 Submit 写一条零时长 `PrepareMap` 结构 marker；它不
+读钟、不访问 region sidecar，且在 perf-clock/submit-PMU 构建中编译消除，
+不能把该 marker 解读为 shared 模式仍有 PrepareMap 业务开销。
 
 ## 5. 使用说明：运行、测量与泳道查看
 
@@ -957,6 +979,7 @@ b256 是开启 atomic 泳道的诊断运行；上表 Submit 只能证明当前�
 不能替代关闭 trace 的性能基线或与历史样本做单轮减法。
 
 #### 历史 schema-v2 样本（仅保留旧口径）
+
 2026-07-18 的旧 CCEC b256 文件
 `outputs/scalar_observation_final_20260718/atomic_inlineasm_ccec_b256/raw.json`
 记录了 963,368 条物理记录，其中逐条 Atomic 99,944 条、ClockBaseline 192 条，
