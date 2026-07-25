@@ -407,7 +407,9 @@ S4.15a 历史候选曾把 shared Cube 四分片迁到 sidecar，但六区组
 地址以及 Claim 热路径 `task_id%8` 都不变。新增八条线位于 state
 尾部，sidecar 为 4,736,704B，CPU non-split/CCEC split state
 为 1,011,852,672B/1,011,858,816B；后八条线零 attempted 且终值
-保持 -1。CPU/CCEC/A5 正确性已闭合，尚无冻结性能结果。
+保持 -1。CPU/CCEC/A5 正确性已闭合；相对重建 `319077a9` 的冻结
+布局成本配对为 4/6 更快、中位数 `-12.1595us/-0.5136%`，但它不
+单独决定 S4.16b 的保留或取消。
 
 S4.16b 才会在相同地址、物理容量和 state 大小下把 active 改为 16。
 无论 S4.16a 还是 S4.16b，Vector ClaimMax 都仍为 32,768 次、全局

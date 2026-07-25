@@ -276,8 +276,10 @@ S4.14b `ee42b8c1` 一致。
 物理容量从 8 扩成 16，active 仍为 8，
 用来量化尾增 512B 带来的 state/GM/静态布局整体成本；它只是临时
 布局控制，不单独长期保留。CPU shared/private、CCEC shared/private
-构建和 A5 shared b1 已闭合正确性，但尚未冻结或比较性能。S4.16b
-才在相同地址、容量和 state 下把
+构建和 A5 shared b1 已闭合正确性；相对重建 `319077a9` 的冻结
+六区组配对为 4/6 更快、中位数 `-12.1595us/-0.5136%`。该布局成本
+结果不单独决定保留或取消下一步。S4.16b 才在相同地址、容量和 state
+下把
 active 从 8 改为 16。只有 S4.16b 相对 S4.16a、再相对 `319077a9`
 的两级严格配对都通过，才保留整套改动，否则整体回退。
 
@@ -1758,9 +1760,10 @@ standalone 控制字段 offset 不变。S4.15a 历史候选虽然也恰为
 4,735,680B、历史 S2.5 的 2,113,664B 和 S3.1 的 4,735,104B 也都
 不是当前 shared 构建的传输或分配口径。
 
-S4.16a 的 host/device `sizeof(SchedulerState)` 握手和 manifest
-校验已经通过；仍需冻结本提交 ELF，再与 `319077a9` 做正式 b256
-六区组配对。不能因字节数碰巧与 S4.15a 相同就混用历史产物。
+S4.16a 的 host/device `sizeof(SchedulerState)` 握手、manifest
+校验和相对重建 `319077a9` 的正式 b256 六区组配对已经完成。不能因
+字节数碰巧与 S4.15a 相同就混用历史产物；两份当前冻结件及配对路径
+见 `shared_tensormap_record.md`。
 
 独立的 64 bytes PMU 配置和 64 bytes winner workload 配置各占一条
 cache line；二者都位于完整生产 DistGlobal 镜像之后，生产 DistGlobal/
