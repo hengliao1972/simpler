@@ -27,13 +27,13 @@
 执行。每次运行都会校验这些数量以及最终 TensorMap、heap、cursor、flag、vend、
 frontier 和 worker 状态，任一不符都会返回失败。
 
-当前提交顺序是 compete-first eager：每核先执行 `EfDrain` 和
-`Claim`，再同步构造完整 `TaskArgs`，然后进入 `Materialize`、
-`PrepareMap`、winner `Fanin`、`Register` 与 winner 尾流程。eager 语义保持
-不变：loser 也构造全部参数并执行后续前端逻辑，不存在按
-winner 跳过构参的 lazy 快路。CCEC 正式泳道构建将 orchestration caller、
-每核 runtime state 和 noinline finish 拆分为独立 TU；CPU/AscendC 保持
-同一业务顺序，但 finish 在当前 TU 内联。
+两种 TensorMap 构建都先执行 `EfDrain` 和 `Claim`。private 随后保持
+compete-first eager：每核构造五类完整 `TaskArgs` 并执行 per-worker
+Materialize/map 前端。shared 则只保留 Alloc 的全员轻构参，QK/SF/PV/UP
+只有 winner 构参和 Materialize；loser 只声明稳定 output symbol，并闭合
+固定 finish/Submit 边界。CCEC 正式泳道构建将 orchestration caller、每核
+runtime state 和 noinline finish 拆分为独立 TU；CPU 使用同一公共业务模板
+做协议回归。本阶段只验收 CCEC 与 CPU，不把 AscendC 结果写进闭环证据。
 
 Case1 的 task 不是五个彼此独立的占位符。standalone 会从 Tensor descriptor 的
 owner 和当前构建模式的 TensorMap 收集 producer，去重后构造下列 fanin 图：
@@ -297,13 +297,19 @@ standalone 控制区和 `results` 之后，不移动 `WorkerState`、`RunConfig`
 `FdwicOutputRef` 表达 `(producer_task_id, output_slot)`，返回句柄为
 8B `SharedTaskOutputs`。构建身份 ABI 当前为 3。
 
-当前仍是 compete-first eager 构参，但已经是 winner-only Materialize：
-所有 worker 在 Claim 后构造完整参数和同一组 output symbol，只有持有
-`committed_tasks == N` exact turn 的 task winner 才预留 shared heap、
-生成 descriptor、发布到共享表并提交 task N。loser 仍进入 split finish
-并闭合固定泳道/Submit 边界，但不读取 args，不触碰 heap/map，也不写 payload。
-下一阶段才收敛 QK/SF/PV/UP 的重参数构造，不能把当前 eager 构参计数误写成
-最终成本。
+当前 shared 已完成 winner-only 重构参与 Materialize：所有 worker 仍先
+Claim 并独立声明同一组 output symbol；Alloc 暂时保留每核三个静态 Output
+参数，以对齐参考 `alloc_tensors(args)` 的调用形状。QK/SF/PV/UP 只有 winner
+执行 reset、view/CreateInfo 构造以及 tensor/scalar 参数添加。持有
+`committed_tasks == N` exact turn 的 winner 随后预留 shared heap、生成
+descriptor、发布到共享表并提交 task N。loser 仍以非空地址把上一 task 的
+陈旧 `TaskArgs` 传过 split ABI，但 finish 只闭合固定泳道/Submit 边界，不读
+参数内容，也不触碰 heap/map/payload。
+
+CPU guard-page 定向测试会把 loser 的 `TaskArgs` 页改成 `PROT_NONE`，依次
+通过 Alloc/QK/SF/PV/UP 五次 split finish；任一字段读取都会立即失败。逐核
+host oracle 还按实际 wins 精确核对四类重构参次数，防止只看全局总数而漏掉
+某个 loser 回退。
 
 shared heap 使用 `task_id % 8` 的有界绝对 cursor，物理 shard span 默认为
 32MiB；b256 每 shard 精确使用 25,821,184B，不 wrap、不复用 generation。
@@ -362,9 +368,9 @@ S2.5 shared b256 的同类单样本为 26.556193 ms。S3.1 在正确性审计前
 23.562916 ms，但当时重复发布和后置非法引用的失败路径可能留下部分共享
 状态；补齐全量发布预检与两遍 resolver 后，最终同类单样本为 27.094219 ms。
 两者只差约 +2.03%，且都不是多轮稳定基线，不能据此宣称稳定回退或收益；
-被撤销的 23.562916 ms 也不能作为有效 S3.1 基线。当前 S3.2a 已把
-Materialize 与 heap 收敛到 winner；下一小步只处理 winner-only 重构参，
-并继续单独量化正确性检查的热路径成本。
+被撤销的 23.562916 ms 也不能作为有效 S3.1 基线。S3.2a 已把 Materialize
+与 heap 收敛到 winner，S3.2b 又只收敛 QK/SF/PV/UP 重构参；两步分别提交，
+没有把分配主体和构参主体混成一个不可归因的性能变量。
 
 实现中验证了一项 CCEC 约束：`[[block_local]]` runtime state 不能包含具有
 非平凡构造函数的类型。不能用 `block-local-init` 绕过该限制；当前
@@ -1042,9 +1048,10 @@ I-cache stall**：差值还混有同步等待、Cube/Vector/MTE 等 engine 等�
 的 raw，但本次 action 会返回非零。
 
 这里的 PMU whole gate 从 orchestration 初始化前开始，到末次
-Submit 返回后停止，包含 Submit 内的 EfDrain、Claim、同步 eager
-构参和 finish，也包含 Submit 间的 `AcceptTaskOutputs()`/调用衔接，排除
-FinalDrain。`submit_elapsed_ticks` 是每核首末 Submit 时间；顶部
+Submit 返回后停止，包含 Submit 内的 EfDrain、Claim、当前模式实际构参
+（private 全员 eager；shared Alloc 全员、其余 task winner-only）和
+finish，也包含 Submit 间的 `AcceptTaskOutputs()`/调用衔接，排除 FinalDrain。
+`submit_elapsed_ticks` 是每核首末 Submit 时间；顶部
 `submit_span_us` 则是 96 核共同墙钟范围。三者不能混用，详细定义见
 `../icache_miss_usage_guide.md`。
 

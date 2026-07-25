@@ -843,7 +843,8 @@ struct CallbackSubmitBuildCounts {
 };
 
 // builder 只在当前 Submit 栈帧内被同步调用，任何 thunk 都不会被保存或跨 TU。
-// 所有 Add* 均无 winner 分支，明确保持 compete-first eager 的全员构参语义。
+// builder 内部不判断 winner：private 和 shared Alloc 由所有 actor 调用；
+// shared QK/SF/PV/UP 由外层在 Claim 后只让 winner 调用。
 class CallbackSubmitArgsBuilder {
 public:
     PA_DEVICE CallbackSubmitArgsBuilder(TaskArgs &args, TaskKind kind)

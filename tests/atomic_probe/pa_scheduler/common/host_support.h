@@ -1856,24 +1856,28 @@ inline Metrics Validate(
             result.compete_first_split_reserved == 0;
 #endif
 #if PTO_FDWIC_SHARED_MAP
-        // S3.2 的第一小步只收敛 Materialize/heap；参数构造仍保持所有
-        // worker eager，便于把分配主体变化与下一步 winner-only 构参分开
-        // 验证。Materialize 数量则必须由本核实际 wins[] 精确推导。
+        // shared 只让 Alloc 保留全员三个静态 Output 参数；四个重构参 task
+        // 与 Materialize 都必须由本核实际 wins[] 精确推导，不能只核对
+        // 跨核总数而漏掉 loser 的意外构参。
         const uint64_t alloc_wins = result.wins[static_cast<uint32_t>(TaskKind::Alloc)];
         const uint64_t qk_wins = result.wins[static_cast<uint32_t>(TaskKind::Qk)];
         const uint64_t sf_wins = result.wins[static_cast<uint32_t>(TaskKind::Sf)];
         const uint64_t pv_wins = result.wins[static_cast<uint32_t>(TaskKind::Pv)];
+        const uint64_t up_wins = result.wins[static_cast<uint32_t>(TaskKind::Up)];
         frontend_worker_counts_ok &= result.context_reads == batches;
         frontend_worker_counts_ok &=
-            result.views_created == static_cast<uint64_t>(batches) * 2;
+            result.views_created == qk_wins + up_wins;
         frontend_worker_counts_ok &=
-            result.dynamic_create_infos == static_cast<uint64_t>(batches) * 2;
+            result.dynamic_create_infos == qk_wins + sf_wins;
         frontend_worker_counts_ok &=
-            result.arg_resets == static_cast<uint64_t>(batches) * 4;
+            result.arg_resets == qk_wins + sf_wins + pv_wins + up_wins;
         frontend_worker_counts_ok &=
-            result.tensor_args_added == static_cast<uint64_t>(batches) * 22;
+            result.tensor_args_added ==
+                static_cast<uint64_t>(batches) * 3 +
+                4 * (qk_wins + sf_wins + pv_wins) + 7 * up_wins;
         frontend_worker_counts_ok &=
-            result.scalar_args_added == static_cast<uint64_t>(batches) * 9;
+            result.scalar_args_added ==
+                2 * qk_wins + 3 * sf_wins + 2 * pv_wins + 2 * up_wins;
         frontend_worker_counts_ok &=
             result.materialized_outputs ==
                 alloc_wins * 3 + qk_wins + sf_wins * 3 + pv_wins;
@@ -2073,7 +2077,7 @@ inline Metrics Validate(
         frontend_worker_counts_ok,
         kCompiledTensorMapMode == TensorMapBuildMode::Private
             ? "every private worker replays the exact eager frontend counts"
-            : "shared eager args and winner-only materialize counts are exact",
+            : "shared winner-derived heavy args and materialize counts are exact",
         &metrics
     );
     const uint64_t expected_global_map_inserts =
@@ -2086,14 +2090,14 @@ inline Metrics Validate(
     const bool global_frontend_counts_ok =
 #if PTO_FDWIC_SHARED_MAP
         context_reads == static_cast<uint64_t>(kWorkers) * batches &&
-        views_created == static_cast<uint64_t>(kWorkers) * batches * 2 &&
-        dynamic_create_infos ==
-            static_cast<uint64_t>(kWorkers) * batches * 2 &&
-        arg_resets == static_cast<uint64_t>(kWorkers) * batches * 4 &&
+        views_created == static_cast<uint64_t>(batches) * 2 &&
+        dynamic_create_infos == static_cast<uint64_t>(batches) * 2 &&
+        arg_resets == static_cast<uint64_t>(batches) * 4 &&
         tensor_args_added ==
-            static_cast<uint64_t>(kWorkers) * batches * 22 &&
+            static_cast<uint64_t>(batches) *
+                (static_cast<uint64_t>(kWorkers) * 3 + 19) &&
         scalar_args_added ==
-            static_cast<uint64_t>(kWorkers) * batches * 9 &&
+            static_cast<uint64_t>(batches) * 9 &&
         materialized_outputs == static_cast<uint64_t>(batches) * 8 &&
         map_inserts == expected_global_map_inserts;
 #else

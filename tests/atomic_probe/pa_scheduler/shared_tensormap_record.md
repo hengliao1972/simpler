@@ -812,8 +812,8 @@ CPU private/shared b1/b256、定向 sanitizer、Python 100 项和 CCEC
 private/shared b1/b256 均通过。此步没有引入 generation、deferred resolve、
 shared heap 或 winner-only Materialize；详细结果见第 15 节。
 
-**S3.2a 状态：已完成 shared heap 与 winner-only Materialize 的
-CPU/CCEC 闭环。S3.2b 的 winner-only 重构参尚未开始。**
+**S3.2 状态：S3.2a shared heap/winner-only Materialize 与 S3.2b
+winner-only 重构参均已分别完成 CPU/CCEC 闭环。**
 
 S3.2 继续拆开验证分配主体与构参主体。第一小步只把 Materialize 和堆分配
 收敛到 winner，所有 worker 仍保持 S3.1 的 eager 构参；第二小步再把
@@ -826,9 +826,16 @@ shared heap 首版使用 8 shard 绝对递增分配，默认 b256 每 shard 需�
 从 b1/b256 的 768/196,608 精确降为 8/2,048，shared heap vend 为
 806,912/206,569,472 bytes，region insert 保持 0；CPU 定向测试和 CCEC
 A5 b1 当前最终 ELF 已通过；CCEC b256 的规模证据在非法输入预检加固前已
-通过，最终 ELF 按后续只跑 b1 的约定没有重复消耗上板时间。S3.2b 完成后
-还要另行闭合 shared 构参计数，不能把 S3.2a 的 eager 计数误写成最终
-winner-only 前端成本。
+通过，最终 ELF 按后续只跑 b1 的约定没有重复消耗上板时间。
+
+**S3.2b Gate**：shared 的 Alloc 仍保留全员 3 个静态 Output 参数，
+QK/SF/PV/UP 的 reset、view/CreateInfo、tensor/scalar 添加只由 winner
+执行。全局每 batch 精确闭合为 307 tensor args、9 scalar args、4 reset、
+2 view、2 dynamic CreateInfo；Materialize 仍为 8 个 output。CPU guard-page
+锁定公共 split-finish loser 路径不访问上一 task 的陈旧 args；CCEC 侧
+另由 winner 分支源码审计和 b1 集成回归取证。CCEC split private/shared
+均完成编译，shared split 与 inline Materialize/Register 分别通过 b1
+运行门禁。
 
 ### 阶段 S4：standalone CPU/CCEC 验收
 
@@ -1417,5 +1424,72 @@ heap cursor/vend 的 Load/FetchAdd/Exchange 直接调用 `Ops`，尚未进入既
 `AtomicSite` wrapper。它们已经计入 Submit/阶段总时间和 host 终态校验，
 但现有 atomic trace 不能用于拆分这几项单指令成本。
 
-S3.2a 仍保留所有 worker eager 构参；下一提交只收敛 QK/SF/PV/UP 重构参
-并重新闭合逐核/全局前端计数。
+S3.2a 到此仍保留所有 worker eager 构参；随后由独立的 S3.2b 提交收敛
+QK/SF/PV/UP 重构参。
+
+### 2026-07-25：S3.2b winner-only 重构参
+
+本小步不再改 heap、Materialize、symbol、ordered commit 或 ticket ABI，
+只改变 shared 的 `BuildCallbackSubmitArgs()` 调用主体：
+
+- Alloc 继续由所有 worker 构造 3 个静态 Output 参数，用于对齐参考
+  `alloc_tensors(args)` 调用形状，并把本小步变量限定在四个重构参 task；
+- QK/SF/PV/UP 只有 `claim.won` 时才执行 reset、view/CreateInfo 构造以及
+  tensor/scalar 参数添加；
+- private 的五类 task 仍由所有 worker eager 构参，执行路径不变；
+- output symbol 继续在构参分支前由所有 worker 独立声明，故 loser 后续
+  orchestration 不依赖 winner 私有 descriptor。
+
+Alloc 全员构参不是 standalone 符号协议的永久要求。这里是与参考路径对齐
+和单变量验证策略，后续若要收敛 Alloc，必须另做提交和计数门禁，不能把它
+伪装成 S3.2b 的顺手修改。
+
+#### 精确计数
+
+设单 worker 的 Alloc/QK/SF/PV/UP 获胜次数为 `A/Q/S/P/U`，batch 数为 `B`：
+
+| 计数 | shared 逐核期望 |
+| --- | ---: |
+| context read | `B` |
+| view | `Q + U` |
+| dynamic CreateInfo | `Q + S` |
+| reset | `Q + S + P + U` |
+| tensor args | `3B + 4Q + 4S + 4P + 7U` |
+| scalar args | `2Q + 3S + 2P + 2U` |
+| Materialize outputs | `3A + Q + 3S + P` |
+
+每类 task 全局恰有 `B` 个 winner，因此 shared 全局每 batch 为
+`context=96, view=2, dynamic=2, reset=4, tensor=307, scalar=9,
+materialized=8`。b1 即 `96/2/2/4/307/9/8`。host 按逐核 wins 核对，
+既能防止全局总数碰巧相等，也能发现某个 loser 意外恢复构参。
+
+#### stale args 与 split-finish 门禁
+
+split ABI 仍要求传非空 `&args`。每批 Alloc 会先在所有 worker 上
+`ConstructTaskArgs()`，所以 heavy-task loser 传入的是生命周期有效但内容
+属于上一 task 的陈旧对象，不是空指针或悬空对象。shared finish 中
+Materialize、fanin/register 和 winner build 的每个 args 读取都由 winner
+分支支配。
+
+CPU 新增 guard-page 定向测试：在匿名页上建立 `TaskArgs` 后填入毒值并设为
+`PROT_NONE`，再让 Alloc/QK/SF/PV/UP 五个 loser 逐一通过真实
+`FinishSplitCallbackSubmitFromRuntime()`。测试同时要求 finish 次数为 5、
+protocol error/materialized/map insert/fatal 全为 0；任何 args 字段读取都会
+立即触发失败。约 1 GiB 的 `SchedulerState` 只用 `MAP_NORESERVE` 建立稀疏
+虚拟对象，不提交无关物理页。
+
+#### 当前闭环结果
+
+- CPU private/shared 严格构建和 b1 完整语义回归通过；
+- guard-page split-finish loser 定向测试通过；
+- CCEC private/shared split swimlane 两种 ELF 均完成 AIC/AIV 链接、符号
+  和 manifest 校验；
+- shared inline-finish 的 submit-PMU Materialize/Register 两种 ELF 均完成
+  编译，并分别执行 A5 b1，PMU owner 恢复和全部语义/计数断言通过；
+- shared split CCEC A5 b1 的 symbol、heap、descriptor、依赖、前端计数和
+  real-compute 输出断言通过，`real-compute-count=1` Submit 单样本为
+  98.664us。
+
+以上 b1 数字只证明最终 S3.2b ELF 可执行，不与 S3.2a 的单样本相减，也不
+宣称 winner-only 构参已经获得稳定性能收益。性能判断仍须使用同一
+`perf-clock` 构建做配对多轮；swimlane 与 submit-PMU 只负责解释。

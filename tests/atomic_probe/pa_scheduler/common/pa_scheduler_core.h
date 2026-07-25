@@ -1218,8 +1218,9 @@ PA_DEVICE bool BuildCallbackSubmitArgs(
     PaOrchestrationState &orch, TaskArgs &args, uint32_t batch, LocalStats &stats
 ) {
     CallbackSubmitArgsBuilder builder(args, Kind);
-    // 外层 callback 和所有参数 thunk 都只在这一调用点同步执行。eager
-    // 语义没有 winner 条件：96 个 worker 的前端构参次数保持完全一致。
+    // 外层 callback 和所有参数 thunk 都只在这一调用点同步执行。调用者决定
+    // 是否构参：private 仍全员 eager；shared 的 Alloc 保留全员轻构参，
+    // QK/SF/PV/UP 则只由 Claim winner 进入这里。
     auto callback = [&](CallbackSubmitArgsBuilder &out) PA_CALLBACK_LAMBDA_DEVICE {
         out.Begin();
         if constexpr (Kind == TaskKind::Alloc) {
@@ -1686,10 +1687,31 @@ PA_DEVICE bool SubmitCallbackTask(
         return false;
     }
 #endif
+#if PTO_FDWIC_SHARED_MAP
+    if constexpr (Kind == TaskKind::Alloc) {
+        // 为对齐参考 alloc_tensors(args) 的调用形状，并把本小步变量限定
+        // 在四个重构参 task，Alloc 暂保留全员三个静态 Output 参数。
+        // standalone 的 output symbol 已由上方独立声明，并不依赖这次构参。
+        if (!BuildCallbackSubmitArgs<Kind>(orch, args, batch, stats)) {
+            SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+            return false;
+        }
+    } else if (__builtin_expect(claim.won, 0)) {
+        // shared loser 已在上方声明稳定 output symbol；它不需要构造本 task
+        // 的 descriptor/scalar 参数。finish 的 loser 分支只闭合边界，不读
+        // 这里留下的上一 task args。
+        if (!BuildCallbackSubmitArgs<Kind>(orch, args, batch, stats)) {
+            SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+            return false;
+        }
+    }
+#else
+    // private 保持所有 worker 对五个 task 的 eager 构参语义。
     if (!BuildCallbackSubmitArgs<Kind>(orch, args, batch, stats)) {
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
+#endif
     const CallbackSubmitTicket ticket{
         submit_begin,
         task_id,
@@ -1956,7 +1978,9 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         // Case1 每个 batch 固定回放 Alloc/QK/SF/PV/UP 五个 task；所有 worker 顺序相同，执行 lane 由 Claim 筛选。
         // CCEC 可在这里开启本 worker 私有 PMU 窗口；CPU/AscendC 适配层是空实现。
         // 窗口覆盖本 worker 的全部调度期：从 orchestration 初始化前开始，
-        // 依次包含 EfDrain、Claim、同步 eager 参数构造与后续 Submit 阶段，到末次 Submit 返回。
+        // 依次包含 EfDrain、Claim、当前模式实际执行的参数构造与后续 Submit
+        // 阶段，到末次 Submit 返回。private 为全员 eager；shared 仅 Alloc
+        // 全员构参，其余 task 由 winner 构参。
         // 它与全局“首 Submit.begin～末 Submit.end”口径接近但不相同，host sidecar
         // 必须按 per-worker 累计解释。泳道父边界在 PMU-only 构建中会被编译为空，
         // 不应污染 Submit 取数。

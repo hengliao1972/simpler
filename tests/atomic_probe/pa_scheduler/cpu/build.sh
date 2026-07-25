@@ -123,6 +123,21 @@ else
 
     echo "[TEST] shared winner materialize self-test"
     "$BUILD_DIR/test_shared_materialize"
+
+    # S3.2b 允许 heavy-task loser 把上一 task 的非空 args 地址传进 split
+    # finish，但 finish 不得读取其内容。guard page 会把任何字段访问立即
+    # 转成测试失败，锁定 winner-only 构参与跨 TU 协议之间的关键契约。
+    echo "[BUILD] shared split-finish loser protected-args self-test"
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -DPA_COMPETE_FIRST_SPLIT_FINISH=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/common/test_shared_loser_finish.cpp" \
+        -o "$BUILD_DIR/test_shared_loser_finish"
+
+    echo "[TEST] shared split-finish loser protected-args self-test"
+    "$BUILD_DIR/test_shared_loser_finish"
 fi
 
 # set -e 保证编译或链接失败时不会打印 complete，也不会在组合构建中继续

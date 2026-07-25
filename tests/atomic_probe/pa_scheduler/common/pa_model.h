@@ -929,9 +929,9 @@ struct alignas(64) WorkerResult {
     uint64_t wait_events[2];
     uint64_t wait_iterations[2];
 
-    // 前端工作量计数不是性能填充：private 核对全员构参/物化，shared
-    // 分阶段区分 eager 构参与 winner-only 物化；lookup、slot copy 和 fanin
-    // 始终按 winner-only 的全局业务量闭合。
+    // 前端工作量计数不是性能填充：private 核对全员构参/物化；shared
+    // 区分全员 Alloc 轻构参、四个 task 的 winner-only 重构参与
+    // winner-only 物化。lookup、slot copy 和 fanin 也按 winner 业务量闭合。
     uint64_t context_reads;
     uint64_t views_created;
     uint64_t dynamic_create_infos;
