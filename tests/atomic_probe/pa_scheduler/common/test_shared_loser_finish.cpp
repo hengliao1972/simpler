@@ -194,6 +194,96 @@ TensorDesc MakeTestTensor(uint64_t address, uint32_t owner) {
     return tensor;
 }
 
+bool AllBytesEqual(const void *object, size_t size, unsigned char expected) {
+    const unsigned char *bytes =
+        reinterpret_cast<const unsigned char *>(object);
+    for (size_t index = 0; index < size; ++index) {
+        if (bytes[index] != expected) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool RunReadySharedDescriptorDirectToSlotTest() {
+    SchedulerState *state = MapSchedulerState();
+    if (state == nullptr) {
+        return false;
+    }
+    state->fatal.value = 0;
+    state->heap_base = kSyntheticHeapBase;
+    state->heap_size = kHeapBytes;
+    state->heap_window = kHeapWindow;
+    state->shared_map.committed_tasks.value = 0;
+    state->shared_map.reclaim_upto.value = -1;
+    ResetOutputCell(state->shared_map.shared_outputs[0]);
+    ResetOutputCell(state->shared_map.shared_outputs[4]);
+
+    const TensorDesc published =
+        MakeTestTensor(kSyntheticHeapBase + 4096, 0);
+    SharedOutputCell &producer = state->shared_map.shared_outputs[0];
+    producer.tensors[0] = published;
+    producer.last_writer[0].value = 0;
+    producer.published[0].value = 0;
+
+    WorkerState &worker = state->workers[0];
+    worker.role = CoreRole::Aiv;
+    worker.core_idx = static_cast<int32_t>(kAicWorkers);
+    worker.lane = 1;
+    worker.local_index = 4;
+    worker.occupied_count = 0;
+
+    TaskArgs args;
+    ConstructTaskArgs(args);
+    AppendSharedOutputRef(
+        args, FdwicOutputRef{0, 0, 0, 0, 0, 0},
+        TensorArgType::Input
+    );
+
+    SubmitContext context{};
+    BeginCallbackSubmit(worker, context);
+    bool ok =
+        context.task_id == 4 &&
+        PrepareSharedTaskOutputs(
+            context.shared_result, 4, TaskKind::Up
+        );
+    std::memset(context.payload, 0xA5, sizeof(*context.payload));
+
+    LocalStats stats{};
+    bool pmu_context = false;
+    const CallbackSubmitTicket ticket{
+        1, 4, static_cast<int16_t>(FunctionId(TaskKind::Up)), 1, 0
+    };
+    const bool finished =
+        FinishCallbackSubmitBody<LoserFinishTestOps, false>(
+            state, worker, kTasksPerBatch, args, context, stats,
+            pmu_context, ticket
+        );
+
+    const LocalSlot &slot = worker.slots[0];
+    ok &= finished;
+    ok &= state->fatal.value == 0;
+    ok &= AllBytesEqual(context.payload, sizeof(*context.payload), 0xA5);
+    ok &= worker.occupied_count == 1;
+    ok &= slot.occupied && slot.built && slot.task_id == 4;
+    ok &= slot.tensor_count == 1;
+    ok &= std::memcmp(&slot.tensors[0], &published, sizeof(published)) == 0;
+    ok &= slot.args[0] ==
+          static_cast<uint64_t>(
+              reinterpret_cast<uintptr_t>(&slot.tensors[0])
+          );
+    ok &= slot.fanin_count == 1 && slot.fanin[0] == 0;
+    ok &= context.fanin_count == 1 && context.fanin[0] == 0;
+    ok &= stats.result.shared_symbol_input_loads == 1;
+    ok &= stats.result.slot_tensor_copies == 1;
+    ok &= stats.result.submits == 1;
+    ok &= producer.published[0].value == 0;
+    ok &= producer.last_writer[0].value == 0;
+
+    (void)munmap(state, sizeof(SchedulerState));
+    return ok;
+}
+
 bool RunProtectedArgsLoserTest() {
     void *state_memory = MapAnonymous(sizeof(SchedulerState), true);
     if (state_memory == MAP_FAILED) {
@@ -644,13 +734,14 @@ bool RunUpWriterCommitFailureTest() {
 }  // namespace
 
 int main() {
+    const bool direct_slot_ok = RunReadySharedDescriptorDirectToSlotTest();
     const bool loser_ok = RunProtectedArgsLoserTest();
     const bool future_task_ok = RunFutureTaskWithoutSequencerTest();
     const bool fatal_stop_ok = RunPreRaisedFatalStopsWinnerTest();
     const bool alloc_failure_ok = RunAllocPublicationFailureTest();
     const bool qk_failure_ok = RunQkPublicationFailureTest();
     const bool up_failure_ok = RunUpWriterCommitFailureTest();
-    if (!loser_ok || !future_task_ok || !fatal_stop_ok ||
+    if (!direct_slot_ok || !loser_ok || !future_task_ok || !fatal_stop_ok ||
         !alloc_failure_ok || !qk_failure_ok || !up_failure_ok) {
         std::fprintf(
             stderr,

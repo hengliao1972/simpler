@@ -1209,7 +1209,7 @@ CPU/CCEC b1/b256 证明 per-slot 依赖协议能够独立闭环。
 | --- | --- | --- |
 | output 数量门禁 | `common/state.h:305-315` 的物理 cell 只有 8 个 slot，但 `runtime/pto_types.h:119-124` 的 `SharedTaskOutputs::add_output_ref()` 只按 `MAX_TENSOR_ARGS` 检查，`pto_orchestration_api.h:42-48` 又按调用方 count 循环。当前 PA 每 task 最多 3 个 output，基本流程不会触发不一致 | `pa_frontend.h:97-105` 在句柄追加时显式限制 `kSharedOutputMaxPerTask=8`，最终发布再次核对 count。迁移必须保留 API/存储同上限门禁，不能因参考 PA 当前规模没越界而照搬这一处接口缝隙 |
 | output 发布时机 | `submit_core.h:743-758` 在 Materialize 内复制/flush descriptor、初始化 writer 并发布；`submit_runtime.h:524-552` 随后才进入 Register/Fanin/Build | S4.5 先采用 Build/Complete → writer FetchMax → release turn → `published`；S4.6 删除 turn 后为 Build/Complete → writer FetchMax → `published`。这样 `published` 直接表示可执行状态已建立，失败闭环更清楚；但它可能延迟 consumer，最终真实路径是否保持该顺序必须由 perf-clock 配对决定，不能仅凭 standalone 偏好否定参考快路径 |
-| 引用解析位置与执行槽 ABI | 参考 `common/state.h:126-140,153-167` 在 `RingSlot` 和 `BuiltSubtask` 的 ABI 中都保留 `shared_ref_mask/shared_refs`。但当前 HEAD 只有普通 `RingSlot` 路径真正延迟解析：`submit_core.h:990-1001` 先 try-resolve，未就绪引用由 `113-121,216-218` 在执行前等待。winner follower 自 `0f9862a2` 起在 `489-499` 构造 `BuiltSubtask` 时同步调用阻塞式 resolver，并把 mask 固定为 0；不能把字段存在误写成该路径也已 deferred。实测 `RingSlot` 因 shared 形态从 4,864B 增至 5,440B。presubmit 还复用 64B task cell 中的 `deps_prepared`，并在 `DistGlobal` 增加每 worker `prepared_deps`（`common/state.h:292-296,389`） | standalone 在 `CollectSharedFanin()` 内完成等待，把解析后的 descriptor 复制到既有 `TaskPayload`，`LocalSlot` 不保存 symbol ref。它保持较小的执行槽 ABI、失败点集中在 Submit，却让 Submit 阻塞 producer publication。PA Case1 是普通单-lane slot，参考 deferred resolve 仍是已跑通且很有价值的候选；但 standalone 不应为了表面对齐给未使用的 `BuiltSubtask` 增加冗余状态。迁移时还要同时量 Submit 缩短、GM slot 搬运/I-cache、slot 容量与执行前失败语义 |
+| 引用解析位置与执行槽 ABI | 参考 `common/state.h:126-140,153-167` 在 `RingSlot` 和 `BuiltSubtask` 的 ABI 中都保留 `shared_ref_mask/shared_refs`。但当前 HEAD 只有普通 `RingSlot` 路径真正延迟解析：`submit_core.h:990-1001` 先 try-resolve，未就绪引用由 `113-121,216-218` 在执行前等待。winner follower 自 `0f9862a2` 起在 `489-499` 构造 `BuiltSubtask` 时同步调用阻塞式 resolver，并把 mask 固定为 0；不能把字段存在误写成该路径也已 deferred。实测 `RingSlot` 因 shared 形态从 4,864B 增至 5,440B。presubmit 还复用 64B task cell 中的 `deps_prepared`，并在 `DistGlobal` 增加每 worker `prepared_deps`（`common/state.h:292-296,389`） | standalone S4.8 仍在 `CollectSharedFanin()` 内完成 eager publication 等待，但已采用参考 ready-ref 的优点：验证后从 shared cell 直写既有 `LocalSlot`，不再经过 `TaskPayload`。它保持 4,824B slot ABI和 Submit 内集中失败点，却仍会阻塞 producer publication。PA Case1 是普通单-lane slot，参考 deferred resolve 仍是已跑通且很有价值的下一候选；但 standalone 不应为了表面对齐给未使用的 `BuiltSubtask` 增加冗余状态。迁移时还要同时量 Submit 缩短、GM slot 搬运/I-cache、slot 容量与执行前失败语义 |
 | writer intent | `submit_runtime.h:302-311` 在 fanin 收集时用 Exchange claim writer，旧值为负则以 producer 作为 fanin；producer 在 `submit_core.h:748-750` 用 FetchMax 初始化，因此不会把已经提前写入的更大 writer 倒退。`345-385,493-507` 还提供 presubmit intent，让唯一 winner 预备依赖、loser 等待。`submit_dependency_smoke` 会调用该 API，但真实 PA 的 `paged_attention_orch.cpp:345` 当前仍调用普通 `rt_presubmit_aiv_task` | “Exchange claim + producer FetchMax”是参考代码很有价值的通用机制，允许 writer intent 早于 descriptor 发布并表达多级 writer 链；不能把“intent API/烟测可用”误写成“参考 PA 已接入该 API”。当前固定 PA Case1 先等待 published、要求 `writer==producer`，再 post-build FetchMax，限制更保守也可能产生性能差。迁移真实 simpler 时应重点配对验证参考组合，并补齐发布后失败和多 writer 顺序证明，而不是把 Case1 限制推广成通用设计 |
 | symbol view | `submit_core.h:810-820,840-849` 已处理一维 view flags | standalone ABI 保留字段但 plain ref 之外显式失败；当前 Case1 的 output view 走 `manual_dep`，未提供足够业务用例证明 shared-symbol view。真实迁移需要复用参考 view 语义并增加边界测试 |
 | heap 复用 | `submit_core.h:630-651` 支持 shard 取模、等待 H 窗口和最多 64 次 wrap 调整 | standalone b256 有界容量足够，先使用绝对 no-wrap cursor，避免在 generation/复用条件未证明时覆盖旧 descriptor。参考的 wrap 思路应保留为长期方案，但不能只移植取模而省略复用证明 |
@@ -2238,3 +2238,106 @@ Submit 仍有约 2.15ms 中位差。下一步先做不改变 atomic/slot ABI 的
 直落 slot，再只对纯 INPUT 验证 deferred resolve；不先改 writer intent，也
 不把参考 MIX `BuiltSubtask` 的同步 resolve 误写成普通 `RingSlot` 的
 deferred 行为。
+
+### 2026-07-25：S4.8 ready shared descriptor 直写 LocalSlot
+
+#### 参考实现中复用的机制
+
+参考分支的 `dist_try_resolve_shared_output_ref()` 把已经发布的 descriptor
+直接写入 `RingSlot::tensors[i]`；只有尚未发布的普通 RingSlot 引用才写入
+`shared_ref_mask/shared_refs`，留到 kernel 前解析。这一“ready ref 不经过
+submit payload”的数据路径是可直接复用的优点：descriptor 最终本来就必须
+成为 slot 的独立快照，中间 4 KiB `TaskPayload` 并不承载额外协议语义。
+
+standalone 当前没有原样照搬参考代码的两个部分：
+
+- 本阶段不引入 deferred mask/ref，也不扩大 `LocalSlot`。先只消除 ready
+  路径的冗余搬运，避免把直写收益与延迟解析、更多在途 slot 混在一起；
+- 不增加参考 helper 中的第二次 `published` atomic load。当前生产链由
+  `MaterializeTask()` 先校验 producer 对应业务 task 的声明 output 上限，
+  `CollectSharedFanin()` 再完成 acquire 等待、plain-view、物理 slot、
+  `published` 和 `last_writer` 校验；在合法、非 fatal 的成功发布路径中，
+  fresh output descriptor 随后不再改写。紧接着进入同一 winner 的 Build
+  阶段时重读控制字只增加观察不到新状态的 atomic 成本。
+
+以上差异不是否定参考实现。参考代码同时支持“ready 或 deferred”两条
+RingSlot 路径，所以 try-resolve 必须自行判断 publication；standalone
+S4.8 仍是纯 eager 前提，两者的 helper 责任不同。后续 S4.9 验证纯 INPUT
+deferred 时，必须重新引入执行前 acquire 校验，不能把 S4.8 的前置条件
+外推到未等待的引用。
+
+参考 builder 先复制普通参数和 Output，再单独覆盖 shared ref；standalone
+为保持现有 builder 接口，先把 shared ref 直写 slot，再由
+`PopulateSlotPayload()` 填普通参数和 Output。两类索引互斥，正确性等价，
+但写流顺序可能影响 cache 行为；是否有净收益由同一 perf-clock 配对判定，
+不能仅凭少一次拷贝就预设结论。
+
+参考实现和 standalone 都允许多 output 发布中的冷故障回滚此前短暂发布的
+descriptor；一旦发生，整轮由 terminal fatal 作废。S4.8 没有新增这个窗口，
+旧 eager payload copy 也不能把它变成可恢复事务；额外一次 `published` 重读
+同样无法证明读后不会回滚。因此本阶段保持既有 terminal 语义，不为故障注入
+给正常热路径增加 atomic。
+
+#### 单一变量与实现边界
+
+S4.7 每个 shared ref 有两次 128B descriptor 搬运：
+
+```text
+published SharedOutputCell
+  -> CollectSharedFanin: TaskPayload scratch
+  -> PopulateSlotPayload: LocalSlot
+```
+
+S4.8 改为：
+
+```text
+CollectSharedFanin: 只做全量协议校验和 fanin 收集
+  -> BuildWinner: invalidate published descriptor 并直写 LocalSlot
+  -> PopulateSlotPayload: 只把 slot descriptor 地址写入 dispatch args
+```
+
+PA Case1 每 batch 有 8 个 shared refs，因此删除 8 次 shared-cell 到
+TaskPayload 的 128B 中间拷贝；b256 共删除 2,048 次，即 256 KiB
+descriptor 写入及其对应读取。`shared_symbol_input_loads` 在第一遍验证中
+先累计到局部量，只有所有引用成功后才一次提交；这样保留 late-failure
+all-or-nothing，同时删除原来仅为提交该统计而执行的第二遍 tensor 扫描。
+
+分段观察口径也随实现职责变化：剩余的一次 invalidate + descriptor copy
+从 `Fanin` 移到 `WinnerBuild`。因此新泳道可能表现为 Fanin 缩短而
+WinnerBuild 增长；这只表示工作归属移动，净收益仍由无泳道、无 PMU 的
+perf-clock 完整 Submit 配对决定。
+
+这一步明确没有改变：
+
+- `published` 等待、fanin、INOUT writer FetchMax 和最终封口顺序；
+- `TaskPayload`、`LocalSlot`、`SubmitContext`、`WorkerResult` 或 trace ABI；
+- `slot_tensor_copies=19*batches`、`input_loads=5*batches`、
+  `writer_commits=3*batches` 的既有统计口径；
+- private 构建的数据路径。
+
+公共 frontend 原有的五参 compatibility builder 仍允许“调用方预填
+TaskPayload”后构建 slot。生产 `BuildWinner` 通过编译期模板参数选择
+direct-to-slot 实例；CCEC 不承担运行时布尔分支，兼容接口也没有被静默
+改写。没有增加新的 profiling 字段或 raw 记录。
+
+#### 正确性门禁
+
+CPU 定向测试覆盖：
+
+- 普通 INPUT、INOUT 和延迟 publication 均保持整个 TaskPayload poison
+  不变，最终 LocalSlot descriptor 和 dispatch args 精确；
+- 真实 `FinishCallbackSubmitBody -> Collect -> Register -> BuildWinner`
+  正向链证明生产接线，而不是只测试独立 helper；
+- “合法 INPUT 后跟非法 future ref”不会泄露局部 input 计数或 fanin；
+- 原有“合法 INOUT 后跟非法 ref”继续证明 writer、payload、统计和 fanin
+  均无半次提交；
+- compatibility builder 仍能从预填 payload 构建正确 descriptor；
+- private/shared 严格 CPU 构建、shared/private b1、symbol 与完整
+  split-finish 用例均通过，两个定向用例通过 ASan/UBSan/leak。
+
+CCEC shared perf-clock 完成 AIC/AIV 编译、mixed ELF 链接和 manifest 校验；
+A5 b1 默认 real-compute 的 96 核语义、8/5/3 symbol 计数、5 条 fanin、
+shared heap、writer signature 和输出 tile 全部 PASS，Submit 单样本
+70.265us。该单样本只作为最终 ELF 正确性门禁；性能结论必须继续与冻结的
+S4.6 shared ELF 做同负载 ABBA/BAAB 配对，不能和 private 或历史单样本直接
+相减。

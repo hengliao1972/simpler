@@ -658,6 +658,37 @@ PA_DEVICE void RecordClaimOutcome(LocalStats &stats, TaskKind kind, const ClaimO
     }
 }
 
+#if PTO_FDWIC_SHARED_MAP
+template <typename Ops>
+PA_DEVICE void CopyValidatedSharedDescriptorsToSlot(
+    PA_GM SharedTensorMapSidecar &map, const TaskArgs &args,
+    PA_GM LocalSlot &slot
+) {
+    // MaterializeTask + CollectSharedFanin 已经一次性验证全部 shared ref 的
+    // 业务 output 上限、producer/物理 slot/view、published 与 last_writer；
+    // 合法、非 fatal 的成功发布一旦完成，fresh output descriptor 不再改写。
+    // 多 output 冷故障可能回滚已短暂发布的槽，但整轮随后按 terminal fatal
+    // 作废；本 helper 不用额外 atomic 把无效运行伪装成可恢复事务。
+    // 因而这里沿用参考实现的 ready-ref 直落 ring slot 思路，只做一次
+    // invalidate + 128-byte GM copy，不再经过 4 KiB TaskPayload scratch。
+    for (int32_t index = 0; index < args.tensor_count; ++index) {
+        if (TaskTag(args, static_cast<uint32_t>(index)) ==
+                TensorArgType::Output ||
+            !IsSharedOutputReference(args.tensors[index])) {
+            continue;
+        }
+        const FdwicOutputRef output_ref =
+            SharedOutputReference(args.tensors[index]);
+        PA_GM const TensorDesc &shared_tensor =
+            map.shared_outputs[
+                static_cast<uint32_t>(output_ref.producer_task_id)
+            ].tensors[output_ref.output_slot];
+        Ops::InvalidateRegion(&shared_tensor, sizeof(shared_tensor));
+        CopyGmTensor(slot.tensors[index], shared_tensor);
+    }
+}
+#endif
+
 template <typename Ops, bool Profile>
 PA_DEVICE bool BuildWinner(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_id, TaskKind kind,
@@ -693,8 +724,13 @@ PA_DEVICE bool BuildWinner(
     if (worker.occupied_count > stats.max_occupied) {
         stats.max_occupied = worker.occupied_count;
     }
+#if PTO_FDWIC_SHARED_MAP
+    CopyValidatedSharedDescriptorsToSlot<Ops>(
+        state->shared_map, args, slot
+    );
+#endif
     const int32_t sub_block_id = worker.lane == 2 ? 1 : 0;
-    BuildSlotPayload(
+    BuildSlotPayload<(PTO_FDWIC_SHARED_MAP != 0)>(
         slot, task_id, static_cast<uint32_t>(FunctionId(kind)), 0, args, context, fanin, fanin_count,
         sub_block_id
     );
@@ -825,7 +861,7 @@ PA_DEVICE bool WaitForSharedOutputPublished(
 
 template <typename Ops>
 PA_DEVICE uint32_t CollectSharedFanin(
-    PA_GM SharedTensorMapSidecar &map, const TaskArgs &args, SubmitContext &context,
+    PA_GM SharedTensorMapSidecar &map, const TaskArgs &args,
     int32_t task_id, int32_t heap_window, LocalStats &stats,
     int32_t fanin[kMaxFanin], bool &protocol_ok,
     uint32_t &ordinary_lookup_count,
@@ -842,6 +878,7 @@ PA_DEVICE uint32_t CollectSharedFanin(
     int32_t validated_fanin[kMaxFanin] = {};
     uint32_t validated_count = 0;
     uint32_t validated_ordinary_lookups = 0;
+    uint32_t validated_input_loads = 0;
 
     // 第一遍只读取并校验，不修改 last_writer、payload、统计或输出 fanin。
     // 后续引用即使非法，也不会让前面的合法 INOUT 留下半次提交。
@@ -915,6 +952,9 @@ PA_DEVICE uint32_t CollectSharedFanin(
                 validated_fanin, validated_count,
                 output_ref.producer_task_id
             );
+            if (tag == TensorArgType::Input) {
+                ++validated_input_loads;
+            }
             continue;
         }
         if (reference.kind == TensorRefKind::GmTensor) {
@@ -975,26 +1015,10 @@ PA_DEVICE uint32_t CollectSharedFanin(
         }
     }
 
-    // 全部引用只读校验通过后，才把 descriptor 复制到当前 task 的 payload
-    // scratch，并一次性发布统计与 fanin 结果。RingSlot 永远不保存符号引用。
-    for (int32_t index = 0; index < args.tensor_count; ++index) {
-        const TaskTensorRef &reference = args.tensors[index];
-        if (reference.kind != TensorRefKind::SharedOutputRef) {
-            continue;
-        }
-        const FdwicOutputRef output_ref = SharedOutputReference(reference);
-        PA_GM const TensorDesc &shared_tensor =
-            map.shared_outputs[
-                static_cast<uint32_t>(output_ref.producer_task_id)
-            ].tensors[output_ref.output_slot];
-        Ops::InvalidateRegion(&shared_tensor, sizeof(shared_tensor));
-        CopyGmTensor(context.payload->tensors[index], shared_tensor);
-        const TensorArgType tag =
-            TaskTag(args, static_cast<uint32_t>(index));
-        if (tag == TensorArgType::Input) {
-            ++stats.result.shared_symbol_input_loads;
-        }
-    }
+    // 全部引用只读校验通过后，才一次性发布统计与 fanin 结果。INPUT 次数
+    // 在验证扫描中先落局部量，既保留 late-failure 的 all-or-nothing，
+    // 又不为删除 payload scratch 后的空操作再扫一遍全部 tensor。
+    stats.result.shared_symbol_input_loads += validated_input_loads;
     ordinary_lookup_count = validated_ordinary_lookups;
     for (uint32_t edge = 0; edge < validated_count; ++edge) {
         fanin[edge] = validated_fanin[edge];
@@ -1476,7 +1500,7 @@ PA_DEVICE bool FinishCallbackSubmitBody(
         bool lookup_protocol_ok = false;
         uint32_t ordinary_lookup_count = 0;
         context.fanin_count = static_cast<int32_t>(CollectSharedFanin<Ops>(
-            state->shared_map, args, context, static_cast<int32_t>(task_id),
+            state->shared_map, args, static_cast<int32_t>(task_id),
             static_cast<int32_t>(state->heap_window), stats, context.fanin,
             lookup_protocol_ok, ordinary_lookup_count, &state->fatal.value
         ));

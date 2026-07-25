@@ -238,6 +238,17 @@ bool SameTensor(const TensorDesc &left, const TensorDesc &right) {
     return std::memcmp(&left, &right, sizeof(TensorDesc)) == 0;
 }
 
+bool AllBytesEqual(const void *object, size_t size, unsigned char expected) {
+    const unsigned char *bytes =
+        reinterpret_cast<const unsigned char *>(object);
+    for (size_t index = 0; index < size; ++index) {
+        if (bytes[index] != expected) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void TestPublishAndResolve() {
     auto map = std::make_unique<SharedTensorMapSidecar>();
     ResetSharedState(*map);
@@ -286,15 +297,18 @@ void TestPublishAndResolve() {
         input_args, producer.shared_result.OutputRef(0), TensorArgType::Input
     );
     auto input_payload = std::make_unique<TaskPayload>();
+    std::memset(input_payload.get(), 0xA5, sizeof(*input_payload));
     SubmitContext input_context{};
     input_context.task_id = 1;
     input_context.payload = input_payload.get();
+    input_context.tensor_count = input_args.tensor_count;
+    input_context.scalar_count = input_args.scalar_count;
     LocalStats input_stats{};
     int32_t input_fanin[kMaxFanin] = {};
     bool protocol_ok = false;
     uint32_t ordinary_lookups = UINT32_MAX;
     const uint32_t input_count = CollectSharedFanin<SymbolTestOps>(
-        *map, input_args, input_context, 1, kHeapWindow, input_stats,
+        *map, input_args, 1, kHeapWindow, input_stats,
         input_fanin, protocol_ok, ordinary_lookups
     );
     Check(protocol_ok, "plain symbolic INPUT resolves");
@@ -305,8 +319,37 @@ void TestPublishAndResolve() {
         "INPUT writer load is counted"
     );
     Check(
-        SameTensor(input_context.payload->tensors[0], first),
-        "resolver copies descriptor into task payload scratch"
+        AllBytesEqual(input_payload.get(), sizeof(*input_payload), 0xA5),
+        "resolver leaves task payload scratch untouched"
+    );
+    LocalSlot input_slot{};
+    CopyValidatedSharedDescriptorsToSlot<SymbolTestOps>(
+        *map, input_args, input_slot
+    );
+    BuildSlotPayload<true>(
+        input_slot, 1, static_cast<uint32_t>(FunctionId(TaskKind::Qk)), 0,
+        input_args, input_context, input_fanin, input_count
+    );
+    Check(
+        SameTensor(input_slot.tensors[0], first),
+        "validated INPUT descriptor lands directly in LocalSlot"
+    );
+    Check(
+        input_slot.args[0] ==
+            static_cast<uint64_t>(
+                reinterpret_cast<uintptr_t>(&input_slot.tensors[0])
+            ),
+        "direct INPUT slot descriptor is wired into dispatch args"
+    );
+    input_payload->tensors[0] = first;
+    LocalSlot compatibility_slot{};
+    BuildSlotPayload(
+        compatibility_slot, input_args, input_context, input_fanin,
+        input_count
+    );
+    Check(
+        SameTensor(compatibility_slot.tensors[0], first),
+        "legacy prefilled-payload builder contract remains available"
     );
 
     TaskArgs inout_args;
@@ -315,15 +358,18 @@ void TestPublishAndResolve() {
         inout_args, producer.shared_result.OutputRef(0), TensorArgType::Inout
     );
     auto inout_payload = std::make_unique<TaskPayload>();
+    std::memset(inout_payload.get(), 0x5A, sizeof(*inout_payload));
     SubmitContext inout_context{};
     inout_context.task_id = 2;
     inout_context.payload = inout_payload.get();
+    inout_context.tensor_count = inout_args.tensor_count;
+    inout_context.scalar_count = inout_args.scalar_count;
     LocalStats inout_stats{};
     int32_t inout_fanin[kMaxFanin] = {};
     protocol_ok = false;
     ordinary_lookups = UINT32_MAX;
     const uint32_t inout_count = CollectSharedFanin<SymbolTestOps>(
-        *map, inout_args, inout_context, 2, kHeapWindow, inout_stats,
+        *map, inout_args, 2, kHeapWindow, inout_stats,
         inout_fanin, protocol_ok, ordinary_lookups
     );
     Check(protocol_ok, "plain symbolic INOUT resolves");
@@ -335,6 +381,22 @@ void TestPublishAndResolve() {
     Check(
         inout_stats.result.shared_symbol_inout_commits == 0,
         "read-only INOUT resolve publishes no writer statistic"
+    );
+    Check(
+        AllBytesEqual(inout_payload.get(), sizeof(*inout_payload), 0x5A),
+        "INOUT resolver also leaves task payload scratch untouched"
+    );
+    LocalSlot inout_slot{};
+    CopyValidatedSharedDescriptorsToSlot<SymbolTestOps>(
+        *map, inout_args, inout_slot
+    );
+    BuildSlotPayload<true>(
+        inout_slot, 2, static_cast<uint32_t>(FunctionId(TaskKind::Sf)), 0,
+        inout_args, inout_context, inout_fanin, inout_count
+    );
+    Check(
+        SameTensor(inout_slot.tensors[0], first),
+        "validated INOUT descriptor lands directly in LocalSlot"
     );
     Check(
         CommitSharedFaninWriters<SymbolTestOps>(
@@ -360,16 +422,12 @@ void TestPublishAndResolve() {
         successor_args, producer.shared_result.OutputRef(0),
         TensorArgType::Input
     );
-    auto successor_payload = std::make_unique<TaskPayload>();
-    SubmitContext successor_context{};
-    successor_context.task_id = 3;
-    successor_context.payload = successor_payload.get();
     LocalStats successor_stats{};
     int32_t successor_fanin[kMaxFanin] = {};
     protocol_ok = false;
     ordinary_lookups = UINT32_MAX;
     const uint32_t successor_count = CollectSharedFanin<SymbolTestOps>(
-        *map, successor_args, successor_context, 3, kHeapWindow,
+        *map, successor_args, 3, kHeapWindow,
         successor_stats, successor_fanin, protocol_ok, ordinary_lookups
     );
     Check(!protocol_ok, "post-INOUT successor is outside the Case1 symbol contract");
@@ -925,9 +983,12 @@ void TestConsumerWaitsForDelayedPublication() {
         args, producer.shared_result.OutputRef(0), TensorArgType::Input
     );
     auto payload = std::make_unique<TaskPayload>();
+    std::memset(payload.get(), 0x3C, sizeof(*payload));
     SubmitContext consumer{};
     consumer.task_id = 1;
     consumer.payload = payload.get();
+    consumer.tensor_count = args.tensor_count;
+    consumer.scalar_count = args.scalar_count;
     LocalStats stats{};
     int32_t fanin[kMaxFanin] = {};
     bool protocol_ok = false;
@@ -952,7 +1013,7 @@ void TestConsumerWaitsForDelayedPublication() {
     });
 
     const uint32_t count = CollectSharedFanin<SymbolTestOps>(
-        *map, args, consumer, 1, kHeapWindow, stats, fanin,
+        *map, args, 1, kHeapWindow, stats, fanin,
         protocol_ok, ordinary_lookups, &fatal
     );
     publisher.join();
@@ -971,8 +1032,18 @@ void TestConsumerWaitsForDelayedPublication() {
     Check(count == 1 && fanin[0] == 0, "delayed INPUT closes producer fanin");
     Check(ordinary_lookups == 0, "delayed symbol never enters ordinary map");
     Check(
-        SameTensor(payload->tensors[0], output),
-        "descriptor is visible after publication becomes ready"
+        AllBytesEqual(payload.get(), sizeof(*payload), 0x3C),
+        "delayed resolver leaves task payload scratch untouched"
+    );
+    LocalSlot slot{};
+    CopyValidatedSharedDescriptorsToSlot<SymbolTestOps>(*map, args, slot);
+    BuildSlotPayload<true>(
+        slot, 1, static_cast<uint32_t>(FunctionId(TaskKind::Qk)), 0,
+        args, consumer, fanin, count
+    );
+    Check(
+        SameTensor(slot.tensors[0], output),
+        "delayed descriptor lands directly in LocalSlot after publication"
     );
 }
 
@@ -1040,15 +1111,12 @@ void TestInvalidReferencesFailClosed() {
         TaskArgs args;
         ConstructTaskArgs(args);
         AppendSharedOutputRef(args, reference, TensorArgType::Input);
-        SubmitContext context{};
-        context.task_id = 2;
-        context.payload = payload.get();
         LocalStats stats{};
         int32_t fanin[kMaxFanin] = {};
         bool protocol_ok = true;
         uint32_t ordinary_lookups = UINT32_MAX;
         (void)CollectSharedFanin<SymbolTestOps>(
-            *map, args, context, 2, kHeapWindow, stats, fanin,
+            *map, args, 2, kHeapWindow, stats, fanin,
             protocol_ok, ordinary_lookups
         );
         Check(!protocol_ok, "invalid/future/view symbol fails closed");
@@ -1080,9 +1148,6 @@ void TestInvalidReferencesFailClosed() {
         TensorArgType::Input
     );
     std::memset(payload.get(), 0xA5, sizeof(*payload));
-    SubmitContext mixed_context{};
-    mixed_context.task_id = 2;
-    mixed_context.payload = payload.get();
     LocalStats mixed_stats{};
     int32_t mixed_fanin[kMaxFanin];
     for (uint32_t index = 0; index < kMaxFanin; ++index) {
@@ -1091,7 +1156,7 @@ void TestInvalidReferencesFailClosed() {
     bool mixed_protocol_ok = true;
     uint32_t mixed_ordinary_lookups = UINT32_MAX;
     (void)CollectSharedFanin<SymbolTestOps>(
-        *map, mixed_args, mixed_context, 2, kHeapWindow, mixed_stats,
+        *map, mixed_args, 2, kHeapWindow, mixed_stats,
         mixed_fanin, mixed_protocol_ok, mixed_ordinary_lookups
     );
     Check(!mixed_protocol_ok, "late invalid symbol rejects whole resolve");
@@ -1108,13 +1173,51 @@ void TestInvalidReferencesFailClosed() {
         mixed_fanin[0] == -77,
         "late invalid symbol publishes no fanin"
     );
-    const unsigned char *payload_bytes =
-        reinterpret_cast<const unsigned char *>(payload.get());
-    bool payload_untouched = true;
-    for (size_t index = 0; index < sizeof(*payload); ++index) {
-        payload_untouched &= payload_bytes[index] == 0xA5;
+    Check(
+        AllBytesEqual(payload.get(), sizeof(*payload), 0xA5),
+        "late invalid symbol does not touch payload scratch"
+    );
+
+    // 合法 INPUT 会先命中局部计数，随后才发现非法引用；统计与 fanin
+    // 必须等整批验证成功后才发布，不能把局部累计泄露成半次提交。
+    TaskArgs late_input_args;
+    ConstructTaskArgs(late_input_args);
+    AppendSharedOutputRef(
+        late_input_args, producer.shared_result.OutputRef(0),
+        TensorArgType::Input
+    );
+    AppendSharedOutputRef(
+        late_input_args, FdwicOutputRef{3, 0, 0, 0, 0, 0},
+        TensorArgType::Input
+    );
+    LocalStats late_input_stats{};
+    int32_t late_input_fanin[kMaxFanin];
+    for (uint32_t index = 0; index < kMaxFanin; ++index) {
+        late_input_fanin[index] = -91;
     }
-    Check(payload_untouched, "late invalid symbol does not touch payload scratch");
+    bool late_input_protocol_ok = true;
+    uint32_t late_input_ordinary_lookups = UINT32_MAX;
+    (void)CollectSharedFanin<SymbolTestOps>(
+        *map, late_input_args, 2, kHeapWindow, late_input_stats,
+        late_input_fanin, late_input_protocol_ok,
+        late_input_ordinary_lookups
+    );
+    Check(
+        !late_input_protocol_ok,
+        "late invalid symbol rejects preceding valid INPUT"
+    );
+    Check(
+        late_input_stats.result.shared_symbol_input_loads == 0,
+        "late invalid symbol publishes no partial INPUT statistic"
+    );
+    Check(
+        late_input_fanin[0] == -91,
+        "late invalid symbol publishes no partial INPUT fanin"
+    );
+    Check(
+        AllBytesEqual(payload.get(), sizeof(*payload), 0xA5),
+        "late invalid INPUT pair leaves payload scratch untouched"
+    );
 
     TaskArgs duplicate_args;
     ConstructTaskArgs(duplicate_args);
@@ -1126,15 +1229,12 @@ void TestInvalidReferencesFailClosed() {
         duplicate_args, producer.shared_result.OutputRef(0),
         TensorArgType::OutputExisting
     );
-    SubmitContext duplicate_context{};
-    duplicate_context.task_id = 2;
-    duplicate_context.payload = payload.get();
     LocalStats duplicate_stats{};
     int32_t duplicate_fanin[kMaxFanin] = {};
     bool duplicate_protocol_ok = true;
     uint32_t duplicate_ordinary_lookups = UINT32_MAX;
     (void)CollectSharedFanin<SymbolTestOps>(
-        *map, duplicate_args, duplicate_context, 2, kHeapWindow,
+        *map, duplicate_args, 2, kHeapWindow,
         duplicate_stats, duplicate_fanin, duplicate_protocol_ok,
         duplicate_ordinary_lookups
     );

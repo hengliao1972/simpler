@@ -1485,6 +1485,7 @@ PA_DEVICE void CopyGmTensor(PA_GM TensorDesc &destination, PA_GM const TensorDes
     }
 }
 
+template <bool SharedDescriptorsPrefilled = false>
 PA_DEVICE void PopulateSlotPayload(
     PA_GM LocalSlot &slot, const TaskArgs &args, const SubmitContext &context, const int32_t fanin[kMaxFanin],
     uint32_t fanin_count, int32_t sub_block_id, bool is_multicore, int32_t won_block, int32_t won_slot
@@ -1498,10 +1499,18 @@ PA_DEVICE void PopulateSlotPayload(
             CopyGmTensor(slot.tensors[index], context.payload->tensors[index]);
 #if PTO_FDWIC_SHARED_MAP
         } else if (IsSharedOutputReference(args.tensors[index])) {
-            // scheduler resolver 已在 WinnerBuild 内校验 published 与 plain-view
-            // 契约，并把共享 descriptor 拷入当前 task 的 payload scratch。
-            // slot builder 只复用该快照，不保存符号，也不增加 RingSlot ABI。
-            CopyGmTensor(slot.tensors[index], context.payload->tensors[index]);
+            // shared scheduler 已在调用本 builder 前把验证通过的 descriptor
+            // 直接写入 slot；此处只建立 args 指针，不能再从 payload scratch
+            // 做第二次 128-byte 搬运。这个前置条件只属于 shared BuildWinner，
+            // 不改变 private builder，也不把符号或 mask 写进 LocalSlot ABI。
+            if constexpr (!SharedDescriptorsPrefilled) {
+                // 兼容入口仍允许调用方预先把 descriptor 放进 TaskPayload；
+                // 编译期布尔量保证生产 BuildWinner 的 direct-to-slot 实例
+                // 不产生这个分支或旧中间拷贝。
+                CopyGmTensor(
+                    slot.tensors[index], context.payload->tensors[index]
+                );
+            }
 #endif
         } else {
             CopyTensorFromRef(slot.tensors[index], args.tensors[index]);
@@ -1539,6 +1548,7 @@ PA_DEVICE void PopulateSlotPayload(
     slot.won_slot = won_slot;
 }
 
+template <bool SharedDescriptorsPrefilled = false>
 PA_DEVICE void BuildSlotPayload(
     PA_GM LocalSlot &slot, uint32_t task_id, uint32_t function_id, uint64_t function_address, const TaskArgs &args,
     const SubmitContext &context, const int32_t fanin[kMaxFanin], uint32_t fanin_count, int32_t sub_block_id = 0,
@@ -1553,7 +1563,7 @@ PA_DEVICE void BuildSlotPayload(
     slot.kind = function_id;
     slot.function_address = function_address;
     slot.built = 1;
-    PopulateSlotPayload(
+    PopulateSlotPayload<SharedDescriptorsPrefilled>(
         slot, args, context, fanin, fanin_count, sub_block_id, is_multicore, won_block, won_slot
     );
 }
@@ -1567,7 +1577,9 @@ PA_DEVICE void BuildSlotPayload(
     uint32_t fanin_count
 ) {
     slot.built = 1;
-    PopulateSlotPayload(slot, args, context, fanin, fanin_count, 0, false, -1, -1);
+    PopulateSlotPayload<false>(
+        slot, args, context, fanin, fanin_count, 0, false, -1, -1
+    );
 }
 
 }  // namespace pa_scheduler

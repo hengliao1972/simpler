@@ -121,8 +121,8 @@ else
     "$BUILD_DIR/test_shared_prepare_map_trace"
 
     # fresh-output symbol 与 region ring 是两条独立协议。该用例单独锁定
-    # descriptor 最终封口、只读 fanin、构建后 INOUT writer commit、
-    # 失败 slot 撤销、payload scratch 解析及非法引用 fail-closed，
+    # descriptor 最终封口、只读 fanin、ready descriptor 直写 slot、
+    # 构建后 INOUT writer commit、失败 slot 撤销及非法引用 fail-closed，
     # 避免只靠完整 96 线程回放偶然覆盖。
     echo "[BUILD] shared-output symbol self-test"
     "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror -pthread \
