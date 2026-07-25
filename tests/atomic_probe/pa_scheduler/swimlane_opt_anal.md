@@ -137,30 +137,26 @@ scalar 控制流、TensorMap、ring slot、heap cursor 和 task payload arena。
 
 | task | 真正执行 atomicMax 的 worker | 每个 task 的 winner 数 |
 | ---- | ---------------------------: | ---------------------: |
-| Alloc（shared） | `[lane=task%3][shard=task&7]` 对应的唯一 owner | 1 |
-| Alloc（private） | 全部 96 个 worker | 1 |
+| Alloc | 全部 96 个 worker | 1 |
 | QK、PV | 32 个 AIC | 各 1 |
 | SF、UP | 64 个 AIV | 各 1 |
 
-不符合 role 或 shared Alloc owner 映射的 worker 仍有一条 `Claim` span，
-但 `attempted=false`，不会执行该 task 的 `atomicMax`。
+不符合 role 的 worker 仍有一条 `Claim` span，但 `attempted=false`，不会执行
+该 task 的 `atomicMax`。
 
 ### 2.2 四类状态及其业务职责
 
 | 状态 | 所有权 | 保存内容 | 业务作用 |
 | ---- | ------ | -------- | -------- |
-| `SchedulerState` 共享前缀 | 96 核共享 | cube/vector/private Alloc 四 shard cursor、task cell、frontier、屏障、fatal | 建立全局唯一 winner、完成可见性和生命周期同步 |
-| shared sidecar | 96 核共享，仅 shared 构建存在 | shared Alloc `3×8` cursor、output symbol、region、heap | 分散 Alloc owner，并承载 shared TensorMap 协议 |
+| `SchedulerState` 共享前缀 | 96 核共享 | Claim cursor、task cell、frontier、屏障、fatal | 建立全局唯一 winner、完成可见性和生命周期同步 |
 | `WorkerState` | 每个 worker 私有 | heap cursor、TensorMap、slot、payload | 让每核独立回放同一图，并暂存自己赢得的任务 |
 | `TaskCell` | 每个全局 task 一份 | `vend`、`flag` | 发布 heap 水位和完成状态，供 fanin/回收读取 |
 | `PaOrchestrationState`/`TaskArgs` | 当前 worker 回放栈 | PA descriptor、动态 shape、参数列表 | 把前一 Submit 的输出接到后一 Submit 的输入 |
 
 共享与私有的边界非常重要：
 
-- cube/vector cursor 和 completion flag 是两种模式都使用的跨核协议；
-  private Alloc 使用 prefix 四 shard，shared Alloc 使用 sidecar `3×8`
-  cursor；frontier 是 private ring 回收协议，shared Case1 的严格 no-wrap
-  heap 不消费它；
+- Claim cursor 和 completion flag 是两种模式都使用的跨核协议；frontier
+  是 private ring 回收协议，shared Case1 的严格 no-wrap heap 不消费它；
 - private TensorMap 和 slot 只属于本 worker，维护它们不需要跨核原子；
   shared TensorMap sidecar 是全局共享状态；
 - 每个 worker 都维护同一 task stream 的私有 descriptor/producer 视图；
@@ -260,8 +256,7 @@ UP 参数包括：
 | ---- | ---: | ------: |
 | 每 worker 的 Submit | `5B` | 1,280 |
 | 96 核 Submit 总记录 | `96 × 5B` | 122,880 |
-| 实际 Claim atomicMax（shared） | `193B` | 49,408 |
-| 实际 Claim atomicMax（private） | `288B` | 73,728 |
+| 实际 Claim atomicMax | `288B` | 73,728 |
 | 全局 winner task | `5B` | 1,280 |
 | AllocComplete | `B` | 256 |
 | WinnerBuild / Kernel | `4B` | 1,024 |
@@ -393,18 +388,14 @@ Submit 的 task kind 给其中 Kernel 归类会得到错误结论，必须使用
 
 ### 5.3 `Claim`：决定谁负责本 task 的真实尾动作
 
-Claim 先根据 task kind 生成 active role，再选择对应的 cursor：
+Claim 先根据 task kind 生成 active role，再选择四个 cursor shard 之一：
 
-- shared Alloc 使用
-  `shared_alloc_cursor[task_id%3][task_id&7]`，且只允许映射到该
-  `(lane, shard)` 的固定 block owner 发起 atomicMax；
-- private Alloc 使用四路 `alloc_cursor`；
+- Alloc 使用 `alloc_cursor`；
 - QK/PV 使用 `cube_cursor`；
 - SF/UP 使用 `vector_cursor`。
 
-符合 role 的 worker 才可能对 cursor 执行 `atomicMax(task_id)`；shared
-Alloc 还必须符合固定 `(block,lane)` owner 映射。返回旧值小于当前 task id
-的调用成为 winner；发起 atomic 但未获胜的是 attempted loser，其余是
+符合 role 的 worker 对 cursor 执行 `atomicMax(task_id)`。返回旧值小于当前
+task id 的唯一竞争者获胜；其他参与者是 attempted loser，不符合 role 的核是
 not-attempted loser。
 
 Claim 的输出包括：

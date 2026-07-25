@@ -148,21 +148,6 @@ else
     echo "[TEST] shared heap no-wrap reserve self-test"
     "$BUILD_DIR/test_shared_heap_reserve"
 
-    # shared Alloc 使用独立的 [3 lanes][8 shards] cursor，并把每个
-    # (lane, shard) 固定映射到唯一 block owner。该定向测试枚举真实
-    # 96-worker 拓扑与 b256 Alloc task，锁定 24-owner 分布、+120 单调
-    # 序列、非 owner 零 atomic，以及 kernel 仍走原 cube/vector[4]。
-    echo "[BUILD] shared Alloc Claim cursor self-test"
-    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
-        -DPTO_FDWIC_SHARED_MAP=1 \
-        -DPA_BUILD_SWIMLANE=1 \
-        -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/common/test_shared_alloc_claim_cursor.cpp" \
-        -o "$BUILD_DIR/test_shared_alloc_claim_cursor"
-
-    echo "[TEST] shared Alloc Claim cursor self-test"
-    "$BUILD_DIR/test_shared_alloc_claim_cursor"
-
     # Materialize 在触碰 shared cursor 前必须完成数量、引用、shape/stride
     # 和地址区间预检；这些 reserve 前拒绝路径不能推进 heap。FetchAdd 后
     # 才暴露的容量竞争则按 terminal 契约保留 overrun 现场。

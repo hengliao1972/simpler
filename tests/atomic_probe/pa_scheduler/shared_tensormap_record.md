@@ -4,7 +4,7 @@
 [`poursoul/simpler:fdwic-shared-tensormap`](https://github.com/poursoul/simpler/tree/fdwic-shared-tensormap)
 在 A5 FDWIC runtime 中实现的 shared TensorMap 方案，并与当前分支 standalone
 方案比较。本文用于后续开发决策，不表示目标分支已经合入，也不把分支文档中的
-实验记录自动当成当前分支的性能结论；当前分支 S0～S4.13a 的实际实施证据另记于
+实验记录自动当成当前分支的性能结论；当前分支 S0～S4.13 的实际实施证据另记于
 第 15 节。当前继续开发和验收的后端范围固定为 CPU/CCEC。
 
 后续每个实现小步都必须先对照参考提交：可直接复用的机制要说明复用位置；
@@ -3217,29 +3217,21 @@ S4.12b，因为它仍只裁剪同一类空外壳；撤销时确定的下一候�
 状态访问形状的 `alloc_cursor[3][8]`，其正确性、winner 分布和性能在
 下节作为独立阶段重新验证。
 
-### 2026-07-25：S4.13a 对等迁移 shared Alloc 的 `3×8` Claim cursor
+### 2026-07-25：S4.13 `3×8` Alloc cursor 功能闭合但性能中性，已撤销
 
-#### 参考实现与本阶段边界
+#### 参考实现、候选边界与正确性
 
-重新按提交而不是只按最终文件核对参考分支后，确认相关能力分两步进入：
+重新按提交核对参考分支后，确认 shared Alloc 的最终形态由两个提交组成：
 
-- `0350b558` 把 `DistGlobal::alloc_cursor` 改为
-  `[kLaneCount][kAllocCursorShards]`，即三条物理 lane、每条八个 shard，
-  并在 Alloc Claim 中先按 `task_id % 3` 选择 lane；
-- `076f1265` 再增加 shared 专用候选判断，按
-  `task_id & 7` 选择 shard、按 `shard % num_blocks` 选择唯一 block，
-  候选失败者在 EfDrain 和 Claim 之前返回。
+- `0350b558` 把 `DistGlobal::alloc_cursor` 改成三条物理 lane、每条八个
+  shard，并在 Claim 中按 `task_id%3` 选择 lane；
+- `076f1265` 再按 `task_id&7` 选择 shard、按
+  `shard%num_blocks` 选择唯一 block，并把非候选早退前移到 EfDrain 之前。
 
-本阶段只迁移第一项状态形状和“唯一 `(block,lane)` owner 发
-`ClaimMax`”的访问拓扑，不同时迁移参考中的 pre-EfDrain 早退，也不修改
-cube/vector cursor、slot 深度、延迟解析或 shared heap。原因是 S4.10
-已经证明“单层四 shard 固定四个 owner”虽然少了相同数量的 atomic，却会
-集中 winner 并稳定回退；S4.12 又证明只裁 generic finish 是墙钟中性。
-只有先把参考的 24-owner 分散拓扑作为单一变量，才能区分 cursor 访问形状
-与控制流裁剪的效果。
-
-standalone 固定 32 个 mixed block，八个 Alloc shard 均小于 block 数，
-所以参考的 `shard % num_blocks` 在当前拓扑中精确化简为 `block=shard`：
+S4.13 候选 `327de856` 只迁移 `3×8` cursor 和 24-owner Claim 拓扑，
+不同时迁移 pre-EfDrain 早退、cube/vector cursor、slot 深度、延迟解析或
+shared heap。standalone 固定 32 个 mixed block，八个 shard 均小于 block
+数，因此映射精确为：
 
 ```text
 lane  = task_id % 3
@@ -3247,83 +3239,85 @@ shard = task_id & 7
 block = shard
 ```
 
-每个 `(lane, shard)` 因而只有一个物理 worker，24 条 cursor 由 24 个
-owner 分散推进。同一 cursor 上的 Alloc task_id 间隔为
-`lcm(3, 8) × 5 = 120`，本核顺序回放时严格递增。若固定 owner 已经发起
-FetchMax 却观察到旧值不小于当前 task，说明状态未复位或发生越序；该情况
-通过生产路径共用的 helper 发布 fatal，不能静默当作正常 Replay。
+新 cursor 追加在 shared-only sidecar 尾部，既有 production prefix、
+region、output 和 heap 字段 offset 不动；这只声明访问拓扑与参考一致，
+不伪称参考 `DistGlobal` 字节布局一致。全部 96 个 actor 仍保留 EfDrain、
+Claim span、参数构造、generic finish、Submit、perf-clock 和 PMU 边界，
+非 owner 只在 Claim 内返回 `attempted=false`。固定 owner 若发起 FetchMax
+后仍未获胜会发布 fatal，避免把状态未复位或越序推进静默解释成 Replay。
 
-#### ABI 和观察口径
+物理 Claim 从 `288B` 降到 `193B`，所以 b256 从 73,728 精确降到
+49,408，删除 24,320 次 Alloc `ClaimMax`。256 个 Alloc winner 分散到
+24 个 owner，其中 16 个 owner 各 11 个、8 个 owner 各 10 个；这与
+S4.10 集中到四个 owner 的候选不同。
 
-为了不移动已经验证过的 standalone production prefix、region、output 和
-heap 字段，新 cursor 追加在 shared-only sidecar 尾部：
+新增定向测试覆盖唯一 owner、物理 worker 映射、非 owner 零 FetchMax、
+同 cursor 的 `0→120→240`、`120→0` 乱序 fatal，以及 QK/SF 仍使用原
+cube/vector cursor。功能门禁包括：
 
-```text
-shared_alloc_cursor offset = 4,735,680B
-shape                      = AtomicLine[3][8]
-SharedTensorMapSidecar     = 4,737,216B
-```
-
-这表示访问拓扑与参考一致，不表示参考 `DistGlobal` 的字节 offset 已被
-复制。private sidecar、private Claim 控制流和既有 shared 字段 offset
-均不变；Host 每轮把 24 条 cursor 全部复位为 `-1`，H2D/D2H 继续以
-`sizeof(SharedTensorMapSidecar)` 完整搬运。
-
-本小步保留全部 96 个 actor 的 EfDrain、Claim span、参数构造、generic
-finish、Submit、perf-clock 和 PMU 边界。shared Alloc 非 owner 只在
-`Claim()` 内返回 `attempted=false`，不发 atomic；因此 raw schema 和
-阶段记录数没有变化，只有真实 `ClaimMax` 数减少。private 仍保持全员
-Alloc 竞争。
-
-设 batch 数为 `B`，shared 的物理 Claim 精确变为：
-
-```text
-Alloc + QK + SF + PV + UP
-= 1B + 32B + 64B + 32B + 64B
-= 193B
-```
-
-所以 b256 从 S4.9 的 `288B=73,728` 降为
-`193B=49,408`，精确删除 24,320 次 Alloc `ClaimMax`。这和 S4.10
-删除的 atomic 数相同，但 S4.13 把 256 个 Alloc winner 分散到 24 个
-owner：其中 16 个 owner 各处理 11 个任务，8 个 owner 各处理 10 个，
-而不是集中到四个 owner。
-
-#### 正确性与构建门禁
-
-新增 CPU 定向测试直接调用生产 `Claim()` 和 fatal helper，锁定：
-
-- b256 每个 Alloc task 恰有一个 owner，且 owner 集合严格为 24 个；
-- 24 个 owner 的物理 worker 映射及 `16×11 + 8×10` 分布；
-- owner 只对预期 cursor 发一次 FetchMax，非 owner 为零次；
-- 同 cursor 的 `0→120→240` 单调推进；
-- `120→0` 乱序反例触发 fatal；
-- QK/SF 仍只访问原 cube/vector 四 shard cursor。
-
-完整门禁结果为：
-
-- 用户 `.venv` 下 100 项 converter、exclusive analyzer 和 PMU 测试通过；
-- CPU shared/private strict 构建通过；shared b1/b24/b256、private
-  b1/b256 完整 96-worker 回放通过，Claim 分别为
-  `193/4,632/49,408` 与 `288/73,728`；
-- CCEC shared/private 的 swimlane、perf-clock 和五种 submit-PMU 共
-  14 种构建全部通过，manifest SHA 全部复验；
-- private perf-clock 的 `.text=125,752B`、`.rodata=300B` 与
-  `dc22d076` 冻结件内容逐字节一致；
+- 用户 `.venv` 下 100 项 Python 测试；
+- CPU shared/private strict 构建，shared b1/b24/b256 与 private
+  b1/b256 完整回放；
+- CCEC shared/private 的 swimlane、perf-clock 和五种 submit-PMU，
+  共 14 种构建及 manifest SHA；
 - A5 shared b1 atomic 泳道、shared b24 perf-clock 和 private b1
-  perf-clock 均通过完整 heap、symbol、dependency、cursor 与输出校验。
+  perf-clock。
 
-shared b1 原始泳道位于：
+shared b1 raw 共 4,034 条且零丢失；193 条 `ClaimMax` 与 Claim
+attempted 一一闭合，按 Alloc/QK/SF/PV/UP 分为 `1/32/64/32/64`，
+全部是 `return_ready` 边界。候选 shared perf-clock `.text=129,592B`，
+比 S4.9 增加 512B，`.rodata` 同为 288B。功能取证泳道位于：
 
 ```text
 outputs/pa_scheduler_shared_swimlane_20260725_143815_2563482/ccec/
 ```
 
-其中 4,034 条 raw 零丢失；193 条 `ClaimMax` 与 Claim attempted 一一
-闭合，按 task kind 精确分为 `1/32/64/32/64`，且全部使用
-`return_ready` 边界。shared perf-clock mixed `.text` 为 129,592B，
-比 S4.9 的 129,080B 增加 512B，`.rodata` 同为 288B。
+#### 冻结配对与撤销判定
 
-以上只证明状态、路由、计数和观察契约闭合。是否保留 S4.13 必须等 clean
-候选与 S4.9 `e8320280` 完成相同 device、两次预热、六个 ABBA/BAAB
-区组的 b256 交错配对；不能用 atomic 数量下降或单次 A5 时间宣称性能收益。
+clean 候选冻结在：
+
+```text
+outputs/perf_clock_freeze_327de856_20260725_145606/
+```
+
+与 S4.9 `e8320280` 在同一 device 0 上各预热两次，再执行六个
+ABBA/BAAB 区组；每版 12 个正式 b256 独立进程，均使用
+`real-compute 6,28,4,1`、`two-16`，计时范围为首个 Submit 起点到最后
+一个 Submit 返回。全部样本都满足 `active_workers=96`、`RingBp=0` 和
+完整语义断言。
+
+| 指标 | S4.9 `e8320280` | S4.13 `327de856` |
+| --- | ---: | ---: |
+| ClaimMax | 73,728 | 49,408 |
+| 最小值 | 3,224.547us | 3,219.012us |
+| 中位数 | 3,242.079us | 3,244.868us |
+| 均值 | 3,247.788us | 3,245.274us |
+| 最大值 | 3,284.128us | 3,268.426us |
+| 标准差 | 19.917us | 15.907us |
+| `max_wins_per_worker` 范围 | 29～42 | 27～32 |
+
+候选均值表面快 2.514us，但中位数慢 2.789us；六个区组恰好 3 快、3 慢，
+区组配对差中位数为 `+3.666us / +0.113%`。winner 集中度和 atomic 次数
+都按设计下降，但完整 Submit 没有稳定同向收益。按实施前声明的门槛，
+`0～3/6` 区组更快且配对差中位数非负时直接撤销，不启动第二轮，也不叠加
+参考的 pre-EfDrain 早退来掩盖本候选结果。
+
+原始日志、逐样本表和机器可读汇总位于：
+
+```text
+outputs/perf_clock_pair_327de856_vs_e8320280_20260725_145751/
+```
+
+因此完整撤销 `327de856` 的 source、ABI、测试和当前行为文档，恢复 S4.9
+的四 shard/96-worker Alloc Claim。保留本节作为负结果：`3×8`/24-owner
+确实解决了 S4.10 的 winner 集中并消减 24,320 次 return-ready FetchMax，
+但在当前代码布局和调度路径中仍不足以形成可测净收益。以后若研究参考的
+pre-EfDrain 早退，必须把它作为新的独立候选相对 S4.9 冻结配对，不能把
+本轮 atomic 消减记成已保留的性能优化。
+
+撤销后，非文档源码与 `e8320280` 逐字节一致；用户 `.venv` 下 100 项
+Python 测试、CPU shared strict/perf-clock 构建和 b256 完整回放再次通过。
+重建的 shared perf-clock Host 与 S4.9 冻结件 SHA 完全相同；device ELF
+因调试/符号节存在构建差异，但实际执行的 `.text=129,080B` 和
+`.rodata=288B` 内容逐字节一致。因此当前运行身份确实回到 S4.9，而不是
+只在源码表面删除了候选分支。
