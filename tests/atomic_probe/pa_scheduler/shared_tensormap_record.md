@@ -4,7 +4,7 @@
 [`poursoul/simpler:fdwic-shared-tensormap`](https://github.com/poursoul/simpler/tree/fdwic-shared-tensormap)
 在 A5 FDWIC runtime 中实现的 shared TensorMap 方案，并与当前分支 standalone
 方案比较。本文用于后续开发决策，不表示目标分支已经合入，也不把分支文档中的
-实验记录自动当成当前分支的性能结论；当前分支 S0～S4.7 的实际实施证据另记于
+实验记录自动当成当前分支的性能结论；当前分支 S0～S4.13a 的实际实施证据另记于
 第 15 节。当前继续开发和验收的后端范围固定为 CPU/CCEC。
 
 后续每个实现小步都必须先对照参考提交：可直接复用的机制要说明复用位置；
@@ -1497,7 +1497,7 @@ printf '#include "pto_types.h"\n' |
 shared 组合再增加 `-DPTO_FDWIC_SHARED_MAP=1`。两次返回码均为 1，失败位置为
 `pto_types.h:906-908`，断言实际值均为 `(32 == 0)`。
 
-## 14. 当前决策摘要与尚未闭环问题
+## 14. S4.6 阶段决策摘要与当时尚未闭环的问题
 
 截至 S4.6，standalone 已经证明：
 
@@ -3213,6 +3213,117 @@ outputs/perf_clock_pair_e8320280_vs_b2fe435f_20260725_135812/
 泳道和 PMU 新增的工具分支。撤销后重新构建的 Host 与 S4.9 冻结件 SHA
 一致；device ELF 的完整文件因调试/符号信息存在构建差异，但实际执行的
 `.text=129,080B` 与 `.rodata=288B` 均逐字节一致。后续不再开展
-S4.12b，因为它仍只裁剪同一类空外壳；下一候选应回到会改变共享状态访问
-形状的 `alloc_cursor[3][8]`，并把正确性、winner 分布和性能作为独立
-阶段重新验证。
+S4.12b，因为它仍只裁剪同一类空外壳；撤销时确定的下一候选是会改变共享
+状态访问形状的 `alloc_cursor[3][8]`，其正确性、winner 分布和性能在
+下节作为独立阶段重新验证。
+
+### 2026-07-25：S4.13a 对等迁移 shared Alloc 的 `3×8` Claim cursor
+
+#### 参考实现与本阶段边界
+
+重新按提交而不是只按最终文件核对参考分支后，确认相关能力分两步进入：
+
+- `0350b558` 把 `DistGlobal::alloc_cursor` 改为
+  `[kLaneCount][kAllocCursorShards]`，即三条物理 lane、每条八个 shard，
+  并在 Alloc Claim 中先按 `task_id % 3` 选择 lane；
+- `076f1265` 再增加 shared 专用候选判断，按
+  `task_id & 7` 选择 shard、按 `shard % num_blocks` 选择唯一 block，
+  候选失败者在 EfDrain 和 Claim 之前返回。
+
+本阶段只迁移第一项状态形状和“唯一 `(block,lane)` owner 发
+`ClaimMax`”的访问拓扑，不同时迁移参考中的 pre-EfDrain 早退，也不修改
+cube/vector cursor、slot 深度、延迟解析或 shared heap。原因是 S4.10
+已经证明“单层四 shard 固定四个 owner”虽然少了相同数量的 atomic，却会
+集中 winner 并稳定回退；S4.12 又证明只裁 generic finish 是墙钟中性。
+只有先把参考的 24-owner 分散拓扑作为单一变量，才能区分 cursor 访问形状
+与控制流裁剪的效果。
+
+standalone 固定 32 个 mixed block，八个 Alloc shard 均小于 block 数，
+所以参考的 `shard % num_blocks` 在当前拓扑中精确化简为 `block=shard`：
+
+```text
+lane  = task_id % 3
+shard = task_id & 7
+block = shard
+```
+
+每个 `(lane, shard)` 因而只有一个物理 worker，24 条 cursor 由 24 个
+owner 分散推进。同一 cursor 上的 Alloc task_id 间隔为
+`lcm(3, 8) × 5 = 120`，本核顺序回放时严格递增。若固定 owner 已经发起
+FetchMax 却观察到旧值不小于当前 task，说明状态未复位或发生越序；该情况
+通过生产路径共用的 helper 发布 fatal，不能静默当作正常 Replay。
+
+#### ABI 和观察口径
+
+为了不移动已经验证过的 standalone production prefix、region、output 和
+heap 字段，新 cursor 追加在 shared-only sidecar 尾部：
+
+```text
+shared_alloc_cursor offset = 4,735,680B
+shape                      = AtomicLine[3][8]
+SharedTensorMapSidecar     = 4,737,216B
+```
+
+这表示访问拓扑与参考一致，不表示参考 `DistGlobal` 的字节 offset 已被
+复制。private sidecar、private Claim 控制流和既有 shared 字段 offset
+均不变；Host 每轮把 24 条 cursor 全部复位为 `-1`，H2D/D2H 继续以
+`sizeof(SharedTensorMapSidecar)` 完整搬运。
+
+本小步保留全部 96 个 actor 的 EfDrain、Claim span、参数构造、generic
+finish、Submit、perf-clock 和 PMU 边界。shared Alloc 非 owner 只在
+`Claim()` 内返回 `attempted=false`，不发 atomic；因此 raw schema 和
+阶段记录数没有变化，只有真实 `ClaimMax` 数减少。private 仍保持全员
+Alloc 竞争。
+
+设 batch 数为 `B`，shared 的物理 Claim 精确变为：
+
+```text
+Alloc + QK + SF + PV + UP
+= 1B + 32B + 64B + 32B + 64B
+= 193B
+```
+
+所以 b256 从 S4.9 的 `288B=73,728` 降为
+`193B=49,408`，精确删除 24,320 次 Alloc `ClaimMax`。这和 S4.10
+删除的 atomic 数相同，但 S4.13 把 256 个 Alloc winner 分散到 24 个
+owner：其中 16 个 owner 各处理 11 个任务，8 个 owner 各处理 10 个，
+而不是集中到四个 owner。
+
+#### 正确性与构建门禁
+
+新增 CPU 定向测试直接调用生产 `Claim()` 和 fatal helper，锁定：
+
+- b256 每个 Alloc task 恰有一个 owner，且 owner 集合严格为 24 个；
+- 24 个 owner 的物理 worker 映射及 `16×11 + 8×10` 分布；
+- owner 只对预期 cursor 发一次 FetchMax，非 owner 为零次；
+- 同 cursor 的 `0→120→240` 单调推进；
+- `120→0` 乱序反例触发 fatal；
+- QK/SF 仍只访问原 cube/vector 四 shard cursor。
+
+完整门禁结果为：
+
+- 用户 `.venv` 下 100 项 converter、exclusive analyzer 和 PMU 测试通过；
+- CPU shared/private strict 构建通过；shared b1/b24/b256、private
+  b1/b256 完整 96-worker 回放通过，Claim 分别为
+  `193/4,632/49,408` 与 `288/73,728`；
+- CCEC shared/private 的 swimlane、perf-clock 和五种 submit-PMU 共
+  14 种构建全部通过，manifest SHA 全部复验；
+- private perf-clock 的 `.text=125,752B`、`.rodata=300B` 与
+  `dc22d076` 冻结件内容逐字节一致；
+- A5 shared b1 atomic 泳道、shared b24 perf-clock 和 private b1
+  perf-clock 均通过完整 heap、symbol、dependency、cursor 与输出校验。
+
+shared b1 原始泳道位于：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260725_143815_2563482/ccec/
+```
+
+其中 4,034 条 raw 零丢失；193 条 `ClaimMax` 与 Claim attempted 一一
+闭合，按 task kind 精确分为 `1/32/64/32/64`，且全部使用
+`return_ready` 边界。shared perf-clock mixed `.text` 为 129,592B，
+比 S4.9 的 129,080B 增加 512B，`.rodata` 同为 288B。
+
+以上只证明状态、路由、计数和观察契约闭合。是否保留 S4.13 必须等 clean
+候选与 S4.9 `e8320280` 完成相同 device、两次预热、六个 ABBA/BAAB
+区组的 b256 交错配对；不能用 atomic 数量下降或单次 A5 时间宣称性能收益。

@@ -3,9 +3,9 @@
 ## 1. 范围与当前结论
 
 本文记录 `TestPagedAttentionUnroll::Case1` 在真实 A5 上的 FDWIC AICore
-Submit 路径，供后续继续优化。快照日期更新至 2026-07-18；当前保留的生产
-优化基线为 `2c3dd1e2`，F1 负结果记录提交为 `c93c3666`。文档中
-standalone 观察链路的最新状态更新至 2026-07-19。
+Submit 路径，供后续继续优化。真实 PA 生产快照日期为 2026-07-18；当前
+保留的生产优化基线为 `2c3dd1e2`，F1 负结果记录提交为 `c93c3666`。
+standalone 观察链路更新至 2026-07-25 的 S4.13a。
 
 范围限定为：
 
@@ -304,7 +304,7 @@ Submit 调度而非 kernel 计算变快。
 
 1. **Claim cursor 竞争。** 73728 次 `atomicMax` 是最大固定项。可以研究
    确定性 owner、分层/分片 Claim 或减少无胜算 worker 参与，但必须保持
-   AIC/AIV 负载均衡、ring slot 容量和 joint placement 语义。当前四分片是按
+   AIC/AIV 负载均衡、ring slot 容量和 joint placement 语义。当时的四分片按
    task id 分片，不能假设再加 shard 一定能降低同一 task 的竞争。
 2. **completion/frontier。** 研究减少重复 `atomicMax(frontier)` 和连续 flag
    扫描，例如单 advancer、批量前推或分层 frontier；最终判断必须保持“只有
@@ -334,12 +334,14 @@ schema-v4 已改为显式互斥的 `WinnerBuild/LoserReplay/AllocComplete` 尾 s
 
 ## 6. 独立 PA 调度复现的对应关系
 
-`pa_scheduler/` 下的 CCEC、AscendC 和 CPU 用例以本文的真实 PA 路径为模型，
+`pa_scheduler/` 下当前验收的 CCEC 和 CPU 用例以本文的真实 PA 路径为模型，
 目标是脱离 simpler 的编译和链接依赖后，仍能单独研究 Submit 调度性能。这里的
 “脱离 simpler”不表示删减 PA 调度逻辑。当前独立模型保留：
 
 - Case1 的 256 batch、Alloc/QK/SF/PV/UP 五 task 拓扑和 AIC/AIV active mask；
-- 96 worker 全量回放、四分片 Claim cursor 和固定 73728 次 Claim atomicMax；
+- 96 worker 全量回放；shared Alloc 使用 `3×8` cursor 和唯一 owner，
+  b256 共 49,408 次 Claim atomicMax；private 保持四分片 Alloc cursor，
+  b256 共 73,728 次；
 - TaskArgs/Tensor/TaskPayload/DistSubmitCtx 的关键 ABI 和真实 tag 扫描；
 - materialize、TensorMap retire/lookup/insert、register、fanin、slot payload；
 - EfDrain、Replay、WaitForSlot、HeapGuard、flag/vend/frontier 和最终 drain；
@@ -372,9 +374,10 @@ load/compute/store span 已接近真实 PA 的 44.170/53.729/27.626/1.565 us；�
 硬凑到 5.1 ms。standalone 未覆盖的真实控制流、代码布局和资源竞争仍会形成
 端到端差值，不能把这部分差值反推成缺少的 kernel repeat。
 
-当前严格校验覆盖 73,728 次 Claim、每 task 唯一 winner、1,024 个 kernel、
-TensorMap/heap 最终状态、fanin、flag、vend、frontier、cursor、ring placement
-和每 worker 的前端操作次数。2026-07-17 三个 CCEC 独立进程首轮为
+当前严格校验按构建模式覆盖 shared 49,408 次或 private 73,728 次 Claim、
+每 task 唯一 winner、1,024 个 kernel、TensorMap/heap 最终状态、fanin、
+flag、vend、frontier、cursor、ring placement 和每 worker 的前端操作次数。
+2026-07-17 三个 CCEC 独立进程首轮为
 4.846431/4.798260/4.830184 ms，中位数 4.830184 ms；AscendC 独立进程首轮为
 4.917014 ms，均为 PASS；真实最好泳道为 5.096685 ms。
 差异主要来自真实 orchestration 与 `dist_submit_impl` 跨翻译单元，而 standalone
@@ -384,8 +387,9 @@ TensorMap/heap 最终状态、fanin、flag、vend、frontier、cursor、ring pla
 
 下列四阶段是普通 runtime `--profile-phases` 的历史诊断口径；调度器中的
 WaitForSlot 协议和普通泳道仍保留。
-Claim 和 EfDrain 每 worker 调用
-1280 次；WaitForSlot 由 1024 个 kernel winner 调用；HeapGuard 由每 batch 的
+Claim span 和 EfDrain 每 worker 调用 1,280 次；shared Alloc 非 owner 的
+Claim `attempted=false`，不能把 span 次数当成 atomic 次数。WaitForSlot 由
+1,024 个 kernel winner 调用；HeapGuard 由每 batch 的
 Alloc/QK/SF/PV winner 调用，共 1024 次。当前代表性 CCEC 轮次的累计中位数为：
 
 | role | Claim | EfDrain | WaitForSlot | HeapGuard |
@@ -2089,9 +2093,9 @@ atomic 消减；`fanin_ready/not_ready` 也只统计 task flag。
 slot 容量上重试，仍需重新统计 physical atomic 与完整 Submit，不能复用
 本轮逻辑计数宣称收益。
 
-撤销后 shared perf-clock host/kernel 与 `e8320280` 冻结件逐字节相同，
-b256 `RingBp` 恢复为 0；因此当前 atomic 与 publication 口径也已严格
-回到 S4.9，而不是仅在源码表面删除了实验分支。
+撤销完成时，shared perf-clock host/kernel 与 `e8320280` 冻结件逐字节
+相同，b256 `RingBp` 恢复为 0；因此当时的 atomic 与 publication 口径
+严格回到 S4.9，而不是仅在源码表面删除了实验分支。
 
 #### 7.5.23 S4.12a shared loser generic finish 快返实验
 
@@ -2106,5 +2110,43 @@ CPU、CCEC、A5 泳道和稀疏局部 PMU 均证明 winner-only 路径及其观�
 `-0.477us / -0.015%`，区组胜负为 3:3；候选均值也只表面快约 0.043%。
 结论是噪声内中性，不能把源码调用数减少解释成 atomic 或墙钟收益。
 
-本轮已完整撤销，当前 atomic 计数与 S4.9 保持一致。详细正确性门禁、样本
-分布和原始结果路径见 `shared_tensormap_record.md` 的 S4.12a 实测结论。
+本轮完整撤销时，atomic 计数恢复为 S4.9。详细正确性门禁、样本分布和
+原始结果路径见 `shared_tensormap_record.md` 的 S4.12a 实测结论。
+
+#### 7.5.24 S4.13a shared Alloc `3×8` cursor 的 atomic 消减候选
+
+参考分支不是只给现有四 shard cursor 增加一个条件，而是先在
+`0350b558` 中把 Alloc cursor 改成三条 lane、每条八个 shard，再在
+`076f1265` 中把 shared Alloc 固定到唯一 `(block,lane)` 候选。本阶段
+只迁移这套 cursor 与 24-owner Claim 拓扑，保留全部 EfDrain、Claim
+span、参数构造和 generic finish；因此它是 atomic 访问形状实验，不混入
+pre-EfDrain 早退。
+
+固定 32-block standalone 中的映射为：
+
+```text
+lane=task_id%3, shard=task_id&7, block=shard
+```
+
+shared 每个 Alloc task 因此只有一个 `ClaimMax`，private 仍有 96 个。
+总物理 Claim 从 `288B` 降到 `193B`：
+
+| 规模 | S4.9 shared | S4.13a shared | 消减 |
+| --- | ---: | ---: | ---: |
+| b1 | 288 | 193 | 95 |
+| b24 | 6,912 | 4,632 | 2,280 |
+| b256 | 73,728 | 49,408 | 24,320 |
+
+b256 的 256 个 Alloc winner 分布在 24 个 owner，其中 16 个 owner 各
+11 个、8 个 owner 各 10 个；该形状避免重演 S4.10 四 owner 的固定集中。
+owner 若执行 FetchMax 后仍未获胜会发布 fatal，非 owner
+`attempted=false` 且不发 atomic。
+
+A5 shared b1 原始泳道中的 `ClaimMax` 精确为 193 条，分解为 Alloc/QK/
+SF/PV/UP 的 `1/32/64/32/64`；每条 flags 都是 `0x53`，即 FetchMax、
+返回值被消费且时间戳位于 `return_ready` 边界。Claim attempted 与 atomic
+记录一一闭合，raw schema、phase 和记录字段均未增加。
+
+该候选的 CPU、CCEC 14 变体、A5 shared b1/b24 与 private 回归均已通过；
+shared perf-clock `.text` 比 S4.9 增加 512B。此处只记录已证明的 atomic
+消减，完整 Submit 收益仍待 clean ELF 配对，尚不能写成性能优化结论。

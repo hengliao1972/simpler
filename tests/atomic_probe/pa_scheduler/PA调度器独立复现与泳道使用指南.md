@@ -13,8 +13,11 @@
 - 32 个 AIC worker、64 个 AIV worker，物理启动比例为 1:2；
 - 默认 256 个 batch，每 batch 依次提交 Alloc、QK、SF、PV、UP 五个 task；
 - 96 个 worker 各自回放 1,280 次 Submit，共 122,880 次 Submit；
-- Alloc 由 96 个 worker 竞争，QK/PV 由 32 个 AIC 竞争，SF/UP 由 64 个 AIV 竞争；
-- 4 路 Alloc/cube/vector Claim cursor，以及实际 `atomicMax` Claim；
+- shared Alloc 按 `[lane=task%3][shard=task&7]` 固定到 24 个物理
+  owner，每个 task 只由其中一个 owner 发起 Claim；private Alloc 仍由
+  96 个 worker 竞争，QK/PV 由 32 个 AIC、SF/UP 由 64 个 AIV 竞争；
+- shared Alloc 独立使用 `3×8` 路 Claim cursor，private Alloc 与
+  cube/vector 继续使用 4 路 cursor，以及实际 `atomicMax` Claim；
 - PA 的 TaskArgs、Tensor、TaskPayload、DistSubmitCtx、DistCore/DistGlobal 关键 ABI 布局；
 - tensor tag 扫描、输出 layout、materialize，以及按构建模式选择的 private
   每核有界桶环或 shared 有序桶环的 retire/lookup/insert、register mask；
@@ -23,9 +26,11 @@
 - 与真实 PA 相同的单 lane 优化：Case1 不执行 BlockWon 轮询；
 - 与真实泳道格式对齐的阶段记录及严格的结束状态校验。
 
-默认工作量固定产生 73,728 次 Claim、1,280 个 winner 和 1,024 次 kernel
-执行。每次运行都会校验这些数量以及最终 TensorMap、heap、cursor、flag、vend、
-frontier 和 worker 状态，任一不符都会返回失败。
+默认工作量在 shared 构建固定产生 49,408 次 Claim，在 private 构建固定
+产生 73,728 次 Claim；两种构建都产生 1,280 个 winner 和 1,024 次
+kernel 执行。每次运行都会校验这些数量、shared Alloc 的逐核 owner 分布，
+以及最终 TensorMap、heap、cursor、flag、vend、frontier 和 worker 状态，
+任一不符都会返回失败。
 
 两种 TensorMap 构建都先执行 `EfDrain` 和 `Claim`。private 随后保持
 compete-first eager：每核构造五类完整 `TaskArgs` 并执行 per-worker
@@ -251,9 +256,11 @@ submit-pmu 四件套都必须通过 manifest 的模式、变体、阶段和 SHA2
 不能作为 A5 性能证据。
 
 当前已完成 S0 构建身份、S1 private ring、S2 shared ordered ring 正确性
-基线、S2.5 ordered-winner reclaim、S3 fresh-output symbol，以及 S4.6
-PA Case1 从全局 sequencer 解耦。后续 shared TensorMap 开发与阶段门禁固定
-覆盖 CPU/CCEC。
+基线、S2.5 ordered-winner reclaim、S3 fresh-output symbol、S4.6
+PA Case1 从全局 sequencer 解耦，以及 S4.13a shared Alloc `3×8`
+cursor/24-owner 候选。S4.10 固定四 owner 与 S4.12 loser 快返均因没有
+稳定净收益而撤销；S4.13a 的功能门禁已闭合，性能配对尚未完成。后续
+shared TensorMap 开发与阶段门禁固定覆盖 CPU/CCEC。
 `--tensormap private|shared` 都会生成对应模式的真实可执行文件；S0 用于禁止
 伪 shared 产物的临时编译门禁已在 S2 接入 shared sidecar 后删除。两种模式仍
 使用相互隔离的产物目录、manifest 和 host/device ABI 握手，不能混用镜像。
@@ -301,17 +308,19 @@ ASan/UBSan。CPU b1、CPU b256 的完整调度断言和 CCEC private 三镜像�
 ### 4.2 当前 shared TensorMap：per-slot symbol、shared heap 与隔离的 region 原型
 
 S3.2a 在 S3.1 的 4,735,104B output table 尾部追加 8 条 cache-line
-heap cursor 和 1 条 aggregate vend，因此当前 `SharedTensorMapSidecar`
-为 4,735,680B。shared `SchedulerState` 的 CPU 非 split 布局为
-1,011,851,648B，CCEC split 布局为 1,011,857,792B；新增控制字位于
-standalone 控制区和 `results` 之后，不移动 `WorkerState`、`RunConfig`
-或既有结果字段。每 task 最多八个 fresh output，以 16B
+heap cursor 和 1 条 aggregate vend；S4.13 再在既有 sidecar 尾部追加
+`3×8` 条 shared Alloc Claim cursor。因此当前
+`SharedTensorMapSidecar` 为 4,737,216B。shared `SchedulerState` 的
+CPU 非 split 布局为 1,011,853,184B，CCEC split 布局为
+1,011,859,328B；新增控制字位于 standalone 控制区和 `results` 之后，
+不移动 `WorkerState`、`RunConfig` 或既有结果字段。每 task 最多八个 fresh output，以 16B
 `FdwicOutputRef` 表达 `(producer_task_id, output_slot)`，返回句柄为
 8B `SharedTaskOutputs`。构建身份 ABI 当前为 4。
 
-当前 shared 已完成 winner-only 重构参与 Materialize：所有 worker 仍先
-Claim 并独立声明同一组 output symbol；Alloc 暂时保留每核三个静态 Output
-参数，以对齐参考 `alloc_tensors(args)` 的调用形状。QK/SF/PV/UP 只有 winner
+当前 shared 已完成 winner-only 重构参与 Materialize：所有 worker 仍保留
+Claim span 并独立声明同一组 output symbol，但 shared Alloc 只有固定 owner
+真正发起 atomicMax；Alloc 暂时保留每核三个静态 Output 参数，以对齐参考
+`alloc_tensors(args)` 的调用形状。QK/SF/PV/UP 只有 winner
 执行 reset、view/CreateInfo 构造以及 tensor/scalar 参数添加。winner 随后
 独立预留 shared heap、生成 descriptor，只在自己实际依赖的
 `(producer_task_id, output_slot).published` 上等待并只读解析 fanin；本地
@@ -384,7 +393,7 @@ dependency/normalized writer 签名为
 `5cb454393ed48dcb`/`3a3d526c9b23c3db`，b256 为
 `b7d985d6edb07078`/`556bec7ec8d0f323`。
 
-以下是 S3.1 当时的历史门禁，不是当前 S4.6 的提交顺序或统计口径：
+以下是 S3.1 当时的历史门禁，不是当前 S4.13a 的提交顺序或统计口径：
 
 | 门禁 | 结果 |
 | --- | --- |
@@ -1703,11 +1712,11 @@ ClockBaseline，并继续以逐核容量、调用数、总记录数和 `dropped=
 `64 * 96 = 6,144` bytes。split ELF 另预留 AIC/AIV 两个 role-specific
 block-local runtime state，每个精确 1,664 bytes、最终 section 合计
 3,328 bytes；它们不属于 GM `SchedulerState`。以上 `SchedulerState` 数字
-是 private 模式；当前 S3.2a shared 模式在尾部另追加精确 4,735,680 bytes
-的 sidecar，故 CPU non-split/CCEC split 总大小分别为
-1,011,851,648/1,011,857,792 bytes；既有生产和 standalone 字段 offset
-不变。历史 S2.5 的 2,113,664B 和 S3.1 的 4,735,104B 都不是当前传输或
-分配口径。
+是 private 模式；当前 S4.13a shared 模式在尾部另追加精确
+4,737,216 bytes 的 sidecar，故 CPU non-split/CCEC split 总大小分别为
+1,011,853,184/1,011,859,328 bytes；既有生产和 standalone 字段 offset
+不变。历史 S2.5 的 2,113,664B、S3.1 的 4,735,104B 和 S3.2a 的
+4,735,680B 都不是当前传输或分配口径。
 独立的 64 bytes PMU 配置和 64 bytes winner workload 配置各占一条
 cache line；二者都位于完整生产 DistGlobal 镜像之后，生产 DistGlobal/
 DistCore 关键偏移保持不变。

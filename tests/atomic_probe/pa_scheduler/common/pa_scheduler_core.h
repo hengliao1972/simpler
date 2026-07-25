@@ -598,20 +598,54 @@ struct ClaimOutcome {
     int32_t function_id;
 };
 
+#if PTO_FDWIC_SHARED_MAP
+PA_DEVICE bool IsSharedAllocCandidate(
+    int32_t block_id, int32_t lane, uint32_t task_id
+) {
+    static_assert(
+        kSharedAllocCursorShards <= kAicWorkers,
+        "every shared Alloc cursor shard needs a physical block owner"
+    );
+    if (task_id >= kTaskCellCapacity) {
+        return false;
+    }
+    const uint32_t shard = task_id & kSharedAllocCursorShardMask;
+    const int32_t target_lane =
+        static_cast<int32_t>(task_id % kSharedAllocCursorLanes);
+    // 参考公式为 shard % num_blocks。standalone 固定 32 个 block 且
+    // shard 仅为 0..7，所以 target_block 精确等于 shard；直接使用常量
+    // 关系，避免在被测 Claim 热路径额外读取 GM num_blocks。
+    return lane == target_lane && block_id == static_cast<int32_t>(shard);
+}
+#endif
+
 template <typename Ops>
 PA_DEVICE ClaimOutcome Claim(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_id, TaskKind kind,
     LocalStats &stats
 ) {
-    // Claim 在四个 shard 的单调 cursor 上执行 atomicMax：同一 task 只有观察到旧值更小的竞争者获胜。
-    // Alloc 由全部 96 个 worker 竞争；QK/PV 仅 32 个 AIC，SF/UP 仅 64 个 AIV 进入真正的 atomicMax。
+    // Claim 在单调 cursor 上执行 atomicMax。shared Alloc 使用参考
+    // [lane=task%3][shard=task&7] 的 24-owner 拓扑；private Alloc 仍由
+    // 96 个 worker 竞争。QK/PV 仅 32 个 AIC，SF/UP 仅 64 个 AIV。
     ClaimOutcome outcome{false, false, 0, -1};
     if (task_id >= kTaskCellCapacity) {
         return outcome;
     }
     PA_GM AtomicLine *cursor = nullptr;
     if (kind == TaskKind::Alloc) {
+#if PTO_FDWIC_SHARED_MAP
+        if (!IsSharedAllocCandidate(
+                worker.block_id, worker.lane, task_id
+            )) {
+            return outcome;
+        }
+        cursor =
+            &state->shared_map.shared_alloc_cursor
+                [task_id % kSharedAllocCursorLanes]
+                [task_id & kSharedAllocCursorShardMask];
+#else
         cursor = &state->alloc_cursor[task_id % kCursorShards];
+#endif
     } else {
         // Mirror MixedKernels::to_active_mask(), core_mask(), popcount(),
         // lane_active(), and self->role routing inside the real Claim span.
@@ -661,6 +695,23 @@ PA_DEVICE void RecordClaimOutcome(LocalStats &stats, TaskKind kind, const ClaimO
         ++stats.result.wins[KindIndex(kind)];
     }
 }
+
+#if PTO_FDWIC_SHARED_MAP
+template <typename Ops>
+PA_DEVICE bool ValidateSharedAllocOwnerClaim(
+    PA_GM SchedulerState *state, LocalStats &stats, uint32_t task_id,
+    const ClaimOutcome &claim
+) {
+    if (!claim.attempted || claim.won) {
+        return true;
+    }
+    // 固定 owner 在同一 cursor 上按本地 task_id 递增回放；attempted loser
+    // 只能来自继承旧状态或越序推进。发布 fatal，不能把永久缺少完成者的
+    // task 当成正常 Replay。
+    SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+    return false;
+}
+#endif
 
 template <typename Ops, bool Profile>
 PA_DEVICE bool BuildWinner(
@@ -1705,6 +1756,16 @@ PA_DEVICE bool SubmitCallbackTask(
         (claim.won ? kClaimWon : 0U) | (claim.attempted ? kClaimAttempted : 0U),
         Kind == TaskKind::Alloc ? 1U : 0U
     );
+
+#if PTO_FDWIC_SHARED_MAP
+    if constexpr (Kind == TaskKind::Alloc) {
+        if (!ValidateSharedAllocOwnerClaim<Ops>(
+                state, stats, task_id, claim
+            )) {
+            return false;
+        }
+    }
+#endif
 
 #if PTO_FDWIC_SHARED_MAP
     // fresh Output 的返回值是 task/slot 符号，不依赖哪个 worker 获胜。

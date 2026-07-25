@@ -79,6 +79,16 @@ constexpr uint32_t kAivWorkers = 64;
 constexpr uint32_t kWorkers = kAicWorkers + kAivWorkers;
 constexpr uint32_t kRuntimeMaxWorkers = 108;
 constexpr uint32_t kCursorShards = 4;
+// 参考 shared 实现把 Alloc cursor 拆成 3 条物理 lane、每条 8 个 shard。
+// standalone 先只迁移这组 Claim 访问拓扑；cube/vector 和 private Alloc
+// 继续保留生产基线的 4-shard prefix，避免把多项 cursor 实验混在一起。
+constexpr uint32_t kSharedAllocCursorLanes = 3;
+constexpr uint32_t kSharedAllocCursorShards = 8;
+constexpr uint32_t kSharedAllocCursorShardMask = kSharedAllocCursorShards - 1;
+static_assert(
+    (kSharedAllocCursorShards & kSharedAllocCursorShardMask) == 0,
+    "shared Alloc cursor shards must be a power of two"
+);
 // shared 输出 heap 按 task_id 固定分成 8 个物理 shard。首版只做有界
 // 绝对递增分配，不在 shard 内回绕；该常量同时属于 host 地址 oracle。
 constexpr uint32_t kSharedHeapShards = 8;
@@ -801,10 +811,15 @@ struct alignas(64) SharedTensorMapSidecar {
     // 与全局 aggregate vend 独占 cache line，避免不同 winner 的原子更新伪共享。
     AtomicLine shared_heap_cursor[kSharedHeapShards];
     AtomicLine shared_heap_vend;
+    // S4.13 只在 standalone shared sidecar 末尾追加参考实现的
+    // [lane][shard] Alloc Claim cursor。这样既保留现有 production prefix，
+    // 也不移动已经验证过的 region/output/heap 字段；它验证的是竞争拓扑，
+    // 不是参考 DistGlobal 的字节 offset。
+    AtomicLine shared_alloc_cursor[kSharedAllocCursorLanes][kSharedAllocCursorShards];
 #endif
 };
 #if PTO_FDWIC_SHARED_MAP
-static_assert(sizeof(SharedTensorMapSidecar) == 4735680, "shared TensorMap sidecar size changed");
+static_assert(sizeof(SharedTensorMapSidecar) == 4737216, "shared TensorMap sidecar size changed");
 static_assert(
     offsetof(SharedTensorMapSidecar, shared_outputs) == 2113664,
     "shared output table offset mismatch"
@@ -816,6 +831,10 @@ static_assert(
 static_assert(
     offsetof(SharedTensorMapSidecar, shared_heap_vend) == 4735616,
     "shared heap vend offset mismatch"
+);
+static_assert(
+    offsetof(SharedTensorMapSidecar, shared_alloc_cursor) == 4735680,
+    "shared Alloc cursor offset mismatch"
 );
 #else
 static_assert(sizeof(SharedTensorMapSidecar) == 2113664, "private sidecar layout changed");
@@ -1109,8 +1128,9 @@ static_assert(
 // 并非字段级完整镜像。RunConfig、输入 context_lens 与校验结果追加在该跨度之后，
 // 因此测试控制信息不会改变被测字段 offset。
 struct alignas(64) SchedulerState {
-    // 三组四分片 cursor 分别服务 AIC kernel、AIV kernel 和 Alloc；同 task 的
-    // eligible workers 竞争同一 shard，只有旧值小于 task_id 的调用成为 winner。
+    // production prefix 的三组四分片 cursor 分别服务 AIC、AIV 和 private
+    // Alloc；shared Alloc 改用 sidecar 尾部的 [3][8] cursor。真正参与
+    // 同一 cursor 的 worker 以 atomicMax 竞争，旧值小于 task_id 才成为 winner。
     AtomicLine cube_cursor[kCursorShards];
     AtomicLine vector_cursor[kCursorShards];
     AtomicLine alloc_cursor[kCursorShards];

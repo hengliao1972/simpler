@@ -267,6 +267,14 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
         state->shared_map.shared_heap_cursor[shard].value = 0;
     }
     state->shared_map.shared_heap_vend.value = 0;
+    // shared Alloc Claim cursor 与 heap cursor 是两套独立状态。参考实现用
+    // -1 表示该 (lane, shard) 尚未认领任何 task；每轮都必须完整复位，
+    // 不能让上一次运行的高水位把首个候选误判成 loser。
+    for (uint32_t lane = 0; lane < kSharedAllocCursorLanes; ++lane) {
+        for (uint32_t shard = 0; shard < kSharedAllocCursorShards; ++shard) {
+            state->shared_map.shared_alloc_cursor[lane][shard].value = -1;
+        }
+    }
 #endif
     state->heap_window = kHeapWindow;
     state->heap_base = kSyntheticHeapBase;
@@ -330,7 +338,7 @@ inline constexpr size_t ResultBytes() { return sizeof(WorkerResult) * kWorkers; 
 
 inline constexpr size_t SharedSidecarBytes() { return sizeof(SharedTensorMapSidecar); }
 #if PTO_FDWIC_SHARED_MAP
-static_assert(SharedSidecarBytes() == 4735680, "shared TensorMap transfer size changed");
+static_assert(SharedSidecarBytes() == 4737216, "shared TensorMap transfer size changed");
 #else
 static_assert(SharedSidecarBytes() == 2113664, "private TensorMap transfer size changed");
 #endif
@@ -707,6 +715,33 @@ inline void ExpectedTraceTopology(uint32_t worker, int32_t *block_id, int32_t *l
     *block_id = static_cast<int32_t>(vector_id / 2);
     *lane = static_cast<int32_t>(1 + vector_id % 2);
 }
+
+#if PTO_FDWIC_SHARED_MAP
+inline bool ExpectedSharedAllocCandidate(uint32_t worker, uint32_t task_id) {
+    if (worker >= kWorkers || task_id >= kTaskCellCapacity) {
+        return false;
+    }
+    int32_t block_id = -1;
+    int32_t lane = -1;
+    ExpectedTraceTopology(worker, &block_id, &lane);
+    const uint32_t shard = task_id & kSharedAllocCursorShardMask;
+    const int32_t target_lane =
+        static_cast<int32_t>(task_id % kSharedAllocCursorLanes);
+    // standalone 固定 32 个 mixed block，而 shard 仅为 0..7，因此参考
+    // shard%num_blocks 在本拓扑上精确等于 shard；不在热路径引入 GM 读取。
+    return lane == target_lane && block_id == static_cast<int32_t>(shard);
+}
+
+inline uint64_t ExpectedSharedAllocClaims(uint32_t worker, uint32_t batches) {
+    uint64_t claims = 0;
+    for (uint32_t batch = 0; batch < batches; ++batch) {
+        claims += ExpectedSharedAllocCandidate(
+            worker, batch * kTasksPerBatch
+        );
+    }
+    return claims;
+}
+#endif
 
 template <typename ReadRecords>
 inline bool ExportSwimlaneRecords(
@@ -1787,8 +1822,9 @@ inline Metrics Validate(
     const SchedulerState &state, uint32_t run, double host_us, const TraceHeader *trace_header = nullptr
 ) {
     Metrics metrics;
-    // 每个 worker 都回放全部 task。Alloc 由 96 个 worker 全部执行 atomicMax Claim；
-    // 其余 kernel task 只有与 active role 匹配的 AIC 或 AIV 参与 Claim。
+    // 每个 worker 都回放全部 task。shared Alloc 只由参考 [lane][shard]
+    // 映射出的唯一 owner 执行 atomicMax；private Alloc 仍由 96 个 worker
+    // 竞争。其余 kernel task 只有匹配 active role 的 AIC/AIV 参与 Claim。
     const uint32_t batches = state.config.batches;
     const uint32_t task_count = batches * kTasksPerBatch;
     const bool final_barrier_shape_valid =
@@ -1796,8 +1832,14 @@ inline Metrics Validate(
     const auto final_barrier_shape = static_cast<FinalBarrierShape>(state.config.final_barrier_shape);
     const uint64_t expected_submits = static_cast<uint64_t>(kWorkers) * task_count;
     const uint64_t expected_claims =
-        static_cast<uint64_t>(batches) * (kWorkers + kAicWorkers + kAivWorkers + kAicWorkers + kAivWorkers);
-    // 上式依次对应 Alloc、QK、SF、PV、UP 的 active worker 数，默认 256 batch 时为 73728。
+        static_cast<uint64_t>(batches) *
+#if PTO_FDWIC_SHARED_MAP
+        (1U + kAicWorkers + kAivWorkers + kAicWorkers + kAivWorkers);
+    // shared 依次为唯一 Alloc owner、QK、SF、PV、UP；b256 为 49,408。
+#else
+        (kWorkers + kAicWorkers + kAivWorkers + kAicWorkers + kAivWorkers);
+    // private 保留 96 路 Alloc 竞争；b256 为 73,728。
+#endif
 
     // 聚合量分为调度核心计数、kernel 分布、前端操作数和最终状态四组，便于定位语义偏差。
     uint64_t first_submit = UINT64_MAX;
@@ -1865,6 +1907,7 @@ inline Metrics Validate(
     bool frontend_worker_counts_ok = true;
     bool final_worker_state_ok = true;
     bool worker_checksums_ok = true;
+    bool claim_worker_counts_ok = true;
 #if !PTO_FDWIC_SHARED_MAP
     uint64_t private_logical_map_signature = 0;
 #endif
@@ -2054,6 +2097,19 @@ inline Metrics Validate(
         submits += result.submits;
         claims += result.claim_attempts;
         wins += result.claim_wins;
+#if PTO_FDWIC_SHARED_MAP
+        const uint64_t expected_alloc_claims =
+            ExpectedSharedAllocClaims(index, batches);
+        claim_worker_counts_ok &=
+            result.claim_attempts ==
+                static_cast<uint64_t>(batches) * 2U +
+                    expected_alloc_claims &&
+            result.wins[static_cast<uint32_t>(TaskKind::Alloc)] ==
+                expected_alloc_claims;
+#else
+        claim_worker_counts_ok &=
+            result.claim_attempts == static_cast<uint64_t>(batches) * 3U;
+#endif
         if (result.claim_wins != 0) ++winning_workers;
         max_worker_wins = std::max(max_worker_wins, result.claim_wins);
         heap_guards += result.heap_guards;
@@ -2320,6 +2376,13 @@ inline Metrics Validate(
     );
     Expect(submits == expected_submits, "replay count is workers * tasks", &metrics);
     Expect(claims == expected_claims, "Claim attempt count matches PA topology", &metrics);
+    Expect(
+        claim_worker_counts_ok,
+        kCompiledTensorMapMode == TensorMapBuildMode::Shared
+            ? "shared per-worker Alloc Claim attempts match 24 owners"
+            : "private per-worker Claim attempts retain all-worker Alloc",
+        &metrics
+    );
     Expect(wins == task_count, "exactly one winner per task", &metrics);
     Expect(
         wins_by_kind[0] == batches && wins_by_kind[1] == batches && wins_by_kind[2] == batches &&
@@ -2613,23 +2676,58 @@ inline Metrics Validate(
         &metrics
     );
 
-    // 三类 Claim cursor 各有四个 shard；按 task_id 重新推导每个 shard 应停留的最后任务。
+    // cube/vector 与 private Alloc 保留四个 shard；shared Alloc 按参考
+    // [lane=task%3][shard=task&7] 重新推导每条高水位的最终 task。
     int64_t expected_cube[kCursorShards] = {-1, -1, -1, -1};
     int64_t expected_vector[kCursorShards] = {-1, -1, -1, -1};
+#if PTO_FDWIC_SHARED_MAP
+    int64_t expected_shared_alloc[kSharedAllocCursorLanes][kSharedAllocCursorShards];
+    for (uint32_t lane = 0; lane < kSharedAllocCursorLanes; ++lane) {
+        for (uint32_t shard = 0; shard < kSharedAllocCursorShards; ++shard) {
+            expected_shared_alloc[lane][shard] = -1;
+        }
+    }
+#else
     int64_t expected_alloc[kCursorShards] = {-1, -1, -1, -1};
+#endif
     for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
         const TaskKind kind = static_cast<TaskKind>(task_id % kTasksPerBatch);
-        int64_t *cursors = kind == TaskKind::Alloc
-            ? expected_alloc
-            : (kind == TaskKind::Qk || kind == TaskKind::Pv ? expected_cube : expected_vector);
-        cursors[task_id % kCursorShards] = task_id;
+        if (kind == TaskKind::Alloc) {
+#if PTO_FDWIC_SHARED_MAP
+            expected_shared_alloc[task_id % kSharedAllocCursorLanes]
+                                 [task_id & kSharedAllocCursorShardMask] = task_id;
+#else
+            expected_alloc[task_id % kCursorShards] = task_id;
+#endif
+        } else {
+            int64_t *cursors =
+                kind == TaskKind::Qk || kind == TaskKind::Pv
+                    ? expected_cube
+                    : expected_vector;
+            cursors[task_id % kCursorShards] = task_id;
+        }
     }
     bool cursors_ok = true;
     for (uint32_t shard = 0; shard < kCursorShards; ++shard) {
         cursors_ok &= state.cube_cursor[shard].value == expected_cube[shard];
         cursors_ok &= state.vector_cursor[shard].value == expected_vector[shard];
+#if PTO_FDWIC_SHARED_MAP
+        // shared 改用 sidecar [3][8] 后，production-prefix alloc[4] 必须保持
+        // 初始化值，防止旧路径被意外继续访问而未被最终状态发现。
+        cursors_ok &= state.alloc_cursor[shard].value == -1;
+#else
         cursors_ok &= state.alloc_cursor[shard].value == expected_alloc[shard];
+#endif
     }
+#if PTO_FDWIC_SHARED_MAP
+    for (uint32_t lane = 0; lane < kSharedAllocCursorLanes; ++lane) {
+        for (uint32_t shard = 0; shard < kSharedAllocCursorShards; ++shard) {
+            cursors_ok &=
+                state.shared_map.shared_alloc_cursor[lane][shard].value ==
+                    expected_shared_alloc[lane][shard];
+        }
+    }
+#endif
     Expect(cursors_ok, "all sharded Claim cursors reach their exact final task", &metrics);
 
     if (state.config.profile_phases != 0) {
