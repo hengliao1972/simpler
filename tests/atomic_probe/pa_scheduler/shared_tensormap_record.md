@@ -5,7 +5,7 @@
 在 A5 FDWIC runtime 中实现的 shared TensorMap 方案，并与当前分支 standalone
 方案比较。本文用于后续开发决策，不表示目标分支已经合入，也不把分支文档中的
 实验记录自动当成当前分支的性能结论；当前分支 S0～S4.14b 的保留结果及
-S4.15a 的正确性成立、性能否决记录另记于第 15 节。当前有效 shared
+S4.15/S4.16 正确性成立、性能否决记录另记于第 15 节。当前有效 shared
 性能基线为已撤销 S4.15a 源码的 `319077a9`，其运行行为回到
 `ee42b8c1`；继续开发和验收的后端范围固定为 CPU/CCEC。
 
@@ -3872,7 +3872,7 @@ outputs/perf_clock_pair_bab00e30_vs_ee42b8c1_20260725_171005/
 
 #### 旧实验只能作为弱先验
 
-当前 S4.16 候选回到 shared Vector，但不能用旧实验替代当前单变量验证。本仓
+当时的 S4.16 候选回到 shared Vector，但不能用旧实验替代该次单变量验证。本仓
 `2e92da17` 记录的旧 A5 sweep 把 Cube、Vector、Alloc 三类 cursor
 一起选择 `G=1/4/8/16`，且以物理容量 16、运行时 mask 和同一个
 AICore ELF 比较四档；它不是当前 shared-only sidecar 上的静态
@@ -3884,7 +3884,7 @@ Vector 构建。旧 standalone 中 `G=16-G=8` 的配对中位数为
 参考分支同样不是独立证据：`e49f73a3` 同时改变三类 cursor 和多项
 shared 提交流程，`0350b558` 将 Vector 从 8 改到 16 时又引入
 `alloc_cursor[3][8]` 并删除 shared completion frontier。参考实现与旧
-sweep 只证明十六分片形态具备可实现性，不证明当前 shared Vector
+sweep 只证明十六分片形态具备可实现性，不证明该次 shared Vector
 `8→16` 的净收益。
 
 #### S4.16a 只建立十六条物理线的临时布局控制
@@ -4113,6 +4113,82 @@ outputs/pa_scheduler_shared_swimlane_20260725_182035_2773375/ccec/
 
 b1 的 Vector task 只有 2/4，它们在 `%8` 和 `%16` 下都命中 shard 2/4，
 所以这份 b1 raw 和终态不能单独证明后八条线已启用。active16 的地址
-语义由 CPU 定向测试和 b256 逐调用 oracle 证明；后续正式 b256 配对
-还必须再次通过十六条线终态和全部业务断言。当前只完成 S4.16b
-正确性，尚无冻结性能结果。
+语义由 CPU 定向测试和 b256 逐调用 oracle 证明；随后的正式 b256
+配对也再次通过十六条线终态和全部业务断言。
+
+#### S4.16b 第一层性能否决与整体回退
+
+正确性提交 `2e7a0c73` 的 perf-clock 冻结件为：
+
+```text
+outputs/perf_clock_freeze_2e7a0c73_20260725_182454/
+```
+
+冻结件保持 S4.16a 的 1,011,858,816B split state；kernel `.text`
+为 129,080B、
+`331daafefa3dcb18c047a6333da797caafdfc48f7d1cc78ea3e33b0c39966a15`，
+`.rodata` 为 288B、
+`239e997707a3090248a65626afca3cfbec89793c703ea05461bfb02789722ded`。
+原生 manifest 与提取执行段前后的原始 ELF 哈希均通过校验。
+
+第一层使用 S4.16a `e719cd17` 为 base、S4.16b `2e7a0c73` 为
+candidate，继续按预登记的 device0、b256、`real-compute 6,28,4,1`、
+two-16、PMU off 和六区组 ABBA/BAAB。差值为 S4.16b 减 S4.16a：
+
+| 区组 | 差值（us） | 差值（%） | 方向 |
+| ---: | ---: | ---: | --- |
+| 1 | +0.2985 | +0.0127 | S4.16b 更慢 |
+| 2 | +12.2665 | +0.5206 | S4.16b 更慢 |
+| 3 | -2.0840 | -0.0883 | S4.16b 更快 |
+| 4 | +3.2035 | +0.1364 | S4.16b 更慢 |
+| 5 | +1.7325 | +0.0734 | S4.16b 更慢 |
+| 6 | +7.6325 | +0.3247 | S4.16b 更慢 |
+| 中位数 | **+2.4680** | **+0.1049** | **仅 1/6 更快** |
+
+证据位于：
+
+```text
+outputs/perf_clock_pair_2e7a0c73_vs_e719cd17_20260725_182506/
+```
+
+独立 audit 对 28 个进程逐日志复核：每个进程 42 条断言全部通过，
+SYS_CNT 与 TSV 精确一致，Claim 固定 73,728、active worker 固定 96、
+RingBp 和 CAS retry 均为 0，依赖签名固定
+`b7d985d6edb07078`，四类 kernel 各 256 次。候选的 fanin load 中位数
+比 base 多 548.5 次，但该计数受到达时序影响，只作为伴随诊断，不把
+`+0.1049%` 因果归给某一类 load。
+
+该结果同时命中预登记的两条第一层失败条件：只有 `0～3/6` 区组更快，
+且配对中位数 `>=0`。因此不追加第二轮六区组，也不执行相对
+`319077a9` 的第二层净收益配对；不能因为 S4.16a 单独为
+`-0.5136%` 就留下临时容量控制。
+
+S4.16a/S4.16b 的源码、ABI 和测试已整体撤销。回退后对
+`common/pa_model.h`、`common/host_support.h`、
+`common/test_shared_tensor_map_ring.cpp`、
+`common/test_shared_vector_claim_cursor.cpp` 和 `cpu/build.sh` 执行
+`git diff --exit-code 319077a9 -- ...` 无差异，当前恢复：
+
+```text
+shared_vector_cursor capacity = 8
+shared_vector_cursor active   = 8
+shared sidecar                = 4,736,192B
+CPU non-split state           = 1,011,852,160B
+CCEC split state              = 1,011,858,304B
+```
+
+回退后再次用 `/usr/bin/g++` 完整重建并执行 CPU shared perf-clock：
+全部独立自测和 b1 的 42 条调度/业务断言通过。随后用本机 CANN 9.1
+串行重建 CCEC shared perf-clock，manifest 严格校验通过；只读复制
+kernel 后按 `readelf` 偏移用 `dd` 提取执行节，原始 ELF 提取前后
+SHA256 均为
+`77dd7f2eef6ac4daf220f166b0d0aef3181478eb2d2b51255ebf1f2d05fb4df6`。
+回退件与重建 `319077a9` 冻结基线的执行节逐字节一致：
+
+```text
+.text   129,080B  90f58e5715112e30f2f57d768ed257580c96ccc187d0c9b7fa4d6a1e9b05fd26
+.rodata     288B  239e997707a3090248a65626afca3cfbec89793c703ea05461bfb02789722ded
+```
+
+S4.16 的正确性提交、冻结件和负结果保留用于后续决策，但不属于当前
+运行布局或性能收益。

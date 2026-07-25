@@ -272,16 +272,16 @@ S4.15a 曾仿照上述拆分方法，把 shared Cube 四分片迁到 sidecar
 该候选由 `319077a9` 回退；`319077a9` 回退后的冻结基线布局与
 S4.14b `ee42b8c1` 一致。
 
-当前候选 S4.16 已完成测量前预登记。S4.16a 已把 shared Vector
+S4.16 已按测量前预登记完成。S4.16a 曾把 shared Vector
 物理容量从 8 扩成 16，active 仍为 8，
 用来量化尾增 512B 带来的 state/GM/静态布局整体成本；它只是临时
 布局控制，不单独长期保留。CPU shared/private、CCEC shared/private
 构建和 A5 shared b1 已闭合正确性；相对重建 `319077a9` 的冻结
 六区组配对为 4/6 更快、中位数 `-12.1595us/-0.5136%`。该布局成本
-结果不单独决定保留或取消下一步。S4.16b 已在相同地址、容量和 state
-下只把 active 从 8 改为 16，并闭合 CPU/CCEC/A5 b1 正确性，尚未
-冻结或比较性能。只有 S4.16b 相对 S4.16a、再相对 `319077a9`
-的两级严格配对都通过，才保留整套改动，否则整体回退。
+结果没有取消下一步。S4.16b 随后在相同地址、容量和 state 下只把
+active 从 8 改为 16，并闭合正确性；但相对 S4.16a 仅 1/6 更快、
+中位数 `+2.468us/+0.1049%`，第一层即失败。因此没有追加第二轮，
+也没有执行相对 `319077a9` 的第二层，整套 S4.16 已回退。
 
 完整历史证据和互斥判据见 `shared_tensormap_record.md`。后续 shared
 TensorMap 开发与阶段门禁固定覆盖 CPU/CCEC。
@@ -334,25 +334,24 @@ ASan/UBSan。CPU b1、CPU b256 的完整调度断言和 CCEC private 三镜像�
 S3.2a 在 S3.1 的 4,735,104B output table 尾部追加 8 条 cache-line
 heap cursor 和 1 条 aggregate vend，因此 `SharedTensorMapSidecar`
 在 S4.9 为 4,735,680B；S4.14a 再在尾部追加 8 条物理 shared Vector
-Claim cursor，S4.14b 已启用全部 8 条。S4.16a 又在数组尾部追加
-8 条临时 inactive 物理线，S4.16b 当前已启用全部十六条，sidecar
-仍为 4,736,704B，热路径使用 `task_id%16`。当前 shared
-`SchedulerState` 的 CPU
-非 split 布局为 1,011,852,672B，CCEC split 布局为
-1,011,858,816B；sidecar
+Claim cursor，S4.14b 已启用全部 8 条。S4.16a/S4.16b 曾在数组
+尾部追加并启用另外 8 条，但因性能门槛失败已整体撤销。当前 sidecar
+恢复为 4,736,192B，热路径使用 `task_id%8`；当前 shared
+`SchedulerState` 的 CPU 非 split 布局为 1,011,852,160B，
+CCEC split 布局为 1,011,858,304B；sidecar
 位于 standalone 控制区和 `results` 之后，不移动 `WorkerState`、
 `RunConfig` 或既有结果字段。S4.15a 历史候选曾在末尾追加 512B
 Cube cursor，但已因性能门槛未通过而撤销，不属于当前传输布局。
 
-S4.16a 的历史布局保持
+S4.16a 的历史布局曾保持
 `shared_vector_cursor` 起点 4,735,680B、前八条线地址和热路径
 `task_id%8` 不变，只在数组尾部追加八条 inactive 物理线。
 sidecar 为 4,736,704B，CPU non-split/CCEC split `SchedulerState`
 分别为 1,011,852,672B/1,011,858,816B；后八条线必须零 attempted
-且终值为 -1。当前 S4.16b 在完全相同布局中启用全部十六条线，
-b256 每线 2,048 次 attempted。上述 ABI 已由 host/device 大小握手、
-CPU 回放和 CCEC manifest 实际校验；S4.16b 仍是性能配对前候选，
-不是已保留优化。
+且终值为 -1。S4.16b 在完全相同布局中启用全部十六条线，b256
+每线 2,048 次 attempted。上述 ABI 和语义均实际验收通过，但
+S4.16b 第一层性能门槛失败；这些数字只属于历史候选，不是当前传输
+布局。
 
 每 task 最多八个 fresh output，以 16B
 `FdwicOutputRef` 表达 `(producer_task_id, output_slot)`，返回句柄为
@@ -1752,21 +1751,21 @@ ClockBaseline，并继续以逐核容量、调用数、总记录数和 `dropped=
 `64 * 96 = 6,144` bytes。split ELF 另预留 AIC/AIV 两个 role-specific
 block-local runtime state，每个精确 1,664 bytes、最终 section 合计
 3,328 bytes；它们不属于 GM `SchedulerState`。以上 `SchedulerState` 数字
-是 private 模式；当前 S4.16b 候选的 shared sidecar 为
-4,736,704 bytes，
+是 private 模式；当前回退后的 S4.14b shared sidecar 为
+4,736,192 bytes，
 故 CPU non-split/CCEC split 总大小分别为
-1,011,852,672/1,011,858,816 bytes；既有 production prefix 和
-standalone 控制字段 offset 不变。S4.15a 历史候选虽然也恰为
-4,736,704B，但末尾 512B 当时是 Cube cursor，不能与当前
-`shared_vector_cursor[8..15]` 混用。S4.9 的
+1,011,852,160/1,011,858,304 bytes；既有 production prefix 和
+standalone 控制字段 offset 不变。S4.15a/S4.16 历史候选都曾得到
+4,736,704B，但末尾 512B 分别是 Cube cursor 和
+`shared_vector_cursor[8..15]`，且均已撤销。S4.9 的
 4,735,680B、历史 S2.5 的 2,113,664B 和 S3.1 的 4,735,104B 也都
 不是当前 shared 构建的传输或分配口径。
 
 S4.16a 的 host/device `sizeof(SchedulerState)` 握手、manifest
 校验和相对重建 `319077a9` 的正式 b256 六区组配对已经完成。不能因
 字节数碰巧与 S4.15a 相同就混用历史产物；两份当前冻结件及配对路径
-见 `shared_tensormap_record.md`。S4.16b 沿用相同大小并已闭合
-CPU/CCEC/A5 b1 正确性，尚未冻结性能 ELF。
+见 `shared_tensormap_record.md`。S4.16b 沿用相同大小并闭合正确性，
+但第一层性能门槛失败；当前源码和传输大小均已恢复 S4.14b。
 
 独立的 64 bytes PMU 配置和 64 bytes winner workload 配置各占一条
 cache line；二者都位于完整生产 DistGlobal 镜像之后，生产 DistGlobal/

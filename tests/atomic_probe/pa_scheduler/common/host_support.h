@@ -268,8 +268,7 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     }
     state->shared_map.shared_heap_vend.value = 0;
     // shared Vector Claim cursor 与 heap cursor 是两套独立状态；-1 表示
-    // 尚未 Claim 任一 SF/UP task。S4.16b 会启用全部十六条物理线，
-    // 每轮仍逐线完整复位，避免继承旧高水位。
+    // 尚未 Claim 任一 SF/UP task。每轮完整复位，避免继承旧高水位。
     for (uint32_t shard = 0; shard < kSharedVectorCursorCapacity; ++shard) {
         state->shared_map.shared_vector_cursor[shard].value = -1;
     }
@@ -336,7 +335,7 @@ inline constexpr size_t ResultBytes() { return sizeof(WorkerResult) * kWorkers; 
 
 inline constexpr size_t SharedSidecarBytes() { return sizeof(SharedTensorMapSidecar); }
 #if PTO_FDWIC_SHARED_MAP
-static_assert(SharedSidecarBytes() == 4736704, "shared TensorMap transfer size changed");
+static_assert(SharedSidecarBytes() == 4736192, "shared TensorMap transfer size changed");
 #else
 static_assert(SharedSidecarBytes() == 2113664, "private TensorMap transfer size changed");
 #endif
@@ -2619,15 +2618,14 @@ inline Metrics Validate(
         &metrics
     );
 
-    // private 三类 Claim cursor 均为 production-prefix 四分片。S4.16b
-    // shared Vector 在 S4.16a 的同址容量16布局中启用全部十六条；
-    // Cube/Alloc 保持不变。逐 task 重新推导每条 cursor 的最终高水位。
+    // private 三类 Claim cursor 均为 production-prefix 四分片。S4.14b
+    // shared Vector 启用 sidecar 的全部八条物理线；Cube/Alloc 保持
+    // 不变。逐 task 重新推导每条物理 cursor 的最终高水位。
     int64_t expected_cube[kCursorShards] = {-1, -1, -1, -1};
 #if PTO_FDWIC_SHARED_MAP
-    int64_t expected_vector[kSharedVectorCursorCapacity];
-    for (uint32_t shard = 0; shard < kSharedVectorCursorCapacity; ++shard) {
-        expected_vector[shard] = -1;
-    }
+    int64_t expected_vector[kSharedVectorCursorCapacity] = {
+        -1, -1, -1, -1, -1, -1, -1, -1
+    };
 #else
     int64_t expected_vector[kCursorShards] = {-1, -1, -1, -1};
 #endif
