@@ -4192,3 +4192,202 @@ SHA256 均为
 
 S4.16 的正确性提交、冻结件和负结果保留用于后续决策，但不属于当前
 运行布局或性能收益。
+
+### 2026-07-25：S4.17 shared `WorkerState` 热控制字段前置预登记
+
+S4.16 回退后，当前有效运行身份是 `bf7a7076`，其源码行为与
+`319077a9` 的 S4.14b 一致。下一步不继续扩大 cursor 分片，也不叠加
+Alloc cursor 迁址、output writer 去 RMW 或 descriptor 提前发布。
+S4.17 只验证参考实现 `deb2dfc3` 中一个可以独立抽出的布局假设：
+shared 模式把高频访问的 worker 热控制字段移到固定头部，private 模式
+保持现有 ABI 逐字节不变。
+
+当前 `WorkerState` 的关键布局为：
+
+| 字段 | 当前 offset |
+| --- | ---: |
+| `local_index` | 20B |
+| `heap_next` | 24B |
+| `map` | 32B |
+| `slots` | 823,360B |
+| `occupied_count` | 842,656B |
+| `owned_total` | 842,660B |
+| `swimlane_last_cycle` | 842,664B |
+| `payloads` | 842,688B |
+
+`DrainReady()` 在每次逻辑 Submit 开头都会先读 `occupied_count`；b256
+固定执行 `96 × 1280 = 122,880` 次。当前该字段与 `local_index` 相距
+约 823KiB，而 `occupied_count == 0` 又是最常见的快速返回条件之一。
+参考实现把这些控制字段放在 map 前方，说明这不是凭空创造的新接口；
+但参考实现还同时删除 shared worker 中的 private map、扩大 ring 并
+改变发布协议，这些变化不属于本轮。
+
+S4.17 的 shared 候选布局预先固定如下：
+
+| 字段 | 候选 offset | 相对当前 |
+| --- | ---: | ---: |
+| `local_index` | 20B | 0 |
+| `heap_next` | 24B | 0 |
+| `occupied_count` | 32B | -842,624B |
+| `owned_total` | 36B | -842,624B |
+| `swimlane_last_cycle` | 40B | -842,624B |
+| `map` | 48B | +16B |
+| `slots` | 823,360B | 0 |
+| `payloads` | 842,688B | 0 |
+
+计算依据是 `sizeof(TensorMap) == 823,312B`：`48 + 823,312 =
+823,360`，因此 shared 模式的 `map` 后不再需要原来的 16B
+`slot_padding`；四个 `LocalSlot` 结束于 842,656B，原来位于此处的
+16B 控制字段迁走后，以 32B `payload_padding` 保持 payload 起点不变。
+候选必须继续满足：
+
+- `sizeof(WorkerState) == 9,231,296B`；
+- shared sidecar、CPU/CCEC `SchedulerState`、host-device 传输长度均不变；
+- `slots`、`payloads`、task/cursor/frontier/sidecar 的 offset 均不变；
+- shared worker 中暂时无用的 private `TensorMap` 仍然保留，本轮不借机
+  缩减 state；
+- shared 构建身份版本从 v4 推进到 v5，拒绝总大小相同但字段解释不同的
+  新旧 host/kernel 混用；该握手发生在首个 Submit 之前；
+- private 模式字段顺序、padding、所有 offset、ABI v4 和运行行为不变；
+- Claim 地址、分片数、atomic 次数、winner、fanin、heap、依赖和
+  kernel 业务逻辑均不变。
+
+这是一项 shared-only 静态布局实验。即使获得墙钟收益，也只能命名为
+“`WorkerState` 热控制字段前置整体收益”，不能仅凭结果断言收益一定
+来自某一条 cache line、I-cache、页映射或单次 load 延迟。CCEC 可能因
+结构体常量 offset 改变而生成不同指令编码，这同样属于候选整体。
+
+#### S4.17 正确性门槛
+
+实现后先以模式化 `static_assert` 锁死上述 shared offset，并继续锁死
+private 的现有 offset。随后依次验证：
+
+1. 用 `/usr/bin/g++` 重建 CPU shared，运行独立布局/协议测试和 b1、
+   b256 完整回放；42 条业务断言、96 个 active worker、依赖签名
+   `b7d985d6edb07078`、QK/SF/PV/UP 各 256 次、三类 placement 总数及
+   终态 `occupied_count=0` 必须闭合。CPU 线程调度可能产生 RingBp，
+   不能把设备历史值 0 错当成 CPU 正确性门槛；
+2. 重建 CPU private 并运行 b1，确认 private 的 production-prefix
+   路由、状态大小和全部业务断言未变；
+3. 串行重建 CCEC private/shared 构建身份并严格校验 manifest，禁止
+   多个变体并发覆盖同一输出目录；
+4. A5 shared b1 perf-clock 与合并 atomic 泳道只作为正确性证据，
+   atomic raw 必须 0 丢失，所有协议和业务 oracle 必须通过；
+5. 任一语义、ABI、manifest 或设备断言失败，直接撤销候选，不进入
+   b256 正式性能取数。
+
+#### S4.17 性能口径与保留门槛
+
+正式性能只比较 clean shared perf-clock ELF。基线固定使用从
+`319077a9` 重建且未被 `objcopy` 改写的冻结件：
+
+```text
+outputs/perf_clock_freeze_319077a9_rebuild_20260725_180058/
+```
+
+候选冻结时先只读复制 kernel，再按 `readelf` 给出的 section offset
+用 `dd` 提取 `.text/.rodata`；提取前后原始 ELF SHA256 必须一致。
+测试固定为 device0、b256、`real-compute 6,28,4,1`、two-16、PMU off，
+每版先运行 2 个不计入统计的独立进程预热，再执行 6 个交替
+ABBA/BAAB 区组，每版共 12 个正式独立进程。
+
+首轮六区组按以下互斥规则判定，差值统一为候选减基线：
+
+- 任一语义失败、只有 0～3/6 区组更快，或配对中位数百分比 `>= 0`：
+  立即撤销；
+- 6/6 区组更快且配对中位数百分比 `<= -0.2%`：直接保留；
+- 4～5/6 区组更快且中位数为负，或 6/6 更快但中位数落在
+  `(-0.2%, 0)`：再追加 6 个交替区组；
+- 十二区组累计至少 10/12 更快且中位数百分比 `<= -0.2%` 才保留，
+  否则撤销。
+
+当前 S4.14b 的历史正式中位数约 2,357.489us；参考分支
+`2866ad73` 的历史合并泳道全局 X-event span 约 2,540.538us。两者
+来自不同 ELF、不同观测能力和不同时间边界，不能直接相减或宣称
+standalone 已经超过参考实现，只能说明继续做边际实验的价值已经降低。
+如果 S4.17 未达到预登记门槛，standalone 的低风险布局探索到此停止，
+下一阶段转入真实 simpler shared TensorMap 路径，不再为了追求单个
+standalone 数字而重复已否决方向。
+
+#### S4.17 实现与正确性实测
+
+S4.17 已按预登记的 shared-only 布局实现，源码只改动
+`common/pa_model.h`：
+
+- shared 的 `occupied_count/owned_total/swimlane_last_cycle` 分别移动到
+  32/36/40B，`map` 移到 48B；
+- shared 删除 map 后的 16B padding，并以 slots 后的 32B padding 保持
+  `slots=823,360B`、`payloads=842,688B`；
+- `WorkerState=9,231,296B`、shared sidecar、CPU/CCEC state 和传输长度
+  均未改变；
+- private 仍是 `map=32B`、`slot_padding=823,344B`、
+  `occupied_count=842,656B`、`payloads=842,688B`；
+- shared 构建身份为 ABI v5，private 继续为 ABI v4。头部字段、两种
+  padding、热控制、map、slots、payloads 和总大小均有模式化
+  `static_assert`，没有使用 union、零长数组或 packing。
+
+CPU 证据均使用显式 `CXX=/usr/bin/g++` 完整重建，避免用户 GCC 15
+生成本机汇编器不识别的伪指令：
+
+- shared perf-clock 构建中的 PollBatch、shared ordinary-region ring、
+  PrepareMap marker、shared output symbol、no-wrap heap、Vector cursor、
+  Materialize 和 split-finish loser 定向测试全部通过；
+- shared b1/b256 完整回放均通过全部业务断言。b256 为 96 个 active
+  worker、73,728 次 Claim、依赖签名 `b7d985d6edb07078`、四类 kernel
+  各 256 次；CPU 宿主调度产生
+  `EfDrain=572/RingBp=354/FinalDrain=98`，三者精确覆盖 1,024 个
+  kernel，不能把该动态 placement 数当作 A5 性能结论；
+- private perf-clock 重新构建并通过 PollBatch、private TensorMap ring
+  和 b1 全部业务断言，状态仍为 1,007,115,968B；
+- 本用户 `/home/q00473782/.venv` 在按仓库文档设置
+  `PYTHONPATH=$PWD:$PWD/python` 后，四个泳道/PMU 加工测试共 100 项全部
+  通过。第一次未设置项目 `PYTHONPATH` 的调用在 conftest 导入阶段即
+  失败，未进入收集，也未被记作测试证据。
+
+本机 CANN 9.1 下，private/shared 的 swimlane、perf-clock 及
+none/claim/efdrain/materialize/register 五种 submit-PMU 共 14 个 CCEC
+身份严格串行重建；每个目录的 mode、variant、phase 和全部 artifact
+SHA 均通过 manifest `--check --strict`。private perf-clock 的执行节
+与冻结基线逐字节一致：
+
+```text
+.text   125,752B  94017cdbeb758c0710aec30f238b396d217e648581cc5c67f2deaaa14bca79ef
+.rodata     300B  31d12b9797d051f1529d1792055ac9f46449022118990ca65f458e41f09bbfea
+```
+
+shared 候选 perf-clock 的原始 artifact 和执行节为：
+
+```text
+host SHA256    c1d0bb76f13ee6d8dd7d39b2f2d87ba079f8ea8d37402667f373a3bdff4ac912
+kernel SHA256  17c2ca88d5e5240d8ca917e33eca4480427e23b6f833f0f57f0af26b22b6d8a4
+.text          128,824B  598738d3540d162b0e01bed29651458a4dec879fb56adb7dc5be5ea90d913bbb
+.rodata            288B  239e997707a3090248a65626afca3cfbec89793c703ea05461bfb02789722ded
+```
+
+相对 `319077a9`，`.text` 减少 256B 且内容变化，`.rodata` 保持逐字节
+一致。这只能证明 CCEC 为新 offset/ABI 身份生成了不同代码，不能在
+正式配对前据此推导性能方向。
+
+A5 device0 shared b1 的两条正确性证据均通过：
+
+- perf-clock：42 条业务/观测隔离断言闭合，Submit 为 65.249us，
+  `RingBp=0`；
+- 合并 atomic 泳道：Submit 为 81.664us，raw 4,145 条、0 丢失，
+  4,453 次逻辑 atomic 调用闭合为 864 条直接物理记录和 242 条
+  PollBatch 记录，严格排他分析通过。
+
+泳道证据位于：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260725_185913_2807044/ccec/
+```
+
+构建身份还做了双向真实设备负测：
+
+1. S4.17 v5 host 配 `319077a9` v4 kernel；
+2. `319077a9` v4 host 配 S4.17 v5 kernel。
+
+两次都在 0 次 Submit、96 个 worker 均未进入调度时置 `fatal=1`，
+进程退出码为 1；没有先按错误 offset 运行后再依赖崩溃兜底。至此
+S4.17 的源码、ABI、CPU、Python、14 种 CCEC 身份和 A5 b1 正确性门槛
+全部通过，可以形成独立正确性提交；该提交本身不代表性能候选已获保留。
