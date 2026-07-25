@@ -3449,11 +3449,12 @@ clean shared perf-clock ELF，并相对 S4.9 `e8320280` 在 device0 上各预热
 只在绝对中位差 `<0.2%` 且 `5～7/12` 更快时判中性；其他组合均视为
 不适合继续叠加的迁址结果并撤销。这样不会在看到数据后临时放宽“中性”。
 
-S4.14b 仍使用既定六区组门槛：6/6 更快且配对差中位数至少约
-`-0.2%` 才直接保留；4～5/6 或小于 `0.2%` 时追加第二轮；
-0～3/6 或中位数非负则撤销。只有 Vector `4→8` 最终保留后，才相对
-新冻结基线单独测试 Cube `4→8`，再测试 Vector `8→16`。任何一步失败
-都回到上一冻结基线，不能堆叠后再猜收益来源。
+S4.14b 使用互斥六区组门槛：任何语义失败、0～3/6 更快或配对差中位数
+`>=0` 时直接撤销；6/6 更快且中位数 `<=-0.2%` 时直接保留；其余负向
+边界才追加第二轮。合并十二个区组后，仅在至少 10/12 更快且中位数
+`<=-0.2%` 时保留，其他结果全部撤销。只有 Vector `4→8` 最终保留后，
+才相对新冻结基线单独测试 Cube `4→8`，再测试 Vector `8→16`。任何
+一步失败都回到上一冻结基线，不能堆叠后再猜收益来源。
 
 正式六区组结果如下。表中差值均为区组内候选两次均值减去基线两次均值，
 不是把两边各 12 个总体中位数直接相减：
@@ -3501,3 +3502,101 @@ shared 性能基线前移到 `e24e579c`。
 sidecar offset、物理容量、state 大小、初始化、Host 传输和寻址表达式均
 冻结不动。若 S4.14b 相对 S4.14a 通过自身门槛，仍需再相对 S4.9 核对
 最终净收益，避免把迁址容忍和分片变化叠加后只看局部比较。
+
+### 2026-07-25：S4.14b shared Vector cursor 同址八分片候选
+
+#### 唯一运行时变量
+
+S4.14a 已把 sidecar 地址效应单独量清。S4.14b 以 `e24e579c` 为冻结
+基线，只把：
+
+```cpp
+kSharedVectorCursorShards = 4
+```
+
+改为：
+
+```cpp
+kSharedVectorCursorShards = 8
+```
+
+`Claim()` 仍使用同一条
+`task_id % kSharedVectorCursorShards` 表达式。sidecar 字段 offset
+4,735,680B、物理容量 8、`SchedulerState` 大小、Host 初始化和 H2D/D2H
+跨度均不变；private、Cube、Alloc、heap、TensorMap、fanin、completion、
+观察器和构建身份协议也不动。因此候选 perf-clock 相对 S4.14a 的 device
+热路径差异只应来自有效取模范围 4→8。
+
+b256 的总调用和每 task 竞争面保持：
+
+```text
+Vector ClaimMax = 64 AIV × 2 tasks/batch × 256 = 32,768
+全局 ClaimMax = 73,728
+每个 SF/UP = 64 个 attempted、1 个 winner
+```
+
+变化只在跨 task 的物理线分布：四分片时每线 8,192 次，八分片时每线
+4,096 次。单个 task 的 64 个 AIV 仍竞争同一条线，所以不能把本候选描述成
+每 task fan-in 缩小或 atomic 次数消减。
+
+#### 正确性与性能门槛
+
+定向测试同步改为验证 task 2 落 sidecar shard 2、task 14 落 shard 6，
+并对 b256 的每一次 attempted FetchMax 核对 `task_id%8` 实际地址。
+Host 终态 oracle 从 task 序列重新推导八条高水位；旧 prefix Vector 必须
+仍全为 -1，Cube/Alloc 仍为 production-prefix 四分片。
+
+候选提交前必须完成：
+
+- CPU shared 定向测试和 96-worker b1/b256 完整回放；
+- 用户 `.venv` 下 100 项观察工具回归；
+- CCEC private/shared 的 swimlane、perf-clock 和五种 submit-PMU，
+  manifest 全部校验；
+- private device 执行节与既有冻结件一致；
+- A5 shared b1 perf-clock 与 atomic 泳道，Claim 分布和全部业务 oracle
+  闭合。
+
+性能只使用提交后的冻结 shared perf-clock ELF，与 `e24e579c` 做相同
+device0、b256、`real-compute 6,28,4,1`、two-16 配对。首轮六区组
+门槛按以下互斥顺序执行：
+
+- 任何语义失败、0～3/6 更快或配对百分差中位数 `>=0`：直接撤销；
+- 6/6 更快且配对百分差中位数 `<=-0.2%`：直接保留；
+- 其余负向边界，即 4～5/6 且中位数 `<0`，或 6/6 但中位数在
+  `(-0.2%,0)`：追加第二轮六区组。
+
+合并十二个区组后，只在至少 10/12 更快且配对百分差中位数
+`<=-0.2%` 时保留，其他结果全部撤销。
+
+当前正确性证据已经闭合：
+
+- CPU shared 定向测试显式验证 task 2/14 分别落 shard 2/6，b256 每条
+  sidecar 线恰有 4,096 次 attempted；shared b1/b256 完整回放通过；
+- 用户 `/home/q00473782/.venv` 下 100 项 Python 测试通过；
+- CCEC private/shared 的 14 种构建与 manifest 全部通过；shared
+  perf-clock `.text=129,080B`、`.rodata=288B`，与 S4.14a 大小相同；
+- private perf-clock `.text=125,752B`、`.rodata=300B` 的内容 SHA
+  与 `dc22d076` 冻结件逐字节一致；
+- A5 shared b1 perf-clock 为 65.435us，全部语义与真实计算输出 PASS；
+- 最终 atomic 泳道 raw 4,120 条、drop=0，288 条 ClaimMax 仍按
+  Alloc/QK/SF/PV/UP 分为 `96/32/64/32/64`，flags 全为
+  `0x53 return_ready`。
+
+另做了编译确定性审计：从提交 `e24e579c` 重新导出源码并重建
+perf-clock，`.text/.rodata` 与冻结件逐字节一致，证明 CCEC 本轮可复现。
+S4.14b 的 `.rodata` 与 S4.14a 仍逐字节一致，`.text` 大小相同但有
+50,103 个字节位置变化。这不是发现了额外源码业务改动，而是静态常量
+4→8 经内联和链接后引发的编译布局连锁变化。因此正式配对衡量的是
+“生产形态的静态八分片构建”整体效果；即使出现收益，也不能只凭该数字
+把它进一步拆成 atomic 竞争收益与 I-cache/代码布局收益。若需要机制取证，
+可另做同 ELF selector 辅助实验，但不能用带运行时 selector 的绝对时间
+替代静态 perf-clock 定案。
+
+最终源码泳道证据位于：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260725_163417_2671540/ccec/
+```
+
+这些结果只证明八分片实现与观察契约闭合，不提前填写性能结论。必须先提交
+并冻结 clean ELF，再执行上述配对。

@@ -393,8 +393,8 @@ Claim 先根据 task kind 生成 active role，再选择对应 cursor shard：
 - Alloc 使用 production-prefix `alloc_cursor[4]`；
 - QK/PV 使用 production-prefix `cube_cursor[4]`；
 - private SF/UP 使用 production-prefix `vector_cursor[4]`；
-- 当前 S4.14a shared 迁址对照的 SF/UP 使用物理容量 8、active 为 4
-  的 sidecar `shared_vector_cursor[8]`。
+- 当前 S4.14b shared SF/UP 使用 sidecar 中全部 8 个 active shard：
+  `shared_vector_cursor[8]`。
 
 符合 role 的 worker 对 cursor 执行 `atomicMax(task_id)`。返回旧值小于当前
 task id 的唯一竞争者获胜；其他参与者是 attempted loser，不符合 role 的核是

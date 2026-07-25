@@ -604,8 +604,8 @@ PA_DEVICE ClaimOutcome Claim(
     LocalStats &stats
 ) {
     // Claim 在单调 cursor 上执行 atomicMax。private/Cube/Alloc 使用
-    // production-prefix 四分片；S4.14a shared Vector 使用 sidecar 中
-    // active 为4的迁址对照。同一 task 只有观察到旧值更小的竞争者获胜。
+    // production-prefix 四分片；S4.14b shared Vector 使用 sidecar 中
+    // 的八分片 cursor。同一 task 只有观察到旧值更小的竞争者获胜。
     // Alloc 由全部 96 个 worker 竞争；QK/PV 仅 32 个 AIC、
     // SF/UP 仅 64 个 AIV 发 atomicMax。
     ClaimOutcome outcome{false, false, 0, -1};

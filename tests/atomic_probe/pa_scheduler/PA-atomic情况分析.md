@@ -5,9 +5,9 @@
 本文记录 `TestPagedAttentionUnroll::Case1` 在真实 A5 上的 FDWIC AICore
 Submit 路径，供后续继续优化。真实 PA 生产快照日期为 2026-07-18；当前
 保留的生产优化基线为 `2c3dd1e2`，F1 负结果记录提交为 `c93c3666`。
-standalone 实验记录更新至 2026-07-25 的 S4.14a；shared Vector cursor
-四分片迁址已通过冻结 ELF 配对门槛，当前 standalone shared 性能基线为
-`e24e579c`。
+standalone 实验记录更新至 2026-07-25 的 S4.14b 候选；shared Vector
+cursor 四分片迁址已通过冻结 ELF 配对门槛，当前有效性能基线仍为
+`e24e579c`，八分片尚待独立定案。
 
 范围限定为：
 
@@ -2182,7 +2182,7 @@ atomic/泳道/PMU 记录字段。
 QK/SF/PV/UP 各 256 次和相同依赖签名。六个区组的候选减基线分别为
 `-5.184%/-4.908%/-5.875%/-4.949%/-6.096%/-4.872%`，候选
 6/6 更快，配对百分差中位数为 **-5.066%**，绝对差中位数为
-**-164.322us**。它满足测量前写定的“6/6 且不差于 -0.2%”直接保留
+**-164.322us**。它满足测量前写定的“6/6 且 `<= -0.2%`”直接保留
 门槛，无需追加第二轮。
 
 这里能归因的是“保持四分片时，把 shared Vector cursor 搬到 sidecar”
@@ -2202,3 +2202,32 @@ outputs/perf_clock_pair_e24e579c_vs_e8320280_20260725_160507/
 ```
 
 详细源码历史、ABI 和门禁见 `shared_tensormap_record.md` 的 S4.14 节。
+
+#### 7.5.26 S4.14b shared Vector 同址八分片候选
+
+S4.14b 以已保留的 `e24e579c` 为基线，只把
+`kSharedVectorCursorShards` 从 4 改为 8。sidecar 地址、物理容量、
+state 大小、初始化、Host 传输和 `%` 寻址骨架全部不变；private、
+Cube/Alloc 和其他调度协议也不变。
+
+本候选不减少 atomic：b256 仍有 32,768 次 Vector ClaimMax 和 73,728 次
+全局 ClaimMax，每个 SF/UP 仍由 64 个 AIV 竞争同一条 cursor。它只把跨
+task 的每线累计流量从 8,192 次降为 4,096 次。定向测试必须逐调用证明
+FetchMax 地址为 `sidecar[task_id%8]`，完整回放和 A5 则继续证明唯一
+winner、依赖、TensorMap、heap、completion 与真实计算输出不变。
+
+性能门槛在取数前固定且互斥。相对 `e24e579c` 的首轮六个 ABBA/BAAB
+区组：任何语义失败、仅 0～3/6 更快或配对百分差中位数 `>=0` 时直接
+撤销；只有 6/6 更快且中位数 `<=-0.2%` 时直接保留；其余负向边界
+（4～5/6 且中位数 `<0`，或 6/6 但中位数落在 `(-0.2%,0)`）追加
+第二轮。合并十二个区组后，仅在至少 10/12 更快且中位数 `<=-0.2%`
+时保留，其他结果全部撤销。
+
+当前 CPU shared 定向和 b1/b256、Python 100 项、CCEC 14 种构建及
+manifest、A5 shared b1 perf-clock 与 atomic 泳道均通过。定向测试确认
+b256 每条 Vector sidecar 线恰有 4,096 次 attempted；A5 b1 泳道 raw
+4,120 条、drop=0，288 条 ClaimMax 分布仍为 `96/32/64/32/64` 且
+flags 全为 `0x53`。重建 S4.14a 可逐字节复现冻结执行节；S4.14b 与其
+`.rodata` 相同、`.text` 等长，但静态常量变化经 CCEC 优化后有 50,103
+个字节位置变化。因此后续只能把性能差归给“静态八分片构建”的整体效果，
+不能仅凭墙钟再拆成 atomic 竞争与代码布局两部分。当前尚无正式性能结果。

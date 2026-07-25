@@ -2618,9 +2618,9 @@ inline Metrics Validate(
         &metrics
     );
 
-    // private 三类 Claim cursor 均为 production-prefix 四分片。S4.14a
-    // shared Vector 改用物理容量8、active仍为4的 sidecar；Cube/Alloc
-    // 保持不变。逐 task 重新推导每条物理 cursor 的最终高水位。
+    // private 三类 Claim cursor 均为 production-prefix 四分片。S4.14b
+    // shared Vector 启用 sidecar 的全部八条物理线；Cube/Alloc 保持
+    // 不变。逐 task 重新推导每条物理 cursor 的最终高水位。
     int64_t expected_cube[kCursorShards] = {-1, -1, -1, -1};
 #if PTO_FDWIC_SHARED_MAP
     int64_t expected_vector[kSharedVectorCursorCapacity] = {

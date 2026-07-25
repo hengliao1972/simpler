@@ -15,7 +15,7 @@
 - 96 个 worker 各自回放 1,280 次 Submit，共 122,880 次 Submit；
 - Alloc 由 96 个 worker 竞争，QK/PV 由 32 个 AIC 竞争，SF/UP 由 64 个 AIV 竞争；
 - private 使用 4 路 Alloc/cube/vector Claim cursor；当前 shared
-  S4.14a 迁址对照让 Vector 使用物理容量 8、active 仍为 4 的 sidecar，
+  S4.14b 让 Vector 使用 sidecar 中全部 8 个 active shard，
   Alloc/Cube 仍为 4 路；两种模式都执行实际 `atomicMax` Claim；
 - PA 的 TaskArgs、Tensor、TaskPayload、DistSubmitCtx、DistCore/DistGlobal 关键 ABI 布局；
 - tensor tag 扫描、输出 layout、materialize，以及按构建模式选择的 private
@@ -259,7 +259,8 @@ loser 快返和 `3×8` cursor 均已完成独立实验并因没有稳定净收�
 S4.14a 先把 shared Vector cursor 搬到物理容量 8、active 仍为 4 的
 sidecar；相对 S4.9 的冻结 ELF 配对为 6/6 区组更快、百分差中位数
 `-5.066%`，因此当前 standalone shared 性能基线为 `e24e579c`。
-尚未开始同址 `4→8`；详细证据见
+S4.14b 正在相同地址、容量、state 大小和寻址骨架下单独验证 active
+`4→8`；详细证据见
 `shared_tensormap_record.md`。后续 shared TensorMap 开发与阶段门禁固定
 覆盖 CPU/CCEC。
 `--tensormap private|shared` 都会生成对应模式的真实可执行文件；S0 用于禁止
@@ -1714,11 +1715,11 @@ ClockBaseline，并继续以逐核容量、调用数、总记录数和 `dropped=
 `64 * 96 = 6,144` bytes。split ELF 另预留 AIC/AIV 两个 role-specific
 block-local runtime state，每个精确 1,664 bytes、最终 section 合计
 3,328 bytes；它们不属于 GM `SchedulerState`。以上 `SchedulerState` 数字
-是 private 模式；当前 S4.14a shared 迁址对照在尾部另追加精确
+是 private 模式；当前 S4.14b 继续复用 S4.14a 在尾部追加的精确
 4,736,192 bytes 的 sidecar，故 CPU non-split/CCEC split 总大小分别为
 1,011,852,160/1,011,858,304 bytes；既有生产和 standalone 字段 offset
 不变。S4.9 的 4,735,680B、历史 S2.5 的 2,113,664B 和 S3.1 的
-4,735,104B 都不是当前迁址对照的传输或分配口径。
+4,735,104B 都不是当前 shared 构建的传输或分配口径。
 独立的 64 bytes PMU 配置和 64 bytes winner workload 配置各占一条
 cache line；二者都位于完整生产 DistGlobal 镜像之后，生产 DistGlobal/
 DistCore 关键偏移保持不变。

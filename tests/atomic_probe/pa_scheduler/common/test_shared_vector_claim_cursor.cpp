@@ -143,16 +143,16 @@ void TestSharedVectorRouting() {
         "SF Claim issues one FetchMax to the expected sidecar address"
     );
 
-    // S4.14a 是迁址对照，不改变四分片映射：task 14 与 task 2 仍同属
-    // shard 2，只是地址从 production prefix 搬到固定 sidecar。
+    // S4.14b 在相同 sidecar 上把 active 4→8：task 14 改落 shard 6，
+    // task 2 仍落 shard 2，正好锁定新增的取模范围。
     const ClaimOutcome up = Claim<ClaimTestOps>(
         state, *worker, 14, TaskKind::Up, stats
     );
     Check(
         up.attempted && up.won &&
-            state->shared_map.shared_vector_cursor[2].value == 14 &&
-            state->shared_map.shared_vector_cursor[6].value == -1,
-        "sidecar relocation preserves the original four-shard task mapping"
+            state->shared_map.shared_vector_cursor[2].value == 2 &&
+            state->shared_map.shared_vector_cursor[6].value == 14,
+        "active eight-shard routing separates task 2 and task 14"
     );
 
     const ClaimOutcome same_shard = Claim<ClaimTestOps>(
@@ -222,6 +222,7 @@ void TestB256VectorCursorFinalState() {
         -1, -1, -1, -1, -1, -1, -1, -1
     };
     uint32_t attempts_by_worker[kWorkers] = {};
+    uint32_t attempts_by_shard[kSharedVectorCursorCapacity] = {};
     uint32_t winners = 0;
     bool topology_exact = true;
     for (uint32_t task_id = 0;
@@ -241,6 +242,9 @@ void TestB256VectorCursorFinalState() {
             if (claim.attempted) {
                 ++task_attempts;
                 ++attempts_by_worker[worker_id];
+                ++attempts_by_shard[
+                    task_id % kSharedVectorCursorShards
+                ];
                 topology_exact &=
                     ClaimTestOps::last_fetch_max_address ==
                         &state->shared_map.shared_vector_cursor[
@@ -264,9 +268,15 @@ void TestB256VectorCursorFinalState() {
         topology_exact && winners == kMaxBatches * 2U &&
         PrefixVectorUntouched(*state);
     for (uint32_t shard = 0; shard < kSharedVectorCursorCapacity; ++shard) {
+        const uint32_t expected_attempts =
+            shard < kSharedVectorCursorShards
+                ? kMaxBatches * 2U * kAivWorkers /
+                    kSharedVectorCursorShards
+                : 0U;
         exact &=
             state->shared_map.shared_vector_cursor[shard].value ==
-                expected[shard];
+                expected[shard] &&
+            attempts_by_shard[shard] == expected_attempts;
     }
     Check(
         ClaimTestOps::fetch_max_calls ==
@@ -275,7 +285,7 @@ void TestB256VectorCursorFinalState() {
     );
     Check(
         exact,
-        "b256 preserves 64 AIV candidates, one winner, and exact sidecar high watermarks"
+        "b256 preserves 64 AIV candidates, one winner, 4096 attempts per shard, and exact high watermarks"
     );
 
     munmap(worker, sizeof(*worker));
