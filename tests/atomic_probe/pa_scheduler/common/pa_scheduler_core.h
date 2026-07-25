@@ -598,19 +598,53 @@ struct ClaimOutcome {
     int32_t function_id;
 };
 
+#if PTO_FDWIC_SHARED_MAP
+PA_DEVICE bool IsSharedAllocCandidate(
+    int32_t block_id, int32_t lane, uint32_t task_id
+) {
+    static_assert(
+        kCursorShards <= kAicWorkers,
+        "every standalone Alloc cursor shard needs a physical block owner"
+    );
+    if (task_id >= kTaskCellCapacity) {
+        return false;
+    }
+
+    // 参考 shared 实现会把每个 Alloc cursor shard 固定交给一个物理
+    // (block,lane)，从而让同一 cursor 上递增的 task 始终由同一 worker
+    // 按本地回放顺序推进。standalone 当前必须保持生产基线的单层
+    // 4-shard alloc_cursor ABI，不能直接套用参考分支的 [lane][8] cursor
+    // 映射；否则同一 4-shard cursor 会被多个 worker 乱序 atomicMax，
+    // 较早 task 可能在较晚 task 之后到达并失去唯一 winner。
+    const uint32_t shard = task_id % kCursorShards;
+    const int32_t target_block = static_cast<int32_t>(shard);
+    const int32_t target_lane = static_cast<int32_t>(shard % 3U);
+    return block_id == target_block && lane == target_lane;
+}
+#endif
+
 template <typename Ops>
 PA_DEVICE ClaimOutcome Claim(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_id, TaskKind kind,
     LocalStats &stats
 ) {
     // Claim 在四个 shard 的单调 cursor 上执行 atomicMax：同一 task 只有观察到旧值更小的竞争者获胜。
-    // Alloc 由全部 96 个 worker 竞争；QK/PV 仅 32 个 AIC，SF/UP 仅 64 个 AIV 进入真正的 atomicMax。
+    // shared Alloc 每个 shard 固定一个候选 worker；private Alloc 仍由全部
+    // 96 个 worker 竞争。QK/PV 仅 32 个 AIC，SF/UP 仅 64 个 AIV
+    // 进入真正的 atomicMax。
     ClaimOutcome outcome{false, false, 0, -1};
     if (task_id >= kTaskCellCapacity) {
         return outcome;
     }
     PA_GM AtomicLine *cursor = nullptr;
     if (kind == TaskKind::Alloc) {
+#if PTO_FDWIC_SHARED_MAP
+        if (!IsSharedAllocCandidate(
+                worker.block_id, worker.lane, task_id
+            )) {
+            return outcome;
+        }
+#endif
         cursor = &state->alloc_cursor[task_id % kCursorShards];
     } else {
         // Mirror MixedKernels::to_active_mask(), core_mask(), popcount(),
@@ -1705,6 +1739,18 @@ PA_DEVICE bool SubmitCallbackTask(
         (claim.won ? kClaimWon : 0U) | (claim.attempted ? kClaimAttempted : 0U),
         Kind == TaskKind::Alloc ? 1U : 0U
     );
+#if PTO_FDWIC_SHARED_MAP
+    if constexpr (Kind == TaskKind::Alloc) {
+        // 固定 owner 是该 cursor shard 唯一会执行 atomicMax 的 worker，
+        // 且它按本地 task_id 顺序推进；因此 attempted 却未获胜只能表示
+        // cursor 已被越序推进或状态继承。继续当普通 replay 会让本 task
+        // 永远没有 completion owner，必须在首次异常处终止。
+        if (claim.attempted && !claim.won) {
+            SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+            return false;
+        }
+    }
+#endif
 
 #if PTO_FDWIC_SHARED_MAP
     // fresh Output 的返回值是 task/slot 符号，不依赖哪个 worker 获胜。

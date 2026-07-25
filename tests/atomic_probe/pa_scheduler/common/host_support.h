@@ -708,6 +708,29 @@ inline void ExpectedTraceTopology(uint32_t worker, int32_t *block_id, int32_t *l
     *lane = static_cast<int32_t>(1 + vector_id % 2);
 }
 
+#if PTO_FDWIC_SHARED_MAP
+inline uint64_t ExpectedSharedAllocAttempts(
+    uint32_t worker, uint32_t batches
+) {
+    if (worker >= kWorkers) {
+        return 0;
+    }
+    int32_t block_id = -1;
+    int32_t lane = -1;
+    ExpectedTraceTopology(worker, &block_id, &lane);
+    uint64_t attempts = 0;
+    for (uint32_t batch = 0; batch < batches; ++batch) {
+        const uint32_t task_id = batch * kTasksPerBatch;
+        const uint32_t shard = task_id % kCursorShards;
+        const int32_t target_block = static_cast<int32_t>(shard);
+        const int32_t target_lane = static_cast<int32_t>(shard % 3U);
+        attempts +=
+            block_id == target_block && lane == target_lane ? 1U : 0U;
+    }
+    return attempts;
+}
+#endif
+
 template <typename ReadRecords>
 inline bool ExportSwimlaneRecords(
     const TraceHeader &header, const std::string &output_path,
@@ -1787,8 +1810,10 @@ inline Metrics Validate(
     const SchedulerState &state, uint32_t run, double host_us, const TraceHeader *trace_header = nullptr
 ) {
     Metrics metrics;
-    // 每个 worker 都回放全部 task。Alloc 由 96 个 worker 全部执行 atomicMax Claim；
-    // 其余 kernel task 只有与 active role 匹配的 AIC 或 AIV 参与 Claim。
+    // 每个 worker 都回放全部 task。shared Alloc 每个 batch 只让绑定
+    // alloc-cursor shard 的唯一 worker 执行 atomicMax；private Alloc
+    // 仍由 96 个 worker 竞争。其余 kernel task 只有与 active role
+    // 匹配的 AIC 或 AIV 参与 Claim。
     const uint32_t batches = state.config.batches;
     const uint32_t task_count = batches * kTasksPerBatch;
     const bool final_barrier_shape_valid =
@@ -1796,8 +1821,16 @@ inline Metrics Validate(
     const auto final_barrier_shape = static_cast<FinalBarrierShape>(state.config.final_barrier_shape);
     const uint64_t expected_submits = static_cast<uint64_t>(kWorkers) * task_count;
     const uint64_t expected_claims =
-        static_cast<uint64_t>(batches) * (kWorkers + kAicWorkers + kAivWorkers + kAicWorkers + kAivWorkers);
-    // 上式依次对应 Alloc、QK、SF、PV、UP 的 active worker 数，默认 256 batch 时为 73728。
+        static_cast<uint64_t>(batches) *
+#if PTO_FDWIC_SHARED_MAP
+        (1U + kAicWorkers + kAivWorkers + kAicWorkers + kAivWorkers);
+    // shared 依次对应唯一 Alloc 候选、QK、SF、PV、UP，默认
+    // 256 batch 为 49,408 次真实 atomicMax。
+#else
+        (kWorkers + kAicWorkers + kAivWorkers + kAicWorkers + kAivWorkers);
+    // private 的 Alloc 保持 96-worker 竞争，默认 256 batch 为
+    // 73,728 次真实 atomicMax。
+#endif
 
     // 聚合量分为调度核心计数、kernel 分布、前端操作数和最终状态四组，便于定位语义偏差。
     uint64_t first_submit = UINT64_MAX;
@@ -1865,6 +1898,7 @@ inline Metrics Validate(
     bool frontend_worker_counts_ok = true;
     bool final_worker_state_ok = true;
     bool worker_checksums_ok = true;
+    bool claim_worker_counts_ok = true;
 #if !PTO_FDWIC_SHARED_MAP
     uint64_t private_logical_map_signature = 0;
 #endif
@@ -2054,6 +2088,19 @@ inline Metrics Validate(
         submits += result.submits;
         claims += result.claim_attempts;
         wins += result.claim_wins;
+#if PTO_FDWIC_SHARED_MAP
+        const uint64_t expected_alloc_attempts =
+            ExpectedSharedAllocAttempts(index, batches);
+        claim_worker_counts_ok &=
+            result.claim_attempts ==
+                static_cast<uint64_t>(batches) * 2U +
+                    expected_alloc_attempts &&
+            result.wins[static_cast<uint32_t>(TaskKind::Alloc)] ==
+                expected_alloc_attempts;
+#else
+        claim_worker_counts_ok &=
+            result.claim_attempts == static_cast<uint64_t>(batches) * 3U;
+#endif
         if (result.claim_wins != 0) ++winning_workers;
         max_worker_wins = std::max(max_worker_wins, result.claim_wins);
         heap_guards += result.heap_guards;
@@ -2320,6 +2367,13 @@ inline Metrics Validate(
     );
     Expect(submits == expected_submits, "replay count is workers * tasks", &metrics);
     Expect(claims == expected_claims, "Claim attempt count matches PA topology", &metrics);
+    Expect(
+        claim_worker_counts_ok,
+        kCompiledTensorMapMode == TensorMapBuildMode::Private
+            ? "private per-worker Claim attempts retain all-worker Alloc"
+            : "shared per-worker Alloc Claim attempts match fixed shard owners",
+        &metrics
+    );
     Expect(wins == task_count, "exactly one winner per task", &metrics);
     Expect(
         wins_by_kind[0] == batches && wins_by_kind[1] == batches && wins_by_kind[2] == batches &&

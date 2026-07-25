@@ -2483,10 +2483,12 @@ standalone b1 泳道的 QK/SF/PV/UP 分别约
 1. **参考在 shared Alloc 前先做唯一候选过滤。**
    参考实际 Claim 为 49,408 次，精确等于
    `256 + 2×256×32 + 2×256×64`。standalone 为 73,728 次，多出的
-   `24,320 = 256×(96-1)` 全是 Alloc 的非候选竞争；而且这些 actor 还会
-   构造三个 Alloc Output 参数。参考在候选判断失败后立即返回，既不发
-   Claim atomic，也不进入 Materialize/Submit 主体。这是明确可复用的
-   winner-first 优点。
+   `24,320 = 256×(96-1)` 全是 Alloc 的非候选竞争。参考在候选判断失败后
+   立即返回，既不发 Claim atomic，也不进入 Materialize/Submit 主体。
+   但参考的 orchestration 已在调用 `dist_alloc_outputs_impl()` 前构造好
+   三个 Output 参数；standalone 的全员 Alloc 轻构参对应这个调用方成本，
+   不能误写成参考早退一并删除。这项可直接复用的优点首先是内部
+   winner-first 过滤，不是删掉调用方参数。
 
 2. **参考 shared 正常完成不推进全局 frontier。**
    `complete_executed_task()` 只在 private 宏分支调用
@@ -2528,7 +2530,8 @@ standalone b1 泳道的 QK/SF/PV/UP 分别约
 1. shared no-wrap PA 先停止每 task frontier helping，并把 host 断言改为
    “flag 全 ready、frontier 保持初始化”；单独做 CPU/CCEC/A5 和 frozen
    perf-clock 配对；
-2. shared Alloc 增加唯一候选早退，删除 95/96 actor 的 Claim 与构参；
+2. shared Alloc 先只过滤 95/96 actor 的 Claim，保持调用方全员轻构参和
+   现有观察边界；验证后再单独把非候选早退前移到 EfDrain 之前；
 3. 再独立比较 4→14 或分档 ring 深度，不能和 deferred 同时改；
 4. 最后接纯 INPUT deferred resolve，保留 INOUT writer 等待和完整故障门禁。
 
@@ -2624,3 +2627,90 @@ outputs/perf_clock_pair_e8320280_vs_d0042690_20260725_090233/
 不是 first-to-last Submit perf-clock，并且两边 ELF、构参覆盖和执行模型不同。
 它只用于决定下一步优先级：先迁移参考分支已证明的 Alloc 唯一候选早退，
 再单独评估 ring 深度和纯 INPUT deferred resolve，不能把三项一起修改。
+
+### 2026-07-25：S4.10a 先收敛 shared Alloc 的 Claim 候选
+
+#### 为什么没有机械照搬参考的候选公式
+
+参考 `2866ad73` 使用 `alloc_cursor[3 lanes][8 shards]`，其候选是：
+
+```text
+shard = task_id & 7
+target_lane = task_id % 3
+target_block = shard % num_blocks
+```
+
+同一个 `(lane, shard)` cursor 始终由同一物理 worker 按本地 task 顺序
+推进。standalone 为保持当前生产基线 ABI，仍是单层
+`alloc_cursor[4]`。如果只复制 `task_id % 3` 的 lane 规则，同一 4-shard
+cursor 会被不同 worker 推进；快 worker 可能先把后续 task atomicMax 到
+cursor，慢 worker 再处理较早 task 时会观察到 `old >= task_id`，导致较早
+task 永久没有 winner。
+
+因此本阶段保留 4-shard 状态布局，把每个 shard 固定绑定到一个 worker：
+
+| shard | block/lane | standalone worker |
+| ---: | --- | ---: |
+| 0 | block 0 / AIC lane 0 | 0 |
+| 1 | block 1 / AIV0 lane 1 | 34 |
+| 2 | block 2 / AIV1 lane 2 | 37 |
+| 3 | block 3 / AIC lane 0 | 3 |
+
+设备拓扑固定为 32 AIC + 64 AIV，因此热路径直接使用
+`target_block=shard`、`target_lane=shard%3`，不新增 GM `num_blocks`
+读取或动态除法。`static_assert(kCursorShards <= kAicWorkers)` 锁定每个
+cursor 都有物理 block owner。这个映射保留了参考实现真正重要的单调性
+不变量，但没有伪称两边 cursor ABI 已相同。
+
+#### 本小步明确保留和删除的内容
+
+候选判断只放在 shared `Claim()` 的 Alloc 分支内：
+
+- 非候选仍进入 EfDrain 和 Claim span，但 `attempted=false`，不发
+  `ClaimMax`；
+- 唯一候选继续对原 `alloc_cursor[task_id%4]` 执行 atomicMax；
+- 全员仍建立相同 shared output handles、构造三个 Alloc Output 参数、
+  进入 generic finish 并闭合 Materialize/PrepareMap/Register/Submit；
+- `submits`、split-finish 调用次数、PMU 窗口和普通泳道固定记录数不变；
+- private 完全保持 96-worker Alloc 竞争。
+
+固定 owner 按本地顺序执行时必须赢。若出现 `attempted && !won`，说明 cursor
+继承了旧状态或已经被越序推进；把它当普通 replay 会让本 task 永久没有
+completion owner，因此 shared Alloc 在 Claim 记录闭合后立即广播 fatal。
+
+本阶段没有增加 WorkerResult、TraceRecord 或 raw 字段。新增纯 CPU 定向测试
+逐 task 枚举唯一候选、锁定 `[0,34,37,3]` owner 表、验证同 shard 的
+`0→20→40` 连续 Claim 均获胜、非候选不改 cursor，并构造 `20→0` 反例证明
+为什么 candidate loss 必须终止。host 又逐 worker 复算候选次数，防止只看
+全局 49,408 而漏掉 owner 分布错误。
+
+#### 正确性和单轮观测
+
+CPU shared/private strict 构建及 b1/b256 全部 PASS。Claim 次数精确闭合为：
+
+| 模式 | b1 | b256 |
+| --- | ---: | ---: |
+| shared | 193 | 49,408 |
+| private | 288 | 73,728 |
+
+shared b256 相对旧实现删除
+`73,728 - 49,408 = 24,320 = 95×256` 次 Alloc `ClaimMax`；winner、
+四个 cursor 终值、全部 completion、8-shard heap、symbol 8/5/3 计数、
+依赖签名和输出 tile 均不变。CCEC shared/private 的 swimlane 与 perf-clock
+均完成 AIC/AIV 编译、mixed ELF、导出符号和 manifest 门禁。
+
+A5 shared b1 atomic 泳道有 4,026 条 raw 记录、0 drop；其中
+`ClaimMax` 恰为 193 条，普通 Claim/EfDrain/Materialize/PrepareMap/
+Register/Submit 仍各 480 条，证明本小步只删 atomic，没有偷偷改变阶段
+边界。产物位于：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260725_101155_2313002/
+```
+
+A5 shared b256 的一轮普通构建为 3.417ms，perf-clock 为 3.300ms；
+private b256 分别为 3.884ms 和 3.630ms。所有语义门禁通过。这些是构建与
+正确性阶段的单样本，不能与 S4.9 的 12 样本中位数直接相减。当前 shared
+perf-clock `.text=129,336B`，相对 S4.9 的 129,080B 增加 256B；下一提交
+会冻结本阶段 clean ELF，与 `e8320280` 做交错配对后再判断这 24,320 次
+atomic 消减是否转化为稳定墙钟收益。

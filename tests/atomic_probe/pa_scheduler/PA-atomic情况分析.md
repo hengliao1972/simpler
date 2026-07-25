@@ -1937,3 +1937,48 @@ outputs/perf_clock_pair_e8320280_vs_d0042690_20260725_090233/
 
 若未来 shared heap 允许回绕，必须恢复 frontier 或等价
 generation/reclaim 协议；这条保留结论不适用于可回绕实现。
+
+#### 7.5.20 standalone shared Alloc 固定候选消减 ClaimMax
+
+2026-07-25 在 S4.9 no-wrap 基线上继续对照参考 shared 分支。参考使用
+`alloc_cursor[lane][8 shards]`，可按 task 同时选择 lane 与 shard；
+standalone 为保持现有生产 ABI 仍是单层 `alloc_cursor[4]`，不能直接复制
+参考的 `task_id%3` lane 公式，否则同一 cursor 会由不同 worker 乱序推进。
+
+当前 shared 采用“一 shard 固定一 worker”：
+
+```text
+shard 0 -> worker 0   (block 0, AIC)
+shard 1 -> worker 34  (block 1, AIV0)
+shard 2 -> worker 37  (block 2, AIV1)
+shard 3 -> worker 3   (block 3, AIC)
+```
+
+本小步只在 Alloc 的 Claim 内过滤非候选。所有 worker 仍执行 EfDrain、
+保留 Claim 边界、构造三个 Alloc Output 参数、建立 shared symbol 并进入
+generic finish；因此普通泳道、split finish、submit-PMU 和 perf-clock
+边界全部不变。private 仍由 96 worker 竞争。唯一候选若执行 atomicMax
+却未获胜，会立即广播 fatal，禁止把 cursor 越序错误静默解释成 replay。
+
+b256 固定 Claim 由：
+
+| task | 修改前参与核 | 修改后参与核 | 修改后次数 |
+| --- | ---: | ---: | ---: |
+| Alloc | 96 | 1 | 256 |
+| QK | 32 | 32 | 8,192 |
+| SF | 64 | 64 | 16,384 |
+| PV | 32 | 32 | 8,192 |
+| UP | 64 | 64 | 16,384 |
+| 合计 | - | - | **49,408** |
+
+相对原 73,728 次固定 Claim，精确删除 24,320 次 Alloc `ClaimMax`。CPU
+shared/private b1、b256 和逐 worker owner oracle 全部通过；shared/private
+CCEC swimlane、perf-clock 构建及 A5 b1、b256 均通过。shared A5 b1
+atomic raw 有 193 条 `ClaimMax`，与
+`1 + 32 + 64 + 32 + 64` 精确闭合；总 raw 4,026 条、drop=0。其余
+completion、fanin、heap、symbol、writer signature 和计算结果保持原门禁。
+
+本阶段单轮 shared b256 perf-clock 为 3.300ms，当前只能作为正确性样本。
+是否比 S4.9 的冻结中位数 3.243ms 更快或更慢，必须等待 clean ELF 的独立
+进程交错配对，不能用一次运行给出收益结论。当前 `.text` 比 S4.9 增加
+256B，也要与 atomic 消减一起纳入配对解释。
