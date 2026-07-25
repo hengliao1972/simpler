@@ -661,11 +661,15 @@ PA_DEVICE bool BuildWinner(
     // kernel winner 不在 Submit 内立即执行计算，而是把完整 payload 和 fanin 存入自己的私有 ring slot。
     // 后续 EfDrain/背压 drain/最终 drain 在依赖满足后执行它，这正是 PA 的 Submit 与执行解耦点。
     WaitForSlot<Ops, Profile>(state, worker, task_id, stats);
+#if !PTO_FDWIC_SHARED_MAP
+    // private heap_next 是单调 ring 坐标，必须通过 frontier/vend 防止覆盖。
+    // shared S3.2 使用有界 shard cursor 且首版禁止回绕，两种坐标不能混用。
     if (!HeapGuard<Ops, Profile>(
             state, worker, task_id, context.output_bytes, stats
         )) {
         return false;
     }
+#endif
     const int32_t slot_index = FindFreeSlot(worker);
     if (slot_index < 0) {
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
@@ -716,6 +720,12 @@ PA_DEVICE bool WaitForSharedTaskTurn(
             return false;
         }
         if (committed == static_cast<int64_t>(task_id)) {
+            // exact turn 已就绪时仍做一次终止态检查，避免其他 worker 已经
+            // 广播 fatal，而本 winner 继续 reserve/publish。直接走 Ops
+            // 保持这条协议检查不额外扩张 atomic 泳道记录。
+            if (Ops::Load(&state->fatal.value) != 0) {
+                return false;
+            }
             return true;
         }
         if (committed > static_cast<int64_t>(task_id)) {
@@ -1356,12 +1366,65 @@ PA_DEVICE bool FinishCallbackSubmitBody(
     const int32_t function_id = static_cast<int32_t>(ticket.function_id);
     const bool winner = ticket.won != 0;
 
-    // callback 已经返回，finish 只消费稳定的 TaskArgs。该函数既可被
-    // CPU/AscendC/局部 PMU 内联，也可在正式 CCEC 路径由独立 TU 实例化。
-    const uint64_t materialize_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
+#if PTO_FDWIC_SHARED_MAP
+    // shared heap 的物理地址必须与 task 顺序形成确定映射。winner 先取得
+    // committed_tasks==task_id 的 exact turn，并一直持有到后面的 ordered
+    // append/commit；loser 只保留空边界，不读取 args 或 shared sidecar。
+    const uint64_t prepare_begin =
+        TraceTimestamp<Ops>(stats.trace, stats.result);
+    if (__builtin_expect(winner, 0) &&
+        !WaitForSharedTaskTurn<Ops>(
+            state, worker, task_count, task_id, stats
+        )) {
+        return false;
+    }
+    const uint64_t prepare_end =
+        TraceTimestamp<Ops>(stats.trace, stats.result);
+
+    // callback 已经返回；只有 Claim winner 才把 CreateInfo 物化为 descriptor
+    // 并预留 shared heap。所有 replay actor 都仍进入 split finish、闭合固定
+    // span 和 Submit 计数，但不会推进 heap、写 payload 或读取 TaskArgs。
+    const uint64_t materialize_begin = prepare_end;
+    BeginSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
+    bool materialized = true;
+    if (__builtin_expect(winner, 0)) {
+        materialized = MaterializeTask<Ops>(
+            worker, task_id, args, context, state->shared_map,
+            state->heap_base, state->heap_size
+        );
+        if (materialized) {
+            stats.result.materialized_outputs += context.result.count;
+        }
+    }
+    EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
+    if (!materialized) {
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
+    const uint64_t materialize_end =
+        TraceTimestamp<Ops>(stats.trace, stats.result);
+    WriteTrace<Profile>(
+        stats.trace, stats.result, static_cast<int32_t>(task_id), function_id,
+        TracePhase::Materialize, ProfilePhase::Materialize,
+        materialize_begin, materialize_end, 0,
+        kind == TaskKind::Alloc ? 1U : 0U
+    );
+    WriteTrace<Profile>(
+        stats.trace, stats.result, static_cast<int32_t>(task_id), function_id,
+        TracePhase::PrepareMap, ProfilePhase::PrepareMap,
+        prepare_begin, prepare_end, 0,
+        kind == TaskKind::Alloc ? 1U : 0U
+    );
+#else
+    // private 模式保持 S3.1 的 eager Materialize 与每核 heap 路径不变。
+    const uint64_t materialize_begin =
+        TraceTimestamp<Ops>(stats.trace, stats.result);
     BeginSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
     const bool materialized =
-        MaterializeTask(worker, task_id, args, context, state->heap_base, state->heap_size);
+        MaterializeTask(
+            worker, task_id, args, context,
+            state->heap_base, state->heap_size
+        );
     if (!materialized) {
         EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
@@ -1369,37 +1432,33 @@ PA_DEVICE bool FinishCallbackSubmitBody(
     }
     stats.result.materialized_outputs += context.result.count;
     EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
-    const uint64_t materialize_end = TraceTimestamp<Ops>(stats.trace, stats.result);
+    const uint64_t materialize_end =
+        TraceTimestamp<Ops>(stats.trace, stats.result);
     WriteTrace<Profile>(
         stats.trace, stats.result, static_cast<int32_t>(task_id), function_id,
         TracePhase::Materialize, ProfilePhase::Materialize,
-        materialize_begin, materialize_end, 0, kind == TaskKind::Alloc ? 1U : 0U
+        materialize_begin, materialize_end, 0,
+        kind == TaskKind::Alloc ? 1U : 0U
     );
 
     const uint64_t prepare_begin = materialize_end;
-#if PTO_FDWIC_SHARED_MAP
-    // 只有 winner 会查询 shared map 并追加 task N；因此也只有 winner 在
-    // PrepareMap 等待 committed_tasks 精确等于 N。loser 不触碰 map，
-    // 无需被全局 sequencer 串行化。
-    if (__builtin_expect(winner, 0) &&
-        !WaitForSharedTaskTurn<Ops>(
-            state, worker, task_count, task_id, stats
-        )) {
-        return false;
-    }
-#else
     AdvanceTensorMap(worker.map, task_id, static_cast<int32_t>(state->heap_window));
-#endif
     const uint64_t prepare_end = TraceTimestamp<Ops>(stats.trace, stats.result);
     WriteTrace<Profile>(
         stats.trace, stats.result, static_cast<int32_t>(task_id), function_id,
         TracePhase::PrepareMap, ProfilePhase::PrepareMap,
         prepare_begin, prepare_end, 0, kind == TaskKind::Alloc ? 1U : 0U
     );
+#endif
 
-    uint64_t register_begin = prepare_end;
+    uint64_t register_begin =
+#if PTO_FDWIC_SHARED_MAP
+        materialize_end;
+#else
+        prepare_end;
+#endif
     if (kind != TaskKind::Alloc && __builtin_expect(winner, 0)) {
-        const uint64_t fanin_begin = prepare_end;
+        const uint64_t fanin_begin = register_begin;
 #if PTO_FDWIC_SHARED_MAP
         bool lookup_protocol_ok = false;
         uint32_t ordinary_lookup_count = 0;
@@ -1475,9 +1534,11 @@ PA_DEVICE bool FinishCallbackSubmitBody(
     if (__builtin_expect(winner, 0)) {
         const uint64_t winner_build_begin = register_end;
         if (kind == TaskKind::Alloc) {
+#if !PTO_FDWIC_SHARED_MAP
             if (!HeapGuard<Ops, Profile>(state, worker, task_id, context.output_bytes, stats)) {
                 return false;
             }
+#endif
             CompleteTask<Ops>(state, worker, task_id, stats);
         } else {
             if (!BuildWinner<Ops, Profile>(
@@ -1532,6 +1593,15 @@ PA_DEVICE uint32_t FinishSplitCallbackSubmitFromRuntime(
                 runtime.context.task_id == static_cast<int32_t>(ticket->task_id) &&
                 runtime.context.kernel_id == static_cast<int32_t>(ticket->function_id) &&
                 runtime.context.won == (ticket->won != 0);
+#if PTO_FDWIC_SHARED_MAP
+        if (valid) {
+            valid =
+                runtime.context.shared_result.TaskId() ==
+                    static_cast<int32_t>(ticket->task_id) &&
+                runtime.context.shared_result.Size() ==
+                    FrontendTaskOutputCount(GetTaskKind(ticket->task_id));
+        }
+#endif
     }
     ++runtime.finish_calls;
     if (ticket != nullptr) runtime.task_id_sum += ticket->task_id;
@@ -1605,6 +1675,17 @@ PA_DEVICE bool SubmitCallbackTask(
         Kind == TaskKind::Alloc ? 1U : 0U
     );
 
+#if PTO_FDWIC_SHARED_MAP
+    // fresh Output 的返回值是 task/slot 符号，不依赖哪个 worker 获胜。
+    // 在跨 TU finish 前为所有 replay actor 建立同一句柄集，保证 loser
+    // 返回后也能继续构造本核后续 task 的输入引用。
+    if (!PrepareSharedTaskOutputs(
+            context.shared_result, static_cast<int32_t>(task_id), Kind
+        )) {
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
+#endif
     if (!BuildCallbackSubmitArgs<Kind>(orch, args, batch, stats)) {
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;

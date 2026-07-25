@@ -261,6 +261,12 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
             state->shared_map.shared_outputs[task_id].last_writer[slot].value = -1;
         }
     }
+    // shared heap 只由 ordered winner 推进；每轮必须从绝对 cursor/vend 的
+    // 零点重新开始，不能继承上一轮 host/device sidecar 的终态。
+    for (uint32_t shard = 0; shard < kSharedHeapShards; ++shard) {
+        state->shared_map.shared_heap_cursor[shard].value = 0;
+    }
+    state->shared_map.shared_heap_vend.value = 0;
 #endif
     state->heap_window = kHeapWindow;
     state->heap_base = kSyntheticHeapBase;
@@ -323,7 +329,7 @@ inline constexpr size_t ResultBytes() { return sizeof(WorkerResult) * kWorkers; 
 
 inline constexpr size_t SharedSidecarBytes() { return sizeof(SharedTensorMapSidecar); }
 #if PTO_FDWIC_SHARED_MAP
-static_assert(SharedSidecarBytes() == 4735104, "shared TensorMap transfer size changed");
+static_assert(SharedSidecarBytes() == 4735680, "shared TensorMap transfer size changed");
 #else
 static_assert(SharedSidecarBytes() == 2113664, "private TensorMap transfer size changed");
 #endif
@@ -1257,14 +1263,48 @@ inline uint64_t HostElementSize(DataType dtype) {
     return 0;
 }
 
-inline TensorDesc ExpectedSharedOutputDescriptor(
+inline uint64_t ExpectedTaskOutputBytes(uint32_t task_id) {
+    constexpr uint64_t kOutputBytesByKind[kTasksPerBatch] = {
+        10240, 524288, 264192, 8192, 0
+    };
+    return kOutputBytesByKind[task_id % kTasksPerBatch];
+}
+
+inline uint64_t ExpectedCanonicalTaskBase(uint32_t task_id) {
+    constexpr uint64_t kTaskOffsetByKind[kTasksPerBatch] = {
+        0, 10240, 534528, 798720, 806912
+    };
+    return static_cast<uint64_t>(task_id / kTasksPerBatch) * 806912ULL +
+           kTaskOffsetByKind[task_id % kTasksPerBatch];
+}
+
+#if PTO_FDWIC_SHARED_MAP
+inline uint64_t ExpectedSharedHeapShardSpan(uint64_t heap_size) {
+    const uint64_t raw = heap_size / kSharedHeapShards;
+    return raw / kOutputAlignment * kOutputAlignment;
+}
+
+inline uint64_t ExpectedSharedTaskBase(uint32_t task_id, uint64_t heap_size) {
+    const uint32_t shard = task_id % kSharedHeapShards;
+    uint64_t shard_cursor = 0;
+    // task id 不回绕，且分片只由 task_id%8 决定。沿同一 shard 的历史
+    // task 累加即可独立重建该 task reserve 前的绝对 cursor。
+    for (uint32_t previous = shard; previous < task_id;
+         previous += kSharedHeapShards) {
+        shard_cursor += ExpectedTaskOutputBytes(previous);
+    }
+    return static_cast<uint64_t>(shard) *
+               ExpectedSharedHeapShardSpan(heap_size) +
+           shard_cursor;
+}
+#endif
+
+inline TensorDesc ExpectedCanonicalOutputDescriptor(
     uint32_t task_id, uint32_t output_slot
 ) {
-    // 这里按 MaterializeTask 的固定 PA Case1 布局重建 descriptor；只使用
-    // 其语义字段，不把 TensorDesc 的保留 padding 当作协议内容比较。
-    const uint32_t batch = task_id / kTasksPerBatch;
-    const uint64_t batch_base = static_cast<uint64_t>(batch) * 806912ULL;
-    uint64_t task_base = 0;
+    // canonical 地址保持 private 连续 heap 布局，只服务跨模式逻辑签名；
+    // shared 实际 descriptor 由下方 8-shard oracle 独立验证。
+    const uint64_t task_base = ExpectedCanonicalTaskBase(task_id);
     uint64_t output_offset = 0;
     uint64_t buffer_size = 0;
     uint32_t ndims = 0;
@@ -1272,7 +1312,6 @@ inline TensorDesc ExpectedSharedOutputDescriptor(
     uint32_t shapes[kMaxTensorDims] = {};
     const TaskKind kind = static_cast<TaskKind>(task_id % kTasksPerBatch);
     if (kind == TaskKind::Alloc) {
-        task_base = batch_base;
         if (output_slot == 0) {
             buffer_size = 8192;
             ndims = 2;
@@ -1285,13 +1324,11 @@ inline TensorDesc ExpectedSharedOutputDescriptor(
             shapes[0] = kHostPaHeads;
         }
     } else if (kind == TaskKind::Qk && output_slot == 0) {
-        task_base = batch_base + 10240;
         buffer_size = 524288;
         ndims = 2;
         shapes[0] = kHostPaHeads;
         shapes[1] = kHostPaBlocksPerRequest * kHostPaBlockSize;
     } else if (kind == TaskKind::Sf) {
-        task_base = batch_base + 534528;
         if (output_slot == 0) {
             buffer_size = 262144;
             ndims = 2;
@@ -1305,7 +1342,6 @@ inline TensorDesc ExpectedSharedOutputDescriptor(
             shapes[0] = kHostPaHeads;
         }
     } else if (kind == TaskKind::Pv && output_slot == 0) {
-        task_base = batch_base + 798720;
         buffer_size = 8192;
         ndims = 2;
         shapes[0] = kHostPaHeads;
@@ -1334,6 +1370,23 @@ inline TensorDesc ExpectedSharedOutputDescriptor(
     }
     return expected;
 }
+
+#if PTO_FDWIC_SHARED_MAP
+inline TensorDesc ExpectedSharedOutputDescriptor(
+    uint32_t task_id, uint32_t output_slot, uint64_t heap_size
+) {
+    TensorDesc expected =
+        ExpectedCanonicalOutputDescriptor(task_id, output_slot);
+    const uint64_t canonical_task_base =
+        ExpectedCanonicalTaskBase(task_id);
+    const uint64_t output_offset =
+        expected.buffer_addr - kSyntheticHeapBase - canonical_task_base;
+    expected.buffer_addr =
+        kSyntheticHeapBase + ExpectedSharedTaskBase(task_id, heap_size) +
+        output_offset;
+    return expected;
+}
+#endif
 
 inline bool TensorDescFieldsMatch(
     const TensorDesc &actual, const TensorDesc &expected
@@ -1365,7 +1418,8 @@ struct SharedOutputValidation {
 };
 
 inline SharedOutputValidation ValidateSharedOutputs(
-    const SharedTensorMapSidecar &map, uint32_t task_count
+    const SharedTensorMapSidecar &map, uint32_t task_count,
+    uint64_t heap_size
 ) {
     SharedOutputValidation validation;
     const TensorDesc zero_tensor{};
@@ -1391,7 +1445,8 @@ inline SharedOutputValidation ValidateSharedOutputs(
                 cell.published[slot].value == static_cast<int64_t>(task_id);
             validation.protocol_ok &= cell.last_writer[slot].value == expected_writer;
             validation.protocol_ok &= TensorDescFieldsMatch(
-                cell.tensors[slot], ExpectedSharedOutputDescriptor(task_id, slot)
+                cell.tensors[slot],
+                ExpectedSharedOutputDescriptor(task_id, slot, heap_size)
             );
             ++validation.published_outputs;
         }
@@ -1472,9 +1527,15 @@ inline uint64_t ExpectedNormalizedWriterSignature(
             continue;
         }
         // RegisterOutputs 的真实顺序是 max、sum、output、manual output_view。
-        AddNormalizedWriter(by_bucket, ExpectedSharedOutputDescriptor(alloc, 2), up);
-        AddNormalizedWriter(by_bucket, ExpectedSharedOutputDescriptor(alloc, 1), up);
-        AddNormalizedWriter(by_bucket, ExpectedSharedOutputDescriptor(alloc, 0), up);
+        AddNormalizedWriter(
+            by_bucket, ExpectedCanonicalOutputDescriptor(alloc, 2), up
+        );
+        AddNormalizedWriter(
+            by_bucket, ExpectedCanonicalOutputDescriptor(alloc, 1), up
+        );
+        AddNormalizedWriter(
+            by_bucket, ExpectedCanonicalOutputDescriptor(alloc, 0), up
+        );
         AddNormalizedWriter(by_bucket, ExpectedManualOutputView(batch, batches), up);
     }
     return FinishNormalizedWriterSignature(by_bucket);
@@ -1492,16 +1553,20 @@ inline uint64_t SharedNormalizedWriterSignature(
             continue;
         }
         const SharedOutputCell &cell = map.shared_outputs[alloc];
+        // 实际 shared descriptor 的 8-shard 地址已经由
+        // ValidateSharedOutputs 严格校验。跨模式签名只投影同一个业务
+        // output 的 canonical(private 连续 heap)地址，不能把物理分片差异
+        // 误判成 writer 拓扑差异。
         AddNormalizedWriter(
-            by_bucket, cell.tensors[2],
+            by_bucket, ExpectedCanonicalOutputDescriptor(alloc, 2),
             static_cast<uint32_t>(cell.last_writer[2].value)
         );
         AddNormalizedWriter(
-            by_bucket, cell.tensors[1],
+            by_bucket, ExpectedCanonicalOutputDescriptor(alloc, 1),
             static_cast<uint32_t>(cell.last_writer[1].value)
         );
         AddNormalizedWriter(
-            by_bucket, cell.tensors[0],
+            by_bucket, ExpectedCanonicalOutputDescriptor(alloc, 0),
             static_cast<uint32_t>(cell.last_writer[0].value)
         );
         AddNormalizedWriter(by_bucket, ExpectedManualOutputView(batch, batches), up);
@@ -1597,26 +1662,75 @@ inline Metrics Validate(
         static_cast<uint64_t>(task_count) * (task_count - 1U) / 2U;
 #endif
 
-    // 按真实输出大小、1 KiB 对齐和 256 MiB 环回规则重算每个 task 可接受的最小 vend。
+    // private 按连续逻辑 heap 重建；shared 则按 task_id%8 的独立绝对
+    // cursor 重建物理 reserve，同时用所有 shard reserve 之和形成全局 vend。
+    // 两种模式最后都得到逐 task 的最小 completion vend。
     uint64_t expected_heap_next = 0;
     bool vend_progress_bounds_ok = true;
     uint32_t first_bad_vend = task_count;
     uint64_t first_bad_vend_minimum = 0;
     uint64_t first_bad_vend_actual = 0;
     std::vector<uint64_t> minimum_vends(task_count);
-    const uint64_t output_bytes_by_kind[] = {10240, 524288, 264192, 8192, 0};
+#if PTO_FDWIC_SHARED_MAP
+    uint64_t expected_shared_heap_cursor[kSharedHeapShards] = {};
+    const uint64_t shared_heap_shard_span =
+        ExpectedSharedHeapShardSpan(state.heap_size);
+    bool shared_heap_capacity_ok = shared_heap_shard_span != 0;
+#endif
     for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
-        const uint64_t output_bytes = output_bytes_by_kind[task_id % kTasksPerBatch];
+        const uint64_t output_bytes = ExpectedTaskOutputBytes(task_id);
+#if PTO_FDWIC_SHARED_MAP
+        const uint32_t shard = task_id % kSharedHeapShards;
+        shared_heap_capacity_ok &=
+            expected_shared_heap_cursor[shard] <= shared_heap_shard_span &&
+            output_bytes <=
+                shared_heap_shard_span -
+                    std::min(
+                        expected_shared_heap_cursor[shard],
+                        shared_heap_shard_span
+                    );
+        expected_shared_heap_cursor[shard] += output_bytes;
+        expected_heap_next += output_bytes;
+#else
         uint64_t task_base = (expected_heap_next + kOutputAlignment - 1) / kOutputAlignment * kOutputAlignment;
         if (output_bytes != 0 && (task_base % state.heap_size) + output_bytes > state.heap_size) {
             task_base = (task_base / state.heap_size + 1) * state.heap_size;
         }
         expected_heap_next = task_base + output_bytes;
+#endif
         minimum_vends[task_id] = expected_heap_next;
     }
+#if PTO_FDWIC_SHARED_MAP
+    bool shared_heap_state_ok = shared_heap_capacity_ok;
+    uint64_t actual_shared_cursor_sum = 0;
+    uint64_t expected_shared_cursor_sum = 0;
+    for (uint32_t shard = 0; shard < kSharedHeapShards; ++shard) {
+        const int64_t raw_cursor =
+            state.shared_map.shared_heap_cursor[shard].value;
+        shared_heap_state_ok &= raw_cursor >= 0;
+        const uint64_t actual_cursor =
+            raw_cursor < 0 ? 0 : static_cast<uint64_t>(raw_cursor);
+        shared_heap_state_ok &=
+            actual_cursor == expected_shared_heap_cursor[shard];
+        shared_heap_capacity_ok &=
+            actual_cursor <= shared_heap_shard_span;
+        actual_shared_cursor_sum += actual_cursor;
+        expected_shared_cursor_sum += expected_shared_heap_cursor[shard];
+    }
+    const int64_t raw_shared_vend =
+        state.shared_map.shared_heap_vend.value;
+    shared_heap_state_ok &= raw_shared_vend >= 0;
+    const uint64_t actual_shared_vend =
+        raw_shared_vend < 0 ? 0 : static_cast<uint64_t>(raw_shared_vend);
+    shared_heap_state_ok &=
+        actual_shared_vend == expected_heap_next &&
+        actual_shared_cursor_sum == actual_shared_vend &&
+        expected_shared_cursor_sum == expected_heap_next;
+    shared_heap_state_ok &= shared_heap_capacity_ok;
+#endif
     for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
-        // vend 可以大于本 task 的最小末端，因为 winner 发布的是其本地 heap_cursor 快照；
-        // 但不能超过该 worker 完整回放所有 task 后的最终 heap_next。
+        // kernel 可以晚于后续 Submit 完成，故 task vend 可以高于本 task
+        // reserve 后的 prefix；但绝不能小于该 prefix，也不能越过最终全局 vend。
         if (state.tasks[task_id].vend < minimum_vends[task_id] ||
             state.tasks[task_id].vend > expected_heap_next) {
             vend_progress_bounds_ok = false;
@@ -1640,7 +1754,7 @@ inline Metrics Validate(
     const SharedTensorMapValidation shared_map_validation =
         ValidateSharedTensorMap(state.shared_map, task_count);
     const SharedOutputValidation shared_output_validation =
-        ValidateSharedOutputs(state.shared_map, task_count);
+        ValidateSharedOutputs(state.shared_map, task_count, state.heap_size);
     const uint64_t shared_normalized_writer_signature =
         shared_output_validation.protocol_ok
             ? SharedNormalizedWriterSignature(
@@ -1741,6 +1855,44 @@ inline Metrics Validate(
         compete_first_split_runtime_oracle_ok &=
             result.compete_first_split_reserved == 0;
 #endif
+#if PTO_FDWIC_SHARED_MAP
+        // S3.2 的第一小步只收敛 Materialize/heap；参数构造仍保持所有
+        // worker eager，便于把分配主体变化与下一步 winner-only 构参分开
+        // 验证。Materialize 数量则必须由本核实际 wins[] 精确推导。
+        const uint64_t alloc_wins = result.wins[static_cast<uint32_t>(TaskKind::Alloc)];
+        const uint64_t qk_wins = result.wins[static_cast<uint32_t>(TaskKind::Qk)];
+        const uint64_t sf_wins = result.wins[static_cast<uint32_t>(TaskKind::Sf)];
+        const uint64_t pv_wins = result.wins[static_cast<uint32_t>(TaskKind::Pv)];
+        frontend_worker_counts_ok &= result.context_reads == batches;
+        frontend_worker_counts_ok &=
+            result.views_created == static_cast<uint64_t>(batches) * 2;
+        frontend_worker_counts_ok &=
+            result.dynamic_create_infos == static_cast<uint64_t>(batches) * 2;
+        frontend_worker_counts_ok &=
+            result.arg_resets == static_cast<uint64_t>(batches) * 4;
+        frontend_worker_counts_ok &=
+            result.tensor_args_added == static_cast<uint64_t>(batches) * 22;
+        frontend_worker_counts_ok &=
+            result.scalar_args_added == static_cast<uint64_t>(batches) * 9;
+        frontend_worker_counts_ok &=
+            result.materialized_outputs ==
+                alloc_wins * 3 + qk_wins + sf_wins * 3 + pv_wins;
+        frontend_worker_counts_ok &= result.map_inserts == 0;
+        // shared 的权威进度是 sidecar cursor/vend。worker.heap_next 只保存
+        // 该 worker 最近一次获胜时看到的 prefix，可为从未获胜核的 0；
+        // 非零值必须对应某个真实 task prefix，且有 winner 的核不能仍为 0。
+        const bool final_heap_is_prefix =
+            result.final_heap_next == 0 ||
+            std::binary_search(
+                minimum_vends.begin(), minimum_vends.end(),
+                result.final_heap_next
+            );
+        final_worker_state_ok &=
+            final_heap_is_prefix && result.final_heap_next <= expected_heap_next &&
+            (result.final_heap_next == 0 ||
+             result.final_heap_next % kOutputAlignment == 0) &&
+            ((result.claim_wins == 0) == (result.final_heap_next == 0));
+#else
         frontend_worker_counts_ok &= result.context_reads == batches;
         frontend_worker_counts_ok &= result.views_created == static_cast<uint64_t>(batches) * 2;
         frontend_worker_counts_ok &= result.dynamic_create_infos == static_cast<uint64_t>(batches) * 2;
@@ -1748,12 +1900,9 @@ inline Metrics Validate(
         frontend_worker_counts_ok &= result.tensor_args_added == static_cast<uint64_t>(batches) * 22;
         frontend_worker_counts_ok &= result.scalar_args_added == static_cast<uint64_t>(batches) * 9;
         frontend_worker_counts_ok &= result.materialized_outputs == static_cast<uint64_t>(batches) * 8;
-#if PTO_FDWIC_SHARED_MAP
-        frontend_worker_counts_ok &= result.map_inserts == 0;
-#else
         frontend_worker_counts_ok &= result.map_inserts == static_cast<uint64_t>(batches) * 4;
-#endif
         final_worker_state_ok &= result.final_heap_next == expected_heap_next;
+#endif
         final_worker_state_ok &= result.map_high_water ==
 #if PTO_FDWIC_SHARED_MAP
             0;
@@ -1873,7 +2022,18 @@ inline Metrics Validate(
         role_kernel_routing_ok,
         "AIC executes only QK/PV and AIV executes only SF/UP", &metrics
     );
-    Expect(heap_guards == static_cast<uint64_t>(batches) * 4, "heap guard count matches output winners", &metrics);
+    Expect(
+        heap_guards ==
+#if PTO_FDWIC_SHARED_MAP
+            0,
+#else
+            static_cast<uint64_t>(batches) * 4,
+#endif
+        kCompiledTensorMapMode == TensorMapBuildMode::Private
+            ? "private heap guard count matches output winners"
+            : "shared no-wrap heap needs no private ring guard",
+        &metrics
+    );
     Expect(
         fanin_worker_counts_ok && fanin_ready_loads >= fanin_edges &&
             fanin_ready_loads - fanin_edges <= 2 * fanin_not_ready_loads,
@@ -1890,7 +2050,13 @@ inline Metrics Validate(
     Expect(duplicates == 0, "completion flags are published once", &metrics);
     Expect(ready_flags == task_count, "all task flags are ready", &metrics);
     Expect(vend_values_ok, "all published vend values are nonzero and aligned", &metrics);
-    Expect(vend_progress_bounds_ok, "every task vend is within PA worker heap progress bounds", &metrics);
+    Expect(
+        vend_progress_bounds_ok,
+        kCompiledTensorMapMode == TensorMapBuildMode::Private
+            ? "every task vend is within private worker heap progress bounds"
+            : "every task vend is within shared aggregate heap progress bounds",
+        &metrics
+    );
     Expect(state.frontier.value == static_cast<int64_t>(task_count) - 1, "frontier reaches the final task", &metrics);
     Expect(
         state.replay_done.value == (flat_final_barrier ? static_cast<int64_t>(kWorkers) : 0) &&
@@ -1903,7 +2069,13 @@ inline Metrics Validate(
     // 此断言只确认现有输出保持零，不能单独证明 active_count>=2 分支不可达。
     Expect(joint_polls == 0, "single-lane PA performs no BlockWon polling", &metrics);
     // 第二组断言锁定 scalar 前端工作量，防止编译器优化或后续改动悄悄删掉 PA 模拟步骤。
-    Expect(frontend_worker_counts_ok, "every worker replays the exact PA frontend operation counts", &metrics);
+    Expect(
+        frontend_worker_counts_ok,
+        kCompiledTensorMapMode == TensorMapBuildMode::Private
+            ? "every private worker replays the exact eager frontend counts"
+            : "shared eager args and winner-only materialize counts are exact",
+        &metrics
+    );
     const uint64_t expected_global_map_inserts =
 #if PTO_FDWIC_SHARED_MAP
         0;
@@ -1911,15 +2083,31 @@ inline Metrics Validate(
         static_cast<uint64_t>(kWorkers) * batches *
         kPaCase1MapEntriesPerBatch;
 #endif
-    Expect(
+    const bool global_frontend_counts_ok =
+#if PTO_FDWIC_SHARED_MAP
         context_reads == static_cast<uint64_t>(kWorkers) * batches &&
-            views_created == static_cast<uint64_t>(kWorkers) * batches * 2 &&
-            dynamic_create_infos == static_cast<uint64_t>(kWorkers) * batches * 2 &&
-            arg_resets == static_cast<uint64_t>(kWorkers) * batches * 4 &&
-            tensor_args_added == static_cast<uint64_t>(kWorkers) * batches * 22 &&
-            scalar_args_added == static_cast<uint64_t>(kWorkers) * batches * 9 &&
-            materialized_outputs == static_cast<uint64_t>(kWorkers) * batches * 8 &&
-            map_inserts == expected_global_map_inserts,
+        views_created == static_cast<uint64_t>(kWorkers) * batches * 2 &&
+        dynamic_create_infos ==
+            static_cast<uint64_t>(kWorkers) * batches * 2 &&
+        arg_resets == static_cast<uint64_t>(kWorkers) * batches * 4 &&
+        tensor_args_added ==
+            static_cast<uint64_t>(kWorkers) * batches * 22 &&
+        scalar_args_added ==
+            static_cast<uint64_t>(kWorkers) * batches * 9 &&
+        materialized_outputs == static_cast<uint64_t>(batches) * 8 &&
+        map_inserts == expected_global_map_inserts;
+#else
+        context_reads == static_cast<uint64_t>(kWorkers) * batches &&
+        views_created == static_cast<uint64_t>(kWorkers) * batches * 2 &&
+        dynamic_create_infos == static_cast<uint64_t>(kWorkers) * batches * 2 &&
+        arg_resets == static_cast<uint64_t>(kWorkers) * batches * 4 &&
+        tensor_args_added == static_cast<uint64_t>(kWorkers) * batches * 22 &&
+        scalar_args_added == static_cast<uint64_t>(kWorkers) * batches * 9 &&
+        materialized_outputs == static_cast<uint64_t>(kWorkers) * batches * 8 &&
+        map_inserts == expected_global_map_inserts;
+#endif
+    Expect(
+        global_frontend_counts_ok,
         "global PA frontend operation totals are exact", &metrics
     );
     Expect(
@@ -1975,8 +2163,38 @@ inline Metrics Validate(
         static_cast<unsigned long long>(fanin_edges),
         static_cast<unsigned long long>(dependency_signature)
     );
-    Expect(final_worker_state_ok, "every worker final heap and TensorMap state is exact", &metrics);
+    Expect(
+        final_worker_state_ok,
+        kCompiledTensorMapMode == TensorMapBuildMode::Private
+            ? "every private worker final heap and TensorMap state is exact"
+            : "shared worker heap snapshots are legal and TensorMap summaries are exact",
+        &metrics
+    );
 #if PTO_FDWIC_SHARED_MAP
+    Expect(
+        shared_heap_state_ok,
+        "shared heap cursors, vend sum, and shard capacity are exact",
+        &metrics
+    );
+    std::printf(
+        "[SHARED_HEAP] shard_span=%llu cursors=[",
+        static_cast<unsigned long long>(shared_heap_shard_span)
+    );
+    for (uint32_t shard = 0; shard < kSharedHeapShards; ++shard) {
+        std::printf(
+            "%s%lld", shard == 0 ? "" : ",",
+            static_cast<long long>(
+                state.shared_map.shared_heap_cursor[shard].value
+            )
+        );
+    }
+    std::printf(
+        "] cursor_sum=%llu vend=%lld expected_vend=%llu capacity_ok=%u\n",
+        static_cast<unsigned long long>(actual_shared_cursor_sum),
+        static_cast<long long>(state.shared_map.shared_heap_vend.value),
+        static_cast<unsigned long long>(expected_heap_next),
+        shared_heap_capacity_ok ? 1U : 0U
+    );
     Expect(
         shared_map_validation.protocol_ok &&
             shared_map_validation.total_appends == 0 &&
@@ -2081,8 +2299,15 @@ inline Metrics Validate(
                 phase_calls[static_cast<uint32_t>(ProfilePhase::WaitForSlot)] ==
                     static_cast<uint64_t>(batches) * 4 &&
                 phase_calls[static_cast<uint32_t>(ProfilePhase::HeapGuard)] ==
+#if PTO_FDWIC_SHARED_MAP
+                    0,
+#else
                     static_cast<uint64_t>(batches) * 4,
-            "profile call counts match Claim/EfDrain/WaitForSlot/HeapGuard flow", &metrics
+#endif
+            kCompiledTensorMapMode == TensorMapBuildMode::Private
+                ? "private profile calls match Claim/EfDrain/WaitForSlot/HeapGuard"
+                : "shared profile calls match Claim/EfDrain/WaitForSlot without private HeapGuard",
+            &metrics
         );
     }
 

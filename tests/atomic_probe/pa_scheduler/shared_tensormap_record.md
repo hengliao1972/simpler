@@ -812,16 +812,23 @@ CPU private/shared b1/b256、定向 sanitizer、Python 100 项和 CCEC
 private/shared b1/b256 均通过。此步没有引入 generation、deferred resolve、
 shared heap 或 winner-only Materialize；详细结果见第 15 节。
 
-S3.2 再把 QK/SF/PV/UP 的重参数构造、Materialize 和堆分配收敛到 winner；
-Alloc 是否保留全核轻参数路径按真实 PA 调用点处理。shared heap 首版使用参考
-实现的 8 shard 绝对递增分配，默认 b256 每 shard 需求 25,821,184B，小于
-32MiB shard span；临近 wrap 时先显式失败，不能用尚未证明的 generation
-覆盖旧 descriptor。
+**S3.2a 状态：已完成 shared heap 与 winner-only Materialize 的
+CPU/CCEC 闭环。S3.2b 的 winner-only 重构参尚未开始。**
 
-**S3.2 Gate**：private 工作量计数保持原值；shared 全局 Materialize output
+S3.2 继续拆开验证分配主体与构参主体。第一小步只把 Materialize 和堆分配
+收敛到 winner，所有 worker 仍保持 S3.1 的 eager 构参；第二小步再把
+QK/SF/PV/UP 的重参数构造收敛到 winner，Alloc 保留全核轻参数路径。
+shared heap 首版使用 8 shard 绝对递增分配，默认 b256 每 shard 需求
+25,821,184B，小于 32MiB shard span；临近 wrap 时显式失败，不能用尚未
+证明的 generation 覆盖旧 descriptor。
+
+**S3.2a Gate**：private 工作量计数保持原值；shared 全局 Materialize output
 从 b1/b256 的 768/196,608 精确降为 8/2,048，shared heap vend 为
 806,912/206,569,472 bytes，region insert 保持 0；CPU 定向测试和 CCEC
-A5 b1/b256 均通过。
+A5 b1 当前最终 ELF 已通过；CCEC b256 的规模证据在非法输入预检加固前已
+通过，最终 ELF 按后续只跑 b1 的约定没有重复消耗上板时间。S3.2b 完成后
+还要另行闭合 shared 构参计数，不能把 S3.2a 的 eager 计数误写成最终
+winner-only 前端成本。
 
 ### 阶段 S4：standalone CPU/CCEC 验收
 
@@ -1313,3 +1320,102 @@ S2.5 shared b256 的同类单样本为 26.556193 ms。S3.1 在正确性审计前
 Materialize 和 private heap 分配。S3.2 应继续以独立提交收敛 winner-only
 Materialize 与 shared heap，不在该步夹带 generation、deferred view 或真实
 simpler 迁移。
+
+### 2026-07-25：S3.2a shared heap 与 winner-only Materialize
+
+本小步只改变 shared 模式的输出物化和 heap 主体，所有 worker 的
+`BuildCallbackSubmitArgs` 仍保持 eager。这样可以先证明物理地址、发布顺序
+和 loser 空路径，再在下一提交单独衡量重构参收敛，避免两个性能变量混算。
+private 的 Materialize、per-worker ring heap、HeapGuard 和构参计数均未改变。
+
+#### 顺序与分配协议
+
+shared winner 在 Materialize 前等待
+`committed_tasks == task_id`，并一直持有 exact turn 到 descriptor 发布、
+region 空/非空 delta 写入和 commit 完成。这个顺序同时保证：
+
+1. 同一 task 只有 winner 读取 `TaskArgs`、写 payload 和物化 descriptor；
+2. loser 仍闭合 split-finish、固定阶段和 Submit 计数，但不读取 args，
+   不触碰 shared heap/map，也不发布输出；
+3. 同 shard 的 task 以 task id 顺序推进，host 可以独立重建确定的物理地址；
+4. consumer 在后继 task 收集 fanin 前，必定先观察到 producer 的 descriptor
+   和连续 commit。
+
+shared sidecar 在 S3.1 output table 后追加 8 条 cache-line cursor 和 1 条
+aggregate vend。当前 ABI 为：
+
+| 项目 | 数值 |
+| --- | ---: |
+| `shared_heap_cursor` offset | 4,735,104B |
+| `shared_heap_vend` offset | 4,735,616B |
+| `SharedTensorMapSidecar` | 4,735,680B |
+| CPU non-split `SchedulerState` | 1,011,851,648B |
+| CCEC split `SchedulerState` | 1,011,857,792B |
+| 构建身份 ABI | 3 |
+
+heap 被均分为 8 个 1KiB 对齐的物理 shard。每个非空 output task 先在
+`task_id % 8` 的 cursor 上 FetchAdd，再推进 aggregate vend；零输出 UP
+只读取当前 vend，不执行 RMW。`aggregate_vend` 是所有 shard 已分配字节之和，
+不是物理地址，不能拿来替代 shard base。首版不 wrap：任何 cursor 或 vend
+越界都在写入前失败。两个 FetchAdd 若观察到与 exact-turn 预检不同的旧值，
+冷路径恢复预检快照并返回失败；该无条件恢复只在“没有合法并发 allocator”
+的 exact-turn 契约下成立。
+
+这里的回滚边界只覆盖 reserve 内部两个原子操作观测到异常旧值的情形。
+一旦 reserve 成功，后续 resolver、append 或 descriptor build 异常会设置
+整轮 terminal fatal，并保留已经推进的分配状态供 host 取证；当前协议没有
+把一次 Submit 包装成可回收 heap 的完整事务，不能把它描述为全路径回滚。
+
+shared 不再调用 private `HeapGuard`。旧 guard 使用 per-worker 单调 ring
+坐标，而 shared cursor/vend 属于全局分片坐标，混用会制造错误等待。host
+分别验证两种地址口径：
+
+- shared 实际 descriptor 必须匹配 8-shard 物理地址；
+- 跨 private/shared 的 normalized writer signature 仍投影到同一连续
+  canonical 地址，只比较业务 writer 拓扑，不把物理分片差异误判为语义差异。
+
+#### 预检与失败不污染
+
+winner 在任一 cursor 推进前校验参数数量、builder error、空 result、
+Output 引用类型、CreateInfo rank/dtype/连续布局、shape/stride 上界和
+`heap_base + heap_size` 地址可表达性。shape 乘积直接按 `TensorDesc`
+的 32-bit stride 上界检查；最初的通用 64-bit 乘法溢出写法会使 CCEC
+生成设备 ELF 不提供的 `__multi3`，因此不能保留。
+
+CPU 新增两个独立定向门禁：
+
+- shared heap reserve：b1/b256 精确分片、对齐、满 shard、零输出、
+  vend/cursor 的负值/未对齐/越界、aggregate 容量耗尽，以及零/非零快照上的
+  cursor/vend 原子异常回滚；
+- shared Materialize：合法 QK 物化、shape 乘积和 stride 溢出、非法计数、
+  builder error、非空 result、错误/空 CreateInfo 引用、非法 tag 和 heap
+  地址溢出；所有失败都必须保持 cursor、vend 与 worker heap 快照不变。
+
+host 还要求 `(claim_wins == 0) == (final_heap_next == 0)`，防止纯 loser
+误写任一看似合法的 aggregate prefix 后仍通过。shared 的 profile-phase
+oracle 同步改为 `HeapGuard=0`；private 仍为 `4*batches`。
+
+#### 当前闭环结果
+
+| 规模 | 8 个 shard cursor | aggregate vend | Materialize outputs |
+| --- | --- | ---: | ---: |
+| b1 | `10240,524288,264192,8192,0,0,0,0` | 806,912B | 8 |
+| b256 | 每 shard 25,821,184B | 206,569,472B | 2,048 |
+
+CPU private/shared 严格构建、shared b1/b256、profile-phase 和新增定向用例
+全部通过；CCEC private/shared 两种 ELF 均完成链接与 manifest 校验，shared
+A5 b1 的全部调度、symbol、heap、descriptor、依赖和签名断言通过。
+最终加固后的 b1 `real-compute-count=1` Submit 单样本为 92.412us，只是正确性
+运行，不与历史默认 workload 性能相减。加固非法输入预检前还执行过一次
+CCEC b256 `scalar-nop-count=1`，Submit 为 58.371217ms，8 个 cursor 均为
+25,821,184B、vend 为 206,569,472B，全部语义断言通过；后续改动只增加
+reserve 前的拒绝条件和 host 断言，按只跑 b1 的约定未把该数字冒充最终
+ELF 复测值。
+
+当前 atomic 泳道不是 shared 协议全量清单：exact-turn 的 load，以及 shared
+heap cursor/vend 的 Load/FetchAdd/Exchange 直接调用 `Ops`，尚未进入既有
+`AtomicSite` wrapper。它们已经计入 Submit/阶段总时间和 host 终态校验，
+但现有 atomic trace 不能用于拆分这几项单指令成本。
+
+S3.2a 仍保留所有 worker eager 构参；下一提交只收敛 QK/SF/PV/UP 重构参
+并重新闭合逐核/全局前端计数。

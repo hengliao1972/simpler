@@ -97,6 +97,32 @@ else
 
     echo "[TEST] shared-output symbol self-test"
     "$BUILD_DIR/test_shared_output_symbols"
+
+    # shared heap 与 region/symbol 协议分开验证：这里按 exact-turn 前提
+    # 锁定 8 shard、1 KiB 对齐、首版禁止 wrap、零输出及异常原子回滚。
+    echo "[BUILD] shared heap no-wrap reserve self-test"
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/common/test_shared_heap_reserve.cpp" \
+        -o "$BUILD_DIR/test_shared_heap_reserve"
+
+    echo "[TEST] shared heap no-wrap reserve self-test"
+    "$BUILD_DIR/test_shared_heap_reserve"
+
+    # Materialize 在触碰 shared cursor 前必须完成数量、引用、shape/stride
+    # 和地址区间预检；定向用例保证失败不会留下半次 heap 推进。
+    echo "[BUILD] shared winner materialize self-test"
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/common/test_shared_materialize.cpp" \
+        -o "$BUILD_DIR/test_shared_materialize"
+
+    echo "[TEST] shared winner materialize self-test"
+    "$BUILD_DIR/test_shared_materialize"
 fi
 
 # set -e 保证编译或链接失败时不会打印 complete，也不会在组合构建中继续

@@ -286,21 +286,32 @@ ASan/UBSan。CPU b1、CPU b256 的完整调度断言和 CCEC private 三镜像�
 同口径单次为 3,862.246 us，只作协议和规模回归记录，不是性能基线，也不
 替代后续配对多轮性能验证。
 
-### 4.2 当前 shared TensorMap：有序 region ring 与 fresh-output symbol
+### 4.2 当前 shared TensorMap：有序 ring、fresh symbol 与 shared heap
 
-S3.1 在 S2.5 的 2,113,664B region sidecar 尾部追加 1,280 个
-`SharedOutputCell`，每个 cell 为 2,048B，因此当前
-`SharedTensorMapSidecar` 为 4,735,104B。shared `SchedulerState` 的 CPU
-非 split 布局为 1,011,851,072B，CCEC split 布局为 1,011,857,216B；
-新增表位于 standalone 控制区和 `results` 之后，不移动 `WorkerState`、
-`RunConfig` 或既有结果字段。每 task 最多八个 fresh output，以 16B
-`FdwicOutputRef` 表达 `(producer_task_id, output_slot)`，Materialize 的
-返回句柄为 8B `SharedTaskOutputs`。
+S3.2a 在 S3.1 的 4,735,104B output table 尾部追加 8 条 cache-line
+heap cursor 和 1 条 aggregate vend，因此当前 `SharedTensorMapSidecar`
+为 4,735,680B。shared `SchedulerState` 的 CPU 非 split 布局为
+1,011,851,648B，CCEC split 布局为 1,011,857,792B；新增控制字位于
+standalone 控制区和 `results` 之后，不移动 `WorkerState`、`RunConfig`
+或既有结果字段。每 task 最多八个 fresh output，以 16B
+`FdwicOutputRef` 表达 `(producer_task_id, output_slot)`，返回句柄为
+8B `SharedTaskOutputs`。构建身份 ABI 当前为 3。
 
-当前仍是 compete-first eager 基线：所有 worker 都构造完整参数、执行
-Materialize，并使用既有 per-worker private heap。只有持有
-`committed_tasks == N` exact turn 的 task winner 才把自己的 descriptor
-发布到共享表并提交 task N；这还不是 winner-only Materialize 或 shared heap。
+当前仍是 compete-first eager 构参，但已经是 winner-only Materialize：
+所有 worker 在 Claim 后构造完整参数和同一组 output symbol，只有持有
+`committed_tasks == N` exact turn 的 task winner 才预留 shared heap、
+生成 descriptor、发布到共享表并提交 task N。loser 仍进入 split finish
+并闭合固定泳道/Submit 边界，但不读取 args，不触碰 heap/map，也不写 payload。
+下一阶段才收敛 QK/SF/PV/UP 的重参数构造，不能把当前 eager 构参计数误写成
+最终成本。
+
+shared heap 使用 `task_id % 8` 的有界绝对 cursor，物理 shard span 默认为
+32MiB；b256 每 shard 精确使用 25,821,184B，不 wrap、不复用 generation。
+非空 task 分别推进 shard cursor 和 aggregate vend，零输出 task 只读取 vend。
+shared 不调用 private per-worker ring 的 HeapGuard。host 直接核对 8-shard
+实际 descriptor 地址，再以 canonical 连续地址比较 private/shared 的
+normalized writer signature。
+
 发布前先对本 task 的全部 output slot 做只读预检；全部通过后初始化
 `last_writer`，再写 descriptor、执行 `FlushRegion`、存储屏障并发布
 `published`，最后才把连续 commit 前沿从 N 推进到 N+1。重复发布或后槽异常
@@ -351,9 +362,9 @@ S2.5 shared b256 的同类单样本为 26.556193 ms。S3.1 在正确性审计前
 23.562916 ms，但当时重复发布和后置非法引用的失败路径可能留下部分共享
 状态；补齐全量发布预检与两遍 resolver 后，最终同类单样本为 27.094219 ms。
 两者只差约 +2.03%，且都不是多轮稳定基线，不能据此宣称稳定回退或收益；
-被撤销的 23.562916 ms 也不能作为有效 S3.1 基线。下一小步 S3.2 只处理
-winner-only Materialize 与 shared heap，并继续单独量化正确性检查的热路径
-成本。
+被撤销的 23.562916 ms 也不能作为有效 S3.1 基线。当前 S3.2a 已把
+Materialize 与 heap 收敛到 winner；下一小步只处理 winner-only 重构参，
+并继续单独量化正确性检查的热路径成本。
 
 实现中验证了一项 CCEC 约束：`[[block_local]]` runtime state 不能包含具有
 非平凡构造函数的类型。不能用 `block-local-init` 绕过该限制；当前
@@ -368,9 +379,11 @@ S2 的 2,119,808B sidecar（含 96 条 per-core progress）和 S2.5 的
 慢核。S2/S2.5 的历史结构、失败实验和上板结果见
 `shared_tensormap_record.md`。
 
-shared sidecar 的 atomic 当前会计入既有 Submit/业务阶段时间，但尚未逐条
+shared sidecar 的 atomic 当前会计入既有 Submit/业务阶段时间，但
+exact-turn load、heap cursor/vend 的 Load/FetchAdd/Exchange 等尚未逐条
 接入 atomic 泳道 wrapper；所以这一版泳道不能声称完整列出了 shared 协议
-atomic。这不影响 host 对 sidecar、输出符号、依赖边和规范化 writer 签名的
+atomic，也不能从现有 atomic 事件拆出 shared heap 单指令成本。这不影响
+host 对 cursor/vend、descriptor、输出符号、依赖边和规范化 writer 签名的
 独立校验。
 
 ## 5. 使用说明：运行、测量与泳道查看
@@ -1611,11 +1624,11 @@ ClockBaseline，并继续以逐核容量、调用数、总记录数和 `dropped=
 `64 * 96 = 6,144` bytes。split ELF 另预留 AIC/AIV 两个 role-specific
 block-local runtime state，每个精确 1,664 bytes、最终 section 合计
 3,328 bytes；它们不属于 GM `SchedulerState`。以上 `SchedulerState` 数字
-是 private 模式；当前 S3.1 shared 模式在尾部另追加精确 4,735,104 bytes
+是 private 模式；当前 S3.2a shared 模式在尾部另追加精确 4,735,680 bytes
 的 sidecar，故 CPU non-split/CCEC split 总大小分别为
-1,011,851,072/1,011,857,216 bytes；既有生产和 standalone 字段 offset
-不变。历史 S2.5 的 2,113,664B 只是不含 fresh-output table 的旧 sidecar
-大小，不能再作为当前传输或分配口径。
+1,011,851,648/1,011,857,792 bytes；既有生产和 standalone 字段 offset
+不变。历史 S2.5 的 2,113,664B 和 S3.1 的 4,735,104B 都不是当前传输或
+分配口径。
 独立的 64 bytes PMU 配置和 64 bytes winner workload 配置各占一条
 cache line；二者都位于完整生产 DistGlobal 镜像之后，生产 DistGlobal/
 DistCore 关键偏移保持不变。

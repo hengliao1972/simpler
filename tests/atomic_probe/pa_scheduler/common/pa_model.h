@@ -54,7 +54,7 @@ enum class TensorMapBuildMode : uint32_t {
 constexpr TensorMapBuildMode kCompiledTensorMapMode =
     static_cast<TensorMapBuildMode>(PTO_FDWIC_SHARED_MAP);
 constexpr uint32_t kBuildIdentityMagic = 0x50414249U;  // "PABI"
-constexpr uint32_t kBuildIdentityAbiVersion = 2;
+constexpr uint32_t kBuildIdentityAbiVersion = 3;
 
 // 这里固定的是 PA Case1 的调度拓扑，而不是为了缩小 standalone 人为选择的规模：
 // 每个 batch 依次回放 Alloc/QK/SF/PV/UP 五个 task，32 个 AIC 与 64 个 AIV
@@ -70,6 +70,9 @@ constexpr uint32_t kAivWorkers = 64;
 constexpr uint32_t kWorkers = kAicWorkers + kAivWorkers;
 constexpr uint32_t kRuntimeMaxWorkers = 108;
 constexpr uint32_t kCursorShards = 4;
+// shared 输出 heap 按 task_id 固定分成 8 个物理 shard。首版只做有界
+// 绝对递增分配，不在 shard 内回绕；该常量同时属于 host 地址 oracle。
+constexpr uint32_t kSharedHeapShards = 8;
 constexpr uint32_t kFinalBarrierMaxLeafGroups = 16;
 constexpr uint32_t kFinalBarrierMaxMiddleGroups = 4;
 // 每个 worker 私有 ring 有 4 个物理 slot，其中 2 个为 BlockWon 协议预留；
@@ -765,13 +768,25 @@ struct alignas(64) SharedTensorMapSidecar {
     // 追加在既有 S2.5 region ring 之后，保持 committed/reclaim、bucket 和
     // slot 的全部 offset 不变；现有 shared sidecar H2D/D2H 按 sizeof 搬运。
     SharedOutputCell shared_outputs[kMaxTasks];
+    // shared heap 控制字继续追加在 S3.1 output table 之后。每个 shard cursor
+    // 与全局 aggregate vend 独占 cache line，避免不同 winner 的原子更新伪共享。
+    AtomicLine shared_heap_cursor[kSharedHeapShards];
+    AtomicLine shared_heap_vend;
 #endif
 };
 #if PTO_FDWIC_SHARED_MAP
-static_assert(sizeof(SharedTensorMapSidecar) == 4735104, "shared TensorMap sidecar size changed");
+static_assert(sizeof(SharedTensorMapSidecar) == 4735680, "shared TensorMap sidecar size changed");
 static_assert(
     offsetof(SharedTensorMapSidecar, shared_outputs) == 2113664,
     "shared output table offset mismatch"
+);
+static_assert(
+    offsetof(SharedTensorMapSidecar, shared_heap_cursor) == 4735104,
+    "shared heap cursor offset mismatch"
+);
+static_assert(
+    offsetof(SharedTensorMapSidecar, shared_heap_vend) == 4735616,
+    "shared heap vend offset mismatch"
 );
 #else
 static_assert(sizeof(SharedTensorMapSidecar) == 2113664, "private sidecar layout changed");
@@ -914,8 +929,9 @@ struct alignas(64) WorkerResult {
     uint64_t wait_events[2];
     uint64_t wait_iterations[2];
 
-    // 前端工作量计数不是性能填充：构参、materialize 和 map insert 用于核对全部
-    // 96 个 worker 的回放；map lookup、slot copy 与 fanin 则是 winner-only 全局计数。
+    // 前端工作量计数不是性能填充：private 核对全员构参/物化，shared
+    // 分阶段区分 eager 构参与 winner-only 物化；lookup、slot copy 和 fanin
+    // 始终按 winner-only 的全局业务量闭合。
     uint64_t context_reads;
     uint64_t views_created;
     uint64_t dynamic_create_infos;
@@ -929,7 +945,8 @@ struct alignas(64) WorkerResult {
     uint64_t slot_scalar_copies;
     uint64_t fanin_edges;
 
-    // 最终快照用于跨 worker 比较逻辑 heap 与 TensorMap 回收状态是否完全一致。
+    // private 保存逐 worker 逻辑 heap/map 终态；shared 的 heap_next 只是本核
+    // 最近一次 winner 看到的 aggregate prefix，权威终态位于 shared sidecar。
     uint64_t final_heap_next;
     uint64_t map_high_water;
     uint64_t map_alive_floor;
@@ -1070,7 +1087,8 @@ struct alignas(64) SchedulerState {
     int32_t heap_window;
     uint8_t tasks_padding[60];
     TaskCell tasks[kTaskCellCapacity];
-    // heap_base/size 描述共享物理环，worker.heap_next 则是各 worker 一致推进的逻辑游标。
+    // heap_base/size 描述共享物理区间。private 的 worker.heap_next 是各核
+    // 独立回放的 ring 逻辑游标；shared 下它只镜像本核最近 winner 的 vend。
     uint64_t heap_base;
     uint64_t heap_size;
     uint64_t orchestration_args;

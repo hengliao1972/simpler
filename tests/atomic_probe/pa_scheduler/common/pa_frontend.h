@@ -13,6 +13,9 @@
 #define PA_SCHEDULER_COMMON_PA_FRONTEND_H
 
 #include "pa_model.h"
+#if PTO_FDWIC_SHARED_MAP
+#include "pa_shared_heap.h"
+#endif
 
 namespace pa_scheduler {
 
@@ -122,6 +125,39 @@ static_assert(
     __is_trivially_constructible(SharedTaskOutputs),
     "SharedTaskOutputs must remain trivial for CCEC block-local state"
 );
+
+// pa_model.h 可能先被 CCEC 的 host-side PMU 头包含，因此这里保留明确的
+// device 版本，避免 __aicore__ 路径调用先前已实例化的 host constexpr。
+PA_DEVICE uint32_t FrontendTaskOutputCount(TaskKind kind) {
+    switch (kind) {
+        case TaskKind::Alloc: return 3;
+        case TaskKind::Qk: return 1;
+        case TaskKind::Sf: return 3;
+        case TaskKind::Pv: return 1;
+        case TaskKind::Up:
+        case TaskKind::Count: return 0;
+    }
+    return 0;
+}
+
+PA_DEVICE bool PrepareSharedTaskOutputs(
+    SharedTaskOutputs &outputs, int32_t task_id, TaskKind kind
+) {
+    // loser 也必须把同一组 (producer,slot) 句柄交给本核后续 orchestration；
+    // 这里仅声明稳定符号，不读取 winner 私有 payload，也不物化 descriptor。
+    if (task_id < 0 || outputs.TaskId() != task_id || !outputs.Empty()) {
+        return false;
+    }
+    const uint32_t output_count = FrontendTaskOutputCount(kind);
+    for (uint32_t slot = 0; slot < output_count; ++slot) {
+        if (!outputs.AddOutputRef(
+                task_id, static_cast<int16_t>(slot)
+            )) {
+            return false;
+        }
+    }
+    return outputs.Size() == output_count;
+}
 #endif
 
 // TaskArgs 同时容纳 orchestration 栈上的 descriptor、GM 中已物化的 descriptor，
@@ -1185,8 +1221,47 @@ PA_DEVICE uint64_t FrontendAlignUp(uint64_t value, uint64_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
+#if PTO_FDWIC_SHARED_MAP
+PA_DEVICE bool SharedCreateInfoBytes(
+    const TensorCreateInfo &info, uint64_t &bytes
+) {
+    bytes = 0;
+    // shared cursor 一旦推进就不能交给另一个 task 回退。先完整校验本
+    // standalone 确实模拟的连续、无初值 CreateInfo，并用除法保护每次乘法。
+    if (info.ndims == 0 || info.ndims > kMaxTensorDims ||
+        info.dtype >= DataType::Count || info.has_initial_value ||
+        info.start_offset != 0 || !info.is_contiguous ||
+        info.child_memory != 0) {
+        return false;
+    }
+    // descriptor stride 本身只有 32 bit，因此直接在 uint32_t 域做上界
+    // 校验；这也避免 CCEC 为通用 64x64 溢出检测引入设备端不存在的
+    // __multi3 运行库调用。
+    uint32_t elements = 1;
+    for (uint32_t dimension = 0; dimension < info.ndims; ++dimension) {
+        const uint32_t extent = info.shapes[dimension];
+        if (extent == 0 || elements > UINT32_MAX / extent) {
+            return false;
+        }
+        elements *= extent;
+    }
+    const uint64_t element_size = ElementSize(info.dtype);
+    if (element_size == 0) {
+        return false;
+    }
+    bytes = static_cast<uint64_t>(elements) * element_size;
+    return true;
+}
+#endif
+
+#if PTO_FDWIC_SHARED_MAP
+template <typename Ops>
+#endif
 PA_DEVICE bool MaterializeTask(
     PA_GM WorkerState &worker, uint32_t task_id, const TaskArgs &args, SubmitContext &context,
+#if PTO_FDWIC_SHARED_MAP
+    PA_GM SharedTensorMapSidecar &shared_map,
+#endif
     uint64_t heap_base, uint64_t heap_size
 ) {
     // 输入是 BeginCallbackSubmit 已绑定的 payload/context 与当前 worker.heap_next；成功输出
@@ -1199,8 +1274,17 @@ PA_DEVICE bool MaterializeTask(
     }
 #if PTO_FDWIC_SHARED_MAP
     if (task_id >= kMaxTasks ||
+        args.tensor_count < 0 ||
+        args.tensor_count > static_cast<int32_t>(kMaxTaskTensors) ||
+        args.scalar_count < 0 ||
+        args.scalar_count > static_cast<int32_t>(kMaxTaskScalars) ||
+        args.has_error ||
+        context.result.task_id != task_id ||
+        context.result.count != 0 ||
         context.shared_result.TaskId() != static_cast<int32_t>(task_id) ||
-        context.shared_result.Size() != 0) {
+        context.shared_result.Size() != FrontendTaskOutputCount(
+            static_cast<TaskKind>(task_id % kTasksPerBatch)
+        )) {
         return false;
     }
 #endif
@@ -1217,28 +1301,119 @@ PA_DEVICE bool MaterializeTask(
     uint32_t output_mask = 0;
     uint32_t output_count = 0;
     for (int32_t index = 0; index < args.tensor_count; ++index) {
+#if PTO_FDWIC_SHARED_MAP
+        if (args.tags[index] < static_cast<int32_t>(TensorArgType::Input) ||
+            args.tags[index] >
+                static_cast<int32_t>(TensorArgType::NoDependency)) {
+            return false;
+        }
+#endif
         const TensorArgType tag = TaskTag(args, static_cast<uint32_t>(index));
         if (tag == TensorArgType::Inout || tag == TensorArgType::OutputExisting) {
             context.register_mask |= 1U << index;
         }
         if (tag != TensorArgType::Output) {
+#if PTO_FDWIC_SHARED_MAP
+            // 先把所有后续 CollectFanin/Register 可能解引用的 active ref
+            // 验证完，再允许任一 shared cursor 推进。symbol 只接受当前
+            // 已接入的 plain 形态，且 producer/slot 必须属于已声明输出。
+            const TaskTensorRef &reference = args.tensors[index];
+            if (reference.kind == TensorRefKind::LocalTensor) {
+                if (reference.pointer.local_tensor == nullptr) {
+                    return false;
+                }
+            } else if (reference.kind == TensorRefKind::GmTensor) {
+                if (reference.pointer.gm_tensor == nullptr) {
+                    return false;
+                }
+            } else if (reference.kind == TensorRefKind::SharedOutputRef) {
+                const FdwicOutputRef output_ref =
+                    SharedOutputReference(reference);
+                if (!IsPlainSharedOutputRef(output_ref) ||
+                    output_ref.producer_task_id < 0 ||
+                    output_ref.producer_task_id >=
+                        static_cast<int32_t>(task_id) ||
+                    output_ref.output_slot >= static_cast<int16_t>(
+                        FrontendTaskOutputCount(static_cast<TaskKind>(
+                            static_cast<uint32_t>(
+                                output_ref.producer_task_id
+                            ) % kTasksPerBatch
+                        ))
+                    ) ||
+                    (tag != TensorArgType::Input &&
+                     tag != TensorArgType::Inout &&
+                     tag != TensorArgType::OutputExisting)) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+#endif
             continue;
         }
+#if PTO_FDWIC_SHARED_MAP
+        // Output 必须显式携带 CreateInfo，不能把 union 中其他地址空间的
+        // 位模式误解引用；大小计算失败时也必须在触碰 heap 控制字前退出。
+        if (args.tensors[index].kind != TensorRefKind::CreateInfo) {
+            return false;
+        }
+        if (args.tensors[index].pointer.create_info == nullptr) {
+            return false;
+        }
+        const TensorCreateInfo &create_info =
+            *args.tensors[index].pointer.create_info;
+        if (!SharedCreateInfoBytes(
+                create_info, layout.buffer_sizes[index]
+            )) {
+            return false;
+        }
+#else
+        layout.buffer_sizes[index] =
+            CreateInfoBytes(*args.tensors[index].pointer.create_info);
+#endif
         output_mask |= 1U << index;
         ++output_count;
-        layout.buffer_sizes[index] = CreateInfoBytes(*args.tensors[index].pointer.create_info);
-        layout.total_output_size += FrontendAlignUp(layout.buffer_sizes[index], kOutputAlignment);
+#if PTO_FDWIC_SHARED_MAP
+        if (layout.buffer_sizes[index] >
+            UINT64_MAX - (kOutputAlignment - 1)) {
+            return false;
+        }
+#endif
+        const uint64_t aligned_size =
+            FrontendAlignUp(layout.buffer_sizes[index], kOutputAlignment);
+#if PTO_FDWIC_SHARED_MAP
+        if (aligned_size < layout.buffer_sizes[index] ||
+            UINT64_MAX - layout.total_output_size < aligned_size) {
+            return false;
+        }
+#endif
+        layout.total_output_size += aligned_size;
     }
 #if PTO_FDWIC_SHARED_MAP
-    if (output_count > kSharedOutputMaxPerTask) {
+    if (output_count > kSharedOutputMaxPerTask ||
+        output_count != context.shared_result.Size()) {
         return false;
     }
 #else
     (void)output_count;
 #endif
 
-    uint64_t task_base = FrontendAlignUp(worker.heap_next, kOutputAlignment);
     const uint64_t total = layout.total_output_size;
+#if PTO_FDWIC_SHARED_MAP
+    if (total != 0 &&
+        (heap_base == 0 || heap_base > UINT64_MAX - heap_size)) {
+        return false;
+    }
+    SharedHeapReservation reservation{};
+    if (!ReserveSharedOutputHeap<Ops>(
+            shared_map, task_id, total, heap_size, reservation
+        )) {
+        return false;
+    }
+    uint64_t task_base = reservation.task_base;
+    worker.heap_next = reservation.aggregate_vend;
+#else
+    uint64_t task_base = FrontendAlignUp(worker.heap_next, kOutputAlignment);
     if (total > heap_size || (total != 0 && heap_base == 0)) {
         return false;
     }
@@ -1247,6 +1422,7 @@ PA_DEVICE bool MaterializeTask(
         // 下一圈起点。heap_next 仍保持单调，不在这里取模。
         task_base = (task_base / heap_size + 1) * heap_size;
     }
+#endif
 
     uint64_t output_offset = 0;
     // 各 Output 在同一 task_base 内按参数顺序排布；result 只收集 Output，索引与
@@ -1255,7 +1431,11 @@ PA_DEVICE bool MaterializeTask(
         if ((output_mask & 1U) == 0) {
             continue;
         }
+#if PTO_FDWIC_SHARED_MAP
+        const uint64_t physical = task_base + output_offset;
+#else
         const uint64_t physical = (task_base + output_offset) % heap_size;
+#endif
         PA_GM TensorDesc &tensor = context.payload->tensors[index];
         if (!InitTensorFromCreateInfo(
                 tensor, *args.tensors[index].pointer.create_info, heap_base + physical, layout.buffer_sizes[index]
@@ -1264,19 +1444,13 @@ PA_DEVICE bool MaterializeTask(
         }
         tensor.owner_task_id = task_id;
         const uint32_t output_ordinal = context.result.count;
-#if PTO_FDWIC_SHARED_MAP
-        if (!context.shared_result.AddOutputRef(
-                static_cast<int32_t>(task_id),
-                static_cast<int16_t>(output_ordinal)
-            )) {
-            return false;
-        }
-#endif
         context.result.tensors[output_ordinal] = &tensor;
         ++context.result.count;
         output_offset += FrontendAlignUp(layout.buffer_sizes[index], kOutputAlignment);
     }
+#if !PTO_FDWIC_SHARED_MAP
     worker.heap_next = task_base + total;
+#endif
     context.output_bytes = total;
     return true;
 }
