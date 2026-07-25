@@ -4,8 +4,8 @@
 [`poursoul/simpler:fdwic-shared-tensormap`](https://github.com/poursoul/simpler/tree/fdwic-shared-tensormap)
 在 A5 FDWIC runtime 中实现的 shared TensorMap 方案，并与当前分支 standalone
 方案比较。本文用于后续开发决策，不表示目标分支已经合入，也不把分支文档中的
-实验记录自动当成当前分支的性能结论；当前分支 S0～S2.5 的实际实施证据另记于
-第 15 节。
+实验记录自动当成当前分支的性能结论；当前分支 S0～S3.1 的实际实施证据另记于
+第 15 节。当前继续开发和验收的后端范围固定为 CPU/CCEC。
 
 ## 1. 审查快照与证据口径
 
@@ -791,22 +791,26 @@ Materialize 或 shared heap：
 
 S3 继续拆成两个独立提交，不能同时改变引用 ABI 和分配主体。
 
-S3.1 先按参考实现接入 16B `FdwicOutputRef`、8B
+**S3.1 状态：已完成 CPU/CCEC b1/b256 闭环。**
+
+S3.1 已按参考实现接入 16B `FdwicOutputRef`、8B
 `SharedTaskOutputs` 和每 task 2,048B 的 `SharedOutputCell`：
 
 - 本小步仍保留所有 worker 构参和 Materialize，只有 winner 把 8 类 fresh
   output descriptor 发布到 shared cell；
-- symbol INPUT 读取 `last_writer`，三个 Alloc INOUT 以返回旧值的 Exchange
-  声明当前 writer；旧值小于 0 时回退到 producer task；
+- symbol resolver 只接收 plain ref；INPUT 读取 `last_writer`，三个 Alloc
+  INOUT 以返回旧值的 Exchange 声明当前 writer；
 - symbol 与 `manual_dep=true` 的 output view 都跳过 region lookup/register，
-  因而 Case1 shared region insert 应从当前 4/batch 精确变成 0；
+  因而 Case1 shared region insert 已从 4/batch 精确变成 0；
 - 仍保留 S2.5 ordered winner turn，避免把当前 Case1 的单 writer 事实误推广成
   任意多个 INOUT writer 都可乱序。
 
-**S3.1 Gate**：b1/b256 fresh descriptor 发布为 8/2,048，symbol INPUT load
-为 5/1,280，symbol INOUT Exchange 为 3/768，region insert 为 0/0，fanin
-仍为 5/1,280；依赖边签名保持不变。此步不引入 generation、deferred resolve
-或 shared heap。
+**S3.1 Gate**：b1/b256 fresh descriptor 发布为 8/2,048，symbol INPUT
+load 为 5/1,280，symbol INOUT Exchange 为 3/768，region insert 为 0/0，
+fanin 仍为 5/1,280；依赖边和规范化 writer 签名保持与 private 一致。
+CPU private/shared b1/b256、定向 sanitizer、Python 100 项和 CCEC
+private/shared b1/b256 均通过。此步没有引入 generation、deferred resolve、
+shared heap 或 winner-only Materialize；详细结果见第 15 节。
 
 S3.2 再把 QK/SF/PV/UP 的重参数构造、Materialize 和堆分配收敛到 winner；
 Alloc 是否保留全核轻参数路径按真实 PA 调用点处理。shared heap 首版使用参考
@@ -908,20 +912,22 @@ shared 组合再增加 `-DPTO_FDWIC_SHARED_MAP=1`。两次返回码均为 1，�
 
 ## 14. 后续决策摘要
 
-S0～S2.5 已先在 standalone 回答了构建身份、private/shared 同构逻辑结果、
-region writer 顺序和 ordered reclaim 四个问题；S3 仍需继续回答 symbol 与
-heap 的有界复用问题：
+S0～S3.1 已先在 standalone 回答了构建身份、private/shared 可比逻辑结果、
+region writer 顺序、ordered reclaim 和当前固定 task 上限内的 fresh symbol
+发布/消费问题；S3.2 仍需回答 winner-only Materialize 与 shared heap：
 
 1. 三镜像如何证明自己属于同一个 map/profile ABI？
 2. private/shared 如何基于同构 ring 生成可比较的逻辑依赖结果？
 3. 任意 winner 到达顺序下，writer 链如何仍严格遵守 task 顺序？
 4. region、symbol 和 heap 如何在有界内存中安全复用并可靠终止？
 
-前三项已经由模式握手、ordered ring、host 独立验证和跨模式签名闭环；第四项
-不能拿当前 per-worker heap 冒充答案。四项和 standalone CPU/CCEC 验收全部闭环
-后，目标分支的 winner-first 和符号快路径才适合进入真实代码。否则即使某次
-PA 上板更快，也只能说明特定 workload 没触发协议边界，不能说明 shared
-TensorMap 已经具备可维护、可扩展的架构。
+前三项已经由模式握手、ordered ring、plain symbol resolver、host 独立验证和
+跨模式签名闭环；第四项不能拿当前 per-worker heap 冒充答案。S3.1 的
+`shared_outputs[1280]` 不取模、不复用 task id，因而本阶段有意没有引入
+generation 或 deferred resolve。S3.2 与 standalone CPU/CCEC 验收全部闭环后，
+目标分支的 winner-first、符号快路径和 shared heap 才适合进入真实代码。否则
+即使某次 PA 上板更快，也只能说明特定 workload 没触发协议边界，不能说明
+shared TensorMap 已经具备可维护、可扩展的架构。
 
 ## 15. 当前分支实施记录
 
@@ -1184,3 +1190,126 @@ bucket head 只在
 活性并消除了主要结构性等待。相对 private b256 3.816830 ms 仍有明显差距，
 下一阶段应转向 fresh-output symbol 与 winner-only Materialize，不把 S2.5
 误写成性能终态。
+
+### 2026-07-24：S3.1 fresh-output symbol
+
+本阶段只在 standalone 中迁移 fresh-output symbol，没有同时改变分配主体。
+开发和验收范围明确为 CPU/CCEC。
+
+#### ABI 与状态布局
+
+shared 模式新增的稳定引用与返回句柄为：
+
+| 类型/状态 | 当前布局 |
+| --- | --- |
+| `FdwicOutputRef` | 16B；保存 producer、output slot 和预留的一维 view 字段 |
+| `SharedTaskOutputs` | 8B；保存 producer 和连续 output count |
+| `SharedOutputCell` | 2,048B；8 个 publish line、8 个 writer line、8 个 descriptor |
+| `shared_outputs` | 1,280 个 cell，共 2,621,440B，按 task id 直接寻址 |
+
+`shared_outputs` 追加在 S2.5 的 region ring 之后，offset 为 2,113,664。
+因此 shared sidecar 从 S2.5 的 2,113,664B 扩为 4,735,104B；region ring 的
+committed/reclaim、bucket 和 slot offset 均未改变。完整 shared
+`SchedulerState` 在 CPU 非 split 构建中为 1,011,851,072B，在 CCEC split
+构建中为 1,011,857,216B。构建身份 ABI 版本同步推进到 2，host/device
+继续核对 mode、版本和完整 state size。
+
+这里没有 generation：standalone 最多 1,280 个 task，输出表不取模，也不
+复用 task id。它是本阶段明确的有界条件，不应被外推为真实 runtime 的长期
+复用方案。
+
+#### 发布、解析与 writer 链
+
+所有 worker 仍执行 eager 构参、Materialize 和 per-worker private heap
+分配；b1/b256 的全局 Materialize output 数仍是 768/196,608。只有 ordered
+winner 持有 task N 的 exact turn 后执行以下动作：
+
+1. 只读预检本 task 全部 output slot 的 source、`published` 和
+   `last_writer`；
+2. 用 FetchMax 把全部 `last_writer` 从 -1 初始化为 N；
+3. 将已经物化的 descriptor 复制到 `shared_outputs[N]` 并逐个 flush；
+4. store barrier 后发布每个 `published`；
+5. 提交空/非空 region delta，把 `committed_tasks` 从 N 推进为 N+1。
+
+预检失败时没有共享写入；预留阶段的异常旧值会撤回本 task 已预留的前槽。
+发布位 Exchange 若在 exact-turn 契约外观察到异常旧值，则冷路径撤回全部
+published/last_writer 并清空、flush 本 task descriptor。因此不同 descriptor
+的重复发布和后槽异常都不会污染既有 descriptor 或留下多输出 task 的部分
+控制状态。
+
+consumer 只接受 flags/view 全零的 plain `FdwicOutputRef`。第一遍先校验
+全部引用，读取每个 symbol 的 `published`，并只对 `INPUT` 读取
+`last_writer`；它不修改 writer、payload、统计或输出 fanin。全部通过后才对
+`INOUT`/`OUTPUT_EXISTING` 执行返回旧值的 Exchange、复制 descriptor，并
+一次性发布计数与 fanin。
+writer 必须处于 `[0,current_task)`，同一 task 的重复写引用会被拒绝，再通过
+既有 `AddFanin` 去重。带 view 的引用目前显式失败，没有 deferred resolve
+或静默回退。
+
+实现过程中实际遇到 CCEC 编译器拒绝 `[[block_local]]` runtime state 包含
+非平凡构造函数。正确修复不是使用 `block-local-init` 绕过，而是让
+`FdwicOutputRef` 和 `SharedTaskOutputs` 保持 trivial POD，以显式
+`InvalidSharedOutputRef()` 工厂构造非法值，并用 trivial
+`static_assert` 固化约束。
+
+#### 与 private TensorMap 的可比口径
+
+PA Case1 的 fresh symbol 和 `manual_dep=true` output view 都跳过 shared
+region lookup/register，所以 S3.1 的 shared region raw ring 为空：
+
+- b1/b256 的 region append、physical entry、logical entry 均为 0；
+- raw 空表签名固定为 `14650fb0739d0383`；
+- ordered commit/reclaim 继续由每 task 的空 delta 推进，b256 终态为
+  `committed_tasks=1280`、`reclaim_upto=1214`。
+
+private 仍在 region ring 中保存三个 Alloc writer 和 manual output view。
+因此不能直接比较两种 raw 表。host 使用同一规范化 writer 口径：shared 从
+实际回读的三个 Alloc symbol cell 投影最终 writer，再按 Case1 约定补入
+manual output view；private 使用其 raw logical writer。两者按相同
+bucket/order 计算后必须得到同一签名：
+
+| 规模 | dependency signature | normalized writer signature |
+| --- | --- | --- |
+| b1 | `5cb454393ed48dcb` | `3a3d526c9b23c3db` |
+| b256 | `b7d985d6edb07078` | `556bec7ec8d0f323` |
+
+其中 fresh-symbol writer 来自 shared 执行终态的独立校验；manual view
+则是约定补齐，不是从 shared 执行态独立取证。因此该签名证明的是 PA Case1
+已观测 fresh-symbol writer 与约定 manual-view 投影的一致性，不声称
+shared raw region 与 private raw region 具有相同物理内容，也不把它作为
+manual view 单项对等证据。
+
+#### 正确性与性能结果
+
+门禁结果：
+
+- CPU private/shared b1、b256：全部调度、输出、fanin、map 和终态断言 PASS；
+- 新增 shared symbol 定向测试与 shared ring：ASan/UBSan/leak PASS；
+- standalone Python：100 项 PASS；
+- CCEC shared `submit-pmu none` b1：调度、symbol、PMU owner
+  restore/cleanup 全部 PASS；
+- CCEC private/shared b1、b256：全部断言 PASS。
+
+shared symbol 计数严格闭合：
+
+| 规模 | published outputs | INPUT loads | INOUT exchanges |
+| --- | ---: | ---: | ---: |
+| b1 | 8 | 5 | 3 |
+| b256 | 2,048 | 1,280 | 768 |
+
+同一阶段取得的 CCEC 单进程单次结果为：
+
+| 模式 | b1 Submit | b256 Submit |
+| --- | ---: | ---: |
+| private | 73.318 us | 3.808011 ms |
+| shared S3.1（fail-closed 修正后） | 86.552 us | 27.094219 ms |
+
+S2.5 shared b256 的同类单样本为 26.556193 ms。S3.1 在正确性审计前曾取得
+23.562916 ms，但当时重复发布和后置非法引用的失败路径可能留下部分共享
+状态；补齐全量发布预检与两遍 resolver 后，最终同类单样本为
+27.094219 ms。相对 S2.5 约 +2.03%，但这不是多轮稳定性能基线，不能据此
+宣称稳定回退；
+被撤销的 23.562916 ms 也不能作为有效 S3.1 基线。当前所有 worker 仍重复
+Materialize 和 private heap 分配。S3.2 应继续以独立提交收敛 winner-only
+Materialize 与 shared heap，不在该步夹带 generation、deferred view 或真实
+simpler 迁移。

@@ -83,6 +83,20 @@ else
 
     echo "[TEST] shared TensorMap ordered-ring self-test"
     "$BUILD_DIR/test_shared_tensor_map_ring"
+
+    # fresh-output symbol 与 region ring 是两条独立协议。该用例单独锁定
+    # descriptor 发布、INPUT last-writer load、INOUT exchange、payload
+    # scratch 解析及非法引用 fail-closed，避免只靠完整 96 线程回放偶然覆盖。
+    echo "[BUILD] shared-output symbol self-test"
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/common/test_shared_output_symbols.cpp" \
+        -o "$BUILD_DIR/test_shared_output_symbols"
+
+    echo "[TEST] shared-output symbol self-test"
+    "$BUILD_DIR/test_shared_output_symbols"
 fi
 
 # set -e 保证编译或链接失败时不会打印 complete，也不会在组合构建中继续

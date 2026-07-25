@@ -54,7 +54,7 @@ enum class TensorMapBuildMode : uint32_t {
 constexpr TensorMapBuildMode kCompiledTensorMapMode =
     static_cast<TensorMapBuildMode>(PTO_FDWIC_SHARED_MAP);
 constexpr uint32_t kBuildIdentityMagic = 0x50414249U;  // "PABI"
-constexpr uint32_t kBuildIdentityAbiVersion = 1;
+constexpr uint32_t kBuildIdentityAbiVersion = 2;
 
 // 这里固定的是 PA Case1 的调度拓扑，而不是为了缩小 standalone 人为选择的规模：
 // 每个 batch 依次回放 Alloc/QK/SF/PV/UP 五个 task，32 个 AIC 与 64 个 AIV
@@ -87,6 +87,7 @@ constexpr uint64_t kOutputAlignment = 1024;
 constexpr uint32_t kMaxTensorDims = 5;
 constexpr uint32_t kMaxTaskTensors = 32;
 constexpr uint32_t kMaxTaskScalars = 16;
+constexpr uint32_t kSharedOutputMaxPerTask = 8;
 constexpr uint32_t kPayloadSlots = 2048;
 constexpr uint32_t kPayloadMask = kPayloadSlots - 1;
 constexpr uint32_t kPayloadStride = 4096;
@@ -732,6 +733,24 @@ struct alignas(64) SharedBucketState {
 static_assert(sizeof(SharedBucketState) == 128, "shared TensorMap bucket controls changed");
 static_assert(offsetof(SharedBucketState, tail) == 64, "shared head/tail must not share a cache line");
 
+#if PTO_FDWIC_SHARED_MAP
+// fresh Output 不再借助 region map 按地址查找，而是由
+// (producer_task_id, output_slot) 直接定位。descriptor 发布位、writer 链
+// 和不可变 descriptor 分属独立 cache line 区域，避免三种访问彼此伪共享。
+// standalone 本阶段最多 1280 个 task，且不复用 task id，因此外层表直接按
+// task_id 寻址，不做取模，也不在这里提前引入 generation。
+struct alignas(64) SharedOutputCell {
+    AtomicLine published[kSharedOutputMaxPerTask];
+    AtomicLine last_writer[kSharedOutputMaxPerTask];
+    TensorDesc tensors[kSharedOutputMaxPerTask];
+};
+static_assert(sizeof(SharedOutputCell) == 2048, "shared output cell size changed");
+static_assert(alignof(SharedOutputCell) == 64, "shared output cell alignment changed");
+static_assert(offsetof(SharedOutputCell, published) == 0, "shared output publish offset mismatch");
+static_assert(offsetof(SharedOutputCell, last_writer) == 512, "shared output writer offset mismatch");
+static_assert(offsetof(SharedOutputCell, tensors) == 1024, "shared output tensor offset mismatch");
+#endif
+
 struct alignas(64) SharedTensorMapSidecar {
     // committed_tasks 是已按 task_id 连续发布的数量：初始 0，任务 N（即使
     // 没有 region entry）发布完成后变为 N+1。
@@ -742,8 +761,21 @@ struct alignas(64) SharedTensorMapSidecar {
     AtomicLine reclaim_upto;
     SharedBucketState buckets[kMapBuckets];
     SharedRegionSlot slots[kMapCapacity];
+#if PTO_FDWIC_SHARED_MAP
+    // 追加在既有 S2.5 region ring 之后，保持 committed/reclaim、bucket 和
+    // slot 的全部 offset 不变；现有 shared sidecar H2D/D2H 按 sizeof 搬运。
+    SharedOutputCell shared_outputs[kMaxTasks];
+#endif
 };
-static_assert(sizeof(SharedTensorMapSidecar) == 2113664, "shared TensorMap sidecar size changed");
+#if PTO_FDWIC_SHARED_MAP
+static_assert(sizeof(SharedTensorMapSidecar) == 4735104, "shared TensorMap sidecar size changed");
+static_assert(
+    offsetof(SharedTensorMapSidecar, shared_outputs) == 2113664,
+    "shared output table offset mismatch"
+);
+#else
+static_assert(sizeof(SharedTensorMapSidecar) == 2113664, "private sidecar layout changed");
+#endif
 static_assert(alignof(SharedTensorMapSidecar) == 64, "shared TensorMap sidecar alignment changed");
 static_assert(
     offsetof(SharedTensorMapSidecar, buckets) == 128,
@@ -979,9 +1011,12 @@ struct alignas(64) WorkerResult {
     uint64_t final_barrier_begin;
     uint64_t final_barrier_release;
     uint64_t final_barrier_end;
-    // 不扩大结果 ABI：首槽复用为本 worker 赢得任务的 fanin-edge XOR
-    // 签名，后两槽继续保留并必须为零。
-    uint64_t barrier_reserved[3];
+    // 复用原 barrier_reserved[3] 的 24B，不扩大 WorkerResult。dependency
+    // signature 继续闭合 fanin 拓扑；后两项统计 shared symbol 的
+    // last_writer INPUT load 和 INOUT exchange，private 构建必须保持零。
+    uint64_t dependency_signature;
+    uint64_t shared_symbol_input_loads;
+    uint64_t shared_symbol_inout_exchanges;
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
     // split 协议诊断独占一条 cache line。普通 CPU/AscendC 与局部 PMU
     // 构建不带这些字段，不改变它们的 WorkerResult ABI。
@@ -1014,6 +1049,13 @@ static_assert(offsetof(WorkerResult, pmu_window_ticks) == 744, "WorkerResult PMU
 static_assert(offsetof(WorkerResult, pmu_vector_busy) == 776, "WorkerResult extended PMU offset mismatch");
 static_assert(offsetof(WorkerResult, pmu_build_variant) == 800, "WorkerResult submit-PMU offset mismatch");
 static_assert(offsetof(WorkerResult, pmu_shadow_icache_misses) == 828, "WorkerResult submit-PMU tail mismatch");
+static_assert(offsetof(WorkerResult, dependency_signature) == 872, "WorkerResult dependency signature offset mismatch");
+static_assert(offsetof(WorkerResult, shared_symbol_input_loads) == 880,
+              "WorkerResult shared symbol-load offset mismatch");
+static_assert(
+    offsetof(WorkerResult, shared_symbol_inout_exchanges) == 888,
+    "WorkerResult shared symbol-exchange offset mismatch"
+);
 
 // 从 cube_cursor 到 workers 结束保留关键字段 offset、DistCore ABI 和生产总字节跨度，
 // 并非字段级完整镜像。RunConfig、输入 context_lens 与校验结果追加在该跨度之后，

@@ -252,6 +252,15 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     for (uint32_t slot = 0; slot < kMapCapacity; ++slot) {
         state->shared_map.slots[slot].seq.value = -1;
     }
+    // 每个 task 的 fresh Output 只在本轮使用一次，发布位与最后 writer 都用
+    // -1 表示“尚无可消费 descriptor”。TensorDesc 区已由上方 memset 清零；
+    // 不对 task_id 取模，避免在本阶段提前引入 generation 语义。
+    for (uint32_t task_id = 0; task_id < kMaxTasks; ++task_id) {
+        for (uint32_t slot = 0; slot < kSharedOutputMaxPerTask; ++slot) {
+            state->shared_map.shared_outputs[task_id].published[slot].value = -1;
+            state->shared_map.shared_outputs[task_id].last_writer[slot].value = -1;
+        }
+    }
 #endif
     state->heap_window = kHeapWindow;
     state->heap_base = kSyntheticHeapBase;
@@ -313,7 +322,11 @@ inline constexpr size_t ControlBytes() {
 inline constexpr size_t ResultBytes() { return sizeof(WorkerResult) * kWorkers; }
 
 inline constexpr size_t SharedSidecarBytes() { return sizeof(SharedTensorMapSidecar); }
-static_assert(SharedSidecarBytes() == 2113664, "shared TensorMap transfer size changed");
+#if PTO_FDWIC_SHARED_MAP
+static_assert(SharedSidecarBytes() == 4735104, "shared TensorMap transfer size changed");
+#else
+static_assert(SharedSidecarBytes() == 2113664, "private TensorMap transfer size changed");
+#endif
 
 inline constexpr size_t FinalBarrierStateBytes() { return sizeof(FinalBarrierState); }
 
@@ -1138,15 +1151,6 @@ inline uint64_t ExpectedPaDependencySignature(uint32_t batches) {
     return signature;
 }
 
-#if PTO_FDWIC_SHARED_MAP
-struct SharedTensorMapValidation {
-    bool protocol_ok = true;
-    uint64_t total_appends = 0;
-    uint64_t physical_entries = 0;
-    uint64_t logical_entries = 0;
-    uint64_t logical_signature = 1469598103934665603ULL;
-};
-
 inline uint32_t SharedTensorMapHashHost(uint64_t address) {
     address *= 0x9E3779B97F4A7C15ULL;
     return static_cast<uint32_t>(
@@ -1163,9 +1167,17 @@ inline void SharedLogicalHashWord(uint64_t *hash, uint64_t value) {
     }
 }
 
+#if PTO_FDWIC_SHARED_MAP
+struct SharedTensorMapValidation {
+    bool protocol_ok = true;
+    uint64_t total_appends = 0;
+    uint64_t physical_entries = 0;
+    uint64_t logical_entries = 0;
+    uint64_t logical_signature = 1469598103934665603ULL;
+};
+
 inline SharedTensorMapValidation ValidateSharedTensorMap(
-    const SharedTensorMapSidecar &map, uint32_t task_count,
-    uint32_t logical_floor
+    const SharedTensorMapSidecar &map, uint32_t task_count
 ) {
     SharedTensorMapValidation validation;
     validation.protocol_ok &=
@@ -1179,74 +1191,322 @@ inline SharedTensorMapValidation ValidateSharedTensorMap(
     validation.protocol_ok &=
         map.reclaim_upto.value == expected_reclaim;
 
-    std::vector<uint32_t> logical_entries_by_task(task_count, 0);
+    // S3.1 的 fresh Output 已改由 shared_outputs 直接按
+    // (producer_task_id, output_slot) 定位；Case1 中的唯一 ordinary
+    // output_view 又是 manual_dep。因此 region ring 必须完全为空，但仍由
+    // 每个 ordered winner 提交空 delta 推进 committed/reclaim。
+    const SharedRegionPayload zero_payload{};
     for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
         const int64_t head = map.buckets[bucket].head.value;
         const int64_t tail = map.buckets[bucket].tail.value;
-        if (head < 0 || tail < head ||
-            static_cast<uint64_t>(tail - head) >
-                kMapBucketCapacity) {
-            validation.protocol_ok = false;
-            continue;
-        }
-        validation.total_appends += static_cast<uint64_t>(tail);
-        validation.physical_entries +=
-            static_cast<uint64_t>(tail - head);
-        for (int64_t cursor = head; cursor < tail; ++cursor) {
-            const uint32_t slot_index =
-                bucket * kMapBucketCapacity +
-                (static_cast<uint32_t>(cursor) &
-                 kMapBucketSlotMask);
-            const SharedRegionSlot &slot = map.slots[slot_index];
-            const SharedRegionValue &value = slot.payload.value;
-            const bool slot_ok =
-                slot.seq.value == cursor && value.reserved == 0 &&
-                value.lo < value.hi && value.producer >= 0 &&
-                value.producer < static_cast<int32_t>(task_count) &&
-                SharedTensorMapHashHost(value.buffer_addr) == bucket;
-            if (!slot_ok) {
-                validation.protocol_ok = false;
-                continue;
-            }
-            if (value.producer <
-                static_cast<int32_t>(logical_floor)) {
-                continue;
-            }
-            ++validation.logical_entries;
-            ++logical_entries_by_task[
-                static_cast<uint32_t>(value.producer)
-            ];
-            SharedLogicalHashWord(
-                &validation.logical_signature, bucket
-            );
-            SharedLogicalHashWord(
-                &validation.logical_signature, value.buffer_addr
-            );
-            SharedLogicalHashWord(
-                &validation.logical_signature, value.lo
-            );
-            SharedLogicalHashWord(
-                &validation.logical_signature, value.hi
-            );
-            SharedLogicalHashWord(
-                &validation.logical_signature,
-                static_cast<uint32_t>(value.producer)
-            );
-        }
+        validation.protocol_ok &= head == 0 && tail == 0;
     }
-
-    for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
-        const uint32_t expected =
-            task_id >= logical_floor &&
-                    static_cast<TaskKind>(
-                        task_id % kTasksPerBatch
-                    ) == TaskKind::Up
-                ? kPaCase1MapEntriesPerBatch
-                : 0;
-        validation.protocol_ok &=
-            logical_entries_by_task[task_id] == expected;
+    for (uint32_t slot = 0; slot < kMapCapacity; ++slot) {
+        validation.protocol_ok &= map.slots[slot].seq.value == -1;
+        validation.protocol_ok &= std::memcmp(
+            &map.slots[slot].payload, &zero_payload,
+            sizeof(zero_payload)
+        ) == 0;
     }
     return validation;
+}
+#endif
+
+inline uint32_t ExpectedOutputCount(uint32_t task_id) {
+    switch (static_cast<TaskKind>(task_id % kTasksPerBatch)) {
+        case TaskKind::Alloc: return 3;
+        case TaskKind::Qk: return 1;
+        case TaskKind::Sf: return 3;
+        case TaskKind::Pv: return 1;
+        case TaskKind::Up: return 0;
+        case TaskKind::Count: return 0;
+    }
+    return 0;
+}
+
+// host_support 只依赖 pa_model，不能反向 include 设备端 pa_frontend；这里保留
+// Case1 协议已固定的 descriptor 常量和 dtype 字节数，避免 host 校验引入设备代码。
+constexpr uint32_t kHostPaHeads = 16;
+constexpr uint32_t kHostPaHeadDim = 128;
+constexpr uint32_t kHostPaBlockSize = 128;
+constexpr uint32_t kHostPaBlocksPerRequest = 64;
+constexpr uint64_t kHostSyntheticOutputBase = 0x600000000ULL;
+constexpr uint64_t kHostInvalidTaskId = UINT64_MAX;
+
+inline uint64_t HostElementSize(DataType dtype) {
+    switch (dtype) {
+        case DataType::Float32:
+        case DataType::Int32:
+        case DataType::Uint32:
+            return 4;
+        case DataType::Float16:
+        case DataType::Bfloat16:
+        case DataType::Int16:
+        case DataType::Uint16:
+            return 2;
+        case DataType::Int8:
+        case DataType::Uint8:
+        case DataType::Bool:
+            return 1;
+        case DataType::Int64:
+        case DataType::Uint64:
+            return 8;
+        case DataType::Count:
+            return 0;
+    }
+    return 0;
+}
+
+inline TensorDesc ExpectedSharedOutputDescriptor(
+    uint32_t task_id, uint32_t output_slot
+) {
+    // 这里按 MaterializeTask 的固定 PA Case1 布局重建 descriptor；只使用
+    // 其语义字段，不把 TensorDesc 的保留 padding 当作协议内容比较。
+    const uint32_t batch = task_id / kTasksPerBatch;
+    const uint64_t batch_base = static_cast<uint64_t>(batch) * 806912ULL;
+    uint64_t task_base = 0;
+    uint64_t output_offset = 0;
+    uint64_t buffer_size = 0;
+    uint32_t ndims = 0;
+    DataType dtype = DataType::Float32;
+    uint32_t shapes[kMaxTensorDims] = {};
+    const TaskKind kind = static_cast<TaskKind>(task_id % kTasksPerBatch);
+    if (kind == TaskKind::Alloc) {
+        task_base = batch_base;
+        if (output_slot == 0) {
+            buffer_size = 8192;
+            ndims = 2;
+            shapes[0] = kHostPaHeads;
+            shapes[1] = kHostPaHeadDim;
+        } else if (output_slot == 1 || output_slot == 2) {
+            output_offset = output_slot == 1 ? 8192 : 9216;
+            buffer_size = 64;
+            ndims = 1;
+            shapes[0] = kHostPaHeads;
+        }
+    } else if (kind == TaskKind::Qk && output_slot == 0) {
+        task_base = batch_base + 10240;
+        buffer_size = 524288;
+        ndims = 2;
+        shapes[0] = kHostPaHeads;
+        shapes[1] = kHostPaBlocksPerRequest * kHostPaBlockSize;
+    } else if (kind == TaskKind::Sf) {
+        task_base = batch_base + 534528;
+        if (output_slot == 0) {
+            buffer_size = 262144;
+            ndims = 2;
+            dtype = DataType::Bfloat16;
+            shapes[0] = kHostPaHeads;
+            shapes[1] = kHostPaBlocksPerRequest * kHostPaBlockSize;
+        } else if (output_slot == 1 || output_slot == 2) {
+            output_offset = output_slot == 1 ? 262144 : 263168;
+            buffer_size = 64;
+            ndims = 1;
+            shapes[0] = kHostPaHeads;
+        }
+    } else if (kind == TaskKind::Pv && output_slot == 0) {
+        task_base = batch_base + 798720;
+        buffer_size = 8192;
+        ndims = 2;
+        shapes[0] = kHostPaHeads;
+        shapes[1] = kHostPaHeadDim;
+    }
+
+    TensorDesc expected{};
+    expected.buffer_addr = kSyntheticHeapBase + task_base + output_offset;
+    expected.buffer_size = buffer_size;
+    expected.owner_task_id = task_id;
+    expected.start_offset = 0;
+    expected.version = 0;
+    expected.ndims = ndims;
+    expected.dtype = dtype;
+    expected.manual_dep = false;
+    expected.is_contiguous = true;
+    expected.child_memory = 0;
+    uint32_t stride = 1;
+    for (int32_t index = static_cast<int32_t>(ndims) - 1; index >= 0; --index) {
+        expected.strides[index] = stride;
+        stride *= shapes[index];
+    }
+    expected.extent_elem_cache = stride;
+    for (uint32_t index = 0; index < kMaxTensorDims; ++index) {
+        expected.shapes[index] = shapes[index];
+    }
+    return expected;
+}
+
+inline bool TensorDescFieldsMatch(
+    const TensorDesc &actual, const TensorDesc &expected
+) {
+    if (actual.buffer_addr != expected.buffer_addr ||
+        actual.buffer_size != expected.buffer_size ||
+        actual.owner_task_id != expected.owner_task_id ||
+        actual.start_offset != expected.start_offset ||
+        actual.version != expected.version || actual.ndims != expected.ndims ||
+        actual.dtype != expected.dtype || actual.manual_dep != expected.manual_dep ||
+        actual.is_contiguous != expected.is_contiguous ||
+        actual.child_memory != expected.child_memory ||
+        actual.extent_elem_cache != expected.extent_elem_cache) {
+        return false;
+    }
+    for (uint32_t index = 0; index < kMaxTensorDims; ++index) {
+        if (actual.shapes[index] != expected.shapes[index] ||
+            actual.strides[index] != expected.strides[index]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+#if PTO_FDWIC_SHARED_MAP
+struct SharedOutputValidation {
+    bool protocol_ok = true;
+    uint64_t published_outputs = 0;
+};
+
+inline SharedOutputValidation ValidateSharedOutputs(
+    const SharedTensorMapSidecar &map, uint32_t task_count
+) {
+    SharedOutputValidation validation;
+    const TensorDesc zero_tensor{};
+    for (uint32_t task_id = 0; task_id < kMaxTasks; ++task_id) {
+        const uint32_t expected_count =
+            task_id < task_count ? ExpectedOutputCount(task_id) : 0;
+        for (uint32_t slot = 0; slot < kSharedOutputMaxPerTask; ++slot) {
+            const SharedOutputCell &cell = map.shared_outputs[task_id];
+            const bool active = slot < expected_count;
+            if (!active) {
+                validation.protocol_ok &= cell.published[slot].value == -1;
+                validation.protocol_ok &= cell.last_writer[slot].value == -1;
+                validation.protocol_ok &= std::memcmp(
+                    &cell.tensors[slot], &zero_tensor, sizeof(zero_tensor)
+                ) == 0;
+                continue;
+            }
+            const TaskKind kind = static_cast<TaskKind>(task_id % kTasksPerBatch);
+            const int64_t expected_writer = kind == TaskKind::Alloc
+                ? static_cast<int64_t>(task_id + 4)
+                : static_cast<int64_t>(task_id);
+            validation.protocol_ok &=
+                cell.published[slot].value == static_cast<int64_t>(task_id);
+            validation.protocol_ok &= cell.last_writer[slot].value == expected_writer;
+            validation.protocol_ok &= TensorDescFieldsMatch(
+                cell.tensors[slot], ExpectedSharedOutputDescriptor(task_id, slot)
+            );
+            ++validation.published_outputs;
+        }
+    }
+    return validation;
+}
+#endif
+
+struct NormalizedWriterEntry {
+    uint64_t buffer_addr;
+    uint64_t lo;
+    uint64_t hi;
+    uint32_t producer;
+};
+
+inline void AddNormalizedWriter(
+    std::vector<NormalizedWriterEntry> buckets[kMapBuckets],
+    const TensorDesc &tensor, uint32_t producer
+) {
+    const uint64_t element_size = HostElementSize(tensor.dtype);
+    uint64_t extent = tensor.is_contiguous ? 1 : tensor.extent_elem_cache;
+    if (tensor.is_contiguous) {
+        for (uint32_t index = 0; index < tensor.ndims; ++index) {
+            extent *= tensor.shapes[index];
+        }
+    }
+    const uint64_t lo = tensor.start_offset * element_size;
+    const uint64_t hi = (tensor.start_offset + extent) * element_size;
+    buckets[SharedTensorMapHashHost(tensor.buffer_addr)].push_back(
+        {tensor.buffer_addr, lo, hi, producer}
+    );
+}
+
+inline TensorDesc ExpectedManualOutputView(uint32_t batch, uint32_t batches) {
+    TensorDesc view{};
+    view.buffer_addr = kHostSyntheticOutputBase;
+    view.buffer_size = static_cast<uint64_t>(batches) * kHostPaHeads * kHostPaHeadDim * 4;
+    view.owner_task_id = kHostInvalidTaskId;
+    view.start_offset = static_cast<uint64_t>(batch) * kHostPaHeads * kHostPaHeadDim;
+    view.version = 0;
+    view.ndims = 2;
+    view.dtype = DataType::Float32;
+    view.manual_dep = true;
+    view.is_contiguous = true;
+    view.child_memory = 0;
+    view.shapes[0] = kHostPaHeads;
+    view.shapes[1] = kHostPaHeadDim;
+    view.extent_elem_cache = kHostPaHeads * kHostPaHeadDim;
+    view.strides[0] = kHostPaHeadDim;
+    view.strides[1] = 1;
+    return view;
+}
+
+inline uint64_t FinishNormalizedWriterSignature(
+    std::vector<NormalizedWriterEntry> buckets[kMapBuckets]
+) {
+    uint64_t signature = 1469598103934665603ULL;
+    for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
+        for (const NormalizedWriterEntry &entry : buckets[bucket]) {
+            SharedLogicalHashWord(&signature, bucket);
+            SharedLogicalHashWord(&signature, entry.buffer_addr);
+            SharedLogicalHashWord(&signature, entry.lo);
+            SharedLogicalHashWord(&signature, entry.hi);
+            SharedLogicalHashWord(&signature, entry.producer);
+        }
+    }
+    return signature;
+}
+
+inline uint64_t ExpectedNormalizedWriterSignature(
+    uint32_t batches, uint32_t logical_floor
+) {
+    std::vector<NormalizedWriterEntry> by_bucket[kMapBuckets];
+    for (uint32_t batch = 0; batch < batches; ++batch) {
+        const uint32_t alloc = batch * kTasksPerBatch;
+        const uint32_t up = alloc + 4;
+        if (up < logical_floor) {
+            continue;
+        }
+        // RegisterOutputs 的真实顺序是 max、sum、output、manual output_view。
+        AddNormalizedWriter(by_bucket, ExpectedSharedOutputDescriptor(alloc, 2), up);
+        AddNormalizedWriter(by_bucket, ExpectedSharedOutputDescriptor(alloc, 1), up);
+        AddNormalizedWriter(by_bucket, ExpectedSharedOutputDescriptor(alloc, 0), up);
+        AddNormalizedWriter(by_bucket, ExpectedManualOutputView(batch, batches), up);
+    }
+    return FinishNormalizedWriterSignature(by_bucket);
+}
+
+#if PTO_FDWIC_SHARED_MAP
+inline uint64_t SharedNormalizedWriterSignature(
+    const SharedTensorMapSidecar &map, uint32_t batches, uint32_t logical_floor
+) {
+    std::vector<NormalizedWriterEntry> by_bucket[kMapBuckets];
+    for (uint32_t batch = 0; batch < batches; ++batch) {
+        const uint32_t alloc = batch * kTasksPerBatch;
+        const uint32_t up = alloc + 4;
+        if (up < logical_floor) {
+            continue;
+        }
+        const SharedOutputCell &cell = map.shared_outputs[alloc];
+        AddNormalizedWriter(
+            by_bucket, cell.tensors[2],
+            static_cast<uint32_t>(cell.last_writer[2].value)
+        );
+        AddNormalizedWriter(
+            by_bucket, cell.tensors[1],
+            static_cast<uint32_t>(cell.last_writer[1].value)
+        );
+        AddNormalizedWriter(
+            by_bucket, cell.tensors[0],
+            static_cast<uint32_t>(cell.last_writer[0].value)
+        );
+        AddNormalizedWriter(by_bucket, ExpectedManualOutputView(batch, batches), up);
+    }
+    return FinishNormalizedWriterSignature(by_bucket);
 }
 #endif
 
@@ -1311,6 +1571,8 @@ inline Metrics Validate(
     uint64_t slot_scalar_copies = 0;
     uint64_t fanin_edges = 0;
     uint64_t dependency_signature = 0;
+    uint64_t shared_symbol_input_loads = 0;
+    uint64_t shared_symbol_inout_exchanges = 0;
     bool worker_ids[kWorkers] = {};
     uint32_t aic_count = 0;
     uint32_t aiv_count = 0;
@@ -1365,18 +1627,32 @@ inline Metrics Validate(
             }
         }
     }
-    // TensorMap 只保留 heap window 内仍可能被依赖的四类输出；floor 对应已安全退休的 task 边界。
-    const uint64_t expected_map_live =
+    // private ring 仍保留 heap window 内的四类 writer。shared S3.1 的 fresh
+    // Output 已迁出 region ring，因此它的 region live/high-water 为零；但
+    // ordered committed/reclaim 仍沿用同一 logical floor。
+#if !PTO_FDWIC_SHARED_MAP
+    const uint64_t expected_private_map_live =
         static_cast<uint64_t>(kPaCase1MapEntriesPerBatch) *
         std::min<uint32_t>(batches, kPaCase1MaxLiveMapBatches);
+#endif
     const uint64_t expected_map_floor = task_count > kHeapWindow + 1 ? task_count - kHeapWindow - 1 : 0;
 #if PTO_FDWIC_SHARED_MAP
     const SharedTensorMapValidation shared_map_validation =
-        ValidateSharedTensorMap(
-            state.shared_map, task_count,
-            static_cast<uint32_t>(expected_map_floor)
-        );
+        ValidateSharedTensorMap(state.shared_map, task_count);
+    const SharedOutputValidation shared_output_validation =
+        ValidateSharedOutputs(state.shared_map, task_count);
+    const uint64_t shared_normalized_writer_signature =
+        shared_output_validation.protocol_ok
+            ? SharedNormalizedWriterSignature(
+                  state.shared_map, batches,
+                  static_cast<uint32_t>(expected_map_floor)
+              )
+            : 0;
 #endif
+    const uint64_t expected_normalized_writer_signature =
+        ExpectedNormalizedWriterSignature(
+            batches, static_cast<uint32_t>(expected_map_floor)
+        );
 
     for (uint32_t index = 0; index < kWorkers; ++index) {
         // 每核只写自己独占且按 cache line 隔离的 WorkerResult；host 在 kernel 完成后统一汇总，不引入额外 atomic。
@@ -1401,10 +1677,9 @@ inline Metrics Validate(
         lifecycle_timestamps_ok &= result.final_barrier_release >= result.final_barrier_begin;
         lifecycle_timestamps_ok &= result.final_barrier_end >= result.final_barrier_release;
         lifecycle_timestamps_ok &= result.finish_cycle >= result.final_barrier_end;
-        dependency_signature ^= result.barrier_reserved[0];
-        lifecycle_timestamps_ok &=
-            result.barrier_reserved[1] == 0 &&
-            result.barrier_reserved[2] == 0;
+        dependency_signature ^= result.dependency_signature;
+        shared_symbol_input_loads += result.shared_symbol_input_loads;
+        shared_symbol_inout_exchanges += result.shared_symbol_inout_exchanges;
         first_submit = std::min(first_submit, result.submit_begin);
         last_submit = std::max(last_submit, result.submit_end);
         first_startup_begin = std::min(first_startup_begin, result.startup_barrier_begin);
@@ -1474,18 +1749,23 @@ inline Metrics Validate(
         frontend_worker_counts_ok &= result.scalar_args_added == static_cast<uint64_t>(batches) * 9;
         frontend_worker_counts_ok &= result.materialized_outputs == static_cast<uint64_t>(batches) * 8;
 #if PTO_FDWIC_SHARED_MAP
-        // eager S2 仍由每核构参/Materialize，但 region 只由每 task winner
-        // 追加；单核 insert 数取决于 winner 分布，只能在全局闭合。
-        frontend_worker_counts_ok &=
-            result.map_inserts <=
-            static_cast<uint64_t>(batches) *
-                kPaCase1MapEntriesPerBatch;
+        frontend_worker_counts_ok &= result.map_inserts == 0;
 #else
         frontend_worker_counts_ok &= result.map_inserts == static_cast<uint64_t>(batches) * 4;
 #endif
         final_worker_state_ok &= result.final_heap_next == expected_heap_next;
-        final_worker_state_ok &= result.map_high_water == expected_map_live;
-        final_worker_state_ok &= result.map_live_entries == expected_map_live;
+        final_worker_state_ok &= result.map_high_water ==
+#if PTO_FDWIC_SHARED_MAP
+            0;
+#else
+            expected_private_map_live;
+#endif
+        final_worker_state_ok &= result.map_live_entries ==
+#if PTO_FDWIC_SHARED_MAP
+            0;
+#else
+            expected_private_map_live;
+#endif
         final_worker_state_ok &= result.map_alive_floor == expected_map_floor;
         final_worker_state_ok &= result.map_cleaned_upto == expected_map_floor;
 #if PTO_FDWIC_SHARED_MAP
@@ -1626,8 +1906,7 @@ inline Metrics Validate(
     Expect(frontend_worker_counts_ok, "every worker replays the exact PA frontend operation counts", &metrics);
     const uint64_t expected_global_map_inserts =
 #if PTO_FDWIC_SHARED_MAP
-        static_cast<uint64_t>(batches) *
-        kPaCase1MapEntriesPerBatch;
+        0;
 #else
         static_cast<uint64_t>(kWorkers) * batches *
         kPaCase1MapEntriesPerBatch;
@@ -1644,12 +1923,43 @@ inline Metrics Validate(
         "global PA frontend operation totals are exact", &metrics
     );
     Expect(
-        map_lookups == static_cast<uint64_t>(batches) * 14 &&
+        map_lookups ==
+#if PTO_FDWIC_SHARED_MAP
+            0 &&
+#else
+            static_cast<uint64_t>(batches) * 14 &&
+#endif
             slot_tensor_copies == static_cast<uint64_t>(batches) * 19 &&
             slot_scalar_copies == static_cast<uint64_t>(batches) * 9 &&
             fanin_edges == static_cast<uint64_t>(batches) * 5,
-        "winner-only map, slot-copy, and fanin totals are exact", &metrics
+        "winner-only TensorMap/symbol, slot-copy, and fanin totals are exact", &metrics
     );
+    Expect(
+        shared_symbol_input_loads ==
+#if PTO_FDWIC_SHARED_MAP
+            static_cast<uint64_t>(batches) * 5 &&
+#else
+            0 &&
+#endif
+        shared_symbol_inout_exchanges ==
+#if PTO_FDWIC_SHARED_MAP
+            static_cast<uint64_t>(batches) * 3,
+#else
+            0,
+#endif
+        "shared symbol INPUT-load / INOUT-exchange totals are exact", &metrics
+    );
+#if PTO_FDWIC_SHARED_MAP
+    std::printf(
+        "[SHARED_SYMBOL] published_outputs=%llu input_loads=%llu "
+        "inout_exchanges=%llu\n",
+        static_cast<unsigned long long>(
+            shared_output_validation.published_outputs
+        ),
+        static_cast<unsigned long long>(shared_symbol_input_loads),
+        static_cast<unsigned long long>(shared_symbol_inout_exchanges)
+    );
+#endif
     const uint64_t expected_dependency_signature =
         ExpectedPaDependencySignature(batches);
     Expect(
@@ -1669,18 +1979,32 @@ inline Metrics Validate(
 #if PTO_FDWIC_SHARED_MAP
     Expect(
         shared_map_validation.protocol_ok &&
-            shared_map_validation.total_appends ==
-                static_cast<uint64_t>(batches) *
-                    kPaCase1MapEntriesPerBatch &&
-            shared_map_validation.logical_entries ==
-                expected_map_live,
-        "shared ordered ring commit/reclaim/seq/logical window is exact",
+            shared_map_validation.total_appends == 0 &&
+            shared_map_validation.physical_entries == 0 &&
+            shared_map_validation.logical_entries == 0 &&
+            shared_map_validation.logical_signature == 1469598103934665603ULL,
+        "shared empty region ring keeps ordered commit/reclaim exact",
+        &metrics
+    );
+    Expect(
+        shared_output_validation.protocol_ok &&
+            shared_output_validation.published_outputs ==
+                static_cast<uint64_t>(batches) * 8,
+        "shared fresh-output table publishes exact descriptors and writers",
+        &metrics
+    );
+    Expect(
+        shared_output_validation.protocol_ok &&
+            shared_normalized_writer_signature ==
+            expected_normalized_writer_signature,
+        "shared symbol projection matches canonical normalized writer signature",
         &metrics
     );
     std::printf(
         "[TENSORMAP] mode=shared committed=%lld reclaim_upto=%lld "
-        "total_appends=%llu physical_entries=%llu logical_entries=%llu "
-        "logical_floor=%llu logical_signature=%016llx\n",
+        "region_appends=%llu region_physical=%llu region_logical=%llu "
+        "region_raw_signature=%016llx normalized_writer_signature=%016llx "
+        "published_outputs=%llu logical_floor=%llu\n",
         static_cast<long long>(
             state.shared_map.committed_tasks.value
         ),
@@ -1694,19 +2018,33 @@ inline Metrics Validate(
         static_cast<unsigned long long>(
             shared_map_validation.logical_entries
         ),
-        static_cast<unsigned long long>(expected_map_floor),
         static_cast<unsigned long long>(
             shared_map_validation.logical_signature
-        )
+        ),
+        static_cast<unsigned long long>(
+            shared_normalized_writer_signature
+        ),
+        static_cast<unsigned long long>(
+            shared_output_validation.published_outputs
+        ),
+        static_cast<unsigned long long>(expected_map_floor)
     );
 #else
+    Expect(
+        private_logical_map_signature == expected_normalized_writer_signature,
+        "private raw TensorMap checksum matches canonical normalized writer signature",
+        &metrics
+    );
     std::printf(
-        "[TENSORMAP] mode=private logical_entries=%llu "
-        "logical_floor=%llu logical_signature=%016llx\n",
-        static_cast<unsigned long long>(expected_map_live),
+        "[TENSORMAP] mode=private logical_entries=%llu logical_floor=%llu "
+        "region_raw_signature=%016llx normalized_writer_signature=%016llx\n",
+        static_cast<unsigned long long>(expected_private_map_live),
         static_cast<unsigned long long>(expected_map_floor),
         static_cast<unsigned long long>(
             private_logical_map_signature
+        ),
+        static_cast<unsigned long long>(
+            expected_normalized_writer_signature
         )
     );
 #endif

@@ -58,10 +58,14 @@ static_assert(sizeof(SharedRegionSlot) == 128, "shared slot must occupy two cach
 static_assert(offsetof(SharedRegionSlot, seq) == 64, "shared seq cache line offset changed");
 static_assert(sizeof(SharedBucketState) == 128, "shared bucket control ABI changed");
 static_assert(offsetof(SharedBucketState, tail) == 64, "shared head/tail cache lines merged");
-static_assert(sizeof(SharedTensorMapSidecar) == 2113664, "shared sidecar ABI changed");
+static_assert(sizeof(SharedTensorMapSidecar) == 4735104, "shared sidecar ABI changed");
 static_assert(alignof(SharedTensorMapSidecar) == 64, "shared sidecar alignment changed");
 static_assert(offsetof(SharedTensorMapSidecar, buckets) == 128, "shared bucket offset changed");
 static_assert(offsetof(SharedTensorMapSidecar, slots) == 16512, "shared slot offset changed");
+static_assert(
+    offsetof(SharedTensorMapSidecar, shared_outputs) == 2113664,
+    "shared output table offset changed"
+);
 
 enum class EventKind : uint8_t {
     Load,
@@ -200,6 +204,15 @@ void ResetSharedTensorMap(SharedTensorMapSidecar &map) {
     }
     for (uint32_t slot = 0; slot < kMapCapacity; ++slot) {
         StoreControl(&map.slots[slot].seq.value, kSharedMapEmptySeq);
+    }
+    // descriptor 的零值由正式 host 对整块 sidecar 的 memset 建立；独立 ring
+    // 用例不读取 descriptor，但仍把两组发布控制字初始化成协议要求的 -1，
+    // 防止后续 symbol 子测把 task 0 误判成已发布。
+    for (uint32_t task = 0; task < pa_scheduler::kMaxTasks; ++task) {
+        for (uint32_t output = 0; output < pa_scheduler::kSharedOutputMaxPerTask; ++output) {
+            StoreControl(&map.shared_outputs[task].published[output].value, -1);
+            StoreControl(&map.shared_outputs[task].last_writer[output].value, -1);
+        }
     }
 }
 

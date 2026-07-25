@@ -56,6 +56,11 @@ struct alignas(64) CompeteFirstSplitRuntimeState {
 };
 static_assert(sizeof(CompeteFirstSplitRuntimeState) % 64 == 0,
               "split runtime state must occupy whole cache lines");
+static_assert(
+    __is_trivially_constructible(CompeteFirstSplitRuntimeState) &&
+        __has_trivial_destructor(CompeteFirstSplitRuntimeState),
+    "CCEC block-local split state must not require ctor/dtor"
+);
 
 PA_DEVICE uint64_t CompeteFirstSplitStateCookie(uint32_t worker_id, CoreRole role) {
     return kCompeteFirstSplitStateCookieBase ^ static_cast<uint64_t>(worker_id) ^
@@ -745,14 +750,23 @@ PA_DEVICE bool BuildSharedRegistrationEntries(
             continue;
         }
         const TaskTensorRef &reference = args.tensors[index];
+        // S3.1 的 fresh Output 由 (producer,slot) 直接寻址，不能退回
+        // region map。manual_dep 的 output_view 同样不是 TensorMap 的
+        // 自动 hazard，保留在 task args 但不登记。
+        if (reference.kind == TensorRefKind::SharedOutputRef) {
+            register_mask &= ~bit;
+            continue;
+        }
         if (reference.kind == TensorRefKind::GmTensor) {
-            entries[count++] = MakeSharedRegionValue(
-                *reference.pointer.gm_tensor, context.task_id
-            );
+            PA_GM const TensorDesc &tensor = *reference.pointer.gm_tensor;
+            if (!tensor.manual_dep) {
+                entries[count++] = MakeSharedRegionValue(tensor, context.task_id);
+            }
         } else if (reference.kind == TensorRefKind::LocalTensor) {
-            entries[count++] = MakeSharedRegionValue(
-                *reference.pointer.local_tensor, context.task_id
-            );
+            const TensorDesc &tensor = *reference.pointer.local_tensor;
+            if (!tensor.manual_dep) {
+                entries[count++] = MakeSharedRegionValue(tensor, context.task_id);
+            }
         } else {
             return false;
         }
@@ -763,12 +777,25 @@ PA_DEVICE bool BuildSharedRegistrationEntries(
 
 template <typename Ops>
 PA_DEVICE uint32_t CollectSharedFanin(
-    PA_GM SharedTensorMapSidecar &map, const TaskArgs &args,
-    int32_t task_id, int32_t heap_window,
-    int32_t fanin[kMaxFanin], bool &protocol_ok
+    PA_GM SharedTensorMapSidecar &map, const TaskArgs &args, SubmitContext &context,
+    int32_t task_id, int32_t heap_window, LocalStats &stats,
+    int32_t fanin[kMaxFanin], bool &protocol_ok, uint32_t &ordinary_lookup_count
 ) {
     protocol_ok = true;
-    uint32_t count = 0;
+    ordinary_lookup_count = 0;
+    if (args.tensor_count < 0 ||
+        args.tensor_count > static_cast<int32_t>(kMaxTaskTensors)) {
+        protocol_ok = false;
+        return 0;
+    }
+
+    int32_t validated_fanin[kMaxFanin] = {};
+    int64_t symbol_writers[kMaxTaskTensors] = {};
+    uint32_t validated_count = 0;
+    uint32_t validated_ordinary_lookups = 0;
+
+    // 第一遍只读取并校验，不修改 last_writer、payload、统计或输出 fanin。
+    // 后续引用即使非法，也不会让前面的合法 INOUT 留下半次提交。
     for (int32_t index = 0; index < args.tensor_count; ++index) {
         const TensorArgType tag =
             TaskTag(args, static_cast<uint32_t>(index));
@@ -776,54 +803,305 @@ PA_DEVICE uint32_t CollectSharedFanin(
             continue;
         }
         const TaskTensorRef &reference = args.tensors[index];
+        if (reference.kind == TensorRefKind::SharedOutputRef) {
+            // S3.1 暂只接收普通 fresh Output；view ABI 已占位但尚未接入，
+            // 不能静默把带 view 的符号当成 plain descriptor 使用。
+            const FdwicOutputRef output_ref = SharedOutputReference(reference);
+            if (!IsPlainSharedOutputRef(output_ref) ||
+                output_ref.producer_task_id < 0 ||
+                output_ref.producer_task_id >= task_id) {
+                protocol_ok = false;
+                return 0;
+            }
+            PA_GM SharedOutputCell &cell =
+                map.shared_outputs[static_cast<uint32_t>(output_ref.producer_task_id)];
+            if (Ops::Load(&cell.published[output_ref.output_slot].value) !=
+                static_cast<int64_t>(output_ref.producer_task_id)) {
+                protocol_ok = false;
+                return 0;
+            }
+            if (tag != TensorArgType::Input &&
+                tag != TensorArgType::Inout &&
+                tag != TensorArgType::OutputExisting) {
+                protocol_ok = false;
+                return 0;
+            }
+            // 同一 task 对同一 symbol 最多只能有一个写引用，否则第二次
+            // exchange 会把本 task 自己误当成旧 writer。
+            if (tag == TensorArgType::Inout ||
+                tag == TensorArgType::OutputExisting) {
+                for (int32_t previous = 0; previous < index; ++previous) {
+                    const TensorArgType previous_tag =
+                        TaskTag(args, static_cast<uint32_t>(previous));
+                    if (previous_tag != TensorArgType::Inout &&
+                        previous_tag != TensorArgType::OutputExisting) {
+                        continue;
+                    }
+                    const TaskTensorRef &previous_ref = args.tensors[previous];
+                    if (previous_ref.kind != TensorRefKind::SharedOutputRef) {
+                        continue;
+                    }
+                    const FdwicOutputRef previous_output =
+                        SharedOutputReference(previous_ref);
+                    if (previous_output.producer_task_id ==
+                            output_ref.producer_task_id &&
+                        previous_output.output_slot ==
+                            output_ref.output_slot) {
+                        protocol_ok = false;
+                        return 0;
+                    }
+                }
+            } else {
+                const int64_t writer =
+                    Ops::Load(&cell.last_writer[output_ref.output_slot].value);
+                // INPUT 读取的 writer 必须严格属于已经提交的较早 task。
+                if (writer < 0 || writer >= task_id) {
+                    protocol_ok = false;
+                    return 0;
+                }
+                symbol_writers[index] = writer;
+                AddFanin(
+                    validated_fanin, validated_count,
+                    static_cast<int32_t>(writer)
+                );
+            }
+            continue;
+        }
         if (reference.kind == TensorRefKind::GmTensor) {
             PA_GM const TensorDesc &tensor = *reference.pointer.gm_tensor;
+            if (tensor.manual_dep) {
+                continue;
+            }
             const uint64_t owner = tensor.owner_task_id;
             if (owner != kInvalidTaskId) {
                 AddFanin(
-                    fanin, count,
+                    validated_fanin, validated_count,
                     static_cast<int32_t>(owner & 0xFFFFFFFFU)
                 );
             }
-            if (tag == TensorArgType::Input ||
-                tag == TensorArgType::Inout) {
+            if (tag == TensorArgType::Inout ||
+                tag == TensorArgType::OutputExisting ||
+                (tag == TensorArgType::Input && owner != kInvalidTaskId)) {
                 bool lookup_ok = false;
                 const int32_t producer = SharedLookupTensor<Ops>(
                     map, tensor, task_id, heap_window, lookup_ok
                 );
                 if (!lookup_ok) {
                     protocol_ok = false;
-                    return count;
+                    return 0;
                 }
-                AddFanin(fanin, count, producer);
+                ++validated_ordinary_lookups;
+                AddFanin(validated_fanin, validated_count, producer);
             }
         } else if (reference.kind == TensorRefKind::LocalTensor) {
             const TensorDesc &tensor = *reference.pointer.local_tensor;
+            if (tensor.manual_dep) {
+                continue;
+            }
             const uint64_t owner = tensor.owner_task_id;
             if (owner != kInvalidTaskId) {
                 AddFanin(
-                    fanin, count,
+                    validated_fanin, validated_count,
                     static_cast<int32_t>(owner & 0xFFFFFFFFU)
                 );
             }
-            if (tag == TensorArgType::Input ||
-                tag == TensorArgType::Inout) {
+            if (tag == TensorArgType::Inout ||
+                tag == TensorArgType::OutputExisting ||
+                (tag == TensorArgType::Input && owner != kInvalidTaskId)) {
                 bool lookup_ok = false;
                 const int32_t producer = SharedLookupTensor<Ops>(
                     map, tensor, task_id, heap_window, lookup_ok
                 );
                 if (!lookup_ok) {
                     protocol_ok = false;
-                    return count;
+                    return 0;
                 }
-                AddFanin(fanin, count, producer);
+                ++validated_ordinary_lookups;
+                AddFanin(validated_fanin, validated_count, producer);
             }
         } else {
             protocol_ok = false;
-            return count;
+            return 0;
         }
     }
-    return count;
+
+    // 第二遍先发布全部写符号的 writer。exact-turn 保证本 task 解析期间
+    // 没有其他合法 consumer；若 Exchange 返回非法旧值，则回滚已经完成
+    // 的 exchange，并保持 payload、统计和 fanin 都未发布。
+    for (int32_t index = 0; index < args.tensor_count; ++index) {
+        const TaskTensorRef &reference = args.tensors[index];
+        if (reference.kind != TensorRefKind::SharedOutputRef) {
+            continue;
+        }
+        const TensorArgType tag =
+            TaskTag(args, static_cast<uint32_t>(index));
+        if (tag != TensorArgType::Inout &&
+            tag != TensorArgType::OutputExisting) {
+            continue;
+        }
+        const FdwicOutputRef output_ref = SharedOutputReference(reference);
+        PA_GM volatile int64_t *writer_address =
+            &map.shared_outputs[
+                 static_cast<uint32_t>(output_ref.producer_task_id)
+             ].last_writer[output_ref.output_slot].value;
+        const int64_t observed =
+            Ops::Exchange(writer_address, static_cast<int64_t>(task_id));
+        // INOUT 在第二遍用 Exchange 同时取得旧 writer 和发布当前 writer；
+        // 旧值必须来自更早的已提交 task。
+        if (observed >= 0 && observed < task_id) {
+            symbol_writers[index] = observed;
+            AddFanin(
+                validated_fanin, validated_count,
+                static_cast<int32_t>(observed)
+            );
+            continue;
+        }
+        (void)Ops::Exchange(writer_address, observed);
+        for (int32_t previous = index - 1; previous >= 0; --previous) {
+            const TaskTensorRef &previous_ref = args.tensors[previous];
+            if (previous_ref.kind != TensorRefKind::SharedOutputRef) {
+                continue;
+            }
+            const TensorArgType previous_tag =
+                TaskTag(args, static_cast<uint32_t>(previous));
+            if (previous_tag != TensorArgType::Inout &&
+                previous_tag != TensorArgType::OutputExisting) {
+                continue;
+            }
+            const FdwicOutputRef previous_output =
+                SharedOutputReference(previous_ref);
+            (void)Ops::Exchange(
+                &map.shared_outputs[
+                     static_cast<uint32_t>(previous_output.producer_task_id)
+                 ].last_writer[previous_output.output_slot].value,
+                symbol_writers[previous]
+            );
+        }
+        protocol_ok = false;
+        return 0;
+    }
+
+    // writer 链完整更新后，才把 descriptor 复制到当前 task 的 payload
+    // scratch，并一次性发布统计与 fanin 结果。RingSlot 永远不保存符号引用。
+    for (int32_t index = 0; index < args.tensor_count; ++index) {
+        const TaskTensorRef &reference = args.tensors[index];
+        if (reference.kind != TensorRefKind::SharedOutputRef) {
+            continue;
+        }
+        const FdwicOutputRef output_ref = SharedOutputReference(reference);
+        PA_GM const TensorDesc &shared_tensor =
+            map.shared_outputs[
+                static_cast<uint32_t>(output_ref.producer_task_id)
+            ].tensors[output_ref.output_slot];
+        Ops::InvalidateRegion(&shared_tensor, sizeof(shared_tensor));
+        CopyGmTensor(context.payload->tensors[index], shared_tensor);
+        const TensorArgType tag =
+            TaskTag(args, static_cast<uint32_t>(index));
+        if (tag == TensorArgType::Input) {
+            ++stats.result.shared_symbol_input_loads;
+        } else if (tag == TensorArgType::Inout ||
+            tag == TensorArgType::OutputExisting) {
+            ++stats.result.shared_symbol_inout_exchanges;
+        }
+    }
+    ordinary_lookup_count = validated_ordinary_lookups;
+    for (uint32_t edge = 0; edge < validated_count; ++edge) {
+        fanin[edge] = validated_fanin[edge];
+    }
+    return validated_count;
+}
+
+// fresh descriptor 的内容先写入每 task 独占的 shared-output cell，并通过
+// FlushRegion 让 descriptor 先于 published 可见。last_writer 是该符号的
+// writer 链起点；published 则只证明 descriptor 已完成发布。两者不可合并。
+template <typename Ops>
+PA_DEVICE_NOINLINE void RollbackSharedTaskOutputs(
+    PA_GM SharedOutputCell &cell, uint32_t output_count
+) {
+    // 此入口只处理 exact-turn 已被判定破坏后的冷失败路径。先撤销发布位，
+    // 使任何非法越界 reader 都不能继续消费，再恢复 writer 与 descriptor
+    // 的未发布状态；正常 Submit 不执行这些额外 atomic/DCCI。
+    for (uint32_t output = 0; output < output_count; ++output) {
+        (void)Ops::Exchange(&cell.published[output].value, -1);
+    }
+    for (uint32_t output = 0; output < output_count; ++output) {
+        (void)Ops::Exchange(&cell.last_writer[output].value, -1);
+    }
+    for (uint32_t output = 0; output < output_count; ++output) {
+        PA_GM volatile uint8_t *descriptor =
+            reinterpret_cast<PA_GM volatile uint8_t *>(
+                &cell.tensors[output]
+            );
+        for (uint32_t byte = 0; byte < sizeof(TensorDesc); ++byte) {
+            descriptor[byte] = 0;
+        }
+    }
+    if (output_count != 0) {
+        Ops::FlushRegion(
+            &cell.tensors[0],
+            static_cast<uint64_t>(output_count) * sizeof(TensorDesc)
+        );
+    }
+}
+
+template <typename Ops>
+PA_DEVICE bool PublishSharedTaskOutputs(
+    PA_GM SharedTensorMapSidecar &map, const SubmitContext &context,
+    uint32_t task_id
+) {
+    if (task_id >= kMaxTasks || context.shared_result.TaskId() != static_cast<int32_t>(task_id) ||
+        context.shared_result.Size() != context.result.count ||
+        context.result.count > kSharedOutputMaxPerTask) {
+        return false;
+    }
+    PA_GM SharedOutputCell &cell = map.shared_outputs[task_id];
+    // 先完整预检所有 slot；异常重复发布不能覆盖已对 consumer 可见的
+    // descriptor，也不能让多输出 task 留下前半段控制字。
+    for (uint32_t output = 0; output < context.result.count; ++output) {
+        PA_GM TensorDesc *source = context.result.tensors[output];
+        // 当前 winner 已持有 exact turn；这些 slot 尚无合法并发访问者，
+        // 因此预检用普通 volatile GM load 即可，不额外制造 atomic RMW。
+        if (source == nullptr ||
+            cell.published[output].value != -1 ||
+            cell.last_writer[output].value != -1) {
+            return false;
+        }
+    }
+    // exact-turn 唯一 winner 使预检到写入之间不存在合法竞争。仍用
+    // FetchMax 预留全部 writer 控制字，并在异常旧值时撤回本次已预留项。
+    for (uint32_t output = 0; output < context.result.count; ++output) {
+        uint64_t retries = 0;
+        const int64_t observed = Ops::FetchMax(
+            &cell.last_writer[output].value,
+            static_cast<int64_t>(task_id), retries
+        );
+        if (observed != -1) {
+            // atomicMax 在 observed<task_id 时已经改写当前 slot；无论旧值
+            // 大小都显式恢复，前面已成功预留的 slot 则回到 -1。
+            (void)Ops::Exchange(
+                &cell.last_writer[output].value, observed
+            );
+            for (uint32_t previous = 0; previous < output; ++previous) {
+                (void)Ops::Exchange(&cell.last_writer[previous].value, -1);
+            }
+            return false;
+        }
+    }
+    for (uint32_t output = 0; output < context.result.count; ++output) {
+        PA_GM TensorDesc *source = context.result.tensors[output];
+        CopyGmTensor(cell.tensors[output], *source);
+        Ops::FlushRegion(&cell.tensors[output], sizeof(TensorDesc));
+    }
+    Ops::StoreBarrier();
+    for (uint32_t output = 0; output < context.result.count; ++output) {
+        if (Ops::Exchange(
+                &cell.published[output].value, static_cast<int64_t>(task_id)
+            ) != -1) {
+            RollbackSharedTaskOutputs<Ops>(cell, context.result.count);
+            return false;
+        }
+    }
+    return true;
 }
 
 // 当前 task 的唯一 winner 持有 append turn。Append 前必须再次核对 exact
@@ -834,7 +1112,7 @@ template <typename Ops>
 PA_DEVICE bool AppendSharedTaskOrdered(
     PA_GM SchedulerState *state,
     const SharedRegionValue *entries, uint32_t count,
-    uint32_t task_id, LocalStats &stats
+    const SubmitContext &context, uint32_t task_id, LocalStats &stats
 ) {
     int64_t reclaim_upto = -1;
     // Refresh 的第一步就是 committed_tasks==task_id 的 exact-turn 检查；
@@ -846,16 +1124,25 @@ PA_DEVICE bool AppendSharedTaskOrdered(
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
-    const SharedAppendCheck check = SharedCheckTaskAppend<Ops>(
-        state->shared_map, entries, count, reclaim_upto
-    );
-    if (check != SharedAppendCheck::Ready) {
+    if (!SharedPreflightTaskAppend<Ops>(
+            state->shared_map, entries, count, reclaim_upto
+        )) {
         // CapacityBlocked 在精确 task-order reclaim 后仍无空间，已没有可等待
         // 的慢核进度；与 ProtocolError 一样立即广播 fatal。
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
 
+    // preflight 已经对当前 exact-turn 的全部 bucket/slot 做完容量与 seq
+    // 核验。只有通过这一步，fresh descriptor 才允许写入可发布表；若
+    // preflight 失败，则不会留下任何 published。此时 task 尚未 commit，
+    // consumer 仍不能越过 ordered 前沿观察它。
+    if (!PublishSharedTaskOutputs<Ops>(
+            state->shared_map, context, task_id
+        )) {
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
     if (!SharedAppendPreparedTask<Ops>(
             state->shared_map, entries, count
         ) ||
@@ -895,6 +1182,9 @@ PA_DEVICE void BeginCallbackSubmit(PA_GM WorkerState &worker, SubmitContext &con
     context.scalar_count = 0;
     context.result.task_id = task_id;
     context.result.count = 0;
+#if PTO_FDWIC_SHARED_MAP
+    context.shared_result.Reset(static_cast<int32_t>(task_id));
+#endif
     context.register_mask = 0;
     context.output_bytes = 0;
     context.fanin_count = 0;
@@ -962,8 +1252,8 @@ PA_DEVICE bool BuildCallbackSubmitArgs(
                        orch.current_block_offset;
             });
         } else if constexpr (Kind == TaskKind::Sf) {
-            out.AddGmInput([&]() PA_CALLBACK_LAMBDA_DEVICE -> PA_GM const TensorDesc & {
-                return *orch.qk_scores;
+            out.AddOutputHandleInput([&]() PA_CALLBACK_LAMBDA_DEVICE -> PaOutputHandle {
+                return orch.qk_scores;
             });
             out.AddOutput([&]() PA_CALLBACK_LAMBDA_DEVICE -> const TensorCreateInfo & {
                 const uint32_t probability_shape[kMaxTensorDims] = {
@@ -989,8 +1279,8 @@ PA_DEVICE bool BuildCallbackSubmitArgs(
                 return orch.current_valid_len;
             });
         } else if constexpr (Kind == TaskKind::Pv) {
-            out.AddGmInput([&]() PA_CALLBACK_LAMBDA_DEVICE -> PA_GM const TensorDesc & {
-                return *orch.sf_probs;
+            out.AddOutputHandleInput([&]() PA_CALLBACK_LAMBDA_DEVICE -> PaOutputHandle {
+                return orch.sf_probs;
             });
             out.AddLocalInput([&]() PA_CALLBACK_LAMBDA_DEVICE -> const TensorDesc & {
                 return orch.value_cache;
@@ -1010,23 +1300,23 @@ PA_DEVICE bool BuildCallbackSubmitArgs(
             });
         } else {
             static_assert(Kind == TaskKind::Up, "unsupported PA task kind");
-            out.AddGmInput([&]() PA_CALLBACK_LAMBDA_DEVICE -> PA_GM const TensorDesc & {
-                return *orch.sf_max;
+            out.AddOutputHandleInput([&]() PA_CALLBACK_LAMBDA_DEVICE -> PaOutputHandle {
+                return orch.sf_max;
             });
-            out.AddGmInput([&]() PA_CALLBACK_LAMBDA_DEVICE -> PA_GM const TensorDesc & {
-                return *orch.sf_sum;
+            out.AddOutputHandleInput([&]() PA_CALLBACK_LAMBDA_DEVICE -> PaOutputHandle {
+                return orch.sf_sum;
             });
-            out.AddGmInput([&]() PA_CALLBACK_LAMBDA_DEVICE -> PA_GM const TensorDesc & {
-                return *orch.pv_output;
+            out.AddOutputHandleInput([&]() PA_CALLBACK_LAMBDA_DEVICE -> PaOutputHandle {
+                return orch.pv_output;
             });
-            out.AddGmInout([&]() PA_CALLBACK_LAMBDA_DEVICE -> PA_GM const TensorDesc & {
-                return *orch.accumulated_max;
+            out.AddOutputHandleInout([&]() PA_CALLBACK_LAMBDA_DEVICE -> PaOutputHandle {
+                return orch.accumulated_max;
             });
-            out.AddGmInout([&]() PA_CALLBACK_LAMBDA_DEVICE -> PA_GM const TensorDesc & {
-                return *orch.accumulated_sum;
+            out.AddOutputHandleInout([&]() PA_CALLBACK_LAMBDA_DEVICE -> PaOutputHandle {
+                return orch.accumulated_sum;
             });
-            out.AddGmInout([&]() PA_CALLBACK_LAMBDA_DEVICE -> PA_GM const TensorDesc & {
-                return *orch.accumulated_output;
+            out.AddOutputHandleInout([&]() PA_CALLBACK_LAMBDA_DEVICE -> PaOutputHandle {
+                return orch.accumulated_output;
             });
             out.AddLocalInout([&]() PA_CALLBACK_LAMBDA_DEVICE -> const TensorDesc & {
                 MakeCallbackOutputView(orch, batch);
@@ -1112,21 +1402,23 @@ PA_DEVICE bool FinishCallbackSubmitBody(
         const uint64_t fanin_begin = prepare_end;
 #if PTO_FDWIC_SHARED_MAP
         bool lookup_protocol_ok = false;
+        uint32_t ordinary_lookup_count = 0;
         context.fanin_count = static_cast<int32_t>(CollectSharedFanin<Ops>(
-            state->shared_map, args, static_cast<int32_t>(task_id),
-            static_cast<int32_t>(state->heap_window), context.fanin,
-            lookup_protocol_ok
+            state->shared_map, args, context, static_cast<int32_t>(task_id),
+            static_cast<int32_t>(state->heap_window), stats, context.fanin,
+            lookup_protocol_ok, ordinary_lookup_count
         ));
         if (!lookup_protocol_ok) {
             SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
             return false;
         }
+        stats.result.map_lookups += ordinary_lookup_count;
 #else
         context.fanin_count = static_cast<int32_t>(CollectFanin(worker.map, args, context.fanin));
-#endif
         stats.result.map_lookups += static_cast<uint32_t>(args.tensor_count) - context.result.count;
+#endif
         for (int32_t edge = 0; edge < context.fanin_count; ++edge) {
-            stats.result.barrier_reserved[0] ^=
+            stats.result.dependency_signature ^=
                 DependencyEdgeSignature(
                     task_id,
                     static_cast<uint32_t>(context.fanin[edge])
@@ -1152,7 +1444,7 @@ PA_DEVICE bool FinishCallbackSubmitBody(
         );
         if (registered) {
             registered = AppendSharedTaskOrdered<Ops>(
-                state, shared_entries, shared_entry_count, task_id, stats
+                state, shared_entries, shared_entry_count, context, task_id, stats
             );
         }
         if (registered) {
@@ -1447,9 +1739,9 @@ PA_DEVICE void PublishResult(PA_GM WorkerResult &destination, const WorkerResult
     PA_PUBLISH_FIELD(final_barrier_begin);
     PA_PUBLISH_FIELD(final_barrier_release);
     PA_PUBLISH_FIELD(final_barrier_end);
-    for (uint32_t index = 0; index < 3; ++index) {
-        Ops::Publish(&destination.barrier_reserved[index], source.barrier_reserved[index]);
-    }
+    PA_PUBLISH_FIELD(dependency_signature);
+    PA_PUBLISH_FIELD(shared_symbol_input_loads);
+    PA_PUBLISH_FIELD(shared_symbol_inout_exchanges);
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
     PA_PUBLISH_FIELD(compete_first_split_caller_state_address);
     PA_PUBLISH_FIELD(compete_first_split_finish_state_address);
@@ -1599,7 +1891,9 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 )) {
                 break;
             }
-            AcceptTaskOutputs(orchestration, TaskKind::Alloc, context.result);
+            AcceptTaskOutputs(
+                orchestration, TaskKind::Alloc, OrchestrationOutputs(context)
+            );
 
             PreparePaBlockGroup(orchestration, 0);
             if (!SubmitCallbackTask<TaskKind::Qk, Ops, Profile>(
@@ -1608,7 +1902,9 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 )) {
                 break;
             }
-            AcceptTaskOutputs(orchestration, TaskKind::Qk, context.result);
+            AcceptTaskOutputs(
+                orchestration, TaskKind::Qk, OrchestrationOutputs(context)
+            );
 
             if (!SubmitCallbackTask<TaskKind::Sf, Ops, Profile>(
                     state, worker, task_count, orchestration, args, batch, context, stats,
@@ -1616,7 +1912,9 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 )) {
                 break;
             }
-            AcceptTaskOutputs(orchestration, TaskKind::Sf, context.result);
+            AcceptTaskOutputs(
+                orchestration, TaskKind::Sf, OrchestrationOutputs(context)
+            );
 
             if (!SubmitCallbackTask<TaskKind::Pv, Ops, Profile>(
                     state, worker, task_count, orchestration, args, batch, context, stats,
@@ -1624,7 +1922,9 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 )) {
                 break;
             }
-            AcceptTaskOutputs(orchestration, TaskKind::Pv, context.result);
+            AcceptTaskOutputs(
+                orchestration, TaskKind::Pv, OrchestrationOutputs(context)
+            );
 
             if (!SubmitCallbackTask<TaskKind::Up, Ops, Profile>(
                     state, worker, task_count, orchestration, args, batch, context, stats,
@@ -1761,20 +2061,17 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #if PTO_FDWIC_SHARED_MAP
     // shared 后端没有每核 map 控制字；这里发布统一逻辑窗口摘要，实际
     // bucket/head/tail/seq/payload 由 host 回读唯一 sidecar 后逐槽校验。
-    // PA Case1 每 batch 只有 UP 的四个 Inout 进入 map。
-    const uint32_t shared_map_live =
-        kPaCase1MapEntriesPerBatch *
-        (batches < kPaCase1MaxLiveMapBatches
-             ? batches
-             : kPaCase1MaxLiveMapBatches);
+    // S3.1 的 fresh Output 都由 shared-output table 直接寻址，manual_dep
+    // 的 output_view 也不进入自动 region hazard；因此 Case1 region ring
+    // 严格为空。ordered reclaim 前沿仍照 task/H 计算，供 host 闭合回收状态。
     const uint32_t shared_map_floor =
         task_count > kHeapWindow + 1
             ? task_count - kHeapWindow - 1
             : 0;
-    stats.result.map_high_water = shared_map_live;
+    stats.result.map_high_water = 0;
     stats.result.map_alive_floor = shared_map_floor;
     stats.result.map_cleaned_upto = shared_map_floor;
-    stats.result.map_live_entries = shared_map_live;
+    stats.result.map_live_entries = 0;
 #else
     stats.result.map_high_water = static_cast<uint32_t>(worker.map.high_water);
     stats.result.map_alive_floor = static_cast<uint32_t>(worker.map.alive_floor);
