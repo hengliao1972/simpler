@@ -63,10 +63,7 @@ enum class TensorMapBuildMode : uint32_t {
 constexpr TensorMapBuildMode kCompiledTensorMapMode =
     static_cast<TensorMapBuildMode>(PTO_FDWIC_SHARED_MAP);
 constexpr uint32_t kBuildIdentityMagic = 0x50414249U;  // "PABI"
-// S4.17 改变 shared WorkerState 内部字段解释，但保持总大小不变；shared
-// 单独推进身份版本，确保运行时仍能拒绝新旧 host/kernel 混用。private
-// 的生产对齐布局和既有身份继续保持 v4。
-constexpr uint32_t kBuildIdentityAbiVersion = PTO_FDWIC_SHARED_MAP ? 5U : 4U;
+constexpr uint32_t kBuildIdentityAbiVersion = 4;
 
 // 这里固定的是 PA Case1 的调度拓扑，而不是为了缩小 standalone 人为选择的规模：
 // 每个 batch 依次回放 Alloc/QK/SF/PV/UP 五个 task，32 个 AIC 与 64 个 AIV
@@ -932,66 +929,28 @@ struct WorkerState {
     int32_t sub_block_id;
     int32_t local_index;
     uint64_t heap_next;
-#if PTO_FDWIC_SHARED_MAP
-    // shared 模式把每次 Submit 都会访问的控制字段留在 worker 首个
-    // cache line；仍保留后面的 private TensorMap，避免本轮混入缩容。
-    uint32_t occupied_count;
-    uint32_t owned_total;
-    uint64_t swimlane_last_cycle;
-#endif
     TensorMap map;
-#if !PTO_FDWIC_SHARED_MAP
     uint8_t slot_padding[16];
-#endif
     LocalSlot slots[kPrivateSlots];
-#if PTO_FDWIC_SHARED_MAP
-    // 热字段前移后补齐原有 payload 起点，使 ring、payload 与总状态大小
-    // 都不随本轮 shared-only 布局实验改变。
-    uint8_t payload_padding[32];
-#else
     uint32_t occupied_count;
     uint32_t owned_total;
     uint64_t swimlane_last_cycle;
     uint8_t payload_padding[16];
-#endif
     TaskPayload payloads[kPayloadSlots];
 };
 // 每个物理 worker 都持有独立 heap cursor、TensorMap、ring 与 task payload arena；
 // 多核共享的只有 SchedulerState 前缀中的 cursor/task/frontier 等协议状态。
-// shared 模式仅前置本地热控制字段；private 模式继续保持生产对齐布局。
 static_assert(sizeof(WorkerState) == 9231296, "WorkerState must match the PA DistCore ABI size");
 static_assert(alignof(WorkerState) == 8, "WorkerState alignment must match DistCore");
 static_assert(offsetof(WorkerState, role) == 0, "WorkerState role offset mismatch");
-static_assert(offsetof(WorkerState, core_idx) == 4, "WorkerState core index offset mismatch");
-static_assert(offsetof(WorkerState, block_id) == 8, "WorkerState block offset mismatch");
-static_assert(offsetof(WorkerState, lane) == 12, "WorkerState lane offset mismatch");
-static_assert(offsetof(WorkerState, sub_block_id) == 16, "WorkerState sub-block offset mismatch");
 static_assert(offsetof(WorkerState, local_index) == 20, "WorkerState replay-index offset mismatch");
 static_assert(offsetof(WorkerState, heap_next) == 24, "WorkerState heap cursor offset mismatch");
-#if PTO_FDWIC_SHARED_MAP
-static_assert(offsetof(WorkerState, occupied_count) == 32, "shared WorkerState occupancy offset mismatch");
-static_assert(offsetof(WorkerState, owned_total) == 36, "shared WorkerState owned-count offset mismatch");
-static_assert(offsetof(WorkerState, swimlane_last_cycle) == 40, "shared WorkerState trace clock offset mismatch");
-static_assert(offsetof(WorkerState, map) == 48, "shared WorkerState tensor-map offset mismatch");
-static_assert(offsetof(WorkerState, slots) == 823360, "shared WorkerState ring-slot offset mismatch");
-static_assert(
-    offsetof(WorkerState, payload_padding) == 842656,
-    "shared WorkerState payload padding offset mismatch"
-);
-static_assert(offsetof(WorkerState, payloads) == 842688, "shared WorkerState task-payload offset mismatch");
-#else
 static_assert(offsetof(WorkerState, map) == 32, "WorkerState tensor-map offset mismatch");
-static_assert(offsetof(WorkerState, slot_padding) == 823344, "WorkerState slot padding offset mismatch");
 static_assert(offsetof(WorkerState, slots) == 823360, "WorkerState ring-slot offset mismatch");
 static_assert(offsetof(WorkerState, occupied_count) == 842656, "WorkerState occupancy offset mismatch");
 static_assert(offsetof(WorkerState, owned_total) == 842660, "WorkerState owned-count offset mismatch");
 static_assert(offsetof(WorkerState, swimlane_last_cycle) == 842664, "WorkerState trace clock offset mismatch");
-static_assert(
-    offsetof(WorkerState, payload_padding) == 842672,
-    "WorkerState payload padding offset mismatch"
-);
 static_assert(offsetof(WorkerState, payloads) == 842688, "WorkerState task-payload offset mismatch");
-#endif
 
 struct alignas(64) WorkerResult {
     // 时间边界：Submit 口径不含启动屏障和最终 drain，finish_cycle 则覆盖完整 worker 生命周期。

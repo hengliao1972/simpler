@@ -4391,3 +4391,103 @@ outputs/pa_scheduler_shared_swimlane_20260725_185913_2807044/ccec/
 进程退出码为 1；没有先按错误 offset 运行后再依赖崩溃兜底。至此
 S4.17 的源码、ABI、CPU、Python、14 种 CCEC 身份和 A5 b1 正确性门槛
 全部通过，可以形成独立正确性提交；该提交本身不代表性能候选已获保留。
+
+#### S4.17 十二区组性能否决与整体回退
+
+S4.17 正确性提交为：
+
+```text
+82c0828d 优化(a5): 前置shared worker热控制字段
+```
+
+该 clean commit 的 shared perf-clock 冻结件为：
+
+```text
+outputs/perf_clock_freeze_82c0828d_20260725_191346/
+```
+
+冻结时先校验原生 manifest，再只读复制 kernel，并按 `readelf` 给出的
+offset 用 `dd` 提取执行节；提取前后原始 ELF SHA256 均为
+`17c2ca88d5e5240d8ca917e33eca4480427e23b6f833f0f57f0af26b22b6d8a4`，
+没有使用 `objcopy` 改写被测件。
+
+第一轮严格使用预登记的 device0、b256、`real-compute 6,28,4,1`、
+two-16、PMU off、每版两次预热和六个 ABBA/BAAB 区组。结果为 4/6
+区组更快，配对中位数：
+
+```text
+-5.117250us / -0.217197%
+```
+
+它既不满足 6/6 直接保留，又命中“4～5/6 且中位数为负”的追加条件，
+因此不在首轮下结论，原样追加区组 7～12。首轮 28 个独立进程均经过
+深审计：每个进程恰有 42 条断言、SYS_CNT 与 TSV 精确一致、Claim
+73,728、active worker 96、RingBp=0、依赖签名
+`b7d985d6edb07078`，四类 kernel 各 256 次。首轮 samples、summary、
+audit 和 diagnostics 已另存为同目录下的 `*_6blocks` 文件。
+
+十二个区组的差值如下，正值表示 S4.17 更慢：
+
+| 区组 | 差值（us） | 差值（%） | 方向 |
+| ---: | ---: | ---: | --- |
+| 1 | -24.1950 | -1.0207 | S4.17 更快 |
+| 2 | +1.6500 | +0.0699 | S4.17 更慢 |
+| 3 | -10.2220 | -0.4344 | S4.17 更快 |
+| 4 | -1.6900 | -0.0715 | S4.17 更快 |
+| 5 | +6.0585 | +0.2577 | S4.17 更慢 |
+| 6 | -8.5445 | -0.3629 | S4.17 更快 |
+| 7 | +13.3505 | +0.5692 | S4.17 更慢 |
+| 8 | +5.6315 | +0.2391 | S4.17 更慢 |
+| 9 | -9.0895 | -0.3840 | S4.17 更快 |
+| 10 | +1.3045 | +0.0554 | S4.17 更慢 |
+| 11 | +0.1300 | +0.0055 | S4.17 更慢 |
+| 12 | -17.0740 | -0.7210 | S4.17 更快 |
+| 中位数 | **-0.7800** | **-0.0330** | **6 快 / 6 慢** |
+
+十二组的未配对分布也近乎重合：base 24 个正式样本中位数
+2,358.174us，candidate 为 2,358.205us。主判据仍是上表的成组配对，
+不使用未配对中位数替代。
+
+扩展取数后使用独立加固的 audit 从 `samples.tsv` 重新验证 52 个进程
+身份、warm-up/formal 顺序、每个 block 的 ABBA/BAAB position、全部
+日志和 SYS_CNT，并重新计算十二个 block 及最终中位数，再逐字段与
+`summary.json` 对照。结果仍为 6/12 更快、`-0.0330%`。因此同时未达到
+“至少 10/12 更快”和“配对中位数不高于 -0.2%”两条门槛，S4.17
+判定为中性噪声内波动，不能保留。
+
+完整证据位于：
+
+```text
+outputs/perf_clock_pair_82c0828d_vs_319077a9_20260725_191435/
+```
+
+动态诊断中，candidate 的 fanin load 和 `submit_completion_ops` 中位数
+均比 base 少 476 次；但它们由 winner 到达和轮询时序决定，固定 Claim、
+业务、依赖和 kernel 数并未改变。既然成组墙钟没有稳定收益，不能把这
+一伴随变化解释成热字段前置的确定因果。
+
+S4.17 的 shared 字段移动、条件 ABI v5 和新增 offset 断言已全部撤销。
+回退后的 `common/pa_model.h` 与 `bf7a7076` 逐字节无差异，当前重新恢复：
+
+```text
+shared/private build ABI = v4
+map offset               = 32B
+slots offset             = 823,360B
+occupied_count offset    = 842,656B
+payloads offset          = 842,688B
+WorkerState              = 9,231,296B
+```
+
+回退后再次使用 `/usr/bin/g++` 完整重建 CPU shared，全部独立自测与
+b1 业务断言通过；用本机 CANN 9.1 重建 CCEC shared perf-clock，
+manifest 通过，执行节与 `319077a9` 重建冻结基线逐字节一致：
+
+```text
+.text   129,080B  90f58e5715112e30f2f57d768ed257580c96ccc187d0c9b7fa4d6a1e9b05fd26
+.rodata     288B  239e997707a3090248a65626afca3cfbec89793c703ea05461bfb02789722ded
+```
+
+最后一次 A5 shared b1 perf-clock 也通过全部门禁，Submit 为 67.668us。
+S4.17 的正确性提交、冻结件和负结果继续保留用于后续决策，但其实现
+不属于当前运行布局。按照预登记规则，standalone 的低风险热布局边际
+探索到此停止，下一步转向真实 simpler shared TensorMap 路径。
