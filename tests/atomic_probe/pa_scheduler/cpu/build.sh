@@ -110,7 +110,7 @@ else
     # descriptor 发布、INPUT last-writer load、INOUT exchange、payload
     # scratch 解析及非法引用 fail-closed，避免只靠完整 96 线程回放偶然覆盖。
     echo "[BUILD] shared-output symbol self-test"
-    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror -pthread \
         -DPTO_FDWIC_SHARED_MAP=1 \
         -DPA_BUILD_SWIMLANE=1 \
         -I"$ROOT_DIR/common" \
@@ -120,10 +120,10 @@ else
     echo "[TEST] shared-output symbol self-test"
     "$BUILD_DIR/test_shared_output_symbols"
 
-    # shared heap 与 region/symbol 协议分开验证：这里按 exact-turn 前提
-    # 锁定 8 shard、1 KiB 对齐、首版禁止 wrap、零输出及异常原子回滚。
+    # shared heap 与 region/symbol 协议分开验证：锁定 8 shard、1 KiB
+    # 对齐、首版禁止 wrap、并发唯一分配及 terminal 容量竞争不回滚。
     echo "[BUILD] shared heap no-wrap reserve self-test"
-    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror -pthread \
         -DPTO_FDWIC_SHARED_MAP=1 \
         -DPA_BUILD_SWIMLANE=1 \
         -I"$ROOT_DIR/common" \
@@ -134,7 +134,8 @@ else
     "$BUILD_DIR/test_shared_heap_reserve"
 
     # Materialize 在触碰 shared cursor 前必须完成数量、引用、shape/stride
-    # 和地址区间预检；定向用例保证失败不会留下半次 heap 推进。
+    # 和地址区间预检；这些 reserve 前拒绝路径不能推进 heap。FetchAdd 后
+    # 才暴露的容量竞争则按 terminal 契约保留 overrun 现场。
     echo "[BUILD] shared winner materialize self-test"
     "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \

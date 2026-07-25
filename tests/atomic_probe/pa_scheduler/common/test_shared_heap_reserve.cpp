@@ -9,11 +9,14 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <thread>
+#include <vector>
 
 #define PA_DEVICE inline
 #define PA_GM
@@ -41,31 +44,37 @@ struct HeapTestOps {
     static int64_t FetchAdd(volatile int64_t *address, int64_t value) {
         return __atomic_fetch_add(address, value, __ATOMIC_ACQ_REL);
     }
-
-    static int64_t Exchange(volatile int64_t *address, int64_t value) {
-        return __atomic_exchange_n(address, value, __ATOMIC_ACQ_REL);
-    }
 };
 
-// 只在定向测试中模拟“预检完成后、FetchAdd 发射前”出现的非法状态变化。
-// 生产 exact-turn 不允许该交错；helper 仍须拒绝异常 old value 并恢复两项状态。
-struct HeapFaultOps : HeapTestOps {
-    static volatile int64_t *fault_address;
+// 在 cursor 的前置 Load 与 FetchAdd 之间插入另一笔 reserve；它可以暂停在
+// cursor/vend 两条原子之间，也可以完整推进。helper 必须消费 FetchAdd 的
+// 真实 old value，不能要求它等于预检快照，更不能回滚并发进度。
+struct HeapInterleaveOps : HeapTestOps {
+    static volatile int64_t *race_cursor;
+    static volatile int64_t *race_vend;
     static int64_t injected_delta;
+    static bool advance_vend;
 
     static int64_t FetchAdd(volatile int64_t *address, int64_t value) {
-        if (address == fault_address) {
+        if (address == race_cursor) {
             (void)__atomic_fetch_add(
                 address, injected_delta, __ATOMIC_ACQ_REL
             );
-            fault_address = nullptr;
+            if (advance_vend) {
+                (void)__atomic_fetch_add(
+                    race_vend, injected_delta, __ATOMIC_ACQ_REL
+                );
+            }
+            race_cursor = nullptr;
         }
         return HeapTestOps::FetchAdd(address, value);
     }
 };
 
-volatile int64_t *HeapFaultOps::fault_address = nullptr;
-int64_t HeapFaultOps::injected_delta = 0;
+volatile int64_t *HeapInterleaveOps::race_cursor = nullptr;
+volatile int64_t *HeapInterleaveOps::race_vend = nullptr;
+int64_t HeapInterleaveOps::injected_delta = 0;
+bool HeapInterleaveOps::advance_vend = false;
 
 void ResetHeapState(SharedTensorMapSidecar &map) {
     for (uint32_t shard = 0; shard < kSharedHeapShards; ++shard) {
@@ -103,6 +112,8 @@ constexpr uint64_t kOutputBytes[kTasksPerBatch] = {
     10240, 524288, 264192, 8192, 0,
 };
 
+// 串行 reference 只校验 PA Case1 的业务字节总量、默认 shard 分布和 no-wrap
+// 容量；生产并发时同一 shard 内的 task 物理次序不由 task_id 决定。
 void TestPaCase(uint32_t batches) {
     auto map = std::make_unique<SharedTensorMapSidecar>();
     ResetHeapState(*map);
@@ -126,13 +137,13 @@ void TestPaCase(uint32_t batches) {
             total == 0 ? 0 : shard * shard_span + expected_cursor[shard];
         Check(
             reservation.task_base == expected_base,
-            "PA Case1 task base follows task-id shard cursor"
+            "serial PA reference follows its current shard cursor"
         );
         expected_cursor[shard] += total;
         expected_vend += total;
         Check(
             reservation.aggregate_vend == expected_vend,
-            "PA Case1 aggregate vend is exact"
+            "serial PA reference aggregate vend is exact"
         );
     }
 
@@ -202,6 +213,22 @@ void TestAlignmentAndShardTail() {
             static_cast<int64_t>(kOutputAlignment),
         "rounded reservation advances only its shard"
     );
+
+    ResetHeapState(*map);
+    map->shared_heap_vend.value =
+        static_cast<int64_t>(kSharedHeapShards * shard_span + kOutputAlignment);
+    const HeapSnapshot excluded_tail = Snapshot(*map);
+    SharedHeapReservation zero{};
+    Check(
+        !ReserveSharedOutputHeap<HeapTestOps>(
+            *map, 0, 0, heap_size, zero
+        ),
+        "aggregate vend inside the excluded heap tail is rejected"
+    );
+    Check(
+        SameSnapshot(*map, excluded_tail),
+        "excluded-tail rejection changes no heap state"
+    );
 }
 
 void TestBoundaryZeroAndPreflightFailures() {
@@ -209,6 +236,23 @@ void TestBoundaryZeroAndPreflightFailures() {
     ResetHeapState(*map);
     const uint64_t heap_size =
         kSharedHeapShards * 4096;
+
+    SharedHeapReservation empty_zero{UINT64_MAX, UINT64_MAX};
+    const HeapSnapshot empty_snapshot = Snapshot(*map);
+    Check(
+        ReserveSharedOutputHeap<HeapTestOps>(
+            *map, 4, 0, heap_size, empty_zero
+        ),
+        "zero-output task may observe an empty aggregate vend"
+    );
+    Check(
+        empty_zero.task_base == 0 && empty_zero.aggregate_vend == 0,
+        "empty zero-output reservation returns a zero diagnostic prefix"
+    );
+    Check(
+        SameSnapshot(*map, empty_snapshot),
+        "empty zero-output reservation changes no heap state"
+    );
 
     SharedHeapReservation full{};
     Check(
@@ -384,6 +428,18 @@ void TestBoundaryZeroAndPreflightFailures() {
 
     ResetHeapState(*map);
     const HeapSnapshot tiny_heap = Snapshot(*map);
+    SharedHeapReservation tiny_zero{};
+    Check(
+        ReserveSharedOutputHeap<HeapTestOps>(
+            *map, 4, 0, kOutputAlignment - 1, tiny_zero
+        ),
+        "zero-output task does not require one allocatable shard"
+    );
+    Check(
+        tiny_zero.task_base == 0 && tiny_zero.aggregate_vend == 0 &&
+            SameSnapshot(*map, tiny_heap),
+        "tiny-heap zero-output reservation preserves empty state"
+    );
     Check(
         !ReserveSharedOutputHeap<HeapTestOps>(
             *map, 0, 1024, kOutputAlignment - 1, failed
@@ -396,80 +452,167 @@ void TestBoundaryZeroAndPreflightFailures() {
     );
 }
 
-void TestAtomicFaultRollback() {
+void TestConcurrentReservations() {
     auto map = std::make_unique<SharedTensorMapSidecar>();
     ResetHeapState(*map);
-    SharedHeapReservation reservation{};
+    constexpr uint32_t kThreads = 64;
+    std::vector<SharedHeapReservation> reservations(kThreads);
+    std::vector<uint64_t> reserve_bytes(kThreads);
+    std::vector<uint8_t> success(kThreads, 0);
+    std::vector<std::thread> workers;
+    workers.reserve(kThreads);
+    std::atomic<uint32_t> ready{0};
+    std::atomic<bool> start{false};
 
-    const HeapSnapshot initial = Snapshot(*map);
-    HeapFaultOps::fault_address = &map->shared_heap_cursor[0].value;
-    HeapFaultOps::injected_delta = 2048;
-    Check(
-        !ReserveSharedOutputHeap<HeapFaultOps>(
-            *map, 0, 1024, kHeapBytes, reservation
-        ),
-        "unexpected shard FetchAdd old value is rejected"
-    );
-    Check(
-        SameSnapshot(*map, initial),
-        "shard FetchAdd anomaly is fully rolled back"
-    );
+    for (uint32_t task_id = 0; task_id < kThreads; ++task_id) {
+        reserve_bytes[task_id] =
+            (task_id / kSharedHeapShards % 4 + 1) * kOutputAlignment;
+        workers.emplace_back([&, task_id] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            success[task_id] = ReserveSharedOutputHeap<HeapTestOps>(
+                *map, task_id, reserve_bytes[task_id], kHeapBytes,
+                reservations[task_id]
+            ) ? 1 : 0;
+        });
+    }
+    while (ready.load(std::memory_order_acquire) != kThreads) {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
+    for (std::thread &worker : workers) {
+        worker.join();
+    }
 
-    HeapFaultOps::fault_address = &map->shared_heap_vend.value;
-    HeapFaultOps::injected_delta = 2048;
+    std::vector<std::pair<uint64_t, uint64_t>>
+        shard_intervals[kSharedHeapShards];
+    std::vector<std::pair<uint64_t, uint64_t>> vend_intervals;
+    vend_intervals.reserve(kThreads);
+    const uint64_t shard_span =
+        SharedHeapAlignDown(kHeapBytes / kSharedHeapShards);
+    uint64_t expected_total = 0;
+    for (uint32_t task_id = 0; task_id < kThreads; ++task_id) {
+        Check(success[task_id] != 0, "concurrent reservation succeeds");
+        const uint32_t shard = task_id % kSharedHeapShards;
+        const uint64_t bytes = reserve_bytes[task_id];
+        shard_intervals[shard].push_back(
+            {
+                reservations[task_id].task_base,
+                reservations[task_id].task_base + bytes
+            }
+        );
+        vend_intervals.push_back(
+            {
+                reservations[task_id].aggregate_vend - bytes,
+                reservations[task_id].aggregate_vend
+            }
+        );
+        expected_total += bytes;
+        Check(
+            reservations[task_id].task_base >= shard * shard_span &&
+                reservations[task_id].task_base + bytes <=
+                    (shard + 1) * shard_span,
+            "concurrent reservation remains inside its assigned shard"
+        );
+    }
+    for (uint32_t shard = 0; shard < kSharedHeapShards; ++shard) {
+        std::sort(
+            shard_intervals[shard].begin(),
+            shard_intervals[shard].end()
+        );
+        uint64_t next = shard * shard_span;
+        for (const auto &interval : shard_intervals[shard]) {
+            Check(
+                interval.first == next,
+                "variable-size same-shard reservations are unique and gap-free"
+            );
+            next = interval.second;
+        }
+        Check(
+            map->shared_heap_cursor[shard].value ==
+                static_cast<int64_t>(next - shard * shard_span),
+            "concurrent shard cursor equals its reserved byte sum"
+        );
+    }
+    std::sort(vend_intervals.begin(), vend_intervals.end());
+    uint64_t next_vend = 0;
+    for (const auto &interval : vend_intervals) {
+        Check(
+            interval.first == next_vend,
+            "variable-size aggregate vend prefixes are unique and gap-free"
+        );
+        next_vend = interval.second;
+    }
     Check(
-        !ReserveSharedOutputHeap<HeapFaultOps>(
-            *map, 0, 1024, kHeapBytes, reservation
-        ),
-        "unexpected vend FetchAdd old value is rejected"
+        map->shared_heap_vend.value ==
+            static_cast<int64_t>(expected_total) &&
+            next_vend == expected_total,
+        "concurrent aggregate vend equals all successful reservations"
     );
-    Check(
-        SameSnapshot(*map, initial),
-        "vend anomaly rolls back both vend and shard cursor"
-    );
+}
 
-    // 再从非零合法快照注入相同故障，证明 rollback 恢复的是预检值，
-    // 而不是测试恰好从全零开始才看似成功。
+void TestInterleavingAndTerminalCapacityRace() {
+    auto map = std::make_unique<SharedTensorMapSidecar>();
     ResetHeapState(*map);
-    map->shared_heap_cursor[0].value = 4096;
-    map->shared_heap_cursor[1].value = 4096;
-    map->shared_heap_vend.value = 8192;
-    const HeapSnapshot nonzero = Snapshot(*map);
-
-    HeapFaultOps::fault_address = &map->shared_heap_cursor[0].value;
-    HeapFaultOps::injected_delta = 2048;
-    reservation = SharedHeapReservation{UINT64_MAX, UINT64_MAX};
+    HeapInterleaveOps::race_cursor = &map->shared_heap_cursor[0].value;
+    HeapInterleaveOps::race_vend = &map->shared_heap_vend.value;
+    HeapInterleaveOps::injected_delta = kOutputAlignment;
+    HeapInterleaveOps::advance_vend = false;
+    SharedHeapReservation reservation{UINT64_MAX, UINT64_MAX};
     Check(
-        !ReserveSharedOutputHeap<HeapFaultOps>(
+        ReserveSharedOutputHeap<HeapInterleaveOps>(
             *map, 0, 1024, kHeapBytes, reservation
         ),
-        "nonzero cursor FetchAdd anomaly is rejected"
+        "stale preflight snapshot accepts a legal concurrent reservation"
     );
     Check(
-        SameSnapshot(*map, nonzero),
-        "cursor anomaly restores the nonzero snapshot"
+        reservation.task_base == kOutputAlignment &&
+            reservation.aggregate_vend == kOutputAlignment,
+        "physical cursor and aggregate vend may linearize in different orders"
+    );
+    Check(
+        map->shared_heap_cursor[0].value == 2 * kOutputAlignment &&
+            map->shared_heap_vend.value == kOutputAlignment,
+        "paused competitor may own a cursor interval before publishing vend"
+    );
+    (void)__atomic_fetch_add(
+        &map->shared_heap_vend.value, static_cast<int64_t>(kOutputAlignment),
+        __ATOMIC_ACQ_REL
+    );
+    Check(
+        map->shared_heap_cursor[0].value == 2 * kOutputAlignment &&
+            map->shared_heap_vend.value == 2 * kOutputAlignment,
+        "resumed competitor closes final cursor and vend byte sums"
+    );
+
+    // 两个 caller 都从 shard 尾部看到一份余量；竞争者先占满，当前
+    // FetchAdd 随后越过 no-wrap 边界。此时必须 terminal fail 并保留
+    // 5KiB cursor 现场，绝不能 Exchange 回 3KiB 覆盖竞争者的合法 1KiB。
+    ResetHeapState(*map);
+    const uint64_t heap_size = kSharedHeapShards * 4096;
+    map->shared_heap_cursor[0].value = 3 * kOutputAlignment;
+    map->shared_heap_vend.value = 3 * kOutputAlignment;
+    HeapInterleaveOps::race_cursor = &map->shared_heap_cursor[0].value;
+    HeapInterleaveOps::race_vend = &map->shared_heap_vend.value;
+    HeapInterleaveOps::injected_delta = kOutputAlignment;
+    HeapInterleaveOps::advance_vend = true;
+    reservation = SharedHeapReservation{UINT64_MAX, UINT64_MAX};
+    Check(
+        !ReserveSharedOutputHeap<HeapInterleaveOps>(
+            *map, 0, kOutputAlignment, heap_size, reservation
+        ),
+        "capacity race fails after the competing reservation fills the shard"
+    );
+    Check(
+        map->shared_heap_cursor[0].value == 5 * kOutputAlignment &&
+            map->shared_heap_vend.value == 4 * kOutputAlignment,
+        "terminal capacity race preserves competitor progress and overrun evidence"
     );
     Check(
         reservation.task_base == 0 && reservation.aggregate_vend == 0,
-        "cursor anomaly clears the returned reservation"
-    );
-
-    HeapFaultOps::fault_address = &map->shared_heap_vend.value;
-    HeapFaultOps::injected_delta = 2048;
-    reservation = SharedHeapReservation{UINT64_MAX, UINT64_MAX};
-    Check(
-        !ReserveSharedOutputHeap<HeapFaultOps>(
-            *map, 0, 1024, kHeapBytes, reservation
-        ),
-        "nonzero vend FetchAdd anomaly is rejected"
-    );
-    Check(
-        SameSnapshot(*map, nonzero),
-        "vend anomaly restores both nonzero control words"
-    );
-    Check(
-        reservation.task_base == 0 && reservation.aggregate_vend == 0,
-        "vend anomaly clears the returned reservation"
+        "terminal capacity race returns no usable reservation"
     );
 }
 
@@ -480,7 +623,8 @@ int main() {
     TestPaCase(kDefaultBatches);
     TestAlignmentAndShardTail();
     TestBoundaryZeroAndPreflightFailures();
-    TestAtomicFaultRollback();
+    TestConcurrentReservations();
+    TestInterleavingAndTerminalCapacityRace();
     if (g_failures != 0) {
         std::fprintf(
             stderr, "shared heap reserve self-test failed: %d assertion(s)\n",

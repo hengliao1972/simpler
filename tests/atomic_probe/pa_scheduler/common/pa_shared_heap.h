@@ -33,12 +33,13 @@ PA_DEVICE bool SharedHeapAligned(uint64_t value) {
     return (value & (kOutputAlignment - 1)) == 0;
 }
 
-// 调用者必须已经持有 committed_tasks==task_id 的 exact turn。因此两个
-// FetchAdd 之间不存在合法并发 writer；若原子返回值仍偏离预检快照，就属于
-// 协议异常，冷路径把 cursor/vend 恢复后返回 false，由上层发布 fatal。
-//
 // no-wrap 是本阶段的明确边界：每个 shard 的绝对 cursor 只能从 0 推进到
-// shard_span，绝不取模。这样不依赖尚未证明的 generation 或 H-window 复用。
+// shard_span，绝不取模。FetchAdd 返回的旧 cursor 是当前 task 唯一的物理
+// 区间；合法并发 writer 可以让它不同于前置 Load 的观察值，不能因此回滚。
+//
+// 容量竞争若在 FetchAdd 后才被发现，则本轮进入 terminal fatal 并保留已经
+// 推进的控制字供 host 取证。并发 allocator 绝不能用 Exchange 恢复预检
+// 快照，否则会覆盖其他 winner 的合法进度。
 template <class Ops>
 PA_DEVICE bool ReserveSharedOutputHeap(
     PA_GM SharedTensorMapSidecar &map, uint32_t task_id, uint64_t total,
@@ -56,24 +57,33 @@ PA_DEVICE bool ReserveSharedOutputHeap(
         (kOutputAlignment & (kOutputAlignment - 1)) == 0,
         "shared heap alignment must be a power of two"
     );
-    if (task_id >= kMaxTasks) {
+    if (task_id >= kMaxTasks ||
+        heap_size > static_cast<uint64_t>(INT64_MAX)) {
         return false;
     }
+    const uint64_t shard_span =
+        SharedHeapAlignDown(heap_size / kSharedHeapShards);
+    const uint64_t usable_capacity =
+        shard_span * kSharedHeapShards;
 
-    const int64_t signed_vend_before = Ops::Load(&map.shared_heap_vend.value);
-    if (signed_vend_before < 0) {
+    const int64_t checked_vend = Ops::Load(&map.shared_heap_vend.value);
+    if (checked_vend < 0) {
         return false;
     }
-    const uint64_t vend_before = static_cast<uint64_t>(signed_vend_before);
-    if (!SharedHeapAligned(vend_before) || vend_before > heap_size) {
+    const uint64_t vend_snapshot = static_cast<uint64_t>(checked_vend);
+    if (!SharedHeapAligned(vend_snapshot) ||
+        vend_snapshot > usable_capacity) {
         return false;
     }
 
     // 零输出 task 仍需要取得当前 aggregate vend，供完成协议发布该 task 的
     // progress；但它不读取或推进任一 shard cursor，也不要求可用 heap 空间。
     if (total == 0) {
-        reservation.aggregate_vend = vend_before;
+        reservation.aggregate_vend = vend_snapshot;
         return true;
+    }
+    if (shard_span == 0) {
+        return false;
     }
 
     if (total > UINT64_MAX - (kOutputAlignment - 1)) {
@@ -85,11 +95,9 @@ PA_DEVICE bool ReserveSharedOutputHeap(
         return false;
     }
 
-    const uint64_t shard_span =
-        SharedHeapAlignDown(heap_size / kSharedHeapShards);
-    if (shard_span == 0 || reserve > shard_span ||
-        vend_before > heap_size - reserve ||
-        vend_before > static_cast<uint64_t>(INT64_MAX) - reserve) {
+    if (reserve > shard_span ||
+        vend_snapshot > usable_capacity - reserve ||
+        vend_snapshot > static_cast<uint64_t>(INT64_MAX) - reserve) {
         return false;
     }
 
@@ -110,10 +118,11 @@ PA_DEVICE bool ReserveSharedOutputHeap(
     const int64_t observed_cursor = Ops::FetchAdd(
         cursor_address, static_cast<int64_t>(reserve)
     );
-    if (observed_cursor != signed_cursor_before) {
-        // exact-turn 契约下没有第三方合法写者，因此恢复预检快照不会覆盖
-        // 合法进度；若契约已被破坏，上层会立即 fatal，不得继续分配。
-        (void)Ops::Exchange(cursor_address, signed_cursor_before);
+    if (observed_cursor < 0) {
+        return false;
+    }
+    const uint64_t cursor = static_cast<uint64_t>(observed_cursor);
+    if (!SharedHeapAligned(cursor) || cursor > shard_span - reserve) {
         return false;
     }
 
@@ -121,15 +130,19 @@ PA_DEVICE bool ReserveSharedOutputHeap(
     const int64_t observed_vend = Ops::FetchAdd(
         vend_address, static_cast<int64_t>(reserve)
     );
-    if (observed_vend != signed_vend_before) {
-        (void)Ops::Exchange(vend_address, signed_vend_before);
-        (void)Ops::Exchange(cursor_address, signed_cursor_before);
+    if (observed_vend < 0) {
+        return false;
+    }
+    const uint64_t vend = static_cast<uint64_t>(observed_vend);
+    if (!SharedHeapAligned(vend) ||
+        vend > usable_capacity - reserve ||
+        vend > static_cast<uint64_t>(INT64_MAX) - reserve) {
         return false;
     }
 
     reservation.task_base =
-        static_cast<uint64_t>(shard) * shard_span + cursor_before;
-    reservation.aggregate_vend = vend_before + reserve;
+        static_cast<uint64_t>(shard) * shard_span + cursor;
+    reservation.aggregate_vend = vend + reserve;
     return true;
 }
 

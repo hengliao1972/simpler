@@ -261,8 +261,8 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
             state->shared_map.shared_outputs[task_id].last_writer[slot].value = -1;
         }
     }
-    // shared heap 只由 ordered winner 推进；每轮必须从绝对 cursor/vend 的
-    // 零点重新开始，不能继承上一轮 host/device sidecar 的终态。
+    // shared heap 允许不同 winner 并发推进分片 cursor 与 aggregate vend；
+    // 每轮仍必须从绝对零点开始，不能继承上一轮 sidecar 的终态。
     for (uint32_t shard = 0; shard < kSharedHeapShards; ++shard) {
         state->shared_map.shared_heap_cursor[shard].value = 0;
     }
@@ -1284,20 +1284,6 @@ inline uint64_t ExpectedSharedHeapShardSpan(uint64_t heap_size) {
     const uint64_t raw = heap_size / kSharedHeapShards;
     return raw / kOutputAlignment * kOutputAlignment;
 }
-
-inline uint64_t ExpectedSharedTaskBase(uint32_t task_id, uint64_t heap_size) {
-    const uint32_t shard = task_id % kSharedHeapShards;
-    uint64_t shard_cursor = 0;
-    // task id 不回绕，且分片只由 task_id%8 决定。沿同一 shard 的历史
-    // task 累加即可独立重建该 task reserve 前的绝对 cursor。
-    for (uint32_t previous = shard; previous < task_id;
-         previous += kSharedHeapShards) {
-        shard_cursor += ExpectedTaskOutputBytes(previous);
-    }
-    return static_cast<uint64_t>(shard) *
-               ExpectedSharedHeapShardSpan(heap_size) +
-           shard_cursor;
-}
 #endif
 
 inline TensorDesc ExpectedCanonicalOutputDescriptor(
@@ -1373,8 +1359,8 @@ inline TensorDesc ExpectedCanonicalOutputDescriptor(
 }
 
 #if PTO_FDWIC_SHARED_MAP
-inline TensorDesc ExpectedSharedOutputDescriptor(
-    uint32_t task_id, uint32_t output_slot, uint64_t heap_size
+inline TensorDesc ExpectedSharedOutputDescriptorAtBase(
+    uint32_t task_id, uint32_t output_slot, uint64_t task_base
 ) {
     TensorDesc expected =
         ExpectedCanonicalOutputDescriptor(task_id, output_slot);
@@ -1383,8 +1369,7 @@ inline TensorDesc ExpectedSharedOutputDescriptor(
     const uint64_t output_offset =
         expected.buffer_addr - kSyntheticHeapBase - canonical_task_base;
     expected.buffer_addr =
-        kSyntheticHeapBase + ExpectedSharedTaskBase(task_id, heap_size) +
-        output_offset;
+        kSyntheticHeapBase + task_base + output_offset;
     return expected;
 }
 #endif
@@ -1416,6 +1401,13 @@ inline bool TensorDescFieldsMatch(
 struct SharedOutputValidation {
     bool protocol_ok = true;
     uint64_t published_outputs = 0;
+    uint64_t allocated_bytes = 0;
+    uint64_t shard_bytes[kSharedHeapShards] = {};
+};
+
+struct SharedHeapInterval {
+    uint64_t begin;
+    uint64_t end;
 };
 
 inline SharedOutputValidation ValidateSharedOutputs(
@@ -1424,11 +1416,40 @@ inline SharedOutputValidation ValidateSharedOutputs(
 ) {
     SharedOutputValidation validation;
     const TensorDesc zero_tensor{};
+    const uint64_t shard_span = ExpectedSharedHeapShardSpan(heap_size);
+    std::vector<SharedHeapInterval> intervals[kSharedHeapShards];
     for (uint32_t task_id = 0; task_id < kMaxTasks; ++task_id) {
         const uint32_t expected_count =
             task_id < task_count ? ExpectedOutputCount(task_id) : 0;
+        const SharedOutputCell &cell = map.shared_outputs[task_id];
+        uint64_t task_base = 0;
+        if (expected_count != 0) {
+            const uint64_t output_bytes = ExpectedTaskOutputBytes(task_id);
+            const uint32_t shard = task_id % kSharedHeapShards;
+            const uint64_t shard_begin =
+                static_cast<uint64_t>(shard) * shard_span;
+            const uint64_t shard_end = shard_begin + shard_span;
+            const uint64_t address = cell.tensors[0].buffer_addr;
+            const bool address_ok =
+                address >= kSyntheticHeapBase &&
+                output_bytes != 0 &&
+                output_bytes <= shard_span;
+            if (address_ok) {
+                task_base = address - kSyntheticHeapBase;
+            }
+            const bool interval_ok =
+                address_ok &&
+                task_base % kOutputAlignment == 0 &&
+                task_base >= shard_begin &&
+                task_base <= shard_end - output_bytes;
+            validation.protocol_ok &= interval_ok;
+            if (interval_ok) {
+                intervals[shard].push_back(
+                    {task_base, task_base + output_bytes}
+                );
+            }
+        }
         for (uint32_t slot = 0; slot < kSharedOutputMaxPerTask; ++slot) {
-            const SharedOutputCell &cell = map.shared_outputs[task_id];
             const bool active = slot < expected_count;
             if (!active) {
                 validation.protocol_ok &= cell.published[slot].value == -1;
@@ -1447,10 +1468,29 @@ inline SharedOutputValidation ValidateSharedOutputs(
             validation.protocol_ok &= cell.last_writer[slot].value == expected_writer;
             validation.protocol_ok &= TensorDescFieldsMatch(
                 cell.tensors[slot],
-                ExpectedSharedOutputDescriptor(task_id, slot, heap_size)
+                ExpectedSharedOutputDescriptorAtBase(
+                    task_id, slot, task_base
+                )
             );
             ++validation.published_outputs;
         }
+    }
+    for (uint32_t shard = 0; shard < kSharedHeapShards; ++shard) {
+        std::sort(
+            intervals[shard].begin(), intervals[shard].end(),
+            [](const SharedHeapInterval &left, const SharedHeapInterval &right) {
+                return left.begin < right.begin;
+            }
+        );
+        uint64_t next =
+            static_cast<uint64_t>(shard) * shard_span;
+        for (const SharedHeapInterval &interval : intervals[shard]) {
+            validation.protocol_ok &= interval.begin == next;
+            next = interval.end;
+        }
+        validation.shard_bytes[shard] =
+            next - static_cast<uint64_t>(shard) * shard_span;
+        validation.allocated_bytes += validation.shard_bytes[shard];
     }
     return validation;
 }
@@ -1719,9 +1759,9 @@ inline Metrics Validate(
         static_cast<uint64_t>(task_count) * (task_count - 1U) / 2U;
 #endif
 
-    // private 按连续逻辑 heap 重建；shared 则按 task_id%8 的独立绝对
-    // cursor 重建物理 reserve，同时用所有 shard reserve 之和形成全局 vend。
-    // 两种模式最后都得到逐 task 的最小 completion vend。
+    // private 按连续逻辑 heap 重建逐 task prefix；shared 只按 task_id%8
+    // 重建每个 shard 的最终字节总量。并发 FetchAdd 后，某 task 获得的
+    // task_base 和 aggregate vend prefix 都不再由 task_id 顺序决定。
     uint64_t expected_heap_next = 0;
     bool vend_progress_bounds_ok = true;
     uint32_t first_bad_vend = task_count;
@@ -1748,14 +1788,15 @@ inline Metrics Validate(
                     );
         expected_shared_heap_cursor[shard] += output_bytes;
         expected_heap_next += output_bytes;
+        minimum_vends[task_id] = output_bytes;
 #else
         uint64_t task_base = (expected_heap_next + kOutputAlignment - 1) / kOutputAlignment * kOutputAlignment;
         if (output_bytes != 0 && (task_base % state.heap_size) + output_bytes > state.heap_size) {
             task_base = (task_base / state.heap_size + 1) * state.heap_size;
         }
         expected_heap_next = task_base + output_bytes;
-#endif
         minimum_vends[task_id] = expected_heap_next;
+#endif
     }
 #if PTO_FDWIC_SHARED_MAP
     bool shared_heap_state_ok = shared_heap_capacity_ok;
@@ -1787,7 +1828,8 @@ inline Metrics Validate(
 #endif
     for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
         // kernel 可以晚于后续 Submit 完成，故 task vend 可以高于本 task
-        // reserve 后的 prefix；但绝不能小于该 prefix，也不能越过最终全局 vend。
+        // reserve 后的 prefix。private 使用确定 task-order prefix；shared
+        // 的并发 prefix 只要求覆盖本 task 自身 reserve 且不越过最终 vend。
         if (state.tasks[task_id].vend < minimum_vends[task_id] ||
             state.tasks[task_id].vend > expected_heap_next) {
             vend_progress_bounds_ok = false;
@@ -1812,8 +1854,22 @@ inline Metrics Validate(
         ValidateSharedTensorMap(state.shared_map, task_count);
     const SharedOutputValidation shared_output_validation =
         ValidateSharedOutputs(state.shared_map, task_count, state.heap_size);
+    bool shared_output_heap_layout_ok =
+        shared_output_validation.protocol_ok &&
+        shared_output_validation.allocated_bytes == expected_heap_next &&
+        shared_output_validation.allocated_bytes == actual_shared_vend;
+    for (uint32_t shard = 0; shard < kSharedHeapShards; ++shard) {
+        const int64_t raw_cursor =
+            state.shared_map.shared_heap_cursor[shard].value;
+        shared_output_heap_layout_ok &=
+            shared_output_validation.shard_bytes[shard] ==
+                expected_shared_heap_cursor[shard] &&
+            raw_cursor >= 0 &&
+            shared_output_validation.shard_bytes[shard] ==
+                static_cast<uint64_t>(raw_cursor);
+    }
     const uint64_t shared_normalized_writer_signature =
-        shared_output_validation.protocol_ok
+        shared_output_heap_layout_ok
             ? SharedNormalizedWriterSignature(
                   state.shared_map, batches,
                   static_cast<uint32_t>(expected_map_floor)
@@ -1955,19 +2011,31 @@ inline Metrics Validate(
                 alloc_wins * 3 + qk_wins + sf_wins * 3 + pv_wins;
         frontend_worker_counts_ok &= result.map_inserts == 0;
         // shared 的权威进度是 sidecar cursor/vend。worker.heap_next 只保存
-        // 该 worker 最近一次获胜时看到的 prefix，可为从未获胜核的 0；
-        // 非零值必须对应某个真实 task prefix，且有 winner 的核不能仍为 0。
-        const bool final_heap_is_prefix =
-            result.final_heap_next == 0 ||
-            std::binary_search(
-                minimum_vends.begin(), minimum_vends.end(),
-                result.final_heap_next
+        // 该 worker 最近一次获胜时观察到的并发 aggregate prefix；不同
+        // winner 的 FetchAdd 顺序不由 task_id 决定，因此不能再拿确定的
+        // task-order prefix 集合核对。纯 loser 仍必须保持 0。
+        const uint64_t nonzero_output_wins =
+            alloc_wins + qk_wins + sf_wins + pv_wins;
+        const uint64_t own_reserved_bytes =
+            alloc_wins * ExpectedTaskOutputBytes(
+                static_cast<uint32_t>(TaskKind::Alloc)
+            ) +
+            qk_wins * ExpectedTaskOutputBytes(
+                static_cast<uint32_t>(TaskKind::Qk)
+            ) +
+            sf_wins * ExpectedTaskOutputBytes(
+                static_cast<uint32_t>(TaskKind::Sf)
+            ) +
+            pv_wins * ExpectedTaskOutputBytes(
+                static_cast<uint32_t>(TaskKind::Pv)
             );
         final_worker_state_ok &=
-            final_heap_is_prefix && result.final_heap_next <= expected_heap_next &&
+            result.final_heap_next <= expected_heap_next &&
+            result.final_heap_next >= own_reserved_bytes &&
             (result.final_heap_next == 0 ||
              result.final_heap_next % kOutputAlignment == 0) &&
-            ((result.claim_wins == 0) == (result.final_heap_next == 0));
+            (result.claim_wins != 0 || result.final_heap_next == 0) &&
+            (nonzero_output_wins == 0 || result.final_heap_next != 0);
 #else
         frontend_worker_counts_ok &= result.context_reads == batches;
         frontend_worker_counts_ok &= result.views_created == static_cast<uint64_t>(batches) * 2;
@@ -2050,7 +2118,16 @@ inline Metrics Validate(
     for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
         // ready flag 和 vend 是跨核 completion 的最终外部可见状态，不能只依赖 worker 私有计数判断完成。
         ready_flags += state.tasks[task_id].flag == 1;
+#if PTO_FDWIC_SHARED_MAP
+        // 零输出 UP 可能在依赖 producer 发布前先取得 aggregate vend=0；
+        // shared 不使用该值做 heap reclaim。非零输出 task 的 reserve prefix
+        // 则必须非零。
+        vend_values_ok &=
+            ExpectedTaskOutputBytes(task_id) == 0 ||
+            state.tasks[task_id].vend != 0;
+#else
         vend_values_ok &= state.tasks[task_id].vend != 0;
+#endif
         vend_values_ok &= state.tasks[task_id].vend % kOutputAlignment == 0;
     }
     const uint64_t kernel_total = kernel_counts[0] + kernel_counts[1] + kernel_counts[2] + kernel_counts[3];
@@ -2148,7 +2225,13 @@ inline Metrics Validate(
     );
     Expect(duplicates == 0, "completion flags are published once", &metrics);
     Expect(ready_flags == task_count, "all task flags are ready", &metrics);
-    Expect(vend_values_ok, "all published vend values are nonzero and aligned", &metrics);
+    Expect(
+        vend_values_ok,
+        kCompiledTensorMapMode == TensorMapBuildMode::Private
+            ? "all published vend values are nonzero and aligned"
+            : "shared task vends are aligned and nonzero for output reservations",
+        &metrics
+    );
     Expect(
         vend_progress_bounds_ok,
         kCompiledTensorMapMode == TensorMapBuildMode::Private
@@ -2304,14 +2387,14 @@ inline Metrics Validate(
         &metrics
     );
     Expect(
-        shared_output_validation.protocol_ok &&
+        shared_output_heap_layout_ok &&
             shared_output_validation.published_outputs ==
                 static_cast<uint64_t>(batches) * 8,
-        "shared fresh-output table publishes exact descriptors and writers",
+        "shared fresh-output descriptors form exact non-overlapping shard coverage",
         &metrics
     );
     Expect(
-        shared_output_validation.protocol_ok &&
+        shared_output_heap_layout_ok &&
             shared_normalized_writer_signature ==
             expected_normalized_writer_signature,
         "shared symbol projection matches canonical normalized writer signature",

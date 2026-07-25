@@ -993,6 +993,80 @@ heap 改成合法并发分配，再单独移除 PA Case1 的空 region 全局 se
 terminal abort 闭环。当前 per-slot wait 不能单独替代全局 sequencer。
 本步只对 CCEC 与 CPU 做专项实现和验证，未做 AscendC 适配或验证。
 
+#### S4.4 shared 8-shard heap 建立并发合法性
+
+第二项结构修正只改变 allocator、CPU 定向测试和 host oracle，暂不移动
+`FinishCallbackSubmitBody()` 中 Materialize 前的 exact-turn。这样先证明
+heap 本身允许并发，再单独处理仍依赖 task 顺序的 `last_writer` 与发布后
+失败终止协议。
+
+新的 no-wrap allocator 契约为：
+
+1. `task_id % 8` 只决定 shard，物理 `task_base` 由该 shard cursor 的
+   `FetchAdd` 返回旧值决定；
+2. 前置 Load 只拒绝当时已经可见的负值、未对齐、容量耗尽等损坏状态，
+   不能要求后续 FetchAdd old 与该快照相等；
+3. `shared_heap_vend` 是另一条独立 FetchAdd 的全局已分配字节前缀，不是
+   物理地址，也不是 task-id prefix；cursor 与 vend 的线性化顺序可以不同；
+4. 零输出 task 不执行 RMW，只读取当时 vend，因此在 empty/tiny heap 上
+   合法返回 0；多个零输出 task 也可以观察到相同 vend；
+5. 可用总容量为
+   `align_down(heap_size / 8, 1 KiB) * 8`，原始 heap 的分片尾部不能被 vend
+   当成容量；
+6. 若容量竞争在 cursor FetchAdd 后才暴露，本次返回 false 并由上层把整轮
+   置为 terminal fatal。越界 cursor 作为现场保留，绝不能 Exchange 回预检
+   快照或用负 FetchAdd 回滚，否则会覆盖其他 winner 的合法区间。
+
+CPU heap 定向测试由旧的“异常 old value 必须回滚”改为真实并发契约：
+
+- 64 个线程使用 1～4 KiB 变长 reserve，同时覆盖 8 个 shard；排序后每个
+  shard 的物理区间必须唯一、无重叠且无空洞；
+- 非零 reserve 的 aggregate vend 返回值转换成全局字节区间后也必须唯一
+  且无空洞；零输出 Load 可重复同一 prefix；
+- 用 `HeapInterleaveOps` 定向注入 cursor 已推进、vend 尚未推进的原子交错，
+  证明两条原子序可以解耦并在静止后重新闭合；
+- 用同一注入器模拟 shard 尾部容量竞争，验证失败者保留 overrun、竞争者
+  进度不被回滚；
+- 额外覆盖 empty zero-output、tiny heap zero-output、excluded heap tail、
+  满 shard、负值、未对齐、溢出及 b1/b256 最终业务字节分布。
+
+host 不再用 `ExpectedSharedTaskBase(task_id)` 重建并发物理地址。它从每个
+已发布 task 的首个 descriptor 反推实际 task base，验证 task 内 output
+偏移/shape/size 后，按 shard 对所有区间排序并要求从 shard 起点连续覆盖。
+每个 task 的物理区间按逐 output 1 KiB 对齐后的 reserve span 计算，最终
+必须三向闭合：
+
+```text
+descriptor-derived aligned reserve span == actual cursor
+    == expected PA aligned reserve bytes
+sum(descriptor-derived aligned reserve span) == sum(cursor)
+    == actual aggregate vend == expected aligned reserve total
+```
+
+shared `TaskCell::vend` 只要求覆盖本 task 自身非零 reserve、对齐且不超过最终
+vend；零输出 UP 可为 0。worker 的 `final_heap_next` 不再与 task-id prefix
+集合比较：纯 loser 必须为 0，赢过非零输出 task 的 worker 必须非零且至少
+覆盖本核自身 reserve 总量。跨 private/shared 的 normalized writer signature
+仍使用 canonical 连续地址，但只有实际 descriptor/cursor/vend 校验通过后
+才允许计算，不能让规范化签名掩盖物理错址。
+
+当前门禁：
+
+- CPU private/shared 严格构建与全部公共自测 PASS；
+- CPU shared b1 的 heap、descriptor、依赖、writer 签名与 real-compute
+  输出全部 PASS；
+- shared heap 并发定向测试在 ASan/UBSan/leak 检查下 PASS。
+- CCEC shared perf-clock mixed ELF 构建与 b1 全部断言 PASS；新 descriptor
+  非重叠覆盖 oracle、cursor/vend、规范化签名和 real-compute 输出均闭合，
+  最终工作树单个可执行性样本为 `81.699 us`。
+
+本小步的完整运行仍被旧 exact-turn 串行保护，因此这些结果证明的是
+“allocator 与 oracle 已允许合法并发”，不声称 A5 已发生同 shard 乱序。
+b1 四个非零输出 task 还恰好落在四个不同 shard；真正移除 turn 后必须用
+CCEC b256 覆盖多个同-shard reserve，并验证运行中实际产生的任意物理次序，
+不能预设单次运行必然出现乱序。本步只对 CCEC 与 CPU 做专项实现和验证，
+未做 AscendC 适配或验证。
+
 ### 阶段 R0：迁移真实 simpler
 
 只有 S0～S4 全部闭环后，才按已验证结构依次迁移：
