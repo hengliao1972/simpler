@@ -3430,9 +3430,9 @@ outputs/pa_scheduler_shared_swimlane_20260725_155729_2638154/ccec/
 private Host 当前使用用户 GCC15，而旧冻结件使用 GCC13.3，因此不把 Host
 全文件差异误写成 shared 代码泄漏。
 
-#### 性能判定尚未完成
+#### 预声明门槛与冻结配对结果
 
-上述结果只说明实现与观察契约闭合，不代表已有收益。S4.14a 提交后将冻结
+正确性结果本身不代表已有收益。S4.14a 提交为 `e24e579c` 后冻结
 clean shared perf-clock ELF，并相对 S4.9 `e8320280` 在 device0 上各预热
 两次，再执行六个 ABBA/BAAB 区组、每版 12 个独立 b256 正式进程。
 
@@ -3454,3 +3454,50 @@ S4.14b 仍使用既定六区组门槛：6/6 更快且配对差中位数至少约
 0～3/6 或中位数非负则撤销。只有 Vector `4→8` 最终保留后，才相对
 新冻结基线单独测试 Cube `4→8`，再测试 Vector `8→16`。任何一步失败
 都回到上一冻结基线，不能堆叠后再猜收益来源。
+
+正式六区组结果如下。表中差值均为区组内候选两次均值减去基线两次均值，
+不是把两边各 12 个总体中位数直接相减：
+
+| 区组 | S4.9 均值 | S4.14a 均值 | 差值 | 百分差 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 3,254.115us | 3,085.436us | -168.680us | -5.184% |
+| 2 | 3,247.635us | 3,088.239us | -159.396us | -4.908% |
+| 3 | 3,255.936us | 3,064.637us | -191.299us | -5.875% |
+| 4 | 3,232.131us | 3,072.167us | -159.964us | -4.949% |
+| 5 | 3,270.661us | 3,071.275us | -199.387us | -6.096% |
+| 6 | 3,239.886us | 3,082.049us | -157.837us | -4.872% |
+| 配对中位数 | - | - | **-164.322us** | **-5.066%** |
+
+候选 6/6 区组更快且幅度远超过预声明的 `-0.2%`，因此按门槛直接保留
+S4.14a，不追加第二轮。S4.9 的 12 个正式样本中位数为 3,249.714us，
+S4.14a 为 3,073.963us；这两个总体中位数仅描述分布，不替代上表的配对
+主指标。
+
+28 个独立进程日志经过二次审计，每份都有 42 条 PASS 断言，并统一满足：
+
+- 两版 manifest 身份均为 shared/perf-clock/none，Host 与 kernel SHA
+  与各自冻结清单一致；
+- 73,728 次 ClaimMax、96 个 active worker、RingBp=0；
+- 依赖边 1,280、签名 `b7d985d6edb07078`，QK/SF/PV/UP 各 256 次；
+- `global_end_tick - global_start_tick == global_span_ticks`，且 1ns
+  SYS_CNT tick 精确对应 `[METRIC] submit_span_us`；
+- execution、semantic、postprocess 和真实计算输出全部 PASS。
+
+证据目录：
+
+```text
+outputs/perf_clock_freeze_e24e579c_20260725_160026/
+outputs/perf_clock_pair_e24e579c_vs_e8320280_20260725_160507/
+```
+
+当前证据能归因的是“shared Vector 保持四分片并整体迁到 sidecar”，不能
+进一步断言是哪一级 cache、atomic 单元或地址映射带来的收益。新增的 512B
+位于 `SchedulerState` 最后；`shared_map` 本就是最后一个字段，所以没有
+移动 production prefix、standalone controls、results 或任何既有 shared
+字段。额外 H2D/D2H 字节也发生在首末 Submit 窗外。由此当前 standalone
+shared 性能基线前移到 `e24e579c`。
+
+下一步 S4.14b 只允许把 `kSharedVectorCursorShards` 从 4 改为 8。
+sidecar offset、物理容量、state 大小、初始化、Host 传输和寻址表达式均
+冻结不动。若 S4.14b 相对 S4.14a 通过自身门槛，仍需再相对 S4.9 核对
+最终净收益，避免把迁址容忍和分片变化叠加后只看局部比较。

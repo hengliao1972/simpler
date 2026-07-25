@@ -5,8 +5,9 @@
 本文记录 `TestPagedAttentionUnroll::Case1` 在真实 A5 上的 FDWIC AICore
 Submit 路径，供后续继续优化。真实 PA 生产快照日期为 2026-07-18；当前
 保留的生产优化基线为 `2c3dd1e2`，F1 负结果记录提交为 `c93c3666`。
-standalone 实验记录更新至 2026-07-25 的 S4.14a；当前只是
-shared Vector cursor 的迁址对照，有效性能基线仍是 S4.9。
+standalone 实验记录更新至 2026-07-25 的 S4.14a；shared Vector cursor
+四分片迁址已通过冻结 ELF 配对门槛，当前 standalone shared 性能基线为
+`e24e579c`。
 
 范围限定为：
 
@@ -2175,8 +2176,29 @@ CCEC private/shared 14 种构建与 manifest 全部通过。A5 shared b1 atomic
 `.text=129,080B`、`.rodata=288B`，与 S4.9 大小相同；没有新增
 atomic/泳道/PMU 记录字段。
 
-这些只是正确性和计数证据。S4.14a 必须先相对 S4.9 做六区组
-ABBA/BAAB 配对，量清迁址本身；只有该对照可接受，S4.14b 才在相同
-sidecar 地址、物理容量和代码骨架下只把有效分片数和取模从 4 改为 8。
-在两轮结果出来前，不能把迁址或“预留八条线”写成性能提升。详细源码
-历史、ABI 和门禁见 `shared_tensormap_record.md` 的 S4.14 节。
+提交 `e24e579c` 后冻结候选 ELF，相对 S4.9 `e8320280` 各预热两次，
+再跑六个交替 ABBA/BAAB 区组；每版 12 个独立 b256 正式进程。每个样本
+都保持 73,728 次 ClaimMax、96 个 active worker、RingBp=0、
+QK/SF/PV/UP 各 256 次和相同依赖签名。六个区组的候选减基线分别为
+`-5.184%/-4.908%/-5.875%/-4.949%/-6.096%/-4.872%`，候选
+6/6 更快，配对百分差中位数为 **-5.066%**，绝对差中位数为
+**-164.322us**。它满足测量前写定的“6/6 且不差于 -0.2%”直接保留
+门槛，无需追加第二轮。
+
+这里能归因的是“保持四分片时，把 shared Vector cursor 搬到 sidecar”
+这一整体改动，不是分片数或 atomic 次数消减。新增 512B 位于
+`SchedulerState` 最后，未移动任何 production、control、result 或既有
+shared 字段；额外 Host 传输也不在首末 Submit 计时窗内。究竟是 cache
+映射、atomic 资源隔离还是其他地址效应，当前证据不能再细分，不能把推测
+写成定论。
+
+当前 standalone shared 性能基线因此前移到 `e24e579c`。S4.14b 将在完全
+相同的 sidecar 地址、物理容量、state 大小和代码骨架下，只把有效分片数
+及取模从 4 改为 8；若通过，还必须相对 S4.9 再核一次最终净收益。完整
+逐样本日志、冻结件 SHA 和 SYS_CNT 审计位于：
+
+```text
+outputs/perf_clock_pair_e24e579c_vs_e8320280_20260725_160507/
+```
+
+详细源码历史、ABI 和门禁见 `shared_tensormap_record.md` 的 S4.14 节。
