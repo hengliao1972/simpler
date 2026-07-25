@@ -2412,3 +2412,125 @@ AIC/AIV 主体分别减少 96B 和 88B。A5 shared b1 默认 real-compute 为
 65.734us，96 核语义、8/5/3 symbol、5 条 fanin、heap、writer signature
 和输出 tile 全部 PASS。该 b1 单样本仍只作为正确性门禁，不能据此声称
 相对 S4.8 的性能收益；冻结后的 b256 配对与参考分支同口径对照另行记录。
+
+### 2026-07-25：S4.8b 与参考 shared 分支的同机近似对照
+
+#### 对照来源和环境适配
+
+参考实现固定为 `fdwic-shared-tensormap` 的 `2866ad73`，shared 编译开关
+查档确认是：
+
+```bash
+CXXFLAGS='-DPTO_FDWIC_SHARED_MAP=1'
+```
+
+参考 checkout 原始 Case1 写死 `block_dim=36`，而本机 device 0 报告
+`cube=32/vector=64`，所以只在 `/tmp` 测试配置中临时改为 32；这也使实际
+worker 拓扑与 standalone 的 32 AIC + 64 AIV 对齐。参考提交还没有旧驱动
+`CPU_TOPO=65534` 的兼容分支，因此临时移入当前 simpler 已有的
+“ACL AICPU 核数与 OCCUPY 位图相等才允许平铺拓扑”host fallback。该补丁
+只决定 AICPU 线程可见性，不进入 AICore Submit/shared TensorMap 热路径。
+
+构建过程还复用了 CANN 9.1 自带 `llvm-strip` 处理 AArch64 dispatcher，
+因为参考脚本会错误地让 x86 `/usr/bin/strip` 处理该 so 并硬失败。PTO-ISA
+直接复用本机完全相同的 `ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8`
+checkout。以上均是让旧参考提交在本机启动的工具链或平台适配，不是性能
+实现移植。
+
+参考 PA Case1 使用 batch=256、每 batch 5 个 Alloc/QK/SF/PV/UP task，
+真实执行 4 类 PA kernel，并开启 level-4 L2 泳道。用例 golden 通过；
+原始和合并泳道冻结在：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  reference_compare_2866ad73_20260725_082426/
+```
+
+#### 时间结果和口径限制
+
+standalone `d0042690` 从 clean shared perf-clock ELF 先跑 3 次 warm-up，
+再跑 12 个独立 b256 real-compute 进程。正式样本的首个 Submit 起点到
+最后一个 Submit 返回为：
+
+| 数据 | min | median | max | mean |
+| --- | ---: | ---: | ---: | ---: |
+| standalone perf-clock | 4.031ms | 6.874ms | 7.721ms | 6.580ms |
+
+参考分支本机泳道有 97,500 条 X 事件，所有事件最早起点到最晚终点为
+2.541ms。表面上它比 standalone 中位数少 4.334ms，standalone/reference
+约为 2.70 倍；参考文档此前在 device 6 的单次记录为 2.285～2.330ms，
+本机这次约慢 11%。
+
+这个差值只能用来判断优化方向，不能当作严格方案收益：
+
+- standalone 窗口是每核 task0 的 Submit 边界到 task1279 的 Submit 尾动作，
+  且 perf-clock 编译期去掉泳道、atomic trace 和 PMU；
+- 参考 2.541ms 是全部已记录 X 事件的 global span，既包含 Kernel、Commit
+  和末端 drain，又不包含未打点的 orchestration 构参；
+- 参考执行真实 PA kernel/内存流，standalone 使用
+  `real-compute/6,28,4,1` 的引擎负载模型；
+- 参考分支没有现成 first-to-last Submit 计时，不能把现有逐调用
+  `prof_submit_task` 累计冒充 wall window。
+
+尽管绝对值不能直接相减，重计算负载并不是当前 2.7 倍表面差异的合理主因。
+standalone b1 泳道的 QK/SF/PV/UP 分别约
+42.062/53.712/28.658/3.332us；参考本机 256 个同类真实 kernel 的中位数
+分别为 47.131/54.857/29.370/1.742us。三个重任务在参考中反而略慢或接近，
+说明需要优先审查 scheduler 协议，而不是继续盲调 NOP/compute 次数。
+
+#### 已确认的结构性差异
+
+1. **参考在 shared Alloc 前先做唯一候选过滤。**
+   参考实际 Claim 为 49,408 次，精确等于
+   `256 + 2×256×32 + 2×256×64`。standalone 为 73,728 次，多出的
+   `24,320 = 256×(96-1)` 全是 Alloc 的非候选竞争；而且这些 actor 还会
+   构造三个 Alloc Output 参数。参考在候选判断失败后立即返回，既不发
+   Claim atomic，也不进入 Materialize/Submit 主体。这是明确可复用的
+   winner-first 优点。
+
+2. **参考 shared 正常完成不推进全局 frontier。**
+   `complete_executed_task()` 只在 private 宏分支调用
+   `advance_frontier()`；PA shared heap 在 8 个 32MiB shard 内不 wrap，
+   fanin 直接依赖 per-task flag，所以正常路径不需要连续完成前沿。
+   standalone 本次仍执行 1,280 次 initial load、32,861 次 flag load 和
+   31,581 次 FetchMax，共 65,722 个 frontier atomic，占自身
+   `submit_completion_ops=176,930` 的 37.1%。这不是参考实现的细枝末节，
+   而是当前 standalone 尚未剥离的 private ring 时代协议。
+
+3. **参考 shared 把私有 ring 从 4 槽扩到 14 槽。**
+   standalone 保持 4 个 `LocalSlot`，扣除 2 个协议预留后普通任务只有
+   2 槽；参考 14 槽同样扣除 2 个预留后仍有 12 槽。参考编译期
+   移除每核 private TensorMap 后，即使 `RingSlot` 因 deferred ref 从
+   4,864B 增到 5,440B，仍为每核配置 14 槽。更深的在途窗口能减少
+   RingBackpressure，并让构建与真实 kernel 更充分重叠。这部分有状态体积、
+   槽回收和执行顺序风险，不能与前两项一次合并验证。
+
+4. **参考对未发布 INPUT 使用执行前 deferred resolve。**
+   本机参考泳道实际出现 491 条 Resolve 区间，并完成 2,048 次 descriptor
+   copy/invalidate，证明 ready/deferred 两条路径都命中。standalone 仍在
+   `CollectSharedFanin()` 中同步等 publication；本次 perf-clock 有
+   34,920 次 fanin load，其中 25,457 次 not-ready。standalone 随后又在
+   slot 执行前检查 fanin flag，因此 eager 等待既限制提交超前，也没有替代
+   执行门禁。S4.8b 只对齐了 ready descriptor 直写，没有对齐 deferred。
+
+5. **两者的 shared 输出分配方向已经接近，但状态裁剪程度不同。**
+   两者都按 task shard 预留 output heap，也都让 ready descriptor 直接落
+   slot。standalone 仍保留大块 per-worker private TensorMap/TaskPayload
+   形态和 4 槽 ABI；参考把 shared 编译期状态作为整体重新布局。后续不能只
+   比一条 copy 指令就声称两套架构已经对等。
+
+#### 对后续顺序的影响
+
+本次对照改变后续优先级。纯 INPUT deferred 仍是目标，但在它之前已有两项
+更小、参考代码和本机计数都直接支持的变量：
+
+1. shared no-wrap PA 先停止每 task frontier helping，并把 host 断言改为
+   “flag 全 ready、frontier 保持初始化”；单独做 CPU/CCEC/A5 和 frozen
+   perf-clock 配对；
+2. shared Alloc 增加唯一候选早退，删除 95/96 actor 的 Claim 与构参；
+3. 再独立比较 4→14 或分档 ring 深度，不能和 deferred 同时改；
+4. 最后接纯 INPUT deferred resolve，保留 INOUT writer 等待和完整故障门禁。
+
+这个顺序不是照抄参考提交：shared heap 一旦允许 wrap，frontier 或等价
+generation/reclaim 协议仍必须恢复；14 槽也必须按本机状态预算验证。复用的
+是已被参考实跑证明的主路径机制，差异和限制继续在本文件逐阶段记录。
