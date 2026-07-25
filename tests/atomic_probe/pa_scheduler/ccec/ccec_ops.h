@@ -227,6 +227,15 @@ struct CcecOps {
 
     __aicore__ static inline uint64_t Now() { return static_cast<uint64_t>(get_sys_cnt()); }
 
+#if PA_BUILD_PERF_CLOCK
+    // 专用接口只允许出现在公共调度器的首个/末个 Submit 条件分支。
+    // 普通 Now 仍服务 watchdog；区分命名让源码审计不会把正确性超时读
+    // 误算成新增的性能观察点。
+    __aicore__ static inline uint64_t PerfClockNow() {
+        return static_cast<uint64_t>(get_sys_cnt());
+    }
+#endif
+
     template <typename T>
     __aicore__ static inline uint64_t NowAfterAtomicResult(T value) {
         static_assert(sizeof(T) == 4 || sizeof(T) == 8, "atomic dependency expects a scalar result");

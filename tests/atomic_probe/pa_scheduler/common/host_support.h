@@ -282,6 +282,7 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     state->config.build_identity_abi_version = kBuildIdentityAbiVersion;
     state->config.tensor_map_mode = static_cast<uint32_t>(kCompiledTensorMapMode);
     state->config.scheduler_state_size = static_cast<uint32_t>(sizeof(SchedulerState));
+    state->pmu_probe.build_variant = kCompiledBuildVariant;
     for (uint32_t batch = 0; batch < options.batches; ++batch) {
         state->context_lens[batch] = 8192;
     }
@@ -1575,6 +1576,55 @@ inline uint64_t SharedNormalizedWriterSignature(
 }
 #endif
 
+#if PA_BUILD_PERF_CLOCK
+inline bool PerfClockObserverFieldsAreZero(const WorkerResult &result) {
+    for (uint32_t kind = 0; kind < 4; ++kind) {
+        if (result.kernel_cycles[kind] != 0 ||
+            result.kernel_min_cycles[kind] != 0 ||
+            result.kernel_max_cycles[kind] != 0) {
+            return false;
+        }
+    }
+    for (uint32_t phase = 0;
+         phase < static_cast<uint32_t>(ProfilePhase::Count); ++phase) {
+        if (result.phase_cycles[phase] != 0 ||
+            result.phase_calls[phase] != 0) {
+            return false;
+        }
+    }
+    return result.atomic_trace_calls == 0 &&
+           result.pmu_total_cycles == 0 &&
+           result.pmu_scalar_busy == 0 &&
+           result.pmu_icache_requests == 0 &&
+           result.pmu_icache_misses == 0 &&
+           result.pmu_status == 0 &&
+           result.pmu_window_ticks == 0 &&
+           result.pmu_warm_total_cycles == 0 &&
+           result.pmu_warm_window_ticks == 0 &&
+           result.pmu_warm_icache_requests == 0 &&
+           result.pmu_warm_icache_misses == 0 &&
+           result.pmu_vector_busy == 0 &&
+           result.pmu_cube_busy == 0 &&
+           result.pmu_mte1_busy == 0 &&
+           result.pmu_mte2_busy == 0 &&
+           result.pmu_mte3_busy == 0 &&
+           result.pmu_fix_busy == 0 &&
+           result.pmu_build_variant == 0 &&
+           result.pmu_phase_id == 0 &&
+           result.pmu_phase_calls == 0 &&
+           result.pmu_phase_status == 0 &&
+           result.pmu_phase_icache_requests == 0 &&
+           result.pmu_phase_icache_misses == 0 &&
+           result.pmu_shadow_icache_requests == 0 &&
+           result.pmu_shadow_icache_misses == 0 &&
+           result.startup_barrier_begin == 0 &&
+           result.startup_barrier_end == 0 &&
+           result.final_barrier_begin == 0 &&
+           result.final_barrier_release == 0 &&
+           result.final_barrier_end == 0;
+}
+#endif
+
 inline Metrics Validate(
     const SchedulerState &state, uint32_t run, double host_us, const TraceHeader *trace_header = nullptr
 ) {
@@ -1594,6 +1644,7 @@ inline Metrics Validate(
     // 聚合量分为调度核心计数、kernel 分布、前端操作数和最终状态四组，便于定位语义偏差。
     uint64_t first_submit = UINT64_MAX;
     uint64_t last_submit = 0;
+#if !PA_BUILD_PERF_CLOCK
     uint64_t first_startup_begin = UINT64_MAX;
     uint64_t last_startup_end = 0;
     uint64_t first_final_begin = UINT64_MAX;
@@ -1602,6 +1653,7 @@ inline Metrics Validate(
     std::vector<uint64_t> startup_wait_ticks;
     std::vector<uint64_t> final_release_wait_ticks;
     std::vector<uint64_t> post_release_drain_ticks;
+#endif
     uint64_t submits = 0;
     uint64_t claims = 0;
     uint64_t wins = 0;
@@ -1618,9 +1670,11 @@ inline Metrics Validate(
     uint64_t trace_wait_records = 0;
     uint64_t wins_by_kind[5] = {};
     uint64_t kernel_counts[4] = {};
+#if !PA_BUILD_PERF_CLOCK
     uint64_t kernel_cycles[4] = {};
     uint64_t kernel_min[4] = {};
     uint64_t kernel_max[4] = {};
+#endif
     uint64_t placements[3] = {};
     uint64_t phase_calls[static_cast<uint32_t>(ProfilePhase::Count)] = {};
     uint64_t context_reads = 0;
@@ -1646,6 +1700,9 @@ inline Metrics Validate(
     bool worker_shape_ok = true;
     bool submit_timestamps_ok = true;
     bool lifecycle_timestamps_ok = true;
+#if PA_BUILD_PERF_CLOCK
+    bool perf_clock_observer_fields_zero = true;
+#endif
     bool vend_values_ok = true;
     bool frontend_worker_counts_ok = true;
     bool final_worker_state_ok = true;
@@ -1782,6 +1839,18 @@ inline Metrics Validate(
         worker_shape_ok &= result.max_occupied <= kUsableSlots;
         worker_shape_ok &= result.final_occupied == 0;
         submit_timestamps_ok &= result.submit_begin != 0;
+#if PA_BUILD_PERF_CLOCK
+        submit_timestamps_ok &= result.submit_end > result.submit_begin;
+        submit_timestamps_ok &= result.finish_cycle == result.submit_end;
+        lifecycle_timestamps_ok &=
+            result.startup_barrier_begin == 0 &&
+            result.startup_barrier_end == 0 &&
+            result.final_barrier_begin == 0 &&
+            result.final_barrier_release == 0 &&
+            result.final_barrier_end == 0;
+        perf_clock_observer_fields_zero &=
+            PerfClockObserverFieldsAreZero(result);
+#else
         submit_timestamps_ok &= result.submit_end >= result.submit_begin;
         submit_timestamps_ok &= result.finish_cycle >= result.submit_end;
         lifecycle_timestamps_ok &= result.startup_barrier_begin != 0;
@@ -1791,11 +1860,13 @@ inline Metrics Validate(
         lifecycle_timestamps_ok &= result.final_barrier_release >= result.final_barrier_begin;
         lifecycle_timestamps_ok &= result.final_barrier_end >= result.final_barrier_release;
         lifecycle_timestamps_ok &= result.finish_cycle >= result.final_barrier_end;
+#endif
         dependency_signature ^= result.dependency_signature;
         shared_symbol_input_loads += result.shared_symbol_input_loads;
         shared_symbol_inout_exchanges += result.shared_symbol_inout_exchanges;
         first_submit = std::min(first_submit, result.submit_begin);
         last_submit = std::max(last_submit, result.submit_end);
+#if !PA_BUILD_PERF_CLOCK
         first_startup_begin = std::min(first_startup_begin, result.startup_barrier_begin);
         last_startup_end = std::max(last_startup_end, result.startup_barrier_end);
         first_final_begin = std::min(first_final_begin, result.final_barrier_begin);
@@ -1804,6 +1875,7 @@ inline Metrics Validate(
         startup_wait_ticks.push_back(result.startup_barrier_end - result.startup_barrier_begin);
         final_release_wait_ticks.push_back(result.final_barrier_release - result.final_barrier_begin);
         post_release_drain_ticks.push_back(result.final_barrier_end - result.final_barrier_release);
+#endif
         submits += result.submits;
         claims += result.claim_attempts;
         wins += result.claim_wins;
@@ -1957,12 +2029,14 @@ inline Metrics Validate(
             wins_by_kind[kind] += result.wins[kind];
         for (uint32_t kind = 0; kind < 4; ++kind) {
             kernel_counts[kind] += result.kernel_counts[kind];
+#if !PA_BUILD_PERF_CLOCK
             kernel_cycles[kind] += result.kernel_cycles[kind];
             if (result.kernel_min_cycles[kind] != 0 &&
                 (kernel_min[kind] == 0 || result.kernel_min_cycles[kind] < kernel_min[kind])) {
                 kernel_min[kind] = result.kernel_min_cycles[kind];
             }
             kernel_max[kind] = std::max(kernel_max[kind], result.kernel_max_cycles[kind]);
+#endif
         }
         for (uint32_t place = 0; place < 3; ++place)
             placements[place] += result.placement[place];
@@ -2001,7 +2075,28 @@ inline Metrics Validate(
     );
 #endif
     Expect(submit_timestamps_ok, "all Submit timing markers are valid", &metrics);
+#if PA_BUILD_PERF_CLOCK
+    Expect(
+        lifecycle_timestamps_ok,
+        "perf-clock lifecycle-only timing fields stay zero",
+        &metrics
+    );
+    Expect(
+        perf_clock_observer_fields_zero,
+        "perf-clock excludes phase, atomic-trace, PMU, and kernel timing observations",
+        &metrics
+    );
+    Expect(
+        state.config.trace_enabled == 0 &&
+            state.config.trace_base == 0 &&
+            state.config.trace_records_per_core == 0 &&
+            state.config.profile_phases == 0,
+        "perf-clock runtime trace and phase controls stay disabled",
+        &metrics
+    );
+#else
     Expect(lifecycle_timestamps_ok, "all lifecycle timing markers are valid", &metrics);
+#endif
     Expect(final_barrier_shape_valid, "final barrier selector is valid", &metrics);
     const bool flat_final_barrier = final_barrier_shape == FinalBarrierShape::Flat;
     Expect(
@@ -2408,6 +2503,20 @@ inline Metrics Validate(
         // 性能口径只覆盖最早 Submit.begin 到最晚 Submit.end，不含启动屏障、最终 drain 和 host 同步。
         metrics.submit_span_us = static_cast<double>(last_submit - first_submit) / 1000.0;
     }
+#if PA_BUILD_PERF_CLOCK
+    std::printf(
+        "[PERF-CLOCK] run=%u global_start_tick=%llu global_end_tick=%llu "
+        "global_span_ticks=%llu scope=first-submit-begin-to-last-submit-end\n",
+        run,
+        static_cast<unsigned long long>(first_submit),
+        static_cast<unsigned long long>(last_submit),
+        static_cast<unsigned long long>(
+            first_submit == UINT64_MAX || last_submit < first_submit
+                ? 0
+                : last_submit - first_submit
+        )
+    );
+#else
     if (first_startup_begin != UINT64_MAX && last_startup_end >= first_startup_begin &&
         first_final_begin != UINT64_MAX && last_final_release >= first_final_begin &&
         last_final_end >= first_final_begin && last_final_end >= first_startup_begin) {
@@ -2431,6 +2540,7 @@ inline Metrics Validate(
         final_release_wait.median / 1000.0, static_cast<double>(final_release_wait.p95) / 1000.0,
         post_release_drain.median / 1000.0, static_cast<double>(post_release_drain.p95) / 1000.0
     );
+#endif
     std::printf(
         "[METRIC] run=%u submit_span_us=%.3f host_launch_us=%.3f claims=%llu fanin_loads=%llu cas_retries=%llu\n", run,
         metrics.submit_span_us, host_us, static_cast<unsigned long long>(claims),
@@ -2462,8 +2572,17 @@ inline Metrics Validate(
     );
     // placement 统计回答 kernel 最终在哪个 drain 点执行，与 TracePhase 的累计 span 互补。
     const char *kernel_names[] = {"QK", "SF", "PV", "UP"};
+#if !PA_BUILD_PERF_CLOCK
     const uint32_t targets[] = {kTargetQkTicks, kTargetSfTicks, kTargetPvTicks, kTargetUpTicks};
+#endif
     for (uint32_t kind = 0; kind < 4; ++kind) {
+#if PA_BUILD_PERF_CLOCK
+        std::printf(
+            "[KERNEL] %-2s count=%llu timing=disabled-in-perf-clock\n",
+            kernel_names[kind],
+            static_cast<unsigned long long>(kernel_counts[kind])
+        );
+#else
         const double mean =
             kernel_counts[kind] == 0 ? 0.0 : static_cast<double>(kernel_cycles[kind]) / kernel_counts[kind];
         std::printf(
@@ -2471,6 +2590,7 @@ inline Metrics Validate(
             static_cast<unsigned long long>(kernel_counts[kind]), mean / 1000.0, kernel_min[kind] / 1000.0,
             kernel_max[kind] / 1000.0, targets[kind] / 1000.0
         );
+#endif
     }
     PrintPhaseDiagnostics(state);
     if (!metrics.passed) {

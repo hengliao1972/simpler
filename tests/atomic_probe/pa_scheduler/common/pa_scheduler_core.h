@@ -94,7 +94,7 @@ PA_DEVICE void EndSubmitPmuPhase(PmuContext &context) {
 
 template <typename Ops>
 PA_DEVICE uint64_t TraceTimestamp(TraceContext &trace, WorkerResult &result) {
-#if PA_BUILD_SUBMIT_PMU
+#if PA_BUILD_TRACE_FREE
     (void)trace;
     (void)result;
     return 0;
@@ -387,6 +387,11 @@ PA_DEVICE bool SlotReady(PA_GM SchedulerState *state, PA_GM LocalSlot &slot, Loc
 PA_DEVICE void RecordKernelCycles(LocalStats &stats, TaskKind kind, uint64_t cycles) {
     const uint32_t index = KindIndex(kind) - 1;
     ++stats.result.kernel_counts[index];
+#if PA_BUILD_TRACE_FREE
+    // 无 trace 构建仍保留四类 kernel 的正确性计数，但不把恒为零的
+    // 观察时长写进热路径，更不会在 host 侧把 0 冒充 kernel 性能。
+    (void)cycles;
+#else
     stats.result.kernel_cycles[index] += cycles;
     if (stats.result.kernel_min_cycles[index] == 0 || cycles < stats.result.kernel_min_cycles[index]) {
         stats.result.kernel_min_cycles[index] = cycles;
@@ -394,6 +399,7 @@ PA_DEVICE void RecordKernelCycles(LocalStats &stats, TaskKind kind, uint64_t cyc
     if (cycles > stats.result.kernel_max_cycles[index]) {
         stats.result.kernel_max_cycles[index] = cycles;
     }
+#endif
 }
 
 template <typename Ops>
@@ -1558,7 +1564,13 @@ PA_DEVICE bool FinishCallbackSubmitBody(
     }
 
     ++stats.result.submits;
-#if PA_BUILD_SUBMIT_PMU
+#if PA_BUILD_PERF_CLOCK
+    // 与真实 FDWIC perf-clock 相同：只有末个 Submit 完成全部尾动作后
+    // 才采一次专用性能边界。协议 watchdog 继续使用 Ops::Now()，两者
+    // 在源码上保持可审计的不同接口。
+    const uint64_t submit_end =
+        task_id + 1 == task_count ? Ops::PerfClockNow() : 0;
+#elif PA_BUILD_SUBMIT_PMU
     const uint64_t submit_end = task_id + 1 == task_count ? Ops::Now() : 0;
 #else
     const uint64_t submit_end = TraceTimestamp<Ops>(stats.trace, stats.result);
@@ -1644,7 +1656,12 @@ PA_DEVICE bool SubmitCallbackTask(
 ) {
     BeginCallbackSubmit(worker, context);
     const uint32_t task_id = static_cast<uint32_t>(context.task_id);
-#if PA_BUILD_SUBMIT_PMU
+#if PA_BUILD_PERF_CLOCK
+    // dist_submit_begin/BeginCallbackSubmit 已建立本次 task_id；首个
+    // Submit 的 EfDrain 前只读一次性能时钟，不为其余 Submit 递增
+    // 另一份观察计数。
+    const uint64_t submit_begin = task_id == 0 ? Ops::PerfClockNow() : 0;
+#elif PA_BUILD_SUBMIT_PMU
     const uint64_t submit_begin = task_id == 0 ? Ops::Now() : 0;
 #else
     const uint64_t submit_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
@@ -1877,7 +1894,8 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         state->config.build_identity_magic == kBuildIdentityMagic &&
         state->config.build_identity_abi_version == kBuildIdentityAbiVersion &&
         state->config.tensor_map_mode == static_cast<uint32_t>(kCompiledTensorMapMode) &&
-        state->config.scheduler_state_size == static_cast<uint32_t>(sizeof(SchedulerState));
+        state->config.scheduler_state_size == static_cast<uint32_t>(sizeof(SchedulerState)) &&
+        state->pmu_probe.build_variant == kCompiledBuildVariant;
     if (!build_identity_matches) {
         (void)Ops::Exchange(&state->fatal.value, static_cast<int32_t>(1));
         return;
@@ -1937,7 +1955,13 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     // startup 严格保持生产 flat 语义；本实验只改变 replay 尾部的 final 汇合。
     // 96 个参与者全部完成本地状态初始化后再进入 task 0，主要用于压低启动偏斜对
     // winner 分布和 Submit 时序的干扰；atomicMax 的唯一 winner 正确性本身不依赖该屏障。
+#if PA_BUILD_PERF_CLOCK
+    // perf-clock 不采集生命周期诊断。启动 watchdog 仍在下一行建立自己的
+    // 正确性超时起点，不能为了追求字面上的“两次 SYS_CNT”删除防挂死机制。
+    stats.result.startup_barrier_begin = 0;
+#else
     stats.result.startup_barrier_begin = Ops::Now();
+#endif
     TraceAtomicFetchAdd<Ops>(
         stats.trace, stats.result, -1, AtomicSite::StartupIncrement,
         &state->started_count.value, 1
@@ -1958,7 +1982,11 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         }
     }
     AtomicPollRegionEnd<Ops>(stats.trace, stats.result, startup_poll_region);
+#if PA_BUILD_PERF_CLOCK
+    stats.result.startup_barrier_end = 0;
+#else
     stats.result.startup_barrier_end = Ops::Now();
+#endif
 
     const uint32_t batches = state->config.batches;
     const uint32_t task_count = batches * kTasksPerBatch;
@@ -2048,7 +2076,11 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     const uint64_t final_drain_begin = orchestration_end != 0
         ? orchestration_end
         : TraceTimestamp<Ops>(stats.trace, stats.result);
+#if PA_BUILD_PERF_CLOCK
+    stats.result.final_barrier_begin = 0;
+#else
     stats.result.final_barrier_begin = Ops::Now();
+#endif
     const auto final_barrier_shape = static_cast<FinalBarrierShape>(state->config.final_barrier_shape);
     const uint32_t final_two_level_groups = TwoLevelFinalBarrierGroupCount(final_barrier_shape);
     const bool hierarchical_final_barrier =
@@ -2082,7 +2114,9 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                                       LoadLine<Ops>(state->replay_done, stats, AtomicSite::ReplayDonePoll) >=
                                           static_cast<int64_t>(state->config.workers);
         if (all_replayed && !global_release_observed) {
+#if !PA_BUILD_PERF_CLOCK
             stats.result.final_barrier_release = Ops::Now();
+#endif
             global_release_observed = true;
         }
         // 必须同时满足“无人再生产新 slot”和“本核旧 slot 全部完成”，否则继续帮助系统推进 completion。
@@ -2094,7 +2128,11 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         }
     }
     AtomicPollRegionEnd<Ops>(stats.trace, stats.result, final_poll_region);
+#if PA_BUILD_PERF_CLOCK
+    stats.result.final_barrier_end = 0;
+#else
     stats.result.final_barrier_end = Ops::Now();
+#endif
     const uint64_t final_drain_end = TraceTimestamp<Ops>(stats.trace, stats.result);
     if (orchestration_begin != 0 && orchestration_end >= orchestration_begin) {
         WriteTrace<false>(
@@ -2107,7 +2145,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         ProfilePhase::ReplayTail, final_drain_begin, final_drain_end
     );
 
-#if !PA_BUILD_SUBMIT_PMU
+#if !PA_BUILD_TRACE_FREE
     if (stats.trace.atomics_enabled) {
         // 两条基线都放在最终 drain 之后。第一条量连续
         // SYS_CNT，第二条量返回依赖钩子的固定成本；它们只描述计时底噪，不能
@@ -2159,7 +2197,13 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     // PA writes swimlane records through the ordinary GM cache and explicitly
     // cleans each worker's record range before the kernel finishes.
     FlushTraceCore<Ops>(stats.trace, stats.result);
+#if PA_BUILD_PERF_CLOCK
+    // 复用末个 Submit 的已保存边界满足结果有序性，不再为 worker 尾部
+    // 增加一次纯诊断 SYS_CNT。
+    stats.result.finish_cycle = stats.result.submit_end;
+#else
     stats.result.finish_cycle = Ops::Now();
+#endif
     stats.result.max_occupied = stats.max_occupied;
     stats.result.final_occupied = worker.occupied_count;
     stats.result.final_heap_next = worker.heap_next;
@@ -2193,7 +2237,7 @@ PA_DEVICE void RunScheduler(PA_GM SchedulerState *state, uint32_t worker_id, Cor
     // 两个正式 CCEC 构建都不再携带旧 phase-profile 模板副本：swimlane 用
     // records 表达阶段，submit-pmu 使用独立 PMU 边界。其他后端暂时保留原
     // 运行时入口，保证公共 standalone 的 CPU/AscendC 回归不被 CCEC 构建切分影响。
-#if PA_BUILD_SWIMLANE || PA_BUILD_SUBMIT_PMU
+#if PA_BUILD_SWIMLANE || PA_BUILD_SUBMIT_PMU || PA_BUILD_PERF_CLOCK
     RunSchedulerImpl<Ops, false>(state, worker_id, role);
 #else
     // Profile 作为编译期模板参数，只在显式开启时保留阶段累计代码，关闭时不在热路径增加运行时分支。

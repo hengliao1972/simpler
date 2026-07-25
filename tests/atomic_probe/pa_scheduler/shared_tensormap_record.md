@@ -848,6 +848,54 @@ QK/SF/PV/UP 的 reset、view/CreateInfo、tensor/scalar 添加只由 winner
 shared 没有 future/stale 依赖、silent overflow 或永久等待；同构 `perf-clock`
 结果达到可迁移标准。目标分支的 2.3 ms 只作为潜力参考，不作验收阈值。
 
+#### S4.1 独立 `perf-clock` 证据链
+
+2026-07-24 先补齐了此前缺失的 standalone 低扰动性能构建。它不是在
+swimlane ELF 上运行时传 `--no-swimlane`：后者仍会保留各阶段
+`TraceTimestamp` 和 atomic 包围计时。新变体使用独立
+`PA_BUILD_PERF_CLOCK=1`，并在编译期统一消去：
+
+- 普通阶段记录、PollBatch、atomic 开始/结束时间及返回依赖观察；
+- phase-profile 累计；
+- submit-PMU counter reader 与 owner；
+- Kernel/Commit、startup/final lifecycle 和 ClockBaseline 计时。
+
+首个 Submit 在 `BeginCallbackSubmit()` 已确定 task 0 后、EfDrain 前调用
+专用 `PerfClockNow()`；末个 Submit 在 register/winner 或 loser 尾动作、
+`submits++` 之后、返回前调用第二次。结果继续复用既有
+`WorkerResult::submit_begin/submit_end/submits`，没有扩大 trace buffer 或
+增加逐 Submit 记录。shared exact-turn 与 startup 屏障的时间 watchdog
+仍保留：每个等待窗口会先读取一次超时起点，之后每 1024 次未完成轮询
+复查一次。它是正确性超时，不属于新增性能观察，因而本实现只声称
+“每核两个专用性能边界”，不声称最终 ELF 物理上只会读取两次系统时钟。
+
+构建身份 ABI 从 3 升到 4，并复用 `PmuProbeConfig` 的一个保留槽加入
+`swimlane=1 / submit-pmu=2 / perf-clock=3` 握手。这样即使绕过
+`run.sh` 和 manifest，host/kernel 变体不一致也会在解释 worker 状态前
+fail-closed。CCEC perf-clock 保持现有 split-finish 形状，只生成
+host/kernel 两件套；最终 ELF 不得含 `WritePollBatchRecordRaw`，也不放置
+会改变后续热函数 I-cache 对齐的可执行 marker。CPU 使用独立产物目录，并逐线程断言专用
+性能时钟恰好调用 2 次、全局共 192 次；CPU 仍不作为 A5 性能证据。
+
+本小步先按既定规则只做 b1 门禁：
+
+| 门禁 | 结果 |
+| --- | --- |
+| CPU private/shared perf-clock 严格构建 | 系统 g++ 13.3.0 下全部独立自测 PASS |
+| CPU private/shared b1 real-compute | 96 核、每核 5 Submit、专用读钟 192/192、全部语义与数值断言 PASS |
+| CCEC private/shared mixed ELF | split caller/runtime/finish、无 trace writer、LOCAL helper、无残留 relocation、manifest 全部 PASS |
+| CCEC private b1 real-compute | 最终代码全部断言 PASS；单个结构样本 `66.620 us` |
+| CCEC shared b1 real-compute | 最终代码全部断言 PASS；单个结构样本 `81.714 us` |
+| 既有普通构建回归 | CPU private 与 CCEC private swimlane b1 全部断言 PASS |
+| 既有 submit-PMU 回归 | CCEC private `none` 构建、96 核身份/窗口、PMU 清理与 b1 语义全部 PASS |
+| 变体交叉运行负向门禁 | perf-clock host 搭配 swimlane kernel 被 ABI4 `build_variant` 握手拒绝 |
+
+两个 CCEC 数值来自不同 ELF 的各一个独立 b1 进程，只证明边界和产物可用，
+不能据此判断 shared 快慢。正式性能结论仍需冻结两份 perf-clock ELF 后做
+平衡顺序的 b256 private/shared 配对；swimlane 与 submit-PMU 只负责解释，
+不得和 perf-clock 的绝对时间互减。当前 S4 尚未因为这两个 b1 样本而宣告完成。
+本阶段只实现和验收 CCEC、CPU 两条路径，不新增 AscendC perf-clock。
+
 ### 阶段 R0：迁移真实 simpler
 
 只有 S0～S4 全部闭环后，才按已验证结构依次迁移：

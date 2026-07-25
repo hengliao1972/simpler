@@ -21,6 +21,8 @@ Usage:
   ./run.sh run    ccec|ascendc|cpu|all [--tensormap private|shared] [benchmark options]
   ./run.sh smoke  ccec|ascendc|cpu|all [--tensormap private|shared] [--device N]
   ./run.sh swimlane ccec|ascendc|cpu|all [--tensormap private|shared] [benchmark options]
+  ./run.sh build-perf-clock ccec|cpu [--tensormap private|shared]
+  ./run.sh perf-clock ccec|cpu [--tensormap private|shared] [benchmark options]
   ./run.sh build-submit-pmu ccec none|claim|efdrain|materialize|register [--tensormap private|shared]
   ./run.sh submit-pmu ccec none|claim|efdrain|materialize|register [--tensormap private|shared] [benchmark options]
 
@@ -162,6 +164,8 @@ ccec_artifact_failure() {
     echo "Invalid CCEC artifact set for mode '$tensormap_mode', variant '$variant', phase '$phase': $reason" >&2
     if [[ "$variant" == "submit-pmu" ]]; then
         echo "Run: $0 build-submit-pmu ccec $phase --tensormap $tensormap_mode" >&2
+    elif [[ "$variant" == "perf-clock" ]]; then
+        echo "Run: $0 build-perf-clock ccec --tensormap $tensormap_mode" >&2
     else
         echo "Run: $0 build ccec --tensormap $tensormap_mode" >&2
     fi
@@ -196,6 +200,13 @@ validate_ccec_artifacts() {
         swimlane)
             if [[ "$phase" != "none" ]]; then
                 ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" "swimlane phase must be none"
+                return 1
+            fi
+            ;;
+        perf-clock)
+            if [[ "$phase" != "none" ]]; then
+                ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" \
+                    "perf-clock phase must be none"
                 return 1
             fi
             ;;
@@ -319,6 +330,52 @@ run_submit_pmu() {
         fi
         "$python_bin" "$SCRIPT_DIR/pmu_html_report.py" "$pmu_json"
     fi
+}
+
+reject_managed_perf_clock_options() {
+    # perf-clock 必须保持单进程、单轮、无其他观察器。多样本由外层独立
+    # 进程交错运行，不能用同一进程的热 runs 冒充独立样本。
+    for argument in "$@"; do
+        case "$argument" in
+            --kernel|--kernel=*|--runs|--runs=*|--no-swimlane|\
+            --profile-phases|--trace-atomics|--analyze-swimlane|\
+            --swimlane-json|--swimlane-json=*|--pmu-window|--pmu-window=*|\
+            --pmu-scalar-nops|--pmu-scalar-nops=*|\
+            --pmu-icache-trials|--pmu-icache-trials=*|\
+            --pmu-json|--pmu-json=*)
+                echo "The perf-clock action manages or forbids $argument." >&2
+                exit 1
+                ;;
+        esac
+    done
+}
+
+run_perf_clock() {
+    local backend="$1"
+    local tensormap_mode="$2"
+    shift 2
+    case "$backend" in
+        ccec)
+            local build_dir="$SCRIPT_DIR/build/ccec/$tensormap_mode/perf-clock"
+            local host="$build_dir/pa_scheduler_host"
+            local kernel="$build_dir/pa_scheduler_kernel.o"
+            validate_ccec_artifacts "$tensormap_mode" perf-clock none "$build_dir"
+            "$host" --kernel "$kernel" --runs 1 --no-swimlane "$@"
+            ;;
+        cpu)
+            local executable="$SCRIPT_DIR/build/cpu/$tensormap_mode/perf-clock/pa_scheduler_cpu"
+            if [[ ! -x "$executable" ]]; then
+                echo "Missing CPU perf-clock artifact: $executable" >&2
+                echo "Run: $0 build-perf-clock cpu --tensormap $tensormap_mode" >&2
+                return 1
+            fi
+            "$executable" --runs 1 --no-swimlane "$@"
+            ;;
+        *)
+            echo "perf-clock supports only ccec or cpu, not '$backend'." >&2
+            return 1
+            ;;
+    esac
 }
 
 reject_managed_swimlane_options() {
@@ -499,6 +556,21 @@ case "$ACTION" in
                 "$RAW_JSON" -o "$EXCLUSIVE_JSON"
         done
         echo "[SWIMLANE] output_root=$OUTPUT_ROOT"
+        ;;
+    build-perf-clock)
+        if [[ "$BACKEND" != "ccec" && "$BACKEND" != "cpu" ]] || [[ $# -ne 0 ]]; then
+            echo "Usage: $0 build-perf-clock ccec|cpu [--tensormap private|shared]" >&2
+            exit 1
+        fi
+        "$SCRIPT_DIR/$BACKEND/build.sh" "$TENSORMAP_MODE" perf-clock
+        ;;
+    perf-clock)
+        if [[ "$BACKEND" != "ccec" && "$BACKEND" != "cpu" ]]; then
+            echo "Usage: $0 perf-clock ccec|cpu [--tensormap private|shared] [benchmark options]" >&2
+            exit 1
+        fi
+        reject_managed_perf_clock_options "$@"
+        run_perf_clock "$BACKEND" "$TENSORMAP_MODE" "$@"
         ;;
     build-submit-pmu)
         if [[ "$BACKEND" != "ccec" || $# -ne 1 ]]; then

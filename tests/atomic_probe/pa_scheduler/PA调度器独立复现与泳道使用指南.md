@@ -220,24 +220,35 @@ export CXX="$GCC15_ROOT/usr/bin/g++-15"
 `include/pto/common/kernel_meta.hpp` 的目录；同一 include tree 还必须具有
 `pto/pto-inst.hpp`、`pto/common/constants.hpp` 和 `pto/common/pto_tile.hpp`。
 
-当前最终只保留两类正式观察构建，不再生成同时夹带泳道与 PMU
-诊断代码的统一 CCEC ELF：
+当前固定三条互不混算的证据链，不再生成同时夹带泳道、PMU 与性能基线
+代码的统一 CCEC ELF：
 
 | 构建 | 后端 | 内容 | 构建命令 | 产物目录 |
 | --- | --- | --- | --- | --- |
 | `swimlane` | CCEC/AscendC/CPU | schema-v4 普通阶段、业务父区间、真实 Submit 尾动作与 atomic（direct + PollBatch）合并采集；不配置 PMU | `./run.sh build ccec --tensormap <mode>` 或 `./run.sh build all --tensormap <mode>` | `build/<backend>/<mode>/swimlane/` |
+| `perf-clock` | CCEC/CPU | 编译掉泳道、atomic 观察、phase-profile、PMU 和 kernel/lifecycle 计时；每核只新增首个 Submit 起点与末个 Submit 终点两个性能边界 | `./run.sh build-perf-clock ccec\|cpu --tensormap <mode>` | `build/<backend>/<mode>/perf-clock/` |
 | `submit-pmu` | 仅 CCEC | 每核完整 Submit PMU，并在编译期可选一个局部阶段；当前有 `none|claim|efdrain|materialize|register` | `./run.sh build-submit-pmu ccec <phase> --tensormap <mode>` | `build/ccec/<mode>/submit-pmu/<phase>/` |
 
-`./run.sh build all` 只构建三后端的 `swimlane` 产物；`submit-pmu`
-必须按 phase 另行构建。`none` 是不做局部边界读取的完整 Submit
-基准，不是第三类构建。
+`./run.sh build all` 只构建三后端的 `swimlane` 产物；`perf-clock`
+只支持当前验收范围内的 CCEC/CPU，必须逐后端构建；`submit-pmu` 必须按
+phase 另行构建。`none` 是不做局部边界读取的完整 Submit PMU 窗口，
+不能替代 `perf-clock`。
 
 `--tensormap private|shared` 是由 `run.sh` 消费的构建身份，不会下传为
 benchmark 运行时参数；省略时默认 `private`。它与 `swimlane`/
-`submit-pmu` 正交，并进入产物目录、CCEC manifest 以及 host/device
-`magic + ABI version + mode + sizeof(SchedulerState)` 握手。CCEC 的
-swimlane 两件套和 submit-pmu 四件套都必须通过 manifest 的模式、变体、
-阶段和 SHA256 校验，才能启动 host。
+`perf-clock`/`submit-pmu` 正交，并进入产物目录、CCEC manifest 以及
+host/device `magic + ABI version + mode + build variant +
+sizeof(SchedulerState)` 握手。CCEC 的 swimlane/perf-clock 两件套和
+submit-pmu 四件套都必须通过 manifest 的模式、变体、阶段和 SHA256
+校验，才能启动 host。
+
+`perf-clock` 的“两个时间边界”专指新增的性能观察：task 0 在 EfDrain 前
+读取一次，末 task 完成 Submit 尾动作后读取一次。shared ordered 协议和
+startup 屏障仍保留时间型 watchdog；每个等待窗口先读取一次超时起点，
+随后只在每 1024 次未完成轮询时复查系统计数器。它属于防止协议永久挂死
+的正确性机制，不应谎称整个 ELF 物理上只有两条 `SYS_CNT`。CPU 变体会
+逐线程断言专用性能接口恰好调用两次，但 CPU 时间只验证协议和算术，
+不能作为 A5 性能证据。
 
 当前已完成 S0 构建身份、S1 private ring、S2 shared ordered ring 正确性
 基线、S2.5 ordered-winner reclaim 和 S3.1 fresh-output symbol。后续
@@ -403,6 +414,8 @@ host 对 cursor/vend、descriptor、输出符号、依赖边和规范化 writer 
 | `smoke` | 固定 b1/r1/`scalar-nop=0` 的快速语义回归 | 否，只做内存记录校验 |
 | `run` | 自行控制 batch、run、winner 负载和诊断参数 | 仅显式传入 `--swimlane-json` 时生成 raw |
 | `swimlane` | 单轮运行并自动生成 raw、Perfetto merged JSON 和排他闭合分析 JSON | 是 |
+| `build-perf-clock` | 单独构建 CCEC 或 CPU 的低扰动首末 Submit 计时产物 | 否 |
+| `perf-clock` | 强制单进程单轮、关闭全部其他观察器，输出完整 Submit 全局跨度 | 否 |
 | `build-submit-pmu` | 构建指定 `none|claim|efdrain|materialize|register` 的 CCEC PMU-only ELF | 否 |
 | `submit-pmu` | 单轮采集完整 Submit PMU，可选导出 JSON | 否，与泳道隔离 |
 
@@ -415,6 +428,19 @@ CCEC、AscendC 和 CPU 的 `run/swimlane` 都可使用
 `--real-compute-count N`、`--real-compute-counts QK,SF,PV,UP` 或
 `--real-compute-pattern constant|layout-diagnostic`；真计算 count/pattern
 与 `--nop-count*` 互斥。`smoke` 有意固定 scalar-nop，不接受这些覆盖项。
+
+低扰动 b1 门禁使用：
+
+```bash
+./run.sh build-perf-clock cpu  --tensormap private
+./run.sh perf-clock       cpu  --tensormap private --batches 1
+./run.sh build-perf-clock ccec --tensormap private
+./run.sh perf-clock       ccec --tensormap private --batches 1
+```
+
+shared 时只替换 `--tensormap shared`。`perf-clock` action 自己固定
+`--runs 1 --no-swimlane`，并拒绝泳道、atomic、phase-profile 与 PMU
+参数；需要多样本时应由外层启动多个独立进程并平衡 private/shared 顺序。
 
 ### 5.1 首次回归
 

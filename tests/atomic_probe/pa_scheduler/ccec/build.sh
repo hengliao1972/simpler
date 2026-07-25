@@ -33,8 +33,8 @@ case "$TENSORMAP_MODE" in
         ;;
 esac
 
-# CCEC 不再生成同时夹带泳道与 PMU 的统一 ELF。无 variant 保持兼容并
-# 等价于 swimlane；submit-pmu phase 必须先由白名单映射为稳定数值。
+# CCEC 不生成跨证据链的统一 ELF。无 variant 保持兼容并等价于
+# swimlane；perf-clock 与 submit-pmu 分别拥有独立目录和编译身份。
 BUILD_VARIANT="${1:-swimlane}"
 SPLIT_FINISH=0
 case "$BUILD_VARIANT" in
@@ -50,8 +50,28 @@ case "$BUILD_VARIANT" in
             "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID"
             -DPA_BUILD_SWIMLANE=1
             -DPA_BUILD_SUBMIT_PMU=0
+            -DPA_BUILD_PERF_CLOCK=0
             -DPA_SUBMIT_PMU_PHASE_ID=0
         )
+        SPLIT_FINISH=1
+        ;;
+    perf-clock)
+        if [[ $# -gt 1 ]]; then
+            echo "Usage: $0 [private|shared] perf-clock" >&2
+            exit 1
+        fi
+        PHASE_NAME="none"
+        PHASE_ID=0
+        BUILD_DIR="$ROOT_DIR/build/ccec/$TENSORMAP_MODE/perf-clock"
+        VARIANT_DEFINES=(
+            "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID"
+            -DPA_BUILD_SWIMLANE=0
+            -DPA_BUILD_SUBMIT_PMU=0
+            -DPA_BUILD_PERF_CLOCK=1
+            -DPA_SUBMIT_PMU_PHASE_ID=0
+        )
+        # 性能基线必须保持与正式 swimlane/none 相同的 split-finish
+        # 调用形状，不能为减少编译工作偷偷换成 inline finish。
         SPLIT_FINISH=1
         ;;
     submit-pmu)
@@ -76,6 +96,7 @@ case "$BUILD_VARIANT" in
             "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID"
             -DPA_BUILD_SWIMLANE=0
             -DPA_BUILD_SUBMIT_PMU=1
+            -DPA_BUILD_PERF_CLOCK=0
             "-DPA_SUBMIT_PMU_PHASE_ID=$PHASE_ID"
         )
         # none/Claim/EfDrain 的 PMU 窗口在 finish 之前已经闭合，可以复用泳道版
@@ -87,7 +108,7 @@ case "$BUILD_VARIANT" in
         fi
         ;;
     *)
-        echo "Usage: $0 [private|shared] [swimlane] | $0 [private|shared] submit-pmu <phase>" >&2
+        echo "Usage: $0 [private|shared] [swimlane|perf-clock] | $0 [private|shared] submit-pmu <phase>" >&2
         exit 1
         ;;
 esac
@@ -138,8 +159,8 @@ done
 
 mkdir -p "$BUILD_DIR"
 rm -f -- "$BUILD_DIR/$ARTIFACT_MANIFEST_NAME"
-if [[ "$BUILD_VARIANT" == "swimlane" ]]; then
-    # 旧统一构建可能在根目录残留 PMU owner；swimlane 构建主动移除这两个
+if [[ "$BUILD_VARIANT" != "submit-pmu" ]]; then
+    # 旧构建可能在目录中残留 PMU owner；swimlane/perf-clock 主动移除
     # 不属于本变体的产物，避免 direct host 调用误加载上一版诊断 SO。
     rm -f \
         "$BUILD_DIR/libpa_scheduler_pmu_owner_dispatcher.so" \
@@ -478,6 +499,19 @@ for entry in pa_scheduler_0_mix_aic pa_scheduler_0_mix_aiv; do
     fi
 done
 echo "[CHECK] both 1:2 mixed entries and metadata sections are present"
+
+# perf-clock 最终 ELF 必须证明最重的泳道写记录慢体已经在编译期消失。
+# 正向身份由 manifest SHA 和运行时 build_variant 双重闭合；不额外向
+# `.text` 塞 marker，避免仅用于取证的代码改变后续热函数 I-cache 对齐。
+if [[ "$BUILD_VARIANT" == "perf-clock" ]]; then
+    if awk \
+        '$7 != "UND" && index($NF, "WritePollBatchRecordRaw") != 0 {found = 1}
+         END {exit !found}' <<<"$SYMBOL_TABLE"; then
+        echo "Swimlane record writer leaked into perf-clock AICore ELF." >&2
+        exit 1
+    fi
+    echo "[CHECK] perf-clock swimlane record writer is absent; identity uses manifest/runtime handshake"
+fi
 
 # A5 runtime 会把已定义的 GLOBAL FUNC 当作可启动候选；最终 device ELF 只允许
 # 两个带 metadata 的 mixed 入口暴露为全局函数。任何新增 helper 都必须保持 LOCAL。

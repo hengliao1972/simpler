@@ -12,8 +12,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-if [[ $# -gt 1 ]]; then
-    echo "Usage: $0 [private|shared]" >&2
+if [[ $# -gt 2 ]]; then
+    echo "Usage: $0 [private|shared] [swimlane|perf-clock]" >&2
     exit 1
 fi
 TENSORMAP_MODE="${1:-private}"
@@ -25,7 +25,28 @@ case "$TENSORMAP_MODE" in
         exit 1
         ;;
 esac
-BUILD_DIR="$ROOT_DIR/build/cpu/$TENSORMAP_MODE/swimlane"
+BUILD_VARIANT="${2:-swimlane}"
+case "$BUILD_VARIANT" in
+    swimlane)
+        VARIANT_DEFINES=(
+            -DPA_BUILD_SWIMLANE=0
+            -DPA_BUILD_SUBMIT_PMU=0
+            -DPA_BUILD_PERF_CLOCK=0
+        )
+        ;;
+    perf-clock)
+        VARIANT_DEFINES=(
+            -DPA_BUILD_SWIMLANE=0
+            -DPA_BUILD_SUBMIT_PMU=0
+            -DPA_BUILD_PERF_CLOCK=1
+        )
+        ;;
+    *)
+        echo "Unknown CPU build variant: $BUILD_VARIANT (expected swimlane|perf-clock)" >&2
+        exit 1
+        ;;
+esac
+BUILD_DIR="$ROOT_DIR/build/cpu/$TENSORMAP_MODE/$BUILD_VARIANT"
 CXX_BIN="${CXX:-g++}"
 
 # CPU 后端只依赖 C++17、pthread 和本目录 common/，不需要 CANN。
@@ -41,6 +62,7 @@ echo "[BUILD] CPU scheduler executable"
 # 都实例化同一 scheduler，模式宏只选择各自已经接线的 TensorMap backend。
 "$CXX_BIN" -O3 -std=c++17 -pthread -Wall -Wextra -Werror \
     "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID" \
+    "${VARIANT_DEFINES[@]}" \
     -I"$ROOT_DIR/common" \
     "$SCRIPT_DIR/main.cpp" \
     -o "$BUILD_DIR/pa_scheduler_cpu"

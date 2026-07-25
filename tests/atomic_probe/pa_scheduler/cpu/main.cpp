@@ -29,6 +29,10 @@
 
 namespace {
 
+#if PA_BUILD_PERF_CLOCK
+thread_local uint32_t g_perf_clock_read_count = 0;
+#endif
+
 template <uint32_t Count>
 inline void EmitNops() {
     // 编译期 Count 配合强制展开，避免编译器把空循环折叠掉。
@@ -200,6 +204,17 @@ struct CpuOps {
         );
     }
 
+#if PA_BUILD_PERF_CLOCK
+    static inline void ResetPerfClockReadCount() { g_perf_clock_read_count = 0; }
+
+    static inline uint32_t PerfClockReadCount() { return g_perf_clock_read_count; }
+
+    static inline uint64_t PerfClockNow() {
+        ++g_perf_clock_read_count;
+        return Now();
+    }
+#endif
+
     template <typename T>
     static inline uint64_t NowAfterAtomicResult(T value) {
         // 空 asm 让编译器保留返回值到计时点的数据依赖，不额外插入 CPU fence。
@@ -275,6 +290,18 @@ int main(int argc, char **argv) {
     if (!pa_scheduler::host::ValidateWinnerWorkloadOptions(workload_options)) {
         return EXIT_FAILURE;
     }
+#if PA_BUILD_PERF_CLOCK
+    if (options.runs != 1 || options.trace_enabled || options.trace_atomics ||
+        options.profile_phases || options.analyze_swimlane ||
+        !options.swimlane_json.empty()) {
+        std::fprintf(
+            stderr,
+            "CPU perf-clock requires one trace-free run: "
+            "--runs 1 --no-swimlane and no trace/profile options.\n"
+        );
+        return EXIT_FAILURE;
+    }
+#endif
     const bool real_compute =
         workload_options.mode == pa_scheduler::WinnerWorkloadMode::RealCompute;
     std::vector<float> workload_image;
@@ -305,6 +332,10 @@ int main(int argc, char **argv) {
     std::vector<double> lifecycle_spans;
     bool all_passed = true;
     bool postprocess_ok = true;
+#if PA_BUILD_PERF_CLOCK
+    std::atomic<uint32_t> perf_clock_reads{0};
+    std::atomic<bool> perf_clock_read_shape_ok{true};
+#endif
     // 每轮复用大块 host 分配，只重置公共状态和 trace header。与设备后端一样，
     // runs>1 表示同进程热运行，不等价于多个独立首轮。
     for (uint32_t run = 1; run <= options.runs; ++run) {
@@ -331,9 +362,24 @@ int main(int argc, char **argv) {
         for (uint32_t worker_id = 0; worker_id < pa_scheduler::kWorkers; ++worker_id) {
             const pa_scheduler::CoreRole role =
                 worker_id < pa_scheduler::kAicWorkers ? pa_scheduler::CoreRole::Aic : pa_scheduler::CoreRole::Aiv;
+#if PA_BUILD_PERF_CLOCK
+            workers.emplace_back([
+                state_pointer = state.get(), worker_id, role,
+                &perf_clock_reads, &perf_clock_read_shape_ok
+            ]() {
+                CpuOps::ResetPerfClockReadCount();
+                pa_scheduler::RunScheduler<CpuOps>(state_pointer, worker_id, role);
+                const uint32_t reads = CpuOps::PerfClockReadCount();
+                perf_clock_reads.fetch_add(reads, std::memory_order_relaxed);
+                if (reads != 2) {
+                    perf_clock_read_shape_ok.store(false, std::memory_order_relaxed);
+                }
+            });
+#else
             workers.emplace_back([state_pointer = state.get(), worker_id, role]() {
                 pa_scheduler::RunScheduler<CpuOps>(state_pointer, worker_id, role);
             });
+#endif
         }
         // join 是本后端的 kernel 完成屏障；所有 worker 退出后才能读取最终状态，
         // 对应设备 runner 的 aclrtSynchronizeStream。
@@ -368,11 +414,26 @@ int main(int argc, char **argv) {
         const pa_scheduler::host::Metrics metrics = pa_scheduler::host::Validate(
             *state, run, host_us, options.trace_enabled ? trace_header : nullptr
         );
+#if PA_BUILD_PERF_CLOCK
+        const bool perf_clock_reads_ok =
+            perf_clock_read_shape_ok.load(std::memory_order_relaxed) &&
+            perf_clock_reads.load(std::memory_order_relaxed) == 2U * pa_scheduler::kWorkers;
+        std::printf(
+            "[PERF-CLOCK] perf_boundary_reads_per_worker=2 "
+            "perf_boundary_total_reads=%u expected=%u status=%s\n",
+            perf_clock_reads.load(std::memory_order_relaxed),
+            2U * pa_scheduler::kWorkers,
+            perf_clock_reads_ok ? "PASS" : "FAIL"
+        );
+#endif
         const bool workload_passed =
             !real_compute || pa_scheduler::host::ValidateRealComputeOutputs(
                 *state, workload_options, workload_outputs, run
             );
         all_passed &= metrics.passed && workload_passed;
+#if PA_BUILD_PERF_CLOCK
+        all_passed &= perf_clock_reads_ok;
+#endif
         spans.push_back(metrics.submit_span_us);
         startup_barrier_spans.push_back(metrics.startup_barrier_span_us);
         final_barrier_spans.push_back(metrics.final_barrier_span_us);
@@ -414,6 +475,17 @@ int main(int argc, char **argv) {
         }
     }
 
+#if PA_BUILD_PERF_CLOCK
+    std::printf(
+        "[SUMMARY] runs=%u final_shape=%s median_submit_span_us=%.3f "
+        "lifecycle_timing=disabled semantic_status=%s postprocess_status=%s\n",
+        options.runs,
+        pa_scheduler::host::FinalBarrierShapeName(options.final_barrier_shape),
+        pa_scheduler::host::Median(spans),
+        all_passed ? "PASS" : "FAIL",
+        postprocess_ok ? "PASS" : "FAIL"
+    );
+#else
     std::printf(
         "[SUMMARY] runs=%u final_shape=%s median_submit_span_us=%.3f median_startup_barrier_us=%.3f "
         "median_final_barrier_us=%.3f median_final_drain_us=%.3f median_lifecycle_us=%.3f "
@@ -423,6 +495,7 @@ int main(int argc, char **argv) {
         pa_scheduler::host::Median(final_barrier_spans), pa_scheduler::host::Median(final_drain_spans),
         pa_scheduler::host::Median(lifecycle_spans), all_passed ? "PASS" : "FAIL", postprocess_ok ? "PASS" : "FAIL"
     );
+#endif
     // std::free(nullptr) 合法，因此关闭泳道时也走同一条收尾路径。
     std::free(trace_memory);
     return all_passed && postprocess_ok ? EXIT_SUCCESS : EXIT_FAILURE;

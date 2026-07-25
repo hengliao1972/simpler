@@ -1576,6 +1576,25 @@ int main(int argc, char **argv) {
         );
         return EXIT_FAILURE;
     }
+#elif PA_BUILD_PERF_CLOCK
+    // perf-clock 是唯一决定候选净性能的低扰动构建。它只允许完整
+    // Submit 首尾边界，不能借运行时参数重新打开泳道、atomic、PMU
+    // 或 phase-profile。
+    if (pmu_options.mode != pa_scheduler::ccec_pmu::WindowMode::Off ||
+        !pmu_options.json_path.empty()) {
+        std::fprintf(stderr, "The perf-clock build forbids PMU collection and PMU JSON.\n");
+        return EXIT_FAILURE;
+    }
+    if (options.runs != 1 || options.trace_enabled || options.trace_atomics ||
+        options.profile_phases || options.analyze_swimlane ||
+        !options.swimlane_json.empty()) {
+        std::fprintf(
+            stderr,
+            "perf-clock requires one trace-free run: "
+            "--runs 1 --no-swimlane and no trace/profile options.\n"
+        );
+        return EXIT_FAILURE;
+    }
 #endif
     if (!pmu_options.json_path.empty() &&
         pmu_options.mode == pa_scheduler::ccec_pmu::WindowMode::Off) {
@@ -1795,6 +1814,22 @@ int main(int argc, char **argv) {
             execution_ok = false;
             break;
         }
+#if PA_BUILD_PERF_CLOCK
+        // WorkerResult 的 PMU 尾槽通常由 submit-pmu kernel 另行发布；perf-clock
+        // 没有这些写。launch 前显式清零约 90 KiB 结果区，随后再要求它们保持
+        // 为零，避免设备分配残值伪装成观察代码泄漏。该搬运发生在计时窗口外。
+        if (!CheckAcl(
+                aclrtMemcpy(
+                    &static_cast<pa_scheduler::SchedulerState *>(state_device)->results[0],
+                    pa_scheduler::host::ResultBytes(), state->results,
+                    pa_scheduler::host::ResultBytes(), ACL_MEMCPY_HOST_TO_DEVICE
+                ),
+                "aclrtMemcpy(H2D zeroed perf-clock results)"
+            )) {
+            execution_ok = false;
+            break;
+        }
+#endif
 #if PTO_FDWIC_SHARED_MAP
         // shared map 位于 results 之后，不能扩大 ControlBytes 或把它重复混入
         // 每核结果范围；初始化搬运仍发生在 launch 计时开始之前。
@@ -1988,6 +2023,19 @@ int main(int argc, char **argv) {
     }
 
     const double median_submit_span_us = spans.empty() ? 0.0 : pa_scheduler::host::Median(spans);
+#if PA_BUILD_PERF_CLOCK
+    std::printf(
+        "[SUMMARY] runs=%u completed_runs=%zu final_shape=%s "
+        "median_submit_span_us=%.3f lifecycle_timing=disabled "
+        "execution_status=%s semantic_status=%s postprocess_status=%s\n",
+        options.runs, spans.size(),
+        pa_scheduler::host::FinalBarrierShapeName(options.final_barrier_shape),
+        median_submit_span_us,
+        execution_ok ? "PASS" : "FAIL",
+        all_passed ? "PASS" : "FAIL",
+        postprocess_ok ? "PASS" : "FAIL"
+    );
+#else
     const double median_startup_barrier_us =
         startup_barrier_spans.empty() ? 0.0 : pa_scheduler::host::Median(startup_barrier_spans);
     const double median_final_barrier_us =
@@ -2005,6 +2053,7 @@ int main(int argc, char **argv) {
         median_lifecycle_us, execution_ok ? "PASS" : "FAIL", all_passed ? "PASS" : "FAIL",
         postprocess_ok ? "PASS" : "FAIL"
     );
+#endif
 
     // 后处理失败也统一走设备资源释放、ELF 卸载和 ACL 收尾，避免文件系统错误遗留运行时上下文。
     bool cleanup_ok = true;

@@ -29,9 +29,9 @@
 // S0 的 fail-closed 门禁在 S2 接入真实 shared sidecar 后解除。模式仍由
 // 三镜像统一的构建身份与 manifest 锁定，不能把 shared 目录指向 private 实现。
 
-// CCEC 的正式产物只允许二选一：swimlane 保存普通阶段与 atomic 记录，
-// submit-pmu 则编译掉泳道观察代码。CPU/AscendC 未传这些宏时继续使用原有
-// 通用实现，避免公共模型反向依赖某个后端的构建脚本。
+// 三类证据链在编译期严格互斥：swimlane 保存普通阶段与 atomic 记录，
+// submit-pmu 只保留 PMU 窗口，perf-clock 则只增加首个/末个 Submit
+// 两个性能时间边界。未显式传宏的既有后端继续使用原有通用实现。
 #ifndef PA_BUILD_SWIMLANE
 #define PA_BUILD_SWIMLANE 0
 #endif
@@ -40,9 +40,18 @@
 #define PA_BUILD_SUBMIT_PMU 0
 #endif
 
-#if PA_BUILD_SWIMLANE && PA_BUILD_SUBMIT_PMU
-#error "PA_BUILD_SWIMLANE and PA_BUILD_SUBMIT_PMU are mutually exclusive"
+#ifndef PA_BUILD_PERF_CLOCK
+#define PA_BUILD_PERF_CLOCK 0
 #endif
+
+#if (PA_BUILD_SWIMLANE + PA_BUILD_SUBMIT_PMU + PA_BUILD_PERF_CLOCK) > 1
+#error "swimlane, submit-pmu, and perf-clock builds are mutually exclusive"
+#endif
+
+// submit-pmu 与 perf-clock 都不允许把阶段泳道、atomic 包围计时或
+// phase-profile 模板带入最终 ELF。统一谓词避免各 helper 对“无 trace”
+// 的理解逐渐分叉；它不代表 PMU 已开启。
+#define PA_BUILD_TRACE_FREE (PA_BUILD_SUBMIT_PMU || PA_BUILD_PERF_CLOCK)
 
 namespace pa_scheduler {
 
@@ -54,7 +63,7 @@ enum class TensorMapBuildMode : uint32_t {
 constexpr TensorMapBuildMode kCompiledTensorMapMode =
     static_cast<TensorMapBuildMode>(PTO_FDWIC_SHARED_MAP);
 constexpr uint32_t kBuildIdentityMagic = 0x50414249U;  // "PABI"
-constexpr uint32_t kBuildIdentityAbiVersion = 3;
+constexpr uint32_t kBuildIdentityAbiVersion = 4;
 
 // 这里固定的是 PA Case1 的调度拓扑，而不是为了缩小 standalone 人为选择的规模：
 // 每个 batch 依次回放 Alloc/QK/SF/PV/UP 五个 task，32 个 AIC 与 64 个 AIV
@@ -272,6 +281,15 @@ constexpr SubmitPmuPhase kCompiledSubmitPmuPhase =
     static_cast<SubmitPmuPhase>(PA_SUBMIT_PMU_PHASE_ID);
 constexpr uint32_t kBuildVariantSwimlane = 1U;
 constexpr uint32_t kBuildVariantSubmitPmu = 2U;
+constexpr uint32_t kBuildVariantPerfClock = 3U;
+constexpr uint32_t kCompiledBuildVariant =
+#if PA_BUILD_SUBMIT_PMU
+    kBuildVariantSubmitPmu;
+#elif PA_BUILD_PERF_CLOCK
+    kBuildVariantPerfClock;
+#else
+    kBuildVariantSwimlane;
+#endif
 static_assert(
     PA_SUBMIT_PMU_PHASE_ID == static_cast<int>(SubmitPmuPhase::None) ||
         PA_SUBMIT_PMU_PHASE_ID == static_cast<int>(SubmitPmuPhase::Claim) ||
@@ -352,11 +370,16 @@ struct alignas(64) PmuProbeConfig {
     uint32_t work_amount;
     uint64_t register_table;
     uint32_t magic;
-    uint32_t reserved[11];
+    // 该 cache line 已随 RunConfig 一起由 host 写入并由 device 失效读取。
+    // 复用首个保留槽做构建变体握手，防止绕过 manifest 后把
+    // swimlane/submit-pmu/perf-clock 的 host 与 kernel 交叉运行。
+    uint32_t build_variant;
+    uint32_t reserved[10];
 };
 static_assert(sizeof(PmuProbeConfig) == 64, "PMU probe config must occupy one cache line");
 static_assert(offsetof(PmuProbeConfig, register_table) == 8, "PMU register-table offset changed");
 static_assert(offsetof(PmuProbeConfig, magic) == 16, "PMU magic offset changed");
+static_assert(offsetof(PmuProbeConfig, build_variant) == 20, "build variant offset changed");
 
 enum class TracePhase : int32_t {
     Kernel = 0,

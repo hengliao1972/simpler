@@ -131,7 +131,7 @@ PA_DEVICE TraceContext AttachTrace(
     trace.lane = worker.lane;
     trace.block_id = worker.block_id;
     trace.core_idx = static_cast<int32_t>(worker_id);
-#if PA_BUILD_SUBMIT_PMU
+#if PA_BUILD_TRACE_FREE
     // 诊断 ELF 不含 records 写入、atomic span 或 trace-only SYS_CNT；保留同一
     // TraceContext 形状只是为了复用调度协议源码。
     (void)state;
@@ -175,20 +175,11 @@ PA_DEVICE void WriteTrace(
 // CCEC 不让栈上的 TraceContext/WorkerResult 引用跨非内联调用。这里仅把
 // PollBatch 固定形状的 64-byte GM 写入抽成共享函数，以抑制各 phase 边界
 // 内联后的代码膨胀；参数只有 GM 指针与标量，局部 batch 状态仍由调用者维护。
+#if !PA_BUILD_TRACE_FREE
 PA_DEVICE_NOINLINE bool WritePollBatchRecordRaw(
     PA_GM TraceCoreState *core, PA_GM TraceRecord *records, uint32_t capacity,
     uint64_t start_cycle, uint64_t end_cycle, uint32_t call_count, uint32_t site_id
 ) {
-#if PA_BUILD_SUBMIT_PMU
-    (void)core;
-    (void)records;
-    (void)capacity;
-    (void)start_cycle;
-    (void)end_cycle;
-    (void)call_count;
-    (void)site_id;
-    return false;
-#else
     if (core == nullptr || records == nullptr || capacity == 0) {
         return false;
     }
@@ -214,8 +205,8 @@ PA_DEVICE_NOINLINE bool WritePollBatchRecordRaw(
     // count 最后更新，使其始终指向下一空槽；单写者条件下无需 reserve/commit 两阶段。
     core->count = slot + 1;
     return true;
-#endif
 }
+#endif
 
 PA_DEVICE uint32_t AtomicTraceFlags(
     AtomicOp op, bool result_used, bool return_ready, bool value_zero = false,
@@ -250,7 +241,7 @@ template <typename Ops>
 PA_DEVICE void AtomicPollBoundaryAt(
     TraceContext &trace, uint64_t end_cycle
 ) {
-#if PA_BUILD_SUBMIT_PMU
+#if PA_BUILD_TRACE_FREE
     (void)trace;
     (void)end_cycle;
 #else
@@ -288,7 +279,7 @@ PA_DEVICE void AtomicPollBoundaryAt(
 
 template <typename Ops>
 PA_DEVICE void AtomicPollBoundary(TraceContext &trace, WorkerResult &result) {
-#if PA_BUILD_SUBMIT_PMU
+#if PA_BUILD_TRACE_FREE
     (void)trace;
     (void)result;
 #else
@@ -303,7 +294,7 @@ PA_DEVICE uint32_t AtomicPollRegionBegin(
     TraceContext &trace, WorkerResult &result, uint32_t site_mask
 ) {
     const uint32_t previous_mask = trace.poll_burst.enabled_mask;
-#if PA_BUILD_SUBMIT_PMU
+#if PA_BUILD_TRACE_FREE
     (void)result;
     (void)site_mask;
 #else
@@ -318,7 +309,7 @@ template <typename Ops>
 PA_DEVICE void AtomicPollRegionEnd(
     TraceContext &trace, WorkerResult &result, uint32_t previous_mask
 ) {
-#if PA_BUILD_SUBMIT_PMU
+#if PA_BUILD_TRACE_FREE
     (void)trace;
     (void)result;
     (void)previous_mask;
@@ -382,7 +373,7 @@ PA_DEVICE T TraceAtomicLoad(
     TraceContext &trace, WorkerResult &result, int32_t task_id, AtomicSite site,
     PA_GM volatile T *address, bool result_used = true
 ) {
-#if PA_BUILD_SUBMIT_PMU
+#if PA_BUILD_TRACE_FREE
     (void)trace;
     (void)result;
     (void)task_id;
@@ -419,7 +410,7 @@ PA_DEVICE T TraceAtomicExchange(
     TraceContext &trace, WorkerResult &result, int32_t task_id, AtomicSite site,
     PA_GM volatile T *address, T value, bool result_used = false
 ) {
-#if PA_BUILD_SUBMIT_PMU
+#if PA_BUILD_TRACE_FREE
     (void)trace;
     (void)result;
     (void)task_id;
@@ -444,7 +435,7 @@ PA_DEVICE int64_t TraceAtomicFetchAdd(
     TraceContext &trace, WorkerResult &result, int32_t task_id, AtomicSite site,
     PA_GM volatile int64_t *address, int64_t value, bool result_used = false
 ) {
-#if PA_BUILD_SUBMIT_PMU
+#if PA_BUILD_TRACE_FREE
     (void)trace;
     (void)result;
     (void)task_id;
@@ -469,7 +460,7 @@ PA_DEVICE int64_t TraceAtomicFetchMax(
     TraceContext &trace, WorkerResult &result, int32_t task_id, AtomicSite site,
     PA_GM volatile int64_t *address, int64_t value, uint64_t &retries, bool result_used = true
 ) {
-#if PA_BUILD_SUBMIT_PMU
+#if PA_BUILD_TRACE_FREE
     (void)trace;
     (void)result;
     (void)task_id;
@@ -494,7 +485,7 @@ template <bool Profile>
 PA_DEVICE void AccumulatePhase(
     WorkerResult &result, ProfilePhase phase, uint64_t start_cycle, uint64_t end_cycle
 ) {
-#if PA_BUILD_SUBMIT_PMU
+#if PA_BUILD_TRACE_FREE
     (void)result;
     (void)phase;
     (void)start_cycle;
@@ -524,7 +515,7 @@ PA_DEVICE void WriteTrace(
     ProfilePhase profile_phase, uint64_t start_cycle, uint64_t end_cycle, uint32_t flags,
     uint32_t auxiliary
 ) {
-#if PA_BUILD_SUBMIT_PMU
+#if PA_BUILD_TRACE_FREE
     (void)trace;
     (void)result;
     (void)task_id;
@@ -572,7 +563,7 @@ PA_DEVICE void ResetTraceLap(
 ) {
     // lap 是后续 Build/Replay/Alloc 等覆盖式阶段的共同起点，不代表新增嵌套 span。
     // 因此分析时不能把 lap 时长再与其中的 Materialize/Claim/Register 直接相加。
-#if PA_BUILD_SUBMIT_PMU
+#if PA_BUILD_TRACE_FREE
     (void)trace;
     (void)result;
     (void)worker;
@@ -588,7 +579,7 @@ PA_DEVICE void ResetTraceLap(
 
 template <typename Ops>
 PA_DEVICE void FlushTraceCore(TraceContext &trace, WorkerResult &result) {
-#if PA_BUILD_SUBMIT_PMU
+#if PA_BUILD_TRACE_FREE
     (void)trace;
     (void)result;
     return;
@@ -623,7 +614,7 @@ PA_DEVICE uint64_t WriteTraceLap(
     int32_t function_id, TracePhase trace_phase, ProfilePhase profile_phase,
     uint32_t flags = 0, uint32_t auxiliary = 0
 ) {
-#if PA_BUILD_SUBMIT_PMU
+#if PA_BUILD_TRACE_FREE
     (void)trace;
     (void)worker;
     (void)result;
