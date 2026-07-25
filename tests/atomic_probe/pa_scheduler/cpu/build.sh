@@ -107,8 +107,9 @@ else
     "$BUILD_DIR/test_shared_tensor_map_ring"
 
     # fresh-output symbol 与 region ring 是两条独立协议。该用例单独锁定
-    # descriptor 发布、INPUT last-writer load、INOUT exchange、payload
-    # scratch 解析及非法引用 fail-closed，避免只靠完整 96 线程回放偶然覆盖。
+    # descriptor 最终封口、只读 fanin、构建后 INOUT writer commit、
+    # 失败 slot 撤销、payload scratch 解析及非法引用 fail-closed，
+    # 避免只靠完整 96 线程回放偶然覆盖。
     echo "[BUILD] shared-output symbol self-test"
     "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror -pthread \
         -DPTO_FDWIC_SHARED_MAP=1 \

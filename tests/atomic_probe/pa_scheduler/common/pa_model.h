@@ -627,7 +627,9 @@ struct alignas(64) TaskCell {
     uint8_t padding[64 - 2 * sizeof(int64_t)];
 };
 // flag 是依赖就绪与 frontier 连续前推的发布位；vend 是该 task 完成时 worker 的
-// 单调 heap_next 快照。HeapGuard 读取 frontier-H 对应 vend，判断环形 heap 是否可覆盖。
+// 单调 heap_next 快照。private 的 HeapGuard 读取 frontier-H 对应 vend，判断
+// 环形 heap 是否可覆盖；shared 中它只是 completion 时的 aggregate-vend
+// 快照，不参与 shared heap 回收。
 static_assert(sizeof(TaskCell) == 64, "TaskCell must occupy one cache line");
 
 // TensorDesc 保留真实 Tensor 的两条 64-byte 数据线。owner_task_id 表达显式生产者，
@@ -778,8 +780,10 @@ static_assert(offsetof(SharedOutputCell, tensors) == 1024, "shared output tensor
 #endif
 
 struct alignas(64) SharedTensorMapSidecar {
-    // committed_tasks 是已按 task_id 连续发布的数量：初始 0，任务 N（即使
-    // 没有 region entry）发布完成后变为 N+1。
+    // committed_tasks 是 ordered-region/writer 阶段已按 task_id 连续提交的
+    // 数量：初始 0，任务 N（即使没有 region entry）完成 region prepare 和
+    // INOUT writer commit 后变为 N+1。fresh output 由每个 cell 的 published
+    // 独立封口，不能把 committed_tasks=N+1 解释成 descriptor 已经发布。
     AtomicLine committed_tasks;
     // reclaim_upto 是可回收 producer 的 inclusive 上界，初始 -1。
     // 只有持有 committed_tasks==current_task 的有序 winner 才能推进它，
@@ -1053,10 +1057,11 @@ struct alignas(64) WorkerResult {
     uint64_t final_barrier_end;
     // 复用原 barrier_reserved[3] 的 24B，不扩大 WorkerResult。dependency
     // signature 继续闭合 fanin 拓扑；后两项统计 shared symbol 的
-    // last_writer INPUT load 和 INOUT exchange，private 构建必须保持零。
+    // last_writer INPUT load 和构建后 INOUT writer commit，private 构建
+    // 必须保持零。
     uint64_t dependency_signature;
     uint64_t shared_symbol_input_loads;
-    uint64_t shared_symbol_inout_exchanges;
+    uint64_t shared_symbol_inout_commits;
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
     // split 协议诊断独占一条 cache line。普通 CPU/AscendC 与局部 PMU
     // 构建不带这些字段，不改变它们的 WorkerResult ABI。
@@ -1093,8 +1098,8 @@ static_assert(offsetof(WorkerResult, dependency_signature) == 872, "WorkerResult
 static_assert(offsetof(WorkerResult, shared_symbol_input_loads) == 880,
               "WorkerResult shared symbol-load offset mismatch");
 static_assert(
-    offsetof(WorkerResult, shared_symbol_inout_exchanges) == 888,
-    "WorkerResult shared symbol-exchange offset mismatch"
+    offsetof(WorkerResult, shared_symbol_inout_commits) == 888,
+    "WorkerResult shared symbol-commit offset mismatch"
 );
 
 // 从 cube_cursor 到 workers 结束保留关键字段 offset、DistCore ABI 和生产总字节跨度，

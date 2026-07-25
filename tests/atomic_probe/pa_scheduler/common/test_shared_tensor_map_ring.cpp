@@ -378,6 +378,23 @@ void TestAbiResetAndZeroEntryCommit() {
     );
     ExpectEqual(LoadControl(&map->committed_tasks.value), 2, kTest, "empty commit sequencer");
     ExpectEqual(LoadControl(&map->reclaim_upto.value), -1, kTest, "empty commit reclaim");
+    Expect(
+        !SharedPublishTaskCommit<RecordingOps>(*map, 1),
+        kTest, "repeated commit is rejected"
+    );
+    ExpectEqual(
+        LoadControl(&map->committed_tasks.value), 2, kTest,
+        "repeated commit preserves the advanced frontier"
+    );
+    StoreControl(&map->committed_tasks.value, 0);
+    Expect(
+        !SharedPublishTaskCommit<RecordingOps>(*map, 1),
+        kTest, "future commit is rejected"
+    );
+    ExpectEqual(
+        LoadControl(&map->committed_tasks.value), 0, kTest,
+        "future commit preserves the earlier frontier"
+    );
     for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
         if (LoadControl(&map->buckets[bucket].tail.value) != 0) {
             Expect(false, kTest, "empty commit changed a bucket tail");

@@ -306,16 +306,17 @@ heap cursor 和 1 条 aggregate vend，因此当前 `SharedTensorMapSidecar`
 standalone 控制区和 `results` 之后，不移动 `WorkerState`、`RunConfig`
 或既有结果字段。每 task 最多八个 fresh output，以 16B
 `FdwicOutputRef` 表达 `(producer_task_id, output_slot)`，返回句柄为
-8B `SharedTaskOutputs`。构建身份 ABI 当前为 3。
+8B `SharedTaskOutputs`。构建身份 ABI 当前为 4。
 
 当前 shared 已完成 winner-only 重构参与 Materialize：所有 worker 仍先
 Claim 并独立声明同一组 output symbol；Alloc 暂时保留每核三个静态 Output
 参数，以对齐参考 `alloc_tensors(args)` 的调用形状。QK/SF/PV/UP 只有 winner
 执行 reset、view/CreateInfo 构造以及 tensor/scalar 参数添加。持有
 `committed_tasks == N` exact turn 的 winner 随后预留 shared heap、生成
-descriptor、发布到共享表并提交 task N。loser 仍以非空地址把上一 task 的
-陈旧 `TaskArgs` 传过 split ABI，但 finish 只闭合固定泳道/Submit 边界，不读
-参数内容，也不触碰 heap/map/payload。
+descriptor、只读解析 fanin、建立本地执行状态，再提交 INOUT writer、释放
+turn 并最终发布 descriptor。loser 仍以非空地址把上一 task 的陈旧
+`TaskArgs` 传过 split ABI，但 finish 只闭合固定泳道/Submit 边界，不读参数
+内容，也不触碰 heap/map/payload。
 
 CPU guard-page 定向测试会把 loser 的 `TaskArgs` 页改成 `PROT_NONE`，依次
 通过 Alloc/QK/SF/PV/UP 五次 split finish；任一字段读取都会立即失败。逐核
@@ -329,30 +330,41 @@ shared 不调用 private per-worker ring 的 HeapGuard。host 直接核对 8-sha
 实际 descriptor 地址，再以 canonical 连续地址比较 private/shared 的
 normalized writer signature。
 
-发布前先对本 task 的全部 output slot 做只读预检；全部通过后初始化
-`last_writer`，再写 descriptor、执行 `FlushRegion`、存储屏障并发布
-`published`，最后才把连续 commit 前沿从 N 推进到 N+1。重复发布或后槽异常
-不会覆盖既有 descriptor，也不会留下前槽的部分发布；若发布位 Exchange
-在 exact-turn 契约外观察到异常旧值，冷路径会撤回全部控制字并清空、flush
-本 task descriptor。loser 不读取 shared sidecar，也不等待 commit。
+Materialize 只在 winner 上预留 heap 并生成本地 descriptor，不再提前发布。
+本地 `CompleteTask`/`BuildWinner` 成功后，winner 仍在 exact turn 内用
+FetchMax 提交本 task 消费的 INOUT writer；随后推进连续 commit 前沿，再把
+本 task 的全部 output descriptor 复制到共享 cell，执行 `FlushRegion`、
+存储屏障并发布 `published`。后继即使已经取得 turn，也必须等待自己实际消费
+的 `(producer,slot).published`。因此当前 `published=N` 表示 producer
+Submit 已封口，而不只是 descriptor 已构造。
+
+重复发布或后槽异常不会覆盖既有 descriptor，也不会留下前槽的部分发布；
+若发布位 Exchange 观察到异常旧值，冷路径会撤回本 producer cell 的全部
+控制字并清空、flush descriptor。QK/SF/PV/UP 的构建后封口失败还会撤销本地
+built slot，避免 FinalDrain 执行失败任务；Alloc ready flag 已不可逆，只能
+广播 fatal 使整轮结果无效。loser 不读取 shared sidecar，也不等待 commit。
 
 shared symbol resolver 只接受 flags/view 字段全零的 plain ref；其他形态显式
-失败，不能被悄悄降级为普通 descriptor。consumer 已处在 producer commit
-之后。resolver 第一遍校验全部引用，读取每个 symbol 的 `published`，并只对
-`INPUT` 读取 `last_writer`；它不修改 writer、payload、统计或输出 fanin。
-全部通过后：
+失败，不能被悄悄降级为普通 descriptor。resolver 第一遍等待并校验全部引用，
+读取每个 symbol 的 `published` 和 `last_writer`，但不修改 writer、payload、
+统计或输出 fanin。PA Case1 当前每个 fresh symbol 只有一个后继 writer，
+所以 Input/Inout/OutputExisting 看到的 writer 都必须精确等于句柄声明的
+producer；同一 task 的重复写引用也会被拒绝。全部通过后才失效并复制
+descriptor 到本 task payload scratch，一次性提交 input-load 计数和按既有
+`AddFanin` 去重的 fanin。
 
-- `INOUT`/`OUTPUT_EXISTING` 以返回旧值的 Exchange 串接 writer；
-- 失效并复制 descriptor 到本 task payload scratch；
-- 一次性发布 writer-load/exchange 计数与按既有 `AddFanin` 去重的 fanin。
-
-预检读取的 writer 必须严格早于当前 task；同一 task 的重复写引用也会被拒绝。
-定向测试覆盖了“合法 INOUT 后跟非法引用不留下部分状态”和
-`producer → INOUT → 后继 INPUT` 的 writer 链。
+INOUT/OutputExisting 的 writer 更新单独发生在本地执行状态成功建立后。
+FetchMax 的返回旧值必须精确等于 producer；成功项计入
+`inout_writer_commits`。异常 FetchMax 的终态不做负向 RMW 回滚，而是保留
+现场并广播 fatal；该 RMW 已经线性化，多 symbol 提交不是事务，不能伪造
+负向 RMW 抹掉故障现场。当前固定拓扑不支持
+`producer -> INOUT -> 后继 INPUT` 的多级 writer 链，定向测试要求该形态显式
+失败，不能把它误写成通用能力。
 
 符号和 `manual_dep=true` 的 output view 都不进入 region lookup/register。
-因此 PA Case1 的 shared region raw ring 当前为空，但每个 task 仍通过空 delta
-推进 ordered commit/reclaim。host 将实际读取到的 fresh symbol 最终 writer
+因此 PA Case1 的 shared region raw ring 当前为空，但 S4.5 仍让每个 task
+通过空 delta 推进 ordered commit/reclaim；该 sequencer 是下一阶段要删除的
+过程态。host 将实际读取到的 fresh symbol 最终 writer
 投影为与 private region 相同的规范化 writer 序列，并按 Case1 约定补入
 manual output view；所以 raw 存储不同不妨碍两种模式使用同一规范化签名
 核对已观测 fresh-symbol writer。manual view 是约定投影，不是从 shared
@@ -361,7 +373,7 @@ dependency/normalized writer 签名为
 `5cb454393ed48dcb`/`3a3d526c9b23c3db`，b256 为
 `b7d985d6edb07078`/`556bec7ec8d0f323`。
 
-S3.1 已通过以下门禁：
+以下是 S3.1 当时的历史门禁，不是当前 S4.5 的提交顺序或统计口径：
 
 | 门禁 | 结果 |
 | --- | --- |
@@ -371,8 +383,8 @@ S3.1 已通过以下门禁：
 | CCEC shared submit-pmu none b1 | 调度、symbol、PMU owner 恢复均 PASS |
 | CCEC private b1/b256 | 73.318 us / 3.808011 ms |
 | CCEC shared b1/b256（fail-closed 修正后） | 86.552 us / 27.094219 ms |
-| shared symbol publish/INPUT-load/exchange，b1 | 8 / 5 / 3 |
-| shared symbol publish/INPUT-load/exchange，b256 | 2,048 / 1,280 / 768 |
+| S3.1 历史 symbol publish/INPUT-load/exchange，b1 | 8 / 5 / 3 |
+| S3.1 历史 symbol publish/INPUT-load/exchange，b256 | 2,048 / 1,280 / 768 |
 | shared b256 ordered 终态 | `committed_tasks=1280`，`reclaim_upto=1214` |
 
 S2.5 shared b256 的同类单样本为 26.556193 ms。S3.1 在正确性审计前曾取得

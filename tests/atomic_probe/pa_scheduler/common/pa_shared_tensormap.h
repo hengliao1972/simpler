@@ -368,7 +368,14 @@ PA_DEVICE bool SharedPublishTaskCommit(
     const int64_t previous = Ops::Exchange(
         &map.committed_tasks.value, static_cast<int64_t>(task_id) + 1
     );
-    return previous == task_id;
+    if (previous == task_id) {
+        return true;
+    }
+    // 调用者必须持有 exact turn，因此失败分支不存在合法的并发 publisher。
+    // 无条件 Exchange 已经写入 task_id+1；恢复观测到的旧值，避免协议损坏时
+    // 把一个更大的前沿写小，或把尚未到达的前沿错误推进。
+    (void)Ops::Exchange(&map.committed_tasks.value, previous);
+    return false;
 }
 
 }  // namespace pa_scheduler

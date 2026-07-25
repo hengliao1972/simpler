@@ -1198,7 +1198,7 @@ inline SharedTensorMapValidation ValidateSharedTensorMap(
     validation.protocol_ok &=
         map.reclaim_upto.value == expected_reclaim;
 
-    // S3.1 的 fresh Output 已改由 shared_outputs 直接按
+    // shared fresh Output 已改由 shared_outputs 直接按
     // (producer_task_id, output_slot) 定位；Case1 中的唯一 ordinary
     // output_view 又是 manual_dep。因此 region ring 必须完全为空，但仍由
     // 每个 ordered winner 提交空 delta 推进 committed/reclaim。
@@ -1731,7 +1731,7 @@ inline Metrics Validate(
     uint64_t fanin_edges = 0;
     uint64_t dependency_signature = 0;
     uint64_t shared_symbol_input_loads = 0;
-    uint64_t shared_symbol_inout_exchanges = 0;
+    uint64_t shared_symbol_inout_commits = 0;
     bool worker_ids[kWorkers] = {};
     uint32_t aic_count = 0;
     uint32_t aiv_count = 0;
@@ -1840,7 +1840,7 @@ inline Metrics Validate(
             }
         }
     }
-    // private ring 仍保留 heap window 内的四类 writer。shared S3.1 的 fresh
+    // private ring 仍保留 heap window 内的四类 writer。shared fresh
     // Output 已迁出 region ring，因此它的 region live/high-water 为零；但
     // ordered committed/reclaim 仍沿用同一 logical floor。
 #if !PTO_FDWIC_SHARED_MAP
@@ -1919,7 +1919,7 @@ inline Metrics Validate(
 #endif
         dependency_signature ^= result.dependency_signature;
         shared_symbol_input_loads += result.shared_symbol_input_loads;
-        shared_symbol_inout_exchanges += result.shared_symbol_inout_exchanges;
+        shared_symbol_inout_commits += result.shared_symbol_inout_commits;
         first_submit = std::min(first_submit, result.submit_begin);
         last_submit = std::max(last_submit, result.submit_end);
 #if !PA_BUILD_PERF_CLOCK
@@ -2119,9 +2119,10 @@ inline Metrics Validate(
         // ready flag 和 vend 是跨核 completion 的最终外部可见状态，不能只依赖 worker 私有计数判断完成。
         ready_flags += state.tasks[task_id].flag == 1;
 #if PTO_FDWIC_SHARED_MAP
-        // 零输出 UP 可能在依赖 producer 发布前先取得 aggregate vend=0；
-        // shared 不使用该值做 heap reclaim。非零输出 task 的 reserve prefix
-        // 则必须非零。
+        // allocator helper 与后续去 exact-turn 结构允许零输出 UP 在 producer
+        // reserve 前观察到 aggregate vend=0；当前 S4.5 完整流程因仍持有
+        // exact turn 实际会得到非零值。shared 从不使用该值做 heap reclaim，
+        // 因而 oracle 保留更一般的 0；非零输出 task 的 reserve prefix 必须非零。
         vend_values_ok &=
             ExpectedTaskOutputBytes(task_id) == 0 ||
             state.tasks[task_id].vend != 0;
@@ -2311,23 +2312,23 @@ inline Metrics Validate(
 #else
             0 &&
 #endif
-        shared_symbol_inout_exchanges ==
+        shared_symbol_inout_commits ==
 #if PTO_FDWIC_SHARED_MAP
             static_cast<uint64_t>(batches) * 3,
 #else
             0,
 #endif
-        "shared symbol INPUT-load / INOUT-exchange totals are exact", &metrics
+        "shared symbol INPUT-load / INOUT-writer-commit totals are exact", &metrics
     );
 #if PTO_FDWIC_SHARED_MAP
     std::printf(
         "[SHARED_SYMBOL] published_outputs=%llu input_loads=%llu "
-        "inout_exchanges=%llu\n",
+        "inout_writer_commits=%llu\n",
         static_cast<unsigned long long>(
             shared_output_validation.published_outputs
         ),
         static_cast<unsigned long long>(shared_symbol_input_loads),
-        static_cast<unsigned long long>(shared_symbol_inout_exchanges)
+        static_cast<unsigned long long>(shared_symbol_inout_commits)
     );
 #endif
     const uint64_t expected_dependency_signature =

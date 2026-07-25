@@ -158,7 +158,7 @@ void TestValidQkMaterialize() {
     Check(
         fixture.map->shared_heap_vend.value == static_cast<int64_t>(bytes) &&
             fixture.worker->heap_next == bytes,
-        "valid QK publishes the aggregate vend"
+        "valid QK advances and snapshots the aggregate vend"
     );
     Check(
         fixture.context.output_bytes == bytes &&

@@ -123,6 +123,34 @@ struct LoserFinishTestOps {
     }
 };
 
+// winner 封口故障注入只在指定 int64 控制字上生效。注入发生在真实
+// FinishCallbackSubmitBody 内，验证 Materialize、BuildWinner、turn、
+// writer commit、published 和失败 slot 撤销的整体顺序。
+struct WinnerSealFaultOps : LoserFinishTestOps {
+    using LoserFinishTestOps::Exchange;
+
+    static inline volatile int64_t *exchange_race_address = nullptr;
+    static inline volatile int64_t *fetch_race_address = nullptr;
+
+    static int64_t Exchange(volatile int64_t *address, int64_t value) {
+        if (address == exchange_race_address) {
+            __atomic_store_n(address, int64_t{7}, __ATOMIC_RELEASE);
+            exchange_race_address = nullptr;
+        }
+        return LoserFinishTestOps::Exchange(address, value);
+    }
+
+    static int64_t FetchMax(
+        volatile int64_t *address, int64_t value, uint64_t &retries
+    ) {
+        if (address == fetch_race_address) {
+            __atomic_store_n(address, int64_t{-1}, __ATOMIC_RELEASE);
+            fetch_race_address = nullptr;
+        }
+        return LoserFinishTestOps::FetchMax(address, value, retries);
+    }
+};
+
 void *MapAnonymous(size_t bytes, bool no_reserve) {
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #ifdef MAP_NORESERVE
@@ -133,6 +161,37 @@ void *MapAnonymous(size_t bytes, bool no_reserve) {
     (void)no_reserve;
 #endif
     return mmap(nullptr, bytes, PROT_READ | PROT_WRITE, flags, -1, 0);
+}
+
+SchedulerState *MapSchedulerState() {
+    void *memory = MapAnonymous(sizeof(SchedulerState), true);
+    if (memory == MAP_FAILED) {
+        std::perror("mmap SchedulerState");
+        return nullptr;
+    }
+    return ::new (memory) SchedulerState;
+}
+
+void ResetOutputCell(SharedOutputCell &cell) {
+    std::memset(&cell, 0, sizeof(cell));
+    for (uint32_t slot = 0; slot < kSharedOutputMaxPerTask; ++slot) {
+        cell.published[slot].value = -1;
+        cell.last_writer[slot].value = -1;
+    }
+}
+
+TensorDesc MakeTestTensor(uint64_t address, uint32_t owner) {
+    TensorDesc tensor{};
+    tensor.buffer_addr = address;
+    tensor.buffer_size = 1024;
+    tensor.owner_task_id = owner;
+    tensor.ndims = 1;
+    tensor.dtype = DataType::Float32;
+    tensor.is_contiguous = true;
+    tensor.shapes[0] = 256;
+    tensor.strides[0] = 1;
+    tensor.extent_elem_cache = 256;
+    return tensor;
 }
 
 bool RunProtectedArgsLoserTest() {
@@ -227,18 +286,249 @@ bool RunProtectedArgsLoserTest() {
     return ok;
 }
 
+bool RunAllocPublicationFailureTest() {
+    SchedulerState *state = MapSchedulerState();
+    if (state == nullptr) {
+        return false;
+    }
+    state->fatal.value = 0;
+    state->heap_base = kSyntheticHeapBase;
+    state->heap_size = kHeapBytes;
+    state->heap_window = kHeapWindow;
+    state->shared_map.committed_tasks.value = 0;
+    state->shared_map.reclaim_upto.value = -1;
+    ResetOutputCell(state->shared_map.shared_outputs[0]);
+
+    WorkerState &worker = state->workers[0];
+    worker.role = CoreRole::Aic;
+    worker.core_idx = 0;
+    worker.lane = 0;
+    worker.local_index = 0;
+    worker.occupied_count = 0;
+
+    TaskArgs args;
+    ConstructTaskArgs(args);
+    TensorCreateInfo create_info{};
+    const uint32_t shape[kMaxTensorDims] = {16, 0, 0, 0, 0};
+    InitCreateInfo(create_info, shape, 1, DataType::Float32);
+    AddOutput(args, create_info);
+    AddOutput(args, create_info);
+    AddOutput(args, create_info);
+
+    SubmitContext context{};
+    BeginCallbackSubmit(worker, context);
+    bool ok =
+        context.task_id == 0 &&
+        PrepareSharedTaskOutputs(
+            context.shared_result, 0, TaskKind::Alloc
+        );
+    LocalStats stats{};
+    bool pmu_context = false;
+    const CallbackSubmitTicket ticket{
+        1, 0, static_cast<int16_t>(FunctionId(TaskKind::Alloc)), 1, 0
+    };
+    WinnerSealFaultOps::exchange_race_address =
+        &state->shared_map.shared_outputs[0].published[0].value;
+    const bool finished =
+        FinishCallbackSubmitBody<WinnerSealFaultOps, false>(
+            state, worker, kTasksPerBatch, args, context, stats,
+            pmu_context, ticket
+        );
+
+    const TensorDesc zero{};
+    ok &= !finished;
+    ok &= WinnerSealFaultOps::exchange_race_address == nullptr;
+    ok &= state->fatal.value == 1;
+    ok &= state->shared_map.committed_tasks.value == 1;
+    // Alloc CompleteTask 已先发布 completion；final symbol publication 失败
+    // 后不能伪装成可事务回滚，只能依靠 fatal 使整轮结果无效。
+    ok &= state->tasks[0].flag == 1;
+    ok &= worker.occupied_count == 0;
+    for (uint32_t slot = 0; slot < 3; ++slot) {
+        ok &= state->shared_map.shared_outputs[0]
+                  .published[slot].value == -1;
+        ok &= state->shared_map.shared_outputs[0]
+                  .last_writer[slot].value == -1;
+        ok &= std::memcmp(
+                  &state->shared_map.shared_outputs[0].tensors[slot],
+                  &zero, sizeof(zero)
+              ) == 0;
+    }
+    ok &= stats.result.materialized_outputs == 3;
+    ok &= stats.result.submits == 0;
+    ok &= state->shared_map.shared_heap_cursor[0].value == 3072;
+    ok &= state->shared_map.shared_heap_vend.value == 3072;
+
+    (void)munmap(state, sizeof(SchedulerState));
+    return ok;
+}
+
+bool RunQkPublicationFailureTest() {
+    SchedulerState *state = MapSchedulerState();
+    if (state == nullptr) {
+        return false;
+    }
+    state->fatal.value = 0;
+    state->heap_base = kSyntheticHeapBase;
+    state->heap_size = kHeapBytes;
+    state->heap_window = kHeapWindow;
+    state->shared_map.committed_tasks.value = 1;
+    state->shared_map.reclaim_upto.value = -1;
+    ResetOutputCell(state->shared_map.shared_outputs[1]);
+
+    WorkerState &worker = state->workers[0];
+    worker.role = CoreRole::Aic;
+    worker.core_idx = 0;
+    worker.lane = 0;
+    worker.local_index = 1;
+    worker.occupied_count = 0;
+
+    TaskArgs args;
+    ConstructTaskArgs(args);
+    TensorCreateInfo create_info{};
+    const uint32_t shape[kMaxTensorDims] = {16, 0, 0, 0, 0};
+    InitCreateInfo(create_info, shape, 1, DataType::Float32);
+    AddOutput(args, create_info);
+
+    SubmitContext context{};
+    BeginCallbackSubmit(worker, context);
+    bool ok =
+        context.task_id == 1 &&
+        PrepareSharedTaskOutputs(
+            context.shared_result, 1, TaskKind::Qk
+        );
+    LocalStats stats{};
+    bool pmu_context = false;
+    const CallbackSubmitTicket ticket{
+        1, 1, static_cast<int16_t>(FunctionId(TaskKind::Qk)), 1, 0
+    };
+    WinnerSealFaultOps::exchange_race_address =
+        &state->shared_map.shared_outputs[1].published[0].value;
+    const bool finished =
+        FinishCallbackSubmitBody<WinnerSealFaultOps, false>(
+            state, worker, kTasksPerBatch, args, context, stats,
+            pmu_context, ticket
+        );
+
+    const TensorDesc zero{};
+    ok &= !finished;
+    ok &= WinnerSealFaultOps::exchange_race_address == nullptr;
+    ok &= state->fatal.value == 1;
+    ok &= state->shared_map.committed_tasks.value == 2;
+    ok &= state->shared_map.shared_outputs[1].published[0].value == -1;
+    ok &= state->shared_map.shared_outputs[1].last_writer[0].value == -1;
+    ok &= std::memcmp(
+              &state->shared_map.shared_outputs[1].tensors[0],
+              &zero, sizeof(zero)
+          ) == 0;
+    ok &= worker.occupied_count == 0;
+    ok &= !worker.slots[0].occupied && !worker.slots[0].built;
+    ok &= state->tasks[1].flag == 0;
+    ok &= stats.result.submits == 0;
+    ok &= stats.result.materialized_outputs == 1;
+    // 64B raw tensor 数据按 shared allocator 的逐 output 1KiB 边界保留，
+    // 因而 cursor/vend 验证的是 1024B reserve，而不是 descriptor 数据量。
+    ok &= state->shared_map.shared_heap_cursor[1].value == 1024;
+    ok &= state->shared_map.shared_heap_vend.value == 1024;
+
+    (void)munmap(state, sizeof(SchedulerState));
+    return ok;
+}
+
+bool RunUpWriterCommitFailureTest() {
+    SchedulerState *state = MapSchedulerState();
+    if (state == nullptr) {
+        return false;
+    }
+    state->fatal.value = 0;
+    state->heap_base = kSyntheticHeapBase;
+    state->heap_size = kHeapBytes;
+    state->heap_window = kHeapWindow;
+    state->shared_map.committed_tasks.value = 4;
+    state->shared_map.reclaim_upto.value = -1;
+    ResetOutputCell(state->shared_map.shared_outputs[0]);
+    ResetOutputCell(state->shared_map.shared_outputs[4]);
+    for (uint32_t slot = 0; slot < 2; ++slot) {
+        state->shared_map.shared_outputs[0].published[slot].value = 0;
+        state->shared_map.shared_outputs[0].last_writer[slot].value = 0;
+        state->shared_map.shared_outputs[0].tensors[slot] =
+            MakeTestTensor(kSyntheticHeapBase + slot * 1024, 0);
+    }
+
+    WorkerState &worker = state->workers[0];
+    worker.role = CoreRole::Aiv;
+    worker.core_idx = static_cast<int32_t>(kAicWorkers);
+    worker.lane = 1;
+    worker.local_index = 4;
+    worker.occupied_count = 0;
+
+    TaskArgs args;
+    ConstructTaskArgs(args);
+    AppendSharedOutputRef(
+        args, FdwicOutputRef{0, 0, 0, 0, 0, 0},
+        TensorArgType::Inout
+    );
+    AppendSharedOutputRef(
+        args, FdwicOutputRef{0, 1, 0, 0, 0, 0},
+        TensorArgType::Inout
+    );
+
+    SubmitContext context{};
+    BeginCallbackSubmit(worker, context);
+    bool ok =
+        context.task_id == 4 &&
+        PrepareSharedTaskOutputs(
+            context.shared_result, 4, TaskKind::Up
+        );
+    LocalStats stats{};
+    bool pmu_context = false;
+    const CallbackSubmitTicket ticket{
+        1, 4, static_cast<int16_t>(FunctionId(TaskKind::Up)), 1, 0
+    };
+    WinnerSealFaultOps::fetch_race_address =
+        &state->shared_map.shared_outputs[0].last_writer[1].value;
+    const bool finished =
+        FinishCallbackSubmitBody<WinnerSealFaultOps, false>(
+            state, worker, kTasksPerBatch, args, context, stats,
+            pmu_context, ticket
+        );
+
+    ok &= !finished;
+    ok &= WinnerSealFaultOps::fetch_race_address == nullptr;
+    ok &= state->fatal.value == 1;
+    ok &= state->shared_map.committed_tasks.value == 4;
+    ok &= state->shared_map.shared_outputs[0].last_writer[0].value == 4;
+    ok &= state->shared_map.shared_outputs[0].last_writer[1].value == 4;
+    ok &= state->shared_map.shared_outputs[0].published[0].value == 0;
+    ok &= state->shared_map.shared_outputs[0].published[1].value == 0;
+    ok &= state->shared_map.shared_outputs[4].published[0].value == -1;
+    ok &= stats.result.shared_symbol_inout_commits == 1;
+    ok &= context.fanin_count == 1 && context.fanin[0] == 0;
+    ok &= worker.occupied_count == 0;
+    ok &= !worker.slots[0].occupied && !worker.slots[0].built;
+    ok &= state->tasks[4].flag == 0;
+    ok &= stats.result.submits == 0;
+
+    (void)munmap(state, sizeof(SchedulerState));
+    return ok;
+}
+
 }  // namespace
 
 int main() {
-    if (!RunProtectedArgsLoserTest()) {
+    const bool loser_ok = RunProtectedArgsLoserTest();
+    const bool alloc_failure_ok = RunAllocPublicationFailureTest();
+    const bool qk_failure_ok = RunQkPublicationFailureTest();
+    const bool up_failure_ok = RunUpWriterCommitFailureTest();
+    if (!loser_ok || !alloc_failure_ok || !qk_failure_ok || !up_failure_ok) {
         std::fprintf(
             stderr,
-            "[FAIL] shared split-finish loser touched protected TaskArgs\n"
+            "[FAIL] shared split-finish loser or winner seal regression\n"
         );
         return 1;
     }
     std::printf(
-        "[PASS] shared split-finish loser never reads stale TaskArgs\n"
+        "[PASS] shared split-finish loser and winner seal failure paths\n"
     );
     return 0;
 }

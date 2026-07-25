@@ -16,6 +16,8 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <new>
+#include <sys/mman.h>
 #include <thread>
 
 namespace {
@@ -35,6 +37,7 @@ void Check(bool condition, const char *message) {
 // 该 Ops 只验证公共 symbol helper 的原子状态机和 descriptor 搬运。
 // fence 不模拟 A5 DCache；设备缓存可见性仍必须由 CCEC 上板门禁证明。
 struct SymbolTestOps {
+    static constexpr bool kAtomicReturnReadyObserved = false;
     static volatile int64_t *wait_address;
     static std::atomic<uint64_t> wait_loads;
     static std::atomic<uint64_t> now_calls;
@@ -96,6 +99,12 @@ struct SymbolTestOps {
         );
     }
 
+    template <typename T>
+    static uint64_t NowAfterAtomicResult(T value) {
+        asm volatile("" : "+r"(value));
+        return Now();
+    }
+
     static void SpinHint() {
         std::this_thread::yield();
     }
@@ -150,6 +159,47 @@ struct PublicationFaultOps : SymbolTestOps {
 volatile int64_t *PublicationFaultOps::fetch_race_address = nullptr;
 volatile int64_t *PublicationFaultOps::exchange_race_address = nullptr;
 
+struct SealOrderOps : SymbolTestOps {
+    using SymbolTestOps::Exchange;
+
+    static volatile int64_t *committed_address;
+    static volatile int64_t *output_writer_address;
+    static volatile int64_t *published_address;
+    static int64_t expected_committed;
+    static int64_t expected_writer;
+    static bool order_ok;
+
+    static int64_t FetchMax(
+        volatile int64_t *address, int64_t value, uint64_t &retries
+    ) {
+        if (address == output_writer_address) {
+            order_ok &=
+                __atomic_load_n(committed_address, __ATOMIC_ACQUIRE) ==
+                    expected_committed;
+        }
+        return SymbolTestOps::FetchMax(address, value, retries);
+    }
+
+    static int64_t Exchange(volatile int64_t *address, int64_t value) {
+        if (address == published_address) {
+            order_ok &=
+                __atomic_load_n(committed_address, __ATOMIC_ACQUIRE) ==
+                    expected_committed;
+            order_ok &=
+                __atomic_load_n(output_writer_address, __ATOMIC_ACQUIRE) ==
+                    expected_writer;
+        }
+        return SymbolTestOps::Exchange(address, value);
+    }
+};
+
+volatile int64_t *SealOrderOps::committed_address = nullptr;
+volatile int64_t *SealOrderOps::output_writer_address = nullptr;
+volatile int64_t *SealOrderOps::published_address = nullptr;
+int64_t SealOrderOps::expected_committed = 0;
+int64_t SealOrderOps::expected_writer = 0;
+bool SealOrderOps::order_ok = true;
+
 void ResetSharedState(SharedTensorMapSidecar &map) {
     std::memset(&map, 0, sizeof(map));
     map.reclaim_upto.value = -1;
@@ -161,6 +211,30 @@ void ResetSharedState(SharedTensorMapSidecar &map) {
             map.shared_outputs[task].published[slot].value = -1;
             map.shared_outputs[task].last_writer[slot].value = -1;
         }
+    }
+}
+
+SchedulerState *MapSparseSchedulerState() {
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_NORESERVE
+    flags |= MAP_NORESERVE;
+#endif
+    void *memory = mmap(
+        nullptr, sizeof(SchedulerState), PROT_READ | PROT_WRITE,
+        flags, -1, 0
+    );
+    if (memory == MAP_FAILED) {
+        std::perror("mmap SchedulerState");
+        return nullptr;
+    }
+    // SchedulerState 是 trivial 类型；匿名映射提供零页，default-init
+    // 只建立对象生命周期，避免为定向测试提交约 1 GiB 无关物理页。
+    return ::new (memory) SchedulerState;
+}
+
+void UnmapSparseSchedulerState(SchedulerState *state) {
+    if (state != nullptr) {
+        (void)munmap(state, sizeof(SchedulerState));
     }
 }
 
@@ -272,14 +346,32 @@ void TestPublishAndResolve() {
     );
     Check(protocol_ok, "plain symbolic INOUT resolves");
     Check(inout_count == 1 && inout_fanin[0] == 0, "INOUT consumes old writer");
-    Check(map->shared_outputs[0].last_writer[0].value == 2, "INOUT publishes current writer");
     Check(
-        inout_stats.result.shared_symbol_inout_exchanges == 1,
-        "INOUT exchange is counted"
+        map->shared_outputs[0].last_writer[0].value == 0,
+        "read-only INOUT resolve keeps producer writer unchanged"
+    );
+    Check(
+        inout_stats.result.shared_symbol_inout_commits == 0,
+        "read-only INOUT resolve publishes no writer statistic"
+    );
+    Check(
+        CommitSharedFaninWriters<SymbolTestOps>(
+            *map, inout_args, 2, inout_stats
+        ),
+        "explicit post-build step commits the INOUT writer"
+    );
+    Check(
+        map->shared_outputs[0].last_writer[0].value == 2,
+        "INOUT commit advances writer to current task"
+    );
+    Check(
+        inout_stats.result.shared_symbol_inout_commits == 1,
+        "successful INOUT writer commit is counted"
     );
 
-    // A(0) -> B(2) -> C(3)：后继 INPUT 必须看到最近一次 INOUT writer，
-    // 不能退回最初 producer。
+    // PA Case1 的 fresh symbol 不存在 A -> B(INOUT) -> C(INPUT) 链。
+    // writer 已从 producer 改成唯一 UP consumer 后，任何后继复用同一
+    // producer handle 都必须 fail-closed，不能脑补成通用 generation 链。
     TaskArgs successor_args;
     ConstructTaskArgs(successor_args);
     AppendSharedOutputRef(
@@ -298,15 +390,370 @@ void TestPublishAndResolve() {
         *map, successor_args, successor_context, 3, kHeapWindow,
         successor_stats, successor_fanin, protocol_ok, ordinary_lookups
     );
-    Check(protocol_ok, "successor INPUT resolves after INOUT");
+    Check(!protocol_ok, "post-INOUT successor is outside the Case1 symbol contract");
     Check(
-        successor_count == 1 && successor_fanin[0] == 2,
-        "successor INPUT observes latest writer"
+        successor_count == 0,
+        "unsupported writer chain publishes no successor fanin"
     );
     Check(
         SymbolTestOps::now_calls.load(std::memory_order_relaxed) == 0,
         "already-published symbol fast path never reads the watchdog clock"
     );
+}
+
+void TestWriterCommitFailuresKeepTerminalEvidence() {
+    auto map = std::make_unique<SharedTensorMapSidecar>();
+    ResetSharedState(*map);
+
+    TaskArgs args;
+    ConstructTaskArgs(args);
+    AppendSharedOutputRef(
+        args, FdwicOutputRef{0, 0, 0, 0, 0, 0},
+        TensorArgType::Inout
+    );
+
+    LocalStats stats{};
+    map->shared_outputs[0].last_writer[0].value = -1;
+    Check(
+        !CommitSharedFaninWriters<SymbolTestOps>(*map, args, 4, stats),
+        "missing producer writer rejects INOUT commit"
+    );
+    Check(
+        map->shared_outputs[0].last_writer[0].value == 4,
+        "failed FetchMax keeps terminal over-advance evidence instead of rolling back"
+    );
+    Check(
+        stats.result.shared_symbol_inout_commits == 0,
+        "failed writer commit is not counted as success"
+    );
+
+    map->shared_outputs[0].last_writer[0].value = 7;
+    Check(
+        !CommitSharedFaninWriters<SymbolTestOps>(*map, args, 4, stats),
+        "future writer rejects INOUT commit"
+    );
+    Check(
+        map->shared_outputs[0].last_writer[0].value == 7,
+        "failed FetchMax does not overwrite a later writer"
+    );
+}
+
+void TestMultiWriterFailureKeepsPartialTerminalEvidence() {
+    auto map = std::make_unique<SharedTensorMapSidecar>();
+    ResetSharedState(*map);
+    TaskArgs args;
+    ConstructTaskArgs(args);
+    for (int32_t producer = 0; producer < 3; ++producer) {
+        AppendSharedOutputRef(
+            args, FdwicOutputRef{producer, 0, 0, 0, 0, 0},
+            TensorArgType::Inout
+        );
+        map->shared_outputs[static_cast<uint32_t>(producer)]
+            .last_writer[0].value = producer;
+    }
+    // 模拟只读解析完成后第二个 producer 控制字被破坏。第一个提交已经
+    // 线性化，不能为了伪造事务性而回滚；第三个尚未触碰。
+    map->shared_outputs[1].last_writer[0].value = -1;
+    LocalStats stats{};
+    Check(
+        !CommitSharedFaninWriters<SymbolTestOps>(*map, args, 4, stats),
+        "second of three INOUT commits rejects damaged producer writer"
+    );
+    Check(
+        map->shared_outputs[0].last_writer[0].value == 4 &&
+            map->shared_outputs[1].last_writer[0].value == 4 &&
+            map->shared_outputs[2].last_writer[0].value == 2,
+        "partial terminal commit preserves completed, failed, and untouched evidence"
+    );
+    Check(
+        stats.result.shared_symbol_inout_commits == 1,
+        "only the writer committed before terminal failure is counted"
+    );
+}
+
+void TestFailedSealDiscardsBuiltTask() {
+    auto worker = std::make_unique<WorkerState>();
+    worker->occupied_count = 2;
+    worker->slots[0].task_id = 4;
+    worker->slots[0].occupied = true;
+    worker->slots[0].built = true;
+    worker->slots[1].task_id = 3;
+    worker->slots[1].occupied = true;
+    worker->slots[1].built = true;
+
+    Check(
+        DiscardBuiltTask(*worker, 4),
+        "failed shared seal finds its just-built private slot"
+    );
+    Check(
+        !worker->slots[0].occupied && !worker->slots[0].built &&
+            worker->occupied_count == 1,
+        "failed shared seal removes only its own slot from FinalDrain"
+    );
+    Check(
+        worker->slots[1].occupied && worker->slots[1].built,
+        "failed shared seal preserves previously built work"
+    );
+    Check(
+        !DiscardBuiltTask(*worker, 9) && worker->occupied_count == 1,
+        "missing failed task cannot corrupt occupied accounting"
+    );
+    worker->slots[0].task_id = 5;
+    worker->slots[0].occupied = true;
+    worker->slots[0].built = true;
+    worker->occupied_count = 0;
+    Check(
+        !DiscardBuiltTask(*worker, 5),
+        "corrupt occupied accounting remains visible to the caller"
+    );
+    Check(
+        !worker->slots[0].occupied && !worker->slots[0].built,
+        "terminal discard clears the failed slot despite corrupt accounting"
+    );
+}
+
+void TestPostBuildSealClosesSuccessAndFailurePaths() {
+    {
+        SchedulerState *state = MapSparseSchedulerState();
+        Check(state != nullptr, "writer-failure seal state maps");
+        if (state != nullptr) {
+            ResetSharedState(state->shared_map);
+            state->shared_map.committed_tasks.value = 4;
+            WorkerState &worker = state->workers[0];
+            worker.occupied_count = 1;
+            worker.slots[0].task_id = 4;
+            worker.slots[0].occupied = true;
+            worker.slots[0].built = true;
+
+            TaskArgs args;
+            ConstructTaskArgs(args);
+            AppendSharedOutputRef(
+                args, FdwicOutputRef{0, 0, 0, 0, 0, 0},
+                TensorArgType::Inout
+            );
+            SubmitContext context{};
+            context.task_id = 4;
+            context.result.task_id = 4;
+            context.shared_result.Reset(4);
+            LocalStats stats{};
+
+            Check(
+                !SealSharedWinnerAfterBuild<SymbolTestOps>(
+                    state, worker, args, context, 4, TaskKind::Up, stats
+                ),
+                "writer invariant failure rejects post-build seal"
+            );
+            Check(
+                state->fatal.value == 1 &&
+                    state->shared_map.committed_tasks.value == 4,
+                "writer failure broadcasts fatal before releasing task turn"
+            );
+            Check(
+                state->shared_map.shared_outputs[0]
+                        .last_writer[0].value == 4,
+                "writer failure retains terminal FetchMax evidence"
+            );
+            Check(
+                !worker.slots[0].occupied &&
+                    !worker.slots[0].built &&
+                    worker.occupied_count == 0,
+                "writer failure removes the failed winner from FinalDrain"
+            );
+            UnmapSparseSchedulerState(state);
+        }
+    }
+
+    {
+        SchedulerState *state = MapSparseSchedulerState();
+        Check(state != nullptr, "turn-release-failure seal state maps");
+        if (state != nullptr) {
+            ResetSharedState(state->shared_map);
+            state->shared_map.committed_tasks.value = 4;
+            state->shared_map.shared_outputs[0]
+                .last_writer[0].value = 0;
+            WorkerState &worker = state->workers[0];
+            worker.occupied_count = 1;
+            worker.slots[0].task_id = 4;
+            worker.slots[0].occupied = true;
+            worker.slots[0].built = true;
+
+            TaskArgs args;
+            ConstructTaskArgs(args);
+            AppendSharedOutputRef(
+                args, FdwicOutputRef{0, 0, 0, 0, 0, 0},
+                TensorArgType::Inout
+            );
+            SubmitContext context{};
+            context.task_id = 4;
+            context.result.task_id = 4;
+            context.shared_result.Reset(4);
+            LocalStats stats{};
+
+            PublicationFaultOps::exchange_race_address =
+                &state->shared_map.committed_tasks.value;
+            Check(
+                !SealSharedWinnerAfterBuild<PublicationFaultOps>(
+                    state, worker, args, context, 4, TaskKind::Up, stats
+                ),
+                "turn-release invariant failure rejects post-build seal"
+            );
+            Check(
+                PublicationFaultOps::exchange_race_address == nullptr &&
+                    state->fatal.value == 1,
+                "turn-release failure consumes injection and broadcasts fatal"
+            );
+            Check(
+                state->shared_map.committed_tasks.value == 7,
+                "turn-release failure restores the observed frontier"
+            );
+            Check(
+                state->shared_map.shared_outputs[0]
+                        .last_writer[0].value == 4 &&
+                    stats.result.shared_symbol_inout_commits == 1,
+                "turn-release failure retains the completed writer commit"
+            );
+            Check(
+                !worker.slots[0].occupied &&
+                    !worker.slots[0].built &&
+                    worker.occupied_count == 0,
+                "turn-release failure removes the failed winner slot"
+            );
+            UnmapSparseSchedulerState(state);
+        }
+    }
+
+    {
+        SchedulerState *state = MapSparseSchedulerState();
+        Check(state != nullptr, "publication-failure seal state maps");
+        if (state != nullptr) {
+            ResetSharedState(state->shared_map);
+            state->shared_map.committed_tasks.value = 1;
+            state->shared_map.shared_outputs[1]
+                .last_writer[0].value = 7;
+            WorkerState &worker = state->workers[0];
+            worker.occupied_count = 1;
+            worker.slots[0].task_id = 1;
+            worker.slots[0].occupied = true;
+            worker.slots[0].built = true;
+
+            TensorDesc output = MakeTensor(0x390000000ULL, 1);
+            TaskArgs args;
+            ConstructTaskArgs(args);
+            SubmitContext context{};
+            context.task_id = 1;
+            context.result.task_id = 1;
+            context.result.count = 1;
+            context.result.tensors[0] = &output;
+            context.shared_result.Reset(1);
+            Check(
+                context.shared_result.AddOutputRef(1, 0),
+                "publication-failure context declares output"
+            );
+            LocalStats stats{};
+
+            Check(
+                !SealSharedWinnerAfterBuild<SymbolTestOps>(
+                    state, worker, args, context, 1, TaskKind::Qk, stats
+                ),
+                "publication invariant failure rejects post-build seal"
+            );
+            Check(
+                state->fatal.value == 1 &&
+                    state->shared_map.committed_tasks.value == 2,
+                "publication failure is terminal after releasing the old turn"
+            );
+            Check(
+                state->shared_map.shared_outputs[1]
+                        .published[0].value == -1 &&
+                    state->shared_map.shared_outputs[1]
+                        .last_writer[0].value == 7,
+                "publication preflight failure exposes no new descriptor"
+            );
+            Check(
+                !worker.slots[0].occupied &&
+                    worker.occupied_count == 0,
+                "publication failure removes the failed winner slot"
+            );
+            UnmapSparseSchedulerState(state);
+        }
+    }
+
+    {
+        SchedulerState *state = MapSparseSchedulerState();
+        Check(state != nullptr, "successful seal state maps");
+        if (state != nullptr) {
+            ResetSharedState(state->shared_map);
+            state->shared_map.committed_tasks.value = 1;
+            WorkerState &worker = state->workers[0];
+            worker.occupied_count = 1;
+            worker.slots[0].task_id = 1;
+            worker.slots[0].occupied = true;
+            worker.slots[0].built = true;
+
+            TensorDesc output = MakeTensor(0x3A0000000ULL, 1);
+            TaskArgs args;
+            ConstructTaskArgs(args);
+            SubmitContext context{};
+            context.task_id = 1;
+            context.result.task_id = 1;
+            context.result.count = 1;
+            context.result.tensors[0] = &output;
+            context.shared_result.Reset(1);
+            Check(
+                context.shared_result.AddOutputRef(1, 0),
+                "successful seal context declares output"
+            );
+            LocalStats stats{};
+
+            SealOrderOps::committed_address =
+                &state->shared_map.committed_tasks.value;
+            SealOrderOps::output_writer_address =
+                &state->shared_map.shared_outputs[1]
+                     .last_writer[0].value;
+            SealOrderOps::published_address =
+                &state->shared_map.shared_outputs[1]
+                     .published[0].value;
+            SealOrderOps::expected_committed = 2;
+            SealOrderOps::expected_writer = 1;
+            SealOrderOps::order_ok = true;
+            Check(
+                SealSharedWinnerAfterBuild<SealOrderOps>(
+                    state, worker, args, context, 1, TaskKind::Qk, stats
+                ),
+                "valid post-build seal succeeds"
+            );
+            Check(
+                SealOrderOps::order_ok,
+                "turn release and writer initialization precede published"
+            );
+            Check(
+                state->fatal.value == 0 &&
+                    state->shared_map.committed_tasks.value == 2 &&
+                    state->shared_map.shared_outputs[1]
+                        .last_writer[0].value == 1 &&
+                    state->shared_map.shared_outputs[1]
+                        .published[0].value == 1,
+                "successful seal closes turn, writer, and publication state"
+            );
+            Check(
+                SameTensor(
+                    state->shared_map.shared_outputs[1].tensors[0],
+                    output
+                ),
+                "successful seal publishes the exact descriptor"
+            );
+            Check(
+                worker.slots[0].occupied &&
+                    worker.slots[0].built &&
+                    worker.occupied_count == 1,
+                "successful seal preserves executable winner slot"
+            );
+            SealOrderOps::committed_address = nullptr;
+            SealOrderOps::output_writer_address = nullptr;
+            SealOrderOps::published_address = nullptr;
+            UnmapSparseSchedulerState(state);
+        }
+    }
 }
 
 void TestPublicationPreflightIsAllOrNothing() {
@@ -598,7 +1045,7 @@ void TestInvalidReferencesFailClosed() {
     );
     Check(
         mixed_stats.result.shared_symbol_input_loads == 0 &&
-            mixed_stats.result.shared_symbol_inout_exchanges == 0,
+            mixed_stats.result.shared_symbol_inout_commits == 0,
         "late invalid symbol publishes no resolve statistics"
     );
     Check(
@@ -612,12 +1059,47 @@ void TestInvalidReferencesFailClosed() {
         payload_untouched &= payload_bytes[index] == 0xA5;
     }
     Check(payload_untouched, "late invalid symbol does not touch payload scratch");
+
+    TaskArgs duplicate_args;
+    ConstructTaskArgs(duplicate_args);
+    AppendSharedOutputRef(
+        duplicate_args, producer.shared_result.OutputRef(0),
+        TensorArgType::Inout
+    );
+    AppendSharedOutputRef(
+        duplicate_args, producer.shared_result.OutputRef(0),
+        TensorArgType::OutputExisting
+    );
+    SubmitContext duplicate_context{};
+    duplicate_context.task_id = 2;
+    duplicate_context.payload = payload.get();
+    LocalStats duplicate_stats{};
+    int32_t duplicate_fanin[kMaxFanin] = {};
+    bool duplicate_protocol_ok = true;
+    uint32_t duplicate_ordinary_lookups = UINT32_MAX;
+    (void)CollectSharedFanin<SymbolTestOps>(
+        *map, duplicate_args, duplicate_context, 2, kHeapWindow,
+        duplicate_stats, duplicate_fanin, duplicate_protocol_ok,
+        duplicate_ordinary_lookups
+    );
+    Check(
+        !duplicate_protocol_ok,
+        "duplicate write references to one symbol fail before commit"
+    );
+    Check(
+        map->shared_outputs[0].last_writer[0].value == 0,
+        "duplicate write rejection preserves producer writer"
+    );
 }
 
 }  // namespace
 
 int main() {
     TestPublishAndResolve();
+    TestWriterCommitFailuresKeepTerminalEvidence();
+    TestMultiWriterFailureKeepsPartialTerminalEvidence();
+    TestFailedSealDiscardsBuiltTask();
+    TestPostBuildSealClosesSuccessAndFailurePaths();
     TestPublicationPreflightIsAllOrNothing();
     TestPublicationCommitFaultsRollback();
     TestConsumerWaitsForDelayedPublication();
