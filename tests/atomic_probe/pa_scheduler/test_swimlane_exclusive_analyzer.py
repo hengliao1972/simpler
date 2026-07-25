@@ -179,7 +179,6 @@ def _capture() -> dict[str, object]:
             "clock_freq_hz": 1_000_000_000,
             "num_cores": CORE_COUNT,
             "trace_schema_version": 3,
-            "tensor_map_mode": "private",
             "core_types": [_topology(core_id)[2] for core_id in range(CORE_COUNT)],
         },
         "fdwic_events": rows,
@@ -291,79 +290,6 @@ def _v4_capture() -> dict[str, object]:
     return capture
 
 
-def _shared_v4_capture(*, batches: int = 4) -> dict[str, object]:
-    """构造 shared Alloc 仅由四个固定 owner 记录的完整 schema-v4 样本。"""
-
-    owner_by_shard = (0, 34, 37, 3)
-    logical_task_count = batches * 5
-    rows: list[list[object]] = []
-    for core_id in range(CORE_COUNT):
-        base = 1000 + core_id
-        for task_id in range(logical_task_count):
-            is_alloc = task_id % 5 == 0
-            if is_alloc and owner_by_shard[task_id % 4] != core_id:
-                continue
-            start = base + task_id * 20
-            rows.extend(
-                [
-                    _row(core_id, task_id, "EfDrain", start + 1, start + 2),
-                    _row(
-                        core_id,
-                        task_id,
-                        "Claim",
-                        start + 3,
-                        start + 4,
-                        flags=0x2,
-                        auxiliary=1 if is_alloc else 0,
-                    ),
-                    _row(core_id, task_id, "Materialize", start + 5, start + 6),
-                    _row(core_id, task_id, "PrepareMap", start + 6, start + 7),
-                    _row(core_id, task_id, "Register", start + 8, start + 9),
-                    _row(
-                        core_id,
-                        task_id,
-                        "Submit",
-                        start,
-                        start + 10,
-                        auxiliary=1 if is_alloc else 0,
-                    ),
-                ]
-            )
-        orchestration_end = base + logical_task_count * 20
-        rows.extend(
-            [
-                _row(
-                    core_id,
-                    -1,
-                    "OrchestrationReplay",
-                    base - 10,
-                    orchestration_end,
-                ),
-                _row(
-                    core_id,
-                    -1,
-                    "FinalDrain",
-                    orchestration_end,
-                    orchestration_end + 10,
-                ),
-            ]
-        )
-
-    capture: dict[str, object] = {
-        "l2_swimlane_level": 1,
-        "metadata": {
-            "clock_freq_hz": 1_000_000_000,
-            "num_cores": CORE_COUNT,
-            "trace_schema_version": 4,
-            "tensor_map_mode": "shared",
-            "core_types": [_topology(core_id)[2] for core_id in range(CORE_COUNT)],
-        },
-        "fdwic_events": rows,
-    }
-    _refresh_summary(capture)
-    return capture
-
-
 class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
     def _write(self, directory: str, capture: dict[str, object]) -> Path:
         path = Path(directory) / "l2_swimlane_records.json"
@@ -377,11 +303,7 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
 
         self.assertEqual(report["validation"]["status"], "PASS")
         self.assertEqual(report["capture"]["core_count"], 96)
-        self.assertEqual(report["capture"]["logical_task_count"], 2)
-        self.assertEqual(
-            report["capture"]["profiled_submit_count_per_core"],
-            {"min": 2, "max": 2},
-        )
+        self.assertEqual(report["capture"]["task_count_per_core"], 2)
         self.assertEqual(report["global_submit_makespan"]["duration_cycles"], 295)
 
         metrics = report["aggregate_core_work"]["metrics_cycles"]
@@ -523,79 +445,6 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
             report["kernel_containment"]["unclassified_without_v4_parent_events"],
             0,
         )
-
-    def test_v4_shared_validates_sparse_alloc_owners_and_reports_profiled_counts(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = self._write(directory, _shared_v4_capture())
-            report = analyze_capture(path)
-
-        capture = report["capture"]
-        self.assertEqual(capture["tensor_map_mode"], "shared")
-        self.assertEqual(capture["logical_task_count"], 20)
-        self.assertEqual(
-            capture["profiled_submit_count_per_core"],
-            {"min": 16, "max": 17},
-        )
-        self.assertEqual(capture["profiled_submit_count_total"], 1540)
-        self.assertIs(
-            report["validation"]["submit_task_ids_match_tensor_map_mode"],
-            True,
-        )
-        self.assertNotIn(
-            "task_ids_contiguous_and_equal_per_core", report["validation"]
-        )
-        self.assertEqual(
-            report["semantics"]["shared_alloc_owner_by_shard"],
-            [0, 34, 37, 3],
-        )
-        self.assertEqual(report["per_core"][0]["submit_count"], 17)
-        self.assertEqual(report["per_core"][34]["submit_count"], 17)
-        self.assertEqual(report["per_core"][37]["submit_count"], 17)
-        self.assertEqual(report["per_core"][3]["submit_count"], 17)
-        self.assertEqual(report["per_core"][1]["submit_count"], 16)
-
-        # core1 的首个 Alloc 早退落入 OrchestrationSetup；后续三个
-        # 稀疏 Alloc 则扩大相邻 full-path Submit 间的 residual。
-        core1_metrics = report["per_core"][1]["metrics_cycles"]
-        self.assertEqual(core1_metrics["orchestration_setup"], 30)
-        self.assertEqual(core1_metrics["between_submit_residual"], 210)
-
-    def test_v4_shared_rejects_alloc_submit_on_non_owner(self) -> None:
-        capture = _shared_v4_capture()
-        rows = capture["fdwic_events"]
-        assert isinstance(rows, list)
-        # 复制 core0/task0 的完整路径到非 owner core1；所有 row key、
-        # parent containment 和 Claim/Submit 对仍合法，应由 mode 精确集合拒绝。
-        for source in list(rows):
-            if source[0] != 0 or source[3] != 0:
-                continue
-            copied = list(source)
-            copied[0] = 1
-            copied[1] = 1
-            copied[2] = 0
-            copied[6] = int(copied[6]) + 1
-            copied[7] = int(copied[7]) + 1
-            rows.append(copied)
-        _refresh_summary(capture)
-        with tempfile.TemporaryDirectory() as directory:
-            path = self._write(directory, capture)
-            with self.assertRaisesRegex(ValueError, "shared full-path set"):
-                analyze_capture(path)
-
-    def test_v4_shared_rejects_missing_non_alloc_full_path(self) -> None:
-        capture = _shared_v4_capture()
-        rows = capture["fdwic_events"]
-        assert isinstance(rows, list)
-        capture["fdwic_events"] = [
-            row for row in rows if not (row[0] == 1 and row[3] == 1)
-        ]
-        _refresh_summary(capture)
-        with tempfile.TemporaryDirectory() as directory:
-            path = self._write(directory, capture)
-            with self.assertRaisesRegex(ValueError, "shared full-path set"):
-                analyze_capture(path)
 
     def test_v4_phase_only_capture_still_has_dropped_evidence_and_closes(self) -> None:
         capture = _v4_capture()
@@ -747,8 +596,7 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
             self.assertEqual(envelope["max_cycles"], 200)
         self.assertEqual(
             report["global_submit_makespan"]["semantics"],
-            "cross-core wall-clock envelope of recorded full-path Submit spans; "
-            "not aggregate core-work",
+            "cross-core wall-clock envelope; not aggregate core-work",
         )
         self.assertEqual(
             report["aggregate_core_work"]["semantics"],

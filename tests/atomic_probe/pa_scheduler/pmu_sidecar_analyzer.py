@@ -111,7 +111,6 @@ CONFIG_FINGERPRINT_FIELDS = (
 SUBMIT_PMU_FINGERPRINT_FIELDS = CONFIG_FINGERPRINT_FIELDS + (
     "build_variant",
     "build_variant_id",
-    "tensor_map_mode",
     "compiled_phase",
     "compiled_phase_id",
     "primary_window_segments_per_record",
@@ -308,7 +307,7 @@ def _validate_group_summary(
 
 def _validate_submit_pmu_configuration(
     path: Path, configuration: dict[str, Any], schema_version: int
-) -> tuple[str, int, str]:
+) -> tuple[str, int]:
     """校验 submit-pmu 的编译期身份、局部阶段和观察能力契约。"""
 
     _require(
@@ -321,11 +320,6 @@ def _validate_submit_pmu_configuration(
     _require(
         variant_id == SUBMIT_PMU_BUILD_VARIANT_ID,
         f"{path}: unexpected submit-pmu build_variant_id {variant_id}",
-    )
-    tensor_map_mode = configuration.get("tensor_map_mode")
-    _require(
-        tensor_map_mode in ("private", "shared"),
-        f"{path}: unsupported configuration.tensor_map_mode {tensor_map_mode!r}",
     )
     phase_name = configuration.get("compiled_phase")
     _require(
@@ -470,7 +464,7 @@ def _validate_submit_pmu_configuration(
             _integer(selectors.get(field), f"{path}: configuration.selectors.{field}") == expected,
             f"{path}: configuration.selectors.{field} is not 0x{expected:03x}",
         )
-    return phase_name, phase_id, tensor_map_mode
+    return phase_name, phase_id
 
 
 def _is_aic_physical_slot(physical_id: int) -> bool:
@@ -634,28 +628,10 @@ def _validate_submit_pmu_owner(
     return configured_ids
 
 
-def _expected_submit_pmu_phase_calls(
-    phase_name: str,
-    batches: int,
-    tensor_map_mode: str,
-    block_id: int,
-    lane: int,
-) -> int:
-    """按构建模式与 raw 逻辑核坐标独立重算局部阶段调用次数。"""
+def _expected_submit_pmu_phase_calls(phase_name: str, batches: int) -> int:
+    """当前 running phase 都覆盖每核每次 Submit，调用次数固定为 5B。"""
 
-    if phase_name == "none":
-        return 0
-    if tensor_map_mode == "private":
-        return batches * TASKS_PER_BATCH
-
-    # shared 的四个 alloc_cursor shard 分别固定到
-    # (block,lane)=(0,0),(1,1),(2,2),(3,0)。每 batch 的 Alloc task_id
-    # 为 batch*5；其余四类 task 仍在每个 worker 上进入局部阶段。
-    shared_alloc_calls = 0
-    for batch in range(batches):
-        shard = (batch * TASKS_PER_BATCH) % 4
-        shared_alloc_calls += (block_id, lane) == (shard, shard % 3)
-    return batches * (TASKS_PER_BATCH - 1) + shared_alloc_calls
+    return 0 if phase_name == "none" else batches * TASKS_PER_BATCH
 
 
 def _validate_submit_pmu_record(
@@ -665,7 +641,6 @@ def _validate_submit_pmu_record(
     phase_name: str,
     phase_id: int,
     batches: int,
-    tensor_map_mode: str,
     schema_version: int,
 ) -> PhasePartitionEvidence:
     """重验 raw phase 分区；运行中 read-clear 只形成上下界。"""
@@ -688,11 +663,7 @@ def _validate_submit_pmu_record(
         (phase_status & phase_status_required) == phase_status_required,
         f"{prefix} phase_status is incomplete",
     )
-    block_id = _integer(record.get("block_id"), f"{prefix}.block_id")
-    lane = _integer(record.get("lane"), f"{prefix}.lane")
-    expected_calls = _expected_submit_pmu_phase_calls(
-        phase_name, batches, tensor_map_mode, block_id, lane
-    )
+    expected_calls = _expected_submit_pmu_phase_calls(phase_name, batches)
     if "phase_expected_calls" in record:
         _require(
             _integer(record.get("phase_expected_calls"), f"{prefix}.phase_expected_calls")
@@ -870,14 +841,13 @@ def load_capture(path: Path) -> Capture:
     _require(len(records) == workers, f"{path}: record count does not match configuration.workers")
     phase_name: str | None = None
     phase_id: int | None = None
-    tensor_map_mode: str | None = None
     if schema_version in SUBMIT_PMU_SCHEMA_VERSIONS:
         _require(
             (workers, aic_workers, aiv_workers)
             == (A5_WORKERS, A5_AIC_WORKERS, A5_AIV_WORKERS),
             f"{path}: submit-pmu schema requires the fixed 96/32/64 A5 topology",
         )
-        phase_name, phase_id, tensor_map_mode = _validate_submit_pmu_configuration(
+        phase_name, phase_id = _validate_submit_pmu_configuration(
             path, configuration, schema_version
         )
     else:
@@ -1080,21 +1050,10 @@ def load_capture(path: Path) -> Capture:
         if schema_version in SUBMIT_PMU_SCHEMA_VERSIONS:
             # 上面的 configuration 校验已保证二者不是 None；显式 assert 只帮助
             # 类型收窄，不替代任何 JSON 运行时门禁。
-            assert (
-                phase_name is not None
-                and phase_id is not None
-                and tensor_map_mode is not None
-            )
+            assert phase_name is not None and phase_id is not None
             phase_partition_evidence.append(
                 _validate_submit_pmu_record(
-                    path,
-                    index,
-                    record,
-                    phase_name,
-                    phase_id,
-                    batches,
-                    tensor_map_mode,
-                    schema_version,
+                    path, index, record, phase_name, phase_id, batches, schema_version
                 )
             )
 

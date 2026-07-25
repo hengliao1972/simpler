@@ -148,21 +148,6 @@ else
     echo "[TEST] shared heap no-wrap reserve self-test"
     "$BUILD_DIR/test_shared_heap_reserve"
 
-    # shared Alloc 仍保留 production 4-shard cursor ABI；每个 shard 必须
-    # 始终映射到同一物理 worker，才能在去除 95 路无效 atomicMax 后
-    # 保持 task_id 单调推进。该测试覆盖完整 96-worker 拓扑和四个
-    # shard 的精确 owner 身份。
-    echo "[BUILD] shared Alloc candidate topology self-test"
-    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
-        -DPTO_FDWIC_SHARED_MAP=1 \
-        -DPA_BUILD_SWIMLANE=1 \
-        -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/common/test_shared_alloc_candidate.cpp" \
-        -o "$BUILD_DIR/test_shared_alloc_candidate"
-
-    echo "[TEST] shared Alloc candidate topology self-test"
-    "$BUILD_DIR/test_shared_alloc_candidate"
-
     # Materialize 在触碰 shared cursor 前必须完成数量、引用、shape/stride
     # 和地址区间预检；这些 reserve 前拒绝路径不能推进 heap。FetchAdd 后
     # 才暴露的容量竞争则按 terminal 契约保留 overrun 现场。

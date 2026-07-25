@@ -319,10 +319,8 @@ atomicMax，不依赖屏障来保证正确性。
 4. 接收每个 Submit 返回的 output descriptor，更新后继 task 的输入；
 5. 执行 Submit 间的循环、view、分组和返回控制逻辑。
 
-所有 worker 都执行连续的逻辑回放，所以每核外层 `task_id` 仍是
-`0..5B-1`，且 `task_id % 5` 固定映射为 Alloc/QK/SF/PV/UP。shared
-模式的 Alloc 非候选会在构造调用方参数和稳定 output handle 后跳过内部
-调度主体，因此它没有 Claim/Submit raw；这不等于逻辑 task 消失。
+所有 worker 都走这段代码，所以每核 `task_id` 都是连续的 `0..5B-1`，且
+`task_id % 5` 固定映射为 Alloc/QK/SF/PV/UP。
 
 ### 4.5 FinalDrain：停止生产后清空在途任务
 
@@ -958,10 +956,8 @@ converter 会：
 
 - 96 个 core id、32/64 role map 和 block/lane 映射完整；
 - `dropped_records == 0`；
-- private 每核 Submit task id 连续且 task stream 完全一致；shared 则按
-  固定 Alloc shard owner 验证精确稀疏集合，所有非 Alloc 仍必须全核存在；
-- 每条已记录的 full-path Submit 恰有 EfDrain、Materialize、PrepareMap、
-  Claim、Register，且 Claim/Submit key 完全相同；
+- 每核 Submit task id 连续且 task stream 完全一致；
+- 每个 Submit 恰有 EfDrain、Materialize、PrepareMap、Claim、Register；
 - Fanin 和 winner tail 的条件数量与 Claim winner/Alloc 标记一致；
 - 同一父区间的排他 child 不重叠，且 task id 与父 Submit 一致；
 - 每核恰有一个 OrchestrationReplay 和一个 FinalDrain，二者边界相邻；

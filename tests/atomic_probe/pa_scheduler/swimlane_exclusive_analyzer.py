@@ -32,11 +32,10 @@ except ImportError:
     from swimlane_converter import _load_and_validate, _standalone_topology
 
 
-REPORT_SCHEMA_VERSION = 3
+REPORT_SCHEMA_VERSION = 2
 EXPECTED_CORES = 96
 EXPECTED_AIC_CORES = 32
 EXPECTED_AIV_CORES = 64
-SHARED_ALLOC_OWNER_BY_SHARD = (0, 34, 37, 3)
 
 # v3 的六类显式 child 保持历史口径；v4 只把 winner 的两个真实
 # 尾动作加入排他分区。loser 没有尾动作，其剩余时间属于 Submit residual。
@@ -266,7 +265,7 @@ def _validate_capture_identity(
     trace_schema_version: int,
     metadata: dict[str, Any],
     events: Sequence[Event],
-) -> tuple[list[str], int, str]:
+) -> tuple[list[str], int]:
     """补足 converter 之外、排他报告必须证明的完整 96 核和 task stream 身份。"""
 
     if trace_schema_version not in (3, 4):
@@ -287,12 +286,6 @@ def _validate_capture_identity(
     if core_types != expected_types:
         raise ValueError("metadata.core_types is not the complete 32 AIC + 64 AIV role map")
 
-    tensor_map_mode = str(metadata.get("tensor_map_mode", "private"))
-    if tensor_map_mode not in {"private", "shared"}:
-        raise ValueError("metadata.tensor_map_mode must be private or shared")
-    if trace_schema_version != 4 and tensor_map_mode != "private":
-        raise ValueError("sparse shared Submit analysis requires trace_schema_version=4")
-
     summary = metadata.get("fdwic_summary")
     if not isinstance(summary, dict) or int(summary.get("dropped_records", -1)) != 0:
         raise ValueError("metadata.fdwic_summary.dropped_records must be exactly 0")
@@ -303,14 +296,13 @@ def _validate_capture_identity(
         missing = sorted(expected_core_ids - observed_core_ids)
         extra = sorted(observed_core_ids - expected_core_ids)
         raise ValueError(f"raw core IDs are incomplete: missing={missing} extra={extra}")
-    return expected_types, num_cores, tensor_map_mode
+    return expected_types, num_cores
 
 
 def _validate_and_group_submits(
     events: Sequence[Event],
-    tensor_map_mode: str,
 ) -> tuple[dict[tuple[int, int], list[Event]], list[int]]:
-    """按 TensorMap 模式验证每个 core/lane 的精确 full-path Submit 集合。"""
+    """验证每个 core/lane 的 Submit 不重叠，且 task 0..N-1 顺序完整一致。"""
 
     by_lane: dict[tuple[int, int], list[Event]] = defaultdict(list)
     for event in events:
@@ -327,22 +319,7 @@ def _validate_and_group_submits(
         extra = sorted(set(by_lane) - expected_lane_keys)
         raise ValueError(f"Submit core/lane IDs are incomplete: missing={missing} extra={extra}")
 
-    logical_task_ids = sorted(
-        {submit.task_id for submits in by_lane.values() for submit in submits}
-    )
-    if (
-        not logical_task_ids
-        or logical_task_ids != list(range(logical_task_ids[-1] + 1))
-    ):
-        raise ValueError(
-            "global logical Submit task IDs are not contiguous 0..N-1: "
-            f"{logical_task_ids}"
-        )
-    if tensor_map_mode == "shared" and len(logical_task_ids) % len(TASK_KIND_NAMES) != 0:
-        raise ValueError(
-            "shared logical Submit task count must contain complete five-task batches"
-        )
-
+    reference_task_ids: list[int] | None = None
     for lane_key, submits in by_lane.items():
         submits.sort(key=lambda event: (event.start_cycle, event.end_cycle, event.row_index))
         for previous, current in zip(submits, submits[1:]):
@@ -354,25 +331,19 @@ def _validate_and_group_submits(
         task_ids = [event.task_id for event in submits]
         if len(task_ids) != len(set(task_ids)):
             raise ValueError(f"core/lane {lane_key} has duplicate Submit task IDs")
-        core_id = lane_key[0]
-        if tensor_map_mode == "private":
-            expected_task_ids = logical_task_ids
-        else:
-            expected_task_ids = [
-                task_id
-                for task_id in logical_task_ids
-                if task_id % len(TASK_KIND_NAMES) != 0
-                or SHARED_ALLOC_OWNER_BY_SHARD[task_id % len(SHARED_ALLOC_OWNER_BY_SHARD)]
-                == core_id
-            ]
-        if task_ids != expected_task_ids:
+        if reference_task_ids is None:
+            if not task_ids or task_ids != list(range(task_ids[-1] + 1)):
+                raise ValueError(
+                    f"core/lane {lane_key} Submit task IDs are not contiguous 0..N-1: {task_ids}"
+                )
+            reference_task_ids = task_ids
+        elif task_ids != reference_task_ids:
             raise ValueError(
-                f"core/lane {lane_key} Submit task IDs do not match "
-                f"{tensor_map_mode} full-path set: expected={expected_task_ids}, "
-                f"actual={task_ids}"
+                f"core/lane {lane_key} Submit task IDs do not match the common task stream"
             )
 
-    return by_lane, logical_task_ids
+    assert reference_task_ids is not None
+    return by_lane, reference_task_ids
 
 
 def _associate_exclusive_children(
@@ -819,7 +790,7 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
     for index, row in enumerate(rows):
         rows[index] = _event_from_row(index, row)
     events = cast(list[Event], rows)
-    core_types, num_cores, tensor_map_mode = _validate_capture_identity(
+    core_types, num_cores = _validate_capture_identity(
         trace_schema_version, metadata, events
     )
     if len(core_by_block_lane) != num_cores or set(core_by_block_lane.values()) != set(
@@ -827,9 +798,7 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
     ):
         raise ValueError("block/lane to core mapping is incomplete")
 
-    submits_by_lane, logical_task_ids = _validate_and_group_submits(
-        events, tensor_map_mode
-    )
+    submits_by_lane, task_ids = _validate_and_group_submits(events)
     exclusive_phases = _exclusive_phases(trace_schema_version)
     submit_partition_names = _submit_partition_metrics(trace_schema_version)
     role_metric_names = _role_metrics(trace_schema_version)
@@ -1025,7 +994,6 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
     all_submits = [
         submit for submits in submits_by_lane.values() for submit in submits
     ]
-    profiled_submit_counts = [len(submits) for submits in submits_by_lane.values()]
     global_start = min(submit.start_cycle for submit in all_submits)
     global_end = max(submit.end_cycle for submit in all_submits)
 
@@ -1061,8 +1029,7 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
         "dropped_records": 0,
         "core_ids_complete": True,
         "role_map_complete": True,
-        "logical_task_ids_contiguous": True,
-        "submit_task_ids_match_tensor_map_mode": True,
+        "task_ids_contiguous_and_equal_per_core": True,
         "exclusive_child_task_ids_match_parent": True,
         "submit_non_overlapping_per_core_lane": True,
         "submit_partition_exact": True,
@@ -1098,8 +1065,7 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
             "not a standalone business phase"
         ),
         "between_submit_residual": (
-            "unattributed gap from one recorded full-path Submit end to the next "
-            "Submit begin; in shared mode this also contains skipped Alloc early returns"
+            "unattributed gap from one Submit end to the next Submit begin"
         ),
         "efdrain_children": ["KernelUnion", "EfDrainControl"],
         "overlay_phases": list(OVERLAY_PHASES),
@@ -1126,13 +1092,6 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
                     "AllocComplete",
                     "FinalDrain",
                 ],
-                "shared_alloc_owner_by_shard": list(
-                    SHARED_ALLOC_OWNER_BY_SHARD
-                ),
-                "shared_early_return_accounting": (
-                    "a skipped leading Alloc is covered by OrchestrationSetup; "
-                    "later skipped Alloc tasks are covered by BetweenSubmitResidual"
-                ),
             }
         )
 
@@ -1143,13 +1102,7 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
             "trace_schema_version": trace_schema_version,
             "clock_freq_hz": frequency_hz,
             "core_count": num_cores,
-            "tensor_map_mode": tensor_map_mode,
-            "logical_task_count": len(logical_task_ids),
-            "profiled_submit_count_per_core": {
-                "min": min(profiled_submit_counts),
-                "max": max(profiled_submit_counts),
-            },
-            "profiled_submit_count_total": len(all_submits),
+            "task_count_per_core": len(task_ids),
             "event_count": len(events),
         },
         "validation": validation,
@@ -1159,10 +1112,7 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
             "end_cycle": global_end,
             "duration_cycles": global_end - global_start,
             "duration_us": (global_end - global_start) * 1_000_000 / frequency_hz,
-            "semantics": (
-                "cross-core wall-clock envelope of recorded full-path Submit spans; "
-                "not aggregate core-work"
-            ),
+            "semantics": "cross-core wall-clock envelope; not aggregate core-work",
         },
         "aggregate_core_work": {
             "metrics_cycles": aggregate_metrics,

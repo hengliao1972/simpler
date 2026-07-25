@@ -507,13 +507,8 @@ struct PmuValidation {
 // 高水位作为保守拒绝阈值；它只降低风险，不把“未越线”表述成回卷证明。
 constexpr uint32_t kProgrammableCounterRiskThreshold = UINT32_MAX / 4U;
 
-uint32_t ExpectedSubmitPmuPhaseCallsPerWorker(uint32_t worker, uint32_t batches) {
-    // private 的 running phase 仍覆盖每核五类 Submit。shared 只有固定
-    // shard owner 进入 Alloc 的 Claim/后续阶段，其余四类 task 仍逐核进入；
-    // 直接复用语义校验的 owner oracle，避免 PMU 与调度拓扑各维护一份映射。
-#if !PTO_FDWIC_SHARED_MAP
-    (void)worker;
-#endif
+uint32_t ExpectedSubmitPmuPhaseCallsPerWorker(uint32_t batches) {
+    // 当前所有 running phase 都覆盖每个 worker 的每次 Submit，固定为 5B。
     switch (pa_scheduler::kCompiledSubmitPmuPhase) {
     case pa_scheduler::SubmitPmuPhase::None:
         return 0U;
@@ -521,14 +516,7 @@ uint32_t ExpectedSubmitPmuPhaseCallsPerWorker(uint32_t worker, uint32_t batches)
     case pa_scheduler::SubmitPmuPhase::EfDrain:
     case pa_scheduler::SubmitPmuPhase::Materialize:
     case pa_scheduler::SubmitPmuPhase::Register:
-#if PTO_FDWIC_SHARED_MAP
-        return batches * (pa_scheduler::kTasksPerBatch - 1U) +
-            static_cast<uint32_t>(
-                pa_scheduler::host::ExpectedSharedAllocAttempts(worker, batches)
-            );
-#else
         return batches * pa_scheduler::kTasksPerBatch;
-#endif
     case pa_scheduler::SubmitPmuPhase::Count:
         break;
     }
@@ -585,7 +573,7 @@ bool ValidatePmu(
     for (uint32_t worker = 0; worker < pa_scheduler::kWorkers; ++worker) {
         const pa_scheduler::WorkerResult &result = state.results[worker];
         const uint32_t expected_phase_calls_per_worker =
-            ExpectedSubmitPmuPhaseCallsPerWorker(worker, state.config.batches);
+            ExpectedSubmitPmuPhaseCallsPerWorker(state.config.batches);
         const uint32_t status = result.pmu_status;
         const uint32_t core_id = StatusCoreId(status);
         const bool record_trusted = (status & kStatusRequired) == kStatusRequired;
@@ -1116,13 +1104,6 @@ bool ExportPmuJson(
     WriteJsonString(output, options.kernel_path);
     std::fputs(",\"build_variant\":\"submit-pmu\",\"build_variant_id\":2,\"compiled_phase\":", output);
     WriteJsonString(output, SubmitPmuPhaseName(pa_scheduler::kCompiledSubmitPmuPhase));
-    std::fputs(",\"tensor_map_mode\":", output);
-    WriteJsonString(
-        output,
-        pa_scheduler::kCompiledTensorMapMode == pa_scheduler::TensorMapBuildMode::Private
-            ? "private"
-            : "shared"
-    );
     std::fprintf(
         output, ",\"compiled_phase_id\":%u",
         static_cast<uint32_t>(pa_scheduler::kCompiledSubmitPmuPhase)
@@ -1410,7 +1391,7 @@ bool ExportPmuJson(
             result.pmu_phase_begin_reads == result.pmu_phase_calls &&
             result.pmu_phase_end_reads == result.pmu_phase_calls;
         const uint32_t expected_phase_calls =
-            ExpectedSubmitPmuPhaseCallsPerWorker(worker, state.config.batches);
+            ExpectedSubmitPmuPhaseCallsPerWorker(state.config.batches);
         std::fprintf(
             output,
             "%s{\"worker_id\":%u,\"physical_core_id\":%u,\"role\":\"%s\",\"block_id\":%u,"

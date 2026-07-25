@@ -607,48 +607,10 @@ inline bool ClockRecordSchemaValid(const TraceRecord &record) {
 
 // shared PA Case1 不再执行 ordinary-region PrepareMap，但为保持现有 raw
 // schema 仍写一条零时长 marker。这里直接在 host 已有 raw 扫描中闭合
-inline void ExpectedTraceTopology(
-    uint32_t worker, int32_t *block_id, int32_t *lane
-) {
-    if (worker < kAicWorkers) {
-        *block_id = static_cast<int32_t>(worker);
-        *lane = 0;
-        return;
-    }
-    const uint32_t vector_id = worker - kAicWorkers;
-    *block_id = static_cast<int32_t>(vector_id / 2);
-    *lane = static_cast<int32_t>(1 + vector_id % 2);
-}
-
-#if PTO_FDWIC_SHARED_MAP
-inline bool ExpectedSharedAllocCandidate(
-    uint32_t worker, uint32_t task_id
-) {
-    if (worker >= kWorkers || task_id >= kTaskCellCapacity ||
-        task_id % kTasksPerBatch != 0) {
-        return false;
-    }
-    int32_t block_id = -1;
-    int32_t lane = -1;
-    ExpectedTraceTopology(worker, &block_id, &lane);
-    const uint32_t shard = task_id % kCursorShards;
-    return block_id == static_cast<int32_t>(shard) &&
-        lane == static_cast<int32_t>(shard % 3U);
-}
-#endif
-
 // Claim -> Materialize -> PrepareMap -> Submit 身份、顺序与次数，不增加任何
-// device 记录字段。shared Alloc 非候选没有这四条记录；validator 根据
-// worker 拓扑跳过且只跳过这些已证明的早退 task。private 的 PrepareMap
-// 是真实动作，因此编译为无约束 validator。
+// device 记录字段。private 的 PrepareMap 是真实动作，因此编译为无约束
+// validator。
 struct SharedPrepareMapTraceValidator {
-    explicit SharedPrepareMapTraceValidator(uint32_t worker = 0)
-        : worker_(worker) {
-#if PTO_FDWIC_SHARED_MAP
-        SkipSharedAllocEarlyReturns();
-#endif
-    }
-
     bool Observe(const TraceRecord &record) {
 #if PTO_FDWIC_SHARED_MAP
         const auto phase = static_cast<TracePhase>(record.phase);
@@ -692,7 +654,6 @@ struct SharedPrepareMapTraceValidator {
             }
             submit_pending_ = false;
             ++next_task_id_;
-            SkipSharedAllocEarlyReturns();
             ++submit_count_;
         }
 #else
@@ -724,20 +685,6 @@ struct SharedPrepareMapTraceValidator {
     }
 
 private:
-#if PTO_FDWIC_SHARED_MAP
-    void SkipSharedAllocEarlyReturns() {
-        while (next_task_id_ >= 0 &&
-               static_cast<uint32_t>(next_task_id_) < kTaskCellCapacity &&
-               next_task_id_ % static_cast<int32_t>(kTasksPerBatch) == 0 &&
-               !ExpectedSharedAllocCandidate(
-                   worker_, static_cast<uint32_t>(next_task_id_)
-               )) {
-            ++next_task_id_;
-        }
-    }
-#endif
-
-    uint32_t worker_ = 0;
     bool submit_pending_ = false;
     bool materialize_seen_ = false;
     bool marker_seen_ = false;
@@ -750,39 +697,16 @@ private:
     uint32_t submit_count_ = 0;
 };
 
-#if PTO_FDWIC_SHARED_MAP
-inline uint64_t ExpectedSharedAllocAttempts(
-    uint32_t worker, uint32_t batches
-) {
-    uint64_t attempts = 0;
-    for (uint32_t batch = 0; batch < batches; ++batch) {
-        const uint32_t task_id = batch * kTasksPerBatch;
-        attempts += ExpectedSharedAllocCandidate(worker, task_id) ? 1U : 0U;
+inline void ExpectedTraceTopology(uint32_t worker, int32_t *block_id, int32_t *lane) {
+    if (worker < kAicWorkers) {
+        *block_id = static_cast<int32_t>(worker);
+        *lane = 0;
+        return;
     }
-    return attempts;
+    const uint32_t vector_id = worker - kAicWorkers;
+    *block_id = static_cast<int32_t>(vector_id / 2);
+    *lane = static_cast<int32_t>(1 + vector_id % 2);
 }
-
-inline uint64_t ExpectedSharedAllocTaskIdSum(
-    uint32_t worker, uint32_t batches
-) {
-    uint64_t task_id_sum = 0;
-    for (uint32_t batch = 0; batch < batches; ++batch) {
-        const uint32_t task_id = batch * kTasksPerBatch;
-        if (ExpectedSharedAllocCandidate(worker, task_id)) {
-            task_id_sum += task_id;
-        }
-    }
-    return task_id_sum;
-}
-
-inline uint64_t ExpectedSharedFullPathSubmits(
-    uint32_t worker, uint32_t batches
-) {
-    return static_cast<uint64_t>(batches) *
-               (kTasksPerBatch - 1U) +
-           ExpectedSharedAllocAttempts(worker, batches);
-}
-#endif
 
 template <typename ReadRecords>
 inline bool ExportSwimlaneRecords(
@@ -871,17 +795,13 @@ inline bool ExportSwimlaneRecords(
     std::fprintf(
         output,
         "{\n\"l2_swimlane_level\":%u,\n"
-        "\"metadata\":{\"tensor_map_mode\":\"%s\","
-        "\"clock_freq_hz\":%llu,\"num_cores\":%u,"
+        "\"metadata\":{\"clock_freq_hz\":%llu,\"num_cores\":%u,"
         "\"trace_schema_version\":%u,\"final_barrier\":\"%s\","
         "\"winner_workload\":{\"mode\":\"%s\","
         "\"counts\":{\"qk\":%u,\"sf\":%u,\"pv\":%u,\"up\":%u},"
         "\"unit\":\"%s\",\"input_pattern\":\"%s\","
         "\"engine_mapping\":%s},\"core_types\":[",
         atomic_trace_enabled ? 4U : 1U,
-        kCompiledTensorMapMode == TensorMapBuildMode::Private
-            ? "private"
-            : "shared",
         static_cast<unsigned long long>(header.frequency_hz), kWorkers, 4U,
         FinalBarrierShapeName(final_barrier_shape),
         workload_mode == WinnerWorkloadMode::RealCompute ? "real-compute" : "scalar-nop",
@@ -953,7 +873,7 @@ inline bool ExportSwimlaneRecords(
         bool dependency_applied = false;
         bool direct_result_used_return_ready = false;
         bool direct_result_used_source_issue = false;
-        SharedPrepareMapTraceValidator prepare_map_validator(worker);
+        SharedPrepareMapTraceValidator prepare_map_validator;
         for (uint32_t index = 0; index < available; ++index) {
             const TraceRecord &record = scratch[index];
             const bool atomic_record = record.phase == static_cast<int32_t>(TracePhase::Atomic);
@@ -1135,7 +1055,7 @@ inline bool AnalyzeSwimlaneRecords(
     uint64_t clock_dependency_applied[2] = {};
     std::vector<TraceRecord> scratch(kTraceRecordsPerCore);
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
-        SharedPrepareMapTraceValidator prepare_map_validator(worker);
+        SharedPrepareMapTraceValidator prepare_map_validator;
         const uint32_t available = header.cores[worker].count;
         const uint32_t count = std::min(available, header.records_per_core);
         if (count != 0 && !read_records(worker, count, scratch.data())) {
@@ -1867,34 +1787,17 @@ inline Metrics Validate(
     const SchedulerState &state, uint32_t run, double host_us, const TraceHeader *trace_header = nullptr
 ) {
     Metrics metrics;
-    // 每个 worker 都回放全部 task。shared Alloc 每个 batch 只让绑定
-    // alloc-cursor shard 的唯一 worker 执行 atomicMax；private Alloc
-    // 仍由 96 个 worker 竞争。其余 kernel task 只有与 active role
-    // 匹配的 AIC 或 AIV 参与 Claim。
+    // 每个 worker 都回放全部 task。Alloc 由 96 个 worker 全部执行 atomicMax Claim；
+    // 其余 kernel task 只有与 active role 匹配的 AIC 或 AIV 参与 Claim。
     const uint32_t batches = state.config.batches;
     const uint32_t task_count = batches * kTasksPerBatch;
     const bool final_barrier_shape_valid =
         state.config.final_barrier_shape <= static_cast<uint32_t>(FinalBarrierShape::ThreeLevel6x4x4);
     const auto final_barrier_shape = static_cast<FinalBarrierShape>(state.config.final_barrier_shape);
     const uint64_t expected_submits = static_cast<uint64_t>(kWorkers) * task_count;
-    const uint64_t expected_full_path_submits =
-#if PTO_FDWIC_SHARED_MAP
-        static_cast<uint64_t>(batches) *
-        (static_cast<uint64_t>(kWorkers) * (kTasksPerBatch - 1U) + 1U);
-#else
-        expected_submits;
-#endif
     const uint64_t expected_claims =
-        static_cast<uint64_t>(batches) *
-#if PTO_FDWIC_SHARED_MAP
-        (1U + kAicWorkers + kAivWorkers + kAicWorkers + kAivWorkers);
-    // shared 依次对应唯一 Alloc 候选、QK、SF、PV、UP，默认
-    // 256 batch 为 49,408 次真实 atomicMax。
-#else
-        (kWorkers + kAicWorkers + kAivWorkers + kAicWorkers + kAivWorkers);
-    // private 的 Alloc 保持 96-worker 竞争，默认 256 batch 为
-    // 73,728 次真实 atomicMax。
-#endif
+        static_cast<uint64_t>(batches) * (kWorkers + kAicWorkers + kAivWorkers + kAicWorkers + kAivWorkers);
+    // 上式依次对应 Alloc、QK、SF、PV、UP 的 active worker 数，默认 256 batch 时为 73728。
 
     // 聚合量分为调度核心计数、kernel 分布、前端操作数和最终状态四组，便于定位语义偏差。
     uint64_t first_submit = UINT64_MAX;
@@ -1962,7 +1865,6 @@ inline Metrics Validate(
     bool frontend_worker_counts_ok = true;
     bool final_worker_state_ok = true;
     bool worker_checksums_ok = true;
-    bool claim_worker_counts_ok = true;
 #if !PTO_FDWIC_SHARED_MAP
     uint64_t private_logical_map_signature = 0;
 #endif
@@ -1971,15 +1873,8 @@ inline Metrics Validate(
     bool role_kernel_routing_ok = true;
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
     bool compete_first_split_runtime_oracle_ok = true;
-    const uint64_t all_task_id_sum =
+    const uint64_t expected_split_task_id_sum =
         static_cast<uint64_t>(task_count) * (task_count - 1U) / 2U;
-#if PTO_FDWIC_SHARED_MAP
-    const uint64_t all_alloc_task_id_sum =
-        batches == 0
-            ? 0
-            : static_cast<uint64_t>(kTasksPerBatch) * batches *
-                  (batches - 1U) / 2U;
-#endif
 #endif
 
     // private 按连续逻辑 heap 重建逐 task prefix；shared 只按 task_id%8
@@ -2159,19 +2054,6 @@ inline Metrics Validate(
         submits += result.submits;
         claims += result.claim_attempts;
         wins += result.claim_wins;
-#if PTO_FDWIC_SHARED_MAP
-        const uint64_t expected_alloc_attempts =
-            ExpectedSharedAllocAttempts(index, batches);
-        claim_worker_counts_ok &=
-            result.claim_attempts ==
-                static_cast<uint64_t>(batches) * 2U +
-                    expected_alloc_attempts &&
-            result.wins[static_cast<uint32_t>(TaskKind::Alloc)] ==
-                expected_alloc_attempts;
-#else
-        claim_worker_counts_ok &=
-            result.claim_attempts == static_cast<uint64_t>(batches) * 3U;
-#endif
         if (result.claim_wins != 0) ++winning_workers;
         max_worker_wins = std::max(max_worker_wins, result.claim_wins);
         heap_guards += result.heap_guards;
@@ -2199,16 +2081,6 @@ inline Metrics Validate(
         fanin_edges += result.fanin_edges;
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
         const CoreRole expected_role = index < kAicWorkers ? CoreRole::Aic : CoreRole::Aiv;
-#if PTO_FDWIC_SHARED_MAP
-        const uint64_t expected_split_finish_calls =
-            ExpectedSharedFullPathSubmits(index, batches);
-        const uint64_t expected_split_task_id_sum =
-            all_task_id_sum - all_alloc_task_id_sum +
-            ExpectedSharedAllocTaskIdSum(index, batches);
-#else
-        const uint64_t expected_split_finish_calls = task_count;
-        const uint64_t expected_split_task_id_sum = all_task_id_sum;
-#endif
         compete_first_split_runtime_oracle_ok &= result.worker_id == index;
         compete_first_split_runtime_oracle_ok &=
             result.compete_first_split_caller_state_address != 0;
@@ -2216,8 +2088,7 @@ inline Metrics Validate(
             result.compete_first_split_finish_state_address ==
                 result.compete_first_split_caller_state_address;
         compete_first_split_runtime_oracle_ok &=
-            result.compete_first_split_finish_calls ==
-                expected_split_finish_calls;
+            result.compete_first_split_finish_calls == task_count;
         compete_first_split_runtime_oracle_ok &=
             result.compete_first_split_protocol_errors == 0;
         compete_first_split_runtime_oracle_ok &=
@@ -2449,13 +2320,6 @@ inline Metrics Validate(
     );
     Expect(submits == expected_submits, "replay count is workers * tasks", &metrics);
     Expect(claims == expected_claims, "Claim attempt count matches PA topology", &metrics);
-    Expect(
-        claim_worker_counts_ok,
-        kCompiledTensorMapMode == TensorMapBuildMode::Private
-            ? "private per-worker Claim attempts retain all-worker Alloc"
-            : "shared per-worker Alloc Claim attempts match fixed shard owners",
-        &metrics
-    );
     Expect(wins == task_count, "exactly one winner per task", &metrics);
     Expect(
         wins_by_kind[0] == batches && wins_by_kind[1] == batches && wins_by_kind[2] == batches &&
@@ -2771,10 +2635,8 @@ inline Metrics Validate(
     if (state.config.profile_phases != 0) {
         // profile 开关关闭时这些字段允许保持零，避免把可选诊断本身变成语义门禁。
         Expect(
-            phase_calls[static_cast<uint32_t>(ProfilePhase::Claim)] ==
-                    expected_full_path_submits &&
-                phase_calls[static_cast<uint32_t>(ProfilePhase::EfDrain)] ==
-                    expected_full_path_submits &&
+            phase_calls[static_cast<uint32_t>(ProfilePhase::Claim)] == expected_submits &&
+                phase_calls[static_cast<uint32_t>(ProfilePhase::EfDrain)] == expected_submits &&
                 phase_calls[static_cast<uint32_t>(ProfilePhase::WaitForSlot)] ==
                     static_cast<uint64_t>(batches) * 4 &&
                 phase_calls[static_cast<uint32_t>(ProfilePhase::HeapGuard)] ==
@@ -2833,15 +2695,8 @@ inline Metrics Validate(
                     trace_shape_ok &= core.atomic_calls == 0 && core.poll_calls == 0 &&
                                       core.poll_batch_records == 0;
                 }
-#if PTO_FDWIC_SHARED_MAP
-                const uint64_t worker_full_path_submits =
-                    ExpectedSharedFullPathSubmits(worker, batches);
-#else
-                const uint64_t worker_full_path_submits = result.submits;
-#endif
                 const uint64_t worker_expected =
-                    6 * worker_full_path_submits +
-                    2 * result.claim_wins - result.wins[0] +
+                    6 * result.submits + 2 * result.claim_wins - result.wins[0] +
                     2 * worker_kernels + result.wait_events[0] + result.wait_events[1] + 2 +
                     (((state.config.trace_enabled & kTraceAtomicsEnabled) != 0)
                          ? worker_physical_atomic + 2
@@ -2850,17 +2705,16 @@ inline Metrics Validate(
             }
         }
         const uint64_t expected_trace_records =
-            6 * expected_full_path_submits +
-            static_cast<uint64_t>(batches) * 17 +
+            static_cast<uint64_t>(batches) * (static_cast<uint64_t>(kWorkers) * 30 + 17) +
             trace_wait_records + 2 * kWorkers +
             (((state.config.trace_enabled & kTraceAtomicsEnabled) != 0)
                  ? physical_atomic_records + 2 * kWorkers
                  : 0);
-        // 每条 full-path Submit 固定六条记录；shared Alloc 非候选只保留
-        // 外层逻辑 submits，不进入 EfDrain/Claim/finish，因此不产生这
-        // 六条。PrepareMap 仍是零时长结构 marker，不代表 region 业务。
-        // 每 batch 另有 17 条 winner/Fanin/Kernel/Commit；两个父 span
-        // 每核固定增加 2 条，RingBp 等真实等待按运行时次数额外加入。
+        // 每 batch 的 96*30 是六条每 Submit 固定记录；shared 的
+        // PrepareMap 是零时长结构 marker，不代表 region 业务。17 条是
+        // winner/Fanin/Kernel/Commit 记录。loser 不再写额外零时长
+        // winner marker；两个父 span 再各核固定增加 2 条；
+        // RingBp 等真实等待按运行时次数额外加入。
         Expect(trace_shape_ok, "swimlane header and per-worker capacities are valid", &metrics);
         Expect(trace_dropped == 0, "swimlane records fit without drops", &metrics);
         Expect(trace_records == expected_trace_records, "swimlane record count matches PA phase flow", &metrics);

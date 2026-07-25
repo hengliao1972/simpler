@@ -338,20 +338,9 @@ __aicore__ inline void CcecOps::PmuWindowStop(
         context.phase_calls == 0 && context.begin_reads == 0 && context.end_reads == 0 &&
         context.phase_requests == 0 && context.phase_misses == 0 &&
         context.phase_elapsed_ticks == 0;
-    uint32_t expected_running_calls =
-        state->config.batches * pa_scheduler::kTasksPerBatch;
-#if PTO_FDWIC_SHARED_MAP
-    expected_running_calls =
-        state->config.batches * (pa_scheduler::kTasksPerBatch - 1U) +
-        pa_scheduler::SharedAllocOwnedTaskCount(
-            state->workers[worker_id].block_id,
-            state->workers[worker_id].lane,
-            state->config.batches
-        );
-#endif
     const bool running_shape =
         pa_scheduler::kCompiledSubmitPmuPhase != pa_scheduler::SubmitPmuPhase::None &&
-        context.phase_calls == expected_running_calls &&
+        context.phase_calls == state->config.batches * pa_scheduler::kTasksPerBatch &&
         context.begin_reads == context.phase_calls &&
         context.end_reads == context.phase_calls;
     if (none_shape || running_shape)

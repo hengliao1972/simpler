@@ -1945,7 +1945,7 @@ generation/reclaim 协议；这条保留结论不适用于可回绕实现。
 standalone 为保持现有生产 ABI 仍是单层 `alloc_cursor[4]`，不能直接复制
 参考的 `task_id%3` lane 公式，否则同一 cursor 会由不同 worker 乱序推进。
 
-当前 shared 采用“一 shard 固定一 worker”：
+S4.10a 候选采用“一 shard 固定一 worker”：
 
 ```text
 shard 0 -> worker 0   (block 0, AIC)
@@ -1995,7 +1995,7 @@ b256 独立进程后：
 `+49.152us / +1.514%`。也就是说，24,320 次 `ClaimMax` 的物理消减已经
 由计数严格证明，但没有转化成完整 Submit 收益，反而发生稳定小幅回退。
 
-当前 4-shard 固定 owner 还使 12 个正式样本的
+该 4-shard 固定 owner 候选还使 12 个正式样本的
 `max_wins_per_worker` 从基线 32～37 增至候选 75～81，并让 mixed ELF
 `.text` 增加 256B；perf-clock 无法把回退唯一拆给 winner 集中或代码布局，
 不能把其中任一项写成已证明的单一原因。完整日志位于：
@@ -2011,36 +2011,58 @@ split-finish、普通阶段和局部 PMU 调用数按真实早退精确减少。
 与 `e83283f6` 的对照只解释早退增量，最终必须相对 `e8320280` 取得净收益；
 否则整个候选方案应撤销，不能只以 atomic 次数下降作为保留理由。
 
-#### 7.5.21 shared Alloc 非候选在 Claim 前完整早退
+#### 7.5.21 S4.10b 完整早退实测与整套 S4.10 撤销结论
 
-S4.10b 保留 S4.10a 已经证明的 49,408 次 b256 Claim 拓扑，但把 95/96 的
-Alloc 非候选从 EfDrain 之前直接返回。调用方三项 Output 构参、稳定
-shared handle、连续逻辑 task id、首末 perf/PMU 边界均保留；被删除的是
-没有业务效果的内部 full-path 阶段与 split finish，不再为它们伪造泳道
-记录。
+S4.10b 提交 `f41e2833` 在 S4.10a 的 4-owner 规则上继续前移 shared Alloc
+非候选早退。所有 worker 仍建立逻辑 task、构造三个 Output 参数并创建稳定
+shared symbol handle；只有 owner 继续执行 EfDrain、Claim 和 generic
+finish。外层逻辑 Submit 仍为每核 `5×batches`，首个 Submit 起点和末个
+Submit 终点也保持不变；普通泳道、局部 PMU 和 host oracle 则按真实进入
+full path 的调用数改为 `4×batches + owned_alloc`。
 
-因此 atomic 次数本身不再继续下降：b1 `ClaimMax=193`，b256
-`ClaimMax=49,408`，与 S4.10a 相同。本步观察到的变量是围绕这些非候选的
-scalar 控制流。b1 六个固定阶段从每类 480 条降为每类 385 条；b256
-full-path Submit 从 122,880 降为 98,560。外层逻辑 submits 仍为
-122,880，不能把两组数字混用。
+这一步没有扩大 raw ABI。shared b1 的普通泳道实测为 3,458 条 raw、零
+drop；六类 full-path span 每类各 385 条，`ClaimMax` 仍为 193 条。b256
+claim PMU 的 full-path 总数为 98,560：92 个非 owner 核各 1,024 次，
+4 个 owner 核各 1,088 次。CPU shared/private、CCEC 14 种构建组合以及
+A5 shared b1/b256 的 heap、symbol、依赖、输出 tile、split-finish 和
+逐核计数门禁均通过。这证明完整早退的功能语义和稀疏观察口径成立，但不能
+替代性能门槛。
 
-A5 b1 atomic 泳道有 3,458 条 raw、零丢失，Claim/Submit key 严格相等；
-排他报告按 shared owner 精确接受每核 4～5 条记录。实际产物位于：
+clean `f41e2833` 冻结 ELF 的 `.text` 为 130,104B；相对 S4.10a
+`e83283f6` 增加 768B，相对 S4.9 `e8320280` 增加 1,024B。两组冻结件
+都先各预热 2 次，再跑 6 个交替 ABBA/BAAB block，每版 12 个正式 b256
+独立进程：
+
+| 对照 | 基线中位数 | S4.10b 中位数 | block 配对差中位数 | block 胜负 |
+| --- | ---: | ---: | ---: | ---: |
+| S4.10a `e83283f6` | 3.292ms | 3.310ms | `+17.885us / +0.543%` | 1 快 / 5 慢 |
+| S4.9 `e8320280` | 3.250ms | 3.315ms | `+62.879us / +1.934%` | 0 快 / 6 慢 |
+
+原始日志和机器可读汇总位于：
 
 ```text
-outputs/pa_scheduler_shared_swimlane_20260725_110831_2370447/
+outputs/perf_clock_pair_f41e2833_vs_e83283f6_20260725_112141/
+outputs/perf_clock_pair_f41e2833_vs_e8320280_20260725_112548/
 ```
 
-submit-PMU 的 b1 四个 running phase 均精确为 385 次；b256 claim 为
-98,560 次，其中 92 核各 1,024，worker 0/3/34/37 各 1,088。private b1
-claim 仍为 480。raw/HTML 位于：
+S4.10b 相对 S4.10a 的完整早退没有收回前一小步的回退，反而继续回退；
+整套 S4.10 相对 S4.9 的净回退约为 1.93%。配对还观察到固定 owner 使
+`max_wins_per_worker` 长期集中到约 73～82，而 S4.9 的一组对照为
+30～49；不同配对轮次的 fanin 和活跃 tile 也同步变化。它们只作为已证实
+的伴随现象，不能由 perf-clock 唯一拆成单一因果。
 
-```text
-outputs/submit_pmu_s410b_20260725_1115/
-```
+因此按预先声明的净收益门槛，撤销 S4.10a 与 S4.10b：恢复 shared Alloc
+由 96 worker 竞争的 S4.9 路径，同时删除为稀疏 full-path 观察新增的
+converter/analyzer/PMU 分支。保留本节实验记录，避免未来仅凭“atomic 次数
+减少”再次引入同类回退。若以后重新研究唯一候选，应先采用参考实现那样的
+多 lane×多 shard 分散 owner 和匹配的 cursor ABI，作为独立架构实验重新
+建立正确性及冻结配对证据。
 
-这些结果证明观察口径与真实控制流一致，但尚不证明性能收益。当前 shared
-perf-clock `.text` 比 S4.10a 增加 768B，单轮 b256 仍为 3.300ms；
-必须在 clean 实现提交后同时对照 `e83283f6` 和 `e8320280`。若相对 S4.9
-没有净收益，整个 S4.10 应撤销，而不是因为 ClaimMax 较少就保留。
+撤销后的非文档文件与 `e8320280` 逐字节相同。用户 `.venv` 下 85 项
+PMU/converter/exclusive analyzer 测试、CPU shared/private b1/b256、
+CCEC shared/private 的普通与 perf-clock 四种构建，以及 A5 shared
+b1/b256、private b1 均通过。重新构建的 shared perf-clock
+`.text=129,080B`，host/kernel SHA 与 S4.9 冻结件完全相同；A5 b256
+单轮为 3.233ms，Claim 恢复到 73,728，96 个 worker 均有 winner，
+`max_wins_per_worker=35`。这条单轮只作为恢复身份与量级检查；S4.10
+撤销决定仍以此前 12+12 样本的冻结配对为依据。

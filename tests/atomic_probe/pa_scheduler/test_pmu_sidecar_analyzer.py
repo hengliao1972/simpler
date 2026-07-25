@@ -213,11 +213,7 @@ def _capture(offset: int = 0, window: str = "submit-all") -> dict[str, Any]:
 
 
 def _submit_pmu_capture(
-    offset: int = 0,
-    phase: str = "claim",
-    schema_version: int = 5,
-    tensor_map_mode: str = "private",
-    batches: int = 2,
+    offset: int = 0, phase: str = "claim", schema_version: int = 5
 ) -> dict[str, Any]:
     phase_ids = {
         "none": 0,
@@ -227,6 +223,7 @@ def _submit_pmu_capture(
         "register": 5,
     }
     phase_id = phase_ids[phase]
+    batches = 2
     records: list[dict[str, Any]] = []
     for worker_id in range(A5_WORKERS):
         role = "aic" if worker_id < A5_AIC_WORKERS else "aiv"
@@ -234,17 +231,7 @@ def _submit_pmu_capture(
         block_id = worker_id if role == "aic" else vector_id // 2
         lane = 0 if role == "aic" else 1 + vector_id % 2
         base = 100 + worker_id * 10 + offset
-        shared_alloc_calls = 0
-        for batch in range(batches):
-            shard = (batch * TASKS_PER_BATCH) % 4
-            shared_alloc_calls += (block_id, lane) == (shard, shard % 3)
-        calls_per_worker = (
-            0
-            if phase == "none"
-            else batches * TASKS_PER_BATCH
-            if tensor_map_mode == "private"
-            else batches * (TASKS_PER_BATCH - 1) + shared_alloc_calls
-        )
+        calls_per_worker = 0 if phase == "none" else batches * TASKS_PER_BATCH
         primary_requests = 1000 + base
         primary_misses = 100 + base // 10
         phase_requests = 0 if calls_per_worker == 0 else 100 + worker_id * 10 + offset
@@ -342,7 +329,6 @@ def _submit_pmu_capture(
         "configuration": {
             "build_variant": "submit-pmu",
             "build_variant_id": 2,
-            "tensor_map_mode": tensor_map_mode,
             "compiled_phase": phase,
             "compiled_phase_id": phase_id,
             "device": 0,
@@ -889,90 +875,6 @@ class PmuSidecarAnalyzerTest(unittest.TestCase):
                     )
                     with self.assertRaisesRegex(ValueError, "phase_calls does not match"):
                         load_capture(path)
-
-    def test_submit_pmu_phase_calls_follow_tensor_map_mode_for_b1_and_b256(self) -> None:
-        cases = (
-            ("private", 1, 480),
-            ("private", 256, 122880),
-            ("shared", 1, 385),
-            ("shared", 256, 98560),
-        )
-        shared_owner_by_shard = (0, 34, 37, 3)
-        for mode, batches, global_calls in cases:
-            with self.subTest(mode=mode, batches=batches):
-                capture = _submit_pmu_capture(
-                    phase="claim", tensor_map_mode=mode, batches=batches
-                )
-                records = capture["records"]
-                self.assertEqual(
-                    sum(record["phase_expected_calls"] for record in records),
-                    global_calls,
-                )
-                for worker, record in enumerate(records):
-                    expected = batches * TASKS_PER_BATCH
-                    if mode == "shared":
-                        expected = batches * (TASKS_PER_BATCH - 1) + sum(
-                            shared_owner_by_shard[
-                                (batch * TASKS_PER_BATCH) % len(shared_owner_by_shard)
-                            ]
-                            == worker
-                            for batch in range(batches)
-                        )
-                    self.assertEqual(record["phase_expected_calls"], expected)
-                with tempfile.TemporaryDirectory() as directory:
-                    path = self._write(
-                        directory, f"{mode}-b{batches}.json", capture
-                    )
-                    load_capture(path)
-
-    def test_submit_pmu_rejects_unknown_tensor_map_mode(self) -> None:
-        capture = _submit_pmu_capture()
-        capture["configuration"]["tensor_map_mode"] = "shared-ish"
-        with tempfile.TemporaryDirectory() as directory:
-            path = self._write(directory, "invalid-tensor-map-mode.json", capture)
-            with self.assertRaisesRegex(ValueError, "tensor_map_mode"):
-                load_capture(path)
-
-    def test_submit_pmu_none_is_zero_for_private_and_shared(self) -> None:
-        for mode in ("private", "shared"):
-            for batches in (1, 256):
-                with self.subTest(mode=mode, batches=batches):
-                    capture = _submit_pmu_capture(
-                        phase="none", tensor_map_mode=mode, batches=batches
-                    )
-                    self.assertTrue(
-                        all(
-                            record["phase_expected_calls"] == 0
-                            for record in capture["records"]
-                        )
-                    )
-                    with tempfile.TemporaryDirectory() as directory:
-                        path = self._write(
-                            directory, f"none-{mode}-b{batches}.json", capture
-                        )
-                        load_capture(path)
-
-    def test_submit_pmu_shared_rejects_wrong_per_worker_expected_count(self) -> None:
-        capture = _submit_pmu_capture(
-            phase="claim", tensor_map_mode="shared", batches=256
-        )
-        capture["records"][34]["phase_expected_calls"] -= 1
-        with tempfile.TemporaryDirectory() as directory:
-            path = self._write(directory, "shared-wrong-count.json", capture)
-            with self.assertRaisesRegex(ValueError, "phase_expected_calls"):
-                load_capture(path)
-
-    def test_submit_pmu_valid_but_wrong_tensor_map_mode_is_rejected_by_raw_counts(
-        self,
-    ) -> None:
-        capture = _submit_pmu_capture(
-            phase="claim", tensor_map_mode="private", batches=256
-        )
-        capture["configuration"]["tensor_map_mode"] = "shared"
-        with tempfile.TemporaryDirectory() as directory:
-            path = self._write(directory, "wrong-valid-mode.json", capture)
-            with self.assertRaisesRegex(ValueError, "phase_expected_calls"):
-                load_capture(path)
 
     def test_submit_pmu_efdrain_is_an_independent_phase(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

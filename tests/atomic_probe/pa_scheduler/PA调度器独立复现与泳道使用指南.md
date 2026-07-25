@@ -433,12 +433,9 @@ cursor/vend、symbol writer/published 等尚未逐条接入 atomic 泳道 wrappe
 所以这一版泳道不能声称完整列出了 shared 协议 atomic，也不能从现有事件拆出
 shared heap 或 symbol 单指令成本。这不影响 host 对 cursor/vend、descriptor、
 输出符号、依赖边和规范化 writer 签名的独立校验。为复用现有 analyzer，
-shared 泳道为每个进入完整调度主体的 Submit 写一条零时长 `PrepareMap`
-结构 marker；Alloc 非候选在主体前早退，不伪造 Claim、PrepareMap 或
-Submit 记录。外层逻辑回放仍是每核 `5*batches` 次，早退缺口由
-`OrchestrationSetup` 或 `BetweenSubmitResidual` 使用既有父边界闭合。该
-marker 不读钟、不访问 region sidecar，且在 perf-clock/submit-PMU 构建中
-编译消除，不能把它解读为 shared 模式仍有 PrepareMap 业务开销。
+shared 泳道仍为每个 Submit 写一条零时长 `PrepareMap` 结构 marker；它不
+读钟、不访问 region sidecar，且在 perf-clock/submit-PMU 构建中编译消除，
+不能把该 marker 解读为 shared 模式仍有 PrepareMap 业务开销。
 
 ## 5. 使用说明：运行、测量与泳道查看
 
@@ -1030,7 +1027,7 @@ PMU context 而采用 inline-finish 诊断 ELF。因此后两者与 `none`
 | `claim` | 1 | 每次 `Claim()` 调用前后读取 shadow counter | 验证局部归因链路，输出带观察扰动的 running read-clear 下界和保守上界 |
 | `efdrain` | 2 | Submit 开头唯一的 EfDrain call-site 前后 | 归因 opportunistic drain，不包含 RingBackpressure/FinalDrain |
 | `materialize` | 4 | 每次 `MaterializeTask()` 调用前后 | 归因 descriptor materialize；成功和失败出口都由同一闭合边界覆盖 |
-| `register` | 5 | 每次进入完整调度主体的 `RegisterOutputs()` 调用前后 | 归因输出注册；Alloc 与非 Alloc 两个互斥调用点合起来仍是每条 full-path Submit 一次 |
+| `register` | 5 | 每次 `RegisterOutputs()` 调用前后 | 归因输出注册；Alloc 与非 Alloc 两个互斥调用点合起来仍是每次 Submit 一次 |
 
 分别构建：
 
@@ -1199,24 +1196,20 @@ phase miss    ∈ [observed miss,    observed miss    + miss loss]
 区间必须逐核构造后再聚合。CNT8/CNT5 是顺序 `ld_dev` 而非原子配对快照，
 不要求局部 `phase miss <= phase request`；只要求二者分别不超过对应 shadow，
 上界分别不超过对应 primary。`none` 中 phase calls/begin/end/request/miss 必须
-全为 0；其余四个 phase 的每核 begin/end/calls 都必须配对。private 每核
-固定为 `5*batches`，全局为 `5*batches*96`；shared 的 Alloc 非候选在
-这些边界之前返回，因此每核为
-`4*batches + 本核拥有的 Alloc 数`，全局为
-`batches*(4*96+1)`。外层逻辑 Submit 计数仍为每核 `5*batches`，不能把
-PMU phase 次数减少误写成少回放了 task。`efdrain` 插点只允许包围 Submit
-开头的专属调用，
+全为 0；其余四个 phase 的每核 begin/end/calls 都必须配对，且每核 calls 固定为
+`batches * 5`，全局为 `batches * 5 * 96`。原因是每个 batch 固定提交
+Alloc/QK/SF/PV/UP 五个 task，每次 Submit 都恰好执行一次 Claim、开头 EfDrain、
+Materialize 和 Register 边界。`efdrain` 插点只允许包围 Submit 开头的专属调用，
 不能插入复用的 `DrainReady()` 函数体；`materialize` 必须先保存真实返回值再关闭
 边界，保证失败出口也闭合；`register` 的 Alloc 与非 Alloc 两个源码调用点互斥，
-不能误算成每条 full-path Submit 两次。每个 running phase 还要求每核
+不能误算成每次 Submit 两次。每个 running phase 还要求每核
 `phase_elapsed_ticks > 0`且不超过同核从首个 `submit_begin` 计时点
 到末个 `submit_end` 计时点的 `submit_elapsed_ticks`；前者位于首个
 `BeginCallbackSubmit()` 上下文初始化之后，后者位于末个 Submit 返回之前。
 `none` 的 phase elapsed 必须精确为 0。
 当前 Case1 中真实 TensorMap insert 工作主要发生在
 UP 的输出注册，其他 task 的 Register 可能很短或没有 insert；因此该 phase 的
-调用数只证明边界覆盖了应进入调度主体的路径，不能解释为五类 task 拥有
-等量注册工作。
+固定调用数只证明边界覆盖完整，不能解释为五类 task 拥有等量注册工作。
 
 局部边界读取本身会增加 scalar 指令、改变 I-cache 布局和多核时序，
 因此所有非 `none` phase 都是带边界扰动的归因结果。`none` 与每个局部 phase
