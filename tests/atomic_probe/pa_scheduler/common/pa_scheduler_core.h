@@ -1364,6 +1364,13 @@ PA_DEVICE bool BuildCallbackSubmitArgs(
 
 #undef PA_CALLBACK_LAMBDA_DEVICE
 
+template <typename Ops, bool Profile, bool RecordSubmit>
+PA_DEVICE void CompleteLogicalCallbackSubmit(
+    LocalStats &stats, uint32_t task_id, uint32_t task_count,
+    uint64_t submit_begin, int32_t function_id, bool winner,
+    bool is_alloc
+);
+
 template <typename Ops, bool Profile, typename PmuContext>
 PA_DEVICE bool FinishCallbackSubmitBody(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_count,
@@ -1376,9 +1383,9 @@ PA_DEVICE bool FinishCallbackSubmitBody(
     const bool winner = ticket.won != 0;
 
 #if PTO_FDWIC_SHARED_MAP
-    // callback 已经返回；只有 Claim winner 才把 CreateInfo 物化为 descriptor
-    // 并预留 shared heap。所有 replay actor 都仍进入 split finish、闭合固定
-    // span 和 Submit 计数，但不会推进 heap、写 payload 或读取 TaskArgs。
+    // shared Claim loser 已在 caller 中直接返回稳定 output symbol，不会进入
+    // 本 generic finish。到达这里的只有 winner：callback 已经返回，随后把
+    // CreateInfo 物化为 descriptor、预留 shared heap 并建立可执行状态。
     // PA Case1 的普通 region 恒为空，winner 不再等待全局 exact turn；
     // 跨 task 顺序只由实际消费的 (producer,slot).published 建立。
     // 删除 exact-turn 不能连带删除它成功出口的终止态检查：若其他核已经
@@ -1418,9 +1425,10 @@ PA_DEVICE bool FinishCallbackSubmitBody(
         materialize_begin, materialize_end, 0,
         kind == TaskKind::Alloc ? 1U : 0U
     );
-    // 现有泳道 analyzer 要求每个 Submit 都有一条 PrepareMap。shared
-    // Case1 已无对应业务动作，因此复用 materialize_end 写零时长结构
-    // marker：不额外读钟、不触碰 region sidecar；非泳道构建会编译消除。
+    // shared Case1 已无 ordinary PrepareMap 动作；只为真正进入 winner
+    // finish 的 Submit 复用 materialize_end 写零时长结构 marker。loser
+    // 已在 caller 轻返回，不能为它伪造 marker。不额外读钟、不触碰
+    // region sidecar；非泳道构建会编译消除。
     WriteTrace<Profile>(
         stats.trace, stats.result, static_cast<int32_t>(task_id), function_id,
         TracePhase::PrepareMap, ProfilePhase::PrepareMap,
@@ -1576,25 +1584,51 @@ PA_DEVICE bool FinishCallbackSubmitBody(
         );
     }
 
+    CompleteLogicalCallbackSubmit<Ops, Profile, true>(
+        stats, task_id, task_count, ticket.submit_begin, function_id,
+        winner, kind == TaskKind::Alloc
+    );
+    return true;
+}
+
+template <typename Ops, bool Profile, bool RecordSubmit>
+PA_DEVICE void CompleteLogicalCallbackSubmit(
+    LocalStats &stats, uint32_t task_id, uint32_t task_count,
+    uint64_t submit_begin, int32_t function_id, bool winner,
+    bool is_alloc
+) {
+    // submits 是外层 API 的逻辑调用数，不等于进入 generic finish 的次数。
+    // shared loser 仍需推进该计数，并在末 task 负责闭合本核权威性能窗口。
     ++stats.result.submits;
+    if constexpr (!RecordSubmit) {
+        (void)submit_begin;
+        (void)function_id;
+        (void)winner;
+        (void)is_alloc;
+    }
 #if PA_BUILD_PERF_CLOCK
-    // 与真实 FDWIC perf-clock 相同：只有末个 Submit 完成全部尾动作后
-    // 才采一次专用性能边界。协议 watchdog 继续使用 Ops::Now()，两者
-    // 在源码上保持可审计的不同接口。
+    // 与真实 FDWIC perf-clock 相同：只有末个逻辑 Submit 返回时才读取一次
+    // 专用性能时钟。末个 task 可以是本核 loser，不能把计时收尾绑在
+    // FinishCallbackSubmitBody 的 winner-only 路径上。
     const uint64_t submit_end =
         task_id + 1 == task_count ? Ops::PerfClockNow() : 0;
 #elif PA_BUILD_SUBMIT_PMU
     const uint64_t submit_end = task_id + 1 == task_count ? Ops::Now() : 0;
 #else
-    const uint64_t submit_end = TraceTimestamp<Ops>(stats.trace, stats.result);
+    const uint64_t submit_end =
+        RecordSubmit || task_id + 1 == task_count
+            ? TraceTimestamp<Ops>(stats.trace, stats.result)
+            : 0;
 #endif
-    WriteTrace<Profile>(
-        stats.trace, stats.result, static_cast<int32_t>(task_id), function_id,
-        TracePhase::Submit, ProfilePhase::Submit,
-        ticket.submit_begin, submit_end, winner ? 1U : 0U, kind == TaskKind::Alloc ? 1U : 0U
-    );
+    if constexpr (RecordSubmit) {
+        WriteTrace<Profile>(
+            stats.trace, stats.result, static_cast<int32_t>(task_id),
+            function_id, TracePhase::Submit, ProfilePhase::Submit,
+            submit_begin, submit_end, winner ? 1U : 0U,
+            is_alloc ? 1U : 0U
+        );
+    }
     if (task_id + 1 == task_count) stats.result.submit_end = submit_end;
-    return true;
 }
 
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
@@ -1622,6 +1656,7 @@ PA_DEVICE uint32_t FinishSplitCallbackSubmitFromRuntime(
 #if PTO_FDWIC_SHARED_MAP
         if (valid) {
             valid =
+                ticket->won != 0 &&
                 runtime.context.shared_result.TaskId() ==
                     static_cast<int32_t>(ticket->task_id) &&
                 runtime.context.shared_result.Size() ==
@@ -1728,8 +1763,8 @@ PA_DEVICE bool SubmitCallbackTask(
         }
     } else if (__builtin_expect(claim.won, 0)) {
         // shared loser 已在上方声明稳定 output symbol；它不需要构造本 task
-        // 的 descriptor/scalar 参数。finish 的 loser 分支只闭合边界，不读
-        // 这里留下的上一 task args。
+        // 的 descriptor/scalar 参数，也不会进入 generic finish。只有 winner
+        // 构造本 task 的重参数，并把它们交给后续 split finish。
         if (!BuildCallbackSubmitArgs<Kind>(orch, args, batch, stats)) {
             SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
             return false;
@@ -1740,6 +1775,20 @@ PA_DEVICE bool SubmitCallbackTask(
     if (!BuildCallbackSubmitArgs<Kind>(orch, args, batch, stats)) {
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
+    }
+#endif
+#if PTO_FDWIC_SHARED_MAP
+    if (__builtin_expect(!claim.won, 1)) {
+        // 参考 shared API 的 loser 只按 task/output-slot 返回稳定符号。
+        // Alloc 的三个轻量 Output 参数已在上方保留；kernel loser 原本就
+        // 不构重参数。这里不伪造 Materialize/PrepareMap/Register/Submit
+        // 记录，也不跨 TU 调用 generic finish；逻辑计数和末 task 性能
+        // 边界由统一收尾 helper 保持完整。
+        CompleteLogicalCallbackSubmit<Ops, Profile, false>(
+            stats, task_id, task_count, submit_begin, claim.function_id,
+            false, Kind == TaskKind::Alloc
+        );
+        return true;
     }
 #endif
     const CallbackSubmitTicket ticket{
@@ -2183,14 +2232,39 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #endif
 
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+#if PTO_FDWIC_SHARED_MAP
+    // shared loser 在 Claim 后直接返回 symbol，只有本核实际 winner 才跨 TU
+    // 进入 finish。逐核 winner task-id 集合由竞争动态决定，device 这里只
+    // 闭合调用数、地址与局部和值范围；host 再对 96 核做精确总次数和
+    // task-id 总和 oracle。
+    const uint64_t expected_finish_calls = stats.result.claim_wins;
+    const bool finish_address_ok =
+        expected_finish_calls == 0
+            ? split_runtime.finish_state_address == 0
+            : split_runtime.finish_state_address ==
+                  split_runtime.caller_state_address;
+    const bool finish_task_sum_in_range =
+        expected_finish_calls == 0
+            ? split_runtime.task_id_sum == 0
+            : split_runtime.task_id_sum <=
+                  static_cast<uint64_t>(task_count - 1U) *
+                      expected_finish_calls;
+#else
     const uint64_t expected_task_id_sum =
         static_cast<uint64_t>(task_count) * (task_count - 1U) / 2U;
+#endif
     const bool split_protocol_ok =
         split_runtime.scheduler == state && split_runtime.worker == &worker &&
         split_runtime.task_count == task_count && split_runtime.worker_id == worker_id &&
         split_runtime.owner_worker_id == worker_id && split_runtime.caller_state_address != 0 &&
+#if PTO_FDWIC_SHARED_MAP
+        finish_address_ok &&
+        split_runtime.finish_calls == expected_finish_calls &&
+        finish_task_sum_in_range &&
+#else
         split_runtime.finish_state_address == split_runtime.caller_state_address &&
         split_runtime.finish_calls == task_count && split_runtime.task_id_sum == expected_task_id_sum &&
+#endif
         split_runtime.state_cookie == CompeteFirstSplitStateCookie(worker_id, role) &&
         split_runtime.reserved == 0;
     if (!split_protocol_ok) {

@@ -3169,3 +3169,99 @@ b1/b256 和 private b1。clean 实现提交冻结后，与 S4.9 `e8320280` 使�
 
 上述四项不能合成一个提交，否则无法判断收益来自 loser 裁剪、winner
 分布、cursor cacheline 冲突还是在途容量。
+
+#### S4.12a 实现与正确性闭合
+
+实现保持了上述边界，没有把 loser 早退扩大成新的候选规则：
+
+- `SubmitCallbackTask()` 仍让所有 actor 执行 EfDrain、Claim 和
+  `PrepareSharedTaskOutputs()`；Alloc 仍由所有 actor 构造三个轻量
+  Output 参数；
+- shared loser 随后只推进逻辑 `submits`，必要时闭合末 task 的
+  perf-clock/PMU 结束边界，再直接返回；
+- shared winner 才构造 ticket 并进入 generic/split finish；
+- private 仍保留每次 replay 的完整 eager finish；
+- device raw 没有增加字段。swimlane metadata 只补充已有编译身份
+  `tensor_map_mode`，供离线工具拒绝把 private 缺记录误认成 shared 稀疏
+  Submit。
+
+CPU guard-page 用例经过实际 `SubmitCallbackTask()` 连续回放五类 loser：
+Alloc 先构造三个 Output 参数，随后把同一 `TaskArgs` 页设为
+`PROT_NONE`；QK/SF/PV/UP 仍能返回正确 task/slot symbol，且 finish trap
+保持 0 次。用例同时核对：
+
+```text
+submits=5
+claim_attempts=3
+claim_wins=0
+tensor_args_added=3
+materialized/map_insert/slot/completion/publication=0
+shared heap cursor/vend=0
+```
+
+CPU shared/private 的 swimlane、perf-clock 四组严格构建和 b1 均通过；
+shared b256 在两种构建下也通过，继续闭合 122,880 次逻辑 replay、
+73,728 次 ClaimMax、1,280 个 winner、1,024 个 kernel、1,280 条 fanin、
+2,048 次 output publication、768 次 writer commit，`RingBp=0`，
+shared heap vend 为 206,569,472B。
+
+CCEC shared/private 各七种构建全部通过：
+
+```text
+swimlane
+perf-clock
+submit-pmu none/claim/efdrain/materialize/register
+```
+
+每份 manifest 的 mode/variant/phase 与产物 SHA 均复验通过。shared
+perf-clock `.text=130,360B`，相对 S4.9 的 129,080B 增加 1,280B；
+shared swimlane `.text=415,288B`，相对 S4.9 的 411,192B 增加
+4,096B。private perf-clock `.text=125,752B`、`.rodata=300B` 与仓内
+S4.6 private 冻结件逐字节一致；完整 ELF 的 SHA 差异只位于调试和符号
+信息。S4.9 冻结目录没有 private 产物，不能谎称做了不存在的 S4.9
+private 完整 ELF 对比。
+
+A5 shared b1 的正式稀疏泳道位于：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260725_134134_2512990/ccec/
+```
+
+该轮 raw 有 2,229 条记录，host 预计值同为 2,229，`dropped=0`；
+480 条 EfDrain、480 条 Claim 保持完整，而
+Materialize/PrepareMap/Register/Submit 各只有 5 条。Host 的 split
+oracle 证明每个动态 winner 只进入一次 finish，并精确闭合全局 5 次
+finish 与 task-id 和 10；没有 winner 的核保持零 finish 地址/调用。
+converter 生成 2,240 条 merged event，exclusive analyzer 证明：
+
+```text
+Submit partition                              exact
+shared-loser EfDrain = Kernel union + control exact
+OrchestrationReplay partition                 exact
+FinalDrain partition                          exact
+WorkerCompletion partition                    exact
+```
+
+其中 loser EfDrain 内嵌的前序 Kernel 被单独归入 kernel union，没有把
+计算单元时间冒充 scalar control。private b1 也通过完整 480 条 Submit
+矩形和同一 analyzer，产物位于：
+
+```text
+outputs/pa_scheduler_private_swimlane_20260725_134346_2514875/ccec/
+```
+
+shared Materialize/Register 的 A5 b1 submit-PMU 又独立验证了稀疏阶段
+口径：两轮都是全局 calls=5、91 个零调用核、96/96 record trusted 且
+96/96 phase time valid。对应 raw/HTML 为：
+
+```text
+/tmp/s412_shared_materialize_b1_20260725.json
+/tmp/s412_shared_materialize_b1_20260725_report.html
+/tmp/s412_shared_register_b1_20260725.json
+/tmp/s412_shared_register_b1_20260725_report.html
+```
+
+到这里仅证明 S4.12a 的路径、观测和 private 隔离正确。A5 b1
+perf-clock 单轮 62.793us 只作首末边界门禁；它不是 b256 性能收益证据。
+下一步必须先冻结本实现，再与 S4.9 `e8320280` 做既定 12+12
+ABBA/BAAB 配对，才能决定保留还是撤销。

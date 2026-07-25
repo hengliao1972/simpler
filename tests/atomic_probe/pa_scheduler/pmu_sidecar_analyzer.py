@@ -111,6 +111,7 @@ CONFIG_FINGERPRINT_FIELDS = (
 SUBMIT_PMU_FINGERPRINT_FIELDS = CONFIG_FINGERPRINT_FIELDS + (
     "build_variant",
     "build_variant_id",
+    "tensor_map_mode",
     "compiled_phase",
     "compiled_phase_id",
     "primary_window_segments_per_record",
@@ -307,7 +308,7 @@ def _validate_group_summary(
 
 def _validate_submit_pmu_configuration(
     path: Path, configuration: dict[str, Any], schema_version: int
-) -> tuple[str, int]:
+) -> tuple[str, int, str]:
     """校验 submit-pmu 的编译期身份、局部阶段和观察能力契约。"""
 
     _require(
@@ -320,6 +321,11 @@ def _validate_submit_pmu_configuration(
     _require(
         variant_id == SUBMIT_PMU_BUILD_VARIANT_ID,
         f"{path}: unexpected submit-pmu build_variant_id {variant_id}",
+    )
+    tensor_map_mode = configuration.get("tensor_map_mode")
+    _require(
+        tensor_map_mode in ("private", "shared"),
+        f"{path}: unsupported configuration.tensor_map_mode {tensor_map_mode!r}",
     )
     phase_name = configuration.get("compiled_phase")
     _require(
@@ -464,7 +470,7 @@ def _validate_submit_pmu_configuration(
             _integer(selectors.get(field), f"{path}: configuration.selectors.{field}") == expected,
             f"{path}: configuration.selectors.{field} is not 0x{expected:03x}",
         )
-    return phase_name, phase_id
+    return phase_name, phase_id, tensor_map_mode
 
 
 def _is_aic_physical_slot(physical_id: int) -> bool:
@@ -628,10 +634,45 @@ def _validate_submit_pmu_owner(
     return configured_ids
 
 
-def _expected_submit_pmu_phase_calls(phase_name: str, batches: int) -> int:
-    """当前 running phase 都覆盖每核每次 Submit，调用次数固定为 5B。"""
+def _expected_submit_pmu_phase_calls(
+    path: Path,
+    phase_name: str,
+    batches: int,
+    tensor_map_mode: str,
+    records: Sequence[Any],
+) -> list[int]:
+    """按编译模式重验每核局部阶段次数，并返回逐 worker 期望值。"""
 
-    return 0 if phase_name == "none" else batches * TASKS_PER_BATCH
+    full_calls = batches * TASKS_PER_BATCH
+    if phase_name == "none":
+        return [0] * len(records)
+    if phase_name in {"claim", "efdrain"} or tensor_map_mode == "private":
+        return [full_calls] * len(records)
+
+    # shared 的 Materialize/Register 只包 winner，winner 落在哪个 worker
+    # 由运行时 Claim 决定，离线侧无法从静态 core 坐标重算。复用现有
+    # phase_expected_calls（host 从同一 WorkerResult.wins 生成），同时用
+    # 每核界限、全局恰好 5B 和实际 phase_calls 三重约束防止自报漂移。
+    expected: list[int] = []
+    for index, record in enumerate(records):
+        _require(
+            isinstance(record, dict),
+            f"{path}: records[{index}] must be an object",
+        )
+        calls = _integer(
+            record.get("phase_expected_calls"),
+            f"{path}: records[{index}].phase_expected_calls",
+        )
+        _require(
+            0 <= calls <= full_calls,
+            f"{path}: records[{index}].phase_expected_calls is outside [0,{full_calls}]",
+        )
+        expected.append(calls)
+    _require(
+        sum(expected) == full_calls,
+        f"{path}: shared {phase_name} phase_expected_calls must sum to {full_calls}",
+    )
+    return expected
 
 
 def _validate_submit_pmu_record(
@@ -640,7 +681,7 @@ def _validate_submit_pmu_record(
     record: dict[str, Any],
     phase_name: str,
     phase_id: int,
-    batches: int,
+    expected_calls: int,
     schema_version: int,
 ) -> PhasePartitionEvidence:
     """重验 raw phase 分区；运行中 read-clear 只形成上下界。"""
@@ -663,13 +704,11 @@ def _validate_submit_pmu_record(
         (phase_status & phase_status_required) == phase_status_required,
         f"{prefix} phase_status is incomplete",
     )
-    expected_calls = _expected_submit_pmu_phase_calls(phase_name, batches)
-    if "phase_expected_calls" in record:
-        _require(
-            _integer(record.get("phase_expected_calls"), f"{prefix}.phase_expected_calls")
-            == expected_calls,
-            f"{prefix}.phase_expected_calls disagrees with the fixed phase contract",
-        )
+    _require(
+        _integer(record.get("phase_expected_calls"), f"{prefix}.phase_expected_calls")
+        == expected_calls,
+        f"{prefix}.phase_expected_calls disagrees with the phase contract",
+    )
 
     primary_requests = _integer(record.get("icache_requests"), f"{prefix}.icache_requests")
     primary_misses = _integer(record.get("icache_misses"), f"{prefix}.icache_misses")
@@ -841,14 +880,19 @@ def load_capture(path: Path) -> Capture:
     _require(len(records) == workers, f"{path}: record count does not match configuration.workers")
     phase_name: str | None = None
     phase_id: int | None = None
+    tensor_map_mode: str | None = None
+    phase_expected_calls_by_worker: list[int] | None = None
     if schema_version in SUBMIT_PMU_SCHEMA_VERSIONS:
         _require(
             (workers, aic_workers, aiv_workers)
             == (A5_WORKERS, A5_AIC_WORKERS, A5_AIV_WORKERS),
             f"{path}: submit-pmu schema requires the fixed 96/32/64 A5 topology",
         )
-        phase_name, phase_id = _validate_submit_pmu_configuration(
+        phase_name, phase_id, tensor_map_mode = _validate_submit_pmu_configuration(
             path, configuration, schema_version
+        )
+        phase_expected_calls_by_worker = _expected_submit_pmu_phase_calls(
+            path, phase_name, batches, tensor_map_mode, records
         )
     else:
         counter_widths = configuration.get("counter_width_bits")
@@ -1050,10 +1094,21 @@ def load_capture(path: Path) -> Capture:
         if schema_version in SUBMIT_PMU_SCHEMA_VERSIONS:
             # 上面的 configuration 校验已保证二者不是 None；显式 assert 只帮助
             # 类型收窄，不替代任何 JSON 运行时门禁。
-            assert phase_name is not None and phase_id is not None
+            assert (
+                phase_name is not None
+                and phase_id is not None
+                and tensor_map_mode is not None
+                and phase_expected_calls_by_worker is not None
+            )
             phase_partition_evidence.append(
                 _validate_submit_pmu_record(
-                    path, index, record, phase_name, phase_id, batches, schema_version
+                    path,
+                    index,
+                    record,
+                    phase_name,
+                    phase_id,
+                    phase_expected_calls_by_worker[index],
+                    schema_version,
                 )
             )
 

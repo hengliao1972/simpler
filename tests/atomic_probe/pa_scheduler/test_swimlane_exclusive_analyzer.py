@@ -195,6 +195,7 @@ def _v4_capture() -> dict[str, object]:
     metadata = capture["metadata"]
     assert isinstance(metadata, dict)
     metadata["trace_schema_version"] = 4
+    metadata["tensor_map_mode"] = "private"
     source_rows = capture["fdwic_events"]
     assert isinstance(source_rows, list)
     rows: list[list[object]] = []
@@ -286,6 +287,103 @@ def _v4_capture() -> dict[str, object]:
             ]
         )
     capture["fdwic_events"] = rows
+    _refresh_summary(capture)
+    return capture
+
+
+def _shared_v4_capture() -> dict[str, object]:
+    """把 private v4 矩形裁成 Claim 决定的 shared winner-only 主体。"""
+
+    capture = _v4_capture()
+    metadata = capture["metadata"]
+    assert isinstance(metadata, dict)
+    metadata["tensor_map_mode"] = "shared"
+    rows = capture["fdwic_events"]
+    assert isinstance(rows, list)
+    winner_keys = {(0, 0), (1, 1)}
+    loser_heavy_phases = {
+        "Materialize",
+        "PrepareMap",
+        "Fanin",
+        "Register",
+        "Submit",
+        "Commit",
+    }
+    capture["fdwic_events"] = [
+        row
+        for row in rows
+        if (
+            int(row[3]) < 0
+            or (int(row[0]), int(row[3])) in winner_keys
+            or str(row[5]) not in loser_heavy_phases
+        )
+    ]
+    _refresh_summary(capture)
+    return capture
+
+
+def _shared_v4_capture_with_between_loser() -> dict[str, object]:
+    """增加 task2 winner，使 core0 的两个 winner 之间夹着 task1 loser。"""
+
+    capture = _shared_v4_capture()
+    rows = capture["fdwic_events"]
+    assert isinstance(rows, list)
+    for row in rows:
+        core_id = int(row[0])
+        base = 1000 + core_id
+        if row[5] == "OrchestrationReplay":
+            row[7] = base + 330
+        elif row[5] == "FinalDrain":
+            row[6:8] = [base + 330, base + 370]
+        elif (
+            row[5] == "Kernel"
+            and int(row[6]) >= base + 210
+        ):
+            row[6:8] = [base + 340, base + 350]
+
+    for core_id in range(CORE_COUNT):
+        base = 1000 + core_id
+        winner = core_id == 0
+        rows.extend(
+            [
+                _row(core_id, 2, "EfDrain", base + 221, base + 231),
+                _row(
+                    core_id,
+                    2,
+                    "Kernel",
+                    base + 223,
+                    base + 227,
+                    function_id=1,
+                ),
+                _row(
+                    core_id,
+                    2,
+                    "Claim",
+                    base + 234,
+                    base + 240,
+                    flags=0x3 if winner else 0x2,
+                ),
+            ]
+        )
+        if not winner:
+            continue
+        rows.extend(
+            [
+                _row(core_id, 2, "Materialize", base + 244, base + 252),
+                _row(core_id, 2, "PrepareMap", base + 253, base + 257),
+                _row(core_id, 2, "Fanin", base + 260, base + 262, function_id=1),
+                _row(core_id, 2, "Register", base + 263, base + 269),
+                _row(
+                    core_id,
+                    2,
+                    "WinnerBuild",
+                    base + 270,
+                    base + 280,
+                    function_id=1,
+                ),
+                _row(core_id, 2, "Submit", base + 220, base + 290, flags=1),
+            ]
+        )
     _refresh_summary(capture)
     return capture
 
@@ -466,6 +564,104 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
             report["aggregate_core_work"]["closure"]["worker_completion"]["exact"],
             True,
         )
+
+    def test_v4_shared_uses_claim_winners_as_sparse_submit_oracle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, _shared_v4_capture())
+            report = analyze_capture(path)
+
+        capture = report["capture"]
+        self.assertEqual(capture["tensor_map_mode"], "shared")
+        self.assertEqual(capture["task_count_per_core"], 2)
+        self.assertEqual(
+            capture["profiled_submit_count_per_core"],
+            {"min": 0, "max": 1},
+        )
+        self.assertEqual(capture["profiled_submit_count_total"], 2)
+        self.assertIs(report["validation"]["submit_keys_match_tensor_map_mode"], True)
+        self.assertEqual(report["per_core"][0]["submit_count"], 1)
+        self.assertEqual(report["per_core"][1]["submit_count"], 1)
+        self.assertEqual(report["per_core"][2]["submit_count"], 0)
+        self.assertIsNone(report["per_core"][2]["first_submit_start_cycle"])
+        self.assertEqual(
+            report["per_core"][2]["metrics_cycles"]["orchestration_setup"],
+            176,
+        )
+        aggregate = report["aggregate_core_work"]["metrics_cycles"]
+        self.assertEqual(aggregate["shared_loser_efdrain"], 2_850)
+        self.assertEqual(
+            aggregate["shared_loser_efdrain_kernel_union"],
+            1_330,
+        )
+        self.assertEqual(aggregate["shared_loser_efdrain_control"], 1_520)
+        self.assertEqual(aggregate["shared_loser_claim"], 1_330)
+        self.assertIs(
+            report["aggregate_core_work"]["closure"][
+                "shared_loser_efdrain_partition"
+            ]["exact"],
+            True,
+        )
+        self.assertIs(
+            report["aggregate_core_work"]["closure"]["orchestration_replay"][
+                "exact"
+            ],
+            True,
+        )
+        # loser EfDrain 中执行的 Kernel 仍必须完成唯一父区间分类。
+        self.assertEqual(report["kernel_containment"]["orphan_events"], 0)
+        self.assertEqual(report["kernel_containment"]["inside_efdrain_events"], 192)
+
+    def test_v4_shared_rejects_submit_on_losing_claim(self) -> None:
+        capture = _shared_v4_capture()
+        private = _v4_capture()
+        rows = capture["fdwic_events"]
+        private_rows = private["fdwic_events"]
+        assert isinstance(rows, list)
+        assert isinstance(private_rows, list)
+        rows.extend(
+            row
+            for row in private_rows
+            if int(row[0]) == 2
+            and int(row[3]) == 0
+            and str(row[5])
+            in {"Materialize", "PrepareMap", "Register", "Submit"}
+        )
+        _refresh_summary(capture)
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, capture)
+            with self.assertRaisesRegex(ValueError, "shared Submit keys"):
+                analyze_capture(path)
+
+    def test_v4_shared_loser_known_time_is_removed_from_between_residual(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(
+                directory, _shared_v4_capture_with_between_loser()
+            )
+            report = analyze_capture(path)
+
+        core0 = report["per_core"][0]["metrics_cycles"]
+        # 两个 winner Submit 间原始空档为120 cycle；task1 loser 的
+        # EfDrain(10)+Claim(6)是已知工作，真实 residual 只剩104。
+        self.assertEqual(core0["submit_union"], 170)
+        self.assertEqual(core0["submit_envelope"], 290)
+        self.assertEqual(core0["shared_loser_known_in_submit_envelope"], 16)
+        self.assertEqual(core0["between_submit_residual"], 104)
+        self.assertEqual(
+            core0["submit_union"]
+            + core0["shared_loser_known_in_submit_envelope"]
+            + core0["between_submit_residual"],
+            core0["submit_envelope"],
+        )
+
+    def test_v4_private_rejects_shared_sparse_shape(self) -> None:
+        capture = _shared_v4_capture()
+        metadata = capture["metadata"]
+        assert isinstance(metadata, dict)
+        metadata["tensor_map_mode"] = "private"
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, capture)
+            with self.assertRaisesRegex(ValueError, "private Submit keys"):
+                analyze_capture(path)
 
     def test_v4_parent_boundary_gap_is_rejected(self) -> None:
         capture = _v4_capture()

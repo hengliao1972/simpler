@@ -19,6 +19,9 @@ using pa_scheduler::TracePhase;
 using pa_scheduler::TraceRecord;
 using pa_scheduler::host::SharedPrepareMapTraceValidator;
 
+constexpr uint32_t kWinnerClaimFlags =
+    pa_scheduler::kClaimWon | pa_scheduler::kClaimAttempted;
+
 int g_failures = 0;
 
 void Check(bool condition, const char *message) {
@@ -43,12 +46,20 @@ TraceRecord MakeRecord(
     return record;
 }
 
+TraceRecord MakeWinnerClaim(
+    int32_t task_id, int32_t function_id, uint64_t begin,
+    uint64_t end, uint32_t auxiliary = 0
+) {
+    return MakeRecord(
+        TracePhase::Claim, task_id, function_id, begin, end,
+        kWinnerClaimFlags, auxiliary
+    );
+}
+
 void TestValidSequentialFlow() {
     SharedPrepareMapTraceValidator validator;
     Check(
-        validator.Observe(
-            MakeRecord(TracePhase::Claim, 0, -1, 10, 12, 3, 1)
-        ),
+        validator.Observe(MakeWinnerClaim(0, -1, 10, 12, 1)),
         "task 0 Claim opens the first Submit"
     );
     Check(
@@ -71,9 +82,7 @@ void TestValidSequentialFlow() {
     );
 
     Check(
-        validator.Observe(
-            MakeRecord(TracePhase::Claim, 1, 0, 20, 21, 3)
-        ),
+        validator.Observe(MakeWinnerClaim(1, 0, 20, 21)),
         "task 1 Claim follows task 0"
     );
     Check(
@@ -103,6 +112,55 @@ void TestValidSequentialFlow() {
     );
 }
 
+void TestLoserAdvancesWithoutFinishRecords() {
+    SharedPrepareMapTraceValidator validator;
+    Check(
+        validator.Observe(
+            MakeRecord(
+                TracePhase::Claim, 0, -1, 10, 11,
+                pa_scheduler::kClaimAttempted, 1
+            )
+        ),
+        "loser Claim advances without opening a finish flow"
+    );
+    Check(
+        !validator.Observe(
+            MakeRecord(TracePhase::Materialize, 0, -1, 11, 12, 0, 1)
+        ),
+        "loser cannot publish a Materialize record"
+    );
+    Check(
+        validator.Observe(MakeWinnerClaim(1, 0, 12, 13)),
+        "the task after a loser Claim remains sequential"
+    );
+    Check(
+        validator.Observe(
+            MakeRecord(TracePhase::Materialize, 1, 0, 13, 14)
+        ),
+        "winner after loser records Materialize"
+    );
+    Check(
+        validator.Observe(
+            MakeRecord(TracePhase::PrepareMap, 1, 0, 14, 14)
+        ),
+        "winner after loser records the PrepareMap marker"
+    );
+    Check(
+        validator.Observe(
+            MakeRecord(TracePhase::Submit, 1, 0, 12, 16, 1)
+        ),
+        "winner after loser closes its finish flow"
+    );
+    Check(validator.Closed(), "loser plus winner sequence closes");
+    Check(
+        validator.WinnerCount() == 1 &&
+            validator.MaterializeCount() == 1 &&
+            validator.MarkerCount() == 1 &&
+            validator.SubmitCount() == 1,
+        "only the dynamic winner contributes finish records"
+    );
+}
+
 void TestRejectsTaskSequenceDrift() {
     {
         SharedPrepareMapTraceValidator validator;
@@ -116,9 +174,7 @@ void TestRejectsTaskSequenceDrift() {
     {
         SharedPrepareMapTraceValidator validator;
         Check(
-            validator.Observe(
-                MakeRecord(TracePhase::Claim, 0, -1, 10, 11)
-            ),
+            validator.Observe(MakeWinnerClaim(0, -1, 10, 11)),
             "task 0 opens the sequence-gap test"
         );
         Check(
@@ -152,9 +208,7 @@ void TestRejectsMaterializeMismatch() {
     {
         SharedPrepareMapTraceValidator validator;
         Check(
-            validator.Observe(
-                MakeRecord(TracePhase::Claim, 0, -1, 20, 21)
-            ),
+            validator.Observe(MakeWinnerClaim(0, -1, 20, 21)),
             "Claim opens the missing-Materialize test"
         );
         Check(
@@ -167,9 +221,7 @@ void TestRejectsMaterializeMismatch() {
     {
         SharedPrepareMapTraceValidator validator;
         Check(
-            validator.Observe(
-                MakeRecord(TracePhase::Claim, 0, -1, 30, 31)
-            ),
+            validator.Observe(MakeWinnerClaim(0, -1, 30, 31)),
             "Claim opens the duplicate-Materialize test"
         );
         const TraceRecord materialize =
@@ -186,9 +238,7 @@ void TestRejectsMaterializeMismatch() {
     {
         SharedPrepareMapTraceValidator validator;
         Check(
-            validator.Observe(
-                MakeRecord(TracePhase::Claim, 0, -1, 40, 41)
-            ),
+            validator.Observe(MakeWinnerClaim(0, -1, 40, 41)),
             "Claim opens the Materialize identity test"
         );
         Check(
@@ -204,9 +254,7 @@ void TestRejectsMarkerTimingDrift() {
     {
         SharedPrepareMapTraceValidator validator;
         Check(
-            validator.Observe(
-                MakeRecord(TracePhase::Claim, 0, -1, 50, 51)
-            ),
+            validator.Observe(MakeWinnerClaim(0, -1, 50, 51)),
             "Claim opens the marker-anchor test"
         );
         Check(
@@ -225,9 +273,7 @@ void TestRejectsMarkerTimingDrift() {
     {
         SharedPrepareMapTraceValidator validator;
         Check(
-            validator.Observe(
-                MakeRecord(TracePhase::Claim, 0, -1, 60, 61)
-            ),
+            validator.Observe(MakeWinnerClaim(0, -1, 60, 61)),
             "Claim opens the non-zero marker test"
         );
         Check(
@@ -249,9 +295,7 @@ void TestRejectsIdentitySchemaAndMultiplicityDrift() {
     {
         SharedPrepareMapTraceValidator validator;
         Check(
-            validator.Observe(
-                MakeRecord(TracePhase::Claim, 0, -1, 70, 71)
-            ),
+            validator.Observe(MakeWinnerClaim(0, -1, 70, 71)),
             "Claim opens the marker-function test"
         );
         Check(
@@ -270,9 +314,7 @@ void TestRejectsIdentitySchemaAndMultiplicityDrift() {
     {
         SharedPrepareMapTraceValidator validator;
         Check(
-            validator.Observe(
-                MakeRecord(TracePhase::Claim, 0, -1, 80, 81)
-            ),
+            validator.Observe(MakeWinnerClaim(0, -1, 80, 81)),
             "Claim opens the flags test"
         );
         Check(
@@ -291,9 +333,7 @@ void TestRejectsIdentitySchemaAndMultiplicityDrift() {
     {
         SharedPrepareMapTraceValidator validator;
         Check(
-            validator.Observe(
-                MakeRecord(TracePhase::Claim, 0, -1, 90, 91)
-            ),
+            validator.Observe(MakeWinnerClaim(0, -1, 90, 91)),
             "Claim opens the auxiliary test"
         );
         Check(
@@ -312,9 +352,7 @@ void TestRejectsIdentitySchemaAndMultiplicityDrift() {
     {
         SharedPrepareMapTraceValidator validator;
         Check(
-            validator.Observe(
-                MakeRecord(TracePhase::Claim, 0, -1, 100, 101)
-            ),
+            validator.Observe(MakeWinnerClaim(0, -1, 100, 101)),
             "Claim opens the duplicate-marker test"
         );
         Check(
@@ -333,9 +371,7 @@ void TestRejectsIdentitySchemaAndMultiplicityDrift() {
 void TestRejectsSubmitWithoutCompleteMarkerFlow() {
     SharedPrepareMapTraceValidator validator;
     Check(
-        validator.Observe(
-            MakeRecord(TracePhase::Claim, 0, -1, 110, 111)
-        ),
+        validator.Observe(MakeWinnerClaim(0, -1, 110, 111)),
         "Claim opens the incomplete-flow test"
     );
     Check(
@@ -356,6 +392,7 @@ void TestRejectsSubmitWithoutCompleteMarkerFlow() {
 
 int main() {
     TestValidSequentialFlow();
+    TestLoserAdvancesWithoutFinishRecords();
     TestRejectsTaskSequenceDrift();
     TestRejectsMaterializeMismatch();
     TestRejectsMarkerTimingDrift();

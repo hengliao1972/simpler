@@ -69,6 +69,7 @@ V4_EXCLUSIVE_SUBMIT_PHASES = {
 KERNEL_NAMES = {0: "QK", 1: "SF", 2: "PV", 3: "UP"}
 # 一个物理 mixed block 的三条 runtime lane：AIC、AIV0、AIV1。
 LANE_NAMES = {0: "AIC", 1: "AIV0", 2: "AIV1"}
+TENSOR_MAP_MODES = ("private", "shared")
 
 # Atomic raw ABI：auxiliary 存放调用点，flags 低 4 位存放操作类型。这里的
 # 数值必须与 standalone C++ AtomicSite/AtomicOp 枚举保持一致；未知值仍会
@@ -186,6 +187,13 @@ def _load_and_validate(
         raise ValueError(
             "metadata.trace_schema_version=4 requires l2_swimlane_level=1 or 4"
         )
+    tensor_map_mode = metadata.get("tensor_map_mode")
+    if trace_schema_version == 4 and tensor_map_mode not in TENSOR_MAP_MODES:
+        raise ValueError(
+            "schema-v4 metadata.tensor_map_mode must be private or shared"
+        )
+    if tensor_map_mode is not None and tensor_map_mode not in TENSOR_MAP_MODES:
+        raise ValueError("metadata.tensor_map_mode must be private or shared")
     num_cores = _integer(metadata.get("num_cores"), "metadata.num_cores")
     if num_cores <= 0:
         raise ValueError("metadata.num_cores must be positive")
@@ -292,6 +300,7 @@ def _load_and_validate(
     v4_submits: set[tuple[int, int]] = set()
     v4_submit_semantics: dict[tuple[int, int], tuple[bool, bool]] = {}
     v4_tails: dict[tuple[int, int], str] = {}
+    v4_exclusive_phase_counts: dict[tuple[int, int], dict[str, int]] = {}
     # 逐行在写输出前检查列数、范围和可转整数的字段。任一行不满足这些约束
     # 都会整体拒绝输入，不生成缺少关键阶段的“部分可看”泳道。
     for index, row in enumerate(rows):
@@ -433,6 +442,9 @@ def _load_and_validate(
                     clock_state["plain"] = int(clock_state["plain"]) + 1
         if trace_schema_version == 4:
             task_key = (core_id, task_id)
+            if phase in V4_EXCLUSIVE_SUBMIT_PHASES:
+                phase_counts = v4_exclusive_phase_counts.setdefault(task_key, {})
+                phase_counts[phase] = phase_counts.get(phase, 0) + 1
             if phase in ("OrchestrationReplay", "FinalDrain"):
                 if task_id != -1 or function_id != -1 or flags != 0 or auxiliary != 0:
                     raise ValueError(
@@ -531,24 +543,54 @@ def _load_and_validate(
                     raise ValueError(
                         f"core {core_id} requires exactly one schema-v4 {phase}: count={count}"
                     )
-        if set(v4_claims) != v4_submits:
-            raise ValueError("schema-v4 Claim keys do not match Submit keys")
+        claim_keys = set(v4_claims)
+        winner_claim_keys = {
+            task_key
+            for task_key, (_attempted, won, _is_alloc) in v4_claims.items()
+            if won
+        }
+        # metadata 只声明 host 已有的编译模式；实际稀疏集合仍必须由 Claim
+        # winner 位重算。这样 private 丢失 loser Submit 不会被误判成 shared。
+        tensor_map_mode = metadata["tensor_map_mode"]
+        expected_submit_keys = (
+            claim_keys if tensor_map_mode == "private" else winner_claim_keys
+        )
+        if v4_submits != expected_submit_keys:
+            raise ValueError(
+                f"schema-v4 {tensor_map_mode} Submit keys do not match "
+                f"{'all' if tensor_map_mode == 'private' else 'winner'} Claim keys"
+            )
+        sparse_winner_submits = tensor_map_mode == "shared"
         for task_key, (attempted, won, is_alloc) in v4_claims.items():
-            submit_won, submit_alloc = v4_submit_semantics[task_key]
             expected_alloc = task_key[1] % 5 == 0
-            if is_alloc != expected_alloc or submit_alloc != expected_alloc:
+            if is_alloc != expected_alloc:
                 raise ValueError(
                     f"schema-v4 task-kind mismatch at {task_key}: "
                     f"expected_alloc={expected_alloc}"
                 )
             if won and not attempted:
                 raise ValueError(f"schema-v4 Claim won without attempt at {task_key}")
-            if submit_won != won or submit_alloc != is_alloc:
-                raise ValueError(f"schema-v4 Submit/Claim semantics mismatch at {task_key}")
+            if task_key in v4_submits:
+                submit_won, submit_alloc = v4_submit_semantics[task_key]
+                if submit_won != won or submit_alloc != is_alloc:
+                    raise ValueError(
+                        f"schema-v4 Submit/Claim semantics mismatch at {task_key}"
+                    )
+            else:
+                if won or not sparse_winner_submits:
+                    raise ValueError(
+                        f"schema-v4 missing Submit is not a shared loser at {task_key}"
+                    )
+                phase_counts = v4_exclusive_phase_counts.get(task_key, {})
+                if phase_counts != {"EfDrain": 1, "Claim": 1}:
+                    raise ValueError(
+                        f"schema-v4 shared loser at {task_key} must contain exactly "
+                        f"one EfDrain and one Claim, got {phase_counts}"
+                    )
             expected_tail = "AllocComplete" if is_alloc else "WinnerBuild"
             actual_tail = v4_tails.get(task_key)
-            # 只为 winner 记录真实尾动作；loser 没有尾记录，其剩余时间
-            # 由 Submit 的离线补集表示。
+            # 只为 winner 记录真实尾动作。shared loser 没有 Submit 父区间，
+            # 它只保留 EfDrain/Claim；其余空白由 orchestration 补集表示。
             tail_valid = actual_tail == expected_tail if won else actual_tail is None
             if not tail_valid:
                 raise ValueError(
@@ -591,6 +633,7 @@ def _iter_v4_residual_spans(
     submits_by_lane: dict[tuple[int, int], list[tuple[Any, ...]]] = {}
     submit_by_task: dict[tuple[int, int, int], tuple[Any, ...]] = {}
     children_by_task: dict[tuple[int, int, int], list[tuple[Any, ...]]] = {}
+    claim_won_by_task: dict[tuple[int, int, int], bool] = {}
     for row in rows:
         core_id, _block_id, lane, task_id, _function_id, phase, *_rest = row
         lane_key = (int(core_id), int(lane))
@@ -602,13 +645,49 @@ def _iter_v4_residual_spans(
             submit_by_task[task_key] = row
         elif phase in V4_EXCLUSIVE_SUBMIT_PHASES:
             children_by_task.setdefault(task_key, []).append(row)
+        if phase == "Claim":
+            claim_won_by_task[task_key] = bool(int(row[8]) & 0x1)
 
     orphan_child_keys = set(children_by_task) - set(submit_by_task)
-    if orphan_child_keys:
+    invalid_orphan_keys = {
+        task_key
+        for task_key in orphan_child_keys
+        if claim_won_by_task.get(task_key, True)
+        or {str(row[5]) for row in children_by_task[task_key]}
+        != {"EfDrain", "Claim"}
+    }
+    if invalid_orphan_keys:
         raise ValueError(
             "schema-v4 residual synthesis found children without matching Submit: "
-            f"{sorted(orphan_child_keys)[:8]}"
+            f"{sorted(invalid_orphan_keys)[:8]}"
         )
+    # shared loser 的 EfDrain/Claim 是完整 orchestration 中的轻量观察边界，
+    # 没有伪造 Submit 父区间；生成 residual 时必须拿它们切割真实空白，
+    # 不能再让合成 residual 与已有 raw span 重叠。
+    orphan_children_by_lane: dict[
+        tuple[int, int], list[tuple[Any, ...]]
+    ] = {}
+    for task_key in orphan_child_keys:
+        lane_key = (task_key[0], task_key[1])
+        orphan_children_by_lane.setdefault(lane_key, []).extend(
+            children_by_task.pop(task_key)
+        )
+    for lane_key, children in orphan_children_by_lane.items():
+        children.sort(key=lambda row: (int(row[6]), int(row[7]), str(row[5])))
+        for previous, current in zip(children, children[1:]):
+            if int(current[6]) < int(previous[7]):
+                raise ValueError(
+                    f"schema-v4 shared loser children overlap on core/lane {lane_key}"
+                )
+        for child in children:
+            for submit in submits_by_lane.get(lane_key, []):
+                if max(int(child[6]), int(submit[6])) < min(
+                    int(child[7]), int(submit[7])
+                ):
+                    raise ValueError(
+                        "schema-v4 shared loser child overlaps a winner Submit "
+                        f"on core/lane {lane_key}"
+                    )
 
     # 先按每个 scalar lane 标记相邻 Submit 之间的真实空白。
     for lane_key in sorted(submits_by_lane):
@@ -620,12 +699,32 @@ def _iter_v4_residual_spans(
             current_start = int(current[6])
             if current_start < previous_end:
                 raise ValueError(f"schema-v4 Submit spans overlap on core/lane {lane_key}")
-            if current_start > previous_end:
+            cursor = previous_end
+            gap_children = [
+                child
+                for child in orphan_children_by_lane.get(lane_key, [])
+                if previous_end <= int(child[6])
+                and int(child[7]) <= current_start
+            ]
+            for child in gap_children:
+                child_start = int(child[6])
+                child_end = int(child[7])
+                if child_start > cursor:
+                    yield (
+                        int(previous[0]),
+                        int(previous[1]),
+                        int(previous[2]),
+                        cursor,
+                        child_start,
+                        "between_submit_residual",
+                    )
+                cursor = child_end
+            if current_start > cursor:
                 yield (
                     int(previous[0]),
                     int(previous[1]),
                     int(previous[2]),
-                    previous_end,
+                    cursor,
                     current_start,
                     "between_submit_residual",
                 )

@@ -473,40 +473,49 @@ OutputExisting 登记为“由当前 task 写入”。
 
 当前固定图中：
 
-- Alloc 以 `include_existing=false` 调用，实际不插入；
-- QK/SF/PV 只有新 Output，register mask 为空；
-- UP 有四个 Inout，因此每个 worker 都插入四个 producer entry。
+- private Alloc 以 `include_existing=false` 调用，实际不插入；
+- private QK/SF/PV 只有新 Output，register mask 为空；
+- private UP 有四个 Inout，因此每个 worker 都插入四个 producer entry；
+- shared 只有 Claim winner 进入 Register，并只读验证 PA Case1 的
+  ordinary region 为空；loser 在 Claim 后直接返回，没有 Register span。
 
-Register 不是 winner-only。它维护的是每个 worker 自己的未来依赖视图，而不是
-宣告 kernel 已完成。
+所以“Register 不是 winner-only”只适用于 private 的每核 TensorMap。
+shared 当前的 Register 是 winner-only 的空 region 协议验证。两种模式都
+不能把 Register 解读为 kernel 已完成。
 
 ### 5.9 winner 和 loser 的尾部分支
 
 非 Alloc winner 进入 `WinnerBuild`：
 
 1. 若两个普通 slot 已满，`WaitForSlot` 循环 drain 直到有空间；
-2. 对有新 Output 的任务运行 `HeapGuard`，避免覆盖仍存活的 ring 区间；
+2. private 对有新 Output 的任务运行 `HeapGuard`，避免覆盖仍存活的
+   ring 区间；shared 使用 Materialize 已完成的 no-wrap shared heap
+   reservation，不执行 private HeapGuard；
 3. 预留一个私有 slot；
 4. 把 active descriptor、scalar、dispatch context 和 fanin 快照复制进 slot。
 
 `WinnerBuild` 的产物是一个 `occupied && built` 的待执行 slot，不是已完成
 kernel。
 
-Alloc winner 进入 `AllocComplete`：它不创建 slot，在 `HeapGuard` 通过后直接
-发布 vend/flag/frontier，使本次逻辑分配成为已完成 producer。
+Alloc winner 进入 `AllocComplete`：它不创建 slot。private 在 HeapGuard
+通过后发布 vend/flag/frontier；shared 使用已完成的 shared heap reserve，
+建立任务完成态后发布 fresh-output descriptor。
 
-standalone loser 没有额外业务动作。它只走公共 Submit 收尾，因此不能为了让
-图看起来完整而虚构 `Replay` 或 `LoserReplay` phase；剩余后缀归入
-`SubmitResidual`。
+private loser 没有额外业务动作，但仍走公共 Submit 收尾；不能为了让图
+看起来完整而虚构 `Replay` 或 `LoserReplay`，剩余后缀归入
+`SubmitResidual`。shared loser 在 Claim 后返回稳定 output symbol，不进入
+generic/split finish，也没有 Submit 父区间；它只保留 EfDrain/Claim，
+其余空白由 Orchestration residual 承接。
 
 ### 5.10 Submit 返回时已经保证了什么
 
 成功路径的 Submit 返回只保证：
 
-- 本 worker 已完成本 task 的 descriptor 和私有依赖状态更新；
+- private 本 worker、shared winner 已完成本 task 的 descriptor 和依赖
+  前端；shared loser 只建立稳定 output symbol；
 - 全局唯一 winner 已选出；
 - Alloc winner 已完成，或 kernel winner 已把任务构造成待执行 slot；
-- 后继 orchestration 拿到了可携带 owner 的输出 descriptor。
+- 后继 orchestration 拿到了 private descriptor 或 shared task/slot symbol。
 
 它不保证：
 
@@ -689,7 +698,7 @@ exclusive analyzer 使用的名称略有不同：
 - merged `submit_tail_gap` 对应 `submit_tail_residual`；
 - `between_submit_residual` 在两份产物中同名。
 
-#### 7.5.1 `between_submit_residual`：两个 Submit 父区间之间
+#### 7.5.1 `between_submit_residual`：两个已记录 Submit 父区间之间
 
 精确边界是同一物理 scalar lane 上：
 
@@ -730,11 +739,13 @@ previous Submit.end
   `context_lens` 读取下一 batch 的真实 sequence length，计算 block 数，增加
   `context_reads` 统计，再进入 Alloc Submit prologue。
 
-设 batch 数为 `B`，每核依次有 `B` 个 Alloc→QK、QK→SF、SF→PV 和 PV→UP
-候选 gap，以及 `B-1` 个 UP→Alloc 候选 gap，总计 `5B-1` 个相邻 Submit
-边界。当前路径有实际控制工作，通常都会形成正区间；严格的 merged event 数仍以
-`next.start > previous.end` 为准。最后一个 UP 到 `OrchestrationReplay.end`
-不属于此类，而是 `OrchestrationTail`。
+设 batch 数为 `B`，private 每核依次有 `B` 个 Alloc→QK、QK→SF、SF→PV
+和 PV→UP 候选 gap，以及 `B-1` 个 UP→Alloc 候选 gap，总计 `5B-1`
+个相邻 Submit 边界。shared 只记录本核 winner Submit，因此每核候选数为
+`winner_submit_count-1`，中间的 loser EfDrain/Claim 会切割 residual，
+不会被整段重复覆盖；没有 winner 的核不存在该类区间。严格 merged event
+数仍以 `next.start > previous.end` 为准。父区间前后剩余时间分别属于
+`OrchestrationSetup` 与 `OrchestrationTail`。
 
 因此 `between_submit_residual` 是一个有明确边界、但内容随 transition 变化的
 orchestration 区域。它不能整体命名成“参数构造”：当前主要参数构造已经移动到
@@ -742,8 +753,9 @@ orchestration 区域。它不能整体命名成“参数构造”：当前主要
 
 #### 7.5.2 `submit_residual`：Submit 内显式 child 之间
 
-converter 从 `Submit.start` 开始，按时间排序 EfDrain、Claim、Materialize、
-PrepareMap、可选 Fanin、Register 和可选 winner tail。每遇到
+converter 从每条已记录的 `Submit.start` 开始，按时间排序 EfDrain、
+Claim、Materialize、PrepareMap、可选 Fanin、Register 和可选 winner tail。
+private 记录所有逻辑 Submit，shared 只记录 winner Submit。每遇到
 `previous_child.end < next_child.start`，就为这个空白生成一条
 `submit_residual`。因此一个 Submit 理论上可以有多条同名 span，必须结合两侧
 child 名称解释。
@@ -757,15 +769,19 @@ Claim.end → Materialize.begin
 它按源码顺序包含：
 
 1. 发布当前 `Claim` 的 TraceRecord；
-2. 所有 96 个 worker 同步执行 `BuildCallbackSubmitArgs<Kind>`；
+2. private 所有 worker 执行完整 `BuildCallbackSubmitArgs<Kind>`；
+   shared 的 Alloc 所有 worker 只构三个轻量 Output 参数，QK/SF/PV/UP
+   只有 winner 构造完整参数；
 3. 检查 builder 是否有效，并累计 reset/view/create-info/参数个数统计；
-4. 构造固定 16-byte `CallbackSubmitTicket`；
+4. private 所有 actor、shared winner 构造固定 16-byte
+   `CallbackSubmitTicket`；
 5. CCEC 路径跨入 noinline split-finish TU，恢复对应 role 的 block-local
    runtime state，校验 worker、task id、winner、cookie 和 ticket；
 6. 进入 `FinishCallbackSubmitBody`，读取 `Materialize.begin`。
 
-第 2 步是 compete-first eager 的主体，而且 winner、attempted loser、
-not-attempted loser 都完整执行：
+private 的第 2 步是 compete-first eager 主体，winner、attempted loser 和
+not-attempted loser 都完整执行五类构参。shared 则只有 Alloc 保留全员
+轻构参，其余四类只有 winner 执行：
 
 - Alloc：构造新的 `TaskArgs`，加入三个 Output；
 - QK：reset，构造 query view 和动态 score create-info，加入三个 Input、一个
@@ -775,10 +791,11 @@ not-attempted loser 都完整执行：
 - PV：reset，加入三个 Input、一个 Output 和两个 scalar；
 - UP：reset，构造 output view，加入三个 Input、四个 Inout 和两个 scalar。
 
-CPU/AscendC 不经过 CCEC 的 cross-TU ABI，但仍执行同一 builder、ticket 语义和
-Finish 入口衔接。因此这个 residual 可以描述为“Claim record + 全员 eager
-ArgBuild + Begin/Finish bridge”，不能缩写成纯 `BuildCallbackSubmitArgs()`
-函数耗时。
+CPU 不经过 CCEC 的 cross-TU ABI，但仍执行同一 builder、ticket 语义和
+Finish 入口衔接。因此 private residual 可以描述为
+“Claim record + 全员 eager ArgBuild + Begin/Finish bridge”；shared winner
+residual 是“Claim record + winner ArgBuild + Begin/Finish bridge”。shared
+loser 没有 Submit 父区间，不能套用该解释。
 
 它不包含 Claim 的 role 路由/atomicMax，也不包含 `MaterializeTask`：前者已经在
 `Claim` child 内结束，后者从 `Materialize.begin` 才开始。若未来出现其他
@@ -798,9 +815,9 @@ last exclusive child.end → Submit.end
 
 - 非 Alloc winner：从 `WinnerBuild.end` 开始；
 - Alloc winner：从 `AllocComplete.end` 开始；
-- 任意 loser：没有 winner tail，从 `Register.end` 开始。
+- private loser：没有 winner tail，从 `Register.end` 开始。
 
-三类路径的实际内容是：
+private 有上述三类路径；shared 只保留两类 winner Submit：
 
 - **非 Alloc winner**：发布 `WinnerBuild` TraceRecord，增加本核 Submit 计数，
   读取 `Submit.end`；slot 等待、HeapGuard 和 payload build 已经位于
@@ -808,14 +825,15 @@ last exclusive child.end → Submit.end
 - **Alloc winner**：发布 `AllocComplete` TraceRecord，增加 Submit 计数，读取
   `Submit.end`；HeapGuard、vend/flag 发布和 frontier 推进已经位于
   `AllocComplete` child 内。
-- **loser**：发布 `Register` TraceRecord，增加 Submit 计数，读取
-  `Submit.end`。standalone loser 在 Register 后没有 Replay/LoserReplay 或
-  其他调度动作，所以这段不能解释为“loser replay”。
+- **private loser**：发布 `Register` TraceRecord，增加 Submit 计数，读取
+  `Submit.end`。它在 Register 后没有 Replay/LoserReplay 或其他调度
+  动作，所以这段不能解释为“loser replay”。
 
 winner 路径的 Register record 写入发生在 `Register.end` 之后，但由于 winner
 tail 复用 `Register.end` 作为 start，它在数值上属于 WinnerBuild/AllocComplete，
-不属于 `submit_tail_gap`。loser 没有该 tail child，所以同一笔 Register record
-写入才落入 loser 的 `submit_tail_gap`。
+不属于 `submit_tail_gap`。private loser 没有该 tail child，所以同一笔
+Register record 写入才落入它的 `submit_tail_gap`；shared loser 没有
+Register、Submit 或 `submit_tail_gap`。
 
 `WriteTrace(Submit)` 发生在 `Submit.end` 取时之后，也不属于
 `submit_tail_gap`：非末次 Submit 时它落入随后的 `between_submit_residual`；
@@ -829,11 +847,12 @@ Submit 在整数 tick 上严格闭合。
 
 ```text
 OrchestrationReplay
-  ├─ Submit
+  ├─ Submit（private 全量；shared winner-only）
   │    ├─ explicit exclusive children
   │    ├─ submit_residual       内部前缀/child 间空白，可有多段
   │    └─ submit_tail_gap       最后 child 后缀，至多一段
-  └─ between_submit_residual    相邻 Submit 之间，不属于任一 Submit
+  ├─ shared loser EfDrain/Claim 已知 span
+  └─ residual                   相邻 Submit 或父区间边缘的未知空白
 ```
 
 排他闭合时只能这样加：

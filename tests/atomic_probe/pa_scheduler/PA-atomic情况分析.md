@@ -2092,3 +2092,25 @@ slot 容量上重试，仍需重新统计 physical atomic 与完整 Submit，不
 撤销后 shared perf-clock host/kernel 与 `e8320280` 冻结件逐字节相同，
 b256 `RingBp` 恢复为 0；因此当前 atomic 与 publication 口径也已严格
 回到 S4.9，而不是仅在源码表面删除了实验分支。
+
+#### 7.5.23 S4.12 shared loser 快返不消减 atomic
+
+S4.12 只删除 Claim loser 在稳定 output symbol 建立之后的空
+generic/split finish；所有 worker 仍执行原有 EfDrain 和 Claim。因此该
+候选不是 atomic 消减：
+
+```text
+b1  ClaimMax = 288
+b256 ClaimMax = 73,728
+```
+
+Startup、Claim、fanin、completion 和 final-barrier 的固定 atomic
+调用点都没有删除。动态 fanin/final 轮询次数仍可能随多核到达时序变化，
+不能拿不同单轮的总 atomic calls 差值冒充源码调用点消减。
+
+这一步改变的是 Claim 之后的 scalar 控制流和观察拓扑：shared loser 只
+保留 EfDrain/Claim，Materialize/PrepareMap/Register/Submit 与 split
+finish 只属于 1,280 个 winner。A5 b1 raw 精确得到 480 条 EfDrain、
+480 条 Claim，以及各 5 条 winner finish 阶段；`dropped=0`。所以后续
+若完整 Submit 变短，应解释为 121,600 条 loser 空 finish 外壳被裁掉，
+不能归功于 atomic 数量减少。是否保留仍等待与 S4.9 的 b256 冻结配对。

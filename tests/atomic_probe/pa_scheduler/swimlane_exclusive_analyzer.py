@@ -32,13 +32,14 @@ except ImportError:
     from swimlane_converter import _load_and_validate, _standalone_topology
 
 
-REPORT_SCHEMA_VERSION = 2
+REPORT_SCHEMA_VERSION = 3
 EXPECTED_CORES = 96
 EXPECTED_AIC_CORES = 32
 EXPECTED_AIV_CORES = 64
 
 # v3 的六类显式 child 保持历史口径；v4 只把 winner 的两个真实
-# 尾动作加入排他分区。loser 没有尾动作，其剩余时间属于 Submit residual。
+# 尾动作加入排他分区。shared loser 没有 Submit 父区间和尾动作，只保留
+# EfDrain/Claim；两条已知 span 之外的时间由 orchestration residual 承接。
 # Kernel 只在 EfDrain/FinalDrain 内部再次细分，不会与父区间重复相加。
 V3_EXCLUSIVE_SUBMIT_PHASES = (
     "EfDrain",
@@ -97,6 +98,11 @@ V4_PARENT_METRICS = (
     "orchestration_replay",
     "orchestration_setup",
     "orchestration_tail",
+    "shared_loser_efdrain",
+    "shared_loser_efdrain_kernel_union",
+    "shared_loser_efdrain_control",
+    "shared_loser_claim",
+    "shared_loser_known_in_submit_envelope",
     "final_drain",
     "final_drain_kernel_union",
     "final_drain_residual",
@@ -265,7 +271,7 @@ def _validate_capture_identity(
     trace_schema_version: int,
     metadata: dict[str, Any],
     events: Sequence[Event],
-) -> tuple[list[str], int]:
+) -> tuple[list[str], int, str]:
     """补足 converter 之外、排他报告必须证明的完整 96 核和 task stream 身份。"""
 
     if trace_schema_version not in (3, 4):
@@ -286,6 +292,12 @@ def _validate_capture_identity(
     if core_types != expected_types:
         raise ValueError("metadata.core_types is not the complete 32 AIC + 64 AIV role map")
 
+    tensor_map_mode = str(metadata.get("tensor_map_mode", "private"))
+    if tensor_map_mode not in {"private", "shared"}:
+        raise ValueError("metadata.tensor_map_mode must be private or shared")
+    if trace_schema_version != 4 and tensor_map_mode != "private":
+        raise ValueError("shared sparse Submit analysis requires trace_schema_version=4")
+
     summary = metadata.get("fdwic_summary")
     if not isinstance(summary, dict) or int(summary.get("dropped_records", -1)) != 0:
         raise ValueError("metadata.fdwic_summary.dropped_records must be exactly 0")
@@ -296,13 +308,19 @@ def _validate_capture_identity(
         missing = sorted(expected_core_ids - observed_core_ids)
         extra = sorted(observed_core_ids - expected_core_ids)
         raise ValueError(f"raw core IDs are incomplete: missing={missing} extra={extra}")
-    return expected_types, num_cores
+    return expected_types, num_cores, tensor_map_mode
 
 
 def _validate_and_group_submits(
     events: Sequence[Event],
-) -> tuple[dict[tuple[int, int], list[Event]], list[int]]:
-    """验证每个 core/lane 的 Submit 不重叠，且 task 0..N-1 顺序完整一致。"""
+    trace_schema_version: int,
+    tensor_map_mode: str,
+) -> tuple[
+    dict[tuple[int, int], list[Event]],
+    list[int],
+    set[tuple[int, int]],
+]:
+    """验证逻辑 Claim 矩形及由编译模式决定的精确 Submit 集合。"""
 
     by_lane: dict[tuple[int, int], list[Event]] = defaultdict(list)
     for event in events:
@@ -314,12 +332,101 @@ def _validate_and_group_submits(
     expected_lane_keys = {
         (core_id, _standalone_topology(core_id)[1]) for core_id in range(EXPECTED_CORES)
     }
-    if set(by_lane) != expected_lane_keys:
-        missing = sorted(expected_lane_keys - set(by_lane))
-        extra = sorted(set(by_lane) - expected_lane_keys)
-        raise ValueError(f"Submit core/lane IDs are incomplete: missing={missing} extra={extra}")
 
-    reference_task_ids: list[int] | None = None
+    # private 与 schema-v3 继续以完整 Submit 矩形作为逻辑 task oracle。
+    # shared schema-v4 可能有大量零 winner 核，必须改用仍然完整记录的 Claim。
+    if trace_schema_version != 4 or tensor_map_mode == "private":
+        if set(by_lane) != expected_lane_keys:
+            missing = sorted(expected_lane_keys - set(by_lane))
+            extra = sorted(set(by_lane) - expected_lane_keys)
+            raise ValueError(
+                f"Submit core/lane IDs are incomplete: missing={missing} extra={extra}"
+            )
+        reference_task_ids: list[int] | None = None
+        for lane_key, submits in by_lane.items():
+            submits.sort(
+                key=lambda event: (event.start_cycle, event.end_cycle, event.row_index)
+            )
+            for previous, current in zip(submits, submits[1:]):
+                if current.start_cycle < previous.end_cycle:
+                    raise ValueError(
+                        f"core/lane {lane_key} has overlapping Submit rows "
+                        f"{previous.row_index} and {current.row_index}"
+                    )
+            task_ids = [event.task_id for event in submits]
+            if len(task_ids) != len(set(task_ids)):
+                raise ValueError(f"core/lane {lane_key} has duplicate Submit task IDs")
+            if reference_task_ids is None:
+                if not task_ids or task_ids != list(range(task_ids[-1] + 1)):
+                    raise ValueError(
+                        f"core/lane {lane_key} Submit task IDs are not contiguous "
+                        f"0..N-1: {task_ids}"
+                    )
+                reference_task_ids = task_ids
+            elif task_ids != reference_task_ids:
+                raise ValueError(
+                    f"core/lane {lane_key} Submit task IDs do not match the common "
+                    "task stream"
+                )
+        assert reference_task_ids is not None
+        return by_lane, reference_task_ids, set()
+
+    claims_by_lane: dict[tuple[int, int], list[Event]] = defaultdict(list)
+    for event in events:
+        if event.phase == "Claim":
+            claims_by_lane[event.lane_key].append(event)
+    if set(claims_by_lane) != expected_lane_keys:
+        missing = sorted(expected_lane_keys - set(claims_by_lane))
+        extra = sorted(set(claims_by_lane) - expected_lane_keys)
+        raise ValueError(
+            f"shared Claim core/lane IDs are incomplete: missing={missing} extra={extra}"
+        )
+
+    logical_task_ids: list[int] | None = None
+    winner_keys: set[tuple[int, int]] = set()
+    loser_keys: set[tuple[int, int]] = set()
+    winners_per_task: Counter[int] = Counter()
+    for lane_key, claims in claims_by_lane.items():
+        claims.sort(key=lambda event: (event.task_id, event.row_index))
+        task_ids = [event.task_id for event in claims]
+        if len(task_ids) != len(set(task_ids)):
+            raise ValueError(f"core/lane {lane_key} has duplicate Claim task IDs")
+        if logical_task_ids is None:
+            if not task_ids or task_ids != list(range(task_ids[-1] + 1)):
+                raise ValueError(
+                    f"core/lane {lane_key} Claim task IDs are not contiguous "
+                    f"0..N-1: {task_ids}"
+                )
+            logical_task_ids = task_ids
+        elif task_ids != logical_task_ids:
+            raise ValueError(
+                f"core/lane {lane_key} Claim task IDs do not match the common task stream"
+            )
+        for claim in claims:
+            key = (claim.core_id, claim.task_id)
+            if claim.flags & 0x1:
+                winner_keys.add(key)
+                winners_per_task[claim.task_id] += 1
+            else:
+                loser_keys.add(key)
+
+    assert logical_task_ids is not None
+    invalid_winner_counts = {
+        task_id: winners_per_task[task_id]
+        for task_id in logical_task_ids
+        if winners_per_task[task_id] != 1
+    }
+    if invalid_winner_counts:
+        raise ValueError(
+            "shared Claim stream requires exactly one winner per logical task: "
+            f"{invalid_winner_counts}"
+        )
+
+    # 保留所有 96 条 lane key，包括本轮没有任何 winner 的核，方便下游
+    # parent 闭合时把其完整 orchestration 作为无 Submit 区间处理。
+    for lane_key in expected_lane_keys:
+        by_lane.setdefault(lane_key, [])
+    actual_submit_keys: set[tuple[int, int]] = set()
     for lane_key, submits in by_lane.items():
         submits.sort(key=lambda event: (event.start_cycle, event.end_cycle, event.row_index))
         for previous, current in zip(submits, submits[1:]):
@@ -331,25 +438,27 @@ def _validate_and_group_submits(
         task_ids = [event.task_id for event in submits]
         if len(task_ids) != len(set(task_ids)):
             raise ValueError(f"core/lane {lane_key} has duplicate Submit task IDs")
-        if reference_task_ids is None:
-            if not task_ids or task_ids != list(range(task_ids[-1] + 1)):
-                raise ValueError(
-                    f"core/lane {lane_key} Submit task IDs are not contiguous 0..N-1: {task_ids}"
-                )
-            reference_task_ids = task_ids
-        elif task_ids != reference_task_ids:
+        actual_submit_keys.update((event.core_id, event.task_id) for event in submits)
+        expected_task_ids = [
+            task_id
+            for task_id in logical_task_ids
+            if (lane_key[0], task_id) in winner_keys
+        ]
+        if task_ids != expected_task_ids:
             raise ValueError(
-                f"core/lane {lane_key} Submit task IDs do not match the common task stream"
+                f"core/lane {lane_key} Submit task IDs do not match Claim winner set: "
+                f"expected={expected_task_ids}, actual={task_ids}"
             )
-
-    assert reference_task_ids is not None
-    return by_lane, reference_task_ids
+    if actual_submit_keys != winner_keys:
+        raise ValueError("shared Submit keys do not exactly match Claim winner keys")
+    return by_lane, logical_task_ids, loser_keys
 
 
 def _associate_exclusive_children(
     events: Sequence[Event],
     submits_by_lane: dict[tuple[int, int], list[Event]],
     exclusive_phases: Sequence[str],
+    shared_loser_keys: set[tuple[int, int]],
 ) -> dict[int, list[Event]]:
     """把每条显式 child 严格归入同一 core/lane 上唯一包含它的 Submit。"""
 
@@ -371,6 +480,11 @@ def _associate_exclusive_children(
             event, parents, starts[event.lane_key], parent_name="Submit"
         )
         if parent is None:
+            if (
+                (event.core_id, event.task_id) in shared_loser_keys
+                and event.phase in {"EfDrain", "Claim"}
+            ):
+                continue
             raise ValueError(
                 f"row {event.row_index} {event.phase} is outside every Submit "
                 f"on core/lane {event.lane_key}"
@@ -422,15 +536,13 @@ def _associate_kernels_to_parents(
 
 def _associate_efdrain_kernels(
     events: Sequence[Event],
-    children_by_submit: dict[int, list[Event]],
 ) -> tuple[dict[int, list[Event]], set[int]]:
-    """只把完整包含于 EfDrain 的 Kernel 纳入其 nested union。"""
+    """把 Kernel 归入所有 EfDrain，包括 shared loser 的轻返回 EfDrain。"""
 
     efdrains_by_lane: dict[tuple[int, int], list[Event]] = defaultdict(list)
-    for children in children_by_submit.values():
-        for event in children:
-            if event.phase == "EfDrain":
-                efdrains_by_lane[event.lane_key].append(event)
+    for event in events:
+        if event.phase == "EfDrain":
+            efdrains_by_lane[event.lane_key].append(event)
     return _associate_kernels_to_parents(
         events, efdrains_by_lane, parent_name="EfDrain"
     )
@@ -485,6 +597,7 @@ def _analyze_core(
     orchestration: Event | None,
     final_drain: Event | None,
     kernels_by_final_drain: dict[int, list[Event]],
+    shared_loser_children: Sequence[Event],
 ) -> dict[str, Any]:
     """逐 Submit 做整数闭合；v4 继续闭合两个父 span 与 worker completion。"""
 
@@ -586,17 +699,119 @@ def _analyze_core(
         metrics["efdrain_kernel_union"] += kernel_union
         metrics["efdrain_control"] += control
 
-    first_start = submits[0].start_cycle
-    last_end = submits[-1].end_cycle
-    between = sum(
-        current.start_cycle - previous.end_cycle
-        for previous, current in zip(submits, submits[1:])
+    ordered_loser_children = sorted(
+        shared_loser_children,
+        key=lambda event: (event.start_cycle, event.end_cycle, event.row_index),
     )
-    envelope = last_end - first_start
+    for child in ordered_loser_children:
+        if child.phase not in {"EfDrain", "Claim"}:
+            raise AssertionError("shared loser child has an unexpected phase")
+        if child.duration < 0:
+            raise AssertionError("converter accepted a negative shared loser child")
+        if orchestration is None or not (
+            orchestration.start_cycle <= child.start_cycle
+            and child.end_cycle <= orchestration.end_cycle
+        ):
+            raise ValueError(
+                f"core {core_id} shared loser {child.phase} is outside "
+                "OrchestrationReplay"
+            )
+        if any(_overlaps(child, submit) for submit in submits):
+            raise ValueError(
+                f"core {core_id} shared loser {child.phase} overlaps a winner Submit"
+            )
+    for previous, current in zip(
+        ordered_loser_children, ordered_loser_children[1:]
+    ):
+        if current.start_cycle < previous.end_cycle:
+            raise ValueError(
+                f"core {core_id} shared loser spans overlap: rows "
+                f"{previous.row_index} and {current.row_index}"
+            )
+
+    loser_efdrain_cycles = sum(
+        child.duration
+        for child in ordered_loser_children
+        if child.phase == "EfDrain"
+    )
+    loser_efdrain_kernel_union = 0
+    for child in ordered_loser_children:
+        if child.phase != "EfDrain":
+            continue
+        kernel_union = _interval_union_cycles(
+            [
+                (kernel.start_cycle, kernel.end_cycle)
+                for kernel in kernels_by_efdrain[child.row_index]
+            ]
+        )
+        if kernel_union > child.duration:
+            raise ValueError(
+                f"core {core_id} shared loser EfDrain Kernel union exceeds parent"
+            )
+        loser_efdrain_kernel_union += kernel_union
+    loser_efdrain_control = (
+        loser_efdrain_cycles - loser_efdrain_kernel_union
+    )
+    loser_claim_cycles = sum(
+        child.duration
+        for child in ordered_loser_children
+        if child.phase == "Claim"
+    )
+    loser_known_total = loser_efdrain_cycles + loser_claim_cycles
+    if trace_schema_version == 4:
+        metrics["shared_loser_efdrain"] = loser_efdrain_cycles
+        metrics["shared_loser_efdrain_kernel_union"] = (
+            loser_efdrain_kernel_union
+        )
+        metrics["shared_loser_efdrain_control"] = loser_efdrain_control
+        metrics["shared_loser_claim"] = loser_claim_cycles
+
+    first_start = submits[0].start_cycle if submits else None
+    last_end = submits[-1].end_cycle if submits else None
+    raw_between = (
+        sum(
+            current.start_cycle - previous.end_cycle
+            for previous, current in zip(submits, submits[1:])
+        )
+        if submits
+        else 0
+    )
+    loser_known_setup = 0
+    loser_known_between = 0
+    loser_known_tail = 0
+    if first_start is None or last_end is None:
+        loser_known_setup = loser_known_total
+    else:
+        for child in ordered_loser_children:
+            if child.end_cycle <= first_start:
+                loser_known_setup += child.duration
+            elif child.start_cycle >= last_end:
+                loser_known_tail += child.duration
+            elif any(
+                previous.end_cycle <= child.start_cycle
+                and child.end_cycle <= current.start_cycle
+                for previous, current in zip(submits, submits[1:])
+            ):
+                loser_known_between += child.duration
+            else:
+                raise ValueError(
+                    f"core {core_id} shared loser {child.phase} does not fit "
+                    "setup/between/tail residual boundaries"
+                )
+    between = raw_between - loser_known_between
+    if between < 0:
+        raise ValueError(f"core {core_id} shared loser spans exceed Submit gaps")
+    envelope = (
+        last_end - first_start
+        if first_start is not None and last_end is not None
+        else 0
+    )
     metrics["between_submit_residual"] = between
     metrics["submit_envelope"] = envelope
-    if metrics["submit_union"] + between != envelope:
+    if metrics["submit_union"] + between + loser_known_between != envelope:
         raise ValueError(f"core {core_id} first/last Submit envelope does not close")
+    if trace_schema_version == 4:
+        metrics["shared_loser_known_in_submit_envelope"] = loser_known_between
     if sum(metrics[name] for name in submit_partition_names) != metrics["submit_union"]:
         raise ValueError(f"core {core_id} aggregate Submit partition does not close")
     if (
@@ -614,21 +829,42 @@ def _analyze_core(
             raise ValueError(
                 f"core {core_id} OrchestrationReplay.end must equal FinalDrain.start"
             )
-        if not (
-            orchestration.start_cycle <= first_start
-            and last_end <= orchestration.end_cycle
-        ):
-            raise ValueError(
-                f"core {core_id} Submit envelope is outside OrchestrationReplay"
+        if first_start is None or last_end is None:
+            # shared b1 中大多数核没有 winner，因此没有可作为前后锚点的
+            # Submit。完整 orchestration 归到 setup，保持 parent 精确闭合；
+            # 不虚构零时长 Submit，也不把单边区间叫作 between-Submit。
+            setup = orchestration.duration - loser_known_setup
+            tail = 0
+        else:
+            if not (
+                orchestration.start_cycle <= first_start
+                and last_end <= orchestration.end_cycle
+            ):
+                raise ValueError(
+                    f"core {core_id} Submit envelope is outside OrchestrationReplay"
+                )
+            setup = (
+                first_start
+                - orchestration.start_cycle
+                - loser_known_setup
             )
-        setup = first_start - orchestration.start_cycle
-        tail = orchestration.end_cycle - last_end
+            tail = (
+                orchestration.end_cycle
+                - last_end
+                - loser_known_tail
+            )
+        if setup < 0 or tail < 0:
+            raise ValueError(
+                f"core {core_id} shared loser spans exceed orchestration edge residual"
+            )
         metrics["orchestration_setup"] = setup
         metrics["orchestration_tail"] = tail
         metrics["orchestration_replay"] = orchestration.duration
         orchestration_children = (
             setup + metrics["submit_union"]
-            + metrics["between_submit_residual"] + tail
+            + metrics["between_submit_residual"]
+            + loser_known_total
+            + tail
         )
         if orchestration_children != orchestration.duration:
             raise ValueError(f"core {core_id} OrchestrationReplay partition does not close")
@@ -695,6 +931,7 @@ def _add_residual_segment(
 def _residual_breakdown(
     submits_by_lane: dict[tuple[int, int], list[Event]],
     children_by_submit: dict[int, list[Event]],
+    shared_loser_children_by_core: dict[int, list[Event]],
 ) -> dict[str, Any]:
     """按相邻既有边界聚合 Submit 内和 Submit 间空白，保持输出规模恒定。"""
 
@@ -734,12 +971,38 @@ def _residual_breakdown(
             tail_total += max(tail_gap, 0)
 
         for previous, current in zip(submits, submits[1:]):
-            gap = current.start_cycle - previous.end_cycle
             previous_kind = TASK_KIND_NAMES[previous.task_id % len(TASK_KIND_NAMES)]
             current_kind = TASK_KIND_NAMES[current.task_id % len(TASK_KIND_NAMES)]
+            cursor = previous.end_cycle
+            previous_boundary = previous_kind
+            gap_children = sorted(
+                (
+                    child
+                    for child in shared_loser_children_by_core.get(core_id, [])
+                    if previous.end_cycle <= child.start_cycle
+                    and child.end_cycle <= current.start_cycle
+                ),
+                key=lambda event: (
+                    event.start_cycle,
+                    event.end_cycle,
+                    event.row_index,
+                ),
+            )
+            for child in gap_children:
+                gap = child.start_cycle - cursor
+                _add_residual_segment(
+                    between_segments,
+                    f"{previous_boundary}->{child.phase}(shared-loser)",
+                    gap,
+                    role,
+                )
+                between_total += max(gap, 0)
+                cursor = child.end_cycle
+                previous_boundary = f"{child.phase}(shared-loser)"
+            gap = current.start_cycle - cursor
             _add_residual_segment(
                 between_segments,
-                f"{previous_kind}->{current_kind}",
+                f"{previous_boundary}->{current_kind}",
                 gap,
                 role,
             )
@@ -790,7 +1053,7 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
     for index, row in enumerate(rows):
         rows[index] = _event_from_row(index, row)
     events = cast(list[Event], rows)
-    core_types, num_cores = _validate_capture_identity(
+    core_types, num_cores, tensor_map_mode = _validate_capture_identity(
         trace_schema_version, metadata, events
     )
     if len(core_by_block_lane) != num_cores or set(core_by_block_lane.values()) != set(
@@ -798,16 +1061,23 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
     ):
         raise ValueError("block/lane to core mapping is incomplete")
 
-    submits_by_lane, task_ids = _validate_and_group_submits(events)
+    submits_by_lane, task_ids, shared_loser_keys = _validate_and_group_submits(
+        events, trace_schema_version, tensor_map_mode
+    )
     exclusive_phases = _exclusive_phases(trace_schema_version)
     submit_partition_names = _submit_partition_metrics(trace_schema_version)
     role_metric_names = _role_metrics(trace_schema_version)
     children_by_submit = _associate_exclusive_children(
-        events, submits_by_lane, exclusive_phases
+        events, submits_by_lane, exclusive_phases, shared_loser_keys
     )
-    kernels_by_efdrain, efdrain_kernel_rows = _associate_efdrain_kernels(
-        events, children_by_submit
-    )
+    shared_loser_children_by_core: dict[int, list[Event]] = defaultdict(list)
+    for event in events:
+        if (
+            (event.core_id, event.task_id) in shared_loser_keys
+            and event.phase in {"EfDrain", "Claim"}
+        ):
+            shared_loser_children_by_core[event.core_id].append(event)
+    kernels_by_efdrain, efdrain_kernel_rows = _associate_efdrain_kernels(events)
 
     orchestrations_by_lane: dict[tuple[int, int], list[Event]] = {}
     final_drains_by_lane: dict[tuple[int, int], list[Event]] = {}
@@ -863,6 +1133,7 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
                     else None
                 ),
                 kernels_by_final_drain,
+                shared_loser_children_by_core[core_id],
             )
         )
 
@@ -870,7 +1141,11 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
         metric: sum(core["metrics_cycles"][metric] for core in per_core)
         for metric in role_metric_names
     }
-    residual_breakdown = _residual_breakdown(submits_by_lane, children_by_submit)
+    residual_breakdown = _residual_breakdown(
+        submits_by_lane,
+        children_by_submit,
+        shared_loser_children_by_core,
+    )
     if (
         residual_breakdown["submit_internal_residual"]["total_cycles"]
         + residual_breakdown["submit_tail_residual"]["total_cycles"]
@@ -901,10 +1176,21 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
     envelope_partition_sum = (
         aggregate_metrics["submit_union"]
         + aggregate_metrics["between_submit_residual"]
+        + (
+            aggregate_metrics["shared_loser_known_in_submit_envelope"]
+            if trace_schema_version == 4
+            else 0
+        )
     )
     efdrain_partition_sum = (
         aggregate_metrics["efdrain_kernel_union"]
         + aggregate_metrics["efdrain_control"]
+    )
+    shared_loser_efdrain_partition_sum = (
+        aggregate_metrics["shared_loser_efdrain_kernel_union"]
+        + aggregate_metrics["shared_loser_efdrain_control"]
+        if trace_schema_version == 4
+        else 0
     )
     if submit_partition_sum != aggregate_metrics["submit_union"]:
         raise AssertionError("per-core Submit closures did not preserve aggregate closure")
@@ -912,6 +1198,14 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
         raise AssertionError("per-core envelope closures did not preserve aggregate closure")
     if efdrain_partition_sum != aggregate_metrics["efdrain"]:
         raise AssertionError("per-core EfDrain closures did not preserve aggregate closure")
+    if (
+        trace_schema_version == 4
+        and shared_loser_efdrain_partition_sum
+        != aggregate_metrics["shared_loser_efdrain"]
+    ):
+        raise AssertionError(
+            "shared loser EfDrain Kernel/control partition did not close"
+        )
 
     closure: dict[str, Any] = {
         "submit_partition": {
@@ -921,7 +1215,8 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
         },
         "submit_envelope": {
             "parent_cycles": aggregate_metrics["submit_envelope"],
-            "submit_union_plus_between_cycles": envelope_partition_sum,
+            "submit_union_plus_known_loser_plus_between_cycles":
+                envelope_partition_sum,
             "exact": True,
         },
         "efdrain_partition": {
@@ -935,6 +1230,8 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
             aggregate_metrics["orchestration_setup"]
             + aggregate_metrics["submit_union"]
             + aggregate_metrics["between_submit_residual"]
+            + aggregate_metrics["shared_loser_efdrain"]
+            + aggregate_metrics["shared_loser_claim"]
             + aggregate_metrics["orchestration_tail"]
         )
         final_drain_partition_sum = (
@@ -953,9 +1250,16 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
             raise AssertionError("aggregate WorkerCompletion partition does not close")
         closure.update(
             {
+                "shared_loser_efdrain_partition": {
+                    "parent_cycles": aggregate_metrics["shared_loser_efdrain"],
+                    "kernel_union_plus_control_cycles":
+                        shared_loser_efdrain_partition_sum,
+                    "exact": True,
+                },
                 "orchestration_replay": {
                     "parent_cycles": aggregate_metrics["orchestration_replay"],
-                    "setup_submit_union_between_tail_cycles": orchestration_partition_sum,
+                    "setup_submit_union_shared_loser_between_tail_cycles":
+                        orchestration_partition_sum,
                     "exact": True,
                 },
                 "final_drain": {
@@ -994,6 +1298,9 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
     all_submits = [
         submit for submits in submits_by_lane.values() for submit in submits
     ]
+    if not all_submits:
+        raise ValueError("capture has no winner/full-path Submit")
+    profiled_submit_counts = [len(submits) for submits in submits_by_lane.values()]
     global_start = min(submit.start_cycle for submit in all_submits)
     global_end = max(submit.end_cycle for submit in all_submits)
 
@@ -1029,7 +1336,8 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
         "dropped_records": 0,
         "core_ids_complete": True,
         "role_map_complete": True,
-        "task_ids_contiguous_and_equal_per_core": True,
+        "logical_task_ids_contiguous_and_equal_per_core": True,
+        "submit_keys_match_tensor_map_mode": True,
         "exclusive_child_task_ids_match_parent": True,
         "submit_non_overlapping_per_core_lane": True,
         "submit_partition_exact": True,
@@ -1065,7 +1373,8 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
             "not a standalone business phase"
         ),
         "between_submit_residual": (
-            "unattributed gap from one Submit end to the next Submit begin"
+            "unattributed gap from one recorded full-path Submit end to the next "
+            "Submit begin; observed shared-loser EfDrain/Claim spans are excluded"
         ),
         "efdrain_children": ["KernelUnion", "EfDrainControl"],
         "overlay_phases": list(OVERLAY_PHASES),
@@ -1078,10 +1387,12 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
         semantics.update(
             {
                 "orchestration_children": [
-                    "OrchestrationSetup",
+                    "OrchestrationSetupResidual",
                     "SubmitUnion",
+                    "SharedLoserEfDrain",
+                    "SharedLoserClaim",
                     "BetweenSubmitResidual",
-                    "OrchestrationTail",
+                    "OrchestrationTailResidual",
                 ],
                 "final_drain_children": ["KernelUnion", "FinalDrainResidual"],
                 "worker_completion_children": ["OrchestrationReplay", "FinalDrain"],
@@ -1092,6 +1403,13 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
                     "AllocComplete",
                     "FinalDrain",
                 ],
+                "shared_loser_observation": (
+                    "shared loser keeps EfDrain and Claim raw spans without a "
+                    "fabricated Submit parent; the report counts them as known "
+                    "orchestration children and removes them from setup/between/tail "
+                    "residual; loser EfDrain is further split into nested Kernel union "
+                    "and scalar control, so its full parent is not treated as scalar time"
+                ),
             }
         )
 
@@ -1102,7 +1420,13 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
             "trace_schema_version": trace_schema_version,
             "clock_freq_hz": frequency_hz,
             "core_count": num_cores,
+            "tensor_map_mode": tensor_map_mode,
             "task_count_per_core": len(task_ids),
+            "profiled_submit_count_per_core": {
+                "min": min(profiled_submit_counts),
+                "max": max(profiled_submit_counts),
+            },
+            "profiled_submit_count_total": len(all_submits),
             "event_count": len(events),
         },
         "validation": validation,
