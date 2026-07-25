@@ -3057,3 +3057,41 @@ S4.9 冻结样本均为 0，说明 pure INPUT 延迟确实让提交推进得更�
 RingBp 都不能独立决定保留；下一步必须从 clean commit 冻结本候选，与
 `e8320280` 冻结件完成同一 ABBA/BAAB 配对，并同时核对完整 launch/final
 drain，防止把单纯工作后移写成净收益。
+
+#### S4.11a 冻结配对：协议正确，但当前代码形态小幅回退
+
+协议实现提交为 `b516409e`。从 clean commit 重新构建 shared perf-clock，
+冻结后再次校验 manifest 中的 host/kernel SHA；与 S4.9 `e8320280` 使用
+完全相同的 device 0、b256、`real-compute/6,28,4,1`、2 次 warm-up/版本和
+6 个 ABBA/BAAB block。每版 12 个正式独立进程全部通过 shared heap、
+symbol、依赖、输出 tile 与构建身份门禁。证据位于：
+
+```text
+outputs/perf_clock_freeze_b516409e_20260725_123109/
+outputs/perf_clock_pair_b516409e_vs_e8320280_20260725_123124/
+```
+
+| 版本 | 最小值 | 中位数 | 均值 | 最大值 | 样本标准差 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| S4.9 `e8320280` | 3.233ms | 3.247ms | 3.248ms | 3.262ms | 0.010ms |
+| S4.11a `b516409e` | 3.207ms | 3.259ms | 3.261ms | 3.343ms | 0.034ms |
+
+6 个 block 中候选 2 个更快、4 个更慢；block 内各取两个样本均值后，候选
+减基线的配对差中位数为 **`+11.105us / +0.342%`**，范围为
+`-18.165～+45.535us`。候选还出现一个 3.343ms 长样本，使离散度高于
+基线；单轮不能把该尾部唯一归因于 deferred 或 RingBp，但足以说明当前证据
+没有达到稳定净收益门槛。
+
+因此不能保留 S4.11a 的当前代码形态。与此同时，功能取证已经证明：
+
+- pure INPUT 延迟解析可保持全部逻辑/数值语义；
+- normal/perf-clock 单样本分别出现 88/93 次 RingBp，提交超前确实到达
+  两个可用 slot，而不是 dead code；
+- shared perf-clock `.text` 从 129,080B 增至 157,496B，增加
+  **28,416B / 22.01%**，是当前候选与协议变化同时存在的显著代码生成变量。
+
+下一步只做一项代码生成收敛：在 `DrainReady()` 先用既有 deferred mask
+判断是否需要解析，再把 resolver 固定为单份 noinline 冷/慢 helper，避免其
+随四个 DrainReady 调用点重复内联。协议、mask 编码、publication/writer
+顺序、slot 数和终止状态都不改变。收缩后的 clean ELF 必须重新做同一配对；
+若仍无净收益，则完整撤销 S4.11 实现，只保留本记录。

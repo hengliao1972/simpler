@@ -2110,3 +2110,11 @@ resolver 冷失败新增的 terminal sentinel 不是 atomic。为防失败 task 
 后继 slot 永久等待，RingBackpressure/FinalDrain 在连续 1,024 次无进展时
 低频读取全局 fatal；该 `FatalPoll` 被纳入已有 poll-region 聚合，不增加
 raw 字段，零背压成功快路径也不增加该读取。
+
+clean `b516409e` 与 S4.9 `e8320280` 的 12+12 正式配对已经完成：
+6 个 block 为 2 快/4 慢，配对差中位数
+`+11.105us / +0.342%`。这与本节的口径一致：S4.11a 没有删除 ready
+INPUT 的固定 atomic，只把未就绪 publication 轮询移出 Submit；不能因为
+观察到提交超前就宣称 atomic 已消减或性能已提升。当前 shared perf-clock
+`.text` 同时增加 28,416B，下一小步只收敛 resolver 的重复内联；若重新
+配对仍无净收益，S4.11 整体撤销。
