@@ -5,8 +5,8 @@
 本文记录 `TestPagedAttentionUnroll::Case1` 在真实 A5 上的 FDWIC AICore
 Submit 路径，供后续继续优化。真实 PA 生产快照日期为 2026-07-18；当前
 保留的生产优化基线为 `2c3dd1e2`，F1 负结果记录提交为 `c93c3666`。
-standalone 实验记录更新至 2026-07-25 的 S4.13，当前代码仍以 S4.9 为
-有效性能基线。
+standalone 实验记录更新至 2026-07-25 的 S4.14a；当前只是
+shared Vector cursor 的迁址对照，有效性能基线仍是 S4.9。
 
 范围限定为：
 
@@ -2134,3 +2134,49 @@ attempted 一一闭合。
 73,728 次 Claim。atomic 数量下降仍作为已证实机制保留在实验记录中，但
 不能写成当前代码的性能收益。详细 ABI、正确性门禁和逐样本路径见
 `shared_tensormap_record.md` 的 S4.13 节。
+
+#### 7.5.25 S4.14a shared Vector cursor 迁址对照
+
+参考分支的 `cube=8/vector=16` 和本仓旧 `G=1/4/8/16` sweep 都同时
+改变过多类 cursor，不能证明 Cube 或 Vector 的独立收益。若直接把当前
+shared Vector 从 production prefix 的四分片改成 sidecar 八分片，还会
+同时改变地址生成、页/cache 映射与分片数，仍然不是单变量。
+
+S4.14 因此拆成两步。S4.14a 先在 shared-only sidecar 尾部追加物理容量
+为 8 的 `shared_vector_cursor`，但 active shards 保持 4，SF/UP 仍按
+`task_id % kSharedVectorCursorShards` 映射，与 S4.9 的 `%4` 运算形态
+一致。旧 production-prefix `vector_cursor[4]` 保持原
+offset 且 shared 运行中必须始终为 -1；private、Cube、Alloc、候选
+worker、task 图和观察边界都不变。
+
+b256 的物理 atomic 数量与每线流量也保持 S4.9 原值：
+
+| task | 竞争核 | task 数 | ClaimMax |
+| --- | ---: | ---: | ---: |
+| Alloc | 96 | 256 | 24,576 |
+| QK/PV | 32 AIC | 512 | 16,384 |
+| SF/UP | 64 AIV | 512 | 32,768 |
+| 合计 | - | 1,280 | **73,728** |
+
+当前四条 active Vector cursor 每条仍承担 8,192 次 ClaimMax，另外四条
+物理线保持 -1。因此本轮只量“同样四分片从 prefix 搬到 sidecar”的影响，
+不是 atomic 次数消减，也不是分片优化。
+
+CPU 定向测试和 b256 完整回放已经证明：
+
+- 每个 SF/UP 恰有 64 个 attempted 和一个 winner；
+- 32,768 次 Vector FetchMax 全部命中 `task_id%4` 对应的 sidecar；
+- 四条 active 高水位与四条 inactive -1、Cube/Alloc 四分片、
+  heap/TensorMap/fanin/completion 全部精确闭合。
+
+CCEC private/shared 14 种构建与 manifest 全部通过。A5 shared b1 atomic
+最终源码对应的 raw 为 4,127 条、drop=0，其中 288 条 ClaimMax 仍为
+`96/32/64/32/64`，全部是 `return_ready`。迁址对照
+`.text=129,080B`、`.rodata=288B`，与 S4.9 大小相同；没有新增
+atomic/泳道/PMU 记录字段。
+
+这些只是正确性和计数证据。S4.14a 必须先相对 S4.9 做六区组
+ABBA/BAAB 配对，量清迁址本身；只有该对照可接受，S4.14b 才在相同
+sidecar 地址、物理容量和代码骨架下只把有效分片数和取模从 4 改为 8。
+在两轮结果出来前，不能把迁址或“预留八条线”写成性能提升。详细源码
+历史、ABI 和门禁见 `shared_tensormap_record.md` 的 S4.14 节。

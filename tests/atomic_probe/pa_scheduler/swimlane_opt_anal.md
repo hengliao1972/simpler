@@ -388,11 +388,13 @@ Submit 的 task kind 给其中 Kernel 归类会得到错误结论，必须使用
 
 ### 5.3 `Claim`：决定谁负责本 task 的真实尾动作
 
-Claim 先根据 task kind 生成 active role，再选择四个 cursor shard 之一：
+Claim 先根据 task kind 生成 active role，再选择对应 cursor shard：
 
-- Alloc 使用 `alloc_cursor`；
-- QK/PV 使用 `cube_cursor`；
-- SF/UP 使用 `vector_cursor`。
+- Alloc 使用 production-prefix `alloc_cursor[4]`；
+- QK/PV 使用 production-prefix `cube_cursor[4]`；
+- private SF/UP 使用 production-prefix `vector_cursor[4]`；
+- 当前 S4.14a shared 迁址对照的 SF/UP 使用物理容量 8、active 为 4
+  的 sidecar `shared_vector_cursor[8]`。
 
 符合 role 的 worker 对 cursor 执行 `atomicMax(task_id)`。返回旧值小于当前
 task id 的唯一竞争者获胜；其他参与者是 attempted loser，不符合 role 的核是

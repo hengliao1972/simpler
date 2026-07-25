@@ -58,7 +58,7 @@ static_assert(sizeof(SharedRegionSlot) == 128, "shared slot must occupy two cach
 static_assert(offsetof(SharedRegionSlot, seq) == 64, "shared seq cache line offset changed");
 static_assert(sizeof(SharedBucketState) == 128, "shared bucket control ABI changed");
 static_assert(offsetof(SharedBucketState, tail) == 64, "shared head/tail cache lines merged");
-static_assert(sizeof(SharedTensorMapSidecar) == 4735680, "shared sidecar ABI changed");
+static_assert(sizeof(SharedTensorMapSidecar) == 4736192, "shared sidecar ABI changed");
 static_assert(alignof(SharedTensorMapSidecar) == 64, "shared sidecar alignment changed");
 static_assert(offsetof(SharedTensorMapSidecar, buckets) == 128, "shared bucket offset changed");
 static_assert(offsetof(SharedTensorMapSidecar, slots) == 16512, "shared slot offset changed");
@@ -73,6 +73,10 @@ static_assert(
 static_assert(
     offsetof(SharedTensorMapSidecar, shared_heap_vend) == 4735616,
     "shared heap vend offset changed"
+);
+static_assert(
+    offsetof(SharedTensorMapSidecar, shared_vector_cursor) == 4735680,
+    "shared Vector cursor offset changed"
 );
 
 enum class EventKind : uint8_t {

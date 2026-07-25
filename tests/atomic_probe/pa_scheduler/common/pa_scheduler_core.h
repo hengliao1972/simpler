@@ -603,8 +603,11 @@ PA_DEVICE ClaimOutcome Claim(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_id, TaskKind kind,
     LocalStats &stats
 ) {
-    // Claim 在四个 shard 的单调 cursor 上执行 atomicMax：同一 task 只有观察到旧值更小的竞争者获胜。
-    // Alloc 由全部 96 个 worker 竞争；QK/PV 仅 32 个 AIC，SF/UP 仅 64 个 AIV 进入真正的 atomicMax。
+    // Claim 在单调 cursor 上执行 atomicMax。private/Cube/Alloc 使用
+    // production-prefix 四分片；S4.14a shared Vector 使用 sidecar 中
+    // active 为4的迁址对照。同一 task 只有观察到旧值更小的竞争者获胜。
+    // Alloc 由全部 96 个 worker 竞争；QK/PV 仅 32 个 AIC、
+    // SF/UP 仅 64 个 AIV 发 atomicMax。
     ClaimOutcome outcome{false, false, 0, -1};
     if (task_id >= kTaskCellCapacity) {
         return outcome;
@@ -636,7 +639,13 @@ PA_DEVICE ClaimOutcome Claim(
             outcome.function_id = aic_kernel;
         } else if ((core_mask & 6U) != 0) {
             if (worker.role != CoreRole::Aiv) return outcome;
+#if PTO_FDWIC_SHARED_MAP
+            cursor = &state->shared_map.shared_vector_cursor[
+                task_id % kSharedVectorCursorShards
+            ];
+#else
             cursor = &state->vector_cursor[task_id % kCursorShards];
+#endif
             outcome.function_id = (core_mask & 2U) != 0 ? aiv0_kernel : aiv1_kernel;
         } else {
             return outcome;

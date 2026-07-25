@@ -4,7 +4,7 @@
 [`poursoul/simpler:fdwic-shared-tensormap`](https://github.com/poursoul/simpler/tree/fdwic-shared-tensormap)
 在 A5 FDWIC runtime 中实现的 shared TensorMap 方案，并与当前分支 standalone
 方案比较。本文用于后续开发决策，不表示目标分支已经合入，也不把分支文档中的
-实验记录自动当成当前分支的性能结论；当前分支 S0～S4.13 的实际实施证据另记于
+实验记录自动当成当前分支的性能结论；当前分支 S0～S4.14 的实际实施证据另记于
 第 15 节。当前继续开发和验收的后端范围固定为 CPU/CCEC。
 
 后续每个实现小步都必须先对照参考提交：可直接复用的机制要说明复用位置；
@@ -3321,3 +3321,136 @@ Python 测试、CPU shared strict/perf-clock 构建和 b256 完整回放再次�
 因调试/符号节存在构建差异，但实际执行的 `.text=129,080B` 和
 `.rodata=288B` 内容逐字节一致。因此当前运行身份确实回到 S4.9，而不是
 只在源码表面删除了候选分支。
+
+### 2026-07-25：S4.14a shared Vector cursor 迁址对照
+
+#### 为什么不能直接照搬参考的 `cube=8/vector=16`
+
+重新逐提交审查参考历史与本仓旧实验后，得到以下边界：
+
+- 参考 `e49f73a3` 把 cube/vector/alloc 一起从四分片改为八分片，同时还
+  修改延迟 shared ref 解析、BlockWon drain、fatal/frontier 和 trace；
+- 参考 `0350b558` 再把 vector 从八分片改为十六分片，但同一提交还引入
+  `alloc_cursor[3][8]` 并删除 shared completion frontier；
+- 本仓 `2e92da17` 记录的 A5 sweep 也让 cube/vector/alloc 三类 cursor
+  同时选择 `G=1/4/8/16`。standalone 的 `G4→G8` 虽然是
+  `-176.631us/-4.632%`、7/7 配对更快，但 fanin loads 同时从
+  29,504 降到 24,601，不能把收益归因给某一类 cursor；真实 simpler
+  的 `G4→G8` 只有三个样本且为 `+0.526%`，只能判定没有可辨认变化。
+
+因此参考配置只证明可运行形态，不能作为独立收益证据。进一步审查还确认：
+若直接把 shared Vector 从 production prefix 的四分片改成 sidecar
+八分片，会同时改变 cursor 地址、页/cache 映射和分片数，仍不能把结果
+单独归因给 `4→8`。
+
+S4.14 因而拆成两步。S4.14a 只做迁址对照：sidecar 预留八条物理
+cache line，但 active shards 保持 4，SF/UP 仍按 `%4` 映射。
+Cube、Alloc、private、frontier、task 图、观察器和 Claim 候选集合全部
+不变。后续 S4.14b 才在相同 sidecar 地址、物理容量和代码骨架下只把
+有效分片数和取模从 4 改为 8。
+
+选择 Vector 作为后续首个分片候选，是因为 b256 中 SF/UP 固定执行：
+
+```text
+64 AIV × 2 tasks/batch × 256 batches = 32,768 ClaimMax
+```
+
+而 QK/PV 的 Cube ClaimMax 为 16,384 次。S4.14a 尚未改变分片，所以
+四条 active Vector cursor 每条仍承担 8,192 次 ClaimMax，另外四条
+物理线保持 -1。未来 S4.14b 才会把每条流量降到 4,096，但即使届时也
+不会减少：
+
+- 总计 32,768 次 Vector ClaimMax；
+- 每个 SF/UP task 的 64 路同地址竞争；
+- 73,728 次全局 ClaimMax；
+- winner、fanin、completion 或 kernel 数量。
+
+本阶段只量同样四分片从 prefix 搬到 sidecar 的影响，不把它描述成
+atomic 次数消减或分片收益。
+
+#### ABI 与实现边界
+
+production prefix 的 `cube_cursor[4]`、`vector_cursor[4]` 和
+`alloc_cursor[4]` 均不移动。shared-only sidecar 尾部追加完整的
+`shared_vector_cursor[8]`，SF/UP 在 shared 编译中按
+`task_id % kSharedVectorCursorShards` 访问当前四条 active line；
+这与 S4.9 的 `%4` 源码运算形态一致。private 继续使用 prefix
+`vector_cursor[4]`。这样保持 private 与现有 production offset 冻结，
+也为下一步同址 `4→8` 建立严格对照；不伪称 sidecar 地址等于参考
+`DistGlobal` 地址。
+
+sidecar 从 4,735,680B 增至 4,736,192B，既有 region/output/heap 字段
+offset 均不变。Host 仍通过 `SharedSidecarBytes()` 整块 H2D/D2H；
+每轮把新八条 cursor 初始化为 -1，终态 oracle 要求：
+
+- 四条 active cursor 精确等于 b1/b256 最终 task 高水位，另外四条
+  始终为 -1；
+- 旧 prefix `vector_cursor[4]` 在 shared 中始终为 -1；
+- Cube/Alloc 仍按原四分片达到精确终值。
+
+没有新增 trace、PMU、WorkerResult、span 或 atomic 记录字段。
+
+#### 候选正确性取证
+
+新增 CPU 定向测试不只读取最终值，还在每次 attempted 后核对 FetchMax
+地址并累计次数。它锁定：
+
+- task 2 与 task 14 迁址后仍同属 sidecar shard 2，证明映射仍为四分片；
+- AIC 对 SF/UP 不发 FetchMax，shared Vector 不触碰旧 prefix；
+- Cube/Alloc 继续访问 production-prefix 四分片；
+- b256 每个 SF/UP 恰有 64 个 AIV attempted 和一个 winner，合计
+  32,768 次 Vector ClaimMax；四条 active 高水位与四条 inactive -1
+  精确闭合。
+
+这里的定向用例按顺序模拟路由、地址与计数；真正的并发唯一 winner 由
+完整 CPU 96-worker b1/b256 回放验证，不能把两种证据混成一个结论。
+
+当前已通过：
+
+- 用户 `/home/q00473782/.venv` 下 100 项 Python converter/analyzer/PMU
+  回归；
+- CPU shared 全部定向测试、shared b1/b256 完整回放，以及 private
+  strict/perf-clock 回归；
+- CCEC private/shared 的 swimlane、perf-clock 和五种 submit-PMU，
+  共 14 种构建，全部 manifest 校验通过；
+- A5 shared b1 perf-clock 与 atomic 泳道，heap/TensorMap、依赖签名、
+  completion、真实计算输出和新 cursor oracle 全部通过。
+
+b1 最终源码泳道共有 4,127 条 raw、零丢失；288 条 `ClaimMax` 仍按
+Alloc/QK/SF/PV/UP 精确分为 `96/32/64/32/64`，flags 均为
+`0x53 return_ready`。证据位于：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260725_155729_2638154/ccec/
+```
+
+迁址对照 shared perf-clock `.text=129,080B`、`.rodata=288B`，大小与 S4.9
+相同。private device 的 `.text=125,752B`、`.rodata=300B` 与已有
+`dc22d076` 冻结件内容逐字节一致；完整 ELF 只因调试节/对齐多 16B。
+private Host 当前使用用户 GCC15，而旧冻结件使用 GCC13.3，因此不把 Host
+全文件差异误写成 shared 代码泄漏。
+
+#### 性能判定尚未完成
+
+上述结果只说明实现与观察契约闭合，不代表已有收益。S4.14a 提交后将冻结
+clean shared perf-clock ELF，并相对 S4.9 `e8320280` 在 device0 上各预热
+两次，再执行六个 ABBA/BAAB 区组、每版 12 个独立 b256 正式进程。
+
+测量前固定迁址对照的数值门槛。首轮六区组按候选减基线计算：
+
+- 任何语义失败，或配对中位数 `>= +0.2%` 且仅 `0～2/6` 区组更快：
+  判回退并撤销 sidecar；
+- 配对中位数 `<= -0.2%` 且 `6/6` 更快：只把收益记给迁址；
+- 配对中位数落在 `(-0.2%, +0.2%)` 且 `2～4/6` 更快：判中性，
+  可作为 S4.14b 的同址对照；
+- 其他边界组合追加第二轮六区组。
+
+若追加到十二区组，只在 `<=-0.2%` 且至少 `10/12` 更快时判改善；
+只在绝对中位差 `<0.2%` 且 `5～7/12` 更快时判中性；其他组合均视为
+不适合继续叠加的迁址结果并撤销。这样不会在看到数据后临时放宽“中性”。
+
+S4.14b 仍使用既定六区组门槛：6/6 更快且配对差中位数至少约
+`-0.2%` 才直接保留；4～5/6 或小于 `0.2%` 时追加第二轮；
+0～3/6 或中位数非负则撤销。只有 Vector `4→8` 最终保留后，才相对
+新冻结基线单独测试 Cube `4→8`，再测试 Vector `8→16`。任何一步失败
+都回到上一冻结基线，不能堆叠后再猜收益来源。

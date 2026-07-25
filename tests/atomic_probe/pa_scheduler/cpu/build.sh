@@ -148,6 +148,21 @@ else
     echo "[TEST] shared heap no-wrap reserve self-test"
     "$BUILD_DIR/test_shared_heap_reserve"
 
+    # S4.14a 是 shared Vector cursor 的迁址对照：sidecar 物理容量为8，
+    # active shard 仍为4。定向测试锁定 SF/UP 的 sidecar 地址、原四分片
+    # task 映射、错误 role 零 atomic、Cube/Alloc 不变，以及 b256 的
+    # 32,768 次 Vector Claim、每 task 唯一 winner 与全部物理线终态。
+    echo "[BUILD] shared Vector Claim cursor self-test"
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/common/test_shared_vector_claim_cursor.cpp" \
+        -o "$BUILD_DIR/test_shared_vector_claim_cursor"
+
+    echo "[TEST] shared Vector Claim cursor self-test"
+    "$BUILD_DIR/test_shared_vector_claim_cursor"
+
     # Materialize 在触碰 shared cursor 前必须完成数量、引用、shape/stride
     # 和地址区间预检；这些 reserve 前拒绝路径不能推进 heap。FetchAdd 后
     # 才暴露的容量竞争则按 terminal 契约保留 overrun 现场。

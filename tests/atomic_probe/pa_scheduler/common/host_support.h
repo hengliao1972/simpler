@@ -267,6 +267,11 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
         state->shared_map.shared_heap_cursor[shard].value = 0;
     }
     state->shared_map.shared_heap_vend.value = 0;
+    // shared Vector Claim cursor 与 heap cursor 是两套独立状态；-1 表示
+    // 尚未 Claim 任一 SF/UP task。每轮完整复位，避免继承旧高水位。
+    for (uint32_t shard = 0; shard < kSharedVectorCursorCapacity; ++shard) {
+        state->shared_map.shared_vector_cursor[shard].value = -1;
+    }
 #endif
     state->heap_window = kHeapWindow;
     state->heap_base = kSyntheticHeapBase;
@@ -330,7 +335,7 @@ inline constexpr size_t ResultBytes() { return sizeof(WorkerResult) * kWorkers; 
 
 inline constexpr size_t SharedSidecarBytes() { return sizeof(SharedTensorMapSidecar); }
 #if PTO_FDWIC_SHARED_MAP
-static_assert(SharedSidecarBytes() == 4735680, "shared TensorMap transfer size changed");
+static_assert(SharedSidecarBytes() == 4736192, "shared TensorMap transfer size changed");
 #else
 static_assert(SharedSidecarBytes() == 2113664, "private TensorMap transfer size changed");
 #endif
@@ -2613,23 +2618,51 @@ inline Metrics Validate(
         &metrics
     );
 
-    // 三类 Claim cursor 各有四个 shard；按 task_id 重新推导每个 shard 应停留的最后任务。
+    // private 三类 Claim cursor 均为 production-prefix 四分片。S4.14a
+    // shared Vector 改用物理容量8、active仍为4的 sidecar；Cube/Alloc
+    // 保持不变。逐 task 重新推导每条物理 cursor 的最终高水位。
     int64_t expected_cube[kCursorShards] = {-1, -1, -1, -1};
+#if PTO_FDWIC_SHARED_MAP
+    int64_t expected_vector[kSharedVectorCursorCapacity] = {
+        -1, -1, -1, -1, -1, -1, -1, -1
+    };
+#else
     int64_t expected_vector[kCursorShards] = {-1, -1, -1, -1};
+#endif
     int64_t expected_alloc[kCursorShards] = {-1, -1, -1, -1};
     for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
         const TaskKind kind = static_cast<TaskKind>(task_id % kTasksPerBatch);
-        int64_t *cursors = kind == TaskKind::Alloc
-            ? expected_alloc
-            : (kind == TaskKind::Qk || kind == TaskKind::Pv ? expected_cube : expected_vector);
-        cursors[task_id % kCursorShards] = task_id;
+        if (kind == TaskKind::Alloc) {
+            expected_alloc[task_id % kCursorShards] = task_id;
+        } else if (kind == TaskKind::Qk || kind == TaskKind::Pv) {
+            expected_cube[task_id % kCursorShards] = task_id;
+        } else {
+#if PTO_FDWIC_SHARED_MAP
+            expected_vector[task_id % kSharedVectorCursorShards] =
+                task_id;
+#else
+            expected_vector[task_id % kCursorShards] = task_id;
+#endif
+        }
     }
     bool cursors_ok = true;
     for (uint32_t shard = 0; shard < kCursorShards; ++shard) {
         cursors_ok &= state.cube_cursor[shard].value == expected_cube[shard];
+#if PTO_FDWIC_SHARED_MAP
+        // shared Vector 不应再触碰旧 production-prefix vector cursor。
+        cursors_ok &= state.vector_cursor[shard].value == -1;
+#else
         cursors_ok &= state.vector_cursor[shard].value == expected_vector[shard];
+#endif
         cursors_ok &= state.alloc_cursor[shard].value == expected_alloc[shard];
     }
+#if PTO_FDWIC_SHARED_MAP
+    for (uint32_t shard = 0; shard < kSharedVectorCursorCapacity; ++shard) {
+        cursors_ok &=
+            state.shared_map.shared_vector_cursor[shard].value ==
+                expected_vector[shard];
+    }
+#endif
     Expect(cursors_ok, "all sharded Claim cursors reach their exact final task", &metrics);
 
     if (state.config.profile_phases != 0) {
