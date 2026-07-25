@@ -896,6 +896,60 @@ host/kernel 两件套；最终 ELF 不得含 `WritePollBatchRecordRaw`，也不�
 不得和 perf-clock 的绝对时间互减。当前 S4 尚未因为这两个 b1 样本而宣告完成。
 本阶段只实现和验收 CCEC、CPU 两条路径，不新增 AscendC perf-clock。
 
+#### S4.2 `perf-clock` 规模门禁否定全局 exact-turn
+
+冻结 `bb482001` 对应的 private/shared CCEC perf-clock 两份 ELF 后，先按
+`private -> shared -> shared -> private` 做独立进程交错。b1 全部语义断言
+通过：
+
+| 模式 | 两个独立 b1 样本 | 平均值 |
+| --- | --- | ---: |
+| private | `65.808 us`、`67.343 us` | `66.576 us` |
+| shared | `77.823 us`、`78.893 us` | `78.358 us` |
+
+shared b1 平均多约 `11.783 us`，即 `17.7%`。这个结果只说明短序列差异
+方向稳定，不能替代规模门禁。
+
+同一组冻结 ELF 随后只做一轮 b256 ABBA。private 两次均通过，分别为
+`3.810849 ms` 和 `4.920407 ms`；shared 两次都不是性能样本：
+
+| shared 样本 | watchdog 退出 | `committed_tasks` | 语义 |
+| --- | ---: | ---: | --- |
+| 第一次 | `2.006839 s` | 19 | FAIL |
+| 第二次 | `2.008819 s` | 29 | FAIL |
+
+两个失败都恰好命中 2 秒 watchdog。96 个 worker 全部未完成，最快与最慢
+worker 的 Submit 进度相差 116，且很多 future winner 已经取得 Claim。
+因此这不是普通的 Claim 漏选，而是当前结构形成了 winner convoy：
+
+1. 分片 Claim 允许快核提前取得 future task；
+2. winner 随后在原调用栈等待全局 `committed_tasks == task_id`；
+3. shared loser 不等待并继续前冲，最终更多 winner 占住 worker；
+4. CCEC `SpinHint()` 为空，所有 future winner 持续对同一 cache line 发
+   atomic load，下一 turn 的 winner受到严重争用和饥饿；
+5. Case1 的 region ring 明明恒为空，shared heap、descriptor 发布、symbol
+   resolve 和 register 仍被放进同一条全局串行链。
+
+参考分支的高性能设计已经明确禁止该结构：fresh output 按
+`(producer_task_id, output_slot)` 独立发布，consumer 只等待自己实际消费的
+symbol；ordinary region 才进入 bucket 局部协议，不能在 shared winner
+入口统一等待全局发布前缀。当前 standalone exact-turn 既与该目标冲突，
+也已被 b256 反例否定，不能迁移到真实 simpler。
+
+后续修正按以下独立小步推进：
+
+1. 先把 fresh descriptor 提前到 winner 物化后独立发布，并让 symbol
+   resolver 只等待实际 producer slot；保留 watchdog 和逐字段校验；
+2. 把 shared heap 的 8-shard FetchAdd 改成允许合法并发 allocator，
+   删除只在“全局唯一 writer”前提下成立的预检快照与回滚；
+3. PA Case1 的 region entry 数必须继续严格为 0，并绕过全局 ordered
+   sequencer；非空 region 在 bucket 局部并发协议完成前显式拒绝；
+4. 依次通过 CPU 定向测试、CCEC b1、CCEC b256 语义与签名，再重新做
+   private/shared perf-clock 交错比较。
+
+S4 因此保持未完成。当前优先级是修复 shared 长序列活性，而不是根据失败的
+b256 运行估算性能；本阶段范围仍只有 CCEC 与 CPU。
+
 ### 阶段 R0：迁移真实 simpler
 
 只有 S0～S4 全部闭环后，才按已验证结构依次迁移：
