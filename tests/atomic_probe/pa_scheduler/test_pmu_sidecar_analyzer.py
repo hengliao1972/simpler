@@ -213,11 +213,7 @@ def _capture(offset: int = 0, window: str = "submit-all") -> dict[str, Any]:
 
 
 def _submit_pmu_capture(
-    offset: int = 0,
-    phase: str = "claim",
-    schema_version: int = 5,
-    tensor_map_mode: str = "private",
-    winner_calls: list[int] | None = None,
+    offset: int = 0, phase: str = "claim", schema_version: int = 5
 ) -> dict[str, Any]:
     phase_ids = {
         "none": 0,
@@ -228,10 +224,6 @@ def _submit_pmu_capture(
     }
     phase_id = phase_ids[phase]
     batches = 2
-    if winner_calls is None:
-        winner_calls = [batches * TASKS_PER_BATCH] + [0] * (A5_WORKERS - 1)
-    if len(winner_calls) != A5_WORKERS:
-        raise ValueError("winner_calls fixture must contain one value per worker")
     records: list[dict[str, Any]] = []
     for worker_id in range(A5_WORKERS):
         role = "aic" if worker_id < A5_AIC_WORKERS else "aiv"
@@ -239,13 +231,7 @@ def _submit_pmu_capture(
         block_id = worker_id if role == "aic" else vector_id // 2
         lane = 0 if role == "aic" else 1 + vector_id % 2
         base = 100 + worker_id * 10 + offset
-        calls_per_worker = (
-            0
-            if phase == "none"
-            else batches * TASKS_PER_BATCH
-            if phase in {"claim", "efdrain"} or tensor_map_mode == "private"
-            else winner_calls[worker_id]
-        )
+        calls_per_worker = 0 if phase == "none" else batches * TASKS_PER_BATCH
         primary_requests = 1000 + base
         primary_misses = 100 + base // 10
         phase_requests = 0 if calls_per_worker == 0 else 100 + worker_id * 10 + offset
@@ -343,7 +329,6 @@ def _submit_pmu_capture(
         "configuration": {
             "build_variant": "submit-pmu",
             "build_variant_id": 2,
-            "tensor_map_mode": tensor_map_mode,
             "compiled_phase": phase,
             "compiled_phase_id": phase_id,
             "device": 0,
@@ -890,73 +875,6 @@ class PmuSidecarAnalyzerTest(unittest.TestCase):
                     )
                     with self.assertRaisesRegex(ValueError, "phase_calls does not match"):
                         load_capture(path)
-
-    def test_submit_pmu_shared_claim_and_efdrain_remain_full_per_worker(self) -> None:
-        for phase in ("claim", "efdrain"):
-            with self.subTest(phase=phase):
-                capture = _submit_pmu_capture(
-                    phase=phase, tensor_map_mode="shared"
-                )
-                self.assertTrue(
-                    all(
-                        record["phase_expected_calls"] == 2 * TASKS_PER_BATCH
-                        for record in capture["records"]
-                    )
-                )
-                with tempfile.TemporaryDirectory() as directory:
-                    path = self._write(directory, f"shared-{phase}.json", capture)
-                    load_capture(path)
-
-    def test_submit_pmu_shared_winner_phase_uses_per_worker_wins(self) -> None:
-        winner_calls = [3, 7] + [0] * (A5_WORKERS - 2)
-        for phase in ("materialize", "register"):
-            with self.subTest(phase=phase):
-                capture = _submit_pmu_capture(
-                    phase=phase,
-                    tensor_map_mode="shared",
-                    winner_calls=winner_calls,
-                )
-                self.assertEqual(
-                    [record["phase_expected_calls"] for record in capture["records"]],
-                    winner_calls,
-                )
-                with tempfile.TemporaryDirectory() as directory:
-                    path = self._write(directory, f"shared-{phase}.json", capture)
-                    load_capture(path)
-                self.assertEqual(
-                    sum(
-                        record["phase_expected_calls"]
-                        for record in capture["records"]
-                    ),
-                    2 * TASKS_PER_BATCH,
-                )
-
-    def test_submit_pmu_shared_winner_phase_rejects_wrong_global_sum(self) -> None:
-        capture = _submit_pmu_capture(
-            phase="materialize",
-            tensor_map_mode="shared",
-            winner_calls=[3, 6] + [0] * (A5_WORKERS - 2),
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            path = self._write(directory, "shared-wrong-winner-sum.json", capture)
-            with self.assertRaisesRegex(ValueError, "must sum to"):
-                load_capture(path)
-
-    def test_submit_pmu_private_rejects_sparse_winner_phase(self) -> None:
-        capture = _submit_pmu_capture(phase="register")
-        capture["records"][0]["phase_expected_calls"] -= 1
-        with tempfile.TemporaryDirectory() as directory:
-            path = self._write(directory, "private-sparse-register.json", capture)
-            with self.assertRaisesRegex(ValueError, "phase_expected_calls"):
-                load_capture(path)
-
-    def test_submit_pmu_rejects_unknown_tensor_map_mode(self) -> None:
-        capture = _submit_pmu_capture()
-        capture["configuration"]["tensor_map_mode"] = "shared-ish"
-        with tempfile.TemporaryDirectory() as directory:
-            path = self._write(directory, "invalid-tensor-map-mode.json", capture)
-            with self.assertRaisesRegex(ValueError, "tensor_map_mode"):
-                load_capture(path)
 
     def test_submit_pmu_efdrain_is_an_independent_phase(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

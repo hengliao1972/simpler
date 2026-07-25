@@ -2093,24 +2093,18 @@ slot 容量上重试，仍需重新统计 physical atomic 与完整 Submit，不
 b256 `RingBp` 恢复为 0；因此当前 atomic 与 publication 口径也已严格
 回到 S4.9，而不是仅在源码表面删除了实验分支。
 
-#### 7.5.23 S4.12 shared loser 快返不消减 atomic
+#### 7.5.23 S4.12a shared loser generic finish 快返实验
 
-S4.12 只删除 Claim loser 在稳定 output symbol 建立之后的空
-generic/split finish；所有 worker 仍执行原有 EfDrain 和 Claim。因此该
-候选不是 atomic 消减：
+S4.12a 候选 `b2fe435f` 只让 shared Claim loser 在建立稳定输出引用后
+跳过 generic finish；Claim 候选集合、winner 分布、fanin、publication、
+completion 以及所有 physical atomic 次数都没有改变。因此它是控制流
+裁剪实验，不是 atomic 消减实验。
 
-```text
-b1  ClaimMax = 288
-b256 ClaimMax = 73,728
-```
+CPU、CCEC、A5 泳道和稀疏局部 PMU 均证明 winner-only 路径及其观察契约
+正确。然而与 S4.9 `e8320280` 做每版 12 个正式进程、六个 ABBA/BAAB
+区组的 b256 配对后，候选区组差中位数只有
+`-0.477us / -0.015%`，区组胜负为 3:3；候选均值也只表面快约 0.043%。
+结论是噪声内中性，不能把源码调用数减少解释成 atomic 或墙钟收益。
 
-Startup、Claim、fanin、completion 和 final-barrier 的固定 atomic
-调用点都没有删除。动态 fanin/final 轮询次数仍可能随多核到达时序变化，
-不能拿不同单轮的总 atomic calls 差值冒充源码调用点消减。
-
-这一步改变的是 Claim 之后的 scalar 控制流和观察拓扑：shared loser 只
-保留 EfDrain/Claim，Materialize/PrepareMap/Register/Submit 与 split
-finish 只属于 1,280 个 winner。A5 b1 raw 精确得到 480 条 EfDrain、
-480 条 Claim，以及各 5 条 winner finish 阶段；`dropped=0`。所以后续
-若完整 Submit 变短，应解释为 121,600 条 loser 空 finish 外壳被裁掉，
-不能归功于 atomic 数量减少。是否保留仍等待与 S4.9 的 b256 冻结配对。
+本轮已完整撤销，当前 atomic 计数与 S4.9 保持一致。详细正确性门禁、样本
+分布和原始结果路径见 `shared_tensormap_record.md` 的 S4.12a 实测结论。

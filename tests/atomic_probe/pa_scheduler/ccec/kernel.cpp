@@ -338,20 +338,9 @@ __aicore__ inline void CcecOps::PmuWindowStop(
         context.phase_calls == 0 && context.begin_reads == 0 && context.end_reads == 0 &&
         context.phase_requests == 0 && context.phase_misses == 0 &&
         context.phase_elapsed_ticks == 0;
-    const bool winner_only_shared_phase =
-#if PTO_FDWIC_SHARED_MAP
-        pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::Materialize ||
-        pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::Register;
-#else
-        false;
-#endif
-    const uint32_t replay_calls =
-        state->config.batches * pa_scheduler::kTasksPerBatch;
     const bool running_shape =
         pa_scheduler::kCompiledSubmitPmuPhase != pa_scheduler::SubmitPmuPhase::None &&
-        (winner_only_shared_phase
-             ? context.phase_calls <= replay_calls
-             : context.phase_calls == replay_calls) &&
+        context.phase_calls == state->config.batches * pa_scheduler::kTasksPerBatch &&
         context.begin_reads == context.phase_calls &&
         context.end_reads == context.phase_calls;
     if (none_shape || running_shape)
@@ -359,9 +348,7 @@ __aicore__ inline void CcecOps::PmuWindowStop(
     const bool phase_time_valid =
         pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
             ? context.phase_elapsed_ticks == 0
-            : (context.phase_calls == 0
-                   ? context.phase_elapsed_ticks == 0
-                   : context.phase_elapsed_ticks != 0);
+            : context.phase_calls != 0 && context.phase_elapsed_ticks != 0;
     if (phase_time_valid)
         context.phase_status |= kPhaseStatusTimeValid;
 

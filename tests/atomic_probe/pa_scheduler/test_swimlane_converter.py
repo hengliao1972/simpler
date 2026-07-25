@@ -108,7 +108,6 @@ def _v4_capture(
     *,
     num_cores: int = 1,
     add_parents: bool = True,
-    tensor_map_mode: str = "private",
 ) -> dict[str, object]:
     """构造 phase-only schema-v4 raw；调用者显式提供 Claim/Submit/尾动作。"""
     all_rows = [list(row) for row in rows]
@@ -127,7 +126,6 @@ def _v4_capture(
             "clock_freq_hz": 1_000_000_000,
             "num_cores": num_cores,
             "trace_schema_version": 4,
-            "tensor_map_mode": tensor_map_mode,
             "core_types": [
                 _standalone_topology(core_id)[2] for core_id in range(num_cores)
             ],
@@ -146,119 +144,6 @@ def _v4_capture(
 
 
 class SwimlaneConverterLayoutTest(unittest.TestCase):
-    def test_v4_shared_accepts_claim_derived_winner_only_submit(self) -> None:
-        capture = _v4_capture(
-            [
-                [0, 0, 0, 0, -1, "EfDrain", 100, 105, 0, 0],
-                [0, 0, 0, 0, -1, "Claim", 106, 110, 0x3, 1],
-                [0, 0, 0, 0, -1, "Materialize", 111, 115, 0, 0],
-                [0, 0, 0, 0, -1, "PrepareMap", 116, 118, 0, 0],
-                [0, 0, 0, 0, -1, "Register", 119, 121, 0, 0],
-                [0, 0, 0, 0, -1, "AllocComplete", 122, 126, 0, 0],
-                [0, 0, 0, 0, -1, "Submit", 99, 130, 1, 1],
-                [1, 1, 0, 0, -1, "EfDrain", 100, 105, 0, 0],
-                [1, 1, 0, 0, -1, "Claim", 106, 110, 0x2, 1],
-            ],
-            num_cores=2,
-            tensor_map_mode="shared",
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            input_path = Path(directory) / "raw.json"
-            output_path = Path(directory) / "merged.json"
-            input_path.write_text(json.dumps(capture), encoding="utf-8")
-            convert(input_path, output_path)
-            merged = json.loads(output_path.read_text(encoding="utf-8"))
-
-        names = [event.get("name") for event in merged["traceEvents"]]
-        self.assertEqual(names.count("submit#0"), 1)
-        self.assertIn("claim.won#0", names)
-        self.assertIn("claim.lost#0", names)
-        self.assertEqual(merged["metadata"]["tensor_map_mode"], "shared")
-
-    def test_v4_shared_loser_spans_cut_between_submit_residual(self) -> None:
-        capture = _v4_capture(
-            [
-                [0, 0, 0, 0, -1, "Claim", 105, 110, 0x3, 1],
-                [0, 0, 0, 0, -1, "AllocComplete", 115, 120, 0, 0],
-                [0, 0, 0, 0, -1, "Submit", 100, 130, 1, 1],
-                [0, 0, 0, 1, -1, "EfDrain", 140, 145, 0, 0],
-                [0, 0, 0, 1, -1, "Claim", 150, 155, 0x2, 0],
-                [0, 0, 0, 2, -1, "Claim", 175, 180, 0x3, 0],
-                [0, 0, 0, 2, 1, "WinnerBuild", 185, 190, 0, 0],
-                [0, 0, 0, 2, -1, "Submit", 170, 200, 1, 0],
-            ],
-            tensor_map_mode="shared",
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            input_path = Path(directory) / "raw.json"
-            output_path = Path(directory) / "merged.json"
-            input_path.write_text(json.dumps(capture), encoding="utf-8")
-            convert(input_path, output_path)
-            events = json.loads(output_path.read_text(encoding="utf-8"))[
-                "traceEvents"
-            ]
-
-        between = [
-            (event["ts"], event["dur"])
-            for event in events
-            if event.get("name") == "between_submit_residual"
-        ]
-        # base=90；loser EfDrain[140,145) 与 Claim[150,155) 是已有边界，
-        # 因而只生成三段真正空白，不能再出现覆盖 [130,170) 的整段 residual。
-        self.assertEqual(
-            between,
-            [(0.04, 0.01), (0.055, 0.005), (0.065, 0.015)],
-        )
-
-    def test_v4_private_rejects_missing_loser_submit(self) -> None:
-        capture = _v4_capture(
-            [
-                [0, 0, 0, 0, -1, "EfDrain", 100, 105, 0, 0],
-                [0, 0, 0, 0, -1, "Claim", 106, 110, 0x2, 1],
-            ],
-            tensor_map_mode="private",
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            input_path = Path(directory) / "raw.json"
-            output_path = Path(directory) / "merged.json"
-            input_path.write_text(json.dumps(capture), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "private Submit keys"):
-                convert(input_path, output_path)
-
-    def test_v4_shared_rejects_loser_heavy_phase_without_submit(self) -> None:
-        capture = _v4_capture(
-            [
-                [0, 0, 0, 0, -1, "EfDrain", 100, 105, 0, 0],
-                [0, 0, 0, 0, -1, "Claim", 106, 110, 0x2, 1],
-                [0, 0, 0, 0, -1, "Materialize", 111, 115, 0, 0],
-            ],
-            tensor_map_mode="shared",
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            input_path = Path(directory) / "raw.json"
-            output_path = Path(directory) / "merged.json"
-            input_path.write_text(json.dumps(capture), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "exactly one EfDrain and one Claim"):
-                convert(input_path, output_path)
-
-    def test_v4_requires_explicit_tensor_map_mode(self) -> None:
-        capture = _v4_capture(
-            [
-                [0, 0, 0, 0, -1, "Claim", 110, 120, 0x3, 1],
-                [0, 0, 0, 0, -1, "AllocComplete", 120, 130, 0, 0],
-                [0, 0, 0, 0, -1, "Submit", 100, 140, 1, 1],
-            ]
-        )
-        metadata = capture["metadata"]
-        assert isinstance(metadata, dict)
-        metadata.pop("tensor_map_mode")
-        with tempfile.TemporaryDirectory() as directory:
-            input_path = Path(directory) / "raw.json"
-            output_path = Path(directory) / "merged.json"
-            input_path.write_text(json.dumps(capture), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "tensor_map_mode"):
-                convert(input_path, output_path)
-
     def test_v4_splits_internal_and_tail_residual_without_repeated_fields(self) -> None:
         capture = _v4_capture(
             [

@@ -264,11 +264,9 @@ enum class ProfilePhase : uint32_t {
 };
 
 // submit-pmu 每个 ELF 只编译一个局部归因阶段。none 不做中途 counter
-// 读取，是完整 Submit 的正式基线；Claim/EfDrain 覆盖每核 5*batches
-// 个逻辑 task。private 的 Materialize/Register 仍是同一矩形；shared
-// loser 轻返回后，两者按本核 claim_wins 闭合、全局仍为 5*batches。
-// 历史 ID=3 曾用于 winner-only WaitForSlot，现已退役且不复用，避免旧
-// raw 被误认成新阶段。
+// 读取，是完整 Submit 的正式基线；其余阶段都在每个 worker 的五次 Submit
+// 上各执行一次，因此统一按固定 5*batches 次数闭合。历史 ID=3 曾用于
+// winner-only WaitForSlot，现已退役且不复用，避免旧 raw 被误认成新阶段。
 enum class SubmitPmuPhase : uint32_t {
     None = 0,
     Claim = 1,

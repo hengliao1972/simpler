@@ -3170,98 +3170,49 @@ b1/b256 和 private b1。clean 实现提交冻结后，与 S4.9 `e8320280` 使�
 上述四项不能合成一个提交，否则无法判断收益来自 loser 裁剪、winner
 分布、cursor cacheline 冲突还是在途容量。
 
-#### S4.12a 实现与正确性闭合
+#### S4.12a 实测结论：路径正确，但墙钟中性，已撤销
 
-实现保持了上述边界，没有把 loser 早退扩大成新的候选规则：
+候选提交 `b2fe435f` 按上述边界完成了 shared loser 快返。CPU guard-page
+测试证明 loser 在构造稳定输出引用后不再读取 TaskArgs 后半区；Host
+oracle、split finish、raw 泳道、局部 PMU 和 Python 工具也都收敛为
+winner-only 的 Materialize/PrepareMap/Register/Submit。验证覆盖：
 
-- `SubmitCallbackTask()` 仍让所有 actor 执行 EfDrain、Claim 和
-  `PrepareSharedTaskOutputs()`；Alloc 仍由所有 actor 构造三个轻量
-  Output 参数；
-- shared loser 随后只推进逻辑 `submits`，必要时闭合末 task 的
-  perf-clock/PMU 结束边界，再直接返回；
-- shared winner 才构造 ticket 并进入 generic/split finish；
-- private 仍保留每次 replay 的完整 eager finish；
-- device raw 没有增加字段。swimlane metadata 只补充已有编译身份
-  `tensor_map_mode`，供离线工具拒绝把 private 缺记录误认成 shared 稀疏
-  Submit。
+- 用户 `.venv` 下 114 项 converter、exclusive analyzer 和 PMU 测试；
+- CPU private/shared b1、shared b256 及 perf-clock；
+- CCEC private/shared 的 swimlane、perf-clock 和五种 submit-PMU，
+  共 14 种构建；
+- A5 shared/private b1 泳道，以及 shared Materialize/Register PMU；
+  b1 的五个 winner 分散在五个核，其余 91 核为合法零调用。
 
-CPU guard-page 用例经过实际 `SubmitCallbackTask()` 连续回放五类 loser：
-Alloc 先构造三个 Output 参数，随后把同一 `TaskArgs` 页设为
-`PROT_NONE`；QK/SF/PV/UP 仍能返回正确 task/slot symbol，且 finish trap
-保持 0 次。用例同时核对：
+这些结果证明路径与观察契约正确，但不能替代性能门槛。候选 shared
+perf-clock `.text` 从 S4.9 的 129,080B 增至 130,360B。冻结
+`e8320280` 与 `b2fe435f` 后，在同一 device 上各预热两次，再执行六个
+ABBA/BAAB 区组；每版包含 12 个独立 b256 正式进程，范围均为
+`real-compute 6,28,4,1`、`two-16`，计时边界为首个 Submit 起点到最后
+一个 Submit 返回：
 
-```text
-submits=5
-claim_attempts=3
-claim_wins=0
-tensor_args_added=3
-materialized/map_insert/slot/completion/publication=0
-shared heap cursor/vend=0
-```
+| 指标 | S4.9 `e8320280` | S4.12a `b2fe435f` |
+| --- | ---: | ---: |
+| 正式样本数 | 12 | 12 |
+| 最小值 | 3,213.912us | 3,210.795us |
+| 中位数 | 3,243.442us | 3,242.090us |
+| 均值 | 3,241.991us | 3,240.591us |
+| 最大值 | 3,279.896us | 3,256.256us |
+| 标准差 | 16.733us | 14.042us |
 
-CPU shared/private 的 swimlane、perf-clock 四组严格构建和 b1 均通过；
-shared b256 在两种构建下也通过，继续闭合 122,880 次逻辑 replay、
-73,728 次 ClaimMax、1,280 个 winner、1,024 个 kernel、1,280 条 fanin、
-2,048 次 output publication、768 次 writer commit，`RingBp=0`，
-shared heap vend 为 206,569,472B。
-
-CCEC shared/private 各七种构建全部通过：
+候选均值表面快 1.400us（约 0.043%），但六个区组恰好 3 快、3 慢，
+区组配对差中位数仅为 `-0.477us / -0.015%`。该差异远小于样本波动，
+只能判定为中性，不能宣称减少 121,600 次源码级 generic finish 调用带来
+了可测收益。原始日志与机器可读汇总位于：
 
 ```text
-swimlane
-perf-clock
-submit-pmu none/claim/efdrain/materialize/register
+outputs/perf_clock_pair_e8320280_vs_b2fe435f_20260725_135812/
 ```
 
-每份 manifest 的 mode/variant/phase 与产物 SHA 均复验通过。shared
-perf-clock `.text=130,360B`，相对 S4.9 的 129,080B 增加 1,280B；
-shared swimlane `.text=415,288B`，相对 S4.9 的 411,192B 增加
-4,096B。private perf-clock `.text=125,752B`、`.rodata=300B` 与仓内
-S4.6 private 冻结件逐字节一致；完整 ELF 的 SHA 差异只位于调试和符号
-信息。S4.9 冻结目录没有 private 产物，不能谎称做了不存在的 S4.9
-private 完整 ELF 对比。
-
-A5 shared b1 的正式稀疏泳道位于：
-
-```text
-outputs/pa_scheduler_shared_swimlane_20260725_134134_2512990/ccec/
-```
-
-该轮 raw 有 2,229 条记录，host 预计值同为 2,229，`dropped=0`；
-480 条 EfDrain、480 条 Claim 保持完整，而
-Materialize/PrepareMap/Register/Submit 各只有 5 条。Host 的 split
-oracle 证明每个动态 winner 只进入一次 finish，并精确闭合全局 5 次
-finish 与 task-id 和 10；没有 winner 的核保持零 finish 地址/调用。
-converter 生成 2,240 条 merged event，exclusive analyzer 证明：
-
-```text
-Submit partition                              exact
-shared-loser EfDrain = Kernel union + control exact
-OrchestrationReplay partition                 exact
-FinalDrain partition                          exact
-WorkerCompletion partition                    exact
-```
-
-其中 loser EfDrain 内嵌的前序 Kernel 被单独归入 kernel union，没有把
-计算单元时间冒充 scalar control。private b1 也通过完整 480 条 Submit
-矩形和同一 analyzer，产物位于：
-
-```text
-outputs/pa_scheduler_private_swimlane_20260725_134346_2514875/ccec/
-```
-
-shared Materialize/Register 的 A5 b1 submit-PMU 又独立验证了稀疏阶段
-口径：两轮都是全局 calls=5、91 个零调用核、96/96 record trusted 且
-96/96 phase time valid。对应 raw/HTML 为：
-
-```text
-/tmp/s412_shared_materialize_b1_20260725.json
-/tmp/s412_shared_materialize_b1_20260725_report.html
-/tmp/s412_shared_register_b1_20260725.json
-/tmp/s412_shared_register_b1_20260725_report.html
-```
-
-到这里仅证明 S4.12a 的路径、观测和 private 隔离正确。A5 b1
-perf-clock 单轮 62.793us 只作首末边界门禁；它不是 b256 性能收益证据。
-下一步必须先冻结本实现，再与 S4.9 `e8320280` 做既定 12+12
-ABBA/BAAB 配对，才能决定保留还是撤销。
+因此按预先声明的净收益门槛撤销 `b2fe435f`，同时撤销为稀疏 loser
+泳道和 PMU 新增的工具分支。撤销后重新构建的 Host 与 S4.9 冻结件 SHA
+一致；device ELF 的完整文件因调试/符号信息存在构建差异，但实际执行的
+`.text=129,080B` 与 `.rodata=288B` 均逐字节一致。后续不再开展
+S4.12b，因为它仍只裁剪同一类空外壳；下一候选应回到会改变共享状态访问
+形状的 `alloc_cursor[3][8]`，并把正确性、winner 分布和性能作为独立
+阶段重新验证。

@@ -507,62 +507,20 @@ struct PmuValidation {
 // 高水位作为保守拒绝阈值；它只降低风险，不把“未越线”表述成回卷证明。
 constexpr uint32_t kProgrammableCounterRiskThreshold = UINT32_MAX / 4U;
 
-uint32_t ExpectedSubmitPmuPhaseCallsPerWorker(
-    uint32_t batches, const pa_scheduler::WorkerResult &result
-) {
-    // Claim/EfDrain 仍覆盖每个 worker 的每次 Submit。shared 的
-    // Materialize/Register 已位于 Claim winner 分支内，故逐核期望必须从
-    // 真实 wins[] 汇总值推导，不能由 host 预言动态 winner。
-#if !PTO_FDWIC_SHARED_MAP
-    (void)result;
-#endif
+uint32_t ExpectedSubmitPmuPhaseCallsPerWorker(uint32_t batches) {
+    // 当前所有 running phase 都覆盖每个 worker 的每次 Submit，固定为 5B。
     switch (pa_scheduler::kCompiledSubmitPmuPhase) {
     case pa_scheduler::SubmitPmuPhase::None:
         return 0U;
     case pa_scheduler::SubmitPmuPhase::Claim:
     case pa_scheduler::SubmitPmuPhase::EfDrain:
-        return batches * pa_scheduler::kTasksPerBatch;
     case pa_scheduler::SubmitPmuPhase::Materialize:
     case pa_scheduler::SubmitPmuPhase::Register:
-#if PTO_FDWIC_SHARED_MAP
-        {
-            uint64_t winner_calls = 0;
-            for (uint32_t kind = 0;
-                 kind < static_cast<uint32_t>(pa_scheduler::TaskKind::Count);
-                 ++kind) {
-                winner_calls += result.wins[kind];
-            }
-            return static_cast<uint32_t>(winner_calls);
-        }
-#else
         return batches * pa_scheduler::kTasksPerBatch;
-#endif
     case pa_scheduler::SubmitPmuPhase::Count:
         break;
     }
     return UINT32_MAX;
-}
-
-uint64_t ExpectedSubmitPmuPhaseCallsGlobal(uint32_t batches) {
-    const uint64_t tasks =
-        static_cast<uint64_t>(batches) * pa_scheduler::kTasksPerBatch;
-    switch (pa_scheduler::kCompiledSubmitPmuPhase) {
-    case pa_scheduler::SubmitPmuPhase::None:
-        return 0U;
-    case pa_scheduler::SubmitPmuPhase::Claim:
-    case pa_scheduler::SubmitPmuPhase::EfDrain:
-        return tasks * pa_scheduler::kWorkers;
-    case pa_scheduler::SubmitPmuPhase::Materialize:
-    case pa_scheduler::SubmitPmuPhase::Register:
-#if PTO_FDWIC_SHARED_MAP
-        return tasks;
-#else
-        return tasks * pa_scheduler::kWorkers;
-#endif
-    case pa_scheduler::SubmitPmuPhase::Count:
-        break;
-    }
-    return UINT64_MAX;
 }
 
 bool ValidatePmu(
@@ -615,7 +573,7 @@ bool ValidatePmu(
     for (uint32_t worker = 0; worker < pa_scheduler::kWorkers; ++worker) {
         const pa_scheduler::WorkerResult &result = state.results[worker];
         const uint32_t expected_phase_calls_per_worker =
-            ExpectedSubmitPmuPhaseCallsPerWorker(state.config.batches, result);
+            ExpectedSubmitPmuPhaseCallsPerWorker(state.config.batches);
         const uint32_t status = result.pmu_status;
         const uint32_t core_id = StatusCoreId(status);
         const bool record_trusted = (status & kStatusRequired) == kStatusRequired;
@@ -657,9 +615,7 @@ bool ValidatePmu(
             result.pmu_phase_elapsed_ticks <= submit_elapsed_ticks &&
             (pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
                  ? result.pmu_phase_elapsed_ticks == 0U
-                 : (expected_phase_calls_per_worker == 0U
-                        ? result.pmu_phase_elapsed_ticks == 0U
-                        : result.pmu_phase_elapsed_ticks != 0U));
+                 : result.pmu_phase_elapsed_ticks != 0U);
         const bool logical_aic = worker < pa_scheduler::kAicWorkers;
         const bool physical_aic = pa_scheduler::pmu_owner::IsAicPhysicalSlot(core_id);
         trusted += record_trusted;
@@ -807,10 +763,7 @@ bool ValidatePmu(
     const bool phase_boundaries_ok = phase_boundary_matches == pa_scheduler::kWorkers;
     const bool phase_call_shape_ok = phase_call_shape_matches == pa_scheduler::kWorkers;
     const bool phase_time_ok = phase_time_valid_records == pa_scheduler::kWorkers;
-    const bool phase_calls_ok =
-        phase_calls == expected_phase_calls &&
-        expected_phase_calls ==
-            ExpectedSubmitPmuPhaseCallsGlobal(state.config.batches);
+    const bool phase_calls_ok = phase_calls == expected_phase_calls;
     const bool submit_engine_observation_ok =
         pmu.mode != WindowMode::SubmitAll ||
         workload.mode != pa_scheduler::WinnerWorkloadMode::RealCompute ||
@@ -1149,19 +1102,7 @@ bool ExportPmuJson(
     );
     std::fputs("\"configuration\":{\"kernel_path\":", output);
     WriteJsonString(output, options.kernel_path);
-    std::fputs(
-        ",\"build_variant\":\"submit-pmu\",\"build_variant_id\":2,"
-        "\"tensor_map_mode\":",
-        output
-    );
-    WriteJsonString(
-        output,
-        pa_scheduler::kCompiledTensorMapMode ==
-                pa_scheduler::TensorMapBuildMode::Shared
-            ? "shared"
-            : "private"
-    );
-    std::fputs(",\"compiled_phase\":", output);
+    std::fputs(",\"build_variant\":\"submit-pmu\",\"build_variant_id\":2,\"compiled_phase\":", output);
     WriteJsonString(output, SubmitPmuPhaseName(pa_scheduler::kCompiledSubmitPmuPhase));
     std::fprintf(
         output, ",\"compiled_phase_id\":%u",
@@ -1414,16 +1355,12 @@ bool ExportPmuJson(
         const uint64_t submit_elapsed_ticks = result.submit_end >= result.submit_begin
             ? result.submit_end - result.submit_begin
             : 0U;
-        const uint32_t expected_phase_calls =
-            ExpectedSubmitPmuPhaseCallsPerWorker(state.config.batches, result);
         const bool phase_time_valid =
             submit_elapsed_ticks != 0U &&
             result.pmu_phase_elapsed_ticks <= submit_elapsed_ticks &&
             (pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
                  ? result.pmu_phase_elapsed_ticks == 0U
-                 : (expected_phase_calls == 0U
-                        ? result.pmu_phase_elapsed_ticks == 0U
-                        : result.pmu_phase_elapsed_ticks != 0U));
+                 : result.pmu_phase_elapsed_ticks != 0U);
         const bool trusted = primary_trusted && phase_trusted && phase_time_valid;
         const bool is_aic = result.role == static_cast<uint32_t>(pa_scheduler::CoreRole::Aic);
         const uint32_t vector_id = is_aic ? 0U : worker - pa_scheduler::kAicWorkers;
@@ -1453,6 +1390,8 @@ bool ExportPmuJson(
         const bool boundaries_balanced =
             result.pmu_phase_begin_reads == result.pmu_phase_calls &&
             result.pmu_phase_end_reads == result.pmu_phase_calls;
+        const uint32_t expected_phase_calls =
+            ExpectedSubmitPmuPhaseCallsPerWorker(state.config.batches);
         std::fprintf(
             output,
             "%s{\"worker_id\":%u,\"physical_core_id\":%u,\"role\":\"%s\",\"block_id\":%u,"

@@ -31,11 +31,9 @@ frontier 和 worker 状态，任一不符都会返回失败。
 compete-first eager：每核构造五类完整 `TaskArgs` 并执行 per-worker
 Materialize/map 前端。shared 则只保留 Alloc 的全员轻构参，QK/SF/PV/UP
 只有 winner 构参和 Materialize；loser 只声明稳定 output symbol，并闭合
-逻辑 Submit 计数后直接返回，不进入 generic/split finish，也不伪造
-Materialize、PrepareMap、Register 或 Submit 记录。CCEC 正式泳道构建将
-orchestration caller、每核 runtime state 和 winner-only noinline finish
-拆分为独立 TU；CPU 使用同一公共业务模板做协议回归。本阶段只验收 CCEC
-与 CPU，不把 AscendC 结果写进闭环证据。
+固定 finish/Submit 边界。CCEC 正式泳道构建将 orchestration caller、每核
+runtime state 和 noinline finish 拆分为独立 TU；CPU 使用同一公共业务模板
+做协议回归。本阶段只验收 CCEC 与 CPU，不把 AscendC 结果写进闭环证据。
 
 Case1 的 task 不是五个彼此独立的占位符。standalone 会从 Tensor descriptor 的
 owner 和当前构建模式的 TensorMap 收集 producer，去重后构造下列 fanin 图：
@@ -318,18 +316,15 @@ Claim 并独立声明同一组 output symbol；Alloc 暂时保留每核三个静
 独立预留 shared heap、生成 descriptor，只在自己实际依赖的
 `(producer_task_id, output_slot).published` 上等待并只读解析 fanin；本地
 执行状态建立后再提交 INOUT writer，最后发布 descriptor。PA Case1 不再
-读取或推进全局 `committed_tasks/reclaim_upto`。所有 loser 都在 Claim 后
-返回稳定 output symbol：Alloc loser 仍完成三个轻量 Output 参数构造，
-QK/SF/PV/UP loser 不读取上一 task 的 `TaskArgs`。loser 不进入
-generic/split finish，不触碰 heap/map/payload，也不生成虚假的 finish 阶段
-记录。逻辑 Submit 数和末 task 性能边界由 caller 内的统一收尾保持完整。
+读取或推进全局 `committed_tasks/reclaim_upto`。loser 仍以非空地址把上一
+task 的陈旧
+`TaskArgs` 传过 split ABI，但 finish 只闭合固定泳道/Submit 边界，不读参数
+内容，也不触碰 heap/map/payload。
 
-CPU guard-page 定向测试先让 Alloc loser 构造三个轻量 Output 参数，再把
-`TaskArgs` 页改成 `PROT_NONE`，随后通过 QK/SF/PV/UP 四个真实 loser
-Submit；任一陈旧字段读取都会立即失败。测试还用 finish trap 断言 loser
-跨 TU 调用数为 0，并逐项核对五类 task 返回的 output symbol。逐核 host
-oracle 按实际 wins 精确核对四类重构参次数，防止只看全局总数而漏掉某个
-loser 回退。S4.6 另有三组定向门禁：预置 terminal `fatal` 后 winner
+CPU guard-page 定向测试会把 loser 的 `TaskArgs` 页改成 `PROT_NONE`，依次
+通过 Alloc/QK/SF/PV/UP 五次 split finish；任一字段读取都会立即失败。逐核
+host oracle 还按实际 wins 精确核对四类重构参次数，防止只看全局总数而漏掉
+某个 loser 回退。S4.6 另有三组定向门禁：预置 terminal `fatal` 后 winner
 不得产生 heap/slot/completion/symbol 副作用；空 region 验证分别覆盖
 Local/GM 的 manual 与 ordinary writer；shared `PrepareMap` raw marker 的
 负向自测会拒绝非零时长、task 序列或身份漂移、未锚定 matching
@@ -438,10 +433,9 @@ cursor/vend、symbol writer/published 等尚未逐条接入 atomic 泳道 wrappe
 所以这一版泳道不能声称完整列出了 shared 协议 atomic，也不能从现有事件拆出
 shared heap 或 symbol 单指令成本。这不影响 host 对 cursor/vend、descriptor、
 输出符号、依赖边和规范化 writer 签名的独立校验。为复用现有 analyzer，
-shared 泳道仍为每个 winner Submit 写一条零时长 `PrepareMap` 结构
-marker；loser 在 Claim 后直接返回，不生成该 marker。marker 不读钟、
-不访问 region sidecar，且在 perf-clock/submit-PMU 构建中编译消除，
-不能把它解读为 shared 模式仍有 PrepareMap 业务开销。
+shared 泳道仍为每个 Submit 写一条零时长 `PrepareMap` 结构 marker；它不
+读钟、不访问 region sidecar，且在 perf-clock/submit-PMU 构建中编译消除，
+不能把该 marker 解读为 shared 模式仍有 PrepareMap 业务开销。
 
 ## 5. 使用说明：运行、测量与泳道查看
 
@@ -893,8 +887,7 @@ raw 行重算和 converter 重算逐项一致；`dropped_records` 必须为 0，
 
 2026-07-19 早期曾完成 CPU/CCEC/AscendC b1 语义门禁，但该过程态
 raw 仍含现已删除的 `LoserReplay`，当前 converter 会拒绝它们。下面
-只列当前不含 `LoserReplay` 伪阶段的 CCEC 证据。删除无业务实体的
-loser 标记后，
+只列当前无 loser 记录的 CCEC 证据。删除无业务实体的 loser 标记后，
 b256 规模样本位于：
 
 ```text
@@ -1020,12 +1013,11 @@ phase/lap/Kernel 边界修复之前的 schema-v2 逐调用模型，只能用于�
 运行时关闭 record，也会污染要观察的取指环境。
 
 `none`/`claim`/`efdrain` 保持与泳道版一致的跨 TU split-finish
-形状；shared 中只有 Claim winner 跨 TU，loser 在 caller 内直接返回。
-Claim/EfDrain 的局部边界都在 finish 之前。`materialize`/`register`
-边界位于 finish 内，当前为了使用同一份真实 PMU context 而采用
-inline-finish 诊断 ELF。因此后两者与 `none` 的代码布局并不相同，
-只能解释各自 ELF 内的观测结果，不能与 `none` 机械相减或当作无扰动
-的阶段净值。
+形状；这两个局部阶段的边界都在 finish 之前。`materialize`/
+`register` 边界位于 finish 内，当前为了使用同一份真实
+PMU context 而采用 inline-finish 诊断 ELF。因此后两者与 `none`
+的代码布局并不相同，只能解释各自 ELF 内的观测结果，不能与
+`none` 机械相减或当作无扰动的阶段净值。
 
 当前 `submit-pmu` 只支持：
 
@@ -1034,8 +1026,8 @@ inline-finish 诊断 ELF。因此后两者与 `none` 的代码布局并不相同
 | `none` | 0 | 不做任何中途 shadow counter 读取 | 完整 Submit 主基准，优先用于回答 AIC/AIV 每核 request/miss |
 | `claim` | 1 | 每次 `Claim()` 调用前后读取 shadow counter | 验证局部归因链路，输出带观察扰动的 running read-clear 下界和保守上界 |
 | `efdrain` | 2 | Submit 开头唯一的 EfDrain call-site 前后 | 归因 opportunistic drain，不包含 RingBackpressure/FinalDrain |
-| `materialize` | 4 | 每次实际 `MaterializeTask()` 调用前后 | 归因 descriptor materialize；private 覆盖全部 Submit，shared 只覆盖 winner |
-| `register` | 5 | 每次实际注册边界前后 | 归因输出注册；private 覆盖全部 Submit，shared 只覆盖 winner |
+| `materialize` | 4 | 每次 `MaterializeTask()` 调用前后 | 归因 descriptor materialize；成功和失败出口都由同一闭合边界覆盖 |
+| `register` | 5 | 每次 `RegisterOutputs()` 调用前后 | 归因输出注册；Alloc 与非 Alloc 两个互斥调用点合起来仍是每次 Submit 一次 |
 
 分别构建：
 
@@ -1204,19 +1196,17 @@ phase miss    ∈ [observed miss,    observed miss    + miss loss]
 区间必须逐核构造后再聚合。CNT8/CNT5 是顺序 `ld_dev` 而非原子配对快照，
 不要求局部 `phase miss <= phase request`；只要求二者分别不超过对应 shadow，
 上界分别不超过对应 primary。`none` 中 phase calls/begin/end/request/miss 必须
-全为 0。Claim/EfDrain 的每核 begin/end/calls 固定为
-`batches * 5`，全局为 `batches * 5 * 96`。private 的
-Materialize/Register 保持同一矩形；shared 的 Materialize/Register
-逐核调用数等于本核 `claim_wins`，允许为 0，全局总和固定为
-`batches * 5`。所有非零调用都要求 begin/end/calls 配对；零 winner 核的
-局部 calls、elapsed、request 和 miss 必须同时为 0。`efdrain` 插点只允许
-包围 Submit 开头的专属调用，不能插入复用的 `DrainReady()` 函数体；
-`materialize` 必须先保存真实返回值再关闭边界，保证失败出口也闭合。
-每个非零 running phase 还要求 `phase_elapsed_ticks > 0`，且不超过同核从
-首个 `submit_begin` 计时点到末个 `submit_end` 计时点的
-`submit_elapsed_ticks`；前者位于首个 `BeginCallbackSubmit()` 上下文初始化
-之后，后者位于末个逻辑 Submit 返回之前。`none` 的 phase elapsed 必须
-精确为 0。
+全为 0；其余四个 phase 的每核 begin/end/calls 都必须配对，且每核 calls 固定为
+`batches * 5`，全局为 `batches * 5 * 96`。原因是每个 batch 固定提交
+Alloc/QK/SF/PV/UP 五个 task，每次 Submit 都恰好执行一次 Claim、开头 EfDrain、
+Materialize 和 Register 边界。`efdrain` 插点只允许包围 Submit 开头的专属调用，
+不能插入复用的 `DrainReady()` 函数体；`materialize` 必须先保存真实返回值再关闭
+边界，保证失败出口也闭合；`register` 的 Alloc 与非 Alloc 两个源码调用点互斥，
+不能误算成每次 Submit 两次。每个 running phase 还要求每核
+`phase_elapsed_ticks > 0`且不超过同核从首个 `submit_begin` 计时点
+到末个 `submit_end` 计时点的 `submit_elapsed_ticks`；前者位于首个
+`BeginCallbackSubmit()` 上下文初始化之后，后者位于末个 Submit 返回之前。
+`none` 的 phase elapsed 必须精确为 0。
 当前 Case1 中真实 TensorMap insert 工作主要发生在
 UP 的输出注册，其他 task 的 Register 可能很短或没有 insert；因此该 phase 的
 固定调用数只证明边界覆盖完整，不能解释为五类 task 拥有等量注册工作。
