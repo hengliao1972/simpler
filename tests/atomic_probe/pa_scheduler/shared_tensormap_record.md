@@ -2881,3 +2881,96 @@ S4.10 的设计和失败证据，因为参考分支的唯一候选思想仍有�
 
 严格的源码与 ELF 等价证明已恢复 S4.9 实现身份；3.233ms 单轮仅验证设备上
 的性能量级，没有被拿来替代此前冻结件 12+12 样本的保留/撤销判据。
+
+### 2026-07-25：S4.11 候选收敛到 pure INPUT deferred resolve
+
+#### 不把参考的 14 slot 当成当前 Case1 优化
+
+重新核对后，参考 shared 的 14 和 standalone 的 4 都是每核 kernel 执行
+slot 数，不是 ordinary-region TensorMap ring 深度。当前 4 slot 扣除两个
+BlockWon 预留后有两个普通 slot；参考 14 slot 则有 12 个普通 slot。但当前
+Case1 和参考 PA 都只提交单 lane task，standalone 也没有实现 BlockWon
+执行路径。
+
+更关键的是，S4.9 冻结配对中 12/12 个正式 b256 样本均为
+`RingBp=0`。当前两个可用 slot 已经没有容量等待，把 4 改成 14 不会删除
+任何已观测开销，反而会：
+
+- 把 `DrainReady()` 和 `FindFreeSlot()` 的扫描上限从 4 增至 14；
+- 每核增加十个 4,824B slot，并移动 WorkerState 后续字段；
+- 破坏 standalone 固定的 production prefix 和 `kRealDistGlobalBytes`；
+- 把状态布局、代码生成和扫描成本混进容量实验，无法解释因果。
+
+因此本阶段不实现、不编译也不上板比较 4→14。只有未来接入多 lane
+BlockWon、实测持续出现 RingBp，或整体迁移参考 shared DistCore ABI 时，
+才重新建立独立容量实验。
+
+#### pure INPUT 为什么是下一项单变量
+
+S4.9 的 pure INPUT 当前走：
+
+```text
+Submit 内等待 shared-output published
+→ invalidate/copy 128B descriptor 到 LocalSlot
+→ 执行前再次等待 producer task flag
+→ Kernel
+```
+
+前一个等待只保证 descriptor 已发布，后一个 flag 才保证 producer kernel
+数据完成。参考路径在 Build 时先 try-resolve：ready 就直接复制，未发布就把
+句柄随 slot 保存；drain 在 fanin flag ready 后、Kernel 前完成解析。
+
+参考泳道的 491 个 Resolve task 中，若只延迟 pure INPUT，仍覆盖 490 个，
+约 99.8%；共可延迟 872 个实际未就绪 pure INPUT ref，同时把 720 个
+INOUT deferred 排除在本轮之外。全量 b256 逻辑图有 1,280 个 pure INPUT
+descriptor：SF 256、PV 256、UP 768。由此可在不迁移 writer intent 的前提下
+验证绝大部分调度超前价值。
+
+本阶段边界固定为：
+
+- 只有 plain `SharedOutputRef + Input` 可 deferred；
+- INOUT/OutputExisting 继续在 Submit 内等待 publication、校验
+  `last_writer==producer`，并保持
+  `BuildWinner → FetchMax writer commit → publish outputs`；
+- deferred INPUT 仍把原 producer 加入 fanin，不能删除执行门禁；
+- resolver 必须位于 fanin flag ready 后、Kernel 前；
+- 非法 ref、错误 published/writer 或解析失败必须广播 fatal、只释放一次
+  slot，禁止 Kernel 和 completion；
+- 不改 Claim、shared heap、ordinary region、slot 数、trace/raw、PMU 和
+  private 路径。
+
+#### standalone 复用现有 slot 存储，不扩 production prefix
+
+参考 production ABI 在 RingSlot 中有独立
+`shared_ref_mask/shared_refs[32]`；机械照搬会让 standalone 每个 slot
+增加约 520B，并移动固定的 WorkerState/DistGlobal 边界。这会使性能差异
+同时包含 GM 状态体积和缓存布局，不适合作为单变量验证。
+
+standalone 首版采用等价协议、不同存储编码：
+
+- 复用 `LocalSlot.function_padding` 的 4B 保存 32-bit deferred mask；
+- 某 tensor 未解析时，其 `slot.tensors[i]` 本来还没有有效 descriptor，
+  用 `buffer_addr/buffer_size` 两个既有 `uint64_t` 暂存完整 16B
+  `FdwicOutputRef`；
+- pack/unpack 使用显式位运算，不用跨类型指针别名；
+- resolver 先把两个 word 解码到局部 ref，再 invalidate/copy 完整 128B
+  descriptor 原地覆盖；既有 `slot.args[i]=&slot.tensors[i]` 无需重建；
+- 每次 Build 先清 mask，成功 resolve、正常释放和失败释放都清 mask，
+  防止 slot 复用继承旧状态。
+
+这样 `sizeof(LocalSlot)==4,824B`、WorkerState 全部 offset 和完整
+production prefix 保持不变。它只用于 standalone 隔离验证 deferred 协议，
+不能伪称等同参考的 typed slot ABI；若候选有效，迁移真实 simpler 时应复用
+其已有 typed storage，并重新做性能配对。
+
+#### 实施与保留门槛
+
+先用 CPU 定向测试覆盖 ready/deferred 混合、多 mask 位、pack/unpack、
+延迟发布、错误 publication/writer、INOUT 仍 eager、slot 脏状态复用以及
+失败不执行 Kernel/Completion；再跑 CPU shared/private b1/b256 和
+CCEC shared/private 构建。A5 先做 b1/b256 语义门禁，最后冻结 clean
+perf-clock ELF，与 S4.9 `e8320280` 做相同 ABBA/BAAB 配对。
+
+主判据仍是完整 Submit；同时用同口径正常构建检查最终 drain/完整 launch。
+若 Submit 变短但最终 drain 等量变长，只能记录为工作后移。只有正确性闭合且
+冻结配对取得净收益才保留；否则像 S4.10 一样完整撤销。
