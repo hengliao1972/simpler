@@ -792,10 +792,69 @@ PA_DEVICE bool BuildSharedRegistrationEntries(
 }
 
 template <typename Ops>
+PA_DEVICE bool WaitForSharedOutputPublished(
+    PA_GM SharedTensorMapSidecar &map, const FdwicOutputRef &output_ref,
+    PA_GM volatile int32_t *fatal
+) {
+    // 前置条件：调用者已经用 IsPlainSharedOutputRef 校验 producer/slot/view
+    // 范围，并确认 producer_task_id 严格早于当前 consumer task。
+    PA_GM volatile int64_t *published =
+        &map.shared_outputs[
+             static_cast<uint32_t>(output_ref.producer_task_id)
+         ].published[output_ref.output_slot].value;
+    const int64_t expected =
+        static_cast<int64_t>(output_ref.producer_task_id);
+    int64_t observed = Ops::Load(published);
+    if (observed == expected) {
+        return true;
+    }
+    if (observed != -1) {
+        if (fatal != nullptr) {
+            (void)Ops::Exchange(fatal, static_cast<int32_t>(1));
+        }
+        return false;
+    }
+
+    // 只在 producer 尚未发布时建立超时窗口；正常已就绪路径不增加
+    // SYS_CNT。轮询对象按 (producer,slot) 分散，不再让所有依赖消费者
+    // 争用同一条全局发布前沿。
+    const uint64_t begin = Ops::Now();
+    uint32_t polls = 0;
+    while (true) {
+        Ops::SpinHint();
+        observed = Ops::Load(published);
+        if (observed == expected) {
+            return true;
+        }
+        if (observed != -1) {
+            if (fatal != nullptr) {
+                (void)Ops::Exchange(fatal, static_cast<int32_t>(1));
+            }
+            return false;
+        }
+        ++polls;
+        if ((polls & 1023U) != 0) {
+            continue;
+        }
+        if (fatal != nullptr && Ops::Load(fatal) != 0) {
+            return false;
+        }
+        if (Ops::Now() - begin > kWatchdogTicks) {
+            if (fatal != nullptr) {
+                (void)Ops::Exchange(fatal, static_cast<int32_t>(1));
+            }
+            return false;
+        }
+    }
+}
+
+template <typename Ops>
 PA_DEVICE uint32_t CollectSharedFanin(
     PA_GM SharedTensorMapSidecar &map, const TaskArgs &args, SubmitContext &context,
     int32_t task_id, int32_t heap_window, LocalStats &stats,
-    int32_t fanin[kMaxFanin], bool &protocol_ok, uint32_t &ordinary_lookup_count
+    int32_t fanin[kMaxFanin], bool &protocol_ok,
+    uint32_t &ordinary_lookup_count,
+    PA_GM volatile int32_t *fatal = nullptr
 ) {
     protocol_ok = true;
     ordinary_lookup_count = 0;
@@ -831,8 +890,9 @@ PA_DEVICE uint32_t CollectSharedFanin(
             }
             PA_GM SharedOutputCell &cell =
                 map.shared_outputs[static_cast<uint32_t>(output_ref.producer_task_id)];
-            if (Ops::Load(&cell.published[output_ref.output_slot].value) !=
-                static_cast<int64_t>(output_ref.producer_task_id)) {
+            if (!WaitForSharedOutputPublished<Ops>(
+                    map, output_ref, fatal
+                )) {
                 protocol_ok = false;
                 return 0;
             }
@@ -1128,7 +1188,7 @@ template <typename Ops>
 PA_DEVICE bool AppendSharedTaskOrdered(
     PA_GM SchedulerState *state,
     const SharedRegionValue *entries, uint32_t count,
-    const SubmitContext &context, uint32_t task_id, LocalStats &stats
+    uint32_t task_id, LocalStats &stats
 ) {
     int64_t reclaim_upto = -1;
     // Refresh 的第一步就是 committed_tasks==task_id 的 exact-turn 检查；
@@ -1149,16 +1209,9 @@ PA_DEVICE bool AppendSharedTaskOrdered(
         return false;
     }
 
-    // preflight 已经对当前 exact-turn 的全部 bucket/slot 做完容量与 seq
-    // 核验。只有通过这一步，fresh descriptor 才允许写入可发布表；若
-    // preflight 失败，则不会留下任何 published。此时 task 尚未 commit，
-    // consumer 仍不能越过 ordered 前沿观察它。
-    if (!PublishSharedTaskOutputs<Ops>(
-            state->shared_map, context, task_id
-        )) {
-        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
-        return false;
-    }
+    // fresh descriptor 已在 Materialize 成功后按 (task,slot) 独立发布。
+    // ordered region helper 只负责 ordinary region delta，不能再次发布
+    // symbol 或把 symbol 可见性重新绑回全局 committed_tasks。
     if (!SharedAppendPreparedTask<Ops>(
             state->shared_map, entries, count
         ) ||
@@ -1403,11 +1456,23 @@ PA_DEVICE bool FinishCallbackSubmitBody(
             stats.result.materialized_outputs += context.result.count;
         }
     }
-    EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
     if (!materialized) {
+        EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
+    // shared 的 Materialize 边界覆盖 descriptor 构造及其 fresh-symbol
+    // 发布：泳道与 submit-PMU 必须使用同一业务边界，避免分段 I-cache
+    // 结果漏掉 descriptor flush 和 published 原子发布。
+    if (__builtin_expect(winner, 0) &&
+        !PublishSharedTaskOutputs<Ops>(
+            state->shared_map, context, task_id
+        )) {
+        EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
+    EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
     const uint64_t materialize_end =
         TraceTimestamp<Ops>(stats.trace, stats.result);
     WriteTrace<Profile>(
@@ -1472,7 +1537,7 @@ PA_DEVICE bool FinishCallbackSubmitBody(
         context.fanin_count = static_cast<int32_t>(CollectSharedFanin<Ops>(
             state->shared_map, args, context, static_cast<int32_t>(task_id),
             static_cast<int32_t>(state->heap_window), stats, context.fanin,
-            lookup_protocol_ok, ordinary_lookup_count
+            lookup_protocol_ok, ordinary_lookup_count, &state->fatal.value
         ));
         if (!lookup_protocol_ok) {
             SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
@@ -1510,7 +1575,7 @@ PA_DEVICE bool FinishCallbackSubmitBody(
         );
         if (registered) {
             registered = AppendSharedTaskOrdered<Ops>(
-                state, shared_entries, shared_entry_count, context, task_id, stats
+                state, shared_entries, shared_entry_count, task_id, stats
             );
         }
         if (registered) {

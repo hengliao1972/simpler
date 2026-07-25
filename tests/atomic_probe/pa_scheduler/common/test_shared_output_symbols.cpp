@@ -12,9 +12,11 @@
 #include "pa_scheduler_core.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <thread>
 
 namespace {
 
@@ -33,8 +35,23 @@ void Check(bool condition, const char *message) {
 // 该 Ops 只验证公共 symbol helper 的原子状态机和 descriptor 搬运。
 // fence 不模拟 A5 DCache；设备缓存可见性仍必须由 CCEC 上板门禁证明。
 struct SymbolTestOps {
+    static volatile int64_t *wait_address;
+    static std::atomic<uint64_t> wait_loads;
+    static std::atomic<uint64_t> now_calls;
+
+    static int32_t Load(volatile int32_t *address) {
+        return __atomic_fetch_add(address, int32_t{0}, __ATOMIC_ACQUIRE);
+    }
+
     static int64_t Load(volatile int64_t *address) {
+        if (address == wait_address) {
+            wait_loads.fetch_add(1, std::memory_order_release);
+        }
         return __atomic_fetch_add(address, int64_t{0}, __ATOMIC_ACQUIRE);
+    }
+
+    static int32_t Exchange(volatile int32_t *address, int32_t value) {
+        return __atomic_exchange_n(address, value, __ATOMIC_ACQ_REL);
     }
 
     static int64_t Exchange(volatile int64_t *address, int64_t value) {
@@ -69,11 +86,45 @@ struct SymbolTestOps {
     static void InvalidateRegion(const void *, uint64_t) {
         std::atomic_thread_fence(std::memory_order_seq_cst);
     }
+
+    static uint64_t Now() {
+        now_calls.fetch_add(1, std::memory_order_relaxed);
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()
+            ).count()
+        );
+    }
+
+    static void SpinHint() {
+        std::this_thread::yield();
+    }
 };
+
+volatile int64_t *SymbolTestOps::wait_address = nullptr;
+std::atomic<uint64_t> SymbolTestOps::wait_loads{0};
+std::atomic<uint64_t> SymbolTestOps::now_calls{0};
+
+// 把第二次读钟直接推进到 watchdog 期限之后，避免用真实 2 秒等待测试
+// timeout 终止语义。
+struct ExpiredWaitOps : SymbolTestOps {
+    static std::atomic<uint64_t> calls;
+
+    static uint64_t Now() {
+        const uint64_t call = calls.fetch_add(1, std::memory_order_relaxed);
+        return call == 0 ? 0 : kWatchdogTicks + 1;
+    }
+
+    static void SpinHint() {}
+};
+
+std::atomic<uint64_t> ExpiredWaitOps::calls{0};
 
 // 只在定向测试中模拟“预检后、atomic 执行前”出现的协议异常，覆盖正常
 // exact-turn 不会命中的冷回滚分支。
 struct PublicationFaultOps : SymbolTestOps {
+    using SymbolTestOps::Exchange;
+
     static volatile int64_t *fetch_race_address;
     static volatile int64_t *exchange_race_address;
 
@@ -134,6 +185,7 @@ bool SameTensor(const TensorDesc &left, const TensorDesc &right) {
 void TestPublishAndResolve() {
     auto map = std::make_unique<SharedTensorMapSidecar>();
     ResetSharedState(*map);
+    SymbolTestOps::now_calls.store(0, std::memory_order_relaxed);
 
     TensorDesc first = MakeTensor(0x100000000ULL, 0);
     TensorDesc second = MakeTensor(0x100001000ULL, 0);
@@ -251,6 +303,10 @@ void TestPublishAndResolve() {
         successor_count == 1 && successor_fanin[0] == 2,
         "successor INPUT observes latest writer"
     );
+    Check(
+        SymbolTestOps::now_calls.load(std::memory_order_relaxed) == 0,
+        "already-published symbol fast path never reads the watchdog clock"
+    );
 }
 
 void TestPublicationPreflightIsAllOrNothing() {
@@ -341,6 +397,129 @@ void TestPublicationCommitFaultsRollback() {
         SameTensor(map->shared_outputs[0].tensors[0], zero) &&
             SameTensor(map->shared_outputs[0].tensors[1], zero),
         "published Exchange failure clears flushed descriptors"
+    );
+}
+
+void TestConsumerWaitsForDelayedPublication() {
+    auto map = std::make_unique<SharedTensorMapSidecar>();
+    ResetSharedState(*map);
+
+    TensorDesc output = MakeTensor(0x380000000ULL, 0);
+    SubmitContext producer{};
+    producer.task_id = 0;
+    producer.result.task_id = 0;
+    producer.result.count = 1;
+    producer.result.tensors[0] = &output;
+    producer.shared_result.Reset(0);
+    Check(
+        producer.shared_result.AddOutputRef(0, 0),
+        "delayed producer accepts output slot"
+    );
+
+    TaskArgs args;
+    ConstructTaskArgs(args);
+    AppendSharedOutputRef(
+        args, producer.shared_result.OutputRef(0), TensorArgType::Input
+    );
+    auto payload = std::make_unique<TaskPayload>();
+    SubmitContext consumer{};
+    consumer.task_id = 1;
+    consumer.payload = payload.get();
+    LocalStats stats{};
+    int32_t fanin[kMaxFanin] = {};
+    bool protocol_ok = false;
+    uint32_t ordinary_lookups = UINT32_MAX;
+    volatile int32_t fatal = 0;
+    std::atomic<bool> publish_ok{false};
+
+    SymbolTestOps::wait_address =
+        &map->shared_outputs[0].published[0].value;
+    SymbolTestOps::wait_loads.store(0, std::memory_order_relaxed);
+    SymbolTestOps::now_calls.store(0, std::memory_order_relaxed);
+    std::thread publisher([&] {
+        // 等 consumer 已经观察到未发布状态后再发布，避免把本测试退化成
+        // “进入 helper 前已经 ready”的普通快路径。
+        while (SymbolTestOps::wait_loads.load(std::memory_order_acquire) == 0) {
+            std::this_thread::yield();
+        }
+        publish_ok.store(
+            PublishSharedTaskOutputs<SymbolTestOps>(*map, producer, 0),
+            std::memory_order_release
+        );
+    });
+
+    const uint32_t count = CollectSharedFanin<SymbolTestOps>(
+        *map, args, consumer, 1, kHeapWindow, stats, fanin,
+        protocol_ok, ordinary_lookups, &fatal
+    );
+    publisher.join();
+    SymbolTestOps::wait_address = nullptr;
+
+    Check(publish_ok.load(std::memory_order_acquire), "delayed publication succeeds");
+    Check(protocol_ok && fatal == 0, "consumer waits without protocol failure");
+    Check(
+        SymbolTestOps::wait_loads.load(std::memory_order_acquire) > 1,
+        "consumer performs at least one unpublished retry"
+    );
+    Check(
+        SymbolTestOps::now_calls.load(std::memory_order_relaxed) >= 1,
+        "unpublished slow path establishes a watchdog window"
+    );
+    Check(count == 1 && fanin[0] == 0, "delayed INPUT closes producer fanin");
+    Check(ordinary_lookups == 0, "delayed symbol never enters ordinary map");
+    Check(
+        SameTensor(payload->tensors[0], output),
+        "descriptor is visible after publication becomes ready"
+    );
+}
+
+void TestPublicationWaitFailuresFailClosed() {
+    auto map = std::make_unique<SharedTensorMapSidecar>();
+    const FdwicOutputRef output_ref{0, 0, 0, 0, 0, 0};
+
+    ResetSharedState(*map);
+    map->shared_outputs[0].published[0].value = 7;
+    volatile int32_t fatal = 0;
+    SymbolTestOps::now_calls.store(0, std::memory_order_relaxed);
+    Check(
+        !WaitForSharedOutputPublished<SymbolTestOps>(
+            *map, output_ref, &fatal
+        ),
+        "unexpected publication value is rejected"
+    );
+    Check(fatal == 1, "unexpected publication value broadcasts fatal");
+    Check(
+        SymbolTestOps::now_calls.load(std::memory_order_relaxed) == 0,
+        "unexpected ready value fails before opening a watchdog window"
+    );
+
+    ResetSharedState(*map);
+    fatal = 1;
+    SymbolTestOps::now_calls.store(0, std::memory_order_relaxed);
+    Check(
+        !WaitForSharedOutputPublished<SymbolTestOps>(
+            *map, output_ref, &fatal
+        ),
+        "existing fatal terminates unpublished wait"
+    );
+    Check(
+        SymbolTestOps::now_calls.load(std::memory_order_relaxed) == 1,
+        "fatal wait exits before a watchdog recheck"
+    );
+
+    ResetSharedState(*map);
+    fatal = 0;
+    ExpiredWaitOps::calls.store(0, std::memory_order_relaxed);
+    Check(
+        !WaitForSharedOutputPublished<ExpiredWaitOps>(
+            *map, output_ref, &fatal
+        ),
+        "watchdog terminates permanently unpublished symbol"
+    );
+    Check(fatal == 1, "publication watchdog broadcasts fatal");
+    Check(
+        ExpiredWaitOps::calls.load(std::memory_order_relaxed) == 2,
+        "watchdog clock is read only at slow-path begin and periodic recheck"
     );
 }
 
@@ -441,6 +620,8 @@ int main() {
     TestPublishAndResolve();
     TestPublicationPreflightIsAllOrNothing();
     TestPublicationCommitFaultsRollback();
+    TestConsumerWaitsForDelayedPublication();
+    TestPublicationWaitFailuresFailClosed();
     TestInvalidReferencesFailClosed();
     if (g_failures != 0) {
         std::fprintf(stderr, "[FAIL] shared-output symbol tests: %d\n", g_failures);

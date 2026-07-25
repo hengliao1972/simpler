@@ -950,6 +950,49 @@ symbol；ordinary region 才进入 bucket 局部协议，不能在 shared winner
 S4 因此保持未完成。当前优先级是修复 shared 长序列活性，而不是根据失败的
 b256 运行估算性能；本阶段范围仍只有 CCEC 与 CPU。
 
+#### S4.3 fresh symbol 从全局 ordered commit 中拆出
+
+第一项结构修正只拆 fresh descriptor 的发布与消费，不同时改 shared heap
+或 region ring，避免把多个并发协议混进一个提交：
+
+- winner 完成 descriptor 物化后，立即按 `(producer_task_id, output_slot)`
+  发布 `TensorDesc`、`last_writer` 和 `published`；
+- `AppendSharedTaskOrdered()` 不再代发 fresh symbol，只保留 ordinary region
+  delta 与旧全局 commit；
+- consumer 解析真实 `FdwicOutputRef` 时先读取对应 `published` cell。已就绪
+  快路径只做一次 atomic load；只有首次观察到 `-1` 才读取 watchdog 起点，
+  随后只轮询该 producer/slot，每 1,024 次复查 fatal 和 2 秒超时；
+- 任意非 `-1` 且非预期 producer 的值都按协议错误 fail-closed，不能退回
+  ordinary region 查找掩盖 symbol 状态破坏。
+
+descriptor 发布继续落在 `Materialize` 业务区间。泳道的
+`TracePhase::Materialize` 与 submit-PMU 的 `materialize` 起止点同步覆盖
+descriptor 构造、DCCI flush 和 `published` 原子发布，避免分段泳道已经计入
+发布、I-cache 窗口却提前关闭的边界错位。
+
+CPU 新增确定性延迟发布测试：publisher 必须等 consumer 已经至少观察一次
+未发布状态后才执行发布；consumer 随后必须完成多次读取、取得正确 descriptor
+与 producer fanin，且 ordinary lookup 为 0、fatal 保持 0。该测试与既有
+shared symbol、ordered ring、heap、Materialize、loser stale-args 自测全部
+通过，CPU shared b1 的依赖签名、heap 终态和规范化 writer 签名也全部闭合。
+
+CCEC 使用最终代码完成以下 b1 门禁：
+
+| 构建 | 结果 |
+| --- | --- |
+| shared perf-clock real-compute | 全部语义与输出断言 PASS；单个可执行性样本 `81.801 us` |
+| shared submit-PMU materialize | 96/96 PMU 边界、phase shadow、owner restore/cleanup 与全部语义断言 PASS |
+
+submit-PMU 样本中 `materialize` 为 480 次固定边界，phase time 占完整 Submit
+PMU 窗口约 7.69%；该数字只验证新边界可采集且完整闭合，不用于判断结构收益。
+本小步仍保留 winner 入口的全局 exact-turn，因此没有声称 S4.2 的 b256
+convoy 已解决，也不运行会重复证明旧失败结构的 b256。下一小步先把 8-shard
+heap 改成合法并发分配，再单独移除 PA Case1 的空 region 全局 sequencer。
+在移除 exact-turn 前还必须补齐两项协议：`last_writer` 的 per-symbol 有序
+更新，以及 producer 已发布 descriptor、但后续 fanin/register 失败时的
+terminal abort 闭环。当前 per-slot wait 不能单独替代全局 sequencer。
+本步只对 CCEC 与 CPU 做专项实现和验证，未做 AscendC 适配或验证。
+
 ### 阶段 R0：迁移真实 simpler
 
 只有 S0～S4 全部闭环后，才按已验证结构依次迁移：
