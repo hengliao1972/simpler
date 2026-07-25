@@ -3095,3 +3095,40 @@ outputs/perf_clock_pair_b516409e_vs_e8320280_20260725_123124/
 随四个 DrainReady 调用点重复内联。协议、mask 编码、publication/writer
 顺序、slot 数和终止状态都不改变。收缩后的 clean ELF 必须重新做同一配对；
 若仍无净收益，则完整撤销 S4.11 实现，只保留本记录。
+
+#### S4.11b resolver 单份化
+
+对 S4.9 与 S4.11a frozen kernel 做符号和 DWARF 行表审计后，`.text`
+增加 28,416B 的来源已经闭合：
+
+| 组成 | 增量 |
+| --- | ---: |
+| AIC/AIV orchestration 两个大函数 | +21,532B |
+| AIC/AIV finish 两个大函数 | +4,840B |
+| 4 份 noinline `ConvergeFatalStall` | +1,952B |
+| 对齐 | +92B |
+
+前四个大函数与 `ConvergeFatalStall` 共解释 99.68% 的增长；`.rodata`
+仍为 288B。行表进一步证明 resolver 完整体在 S4.11a 被内联 14 次：
+AIC/AIV orchestration 各 6 份、AIC/AIV finish 各 1 份，累计约
+14,636B。
+
+本小步只把 `ResolveDeferredSharedInputs` 标为 noinline，并在
+`DrainReady()` 先判断既有 `function_padding != 0`。mask 为 0 时原
+resolver 本来也立即返回 true；非零非法 mask 仍进入 helper fail-closed，
+publication、writer、invalidate/copy、fatal sentinel 和 completion 顺序
+均未改变。重建后的 mixed ELF 用 `nm` 精确得到 4 份 TU-local resolver：
+AIC/AIV 的 orchestration/finish 各一份，每份 904B，不是 0 份或残留 14
+份内联体。
+
+| 构建 | S4.11a `.text` | S4.11b `.text` | 减少 |
+| --- | ---: | ---: | ---: |
+| shared normal mixed | 450,360B | 437,816B | 12,544B / 2.79% |
+| shared perf-clock mixed | 157,496B | 144,440B | 13,056B / 8.29% |
+
+相对 S4.9 的 129,080B，S4.11b 仍多 15,360B，不能仅凭体积下降宣告
+性能收益。CPU shared/private strict、CCEC shared normal/perf-clock、
+A5 shared b1/b256 real-compute 均通过；b256 依赖、heap、symbol 与数值
+门禁不变，普通构建仍实际出现 90 次 RingBp。perf-clock scalar-nop0 单样本
+为 3.184ms，只用于量级检查。下一步从 clean commit 冻结并重复 S4.11a
+完全相同的 ABBA/BAAB 配对。

@@ -392,7 +392,7 @@ PA_DEVICE bool SlotReady(PA_GM SchedulerState *state, PA_GM LocalSlot &slot, Loc
 constexpr uint32_t kDrainFatalResult = UINT32_MAX;
 
 template <typename Ops>
-PA_DEVICE bool ResolveDeferredSharedInputs(
+PA_DEVICE_NOINLINE bool ResolveDeferredSharedInputs(
     PA_GM SchedulerState *state, PA_GM LocalSlot &slot, LocalStats &stats
 );
 
@@ -487,7 +487,12 @@ PA_DEVICE uint32_t DrainReady(
         // fanin flag ready 只证明 producer 数据完成；deferred INPUT 的
         // descriptor 必须在 Kernel 前完成 acquire、invalidate 与原地复制。
         // 失败 slot 只释放一次，且不得进入 ExecuteKernel/CompleteTask。
-        if (!ResolveDeferredSharedInputs<Ops>(state, slot, stats)) {
+        // 先在 DrainReady 热路径读取复用的 32-bit mask；没有 deferred
+        // INPUT 时完全不调用慢 helper。resolver 固定 noinline，避免其
+        // publication watchdog、校验和 128B copy 随四个 drain 调用点
+        // 重复展开，协议和线性化边界保持不变。
+        if (slot.function_padding != 0 &&
+            !ResolveDeferredSharedInputs<Ops>(state, slot, stats)) {
             SetFatal<Ops>(
                 state, stats, static_cast<int32_t>(slot.task_id)
             );
@@ -955,7 +960,7 @@ PA_DEVICE bool WaitForSharedOutputPublished(
 }
 
 template <typename Ops>
-PA_DEVICE bool ResolveDeferredSharedInputs(
+PA_DEVICE_NOINLINE bool ResolveDeferredSharedInputs(
     PA_GM SchedulerState *state, PA_GM LocalSlot &slot, LocalStats &stats
 ) {
     // fatal 的统一 trace/计数仍由 DrainReady 调用点发布；保留 stats 参数
