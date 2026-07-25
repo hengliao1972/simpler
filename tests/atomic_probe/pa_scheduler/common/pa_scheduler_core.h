@@ -658,37 +658,6 @@ PA_DEVICE void RecordClaimOutcome(LocalStats &stats, TaskKind kind, const ClaimO
     }
 }
 
-#if PTO_FDWIC_SHARED_MAP
-template <typename Ops>
-PA_DEVICE void CopyValidatedSharedDescriptorsToSlot(
-    PA_GM SharedTensorMapSidecar &map, const TaskArgs &args,
-    PA_GM LocalSlot &slot
-) {
-    // MaterializeTask + CollectSharedFanin 已经一次性验证全部 shared ref 的
-    // 业务 output 上限、producer/物理 slot/view、published 与 last_writer；
-    // 合法、非 fatal 的成功发布一旦完成，fresh output descriptor 不再改写。
-    // 多 output 冷故障可能回滚已短暂发布的槽，但整轮随后按 terminal fatal
-    // 作废；本 helper 不用额外 atomic 把无效运行伪装成可恢复事务。
-    // 因而这里沿用参考实现的 ready-ref 直落 ring slot 思路，只做一次
-    // invalidate + 128-byte GM copy，不再经过 4 KiB TaskPayload scratch。
-    for (int32_t index = 0; index < args.tensor_count; ++index) {
-        if (TaskTag(args, static_cast<uint32_t>(index)) ==
-                TensorArgType::Output ||
-            !IsSharedOutputReference(args.tensors[index])) {
-            continue;
-        }
-        const FdwicOutputRef output_ref =
-            SharedOutputReference(args.tensors[index]);
-        PA_GM const TensorDesc &shared_tensor =
-            map.shared_outputs[
-                static_cast<uint32_t>(output_ref.producer_task_id)
-            ].tensors[output_ref.output_slot];
-        Ops::InvalidateRegion(&shared_tensor, sizeof(shared_tensor));
-        CopyGmTensor(slot.tensors[index], shared_tensor);
-    }
-}
-#endif
-
 template <typename Ops, bool Profile>
 PA_DEVICE bool BuildWinner(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_id, TaskKind kind,
@@ -724,16 +693,18 @@ PA_DEVICE bool BuildWinner(
     if (worker.occupied_count > stats.max_occupied) {
         stats.max_occupied = worker.occupied_count;
     }
+    const int32_t sub_block_id = worker.lane == 2 ? 1 : 0;
 #if PTO_FDWIC_SHARED_MAP
-    CopyValidatedSharedDescriptorsToSlot<Ops>(
-        state->shared_map, args, slot
+    BuildSlotPayload<Ops, true>(
+        slot, task_id, static_cast<uint32_t>(FunctionId(kind)), 0, args, context, fanin, fanin_count,
+        state->shared_map, sub_block_id
+    );
+#else
+    BuildSlotPayload(
+        slot, task_id, static_cast<uint32_t>(FunctionId(kind)), 0, args,
+        context, fanin, fanin_count, sub_block_id
     );
 #endif
-    const int32_t sub_block_id = worker.lane == 2 ? 1 : 0;
-    BuildSlotPayload<(PTO_FDWIC_SHARED_MAP != 0)>(
-        slot, task_id, static_cast<uint32_t>(FunctionId(kind)), 0, args, context, fanin, fanin_count,
-        sub_block_id
-    );
     stats.result.slot_tensor_copies += static_cast<uint32_t>(context.tensor_count);
     stats.result.slot_scalar_copies += static_cast<uint32_t>(context.scalar_count);
     stats.result.fanin_edges += fanin_count;

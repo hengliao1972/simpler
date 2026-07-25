@@ -323,12 +323,9 @@ void TestPublishAndResolve() {
         "resolver leaves task payload scratch untouched"
     );
     LocalSlot input_slot{};
-    CopyValidatedSharedDescriptorsToSlot<SymbolTestOps>(
-        *map, input_args, input_slot
-    );
-    BuildSlotPayload<true>(
+    BuildSlotPayload<SymbolTestOps, true>(
         input_slot, 1, static_cast<uint32_t>(FunctionId(TaskKind::Qk)), 0,
-        input_args, input_context, input_fanin, input_count
+        input_args, input_context, input_fanin, input_count, *map
     );
     Check(
         SameTensor(input_slot.tensors[0], first),
@@ -387,12 +384,9 @@ void TestPublishAndResolve() {
         "INOUT resolver also leaves task payload scratch untouched"
     );
     LocalSlot inout_slot{};
-    CopyValidatedSharedDescriptorsToSlot<SymbolTestOps>(
-        *map, inout_args, inout_slot
-    );
-    BuildSlotPayload<true>(
+    BuildSlotPayload<SymbolTestOps, true>(
         inout_slot, 2, static_cast<uint32_t>(FunctionId(TaskKind::Sf)), 0,
-        inout_args, inout_context, inout_fanin, inout_count
+        inout_args, inout_context, inout_fanin, inout_count, *map
     );
     Check(
         SameTensor(inout_slot.tensors[0], first),
@@ -1036,10 +1030,9 @@ void TestConsumerWaitsForDelayedPublication() {
         "delayed resolver leaves task payload scratch untouched"
     );
     LocalSlot slot{};
-    CopyValidatedSharedDescriptorsToSlot<SymbolTestOps>(*map, args, slot);
-    BuildSlotPayload<true>(
+    BuildSlotPayload<SymbolTestOps, true>(
         slot, 1, static_cast<uint32_t>(FunctionId(TaskKind::Qk)), 0,
-        args, consumer, fanin, count
+        args, consumer, fanin, count, *map
     );
     Check(
         SameTensor(slot.tensors[0], output),

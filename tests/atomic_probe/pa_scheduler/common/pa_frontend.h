@@ -1485,10 +1485,19 @@ PA_DEVICE void CopyGmTensor(PA_GM TensorDesc &destination, PA_GM const TensorDes
     }
 }
 
-template <bool SharedDescriptorsPrefilled = false>
+#if PTO_FDWIC_SHARED_MAP
+template <typename SharedCopyOps, bool SharedDescriptorsDirect>
+PA_DEVICE void PopulateSlotPayloadImpl(
+#else
 PA_DEVICE void PopulateSlotPayload(
+#endif
     PA_GM LocalSlot &slot, const TaskArgs &args, const SubmitContext &context, const int32_t fanin[kMaxFanin],
-    uint32_t fanin_count, int32_t sub_block_id, bool is_multicore, int32_t won_block, int32_t won_slot
+    uint32_t fanin_count,
+#if PTO_FDWIC_SHARED_MAP
+    PA_GM SharedTensorMapSidecar *shared_map,
+#endif
+    int32_t sub_block_id, bool is_multicore, int32_t won_block,
+    int32_t won_slot
 ) {
     // winner 将活动 descriptor/scalar 复制进私有 slot，dispatch args 指向 slot 内
     // 副本而非 orchestration 临时对象；fanin 随 slot 保存，kernel 执行前逐 flag 检查。
@@ -1499,14 +1508,25 @@ PA_DEVICE void PopulateSlotPayload(
             CopyGmTensor(slot.tensors[index], context.payload->tensors[index]);
 #if PTO_FDWIC_SHARED_MAP
         } else if (IsSharedOutputReference(args.tensors[index])) {
-            // shared scheduler 已在调用本 builder 前把验证通过的 descriptor
-            // 直接写入 slot；此处只建立 args 指针，不能再从 payload scratch
-            // 做第二次 128-byte 搬运。这个前置条件只属于 shared BuildWinner，
-            // 不改变 private builder，也不把符号或 mask 写进 LocalSlot ABI。
-            if constexpr (!SharedDescriptorsPrefilled) {
+            if constexpr (SharedDescriptorsDirect) {
+                // Materialize + Collect 已验证该 ready ref。把 invalidate/copy
+                // 融入既有 slot tensor 扫描，避免独立 helper 再遍历一遍
+                // args；shared_map 非空是生产 BuildWinner 的内部前置条件。
+                const FdwicOutputRef output_ref =
+                    SharedOutputReference(args.tensors[index]);
+                PA_GM const TensorDesc &shared_tensor =
+                    shared_map->shared_outputs[
+                        static_cast<uint32_t>(
+                            output_ref.producer_task_id
+                        )
+                    ].tensors[output_ref.output_slot];
+                SharedCopyOps::InvalidateRegion(
+                    &shared_tensor, sizeof(shared_tensor)
+                );
+                CopyGmTensor(slot.tensors[index], shared_tensor);
+            } else {
                 // 兼容入口仍允许调用方预先把 descriptor 放进 TaskPayload；
-                // 编译期布尔量保证生产 BuildWinner 的 direct-to-slot 实例
-                // 不产生这个分支或旧中间拷贝。
+                // 编译期布尔量保证生产 direct-to-slot 实例不产生该分支。
                 CopyGmTensor(
                     slot.tensors[index], context.payload->tensors[index]
                 );
@@ -1548,10 +1568,17 @@ PA_DEVICE void PopulateSlotPayload(
     slot.won_slot = won_slot;
 }
 
-template <bool SharedDescriptorsPrefilled = false>
+#if PTO_FDWIC_SHARED_MAP
+template <typename SharedCopyOps, bool SharedDescriptorsDirect>
+#endif
 PA_DEVICE void BuildSlotPayload(
     PA_GM LocalSlot &slot, uint32_t task_id, uint32_t function_id, uint64_t function_address, const TaskArgs &args,
-    const SubmitContext &context, const int32_t fanin[kMaxFanin], uint32_t fanin_count, int32_t sub_block_id = 0,
+    const SubmitContext &context, const int32_t fanin[kMaxFanin],
+    uint32_t fanin_count,
+#if PTO_FDWIC_SHARED_MAP
+    PA_GM SharedTensorMapSidecar &shared_map,
+#endif
+    int32_t sub_block_id = 0,
     bool is_multicore = false, int32_t won_block = -1, int32_t won_slot = -1
 ) {
     // Match build_ring_slot_from_submit ordering: publish the header first,
@@ -1563,9 +1590,17 @@ PA_DEVICE void BuildSlotPayload(
     slot.kind = function_id;
     slot.function_address = function_address;
     slot.built = 1;
-    PopulateSlotPayload<SharedDescriptorsPrefilled>(
-        slot, args, context, fanin, fanin_count, sub_block_id, is_multicore, won_block, won_slot
+#if PTO_FDWIC_SHARED_MAP
+    PopulateSlotPayloadImpl<SharedCopyOps, SharedDescriptorsDirect>(
+        slot, args, context, fanin, fanin_count, &shared_map, sub_block_id,
+        is_multicore, won_block, won_slot
     );
+#else
+    PopulateSlotPayload(
+        slot, args, context, fanin, fanin_count, sub_block_id, is_multicore,
+        won_block, won_slot
+    );
+#endif
 }
 
 // Compatibility overload for a core that has already populated the slot
@@ -1577,9 +1612,17 @@ PA_DEVICE void BuildSlotPayload(
     uint32_t fanin_count
 ) {
     slot.built = 1;
-    PopulateSlotPayload<false>(
+#if PTO_FDWIC_SHARED_MAP
+    // false 实例按旧契约从 context.payload 取 shared descriptor，编译期
+    // 丢弃 direct 分支，因此内部空 map 不会产生读取或运行时判断。
+    PopulateSlotPayloadImpl<void, false>(
+        slot, args, context, fanin, fanin_count, nullptr, 0, false, -1, -1
+    );
+#else
+    PopulateSlotPayload(
         slot, args, context, fanin, fanin_count, 0, false, -1, -1
     );
+#endif
 }
 
 }  // namespace pa_scheduler

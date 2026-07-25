@@ -2373,3 +2373,42 @@ helper 在 BuildWinner 中另扫一次 tensor，随后
 `PopulateSlotPayload()` 又遍历全部 tensor。下一小步先在不改协议/ABI的
 前提下把 direct copy 折叠进既有 slot 填充扫描，单独核对 CCEC `.text` 和
 配对方向；解释这项代码布局成本后，再进入纯 INPUT deferred resolve。
+
+### 2026-07-25：S4.8b 把 ready descriptor 直写融合进既有 slot 扫描
+
+S4.8 已消除 `SharedOutputCell -> TaskPayload -> LocalSlot` 的中间搬运，但
+实现上仍由 `CopyValidatedSharedDescriptorsToSlot()` 先独立扫描全部 tensor，
+随后 `PopulateSlotPayload()` 再扫描一次普通参数和 Output。S4.8b 不改变
+协议，只把前者的 invalidate 和 128B copy 合并到后者已有的逐 tensor 分支：
+
+```text
+BuildWinner
+  -> PopulateSlotPayload 单次扫描
+       普通参数/Output：沿用 TaskPayload -> LocalSlot
+       ready shared ref：SharedOutputCell -> LocalSlot
+```
+
+生产 shared builder 以编译期模板参数选择 direct 分支，并显式接收非空
+`SharedTensorMapSidecar&`；private 保留原函数签名和实现。五参兼容入口仍
+走“调用方已填 TaskPayload”的 false 实例，`if constexpr` 在编译期删除
+shared map 访问，不增加运行时判断。这样既没有为公共接口引入可空 map
+约定，也没有把 shared 模板扩散到 private 构建。
+
+这一融合使每个 shared ref 的 invalidation/copy 与 slot 参数指针建立发生
+在同一索引分支。不同索引写入互不重叠，因而相对 S4.8 只改变独立扫描与
+代码布局，不改变以下内容：
+
+- `Materialize -> CollectSharedFanin -> Register -> BuildWinner` 的协议边界；
+- acquire 等待、published/last_writer 校验、INOUT writer 和最终发布顺序；
+- `TaskPayload`、`LocalSlot`、sidecar、result 和 trace ABI；
+- `slot_tensor_copies`、8/5/3 shared symbol 计数和 5 条 fanin；
+- compatibility builder 与 private 数据路径。
+
+CPU shared/private perf-clock 严格构建和 b1 全部通过；shared symbol 的普通
+与 split-finish 用例通过 ASan/UBSan/leak。CCEC shared/private 均完成
+AIC/AIV 编译、mixed ELF 链接和 manifest 校验。shared mixed ELF 的
+`.text` 从 S4.8 的 134,456B 降至 134,200B，减少 256B；split finish
+AIC/AIV 主体分别减少 96B 和 88B。A5 shared b1 默认 real-compute 为
+65.734us，96 核语义、8/5/3 symbol、5 条 fanin、heap、writer signature
+和输出 tile 全部 PASS。该 b1 单样本仍只作为正确性门禁，不能据此声称
+相对 S4.8 的性能收益；冻结后的 b256 配对与参考分支同口径对照另行记录。
