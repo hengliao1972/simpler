@@ -5,9 +5,10 @@
 本文记录 `TestPagedAttentionUnroll::Case1` 在真实 A5 上的 FDWIC AICore
 Submit 路径，供后续继续优化。真实 PA 生产快照日期为 2026-07-18；当前
 保留的生产优化基线为 `2c3dd1e2`，F1 负结果记录提交为 `c93c3666`。
-standalone 实验记录更新至 2026-07-25 的 S4.14b；shared Vector
-cursor 四分片迁址和同址八分片均通过冻结 ELF 配对门槛，当前
-standalone shared 性能基线为 `ee42b8c1`。
+standalone 已完成 2026-07-25 的 S4.14b；shared Vector cursor
+四分片迁址和同址八分片均通过冻结 ELF 配对门槛，当前 standalone
+shared 性能基线为 `ee42b8c1`。S4.15a 正在以该基线预登记 shared
+Cube 四分片迁址对照，尚无性能结论。
 
 范围限定为：
 
@@ -2255,3 +2256,43 @@ flags 全为 `0x53`。重建 S4.14a 可逐字节复现冻结执行节；S4.14b �
 outputs/perf_clock_pair_ee42b8c1_vs_e24e579c_20260725_163800/
 outputs/perf_clock_pair_ee42b8c1_vs_e8320280_20260725_164329/
 ```
+
+#### 7.5.27 S4.15a shared Cube 四分片迁址对照预登记
+
+S4.15a 不直接扩张 production-prefix `cube_cursor[4]`，而是在现有
+shared-only sidecar 尾部追加容量 8、active 仍为 4 的
+`shared_cube_cursor`。shared QK/PV 继续按 `task_id%4` 路由；旧
+prefix、private、已保留的 Vector8 和 Alloc4 全部不变。sidecar 从
+4,736,192B 增至 4,736,704B，新增 512B 位于 state 末尾，不增加
+trace、PMU、span 或 atomic 记录字段。
+
+尾部增长仍会改变 GM 分配长度、`scheduler_state_size` 常量及潜在
+静态代码/页布局，所以 S4.15a 配对只能评价“Cube 迁址候选整体”，
+不能把差值直接等同为 atomic 硬件延迟。后续 S4.15b 才在同一地址、
+容量和 state 大小下只切 active `4→8`。
+
+本候选仍固定执行 16,384 次 Cube ClaimMax。四条 active line 每条
+4,096 次 attempted，四条 inactive line attempted 为 0 且 cursor
+终值保持 -1；全局 ClaimMax 仍为 73,728。定向测试必须逐调用核对
+FetchMax 地址，完整 CPU/A5 回放继续证明唯一 winner 和全部业务语义，
+不能只用最终 cursor 值代替并发正确性。
+
+性能仅在正确性门禁闭合、形成提交并冻结 ELF 后，相对 `ee42b8c1`
+做六区组 ABBA/BAAB 配对。首轮规则预先固定：语义失败，或中位数
+`>=+0.2%` 且仅 `0～2/6` 更快时撤销；中位数 `<=-0.2%` 且
+`6/6` 更快时记为有益；绝对中位差 `<0.2%` 且 `2～4/6` 更快时
+记为中性；其他组合追加六区组。合计十二个区组时，只有
+`<=-0.2%` 且至少 `10/12` 更快才记为提升，只有绝对中位差
+`<0.2%` 且 `5～7/12` 更快才记为中性，其余全部撤销。
+
+完整 ABI 数字、正确性清单和判据见 `shared_tensormap_record.md` 的
+S4.15a 节。本节不改写 S4.14a/S4.14b 的既有结果，也不提前把迁址
+描述成 atomic 次数消减或性能收益。
+
+提交前验证已闭合 CPU shared b1/b256、private b1、100 项 Python
+观察工具测试、CCEC private/shared 共 14 个构建与 manifest，以及
+A5 shared b1 perf-clock/合并 atomic 泳道。最新 b1 泳道 raw 为
+4,154 条、dropped=0；其中 ClaimMax 精确 288 次，AIC 的
+Alloc/QK/PV 与两个 AIV lane 的 Alloc/SF/UP 均各 32 次，全部
+`flags=0x53`。这些结果只证明迁址没有改变调用总量、role 分流和
+return-ready 语义；是否保留仍待冻结 b256 配对。

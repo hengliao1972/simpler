@@ -148,19 +148,20 @@ else
     echo "[TEST] shared heap no-wrap reserve self-test"
     "$BUILD_DIR/test_shared_heap_reserve"
 
-    # S4.14b 启用 shared Vector sidecar 的全部八个 shard。定向测试锁定
-    # SF/UP 的 task%8 地址、错误 role 零 atomic、Cube/Alloc 不变，以及
-    # b256 的32,768次 Vector Claim、每 task 唯一 winner与八线终态。
-    echo "[BUILD] shared Vector Claim cursor self-test"
+    # shared Vector 启用 sidecar 的全部八个 shard；S4.15a 将 Cube
+    # 迁入 capacity=8、active=4 的独立 sidecar。定向测试逐次锁定
+    # task 取模地址、错误 role 零 atomic、prefix 不变，以及 b256 的
+    # Vector 32,768/Cube 16,384 次 Claim 与每条 active 线 4,096 次。
+    echo "[BUILD] shared Claim cursor self-test"
     "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \
         -DPA_BUILD_SWIMLANE=1 \
         -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/common/test_shared_vector_claim_cursor.cpp" \
-        -o "$BUILD_DIR/test_shared_vector_claim_cursor"
+        "$ROOT_DIR/common/test_shared_claim_cursors.cpp" \
+        -o "$BUILD_DIR/test_shared_claim_cursors"
 
-    echo "[TEST] shared Vector Claim cursor self-test"
-    "$BUILD_DIR/test_shared_vector_claim_cursor"
+    echo "[TEST] shared Claim cursor self-test"
+    "$BUILD_DIR/test_shared_claim_cursors"
 
     # Materialize 在触碰 shared cursor 前必须完成数量、引用、shape/stride
     # 和地址区间预检；这些 reserve 前拒绝路径不能推进 heap。FetchAdd 后

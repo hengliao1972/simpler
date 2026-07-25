@@ -14,9 +14,11 @@
 - 默认 256 个 batch，每 batch 依次提交 Alloc、QK、SF、PV、UP 五个 task；
 - 96 个 worker 各自回放 1,280 次 Submit，共 122,880 次 Submit；
 - Alloc 由 96 个 worker 竞争，QK/PV 由 32 个 AIC 竞争，SF/UP 由 64 个 AIV 竞争；
-- private 使用 4 路 Alloc/cube/vector Claim cursor；当前 shared
-  S4.14b 让 Vector 使用 sidecar 中全部 8 个 active shard，
-  Alloc/Cube 仍为 4 路；两种模式都执行实际 `atomicMax` Claim；
+- private 使用 production-prefix 的 4 路 Alloc/cube/vector Claim
+  cursor；当前 S4.15a shared 候选让 Vector 使用 sidecar 中全部
+  8 个 active shard，让 Cube 使用 sidecar 中容量 8、active 4 的
+  迁址对照，Alloc 仍使用 prefix 4 路；两种模式都执行实际
+  `atomicMax` Claim；
 - PA 的 TaskArgs、Tensor、TaskPayload、DistSubmitCtx、DistCore/DistGlobal 关键 ABI 布局；
 - tensor tag 扫描、输出 layout、materialize，以及按构建模式选择的 private
   每核有界桶环或 shared 有序桶环的 retire/lookup/insert、register mask；
@@ -252,18 +254,21 @@ submit-pmu 四件套都必须通过 manifest 的模式、变体、阶段和 SHA2
 逐线程断言专用性能接口恰好调用两次，但 CPU 时间只验证协议和算术，
 不能作为 A5 性能证据。
 
-当前候选代码完成至 S4.14：在 S0～S4.6 的构建身份、private/shared
-TensorMap 与 no-sequencer 基线上，shared no-wrap 完成路径已移除无消费者
-的 frontier helping。S4.10～S4.13 的固定 owner、早退、延迟解析、
-loser 快返和 `3×8` cursor 均已完成独立实验并因没有稳定净收益而撤销。
-S4.14a 先把 shared Vector cursor 搬到物理容量 8、active 仍为 4 的
-sidecar；相对 S4.9 的冻结 ELF 配对为 6/6 区组更快、百分差中位数
-`-5.066%`。S4.14b 随后在相同地址、容量、state 大小和寻址骨架下
-只改 active `4→8`，相对 S4.14a 为 6/6 更快、配对中位数
+当前已保留的代码完成至 S4.14b：在 S0～S4.6 的构建身份、
+private/shared TensorMap 与 no-sequencer 基线上，shared no-wrap 完成
+路径已移除无消费者的 frontier helping。S4.10～S4.13 的固定 owner、
+早退、延迟解析、loser 快返和 `3×8` cursor 均已完成独立实验并因没有
+稳定净收益而撤销。S4.14a 先把 shared Vector cursor 搬到物理容量 8、
+active 仍为 4 的 sidecar；相对 S4.9 的冻结 ELF 配对为 6/6 区组更快、
+百分差中位数 `-5.066%`。S4.14b 随后在相同地址、容量、state 大小和
+寻址骨架下只改 active `4→8`，相对 S4.14a 为 6/6 更快、配对中位数
 `-23.472%`；直接相对 S4.9 的净收益为 `-27.665%`。因此当前
-standalone shared 性能基线为 `ee42b8c1`；详细证据见
-`shared_tensormap_record.md`。后续 shared TensorMap 开发与阶段门禁固定
-覆盖 CPU/CCEC。
+standalone shared 性能基线为 `ee42b8c1`。
+
+当前 S4.15a 候选仿照上述拆分方法，只把 shared Cube 四分片迁到
+sidecar 容量 8、active 4 的新字段；它尚未改变 Cube 分片数，也尚未
+取得性能结论。详细证据和预声明门槛见 `shared_tensormap_record.md`。
+后续 shared TensorMap 开发与阶段门禁固定覆盖 CPU/CCEC。
 `--tensormap private|shared` 都会生成对应模式的真实可执行文件；S0 用于禁止
 伪 shared 产物的临时编译门禁已在 S2 接入 shared sidecar 后删除。两种模式仍
 使用相互隔离的产物目录、manifest 和 host/device ABI 握手，不能混用镜像。
@@ -311,14 +316,15 @@ ASan/UBSan。CPU b1、CPU b256 的完整调度断言和 CCEC private 三镜像�
 ### 4.2 当前 shared TensorMap：per-slot symbol、shared heap 与隔离的 region 原型
 
 S3.2a 在 S3.1 的 4,735,104B output table 尾部追加 8 条 cache-line
-heap cursor 和 1 条 aggregate vend，因此当前 `SharedTensorMapSidecar`
-在 S4.9 为 4,735,680B；S4.14a 迁址对照再在尾部追加 8 条物理
-shared Vector Claim cursor，当前只启用其中 4 条，因此 sidecar 为
-4,736,192B。shared `SchedulerState` 的 CPU
-非 split 布局为 1,011,852,160B，CCEC split 布局为
-1,011,858,304B；新增控制字位于
-standalone 控制区和 `results` 之后，不移动 `WorkerState`、`RunConfig`
-或既有结果字段。每 task 最多八个 fresh output，以 16B
+heap cursor 和 1 条 aggregate vend，因此 `SharedTensorMapSidecar`
+在 S4.9 为 4,735,680B；S4.14a 再在尾部追加 8 条物理 shared Vector
+Claim cursor，S4.14b 已启用全部 8 条，sidecar 为 4,736,192B。
+当前 S4.15a 候选继续在尾部追加 8 条物理 shared Cube Claim cursor，
+active 保持 4，因此 sidecar 为 4,736,704B。shared `SchedulerState`
+的 CPU 非 split 布局为 1,011,852,672B，CCEC split 布局为
+1,011,858,816B；新增控制字位于 standalone 控制区和 `results`
+之后，不移动 `WorkerState`、`RunConfig` 或既有结果字段。每 task
+最多八个 fresh output，以 16B
 `FdwicOutputRef` 表达 `(producer_task_id, output_slot)`，返回句柄为
 8B `SharedTaskOutputs`。构建身份 ABI 当前为 4。
 
@@ -1716,11 +1722,13 @@ ClockBaseline，并继续以逐核容量、调用数、总记录数和 `dropped=
 `64 * 96 = 6,144` bytes。split ELF 另预留 AIC/AIV 两个 role-specific
 block-local runtime state，每个精确 1,664 bytes、最终 section 合计
 3,328 bytes；它们不属于 GM `SchedulerState`。以上 `SchedulerState` 数字
-是 private 模式；当前 S4.14b 继续复用 S4.14a 在尾部追加的精确
-4,736,192 bytes 的 sidecar，故 CPU non-split/CCEC split 总大小分别为
-1,011,852,160/1,011,858,304 bytes；既有生产和 standalone 字段 offset
-不变。S4.9 的 4,735,680B、历史 S2.5 的 2,113,664B 和 S3.1 的
-4,735,104B 都不是当前 shared 构建的传输或分配口径。
+是 private 模式；当前 S4.15a 候选在 S4.14b 的 4,736,192 bytes
+sidecar 尾部再追加 512 bytes Cube cursor，故 sidecar 为
+4,736,704 bytes，CPU non-split/CCEC split 总大小分别为
+1,011,852,672/1,011,858,816 bytes；既有生产和 standalone 字段
+offset 不变。S4.14b 的 4,736,192B、S4.9 的 4,735,680B、历史 S2.5
+的 2,113,664B 和 S3.1 的 4,735,104B 都不是当前候选 shared 构建的
+传输或分配口径。
 独立的 64 bytes PMU 配置和 64 bytes winner workload 配置各占一条
 cache line；二者都位于完整生产 DistGlobal 镜像之后，生产 DistGlobal/
 DistCore 关键偏移保持不变。

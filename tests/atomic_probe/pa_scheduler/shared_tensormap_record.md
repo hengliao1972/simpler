@@ -4,8 +4,9 @@
 [`poursoul/simpler:fdwic-shared-tensormap`](https://github.com/poursoul/simpler/tree/fdwic-shared-tensormap)
 在 A5 FDWIC runtime 中实现的 shared TensorMap 方案，并与当前分支 standalone
 方案比较。本文用于后续开发决策，不表示目标分支已经合入，也不把分支文档中的
-实验记录自动当成当前分支的性能结论；当前分支 S0～S4.14 的实际实施证据另记于
-第 15 节。当前继续开发和验收的后端范围固定为 CPU/CCEC。
+实验记录自动当成当前分支的性能结论；当前分支 S0～S4.14b 的实际实施证据及
+S4.15a 候选的测量前登记另记于第 15 节。当前继续开发和验收的后端范围固定为
+CPU/CCEC。
 
 后续每个实现小步都必须先对照参考提交：可直接复用的机制要说明复用位置；
 有意不同的顺序、ABI、失败语义或性能取舍要在本文记录证据和复核条件，不能只
@@ -3659,3 +3660,144 @@ outputs/perf_clock_pair_ee42b8c1_vs_e8320280_20260725_164329/
 Cube `4→8`，不能扩张 production-prefix `cube_cursor[4]` 并移动真实
 ABI；应先仿照 S4.14a 在 shared-only sidecar 追加容量 8、active 仍为 4
 的 Cube cursor 做迁址对照，再在同址下只改 active 4→8。
+
+### 2026-07-25：S4.15a shared Cube cursor 迁址对照预登记
+
+#### 单一变量与布局边界
+
+本节在性能取数前固定候选设计和判据。当前可比较基线是已保留的
+S4.14b `ee42b8c1`：shared Vector 已使用 sidecar 中全部八条 active
+cursor，Cube/Alloc 仍使用 production prefix 四分片。若直接把 prefix
+`cube_cursor[4]` 扩成八条，既会移动 production ABI，又会同时改变地址和
+分片数，无法归因。
+
+S4.15a 因此只做 Cube 迁址对照：在现有 sidecar 尾部追加物理容量为 8 的
+`shared_cube_cursor`，但 active shards 保持 4，shared QK/PV 仍按
+`task_id % 4` 路由。以下部分全部冻结不动：
+
+- production-prefix `cube_cursor[4]`、`vector_cursor[4]` 和
+  `alloc_cursor[4]` 的大小、offset 与 private 路由；
+- 已保留的 shared `shared_vector_cursor[8]` 地址、八分片路由与终态；
+- shared heap、TensorMap、fanin、completion、task 图、winner 候选集合；
+- trace、PMU、WorkerResult、span、atomic 记录和构建身份字段的布局与
+  握手协议；`scheduler_state_size` 的运行时取值必须随完整 state
+  增长 512B，不能伪装成旧大小。
+
+新字段紧接 `shared_vector_cursor[8]`，offset 为 4,736,192B。sidecar
+从 4,736,192B 增至 4,736,704B；CPU non-split `SchedulerState` 从
+1,011,852,160B 增至 1,011,852,672B，CCEC split `SchedulerState`
+从 1,011,858,304B 增至 1,011,858,816B。新增 512B 位于完整 state
+末尾，不移动任何旧字段；Host 继续通过 `SharedSidecarBytes()` 整块
+初始化和传输。
+
+这仍不是“只换一个 atomic 地址而其余二进制完全相同”的实验。尾部
+新增 512B 会改变 GM 分配长度，可能改变基址后的页映射；更新后的
+`scheduler_state_size` 也会作为编译期常量进入 AIC/AIV 执行节，并可能
+连带改变静态代码布局。因此配对结果只能归因于“shared Cube 四分片
+迁址候选整体”，不能直接解释成某条 atomic 的纯硬件等待差。S4.15b
+必须复用本阶段同一地址、容量与 state 大小，才可继续隔离 active
+分片数 `4→8` 的增量。
+
+#### Atomic 数量与正确性门禁
+
+b256 中 QK/PV 的 Cube ClaimMax 固定为：
+
+```text
+32 AIC × 2 tasks/batch × 256 batches = 16,384
+```
+
+迁址不减少这 16,384 次 atomic，也不改变每个 QK/PV task 的 32 路
+同地址竞争。四条 active sidecar line 各承受 4,096 次 attempted，
+另外四条 inactive line 的 attempted 次数必须为 0，cursor 终值保持
+初始化值 -1。全局 ClaimMax 仍为 73,728；Vector 仍为 32,768 次并
+均分到八条 active sidecar line，Alloc 仍为 prefix 四分片。
+
+候选提交前必须逐项闭合：
+
+- ABI 静态断言锁定新字段 offset、sidecar 和两种 `SchedulerState`
+  精确大小，旧字段 offset 全部不变；
+- Host 初始化全部八条 Cube 物理线为 -1；终态 oracle 要求旧 prefix
+  Cube 在 shared 模式始终为 -1，四条 active sidecar line 达到按 task
+  序列推导的精确高水位，四条 inactive line 始终为 -1；
+- CPU 定向测试逐次核对 QK/PV FetchMax 的真实地址为
+  `shared_cube_cursor[task_id % 4]`，并闭合 16,384 次总量、
+  active 每线 4,096 次、inactive 每线 0 次；同一 shared 定向程序
+  继续锁定 Vector8 路由与 Alloc task0 的 prefix 地址；
+- CPU shared 96-worker b1/b256 完整回放、private 完整回归继续证明
+  Alloc 四分片和 private 三类路由不变；用户
+  `/home/q00473782/.venv` 下观察工具测试全部通过；
+- CCEC private/shared 的 swimlane、perf-clock 和五种 submit-PMU
+  共 14 种构建及 manifest 全部通过，private device 执行节与既有
+  冻结件逐字节一致；
+- A5 shared b1 perf-clock 与 atomic 泳道闭合全部业务 oracle，
+  ClaimMax 数量、分类和 `return_ready` 语义不变。
+
+顺序定向测试只证明路由、地址和计数；唯一 winner 与并发闭合仍由
+96-worker 完整回放和 A5 结果证明。不得把两种证据互相替代。
+
+#### 冻结配对与预声明性能判据
+
+只有上述正确性门禁全部通过并形成独立提交后，才冻结 S4.15a shared
+perf-clock ELF，与 `ee42b8c1` 使用同一 device0、b256、
+`real-compute 6,28,4,1`、two-16、独立进程和 ABBA/BAAB 协议配对。
+差值统一按“候选减基线”计算；swimlane、submit-PMU 或单次可执行性样本
+不参与保留判断。
+
+首轮六区组按以下互斥规则判定：
+
+- 任何语义失败，或配对百分差中位数 `>=+0.2%` 且仅 `0～2/6`
+  区组更快：撤销 S4.15a；
+- 配对百分差中位数 `<=-0.2%` 且 `6/6` 更快：记为有益的 Cube
+  迁址并保留；
+- 配对百分差中位数绝对值 `<0.2%` 且 `2～4/6` 更快：记为中性，
+  可作为后续同址分片实验的对照；
+- 其余组合追加第二轮六区组，不在看到结果后修改门槛。
+
+合并十二个区组后，只在中位数 `<=-0.2%` 且至少 `10/12` 更快时记为
+提升；只在中位数绝对值 `<0.2%` 且 `5～7/12` 更快时记为中性；
+其他结果全部撤销。只有迁址结果被判为有益或中性，S4.15b 才允许在
+相同地址、容量、state 大小和寻址骨架下只把 Cube active shards
+从 4 改为 8。
+
+以上内容在测量前完成登记；下面把正确性结果单列记录，但不把 S4.14a
+的历史迁址收益外推为 Cube 迁址收益，也不提前填写性能结论。
+
+#### 提交前正确性与构建结果
+
+S4.15a 已按上述单一变量完成实现，提交前门禁结果如下：
+
+- CPU shared 构建中的 ring/ABI、PrepareMap、symbol、heap、
+  Cube/Vector Claim cursor、materialize、loser-finish 定向测试全部
+  通过；shared b1/b256 `real-compute 6,28,4,1` 的完整 96-worker
+  回放全部通过，private b1 回归通过；
+- 合并后的 Claim cursor 定向测试逐调用核对 FetchMax 地址；b256
+  精确得到 Vector 32,768 次、Cube 16,384 次，两族 active line
+  均为每线 4,096 次，Cube 后四条 inactive line 为 0 次且终值 -1；
+- 用户 `/home/q00473782/.venv` 下 PMU HTML、PMU sidecar、泳道转换和
+  exclusive analyzer 共 100 项 Python 测试通过；
+- CCEC private/shared 各自的 swimlane、perf-clock 和
+  submit-PMU none/claim/efdrain/materialize/register 共 14 个构建
+  全部通过，14 份 manifest 均完成文件哈希校验；private perf-clock
+  `.text` 为 125,752B、SHA256
+  `94017cdbeb758c0710aec30f238b396d217e648581cc5c67f2deaaa14bca79ef`，
+  `.rodata` 为 300B、SHA256
+  `31d12b9797d051f1529d1792055ac9f46449022118990ca65f458e41f09bbfea`，
+  与 `dc22d076` 冻结件逐字节一致；
+- A5 shared b1 perf-clock 完整语义通过，state 大小为
+  1,011,858,816B，Submit 冒烟值为 64.594us；该单次 b1 只证明
+  可执行性，不进入保留判据；
+- A5 shared b1 合并泳道完整语义通过，raw 4,154 条、dropped=0。
+  ClaimMax 共 288 次：AIC lane 的 Alloc/QK/PV 各 32 次，两个 AIV
+  lane 的 Alloc/SF/UP 各 32 次；全部 flags 为 `0x53`，即 FetchMax、
+  返回值参与判断且结束边界为 return-ready。依赖签名保持
+  `5cb454393ed48dcb`。
+
+本次 b1 泳道位于：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260725_170632_2702522/ccec/
+```
+
+至此正确性门禁闭合，可以形成独立实现提交并冻结 perf-clock ELF。
+S4.15a 是否保留仍只由预登记的 b256 六/十二区组配对决定；上述 b1
+数值和泳道记录不得提前充当性能结论。
