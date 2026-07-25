@@ -2714,3 +2714,65 @@ private b256 分别为 3.884ms 和 3.630ms。所有语义门禁通过。这些�
 perf-clock `.text=129,336B`，相对 S4.9 的 129,080B 增加 256B；下一提交
 会冻结本阶段 clean ELF，与 `e8320280` 做交错配对后再判断这 24,320 次
 atomic 消减是否转化为稳定墙钟收益。
+
+#### S4.10a 冻结配对：atomic 次数下降，但完整 Submit 稳定回退
+
+S4.10a 实现提交为 `e83283f6`。从 clean 提交重新构建并冻结 shared
+perf-clock 三件套，与 S4.9 的 `e8320280` 冻结件运行完全相同的 device 0、
+b256、`real-compute/6,28,4,1`。每版先运行 2 个不计入统计的 warm-up，
+再运行 6 个交替 ABBA/BAAB block；每版共 12 个正式独立进程，全部通过
+shared heap、symbol、依赖、输出 tile 和构建身份门禁。产物和机器可读结果
+位于：
+
+```text
+outputs/perf_clock_freeze_e83283f6_20260725_102242/
+outputs/perf_clock_pair_e83283f6_vs_e8320280_20260725_102404/
+```
+
+| 版本 | 最小值 | 中位数 | 均值 | 最大值 | 样本标准差 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `e8320280` | 3.217ms | 3.252ms | 3.248ms | 3.269ms | 0.017ms |
+| `e83283f6` | 3.259ms | 3.296ms | 3.295ms | 3.321ms | 0.018ms |
+
+6/6 个 block 都是 S4.10a 更慢。每个 block 内先分别对两个样本求均值，
+候选减基线的配对差中位数为 `+49.152us / +1.514%`，范围为
+`+19.811～+71.417us`。因此本轮必须把结果记为稳定回退，不能因为
+`ClaimMax` 数量更少就宣称优化有效。
+
+两版的全局 task/kernel 数、依赖签名、heap/symbol 终态和数值输出门禁均
+通过；winner 落点与动态轮询量并不相同。配对日志可核实以下伴随变化：
+
+- `claims` 从 73,728 精确降到 49,408，少 24,320；代表原定的 atomic
+  消减确实生效；
+- 12 个正式样本的 `max_wins_per_worker` 从基线 32～37 增至
+  候选 75～81。当前 4-shard 固定 owner 把 256 个 Alloc winner 集中到
+  4 个 worker，而参考
+  `[lane][8]` 候选可落到最多 24 个 `(block,lane)` owner；这是两种架构
+  不能混称等价的直接证据；
+- `fanin_loads` 从基线 22,958～23,349（中位数 23,181）变为候选
+  20,225～21,357（中位数 20,598）；real-compute 活跃输出 tile 则从
+  189～192 变为 186～189。它们说明固定 Alloc owner 已经改变后续任务
+  winner 分布和依赖就绪时机，即使全局任务数和数值结果仍然正确；
+- mixed ELF `.text` 从 129,080B 增至 129,336B。AIC/AIV orchestration
+  主体分别增加 48B/120B，其余 88B 是链接布局和对齐的净变化；
+  `.rodata` 大小仍为 288B。
+
+perf-clock 不能把 49us 唯一归因到 winner 集中或代码布局，因此这里只把
+这些数据列为已证实的伴随变化，不把相关性写成单一因果。更重要的是，本小步
+仍让 95 个非候选执行 EfDrain、普通阶段空包围和 generic finish，只消除了
+Claim atomic，没有取得参考实现“候选判断失败后立即返回”的主体裁剪。
+
+下一小步继续保持单一变量：在相同 4-shard owner 规则上把 shared Alloc
+非候选早退前移，删除其 EfDrain、Claim 后半段和 generic finish，同时保留
+调用方已经构造的三个 Output 参数，并为所有 actor 建立
+`PrepareSharedTaskOutputs/shared_result` 符号句柄，保证非候选返回后仍能
+为后续 QK/SF/PV/UP 建立输入引用。外层 `submits` 和 perf-clock 首末边界
+继续覆盖完整 5-task 回放；split-finish calls/task-id sum、普通
+trace/profile 和局部 PMU phase 调用数则按真实跳过的非候选精确减少，并同步
+修改 host/analyzer oracle，不增加 raw 字段。
+
+完整早退版必须同时对照两条基线：与 `e83283f6` 配对只隔离早退本身的增量，
+最终保留判据必须是与 `e8320280` 配对后取得净收益。若它仍不能抵消本轮
+回退，就撤销整个 S4.10 候选方案，而不是为了 atomic 数字好看而保留回退
+代码。后续若要采用参考的 24-owner 分散方式，必须单独修改 cursor ABI 和
+host oracle，不能塞进本次早退验证。

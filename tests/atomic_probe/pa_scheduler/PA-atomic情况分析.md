@@ -1982,3 +1982,31 @@ completion、fanin、heap、symbol、writer signature 和计算结果保持原�
 是否比 S4.9 的冻结中位数 3.243ms 更快或更慢，必须等待 clean ELF 的独立
 进程交错配对，不能用一次运行给出收益结论。当前 `.text` 比 S4.9 增加
 256B，也要与 atomic 消减一起纳入配对解释。
+
+配对已经在 clean `e83283f6` 上完成。与 `e8320280` 各运行 12 个正式
+b256 独立进程后：
+
+| 版本 | Claim 次数 | Submit 中位数 |
+| --- | ---: | ---: |
+| `e8320280` | 73,728 | 3.252ms |
+| `e83283f6` | 49,408 | 3.296ms |
+
+6/6 个 ABBA/BAAB block 都是候选更慢，block 配对差中位数为
+`+49.152us / +1.514%`。也就是说，24,320 次 `ClaimMax` 的物理消减已经
+由计数严格证明，但没有转化成完整 Submit 收益，反而发生稳定小幅回退。
+
+当前 4-shard 固定 owner 还使 12 个正式样本的
+`max_wins_per_worker` 从基线 32～37 增至候选 75～81，并让 mixed ELF
+`.text` 增加 256B；perf-clock 无法把回退唯一拆给 winner 集中或代码布局，
+不能把其中任一项写成已证明的单一原因。完整日志位于：
+
+```text
+outputs/perf_clock_pair_e83283f6_vs_e8320280_20260725_102404/
+```
+
+下一步只验证参考实现还具备、当前小步尚未具备的“shared Alloc 非候选立即
+返回”。非候选仍须保留调用方的三个 Output 参数和
+`PrepareSharedTaskOutputs` 符号句柄；外层 submits 保持 5×batches，
+split-finish、普通阶段和局部 PMU 调用数按真实早退精确减少。完整早退版
+与 `e83283f6` 的对照只解释早退增量，最终必须相对 `e8320280` 取得净收益；
+否则整个候选方案应撤销，不能只以 atomic 次数下降作为保留理由。
