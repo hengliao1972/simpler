@@ -6,7 +6,8 @@
 方案比较。本文用于后续开发决策，不表示目标分支已经合入，也不把分支文档中的
 实验记录自动当成当前分支的性能结论；当前分支 S0～S4.14b 的保留结果及
 S4.15a 的正确性成立、性能否决记录另记于第 15 节。当前有效 shared
-性能基线仍为 `ee42b8c1`，继续开发和验收的后端范围固定为 CPU/CCEC。
+性能基线为已撤销 S4.15a 源码的 `319077a9`，其运行行为回到
+`ee42b8c1`；继续开发和验收的后端范围固定为 CPU/CCEC。
 
 后续每个实现小步都必须先对照参考提交：可直接复用的机制要说明复用位置；
 有意不同的顺序、ABI、失败语义或性能取舍要在本文记录证据和复核条件，不能只
@@ -3854,9 +3855,9 @@ outputs/perf_clock_freeze_bab00e30_20260725_170929/
 outputs/perf_clock_pair_bab00e30_vs_ee42b8c1_20260725_171005/
 ```
 
-`bab00e30` 作为正确但性能未过门槛的历史实现提交保留；随后撤销其
-source、ABI、测试和当前行为描述。当前有效 baseline 仍为 S4.14b
-`ee42b8c1`，当前布局恢复为：
+`bab00e30` 作为正确但性能未过门槛的历史实现提交保留；随后由
+`319077a9` 撤销其 source、ABI、测试和当前行为描述。当前有效 baseline
+提交为 `319077a9`，运行行为恢复到 S4.14b `ee42b8c1`：
 
 - sidecar 4,736,192B，CPU non-split `SchedulerState`
   1,011,852,160B，CCEC split `SchedulerState` 1,011,858,304B；
@@ -3866,3 +3867,152 @@ source、ABI、测试和当前行为描述。当前有效 baseline 仍为 S4.14b
 
 由于迁址对照已经被首轮门槛否决，不再在其上叠加 Cube 同址
 `4→8`；后续若重启 Cube 方向，必须提出新的单变量方案并重新预登记。
+
+### 2026-07-25：S4.16 shared Vector `8→16` 的布局控制与性能预登记
+
+#### 旧实验只能作为弱先验
+
+当前 S4.16 候选回到 shared Vector，但不能用旧实验替代当前单变量验证。本仓
+`2e92da17` 记录的旧 A5 sweep 把 Cube、Vector、Alloc 三类 cursor
+一起选择 `G=1/4/8/16`，且以物理容量 16、运行时 mask 和同一个
+AICore ELF 比较四档；它不是当前 shared-only sidecar 上的静态
+Vector 构建。旧 standalone 中 `G=16-G=8` 的配对中位数为
+`-37.935us/-1.043%`，只有 5/7 组更快，95% 置信区间
+`[-57.306,+21.706]us` 跨零。该结果只提供“边际收益可能已经接近
+饱和”的弱先验，不能预填本轮方向或替代当前冻结配对。
+
+参考分支同样不是独立证据：`e49f73a3` 同时改变三类 cursor 和多项
+shared 提交流程，`0350b558` 将 Vector 从 8 改到 16 时又引入
+`alloc_cursor[3][8]` 并删除 shared completion frontier。参考实现与旧
+sweep 只证明十六分片形态具备可实现性，不证明当前 shared Vector
+`8→16` 的净收益。
+
+#### S4.16a 只建立十六条物理线的临时布局控制
+
+当前冻结基线 `319077a9` 的运行布局与 `ee42b8c1` 一致：
+`shared_vector_cursor` 物理容量和 active shards 均为 8，数组起点为
+sidecar offset 4,735,680B。S4.16a 只把物理容量从 8 扩成 16，
+active shards 仍保持 8；设备 Claim 热路径继续执行
+`task_id % 8`，数组起点、前八条 cache line 的地址和访问顺序全部
+不变。新增加的八条物理线只追加在现有 state 尾部，不新增 trace、
+PMU、span、atomic 记录或业务状态。
+
+预登记的精确 ABI 变化如下：
+
+| 项目 | `319077a9` 冻结基线 | S4.16a 临时控制 |
+| --- | ---: | ---: |
+| Vector 物理容量 | 8 | 16 |
+| Vector active shards | 8 | 8 |
+| `shared_vector_cursor` 起点 | 4,735,680B | 4,735,680B |
+| shared sidecar 大小 | 4,736,192B | 4,736,704B |
+| CPU non-split `SchedulerState` | 1,011,852,160B | 1,011,852,672B |
+| CCEC split `SchedulerState` | 1,011,858,304B | 1,011,858,816B |
+
+尾增 512B 不移动 production prefix、已有 region/output/heap 字段、
+前八条 Vector cursor、standalone 控制区或 `WorkerResult`。但容量变化
+仍会改变完整 state 大小、GM 分配/H2D/D2H 长度、
+`scheduler_state_size` 握手常量，并可能连带改变页映射与 CCEC 静态
+代码布局。因此 S4.16a 的配对只能量化“容量 16、active 8 的静态布局
+整体成本”，不能解释成 atomic 等待变化。
+
+S4.16a 是为 S4.16b 建立同址对照的临时控制，不作为一个可独立长期保留
+的优化候选。只要语义门禁全部通过，就固定相对 `319077a9` 运行六个
+ABBA/BAAB 区组，记录扩容布局成本；无论 S4.16a 单独表现为改善、中性
+还是回退，都不据此取消或放宽后续 S4.16b。若语义失败，则不进入性能
+比较并完整回退。
+
+#### Atomic 数量与正确性门禁
+
+S4.16a 不改变任何 Claim 的参与者、地址映射或次数。b256 必须精确闭合：
+
+```text
+Vector ClaimMax = 64 AIV × 2 tasks/batch × 256 batches = 32,768
+全局 ClaimMax = 73,728
+前 8 条 Vector line = 每条 4,096 次 attempted
+后 8 条 Vector line = 每条 0 次 attempted，终值保持 -1
+```
+
+除逐调用地址与 attempted 计数外，Host 终态 oracle 还必须重新推导全部
+十六条 cursor：前八条达到各自精确 task 高水位，后八条始终为 -1；
+旧 production-prefix Vector 在 shared 模式继续保持 -1，Cube/Alloc
+继续使用 production-prefix 四分片。CPU 定向测试和 shared b1/b256
+96-worker 回放负责闭合地址、计数、唯一 winner、heap/TensorMap、依赖、
+completion 和真实计算输出；private 回归必须证明其状态和路由未受影响。
+
+CCEC 需要重新完成 private/shared 的 swimlane、perf-clock 和五种
+submit-PMU 构建及 manifest 身份校验；private 执行节应与冻结件一致。
+A5 shared b1 perf-clock 与合并 atomic 泳道只用于证明设备可执行、业务
+oracle、ClaimMax 分类、`return_ready` 标志和 `dropped=0` 闭合，不进入
+b256 性能保留判定。
+
+#### S4.16a 正确性实测
+
+S4.16a 已按上述边界实现，热路径仍按 active 8 取模，新增容量只改变
+sidecar 尾部和完整 state 大小。提交前正确性结果如下：
+
+- CPU shared 定向测试、b1 和 b256 全部通过；b1/b256 分别闭合
+  288/73,728 次全局 Claim，b256 的前八条 Vector line 各 4,096 次
+  attempted，后八条均为 0 且终值为 -1；
+- CPU private b1 仍为 1,007,115,968B，production-prefix 路由和全部
+  业务断言通过，证明 shared 尾扩展没有进入 private 状态；
+- CCEC shared/private 各自的 swimlane、perf-clock 和五种 submit-PMU
+  各 7 个变体、共 14 个构建全部完成，artifact manifest 校验通过；
+  private 当前 `.text` 为 125,752B、SHA256
+  `94017cdbeb758c0710aec30f238b396d217e648581cc5c67f2deaaa14bca79ef`，
+  `.rodata` 为 300B、SHA256
+  `31d12b9797d051f1529d1792055ac9f46449022118990ca65f458e41f09bbfea`，
+  与文档保存的冻结 private 基线执行节摘要一致；
+- A5 shared b1 perf-clock 在 1,011,858,816B split state 上通过执行、
+  语义和后处理门禁，功能烟测 Submit 为 `65.105us`；随后合并 atomic
+  泳道得到 4,148 条 raw 记录、
+  0 丢失和 288 条 `ClaimMax`。其中 Alloc 为 96 条，QK/PV 各 32 条，
+  SF/UP 各 64 条，全部 direct atomic flags 为 `0x53`
+  （FetchMax、消费返回值、`return_ready`）。全部十六条 cursor 的
+  Host 终态 oracle 同时通过。
+
+A5 泳道证据位于：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260725_174924_2741480/ccec/
+```
+
+b1 只覆盖 task 0～4，不能单独证明前八条 line 的均匀 attempted 分布；
+该分布由 CPU b256 的逐调用地址 oracle 闭合。以上只完成 S4.16a
+正确性门禁，尚未冻结或比较 b256 性能，泳道中的 `81.671us` 也不进入
+性能保留判定。
+
+#### S4.16b 同址十六分片与两级保留门槛
+
+S4.16b 必须复用 S4.16a 的数组起点、物理容量 16、state 大小、初始化、
+Host 传输和寻址骨架，只把 active shards 与热路径取模从 8 改为 16。
+届时 Vector ClaimMax 和全局 ClaimMax 仍分别为 32,768 与 73,728；
+每个 SF/UP task 仍由 64 个 AIV 竞争同一条 cursor，变化只在跨 task
+流量从八条线每条 4,096 次摊到十六条线每条 2,048 次。它不是 atomic
+次数消减，也不缩小单 task 的竞争面。
+
+第一层先将冻结的 S4.16b perf-clock ELF 与 S4.16a 做独立进程、
+`real-compute 6,28,4,1`、b256、同一 device 的 ABBA/BAAB 配对。
+首轮六区组按以下互斥规则判定，差值统一为 S4.16b 减 S4.16a：
+
+- 任一语义失败、只有 `0～3/6` 区组更快，或配对百分差中位数
+  `>=0`：判定失败；
+- `6/6` 更快且配对百分差中位数 `<=-0.2%`：通过第一层；
+- 其余仍为负向的组合，即 `4～5/6` 更快且中位数 `<0`，或
+  `6/6` 更快但中位数位于 `(-0.2%,0)`：再追加六个区组。
+
+合并十二个区组后，只有至少 `10/12` 更快且配对百分差中位数
+`<=-0.2%` 才通过第一层，其他组合均判定失败，不在看到数据后修改
+门槛。
+
+只有第一层通过，才把同一个 S4.16b 冻结 ELF 再与 `319077a9` 做第二层
+净收益配对；第二层复用完全相同的首六区组和必要时十二条区组规则。
+只有“S4.16b 相对 S4.16a”和“S4.16b 相对 `319077a9`”两层都通过，
+才保留最终 capacity 16、active 16 的实现。任一层失败都完整撤销
+S4.16a 与 S4.16b，恢复 `319077a9` 的 capacity 8、active 8 布局；
+即使 S4.16a 单独更快，也不把临时布局控制留下。
+
+S4.16b 的 active 常量变化会重新触发 CCEC 内联、常量传播和静态布局
+变化，因此其结果只能评价“静态 shared Vector16 构建整体”，不能仅凭
+墙钟进一步拆分为 atomic 竞争、I-cache、页映射或 winner 到达时序中的
+某一项。当前已完成预登记和 S4.16a 正确性，尚无 S4.16a/S4.16b
+冻结性能结果。

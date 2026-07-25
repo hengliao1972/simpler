@@ -23,6 +23,11 @@ namespace {
 using namespace pa_scheduler;
 
 int g_failures = 0;
+static_assert(
+    kSharedVectorCursorCapacity == 16 &&
+        kSharedVectorCursorShards == 8,
+    "S4.16a must keep capacity16/active8"
+);
 
 // 只实现 Claim/atomic trace 会触及的最小 Ops 接口，同时记录 FetchMax
 // 地址和次数，避免定向测试仅凭最终 cursor 猜测实际走过的路径。
@@ -155,6 +160,30 @@ void TestSharedVectorRouting() {
         "active eight-shard routing separates task 2 and task 14"
     );
 
+    // task 4(UP) 与 task 12(SF) 在 %8 下同落 shard 4，在未来 %16
+    // 下才会分到 shard 4/12。S4.16a 用它们锁定“容量已扩展、active
+    // 仍为8”，并逐次验证后八条物理线尚未进入热路径。
+    const ClaimOutcome active8_first = Claim<ClaimTestOps>(
+        state, *worker, 4, TaskKind::Up, stats
+    );
+    Check(
+        active8_first.attempted && active8_first.won &&
+            ClaimTestOps::last_fetch_max_address ==
+                &state->shared_map.shared_vector_cursor[4].value,
+        "task 4 issues FetchMax to active Vector shard 4"
+    );
+    const ClaimOutcome active8_second = Claim<ClaimTestOps>(
+        state, *worker, 12, TaskKind::Sf, stats
+    );
+    Check(
+        active8_second.attempted && active8_second.won &&
+            ClaimTestOps::last_fetch_max_address ==
+                &state->shared_map.shared_vector_cursor[4].value &&
+            state->shared_map.shared_vector_cursor[4].value == 12 &&
+            state->shared_map.shared_vector_cursor[12].value == -1,
+        "capacity16/active8 keeps task 4 and task 12 on shard 4"
+    );
+
     const ClaimOutcome same_shard = Claim<ClaimTestOps>(
         state, *worker, 34, TaskKind::Up, stats
     );
@@ -218,9 +247,10 @@ void TestB256VectorCursorFinalState() {
     InitializeClaimCursors(state);
     LocalStats stats{};
     ClaimTestOps::ResetFetchMaxTrace();
-    int64_t expected[kSharedVectorCursorCapacity] = {
-        -1, -1, -1, -1, -1, -1, -1, -1
-    };
+    int64_t expected[kSharedVectorCursorCapacity];
+    for (uint32_t shard = 0; shard < kSharedVectorCursorCapacity; ++shard) {
+        expected[shard] = -1;
+    }
     uint32_t attempts_by_worker[kWorkers] = {};
     uint32_t attempts_by_shard[kSharedVectorCursorCapacity] = {};
     uint32_t winners = 0;
@@ -285,7 +315,7 @@ void TestB256VectorCursorFinalState() {
     );
     Check(
         exact,
-        "b256 preserves 64 AIV candidates, one winner, 4096 attempts per shard, and exact high watermarks"
+        "b256 preserves 64 AIV candidates, one winner, 4096 attempts per active shard, eight inactive lines, and exact high watermarks"
     );
 
     munmap(worker, sizeof(*worker));

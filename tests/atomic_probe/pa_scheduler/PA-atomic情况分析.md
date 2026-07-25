@@ -7,8 +7,11 @@ Submit 路径，供后续继续优化。真实 PA 生产快照日期为 2026-07-
 保留的生产优化基线为 `2c3dd1e2`，F1 负结果记录提交为 `c93c3666`。
 standalone 已完成 2026-07-25 的 S4.14b；shared Vector cursor
 四分片迁址和同址八分片均通过冻结 ELF 配对门槛，当前 standalone
-shared 性能基线为 `ee42b8c1`。S4.15a shared Cube 四分片迁址虽然
-正确性闭合，但配对中位数回退 `+0.567%`，已按预登记门槛撤销。
+shared 性能基线为回退提交 `319077a9`，其运行行为与 `ee42b8c1`
+一致。S4.15a shared Cube 四分片迁址虽然正确性闭合，但配对中位数
+回退 `+0.567%`，已按预登记门槛撤销。当前候选 S4.16 已预登记为
+shared Vector `8→16`；其中 S4.16a 已建立 capacity 16、active 8 的
+临时布局控制并闭合 CPU/CCEC/A5 正确性，尚未冻结或比较性能。
 
 范围限定为：
 
@@ -2319,7 +2322,41 @@ atomic 的纯硬件延迟。证据位于：
 outputs/perf_clock_pair_bab00e30_vs_ee42b8c1_20260725_171005/
 ```
 
-随后回退候选 source、ABI 和测试，当前 baseline 仍为 `ee42b8c1`：
-Cube/Alloc 使用 production-prefix 四分片，shared Vector 使用 sidecar
-八分片。S4.15a 正确性成立的历史提交和取证保留，但不得再描述成当前
-布局或性能收益。
+随后由 `319077a9` 回退候选 source、ABI 和测试；当前 baseline 提交为
+`319077a9`，运行行为恢复到 `ee42b8c1`：Cube/Alloc 使用
+production-prefix 四分片，shared Vector 使用 sidecar 八分片。S4.15a
+正确性成立的历史提交和取证保留，但不得再描述成当前布局或性能收益。
+
+#### 7.5.28 S4.16 shared Vector `8→16` 测量前边界
+
+当前回退提交 `319077a9` 的有效布局仍是 shared Vector sidecar
+capacity 8、active 8。S4.16a 只把物理容量扩成 16，active 和 Claim
+热路径保持 `task_id%8`；数组起点及前八条线地址不变，尾部新增八条
+cache line。sidecar 因此从 4,736,192B 增至 4,736,704B，CPU
+non-split/CCEC split `SchedulerState` 分别变为
+1,011,852,672B/1,011,858,816B。
+
+本阶段的 Claim 数量不变：Vector 仍为 32,768 次、全局仍为 73,728
+次；前八条线各 4,096 次 attempted，后八条线必须为零次且终值保持
+-1。容量扩张会改变完整 state 大小、GM 分配和传输长度、
+`scheduler_state_size` 常量及潜在静态代码/页布局，所以 S4.16a
+只量“capacity 16、active 8 静态布局”的整体成本。它是临时布局控制，
+语义通过后固定与 `319077a9` 做六区组 ABBA/BAAB 取数，但不因其单独
+快慢取消下一步，也不单独长期保留。
+
+S4.16b 复用同一地址、容量和 state，只把 active 与热路径取模从 8
+改到 16；每条线变为 2,048 次 attempted，但每个 SF/UP task 的 64 路
+竞争和总 atomic 数不变。保留判据分两层：
+
+1. 先相对 S4.16a：首轮语义失败、仅 `0～3/6` 更快或配对中位数
+   `>=0` 即失败；`6/6` 且 `<=-0.2%` 直接通过；其余负向组合补至
+   12 个区组，只有至少 `10/12` 且 `<=-0.2%` 才通过。
+2. 第一层通过后，再相对 `319077a9` 使用同一门槛验证最终净收益。
+
+两层都通过才保留 capacity 16、active 16；否则 S4.16a/S4.16b 整体
+回退。旧统一 sweep 的 `G=16-G=8` 只有 5/7 更快、配对中位数
+`-37.935us/-1.043%` 且 95% 置信区间跨零，只作为收益可能已接近
+饱和的弱先验。S4.16b 也只能评价静态 Vector16 构建整体，不能把结果
+单独解释成 atomic 硬件等待变化。完整 ABI、正确性门禁和性能协议见
+`shared_tensormap_record.md` 的 S4.16 节。S4.16a 当前只有正确性结果，
+尚无冻结性能结果；不得用 b1 功能烟测时间代替后续 b256 配对。

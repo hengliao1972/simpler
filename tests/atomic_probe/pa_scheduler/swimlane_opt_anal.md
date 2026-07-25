@@ -393,13 +393,29 @@ Claim 先根据 task kind 生成 active role，再选择对应 cursor shard：
 - Alloc 使用 production-prefix `alloc_cursor[4]`；
 - QK/PV 使用 production-prefix `cube_cursor[4]`；
 - private SF/UP 使用 production-prefix `vector_cursor[4]`；
-- 当前 shared SF/UP 使用 sidecar 中全部 8 个 active shard：
-  `shared_vector_cursor[8]`。
+- 当前 S4.16a shared SF/UP 使用 `shared_vector_cursor[16]` 中前
+  8 个 active shard。
 
 S4.15a 历史候选曾把 shared Cube 四分片迁到 sidecar，但六区组
 性能门槛未通过并已撤销；它不属于当前 Claim 路由。当前 private/shared
 的 Cube 和 Alloc 均继续使用 production prefix，只有 shared Vector
 使用 sidecar。
+
+当前候选 S4.16 只围绕 shared Vector 展开。S4.16a 已建立临时布局
+控制：把 `shared_vector_cursor` 物理容量从 8 扩成 16，但 active
+保持 8，数组起点 4,735,680B、前八条 cache line
+地址以及 Claim 热路径 `task_id%8` 都不变。新增八条线位于 state
+尾部，sidecar 为 4,736,704B，CPU non-split/CCEC split state
+为 1,011,852,672B/1,011,858,816B；后八条线零 attempted 且终值
+保持 -1。CPU/CCEC/A5 正确性已闭合，尚无冻结性能结果。
+
+S4.16b 才会在相同地址、物理容量和 state 大小下把 active 改为 16。
+无论 S4.16a 还是 S4.16b，Vector ClaimMax 都仍为 32,768 次、全局
+ClaimMax 仍为 73,728 次；前者由前八条线各承担 4,096 次，后者由
+十六条线各承担 2,048 次。每个 SF/UP task 仍是 64 个 AIV 竞争同一
+地址，所以泳道中的 Claim/Atomic 事件总数、父子层级和
+`return_ready` 解释均不因容量控制而变化。S4.16a 不会单独长期
+保留；完整预登记门槛见 `shared_tensormap_record.md` 的 S4.16 节。
 
 符合 role 的 worker 对 cursor 执行 `atomicMax(task_id)`。返回旧值小于当前
 task id 的唯一竞争者获胜；其他参与者是 attempted loser，不符合 role 的核是

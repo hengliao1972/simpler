@@ -148,9 +148,10 @@ else
     echo "[TEST] shared heap no-wrap reserve self-test"
     "$BUILD_DIR/test_shared_heap_reserve"
 
-    # S4.14b 启用 shared Vector sidecar 的全部八个 shard。定向测试锁定
-    # SF/UP 的 task%8 地址、错误 role 零 atomic、Cube/Alloc 不变，以及
-    # b256 的32,768次 Vector Claim、每 task 唯一 winner与八线终态。
+    # S4.16a 将 shared Vector sidecar 物理容量扩到16但 active 保持8。
+    # 定向测试锁定 SF/UP 的 task%8 地址、错误 role 零 atomic、
+    # Cube/Alloc 不变，以及 b256 的32,768次 Vector Claim、active
+    # 每线4,096次、后八条物理线零访问和每 task 唯一 winner。
     echo "[BUILD] shared Vector Claim cursor self-test"
     "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \

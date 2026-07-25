@@ -79,11 +79,11 @@ constexpr uint32_t kAivWorkers = 64;
 constexpr uint32_t kWorkers = kAicWorkers + kAivWorkers;
 constexpr uint32_t kRuntimeMaxWorkers = 108;
 constexpr uint32_t kCursorShards = 4;
-// S4.14a 已建立 shared Vector 四分片迁址对照；S4.14b 继续使用相同的
-// sidecar 地址、物理容量和代码骨架，只启用此前预留的后四条物理线。
-// device 热路径仍使用同一取模表达式，唯一数值变量是 active shards
-// 从4改8，以便单独归因分片收益。
-constexpr uint32_t kSharedVectorCursorCapacity = 8;
+// S4.16a 只把 shared Vector sidecar 的尾部物理容量从8扩到16，
+// active shards 仍保持 S4.14b 已验证的8。前八条地址与 device 热路径
+// 的取模表达式均不变；S4.16b 才会在相同地址和 state 大小下只改
+// active 8→16。
+constexpr uint32_t kSharedVectorCursorCapacity = 16;
 constexpr uint32_t kSharedVectorCursorShards = 8;
 constexpr uint32_t kSharedVectorCursorShardMask =
     kSharedVectorCursorShards - 1;
@@ -817,15 +817,15 @@ struct alignas(64) SharedTensorMapSidecar {
     // 与全局 aggregate vend 独占 cache line，避免不同 winner 的原子更新伪共享。
     AtomicLine shared_heap_cursor[kSharedHeapShards];
     AtomicLine shared_heap_vend;
-    // S4.14a 的 shared-only Vector Claim cursor 追加在既有 sidecar 尾部；
-    // S4.14b 只启用此前已经预留的后四条物理线。production prefix 和
-    // 已验证的 region/output/heap 字段仍不移动，且不宣称该地址与参考
-    // DistGlobal 具有相同字节 offset。
+    // S4.16a 在既有 shared-only Vector cursor 尾部预留后八条物理线，
+    // 当前仍只启用前八条。production prefix 和已验证的
+    // region/output/heap 字段均不移动，也不宣称该地址与参考 DistGlobal
+    // 具有相同字节 offset。
     AtomicLine shared_vector_cursor[kSharedVectorCursorCapacity];
 #endif
 };
 #if PTO_FDWIC_SHARED_MAP
-static_assert(sizeof(SharedTensorMapSidecar) == 4736192, "shared TensorMap sidecar size changed");
+static_assert(sizeof(SharedTensorMapSidecar) == 4736704, "shared TensorMap sidecar size changed");
 static_assert(
     offsetof(SharedTensorMapSidecar, shared_outputs) == 2113664,
     "shared output table offset mismatch"
@@ -841,6 +841,12 @@ static_assert(
 static_assert(
     offsetof(SharedTensorMapSidecar, shared_vector_cursor) == 4735680,
     "shared Vector cursor offset mismatch"
+);
+static_assert(
+    offsetof(SharedTensorMapSidecar, shared_vector_cursor) +
+            8 * sizeof(AtomicLine) ==
+        4736192,
+    "the original eight shared Vector cursor addresses changed"
 );
 #else
 static_assert(sizeof(SharedTensorMapSidecar) == 2113664, "private sidecar layout changed");
@@ -1135,8 +1141,8 @@ static_assert(
 // 因此测试控制信息不会改变被测字段 offset。
 struct alignas(64) SchedulerState {
     // production prefix 的三组四分片 cursor 服务 AIC、private AIV 与
-    // Alloc；shared AIV 继续使用 sidecar 尾部的 Vector cursor，
-    // S4.14b 启用全部八条物理线。
+    // Alloc；shared AIV 使用 sidecar 尾部 capacity16/active8 的
+    // Vector cursor，S4.16a 新增的后八条只作同址扩分片控制。
     // 同 task 的 eligible workers 仍竞争同一 shard，只有旧值小于
     // task_id 的调用成为 winner。
     AtomicLine cube_cursor[kCursorShards];
@@ -1232,6 +1238,17 @@ static_assert(
         offsetof(SchedulerState, results) + sizeof(WorkerResult) * kWorkers,
     "shared TensorMap sidecar must follow the complete result array"
 );
+#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+static_assert(
+    sizeof(SchedulerState) == 1011858816,
+    "shared split SchedulerState size changed"
+);
+#else
+static_assert(
+    sizeof(SchedulerState) == 1011852672,
+    "shared non-split SchedulerState size changed"
+);
+#endif
 #endif
 static_assert(sizeof(SchedulerState) <= UINT32_MAX, "SchedulerState size must fit build identity");
 
