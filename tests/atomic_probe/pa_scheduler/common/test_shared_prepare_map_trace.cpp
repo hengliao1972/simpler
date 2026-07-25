@@ -148,6 +148,126 @@ void TestRejectsTaskSequenceDrift() {
     }
 }
 
+void TestAcceptsOnlyProvenSharedAllocGaps() {
+    // worker1=(block1,AIC) 不是 task0/task5 的 Alloc owner，因此首个
+    // full-path task 是 QK task1，task4 之后又应精确跳到 task6。
+    SharedPrepareMapTraceValidator validator(1);
+    const auto close_task = [&](int32_t task_id, int32_t function_id,
+                                uint64_t begin) {
+        Check(
+            validator.Observe(
+                MakeRecord(
+                    TracePhase::Claim, task_id, function_id,
+                    begin, begin + 1, 2
+                )
+            ),
+            "sparse shared task Claim is accepted"
+        );
+        Check(
+            validator.Observe(
+                MakeRecord(
+                    TracePhase::Materialize, task_id, function_id,
+                    begin + 1, begin + 2
+                )
+            ),
+            "sparse shared task Materialize is accepted"
+        );
+        Check(
+            validator.Observe(
+                MakeRecord(
+                    TracePhase::PrepareMap, task_id, function_id,
+                    begin + 2, begin + 2
+                )
+            ),
+            "sparse shared task PrepareMap is accepted"
+        );
+        Check(
+            validator.Observe(
+                MakeRecord(
+                    TracePhase::Submit, task_id, function_id,
+                    begin, begin + 3
+                )
+            ),
+            "sparse shared task Submit is accepted"
+        );
+    };
+    close_task(1, 0, 10);
+    close_task(2, 1, 20);
+    close_task(3, 2, 30);
+    close_task(4, 3, 40);
+    close_task(6, 0, 60);
+    Check(validator.Closed(), "sparse shared sequence closes");
+
+    SharedPrepareMapTraceValidator wrong_gap(1);
+    Check(
+        !wrong_gap.Observe(
+            MakeRecord(TracePhase::Claim, 2, 1, 10, 11, 2)
+        ),
+        "non-Alloc task cannot be skipped together with an early-return Alloc"
+    );
+
+    // worker34=(block1,AIV0) 拥有 shard1：它必须跳过 task0，却不能把
+    // 自己拥有的 task5 也当成早退缺口。
+    SharedPrepareMapTraceValidator owner(34);
+    Check(
+        !owner.Observe(
+            MakeRecord(TracePhase::Claim, 0, -1, 10, 11, 3, 1)
+        ),
+        "shared owner skips only Alloc tasks owned by another shard"
+    );
+    for (int32_t task_id = 1; task_id <= 4; ++task_id) {
+        const uint64_t begin = 100 + static_cast<uint64_t>(task_id) * 10;
+        Check(
+            owner.Observe(
+                MakeRecord(
+                    TracePhase::Claim, task_id, task_id - 1,
+                    begin, begin + 1, 2
+                )
+            ) &&
+                owner.Observe(
+                    MakeRecord(
+                        TracePhase::Materialize, task_id, task_id - 1,
+                        begin + 1, begin + 2
+                    )
+                ) &&
+                owner.Observe(
+                    MakeRecord(
+                        TracePhase::PrepareMap, task_id, task_id - 1,
+                        begin + 2, begin + 2
+                    )
+                ) &&
+                owner.Observe(
+                    MakeRecord(
+                        TracePhase::Submit, task_id, task_id - 1,
+                        begin, begin + 3
+                    )
+                ),
+            "owner pre-Alloc non-Alloc flow stays complete"
+        );
+    }
+    Check(
+        !owner.Observe(
+            MakeRecord(TracePhase::Claim, 6, 0, 200, 201, 2)
+        ),
+        "owner cannot skip its own task5 Alloc"
+    );
+    Check(
+        owner.Observe(
+            MakeRecord(TracePhase::Claim, 5, -1, 210, 211, 3, 1)
+        ) &&
+            owner.Observe(
+                MakeRecord(TracePhase::Materialize, 5, -1, 211, 212)
+            ) &&
+            owner.Observe(
+                MakeRecord(TracePhase::PrepareMap, 5, -1, 212, 212, 0, 1)
+            ) &&
+            owner.Observe(
+                MakeRecord(TracePhase::Submit, 5, -1, 210, 213, 1, 1)
+            ),
+        "owner keeps the full path for its task5 Alloc"
+    );
+}
+
 void TestRejectsMaterializeMismatch() {
     {
         SharedPrepareMapTraceValidator validator;
@@ -357,6 +477,7 @@ void TestRejectsSubmitWithoutCompleteMarkerFlow() {
 int main() {
     TestValidSequentialFlow();
     TestRejectsTaskSequenceDrift();
+    TestAcceptsOnlyProvenSharedAllocGaps();
     TestRejectsMaterializeMismatch();
     TestRejectsMarkerTimingDrift();
     TestRejectsIdentitySchemaAndMultiplicityDrift();

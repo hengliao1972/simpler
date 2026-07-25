@@ -599,13 +599,26 @@ struct ClaimOutcome {
 };
 
 #if PTO_FDWIC_SHARED_MAP
-PA_DEVICE bool IsSharedAllocCandidate(
-    int32_t block_id, int32_t lane, uint32_t task_id
+PA_DEVICE int32_t SharedAllocOwnerShard(
+    int32_t block_id, int32_t lane
 ) {
     static_assert(
         kCursorShards <= kAicWorkers,
         "every standalone Alloc cursor shard needs a physical block owner"
     );
+    if (block_id < 0 ||
+        block_id >= static_cast<int32_t>(kCursorShards)) {
+        return -1;
+    }
+    const uint32_t shard = static_cast<uint32_t>(block_id);
+    return lane == static_cast<int32_t>(shard % 3U)
+        ? static_cast<int32_t>(shard)
+        : -1;
+}
+
+PA_DEVICE bool IsSharedAllocCandidate(
+    int32_t block_id, int32_t lane, uint32_t task_id
+) {
     if (task_id >= kTaskCellCapacity) {
         return false;
     }
@@ -617,9 +630,42 @@ PA_DEVICE bool IsSharedAllocCandidate(
     // 映射；否则同一 4-shard cursor 会被多个 worker 乱序 atomicMax，
     // 较早 task 可能在较晚 task 之后到达并失去唯一 winner。
     const uint32_t shard = task_id % kCursorShards;
-    const int32_t target_block = static_cast<int32_t>(shard);
-    const int32_t target_lane = static_cast<int32_t>(shard % 3U);
-    return block_id == target_block && lane == target_lane;
+    return SharedAllocOwnerShard(block_id, lane) ==
+        static_cast<int32_t>(shard);
+}
+
+PA_DEVICE uint32_t SharedAllocOwnedTaskCount(
+    int32_t block_id, int32_t lane, uint32_t batches
+) {
+    const int32_t owner_shard = SharedAllocOwnerShard(block_id, lane);
+    if (owner_shard < 0 ||
+        batches <= static_cast<uint32_t>(owner_shard)) {
+        return 0;
+    }
+    return 1U +
+        (batches - 1U - static_cast<uint32_t>(owner_shard)) /
+            kCursorShards;
+}
+
+PA_DEVICE uint64_t SharedAllocOwnedTaskIdSum(
+    int32_t block_id, int32_t lane, uint32_t batches
+) {
+    const int32_t owner_shard = SharedAllocOwnerShard(block_id, lane);
+    const uint64_t count =
+        SharedAllocOwnedTaskCount(block_id, lane, batches);
+    if (count == 0) {
+        return 0;
+    }
+    // Alloc task_id=5*batch，且 5 mod 4=1；固定 shard 拥有
+    // batch=shard, shard+4, ... 的等差序列。
+    const uint64_t first_batch =
+        static_cast<uint32_t>(owner_shard);
+    const uint64_t batch_sum =
+        count *
+        (2U * first_batch +
+         static_cast<uint64_t>(kCursorShards) * (count - 1U)) /
+        2U;
+    return static_cast<uint64_t>(kTasksPerBatch) * batch_sum;
 }
 #endif
 
@@ -1224,8 +1270,10 @@ static_assert(offsetof(CallbackSubmitTicket, function_id) == 12, "callback ticke
 static_assert(offsetof(CallbackSubmitTicket, won) == 14, "callback ticket winner offset mismatch");
 
 PA_DEVICE void BeginCallbackSubmit(PA_GM WorkerState &worker, SubmitContext &context) {
-    // Claim 必须先于 TaskArgs 构造，因此这里只建立与参数无关的 Submit 上下文；
-    // tensor/scalar 数量由 callback 完成后在 MaterializeTask 内写入。
+    // 普通 kernel task 仍先 Claim、winner 再做重构参；shared Alloc 为对齐
+    // 参考 wrapper，会在候选判断前构造三项轻量 Output 参数。这里统一只建立
+    // 与参数无关的 Submit 上下文，tensor/scalar 数量仍由 MaterializeTask
+    // 在真正需要消费参数时写入。
     const uint32_t task_id = static_cast<uint32_t>(worker.local_index++);
     context.self = &worker;
     context.payload = &worker.payloads[task_id & kPayloadMask];
@@ -1398,6 +1446,13 @@ PA_DEVICE bool BuildCallbackSubmitArgs(
 
 #undef PA_CALLBACK_LAMBDA_DEVICE
 
+template <typename Ops, bool Profile, bool RecordSubmit>
+PA_DEVICE void CompleteLogicalCallbackSubmit(
+    LocalStats &stats, uint32_t task_id, uint32_t task_count,
+    uint64_t submit_begin, int32_t function_id, bool winner,
+    bool is_alloc
+);
+
 template <typename Ops, bool Profile, typename PmuContext>
 PA_DEVICE bool FinishCallbackSubmitBody(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_count,
@@ -1411,8 +1466,9 @@ PA_DEVICE bool FinishCallbackSubmitBody(
 
 #if PTO_FDWIC_SHARED_MAP
     // callback 已经返回；只有 Claim winner 才把 CreateInfo 物化为 descriptor
-    // 并预留 shared heap。所有 replay actor 都仍进入 split finish、闭合固定
-    // span 和 Submit 计数，但不会推进 heap、写 payload 或读取 TaskArgs。
+    // 并预留 shared heap。所有进入 full path 的 replay actor 都仍进入
+    // split finish、闭合固定 span 和 Submit 计数，但不会推进 heap、写
+    // payload 或读取 TaskArgs；Alloc 非候选已在 caller 中提前返回。
     // PA Case1 的普通 region 恒为空，winner 不再等待全局 exact turn；
     // 跨 task 顺序只由实际消费的 (producer,slot).published 建立。
     // 删除 exact-turn 不能连带删除它成功出口的终止态检查：若其他核已经
@@ -1610,7 +1666,26 @@ PA_DEVICE bool FinishCallbackSubmitBody(
         );
     }
 
+    CompleteLogicalCallbackSubmit<Ops, Profile, true>(
+        stats, task_id, task_count, ticket.submit_begin, function_id,
+        winner, kind == TaskKind::Alloc
+    );
+    return true;
+}
+
+template <typename Ops, bool Profile, bool RecordSubmit>
+PA_DEVICE void CompleteLogicalCallbackSubmit(
+    LocalStats &stats, uint32_t task_id, uint32_t task_count,
+    uint64_t submit_begin, int32_t function_id, bool winner,
+    bool is_alloc
+) {
     ++stats.result.submits;
+    if constexpr (!RecordSubmit) {
+        (void)submit_begin;
+        (void)function_id;
+        (void)winner;
+        (void)is_alloc;
+    }
 #if PA_BUILD_PERF_CLOCK
     // 与真实 FDWIC perf-clock 相同：只有末个 Submit 完成全部尾动作后
     // 才采一次专用性能边界。协议 watchdog 继续使用 Ops::Now()，两者
@@ -1620,15 +1695,20 @@ PA_DEVICE bool FinishCallbackSubmitBody(
 #elif PA_BUILD_SUBMIT_PMU
     const uint64_t submit_end = task_id + 1 == task_count ? Ops::Now() : 0;
 #else
-    const uint64_t submit_end = TraceTimestamp<Ops>(stats.trace, stats.result);
+    const uint64_t submit_end =
+        RecordSubmit || task_id + 1 == task_count
+            ? TraceTimestamp<Ops>(stats.trace, stats.result)
+            : 0;
 #endif
-    WriteTrace<Profile>(
-        stats.trace, stats.result, static_cast<int32_t>(task_id), function_id,
-        TracePhase::Submit, ProfilePhase::Submit,
-        ticket.submit_begin, submit_end, winner ? 1U : 0U, kind == TaskKind::Alloc ? 1U : 0U
-    );
+    if constexpr (RecordSubmit) {
+        WriteTrace<Profile>(
+            stats.trace, stats.result, static_cast<int32_t>(task_id),
+            function_id, TracePhase::Submit, ProfilePhase::Submit,
+            submit_begin, submit_end, winner ? 1U : 0U,
+            is_alloc ? 1U : 0U
+        );
+    }
     if (task_id + 1 == task_count) stats.result.submit_end = submit_end;
-    return true;
 }
 
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
@@ -1715,6 +1795,36 @@ PA_DEVICE bool SubmitCallbackTask(
 #endif
     if (task_id == 0) stats.result.submit_begin = submit_begin;
 
+#if PTO_FDWIC_SHARED_MAP
+    if constexpr (Kind == TaskKind::Alloc) {
+        // 参考 shared alloc_tensors 的 L0TaskArgs 已在进入 inner Submit
+        // 前由所有 actor 构造。standalone 仍在同一公共函数中实现，但把
+        // 三个静态 Output 参数前移到候选判断之前，保证早退只删除 inner
+        // 调度主体，不偷删调用方成本。
+        if (!BuildCallbackSubmitArgs<Kind>(orch, args, batch, stats)) {
+            SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+            return false;
+        }
+        if (!PrepareSharedTaskOutputs(
+                context.shared_result, static_cast<int32_t>(task_id), Kind
+            )) {
+            SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+            return false;
+        }
+        if (!IsSharedAllocCandidate(
+                worker.block_id, worker.lane, task_id
+            )) {
+            // 非候选与参考实现相同：返回稳定 task/output 符号，但不进入
+            // EfDrain、Claim 或跨 TU generic finish。submits 仍统计外层
+            // API 调用；task0 的首个 perf-clock 边界已经在上方保存。
+            CompleteLogicalCallbackSubmit<Ops, Profile, false>(
+                stats, task_id, task_count, submit_begin, -1, false, true
+            );
+            return true;
+        }
+    }
+#endif
+
     const uint64_t efdrain_begin = submit_begin;
     BeginSubmitPmuPhase<SubmitPmuPhase::EfDrain, Ops>(pmu_context);
     DrainReady<Ops>(state, worker, DrainPlace::EfDrain, stats);
@@ -1756,29 +1866,25 @@ PA_DEVICE bool SubmitCallbackTask(
     // fresh Output 的返回值是 task/slot 符号，不依赖哪个 worker 获胜。
     // 在跨 TU finish 前为所有 replay actor 建立同一句柄集，保证 loser
     // 返回后也能继续构造本核后续 task 的输入引用。
-    if (!PrepareSharedTaskOutputs(
-            context.shared_result, static_cast<int32_t>(task_id), Kind
-        )) {
-        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
-        return false;
-    }
-#endif
-#if PTO_FDWIC_SHARED_MAP
-    if constexpr (Kind == TaskKind::Alloc) {
-        // 为对齐参考 alloc_tensors(args) 的调用形状，并把本小步变量限定
-        // 在四个重构参 task，Alloc 暂保留全员三个静态 Output 参数。
-        // standalone 的 output symbol 已由上方独立声明，并不依赖这次构参。
-        if (!BuildCallbackSubmitArgs<Kind>(orch, args, batch, stats)) {
+    if constexpr (Kind != TaskKind::Alloc) {
+        if (!PrepareSharedTaskOutputs(
+                context.shared_result, static_cast<int32_t>(task_id), Kind
+            )) {
             SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
             return false;
         }
-    } else if (__builtin_expect(claim.won, 0)) {
+    }
+#endif
+#if PTO_FDWIC_SHARED_MAP
+    if constexpr (Kind != TaskKind::Alloc) {
         // shared loser 已在上方声明稳定 output symbol；它不需要构造本 task
         // 的 descriptor/scalar 参数。finish 的 loser 分支只闭合边界，不读
         // 这里留下的上一 task args。
-        if (!BuildCallbackSubmitArgs<Kind>(orch, args, batch, stats)) {
-            SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
-            return false;
+        if (__builtin_expect(claim.won, 0)) {
+            if (!BuildCallbackSubmitArgs<Kind>(orch, args, batch, stats)) {
+                SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+                return false;
+            }
         }
     }
 #else
@@ -2229,14 +2335,30 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #endif
 
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
-    const uint64_t expected_task_id_sum =
+    uint32_t expected_finish_calls = task_count;
+    uint64_t expected_task_id_sum =
         static_cast<uint64_t>(task_count) * (task_count - 1U) / 2U;
+#if PTO_FDWIC_SHARED_MAP
+    const uint32_t owned_alloc_tasks =
+        SharedAllocOwnedTaskCount(worker.block_id, worker.lane, batches);
+    const uint64_t all_alloc_task_id_sum =
+        batches == 0
+            ? 0
+            : static_cast<uint64_t>(kTasksPerBatch) * batches *
+                  (batches - 1U) / 2U;
+    expected_finish_calls =
+        task_count - batches + owned_alloc_tasks;
+    expected_task_id_sum =
+        expected_task_id_sum - all_alloc_task_id_sum +
+        SharedAllocOwnedTaskIdSum(worker.block_id, worker.lane, batches);
+#endif
     const bool split_protocol_ok =
         split_runtime.scheduler == state && split_runtime.worker == &worker &&
         split_runtime.task_count == task_count && split_runtime.worker_id == worker_id &&
         split_runtime.owner_worker_id == worker_id && split_runtime.caller_state_address != 0 &&
         split_runtime.finish_state_address == split_runtime.caller_state_address &&
-        split_runtime.finish_calls == task_count && split_runtime.task_id_sum == expected_task_id_sum &&
+        split_runtime.finish_calls == expected_finish_calls &&
+        split_runtime.task_id_sum == expected_task_id_sum &&
         split_runtime.state_cookie == CompeteFirstSplitStateCookie(worker_id, role) &&
         split_runtime.reserved == 0;
     if (!split_protocol_ok) {

@@ -108,6 +108,7 @@ def _v4_capture(
     *,
     num_cores: int = 1,
     add_parents: bool = True,
+    tensor_map_mode: str = "private",
 ) -> dict[str, object]:
     """构造 phase-only schema-v4 raw；调用者显式提供 Claim/Submit/尾动作。"""
     all_rows = [list(row) for row in rows]
@@ -126,6 +127,7 @@ def _v4_capture(
             "clock_freq_hz": 1_000_000_000,
             "num_cores": num_cores,
             "trace_schema_version": 4,
+            "tensor_map_mode": tensor_map_mode,
             "core_types": [
                 _standalone_topology(core_id)[2] for core_id in range(num_cores)
             ],
@@ -144,6 +146,74 @@ def _v4_capture(
 
 
 class SwimlaneConverterLayoutTest(unittest.TestCase):
+    def test_v4_shared_accepts_sparse_alloc_but_keeps_claim_submit_keys_equal(
+        self,
+    ) -> None:
+        # task0 是 Alloc，仅固定 owner core0 保留完整 Submit；core1 从
+        # task1 开始。converter 不为早退路径伪造记录，仍要求每个已记录
+        # full-path Submit 都有同 key Claim。
+        capture = _v4_capture(
+            [
+                [0, 0, 0, 0, -1, "Claim", 100, 101, 0x3, 1],
+                [0, 0, 0, 0, -1, "AllocComplete", 102, 103, 0, 0],
+                [0, 0, 0, 0, -1, "Submit", 99, 104, 1, 1],
+                [0, 0, 0, 1, -1, "Claim", 110, 111, 0x2, 0],
+                [0, 0, 0, 1, -1, "Submit", 109, 112, 0, 0],
+                [1, 1, 0, 1, -1, "Claim", 110, 111, 0x2, 0],
+                [1, 1, 0, 1, -1, "Submit", 109, 112, 0, 0],
+            ],
+            num_cores=2,
+            tensor_map_mode="shared",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            convert(input_path, output_path)
+            merged = json.loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(merged["metadata"]["tensor_map_mode"], "shared")
+        submits = [
+            event for event in merged["traceEvents"]
+            if event.get("name", "").startswith("submit#")
+        ]
+        self.assertEqual(len(submits), 3)
+
+        # 即使是 shared，Claim 也不能比已记录 Submit 少。
+        rows = capture["fdwic_events"]
+        assert isinstance(rows, list)
+        rows[:] = [
+            row
+            for row in rows
+            if not (row[0] == 1 and row[3] == 1 and row[5] == "Claim")
+        ]
+        summary = capture["metadata"]["fdwic_summary"]
+        assert isinstance(summary, dict)
+        summary["records"] = len(rows)
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Claim keys do not match Submit keys"):
+                convert(input_path, output_path)
+
+    def test_v4_requires_explicit_tensor_map_mode(self) -> None:
+        capture = _v4_capture(
+            [
+                [0, 0, 0, 0, -1, "Claim", 110, 120, 0x2, 1],
+                [0, 0, 0, 0, -1, "Submit", 100, 140, 0, 1],
+            ]
+        )
+        metadata = capture["metadata"]
+        assert isinstance(metadata, dict)
+        metadata.pop("tensor_map_mode")
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "tensor_map_mode"):
+                convert(input_path, output_path)
+
     def test_v4_splits_internal_and_tail_residual_without_repeated_fields(self) -> None:
         capture = _v4_capture(
             [

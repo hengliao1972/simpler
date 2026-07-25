@@ -2010,3 +2010,37 @@ outputs/perf_clock_pair_e83283f6_vs_e8320280_20260725_102404/
 split-finish、普通阶段和局部 PMU 调用数按真实早退精确减少。完整早退版
 与 `e83283f6` 的对照只解释早退增量，最终必须相对 `e8320280` 取得净收益；
 否则整个候选方案应撤销，不能只以 atomic 次数下降作为保留理由。
+
+#### 7.5.21 shared Alloc 非候选在 Claim 前完整早退
+
+S4.10b 保留 S4.10a 已经证明的 49,408 次 b256 Claim 拓扑，但把 95/96 的
+Alloc 非候选从 EfDrain 之前直接返回。调用方三项 Output 构参、稳定
+shared handle、连续逻辑 task id、首末 perf/PMU 边界均保留；被删除的是
+没有业务效果的内部 full-path 阶段与 split finish，不再为它们伪造泳道
+记录。
+
+因此 atomic 次数本身不再继续下降：b1 `ClaimMax=193`，b256
+`ClaimMax=49,408`，与 S4.10a 相同。本步观察到的变量是围绕这些非候选的
+scalar 控制流。b1 六个固定阶段从每类 480 条降为每类 385 条；b256
+full-path Submit 从 122,880 降为 98,560。外层逻辑 submits 仍为
+122,880，不能把两组数字混用。
+
+A5 b1 atomic 泳道有 3,458 条 raw、零丢失，Claim/Submit key 严格相等；
+排他报告按 shared owner 精确接受每核 4～5 条记录。实际产物位于：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260725_110831_2370447/
+```
+
+submit-PMU 的 b1 四个 running phase 均精确为 385 次；b256 claim 为
+98,560 次，其中 92 核各 1,024，worker 0/3/34/37 各 1,088。private b1
+claim 仍为 480。raw/HTML 位于：
+
+```text
+outputs/submit_pmu_s410b_20260725_1115/
+```
+
+这些结果证明观察口径与真实控制流一致，但尚不证明性能收益。当前 shared
+perf-clock `.text` 比 S4.10a 增加 768B，单轮 b256 仍为 3.300ms；
+必须在 clean 实现提交后同时对照 `e83283f6` 和 `e8320280`。若相对 S4.9
+没有净收益，整个 S4.10 应撤销，而不是因为 ClaimMax 较少就保留。

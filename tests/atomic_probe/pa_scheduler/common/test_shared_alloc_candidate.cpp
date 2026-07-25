@@ -140,6 +140,46 @@ void TestExactShardOwners() {
     }
 }
 
+void TestOwnedTaskCountAndSum() {
+    constexpr uint32_t batch_cases[] = {1, 2, 4, 5, 17, kMaxBatches};
+    for (uint32_t batches : batch_cases) {
+        uint64_t total_count = 0;
+        uint64_t total_task_id_sum = 0;
+        for (uint32_t worker_id = 0; worker_id < kWorkers; ++worker_id) {
+            int32_t block_id = -1;
+            int32_t lane = -1;
+            WorkerTopology(worker_id, &block_id, &lane);
+            total_count +=
+                SharedAllocOwnedTaskCount(block_id, lane, batches);
+            total_task_id_sum +=
+                SharedAllocOwnedTaskIdSum(block_id, lane, batches);
+        }
+        Check(
+            total_count == batches,
+            "fixed owners cover each batch Alloc exactly once"
+        );
+        Check(
+            total_task_id_sum ==
+                static_cast<uint64_t>(kTasksPerBatch) * batches *
+                    (batches - 1U) / 2U,
+            "fixed-owner Alloc task-id sums close exactly"
+        );
+    }
+
+    Check(
+        SharedAllocOwnedTaskCount(0, 0, kMaxBatches) == 64 &&
+            SharedAllocOwnedTaskCount(1, 1, kMaxBatches) == 64 &&
+            SharedAllocOwnedTaskCount(2, 2, kMaxBatches) == 64 &&
+            SharedAllocOwnedTaskCount(3, 0, kMaxBatches) == 64,
+        "b256 distributes the four cursor shards evenly across owners"
+    );
+    Check(
+        SharedAllocOwnedTaskCount(4, 0, kMaxBatches) == 0 &&
+            SharedAllocOwnedTaskIdSum(4, 0, kMaxBatches) == 0,
+        "nonowner workers have no full-path shared Alloc"
+    );
+}
+
 void TestClaimOrderingContract() {
     SchedulerState *state = MapSparseObject<SchedulerState>();
     WorkerState *candidate = MapSparseObject<WorkerState>();
@@ -223,6 +263,7 @@ void TestRejectedInputs() {
 int main() {
     TestFullPaTopology();
     TestExactShardOwners();
+    TestOwnedTaskCountAndSum();
     TestClaimOrderingContract();
     TestRejectedInputs();
     if (g_failures != 0) {

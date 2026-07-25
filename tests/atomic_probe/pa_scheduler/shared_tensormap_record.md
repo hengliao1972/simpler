@@ -2776,3 +2776,111 @@ trace/profile 和局部 PMU phase 调用数则按真实跳过的非候选精确�
 回退，就撤销整个 S4.10 候选方案，而不是为了 atomic 数字好看而保留回退
 代码。后续若要采用参考的 24-owner 分散方式，必须单独修改 cursor ABI 和
 host oracle，不能塞进本次早退验证。
+
+### 2026-07-25：S4.10b shared Alloc 非候选完整早退
+
+#### 对齐参考语义，但不偷删调用方工作
+
+参考 `2866ad73` 的 shared `alloc_tensors()` 先在调用方构造
+`L0TaskArgs`，`dist_alloc_outputs_impl()` 内完成 `dist_submit_begin()` 后
+立即判断唯一候选；非候选直接返回 task id。wrapper 随后仍按 task id 和
+Output 个数构造稳定引用。因此 standalone 本步采用相同边界：
+
+1. 所有 worker 仍执行 `BeginCallbackSubmit()`，递增连续的逻辑 task id；
+2. 所有 worker 仍构造三个 Alloc Output 参数，并建立三项
+   `SharedTaskOutputs` 引用；
+3. 非候选只跳过 EfDrain、Claim、Materialize、PrepareMap、Register 和
+   split finish，随后仍由 orchestration 接收稳定 handle；
+4. 唯一候选继续走 S4.10a 的 Claim、winner materialize、completion 和
+   symbol publication。
+
+外层 `WorkerResult::submits` 仍严格为每核 `5*batches`，首个 task 的
+`submit_begin` 也在候选判断前保存；末个 task 是全员进入完整路径的 UP，
+所以 perf-clock/submit-PMU 的 `submit_end` 仍覆盖整轮回放。没有把
+“不记录 skipped Alloc 的内部 Submit span”写成“没有执行逻辑 Submit”。
+
+split-finish 的调用数和 task-id sum 则按真实控制流缩减。shared 每核完整
+路径数为：
+
+```text
+4*batches + owned_alloc(worker)
+```
+
+b256 时四个 owner `[0,34,37,3]` 各为 1,088，其他 92 核各为 1,024；
+全局为 `98,560 = 256*(4*96+1)`。device 和 host 分别独立重算次数与
+task-id sum，避免两端复用同一个错误结果而“互相证明”。
+
+#### 泳道与 PMU 如何表示稀疏路径
+
+没有给非候选 Alloc 增加新的 raw 记录或字段。每条 full-path Submit 仍固定
+写 EfDrain/Claim/Materialize/PrepareMap/Register/Submit 六条；skipped
+Alloc 的调用方时间使用已有父边界闭合：
+
+- 每核开头被跳过的 task0 归入 `OrchestrationSetup`；
+- 后续被跳过的 Alloc 归入 `BetweenSubmitResidual`。
+
+raw metadata 只增加一个很小的 `tensor_map_mode` 构建身份。converter 仍
+严格要求已有记录的 Claim key 与 Submit key 完全相同；exclusive analyzer
+在 private 下继续要求每核全量连续，在 shared 下按
+`task_id=5*batch`、`shard=task_id%4` 和 owner `[0,34,37,3]` 验证精确
+稀疏集合，所有非 Alloc task 仍必须全核存在。报告把 makespan 明确写成
+“已记录 full-path Submit 的跨核包络”，不冒充完整逻辑调用集合。
+
+submit-PMU 的 `none` 仍只在完整 Submit 前后各开关一次。四个 running
+phase 的 device status、host raw 和离线 analyzer 都按模式独立重算：
+
+- private：每核 `5*batches`；
+- shared：每核 `4*batches+owned_alloc`。
+
+这次审查实际抓出了两个会让真机诊断失败的旧假设：device
+`PhaseShape` 曾硬编码 `5B`，host PrepareMap validator 曾强迫每核 task id
+连续。二者都已改成上述精确集合，并增加 worker1 的首段/中段缺口和
+worker34 不得跳过自有 task5 的定向反例。
+
+#### 正确性、观察链和单轮上板结果
+
+最终工作树完成以下门禁：
+
+- 用户 `.venv` 下 PMU/converter/exclusive analyzer 共 95 项 Python
+  测试 PASS；
+- CPU shared/private strict 构建 PASS；shared b1、b4 稀疏泳道与 b256
+  phase-profile PASS，private b256 回归 PASS；
+- 最终同一 diff 指纹下，CCEC shared/private 的 swimlane、perf-clock
+  以及两模式各五个 submit-PMU 变体共 14/14 构建 PASS；
+- A5 shared/private b1/b256 的 split-finish、逻辑 submits、heap、symbol、
+  dependency signature 和真实计算输出门禁 PASS。
+
+A5 shared b1 atomic 泳道产物为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260725_110831_2370447/
+```
+
+它有 3,458 条 raw、零丢失；六个 full-path 固定阶段各 385 条，ClaimMax
+仍为 193 条。排他报告给出逻辑 task 数 5、每核实际记录 Submit
+`min=4/max=5`、全局 385，并通过稀疏 owner、父子分区和 kernel 唯一归属
+全部门禁。相对 S4.10a b1 的每阶段 480 条，固定阶段精确各删除 95 条；
+总 raw 的实际差值还会叠加动态 atomic/poll 记录变化，不能只用
+`6*95` 机械推导总文件差。
+
+真实 A5 submit-PMU 证据位于：
+
+```text
+outputs/submit_pmu_s410b_20260725_1115/
+```
+
+b1 的 claim/efdrain/materialize/register 均为全局 385 次，none 为 0；
+b256 claim 为 98,560 次，其中 92 核各 1,024、四个 owner 各 1,088。
+所有 raw 都有 96 条独占记录，device required status、host 逐核次数、
+离线 JSON 重验和 HTML 生成全部 PASS。private b1 claim 仍为
+`96*5=480`，证明 shared 稀疏口径没有污染 private。
+
+同一最终 ELF 的正确性单样本中，shared b256 普通构建为 3.398ms，
+perf-clock 为 3.300ms；private b256 普通构建为 3.851ms。它们只证明量级
+和门禁，不是收益结论。当前 shared perf-clock `.text=130,104B`，比
+S4.10a 的 129,336B 增加 768B，比 S4.9 的 129,080B 增加 1,024B；
+早退减少动态执行却扩大静态 orchestration，必须一起进入 clean ELF 配对。
+
+下一步先提交这份实现并冻结 clean 三件套，再分别与 `e83283f6` 和
+`e8320280` 做相同的 2 次预热、6 个 ABBA/BAAB block、每版 12 个正式
+b256 进程。前者只回答完整早退的增量，后者才决定整个 S4.10 是否保留。

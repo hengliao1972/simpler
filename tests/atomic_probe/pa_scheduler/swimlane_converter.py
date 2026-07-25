@@ -69,6 +69,7 @@ V4_EXCLUSIVE_SUBMIT_PHASES = {
 KERNEL_NAMES = {0: "QK", 1: "SF", 2: "PV", 3: "UP"}
 # 一个物理 mixed block 的三条 runtime lane：AIC、AIV0、AIV1。
 LANE_NAMES = {0: "AIC", 1: "AIV0", 2: "AIV1"}
+TENSOR_MAP_MODES = ("private", "shared")
 
 # Atomic raw ABI：auxiliary 存放调用点，flags 低 4 位存放操作类型。这里的
 # 数值必须与 standalone C++ AtomicSite/AtomicOp 枚举保持一致；未知值仍会
@@ -186,6 +187,13 @@ def _load_and_validate(
         raise ValueError(
             "metadata.trace_schema_version=4 requires l2_swimlane_level=1 or 4"
         )
+    tensor_map_mode = metadata.get("tensor_map_mode")
+    if trace_schema_version == 4 and tensor_map_mode not in TENSOR_MAP_MODES:
+        raise ValueError(
+            "schema-v4 metadata.tensor_map_mode must be private or shared"
+        )
+    if tensor_map_mode is not None and tensor_map_mode not in TENSOR_MAP_MODES:
+        raise ValueError("metadata.tensor_map_mode must be private or shared")
     num_cores = _integer(metadata.get("num_cores"), "metadata.num_cores")
     if num_cores <= 0:
         raise ValueError("metadata.num_cores must be positive")
