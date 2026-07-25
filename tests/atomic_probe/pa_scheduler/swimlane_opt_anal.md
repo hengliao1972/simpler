@@ -155,20 +155,27 @@ scalar 控制流、TensorMap、ring slot、heap cursor 和 task payload arena。
 
 共享与私有的边界非常重要：
 
-- Claim cursor、completion flag、frontier 是跨核协议，访问需要原子语义；
-- TensorMap 和 slot 只属于本 worker，维护它们不需要跨核原子；
+- Claim cursor 和 completion flag 是两种模式都使用的跨核协议；frontier
+  是 private ring 回收协议，shared Case1 的严格 no-wrap heap 不消费它；
+- private TensorMap 和 slot 只属于本 worker，维护它们不需要跨核原子；
+  shared TensorMap sidecar 是全局共享状态；
 - 每个 worker 都维护同一 task stream 的私有 descriptor/producer 视图；
 - kernel 的完成通过共享 `TaskCell::flag` 对所有 worker 可见。
 
 ### 2.3 `vend`、`flag` 和 `frontier` 分别表示什么
 
-任务完成时按固定顺序发布：
+private 任务完成时按固定顺序发布：
 
 1. 把 winner 当前的单调 `heap_next` 写入 task 的 `vend`；
 2. 执行 store barrier；
 3. 把 task 的 `flag` 发布为 ready；
 4. 从当前 `frontier + 1` 开始扫描连续 ready 的 task，并用 `FetchMax`
    单调推进共享 frontier。
+
+shared no-wrap Case1 只执行前三步。它用每 task flag 做 fanin，可用共享
+shard cursor/vend 做容量终态校验，并且编译期禁止 heap 回绕，所以不需要在
+每次完成后维护连续 frontier。`SchedulerState::frontier` 和相关 schema
+仍保留给 private；未来 shared 支持回绕时必须恢复等价的回收代际协议。
 
 三者不能混为一个概念：
 

@@ -61,6 +61,10 @@ struct SymbolTestOps {
         return __atomic_exchange_n(address, value, __ATOMIC_ACQ_REL);
     }
 
+    static uint64_t Exchange(volatile uint64_t *address, uint64_t value) {
+        return __atomic_exchange_n(address, value, __ATOMIC_ACQ_REL);
+    }
+
     static int64_t FetchMax(
         volatile int64_t *address, int64_t value, uint64_t &retries
     ) {
@@ -218,6 +222,41 @@ void UnmapSparseSchedulerState(SchedulerState *state) {
     if (state != nullptr) {
         (void)munmap(state, sizeof(SchedulerState));
     }
+}
+
+void TestSharedCompletionPublishesWithoutFrontier() {
+    SchedulerState *state = MapSparseSchedulerState();
+    if (state == nullptr) {
+        ++g_failures;
+        return;
+    }
+    state->frontier.value = -1;
+    WorkerState &worker = state->workers[0];
+    worker.heap_next = 4096;
+    LocalStats stats{};
+
+    CompleteTask<SymbolTestOps>(state, worker, 0, stats);
+
+    Check(
+        state->tasks[0].vend == worker.heap_next &&
+            state->tasks[0].flag == 1,
+        "shared completion publishes both vend and ready flag"
+    );
+    Check(
+        state->frontier.value == -1,
+        "shared no-wrap completion leaves frontier at its initial value"
+    );
+    Check(
+        stats.result.frontier_initial_loads == 0 &&
+            stats.result.frontier_updates == 0 &&
+            stats.result.frontier_terminal_loads == 0,
+        "shared no-wrap completion performs no frontier helping"
+    );
+    Check(
+        stats.result.cas_retries == 0,
+        "shared completion adds no hidden frontier CAS retries"
+    );
+    UnmapSparseSchedulerState(state);
 }
 
 TensorDesc MakeTensor(uint64_t address, uint32_t owner) {
@@ -1244,6 +1283,7 @@ void TestInvalidReferencesFailClosed() {
 }  // namespace
 
 int main() {
+    TestSharedCompletionPublishesWithoutFrontier();
     TestPublishAndResolve();
     TestWriterCommitFailuresKeepTerminalEvidence();
     TestMultiWriterFailureKeepsPartialTerminalEvidence();

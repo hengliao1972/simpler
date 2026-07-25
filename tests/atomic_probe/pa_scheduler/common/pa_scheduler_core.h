@@ -353,8 +353,10 @@ template <typename Ops>
 PA_DEVICE void CompleteTask(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_id, LocalStats &stats
 ) {
-    // 完成发布顺序与 PA 一致：先公布该 worker 的 heap 游标，再发布 ready flag，最后推进连续 frontier。
-    // fanin 和 heap 回收方以 flag/frontier 为可见性条件，因此不能交换 vend 与 flag 的先后关系。
+    // 两种模式都先发布 vend，再经 store barrier 发布 ready flag：fanin 和
+    // slot 执行以 flag 为可见性条件，不能交换顺序。private ring 还需要
+    // 连续 frontier 做 heap reclaim；shared PA 使用有界 no-wrap shard，
+    // 依赖逐 task flag，正常完成路径不维护无消费者的全局前沿。
     TraceAtomicExchange<Ops>(
         stats.trace, stats.result, static_cast<int32_t>(task_id), AtomicSite::CompletionVendExchange,
         &state->tasks[task_id].vend, worker.heap_next
@@ -364,7 +366,9 @@ PA_DEVICE void CompleteTask(
         stats.trace, stats.result, static_cast<int32_t>(task_id), AtomicSite::CompletionFlagExchange,
         &state->tasks[task_id].flag, static_cast<int64_t>(1)
     );
+#if !PTO_FDWIC_SHARED_MAP
     AdvanceFrontier<Ops>(state, stats);
+#endif
 }
 
 template <typename Ops>

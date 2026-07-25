@@ -2204,8 +2204,6 @@ inline Metrics Validate(
         }
         worker_checksums_ok &= result.checksum != 0;
 #endif
-        const uint64_t worker_kernel_completions = result.kernel_counts[0] + result.kernel_counts[1] +
-                                                   result.kernel_counts[2] + result.kernel_counts[3];
         if (result.role == static_cast<uint32_t>(CoreRole::Aic)) {
             role_kernel_routing_ok &= result.kernel_counts[1] == 0 && result.kernel_counts[3] == 0;
         } else if (result.role == static_cast<uint32_t>(CoreRole::Aiv)) {
@@ -2213,9 +2211,20 @@ inline Metrics Validate(
         } else {
             role_kernel_routing_ok = false;
         }
+#if PTO_FDWIC_SHARED_MAP
+        // shared no-wrap heap 不消费连续 frontier；每核完成只发布 vend/flag。
+        // 三个计数必须保持零，防止 private reclaim helping 悄悄回到热路径。
+        frontier_worker_counts_ok &=
+            result.frontier_initial_loads == 0 &&
+            result.frontier_updates == 0 &&
+            result.frontier_terminal_loads == 0;
+#else
+        const uint64_t worker_kernel_completions = result.kernel_counts[0] + result.kernel_counts[1] +
+                                                   result.kernel_counts[2] + result.kernel_counts[3];
         const uint64_t worker_completions = result.wins[0] + worker_kernel_completions;
         frontier_worker_counts_ok &= result.frontier_initial_loads == worker_completions;
         frontier_worker_counts_ok &= result.frontier_terminal_loads == result.frontier_initial_loads;
+#endif
         fanin_worker_counts_ok &= result.fanin_ready_loads >= result.fanin_edges;
         if (result.fanin_ready_loads >= result.fanin_edges) {
             // PA 最大 fanin 为 3；每次失败检查最多先重读两个 ready 前缀，再遇到一个 not-ready。
@@ -2344,14 +2353,25 @@ inline Metrics Validate(
             fanin_ready_loads - fanin_edges <= 2 * fanin_not_ready_loads,
         "fanin ready/failure load classification is complete", &metrics
     );
+#if PTO_FDWIC_SHARED_MAP
+    Expect(
+        frontier_worker_counts_ok && frontier_initial_loads == 0,
+        "shared no-wrap completion performs no frontier loads", &metrics
+    );
+    Expect(
+        frontier_terminal_loads == 0 && frontier_updates == 0,
+        "shared no-wrap completion performs no frontier helping", &metrics
+    );
+#else
     Expect(
         frontier_worker_counts_ok && frontier_initial_loads == task_count,
-        "frontier initial loads match completed tasks", &metrics
+        "private frontier initial loads match completed tasks", &metrics
     );
     Expect(
         frontier_terminal_loads == task_count && frontier_updates >= task_count,
-        "frontier ready/update/terminal load identity is exact", &metrics
+        "private frontier ready/update/terminal load identity is exact", &metrics
     );
+#endif
     Expect(duplicates == 0, "completion flags are published once", &metrics);
     Expect(ready_flags == task_count, "all task flags are ready", &metrics);
     Expect(
@@ -2368,7 +2388,17 @@ inline Metrics Validate(
             : "every task vend is within shared aggregate heap progress bounds",
         &metrics
     );
-    Expect(state.frontier.value == static_cast<int64_t>(task_count) - 1, "frontier reaches the final task", &metrics);
+#if PTO_FDWIC_SHARED_MAP
+    Expect(
+        state.frontier.value == -1,
+        "shared no-wrap frontier remains at its initial value", &metrics
+    );
+#else
+    Expect(
+        state.frontier.value == static_cast<int64_t>(task_count) - 1,
+        "private frontier reaches the final task", &metrics
+    );
+#endif
     Expect(
         state.replay_done.value == (flat_final_barrier ? static_cast<int64_t>(kWorkers) : 0) &&
             FinalBarrierStateMatches(state.final_barrier, final_barrier_shape),
@@ -2828,7 +2858,37 @@ inline Metrics Validate(
             occupied_workers += result.final_occupied != 0;
             max_final_occupied = std::max(max_final_occupied, result.final_occupied);
         }
-        const int64_t retire = state.frontier.value - static_cast<int64_t>(kHeapWindow);
+#if PTO_FDWIC_SHARED_MAP
+        std::printf(
+            "[FAILURE_STATE] fatal=%d frontier=%lld first_not_ready=%u first_bad_vend=%u "
+            "vend_minimum=%llu vend_actual=%llu shared_heap_cursors="
+            "[%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld] shared_heap_vend=%lld "
+            "shared_heap_shard_span=%llu shared_heap_capacity_ok=%d "
+            "worker_submits_min=%llu worker_submits_max=%llu incomplete_workers=%u "
+            "final_occupied_workers=%u max_final_occupied=%llu\n",
+            state.fatal.value, static_cast<long long>(state.frontier.value),
+            first_not_ready, first_bad_vend,
+            static_cast<unsigned long long>(first_bad_vend_minimum),
+            static_cast<unsigned long long>(first_bad_vend_actual),
+            static_cast<long long>(state.shared_map.shared_heap_cursor[0].value),
+            static_cast<long long>(state.shared_map.shared_heap_cursor[1].value),
+            static_cast<long long>(state.shared_map.shared_heap_cursor[2].value),
+            static_cast<long long>(state.shared_map.shared_heap_cursor[3].value),
+            static_cast<long long>(state.shared_map.shared_heap_cursor[4].value),
+            static_cast<long long>(state.shared_map.shared_heap_cursor[5].value),
+            static_cast<long long>(state.shared_map.shared_heap_cursor[6].value),
+            static_cast<long long>(state.shared_map.shared_heap_cursor[7].value),
+            static_cast<long long>(state.shared_map.shared_heap_vend.value),
+            static_cast<unsigned long long>(shared_heap_shard_span),
+            shared_heap_capacity_ok ? 1 : 0,
+            static_cast<unsigned long long>(min_worker_submits),
+            static_cast<unsigned long long>(max_worker_submits),
+            incomplete_workers, occupied_workers,
+            static_cast<unsigned long long>(max_final_occupied)
+        );
+#else
+        const int64_t retire =
+            state.frontier.value - static_cast<int64_t>(kHeapWindow);
         const uint64_t retire_vend =
             retire >= 0 && retire < static_cast<int64_t>(task_count) ? state.tasks[retire].vend : 0;
         std::printf(
@@ -2844,6 +2904,7 @@ inline Metrics Validate(
             static_cast<unsigned long long>(max_worker_submits), incomplete_workers, occupied_workers,
             static_cast<unsigned long long>(max_final_occupied)
         );
+#endif
     }
     return metrics;
 }

@@ -702,14 +702,25 @@ frontier_initial=... frontier_flag=... frontier_ready_fetch_max=... frontier_ter
 
 - `fanin_ready/not_ready` 分别是依赖 flag 返回 1/0 的次数，两者之和等于
   `[METRIC] fanin_loads`；
-- `frontier_initial` 是每个 completion 对 frontier 的首次 load；
+- private 模式下，`frontier_initial` 是每个 completion 对 frontier 的首次
+  load；shared Case1 使用严格 no-wrap heap，完成只发布 vend/flag，
+  `frontier_initial`、`frontier_flag`、`frontier_ready_fetch_max` 和
+  `frontier_terminal` 均应为 0；
 - `frontier_ready_fetch_max` 同时计数 ready flag 和紧随其后的 FetchMax，两者在
   这条控制流中一一对应；CCEC/AscendC 上它是一条真实 A5 atomicMax，CPU 上只是
   一次逻辑 FetchMax 调用；
-- `frontier_terminal` 是每次扫描最终遇到的 not-ready flag，当前工作量下应与
-  completion 数相等；`frontier_flag = ready + terminal`；
+- private 模式下，`frontier_terminal` 是每次扫描最终遇到的 not-ready flag，
+  当前工作量下应与 completion 数相等；
+  `frontier_flag = ready + terminal`；
 - `submit_completion_ops` 覆盖 Claim、第一圈 HeapGuard、fanin、completion 发布和
   frontier，不包含 started/replay_done 生命周期屏障。
+
+shared 模式仍保留上述 frontier 字段、AtomicSite 编号和 ABI，以便与 private
+共用 converter/schema。只有在 `--trace-atomics` 已开启、
+`dropped_records=0` 且 logical/physical/batch 闭合通过时，泳道没有对应
+记录才能证明热路径没有执行调用，而不是采集丢失。如果后续 shared heap
+允许 wrap 或复用 task cell，必须恢复 frontier 或等价
+generation/reclaim 协议，不能沿用 no-wrap 结论。
 
 这些字段在每个 worker 的私有 `LocalStats` 中递增，kernel 结束时才发布到独占
 结果区，不为诊断新增共享 atomic。它们仍会增加少量 scalar 指令，因此优化 A/B

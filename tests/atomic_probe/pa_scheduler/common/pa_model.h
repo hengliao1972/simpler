@@ -156,7 +156,10 @@ static_assert(
     "PA Case1 worst-case bucket occupancy exceeds private ring capacity"
 );
 static_assert(kTaskWindow > kHeapWindow, "task counters must retire before their slot is reused");
-static_assert(kMaxTasks < kTaskCellCapacity, "every frontier scan must terminate on an in-range not-ready flag");
+static_assert(
+    kMaxTasks < kTaskCellCapacity,
+    "task table must cover every PA task and private frontier sentinel"
+);
 
 // These are the measured means from the best PA A5 trace, in 1 GHz ticks.
 // The scalar-NOP compatibility baseline calibrates its counts against these targets.
@@ -626,10 +629,10 @@ struct alignas(64) TaskCell {
     volatile uint64_t vend;
     uint8_t padding[64 - 2 * sizeof(int64_t)];
 };
-// flag 是依赖就绪与 frontier 连续前推的发布位；vend 是该 task 完成时 worker 的
-// 单调 heap_next 快照。private 的 HeapGuard 读取 frontier-H 对应 vend，判断
-// 环形 heap 是否可覆盖；shared 中它只是 completion 时的 aggregate-vend
-// 快照，不参与 shared heap 回收。
+// flag 是两种模式的依赖就绪发布位；vend 是该 task 完成时 worker 的 heap
+// 快照。private 还用 flag 连续推进 frontier，并由 HeapGuard 读取
+// frontier-H 对应 vend 判断环形 heap 是否可覆盖；shared no-wrap 中 vend
+// 只是 aggregate-vend 快照，flag 只服务 fanin/slot，均不参与 heap 回收。
 static_assert(sizeof(TaskCell) == 64, "TaskCell must occupy one cache line");
 
 // TensorDesc 保留真实 Tensor 的两条 64-byte 数据线。owner_task_id 表达显式生产者，
@@ -992,8 +995,9 @@ struct alignas(64) WorkerResult {
     uint32_t pmu_icache_misses;
     uint32_t pmu_status;
 
-    // 这些计数只在 worker 私有 LocalStats 中递增，结束时一次性发布；它们把动态
-    // fanin 重试和 frontier helping 展开为准确次数，不为取数再增加共享 atomic。
+    // 这些计数只在 worker 私有 LocalStats 中递增，结束时一次性发布；它们把
+    // 动态 fanin 重试和 private frontier helping 展开为准确次数。shared
+    // no-wrap 构建要求三个 frontier 计数全零；取数本身不增加共享 atomic。
     uint64_t fanin_not_ready_loads;
     uint64_t frontier_initial_loads;
     uint64_t frontier_updates;

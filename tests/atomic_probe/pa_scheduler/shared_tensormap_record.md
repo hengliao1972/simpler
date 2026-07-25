@@ -2490,8 +2490,9 @@ standalone b1 泳道的 QK/SF/PV/UP 分别约
 
 2. **参考 shared 正常完成不推进全局 frontier。**
    `complete_executed_task()` 只在 private 宏分支调用
-   `advance_frontier()`；PA shared heap 在 8 个 32MiB shard 内不 wrap，
-   fanin 直接依赖 per-task flag，所以正常路径不需要连续完成前沿。
+   `advance_frontier()`；本次 PA Case1/b256 容量内的 8 个 32MiB shard
+   没有触发 wrap，fanin 直接依赖 per-task flag，所以正常路径不需要连续
+   完成前沿。参考实现允许未来回绕，并在复用慢路径按需推进回收前沿。
    standalone 本次仍执行 1,280 次 initial load、32,861 次 flag load 和
    31,581 次 FetchMax，共 65,722 个 frontier atomic，占自身
    `submit_completion_ops=176,930` 的 37.1%。这不是参考实现的细枝末节，
@@ -2534,3 +2535,63 @@ standalone b1 泳道的 QK/SF/PV/UP 分别约
 这个顺序不是照抄参考提交：shared heap 一旦允许 wrap，frontier 或等价
 generation/reclaim 协议仍必须恢复；14 槽也必须按本机状态预算验证。复用的
 是已被参考实跑证明的主路径机制，差异和限制继续在本文件逐阶段记录。
+
+### 2026-07-25：S4.9 shared no-wrap 完成路径停止推进 private frontier
+
+#### 采用参考机制，但明确收窄适用边界
+
+参考 `2866ad73` 的 `complete_executed_task()` 在 shared 构建中不调用
+`advance_frontier()`。逐条审计 standalone 后确认，当前 shared Case1
+同样满足这一前提：
+
+- fanin 只 acquire-load producer 的 per-task `flag`；
+- kernel 和 Alloc 完成都先发布 `vend`，经 store barrier 后发布 `flag`；
+- shared Materialize 使用 8 个不回绕 shard，容量不足是 terminal failure；
+- shared BuildWinner/Alloc 已不调用 private `HeapGuard`；
+- 最终退出依赖 replay barrier、本核 slot 清空和 fanin ready，不读 frontier。
+
+因此 S4.9 只在 `PTO_FDWIC_SHARED_MAP=1` 时编译期去掉
+`CompleteTask()` 末尾的 `AdvanceFrontier()` 调用。vend、barrier、flag、
+`AdvanceFrontier` 实现、AtomicSite 编号、`SchedulerState::frontier` 和
+`WorkerResult` ABI 全部保留；private 仍执行原协议。这里不同意把参考代码的
+“shared 不推进 frontier”无条件推广为通用结论：参考实现在 shared heap
+真正回绕的慢路径仍会推进回收前沿，standalone 以后若允许 wrap 或 task-cell
+复用，也必须恢复 frontier 或等价 generation/reclaim 协议。
+
+host oracle 按模式闭合：
+
+- shared 每核和聚合的 initial/update/terminal 三类计数必须全为 0，
+  `state.frontier` 必须保持初值 `-1`；
+- private 继续要求 initial/terminal 与完成数相等、update 不少于 task 数，
+  最终 frontier 为 `task_count - 1`；
+- shared 失败诊断改为输出 8 个 shard cursor、aggregate vend 和容量状态，
+  不再用只对 private ring 有意义的 `frontier-H` 解释回收。
+
+新增 shared 定向测试直接调用 `CompleteTask()`，分别锁定 vend、flag 已发布，
+frontier 仍为 `-1`，三个 frontier 计数和 CAS retry 均为 0。没有新增
+profiling 字段或 raw 记录。
+
+#### 正确性与初步性能结果
+
+CPU shared/private 的 strict `-Werror` 构建和 b1/b256 均 PASS。shared
+完整运行的三个 frontier 计数严格为 0；private 的旧计数身份和最终值保持
+不变。CCEC shared/private perf-clock 均完成 AIC/AIV 编译、mixed ELF 链接和
+manifest 校验。S4.9 shared perf-clock `.text` 为 129,080B，相对
+`d0042690` 冻结件的 134,200B 减少 5,120B（3.815%）；`.rodata` 大小均为
+288B，但内容会随代码布局控制表变化，不能写成逐字节相同。四个 AIC/AIV
+orchestration/finish 主函数合计减少 4,880B，其余 240B 来自链接布局/对齐。
+A5 默认 real-compute：
+
+- shared b1 为 65.563us，private b1 为 66.801us，均通过 96 核、fanin、
+  heap/TensorMap 签名和真实输出 tile 门禁；
+- shared b256 单样本为 3.218ms，`frontier_initial/frontier_flag/`
+  `frontier_ready_fetch_max/frontier_terminal` 全为 0，全部语义门禁 PASS；
+- shared b1 atomic 泳道 4,130 条 raw 记录、849 条 atomic 物理记录、零丢失，
+  不再出现 FrontierInitial/FrontierFlag/FrontierMax/HeapFrontier 调用，
+  completion vend/flag 发布仍各 5 次；private b1 泳道继续得到
+  `initial/flag/FetchMax/terminal = 5/10/5/5`，trace 闭合且零丢失。
+
+这份 b256 单样本相对 S4.8b 的 6.874ms 历史中位数方向显著，也把与参考分支
+本机 2.541ms 全局泳道跨度的表面差距缩到约 0.678ms。但两边窗口、ELF 和观察
+方式不同，不能把 26.7% 差值解释成某个具体实现成本；S4.9 的正式收益仍以
+冻结 clean ELF 后与 `d0042690` 同负载交错配对为准。

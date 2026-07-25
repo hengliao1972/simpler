@@ -1890,3 +1890,33 @@ G=16 相对原 flat 的 FinalDrain 中位数为 `-112.369 us / -24.527%`，
 G=16 在 simpler 完整 PA 中功能正确，且 FinalDrain 相对 G=8 继续向好。
 完整 worker completion 差异仅 0.287%，低于 5% 门槛，因此不启动
 I-cache PMU 对比。
+
+#### 7.5.19 standalone shared no-wrap 删除 completion frontier helping
+
+2026-07-25 对照可运行参考 shared 分支后，确认 standalone 的 shared Case1
+也使用严格 no-wrap shard heap，fanin 只依赖 per-task flag，正常执行和最终
+退出均不读取连续 frontier。因此只在 `PTO_FDWIC_SHARED_MAP=1` 下编译期跳过
+`CompleteTask()` 的 `AdvanceFrontier()`；private 路径、vend → barrier →
+flag 发布顺序、frontier ABI 和 AtomicSite 编号均保持不变。
+
+修改前一轮 standalone shared b256 的动态计数为：
+
+| 项目 | 次数 |
+| --- | ---: |
+| frontier initial load | 1,280 |
+| frontier flag load | 32,861 |
+| frontier FetchMax | 31,581 |
+| frontier terminal load | 1,280 |
+| 三类去重后的 frontier atomic 总计 | 65,722 |
+
+其中 `frontier flag load = FetchMax + terminal`，所以实际完成路径删除的是
+1,280 次 initial、32,861 次 flag load 和 31,581 次 FetchMax，共 65,722
+次 atomic 调用；terminal 是 flag load 的分类，不再重复相加。修改后 A5
+shared b1/b256 四个 frontier 汇总字段均严格为 0，atomic 泳道也不再出现
+对应 site；completion vend/flag 仍完整保留。private CPU/A5 b1 的旧
+frontier 身份回归通过。
+
+shared b256 首个正确性样本从此前 6.874ms 历史中位数方向下降到 3.218ms，
+但这不是冻结交错配对，不能据此宣称 53.2% 为正式收益。后续先冻结当前
+clean ELF，与 `d0042690` 做同负载多进程配对，再决定是否保留；若未来
+shared heap 允许回绕，必须恢复 frontier 或等价 generation/reclaim 协议。
