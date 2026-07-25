@@ -164,47 +164,55 @@ PA_DEVICE bool SharedRetireBucket(
     return observed == original_head;
 }
 
-template <typename Ops>
-PA_DEVICE bool SharedComputeReclaimCandidate(
-    PA_GM SharedTensorMapSidecar &map, int32_t heap_window,
-    int64_t &candidate
+// winner N 持有 committed_tasks==N 的唯一 append turn。它已经完成本任务
+// 的全部 lookup，后续任务最早只会读取 producer>=N-H，因此 N-H-1 可按
+// inclusive 上界回收。用 int64_t 计算，避免 int32_t 边界减法溢出。
+PA_DEVICE bool SharedComputeOrderedReclaimCandidate(
+    int32_t current_task, int32_t heap_window, int64_t &candidate
 ) {
-    if (heap_window < 0) {
+    if (current_task < 0 || heap_window < 0) {
         return false;
     }
-    int64_t minimum = INT64_MAX;
-    for (uint32_t worker = 0; worker < kWorkers; ++worker) {
-        const int64_t progress = Ops::Load(&map.core_progress[worker].value);
-        if (progress < -1) {
-            return false;
-        }
-        if (progress < minimum) {
-            minimum = progress;
-        }
-    }
-    candidate = minimum - static_cast<int64_t>(heap_window) - 1;
+    candidate =
+        static_cast<int64_t>(current_task) -
+        static_cast<int64_t>(heap_window) - 1;
     if (candidate < -1) {
         candidate = -1;
     }
     return true;
 }
 
-// sequencer owner 串行调用；Exchange 的旧值参与判断，既防止回退，也让
-// A5 atomic 返回真正进入后续依赖链，而不是只观察发射括号。
 template <typename Ops>
-PA_DEVICE bool SharedRefreshReclaim(
-    PA_GM SharedTensorMapSidecar &map, int32_t heap_window,
+PA_DEVICE bool SharedHasExactTaskTurn(
+    PA_GM SharedTensorMapSidecar &map, int32_t current_task
+) {
+    return current_task >= 0 &&
+           Ops::Load(&map.committed_tasks.value) == current_task;
+}
+
+// 只有 exact committed turn 的 winner 可以推进 reclaim。先验证
+// committed_tasks==current_task，再计算当前任务的 inclusive 回收边界；
+// 逆序/陈旧 actor 在任何 head、tail 或 reclaim 写入前失败。
+template <typename Ops>
+PA_DEVICE bool SharedRefreshReclaimForTask(
+    PA_GM SharedTensorMapSidecar &map, int32_t current_task,
+    int32_t heap_window,
     int64_t &reclaim_upto
 ) {
+    if (!SharedHasExactTaskTurn<Ops>(map, current_task)) {
+        return false;
+    }
     int64_t candidate = -1;
-    if (!SharedComputeReclaimCandidate<Ops>(map, heap_window, candidate)) {
+    if (!SharedComputeOrderedReclaimCandidate(
+            current_task, heap_window, candidate
+        )) {
         return false;
     }
     const int64_t current = Ops::Load(&map.reclaim_upto.value);
-    if (current < -1) {
+    if (current < -1 || candidate < current) {
         return false;
     }
-    if (candidate <= current) {
+    if (candidate == current) {
         reclaim_upto = current;
         return true;
     }
@@ -229,8 +237,9 @@ PA_DEVICE uint32_t SharedEarlierEntriesInBucket(
     return earlier;
 }
 
-// 在写任何 slot 前完成整任务容量、目标 seq 与 cursor 检查。这样普通容量
-// 不足是严格 all-or-nothing；随后 append 失败只可能是协议破坏，调用方应 fatal。
+// 在写任何 slot 前完成整任务容量、目标 seq 与 cursor 检查。容量不足时
+// 当前任务的 payload/seq/tail/commit 都不发布；检查期间按已发布边界推进
+// 的陈旧 head 可以保留。随后 append 失败只可能是协议破坏，调用方应 fatal。
 template <typename Ops>
 PA_DEVICE SharedAppendCheck SharedCheckTaskAppend(
     PA_GM SharedTensorMapSidecar &map, const SharedRegionValue *entries,
@@ -360,19 +369,6 @@ PA_DEVICE bool SharedPublishTaskCommit(
         &map.committed_tasks.value, static_cast<int64_t>(task_id) + 1
     );
     return previous == task_id;
-}
-
-template <typename Ops>
-PA_DEVICE bool SharedPublishCoreProgress(
-    PA_GM SharedTensorMapSidecar &map, uint32_t worker_id, int32_t task_id
-) {
-    if (worker_id >= kWorkers || task_id < 0) {
-        return false;
-    }
-    const int64_t previous = Ops::Exchange(
-        &map.core_progress[worker_id].value, task_id
-    );
-    return previous == static_cast<int64_t>(task_id) - 1;
 }
 
 }  // namespace pa_scheduler

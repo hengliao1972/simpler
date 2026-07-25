@@ -28,13 +28,16 @@
 namespace {
 
 using pa_scheduler::SharedAppendPreparedTask;
+using pa_scheduler::SharedAppendCheck;
 using pa_scheduler::SharedBucketState;
+using pa_scheduler::SharedCheckTaskAppend;
+using pa_scheduler::SharedComputeOrderedReclaimCandidate;
+using pa_scheduler::SharedHasExactTaskTurn;
 using pa_scheduler::SharedLookupRegion;
 using pa_scheduler::SharedPreflightTaskAppend;
-using pa_scheduler::SharedPublishCoreProgress;
 using pa_scheduler::SharedPublishTaskCommit;
 using pa_scheduler::SharedReadRegionSlot;
-using pa_scheduler::SharedRefreshReclaim;
+using pa_scheduler::SharedRefreshReclaimForTask;
 using pa_scheduler::SharedRegionPayload;
 using pa_scheduler::SharedRegionSlot;
 using pa_scheduler::SharedRegionValue;
@@ -46,7 +49,6 @@ using pa_scheduler::kMapBucketCapacity;
 using pa_scheduler::kMapBuckets;
 using pa_scheduler::kMapCapacity;
 using pa_scheduler::kSharedMapEmptySeq;
-using pa_scheduler::kWorkers;
 
 static_assert(PTO_FDWIC_SHARED_MAP == 1, "this test must compile as the shared TensorMap mode");
 static_assert(sizeof(SharedRegionValue) == 32, "shared logical value ABI changed");
@@ -56,11 +58,10 @@ static_assert(sizeof(SharedRegionSlot) == 128, "shared slot must occupy two cach
 static_assert(offsetof(SharedRegionSlot, seq) == 64, "shared seq cache line offset changed");
 static_assert(sizeof(SharedBucketState) == 128, "shared bucket control ABI changed");
 static_assert(offsetof(SharedBucketState, tail) == 64, "shared head/tail cache lines merged");
-static_assert(sizeof(SharedTensorMapSidecar) == 2119808, "shared sidecar ABI changed");
+static_assert(sizeof(SharedTensorMapSidecar) == 2113664, "shared sidecar ABI changed");
 static_assert(alignof(SharedTensorMapSidecar) == 64, "shared sidecar alignment changed");
-static_assert(offsetof(SharedTensorMapSidecar, core_progress) == 128, "shared progress offset changed");
-static_assert(offsetof(SharedTensorMapSidecar, buckets) == 6272, "shared bucket offset changed");
-static_assert(offsetof(SharedTensorMapSidecar, slots) == 22656, "shared slot offset changed");
+static_assert(offsetof(SharedTensorMapSidecar, buckets) == 128, "shared bucket offset changed");
+static_assert(offsetof(SharedTensorMapSidecar, slots) == 16512, "shared slot offset changed");
 
 enum class EventKind : uint8_t {
     Load,
@@ -193,9 +194,6 @@ void ResetSharedTensorMap(SharedTensorMapSidecar &map) {
     // sidecar，只是为了让 host 诊断中的保留字节也确定。
     StoreControl(&map.committed_tasks.value, 0);
     StoreControl(&map.reclaim_upto.value, -1);
-    for (uint32_t worker = 0; worker < kWorkers; ++worker) {
-        StoreControl(&map.core_progress[worker].value, -1);
-    }
     for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
         StoreControl(&map.buckets[bucket].head.value, 0);
         StoreControl(&map.buckets[bucket].tail.value, 0);
@@ -235,12 +233,20 @@ enum class CommitResult : uint8_t {
 
 CommitResult TryCommitTask(
     SharedTensorMapSidecar &map, int32_t task_id,
-    const std::vector<SharedRegionValue> &entries, int64_t reclaim_upto = -1
+    const std::vector<SharedRegionValue> &entries,
+    int32_t heap_window = INT32_MAX
 ) {
     // 这只是按公开 primitive 组合的一步式确定性 driver：未持有 task turn
-    // 时不调用会无条件 Exchange 的 PublishTaskCommit，避免测试自行创造协议。
+    // 时不触碰 reclaim/head/tail；持有 exact turn 后按 N-H-1 推进回收，
+    // 再做整任务预检、append 和 commit。
     if (RecordingOps::Load(&map.committed_tasks.value) != task_id) {
         return CommitResult::Pending;
+    }
+    int64_t reclaim_upto = -2;
+    if (!SharedRefreshReclaimForTask<RecordingOps>(
+            map, task_id, heap_window, reclaim_upto
+        )) {
+        return CommitResult::Failed;
     }
     if (!SharedPreflightTaskAppend<RecordingOps>(
             map, entries.data(), static_cast<uint32_t>(entries.size()),
@@ -326,12 +332,6 @@ void TestAbiResetAndZeroEntryCommit() {
 
     ExpectEqual(LoadControl(&map->committed_tasks.value), 0, kTest, "committed reset");
     ExpectEqual(LoadControl(&map->reclaim_upto.value), -1, kTest, "reclaim reset");
-    for (uint32_t worker = 0; worker < kWorkers; ++worker) {
-        if (LoadControl(&map->core_progress[worker].value) != -1) {
-            Expect(false, kTest, "core progress reset");
-            break;
-        }
-    }
     for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
         if (LoadControl(&map->buckets[bucket].head.value) != 0 ||
             LoadControl(&map->buckets[bucket].tail.value) != 0) {
@@ -356,6 +356,7 @@ void TestAbiResetAndZeroEntryCommit() {
         kTest, "task 1 empty delta commit"
     );
     ExpectEqual(LoadControl(&map->committed_tasks.value), 2, kTest, "empty commit sequencer");
+    ExpectEqual(LoadControl(&map->reclaim_upto.value), -1, kTest, "empty commit reclaim");
     for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
         if (LoadControl(&map->buckets[bucket].tail.value) != 0) {
             Expect(false, kTest, "empty commit changed a bucket tail");
@@ -506,8 +507,62 @@ void TestVersionsWindowAndMultipleBuckets() {
     ExpectEqual(producer, -1, kTest, "touching half-open ranges do not overlap");
 }
 
-void TestSlowProgressAndReclaimBoundary() {
-    constexpr const char *kTest = "slow-progress-reclaim";
+void TestOrderedReclaimFormulaAndExactTurn() {
+    constexpr const char *kTest = "ordered-reclaim-exact-turn";
+    int64_t candidate = -2;
+    Expect(
+        SharedComputeOrderedReclaimCandidate(0, 64, candidate),
+        kTest, "task 0 reclaim formula"
+    );
+    ExpectEqual(candidate, -1, kTest, "task 0 reclaim boundary");
+    Expect(
+        SharedComputeOrderedReclaimCandidate(64, 64, candidate),
+        kTest, "task H reclaim formula"
+    );
+    ExpectEqual(candidate, -1, kTest, "task H reclaim boundary");
+    Expect(
+        SharedComputeOrderedReclaimCandidate(65, 64, candidate),
+        kTest, "task H+1 reclaim formula"
+    );
+    ExpectEqual(candidate, 0, kTest, "task H+1 inclusive reclaim");
+    Expect(
+        SharedComputeOrderedReclaimCandidate(1279, 64, candidate),
+        kTest, "Case1 final task reclaim formula"
+    );
+    ExpectEqual(candidate, 1214, kTest, "Case1 final task reclaim boundary");
+    Expect(
+        !SharedComputeOrderedReclaimCandidate(-1, 64, candidate),
+        kTest, "negative task rejected"
+    );
+    Expect(
+        !SharedComputeOrderedReclaimCandidate(0, -1, candidate),
+        kTest, "negative heap window rejected"
+    );
+
+    {
+        auto ahead_map = NewMap();
+        StoreControl(&ahead_map->committed_tasks.value, 65);
+        StoreControl(&ahead_map->reclaim_upto.value, 1);
+        RecordingOps::ResetEvents();
+        int64_t rejected = -2;
+        Expect(
+            !SharedRefreshReclaimForTask<RecordingOps>(
+                *ahead_map, 65, 64, rejected
+            ),
+            kTest, "reclaim state ahead of candidate rejected"
+        );
+        ExpectEqual(
+            LoadControl(&ahead_map->reclaim_upto.value), 1,
+            kTest, "ahead reclaim state preserved"
+        );
+        for (const Event &event : RecordingOps::events) {
+            if (event.kind == EventKind::Exchange) {
+                Expect(false, kTest, "reclaim regression issued Exchange");
+                break;
+            }
+        }
+    }
+
     auto map = NewMap();
     RecordingOps::DisableEvents();
     const uint64_t address = 0x300000000ULL;
@@ -523,36 +578,92 @@ void TestSlowProgressAndReclaimBoundary() {
             CommitResult::Committed,
         kTest, "producer 1 commit"
     );
+    const std::vector<SharedRegionValue> empty;
+    Expect(
+        TryCommitTask(*map, 2, empty, 2) == CommitResult::Committed,
+        kTest, "boundary zero-entry task commit"
+    );
+    ExpectEqual(
+        LoadControl(&map->committed_tasks.value), 3,
+        kTest, "sequencer before exact turn"
+    );
+    ExpectEqual(
+        LoadControl(&map->reclaim_upto.value), -1,
+        kTest, "task N=H does not reclaim"
+    );
+    ExpectEqual(
+        LoadControl(&map->buckets[bucket].head.value), 0,
+        kTest, "boundary task keeps head"
+    );
+    ExpectEqual(
+        LoadControl(&map->buckets[bucket].tail.value), 2,
+        kTest, "boundary task keeps tail"
+    );
 
-    for (uint32_t worker = 0; worker < kWorkers; ++worker) {
-        StoreControl(&map->core_progress[worker].value, 10);
-    }
-    StoreControl(&map->core_progress[0].value, 2);
-
+    RecordingOps::ResetEvents();
     int64_t reclaim_upto = -2;
     Expect(
-        SharedRefreshReclaim<RecordingOps>(*map, 2, reclaim_upto),
-        kTest, "refresh with slow worker"
+        !SharedRefreshReclaimForTask<RecordingOps>(
+            *map, 2, 2, reclaim_upto
+        ),
+        kTest, "stale actor rejected"
     );
-    ExpectEqual(reclaim_upto, -1, kTest, "slow worker holds reclaim");
     Expect(
-        SharedRetireBucket<RecordingOps>(*map, bucket, reclaim_upto),
-        kTest, "retire at held boundary"
+        !SharedRefreshReclaimForTask<RecordingOps>(
+            *map, 4, 2, reclaim_upto
+        ),
+        kTest, "future actor rejected"
     );
-    ExpectEqual(LoadControl(&map->buckets[bucket].head.value), 0, kTest, "head held");
+    for (const Event &event : RecordingOps::events) {
+        if (event.kind == EventKind::Exchange ||
+            event.kind == EventKind::Flush) {
+            Expect(false, kTest, "out-of-turn actor changed shared state");
+            break;
+        }
+    }
+    ExpectEqual(
+        LoadControl(&map->reclaim_upto.value), -1,
+        kTest, "out-of-turn actor preserves reclaim"
+    );
+    ExpectEqual(
+        LoadControl(&map->buckets[bucket].head.value), 0,
+        kTest, "out-of-turn actor preserves head"
+    );
+    ExpectEqual(
+        LoadControl(&map->buckets[bucket].tail.value), 2,
+        kTest, "out-of-turn actor preserves tail"
+    );
 
+    RecordingOps::DisableEvents();
     Expect(
-        SharedPublishCoreProgress<RecordingOps>(*map, 0, 3),
-        kTest, "slow worker progresses one task"
+        SharedHasExactTaskTurn<RecordingOps>(*map, 3),
+        kTest, "task 3 owns exact turn"
     );
     Expect(
-        SharedRefreshReclaim<RecordingOps>(*map, 2, reclaim_upto),
-        kTest, "refresh after slow progress"
+        TryCommitTask(*map, 3, empty, 2) == CommitResult::Committed,
+        kTest, "zero-entry task advances ordered reclaim"
     );
-    ExpectEqual(reclaim_upto, 0, kTest, "inclusive reclaim boundary");
+    ExpectEqual(
+        LoadControl(&map->committed_tasks.value), 4,
+        kTest, "zero-entry task publishes commit"
+    );
+    ExpectEqual(
+        LoadControl(&map->reclaim_upto.value), 0,
+        kTest, "zero-entry task advances inclusive reclaim"
+    );
+    ExpectEqual(
+        LoadControl(&map->buckets[bucket].head.value), 0,
+        kTest, "zero-entry task does not scan unrelated bucket"
+    );
+    ExpectEqual(
+        LoadControl(&map->buckets[bucket].tail.value), 2,
+        kTest, "zero-entry task does not append"
+    );
+
+    reclaim_upto = LoadControl(&map->reclaim_upto.value);
     Expect(
         SharedRetireBucket<RecordingOps>(*map, bucket, reclaim_upto),
-        kTest, "retire producer at boundary"
+        kTest, "lazy retire at published boundary"
     );
     ExpectEqual(LoadControl(&map->buckets[bucket].head.value), 1, kTest, "producer 0 retired");
 
@@ -573,18 +684,10 @@ void TestAbsoluteSeqMultipleLapsAndAba() {
     constexpr uint32_t kIterations = 3 * kMapBucketCapacity + 7;
 
     for (uint32_t task = 0; task < kIterations; ++task) {
-        if (task != 0) {
-            Expect(
-                SharedRetireBucket<RecordingOps>(
-                    *map, bucket, static_cast<int64_t>(task) - 1
-                ),
-                kTest, "lap retire"
-            );
-        }
         const CommitResult result = TryCommitTask(
             *map, static_cast<int32_t>(task),
             {MakeRegion(address, 0, 64, static_cast<int32_t>(task))},
-            static_cast<int64_t>(task) - 1
+            0
         );
         if (result != CommitResult::Committed) {
             std::fprintf(
@@ -613,6 +716,10 @@ void TestAbsoluteSeqMultipleLapsAndAba() {
     ExpectEqual(
         LoadControl(&map->buckets[bucket].head.value), kIterations - 1,
         kTest, "single live entry after laps"
+    );
+    ExpectEqual(
+        LoadControl(&map->reclaim_upto.value), kIterations - 2,
+        kTest, "three-lap ordered reclaim boundary"
     );
     const uint64_t last_cursor = kIterations - 1;
     SharedRegionSlot &last_slot =
@@ -689,11 +796,19 @@ void TestCapacityFailureIsAllOrNothing() {
         MakeRegion(full_address, 4096, 4104, kMapBucketCapacity),
     };
     RecordingOps::ResetEvents();
+    int64_t reclaim_upto = -2;
     Expect(
-        !SharedPreflightTaskAppend<RecordingOps>(
-            *map, overflowing.data(),
-            static_cast<uint32_t>(overflowing.size()), -1
+        SharedRefreshReclaimForTask<RecordingOps>(
+            *map, kMapBucketCapacity, kMapBucketCapacity, reclaim_upto
         ),
+        kTest, "exact turn computes non-retiring boundary"
+    );
+    ExpectEqual(reclaim_upto, -1, kTest, "full-window reclaim boundary");
+    Expect(
+        SharedCheckTaskAppend<RecordingOps>(
+            *map, overflowing.data(),
+            static_cast<uint32_t>(overflowing.size()), reclaim_upto
+        ) == SharedAppendCheck::CapacityBlocked,
         kTest, "preflight rejects task if any target bucket is full"
     );
     for (const Event &event : RecordingOps::events) {
@@ -726,6 +841,117 @@ void TestCapacityFailureIsAllOrNothing() {
     ExpectEqual(
         LoadControl(&map->slots[other_slot_index].seq.value), other_seq,
         kTest, "earlier preflight entry did not publish seq"
+    );
+}
+
+void TestCapacityBlockedAfterSafeRetire() {
+    constexpr const char *kTest = "capacity-after-safe-retire";
+    auto map = NewMap();
+    RecordingOps::DisableEvents();
+    const uint64_t full_address = 0x580000000ULL;
+    const uint32_t full_bucket = TensorMapHash(full_address);
+
+    for (uint32_t task = 0; task < kMapBucketCapacity; ++task) {
+        const CommitResult result = TryCommitTask(
+            *map, static_cast<int32_t>(task),
+            {MakeRegion(
+                full_address, static_cast<uint64_t>(task) * 16,
+                static_cast<uint64_t>(task) * 16 + 8,
+                static_cast<int32_t>(task)
+            )}
+        );
+        if (result != CommitResult::Committed) {
+            std::fprintf(
+                stderr, "[FAIL] shared TensorMap ring/%s: fill failed task=%u\n",
+                kTest, task
+            );
+            ++g_failures;
+            return;
+        }
+    }
+
+    const uint64_t other_address =
+        FindAddressOutsideBucket(0x590000000ULL, full_bucket);
+    const uint32_t other_bucket = TensorMapHash(other_address);
+    const int64_t other_tail =
+        LoadControl(&map->buckets[other_bucket].tail.value);
+    const uint32_t other_slot_index =
+        SharedTensorMapSlotIndex(other_bucket, static_cast<uint64_t>(other_tail));
+    const int64_t other_seq =
+        LoadControl(&map->slots[other_slot_index].seq.value);
+    const std::vector<SharedRegionValue> overflowing = {
+        MakeRegion(other_address, 0, 8, kMapBucketCapacity),
+        MakeRegion(full_address, 4096, 4104, kMapBucketCapacity),
+        MakeRegion(full_address, 4112, 4120, kMapBucketCapacity),
+    };
+
+    RecordingOps::ResetEvents();
+    int64_t reclaim_upto = -2;
+    Expect(
+        SharedRefreshReclaimForTask<RecordingOps>(
+            *map, kMapBucketCapacity, kMapBucketCapacity - 1,
+            reclaim_upto
+        ),
+        kTest, "exact turn advances reclaim to producer 0"
+    );
+    ExpectEqual(reclaim_upto, 0, kTest, "inclusive stale boundary");
+    ExpectEqual(
+        LoadControl(&map->reclaim_upto.value), 0,
+        kTest, "published stale boundary"
+    );
+    Expect(
+        SharedCheckTaskAppend<RecordingOps>(
+            *map, overflowing.data(),
+            static_cast<uint32_t>(overflowing.size()), reclaim_upto
+        ) == SharedAppendCheck::CapacityBlocked,
+        kTest, "two same-bucket entries still exceed capacity"
+    );
+    for (const Event &event : RecordingOps::events) {
+        if (event.kind == EventKind::Flush) {
+            Expect(false, kTest, "capacity failure flushed a payload");
+            break;
+        }
+    }
+    RecordingOps::DisableEvents();
+
+    ExpectEqual(
+        LoadControl(&map->committed_tasks.value), kMapBucketCapacity,
+        kTest, "failed task not committed"
+    );
+    ExpectEqual(
+        LoadControl(&map->buckets[full_bucket].head.value), 1,
+        kTest, "only stale producer 0 retired"
+    );
+    ExpectEqual(
+        LoadControl(&map->buckets[full_bucket].tail.value), kMapBucketCapacity,
+        kTest, "failed task did not publish full-bucket tail"
+    );
+    ExpectEqual(
+        LoadControl(&map->buckets[other_bucket].tail.value), other_tail,
+        kTest, "earlier target bucket did not partially append"
+    );
+    ExpectEqual(
+        LoadControl(&map->slots[other_slot_index].seq.value), other_seq,
+        kTest, "earlier target bucket did not publish seq"
+    );
+
+    std::vector<LogicalTuple> after;
+    Expect(SnapshotLogicalMap(*map, after), kTest, "snapshot after safe retire");
+    ExpectEqual(
+        static_cast<int64_t>(after.size()),
+        static_cast<int64_t>(kMapBucketCapacity - 1),
+        kTest, "only one stale logical entry removed"
+    );
+    const bool published_failed_task = std::any_of(
+        after.begin(), after.end(),
+        [](const LogicalTuple &entry) {
+            return entry.producer ==
+                   static_cast<int32_t>(kMapBucketCapacity);
+        }
+    );
+    Expect(
+        !published_failed_task, kTest,
+        "capacity failure published a current-task entry"
     );
 }
 
@@ -762,6 +988,13 @@ void TestDeterministicArrivalAndLogicalTupleDifference() {
             if (committed[actor]) {
                 continue;
             }
+            const int64_t heads_before = [&]() {
+                int64_t total = 0;
+                for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
+                    total += LoadControl(&map->buckets[bucket].head.value);
+                }
+                return total;
+            }();
             const int64_t tails_before = [&]() {
                 int64_t total = 0;
                 for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
@@ -769,10 +1002,33 @@ void TestDeterministicArrivalAndLogicalTupleDifference() {
                 }
                 return total;
             }();
+            const int64_t reclaim_before =
+                LoadControl(&map->reclaim_upto.value);
             const CommitResult result = TryCommitTask(
                 *map, static_cast<int32_t>(actor), deltas[actor]
             );
             if (result == CommitResult::Pending) {
+                int64_t heads_after = 0;
+                int64_t tails_after = 0;
+                for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
+                    heads_after +=
+                        LoadControl(&map->buckets[bucket].head.value);
+                    tails_after +=
+                        LoadControl(&map->buckets[bucket].tail.value);
+                }
+                ExpectEqual(
+                    heads_after, heads_before, kTest,
+                    "reverse actor preserves all heads"
+                );
+                ExpectEqual(
+                    tails_after, tails_before, kTest,
+                    "reverse actor preserves all tails"
+                );
+                ExpectEqual(
+                    LoadControl(&map->reclaim_upto.value),
+                    reclaim_before, kTest,
+                    "reverse actor preserves reclaim"
+                );
                 continue;
             }
             if (result == CommitResult::Failed) {
@@ -826,9 +1082,10 @@ int main() {
     TestAbiResetAndZeroEntryCommit();
     TestPublicationOrderAndDoubleSeqCheck();
     TestVersionsWindowAndMultipleBuckets();
-    TestSlowProgressAndReclaimBoundary();
+    TestOrderedReclaimFormulaAndExactTurn();
     TestAbsoluteSeqMultipleLapsAndAba();
     TestCapacityFailureIsAllOrNothing();
+    TestCapacityBlockedAfterSafeRetire();
     TestDeterministicArrivalAndLogicalTupleDifference();
 
     if (g_failures != 0) {

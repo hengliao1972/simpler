@@ -240,13 +240,11 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
 #if PTO_FDWIC_SHARED_MAP
     // shared_map 位于 results 之后，不属于上面的 control/result 任一范围。
     // 先把 payload、bucket 游标和保留字节清零，再建立协议要求的 -1
-    // sentinel；这样每轮复用同一 host/device 分配时不会继承上一轮 lap。
+    // seq/reclaim sentinel；这样每轮复用同一 host/device 分配时不会继承
+    // 上一轮 lap。S2.5 不再使用 per-core replay progress。
     std::memset(&state->shared_map, 0, sizeof(state->shared_map));
     state->shared_map.committed_tasks.value = 0;
     state->shared_map.reclaim_upto.value = -1;
-    for (uint32_t worker = 0; worker < kWorkers; ++worker) {
-        state->shared_map.core_progress[worker].value = -1;
-    }
     for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
         state->shared_map.buckets[bucket].head.value = 0;
         state->shared_map.buckets[bucket].tail.value = 0;
@@ -315,7 +313,7 @@ inline constexpr size_t ControlBytes() {
 inline constexpr size_t ResultBytes() { return sizeof(WorkerResult) * kWorkers; }
 
 inline constexpr size_t SharedSidecarBytes() { return sizeof(SharedTensorMapSidecar); }
-static_assert(SharedSidecarBytes() == 2119808, "shared TensorMap transfer size changed");
+static_assert(SharedSidecarBytes() == 2113664, "shared TensorMap transfer size changed");
 
 inline constexpr size_t FinalBarrierStateBytes() { return sizeof(FinalBarrierState); }
 
@@ -1172,17 +1170,14 @@ inline SharedTensorMapValidation ValidateSharedTensorMap(
     SharedTensorMapValidation validation;
     validation.protocol_ok &=
         map.committed_tasks.value == static_cast<int64_t>(task_count);
-    const int64_t final_task = static_cast<int64_t>(task_count) - 1;
-    for (uint32_t worker = 0; worker < kWorkers; ++worker) {
-        validation.protocol_ok &=
-            map.core_progress[worker].value == final_task;
+    int64_t expected_reclaim =
+        static_cast<int64_t>(task_count) -
+        static_cast<int64_t>(kHeapWindow) - 2;
+    if (expected_reclaim < -1) {
+        expected_reclaim = -1;
     }
-    const int64_t maximum_reclaim =
-        final_task - static_cast<int64_t>(kHeapWindow) - 1;
-    validation.protocol_ok &= map.reclaim_upto.value >= -1;
     validation.protocol_ok &=
-        map.reclaim_upto.value <=
-        (maximum_reclaim < -1 ? -1 : maximum_reclaim);
+        map.reclaim_upto.value == expected_reclaim;
 
     std::vector<uint32_t> logical_entries_by_task(task_count, 0);
     for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
@@ -1679,7 +1674,7 @@ inline Metrics Validate(
                     kPaCase1MapEntriesPerBatch &&
             shared_map_validation.logical_entries ==
                 expected_map_live,
-        "shared ordered ring commit/progress/seq/logical window is exact",
+        "shared ordered ring commit/reclaim/seq/logical window is exact",
         &metrics
     );
     std::printf(

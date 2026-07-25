@@ -239,7 +239,8 @@ benchmark 运行时参数；省略时默认 `private`。它与 `swimlane`/
 swimlane 两件套和 submit-pmu 四件套都必须通过 manifest 的模式、变体、
 阶段和 SHA256 校验，才能启动 host。
 
-当前已完成 S0 构建身份、S1 private ring 和 S2 shared ordered ring。
+当前已完成 S0 构建身份、S1 private ring、S2 shared ordered ring 正确性
+基线和 S2.5 ordered-winner reclaim。
 `--tensormap private|shared` 都会生成对应模式的真实可执行文件；S0 用于禁止
 伪 shared 产物的临时编译门禁已在 S2 接入 shared sidecar 后删除。两种模式仍
 使用相互隔离的产物目录、manifest 和 host/device ABI 握手，不能混用镜像。
@@ -286,25 +287,30 @@ ASan/UBSan。CPU b1、CPU b256 的完整调度断言和 CCEC private 三镜像�
 
 ### 4.2 当前 shared TensorMap：全 task 有序共享桶环
 
-S2 在 `SchedulerState` 的完整生产前缀、standalone 控制区和 `results` 之后
-追加一个 64B 对齐、2,119,808 bytes 的 `SharedTensorMapSidecar`，不移动
-`WorkerState`、`RunConfig` 或既有结果字段。sidecar 包含连续 task commit
-前沿、全局 reclaim 前沿、96 条每核 progress、128 组分离 cache line 的
-head/tail，以及 16,384 个共享槽。每个槽的 64B payload 与 64B 绝对 `seq`
-分离，避免 payload 与发布标志共享 cache line。
+S2.5 在 `SchedulerState` 的完整生产前缀、standalone 控制区和 `results`
+之后追加一个 64B 对齐、2,113,664 bytes 的
+`SharedTensorMapSidecar`，不移动 `WorkerState`、`RunConfig` 或既有结果
+字段。sidecar 包含连续 task commit 前沿、全局 reclaim 前沿、128 组分离
+cache line 的 head/tail，以及 16,384 个共享槽。每个槽的 64B payload 与
+64B 绝对 `seq` 分离，避免 payload 与发布标志共享 cache line。S2 正确性
+基线中的 96 条 per-core progress 已删除，sidecar 因而精确减少 6,144 bytes。
 
-本阶段的“winner-only”只指 region entry：所有 worker 仍按 eager 路径构造
-参数和 Materialize，heap 仍是既有 per-worker 逻辑；只有 task winner 收集并
+当前的“winner-only”仍只指 region map：所有 worker 按 eager 路径构造参数和
+Materialize，heap 仍是既有 per-worker 逻辑；只有 task winner 查询、收集并
 追加该 task 的 region，零 entry task 也发布一次空 commit。顺序协议固定为：
 
-1. task N 的每个 worker 在 lookup 前等待 `committed_tasks >= N`，确认
-   前 N 个 task 已连续发布；
-2. winner 对整 task 做容量预检，写入全部 region 后把 commit 推进到 N+1；
-3. loser 等待 N+1，winner 直接消费自己的发布结果；随后 96 个 worker 都把
-   本核 progress 从 N-1 精确推进到 N。
+1. 只有 task N 的 winner 在 lookup 前等待
+   `committed_tasks == N`；若已经越过 N 则显式报告协议错误，不能用 `>=`
+   掩盖重复或迟到 actor；
+2. winner 完成本 task lookup 后，由 exact turn 推导 inclusive 回收上界
+   `max(-1, N-H-1)`，对整 task 做一次容量预检；
+3. winner 写入全部 region 后把 commit 从 N 推进到 N+1；loser 不读取
+   shared map、不等待 commit、也不再发布 per-core progress。
 
-因此每个 worker 都跨过相同的 task commit 边界，不会把 future producer
-引入当前 fanin。lookup 只接受
+只有 winner 读取 shared map，且 commit N 证明所有早于 N 的 map writer
+已经结束；winner N 在推进 reclaim 前又已经完成自己的 lookup。因此后续
+task 最早只会读取 producer N-H，`N-H-1` 可安全回收，不再依赖 96 核 replay
+速度。lookup 只接受
 `producer ∈ [max(0, N-H), N)`。writer 先把旧 `seq` 失效，写 payload 并通过
 后端 `FlushRegion` 完成 DCache 写回，再发布绝对 `seq` 和 bucket tail；
 reader 执行“第一次原子读 `seq` → `InvalidateRegion` payload → 拷贝本地快照
@@ -312,27 +318,35 @@ reader 执行“第一次原子读 `seq` → `InvalidateRegion` payload → 拷�
 CCEC/AscendC 的两个 region hook 都逐 cache line 使用 `dcci`，并用 `dsb`
 收口；CPU hook 只模拟顺序，不能替代这项设备缓存语义。
 
-回收上界由 `min(core_progress)-H-1` 单调推进。整 task 预检保证普通容量不足
-时不发布当前 task 的任何 entry；预检可以先推进已经满足回收条件的 bucket
-head，这只是删除已过期历史，不属于当前 task 的部分写入。等待慢核期间可协作
-drain，并受既有 fatal/watchdog 约束。host 在 D2H 后独立遍历 sidecar，核对最终 commit、96 核 progress、
-bucket cursor/容量、每个 live 槽的 `seq`、payload、hash、producer 和逻辑
-窗口，不依赖 device 汇总计数替自己证明正确。
+整 task 预检保证容量不足时不发布当前 task 的 payload、`seq`、tail 或
+commit；预检可以先推进已经满足回收条件的 bucket head，这只是删除已过期
+历史，不属于当前 task 的部分写入。exact turn 下的回收上界已经固定，容量
+仍不足时没有任何慢核进度可等待，因此立即 fatal，不能在 ordered writer
+内部空转到 watchdog。host 在 D2H 后独立遍历 sidecar，精确核对最终 commit、
+`reclaim_upto`、bucket cursor/容量、每个 live 槽的 `seq`、payload、hash、
+producer 和逻辑窗口，不依赖 device 汇总计数替自己证明正确。
 
 private/shared 还会分别生成规范化逻辑 map 签名，并用与存储布局无关的依赖边
-签名核对 PA Case1。当前 CPU 与 CCEC A5 的 b1/b256 均通过；AscendC shared
-也已完成构建和 A5 b1 门禁。b1 的依赖/map 签名为
+签名核对 PA Case1。当前 S2.5 的 CPU 与 CCEC A5 b1/b256 均通过；历史 S2
+基线还完成过 AscendC shared 构建和 A5 b1 门禁。后续 shared TensorMap
+实现按当前范围只以 CPU/CCEC 为阶段出口。b1 的依赖/map 签名为
 `5cb454393ed48dcb`/`3a3d526c9b23c3db`，b256 为
 `b7d985d6edb07078`/`556bec7ec8d0f323`，两种 TensorMap 模式逐项一致。
 CPU 测试证明原子顺序、窗口、容量、回绕和差分逻辑，不证明 A5 的非一致缓存、
 DCache/DCCI 或设备原子行为；后两项只能以上板结果为证。
 
-S2 当前是正确性基线，不是性能可接受的终态。最终同源 CCEC、关闭泳道、单进程
-单次 b256 复测中，private 为 3.816830 ms，shared 为 68.796708 ms。两点不能
-当成稳定统计，但数量级已足以判定当前逐 task 强一致协议不可直接迁移。
-一次仅让 winner 承担 commit 前等待的过程实验在 b1 得到 76.558 us，却在
-b256 停在 `committed_tasks=819` 并触发 watchdog；该实验已完整撤回，不属于
-当前实现或提交。
+S2 的全核强一致正确性基线中，同源 CCEC、关闭泳道、单进程单次 b256 为
+68.796708 ms。S2.5 改用 ordered-winner reclaim 后，b1 为 74.683 us，
+b256 为 26.556193 ms；后者完整达到 `committed_tasks=1280`、
+`reclaim_upto=1214` 和 1,024 次 append，不再停在 819。相对 S2 单样本下降
+约 61.4%，但仍明显慢于 private 的 3.816830 ms，且这些点不是多轮稳定统计。
+结果支持判断 loser 全局等待与 per-core progress 是主要结构性开销之一；
+当前 shared region map 仍不是性能终态。
+
+在 S2.5 之前曾只删除 loser 等待、却保留 `min(core_progress)` 回收。该过程
+实验 b1 为 76.558 us，b256 在 `committed_tasks=819` 触发 watchdog，说明
+“loser 前跑 + 慢核 progress 回收”不具备长序列活性；实验已完整撤回。当前
+S2.5 是用 exact winner turn 重建回收证明，不是把失败实验原样恢复。
 
 shared sidecar 的 atomic 当前会计入既有 Submit/业务阶段时间，但尚未逐条接入
 atomic 泳道 wrapper；所以这一版泳道不能声称完整列出了 shared 协议 atomic。
@@ -1576,8 +1590,8 @@ ClockBaseline，并继续以逐核容量、调用数、总记录数和 `dropped=
 `64 * 96 = 6,144` bytes。split ELF 另预留 AIC/AIV 两个 role-specific
 block-local runtime state，每个精确 1,600 bytes、最终 section 合计
 3,200 bytes；它们不属于 GM `SchedulerState`。以上 `SchedulerState` 数字
-是 private 模式；shared 模式在尾部另追加精确 2,119,808 bytes 的 sidecar，
-故 non-split/split 总大小分别为 1,009,235,776/1,009,241,920 bytes；既有
+是 private 模式；shared 模式在尾部另追加精确 2,113,664 bytes 的 sidecar，
+故 non-split/split 总大小分别为 1,009,229,632/1,009,235,776 bytes；既有
 生产和 standalone 字段 offset 不变。
 独立的 64 bytes PMU 配置和 64 bytes winner workload 配置各占一条
 cache line；二者都位于完整生产 DistGlobal 镜像之后，生产 DistGlobal/

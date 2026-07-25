@@ -4,7 +4,7 @@
 [`poursoul/simpler:fdwic-shared-tensormap`](https://github.com/poursoul/simpler/tree/fdwic-shared-tensormap)
 在 A5 FDWIC runtime 中实现的 shared TensorMap 方案，并与当前分支 standalone
 方案比较。本文用于后续开发决策，不表示目标分支已经合入，也不把分支文档中的
-实验记录自动当成当前分支的性能结论；当前分支 S0～S2 的实际实施证据另记于
+实验记录自动当成当前分支的性能结论；当前分支 S0～S2.5 的实际实施证据另记于
 第 15 节。
 
 ## 1. 审查快照与证据口径
@@ -732,7 +732,7 @@ retire、容量耗尽和复用；容量不足必须显式失败，不能静默�
 
 ### 阶段 S2：standalone shared 有序 ring
 
-**状态：已完成正确性闭环；当前性能不可接受，尚不具备迁移条件。**
+**状态：已完成全核强一致正确性基线；其性能问题已由后续 S2.5 定向处理。**
 
 第一版 shared 只切换 map 的副本数、写入主体和并发纪律，暂时保留 eager 构参和
 每核 private heap，避免在一个提交里同时改三个协议面：
@@ -761,26 +761,68 @@ retire、容量耗尽和复用；容量不足必须显式失败，不能静默�
 signature 一致。CPU b1/b256 与 CCEC A5 b1/b256 已通过该 Gate；详细证据和
 性能边界见第 15 节。
 
-### 阶段 S3：standalone winner-only 与 fresh symbol
+### 阶段 S2.5：ordered-winner reclaim
 
-- 引入轻量 `SubmitMeta`，把 active role、output count 和 writer delta 与完整
-  `TaskArgs` 分离；
-- Claim 后只有 winner 构造完整参数、Materialize、Register 和 Build；
-- loser 只携带 `(task_id, output_slot, generation)` 符号引用；
-- fresh descriptor table 只负责 descriptor identity，writer 顺序仍进入统一
-  ordered region ring；
-- 输出物理容量与 32 tensor 公共上限一致，或在构参边界明确拒绝，不能晚报越界；
-- 再单独引入 generation-aware shared heap 和有界 wrap 反压。
+**状态：已完成 CPU/CCEC b1/b256 闭环；后续实现按当前开发范围不再以
+AscendC 为阶段出口。**
 
-**Gate**：private 模式工作量计数保持原值；shared 的完整构参/Materialize 从
-“每 worker 每 task”下降为“每 task winner”；9 outputs、17 fanin、stale ref、
-writer/reader 逆序、heap wrap 和 fatal 传播有确定性用例。
+S2.5 只改变 sequencer 与 reclaim，不提前混入 fresh symbol、winner-only
+Materialize 或 shared heap：
 
-### 阶段 S4：standalone 三后端验收
+- 只有 task N 的 winner 等待 `committed_tasks == N` 并读取 shared map；
+  loser 不再等待 N/N+1，也不发布 per-core progress；
+- winner 完成本 task lookup 后，以当前 exact turn 推导
+  `reclaim_upto=max(-1,N-H-1)`；因此 sidecar 删除 96 条 progress line，
+  从 2,119,808 bytes 缩减为 2,113,664 bytes；
+- reclaim refresh 首先验证 exact turn，陈旧、未来或试图回退 reclaim 的
+  actor 在任何共享写入前失败；
+- 整 task preflight 后若仍容量不足，立即 fatal。当前 turn 的可回收边界
+  已经固定，不再等待不可能扩大该边界的慢核进度；
+- 零 entry task 仍由唯一 winner 推进 commit 和 reclaim，保证 task-order
+  sequencer 连续。
+
+**Gate**：b256 精确达到 `committed_tasks=1280`、
+`reclaim_upto=1214`、1,024 次 append、52 条逻辑 live entry；依赖签名
+`b7d985d6edb07078` 与逻辑 map 签名 `556bec7ec8d0f323` 均保持不变。
+定向测试覆盖 ordered reclaim 边界、逆序 actor、零 entry、三圈绝对 seq、
+满桶及“回收 stale 后仍满”的 all-or-nothing。验证和性能数据见第 15 节。
+
+### 阶段 S3：standalone fresh symbol 与 winner-only
+
+S3 继续拆成两个独立提交，不能同时改变引用 ABI 和分配主体。
+
+S3.1 先按参考实现接入 16B `FdwicOutputRef`、8B
+`SharedTaskOutputs` 和每 task 2,048B 的 `SharedOutputCell`：
+
+- 本小步仍保留所有 worker 构参和 Materialize，只有 winner 把 8 类 fresh
+  output descriptor 发布到 shared cell；
+- symbol INPUT 读取 `last_writer`，三个 Alloc INOUT 以返回旧值的 Exchange
+  声明当前 writer；旧值小于 0 时回退到 producer task；
+- symbol 与 `manual_dep=true` 的 output view 都跳过 region lookup/register，
+  因而 Case1 shared region insert 应从当前 4/batch 精确变成 0；
+- 仍保留 S2.5 ordered winner turn，避免把当前 Case1 的单 writer 事实误推广成
+  任意多个 INOUT writer 都可乱序。
+
+**S3.1 Gate**：b1/b256 fresh descriptor 发布为 8/2,048，symbol INPUT load
+为 5/1,280，symbol INOUT Exchange 为 3/768，region insert 为 0/0，fanin
+仍为 5/1,280；依赖边签名保持不变。此步不引入 generation、deferred resolve
+或 shared heap。
+
+S3.2 再把 QK/SF/PV/UP 的重参数构造、Materialize 和堆分配收敛到 winner；
+Alloc 是否保留全核轻参数路径按真实 PA 调用点处理。shared heap 首版使用参考
+实现的 8 shard 绝对递增分配，默认 b256 每 shard 需求 25,821,184B，小于
+32MiB shard span；临近 wrap 时先显式失败，不能用尚未证明的 generation
+覆盖旧 descriptor。
+
+**S3.2 Gate**：private 工作量计数保持原值；shared 全局 Materialize output
+从 b1/b256 的 768/196,608 精确降为 8/2,048，shared heap vend 为
+806,912/206,569,472 bytes，region insert 保持 0；CPU 定向测试和 CCEC
+A5 b1/b256 均通过。
+
+### 阶段 S4：standalone CPU/CCEC 验收
 
 - CPU 用于确定性交错、ABA、容量和逻辑 differential 测试，不作为 A5 性能证据；
 - CCEC 先做 b1 正确性和泳道，再做一次 b256 阶段出口验证；
-- AscendC 在 CCEC 协议闭环后接入，不能反向定义 shared 语义；
 - 性能继续分开使用 `perf-clock`、`swimlane`、`submit-pmu` 三条证据链；
 - 新增等待轮询使用聚合记录，不能把约 300 MiB raw 继续无界放大。
 
@@ -792,7 +834,7 @@ shared 没有 future/stale 依赖、silent overflow 或永久等待；同构 `pe
 
 只有 S0～S4 全部闭环后，才按已验证结构依次迁移：
 
-1. 真实构建身份、缓存隔离和三镜像 ABI 握手；
+1. 真实构建身份、缓存隔离和 CPU/CCEC ABI 握手；
 2. private ring 同构化；
 3. shared ordered ring 与统一 facade；
 4. PA winner-only/fresh symbol/shared heap；
@@ -866,8 +908,9 @@ shared 组合再增加 `-DPTO_FDWIC_SHARED_MAP=1`。两次返回码均为 1，�
 
 ## 14. 后续决策摘要
 
-S0～S2 已先在 standalone 回答了构建身份、private/shared 同构逻辑结果和
-region writer 顺序三个问题；S3 仍需继续回答 symbol 与 heap 的有界复用问题：
+S0～S2.5 已先在 standalone 回答了构建身份、private/shared 同构逻辑结果、
+region writer 顺序和 ordered reclaim 四个问题；S3 仍需继续回答 symbol 与
+heap 的有界复用问题：
 
 1. 三镜像如何证明自己属于同一个 map/profile ABI？
 2. private/shared 如何基于同构 ring 生成可比较的逻辑依赖结果？
@@ -875,7 +918,7 @@ region writer 顺序三个问题；S3 仍需继续回答 symbol 与 heap 的有�
 4. region、symbol 和 heap 如何在有界内存中安全复用并可靠终止？
 
 前三项已经由模式握手、ordered ring、host 独立验证和跨模式签名闭环；第四项
-不能拿当前 per-worker heap 冒充答案。四项和 standalone 三后端验收全部闭环
+不能拿当前 per-worker heap 冒充答案。四项和 standalone CPU/CCEC 验收全部闭环
 后，目标分支的 winner-first 和符号快路径才适合进入真实代码。否则即使某次
 PA 上板更快，也只能说明特定 workload 没触发协议边界，不能说明 shared
 TensorMap 已经具备可维护、可扩展的架构。
@@ -891,7 +934,7 @@ TensorMap 已经具备可维护、可扩展的架构。
 
 - `run.sh` 增加 `--tensormap private|shared`，默认 private，并从 benchmark
   参数中消费该选项；
-- 三后端产物按 `<backend>/<mode>/<variant>` 隔离；
+- CPU/CCEC 产物按 `<backend>/<mode>/<variant>` 隔离；
 - CCEC swimlane 与 submit-pmu 使用同一 manifest schema，固定
   mode、variant、phase 和完整运行件 SHA256；
 - `RunConfig` 在原有 16B 尾部写入 magic、ABI version、mode 和
@@ -1070,7 +1113,7 @@ CCEC 上板 b1/b256 与 AscendC shared b1 PASS 才是当前设备缓存协议的
 | shared S2 | 68.796708 ms |
 
 这不是多轮性能统计，不能把 64.979878 ms 差值细分成某条指令的稳定成本；
-但数量级差异已经足以说明当前“96 核逐 task commit 前后强一致”只能作为
+但数量级差异已经足以说明 S2 这套“96 核逐 task commit 前后强一致”只能作为
 正确性基线，性能不可接受，不能直接迁移到真实 simpler。
 
 曾做过一次过程实验：只让 winner 承担 commit 前等待，b1 得到 76.558 us；
@@ -1078,7 +1121,66 @@ CCEC 上板 b1/b256 与 AscendC shared b1 PASS 才是当前设备缓存协议的
 简单删除 loser 的前置顺序边界会破坏长序列活性，不能当成性能优化。实验代码
 已完整撤回，不属于 S2 提交，也不改变上述 private/shared 正确性签名。
 
-当前 shared sidecar 的原子调用会落入既有 Submit 与业务阶段 span，但还没有
+S2/S2.5 shared sidecar 的原子调用会落入既有 Submit 与业务阶段 span，但还没有
 逐条接入 atomic 泳道 wrapper。因此现阶段泳道不能用来声称“shared 协议原子
 已经全量可见”；这项观察能力留到后续独立小步补齐。本阶段的正确性证据来自
 host 对 sidecar 的逐字段校验、依赖边签名和规范化 logical-map 签名。
+
+### 2026-07-24：S2.5 ordered-winner reclaim
+
+S2 的 b1 过程实验已经提示 loser 全局等待很重，但直接让 loser 前跑后，
+`min(core_progress)` 仍由最慢核决定，b256 最终停在 commit 819。S2.5 没有
+把该失败补丁原样恢复，而是重新建立只依赖 ordered winner 的回收证明：
+
+1. shared map 的唯一 reader/writer 是 task winner；
+2. winner N 只在 `committed_tasks == N` 时进入 lookup，commit N 证明
+   所有更早 winner 已结束 map 访问；
+3. winner N 完成本 task lookup 后，未来 task 的合法查询下界为 N-H；
+4. 因而当前 turn 可以回收 `producer <= N-H-1`，不需要等待 loser replay
+   或 96 核 progress。
+
+落地改动严格限定在该证明内：
+
+- PrepareMap 只有 winner 等 exact turn；如果看到 commit 已越过 N，按重复或
+  迟到 actor 显式失败，不能把 `>=` 当成成功；
+- loser 在 Register 不再读写 shared sidecar；
+- `SharedRefreshReclaimForTask()` 先核对 exact turn，再以 signed 64-bit
+  计算 `max(-1,N-H-1)`；candidate 回退、陈旧 actor 和 future actor 都在
+  任何共享写入前失败；
+- 删除 `core_progress[96]`，sidecar 从 2,119,808 bytes 缩至
+  2,113,664 bytes；bucket 和 slot offset 分别变为 128、16,512；
+- preflight 仍可以发布已经安全的 stale-head 回收，但容量检查失败时不发布
+  当前 task 的 payload、seq、tail 或 commit。exact turn 的回收上界已经
+  固定，容量仍不足时直接 fatal，不再无意义地 spin/drain 到 watchdog；
+- 零 entry task 仍 refresh reclaim 并提交 N+1，保持 sequencer 连续。
+
+#### 正确性与活性结果
+
+定向 ring 用例更新为 ordered-turn 口径，覆盖：
+
+- `N=0`、`N=H`、`N=H+1` 和 Case1 最后 task 的 reclaim 边界；
+- 零 entry commit、陈旧/future actor、reclaim 回退拒绝；
+- 同桶三圈绝对 seq、ABA 注入、逆序 actor 到达；
+- 满桶 all-or-nothing，以及合法回收 stale head 后仍然满的失败路径。
+
+CPU private/shared b1/b256、ASan/UBSan、leak 检查和 100 项 Python 测试均
+通过。CCEC A5 shared b1/b256 的关键结果为：
+
+| 场景 | Submit | commit/reclaim | append/live | dependency/map signature |
+| ---- | ----: | ---- | ---- | ---- |
+| b1 | 74.683 us | `5 / -1` | `4 / 4` | `5cb454393ed48dcb` / `3a3d526c9b23c3db` |
+| b256 | 26.556193 ms | `1280 / 1214` | `1024 / 52` | `b7d985d6edb07078` / `556bec7ec8d0f323` |
+
+b256 本轮观察到的 `physical_entries=142` 大于逻辑 live 52 并非泄漏：
+bucket head 只在
+该桶下次被触达时惰性推进，host 仍按 `logical_floor=1215` 过滤旧 producer。
+历史 append 总数取 tail 求和，物理驻留取 `tail-head`，逻辑窗口按 producer
+过滤，三者不能混用。
+
+与 S2 同源 CCEC 单样本相比，b1 从 248.477 us 降到 74.683 us，b256 从
+68.796708 ms 降到 26.556193 ms，后者下降约 61.4%。这些不是多轮稳定性能
+统计，不能继续拆成单条 atomic 的稳定成本；但 b256 已完整跨过此前的 819
+停点，并保持所有逻辑签名不变，足以证明 ordered-winner reclaim 同时恢复
+活性并消除了主要结构性等待。相对 private b256 3.816830 ms 仍有明显差距，
+下一阶段应转向 fresh-output symbol 与 winner-only Materialize，不把 S2.5
+误写成性能终态。

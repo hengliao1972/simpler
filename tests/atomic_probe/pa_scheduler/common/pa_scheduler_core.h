@@ -691,12 +691,13 @@ PA_DEVICE bool BuildWinner(
 
 #if PTO_FDWIC_SHARED_MAP
 // shared TensorMap 的顺序前沿不借用 Claim cursor：后者按 role 分片且会被
-// 快核提前推进，不能证明更早 task 的 region 已经发布。这里等待唯一的
-// committed_tasks，并在等待期间继续 drain 本核可执行 slot。
+// 快核提前推进，不能证明更早 task 的 region 已经发布。只有当前 task 的
+// winner 等待 committed_tasks 精确等于 task_id；若已经越过该 task，说明
+// ordered append 协议被破坏，不能把“>=”误当成本 task 仍持有 turn。
 template <typename Ops>
-PA_DEVICE bool WaitForSharedCommit(
+PA_DEVICE bool WaitForSharedTaskTurn(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker,
-    uint32_t task_count, uint32_t target, uint32_t task_id,
+    uint32_t task_count, uint32_t task_id,
     LocalStats &stats
 ) {
     const uint64_t begin = Ops::Now();
@@ -709,8 +710,12 @@ PA_DEVICE bool WaitForSharedCommit(
             SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
             return false;
         }
-        if (committed >= static_cast<int64_t>(target)) {
+        if (committed == static_cast<int64_t>(task_id)) {
             return true;
+        }
+        if (committed > static_cast<int64_t>(task_id)) {
+            SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+            return false;
         }
         if (IsFatal<Ops>(state, stats, static_cast<int32_t>(task_id))) {
             return false;
@@ -821,52 +826,34 @@ PA_DEVICE uint32_t CollectSharedFanin(
     return count;
 }
 
-// 当前 task 的唯一 winner 持有 append turn。容量不足不是协议错误：先用
-// min(core_progress)-H-1 推进 reclaim，再协作 drain/等待慢核；只有 seq、
-// cursor 或单调状态破坏才立即 fatal。写入全部 entry 后才发布空/非空 commit。
+// 当前 task 的唯一 winner 持有 append turn。Append 前必须再次核对 exact
+// turn，并按 task_id/H 精确推进 reclaim；容量不足与 seq/cursor/单调状态
+// 破坏都直接 fatal，不在 ordered writer 内等待其他 worker 的 replay 进度。
+// 写入全部 entry 后才发布空/非空 commit。
 template <typename Ops>
 PA_DEVICE bool AppendSharedTaskOrdered(
-    PA_GM SchedulerState *state, PA_GM WorkerState &worker,
+    PA_GM SchedulerState *state,
     const SharedRegionValue *entries, uint32_t count,
     uint32_t task_id, LocalStats &stats
 ) {
-    const uint64_t begin = Ops::Now();
-    uint32_t polls = 0;
-    int64_t reclaim_upto = Ops::Load(
-        &state->shared_map.reclaim_upto.value
-    );
-    if (reclaim_upto < -1) {
+    int64_t reclaim_upto = -1;
+    // Refresh 的第一步就是 committed_tasks==task_id 的 exact-turn 检查；
+    // 不在热路径重复一次相同 atomic load。
+    if (!SharedRefreshReclaimForTask<Ops>(
+            state->shared_map, static_cast<int32_t>(task_id),
+            static_cast<int32_t>(state->heap_window), reclaim_upto
+        )) {
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
-
-    while (true) {
-        const SharedAppendCheck check = SharedCheckTaskAppend<Ops>(
-            state->shared_map, entries, count, reclaim_upto
-        );
-        if (check == SharedAppendCheck::Ready) {
-            break;
-        }
-        if (check == SharedAppendCheck::ProtocolError ||
-            !SharedRefreshReclaim<Ops>(
-                state->shared_map,
-                static_cast<int32_t>(state->heap_window),
-                reclaim_upto
-            )) {
-            SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
-            return false;
-        }
-        if (IsFatal<Ops>(state, stats, static_cast<int32_t>(task_id))) {
-            return false;
-        }
-        if (DrainReady<Ops>(
-                state, worker, DrainPlace::RingBackpressure, stats
-            ) == 0) {
-            Ops::SpinHint();
-        }
-        if (WatchdogExpired<Ops>(state, stats, begin, polls)) {
-            return false;
-        }
+    const SharedAppendCheck check = SharedCheckTaskAppend<Ops>(
+        state->shared_map, entries, count, reclaim_upto
+    );
+    if (check != SharedAppendCheck::Ready) {
+        // CapacityBlocked 在精确 task-order reclaim 后仍无空间，已没有可等待
+        // 的慢核进度；与 ProtocolError 一样立即广播 fatal。
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
     }
 
     if (!SharedAppendPreparedTask<Ops>(
@@ -1101,10 +1088,12 @@ PA_DEVICE bool FinishCallbackSubmitBody(
 
     const uint64_t prepare_begin = materialize_end;
 #if PTO_FDWIC_SHARED_MAP
-    // task N 的 lookup 只能在 0..N-1 的 ordered append 全部发布后开始。
-    // committed_tasks 是发布数量，因此等待目标恰为 N；task 0 不等待。
-    if (!WaitForSharedCommit<Ops>(
-            state, worker, task_count, task_id, task_id, stats
+    // 只有 winner 会查询 shared map 并追加 task N；因此也只有 winner 在
+    // PrepareMap 等待 committed_tasks 精确等于 N。loser 不触碰 map，
+    // 无需被全局 sequencer 串行化。
+    if (__builtin_expect(winner, 0) &&
+        !WaitForSharedTaskTurn<Ops>(
+            state, worker, task_count, task_id, stats
         )) {
         return false;
     }
@@ -1155,33 +1144,20 @@ PA_DEVICE bool FinishCallbackSubmitBody(
     BeginSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(pmu_context);
 #if PTO_FDWIC_SHARED_MAP
     bool registered = true;
-    uint32_t shared_entry_count = 0;
-    SharedRegionValue shared_entries[kMaxTaskTensors];
     if (__builtin_expect(winner, 0)) {
+        uint32_t shared_entry_count = 0;
+        SharedRegionValue shared_entries[kMaxTaskTensors];
         registered = BuildSharedRegistrationEntries(
             args, context, shared_entries, shared_entry_count
         );
         if (registered) {
             registered = AppendSharedTaskOrdered<Ops>(
-                state, worker, shared_entries, shared_entry_count,
-                task_id, stats
+                state, shared_entries, shared_entry_count, task_id, stats
             );
         }
         if (registered) {
             stats.result.map_inserts += shared_entry_count;
         }
-    } else {
-        // loser 不重放 region 写入，但必须观察本 task 的空/非空 commit，
-        // 才能保证下一 task 的强一致 lookup 与 private 副本处于同一逻辑状态。
-        registered = WaitForSharedCommit<Ops>(
-            state, worker, task_count, task_id + 1, task_id, stats
-        );
-    }
-    if (registered) {
-        registered = SharedPublishCoreProgress<Ops>(
-            state->shared_map, stats.result.worker_id,
-            static_cast<int32_t>(task_id)
-        );
     }
 #else
     const bool registered = RegisterOutputs(context, args, kind != TaskKind::Alloc);

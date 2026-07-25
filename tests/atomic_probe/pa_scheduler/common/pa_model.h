@@ -737,24 +737,20 @@ struct alignas(64) SharedTensorMapSidecar {
     // 没有 region entry）发布完成后变为 N+1。
     AtomicLine committed_tasks;
     // reclaim_upto 是可回收 producer 的 inclusive 上界，初始 -1。
+    // 只有持有 committed_tasks==current_task 的有序 winner 才能推进它，
+    // 因而无需再维护 96 份按核 progress。
     AtomicLine reclaim_upto;
-    // 每核发布自己已完成全部 map 观察的最后一个 task，初始 -1。
-    AtomicLine core_progress[kWorkers];
     SharedBucketState buckets[kMapBuckets];
     SharedRegionSlot slots[kMapCapacity];
 };
-static_assert(sizeof(SharedTensorMapSidecar) == 2119808, "shared TensorMap sidecar size changed");
+static_assert(sizeof(SharedTensorMapSidecar) == 2113664, "shared TensorMap sidecar size changed");
 static_assert(alignof(SharedTensorMapSidecar) == 64, "shared TensorMap sidecar alignment changed");
 static_assert(
-    offsetof(SharedTensorMapSidecar, core_progress) == 128,
-    "shared TensorMap progress offset mismatch"
-);
-static_assert(
-    offsetof(SharedTensorMapSidecar, buckets) == 6272,
+    offsetof(SharedTensorMapSidecar, buckets) == 128,
     "shared TensorMap bucket offset mismatch"
 );
 static_assert(
-    offsetof(SharedTensorMapSidecar, slots) == 22656,
+    offsetof(SharedTensorMapSidecar, slots) == 16512,
     "shared TensorMap slot offset mismatch"
 );
 
