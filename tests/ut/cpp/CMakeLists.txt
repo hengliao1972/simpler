@@ -446,24 +446,38 @@ target_include_directories(test_fdwic_swimlane_poll_batch BEFORE PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
 )
 
-# DistTensorMap 的 retire 实现同样是 header-only。直接包含真实 FDWIC
-# `tensor_map.h`，避免用另一份 host 模型替代生产代码的 task-head/free-list
-# 语义。该测试只使用普通内存，不需要设备或 CANN runtime。
-add_a5_test(test_fdwic_tensor_map_retire a5/test_fdwic_tensor_map_retire.cpp)
-target_compile_definitions(test_fdwic_tensor_map_retire PRIVATE __CPU_SIM=1)
-target_include_directories(test_fdwic_tensor_map_retire BEFORE PRIVATE
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
-)
-set_tests_properties(test_fdwic_tensor_map_retire PROPERTIES LABELS "no_hardware")
+# DistTensorMap ring 是 header-only production 实现。同一源码先锁默认
+# CAP=128，再重编译四个结构边界，覆盖额外 bucket control、普通固定前缀
+# 和单桶 hash 特例；reference 只比较逻辑语义，不复制被测 ring。
+function(add_fdwic_tensor_map_ring_test name ring_cap)
+    add_a5_test(${name} a5/test_fdwic_tensor_map_retire.cpp)
+    target_compile_definitions(${name} PRIVATE
+        __CPU_SIM=1
+        PTO_FDWIC_TENSORMAP_RING_CAP=${ring_cap}
+    )
+    target_include_directories(${name} BEFORE PRIVATE
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
+    )
+    set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
+endfunction()
+
+add_fdwic_tensor_map_ring_test(test_fdwic_tensor_map_retire 128)
+add_fdwic_tensor_map_ring_test(test_fdwic_tensor_map_ring_cap32 32)
+add_fdwic_tensor_map_ring_test(test_fdwic_tensor_map_ring_cap64 64)
+add_fdwic_tensor_map_ring_test(test_fdwic_tensor_map_ring_cap256 256)
+add_fdwic_tensor_map_ring_test(test_fdwic_tensor_map_ring_cap16384 16384)
 
 # 容量错误必须在真实 Register→Build 边界中止，并让后续 eager Begin 在
 # Claim 前返回。该目标直接编译 production CPU-sim dist_engine TU，避免
 # 用测试替身重写 Submit 状态机。
 add_a5_test(test_fdwic_submit_capacity a5/test_fdwic_submit_capacity.cpp)
-target_compile_definitions(test_fdwic_submit_capacity PRIVATE __CPU_SIM=1)
+target_compile_definitions(test_fdwic_submit_capacity PRIVATE
+    __CPU_SIM=1
+    PTO_FDWIC_TENSORMAP_RING_CAP=128
+)
 target_include_directories(test_fdwic_submit_capacity BEFORE PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
     ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
@@ -492,7 +506,10 @@ set_tests_properties(test_fdwic_config_parse PROPERTIES LABELS "no_hardware")
 # fail-closed while its ABI identity is still well-formed.
 function(add_fdwic_build_identity_test name shared_map)
     add_executable(${name} a5/test_fdwic_build_identity.cpp)
-    target_compile_definitions(${name} PRIVATE PTO_FDWIC_SHARED_MAP=${shared_map})
+    target_compile_definitions(${name} PRIVATE
+        PTO_FDWIC_SHARED_MAP=${shared_map}
+        PTO_FDWIC_TENSORMAP_RING_CAP=128
+    )
     target_include_directories(${name} PRIVATE
         ${GTEST_INCLUDE_DIRS}
         ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime

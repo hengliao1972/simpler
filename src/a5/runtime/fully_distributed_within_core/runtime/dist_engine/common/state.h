@@ -18,6 +18,7 @@
 
 #include "dist_engine/dist_engine.h"
 #include "common/core_type.h"
+#include "fdwic_build_identity.h"
 #include "pto2_dispatch_payload.h"
 #include "pto_constants.h"
 #include "pto_submit_types.h"
@@ -37,10 +38,26 @@ constexpr int32_t kPrivateSlots = 4;
 constexpr int32_t kWonReserve = 2;
 constexpr int32_t kMaxFanin = 16;
 constexpr int32_t kMapCap = 16384;
+constexpr uint32_t kMapBucketCapacity = kFdwicTensorMapRingCap;
+constexpr uint32_t kMapBuckets = kFdwicTensorMapRingBuckets;
+constexpr uint32_t kMapBaseControlBuckets = 128;
+constexpr uint32_t kMapBucketSlotMask = kMapBucketCapacity - 1;
+constexpr uint32_t kMapBucketMask = kMapBuckets - 1;
+constexpr size_t kMapControlBytes = 32768;
 constexpr int32_t kFlagCap = 1 << 16;
 constexpr int32_t kTaskPayloadSlots = 2048;
 constexpr int32_t kTaskPayloadMask = kTaskPayloadSlots - 1;
 static_assert((kTaskPayloadSlots & kTaskPayloadMask) == 0, "task payload slots must be a power of two");
+static_assert(kMapBucketCapacity * kMapBuckets == static_cast<uint32_t>(kMapCap));
+static_assert((kMapBucketCapacity & kMapBucketSlotMask) == 0, "TensorMap bucket capacity must be a power of two");
+static_assert((kMapBuckets & kMapBucketMask) == 0, "TensorMap bucket count must be a power of two");
+static_assert(kMapBuckets <= 512, "TensorMap control area only reserves up to 512 buckets");
+
+constexpr uint32_t dist_constexpr_log2(uint32_t value) {
+    return value <= 1U ? 0U : 1U + dist_constexpr_log2(value >> 1U);
+}
+
+constexpr uint32_t kMapBucketShift = dist_constexpr_log2(kMapBuckets);
 
 struct DistTaskPayload {
     Tensor tensors[MAX_TENSOR_ARGS];
@@ -61,26 +78,69 @@ struct MapEntry {
     uint64_t lo;
     uint64_t hi;
     int32_t producer;
-    int32_t bucket;
-    int32_t next_in_bucket;
-    int32_t prev_in_bucket;
-    int32_t next_in_task;
+    uint32_t payload_abi_reserved;
+    // private ring 的 bucket/slot 由连续下标隐式给出，不再保存链指针。
+    // 末 16B 为后续布局演进预留；shared 发布协议不会借用 private 热槽。
+    uint8_t abi_reserved[16];
 };
+static_assert(sizeof(MapEntry) == 48, "FDWIC MapEntry ABI size changed");
+static_assert(alignof(MapEntry) == 8, "FDWIC MapEntry ABI alignment changed");
+static_assert(offsetof(MapEntry, producer) == 24, "FDWIC MapEntry producer offset changed");
+static_assert(offsetof(MapEntry, abi_reserved) == 32, "FDWIC MapEntry reserve offset changed");
 
-constexpr int32_t kMapBuckets = 1 << 13;
-constexpr int32_t kMapBucketShift = 13;
 constexpr int32_t kTaskWindow = 1 << 10;
 constexpr int32_t kTaskWindowMask = kTaskWindow - 1;
 
 struct DistTensorMap {
     MapEntry entries[kMapCap];
-    int32_t buckets[kMapBuckets];
-    int32_t task_heads[kTaskWindow];
-    int32_t free_head;
-    int32_t high_water;
+    // 默认 CAP=128 时，前 128 个 head/tail 保持连续固定位置。CAP=32/64
+    // 的额外桶游标从原 32KiB bucket 区域内部切出，所有模式的 map 总尺寸
+    // 和 DistCore 后续字段偏移保持不动。
+    uint64_t bucket_heads[kMapBaseControlBuckets];
+    uint64_t bucket_tails[kMapBaseControlBuckets];
+#if PTO_FDWIC_TENSORMAP_RING_CAP < 128
+    uint64_t extra_bucket_heads[kMapBuckets - kMapBaseControlBuckets];
+    uint64_t extra_bucket_tails[kMapBuckets - kMapBaseControlBuckets];
+    uint8_t control_abi_reserved[kMapControlBytes - 2 * sizeof(uint64_t) * kMapBuckets];
+#else
+    uint8_t control_abi_reserved[
+        kMapControlBytes - 2 * sizeof(uint64_t) * kMapBaseControlBuckets
+    ];
+#endif
+    // 旧 task-head/free-list 区只保留物理 ABI，不在默认热路径维护全局 live
+    // 计数。每桶容量由 tail-head 当场判断，auto CAP 由后续静态 planner 负责。
+    uint8_t task_window_abi_reserved[sizeof(int32_t) * kTaskWindow];
+    uint32_t tail_abi_reserved0;
+    uint32_t tail_abi_reserved1;
     int32_t alive_floor;
-    int32_t cleaned_upto;
+    int32_t tail_abi_reserved2;
 };
+static_assert(sizeof(DistTensorMap) == 823312, "FDWIC TensorMap must preserve the DistCore ABI");
+static_assert(alignof(DistTensorMap) == 8, "FDWIC TensorMap alignment changed");
+static_assert(offsetof(DistTensorMap, bucket_heads) == 786432, "FDWIC TensorMap head offset changed");
+static_assert(offsetof(DistTensorMap, bucket_tails) == 787456, "FDWIC TensorMap tail offset changed");
+#if PTO_FDWIC_TENSORMAP_RING_CAP < 128
+static_assert(
+    offsetof(DistTensorMap, extra_bucket_heads) == 788480, "FDWIC TensorMap extra-head offset changed"
+);
+static_assert(
+    offsetof(DistTensorMap, extra_bucket_tails) ==
+        788480 + sizeof(uint64_t) * (kMapBuckets - kMapBaseControlBuckets),
+    "FDWIC TensorMap extra-tail offset changed"
+);
+#endif
+static_assert(
+    offsetof(DistTensorMap, task_window_abi_reserved) == 819200,
+    "FDWIC TensorMap task-window reserve offset changed"
+);
+static_assert(
+    offsetof(DistTensorMap, control_abi_reserved) + sizeof(DistTensorMap::control_abi_reserved) == 819200,
+    "FDWIC TensorMap control area size changed"
+);
+static_assert(offsetof(DistTensorMap, tail_abi_reserved0) == 823296, "FDWIC TensorMap tail offset changed");
+static_assert(offsetof(DistTensorMap, tail_abi_reserved1) == 823300, "FDWIC TensorMap tail offset changed");
+static_assert(offsetof(DistTensorMap, alive_floor) == 823304, "FDWIC TensorMap alive-floor offset changed");
+static_assert(offsetof(DistTensorMap, tail_abi_reserved2) == 823308, "FDWIC TensorMap tail offset changed");
 
 enum class TracePhase : int32_t {
     Kernel = 0,
@@ -225,6 +285,19 @@ struct DistCore {
     uint8_t task_payloads_pad[16];
     DistTaskPayload task_payloads[kTaskPayloadSlots];
 };
+static_assert(offsetof(DistCore, map) == 32, "FDWIC DistCore TensorMap offset changed");
+static_assert(offsetof(DistCore, slots_pad) == 823344, "FDWIC DistCore slot padding offset changed");
+static_assert(offsetof(DistCore, slots) == 823360, "FDWIC DistCore ring-slot offset changed");
+static_assert(offsetof(DistCore, occupied_count) == 842656, "FDWIC DistCore occupancy offset changed");
+static_assert(offsetof(DistCore, owned_total) == 842660, "FDWIC DistCore owned-total offset changed");
+static_assert(
+    offsetof(DistCore, swimlane_last_cycle) == 842664, "FDWIC DistCore swimlane-clock offset changed"
+);
+static_assert(
+    offsetof(DistCore, task_payloads_pad) == 842672, "FDWIC DistCore payload padding offset changed"
+);
+static_assert(offsetof(DistCore, task_payloads) == 842688, "FDWIC DistCore task-payload offset changed");
+static_assert(sizeof(DistCore) == 9231296, "FDWIC DistCore ABI size changed");
 static_assert(offsetof(DistCore, slots) % 64 == 0, "DistCore slots must be cacheline-aligned");
 static_assert(offsetof(DistCore, task_payloads) % 64 == 0, "DistCore task_payloads must be cacheline-aligned");
 

@@ -6695,9 +6695,140 @@ free-list 或 lookup helper，也不描述 bucket/CAP。它只回答共同的外
 单桶 CAP=32。因此该用例中的 insert 失败只能表示实现错误，不会把未来
 per-bucket 容量差异误判为 linked/ring 语义差异。现有六个 linked 专属测试
 暂时原样保留；backend 真正迁移时再删除 free-list/next/prev 的内部断言，
-新增四个逻辑测试必须一行不改继续通过。
+新增四个逻辑测试的 reference 算法、场景和断言必须原样继续通过。ring 的
+lookup 会惰性推进物理 head，因此实际 map 参数可由 `const` 机械调整为
+可变引用；这不能被解释成允许修改 reference 口径。
 
 本阶段 `test_fdwic_tensor_map_retire` 共 10 项全部通过，其中新增 12,000-task
 差分约 41 ms；`git diff --check` 通过。下一阶段先替换 `DistTensorMap`
 存储和 private helper，再把容量集成测试改成真实填满目标 bucket，不能在
 同一提交改变现有“多 output 前缀可已登记、失败 task 不 Build”的合同。
+
+### 2026-07-26：R1b-e 将 production private TensorMap 迁移为连续分桶环
+
+本阶段只替换 private TensorMap 的物理存储与回收方式，没有提前混入 shared
+的跨核原子、`seq`、可见性操作或全局回收协议。这样可以先在单写者语义下证明
+环本身正确，再把后续 shared 的问题收敛到并发发布层。
+
+#### 物理布局与 ABI
+
+production 继续保留固定的 16,384 个 `MapEntry` 物理槽，但它不是“一个全局
+时序环”。槽池按编译期 `CAP` 均匀切成连续的 per-bucket ring：
+
+```text
+bucket_count = 16384 / CAP
+slot(bucket, cursor) = bucket * CAP + (cursor & (CAP - 1))
+```
+
+默认 `CAP=128`，即 128 个 bucket、每桶 128 个连续槽。CAP=32/64 时需要的
+额外 bucket head/tail 从旧 32 KiB bucket-control 区内部切出；CAP=128/256/
+16384 则只使用固定的前 128 组游标。五种 CAP 下均保持：
+
+- `sizeof(MapEntry) == 48`；
+- `sizeof(DistTensorMap) == 823,312`；
+- `sizeof(DistCore) == 9,231,296`；
+- `DistCore::map/slots/occupied_count/owned_total/swimlane_last_cycle/task_payloads`
+  的精确 offset 不变。
+
+旧链表的 `bucket/next/prev/task-next` 字段改为 ABI reserve，旧 task-head 与
+free-list 控制区也只保留物理位置，private 热路径不再读写它们。虽然总尺寸和
+后续 offset 没变，同一批字节的解释已经不兼容，因此 build ABI 与 DistGlobal
+layout identity 都从 v2 升到 v3；旧、新三镜像不能混用。
+
+#### private 算法与生命周期合同
+
+private `PrepareMap(N,H)` 现在只单调推进
+`alive_floor=max(alive_floor,N-H)`，不再扫描 task-head。lookup/insert 只在
+实际触达的 bucket 上从 head 开始惰性退休
+`producer < alive_floor` 的前缀；insert 在确认
+`tail-head<CAP` 后写连续槽，再推进 tail。
+
+惰性前缀退休依赖一个明确合同：同一 bucket 内 producer 必须单调不降。
+production Submit 中 `DistCore::local_index` 随 replay 单调递增，同一 task
+的多个 output producer 相等，因此该合同成立。CPU/A5sim 用
+`always_assert(last.producer <= producer)` 拒绝绕过 Submit 的逆序调用；
+CCEC 中该断言编译为空，不增加设备热路径开销。
+
+lookup 仍扫描完整存活区间并选择重叠 entry 中最大的 producer，没有把“反向
+首命中”优化混入本次结构迁移。容量检查发生在任何槽写入之前；Register 的
+既有合同仍是按参数顺序发布，较早 output 已登记、后续 output 满桶时不回滚
+前缀，但失败 task 不进入 WinnerBuild，随后 Submit 在 Claim 前关闭。
+
+#### 容量边界：当前只对 PA Case1 给出严格证明
+
+固定 `CAP=128` 不是通用 runtime 容量结论。旧 free-list 的 16K 全局池可以
+容纳“单桶同时存活 129 项”，默认分桶环会对该图结构化报容量错误，因此当前
+接受域比旧实现窄；它不会静默覆写，但尚未实现第 12 章的通用 `auto CAP`。
+
+当前 Host/build 阶段没有一份可枚举全部 FDWIC register-event 的不可变任务图。
+task id、OUTPUT 地址和 Register 事件仍在 AICore 动态 replay 时形成，所以不能
+用经验公式冒充精确 auto planner。CAP 不足时沿 R1b-a 的 fatal 合同明确失败。
+
+对本轮目标 PA Case1、private、默认 `H=64` 则可以从真实 task plan 严格证明：
+
+- 每 batch 固定 Alloc/QK/SF/PV/UP 五个 task；
+- 只有 UP 登记四个 INOUT entry；
+- 任意 `H` 窗口内单桶最大存活量为
+  `4 * ceil((64 + 1) / 5) = 52`；
+- B256 虽累计 append 1,024 项，滑动窗口峰值仍为 52，小于 CAP128。
+
+该证明不覆盖 Case2/Case3、多 group、修改后的 task signature、shared 的
+`Delta+H` 窗口或其他 H。完整 runtime 放行前仍需增加可证的 CAP admission，
+不能把 PA 特例写成通用保证。
+
+#### 正确性与编译证据
+
+| 检查 | 结果 |
+| --- | --- |
+| 独立逻辑 reference：半开区间、多版本、历史窗口、12,000 task | PASS |
+| CAP32/64/128/256/16384：三圈回绕、空桶重插、同桶不同 buffer、跨桶隔离、control 边界 | 5/5 PASS |
+| production Register 容量失败与 output 前缀合同 | 3/3 PASS |
+| ASAN+UBSAN：五种 CAP 加 Submit capacity | 6/6 程序、68/68 case PASS，无报告 |
+| 默认 FDWIC C++ 相关门槛 | 10/10 PASS |
+| CCEC CAP32/64/128/256/16384，AIC/AIV 完整 runtime | 全部编译通过 |
+| private/shared × A5sim/A5 三镜像独立 artifact | 4/4 构建通过 |
+| A5sim private PA Case1 B256 | PASS |
+| A5 private PA Case1 B256 golden | PASS |
+| 相关 Python 非真实构建测试 | 473 PASS、12 deselected |
+
+完整 Python 组合另有 5 个既有 A2/A3 真实构建失败，均为
+`PTO2TaskPayload` 实际 568B、规范断言 576B；本阶段只改 A5 FDWIC，不能把
+这些失败隐去，也不能解释为 private ring 引入。
+
+#### A5 B256 成对 perf-clock
+
+对照 A 使用提交 `ae3ef378` 的旧 linked/free-list，候选 B 使用本阶段源码。
+两边都先跑一轮 warmup/golden，再各启动六个独立进程。每份 raw 都严格验证
+96 个唯一 core、32 AIC + 64 AIV、每核 1,280 次 Submit，以及
+`elapsed=end-start` 和全局首尾边界。
+
+| 版本 | 六轮 ticks | 中位数 | 范围 |
+| --- | --- | ---: | ---: |
+| A：旧 linked | 4,494,319 / 5,582,428 / 4,556,441 / 5,650,159 / 4,650,222 / 4,987,514 | 4,818,868 | 4,494,319～5,650,159 |
+| B：private ring | 4,505,755 / 5,188,389 / 4,924,792 / 4,487,396 / 5,693,508 / 4,481,595 | 4,715,273.5 | 4,481,595～5,693,508 |
+
+B 中位数比 A 低 103,594.5 ticks，约 `-2.15%`，但两组范围高度重叠，按运行
+顺序比较也只有 3/6 的 B 更快。因此证据只能支持“没有观察到明确整体回退”，
+不能宣称稳定获得 2.15% 收益。
+
+实际 perf ELF 的 `.text` 从 130,264B 增至 136,408B，增加 6,144B
+（约 4.72%）：
+
+- A ELF SHA256：
+  `6d73825d9aee422c05d2915d0dcc60c0e93e5f21fa6d36baa6202c39a4eac94d`；
+- B ELF SHA256：
+  `dd1cf3f51e92416aacb53d67fadb920534536e55ca07280192c98364094fd713`。
+
+代码尺寸增长没有在六轮 B256 中形成可分辨回退，但它是后续 shared 迁移时
+必须继续观察的 I-cache 风险，不能因时间中位数较低而忽略。
+
+#### 下一阶段边界
+
+private ring 到此冻结。shared 不能靠“给 private head/tail 加 atomic”实现；
+下一阶段需要独立完成 task-id 有序的单追加者协议、整 task 容量预检、
+winner-only publish、`seq` 发布与跨核可见性、`core_progress` 推导的全局
+reclaim，以及 PA 非末组 INOUT 的 region-intent gate。每一层先保持 shared
+顶层 fail-closed，待 CPU/CCEC/A5sim 门槛闭合后再解除，避免把半成品误跑成
+private 语义。当前容量失败集成测试只覆盖单 worker；在解除 shared 门禁或
+扩大通用输入域之前，还必须补多 worker 故障传播、wait/drain 退出和
+AICPU/Host 非零返回的收敛门槛。

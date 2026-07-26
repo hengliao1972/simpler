@@ -29,28 +29,6 @@
 
 namespace {
 
-// 保留优化前的 retire 控制流作为差分参考。entry 摘链仍复用生产 helper，
-// 因而测试只对比本次候选涉及的 task-head 分支，不复制整套 TensorMap 实现。
-void advance_retire_reference(DistTensorMap &map, int32_t task_id, int32_t history) {
-    const int32_t new_floor = task_id - history;
-    if (new_floor <= map.cleaned_upto) {
-        if (new_floor > map.alive_floor) map.alive_floor = new_floor;
-        return;
-    }
-    for (int32_t id = map.cleaned_upto; id < new_floor; ++id) {
-        int32_t current = map.task_heads[id & kTaskWindowMask];
-        while (current >= 0) {
-            const int32_t next = map.entries[current].next_in_task;
-            EXPECT_EQ(map.entries[current].producer, id);
-            dist_private_tensor_map_free_entry(map, current);
-            current = next;
-        }
-        map.task_heads[id & kTaskWindowMask] = -1;
-    }
-    map.cleaned_upto = new_floor;
-    map.alive_floor = new_floor;
-}
-
 std::unique_ptr<DistTensorMap> make_empty_map() {
     auto map = std::make_unique<DistTensorMap>();
     dist_private_tensor_map_reset(*map);
@@ -65,24 +43,9 @@ std::unique_ptr<DistTensorMap> clone_map_bytes(const DistTensorMap &source) {
 }
 
 void expect_exact_map_state(const DistTensorMap &actual, const DistTensorMap &expected) {
-    // expected 是 actual 在调用前的逐字节副本；两边只经过确定性的生产/参考
-    // retire，因此这里可以连同未触及的 entry 一起检查，防止快路误写相邻状态。
+    // expected 是调用前的逐字节副本。失败路径必须连同未触及 entry 与 ABI
+    // 保留区一起保持不变，防止满环检查后仍误写 slot 或 cursor。
     EXPECT_EQ(std::memcmp(&actual, &expected, sizeof(DistTensorMap)), 0);
-}
-
-void seed_entry(
-    DistTensorMap &map, int32_t index, int32_t producer, int32_t bucket, int32_t previous_in_bucket,
-    int32_t next_in_bucket, int32_t next_in_task
-) {
-    MapEntry &entry = map.entries[index];
-    entry.buf_addr = static_cast<uint64_t>(0x1000 + index * 0x100);
-    entry.lo = static_cast<uint64_t>(index * 16);
-    entry.hi = entry.lo + 16;
-    entry.producer = producer;
-    entry.bucket = bucket;
-    entry.prev_in_bucket = previous_in_bucket;
-    entry.next_in_bucket = next_in_bucket;
-    entry.next_in_task = next_in_task;
 }
 
 Tensor make_region(uint64_t address) {
@@ -96,6 +59,34 @@ Tensor make_region(uint64_t address) {
     tensor.extent_elem_cache = 1;
     tensor.strides[0] = 1;
     return tensor;
+}
+
+Tensor make_region_in_another_bucket(uint64_t address) {
+    const uint32_t original_bucket = dist_private_tensor_map_hash(address);
+    for (uint64_t candidate = address + 64; candidate < address + (1ULL << 30); candidate += 64) {
+        if (dist_private_tensor_map_hash(candidate) != original_bucket) {
+            return make_region(candidate);
+        }
+    }
+    throw std::logic_error("failed to find a TensorMap address in another bucket");
+}
+
+Tensor make_region_in_bucket(uint32_t target_bucket, uint64_t seed) {
+    constexpr uint64_t kSearchSteps = 1ULL << 20;
+    for (uint64_t step = 0; step < kSearchSteps; ++step) {
+        const uint64_t candidate = seed + step * 64;
+        if (dist_private_tensor_map_hash(candidate) == target_bucket) {
+            return make_region(candidate);
+        }
+    }
+    throw std::logic_error("failed to find a TensorMap address in the requested bucket");
+}
+
+void fill_region_bucket(DistTensorMap &map, const Tensor &tensor, uint32_t count, int32_t first_producer = 0) {
+    for (uint32_t index = 0; index < count; ++index) {
+        ASSERT_TRUE(dist_private_tensor_map_insert(map, tensor, first_producer + static_cast<int32_t>(index)))
+            << "index=" << index << " count=" << count << " cap=" << kMapBucketCapacity;
+    }
 }
 
 Tensor make_logical_test_tensor(
@@ -213,7 +204,7 @@ private:
 };
 
 void expect_logical_lookup_matches(
-    const DistTensorMap &actual, const LogicalReferenceMap &reference, const Tensor &query, const char *context,
+    DistTensorMap &actual, const LogicalReferenceMap &reference, const Tensor &query, const char *context,
     int32_t task_id = -1
 ) {
     EXPECT_EQ(dist_private_tensor_map_lookup(actual, query), reference.lookup(query))
@@ -312,6 +303,23 @@ TEST(FdwicTensorMapLogical, HistoryFloorIsHalfOpenAndMonotonic) {
     EXPECT_EQ(reference.lookup(producer_10), -1);
 }
 
+TEST(FdwicTensorMapRing, SameBucketProducerContractAcceptsEqualAndIncreasingAndRejectsDecreasing) {
+    auto map = make_empty_map();
+    const Tensor region = make_region(0x380000);
+
+    ASSERT_TRUE(dist_private_tensor_map_insert(*map, region, 3));
+    ASSERT_TRUE(dist_private_tensor_map_insert(*map, region, 3));
+    ASSERT_TRUE(dist_private_tensor_map_insert(*map, region, 4));
+    EXPECT_EQ(dist_private_tensor_map_lookup(*map, region), 4);
+
+    const auto before_decreasing_insert = clone_map_bytes(*map);
+    EXPECT_THROW(
+        (void)dist_private_tensor_map_insert(*map, region, 2),
+        std::logic_error
+    );
+    expect_exact_map_state(*map, *before_decreasing_insert);
+}
+
 TEST(FdwicTensorMapLogical, FixedSeedTwelveThousandTasksMatchIndependentReference) {
     constexpr uint64_t kSeed = 0x5041524F445631ULL;  // "PARODV1"
     constexpr int32_t kHistory = 15;
@@ -349,122 +357,212 @@ TEST(FdwicTensorMapLogical, FixedSeedTwelveThousandTasksMatchIndependentReferenc
     }
 }
 
-TEST(FdwicTensorMapRetire, EmptySentinelAndDefensiveNegativeValueMatchOriginalState) {
-    auto actual = make_empty_map();
-    actual->task_heads[1] = -2;
-    auto expected = clone_map_bytes(*actual);
-
-    // new_floor=3：id 0/2 是正常空链 -1；id 1 是防御性异常负值。
-    // 候选只能跳过精确的 -1，仍须把其他负值归一为 -1。
-    dist_private_tensor_map_advance_retire(*actual, 67, 64);
-    advance_retire_reference(*expected, 67, 64);
-
-    expect_exact_map_state(*actual, *expected);
-    EXPECT_EQ(actual->task_heads[0], -1);
-    EXPECT_EQ(actual->task_heads[1], -1);
-    EXPECT_EQ(actual->task_heads[2], -1);
-    EXPECT_EQ(actual->cleaned_upto, 3);
-    EXPECT_EQ(actual->alive_floor, 3);
-    EXPECT_EQ(actual->free_head, -1);
-    EXPECT_EQ(actual->high_water, 0);
-}
-
-TEST(FdwicTensorMapRetire, NonEmptyTaskChainsPreserveBucketAndFreeListSemantics) {
-    auto actual = make_empty_map();
-    actual->high_water = 4;
-
-    // bucket 7: retired entry 0 -> live entry 1。
-    actual->buckets[7] = 0;
-    seed_entry(*actual, 0, 0, 7, -1, 1, -1);
-    seed_entry(*actual, 1, 5, 7, 0, -1, -1);
-    actual->task_heads[0] = 0;
-    actual->task_heads[5] = 1;
-
-    // bucket 9 与 task 2 都是 entry 2 -> entry 3；两项应按原顺序进入 free list。
-    actual->buckets[9] = 2;
-    seed_entry(*actual, 2, 2, 9, -1, 3, 3);
-    seed_entry(*actual, 3, 2, 9, 2, -1, -1);
-    actual->task_heads[2] = 2;
-
-    auto expected = clone_map_bytes(*actual);
-    dist_private_tensor_map_advance_retire(*actual, 67, 64);
-    advance_retire_reference(*expected, 67, 64);
-
-    expect_exact_map_state(*actual, *expected);
-    EXPECT_EQ(actual->buckets[7], 1);
-    EXPECT_EQ(actual->entries[1].prev_in_bucket, -1);
-    EXPECT_EQ(actual->buckets[9], -1);
-    EXPECT_EQ(actual->task_heads[0], -1);
-    EXPECT_EQ(actual->task_heads[2], -1);
-    EXPECT_EQ(actual->task_heads[5], 1);
-    EXPECT_EQ(actual->free_head, 3);
-    EXPECT_EQ(actual->entries[3].next_in_bucket, 2);
-    EXPECT_EQ(actual->entries[2].next_in_bucket, 0);
-    EXPECT_EQ(actual->entries[0].next_in_bucket, -1);
-    EXPECT_EQ(actual->high_water, 4);
-    EXPECT_EQ(actual->cleaned_upto, 3);
-    EXPECT_EQ(actual->alive_floor, 3);
-}
-
-TEST(FdwicTensorMapRetire, ReusedTaskWindowSlotAndRepeatedFloorsRemainDeterministic) {
-    auto actual = make_empty_map();
-    actual->cleaned_upto = kTaskWindow;
-    actual->alive_floor = kTaskWindow;
-    actual->high_water = 1;
-    actual->buckets[11] = 0;
-    seed_entry(*actual, 0, kTaskWindow, 11, -1, -1, -1);
-    actual->task_heads[0] = 0;  // producer 1024 复用 task-window 槽 0。
-
-    auto expected = clone_map_bytes(*actual);
-    dist_private_tensor_map_advance_retire(*actual, kTaskWindow + 65, 64);
-    advance_retire_reference(*expected, kTaskWindow + 65, 64);
-
-    expect_exact_map_state(*actual, *expected);
-    EXPECT_EQ(actual->task_heads[0], -1);
-    EXPECT_EQ(actual->buckets[11], -1);
-    EXPECT_EQ(actual->free_head, 0);
-    EXPECT_EQ(actual->cleaned_upto, kTaskWindow + 1);
-    EXPECT_EQ(actual->alive_floor, kTaskWindow + 1);
-
-    const auto after_first_retire = clone_map_bytes(*actual);
-    dist_private_tensor_map_advance_retire(*actual, kTaskWindow + 65, 64);
-    dist_private_tensor_map_advance_retire(*actual, 100, 64);
-    expect_exact_map_state(*actual, *after_first_retire);
-}
-
-TEST(FdwicTensorMapRetire, LastPhysicalSlotSucceedsAndOverflowLeavesMapUnchanged) {
+TEST(FdwicTensorMapRing, ResetAndPhysicalBoundariesMatchTheFixedPool) {
     auto map = make_empty_map();
-    map->high_water = kMapCap - 1;
-    const Tensor last = make_region(0x100000);
 
-    EXPECT_TRUE(dist_private_tensor_map_insert(*map, last, 7));
-    EXPECT_EQ(map->high_water, kMapCap);
+    EXPECT_EQ(sizeof(DistTensorMap), 823312U);
+    EXPECT_EQ(sizeof(MapEntry), 48U);
+    EXPECT_EQ(kMapBuckets * kMapBucketCapacity, static_cast<uint32_t>(kMapCap));
+    EXPECT_EQ(dist_private_tensor_map_slot_index(0, 0), 0U);
+    EXPECT_EQ(
+        dist_private_tensor_map_slot_index(kMapBuckets - 1, kMapBucketCapacity - 1),
+        static_cast<uint32_t>(kMapCap - 1)
+    );
+    EXPECT_EQ(
+        dist_private_tensor_map_slot_index(kMapBuckets - 1, kMapBucketCapacity),
+        (kMapBuckets - 1) * kMapBucketCapacity
+    );
+    EXPECT_EQ(map->alive_floor, 0);
+    for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
+        EXPECT_EQ(dist_private_tensor_map_load_head(*map, bucket), 0U);
+        EXPECT_EQ(dist_private_tensor_map_load_tail(*map, bucket), 0U);
+    }
+}
+
+TEST(FdwicTensorMapRing, PrepareMapMovesOnlyTheFloorAndTouchedBucketsRetireLazily) {
+    auto map = make_empty_map();
+    const Tensor region = make_region(0x100000);
+    ASSERT_TRUE(dist_private_tensor_map_insert(*map, region, 9));
+    ASSERT_TRUE(dist_private_tensor_map_insert(*map, region, 10));
+    const uint32_t bucket = dist_private_tensor_map_hash(region.buffer.addr);
+
+    dist_private_tensor_map_advance_retire(*map, 20, 10);
+    EXPECT_EQ(map->alive_floor, 10);
+    EXPECT_EQ(dist_private_tensor_map_load_head(*map, bucket), 0U);
+    EXPECT_EQ(dist_private_tensor_map_lookup(*map, region), 10);
+    EXPECT_EQ(dist_private_tensor_map_load_head(*map, bucket), 1U);
+
+    dist_private_tensor_map_advance_retire(*map, 20, 10);
+    dist_private_tensor_map_advance_retire(*map, 19, 10);
+    EXPECT_EQ(map->alive_floor, 10);
+    EXPECT_EQ(dist_private_tensor_map_load_head(*map, bucket), 1U);
+
+    dist_private_tensor_map_advance_retire(*map, 21, 10);
+    EXPECT_EQ(map->alive_floor, 11);
+    EXPECT_EQ(dist_private_tensor_map_load_head(*map, bucket), 1U);
+    EXPECT_EQ(dist_private_tensor_map_lookup(*map, region), -1);
+    EXPECT_EQ(dist_private_tensor_map_load_head(*map, bucket), 2U);
+}
+
+TEST(FdwicTensorMapRing, DifferentBuffersInTheSameBucketRemainLogicallyIndependent) {
+    auto map = make_empty_map();
+    const Tensor first = make_region(0x180000);
+    const uint32_t bucket = dist_private_tensor_map_hash(first.buffer.addr);
+    const Tensor second = make_region_in_bucket(bucket, 0x700000000ULL);
+    ASSERT_NE(first.buffer.addr, second.buffer.addr);
+    ASSERT_EQ(dist_private_tensor_map_hash(second.buffer.addr), bucket);
+
+    ASSERT_TRUE(dist_private_tensor_map_insert(*map, first, 7));
+    ASSERT_TRUE(dist_private_tensor_map_insert(*map, second, 8));
+    EXPECT_EQ(dist_private_tensor_map_lookup(*map, first), 7);
+    EXPECT_EQ(dist_private_tensor_map_lookup(*map, second), 8);
+
+    ASSERT_TRUE(dist_private_tensor_map_insert(*map, first, 9));
+    EXPECT_EQ(dist_private_tensor_map_lookup(*map, first), 9);
+    EXPECT_EQ(dist_private_tensor_map_lookup(*map, second), 8);
+}
+
+TEST(FdwicTensorMapRing, FullyRetiredBucketReusesANonzeroCursorWithoutExposingStaleSlots) {
+    auto map = make_empty_map();
+    const Tensor region = make_region(0x1c0000);
+    const uint32_t bucket = dist_private_tensor_map_hash(region.buffer.addr);
+    fill_region_bucket(*map, region, kMapBucketCapacity);
+
+    dist_private_tensor_map_advance_retire(
+        *map, static_cast<int32_t>(kMapBucketCapacity), /*history=*/0
+    );
+    EXPECT_EQ(dist_private_tensor_map_load_head(*map, bucket), 0U);
+    EXPECT_EQ(dist_private_tensor_map_lookup(*map, region), -1);
+    EXPECT_EQ(dist_private_tensor_map_load_head(*map, bucket), kMapBucketCapacity);
+    EXPECT_EQ(dist_private_tensor_map_load_tail(*map, bucket), kMapBucketCapacity);
+
+    ASSERT_TRUE(
+        dist_private_tensor_map_insert(
+            *map, region, static_cast<int32_t>(kMapBucketCapacity)
+        )
+    );
+    EXPECT_EQ(dist_private_tensor_map_load_head(*map, bucket), kMapBucketCapacity);
+    EXPECT_EQ(dist_private_tensor_map_load_tail(*map, bucket), kMapBucketCapacity + 1);
+    EXPECT_EQ(
+        map->entries[dist_private_tensor_map_slot_index(bucket, kMapBucketCapacity)].producer,
+        static_cast<int32_t>(kMapBucketCapacity)
+    );
+    EXPECT_EQ(
+        dist_private_tensor_map_lookup(*map, region),
+        static_cast<int32_t>(kMapBucketCapacity)
+    );
+}
+
+TEST(FdwicTensorMapRing, FullBucketRejectsWithoutMutationAndDoesNotBlockAnotherBucket) {
+    auto map = make_empty_map();
+    const Tensor full = make_region(0x200000);
+    const uint32_t full_bucket = dist_private_tensor_map_hash(full.buffer.addr);
+    fill_region_bucket(*map, full, kMapBucketCapacity);
+    EXPECT_EQ(dist_private_tensor_map_load_tail(*map, full_bucket), kMapBucketCapacity);
 
     const auto full_state = clone_map_bytes(*map);
-    const Tensor overflow = make_region(0x200000);
-    EXPECT_FALSE(dist_private_tensor_map_insert(*map, overflow, 8));
+    EXPECT_FALSE(dist_private_tensor_map_insert(*map, full, static_cast<int32_t>(kMapBucketCapacity)));
     expect_exact_map_state(*map, *full_state);
+
+    if constexpr (kMapBuckets > 1) {
+        const uint32_t full_slot_begin = full_bucket * kMapBucketCapacity;
+        std::vector<MapEntry> full_entries_before(kMapBucketCapacity);
+        std::memcpy(
+            full_entries_before.data(), &map->entries[full_slot_begin],
+            full_entries_before.size() * sizeof(MapEntry)
+        );
+        const Tensor independent = make_region_in_another_bucket(full.buffer.addr);
+        const uint32_t independent_bucket = dist_private_tensor_map_hash(independent.buffer.addr);
+        ASSERT_NE(independent_bucket, full_bucket);
+        ASSERT_TRUE(
+            dist_private_tensor_map_insert(*map, independent, static_cast<int32_t>(kMapBucketCapacity + 1))
+        );
+        EXPECT_EQ(dist_private_tensor_map_load_head(*map, full_bucket), 0U);
+        EXPECT_EQ(dist_private_tensor_map_load_tail(*map, full_bucket), kMapBucketCapacity);
+        EXPECT_EQ(
+            std::memcmp(
+                full_entries_before.data(), &map->entries[full_slot_begin],
+                full_entries_before.size() * sizeof(MapEntry)
+            ),
+            0
+        );
+        EXPECT_EQ(dist_private_tensor_map_lookup(*map, independent), static_cast<int32_t>(kMapBucketCapacity + 1));
+    }
 }
 
-TEST(FdwicTensorMapRetire, RetiredFreeSlotCanBeReusedAfterHighWaterReachesCapacity) {
+TEST(FdwicTensorMapRing, BaseAndExtraBucketControlBoundaryIsIsolated) {
+    if constexpr (kMapBuckets > kMapBaseControlBuckets) {
+        constexpr uint32_t kLastBaseBucket = kMapBaseControlBuckets - 1;
+        constexpr uint32_t kFirstExtraBucket = kMapBaseControlBuckets;
+        const Tensor base_region = make_region_in_bucket(kLastBaseBucket, 0x500000000ULL);
+        const Tensor extra_region = make_region_in_bucket(kFirstExtraBucket, 0x600000000ULL);
+        auto map = make_empty_map();
+
+        ASSERT_EQ(dist_private_tensor_map_hash(base_region.buffer.addr), kLastBaseBucket);
+        ASSERT_EQ(dist_private_tensor_map_hash(extra_region.buffer.addr), kFirstExtraBucket);
+        ASSERT_TRUE(dist_private_tensor_map_insert(*map, base_region, 1));
+        ASSERT_TRUE(dist_private_tensor_map_insert(*map, base_region, 2));
+        ASSERT_TRUE(dist_private_tensor_map_insert(*map, extra_region, 1));
+
+        EXPECT_EQ(dist_private_tensor_map_load_head(*map, kLastBaseBucket), 0U);
+        EXPECT_EQ(dist_private_tensor_map_load_tail(*map, kLastBaseBucket), 2U);
+        EXPECT_EQ(dist_private_tensor_map_load_head(*map, kFirstExtraBucket), 0U);
+        EXPECT_EQ(dist_private_tensor_map_load_tail(*map, kFirstExtraBucket), 1U);
+
+        const uint32_t base_slot = dist_private_tensor_map_slot_index(kLastBaseBucket, 0);
+        const uint32_t extra_slot = dist_private_tensor_map_slot_index(kFirstExtraBucket, 0);
+        ASSERT_NE(base_slot, extra_slot);
+        EXPECT_EQ(map->entries[base_slot].buf_addr, base_region.buffer.addr);
+        EXPECT_EQ(map->entries[base_slot].producer, 1);
+        EXPECT_EQ(map->entries[base_slot + 1].buf_addr, base_region.buffer.addr);
+        EXPECT_EQ(map->entries[base_slot + 1].producer, 2);
+        EXPECT_EQ(map->entries[extra_slot].buf_addr, extra_region.buffer.addr);
+        EXPECT_EQ(map->entries[extra_slot].producer, 1);
+        EXPECT_EQ(dist_private_tensor_map_lookup(*map, base_region), 2);
+        EXPECT_EQ(dist_private_tensor_map_lookup(*map, extra_region), 1);
+    }
+}
+
+TEST(FdwicTensorMapRing, RetiredSlotsWrapForThreeLapsWithoutExposingOldValues) {
     auto map = make_empty_map();
-    map->high_water = kMapCap;
-    map->free_head = 19;
-    map->entries[19].next_in_bucket = -1;
-    const Tensor tensor = make_region(0x300000);
+    const Tensor region = make_region(0x300000);
+    const uint32_t bucket = dist_private_tensor_map_hash(region.buffer.addr);
+    fill_region_bucket(*map, region, kMapBucketCapacity);
 
-    EXPECT_TRUE(dist_private_tensor_map_insert(*map, tensor, 9));
-    EXPECT_EQ(map->high_water, kMapCap);
-    EXPECT_EQ(map->free_head, -1);
-    EXPECT_EQ(map->entries[19].producer, 9);
+    for (uint32_t lap = 1; lap <= 3; ++lap) {
+        const uint32_t producer_base = lap * kMapBucketCapacity;
+        for (uint32_t offset = 0; offset < kMapBucketCapacity; ++offset) {
+            const uint32_t producer = producer_base + offset;
+            const uint32_t new_floor = producer - kMapBucketCapacity + 1;
+            dist_private_tensor_map_advance_retire(*map, static_cast<int32_t>(new_floor), 0);
+            ASSERT_TRUE(dist_private_tensor_map_insert(*map, region, static_cast<int32_t>(producer)))
+                << "lap=" << lap << " offset=" << offset;
+        }
+
+        const uint64_t expected_head = static_cast<uint64_t>(lap) * kMapBucketCapacity;
+        const uint64_t expected_tail = static_cast<uint64_t>(lap + 1) * kMapBucketCapacity;
+        EXPECT_EQ(dist_private_tensor_map_load_head(*map, bucket), expected_head);
+        EXPECT_EQ(dist_private_tensor_map_load_tail(*map, bucket), expected_tail);
+        EXPECT_EQ(
+            dist_private_tensor_map_lookup(*map, region),
+            static_cast<int32_t>(expected_tail - 1)
+        );
+        for (uint32_t slot_offset = 0; slot_offset < kMapBucketCapacity; ++slot_offset) {
+            const uint32_t physical_slot = dist_private_tensor_map_slot_index(bucket, slot_offset);
+            EXPECT_EQ(map->entries[physical_slot].buf_addr, region.buffer.addr)
+                << "lap=" << lap << " slot_offset=" << slot_offset;
+            EXPECT_EQ(map->entries[physical_slot].producer, static_cast<int32_t>(producer_base + slot_offset))
+                << "lap=" << lap << " slot_offset=" << slot_offset;
+        }
+    }
 }
 
-TEST(FdwicTensorMapRetire, FacadePropagatesBackendCapacityFailureWithoutMutation) {
+TEST(FdwicTensorMapRing, FacadePropagatesPerBucketCapacityFailureWithoutMutation) {
     auto worker = std::make_unique<DistCore>();
     dist_tensor_map_reset_worker(*worker);
-    worker->map.high_water = kMapCap;
-    const auto full_state = clone_map_bytes(worker->map);
     const Tensor tensor = make_region(0x400000);
+    fill_region_bucket(worker->map, tensor, kMapBucketCapacity);
+    const auto full_state = clone_map_bytes(worker->map);
 
     EXPECT_FALSE(dist_tensor_map_insert_for_task(*worker, tensor, 10, /*task_won=*/true));
     expect_exact_map_state(worker->map, *full_state);
