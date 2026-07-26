@@ -340,17 +340,28 @@ __aicore__ inline void CcecOps::PmuWindowStop(
         context.phase_elapsed_ticks == 0;
 #if PTO_FDWIC_SHARED_MAP
     // shared 的 task 数由各 batch 的 context_len 决定。Stop 时公共结果尚未
-    // 发布到 state->results，因此直接读取本 worker 已完成回放的 local_index；
-    // host 再用独立 task plan 校验这个实际值，避免设备端复制一套期望公式。
-    const uint32_t expected_phase_calls =
+    // 发布到 state->results，因此这里只能直接读取本 worker 已完成回放的
+    // local_index。Claim/EfDrain 仍严格覆盖全部逻辑 task；Materialize/
+    // Register 已改为 winner-only，设备端只验证不超过任务数，host 随后
+    // 用已发布的 claim_wins 做逐核精确校验。
+    const uint32_t replay_task_count =
         static_cast<uint32_t>(state->workers[worker_id].local_index);
+    const bool running_call_shape =
+        pa_scheduler::kCompiledSubmitPmuPhase ==
+                pa_scheduler::SubmitPmuPhase::Claim ||
+            pa_scheduler::kCompiledSubmitPmuPhase ==
+                pa_scheduler::SubmitPmuPhase::EfDrain
+        ? context.phase_calls == replay_task_count
+        : context.phase_calls <= replay_task_count;
 #else
     const uint32_t expected_phase_calls =
         state->config.batches * pa_scheduler::kTasksPerBatch;
+    const bool running_call_shape =
+        context.phase_calls == expected_phase_calls;
 #endif
     const bool running_shape =
         pa_scheduler::kCompiledSubmitPmuPhase != pa_scheduler::SubmitPmuPhase::None &&
-        context.phase_calls == expected_phase_calls &&
+        running_call_shape &&
         context.begin_reads == context.phase_calls &&
         context.end_reads == context.phase_calls;
     if (none_shape || running_shape)
@@ -358,7 +369,9 @@ __aicore__ inline void CcecOps::PmuWindowStop(
     const bool phase_time_valid =
         pa_scheduler::kCompiledSubmitPmuPhase == pa_scheduler::SubmitPmuPhase::None
             ? context.phase_elapsed_ticks == 0
-            : context.phase_calls != 0 && context.phase_elapsed_ticks != 0;
+            : context.phase_calls == 0
+                ? context.phase_elapsed_ticks == 0
+                : context.phase_elapsed_ticks != 0;
     if (phase_time_valid)
         context.phase_status |= kPhaseStatusTimeValid;
 

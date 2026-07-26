@@ -250,7 +250,17 @@ def _submit_pmu_capture(
         block_id = worker_id if role == "aic" else vector_id // 2
         lane = 0 if role == "aic" else 1 + vector_id % 2
         base = 100 + worker_id * 10 + offset
-        calls_per_worker = 0 if phase == "none" else tasks_per_worker
+        if phase == "none":
+            calls_per_worker = 0
+        elif schema_version == 6 and phase in ("materialize", "register"):
+            # shared 每个逻辑 task 恰有一个 winner；测试数据用确定性分配
+            # 构造含零 winner 核的逐核稀疏调用，总和严格等于 task 数。
+            calls_per_worker = (
+                tasks_per_worker // A5_WORKERS
+                + (1 if worker_id < tasks_per_worker % A5_WORKERS else 0)
+            )
+        else:
+            calls_per_worker = tasks_per_worker
         primary_requests = 1000 + base
         primary_misses = 100 + base // 10
         phase_requests = 0 if calls_per_worker == 0 else 100 + worker_id * 10 + offset
@@ -731,6 +741,66 @@ class PmuSidecarAnalyzerTest(unittest.TestCase):
                     "phase_elapsed_per_call_ns",
                     result["per_run"][0]["groups"]["all"],
                 )
+
+    def test_submit_pmu_v6_winner_only_phases_use_sparse_per_core_calls(self) -> None:
+        for phase in ("materialize", "register"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                capture = _submit_pmu_capture(
+                    phase=phase,
+                    schema_version=6,
+                    shared_context_lens=[8193],
+                )
+                path = self._write(directory, f"{phase}.json", capture)
+                result = analyze([path])
+
+                calls = [
+                    record["phase_expected_calls"]
+                    for record in capture["records"]
+                ]
+                self.assertEqual(sum(calls), 9)
+                self.assertEqual(calls.count(0), A5_WORKERS - 9)
+                self.assertEqual(
+                    result["per_run"][0]["groups"]["all"]["phase_calls_sum"],
+                    9,
+                )
+
+    def test_submit_pmu_v6_rejects_winner_only_call_sum_without_unique_winner(self) -> None:
+        capture = _submit_pmu_capture(
+            phase="materialize",
+            schema_version=6,
+            shared_context_lens=[8193],
+        )
+        # 同步篡改一个零 winner 核的局部 raw/summary，使逐核字段自洽，
+        # 但全局调用数变成 10；analyzer 必须以唯一 winner 契约拒绝。
+        record = capture["records"][20]
+        record["phase_calls"] = 1
+        record["phase_expected_calls"] = 1
+        record["phase_begin_reads"] = 1
+        record["phase_end_reads"] = 1
+        record["shadow_read_segments"] = 3
+        record["phase_icache_requests"] = 1
+        record["phase_icache_misses"] = 0
+        record["phase_icache_requests_upper_bound"] = 1
+        record["phase_icache_misses_upper_bound"] = 0
+        record["phase_elapsed_ticks"] = 1
+        capture["validation"]["phase_calls"] += 1
+        capture["validation"]["phase_expected_calls"] += 1
+        records = capture["records"]
+        capture["summary"] = {
+            "all": _submit_pmu_summary(records, 6),
+            "aic": _submit_pmu_summary(
+                [item for item in records if item["role"] == "aic"], 6
+            ),
+            "aiv": _submit_pmu_summary(
+                [item for item in records if item["role"] == "aiv"], 6
+            ),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, "too-many-winners.json", capture)
+            with self.assertRaisesRegex(
+                ValueError, "unique-winner/global-replay contract"
+            ):
+                load_capture(path)
 
     def test_submit_pmu_v6_rejects_tampered_shared_task_metadata(self) -> None:
         cases = (

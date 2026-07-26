@@ -5979,7 +5979,8 @@ barrier、`DiscardSharedSlotsAfterReplayFatal()` 完成收敛。hook 自身有
 
 - 96 个 pthread 全部 join，startup=96，two-16 final barrier 精确闭合；
 - hook 恰好一次，fault worker 必须是 AIV；该 worker 在 task4 失败前
-  `submits=4`、split finish calls=5、task-id sum=10；
+  `submits=4`、split finish calls 等于该核已经取得的 Claim winner 数、
+  task-id sum=10；
 - `fatal=1`、`deps_prepared[4]=4`，但 task4/task8 的 flag 和 vend 都为
   0，`deps_prepared[8]` 仍为 -1；
 - Alloc 三个 writer 都等于 8，而 task8 自身无 Output 的 publication/
@@ -5993,14 +5994,12 @@ barrier、`DiscardSharedSlotsAfterReplayFatal()` 完成收敛。hook 自身有
   相等，全部 placement 之和等于 kernel 总数，completion duplicate 为
   0。
 
-故障广播存在合法竞态：少数 worker 可能在首个 Submit 前已经观察到
-fatal，因此 `task_count=0/finish_calls=0/finish_state_address=0`。旧 split
-尾检无条件要求 finish 地址等于 caller 地址，会把这种零回放正常退出
-误记成 protocol error。本阶段只允许“全局已经进入 terminal fatal，且
-task_count 和 finish_calls 同为零时 finish 地址尚未建立”；无 fatal 的
-零回放不能借此通过。任何进入过一个 Submit 的 worker 仍严格要求
-caller/finish 指向同一 thread-local runtime，其他 cookie、owner、调用
-次数、task sum 和 reserved 门槛均未放宽。
+shared loser 后续已经改为 caller 内轻量返回，不再跨 TU 进入完整 Finish。
+因此 split 尾检把两条事实分开证明：`task_id_sum` 必须覆盖该核实际重放的
+完整 `0..N-1` 序列；`finish_calls` 只等于该核 Claim winner 数。零 winner
+worker 即使完成了全部逻辑 Submit，`finish_state_address` 也应保持 0；
+只要至少赢过一次，caller/finish 仍必须指向同一 thread-local runtime。
+cookie、owner、task sum 和 reserved 门槛均未放宽。
 
 #### 实测
 
@@ -6128,3 +6127,157 @@ ignored `outputs/`，没有重复复制到 `test_record`。
 standalone 的故障宏、split runtime、固定 96-worker 测试状态、host thread
 yield 和模拟负载都不得进入 production。迁移的是已经证明的协议和 oracle，
 不是复制测试脚手架。
+
+### 2026-07-26：S6.6 按真实 replay 形态收敛 shared loser，并复核 INOUT region intent
+
+S6.5 冻结时，shared 的 96 个 replay actor 仍会进入同一份完整
+`FinishCallbackSubmitBody()`；loser 虽然不执行 Materialize 的主体，却仍
+穿过完整函数外壳和矩形观察边界。这既不符合参考实现的轻量 loser 返回形态，
+也会让泳道和局部 PMU 把不存在的 shared loser 重活当成业务阶段。本阶段先
+修正 standalone，不迁移真实 simpler。
+
+#### 不能照抄参考 PA 的 region-intent 缺口
+
+参考分支已经提供
+`rt_presubmit_*_with_region_intent()` 和
+`dist_presubmit_task_with_region_intent_impl()`，其通用协议允许 winner
+先登记覆盖 writer、发布 `deps_prepared`，loser 等门后返回。但是参考分支
+真实
+`examples/a5/fully_distributed_within_core/paged_attention_unroll`
+在 `FUNC_ONLINE_UPDATE` 的预提交处仍调用普通
+`rt_presubmit_aiv_task()`，没有调用 `_with_region_intent`。因此只能复用
+它已经证明的协议机制，不能把“API 存在”脑补成“PA 的跨组 INOUT 已接线”。
+
+PA 的约束按业务语义固定为：
+
+```text
+每组最后一个 UP 是 accumulator 的 INOUT writer
+    ├─ 后面还有组：winner 先登记新 writer 并发布 writer-ready
+    │              loser 等门后才返回并构造下一组
+    └─ 已是最后一组：没有后继构造者，不增加 writer-ready 门
+```
+
+standalone 使用动态 task plan 的 `has_following_group` 表达这一事实，不能
+用 `task_id % 5` 或固定 B1 任务数推断。winner 先完成当前 UP 的 fanin 和
+registration 校验，再由 `CommitPaSharedWriterIntentAfterFanin()` 将三个
+accumulator 的 `last_writer` 更新为本 UP，最后发布
+`deps_prepared=task_id`。loser 的
+`FinishSharedLoserSubmit()` 只在该位为真时等待门，且不读取 `TaskArgs`；
+下一组最终 UP 的 fanin 因而能观察上一组 UP，而不是退回最初 Alloc。
+non-final UP 在 Build 后跳过重复 writer commit；final UP 没有门，仍在
+Build 成功后提交最终 writer。
+
+两个互补定向 oracle 锁定这条协议：
+
+- G2 `context_len=8193` 的全 loser 回放中，task4 是 non-final INOUT，
+  task8 是 final INOUT；loser 在 `deps_prepared[4] == -1` 时不能返回，
+  发布为 4 后才能继续，而 `deps_prepared[8]` 始终为 -1。传入的上一任务
+  `TaskArgs` 页设为 `PROT_NONE`，完整重放仍通过，证明轻路径没有偷读
+  winner-only 参数；
+- G4 `context_len=32768` 的显式 winner 链逐组验证
+  task4/8/12/16 的 accumulator fanin 分别来自
+  Alloc/task4/task8/task12；task4/8/12 依次发布门，final task16 不发布；
+- G4 中间 task8 在放门后、Build 前注入 fatal。hook 等到 task12 和
+  task16 都已建立依赖 slot 后才失败；两者的 fanin 分别为
+  `{10,11,8}`、`{14,15,12}`，但 task8/12/16 都不能执行，96 worker
+  最终清空所有在途 slot。
+
+这条门表示“下一任 writer 身份已经登记”，不表示对应 UP kernel 已执行或
+完成。后继 slot 仍通过 producer completion flag 保证执行依赖；不能把
+`deps_prepared` 冒充 completion。
+
+当前证据也不扩大为三项未完成承诺：fatal 前已经独立就绪的后组
+QK/SF/PV 允许按 DAG 语义执行，只保证依赖失败 UP 的后继不执行；G4
+故障注入是 CPU 并发门槛，A5 目前只有当前 G2 和此前 G4 正常路径的发布
+可见性证据；损坏 gate 的重复发布仍使用 Exchange，可能先短暂放行
+waiter 再广播 fatal，
+但 completion flag 会阻止其错误执行。若以后要求“非法 gate 绝不放行”
+的更强异常态契约，应单独验证 CAS 发布，不能和本次热路径迁移混做。
+
+#### shared replay 与稀疏观察的最终形态
+
+shared 每个 actor 仍按相同 task plan 调用每次逻辑 Submit，以便 loser
+取得稳定 `(task_id, output_slot)` 返回值并继续构造后续参数。但实际阶段
+改为：
+
+| actor / task | EfDrain | Claim | Submit 父区间 | Materialize | Fanin | Register | Build/Complete |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| loser | 1 | 1 | 1 | 0 | 0 | 0 | 0 |
+| Alloc winner | 1 | 1 | 1 | 1 | 0 | 1 | 1 |
+| 非 Alloc winner | 1 | 1 | 1 | 1 | 1 | 1 | 1 |
+
+Alloc 暂时仍由所有 actor 构造三个静态输出参数，以保持参考
+`alloc_tensors(args)` 的特殊调用形状；其 output symbol 不依赖这次构参。
+其他重任务只有 Claim winner 构造 descriptor/scalar 参数并跨 TU Finish。
+shared PA 没有 ordinary-region `PrepareMap`，因此删除原来的零时长假
+marker；private 继续保持原矩形协议和 eager 参数构造。
+
+split runtime 也按真实职责拆开：
+
+- caller 对每个逻辑 task 累加 `task_id_sum`，证明全量 replay；
+- 只有 winner arm ticket 并进入 noinline Finish，
+  `finish_calls == claim_wins`；
+- 零 winner worker 的 `finish_state_address` 合法保持 0；赢过任务的 worker
+  仍要求 caller/finish 地址完全一致。
+
+raw 不增加逐事件字段。现有 `Submit` 父区间覆盖轻量 loser 返回和
+non-final UP 等门，普通 child 只记录真实执行阶段；文件级 metadata 只
+增加一次 `tensormap_mode`。converter/analyzer 按 schema v4 和模式分别
+验证：shared 禁止 `PrepareMap`、loser 禁止重阶段、winner 要求对应稀疏
+子区间；private 仍执行原契约。旧 raw 不做兼容，因为当前采集与加工是一体
+版本。
+
+submit-PMU 同步采用相同边界。Claim/EfDrain 每核调用数等于 replay task
+数；Materialize/Register 每核调用数等于本核 winner 数，允许为 0，但
+全局调用和必须等于 task 数。零调用记录必须满足
+`phase_elapsed_ticks=0`，同时仍是可信的完整 Submit PMU 记录。host 导出
+和运行期校验现在共用同一 `SubmitPmuPhaseTimeValid()` 判定，避免“终端
+打印 96/96 可信、JSON 却把零 winner 核标成不可信”的双口径。
+
+#### 本阶段证据
+
+- CPU shared 全套测试通过；G4 task8 post-gate 故障门槛额外连续运行
+  5 次均通过，稳定得到
+  `deps=4:4,8:8,12:12,16:-1`、
+  `flags(up4/up8/up12/up16)=1/0/0/0`、writers=`16,16,16`，
+  task12/task16 诊断 slot 均为 `1/1`，`slots_clear=1`；
+- Python converter/analyzer/PMU 共 105 项通过；
+- CCEC shared G1 泳道为 2,714/2,714 条，G2 为 4,110/4,110 条，
+  两者 `dropped=0`，依赖签名分别为
+  `5cb454393ed48dcb`、`dda63f4f5405eaf1`；
+- private CCEC B1 重新构建并上板通过，4,149/4,149 条、
+  `dropped=0`，证明 shared 稀疏分支没有污染 private；
+- shared G2 的五个 submit-PMU 变体全部生成 raw 和 HTML：none 为 0 次
+  局部调用，Claim/EfDrain 各为 `9 × 96 = 864` 次，
+  Materialize/Register 各为 9 次全局唯一 winner 调用；五份均为
+  96/96 记录可信，Materialize/Register 各有 87 个零 winner 核且仍可信。
+  一次实测中 Materialize 为
+  4,166 request / 279 miss / 31,497 ticks，Register 为
+  147 request / 11 miss / 310 ticks。这些只证明稀疏取数合同闭合，
+  不作为 B256 性能结论。
+
+#### B256 配对性能
+
+旧基线使用干净 detached worktree 的精确提交 `47d22e3f`，当前候选使用
+本节源码；两者重新独立构建 shared `perf-clock`。固定 CANN 9.1、用户
+`.venv`、device 0、B256、`real-compute 6,28,4,1`、two-16，关闭 PMU 和
+泳道。每版先预热 2 次，再做 6 个 ABBA/BAAB 四进程区组，A/B 各 12 个
+正式样本。
+
+| 版本 | 最小值 | 中位数 | 最大值 |
+| --- | ---: | ---: | ---: |
+| `47d22e3f` | 2,358.457 us | 2,380.110 us | 2,400.307 us |
+| 当前候选 | 2,314.435 us | 2,338.860 us | 2,367.994 us |
+
+六个区组的 `candidate - baseline` 依次为
+`-26.438/-45.852/-30.611/-35.463/-49.106/-47.787 us`，6/6 更快；
+配对中位数为 `-40.658 us/-1.703%`，整体中位数差为
+`-41.251 us/-1.733%`。24/24 次都闭合 1,280 task、1,024 kernel、
+依赖签名 `b7d985d6edb07078`、96 active worker、`RingBp=0`、fatal
+clear 和真实计算输出。
+
+候选 `.text` 比基线增加 2,560B，二者仍都只有两个 GLOBAL device FUNC；
+因此不能把收益解释成代码体积或符号数下降。当前最直接且与源码单变量一致的
+解释是：shared loser 不再进入完整 Finish 和 winner-only 重阶段外壳。
+这组数据达到 6/6 同向且超过 0.2% 的预设保留门槛，可以保留；它仍不能外推
+为真实 simpler 的同等收益，真实路径迁移后必须重新做同口径配对。

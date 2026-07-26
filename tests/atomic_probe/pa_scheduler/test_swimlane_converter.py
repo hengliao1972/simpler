@@ -108,6 +108,7 @@ def _v4_capture(
     *,
     num_cores: int = 1,
     add_parents: bool = True,
+    tensormap_mode: str = "private",
 ) -> dict[str, object]:
     """构造 phase-only schema-v4 raw；调用者显式提供 Claim/Submit/尾动作。"""
     all_rows = [list(row) for row in rows]
@@ -154,6 +155,7 @@ def _v4_capture(
             "clock_freq_hz": 1_000_000_000,
             "num_cores": num_cores,
             "trace_schema_version": 4,
+            "tensormap_mode": tensormap_mode,
             "core_types": [
                 _standalone_topology(core_id)[2] for core_id in range(num_cores)
             ],
@@ -172,6 +174,43 @@ def _v4_capture(
 
 
 class SwimlaneConverterLayoutTest(unittest.TestCase):
+    def test_v4_requires_explicit_tensormap_mode(self) -> None:
+        capture = _v4_capture(
+            [
+                [0, 0, 0, 0, -1, "Claim", 110, 120, 0x3, 1],
+                [0, 0, 0, 0, -1, "AllocComplete", 120, 130, 0, 0],
+                [0, 0, 0, 0, -1, "Submit", 100, 140, 1, 1],
+            ]
+        )
+        metadata = capture["metadata"]
+        assert isinstance(metadata, dict)
+        metadata.pop("tensormap_mode")
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "tensormap_mode"):
+                convert(input_path, output_path)
+
+    def test_v4_shared_rejects_private_prepare_map_record(self) -> None:
+        capture = _v4_capture(
+            [
+                [0, 0, 0, 0, -1, "Claim", 110, 115, 0x3, 1],
+                [0, 0, 0, 0, -1, "Materialize", 116, 120, 0, 1],
+                [0, 0, 0, 0, -1, "PrepareMap", 120, 120, 0, 1],
+                [0, 0, 0, 0, -1, "Register", 121, 125, 0, 0],
+                [0, 0, 0, 0, -1, "AllocComplete", 126, 130, 0, 0],
+                [0, 0, 0, 0, -1, "Submit", 100, 140, 1, 1],
+            ],
+            tensormap_mode="shared",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "must not contain PrepareMap"):
+                convert(input_path, output_path)
+
     def test_v4_splits_internal_and_tail_residual_without_repeated_fields(self) -> None:
         capture = _v4_capture(
             [

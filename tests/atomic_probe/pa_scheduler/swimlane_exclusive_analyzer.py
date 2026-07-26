@@ -60,13 +60,15 @@ V3_EXCLUSIVE_SUBMIT_PHASES = (
 )
 V4_TAIL_PHASES = ("WinnerBuild", "AllocComplete")
 V4_EXCLUSIVE_SUBMIT_PHASES = V3_EXCLUSIVE_SUBMIT_PHASES + V4_TAIL_PHASES
-REQUIRED_ON_EVERY_SUBMIT = (
+PRIVATE_REQUIRED_ON_EVERY_SUBMIT = (
     "EfDrain",
     "Materialize",
     "PrepareMap",
     "Claim",
     "Register",
 )
+SHARED_REQUIRED_ON_EVERY_SUBMIT = ("EfDrain", "Claim")
+SHARED_WINNER_ONLY_PHASES = ("Materialize", "Register")
 
 # 这些记录仍保留调用次数和 aggregate duration，但明确不进入任何闭合式。
 OVERLAY_PHASES = (
@@ -122,12 +124,20 @@ PHASE_TO_METRIC = {
     "WinnerBuild": "winner_build",
     "AllocComplete": "alloc_complete",
 }
-def _exclusive_phases(trace_schema_version: int) -> tuple[str, ...]:
-    return (
-        V4_EXCLUSIVE_SUBMIT_PHASES
-        if trace_schema_version == 4
-        else V3_EXCLUSIVE_SUBMIT_PHASES
-    )
+def _exclusive_phases(
+    trace_schema_version: int, tensormap_mode: str
+) -> tuple[str, ...]:
+    if trace_schema_version != 4:
+        return V3_EXCLUSIVE_SUBMIT_PHASES
+    if tensormap_mode == "shared":
+        # shared 的 raw 已从源头禁止 PrepareMap；分析语义也不能继续把它
+        # 声称为可能存在的 Submit child。
+        return tuple(
+            phase
+            for phase in V4_EXCLUSIVE_SUBMIT_PHASES
+            if phase != "PrepareMap"
+        )
+    return V4_EXCLUSIVE_SUBMIT_PHASES
 
 
 def _submit_partition_metrics(trace_schema_version: int) -> tuple[str, ...]:
@@ -482,10 +492,53 @@ def _group_v4_parents(
     return parents
 
 
+def _validate_submit_frontend_contract(
+    core_id: int,
+    trace_schema_version: int,
+    tensormap_mode: str,
+    submit: Event,
+    counts: Counter[str],
+) -> None:
+    """按 TensorMap 模式校验 Submit 前端 child 的基数。"""
+
+    winner = bool(submit.flags & 1)
+    if trace_schema_version == 4 and tensormap_mode == "shared":
+        for phase in SHARED_REQUIRED_ON_EVERY_SUBMIT:
+            if counts[phase] != 1:
+                raise ValueError(
+                    f"core {core_id} task {submit.task_id} shared path requires "
+                    f"exactly one {phase}, got {counts[phase]}"
+                )
+        for phase in SHARED_WINNER_ONLY_PHASES:
+            expected_count = 1 if winner else 0
+            if counts[phase] != expected_count:
+                raise ValueError(
+                    f"core {core_id} task {submit.task_id} shared "
+                    f"{'winner' if winner else 'loser'} path requires "
+                    f"{expected_count} {phase} spans, got {counts[phase]}"
+                )
+        if counts["PrepareMap"] != 0:
+            raise ValueError(
+                f"core {core_id} task {submit.task_id} shared path forbids PrepareMap"
+            )
+    else:
+        for phase in PRIVATE_REQUIRED_ON_EVERY_SUBMIT:
+            if counts[phase] != 1:
+                raise ValueError(
+                    f"core {core_id} task {submit.task_id} requires exactly one "
+                    f"{phase}, got {counts[phase]}"
+                )
+    if counts["Fanin"] > 1:
+        raise ValueError(
+            f"core {core_id} task {submit.task_id} has {counts['Fanin']} Fanin spans"
+        )
+
+
 def _analyze_core(
     core_id: int,
     role: str,
     trace_schema_version: int,
+    tensormap_mode: str,
     submits: Sequence[Event],
     children_by_submit: dict[int, list[Event]],
     kernels_by_efdrain: dict[int, list[Event]],
@@ -504,19 +557,18 @@ def _analyze_core(
             key=lambda event: (event.start_cycle, event.end_cycle, event.row_index),
         )
         counts = Counter(event.phase for event in children)
-        for phase in REQUIRED_ON_EVERY_SUBMIT:
-            if counts[phase] != 1:
-                raise ValueError(
-                    f"core {core_id} task {submit.task_id} requires exactly one {phase}, "
-                    f"got {counts[phase]}"
-                )
-        if counts["Fanin"] > 1:
-            raise ValueError(
-                f"core {core_id} task {submit.task_id} has {counts['Fanin']} Fanin spans"
-            )
+        winner = bool(submit.flags & 1)
+        is_alloc = bool(submit.auxiliary)
+        _validate_submit_frontend_contract(
+            core_id,
+            trace_schema_version,
+            tensormap_mode,
+            submit,
+            counts,
+        )
         if trace_schema_version == 4:
             tail_count = sum(counts[phase] for phase in V4_TAIL_PHASES)
-            expected_tail_count = 1 if bool(submit.flags & 1) else 0
+            expected_tail_count = 1 if winner else 0
             if tail_count != expected_tail_count or any(
                 counts[phase] > 1 for phase in V4_TAIL_PHASES
             ):
@@ -539,17 +591,17 @@ def _analyze_core(
                         f"core {core_id} task {submit.task_id} {tail.phase} must start "
                         "at or after every preceding frontend child"
                     )
-                expected_tail = "AllocComplete" if bool(submit.auxiliary) else "WinnerBuild"
+                expected_tail = "AllocComplete" if is_alloc else "WinnerBuild"
                 if tail.phase != expected_tail:
                     raise ValueError(
                         f"core {core_id} task {submit.task_id} expected {expected_tail}, "
                         f"got {tail.phase}"
                     )
-            expected_fanin_count = 1 if tail is not None and tail.phase == "WinnerBuild" else 0
+            expected_fanin_count = 1 if winner and not is_alloc else 0
             if counts["Fanin"] != expected_fanin_count:
                 raise ValueError(
                     f"core {core_id} task {submit.task_id} "
-                    f"{tail.phase if tail is not None else 'loser path'} requires "
+                    f"{'winner' if winner else 'loser'} path requires "
                     f"{expected_fanin_count} Fanin spans, got {counts['Fanin']}"
                 )
         for previous, current in zip(children, children[1:]):
@@ -808,6 +860,11 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
     core_types, num_cores = _validate_capture_identity(
         trace_schema_version, metadata, events
     )
+    tensormap_mode = (
+        str(metadata["tensormap_mode"])
+        if trace_schema_version == 4
+        else "private"
+    )
     if len(core_by_block_lane) != num_cores or set(core_by_block_lane.values()) != set(
         range(num_cores)
     ):
@@ -827,7 +884,9 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
             if event.phase == "Submit"
         }
         task_kind_by_id = _derive_v4_task_kinds(submit_semantics, num_cores)
-    exclusive_phases = _exclusive_phases(trace_schema_version)
+    exclusive_phases = _exclusive_phases(
+        trace_schema_version, tensormap_mode
+    )
     submit_partition_names = _submit_partition_metrics(trace_schema_version)
     role_metric_names = _role_metrics(trace_schema_version)
     children_by_submit = _associate_exclusive_children(
@@ -877,6 +936,7 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
                 core_id,
                 core_types[core_id],
                 trace_schema_version,
+                tensormap_mode,
                 submits_by_lane[(core_id, lane)],
                 children_by_submit,
                 kernels_by_efdrain,
@@ -1082,6 +1142,7 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
 
     semantics: dict[str, Any] = {
         "cycle_arithmetic": "raw_integer_cycles",
+        "tensormap_mode": tensormap_mode,
         "exclusive_submit_children": list(exclusive_phases),
         "submit_residual": (
             "Submit minus the union of exclusive children; exactly equals "
@@ -1130,6 +1191,7 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
         "input": str(input_path),
         "capture": {
             "trace_schema_version": trace_schema_version,
+            "tensormap_mode": tensormap_mode,
             "clock_freq_hz": frequency_hz,
             "core_count": num_cores,
             "task_count_per_core": len(task_ids),

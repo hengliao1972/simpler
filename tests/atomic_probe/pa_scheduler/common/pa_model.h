@@ -1161,7 +1161,9 @@ struct alignas(64) WorkerResult {
     uint64_t shared_symbol_inout_commits;
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
     // split 协议诊断独占一条 cache line。普通 CPU/AscendC 与局部 PMU
-    // 构建不带这些字段，不改变它们的 WorkerResult ABI。
+    // 构建不带这些字段，不改变它们的 WorkerResult ABI。shared 下
+    // finish_calls 只统计跨 TU 的 winner Finish；task_id_sum 则由 caller
+    // 统计完整逻辑 replay，二者有意采用不同粒度。
     uint64_t compete_first_split_caller_state_address;
     uint64_t compete_first_split_finish_state_address;
     uint64_t compete_first_split_finish_calls;

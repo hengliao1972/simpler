@@ -742,7 +742,7 @@ def _validate_submit_pmu_task_contract(
 def _expected_submit_pmu_phase_calls(
     phase_name: str, batches: int, tasks_per_worker: int | None = None
 ) -> int:
-    """running phase 覆盖每核每次 Submit。"""
+    """重建 private 或 shared 全员阶段的逐核调用数。"""
 
     if phase_name == "none":
         return 0
@@ -781,7 +781,7 @@ def _validate_submit_pmu_record(
         (phase_status & phase_status_required) == phase_status_required,
         f"{prefix} phase_status is incomplete",
     )
-    expected_calls = _expected_submit_pmu_phase_calls(
+    reconstructed_calls = _expected_submit_pmu_phase_calls(
         phase_name, batches, tasks_per_worker
     )
     if schema_version == 6:
@@ -789,10 +789,25 @@ def _validate_submit_pmu_record(
             "phase_expected_calls" in record,
             f"{prefix}.phase_expected_calls is required by schema-v6",
         )
-    if "phase_expected_calls" in record:
+    reported_expected_calls = (
+        _integer(record.get("phase_expected_calls"), f"{prefix}.phase_expected_calls")
+        if "phase_expected_calls" in record
+        else reconstructed_calls
+    )
+    shared_winner_only_phase = (
+        schema_version == 6 and phase_name in ("materialize", "register")
+    )
+    if shared_winner_only_phase:
+        assert tasks_per_worker is not None
         _require(
-            _integer(record.get("phase_expected_calls"), f"{prefix}.phase_expected_calls")
-            == expected_calls,
+            0 <= reported_expected_calls <= tasks_per_worker,
+            f"{prefix}.phase_expected_calls exceeds the shared replay task count",
+        )
+        expected_calls = reported_expected_calls
+    else:
+        expected_calls = reconstructed_calls
+        _require(
+            reported_expected_calls == expected_calls,
             f"{prefix}.phase_expected_calls disagrees with the phase contract",
         )
 
@@ -1216,6 +1231,22 @@ def load_capture(path: Path) -> Capture:
             for item in phase_partition_evidence
         )
         expected_phase_calls = sum(item.expected_calls for item in phase_partition_evidence)
+        if schema_version == 6:
+            assert tasks_per_worker is not None and phase_name is not None
+            expected_shared_total = (
+                tasks_per_worker
+                if phase_name in ("materialize", "register")
+                else (
+                    0
+                    if phase_name == "none"
+                    else tasks_per_worker * A5_WORKERS
+                )
+            )
+            _require(
+                expected_phase_calls == expected_shared_total,
+                f"{path}: shared phase_expected_calls do not close to the "
+                "unique-winner/global-replay contract",
+            )
         _require(
             shadow_bounded_records == A5_WORKERS,
             f"{path}: not all shadow partitions are bounded by primary",

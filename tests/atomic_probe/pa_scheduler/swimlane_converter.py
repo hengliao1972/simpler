@@ -286,6 +286,17 @@ def _load_and_validate(
         raise ValueError(
             "metadata.trace_schema_version=4 requires l2_swimlane_level=1 or 4"
         )
+    tensormap_mode = metadata.get("tensormap_mode")
+    if trace_schema_version == 4:
+        if tensormap_mode not in ("private", "shared"):
+            raise ValueError(
+                "metadata.tensormap_mode must be private or shared for "
+                "trace_schema_version=4"
+            )
+    elif tensormap_mode is not None:
+        raise ValueError(
+            "metadata.tensormap_mode is only valid for trace_schema_version=4"
+        )
     num_cores = _integer(metadata.get("num_cores"), "metadata.num_cores")
     if num_cores <= 0:
         raise ValueError("metadata.num_cores must be positive")
@@ -533,6 +544,10 @@ def _load_and_validate(
                     clock_state["plain"] = int(clock_state["plain"]) + 1
         if trace_schema_version == 4:
             task_key = (core_id, task_id)
+            if tensormap_mode == "shared" and phase == "PrepareMap":
+                raise ValueError(
+                    f"fdwic_events[{index}] shared schema-v4 must not contain PrepareMap"
+                )
             if phase in ("OrchestrationReplay", "FinalDrain"):
                 if task_id != -1 or function_id != -1 or flags != 0 or auxiliary != 0:
                     raise ValueError(

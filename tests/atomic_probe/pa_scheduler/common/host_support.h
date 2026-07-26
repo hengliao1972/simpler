@@ -1127,14 +1127,16 @@ inline bool ClockRecordSchemaValid(const TraceRecord &record) {
            record.function_id == -1 && record.auxiliary == 0;
 }
 
-// shared PA Case1 不再执行 ordinary-region PrepareMap，但为保持现有 raw
-// schema 仍写一条零时长 marker。这里直接在 host 已有 raw 扫描中闭合
-// Claim -> Materialize -> PrepareMap -> Submit 身份、顺序与次数，不增加任何
-// device 记录字段。private 的 PrepareMap 是真实动作，因此编译为无约束
-// validator。
-struct SharedPrepareMapTraceValidator {
+// shared 的真实回放边界是稀疏的：每个逻辑 task 都记录连续的
+// EfDrain -> Claim，并都用 Submit 父区间覆盖本次轻量或完整调用；winner
+// 才继续记录 Materialize、Fanin（非 Alloc）、Register 和
+// WinnerBuild/AllocComplete 子区间。
+// PrepareMap 属于 private TensorMap，不得以零时长 marker 混入 shared raw。
+// 这里复用现有字段逐核闭合身份、顺序、次数和相邻时间边界，不扩张
+// device 记录。private 编译仍保持无约束，避免改变既有行为。
+struct SharedSparseTraceValidator {
 #if PTO_FDWIC_SHARED_MAP
-    explicit SharedPrepareMapTraceValidator(
+    explicit SharedSparseTraceValidator(
         const SharedHostTaskPlan *plan = nullptr
     ) : plan_(plan) {}
 #endif
@@ -1142,67 +1144,121 @@ struct SharedPrepareMapTraceValidator {
     bool Observe(const TraceRecord &record) {
 #if PTO_FDWIC_SHARED_MAP
         const auto phase = static_cast<TracePhase>(record.phase);
-        if (phase == TracePhase::Claim) {
-            if (submit_pending_ ||
+        if (phase == TracePhase::PrepareMap) {
+            return false;
+        }
+        if (phase == TracePhase::EfDrain) {
+            if (state_ != State::AwaitEfDrain ||
                 record.task_id != next_task_id_ ||
-                (plan_ != nullptr &&
-                 plan_->TaskAt(
-                     static_cast<uint32_t>(record.task_id)
-                 ) == nullptr)) {
+                record.function_id != -1 || record.flags != 0 ||
+                record.auxiliary != 0 ||
+                record.end_cycle < record.start_cycle) {
                 return false;
             }
-            submit_pending_ = true;
-            materialize_seen_ = false;
-            marker_seen_ = false;
+            const SharedHostPlannedTask *task = PlannedTask(record.task_id);
+            if (task == nullptr) {
+                return false;
+            }
             task_id_ = record.task_id;
-            function_id_ = record.function_id;
-        } else if (phase == TracePhase::Materialize) {
-            if (!submit_pending_ || materialize_seen_ || marker_seen_ ||
-                record.task_id != task_id_ ||
-                record.function_id != function_id_) {
+            kind_ = task->kind;
+            efdrain_begin_ = record.start_cycle;
+            previous_end_ = record.end_cycle;
+            state_ = State::AwaitClaim;
+            ++efdrain_count_;
+        } else if (phase == TracePhase::Claim) {
+            if (state_ != State::AwaitClaim ||
+                !SameTask(record) ||
+                record.start_cycle != previous_end_ ||
+                record.end_cycle < record.start_cycle ||
+                (record.flags & ~(kClaimWon | kClaimAttempted)) != 0 ||
+                ((record.flags & kClaimWon) != 0 &&
+                 (record.flags & kClaimAttempted) == 0) ||
+                record.auxiliary !=
+                    (kind_ == TaskKind::Alloc ? 1U : 0U)) {
                 return false;
             }
-            materialize_seen_ = true;
-            materialize_end_ = record.end_cycle;
-            ++materialize_count_;
-        } else if (phase == TracePhase::PrepareMap) {
-            if (!submit_pending_ || !materialize_seen_ || marker_seen_ ||
-                record.task_id != task_id_ ||
-                record.function_id != function_id_ ||
-                record.start_cycle != materialize_end_ ||
-                record.end_cycle != materialize_end_ ||
-                record.flags != 0 || record.task_id < 0) {
+            winner_ = (record.flags & kClaimWon) != 0;
+            function_id_ = winner_ ? ExpectedFunctionId(kind_) : -1;
+            if (record.function_id != function_id_) {
                 return false;
             }
-            const SharedHostPlannedTask *task =
-                plan_ == nullptr
-                    ? nullptr
-                    : plan_->TaskAt(
-                          static_cast<uint32_t>(
-                              record.task_id
-                          )
-                      );
-            // nullptr 只供隔离 validator 单测保留原固定图输入；真实
-            // export/analyze 总是传入由最终 context_lens 建立的 plan。
-            const bool is_alloc =
-                task == nullptr
-                    ? static_cast<uint32_t>(record.task_id) %
-                          kTasksPerBatch ==
-                          static_cast<uint32_t>(TaskKind::Alloc)
-                    : task->kind == TaskKind::Alloc;
-            if (record.auxiliary != (is_alloc ? 1U : 0U)) {
-                return false;
-            }
-            marker_seen_ = true;
-            ++marker_count_;
-        } else if (phase == TracePhase::Submit) {
-            if (!submit_pending_ || !materialize_seen_ || !marker_seen_ ||
-                record.task_id != task_id_ ||
-                record.function_id != function_id_) {
-                return false;
-            }
-            submit_pending_ = false;
+            previous_end_ = record.end_cycle;
+            ++claim_count_;
             ++next_task_id_;
+            if (winner_) {
+                ++winner_count_;
+                state_ = State::AwaitMaterialize;
+            } else {
+                state_ = State::AwaitLoserSubmit;
+            }
+        } else if (phase == TracePhase::Materialize) {
+            if (state_ != State::AwaitMaterialize ||
+                !SameWinnerTask(record) || record.flags != 0 ||
+                record.auxiliary !=
+                    (kind_ == TaskKind::Alloc ? 1U : 0U) ||
+                record.start_cycle < previous_end_ ||
+                record.end_cycle < record.start_cycle) {
+                return false;
+            }
+            previous_end_ = record.end_cycle;
+            state_ = kind_ == TaskKind::Alloc
+                ? State::AwaitRegister
+                : State::AwaitFanin;
+            ++materialize_count_;
+        } else if (phase == TracePhase::Fanin) {
+            if (state_ != State::AwaitFanin ||
+                !SameWinnerTask(record) || record.flags != 0 ||
+                record.start_cycle != previous_end_ ||
+                record.end_cycle < record.start_cycle) {
+                return false;
+            }
+            previous_end_ = record.end_cycle;
+            state_ = State::AwaitRegister;
+            ++fanin_count_;
+        } else if (phase == TracePhase::Register) {
+            if (state_ != State::AwaitRegister ||
+                !SameWinnerTask(record) || record.flags != 0 ||
+                record.auxiliary !=
+                    (kind_ == TaskKind::Alloc ? 0U : 1U) ||
+                record.start_cycle != previous_end_ ||
+                record.end_cycle < record.start_cycle) {
+                return false;
+            }
+            previous_end_ = record.end_cycle;
+            state_ = State::AwaitWinnerTail;
+            ++register_count_;
+        } else if (phase == TracePhase::WinnerBuild ||
+                   phase == TracePhase::AllocComplete) {
+            const TracePhase expected =
+                kind_ == TaskKind::Alloc
+                    ? TracePhase::AllocComplete
+                    : TracePhase::WinnerBuild;
+            if (state_ != State::AwaitWinnerTail ||
+                phase != expected || !SameWinnerTask(record) ||
+                record.flags != 0 || record.auxiliary != 0 ||
+                record.start_cycle != previous_end_ ||
+                record.end_cycle < record.start_cycle) {
+                return false;
+            }
+            previous_end_ = record.end_cycle;
+            state_ = State::AwaitWinnerSubmit;
+            ++winner_tail_count_;
+        } else if (phase == TracePhase::Submit) {
+            const bool winner_submit =
+                state_ == State::AwaitWinnerSubmit && winner_;
+            const bool loser_submit =
+                state_ == State::AwaitLoserSubmit && !winner_;
+            if ((!winner_submit && !loser_submit) ||
+                !SameTask(record) ||
+                record.function_id != function_id_ ||
+                record.flags != (winner_ ? kClaimWon : 0U) ||
+                record.auxiliary !=
+                    (kind_ == TaskKind::Alloc ? 1U : 0U) ||
+                record.start_cycle != efdrain_begin_ ||
+                record.end_cycle < previous_end_) {
+                return false;
+            }
+            state_ = State::AwaitEfDrain;
             ++submit_count_;
         }
 #else
@@ -1213,22 +1269,45 @@ struct SharedPrepareMapTraceValidator {
 
     bool Closed() const {
 #if PTO_FDWIC_SHARED_MAP
-        return !submit_pending_ &&
-               materialize_count_ == marker_count_ &&
-               marker_count_ == submit_count_ &&
+        return state_ == State::AwaitEfDrain &&
+               efdrain_count_ == claim_count_ &&
+               materialize_count_ == winner_count_ &&
+               register_count_ == winner_count_ &&
+               winner_tail_count_ == winner_count_ &&
+               submit_count_ == claim_count_ &&
                (plan_ == nullptr ||
-                submit_count_ == plan_->total_tasks);
+                claim_count_ == plan_->total_tasks);
 #else
         return true;
 #endif
+    }
+
+    uint32_t EfDrainCount() const {
+        return efdrain_count_;
+    }
+
+    uint32_t ClaimCount() const {
+        return claim_count_;
+    }
+
+    uint32_t WinnerCount() const {
+        return winner_count_;
     }
 
     uint32_t MaterializeCount() const {
         return materialize_count_;
     }
 
-    uint32_t MarkerCount() const {
-        return marker_count_;
+    uint32_t FaninCount() const {
+        return fanin_count_;
+    }
+
+    uint32_t RegisterCount() const {
+        return register_count_;
+    }
+
+    uint32_t WinnerTailCount() const {
+        return winner_tail_count_;
     }
 
     uint32_t SubmitCount() const {
@@ -1237,17 +1316,66 @@ struct SharedPrepareMapTraceValidator {
 
 private:
 #if PTO_FDWIC_SHARED_MAP
+    enum class State {
+        AwaitEfDrain,
+        AwaitClaim,
+        AwaitMaterialize,
+        AwaitFanin,
+        AwaitRegister,
+        AwaitWinnerTail,
+        AwaitWinnerSubmit,
+        AwaitLoserSubmit,
+    };
+
+    const SharedHostPlannedTask *PlannedTask(int32_t task_id) {
+        if (task_id < 0) {
+            return nullptr;
+        }
+        if (plan_ != nullptr) {
+            return plan_->TaskAt(static_cast<uint32_t>(task_id));
+        }
+        fallback_task_.task_id = static_cast<uint32_t>(task_id);
+        fallback_task_.kind = static_cast<TaskKind>(
+            static_cast<uint32_t>(task_id) % kTasksPerBatch
+        );
+        return &fallback_task_;
+    }
+
+    static int32_t ExpectedFunctionId(TaskKind kind) {
+        return kind == TaskKind::Alloc
+            ? -1
+            : static_cast<int32_t>(
+                  static_cast<uint32_t>(kind) - 1U
+              );
+    }
+
+    bool SameTask(const TraceRecord &record) const {
+        return record.task_id == task_id_;
+    }
+
+    bool SameWinnerTask(const TraceRecord &record) const {
+        return winner_ && SameTask(record) &&
+               record.function_id == function_id_;
+    }
+
     const SharedHostTaskPlan *plan_;
+    SharedHostPlannedTask fallback_task_{};
+    State state_ = State::AwaitEfDrain;
 #endif
-    bool submit_pending_ = false;
-    bool materialize_seen_ = false;
-    bool marker_seen_ = false;
     int32_t next_task_id_ = 0;
     int32_t task_id_ = -1;
     int32_t function_id_ = -1;
-    uint64_t materialize_end_ = 0;
+    TaskKind kind_ = TaskKind::Count;
+    bool winner_ = false;
+    uint64_t efdrain_begin_ = 0;
+    uint64_t previous_end_ = 0;
+    uint32_t efdrain_count_ = 0;
+    uint32_t claim_count_ = 0;
+    uint32_t winner_count_ = 0;
     uint32_t materialize_count_ = 0;
-    uint32_t marker_count_ = 0;
+    uint32_t fanin_count_ = 0;
+    uint32_t register_count_ = 0;
+    uint32_t winner_tail_count_ = 0;
     uint32_t submit_count_ = 0;
 };
 
@@ -1368,13 +1496,15 @@ inline bool ExportSwimlaneRecords(
     std::fprintf(
         output,
         "{\n\"l2_swimlane_level\":%u,\n"
-        "\"metadata\":{\"clock_freq_hz\":%llu,\"num_cores\":%u,"
+        "\"metadata\":{\"tensormap_mode\":\"%s\","
+        "\"clock_freq_hz\":%llu,\"num_cores\":%u,"
         "\"trace_schema_version\":%u,\"final_barrier\":\"%s\","
         "\"winner_workload\":{\"mode\":\"%s\","
         "\"counts\":{\"qk\":%u,\"sf\":%u,\"pv\":%u,\"up\":%u},"
         "\"unit\":\"%s\",\"input_pattern\":\"%s\","
         "\"engine_mapping\":%s},\"core_types\":[",
         atomic_trace_enabled ? 4U : 1U,
+        PTO_FDWIC_SHARED_MAP ? "shared" : "private",
         static_cast<unsigned long long>(header.frequency_hz), kWorkers, 4U,
         FinalBarrierShapeName(final_barrier_shape),
         workload_mode == WinnerWorkloadMode::RealCompute ? "real-compute" : "scalar-nop",
@@ -1447,11 +1577,11 @@ inline bool ExportSwimlaneRecords(
         bool direct_result_used_return_ready = false;
         bool direct_result_used_source_issue = false;
 #if PTO_FDWIC_SHARED_MAP
-        SharedPrepareMapTraceValidator prepare_map_validator(
+        SharedSparseTraceValidator sparse_trace_validator(
             &shared_plan
         );
 #else
-        SharedPrepareMapTraceValidator prepare_map_validator;
+        SharedSparseTraceValidator sparse_trace_validator;
 #endif
         for (uint32_t index = 0; index < available; ++index) {
             const TraceRecord &record = scratch[index];
@@ -1472,7 +1602,7 @@ inline bool ExportSwimlaneRecords(
                                 record.block_id == core.block_id &&
                                 record.core_idx == core.core_idx && atomic_schema_valid &&
                                 claim_schema_valid && clock_schema_valid;
-            if (record_valid && !prepare_map_validator.Observe(record)) {
+            if (record_valid && !sparse_trace_validator.Observe(record)) {
                 record_valid = false;
             }
             if (!record_valid) {
@@ -1536,23 +1666,29 @@ inline bool ExportSwimlaneRecords(
             core_closed = core_atomic_records == 0 && core_atomic_calls == 0 && core_poll_calls == 0 &&
                           core_poll_batch_records == 0 && core_clock_records == 0;
         }
-        core_closed &= prepare_map_validator.Closed();
+        core_closed &= sparse_trace_validator.Closed();
         if (!core_closed) {
             std::fprintf(
                 stderr,
                 "swimlane closure failed on worker=%u: physical_atomic=%u logical_atomic=%llu/%u "
                 "poll_calls=%llu/%u poll_batches=%u/%u clock=%u plain=%u dependency=%u "
                 "dependency_applied=%s direct_ready=%s direct_issue=%s "
-                "materializes=%u prepare_map_markers=%u submits=%u\n",
+                "efdrains=%u claims=%u winners=%u materializes=%u fanins=%u "
+                "registers=%u tails=%u submits=%u\n",
                 worker, core_atomic_records, static_cast<unsigned long long>(core_atomic_calls),
                 core.atomic_calls, static_cast<unsigned long long>(core_poll_calls), core.poll_calls,
                 core_poll_batch_records, core.poll_batch_records, core_clock_records,
                 core_plain_clock_records, core_dependency_clock_records,
                 dependency_applied ? "yes" : "no", direct_result_used_return_ready ? "yes" : "no",
                 direct_result_used_source_issue ? "yes" : "no",
-                prepare_map_validator.MaterializeCount(),
-                prepare_map_validator.MarkerCount(),
-                prepare_map_validator.SubmitCount()
+                sparse_trace_validator.EfDrainCount(),
+                sparse_trace_validator.ClaimCount(),
+                sparse_trace_validator.WinnerCount(),
+                sparse_trace_validator.MaterializeCount(),
+                sparse_trace_validator.FaninCount(),
+                sparse_trace_validator.RegisterCount(),
+                sparse_trace_validator.WinnerTailCount(),
+                sparse_trace_validator.SubmitCount()
             );
             success = false;
             break;
@@ -1655,11 +1791,11 @@ inline bool AnalyzeSwimlaneRecords(
     std::vector<TraceRecord> scratch(kTraceRecordsPerCore);
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
 #if PTO_FDWIC_SHARED_MAP
-        SharedPrepareMapTraceValidator prepare_map_validator(
+        SharedSparseTraceValidator sparse_trace_validator(
             &shared_plan
         );
 #else
-        SharedPrepareMapTraceValidator prepare_map_validator;
+        SharedSparseTraceValidator sparse_trace_validator;
 #endif
         const uint32_t available = header.cores[worker].count;
         const uint32_t count = std::min(available, header.records_per_core);
@@ -1673,10 +1809,10 @@ inline bool AnalyzeSwimlaneRecords(
                 // 分析器面对单条坏记录选择跳过；严格导出路径会直接拒绝，二者服务于不同诊断目的。
                 continue;
             }
-            if (!prepare_map_validator.Observe(record)) {
+            if (!sparse_trace_validator.Observe(record)) {
                 std::fprintf(
                     stderr,
-                    "swimlane analysis rejected shared PrepareMap flow at "
+                    "swimlane analysis rejected shared sparse flow at "
                     "worker=%u index=%u task=%d function=%d start=%llu end=%llu "
                     "flags=0x%08x aux=%u\n",
                     worker, index, record.task_id, record.function_id,
@@ -1744,14 +1880,20 @@ inline bool AnalyzeSwimlaneRecords(
                 }
             }
         }
-        if (!prepare_map_validator.Closed()) {
+        if (!sparse_trace_validator.Closed()) {
             std::fprintf(
                 stderr,
-                "swimlane analysis rejected unclosed shared PrepareMap flow on "
-                "worker=%u: materializes=%u markers=%u submits=%u\n",
-                worker, prepare_map_validator.MaterializeCount(),
-                prepare_map_validator.MarkerCount(),
-                prepare_map_validator.SubmitCount()
+                "swimlane analysis rejected an unclosed shared sparse flow on "
+                "worker=%u: efdrains=%u claims=%u winners=%u "
+                "materializes=%u fanins=%u registers=%u tails=%u submits=%u\n",
+                worker, sparse_trace_validator.EfDrainCount(),
+                sparse_trace_validator.ClaimCount(),
+                sparse_trace_validator.WinnerCount(),
+                sparse_trace_validator.MaterializeCount(),
+                sparse_trace_validator.FaninCount(),
+                sparse_trace_validator.RegisterCount(),
+                sparse_trace_validator.WinnerTailCount(),
+                sparse_trace_validator.SubmitCount()
             );
             return false;
         }
@@ -3042,11 +3184,26 @@ inline Metrics Validate(
         compete_first_split_runtime_oracle_ok &= result.worker_id == index;
         compete_first_split_runtime_oracle_ok &=
             result.compete_first_split_caller_state_address != 0;
+#if PTO_FDWIC_SHARED_MAP
+        // shared loser 已在 caller 轻路径返回，只有本核 Claim winner 才跨
+        // TU 进入完整 finish。因此 finish_calls 精确等于本核 wins；
+        // 没有 winner 的核从未绑定 finish TU，地址保持 0。task_id_sum
+        // 仍由 caller 覆盖完整 0..N-1 回放序列。
+        compete_first_split_runtime_oracle_ok &=
+            result.compete_first_split_finish_state_address ==
+                (result.claim_wins == 0
+                     ? 0
+                     : result.compete_first_split_caller_state_address);
+        compete_first_split_runtime_oracle_ok &=
+            result.compete_first_split_finish_calls ==
+                result.claim_wins;
+#else
         compete_first_split_runtime_oracle_ok &=
             result.compete_first_split_finish_state_address ==
                 result.compete_first_split_caller_state_address;
         compete_first_split_runtime_oracle_ok &=
             result.compete_first_split_finish_calls == task_count;
+#endif
         compete_first_split_runtime_oracle_ok &=
             result.compete_first_split_protocol_errors == 0;
         compete_first_split_runtime_oracle_ok &=
@@ -3757,7 +3914,13 @@ inline Metrics Validate(
                                       core.poll_batch_records == 0;
                 }
                 const uint64_t worker_expected =
+#if PTO_FDWIC_SHARED_MAP
+                    // 每个逻辑 task 都有 EfDrain+Claim+Submit；winner 追加
+                    // Materialize/Register/tail，非 Alloc 再追加 Fanin。
+                    3 * result.submits + 4 * result.claim_wins - result.wins[0] +
+#else
                     6 * result.submits + 2 * result.claim_wins - result.wins[0] +
+#endif
                     2 * worker_kernels + result.wait_events[0] + result.wait_events[1] + 2 +
                     (((state.config.trace_enabled & kTraceAtomicsEnabled) != 0)
                          ? worker_physical_atomic + 2
@@ -3766,12 +3929,15 @@ inline Metrics Validate(
             }
         }
 #if PTO_FDWIC_SHARED_MAP
-        const uint64_t expected_winner_trace_records =
-            static_cast<uint64_t>(batches) +
-            static_cast<uint64_t>(group_count) * 16;
+        // 除三条逐 task 前端记录外：每 batch 的 Alloc winner 有 3 条，
+        // 每 group 的四个普通 winner 子区间有 16 条、四个实际 kernel
+        // 的 Kernel/Commit 有 8 条，合计 24 条。
+        const uint64_t expected_shared_extra_records =
+            3ULL * static_cast<uint64_t>(batches) +
+            24ULL * static_cast<uint64_t>(group_count);
         const uint64_t expected_trace_records =
-            6ULL * expected_submits +
-            expected_winner_trace_records +
+            3ULL * expected_submits +
+            expected_shared_extra_records +
             trace_wait_records + 2 * kWorkers +
             (((state.config.trace_enabled & kTraceAtomicsEnabled) != 0)
                  ? physical_atomic_records + 2 * kWorkers
@@ -3784,12 +3950,12 @@ inline Metrics Validate(
                  ? physical_atomic_records + 2 * kWorkers
                  : 0);
 #endif
-        // 每个 Submit 固定六条记录；shared 的 PrepareMap 是零时长结构
-        // marker，不代表 region 业务。每个 Alloc winner 另有一条，每个
-        // 四 task group 另有十六条 winner/Fanin/Kernel/Commit 记录。
-        // loser 不再写额外零时长
-        // winner marker；两个父 span 再各核固定增加 2 条；
-        // RingBp 等真实等待按运行时次数额外加入。
+        // shared 每个逻辑 task 固定 EfDrain+Claim+Submit 三条，loser 没有
+        // 业务子区间；Alloc winner 追加 Materialize/Register/AllocComplete
+        // 三条，每个普通 winner追加 Materialize/Fanin/Register/WinnerBuild
+        // 四条；每组四个实际 kernel 再各有 Kernel+Commit 两条。private
+        // 仍保持既有固定六条 Submit 记录。两个父 span 每核固定增加 2 条，
+        // 真实等待按运行时次数加入。
         Expect(trace_shape_ok, "swimlane header and per-worker capacities are valid", &metrics);
         Expect(trace_dropped == 0, "swimlane records fit without drops", &metrics);
         Expect(trace_records == expected_trace_records, "swimlane record count matches PA phase flow", &metrics);

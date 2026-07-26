@@ -122,18 +122,17 @@ else
     echo "[TEST] isolated shared ordinary-region ring self-test"
     "$BUILD_DIR/test_shared_tensor_map_ring"
 
-    # PA Case1 为兼容既有 schema 保留零时长 PrepareMap marker。该 host
-    # 定向用例锁定 Claim/Materialize/marker/Submit 身份、逐 task 顺序、
-    # Materialize.end 锚点、flags/aux 与唯一性。
-    echo "[BUILD] shared PrepareMap raw-marker self-test"
+    # shared raw 只保留真实稀疏边界：所有 task 有连续 EfDrain+Claim
+    # 和 Submit 父区间，loser 没有业务子区间；PrepareMap 必须彻底缺席。
+    echo "[BUILD] shared sparse raw-trace self-test"
     "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \
         -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/test/test_shared_prepare_map_trace.cpp" \
-        -o "$BUILD_DIR/test_shared_prepare_map_trace"
+        "$ROOT_DIR/test/test_shared_sparse_trace.cpp" \
+        -o "$BUILD_DIR/test_shared_sparse_trace"
 
-    echo "[TEST] shared PrepareMap raw-marker self-test"
-    "$BUILD_DIR/test_shared_prepare_map_trace"
+    echo "[TEST] shared sparse raw-trace self-test"
+    "$BUILD_DIR/test_shared_sparse_trace"
 
     # fresh-output symbol 与 region ring 是两条独立协议。该用例单独锁定
     # descriptor 最终封口、只读 fanin、ready descriptor 直写 slot、

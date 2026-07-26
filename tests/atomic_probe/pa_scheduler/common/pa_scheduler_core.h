@@ -42,7 +42,8 @@ struct LocalStats {
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
 // runtime-entry TU 按核型各自拥有一份 external [[block_local]] 实例。
 // orchestration caller 与 noinline finish 只交换固定 ticket/TaskArgs，Submit
-// 内部的 context、统计与状态指针全部留在这份每核状态里。
+// 内部的 context、统计与状态指针全部留在这份每核状态里。shared loser
+// 不跨 TU：finish_calls 是 winner 数，task_id_sum 仍证明全量 caller replay。
 struct alignas(64) CompeteFirstSplitRuntimeState {
     PA_GM SchedulerState *scheduler;
     PA_GM WorkerState *worker;
@@ -1706,6 +1707,22 @@ PA_DEVICE bool ArmSharedSplitTicket(
     runtime.reserved = SharedSplitTicketBinding(ticket);
     return true;
 }
+
+PA_DEVICE bool RecordSharedSplitReplayTask(
+    CompeteFirstSplitRuntimeState &runtime,
+    const CallbackSubmitTicket &ticket
+) {
+    // task_id_sum 描述 caller 确实按 0..N-1 重放了完整前端序列，
+    // 与只有 winner 才跨 TU 的 finish_calls 是两条不同的协议证据。
+    // loser 不再 Arm ticket，因此这一步必须留在 caller。
+    if (runtime.reserved != 0 ||
+        static_cast<uint64_t>(ticket.task_id) !=
+            runtime.stats.result.submits) {
+        return false;
+    }
+    runtime.task_id_sum += ticket.task_id;
+    return true;
+}
 #endif
 
 PA_DEVICE void BeginCallbackSubmit(PA_GM WorkerState &worker, SubmitContext &context) {
@@ -1883,6 +1900,103 @@ PA_DEVICE bool BuildCallbackSubmitArgs(
 
 #undef PA_CALLBACK_LAMBDA_DEVICE
 
+#if PTO_FDWIC_SHARED_MAP
+template <typename Ops, bool Profile>
+PA_DEVICE bool CloseSharedCallbackSubmit(
+    PA_GM SchedulerState *state, LocalStats &stats,
+    const CallbackSubmitTicket &ticket,
+    const SharedPaTaskMeta &shared_task_meta
+) {
+    const uint32_t task_id = ticket.task_id;
+    const int32_t function_id =
+        static_cast<int32_t>(ticket.function_id);
+    const bool winner = ticket.won != 0;
+    ++stats.result.submits;
+
+    // shared 的总 task 数取决于每批 context_len。末次身份由调用者在
+    // 既有 ticket bit 中显式携带，避免 96 个 worker 为了一个计时边界
+    // 额外预扫整份 context_lens。
+    const bool is_last_submit = shared_task_meta.is_last_submit;
+#if PA_BUILD_PERF_CLOCK
+    // 与真实 FDWIC perf-clock 相同：只有末个逻辑 Submit 完成后才读取
+    // 一次专用性能边界；loser 也必须闭合自己的全量重放窗口。
+    const uint64_t submit_end =
+        is_last_submit ? Ops::PerfClockNow() : 0;
+#elif PA_BUILD_SUBMIT_PMU
+    const uint64_t submit_end = is_last_submit ? Ops::Now() : 0;
+#else
+    // 参考前端的 rt_submit_loser 仍是一次真实轻量 Submit；保留既有父
+    // 区间用于覆盖稳定符号返回及 non-final UP writer-ready 等待，但
+    // loser 不再写任何 winner-only child。
+    const uint64_t submit_end =
+        TraceTimestamp<Ops>(stats.trace, stats.result);
+#endif
+    WriteTrace<Profile>(
+        stats.trace, stats.result, static_cast<int32_t>(task_id),
+        function_id, TracePhase::Submit, ProfilePhase::Submit,
+        ticket.submit_begin, submit_end, winner ? 1U : 0U,
+        shared_task_meta.kind == TaskKind::Alloc ? 1U : 0U
+    );
+    if (!is_last_submit) {
+        return true;
+    }
+    if (stats.declared_task_count != 0) {
+        SetFatal<Ops>(
+            state, stats, static_cast<int32_t>(task_id)
+        );
+        return false;
+    }
+    stats.declared_task_count = task_id + 1U;
+    stats.result.submit_end = submit_end;
+    return true;
+}
+
+template <typename Ops, bool Profile>
+PA_DEVICE bool FinishSharedLoserSubmit(
+    PA_GM SchedulerState *state, SubmitContext &context,
+    LocalStats &stats, const CallbackSubmitTicket &ticket
+) {
+    SharedPaTaskMeta shared_task_meta{};
+    const uint32_t task_id = ticket.task_id;
+    const bool valid =
+        ticket.won == 0 &&
+        DecodeSharedPaTaskMeta(
+            ticket.reserved, task_id, shared_task_meta
+        ) &&
+        SharedPaFunctionIdMatches(
+            shared_task_meta.kind, false,
+            static_cast<int32_t>(ticket.function_id)
+        ) &&
+        context.task_id == static_cast<int32_t>(task_id) &&
+        !context.won &&
+        context.kernel_id ==
+            static_cast<int32_t>(ticket.function_id) &&
+        context.shared_result.TaskId() ==
+            static_cast<int32_t>(task_id) &&
+        context.shared_result.Size() ==
+            FrontendTaskOutputCount(shared_task_meta.kind);
+    if (!valid) {
+        SetFatal<Ops>(
+            state, stats, static_cast<int32_t>(task_id)
+        );
+        return false;
+    }
+
+    // non-final UP 的 loser 只保留这一条业务必需的等待：winner 先登记
+    // INOUT writer intent，loser 才能返回前端并构造下一组。它不读取
+    // TaskArgs，也不进入 Materialize/Fanin/Register/BuildWinner。
+    if (shared_task_meta.has_following_group &&
+        !WaitForSharedWriterReady<Ops>(
+            state, static_cast<int32_t>(task_id), stats
+        )) {
+        return false;
+    }
+    return CloseSharedCallbackSubmit<Ops, Profile>(
+        state, stats, ticket, shared_task_meta
+    );
+}
+#endif
+
 template <typename Ops, bool Profile, typename PmuContext>
 PA_DEVICE bool FinishCallbackSubmitBody(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_count,
@@ -1909,45 +2023,38 @@ PA_DEVICE bool FinishCallbackSubmitBody(
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
+    // shared loser 必须在 caller 的轻路径返回；跨 TU / 完整 Finish 只允许
+    // winner 进入。这样 Materialize、Fanin、Register 与 Build 的边界才与
+    // 实际 shared TensorMap 协议一致。
+    if (!winner) {
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
 #endif
 
 #if PTO_FDWIC_SHARED_MAP
     // callback 已经返回；只有 Claim winner 才把 CreateInfo 物化为 descriptor
-    // 并预留 shared heap。所有 replay actor 都仍进入 split finish、闭合固定
-    // span 和 Submit 计数，但不会推进 heap、写 payload 或读取 TaskArgs。
+    // 并预留 shared heap。loser 已在 caller 轻路径返回，这里只处理 winner。
     // PA Case1 的普通 region 恒为空，winner 不再等待全局 exact turn；
     // 跨 task 顺序只由实际消费的 (producer,slot).published 建立。
     // 删除 exact-turn 不能连带删除它成功出口的终止态检查：若其他核已经
     // 广播 fatal，本 winner 不得继续预留 heap、构建 slot 或发布 symbol。
     // 这里直接使用 Ops，不扩张 atomic 泳道记录，也不恢复任何全局前沿。
-    if (__builtin_expect(winner, 0) &&
-        Ops::Load(&state->fatal.value) != 0) {
-        return false;
-    }
-    // non-final UP 的每个 loser 都必须等 winner 完成 writer intent 登记，
-    // 才能返回 orchestration 并构造下一组。这里只等待依赖元数据可见，
-    // task 的 kernel 完成仍由后继 slot fanin 的 completion flag 保证。
-    if (!winner && shared_task_meta.has_following_group &&
-        !WaitForSharedWriterReady<Ops>(
-            state, static_cast<int32_t>(task_id), stats
-        )) {
+    if (Ops::Load(&state->fatal.value) != 0) {
         return false;
     }
     const uint64_t materialize_begin =
         TraceTimestamp<Ops>(stats.trace, stats.result);
     BeginSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
-    bool materialized = true;
-    if (__builtin_expect(winner, 0)) {
-        materialized = MaterializeTask<Ops, true>(
-            worker, task_id, args, context, state->shared_map,
-            state->heap_base, state->heap_size,
-            kind, shared_task_meta.batch_start,
-            shared_task_meta.group_index,
-            &stats.trace, &stats.result
-        );
-        if (materialized) {
-            stats.result.materialized_outputs += context.result.count;
-        }
+    const bool materialized = MaterializeTask<Ops, true>(
+        worker, task_id, args, context, state->shared_map,
+        state->heap_base, state->heap_size,
+        kind, shared_task_meta.batch_start,
+        shared_task_meta.group_index,
+        &stats.trace, &stats.result
+    );
+    if (materialized) {
+        stats.result.materialized_outputs += context.result.count;
     }
     if (!materialized) {
         EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
@@ -1966,15 +2073,8 @@ PA_DEVICE bool FinishCallbackSubmitBody(
         materialize_begin, materialize_end, 0,
         kind == TaskKind::Alloc ? 1U : 0U
     );
-    // 现有泳道 analyzer 要求每个 Submit 都有一条 PrepareMap。shared
-    // Case1 已无对应业务动作，因此复用 materialize_end 写零时长结构
-    // marker：不额外读钟、不触碰 region sidecar；非泳道构建会编译消除。
-    WriteTrace<Profile>(
-        stats.trace, stats.result, static_cast<int32_t>(task_id), function_id,
-        TracePhase::PrepareMap, ProfilePhase::PrepareMap,
-        materialize_end, materialize_end, 0,
-        kind == TaskKind::Alloc ? 1U : 0U
-    );
+    // shared PA Case1 没有 ordinary-region PrepareMap；不再为兼容旧矩形
+    // 泳道写零时长 marker。host/analyzer 直接校验 shared 稀疏真实边界。
 #else
     // private 模式保持 S3.1 的 eager Materialize 与每核 heap 路径不变。
     const uint64_t materialize_begin =
@@ -2020,7 +2120,12 @@ PA_DEVICE bool FinishCallbackSubmitBody(
 #else
         prepare_end;
 #endif
-    if (kind != TaskKind::Alloc && __builtin_expect(winner, 0)) {
+#if PTO_FDWIC_SHARED_MAP
+    if (kind != TaskKind::Alloc) {
+#else
+    if (kind != TaskKind::Alloc &&
+        __builtin_expect(winner, 0)) {
+#endif
         const uint64_t fanin_begin = register_begin;
 #if PTO_FDWIC_SHARED_MAP
         bool lookup_protocol_ok = false;
@@ -2077,13 +2182,11 @@ PA_DEVICE bool FinishCallbackSubmitBody(
 
     BeginSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(pmu_context);
 #if PTO_FDWIC_SHARED_MAP
-    bool registered = true;
-    if (__builtin_expect(winner, 0)) {
-        // 当前 standalone 只模拟 PA Case1：fresh symbol 直接寻址，
-        // output_view 又是 manual_dep，ordinary region 必须严格为空。
-        // 这里只读验证，不构造空 delta，也不触碰 region sequencer。
-        registered = ValidateEmptySharedRegistration(args, context);
-    }
+    // 当前 standalone 只模拟 PA Case1：fresh symbol 直接寻址，
+    // output_view 又是 manual_dep，ordinary region 必须严格为空。
+    // 这里只读验证，不构造空 delta，也不触碰 region sequencer。
+    const bool registered =
+        ValidateEmptySharedRegistration(args, context);
 #else
     const bool registered = RegisterOutputs(context, args, kind != TaskKind::Alloc);
     if (registered && kind != TaskKind::Alloc) {
@@ -2112,8 +2215,7 @@ PA_DEVICE bool FinishCallbackSubmitBody(
     }
 
 #if PTO_FDWIC_SHARED_MAP
-    if (__builtin_expect(winner, 0) &&
-        shared_task_meta.has_following_group) {
+    if (shared_task_meta.has_following_group) {
         // PA 的 non-final UP 固定有 SF/PV/accumulator 三条 fanin。先完成
         // registration，再登记 writer intent并放行 loser；Build 后只做
         // fresh-output 封口，绝不能重复 Collect/Commit。
@@ -2141,7 +2243,11 @@ PA_DEVICE bool FinishCallbackSubmitBody(
     }
 #endif
 
+#if PTO_FDWIC_SHARED_MAP
+    {
+#else
     if (__builtin_expect(winner, 0)) {
+#endif
         const uint64_t winner_build_begin = register_end;
 #if PTO_FDWIC_SHARED_MAP && \
     defined(PA_TEST_SHARED_POST_GATE_BUILD_FAILURE)
@@ -2199,25 +2305,13 @@ PA_DEVICE bool FinishCallbackSubmitBody(
         );
     }
 
-    ++stats.result.submits;
 #if PTO_FDWIC_SHARED_MAP
-    // shared 的总 task 数取决于每批 context_len。末次身份由调用者在
-    // 既有 ticket bit 中显式携带，避免 96 个 worker 为了一个计时边界
-    // 额外预扫整份 context_lens。
-    const bool is_last_submit = shared_task_meta.is_last_submit;
     (void)task_count;
-#if PA_BUILD_PERF_CLOCK
-    // 与真实 FDWIC perf-clock 相同：只有末个 Submit 完成全部尾动作后
-    // 才采一次专用性能边界。协议 watchdog 继续使用 Ops::Now()，两者
-    // 在源码上保持可审计的不同接口。
-    const uint64_t submit_end =
-        is_last_submit ? Ops::PerfClockNow() : 0;
-#elif PA_BUILD_SUBMIT_PMU
-    const uint64_t submit_end = is_last_submit ? Ops::Now() : 0;
+    return CloseSharedCallbackSubmit<Ops, Profile>(
+        state, stats, ticket, shared_task_meta
+    );
 #else
-    const uint64_t submit_end = TraceTimestamp<Ops>(stats.trace, stats.result);
-#endif
-#else
+    ++stats.result.submits;
 #if PA_BUILD_PERF_CLOCK
     // 与真实 FDWIC perf-clock 相同：只有末个 Submit 完成全部尾动作后
     // 才采一次专用性能边界。协议 watchdog 继续使用 Ops::Now()，两者
@@ -2229,27 +2323,14 @@ PA_DEVICE bool FinishCallbackSubmitBody(
 #else
     const uint64_t submit_end = TraceTimestamp<Ops>(stats.trace, stats.result);
 #endif
-#endif
     WriteTrace<Profile>(
         stats.trace, stats.result, static_cast<int32_t>(task_id), function_id,
         TracePhase::Submit, ProfilePhase::Submit,
         ticket.submit_begin, submit_end, winner ? 1U : 0U, kind == TaskKind::Alloc ? 1U : 0U
     );
-#if PTO_FDWIC_SHARED_MAP
-    if (is_last_submit) {
-        if (stats.declared_task_count != 0) {
-            SetFatal<Ops>(
-                state, stats, static_cast<int32_t>(task_id)
-            );
-            return false;
-        }
-        stats.declared_task_count = task_id + 1U;
-        stats.result.submit_end = submit_end;
-    }
-#else
     if (task_id + 1 == task_count) stats.result.submit_end = submit_end;
-#endif
     return true;
+#endif
 }
 
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
@@ -2281,7 +2362,7 @@ PA_DEVICE uint32_t FinishSplitCallbackSubmitFromRuntime(
         runtime.state_cookie == CompeteFirstSplitStateCookie(
             runtime.worker_id, runtime.worker->role
         ) &&
-        expected_ticket_bound &&
+        expected_ticket_bound && ticket->won != 0 &&
         static_cast<uint64_t>(ticket->task_id) ==
             runtime.stats.result.submits;
 #else
@@ -2322,7 +2403,9 @@ PA_DEVICE uint32_t FinishSplitCallbackSubmitFromRuntime(
 #endif
     }
     ++runtime.finish_calls;
+#if !PTO_FDWIC_SHARED_MAP
     if (ticket != nullptr) runtime.task_id_sum += ticket->task_id;
+#endif
     if (!valid) {
         ++runtime.protocol_errors;
         if (runtime.scheduler != nullptr) {
@@ -2480,6 +2563,15 @@ PA_DEVICE bool SubmitCallbackTask(
 #if PTO_FDWIC_SHARED_MAP
     CompeteFirstSplitRuntimeState &split_runtime =
         Ops::CompeteFirstSplitState();
+    if (!RecordSharedSplitReplayTask(split_runtime, ticket)) {
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
+    if (!claim.won) {
+        return FinishSharedLoserSubmit<Ops, Profile>(
+            state, context, stats, ticket
+        );
+    }
     if (!ArmSharedSplitTicket(split_runtime, ticket)) {
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
@@ -2493,6 +2585,13 @@ PA_DEVICE bool SubmitCallbackTask(
     (void)pmu_context;
     return Ops::FinishCompeteFirstCallback(&ticket, &args);
 #else
+#if PTO_FDWIC_SHARED_MAP
+    if (!claim.won) {
+        return FinishSharedLoserSubmit<Ops, Profile>(
+            state, context, stats, ticket
+        );
+    }
+#endif
     return FinishCallbackSubmitBody<Ops, Profile>(
         state, worker, task_count, args, context, stats, pmu_context, ticket
     );
@@ -3116,6 +3215,17 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     // 该 worker 合法地没有 finish 调用，finish TU 地址也尚未回写；不能
     // 把这种零回放收敛误报成 split 状态错配。只要开始过任一 Submit，
     // 仍严格要求 caller/finish 是同一个 TLS runtime。
+#if PTO_FDWIC_SHARED_MAP
+    // shared 的 loser 不跨 TU；某个 worker 即使完整重放了 N 个任务，也
+    // 可能一个都没赢。finish 地址是否出现只取决于本核 winner 数。
+    const bool finish_state_matches =
+        split_runtime.finish_calls == 0
+            ? split_runtime.finish_state_address == 0
+            : split_runtime.finish_state_address ==
+                  split_runtime.caller_state_address;
+    const uint64_t expected_finish_calls =
+        stats.result.claim_wins;
+#else
     const bool finish_state_matches =
         task_count == 0
             ? Ops::Load(&state->fatal.value) != 0 &&
@@ -3123,12 +3233,15 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                   split_runtime.finish_state_address == 0
             : split_runtime.finish_state_address ==
                   split_runtime.caller_state_address;
+    const uint64_t expected_finish_calls = task_count;
+#endif
     const bool split_protocol_ok =
         split_runtime.scheduler == state && split_runtime.worker == &worker &&
         split_runtime.task_count == task_count && split_runtime.worker_id == worker_id &&
         split_runtime.owner_worker_id == worker_id && split_runtime.caller_state_address != 0 &&
         finish_state_matches &&
-        split_runtime.finish_calls == task_count && split_runtime.task_id_sum == expected_task_id_sum &&
+        split_runtime.finish_calls == expected_finish_calls &&
+        split_runtime.task_id_sum == expected_task_id_sum &&
         split_runtime.state_cookie == CompeteFirstSplitStateCookie(worker_id, role) &&
         split_runtime.reserved == 0;
     if (!split_protocol_ok) {

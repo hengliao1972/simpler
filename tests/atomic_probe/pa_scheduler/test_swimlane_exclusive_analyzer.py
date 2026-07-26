@@ -187,7 +187,9 @@ def _capture() -> dict[str, object]:
     return capture
 
 
-def _append_v4_g1_tail_tasks(rows: list[list[object]]) -> None:
+def _append_v4_g1_tail_tasks(
+    rows: list[list[object]], tensormap_mode: str
+) -> None:
     """给历史 Alloc/QK fixture 补齐 SF/PV/UP 三个 loser。"""
 
     for core_id in range(CORE_COUNT):
@@ -207,9 +209,18 @@ def _append_v4_g1_tail_tasks(rows: list[list[object]]) -> None:
                         function_id=function_id,
                     ),
                     _row(core_id, task_id, "Claim", start + 14, start + 20, flags=0x2),
-                    _row(core_id, task_id, "Materialize", start + 24, start + 32),
-                    _row(core_id, task_id, "PrepareMap", start + 33, start + 37),
-                    _row(core_id, task_id, "Register", start + 43, start + 49),
+                ]
+            )
+            if tensormap_mode == "private":
+                rows.extend(
+                    [
+                        _row(core_id, task_id, "Materialize", start + 24, start + 32),
+                        _row(core_id, task_id, "PrepareMap", start + 33, start + 37),
+                        _row(core_id, task_id, "Register", start + 43, start + 49),
+                    ]
+                )
+            rows.extend(
+                [
                     _row(
                         core_id,
                         task_id,
@@ -224,14 +235,35 @@ def _append_v4_g1_tail_tasks(rows: list[list[object]]) -> None:
             )
 
 
-def _v4_capture() -> dict[str, object]:
-    """在 v3 结构样本上替换真实尾动作，并补齐两个首尾相接的父 span。"""
+def _skip_v4_source_phase(
+    tensormap_mode: str,
+    phase: str,
+    winner: bool,
+    task_id: int,
+) -> bool:
+    """过滤 v3 fixture 中不属于目标 v4 Submit 路径的历史 child/overlay。"""
+
+    return (
+        phase in {"Build", "Replay", "Alloc"}
+        or (tensormap_mode == "shared" and phase == "PrepareMap")
+        or (
+            tensormap_mode == "shared"
+            and not winner
+            and phase in {"Materialize", "Register"}
+        )
+        or (phase == "Fanin" and (not winner or task_id == 0))
+    )
+
+
+def _v4_capture(*, tensormap_mode: str = "shared") -> dict[str, object]:
+    """构造 shared 稀疏或 private 矩形 v4 Submit，并补齐父 span。"""
 
     capture = _capture()
     capture["l2_swimlane_level"] = 4
     metadata = capture["metadata"]
     assert isinstance(metadata, dict)
     metadata["trace_schema_version"] = 4
+    metadata["tensormap_mode"] = tensormap_mode
     source_rows = capture["fdwic_events"]
     assert isinstance(source_rows, list)
     rows: list[list[object]] = []
@@ -241,9 +273,7 @@ def _v4_capture() -> dict[str, object]:
         task_id = int(row[3])
         phase = str(row[5])
         winner = (core_id, task_id) in {(0, 0), (1, 1)}
-        if phase in {"Build", "Replay", "Alloc"}:
-            continue
-        if phase == "Fanin" and (not winner or task_id == 0):
+        if _skip_v4_source_phase(tensormap_mode, phase, winner, task_id):
             continue
         base = 1000 + core_id
         submit_start = base + (0 if task_id == 0 else 120)
@@ -315,7 +345,7 @@ def _v4_capture() -> dict[str, object]:
 
     # schema-v4 动态门槛必须使用完整 G1：在历史两 task fixture 后补齐
     # SF/PV/UP 三个 loser。这样测试不会再依赖“截断到 QK 的非法 batch”。
-    _append_v4_g1_tail_tasks(rows)
+    _append_v4_g1_tail_tasks(rows, tensormap_mode)
 
     for core_id in range(CORE_COUNT):
         base = 1000 + core_id
@@ -409,9 +439,14 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
             report = analyze_capture(path)
 
         self.assertEqual(report["capture"]["trace_schema_version"], 4)
+        self.assertEqual(report["capture"]["tensormap_mode"], "shared")
         self.assertEqual(
             report["semantics"]["exclusive_submit_children"][-2:],
             ["WinnerBuild", "AllocComplete"],
+        )
+        self.assertNotIn(
+            "PrepareMap",
+            report["semantics"]["exclusive_submit_children"],
         )
         validation = report["validation"]
         self.assertIs(validation["parent_boundaries_adjacent"], True)
@@ -423,7 +458,10 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
         self.assertEqual(metrics["fanin"], 2)
         self.assertEqual(metrics["winner_build"], 10)
         self.assertEqual(metrics["alloc_complete"], 10)
-        self.assertEqual(metrics["submit_residual"], 22_442)
+        self.assertEqual(metrics["materialize"], 18)
+        self.assertEqual(metrics["prepare_map"], 0)
+        self.assertEqual(metrics["register"], 13)
+        self.assertEqual(metrics["submit_residual"], 31_435)
         self.assertEqual(metrics["orchestration_setup"], 960)
         self.assertEqual(metrics["orchestration_tail"], 960)
         self.assertEqual(metrics["orchestration_replay"], 49_920)
@@ -432,16 +470,16 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
         self.assertEqual(metrics["final_drain_residual"], 2_880)
         self.assertEqual(metrics["worker_completion"], 53_760)
         residual = report["residual_breakdown"]
-        self.assertEqual(residual["submit_internal_residual"]["total_cycles"], 7_009)
-        self.assertEqual(residual["submit_tail_residual"]["total_cycles"], 15_433)
+        self.assertEqual(residual["submit_internal_residual"]["total_cycles"], 2_045)
+        self.assertEqual(residual["submit_tail_residual"]["total_cycles"], 29_390)
         self.assertEqual(residual["between_submit_residual"]["total_cycles"], 7_680)
         self.assertAlmostEqual(
             residual["submit_internal_residual"]["share_of_submit_union"],
-            7_009 / 40_320,
+            2_045 / 40_320,
         )
         self.assertAlmostEqual(
             residual["submit_tail_residual"]["share_of_submit_union"],
-            15_433 / 40_320,
+            29_390 / 40_320,
         )
         self.assertAlmostEqual(
             residual["between_submit_residual"]["share_of_submit_envelope"],
@@ -451,7 +489,7 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
             segment["boundary"]
             for segment in residual["submit_tail_residual"]["segments"]
         }
-        self.assertIn("Register->SubmitEnd", tail_boundaries)
+        self.assertIn("Claim->SubmitEnd", tail_boundaries)
         self.assertIn("AllocComplete->SubmitEnd", tail_boundaries)
         self.assertIn("WinnerBuild->SubmitEnd", tail_boundaries)
         self.assertTrue(
@@ -486,6 +524,95 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
             report["kernel_containment"]["unclassified_without_v4_parent_events"],
             0,
         )
+
+    def test_v4_private_keeps_rectangular_frontend_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(
+                directory, _v4_capture(tensormap_mode="private")
+            )
+            report = analyze_capture(path)
+
+        self.assertEqual(report["capture"]["tensormap_mode"], "private")
+        self.assertIn(
+            "PrepareMap",
+            report["semantics"]["exclusive_submit_children"],
+        )
+        metrics = report["aggregate_core_work"]["metrics_cycles"]
+        self.assertEqual(metrics["materialize"], 4_032)
+        self.assertEqual(metrics["prepare_map"], 2_016)
+        self.assertEqual(metrics["register"], 2_976)
+        self.assertEqual(metrics["submit_residual"], 22_442)
+
+        capture = _v4_capture(tensormap_mode="private")
+        rows = capture["fdwic_events"]
+        assert isinstance(rows, list)
+        capture["fdwic_events"] = [
+            row
+            for row in rows
+            if not (row[0] == 0 and row[3] == 1 and row[5] == "Materialize")
+        ]
+        _refresh_summary(capture)
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, capture)
+            with self.assertRaisesRegex(
+                ValueError, "requires exactly one Materialize"
+            ):
+                analyze_capture(path)
+
+    def test_v4_shared_loser_rejects_winner_only_frontend(self) -> None:
+        for phase, start, end in (
+            ("Materialize", 1144, 1152),
+            ("Register", 1154, 1160),
+        ):
+            with self.subTest(phase=phase):
+                capture = _v4_capture()
+                rows = capture["fdwic_events"]
+                assert isinstance(rows, list)
+                rows.append(_row(0, 1, phase, start, end))
+                _refresh_summary(capture)
+                with tempfile.TemporaryDirectory() as directory:
+                    path = self._write(directory, capture)
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        rf"shared loser path requires 0 {phase} spans",
+                    ):
+                        analyze_capture(path)
+
+    def test_v4_shared_winner_requires_frontend_and_forbids_prepare_map(self) -> None:
+        for phase in ("Materialize", "Register"):
+            with self.subTest(missing=phase):
+                capture = _v4_capture()
+                rows = capture["fdwic_events"]
+                assert isinstance(rows, list)
+                capture["fdwic_events"] = [
+                    row
+                    for row in rows
+                    if not (
+                        row[0] == 0
+                        and row[3] == 0
+                        and row[5] == phase
+                    )
+                ]
+                _refresh_summary(capture)
+                with tempfile.TemporaryDirectory() as directory:
+                    path = self._write(directory, capture)
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        rf"shared winner path requires 1 {phase} spans",
+                    ):
+                        analyze_capture(path)
+
+        capture = _v4_capture()
+        rows = capture["fdwic_events"]
+        assert isinstance(rows, list)
+        rows.append(_row(0, 1, "PrepareMap", 1144, 1148))
+        _refresh_summary(capture)
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, capture)
+            with self.assertRaisesRegex(
+                ValueError, "shared schema-v4 must not contain PrepareMap"
+            ):
+                analyze_capture(path)
 
     def test_v4_phase_only_capture_still_has_dropped_evidence_and_closes(self) -> None:
         capture = _v4_capture()
