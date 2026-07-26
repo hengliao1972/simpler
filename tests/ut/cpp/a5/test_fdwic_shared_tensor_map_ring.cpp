@@ -23,7 +23,8 @@
 #include <vector>
 
 #include "inner_kernel.h"
-// shared_tensor_map.h 必须在未被 AICPU 初始化头间接补齐依赖时独立可编译。
+// The header must compile without dependencies supplied indirectly by AICPU
+// initialization headers.
 #include "dist_engine/aicore/shared_tensor_map.h"
 #include "dist_engine/aicpu/shared_tensor_map_init.h"
 
@@ -70,17 +71,19 @@ struct RecordingOps {
     }
 
     static int64_t CompareExchange(volatile int64_t *address, int64_t expected, int64_t desired) {
-        // 在被测 CAS 的线性化点前确定性模拟一个非法并发 writer。真实
-        // exact-turn 路径不允许该竞争；注入只用于证明失败 CAS 不会再把
-        // 对方刚发布的控制字覆盖掉。
+        // Deterministically inject an illegal concurrent writer immediately
+        // before the tested CAS linearization point. Exact-turn forbids this
+        // race; the injection only proves a failed CAS preserves the observed
+        // control word.
         if (mutate_cas_once && address == mutate_cas_address && expected == mutate_cas_expected &&
             desired == mutate_cas_desired) {
             __atomic_store_n(address, mutate_cas_value, __ATOMIC_RELEASE);
             mutate_cas_once = false;
         }
         int64_t observed = expected;
-        (void
-        )__atomic_compare_exchange_n(address, &observed, desired, /*weak=*/false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+        (void)__atomic_compare_exchange_n(
+            address, &observed, desired, /*weak=*/false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE
+        );
         if (record) {
             events.push_back({EventKind::CompareExchange, control_address(address), expected, desired, observed});
         }
@@ -91,8 +94,8 @@ struct RecordingOps {
         if (record) {
             events.push_back({EventKind::Invalidate, address, 0, static_cast<int64_t>(bytes), 0});
         }
-        // 在第一次 seq 检查与 payload snapshot 之间确定性制造下一 lap 复用，
-        // 证明第二次 seq 检查不是装饰。
+        // Reuse the slot for the next lap between the first sequence check and
+        // the payload snapshot, proving that the second check is required.
         if (mutate_once && address == mutate_payload && mutate_sequence != nullptr) {
             __atomic_store_n(mutate_sequence, mutate_sequence_value, __ATOMIC_RELEASE);
             mutate_once = false;
@@ -171,6 +174,7 @@ enum class DriverResult : uint8_t {
     Committed,
     CapacityBlocked,
     ProtocolError,
+    PartialPublish,
 };
 
 DriverResult try_commit(
@@ -187,21 +191,18 @@ DriverResult try_commit(
     if (committed > task_id) {
         return DriverResult::ProtocolError;
     }
-    int64_t reclaim_upto = -2;
-    if (!dist_shared_tensor_map_refresh_reclaim_impl<RecordingOps>(map, task_id, history, reclaim_upto)) {
-        return DriverResult::ProtocolError;
+    const DistSharedTensorMapTaskPublishResult result =
+        dist_shared_tensor_map_publish_task_impl<RecordingOps>(map, entries, count, task_id, history);
+    if (result == DistSharedTensorMapTaskPublishResult::Committed) {
+        return DriverResult::Committed;
     }
-    const DistSharedTensorMapAppendCheck check =
-        dist_shared_tensor_map_check_task_append_impl<RecordingOps>(map, entries, count, task_id, reclaim_upto);
-    if (check == DistSharedTensorMapAppendCheck::CapacityBlocked) {
+    if (result == DistSharedTensorMapTaskPublishResult::CapacityBlocked) {
         return DriverResult::CapacityBlocked;
     }
-    if (check != DistSharedTensorMapAppendCheck::Ready ||
-        !dist_shared_tensor_map_append_prepared_task_impl<RecordingOps>(map, entries, count, task_id) ||
-        !dist_shared_tensor_map_publish_commit_impl<RecordingOps>(map, task_id)) {
-        return DriverResult::ProtocolError;
+    if (result == DistSharedTensorMapTaskPublishResult::PartialPublish) {
+        return DriverResult::PartialPublish;
     }
-    return DriverResult::Committed;
+    return DriverResult::ProtocolError;
 }
 
 DriverResult try_commit(
@@ -380,18 +381,23 @@ TEST(FdwicSharedTensorMapRing, SlotAcquireCasFailurePublishesNothing) {
     const uint32_t bucket = dist_tensor_map_hash(entry.buf_addr);
     SharedTensorMapSlot &slot = map->slots[dist_shared_tensor_map_slot_index(bucket, 0)];
     int64_t reclaim_upto = -2;
+    uint64_t planned_cursor = UINT64_MAX;
     ASSERT_TRUE(dist_shared_tensor_map_refresh_reclaim_impl<RecordingOps>(*map, 0, 64, reclaim_upto));
     ASSERT_EQ(
-        dist_shared_tensor_map_check_task_append_impl<RecordingOps>(*map, &entry, 1, 0, reclaim_upto),
+        dist_shared_tensor_map_check_task_append_impl<RecordingOps>(*map, &entry, 1, 0, reclaim_upto, &planned_cursor),
         DistSharedTensorMapAppendCheck::Ready
     );
+    ASSERT_EQ(planned_cursor, 0U);
     const SharedTensorMapPayloadLine payload_before = slot.payload;
 
     RecordingOps::ResetEvents();
     RecordingOps::MutateBeforeCas(
         &slot.sequence.v, kSharedTensorMapInvalidSequence, kSharedTensorMapWritingSequence, 77
     );
-    EXPECT_FALSE(dist_shared_tensor_map_append_prepared_task_impl<RecordingOps>(*map, &entry, 1, 0));
+    EXPECT_EQ(
+        dist_shared_tensor_map_publish_prepared_task_impl<RecordingOps>(*map, &entry, &planned_cursor, 1, 0),
+        DistSharedTensorMapTaskPublishResult::ProtocolError
+    );
     EXPECT_FALSE(RecordingOps::mutate_cas_once);
     EXPECT_EQ(slot.sequence.v, 77);
     expect_recorded_cas(
@@ -405,16 +411,53 @@ TEST(FdwicSharedTensorMapRing, SlotAcquireCasFailurePublishesNothing) {
         EXPECT_NE(event.kind, EventKind::Flush);
     }
 
-    // 两个非法 writer 都已通过旧 preflight 时，第一个把槽置为 WRITING，
-    // 第二个进入 append 仍必须在 ownership CAS 失败，不能写 payload。
+    // If two illegal writers both passed stale preflight, the first moves the
+    // slot to WRITING and the second must still fail the ownership CAS before
+    // touching payload.
     auto owned_map = make_empty_map();
     SharedTensorMapSlot &owned_slot = owned_map->slots[dist_shared_tensor_map_slot_index(bucket, 0)];
     owned_slot.sequence.v = kSharedTensorMapWritingSequence;
     const SharedTensorMapPayloadLine owned_payload_before = owned_slot.payload;
-    EXPECT_FALSE(dist_shared_tensor_map_append_prepared_entry_impl<RecordingOps>(*owned_map, entry, 0));
+    EXPECT_EQ(
+        dist_shared_tensor_map_publish_prepared_entry_impl<RecordingOps>(*owned_map, entry, 0, 0),
+        DistSharedTensorMapEntryPublishResult::ProtocolError
+    );
     EXPECT_EQ(owned_slot.sequence.v, kSharedTensorMapWritingSequence);
     EXPECT_EQ(std::memcmp(&owned_payload_before, &owned_slot.payload, sizeof(owned_payload_before)), 0);
     EXPECT_EQ(owned_map->buckets[bucket].tail.v, 0);
+}
+
+TEST(FdwicSharedTensorMapRing, PreparedTaskRejectsTailDriftInsteadOfPublishingAnUncheckedSlot) {
+    auto map = make_empty_map();
+    const SharedTensorMapValue entry = make_region(0x1b0000000ULL, 0, 64, 0);
+    const uint32_t bucket = dist_tensor_map_hash(entry.buf_addr);
+    int64_t reclaim_upto = -2;
+    uint64_t planned_cursor = UINT64_MAX;
+    ASSERT_TRUE(dist_shared_tensor_map_refresh_reclaim_impl<RecordingOps>(*map, 0, 64, reclaim_upto));
+    ASSERT_EQ(
+        dist_shared_tensor_map_check_task_append_impl<RecordingOps>(*map, &entry, 1, 0, reclaim_upto, &planned_cursor),
+        DistSharedTensorMapAppendCheck::Ready
+    );
+    ASSERT_EQ(planned_cursor, 0U);
+    const SharedTensorMapSlot first_before = map->slots[dist_shared_tensor_map_slot_index(bucket, 0)];
+    const SharedTensorMapSlot second_before = map->slots[dist_shared_tensor_map_slot_index(bucket, 1)];
+
+    // Model an illegal same-task writer advancing tail after preflight. The
+    // prepared publisher must not silently switch from planned cursor 0 to the
+    // unchecked cursor 1.
+    map->buckets[bucket].tail.v = 1;
+    EXPECT_EQ(
+        dist_shared_tensor_map_publish_prepared_task_impl<RecordingOps>(*map, &entry, &planned_cursor, 1, 0),
+        DistSharedTensorMapTaskPublishResult::ProtocolError
+    );
+    EXPECT_EQ(map->buckets[bucket].tail.v, 1);
+    EXPECT_EQ(map->committed_tasks.v, 0);
+    EXPECT_EQ(
+        std::memcmp(&first_before, &map->slots[dist_shared_tensor_map_slot_index(bucket, 0)], sizeof(first_before)), 0
+    );
+    EXPECT_EQ(
+        std::memcmp(&second_before, &map->slots[dist_shared_tensor_map_slot_index(bucket, 1)], sizeof(second_before)), 0
+    );
 }
 
 TEST(FdwicSharedTensorMapRing, PostAcquireCasFailuresPreserveTheObservedControlWord) {
@@ -425,15 +468,21 @@ TEST(FdwicSharedTensorMapRing, PostAcquireCasFailuresPreserveTheObservedControlW
         const uint32_t bucket = dist_tensor_map_hash(entry.buf_addr);
         SharedTensorMapSlot &slot = map->slots[dist_shared_tensor_map_slot_index(bucket, 0)];
         int64_t reclaim_upto = -2;
+        uint64_t planned_cursor = UINT64_MAX;
         ASSERT_TRUE(dist_shared_tensor_map_refresh_reclaim_impl<RecordingOps>(*map, 0, 64, reclaim_upto));
         ASSERT_EQ(
-            dist_shared_tensor_map_check_task_append_impl<RecordingOps>(*map, &entry, 1, 0, reclaim_upto),
+            dist_shared_tensor_map_check_task_append_impl<RecordingOps>(
+                *map, &entry, 1, 0, reclaim_upto, &planned_cursor
+            ),
             DistSharedTensorMapAppendCheck::Ready
         );
 
         RecordingOps::ResetEvents();
         RecordingOps::MutateBeforeCas(&slot.sequence.v, kSharedTensorMapWritingSequence, 0, 77);
-        EXPECT_FALSE(dist_shared_tensor_map_append_prepared_task_impl<RecordingOps>(*map, &entry, 1, 0));
+        EXPECT_EQ(
+            dist_shared_tensor_map_publish_prepared_task_impl<RecordingOps>(*map, &entry, &planned_cursor, 1, 0),
+            DistSharedTensorMapTaskPublishResult::PartialPublish
+        );
         EXPECT_FALSE(RecordingOps::mutate_cas_once);
         EXPECT_EQ(slot.sequence.v, 77);
         expect_recorded_cas(control_address(&slot.sequence.v), kSharedTensorMapWritingSequence, 0, 77);
@@ -451,15 +500,21 @@ TEST(FdwicSharedTensorMapRing, PostAcquireCasFailuresPreserveTheObservedControlW
         const uint32_t bucket = dist_tensor_map_hash(entry.buf_addr);
         SharedTensorMapSlot &slot = map->slots[dist_shared_tensor_map_slot_index(bucket, 0)];
         int64_t reclaim_upto = -2;
+        uint64_t planned_cursor = UINT64_MAX;
         ASSERT_TRUE(dist_shared_tensor_map_refresh_reclaim_impl<RecordingOps>(*map, 0, 64, reclaim_upto));
         ASSERT_EQ(
-            dist_shared_tensor_map_check_task_append_impl<RecordingOps>(*map, &entry, 1, 0, reclaim_upto),
+            dist_shared_tensor_map_check_task_append_impl<RecordingOps>(
+                *map, &entry, 1, 0, reclaim_upto, &planned_cursor
+            ),
             DistSharedTensorMapAppendCheck::Ready
         );
 
         RecordingOps::ResetEvents();
         RecordingOps::MutateBeforeCas(&map->buckets[bucket].tail.v, 0, 1, 7);
-        EXPECT_FALSE(dist_shared_tensor_map_append_prepared_task_impl<RecordingOps>(*map, &entry, 1, 0));
+        EXPECT_EQ(
+            dist_shared_tensor_map_publish_prepared_task_impl<RecordingOps>(*map, &entry, &planned_cursor, 1, 0),
+            DistSharedTensorMapTaskPublishResult::PartialPublish
+        );
         EXPECT_FALSE(RecordingOps::mutate_cas_once);
         EXPECT_EQ(slot.sequence.v, 0);
         EXPECT_EQ(slot.payload.value.producer, entry.producer);
@@ -472,12 +527,18 @@ TEST(FdwicSharedTensorMapRing, PostAcquireCasFailuresPreserveTheObservedControlW
         auto map = make_empty_map();
         const uint32_t bucket = dist_tensor_map_hash(entry.buf_addr);
         int64_t reclaim_upto = -2;
+        uint64_t planned_cursor = UINT64_MAX;
         ASSERT_TRUE(dist_shared_tensor_map_refresh_reclaim_impl<RecordingOps>(*map, 0, 64, reclaim_upto));
         ASSERT_EQ(
-            dist_shared_tensor_map_check_task_append_impl<RecordingOps>(*map, &entry, 1, 0, reclaim_upto),
+            dist_shared_tensor_map_check_task_append_impl<RecordingOps>(
+                *map, &entry, 1, 0, reclaim_upto, &planned_cursor
+            ),
             DistSharedTensorMapAppendCheck::Ready
         );
-        ASSERT_TRUE(dist_shared_tensor_map_append_prepared_task_impl<RecordingOps>(*map, &entry, 1, 0));
+        ASSERT_EQ(
+            dist_shared_tensor_map_publish_prepared_entry_impl<RecordingOps>(*map, entry, 0, planned_cursor),
+            DistSharedTensorMapEntryPublishResult::Published
+        );
 
         RecordingOps::ResetEvents();
         RecordingOps::MutateBeforeCas(&map->committed_tasks.v, 0, 1, 2);
@@ -494,6 +555,109 @@ TEST(FdwicSharedTensorMapRing, PostAcquireCasFailuresPreserveTheObservedControlW
             }
         }
         EXPECT_EQ(commit_cas_count, 1U);
+    }
+}
+
+TEST(FdwicSharedTensorMapRing, TaskPublishDistinguishesProtocolRejectFromPartialPublication) {
+    const SharedTensorMapValue first = make_region(0x1e0000000ULL, 0, 64, 0);
+    const SharedTensorMapValue second = make_region(first.buf_addr, 128, 192, 0);
+    const uint32_t bucket = dist_tensor_map_hash(first.buf_addr);
+
+    {
+        auto map = make_empty_map();
+        SharedTensorMapSlot &slot = map->slots[dist_shared_tensor_map_slot_index(bucket, 0)];
+        const SharedTensorMapPayloadLine payload_before = slot.payload;
+        RecordingOps::ResetEvents();
+        RecordingOps::MutateBeforeCas(
+            &slot.sequence.v, kSharedTensorMapInvalidSequence, kSharedTensorMapWritingSequence, 77
+        );
+        EXPECT_EQ(
+            dist_shared_tensor_map_publish_task_impl<RecordingOps>(*map, &first, 1, 0, 64),
+            DistSharedTensorMapTaskPublishResult::ProtocolError
+        );
+        EXPECT_EQ(std::memcmp(&payload_before, &slot.payload, sizeof(payload_before)), 0);
+        EXPECT_EQ(slot.sequence.v, 77);
+        EXPECT_EQ(map->buckets[bucket].tail.v, 0);
+        EXPECT_EQ(map->committed_tasks.v, 0);
+    }
+
+    {
+        auto map = make_empty_map();
+        SharedTensorMapSlot &slot = map->slots[dist_shared_tensor_map_slot_index(bucket, 0)];
+        RecordingOps::ResetEvents();
+        RecordingOps::MutateBeforeCas(&slot.sequence.v, kSharedTensorMapWritingSequence, 0, 77);
+        EXPECT_EQ(
+            dist_shared_tensor_map_publish_task_impl<RecordingOps>(*map, &first, 1, 0, 64),
+            DistSharedTensorMapTaskPublishResult::PartialPublish
+        );
+        EXPECT_EQ(slot.sequence.v, 77);
+        EXPECT_EQ(slot.payload.value.producer, 0);
+        EXPECT_EQ(map->buckets[bucket].tail.v, 0);
+        EXPECT_EQ(map->committed_tasks.v, 0);
+    }
+
+    {
+        auto map = make_empty_map();
+        SharedTensorMapSlot &slot = map->slots[dist_shared_tensor_map_slot_index(bucket, 0)];
+        RecordingOps::ResetEvents();
+        RecordingOps::MutateBeforeCas(&map->buckets[bucket].tail.v, 0, 1, 7);
+        EXPECT_EQ(
+            dist_shared_tensor_map_publish_task_impl<RecordingOps>(*map, &first, 1, 0, 64),
+            DistSharedTensorMapTaskPublishResult::PartialPublish
+        );
+        EXPECT_EQ(slot.sequence.v, 0);
+        EXPECT_EQ(slot.payload.value.producer, 0);
+        EXPECT_EQ(map->buckets[bucket].tail.v, 7);
+        EXPECT_EQ(map->committed_tasks.v, 0);
+    }
+
+    {
+        auto map = make_empty_map();
+        RecordingOps::ResetEvents();
+        RecordingOps::MutateBeforeCas(&map->committed_tasks.v, 0, 1, 2);
+        EXPECT_EQ(
+            dist_shared_tensor_map_publish_task_impl<RecordingOps>(*map, &first, 1, 0, 64),
+            DistSharedTensorMapTaskPublishResult::PartialPublish
+        );
+        EXPECT_EQ(map->buckets[bucket].tail.v, 1);
+        EXPECT_EQ(map->slots[dist_shared_tensor_map_slot_index(bucket, 0)].sequence.v, 0);
+        EXPECT_EQ(map->committed_tasks.v, 2);
+    }
+
+    {
+        auto map = make_empty_map();
+        RecordingOps::ResetEvents();
+        RecordingOps::MutateBeforeCas(&map->committed_tasks.v, 0, 1, 2);
+        EXPECT_EQ(
+            dist_shared_tensor_map_publish_task_impl<RecordingOps>(*map, nullptr, 0, 0, 64),
+            DistSharedTensorMapTaskPublishResult::ProtocolError
+        );
+        EXPECT_EQ(map->committed_tasks.v, 2);
+        for (uint32_t index = 0; index < kMapBuckets; ++index) {
+            EXPECT_EQ(map->buckets[index].head.v, 0);
+            EXPECT_EQ(map->buckets[index].tail.v, 0);
+        }
+    }
+
+    {
+        auto map = make_empty_map();
+        const SharedTensorMapValue entries[] = {first, second};
+        SharedTensorMapSlot &second_slot = map->slots[dist_shared_tensor_map_slot_index(bucket, 1)];
+        const SharedTensorMapPayloadLine second_payload_before = second_slot.payload;
+        RecordingOps::ResetEvents();
+        RecordingOps::MutateBeforeCas(
+            &second_slot.sequence.v, kSharedTensorMapInvalidSequence, kSharedTensorMapWritingSequence, 77
+        );
+        EXPECT_EQ(
+            dist_shared_tensor_map_publish_task_impl<RecordingOps>(*map, entries, 2, 0, 64),
+            DistSharedTensorMapTaskPublishResult::PartialPublish
+        );
+        EXPECT_EQ(map->buckets[bucket].tail.v, 1);
+        EXPECT_EQ(map->slots[dist_shared_tensor_map_slot_index(bucket, 0)].sequence.v, 0);
+        EXPECT_EQ(map->slots[dist_shared_tensor_map_slot_index(bucket, 0)].payload.value.producer, 0);
+        EXPECT_EQ(second_slot.sequence.v, 77);
+        EXPECT_EQ(std::memcmp(&second_payload_before, &second_slot.payload, sizeof(second_payload_before)), 0);
+        EXPECT_EQ(map->committed_tasks.v, 0);
     }
 }
 
@@ -717,9 +881,9 @@ TEST(FdwicSharedTensorMapRing, CapacityFailureAfterRetirePublishesNoTaskData) {
         make_region(address, 0x100000, 0x100004, task_id),
         make_region(address, 0x200000, 0x200004, task_id),
     };
-    // N=CAP、H=CAP-1 只允许回收 producer 0，腾出的一个槽不足以
-    // 发布同 task 的两个 entry。head/reclaim 可保留单调推进，但 task
-    // payload、seq、tail 与 commit 必须完全未发布。
+    // N=CAP and H=CAP-1 can reclaim only producer 0. One free slot cannot hold
+    // both entries from the same task. Head/reclaim may advance monotonically,
+    // but payload, sequence, tail, and commit must remain unpublished.
     EXPECT_EQ(
         try_commit(*map, task_id, entries, static_cast<int32_t>(kMapBucketCapacity - 1)), DriverResult::CapacityBlocked
     );
@@ -886,7 +1050,10 @@ TEST(FdwicSharedTensorMapRing, ProtocolErrorsRemainDistinctFromMissAndCapacity) 
         DistSharedTensorMapAppendCheck::ProtocolError
     );
     EXPECT_EQ(std::memcmp(before.data(), map.get(), before.size()), 0);
-    EXPECT_FALSE(dist_shared_tensor_map_append_prepared_entry_impl<RecordingOps>(*map, valid, 0));
+    EXPECT_EQ(
+        dist_shared_tensor_map_publish_prepared_entry_impl<RecordingOps>(*map, valid, 0, 0),
+        DistSharedTensorMapEntryPublishResult::ProtocolError
+    );
     EXPECT_EQ(std::memcmp(before.data(), map.get(), before.size()), 0);
     map->buckets[bucket].head.v = 0;
     map->buckets[bucket].tail.v = 0;
@@ -974,14 +1141,9 @@ TEST(FdwicSharedTensorMapRing, FixedSeedTwelveThousandTasksMatchIndependentRefer
 TEST(FdwicSharedTensorMapRing, ConcreteAicoreOpsRoundTripUsesTheSameStateMachine) {
     auto map = make_empty_map();
     const SharedTensorMapValue entry = make_region(0x900000000ULL, 16, 80, 0);
-    int64_t reclaim_upto = -2;
-    ASSERT_TRUE(dist_shared_tensor_map_refresh_reclaim(*map, 0, 64, reclaim_upto));
     ASSERT_EQ(
-        dist_shared_tensor_map_check_task_append(*map, &entry, 1, 0, reclaim_upto),
-        DistSharedTensorMapAppendCheck::Ready
+        dist_shared_tensor_map_publish_task(*map, &entry, 1, 0, 64), DistSharedTensorMapTaskPublishResult::Committed
     );
-    ASSERT_TRUE(dist_shared_tensor_map_append_prepared_task(*map, &entry, 1, 0));
-    ASSERT_TRUE(dist_shared_tensor_map_publish_commit(*map, 0));
 
     bool protocol_ok = false;
     EXPECT_EQ(
@@ -989,10 +1151,10 @@ TEST(FdwicSharedTensorMapRing, ConcreteAicoreOpsRoundTripUsesTheSameStateMachine
     );
     EXPECT_TRUE(protocol_ok);
 
-    // 不只验证 concrete CAS 成功路径：若适配器误退化成 Exchange，这里会
-    // 把竞争值 2 覆写成 desired 1，最终值断言会直接失败。
+    // This also rejects an adapter that accidentally degrades CAS to Exchange:
+    // Exchange would overwrite the competing value 2 with desired value 1.
     map->committed_tasks.v = 2;
-    EXPECT_FALSE(dist_shared_tensor_map_publish_commit(*map, 0));
+    EXPECT_FALSE(dist_shared_tensor_map_publish_commit_impl<DistSharedTensorMapAicoreOps>(*map, 0));
     EXPECT_EQ(map->committed_tasks.v, 2);
 }
 

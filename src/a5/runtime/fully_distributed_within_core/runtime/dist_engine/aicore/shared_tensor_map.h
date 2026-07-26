@@ -18,13 +18,32 @@
 
 namespace {
 
-// preflight 不能把“容量不足”和“共享状态已经损坏”压成同一个 bool。
-// exact-turn 下容量不足不会靠等待自行消失，接入 Submit 后应转成结构化
-// TensorMap capacity fatal；ProtocolError 则必须走协议错误收敛。
+// Preflight must distinguish capacity exhaustion from corrupted shared state.
+// Capacity exhaustion cannot resolve by waiting under exact-turn and must map
+// to the structured TensorMap capacity fatal; protocol errors require their
+// own convergence path.
 enum class DistSharedTensorMapAppendCheck : uint32_t {
     Ready = 0,
     CapacityBlocked = 1,
     ProtocolError = 2,
+};
+
+// The task adapter must distinguish rejection before this call publishes
+// current-task data from failure after acquiring slot ownership. The latter
+// cannot be rolled back or retried: preserve the evidence and fail-stop the
+// run. ProtocolError does not claim the whole sidecar is clean; a competing
+// writer may already have corrupted shared control state.
+enum class DistSharedTensorMapEntryPublishResult : uint32_t {
+    Published = 0,
+    ProtocolError = 1,
+    PartialPublish = 2,
+};
+
+enum class DistSharedTensorMapTaskPublishResult : uint32_t {
+    Committed = 0,
+    CapacityBlocked = 1,
+    ProtocolError = 2,
+    PartialPublish = 3,
 };
 
 PTO_DEVICE_FUNC inline uint32_t dist_shared_tensor_map_slot_index(uint32_t bucket, uint64_t cursor) {
@@ -41,8 +60,9 @@ dist_shared_tensor_map_make_value(const TensorRef &tensor, int32_t producer) {
     return value;
 }
 
-// Ops 是独立测试与 production AICore primitive 的唯一适配层；状态机本身
-// 不访问 g_dist，也不依赖 Submit/fatal/wait，使其可在解除门禁前完整验证。
+// Ops is the only seam between standalone tests and production AICore
+// primitives. The state machine does not access g_dist or depend on
+// Submit/fatal/wait, so it can be verified before the backend gate is opened.
 template <typename Ops>
 PTO_DEVICE_FUNC inline bool dist_shared_tensor_map_read_slot_impl(
     __gm__ SharedTensorMapState &map, uint32_t bucket, uint64_t cursor, SharedTensorMapValue &snapshot
@@ -67,8 +87,9 @@ PTO_DEVICE_FUNC inline bool dist_shared_tensor_map_read_slot_impl(
     return snapshot.producer >= 0 && snapshot.reserved == 0 && snapshot.lo < snapshot.hi;
 }
 
-// lookup 的权威窗口为 [max(0,N-H),N)。-1 既可能是正常 miss，也可能是
-// seq/游标协议失败，因此调用方必须同时检查 protocol_ok。
+// The authoritative lookup window is [max(0, N-H), N). A -1 result can mean a
+// normal miss or a sequence/cursor protocol failure, so callers must also
+// inspect protocol_ok.
 template <typename Ops>
 PTO_DEVICE_FUNC inline int32_t dist_shared_tensor_map_lookup_region_impl(
     __gm__ SharedTensorMapState &map, const SharedTensorMapValue &query, int32_t current_task, int32_t history,
@@ -110,8 +131,9 @@ PTO_DEVICE_FUNC inline int32_t dist_shared_tensor_map_lookup_tensor_impl(
     return dist_shared_tensor_map_lookup_region_impl<Ops>(map, query, current_task, history, protocol_ok);
 }
 
-// 只有 committed_tasks==N 的唯一 winner 可以调用 retire/append。多个无序
-// writer 同时修改同一 bucket 不属于这版有序单追加者协议。
+// Only the unique winner observing committed_tasks==N may retire or append.
+// Concurrent unordered writers touching one bucket are outside this ordered
+// single-appender protocol.
 template <typename Ops>
 PTO_DEVICE_FUNC inline bool
 dist_shared_tensor_map_retire_bucket_impl(__gm__ SharedTensorMapState &map, uint32_t bucket, int64_t reclaim_upto) {
@@ -143,8 +165,9 @@ dist_shared_tensor_map_retire_bucket_impl(__gm__ SharedTensorMapState &map, uint
     return observed == original_head;
 }
 
-// winner N 已经完成本任务 lookup，后续任务最早只会读取 N-H，因此
-// inclusive 回收上界是 N-H-1。使用 int64_t 避免边界减法溢出。
+// Winner N has completed its lookups, and later tasks can read no earlier than
+// N-H, so the inclusive reclaim boundary is N-H-1. Use int64_t to avoid
+// underflow at the boundary.
 PTO_DEVICE_FUNC inline bool
 dist_shared_tensor_map_compute_reclaim(int32_t current_task, int32_t history, int64_t &candidate) {
     if (current_task < 0 || history < 0) {
@@ -160,8 +183,9 @@ dist_shared_tensor_map_compute_reclaim(int32_t current_task, int32_t history, in
 template <typename Ops>
 PTO_DEVICE_FUNC inline bool
 dist_shared_tensor_map_has_exact_turn_impl(__gm__ SharedTensorMapState &map, int32_t current_task) {
-    // task/flag 都使用 kFlagCap 有界协议。边界必须在 reclaim、head 或
-    // slot 发生任何修改前拒绝，不能留到最终 publish_commit 才失败。
+    // Tasks and flags share the kFlagCap bounded protocol. Reject an invalid
+    // task before changing reclaim, head, or any slot instead of waiting until
+    // publish_commit.
     return current_task >= 0 && current_task < kFlagCap && Ops::Load(&map.committed_tasks.v) == current_task;
 }
 
@@ -203,13 +227,13 @@ dist_shared_tensor_map_earlier_entries_in_bucket(const SharedTensorMapValue *ent
     return earlier;
 }
 
-// 在写任何 slot 前完成整任务的容量、cursor 与旧 seq 检查。失败时允许
-// reclaim/head 保留已证明正确的单调推进，但本 task 的 payload/seq/tail/
-// commit 必须尚未发布。
+// Validate capacity, cursors, and old sequences for the whole task before
+// writing any slot. A failed check may retain a proven monotonic reclaim/head
+// advance, but must not publish this task's payload, sequence, tail, or commit.
 template <typename Ops>
 PTO_DEVICE_FUNC inline DistSharedTensorMapAppendCheck dist_shared_tensor_map_check_task_append_impl(
     __gm__ SharedTensorMapState &map, const SharedTensorMapValue *entries, uint32_t count, int32_t current_task,
-    int64_t reclaim_upto
+    int64_t reclaim_upto, uint64_t *planned_cursors = nullptr
 ) {
     if (current_task < 0 || count > MAX_TENSOR_ARGS || (count != 0 && entries == nullptr) ||
         !dist_shared_tensor_map_has_exact_turn_impl<Ops>(map, current_task) ||
@@ -236,7 +260,7 @@ PTO_DEVICE_FUNC inline DistSharedTensorMapAppendCheck dist_shared_tensor_map_che
             return DistSharedTensorMapAppendCheck::CapacityBlocked;
         }
         const uint64_t cursor = static_cast<uint64_t>(tail) + earlier;
-        // append 最终要发布 tail=cursor+1，因此 INT64_MAX 本身也不可写。
+        // Append eventually publishes tail=cursor+1, so INT64_MAX is invalid.
         if (cursor >= static_cast<uint64_t>(INT64_MAX)) {
             return DistSharedTensorMapAppendCheck::ProtocolError;
         }
@@ -246,37 +270,40 @@ PTO_DEVICE_FUNC inline DistSharedTensorMapAppendCheck dist_shared_tensor_map_che
         if (Ops::Load(&slot.sequence.v) != expected_old) {
             return DistSharedTensorMapAppendCheck::ProtocolError;
         }
+        if (planned_cursors != nullptr) {
+            planned_cursors[index] = cursor;
+        }
     }
     return DistSharedTensorMapAppendCheck::Ready;
 }
 
 template <typename Ops>
-PTO_DEVICE_FUNC inline bool dist_shared_tensor_map_append_prepared_entry_impl(
-    __gm__ SharedTensorMapState &map, const SharedTensorMapValue &entry, int32_t current_task
+PTO_DEVICE_FUNC inline DistSharedTensorMapEntryPublishResult dist_shared_tensor_map_publish_prepared_entry_impl(
+    __gm__ SharedTensorMapState &map, const SharedTensorMapValue &entry, int32_t current_task, uint64_t planned_cursor
 ) {
-    if (entry.producer != current_task || entry.reserved != 0 || entry.lo >= entry.hi) {
-        return false;
+    if (entry.producer != current_task || entry.reserved != 0 || entry.lo >= entry.hi ||
+        planned_cursor >= static_cast<uint64_t>(INT64_MAX)) {
+        return DistSharedTensorMapEntryPublishResult::ProtocolError;
     }
     const uint32_t bucket = dist_tensor_map_hash(entry.buf_addr);
     __gm__ SharedTensorMapBucketState &controls = map.buckets[bucket];
     const int64_t head = Ops::Load(&controls.head.v);
     const int64_t tail = Ops::Load(&controls.tail.v);
-    if (head < 0 || tail < head || static_cast<uint64_t>(tail - head) >= kMapBucketCapacity) {
-        return false;
+    if (head < 0 || tail < head || static_cast<uint64_t>(tail) != planned_cursor ||
+        static_cast<uint64_t>(tail - head) >= kMapBucketCapacity) {
+        return DistSharedTensorMapEntryPublishResult::ProtocolError;
     }
-    const uint64_t cursor = static_cast<uint64_t>(tail);
-    if (cursor >= static_cast<uint64_t>(INT64_MAX)) {
-        return false;
-    }
-    __gm__ SharedTensorMapSlot &slot = map.slots[dist_shared_tensor_map_slot_index(bucket, cursor)];
-    const int64_t expected_old = cursor < kMapBucketCapacity ? kSharedTensorMapInvalidSequence :
-                                                               static_cast<int64_t>(cursor - kMapBucketCapacity);
-    // WRITING 是独占 ownership 状态。claim 成功后若后续 CAS 仍失败，
-    // 说明 exact-turn 协议已损坏：保留现场并由接入层 fatal 收敛，不能
-    // 把已覆写 payload 的槽回滚成旧 lap seq。
+    __gm__ SharedTensorMapSlot &slot = map.slots[dist_shared_tensor_map_slot_index(bucket, planned_cursor)];
+    const int64_t expected_old = planned_cursor < kMapBucketCapacity ?
+                                     kSharedTensorMapInvalidSequence :
+                                     static_cast<int64_t>(planned_cursor - kMapBucketCapacity);
+    // WRITING is the exclusive ownership state. A later CAS failure after a
+    // successful claim means the exact-turn protocol is broken. Preserve the
+    // evidence for fatal convergence; never roll an overwritten payload back
+    // to the previous lap sequence.
     const int64_t before_claim = Ops::CompareExchange(&slot.sequence.v, expected_old, kSharedTensorMapWritingSequence);
     if (before_claim != expected_old) {
-        return false;
+        return DistSharedTensorMapEntryPublishResult::ProtocolError;
     }
 
     Ops::InvalidateRegion(&slot.payload, sizeof(slot.payload));
@@ -285,32 +312,20 @@ PTO_DEVICE_FUNC inline bool dist_shared_tensor_map_append_prepared_entry_impl(
     slot.payload.value.hi = entry.hi;
     slot.payload.value.producer = entry.producer;
     slot.payload.value.reserved = 0;
-    // padding 不承载协议，不为填充字节增加 scalar store。
+    // Padding carries no protocol state; avoid scalar stores for padding.
     Ops::FlushRegion(&slot.payload, sizeof(slot.payload));
 
     const int64_t before_publish =
-        Ops::CompareExchange(&slot.sequence.v, kSharedTensorMapWritingSequence, static_cast<int64_t>(cursor));
+        Ops::CompareExchange(&slot.sequence.v, kSharedTensorMapWritingSequence, static_cast<int64_t>(planned_cursor));
     if (before_publish != kSharedTensorMapWritingSequence) {
-        return false;
+        return DistSharedTensorMapEntryPublishResult::PartialPublish;
     }
-    const int64_t previous_tail = Ops::CompareExchange(&controls.tail.v, tail, tail + 1);
-    return previous_tail == tail;
-}
-
-template <typename Ops>
-PTO_DEVICE_FUNC inline bool dist_shared_tensor_map_append_prepared_task_impl(
-    __gm__ SharedTensorMapState &map, const SharedTensorMapValue *entries, uint32_t count, int32_t current_task
-) {
-    if (count > MAX_TENSOR_ARGS || (count != 0 && entries == nullptr) ||
-        !dist_shared_tensor_map_has_exact_turn_impl<Ops>(map, current_task)) {
-        return false;
-    }
-    for (uint32_t index = 0; index < count; ++index) {
-        if (!dist_shared_tensor_map_append_prepared_entry_impl<Ops>(map, entries[index], current_task)) {
-            return false;
-        }
-    }
-    return true;
+    const int64_t previous_tail = Ops::CompareExchange(
+        &controls.tail.v, static_cast<int64_t>(planned_cursor), static_cast<int64_t>(planned_cursor) + 1
+    );
+    return previous_tail == static_cast<int64_t>(planned_cursor) ?
+               DistSharedTensorMapEntryPublishResult::Published :
+               DistSharedTensorMapEntryPublishResult::PartialPublish;
 }
 
 template <typename Ops>
@@ -322,6 +337,73 @@ dist_shared_tensor_map_publish_commit_impl(__gm__ SharedTensorMapState &map, int
     const int64_t previous =
         Ops::CompareExchange(&map.committed_tasks.v, current_task, static_cast<int64_t>(current_task) + 1);
     return previous == current_task;
+}
+
+template <typename Ops>
+PTO_DEVICE_FUNC inline DistSharedTensorMapTaskPublishResult dist_shared_tensor_map_publish_prepared_task_impl(
+    __gm__ SharedTensorMapState &map, const SharedTensorMapValue *entries, const uint64_t *planned_cursors,
+    uint32_t count, int32_t current_task
+) {
+    if (count > MAX_TENSOR_ARGS || (count != 0 && (entries == nullptr || planned_cursors == nullptr)) ||
+        !dist_shared_tensor_map_has_exact_turn_impl<Ops>(map, current_task)) {
+        return DistSharedTensorMapTaskPublishResult::ProtocolError;
+    }
+    for (uint32_t index = 0; index < count; ++index) {
+        const DistSharedTensorMapEntryPublishResult result = dist_shared_tensor_map_publish_prepared_entry_impl<Ops>(
+            map, entries[index], current_task, planned_cursors[index]
+        );
+        if (result == DistSharedTensorMapEntryPublishResult::Published) {
+            continue;
+        }
+        if (result == DistSharedTensorMapEntryPublishResult::PartialPublish || index != 0) {
+            return DistSharedTensorMapTaskPublishResult::PartialPublish;
+        }
+        return DistSharedTensorMapTaskPublishResult::ProtocolError;
+    }
+    if (!dist_shared_tensor_map_publish_commit_impl<Ops>(map, current_task)) {
+        return count == 0 ? DistSharedTensorMapTaskPublishResult::ProtocolError :
+                            DistSharedTensorMapTaskPublishResult::PartialPublish;
+    }
+    return DistSharedTensorMapTaskPublishResult::Committed;
+}
+
+// Callers must complete lookup before entering this function. It only handles
+// reclaim, whole-task preflight, ordered publication, and the final commit.
+// A zero-entry task still advances the contiguous task frontier. Any partial
+// publication after preflight is unrecoverable and must reach Submit without
+// being downgraded to an ordinary protocol rejection.
+template <typename Ops>
+PTO_DEVICE_FUNC inline DistSharedTensorMapTaskPublishResult dist_shared_tensor_map_publish_task_impl(
+    __gm__ SharedTensorMapState &map, const SharedTensorMapValue *entries, uint32_t count, int32_t current_task,
+    int32_t history
+) {
+    if (current_task < 0 || current_task >= kFlagCap || history < 0 || count > MAX_TENSOR_ARGS ||
+        (count != 0 && entries == nullptr)) {
+        return DistSharedTensorMapTaskPublishResult::ProtocolError;
+    }
+    for (uint32_t index = 0; index < count; ++index) {
+        const SharedTensorMapValue &entry = entries[index];
+        if (entry.producer != current_task || entry.reserved != 0 || entry.lo >= entry.hi) {
+            return DistSharedTensorMapTaskPublishResult::ProtocolError;
+        }
+    }
+
+    int64_t reclaim_upto = -2;
+    if (!dist_shared_tensor_map_refresh_reclaim_impl<Ops>(map, current_task, history, reclaim_upto)) {
+        return DistSharedTensorMapTaskPublishResult::ProtocolError;
+    }
+    uint64_t planned_cursors[MAX_TENSOR_ARGS];
+    const DistSharedTensorMapAppendCheck check = dist_shared_tensor_map_check_task_append_impl<Ops>(
+        map, entries, count, current_task, reclaim_upto, planned_cursors
+    );
+    if (check == DistSharedTensorMapAppendCheck::CapacityBlocked) {
+        return DistSharedTensorMapTaskPublishResult::CapacityBlocked;
+    }
+    if (check != DistSharedTensorMapAppendCheck::Ready) {
+        return DistSharedTensorMapTaskPublishResult::ProtocolError;
+    }
+
+    return dist_shared_tensor_map_publish_prepared_task_impl<Ops>(map, entries, planned_cursors, count, current_task);
 }
 
 struct DistSharedTensorMapAicoreOps {
@@ -341,8 +423,8 @@ struct DistSharedTensorMapAicoreOps {
     }
 };
 
-// 这些 concrete wrappers 强制 Host/CPU-sim/CCEC 三类编译器都实例化同一套
-// production primitive；S2 尚未从 facade 调用它们。
+// These concrete wrappers force Host, CPU-sim, and CCEC to instantiate the
+// same production primitives. The S2 facade does not call them yet.
 PTO_DEVICE_FUNC inline int32_t dist_shared_tensor_map_lookup_region(
     __gm__ SharedTensorMapState &map, const SharedTensorMapValue &query, int32_t current_task, int32_t history,
     bool &protocol_ok
@@ -369,26 +451,13 @@ PTO_DEVICE_FUNC inline bool dist_shared_tensor_map_refresh_reclaim(
     );
 }
 
-PTO_DEVICE_FUNC inline DistSharedTensorMapAppendCheck dist_shared_tensor_map_check_task_append(
+PTO_DEVICE_FUNC inline DistSharedTensorMapTaskPublishResult dist_shared_tensor_map_publish_task(
     __gm__ SharedTensorMapState &map, const SharedTensorMapValue *entries, uint32_t count, int32_t current_task,
-    int64_t reclaim_upto
+    int32_t history
 ) {
-    return dist_shared_tensor_map_check_task_append_impl<DistSharedTensorMapAicoreOps>(
-        map, entries, count, current_task, reclaim_upto
+    return dist_shared_tensor_map_publish_task_impl<DistSharedTensorMapAicoreOps>(
+        map, entries, count, current_task, history
     );
-}
-
-PTO_DEVICE_FUNC inline bool dist_shared_tensor_map_append_prepared_task(
-    __gm__ SharedTensorMapState &map, const SharedTensorMapValue *entries, uint32_t count, int32_t current_task
-) {
-    return dist_shared_tensor_map_append_prepared_task_impl<DistSharedTensorMapAicoreOps>(
-        map, entries, count, current_task
-    );
-}
-
-PTO_DEVICE_FUNC inline bool
-dist_shared_tensor_map_publish_commit(__gm__ SharedTensorMapState &map, int32_t current_task) {
-    return dist_shared_tensor_map_publish_commit_impl<DistSharedTensorMapAicoreOps>(map, current_task);
 }
 
 }  // namespace

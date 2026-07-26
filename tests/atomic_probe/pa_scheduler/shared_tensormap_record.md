@@ -1,3 +1,5 @@
+<!-- markdownlint-disable MD060 -->
+
 # A5 FDWIC Shared TensorMap 分支架构审查记录
 
 本文审查
@@ -7280,3 +7282,97 @@ AIC `.text` 为 94,600B、SHA256 `a8eae234f72f...`，AIV 为 95,512B、
 SHA256 `5dbfda402594...`，均与 S1 冻结产物逐字节相同。完整 `.o` 仍不用于
 热路径判定。真实 A5 CAS 顺序 litmus 属于接线前门槛，不会用当前纯编译结果
 替代。
+
+### 2026-07-26：S2d 区分协议拒绝与不可恢复的部分发布
+
+S2c 的 CAS 已经保证失败 writer 不会覆写竞争控制字，但
+`append_prepared_task()` 和 `publish_commit()` 仍只返回 `bool`。这个口径
+无法告诉 Submit：失败发生在本调用写任何当前 task payload 之前，还是已经
+写入一个或多个 slot 之后。两种情况都必须停止当前 task，但后者的 shared
+sidecar 已经处于只能由下一轮 AICPU reset 清理的部分发布状态，不能重试或
+回滚。前者只说明本调用没有发布当前 task entry，不证明整个 sidecar 干净：
+竞争 writer 仍可能已经破坏共享控制字，因此也必须 fatal/reset。
+
+本阶段仍不接 Submit、不解除 shared 门禁，只增加两层精确结果：
+
+| 层次 | 结果 | 含义 |
+| --- | --- | --- |
+| 单 entry | `Published` | payload、absolute seq 和 tail 均已发布 |
+| 单 entry | `ProtocolError` | slot ownership 前拒绝，当前 entry 未写 payload |
+| 单 entry | `PartialPublish` | ownership 后的 seq 或 tail 发布失败 |
+| 整 task | `Committed` | 所有 entry 和 `N -> N+1` commit 完成 |
+| 整 task | `CapacityBlocked` | 整批 preflight 容量不足，未发布当前 task |
+| 整 task | `ProtocolError` | 未发布任何当前 task entry 即拒绝 |
+| 整 task | `PartialPublish` | 至少一个 entry 已发布，或非空 task commit 失败 |
+
+`dist_shared_tensor_map_publish_task_impl()` 的固定顺序为：
+
+```text
+参数与全部 entry 只读校验
+  -> refresh reclaim
+  -> 整 task preflight 并冻结每个 entry 的 planned cursor
+  -> 逐 entry 校验 tail==planned cursor 后 ownership/payload/seq/tail
+  -> CAS committed_tasks: N -> N+1
+```
+
+第一个 entry 的 ownership CAS 失败属于纯协议拒绝；第二个及以后 entry
+即使在 ownership 前失败，由于更早 entry 已经发布，也必须上报
+`PartialPublish`。零 entry task 的 commit CAS 失败没有 slot 副作用，仍是
+`ProtocolError`；非空 task 的同一失败则是 `PartialPublish`。任何部分发布
+都保留原现场，不写回旧 seq、不回退 tail、不恢复 commit。
+
+preflight 与 publish 之间也不能重新按“当前 tail”选槽。否则两个非法
+same-task writer 都通过旧 preflight 后，后到者可能跟随先到者推进后的
+tail，转而发布一个从未预检的新槽，甚至错误 commit。现在 preflight 为每个
+entry 保存固定 cursor；publish 发现 tail 漂移时在 ownership 前拒绝。新增
+门槛显式在 preflight 后把 tail 从 0 改为 1，结果必须为
+`ProtocolError`，cursor 0/1 的 payload 与 seq 均保持不变，commit 仍为 0。
+
+原有五档 CAP 的 driver 已切换为调用这条 production task wrapper，因此
+12,000-task 差分、容量、回收、三圈复用和零 entry commit 不再绕过新接口。
+新增故障门槛逐项覆盖：
+
+- 首槽 ownership CAS 失败：payload/tail/commit 均不变，返回
+  `ProtocolError`；
+- `WRITING -> seq` 失败：payload 已 flush，返回 `PartialPublish`；
+- tail CAS 失败：payload/seq 已发布，返回 `PartialPublish`；
+- 非空 task commit CAS 失败：slot/tail 已发布，返回
+  `PartialPublish`；
+- 零 entry commit CAS 失败：无 slot 副作用，返回 `ProtocolError`；
+- 第二槽 ownership CAS 失败：第一槽保持发布、task 不 commit，返回
+  `PartialPublish`。
+- preflight 后 tail 漂移：不得转到未经预检的新槽，返回
+  `ProtocolError`。
+
+验证结果：
+
+| 检查 | 结果 |
+| --- | --- |
+| CAP32/64/128/256/16384 shared ring UT | 5/5 PASS，每档 18 项 |
+| GCC15 ASAN+UBSAN 同一五档门槛 | 5/5 PASS，无报告 |
+| CCEC production wrapper 显式实例化 | AIC/AIV 均编译通过 |
+| A5sim/A5 private/shared runtime artifact | 四种组合均构建通过 |
+| 同口径 private `.text` 对照 | AIC/AIV 与 clean 父提交逐字节相同 |
+| `git diff --check` | PASS |
+
+CCEC 证据位于：
+
+```text
+/tmp/fdwic-s2d-task-result-ccec-20260726/
+```
+
+private 对照使用 clean `177a09c7` detached worktree 与当前主工作树分别重建
+同一 A5 private artifact。AIC `.text` 均为 86,344B、SHA256
+`f7aacd262526...`；AIV 均为 86,704B、SHA256 `3938bd4fa2c5...`，两组
+`cmp` 均为逐字节相同。这里不与 S2c 的 94,600/95,512B 比较，因为后者来自
+另一构建变体。审计证据位于：
+
+```text
+/tmp/fdwic-private-head-177a09c7-20260726/text-compare-safe/
+```
+
+当前枚举还没有映射成 Host 错误码。真实接入时容量不足继续使用
+`PTO2_ERROR_TENSORMAP_CAPACITY`；纯协议拒绝和部分发布必须保留不同错误码，
+并共同执行 fail-stop、不 Build、不 completion、所有 wait/drain 感知 fatal
+后退出。该收敛属于下一阶段 production Submit 门槛，不能用本阶段的原语
+测试代替。
