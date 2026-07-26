@@ -372,7 +372,9 @@ class TestRuntimeBuilderGetBinaries:
             call for call in mock_instance.compile.call_args_list if call.args[0] in {"host", "aicpu", "aicore"}
         ]
         assert len(runtime_calls) == 3
-        assert {tuple(call.kwargs["compile_definitions"]) for call in runtime_calls} == {("PTO_FDWIC_SHARED_MAP=1",)}
+        assert {tuple(call.kwargs["compile_definitions"]) for call in runtime_calls} == {
+            ("PTO_FDWIC_SHARED_MAP=1", "PTO_FDWIC_TENSORMAP_RING_CAP=128")
+        }
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_private_mode_does_not_change_other_runtime_artifacts(self, MockCompiler, tmp_path, monkeypatch):
@@ -424,8 +426,12 @@ class TestRuntimeBuilderGetBinaries:
         assert {Path(call.kwargs["build_dir"]) for call in shared_calls} == {
             tmp_path / "build" / "cache" / "a5" / "onboard" / runtime / "shared"
         }
-        assert {tuple(call.kwargs["compile_definitions"]) for call in private_calls} == {("PTO_FDWIC_SHARED_MAP=0",)}
-        assert {tuple(call.kwargs["compile_definitions"]) for call in shared_calls} == {("PTO_FDWIC_SHARED_MAP=1",)}
+        assert {tuple(call.kwargs["compile_definitions"]) for call in private_calls} == {
+            ("PTO_FDWIC_SHARED_MAP=0", "PTO_FDWIC_TENSORMAP_RING_CAP=128")
+        }
+        assert {tuple(call.kwargs["compile_definitions"]) for call in shared_calls} == {
+            ("PTO_FDWIC_SHARED_MAP=1", "PTO_FDWIC_TENSORMAP_RING_CAP=128")
+        }
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_fdwic_baseline_source_state_tracks_contents_and_mode(self, MockCompiler, tmp_path, monkeypatch):
@@ -514,6 +520,7 @@ class TestFdwicAicoreExtraBuild:
         )
         assert call.kwargs["compile_definitions"] == [
             "PTO_FDWIC_SHARED_MAP=1",
+            "PTO_FDWIC_TENSORMAP_RING_CAP=128",
             "PTO_FDWIC_PERF_CLOCK=1",
             "PTO_FDWIC_TRACE_ENABLED=0",
         ]
@@ -533,6 +540,14 @@ class TestFdwicAicoreExtraBuild:
                 [],
                 "conflict",
                 compile_definitions=["PTO_FDWIC_SHARED_MAP=0"],
+            )
+
+        with pytest.raises(ValueError, match="Conflicting compile definitions for PTO_FDWIC_TENSORMAP_RING_CAP"):
+            builder.build_aicore_with_extra_sources(
+                runtime,
+                [],
+                "cap-conflict",
+                compile_definitions=["PTO_FDWIC_TENSORMAP_RING_CAP=64"],
             )
 
 

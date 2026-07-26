@@ -173,11 +173,17 @@ def test_fdwic_profile_partitions_compile_cache(monkeypatch):
 def test_fdwic_tensormap_mode_and_compile_definition_contract(monkeypatch):
     monkeypatch.delenv("PTO_FDWIC_TENSORMAP_MODE", raising=False)
     assert _fdwic_tensormap_mode() == "private"
-    assert _fdwic_tensormap_compile_definitions("a5", "fully_distributed_within_core") == ["PTO_FDWIC_SHARED_MAP=0"]
+    assert _fdwic_tensormap_compile_definitions("a5", "fully_distributed_within_core") == [
+        "PTO_FDWIC_SHARED_MAP=0",
+        "PTO_FDWIC_TENSORMAP_RING_CAP=128",
+    ]
 
     monkeypatch.setenv("PTO_FDWIC_TENSORMAP_MODE", "shared")
     assert _fdwic_tensormap_mode() == "shared"
-    assert _fdwic_tensormap_compile_definitions("a5sim", "fully_distributed_within_core") == ["PTO_FDWIC_SHARED_MAP=1"]
+    assert _fdwic_tensormap_compile_definitions("a5sim", "fully_distributed_within_core") == [
+        "PTO_FDWIC_SHARED_MAP=1",
+        "PTO_FDWIC_TENSORMAP_RING_CAP=128",
+    ]
     with pytest.raises(ValueError, match="only supported"):
         _fdwic_tensormap_compile_definitions("a5", "host_build_graph")
 
@@ -362,7 +368,11 @@ def test_submit_pmu_override_registers_build_identity_after_elf_gate(
         @staticmethod
         def effective_compile_definitions(name, compile_definitions=None):
             assert name == runtime
-            return ["PTO_FDWIC_SHARED_MAP=0", *(compile_definitions or [])]
+            return [
+                "PTO_FDWIC_SHARED_MAP=0",
+                "PTO_FDWIC_TENSORMAP_RING_CAP=128",
+                *(compile_definitions or []),
+            ]
 
         def get_binaries(self, name):
             assert name == runtime
@@ -404,7 +414,11 @@ def test_submit_pmu_override_registers_build_identity_after_elf_gate(
         "profile": profile,
         "profiled_cache_key": profiled_key,
         "aicore_extra_cache_key": extra_key,
-        "compile_definitions": ["PTO_FDWIC_SHARED_MAP=0", *expected_compile_definitions],
+        "compile_definitions": [
+            "PTO_FDWIC_SHARED_MAP=0",
+            "PTO_FDWIC_TENSORMAP_RING_CAP=128",
+            *expected_compile_definitions,
+        ],
         "aicore_kernel": binary,
         "aicore_build_dir": expected_build_dir,
         "host_runtime": host,

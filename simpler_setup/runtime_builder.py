@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 from .environment import PROJECT_ROOT
+from .fdwic_build_config import fdwic_tensormap_ring_cap_definition
 from .platform_info import TARGETS, load_build_config, parse_platform
 from .runtime_compiler import RuntimeCompiler
 
@@ -257,6 +258,7 @@ class RuntimeBuilder:
         if self._is_fdwic_runtime(name):
             shared_value = 1 if self.fdwic_tensormap_mode == "shared" else 0
             mode_definitions.append(f"{_FDWIC_SHARED_MAP_DEFINITION}={shared_value}")
+            mode_definitions.append(fdwic_tensormap_ring_cap_definition())
         return self._merge_compile_definitions(mode_definitions, compile_definitions)
 
     @staticmethod

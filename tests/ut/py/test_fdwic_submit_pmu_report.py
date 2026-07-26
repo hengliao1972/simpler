@@ -19,6 +19,7 @@ from typing import Any, Callable
 import pytest
 
 import simpler_setup.tools.fdwic_submit_pmu_report as report_module
+from simpler_setup.fdwic_build_config import FDWIC_TENSORMAP_RING_CAP
 from simpler_setup.tools.fdwic_submit_pmu_report import (
     ALLOC_COMPLETE_CAPTURE_MODE,
     ARG_BUILD_CAPTURE_MODE,
@@ -694,6 +695,7 @@ def _fake_build_identity(
 
     compile_definitions = [
         f"PTO_FDWIC_SHARED_MAP={1 if tensormap_mode == 'shared' else 0}",
+        f"PTO_FDWIC_TENSORMAP_RING_CAP={FDWIC_TENSORMAP_RING_CAP}",
         "PTO_FDWIC_SUBMIT_PMU=1",
     ]
     if profile != "submit-pmu-none":
@@ -2420,6 +2422,7 @@ def test_efdrain_control_build_identity_uses_phase_id_7(
     assert identity.profile == EFDRAIN_CONTROL_CAPTURE_MODE
     assert identity.compile_definitions == (
         "PTO_FDWIC_SHARED_MAP=0",
+        "PTO_FDWIC_TENSORMAP_RING_CAP=128",
         "PTO_FDWIC_SUBMIT_PMU=1",
         "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=7",
         "PTO_FDWIC_TRACE_ENABLED=0",
@@ -2464,6 +2467,7 @@ def test_each_phase_profile_closes_raw_identity_provenance_and_html(
     assert provenance["build"]["profile"] == profile
     assert provenance["build"]["compile_definitions"] == [
         "PTO_FDWIC_SHARED_MAP=0",
+        "PTO_FDWIC_TENSORMAP_RING_CAP=128",
         "PTO_FDWIC_SUBMIT_PMU=1",
         f"PTO_FDWIC_SUBMIT_PMU_PHASE_ID={phase_id}",
         "PTO_FDWIC_TRACE_ENABLED=0",

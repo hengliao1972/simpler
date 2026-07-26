@@ -34,6 +34,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from .fdwic_build_config import fdwic_tensormap_ring_cap_definition
 from .log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, configure_logging
 from .pto_isa import ensure_pto_isa_root
 
@@ -130,7 +131,10 @@ def _fdwic_tensormap_compile_definitions(platform: str, runtime: str) -> list[st
         )
     if not is_fdwic:
         return None
-    return [f"PTO_FDWIC_SHARED_MAP={1 if mode == _FDWIC_TENSORMAP_SHARED else 0}"]
+    return [
+        f"PTO_FDWIC_SHARED_MAP={1 if mode == _FDWIC_TENSORMAP_SHARED else 0}",
+        fdwic_tensormap_ring_cap_definition(),
+    ]
 
 
 def _fdwic_profile() -> str:

@@ -122,9 +122,9 @@ extern "C" int bind_callable_to_runtime_impl(
     if (!fdwic_build_identity_matches(runtime->fdwic_build_identity, static_cast<uint32_t>(sizeof(Runtime)))) {
         LOG_ERROR(
             "FDWIC host Runtime build identity is corrupt or stale "
-            "(abi=%u, mode=%u, runtime_bytes=%u)",
+            "(abi=%u, mode=%u, ring_cap=%u, runtime_bytes=%u)",
             runtime->fdwic_build_identity.abi_version, runtime->fdwic_build_identity.tensor_map_mode,
-            runtime->fdwic_build_identity.runtime_bytes
+            runtime->fdwic_build_identity.tensor_map_ring_cap, runtime->fdwic_build_identity.runtime_bytes
         );
         return -1;
     }

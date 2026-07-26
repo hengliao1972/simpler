@@ -250,13 +250,14 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             if (!dispatch_dist_run) {
                 LOG_ERROR(
                     "Thread %d: FDWIC build identity mismatch "
-                    "(magic=0x%" PRIx64 ", abi=%u, mode=%u, runtime_bytes=%u, dist_layout=%u; "
-                    "expected abi=%u, mode=%u, runtime_bytes=%zu, dist_layout=%u)",
+                    "(magic=0x%" PRIx64 ", abi=%u, mode=%u, ring_cap=%u, runtime_bytes=%u, dist_layout=%u; "
+                    "expected abi=%u, mode=%u, ring_cap=%u, runtime_bytes=%zu, dist_layout=%u)",
                     thread_idx, static_cast<uint64_t>(runtime->fdwic_build_identity.magic),
                     runtime->fdwic_build_identity.abi_version, runtime->fdwic_build_identity.tensor_map_mode,
-                    runtime->fdwic_build_identity.runtime_bytes,
+                    runtime->fdwic_build_identity.tensor_map_ring_cap, runtime->fdwic_build_identity.runtime_bytes,
                     runtime->fdwic_build_identity.dist_global_layout_version, kFdwicBuildAbiVersion,
-                    static_cast<uint32_t>(kFdwicCompiledTensorMapMode), sizeof(Runtime), kFdwicDistGlobalLayoutVersion
+                    static_cast<uint32_t>(kFdwicCompiledTensorMapMode), kFdwicTensorMapRingCap, sizeof(Runtime),
+                    kFdwicDistGlobalLayoutVersion
                 );
                 __atomic_fetch_or(
                     &runtime->fdwic_build_identity.error_bits, static_cast<uint32_t>(FdwicBuildErrorAicpuMismatch),

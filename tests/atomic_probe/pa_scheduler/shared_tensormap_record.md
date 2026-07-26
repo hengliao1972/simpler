@@ -6605,3 +6605,64 @@ orchestration SO 和本轮参数，没有一份可枚举的 FDWIC task/output ma
 若 CAP 还要反过来决定本轮实际 arena 分配大小，AICPU prepass 已经太晚，只能
 再增加 Host-native planner 或两阶段 launch。当前下一步先迁移 private
 ring，并保持 16K 预分配上限和明确溢出合同；planner 不与数据结构提交混做。
+
+### 2026-07-26：R1b-c 将 production CAP 纳入三镜像构建身份
+
+private 链表即将换成连续分桶 ring；此后 `CAP` 不只是调参值，还决定
+`bucket_count=16384/CAP`、哈希结果、槽下标及 bucket control 的解释方式。
+Host、AICPU、AICore 若使用不同 CAP，即使三份二进制都能单独加载，也会把
+同一块 GM 解释成不同的 TensorMap。因而先于 backend 迁移完成以下闭环：
+
+1. `PTO_FDWIC_TENSORMAP_RING_CAP` 成为显式编译定义，当前 production
+   仍固定为已验证的 128，没有新增一个未经证明的运行期 `auto`；
+2. RuntimeBuilder 对 Host/AICPU/AICore 统一注入
+   `mode + CAP`，isolated AICore 构建禁止额外定义覆盖二者；
+3. mode 继续由 private/shared 独立 artifact 目录隔离，完整编译定义继续
+   进入 source fingerprint。当前 CAP 不可配置，因此不会产生同目录下的
+   两种合法 CAP；将来若开放 CAP，必须再把它加入 artifact path 和 scene
+   cache key，不能只放开宏；
+4. orchestration 与三镜像使用同一个 Python CAP 常量，Submit-PMU
+   provenance 同时封存 CAP，拒绝把不同布局的诊断 ELF 与 raw/HTML 绑定；
+5. 设备侧 build identity 升为 ABI v2，并比较
+   `magic/abi/mode/CAP/runtime_bytes/dist-layout` 全部字段。
+
+#### 保留旧错误位 offset，而不是机械地在中间插字段
+
+第一次草稿把 CAP 插到 `tensor_map_mode` 后面，导致
+`runtime_bytes/dist_layout/error_bits` 整体后移。只看“同版本三镜像”测试
+不会暴露问题，但新旧 AICore 混件时，失败方会按自己的结构布局写
+`error_bits`，AICPU 可能从另一个 offset 读取，从而漏掉
+`AicoreMismatch`。
+
+最终布局把 CAP 放到 v1 的首个 reserved 字：
+
+| 字段 | 固定 offset |
+| --- | ---: |
+| `runtime_bytes` | 16 |
+| `dist_global_layout_version` | 20 |
+| `error_bits` | 24 |
+| `tensor_map_ring_cap` | 28 |
+
+四个 offset 与 64B cacheline 大小均由编译期断言和 production Runtime UT
+锁定。这样旧镜像即使不理解 CAP，也仍会在双方都认识的 offset 24 发布
+mismatch；ABI 版本差异负责拒绝继续执行。
+
+#### 本阶段证据
+
+| 检查 | 结果 |
+| --- | --- |
+| Python RuntimeBuilder/scene/provenance 非集成回归 | 371 PASS，12 个真实构建参数用例按范围排除 |
+| private/shared build identity C++ UT | 2/2 PASS |
+| private/shared × A5sim/A5 三镜像重建 | 4/4 PASS |
+| A5sim private PA Case1 B256 正常路径 | PASS |
+| Submit-PMU 直接脚本入口（无 `PYTHONPATH`） | `--help` PASS |
+| Ruff / `git diff --check` | PASS |
+
+完整 Python 组合另得到 378 PASS、5 FAIL；5 个失败全部发生在既有 A2/A3
+真实构建的 `PTO2TaskPayload` 结构断言（实际 568、规范 576），与本次只作用
+于 A5 FDWIC 的 mode/CAP 单测无关，不能把它们记录成本阶段通过。
+
+本阶段没有改 `DistTensorMap`、Submit 或任何设备热路径。下一提交先增加一组
+不依赖 linked/ring 内部布局的逻辑 reference 门槛，再在独立提交中替换
+private backend；不能把 shared 的 `seq`、有序 tail、全局 reclaim 或
+region-indent 混入 private 存储迁移。

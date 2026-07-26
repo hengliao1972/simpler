@@ -24,15 +24,33 @@
 #error "PTO_FDWIC_SHARED_MAP must be 0 (private) or 1 (shared)"
 #endif
 
+#ifndef PTO_FDWIC_TENSORMAP_RING_CAP
+#define PTO_FDWIC_TENSORMAP_RING_CAP 128
+#endif
+
+#if PTO_FDWIC_TENSORMAP_RING_CAP < 32 || PTO_FDWIC_TENSORMAP_RING_CAP > 16384
+#error "PTO_FDWIC_TENSORMAP_RING_CAP must be in [32, 16384]"
+#endif
+
+#if (PTO_FDWIC_TENSORMAP_RING_CAP & (PTO_FDWIC_TENSORMAP_RING_CAP - 1)) != 0
+#error "PTO_FDWIC_TENSORMAP_RING_CAP must be a power of two"
+#endif
+
+#if (16384 % PTO_FDWIC_TENSORMAP_RING_CAP) != 0
+#error "PTO_FDWIC_TENSORMAP_RING_CAP must divide the fixed 16K physical slot pool"
+#endif
+
 enum class FdwicTensorMapMode : uint32_t {
     Private = 0,
     Shared = 1,
 };
 
 inline constexpr uint64_t kFdwicBuildIdentityMagic = 0x46445749434d4150ULL;  // "FDWICMAP"
-inline constexpr uint32_t kFdwicBuildAbiVersion = 1;
+inline constexpr uint32_t kFdwicBuildAbiVersion = 2;
 inline constexpr uint32_t kFdwicDistGlobalLayoutVersion = 2;
 inline constexpr FdwicTensorMapMode kFdwicCompiledTensorMapMode = static_cast<FdwicTensorMapMode>(PTO_FDWIC_SHARED_MAP);
+inline constexpr uint32_t kFdwicTensorMapRingCap = PTO_FDWIC_TENSORMAP_RING_CAP;
+inline constexpr uint32_t kFdwicTensorMapRingBuckets = 16384U / kFdwicTensorMapRingCap;
 
 // 第一阶段只建立构建身份，尚未把 shared backend 接入真实调度路径。
 // shared 镜像可以完整编译和参与 ABI 负向测试，但必须在零 Submit 前拒绝
@@ -56,12 +74,20 @@ struct alignas(64) FdwicBuildIdentity {
     uint32_t runtime_bytes;
     uint32_t dist_global_layout_version;
     volatile uint32_t error_bits;
-    uint32_t reserved[9];
+    uint32_t tensor_map_ring_cap;
+    uint32_t reserved[8];
 };
 
 static_assert(sizeof(FdwicBuildIdentity) == 64, "FDWIC build identity must occupy exactly one cache line");
 static_assert(alignof(FdwicBuildIdentity) == 64, "FDWIC build identity must be cache-line aligned");
-static_assert(offsetof(FdwicBuildIdentity, error_bits) < 64, "FDWIC error bits must stay in the identity line");
+// 前三个控制字段已经被 v1 Host/AICPU/AICore 共同使用。新增身份字段只能
+// 消耗旧 reserved，不能移动错误位；否则新旧 AICore 混件时，失败方会把
+// mismatch 写到另一镜像看不到的偏移。
+static_assert(offsetof(FdwicBuildIdentity, runtime_bytes) == 16, "FDWIC runtime-size identity offset changed");
+static_assert(
+    offsetof(FdwicBuildIdentity, dist_global_layout_version) == 20, "FDWIC dist-layout identity offset changed");
+static_assert(offsetof(FdwicBuildIdentity, error_bits) == 24, "FDWIC cross-image error-bit offset changed");
+static_assert(offsetof(FdwicBuildIdentity, tensor_map_ring_cap) == 28, "FDWIC ring-cap identity offset changed");
 
 inline FdwicBuildIdentity fdwic_make_build_identity(uint32_t runtime_bytes) {
     return {
@@ -71,6 +97,7 @@ inline FdwicBuildIdentity fdwic_make_build_identity(uint32_t runtime_bytes) {
         runtime_bytes,
         kFdwicDistGlobalLayoutVersion,
         FdwicBuildErrorNone,
+        kFdwicTensorMapRingCap,
         {},
     };
 }
@@ -83,6 +110,7 @@ inline bool fdwic_build_identity_matches(const volatile FdwicBuildIdentity &iden
 #endif
     return identity.magic == kFdwicBuildIdentityMagic && identity.abi_version == kFdwicBuildAbiVersion &&
            identity.tensor_map_mode == static_cast<uint32_t>(kFdwicCompiledTensorMapMode) &&
+           identity.tensor_map_ring_cap == kFdwicTensorMapRingCap &&
            identity.runtime_bytes == expected_runtime_bytes &&
            identity.dist_global_layout_version == kFdwicDistGlobalLayoutVersion;
 }

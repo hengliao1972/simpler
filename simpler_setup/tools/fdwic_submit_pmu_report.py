@@ -27,6 +27,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+if __package__:
+    from ..fdwic_build_config import fdwic_tensormap_ring_cap_definition
+else:
+    # 保留使用文档中的直接脚本入口；该入口的 sys.path 默认只包含
+    # simpler_setup/tools，直接加入上一层读取统一构建常量，避免触发
+    # simpler_setup 包初始化及其编译环境依赖。
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from fdwic_build_config import fdwic_tensormap_ring_cap_definition  # type: ignore[no-redef]  # noqa: E402
+
 SCHEMA_NAME = "fdwic-submit-pmu-v3"
 DEFAULT_INPUT_NAME = "fdwic_submit_pmu_raw.json"
 DEFAULT_OUTPUT_NAME = "fdwic_submit_pmu_report.html"
@@ -187,6 +196,7 @@ def _expected_compile_definitions(profile: str, tensormap_mode: str = "private")
         _fail(f"unsupported FDWIC TensorMap mode {tensormap_mode!r}")
     definitions = [
         f"PTO_FDWIC_SHARED_MAP={1 if tensormap_mode == 'shared' else 0}",
+        fdwic_tensormap_ring_cap_definition(),
         "PTO_FDWIC_SUBMIT_PMU=1",
     ]
     if profile != NONE_CAPTURE_MODE:
