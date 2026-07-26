@@ -35,6 +35,9 @@ std::atomic<uint32_t> g_observed_turn_wait_spins{0};
 std::atomic<uint32_t> g_spins_after_remote_fatal{0};
 std::atomic<bool> g_remote_fatal_published{false};
 std::atomic<uint32_t> g_single_lane_kernel_calls{0};
+std::atomic<uint32_t> g_joint_kernel_entered[3]{};
+std::atomic<uint32_t> g_joint_kernel_exited[3]{};
+std::atomic<bool> g_joint_kernel_release[3]{};
 thread_local bool g_observe_turn_wait = false;
 thread_local bool g_limit_spins_after_remote_fatal = false;
 
@@ -53,6 +56,14 @@ void spin_wait_hint() {
 
 void count_single_lane_kernel(int64_t *) { g_single_lane_kernel_calls.fetch_add(1, std::memory_order_relaxed); }
 
+void run_joint_kernel(int32_t lane) {
+    g_joint_kernel_entered[lane].fetch_add(1, std::memory_order_release);
+    while (!g_joint_kernel_release[lane].load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    g_joint_kernel_exited[lane].fetch_add(1, std::memory_order_release);
+}
+
 }  // namespace fdwic_shared_multiworker_test
 
 // This is a test-only observation seam around the production wait loop. It
@@ -62,6 +73,16 @@ void count_single_lane_kernel(int64_t *) { g_single_lane_kernel_calls.fetch_add(
 #include "dist_engine/aicore/dist_engine.cpp"  // NOLINT(build/include)
 #include "dist_engine/aicpu/shared_tensor_map_init.h"
 #undef SPIN_WAIT_HINT
+
+namespace fdwic_shared_multiworker_test {
+
+void count_joint_aic_kernel(int64_t *) { run_joint_kernel(LANE_AIC); }
+
+void count_joint_aiv0_kernel(int64_t *) { run_joint_kernel(LANE_AIV0); }
+
+void count_joint_aiv1_kernel(int64_t *) { run_joint_kernel(LANE_AIV1); }
+
+}  // namespace fdwic_shared_multiworker_test
 
 [[noreturn]] void assert_impl(const char *condition, const char *, int) { throw std::logic_error(condition); }
 
@@ -88,6 +109,16 @@ Tensor make_existing_tensor(uint64_t address) {
         reinterpret_cast<void *>(static_cast<uintptr_t>(address)), sizeof(float), shape, 1, DataType::FLOAT32, 0
     );
     return tensor;
+}
+
+void install_test_callable(
+    Runtime &runtime, int32_t kernel_id, void (*kernel)(int64_t *), std::vector<uint8_t> &storage
+) {
+    const ArgDirection signature[] = {ArgDirection::OUT};
+    storage = make_callable<CORE_MAX_TENSOR_ARGS>(signature, 1, nullptr, /*binary_size=*/0);
+    CoreCallable *callable = reinterpret_cast<CoreCallable *>(storage.data());
+    callable->set_resolved_addr(reinterpret_cast<uint64_t>(kernel));
+    runtime.func_id_to_addr_[kernel_id] = reinterpret_cast<uint64_t>(callable);
 }
 
 int32_t built_slot_count(const DistCore &worker) {
@@ -130,6 +161,11 @@ protected:
         fdwic_shared_multiworker_test::g_spins_after_remote_fatal.store(0, std::memory_order_relaxed);
         fdwic_shared_multiworker_test::g_remote_fatal_published.store(false, std::memory_order_relaxed);
         fdwic_shared_multiworker_test::g_single_lane_kernel_calls.store(0, std::memory_order_relaxed);
+        for (int32_t lane = LANE_AIC; lane <= LANE_AIV1; ++lane) {
+            fdwic_shared_multiworker_test::g_joint_kernel_entered[lane].store(0, std::memory_order_relaxed);
+            fdwic_shared_multiworker_test::g_joint_kernel_exited[lane].store(0, std::memory_order_relaxed);
+            fdwic_shared_multiworker_test::g_joint_kernel_release[lane].store(false, std::memory_order_relaxed);
+        }
         g_dist_ptr = &g_dist_fallback;
         dist_shared_tensor_map_reset(g_dist.shared_tensor_map);
 
@@ -429,12 +465,10 @@ TEST_F(FdwicSharedMultiworkerTest, SingleLaneKernelExecutesOnceAndCompletesThrou
     L0TaskArgs args;
     args.add_output(output_info);
 
-    const ArgDirection signature[] = {ArgDirection::OUT};
-    std::vector<uint8_t> callable_storage =
-        make_callable<CORE_MAX_TENSOR_ARGS>(signature, 1, nullptr, /*binary_size=*/0);
-    CoreCallable *callable = reinterpret_cast<CoreCallable *>(callable_storage.data());
-    callable->set_resolved_addr(reinterpret_cast<uint64_t>(&fdwic_shared_multiworker_test::count_single_lane_kernel));
-    runtime_.func_id_to_addr_[kKernelId] = reinterpret_cast<uint64_t>(callable);
+    std::vector<uint8_t> callable_storage;
+    install_test_callable(
+        runtime_, kKernelId, &fdwic_shared_multiworker_test::count_single_lane_kernel, callable_storage
+    );
 
     g_dist.heap_base = heap.data();
     g_dist.heap_size = heap.size();
@@ -562,6 +596,508 @@ TEST_F(FdwicSharedMultiworkerTest, SingleLaneKernelExecutesOnceAndCompletesThrou
     EXPECT_EQ(atomic_load(g_dist.shared_tensor_map.committed_tasks.v), 1);
     EXPECT_EQ(g_dist.fatal, 0);
     EXPECT_EQ(g_dist.error_code, PTO2_ERROR_NONE);
+
+    EXPECT_EQ(g_dist.final_barrier.leaf_arrivals[0].v, 3);
+    EXPECT_EQ(g_dist.final_barrier.root_arrival.v, 1);
+    EXPECT_EQ(g_dist.final_barrier.root_release.v, 1);
+    EXPECT_EQ(g_dist.final_barrier.leaf_releases[0].v, 1);
+    for (int32_t group = 1; group < kFinalBarrierGroups; ++group) {
+        EXPECT_EQ(g_dist.final_barrier.leaf_arrivals[group].v, 0);
+        EXPECT_EQ(g_dist.final_barrier.leaf_releases[group].v, 0);
+    }
+}
+
+TEST_F(FdwicSharedMultiworkerTest, JointThreeLanePendingFollowersDrainAndLastLaneCompletesOnce) {
+    constexpr int32_t kAicKernelId = 31;
+    constexpr int32_t kAiv0KernelId = 32;
+    constexpr int32_t kAiv1KernelId = 33;
+    alignas(PTO2_PACKED_OUTPUT_ALIGN) std::array<uint8_t, 4096> heap{};
+    const uint32_t shape[1] = {1};
+    TensorCreateInfo output_info(shape, 1, DataType::FLOAT32);
+    L0TaskArgs args;
+    args.add_output(output_info);
+
+    std::vector<uint8_t> aic_callable;
+    std::vector<uint8_t> aiv0_callable;
+    std::vector<uint8_t> aiv1_callable;
+    install_test_callable(runtime_, kAicKernelId, &fdwic_shared_multiworker_test::count_joint_aic_kernel, aic_callable);
+    install_test_callable(
+        runtime_, kAiv0KernelId, &fdwic_shared_multiworker_test::count_joint_aiv0_kernel, aiv0_callable
+    );
+    install_test_callable(
+        runtime_, kAiv1KernelId, &fdwic_shared_multiworker_test::count_joint_aiv1_kernel, aiv1_callable
+    );
+
+    g_dist.heap_base = heap.data();
+    g_dist.heap_size = heap.size();
+    g_dist.num_workers = 3;
+    g_dist.num_blocks = 1;
+    g_dist.final_barrier.leaf_arrivals[0].expected = 3;
+    g_dist.final_barrier.root_arrival.expected = 1;
+
+    MixedKernels mixed;
+    mixed.aic_kernel_id = kAicKernelId;
+    mixed.aiv0_kernel_id = kAiv0KernelId;
+    mixed.aiv1_kernel_id = kAiv1KernelId;
+
+    // CPU-sim keeps the "joint submit has been seen" fact in TLS. Each physical
+    // worker therefore stays on one host thread from Begin through FinalDrain,
+    // matching the persistent A5 worker lifecycle instead of manually seeding
+    // the test-only thread-local state.
+    DistCore *workers[3] = {aic_worker_.get(), task0_worker_.get(), task1_worker_.get()};
+    DistCompeteFirstTicket tickets[3]{};
+    std::exception_ptr errors[3];
+    std::atomic<bool> allow_begin[3]{};
+    std::atomic<bool> begin_done[3]{};
+    std::atomic<bool> allow_finish[3]{};
+    std::atomic<bool> finish_done[3]{};
+    std::atomic<bool> drain_returned[3]{};
+    std::atomic<bool> failed[3]{};
+    std::atomic<bool> tls_after_begin[3]{};
+    std::atomic<bool> tls_after_finish[3]{};
+    std::atomic<bool> start_drain{false};
+    std::atomic<bool> abort_workers{false};
+
+    auto worker_main = [&](int32_t lane) {
+        g_self = workers[lane];
+        g_fdwic_joint_submit_seen = false;
+        try {
+            while (!allow_begin[lane].load(std::memory_order_acquire) &&
+                   !abort_workers.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            if (!abort_workers.load(std::memory_order_acquire)) {
+                tickets[lane] = dist_submit_compete_first_begin(nullptr, mixed);
+                tls_after_begin[lane].store(g_fdwic_joint_submit_seen, std::memory_order_relaxed);
+            }
+            begin_done[lane].store(true, std::memory_order_release);
+
+            while (!allow_finish[lane].load(std::memory_order_acquire) &&
+                   !abort_workers.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            if (!abort_workers.load(std::memory_order_acquire)) {
+                (void)dist_submit_compete_first_finish(nullptr, mixed, tickets[lane], args);
+                tls_after_finish[lane].store(g_fdwic_joint_submit_seen, std::memory_order_relaxed);
+            }
+            finish_done[lane].store(true, std::memory_order_release);
+
+            while (!start_drain.load(std::memory_order_acquire) && !abort_workers.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            if (!abort_workers.load(std::memory_order_acquire)) {
+                dist_submit_drain_to_completion(workers[lane]);
+            }
+        } catch (...) {
+            errors[lane] = std::current_exception();
+            failed[lane].store(true, std::memory_order_release);
+        }
+        begin_done[lane].store(true, std::memory_order_release);
+        finish_done[lane].store(true, std::memory_order_release);
+        drain_returned[lane].store(true, std::memory_order_release);
+        g_self = nullptr;
+    };
+
+    std::thread aic_thread(worker_main, LANE_AIC);
+    std::thread aiv0_thread(worker_main, LANE_AIV0);
+    std::thread aiv1_thread(worker_main, LANE_AIV1);
+
+    auto release_all_gates = [&](bool abort) {
+        if (abort) {
+            abort_workers.store(true, std::memory_order_release);
+        }
+        for (int32_t lane = LANE_AIC; lane <= LANE_AIV1; ++lane) {
+            allow_begin[lane].store(true, std::memory_order_release);
+            allow_finish[lane].store(true, std::memory_order_release);
+            fdwic_shared_multiworker_test::g_joint_kernel_release[lane].store(true, std::memory_order_release);
+        }
+        start_drain.store(true, std::memory_order_release);
+    };
+    auto join_all_workers = [&]() {
+        if (aic_thread.joinable()) aic_thread.join();
+        if (aiv0_thread.joinable()) aiv0_thread.join();
+        if (aiv1_thread.joinable()) aiv1_thread.join();
+    };
+    auto abort_and_join = [&]() {
+        release_all_gates(/*abort=*/true);
+        join_all_workers();
+    };
+
+    const auto protocol_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    auto wait_until = [&](const auto &predicate) {
+        while (!predicate() && std::chrono::steady_clock::now() < protocol_deadline) {
+            std::this_thread::yield();
+        }
+        return predicate();
+    };
+
+    // AIC is the only eligible anchor for this active mask. Begin it first to
+    // make the staged observation deterministic, then let both followers
+    // replay the same task on their persistent worker threads.
+    allow_begin[LANE_AIC].store(true, std::memory_order_release);
+    const bool aic_begin_completed = wait_until([&]() {
+        return begin_done[LANE_AIC].load(std::memory_order_acquire);
+    });
+    if (!aic_begin_completed || failed[LANE_AIC].load(std::memory_order_acquire)) {
+        abort_and_join();
+        ADD_FAILURE() << "AIC Begin did not complete successfully";
+        return;
+    }
+    allow_begin[LANE_AIV0].store(true, std::memory_order_release);
+    allow_begin[LANE_AIV1].store(true, std::memory_order_release);
+    const bool all_begins_completed = wait_until([&]() {
+        return begin_done[LANE_AIC].load(std::memory_order_acquire) &&
+               begin_done[LANE_AIV0].load(std::memory_order_acquire) &&
+               begin_done[LANE_AIV1].load(std::memory_order_acquire);
+    });
+    const bool begins_succeeded =
+        aic_begin_completed && all_begins_completed && !failed[LANE_AIC].load(std::memory_order_acquire) &&
+        !failed[LANE_AIV0].load(std::memory_order_acquire) && !failed[LANE_AIV1].load(std::memory_order_acquire);
+    if (!begins_succeeded) {
+        abort_and_join();
+        ADD_FAILURE() << "all three persistent workers did not complete Begin successfully";
+        return;
+    }
+
+    // Finish both losers before the anchor publishes. Their real loser tail
+    // calls drain_block_won(), but any_pub is still zero, so both deposits must
+    // remain pending until these same threads enter FinalDrain.
+    allow_finish[LANE_AIV0].store(true, std::memory_order_release);
+    allow_finish[LANE_AIV1].store(true, std::memory_order_release);
+    const bool followers_finished = wait_until([&]() {
+        return finish_done[LANE_AIV0].load(std::memory_order_acquire) &&
+               finish_done[LANE_AIV1].load(std::memory_order_acquire);
+    });
+    const bool followers_succeeded = begins_succeeded && followers_finished &&
+                                     !failed[LANE_AIV0].load(std::memory_order_acquire) &&
+                                     !failed[LANE_AIV1].load(std::memory_order_acquire);
+    if (!followers_succeeded) {
+        abort_and_join();
+        ADD_FAILURE() << "both follower Finish calls did not complete successfully";
+        return;
+    }
+    const int64_t committed_before_anchor = atomic_load(g_dist.shared_tensor_map.committed_tasks.v);
+    const int32_t any_pub_before_anchor = atomic_load(g_dist.blocks[0].any_pub);
+    const int32_t aiv0_occupied_before_anchor = task0_worker_->occupied_count;
+    const int32_t aiv1_occupied_before_anchor = task1_worker_->occupied_count;
+    const int64_t flag_before_anchor = atomic_load(task_cell(0).flag);
+    const uint64_t vend_before_anchor = atomic_load(task_cell(0).vend);
+    const int64_t frontier_before_anchor = atomic_load(g_dist.frontier);
+
+    allow_finish[LANE_AIC].store(true, std::memory_order_release);
+    const bool anchor_finish_stage_reached = wait_until([&]() {
+        return finish_done[LANE_AIC].load(std::memory_order_acquire);
+    });
+    const bool anchor_finished =
+        followers_succeeded && anchor_finish_stage_reached && !failed[LANE_AIC].load(std::memory_order_acquire);
+    if (!anchor_finished) {
+        abort_and_join();
+        ADD_FAILURE() << "AIC anchor Finish did not complete successfully";
+        return;
+    }
+
+    struct JointDepositSnapshot {
+        bool present = false;
+        int64_t drained = -1;
+        int32_t func_id = INVALID_KERNEL_ID;
+        uint64_t function_bin_addr = 0;
+        int32_t sub_block_id = -1;
+        int32_t tensor_count = -1;
+        int32_t fanin_count = -1;
+        uint64_t tensor_addr = 0;
+        uint64_t tensor_size = 0;
+    };
+    struct AnchorSlotSnapshot {
+        bool found = false;
+        bool occupied = false;
+        bool built = false;
+        bool is_multicore = false;
+        int32_t task_id = -1;
+        int32_t func_id = INVALID_KERNEL_ID;
+        uint64_t function_bin_addr = 0;
+        int32_t won_block = -1;
+        int32_t won_slot = -1;
+        int32_t tensor_count = -1;
+        int32_t fanin_count = -1;
+        uint64_t tensor_addr = 0;
+        uint64_t tensor_size = 0;
+    };
+
+    int32_t published_index = -1;
+    int32_t published_count = 0;
+    int32_t non_free_won_slot_count = 0;
+    for (int32_t index = 0; index < kPrivateSlots; ++index) {
+        const int64_t state = atomic_load(g_dist.blocks[0].slots[index].state.v);
+        if (state != kWonStateFree) {
+            ++non_free_won_slot_count;
+        }
+        if (state == kWonStatePublished) {
+            published_index = index;
+            ++published_count;
+        }
+    }
+    WonSlot *won_slot = published_index >= 0 ? &g_dist.blocks[0].slots[published_index] : nullptr;
+    const RingSlot *anchor_slot = find_built_slot(*aic_worker_, 0);
+    JointDepositSnapshot deposits[3]{};
+    if (won_slot != nullptr) {
+        for (int32_t lane = LANE_AIC; lane <= LANE_AIV1; ++lane) {
+            const BuiltSubtask &source = won_slot->lane[lane];
+            JointDepositSnapshot &snapshot = deposits[lane];
+            snapshot.present = source.present;
+            snapshot.drained = atomic_load(won_slot->drained[lane].v);
+            snapshot.func_id = source.func_id;
+            snapshot.function_bin_addr = source.function_bin_addr;
+            snapshot.sub_block_id = source.sub_block_id;
+            snapshot.tensor_count = source.tensor_count;
+            snapshot.fanin_count = source.fanin_count;
+            if (source.tensor_count > 0) {
+                snapshot.tensor_addr = source.tensors[0].buffer.addr;
+                snapshot.tensor_size = source.tensors[0].buffer.size;
+            }
+        }
+    }
+    AnchorSlotSnapshot anchor_snapshot;
+    if (anchor_slot != nullptr) {
+        anchor_snapshot.found = true;
+        anchor_snapshot.occupied = anchor_slot->occupied;
+        anchor_snapshot.built = anchor_slot->built;
+        anchor_snapshot.is_multicore = anchor_slot->is_multicore;
+        anchor_snapshot.task_id = anchor_slot->task_id;
+        anchor_snapshot.func_id = anchor_slot->func_id;
+        anchor_snapshot.function_bin_addr = anchor_slot->function_bin_addr;
+        anchor_snapshot.won_block = anchor_slot->won_block;
+        anchor_snapshot.won_slot = anchor_slot->won_slot;
+        anchor_snapshot.tensor_count = anchor_slot->tensor_count;
+        anchor_snapshot.fanin_count = anchor_slot->fanin_count;
+        if (anchor_slot->tensor_count > 0) {
+            anchor_snapshot.tensor_addr = anchor_slot->tensors[0].buffer.addr;
+            anchor_snapshot.tensor_size = anchor_slot->tensors[0].buffer.size;
+        }
+    }
+
+    const bool tickets_ok = begins_succeeded && tickets[LANE_AIC].task_id == 0 && tickets[LANE_AIC].won == 1 &&
+                            tickets[LANE_AIC].joint == 1 && tickets[LANE_AIC].joint_init == 1 &&
+                            tickets[LANE_AIC].claim_attempted == 1 && tickets[LANE_AIC].joint_count == 3 &&
+                            tickets[LANE_AIC].joint_block == 0 && tickets[LANE_AIC].kernel_id == kAicKernelId &&
+                            tickets[LANE_AIV0].task_id == 0 && tickets[LANE_AIV0].won == 0 &&
+                            tickets[LANE_AIV0].joint == 1 && tickets[LANE_AIV0].joint_init == 0 &&
+                            tickets[LANE_AIV0].claim_attempted == 0 && tickets[LANE_AIV0].joint_count == 3 &&
+                            tickets[LANE_AIV0].joint_block == 0 && tickets[LANE_AIV0].kernel_id == INVALID_KERNEL_ID &&
+                            tickets[LANE_AIV1].task_id == 0 && tickets[LANE_AIV1].won == 0 &&
+                            tickets[LANE_AIV1].joint == 1 && tickets[LANE_AIV1].joint_init == 0 &&
+                            tickets[LANE_AIV1].claim_attempted == 0 && tickets[LANE_AIV1].joint_count == 3 &&
+                            tickets[LANE_AIV1].joint_block == 0 && tickets[LANE_AIV1].kernel_id == INVALID_KERNEL_ID;
+    const bool no_worker_failed = !failed[LANE_AIC].load(std::memory_order_acquire) &&
+                                  !failed[LANE_AIV0].load(std::memory_order_acquire) &&
+                                  !failed[LANE_AIV1].load(std::memory_order_acquire);
+    const bool published_slot_ok =
+        won_slot != nullptr && published_count == 1 && non_free_won_slot_count == 1 &&
+        atomic_load(won_slot->remaining.v) == 3 && !deposits[LANE_AIC].present && deposits[LANE_AIV0].present &&
+        deposits[LANE_AIV1].present && deposits[LANE_AIV0].drained == kDrainedFree &&
+        deposits[LANE_AIV1].drained == kDrainedFree && deposits[LANE_AIV0].func_id == kAiv0KernelId &&
+        deposits[LANE_AIV0].function_bin_addr ==
+            reinterpret_cast<uint64_t>(&fdwic_shared_multiworker_test::count_joint_aiv0_kernel) &&
+        deposits[LANE_AIV0].sub_block_id == 0 && deposits[LANE_AIV0].tensor_count == 1 &&
+        deposits[LANE_AIV0].fanin_count == 0 &&
+        deposits[LANE_AIV0].tensor_addr == reinterpret_cast<uint64_t>(heap.data()) &&
+        deposits[LANE_AIV0].tensor_size == sizeof(float) && deposits[LANE_AIV1].func_id == kAiv1KernelId &&
+        deposits[LANE_AIV1].function_bin_addr ==
+            reinterpret_cast<uint64_t>(&fdwic_shared_multiworker_test::count_joint_aiv1_kernel) &&
+        deposits[LANE_AIV1].sub_block_id == 1 && deposits[LANE_AIV1].tensor_count == 1 &&
+        deposits[LANE_AIV1].fanin_count == 0 &&
+        deposits[LANE_AIV1].tensor_addr == reinterpret_cast<uint64_t>(heap.data()) &&
+        deposits[LANE_AIV1].tensor_size == sizeof(float);
+    const bool anchor_slot_ok =
+        anchor_snapshot.found && anchor_snapshot.occupied && anchor_snapshot.built && anchor_snapshot.is_multicore &&
+        anchor_snapshot.task_id == 0 && anchor_snapshot.func_id == kAicKernelId &&
+        anchor_snapshot.function_bin_addr ==
+            reinterpret_cast<uint64_t>(&fdwic_shared_multiworker_test::count_joint_aic_kernel) &&
+        anchor_snapshot.won_block == 0 && anchor_snapshot.won_slot == published_index &&
+        anchor_snapshot.tensor_count == 1 && anchor_snapshot.fanin_count == 0 &&
+        anchor_snapshot.tensor_addr == reinterpret_cast<uint64_t>(heap.data()) &&
+        anchor_snapshot.tensor_size == sizeof(float) && aic_worker_->occupied_count == 1 &&
+        built_slot_count(*aic_worker_) == 1 && task0_worker_->occupied_count == 0 &&
+        task1_worker_->occupied_count == 0 && built_slot_count(*task0_worker_) == 0 &&
+        built_slot_count(*task1_worker_) == 0;
+    const bool pre_drain_ok = aic_begin_completed && all_begins_completed && followers_finished && anchor_finished &&
+                              no_worker_failed && tickets_ok && published_slot_ok && anchor_slot_ok;
+    if (!pre_drain_ok) {
+        abort_and_join();
+        EXPECT_TRUE(no_worker_failed);
+        EXPECT_TRUE(tickets_ok);
+        EXPECT_EQ(published_count, 1);
+        EXPECT_EQ(non_free_won_slot_count, 1);
+        EXPECT_TRUE(published_slot_ok);
+        EXPECT_TRUE(anchor_slot_ok);
+        ADD_FAILURE() << "joint task pre-FinalDrain invariants were not established";
+        return;
+    }
+    start_drain.store(true, std::memory_order_release);
+
+    auto all_joint_kernels_entered = [&]() {
+        for (int32_t lane = LANE_AIC; lane <= LANE_AIV1; ++lane) {
+            if (fdwic_shared_multiworker_test::g_joint_kernel_entered[lane].load(std::memory_order_acquire) != 1) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const bool all_kernels_entered = pre_drain_ok && wait_until(all_joint_kernels_entered);
+    const int64_t remaining_before_release = won_slot != nullptr ? atomic_load(won_slot->remaining.v) : -1;
+    const int64_t flag_before_release = atomic_load(task_cell(0).flag);
+    const int64_t state_before_release = won_slot != nullptr ? atomic_load(won_slot->state.v) : -1;
+
+    auto wait_remaining_and_returned = [&](int64_t expected, int32_t lane) {
+        if (won_slot == nullptr) return false;
+        return wait_until([&]() {
+            return atomic_load(won_slot->remaining.v) == expected &&
+                   drain_returned[lane].load(std::memory_order_acquire);
+        });
+    };
+
+    fdwic_shared_multiworker_test::g_joint_kernel_release[LANE_AIC].store(true, std::memory_order_release);
+    const bool anchor_decremented_and_returned = all_kernels_entered && wait_remaining_and_returned(2, LANE_AIC);
+    const int64_t flag_after_anchor = atomic_load(task_cell(0).flag);
+    const uint64_t vend_after_anchor = atomic_load(task_cell(0).vend);
+    const int64_t frontier_after_anchor = atomic_load(g_dist.frontier);
+    const int64_t state_after_anchor = won_slot != nullptr ? atomic_load(won_slot->state.v) : -1;
+    const uint32_t aiv1_exited_after_anchor =
+        fdwic_shared_multiworker_test::g_joint_kernel_exited[LANE_AIV1].load(std::memory_order_acquire);
+    const bool aiv1_returned_after_anchor = drain_returned[LANE_AIV1].load(std::memory_order_acquire);
+
+    fdwic_shared_multiworker_test::g_joint_kernel_release[LANE_AIV0].store(true, std::memory_order_release);
+    const bool first_follower_decremented_and_returned =
+        all_kernels_entered && wait_remaining_and_returned(1, LANE_AIV0);
+    const int64_t flag_after_first_follower = atomic_load(task_cell(0).flag);
+    const uint64_t vend_after_first_follower = atomic_load(task_cell(0).vend);
+    const int64_t frontier_after_first_follower = atomic_load(g_dist.frontier);
+    const int64_t state_after_first_follower = won_slot != nullptr ? atomic_load(won_slot->state.v) : -1;
+    const uint32_t aiv1_exited_after_first_follower =
+        fdwic_shared_multiworker_test::g_joint_kernel_exited[LANE_AIV1].load(std::memory_order_acquire);
+    const bool aiv1_returned_after_first_follower = drain_returned[LANE_AIV1].load(std::memory_order_acquire);
+
+    // Always release every test gate before joining, including a failed
+    // observation, so this test cannot manufacture its own deadlock.
+    release_all_gates(/*abort=*/false);
+    join_all_workers();
+
+    EXPECT_TRUE(aic_begin_completed);
+    EXPECT_TRUE(all_begins_completed);
+    EXPECT_TRUE(begins_succeeded);
+    EXPECT_TRUE(followers_finished);
+    EXPECT_TRUE(followers_succeeded);
+    EXPECT_TRUE(anchor_finish_stage_reached);
+    EXPECT_TRUE(anchor_finished);
+    EXPECT_TRUE(no_worker_failed);
+    EXPECT_TRUE(tickets_ok);
+    EXPECT_TRUE(published_slot_ok);
+    EXPECT_TRUE(anchor_slot_ok);
+    EXPECT_TRUE(pre_drain_ok);
+    EXPECT_TRUE(all_kernels_entered);
+    EXPECT_EQ(committed_before_anchor, 0);
+    EXPECT_EQ(any_pub_before_anchor, 0);
+    EXPECT_EQ(aiv0_occupied_before_anchor, 0);
+    EXPECT_EQ(aiv1_occupied_before_anchor, 0);
+    EXPECT_EQ(flag_before_anchor, 0);
+    EXPECT_EQ(vend_before_anchor, 0);
+    EXPECT_EQ(frontier_before_anchor, -1);
+
+    for (int32_t lane = LANE_AIC; lane <= LANE_AIV1; ++lane) {
+        EXPECT_TRUE(tls_after_begin[lane].load(std::memory_order_relaxed));
+        EXPECT_TRUE(tls_after_finish[lane].load(std::memory_order_relaxed));
+        EXPECT_TRUE(drain_returned[lane].load(std::memory_order_acquire));
+        EXPECT_EQ(errors[lane], nullptr);
+    }
+
+    ASSERT_NE(won_slot, nullptr);
+    EXPECT_EQ(atomic_load(g_dist.shared_tensor_map.committed_tasks.v), 1);
+    EXPECT_EQ(g_dist.fatal, 0);
+    EXPECT_EQ(g_dist.error_code, PTO2_ERROR_NONE);
+    EXPECT_EQ(g_dist.blocks[0].any_pub, 1);
+    EXPECT_EQ(remaining_before_release, 3);
+    EXPECT_EQ(flag_before_release, 0);
+    EXPECT_EQ(state_before_release, kWonStatePublished);
+    EXPECT_TRUE(anchor_decremented_and_returned);
+    EXPECT_EQ(flag_after_anchor, 0);
+    EXPECT_EQ(vend_after_anchor, 0);
+    EXPECT_EQ(frontier_after_anchor, -1);
+    EXPECT_EQ(state_after_anchor, kWonStatePublished);
+    EXPECT_EQ(aiv1_exited_after_anchor, 0);
+    EXPECT_FALSE(aiv1_returned_after_anchor);
+    EXPECT_TRUE(first_follower_decremented_and_returned);
+    EXPECT_EQ(flag_after_first_follower, 0);
+    EXPECT_EQ(vend_after_first_follower, 0);
+    EXPECT_EQ(frontier_after_first_follower, -1);
+    EXPECT_EQ(state_after_first_follower, kWonStatePublished);
+    EXPECT_EQ(aiv1_exited_after_first_follower, 0);
+    EXPECT_FALSE(aiv1_returned_after_first_follower);
+
+    EXPECT_FALSE(deposits[LANE_AIC].present);
+    EXPECT_TRUE(deposits[LANE_AIV0].present);
+    EXPECT_TRUE(deposits[LANE_AIV1].present);
+    EXPECT_EQ(deposits[LANE_AIV0].func_id, kAiv0KernelId);
+    EXPECT_EQ(deposits[LANE_AIV1].func_id, kAiv1KernelId);
+    EXPECT_EQ(deposits[LANE_AIV0].sub_block_id, 0);
+    EXPECT_EQ(deposits[LANE_AIV1].sub_block_id, 1);
+    EXPECT_EQ(deposits[LANE_AIV0].tensor_count, 1);
+    EXPECT_EQ(deposits[LANE_AIV1].tensor_count, 1);
+    EXPECT_EQ(deposits[LANE_AIV0].fanin_count, 0);
+    EXPECT_EQ(deposits[LANE_AIV1].fanin_count, 0);
+    EXPECT_EQ(deposits[LANE_AIV0].tensor_addr, reinterpret_cast<uint64_t>(heap.data()));
+    EXPECT_EQ(deposits[LANE_AIV1].tensor_addr, reinterpret_cast<uint64_t>(heap.data()));
+    EXPECT_EQ(deposits[LANE_AIV0].tensor_size, sizeof(float));
+    EXPECT_EQ(deposits[LANE_AIV1].tensor_size, sizeof(float));
+    EXPECT_EQ(
+        deposits[LANE_AIV0].function_bin_addr,
+        reinterpret_cast<uint64_t>(&fdwic_shared_multiworker_test::count_joint_aiv0_kernel)
+    );
+    EXPECT_EQ(
+        deposits[LANE_AIV1].function_bin_addr,
+        reinterpret_cast<uint64_t>(&fdwic_shared_multiworker_test::count_joint_aiv1_kernel)
+    );
+    EXPECT_EQ(atomic_load(won_slot->drained[LANE_AIV0].v), kDrainedClaimed);
+    EXPECT_EQ(atomic_load(won_slot->drained[LANE_AIV1].v), kDrainedClaimed);
+
+    EXPECT_TRUE(anchor_snapshot.is_multicore);
+    EXPECT_EQ(anchor_snapshot.func_id, kAicKernelId);
+    EXPECT_EQ(
+        anchor_snapshot.function_bin_addr,
+        reinterpret_cast<uint64_t>(&fdwic_shared_multiworker_test::count_joint_aic_kernel)
+    );
+    EXPECT_EQ(anchor_snapshot.won_block, 0);
+    EXPECT_EQ(anchor_snapshot.won_slot, published_index);
+    EXPECT_EQ(anchor_snapshot.tensor_count, 1);
+    EXPECT_EQ(anchor_snapshot.fanin_count, 0);
+    EXPECT_EQ(anchor_snapshot.tensor_addr, reinterpret_cast<uint64_t>(heap.data()));
+    EXPECT_EQ(anchor_snapshot.tensor_size, sizeof(float));
+    EXPECT_EQ(aic_worker_->heap_next, PTO2_PACKED_OUTPUT_ALIGN);
+    EXPECT_EQ(task0_worker_->heap_next, PTO2_PACKED_OUTPUT_ALIGN);
+    EXPECT_EQ(task1_worker_->heap_next, PTO2_PACKED_OUTPUT_ALIGN);
+    EXPECT_EQ(aic_worker_->owned_total, 0);
+    EXPECT_EQ(task0_worker_->owned_total, 1);
+    EXPECT_EQ(task1_worker_->owned_total, 1);
+
+    for (int32_t lane = LANE_AIC; lane <= LANE_AIV1; ++lane) {
+        EXPECT_EQ(fdwic_shared_multiworker_test::g_joint_kernel_entered[lane].load(std::memory_order_acquire), 1);
+        EXPECT_EQ(fdwic_shared_multiworker_test::g_joint_kernel_exited[lane].load(std::memory_order_acquire), 1);
+    }
+    EXPECT_EQ(atomic_load(won_slot->remaining.v), 0);
+    EXPECT_EQ(atomic_load(won_slot->state.v), kWonStateFree);
+    EXPECT_EQ(task_cell(0).flag, 1);
+    EXPECT_EQ(task_cell(0).vend, PTO2_PACKED_OUTPUT_ALIGN);
+    EXPECT_EQ(g_dist.frontier, 0);
+    EXPECT_EQ(aic_worker_->occupied_count, 0);
+    EXPECT_EQ(task0_worker_->occupied_count, 0);
+    EXPECT_EQ(task1_worker_->occupied_count, 0);
+    EXPECT_EQ(occupied_slot_count(*aic_worker_), 0);
+    EXPECT_EQ(occupied_slot_count(*task0_worker_), 0);
+    EXPECT_EQ(occupied_slot_count(*task1_worker_), 0);
+    EXPECT_EQ(built_slot_count(*aic_worker_), 0);
+    EXPECT_EQ(built_slot_count(*task0_worker_), 0);
+    EXPECT_EQ(built_slot_count(*task1_worker_), 0);
+    EXPECT_EQ(aic_worker_->local_index, 1);
+    EXPECT_EQ(task0_worker_->local_index, 1);
+    EXPECT_EQ(task1_worker_->local_index, 1);
 
     EXPECT_EQ(g_dist.final_barrier.leaf_arrivals[0].v, 3);
     EXPECT_EQ(g_dist.final_barrier.root_arrival.v, 1);

@@ -7928,3 +7928,111 @@ TSan 编译明确警告 GCC 的 ThreadSanitizer 不支持
 下一小步先补 joint 的 pending WonSlot、三个 lane 各执行一次、
 `remaining: 3 -> 0` 和 last-lane completion；之后再进入 PA 尾部 INOUT
 region-intent，保持每个协议问题都有独立的失败定位面。
+
+### 2026-07-26：R3b-d 固定 joint pending follower 与 last-lane completion
+
+R3b-c 只覆盖单 lane kernel。当前小步继续不修改 production，新增
+`JointThreeLanePendingFollowersDrainAndLastLaneCompletesOnce`，专门闭合一个
+真实 AIC+AIV0+AIV1 joint task 的以下链路：
+
+```text
+三 lane Begin
+  -> AIV0/AIV1 loser Finish（anchor 尚未发布）
+  -> AIC winner Finish 并发布唯一 WonSlot
+  -> 原来的三条 persistent worker 线程进入 FinalDrain
+  -> AIV0/AIV1 从 WonSlot 搬取 pending follower
+  -> remaining 3 -> 2 -> 1 -> 0
+  -> 最后一条 lane 清 WonSlot 并发布 task completion
+```
+
+#### CPU-sim TLS 踩坑与修正
+
+第一版测试把三个 Begin/Finish 放在主线程，再新建三个 FinalDrain 线程。
+结果只有 AIC anchor kernel 执行，两个 follower 永远没有进入私有 RingSlot。
+检查 production 后确认这不是 shared 协议失败：
+
+- A5 persistent worker 的“本核见过 joint Submit”是 block-local 状态；
+- CPU-sim 用 `thread_local g_fdwic_joint_submit_seen` 等价模拟；
+- 新建的 FinalDrain 线程没有执行过 joint Begin，因此
+  `drain_block_won()` 和 `has_pending_won()` 会按设计直接返回。
+
+修正后的测试让每个物理 lane 固定在一条宿主线程上，从 Begin 一直运行到
+FinalDrain；测试不手工把 TLS 置为 true。三线程 Begin 后的 TLS 快照必须为
+true，Finish 后仍为 true，从而与真实 persistent worker 生命周期一致。
+
+#### 确定性地保留 pending follower
+
+AIC 是三 lane active mask 的唯一 anchor。测试先让三线程都完成 Begin，
+随后只放行两个 AIV loser Finish，AIC Finish 继续停在门闩前。两个 loser
+虽然执行真实 `Materialize/Register/LoserReplay`，其尾部
+`drain_block_won()` 看到的 `any_pub` 仍为 0，因此发布前必须满足：
+
+- `committed_tasks==0`、`any_pub==0`；
+- AIV0/AIV1 私有 ring 均为空；
+- task flag/vend/frontier 仍为 `0/0/-1`。
+
+之后才放行 AIC Finish。FinalDrain 起跑前按值保存所有关键证据，而不是在
+slot 释放后读取碰巧残留的旧字段：
+
+- 恰好一个 WonSlot 非 Free，且状态为 Published、`remaining==3`；
+- AIC deposit 不存在；AIV0/AIV1 deposit 均为 present、drained=Free；
+- 两个 follower 的 func id、真实 callable 地址、sub-block id、tensor 和
+  fan-in 均与本次 joint task 一致；
+- AIC 已有且仅有一个真实 multicore RingSlot，并指向同一个 WonSlot；
+- AIV0/AIV1 仍没有 built/occupied RingSlot，证明 follower 仍是 pending；
+- shared commit 已推进到 1，但三个 kernel 计数均为 0，completion 仍未发布。
+
+扫描同时要求 `Published count==1` 和 `non-Free count==1`，防止额外泄漏一个
+Claimed WonSlot 却被“恰好找到一个 Published”掩盖。
+
+#### last-lane 的中间态与终态
+
+三个 callable 都是真实地从
+`Runtime::func_id_to_addr_ -> CoreCallable::resolved_addr -> RingSlot` 解析，
+并在函数入口分别增加独立计数、等待各自测试门闩。只有观察到三个 kernel
+均已进入后才依次放行：
+
+1. 放行 AIC：要求 `remaining==2` 且 AIC FinalDrain 已返回；
+2. 放行 AIV0：要求 `remaining==1` 且 AIV0 FinalDrain 已返回；
+3. 此时 AIV1 仍停在 kernel 内，必须同时满足
+   `state=Published`、`flag/vend/frontier=0/0/-1`；
+4. 最后放行 AIV1，才允许 `remaining==0`、`state=Free`、
+   `flag/vend/frontier=1/1024/0`。
+
+终态还要求三个 callable 各进入、退出恰好一次，AIV0/AIV1 的
+`owned_total` 各为 1，三核 ring 全空，shared commit 保持 1，fatal/error
+保持 0，final barrier 精确为 leaf arrival 3、root arrival/release 1、
+leaf release 1。由此证明 completion 来自最后一个真实 lane 的
+`fetch_sub==1`，而不是测试直接写 flag 或手填 WonSlot/RingSlot。
+
+#### 测试自身的正确性控制
+
+- 每个阶段用 release/acquire 门闩建立明确 happens-before；
+- worker 线程不调用 GTest 宏；
+- 任一 Begin/Finish 阶段超时或抛异常时，先释放全部测试门闩并 join，再报告
+  失败，不能继续读取正在被 worker 修改的普通字段；
+- callable/deposit/anchor slot 在 FinalDrain 前做值快照，终态不依赖 Free
+  slot 中的陈旧 metadata；
+- 无论观察成功还是失败，join 前都无条件放开三个 kernel 门闩；
+- CTest 的 15 秒超时仍兜住 production 内部不再响应测试门闩的真实挂死。
+
+#### 验证结果
+
+| 检查 | 结果 |
+| --- | --- |
+| multiworker GTest（由 CTest 运行，现含 5 类场景） | 5/5 PASS |
+| joint 定向重复 | 100/100 PASS |
+| GCC15 ASan + UBSan | 5/5 PASS，无报告 |
+| GCC15 TSan | 5/5 PASS，无数据竞态报告 |
+| production / artifact 源码 | 无修改，不产生新的 private/shared 机器码差异 |
+
+TSan 仍报告仓库已知的“`atomic_thread_fence` 不受
+`-fsanitize=thread` 支持”编译告警，因此这里只把它作为宿主线程普通 data
+race 门槛，不把它当作 A5 GM 可见性证明。
+
+下一阶段先增加真实 PA G2 的 exact-turn writer-chain oracle。当前 ordinary
+region 实现已经让未来 winner 在 `committed_tasks==N` 后才 lookup，因此
+task 4 发布完成后 task 8 才能解析到最新 writer 4；此时再额外加入
+region-intent 会重复同步。只有后续同时迁移 shared-output stable symbol、
+winner-only 构参和 light loser、准备解除全局 exact-turn 时，才需要把
+“非末组 UP 的 writer-ready gate”与这些机制作为一个独立阶段引入。
