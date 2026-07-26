@@ -6035,3 +6035,96 @@ perf-clock 产物做预处理文本和符号审计，故障宏及 hook 命中均
 `PA_TEST_SHARED_POST_GATE_BUILD_FAILURE` 的唯一构建定义仍是 CPU host
 self-test。由此把“测试注入能闭合 G2 故障”和“正式 CCEC/private 不带
 注入逻辑”作为两条独立证据闭合。
+
+### 2026-07-26：S6.5 冻结 standalone PA 迁移基线
+
+S6.4j 之后重新审查第 8、12 章、standalone 当前实现和迁移 review。
+按“真实 PA shared TensorMap 的关键调度依赖”这一既定范围，当前没有
+新的 standalone 正确性阻塞项，可以进入真实 simpler。这里的“可以迁移”
+只表示 PA 的 symbol/manual-dependency 路径已经闭合，不能扩大为通用
+ordinary-region shared TensorMap 已经完成。
+
+#### 迁移前已闭合的 PA 边界
+
+- private/shared 构建身份、产物目录、manifest、host/device ABI 和
+  CCEC 测试 hook 隔离均已闭合；
+- G0～G4 动态 task plan 由 device replay、独立 host oracle 和离线工具
+  共同消费；G2 的 task4/task8 身份不再依赖 `%5` 猜测；
+- non-final UP 先提交三个 accumulator writer intent，再发布
+  `deps_prepared` 放行 loser；final UP 在 Build 后提交最终 writer；
+- G2 task8 的 fanin 精确为 `{6,7,4}`，三个 accumulator writer 最终均为
+  8；
+- task4 放门后、Build 前失败时，task8 不执行，96 worker 完成 final
+  barrier 并清空在途 slot；
+- shared fresh output 使用稳定 `(task_id, output_slot)` 引用，只有
+  winner 分配和发布 descriptor；
+- 8-shard no-wrap heap 在 worker 启动前做独立准入；B256 G1 和 G2
+  partial 可运行，固定 256 MiB 下的 G2 full/G4 明确拒绝。
+
+ordinary-region 多版本/generation、长期 task-id 复用、heap wrap/reclaim、
+BlockWon/MIX、108-worker 泛化和任意多 writer 链继续保持后置。它们不是
+当前 PA Case1/G2 的隐式完成项，也不能为了“功能看起来更多”混入第一轮
+真实路径迁移。
+
+#### 同口径 20 轮 perf-clock
+
+在提交 `08d40dd5` 上，private/shared 都重新构建 CCEC `perf-clock`。
+固定 device 0、B256、32 AIC + 64 AIV、two-16 和
+`real-compute 6,28,4,1`；每种模式先丢弃一个 warm-up，再运行 20 个独立
+正式进程。40/40 都闭合 1,280 task、1,024 kernel、依赖签名
+`b7d985d6edb07078`、TensorMap 投影签名 `556bec7ec8d0f323` 和真实计算
+输出。
+
+| 模式 | 最小值 | 中位数 | 均值 | 最大值 | 样本标准差 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| private | 3,648.869 us | 4,821.200 us | 4,857.463 us | 6,599.653 us | 785.201 us |
+| shared | 2,362.384 us | 2,384.792 us | 2,383.710 us | 2,416.547 us | 12.713 us |
+
+按中位数，shared 比 private 少 2,436.408 us，缩短 50.535%。private 的
+3,648.869 us 是通过全部语义门槛的真实原始样本，但它只是 20 轮中的低
+离群值；private 还出现 6,599.653 us，高低范围接近 2.95 ms。因此当前
+private 代表值仍采用 4.821 ms 中位数，不能用单轮最低值宣称性能收益。
+shared 20 轮范围只有约 54 us，本次对比中稳定性明显更好。
+
+#### 两份真正的 B256 泳道
+
+随后分别用 `swimlane` 独立诊断构建采集 private/shared。两份分析均确认
+96 核、每核连续 1,280 task、1,024 kernel、`dropped=0` 和
+`validation.status=PASS`：
+
+| 模式 | raw 记录 | 合并事件 | 诊断 Submit |
+| --- | ---: | ---: | ---: |
+| private | 841,451 | 1,209,996 | 5,258.531 us |
+| shared | 832,617 | 1,201,162 | 4,759.560 us |
+
+诊断 Submit 只用于确认泳道身份和大致布局；两种泳道 ELF 都包含普通阶段
+及 atomic 记录，不能与 `perf-clock` 相减，也不能代替上述 20 轮性能结论。
+
+加工结果和完整样本记录位于：
+
+```text
+tests/atomic_probe/pa_scheduler/test_record/2026-07-26/
+```
+
+其中 `private/shared/merged_swimlane.json` 可直接载入 Perfetto，各自的
+`swimlane_exclusive_analysis.json` 保存排他闭合结果。两份 raw 继续留在
+ignored `outputs/`，没有重复复制到 `test_record`。
+
+#### 真实 simpler 的后续顺序
+
+迁移继续沿用已经建立的 `PTO_FDWIC_SHARED_MAP`、三镜像身份和 fail-closed
+机制，不另造模式开关。低风险到高风险顺序固定为：
+
+1. 先把真实默认 private TensorMap 同构为 ring-per-bucket，证明默认路径
+   行为、ABI 和性能没有回退；
+2. 在同一 region/hash/overlap 语义上增加唯一 shared ring 和真实 CCEC
+   缓存发布纪律；
+3. 在现有 compete-first Finish 中接入 non-final INOUT writer gate；
+4. 新增真实 G2 `context_len=8193` 门槛，重新证明 task4→task8 和终止收敛；
+5. shared backend 通过 CPU/CCEC 门槛后才解除 fail-closed；
+6. 最后再用真实 PA B1/B256 配对数据决定是否迁移 winner-only
+   materialize、shared symbol/heap 等 standalone 性能机制。
+
+standalone 的故障宏、split runtime、固定 96-worker 测试状态、host thread
+yield 和模拟负载都不得进入 production。迁移的是已经证明的协议和 oracle，
+不是复制测试脚手架。
