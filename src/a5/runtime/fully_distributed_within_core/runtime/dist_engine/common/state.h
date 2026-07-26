@@ -358,6 +358,10 @@ static_assert(
 );
 
 constexpr int64_t kSharedTensorMapInvalidSequence = -1;
+// writer 必须先用 CAS 从旧 lap seq 取得 WRITING 所有权，再修改 payload。
+// 不能复用 -1：首圈 expected_old 本来就是 -1，CAS(-1,-1) 无法排除非法
+// 双 writer。有效 absolute cursor 恒非负，因此 INT64_MIN 可作为独立哨兵。
+constexpr int64_t kSharedTensorMapWritingSequence = (-9223372036854775807LL - 1);
 constexpr int64_t kSharedTensorMapInitialCommit = 0;
 constexpr int64_t kSharedTensorMapInitialReclaim = -1;
 

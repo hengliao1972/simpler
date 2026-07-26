@@ -7050,7 +7050,7 @@ append 前先检查整个 task：
 - 任一桶容量不足时，不得发布本 task 的任何 payload、seq、tail 或 commit；
 - `Ready`、`CapacityBlocked`、`ProtocolError` 三种结果保持独立。
 
-单槽 writer 顺序为：
+`3943a82d` 的 S2b 基线单槽 writer 顺序为：
 
 ```text
 seq 置 -1
@@ -7062,10 +7062,11 @@ seq 置 -1
 ```
 
 全部 entry 成功后才发布 task commit。首圈目标槽旧 seq 必须为 `-1`，后续
-lap 必须为 `cursor-CAP`；这使固定物理槽复用时仍能识别 ABA。当前状态迁移
-先与 standalone 一致采用 Exchange，并通过返回旧值检测 exact-turn 合同。
-异常路径仍可能产生“写入后发现旧值不符”的瞬态，下一独立提交会把这些迁移
-改为 CAS；在 CAS 闭合前不会接入多核 Submit。
+lap 必须为 `cursor-CAP`；这使固定物理槽复用时仍能识别 ABA。该阶段提交时
+先与 standalone 一致采用 Exchange，并通过返回旧值检测 exact-turn 合同；
+它留下的“写入后才发现旧值不符”问题已由紧随其后的 S2c 改成
+`expected_old -> WRITING -> absolute seq` 两段 CAS。在 S2c 闭合前没有
+接入多核 Submit。
 
 #### 审查补出的边界
 
@@ -7129,3 +7130,153 @@ A2/A3 问题归因于本次 shared 实现。
 收敛；CPU 事件账本只证明调用顺序，CCEC 只证明目标指令可以生成。下一阶段
 先用 CAS 消除状态迁移失败时的瞬态覆写，再接入 task-level
 prepare/append/commit，继续保持 shared 顶层门禁。
+
+### 2026-07-26：S2c 用 CAS 闭合 shared 控制字失败不覆写
+
+S2b 为了直接对齐 standalone 正确性基线，所有条件状态迁移先采用
+Exchange 后检查旧值；其中 task commit 失败还会再次 Exchange 恢复。这个
+写法在正常 exact-turn 单 writer 路径不会失败，但一旦出现非法双 writer、
+状态损坏或故障注入，会先把错误值短暂发布给其他核，再发现合同不符。commit
+的恢复 Exchange 还可能覆盖真正的并发值。
+
+本阶段仍不接 Submit、不解除 shared 门禁，只把以下六类条件迁移改成现有
+production `atomic_compare_exchange()`：
+
+| 状态 | CAS |
+| --- | --- |
+| bucket head | `original_head -> retired_head` |
+| global reclaim | `current -> candidate` |
+| slot ownership | `expected_old_lap -> WRITING` |
+| slot publish | `WRITING -> absolute_cursor` |
+| bucket tail | `tail -> tail+1` |
+| task commit | `N -> N+1` |
+
+CAS wrapper 返回操作时观察到的旧值，成功条件统一为
+`observed==expected`；不能把返回值当 bool。commit 失败后的恢复写已删除，
+所有 mismatch 都不 retry、不 rollback。
+
+#### 为什么必须增加 WRITING，而不是机械地 CAS(-1,-1)
+
+首圈 slot 的 `expected_old` 本来就是 `-1`。若把旧 Exchange 机械替换为：
+
+```text
+CAS(expected_old=-1, desired=-1)
+```
+
+状态没有改变，两个非法 writer 都可能判断“ownership 成功”。最终增加一个
+不占额外字节的 seq 状态：
+
+```text
+INVALID = -1
+WRITING = INT64_MIN
+valid   = 非负 absolute cursor
+```
+
+writer 必须先从旧 lap seq CAS 到 WRITING，才允许 invalidate/write/flush
+payload；reader 只接受与目标 cursor 完全相等的非负 seq，因此不会消费
+WRITING。若本轮异常中止，下一 run 的 AICPU reset 会把全部 valid/WRITING/
+脏 seq 和 head/tail/commit/reclaim 一次性恢复到初态；payload 无需清零，
+因为 reset 后没有任何 seq 使旧 payload 可达。
+
+WRITING 只扩展已有 `sequence.v` 的值域，没有改变 sidecar 的 offset、size、
+alignment 或 CAP，因此本阶段保持 build ABI v4 和 layout v4。shared 当前
+仍在 `dist_engine_register()` 前 fail-closed，新旧算法混件都不可能进入写
+路径；等真实 Submit 接线并解除门禁时，再把 build ABI 一次提升到 v5，冻结
+可运行协议。layout 只有在物理布局变化时才提升，不能把协议版本和布局版本
+混为一谈。
+
+#### CAS 不是整 task 事务：失败边界必须分层
+
+CAS 只保证**发生 mismatch 的那个控制字不被本 writer 覆写**，不能让多
+slot、多 bucket append 获得自动回滚能力：
+
+1. reclaim/head/slot ownership CAS 失败发生在当前 entry payload 写之前。
+   目标字保留注入/竞争值，当前 entry 不 invalidate、不 flush、不推进
+   seq/tail/commit；此前已证明安全的其他 head/reclaim 单调推进仍可保留。
+2. `WRITING -> cursor` 失败时，payload 已写并 flush，但 tail/commit 未推进。
+3. tail CAS 失败时，该 entry 的 payload 和 seq 已发布，task commit 未推进。
+4. task commit CAS 失败时，全部 entry 的 payload/seq/tail 已发布。
+
+后三类在 exact-turn 单 writer 合同下都不是合法竞争，而是不可恢复的协议
+破坏。接入 Submit 后必须立即 fatal：不 Build 当前 task、不发布 completion、
+不允许后继越过 commit gate，所有 wait/drain 观察 fatal 后退出，AICPU 返回
+非零；下一 run 由冷启动 reset 清理现场。禁止把 seq 恢复成旧 lap、回退
+tail/head 或恢复 commit——payload 已被覆盖时回写旧 seq 会复活错误数据，
+制造真正的 ABA。
+
+CPU 故障门槛在每个 CAS 的线性化点前写入一个同时不同于 expected/desired
+的竞争值，再执行 strong CAS，并同时断言：
+
+- 注入点确实命中；
+- event 中 `observed` 等于竞争值；
+- 目标字最终仍等于竞争值，而不是 desired；
+- payload 前失败没有 invalidate/flush；
+- payload 后失败只保留上述明确的部分发布边界；
+- commit 失败只出现一次 CAS，不再有恢复性第二写。
+
+另外单独覆盖“另一非法 writer 已持有 WRITING”的 stale-preflight 情形，
+以及 production `DistSharedTensorMapAicoreOps` 的真实 CAS mismatch；后者把
+commit 预置为 2，再尝试 `CAS(0,1)`，最终必须仍为 2，可防适配器将来误退化
+成 Exchange。AICPU 重复 reset 同时覆盖 valid seq 和残留 WRITING。
+
+#### A5 顺序与性能尚待真机取证
+
+本机 CANN 9.1 的 CCEC 头声明并能编译 GM `atomicCAS<int64_t>`；production
+wrapper 也已在 AIC/AIV 显式实例化。但 CCEC 实现会忽略 C++ 的
+`__ATOMIC_ACQUIRE/RELEASE` 参数，且 CANN 注释说明部分 CAS 形态可能由编译
+pass 降为软件实现。因此当前证据只说明接口、返回类型和目标代码生成成立，
+不能提前声称“一定是一条硬件指令”或给出延迟结论。
+
+payload 的跨核发布仍依赖已有：
+
+```text
+payload DCCI CACHELINE_OUT -> DSB -> seq CAS -> tail CAS
+```
+
+而“其他核观察到 commit=N+1 后，是否必然已观察到 seq/tail”尚不能只凭 C++
+memory-order 参数证明。接入 Submit 前需要一个 A5 双核 litmus，重复验证
+writer 的 `payload/seq/tail -> commit` 与 reader 的
+`commit -> tail/seq/payload` 可见顺序；若不成立，再在 commit 前增加经过
+真机验证的设备级顺序边界，不能靠臆想接口补 barrier。
+
+正常 append 的原子次数没有增加：原来的 Exchange 被一一替换为 CAS，
+WRITING 复用原本的“置无效 seq”那次原子。CAS 相对 Exchange 的实际延迟仍
+需在接线后的 A5 perf-clock 中单独测量，不能用 CPU 时间推断。
+
+#### 本阶段当前证据
+
+| 检查 | 结果 |
+| --- | --- |
+| shared ring CAS/WRITING 协议门槛 | 16 类，五种 CAP 全部 PASS |
+| 所有相关 FDWIC C++ 目标 | 21/21 PASS |
+| GCC15 ASAN+UBSAN 同一组 FDWIC 目标 | 21/21 PASS，无报告 |
+| AICPU reset：valid seq + WRITING + 非零控制字 | 五种 CAP 全部 PASS |
+| production concrete CAS 成功/失败路径 | PASS |
+| shared CAP32/64/128/256/16384 production CCEC | AIC/AIV/combined/final 全部 PASS |
+| int64 CAS 目标对象证据 | AIC/AIV 均有 CAS/control 差分，wrapper 实例进入 final |
+| private production AIC/AIV `.text` | 94,600/95,512B，与 S1 逐字节相同 |
+| `git diff --check` | PASS |
+
+shared CCEC 证据位于：
+
+```text
+/tmp/fdwic-s2c-shared-cas-cap-matrix-20260726/
+```
+
+每档 probe 显式调用六个 concrete wrapper，AIC/AIV 对象和 final 都保留
+probe 符号。CAP128 另有同 flags、同 include 的最小 CAS/control 对象：
+CAS 对象包含 `atomic_compare_exchange<long>` 与
+`atomicCAS<(ST_L2CacheType)0>` 实例链，control 对象不含；当前
+`llvm-objdump` 对 `elf64-hiipu` 只能识别 section/符号而不能解码助记符，
+所以没有把这个差分夸大成“已证明单条硬件 CAS”。
+
+private 指令对比位于：
+
+```text
+/tmp/fdwic-s2c-private-text-compare-20260726/
+```
+
+AIC `.text` 为 94,600B、SHA256 `a8eae234f72f...`，AIV 为 95,512B、
+SHA256 `5dbfda402594...`，均与 S1 冻结产物逐字节相同。完整 `.o` 仍不用于
+热路径判定。真实 A5 CAS 顺序 litmus 属于接线前门槛，不会用当前纯编译结果
+替代。

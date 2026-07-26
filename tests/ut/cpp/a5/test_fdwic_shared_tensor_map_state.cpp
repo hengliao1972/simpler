@@ -45,6 +45,8 @@ TEST(FdwicSharedTensorMapState, SidecarLayoutAppendsWithoutMovingThePrivateTail)
     EXPECT_EQ(sizeof(SharedTensorMapSequenceLine), kCacheLine);
     EXPECT_EQ(offsetof(SharedTensorMapSequenceLine, v), 0U);
     EXPECT_EQ(sizeof(SharedTensorMapSlot), 2 * kCacheLine);
+    EXPECT_LT(kSharedTensorMapWritingSequence, kSharedTensorMapInvalidSequence);
+    EXPECT_NE(kSharedTensorMapWritingSequence, kSharedTensorMapInvalidSequence);
     EXPECT_EQ(sizeof(SharedTensorMapBucketState), 2 * kCacheLine);
     EXPECT_EQ(sizeof(SharedTensorMapState), kExpectedStateBytes);
     EXPECT_EQ(alignof(SharedTensorMapState), kCacheLine);
@@ -92,7 +94,8 @@ TEST(FdwicSharedTensorMapState, AicpuResetInitializesOnlyPublicationAndCursorSta
     state->reclaim_upto.v = 21;
     state->buckets[kMapBuckets - 1].head.v = 8;
     state->buckets[kMapBuckets - 1].tail.v = 10;
-    state->slots[kMapCap - 1].sequence.v = 16383;
+    state->slots[kMapCap - 2].sequence.v = 16382;
+    state->slots[kMapCap - 1].sequence.v = kSharedTensorMapWritingSequence;
 
     dist_shared_tensor_map_reset(*state);
 
@@ -100,6 +103,7 @@ TEST(FdwicSharedTensorMapState, AicpuResetInitializesOnlyPublicationAndCursorSta
     EXPECT_EQ(state->reclaim_upto.v, kSharedTensorMapInitialReclaim);
     EXPECT_EQ(state->buckets[kMapBuckets - 1].head.v, 0);
     EXPECT_EQ(state->buckets[kMapBuckets - 1].tail.v, 0);
+    EXPECT_EQ(state->slots[kMapCap - 2].sequence.v, kSharedTensorMapInvalidSequence);
     EXPECT_EQ(state->slots[kMapCap - 1].sequence.v, kSharedTensorMapInvalidSequence);
     EXPECT_TRUE(shared_payloads_keep_pattern(*state));
 }

@@ -17,7 +17,8 @@
 namespace {
 
 // shared sidecar 只能由 AICPU setup thread 在唤醒 worker 前初始化一次。
-// payload 无需清零：seq=-1 是唯一有效性判据，且随后 AICPU 会把整个
+// payload 无需清零：reader 只接受与 absolute cursor 相等的非负 seq；
+// -1 和 WRITING 都不可读，reset 统一恢复为 -1，且随后 AICPU 会把整个
 // DistGlobal flush 到 GM。显式重置所有控制字可以支持同一 arena 的重复 run，
 // 也避免把 slot 0 的合法 seq=0 与零填充状态混为一谈。
 inline void dist_shared_tensor_map_reset(SharedTensorMapState &state) {

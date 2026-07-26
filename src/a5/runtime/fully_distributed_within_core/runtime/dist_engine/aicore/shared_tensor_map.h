@@ -139,7 +139,7 @@ dist_shared_tensor_map_retire_bucket_impl(__gm__ SharedTensorMapState &map, uint
     if (head == original_head) {
         return true;
     }
-    const int64_t observed = Ops::Exchange(&controls.head.v, head);
+    const int64_t observed = Ops::CompareExchange(&controls.head.v, original_head, head);
     return observed == original_head;
 }
 
@@ -184,7 +184,7 @@ PTO_DEVICE_FUNC inline bool dist_shared_tensor_map_refresh_reclaim_impl(
         reclaim_upto = current;
         return true;
     }
-    const int64_t observed = Ops::Exchange(&map.reclaim_upto.v, candidate);
+    const int64_t observed = Ops::CompareExchange(&map.reclaim_upto.v, current, candidate);
     if (observed != current) {
         return false;
     }
@@ -271,8 +271,11 @@ PTO_DEVICE_FUNC inline bool dist_shared_tensor_map_append_prepared_entry_impl(
     __gm__ SharedTensorMapSlot &slot = map.slots[dist_shared_tensor_map_slot_index(bucket, cursor)];
     const int64_t expected_old = cursor < kMapBucketCapacity ? kSharedTensorMapInvalidSequence :
                                                                static_cast<int64_t>(cursor - kMapBucketCapacity);
-    const int64_t invalidated = Ops::Exchange(&slot.sequence.v, kSharedTensorMapInvalidSequence);
-    if (invalidated != expected_old) {
+    // WRITING 是独占 ownership 状态。claim 成功后若后续 CAS 仍失败，
+    // 说明 exact-turn 协议已损坏：保留现场并由接入层 fatal 收敛，不能
+    // 把已覆写 payload 的槽回滚成旧 lap seq。
+    const int64_t before_claim = Ops::CompareExchange(&slot.sequence.v, expected_old, kSharedTensorMapWritingSequence);
+    if (before_claim != expected_old) {
         return false;
     }
 
@@ -285,11 +288,12 @@ PTO_DEVICE_FUNC inline bool dist_shared_tensor_map_append_prepared_entry_impl(
     // padding 不承载协议，不为填充字节增加 scalar store。
     Ops::FlushRegion(&slot.payload, sizeof(slot.payload));
 
-    const int64_t before_publish = Ops::Exchange(&slot.sequence.v, static_cast<int64_t>(cursor));
-    if (before_publish != kSharedTensorMapInvalidSequence) {
+    const int64_t before_publish =
+        Ops::CompareExchange(&slot.sequence.v, kSharedTensorMapWritingSequence, static_cast<int64_t>(cursor));
+    if (before_publish != kSharedTensorMapWritingSequence) {
         return false;
     }
-    const int64_t previous_tail = Ops::Exchange(&controls.tail.v, tail + 1);
+    const int64_t previous_tail = Ops::CompareExchange(&controls.tail.v, tail, tail + 1);
     return previous_tail == tail;
 }
 
@@ -315,21 +319,17 @@ dist_shared_tensor_map_publish_commit_impl(__gm__ SharedTensorMapState &map, int
     if (current_task < 0 || current_task >= kFlagCap) {
         return false;
     }
-    const int64_t previous = Ops::Exchange(&map.committed_tasks.v, static_cast<int64_t>(current_task) + 1);
-    if (previous == current_task) {
-        return true;
-    }
-    // exact-turn 合同下不存在合法并发 publisher；恢复旧值只用于让确定性
-    // 协议负测保持最终状态不变。下一小步会单独评估 CAS 失败不写方案。
-    (void)Ops::Exchange(&map.committed_tasks.v, previous);
-    return false;
+    const int64_t previous =
+        Ops::CompareExchange(&map.committed_tasks.v, current_task, static_cast<int64_t>(current_task) + 1);
+    return previous == current_task;
 }
 
 struct DistSharedTensorMapAicoreOps {
     PTO_DEVICE_FUNC static int64_t Load(__gm__ volatile int64_t *address) { return atomic_load(*address); }
 
-    PTO_DEVICE_FUNC static int64_t Exchange(__gm__ volatile int64_t *address, int64_t value) {
-        return atomic_exchange(*address, value);
+    PTO_DEVICE_FUNC static int64_t
+    CompareExchange(__gm__ volatile int64_t *address, int64_t expected, int64_t desired) {
+        return atomic_compare_exchange(*address, expected, desired);
     }
 
     PTO_DEVICE_FUNC static void InvalidateRegion(__gm__ const void *address, uint64_t bytes) {
