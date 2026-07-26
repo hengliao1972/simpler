@@ -5663,3 +5663,88 @@ outputs/shared_dynamic_submit_pmu_v6_20260726/
 
 本阶段只改 host 校验和 host-only 定向测试，不改 device 代码、PMU 窗口
 或 raw schema。上述单轮 Submit 时间仍只作可执行性证据。
+
+### 2026-07-26：S6.4g 闭合 shared 动态 task 的 A5 submit-PMU 矩阵
+
+本小步不再修改设备协议，只用 S6.4e/f 已建立的 schema-v6 采集链验证
+动态计划的边界规模和五种 PMU 构建身份。所有运行都固定 device 0、
+单进程、单轮；目的仅是证明 host 独立计划、device 实际 replay、PMU
+调用边界和输出结果一致，不能把下表中的单轮 Submit 时间当作正式性能
+比较。
+
+#### Claim 动态规模矩阵
+
+| 输入 | group | task/核 | Claim/核 | Claim/96 核 | compute kernel | active/sentinel tile | 结果 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| G0：`0` | 0 | 1 | 1 | 96 | 0 | 0/192 | PASS |
+| G1：`8192` | 1 | 5 | 5 | 480 | 4 | 4/188 | PASS |
+| G2 partial：`8193` | 2 | 9 | 9 | 864 | 8 | 8/184 | PASS |
+| G2 full：`16384` | 2 | 9 | 9 | 864 | 8 | 8/184 | PASS |
+| G4：`32768` | 4 | 17 | 17 | 1,632 | 16 | 16/176 | PASS |
+| mixed：`0,8192,8193,32768` | 7 | 32 | 32 | 3,072 | 28 | 27/165 | PASS |
+
+mixed 的 28 个 compute kernel 与 27 个 active output tile 并不矛盾：
+output tile 按 `(worker,task-kind)` 槽位保存，同一 worker 可以赢得多个
+同类 task，后一次结果复用该 worker 的同类输出槽。kernel 总数和每类
+`QK/SF/PV/UP=7` 由独立协议计数闭合；逐元素输出校验仍覆盖所有实际
+active 槽，其余 165 个槽保持 sentinel。
+
+G2 partial 与 G2 full 刻意保留同一 `2 group/9 task` 拓扑。两者的
+canonical heap 分别为 829,440 和 1,603,584 bytes，证明完整
+`shared_context_lens` 身份确实参与 host 计划和 raw fingerprint，而
+不是只靠 task 数把两个输入误合并。G4 的 canonical heap 为
+3,196,928 bytes；上述三组的 heap cursor、vend、descriptor 覆盖和
+normalized writer projection 均分别闭合。
+
+host 还用独立公式核对实际 fanin dependency signature：G0/G1/G2/G4/
+mixed 的预期值依次为 `0000000000000000`、`5cb454393ed48dcb`、
+`dda63f4f5405eaf1`、`58d7a4b63aac2c4e` 和
+`6437bff09d8f8a11`，所有运行的等值门槛均 PASS。该签名当前没有直接
+写进 raw；这里记录的是 host 执行过的期望值及等值断言，不能误述为从
+JSON 字段读取。
+
+#### G2 partial 的五种 PMU 构建身份
+
+| 编译阶段 | phase call/核 | phase call/96 核 | record | 语义/PMU/输出 |
+| --- | ---: | ---: | ---: | --- |
+| `none` | 0 | 0 | 96 | PASS |
+| `claim` | 9 | 864 | 96 | PASS |
+| `efdrain` | 9 | 864 | 96 | PASS |
+| `materialize` | 9 | 864 | 96 | PASS |
+| `register` | 9 | 864 | 96 | PASS |
+
+`none` 仍只保留完整 Submit 前后一次 PMU 开关，内部 phase 边界严格为
+零；另外四种构建在每个动态 task 上恰好进入一次对应边界，因此都是
+`9 × 96 = 864`。每份 raw 的 `phase_calls` 与
+`phase_expected_calls` 相等，96 条 record 都通过 physical owner、
+AIC/AIV triplet、begin/end、shadow lower-bound、counter headroom 和
+configure/restore/cleanup 校验。五种构建都得到 8 个有效输出和
+184 个 sentinel，说明观察阶段没有改变 G2 partial 的计算语义。
+
+private 隔离对照在 shared G0/G1 运行前后各执行一次，均继续输出
+schema-v5、固定 5 call/核和 480 call/96 核；它不携带
+`tensormap_mode/shared_context_lens/shared_task_plan`，也没有被 shared
+G0 的零 compute 规则放宽。
+
+目录内 12 份 raw 都有对应 HTML，报告记录的 raw SHA-256 与实际文件
+逐份一致。
+
+本阶段 A5 raw 与自包含 HTML 位于：
+
+```text
+outputs/shared_dynamic_submit_pmu_v6_20260726/
+  g0_claim_icache_{raw.json,report.html}
+  g1_claim_icache_{raw.json,report.html}
+  g2_partial_{none,claim,efdrain,materialize,register}_icache_{raw.json,report.html}
+  g2_full_claim_icache_{raw.json,report.html}
+  g4_claim_icache_{raw.json,report.html}
+  mixed_claim_icache_{raw.json,report.html}
+  private_g1_claim_icache_{raw.json,report.html}
+  private_g1_claim_after_g0_{raw.json,report.html}
+```
+
+至此，动态规模正确性不再依赖默认 G1 的“恰好五 task”巧合。下一阶段
+只生成真正的 shared B256 泳道：默认 256 个 8192-token batch 应恢复
+256 group、1,280 task，并要求 raw 无 dropped、converter/exclusive
+按动态 task identity 闭合。该泳道只用于业务区域和 atomic 解释；
+正式墙钟仍由无诊断的 perf-clock 构建单独采集。
