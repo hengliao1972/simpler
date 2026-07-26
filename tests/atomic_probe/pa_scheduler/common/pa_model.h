@@ -64,7 +64,7 @@ constexpr TensorMapBuildMode kCompiledTensorMapMode =
     static_cast<TensorMapBuildMode>(PTO_FDWIC_SHARED_MAP);
 constexpr uint32_t kBuildIdentityMagic = 0x50414249U;  // "PABI"
 #if PTO_FDWIC_SHARED_MAP
-constexpr uint32_t kBuildIdentityAbiVersion = 5;
+constexpr uint32_t kBuildIdentityAbiVersion = 6;
 #else
 constexpr uint32_t kBuildIdentityAbiVersion = 4;
 #endif

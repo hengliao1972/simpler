@@ -5250,3 +5250,119 @@ layout      = Alloc + group_count × (QK/SF/PV/UP)
 
 CPU shared 严格告警全门槛通过。下一小步才让 shared `RunSchedulerImpl`
 消费该计划；private 五 task replay 保持原预处理结果。
+
+### 2026-07-26：S6.4b 让 shared device replay 消费动态 task plan
+
+本小步只收口 device replay 与跨 TU Finish 协议；host 仍是上一阶段的
+单组 oracle，因此当前只把默认 8192-token G1 跑成端到端结果，不把
+尚未合并 host plan 的 G0/G2/G4 冒充成已完成。
+
+#### shared replay 从固定五 task 改为 `1+4N`
+
+每个 worker 对每个 batch 只读一次 `context_len`，随后调用
+`BuildSharedPaBatchPlan()`，严格按下列顺序提交：
+
+```text
+Alloc
+for group in [0, group_count):
+    PreparePaBlockGroup(group * 64)
+    QK -> SF -> PV -> UP
+```
+
+每批结束立即检查 `local_index == batch_start + task_count`。所有 batch
+回放结束后，再用实际 `local_index` 封口 split runtime 的 task 数，并
+与末个 ticket 声明的 `task_id+1` 二次核对。private 的原五次
+`SubmitCallbackTask()` 调用完整保留在预处理 `#else` 中。
+
+末次 Submit 身份没有通过 96 个 worker 预扫全部 `context_lens` 获得。
+那种做法在 B256 最坏会额外引入 `96×256=24,576` 次 GM load。当前改为
+复用 16B ticket 的 bit6：
+
+```text
+bits 0..2 : TaskKind
+bits 3..4 : group index
+bit 5     : has-following-group
+bit 6     : global last Submit
+bit 7     : shared metadata present
+```
+
+因此 S6.3 中“bit6 保留且必须为 0”只描述当时 ABI5 的历史状态；从本
+阶段 ABI6 起，bit6 正式承担 global-last 身份。它只允许出现在 Alloc
+或 UP，且不能与 has-following 同时出现。
+
+#### metadata 只能由 plan 推导
+
+第一版草案曾让五个调用点分别传入 `group/has-following/last`。只做
+编码语法检查无法证明 ticket 与动态 plan 一致，定向测试甚至可以重复
+task4、跳过 task5～7 后直接提交 task8，最后仍碰巧得到
+`declared_task_count==local_index`。该过程态没有提交。
+
+收口后的 `SubmitCallbackTask()` 只接收
+`SharedPaBatchPlan + task_offset`，并在 Claim 前完成四项核对：
+
+- `SharedPaPlannedTaskAt()` 能恢复唯一 task；
+- 恢复的 kind 必须等于模板 `TaskKind`；
+- `task_id == batch_start + task_offset`；
+- global-last 只能由“最后 batch 且 batch 内最后 task”推导。
+
+跨 TU 前，caller 还把 `(task_id, encoded-meta)` 的一次性 binding 写入
+已有 split runtime `reserved` 字段。Finish 必须同时满足：
+
+- ticket 与这份 binding 完全一致；
+- `task_id == 已成功 Submit 数`，即从 0 严格连续；
+- context、winner/function、output count 与 ticket 一致。
+
+Finish 读取后无条件清除 binding，fatal 路也不会留下过程态。最终
+split 协议继续要求 `reserved==0`。这样重复、跳号、乱序，以及跨 TU
+后把合法 Alloc/UP 改成 early-last 都在读取 `TaskArgs` 前被拒绝。
+
+#### PMU 与实际 task 数的收口顺序
+
+shared submit-PMU 的 phase call 数不再使用 `batches×5`，而是在 Stop
+时读取本 worker 已回放的 `local_index`。公共调度先完成：
+
+```text
+actual task_count 检查
+-> declared last 检查
+-> split runtime 封口
+-> PmuWindowStop
+```
+
+因此 missing/early/duplicate-last 不会先产出看似合法的 phase shape；
+Stop 在已经开启窗口的 fatal 路仍无条件执行。host 后续仍需用独立
+authoritative plan 对实际 task 数做外部证明，不能把 device
+`local_index` 当成期望公式。
+
+#### 新增与修正的门槛
+
+- split loser 改为真实连续 `0..8` 两组序列，task4 等 writer-ready，
+  task8 为唯一 global-last；
+- `[empty,empty]`、`[G1,empty]`、`[empty,G2]` 验证累计
+  `batch_start` 与唯一 global-last；
+- 错误 winner/loser function、非法 QK-last、合法 early-last Alloc
+  的跨 TU 篡改、shared-output 容量越界全部在保护页 `TaskArgs` 前拒绝；
+- task 2047→2048→4096 两次 payload 环绕，证明 2048-slot scratch
+  可以复用，而已复制到 `SharedOutputCell` 与 `LocalSlot` 的 descriptor
+  不被覆盖。
+
+#### 本阶段结果
+
+| 验证 | 结果 |
+| --- | --- |
+| CPU shared 全部严格告警门槛 | PASS |
+| CPU shared B1/B256 默认 G1 全部业务/协议断言 | PASS |
+| CCEC shared swimlane / perf-clock / submit-PMU-none 构建与 manifest | PASS |
+| A5 CCEC shared B1 默认 G1 | 96 worker、5 task、4 kernel，全部断言 PASS |
+| A5 B1 dependency / shared symbol | `5cb454393ed48dcb` / `8,5,3` |
+| A5 B1 单次无泳道 Submit | `75.731 us`，只作正确性证据 |
+| CPU private 当前/`ee0fe8c6` 完整 ELF | 逐字节相同，SHA256 均为 `ffa19a...fae4` |
+| CCEC private perf-clock 七个 device 对象 | `.text/.rodata` 全部逐字节相同 |
+| `git diff --check` | PASS |
+
+本阶段仍未声称：
+
+- host oracle、converter、exclusive analyzer 和 PMU host sidecar 已支持
+  动态 plan；
+- G0/G2/G4/mixed 已完成 CPU/CCEC/A5 闭环；
+- B256 G2/G4 可直接运行。shared heap 当前仍是 256 MiB no-wrap，
+  资源准入与回收必须在后续单独处理，不能靠放宽断言掩盖容量不足。

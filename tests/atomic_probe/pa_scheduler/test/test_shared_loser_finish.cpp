@@ -226,6 +226,18 @@ bool AllBytesEqual(const void *object, size_t size, unsigned char expected) {
     return true;
 }
 
+template <typename Ops>
+bool ArmAndFinishSplit(
+    CompeteFirstSplitRuntimeState &runtime,
+    const CallbackSubmitTicket &ticket,
+    const TaskArgs *args
+) {
+    return ArmSharedSplitTicket(runtime, ticket) &&
+           FinishSplitCallbackSubmitFromRuntime<Ops>(
+               &ticket, args
+           ) == 1;
+}
+
 bool RunSharedBatchPlanTest() {
     bool ok = true;
     const auto CheckPlan = [&](uint64_t context_length,
@@ -300,6 +312,125 @@ bool RunSharedBatchPlanTest() {
         kSharedPaMaxContextLength,
         kMaxTasks - kSharedPaMaxTasksPerBatch + 1U, rejected
     );
+
+    const auto CheckBatchSequence = [&](
+        const uint64_t *contexts, uint32_t count,
+        uint32_t expected_total
+    ) {
+        uint32_t batch_start = 0;
+        uint32_t last_count = 0;
+        bool sequence_ok = true;
+        for (uint32_t batch = 0; batch < count; ++batch) {
+            SharedPaBatchPlan plan{};
+            sequence_ok &= BuildSharedPaBatchPlan(
+                contexts[batch], batch_start, plan
+            );
+            sequence_ok &= plan.batch_start == batch_start;
+            for (uint32_t offset = 0;
+                 sequence_ok && offset < plan.task_count; ++offset) {
+                SharedPaPlannedTask task{};
+                sequence_ok &=
+                    SharedPaPlannedTaskAt(plan, offset, task);
+                const bool is_global_last =
+                    batch + 1U == count &&
+                    task.is_last_in_batch;
+                last_count += is_global_last ? 1U : 0U;
+                sequence_ok &=
+                    EncodeSharedPaTaskMeta(
+                        task.kind, task.group_index,
+                        task.has_following_group,
+                        is_global_last
+                    ) != 0;
+            }
+            batch_start += plan.task_count;
+        }
+        return sequence_ok &&
+               batch_start == expected_total &&
+               last_count == 1;
+    };
+    const uint64_t empty_empty[] = {0, 0};
+    const uint64_t g1_empty[] = {
+        kPaBlocksPerRequest * kPaBlockSize, 0,
+    };
+    const uint64_t empty_g2[] = {
+        0, 2ULL * kPaBlocksPerRequest * kPaBlockSize,
+    };
+    ok &= CheckBatchSequence(empty_empty, 2, 2);
+    ok &= CheckBatchSequence(g1_empty, 2, 6);
+    ok &= CheckBatchSequence(empty_g2, 2, 10);
+    return ok;
+}
+
+bool RunPayloadWrapIsolationTest() {
+    SchedulerState *state = MapSchedulerState();
+    if (state == nullptr) {
+        return false;
+    }
+    WorkerState &worker = state->workers[0];
+    constexpr uint32_t first = kPayloadSlots - 1U;
+    constexpr uint32_t second = kPayloadSlots;
+    constexpr uint32_t third = 2U * kPayloadSlots;
+    static_assert(third < kMaxTasks, "shared max task must exercise two payload wraps");
+
+    ResetOutputCell(state->shared_map.shared_outputs[first]);
+    ResetOutputCell(state->shared_map.shared_outputs[second]);
+    ResetOutputCell(state->shared_map.shared_outputs[third]);
+    LocalSlot &slot = worker.slots[0];
+    slot = LocalSlot{};
+
+    SubmitContext context{};
+    worker.local_index = static_cast<int32_t>(first);
+    BeginCallbackSubmit(worker, context);
+    bool ok =
+        context.task_id == static_cast<int32_t>(first) &&
+        context.payload == &worker.payloads[kPayloadSlots - 1U];
+    const TensorDesc first_tensor =
+        MakeTestTensor(kSyntheticHeapBase + first * 4096ULL, first);
+    context.payload->tensors[0] = first_tensor;
+    state->shared_map.shared_outputs[first].tensors[0] = first_tensor;
+    slot.occupied = true;
+    slot.built = true;
+    slot.task_id = first;
+    slot.tensor_count = 1;
+    slot.tensors[0] = first_tensor;
+
+    worker.local_index = static_cast<int32_t>(second);
+    BeginCallbackSubmit(worker, context);
+    ok &=
+        context.task_id == static_cast<int32_t>(second) &&
+        context.payload == &worker.payloads[0];
+    const TensorDesc second_tensor =
+        MakeTestTensor(kSyntheticHeapBase + second * 4096ULL, second);
+    context.payload->tensors[0] = second_tensor;
+    state->shared_map.shared_outputs[second].tensors[0] = second_tensor;
+    ok &= std::memcmp(
+              &state->shared_map.shared_outputs[first].tensors[0],
+              &first_tensor, sizeof(first_tensor)
+          ) == 0;
+    ok &= std::memcmp(
+              &slot.tensors[0], &first_tensor,
+              sizeof(first_tensor)
+          ) == 0;
+
+    worker.local_index = static_cast<int32_t>(third);
+    BeginCallbackSubmit(worker, context);
+    ok &=
+        context.task_id == static_cast<int32_t>(third) &&
+        context.payload == &worker.payloads[0];
+    const TensorDesc third_tensor =
+        MakeTestTensor(kSyntheticHeapBase + third * 4096ULL, third);
+    context.payload->tensors[0] = third_tensor;
+    state->shared_map.shared_outputs[third].tensors[0] = third_tensor;
+    ok &= std::memcmp(
+              &state->shared_map.shared_outputs[second].tensors[0],
+              &second_tensor, sizeof(second_tensor)
+          ) == 0;
+    ok &= std::memcmp(
+              &slot.tensors[0], &first_tensor,
+              sizeof(first_tensor)
+          ) == 0;
+
+    (void)munmap(state, sizeof(SchedulerState));
     return ok;
 }
 
@@ -434,8 +565,14 @@ bool RunProtectedArgsLoserTest() {
         CompeteFirstSplitStateCookie(0, CoreRole::Aic);
 
     bool ok = true;
-    for (uint32_t task_id = 0; task_id < kTasksPerBatch; ++task_id) {
-        const TaskKind kind = GetTaskKind(task_id);
+    const SharedPaBatchPlan two_group_plan{0, 2, 9};
+    for (uint32_t task_id = 0;
+         task_id < two_group_plan.task_count; ++task_id) {
+        SharedPaPlannedTask planned{};
+        ok &= SharedPaPlannedTaskAt(
+            two_group_plan, task_id, planned
+        );
+        const TaskKind kind = planned.kind;
         runtime.context = SubmitContext{};
         runtime.context.task_id = static_cast<int32_t>(task_id);
         // Claim loser 的真实返回值固定为 -1；kind 只能由 shared ticket
@@ -452,200 +589,178 @@ bool RunProtectedArgsLoserTest() {
             task_id,
             -1,
             0,
-            EncodeSharedPaTaskMeta(kind, 0, false),
+            EncodeSharedPaTaskMeta(
+                kind, planned.group_index,
+                planned.has_following_group,
+                planned.is_last_in_batch
+            ),
         };
-        ok &= FinishSplitCallbackSubmitFromRuntime<LoserFinishTestOps>(
-                  &ticket, args
-              ) == 1;
+        if (planned.has_following_group) {
+            volatile int64_t *gate =
+                &state->tasks[task_id].deps_prepared;
+            __atomic_store_n(gate, int64_t{-1}, __ATOMIC_RELEASE);
+            GateReleaseLoserFinishTestOps::gate_address = gate;
+            GateReleaseLoserFinishTestOps::gate_value =
+                static_cast<int64_t>(task_id);
+            GateReleaseLoserFinishTestOps::spin_calls = 0;
+            GateReleaseLoserFinishTestOps::release_old = 0;
+            ok &= ArmAndFinishSplit<
+                GateReleaseLoserFinishTestOps
+            >(runtime, ticket, args);
+            ok &= GateReleaseLoserFinishTestOps::spin_calls == 3;
+            ok &= GateReleaseLoserFinishTestOps::release_old == -1;
+            ok &= __atomic_load_n(gate, __ATOMIC_ACQUIRE) ==
+                static_cast<int64_t>(task_id);
+            GateReleaseLoserFinishTestOps::gate_address = nullptr;
+        } else {
+            ok &= ArmAndFinishSplit<LoserFinishTestOps>(
+                runtime, ticket, args
+            );
+        }
     }
 
-    // 再用同一个 task4 验证 non-final UP 门协议。第一次调用已证明普通
-    // final UP 不等门；本次只有 has_following bit 改变，Finish 必须先
-    // 轮询 gate，再在完全不读保护页参数的前提下闭合 loser 尾部。
-    constexpr uint32_t nonfinal_up_task = 4;
-    runtime.context = SubmitContext{};
-    runtime.context.task_id = static_cast<int32_t>(nonfinal_up_task);
-    runtime.context.kernel_id = -1;
-    runtime.context.won = false;
-    runtime.context.shared_result.Reset(
-        static_cast<int32_t>(nonfinal_up_task)
-    );
-    ok &= PrepareSharedTaskOutputs(
-        runtime.context.shared_result,
-        static_cast<int32_t>(nonfinal_up_task),
-        TaskKind::Up
-    );
-    volatile int64_t *gate =
-        &state->tasks[nonfinal_up_task].deps_prepared;
-    __atomic_store_n(gate, int64_t{-1}, __ATOMIC_RELEASE);
-    GateReleaseLoserFinishTestOps::gate_address = gate;
-    GateReleaseLoserFinishTestOps::gate_value =
-        static_cast<int64_t>(nonfinal_up_task);
-    GateReleaseLoserFinishTestOps::spin_calls = 0;
-    GateReleaseLoserFinishTestOps::release_old = 0;
-    const CallbackSubmitTicket nonfinal_up_ticket{
-        6,
-        nonfinal_up_task,
-        -1,
-        0,
-        EncodeSharedPaTaskMeta(TaskKind::Up, 0, true),
-    };
-    ok &=
-        FinishSplitCallbackSubmitFromRuntime<
-            GateReleaseLoserFinishTestOps
-        >(&nonfinal_up_ticket, args) == 1;
+    // task4 必须等待 writer-ready，而最终 task8 只携带 last、不得再等门；
+    // 整个 0..8 序列恰好一次，不能靠重复 task4、跳过 5..7 拼出终值。
     ok &= GateReleaseLoserFinishTestOps::spin_calls == 3;
     ok &= GateReleaseLoserFinishTestOps::release_old == -1;
-    ok &= __atomic_load_n(gate, __ATOMIC_ACQUIRE) ==
-        static_cast<int64_t>(nonfinal_up_task);
-    GateReleaseLoserFinishTestOps::gate_address = nullptr;
-
-    // 第二组最终 UP 的 task_id=8，如果沿用 %5 会被误判为 PV。loser
-    // 的 function_id 仍为 -1，只有 ticket 中的 group/kind 能恢复语义。
     constexpr uint32_t final_up_task = 8;
     ok &= GetTaskKind(final_up_task) == TaskKind::Pv;
     ok &= FrontendTaskOutputCount(GetTaskKind(final_up_task)) == 1;
     ok &= FrontendTaskOutputCount(TaskKind::Up) == 0;
-    runtime.context = SubmitContext{};
-    runtime.context.task_id = static_cast<int32_t>(final_up_task);
-    runtime.context.kernel_id = -1;
-    runtime.context.won = false;
-    runtime.context.shared_result.Reset(
-        static_cast<int32_t>(final_up_task)
-    );
-    ok &= PrepareSharedTaskOutputs(
-        runtime.context.shared_result, static_cast<int32_t>(final_up_task),
-        TaskKind::Up
-    );
-    const CallbackSubmitTicket final_up_ticket{
-        9,
-        final_up_task,
-        -1,
-        0,
-        EncodeSharedPaTaskMeta(TaskKind::Up, 1, false),
-    };
-    ok &= FinishSplitCallbackSubmitFromRuntime<LoserFinishTestOps>(
-              &final_up_ticket, args
-          ) == 1;
-
-    ok &= runtime.finish_calls == kTasksPerBatch + 2;
+    ok &= runtime.finish_calls == two_group_plan.task_count;
     ok &= runtime.protocol_errors == 0;
-    ok &= runtime.task_id_sum == 22;
-    ok &= runtime.stats.result.submits == kTasksPerBatch + 2;
+    ok &= runtime.task_id_sum == 36;
+    ok &= runtime.stats.result.submits ==
+        two_group_plan.task_count;
     ok &= runtime.stats.result.materialized_outputs == 0;
     ok &= runtime.stats.result.shared_symbol_input_loads == 0;
     ok &= runtime.stats.result.shared_symbol_inout_commits == 0;
     ok &= runtime.stats.result.fanin_edges == 0;
     ok &= runtime.stats.result.map_inserts == 0;
+    ok &= runtime.stats.declared_task_count == 9;
     ok &= worker.occupied_count == 0;
     ok &= state->fatal.value == 0;
 
-    // 非法 ticket 必须在进入 Finish body、读取保护页 args 之前拒绝。
-    // QK/PV 的输出数同为 1，专门用错误 PV function_id 搭配 QK kind，
-    // 防止 shared_result.Size() 恰好相同而掩盖协议错配。
+    // 每个非法边界使用独立 runtime，避免第一次 fatal 后的计数污染掩盖
+    // 后续原因。stats.submits 只在这里设置为待测 next id；生产 caller
+    // 始终从 0 连续推进并由 ArmSharedSplitTicket 强制同一关系。
+    const auto ResetProtocolProbe = [&](
+        uint32_t task_id, TaskKind kind, bool won,
+        int32_t function_id, uint32_t task_capacity
+    ) {
+        runtime = CompeteFirstSplitRuntimeState{};
+        runtime.scheduler = state;
+        runtime.worker = &worker;
+        runtime.task_count = task_capacity;
+        runtime.worker_id = 0;
+        runtime.owner_worker_id = 0;
+        runtime.caller_state_address =
+            reinterpret_cast<uint64_t>(&runtime);
+        runtime.state_cookie =
+            CompeteFirstSplitStateCookie(0, CoreRole::Aic);
+        runtime.stats.result.submits = task_id;
+        runtime.context = SubmitContext{};
+        runtime.context.task_id = static_cast<int32_t>(task_id);
+        runtime.context.kernel_id = function_id;
+        runtime.context.won = won;
+        runtime.context.shared_result.Reset(
+            static_cast<int32_t>(task_id)
+        );
+        return PrepareSharedTaskOutputs(
+            runtime.context.shared_result,
+            static_cast<int32_t>(task_id), kind
+        );
+    };
+
+    // QK/PV 的 output count 同为 1，错误 function 不能借尺寸相同通过。
     state->fatal.value = 0;
-    runtime.context = SubmitContext{};
-    runtime.context.task_id = 1;
-    runtime.context.kernel_id = FunctionId(TaskKind::Pv);
-    runtime.context.won = true;
-    runtime.context.shared_result.Reset(1);
-    ok &= PrepareSharedTaskOutputs(
-        runtime.context.shared_result, 1, TaskKind::Qk
+    ok &= ResetProtocolProbe(
+        1, TaskKind::Qk, true, FunctionId(TaskKind::Pv), 9
     );
     const CallbackSubmitTicket wrong_winner_function{
-        10,
-        1,
-        static_cast<int16_t>(FunctionId(TaskKind::Pv)),
-        1,
+        10, 1, static_cast<int16_t>(FunctionId(TaskKind::Pv)), 1,
         EncodeSharedPaTaskMeta(TaskKind::Qk, 0, false),
     };
+    ok &= ArmSharedSplitTicket(runtime, wrong_winner_function);
     ok &= FinishSplitCallbackSubmitFromRuntime<LoserFinishTestOps>(
               &wrong_winner_function, args
           ) == 0;
-    ok &= runtime.protocol_errors == 1;
-    ok &= state->fatal.value == 1;
+    ok &= runtime.protocol_errors == 1 &&
+        state->fatal.value == 1;
 
-    // reserved bit 属于未来协议，当前版本必须 fail-closed，不能忽略后
-    // 按看似合法的 kind/group 继续解释。
+    // QK 的 last 组合在编码层即非法，且在保护页 args 之前拒绝。
     state->fatal.value = 0;
-    runtime.context = SubmitContext{};
-    runtime.context.task_id = 1;
-    runtime.context.kernel_id = -1;
-    runtime.context.won = false;
-    runtime.context.shared_result.Reset(1);
-    ok &= PrepareSharedTaskOutputs(
-        runtime.context.shared_result, 1, TaskKind::Qk
+    ok &= ResetProtocolProbe(
+        1, TaskKind::Qk, false, -1, 9
     );
-    const CallbackSubmitTicket reserved_bit_ticket{
-        11,
-        1,
-        -1,
-        0,
+    const CallbackSubmitTicket invalid_last_ticket{
+        11, 1, -1, 0,
         static_cast<uint8_t>(
             EncodeSharedPaTaskMeta(TaskKind::Qk, 0, false) |
-            kSharedPaTicketMetaReserved
+            kSharedPaTicketLastSubmit
         ),
     };
+    ok &= ArmSharedSplitTicket(runtime, invalid_last_ticket);
     ok &= FinishSplitCallbackSubmitFromRuntime<LoserFinishTestOps>(
-              &reserved_bit_ticket, args
+              &invalid_last_ticket, args
           ) == 0;
-    ok &= runtime.protocol_errors == 2;
-    ok &= state->fatal.value == 1;
+    ok &= runtime.protocol_errors == 1 &&
+        state->fatal.value == 1;
 
-    // loser 的 Claim 结果只能是 -1；即使 kind 与 output count 都正确，
-    // 也不能接受伪造的可执行 function_id。
+    // caller 先绑定 plan 推导出的 task0 Alloc，再把跨 TU ticket 篡成
+    // “合法 early-last Alloc”；编码自身合法也必须因 binding 不同而拒绝。
     state->fatal.value = 0;
-    runtime.context = SubmitContext{};
-    runtime.context.task_id = 1;
-    runtime.context.kernel_id = FunctionId(TaskKind::Qk);
-    runtime.context.won = false;
-    runtime.context.shared_result.Reset(1);
-    ok &= PrepareSharedTaskOutputs(
-        runtime.context.shared_result, 1, TaskKind::Qk
+    ok &= ResetProtocolProbe(
+        0, TaskKind::Alloc, false, -1, 9
+    );
+    const CallbackSubmitTicket expected_alloc{
+        12, 0, -1, 0,
+        EncodeSharedPaTaskMeta(TaskKind::Alloc, 0, false),
+    };
+    CallbackSubmitTicket early_last_alloc = expected_alloc;
+    early_last_alloc.reserved =
+        EncodeSharedPaTaskMeta(
+            TaskKind::Alloc, 0, false, true
+        );
+    ok &= ArmSharedSplitTicket(runtime, expected_alloc);
+    ok &= FinishSplitCallbackSubmitFromRuntime<LoserFinishTestOps>(
+              &early_last_alloc, args
+          ) == 0;
+    ok &= runtime.protocol_errors == 1 &&
+        state->fatal.value == 1;
+
+    // loser 的 Claim 结果只能是 -1。
+    state->fatal.value = 0;
+    ok &= ResetProtocolProbe(
+        1, TaskKind::Qk, false, FunctionId(TaskKind::Qk), 9
     );
     const CallbackSubmitTicket wrong_loser_function{
-        12,
-        1,
-        static_cast<int16_t>(FunctionId(TaskKind::Qk)),
-        0,
+        13, 1, static_cast<int16_t>(FunctionId(TaskKind::Qk)), 0,
         EncodeSharedPaTaskMeta(TaskKind::Qk, 0, false),
     };
+    ok &= ArmSharedSplitTicket(runtime, wrong_loser_function);
     ok &= FinishSplitCallbackSubmitFromRuntime<LoserFinishTestOps>(
               &wrong_loser_function, args
           ) == 0;
+    ok &= runtime.protocol_errors == 1 &&
+        state->fatal.value == 1;
 
-    // 即使 runtime.task_count 或后续 shared plan 自身损坏，固定容量也
-    // 必须作为最后一道边界。该 final loser 不进入 Materialize，专门
-    // 证明越界不能借“loser 不读 args”绕过 shared-output table 上限。
+    // 固定容量仍是 shared-output table 的最后一道边界。
     state->fatal.value = 0;
-    runtime.task_count = kMaxTasks + 1;
-    runtime.context = SubmitContext{};
-    runtime.context.task_id = static_cast<int32_t>(kMaxTasks);
-    runtime.context.kernel_id = -1;
-    runtime.context.won = false;
-    runtime.context.shared_result.Reset(
-        static_cast<int32_t>(kMaxTasks)
-    );
-    ok &= PrepareSharedTaskOutputs(
-        runtime.context.shared_result,
-        static_cast<int32_t>(kMaxTasks), TaskKind::Qk
+    ok &= ResetProtocolProbe(
+        kMaxTasks, TaskKind::Qk, false, -1, kMaxTasks + 1
     );
     const CallbackSubmitTicket capacity_overflow_loser{
-        13,
-        kMaxTasks,
-        -1,
-        0,
+        14, kMaxTasks, -1, 0,
         EncodeSharedPaTaskMeta(TaskKind::Qk, 0, false),
     };
+    ok &= ArmSharedSplitTicket(runtime, capacity_overflow_loser);
     ok &= FinishSplitCallbackSubmitFromRuntime<LoserFinishTestOps>(
               &capacity_overflow_loser, args
           ) == 0;
-    ok &= runtime.finish_calls == kTasksPerBatch + 6;
-    ok &= runtime.protocol_errors == 4;
-    ok &= runtime.task_id_sum == 25 + kMaxTasks;
-    ok &= runtime.stats.result.submits == kTasksPerBatch + 2;
+    ok &= runtime.protocol_errors == 1 &&
+        state->fatal.value == 1;
     ok &= worker.occupied_count == 0;
-    ok &= state->fatal.value == 1;
 
     // 先恢复权限再撤销映射，便于内存诊断器区分测试刻意保护与真实越界。
     if (mprotect(args_memory, args_bytes, PROT_READ | PROT_WRITE) != 0) {
@@ -1243,7 +1358,7 @@ bool RunTwoGroupExplicitFinishTest() {
     const CallbackSubmitTicket second_ticket{
         2, second_up,
         static_cast<int16_t>(FunctionId(TaskKind::Up)), 1,
-        EncodeSharedPaTaskMeta(TaskKind::Up, 1, false)
+        EncodeSharedPaTaskMeta(TaskKind::Up, 1, false, true)
     };
     ok &= FinishCallbackSubmitBody<LoserFinishTestOps, false>(
         state, worker, 9, second_args, second_context,
@@ -1257,6 +1372,7 @@ bool RunTwoGroupExplicitFinishTest() {
     ok &= second_stats.result.fanin_edges == 3;
     ok &= second_stats.result.dependency_signature ==
         0xf772149f1ca20d6bULL;
+    ok &= second_stats.declared_task_count == 9;
     ok &= second_slot.occupied && second_slot.built &&
         second_slot.task_id == static_cast<uint32_t>(second_up) &&
         second_slot.kind ==
@@ -1281,6 +1397,7 @@ bool RunTwoGroupExplicitFinishTest() {
 
 int main() {
     const bool batch_plan_ok = RunSharedBatchPlanTest();
+    const bool payload_wrap_ok = RunPayloadWrapIsolationTest();
     const bool direct_slot_ok = RunReadySharedDescriptorDirectToSlotTest();
     const bool loser_ok = RunProtectedArgsLoserTest();
     const bool future_task_ok = RunFutureTaskWithoutSequencerTest();
@@ -1290,7 +1407,8 @@ int main() {
     const bool up_failure_ok = RunUpWriterCommitFailureTest();
     const bool fatal_drain_ok = RunFatalBlockedSuccessorDrainTest();
     const bool two_group_finish_ok = RunTwoGroupExplicitFinishTest();
-    if (!batch_plan_ok || !direct_slot_ok || !loser_ok ||
+    if (!batch_plan_ok || !payload_wrap_ok ||
+        !direct_slot_ok || !loser_ok ||
         !future_task_ok || !fatal_stop_ok ||
         !alloc_failure_ok || !qk_failure_ok || !up_failure_ok ||
         !fatal_drain_ok ||

@@ -338,9 +338,19 @@ __aicore__ inline void CcecOps::PmuWindowStop(
         context.phase_calls == 0 && context.begin_reads == 0 && context.end_reads == 0 &&
         context.phase_requests == 0 && context.phase_misses == 0 &&
         context.phase_elapsed_ticks == 0;
+#if PTO_FDWIC_SHARED_MAP
+    // shared 的 task 数由各 batch 的 context_len 决定。Stop 时公共结果尚未
+    // 发布到 state->results，因此直接读取本 worker 已完成回放的 local_index；
+    // host 再用独立 task plan 校验这个实际值，避免设备端复制一套期望公式。
+    const uint32_t expected_phase_calls =
+        static_cast<uint32_t>(state->workers[worker_id].local_index);
+#else
+    const uint32_t expected_phase_calls =
+        state->config.batches * pa_scheduler::kTasksPerBatch;
+#endif
     const bool running_shape =
         pa_scheduler::kCompiledSubmitPmuPhase != pa_scheduler::SubmitPmuPhase::None &&
-        context.phase_calls == state->config.batches * pa_scheduler::kTasksPerBatch &&
+        context.phase_calls == expected_phase_calls &&
         context.begin_reads == context.phase_calls &&
         context.end_reads == context.phase_calls;
     if (none_shape || running_shape)
