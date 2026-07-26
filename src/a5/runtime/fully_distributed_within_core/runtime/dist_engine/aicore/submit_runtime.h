@@ -120,8 +120,8 @@ PTO_DEVICE_FUNC bool dist_submit_wait_heap_capacity(DistSubmitCtx &ctx, DistSubm
     bool heap_poll_region_active = false;
     uint32_t heap_poll_region = 0;
     while (!fdwic_trace_is_fatal(ctx.task_id)) {
-        // 逻辑 heap 尚未走完第一圈时，物理地址还没有发生环形复用；保留 fatal
-        // 原子检查后，可直接跳过 frontier/vend 原子读取。
+        // Before the logical heap completes its first lap, no physical address
+        // has been reused. Keep the fatal check but skip frontier/vend loads.
         if (ctx.self->heap_next <= ring) {
             if (heap_poll_region_active) fdwic_atomic_poll_region_end(heap_poll_region);
             return true;
@@ -174,6 +174,27 @@ PTO_DEVICE_FUNC bool dist_submit_wait_heap_capacity(DistSubmitCtx &ctx, DistSubm
     }
     return false;
 }
+
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC bool dist_submit_wait_shared_tensor_map_turn(DistSubmitCtx &ctx) {
+    if (ctx.self == nullptr || !ctx.won) {
+        return dist_submit_handle_shared_tensor_map_result(ctx, DistSharedTensorMapTaskPublishResult::ProtocolError);
+    }
+    while (!fatal_set()) {
+        const int64_t next_task = dist_tensor_map_next_publish_task();
+        if (next_task == ctx.task_id) return true;
+        if (next_task < 0 || next_task > ctx.task_id) {
+            return dist_submit_handle_shared_tensor_map_result(
+                ctx, DistSharedTensorMapTaskPublishResult::ProtocolError
+            );
+        }
+        drain_block_won(ctx.self);
+        if (drain_phase_b(ctx.self) == 0) SPIN_WAIT_HINT();
+    }
+    ctx.self->local_index = kFlagCap;
+    return false;
+}
+#endif
 
 PTO_DEVICE_FUNC void publish_joint_deposits(DistSubmitCtx &ctx, const MixedKernels &mixed, const L0TaskArgs &args) {
     if (!ctx.joint) return;
@@ -317,7 +338,12 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_finish_kernel_tail(
 ) {
     uint64_t register_begin = tail_begin;
     if (ctx.won) {
+#if PTO_FDWIC_SHARED_MAP
+        if (!dist_submit_wait_shared_tensor_map_turn(ctx)) return ctx.result;
+        const bool fanin_ok = dist_submit_collect_fanin(args, ctx, ctx.fanin, ctx.fanin_count);
+#else
         ctx.fanin_count = dist_submit_collect_fanin(args, ctx, ctx.fanin);
+#endif
         fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Fanin>();
         TRACE_TIMESTAMP(fanin_end);
         TRACE_SPAN_RECORD(
@@ -325,17 +351,24 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_finish_kernel_tail(
             static_cast<uint32_t>(ctx.fanin_count)
         );
         register_begin = fanin_end;
+#if PTO_FDWIC_SHARED_MAP
+        if (__builtin_expect(!fanin_ok, 0)) {
+            (void)dist_submit_handle_shared_tensor_map_result(ctx, DistSharedTensorMapTaskPublishResult::ProtocolError);
+            return ctx.result;
+        }
+#endif
     }
-    // Register 的局部 PMU 只包围真实 RegisterOutputs 调用体，不吸收前一条
-    // Fanin/Claim record 发布或 caller 衔接。
+    // The Register PMU window covers only the real RegisterOutputs call, not
+    // the preceding Fanin/Claim record publication or caller transition.
     fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Register>();
     const bool register_ok = dist_submit_register_outputs(ctx, args, /*include_existing=*/true);
     fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Register>();
     TRACE_TIMESTAMP(register_end);
     if (__builtin_expect(!register_ok, 0)) {
-        // 当前 task 已经 Claim，但绝不能 Build/发布；后续 task 会由本核
-        // task-cap sentinel 在 Claim 前截断。故意不闭合 Submit/perf/PMU
-        // 外层，让失败 raw 被完整性门禁拒绝；Register span 足以定位错误。
+        // The current task has claimed but must not Build or publish. The
+        // worker task-cap sentinel blocks later tasks before Claim. Leave the
+        // outer Submit/perf/PMU window open so integrity validation rejects the
+        // failed raw trace; the Register span still identifies the failure.
         TRACE_SPAN_RECORD(
             register_begin, register_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Register, 0, 1
         );
@@ -344,7 +377,8 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_finish_kernel_tail(
     if (ctx.won) {
         fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::WinnerBuild>();
     } else {
-        // 与泳道共用 Register.end 起点，只包围真实 loser 的 drain_block_won()。
+        // Share Register.end with the swimlane and cover only the loser's real
+        // drain_block_won() call.
         fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::LoserReplay>();
     }
     TRACE_SPAN_RECORD(register_begin, register_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Register, 0, 1);
@@ -378,6 +412,10 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_finish_kernel_tail(
 PTO_DEVICE_FUNC TaskOutputTensors
 dist_submit_finish_alloc_tail(DistSubmitCtx &ctx, uint64_t completion_begin, uint64_t submit_begin) {
     if (__builtin_expect(ctx.won, 0)) {
+#if PTO_FDWIC_SHARED_MAP
+        if (!dist_submit_wait_shared_tensor_map_turn(ctx)) return ctx.result;
+        if (!dist_submit_commit_empty_shared_tensor_map_task(ctx)) return ctx.result;
+#endif
         dist_submit_complete_alloc(ctx);
         fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::AllocComplete>();
         TRACE_TIMESTAMP(alloc_complete_end);
@@ -404,9 +442,8 @@ PTO_DEVICE_FUNC inline void dist_final_barrier_publish(__gm__ volatile int64_t &
     );
 }
 
-PTO_DEVICE_FUNC inline bool dist_final_barrier_progress(
-    __gm__ DistCore *self, bool &leaf_forwarded, bool &root_released, bool &leaf_released
-) {
+PTO_DEVICE_FUNC inline bool
+dist_final_barrier_progress(__gm__ DistCore *self, bool &leaf_forwarded, bool &root_released, bool &leaf_released) {
     const int32_t group = self->block_id % kFinalBarrierGroups;
     __gm__ FinalBarrierArrival &leaf_arrival = g_dist.final_barrier.leaf_arrivals[group];
     const bool leaf_leader = self->lane == LANE_AIC && self->block_id == group;
@@ -429,9 +466,8 @@ PTO_DEVICE_FUNC inline bool dist_final_barrier_progress(
         dist_final_barrier_publish(g_dist.final_barrier.leaf_releases[group].v);
         leaf_released = true;
     }
-    return fdwic_trace_atomic_load(
-               -1, FdwicAtomicSite::ReplayDonePoll, g_dist.final_barrier.leaf_releases[group].v
-           ) >= 1;
+    return fdwic_trace_atomic_load(-1, FdwicAtomicSite::ReplayDonePoll, g_dist.final_barrier.leaf_releases[group].v) >=
+           1;
 }
 
 PTO_DEVICE_FUNC void dist_submit_drain_to_completion(__gm__ DistCore *self) {
@@ -450,8 +486,7 @@ PTO_DEVICE_FUNC void dist_submit_drain_to_completion(__gm__ DistCore *self) {
         drain_block_won(self);
         const int32_t freed = drain_phase_b(self);
         if (!global_release_observed) {
-            global_release_observed =
-                dist_final_barrier_progress(self, leaf_forwarded, root_released, leaf_released);
+            global_release_observed = dist_final_barrier_progress(self, leaf_forwarded, root_released, leaf_released);
         }
         const bool ring_empty = self->occupied_count == 0;
         const bool pending = has_pending_won(self);
@@ -510,8 +545,9 @@ dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &arg
     drain_phase_b(ctx.self);
     fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::EfDrainControl>();
     TRACE_TIMESTAMP(efdrain_end);
-    // 旧 API 的 Materialize.start 复用 efdrain_end；在同一源码边界打开
-    // selected phase。submit-PMU ELF 中泳道 record 已编译去除。
+    // The legacy API reuses efdrain_end as Materialize.start and opens the
+    // selected phase at the same source boundary. Swimlane records are
+    // compiled out of the submit-PMU ELF.
     fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Materialize>();
     TRACE_SPAN_RECORD(submit_begin, efdrain_end, ctx.self, ctx.task_id, -1, TracePhase::EfDrain, 0, 0);
     uint64_t prepare_map_end = efdrain_end;
@@ -526,7 +562,7 @@ dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &arg
     const uint32_t claim_flags = (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U);
     fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Claim>();
     TRACE_TIMESTAMP(claim_end);
-    // legacy Kernel winner 的泳道 Fanin 继承 Claim.end 作为起点。
+    // A legacy Kernel winner starts swimlane Fanin at Claim.end.
     if (ctx.won) fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Fanin>();
     TRACE_SPAN_RECORD(claim_begin, claim_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Claim, claim_flags, 0);
     return dist_submit_finish_kernel_tail(ctx, mixed, args, claim_end, submit_begin);
@@ -563,7 +599,8 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
     const uint32_t claim_flags = (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U);
     fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Claim>();
     TRACE_TIMESTAMP(claim_end);
-    // AllocComplete 与泳道共用 Claim.end 起点；只在真实 Alloc winner 上开窗。
+    // AllocComplete shares Claim.end with the swimlane and opens only for a
+    // real Alloc winner.
     if (ctx.won) fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::AllocComplete>();
     TRACE_SPAN_RECORD(claim_begin, claim_end, ctx.self, ctx.task_id, -1, TracePhase::Claim, claim_flags, 1);
     return dist_submit_finish_alloc_tail(ctx, claim_end, submit_begin);
@@ -593,11 +630,13 @@ dist_submit_compete_first_begin(PTO2Runtime *, const MixedKernels &mixed) {
     const uint32_t claim_flags = (is_winner ? kFdwicClaimWon : 0U) | (ctx.claim_attempted ? kFdwicClaimAttempted : 0U);
     fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Claim>();
     TRACE_TIMESTAMP(claim_end);
-    // 与泳道 Claim.end 使用同一源码边界。局部 PMU 从这里跨过 Begin 返回、
-    // 同步 eager callback 构参，直到匹配 Finish 的 Materialize 入口。
+    // Use the same boundary as swimlane Claim.end. The local PMU spans the
+    // Begin return and synchronous eager argument callback up to Materialize
+    // in the matching Finish.
     fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::ArgBuild>();
-    // 校准 ELF 在相同 Claim.end 调用点紧邻执行一对 begin/end；其他 ELF
-    // 编译成空 wrapper。该窗口只量化观察器自身，不包业务体。
+    // The calibration ELF executes an adjacent begin/end pair at this same
+    // Claim.end call site. Other ELFs compile it to an empty wrapper. This
+    // window measures observer overhead only.
     fdwic_submit_pmu_empty_bracket_calibrate();
     TRACE_SPAN_RECORD(claim_begin, claim_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Claim, claim_flags, 0);
     return dist_submit_make_ticket(ctx, DistSubmitKind::Kernel, submit_begin, ready);
@@ -612,8 +651,8 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_compete_first_finish
 
     fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::ArgBuild>();
     TRACE_TIMESTAMP(materialize_begin);
-    // compete-first 的 selected phase 与当前泳道 Materialize.begin 共用
-    // 同一业务边界，PrepareMap 由 helper 中的 end 排除。
+    // The compete-first selected phase shares the current swimlane
+    // Materialize.begin business boundary. The helper end excludes PrepareMap.
     fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Materialize>();
     uint64_t prepare_map_end = materialize_begin;
     if (!dist_submit_materialize_and_prepare_map(
@@ -669,8 +708,8 @@ dist_alloc_compete_first_finish(PTO2Runtime *, const DistCompeteFirstTicket &tic
     (void)dist_submit_register_outputs(ctx, args, /*include_existing=*/false);
     fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Register>();
     TRACE_TIMESTAMP(register_end);
-    // compete-first AllocComplete 与泳道共用 Register.end 起点；公共 tail
-    // 负责在 dist_submit_complete_alloc() 返回后闭合。
+    // Compete-first AllocComplete shares Register.end with the swimlane. The
+    // common tail closes it after dist_submit_complete_alloc() returns.
     if (ctx.won) fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::AllocComplete>();
     TRACE_SPAN_RECORD(prepare_map_end, register_end, ctx.self, ctx.task_id, -1, TracePhase::Register, 0, 0);
     return dist_submit_finish_alloc_tail(ctx, register_end, ticket.submit_begin);

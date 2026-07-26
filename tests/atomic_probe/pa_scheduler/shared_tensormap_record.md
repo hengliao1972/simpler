@@ -7450,3 +7450,192 @@ private 对照以 clean `ebe3ff28` 为父版本基线。当前与父版本的 AI
 `append -> commit` 接到 Kernel/Alloc/MIX 的真实 winner 路径。接线必须把
 本 helper 作为唯一结果收敛入口；任何非 `Committed` 结果都不得继续 Build
 或发布 completion。
+
+### 2026-07-26：R3a 接入 shared TensorMap 基础 Submit 事务
+
+本阶段开始把 S2e 冻结的错误合同接入 production Submit，但仍保持
+`kFdwicCompiledBackendReady == false`。也就是说，本阶段验证的是正式
+Kernel/Alloc/joint Submit 源码在 shared 构建身份下如何访问和提交
+TensorMap，不把尚未完成多 worker、真实 PA INOUT 和跨核可见性门槛的
+artifact 提前放行。
+
+#### 先固定唯一合法的访问顺序
+
+shared TensorMap 不是把 private `head/tail` 换成 atomic 后让每个 replay
+worker 照旧访问。当前 exact-turn 单追加者协议要求：
+
+```text
+task N 唯一 winner
+  -> 等待 committed_tasks == N
+  -> 完成 N 的 INPUT/INOUT lookup
+  -> 对 N 的全部 INOUT/OUTPUT_EXISTING 做整 task preflight
+  -> 发布全部 payload/seq/tail
+  -> CAS committed_tasks: N -> N+1
+  -> joint deposit（如有）
+  -> Build 本核 RingSlot
+
+task N loser
+  -> 不等待 shared turn
+  -> 不读 shared bucket/slot
+  -> 不发布 shared entry/commit
+  -> 只走既有 loser progress
+```
+
+`committed_tasks < N` 表示较早 task 尚未完成 map 事务，winner 在等待期间
+调用既有 `drain_block_won()/drain_phase_b()` 帮助系统前进；
+`committed_tasks > N`、负值或 lookup 的 cursor/seq 不自洽均是协议错误，
+不能降级成普通 miss。当前等待位于 Kernel 的 Fanin PMU 窗口、Alloc 的
+AllocComplete PMU 窗口内；后续解释分段数据时必须把这段 shared turn 等待
+算进相应阶段，不能把它误判成纯 lookup 或纯 completion 指令时间。
+
+Kernel/joint winner 把 `register_mask` 中所有 INOUT/OUTPUT_EXISTING 先转换
+为固定的 `SharedTensorMapValue[MAX_TENSOR_ARGS]`，再调用一次整 task publish。
+即使 `register_mask == 0`，也必须发布零 entry 事务并推进 N+1，否则后续
+writer 会永远停在断裂的连续 commit 前沿。joint deposit 和本核 Build 均
+放在成功 commit 之后；容量、协议或部分发布失败都先经过 S2e 的唯一结果
+收敛入口，不再继续写 WonSlot 或 RingSlot。
+
+Alloc 没有 ordinary-region entry，但同样占一个逻辑 task id。其 winner
+必须先等待 exact turn，再提交零 entry 事务，最后才调用
+`complete_executed_task()` 发布 vend/flag/frontier。commit-ahead 等错误不得
+伪造立即完成。
+
+#### 模式 facade 与 scalar 访问边界
+
+`tensor_map.h` 现在把两种构建身份完全在编译期分开：
+
+- private 的 worker reset、`N-H` prepare、lookup 和 insert 保持原入口；
+- shared worker reset/prepare 为 no-op，全局 sidecar 仍只由 AICPU setup
+  thread 初始化；
+- shared Submit 使用单独的
+  `dist_tensor_map_lookup_for_submit_winner()`，调用点位于 exact-turn gate
+  之后；
+- loser 不会取得这个入口，shared publish 也只接受 `ctx.won`。
+
+CPU-sim 的通用 `get_tensor_data/set_tensor_data` 没有 Claim，也无法证明
+调用者是当前 exact-turn winner。它不能复用 Submit lookup 去读取 shared
+map。本阶段没有脑补一套 scalar 访问协议，而是明确 fail-closed：shared
+身份下设置 code 13、返回 lookup miss，并在实际读写 tensor buffer 之前
+退出；同时逐字节断言 private map 和 shared sidecar 都不被读取后写回或
+修改。CCEC 原有 scalar data access 路径不经过该 CPU-sim lookup 分支。
+
+#### 集成门槛
+
+新增 `test_fdwic_shared_submit_wiring`，直接在
+`__CPU_SIM=1 + PTO_FDWIC_SHARED_MAP=1 + CAP128` 下编译 production
+`dist_engine.cpp`。最初只加入五个行为断言时，缺少接线的源码按预期全部
+失败；完成接线后扩展为十二类门槛：
+
+1. Kernel winner 从 shared map 获得 fan-in、整 task 发布
+   INOUT/OUTPUT_EXISTING，并 Build 一个 RingSlot；
+2. 零 region Kernel 仍推进 commit，且 bucket/slot/reclaim 不变；
+3. 零 region joint winner 推进 commit 后发布一份 joint work；
+4. Alloc winner 只改变 commit 后再发布 completion，shared 其余字节不变；
+5. legacy 一次式 Kernel 使用同一 shared 事务边界；
+6. legacy 一次式 Alloc 使用同一零 entry 事务边界；
+7. loser 带 INPUT 和 OUTPUT，面对故意损坏的 shared bucket 仍不得读写
+   shared，也不得触碰 private prepare/map；
+8. 通用 scalar get/set 在 shared CPU-sim 下 code 13，并抑制真实 buffer
+   读写；
+9. winner lookup 遇到 `tail` 指向 invalid seq 时，在 publish/Build 前
+   code 13；
+10. Kernel 观察到 commit-ahead 时，在 Build 前 code 13；
+11. Alloc 观察到 commit-ahead 时，不得发布 flag/vend/frontier；
+12. joint winner 整 task 容量不足时，在 WonSlot deposit 和 RingSlot
+    Build 前 code 11。
+
+失败门槛不仅检查 error code，还检查 `local_index == kFlagCap`、
+`committed_tasks`、task flag/vend/frontier、joint publication 和本核
+occupancy，避免把“返回了错误”误当成“没有继续产生副作用”。Alloc 零
+entry 成功门槛把 shared sidecar 除 `committed_tasks.v` 外的所有字节与调用
+前快照比较，证明它不是暗中发布垃圾 region 的伪空事务。
+
+#### 冻结源码验证与代码量
+
+最终冻结源码的关键 SHA256 前缀为：
+
+```text
+tensor_map.h             c045ff8e
+tensor_data_access.h     68617def
+submit_core.h            b928f6a1
+submit_runtime.h         eaf27b46
+shared wiring test       1cb238b9
+```
+
+同一份源码得到以下结果：
+
+| 检查 | 结果 |
+| --- | --- |
+| GCC15 RelWithDebInfo FDWIC C++ 门槛 | 23/23 PASS |
+| shared wiring 内部行为 | 12/12 PASS |
+| GCC15 ASAN+UBSAN shared wiring | 12/12 PASS，无报告 |
+| A5sim/A5 × private/shared production artifact | 4/4 Build complete；模式宏 0/1 与 CAP128 正确 |
+| private CPU production TU 隔离 | 三个执行 section 及语义 relocation 与 `6e7e8af9` 相同 |
+| private A5sim production object 隔离 | `.text/.text.exit` 及语义 relocation 相同 |
+| private A5 CCEC 隔离 | AIC/AIV/final `.text` 与 raw `.rela.text` 均逐字节相同 |
+| 最终格式/英文/头部/cpplint/markdown/clang-tidy | PASS |
+| `git diff --check` | PASS |
+
+private A5 CCEC 的冻结对照为：
+
+| 产物 | `.text` | SHA256 前缀 |
+| --- | ---: | --- |
+| AIC | 86,344B | `f7aacd26` |
+| AIV | 86,704B | `3938bd4f` |
+| final aicore | 190,232B | `08ecb6ac` |
+
+A5sim private 最终 `.so` 的 raw `.text` 都是 75,955B，但有 125B 不同。
+逐项定位表明差异来自 clean worktree 与当前 worktree 的绝对源码根写入
+`.rodata` 后，RIP-local-data displacement 随本地数据地址平移；归一化
+反汇编完全相同，SHA256 都是 `50c4678d...`。因此它不是 private 执行逻辑
+变化，也没有用 raw final hash 掩盖路径重定位原因。
+
+shared CCEC 则真实增加了基础事务代码：
+
+| 产物 | S2e | R3a | 增量 |
+| --- | ---: | ---: | ---: |
+| dist-engine AIC `.text` | 86,344B | 91,312B | +4,968B（+5.75%） |
+| dist-engine AIV `.text` | 86,704B | 91,032B | +4,328B（+4.99%） |
+| final aicore `.text` | 189,976B | 199,192B | +9,216B（+4.85%） |
+
+这部分不是 private 污染，而是 shared exact-turn、lookup、整 task preflight/
+publish 和错误分支进入设备产物的真实成本。后续 A5 正确性闭合后必须用
+shared perf-clock 和 I-cache 观察判断是否需要冷路径外提、缩短临时数组或
+减少模板实例，不能仅凭代码尺寸推断实际时间，也不能忽略约 4.85% 的
+I-cache 风险。
+
+验证证据目录：
+
+```text
+/tmp/fdwic-s3-basic-wiring-review-20260726/freeze-ut
+/tmp/fdwic-s3-basic-wiring-review-20260726/freeze-ut-sanitize
+/tmp/fdwic-s3-basic-wiring-review-20260726/freeze-artifacts
+/tmp/fdwic-s3-basic-wiring-review-20260726/freeze-compare
+```
+
+一次无目标过滤的 C++ `all` build 仍会在既有 A2/A3
+`PTO2TaskPayload` 568B/576B 静态断言处失败；本轮没有修改 A2/A3，也没有
+把该失败隐去。上述 23/23 是显式构建和运行全部 FDWIC 目标的隔离结果。
+唯一编译 warning 是已有 `SPIN_WAIT_HINT` 在 sim
+`inner_kernel.h` 与 `pto_runtime2_types.h` 的重复定义，本阶段未新增或掩盖。
+
+#### 当前阶段边界
+
+R3a 只闭合单 worker 可判定的基础事务顺序，下面这些仍是解除 shared 顶层
+门禁前的必做项，不能被十二类门槛替代：
+
+- `committed_tasks < N` 时多个真实 worker 的等待、帮助前进与恢复；
+- 等待期间由其他 worker 发布 fatal 后的统一退出和 first-error-wins；
+- Kernel Build 后真实执行、completion、final drain 与 Host 非零返回；
+- fresh OUTPUT 的 heap/owner fan-in、连续任务复用和回收；
+- joint 的 anchor/follower/last-lane 完整执行闭环；
+- PA 最后一个含 INOUT task 的 region-intent Submit，保证其后的 loser
+  使用覆写后的正确依赖；
+- CCEC `get_tensor_data/set_tensor_data` 的同步合同；真实 PA 会调用这组
+  scalar API，不能把当前只针对 CPU-sim 的 fail-closed 当成设备方案；
+- A5 双核 `payload/seq/tail -> commit` 可见性 litmus；
+- A5sim/A5 shared 正确性、private/shared 逻辑签名可比和 perf-clock 性能。
+
+整 task 临时数组也会增加 shared winner 的 scalar stack，新增 shared
+分支会扩大 CCEC `.text`。这两项先作为后续 A5 I-cache/栈和性能审计对象，
+不能在基础协议尚未闭合时凭代码大小提前改写事务语义。

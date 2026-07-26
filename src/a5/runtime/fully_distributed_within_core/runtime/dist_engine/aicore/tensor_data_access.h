@@ -53,6 +53,11 @@ DIST_API_ATTR PTO_DEVICE_FUNC uint64_t
 dist_get_tensor_data_impl(PTO2Runtime *, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
     if (tensor.buffer.addr == 0) return 0;
     wait_tensor_data_access_ready(tensor);
+#if PTO_FDWIC_SHARED_MAP && !defined(__CCE_AICORE__)
+    // Shared CPU-sim scalar access has no Claim/exact-turn proof. Its map
+    // facade latches a protocol error, so the underlying buffer must not be read.
+    if (fatal_set()) return 0;
+#endif
     return dist_read_tensor_scalar_raw(tensor, ndims, indices);
 }
 
@@ -61,5 +66,9 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_set_tensor_data_impl(
 ) {
     if (tensor.buffer.addr == 0) return;
     wait_tensor_data_access_ready(tensor);
+#if PTO_FDWIC_SHARED_MAP && !defined(__CCE_AICORE__)
+    // Match the read path: fail before mutating tensor storage.
+    if (fatal_set()) return;
+#endif
     dist_write_tensor_scalar_raw(tensor, ndims, indices, value);
 }

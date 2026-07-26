@@ -29,8 +29,7 @@ int32_t dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int n
     if (const char *e = getenv("PTO_DIST_H")) {
         if (!dist_parse_history_window(e, kTaskWindow - 2, configured_history)) {
             DIST_ERRF(
-                "[dist_engine] invalid PTO_DIST_H='%s'; expected ASCII decimal digits in [0, %d]\n", e,
-                kTaskWindow - 2
+                "[dist_engine] invalid PTO_DIST_H='%s'; expected ASCII decimal digits in [0, %d]\n", e, kTaskWindow - 2
             );
             return runtime_status_from_error_codes(PTO2_ERROR_DIST_CONFIG_INVALID, PTO2_ERROR_NONE);
         }
@@ -69,9 +68,10 @@ int32_t dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int n
     g_dist.final_barrier.root_arrival.expected = 0;
     atomic_exchange(g_dist.final_barrier.root_release.v, int64_t{0}, __ATOMIC_RELAXED);
 #if PTO_FDWIC_SHARED_MAP
-    // 当前 shared artifact 仍由上层 backend-ready 门禁在零 Submit 前拒绝。
-    // 先把一次性初始化接到真实 AICPU setup 入口，后续解除门禁时不再新增
-    // 第二套初始化路径；worker reset 绝不能并发清空这份全局单副本。
+    // The upper backend-ready gate still rejects normal shared execution before
+    // the first Submit. Keep one-time initialization on the real AICPU setup
+    // path so enabling the backend needs no second reset path; worker reset must
+    // never clear this global single copy concurrently.
     dist_shared_tensor_map_reset(g_dist.shared_tensor_map);
 #endif
     g_dist.orch_args = orch_args;

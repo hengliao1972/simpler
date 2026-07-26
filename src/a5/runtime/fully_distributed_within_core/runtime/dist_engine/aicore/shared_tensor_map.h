@@ -424,7 +424,9 @@ struct DistSharedTensorMapAicoreOps {
 };
 
 // These concrete wrappers force Host, CPU-sim, and CCEC to instantiate the
-// same production primitives. The S2 facade does not call them yet.
+// same production primitives. The shared Submit facade calls them, while the
+// top-level backend gate remains closed until the remaining concurrency and
+// device-visibility gates pass.
 PTO_DEVICE_FUNC inline int32_t dist_shared_tensor_map_lookup_region(
     __gm__ SharedTensorMapState &map, const SharedTensorMapValue &query, int32_t current_task, int32_t history,
     bool &protocol_ok

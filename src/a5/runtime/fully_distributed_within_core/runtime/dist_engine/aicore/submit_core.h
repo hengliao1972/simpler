@@ -553,7 +553,12 @@ PTO_DEVICE_FUNC void dist_submit_add_fanin(int32_t fanin[], int32_t &fanin_count
     if (fanin_count < kMaxFanin) fanin[fanin_count++] = producer;
 }
 
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC bool
+dist_submit_collect_fanin(const L0TaskArgs &args, const DistSubmitCtx &ctx, int32_t fanin[], int32_t &fanin_count) {
+#else
 PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const DistSubmitCtx &ctx, int32_t fanin[]) {
+#endif
     int32_t fc = 0;
     for (int32_t i = 0; i < ctx.tensor_count; i++) {
         const TensorArgType tag = args.tag(i);
@@ -565,7 +570,14 @@ PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const 
                 dist_submit_add_fanin(fanin, fc, static_cast<int32_t>(owner_raw & 0xFFFFFFFFu));
             }
             if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
+#if PTO_FDWIC_SHARED_MAP
+            int32_t p = -1;
+            if (!dist_tensor_map_lookup_for_submit_winner(*ctx.self, args.tensor(i).gm_ref(), ctx.task_id, p)) {
+                return false;
+            }
+#else
             const int32_t p = dist_tensor_map_lookup_for_task(*ctx.self, args.tensor(i).gm_ref(), ctx.task_id);
+#endif
             dist_submit_add_fanin(fanin, fc, p);
         } else {
             const Tensor &t = args.tensor(i).ref();
@@ -574,7 +586,12 @@ PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const 
                 dist_submit_add_fanin(fanin, fc, static_cast<int32_t>(owner_raw & 0xFFFFFFFFu));
             }
             if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
+#if PTO_FDWIC_SHARED_MAP
+            int32_t p = -1;
+            if (!dist_tensor_map_lookup_for_submit_winner(*ctx.self, t, ctx.task_id, p)) return false;
+#else
             const int32_t p = dist_tensor_map_lookup_for_task(*ctx.self, t, ctx.task_id);
+#endif
             dist_submit_add_fanin(fanin, fc, p);
         }
 #else
@@ -583,13 +600,24 @@ PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const 
         if (owner_raw != UINT64_MAX) dist_submit_add_fanin(fanin, fc, static_cast<int32_t>(owner_raw & 0xFFFFFFFFu));
         if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
         if (t.manual_dep) continue;
+#if PTO_FDWIC_SHARED_MAP
+        int32_t p = -1;
+        if (!dist_tensor_map_lookup_for_submit_winner(*ctx.self, t, ctx.task_id, p)) return false;
+#else
         const int32_t p = dist_tensor_map_lookup_for_task(*ctx.self, t, ctx.task_id);
+#endif
         dist_submit_add_fanin(fanin, fc, p);
 #endif
     }
+#if PTO_FDWIC_SHARED_MAP
+    fanin_count = fc;
+    return true;
+#else
     return fc;
+#endif
 }
 
+#if !PTO_FDWIC_SHARED_MAP
 PTO_DEVICE_FUNC bool dist_submit_insert_existing_tensor(DistSubmitCtx &ctx, const L0TaskArgs &args, int32_t i) {
 #if defined(__CCE_AICORE__)
     if (args.tensor(i).tensor_from_gm()) {
@@ -610,6 +638,7 @@ PTO_DEVICE_FUNC void dist_submit_latch_tensor_map_failure(DistSubmitCtx &ctx) {
     if (ctx.self != nullptr) ctx.self->local_index = kFlagCap;
     set_fatal_code(PTO2_ERROR_TENSORMAP_CAPACITY);
 }
+#endif
 
 #if PTO_FDWIC_SHARED_MAP
 PTO_DEVICE_FUNC int32_t dist_submit_shared_tensor_map_error_code(DistSharedTensorMapTaskPublishResult result) {
@@ -640,6 +669,25 @@ dist_submit_handle_shared_tensor_map_result(DistSubmitCtx &ctx, DistSharedTensor
 #endif
 
 PTO_DEVICE_FUNC bool dist_submit_register_outputs(DistSubmitCtx &ctx, const L0TaskArgs &args, bool include_existing) {
+#if PTO_FDWIC_SHARED_MAP
+    if (!include_existing || !ctx.won) return true;
+    SharedTensorMapValue entries[MAX_TENSOR_ARGS];
+    uint32_t count = 0;
+    uint32_t register_mask = ctx.register_mask;
+    for (int32_t i = 0; register_mask != 0; i++, register_mask >>= 1) {
+        if ((register_mask & 1u) == 0) continue;
+#if defined(__CCE_AICORE__)
+        entries[count++] = args.tensor(i).tensor_from_gm() ?
+                               dist_shared_tensor_map_make_value(args.tensor(i).gm_ref(), ctx.task_id) :
+                               dist_shared_tensor_map_make_value(args.tensor(i).ref(), ctx.task_id);
+#else
+        entries[count++] = dist_shared_tensor_map_make_value(args.tensor(i).ref(), ctx.task_id);
+#endif
+    }
+    return dist_submit_handle_shared_tensor_map_result(
+        ctx, dist_tensor_map_publish_shared_task(entries, count, ctx.task_id)
+    );
+#else
     if (!include_existing) return true;
     uint32_t register_mask = ctx.register_mask;
     for (int32_t i = 0; register_mask != 0; i++, register_mask >>= 1) {
@@ -650,7 +698,17 @@ PTO_DEVICE_FUNC bool dist_submit_register_outputs(DistSubmitCtx &ctx, const L0Ta
         }
     }
     return true;
+#endif
 }
+
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC bool dist_submit_commit_empty_shared_tensor_map_task(DistSubmitCtx &ctx) {
+    if (!ctx.won) return true;
+    return dist_submit_handle_shared_tensor_map_result(
+        ctx, dist_tensor_map_publish_shared_task(nullptr, 0, ctx.task_id)
+    );
+}
+#endif
 
 PTO_DEVICE_FUNC bool dist_submit_materialize_and_prepare_map(
     __gm__ DistCore *self, const L0TaskArgs &args, DistSubmitCtx &ctx, DistSubmitKind kind, uint64_t materialize_begin,
