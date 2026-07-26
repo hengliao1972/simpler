@@ -11,6 +11,7 @@
 
 #include "spin_hint.h"
 
+#include "aicpu/platform_regs.h"
 #include "pto_runtime2.h"
 #include "runtime.h"
 

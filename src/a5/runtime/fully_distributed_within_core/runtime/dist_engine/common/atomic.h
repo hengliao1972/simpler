@@ -84,4 +84,25 @@ PTO_DEVICE_FUNC inline T atomic_fetch_max(__gm__ volatile T &value, T desired, i
 #endif
 }
 
+// Compare `value` with expected and replace it with desired on equality.
+// Returns the value observed before the operation, matching A5 atomicCAS.
+template <typename T>
+PTO_DEVICE_FUNC inline T atomic_compare_exchange(
+    __gm__ volatile T &value, T expected, T desired, int success_memorder = __ATOMIC_ACQ_REL,
+    int failure_memorder = __ATOMIC_ACQUIRE
+) {
+#if defined(__CCE_AICORE__)
+    (void)success_memorder;
+    (void)failure_memorder;
+    __gm__ T *addr = const_cast<__gm__ T *>(&value);
+    return atomicCAS(addr, expected, desired);
+#else
+    T observed = expected;
+    (void)__atomic_compare_exchange_n(
+        &value, &observed, desired, /*weak=*/false, success_memorder, failure_memorder
+    );
+    return observed;
+#endif
+}
+
 }  // namespace

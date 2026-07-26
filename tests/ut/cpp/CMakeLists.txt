@@ -459,6 +459,19 @@ target_include_directories(test_fdwic_tensor_map_retire BEFORE PRIVATE
 )
 set_tests_properties(test_fdwic_tensor_map_retire PROPERTIES LABELS "no_hardware")
 
+# 容量错误必须在真实 Register→Build 边界中止，并让后续 eager Begin 在
+# Claim 前返回。该目标直接编译 production CPU-sim dist_engine TU，避免
+# 用测试替身重写 Submit 状态机。
+add_a5_test(test_fdwic_submit_capacity a5/test_fdwic_submit_capacity.cpp)
+target_compile_definitions(test_fdwic_submit_capacity PRIVATE __CPU_SIM=1)
+target_include_directories(test_fdwic_submit_capacity BEFORE PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
+)
+set_tests_properties(test_fdwic_submit_capacity PROPERTIES LABELS "no_hardware")
+
 # Stable Host/AICPU/AICore identity is compiled in both artifact modes.  The
 # shared target intentionally verifies that the first-stage backend remains
 # fail-closed while its ABI identity is still well-formed.

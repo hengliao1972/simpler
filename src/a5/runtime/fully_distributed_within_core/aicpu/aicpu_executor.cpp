@@ -57,6 +57,10 @@ struct AicpuExecutor {
 
     std::atomic<int32_t> finished_count_{0};
     std::atomic<bool> runtime_done_{false};
+    // Orchestrator owns the distributed run, then publishes one common status
+    // before runtime_done_. Every AICPU block returns the same runtime failure
+    // instead of depending on launcher-specific multi-block aggregation.
+    std::atomic<int32_t> run_status_{0};
 
     // ===== Core lifecycle context =====
     PTO2DispatchPayload payload_per_core_[RUNTIME_MAX_WORKER][2];
@@ -111,6 +115,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
 
     finished_count_.store(0, std::memory_order_release);
     runtime_done_.store(false, std::memory_order_release);
+    run_status_.store(0, std::memory_order_release);
 
     init_done_.store(true, std::memory_order_release);
     LOG_INFO_V0("AicpuExecutor: Init complete");
@@ -420,9 +425,17 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                             );
                             run_rc = -1;
                         }
+                        const int32_t dist_status = dist_engine_runtime_status(rt);
+                        if (dist_status != 0) {
+                            LOG_ERROR(
+                                "Thread %d: distributed AICore run failed with status %d", thread_idx, dist_status
+                            );
+                            run_rc = dist_status;
+                        }
                     }
                 }
             }
+            run_status_.store(run_rc, std::memory_order_release);
             runtime_done_.store(true, std::memory_order_release);
         }
 #if PTO2_PROFILING
@@ -441,6 +454,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             SPIN_WAIT_HINT();
         }
     }
+
+    const int32_t distributed_status = run_status_.load(std::memory_order_acquire);
+    if (distributed_status != 0) run_rc = distributed_status;
 
     // AICPU launches multiple threads, but the orchestrator alone owns the
     // distributed handoff. Mirror its ABI/backend failure onto every AICPU
@@ -479,6 +495,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
 
     finished_count_.store(0, std::memory_order_release);
     runtime_done_.store(false, std::memory_order_release);
+    run_status_.store(0, std::memory_order_release);
 
     aicpu_thread_num_ = 0;
     sched_thread_num_ = 0;

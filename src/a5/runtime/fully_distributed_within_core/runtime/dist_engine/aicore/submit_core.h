@@ -396,6 +396,9 @@ PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &
 
 PTO_DEVICE_FUNC bool dist_submit_check_task_cap(const DistSubmitCtx &ctx, DistSubmitKind kind) {
     if (ctx.task_id < kFlagCap) return true;
+    // Begin 采用 post-increment；冷分支把计数钳回哨兵，避免失败后的无效
+    // orchestration 若继续发 Submit，最终让 local_index 发生整数回绕。
+    if (ctx.self != nullptr) ctx.self->local_index = kFlagCap;
     fdwic_trace_set_fatal(ctx.task_id);
     if (kind == DistSubmitKind::Alloc) {
         DIST_ERRF("[dist_engine] alloc task id %d exceeds kFlagCap %d\n", ctx.task_id, kFlagCap);
@@ -587,24 +590,37 @@ PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const 
     return fc;
 }
 
-PTO_DEVICE_FUNC void dist_submit_insert_existing_tensor(DistSubmitCtx &ctx, const L0TaskArgs &args, int32_t i) {
+PTO_DEVICE_FUNC bool dist_submit_insert_existing_tensor(DistSubmitCtx &ctx, const L0TaskArgs &args, int32_t i) {
 #if defined(__CCE_AICORE__)
     if (args.tensor(i).tensor_from_gm()) {
-        (void)dist_tensor_map_insert_for_task(*ctx.self, args.tensor(i).gm_ref(), ctx.task_id, ctx.won);
+        return dist_tensor_map_insert_for_task(*ctx.self, args.tensor(i).gm_ref(), ctx.task_id, ctx.won);
     } else {
-        (void)dist_tensor_map_insert_for_task(*ctx.self, args.tensor(i).ref(), ctx.task_id, ctx.won);
+        return dist_tensor_map_insert_for_task(*ctx.self, args.tensor(i).ref(), ctx.task_id, ctx.won);
     }
 #else
-    (void)dist_tensor_map_insert_for_task(*ctx.self, args.tensor(i).ref(), ctx.task_id, ctx.won);
+    return dist_tensor_map_insert_for_task(*ctx.self, args.tensor(i).ref(), ctx.task_id, ctx.won);
 #endif
 }
 
-PTO_DEVICE_FUNC void dist_submit_register_outputs(DistSubmitCtx &ctx, const L0TaskArgs &args, bool include_existing) {
-    if (!include_existing) return;
+PTO_DEVICE_FUNC void dist_submit_latch_tensor_map_failure(DistSubmitCtx &ctx) {
+    // 复用既有 task-cap 门禁作为本核失败锁存，不给正常 Submit 增加额外
+    // 状态字段或 GM 读取。当前 task 已在 Register 失败并中止；后续 Begin
+    // 从 kFlagCap 起只会得到 not-ready，不能再进入 Claim/Build。
+    if (ctx.self != nullptr) ctx.self->local_index = kFlagCap;
+    set_fatal_code(PTO2_ERROR_TENSORMAP_CAPACITY);
+}
+
+PTO_DEVICE_FUNC bool dist_submit_register_outputs(DistSubmitCtx &ctx, const L0TaskArgs &args, bool include_existing) {
+    if (!include_existing) return true;
     uint32_t register_mask = ctx.register_mask;
     for (int32_t i = 0; register_mask != 0; i++, register_mask >>= 1) {
-        if ((register_mask & 1u) != 0) dist_submit_insert_existing_tensor(ctx, args, i);
+        if ((register_mask & 1u) == 0) continue;
+        if (!dist_submit_insert_existing_tensor(ctx, args, i)) {
+            dist_submit_latch_tensor_map_failure(ctx);
+            return false;
+        }
     }
+    return true;
 }
 
 PTO_DEVICE_FUNC bool dist_submit_materialize_and_prepare_map(

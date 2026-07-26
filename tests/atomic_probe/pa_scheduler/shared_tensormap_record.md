@@ -6501,3 +6501,57 @@ bucket 链。需要先闭合三件事：
 3. 在默认产物上先证明容量布局与错误传播，再接 shared 的 per-slot seq、
    发布/失效和有序 reclaim；不能把 fresh symbol、heap、INOUT gate 同时
    混入这一个数据结构提交。
+
+### 2026-07-26：R1b-a 先闭合 TensorMap 容量失败合同
+
+在更换 production private 存储前，先处理旧 backend 已存在但被静默吞掉的
+`kMapCap=16384` 耗尽。这个小步不改变 linked/free-list 数据结构，也不把
+standalone 的 128×128 参数搬进 production；它只建立 private/shared
+有界 ring 都必须遵守的失败合同：
+
+1. backend insert 返回 `bool`，facade 原样传播，满池时不改 TensorMap；
+2. Register 任一 `OUTPUT_EXISTING/INOUT` 插入失败后，当前 task 在
+   WinnerBuild 和 slot 发布前返回；
+3. 失败核把既有 `local_index` 置为 `kFlagCap`。后续 Begin 复用现成
+   task-cap 门禁，在 Claim 前返回 `ready=0`；不新增 DistCore 字段，也不在
+   正常 Submit 增加一次 GM latch 读取；
+4. 失败冷分支持续把 post-increment 后的 `local_index` 钳回哨兵，避免错误
+   orchestration 继续 Submit 时最终发生整数回绕；
+5. 首个非零错误码用 A5 `atomicCAS` 发布到原 fatal cacheline 的 padding，
+   再发布 fatal。AICPU 等全部 worker 完成并失效该 cacheline 后读取错误，
+   所有 AICPU 线程统一返回 `-11`；
+6. fatal 运行不再进入 FinalDrain，因为容量失败后的任务图已经没有完整依赖
+   闭包，继续等待只能造成挂死。
+
+失败分支故意不闭合 Submit/perf-clock/submit-PMU 外层。这样即使合法图恰有
+65,536 个 Submit，失败 raw 也会被现有完整性门禁拒绝，不能混入性能基线；
+已经闭合的 Register span 仍保留真实失败 task id，足够定位。
+
+`DistGlobal::error_code` 复用 fatal 所在 cacheline 的 padding，未移动后续
+字段，但三镜像必须对这个布局语义达成一致，因此
+`kFdwicDistGlobalLayoutVersion` 从 1 升到 2。shared backend 仍保持零
+Submit fail-closed；本阶段只是让未来 bounded shared ring 有一条真实错误
+出口，不能解释为 shared 已经可运行。
+
+#### 本阶段证据
+
+| 检查 | 结果 |
+| --- | --- |
+| backend 最后一槽、满池无写入、retire 后复用 | PASS |
+| facade 容量失败原样传播 | PASS |
+| production CPU-sim Register→失败→无 Build→后续不 Claim | PASS |
+| 首个错误码获胜，后续错误不覆盖容量码 | PASS |
+| private/shared × A5sim/A5 三镜像构建 | 4/4 PASS |
+| A5sim private PA Case1 B256 正常路径 | PASS |
+| `git diff --check` | PASS |
+
+容量门槛 UT 直接编译 production `aicore/dist_engine.cpp`，没有复制一份
+Submit 模型。场景让 map 只剩一个物理 entry，再提交两个
+`OUTPUT_EXISTING`：第一个占用末槽、第二个失败；逐字节确认所有 task slot
+未变，`occupied_count/owned_total` 未增加，随后一次 compete-first Begin
+不推进 vector claim cursor。
+
+本阶段仍未实现 `auto CAP`。现有 Host/AICPU 在 worker 启动前没有一份可直接
+枚举的完整 FDWIC 任务图，不能用 `8×H` 或 PA 的 52-entry 特例冒充第 12 章
+的逐桶滑窗峰值。`auto` 的可证规划接口与 private ring 迁移继续作为后续
+独立阶段。

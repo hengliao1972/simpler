@@ -329,9 +329,18 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_finish_kernel_tail(
     // Register 的局部 PMU 只包围真实 RegisterOutputs 调用体，不吸收前一条
     // Fanin/Claim record 发布或 caller 衔接。
     fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Register>();
-    dist_submit_register_outputs(ctx, args, /*include_existing=*/true);
+    const bool register_ok = dist_submit_register_outputs(ctx, args, /*include_existing=*/true);
     fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Register>();
     TRACE_TIMESTAMP(register_end);
+    if (__builtin_expect(!register_ok, 0)) {
+        // 当前 task 已经 Claim，但绝不能 Build/发布；后续 task 会由本核
+        // task-cap sentinel 在 Claim 前截断。故意不闭合 Submit/perf/PMU
+        // 外层，让失败 raw 被完整性门禁拒绝；Register span 足以定位错误。
+        TRACE_SPAN_RECORD(
+            register_begin, register_end, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Register, 0, 1
+        );
+        return ctx.result;
+    }
     if (ctx.won) {
         fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::WinnerBuild>();
     } else {
@@ -544,7 +553,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
     }
     const uint64_t register_begin = prepare_map_end;
     fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Register>();
-    dist_submit_register_outputs(ctx, args, /*include_existing=*/false);
+    (void)dist_submit_register_outputs(ctx, args, /*include_existing=*/false);
     fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Register>();
     TRACE_TIMESTAMP(register_end);
     TRACE_SPAN_RECORD(register_begin, register_end, ctx.self, ctx.task_id, -1, TracePhase::Register, 0, 0);
@@ -657,7 +666,7 @@ dist_alloc_compete_first_finish(PTO2Runtime *, const DistCompeteFirstTicket &tic
         return ctx.result;
     }
     fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Register>();
-    dist_submit_register_outputs(ctx, args, /*include_existing=*/false);
+    (void)dist_submit_register_outputs(ctx, args, /*include_existing=*/false);
     fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Register>();
     TRACE_TIMESTAMP(register_end);
     // compete-first AllocComplete 与泳道共用 Register.end 起点；公共 tail

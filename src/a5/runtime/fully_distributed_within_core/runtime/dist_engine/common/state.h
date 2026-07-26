@@ -288,7 +288,10 @@ struct DistGlobal {
 
     uint8_t fatal_pad[24];
     volatile int32_t fatal;
-    uint8_t fatal_tail_pad[kCacheLine - sizeof(int32_t)];
+    // 首个非零运行时错误码获胜；fatal 仍保留原 offset，后续字段也不移动。
+    // AICPU 在所有 worker 完成后失效并读取整条 cache line。
+    volatile int32_t error_code;
+    uint8_t fatal_tail_pad[kCacheLine - 2 * sizeof(int32_t)];
 
     int32_t num_workers;
     int32_t num_blocks;
@@ -313,6 +316,10 @@ struct DistGlobal {
 static_assert(offsetof(DistGlobal, frontier) % 64 == 0, "DistGlobal frontier must be cacheline-aligned");
 static_assert(offsetof(DistGlobal, tasks) % 64 == 0, "DistGlobal tasks must be cacheline-aligned");
 static_assert(offsetof(DistGlobal, fatal) % 64 == 0, "DistGlobal fatal must be cacheline-aligned");
+static_assert(
+    offsetof(DistGlobal, error_code) == offsetof(DistGlobal, fatal) + sizeof(int32_t),
+    "DistGlobal runtime error must share the fatal cacheline"
+);
 static_assert(offsetof(DistGlobal, blocks) % 64 == 0, "DistGlobal blocks must be cacheline-aligned");
 static_assert(offsetof(DistGlobal, replay_done) % 64 == 0, "DistGlobal replay_done must be cacheline-aligned");
 static_assert(offsetof(DistGlobal, started_count) % 64 == 0, "DistGlobal started_count must be cacheline-aligned");

@@ -89,11 +89,13 @@ PTO_DEVICE_FUNC void dist_private_tensor_map_advance_retire(__gm__ DistTensorMap
 }
 
 template <typename TensorRef>
-PTO_DEVICE_FUNC void dist_private_tensor_map_insert(__gm__ DistTensorMap &self, const TensorRef &t, int32_t producer) {
+PTO_DEVICE_FUNC bool dist_private_tensor_map_insert(
+    __gm__ DistTensorMap &self, const TensorRef &t, int32_t producer
+) {
     uint64_t addr, lo, hi;
     dist_private_tensor_map_byte_range(t, addr, lo, hi);
     const int32_t s = dist_private_tensor_map_alloc_slot(self);
-    if (s < 0) return;
+    if (s < 0) return false;
     const uint32_t b = dist_private_tensor_map_hash(addr);
     __gm__ MapEntry &e = self.entries[s];
     e.buf_addr = addr;
@@ -108,6 +110,7 @@ PTO_DEVICE_FUNC void dist_private_tensor_map_insert(__gm__ DistTensorMap &self, 
     const int32_t slot = producer & kTaskWindowMask;
     e.next_in_task = self.task_heads[slot];
     self.task_heads[slot] = s;
+    return true;
 }
 
 template <typename TensorRef>

@@ -22,6 +22,8 @@ void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_
     g_dist_ptr = reinterpret_cast<DistGlobal *>(rt->dist_global);
     g_dist.heap_base = static_cast<uint8_t *>(rt->gm_heap);
     g_dist.heap_size = rt->gm_heap_size;
+    atomic_exchange(g_dist.error_code, int32_t{PTO2_ERROR_NONE}, __ATOMIC_RELAXED);
+    atomic_exchange(g_dist.fatal, int32_t{0}, __ATOMIC_RELAXED);
     // Dependency-span bound H (R = F - H). Env override for graphs with longer
     // heap spans; default kHDefault.
     g_dist.H = kHDefault;
@@ -46,7 +48,6 @@ void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_
     atomic_exchange(g_dist.frontier, int64_t{-1}, __ATOMIC_RELAXED);
     for (int32_t i = 0; i < kFlagCap; i++)
         reset_task_cell(i);
-    atomic_exchange(g_dist.fatal, int32_t{0}, __ATOMIC_RELAXED);
     atomic_exchange(g_dist.replay_done, int64_t{0}, __ATOMIC_RELAXED);
     atomic_exchange(g_dist.started_count, int64_t{0}, __ATOMIC_RELAXED);
     for (int32_t group = 0; group < kFinalBarrierGroups; group++) {
@@ -127,4 +128,17 @@ void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_
     // per-core handshake flags.
     store_barrier();
     return;
+}
+
+int32_t dist_engine_runtime_status(PTO2Runtime *rt) {
+    if (rt == nullptr || rt->dist_global == nullptr) {
+        return runtime_status_from_error_codes(PTO2_ERROR_INVALID_ARGS, PTO2_ERROR_NONE);
+    }
+    DistGlobal *state = reinterpret_cast<DistGlobal *>(rt->dist_global);
+    cache_invalidate_range(const_cast<const int32_t *>(&state->fatal), kCacheLine);
+    const int32_t fatal = __atomic_load_n(&state->fatal, __ATOMIC_ACQUIRE);
+    if (fatal == 0) return 0;
+    int32_t code = __atomic_load_n(&state->error_code, __ATOMIC_ACQUIRE);
+    if (code == PTO2_ERROR_NONE) code = PTO2_ERROR_EXPLICIT_ORCH_FATAL;
+    return runtime_status_from_error_codes(code, PTO2_ERROR_NONE);
 }

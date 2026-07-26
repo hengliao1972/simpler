@@ -32,6 +32,7 @@
 #define PTO2_ERROR_TENSOR_WAIT_TIMEOUT 8
 #define PTO2_ERROR_EXPLICIT_ORCH_FATAL 9
 #define PTO2_ERROR_SCOPE_TASKS_OVERFLOW 10  // scope_tasks buffer saturated (all rings full)
+#define PTO2_ERROR_TENSORMAP_CAPACITY 11    // TensorMap cannot retain another live producer region
 
 // Scheduler errors (100+): detected in scheduler threads
 #define PTO2_ERROR_SCHEDULER_TIMEOUT 100

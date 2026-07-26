@@ -43,7 +43,10 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
     TRACE_TIMESTAMP(orchestration_begin);
     dist_submit_replay_orch(runtime);
     TRACE_TIMESTAMP(orchestration_end);
-    dist_submit_drain_to_completion(self);
+    // 失败运行不再等待已经失去依赖闭包的 task ring。容量错误由每个
+    // private replica 在相同逻辑 Submit 上确定性发现，worker 直接完成，
+    // AICPU 汇总全局 error_code 后向 Host 返回非零。
+    if (!fdwic_trace_is_fatal()) dist_submit_drain_to_completion(self);
     TRACE_TIMESTAMP(final_drain_end);
     // Publish both parent records after the measured work. Their own GM writes
     // therefore belong to neither business interval.

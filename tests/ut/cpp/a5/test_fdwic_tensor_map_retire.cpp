@@ -80,6 +80,19 @@ void seed_entry(
     entry.next_in_task = next_in_task;
 }
 
+Tensor make_region(uint64_t address) {
+    Tensor tensor{};
+    tensor.buffer = {address, 4};
+    tensor.start_offset = 0;
+    tensor.ndims = 1;
+    tensor.dtype = DataType::FLOAT32;
+    tensor.is_contiguous = true;
+    tensor.shapes[0] = 1;
+    tensor.extent_elem_cache = 1;
+    tensor.strides[0] = 1;
+    return tensor;
+}
+
 TEST(FdwicTensorMapRetire, EmptySentinelAndDefensiveNegativeValueMatchOriginalState) {
     auto actual = make_empty_map();
     actual->task_heads[1] = -2;
@@ -161,6 +174,44 @@ TEST(FdwicTensorMapRetire, ReusedTaskWindowSlotAndRepeatedFloorsRemainDeterminis
     dist_private_tensor_map_advance_retire(*actual, kTaskWindow + 65, 64);
     dist_private_tensor_map_advance_retire(*actual, 100, 64);
     expect_exact_map_state(*actual, *after_first_retire);
+}
+
+TEST(FdwicTensorMapRetire, LastPhysicalSlotSucceedsAndOverflowLeavesMapUnchanged) {
+    auto map = make_empty_map();
+    map->high_water = kMapCap - 1;
+    const Tensor last = make_region(0x100000);
+
+    EXPECT_TRUE(dist_private_tensor_map_insert(*map, last, 7));
+    EXPECT_EQ(map->high_water, kMapCap);
+
+    const auto full_state = clone_map_bytes(*map);
+    const Tensor overflow = make_region(0x200000);
+    EXPECT_FALSE(dist_private_tensor_map_insert(*map, overflow, 8));
+    expect_exact_map_state(*map, *full_state);
+}
+
+TEST(FdwicTensorMapRetire, RetiredFreeSlotCanBeReusedAfterHighWaterReachesCapacity) {
+    auto map = make_empty_map();
+    map->high_water = kMapCap;
+    map->free_head = 19;
+    map->entries[19].next_in_bucket = -1;
+    const Tensor tensor = make_region(0x300000);
+
+    EXPECT_TRUE(dist_private_tensor_map_insert(*map, tensor, 9));
+    EXPECT_EQ(map->high_water, kMapCap);
+    EXPECT_EQ(map->free_head, -1);
+    EXPECT_EQ(map->entries[19].producer, 9);
+}
+
+TEST(FdwicTensorMapRetire, FacadePropagatesBackendCapacityFailureWithoutMutation) {
+    auto worker = std::make_unique<DistCore>();
+    dist_tensor_map_reset_worker(*worker);
+    worker->map.high_water = kMapCap;
+    const auto full_state = clone_map_bytes(worker->map);
+    const Tensor tensor = make_region(0x400000);
+
+    EXPECT_FALSE(dist_tensor_map_insert_for_task(*worker, tensor, 10, /*task_won=*/true));
+    expect_exact_map_state(worker->map, *full_state);
 }
 
 }  // namespace

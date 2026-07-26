@@ -14,6 +14,7 @@
 #include "dist_engine/common/atomic.h"
 #include "dist_engine/common/state.h"
 #include "dist_engine/common/worker_state.h"
+#include "pto_runtime_status.h"
 
 #if DIST_SIM_HOST_CLOCK
 #include <atomic>
@@ -39,6 +40,17 @@ inline uint64_t dist_now_ns() {
 
 PTO_DEVICE_FUNC inline bool fatal_set() { return atomic_load(g_dist.fatal) != 0; }
 PTO_DEVICE_FUNC inline void set_fatal() { atomic_exchange(g_dist.fatal, 1); }
+
+// 运行时错误使用“首个非零错误码获胜”的合同。先发布错误码，再发布 fatal，
+// AICPU 在观察 fatal 后即可取得与本次失败对应的稳定 code。
+PTO_DEVICE_FUNC inline void set_fatal_code(int32_t code) {
+    if (code == PTO2_ERROR_NONE) code = PTO2_ERROR_EXPLICIT_ORCH_FATAL;
+    (void)atomic_compare_exchange(
+        g_dist.error_code, int32_t{PTO2_ERROR_NONE}, code, __ATOMIC_RELEASE, __ATOMIC_RELAXED
+    );
+    store_barrier();
+    (void)atomic_exchange(g_dist.fatal, int32_t{1}, __ATOMIC_RELEASE);
+}
 
 PTO_DEVICE_FUNC inline void watchdog([[maybe_unused]] uint64_t &start_ns) {
 #if DIST_SIM_HOST_CLOCK

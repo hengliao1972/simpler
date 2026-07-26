@@ -26,6 +26,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 struct PTO2Runtime;
 struct L2TaskArgs;
@@ -52,3 +53,7 @@ inline constexpr size_t dist_engine_global_state_align() { return kDistEngineGlo
  * AICore workers call dist_engine_api.h symbols directly on sim and onboard.
  */
 void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_workers, Runtime *runtime);
+
+// AICPU 在所有 worker 完成后读取 AICore 发布的 fatal cache line，并将
+// 首个运行时错误转换成公共负状态码。正常运行返回 0。
+int32_t dist_engine_runtime_status(PTO2Runtime *rt);

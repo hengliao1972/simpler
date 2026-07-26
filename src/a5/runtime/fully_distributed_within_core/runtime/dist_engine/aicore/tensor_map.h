@@ -46,11 +46,7 @@ PTO_DEVICE_FUNC bool dist_tensor_map_insert_for_task(
     __gm__ DistCore &worker, const TensorRef &tensor, int32_t producer_task_id, bool task_won
 ) {
     (void)task_won;
-    dist_private_tensor_map_insert(worker.map, tensor, producer_task_id);
-    // 既有 private backend 在容量耗尽时静默丢弃；facade 阶段不顺带改变
-    // 这条历史语义。ring 迁移会把可观察的容量失败与上层 fatal 传播作为
-    // 独立正确性提交闭合，再让该返回值承载真实结果。
-    return true;
+    return dist_private_tensor_map_insert(worker.map, tensor, producer_task_id);
 }
 
 }  // namespace

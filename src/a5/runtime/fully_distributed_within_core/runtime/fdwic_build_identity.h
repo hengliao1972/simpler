@@ -31,7 +31,7 @@ enum class FdwicTensorMapMode : uint32_t {
 
 inline constexpr uint64_t kFdwicBuildIdentityMagic = 0x46445749434d4150ULL;  // "FDWICMAP"
 inline constexpr uint32_t kFdwicBuildAbiVersion = 1;
-inline constexpr uint32_t kFdwicDistGlobalLayoutVersion = 1;
+inline constexpr uint32_t kFdwicDistGlobalLayoutVersion = 2;
 inline constexpr FdwicTensorMapMode kFdwicCompiledTensorMapMode = static_cast<FdwicTensorMapMode>(PTO_FDWIC_SHARED_MAP);
 
 // 第一阶段只建立构建身份，尚未把 shared backend 接入真实调度路径。
