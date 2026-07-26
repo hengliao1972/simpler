@@ -2640,8 +2640,8 @@ PA_DEVICE uint64_t PrivateLogicalTensorMapSignature(
 ) {
     uint64_t hash = 1469598103934665603ULL;
     for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
-        const uint64_t head = map.bucket_heads[bucket];
-        const uint64_t tail = map.bucket_tails[bucket];
+        const uint64_t head = TensorMapBucketHead(map, bucket);
+        const uint64_t tail = TensorMapBucketTail(map, bucket);
         for (uint64_t cursor = head; cursor < tail; ++cursor) {
             PA_GM const MapEntry &entry =
                 map.entries[TensorMapSlotIndex(bucket, cursor)];

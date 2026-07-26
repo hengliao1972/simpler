@@ -26,6 +26,14 @@
 #error "PTO_FDWIC_SHARED_MAP must be 0 (private) or 1 (shared)"
 #endif
 
+// standalone 的正式产物仍固定使用已验证的 CAP=128。隔离 ring 门槛会用
+// 同一份生产 helper 重编译多个 CAP，证明“每桶连续环”没有偷写 128。
+// 这里故意采用构建期常量：hash、slot mask 与桶跨度都可被 CCEC 常量折叠；
+// 运行期 auto/覆盖参数还需要静态任务图 planner，不能在本阶段冒充完成。
+#ifndef PTO_FDWIC_TENSORMAP_RING_CAP
+#define PTO_FDWIC_TENSORMAP_RING_CAP 128
+#endif
+
 // S0 的 fail-closed 门禁在 S2 接入真实 shared sidecar 后解除。模式仍由
 // 三镜像统一的构建身份与 manifest 锁定，不能把 shared 目录指向 private 实现。
 
@@ -64,9 +72,20 @@ constexpr TensorMapBuildMode kCompiledTensorMapMode =
     static_cast<TensorMapBuildMode>(PTO_FDWIC_SHARED_MAP);
 constexpr uint32_t kBuildIdentityMagic = 0x50414249U;  // "PABI"
 #if PTO_FDWIC_SHARED_MAP
-constexpr uint32_t kBuildIdentityAbiVersion = 6;
+constexpr uint32_t kBuildIdentityAbiGeneration = 6;
 #else
-constexpr uint32_t kBuildIdentityAbiVersion = 4;
+constexpr uint32_t kBuildIdentityAbiGeneration = 4;
+#endif
+// 默认 CAP=128 保留历史 ABI 值，避免仅为身份元数据让 AIC/AIV 入口多
+// 一条大立即数构造并改变后续代码对齐；manifest v2 另行显式锁定默认
+// CAP。非默认隔离变体才把 CAP 编进 ABI，防止彼此混用。
+#if PTO_FDWIC_TENSORMAP_RING_CAP == 128
+constexpr uint32_t kBuildIdentityAbiVersion =
+    kBuildIdentityAbiGeneration;
+#else
+constexpr uint32_t kBuildIdentityAbiVersion =
+    (kBuildIdentityAbiGeneration << 16U) |
+    static_cast<uint32_t>(PTO_FDWIC_TENSORMAP_RING_CAP);
 #endif
 
 // private 与现有 shared 单组 Case1 每 batch 都回放五个 task。shared
@@ -136,17 +155,23 @@ constexpr uint32_t kSharedOutputMaxPerTask = 8;
 constexpr uint32_t kPayloadSlots = 2048;
 constexpr uint32_t kPayloadMask = kPayloadSlots - 1;
 constexpr uint32_t kPayloadStride = 4096;
-// private/shared 最终统一为 ring-per-bucket。S1 先在 private standalone
-// 验证无原子版本：128 个桶，每桶 128 个连续槽，容量仍与旧 linked map
-// 完全相同。PA Case1 在 H=64 的窗口内全 map 最多只有 52 个 live entry，
-// 因而单桶最坏聚集也小于 128；这个证明只适用于当前 Case1，不能据此
-// 把 128 当成任意任务图的通用容量。
-constexpr uint32_t kMapBuckets = 128;
-constexpr uint32_t kMapBucketCapacity = 128;
-constexpr uint32_t kMapCapacity = kMapBuckets * kMapBucketCapacity;
-constexpr uint32_t kMapBucketShift = 7;
+// private/shared 统一为 ring-per-bucket。物理槽总数继续固定为旧 map 的
+// 16K；构建期 CAP 决定每桶连续槽数，桶数由 16K/CAP 推导。正式默认仍是
+// 128×128，隔离门槛另外覆盖 32×512、256×64 与 16384×1 等形态。
+// CAP 变大意味着桶更少、单桶扫描更长；CAP 变小则更易触发显式满环。
+constexpr uint32_t kMapCapacity = 16384;
+constexpr uint32_t kMapBucketCapacity =
+    static_cast<uint32_t>(PTO_FDWIC_TENSORMAP_RING_CAP);
+constexpr uint32_t kMapBuckets = kMapCapacity / kMapBucketCapacity;
+
+constexpr uint32_t ConstexprLog2(uint32_t value) {
+    return value <= 1U ? 0U : 1U + ConstexprLog2(value >> 1U);
+}
+
+constexpr uint32_t kMapBucketShift = ConstexprLog2(kMapBuckets);
 constexpr uint32_t kMapBucketMask = kMapBuckets - 1;
 constexpr uint32_t kMapBucketSlotMask = kMapBucketCapacity - 1;
+constexpr uint32_t kDefaultMapBucketCapacity = 128;
 constexpr uint32_t kPaCase1MapEntriesPerBatch = 4;
 constexpr uint32_t kPaCase1MaxLiveMapBatches =
     (kHeapWindow + 1 + kTasksPerBatch - 1) / kTasksPerBatch;
@@ -178,6 +203,18 @@ constexpr size_t kRealReplayDoneOffset = 10043776;
 constexpr size_t kRealStartedCountOffset = 10043840;
 constexpr uint32_t kTraceRecordsPerCore = 1U << 16;
 static_assert((kPayloadSlots & kPayloadMask) == 0, "payload slots must be a power of two");
+static_assert(
+    kMapBucketCapacity >= 32 && kMapBucketCapacity <= kMapCapacity,
+    "standalone ring CAP must be in [32, 16384]"
+);
+static_assert(
+    (kMapBucketCapacity & (kMapBucketCapacity - 1U)) == 0,
+    "standalone ring CAP must be a power of two"
+);
+static_assert(
+    kMapCapacity % kMapBucketCapacity == 0,
+    "standalone ring CAP must divide the fixed 16K slot pool"
+);
 static_assert((kMapBuckets & kMapBucketMask) == 0, "map bucket count must be a power of two");
 static_assert(
     (kMapBucketCapacity & kMapBucketSlotMask) == 0,
@@ -185,8 +222,8 @@ static_assert(
 );
 static_assert(kMapCapacity == 16384, "private ring must preserve the old map capacity");
 static_assert(
-    kPaCase1MaxLiveMapEntries <= kMapBucketCapacity,
-    "PA Case1 worst-case bucket occupancy exceeds private ring capacity"
+    kPaCase1MaxLiveMapEntries <= kDefaultMapBucketCapacity,
+    "the default PA Case1 ring capacity no longer covers its conservative live bound"
 );
 static_assert(kTaskWindow > kHeapWindow, "task counters must retire before their slot is reused");
 static_assert(
@@ -784,13 +821,23 @@ static_assert(offsetof(MapEntry, abi_reserved) == 32, "MapEntry ABI reserve offs
 
 struct TensorMap {
     MapEntry entries[kMapCapacity];
-    // private map 由单 worker 访问，head/tail 都是普通单调整数；槽地址为
-    // bucket*kMapBucketCapacity + (cursor & kMapBucketSlotMask)。
-    uint64_t bucket_heads[kMapBuckets];
-    uint64_t bucket_tails[kMapBuckets];
-    // 复用旧 buckets[8192] 所占的 32 KiB，使下方逐 task 计数与控制字
-    // 继续落在旧 task_heads/尾部控制区，减小 standalone ABI 扰动。
+    // 前 128 个桶沿用默认 128×128 的原始位置。CAP=32/64 时桶数增至
+    // 512/256，额外游标从原 32 KiB ABI 保留区中切出；这样默认热字段
+    // offset 不动，所有 CAP 下方的 task 计数与 WorkerState 总跨度也不动。
+    uint64_t bucket_heads[128];
+    uint64_t bucket_tails[128];
+#if PTO_FDWIC_TENSORMAP_RING_CAP == 32
+    uint64_t extra_bucket_heads[384];
+    uint64_t extra_bucket_tails[384];
+    uint8_t abi_reserved[24576];
+#elif PTO_FDWIC_TENSORMAP_RING_CAP == 64
+    uint64_t extra_bucket_heads[128];
+    uint64_t extra_bucket_tails[128];
+    uint8_t abi_reserved[28672];
+#else
+    // CAP>=128 时逻辑桶数不超过 128，完整保留原来的 30 KiB padding。
     uint8_t abi_reserved[30720];
+#endif
     // producer 退休时据此精确扣减 logical live_count；物理 bucket head
     // 则由访问该桶时的 RetireBucket 惰性推进。
     uint32_t task_entry_counts[kTaskWindow];
@@ -801,8 +848,9 @@ struct TensorMap {
 };
 // alive_floor 是 lookup 的权威存活下界；cleaned_upto 表示逐任务计数已
 // 精确扣减到哪里。桶头可以因惰性退休暂时落后，但不会改变逻辑 live 数。
-static_assert(sizeof(TensorMap) == 823312, "TensorMap must match the PA fixed-capacity layout");
+static_assert(sizeof(TensorMap) == 823312, "TensorMap must preserve the WorkerState ABI");
 static_assert(alignof(TensorMap) == 8, "TensorMap alignment changed");
+#if PTO_FDWIC_TENSORMAP_RING_CAP == 128
 static_assert(offsetof(TensorMap, bucket_heads) == 786432, "TensorMap head offset mismatch");
 static_assert(offsetof(TensorMap, bucket_tails) == 787456, "TensorMap tail offset mismatch");
 static_assert(offsetof(TensorMap, abi_reserved) == 788480, "TensorMap reserve offset mismatch");
@@ -811,6 +859,17 @@ static_assert(offsetof(TensorMap, live_count) == 823296, "TensorMap live-count o
 static_assert(offsetof(TensorMap, high_water) == 823300, "TensorMap high-water offset mismatch");
 static_assert(offsetof(TensorMap, alive_floor) == 823304, "TensorMap alive-floor offset mismatch");
 static_assert(offsetof(TensorMap, cleaned_upto) == 823308, "TensorMap cleaned offset mismatch");
+#elif PTO_FDWIC_TENSORMAP_RING_CAP == 64
+static_assert(offsetof(TensorMap, extra_bucket_heads) == 788480, "CAP64 extra-head offset mismatch");
+static_assert(offsetof(TensorMap, extra_bucket_tails) == 789504, "CAP64 extra-tail offset mismatch");
+static_assert(offsetof(TensorMap, abi_reserved) == 790528, "CAP64 reserve offset mismatch");
+static_assert(offsetof(TensorMap, task_entry_counts) == 819200, "CAP64 task-count offset mismatch");
+#elif PTO_FDWIC_TENSORMAP_RING_CAP == 32
+static_assert(offsetof(TensorMap, extra_bucket_heads) == 788480, "CAP32 extra-head offset mismatch");
+static_assert(offsetof(TensorMap, extra_bucket_tails) == 791552, "CAP32 extra-tail offset mismatch");
+static_assert(offsetof(TensorMap, abi_reserved) == 794624, "CAP32 reserve offset mismatch");
+static_assert(offsetof(TensorMap, task_entry_counts) == 819200, "CAP32 task-count offset mismatch");
+#endif
 
 // shared 模式只共享 region→producer 索引，不复用 private MapEntry 尾部的
 // ABI 保留字节。payload 与 seq 各占一条 cache line：普通字段写回完成后，
@@ -892,6 +951,7 @@ struct alignas(64) SharedTensorMapSidecar {
 #endif
 };
 #if PTO_FDWIC_SHARED_MAP
+#if PTO_FDWIC_TENSORMAP_RING_CAP == 128
 static_assert(sizeof(SharedTensorMapSidecar) == 11027648, "shared TensorMap sidecar size changed");
 static_assert(
     offsetof(SharedTensorMapSidecar, shared_outputs) == 2113664,
@@ -909,8 +969,11 @@ static_assert(
     offsetof(SharedTensorMapSidecar, shared_vector_cursor) == 11027136,
     "shared Vector cursor offset mismatch"
 );
+#endif
 #else
+#if PTO_FDWIC_TENSORMAP_RING_CAP == 128
 static_assert(sizeof(SharedTensorMapSidecar) == 2113664, "private sidecar layout changed");
+#endif
 #endif
 static_assert(alignof(SharedTensorMapSidecar) == 64, "shared TensorMap sidecar alignment changed");
 static_assert(
@@ -918,9 +981,13 @@ static_assert(
     "shared TensorMap bucket offset mismatch"
 );
 static_assert(
-    offsetof(SharedTensorMapSidecar, slots) == 16512,
-    "shared TensorMap slot offset mismatch"
+    offsetof(SharedTensorMapSidecar, slots) ==
+        128 + sizeof(SharedBucketState) * kMapBuckets,
+    "shared TensorMap slots must immediately follow all bucket controls"
 );
+#if PTO_FDWIC_TENSORMAP_RING_CAP == 128
+static_assert(offsetof(SharedTensorMapSidecar, slots) == 16512, "shared TensorMap slot offset changed");
+#endif
 
 struct TaskPayload {
     TensorDesc tensors[kMaxTaskTensors];

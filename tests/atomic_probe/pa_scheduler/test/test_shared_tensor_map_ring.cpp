@@ -58,26 +58,36 @@ static_assert(sizeof(SharedRegionSlot) == 128, "shared slot must occupy two cach
 static_assert(offsetof(SharedRegionSlot, seq) == 64, "shared seq cache line offset changed");
 static_assert(sizeof(SharedBucketState) == 128, "shared bucket control ABI changed");
 static_assert(offsetof(SharedBucketState, tail) == 64, "shared head/tail cache lines merged");
+#if PTO_FDWIC_TENSORMAP_RING_CAP == 128
 static_assert(sizeof(SharedTensorMapSidecar) == 11027648, "shared sidecar ABI changed");
+#endif
 static_assert(alignof(SharedTensorMapSidecar) == 64, "shared sidecar alignment changed");
 static_assert(offsetof(SharedTensorMapSidecar, buckets) == 128, "shared bucket offset changed");
-static_assert(offsetof(SharedTensorMapSidecar, slots) == 16512, "shared slot offset changed");
 static_assert(
-    offsetof(SharedTensorMapSidecar, shared_outputs) == 2113664,
-    "shared output table offset changed"
+    offsetof(SharedTensorMapSidecar, slots) ==
+        offsetof(SharedTensorMapSidecar, buckets) +
+        sizeof(SharedBucketState) * kMapBuckets,
+    "shared slots must immediately follow the active bucket controls"
 );
 static_assert(
-    offsetof(SharedTensorMapSidecar, shared_heap_cursor) == 11026560,
-    "shared heap cursor offset changed"
+    offsetof(SharedTensorMapSidecar, shared_outputs) ==
+        offsetof(SharedTensorMapSidecar, slots) +
+        sizeof(SharedRegionSlot) * kMapCapacity,
+    "shared output table must immediately follow the fixed 16K slot pool"
 );
+#if PTO_FDWIC_TENSORMAP_RING_CAP == 128
+static_assert(offsetof(SharedTensorMapSidecar, slots) == 16512, "default shared slot offset changed");
+static_assert(offsetof(SharedTensorMapSidecar, shared_outputs) == 2113664, "default shared output offset changed");
+static_assert(offsetof(SharedTensorMapSidecar, shared_heap_cursor) == 11026560, "default shared heap offset changed");
 static_assert(
     offsetof(SharedTensorMapSidecar, shared_heap_vend) == 11027072,
-    "shared heap vend offset changed"
+    "default shared heap vend offset changed"
 );
 static_assert(
     offsetof(SharedTensorMapSidecar, shared_vector_cursor) == 11027136,
-    "shared Vector cursor offset changed"
+    "default shared Vector cursor offset changed"
 );
+#endif
 
 enum class EventKind : uint8_t {
     Load,
@@ -236,6 +246,30 @@ std::unique_ptr<SharedTensorMapSidecar> NewMap() {
     return map;
 }
 
+void TestPhysicalSlotBoundaries() {
+    constexpr const char *kTest = "physical-slot-boundaries";
+    ExpectEqual(
+        SharedTensorMapSlotIndex(0, 0), 0,
+        kTest, "first physical slot"
+    );
+    ExpectEqual(
+        SharedTensorMapSlotIndex(
+            kMapBuckets - 1U,
+            static_cast<uint64_t>(kMapBucketCapacity - 1U)
+        ),
+        kMapCapacity - 1U,
+        kTest, "last physical slot"
+    );
+    ExpectEqual(
+        SharedTensorMapSlotIndex(
+            kMapBuckets - 1U,
+            static_cast<uint64_t>(kMapBucketCapacity)
+        ),
+        (kMapBuckets - 1U) * kMapBucketCapacity,
+        kTest, "last bucket first wrapped slot"
+    );
+}
+
 SharedRegionValue MakeRegion(
     uint64_t buffer_addr, uint64_t lo, uint64_t hi, int32_t producer
 ) {
@@ -243,6 +277,12 @@ SharedRegionValue MakeRegion(
 }
 
 uint64_t FindAddressOutsideBucket(uint64_t seed, uint32_t excluded_bucket) {
+    if constexpr (kMapBuckets == 1) {
+        // 单桶变体不存在“另一个桶”，但调用方仍需要不同的 region identity。
+        // 返回 seed 让语义测试继续覆盖同桶多地址；跨桶隔离由专门测试按
+        // kMapBuckets>1 条件执行。
+        return seed;
+    }
     uint64_t address = seed;
     while (TensorMapHash(address) == excluded_bucket) {
         address += 64;
@@ -506,8 +546,17 @@ void TestVersionsWindowAndMultipleBuckets() {
     Expect(TryCommitTask(*map, 0, task0) == CommitResult::Committed, kTest, "task 0");
     Expect(TryCommitTask(*map, 1, task1) == CommitResult::Committed, kTest, "task 1");
     Expect(TryCommitTask(*map, 2, task2) == CommitResult::Committed, kTest, "task 2");
+    uint32_t expected_versioned_bucket_entries = 0;
+    for (const auto *task : {&task0, &task1, &task2}) {
+        for (const SharedRegionValue &entry : *task) {
+            if (TensorMapHash(entry.buffer_addr) == versioned_bucket) {
+                ++expected_versioned_bucket_entries;
+            }
+        }
+    }
     ExpectEqual(
-        LoadControl(&map->buckets[versioned_bucket].tail.value), 4,
+        LoadControl(&map->buckets[versioned_bucket].tail.value),
+        expected_versioned_bucket_entries,
         kTest, "same bucket multi-entry tail"
     );
 
@@ -886,6 +935,157 @@ void TestCapacityFailureIsAllOrNothing() {
     );
 }
 
+void TestFullBucketDoesNotBlockIndependentBucket() {
+    constexpr const char *kTest = "full-bucket-independent-bucket";
+    if constexpr (kMapBuckets == 1) {
+        // CAP=16384 的 B=1 形态没有可构造的独立桶；它仍由满环、回绕和
+        // 精确复用门槛覆盖，不能伪造一个“不同桶”结论。
+        return;
+    }
+
+    auto map = NewMap();
+    RecordingOps::DisableEvents();
+    const uint64_t full_address = 0x540000000ULL;
+    const uint32_t full_bucket = TensorMapHash(full_address);
+    for (uint32_t task = 0; task < kMapBucketCapacity; ++task) {
+        const CommitResult result = TryCommitTask(
+            *map, static_cast<int32_t>(task),
+            {MakeRegion(
+                full_address, static_cast<uint64_t>(task) * 16,
+                static_cast<uint64_t>(task) * 16 + 8,
+                static_cast<int32_t>(task)
+            )}
+        );
+        if (result != CommitResult::Committed) {
+            Expect(false, kTest, "failed to fill the target bucket");
+            return;
+        }
+    }
+
+    const int64_t full_head =
+        LoadControl(&map->buckets[full_bucket].head.value);
+    const int64_t full_tail =
+        LoadControl(&map->buckets[full_bucket].tail.value);
+    const uint64_t independent_address =
+        FindAddressOutsideBucket(0x550000000ULL, full_bucket);
+    const uint32_t independent_bucket =
+        TensorMapHash(independent_address);
+    Expect(
+        independent_bucket != full_bucket, kTest,
+        "test address must map to an independent bucket"
+    );
+
+    const SharedRegionValue independent = MakeRegion(
+        independent_address, 0, 64,
+        static_cast<int32_t>(kMapBucketCapacity)
+    );
+    Expect(
+        TryCommitTask(
+            *map, static_cast<int32_t>(kMapBucketCapacity),
+            {independent}
+        ) == CommitResult::Committed,
+        kTest, "a full bucket must not become a global capacity gate"
+    );
+    ExpectEqual(
+        LoadControl(&map->buckets[full_bucket].head.value), full_head,
+        kTest, "independent append preserves full-bucket head"
+    );
+    ExpectEqual(
+        LoadControl(&map->buckets[full_bucket].tail.value), full_tail,
+        kTest, "independent append preserves full-bucket tail"
+    );
+    ExpectEqual(
+        LoadControl(&map->buckets[independent_bucket].tail.value), 1,
+        kTest, "independent bucket publishes one entry"
+    );
+    SharedRegionSlot &slot =
+        map->slots[SharedTensorMapSlotIndex(independent_bucket, 0)];
+    ExpectEqual(
+        LoadControl(&slot.seq.value), 0,
+        kTest, "independent bucket publishes its own absolute seq"
+    );
+}
+
+void TestFullBucketRetireAndReuseExactCapacity() {
+    constexpr const char *kTest = "full-bucket-retire-reuse-exact";
+    auto map = NewMap();
+    RecordingOps::DisableEvents();
+    const uint64_t address = 0x560000000ULL;
+    const uint32_t bucket = TensorMapHash(address);
+    for (uint32_t task = 0; task < kMapBucketCapacity; ++task) {
+        const CommitResult result = TryCommitTask(
+            *map, static_cast<int32_t>(task),
+            {MakeRegion(
+                address, static_cast<uint64_t>(task) * 32,
+                static_cast<uint64_t>(task) * 32 + 8,
+                static_cast<int32_t>(task)
+            )}
+        );
+        if (result != CommitResult::Committed) {
+            Expect(false, kTest, "failed to fill the target bucket");
+            return;
+        }
+    }
+
+    constexpr uint32_t kReuse =
+        kMapBucketCapacity / 4U < 8U
+            ? kMapBucketCapacity / 4U
+            : 8U;
+    static_assert(kReuse > 0, "exact reuse test requires a non-zero batch");
+    std::vector<SharedRegionValue> replacements;
+    replacements.reserve(kReuse);
+    for (uint32_t index = 0; index < kReuse; ++index) {
+        const uint64_t lo =
+            (1ULL << 20U) + static_cast<uint64_t>(index) * 32U;
+        replacements.push_back(MakeRegion(
+            address, lo, lo + 8U,
+            static_cast<int32_t>(kMapBucketCapacity)
+        ));
+    }
+    const int32_t heap_window =
+        static_cast<int32_t>(kMapBucketCapacity - kReuse);
+    Expect(
+        TryCommitTask(
+            *map, static_cast<int32_t>(kMapBucketCapacity),
+            replacements, heap_window
+        ) == CommitResult::Committed,
+        kTest, "retiring exactly K entries must admit exactly K replacements"
+    );
+    ExpectEqual(
+        LoadControl(&map->reclaim_upto.value), kReuse - 1,
+        kTest, "inclusive reclaim boundary"
+    );
+    ExpectEqual(
+        LoadControl(&map->buckets[bucket].head.value), kReuse,
+        kTest, "bucket head retires exactly K old entries"
+    );
+    ExpectEqual(
+        LoadControl(&map->buckets[bucket].tail.value),
+        kMapBucketCapacity + kReuse,
+        kTest, "bucket tail appends exactly K replacement entries"
+    );
+    for (uint32_t index = 0; index < kReuse; ++index) {
+        const uint64_t cursor =
+            static_cast<uint64_t>(kMapBucketCapacity) + index;
+        SharedRegionSlot &slot =
+            map->slots[SharedTensorMapSlotIndex(bucket, cursor)];
+        ExpectEqual(
+            LoadControl(&slot.seq.value), cursor,
+            kTest, "reused physical slot publishes the new absolute seq"
+        );
+        ExpectEqual(
+            slot.payload.value.producer, kMapBucketCapacity,
+            kTest, "reused physical slot contains the replacement producer"
+        );
+    }
+    std::vector<LogicalTuple> snapshot;
+    Expect(SnapshotLogicalMap(*map, snapshot), kTest, "snapshot after exact reuse");
+    ExpectEqual(
+        snapshot.size(), kMapBucketCapacity,
+        kTest, "exact reuse keeps the bucket logically full"
+    );
+}
+
 void TestCapacityBlockedAfterSafeRetire() {
     constexpr const char *kTest = "capacity-after-safe-retire";
     auto map = NewMap();
@@ -1121,12 +1321,15 @@ void TestDeterministicArrivalAndLogicalTupleDifference() {
 }  // namespace
 
 int main() {
+    TestPhysicalSlotBoundaries();
     TestAbiResetAndZeroEntryCommit();
     TestPublicationOrderAndDoubleSeqCheck();
     TestVersionsWindowAndMultipleBuckets();
     TestOrderedReclaimFormulaAndExactTurn();
     TestAbsoluteSeqMultipleLapsAndAba();
     TestCapacityFailureIsAllOrNothing();
+    TestFullBucketDoesNotBlockIndependentBucket();
+    TestFullBucketRetireAndReuseExactCapacity();
     TestCapacityBlockedAfterSafeRetire();
     TestDeterministicArrivalAndLogicalTupleDifference();
 
@@ -1135,8 +1338,10 @@ int main() {
         return EXIT_FAILURE;
     }
     std::printf(
-        "[PASS] shared TensorMap ring: ABI, ordered commit, window, reclaim, "
-        "absolute seq, ABA, overflow, logical differential\n"
+        "[PASS] shared TensorMap ring CAP=%u buckets=%u: "
+        "ABI, ordered commit, window, reclaim, absolute seq, ABA, "
+        "overflow, logical differential\n",
+        kMapBucketCapacity, kMapBuckets
     );
     std::printf(
         "[NOTE] CPU validates atomic/order hooks only; it does not simulate A5 DCache or DCCI.\n"

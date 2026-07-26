@@ -48,6 +48,7 @@ case "$BUILD_VARIANT" in
 esac
 BUILD_DIR="$ROOT_DIR/build/cpu/$TENSORMAP_MODE/$BUILD_VARIANT"
 CXX_BIN="${CXX:-g++}"
+TENSORMAP_RING_CAP=128
 
 # CPU 后端只依赖 C++17、pthread 和本目录 common/，不需要 CANN。
 # CXX 可显式指向用户目录下的 g++-15，未设置时沿用当前 PATH 中的 g++。
@@ -62,6 +63,7 @@ echo "[BUILD] CPU scheduler executable"
 # 都实例化同一 scheduler，模式宏只选择各自已经接线的 TensorMap backend。
 "$CXX_BIN" -O3 -std=c++17 -pthread -Wall -Wextra -Werror \
     "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID" \
+    "-DPTO_FDWIC_TENSORMAP_RING_CAP=$TENSORMAP_RING_CAP" \
     "${VARIANT_DEFINES[@]}" \
     -I"$ROOT_DIR/common" \
     "$SCRIPT_DIR/main.cpp" \
@@ -85,16 +87,22 @@ echo "[TEST] atomic PollBatch boundary self-test"
 # 未来非空 ordinary-region 的隔离原型，覆盖 seq/ABA、回收与容量预检。
 # 当前 shared PA Case1 已绕过该原型，不能用本测试冒充热路径证据。
 if [[ "$TENSORMAP_MODE" == "private" ]]; then
-    echo "[BUILD] private TensorMap ring self-test"
-    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
-        -DPTO_FDWIC_SHARED_MAP=0 \
-        -DPA_BUILD_SWIMLANE=1 \
-        -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/test/test_private_tensor_map_ring.cpp" \
-        -o "$BUILD_DIR/test_private_tensor_map_ring"
+    # 同一生产 helper 在固定 16K 总槽下覆盖多组 CAP×bucket 形态；
+    # 正式 scheduler 仍只编默认 128，隔离门槛不冒充运行期 auto。
+    for cap in 32 64 128 256 16384; do
+        binary="$BUILD_DIR/test_private_tensor_map_ring_cap${cap}"
+        echo "[BUILD] private TensorMap ring self-test CAP=$cap"
+        "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+            -DPTO_FDWIC_SHARED_MAP=0 \
+            "-DPTO_FDWIC_TENSORMAP_RING_CAP=$cap" \
+            -DPA_BUILD_SWIMLANE=1 \
+            -I"$ROOT_DIR/common" \
+            "$ROOT_DIR/test/test_private_tensor_map_ring.cpp" \
+            -o "$binary"
 
-    echo "[TEST] private TensorMap ring self-test"
-    "$BUILD_DIR/test_private_tensor_map_ring"
+        echo "[TEST] private TensorMap ring self-test CAP=$cap"
+        "$binary"
+    done
 else
     # host 必须从最终 SchedulerState.context_lens 独立重建 shared task
     # plan，不能复用 device helper 形成同错 oracle。该测试覆盖 G0/G1/G2/G4、
@@ -111,16 +119,20 @@ else
     echo "[TEST] shared authoritative host task-plan self-test"
     "$BUILD_DIR/test_shared_host_task_plan"
 
-    echo "[BUILD] isolated shared ordinary-region ring self-test"
-    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
-        -DPTO_FDWIC_SHARED_MAP=1 \
-        -DPA_BUILD_SWIMLANE=1 \
-        -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/test/test_shared_tensor_map_ring.cpp" \
-        -o "$BUILD_DIR/test_shared_tensor_map_ring"
+    for cap in 32 64 128 256 16384; do
+        binary="$BUILD_DIR/test_shared_tensor_map_ring_cap${cap}"
+        echo "[BUILD] isolated shared ordinary-region ring self-test CAP=$cap"
+        "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+            -DPTO_FDWIC_SHARED_MAP=1 \
+            "-DPTO_FDWIC_TENSORMAP_RING_CAP=$cap" \
+            -DPA_BUILD_SWIMLANE=1 \
+            -I"$ROOT_DIR/common" \
+            "$ROOT_DIR/test/test_shared_tensor_map_ring.cpp" \
+            -o "$binary"
 
-    echo "[TEST] isolated shared ordinary-region ring self-test"
-    "$BUILD_DIR/test_shared_tensor_map_ring"
+        echo "[TEST] isolated shared ordinary-region ring self-test CAP=$cap"
+        "$binary"
+    done
 
     # shared raw 只保留真实稀疏边界：所有 task 有连续 EfDrain+Claim
     # 和 Submit 父区间，loser 没有业务子区间；PrepareMap 必须彻底缺席。

@@ -2081,10 +2081,15 @@ inline uint64_t ExpectedPaDependencySignature(
 #endif
 
 inline uint32_t SharedTensorMapHashHost(uint64_t address) {
+#if PTO_FDWIC_TENSORMAP_RING_CAP == 16384
+    (void)address;
+    return 0;
+#else
     address *= 0x9E3779B97F4A7C15ULL;
     return static_cast<uint32_t>(
         address >> (64 - kMapBucketShift)
     ) & kMapBucketMask;
+#endif
 }
 
 inline void SharedLogicalHashWord(uint64_t *hash, uint64_t value) {

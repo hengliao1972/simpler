@@ -34,6 +34,7 @@ using pa_scheduler::MapEntry;
 using pa_scheduler::ResetTensorMap;
 using pa_scheduler::TensorDesc;
 using pa_scheduler::TensorMap;
+using pa_scheduler::TensorMapSlotIndex;
 using pa_scheduler::AdvanceTensorMap;
 using pa_scheduler::kMapBucketCapacity;
 using pa_scheduler::kMapBuckets;
@@ -42,13 +43,15 @@ using pa_scheduler::kMapBucketShift;
 using pa_scheduler::kTaskWindow;
 
 static_assert(PTO_FDWIC_SHARED_MAP == 0, "this test covers only the private ring discipline");
-static_assert(kMapBuckets == 128, "private TensorMap ABI requires 128 buckets");
-static_assert(kMapBucketCapacity == 128, "private TensorMap ABI requires 128 slots per bucket");
 static_assert(kMapCapacity == kMapBuckets * kMapBucketCapacity, "private TensorMap capacity mismatch");
-static_assert(kMapBucketShift == 7, "128-bucket hash must consume seven high bits");
 static_assert(sizeof(MapEntry) == 48, "MapEntry must preserve the standalone/production-compatible ABI");
 static_assert(alignof(MapEntry) == 8, "MapEntry alignment changed");
+#if PTO_FDWIC_TENSORMAP_RING_CAP == 128
+static_assert(kMapBuckets == 128, "default private TensorMap ABI requires 128 buckets");
+static_assert(kMapBucketCapacity == 128, "default private TensorMap ABI requires 128 slots per bucket");
+static_assert(kMapBucketShift == 7, "default 128-bucket hash must consume seven high bits");
 static_assert(sizeof(TensorMap) == 823312, "TensorMap must preserve the WorkerState ABI");
+#endif
 static_assert(alignof(TensorMap) == 8, "TensorMap alignment changed");
 static_assert(std::is_standard_layout<MapEntry>::value, "MapEntry must remain a standard-layout ABI type");
 static_assert(std::is_trivially_copyable<MapEntry>::value, "MapEntry must remain trivially copyable");
@@ -144,8 +147,13 @@ ByteRange ReferenceByteRange(const TensorDesc &tensor) {
 uint32_t ReferenceBucket(uint64_t buffer_addr) {
     // 与设计文档固定的乘法哈希一致；reference 不读取被测 ring 的 head/tail，
     // 只需知道一条抽象 entry 属于哪个有界桶，才能独立判断插入是否应当失败。
+#if PTO_FDWIC_TENSORMAP_RING_CAP == 16384
+    (void)buffer_addr;
+    return 0;
+#else
     const uint64_t mixed = buffer_addr * 0x9E3779B97F4A7C15ULL;
     return static_cast<uint32_t>(mixed >> (64U - kMapBucketShift));
+#endif
 }
 
 bool Overlaps(const ByteRange &left, const ByteRange &right) {
@@ -220,6 +228,67 @@ std::unique_ptr<TensorMap> NewMap() {
     return map;
 }
 
+void TestPhysicalLayoutBoundaries() {
+    constexpr const char *kTest = "physical-layout-boundaries";
+    auto map = NewMap();
+    ExpectEqual(
+        TensorMapSlotIndex(0, 0), 0,
+        kTest, "first physical slot"
+    );
+    ExpectEqual(
+        TensorMapSlotIndex(
+            kMapBuckets - 1U,
+            static_cast<uint64_t>(kMapBucketCapacity - 1U)
+        ),
+        kMapCapacity - 1U,
+        kTest, "last physical slot"
+    );
+    ExpectEqual(
+        TensorMapSlotIndex(
+            kMapBuckets - 1U,
+            static_cast<uint64_t>(kMapBucketCapacity)
+        ),
+        (kMapBuckets - 1U) * kMapBucketCapacity,
+        kTest, "last bucket first wrapped slot"
+    );
+
+    // 直接检查物理数组而不是用同一个 helper 算 expected。CAP32/64 必须
+    // 跨过默认前128桶与 ABI padding 中额外游标的分界。
+#if PTO_FDWIC_TENSORMAP_RING_CAP <= 128
+    TensorMapBucketHead(*map, 127U) = 17;
+    TensorMapBucketTail(*map, 127U) = 27;
+    ExpectEqual(map->bucket_heads[127], 17, kTest, "base head bucket 127");
+    ExpectEqual(map->bucket_tails[127], 27, kTest, "base tail bucket 127");
+#endif
+#if PTO_FDWIC_TENSORMAP_RING_CAP < 128
+    TensorMapBucketHead(*map, 128U) = 18;
+    TensorMapBucketTail(*map, 128U) = 28;
+    TensorMapBucketHead(*map, kMapBuckets - 1U) = 19;
+    TensorMapBucketTail(*map, kMapBuckets - 1U) = 29;
+    ExpectEqual(map->extra_bucket_heads[0], 18, kTest, "extra head bucket 128");
+    ExpectEqual(map->extra_bucket_tails[0], 28, kTest, "extra tail bucket 128");
+    ExpectEqual(
+        map->extra_bucket_heads[kMapBuckets - 129U], 19,
+        kTest, "last extra head"
+    );
+    ExpectEqual(
+        map->extra_bucket_tails[kMapBuckets - 129U], 29,
+        kTest, "last extra tail"
+    );
+#else
+    TensorMapBucketHead(*map, kMapBuckets - 1U) = 19;
+    TensorMapBucketTail(*map, kMapBuckets - 1U) = 29;
+    ExpectEqual(
+        map->bucket_heads[kMapBuckets - 1U], 19,
+        kTest, "last base head"
+    );
+    ExpectEqual(
+        map->bucket_tails[kMapBuckets - 1U], 29,
+        kTest, "last base tail"
+    );
+#endif
+}
+
 void TestEmptyAndHalfOpenIntervals() {
     constexpr const char *kTest = "empty-and-half-open";
     auto map = NewMap();
@@ -262,7 +331,13 @@ void TestTaskWindowWrapAndMultipleLaps() {
     constexpr const char *kTest = "task-window-wrap-and-multiple-laps";
     auto map = NewMap();
     const TensorDesc region = MakeTensor(0x400000000ULL, 0, 4);
-    constexpr int32_t kWindow = 64;
+    // 该用例要验证“窗口内始终可追加并跨多 lap”，不是验证配置过小
+    // 的 FATAL；因此窗口必须严格小于当前隔离 CAP。满环失败由下一用例
+    // 独立覆盖。
+    constexpr int32_t kWindow =
+        kMapBucketCapacity > 64U
+            ? 64
+            : static_cast<int32_t>(kMapBucketCapacity - 1U);
     constexpr uint32_t kLastTask = 4 * kTaskWindow + 257;
 
     for (uint32_t task_id = 0; task_id <= kLastTask; ++task_id) {
@@ -321,7 +396,7 @@ void TestFullBucketDoesNotOverwrite() {
 
     ExpectEqual(CountLiveMapEntries(*map), kMapBucketCapacity, kTest, "full bucket live count");
     const bool inserted = InsertTensor(*map, existing.front(), 1000);
-    Expect(!inserted, kTest, "129th insert must fail");
+    Expect(!inserted, kTest, "CAP+1 insert must fail");
     ExpectEqual(
         CountLiveMapEntries(*map), kMapBucketCapacity, kTest, "failed insert must not change count"
     );
@@ -441,6 +516,7 @@ void TestFixedSeedDifferential() {
 }  // namespace
 
 int main() {
+    TestPhysicalLayoutBoundaries();
     TestEmptyAndHalfOpenIntervals();
     TestLatestProducerAndAliveFloor();
     TestTaskWindowWrapAndMultipleLaps();
@@ -452,7 +528,9 @@ int main() {
         return EXIT_FAILURE;
     }
     std::printf(
-        "[PASS] private TensorMap ring: ABI, interval, reclaim, wrap, overflow, differential\n"
+        "[PASS] private TensorMap ring CAP=%u buckets=%u: "
+        "ABI, interval, reclaim, wrap, overflow, differential\n",
+        kMapBucketCapacity, kMapBuckets
     );
     return EXIT_SUCCESS;
 }
