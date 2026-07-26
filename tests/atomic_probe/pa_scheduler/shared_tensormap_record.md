@@ -5748,3 +5748,93 @@ outputs/shared_dynamic_submit_pmu_v6_20260726/
 256 group、1,280 task，并要求 raw 无 dropped、converter/exclusive
 按动态 task identity 闭合。该泳道只用于业务区域和 atomic 解释；
 正式墙钟仍由无诊断的 perf-clock 构建单独采集。
+
+### 2026-07-26：S6.4h 生成真正的 shared B256 泳道与无诊断基线
+
+本阶段先从当前 HEAD 重新构建 shared `swimlane` 和 `perf-clock` 两套
+CCEC 制品，未复用早于 S6.4d～g 的旧 ELF。两套 manifest 分别固定
+`mode=shared`、`variant=swimlane/perf-clock`，运行入口在启动前重新核对
+所有制品 SHA-256。
+
+#### B256 身份与协议闭合
+
+正式泳道命令显式使用：
+
+```bash
+PYTHON=/home/q00473782/.venv/bin/python \
+tests/atomic_probe/pa_scheduler/run.sh swimlane ccec \
+  --tensormap shared --device 0 \
+  --batches 256 --shared-context-lens 8192 \
+  --winner-workload real-compute \
+  --real-compute-counts 6,28,4,1
+```
+
+运行头和独立 host plan 同时报告：
+
+```text
+batches=256
+shared_groups=256
+tasks=1280
+kinds=Alloc:256,QK:256,SF:256,PV:256,UP:256
+```
+
+这次不是依赖输出目录名推断规模。设备实际 replay、host 独立计划和离线
+analyzer 三层分别确认 1,280 个 task/核；exclusive analysis 还要求 96
+核的 task ID 都是同一个连续 `0..1279`，并恢复出 256 组
+`Alloc + QK + SF + PV + UP`。
+
+关键门槛结果：
+
+| 项目 | 结果 |
+| --- | --- |
+| shared heap | vend/expected 均为 206,569,472 bytes，8 shard cursor 完全相等 |
+| TensorMap symbol | published 2,048、INPUT load 1,280、INOUT writer commit 768 |
+| dependency | 1,280 edges，signature `b7d985d6edb07078` |
+| kernel | QK/SF/PV/UP 各 256，共 1,024 |
+| 数值输出 | 192 active、0 sentinel，逐元素 PASS |
+| trace | 832,263 raw records，expected 832,263，dropped 0 |
+| atomic | 95,751 logical calls，90,247 physical records，轮询合批公式闭合 |
+| offline | merged 1,200,808 个非 metadata 事件；exclusive validation 全项 PASS |
+
+merged 的 `traceEvents` 数组另含 256 条 `ph=M` metadata，因此数组总长
+是 1,201,064。这里显式区分 converter 报告的业务/诊断事件数与 JSON
+数组长度，避免把两种口径误判为转换缺失。
+
+exclusive 的 `capture.task_count_per_core=1280`、
+`task_ids_contiguous_and_equal_per_core=true` 和
+`validation.status=PASS` 是之后辨别 B256 的最低证据，不能再用 B1
+产物或仅凭目录名替代。
+
+本次完整产物位于：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260726_100857_3337556/ccec/
+  l2_swimlane_records.json             约 53 MiB
+  merged_swimlane.json                 约 93 MiB
+  swimlane_exclusive_analysis.json     约 115 KiB
+```
+
+#### 诊断泳道与 perf-clock 必须分开解释
+
+泳道构建的 first-to-last Submit 是 4,854.651 us。它同时写普通阶段和
+atomic 记录，并生成 832,263 条设备记录，只用于解释业务区域、依赖和
+atomic，不作为权威性能基线。
+
+perf-clock 构建编译期去除了泳道、atomic 观察和 PMU，只保留每核首个
+Submit 起点与最后一个 Submit 终点。相同 device 0、B256、G1 和
+`real-compute/6,28,4,1` 下，先丢弃两个独立进程预热
+`2392.876/2394.751 us`，随后六个独立正式进程为：
+
+```text
+2382.540, 2380.577, 2389.149, 2381.226, 2356.894, 2389.874 us
+```
+
+正式样本最小值 2,356.894 us，中位数 2,381.883 us，均值
+2,380.043 us，最大值 2,389.874 us，样本标准差 12.028 us；六轮语义、
+输出、heap、symbol 和依赖门槛全部 PASS。当前 standalone shared PA
+B256 的无诊断量级因此仍是约 2.38 ms，与此前约 2.36 ms 的判断一致。
+
+单次泳道是 perf-clock 中位数的约 2.04 倍。这个差异只能说明完整诊断
+构建显著扰动热路径，不能把 2,472.768 us 逐项归因给某一种记录操作，
+也不能拿两套 ELF 的绝对时间直接做候选收益。后续性能候选继续只由
+perf-clock 决定保留或撤销，泳道只解释收益落点。
