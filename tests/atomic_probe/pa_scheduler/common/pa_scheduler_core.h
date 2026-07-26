@@ -2143,6 +2143,21 @@ PA_DEVICE bool FinishCallbackSubmitBody(
 
     if (__builtin_expect(winner, 0)) {
         const uint64_t winner_build_begin = register_end;
+#if PTO_FDWIC_SHARED_MAP && \
+    defined(PA_TEST_SHARED_POST_GATE_BUILD_FAILURE)
+        // 只供 host 96-worker 故障门槛使用：non-final UP 已完成 writer
+        // intent 与 deps_prepared 发布后、建立可执行 slot 前注入失败。
+        // 普通 CPU/CCEC 不定义该宏，预处理后不保留调用或分支。
+        if (shared_writers_prepared &&
+            Ops::InjectSharedPostGateBuildFailure(
+                state, worker, task_id, kind
+            )) {
+            SetFatal<Ops>(
+                state, stats, static_cast<int32_t>(task_id)
+            );
+            return false;
+        }
+#endif
         if (kind == TaskKind::Alloc) {
 #if !PTO_FDWIC_SHARED_MAP
             if (!HeapGuard<Ops, Profile>(state, worker, task_id, context.output_bytes, stats)) {
@@ -3097,11 +3112,22 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
     const uint64_t expected_task_id_sum =
         static_cast<uint64_t>(task_count) * (task_count - 1U) / 2U;
+    // terminal fatal 可能在某个 worker 进入首个 Submit 之前已经可见。
+    // 该 worker 合法地没有 finish 调用，finish TU 地址也尚未回写；不能
+    // 把这种零回放收敛误报成 split 状态错配。只要开始过任一 Submit，
+    // 仍严格要求 caller/finish 是同一个 TLS runtime。
+    const bool finish_state_matches =
+        task_count == 0
+            ? Ops::Load(&state->fatal.value) != 0 &&
+                  split_runtime.finish_calls == 0 &&
+                  split_runtime.finish_state_address == 0
+            : split_runtime.finish_state_address ==
+                  split_runtime.caller_state_address;
     const bool split_protocol_ok =
         split_runtime.scheduler == state && split_runtime.worker == &worker &&
         split_runtime.task_count == task_count && split_runtime.worker_id == worker_id &&
         split_runtime.owner_worker_id == worker_id && split_runtime.caller_state_address != 0 &&
-        split_runtime.finish_state_address == split_runtime.caller_state_address &&
+        finish_state_matches &&
         split_runtime.finish_calls == task_count && split_runtime.task_id_sum == expected_task_id_sum &&
         split_runtime.state_cookie == CompeteFirstSplitStateCookie(worker_id, role) &&
         split_runtime.reserved == 0;

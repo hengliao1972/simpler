@@ -5926,3 +5926,112 @@ private CPU/CCEC 都重新构建并通过 B1。private CCEC host 中不存在
 变成确定、可复核的 host 错误。若之后要求这两类 B256 输入运行，需要
 单独设计更大 heap、分批生命周期或 generation/reclaim 协议，不能通过
 删除设备端容量门槛解决。
+
+### 2026-07-26：S6.4j 闭合 G2 放门后 Build 失败的全局收敛
+
+此前已有两条分开的门槛：
+
+- non-final UP loser 必须等待 `deps_prepared`；
+- 已经存在阻塞 slot 时，terminal fatal 会在 final barrier 后撤销执行
+  资格。
+
+它们没有证明同一轮真实 96-worker scheduler 能闭合以下连续时序：
+
+```text
+task4 winner 提交三个 accumulator writer intent
+→ 发布 deps_prepared=4，放行另外 95 个 replay actor
+→ 第二组 task8 完成 Build，并把三个 writer 都推进到 8
+→ task4 在 Build 前失败并广播 fatal
+→ task8 因 fanin task4 未完成而禁止执行
+→ 96 worker 全部完成 final barrier 并清空在途 slot
+```
+
+G2 的 non-final UP 固定是 task4，final UP 是 task8。`UP` 没有 fresh
+Output，因此这次故障必须准确命名为 post-gate Build failure，不能伪称
+fresh-output seal failure。
+
+#### 仅测试构建可见的注入边界
+
+公共 `FinishCallbackSubmitBody()` 在
+`shared_writers_prepared=true` 之后、`BuildWinner()` 之前增加一个受
+`PA_TEST_SHARED_POST_GATE_BUILD_FAILURE` 保护的 Ops hook。正式 CPU、
+CCEC、swimlane、perf-clock 和 submit-PMU 都不定义该宏，预处理后没有
+该调用和分支；宏只用于 `test_shared_loser_finish`。
+
+故障 Ops 使用 thread-local split runtime 和真实 host atomic 语义启动
+32 AIC + 64 AIV。task4 hook 不会立刻失败，而是等待 Alloc task0 的三个
+`last_writer` 全部等于 8。必须三条都满足，不能只观察线性提交的第一条
+就提前广播 fatal。这个条件同时证明：
+
+1. task4 的 writer-ready 门已经可见；
+2. 其他 actor 已进入第二组；
+3. 唯一 task8 winner 已建立 slot；
+4. task8 的 Build 后 writer commit 已完整结束。
+
+随后 hook 对 task4 返回失败，由真实 `SetFatal`、replay break、分层 final
+barrier、`DiscardSharedSlotsAfterReplayFatal()` 完成收敛。hook 自身有
+2 秒 wall-clock 取证上限，整个测试进程另由 15 秒 `timeout` 兜底；超时
+仍注入 fatal，但最终 oracle 必须失败，不能用“能退出”掩盖 task8 未到达。
+
+#### 故障 oracle
+
+完整门槛要求：
+
+- 96 个 pthread 全部 join，startup=96，two-16 final barrier 精确闭合；
+- hook 恰好一次，fault worker 必须是 AIV；该 worker 在 task4 失败前
+  `submits=4`、split finish calls=5、task-id sum=10；
+- `fatal=1`、`deps_prepared[4]=4`，但 task4/task8 的 flag 和 vend 都为
+  0，`deps_prepared[8]` 仍为 -1；
+- Alloc 三个 writer 都等于 8，而 task8 自身无 Output 的 publication/
+  writer 控制字全部保持 -1；
+- 96 核四个 slot 全部 `occupied=false/built=false`、每核
+  `occupied_count=0`；
+- 全局不存在 task4 诊断 slot，锁定失败发生在 `BuildWinner()` 之前；
+- 恰好保留一个已撤销执行资格的 task8 诊断 slot，function 为 UP，
+  fanin 精确为 `{6,7,4}`；
+- UP kernel 数严格为 0；QK/SF/PV 的完成 flag 分别与各自 kernel 数
+  相等，全部 placement 之和等于 kernel 总数，completion duplicate 为
+  0。
+
+故障广播存在合法竞态：少数 worker 可能在首个 Submit 前已经观察到
+fatal，因此 `task_count=0/finish_calls=0/finish_state_address=0`。旧 split
+尾检无条件要求 finish 地址等于 caller 地址，会把这种零回放正常退出
+误记成 protocol error。本阶段只允许“全局已经进入 terminal fatal，且
+task_count 和 finish_calls 同为零时 finish 地址尚未建立”；无 fatal 的
+零回放不能借此通过。任何进入过一个 Submit 的 worker 仍严格要求
+caller/finish 指向同一 thread-local runtime，其他 cookie、owner、调用
+次数、task sum 和 reserved 门槛均未放宽。
+
+#### 实测
+
+定向二进制连续运行 30 次，30/30 通过。稳定终态为：
+
+```text
+hook=1
+task8_seen=1
+writers=8,8,8
+kernels=2,2,2,0
+placements=6
+task4_slot=0
+task8_slot=1/1
+slots_clear=1
+split_protocol_errors=0
+```
+
+QK/SF/PV 各 2 次属于允许执行的独立上游工作，不依赖 task4；UP 为 0 才是
+本故障的关键禁止条件。
+
+测试宏关闭后，普通 CPU shared G2 partial `context_len=8193` 仍得到 9
+task、8 kernel、13/10/6 symbol、dependency signature
+`dda63f4f5405eaf1`、829,440-byte heap 和真实计算结果全项 PASS。重新
+构建的 CCEC shared perf-clock 在 A5 上得到同一 G2 身份和全部语义门槛
+PASS，单次 first-to-last Submit 为 137.186 us。该数值只用于确认正式
+构建没有被故障 hook 污染，不作为新的性能基线。private CCEC perf-clock
+也重新构建，并在 A5 上以 B1 real-compute 通过 96 worker、5 task、
+四类 kernel 各 1 次及全部输出校验。
+
+最后对 private/shared 的 CCEC split-finish 翻译单元、swimlane 与
+perf-clock 产物做预处理文本和符号审计，故障宏及 hook 命中均为 0；
+`PA_TEST_SHARED_POST_GATE_BUILD_FAILURE` 的唯一构建定义仍是 CPU host
+self-test。由此把“测试注入能闭合 G2 故障”和“正式 CCEC/private 不带
+注入逻辑”作为两条独立证据闭合。

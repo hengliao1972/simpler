@@ -9,13 +9,18 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <new>
 #include <sys/mman.h>
+#include <thread>
 #include <unistd.h>
+#include <vector>
 
+#include "host_support.h"
 #define PA_DEVICE inline
 #define PA_GM
 #define PA_COMPETE_FIRST_SPLIT_FINISH 1
@@ -30,11 +35,18 @@ using namespace pa_scheduler;
 // kernel、共享 heap 或 TensorMap。
 struct LoserFinishTestOps {
     static constexpr bool kAtomicReturnReadyObserved = false;
-    static inline CompeteFirstSplitRuntimeState runtime{};
-    static inline uint64_t tick = 0;
+    static inline thread_local CompeteFirstSplitRuntimeState runtime{};
 
     static CompeteFirstSplitRuntimeState &CompeteFirstSplitState() {
         return runtime;
+    }
+
+    static bool FinishCompeteFirstCallback(
+        const CallbackSubmitTicket *ticket, const TaskArgs *args
+    ) {
+        return FinishSplitCallbackSubmitFromRuntime<
+                   LoserFinishTestOps
+               >(ticket, args) == 1U;
     }
 
     static int32_t Load(volatile int32_t *address) {
@@ -95,7 +107,11 @@ struct LoserFinishTestOps {
     }
 
     static uint64_t Now() {
-        return ++tick;
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()
+            ).count()
+        );
     }
 
     template <typename T>
@@ -108,7 +124,21 @@ struct LoserFinishTestOps {
         SchedulerState *, WorkerState &, TaskKind, uint32_t
     ) {}
 
-    static void SpinHint() {}
+    static bool PmuWindowStart(SchedulerState *, uint32_t) {
+        return false;
+    }
+
+    static void PmuWindowStop(SchedulerState *, uint32_t, bool) {}
+
+    static void SpinHint() {
+        std::this_thread::yield();
+    }
+
+    static bool InjectSharedPostGateBuildFailure(
+        SchedulerState *, WorkerState &, uint32_t, TaskKind
+    ) {
+        return false;
+    }
 
     static void InvalidateRegion(const void *, uint64_t) {
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -120,6 +150,77 @@ struct LoserFinishTestOps {
 
     static void Publish(uint64_t *address, uint64_t value) {
         __atomic_store_n(address, value, __ATOMIC_RELEASE);
+    }
+};
+
+// G2 的 task4 是 non-final UP。它先提交三个 accumulator writer intent
+// 并发布 deps_prepared，task8 才能在第二组建立 slot。hook 等到 task8
+// 已完成 Build 后的 writer commit，再让 task4 Build 失败；这能覆盖
+// “后继已在途、前驱随后 terminal fatal”的完整 96-worker 收敛路径。
+struct PostGateBuildFailureOps : LoserFinishTestOps {
+    static inline std::atomic<uint32_t> hook_calls{0};
+    static inline std::atomic<bool> task8_post_build_seen{false};
+    static inline std::atomic<bool> hook_timed_out{false};
+    static inline std::atomic<int32_t> fault_worker{-1};
+
+    static void ResetFaultState() {
+        hook_calls.store(0, std::memory_order_relaxed);
+        task8_post_build_seen.store(false, std::memory_order_relaxed);
+        hook_timed_out.store(false, std::memory_order_relaxed);
+        fault_worker.store(-1, std::memory_order_relaxed);
+    }
+
+    static bool FinishCompeteFirstCallback(
+        const CallbackSubmitTicket *ticket, const TaskArgs *args
+    ) {
+        return FinishSplitCallbackSubmitFromRuntime<
+                   PostGateBuildFailureOps
+               >(ticket, args) == 1U;
+    }
+
+    static bool InjectSharedPostGateBuildFailure(
+        SchedulerState *state, WorkerState &worker, uint32_t task_id,
+        TaskKind kind
+    ) {
+        constexpr uint32_t kFirstUp = 4;
+        constexpr uint32_t kFinalUp = 8;
+        if (task_id != kFirstUp || kind != TaskKind::Up) {
+            return false;
+        }
+        hook_calls.fetch_add(1, std::memory_order_relaxed);
+        fault_worker.store(
+            worker.core_idx, std::memory_order_release
+        );
+        const auto deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::seconds(2);
+        const auto FinalWritersCommitted = [state]() {
+            for (uint32_t slot = 0; slot < 3; ++slot) {
+                if (PostGateBuildFailureOps::Load(
+                        &state->shared_map.shared_outputs[0]
+                             .last_writer[slot].value
+                    ) != static_cast<int64_t>(kFinalUp)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        while (!FinalWritersCommitted()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                hook_timed_out.store(
+                    true, std::memory_order_relaxed
+                );
+                break;
+            }
+            std::this_thread::yield();
+        }
+        const bool seen = FinalWritersCommitted();
+        task8_post_build_seen.store(
+            seen, std::memory_order_release
+        );
+        // 即使取证超时也必须注入失败，让调度器有机会自行收敛；最终
+        // oracle 会因 seen=false 报错，外层进程 timeout 则兜底死锁。
+        return true;
     }
 };
 
@@ -1215,6 +1316,322 @@ bool RunFatalBlockedSuccessorDrainTest() {
     return ok;
 }
 
+bool RunTwoGroupPostGateBuildFailureTest() {
+    SchedulerState *state = MapSchedulerState();
+    if (state == nullptr) {
+        return false;
+    }
+    pa_scheduler::host::Options options;
+    options.batches = 1;
+    options.runs = 1;
+    options.trace_enabled = false;
+    options.shared_context_lens = {8193};
+    options.final_barrier_shape = FinalBarrierShape::TwoLevel16;
+    pa_scheduler::host::InitializeState(state, options);
+    pa_scheduler::host::ConfigureTrace(state, options, nullptr);
+    PostGateBuildFailureOps::ResetFaultState();
+
+    std::vector<std::thread> workers;
+    workers.reserve(kWorkers);
+    for (uint32_t worker_id = 0;
+         worker_id < kWorkers; ++worker_id) {
+        const CoreRole role =
+            worker_id < kAicWorkers
+                ? CoreRole::Aic
+                : CoreRole::Aiv;
+        workers.emplace_back([state, worker_id, role]() {
+            RunScheduler<PostGateBuildFailureOps>(
+                state, worker_id, role
+            );
+        });
+    }
+    for (std::thread &worker : workers) {
+        worker.join();
+    }
+
+    constexpr uint32_t kAlloc = 0;
+    constexpr uint32_t kFirstUp = 4;
+    constexpr uint32_t kFinalUp = 8;
+    bool ok = true;
+    ok &= PostGateBuildFailureOps::hook_calls.load(
+              std::memory_order_acquire
+          ) == 1;
+    ok &= PostGateBuildFailureOps::task8_post_build_seen.load(
+              std::memory_order_acquire
+          );
+    ok &= !PostGateBuildFailureOps::hook_timed_out.load(
+        std::memory_order_acquire
+    );
+    ok &= state->fatal.value == 1;
+    ok &= state->started_count.value ==
+        static_cast<int64_t>(kWorkers);
+    ok &= pa_scheduler::host::FinalBarrierStateMatches(
+        state->final_barrier, options.final_barrier_shape
+    );
+
+    // task4 已提交三条 writer intent 和 writer-ready 门，但在 Build 前
+    // 失败；task8 只允许留下已撤销执行资格的诊断 slot，绝不能完成。
+    ok &= state->tasks[kAlloc].flag == 1;
+    ok &= state->tasks[kFirstUp].deps_prepared ==
+        static_cast<int64_t>(kFirstUp);
+    ok &= state->tasks[kFirstUp].flag == 0;
+    ok &= state->tasks[kFirstUp].vend == 0;
+    ok &= state->tasks[kFinalUp].deps_prepared == -1;
+    ok &= state->tasks[kFinalUp].flag == 0;
+    ok &= state->tasks[kFinalUp].vend == 0;
+    for (uint32_t slot = 0; slot < 3; ++slot) {
+        ok &= state->shared_map.shared_outputs[kAlloc]
+                  .last_writer[slot].value ==
+            static_cast<int64_t>(kFinalUp);
+    }
+    for (uint32_t slot = 0;
+         slot < kSharedOutputMaxPerTask; ++slot) {
+        ok &= state->shared_map.shared_outputs[kFinalUp]
+                  .published[slot].value == -1;
+        ok &= state->shared_map.shared_outputs[kFinalUp]
+                  .last_writer[slot].value == -1;
+    }
+    const int32_t fault_worker =
+        PostGateBuildFailureOps::fault_worker.load(
+            std::memory_order_acquire
+        );
+    ok &= fault_worker >= static_cast<int32_t>(kAicWorkers) &&
+        fault_worker < static_cast<int32_t>(kWorkers);
+
+    uint64_t kernel_counts[4] = {};
+    uint64_t placement_total = 0;
+    uint64_t completion_duplicates = 0;
+    uint32_t task4_identity_slots = 0;
+    uint32_t task8_identity_slots = 0;
+    uint32_t task8_diagnostic_slots = 0;
+    bool all_results_published = true;
+    bool all_slots_cleared = true;
+    uint32_t bad_result_identity = 0;
+    uint32_t bad_result_finish = 0;
+    uint32_t bad_result_occupancy = 0;
+    uint32_t split_protocol_errors = 0;
+    uint32_t split_reserved_nonzero = 0;
+    for (uint32_t worker_id = 0;
+         worker_id < kWorkers; ++worker_id) {
+        const WorkerResult &result = state->results[worker_id];
+        const bool identity_ok =
+            result.worker_id == worker_id &&
+            result.role ==
+                static_cast<uint64_t>(
+                    worker_id < kAicWorkers
+                        ? CoreRole::Aic
+                        : CoreRole::Aiv
+                );
+        bad_result_identity += identity_ok ? 0U : 1U;
+        bad_result_finish += result.finish_cycle != 0 ? 0U : 1U;
+        bad_result_occupancy +=
+            result.final_occupied == 0 ? 0U : 1U;
+        split_protocol_errors += static_cast<uint32_t>(
+            result.compete_first_split_protocol_errors
+        );
+        if (result.compete_first_split_protocol_errors != 0) {
+            const uint64_t local_task_count =
+                state->workers[worker_id].local_index < 0
+                    ? 0U
+                    : static_cast<uint64_t>(
+                          state->workers[worker_id].local_index
+                      );
+            std::printf(
+                "[POST_GATE_SPLIT_FAIL] worker=%u local=%llu "
+                "submits=%llu calls=%llu sum=%llu expected_sum=%llu "
+                "caller=%llu finish=%llu owner=%llu reserved=%llu "
+                "errors=%llu\n",
+                worker_id,
+                static_cast<unsigned long long>(
+                    local_task_count
+                ),
+                static_cast<unsigned long long>(result.submits),
+                static_cast<unsigned long long>(
+                    result.compete_first_split_finish_calls
+                ),
+                static_cast<unsigned long long>(
+                    result.compete_first_split_task_id_sum
+                ),
+                static_cast<unsigned long long>(
+                    local_task_count * (local_task_count - 1U) / 2U
+                ),
+                static_cast<unsigned long long>(
+                    result.compete_first_split_caller_state_address
+                ),
+                static_cast<unsigned long long>(
+                    result.compete_first_split_finish_state_address
+                ),
+                static_cast<unsigned long long>(
+                    result.compete_first_split_owner_worker_id
+                ),
+                static_cast<unsigned long long>(
+                    result.compete_first_split_reserved
+                ),
+                static_cast<unsigned long long>(
+                    result.compete_first_split_protocol_errors
+                )
+            );
+        }
+        split_reserved_nonzero +=
+            result.compete_first_split_reserved == 0 ? 0U : 1U;
+        all_results_published &=
+            identity_ok && result.finish_cycle != 0 &&
+            result.final_occupied == 0 &&
+            result.compete_first_split_protocol_errors == 0 &&
+            result.compete_first_split_reserved == 0;
+        for (uint32_t kind = 0; kind < 4; ++kind) {
+            kernel_counts[kind] +=
+                result.kernel_counts[kind];
+        }
+        for (uint32_t place = 0;
+             place <
+                 static_cast<uint32_t>(DrainPlace::Count);
+             ++place) {
+            placement_total += result.placement[place];
+        }
+        completion_duplicates +=
+            result.completion_duplicates;
+
+        const WorkerState &worker = state->workers[worker_id];
+        all_slots_cleared &= worker.occupied_count == 0;
+        for (uint32_t slot_index = 0;
+             slot_index < kPrivateSlots; ++slot_index) {
+            const LocalSlot &slot = worker.slots[slot_index];
+            all_slots_cleared &=
+                !slot.occupied && !slot.built;
+            task4_identity_slots +=
+                slot.task_id == kFirstUp ? 1U : 0U;
+            if (slot.task_id != kFinalUp) {
+                continue;
+            }
+            ++task8_identity_slots;
+            const bool exact_task8_slot =
+                slot.kind ==
+                    static_cast<uint32_t>(
+                        FunctionId(TaskKind::Up)
+                    ) &&
+                slot.fanin_count == 3 &&
+                slot.fanin[0] == 6 &&
+                slot.fanin[1] == 7 &&
+                slot.fanin[2] ==
+                    static_cast<int32_t>(kFirstUp);
+            task8_diagnostic_slots +=
+                exact_task8_slot ? 1U : 0U;
+        }
+    }
+    ok &= all_results_published;
+    ok &= all_slots_cleared;
+    ok &= task4_identity_slots == 0;
+    ok &= task8_identity_slots == 1;
+    ok &= task8_diagnostic_slots == 1;
+    if (fault_worker >= 0 &&
+        fault_worker < static_cast<int32_t>(kWorkers)) {
+        const WorkerResult &fault_result =
+            state->results[static_cast<uint32_t>(fault_worker)];
+        ok &= fault_result.role ==
+            static_cast<uint64_t>(CoreRole::Aiv);
+        ok &= fault_result.submits == 4;
+        ok &=
+            fault_result.compete_first_split_finish_calls == 5;
+        ok &=
+            fault_result.compete_first_split_task_id_sum == 10;
+    }
+
+    const uint64_t kernel_total =
+        kernel_counts[0] + kernel_counts[1] +
+        kernel_counts[2] + kernel_counts[3];
+    ok &= kernel_counts[3] == 0;
+    ok &= placement_total == kernel_total;
+    ok &= completion_duplicates == 0;
+    const uint64_t qk_ready =
+        static_cast<uint64_t>(state->tasks[1].flag == 1) +
+        static_cast<uint64_t>(state->tasks[5].flag == 1);
+    const uint64_t sf_ready =
+        static_cast<uint64_t>(state->tasks[2].flag == 1) +
+        static_cast<uint64_t>(state->tasks[6].flag == 1);
+    const uint64_t pv_ready =
+        static_cast<uint64_t>(state->tasks[3].flag == 1) +
+        static_cast<uint64_t>(state->tasks[7].flag == 1);
+    ok &= qk_ready == kernel_counts[0];
+    ok &= sf_ready == kernel_counts[1];
+    ok &= pv_ready == kernel_counts[2];
+
+    const bool final_barrier_ok =
+        pa_scheduler::host::FinalBarrierStateMatches(
+            state->final_barrier, options.final_barrier_shape
+        );
+    std::printf(
+        "[POST_GATE_DETAIL] fatal=%d started=%lld barrier=%u "
+        "flags=alloc:%lld,up4:%lld,up8:%lld "
+        "deps4=%lld vend4=%llu vend8=%llu "
+        "writers=%lld,%lld,%lld results=%u duplicates=%llu "
+        "result_bad=%u,%u,%u split=%u,%u "
+        "ready=%llu,%llu,%llu\n",
+        state->fatal.value,
+        static_cast<long long>(state->started_count.value),
+        final_barrier_ok ? 1U : 0U,
+        static_cast<long long>(state->tasks[kAlloc].flag),
+        static_cast<long long>(state->tasks[kFirstUp].flag),
+        static_cast<long long>(state->tasks[kFinalUp].flag),
+        static_cast<long long>(
+            state->tasks[kFirstUp].deps_prepared
+        ),
+        static_cast<unsigned long long>(
+            state->tasks[kFirstUp].vend
+        ),
+        static_cast<unsigned long long>(
+            state->tasks[kFinalUp].vend
+        ),
+        static_cast<long long>(
+            state->shared_map.shared_outputs[kAlloc]
+                .last_writer[0].value
+        ),
+        static_cast<long long>(
+            state->shared_map.shared_outputs[kAlloc]
+                .last_writer[1].value
+        ),
+        static_cast<long long>(
+            state->shared_map.shared_outputs[kAlloc]
+                .last_writer[2].value
+        ),
+        all_results_published ? 1U : 0U,
+        static_cast<unsigned long long>(
+            completion_duplicates
+        ),
+        bad_result_identity, bad_result_finish,
+        bad_result_occupancy, split_protocol_errors,
+        split_reserved_nonzero,
+        static_cast<unsigned long long>(qk_ready),
+        static_cast<unsigned long long>(sf_ready),
+        static_cast<unsigned long long>(pv_ready)
+    );
+    std::printf(
+        "[POST_GATE_TEST] hook=%u task8_seen=%u "
+        "kernels=%llu,%llu,%llu,%llu placements=%llu "
+        "task4_slot=%u task8_slot=%u/%u "
+        "slots_clear=%u status=%s\n",
+        PostGateBuildFailureOps::hook_calls.load(
+            std::memory_order_relaxed
+        ),
+        PostGateBuildFailureOps::task8_post_build_seen.load(
+            std::memory_order_relaxed
+        ) ? 1U : 0U,
+        static_cast<unsigned long long>(kernel_counts[0]),
+        static_cast<unsigned long long>(kernel_counts[1]),
+        static_cast<unsigned long long>(kernel_counts[2]),
+        static_cast<unsigned long long>(kernel_counts[3]),
+        static_cast<unsigned long long>(placement_total),
+        task4_identity_slots,
+        task8_identity_slots,
+        task8_diagnostic_slots,
+        all_slots_cleared ? 1U : 0U,
+        ok ? "PASS" : "FAIL"
+    );
+
+    (void)munmap(state, sizeof(SchedulerState));
+    return ok;
+}
+
 bool RunTwoGroupExplicitFinishTest() {
     SchedulerState *state = MapSchedulerState();
     if (state == nullptr) {
@@ -1406,12 +1823,14 @@ int main() {
     const bool qk_failure_ok = RunQkPublicationFailureTest();
     const bool up_failure_ok = RunUpWriterCommitFailureTest();
     const bool fatal_drain_ok = RunFatalBlockedSuccessorDrainTest();
+    const bool post_gate_failure_ok =
+        RunTwoGroupPostGateBuildFailureTest();
     const bool two_group_finish_ok = RunTwoGroupExplicitFinishTest();
     if (!batch_plan_ok || !payload_wrap_ok ||
         !direct_slot_ok || !loser_ok ||
         !future_task_ok || !fatal_stop_ok ||
         !alloc_failure_ok || !qk_failure_ok || !up_failure_ok ||
-        !fatal_drain_ok ||
+        !fatal_drain_ok || !post_gate_failure_ok ||
         !two_group_finish_ok) {
         std::fprintf(
             stderr,
@@ -1420,7 +1839,8 @@ int main() {
         return 1;
     }
     std::printf(
-        "[PASS] shared split-finish loser and winner seal failure paths\n"
+        "[PASS] shared split-finish loser, post-gate fatal, "
+        "and winner seal failure paths\n"
     );
     return 0;
 }
