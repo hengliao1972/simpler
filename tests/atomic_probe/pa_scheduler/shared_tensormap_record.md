@@ -7821,3 +7821,110 @@ SHA256 均为 `655241601e3f...`，可执行 relocation 的 offset、类型、符
 下一小步应补完整 Kernel execution/completion/final-drain 正向联合门槛，再
 进入 PA 尾部 INOUT 的 region-intent。当前改动不解除 shared backend 门禁，
 也不使用 CPU-sim 的 fatal 通过来替代 A5 GM 可见性和上板正确性证据。
+
+### 2026-07-26：R3b-c 固定单 lane Kernel 的三 worker FinalDrain 正向闭环
+
+R3b-b 的两项 FinalDrain 证据都是错误路径：它们证明 barrier 参与者缺失时
+能够退出，却不能证明正常运行中最后一个已 Build Kernel 会真正执行、发布
+completion，并让全部 worker 通过两级 barrier。当前小步只补这条正向门槛，
+不修改 production。
+
+#### 不手填 slot 的真实调用链
+
+新用例
+`SingleLaneKernelExecutesOnceAndCompletesThroughThreeWorkerFinalDrain`
+建立一个物理 block 的真实三 lane 拓扑：
+
+```text
+core 0: AIC  / block 0 / LANE_AIC
+core 1: AIV  / block 0 / LANE_AIV0
+core 2: AIV  / block 0 / LANE_AIV1
+```
+
+三核都从 `local_index=0` 重放同一个只含 AIV0 kernel 的 task 0：
+
+- AIV0 先走 production compete-first Begin/Finish，赢得 vector Claim；
+- AIC 重放同一 task，因角色不匹配而不发起 Claim；
+- AIV1 重放同一 task，发起同一 vector Claim 并成为 loser；
+- 三核都通过正常 Begin 自然推进到 `local_index=1`，测试不手拨 task id。
+
+winner 的 RingSlot 必须由完整
+`Materialize -> shared commit -> WinnerBuild` 路径生成。测试提供一个
+真实 `TensorCreateInfo` OUTPUT 和 4 KiB 对齐 heap；每核 materialize 后
+`heap_next=1024`，使 completion 的 vend 不再是无法区分的 0。kernel 地址
+也不是直接写进 slot：测试先构造真实 `CoreCallable`，把计数函数写进其
+`resolved_addr`，再由 production
+`Runtime::func_id_to_addr_ -> resolve_kernel_addr() -> RingSlot` 解析。
+
+FinalDrain 前要求：
+
+- kernel 调用次数为 0，排除 Submit 或 loser replay 提前执行；
+- shared `committed_tasks==1`，无 fatal；
+- 只有 AIV0 有一个 built task 0 slot，AIC/AIV1 ring 为空；
+- slot 的 func id 和最终函数地址与 callable 一致；
+- 三核 `heap_next==1024`；
+- task 0 的 flag/vend 仍为 0，frontier 仍为 -1；
+- `any_pub==0`，明确本用例没有暗中落入 joint/WonSlot 路径。
+
+随后三个 host 线程分别设置真实 TLS `g_self`，在统一起跑门后各调用一次
+production `dist_submit_drain_to_completion()`。barrier 参数完全采用一个
+block 的 control-plane 推导结果：
+
+```text
+leaf[0].expected = 3
+root.expected    = 1
+```
+
+join 后要求：
+
+- 计数 kernel 恰好执行一次；
+- 三核 ring 全空，task 0 `flag=1`、`vend=1024`、`frontier=0`；
+- shared commit 仍为 1，fatal/error 仍为 0；
+- leaf arrival 为 3，root arrival/release 和 leaf release 都为 1；
+- 其余 final-barrier group 仍为 0；
+- 三线程都返回且没有异常，三个 worker 的 `local_index` 均保持 1。
+
+这证明的是单 lane
+`Build -> FinalDrain execute_slot -> completion -> hierarchical barrier`
+闭环。它没有调用 CPU-sim 的 `dist_aicore_finish_worker()`：当前测试平台的
+`sim_get_reg_base()` 返回空地址，强行验证 COND/done 会引入假寄存器环境。
+若需要锁定 `core_main -> finish_worker -> COND`，应另建入口级集成门槛。
+本例的 barrier expected 也只是按 control-plane 的单 block 规则手工设置，
+所以它验证 FinalDrain 使用这些值，不验证 AICPU 拓扑初始化本身。计数 kernel
+虽然通过真实 callable dispatch，且 slot 中 OUTPUT 描述符必须指向本次 heap
+物化出的 4B buffer，但不会检查实际算子结果；它锁定 exactly-once 和
+completion，不替代 kernel 参数 ABI/数值正确性用例。
+
+#### 刻意不混入 joint/follower
+
+joint task 会额外引入 WonSlot deposit、follower `drain_block_won()`、
+`remaining` 最后一核发布 completion 和 WonSlot 回收。把它塞进本用例后，
+失败时无法判断是 FinalDrain/barrier 还是 follower 协议错误。因此本阶段
+只证明单 lane 正常闭环；joint anchor/follower/last-lane 必须作为下一条
+独立正向门槛，不能用“三核参加了 barrier”冒充 joint 已覆盖。
+
+#### 验证结果
+
+| 检查 | 结果 |
+| --- | --- |
+| multiworker CTest（含 4 类场景） | 100/100 PASS，每次受 15 秒超时保护 |
+| 新单 lane FinalDrain 定向用例 | PASS |
+| GCC15 ASan + UBSan | 4/4 PASS，无报告 |
+| GCC15 TSan | 4/4 PASS，无数据竞态报告 |
+| production / artifact 源码 | 无修改，不产生新的 private/shared 机器码差异 |
+
+TSan 编译明确警告 GCC 的 ThreadSanitizer 不支持
+`__atomic_thread_fence`；因此它只能排查 host 测试中的普通 data race，
+不能替代 A5 的 flush/invalidate、GM atomic 或 memory-order litmus。
+
+本阶段继续复用：
+
+```text
+/tmp/fdwic-r3b-fatal-ut-20260726/
+/tmp/fdwic-r3b-future-sanitize-20260726/
+/tmp/fdwic_ut_tsan/
+```
+
+下一小步先补 joint 的 pending WonSlot、三个 lane 各执行一次、
+`remaining: 3 -> 0` 和 last-lane completion；之后再进入 PA 尾部 INOUT
+region-intent，保持每个协议问题都有独立的失败定位面。

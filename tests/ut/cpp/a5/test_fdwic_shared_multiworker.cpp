@@ -11,13 +11,16 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 // The CPU-sim platform and public runtime types both provide their normal
 // SPIN_WAIT_HINT definitions. Include them first, then replace only this
@@ -31,6 +34,7 @@ namespace fdwic_shared_multiworker_test {
 std::atomic<uint32_t> g_observed_turn_wait_spins{0};
 std::atomic<uint32_t> g_spins_after_remote_fatal{0};
 std::atomic<bool> g_remote_fatal_published{false};
+std::atomic<uint32_t> g_single_lane_kernel_calls{0};
 thread_local bool g_observe_turn_wait = false;
 thread_local bool g_limit_spins_after_remote_fatal = false;
 
@@ -46,6 +50,8 @@ void spin_wait_hint() {
     }
     std::this_thread::yield();
 }
+
+void count_single_lane_kernel(int64_t *) { g_single_lane_kernel_calls.fetch_add(1, std::memory_order_relaxed); }
 
 }  // namespace fdwic_shared_multiworker_test
 
@@ -94,6 +100,16 @@ int32_t built_slot_count(const DistCore &worker) {
     return count;
 }
 
+int32_t occupied_slot_count(const DistCore &worker) {
+    int32_t count = 0;
+    for (int32_t index = 0; index < kPrivateSlots; ++index) {
+        if (worker.slots[index].occupied) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 const RingSlot *find_built_slot(const DistCore &worker, int32_t task_id) {
     for (int32_t index = 0; index < kPrivateSlots; ++index) {
         const RingSlot &slot = worker.slots[index];
@@ -113,11 +129,14 @@ protected:
         fdwic_shared_multiworker_test::g_observed_turn_wait_spins.store(0, std::memory_order_relaxed);
         fdwic_shared_multiworker_test::g_spins_after_remote_fatal.store(0, std::memory_order_relaxed);
         fdwic_shared_multiworker_test::g_remote_fatal_published.store(false, std::memory_order_relaxed);
+        fdwic_shared_multiworker_test::g_single_lane_kernel_calls.store(0, std::memory_order_relaxed);
         g_dist_ptr = &g_dist_fallback;
         dist_shared_tensor_map_reset(g_dist.shared_tensor_map);
 
+        dist_core_reset(*aic_worker_, CoreType::AIC, /*block=*/0, LANE_AIC);
         dist_core_reset(*task0_worker_, CoreType::AIV, /*block=*/0, LANE_AIV0);
         dist_core_reset(*task1_worker_, CoreType::AIV, /*block=*/0, LANE_AIV1);
+        aic_worker_->core_idx = 0;
         task0_worker_->core_idx = 1;
         task1_worker_->core_idx = 2;
         g_self = task0_worker_.get();
@@ -132,6 +151,15 @@ protected:
         g_dist.fatal = 0;
         g_dist.error_code = PTO2_ERROR_NONE;
         g_dist.blocks[0].any_pub = 0;
+        for (int32_t index = 0; index < kPrivateSlots; ++index) {
+            WonSlot &slot = g_dist.blocks[0].slots[index];
+            slot.state.v = kWonStateFree;
+            slot.remaining.v = 0;
+            for (int32_t lane = LANE_AIC; lane <= LANE_AIV1; ++lane) {
+                slot.drained[lane].v = kDrainedClaimed;
+                slot.lane[lane].present = false;
+            }
+        }
         for (int32_t shard = 0; shard < kCursorShards; ++shard) {
             g_dist.cube_cursor[shard].v = -1;
             g_dist.vector_cursor[shard].v = -1;
@@ -149,6 +177,7 @@ protected:
         g_dist.final_barrier.root_arrival.expected = 0;
         g_dist.final_barrier.root_release.v = 0;
         g_fdwic_joint_submit_seen = false;
+        g_skip_exec = false;
     }
 
     void TearDown() override {
@@ -159,6 +188,7 @@ protected:
     }
 
     Runtime runtime_;
+    std::unique_ptr<DistCore> aic_worker_ = std::make_unique<DistCore>();
     std::unique_ptr<DistCore> task0_worker_ = std::make_unique<DistCore>();
     std::unique_ptr<DistCore> task1_worker_ = std::make_unique<DistCore>();
 };
@@ -389,6 +419,158 @@ TEST_F(FdwicSharedMultiworkerTest, RemoteFatalInterruptsIncompleteFinalBarrier) 
     EXPECT_EQ(g_dist.final_barrier.root_arrival.v, 0);
     EXPECT_EQ(g_dist.final_barrier.root_release.v, 0);
     EXPECT_EQ(g_dist.final_barrier.leaf_releases[0].v, 0);
+}
+
+TEST_F(FdwicSharedMultiworkerTest, SingleLaneKernelExecutesOnceAndCompletesThroughThreeWorkerFinalDrain) {
+    constexpr int32_t kKernelId = 23;
+    alignas(PTO2_PACKED_OUTPUT_ALIGN) std::array<uint8_t, 4096> heap{};
+    const uint32_t shape[1] = {1};
+    TensorCreateInfo output_info(shape, 1, DataType::FLOAT32);
+    L0TaskArgs args;
+    args.add_output(output_info);
+
+    const ArgDirection signature[] = {ArgDirection::OUT};
+    std::vector<uint8_t> callable_storage =
+        make_callable<CORE_MAX_TENSOR_ARGS>(signature, 1, nullptr, /*binary_size=*/0);
+    CoreCallable *callable = reinterpret_cast<CoreCallable *>(callable_storage.data());
+    callable->set_resolved_addr(reinterpret_cast<uint64_t>(&fdwic_shared_multiworker_test::count_single_lane_kernel));
+    runtime_.func_id_to_addr_[kKernelId] = reinterpret_cast<uint64_t>(callable);
+
+    g_dist.heap_base = heap.data();
+    g_dist.heap_size = heap.size();
+    g_dist.num_workers = 3;
+    g_dist.num_blocks = 1;
+    g_dist.final_barrier.leaf_arrivals[0].expected = 3;
+    g_dist.final_barrier.root_arrival.expected = 1;
+
+    MixedKernels mixed;
+    mixed.aiv0_kernel_id = kKernelId;
+
+    // All three physical lanes replay task 0. AIV0 wins deterministically;
+    // AIC is ineligible, and AIV1 observes the already-published claim.
+    g_self = task0_worker_.get();
+    const DistCompeteFirstTicket aiv0_ticket = dist_submit_compete_first_begin(nullptr, mixed);
+    (void)dist_submit_compete_first_finish(nullptr, mixed, aiv0_ticket, args);
+
+    g_self = aic_worker_.get();
+    const DistCompeteFirstTicket aic_ticket = dist_submit_compete_first_begin(nullptr, mixed);
+    (void)dist_submit_compete_first_finish(nullptr, mixed, aic_ticket, args);
+
+    g_self = task1_worker_.get();
+    const DistCompeteFirstTicket aiv1_ticket = dist_submit_compete_first_begin(nullptr, mixed);
+    (void)dist_submit_compete_first_finish(nullptr, mixed, aiv1_ticket, args);
+
+    ASSERT_EQ(aiv0_ticket.task_id, 0);
+    ASSERT_EQ(aiv0_ticket.won, 1);
+    ASSERT_EQ(aiv0_ticket.joint, 0);
+    ASSERT_EQ(aic_ticket.task_id, 0);
+    ASSERT_EQ(aic_ticket.won, 0);
+    ASSERT_EQ(aic_ticket.claim_attempted, 0);
+    ASSERT_EQ(aiv1_ticket.task_id, 0);
+    ASSERT_EQ(aiv1_ticket.won, 0);
+    ASSERT_EQ(aiv1_ticket.claim_attempted, 1);
+
+    EXPECT_EQ(fdwic_shared_multiworker_test::g_single_lane_kernel_calls.load(std::memory_order_relaxed), 0);
+    EXPECT_EQ(atomic_load(g_dist.shared_tensor_map.committed_tasks.v), 1);
+    EXPECT_EQ(g_dist.fatal, 0);
+    EXPECT_EQ(g_dist.error_code, PTO2_ERROR_NONE);
+    EXPECT_EQ(g_dist.blocks[0].any_pub, 0);
+    EXPECT_EQ(aic_worker_->local_index, 1);
+    EXPECT_EQ(task0_worker_->local_index, 1);
+    EXPECT_EQ(task1_worker_->local_index, 1);
+    EXPECT_EQ(aic_worker_->heap_next, PTO2_PACKED_OUTPUT_ALIGN);
+    EXPECT_EQ(task0_worker_->heap_next, PTO2_PACKED_OUTPUT_ALIGN);
+    EXPECT_EQ(task1_worker_->heap_next, PTO2_PACKED_OUTPUT_ALIGN);
+    EXPECT_EQ(aic_worker_->occupied_count, 0);
+    ASSERT_EQ(task0_worker_->occupied_count, 1);
+    EXPECT_EQ(task1_worker_->occupied_count, 0);
+    const RingSlot *built = find_built_slot(*task0_worker_, 0);
+    ASSERT_NE(built, nullptr);
+    EXPECT_EQ(built->func_id, kKernelId);
+    EXPECT_EQ(
+        built->function_bin_addr, reinterpret_cast<uint64_t>(&fdwic_shared_multiworker_test::count_single_lane_kernel)
+    );
+    ASSERT_EQ(built->tensor_count, 1);
+    EXPECT_EQ(built->tensors[0].buffer.addr, reinterpret_cast<uint64_t>(heap.data()));
+    EXPECT_EQ(built->tensors[0].buffer.size, sizeof(float));
+    EXPECT_EQ(task_cell(0).flag, 0);
+    EXPECT_EQ(task_cell(0).vend, 0);
+    EXPECT_EQ(g_dist.frontier, -1);
+
+    std::atomic<uint32_t> ready_count{0};
+    std::atomic<bool> start_drain{false};
+    std::atomic<bool> aic_returned{false};
+    std::atomic<bool> aiv0_returned{false};
+    std::atomic<bool> aiv1_returned{false};
+    std::exception_ptr aic_error;
+    std::exception_ptr aiv0_error;
+    std::exception_ptr aiv1_error;
+
+    auto drain_worker = [&](DistCore *worker, std::atomic<bool> &returned, std::exception_ptr &error) {
+        g_self = worker;
+        ready_count.fetch_add(1, std::memory_order_release);
+        while (!start_drain.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        try {
+            dist_submit_drain_to_completion(worker);
+        } catch (...) {
+            error = std::current_exception();
+        }
+        returned.store(true, std::memory_order_release);
+        g_self = nullptr;
+    };
+
+    std::thread aic_thread(drain_worker, aic_worker_.get(), std::ref(aic_returned), std::ref(aic_error));
+    std::thread aiv0_thread(drain_worker, task0_worker_.get(), std::ref(aiv0_returned), std::ref(aiv0_error));
+    std::thread aiv1_thread(drain_worker, task1_worker_.get(), std::ref(aiv1_returned), std::ref(aiv1_error));
+
+    const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (ready_count.load(std::memory_order_acquire) != 3 && std::chrono::steady_clock::now() < ready_deadline) {
+        std::this_thread::yield();
+    }
+    const bool all_workers_ready = ready_count.load(std::memory_order_acquire) == 3;
+    start_drain.store(true, std::memory_order_release);
+    aic_thread.join();
+    aiv0_thread.join();
+    aiv1_thread.join();
+
+    EXPECT_TRUE(all_workers_ready);
+    EXPECT_TRUE(aic_returned.load(std::memory_order_acquire));
+    EXPECT_TRUE(aiv0_returned.load(std::memory_order_acquire));
+    EXPECT_TRUE(aiv1_returned.load(std::memory_order_acquire));
+    EXPECT_EQ(aic_error, nullptr);
+    EXPECT_EQ(aiv0_error, nullptr);
+    EXPECT_EQ(aiv1_error, nullptr);
+
+    EXPECT_EQ(fdwic_shared_multiworker_test::g_single_lane_kernel_calls.load(std::memory_order_relaxed), 1);
+    EXPECT_EQ(aic_worker_->occupied_count, 0);
+    EXPECT_EQ(task0_worker_->occupied_count, 0);
+    EXPECT_EQ(task1_worker_->occupied_count, 0);
+    EXPECT_EQ(occupied_slot_count(*aic_worker_), 0);
+    EXPECT_EQ(occupied_slot_count(*task0_worker_), 0);
+    EXPECT_EQ(occupied_slot_count(*task1_worker_), 0);
+    EXPECT_EQ(built_slot_count(*aic_worker_), 0);
+    EXPECT_EQ(built_slot_count(*task0_worker_), 0);
+    EXPECT_EQ(built_slot_count(*task1_worker_), 0);
+    EXPECT_EQ(aic_worker_->local_index, 1);
+    EXPECT_EQ(task0_worker_->local_index, 1);
+    EXPECT_EQ(task1_worker_->local_index, 1);
+    EXPECT_EQ(task_cell(0).flag, 1);
+    EXPECT_EQ(task_cell(0).vend, PTO2_PACKED_OUTPUT_ALIGN);
+    EXPECT_EQ(g_dist.frontier, 0);
+    EXPECT_EQ(atomic_load(g_dist.shared_tensor_map.committed_tasks.v), 1);
+    EXPECT_EQ(g_dist.fatal, 0);
+    EXPECT_EQ(g_dist.error_code, PTO2_ERROR_NONE);
+
+    EXPECT_EQ(g_dist.final_barrier.leaf_arrivals[0].v, 3);
+    EXPECT_EQ(g_dist.final_barrier.root_arrival.v, 1);
+    EXPECT_EQ(g_dist.final_barrier.root_release.v, 1);
+    EXPECT_EQ(g_dist.final_barrier.leaf_releases[0].v, 1);
+    for (int32_t group = 1; group < kFinalBarrierGroups; ++group) {
+        EXPECT_EQ(g_dist.final_barrier.leaf_arrivals[group].v, 0);
+        EXPECT_EQ(g_dist.final_barrier.leaf_releases[group].v, 0);
+    }
 }
 
 }  // namespace
