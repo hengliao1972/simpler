@@ -74,7 +74,7 @@ echo "[BUILD] atomic PollBatch boundary self-test"
     "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID" \
     -DPA_BUILD_SWIMLANE=1 \
     -I"$ROOT_DIR/common" \
-    "$ROOT_DIR/common/test_atomic_poll_batch.cpp" \
+    "$ROOT_DIR/test/test_atomic_poll_batch.cpp" \
     -o "$BUILD_DIR/test_atomic_poll_batch"
 
 echo "[TEST] atomic PollBatch boundary self-test"
@@ -90,7 +90,7 @@ if [[ "$TENSORMAP_MODE" == "private" ]]; then
         -DPTO_FDWIC_SHARED_MAP=0 \
         -DPA_BUILD_SWIMLANE=1 \
         -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/common/test_private_tensor_map_ring.cpp" \
+        "$ROOT_DIR/test/test_private_tensor_map_ring.cpp" \
         -o "$BUILD_DIR/test_private_tensor_map_ring"
 
     echo "[TEST] private TensorMap ring self-test"
@@ -101,7 +101,7 @@ else
         -DPTO_FDWIC_SHARED_MAP=1 \
         -DPA_BUILD_SWIMLANE=1 \
         -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/common/test_shared_tensor_map_ring.cpp" \
+        "$ROOT_DIR/test/test_shared_tensor_map_ring.cpp" \
         -o "$BUILD_DIR/test_shared_tensor_map_ring"
 
     echo "[TEST] isolated shared ordinary-region ring self-test"
@@ -114,7 +114,7 @@ else
     "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \
         -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/common/test_shared_prepare_map_trace.cpp" \
+        "$ROOT_DIR/test/test_shared_prepare_map_trace.cpp" \
         -o "$BUILD_DIR/test_shared_prepare_map_trace"
 
     echo "[TEST] shared PrepareMap raw-marker self-test"
@@ -129,7 +129,7 @@ else
         -DPTO_FDWIC_SHARED_MAP=1 \
         -DPA_BUILD_SWIMLANE=1 \
         -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/common/test_shared_output_symbols.cpp" \
+        "$ROOT_DIR/test/test_shared_output_symbols.cpp" \
         -o "$BUILD_DIR/test_shared_output_symbols"
 
     echo "[TEST] shared-output symbol self-test"
@@ -142,7 +142,7 @@ else
         -DPTO_FDWIC_SHARED_MAP=1 \
         -DPA_BUILD_SWIMLANE=1 \
         -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/common/test_shared_heap_reserve.cpp" \
+        "$ROOT_DIR/test/test_shared_heap_reserve.cpp" \
         -o "$BUILD_DIR/test_shared_heap_reserve"
 
     echo "[TEST] shared heap no-wrap reserve self-test"
@@ -156,7 +156,7 @@ else
         -DPTO_FDWIC_SHARED_MAP=1 \
         -DPA_BUILD_SWIMLANE=1 \
         -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/common/test_shared_vector_claim_cursor.cpp" \
+        "$ROOT_DIR/test/test_shared_vector_claim_cursor.cpp" \
         -o "$BUILD_DIR/test_shared_vector_claim_cursor"
 
     echo "[TEST] shared Vector Claim cursor self-test"
@@ -170,7 +170,7 @@ else
         -DPTO_FDWIC_SHARED_MAP=1 \
         -DPA_BUILD_SWIMLANE=1 \
         -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/common/test_shared_materialize.cpp" \
+        "$ROOT_DIR/test/test_shared_materialize.cpp" \
         -o "$BUILD_DIR/test_shared_materialize"
 
     echo "[TEST] shared winner materialize self-test"
@@ -185,7 +185,7 @@ else
         -DPA_BUILD_SWIMLANE=1 \
         -DPA_COMPETE_FIRST_SPLIT_FINISH=1 \
         -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/common/test_shared_loser_finish.cpp" \
+        "$ROOT_DIR/test/test_shared_loser_finish.cpp" \
         -o "$BUILD_DIR/test_shared_loser_finish"
 
     echo "[TEST] shared split-finish loser protected-args self-test"

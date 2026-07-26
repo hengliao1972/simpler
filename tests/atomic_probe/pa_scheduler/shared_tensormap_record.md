@@ -4165,8 +4165,8 @@ RingBp 和 CAS retry 均为 0，依赖签名固定
 
 S4.16a/S4.16b 的源码、ABI 和测试已整体撤销。回退后对
 `common/pa_model.h`、`common/host_support.h`、
-`common/test_shared_tensor_map_ring.cpp`、
-`common/test_shared_vector_claim_cursor.cpp` 和 `cpu/build.sh` 执行
+`test/test_shared_tensor_map_ring.cpp`、
+`test/test_shared_vector_claim_cursor.cpp` 和 `cpu/build.sh` 执行
 `git diff --exit-code 319077a9 -- ...` 无差异，当前恢复：
 
 ```text
