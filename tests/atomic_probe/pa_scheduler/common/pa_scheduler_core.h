@@ -843,13 +843,14 @@ PA_DEVICE bool WaitForSharedOutputPublished(
     }
 }
 
-template <typename Ops>
+template <typename Ops, bool ChainedWriter = false>
 PA_DEVICE uint32_t CollectSharedFanin(
     PA_GM SharedTensorMapSidecar &map, const TaskArgs &args,
     int32_t task_id, int32_t heap_window, LocalStats &stats,
     int32_t fanin[kMaxFanin], bool &protocol_ok,
     uint32_t &ordinary_lookup_count,
-    PA_GM volatile int32_t *fatal = nullptr
+    PA_GM volatile int32_t *fatal = nullptr,
+    int32_t expected_shared_writer = -1
 ) {
     protocol_ok = true;
     ordinary_lookup_count = 0;
@@ -864,8 +865,8 @@ PA_DEVICE uint32_t CollectSharedFanin(
     uint32_t validated_ordinary_lookups = 0;
     uint32_t validated_input_loads = 0;
 
-    // 第一遍只读取并校验，不修改 last_writer、payload、统计或输出 fanin。
-    // 后续引用即使非法，也不会让前面的合法 INOUT 留下半次提交。
+    // 只读取并校验，不修改 last_writer、统计或输出 fanin。INOUT writer
+    // 仍在 Build 成功后提交；后续引用非法时不会留下半次 writer 更新。
     for (int32_t index = 0; index < args.tensor_count; ++index) {
         const TensorArgType tag =
             TaskTag(args, static_cast<uint32_t>(index));
@@ -923,19 +924,26 @@ PA_DEVICE uint32_t CollectSharedFanin(
                     }
                 }
             }
-            const int64_t writer =
-                Ops::Load(&cell.last_writer[output_ref.output_slot].value);
-            // PA Case1 中每个 fresh symbol 只有一个后继 writer；INPUT 与
-            // INOUT 都必须仍指向句柄声明的原 producer。解析阶段只读取，
-            // 不能提前把“准备执行”冒充成“writer 已提交”。
-            if (writer != output_ref.producer_task_id) {
+            // 默认实例保持单组 PA 原协议：writer 必须精确等于 descriptor
+            // producer。只有显式实例化 ChainedWriter 的多组 UP 才允许
+            // descriptor identity 不变、writer 精确等于调用者给出的前一
+            // UP；不能用“任意较早 task”掩盖跳级或陈旧 writer。
+            const int32_t expected_writer =
+                ChainedWriter
+                    ? expected_shared_writer
+                    : output_ref.producer_task_id;
+            if (expected_writer < output_ref.producer_task_id ||
+                expected_writer >= task_id) {
                 protocol_ok = false;
                 return 0;
             }
-            AddFanin(
-                validated_fanin, validated_count,
-                output_ref.producer_task_id
-            );
+            const int64_t writer =
+                Ops::Load(&cell.last_writer[output_ref.output_slot].value);
+            if (writer != expected_writer) {
+                protocol_ok = false;
+                return 0;
+            }
+            AddFanin(validated_fanin, validated_count, writer);
             if (tag == TensorArgType::Input) {
                 ++validated_input_loads;
             }
@@ -1000,8 +1008,7 @@ PA_DEVICE uint32_t CollectSharedFanin(
     }
 
     // 全部引用只读校验通过后，才一次性发布统计与 fanin 结果。INPUT 次数
-    // 在验证扫描中先落局部量，既保留 late-failure 的 all-or-nothing，
-    // 又不为删除 payload scratch 后的空操作再扫一遍全部 tensor。
+    // 在验证扫描中先落局部量，保留 late-failure 的 all-or-nothing 口径。
     stats.result.shared_symbol_input_loads += validated_input_loads;
     ordinary_lookup_count = validated_ordinary_lookups;
     for (uint32_t edge = 0; edge < validated_count; ++edge) {
@@ -1010,15 +1017,81 @@ PA_DEVICE uint32_t CollectSharedFanin(
     return validated_count;
 }
 
-// 只有任务的本地执行状态已经成功建立后，才提交它消费的 INOUT writer。
-// FetchMax 返回旧 writer；PA Case1 要求旧值精确等于句柄 producer。异常
-// 旧值即使被 FetchMax 推进也不回滚：该 RMW 已经线性化，多 symbol 提交
-// 不是事务，伪造负向 RMW 会抹掉故障现场。调用者随后广播 fatal，整个调度
-// 不再继续消费该状态。
 template <typename Ops>
+PA_DEVICE bool PublishSharedWriterReady(
+    PA_GM SchedulerState *state, int32_t task_id
+) {
+    if (state == nullptr || task_id < 0 ||
+        task_id >= static_cast<int32_t>(kMaxTasks)) {
+        return false;
+    }
+    // 三个 INOUT writer 的登记必须先于门值对 loser 可见；本 task 是否
+    // 已经执行完成仍由它自己的 completion flag 表达，不能把
+    // deps_prepared 冒充成可执行/已完成。Exchange 的旧值只能是初始化
+    // sentinel；重复 winner 或错误 task-cell 复用保留现场并终止整轮。
+    Ops::StoreBarrier();
+    return Ops::Exchange(
+               &state->tasks[static_cast<uint32_t>(task_id)].deps_prepared,
+               static_cast<int64_t>(task_id)
+           ) == -1;
+}
+
+template <typename Ops>
+PA_DEVICE bool WaitForSharedWriterReady(
+    PA_GM SchedulerState *state, int32_t task_id, LocalStats &stats
+) {
+    if (state == nullptr || task_id < 0 ||
+        task_id >= static_cast<int32_t>(kMaxTasks)) {
+        return false;
+    }
+    PA_GM volatile int64_t *prepared =
+        &state->tasks[static_cast<uint32_t>(task_id)].deps_prepared;
+    int64_t observed = Ops::Load(prepared);
+    if (observed == task_id) {
+        return true;
+    }
+    if (observed != -1) {
+        SetFatal<Ops>(state, stats, task_id);
+        return false;
+    }
+
+    const uint64_t begin = Ops::Now();
+    uint32_t polls = 0;
+    while (true) {
+        Ops::SpinHint();
+        observed = Ops::Load(prepared);
+        if (observed == task_id) {
+            return true;
+        }
+        if (observed != -1) {
+            SetFatal<Ops>(state, stats, task_id);
+            return false;
+        }
+        ++polls;
+        if ((polls & 1023U) != 0) {
+            continue;
+        }
+        if (IsFatal<Ops>(state, stats, task_id)) {
+            return false;
+        }
+        if (Ops::Now() - begin > kWatchdogTicks) {
+            SetFatal<Ops>(state, stats, task_id);
+            return false;
+        }
+    }
+}
+
+// 只有任务的本地执行状态已经成功建立后，才提交它消费的 INOUT writer。
+// FetchMax 返回旧 writer；默认实例要求精确等于 descriptor producer，
+// 显式 ChainedWriter 实例则要求精确等于调用方给出的前一 writer。
+// 异常旧值即使被 FetchMax 推进也不回滚：该 RMW 已经线性化，多 symbol
+// 提交不是事务，伪造负向 RMW 会抹掉故障现场。调用者随后广播 fatal，
+// 整个调度不再继续消费该状态。
+template <typename Ops, bool ChainedWriter = false>
 PA_DEVICE bool CommitSharedFaninWriters(
     PA_GM SharedTensorMapSidecar &map, const TaskArgs &args,
-    int32_t task_id, LocalStats &stats
+    int32_t task_id, LocalStats &stats,
+    int32_t expected_shared_writer = -1
 ) {
     if (args.tensor_count < 0 ||
         args.tensor_count > static_cast<int32_t>(kMaxTaskTensors)) {
@@ -1042,6 +1115,14 @@ PA_DEVICE bool CommitSharedFaninWriters(
             output_ref.producer_task_id >= task_id) {
             return false;
         }
+        const int32_t expected_writer =
+            ChainedWriter
+                ? expected_shared_writer
+                : output_ref.producer_task_id;
+        if (expected_writer < output_ref.producer_task_id ||
+            expected_writer >= task_id) {
+            return false;
+        }
         uint64_t retries = 0;
         const int64_t observed = Ops::FetchMax(
             &map.shared_outputs[
@@ -1050,7 +1131,7 @@ PA_DEVICE bool CommitSharedFaninWriters(
             static_cast<int64_t>(task_id), retries
         );
         stats.result.cas_retries += retries;
-        if (observed != output_ref.producer_task_id) {
+        if (observed != expected_writer) {
             return false;
         }
         ++stats.result.shared_symbol_inout_commits;

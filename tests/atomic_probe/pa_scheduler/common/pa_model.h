@@ -676,13 +676,28 @@ static_assert(sizeof(AtomicFlagLine) == 64, "AtomicFlagLine must occupy one cach
 struct alignas(64) TaskCell {
     volatile int64_t flag;
     volatile uint64_t vend;
+#if PTO_FDWIC_SHARED_MAP
+    // shared writer-ready 发布门：winner 完成“读取旧 writer → 登记本
+    // task 为新 writer”后写入 task_id；同 task 的 loser 必须等到该值，
+    // 才能继续构造后继 task。复用真实 DistTaskCell 的第三个 8B 字段，
+    // 不改变 64B task-cell ABI 或后续生产字段偏移。
+    volatile int64_t deps_prepared;
+    uint8_t padding[64 - 3 * sizeof(int64_t)];
+#else
     uint8_t padding[64 - 2 * sizeof(int64_t)];
+#endif
 };
 // flag 是两种模式的依赖就绪发布位；vend 是该 task 完成时 worker 的 heap
 // 快照。private 还用 flag 连续推进 frontier，并由 HeapGuard 读取
 // frontier-H 对应 vend 判断环形 heap 是否可覆盖；shared no-wrap 中 vend
 // 只是 aggregate-vend 快照，flag 只服务 fanin/slot，均不参与 heap 回收。
 static_assert(sizeof(TaskCell) == 64, "TaskCell must occupy one cache line");
+#if PTO_FDWIC_SHARED_MAP
+static_assert(
+    offsetof(TaskCell, deps_prepared) == 16,
+    "shared task dependency-intent offset mismatch"
+);
+#endif
 
 // TensorDesc 保留真实 Tensor 的两条 64-byte 数据线。owner_task_id 表达显式生产者，
 // buffer_addr + 字节区间用于 TensorMap 发现同一 backing buffer 上的读写依赖。

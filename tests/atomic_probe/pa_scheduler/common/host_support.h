@@ -256,6 +256,9 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     // -1 表示“尚无可消费 descriptor”。TensorDesc 区已由上方 memset 清零；
     // 不对 task_id 取模，避免在本阶段提前引入 generation 语义。
     for (uint32_t task_id = 0; task_id < kMaxTasks; ++task_id) {
+        // task 表位于 production prefix，前面的 memset 会把该字段清零；
+        // shared 协议必须用 -1 区分“尚未准备”与 task 0 已发布。
+        state->tasks[task_id].deps_prepared = -1;
         for (uint32_t slot = 0; slot < kSharedOutputMaxPerTask; ++slot) {
             state->shared_map.shared_outputs[task_id].published[slot].value = -1;
             state->shared_map.shared_outputs[task_id].last_writer[slot].value = -1;
@@ -1935,6 +1938,14 @@ inline Metrics Validate(
     }
 #if PTO_FDWIC_SHARED_MAP
     bool shared_heap_state_ok = shared_heap_capacity_ok;
+    // 当前 Case1 每个 batch 只有一个 block group；没有后继 group，就不应
+    // 触发 shared writer-ready gate。host 只在 kernel 完成后读取该状态，
+    // 不给设备热路增加任何观察字段或 atomic。
+    bool shared_writer_gates_idle = true;
+    for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
+        shared_writer_gates_idle &=
+            state.tasks[task_id].deps_prepared == -1;
+    }
     uint64_t actual_shared_cursor_sum = 0;
     uint64_t expected_shared_cursor_sum = 0;
     for (uint32_t shard = 0; shard < kSharedHeapShards; ++shard) {
@@ -2409,6 +2420,11 @@ inline Metrics Validate(
     Expect(
         state.frontier.value == -1,
         "shared no-wrap frontier remains at its initial value", &metrics
+    );
+    Expect(
+        shared_writer_gates_idle,
+        "single-group PA leaves every shared writer-ready gate untouched",
+        &metrics
     );
 #else
     Expect(

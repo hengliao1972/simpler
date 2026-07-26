@@ -4871,3 +4871,86 @@ AIC/AIV 合计分别为 5/4/4/4，17 条 direct 记录的 return-ready 比例均
 S5.2a 只关闭 review 中的 shared heap 漏采。`published` 快速 probe/等待、
 publication Exchange、`last_writer` load/init/commit 仍是下一小步；
 在它们接入前不能宣称 shared atomic 已全量覆盖。
+
+### 2026-07-26：S6.1 建立 shared 多级 writer 原语，保持现有单组热路不变
+
+本阶段处理 PA 正确性边界：如果同一个 accumulator 经过
+`producer -> UP0(INOUT) -> UP1(INOUT)`，UP0 winner 必须先完成
+fanin 解析和 writer intent 登记；同 task 的 loser 在 writer-ready 发布
+前不能返回，否则它可能提前构造 UP1，并把陈旧 producer 当作前驱。
+`deps_prepared` 只表示依赖 writer 已登记，不表示 UP0 已执行或完成；
+UP1 仍必须通过 fanin 等待 UP0 自己的 completion flag。
+
+先澄清现有 Case1 的覆盖范围。`batches=256` 表示 256 条相互独立的
+五 task 链：
+
+```text
+Alloc -> QK -> SF -> PV -> UP
+```
+
+它不是同一 batch 内的 256 个 block group；每条链的 UP 后没有继续消费
+同一 accumulator 的第二个 UP。因此原 B256 不需要执行 writer-ready
+atomic，也不能用其通过来证明多级 writer 正确性。private TensorMap 更
+没有 shared output cell/`last_writer` 协议，这个问题不属于 private。
+
+本次先在 shared-only common 代码建立四项公共基础：
+
+1. 复用 shared `TaskCell` 的 64B 内部 padding，在 offset 16 放置
+   `deps_prepared`；整个 cell 大小和后续生产字段偏移不变，private
+   预处理结果仍是原来的 `flag + vend + padding`。
+2. `PublishSharedWriterReady()` 在 writer intent 登记后执行 store barrier，再
+   把精确 task id 从 `-1` 发布到本 task 独占门；重复发布 fail-closed。
+3. `WaitForSharedWriterReady()` 只接受 `-1` 或精确 task id，并保留
+   fatal/watchdog；错误值和超时均终止，不能把任意非负值当 ready。
+4. `CollectSharedFanin`、`CommitSharedFaninWriters` 增加编译期
+   `ChainedWriter` 实例。默认实例继续要求 writer 精确等于 descriptor
+   producer；只有显式多级实例才要求 writer 精确等于调用方给出的前一
+   writer。范围内但不是前一 writer 的陈旧值也必须拒绝。
+
+定向 CPU 用例构造三个共享 accumulator 加一个 `manual_dep` output view，
+验证第一阶段的三个 INOUT writer 提交、loser 在门发布前确实阻塞、门发布
+后返回、第二阶段把三个相同前驱去重为一条 fanin、第二次 writer 提交以及
+陈旧 writer 拒绝。这里的 `second_up=8` 是协议原语测试 id，不冒充当前
+主拓扑中的真实 `TaskKind::Up`；真实双 group 调度仍需下一阶段泛化 task
+拓扑后覆盖。
+
+一版过程草案曾提前把 `PaHasFollowingBlockGroup`、ticket byte 和
+winner/loser gate 分支接入现有 Submit。虽然 Case1 中条件恒假，CCEC
+shared perf-clock 最终 ELF 的 `.text` 仍从 129,080B 增到 129,592B，
+无收益地增加 512B。该草案已经撤回。最终阶段只保留 shared ABI/原语和
+协议测试，不让单组 B256 为未来拓扑执行恒假分支；重新构建后 `.text`
+恢复 129,080B、`.rodata` 保持 288B。detached HEAD 与最终候选重建件
+的 `.text` 段 SHA256 还同为 `90f58e...fd26`，`.rodata` 同为
+`239e99...2ded`，证明不只是尺寸碰巧相同，而是现有 single-group
+shared 性能代码段逐字节不变。
+
+当前验证：
+
+| 项目 | 结果 |
+| --- | --- |
+| CPU shared 全部严格告警定向测试 | PASS |
+| CPU private 全部严格告警定向测试 | PASS |
+| CPU shared b1 real-compute 全部业务/协议断言 | PASS |
+| shared b1 的 5 个 `deps_prepared` 均保持 `-1` | PASS |
+| CCEC shared perf-clock 构建、split finish、混合 ELF 与 manifest | PASS |
+| CCEC shared perf-clock `.text/.rodata` | 129,080B / 288B |
+| `git diff --check` | PASS |
+
+private 的“无影响”另做了 HEAD/候选逐段对照，而不是只看用例通过：
+
+- private CPU `main.cpp` 在相同宏下的预处理输出逐字节相同，均为
+  1,441,443B，SHA256 均为 `09d35006...c013693`；最终可执行文件也
+  逐字节相同，`.text=134,616B`、`.rodata=11,984B`，两段 hash 各自
+  完全一致。
+- private CCEC/swimlane 的 AIC、AIV、两份 finish、两份 runtime 和最终
+  mixed kernel 共七个对象，其 `.text/.rodata` 大小与段字节 hash 全部
+  一致。最终 mixed kernel 为 `.text=590,392B`、`.rodata=696B`。
+- CCEC device `.o` 的整文件 hash 会因 DWARF 内嵌工作树路径和新增
+  shared-only 源码推移调试行号而不同；这不是 private 指令变化，不能拿
+  manifest 的整对象 hash 代替代码段对照。CCEC host 整文件则仍逐字节
+  相同。
+
+下一阶段必须先生成真实的同 batch 双 block-group 拓扑，再把
+writer-ready gate 接到非末组 UP 的 winner/loser Submit，并让下一组
+显式传入前一 UP task id。届时需要新增调度级 CPU/CCEC/A5 正确性用例；
+在此之前不能把本阶段描述成“真实 PA 双组已跑通”。

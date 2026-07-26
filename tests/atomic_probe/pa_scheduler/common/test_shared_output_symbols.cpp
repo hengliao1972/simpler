@@ -446,9 +446,9 @@ void TestPublishAndResolve() {
         "successful INOUT writer commit is counted"
     );
 
-    // PA Case1 的 fresh symbol 不存在 A -> B(INOUT) -> C(INPUT) 链。
-    // writer 已从 producer 改成唯一 UP consumer 后，任何后继复用同一
-    // producer handle 都必须 fail-closed，不能脑补成通用 generation 链。
+    // descriptor identity 仍指向最初 producer，但后继必须依赖最近一次
+    // 已提交的 INOUT writer。writer-ready gate 负责阻止 loser 在该提交
+    // 之前进入后继；resolver 本身据 last_writer 返回精确的新依赖。
     TaskArgs successor_args;
     ConstructTaskArgs(successor_args);
     AppendSharedOutputRef(
@@ -459,19 +459,198 @@ void TestPublishAndResolve() {
     int32_t successor_fanin[kMaxFanin] = {};
     protocol_ok = false;
     ordinary_lookups = UINT32_MAX;
-    const uint32_t successor_count = CollectSharedFanin<SymbolTestOps>(
+    const uint32_t successor_count = CollectSharedFanin<SymbolTestOps, true>(
         *map, successor_args, 3, kHeapWindow,
-        successor_stats, successor_fanin, protocol_ok, ordinary_lookups
+        successor_stats, successor_fanin, protocol_ok, ordinary_lookups,
+        nullptr, 2
     );
-    Check(!protocol_ok, "post-INOUT successor is outside the Case1 symbol contract");
+    Check(protocol_ok, "post-INOUT successor resolves the same shared descriptor");
     Check(
-        successor_count == 0,
-        "unsupported writer chain publishes no successor fanin"
+        successor_count == 1 && successor_fanin[0] == 2,
+        "post-INOUT successor depends on the latest writer"
     );
     Check(
         SymbolTestOps::now_calls.load(std::memory_order_relaxed) == 0,
         "already-published symbol fast path never reads the watchdog clock"
     );
+}
+
+void TestWriterReadyGateSerializesTwoWriterStages() {
+    SchedulerState *state = MapSparseSchedulerState();
+    if (state == nullptr) {
+        ++g_failures;
+        return;
+    }
+    ResetSharedState(state->shared_map);
+    state->fatal.value = 0;
+    constexpr int32_t first_up = 4;
+    constexpr int32_t second_up = 8;
+    state->tasks[first_up].deps_prepared = -1;
+
+    TensorDesc descriptors[3] = {
+        MakeTensor(0x310000000ULL, 0),
+        MakeTensor(0x310001000ULL, 0),
+        MakeTensor(0x310002000ULL, 0),
+    };
+    for (uint32_t slot = 0; slot < 3; ++slot) {
+        SharedOutputCell &cell = state->shared_map.shared_outputs[0];
+        cell.published[slot].value = 0;
+        cell.last_writer[slot].value = 0;
+        cell.tensors[slot] = descriptors[slot];
+    }
+
+    TensorDesc manual_output = MakeTensor(0x320000000ULL, 0);
+    manual_output.manual_dep = true;
+    TaskArgs first_args;
+    ConstructTaskArgs(first_args);
+    TaskArgs second_args;
+    ConstructTaskArgs(second_args);
+    for (uint32_t slot = 0; slot < 3; ++slot) {
+        const FdwicOutputRef reference{
+            0, static_cast<int16_t>(slot), 0, 0, 0, 0,
+        };
+        AppendSharedOutputRef(first_args, reference, TensorArgType::Inout);
+        AppendSharedOutputRef(second_args, reference, TensorArgType::Inout);
+    }
+    AddLocalTensor(first_args, manual_output, TensorArgType::Inout);
+    AddLocalTensor(second_args, manual_output, TensorArgType::Inout);
+
+    std::atomic<bool> waiter_finished{false};
+    bool waiter_ok = false;
+    LocalStats waiter_stats{};
+    SymbolTestOps::wait_address = &state->tasks[first_up].deps_prepared;
+    SymbolTestOps::wait_loads.store(0, std::memory_order_relaxed);
+    std::thread loser([&]() {
+        waiter_ok = WaitForSharedWriterReady<SymbolTestOps>(
+            state, first_up, waiter_stats
+        );
+        waiter_finished.store(true, std::memory_order_release);
+    });
+    while (SymbolTestOps::wait_loads.load(std::memory_order_acquire) == 0) {
+        std::this_thread::yield();
+    }
+    for (uint32_t spin = 0; spin < 1024; ++spin) {
+        std::this_thread::yield();
+    }
+    Check(
+        !waiter_finished.load(std::memory_order_acquire),
+        "UP loser cannot return before the winner publishes writer-ready"
+    );
+
+    LocalStats first_stats{};
+    Check(
+        CommitSharedFaninWriters<SymbolTestOps>(
+            state->shared_map, first_args, first_up, first_stats
+        ),
+        "first UP commits all three accumulator writers"
+    );
+    Check(
+        PublishSharedWriterReady<SymbolTestOps>(state, first_up),
+        "first UP publishes writer-ready after its commits"
+    );
+    loser.join();
+    SymbolTestOps::wait_address = nullptr;
+    Check(waiter_ok, "UP loser observes the exact writer-ready task id");
+    Check(
+        waiter_finished.load(std::memory_order_acquire),
+        "UP loser returns after writer-ready publication"
+    );
+    Check(
+        !PublishSharedWriterReady<SymbolTestOps>(state, first_up),
+        "duplicate writer-ready publication fails closed"
+    );
+    constexpr int32_t wrong_gate_task = 5;
+    state->tasks[wrong_gate_task].deps_prepared = first_up;
+    LocalStats wrong_gate_stats{};
+    Check(
+        !WaitForSharedWriterReady<SymbolTestOps>(
+            state, wrong_gate_task, wrong_gate_stats
+        ) && state->fatal.value == 1,
+        "writer-ready wait rejects a different task id and broadcasts fatal"
+    );
+    state->fatal.value = 0;
+    constexpr int32_t timeout_gate_task = 6;
+    state->tasks[timeout_gate_task].deps_prepared = -1;
+    ExpiredWaitOps::calls.store(0, std::memory_order_relaxed);
+    LocalStats timeout_gate_stats{};
+    Check(
+        !WaitForSharedWriterReady<ExpiredWaitOps>(
+            state, timeout_gate_task, timeout_gate_stats
+        ) && state->fatal.value == 1,
+        "writer-ready wait times out and broadcasts fatal"
+    );
+    state->fatal.value = 0;
+
+    LocalStats second_stats{};
+    int32_t second_fanin[kMaxFanin] = {};
+    bool protocol_ok = false;
+    uint32_t ordinary_lookups = UINT32_MAX;
+    const uint32_t fanin_count = CollectSharedFanin<SymbolTestOps, true>(
+        state->shared_map, second_args, second_up, kHeapWindow,
+        second_stats, second_fanin, protocol_ok, ordinary_lookups,
+        nullptr, first_up
+    );
+    Check(protocol_ok, "second UP resolves all three rewritten accumulators");
+    Check(
+        fanin_count == 1 && second_fanin[0] == first_up,
+        "second UP deduplicates three refs to the immediately preceding UP"
+    );
+    Check(
+        ordinary_lookups == 0,
+        "manual output view stays outside shared ordinary-region intent"
+    );
+    Check(
+        CommitSharedFaninWriters<SymbolTestOps, true>(
+            state->shared_map, second_args, second_up, second_stats,
+            first_up
+        ),
+        "second UP commits over the first UP writer"
+    );
+    Check(
+        state->shared_map.shared_outputs[0].last_writer[0].value == second_up &&
+            state->shared_map.shared_outputs[0].last_writer[1].value == second_up &&
+            state->shared_map.shared_outputs[0].last_writer[2].value == second_up,
+        "all accumulator writers finish at the second UP"
+    );
+    Check(
+        first_stats.result.shared_symbol_inout_commits == 3 &&
+            second_stats.result.shared_symbol_inout_commits == 3,
+        "two writer stages commit exactly three shared writers each"
+    );
+    LocalStats invalid_expected_stats{};
+    Check(
+        !CommitSharedFaninWriters<SymbolTestOps, true>(
+            state->shared_map, second_args, 12, invalid_expected_stats, -1
+        ),
+        "chained commit rejects an invalid expected writer before mutation"
+    );
+    Check(
+        state->shared_map.shared_outputs[0].last_writer[0].value == second_up &&
+            state->shared_map.shared_outputs[0].last_writer[1].value == second_up &&
+            state->shared_map.shared_outputs[0].last_writer[2].value == second_up,
+        "invalid expected writer leaves every accumulator unchanged"
+    );
+
+    // 这里先验证可复用协议原语，并不把 second_up=8 冒充成当前主拓扑的
+    // TaskKind::Up（主拓扑仍是每 batch 五 task）。故意把三个 writer
+    // 回退为其他较早 task，确认多组实例只接受调用者指定的前一 UP。
+    for (uint32_t slot = 0; slot < 3; ++slot) {
+        state->shared_map.shared_outputs[0].last_writer[slot].value = first_up - 1;
+    }
+    LocalStats stale_stats{};
+    int32_t stale_fanin[kMaxFanin] = {};
+    protocol_ok = true;
+    ordinary_lookups = UINT32_MAX;
+    Check(
+        CollectSharedFanin<SymbolTestOps, true>(
+            state->shared_map, second_args, second_up, kHeapWindow,
+            stale_stats, stale_fanin, protocol_ok, ordinary_lookups,
+            nullptr, first_up
+        ) == 0 && !protocol_ok,
+        "chained resolver rejects a stale writer instead of skipping a stage"
+    );
+
+    UnmapSparseSchedulerState(state);
 }
 
 void TestWriterCommitFailuresKeepTerminalEvidence() {
@@ -1285,6 +1464,7 @@ void TestInvalidReferencesFailClosed() {
 int main() {
     TestSharedCompletionPublishesWithoutFrontier();
     TestPublishAndResolve();
+    TestWriterReadyGateSerializesTwoWriterStages();
     TestWriterCommitFailuresKeepTerminalEvidence();
     TestMultiWriterFailureKeepsPartialTerminalEvidence();
     TestFailedSealDiscardsBuiltTask();
