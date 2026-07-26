@@ -5218,3 +5218,35 @@ A5 b1 本轮无泳道、PMU 关闭，`submit_span_us=78.259`，只作为现有�
 共同消费同一布局，再跑完整九 task CPU/CCEC/A5。不能在现有五 task
 循环后机械追加四次 Submit，也不能先改 host 期望值来掩盖 device 仍按
 `%5` 解释任务。
+
+### 2026-07-26：S6.4a 建立 shared 每批 task plan 的纯函数门槛
+
+本小步只建立后续 device replay 与 host oracle 共用的计划规则，不改
+当前 main 行为，也不把 `kTasksPerBatch` 从 5 改成 9。该常量继续表示
+五种 `TaskKind`；shared 每批的动态 task 数由输入 `context_len` 推导：
+
+```text
+block_count = ceil(context_len / 128)
+group_count = ceil(block_count / 64)
+task_count  = 1 + 4 × group_count
+layout      = Alloc + group_count × (QK/SF/PV/UP)
+```
+
+`SharedPaBatchPlan` 保存 `batch_start/group_count/task_count`，
+`SharedPaPlannedTaskAt()` 从 batch 内 offset 唯一恢复
+`kind/group/has-following/is-last-in-batch`。计划先拒绝超过 PA
+`256 blocks/request` 的 context 和越过 shared `kMaxTasks` 的 batch，
+再执行向上取整，避免损坏的负 `int32` context 转成巨大无符号数后溢出。
+
+门槛覆盖：
+
+- 空 context 仍有 loop 外的一个 Alloc；
+- 64/128/256 blocks 分别得到 5/9/17 task；
+- 64 blocks 后多一个 token 立即进入第二组；
+- 最大 context 恰好可接受，超过一个 token、`UINT64_MAX` 和最后 batch
+  越界全部拒绝；
+- 每个 offset 的 kind/group、non-final UP gate 标记和 batch 尾身份
+  与 `SharedPaTaskOffset()` 双向一致。
+
+CPU shared 严格告警全门槛通过。下一小步才让 shared `RunSchedulerImpl`
+消费该计划；private 五 task replay 保持原预处理结果。

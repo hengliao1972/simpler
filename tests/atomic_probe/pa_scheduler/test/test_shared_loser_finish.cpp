@@ -226,6 +226,83 @@ bool AllBytesEqual(const void *object, size_t size, unsigned char expected) {
     return true;
 }
 
+bool RunSharedBatchPlanTest() {
+    bool ok = true;
+    const auto CheckPlan = [&](uint64_t context_length,
+                               uint32_t expected_groups,
+                               uint32_t expected_tasks) {
+        SharedPaBatchPlan plan{};
+        bool plan_ok = BuildSharedPaBatchPlan(
+            context_length, 17, plan
+        );
+        plan_ok &= plan.batch_start == 17;
+        plan_ok &= plan.group_count == expected_groups;
+        plan_ok &= plan.task_count == expected_tasks;
+        for (uint32_t offset = 0;
+             plan_ok && offset < expected_tasks; ++offset) {
+            SharedPaPlannedTask task{};
+            plan_ok &= SharedPaPlannedTaskAt(plan, offset, task);
+            const TaskKind expected_kind =
+                offset == 0
+                    ? TaskKind::Alloc
+                    : static_cast<TaskKind>(
+                          1U + ((offset - 1U) % 4U)
+                      );
+            const uint32_t expected_group =
+                offset == 0 ? 0U : (offset - 1U) / 4U;
+            plan_ok &= task.kind == expected_kind;
+            plan_ok &= task.group_index == expected_group;
+            plan_ok &=
+                task.has_following_group ==
+                (expected_kind == TaskKind::Up &&
+                 expected_group + 1U < expected_groups);
+            plan_ok &=
+                task.is_last_in_batch ==
+                (offset + 1U == expected_tasks);
+            plan_ok &=
+                SharedPaTaskOffset(task.kind, task.group_index) ==
+                offset;
+        }
+        SharedPaPlannedTask outside{};
+        plan_ok &= !SharedPaPlannedTaskAt(
+            plan, expected_tasks, outside
+        );
+        return plan_ok;
+    };
+
+    // Alloc 在 group loop 之前；0/1/2/4 组分别对应 1/5/9/17 task。
+    ok &= CheckPlan(0, 0, 1);
+    ok &= CheckPlan(
+        kPaBlocksPerRequest * kPaBlockSize, 1, 5
+    );
+    ok &= CheckPlan(
+        2ULL * kPaBlocksPerRequest * kPaBlockSize, 2, 9
+    );
+    ok &= CheckPlan(kSharedPaMaxContextLength, 4, 17);
+
+    // 跨过 64-block 边界一个 token 就必须进入第二组。
+    ok &= CheckPlan(
+        kPaBlocksPerRequest * kPaBlockSize + 1U, 2, 9
+    );
+
+    SharedPaBatchPlan rejected{};
+    ok &= !BuildSharedPaBatchPlan(
+        kSharedPaMaxContextLength + 1U, 0, rejected
+    );
+    ok &= !BuildSharedPaBatchPlan(
+        UINT64_MAX, 0, rejected
+    );
+    ok &= BuildSharedPaBatchPlan(
+        kSharedPaMaxContextLength,
+        kMaxTasks - kSharedPaMaxTasksPerBatch, rejected
+    );
+    ok &= !BuildSharedPaBatchPlan(
+        kSharedPaMaxContextLength,
+        kMaxTasks - kSharedPaMaxTasksPerBatch + 1U, rejected
+    );
+    return ok;
+}
+
 bool RunReadySharedDescriptorDirectToSlotTest() {
     SchedulerState *state = MapSchedulerState();
     if (state == nullptr) {
@@ -1203,6 +1280,7 @@ bool RunTwoGroupExplicitFinishTest() {
 }  // namespace
 
 int main() {
+    const bool batch_plan_ok = RunSharedBatchPlanTest();
     const bool direct_slot_ok = RunReadySharedDescriptorDirectToSlotTest();
     const bool loser_ok = RunProtectedArgsLoserTest();
     const bool future_task_ok = RunFutureTaskWithoutSequencerTest();
@@ -1212,7 +1290,8 @@ int main() {
     const bool up_failure_ok = RunUpWriterCommitFailureTest();
     const bool fatal_drain_ok = RunFatalBlockedSuccessorDrainTest();
     const bool two_group_finish_ok = RunTwoGroupExplicitFinishTest();
-    if (!direct_slot_ok || !loser_ok || !future_task_ok || !fatal_stop_ok ||
+    if (!batch_plan_ok || !direct_slot_ok || !loser_ok ||
+        !future_task_ok || !fatal_stop_ok ||
         !alloc_failure_ok || !qk_failure_ok || !up_failure_ok ||
         !fatal_drain_ok ||
         !two_group_finish_ok) {

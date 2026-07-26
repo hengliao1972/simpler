@@ -151,6 +151,49 @@ PA_DEVICE uint32_t FrontendTaskOutputCount(TaskKind kind) {
 // 与 FrontendTaskOutputCount 相同，这些 replay-layout helper 必须在
 // pa_frontend.h 中按当前 TU 的 PA_DEVICE 身份定义。pa_model.h 可能已被
 // CCEC winner_workload 作为 host 头提前包含，不能依赖其中捕获的宏状态。
+constexpr uint64_t kSharedPaMaxContextLength =
+    static_cast<uint64_t>(kPaMaxBlocksPerRequest) * kPaBlockSize;
+
+struct SharedPaBatchPlan {
+    uint32_t batch_start;
+    uint32_t group_count;
+    uint32_t task_count;
+};
+
+struct SharedPaPlannedTask {
+    TaskKind kind;
+    uint32_t group_index;
+    bool has_following_group;
+    bool is_last_in_batch;
+};
+
+PA_DEVICE bool BuildSharedPaBatchPlan(
+    uint64_t context_length, uint32_t batch_start,
+    SharedPaBatchPlan &plan
+) {
+    // 与真实 PA 一致：Alloc 位于 group loop 之前，因此空 context 仍有
+    // 一个 Alloc task；每 64 blocks 形成一组 QK/SF/PV/UP。先限制请求
+    // 上限再做向上取整，避免损坏的负 int32 context 被转换后溢出。
+    if (context_length > kSharedPaMaxContextLength) {
+        return false;
+    }
+    const uint64_t block_count =
+        (context_length + kPaBlockSize - 1U) / kPaBlockSize;
+    const uint64_t group_count =
+        (block_count + kPaBlocksPerRequest - 1U) /
+        kPaBlocksPerRequest;
+    const uint64_t task_count = 1U + 4U * group_count;
+    if (group_count > kSharedPaMaxBlockGroups ||
+        task_count > kSharedPaMaxTasksPerBatch ||
+        batch_start > kMaxTasks - static_cast<uint32_t>(task_count)) {
+        return false;
+    }
+    plan.batch_start = batch_start;
+    plan.group_count = static_cast<uint32_t>(group_count);
+    plan.task_count = static_cast<uint32_t>(task_count);
+    return true;
+}
+
 PA_DEVICE uint32_t SharedPaTaskOffset(
     TaskKind kind, uint32_t group_index
 ) {
@@ -169,6 +212,27 @@ PA_DEVICE TaskKind SharedPaTaskKindFromOffset(
         : static_cast<TaskKind>(
               1U + ((task_offset - 1U) % 4U)
           );
+}
+
+PA_DEVICE bool SharedPaPlannedTaskAt(
+    const SharedPaBatchPlan &plan, uint32_t task_offset,
+    SharedPaPlannedTask &task
+) {
+    if (plan.group_count > kSharedPaMaxBlockGroups ||
+        plan.task_count != 1U + 4U * plan.group_count ||
+        plan.batch_start > kMaxTasks - plan.task_count ||
+        task_offset >= plan.task_count) {
+        return false;
+    }
+    task.kind = SharedPaTaskKindFromOffset(task_offset);
+    task.group_index =
+        task_offset == 0 ? 0U : (task_offset - 1U) / 4U;
+    task.has_following_group =
+        task.kind == TaskKind::Up &&
+        task.group_index + 1U < plan.group_count;
+    task.is_last_in_batch = task_offset + 1U == plan.task_count;
+    return task.kind < TaskKind::Count &&
+           task.group_index < kSharedPaMaxBlockGroups;
 }
 
 PA_DEVICE bool SharedPaTaskKindInBatch(
