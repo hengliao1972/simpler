@@ -243,17 +243,18 @@ validate_ccec_artifacts() {
         return 1
     fi
 
-    # 六行身份头固定 mode/variant/phase，后续校验和行按变体精确枚举。
+    # 七行身份头固定 mode/CAP/variant/phase，后续校验和行按变体精确枚举。
     # 既拒绝跨模式复用，也拒绝漏项、增项、绝对路径和重复文件。
     local manifest_lines=()
     mapfile -t manifest_lines < "$manifest"
-    if [[ ${#manifest_lines[@]} -ne $((6 + ${#artifacts[@]})) ||
-          "${manifest_lines[0]}" != "# schema=pa_scheduler_artifacts/v1" ||
+    if [[ ${#manifest_lines[@]} -ne $((7 + ${#artifacts[@]})) ||
+          "${manifest_lines[0]}" != "# schema=pa_scheduler_artifacts/v2" ||
           "${manifest_lines[1]}" != "# tensormap_mode=$tensormap_mode" ||
           "${manifest_lines[2]}" != "# tensormap_mode_id=$tensormap_mode_id" ||
-          "${manifest_lines[3]}" != "# variant=$variant" ||
-          "${manifest_lines[4]}" != "# phase=$phase" ||
-          "${manifest_lines[5]}" != "# phase_id=$phase_id" ]]; then
+          "${manifest_lines[3]}" != "# tensormap_ring_cap=128" ||
+          "${manifest_lines[4]}" != "# variant=$variant" ||
+          "${manifest_lines[5]}" != "# phase=$phase" ||
+          "${manifest_lines[6]}" != "# phase_id=$phase_id" ]]; then
         ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" \
             "manifest schema, mode, variant, or phase metadata does not match"
         return 1
@@ -263,7 +264,7 @@ validate_ccec_artifacts() {
         digest=""
         filename=""
         extra=""
-        read -r digest filename extra <<< "${manifest_lines[index + 6]}"
+        read -r digest filename extra <<< "${manifest_lines[index + 7]}"
         if [[ ! "$digest" =~ ^[[:xdigit:]]{64}$ ||
               "$filename" != "${artifacts[index]}" || -n "$extra" ]]; then
             ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" \

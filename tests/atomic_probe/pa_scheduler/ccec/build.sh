@@ -20,6 +20,7 @@ ARTIFACT_MANIFEST_NAME="pa_scheduler_artifacts.manifest"
 # 未传 mode 时仍默认 private，保持原有命令可用。private/shared 分别实例化
 # 各自已接线的 TensorMap backend，manifest 会阻止两种产物交叉运行。
 TENSORMAP_MODE="private"
+TENSORMAP_RING_CAP=128
 if [[ "${1:-}" == "private" || "${1:-}" == "shared" ]]; then
     TENSORMAP_MODE="$1"
     shift
@@ -115,6 +116,9 @@ esac
 if [[ "$SPLIT_FINISH" -eq 1 ]]; then
     VARIANT_DEFINES+=(-DPA_COMPETE_FIRST_SPLIT_FINISH=1)
 fi
+# 正式 standalone CCEC 产物先固定使用已验证的 128×128 布局；CAP 仍
+# 显式进入三镜像编译身份和 manifest，避免默认值漂移后静默混件。
+VARIANT_DEFINES+=("-DPTO_FDWIC_TENSORMAP_RING_CAP=$TENSORMAP_RING_CAP")
 
 # 编译只依赖本目录源码与用户安装的 CANN/PTO 头，不引用 pa_scheduler 目录外的 simpler 构建产物。
 if [[ -z "${ASCEND_HOME_PATH:-}" ]]; then
@@ -756,9 +760,10 @@ cleanup_manifest_tmp() {
 }
 trap cleanup_manifest_tmp EXIT
 {
-    printf '# schema=pa_scheduler_artifacts/v1\n'
+    printf '# schema=pa_scheduler_artifacts/v2\n'
     printf '# tensormap_mode=%s\n' "$TENSORMAP_MODE"
     printf '# tensormap_mode_id=%u\n' "$TENSORMAP_MODE_ID"
+    printf '# tensormap_ring_cap=%u\n' "$TENSORMAP_RING_CAP"
     printf '# variant=%s\n' "$BUILD_VARIANT"
     printf '# phase=%s\n' "$PHASE_NAME"
     printf '# phase_id=%u\n' "$PHASE_ID"

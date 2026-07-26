@@ -6356,3 +6356,148 @@ facade 固定四类上下文：
 改变。该阶段不需要跑 A5 性能，也不提升 build ABI/layout version；下一提交
 只处理 private ring 的 production 容量与错误合同，不能同时接 shared
 ordinary-region、fresh symbol 或 PA region intent。
+
+### 2026-07-26：S-R1 固化连续分桶环的结构边界与多 CAP 门槛
+
+进入 production R1b 前，先重新核对第 12 章所说的
+`ring-per-bucket` 与 standalone 已有 `128 bucket × 128 slot`。结论是：
+
+- 二者不是两种数据结构。后者正是前者在 `B=128、CAP=128` 下的一组
+  具体参数；
+- 规范要求的是“每个 bucket 拥有自己的连续槽段、独立单调
+  `head/tail`，槽只按该桶的绝对 cursor 回绕”，而不是“一个全局 16K
+  时序环再用 bucket 链把离散槽串起来”；
+- 全局时序环即使总容量也是 16K，桶内仍是离散追链，不能继承连续扫描、
+  无 `next`、局部回收和 shared 无 ABA 空闲链这些设计收益；
+- 因此连续 ring-per-bucket 是第 12 章明确要求的最终方向；128×128 只是
+  当前 PA 已验证的默认值，不是通用 runtime 的容量结论。
+
+#### 本阶段刻意只证明结构，不冒充 `auto`
+
+第 12 章的 `--tensormap-ring-cap auto` 要扫描静态任务图，并按 private
+的 `H` 或 shared 的 `Δ+H` 计算各桶滑动窗口峰值。standalone 当前没有
+这套 planner，真实 Host 也没有在 launch 前持有一份可直接枚举的完整动态
+任务图。因此本阶段没有新增一个“看起来像 auto”的经验公式，也没有把
+运行时 GM 配置读取塞进 Submit 热路径。
+
+当前实现只增加构建期隔离参数
+`PTO_FDWIC_TENSORMAP_RING_CAP`，正式 CPU/CCEC scheduler 显式固定为
+128；private/shared ring 自测则用同一份生产 helper 依次重编译：
+
+| CAP | bucket 数 | 总槽数 | 主要门槛意义 |
+| ---: | ---: | ---: | --- |
+| 32 | 512 | 16,384 | 暴露小容量 off-by-one、额外 bucket 游标和满环路径 |
+| 64 | 256 | 16,384 | 覆盖第二种额外游标布局，锁定默认/扩展区分界 |
+| 128 | 128 | 16,384 | 正式 standalone 默认 ABI |
+| 256 | 64 | 16,384 | 排除 helper 偷写 128 |
+| 16,384 | 1 | 16,384 | 单桶覆盖完整旧 pool，并验证 B=1 hash 无右移 64 UB |
+
+这里固定的是总槽池 16K，CAP 与 bucket 数互为反比。CAP 越大，单桶容量越
+宽但 hash 桶越少、lookup 扫描可能越长；CAP 越小，桶更多但单桶更容易满。
+这组变体用于验证结构和错误路径，不能直接当成性能推荐。
+
+private 的 `TensorMap` 在五个 CAP 变体下都保持 823,312B，`WorkerState` 仍为
+9,231,296B。默认前 128 桶的 head/tail 与全部后续字段 offset 原样保留；
+CAP=32/64 多出的 384/128 组游标从原 32KiB ABI padding 中切出，并相应
+缩短剩余 padding。访问统一经过内联 bucket-control helper，默认
+CAP=128 编译分支没有额外桶判断。shared 的正式 CAP=128 sidecar size 和
+region/output/heap/vector offset 继续由原硬断言锁定；其他 CAP 只用于
+隔离算法门槛。
+
+非默认 CAP 编码进 `kBuildIdentityAbiVersion`；默认 128 保留历史 ABI
+值 4/6，避免只为身份元数据让 AIC/AIV 入口多一条大立即数构造并改变后续
+代码对齐。artifact manifest 升为 v2，并新增
+`tensormap_ring_cap=128`。CCEC host、AIC、AIV 必须用同一 CAP 编译，
+运行时 identity、manifest schema/CAP 和整套产物 SHA 共同阻止“三镜像按
+不同桶布局解释 GM”的混件。当前没有对外暴露非 128 的正式运行产物，也
+没有声称完成第 12 章的免重编译覆盖参数。
+
+#### 新增的容量与复用门槛
+
+原测试已经覆盖半开区间、最大 producer、窗口回收、三圈绝对 seq、双检
+ABA、满环不覆写和整 task 预检失败不部分发布。本阶段补齐两个此前缺失的
+正向边界：
+
+1. shared 显式门槛中，A 桶已满时，只向独立 B 桶追加仍必须成功；A 的
+   head/tail 和逻辑内容保持不变，证明容量是 per-bucket，不是误加的全局
+   live gate。B=1 变体明确不执行这条不存在的命题；
+2. 桶满后精确退休 `K=min(8,CAP/4)` 个旧 entry，再由同一 task 追加 K 个
+   新 entry 必须成功。head 前进 K、tail 前进 K、live 仍等于 CAP，物理
+   slot 0..K-1 发布新的绝对 seq `CAP..CAP+K-1`。
+
+private 的长程 wrap 用例把“必须持续成功”的窗口限制为
+`min(64,CAP-1)`；配置过小导致的显式满环由独立 overflow 用例验证。这样
+不会把 CAP=32 在 H=64 下必然不足误判成 ring 算法错误。
+
+#### 当前证据
+
+| 检查 | 结果 |
+| --- | --- |
+| private ring CAP=32/64/128/256/16384 | 5/5 PASS |
+| shared ordered ring CAP=32/64/128/256/16384 | 5/5 PASS |
+| CPU private 完整构建与全部门槛 | PASS，约 14.4s |
+| CPU shared 完整构建与全部门槛 | PASS，约 30.0s |
+| CCEC private/shared 默认 CAP=128 三镜像 | 均 PASS |
+| CCEC manifest v2 mode/CAP/variant/phase/SHA | 两模式均闭合 |
+| A5 B1 private/shared 默认 CAP=128 scalar-nop=0 smoke | 两模式全部语义断言 PASS |
+| standalone converter/analyzer/PMU Python 回归 | 122 PASS（用户 `.venv`） |
+| shell `bash -n` / `git diff --check` | PASS |
+
+A5 smoke 只验证 mode/CAP 身份从 manifest 到 Host、AIC、AIV 的运行闭环，
+不作为性能数据。CAP=32 通过隔离测试也只表示“能正确运行或明确报满”，不
+表示它已被证明足以覆盖 PA；当前 PA Case1 的保守全 map live 上界仍是
+52，正式默认 128 满足该上界。任意任务图、production 的
+`PTO_DIST_H=0..1022` 和 shared `Δ+H` 都必须另做静态逐桶容量证明。
+
+默认 private CCEC swimlane linked device ELF 另与干净 `c4c4e4c2`
+重编产物做执行节逐字节比较：
+
+| ELF section | 大小 | 基线 / 候选 SHA256 |
+| --- | ---: | --- |
+| `.text` | 590,904 B | `49b50da75c356cf2e5d9f2da9ceb5d38d3e3003b446e1eaa604806cd16be1438` |
+| `.rodata` | 696 B | `e75f6281546f2d140d86c1b143bce48ebab6e0952ed3051a3b81ce98a6c027b9` |
+
+两节均完全相同。也就是说，在这个同变体对照中，构建期参数化、
+bucket-control facade 和 CAP=16384 的 B=1 特判没有污染正式 private
+128×128 swimlane device 机器码；manifest 升级发生在 host artifact
+身份层，不靠向 AICore 热代码增加 marker。这一结论不外推到尚未逐节比较
+的其他 variant 或 Host 产物。
+
+为回答默认 PA B256 是否发生性能变化，又从干净 `c4c4e4c2` 和当前
+tracked 修改快照分别重编同一 CCEC perf-clock variant。这里比较的仍只是
+最终 mixed device ELF 的装载执行节，不把 manifest v2 导致的 Host
+artifact 变化混入热路径结论：
+
+| 模式 | section | 大小 | 基线 / 候选 SHA256 |
+| --- | --- | ---: | --- |
+| private | `.text` | 126,264 B | `a016e132247c32e36efcecb7597cfffe462f4d8a409e39b50497f7adb8d074ed` |
+| private | `.rodata` | 300 B | `7c1caafcef85e369058da215f1094b36c74c5a7e5d8103f2454be5b3a4c91598` |
+| shared | `.text` | 149,560 B | `d9717beb8dfd7b5a0ce2907bed00f8119e1139f4f57fa9c3784d7ecda5450f40` |
+| shared | `.rodata` | 304 B | `695626dcc092dcc7e5179f28045e261c3e5a6f51c2b0277b7b2c65ef2ca72b65` |
+
+四组 section 的基线与候选均逐字节相同，因此本轮改动没有给默认 CAP=128
+的 private/shared perf-clock 热路径增加指令或常量。A5 B256 真计算的
+当前快速复核也全部通过语义门槛：
+
+- shared 三个独立进程为 `2,354.757 / 2,327.094 / 2,330.510 us`，
+  中位数 `2,330.510 us`；相对改动前最近 12 样本中位数
+  `2,338.860 us` 只差 `-0.357%`，未见回退；
+- private 三个独立进程为 `6,118.217 / 5,357.404 / 4,505.527 us`，
+  全部落在既有 20 样本 `3,648.869..6,599.653 us` 波动区间内。private
+  竞争本来就有较大抖动，三样本中位数不能解释为回退或收益。
+
+性能样本只用于确认没有出现新异常；“本轮未改变默认热路径代码生成”的
+直接证据是同 variant 的 `.text/.rodata` 相同，不是跨批次时间相减。
+
+#### 对 production R1b 的约束
+
+production 下一步不能把 128×128 数值无脑移植过去，也不能退回全局环加
+bucket 链。需要先闭合三件事：
+
+1. 明确真实任务图可获得的静态 region 集合、`H/Δ` 上界，以及
+   manual CAP 小于可证峰值时的启动拒绝合同；
+2. private 满环从 backend bool 一路传播到 Submit fatal、AICPU/Host
+   非零结果；shared 还要区分可恢复反压与不可恢复容量错误；
+3. 在默认产物上先证明容量布局与错误传播，再接 shared 的 per-slot seq、
+   发布/失效和有序 reclaim；不能把 fresh symbol、heap、INOUT gate 同时
+   混入这一个数据结构提交。
