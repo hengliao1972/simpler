@@ -29,11 +29,20 @@
 namespace fdwic_shared_multiworker_test {
 
 std::atomic<uint32_t> g_observed_turn_wait_spins{0};
+std::atomic<uint32_t> g_spins_after_remote_fatal{0};
+std::atomic<bool> g_remote_fatal_published{false};
 thread_local bool g_observe_turn_wait = false;
+thread_local bool g_limit_spins_after_remote_fatal = false;
+
+constexpr uint32_t kPostFatalSpinLimit = 1024;
 
 void spin_wait_hint() {
     if (g_observe_turn_wait) {
         g_observed_turn_wait_spins.fetch_add(1, std::memory_order_release);
+    }
+    if (g_limit_spins_after_remote_fatal && g_remote_fatal_published.load(std::memory_order_acquire) &&
+        g_spins_after_remote_fatal.fetch_add(1, std::memory_order_acq_rel) >= kPostFatalSpinLimit) {
+        throw std::runtime_error("production wait did not consume the remote fatal");
     }
     std::this_thread::yield();
 }
@@ -102,6 +111,8 @@ protected:
         static_assert(!kFdwicCompiledBackendReady);
 
         fdwic_shared_multiworker_test::g_observed_turn_wait_spins.store(0, std::memory_order_relaxed);
+        fdwic_shared_multiworker_test::g_spins_after_remote_fatal.store(0, std::memory_order_relaxed);
+        fdwic_shared_multiworker_test::g_remote_fatal_published.store(false, std::memory_order_relaxed);
         g_dist_ptr = &g_dist_fallback;
         dist_shared_tensor_map_reset(g_dist.shared_tensor_map);
 
@@ -120,17 +131,29 @@ protected:
         g_dist.frontier = -1;
         g_dist.fatal = 0;
         g_dist.error_code = PTO2_ERROR_NONE;
+        g_dist.blocks[0].any_pub = 0;
         for (int32_t shard = 0; shard < kCursorShards; ++shard) {
             g_dist.cube_cursor[shard].v = -1;
             g_dist.vector_cursor[shard].v = -1;
             g_dist.alloc_cursor[shard].v = -1;
         }
-        reset_task_cell(0);
-        reset_task_cell(1);
+        for (int32_t task = 0; task < 16; ++task) {
+            reset_task_cell(task);
+        }
+        for (int32_t group = 0; group < kFinalBarrierGroups; ++group) {
+            g_dist.final_barrier.leaf_arrivals[group].v = 0;
+            g_dist.final_barrier.leaf_arrivals[group].expected = 0;
+            g_dist.final_barrier.leaf_releases[group].v = 0;
+        }
+        g_dist.final_barrier.root_arrival.v = 0;
+        g_dist.final_barrier.root_arrival.expected = 0;
+        g_dist.final_barrier.root_release.v = 0;
+        g_fdwic_joint_submit_seen = false;
     }
 
     void TearDown() override {
         fdwic_shared_multiworker_test::g_observe_turn_wait = false;
+        fdwic_shared_multiworker_test::g_limit_spins_after_remote_fatal = false;
         g_self = nullptr;
         g_dist_ptr = nullptr;
     }
@@ -236,6 +259,136 @@ TEST_F(FdwicSharedMultiworkerTest, FutureTurnWaitsForPriorCommitThenBuildsWithDe
     EXPECT_EQ(task0_slot->fanin_count, 0);
     ASSERT_EQ(task1_slot->fanin_count, 1);
     EXPECT_EQ(task1_slot->fanin[0], 0);
+}
+
+TEST_F(FdwicSharedMultiworkerTest, RemoteFatalInterruptsSlotCapacityWait) {
+    // Two permanently blocked slots reach the self-owned capacity threshold.
+    // The current task may complete its map transaction, but it must not spin
+    // forever or Build after another worker publishes a terminal failure.
+    constexpr int32_t kBlockedProducer = 7;
+    for (int32_t index = 0; index < kPrivateSlots - kWonReserve; ++index) {
+        RingSlot &slot = task0_worker_->slots[index];
+        slot.occupied = true;
+        slot.built = true;
+        slot.task_id = 100 + index;
+        slot.fanin_count = 1;
+        slot.fanin[0] = kBlockedProducer;
+    }
+    task0_worker_->occupied_count = kPrivateSlots - kWonReserve;
+
+    L0TaskArgs args;
+    MixedKernels mixed;
+    mixed.aiv0_kernel_id = 22;
+    DistCompeteFirstTicket ticket{};
+    std::exception_ptr worker_error;
+    std::atomic<bool> worker_returned{false};
+    std::thread worker([&]() {
+        try {
+            g_self = task0_worker_.get();
+            ticket = dist_submit_compete_first_begin(nullptr, mixed);
+            fdwic_shared_multiworker_test::g_observe_turn_wait = true;
+            fdwic_shared_multiworker_test::g_limit_spins_after_remote_fatal = true;
+            (void)dist_submit_compete_first_finish(nullptr, mixed, ticket, args);
+            fdwic_shared_multiworker_test::g_limit_spins_after_remote_fatal = false;
+            fdwic_shared_multiworker_test::g_observe_turn_wait = false;
+        } catch (...) {
+            worker_error = std::current_exception();
+        }
+        worker_returned.store(true, std::memory_order_release);
+        g_self = nullptr;
+    });
+
+    const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (fdwic_shared_multiworker_test::g_observed_turn_wait_spins.load(std::memory_order_acquire) == 0 &&
+           std::chrono::steady_clock::now() < wait_deadline) {
+        std::this_thread::yield();
+    }
+    const bool entered_capacity_wait =
+        fdwic_shared_multiworker_test::g_observed_turn_wait_spins.load(std::memory_order_acquire) != 0;
+    EXPECT_FALSE(worker_returned.load(std::memory_order_acquire));
+    set_fatal_code(PTO2_ERROR_EXPLICIT_ORCH_FATAL);
+    fdwic_shared_multiworker_test::g_remote_fatal_published.store(true, std::memory_order_release);
+    worker.join();
+
+    EXPECT_TRUE(entered_capacity_wait);
+    EXPECT_TRUE(worker_returned.load(std::memory_order_acquire));
+    if (worker_error != nullptr) {
+        try {
+            std::rethrow_exception(worker_error);
+        } catch (const std::exception &error) {
+            FAIL() << "slot-capacity waiter threw: " << error.what();
+        } catch (...) {
+            FAIL() << "slot-capacity waiter threw a non-standard exception";
+        }
+    }
+    EXPECT_EQ(ticket.task_id, 0);
+    EXPECT_EQ(ticket.won, 1);
+    EXPECT_EQ(g_dist.fatal, 1);
+    EXPECT_EQ(g_dist.error_code, PTO2_ERROR_EXPLICIT_ORCH_FATAL);
+    EXPECT_EQ(atomic_load(g_dist.shared_tensor_map.committed_tasks.v), 1);
+    EXPECT_EQ(task0_worker_->local_index, kFlagCap);
+    EXPECT_EQ(task0_worker_->occupied_count, kPrivateSlots - kWonReserve);
+    EXPECT_EQ(task_cell(0).flag, 0);
+    EXPECT_EQ(task_cell(0).vend, 0);
+    EXPECT_EQ(g_dist.frontier, -1);
+}
+
+TEST_F(FdwicSharedMultiworkerTest, RemoteFatalInterruptsIncompleteFinalBarrier) {
+    // Only one of two expected workers enters the final barrier. A remote fatal
+    // means the absent worker will skip FinalDrain, so this worker must leave
+    // without waiting for an impossible root/leaf release.
+    dist_core_reset(*task0_worker_, CoreType::AIC, /*block=*/0, LANE_AIC);
+    task0_worker_->core_idx = 0;
+    g_dist.final_barrier.leaf_arrivals[0].expected = 2;
+    g_dist.final_barrier.root_arrival.expected = 1;
+
+    std::exception_ptr worker_error;
+    std::atomic<bool> worker_returned{false};
+    std::thread worker([&]() {
+        try {
+            g_self = task0_worker_.get();
+            fdwic_shared_multiworker_test::g_observe_turn_wait = true;
+            fdwic_shared_multiworker_test::g_limit_spins_after_remote_fatal = true;
+            dist_submit_drain_to_completion(task0_worker_.get());
+            fdwic_shared_multiworker_test::g_limit_spins_after_remote_fatal = false;
+            fdwic_shared_multiworker_test::g_observe_turn_wait = false;
+        } catch (...) {
+            worker_error = std::current_exception();
+        }
+        worker_returned.store(true, std::memory_order_release);
+        g_self = nullptr;
+    });
+
+    const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (fdwic_shared_multiworker_test::g_observed_turn_wait_spins.load(std::memory_order_acquire) == 0 &&
+           std::chrono::steady_clock::now() < wait_deadline) {
+        std::this_thread::yield();
+    }
+    const bool entered_final_barrier_wait =
+        fdwic_shared_multiworker_test::g_observed_turn_wait_spins.load(std::memory_order_acquire) != 0;
+    EXPECT_FALSE(worker_returned.load(std::memory_order_acquire));
+    set_fatal_code(PTO2_ERROR_EXPLICIT_ORCH_FATAL);
+    fdwic_shared_multiworker_test::g_remote_fatal_published.store(true, std::memory_order_release);
+    worker.join();
+
+    EXPECT_TRUE(entered_final_barrier_wait);
+    EXPECT_TRUE(worker_returned.load(std::memory_order_acquire));
+    if (worker_error != nullptr) {
+        try {
+            std::rethrow_exception(worker_error);
+        } catch (const std::exception &error) {
+            FAIL() << "final-barrier waiter threw: " << error.what();
+        } catch (...) {
+            FAIL() << "final-barrier waiter threw a non-standard exception";
+        }
+    }
+    EXPECT_EQ(g_dist.fatal, 1);
+    EXPECT_EQ(g_dist.error_code, PTO2_ERROR_EXPLICIT_ORCH_FATAL);
+    EXPECT_EQ(task0_worker_->local_index, kFlagCap);
+    EXPECT_EQ(g_dist.final_barrier.leaf_arrivals[0].v, 1);
+    EXPECT_EQ(g_dist.final_barrier.root_arrival.v, 0);
+    EXPECT_EQ(g_dist.final_barrier.root_release.v, 0);
+    EXPECT_EQ(g_dist.final_barrier.leaf_releases[0].v, 0);
 }
 
 }  // namespace

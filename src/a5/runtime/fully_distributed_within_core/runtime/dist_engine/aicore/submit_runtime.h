@@ -94,15 +94,41 @@ PTO_DEVICE_FUNC __gm__ RingSlot *dist_submit_alloc_slot(__gm__ DistCore *self) {
     return &slot;
 }
 
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC bool dist_submit_wait_slot_capacity(__gm__ DistCore *self, int32_t task_id) {
+#else
 PTO_DEVICE_FUNC void dist_submit_wait_slot_capacity(__gm__ DistCore *self, int32_t task_id) {
-    if (self == nullptr) return;
+#endif
+    if (self == nullptr) {
+#if PTO_FDWIC_SHARED_MAP
+        return false;
+#else
+        return;
+#endif
+    }
     bool waited = false;
     TRACE_SPAN_BEGIN(ring_bp_trace);
     const uint32_t slot_poll_region = fdwic_atomic_poll_region_begin(
-        fdwic_atomic_site_mask(FdwicAtomicSite::FaninFlagLoad) | fdwic_atomic_block_won_poll_mask()
+        fdwic_atomic_site_mask(FdwicAtomicSite::FaninFlagLoad) |
+#if PTO_FDWIC_SHARED_MAP
+        fdwic_atomic_site_mask(FdwicAtomicSite::FatalPoll) |
+#endif
+        fdwic_atomic_block_won_poll_mask()
     );
     while (self->occupied_count >= kPrivateSlots - kWonReserve) {
         waited = true;
+#if PTO_FDWIC_SHARED_MAP
+        // Another winner may terminate the shared run while this worker is
+        // blocked behind slots whose fan-in can no longer complete. Consume
+        // fatal only on the existing backpressure loop, so the no-wait winner
+        // path gains no extra atomic load.
+        if (fdwic_trace_is_fatal(task_id)) {
+            fdwic_atomic_poll_region_end(slot_poll_region);
+            TRACE_SPAN_END(ring_bp_trace, self, task_id, -1, TracePhase::RingBp, 0, 0);
+            self->local_index = kFlagCap;
+            return false;
+        }
+#endif
         drain_block_won(self);
         if (drain_phase_b(self) == 0) SPIN_WAIT_HINT();
     }
@@ -110,6 +136,9 @@ PTO_DEVICE_FUNC void dist_submit_wait_slot_capacity(__gm__ DistCore *self, int32
     if (waited) {
         TRACE_SPAN_END(ring_bp_trace, self, task_id, -1, TracePhase::RingBp, 0, 0);
     }
+#if PTO_FDWIC_SHARED_MAP
+    return true;
+#endif
 }
 
 PTO_DEVICE_FUNC bool dist_submit_wait_heap_capacity(DistSubmitCtx &ctx, DistSubmitKind kind) {
@@ -250,7 +279,11 @@ PTO_DEVICE_FUNC bool dist_submit_build_winner_slot(DistSubmitCtx &ctx, const L0T
 PTO_DEVICE_FUNC void
 dist_submit_build_winner_task(DistSubmitCtx &ctx, const MixedKernels &mixed, const L0TaskArgs &args) {
     if (ctx.self == nullptr) return;
+#if PTO_FDWIC_SHARED_MAP
+    if (!dist_submit_wait_slot_capacity(ctx.self, ctx.task_id)) return;
+#else
     dist_submit_wait_slot_capacity(ctx.self, ctx.task_id);
+#endif
     if (!dist_submit_wait_heap_capacity(ctx, DistSubmitKind::Kernel)) return;
     if (ctx.joint && ctx.joint_slot < 0) {
         ctx.joint_slot = wait_alloc_won_slot(ctx.self, ctx.joint_block, ctx.task_id);
@@ -476,7 +509,11 @@ PTO_DEVICE_FUNC void dist_submit_drain_to_completion(__gm__ DistCore *self) {
     dist_final_barrier_publish(g_dist.final_barrier.leaf_arrivals[final_group].v);
     const uint32_t final_poll_region = fdwic_atomic_poll_region_begin(
         fdwic_atomic_site_mask(FdwicAtomicSite::ReplayDonePoll) |
-        fdwic_atomic_site_mask(FdwicAtomicSite::FaninFlagLoad) | fdwic_atomic_block_won_poll_mask()
+        fdwic_atomic_site_mask(FdwicAtomicSite::FaninFlagLoad) |
+#if PTO_FDWIC_SHARED_MAP
+        fdwic_atomic_site_mask(FdwicAtomicSite::FatalPoll) |
+#endif
+        fdwic_atomic_block_won_poll_mask()
     );
     bool leaf_forwarded = false;
     bool root_released = false;
@@ -491,7 +528,19 @@ PTO_DEVICE_FUNC void dist_submit_drain_to_completion(__gm__ DistCore *self) {
         const bool ring_empty = self->occupied_count == 0;
         const bool pending = has_pending_won(self);
         if (global_release_observed && ring_empty && !pending) break;
-        if (freed == 0) SPIN_WAIT_HINT();
+        if (freed == 0) {
+#if PTO_FDWIC_SHARED_MAP
+            // A worker that reaches FinalDrain before a remote fatal cannot
+            // wait for the missing worker's barrier arrival: core_main skips
+            // FinalDrain after observing fatal. Poll only on an idle drain
+            // iteration so successful progress does not pay an extra load.
+            if (fdwic_trace_is_fatal()) {
+                self->local_index = kFlagCap;
+                break;
+            }
+#endif
+            SPIN_WAIT_HINT();
+        }
     }
     fdwic_atomic_poll_region_end(final_poll_region);
 }

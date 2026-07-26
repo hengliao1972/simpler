@@ -7708,3 +7708,116 @@ shared winner 在本核 slot 已满时没有 fatal 退出；已经进入 FinalDr
 worker 也不会消费稍后由另一核发布的 fatal。若另一核因此跳过 FinalDrain，
 前者可能永久等待不存在的 barrier release。修复必须只进入 shared 构建并
 保持 private 指令隔离，不能把本次正常等待门槛与错误路径改动合成一次提交。
+
+### 2026-07-26：R3b-b 让 shared 已有等待在远端 fatal 后收敛
+
+R3b-a 证明了正常的 future-turn winner 会等待并恢复，但它没有覆盖另一个
+worker 在等待期间终止整次 shared 运行的情况。重新逐个检查 production
+Submit 和收尾循环后，确认有两个会永久等待的真实缺口：
+
+1. `dist_submit_wait_slot_capacity()` 在本核达到
+   `kPrivateSlots-kWonReserve` 阈值后只尝试 drain。若已有 slot 的 fan-in
+   因远端 fatal 永远不能 ready，该循环没有退出条件；
+2. worker 可能先进入 `dist_submit_drain_to_completion()`，随后另一 worker
+   才置 fatal。后者在 `core_main` 中观察到 fatal 后会跳过 FinalDrain，
+   前者却仍等待这个缺席 worker 的 barrier arrival/release。
+
+#### 改动边界
+
+本阶段没有在每个 shared winner 上增加一条 fatal atomic：
+
+- slot-capacity 只在已经进入真实反压循环时检查 fatal；无反压路径不执行
+  新 load；
+- FinalDrain 只在本轮没有释放 slot 时检查 fatal；仍有 ready work 时先
+  继续 drain，避免每个进展轮次增加 load；
+- 两个检查都使用既有 `fdwic_trace_is_fatal()`，并把
+  `FdwicAtomicSite::FatalPoll` 加入对应的现有 poll region。启用 atomic
+  泳道时，这些 load 仍进入原有批量观测口径，不形成不可解释的裸 atomic；
+- private 构建保留原 `void dist_submit_wait_slot_capacity()` 签名和原循环，
+  FinalDrain 也不包含新增分支。shared 构建才让 slot wait 返回
+  `bool`，调用方收到 `false` 后停止 heap/joint/RingSlot Build。
+
+远端 fatal 与已经开始的事务之间采用 fail-stop 合同，不新增一次昂贵的
+“事务提交后再次确认 fatal”。因此 fatal 可能发生在 task N 的 shared map
+事务已经 commit、但尚未 Build 的时刻；该 task 的
+`committed_tasks == N+1` 可以保留，已有本核 slot 也不在这里强制清空。
+整次运行已经失败，AICPU/Host 必须返回首个非零错误，不能把这类中间状态
+解释成可继续执行的成功快照。此边界避免为了错误路径把每个正常 Submit
+改成两阶段提交或增加第二次全局 atomic。
+
+#### 红灯先行与多 worker 门槛
+
+在修改 production 前，先把两个用例加到
+`test_fdwic_shared_multiworker`：
+
+- `RemoteFatalInterruptsSlotCapacityWait` 预置两个永远不能 ready 的本核
+  built slot，让真实 task 0 winner 完成零 entry map commit 后进入
+  slot-capacity wait；主线程确认 waiter 尚未返回，再发布
+  `PTO2_ERROR_EXPLICIT_ORCH_FATAL`。旧实现超过 1,024 次 post-fatal spin
+  后由测试 hook 确定性失败；
+- `RemoteFatalInterruptsIncompleteFinalBarrier` 让一个 AIC worker 进入
+  `expected=2`、实际只有一次 arrival 的真实 FinalDrain barrier；确认
+  waiter 尚未返回后再发布相同 fatal。旧实现同样确定性失败，不依赖
+  sleep 推测阻塞。
+
+修复后第一项要求 commit 已经从 0 推进到 1，但不能新增 Build、completion
+或 frontier；两条用例都要求 `local_index == kFlagCap`、首错保持不变。
+第二项还要求 leaf arrival 保持 1，root arrival/release 和 leaf release
+均不得伪造。测试专用 `SPIN_WAIT_HINT` 仍只存在于该 CPU-sim 测试翻译单元，
+CTEST 的 15 秒超时负责兜住任何不再经过该 hook 的意外挂死。
+
+这两项只证明：
+
+- 本核 slot 反压在远端 fatal 后退出；
+- 已经进入、但 barrier 缺少参与者的 FinalDrain 在远端 fatal 后退出。
+
+它们不冒充“完整 FinalDrain 正常闭环”：fanin-blocked slot、pending joint
+work、1 AIC + 2 AIV 正常 barrier、真实最后一个 Kernel 的 completion 和
+Host done 仍需后续正向联合门槛。
+
+multiworker 门槛为避免测试 hook 污染记录而以 trace-disabled 身份编译；
+`FatalPoll` 进入既有 PollBatch 的证据目前来自 production mask 代码审查和
+通用 PollBatch 门槛，不是本用例导出的路径级泳道。若后续把失败路径 atomic
+观测也升级为发布合同，应另补 trace-enabled 隔离用例，不能拿本次功能门槛
+冒充全部 shared atomic 已经可观测。
+
+#### 冻结验证
+
+| 检查 | 结果 |
+| --- | --- |
+| 两项新增门槛的 red-first | 旧 production 均按预期触发“未消费远端 fatal”失败 |
+| multiworker CTest（每次带 15 秒超时） | 100/100 PASS；每次包含正常 future-turn 和两项 fatal |
+| shared contract / wiring + private capacity | 3/3 PASS |
+| GCC15 ASan + UBSan multiworker | 3/3 PASS，无报告 |
+| private/shared × A5sim/A5 artifact | 4/4 Build complete；shared backend 总门禁仍关闭 |
+| private CPU production TU | `.text` 与父提交逐字节相同 |
+| private A5sim production object | `.text` 逐字节相同；1,652 条 `.rela.text` 的 offset/type/symbol/addend 语义投影相同 |
+| private A5 CCEC | AIC/AIV/final `.text` 及 AIC/AIV raw `.rela.text` 逐字节相同 |
+
+private A5 CCEC 冻结值继续为：
+
+```text
+AIC .text       86,344B   f7aacd262526...
+AIV .text       86,704B   3938bd4fa2c5...
+final .text    190,232B   08ecb6ac0e58...
+```
+
+A5sim clean worktree 与当前 worktree 的绝对源码根长度不同，导致断言路径
+所在 `.rodata` 的局部 `.LC*` 值和完整对象 hash 不同；执行 `.text` 的
+SHA256 均为 `655241601e3f...`，可执行 relocation 的 offset、类型、符号名
+与 addend 也完全一致。这里没有拿整 `.o` 不同掩盖 private 代码变化。
+
+本阶段证据目录：
+
+```text
+/tmp/fdwic-r3b-fatal-ut-20260726/
+/tmp/fdwic-r3b-future-sanitize-20260726/
+/tmp/fdwic-r3b-private-before-src-20260726-2218/
+/tmp/fdwic-r3b-private-before-build-20260726-2221/
+/tmp/fdwic-r3b-private-after-build-20260726-2221/
+/tmp/fdwic-r3b-artifact-compare-20260726-2228/
+```
+
+下一小步应补完整 Kernel execution/completion/final-drain 正向联合门槛，再
+进入 PA 尾部 INOUT 的 region-intent。当前改动不解除 shared backend 门禁，
+也不使用 CPU-sim 的 fatal 通过来替代 A5 GM 可见性和上板正确性证据。
