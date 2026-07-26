@@ -807,6 +807,11 @@ void TestPaWriterIntentPreGateFailuresDoNotPublishGate() {
             TensorArgType::Inout
         );
     }
+    TensorDesc manual_view = MakeTensor(0x360010000ULL, producer);
+    manual_view.manual_dep = true;
+    AddLocalTensor(
+        damaged_writer_args, manual_view, TensorArgType::Inout
+    );
     cell.last_writer[2].value = -1;
     SubmitContext damaged_writer_context{};
     damaged_writer_context.task_id = writer;
@@ -869,6 +874,95 @@ void TestPaWriterIntentPreGateFailuresDoNotPublishGate() {
             cell.last_writer[1].value == producer &&
             cell.last_writer[2].value == producer,
         "missing PA accumulator rejects the fast path before mutation or gate"
+    );
+
+    state->fatal.value = 0;
+    state->tasks[writer].deps_prepared = -1;
+    TaskArgs wrong_accumulator_args = damaged_writer_args;
+    wrong_accumulator_args.tensors[0]
+        .pointer.output_ref.producer_task_id = 1;
+    SubmitContext wrong_accumulator_context{};
+    wrong_accumulator_context.task_id = writer;
+    wrong_accumulator_context.won = true;
+    LocalStats wrong_accumulator_stats{};
+    Check(
+        !PreparePaSharedWriterIntent<SymbolTestOps>(
+            state, wrong_accumulator_args, wrong_accumulator_context,
+            wrong_accumulator_stats
+        ) &&
+            state->fatal.value == 1 &&
+            state->tasks[writer].deps_prepared == -1 &&
+            cell.last_writer[0].value == producer &&
+            cell.last_writer[1].value == producer &&
+            cell.last_writer[2].value == producer,
+        "PA writer intent rejects three refs that are not the batch accumulators"
+    );
+
+    state->fatal.value = 0;
+    state->tasks[writer].deps_prepared = -1;
+    TaskArgs duplicate_accumulator_args = damaged_writer_args;
+    duplicate_accumulator_args.tensors[2]
+        .pointer.output_ref.output_slot = 1;
+    SubmitContext duplicate_accumulator_context{};
+    duplicate_accumulator_context.task_id = writer;
+    duplicate_accumulator_context.won = true;
+    LocalStats duplicate_accumulator_stats{};
+    Check(
+        !PreparePaSharedWriterIntent<SymbolTestOps>(
+            state, duplicate_accumulator_args,
+            duplicate_accumulator_context,
+            duplicate_accumulator_stats
+        ) &&
+            state->fatal.value == 1 &&
+            state->tasks[writer].deps_prepared == -1 &&
+            cell.last_writer[0].value == producer &&
+            cell.last_writer[1].value == producer &&
+            cell.last_writer[2].value == producer,
+        "PA writer intent rejects duplicate accumulator slots before mutation"
+    );
+
+    state->fatal.value = 0;
+    state->tasks[writer].deps_prepared = -1;
+    TaskArgs missing_view_args = damaged_writer_args;
+    missing_view_args.tensor_count = 3;
+    SubmitContext missing_view_context{};
+    missing_view_context.task_id = writer;
+    missing_view_context.won = true;
+    LocalStats missing_view_stats{};
+    Check(
+        !PreparePaSharedWriterIntent<SymbolTestOps>(
+            state, missing_view_args, missing_view_context,
+            missing_view_stats
+        ) &&
+            state->fatal.value == 1 &&
+            state->tasks[writer].deps_prepared == -1 &&
+            cell.last_writer[0].value == producer &&
+            cell.last_writer[1].value == producer &&
+            cell.last_writer[2].value == producer,
+        "PA writer intent rejects a missing manual-dependency output view"
+    );
+
+    state->fatal.value = 0;
+    state->tasks[writer].deps_prepared = -1;
+    TaskArgs duplicate_view_args = damaged_writer_args;
+    AddLocalTensor(
+        duplicate_view_args, manual_view, TensorArgType::Inout
+    );
+    SubmitContext duplicate_view_context{};
+    duplicate_view_context.task_id = writer;
+    duplicate_view_context.won = true;
+    LocalStats duplicate_view_stats{};
+    Check(
+        !PreparePaSharedWriterIntent<SymbolTestOps>(
+            state, duplicate_view_args, duplicate_view_context,
+            duplicate_view_stats
+        ) &&
+            state->fatal.value == 1 &&
+            state->tasks[writer].deps_prepared == -1 &&
+            cell.last_writer[0].value == producer &&
+            cell.last_writer[1].value == producer &&
+            cell.last_writer[2].value == producer,
+        "PA writer intent rejects duplicate manual-dependency writers"
     );
 
     state->fatal.value = 0;

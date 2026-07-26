@@ -111,11 +111,99 @@ PA_DEVICE uint64_t TraceTimestamp(TraceContext &trace, WorkerResult &result) {
 
 PA_DEVICE uint32_t KindIndex(TaskKind kind) { return static_cast<uint32_t>(kind); }
 
-PA_DEVICE TaskKind GetTaskKind(uint32_t task_id) { return static_cast<TaskKind>(task_id % kTasksPerBatch); }
+#if PTO_FDWIC_SHARED_MAP
+constexpr uint8_t kSharedPaTicketMetaPresent = 1U << 7;
+constexpr uint8_t kSharedPaTicketMetaReserved = 1U << 6;
+constexpr uint8_t kSharedPaTicketHasFollowing = 1U << 5;
+constexpr uint8_t kSharedPaTicketKindMask = 0x07U;
+constexpr uint8_t kSharedPaTicketGroupShift = 3;
+constexpr uint8_t kSharedPaTicketGroupMask = 0x03U;
+
+struct SharedPaTaskMeta {
+    TaskKind kind;
+    uint32_t group_index;
+    uint32_t batch_start;
+    bool has_following_group;
+    bool chained_writer;
+};
+
+PA_DEVICE uint8_t EncodeSharedPaTaskMeta(
+    TaskKind kind, uint32_t group_index, bool has_following_group
+) {
+    if (kind >= TaskKind::Count ||
+        group_index >= kSharedPaMaxBlockGroups ||
+        (kind == TaskKind::Alloc &&
+         (group_index != 0 || has_following_group)) ||
+        (kind != TaskKind::Up && has_following_group) ||
+        (has_following_group &&
+         group_index + 1U >= kSharedPaMaxBlockGroups)) {
+        return 0;
+    }
+    return static_cast<uint8_t>(
+        kSharedPaTicketMetaPresent |
+        (has_following_group ? kSharedPaTicketHasFollowing : 0U) |
+        (group_index << kSharedPaTicketGroupShift) |
+        static_cast<uint32_t>(kind)
+    );
+}
+
+PA_DEVICE bool DecodeSharedPaTaskMeta(
+    uint8_t encoded, uint32_t task_id, SharedPaTaskMeta &meta
+) {
+    if ((encoded & kSharedPaTicketMetaPresent) == 0 ||
+        (encoded & kSharedPaTicketMetaReserved) != 0 ||
+        task_id >= kMaxTasks) {
+        return false;
+    }
+    const TaskKind kind =
+        static_cast<TaskKind>(encoded & kSharedPaTicketKindMask);
+    const uint32_t group_index =
+        (encoded >> kSharedPaTicketGroupShift) &
+        kSharedPaTicketGroupMask;
+    const bool has_following_group =
+        (encoded & kSharedPaTicketHasFollowing) != 0;
+    if (kind >= TaskKind::Count ||
+        group_index >= kSharedPaMaxBlockGroups ||
+        (kind == TaskKind::Alloc &&
+         (group_index != 0 || has_following_group)) ||
+        (kind != TaskKind::Up && has_following_group) ||
+        (has_following_group &&
+         group_index + 1U >= kSharedPaMaxBlockGroups)) {
+        return false;
+    }
+    const uint32_t task_offset =
+        SharedPaTaskOffset(kind, group_index);
+    if (task_id < task_offset) {
+        return false;
+    }
+    meta.kind = kind;
+    meta.group_index = group_index;
+    meta.batch_start = task_id - task_offset;
+    meta.has_following_group = has_following_group;
+    meta.chained_writer =
+        kind == TaskKind::Up && group_index != 0;
+    return true;
+}
+#endif
+
+PA_DEVICE TaskKind GetTaskKind(uint32_t task_id) {
+    return static_cast<TaskKind>(task_id % kTasksPerBatch);
+}
 
 PA_DEVICE int32_t FunctionId(TaskKind kind) {
     return kind == TaskKind::Alloc ? -1 : static_cast<int32_t>(KindIndex(kind) - 1);
 }
+
+#if PTO_FDWIC_SHARED_MAP
+PA_DEVICE bool SharedPaFunctionIdMatches(
+    TaskKind kind, bool winner, int32_t function_id
+) {
+    // Claim loser 不执行 kernel，真实 function_id 固定为 -1；winner 则
+    // 必须与 ticket 中显式 kind 一致。QK/PV 的 output count 同为 1，
+    // 不能只靠 shared_result.Size() 间接校验。
+    return function_id == (winner ? FunctionId(kind) : -1);
+}
+#endif
 
 PA_DEVICE uint64_t DependencyEdgeSignature(
     uint32_t consumer, uint32_t producer
@@ -457,7 +545,11 @@ PA_DEVICE int32_t FindFreeSlot(PA_GM WorkerState &worker) {
 
 template <typename Ops, bool Profile>
 PA_DEVICE void WaitForSlot(
-    PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_id, LocalStats &stats
+    PA_GM SchedulerState *state, PA_GM WorkerState &worker,
+    uint32_t task_id, LocalStats &stats
+#if PTO_FDWIC_SHARED_MAP
+    , bool &fatal_exit
+#endif
 ) {
     // 四个物理 slot 中预留两个 won slot 语义位，仅有 kUsableSlots 个可供本图使用；满时靠 drain 取得进展。
     const uint64_t wait_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
@@ -474,6 +566,16 @@ PA_DEVICE void WaitForSlot(
         if (DrainReady<Ops>(
                 state, worker, DrainPlace::RingBackpressure, stats
             ) == 0) {
+#if PTO_FDWIC_SHARED_MAP
+            // gate 放行后若其他 worker 报错，本核可能正被两个永远无法
+            // ready 的后继 slot 顶满。每 1024 次无进展轮询一次 fatal，
+            // 只影响真正的背压慢路，不给正常 winner 热路增加原子读取。
+            if ((stats.result.wait_iterations[0] & 1023ULL) == 0 &&
+                Ops::Load(&state->fatal.value) != 0) {
+                fatal_exit = true;
+                break;
+            }
+#endif
             Ops::SpinHint();
         }
     }
@@ -679,7 +781,17 @@ PA_DEVICE bool BuildWinner(
 ) {
     // kernel winner 不在 Submit 内立即执行计算，而是把完整 payload 和 fanin 存入自己的私有 ring slot。
     // 后续 EfDrain/背压 drain/最终 drain 在依赖满足后执行它，这正是 PA 的 Submit 与执行解耦点。
+#if PTO_FDWIC_SHARED_MAP
+    bool slot_wait_failed = false;
+    WaitForSlot<Ops, Profile>(
+        state, worker, task_id, stats, slot_wait_failed
+    );
+    if (slot_wait_failed) {
+        return false;
+    }
+#else
     WaitForSlot<Ops, Profile>(state, worker, task_id, stats);
+#endif
 #if !PTO_FDWIC_SHARED_MAP
     // private heap_next 是单调 ring 坐标，必须通过 frontier/vend 防止覆盖。
     // shared S3.2 使用有界 shard cursor 且首版禁止回绕，两种坐标不能混用。
@@ -747,6 +859,29 @@ PA_DEVICE bool DiscardBuiltTask(
         return accounting_valid;
     }
     return false;
+}
+
+template <typename Ops>
+PA_DEVICE bool DiscardSharedSlotsAfterReplayFatal(
+    PA_GM SchedulerState *state, PA_GM WorkerState &worker
+) {
+    // 只有所有 worker 都已退出 replay、不会再生产 slot 后才能调用。
+    // fatal 表示本轮结果已经整体无效；此时未完成 fanin 不可能再获得
+    // completion，继续 FinalDrain 只会永久自旋。保留 slot 的 task/fanin
+    // 内容供诊断，只清除本地执行资格与占用计数。
+    if (state == nullptr || Ops::Load(&state->fatal.value) == 0) {
+        return false;
+    }
+    uint32_t occupied_slots = 0;
+    for (uint32_t index = 0; index < kPrivateSlots; ++index) {
+        occupied_slots += worker.slots[index].occupied ? 1U : 0U;
+        worker.slots[index].built = false;
+        worker.slots[index].occupied = false;
+    }
+    const bool accounting_valid =
+        occupied_slots == worker.occupied_count;
+    worker.occupied_count = 0;
+    return accounting_valid;
 }
 
 // register_mask 只指向已经存在的 Local/GM descriptor。两个地址空间分支
@@ -900,8 +1035,10 @@ PA_DEVICE uint32_t CollectSharedFanin(
     uint32_t validated_ordinary_lookups = 0;
     uint32_t validated_input_loads = 0;
 
-    // 只读取并校验，不修改 last_writer、统计或输出 fanin。INOUT writer
-    // 仍在 Build 成功后提交；后续引用非法时不会留下半次 writer 更新。
+    // 只读取并校验，不修改 last_writer、统计或输出 fanin。final UP 与
+    // 普通任务在 Build 成功后提交 writer；non-final UP 则在 registration
+    // 校验后、Build 前提交 intent。两条路径都先完成本轮只读校验，后续
+    // 引用非法时不会留下半次 writer 更新。
     for (int32_t index = 0; index < args.tensor_count; ++index) {
         const TensorArgType tag =
             TaskTag(args, static_cast<uint32_t>(index));
@@ -1119,8 +1256,9 @@ PA_DEVICE bool WaitForSharedWriterReady(
     }
 }
 
-// 只有任务的本地执行状态已经成功建立后，才提交它消费的 INOUT writer。
-// FetchMax 返回旧 writer；默认实例要求精确等于 descriptor producer，
+// 默认路径在本地执行状态建立后提交 INOUT writer；PA non-final UP 的
+// intent 路径允许在 fanin/registration 已验证、winner Build 前提交，以
+// 便 loser 构造下一组。FetchMax 返回旧 writer；默认实例要求精确等于 descriptor producer，
 // 显式 ChainedWriter 实例按原 producer identity 选择链式 symbol，并要求
 // 其旧值精确等于调用方给出的前一 writer；其他 fresh symbol 仍匹配各自
 // producer。
@@ -1218,17 +1356,11 @@ PA_DEVICE bool CommitSharedFaninWriters(
     return true;
 }
 
-// PA 的 non-final UP 在 winner Build 前登记 shared-output writer，并以
-// deps_prepared 放行同 task losers。这里只覆盖 PA 已知的三条 accumulator
-// symbol；普通 region writer 必须另走完整 region-intent 协议，不能被本
-// helper 静默忽略。成功时 context.fanin 已可供后续 winner Build 复用，
-// Finish 不得再次 Collect 或 Commit。
 template <typename Ops, bool ChainedWriter = false>
-PA_DEVICE bool PreparePaSharedWriterIntent(
+PA_DEVICE bool ValidatePaSharedWriterIntentShape(
     PA_GM SchedulerState *state, const TaskArgs &args,
-    SubmitContext &context, LocalStats &stats,
-    int32_t chained_producer_task_id = -1,
-    int32_t expected_shared_writer = -1
+    const SubmitContext &context, LocalStats &stats,
+    int32_t chained_producer_task_id = -1
 ) {
     const int32_t task_id = context.task_id;
     if (state == nullptr || !context.won || task_id < 0 ||
@@ -1244,7 +1376,13 @@ PA_DEVICE bool PreparePaSharedWriterIntent(
         return false;
     }
 
+    const int32_t accumulator_producer =
+        ChainedWriter
+            ? chained_producer_task_id
+            : task_id - 4;
+    bool accumulator_slots[3] = {false, false, false};
     uint32_t shared_writer_refs = 0;
+    uint32_t manual_dep_writer_refs = 0;
     for (int32_t index = 0; index < args.tensor_count; ++index) {
         const TensorArgType tag =
             TaskTag(args, static_cast<uint32_t>(index));
@@ -1254,12 +1392,29 @@ PA_DEVICE bool PreparePaSharedWriterIntent(
         }
         const TaskTensorRef &reference = args.tensors[index];
         if (reference.kind == TensorRefKind::SharedOutputRef) {
+            const FdwicOutputRef output_ref =
+                SharedOutputReference(reference);
+            if (!IsPlainSharedOutputRef(output_ref) ||
+                accumulator_producer < 0 ||
+                output_ref.producer_task_id != accumulator_producer ||
+                output_ref.output_slot < 0 ||
+                output_ref.output_slot >= 3 ||
+                accumulator_slots[
+                    static_cast<uint32_t>(output_ref.output_slot)
+                ]) {
+                SetFatal<Ops>(state, stats, task_id);
+                return false;
+            }
+            accumulator_slots[
+                static_cast<uint32_t>(output_ref.output_slot)
+            ] = true;
             ++shared_writer_refs;
             continue;
         }
-        // PA 的 output_view 是唯一非 symbol INOUT，并由 manual_dep
-        // 显式排除自动 hazard。任何普通 region writer 都不能借这个
-        // PA 专用快路越过登记。
+        // PA UP 的真实参数还包含一个非 symbol、manual_dep 的 output
+        // view。这里不凭地址猜测具体 view 身份，但要求这类 writer 恰好
+        // 一条；任何普通 region writer 或重复 manual-dependency writer
+        // 都不能借这个 PA 专用快路越过登记。
         bool manual_dep = false;
         if (reference.kind == TensorRefKind::GmTensor &&
             reference.pointer.gm_tensor != nullptr) {
@@ -1272,12 +1427,66 @@ PA_DEVICE bool PreparePaSharedWriterIntent(
             SetFatal<Ops>(state, stats, task_id);
             return false;
         }
+        ++manual_dep_writer_refs;
     }
     // 这是 PA UP 专用快路，不是 ordinary-region writer 的通用替代品。
     // 三个 shared writer 必须正好对应 output/sum/max accumulator；缺失或
     // 多出任意一个都拒绝发布门，避免后继在 writer 状态不完整时前进。
-    if (shared_writer_refs != 3) {
+    if (shared_writer_refs != 3 ||
+        manual_dep_writer_refs != 1 ||
+        !accumulator_slots[0] ||
+        !accumulator_slots[1] ||
+        !accumulator_slots[2]) {
         SetFatal<Ops>(state, stats, task_id);
+        return false;
+    }
+    return true;
+}
+
+// 调用者已经完成只读 fanin 解析和 ordinary registration 校验后，登记
+// 三个 accumulator writer，再发布 deps_prepared。它位于 winner Build
+// 之前；后续 Finish 必须复用 context.fanin，并在 Build 后跳过第二次
+// Commit。默认实例处理首组，ChainedWriter 处理中间组。
+template <typename Ops, bool ChainedWriter = false>
+PA_DEVICE bool CommitPaSharedWriterIntentAfterFanin(
+    PA_GM SchedulerState *state, const TaskArgs &args,
+    SubmitContext &context, LocalStats &stats,
+    int32_t chained_producer_task_id = -1,
+    int32_t expected_shared_writer = -1
+) {
+    const int32_t task_id = context.task_id;
+    if (!ValidatePaSharedWriterIntentShape<Ops, ChainedWriter>(
+            state, args, context, stats,
+            chained_producer_task_id
+        )) {
+        return false;
+    }
+    if (!CommitSharedFaninWriters<Ops, ChainedWriter>(
+            state->shared_map, args, task_id, stats,
+            chained_producer_task_id, expected_shared_writer
+        ) ||
+        !PublishSharedWriterReady<Ops>(state, task_id)) {
+        SetFatal<Ops>(state, stats, task_id);
+        return false;
+    }
+    return true;
+}
+
+// 隔离测试和无独立 Finish 阶段的调用点可一次完成 Collect + Commit +
+// gate。真实 shared Finish 先自行 Collect/计入依赖签名，完成 registration
+// 校验后只调用 CommitPaSharedWriterIntentAfterFanin，避免重复读 writer。
+template <typename Ops, bool ChainedWriter = false>
+PA_DEVICE bool PreparePaSharedWriterIntent(
+    PA_GM SchedulerState *state, const TaskArgs &args,
+    SubmitContext &context, LocalStats &stats,
+    int32_t chained_producer_task_id = -1,
+    int32_t expected_shared_writer = -1
+) {
+    const int32_t task_id = context.task_id;
+    if (!ValidatePaSharedWriterIntentShape<Ops, ChainedWriter>(
+            state, args, context, stats,
+            chained_producer_task_id
+        )) {
         return false;
     }
 
@@ -1295,15 +1504,10 @@ PA_DEVICE bool PreparePaSharedWriterIntent(
         SetFatal<Ops>(state, stats, task_id);
         return false;
     }
-    if (!CommitSharedFaninWriters<Ops, ChainedWriter>(
-            state->shared_map, args, task_id, stats,
+    return CommitPaSharedWriterIntentAfterFanin<Ops, ChainedWriter>(
+            state, args, context, stats,
             chained_producer_task_id, expected_shared_writer
-        ) ||
-        !PublishSharedWriterReady<Ops>(state, task_id)) {
-        SetFatal<Ops>(state, stats, task_id);
-        return false;
-    }
-    return true;
+        );
 }
 
 // fresh descriptor 的内容写入每 task 独占的 shared-output cell，并通过
@@ -1404,12 +1608,26 @@ template <typename Ops>
 PA_DEVICE bool PublishSharedWinnerAfterBuild(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker,
     const TaskArgs &args, const SubmitContext &context,
-    uint32_t task_id, TaskKind kind, LocalStats &stats
+    uint32_t task_id, TaskKind kind, LocalStats &stats,
+    bool writers_prepared = false,
+    bool chained_writer = false,
+    int32_t chained_producer_task_id = -1,
+    int32_t expected_shared_writer = -1
 ) {
-    const bool writers_committed =
-        CommitSharedFaninWriters<Ops>(
-            state->shared_map, args, static_cast<int32_t>(task_id), stats
-        );
+    bool writers_committed = writers_prepared;
+    if (!writers_prepared) {
+        writers_committed = chained_writer
+            ? CommitSharedFaninWriters<Ops, true>(
+                  state->shared_map, args,
+                  static_cast<int32_t>(task_id), stats,
+                  chained_producer_task_id,
+                  expected_shared_writer
+              )
+            : CommitSharedFaninWriters<Ops>(
+                  state->shared_map, args,
+                  static_cast<int32_t>(task_id), stats
+              );
+    }
     const bool outputs_published =
         writers_committed &&
         PublishSharedTaskOutputs<Ops>(
@@ -1628,9 +1846,26 @@ PA_DEVICE bool FinishCallbackSubmitBody(
     PmuContext &pmu_context, const CallbackSubmitTicket &ticket
 ) {
     const uint32_t task_id = ticket.task_id;
+#if PTO_FDWIC_SHARED_MAP
+    SharedPaTaskMeta shared_task_meta{};
+    if (!DecodeSharedPaTaskMeta(
+            ticket.reserved, task_id, shared_task_meta
+        )) {
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
+    const TaskKind kind = shared_task_meta.kind;
+#else
     const TaskKind kind = GetTaskKind(task_id);
+#endif
     const int32_t function_id = static_cast<int32_t>(ticket.function_id);
     const bool winner = ticket.won != 0;
+#if PTO_FDWIC_SHARED_MAP
+    if (!SharedPaFunctionIdMatches(kind, winner, function_id)) {
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
+#endif
 
 #if PTO_FDWIC_SHARED_MAP
     // callback 已经返回；只有 Claim winner 才把 CreateInfo 物化为 descriptor
@@ -1645,6 +1880,15 @@ PA_DEVICE bool FinishCallbackSubmitBody(
         Ops::Load(&state->fatal.value) != 0) {
         return false;
     }
+    // non-final UP 的每个 loser 都必须等 winner 完成 writer intent 登记，
+    // 才能返回 orchestration 并构造下一组。这里只等待依赖元数据可见，
+    // task 的 kernel 完成仍由后继 slot fanin 的 completion flag 保证。
+    if (!winner && shared_task_meta.has_following_group &&
+        !WaitForSharedWriterReady<Ops>(
+            state, static_cast<int32_t>(task_id), stats
+        )) {
+        return false;
+    }
     const uint64_t materialize_begin =
         TraceTimestamp<Ops>(stats.trace, stats.result);
     BeginSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
@@ -1653,6 +1897,8 @@ PA_DEVICE bool FinishCallbackSubmitBody(
         materialized = MaterializeTask<Ops, true>(
             worker, task_id, args, context, state->shared_map,
             state->heap_base, state->heap_size,
+            kind, shared_task_meta.batch_start,
+            shared_task_meta.group_index,
             &stats.trace, &stats.result
         );
         if (materialized) {
@@ -1721,6 +1967,9 @@ PA_DEVICE bool FinishCallbackSubmitBody(
     );
 #endif
 
+#if PTO_FDWIC_SHARED_MAP
+    bool shared_writers_prepared = false;
+#endif
     uint64_t register_begin =
 #if PTO_FDWIC_SHARED_MAP
         materialize_end;
@@ -1732,11 +1981,31 @@ PA_DEVICE bool FinishCallbackSubmitBody(
 #if PTO_FDWIC_SHARED_MAP
         bool lookup_protocol_ok = false;
         uint32_t ordinary_lookup_count = 0;
-        context.fanin_count = static_cast<int32_t>(CollectSharedFanin<Ops>(
-            state->shared_map, args, static_cast<int32_t>(task_id),
-            static_cast<int32_t>(state->heap_window), stats, context.fanin,
-            lookup_protocol_ok, ordinary_lookup_count, &state->fatal.value
-        ));
+        if (shared_task_meta.chained_writer) {
+            context.fanin_count = static_cast<int32_t>(
+                CollectSharedFanin<Ops, true>(
+                    state->shared_map, args,
+                    static_cast<int32_t>(task_id),
+                    static_cast<int32_t>(state->heap_window), stats,
+                    context.fanin, lookup_protocol_ok,
+                    ordinary_lookup_count, &state->fatal.value,
+                    static_cast<int32_t>(
+                        shared_task_meta.batch_start
+                    ),
+                    static_cast<int32_t>(task_id) - 4
+                )
+            );
+        } else {
+            context.fanin_count = static_cast<int32_t>(
+                CollectSharedFanin<Ops>(
+                    state->shared_map, args,
+                    static_cast<int32_t>(task_id),
+                    static_cast<int32_t>(state->heap_window), stats,
+                    context.fanin, lookup_protocol_ok,
+                    ordinary_lookup_count, &state->fatal.value
+                )
+            );
+        }
         if (!lookup_protocol_ok) {
             SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
             return false;
@@ -1798,6 +2067,36 @@ PA_DEVICE bool FinishCallbackSubmitBody(
         return false;
     }
 
+#if PTO_FDWIC_SHARED_MAP
+    if (__builtin_expect(winner, 0) &&
+        shared_task_meta.has_following_group) {
+        // PA 的 non-final UP 固定有 SF/PV/accumulator 三条 fanin。先完成
+        // registration，再登记 writer intent并放行 loser；Build 后只做
+        // fresh-output 封口，绝不能重复 Collect/Commit。
+        if (kind != TaskKind::Up || context.fanin_count != 3) {
+            SetFatal<Ops>(
+                state, stats, static_cast<int32_t>(task_id)
+            );
+            return false;
+        }
+        const bool prepared = shared_task_meta.chained_writer
+            ? CommitPaSharedWriterIntentAfterFanin<Ops, true>(
+                  state, args, context, stats,
+                  static_cast<int32_t>(
+                      shared_task_meta.batch_start
+                  ),
+                  static_cast<int32_t>(task_id) - 4
+              )
+            : CommitPaSharedWriterIntentAfterFanin<Ops>(
+                  state, args, context, stats
+              );
+        if (!prepared) {
+            return false;
+        }
+        shared_writers_prepared = true;
+    }
+#endif
+
     if (__builtin_expect(winner, 0)) {
         const uint64_t winner_build_begin = register_end;
         if (kind == TaskKind::Alloc) {
@@ -1815,13 +2114,20 @@ PA_DEVICE bool FinishCallbackSubmitBody(
                 return false;
             }
         }
-        // 先建立可执行状态，再提交本任务的唯一 INOUT writer，最后发布
-        // fresh outputs。PA Case1 没有多级 writer 链；后继只等待自己
-        // 实际依赖的 published cell，不再经过全局 committed_tasks。
+        // 先建立可执行状态。普通/final task 随后提交本任务的 INOUT
+        // writer；non-final UP 已在 Build 前登记 writer intent，这里只
+        // 跳过重复 Commit。fresh outputs 最后封口；后继只等待自己实际
+        // 依赖的 published cell，不再经过全局 committed_tasks。
         // published 成功之后只剩观察记录与 Submit 收尾。
 #if PTO_FDWIC_SHARED_MAP
         if (!PublishSharedWinnerAfterBuild<Ops>(
-                state, worker, args, context, task_id, kind, stats
+                state, worker, args, context, task_id, kind, stats,
+                shared_writers_prepared,
+                shared_task_meta.chained_writer,
+                static_cast<int32_t>(
+                    shared_task_meta.batch_start
+                ),
+                static_cast<int32_t>(task_id) - 4
             )) {
             return false;
         }
@@ -1863,6 +2169,9 @@ PA_DEVICE uint32_t FinishSplitCallbackSubmitFromRuntime(
     CompeteFirstSplitRuntimeState &runtime = Ops::CompeteFirstSplitState();
     const uint64_t state_address = reinterpret_cast<uint64_t>(&runtime);
     runtime.finish_state_address = state_address;
+#if PTO_FDWIC_SHARED_MAP
+    SharedPaTaskMeta ticket_meta{};
+#endif
 
     bool valid = ticket != nullptr && args != nullptr && runtime.scheduler != nullptr &&
                  runtime.worker != nullptr && runtime.task_count != 0 &&
@@ -1873,18 +2182,30 @@ PA_DEVICE uint32_t FinishSplitCallbackSubmitFromRuntime(
                      runtime.worker_id, runtime.worker->role
                  ) && runtime.reserved == 0;
     if (valid) {
+#if PTO_FDWIC_SHARED_MAP
+        valid = ticket->task_id < runtime.task_count &&
+                runtime.context.task_id == static_cast<int32_t>(ticket->task_id) &&
+                runtime.context.kernel_id == static_cast<int32_t>(ticket->function_id) &&
+                runtime.context.won == (ticket->won != 0);
+        if (valid) {
+            valid =
+                DecodeSharedPaTaskMeta(
+                    ticket->reserved, ticket->task_id, ticket_meta
+                ) &&
+                SharedPaFunctionIdMatches(
+                    ticket_meta.kind, ticket->won != 0,
+                    static_cast<int32_t>(ticket->function_id)
+                ) &&
+                runtime.context.shared_result.TaskId() ==
+                    static_cast<int32_t>(ticket->task_id) &&
+                runtime.context.shared_result.Size() ==
+                    FrontendTaskOutputCount(ticket_meta.kind);
+        }
+#else
         valid = ticket->reserved == 0 && ticket->task_id < runtime.task_count &&
                 runtime.context.task_id == static_cast<int32_t>(ticket->task_id) &&
                 runtime.context.kernel_id == static_cast<int32_t>(ticket->function_id) &&
                 runtime.context.won == (ticket->won != 0);
-#if PTO_FDWIC_SHARED_MAP
-        if (valid) {
-            valid =
-                runtime.context.shared_result.TaskId() ==
-                    static_cast<int32_t>(ticket->task_id) &&
-                runtime.context.shared_result.Size() ==
-                    FrontendTaskOutputCount(GetTaskKind(ticket->task_id));
-        }
 #endif
     }
     ++runtime.finish_calls;
@@ -1924,6 +2245,10 @@ PA_DEVICE bool SubmitCallbackTask(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_count,
     PaOrchestrationState &orch, TaskArgs &args, uint32_t batch,
     SubmitContext &context, LocalStats &stats, PmuContext &pmu_context
+#if PTO_FDWIC_SHARED_MAP
+    , uint32_t shared_group_index = 0,
+    bool shared_has_following_group = false
+#endif
 ) {
     BeginCallbackSubmit(worker, context);
     const uint32_t task_id = static_cast<uint32_t>(context.task_id);
@@ -2000,12 +2325,25 @@ PA_DEVICE bool SubmitCallbackTask(
         return false;
     }
 #endif
+#if PTO_FDWIC_SHARED_MAP
+    const uint8_t shared_task_meta = EncodeSharedPaTaskMeta(
+        Kind, shared_group_index, shared_has_following_group
+    );
+    if (shared_task_meta == 0) {
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
+#endif
     const CallbackSubmitTicket ticket{
         submit_begin,
         task_id,
         static_cast<int16_t>(claim.function_id),
         static_cast<uint8_t>(claim.won ? 1 : 0),
+#if PTO_FDWIC_SHARED_MAP
+        shared_task_meta,
+#else
         0,
+#endif
     };
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
     (void)state;
@@ -2375,6 +2713,9 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     bool middle_released = false;
     bool leaf_released = false;
     bool global_release_observed = false;
+#if PTO_FDWIC_SHARED_MAP
+    uint32_t final_stall_polls = 0;
+#endif
     while (true) {
         const uint32_t freed =
             DrainReady<Ops>(state, worker, DrainPlace::FinalDrain, stats);
@@ -2392,6 +2733,23 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #endif
             global_release_observed = true;
         }
+#if PTO_FDWIC_SHARED_MAP
+        // final barrier 证明所有 replay actor 已停止生产。只有本轮没有
+        // 释放任何 slot、且本核仍被未完成 fanin 阻塞时才按 1024 次一批
+        // 探测 fatal；正常 count==0 出口不新增原子，正常跨核推进也不会
+        // 被误清。fatal 时撤销本核执行资格，保证所有 worker 收敛退出。
+        if (global_release_observed && freed == 0 &&
+            worker.occupied_count != 0) {
+            ++final_stall_polls;
+            if ((final_stall_polls & 1023U) == 0) {
+                (void)DiscardSharedSlotsAfterReplayFatal<Ops>(
+                    state, worker
+                );
+            }
+        } else {
+            final_stall_polls = 0;
+        }
+#endif
         // 必须同时满足“无人再生产新 slot”和“本核旧 slot 全部完成”，否则继续帮助系统推进 completion。
         if (global_release_observed && worker.occupied_count == 0) {
             break;

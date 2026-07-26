@@ -128,7 +128,7 @@ void ExpectRejectedWithoutHeapChange(
     Check(
         !MaterializeTask<MaterializeTestOps>(
             *fixture.worker, 1, fixture.args, fixture.context, *fixture.map,
-            heap_base, heap_size
+            heap_base, heap_size, TaskKind::Qk, 0, 0
         ),
         reject_message
     );
@@ -140,7 +140,7 @@ void TestValidQkMaterialize() {
     Check(
         MaterializeTask<MaterializeTestOps>(
             *fixture.worker, 1, fixture.args, fixture.context, *fixture.map,
-            kSyntheticHeapBase, kHeapBytes
+            kSyntheticHeapBase, kHeapBytes, TaskKind::Qk, 0, 0
         ),
         "valid QK output materializes"
     );

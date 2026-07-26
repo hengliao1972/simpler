@@ -63,15 +63,32 @@ enum class TensorMapBuildMode : uint32_t {
 constexpr TensorMapBuildMode kCompiledTensorMapMode =
     static_cast<TensorMapBuildMode>(PTO_FDWIC_SHARED_MAP);
 constexpr uint32_t kBuildIdentityMagic = 0x50414249U;  // "PABI"
+#if PTO_FDWIC_SHARED_MAP
+constexpr uint32_t kBuildIdentityAbiVersion = 5;
+#else
 constexpr uint32_t kBuildIdentityAbiVersion = 4;
+#endif
 
-// 这里固定的是 PA Case1 的调度拓扑，而不是为了缩小 standalone 人为选择的规模：
-// 每个 batch 依次回放 Alloc/QK/SF/PV/UP 五个 task，32 个 AIC 与 64 个 AIV
-// 都执行同一条 orchestration 流，只在 Claim 时按 task 的 active role 分流。
+// private 与现有 shared 单组 Case1 每 batch 都回放五个 task。shared
+// 多组请求复用一次 Alloc，随后每个 block group 增加 QK/SF/PV/UP 四
+// task；ticket 的两个 group bit 与 PA 256/64=4 组上限一致。实际组数
+// 仍由每个 batch 的 context_len 决定，不是编译期固定为四组。
 constexpr uint32_t kDefaultBatches = 256;
 constexpr uint32_t kMaxBatches = 256;
 constexpr uint32_t kTasksPerBatch = 5;
+#if PTO_FDWIC_SHARED_MAP
+constexpr uint32_t kSharedPaMaxBlockGroups = 4;
+constexpr uint32_t kSharedPaMaxTasksPerBatch =
+    1U + 4U * kSharedPaMaxBlockGroups;
+constexpr uint32_t kMaxTasks =
+    kMaxBatches * kSharedPaMaxTasksPerBatch;
+static_assert(
+    kSharedPaMaxTasksPerBatch == 17 && kMaxTasks == 4352,
+    "shared PA task capacity no longer covers four block groups"
+);
+#else
 constexpr uint32_t kMaxTasks = kMaxBatches * kTasksPerBatch;
+#endif
 constexpr uint32_t kTaskCellCapacity = 1U << 16;
 
 constexpr uint32_t kAicWorkers = 32;
@@ -214,8 +231,9 @@ enum class FinalBarrierShape : uint32_t {
 constexpr uint64_t kCompeteFirstSplitStateCookieBase = 0x434653504c495400ULL;
 #endif
 
-// task_id % 5 即 kind；该周期性是不变量，既决定 Claim cursor/active role，
-// 也决定输出大小、fanin 拓扑和 winner workload 的选择。
+// private 的 task_id % 5 即 kind。shared 单组虽有相同数值布局，也统一
+// 从 ticket 元数据恢复 kind；多组布局为 Alloc + N×(QK/SF/PV/UP)，
+// 不能再用 %5 推导。
 enum class TaskKind : uint32_t {
     Alloc = 0,
     Qk = 1,
@@ -832,8 +850,8 @@ static_assert(offsetof(SharedBucketState, tail) == 64, "shared head/tail must no
 // fresh Output 不再借助 region map 按地址查找，而是由
 // (producer_task_id, output_slot) 直接定位。descriptor 发布位、writer 链
 // 和不可变 descriptor 分属独立 cache line 区域，避免三种访问彼此伪共享。
-// standalone 本阶段最多 1280 个 task，且不复用 task id，因此外层表直接按
-// task_id 寻址，不做取模，也不在这里提前引入 generation。
+// shared 最大覆盖 256 batch × 4 block group；本轮 task_id 不复用，
+// 因此外层表直接寻址，不做取模，也不在这里提前引入 generation。
 struct alignas(64) SharedOutputCell {
     AtomicLine published[kSharedOutputMaxPerTask];
     AtomicLine last_writer[kSharedOutputMaxPerTask];
@@ -859,7 +877,8 @@ struct alignas(64) SharedTensorMapSidecar {
     SharedRegionSlot slots[kMapCapacity];
 #if PTO_FDWIC_SHARED_MAP
     // 追加在既有 S2.5 region ring 之后，保持 committed/reclaim、bucket 和
-    // slot 的全部 offset 不变；现有 shared sidecar H2D/D2H 按 sizeof 搬运。
+    // slot 的全部 offset 不变。容量按 shared 最坏 17 task/batch 分配；
+    // 现有 shared sidecar H2D/D2H 按 sizeof 搬运。
     SharedOutputCell shared_outputs[kMaxTasks];
     // shared heap 控制字继续追加在 S3.1 output table 之后。每个 shard cursor
     // 与全局 aggregate vend 独占 cache line，避免不同 winner 的原子更新伪共享。
@@ -873,21 +892,21 @@ struct alignas(64) SharedTensorMapSidecar {
 #endif
 };
 #if PTO_FDWIC_SHARED_MAP
-static_assert(sizeof(SharedTensorMapSidecar) == 4736192, "shared TensorMap sidecar size changed");
+static_assert(sizeof(SharedTensorMapSidecar) == 11027648, "shared TensorMap sidecar size changed");
 static_assert(
     offsetof(SharedTensorMapSidecar, shared_outputs) == 2113664,
     "shared output table offset mismatch"
 );
 static_assert(
-    offsetof(SharedTensorMapSidecar, shared_heap_cursor) == 4735104,
+    offsetof(SharedTensorMapSidecar, shared_heap_cursor) == 11026560,
     "shared heap cursor offset mismatch"
 );
 static_assert(
-    offsetof(SharedTensorMapSidecar, shared_heap_vend) == 4735616,
+    offsetof(SharedTensorMapSidecar, shared_heap_vend) == 11027072,
     "shared heap vend offset mismatch"
 );
 static_assert(
-    offsetof(SharedTensorMapSidecar, shared_vector_cursor) == 4735680,
+    offsetof(SharedTensorMapSidecar, shared_vector_cursor) == 11027136,
     "shared Vector cursor offset mismatch"
 );
 #else
@@ -906,8 +925,10 @@ static_assert(
 struct TaskPayload {
     TensorDesc tensors[kMaxTaskTensors];
 };
-// task_id 通过 kPayloadMask 映射到 2048 个 4 KiB payload；Case1 只有 1280 个 task，
-// 本轮不会回绕，但仍保留生产容量、寻址方式和 4 KiB stride。
+// task_id 通过 kPayloadMask 映射到 2048 个 4 KiB payload。现有单组 B256
+// 只有 1280 个 task，不会回绕；未来 shared 多组允许回绕，但 payload
+// 只活到本次 Finish 完成 descriptor 发布/slot 拷贝，后续依赖读取的是
+// shared cell 或 LocalSlot 中的副本，不能跨 Submit 保存 payload 指针。
 static_assert(sizeof(TaskPayload) == kPayloadStride, "TaskPayload must preserve the real 4 KiB task stride");
 static_assert(alignof(TaskPayload) == 8, "TaskPayload alignment must match DistTaskPayload");
 static_assert(offsetof(TaskPayload, tensors) == 0, "TaskPayload tensor offset mismatch");

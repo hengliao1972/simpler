@@ -5066,3 +5066,155 @@ Finish 和 host oracle 也有同类五 task 假设。下一阶段必须为 share
 上述 shared 代码段与 S6.1 完全相同，证明新增 helper 和测试没有让当前
 单组 B256 多出恒假分支。private 的 CPU 整体产物和 CCEC 七个 device
 对象代码/常量段也都不变；含 DWARF 的 CCEC 整对象不作为比较口径。
+
+### 2026-07-26：S6.3 接通 shared 显式 Finish 协议并补齐异常收敛门槛
+
+本阶段仍只在 standalone 建立双组调度的公共基础，没有把尚未完成的
+九 task main 或 host oracle 冒充成端到端结果。架构边界进一步明确为：
+
+- private 继续使用原五 task、`task_id % 5`、`reserved=0` 和私有
+  TensorMap；shared 多组问题不能污染 private。
+- 全部 shared 构建统一携带 task kind/group 元数据。现有单组 B256
+  自然使用 `group=0,has_following=false`，因此走同一正确性基础但不发布
+  writer-ready gate；不能另造一个“多组专用 ELF”回避公共代码。
+- shared 实际组数最终来自每 batch 的 `context_lens`。本阶段只接通
+  ticket、Materialize、Finish 和异常收敛，主 replay 仍固定五 task。
+
+#### 固定 16B ticket 内的显式 replay 身份
+
+`CallbackSubmitTicket` 没有扩容，只复用最后一个 `reserved` byte：
+
+```text
+bits 0..2 : TaskKind
+bits 3..4 : group index，最多四组
+bit 5     : has-following-group，仅 non-final UP 可置位
+bit 6     : 保留，当前必须为 0
+bit 7     : shared metadata present
+```
+
+解码后由
+`batch_start = task_id - SharedPaTaskOffset(kind,group)` 按 ticket
+自洽布局反推 batch 起点。`MaterializeTask` 不再在 shared 下使用
+`%5`，而是显式接收 `kind/batch_start/group`，并校验所有 producer 都
+落在该 batch 已经可见的 replay 前缀内。这样 task 8 会按第二组 UP
+处理，不会被误判为 PV。这里还不是独立 task-plan 身份校验；下一阶段
+必须让 replay 与 host oracle 共同消费同一 plan，才能从外部证明
+`batch_start`，不能把 ticket 的自洽反推冒充成完整 plan 证明。
+
+split Finish 还显式验证：
+
+- winner 的 `function_id` 必须等于 `FunctionId(kind)`；
+- loser 的 `function_id` 必须为 `-1`；
+- ticket kind 对应的 output count 必须与 `shared_result` 一致；
+- metadata present/reserved/kind/group/has-following 组合全部合法。
+- `task_id` 必须小于 shared 固定容量 `kMaxTasks`，即使损坏的
+  `runtime.task_count` 更大，final loser 也不能绕过 output table 边界。
+
+QK 与 PV 的 output count 同为 1，因此只校验 output count 不足以证明
+kind 正确。定向用例专门构造“QK kind + PV function_id”，确认在进入
+Finish body、读取 `TaskArgs` 之前就 fail-closed。
+
+#### non-final UP 的 Finish 顺序
+
+shared winner 现在固定按下列顺序推进：
+
+```text
+Materialize
+  -> CollectSharedFanin，并只折叠一次 dependency signature
+  -> ValidateEmptySharedRegistration
+  -> non-final UP：登记三个 accumulator writer，发布 gate
+  -> BuildWinner
+  -> 已提前登记 writer 时跳过第二次 Commit
+  -> fresh-output 封口
+```
+
+首组 UP 使用普通 `(producer=Alloc,writer=Alloc)` 校验；第二组及后续
+UP 使用显式 `(chained_producer=Alloc,expected_writer=上一组UP)`。
+final UP 不需要放行下一组，保持 Build 后 writer commit。loser 只有在
+`has_following=true` 时等待精确 gate；放行后仍不读取 `TaskArgs`。
+
+`ValidatePaSharedWriterIntentShape()` 也从“shared writer 数量为三个”
+收紧为“恰好是本 batch Alloc 的 slot 0/1/2，且三槽各出现一次”，并
+要求恰好一个非 symbol、`manual_dep` 的 writer，对应真实 UP 参数中的
+output view。当前不凭地址猜测这个 view 的具体对象身份；能够证明的是
+缺失/重复 manual-dependency writer、任意三个其他 symbol、重复 slot、
+缺槽或 ordinary writer 都不能借 PA 快路发布 gate。
+
+#### 容量与 shared ABI
+
+旧 `kMaxTasks=256×5=1280` 只能覆盖单组，b1 双组测试因 task id 很小
+不会暴露这个问题。shared 现按请求上限预留：
+
+```text
+max groups per batch = 256 / 64 = 4
+max tasks per batch  = 1 + 4 × 4 = 17
+shared kMaxTasks     = 256 × 17 = 4352
+```
+
+因此 `SharedTensorMapSidecar` 的 output table 扩到 4352 个 cell，
+sidecar 大小从 4,736,192B 增到 11,027,648B，shared build identity ABI
+从 4 升到 5。region ring、shared-output table 起点及生产前缀偏移不动，
+只有其后的 heap/vector sidecar 顺延。private 仍是 1280 个 task、
+ABI 4 和原 sidecar 布局。
+
+#### gate 已发布后的终止收敛
+
+gate 在 non-final UP Build 前发布是下一组能正确构参的必要条件，但它
+同时形成一个失败窗口：后继 UP slot 可能已经依赖 task4；若 task4 随后
+Build/封口失败，其 completion flag 永远不会到达。仅广播 fatal 不够，
+旧 `WaitForSlot` 或 `FinalDrain` 都可能永久等待。
+
+shared-only 修正分两层：
+
+1. slot 已满且 `DrainReady()` 连续无进展时，每 1024 次才直接读取一次
+   fatal。看到 fatal 后 `WaitForSlot` 返回失败，使本 worker 停止 replay；
+   正常 winner 和未进入背压的路径不增加原子读取。
+2. 所有 worker 已越过 final replay barrier 后，若本核仍连续无进展，
+   同样每 1024 次探测 fatal。确认失败后清除本核四个 slot 的
+   `occupied/built` 和 `occupied_count`，但不调用 kernel、
+   `CompleteTask` 或 placement 统计。task/fanin 内容保留用于诊断。
+
+清槽只意味着“失败轮次可以退出”，绝不能解释成任务完成。故障用例仍
+要求 task4/task8 flag 为 0、kernel/placement 为 0、fatal 为 1。即使
+`occupied_count` 已损坏，helper 也先清完所有 slot 再返回计数不一致，
+避免错误路径二次卡死。
+
+#### 本阶段门槛结果
+
+| 验证 | 结果 |
+| --- | --- |
+| CPU shared 全部严格告警门槛测试 | PASS |
+| task4 non-final loser：门前轮询、门后仍不读 `PROT_NONE TaskArgs` | PASS |
+| task8 final loser：`function_id=-1`，只从 ticket 恢复 UP | PASS |
+| task4/8 winner Finish：fanin `{2,3,0}` / `{6,7,4}` | PASS |
+| task4/8 单段依赖签名 | `7f405ca7dea83459` / `f772149f1ca20d6b` |
+| 非法 reserved、winner/loser function、越界 task、错误 UP writer 形状 | 全部拒绝 |
+| fatal 满槽退出、final-barrier 后调用的 blocked-slot 清理原语 | PASS |
+| CPU shared b1 real-compute 单组业务/协议回归 | PASS |
+| CCEC shared swimlane、split finish、mixed ELF、manifest | PASS |
+| A5 CCEC shared b1 单组，96 worker、5 task、4 kernel | PASS |
+| A5 b1 shared symbol published/input/commit | `8 / 5 / 3` |
+| A5 b1 dependency signature | `5cb454393ed48dcb` |
+| A5 b1 writer-ready gate | 五个 task 全部保持 `-1` |
+| CPU private 与 `24eb97ed` 同命令完整 ELF | 逐字节相同，SHA256 `ffa19a...fae4` |
+| CCEC private 七对象 `.text/.rodata` | 全部逐字节相同 |
+| `git diff --check` | PASS |
+
+A5 b1 本轮无泳道、PMU 关闭，`submit_span_us=78.259`，只作为现有单组
+设备路径的正确性回归；单次数据不用于判断新 metadata 的性能代价。
+
+本阶段尚未完成的边界必须继续保留：
+
+- `RunSchedulerImpl` 仍以 `batches * 5` 建 task_count，主循环仍只提交
+  `Alloc/QK/SF/PV/UP`；
+- host oracle、CCEC host 和部分 trace 分析仍存在 `%5`/五 task 假设；
+- 尚未得到 b1 九 task 的 864 Submit、480 Claim、8 kernel、
+  13 published output、10 fanin/input、6 writer commit 和最终 writer=8
+  的完整闭环；
+- 尚未在真实九 task 运行中注入“gate 已发布、UP0 封口失败”，当前证明
+  是公共 Finish 与终止原语的定向门槛。
+
+下一阶段应集中建立 shared task plan，让 device replay 与 host oracle
+共同消费同一布局，再跑完整九 task CPU/CCEC/A5。不能在现有五 task
+循环后机械追加四次 Submit，也不能先改 host 期望值来掩盖 device 仍按
+`%5` 解释任务。

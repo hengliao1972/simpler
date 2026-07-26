@@ -34,6 +34,13 @@ constexpr uint32_t kPaHeadDim = 128;
 constexpr uint32_t kPaBlockSize = 128;
 constexpr uint32_t kPaBlocksPerRequest = 64;
 constexpr uint32_t kPaMaxBlocksPerRequest = 256;
+#if PTO_FDWIC_SHARED_MAP
+static_assert(
+    kSharedPaMaxBlockGroups ==
+        kPaMaxBlocksPerRequest / kPaBlocksPerRequest,
+    "shared ticket group bits must cover the PA request limit"
+);
+#endif
 constexpr uint64_t kPaScaleBits = 0x3F800000ULL;
 constexpr uint32_t kSpmdLocalContextIndex = kMaxTaskTensors + kMaxTaskScalars;
 constexpr uint32_t kSpmdGlobalContextIndex = kSpmdLocalContextIndex + 1;
@@ -139,6 +146,49 @@ PA_DEVICE uint32_t FrontendTaskOutputCount(TaskKind kind) {
     }
     return 0;
 }
+
+#if PTO_FDWIC_SHARED_MAP
+// 与 FrontendTaskOutputCount 相同，这些 replay-layout helper 必须在
+// pa_frontend.h 中按当前 TU 的 PA_DEVICE 身份定义。pa_model.h 可能已被
+// CCEC winner_workload 作为 host 头提前包含，不能依赖其中捕获的宏状态。
+PA_DEVICE uint32_t SharedPaTaskOffset(
+    TaskKind kind, uint32_t group_index
+) {
+    return kind == TaskKind::Alloc
+        ? 0U
+        : 1U + group_index * 4U +
+              (static_cast<uint32_t>(kind) -
+               static_cast<uint32_t>(TaskKind::Qk));
+}
+
+PA_DEVICE TaskKind SharedPaTaskKindFromOffset(
+    uint32_t task_offset
+) {
+    return task_offset == 0
+        ? TaskKind::Alloc
+        : static_cast<TaskKind>(
+              1U + ((task_offset - 1U) % 4U)
+          );
+}
+
+PA_DEVICE bool SharedPaTaskKindInBatch(
+    uint32_t task_id, uint32_t batch_start,
+    uint32_t current_group_index, TaskKind &kind
+) {
+    if (current_group_index >= kSharedPaMaxBlockGroups ||
+        task_id < batch_start) {
+        return false;
+    }
+    const uint32_t offset = task_id - batch_start;
+    const uint32_t visible_task_count =
+        1U + 4U * (current_group_index + 1U);
+    if (offset >= visible_task_count) {
+        return false;
+    }
+    kind = SharedPaTaskKindFromOffset(offset);
+    return true;
+}
+#endif
 
 PA_DEVICE bool PrepareSharedTaskOutputs(
     SharedTaskOutputs &outputs, int32_t task_id, TaskKind kind
@@ -1265,7 +1315,9 @@ PA_DEVICE bool MaterializeTask(
 #endif
     uint64_t heap_base, uint64_t heap_size
 #if PTO_FDWIC_SHARED_MAP
-    , TraceContext *atomic_trace = nullptr,
+    , TaskKind task_kind, uint32_t batch_start,
+    uint32_t group_index,
+    TraceContext *atomic_trace = nullptr,
     WorkerResult *atomic_result = nullptr
 #endif
 ) {
@@ -1288,8 +1340,16 @@ PA_DEVICE bool MaterializeTask(
         context.result.count != 0 ||
         context.shared_result.TaskId() != static_cast<int32_t>(task_id) ||
         context.shared_result.Size() != FrontendTaskOutputCount(
-            static_cast<TaskKind>(task_id % kTasksPerBatch)
+            task_kind
         )) {
+        return false;
+    }
+    TaskKind expected_task_kind = TaskKind::Count;
+    if (!SharedPaTaskKindInBatch(
+            task_id, batch_start, group_index,
+            expected_task_kind
+        ) ||
+        expected_task_kind != task_kind) {
         return false;
     }
 #endif
@@ -1338,16 +1398,22 @@ PA_DEVICE bool MaterializeTask(
                     output_ref.producer_task_id < 0 ||
                     output_ref.producer_task_id >=
                         static_cast<int32_t>(task_id) ||
-                    output_ref.output_slot >= static_cast<int16_t>(
-                        FrontendTaskOutputCount(static_cast<TaskKind>(
-                            static_cast<uint32_t>(
-                                output_ref.producer_task_id
-                            ) % kTasksPerBatch
-                        ))
-                    ) ||
                     (tag != TensorArgType::Input &&
                      tag != TensorArgType::Inout &&
                      tag != TensorArgType::OutputExisting)) {
+                    return false;
+                }
+                TaskKind producer_kind = TaskKind::Count;
+                if (!SharedPaTaskKindInBatch(
+                        static_cast<uint32_t>(
+                            output_ref.producer_task_id
+                        ),
+                        batch_start, group_index, producer_kind
+                    ) ||
+                    output_ref.output_slot >=
+                        static_cast<int16_t>(
+                            FrontendTaskOutputCount(producer_kind)
+                        )) {
                     return false;
                 }
             } else {
