@@ -571,6 +571,24 @@ target_include_directories(test_fdwic_shared_submit_wiring BEFORE PRIVATE
 )
 set_tests_properties(test_fdwic_shared_submit_wiring PROPERTIES LABELS "no_hardware")
 
+# This multi-worker gate compiles the same production CPU-sim Submit TU and
+# proves that a future-turn winner waits for committed_tasks before fanin,
+# publication, and Build. SPIN_WAIT_HINT is observed only by the test.
+add_a5_test(test_fdwic_shared_multiworker a5/test_fdwic_shared_multiworker.cpp)
+target_compile_definitions(test_fdwic_shared_multiworker PRIVATE
+    __CPU_SIM=1
+    PTO_FDWIC_SHARED_MAP=1
+    PTO_FDWIC_TENSORMAP_RING_CAP=128
+    PTO_FDWIC_TRACE_ENABLED=0
+)
+target_include_directories(test_fdwic_shared_multiworker BEFORE PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
+)
+set_tests_properties(test_fdwic_shared_multiworker PROPERTIES LABELS "no_hardware" TIMEOUT 15)
+
 # PTO_DIST_H 是 AICPU 控制面的纯配置输入。独立目标直接编译生产解析
 # helper，锁定仅 ASCII 十进制数字串和闭区间边界，不引入设备或 runtime。
 add_executable(test_fdwic_config_parse a5/test_fdwic_config_parse.cpp)

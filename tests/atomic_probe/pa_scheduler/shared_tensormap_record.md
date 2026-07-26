@@ -7639,3 +7639,72 @@ R3a 只闭合单 worker 可判定的基础事务顺序，下面这些仍是解�
 整 task 临时数组也会增加 shared winner 的 scalar stack，新增 shared
 分支会扩大 CCEC `.text`。这两项先作为后续 A5 I-cache/栈和性能审计对象，
 不能在基础协议尚未闭合时凭代码大小提前改写事务语义。
+
+### 2026-07-26：R3b-a 固定 ordinary-region future-turn 等待与恢复
+
+R3a 已经在 production `dist_submit_wait_shared_tensor_map_turn()` 中实现
+`committed_tasks < N` 时的协作式等待，但原有十二类门槛全部是单 worker
+顺序调用，只能证明 exact turn 已经到达时的 lookup/publish/Build 顺序，
+不能证明多个真实 replay worker 之间会等待并恢复。本小步只补这条证据，
+不修改 production 热路径，也不提前解除 shared backend 总门禁。
+
+新增 `test_fdwic_shared_multiworker`，以
+`__CPU_SIM=1 + PTO_FDWIC_SHARED_MAP=1 + CAP128` 直接编译 production
+`dist_engine.cpp`。测试中的两个 worker 使用同一物理 block 的 AIV0/AIV1
+身份，并从相同的 task 0 开始重放：
+
+```text
+AIV0: Begin task0，赢得 Claim，暂缓 Finish
+AIV1: Begin/Finish task0，确定为 loser
+AIV1: Begin task1，赢得 Claim，进入 Finish
+      committed_tasks 仍为 0，因此必须等待
+AIV0: Finish task0，lookup/register/commit 0 -> 1
+AIV1: 从等待恢复，解析 task1 fan-in，commit 1 -> 2，再 Build
+```
+
+这里没有把 AIV1 的 `local_index` 手工拨到 1。它必须先走完真实 task0
+loser 路径，再由 production Begin 自然取得 task1。task0/task1 对同一个
+INOUT region 连续读写，因此恢复后的 task1 RingSlot 还必须精确包含
+`fanin[0] == 0`；只检查最终 commit 数不足以证明等待后的 lookup 使用了
+正确版本。
+
+为避免用 sleep 或“线程似乎没有返回”猜测阻塞，测试 TU 先加载正常 sim
+平台定义，再只在该 TU 内把 `SPIN_WAIT_HINT()` 替换为“计数 + yield”。
+production header、A5sim/A5 artifact 和任何 private/shared 热路径源码均
+未增加 hook。主线程必须先观察到 task1 waiter 至少一次真实 spin，随后在
+释放 task0 之前逐项快照并确认：
+
+- `committed_tasks == 0`；
+- task1 Finish 尚未返回；
+- task0 和 task1 worker 都没有 Build RingSlot；
+- task0 loser 没有推进 shared map。
+
+释放后最终要求：
+
+- task0 loser ticket 为 `(task_id=0, won=0)`；
+- task1 winner ticket 为 `(task_id=1, won=1)`；
+- `committed_tasks == 2`，fatal/error 均为 0；
+- 两个 winner 各有且仅有一个 built/occupied slot；
+- task0 无 fan-in，task1 唯一 fan-in 为 task0。
+
+这条门槛证明的是**通用 ordinary-region exact-turn**。它不能被误写成
+“PA 所有 Submit 都应经过全局 sequencer”：standalone PA Case1 的 fresh
+symbol 热路径已经有独立的 per-output 发布协议，并明确保持 ordinary
+region `committed_tasks == 0`。后续 production PA 迁移仍应让 fresh
+symbol 绕过全局 region turn；只有真正访问普通 region ring 的 winner
+使用本门槛所证明的等待纪律。
+
+本阶段验证结果：
+
+| 检查 | 结果 |
+| --- | --- |
+| 新 production 多 worker 门槛重复运行 | 100/100 PASS |
+| shared contract/wiring/multiworker 相邻回归 | 3/3 PASS |
+| GCC15 ASan + UBSan | PASS，无报告 |
+| `git diff --check` | PASS |
+
+下一小步单独处理错误收敛。当前源码仍有两个与本正常路径正交的缺口：
+shared winner 在本核 slot 已满时没有 fatal 退出；已经进入 FinalDrain 的
+worker 也不会消费稍后由另一核发布的 fatal。若另一核因此跳过 FinalDrain，
+前者可能永久等待不存在的 barrier release。修复必须只进入 shared 构建并
+保持 private 指令隔离，不能把本次正常等待门槛与错误路径改动合成一次提交。
