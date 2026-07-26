@@ -31,9 +31,11 @@
 #define PTO2_ERROR_REQUIRE_SYNC_START_INVALID 7
 #define PTO2_ERROR_TENSOR_WAIT_TIMEOUT 8
 #define PTO2_ERROR_EXPLICIT_ORCH_FATAL 9
-#define PTO2_ERROR_SCOPE_TASKS_OVERFLOW 10  // scope_tasks buffer saturated (all rings full)
-#define PTO2_ERROR_TENSORMAP_CAPACITY 11    // TensorMap cannot retain another live producer region
-#define PTO2_ERROR_DIST_CONFIG_INVALID 12   // Invalid fully-distributed runtime configuration
+#define PTO2_ERROR_SCOPE_TASKS_OVERFLOW 10       // scope_tasks buffer saturated (all rings full)
+#define PTO2_ERROR_TENSORMAP_CAPACITY 11         // TensorMap cannot retain another live producer region
+#define PTO2_ERROR_DIST_CONFIG_INVALID 12        // Invalid fully-distributed runtime configuration
+#define PTO2_ERROR_TENSORMAP_PROTOCOL 13         // Shared TensorMap rejected the task before publishing its entries
+#define PTO2_ERROR_TENSORMAP_PARTIAL_PUBLISH 14  // Shared TensorMap failed after publishing some task state
 
 // Scheduler errors (100+): detected in scheduler threads
 #define PTO2_ERROR_SCHEDULER_TIMEOUT 100

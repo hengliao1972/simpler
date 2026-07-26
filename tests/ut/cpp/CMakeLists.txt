@@ -537,6 +537,23 @@ target_include_directories(test_fdwic_submit_capacity BEFORE PRIVATE
 )
 set_tests_properties(test_fdwic_submit_capacity PROPERTIES LABELS "no_hardware")
 
+# The shared Submit adapter owns the mapping from task-transaction outcomes to
+# structured fatal codes. This target compiles the production CPU-sim TU under
+# the shared build identity without opening the AICPU backend-ready gate.
+add_a5_test(test_fdwic_shared_submit_contract a5/test_fdwic_shared_submit_contract.cpp)
+target_compile_definitions(test_fdwic_shared_submit_contract PRIVATE
+    __CPU_SIM=1
+    PTO_FDWIC_SHARED_MAP=1
+    PTO_FDWIC_TENSORMAP_RING_CAP=128
+)
+target_include_directories(test_fdwic_shared_submit_contract BEFORE PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
+)
+set_tests_properties(test_fdwic_shared_submit_contract PROPERTIES LABELS "no_hardware")
+
 # PTO_DIST_H 是 AICPU 控制面的纯配置输入。独立目标直接编译生产解析
 # helper，锁定仅 ASCII 十进制数字串和闭区间边界，不引入设备或 runtime。
 add_executable(test_fdwic_config_parse a5/test_fdwic_config_parse.cpp)

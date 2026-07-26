@@ -7376,3 +7376,77 @@ private 对照使用 clean `177a09c7` detached worktree 与当前主工作树分
 并共同执行 fail-stop、不 Build、不 completion、所有 wait/drain 感知 fatal
 后退出。该收敛属于下一阶段 production Submit 门槛，不能用本阶段的原语
 测试代替。
+
+### 2026-07-26：S2e 冻结 shared Submit 的结果与错误合同
+
+本阶段仍不把 shared TensorMap 接入真实 Submit，也不解除 backend-ready
+门禁；只把 S2d 的 task 事务结果收敛为 Submit 和 Host 都能稳定识别的错误
+合同。先新增直接编译 production CPU-sim TU 的门槛，确认它因缺少结果处理
+入口和错误码而失败，再补充唯一映射：
+
+| task 发布结果 | 运行时错误码 | Submit 行为 |
+| --- | ---: | --- |
+| `Committed` | `0` | 继续当前 winner 流程 |
+| `CapacityBlocked` | `11` | 标记本 worker 停止并置 fatal |
+| `ProtocolError` | `13` | 标记本 worker 停止并置 fatal |
+| `PartialPublish` | `14` | 标记本 worker 停止并置 fatal |
+| 未知枚举值 | `13` | 按协议错误 fail-stop |
+
+`dist_submit_handle_shared_tensor_map_result()` 只完成上述映射和失败收敛，不
+执行 lookup、append、Build 或 completion。失败时把当前 worker 的
+`local_index` 设为 `kFlagCap`，再通过已有 `set_fatal_code()` 发布错误；
+该函数保留“首个非零错误码获胜”合同，因此后续 worker 再发现其他失败不会
+覆盖根因。`PartialPublish` 与 `ProtocolError` 必须保留不同 code：二者都
+要求本轮停止并由下一次冷启动 reset 清理，但前者明确说明 shared sidecar
+可能已有当前 task 的 payload/seq/tail 副作用，禁止把它误诊为可重试的
+容量反压。
+
+新增 `test_fdwic_shared_submit_contract` 使用：
+
+```text
+__CPU_SIM=1
+PTO_FDWIC_SHARED_MAP=1
+PTO_FDWIC_TENSORMAP_RING_CAP=128
+```
+
+直接包含 production `dist_engine.cpp`，并静态断言 shared 构建身份成立、
+`kFdwicCompiledBackendReady` 仍为 false。测试覆盖成功不置 fatal、三类
+失败和未知枚举的精确映射、worker 停止标记以及 first-error-wins；后者
+预置一个非 shared 首错并遍历全部 shared 失败类型。失败前后还逐项比较
+shared commit/reclaim、bucket head/tail、slot payload/seq、task cell 和
+worker Build 计数，证明 adapter 本身不会继续改写数据面。Host 共用的状态码
+折叠函数同时锁定 `11/13/14 -> -11/-13/-14`。它与 shared ring 五档 CAP、
+private capacity、private/shared build identity 门槛共同通过，证明这一
+阶段没有用结果合同替代真正的事务测试，也没有提前让 shared artifact 进入
+尚未接线的运行路径。
+
+本阶段证据：
+
+| 检查 | 结果 |
+| --- | --- |
+| 新门槛的 red-first | 缺少处理入口与错误码时按预期编译失败 |
+| `test_fdwic_shared_submit_contract` | PASS |
+| private capacity | PASS |
+| shared ring CAP32/64/128/256/16384 | 5/5 PASS |
+| private/shared build identity | 2/2 PASS，shared backend 仍 fail-closed |
+| Host 可见错误值 | `-11/-13/-14` 全部 PASS |
+| GCC15 ASAN+UBSAN 新门槛 | PASS，无报告 |
+| production shared CCEC | AIC/AIV 均以 CAP128 shared 身份编译通过 |
+| private 父提交对照 | AIC/AIV `.text` 与运行时 section 逐字节相同 |
+
+独立构建证据位于：
+
+```text
+/tmp/fdwic-shared-submit-contract-coverage-20260726/
+/tmp/fdwic-s2e-submit-contract-sanitize-20260726/
+```
+
+private 对照以 clean `ebe3ff28` 为父版本基线。当前与父版本的 AIC `.text`
+均为 86,344B，AIV `.text` 均为 86,704B；`.text`、`.rela.text` 和运行时
+只读/数据 section 均逐字节相同。完整对象会受调试元数据影响，因此仍不拿
+整 `.o` hash 冒充热路径证据。
+
+下一阶段才把 exact-turn、winner-only lookup 和整 task
+`append -> commit` 接到 Kernel/Alloc/MIX 的真实 winner 路径。接线必须把
+本 helper 作为唯一结果收敛入口；任何非 `Committed` 结果都不得继续 Build
+或发布 completion。

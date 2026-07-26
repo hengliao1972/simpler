@@ -396,8 +396,8 @@ PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &
 
 PTO_DEVICE_FUNC bool dist_submit_check_task_cap(const DistSubmitCtx &ctx, DistSubmitKind kind) {
     if (ctx.task_id < kFlagCap) return true;
-    // Begin 采用 post-increment；冷分支把计数钳回哨兵，避免失败后的无效
-    // orchestration 若继续发 Submit，最终让 local_index 发生整数回绕。
+    // Begin uses post-increment. Clamp the cold failure path to the sentinel so
+    // invalid orchestration cannot wrap local_index by issuing more Submits.
     if (ctx.self != nullptr) ctx.self->local_index = kFlagCap;
     fdwic_trace_set_fatal(ctx.task_id);
     if (kind == DistSubmitKind::Alloc) {
@@ -603,12 +603,41 @@ PTO_DEVICE_FUNC bool dist_submit_insert_existing_tensor(DistSubmitCtx &ctx, cons
 }
 
 PTO_DEVICE_FUNC void dist_submit_latch_tensor_map_failure(DistSubmitCtx &ctx) {
-    // 复用既有 task-cap 门禁作为本核失败锁存，不给正常 Submit 增加额外
-    // 状态字段或 GM 读取。当前 task 已在 Register 失败并中止；后续 Begin
-    // 从 kFlagCap 起只会得到 not-ready，不能再进入 Claim/Build。
+    // Reuse the existing task-cap gate as this worker's failure latch without
+    // adding state or GM reads to normal Submit. Register has already aborted
+    // the current task; later Begin calls start at kFlagCap and cannot Claim or
+    // Build.
     if (ctx.self != nullptr) ctx.self->local_index = kFlagCap;
     set_fatal_code(PTO2_ERROR_TENSORMAP_CAPACITY);
 }
+
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC int32_t dist_submit_shared_tensor_map_error_code(DistSharedTensorMapTaskPublishResult result) {
+    switch (result) {
+    case DistSharedTensorMapTaskPublishResult::Committed:
+        return PTO2_ERROR_NONE;
+    case DistSharedTensorMapTaskPublishResult::CapacityBlocked:
+        return PTO2_ERROR_TENSORMAP_CAPACITY;
+    case DistSharedTensorMapTaskPublishResult::PartialPublish:
+        return PTO2_ERROR_TENSORMAP_PARTIAL_PUBLISH;
+    case DistSharedTensorMapTaskPublishResult::ProtocolError:
+    default:
+        return PTO2_ERROR_TENSORMAP_PROTOCOL;
+    }
+}
+
+PTO_DEVICE_FUNC bool
+dist_submit_handle_shared_tensor_map_result(DistSubmitCtx &ctx, DistSharedTensorMapTaskPublishResult result) {
+    if (result == DistSharedTensorMapTaskPublishResult::Committed) {
+        return true;
+    }
+    if (ctx.self != nullptr) {
+        ctx.self->local_index = kFlagCap;
+    }
+    set_fatal_code(dist_submit_shared_tensor_map_error_code(result));
+    return false;
+}
+#endif
 
 PTO_DEVICE_FUNC bool dist_submit_register_outputs(DistSubmitCtx &ctx, const L0TaskArgs &args, bool include_existing) {
     if (!include_existing) return true;
@@ -629,8 +658,9 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_and_prepare_map(
 ) {
     if (!dist_submit_check_task_cap(ctx, kind)) return false;
     if (!dist_submit_materialize_args(args, ctx, kind)) return false;
-    // end 与泳道 materialize_end 取时前的业务边界一致。失败路径不伪造
-    // end，最终由 phase shape/平衡门禁拒绝 raw。
+    // Match the business boundary immediately before the swimlane
+    // materialize_end timestamp. Failure paths do not forge an end marker and
+    // are rejected by phase-shape and balance validation.
     fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Materialize>();
     TRACE_TIMESTAMP(materialize_end);
     TRACE_SPAN_RECORD(
@@ -640,14 +670,15 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_and_prepare_map(
 #if !defined(__CCE_AICORE__)
     if (fdwic_trace_is_fatal(ctx.task_id)) return false;
 #endif
-    // 与泳道 PrepareMap 的业务主体共用同一调用边界；PMU 变体只累计
-    // dist_submit_prepare_map()，不把前一阶段的 trace 发布算入该阶段。
+    // Share the business-call boundary with swimlane PrepareMap. The PMU
+    // variant accumulates only dist_submit_prepare_map(), excluding trace
+    // publication from the preceding phase.
     fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::PrepareMap>();
     dist_submit_prepare_map(self, ctx.task_id);
     fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::PrepareMap>();
     TRACE_TIMESTAMP(prepare_map_finish);
-    // compete-first Kernel winner 的泳道 Fanin 从 PrepareMap 结束边界开始；
-    // legacy 路径此时尚未 Claim，ctx.won 为 false，不会提前打开。
+    // A compete-first Kernel winner starts swimlane Fanin at the PrepareMap end
+    // boundary. The legacy path has not claimed yet, so ctx.won remains false.
     if (kind == DistSubmitKind::Kernel && ctx.won) {
         fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Fanin>();
     }
