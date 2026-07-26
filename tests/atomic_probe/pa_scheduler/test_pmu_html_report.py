@@ -131,6 +131,34 @@ class PmuHtmlReportTest(unittest.TestCase):
         self.assertNotIn("https://", document)
         self.assertNotIn("<script", document.lower())
 
+    def test_v6_shared_report_shows_compact_dynamic_task_plan(self) -> None:
+        capture = _submit_pmu_capture(
+            phase="claim",
+            schema_version=6,
+            shared_context_lens=[0, 8192, 8193, 32768],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_capture(directory, capture)
+            document = render_report(path)
+
+        self.assertIn("shared dynamic 32 task/core", document)
+        self.assertIn('data-shared-task-plan="true"', document)
+        self.assertIn("shared 动态 task 计划", document)
+        self.assertIn('<div class="value">32 task/核</div>', document)
+        self.assertIn("group 总数 7 · context 最小 0 · 最大 32,768", document)
+        self.assertNotIn("shared_context_lens", document)
+        self.assertNotIn("[0, 8192, 8193, 32768]", document)
+
+    def test_v5_report_does_not_show_shared_dynamic_task_plan(self) -> None:
+        capture = _submit_pmu_capture(phase="claim", schema_version=5)
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_capture(directory, capture)
+            document = render_report(path)
+
+        self.assertNotIn("shared dynamic", document)
+        self.assertNotIn('data-shared-task-plan="true"', document)
+        self.assertNotIn("shared 动态 task 计划", document)
+
     def test_pmu_role_cards_derive_min_mean_max_from_validated_records(self) -> None:
         capture = _submit_pmu_capture(phase="none")
         with tempfile.TemporaryDirectory() as directory:

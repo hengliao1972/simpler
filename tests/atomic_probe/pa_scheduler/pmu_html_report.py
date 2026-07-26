@@ -501,8 +501,8 @@ def render_report(
         snapshot_path.write_bytes(raw_bytes)
         analysis = analyze([snapshot_path], miss_penalty_ns)
         capture = load_capture(snapshot_path)
-    if capture.schema_version not in (4, 5):
-        raise ValueError("HTML report requires submit-pmu schema-v4/v5 input")
+    if capture.schema_version not in (4, 5, 6):
+        raise ValueError("HTML report requires submit-pmu schema-v4/v5/v6 input")
 
     data = capture.data
     configuration = data["configuration"]
@@ -553,6 +553,30 @@ def render_report(
     phase = str(configuration["compiled_phase"])
     workload = configuration.get("winner_workload") or {}
     workload_counts = workload.get("counts") or {}
+    shared_plan_subtitle = ""
+    shared_plan_card = ""
+    if capture.schema_version == 6:
+        # analyzer 已独立重建并核对过该计划；HTML 只展示通过门禁的紧凑身份，
+        # 不展开 B256 context 向量，避免诊断页面被输入明细淹没。
+        shared_context_lens = configuration["shared_context_lens"]
+        shared_task_plan = configuration["shared_task_plan"]
+        context_min = min(shared_context_lens) if shared_context_lens else None
+        context_max = max(shared_context_lens) if shared_context_lens else None
+        context_range = (
+            "context 无 batch"
+            if context_min is None
+            else f"context 最小 {context_min:,} · 最大 {context_max:,}"
+        )
+        tasks_per_worker = int(shared_task_plan["tasks_per_worker"])
+        total_groups = int(shared_task_plan["total_groups"])
+        shared_plan_subtitle = f" / shared dynamic {tasks_per_worker} task/core"
+        shared_plan_card = (
+            '\n    <div class="card" data-shared-task-plan="true">'
+            '<div class="label">shared 动态 task 计划</div>'
+            f'<div class="value">{tasks_per_worker:,} task/核</div>'
+            f'<div class="muted">group 总数 {total_groups:,} · {context_range}</div>'
+            "</div>"
+        )
     exact_records = int(validation["shadow_primary_match_records"])
     bounded_records = int(validation["shadow_primary_bounded_records"])
     workers = int(configuration["workers"])
@@ -763,7 +787,7 @@ def render_report(
 <main>
   <header>
     <h1>Standalone PA Submit I-cache 报告</h1>
-    <div class="subtitle">submit-pmu / {_escape(phase)} / batch {_escape(configuration['batches'])} / {_escape(workload.get('mode'))} / QK,SF,PV,UP={_escape(workload_counts.get('qk'))},{_escape(workload_counts.get('sf'))},{_escape(workload_counts.get('pv'))},{_escape(workload_counts.get('up'))}</div>
+    <div class="subtitle">submit-pmu / {_escape(phase)} / batch {_escape(configuration['batches'])} / {_escape(workload.get('mode'))} / QK,SF,PV,UP={_escape(workload_counts.get('qk'))},{_escape(workload_counts.get('sf'))},{_escape(workload_counts.get('pv'))},{_escape(workload_counts.get('up'))}{shared_plan_subtitle}</div>
     <div class="badges">
       <span class="badge">RAW → SUMMARY PASS</span>
       <span class="badge">语义与 PMU PASS</span>
@@ -782,7 +806,7 @@ def render_report(
     <div class="card"><div class="label">完整 Submit primary I-cache miss（96 核总和）</div><div class="value">{total_misses:,}</div><div class="muted">逐核平均 {_format_per_core(all_metrics['misses_per_core'])}</div><div class="muted">逐核最小 {_format_count(all_metrics['misses_min'])} · 逐核最大 {_format_count(all_metrics['misses_max'])}</div></div>
     <div class="card"><div class="label">聚合 miss rate</div><div class="value">{_format_rate(float(all_metrics['miss_rate']))}</div></div>
     <div class="card"><div class="label">实测物理子核</div><div class="value">{workers}（32 AIC + 64 AIV）</div></div>
-    <div class="card"><div class="label">Primary/Shadow</div><div class="value">exact {exact_records}/{workers}</div><div class="muted">bounded {bounded_records}/{workers}</div></div>
+    <div class="card"><div class="label">Primary/Shadow</div><div class="value">exact {exact_records}/{workers}</div><div class="muted">bounded {bounded_records}/{workers}</div></div>{shared_plan_card}
   </section>
 
   <h2>PMU cycle 频率校准</h2>

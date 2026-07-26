@@ -26,8 +26,9 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 SCHEMA_NAME = "pa_scheduler_pmu_phase_windows"
-SCHEMA_VERSIONS = (3, 4, 5)
-SUBMIT_PMU_SCHEMA_VERSIONS = (4, 5)
+SCHEMA_VERSIONS = (3, 4, 5, 6)
+SUBMIT_PMU_SCHEMA_VERSIONS = (4, 5, 6)
+SUBMIT_PMU_TIME_SCHEMA_VERSIONS = (5, 6)
 GROUP_NAMES = ("all", "aic", "aiv")
 METRIC_NAMES = (
     "total_cycles",
@@ -72,11 +73,18 @@ SUBMIT_PMU_PHASE_IDS = {
     "materialize": 4,
     "register": 5,
 }
+FINAL_BARRIER_SHAPES = (
+    "flat",
+    "two-4",
+    "two-8",
+    "two-16",
+    "three-6x4x4",
+)
 TASKS_PER_BATCH = 5
 PHASE_STATUS_REQUIRED_MASK_V4 = 0x3CF
 PHASE_STATUS_REQUIRED_MASK_V5 = 0x7CF
 
-# schema-v4/v5 只描述 A5 standalone submit-pmu 正式采集，不接受由 JSON 自报的
+# schema-v4/v5/v6 只描述 A5 standalone submit-pmu 正式采集，不接受由 JSON 自报的
 # 任意缩小拓扑。物理槽按每 die 18 AIC + 36 AIV 排列；当前 runtime 实际开放
 # 32 个 AIC 与 64 个 AIV，共组成 32 组 1:2 mixed triplet。
 A5_WORKERS = 96
@@ -97,6 +105,7 @@ CONFIG_FINGERPRINT_FIELDS = (
     "workers",
     "aic_workers",
     "aiv_workers",
+    "final_barrier",
     "pmu_window",
     "selectors",
     "counter_width_bits",
@@ -128,6 +137,11 @@ SUBMIT_PMU_FINGERPRINT_FIELDS = CONFIG_FINGERPRINT_FIELDS + (
     "phase_time_includes_timestamp_overhead",
     "phase_time_share_definition",
     "phase_time_denominator_scope",
+)
+SHARED_SUBMIT_PMU_FINGERPRINT_FIELDS = SUBMIT_PMU_FINGERPRINT_FIELDS + (
+    "tensormap_mode",
+    "shared_context_lens",
+    "shared_task_plan",
 )
 
 
@@ -211,7 +225,9 @@ def _same_number(lhs: int | float, rhs: Any) -> bool:
 
 def _configuration_fingerprint(configuration: dict[str, Any], schema_version: int) -> str:
     fields = (
-        SUBMIT_PMU_FINGERPRINT_FIELDS
+        SHARED_SUBMIT_PMU_FINGERPRINT_FIELDS
+        if schema_version == 6
+        else SUBMIT_PMU_FINGERPRINT_FIELDS
         if schema_version in SUBMIT_PMU_SCHEMA_VERSIONS
         else CONFIG_FINGERPRINT_FIELDS
     )
@@ -337,6 +353,12 @@ def _validate_submit_pmu_configuration(
         configuration.get("pmu_window") == "submit-all",
         f"{path}: submit-pmu requires pmu_window='submit-all'",
     )
+    final_barrier = configuration.get("final_barrier")
+    _require(
+        isinstance(final_barrier, str)
+        and final_barrier in FINAL_BARRIER_SHAPES,
+        f"{path}: unsupported configuration.final_barrier {final_barrier!r}",
+    )
     _require(
         _integer(
             configuration.get("primary_window_segments_per_record"),
@@ -381,7 +403,10 @@ def _validate_submit_pmu_configuration(
     ):
         _require(configuration.get(field) is False, f"{path}: configuration.{field} is not false")
     expected_boundary_observation = phase_name != "none"
-    expected_phase_timestamps = schema_version == 5 and expected_boundary_observation
+    expected_phase_timestamps = (
+        schema_version in SUBMIT_PMU_TIME_SCHEMA_VERSIONS
+        and expected_boundary_observation
+    )
     _require(
         configuration.get("phase_timestamp_calls_present") is expected_phase_timestamps,
         f"{path}: configuration.phase_timestamp_calls_present does not match schema/phase",
@@ -407,7 +432,7 @@ def _validate_submit_pmu_configuration(
         is running_lower_bounds,
         f"{path}: configuration.phase_values_are_running_read_clear_lower_bounds does not match the phase",
     )
-    if schema_version == 5:
+    if schema_version in SUBMIT_PMU_TIME_SCHEMA_VERSIONS:
         _require(
             configuration.get("phase_time_observation_included")
             is expected_boundary_observation,
@@ -628,10 +653,100 @@ def _validate_submit_pmu_owner(
     return configured_ids
 
 
-def _expected_submit_pmu_phase_calls(phase_name: str, batches: int) -> int:
-    """当前 running phase 都覆盖每核每次 Submit，调用次数固定为 5B。"""
+def _validate_shared_task_plan(
+    path: Path, configuration: dict[str, Any], batches: int
+) -> int:
+    """由 context lengths 独立重建 shared 每核动态 Submit 数。"""
 
-    return 0 if phase_name == "none" else batches * TASKS_PER_BATCH
+    _require(
+        1 <= batches <= 256,
+        f"{path}: schema-v6 configuration.batches must be in [1, 256]",
+    )
+    _require(
+        configuration.get("tensormap_mode") == "shared",
+        f"{path}: schema-v6 requires configuration.tensormap_mode='shared'",
+    )
+    context_lens = configuration.get("shared_context_lens")
+    _require(
+        isinstance(context_lens, list),
+        f"{path}: configuration.shared_context_lens must be an array",
+    )
+    _require(
+        len(context_lens) == batches,
+        f"{path}: configuration.shared_context_lens length does not match batches",
+    )
+    total_groups = 0
+    for batch, raw_context_len in enumerate(context_lens):
+        context_len = _integer(
+            raw_context_len,
+            f"{path}: configuration.shared_context_lens[{batch}]",
+        )
+        _require(
+            context_len <= 32768,
+            f"{path}: configuration.shared_context_lens[{batch}] exceeds 32768",
+        )
+        blocks = (context_len + 127) // 128
+        total_groups += (blocks + 63) // 64
+
+    tasks_per_worker = batches + 4 * total_groups
+    reported_plan = configuration.get("shared_task_plan")
+    _require(
+        isinstance(reported_plan, dict),
+        f"{path}: configuration.shared_task_plan must be an object",
+    )
+    _require(
+        _integer(
+            reported_plan.get("total_groups"),
+            f"{path}: configuration.shared_task_plan.total_groups",
+        )
+        == total_groups,
+        f"{path}: configuration.shared_task_plan.total_groups disagrees with "
+        "shared_context_lens",
+    )
+    _require(
+        _integer(
+            reported_plan.get("tasks_per_worker"),
+            f"{path}: configuration.shared_task_plan.tasks_per_worker",
+        )
+        == tasks_per_worker,
+        f"{path}: configuration.shared_task_plan.tasks_per_worker disagrees with "
+        "shared_context_lens",
+    )
+    return tasks_per_worker
+
+
+def _validate_submit_pmu_task_contract(
+    path: Path,
+    configuration: dict[str, Any],
+    batches: int,
+    schema_version: int,
+) -> int | None:
+    """v6 使用 shared 动态计划；旧 schema 保持 private 固定 5B。"""
+
+    if schema_version == 6:
+        return _validate_shared_task_plan(path, configuration, batches)
+    shared_fields = (
+        "tensormap_mode",
+        "shared_context_lens",
+        "shared_task_plan",
+    )
+    unexpected = [field for field in shared_fields if field in configuration]
+    _require(
+        not unexpected,
+        f"{path}: schema-v4/v5 cannot carry shared task identity fields: "
+        f"{', '.join(unexpected)}",
+    )
+    return None
+
+
+def _expected_submit_pmu_phase_calls(
+    phase_name: str, batches: int, tasks_per_worker: int | None = None
+) -> int:
+    """running phase 覆盖每核每次 Submit。"""
+
+    if phase_name == "none":
+        return 0
+    return batches * TASKS_PER_BATCH if tasks_per_worker is None else tasks_per_worker
 
 
 def _validate_submit_pmu_record(
@@ -642,6 +757,7 @@ def _validate_submit_pmu_record(
     phase_id: int,
     batches: int,
     schema_version: int,
+    tasks_per_worker: int | None = None,
 ) -> PhasePartitionEvidence:
     """重验 raw phase 分区；运行中 read-clear 只形成上下界。"""
 
@@ -657,18 +773,27 @@ def _validate_submit_pmu_record(
     )
     phase_status = _integer(record.get("phase_status"), f"{prefix}.phase_status")
     phase_status_required = (
-        PHASE_STATUS_REQUIRED_MASK_V5 if schema_version == 5 else PHASE_STATUS_REQUIRED_MASK_V4
+        PHASE_STATUS_REQUIRED_MASK_V5
+        if schema_version in SUBMIT_PMU_TIME_SCHEMA_VERSIONS
+        else PHASE_STATUS_REQUIRED_MASK_V4
     )
     _require(
         (phase_status & phase_status_required) == phase_status_required,
         f"{prefix} phase_status is incomplete",
     )
-    expected_calls = _expected_submit_pmu_phase_calls(phase_name, batches)
+    expected_calls = _expected_submit_pmu_phase_calls(
+        phase_name, batches, tasks_per_worker
+    )
+    if schema_version == 6:
+        _require(
+            "phase_expected_calls" in record,
+            f"{prefix}.phase_expected_calls is required by schema-v6",
+        )
     if "phase_expected_calls" in record:
         _require(
             _integer(record.get("phase_expected_calls"), f"{prefix}.phase_expected_calls")
             == expected_calls,
-            f"{prefix}.phase_expected_calls disagrees with the fixed phase contract",
+            f"{prefix}.phase_expected_calls disagrees with the phase contract",
         )
 
     primary_requests = _integer(record.get("icache_requests"), f"{prefix}.icache_requests")
@@ -776,7 +901,7 @@ def _validate_submit_pmu_record(
             phase_request_upper == phase_requests and phase_miss_upper == phase_misses,
             f"{prefix} a phase with zero calls must have zero-width bounds",
         )
-    if schema_version == 5:
+    if schema_version in SUBMIT_PMU_TIME_SCHEMA_VERSIONS:
         submit_elapsed_ticks = _integer(
             record.get("submit_elapsed_ticks"), f"{prefix}.submit_elapsed_ticks"
         )
@@ -806,7 +931,7 @@ def _validate_submit_pmu_record(
 
 
 def load_capture(path: Path) -> Capture:
-    """读取并完整校验历史 v3 或 submit-pmu v4/v5 sidecar。"""
+    """读取并完整校验历史 v3 或 submit-pmu v4/v5/v6 sidecar。"""
 
     with path.open("r", encoding="utf-8") as input_file:
         data = json.load(input_file)
@@ -819,7 +944,7 @@ def load_capture(path: Path) -> Capture:
     schema_version = _integer(schema.get("version"), f"{path}: schema.version")
     _require(
         schema_version in SCHEMA_VERSIONS,
-        f"{path}: expected {SCHEMA_NAME} schema v3, v4 or v5",
+        f"{path}: expected {SCHEMA_NAME} schema v3, v4, v5 or v6",
     )
 
     capture = data.get("capture")
@@ -841,6 +966,7 @@ def load_capture(path: Path) -> Capture:
     _require(len(records) == workers, f"{path}: record count does not match configuration.workers")
     phase_name: str | None = None
     phase_id: int | None = None
+    tasks_per_worker: int | None = None
     if schema_version in SUBMIT_PMU_SCHEMA_VERSIONS:
         _require(
             (workers, aic_workers, aiv_workers)
@@ -849,6 +975,9 @@ def load_capture(path: Path) -> Capture:
         )
         phase_name, phase_id = _validate_submit_pmu_configuration(
             path, configuration, schema_version
+        )
+        tasks_per_worker = _validate_submit_pmu_task_contract(
+            path, configuration, batches, schema_version
         )
     else:
         counter_widths = configuration.get("counter_width_bits")
@@ -1053,7 +1182,14 @@ def load_capture(path: Path) -> Capture:
             assert phase_name is not None and phase_id is not None
             phase_partition_evidence.append(
                 _validate_submit_pmu_record(
-                    path, index, record, phase_name, phase_id, batches, schema_version
+                    path,
+                    index,
+                    record,
+                    phase_name,
+                    phase_id,
+                    batches,
+                    schema_version,
+                    tasks_per_worker,
                 )
             )
 
@@ -1099,6 +1235,11 @@ def load_capture(path: Path) -> Capture:
             == expected_phase_calls,
             f"{path}: validation.phase_calls does not match raw per-worker contracts",
         )
+        if schema_version == 6:
+            _require(
+                "phase_expected_calls" in validation,
+                f"{path}: validation.phase_expected_calls is required by schema-v6",
+            )
         if "phase_expected_calls" in validation:
             _require(
                 _integer(
@@ -1166,7 +1307,7 @@ def load_capture(path: Path) -> Capture:
                 == expected,
                 f"{path}: validation.{field} disagrees with raw records",
             )
-        if schema_version == 5:
+        if schema_version in SUBMIT_PMU_TIME_SCHEMA_VERSIONS:
             _require(
                 _integer(
                     validation.get("phase_time_valid_records"),
@@ -1185,7 +1326,7 @@ def load_capture(path: Path) -> Capture:
 
     metric_names = (
         SUBMIT_PMU_V5_METRIC_NAMES
-        if schema_version == 5
+        if schema_version in SUBMIT_PMU_TIME_SCHEMA_VERSIONS
         else SUBMIT_PMU_METRIC_NAMES
         if schema_version == 4
         else METRIC_NAMES
@@ -1368,7 +1509,7 @@ def analyze(paths: Sequence[Path], miss_penalty_ns: float = 90.0) -> dict[str, A
                             phase_miss_upper_sum / misses if misses != 0 else None,
                     }
                 )
-                if schema_version == 5:
+                if schema_version in SUBMIT_PMU_TIME_SCHEMA_VERSIONS:
                     submit_elapsed_ticks = _integer(
                         group["submit_elapsed_ticks"].get("sum"),
                         "Submit elapsed tick sum",
@@ -1457,7 +1598,7 @@ def analyze(paths: Sequence[Path], miss_penalty_ns: float = 90.0) -> dict[str, A
             "phase_icache_miss_lower_bound_share_of_submit",
             "phase_icache_miss_upper_bound_share_of_submit",
         )
-    if schema_version == 5:
+    if schema_version in SUBMIT_PMU_TIME_SCHEMA_VERSIONS:
         aggregate_fields += (
             "submit_elapsed_ticks_sum",
             "submit_elapsed_per_core_us",
@@ -1486,14 +1627,24 @@ def analyze(paths: Sequence[Path], miss_penalty_ns: float = 90.0) -> dict[str, A
 
     configuration = captures[0].data["configuration"]
     fingerprint_fields = (
-        SUBMIT_PMU_FINGERPRINT_FIELDS
+        SHARED_SUBMIT_PMU_FINGERPRINT_FIELDS
+        if schema_version == 6
+        else SUBMIT_PMU_FINGERPRINT_FIELDS
         if schema_version in SUBMIT_PMU_SCHEMA_VERSIONS
         else CONFIG_FINGERPRINT_FIELDS
     )
     result: dict[str, Any] = {
         "schema": {
             "name": "pa_scheduler_pmu_multi_run_summary",
-            "version": 3 if schema_version == 5 else 2 if schema_version == 4 else 1,
+            "version": (
+                4
+                if schema_version == 6
+                else 3
+                if schema_version == 5
+                else 2
+                if schema_version == 4
+                else 1
+            ),
         },
         "input_schema": {"name": SCHEMA_NAME, "version": schema_version},
         "configuration": {
@@ -1540,7 +1691,7 @@ def analyze(paths: Sequence[Path], miss_penalty_ns: float = 90.0) -> dict[str, A
                 else "running_read_clear_lower_to_loss_adjusted_upper_bound"
             ),
             "cross_phase_elf_sums_valid": False,
-            "phase_time_available": schema_version == 5,
+            "phase_time_available": schema_version in SUBMIT_PMU_TIME_SCHEMA_VERSIONS,
             "phase_time_semantics": (
                 "unavailable_in_schema_v4"
                 if schema_version == 4
@@ -1660,7 +1811,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "inputs", nargs="+", type=Path,
-        help="历史 schema-v3 或 submit-pmu schema-v4/v5 JSON sidecars"
+        help="历史 schema-v3 或 submit-pmu schema-v4/v5/v6 JSON sidecars"
     )
     parser.add_argument(
         "--icache-miss-ns",

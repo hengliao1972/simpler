@@ -100,7 +100,9 @@ def _submit_pmu_summary(
 ) -> dict[str, Any]:
     result = _summary_for_metrics(
         records,
-        SUBMIT_PMU_V5_METRIC_NAMES if schema_version == 5 else SUBMIT_PMU_METRIC_NAMES,
+        SUBMIT_PMU_V5_METRIC_NAMES
+        if schema_version in (5, 6)
+        else SUBMIT_PMU_METRIC_NAMES,
     )
     phase_requests = result["phase_icache_requests"]["sum"]
     phase_misses = result["phase_icache_misses"]["sum"]
@@ -213,7 +215,10 @@ def _capture(offset: int = 0, window: str = "submit-all") -> dict[str, Any]:
 
 
 def _submit_pmu_capture(
-    offset: int = 0, phase: str = "claim", schema_version: int = 5
+    offset: int = 0,
+    phase: str = "claim",
+    schema_version: int = 5,
+    shared_context_lens: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     phase_ids = {
         "none": 0,
@@ -223,7 +228,21 @@ def _submit_pmu_capture(
         "register": 5,
     }
     phase_id = phase_ids[phase]
-    batches = 2
+    if schema_version == 6:
+        context_lens = list(
+            [8192, 8192] if shared_context_lens is None else shared_context_lens
+        )
+        batches = len(context_lens)
+        total_groups = sum(
+            (((context_len + 127) // 128) + 63) // 64
+            for context_len in context_lens
+        )
+        tasks_per_worker = batches + 4 * total_groups
+    else:
+        context_lens = None
+        batches = 2
+        total_groups = None
+        tasks_per_worker = batches * TASKS_PER_BATCH
     records: list[dict[str, Any]] = []
     for worker_id in range(A5_WORKERS):
         role = "aic" if worker_id < A5_AIC_WORKERS else "aiv"
@@ -231,7 +250,7 @@ def _submit_pmu_capture(
         block_id = worker_id if role == "aic" else vector_id // 2
         lane = 0 if role == "aic" else 1 + vector_id % 2
         base = 100 + worker_id * 10 + offset
-        calls_per_worker = 0 if phase == "none" else batches * TASKS_PER_BATCH
+        calls_per_worker = 0 if phase == "none" else tasks_per_worker
         primary_requests = 1000 + base
         primary_misses = 100 + base // 10
         phase_requests = 0 if calls_per_worker == 0 else 100 + worker_id * 10 + offset
@@ -246,7 +265,7 @@ def _submit_pmu_capture(
         )
         phase_status_mask = (
             PHASE_STATUS_REQUIRED_MASK_V5
-            if schema_version == 5
+            if schema_version in (5, 6)
             else PHASE_STATUS_REQUIRED_MASK_V4
         )
         record: dict[str, Any] = {
@@ -284,7 +303,7 @@ def _submit_pmu_capture(
             "shadow_miss_loss": miss_loss,
             "phase_boundaries_balanced": True,
         }
-        if schema_version == 5:
+        if schema_version in (5, 6):
             record.update(
                 {
                     "submit_elapsed_ticks": submit_elapsed_ticks,
@@ -317,7 +336,7 @@ def _submit_pmu_capture(
     )
     request_losses = [record["shadow_request_loss"] for record in records]
     miss_losses = [record["shadow_miss_loss"] for record in records]
-    return {
+    capture = {
         "schema": {"name": "pa_scheduler_pmu_phase_windows", "version": schema_version},
         "capture": {
             "capture_id": f"submit-pmu-{phase}-{offset}",
@@ -336,6 +355,7 @@ def _submit_pmu_capture(
             "workers": workers,
             "aic_workers": A5_AIC_WORKERS,
             "aiv_workers": A5_AIV_WORKERS,
+            "final_barrier": "two-16",
             "pmu_window": "submit-all",
             "primary_window_segments_per_record": 1,
             "unavailable_metrics": ["mte3_busy"],
@@ -353,7 +373,8 @@ def _submit_pmu_capture(
                 "cnt9_unused": 0x000,
             },
             "counter_width_bits": {"total": 64, "programmable": 32},
-            "phase_timestamp_calls_present": schema_version == 5 and phase != "none",
+            "phase_timestamp_calls_present":
+                schema_version in (5, 6) and phase != "none",
             "phase_record_writes": False,
             "profile_accumulation": False,
             "trace_enabled": False,
@@ -367,7 +388,8 @@ def _submit_pmu_capture(
             "phase_shadow_partition_exact_required": phase == "none",
             "phase_values_are_running_read_clear_lower_bounds": phase != "none",
             "cross_phase_elf_sums_valid": False,
-            "phase_time_observation_included": schema_version == 5 and phase != "none",
+            "phase_time_observation_included":
+                schema_version in (5, 6) and phase != "none",
             "phase_time_sys_counter_tick_ns": 1,
             "phase_time_boundary": "after_begin_read_clear_to_before_end_read_clear",
             "phase_time_excludes_shadow_read_overhead": True,
@@ -460,6 +482,19 @@ def _submit_pmu_capture(
             name: _submit_pmu_summary(group, schema_version) for name, group in groups.items()
         },
     }
+    if schema_version == 6:
+        assert context_lens is not None and total_groups is not None
+        capture["configuration"].update(
+            {
+                "tensormap_mode": "shared",
+                "shared_context_lens": context_lens,
+                "shared_task_plan": {
+                    "total_groups": total_groups,
+                    "tasks_per_worker": tasks_per_worker,
+                },
+            }
+        )
+    return capture
 
 
 class PmuSidecarAnalyzerTest(unittest.TestCase):
@@ -648,6 +683,256 @@ class PmuSidecarAnalyzerTest(unittest.TestCase):
         self.assertLess(
             _submit_pmu_capture()["validation"]["shadow_request_signed_delta_sum"], 0
         )
+
+    def test_submit_pmu_v6_rebuilds_shared_dynamic_task_matrix(self) -> None:
+        cases = (
+            ("g0", [0], 0, 1),
+            ("g1", [8192], 1, 5),
+            ("g2-partial", [8193], 2, 9),
+            ("g2-full", [16384], 2, 9),
+            ("g4", [32768], 4, 17),
+            ("mixed", [0, 8192, 8193, 32768], 7, 32),
+        )
+        for name, context_lens, total_groups, tasks_per_worker in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                capture = _submit_pmu_capture(
+                    phase="claim",
+                    schema_version=6,
+                    shared_context_lens=context_lens,
+                )
+                path = self._write(directory, f"{name}.json", capture)
+                result = analyze([path])
+
+                self.assertEqual(result["input_schema"]["version"], 6)
+                self.assertEqual(result["schema"]["version"], 4)
+                self.assertTrue(result["phase_observation"]["phase_time_available"])
+                self.assertEqual(result["configuration"]["tensormap_mode"], "shared")
+                self.assertEqual(
+                    result["configuration"]["shared_context_lens"], context_lens
+                )
+                self.assertEqual(
+                    result["configuration"]["shared_task_plan"],
+                    {
+                        "total_groups": total_groups,
+                        "tasks_per_worker": tasks_per_worker,
+                    },
+                )
+                self.assertEqual(
+                    result["aggregate"]["groups"]["all"]["phase_calls_per_core"]["median"],
+                    tasks_per_worker,
+                )
+                self.assertTrue(
+                    all(
+                        record["phase_expected_calls"] == tasks_per_worker
+                        for record in capture["records"]
+                    )
+                )
+                self.assertIn(
+                    "phase_elapsed_per_call_ns",
+                    result["per_run"][0]["groups"]["all"],
+                )
+
+    def test_submit_pmu_v6_rejects_tampered_shared_task_metadata(self) -> None:
+        cases = (
+            (
+                lambda capture: capture["configuration"].__setitem__(
+                    "tensormap_mode", "private"
+                ),
+                "tensormap_mode='shared'",
+            ),
+            (
+                lambda capture: capture["configuration"]["shared_context_lens"].pop(),
+                "length does not match batches",
+            ),
+            (
+                lambda capture: capture["configuration"]["shared_context_lens"].__setitem__(
+                    0, -1
+                ),
+                r"shared_context_lens\[0\] must be non-negative",
+            ),
+            (
+                lambda capture: capture["configuration"]["shared_context_lens"].__setitem__(
+                    0, True
+                ),
+                r"shared_context_lens\[0\] must be an integer",
+            ),
+            (
+                lambda capture: capture["configuration"]["shared_context_lens"].__setitem__(
+                    0, 32769
+                ),
+                r"shared_context_lens\[0\] exceeds 32768",
+            ),
+            (
+                lambda capture: capture["configuration"]["shared_task_plan"].__setitem__(
+                    "total_groups",
+                    capture["configuration"]["shared_task_plan"]["total_groups"] + 1,
+                ),
+                "total_groups disagrees",
+            ),
+            (
+                lambda capture: capture["configuration"]["shared_task_plan"].__setitem__(
+                    "tasks_per_worker",
+                    capture["configuration"]["shared_task_plan"]["tasks_per_worker"] + 1,
+                ),
+                "tasks_per_worker disagrees",
+            ),
+        )
+        for mutate, message in cases:
+            with self.subTest(message=message):
+                capture = _submit_pmu_capture(schema_version=6)
+                mutate(capture)
+                with tempfile.TemporaryDirectory() as directory:
+                    path = self._write(directory, "tampered-shared-plan.json", capture)
+                    with self.assertRaisesRegex(ValueError, message):
+                        load_capture(path)
+
+    def test_submit_pmu_v6_requires_one_to_256_batches(self) -> None:
+        for context_lens in ([], [0] * 257):
+            with self.subTest(batches=len(context_lens)):
+                capture = _submit_pmu_capture(
+                    schema_version=6, shared_context_lens=context_lens
+                )
+                with tempfile.TemporaryDirectory() as directory:
+                    path = self._write(directory, "invalid-batches.json", capture)
+                    with self.assertRaisesRegex(ValueError, r"batches must be in \[1, 256\]"):
+                        load_capture(path)
+
+    def test_submit_pmu_v6_rejects_record_calls_that_disagree_with_rebuilt_plan(
+        self,
+    ) -> None:
+        capture = _submit_pmu_capture(
+            schema_version=6, shared_context_lens=[0, 8192, 8193, 32768]
+        )
+        capture["records"][0]["phase_expected_calls"] += 1
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, "tampered-record-calls.json", capture)
+            with self.assertRaisesRegex(ValueError, "phase_expected_calls disagrees"):
+                load_capture(path)
+
+    def test_submit_pmu_v6_requires_expected_call_evidence(self) -> None:
+        cases = (
+            (
+                lambda capture: capture["records"][0].pop("phase_expected_calls"),
+                r"records\[0\]\.phase_expected_calls is required",
+            ),
+            (
+                lambda capture: capture["validation"].pop("phase_expected_calls"),
+                r"validation\.phase_expected_calls is required",
+            ),
+        )
+        for mutate, message in cases:
+            with self.subTest(message=message):
+                capture = _submit_pmu_capture(schema_version=6)
+                mutate(capture)
+                with tempfile.TemporaryDirectory() as directory:
+                    path = self._write(directory, "missing-expected-calls.json", capture)
+                    with self.assertRaisesRegex(ValueError, message):
+                        load_capture(path)
+
+    def test_submit_pmu_v6_plan_identity_prevents_incompatible_aggregation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            g0 = self._write(
+                directory,
+                "g0.json",
+                _submit_pmu_capture(
+                    schema_version=6, shared_context_lens=[0, 0]
+                ),
+            )
+            g1 = self._write(
+                directory,
+                "g1.json",
+                _submit_pmu_capture(
+                    schema_version=6, shared_context_lens=[8192, 8192]
+                ),
+            )
+            with self.assertRaisesRegex(
+                ValueError, "observation configuration differs"
+            ):
+                analyze([g0, g1])
+
+            # 即使两组 context lengths 重建出相同 groups/tasks，也不能静默聚合。
+            same_count_a = self._write(
+                directory,
+                "same-count-a.json",
+                _submit_pmu_capture(
+                    schema_version=6, shared_context_lens=[1, 1]
+                ),
+            )
+            same_count_b = self._write(
+                directory,
+                "same-count-b.json",
+                _submit_pmu_capture(
+                    schema_version=6, shared_context_lens=[128, 128]
+                ),
+            )
+            with self.assertRaisesRegex(
+                ValueError, "observation configuration differs"
+            ):
+                analyze([same_count_a, same_count_b])
+
+    def test_submit_pmu_final_barrier_is_validated_and_part_of_identity(self) -> None:
+        for schema_version in (5, 6):
+            with self.subTest(schema_version=schema_version), tempfile.TemporaryDirectory() as directory:
+                baseline_capture = _submit_pmu_capture(schema_version=schema_version)
+                different_capture = _submit_pmu_capture(schema_version=schema_version)
+                different_capture["configuration"]["final_barrier"] = "flat"
+                baseline = self._write(directory, "baseline.json", baseline_capture)
+                different = self._write(directory, "different.json", different_capture)
+                with self.assertRaisesRegex(
+                    ValueError, "observation configuration differs"
+                ):
+                    analyze([baseline, different])
+
+                invalid_capture = _submit_pmu_capture(schema_version=schema_version)
+                invalid_capture["configuration"]["final_barrier"] = "unknown"
+                invalid = self._write(directory, "invalid.json", invalid_capture)
+                with self.assertRaisesRegex(ValueError, "unsupported configuration.final_barrier"):
+                    load_capture(invalid)
+
+    def test_submit_pmu_v5_and_v6_contracts_are_isolated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            private_v5 = self._write(
+                directory, "private-v5.json", _submit_pmu_capture(schema_version=5)
+            )
+            shared_v6 = self._write(
+                directory, "shared-v6.json", _submit_pmu_capture(schema_version=6)
+            )
+            private_result = analyze([private_v5])
+            shared_result = analyze([shared_v6])
+            with self.assertRaisesRegex(ValueError, "input schema differs"):
+                analyze([private_v5, shared_v6])
+
+        self.assertEqual(
+            private_result["aggregate"]["groups"]["all"]["phase_calls_per_core"][
+                "median"
+            ],
+            2 * TASKS_PER_BATCH,
+        )
+        self.assertNotIn("tensormap_mode", private_result["configuration"])
+        self.assertEqual(shared_result["configuration"]["tensormap_mode"], "shared")
+        self.assertTrue(shared_result["phase_observation"]["phase_time_available"])
+
+    def test_submit_pmu_v4_v5_reject_shared_task_identity_fields(self) -> None:
+        for schema_version in (4, 5):
+            with self.subTest(schema_version=schema_version):
+                capture = _submit_pmu_capture(schema_version=schema_version)
+                capture["configuration"].update(
+                    {
+                        "tensormap_mode": "shared",
+                        "shared_context_lens": [8192, 8192],
+                        "shared_task_plan": {
+                            "total_groups": 2,
+                            "tasks_per_worker": 10,
+                        },
+                    }
+                )
+                with tempfile.TemporaryDirectory() as directory:
+                    path = self._write(directory, "mislabelled-shared.json", capture)
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "schema-v4/v5 cannot carry shared task identity",
+                    ):
+                        load_capture(path)
 
     def test_submit_pmu_v5_none_has_zero_disabled_phase(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

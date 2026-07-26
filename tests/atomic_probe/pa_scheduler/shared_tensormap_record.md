@@ -5511,3 +5511,99 @@ host JSON 中由独立 host plan 显式导出，并由 Python 再计算。
 上述 CPU 运行只证明动态采集和离线加工闭合，不把 CPU Submit 时间当作
 A5 性能数据。设备 raw 字段数、记录数和 merged 每事件结构均未增加。
 下一小步再独立处理 submit-PMU 的 host/Python `batches×5` 固定假设。
+
+### 2026-07-26：S6.4e 让 submit-PMU 使用 shared 动态 task identity
+
+本小步只修 standalone submit-PMU 的期望次数、raw 身份和加工链，不改
+device `WorkerResult`、PMU counter、窗口边界或逐核记录布局。shared
+kernel 在 S6.4b 已经用实际回放完成后的 `local_index` 写入 phase call；
+本阶段补上与它独立的 host/Python 期望值，避免继续用 private 的
+`5 × batches` 解释 G0/G2/G4。
+
+#### Host raw：shared schema-v6，private 保持 schema-v5
+
+shared host 在 PMU 校验和 raw 发布前分别从最终
+`SchedulerState.context_lens` 重建 `SharedHostTaskPlan`。running phase
+的逐核期望调用数改为 `plan.total_tasks`，`none` 仍严格为 0；全局期望
+为逐核值乘 96。两次重建结果还会与同一轮 PMU 校验累计值交叉核对，计划
+在校验与发布之间不一致时拒绝 raw。
+
+shared raw 使用 schema-v6，并在 configuration 中只增加三项 host 身份：
+
+```json
+{
+  "tensormap_mode": "shared",
+  "shared_context_lens": [0, 8192, 8193, 32768],
+  "shared_task_plan": {
+    "total_groups": 7,
+    "tasks_per_worker": 32
+  }
+}
+```
+
+完整 context 向量是区分 G2 partial/full、重算实际 task 数所必需的输入，
+不是逐事件字段；B256 也只增加 256 个整数，不放大 device raw 记录。
+private 编译的原 `5 × batches` 分支和 schema-v5 JSON 保持不变，不输出
+shared 字段。
+
+#### Python 不信任 host 自报 task 数
+
+analyzer 对 schema-v6 重新执行独立公式：
+
+```text
+blocks = ceil(context_len / 128)
+groups = ceil(blocks / 64)
+tasks_per_worker = batches + 4 × sum(groups)
+```
+
+它要求 batches 在 `[1,256]`、context 数量与 batches 相等、每项在
+`[0,32768]`，然后同时核对：
+
+- host `shared_task_plan`；
+- 每核 `phase_calls/phase_expected_calls`；
+- 96 核 validation 总调用数；
+- v5 已有的 begin/end、shadow partition 和 phase time 契约。
+
+context 向量、重建后的 plan 和 `final_barrier` 都进入多轮 fingerprint。
+同 batches 但不同 group 数不能聚合；即使 task 数相同，`1` 与 `128`
+这类不同 context identity 也不能静默聚合。schema-v4/v5 继续使用固定
+五 task 规则，并拒绝携带 shared 身份字段；这样默认 G1 恰好也是五 task
+时，也不能把误标为 v5 的 shared raw 当成 private。v5 与 v6 同样不能
+混合分析。schema-v6 还强制每条 record 和 validation 都携带
+`phase_expected_calls`，不把缺字段等同为旧格式兼容。
+
+HTML 只显示每核 task 数、group 总数和 context 最小/最大值，不展开
+B256 的完整向量。这样可以看见动态采集身份，又不把报告变成输入转储。
+
+#### 门槛与 A5 证据
+
+| 门槛 | 结果 |
+| --- | --- |
+| 目录内全部 Python 单测 | 115 项 PASS |
+| schema-v6 合成矩阵 | G0/G1/G2 partial/G2 full/G4/mixed 及元数据篡改全部闭合 |
+| CCEC shared submit-PMU 构建 | none/claim/efdrain/materialize/register 全部 manifest PASS |
+| CCEC private 对照构建 | none/claim manifest PASS |
+| A5 shared mixed B4 Claim | 32 calls/核、3,072 calls/96 核、schema-v6、HTML PASS |
+| mixed host/device plan | 4 batches、7 groups、32 tasks，Claim 1,728，28 个 kernel |
+| A5 private B1 Claim | 5 calls/核、480 calls/96 核、schema-v5、HTML PASS |
+| PMU owner | 两次正式样本 configure/restore/cleanup 全部 PASS |
+| `git diff --check` | PASS |
+
+mixed A5 raw 与报告位于：
+
+```text
+outputs/shared_dynamic_submit_pmu_v6_20260726/
+  mixed_claim_icache_raw.json
+  mixed_claim_icache_report.html
+  private_g1_claim_icache_raw.json
+  private_g1_claim_icache_report.html
+```
+
+这两次单轮时间只证明采集链可执行，不能用来比较 private/shared 性能。
+
+单独运行 shared G0 时，调度、动态 plan、96 次 Claim、PMU 边界和 owner
+恢复全部通过，但通用 real-compute host 校验仍把“0 个计算 task，因此
+192 个输出 tile 全为 sentinel”误判为缺失 kernel，故按发布门槛没有
+生成 raw。这不是放宽 PMU 契约的理由；下一小步应让 shared G0 明确接受
+零 active tile，同时保持 private 和 shared 非零 group 的
+`active_tiles != 0` 门槛不变，然后再继续 A5 动态矩阵。

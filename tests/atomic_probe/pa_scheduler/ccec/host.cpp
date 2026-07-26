@@ -507,6 +507,24 @@ struct PmuValidation {
 // 高水位作为保守拒绝阈值；它只降低风险，不把“未越线”表述成回卷证明。
 constexpr uint32_t kProgrammableCounterRiskThreshold = UINT32_MAX / 4U;
 
+#if PTO_FDWIC_SHARED_MAP
+uint32_t ExpectedSubmitPmuPhaseCallsPerWorker(uint32_t tasks_per_worker) {
+    // shared 的 running phase 覆盖动态 plan 中每个实际 Submit；G0/G1/G2/G4
+    // 分别是 1/5/9/17 次，不能继续复用 private 的固定 5B。
+    switch (pa_scheduler::kCompiledSubmitPmuPhase) {
+    case pa_scheduler::SubmitPmuPhase::None:
+        return 0U;
+    case pa_scheduler::SubmitPmuPhase::Claim:
+    case pa_scheduler::SubmitPmuPhase::EfDrain:
+    case pa_scheduler::SubmitPmuPhase::Materialize:
+    case pa_scheduler::SubmitPmuPhase::Register:
+        return tasks_per_worker;
+    case pa_scheduler::SubmitPmuPhase::Count:
+        break;
+    }
+    return UINT32_MAX;
+}
+#else
 uint32_t ExpectedSubmitPmuPhaseCallsPerWorker(uint32_t batches) {
     // 当前所有 running phase 都覆盖每个 worker 的每次 Submit，固定为 5B。
     switch (pa_scheduler::kCompiledSubmitPmuPhase) {
@@ -522,6 +540,7 @@ uint32_t ExpectedSubmitPmuPhaseCallsPerWorker(uint32_t batches) {
     }
     return UINT32_MAX;
 }
+#endif
 
 bool ValidatePmu(
     const pa_scheduler::SchedulerState &state, uint32_t run, const PmuOptions &pmu,
@@ -533,6 +552,23 @@ bool ValidatePmu(
         *validation = PmuValidation{};
         return true;
     }
+
+#if PTO_FDWIC_SHARED_MAP
+    pa_scheduler::host::SharedHostTaskPlan shared_plan;
+    std::string shared_plan_error;
+    if (!pa_scheduler::host::BuildSharedHostTaskPlan(
+            state, &shared_plan, &shared_plan_error
+        )) {
+        *validation = PmuValidation{};
+        validation->passed = false;
+        std::fprintf(
+            stderr,
+            "[PMU] run=%u cannot build shared expected task plan: %s\n",
+            run, shared_plan_error.c_str()
+        );
+        return false;
+    }
+#endif
 
     bool seen[kPhysicalSubcoreCount] = {};
     uint32_t trusted = 0;
@@ -573,7 +609,11 @@ bool ValidatePmu(
     for (uint32_t worker = 0; worker < pa_scheduler::kWorkers; ++worker) {
         const pa_scheduler::WorkerResult &result = state.results[worker];
         const uint32_t expected_phase_calls_per_worker =
+#if PTO_FDWIC_SHARED_MAP
+            ExpectedSubmitPmuPhaseCallsPerWorker(shared_plan.total_tasks);
+#else
             ExpectedSubmitPmuPhaseCallsPerWorker(state.config.batches);
+#endif
         const uint32_t status = result.pmu_status;
         const uint32_t core_id = StatusCoreId(status);
         const bool record_trusted = (status & kStatusRequired) == kStatusRequired;
@@ -1018,6 +1058,33 @@ bool ExportPmuJson(
     const std::string &output_path
 ) {
     using namespace pa_scheduler::ccec_pmu;
+#if PTO_FDWIC_SHARED_MAP
+    pa_scheduler::host::SharedHostTaskPlan shared_plan;
+    std::string shared_plan_error;
+    if (!pa_scheduler::host::BuildSharedHostTaskPlan(
+            state, &shared_plan, &shared_plan_error
+        )) {
+        std::fprintf(
+            stderr, "Cannot export PMU JSON without a valid shared task plan: %s\n",
+            shared_plan_error.c_str()
+        );
+        return false;
+    }
+    const uint64_t expected_shared_phase_calls =
+        static_cast<uint64_t>(
+            ExpectedSubmitPmuPhaseCallsPerWorker(shared_plan.total_tasks)
+        ) * pa_scheduler::kWorkers;
+    if (validation.expected_phase_calls != expected_shared_phase_calls) {
+        std::fprintf(
+            stderr,
+            "Cannot export PMU JSON: shared expected phase calls changed "
+            "between validation and export (%llu != %llu).\n",
+            static_cast<unsigned long long>(validation.expected_phase_calls),
+            static_cast<unsigned long long>(expected_shared_phase_calls)
+        );
+        return false;
+    }
+#endif
     PmuAggregate all;
     PmuAggregate aic;
     PmuAggregate aiv;
@@ -1080,7 +1147,11 @@ bool ExportPmuJson(
           };
     const uint32_t owner_bitmap_count = pa_scheduler::pmu_owner::CountConfigured(owner);
     const uint32_t owner_complete_triplets = CountConfiguredMixedTriplets(owner);
+#if PTO_FDWIC_SHARED_MAP
+    std::fputs("{\n\"schema\":{\"name\":\"pa_scheduler_pmu_phase_windows\",\"version\":6},\n", output);
+#else
     std::fputs("{\n\"schema\":{\"name\":\"pa_scheduler_pmu_phase_windows\",\"version\":5},\n", output);
+#endif
     std::fputs("\"capture\":{\"capture_id\":", output);
     WriteJsonString(output, capture_id);
     std::fprintf(
@@ -1169,6 +1240,24 @@ bool ExportPmuJson(
             options.nops.qk, options.nops.sf, options.nops.pv, options.nops.up
         );
     }
+#if PTO_FDWIC_SHARED_MAP
+    std::fputs(
+        ",\"tensormap_mode\":\"shared\",\"shared_context_lens\":[",
+        output
+    );
+    for (uint32_t batch = 0; batch < state.config.batches; ++batch) {
+        std::fprintf(
+            output, "%s%d", batch == 0U ? "" : ",",
+            state.context_lens[batch]
+        );
+    }
+    std::fprintf(
+        output,
+        "],\"shared_task_plan\":{\"total_groups\":%u,"
+        "\"tasks_per_worker\":%u}",
+        shared_plan.total_groups, shared_plan.total_tasks
+    );
+#endif
     std::fputs(",\"pmu_window\":", output);
     WriteJsonString(output, PmuModeName(pmu.mode));
     std::fputs(",\"calibration_scalar_nops_per_segment\":", output);
@@ -1391,7 +1480,11 @@ bool ExportPmuJson(
             result.pmu_phase_begin_reads == result.pmu_phase_calls &&
             result.pmu_phase_end_reads == result.pmu_phase_calls;
         const uint32_t expected_phase_calls =
+#if PTO_FDWIC_SHARED_MAP
+            ExpectedSubmitPmuPhaseCallsPerWorker(shared_plan.total_tasks);
+#else
             ExpectedSubmitPmuPhaseCallsPerWorker(state.config.batches);
+#endif
         std::fprintf(
             output,
             "%s{\"worker_id\":%u,\"physical_core_id\":%u,\"role\":\"%s\",\"block_id\":%u,"
