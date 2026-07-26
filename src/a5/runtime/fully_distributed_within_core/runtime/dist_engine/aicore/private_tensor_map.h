@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include "dist_engine/aicore/tensor_map_common.h"
+
 namespace {
 
 PTO_DEVICE_FUNC inline uint64_t
@@ -63,35 +65,16 @@ PTO_DEVICE_FUNC inline void dist_private_tensor_map_reset(__gm__ DistTensorMap &
     }
 }
 
-PTO_DEVICE_FUNC inline uint32_t dist_private_tensor_map_hash(uint64_t addr) {
-#if PTO_FDWIC_TENSORMAP_RING_CAP == 16384
-    (void)addr;
-    return 0;
-#else
-    addr *= 0x9E3779B97F4A7C15ULL;
-    return static_cast<uint32_t>(addr >> (64U - kMapBucketShift)) & kMapBucketMask;
-#endif
-}
+PTO_DEVICE_FUNC inline uint32_t dist_private_tensor_map_hash(uint64_t addr) { return dist_tensor_map_hash(addr); }
 
 template <typename TensorRef>
 PTO_DEVICE_FUNC inline void
 dist_private_tensor_map_byte_range(const TensorRef &t, uint64_t &addr, uint64_t &lo, uint64_t &hi) {
-    const uint64_t esz = get_element_size(t.dtype);
-    addr = t.buffer.addr;
-    lo = t.start_offset * esz;
-    uint64_t ext;
-    if (t.is_contiguous) {
-        ext = 1;
-        for (uint32_t i = 0; i < t.ndims; i++)
-            ext *= t.shapes[i];
-    } else {
-        ext = t.extent_elem_cache;
-    }
-    hi = (t.start_offset + ext) * esz;
+    dist_tensor_map_byte_range(t, addr, lo, hi);
 }
 
 PTO_DEVICE_FUNC inline uint32_t dist_private_tensor_map_slot_index(uint32_t bucket, uint64_t cursor) {
-    return bucket * kMapBucketCapacity + (static_cast<uint32_t>(cursor) & kMapBucketSlotMask);
+    return dist_tensor_map_slot_index(bucket, cursor);
 }
 
 PTO_DEVICE_FUNC inline void dist_private_tensor_map_retire_bucket(

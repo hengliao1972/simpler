@@ -6965,3 +6965,32 @@ payload writeback 后再发布可见字”；没有移植其 64K
 下一提交只实现独立 `shared_tensor_map.h`：时序窗口 lookup、整 task
 preflight、连续 append、absolute seq 双检和 exact-turn reclaim。它仍不接
 Submit、不解除门禁；算法门槛闭合后再单独接 winner-only task publish。
+
+### 2026-07-26：S2a 抽取两种 backend 共用的逻辑原语
+
+在移植 shared 算法前，先把与副本所有权、atomic 和 cache 可见性完全无关的
+四项逻辑从 private 实现中抽到 `tensor_map_common.h`：
+
+- 同一乘法高位 hash；
+- Tensor 到 `[buf_addr,lo,hi)` byte range 的转换；
+- `bucket * CAP + (cursor & (CAP-1))` 连续分桶下标；
+- 同 buffer 半开区间重叠判断。
+
+private 保留原有 `dist_private_tensor_map_*` API 作为零成本 inline wrapper，
+且 lookup 继续保留原条件表达式，没有为了“形式共用”改写已经冻结的默认热
+路径。shared 下一阶段直接使用 common helper，但不会包含或复用
+`DistTensorMap`、private head/tail、alive floor 等状态。
+
+五种 CAP 的 private ring、12,000-task 逻辑差分和 Submit capacity 共 6 项
+全部通过。更关键的是，使用同一 CANN/GCC15 重新编译 production private
+AIC/AIV 后：
+
+| 入口 | S1 `.text` | S2a `.text` | 内容 SHA256 |
+| --- | ---: | ---: | --- |
+| AIC | `0x17188` | `0x17188` | 相同：`a8eae234f72f...` |
+| AIV | `0x17518` | `0x17518` | 相同：`5dbfda402594...` |
+
+完整 `.o` 因源码路径/调试元数据而 hash 不同，故这里比较 ELF 声明的
+`.text` 原始字节，而不是用整文件 hash 冒充热路径证据。结果证明该抽取没有
+改变 private AIC/AIV 指令内容；后续 shared/private 的依赖差异也不会来自两份
+逐渐漂移的 hash/range 算法。
