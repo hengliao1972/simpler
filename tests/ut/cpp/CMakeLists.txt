@@ -470,6 +470,32 @@ add_fdwic_tensor_map_ring_test(test_fdwic_tensor_map_ring_cap64 64)
 add_fdwic_tensor_map_ring_test(test_fdwic_tensor_map_ring_cap256 256)
 add_fdwic_tensor_map_ring_test(test_fdwic_tensor_map_ring_cap16384 16384)
 
+# shared sidecar 先独立验证布局和 AICPU 一次性初始化，production 顶层仍
+# fail-closed。五个 CAP 覆盖 bucket-control 长度变化，额外 private 目标
+# 锁住“只在 shared DistGlobal 尾部追加”的 ABI 边界。
+function(add_fdwic_shared_tensor_map_state_test name shared_map ring_cap)
+    add_a5_test(${name} a5/test_fdwic_shared_tensor_map_state.cpp)
+    target_compile_definitions(${name} PRIVATE
+        __CPU_SIM=1
+        PTO_FDWIC_SHARED_MAP=${shared_map}
+        PTO_FDWIC_TENSORMAP_RING_CAP=${ring_cap}
+    )
+    target_include_directories(${name} BEFORE PRIVATE
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
+    )
+    set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
+endfunction()
+
+add_fdwic_shared_tensor_map_state_test(test_fdwic_private_tensor_map_state_layout 0 128)
+add_fdwic_shared_tensor_map_state_test(test_fdwic_shared_tensor_map_state 1 128)
+add_fdwic_shared_tensor_map_state_test(test_fdwic_shared_tensor_map_state_cap32 1 32)
+add_fdwic_shared_tensor_map_state_test(test_fdwic_shared_tensor_map_state_cap64 1 64)
+add_fdwic_shared_tensor_map_state_test(test_fdwic_shared_tensor_map_state_cap256 1 256)
+add_fdwic_shared_tensor_map_state_test(test_fdwic_shared_tensor_map_state_cap16384 1 16384)
+
 # 容量错误必须在真实 Register→Build 边界中止，并让后续 eager Begin 在
 # Claim 前返回。该目标直接编译 production CPU-sim dist_engine TU，避免
 # 用测试替身重写 Submit 状态机。

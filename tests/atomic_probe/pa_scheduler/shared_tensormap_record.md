@@ -6826,9 +6826,142 @@ B 中位数比 A 低 103,594.5 ticks，约 `-2.15%`，但两组范围高度重�
 
 private ring 到此冻结。shared 不能靠“给 private head/tail 加 atomic”实现；
 下一阶段需要独立完成 task-id 有序的单追加者协议、整 task 容量预检、
-winner-only publish、`seq` 发布与跨核可见性、`core_progress` 推导的全局
-reclaim，以及 PA 非末组 INOUT 的 region-intent gate。每一层先保持 shared
-顶层 fail-closed，待 CPU/CCEC/A5sim 门槛闭合后再解除，避免把半成品误跑成
-private 语义。当前容量失败集成测试只覆盖单 worker；在解除 shared 门禁或
-扩大通用输入域之前，还必须补多 worker 故障传播、wait/drain 退出和
+winner-only publish、`seq` 发布与跨核可见性，以及 PA 非末组 INOUT 的
+region-intent gate。按 standalone S2.5 已验证的 exact-turn 纪律，只有处于
+`committed_tasks == N` 的 task N winner 会在完成 lookup 后访问并修改 shared
+ring，loser 不读 ring；因此可直接把 reclaim 单调推进到
+`max(-1, N-H-1)`，不需要再维护和扫描 `core_progress[]`。每一层先保持
+shared 顶层 fail-closed，待 CPU/CCEC/A5sim 门槛闭合后再解除，避免把半成品
+误跑成 private 语义。当前容量失败集成测试只覆盖单 worker；在解除 shared
+门禁或扩大通用输入域之前，还必须补多 worker 故障传播、wait/drain 退出和
 AICPU/Host 非零返回的收敛门槛。
+
+### 2026-07-26：S1 冻结 production shared TensorMap 尾部状态
+
+本阶段只建立 shared ordinary-region ring 的物理状态、三镜像 ABI 身份和
+AICPU 一次性初始化入口，**没有**把 shared facade 接进 Submit，也没有解除
+顶层门禁。这样可以先回答“所有镜像是否用同一种字节布局解释 GM”，下一阶段
+再独立回答 lookup/append/reclaim 是否正确，避免把布局错误和并发协议错误混
+在一起。
+
+#### sidecar 布局
+
+shared 没有复用 private `MapEntry` 尾部的 16B ABI reserve，而是定义自己的
+32B 逻辑值：
+
+```text
+SharedTensorMapValue
+  buf_addr   @ 0   : u64
+  lo         @ 8   : u64
+  hi         @ 16  : u64
+  producer   @ 24  : i32
+  reserved   @ 28  : u32
+```
+
+`reserved` 约定为 writer 写 0、reader 校验 0。每个物理槽占两条独占
+cache line：
+
+```text
+slot + 0   : payload 64B
+slot + 64  : absolute sequence 64B
+```
+
+payload 与 atomic sequence 分行，是为了避免 A5 上普通 cache writeback 与
+atomic 可见字落在同一行后互相覆盖。后续发布顺序必须是
+`写 payload -> flush payload -> 发布 seq -> 发布 tail`；本阶段只冻结这套
+地址关系，尚未加入任何 AICore DCCI/atomic 热路径。
+
+默认 CAP128 sidecar 与 standalone S2.5 前缀完全同构：
+
+| 字段 | offset | 大小 |
+| --- | ---: | ---: |
+| `committed_tasks` | 0 | 64B |
+| `reclaim_upto` | 64 | 64B |
+| `buckets[128]` | 128 | 16,384B |
+| `slots[16,384]` | 16,512 | 2,097,152B |
+| sidecar 合计 | 0 | 2,113,664B |
+
+每个 bucket 的 `head` 与 `tail` 各占一行且相邻；每个 slot 的物理下标仍为：
+
+```text
+bucket * CAP + (absolute_cursor & (CAP - 1))
+```
+
+第一版采用 task-id exact-turn 的有序单追加者，不引入通用 MPSC `reserve`、
+桶锁、全局 free-list 或 `core_progress[]`。task N winner 完成 N 的 lookup
+后，才在 `committed_tasks == N` 的轮次内 append 并推进 commit；loser 不读
+shared ring。因此 reclaim 可以直接使用 `max(-1,N-H-1)`。这与早期
+standalone S2 的异步 reader 方案不同：后者曾经需要 `core_progress[]`，S2.5
+收紧访问纪律后已经把它删除，不能把历史过程态带回 production。
+
+#### 尾部追加、arena 与构建身份
+
+提交 `68f51451` 冻结的 private `DistGlobal` 精确大小为
+`1,007,026,048B`。shared sidecar 只在 `final_barrier` 后、offset
+`1,007,026,048` 追加：
+
+| artifact | `sizeof(DistGlobal)` |
+| --- | ---: |
+| private | 1,007,026,048B |
+| shared CAP128 | 1,009,139,712B |
+
+固定 arena 仍为 `0x42000000 = 1,107,296,256B`，shared 默认布局剩余
+`98,156,544B`，不需要扩大 arena。private artifact 不实例化这 2MiB
+sidecar，所有旧热字段、`DistCore` 和 per-core private map offset 保持原值。
+
+虽然 private 物理布局没有移动，shared 的尾部解释已经改变，Host、AICPU、
+AIC 和 AIV 必须作为同一家族重新生成。因此：
+
+- build ABI 从 v3 升到 v4；
+- `DistGlobal` layout identity 从 v3 升到 v4；
+- mode 与 CAP128 继续进入三镜像身份和 artifact cache key；
+- shared 的 `kFdwicCompiledBackendReady` 仍为 false，AICPU/AICore 都在零
+  Submit 前拒绝运行，不能静默落到 private 语义。
+
+#### AICPU 初始化边界
+
+新增 reset helper 在未来真实 `dist_engine_register()` 路径中一次性设置：
+
+- `committed_tasks = 0`；
+- `reclaim_upto = -1`；
+- 所有 bucket `head = tail = 0`；
+- 所有 16,384 个 slot `seq = -1`；
+- payload 不清零。
+
+`seq=-1` 是唯一无效哨兵；不能依赖 arena 零填充，因为首圈 slot 0 的合法
+absolute seq 正好是 0。worker reset 不得并发清空全局单副本。AICPU 随后
+沿既有路径 flush 整个 `dist_global` arena，再唤醒 worker。
+
+这里必须严格限定证据：当前 shared backend-ready 门在调用
+`dist_engine_register()` **之前**就会中止，所以 shared A5 负向运行不会实际
+执行这段 reset。现阶段只能证明 helper 的行为、production AICPU 接线可
+编译，以及它位于未来 register setup 路径；正式解除门禁前还要增加
+`dist_engine_register()` 正向集成测试，不能宣称真实 shared A5 已完成初始化。
+
+#### 本阶段证据
+
+| 检查 | 结果 |
+| --- | --- |
+| private CAP128 + shared CAP32/64/128/256/16384 精确布局/reset | 6/6 PASS |
+| 所有相关 FDWIC C++ 门槛 | 16/16 PASS |
+| GCC15 ASAN+UBSAN 同一组 FDWIC 门槛 | 16/16 PASS，无报告 |
+| private Host / inner AICPU / AIC / AIV / final AICore | 全部编译通过 |
+| shared Host / inner AICPU / AIC / AIV / final AICore | 全部编译通过 |
+| shared before-Submit 门禁 | 保持生效 |
+| shared A5 正向初始化/Submit | 本阶段未执行，门禁仍关闭 |
+
+production 纯编译使用本用户 CANN 9.1、`.venv` 与 GCC15，在独立目录同时生成
+private/shared artifact。实际编译命令确认三类镜像分别收到相同的
+`PTO_FDWIC_SHARED_MAP=0/1` 与
+`PTO_FDWIC_TENSORMAP_RING_CAP=128`，AIC/AIV 分别使用
+`dav-c310-cube`/`dav-c310-vec`。这证明 sidecar 类型与 AICPU 初始化入口不是
+只在 host UT 中成立，但不替代后续真实跨核可见性验证。
+
+参考分支中值得保留的是“共享控制字独占 cache line、AICPU 唤醒前建立哨兵、
+payload writeback 后再发布可见字”；没有移植其 64K
+`high_water + bucket head + next` append-only 链，因为它没有 reclaim/seq，
+也不是第 12 章要求的连续 ring-per-bucket。
+
+下一提交只实现独立 `shared_tensor_map.h`：时序窗口 lookup、整 task
+preflight、连续 append、absolute seq 双检和 exact-turn reclaim。它仍不接
+Submit、不解除门禁；算法门槛闭合后再单独接 winner-only task publish。

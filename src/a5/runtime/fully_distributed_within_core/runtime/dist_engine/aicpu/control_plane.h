@@ -13,6 +13,8 @@
 // configuration reads and signal-handler installation; AICore images never
 // include this file.
 
+#include "dist_engine/aicpu/shared_tensor_map_init.h"
+
 int32_t dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_workers, Runtime *runtime) {
     if (runtime != nullptr) runtime->dist.shared_addr = 0;
     if (rt == nullptr || rt->dist_global == nullptr || rt->gm_heap == nullptr || rt->gm_heap_size == 0) {
@@ -66,6 +68,12 @@ int32_t dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int n
     atomic_exchange(g_dist.final_barrier.root_arrival.v, int64_t{0}, __ATOMIC_RELAXED);
     g_dist.final_barrier.root_arrival.expected = 0;
     atomic_exchange(g_dist.final_barrier.root_release.v, int64_t{0}, __ATOMIC_RELAXED);
+#if PTO_FDWIC_SHARED_MAP
+    // 当前 shared artifact 仍由上层 backend-ready 门禁在零 Submit 前拒绝。
+    // 先把一次性初始化接到真实 AICPU setup 入口，后续解除门禁时不再新增
+    // 第二套初始化路径；worker reset 绝不能并发清空这份全局单副本。
+    dist_shared_tensor_map_reset(g_dist.shared_tensor_map);
+#endif
     g_dist.orch_args = orch_args;
     g_dist.rt = rt;
     g_dist.runtime = runtime;

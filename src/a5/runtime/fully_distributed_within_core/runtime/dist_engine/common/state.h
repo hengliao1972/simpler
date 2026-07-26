@@ -313,6 +313,93 @@ struct PaddedCursor {
 };
 static_assert(sizeof(PaddedCursor) == kCacheLine, "PaddedCursor must occupy one cacheline");
 
+// shared TensorMap 与 private 共用 bucket/CAP/hash/逻辑 region 语义，但不
+// 借用 private MapEntry 的 16B ABI reserve。专属 32B value 的 reserved
+// 必须由 writer 写 0、reader 校验 0，协议字段边界与 standalone 一致。
+struct SharedTensorMapValue {
+    uint64_t buf_addr;
+    uint64_t lo;
+    uint64_t hi;
+    int32_t producer;
+    uint32_t reserved;
+};
+static_assert(sizeof(SharedTensorMapValue) == 32, "shared TensorMap logical value size changed");
+static_assert(offsetof(SharedTensorMapValue, buf_addr) == 0, "shared TensorMap buffer offset changed");
+static_assert(offsetof(SharedTensorMapValue, lo) == 8, "shared TensorMap lower-bound offset changed");
+static_assert(offsetof(SharedTensorMapValue, hi) == 16, "shared TensorMap upper-bound offset changed");
+static_assert(offsetof(SharedTensorMapValue, producer) == 24, "shared TensorMap producer offset changed");
+static_assert(offsetof(SharedTensorMapValue, reserved) == 28, "shared TensorMap reserve offset changed");
+
+// payload 与发布 seq 必须分处独占 cache line。A5 的 atomic seq 访问和
+// 普通 payload cache writeback 若落在同一行，可能互相覆盖；两行分离后，
+// writer 可按“payload flush -> seq publish”建立明确的跨核可见性边界。
+struct alignas(kCacheLine) SharedTensorMapPayloadLine {
+    SharedTensorMapValue value;
+    uint8_t pad[kCacheLine - sizeof(SharedTensorMapValue)];
+};
+static_assert(sizeof(SharedTensorMapPayloadLine) == kCacheLine, "shared TensorMap payload must occupy one cacheline");
+static_assert(offsetof(SharedTensorMapPayloadLine, value) == 0, "shared TensorMap payload value offset changed");
+
+struct alignas(kCacheLine) SharedTensorMapSequenceLine {
+    volatile int64_t v;
+    uint8_t pad[kCacheLine - sizeof(int64_t)];
+};
+static_assert(offsetof(SharedTensorMapSequenceLine, v) == 0, "shared TensorMap sequence value offset changed");
+static_assert(sizeof(SharedTensorMapSequenceLine) == kCacheLine, "shared TensorMap sequence must occupy one cacheline");
+
+struct alignas(kCacheLine) SharedTensorMapSlot {
+    SharedTensorMapPayloadLine payload;
+    SharedTensorMapSequenceLine sequence;
+};
+static_assert(sizeof(SharedTensorMapSlot) == 2 * kCacheLine, "shared TensorMap slot size changed");
+static_assert(
+    offsetof(SharedTensorMapSlot, sequence) == kCacheLine,
+    "shared TensorMap sequence must not share the payload cacheline"
+);
+
+constexpr int64_t kSharedTensorMapInvalidSequence = -1;
+constexpr int64_t kSharedTensorMapInitialCommit = 0;
+constexpr int64_t kSharedTensorMapInitialReclaim = -1;
+
+struct alignas(kCacheLine) SharedTensorMapBucketState {
+    PaddedCursor head;
+    PaddedCursor tail;
+};
+static_assert(sizeof(SharedTensorMapBucketState) == 2 * kCacheLine, "shared TensorMap bucket controls changed");
+static_assert(
+    offsetof(SharedTensorMapBucketState, tail) == kCacheLine,
+    "shared TensorMap head and tail must not share a cacheline"
+);
+
+struct alignas(kCacheLine) SharedTensorMapState {
+    // committed_tasks 是下一个允许发布的 task id；即使任务没有 region，
+    // ordered commit 也必须从 N 推进到 N+1。
+    PaddedCursor committed_tasks;
+    // 已可回收的最大 producer id，初值 -1。只有 exact-turn winner 会
+    // 访问 map，因此在完成 task N lookup 后可直接用 N-H-1 单调推进；
+    // loser 不读 map，也不需要 per-core progress。
+    PaddedCursor reclaim_upto;
+    // 每桶 head/tail 各占一行且彼此相邻。第一版采用 task-id 有序单
+    // 追加者，因而不需要 MPSC reserve 游标或全局 free-list。
+    SharedTensorMapBucketState buckets[kMapBuckets];
+    // 与 private 完全相同的连续分桶下标：
+    // bucket * CAP + (absolute_cursor & (CAP - 1))。
+    SharedTensorMapSlot slots[kMapCap];
+};
+static_assert(offsetof(SharedTensorMapState, committed_tasks) == 0);
+static_assert(offsetof(SharedTensorMapState, reclaim_upto) == kCacheLine);
+static_assert(offsetof(SharedTensorMapState, buckets) == 2 * kCacheLine);
+static_assert(
+    offsetof(SharedTensorMapState, slots) == 2 * kCacheLine + sizeof(SharedTensorMapBucketState) * kMapBuckets,
+    "shared TensorMap slots must immediately follow bucket controls"
+);
+static_assert(sizeof(SharedTensorMapState) % kCacheLine == 0);
+#if PTO_FDWIC_TENSORMAP_RING_CAP == 128
+static_assert(offsetof(SharedTensorMapState, buckets) == 128);
+static_assert(offsetof(SharedTensorMapState, slots) == 16512);
+static_assert(sizeof(SharedTensorMapState) == 2113664);
+#endif
+
 struct DistTaskCell {
     volatile int64_t flag;
     volatile uint64_t vend;
@@ -385,6 +472,11 @@ struct DistGlobal {
     // Keep all existing hot-field and DistCore offsets stable. Only the tail
     // grows for the fixed two-level G=16 final barrier.
     FinalBarrierState final_barrier;
+#if PTO_FDWIC_SHARED_MAP
+    // shared 专属 sidecar 只追加在旧 DistGlobal 尾部；private artifact 不
+    // 实例化这 2MiB 状态，且所有旧热字段与 per-core map offset 均不移动。
+    SharedTensorMapState shared_tensor_map;
+#endif
 };
 static_assert(offsetof(DistGlobal, frontier) % 64 == 0, "DistGlobal frontier must be cacheline-aligned");
 static_assert(offsetof(DistGlobal, tasks) % 64 == 0, "DistGlobal tasks must be cacheline-aligned");
@@ -401,6 +493,27 @@ static_assert(
     offsetof(DistGlobal, final_barrier) % 64 == 0, "DistGlobal final barrier must be cacheline-aligned"
 );
 
+// 68f51451 已冻结的 private DistGlobal 尾边界。shared sidecar 只能从该
+// offset 追加，不能把 mode-specific 字段插进旧热布局。
+constexpr size_t kFdwicSharedTensorMapOffset = 1007026048;
+static_assert(
+    offsetof(DistGlobal, final_barrier) + sizeof(FinalBarrierState) == kFdwicSharedTensorMapOffset,
+    "FDWIC legacy DistGlobal tail moved"
+);
+#if PTO_FDWIC_SHARED_MAP
+static_assert(
+    offsetof(DistGlobal, shared_tensor_map) == kFdwicSharedTensorMapOffset,
+    "shared TensorMap sidecar must append after the frozen DistGlobal tail"
+);
+static_assert(
+    sizeof(DistGlobal) == kFdwicSharedTensorMapOffset + sizeof(SharedTensorMapState),
+    "shared DistGlobal may only grow by its TensorMap sidecar"
+);
+#else
+static_assert(
+    sizeof(DistGlobal) == kFdwicSharedTensorMapOffset, "private DistGlobal size changed while adding shared sidecar"
+);
+#endif
 static_assert(sizeof(DistGlobal) <= kDistEngineGlobalStateSize, "DistGlobal exceeds the reserved runtime arena size");
 static_assert(
     alignof(DistGlobal) <= kDistEngineGlobalStateAlign, "DistGlobal exceeds the reserved runtime arena align"

@@ -46,8 +46,8 @@ enum class FdwicTensorMapMode : uint32_t {
 };
 
 inline constexpr uint64_t kFdwicBuildIdentityMagic = 0x46445749434d4150ULL;  // "FDWICMAP"
-inline constexpr uint32_t kFdwicBuildAbiVersion = 3;
-inline constexpr uint32_t kFdwicDistGlobalLayoutVersion = 3;
+inline constexpr uint32_t kFdwicBuildAbiVersion = 4;
+inline constexpr uint32_t kFdwicDistGlobalLayoutVersion = 4;
 inline constexpr FdwicTensorMapMode kFdwicCompiledTensorMapMode = static_cast<FdwicTensorMapMode>(PTO_FDWIC_SHARED_MAP);
 inline constexpr uint32_t kFdwicTensorMapRingCap = PTO_FDWIC_TENSORMAP_RING_CAP;
 inline constexpr uint32_t kFdwicTensorMapRingBuckets = 16384U / kFdwicTensorMapRingCap;
