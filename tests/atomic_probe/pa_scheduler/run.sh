@@ -32,6 +32,8 @@ Build identity option (consumed by run.sh and never forwarded to the benchmark):
 Benchmark options:
   --device N
   --batches 1..256
+  --shared-context-lens C0[,C1...]  (shared standalone test only; one value broadcasts,
+                                     otherwise count must equal --batches; default 8192)
   --runs N
   --nop-count N
   --nop-counts QK,SF,PV,UP

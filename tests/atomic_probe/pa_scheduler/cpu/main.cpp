@@ -456,7 +456,11 @@ int main(int argc, char **argv) {
                 break;
             }
             if (!pa_scheduler::host::ExportSwimlaneRecords(
+#if PTO_FDWIC_SHARED_MAP
+                    *trace_header, *state, options.swimlane_json,
+#else
                     *trace_header, options.swimlane_json,
+#endif
                     workload_options.mode,
                     real_compute
                         ? workload_options.repeats

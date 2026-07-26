@@ -25,10 +25,32 @@
 
 namespace pa_scheduler::host {
 
+// shared host oracle 与 private 固定五 task 校验必须在预处理阶段彻底分叉。
+// private 的 #else 有意保留基线 token 形状，避免同一翻译单元内的 shared
+// AST 改动触发 GCC IPA/内联漂移，破坏两种 TensorMap 的严格产物可比性。
+#if PTO_FDWIC_SHARED_MAP
+constexpr uint32_t kHostPaBlockSize = 128;
+constexpr uint32_t kHostPaBlocksPerRequest = 64;
+
+// 这是 host oracle 自己采用的真实 PA 上限。故意不 include/call
+// pa_frontend.h::BuildSharedPaBatchPlan：host 必须从最终写入
+// SchedulerState.context_lens 的输入独立重算计划，才能发现 device plan
+// 公式、累计 batch_start 或 task 元数据出错。
+constexpr uint32_t kHostSharedPaMaxContextLength =
+    kSharedPaMaxBlockGroups * kHostPaBlocksPerRequest *
+    kHostPaBlockSize;
+#endif
+
 // 三种后端共用同一套命令行配置，保证 CPU 语义回归与 A5 上板使用完全相同的工作量。
 struct Options {
     std::string kernel_path;
     std::string swimlane_json;
+#if PTO_FDWIC_SHARED_MAP
+    // 空向量表示生产默认值 8192；一个值广播到全部 batch，多个值必须
+    // 与 --batches 精确等长。该开关只服务 standalone shared 语义测试，
+    // 不改变默认性能工作量。
+    std::vector<int32_t> shared_context_lens;
+#endif
     uint32_t device = 0;
     uint32_t batches = kDefaultBatches;
     uint32_t runs = 5;
@@ -77,6 +99,39 @@ inline bool ParseNopCounts(const char *raw, NopCounts *counts) {
     return true;
 }
 
+#if PTO_FDWIC_SHARED_MAP
+inline bool ParseSharedContextLens(
+    const char *raw, std::vector<int32_t> *context_lens
+) {
+    if (raw == nullptr || *raw == '\0' || context_lens == nullptr) {
+        return false;
+    }
+    std::vector<int32_t> parsed_values;
+    const char *cursor = raw;
+    while (*cursor != '\0') {
+        errno = 0;
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(cursor, &end, 10);
+        if (errno != 0 || end == cursor ||
+            parsed > kHostSharedPaMaxContextLength ||
+            (*end != ',' && *end != '\0') ||
+            parsed_values.size() >= kMaxBatches) {
+            return false;
+        }
+        parsed_values.push_back(static_cast<int32_t>(parsed));
+        if (*end == '\0') {
+            break;
+        }
+        cursor = end + 1;
+        if (*cursor == '\0') {
+            return false;
+        }
+    }
+    *context_lens = parsed_values;
+    return true;
+}
+#endif
+
 inline const char *FinalBarrierShapeName(FinalBarrierShape shape) {
     switch (shape) {
     case FinalBarrierShape::Flat:
@@ -124,7 +179,15 @@ inline void PrintUsage(const char *program, bool require_kernel) {
         stderr,
         "[--nop-count N | --nop-counts QK,SF,PV,UP] [--profile-phases] [--analyze-swimlane] "
         "[--trace-atomics] [--swimlane-json FILE] [--no-swimlane] "
+#if PTO_FDWIC_SHARED_MAP
+        "[--final-barrier flat|two-4|two-8|two-16|three-6x4x4] "
+        "[--shared-context-lens C0[,C1...]] "
+        "(default: two-16"
+        ", shared context_len=8192"
+        ")\n"
+#else
         "[--final-barrier flat|two-4|two-8|two-16|three-6x4x4] (default: two-16)\n"
+#endif
     );
 }
 
@@ -132,6 +195,9 @@ inline ParseStatus ParseOptions(int argc, char **argv, bool require_kernel, Opti
     // CCEC host 需要外部 kernel ELF；AscendC 和 CPU 的可执行文件已包含 kernel，因此不需要该参数。
     bool nop_override_seen = false;
     bool swimlane_json_seen = false;
+#if PTO_FDWIC_SHARED_MAP
+    bool shared_context_lens_seen = false;
+#endif
     for (int index = 1; index < argc; ++index) {
         // 无值开关先处理；其余参数统一在消费下一个 argv 前检查缺值，保证错误位置明确。
         const std::string argument = argv[index];
@@ -200,6 +266,28 @@ inline ParseStatus ParseOptions(int argc, char **argv, bool require_kernel, Opti
             }
             if (!ParseNopCounts(value, &options->nops)) return ParseStatus::Error;
             nop_override_seen = true;
+#if PTO_FDWIC_SHARED_MAP
+        } else if (argument == "--shared-context-lens") {
+            if (shared_context_lens_seen) {
+                std::fprintf(
+                    stderr,
+                    "Specify --shared-context-lens only once.\n"
+                );
+                return ParseStatus::Error;
+            }
+            if (!ParseSharedContextLens(
+                    value, &options->shared_context_lens
+                )) {
+                std::fprintf(
+                    stderr,
+                    "--shared-context-lens requires 1..256 comma-separated "
+                    "values in [0,%u].\n",
+                    kHostSharedPaMaxContextLength
+                );
+                return ParseStatus::Error;
+            }
+            shared_context_lens_seen = true;
+#endif
         } else {
             std::fprintf(stderr, "Unknown argument: %s\n", argument.c_str());
             return ParseStatus::Error;
@@ -227,8 +315,269 @@ inline ParseStatus ParseOptions(int argc, char **argv, bool require_kernel, Opti
         std::fprintf(stderr, "--swimlane-json requires --runs 1 to avoid overwriting captures.\n");
         return ParseStatus::Error;
     }
+#if PTO_FDWIC_SHARED_MAP
+    if (!options->shared_context_lens.empty() &&
+        options->shared_context_lens.size() != 1 &&
+        options->shared_context_lens.size() != options->batches) {
+        std::fprintf(
+            stderr,
+            "--shared-context-lens must contain one broadcast value or "
+            "exactly --batches (%u) values; got %zu.\n",
+            options->batches, options->shared_context_lens.size()
+        );
+        return ParseStatus::Error;
+    }
+#endif
     return ParseStatus::Ok;
 }
+
+#if PTO_FDWIC_SHARED_MAP
+struct SharedHostBatchPlan {
+    uint32_t batch;
+    uint32_t batch_start;
+    uint32_t group_count;
+    uint32_t task_count;
+    uint32_t block_count;
+    uint32_t final_up_task_id;
+    int32_t context_length;
+};
+
+struct SharedHostPlannedTask {
+    uint32_t task_id;
+    uint32_t batch;
+    uint32_t batch_start;
+    uint32_t task_offset;
+    uint32_t group_index;
+    uint32_t group_block_count;
+    uint64_t canonical_task_base;
+    uint64_t output_bytes;
+    TaskKind kind;
+    bool in_group;
+    bool has_following_group;
+    bool is_final_up;
+    bool is_last_in_batch;
+};
+
+struct SharedHostTaskPlan {
+    uint32_t batch_count = 0;
+    uint32_t total_groups = 0;
+    uint32_t total_tasks = 0;
+    uint64_t canonical_heap_bytes = 0;
+    uint32_t tasks_by_kind[
+        static_cast<uint32_t>(TaskKind::Count)
+    ] = {};
+    std::vector<SharedHostBatchPlan> batches;
+    std::vector<SharedHostPlannedTask> tasks;
+
+    const SharedHostPlannedTask *TaskAt(uint32_t task_id) const {
+        if (task_id >= tasks.size() ||
+            tasks[task_id].task_id != task_id) {
+            return nullptr;
+        }
+        return &tasks[task_id];
+    }
+
+    const SharedHostBatchPlan *BatchAt(uint32_t batch) const {
+        if (batch >= batches.size() ||
+            batches[batch].batch != batch) {
+            return nullptr;
+        }
+        return &batches[batch];
+    }
+};
+
+inline uint64_t SharedHostOutputBytes(
+    TaskKind kind, uint32_t group_block_count
+) {
+    switch (kind) {
+        case TaskKind::Alloc:
+            return 10240;
+        case TaskKind::Qk:
+            return static_cast<uint64_t>(group_block_count) * 8192;
+        case TaskKind::Sf:
+            return static_cast<uint64_t>(group_block_count) * 4096 +
+                   2048;
+        case TaskKind::Pv:
+            return 8192;
+        case TaskKind::Up:
+        case TaskKind::Count:
+            return 0;
+    }
+    return 0;
+}
+
+inline bool BuildSharedHostTaskPlan(
+    const SchedulerState &state, SharedHostTaskPlan *plan,
+    std::string *error = nullptr
+) {
+    if (plan == nullptr) {
+        if (error != nullptr) {
+            *error = "null output plan";
+        }
+        return false;
+    }
+    *plan = SharedHostTaskPlan{};
+    const uint32_t batches = state.config.batches;
+    if (batches == 0 || batches > kMaxBatches) {
+        if (error != nullptr) {
+            *error = "batch count is outside [1,256]";
+        }
+        return false;
+    }
+    plan->batch_count = batches;
+    plan->batches.reserve(batches);
+    plan->tasks.reserve(
+        static_cast<size_t>(batches) *
+        kSharedPaMaxTasksPerBatch
+    );
+
+    for (uint32_t batch = 0; batch < batches; ++batch) {
+        const int32_t context_length = state.context_lens[batch];
+        if (context_length < 0 ||
+            static_cast<uint32_t>(context_length) >
+                kHostSharedPaMaxContextLength) {
+            if (error != nullptr) {
+                *error =
+                    "context_lens[" + std::to_string(batch) +
+                    "] is outside [0," +
+                    std::to_string(kHostSharedPaMaxContextLength) +
+                    "]";
+            }
+            *plan = SharedHostTaskPlan{};
+            return false;
+        }
+        const uint32_t sequence =
+            static_cast<uint32_t>(context_length);
+        const uint32_t block_count =
+            (sequence + kHostPaBlockSize - 1U) /
+            kHostPaBlockSize;
+        const uint32_t group_count =
+            (block_count + kHostPaBlocksPerRequest - 1U) /
+            kHostPaBlocksPerRequest;
+        const uint32_t task_count = 1U + 4U * group_count;
+        if (group_count > kSharedPaMaxBlockGroups ||
+            task_count > kSharedPaMaxTasksPerBatch ||
+            plan->total_tasks >
+                kMaxTasks - task_count) {
+            if (error != nullptr) {
+                *error =
+                    "shared task plan exceeds compiled capacity at batch " +
+                    std::to_string(batch);
+            }
+            *plan = SharedHostTaskPlan{};
+            return false;
+        }
+
+        const uint32_t batch_start = plan->total_tasks;
+        const uint32_t no_final_up = UINT32_MAX;
+        plan->batches.push_back(
+            SharedHostBatchPlan{
+                batch,
+                batch_start,
+                group_count,
+                task_count,
+                block_count,
+                group_count == 0
+                    ? no_final_up
+                    : batch_start + task_count - 1U,
+                context_length,
+            }
+        );
+
+        const auto append_task = [&](
+            TaskKind kind, uint32_t task_offset,
+            uint32_t group_index, uint32_t group_blocks,
+            bool in_group
+        ) {
+            const uint32_t task_id =
+                batch_start + task_offset;
+            const uint64_t output_bytes =
+                SharedHostOutputBytes(kind, group_blocks);
+            const bool has_following_group =
+                kind == TaskKind::Up &&
+                group_index + 1U < group_count;
+            const bool is_final_up =
+                kind == TaskKind::Up &&
+                group_index + 1U == group_count;
+            plan->tasks.push_back(
+                SharedHostPlannedTask{
+                    task_id,
+                    batch,
+                    batch_start,
+                    task_offset,
+                    group_index,
+                    group_blocks,
+                    plan->canonical_heap_bytes,
+                    output_bytes,
+                    kind,
+                    in_group,
+                    has_following_group,
+                    is_final_up,
+                    task_offset + 1U == task_count,
+                }
+            );
+            plan->canonical_heap_bytes += output_bytes;
+            ++plan->tasks_by_kind[
+                static_cast<uint32_t>(kind)
+            ];
+        };
+
+        append_task(TaskKind::Alloc, 0, 0, 0, false);
+        for (uint32_t group = 0; group < group_count; ++group) {
+            const uint32_t block_offset =
+                group * kHostPaBlocksPerRequest;
+            const uint32_t group_blocks = std::min(
+                kHostPaBlocksPerRequest,
+                block_count - block_offset
+            );
+            const uint32_t group_offset = 1U + 4U * group;
+            append_task(
+                TaskKind::Qk, group_offset, group,
+                group_blocks, true
+            );
+            append_task(
+                TaskKind::Sf, group_offset + 1U, group,
+                group_blocks, true
+            );
+            append_task(
+                TaskKind::Pv, group_offset + 2U, group,
+                group_blocks, true
+            );
+            append_task(
+                TaskKind::Up, group_offset + 3U, group,
+                group_blocks, true
+            );
+        }
+        plan->total_groups += group_count;
+        plan->total_tasks += task_count;
+    }
+
+    if (plan->tasks.size() != plan->total_tasks ||
+        plan->batches.size() != plan->batch_count ||
+        plan->tasks_by_kind[
+            static_cast<uint32_t>(TaskKind::Alloc)
+        ] != plan->batch_count ||
+        plan->tasks_by_kind[
+            static_cast<uint32_t>(TaskKind::Qk)
+        ] != plan->total_groups ||
+        plan->tasks_by_kind[
+            static_cast<uint32_t>(TaskKind::Sf)
+        ] != plan->total_groups ||
+        plan->tasks_by_kind[
+            static_cast<uint32_t>(TaskKind::Pv)
+        ] != plan->total_groups ||
+        plan->tasks_by_kind[
+            static_cast<uint32_t>(TaskKind::Up)
+        ] != plan->total_groups) {
+        if (error != nullptr) {
+            *error = "shared task plan internal accounting mismatch";
+        }
+        *plan = SharedHostTaskPlan{};
+        return false;
+    }
+    return true;
+}
+#endif
 
 inline void InitializeState(SchedulerState *state, const Options &options) {
     // WorkerState 有意保持真实 PA 每核约 9 MiB 的布局。若 host 每轮清空全部 worker，
@@ -292,7 +641,23 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     state->config.scheduler_state_size = static_cast<uint32_t>(sizeof(SchedulerState));
     state->pmu_probe.build_variant = kCompiledBuildVariant;
     for (uint32_t batch = 0; batch < options.batches; ++batch) {
+#if PTO_FDWIC_SHARED_MAP
+        if (options.shared_context_lens.empty()) {
+            state->context_lens[batch] = 8192;
+        } else if (options.shared_context_lens.size() == 1) {
+            state->context_lens[batch] =
+                options.shared_context_lens.front();
+        } else if (batch < options.shared_context_lens.size()) {
+            state->context_lens[batch] =
+                options.shared_context_lens[batch];
+        } else {
+            // ParseOptions 会拒绝长度不匹配；这里仍用非法 sentinel
+            // fail closed，避免直接调用 InitializeState 的测试/后端越界。
+            state->context_lens[batch] = -1;
+        }
+#else
         state->context_lens[batch] = 8192;
+#endif
     }
     for (uint32_t shard = 0; shard < kCursorShards; ++shard) {
         // -1 表示尚无 task 被 claim；task 0 的 atomicMax 因而也能正常判定唯一 winner。
@@ -631,11 +996,24 @@ inline bool ClockRecordSchemaValid(const TraceRecord &record) {
 // device 记录字段。private 的 PrepareMap 是真实动作，因此编译为无约束
 // validator。
 struct SharedPrepareMapTraceValidator {
+#if PTO_FDWIC_SHARED_MAP
+    explicit SharedPrepareMapTraceValidator(
+        const SharedHostTaskPlan *plan = nullptr
+    ) : plan_(plan) {}
+#endif
+
     bool Observe(const TraceRecord &record) {
 #if PTO_FDWIC_SHARED_MAP
         const auto phase = static_cast<TracePhase>(record.phase);
         if (phase == TracePhase::Claim) {
-            if (submit_pending_ || record.task_id != next_task_id_) return false;
+            if (submit_pending_ ||
+                record.task_id != next_task_id_ ||
+                (plan_ != nullptr &&
+                 plan_->TaskAt(
+                     static_cast<uint32_t>(record.task_id)
+                 ) == nullptr)) {
+                return false;
+            }
             submit_pending_ = true;
             materialize_seen_ = false;
             marker_seen_ = false;
@@ -659,9 +1037,23 @@ struct SharedPrepareMapTraceValidator {
                 record.flags != 0 || record.task_id < 0) {
                 return false;
             }
-            const uint32_t kind =
-                static_cast<uint32_t>(record.task_id) % kTasksPerBatch;
-            if (record.auxiliary != (kind == 0 ? 1U : 0U)) {
+            const SharedHostPlannedTask *task =
+                plan_ == nullptr
+                    ? nullptr
+                    : plan_->TaskAt(
+                          static_cast<uint32_t>(
+                              record.task_id
+                          )
+                      );
+            // nullptr 只供隔离 validator 单测保留原固定图输入；真实
+            // export/analyze 总是传入由最终 context_lens 建立的 plan。
+            const bool is_alloc =
+                task == nullptr
+                    ? static_cast<uint32_t>(record.task_id) %
+                          kTasksPerBatch ==
+                          static_cast<uint32_t>(TaskKind::Alloc)
+                    : task->kind == TaskKind::Alloc;
+            if (record.auxiliary != (is_alloc ? 1U : 0U)) {
                 return false;
             }
             marker_seen_ = true;
@@ -686,7 +1078,9 @@ struct SharedPrepareMapTraceValidator {
 #if PTO_FDWIC_SHARED_MAP
         return !submit_pending_ &&
                materialize_count_ == marker_count_ &&
-               marker_count_ == submit_count_;
+               marker_count_ == submit_count_ &&
+               (plan_ == nullptr ||
+                submit_count_ == plan_->total_tasks);
 #else
         return true;
 #endif
@@ -705,6 +1099,9 @@ struct SharedPrepareMapTraceValidator {
     }
 
 private:
+#if PTO_FDWIC_SHARED_MAP
+    const SharedHostTaskPlan *plan_;
+#endif
     bool submit_pending_ = false;
     bool materialize_seen_ = false;
     bool marker_seen_ = false;
@@ -730,12 +1127,31 @@ inline void ExpectedTraceTopology(uint32_t worker, int32_t *block_id, int32_t *l
 
 template <typename ReadRecords>
 inline bool ExportSwimlaneRecords(
+#if PTO_FDWIC_SHARED_MAP
+    const TraceHeader &header, const SchedulerState &state,
+    const std::string &output_path,
+#else
     const TraceHeader &header, const std::string &output_path,
+#endif
     WinnerWorkloadMode workload_mode, const WorkloadCounts &workload_counts,
     const char *workload_pattern, FinalBarrierShape final_barrier_shape,
     bool atomic_trace_enabled, ReadRecords read_records
 ) {
     if (!ValidateTraceHeader(header, "swimlane export")) return false;
+#if PTO_FDWIC_SHARED_MAP
+    SharedHostTaskPlan shared_plan;
+    std::string shared_plan_error;
+    if (!BuildSharedHostTaskPlan(
+            state, &shared_plan, &shared_plan_error
+        )) {
+        std::fprintf(
+            stderr,
+            "swimlane export rejected invalid shared task plan: %s\n",
+            shared_plan_error.c_str()
+        );
+        return false;
+    }
+#endif
     if (workload_mode != WinnerWorkloadMode::ScalarNop &&
         workload_mode != WinnerWorkloadMode::RealCompute) {
         std::fprintf(stderr, "swimlane export rejected invalid winner workload mode.\n");
@@ -893,7 +1309,13 @@ inline bool ExportSwimlaneRecords(
         bool dependency_applied = false;
         bool direct_result_used_return_ready = false;
         bool direct_result_used_source_issue = false;
+#if PTO_FDWIC_SHARED_MAP
+        SharedPrepareMapTraceValidator prepare_map_validator(
+            &shared_plan
+        );
+#else
         SharedPrepareMapTraceValidator prepare_map_validator;
+#endif
         for (uint32_t index = 0; index < available; ++index) {
             const TraceRecord &record = scratch[index];
             const bool atomic_record = record.phase == static_cast<int32_t>(TracePhase::Atomic);
@@ -1057,6 +1479,20 @@ inline bool AnalyzeSwimlaneRecords(
     const TraceHeader &header, const SchedulerState &state, ReadRecords read_records
 ) {
     if (!ValidateTraceHeader(header, "swimlane analysis")) return false;
+#if PTO_FDWIC_SHARED_MAP
+    SharedHostTaskPlan shared_plan;
+    std::string shared_plan_error;
+    if (!BuildSharedHostTaskPlan(
+            state, &shared_plan, &shared_plan_error
+        )) {
+        std::fprintf(
+            stderr,
+            "swimlane analysis rejected invalid shared task plan: %s\n",
+            shared_plan_error.c_str()
+        );
+        return false;
+    }
+#endif
 
     // 第一组数组统计“每个 worker 在某阶段的累计时间”；task_durations 则保留重点阶段的单事件分布。
     constexpr uint32_t kTracePhaseCount = static_cast<uint32_t>(TracePhase::Count);
@@ -1065,7 +1501,13 @@ inline bool AnalyzeSwimlaneRecords(
     };
     uint64_t cycles[kWorkers][kTracePhaseCount] = {};
     uint64_t counts[kWorkers][kTracePhaseCount] = {};
+#if PTO_FDWIC_SHARED_MAP
+    std::vector<uint64_t> task_durations[2][
+        static_cast<uint32_t>(TaskKind::Count)
+    ][sizeof(kDetailedPhases) / sizeof(kDetailedPhases[0])];
+#else
     std::vector<uint64_t> task_durations[2][kTasksPerBatch][sizeof(kDetailedPhases) / sizeof(kDetailedPhases[0])];
+#endif
     std::vector<uint64_t> atomic_durations[2][static_cast<uint32_t>(AtomicSite::Count)];
     uint64_t atomic_return_ready_counts[2][static_cast<uint32_t>(AtomicSite::Count)] = {};
     std::vector<uint64_t> atomic_poll_windows[2][static_cast<uint32_t>(AtomicSite::Count)];
@@ -1075,7 +1517,13 @@ inline bool AnalyzeSwimlaneRecords(
     uint64_t clock_dependency_applied[2] = {};
     std::vector<TraceRecord> scratch(kTraceRecordsPerCore);
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
+#if PTO_FDWIC_SHARED_MAP
+        SharedPrepareMapTraceValidator prepare_map_validator(
+            &shared_plan
+        );
+#else
         SharedPrepareMapTraceValidator prepare_map_validator;
+#endif
         const uint32_t available = header.cores[worker].count;
         const uint32_t count = std::min(available, header.records_per_core);
         if (count != 0 && !read_records(worker, count, scratch.data())) {
@@ -1137,10 +1585,21 @@ inline bool AnalyzeSwimlaneRecords(
                 }
             }
             if (record.task_id >= 0) {
-                // task_id % 5 恰好对应 Alloc/QK/SF/PV/UP，这是固定 PA Case1 图的拓扑约束。
                 const uint32_t role_index =
                     state.results[worker].role == static_cast<uint64_t>(CoreRole::Aic) ? 0U : 1U;
+#if PTO_FDWIC_SHARED_MAP
+                const SharedHostPlannedTask *task =
+                    shared_plan.TaskAt(
+                        static_cast<uint32_t>(record.task_id)
+                    );
+                if (task == nullptr) {
+                    return false;
+                }
+                const uint32_t kind =
+                    static_cast<uint32_t>(task->kind);
+#else
                 const uint32_t kind = static_cast<uint32_t>(record.task_id) % kTasksPerBatch;
+#endif
                 for (uint32_t detail = 0; detail < sizeof(kDetailedPhases) / sizeof(kDetailedPhases[0]); ++detail) {
                     if (phase == static_cast<uint32_t>(kDetailedPhases[detail])) {
                         task_durations[role_index][kind][detail].push_back(duration);
@@ -1254,7 +1713,13 @@ inline bool AnalyzeSwimlaneRecords(
     const char *kind_names[] = {"Alloc", "QK", "SF", "PV", "UP"};
     // 单事件统计按 role 与 task kind 展开，可区分“该 role 真实参与”与“只回放前端”的成本。
     for (uint32_t role_index = 0; role_index < 2; ++role_index) {
+#if PTO_FDWIC_SHARED_MAP
+        for (uint32_t kind = 0;
+             kind < static_cast<uint32_t>(TaskKind::Count);
+             ++kind) {
+#else
         for (uint32_t kind = 0; kind < kTasksPerBatch; ++kind) {
+#endif
             for (uint32_t detail = 0; detail < sizeof(kDetailedPhases) / sizeof(kDetailedPhases[0]); ++detail) {
                 const std::vector<uint64_t> &durations = task_durations[role_index][kind][detail];
                 const Uint64Distribution summary = SummarizeUint64(durations);
@@ -1284,6 +1749,7 @@ inline uint64_t DependencyEdgeSignatureHost(
     return value;
 }
 
+#if !PTO_FDWIC_SHARED_MAP
 inline uint64_t ExpectedPaDependencySignature(uint32_t batches) {
     uint64_t signature = 0;
     for (uint32_t batch = 0; batch < batches; ++batch) {
@@ -1303,6 +1769,37 @@ inline uint64_t ExpectedPaDependencySignature(uint32_t batches) {
     }
     return signature;
 }
+#endif
+
+#if PTO_FDWIC_SHARED_MAP
+inline uint64_t ExpectedPaDependencySignature(
+    const SharedHostTaskPlan &plan
+) {
+    uint64_t signature = 0;
+    for (const SharedHostBatchPlan &batch : plan.batches) {
+        uint32_t accumulator_writer = batch.batch_start;
+        for (uint32_t group = 0;
+             group < batch.group_count; ++group) {
+            const uint32_t qk =
+                batch.batch_start + 1U + 4U * group;
+            const uint32_t sf = qk + 1U;
+            const uint32_t pv = qk + 2U;
+            const uint32_t up = qk + 3U;
+            // 每组始终有 SF<-QK、PV<-SF、UP<-SF/PV 三条 fresh
+            // 依赖。三个 accumulator symbol 在 CollectFanin 中去重为
+            // 一条：首组 writer 是 Alloc，后续组 writer 是前一 UP。
+            signature ^= DependencyEdgeSignatureHost(sf, qk);
+            signature ^= DependencyEdgeSignatureHost(pv, sf);
+            signature ^= DependencyEdgeSignatureHost(up, sf);
+            signature ^= DependencyEdgeSignatureHost(up, pv);
+            signature ^=
+                DependencyEdgeSignatureHost(up, accumulator_writer);
+            accumulator_writer = up;
+        }
+    }
+    return signature;
+}
+#endif
 
 inline uint32_t SharedTensorMapHashHost(uint64_t address) {
     address *= 0x9E3779B97F4A7C15ULL;
@@ -1357,6 +1854,19 @@ inline SharedTensorMapValidation ValidateSharedTensorMap(
 }
 #endif
 
+#if PTO_FDWIC_SHARED_MAP
+inline uint32_t ExpectedOutputCount(TaskKind kind) {
+    switch (kind) {
+        case TaskKind::Alloc: return 3;
+        case TaskKind::Qk: return 1;
+        case TaskKind::Sf: return 3;
+        case TaskKind::Pv: return 1;
+        case TaskKind::Up: return 0;
+        case TaskKind::Count: return 0;
+    }
+    return 0;
+}
+#else
 inline uint32_t ExpectedOutputCount(uint32_t task_id) {
     switch (static_cast<TaskKind>(task_id % kTasksPerBatch)) {
         case TaskKind::Alloc: return 3;
@@ -1368,13 +1878,16 @@ inline uint32_t ExpectedOutputCount(uint32_t task_id) {
     }
     return 0;
 }
+#endif
 
 // host_support 只依赖 pa_model，不能反向 include 设备端 pa_frontend；这里保留
 // Case1 协议已固定的 descriptor 常量和 dtype 字节数，避免 host 校验引入设备代码。
 constexpr uint32_t kHostPaHeads = 16;
 constexpr uint32_t kHostPaHeadDim = 128;
+#if !PTO_FDWIC_SHARED_MAP
 constexpr uint32_t kHostPaBlockSize = 128;
 constexpr uint32_t kHostPaBlocksPerRequest = 64;
+#endif
 constexpr uint64_t kHostSyntheticOutputBase = 0x600000000ULL;
 constexpr uint64_t kHostInvalidTaskId = UINT64_MAX;
 
@@ -1402,13 +1915,24 @@ inline uint64_t HostElementSize(DataType dtype) {
     return 0;
 }
 
+#if PTO_FDWIC_SHARED_MAP
+inline uint64_t ExpectedTaskOutputBytesForKind(TaskKind kind) {
+    constexpr uint64_t kOutputBytesByKind[kTasksPerBatch] = {
+        10240, 524288, 264192, 8192, 0
+    };
+    const uint32_t index = static_cast<uint32_t>(kind);
+    return index < kTasksPerBatch ? kOutputBytesByKind[index] : 0;
+}
+#else
 inline uint64_t ExpectedTaskOutputBytes(uint32_t task_id) {
     constexpr uint64_t kOutputBytesByKind[kTasksPerBatch] = {
         10240, 524288, 264192, 8192, 0
     };
     return kOutputBytesByKind[task_id % kTasksPerBatch];
 }
+#endif
 
+#if !PTO_FDWIC_SHARED_MAP
 inline uint64_t ExpectedCanonicalTaskBase(uint32_t task_id) {
     constexpr uint64_t kTaskOffsetByKind[kTasksPerBatch] = {
         0, 10240, 534528, 798720, 806912
@@ -1416,14 +1940,14 @@ inline uint64_t ExpectedCanonicalTaskBase(uint32_t task_id) {
     return static_cast<uint64_t>(task_id / kTasksPerBatch) * 806912ULL +
            kTaskOffsetByKind[task_id % kTasksPerBatch];
 }
+#endif
 
 #if PTO_FDWIC_SHARED_MAP
 inline uint64_t ExpectedSharedHeapShardSpan(uint64_t heap_size) {
     const uint64_t raw = heap_size / kSharedHeapShards;
     return raw / kOutputAlignment * kOutputAlignment;
 }
-#endif
-
+#else
 inline TensorDesc ExpectedCanonicalOutputDescriptor(
     uint32_t task_id, uint32_t output_slot
 ) {
@@ -1495,17 +2019,98 @@ inline TensorDesc ExpectedCanonicalOutputDescriptor(
     }
     return expected;
 }
+#endif
 
 #if PTO_FDWIC_SHARED_MAP
+inline TensorDesc ExpectedCanonicalOutputDescriptorForTask(
+    uint32_t task_id, uint32_t output_slot, TaskKind kind,
+    uint32_t group_block_count, uint64_t task_base
+) {
+    uint64_t output_offset = 0;
+    uint64_t buffer_size = 0;
+    uint32_t ndims = 0;
+    DataType dtype = DataType::Float32;
+    uint32_t shapes[kMaxTensorDims] = {};
+    if (kind == TaskKind::Alloc) {
+        if (output_slot == 0) {
+            buffer_size = 8192;
+            ndims = 2;
+            shapes[0] = kHostPaHeads;
+            shapes[1] = kHostPaHeadDim;
+        } else if (output_slot == 1 || output_slot == 2) {
+            output_offset = output_slot == 1 ? 8192 : 9216;
+            buffer_size = 64;
+            ndims = 1;
+            shapes[0] = kHostPaHeads;
+        }
+    } else if (kind == TaskKind::Qk && output_slot == 0) {
+        buffer_size =
+            static_cast<uint64_t>(kHostPaHeads) *
+            group_block_count * kHostPaBlockSize * 4U;
+        ndims = 2;
+        shapes[0] = kHostPaHeads;
+        shapes[1] = group_block_count * kHostPaBlockSize;
+    } else if (kind == TaskKind::Sf) {
+        const uint64_t probabilities_size =
+            static_cast<uint64_t>(kHostPaHeads) *
+            group_block_count * kHostPaBlockSize * 2U;
+        if (output_slot == 0) {
+            buffer_size = probabilities_size;
+            ndims = 2;
+            dtype = DataType::Bfloat16;
+            shapes[0] = kHostPaHeads;
+            shapes[1] = group_block_count * kHostPaBlockSize;
+        } else if (output_slot == 1 || output_slot == 2) {
+            output_offset =
+                probabilities_size +
+                (output_slot == 1 ? 0 : kOutputAlignment);
+            buffer_size = 64;
+            ndims = 1;
+            shapes[0] = kHostPaHeads;
+        }
+    } else if (kind == TaskKind::Pv && output_slot == 0) {
+        buffer_size = 8192;
+        ndims = 2;
+        shapes[0] = kHostPaHeads;
+        shapes[1] = kHostPaHeadDim;
+    }
+
+    TensorDesc expected{};
+    expected.buffer_addr = kSyntheticHeapBase + task_base + output_offset;
+    expected.buffer_size = buffer_size;
+    expected.owner_task_id = task_id;
+    expected.start_offset = 0;
+    expected.version = 0;
+    expected.ndims = ndims;
+    expected.dtype = dtype;
+    expected.manual_dep = false;
+    expected.is_contiguous = true;
+    expected.child_memory = 0;
+    uint32_t stride = 1;
+    for (int32_t index = static_cast<int32_t>(ndims) - 1; index >= 0; --index) {
+        expected.strides[index] = stride;
+        stride *= shapes[index];
+    }
+    expected.extent_elem_cache = stride;
+    for (uint32_t index = 0; index < kMaxTensorDims; ++index) {
+        expected.shapes[index] = shapes[index];
+    }
+    return expected;
+}
+
 inline TensorDesc ExpectedSharedOutputDescriptorAtBase(
-    uint32_t task_id, uint32_t output_slot, uint64_t task_base
+    const SharedHostPlannedTask &task, uint32_t output_slot,
+    uint64_t task_base
 ) {
     TensorDesc expected =
-        ExpectedCanonicalOutputDescriptor(task_id, output_slot);
-    const uint64_t canonical_task_base =
-        ExpectedCanonicalTaskBase(task_id);
+        ExpectedCanonicalOutputDescriptorForTask(
+            task.task_id, output_slot, task.kind,
+            task.group_block_count,
+            task.canonical_task_base
+        );
     const uint64_t output_offset =
-        expected.buffer_addr - kSyntheticHeapBase - canonical_task_base;
+        expected.buffer_addr - kSyntheticHeapBase -
+        task.canonical_task_base;
     expected.buffer_addr =
         kSyntheticHeapBase + task_base + output_offset;
     return expected;
@@ -1549,7 +2154,8 @@ struct SharedHeapInterval {
 };
 
 inline SharedOutputValidation ValidateSharedOutputs(
-    const SharedTensorMapSidecar &map, uint32_t task_count,
+    const SharedTensorMapSidecar &map,
+    const SharedHostTaskPlan &plan,
     uint64_t heap_size
 ) {
     SharedOutputValidation validation;
@@ -1557,12 +2163,16 @@ inline SharedOutputValidation ValidateSharedOutputs(
     const uint64_t shard_span = ExpectedSharedHeapShardSpan(heap_size);
     std::vector<SharedHeapInterval> intervals[kSharedHeapShards];
     for (uint32_t task_id = 0; task_id < kMaxTasks; ++task_id) {
+        const SharedHostPlannedTask *task =
+            plan.TaskAt(task_id);
         const uint32_t expected_count =
-            task_id < task_count ? ExpectedOutputCount(task_id) : 0;
+            task == nullptr
+                ? 0
+                : ExpectedOutputCount(task->kind);
         const SharedOutputCell &cell = map.shared_outputs[task_id];
         uint64_t task_base = 0;
         if (expected_count != 0) {
-            const uint64_t output_bytes = ExpectedTaskOutputBytes(task_id);
+            const uint64_t output_bytes = task->output_bytes;
             const uint32_t shard = task_id % kSharedHeapShards;
             const uint64_t shard_begin =
                 static_cast<uint64_t>(shard) * shard_span;
@@ -1597,17 +2207,27 @@ inline SharedOutputValidation ValidateSharedOutputs(
                 ) == 0;
                 continue;
             }
-            const TaskKind kind = static_cast<TaskKind>(task_id % kTasksPerBatch);
-            const int64_t expected_writer = kind == TaskKind::Alloc
-                ? static_cast<int64_t>(task_id + 4)
-                : static_cast<int64_t>(task_id);
+            int64_t expected_writer =
+                static_cast<int64_t>(task_id);
+            if (task->kind == TaskKind::Alloc) {
+                const SharedHostBatchPlan *batch =
+                    plan.BatchAt(task->batch);
+                if (batch == nullptr) {
+                    validation.protocol_ok = false;
+                } else if (batch->group_count != 0) {
+                    expected_writer =
+                        static_cast<int64_t>(
+                            batch->final_up_task_id
+                        );
+                }
+            }
             validation.protocol_ok &=
                 cell.published[slot].value == static_cast<int64_t>(task_id);
             validation.protocol_ok &= cell.last_writer[slot].value == expected_writer;
             validation.protocol_ok &= TensorDescFieldsMatch(
                 cell.tensors[slot],
                 ExpectedSharedOutputDescriptorAtBase(
-                    task_id, slot, task_base
+                    *task, slot, task_base
                 )
             );
             ++validation.published_outputs;
@@ -1695,6 +2315,7 @@ inline uint64_t FinishNormalizedWriterSignature(
     return signature;
 }
 
+#if !PTO_FDWIC_SHARED_MAP
 inline uint64_t ExpectedNormalizedWriterSignature(
     uint32_t batches, uint32_t logical_floor
 ) {
@@ -1719,36 +2340,122 @@ inline uint64_t ExpectedNormalizedWriterSignature(
     }
     return FinishNormalizedWriterSignature(by_bucket);
 }
+#endif
 
 #if PTO_FDWIC_SHARED_MAP
-inline uint64_t SharedNormalizedWriterSignature(
-    const SharedTensorMapSidecar &map, uint32_t batches, uint32_t logical_floor
+inline uint64_t ExpectedNormalizedWriterSignature(
+    const SharedHostTaskPlan &plan, uint32_t logical_floor
 ) {
     std::vector<NormalizedWriterEntry> by_bucket[kMapBuckets];
-    for (uint32_t batch = 0; batch < batches; ++batch) {
-        const uint32_t alloc = batch * kTasksPerBatch;
-        const uint32_t up = alloc + 4;
-        if (up < logical_floor) {
+    for (const SharedHostBatchPlan &batch : plan.batches) {
+        if (batch.group_count == 0 ||
+            batch.final_up_task_id < logical_floor) {
             continue;
         }
-        const SharedOutputCell &cell = map.shared_outputs[alloc];
+        const SharedHostPlannedTask *alloc =
+            plan.TaskAt(batch.batch_start);
+        if (alloc == nullptr ||
+            alloc->kind != TaskKind::Alloc) {
+            continue;
+        }
+        // RegisterOutputs 的真实顺序是 max、sum、output、manual
+        // output_view；canonical 地址由动态计划中的 task-order prefix
+        // 给出，不再从 task_id / 5 猜 batch。
+        AddNormalizedWriter(
+            by_bucket,
+            ExpectedCanonicalOutputDescriptorForTask(
+                alloc->task_id, 2, alloc->kind,
+                alloc->group_block_count,
+                alloc->canonical_task_base
+            ),
+            batch.final_up_task_id
+        );
+        AddNormalizedWriter(
+            by_bucket,
+            ExpectedCanonicalOutputDescriptorForTask(
+                alloc->task_id, 1, alloc->kind,
+                alloc->group_block_count,
+                alloc->canonical_task_base
+            ),
+            batch.final_up_task_id
+        );
+        AddNormalizedWriter(
+            by_bucket,
+            ExpectedCanonicalOutputDescriptorForTask(
+                alloc->task_id, 0, alloc->kind,
+                alloc->group_block_count,
+                alloc->canonical_task_base
+            ),
+            batch.final_up_task_id
+        );
+        AddNormalizedWriter(
+            by_bucket,
+            ExpectedManualOutputView(
+                batch.batch, plan.batch_count
+            ),
+            batch.final_up_task_id
+        );
+    }
+    return FinishNormalizedWriterSignature(by_bucket);
+}
+
+inline uint64_t SharedNormalizedWriterSignature(
+    const SharedTensorMapSidecar &map,
+    const SharedHostTaskPlan &plan,
+    uint32_t logical_floor
+) {
+    std::vector<NormalizedWriterEntry> by_bucket[kMapBuckets];
+    for (const SharedHostBatchPlan &batch : plan.batches) {
+        if (batch.group_count == 0 ||
+            batch.final_up_task_id < logical_floor) {
+            continue;
+        }
+        const SharedHostPlannedTask *alloc =
+            plan.TaskAt(batch.batch_start);
+        if (alloc == nullptr ||
+            alloc->kind != TaskKind::Alloc) {
+            continue;
+        }
+        const SharedOutputCell &cell =
+            map.shared_outputs[alloc->task_id];
         // 实际 shared descriptor 的 8-shard 地址已经由
         // ValidateSharedOutputs 严格校验。跨模式签名只投影同一个业务
         // output 的 canonical(private 连续 heap)地址，不能把物理分片差异
         // 误判成 writer 拓扑差异。
         AddNormalizedWriter(
-            by_bucket, ExpectedCanonicalOutputDescriptor(alloc, 2),
+            by_bucket,
+            ExpectedCanonicalOutputDescriptorForTask(
+                alloc->task_id, 2, alloc->kind,
+                alloc->group_block_count,
+                alloc->canonical_task_base
+            ),
             static_cast<uint32_t>(cell.last_writer[2].value)
         );
         AddNormalizedWriter(
-            by_bucket, ExpectedCanonicalOutputDescriptor(alloc, 1),
+            by_bucket,
+            ExpectedCanonicalOutputDescriptorForTask(
+                alloc->task_id, 1, alloc->kind,
+                alloc->group_block_count,
+                alloc->canonical_task_base
+            ),
             static_cast<uint32_t>(cell.last_writer[1].value)
         );
         AddNormalizedWriter(
-            by_bucket, ExpectedCanonicalOutputDescriptor(alloc, 0),
+            by_bucket,
+            ExpectedCanonicalOutputDescriptorForTask(
+                alloc->task_id, 0, alloc->kind,
+                alloc->group_block_count,
+                alloc->canonical_task_base
+            ),
             static_cast<uint32_t>(cell.last_writer[0].value)
         );
-        AddNormalizedWriter(by_bucket, ExpectedManualOutputView(batch, batches), up);
+        AddNormalizedWriter(
+            by_bucket,
+            ExpectedManualOutputView(
+                batch.batch, plan.batch_count
+            ),
+            batch.final_up_task_id
+        );
     }
     return FinishNormalizedWriterSignature(by_bucket);
 }
@@ -1810,13 +2517,70 @@ inline Metrics Validate(
     // 每个 worker 都回放全部 task。Alloc 由 96 个 worker 全部执行 atomicMax Claim；
     // 其余 kernel task 只有与 active role 匹配的 AIC 或 AIV 参与 Claim。
     const uint32_t batches = state.config.batches;
+#if PTO_FDWIC_SHARED_MAP
+    SharedHostTaskPlan shared_plan;
+    std::string shared_plan_error;
+    const bool shared_plan_ok = BuildSharedHostTaskPlan(
+        state, &shared_plan, &shared_plan_error
+    );
+    Expect(
+        shared_plan_ok,
+        "host independently rebuilds the final shared task plan",
+        &metrics
+    );
+    if (!shared_plan_ok) {
+        std::fprintf(
+            stderr, "Invalid shared host task plan: %s\n",
+            shared_plan_error.c_str()
+        );
+    } else {
+        std::printf(
+            "[HOST_PLAN] batches=%u groups=%u tasks=%u "
+            "kinds=Alloc:%u,QK:%u,SF:%u,PV:%u,UP:%u "
+            "canonical_heap_bytes=%llu\n",
+            shared_plan.batch_count,
+            shared_plan.total_groups,
+            shared_plan.total_tasks,
+            shared_plan.tasks_by_kind[
+                static_cast<uint32_t>(TaskKind::Alloc)
+            ],
+            shared_plan.tasks_by_kind[
+                static_cast<uint32_t>(TaskKind::Qk)
+            ],
+            shared_plan.tasks_by_kind[
+                static_cast<uint32_t>(TaskKind::Sf)
+            ],
+            shared_plan.tasks_by_kind[
+                static_cast<uint32_t>(TaskKind::Pv)
+            ],
+            shared_plan.tasks_by_kind[
+                static_cast<uint32_t>(TaskKind::Up)
+            ],
+            static_cast<unsigned long long>(
+                shared_plan.canonical_heap_bytes
+            )
+        );
+    }
+    const uint32_t task_count =
+        shared_plan_ok ? shared_plan.total_tasks : 0;
+    const uint32_t group_count =
+        shared_plan_ok ? shared_plan.total_groups : 0;
+#else
     const uint32_t task_count = batches * kTasksPerBatch;
+#endif
     const bool final_barrier_shape_valid =
         state.config.final_barrier_shape <= static_cast<uint32_t>(FinalBarrierShape::ThreeLevel6x4x4);
     const auto final_barrier_shape = static_cast<FinalBarrierShape>(state.config.final_barrier_shape);
     const uint64_t expected_submits = static_cast<uint64_t>(kWorkers) * task_count;
+#if PTO_FDWIC_SHARED_MAP
+    const uint64_t expected_claims =
+        static_cast<uint64_t>(batches) * kWorkers +
+        static_cast<uint64_t>(group_count) *
+            (2U * kAicWorkers + 2U * kAivWorkers);
+#else
     const uint64_t expected_claims =
         static_cast<uint64_t>(batches) * (kWorkers + kAicWorkers + kAivWorkers + kAicWorkers + kAivWorkers);
+#endif
     // 上式依次对应 Alloc、QK、SF、PV、UP 的 active worker 数，默认 256 batch 时为 73728。
 
     // 聚合量分为调度核心计数、kernel 分布、前端操作数和最终状态四组，便于定位语义偏差。
@@ -1913,9 +2677,19 @@ inline Metrics Validate(
     bool shared_heap_capacity_ok = shared_heap_shard_span != 0;
 #endif
     for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
+#if PTO_FDWIC_SHARED_MAP
+        const SharedHostPlannedTask *planned_task =
+            shared_plan.TaskAt(task_id);
+        const uint64_t output_bytes =
+            planned_task == nullptr
+                ? 0
+                : planned_task->output_bytes;
+#else
         const uint64_t output_bytes = ExpectedTaskOutputBytes(task_id);
+#endif
 #if PTO_FDWIC_SHARED_MAP
         const uint32_t shard = task_id % kSharedHeapShards;
+        shared_heap_capacity_ok &= planned_task != nullptr;
         shared_heap_capacity_ok &=
             expected_shared_heap_cursor[shard] <= shared_heap_shard_span &&
             output_bytes <=
@@ -1938,13 +2712,23 @@ inline Metrics Validate(
     }
 #if PTO_FDWIC_SHARED_MAP
     bool shared_heap_state_ok = shared_heap_capacity_ok;
-    // 当前 Case1 每个 batch 只有一个 block group；没有后继 group，就不应
-    // 触发 shared writer-ready gate。host 只在 kernel 完成后读取该状态，
-    // 不给设备热路增加任何观察字段或 atomic。
-    bool shared_writer_gates_idle = true;
+    // 只有存在后继 group 的 UP 会在 Build 前发布 writer-ready gate；
+    // final UP 与其他 task 必须保留 -1。host 从独立 plan 精确核对每格，
+    // 不能把“出现非 -1”笼统视为错误。
+    bool shared_writer_gates_ok = true;
     for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
-        shared_writer_gates_idle &=
-            state.tasks[task_id].deps_prepared == -1;
+        const SharedHostPlannedTask *planned_task =
+            shared_plan.TaskAt(task_id);
+        const int64_t expected_gate =
+            planned_task != nullptr &&
+            planned_task->kind == TaskKind::Up &&
+            planned_task->has_following_group
+                ? static_cast<int64_t>(task_id)
+                : -1;
+        shared_writer_gates_ok &=
+            planned_task != nullptr &&
+            state.tasks[task_id].deps_prepared ==
+                expected_gate;
     }
     uint64_t actual_shared_cursor_sum = 0;
     uint64_t expected_shared_cursor_sum = 0;
@@ -2000,7 +2784,9 @@ inline Metrics Validate(
     const SharedTensorMapValidation shared_map_validation =
         ValidateSharedTensorMap(state.shared_map);
     const SharedOutputValidation shared_output_validation =
-        ValidateSharedOutputs(state.shared_map, task_count, state.heap_size);
+        ValidateSharedOutputs(
+            state.shared_map, shared_plan, state.heap_size
+        );
     bool shared_output_heap_layout_ok =
         shared_output_validation.protocol_ok &&
         shared_output_validation.allocated_bytes == expected_heap_next &&
@@ -2018,15 +2804,22 @@ inline Metrics Validate(
     const uint64_t shared_normalized_writer_signature =
         shared_output_heap_layout_ok
             ? SharedNormalizedWriterSignature(
-                  state.shared_map, batches,
+                  state.shared_map, shared_plan,
                   static_cast<uint32_t>(expected_map_floor)
               )
             : 0;
 #endif
     const uint64_t expected_normalized_writer_signature =
+#if PTO_FDWIC_SHARED_MAP
+        ExpectedNormalizedWriterSignature(
+            shared_plan,
+            static_cast<uint32_t>(expected_map_floor)
+        );
+#else
         ExpectedNormalizedWriterSignature(
             batches, static_cast<uint32_t>(expected_map_floor)
         );
+#endif
 
     for (uint32_t index = 0; index < kWorkers; ++index) {
         // 每核只写自己独占且按 cache line 隔离的 WorkerResult；host 在 kernel 完成后统一汇总，不引入额外 atomic。
@@ -2163,22 +2956,18 @@ inline Metrics Validate(
         // task-order prefix 集合核对。纯 loser 仍必须保持 0。
         const uint64_t nonzero_output_wins =
             alloc_wins + qk_wins + sf_wins + pv_wins;
-        const uint64_t own_reserved_bytes =
-            alloc_wins * ExpectedTaskOutputBytes(
-                static_cast<uint32_t>(TaskKind::Alloc)
-            ) +
-            qk_wins * ExpectedTaskOutputBytes(
-                static_cast<uint32_t>(TaskKind::Qk)
-            ) +
-            sf_wins * ExpectedTaskOutputBytes(
-                static_cast<uint32_t>(TaskKind::Sf)
-            ) +
-            pv_wins * ExpectedTaskOutputBytes(
-                static_cast<uint32_t>(TaskKind::Pv)
-            );
+        // WorkerResult 只按 kind 聚合 wins，不保存每个动态 group 的
+        // nblocks；对 partial final group 只能重建该 worker 自身 reserve
+        // 的严格下界。全局逐 task output/descriptor/heap cursor 仍由
+        // shared_plan 做精确校验。
+        const uint64_t own_reserved_minimum =
+            alloc_wins * 10240ULL +
+            qk_wins * 8192ULL +
+            sf_wins * 6144ULL +
+            pv_wins * 8192ULL;
         final_worker_state_ok &=
             result.final_heap_next <= expected_heap_next &&
-            result.final_heap_next >= own_reserved_bytes &&
+            result.final_heap_next >= own_reserved_minimum &&
             (result.final_heap_next == 0 ||
              result.final_heap_next % kOutputAlignment == 0) &&
             (result.claim_wins != 0 || result.final_heap_next == 0) &&
@@ -2288,9 +3077,13 @@ inline Metrics Validate(
         // 无全局 turn 时，零输出 UP 可能在任一非零 reserve 前观察到
         // aggregate vend=0。shared 不使用该值做 heap reclaim，因此 oracle
         // 允许 0；有实际 output reserve 的 task 仍必须发布非零 vend。
+        const SharedHostPlannedTask *planned_task =
+            shared_plan.TaskAt(task_id);
         vend_values_ok &=
-            ExpectedTaskOutputBytes(task_id) == 0 ||
+            (planned_task != nullptr &&
+             planned_task->output_bytes == 0) ||
             state.tasks[task_id].vend != 0;
+        vend_values_ok &= planned_task != nullptr;
 #else
         vend_values_ok &= state.tasks[task_id].vend != 0;
 #endif
@@ -2349,6 +3142,30 @@ inline Metrics Validate(
     Expect(submits == expected_submits, "replay count is workers * tasks", &metrics);
     Expect(claims == expected_claims, "Claim attempt count matches PA topology", &metrics);
     Expect(wins == task_count, "exactly one winner per task", &metrics);
+#if PTO_FDWIC_SHARED_MAP
+    Expect(
+        wins_by_kind[0] == batches &&
+            wins_by_kind[1] == group_count &&
+            wins_by_kind[2] == group_count &&
+            wins_by_kind[3] == group_count &&
+            wins_by_kind[4] == group_count,
+        "shared winners match Alloc + groups*(QK/SF/PV/UP)",
+        &metrics
+    );
+    Expect(
+        kernel_total == static_cast<uint64_t>(group_count) * 4,
+        "shared kernel count is four per planned group",
+        &metrics
+    );
+    Expect(
+        kernel_counts[0] == group_count &&
+            kernel_counts[1] == group_count &&
+            kernel_counts[2] == group_count &&
+            kernel_counts[3] == group_count,
+        "each shared kernel kind executes once per planned group",
+        &metrics
+    );
+#else
     Expect(
         wins_by_kind[0] == batches && wins_by_kind[1] == batches && wins_by_kind[2] == batches &&
             wins_by_kind[3] == batches && wins_by_kind[4] == batches,
@@ -2360,6 +3177,7 @@ inline Metrics Validate(
             kernel_counts[3] == batches,
         "each kernel kind executes once per batch", &metrics
     );
+#endif
     Expect(
         role_kernel_routing_ok,
         "AIC executes only QK/PV and AIV executes only SF/UP", &metrics
@@ -2422,8 +3240,8 @@ inline Metrics Validate(
         "shared no-wrap frontier remains at its initial value", &metrics
     );
     Expect(
-        shared_writer_gates_idle,
-        "single-group PA leaves every shared writer-ready gate untouched",
+        shared_writer_gates_ok,
+        "shared writer-ready gates match non-final UP tasks",
         &metrics
     );
 #else
@@ -2460,15 +3278,18 @@ inline Metrics Validate(
     const bool global_frontend_counts_ok =
 #if PTO_FDWIC_SHARED_MAP
         context_reads == static_cast<uint64_t>(kWorkers) * batches &&
-        views_created == static_cast<uint64_t>(batches) * 2 &&
-        dynamic_create_infos == static_cast<uint64_t>(batches) * 2 &&
-        arg_resets == static_cast<uint64_t>(batches) * 4 &&
+        views_created == static_cast<uint64_t>(group_count) * 2 &&
+        dynamic_create_infos ==
+            static_cast<uint64_t>(group_count) * 2 &&
+        arg_resets == static_cast<uint64_t>(group_count) * 4 &&
         tensor_args_added ==
-            static_cast<uint64_t>(batches) *
-                (static_cast<uint64_t>(kWorkers) * 3 + 19) &&
+            static_cast<uint64_t>(batches) * kWorkers * 3 +
+            static_cast<uint64_t>(group_count) * 19 &&
         scalar_args_added ==
-            static_cast<uint64_t>(batches) * 9 &&
-        materialized_outputs == static_cast<uint64_t>(batches) * 8 &&
+            static_cast<uint64_t>(group_count) * 9 &&
+        materialized_outputs ==
+            static_cast<uint64_t>(batches) * 3 +
+            static_cast<uint64_t>(group_count) * 5 &&
         map_inserts == expected_global_map_inserts;
 #else
         context_reads == static_cast<uint64_t>(kWorkers) * batches &&
@@ -2491,21 +3312,33 @@ inline Metrics Validate(
 #else
             static_cast<uint64_t>(batches) * 14 &&
 #endif
+#if PTO_FDWIC_SHARED_MAP
+            slot_tensor_copies ==
+                static_cast<uint64_t>(group_count) * 19 &&
+#else
             slot_tensor_copies == static_cast<uint64_t>(batches) * 19 &&
+#endif
+#if PTO_FDWIC_SHARED_MAP
+            slot_scalar_copies ==
+                static_cast<uint64_t>(group_count) * 9 &&
+            fanin_edges ==
+                static_cast<uint64_t>(group_count) * 5,
+#else
             slot_scalar_copies == static_cast<uint64_t>(batches) * 9 &&
             fanin_edges == static_cast<uint64_t>(batches) * 5,
+#endif
         "winner-only TensorMap/symbol, slot-copy, and fanin totals are exact", &metrics
     );
     Expect(
         shared_symbol_input_loads ==
 #if PTO_FDWIC_SHARED_MAP
-            static_cast<uint64_t>(batches) * 5 &&
+            static_cast<uint64_t>(group_count) * 5 &&
 #else
             0 &&
 #endif
         shared_symbol_inout_commits ==
 #if PTO_FDWIC_SHARED_MAP
-            static_cast<uint64_t>(batches) * 3,
+            static_cast<uint64_t>(group_count) * 3,
 #else
             0,
 #endif
@@ -2523,10 +3356,20 @@ inline Metrics Validate(
     );
 #endif
     const uint64_t expected_dependency_signature =
+#if PTO_FDWIC_SHARED_MAP
+        ExpectedPaDependencySignature(shared_plan);
+#else
         ExpectedPaDependencySignature(batches);
+#endif
     Expect(
         dependency_signature == expected_dependency_signature,
+#if PTO_FDWIC_SHARED_MAP
+        kCompiledTensorMapMode == TensorMapBuildMode::Private
+            ? "fanin dependency-edge signature matches fixed private PA"
+            : "fanin dependency-edge signature matches shared group chain",
+#else
         "fanin dependency-edge signature matches PA Case1",
+#endif
         &metrics
     );
     std::printf(
@@ -2581,7 +3424,8 @@ inline Metrics Validate(
     Expect(
         shared_output_heap_layout_ok &&
             shared_output_validation.published_outputs ==
-                static_cast<uint64_t>(batches) * 8,
+                static_cast<uint64_t>(batches) * 3 +
+                static_cast<uint64_t>(group_count) * 5,
         "shared fresh-output descriptors form exact non-overlapping shard coverage",
         &metrics
     );
@@ -2658,8 +3502,21 @@ inline Metrics Validate(
     int64_t expected_vector[kCursorShards] = {-1, -1, -1, -1};
 #endif
     int64_t expected_alloc[kCursorShards] = {-1, -1, -1, -1};
+#if PTO_FDWIC_SHARED_MAP
+    bool cursors_ok = true;
+#endif
     for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
+#if PTO_FDWIC_SHARED_MAP
+        const SharedHostPlannedTask *planned_task =
+            shared_plan.TaskAt(task_id);
+        const TaskKind kind =
+            planned_task == nullptr
+                ? TaskKind::Count
+                : planned_task->kind;
+        cursors_ok &= planned_task != nullptr;
+#else
         const TaskKind kind = static_cast<TaskKind>(task_id % kTasksPerBatch);
+#endif
         if (kind == TaskKind::Alloc) {
             expected_alloc[task_id % kCursorShards] = task_id;
         } else if (kind == TaskKind::Qk || kind == TaskKind::Pv) {
@@ -2673,7 +3530,9 @@ inline Metrics Validate(
 #endif
         }
     }
+#if !PTO_FDWIC_SHARED_MAP
     bool cursors_ok = true;
+#endif
     for (uint32_t shard = 0; shard < kCursorShards; ++shard) {
         cursors_ok &= state.cube_cursor[shard].value == expected_cube[shard];
 #if PTO_FDWIC_SHARED_MAP
@@ -2699,7 +3558,11 @@ inline Metrics Validate(
             phase_calls[static_cast<uint32_t>(ProfilePhase::Claim)] == expected_submits &&
                 phase_calls[static_cast<uint32_t>(ProfilePhase::EfDrain)] == expected_submits &&
                 phase_calls[static_cast<uint32_t>(ProfilePhase::WaitForSlot)] ==
+#if PTO_FDWIC_SHARED_MAP
+                    static_cast<uint64_t>(group_count) * 4 &&
+#else
                     static_cast<uint64_t>(batches) * 4 &&
+#endif
                 phase_calls[static_cast<uint32_t>(ProfilePhase::HeapGuard)] ==
 #if PTO_FDWIC_SHARED_MAP
                     0,
@@ -2765,15 +3628,29 @@ inline Metrics Validate(
                 per_worker_trace_counts_ok &= core.count == worker_expected;
             }
         }
+#if PTO_FDWIC_SHARED_MAP
+        const uint64_t expected_winner_trace_records =
+            static_cast<uint64_t>(batches) +
+            static_cast<uint64_t>(group_count) * 16;
+        const uint64_t expected_trace_records =
+            6ULL * expected_submits +
+            expected_winner_trace_records +
+            trace_wait_records + 2 * kWorkers +
+            (((state.config.trace_enabled & kTraceAtomicsEnabled) != 0)
+                 ? physical_atomic_records + 2 * kWorkers
+                 : 0);
+#else
         const uint64_t expected_trace_records =
             static_cast<uint64_t>(batches) * (static_cast<uint64_t>(kWorkers) * 30 + 17) +
             trace_wait_records + 2 * kWorkers +
             (((state.config.trace_enabled & kTraceAtomicsEnabled) != 0)
                  ? physical_atomic_records + 2 * kWorkers
                  : 0);
-        // 每 batch 的 96*30 是六条每 Submit 固定记录；shared 的
-        // PrepareMap 是零时长结构 marker，不代表 region 业务。17 条是
-        // winner/Fanin/Kernel/Commit 记录。loser 不再写额外零时长
+#endif
+        // 每个 Submit 固定六条记录；shared 的 PrepareMap 是零时长结构
+        // marker，不代表 region 业务。每个 Alloc winner 另有一条，每个
+        // 四 task group 另有十六条 winner/Fanin/Kernel/Commit 记录。
+        // loser 不再写额外零时长
         // winner marker；两个父 span 再各核固定增加 2 条；
         // RingBp 等真实等待按运行时次数额外加入。
         Expect(trace_shape_ok, "swimlane header and per-worker capacities are valid", &metrics);
@@ -2981,11 +3858,39 @@ inline double Median(std::vector<double> values) {
 inline void PrintBanner(const char *backend, const Options &options) {
     // 开始运行前完整打印工作量和大内存占用，便于确认比较口径没有混用。
     std::printf("=== Standalone PA Scheduler Benchmark: %s ===\n", backend);
+#if PTO_FDWIC_SHARED_MAP
+    uint32_t configured_groups = 0;
+    for (uint32_t batch = 0; batch < options.batches; ++batch) {
+        const uint32_t context_length =
+            options.shared_context_lens.empty()
+                ? 8192U
+                : static_cast<uint32_t>(
+                      options.shared_context_lens.size() == 1
+                          ? options.shared_context_lens.front()
+                          : batch <
+                                options.shared_context_lens.size()
+                              ? options.shared_context_lens[batch]
+                              : -1
+                  );
+        const uint32_t blocks =
+            (context_length + kHostPaBlockSize - 1U) /
+            kHostPaBlockSize;
+        configured_groups +=
+            (blocks + kHostPaBlocksPerRequest - 1U) /
+            kHostPaBlocksPerRequest;
+    }
+    const uint32_t configured_tasks =
+        options.batches + 4U * configured_groups;
+#endif
     std::printf(
         "device=%u batches=%u tasks=%u workers=%u runs=%u tensormap=%s "
         "nops=%u,%u,%u,%u state_bytes=%zu "
         "final_barrier=%s swimlane=%s trace_atomics=%s trace_bytes=%zu\n", options.device,
+#if PTO_FDWIC_SHARED_MAP
+        options.batches, configured_tasks, kWorkers, options.runs,
+#else
         options.batches, options.batches * kTasksPerBatch, kWorkers, options.runs,
+#endif
         kCompiledTensorMapMode == TensorMapBuildMode::Private ? "private" : "shared",
         options.nops.qk, options.nops.sf,
         options.nops.pv, options.nops.up, sizeof(SchedulerState),
@@ -2993,6 +3898,29 @@ inline void PrintBanner(const char *backend, const Options &options) {
         options.trace_atomics ? "on" : "off",
         options.trace_enabled ? kTraceBytes : 0
     );
+#if PTO_FDWIC_SHARED_MAP
+    std::printf(
+        "shared_groups=%u shared_context_lens=",
+        configured_groups
+    );
+    if (options.shared_context_lens.empty()) {
+        std::printf("default:8192");
+    } else if (options.shared_context_lens.size() == 1) {
+        std::printf(
+            "broadcast:%d",
+            options.shared_context_lens.front()
+        );
+    } else {
+        for (size_t index = 0;
+             index < options.shared_context_lens.size(); ++index) {
+            std::printf(
+                "%s%d", index == 0 ? "" : ",",
+                options.shared_context_lens[index]
+            );
+        }
+    }
+    std::printf("\n");
+#endif
     if (!options.swimlane_json.empty()) {
         std::printf("swimlane_json=%s\n", options.swimlane_json.c_str());
     }

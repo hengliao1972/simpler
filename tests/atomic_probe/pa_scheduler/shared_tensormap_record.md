@@ -5366,3 +5366,98 @@ authoritative plan 对实际 task 数做外部证明，不能把 device
 - G0/G2/G4/mixed 已完成 CPU/CCEC/A5 闭环；
 - B256 G2/G4 可直接运行。shared heap 当前仍是 256 MiB no-wrap，
   资源准入与回收必须在后续单独处理，不能靠放宽断言掩盖容量不足。
+
+### 2026-07-26：S6.4c 建立独立 host task plan 并闭合动态设备矩阵
+
+本小步把“设备能按动态 plan 执行”提升为“host 能独立证明设备执行的
+就是输入要求的 plan”。host 没有 include 或调用
+`pa_frontend.h::BuildSharedPaBatchPlan()`，而是只读取 kernel 返回后的
+`SchedulerState.context_lens`，独立重算：
+
+```text
+context_len -> block_count -> group_count
+batch_start -> Alloc + groups × (QK/SF/PV/UP)
+```
+
+`SharedHostTaskPlan` 保存每批累计起点、group 数、逐 task kind/group、
+partial group block 数、前后组关系、输出字节和 canonical heap prefix。
+因此 device 与 host 即使把同一个 group 公式写错，也不会形成“复用同一
+helper 后一起通过”的同错 oracle。
+
+#### host 动态校验范围
+
+`Validate()`、raw export 和 raw analyzer 都从上述独立 plan 获取实际
+task 身份。host 现在逐项闭合：
+
+- `replay = 96 × total_tasks`，Claim 为
+  `96 × batches + 192 × total_groups`；
+- Alloc winner 数等于 batch 数，QK/SF/PV/UP winner 与 kernel 数分别
+  等于 group 数；
+- fresh output、INPUT resolve、INOUT writer commit、slot tensor/scalar
+  copy 和 fanin edge 都按动态 group 数推导；
+- 后一组 UP 的 accumulator writer 必须是上一组 UP，首组仍指向本批
+  Alloc；
+- descriptor 的第二维和输出字节按本组真实 block 数重建，partial
+  final group 不再被 64-block 固定常量掩盖；
+- shared heap 八分片 cursor、aggregate vend、writer-ready gate、
+  Claim cursor、逐 worker frontend 计数和动态 trace 总数均由 plan
+  推导；
+- normalized writer signature 使用 canonical task base，保证 G0/G1/
+  G2/G4 与 private 固定五 task 的逻辑投影仍可比较。
+
+`--shared-context-lens` 只用于 standalone shared 测试：一个值广播到
+全部 batch，多个值必须与 `--batches` 精确等长；未指定时仍保持生产
+默认 8192。private 编译既不接受该参数，也不携带相应容器和解析逻辑。
+
+#### G0/G1/G2/G4 与 mixed 门槛
+
+新增 host-only 定向用例覆盖 G0、G1、G2 partial、G2 full、G4 和
+`[G0,G1,G2,G4]` mixed，另覆盖负 context、超过四组、累计容量越界、
+CLI 广播/逐 batch/错误长度。CPU shared 完整调度的关键闭合值如下：
+
+| 输入 | tasks | groups | published/input/commit | fanin signature | heap bytes |
+| --- | ---: | ---: | ---: | --- | ---: |
+| G0：`0` | 1 | 0 | `3/0/0` | `0` | 10,240 |
+| G1：`8192` | 5 | 1 | `8/5/3` | `5cb454393ed48dcb` | 806,912 |
+| G2 partial：`8193` | 9 | 2 | `13/10/6` | `dda63f4f5405eaf1` | 829,440 |
+| G2 full：`16384` | 9 | 2 | `13/10/6` | `dda63f4f5405eaf1` | 1,603,584 |
+| G4：`32768` | 17 | 4 | `23/20/12` | `58d7a4b63aac2c4e` | 3,196,928 |
+| mixed：`0,8192,8193,32768` | 32 | 7 | `47/35/21` | `6437bff09d8f8a11` | 4,843,520 |
+
+A5 CCEC 无泳道、scalar-nop 为零的正确性矩阵也闭合：
+
+| 输入 | tasks | Claim | kernel | 单次 Submit |
+| --- | ---: | ---: | ---: | ---: |
+| G0 | 1 | 96 | 0 | 23.882 us |
+| G2 partial | 9 | 480 | 8 | 141.658 us |
+| G4 | 17 | 864 | 16 | 261.723 us |
+| mixed B4 | 32 | 1,728 | 28 | 347.386 us |
+
+四组均通过 host plan、symbol、dependency、descriptor、heap、cursor、
+gate、96-worker replay 和最终状态断言。表中时间只说明相应动态路径
+确实完成，不是 real-compute 性能基线，也不能跨构建比较。
+
+#### private 身份隔离的二次收口
+
+host plan 初版虽然在业务上只服务 shared，但若把等价 helper、字符串或
+临时变量留在 private 的同一翻译单元，GCC 13 的 IPA/内联决策仍会变化：
+一次中间构建中 private CPU `.text` 从 `0x20dd8` 增到 `0x21568`，
+`FinishCallbackSubmitBody()` 等 device 模拟函数也因 host AST 改变而
+选择了不同内联方案。这不是 private 业务语义变化，但不满足本项目的
+严格可比门槛。
+
+最终处理不是放宽为“断言通过”，而是让所有 shared host 扩展在预处理
+阶段分叉，private `#else` 原样保留 `ee0fe8c6` 的 token path。收口后：
+
+- private CPU 完整预处理输出逐字节相同，SHA256
+  `e7f71dc48ebca91ecbf8766a12296f06fafe1f684c836f95214e833c3ab79052`；
+- private CPU 完整 ELF 逐字节相同，SHA256
+  `ffa19a3ea82cb75a46bb4a061231158818a0610ebc3d075188b986b5ae4bfae4`；
+- private CCEC perf-clock 七个 device 对象的 `.text/.rodata`
+  全部逐字节相同；
+- shared CPU 的预处理输出也与 host plan 初版逐字节相同，证明隔离修正
+  没有反向改变已上板的 shared 路径。
+
+下一阶段只处理动态 task identity 在 converter、exclusive analyzer 和
+submit-PMU host 加工链中的传播。完成前不做性能优化，也不把固定 `%5`
+的旧加工结果当作动态 shared 性能证据。

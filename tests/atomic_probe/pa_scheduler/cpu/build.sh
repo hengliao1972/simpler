@@ -96,6 +96,21 @@ if [[ "$TENSORMAP_MODE" == "private" ]]; then
     echo "[TEST] private TensorMap ring self-test"
     "$BUILD_DIR/test_private_tensor_map_ring"
 else
+    # host 必须从最终 SchedulerState.context_lens 独立重建 shared task
+    # plan，不能复用 device helper 形成同错 oracle。该测试覆盖 G0/G1/G2/G4、
+    # mixed 累计 batch_start、TaskAt 元数据、partial group 输出字节、writer
+    # dependency chain，以及测试专用 CLI 的广播/逐 batch 形式。
+    echo "[BUILD] shared authoritative host task-plan self-test"
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/test/test_shared_host_task_plan.cpp" \
+        -o "$BUILD_DIR/test_shared_host_task_plan"
+
+    echo "[TEST] shared authoritative host task-plan self-test"
+    "$BUILD_DIR/test_shared_host_task_plan"
+
     echo "[BUILD] isolated shared ordinary-region ring self-test"
     "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \
