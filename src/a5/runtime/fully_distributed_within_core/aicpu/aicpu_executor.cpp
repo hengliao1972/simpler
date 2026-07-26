@@ -351,15 +351,27 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 // This AICPU thread then waits for all workers.
                 // See runtime/dist_engine.* and docs/fully_distributed_within_core.md.
                 {
-                    dist_engine_register(rt, &runtime->dist.orch_args, num_workers, runtime);
+                    const int32_t register_rc =
+                        dist_engine_register(rt, &runtime->dist.orch_args, num_workers, runtime);
+                    if (register_rc != 0) {
+                        LOG_ERROR(
+                            "Thread %d: distributed runtime configuration failed with status %d", thread_idx,
+                            register_rc
+                        );
+                        dispatch_dist_run = false;
+                        run_rc = register_rc;
+                    }
                     runtime->dist.num_workers = num_workers;
                     __atomic_store_n(&runtime->dist.done_count, 0, __ATOMIC_RELEASE);
-                    cache_flush_range(rt->dist_global, dist_engine_global_state_size());
+                    if (dispatch_dist_run) {
+                        cache_flush_range(rt->dist_global, dist_engine_global_state_size());
+                    }
                     cache_flush_range(&runtime->dist, sizeof(runtime->dist));
                     cache_flush_range(const_cast<const int32_t *>(&runtime->dist.num_workers), sizeof(int32_t));
                     cache_flush_range(const_cast<const int64_t *>(&runtime->dist.done_count), sizeof(int64_t));
                     FdwicSubmitPmuHeader *submit_pmu_header = nullptr;
-                    const bool submit_pmu_requested = fdwic_submit_pmu_requested(runtime, &submit_pmu_header);
+                    const bool submit_pmu_requested =
+                        dispatch_dist_run && fdwic_submit_pmu_requested(runtime, &submit_pmu_header);
                     if (submit_pmu_requested && fdwic_submit_pmu_owner_configure(runtime, submit_pmu_header) != 0) {
                         LOG_ERROR(
                             "Thread %d: FDWIC submit-PMU owner configure failed; aborting dist replay", thread_idx

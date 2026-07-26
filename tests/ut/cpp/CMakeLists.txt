@@ -472,6 +472,21 @@ target_include_directories(test_fdwic_submit_capacity BEFORE PRIVATE
 )
 set_tests_properties(test_fdwic_submit_capacity PROPERTIES LABELS "no_hardware")
 
+# PTO_DIST_H 是 AICPU 控制面的纯配置输入。独立目标直接编译生产解析
+# helper，锁定仅 ASCII 十进制数字串和闭区间边界，不引入设备或 runtime。
+add_executable(test_fdwic_config_parse a5/test_fdwic_config_parse.cpp)
+target_include_directories(test_fdwic_config_parse PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
+)
+target_link_libraries(test_fdwic_config_parse PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_fdwic_config_parse COMMAND test_fdwic_config_parse)
+set_tests_properties(test_fdwic_config_parse PROPERTIES LABELS "no_hardware")
+
 # Stable Host/AICPU/AICore identity is compiled in both artifact modes.  The
 # shared target intentionally verifies that the first-stage backend remains
 # fail-closed while its ABI identity is still well-formed.

@@ -6555,3 +6555,53 @@ Submit 模型。场景让 map 只剩一个物理 entry，再提交两个
 枚举的完整 FDWIC 任务图，不能用 `8×H` 或 PA 的 52-entry 特例冒充第 12 章
 的逐桶滑窗峰值。`auto` 的可证规划接口与 private ring 迁移继续作为后续
 独立阶段。
+
+### 2026-07-26：R1b-b 冻结 H 配置与精确 auto 的可实现边界
+
+`H` 不是普通调试参数。private 用它推进 region retire，shared 最终需要
+`Δ+H` 作为存活窗口；错误的 H 会直接改变容量、回收和依赖正确性。旧代码用
+`strtol(e, nullptr, 10)`，会把 `"abc"` 当 0、接受尾随字符，并可能在长整型
+到 `int32_t` 的窄化后才触发断言。因此本阶段把它改成启动门槛：
+
+- 只接受非空 ASCII 十进制数字串；
+- 闭区间固定为 `[0, kTaskWindow-2]`，当前即 `[0,1022]`；
+- 拒绝空白、正负号、尾随字符、溢出和越界，输出值在失败时保持不变；
+- AICPU 在修改共享 arena、配置 PMU或唤醒 AICore worker 前返回结构化
+  `-12`；同一 run 的所有 AICPU 线程取得相同状态。
+
+A5sim 负向 PA Case1 已实际得到：
+
+```text
+[dist_engine] invalid PTO_DIST_H='abc'; expected ASCII decimal digits in [0, 1022]
+run_prepared failed with code -12
+```
+
+四个 AICPU 线程都返回 `rc=-12`，且没有进入 AICore replay。正常默认 H 的
+同一 PA Case1 B256 仍通过。
+
+#### 精确 auto CAP 不能从当前 Host 状态直接算出
+
+逐层核对 production 后，当前 Host/AICPU 启动前只持有 callable 元数据、
+orchestration SO 和本轮参数，没有一份可枚举的 FDWIC task/output manifest。
+真实 task id、OUTPUT 地址和 register 事件是在 96 核执行 orchestration replay
+时才形成；现有 dep-gen 又是运行结束后的离线记录，不能用于启动准入。因此：
+
+1. 短期只能支持显式 manual CAP，并在不足时按 R1b-a 合同明确失败；不能发布
+   一个经验公式命名为 `auto`；
+2. PA 这类只读取已搬运外部输入、任务图确定的 orchestration，可以在 AICPU
+   已启动但 worker 尚未唤醒时，对同一 AArch64 orchestration SO 做一次
+   “只规划、不执行 kernel”的回放；
+3. planner 与执行必须复用同一 OUTPUT 布局和实际 TensorMap register-event
+   helper。fresh OUTPUT 当前并不等价于一次 map insert，机械统计全部逻辑
+   output 会高估且与运行时不对等；
+4. 如果 orchestration 读取本轮 kernel-produced 数据决定后续图，或直接写
+   外部 GM 产生副作用，prepass 不能安全重放，应要求 manual CAP 或显式图
+   manifest，不能猜；
+5. shared 在计算 `Δ+H` 前还必须有硬 runahead 上界和
+   `core_progress[]`。同时 region 地址或 bucket key 必须由 producer task id
+   确定；若用无序 winner 的 heap fetch-add 决定物理地址，竞态会改变 bucket，
+   planner 就无法证明精确峰值。
+
+若 CAP 还要反过来决定本轮实际 arena 分配大小，AICPU prepass 已经太晚，只能
+再增加 Host-native planner 或两阶段 launch。当前下一步先迁移 private
+ring，并保持 16K 预分配上限和明确溢出合同；planner 不与数据结构提交混做。

@@ -13,28 +13,36 @@
 // configuration reads and signal-handler installation; AICore images never
 // include this file.
 
-void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_workers, Runtime *runtime) {
+int32_t dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_workers, Runtime *runtime) {
+    if (runtime != nullptr) runtime->dist.shared_addr = 0;
     if (rt == nullptr || rt->dist_global == nullptr || rt->gm_heap == nullptr || rt->gm_heap_size == 0) {
         DIST_ERRF("[dist_engine] missing host-allocated runtime state\n");
-        if (runtime != nullptr) runtime->dist.shared_addr = 0;
-        return;
+        return runtime_status_from_error_codes(PTO2_ERROR_INVALID_ARGS, PTO2_ERROR_NONE);
     }
+    if (runtime == nullptr || num_workers <= 0 || num_workers > RUNTIME_MAX_WORKER) {
+        DIST_ERRF("[dist_engine] invalid runtime/worker configuration: runtime=%p workers=%d\n", runtime, num_workers);
+        return runtime_status_from_error_codes(PTO2_ERROR_DIST_CONFIG_INVALID, PTO2_ERROR_NONE);
+    }
+    int32_t configured_history = kHDefault;
+    if (const char *e = getenv("PTO_DIST_H")) {
+        if (!dist_parse_history_window(e, kTaskWindow - 2, configured_history)) {
+            DIST_ERRF(
+                "[dist_engine] invalid PTO_DIST_H='%s'; expected ASCII decimal digits in [0, %d]\n", e,
+                kTaskWindow - 2
+            );
+            return runtime_status_from_error_codes(PTO2_ERROR_DIST_CONFIG_INVALID, PTO2_ERROR_NONE);
+        }
+    }
+
     g_dist_ptr = reinterpret_cast<DistGlobal *>(rt->dist_global);
     g_dist.heap_base = static_cast<uint8_t *>(rt->gm_heap);
     g_dist.heap_size = rt->gm_heap_size;
     atomic_exchange(g_dist.error_code, int32_t{PTO2_ERROR_NONE}, __ATOMIC_RELAXED);
     atomic_exchange(g_dist.fatal, int32_t{0}, __ATOMIC_RELAXED);
-    // Dependency-span bound H (R = F - H). Env override for graphs with longer
-    // heap spans; default kHDefault.
-    g_dist.H = kHDefault;
-    if (const char *e = getenv("PTO_DIST_H")) {
-        const long h = std::strtol(e, nullptr, 10);
-        if (h >= 0) g_dist.H = static_cast<int32_t>(h);
-    }
-    // The producer map recycles a task's entry-head slot kTaskWindow tasks later;
-    // cleanup retires a task once it leaves the H span, so H must stay below the
-    // window (with margin) or a slot could be reused before its task is cleaned.
-    always_assert(g_dist.H < kTaskWindow - 1);
+    // Dependency-span bound H (R = F - H). Validation happens before touching
+    // the shared arena, so an invalid run cannot leave partially initialized
+    // control state for a later invocation.
+    g_dist.H = configured_history;
 #if DIST_SIM_HOST_CLOCK
     // Overhead-isolation gate (skip incore kernel calls, keep all bookkeeping).
     g_skip_exec = (getenv("PTO_DIST_SKIP_EXEC") != nullptr);
@@ -127,7 +135,7 @@ void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_
     // Publish all of the above before AICPU wakes workers through their
     // per-core handshake flags.
     store_barrier();
-    return;
+    return 0;
 }
 
 int32_t dist_engine_runtime_status(PTO2Runtime *rt) {
