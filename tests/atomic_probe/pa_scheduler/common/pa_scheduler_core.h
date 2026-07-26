@@ -465,7 +465,7 @@ PA_DEVICE void WaitForSlot(
     // 只聚合这个显式背压等待区中的 fanin 观察；每次 Submit 开头的
     // opportunistic EfDrain 仍保留逐条 Atomic，不能仅凭 site 名称全局聚合。
     const uint32_t poll_region = AtomicPollRegionBegin<Ops>(
-        stats.trace, stats.result, TraceAtomicSiteMask(AtomicSite::FaninFlagLoad)
+        stats.trace, stats.result, TraceAtomicPollBatchMask(AtomicSite::FaninFlagLoad)
     );
     // 退出条件只有 occupied_count 重新低于可用容量；依赖尚未 ready 时 SpinHint 后继续重试。
     while (worker.occupied_count >= kUsableSlots) {
@@ -530,10 +530,10 @@ PA_DEVICE bool HeapGuard(
         if (!poll_region_active) {
             poll_region = AtomicPollRegionBegin<Ops>(
                 stats.trace, stats.result,
-                TraceAtomicSiteMask(AtomicSite::FatalPoll) |
-                    TraceAtomicSiteMask(AtomicSite::HeapFrontierLoad) |
-                    TraceAtomicSiteMask(AtomicSite::HeapVendLoad) |
-                    TraceAtomicSiteMask(AtomicSite::FaninFlagLoad)
+                TraceAtomicPollBatchMask(AtomicSite::FatalPoll) |
+                    TraceAtomicPollBatchMask(AtomicSite::HeapFrontierLoad) |
+                    TraceAtomicPollBatchMask(AtomicSite::HeapVendLoad) |
+                    TraceAtomicPollBatchMask(AtomicSite::FaninFlagLoad)
             );
             poll_region_active = true;
         }
@@ -1992,7 +1992,8 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     uint32_t start_polls = 0;
     const uint32_t startup_poll_region = AtomicPollRegionBegin<Ops>(
         stats.trace, stats.result,
-        TraceAtomicSiteMask(AtomicSite::StartupPoll) | TraceAtomicSiteMask(AtomicSite::FatalPoll)
+        TraceAtomicPollBatchMask(AtomicSite::StartupPoll) |
+            TraceAtomicPollBatchMask(AtomicSite::FatalPoll)
     );
     // 全员到齐或任一核发布 fatal 即退出启动等待；watchdog 防止缺失参与者造成永久挂死。
     while (LoadLine<Ops>(state->started_count, stats, AtomicSite::StartupPoll) <
@@ -2116,7 +2117,8 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     }
     const uint32_t final_poll_region = AtomicPollRegionBegin<Ops>(
         stats.trace, stats.result,
-        TraceAtomicSiteMask(AtomicSite::ReplayDonePoll) | TraceAtomicSiteMask(AtomicSite::FaninFlagLoad)
+        TraceAtomicPollBatchMask(AtomicSite::ReplayDonePoll) |
+            TraceAtomicPollBatchMask(AtomicSite::FaninFlagLoad)
     );
     bool leaf_forwarded = false;
     bool middle_forwarded = false;

@@ -4756,3 +4756,55 @@ review 建议“所有非 DFX 收敛后才补观察工具”不适用于本次�
 后续因此先完成 S5.1/S5.2 的观察正确性，再处理 PMU 纯 scalar 口径；
 不在同一提交里叠加性能候选，也不把 production 的八组 smoke 门禁、
 ambient `CXXFLAGS` 脚本或旧 shared ring oracle 搬进 standalone。
+
+### 2026-07-26：S5.1 PollBatch 启用位改用紧凑索引
+
+本阶段只修正 atomic 观察层的位图语义，不新增 shared 站点，也不修改
+调度协议。此前 `AtomicSite` 的 raw 编号同时承担稳定记录身份与
+PollBatch enable bit 两种职责；而 burst 计数数组早已按
+`AtomicPollBatchIndex()` 的 0～5 紧凑索引存放。两套索引混用会产生
+两个问题：
+
+1. raw site 稀疏增长后，32 位 mask 无法表达编号大于等于 32 的站点；
+2. enabled mask 的 bit 与 burst 数组槽位不一致，后续扩展 shared site
+   时容易启用错误的计数槽。
+
+现将职责明确拆开：
+
+```text
+AtomicSite raw id             稳定 raw ABI、站点名称和记录身份
+AtomicPollBatchIndex(site)    PollBatch allowlist 内的紧凑 0～N-1 下标
+AtomicPollBatchMask(site)     仅由紧凑下标产生 enable bit
+```
+
+未登记或超出范围的 site 返回空 mask，不再对 raw id 执行移位；
+`kAtomicPollBatchSiteCount` 同时约束不超过 32。Host constexpr 路径和
+CCEC device 路径使用相同规则，WaitForSlot、HeapGuard、startup 和
+final barrier 的 region mask 均已切换到紧凑索引。
+
+本阶段补充了以下定向断言：
+
+- 非 PollBatch allowlist 的 `FrontierFlagLoad` mask 必须为 0，且仍走
+  direct atomic 记录；
+- 人工构造 raw site 40 时，compact index 为 -1、mask 为 0，不发生
+  32 位错误移位；
+- raw id 为 5 的 `FaninFlagLoad` 使用 compact bit 2，证明不再把 raw
+  编号直接当 bit 位。
+
+验证结果：
+
+| 验证项 | 结果 |
+| --- | --- |
+| CPU private：严格告警构建、PollBatch 与 private ring 定向测试 | PASS |
+| CPU shared：PollBatch、ordinary ring、PrepareMap、output/heap/Vector/materialize/loser 定向测试 | PASS |
+| CPU private/shared b1 real-compute，全部运行断言 | PASS |
+| CCEC private/shared swimlane 构建及产物 manifest | PASS |
+| `git diff --check` | PASS |
+
+用户目录下抽取的 `g++-15` 在本机调用系统旧 `as` 时不识别编译器输出的
+`.base64` 汇编伪指令，因此该组合不能用于本轮 CPU 链接；这属于编译器与
+汇编器未配套，不是本次代码错误。CPU 回归使用本项目此前已验证的
+`/usr/bin/g++`，CCEC 双模式则由 CANN 9.1 工具链独立完成真实编译。
+
+该修改不会增加 raw record 字段、atomic 调用、load、barrier 或热路径
+分支；它是 S5.2 追加 shared 热路径 atomic 站点前必须先完成的观察基础。

@@ -117,8 +117,9 @@ PA_DEVICE bool TraceAtomicSiteIsPollBatchable(AtomicSite site) {
     return TraceAtomicPollBatchIndex(site) >= 0;
 }
 
-PA_DEVICE uint32_t TraceAtomicSiteMask(AtomicSite site) {
-    return 1U << static_cast<uint32_t>(site);
+PA_DEVICE uint32_t TraceAtomicPollBatchMask(AtomicSite site) {
+    const int32_t index = TraceAtomicPollBatchIndex(site);
+    return index >= 0 && index < 32 ? 1U << static_cast<uint32_t>(index) : 0U;
 }
 
 // Attach 只缓存本 worker 的 header 状态、分区首址和物理 lane 信息。控制区
@@ -291,16 +292,16 @@ PA_DEVICE void AtomicPollBoundary(TraceContext &trace, WorkerResult &result) {
 
 template <typename Ops>
 PA_DEVICE uint32_t AtomicPollRegionBegin(
-    TraceContext &trace, WorkerResult &result, uint32_t site_mask
+    TraceContext &trace, WorkerResult &result, uint32_t poll_batch_mask
 ) {
     const uint32_t previous_mask = trace.poll_burst.enabled_mask;
 #if PA_BUILD_TRACE_FREE
     (void)result;
-    (void)site_mask;
+    (void)poll_batch_mask;
 #else
     if (!trace.atomics_enabled) return previous_mask;
     AtomicPollBoundary<Ops>(trace, result);
-    trace.poll_burst.enabled_mask = previous_mask | site_mask;
+    trace.poll_burst.enabled_mask = previous_mask | poll_batch_mask;
 #endif
     return previous_mask;
 }
@@ -325,7 +326,7 @@ PA_DEVICE bool AtomicPollBatchEnabled(
 ) {
     return trace.atomics_enabled && TraceAtomicSiteIsPollBatchable(site) &&
            TraceAtomicSiteExpectedOp(site) == actual_op &&
-           (trace.poll_burst.enabled_mask & TraceAtomicSiteMask(site)) != 0;
+           (trace.poll_burst.enabled_mask & TraceAtomicPollBatchMask(site)) != 0;
 }
 
 template <typename Ops>

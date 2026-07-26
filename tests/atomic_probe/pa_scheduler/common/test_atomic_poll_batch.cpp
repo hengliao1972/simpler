@@ -29,8 +29,8 @@ using pa_scheduler::AtomicPollRegionEnd;
 using pa_scheduler::AtomicSite;
 using pa_scheduler::AccumulateAtomicPollCall;
 using pa_scheduler::TraceAtomicLoad;
+using pa_scheduler::TraceAtomicPollBatchMask;
 using pa_scheduler::TraceAtomicPollBatchIndex;
-using pa_scheduler::TraceAtomicSiteMask;
 using pa_scheduler::TraceContext;
 using pa_scheduler::TraceCoreState;
 using pa_scheduler::TracePhase;
@@ -175,8 +175,8 @@ void TestNestedRegionRestoresMask() {
     Fixture fixture;
     volatile int64_t startup_value = 96;
     volatile int64_t fanin_value = 1;
-    const uint32_t startup_mask = TraceAtomicSiteMask(AtomicSite::StartupPoll);
-    const uint32_t fanin_mask = TraceAtomicSiteMask(AtomicSite::FaninFlagLoad);
+    const uint32_t startup_mask = TraceAtomicPollBatchMask(AtomicSite::StartupPoll);
+    const uint32_t fanin_mask = TraceAtomicPollBatchMask(AtomicSite::FaninFlagLoad);
     TestOps::now = 1000;
 
     const uint32_t outer_previous =
@@ -232,9 +232,10 @@ void TestNonAllowlistedSiteStaysDirect() {
     Fixture fixture;
     volatile int64_t frontier_flag = 7;
     constexpr AtomicSite kSite = AtomicSite::FrontierFlagLoad;
-    const uint32_t site_mask = TraceAtomicSiteMask(kSite);
+    const uint32_t site_mask = TraceAtomicPollBatchMask(kSite);
     TestOps::now = 2000;
 
+    Expect(site_mask == 0U, "非 PollBatch allowlist 的 site 必须得到空 compact mask");
     const uint32_t previous =
         AtomicPollRegionBegin<TestOps>(fixture.trace, fixture.result, site_mask);
     Expect(
@@ -265,12 +266,29 @@ void TestNonAllowlistedSiteStaysDirect() {
     Expect(!fixture.trace.atomic_counter_overflow, "非 allowlist direct load 不应报告溢出");
 }
 
+void TestRawSiteIdNeverBecomesTheEnableMaskBit() {
+    constexpr AtomicSite kHighRawSite = static_cast<AtomicSite>(40);
+    Expect(
+        TraceAtomicPollBatchIndex(kHighRawSite) == -1,
+        "未登记的高编号 site 不应获得 compact PollBatch index"
+    );
+    Expect(
+        TraceAtomicPollBatchMask(kHighRawSite) == 0U,
+        "高编号 raw site 不得参与 32-bit 移位构造 enable mask"
+    );
+    Expect(
+        TraceAtomicPollBatchMask(AtomicSite::FaninFlagLoad) == (1U << 2),
+        "Fanin 的 enable bit 必须来自 compact index 2，而不是 raw site 5"
+    );
+}
+
 }  // namespace
 
 int main() {
     TestSplitAtMaximumCount();
     TestNestedRegionRestoresMask();
     TestNonAllowlistedSiteStaysDirect();
+    TestRawSiteIdNeverBecomesTheEnableMaskBit();
     if (g_failures != 0) {
         std::fprintf(stderr, "[FAIL] atomic PollBatch self-test failures=%d\n", g_failures);
         return EXIT_FAILURE;

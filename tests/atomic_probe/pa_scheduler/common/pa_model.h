@@ -468,6 +468,7 @@ constexpr uint32_t kAtomicRetriesShift = 8;
 constexpr uint32_t kAtomicPollCountShift = 8;
 constexpr uint32_t kAtomicPollCountMax = 0x00ffffffU;
 constexpr uint32_t kAtomicPollBatchSiteCount = 6;
+static_assert(kAtomicPollBatchSiteCount <= 32, "PollBatch enable mask supports at most 32 compact indices");
 
 // 这些映射是 raw ABI 的一部分，同时被 device 聚合器与 host 闭环校验使用。
 // 0..14 与真实 PA 保持稳定；BlockWon 尚未在 standalone 中实现，不能只为
@@ -550,8 +551,9 @@ PA_MODEL_INLINE constexpr bool AtomicSiteIsPollBatchable(AtomicSite site) {
     return AtomicPollBatchIndex(site) >= 0;
 }
 
-PA_MODEL_INLINE constexpr uint32_t AtomicSiteMask(AtomicSite site) {
-    return 1U << static_cast<uint32_t>(site);
+PA_MODEL_INLINE constexpr uint32_t AtomicPollBatchMask(AtomicSite site) {
+    const int32_t index = AtomicPollBatchIndex(site);
+    return index >= 0 && index < 32 ? 1U << static_cast<uint32_t>(index) : 0U;
 }
 
 #undef PA_MODEL_INLINE
