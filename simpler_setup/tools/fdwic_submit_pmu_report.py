@@ -30,7 +30,7 @@ from typing import Any
 SCHEMA_NAME = "fdwic-submit-pmu-v3"
 DEFAULT_INPUT_NAME = "fdwic_submit_pmu_raw.json"
 DEFAULT_OUTPUT_NAME = "fdwic_submit_pmu_report.html"
-PROVENANCE_SCHEMA_NAME = "fdwic-submit-pmu-provenance-v1"
+PROVENANCE_SCHEMA_NAME = "fdwic-submit-pmu-provenance-v2"
 DEFAULT_PROVENANCE_NAME = "fdwic_submit_pmu_provenance.json"
 
 EXPECTED_CORES = 96
@@ -182,8 +182,13 @@ FIXED_ROLE_DYNAMIC_PHASE_CAPTURE_MODES = frozenset(
 KERNEL_EXCLUDING_PHASE_CAPTURE_MODES = frozenset(PHASE_CONFIG_BY_MODE)
 
 
-def _expected_compile_definitions(profile: str) -> tuple[str, ...]:
-    definitions = ["PTO_FDWIC_SUBMIT_PMU=1"]
+def _expected_compile_definitions(profile: str, tensormap_mode: str = "private") -> tuple[str, ...]:
+    if tensormap_mode not in {"private", "shared"}:
+        _fail(f"unsupported FDWIC TensorMap mode {tensormap_mode!r}")
+    definitions = [
+        f"PTO_FDWIC_SHARED_MAP={1 if tensormap_mode == 'shared' else 0}",
+        "PTO_FDWIC_SUBMIT_PMU=1",
+    ]
     if profile != NONE_CAPTURE_MODE:
         definitions.append(f"PTO_FDWIC_SUBMIT_PMU_PHASE_ID={PHASE_CONFIG_BY_MODE[profile]['id']}")
     definitions.append("PTO_FDWIC_TRACE_ENABLED=0")
@@ -315,6 +320,7 @@ class SubmitPmuBuildIdentity:
     """Build-time identity captured before the A5 case starts."""
 
     profile: str
+    tensormap_mode: str
     profiled_cache_key: tuple[str, ...]
     aicore_extra_cache_key: str
     compile_definitions: tuple[str, ...]
@@ -392,6 +398,7 @@ def capture_build_identity(
     aicore_kernel: Path | str,
     aicore_build_dir: Path | str,
     host_runtime: Path | str,
+    aicpu_runtime: Path | str,
 ) -> SubmitPmuBuildIdentity:
     """Freeze the exact diagnostic ELF/SO identity before running a case."""
 
@@ -399,11 +406,19 @@ def capture_build_identity(
         _fail(f"unsupported Submit-PMU provenance profile {profile!r}")
     if _HEX_16_PATTERN.fullmatch(aicore_extra_cache_key) is None:
         _fail("AICore extra cache key must contain exactly 16 lowercase hex digits")
+    cache_key = tuple(str(value) for value in profiled_cache_key)
+    if len(cache_key) < 2 or cache_key[-1] != profile:
+        _fail("profiled cache key must end with TensorMap mode and the selected Submit-PMU profile")
+    tensormap_mode = cache_key[-2]
+    if tensormap_mode not in {"private", "shared"}:
+        _fail("profiled cache key must carry private/shared immediately before the selected profile")
     definitions = tuple(compile_definitions)
-    if definitions != _expected_compile_definitions(profile):
+    if definitions != _expected_compile_definitions(profile, tensormap_mode):
         _fail("Submit-PMU provenance compile definitions do not match the selected profile")
     kernel = Path(aicore_kernel).resolve()
     build_dir = Path(aicore_build_dir).resolve()
+    host = Path(host_runtime).resolve()
+    aicpu = Path(aicpu_runtime).resolve()
     stamp = build_dir / ".git_commit"
     if not stamp.is_file():
         _fail(f"Submit-PMU AICore source-state stamp is missing: {stamp}")
@@ -415,18 +430,38 @@ def capture_build_identity(
     if kernel.parent.name != aicore_extra_cache_key or build_dir.parent.name != aicore_extra_cache_key:
         _fail("Submit-PMU AICore output/build paths do not match the selected extra cache key")
 
+    runtime_name = "fully_distributed_within_core"
+    host_family = host.parent
+    aicpu_family = aicpu.parent
+    kernel_family = kernel.parents[2] if len(kernel.parents) > 2 else Path()
+    build_family = build_dir.parents[2] if len(build_dir.parents) > 2 else Path()
+    family_tail = (runtime_name, tensormap_mode)
+    if (
+        host_family.parts[-2:] != family_tail
+        or aicpu_family != host_family
+        or kernel_family.parts[-2:] != family_tail
+        or build_family.parts[-2:] != family_tail
+        or kernel.parent.parent.name != "aicore-extra"
+        or build_dir.parent.parent.name != "aicore-extra"
+        or kernel_family.parts[-4:-2] != host_family.parts[-4:-2]
+        or build_family.parts[-4:-2] != host_family.parts[-4:-2]
+    ):
+        _fail(
+            "Submit-PMU Host/AICPU/AICore artifacts do not belong to the selected "
+            f"{tensormap_mode} FDWIC artifact family"
+        )
+
     artifact_paths = (
         ("aicore_kernel", kernel),
         ("aic_combined", build_dir / "aicore_aic_combined.o"),
         ("aiv_combined", build_dir / "aicore_aiv_combined.o"),
-        ("host_runtime", Path(host_runtime).resolve()),
+        ("host_runtime", host),
+        ("aicpu_runtime", aicpu),
     )
     artifacts = tuple((name, _inspect_build_artifact(path)) for name, path in artifact_paths)
-    cache_key = tuple(str(value) for value in profiled_cache_key)
-    if not cache_key or cache_key[-1] != profile:
-        _fail("profiled cache key must end with the selected Submit-PMU profile")
     return SubmitPmuBuildIdentity(
         profile=profile,
+        tensormap_mode=tensormap_mode,
         profiled_cache_key=cache_key,
         aicore_extra_cache_key=aicore_extra_cache_key,
         compile_definitions=definitions,
@@ -1271,18 +1306,14 @@ def _recording_reference_metric(
         "whole_field": whole_field,
         "raw_phase_observed_sum": raw_phase_sum,
         "raw_whole_sum": raw_whole_sum,
-        "raw_phase_observed_ratio_to_raw_whole": (
-            raw_phase_sum / raw_whole_sum if raw_whole_sum else None
-        ),
+        "raw_phase_observed_ratio_to_raw_whole": (raw_phase_sum / raw_whole_sum if raw_whole_sum else None),
         "empty_cost_per_record_pair": empty_cost_per_record_pair,
         "recording_cost_estimate_sum": recording_cost_estimate_sum,
         "recording_cost_estimate_share_of_raw_phase": (
             recording_cost_estimate_sum / raw_phase_sum if raw_phase_sum else None
         ),
         "after_recording_cost_reference_sum": reference_sum,
-        "after_recording_cost_reference_ratio_to_raw_whole": (
-            reference_sum / raw_whole_sum if raw_whole_sum else None
-        ),
+        "after_recording_cost_reference_ratio_to_raw_whole": (reference_sum / raw_whole_sum if raw_whole_sum else None),
     }
 
 
@@ -1304,10 +1335,7 @@ def _validate_phase_recording_cost_inputs(
     for field in PHASE_CALIBRATION_STABLE_CONFIGURATION_FIELDS:
         if target_configuration[field] != empty_configuration[field]:
             _fail(f"recording-cost target and empty-bracket configuration.{field} do not match")
-    if (
-        target_configuration["phase"]["pmu_observation"]
-        != empty_configuration["phase"]["pmu_observation"]
-    ):
+    if target_configuration["phase"]["pmu_observation"] != empty_configuration["phase"]["pmu_observation"]:
         _fail("recording-cost target and empty-bracket phase PMU observation semantics do not match")
     if target_capture.data["capture"]["window_scope"] != empty_capture.data["capture"]["window_scope"]:
         _fail("recording-cost target and empty-bracket window scopes do not match")
@@ -1402,9 +1430,7 @@ def build_phase_recording_cost_reference(
             _fail(f"{metric_name} target ALL phase sum does not equal AIC plus AIV")
         if raw_whole_sum != direct_raw_whole_sum:
             _fail(f"{metric_name} target ALL whole sum does not equal AIC plus AIV")
-        recording_cost_estimate_sum = sum(
-            float(metric["recording_cost_estimate_sum"]) for metric in role_metrics
-        )
+        recording_cost_estimate_sum = sum(float(metric["recording_cost_estimate_sum"]) for metric in role_metrics)
         reference_sum = raw_phase_sum - recording_cost_estimate_sum
         all_metrics[metric_name] = {
             "unit": unit,
@@ -1412,9 +1438,7 @@ def build_phase_recording_cost_reference(
             "whole_field": whole_field,
             "raw_phase_observed_sum": raw_phase_sum,
             "raw_whole_sum": raw_whole_sum,
-            "raw_phase_observed_ratio_to_raw_whole": (
-                raw_phase_sum / raw_whole_sum if raw_whole_sum else None
-            ),
+            "raw_phase_observed_ratio_to_raw_whole": (raw_phase_sum / raw_whole_sum if raw_whole_sum else None),
             "empty_cost_per_record_pair": (
                 recording_cost_estimate_sum / target_all_pairs if target_all_pairs else None
             ),
@@ -1509,6 +1533,7 @@ def _build_provenance_payload(
         },
         "build": {
             "profile": identity.profile,
+            "tensormap_mode": identity.tensormap_mode,
             "profiled_cache_key": list(identity.profiled_cache_key),
             "aicore_extra_cache_key": identity.aicore_extra_cache_key,
             "compile_definitions": list(identity.compile_definitions),
@@ -1575,6 +1600,7 @@ def _validate_provenance_data(data: dict[str, Any], capture: SubmitPmuCapture) -
         build,
         {
             "profile",
+            "tensormap_mode",
             "profiled_cache_key",
             "aicore_extra_cache_key",
             "compile_definitions",
@@ -1603,8 +1629,12 @@ def _validate_provenance_data(data: dict[str, Any], capture: SubmitPmuCapture) -
     cache_key = build["profiled_cache_key"]
     if not isinstance(cache_key, list) or not cache_key or not all(isinstance(value, str) for value in cache_key):
         _fail("provenance.build.profiled_cache_key must be a non-empty string array")
-    if cache_key[-1] != build["profile"]:
-        _fail("provenance.build.profiled_cache_key must end with the selected profile")
+    if (
+        build["tensormap_mode"] not in {"private", "shared"}
+        or len(cache_key) < 2
+        or cache_key[-2:] != [build["tensormap_mode"], build["profile"]]
+    ):
+        _fail("provenance.build.profiled_cache_key must end with TensorMap mode and selected profile")
     if (
         not isinstance(build["aicore_extra_cache_key"], str)
         or _HEX_16_PATTERN.fullmatch(build["aicore_extra_cache_key"]) is None
@@ -1613,13 +1643,19 @@ def _validate_provenance_data(data: dict[str, Any], capture: SubmitPmuCapture) -
     definitions = build["compile_definitions"]
     if not isinstance(definitions, list) or not definitions or not all(isinstance(value, str) for value in definitions):
         _fail("provenance.build.compile_definitions must be a non-empty string array")
-    if tuple(definitions) != _expected_compile_definitions(build["profile"]):
+    if tuple(definitions) != _expected_compile_definitions(build["profile"], build["tensormap_mode"]):
         _fail("provenance.build compile definitions do not match the selected profile")
     if hashlib.sha256(repr(definitions).encode("utf-8")).hexdigest() != definitions_sha256:
         _fail("provenance.build compile definitions do not match definitions_sha256")
 
     artifacts = _object(data["artifacts"], "provenance.artifacts")
-    expected_artifacts = {"aicore_kernel", "aic_combined", "aiv_combined", "host_runtime"}
+    expected_artifacts = {
+        "aicore_kernel",
+        "aic_combined",
+        "aiv_combined",
+        "host_runtime",
+        "aicpu_runtime",
+    }
     _exact_keys(artifacts, expected_artifacts, "provenance.artifacts")
     for name in sorted(expected_artifacts):
         _validate_provenance_artifact(artifacts[name], f"provenance.artifacts.{name}")
@@ -1991,18 +2027,14 @@ def _phase_overview(
       保留在时间和计数口径内。没有 linked Kernel 的阶段不触发 PMU 停/开表；
       每次调用的分母仍是外层业务调用次数，不是 Begin/End 读数，也不是排除的 Kernel 调用数。</p>
         """
-    relationship_header, request_header, miss_header = _phase_table_headers(
-        recording_cost_reference
-    )
+    relationship_header, request_header, miss_header = _phase_table_headers(recording_cost_reference)
 
     group_cells: dict[str, dict[str, str]] = {}
     group_headers: dict[str, str] = {}
     frequencies = capture.data["configuration"]["pmu_cycles_per_ns"]
     for group_name in GROUP_NAMES:
         group = capture.phase_summary[group_name]
-        reference_group = (
-            None if recording_cost_reference is None else recording_cost_reference["groups"][group_name]
-        )
+        reference_group = None if recording_cost_reference is None else recording_cost_reference["groups"][group_name]
         reference_metrics = None if reference_group is None else reference_group["metrics"]
         title = {"all": "ALL", "aic": "AIC", "aiv": "AIV"}[group_name]
         group_headers[group_name] = f"{title}<small>{group['cores']} 核</small>"
@@ -2080,9 +2112,7 @@ def _phase_overview(
             total_reference_sum = float(total_reference["after_recording_cost_reference_sum"])
             scalar_reference_sum = float(scalar_reference["after_recording_cost_reference_sum"])
             non_scalar_reference_sum = float(non_scalar_reference["after_recording_cost_reference_sum"])
-            scalar_of_reference_total = (
-                scalar_reference_sum / total_reference_sum if total_reference_sum else None
-            )
+            scalar_of_reference_total = scalar_reference_sum / total_reference_sum if total_reference_sum else None
             non_scalar_of_reference_total = (
                 non_scalar_reference_sum / total_reference_sum if total_reference_sum else None
             )
@@ -2176,9 +2206,10 @@ def _provenance_overview(provenance: Mapping[str, Any] | None, provenance_sha256
         "aic_combined": "AIC combined",
         "aiv_combined": "AIV combined",
         "host_runtime": "Host runtime",
+        "aicpu_runtime": "Inner AICPU runtime",
     }
     rows = []
-    for name in ("aicore_kernel", "aic_combined", "aiv_combined", "host_runtime"):
+    for name in ("aicore_kernel", "aic_combined", "aiv_combined", "host_runtime", "aicpu_runtime"):
         artifact = artifacts[name]
         rows.append(
             "<tr>"
@@ -2201,6 +2232,7 @@ def _provenance_overview(provenance: Mapping[str, Any] | None, provenance_sha256
       <dt>Provenance SHA-256</dt><dd><code>{provenance_sha256}</code></dd>
       <dt>Profile / extra cache</dt><dd><code>{html.escape(build["profile"])}</code> /
         <code>{build["aicore_extra_cache_key"]}</code></dd>
+      <dt>TensorMap mode</dt><dd><code>{html.escape(build["tensormap_mode"])}</code></dd>
       <dt>Profiled cache key</dt><dd><code>{cache_key}</code></dd>
       <dt>Source state</dt><dd><code>{build["source_state"]}</code></dd>
       <dt>Source-state stamp</dt><dd><code>{html.escape(build["source_state_path"])}</code></dd>
@@ -2388,8 +2420,7 @@ def render_report(
         calibration_provenance_path = calibration_capture.input_path.with_name(DEFAULT_PROVENANCE_NAME)
         if provenance_path.is_file() != calibration_provenance_path.is_file():
             _fail(
-                "recording-cost target and empty-bracket must either both provide provenance sidecars "
-                "or both omit them"
+                "recording-cost target and empty-bracket must either both provide provenance sidecars or both omit them"
             )
         if provenance is None:
             recording_cost_reference["provenance_binding"] = {
@@ -2581,9 +2612,7 @@ def write_report_with_provenance(
         capture,
     )
     provenance_sha256 = hashlib.sha256(provenance_document.encode("utf-8")).hexdigest()
-    document = _clean_html_document(
-        _document(capture, penalty, validated_provenance, provenance_sha256)
-    )
+    document = _clean_html_document(_document(capture, penalty, validated_provenance, provenance_sha256))
     _publish_provenance_report_pair(
         capture=capture,
         raw_snapshot=raw_snapshot,

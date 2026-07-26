@@ -4491,3 +4491,174 @@ manifest 通过，执行节与 `319077a9` 重建冻结基线逐字节一致：
 S4.17 的正确性提交、冻结件和负结果继续保留用于后续决策，但其实现
 不属于当前运行布局。按照预登记规则，standalone 的低风险热布局边际
 探索到此停止，下一步转向真实 simpler shared TensorMap 路径。
+
+### 2026-07-26：R0 真实路径构建身份、缓存隔离与三镜像防混用
+
+本小步严格停在 R0 的第一项：只建立 private/shared 第一等构建身份、
+产物隔离和三镜像 ABI 拒绝机制，不迁移 TensorMap 数据结构或 Submit
+算法。这样可以先证明后续 shared 代码不会误用 private 缓存、宏或 GM
+布局；shared backend 尚未接入时，构建可以完成，但运行必须在 0 次
+Submit 前明确失败。
+
+#### 显式构建身份
+
+入口不再依赖参考分支使用的 ambient `CXXFLAGS`。pytest 和 standalone
+入口新增：
+
+```text
+--fdwic-tensormap private|shared
+```
+
+默认值为 `private`。选择会进入以下全部构建链：
+
+1. baseline Host、AICPU inner runtime、AICore；
+2. 每 callable 的 AICore extra image；
+3. orchestration TU；
+4. Worker 选择和 L2 worker pool 身份；
+5. submit-PMU 构建 provenance。
+
+安装期 `build_runtimes.py` 也提供可重复的显式入口：
+
+```text
+--fdwic-tensormap private
+--fdwic-tensormap shared
+```
+
+不传时固定只构建 private，且不读取 shell 中可能残留的
+`PTO_FDWIC_TENSORMAP_MODE`；重复参数可同时预构建两族。非 A5 或非
+FDWIC runtime 永远用 private builder，不会被 shared 选择污染。
+
+三类 runtime image 均收到同一个编译定义：
+
+```text
+private -> PTO_FDWIC_SHARED_MAP=0
+shared  -> PTO_FDWIC_SHARED_MAP=1
+```
+
+onboard AICPU dispatcher 是进程级、模式无关的公共加载器，因此没有
+携带该宏；只给真正解释 Runtime ABI 的 inner AICPU image 传入。这一点
+与“给所有 AICPU 目标机械加宏”有意不同。
+
+模式同时进入 baseline 和 `aicore-extra` 的目录：
+
+```text
+build/cache/a5/{sim,onboard}/fully_distributed_within_core/{private,shared}/
+build/lib/a5/{sim,onboard}/fully_distributed_within_core/{private,shared}/
+```
+
+baseline FDWIC cache 身份不再只有 Git HEAD，还包含实际 include/source
+内容指纹和有效 compile definitions。这样当前 worktree 未提交修改、
+profile 宏变化或 private/shared 切换都不会复用旧 image。
+`aicore-extra` 会把模式宏和诊断宏合并；同名宏值冲突直接报错，禁止
+调用方用后传定义覆盖构建身份。
+
+#### Runtime 稳定控制前缀与失败协议
+
+`Runtime` 首字段新增一条 64B、64B 对齐的 `FdwicBuildIdentity`：
+
+| 字段 | 当前值或语义 |
+| --- | --- |
+| magic | `FDWICMAP` |
+| build ABI | v1 |
+| TensorMap mode | private=0，shared=1 |
+| runtime bytes | 当前 Host/CPU 两种模式均为 70,080B；真实 A5 private 握手已闭合 |
+| DistGlobal layout version | v1 |
+| error bits | AICPU mismatch、AICore mismatch、backend unavailable |
+
+Host 构造时生成该身份，绑定 callable 前重新校验并清空本轮错误位。
+AICPU 在解释 `DistHandoff/PTO2Runtime` 之前校验；AICore 在进入
+`dist_core_main()` 前校验。两种负向路径分别是：
+
+```text
+Host 与 AICPU 不一致
+  -> AICPU 置 mismatch
+  -> 给所有 worker 发布 DIST_ABORT
+  -> worker 进入公共 EXIT 握手
+  -> 所有 AICPU 线程返回 -1
+
+Host/AICPU 一致、AICore 不一致
+  -> AICore 0 发布全局 mismatch，flush + 完成屏障
+  -> 全部 AICore 各自发布 FIN
+  -> AICPU 等齐后读取错误位
+  -> 公共 EXIT 握手
+  -> 所有 AICPU 线程返回 -1
+```
+
+AICore 错误位只由 `s_block_idx == 0` 发布，避免 96 核争写同一
+cacheline。CCEC 使用单 owner 普通写并在错误冷路径执行 cache flush/DSB；
+A5sim 使用原子 OR，避免宿主线程数据竞争。该屏障只存在于 ABI 错误路径，
+不会进入正常 Submit 热路径。AICPU 各线程在 `runtime_done` 后统一重读
+错误位，不依赖未查档证明的 CANN 多 block 返回码聚合行为。
+
+当前机制明确保证 private/shared **控制布局相同**时的防混用，不声称能让
+任意旧新 `Runtime` 布局互操作。身份字段以及其后的 `workers`、
+`worker_count`、AICPU launch/affinity 字段构成永久公共控制前缀：
+AICore 即使发现模式不一致，也必须按该前缀完成 handshake，AICPU 才能
+发送 `DIST_ABORT/EXIT`。后续模式化 TensorMap 状态必须放在此前缀之后，
+实际 shared backend 继续通过 `dist.shared_addr` 指向。
+
+#### shared fail-closed
+
+本阶段 `kFdwicCompiledBackendReady` 仅对 private 为 true。shared 三镜像
+可以独立构建、参与 cache/ABI 负测，但同模式运行会报告：
+
+```text
+FDWIC shared TensorMap artifact is ABI-valid but its runtime backend
+is not connected yet; aborting before Submit
+```
+
+随后给所有 AICore 发布 `DIST_ABORT` 并正常 teardown。没有用 private
+TensorMap 冒充 shared 成功，也没有为了让测试变绿提前抄入参考分支的
+append-only map、无 generation heap 或可选 writer intent。
+
+#### submit-PMU 联动
+
+submit-PMU provenance 从 v1 推进到 v2，新增 `tensormap_mode`，并要求：
+
+```text
+profiled cache key 中的 mode
+  == provenance mode
+  == PTO_FDWIC_SHARED_MAP 有效定义
+  == 实际 Host/inner AICPU/AICore artifact family
+```
+
+sidecar 同时冻结最终 AICore、AIC/AIV combined object、Host runtime 和
+实际负责 PMU owner/config/restore 的 inner AICPU runtime 的文件及
+`.text` 哈希，发布前再检查实物没有变化。HTML 也显示模式和五类实物。
+旧 raw 不做兼容分支；当前采集和加工是一体化流程，新 schema 的目标是
+拒绝把 private 诊断 image 标成 shared，或反过来。
+
+#### 已完成验证
+
+本用户 Python 环境统一使用 `/home/q00473782/.venv`：
+
+- RuntimeBuilder、安装期预构建入口、KernelCompiler、SceneTest
+  cache/CLI 和 submit-PMU provenance 共 387 项非上板测试通过，
+  12 项 requires-hardware 项未执行；
+- Ruff lint 和 format check 全部通过；
+- C++ `test_fdwic_build_identity_private/shared` 两个独立目标均构建通过，
+  每个目标 4 项测试通过；测试直接包含生产 `Runtime`，约束 identity 为
+  首字段、workers/worker_count/AICPU launch 公共前缀偏移和 70,080B
+  当前布局，不再只用假的 runtime size；
+- A5sim private/shared baseline 三镜像均构建通过；
+- A5 CANN 9.1 CCEC private/shared 的 Host、AICPU、AICore 三镜像均构建
+  通过。CCEC 实测确认普通 host inline helper 不能直接从
+  `__aicore__` 调用，且该后端不能选择 32 位 GM `__atomic_fetch_or`；
+  最终代码按真实 CCEC 接口分别处理，没有用 host 编译成功替代 CCEC 验证；
+- A5sim PA Case1 private 在 `--use-example-exec-time` 下通过；
+- 真实 A5 private CaseB1 正常 Submit 与 golden 通过；因此当前
+  aarch64 Host/inner AICPU 与 CCEC AICore 对 build identity、
+  Runtime 大小和公共握手前缀达成一致；
+- A5sim shared 同模式在 0 Submit 前按预期返回 -1，四个 AICPU 线程均
+  返回失败，且不再输出 `orch_start=0` 的伪超长耗时；
+- private Host/AICPU + shared AICore 的真实三镜像混装在所有 AICore
+  FIN 后明确返回 -1，没有挂死；
+- private Host/AICore + shared AICPU 的真实三镜像混装发布
+  `DIST_ABORT` 后明确返回 -1，没有挂死。
+
+本阶段没有运行 shared A5 业务用例，因为 backend 被有意保持为
+fail-closed；在接入真实 shared facade/backend 前跑板只能重复证明
+“未实现会失败”，不能提供 TensorMap 正确性或性能证据。下一小步应先
+抽取 private/shared 共用 facade，并把 standalone 已证明的 private
+ring 以不改变默认 private 行为的方式接入；shared 仍保持 fail-closed，
+直到它自己的 CPU/CCEC 协议测试闭合。

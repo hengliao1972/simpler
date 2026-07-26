@@ -150,6 +150,14 @@ def pytest_addoption(parser):
         "1=AICore timing, 2=+dispatch/fanout, 3=+sched phases, 4=+orch phases",
     )
     parser.addoption(
+        "--fdwic-tensormap",
+        action="store",
+        choices=["private", "shared"],
+        default="private",
+        help="Select the compile-time TensorMap artifact family for the a5/a5sim "
+        "fully_distributed_within_core runtime. The default is private.",
+    )
+    parser.addoption(
         "--fdwic-profile",
         action="store",
         choices=[
@@ -532,6 +540,27 @@ def _configure_fdwic_profile(config):
     os.environ["PTO_FDWIC_PROFILE"] = fdwic_profile
 
 
+def _configure_fdwic_tensormap(config):
+    """Validate and publish the explicit FDWIC TensorMap artifact family."""
+    mode = config.getoption("--fdwic-tensormap", default="private")
+    if mode == "private":
+        os.environ.pop("PTO_FDWIC_TENSORMAP_MODE", None)
+        return
+    if mode != "shared":
+        raise pytest.UsageError(f"unsupported --fdwic-tensormap {mode!r}")
+
+    platform = config.getoption("--platform", default=None)
+    runtime = config.getoption("--runtime", default=None)
+    level = config.getoption("--level", default=None)
+    if platform not in {"a5", "a5sim"}:
+        raise pytest.UsageError(f"--fdwic-tensormap {mode} requires --platform a5 or a5sim")
+    if runtime not in {None, "fully_distributed_within_core"}:
+        raise pytest.UsageError(f"--fdwic-tensormap {mode} only supports runtime fully_distributed_within_core")
+    if level not in {None, 2}:
+        raise pytest.UsageError(f"--fdwic-tensormap {mode} only supports SceneTest level 2")
+    os.environ["PTO_FDWIC_TENSORMAP_MODE"] = mode
+
+
 def pytest_configure(config):
     """Register custom markers and apply global config."""
     config.addinivalue_line("markers", "platforms(list): supported platforms for standalone ST functions")
@@ -544,6 +573,7 @@ def pytest_configure(config):
     )
 
     _configure_sanitizer(config)
+    _configure_fdwic_tensormap(config)
     _configure_fdwic_profile(config)
 
     # Configure logging unconditionally (not only when --log-level is passed) so
@@ -748,6 +778,27 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
             more = "" if len(incompatible) <= 3 else f" (+{len(incompatible) - 3} more)"
             raise pytest.UsageError(
                 f"--fdwic-profile {fdwic_profile} only accepts level-2 fully_distributed_within_core tests; "
+                f"incompatible item(s): {sample}{more}"
+            )
+
+    fdwic_tensormap = config.getoption("--fdwic-tensormap", default="private")
+    if fdwic_tensormap == "shared":
+        incompatible = []
+        for item in items:
+            if any(m.name == "skip" for m in item.iter_markers()):
+                continue
+            cls = getattr(item, "cls", None)
+            if (
+                cls is None
+                or getattr(cls, "_st_level", None) != 2
+                or getattr(cls, "_st_runtime", None) != "fully_distributed_within_core"
+            ):
+                incompatible.append(item.nodeid)
+        if incompatible:
+            sample = ", ".join(incompatible[:3])
+            more = "" if len(incompatible) <= 3 else f" (+{len(incompatible) - 3} more)"
+            raise pytest.UsageError(
+                "--fdwic-tensormap shared only accepts level-2 fully_distributed_within_core tests; "
                 f"incompatible item(s): {sample}{more}"
             )
 
@@ -1405,6 +1456,29 @@ def _l2_poisoned():
     return set()
 
 
+def _fdwic_worker_build_config(cls, platform, runtime):
+    """Prepare mode-aware FDWIC worker arguments and pool identity."""
+    if runtime != "fully_distributed_within_core" or platform not in {"a5", "a5sim"}:
+        return {}, ""
+
+    from simpler_setup.scene_test import (  # noqa: PLC0415
+        _fdwic_tensormap_mode,
+        get_aicore_path_override,
+    )
+
+    cache_key = (cls.__qualname__, platform, runtime)
+    cls.compile_chip_callable(platform)
+    tensormap_mode = _fdwic_tensormap_mode()
+    kwargs = {"fdwic_tensormap_mode": tensormap_mode}
+    pool_token = f"{tensormap_mode}:"
+    aicore_override = get_aicore_path_override(cache_key)
+    if aicore_override is not None:
+        aicore_override = aicore_override.resolve()
+        kwargs["aicore_path_override"] = aicore_override
+        pool_token += str(aicore_override)
+    return kwargs, pool_token
+
+
 @pytest.fixture()
 def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
     """Per-test Worker.
@@ -1435,18 +1509,7 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
 
         from simpler.worker import Worker  # noqa: PLC0415
 
-        kwargs = {}
-        aicore_pool_token = ""
-        if runtime == "fully_distributed_within_core" and st_platform in {"a5", "a5sim"}:
-            from simpler_setup.scene_test import get_aicore_path_override  # noqa: PLC0415
-
-            cache_key = (cls.__qualname__, st_platform, runtime)
-            cls.compile_chip_callable(st_platform)
-            aicore_override = get_aicore_path_override(cache_key)
-            if aicore_override is not None:
-                aicore_override = aicore_override.resolve()
-                kwargs["aicore_path_override"] = aicore_override
-                aicore_pool_token = str(aicore_override)
+        kwargs, aicore_pool_token = _fdwic_worker_build_config(cls, st_platform, runtime)
 
         # L2 share: reuse any Worker already created for this runtime image in
         # the current process. Under xdist, each worker process is sliced to a

@@ -1875,7 +1875,10 @@ class Worker:
         runtime = self._config["runtime"]
         device_id = self._config.get("device_id", 0)
 
-        builder = RuntimeBuilder(platform)
+        builder = RuntimeBuilder(
+            platform,
+            fdwic_tensormap_mode=self._config.get("fdwic_tensormap_mode"),
+        )
         binaries = builder.get_binaries(runtime)
         aicore_path_override = self._config.get("aicore_path_override")
         if aicore_path_override:
@@ -1911,7 +1914,10 @@ class Worker:
 
             platform = self._config["platform"]
             runtime = self._config["runtime"]
-            builder = RuntimeBuilder(platform)
+            builder = RuntimeBuilder(
+                platform,
+                fdwic_tensormap_mode=self._config.get("fdwic_tensormap_mode"),
+            )
             binaries = builder.get_binaries(runtime)
 
             # Stash the full RuntimeBinaries so forked chip children can

@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 
 _GIT_COMMIT_FILE = ".git_commit"
 _SOURCE_STATE_VERSION = "source-v2"
+_FDWIC_RUNTIME = "fully_distributed_within_core"
+_FDWIC_TENSORMAP_MODE_ENV = "PTO_FDWIC_TENSORMAP_MODE"
+_FDWIC_TENSORMAP_MODES = frozenset({"private", "shared"})
+_FDWIC_SHARED_MAP_DEFINITION = "PTO_FDWIC_SHARED_MAP"
 _SOURCE_FINGERPRINT_SUFFIXES = {
     ".c",
     ".cc",
@@ -148,15 +152,31 @@ class RuntimeBuilder:
     _COMPDB_RUNTIME = "tensormap_and_ringbuffer"
     _COMPDB_VARIANT = "onboard"
 
-    def __init__(self, platform: str = "a2a3"):
+    def __init__(self, platform: str = "a2a3", fdwic_tensormap_mode: Optional[str] = None):
         """
         Initialize RuntimeBuilder with platform selection.
 
         Args:
             platform: Target platform ("a2a3", "a2a3sim", "a5", or "a5sim")
+            fdwic_tensormap_mode: TensorMap implementation selected for the
+                A5 fully_distributed_within_core runtime. ``None`` reads
+                ``PTO_FDWIC_TENSORMAP_MODE`` and falls back to ``private``.
         """
         self.platform = platform
         self._arch, self._variant = parse_platform(platform)
+        selected_mode = (
+            os.environ.get(_FDWIC_TENSORMAP_MODE_ENV, "private")
+            if fdwic_tensormap_mode is None
+            else fdwic_tensormap_mode
+        )
+        if not isinstance(selected_mode, str) or selected_mode.strip().lower() not in _FDWIC_TENSORMAP_MODES:
+            choices = ", ".join(sorted(_FDWIC_TENSORMAP_MODES))
+            raise ValueError(f"Invalid FDWIC TensorMap mode {selected_mode!r}; expected one of: {choices}")
+        self.fdwic_tensormap_mode = selected_mode.strip().lower()
+        if self.fdwic_tensormap_mode == "shared" and self._arch != "a5":
+            raise ValueError(
+                "FDWIC TensorMap mode 'shared' is only valid for the a5/a5sim fully_distributed_within_core runtime"
+            )
 
         runtime_root = PROJECT_ROOT
         self.runtime_root = runtime_root
@@ -187,6 +207,75 @@ class RuntimeBuilder:
                 f"Note: Different platforms may support different runtimes. "
                 f"Check {self.runtime_dir} for available implementations."
             )
+        if self.fdwic_tensormap_mode == "shared" and not self._is_fdwic_runtime(name):
+            raise ValueError(
+                "FDWIC TensorMap mode 'shared' is only valid for the a5/a5sim "
+                "fully_distributed_within_core runtime; "
+                f"got platform={self.platform!r}, runtime={name!r}"
+            )
+
+    def _is_fdwic_runtime(self, name: str) -> bool:
+        """Return whether ``name`` is the A5 runtime with selectable TensorMap."""
+        return self._arch == "a5" and name == _FDWIC_RUNTIME
+
+    def _runtime_artifact_dir(self, root: Path, name: str) -> Path:
+        """Return the cache/output root for one runtime build identity."""
+        path = root / self._arch / self._variant / name
+        if self._is_fdwic_runtime(name):
+            path /= self.fdwic_tensormap_mode
+        return path
+
+    @staticmethod
+    def _merge_compile_definitions(*definition_groups: Optional[list[str]]) -> list[str]:
+        """Merge CMake definitions while rejecting conflicting macro values."""
+        merged: list[str] = []
+        by_name: dict[str, str] = {}
+        for definitions in definition_groups:
+            for raw_definition in definitions or []:
+                if not isinstance(raw_definition, str) or not raw_definition.strip():
+                    raise ValueError(f"Invalid compile definition: {raw_definition!r}")
+                definition = raw_definition.strip()
+                name = definition.split("=", 1)[0].strip()
+                if not name:
+                    raise ValueError(f"Invalid compile definition: {raw_definition!r}")
+                previous = by_name.get(name)
+                if previous is not None:
+                    if previous != definition:
+                        raise ValueError(f"Conflicting compile definitions for {name}: {previous!r} and {definition!r}")
+                    continue
+                by_name[name] = definition
+                merged.append(definition)
+        return merged
+
+    def effective_compile_definitions(
+        self,
+        name: str,
+        compile_definitions: Optional[list[str]] = None,
+    ) -> list[str]:
+        """Return target definitions for ``name`` including its build mode."""
+        mode_definitions: list[str] = []
+        if self._is_fdwic_runtime(name):
+            shared_value = 1 if self.fdwic_tensormap_mode == "shared" else 0
+            mode_definitions.append(f"{_FDWIC_SHARED_MAP_DEFINITION}={shared_value}")
+        return self._merge_compile_definitions(mode_definitions, compile_definitions)
+
+    @staticmethod
+    def _source_state(
+        current_commit: str,
+        fingerprint_paths: list[Path],
+        compile_definitions: list[str],
+    ) -> str:
+        """Build a cache identity from revision, contents, and CMake macros."""
+        definitions_state = hashlib.sha256(repr(compile_definitions).encode("utf-8")).hexdigest()
+        return (
+            _SOURCE_STATE_VERSION
+            + ":"
+            + current_commit
+            + ":"
+            + _source_fingerprint(fingerprint_paths)
+            + ":"
+            + definitions_state
+        )
 
     def _resolve_target_dirs(self, config_dir: Path, build_config: dict, target: str):
         """Resolve include and source dirs for a target from build_config."""
@@ -288,7 +377,7 @@ class RuntimeBuilder:
         self._validate_runtime(name)
 
         arch, variant = self._arch, self._variant
-        output_dir = self._LIB_DIR / arch / variant / name
+        output_dir = self._runtime_artifact_dir(self._LIB_DIR, name)
         # Per-arch shared destination for libsimpler_aicpu_dispatcher.so. The
         # dispatcher has no runtime-specific code, so all runtimes on a given
         # arch reuse the same SO instead of carrying a copy each (~50 KB × N).
@@ -305,12 +394,21 @@ class RuntimeBuilder:
         compiler = self._runtime_compiler
 
         current_commit = _get_git_head(PROJECT_ROOT)
+        effective_compile_definitions = self.effective_compile_definitions(name)
 
         def _compile_target(target: str) -> Path:
             include_dirs, source_dirs = self._resolve_target_dirs(config_dir, build_config, target)
             # compile() adds a {target}/ subdirectory inside build_dir
-            cache_dir = self._CACHE_DIR / arch / variant / name
+            cache_dir = self._runtime_artifact_dir(self._CACHE_DIR, name)
             cache_dir.mkdir(parents=True, exist_ok=True)
+            current_state = current_commit
+            if self._is_fdwic_runtime(name):
+                fingerprint_paths = [*(Path(p) for p in include_dirs), *(Path(p) for p in source_dirs)]
+                current_state = self._source_state(
+                    current_commit,
+                    fingerprint_paths,
+                    effective_compile_definitions,
+                )
 
             # File lock to prevent concurrent cmake runs in the same build dir.
             # Each target gets its own lock so host/aicpu/aicore build in parallel,
@@ -318,7 +416,10 @@ class RuntimeBuilder:
             lock_path = cache_dir / f".{target}.lock"
             with open(lock_path, "w") as lock_fd:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                _invalidate_cache_if_stale(cache_dir / target, current_commit)
+                _invalidate_cache_if_stale(cache_dir / target, current_state)
+                compile_kwargs = {}
+                if effective_compile_definitions:
+                    compile_kwargs["compile_definitions"] = effective_compile_definitions
                 return compiler.compile(  # type: ignore[return-value]
                     target,
                     include_dirs,
@@ -326,6 +427,7 @@ class RuntimeBuilder:
                     build_dir=str(cache_dir),
                     output_dir=output_dir,
                     dispatcher_dest=dispatcher_staging_dir if target == "aicpu" else None,
+                    **compile_kwargs,
                 )
 
         logger.info("Compiling AICore, AICPU, Host in parallel...")
@@ -381,6 +483,7 @@ class RuntimeBuilder:
         silently reuse an image built with different preprocessor gates.
         """
         self._validate_runtime(name)
+        effective_compile_definitions = self.effective_compile_definitions(name, compile_definitions)
         config_path = self._runtimes[name]
         config_dir = config_path.parent
         build_config = load_build_config(config_path)
@@ -403,24 +506,16 @@ class RuntimeBuilder:
             pto_pto_include = os.path.join(pto_isa_root, "include", "pto")
             include_dirs.extend([pto_include, pto_pto_include])
 
-        arch, variant = self._arch, self._variant
-        cache_dir = self._CACHE_DIR / arch / variant / name / "aicore-extra" / cache_key
-        output_dir = self._LIB_DIR / arch / variant / name / "aicore-extra" / cache_key
+        runtime_cache_dir = self._runtime_artifact_dir(self._CACHE_DIR, name)
+        runtime_output_dir = self._runtime_artifact_dir(self._LIB_DIR, name)
+        cache_dir = runtime_cache_dir / "aicore-extra" / cache_key
+        output_dir = runtime_output_dir / "aicore-extra" / cache_key
         cache_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         current_commit = _get_git_head(PROJECT_ROOT)
         fingerprint_paths = [*(Path(p) for p in include_dirs), *(Path(p) for p in source_dirs), *extra_sources]
-        definitions_state = hashlib.sha256(repr(compile_definitions or []).encode("utf-8")).hexdigest()
-        current_state = (
-            _SOURCE_STATE_VERSION
-            + ":"
-            + current_commit
-            + ":"
-            + _source_fingerprint(fingerprint_paths)
-            + ":"
-            + definitions_state
-        )
+        current_state = self._source_state(current_commit, fingerprint_paths, effective_compile_definitions)
         lock_path = cache_dir / ".aicore-extra.lock"
         with open(lock_path, "w") as lock_fd:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -432,7 +527,7 @@ class RuntimeBuilder:
                 build_dir=str(cache_dir),
                 output_dir=output_dir,
                 source_files=[str(p) for p in extra_sources],
-                compile_definitions=compile_definitions,
+                compile_definitions=effective_compile_definitions,
             )
 
     def _resolve_dispatcher_path(self) -> Optional[Path]:
@@ -533,8 +628,9 @@ class RuntimeBuilder:
         """
         arch, variant = self._arch, self._variant
         entries = []
+        runtime_cache_dir = self._runtime_artifact_dir(self._CACHE_DIR, runtime_name)
         for target in TARGETS:
-            cc = self._CACHE_DIR / arch / variant / runtime_name / target / "compile_commands.json"
+            cc = runtime_cache_dir / target / "compile_commands.json"
             if cc.exists():
                 try:
                     entries.extend(json.loads(cc.read_text()))

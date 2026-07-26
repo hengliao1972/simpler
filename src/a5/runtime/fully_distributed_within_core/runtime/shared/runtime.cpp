@@ -28,6 +28,8 @@ Runtime::Runtime() {
     // NOTE: host_api is initialized in InitRuntime() (host-only code)
     // because the CApi functions don't exist when compiled for device.
 
+    fdwic_build_identity = fdwic_make_build_identity(static_cast<uint32_t>(sizeof(Runtime)));
+
     // Initialize handshake buffers
     memset(workers, 0, sizeof(workers));
     worker_count = 0;

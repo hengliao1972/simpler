@@ -226,135 +226,198 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     if (thread_idx >= sched_thread_num_) {
 #if PTO2_PROFILING
         uint64_t orch_cycle_start = 0;
+        bool orch_cycle_started = false;
 #endif
         // AICPU setup thread: initialize the shared distributed state, start
         // AICore workers, and wait for their on-core orchestration replay.
         {
             LOG_INFO_V0("Thread %d: Preparing shared dist state", thread_idx);
+            const int32_t num_workers = runtime->worker_count;
 
-            // Build the entry-arg once per run. The AICore-side dist engine
-            // consumes it when replaying the linked orchestration entry.
-            runtime->dist.orch_args.create_from_chip_args(runtime->get_orch_args());
-            const ChipStorageTaskArgs &orch_args = runtime->get_orch_args();
-            runtime->dist.ccec_orch_tensor_count = orch_args.tensor_count();
-            runtime->dist.ccec_orch_scalar_count = orch_args.scalar_count();
-            for (int32_t i = 0; i < orch_args.tensor_count() && i < CHIP_MAX_TENSOR_ARGS; i++) {
-                Tensor::copy(runtime->dist.ccec_orch_tensors[i], orch_args.tensor(i));
-            }
-            for (int32_t i = 0; i < orch_args.scalar_count() && i < CHIP_MAX_SCALAR_ARGS; i++) {
-                runtime->dist.ccec_orch_scalars[i] = orch_args.scalar(i);
-            }
-            cache_flush_range(runtime->dist.ccec_orch_tensors, sizeof(runtime->dist.ccec_orch_tensors));
-            cache_flush_range(runtime->dist.ccec_orch_scalars, sizeof(runtime->dist.ccec_orch_scalars));
-            cache_flush_range(const_cast<const int32_t *>(&runtime->dist.ccec_orch_tensor_count), 2 * sizeof(int32_t));
-
-            // rt is bound to *this* run's memory and must be reattached every
-            // run.
-            const ChipStorageTaskArgs &args = runtime->get_orch_args();
-            int32_t arg_count = args.tensor_count() + args.scalar_count();
-            LOG_INFO_V0("Thread %d: arg_count=%d", thread_idx, arg_count);
-            for (int32_t i = 0; i < args.tensor_count() && i < 20; i++) {
-                const Tensor &t = args.tensor(i);
-                LOG_INFO_V0(
-                    "Thread %d: orch_args[%d] = TENSOR(data=0x%lx, ndims=%u, dtype=%u)", thread_idx, i,
-                    static_cast<uint64_t>(t.buffer.addr), t.ndims, static_cast<unsigned>(t.dtype)
+            // Validate the stable Runtime prefix before reading DistHandoff or
+            // PTO2Runtime state. A mismatch means the Host/AICPU images came
+            // from different TensorMap artifact families. The shared backend
+            // is intentionally fail-closed until its real implementation is
+            // connected in the next stage.
+            cache_invalidate_range(&runtime->fdwic_build_identity, sizeof(runtime->fdwic_build_identity));
+            bool dispatch_dist_run =
+                fdwic_build_identity_matches(runtime->fdwic_build_identity, static_cast<uint32_t>(sizeof(Runtime)));
+            if (!dispatch_dist_run) {
+                LOG_ERROR(
+                    "Thread %d: FDWIC build identity mismatch "
+                    "(magic=0x%" PRIx64 ", abi=%u, mode=%u, runtime_bytes=%u, dist_layout=%u; "
+                    "expected abi=%u, mode=%u, runtime_bytes=%zu, dist_layout=%u)",
+                    thread_idx, static_cast<uint64_t>(runtime->fdwic_build_identity.magic),
+                    runtime->fdwic_build_identity.abi_version, runtime->fdwic_build_identity.tensor_map_mode,
+                    runtime->fdwic_build_identity.runtime_bytes,
+                    runtime->fdwic_build_identity.dist_global_layout_version, kFdwicBuildAbiVersion,
+                    static_cast<uint32_t>(kFdwicCompiledTensorMapMode), sizeof(Runtime), kFdwicDistGlobalLayoutVersion
                 );
-            }
-            for (int32_t i = 0; i < args.scalar_count() && (args.tensor_count() + i) < 20; i++) {
-                LOG_INFO_V0(
-                    "Thread %d: orch_args[%d] = SCALAR(0x%lx)", thread_idx, args.tensor_count() + i,
-                    static_cast<uint64_t>(args.scalar(i))
+                __atomic_fetch_or(
+                    &runtime->fdwic_build_identity.error_bits, static_cast<uint32_t>(FdwicBuildErrorAicpuMismatch),
+                    __ATOMIC_RELEASE
                 );
+                run_rc = -1;
+            } else if (!kFdwicCompiledBackendReady) {
+                LOG_ERROR(
+                    "Thread %d: FDWIC shared TensorMap artifact is ABI-valid but its runtime backend "
+                    "is not connected yet; aborting before Submit",
+                    thread_idx
+                );
+                __atomic_fetch_or(
+                    &runtime->fdwic_build_identity.error_bits, static_cast<uint32_t>(FdwicBuildErrorBackendUnavailable),
+                    __ATOMIC_RELEASE
+                );
+                dispatch_dist_run = false;
+                run_rc = -1;
             }
+            cache_flush_range(&runtime->fdwic_build_identity, sizeof(runtime->fdwic_build_identity));
 
-            // Host has pre-populated the runtime header and uploaded it into
-            // the pooled runtime_arena buffer. The distributed path reads the
-            // PTO2Runtime header directly from that arena.
-            void *prebuilt_arena = runtime->get_prebuilt_arena_base();
-            size_t off_runtime = runtime->get_prebuilt_runtime_offset();
-            if (prebuilt_arena == nullptr) {
-                LOG_ERROR("Thread %d: prebuilt_arena_base is null", thread_idx);
-                runtime_done_.store(true, std::memory_order_release);
-                return -1;
-            }
-            rt = reinterpret_cast<PTO2Runtime *>(static_cast<char *>(prebuilt_arena) + off_runtime);
-
-#if PTO2_PROFILING
-            if (get_l2_swimlane_level() >= L2SwimlaneLevel::ORCH_PHASES) {
-                l2_swimlane_aicpu_set_orch_thread_idx(thread_idx);
-            }
-#endif
-
-#if PTO2_PROFILING
-            orch_cycle_start = get_sys_cnt_aicpu();
-#endif
-            // ---- fully_distributed_within_core handoff ----
-            // Instead of running orchestration here, wire the distributed engine
-            // (resets cursors/flags/heap) and wake the AICore worker threads,
-            // which call their own linked dist_core_main entry, replay
-            // orchestration in SPMD fashion, and execute the tasks they win.
-            // This AICPU thread then waits for all workers.
-            // See runtime/dist_engine.* and docs/fully_distributed_within_core.md.
-            {
-                const int32_t num_workers = runtime->worker_count;
-                dist_engine_register(rt, &runtime->dist.orch_args, num_workers, runtime);
-                runtime->dist.num_workers = num_workers;
-                __atomic_store_n(&runtime->dist.done_count, 0, __ATOMIC_RELEASE);
-                cache_flush_range(rt->dist_global, dist_engine_global_state_size());
-                cache_flush_range(&runtime->dist, sizeof(runtime->dist));
-                cache_flush_range(const_cast<const int32_t *>(&runtime->dist.num_workers), sizeof(int32_t));
-                cache_flush_range(const_cast<const int64_t *>(&runtime->dist.done_count), sizeof(int64_t));
-                FdwicSubmitPmuHeader *submit_pmu_header = nullptr;
-                const bool submit_pmu_requested = fdwic_submit_pmu_requested(runtime, &submit_pmu_header);
-                bool dispatch_dist_run = true;
-                if (submit_pmu_requested && fdwic_submit_pmu_owner_configure(runtime, submit_pmu_header) != 0) {
-                    LOG_ERROR("Thread %d: FDWIC submit-PMU owner configure failed; aborting dist replay", thread_idx);
-                    // Configure 已经执行一次回滚；这里再做一次幂等恢复，优先
-                    // 避免失败诊断给后续本地设备运行留下 PMU 配置。
-                    (void)fdwic_submit_pmu_owner_restore(submit_pmu_header);
-                    dispatch_dist_run = false;
-                    run_rc = -1;
+            if (!dispatch_dist_run) {
+                for (int32_t i = 0; i < num_workers; i++) {
+                    runtime->workers[i].aicpu_ready = AICPU_READY_DIST_ABORT;
+                    cache_flush_range(const_cast<const uint32_t *>(&runtime->workers[i].aicpu_ready), sizeof(uint32_t));
                 }
-                uint64_t *regs = reinterpret_cast<uint64_t *>(get_platform_regs());
-                if (regs == nullptr) {
-                    LOG_ERROR("Thread %d: platform regs unavailable", thread_idx);
+            } else {
+                // Build the entry-arg once per run. The AICore-side dist engine
+                // consumes it when replaying the linked orchestration entry.
+                runtime->dist.orch_args.create_from_chip_args(runtime->get_orch_args());
+                const ChipStorageTaskArgs &orch_args = runtime->get_orch_args();
+                runtime->dist.ccec_orch_tensor_count = orch_args.tensor_count();
+                runtime->dist.ccec_orch_scalar_count = orch_args.scalar_count();
+                for (int32_t i = 0; i < orch_args.tensor_count() && i < CHIP_MAX_TENSOR_ARGS; i++) {
+                    Tensor::copy(runtime->dist.ccec_orch_tensors[i], orch_args.tensor(i));
+                }
+                for (int32_t i = 0; i < orch_args.scalar_count() && i < CHIP_MAX_SCALAR_ARGS; i++) {
+                    runtime->dist.ccec_orch_scalars[i] = orch_args.scalar(i);
+                }
+                cache_flush_range(runtime->dist.ccec_orch_tensors, sizeof(runtime->dist.ccec_orch_tensors));
+                cache_flush_range(runtime->dist.ccec_orch_scalars, sizeof(runtime->dist.ccec_orch_scalars));
+                cache_flush_range(
+                    const_cast<const int32_t *>(&runtime->dist.ccec_orch_tensor_count), 2 * sizeof(int32_t)
+                );
+
+                // rt is bound to *this* run's memory and must be reattached every
+                // run.
+                const ChipStorageTaskArgs &args = runtime->get_orch_args();
+                int32_t arg_count = args.tensor_count() + args.scalar_count();
+                LOG_INFO_V0("Thread %d: arg_count=%d", thread_idx, arg_count);
+                for (int32_t i = 0; i < args.tensor_count() && i < 20; i++) {
+                    const Tensor &t = args.tensor(i);
+                    LOG_INFO_V0(
+                        "Thread %d: orch_args[%d] = TENSOR(data=0x%lx, ndims=%u, dtype=%u)", thread_idx, i,
+                        static_cast<uint64_t>(t.buffer.addr), t.ndims, static_cast<unsigned>(t.dtype)
+                    );
+                }
+                for (int32_t i = 0; i < args.scalar_count() && (args.tensor_count() + i) < 20; i++) {
+                    LOG_INFO_V0(
+                        "Thread %d: orch_args[%d] = SCALAR(0x%lx)", thread_idx, args.tensor_count() + i,
+                        static_cast<uint64_t>(args.scalar(i))
+                    );
+                }
+
+                // Host has pre-populated the runtime header and uploaded it into
+                // the pooled runtime_arena buffer. The distributed path reads the
+                // PTO2Runtime header directly from that arena.
+                void *prebuilt_arena = runtime->get_prebuilt_arena_base();
+                size_t off_runtime = runtime->get_prebuilt_runtime_offset();
+                if (prebuilt_arena == nullptr) {
+                    LOG_ERROR("Thread %d: prebuilt_arena_base is null", thread_idx);
                     runtime_done_.store(true, std::memory_order_release);
                     return -1;
                 }
-                for (int32_t i = 0; i < num_workers; i++) {
-                    const uint32_t physical_core_id = runtime->workers[i].physical_core_id;
-                    write_reg(regs[physical_core_id], RegId::COND, AICORE_IDLE_VALUE);
+                rt = reinterpret_cast<PTO2Runtime *>(static_cast<char *>(prebuilt_arena) + off_runtime);
+
+#if PTO2_PROFILING
+                if (get_l2_swimlane_level() >= L2SwimlaneLevel::ORCH_PHASES) {
+                    l2_swimlane_aicpu_set_orch_thread_idx(thread_idx);
                 }
-                for (int32_t i = 0; i < num_workers; i++) {
-                    runtime->workers[i].aicpu_ready = dispatch_dist_run ? AICPU_READY_DIST_RUN : AICPU_READY_DIST_ABORT;
-                    cache_flush_range(const_cast<const uint32_t *>(&runtime->workers[i].aicpu_ready), sizeof(uint32_t));
-                }
-                if (dispatch_dist_run) {
-                    while (true) {
-                        if (__atomic_load_n(&runtime->dist.done_count, __ATOMIC_ACQUIRE) >= num_workers) break;
-                        bool all_cond_done = true;
-                        for (int32_t i = 0; i < num_workers; i++) {
-                            const uint32_t physical_core_id = runtime->workers[i].physical_core_id;
-                            const uint64_t cond = read_reg(regs[physical_core_id], RegId::COND);
-                            const bool done = cond == MAKE_FIN_VALUE(0);
-                            all_cond_done = all_cond_done && done;
-                        }
-                        if (all_cond_done) {
-                            __atomic_store_n(&runtime->dist.done_count, num_workers, __ATOMIC_RELEASE);
-                            break;
-                        }
-                        SPIN_WAIT_HINT();
+#endif
+
+#if PTO2_PROFILING
+                orch_cycle_start = get_sys_cnt_aicpu();
+                orch_cycle_started = true;
+#endif
+                // ---- fully_distributed_within_core handoff ----
+                // Instead of running orchestration here, wire the distributed engine
+                // (resets cursors/flags/heap) and wake the AICore worker threads,
+                // which call their own linked dist_core_main entry, replay
+                // orchestration in SPMD fashion, and execute the tasks they win.
+                // This AICPU thread then waits for all workers.
+                // See runtime/dist_engine.* and docs/fully_distributed_within_core.md.
+                {
+                    dist_engine_register(rt, &runtime->dist.orch_args, num_workers, runtime);
+                    runtime->dist.num_workers = num_workers;
+                    __atomic_store_n(&runtime->dist.done_count, 0, __ATOMIC_RELEASE);
+                    cache_flush_range(rt->dist_global, dist_engine_global_state_size());
+                    cache_flush_range(&runtime->dist, sizeof(runtime->dist));
+                    cache_flush_range(const_cast<const int32_t *>(&runtime->dist.num_workers), sizeof(int32_t));
+                    cache_flush_range(const_cast<const int64_t *>(&runtime->dist.done_count), sizeof(int64_t));
+                    FdwicSubmitPmuHeader *submit_pmu_header = nullptr;
+                    const bool submit_pmu_requested = fdwic_submit_pmu_requested(runtime, &submit_pmu_header);
+                    if (submit_pmu_requested && fdwic_submit_pmu_owner_configure(runtime, submit_pmu_header) != 0) {
+                        LOG_ERROR(
+                            "Thread %d: FDWIC submit-PMU owner configure failed; aborting dist replay", thread_idx
+                        );
+                        // Configure 已经执行一次回滚；这里再做一次幂等恢复，优先
+                        // 避免失败诊断给后续本地设备运行留下 PMU 配置。
+                        (void)fdwic_submit_pmu_owner_restore(submit_pmu_header);
+                        dispatch_dist_run = false;
+                        run_rc = -1;
                     }
-                    if (submit_pmu_requested) {
-                        // 每个 worker 在发布 done 前已经 stop/read/flush 自己的
-                        // 整窗记录及可选 phase sidecar。所有 worker 完成后才
-                        // 恢复共享 PMU 配置。
-                        const int restore_rc = fdwic_submit_pmu_owner_restore(submit_pmu_header);
-                        if (restore_rc != 0) {
-                            // ownership bitmap 保留失败槽，允许一次幂等重试；
-                            // 即使重试恢复，首次失败也会留在 header，正式 raw
-                            // 仍被 host 拒绝。
-                            (void)fdwic_submit_pmu_owner_restore(submit_pmu_header);
+                    uint64_t *regs = reinterpret_cast<uint64_t *>(get_platform_regs());
+                    if (regs == nullptr) {
+                        LOG_ERROR("Thread %d: platform regs unavailable", thread_idx);
+                        runtime_done_.store(true, std::memory_order_release);
+                        return -1;
+                    }
+                    for (int32_t i = 0; i < num_workers; i++) {
+                        const uint32_t physical_core_id = runtime->workers[i].physical_core_id;
+                        write_reg(regs[physical_core_id], RegId::COND, AICORE_IDLE_VALUE);
+                    }
+                    for (int32_t i = 0; i < num_workers; i++) {
+                        runtime->workers[i].aicpu_ready =
+                            dispatch_dist_run ? AICPU_READY_DIST_RUN : AICPU_READY_DIST_ABORT;
+                        cache_flush_range(
+                            const_cast<const uint32_t *>(&runtime->workers[i].aicpu_ready), sizeof(uint32_t)
+                        );
+                    }
+                    if (dispatch_dist_run) {
+                        while (true) {
+                            if (__atomic_load_n(&runtime->dist.done_count, __ATOMIC_ACQUIRE) >= num_workers) break;
+                            bool all_cond_done = true;
+                            for (int32_t i = 0; i < num_workers; i++) {
+                                const uint32_t physical_core_id = runtime->workers[i].physical_core_id;
+                                const uint64_t cond = read_reg(regs[physical_core_id], RegId::COND);
+                                const bool done = cond == MAKE_FIN_VALUE(0);
+                                all_cond_done = all_cond_done && done;
+                            }
+                            if (all_cond_done) {
+                                __atomic_store_n(&runtime->dist.done_count, num_workers, __ATOMIC_RELEASE);
+                                break;
+                            }
+                            SPIN_WAIT_HINT();
+                        }
+                        if (submit_pmu_requested) {
+                            // 每个 worker 在发布 done 前已经 stop/read/flush 自己的
+                            // 整窗记录及可选 phase sidecar。所有 worker 完成后才
+                            // 恢复共享 PMU 配置。
+                            const int restore_rc = fdwic_submit_pmu_owner_restore(submit_pmu_header);
+                            if (restore_rc != 0) {
+                                // ownership bitmap 保留失败槽，允许一次幂等重试；
+                                // 即使重试恢复，首次失败也会留在 header，正式 raw
+                                // 仍被 host 拒绝。
+                                (void)fdwic_submit_pmu_owner_restore(submit_pmu_header);
+                                run_rc = -1;
+                            }
+                        }
+                        cache_invalidate_range(&runtime->fdwic_build_identity, sizeof(runtime->fdwic_build_identity));
+                        if ((runtime->fdwic_build_identity.error_bits & FdwicBuildErrorAicoreMismatch) != 0) {
+                            LOG_ERROR(
+                                "Thread %d: at least one AICore rejected the FDWIC build identity; "
+                                "failing the run after clean worker completion",
+                                thread_idx
+                            );
                             run_rc = -1;
                         }
                     }
@@ -363,18 +426,29 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             runtime_done_.store(true, std::memory_order_release);
         }
 #if PTO2_PROFILING
-        uint64_t orch_end_ts = get_sys_cnt_aicpu();
-        LOG_INFO_V9(
-            "Thread %d: orch_start=%" PRIu64 " orch_end=%" PRIu64 " orch_cost=%.3fus", thread_idx,
-            static_cast<uint64_t>(orch_cycle_start), static_cast<uint64_t>(orch_end_ts),
-            cycles_to_us(orch_end_ts - orch_cycle_start)
-        );
+        if (orch_cycle_started) {
+            uint64_t orch_end_ts = get_sys_cnt_aicpu();
+            LOG_INFO_V9(
+                "Thread %d: orch_start=%" PRIu64 " orch_end=%" PRIu64 " orch_cost=%.3fus", thread_idx,
+                static_cast<uint64_t>(orch_cycle_start), static_cast<uint64_t>(orch_end_ts),
+                cycles_to_us(orch_end_ts - orch_cycle_start)
+            );
+        }
 #endif
         LOG_INFO_V0("Thread %d: Orchestrator completed", thread_idx);
     } else {
         while (!runtime_done_.load(std::memory_order_acquire)) {
             SPIN_WAIT_HINT();
         }
+    }
+
+    // AICPU launches multiple threads, but the orchestrator alone owns the
+    // distributed handoff. Mirror its ABI/backend failure onto every AICPU
+    // return value instead of relying on undocumented multi-block return-code
+    // aggregation in the platform launcher.
+    cache_invalidate_range(&runtime->fdwic_build_identity, sizeof(runtime->fdwic_build_identity));
+    if (__atomic_load_n(&runtime->fdwic_build_identity.error_bits, __ATOMIC_ACQUIRE) != FdwicBuildErrorNone) {
+        run_rc = -1;
     }
 
     // Shutdown is gated by runtime_done_: AICores only enter the EXIT wait

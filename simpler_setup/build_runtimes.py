@@ -11,11 +11,16 @@
 
 Detects available toolchains and builds all runtime binaries using
 persistent build directories (build/cache/) for incremental compilation.
-Final binaries are placed in build/lib/{arch}/{variant}/{runtime}/.
+Final binaries are placed in build/lib/{arch}/{variant}/{runtime}/. A5 FDWIC
+uses one additional private/shared mode directory below the runtime.
 
 Usage:
     python simpler_setup/build_runtimes.py                     # auto-detect platforms
     python simpler_setup/build_runtimes.py --platforms a2a3sim  # build specific platform
+    python simpler_setup/build_runtimes.py --platforms a5sim \
+        --fdwic-tensormap shared                               # build shared FDWIC baseline
+    python simpler_setup/build_runtimes.py --platforms a5sim \
+        --fdwic-tensormap private --fdwic-tensormap shared     # build both FDWIC baselines
     python simpler_setup/build_runtimes.py --list               # list buildable platforms
 """
 
@@ -41,6 +46,63 @@ from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: E402
 from simpler_setup.sanitizers import SANITIZER_PRESETS, resolve, validate  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+_FDWIC_RUNTIME = "fully_distributed_within_core"
+_FDWIC_TENSORMAP_MODES = ("private", "shared")
+
+
+def _is_a5_fdwic(platform: str, runtime_name: str) -> bool:
+    """Return whether this task has the selectable TensorMap implementation."""
+    return parse_platform(platform)[0] == "a5" and runtime_name == _FDWIC_RUNTIME
+
+
+def _normalize_fdwic_tensormap_modes(modes: Optional[list[str]]) -> tuple[str, ...]:
+    """Validate and de-duplicate explicitly requested FDWIC build modes.
+
+    The install/pre-build entry point always defaults to ``private`` so wheel
+    contents do not depend on ambient shell state. ``shared`` is built only
+    through the explicit CLI/API request.
+    """
+    requested = ["private"] if modes is None else modes
+    if isinstance(requested, str):
+        raise ValueError("fdwic_tensormap_modes must be a list of 'private'/'shared' values")
+
+    normalized: list[str] = []
+    for raw_mode in requested:
+        if not isinstance(raw_mode, str) or raw_mode.strip().lower() not in _FDWIC_TENSORMAP_MODES:
+            choices = ", ".join(_FDWIC_TENSORMAP_MODES)
+            raise ValueError(f"Invalid FDWIC TensorMap mode {raw_mode!r}; expected one of: {choices}")
+        mode = raw_mode.strip().lower()
+        if mode not in normalized:
+            normalized.append(mode)
+    if not normalized:
+        raise ValueError("fdwic_tensormap_modes must contain at least one mode")
+    return tuple(normalized)
+
+
+def _collect_runtime_build_tasks(
+    platforms: list[str],
+    fdwic_tensormap_modes: Optional[list[str]],
+) -> list[tuple[str, str, str]]:
+    """Collect builds while applying TensorMap mode only to A5 FDWIC."""
+    tasks: list[tuple[str, str, str]] = []
+    selected_fdwic_modes: Optional[tuple[str, ...]] = None
+    for platform in platforms:
+        arch, _ = parse_platform(platform)
+        runtimes = discover_runtimes(arch)
+
+        if not runtimes:
+            logger.warning(f"  {platform}: no runtimes found, skipping")
+            continue
+
+        for runtime_name in runtimes:
+            if arch == "a5" and runtime_name == _FDWIC_RUNTIME:
+                if selected_fdwic_modes is None:
+                    selected_fdwic_modes = _normalize_fdwic_tensormap_modes(fdwic_tensormap_modes)
+                tasks.extend((platform, runtime_name, mode) for mode in selected_fdwic_modes)
+            else:
+                tasks.append((platform, runtime_name, "private"))
+    return tasks
 
 
 def detect_buildable_platforms() -> list:
@@ -78,6 +140,7 @@ def build_all(
     clone_protocol: str = "ssh",
     sanitizer: str = "none",
     pto_isa_commit: Optional[str] = None,
+    fdwic_tensormap_modes: Optional[list[str]] = None,
 ) -> None:
     """Build all runtime variants for the given platforms.
 
@@ -94,6 +157,10 @@ def build_all(
         pto_isa_commit: optional pto-isa commit override for the onboard a2a3
             host build. None preserves the original behavior and uses the
             current checkout HEAD.
+        fdwic_tensormap_modes: FDWIC baseline modes to pre-build. ``None``
+            defaults to ``private``. Passing ``["private", "shared"]`` builds
+            both isolated artifact families. This selection applies only to the A5
+            ``fully_distributed_within_core`` runtime.
     """
     # Override default paths to respect CLI args
     RuntimeBuilder._LIB_DIR = lib_dir
@@ -143,7 +210,7 @@ def build_all(
     if platforms:
         logger.info("Building simpler_log (process-global)...")
         try:
-            RuntimeBuilder(platform=platforms[0]).ensure_simpler_log(build=True)
+            RuntimeBuilder(platform=platforms[0], fdwic_tensormap_mode="private").ensure_simpler_log(build=True)
         except Exception as e:
             logger.error(f"Failed to build simpler_log: {e}")
             raise
@@ -152,42 +219,36 @@ def build_all(
         if sim_platforms:
             logger.info("Building cpu_sim_context (process-global)...")
             try:
-                RuntimeBuilder(platform=sim_platforms[0]).ensure_sim_context(build=True)
+                RuntimeBuilder(platform=sim_platforms[0], fdwic_tensormap_mode="private").ensure_sim_context(build=True)
             except Exception as e:
                 logger.error(f"Failed to build cpu_sim_context: {e}")
                 raise
 
-    # Collect all (platform, runtime_name) tasks to run in parallel
-    tasks: list[tuple[str, str]] = []
-    for platform in platforms:
-        arch, _ = parse_platform(platform)
-        runtimes = discover_runtimes(arch)
+    # Collect all (platform, runtime_name, FDWIC mode) tasks to run in
+    # parallel. Non-FDWIC tasks always receive an explicit private identity,
+    # so a shell-wide shared setting cannot leak into an unrelated builder.
+    tasks = _collect_runtime_build_tasks(platforms, fdwic_tensormap_modes)
 
-        if not runtimes:
-            logger.warning(f"  {platform}: no runtimes found, skipping")
-            continue
-
-        for runtime_name in runtimes:
-            tasks.append((platform, runtime_name))
-
-    def _build_runtime(platform: str, runtime_name: str) -> None:
+    def _build_runtime(platform: str, runtime_name: str, fdwic_tensormap_mode: str) -> None:
         try:
-            builder = RuntimeBuilder(platform=platform)
+            builder = RuntimeBuilder(platform=platform, fdwic_tensormap_mode=fdwic_tensormap_mode)
         except (ValueError, FileNotFoundError) as e:
             logger.warning(f"  {platform}: cannot initialize builder: {e}")
             return
 
-        logger.info(f"  Building {platform}/{runtime_name}...")
+        mode_suffix = f"/{fdwic_tensormap_mode}" if _is_a5_fdwic(platform, runtime_name) else ""
+        logger.info(f"  Building {platform}/{runtime_name}{mode_suffix}...")
         builder.get_binaries(runtime_name, build=True)
 
     with ThreadPoolExecutor(max_workers=len(tasks) or 1) as executor:
-        futures = {executor.submit(_build_runtime, p, r): (p, r) for p, r in tasks}
+        futures = {executor.submit(_build_runtime, p, r, m): (p, r, m) for p, r, m in tasks}
         for future in as_completed(futures):
-            platform, runtime_name = futures[future]
+            platform, runtime_name, fdwic_tensormap_mode = futures[future]
             try:
                 future.result()
             except Exception as e:
-                logger.error(f"  Failed to build {platform}/{runtime_name}: {e}")
+                mode_suffix = f"/{fdwic_tensormap_mode}" if _is_a5_fdwic(platform, runtime_name) else ""
+                logger.error(f"  Failed to build {platform}/{runtime_name}{mode_suffix}: {e}")
                 executor.shutdown(wait=True, cancel_futures=True)
                 raise
 
@@ -253,6 +314,18 @@ def main():
             "a2a3 host_runtime. Default/latest: use the current checkout HEAD."
         ),
     )
+    parser.add_argument(
+        "--fdwic-tensormap",
+        dest="fdwic_tensormap_modes",
+        action="append",
+        choices=_FDWIC_TENSORMAP_MODES,
+        default=None,
+        help=(
+            "FDWIC TensorMap baseline to pre-build (private or shared). "
+            "Repeat the option to build both. If omitted, build private. "
+            "The choice applies only to A5 fully_distributed_within_core."
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -279,6 +352,7 @@ def main():
         clone_protocol=args.clone_protocol,
         sanitizer=args.sanitizer,
         pto_isa_commit=args.pto_isa_commit,
+        fdwic_tensormap_modes=args.fdwic_tensormap_modes,
     )
 
 

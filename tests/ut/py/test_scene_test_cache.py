@@ -29,7 +29,7 @@ from types import SimpleNamespace
 import pytest
 from _task_interface import ArgDirection, ChipCallable  # pyright: ignore[reportMissingImports]
 
-from conftest import _configure_fdwic_profile
+from conftest import _configure_fdwic_profile, _configure_fdwic_tensormap
 
 # ``simpler_setup/__init__.py`` re-exports the ``scene_test`` *decorator*,
 # which shadows the submodule attribute when accessed via ``simpler_setup``.
@@ -45,10 +45,13 @@ from simpler_setup.scene_test import (
     _fdwic_build_identity_cache,
     _fdwic_compile_definitions,
     _fdwic_profile,
+    _fdwic_tensormap_compile_definitions,
+    _fdwic_tensormap_mode,
     _profiled_cache_key,
     _render_case_fdwic_submit_pmu,
     _run_swimlane_converter,
     _validate_case_fdwic_perf_clock,
+    _validate_fdwic_tensormap_test_classes,
     clear_compile_cache,
     maybe_build_aicore_override,
     run_class_cases,
@@ -81,8 +84,8 @@ def test_clear_compile_cache_drops_cached_chip_callables():
     _fdwic_build_identity_cache.clear()
     for i in range(3):
         _compile_cache[("t", "plat", f"rt{i}")] = _build_chip_callable(f"n{i}")
-    _aicore_override_cache[("t", "plat", "rt0", "none")] = Path("/tmp/fake-aicore.o")
-    _fdwic_build_identity_cache[("t", "plat", "rt0", "submit-pmu-none")] = object()
+    _aicore_override_cache[("t", "plat", "rt0", "private", "none")] = Path("/tmp/fake-aicore.o")
+    _fdwic_build_identity_cache[("t", "plat", "rt0", "private", "submit-pmu-none")] = object()
     assert len(_compile_cache) == 3
     assert len(_aicore_override_cache) == 1
     assert len(_fdwic_build_identity_cache) == 1
@@ -95,75 +98,95 @@ def test_clear_compile_cache_drops_cached_chip_callables():
 
 
 def test_fdwic_profile_partitions_compile_cache(monkeypatch):
-    """Normal and every private profile must use distinct AICore overrides."""
+    """TensorMap mode and every evidence profile must partition AICore images."""
     base = ("Case", "a5", "fully_distributed_within_core")
 
+    monkeypatch.delenv("PTO_FDWIC_TENSORMAP_MODE", raising=False)
     monkeypatch.delenv("PTO_FDWIC_PROFILE", raising=False)
     assert _fdwic_profile() == "none"
-    assert _profiled_cache_key(base) == (*base, "none")
+    assert _profiled_cache_key(base) == (*base, "private", "none")
 
     monkeypatch.setenv("PTO_FDWIC_PROFILE", "perf-clock")
     assert _fdwic_profile() == "perf-clock"
-    assert _profiled_cache_key(base) == (*base, "perf-clock")
+    assert _profiled_cache_key(base) == (*base, "private", "perf-clock")
 
     monkeypatch.setenv("PTO_FDWIC_PROFILE", "perf-clock-kernel")
     assert _fdwic_profile() == "perf-clock-kernel"
-    assert _profiled_cache_key(base) == (*base, "perf-clock-kernel")
+    assert _profiled_cache_key(base) == (*base, "private", "perf-clock-kernel")
 
     monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-none")
     assert _fdwic_profile() == "submit-pmu-none"
-    assert _profiled_cache_key(base) == (*base, "submit-pmu-none")
+    assert _profiled_cache_key(base) == (*base, "private", "submit-pmu-none")
 
     monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-arg-build")
     assert _fdwic_profile() == "submit-pmu-arg-build"
-    assert _profiled_cache_key(base) == (*base, "submit-pmu-arg-build")
+    assert _profiled_cache_key(base) == (*base, "private", "submit-pmu-arg-build")
 
     monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-empty-bracket")
     assert _fdwic_profile() == "submit-pmu-empty-bracket"
-    assert _profiled_cache_key(base) == (*base, "submit-pmu-empty-bracket")
+    assert _profiled_cache_key(base) == (*base, "private", "submit-pmu-empty-bracket")
 
     monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-materialize")
     assert _fdwic_profile() == "submit-pmu-materialize"
-    assert _profiled_cache_key(base) == (*base, "submit-pmu-materialize")
+    assert _profiled_cache_key(base) == (*base, "private", "submit-pmu-materialize")
 
     monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-claim")
     assert _fdwic_profile() == "submit-pmu-claim"
-    assert _profiled_cache_key(base) == (*base, "submit-pmu-claim")
+    assert _profiled_cache_key(base) == (*base, "private", "submit-pmu-claim")
 
     monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-register")
     assert _fdwic_profile() == "submit-pmu-register"
-    assert _profiled_cache_key(base) == (*base, "submit-pmu-register")
+    assert _profiled_cache_key(base) == (*base, "private", "submit-pmu-register")
 
     monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-submit-transition")
     assert _fdwic_profile() == "submit-pmu-submit-transition"
-    assert _profiled_cache_key(base) == (*base, "submit-pmu-submit-transition")
+    assert _profiled_cache_key(base) == (*base, "private", "submit-pmu-submit-transition")
 
     monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-efdrain-control")
     assert _fdwic_profile() == "submit-pmu-efdrain-control"
-    assert _profiled_cache_key(base) == (*base, "submit-pmu-efdrain-control")
+    assert _profiled_cache_key(base) == (*base, "private", "submit-pmu-efdrain-control")
 
     monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-prepare-map")
     assert _fdwic_profile() == "submit-pmu-prepare-map"
-    assert _profiled_cache_key(base) == (*base, "submit-pmu-prepare-map")
+    assert _profiled_cache_key(base) == (*base, "private", "submit-pmu-prepare-map")
 
     monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-fanin")
     assert _fdwic_profile() == "submit-pmu-fanin"
-    assert _profiled_cache_key(base) == (*base, "submit-pmu-fanin")
+    assert _profiled_cache_key(base) == (*base, "private", "submit-pmu-fanin")
 
     monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-winner-build-control")
     assert _fdwic_profile() == "submit-pmu-winner-build-control"
-    assert _profiled_cache_key(base) == (*base, "submit-pmu-winner-build-control")
+    assert _profiled_cache_key(base) == (*base, "private", "submit-pmu-winner-build-control")
 
     monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-alloc-complete-control")
     assert _fdwic_profile() == "submit-pmu-alloc-complete-control"
-    assert _profiled_cache_key(base) == (*base, "submit-pmu-alloc-complete-control")
+    assert _profiled_cache_key(base) == (*base, "private", "submit-pmu-alloc-complete-control")
 
     monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-loser-replay")
     assert _fdwic_profile() == "submit-pmu-loser-replay"
-    assert _profiled_cache_key(base) == (*base, "submit-pmu-loser-replay")
+    assert _profiled_cache_key(base) == (*base, "private", "submit-pmu-loser-replay")
+
+    monkeypatch.setenv("PTO_FDWIC_TENSORMAP_MODE", "shared")
+    assert _profiled_cache_key(base) == (*base, "shared", "submit-pmu-loser-replay")
 
 
-def test_fdwic_private_profiles_have_isolated_compile_definitions():
+def test_fdwic_tensormap_mode_and_compile_definition_contract(monkeypatch):
+    monkeypatch.delenv("PTO_FDWIC_TENSORMAP_MODE", raising=False)
+    assert _fdwic_tensormap_mode() == "private"
+    assert _fdwic_tensormap_compile_definitions("a5", "fully_distributed_within_core") == ["PTO_FDWIC_SHARED_MAP=0"]
+
+    monkeypatch.setenv("PTO_FDWIC_TENSORMAP_MODE", "shared")
+    assert _fdwic_tensormap_mode() == "shared"
+    assert _fdwic_tensormap_compile_definitions("a5sim", "fully_distributed_within_core") == ["PTO_FDWIC_SHARED_MAP=1"]
+    with pytest.raises(ValueError, match="only supported"):
+        _fdwic_tensormap_compile_definitions("a5", "host_build_graph")
+
+    monkeypatch.setenv("PTO_FDWIC_TENSORMAP_MODE", "typo")
+    with pytest.raises(ValueError, match="Unsupported PTO_FDWIC_TENSORMAP_MODE"):
+        _fdwic_tensormap_mode()
+
+
+def test_fdwic_evidence_profiles_have_isolated_compile_definitions():
     assert _fdwic_compile_definitions("none") is None
     assert _fdwic_compile_definitions("perf-clock") == [
         "PTO_FDWIC_PERF_CLOCK=1",
@@ -299,11 +322,13 @@ def test_submit_pmu_override_registers_build_identity_after_elf_gate(
 ):
     """The profiled cache key must own one identity frozen from the built files."""
     runtime = "fully_distributed_within_core"
-    profiled_key = ("QualifiedCase", "a5", runtime, profile)
+    profiled_key = ("QualifiedCase", "a5", runtime, "private", profile)
     orch = tmp_path / "orch.cpp"
     orch.write_text("// orchestration\n")
     host = tmp_path / "libhost_runtime.so"
     host.write_bytes(b"host")
+    aicpu = tmp_path / "libaicpu_kernel.so"
+    aicpu.write_bytes(b"aicpu")
     order = []
     captured = {}
     identity = object()
@@ -312,8 +337,9 @@ def test_submit_pmu_override_registers_build_identity_after_elf_gate(
         _CACHE_DIR = tmp_path / "build" / "cache"
         _LIB_DIR = tmp_path / "build" / "lib"
 
-        def __init__(self, platform):
+        def __init__(self, platform, fdwic_tensormap_mode=None):
             assert platform == "a5"
+            assert fdwic_tensormap_mode == "private"
 
         def build_aicore_with_extra_sources(
             self,
@@ -326,14 +352,21 @@ def test_submit_pmu_override_registers_build_identity_after_elf_gate(
             assert name == runtime
             assert extra_sources == [orch.resolve()]
             order.append("build")
-            binary = self._LIB_DIR / "a5" / "onboard" / runtime / "aicore-extra" / cache_key / "aicore_kernel.o"
+            binary = (
+                self._LIB_DIR / "a5" / "onboard" / runtime / "private" / "aicore-extra" / cache_key / "aicore_kernel.o"
+            )
             binary.parent.mkdir(parents=True)
             binary.write_bytes(b"aicore")
             return binary
 
+        @staticmethod
+        def effective_compile_definitions(name, compile_definitions=None):
+            assert name == runtime
+            return ["PTO_FDWIC_SHARED_MAP=0", *(compile_definitions or [])]
+
         def get_binaries(self, name):
             assert name == runtime
-            return SimpleNamespace(host_path=host)
+            return SimpleNamespace(host_path=host, aicpu_path=aicpu)
 
     def fake_elf_gate(binary, selected_profile):
         assert binary.is_file()
@@ -352,6 +385,7 @@ def test_submit_pmu_override_registers_build_identity_after_elf_gate(
 
     runtime_builder_module = importlib.import_module("simpler_setup.runtime_builder")
     report_module = importlib.import_module("simpler_setup.tools.fdwic_submit_pmu_report")
+    monkeypatch.delenv("PTO_FDWIC_TENSORMAP_MODE", raising=False)
     monkeypatch.setenv("PTO_FDWIC_PROFILE", profile)
     monkeypatch.setattr(runtime_builder_module, "RuntimeBuilder", FakeRuntimeBuilder)
     monkeypatch.setattr(_scene_test_module, "_assert_fdwic_submit_pmu_elf", fake_elf_gate)
@@ -363,17 +397,18 @@ def test_submit_pmu_override_registers_build_identity_after_elf_gate(
 
     extra_key = binary.parent.name
     expected_build_dir = (
-        FakeRuntimeBuilder._CACHE_DIR / "a5" / "onboard" / runtime / "aicore-extra" / extra_key / "aicore"
+        FakeRuntimeBuilder._CACHE_DIR / "a5" / "onboard" / runtime / "private" / "aicore-extra" / extra_key / "aicore"
     )
     assert order == ["build", "elf-gate", "host-elf-gate", "capture"]
     assert captured == {
         "profile": profile,
         "profiled_cache_key": profiled_key,
         "aicore_extra_cache_key": extra_key,
-        "compile_definitions": expected_compile_definitions,
+        "compile_definitions": ["PTO_FDWIC_SHARED_MAP=0", *expected_compile_definitions],
         "aicore_kernel": binary,
         "aicore_build_dir": expected_build_dir,
         "host_runtime": host,
+        "aicpu_runtime": aicpu,
     }
     assert _fdwic_build_identity_cache == {profiled_key: identity}
     _fdwic_build_identity_cache.clear()
@@ -411,6 +446,7 @@ def test_submit_pmu_run_rejects_missing_build_identity_before_case(monkeypatch):
         def _run_and_validate(cls, *args, **kwargs):
             cls.called = True
 
+    monkeypatch.delenv("PTO_FDWIC_TENSORMAP_MODE", raising=False)
     monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-none")
     _fdwic_build_identity_cache.clear()
     worker = SimpleNamespace(_config={"platform": "a5", "device_id": 0})
@@ -444,17 +480,16 @@ def test_submit_pmu_run_resolves_profiled_identity_for_render(monkeypatch, tmp_p
             return None
 
     profile = "submit-pmu-none"
-    key = (IdentityCase.__qualname__, "a5", IdentityCase._st_runtime, profile)
+    key = (IdentityCase.__qualname__, "a5", IdentityCase._st_runtime, "private", profile)
     identity = object()
     rendered = []
+    monkeypatch.delenv("PTO_FDWIC_TENSORMAP_MODE", raising=False)
     monkeypatch.setenv("PTO_FDWIC_PROFILE", profile)
     monkeypatch.setattr(_scene_test_module, "_build_output_prefix", lambda _label: tmp_path)
     monkeypatch.setattr(
         _scene_test_module,
         "_render_case_fdwic_submit_pmu",
-        lambda case_label, output_prefix, build_identity: rendered.append(
-            (case_label, output_prefix, build_identity)
-        ),
+        lambda case_label, output_prefix, build_identity: rendered.append((case_label, output_prefix, build_identity)),
     )
     _fdwic_build_identity_cache.clear()
     _fdwic_build_identity_cache[key] = identity
@@ -965,19 +1000,19 @@ def test_swimlane_elf_gate_accepts_merged_phase_atomic_observer(monkeypatch, tmp
             "1: 0 1 FUNC LOCAL DEFAULT 1 fdwic_atomic_poll_boundary_slow\n"
             "2: 0 1 FUNC LOCAL DEFAULT 1 fdwic_swimlane_detail_record_atomic\n"
             "3: 0 1 FUNC WEAK DEFAULT 1 dist_perf_clock_expect_submits\n",
-            "private-profile symbol.*leaked",
+            "isolated-profile symbol.*leaked",
         ),
         (
             "1: 0 1 FUNC LOCAL DEFAULT 1 fdwic_atomic_poll_boundary_slow\n"
             "2: 0 1 FUNC LOCAL DEFAULT 1 fdwic_swimlane_detail_record_atomic\n"
             "3: 0 1 FUNC WEAK DEFAULT 1 dist_submit_pmu_expect_submits\n",
-            "private-profile symbol.*leaked",
+            "isolated-profile symbol.*leaked",
         ),
         (
             "1: 0 1 FUNC LOCAL DEFAULT 1 fdwic_atomic_poll_boundary_slow\n"
             "2: 0 1 FUNC LOCAL DEFAULT 1 fdwic_swimlane_detail_record_atomic\n"
             "3: 0 1 FUNC WEAK DEFAULT 1 get_fdwic_submit_pmu_reg_base\n",
-            "private-profile symbol.*leaked",
+            "isolated-profile symbol.*leaked",
         ),
     ],
 )
@@ -995,6 +1030,7 @@ def test_swimlane_elf_gate_rejects_wrong_image(monkeypatch, tmp_path, symbol_tab
 class _FakePytestConfig:
     def __init__(self, **options):
         self.options = {
+            "--fdwic-tensormap": "private",
             "--fdwic-profile": "submit-pmu-none",
             "--platform": "a5",
             "--runtime": "fully_distributed_within_core",
@@ -1033,6 +1069,46 @@ def test_perf_clock_kernel_profile_publishes_environment(monkeypatch):
     _configure_fdwic_profile(_FakePytestConfig(**{"--fdwic-profile": "perf-clock-kernel"}))
 
     assert _fdwic_profile() == "perf-clock-kernel"
+
+
+def test_shared_tensormap_mode_publishes_environment(monkeypatch):
+    monkeypatch.delenv("PTO_FDWIC_TENSORMAP_MODE", raising=False)
+
+    _configure_fdwic_tensormap(_FakePytestConfig(**{"--fdwic-tensormap": "shared"}))
+
+    assert _fdwic_tensormap_mode() == "shared"
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"--platform": "a2a3sim"}, "requires --platform a5 or a5sim"),
+        ({"--runtime": "host_build_graph"}, "only supports runtime fully_distributed_within_core"),
+        ({"--level": 3}, "only supports SceneTest level 2"),
+    ],
+)
+def test_shared_tensormap_mode_rejects_wrong_execution_scope(options, message):
+    with pytest.raises(pytest.UsageError, match=message):
+        _configure_fdwic_tensormap(_FakePytestConfig(**{"--fdwic-tensormap": "shared", **options}))
+
+
+def test_standalone_shared_tensormap_rejects_mixed_runtime_or_l3_classes():
+    fdwic_l2 = type(
+        "FdwicL2",
+        (),
+        {"_st_level": 2, "_st_runtime": "fully_distributed_within_core"},
+    )
+    fdwic_l3 = type(
+        "FdwicL3",
+        (),
+        {"_st_level": 3, "_st_runtime": "fully_distributed_within_core"},
+    )
+    other_l2 = type("OtherL2", (), {"_st_level": 2, "_st_runtime": "host_build_graph"})
+
+    _validate_fdwic_tensormap_test_classes("private", [fdwic_l3, other_l2])
+    _validate_fdwic_tensormap_test_classes("shared", [fdwic_l2])
+    with pytest.raises(ValueError, match=r"FdwicL3, OtherL2"):
+        _validate_fdwic_tensormap_test_classes("shared", [fdwic_l2, other_l2, fdwic_l3])
 
 
 @pytest.mark.parametrize(

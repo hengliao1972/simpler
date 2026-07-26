@@ -38,6 +38,7 @@
 #include "common/core_type.h"
 #include "dist_engine/common/swimlane_types.h"
 #include "common/platform_config.h"
+#include "fdwic_build_identity.h"
 #include "pto2_dispatch_payload.h"
 #include "pto_types.h"
 #include "task_args.h"
@@ -203,6 +204,15 @@ struct Task {
  */
 class Runtime {
 public:
+    // Stable three-image ABI/control prefix. The identity must remain first;
+    // workers, worker_count and the AICPU launch fields through
+    // aicpu_launch_count must keep the same order and layout in every
+    // private/shared image. AICore must finish the common handshake even when
+    // the identity mismatches, otherwise AICPU cannot issue DIST_ABORT/EXIT.
+    // Mode-dependent state therefore belongs after this common prefix (the
+    // shared TensorMap itself lives behind dist.shared_addr).
+    FdwicBuildIdentity fdwic_build_identity;
+
     // Handshake buffers for AICPU-AICore communication
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
     int worker_count;                       // Number of active workers

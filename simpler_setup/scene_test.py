@@ -46,6 +46,10 @@ _compile_cache: dict[tuple[Any, ...], object] = {}
 _aicore_override_cache: dict[tuple[Any, ...], Path] = {}
 _fdwic_build_identity_cache: dict[tuple[Any, ...], SubmitPmuBuildIdentity] = {}
 
+_FDWIC_TENSORMAP_MODE_ENV = "PTO_FDWIC_TENSORMAP_MODE"
+_FDWIC_TENSORMAP_PRIVATE = "private"
+_FDWIC_TENSORMAP_SHARED = "shared"
+_FDWIC_TENSORMAP_MODES = frozenset({_FDWIC_TENSORMAP_PRIVATE, _FDWIC_TENSORMAP_SHARED})
 _FDWIC_PROFILE_ENV = "PTO_FDWIC_PROFILE"
 _FDWIC_PROFILE_NONE = "none"
 _FDWIC_PROFILE_PERF_CLOCK = "perf-clock"
@@ -88,8 +92,45 @@ _FDWIC_SUBMIT_PMU_PHASE_PROFILES = frozenset(
 )
 _FDWIC_SUBMIT_PMU_PROFILES = frozenset({_FDWIC_PROFILE_SUBMIT_PMU_NONE, *_FDWIC_SUBMIT_PMU_PHASE_PROFILES})
 _FDWIC_PERF_CLOCK_PROFILES = frozenset(_FDWIC_PERF_CLOCK_ARTIFACTS)
-_FDWIC_PRIVATE_PROFILES = frozenset({*_FDWIC_PERF_CLOCK_PROFILES, *_FDWIC_SUBMIT_PMU_PROFILES})
-_FDWIC_PROFILES = frozenset({_FDWIC_PROFILE_NONE, *_FDWIC_PRIVATE_PROFILES})
+_FDWIC_ISOLATED_PROFILES = frozenset({*_FDWIC_PERF_CLOCK_PROFILES, *_FDWIC_SUBMIT_PMU_PROFILES})
+_FDWIC_PROFILES = frozenset({_FDWIC_PROFILE_NONE, *_FDWIC_ISOLATED_PROFILES})
+
+
+def _fdwic_tensormap_mode() -> str:
+    mode = os.environ.get(_FDWIC_TENSORMAP_MODE_ENV, _FDWIC_TENSORMAP_PRIVATE) or _FDWIC_TENSORMAP_PRIVATE
+    if mode not in _FDWIC_TENSORMAP_MODES:
+        raise ValueError(f"Unsupported {_FDWIC_TENSORMAP_MODE_ENV}={mode!r}")
+    return mode
+
+
+def _validate_fdwic_tensormap_test_classes(mode: str, classes) -> None:
+    """Keep standalone shared selection on the same L2 FDWIC scope as pytest."""
+    if mode != _FDWIC_TENSORMAP_SHARED:
+        return
+    incompatible = sorted(
+        cls.__name__
+        for cls in classes
+        if getattr(cls, "_st_level", None) != 2 or getattr(cls, "_st_runtime", None) != "fully_distributed_within_core"
+    )
+    if incompatible:
+        raise ValueError(
+            "--fdwic-tensormap shared only accepts level-2 "
+            "fully_distributed_within_core tests; incompatible class(es): " + ", ".join(incompatible)
+        )
+
+
+def _fdwic_tensormap_compile_definitions(platform: str, runtime: str) -> list[str] | None:
+    """Return the explicit FDWIC mode macro for a mode-aware translation unit."""
+    mode = _fdwic_tensormap_mode()
+    is_fdwic = platform in {"a5", "a5sim"} and runtime == "fully_distributed_within_core"
+    if mode == _FDWIC_TENSORMAP_SHARED and not is_fdwic:
+        raise ValueError(
+            f"{_FDWIC_TENSORMAP_MODE_ENV}=shared is only supported by "
+            "the a5/a5sim fully_distributed_within_core runtime"
+        )
+    if not is_fdwic:
+        return None
+    return [f"PTO_FDWIC_SHARED_MAP={1 if mode == _FDWIC_TENSORMAP_SHARED else 0}"]
 
 
 def _fdwic_profile() -> str:
@@ -188,7 +229,7 @@ def _fdwic_compile_definitions(profile: str) -> list[str] | None:
 
 def _profiled_cache_key(cache_key) -> tuple[Any, ...]:
     base = cache_key if isinstance(cache_key, tuple) else (cache_key,)
-    return (*base, _fdwic_profile())
+    return (*base, _fdwic_tensormap_mode(), _fdwic_profile())
 
 
 def clear_compile_cache() -> None:
@@ -439,7 +480,7 @@ def _assert_fdwic_swimlane_elf(binary: Path) -> None:
         if missing:
             details.append(f"missing defined swimlane observer(s): {', '.join(missing)}")
         if present:
-            details.append(f"private-profile symbol(s) leaked into normal image: {', '.join(present)}")
+            details.append(f"isolated-profile symbol(s) leaked into normal image: {', '.join(present)}")
         raise RuntimeError(f"Invalid FDWIC swimlane AICore image {binary}: {'; '.join(details)}")
 
 
@@ -452,7 +493,7 @@ def maybe_build_aicore_override(
     pto_isa_root: str | None = None,
 ) -> Path | None:
     profile = _fdwic_profile()
-    if profile in _FDWIC_PRIVATE_PROFILES and (platform != "a5" or runtime != "fully_distributed_within_core"):
+    if profile in _FDWIC_ISOLATED_PROFILES and (platform != "a5" or runtime != "fully_distributed_within_core"):
         raise ValueError(f"{profile} is only supported by the real a5 fully_distributed_within_core runtime")
     if platform not in {"a5", "a5sim"} or runtime != "fully_distributed_within_core":
         return None
@@ -468,10 +509,11 @@ def maybe_build_aicore_override(
             source_paths.append(wrapper_path)
     key = _aicore_extra_cache_key(cache_key, source_paths)
     # Keep PTO2_PROFILING at its normal value because it also owns the public
-    # Arg layout. Each private profile independently removes the dist
+    # Arg layout. Each isolated evidence profile independently removes the dist
     # swimlane/atomic path without changing orchestration/incore ABI.
     compile_definitions = _fdwic_compile_definitions(profile)
-    builder = RuntimeBuilder(platform)
+    tensormap_mode = _fdwic_tensormap_mode()
+    builder = RuntimeBuilder(platform, fdwic_tensormap_mode=tensormap_mode)
     binary = builder.build_aicore_with_extra_sources(
         runtime,
         source_paths,
@@ -485,7 +527,9 @@ def maybe_build_aicore_override(
         _assert_fdwic_submit_pmu_elf(binary, profile)
         from .tools.fdwic_submit_pmu_report import capture_build_identity  # noqa: PLC0415
 
-        host_runtime = builder.get_binaries(runtime).host_path
+        baseline_binaries = builder.get_binaries(runtime)
+        host_runtime = baseline_binaries.host_path
+        aicpu_runtime = baseline_binaries.aicpu_path
         _assert_fdwic_submit_pmu_host_elf(host_runtime, profile)
         output_key_dir = Path(binary).resolve().parent
         aicore_build_dir = builder._CACHE_DIR / output_key_dir.relative_to(builder._LIB_DIR) / "aicore"
@@ -493,10 +537,11 @@ def maybe_build_aicore_override(
             profile=profile,
             profiled_cache_key=cache_key,
             aicore_extra_cache_key=key,
-            compile_definitions=compile_definitions or (),
+            compile_definitions=builder.effective_compile_definitions(runtime, compile_definitions),
             aicore_kernel=binary,
             aicore_build_dir=aicore_build_dir,
             host_runtime=host_runtime,
+            aicpu_runtime=aicpu_runtime,
         )
     elif platform == "a5" and runtime == "fully_distributed_within_core":
         _assert_fdwic_swimlane_elf(binary)
@@ -1354,9 +1399,7 @@ def _plot_case_scope_stats(case_label: str, output_prefix: Path) -> None:
         sys.path.remove(str(tools_dir))
 
 
-def _render_case_fdwic_submit_pmu(
-    case_label: str, output_prefix: Path, build_identity: SubmitPmuBuildIdentity
-) -> Path:
+def _render_case_fdwic_submit_pmu(case_label: str, output_prefix: Path, build_identity: SubmitPmuBuildIdentity) -> Path:
     """Strictly validate the real-PA Submit-PMU raw and publish its HTML."""
     from .tools.fdwic_submit_pmu_report import (  # noqa: PLC0415
         DEFAULT_INPUT_NAME,
@@ -1580,7 +1623,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     cls_name = type(cls_inst).__name__
     callable_spec = getattr(type(cls_inst), "CALLABLE", None)
     fdwic_profile = _fdwic_profile()
-    private_profile_on = fdwic_profile in _FDWIC_PRIVATE_PROFILES
+    isolated_profile_on = fdwic_profile in _FDWIC_ISOLATED_PROFILES
     submit_pmu_build_identity = None
     if fdwic_profile in _FDWIC_SUBMIT_PMU_PROFILES:
         platform = worker._config.get("platform")
@@ -1598,7 +1641,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
         or enable_pmu
         or enable_dep_gen
         or enable_scope_stats
-        or private_profile_on
+        or isolated_profile_on
     )
     # device-log timing wraps each case here (not inside _run_and_validate*),
     # the same way swimlane conversion does — _run_and_validate_l2 is overridden
@@ -1709,7 +1752,11 @@ def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
     kc = KernelCompiler(platform=platform)
     is_sim = platform.endswith("sim")
 
-    orch_binary = kc.compile_orchestration(runtime, orch["source"])
+    orch_binary = kc.compile_orchestration(
+        runtime,
+        orch["source"],
+        compile_definitions=_fdwic_tensormap_compile_definitions(platform, runtime),
+    )
     inc_dirs = kc.get_orchestration_include_dirs(runtime)
 
     kernel_binaries = []
@@ -1825,7 +1872,7 @@ class SceneTestCase:
         cache_key = (cls.__qualname__, platform, cls._st_runtime)
         cls.compile_chip_callable(platform)
         aicore_override = get_aicore_path_override(cache_key)
-        kwargs = {}
+        kwargs = {"fdwic_tensormap_mode": _fdwic_tensormap_mode()}
         if aicore_override is not None:
             kwargs["aicore_path_override"] = aicore_override
         w = Worker(level=2, device_id=device_id, platform=platform, runtime=cls._st_runtime, **kwargs)
@@ -2279,6 +2326,13 @@ class SceneTestCase:
         parser = argparse.ArgumentParser()
         parser.add_argument("-p", "--platform", required=True)
         parser.add_argument(
+            "--fdwic-tensormap",
+            choices=["private", "shared"],
+            default="private",
+            help="Select the compile-time TensorMap artifact family for the "
+            "a5/a5sim fully_distributed_within_core runtime.",
+        )
+        parser.add_argument(
             "-d",
             "--device",
             type=str,
@@ -2412,6 +2466,12 @@ class SceneTestCase:
         )
         args = parser.parse_args()
         configure_logging(args.log_level)
+        if args.fdwic_tensormap == "shared":
+            if args.platform not in {"a5", "a5sim"}:
+                parser.error("--fdwic-tensormap shared requires -p a5 or a5sim")
+            os.environ[_FDWIC_TENSORMAP_MODE_ENV] = _FDWIC_TENSORMAP_SHARED
+        else:
+            os.environ.pop(_FDWIC_TENSORMAP_MODE_ENV, None)
 
         # Match the per-test kernel/orchestration compile to the runtime's
         # sanitizer, and require the runtime preloaded — same as conftest, since
@@ -2510,6 +2570,12 @@ class SceneTestCase:
         selected_by_cls: dict[type, list[dict]] = {}
         for cls, case in selected:
             selected_by_cls.setdefault(cls, []).append(case)
+
+        try:
+            _validate_fdwic_tensormap_test_classes(args.fdwic_tensormap, selected_by_cls)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(2)
 
         # L3 profiling not supported yet (multi-chip-process filename collision).
         # Mirror the pytest-side guard so standalone users get the same early-fail.
@@ -2611,6 +2677,8 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
     script = os.path.abspath(getattr(module, "__file__", sys.argv[0]))
 
     common = ["-p", args.platform, "--manual", args.manual, "--log-level", args.log_level]
+    if args.fdwic_tensormap != "private":
+        common += ["--fdwic-tensormap", args.fdwic_tensormap]
     if args.sanitizer != "none":
         common += ["--sanitizer", args.sanitizer]
     if args.rounds != 1:

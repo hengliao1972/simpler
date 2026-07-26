@@ -9,6 +9,7 @@
 import importlib.util
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,8 @@ from .toolchain import (
 )
 
 logger = logging.getLogger(__name__)
+
+_COMPILE_DEFINITION_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class KernelCompiler:
@@ -388,6 +391,7 @@ class KernelCompiler:
         source_path: str,
         extra_include_dirs: Optional[list[str]] = None,
         build_dir: Optional[str] = None,
+        compile_definitions: Optional[list[str]] = None,
     ) -> bytes:
         """Compile an orchestration function for the given runtime.
 
@@ -400,6 +404,9 @@ class KernelCompiler:
             source_path: Path to orchestration source file (.cpp)
             extra_include_dirs: Additional include directories (merged with
                                the runtime/platform include dirs)
+            build_dir: Optional directory for the compiler output
+            compile_definitions: Optional preprocessor definitions. Each item
+                                 is forwarded as one ``-D<definition>`` argument.
 
         Returns:
             Binary contents of the compiled orchestration .so file
@@ -443,7 +450,27 @@ class KernelCompiler:
             extra_include_dirs=include_dirs,
             extra_sources=orch_sources or None,
             build_dir=build_dir,
+            compile_definitions=compile_definitions,
         )
+
+    @staticmethod
+    def _compile_definition_flags(compile_definitions: Optional[list[str]]) -> list[str]:
+        """Validate per-callable macros and return direct compiler arguments."""
+        if compile_definitions is None:
+            return []
+
+        flags: list[str] = []
+        for definition in compile_definitions:
+            if not isinstance(definition, str) or not definition or definition != definition.strip():
+                raise ValueError("compile definitions must be non-empty strings without surrounding whitespace")
+            if "\0" in definition:
+                raise ValueError(f"invalid compile definition: {definition!r}")
+
+            name = definition.split("=", 1)[0]
+            if not _COMPILE_DEFINITION_NAME_RE.fullmatch(name):
+                raise ValueError(f"invalid compile definition name: {name!r}")
+            flags.append(f"-D{definition}")
+        return flags
 
     def _compile_orchestration_shared_lib(
         self,
@@ -452,6 +479,7 @@ class KernelCompiler:
         extra_include_dirs: Optional[list[str]] = None,
         extra_sources: Optional[list[str]] = None,
         build_dir: Optional[str] = None,
+        compile_definitions: Optional[list[str]] = None,
     ) -> bytes:
         """Compile an orchestration function to a shared library (.so).
 
@@ -462,6 +490,9 @@ class KernelCompiler:
             toolchain: Resolved toolchain object (GxxToolchain or Aarch64GxxToolchain)
             extra_include_dirs: Additional include directories
             extra_sources: Additional source files to compile into the SO
+            build_dir: Optional directory for the compiler output
+            compile_definitions: Optional preprocessor definitions. Each item
+                                 is forwarded as one ``-D<definition>`` argument.
 
         Returns:
             Binary contents of the compiled .so file
@@ -477,6 +508,7 @@ class KernelCompiler:
 
         cmd = [toolchain.cxx_path] + toolchain.get_compile_flags()
         cmd += self._sanitizer_flags(toolchain)
+        cmd += self._compile_definition_flags(compile_definitions)
 
         # Force a deterministic ELF GNU Build-ID into every orchestration .so.
         # The host-side DeviceRunner reads `.note.gnu.build-id` to detect when

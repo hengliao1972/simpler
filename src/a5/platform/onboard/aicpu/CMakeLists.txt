@@ -84,6 +84,13 @@ target_compile_options(aicpu_kernel
         $<$<COMPILE_LANGUAGE:C>:-std=gnu11>
 )
 
+# Runtime ABI feature gates belong only to the runtime-bearing inner AICPU
+# image.  The dispatcher is process-global and deliberately remains mode
+# neutral.
+if(DEFINED CUSTOM_COMPILE_DEFINITIONS)
+    target_compile_definitions(aicpu_kernel PRIVATE ${CUSTOM_COMPILE_DEFINITIONS})
+endif()
+
 target_include_directories(aicpu_kernel
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}

@@ -459,6 +459,33 @@ target_include_directories(test_fdwic_tensor_map_retire BEFORE PRIVATE
 )
 set_tests_properties(test_fdwic_tensor_map_retire PROPERTIES LABELS "no_hardware")
 
+# Stable Host/AICPU/AICore identity is compiled in both artifact modes.  The
+# shared target intentionally verifies that the first-stage backend remains
+# fail-closed while its ABI identity is still well-formed.
+function(add_fdwic_build_identity_test name shared_map)
+    add_executable(${name} a5/test_fdwic_build_identity.cpp)
+    target_compile_definitions(${name} PRIVATE PTO_FDWIC_SHARED_MAP=${shared_map})
+    target_include_directories(${name} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+        ${CMAKE_SOURCE_DIR}/../../../src/common
+    )
+    target_link_libraries(${name} PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
+endfunction()
+
+add_fdwic_build_identity_test(test_fdwic_build_identity_private 0)
+add_fdwic_build_identity_test(test_fdwic_build_identity_shared 1)
+
 # A5 trb runtime UTs — mirror of a2a3 trb runtime UTs, link against a5_rt_objs.
 # Target names carry the a5_ prefix because hierarchical/test_tensormap (and
 # the unprefixed a2a3 runtime targets test_scheduler_state / test_ready_queue

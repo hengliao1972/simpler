@@ -18,6 +18,7 @@
 #include "common/pmu_profiling.h"
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
+#include "dist_engine/aicore/primitive.h"
 
 PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int core_idx, int core_type_int);
 
@@ -70,6 +71,14 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2Di
  * @param core_type Core type (AIC or AIV)
  */
 __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int s_block_idx, CoreType core_type) {
+    // The identity line is the stable Runtime prefix shared by all three
+    // images. Read it before interpreting mode-dependent state, but keep the
+    // existing handshake alive even on mismatch so AICPU can issue DIST_ABORT
+    // and complete teardown without a device hang.
+    dcci(&runtime->fdwic_build_identity, SINGLE_CACHE_LINE);
+    const bool fdwic_build_identity_ok =
+        fdwic_build_identity_matches(runtime->fdwic_build_identity, static_cast<uint32_t>(sizeof(Runtime)));
+
     __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->workers[s_block_idx]);
 
     // Phase 1: Wait for AICPU initialization signal
@@ -104,13 +113,33 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // task claim/build/execute, and completion flag publication internally;
     // there is no per-task register handshake.
     // ===========================================================================
-    while (my_hank->aicpu_ready != AICPU_READY_DIST_RUN &&
-           my_hank->aicpu_ready != AICPU_READY_DIST_ABORT) {
+    while (my_hank->aicpu_ready != AICPU_READY_DIST_RUN && my_hank->aicpu_ready != AICPU_READY_DIST_ABORT) {
         dcci(my_hank, SINGLE_CACHE_LINE);
         SPIN_WAIT_HINT();
     }
     if (my_hank->aicpu_ready == AICPU_READY_DIST_RUN) {
-        dist_core_main(runtime, s_block_idx, static_cast<int>(core_type));
+        if (fdwic_build_identity_ok && kFdwicCompiledBackendReady) {
+            dist_core_main(runtime, s_block_idx, static_cast<int>(core_type));
+        } else {
+            // All workers make the same image-level decision, so one elected
+            // core publishes the global error. This avoids a 96-core RMW race
+            // on the identity line. The cold-path flush includes a completion
+            // barrier; block 0 publishes FIN only after the error is visible,
+            // and AICPU waits for every worker's FIN before reading it.
+            if (s_block_idx == 0) {
+#if defined(__CCE_AICORE__)
+                runtime->fdwic_build_identity.error_bits =
+                    runtime->fdwic_build_identity.error_bits | FdwicBuildErrorAicoreMismatch;
+#else
+                __atomic_fetch_or(
+                    &runtime->fdwic_build_identity.error_bits, static_cast<uint32_t>(FdwicBuildErrorAicoreMismatch),
+                    __ATOMIC_RELEASE
+                );
+#endif
+                dist_aicore_flush_region(&runtime->fdwic_build_identity, sizeof(runtime->fdwic_build_identity));
+            }
+            write_reg(RegId::COND, MAKE_FIN_VALUE(0));
+        }
     }
     // Teardown: wait for the AICPU EXIT signal on DATA_MAIN_BASE and ack.
     while (true) {

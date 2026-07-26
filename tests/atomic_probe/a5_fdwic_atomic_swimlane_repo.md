@@ -476,28 +476,48 @@ from simpler_setup.runtime_builder import RuntimeBuilder
 
 runtime = "fully_distributed_within_core"
 for platform in ("a5sim", "a5"):
-    print(f"building {platform}/{runtime}")
-    binaries = RuntimeBuilder(platform).get_binaries(runtime, build=True)
+    print(f"building {platform}/{runtime}/private")
+    binaries = RuntimeBuilder(
+        platform,
+        fdwic_tensormap_mode="private",
+    ).get_binaries(runtime, build=True)
     print(binaries)
 PY
+~~~
+
+`private` 是默认和当前生产行为。若只验证 shared artifact family 的
+构建/ABI 隔离，可把参数改成 `shared`；在 shared backend 真正接入之前，
+该模式会在 0 次 Submit 前明确退出，不能作为业务用例成功运行。
+
+安装期预构建入口也支持显式选择，而且默认固定为 private，不读取 shell
+中的 `PTO_FDWIC_TENSORMAP_MODE`：
+
+~~~bash
+python simpler_setup/build_runtimes.py --platforms a5sim a5 \
+    --fdwic-tensormap private
+
+# 需要同时准备两个彼此隔离的 artifact family 时重复该参数。
+python simpler_setup/build_runtimes.py --platforms a5sim a5 \
+    --fdwic-tensormap private \
+    --fdwic-tensormap shared
 ~~~
 
 验证目标产物：
 
 ~~~bash
 test -f \
-    build/lib/a5/sim/fully_distributed_within_core/libhost_runtime.so
+    build/lib/a5/sim/fully_distributed_within_core/private/libhost_runtime.so
 test -f \
-    build/lib/a5/sim/fully_distributed_within_core/libaicpu_kernel.so
+    build/lib/a5/sim/fully_distributed_within_core/private/libaicpu_kernel.so
 test -f \
-    build/lib/a5/sim/fully_distributed_within_core/libaicore_kernel.so
+    build/lib/a5/sim/fully_distributed_within_core/private/libaicore_kernel.so
 
 test -f \
-    build/lib/a5/onboard/fully_distributed_within_core/libhost_runtime.so
+    build/lib/a5/onboard/fully_distributed_within_core/private/libhost_runtime.so
 test -f \
-    build/lib/a5/onboard/fully_distributed_within_core/libaicpu_kernel.so
+    build/lib/a5/onboard/fully_distributed_within_core/private/libaicpu_kernel.so
 test -f \
-    build/lib/a5/onboard/fully_distributed_within_core/aicore_kernel.o
+    build/lib/a5/onboard/fully_distributed_within_core/private/aicore_kernel.o
 
 test -f build/lib/a5/dispatcher/libsimpler_aicpu_dispatcher.so
 test -f build/lib/libsimpler_log.so

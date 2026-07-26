@@ -88,6 +88,10 @@ target_compile_options(aicpu_kernel
         $<$<COMPILE_LANGUAGE:C>:-std=gnu11>
 )
 
+if(DEFINED CUSTOM_COMPILE_DEFINITIONS)
+    target_compile_definitions(aicpu_kernel PRIVATE ${CUSTOM_COMPILE_DEFINITIONS})
+endif()
+
 # Include directories
 target_include_directories(aicpu_kernel
     PRIVATE

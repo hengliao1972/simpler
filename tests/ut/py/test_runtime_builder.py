@@ -152,6 +152,44 @@ class TestRuntimeBuilderErrors:
             builder.get_binaries("anything", build=True)
 
 
+class TestFdwicTensorMapMode:
+    """FDWIC TensorMap mode is an explicit, narrowly scoped build identity."""
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_defaults_to_private_and_reads_environment(self, MockCompiler, monkeypatch):
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        monkeypatch.delenv("PTO_FDWIC_TENSORMAP_MODE", raising=False)
+        assert RuntimeBuilder(platform="a5").fdwic_tensormap_mode == "private"
+
+        monkeypatch.setenv("PTO_FDWIC_TENSORMAP_MODE", "shared")
+        assert RuntimeBuilder(platform="a5sim").fdwic_tensormap_mode == "shared"
+        assert RuntimeBuilder(platform="a5", fdwic_tensormap_mode="private").fdwic_tensormap_mode == "private"
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    @pytest.mark.parametrize("mode", ["", "unknown", "private/shared"])
+    def test_rejects_invalid_mode(self, MockCompiler, mode):
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        with pytest.raises(ValueError, match="Invalid FDWIC TensorMap mode"):
+            RuntimeBuilder(platform="a5", fdwic_tensormap_mode=mode)
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_rejects_shared_on_other_architecture(self, MockCompiler):
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        with pytest.raises(ValueError, match="only valid for the a5/a5sim"):
+            RuntimeBuilder(platform="a2a3sim", fdwic_tensormap_mode="shared")
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_rejects_shared_for_other_a5_runtime(self, MockCompiler):
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        builder = RuntimeBuilder(platform="a5", fdwic_tensormap_mode="shared")
+        with pytest.raises(ValueError, match="runtime='host_build_graph'"):
+            builder.get_binaries("host_build_graph")
+
+
 class TestRuntimeBuilderPtoIsaValidation:
     """Test PTO-ISA compatibility validation is scoped to affected runtimes."""
 
@@ -216,9 +254,9 @@ class TestRuntimeBuilderGetBinaries:
 
         monkeypatch.setattr(rb_module, "PROJECT_ROOT", tmp_path)
 
-    def _make_runtime(self, tmp_path, test_arch):
+    def _make_runtime(self, tmp_path, test_arch, name="test_rt"):
         """Create a fake runtime with a valid build_config.py."""
-        rt_dir = tmp_path / "src" / test_arch / "runtime" / "test_rt"
+        rt_dir = tmp_path / "src" / test_arch / "runtime" / name
         for sub in ["aicore", "aicpu", "host", "runtime"]:
             (rt_dir / sub).mkdir(parents=True)
 
@@ -240,6 +278,11 @@ class TestRuntimeBuilderGetBinaries:
         """)
         (rt_dir / "build_config.py").write_text(config_content)
         return rt_dir
+
+    @staticmethod
+    def _set_build_roots(monkeypatch, tmp_path, RuntimeBuilder):
+        monkeypatch.setattr(RuntimeBuilder, "_CACHE_DIR", tmp_path / "build" / "cache")
+        monkeypatch.setattr(RuntimeBuilder, "_LIB_DIR", tmp_path / "build" / "lib")
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_returns_runtime_binaries(self, MockCompiler, tmp_path, default_test_platform, test_arch):
@@ -310,6 +353,187 @@ class TestRuntimeBuilderGetBinaries:
         builder = RuntimeBuilder(platform=default_test_platform)
         with pytest.raises(RuntimeError, match="cmake failed"):
             builder.get_binaries("test_rt", build=True)
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_fdwic_mode_macro_reaches_all_three_targets(self, MockCompiler, tmp_path, monkeypatch):
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        runtime = "fully_distributed_within_core"
+        self._make_runtime(tmp_path, "a5", runtime)
+        self._set_build_roots(monkeypatch, tmp_path, RuntimeBuilder)
+        mock_instance = MockCompiler.get_instance.return_value
+        mock_instance.compile.side_effect = lambda target, *a, **kw: Path(kw["output_dir"]) / f"lib{target}.so"
+        mock_instance.compile_simpler_log.return_value = tmp_path / "build" / "lib" / "libsimpler_log.so"
+
+        builder = RuntimeBuilder(platform="a5", fdwic_tensormap_mode="shared")
+        builder.get_binaries(runtime, build=True)
+
+        runtime_calls = [
+            call for call in mock_instance.compile.call_args_list if call.args[0] in {"host", "aicpu", "aicore"}
+        ]
+        assert len(runtime_calls) == 3
+        assert {tuple(call.kwargs["compile_definitions"]) for call in runtime_calls} == {("PTO_FDWIC_SHARED_MAP=1",)}
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_private_mode_does_not_change_other_runtime_artifacts(self, MockCompiler, tmp_path, monkeypatch):
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        self._make_runtime(tmp_path, "a5", "test_rt")
+        self._set_build_roots(monkeypatch, tmp_path, RuntimeBuilder)
+        mock_instance = MockCompiler.get_instance.return_value
+        mock_instance.compile.side_effect = lambda target, *a, **kw: Path(kw["output_dir"]) / f"lib{target}.so"
+        mock_instance.compile_simpler_log.return_value = tmp_path / "build" / "lib" / "libsimpler_log.so"
+
+        RuntimeBuilder(platform="a5", fdwic_tensormap_mode="private").get_binaries("test_rt", build=True)
+
+        runtime_calls = [
+            call for call in mock_instance.compile.call_args_list if call.args[0] in {"host", "aicpu", "aicore"}
+        ]
+        assert {Path(call.kwargs["output_dir"]) for call in runtime_calls} == {
+            tmp_path / "build" / "lib" / "a5" / "onboard" / "test_rt"
+        }
+        assert {Path(call.kwargs["build_dir"]) for call in runtime_calls} == {
+            tmp_path / "build" / "cache" / "a5" / "onboard" / "test_rt"
+        }
+        assert all("compile_definitions" not in call.kwargs for call in runtime_calls)
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_fdwic_private_and_shared_use_separate_output_and_cache_paths(self, MockCompiler, tmp_path, monkeypatch):
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        runtime = "fully_distributed_within_core"
+        self._make_runtime(tmp_path, "a5", runtime)
+        self._set_build_roots(monkeypatch, tmp_path, RuntimeBuilder)
+        mock_instance = MockCompiler.get_instance.return_value
+        mock_instance.compile.side_effect = lambda target, *a, **kw: Path(kw["output_dir"]) / f"lib{target}.so"
+        mock_instance.compile_simpler_log.return_value = tmp_path / "build" / "lib" / "libsimpler_log.so"
+
+        for mode in ("private", "shared"):
+            RuntimeBuilder(platform="a5", fdwic_tensormap_mode=mode).get_binaries(runtime, build=True)
+
+        private_calls = [
+            call for call in mock_instance.compile.call_args_list if Path(call.kwargs["output_dir"]).name == "private"
+        ]
+        shared_calls = [
+            call for call in mock_instance.compile.call_args_list if Path(call.kwargs["output_dir"]).name == "shared"
+        ]
+        assert len(private_calls) == len(shared_calls) == 3
+        assert {Path(call.kwargs["build_dir"]) for call in private_calls} == {
+            tmp_path / "build" / "cache" / "a5" / "onboard" / runtime / "private"
+        }
+        assert {Path(call.kwargs["build_dir"]) for call in shared_calls} == {
+            tmp_path / "build" / "cache" / "a5" / "onboard" / runtime / "shared"
+        }
+        assert {tuple(call.kwargs["compile_definitions"]) for call in private_calls} == {("PTO_FDWIC_SHARED_MAP=0",)}
+        assert {tuple(call.kwargs["compile_definitions"]) for call in shared_calls} == {("PTO_FDWIC_SHARED_MAP=1",)}
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_fdwic_baseline_source_state_tracks_contents_and_mode(self, MockCompiler, tmp_path, monkeypatch):
+        import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        runtime = "fully_distributed_within_core"
+        rt_dir = self._make_runtime(tmp_path, "a5", runtime)
+        source = rt_dir / "runtime" / "state.h"
+        source.write_text("inline constexpr int kState = 1;\n")
+        self._set_build_roots(monkeypatch, tmp_path, RuntimeBuilder)
+        mock_instance = MockCompiler.get_instance.return_value
+        mock_instance.compile.side_effect = lambda target, *a, **kw: Path(kw["output_dir"]) / f"lib{target}.so"
+        mock_instance.compile_simpler_log.return_value = tmp_path / "build" / "lib" / "libsimpler_log.so"
+        observed_states = []
+        monkeypatch.setattr(
+            rb_module,
+            "_invalidate_cache_if_stale",
+            lambda _cache_dir, current_state: observed_states.append(current_state),
+        )
+
+        RuntimeBuilder(platform="a5", fdwic_tensormap_mode="private").get_binaries(runtime, build=True)
+        first_private_states = set(observed_states)
+        observed_states.clear()
+        source.write_text("inline constexpr int kState = 2;\n")
+        RuntimeBuilder(platform="a5", fdwic_tensormap_mode="private").get_binaries(runtime, build=True)
+        second_private_states = set(observed_states)
+        observed_states.clear()
+        RuntimeBuilder(platform="a5", fdwic_tensormap_mode="shared").get_binaries(runtime, build=True)
+        shared_states = set(observed_states)
+
+        assert all(state.startswith("source-v2:") for state in first_private_states)
+        assert first_private_states != second_private_states
+        assert second_private_states != shared_states
+
+
+class TestFdwicAicoreExtraBuild:
+    """Per-callable AICore images share the baseline FDWIC build identity."""
+
+    @staticmethod
+    def _make_runtime(tmp_path):
+        runtime = "fully_distributed_within_core"
+        rt_dir = tmp_path / "src" / "a5" / "runtime" / runtime
+        for subdir in ("aicore", "runtime"):
+            (rt_dir / subdir).mkdir(parents=True)
+        (rt_dir / "build_config.py").write_text(
+            textwrap.dedent("""\
+                BUILD_CONFIG = {
+                    "aicore": {
+                        "include_dirs": ["aicore", "runtime"],
+                        "source_dirs": ["runtime"]
+                    }
+                }
+            """)
+        )
+        return runtime
+
+    @patch("simpler_setup.kernel_compiler.KernelCompiler")
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_mode_path_and_effective_definitions(self, MockCompiler, MockKernelCompiler, tmp_path, monkeypatch):
+        import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        monkeypatch.setattr(rb_module, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(RuntimeBuilder, "_CACHE_DIR", tmp_path / "build" / "cache")
+        monkeypatch.setattr(RuntimeBuilder, "_LIB_DIR", tmp_path / "build" / "lib")
+        runtime = self._make_runtime(tmp_path)
+        MockKernelCompiler.return_value.get_incore_include_dirs.return_value = []
+        mock_instance = MockCompiler.get_instance.return_value
+        mock_instance.compile.side_effect = lambda target, *a, **kw: Path(kw["output_dir"]) / "aicore.o"
+        extra_source = tmp_path / "callable.cpp"
+        extra_source.write_text("void callable() {}\n")
+
+        result = RuntimeBuilder(platform="a5", fdwic_tensormap_mode="shared").build_aicore_with_extra_sources(
+            runtime,
+            [extra_source],
+            "callable-key",
+            compile_definitions=["PTO_FDWIC_PERF_CLOCK=1", "PTO_FDWIC_TRACE_ENABLED=0"],
+        )
+
+        call = mock_instance.compile.call_args
+        expected_root = tmp_path / "build" / "lib" / "a5" / "onboard" / runtime / "shared"
+        assert result == expected_root / "aicore-extra" / "callable-key" / "aicore.o"
+        assert Path(call.kwargs["build_dir"]) == (
+            tmp_path / "build" / "cache" / "a5" / "onboard" / runtime / "shared" / "aicore-extra" / "callable-key"
+        )
+        assert call.kwargs["compile_definitions"] == [
+            "PTO_FDWIC_SHARED_MAP=1",
+            "PTO_FDWIC_PERF_CLOCK=1",
+            "PTO_FDWIC_TRACE_ENABLED=0",
+        ]
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_rejects_conflicting_mode_definition(self, MockCompiler, tmp_path, monkeypatch):
+        import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        monkeypatch.setattr(rb_module, "PROJECT_ROOT", tmp_path)
+        runtime = self._make_runtime(tmp_path)
+        builder = RuntimeBuilder(platform="a5", fdwic_tensormap_mode="shared")
+
+        with pytest.raises(ValueError, match="Conflicting compile definitions for PTO_FDWIC_SHARED_MAP"):
+            builder.build_aicore_with_extra_sources(
+                runtime,
+                [],
+                "conflict",
+                compile_definitions=["PTO_FDWIC_SHARED_MAP=0"],
+            )
 
 
 # --- _invalidate_cache_if_stale unit tests ---
@@ -383,10 +607,7 @@ class TestBuildTargetCompileDefinitions:
             compile_definitions=["PTO_FDWIC_PERF_CLOCK=1", "PTO_FDWIC_TRACE_ENABLED=0"],
         )
 
-        assert (
-            "-DCUSTOM_COMPILE_DEFINITIONS="
-            "PTO_FDWIC_PERF_CLOCK=1;PTO_FDWIC_TRACE_ENABLED=0"
-        ) in args
+        assert ("-DCUSTOM_COMPILE_DEFINITIONS=PTO_FDWIC_PERF_CLOCK=1;PTO_FDWIC_TRACE_ENABLED=0") in args
 
     def test_omits_empty_compile_definitions(self, tmp_path):
         from simpler_setup.runtime_compiler import BuildTarget  # noqa: PLC0415

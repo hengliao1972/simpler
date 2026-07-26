@@ -95,6 +95,9 @@ target_compile_options(host_runtime
 # Platform name baked into the shared get_platform() impl in
 # src/common/platform/shared/host/platform_compile_info.cpp.
 target_compile_definitions(host_runtime PRIVATE SIMPLER_PLATFORM_NAME="a5")
+if(DEFINED CUSTOM_COMPILE_DEFINITIONS)
+    target_compile_definitions(host_runtime PRIVATE ${CUSTOM_COMPILE_DEFINITIONS})
+endif()
 
 # Include directories - always include local headers
 target_include_directories(host_runtime

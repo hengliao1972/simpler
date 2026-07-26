@@ -670,25 +670,32 @@ def _fake_build_identity(
     monkeypatch: pytest.MonkeyPatch,
     *,
     profile: str = "submit-pmu-none",
+    tensormap_mode: str = "private",
 ) -> report_module.SubmitPmuBuildIdentity:
     """Create a source-v2 identity without depending on real ELF tooling."""
 
     extra_cache_key = "0123456789abcdef"
-    cache_directory = directory / "build" / extra_cache_key
-    aicore_build_directory = cache_directory / "aicore_build"
+    runtime_tail = Path("a5") / "onboard" / "fully_distributed_within_core" / tensormap_mode
+    runtime_output_directory = directory / "build" / "lib" / runtime_tail
+    cache_directory = directory / "build" / "cache" / runtime_tail / "aicore-extra" / extra_cache_key
+    aicore_build_directory = cache_directory / "aicore"
     aicore_build_directory.mkdir(parents=True)
-    kernel = cache_directory / "aicore_kernel.o"
+    kernel = runtime_output_directory / "aicore-extra" / extra_cache_key / "aicore_kernel.o"
     artifact_paths = (
         kernel,
         aicore_build_directory / "aicore_aic_combined.o",
         aicore_build_directory / "aicore_aiv_combined.o",
-        directory / "build" / "libfdwic_runtime.so",
+        runtime_output_directory / "libhost_runtime.so",
+        runtime_output_directory / "libaicpu_kernel.so",
     )
     for ordinal, artifact in enumerate(artifact_paths, start=1):
         artifact.parent.mkdir(parents=True, exist_ok=True)
         artifact.write_bytes(f"artifact-{ordinal}-header:text-{ordinal}-payload".encode())
 
-    compile_definitions = ["PTO_FDWIC_SUBMIT_PMU=1"]
+    compile_definitions = [
+        f"PTO_FDWIC_SHARED_MAP={1 if tensormap_mode == 'shared' else 0}",
+        "PTO_FDWIC_SUBMIT_PMU=1",
+    ]
     if profile != "submit-pmu-none":
         compile_definitions.append(f"PTO_FDWIC_SUBMIT_PMU_PHASE_ID={report_module.PHASE_CONFIG_BY_MODE[profile]['id']}")
     compile_definitions.append("PTO_FDWIC_TRACE_ENABLED=0")
@@ -712,12 +719,13 @@ def _fake_build_identity(
     monkeypatch.setattr(report_module, "_inspect_build_artifact", inspect_fake_artifact)
     return capture_build_identity(
         profile=profile,
-        profiled_cache_key=("a5", "fdwic", profile),
+        profiled_cache_key=("a5", "fdwic", tensormap_mode, profile),
         aicore_extra_cache_key=extra_cache_key,
         compile_definitions=frozen_compile_definitions,
         aicore_kernel=kernel,
         aicore_build_dir=aicore_build_directory,
-        host_runtime=artifact_paths[-1],
+        host_runtime=artifact_paths[-2],
+        aicpu_runtime=artifact_paths[-1],
     )
 
 
@@ -1144,14 +1152,14 @@ def test_phase_recording_reference_provenance_requires_one_revision_and_scenario
         "build": {
             "git_head": "1" * 40,
             "source_state_version": "source-v2",
-            "profiled_cache_key": ["Case1", "a5", "fdwic", MATERIALIZE_CAPTURE_MODE],
+            "profiled_cache_key": ["Case1", "a5", "fdwic", "private", MATERIALIZE_CAPTURE_MODE],
         }
     }
     calibration = {
         "build": {
             "git_head": "1" * 40,
             "source_state_version": "source-v2",
-            "profiled_cache_key": ["Case1", "a5", "fdwic", EMPTY_BRACKET_CAPTURE_MODE],
+            "profiled_cache_key": ["Case1", "a5", "fdwic", "private", EMPTY_BRACKET_CAPTURE_MODE],
         }
     }
 
@@ -1160,7 +1168,7 @@ def test_phase_recording_reference_provenance_requires_one_revision_and_scenario
         "verified": True,
         "git_head": "1" * 40,
         "source_state_version": "source-v2",
-        "profiled_cache_key_prefix": ["Case1", "a5", "fdwic"],
+        "profiled_cache_key_prefix": ["Case1", "a5", "fdwic", "private"],
     }
 
     calibration["build"]["git_head"] = "2" * 40
@@ -2309,7 +2317,8 @@ def test_provenance_publish_preserves_raw_and_closes_sidecar_and_html(
     }
     build = provenance["build"]
     assert build["profile"] == "submit-pmu-none"
-    assert build["profiled_cache_key"][-1] == build["profile"]
+    assert build["tensormap_mode"] == "private"
+    assert build["profiled_cache_key"][-2:] == [build["tensormap_mode"], build["profile"]]
     assert build["aicore_extra_cache_key"] == "0123456789abcdef"
     assert build["source_state"].startswith("source-v2:")
     assert build["source_state_version"] == "source-v2"
@@ -2323,6 +2332,7 @@ def test_provenance_publish_preserves_raw_and_closes_sidecar_and_html(
         "aic_combined",
         "aiv_combined",
         "host_runtime",
+        "aicpu_runtime",
     }
     for name, frozen in frozen_artifacts.items():
         artifact = provenance["artifacts"][name]
@@ -2340,7 +2350,13 @@ def test_provenance_publish_preserves_raw_and_closes_sidecar_and_html(
     assert document == render_report(raw_path)
     assert provenance_sha256 in document
     assert "诊断构建身份" in document
-    for label in ("AICore final", "AIC combined", "AIV combined", "Host runtime"):
+    for label in (
+        "AICore final",
+        "AIC combined",
+        "AIV combined",
+        "Host runtime",
+        "Inner AICPU runtime",
+    ):
         assert label in document
     for frozen in frozen_artifacts.values():
         assert frozen.sha256 in document
@@ -2348,6 +2364,47 @@ def test_provenance_publish_preserves_raw_and_closes_sidecar_and_html(
 
     assert not list(tmp_path.glob(".*.pending.*.tmp"))
     assert not list(tmp_path.glob(".*.rollback.*.tmp"))
+
+
+def test_shared_tensormap_provenance_closes_cache_key_definitions_and_html(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_path = _write_capture(tmp_path, _valid_capture())
+    identity = _fake_build_identity(tmp_path, monkeypatch, tensormap_mode="shared")
+
+    output_path, provenance_path = write_report_with_provenance(raw_path, identity)
+    provenance, _ = load_provenance(provenance_path, load_capture(raw_path))
+
+    assert identity.tensormap_mode == "shared"
+    assert provenance["build"]["tensormap_mode"] == "shared"
+    assert provenance["build"]["profiled_cache_key"][-2:] == ["shared", "submit-pmu-none"]
+    assert provenance["build"]["compile_definitions"][0] == "PTO_FDWIC_SHARED_MAP=1"
+    assert "<code>shared</code>" in output_path.read_text(encoding="utf-8")
+
+
+def test_capture_build_identity_rejects_cross_mode_aicpu_artifact_family(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = _fake_build_identity(tmp_path, monkeypatch)
+    artifacts = dict(identity.artifacts)
+    private_aicpu = artifacts["aicpu_runtime"].path
+    shared_aicpu = private_aicpu.parent.parent / "shared" / private_aicpu.name
+    shared_aicpu.parent.mkdir(parents=True)
+    shared_aicpu.write_bytes(private_aicpu.read_bytes())
+
+    with pytest.raises(ValueError, match="do not belong to the selected private FDWIC artifact family"):
+        capture_build_identity(
+            profile=identity.profile,
+            profiled_cache_key=identity.profiled_cache_key,
+            aicore_extra_cache_key=identity.aicore_extra_cache_key,
+            compile_definitions=identity.compile_definitions,
+            aicore_kernel=artifacts["aicore_kernel"].path,
+            aicore_build_dir=identity.source_state_path.parent,
+            host_runtime=artifacts["host_runtime"].path,
+            aicpu_runtime=shared_aicpu,
+        )
 
 
 def test_efdrain_control_build_identity_uses_phase_id_7(
@@ -2362,6 +2419,7 @@ def test_efdrain_control_build_identity_uses_phase_id_7(
 
     assert identity.profile == EFDRAIN_CONTROL_CAPTURE_MODE
     assert identity.compile_definitions == (
+        "PTO_FDWIC_SHARED_MAP=0",
         "PTO_FDWIC_SUBMIT_PMU=1",
         "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=7",
         "PTO_FDWIC_TRACE_ENABLED=0",
@@ -2405,6 +2463,7 @@ def test_each_phase_profile_closes_raw_identity_provenance_and_html(
     assert provenance["binding"]["capture_mode"] == profile
     assert provenance["build"]["profile"] == profile
     assert provenance["build"]["compile_definitions"] == [
+        "PTO_FDWIC_SHARED_MAP=0",
         "PTO_FDWIC_SUBMIT_PMU=1",
         f"PTO_FDWIC_SUBMIT_PMU_PHASE_ID={phase_id}",
         "PTO_FDWIC_TRACE_ENABLED=0",
@@ -2564,17 +2623,19 @@ def test_provenance_rejects_source_state_or_definition_hash_mismatch(
         load_provenance(provenance_path, capture)
 
 
+@pytest.mark.parametrize("artifact_name", ("aiv_combined", "aicpu_runtime"))
 def test_provenance_rejects_artifact_change_after_identity_freeze_without_publishing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    artifact_name: str,
 ) -> None:
     raw_path = _write_capture(tmp_path, _valid_capture())
     raw_before = raw_path.read_bytes()
     identity = _fake_build_identity(tmp_path, monkeypatch)
-    changed_artifact = dict(identity.artifacts)["aiv_combined"].path
+    changed_artifact = dict(identity.artifacts)[artifact_name].path
     changed_artifact.write_bytes(changed_artifact.read_bytes() + b"-changed-after-freeze")
 
-    with pytest.raises(ValueError, match="build artifact changed after identity freeze: aiv_combined"):
+    with pytest.raises(ValueError, match=f"build artifact changed after identity freeze: {artifact_name}"):
         write_report_with_provenance(raw_path, identity)
 
     assert raw_path.read_bytes() == raw_before
