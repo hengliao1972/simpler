@@ -37,7 +37,7 @@ void advance_retire_reference(DistTensorMap &map, int32_t task_id, int32_t histo
         while (current >= 0) {
             const int32_t next = map.entries[current].next_in_task;
             EXPECT_EQ(map.entries[current].producer, id);
-            dist_tensor_map_free_entry(map, current);
+            dist_private_tensor_map_free_entry(map, current);
             current = next;
         }
         map.task_heads[id & kTaskWindowMask] = -1;
@@ -48,7 +48,7 @@ void advance_retire_reference(DistTensorMap &map, int32_t task_id, int32_t histo
 
 std::unique_ptr<DistTensorMap> make_empty_map() {
     auto map = std::make_unique<DistTensorMap>();
-    dist_tensor_map_reset(*map);
+    dist_private_tensor_map_reset(*map);
     return map;
 }
 
@@ -87,7 +87,7 @@ TEST(FdwicTensorMapRetire, EmptySentinelAndDefensiveNegativeValueMatchOriginalSt
 
     // new_floor=3：id 0/2 是正常空链 -1；id 1 是防御性异常负值。
     // 候选只能跳过精确的 -1，仍须把其他负值归一为 -1。
-    dist_tensor_map_advance_retire(*actual, 67, 64);
+    dist_private_tensor_map_advance_retire(*actual, 67, 64);
     advance_retire_reference(*expected, 67, 64);
 
     expect_exact_map_state(*actual, *expected);
@@ -118,7 +118,7 @@ TEST(FdwicTensorMapRetire, NonEmptyTaskChainsPreserveBucketAndFreeListSemantics)
     actual->task_heads[2] = 2;
 
     auto expected = clone_map_bytes(*actual);
-    dist_tensor_map_advance_retire(*actual, 67, 64);
+    dist_private_tensor_map_advance_retire(*actual, 67, 64);
     advance_retire_reference(*expected, 67, 64);
 
     expect_exact_map_state(*actual, *expected);
@@ -147,7 +147,7 @@ TEST(FdwicTensorMapRetire, ReusedTaskWindowSlotAndRepeatedFloorsRemainDeterminis
     actual->task_heads[0] = 0;  // producer 1024 复用 task-window 槽 0。
 
     auto expected = clone_map_bytes(*actual);
-    dist_tensor_map_advance_retire(*actual, kTaskWindow + 65, 64);
+    dist_private_tensor_map_advance_retire(*actual, kTaskWindow + 65, 64);
     advance_retire_reference(*expected, kTaskWindow + 65, 64);
 
     expect_exact_map_state(*actual, *expected);
@@ -158,8 +158,8 @@ TEST(FdwicTensorMapRetire, ReusedTaskWindowSlotAndRepeatedFloorsRemainDeterminis
     EXPECT_EQ(actual->alive_floor, kTaskWindow + 1);
 
     const auto after_first_retire = clone_map_bytes(*actual);
-    dist_tensor_map_advance_retire(*actual, kTaskWindow + 65, 64);
-    dist_tensor_map_advance_retire(*actual, 100, 64);
+    dist_private_tensor_map_advance_retire(*actual, kTaskWindow + 65, 64);
+    dist_private_tensor_map_advance_retire(*actual, 100, 64);
     expect_exact_map_state(*actual, *after_first_retire);
 }
 

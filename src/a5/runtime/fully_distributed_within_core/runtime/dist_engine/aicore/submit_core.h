@@ -540,7 +540,7 @@ PTO_DEVICE_FUNC void build_ring_slot_from_submit(
 
 PTO_DEVICE_FUNC void dist_submit_prepare_map(__gm__ DistCore *self, int32_t task_id) {
     if (self == nullptr) return;
-    dist_tensor_map_advance_retire(self->map, task_id, g_dist.H);
+    dist_tensor_map_prepare_task(*self, task_id, g_dist.H);
 }
 
 PTO_DEVICE_FUNC void dist_submit_add_fanin(int32_t fanin[], int32_t &fanin_count, int32_t producer) {
@@ -562,7 +562,7 @@ PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const 
                 dist_submit_add_fanin(fanin, fc, static_cast<int32_t>(owner_raw & 0xFFFFFFFFu));
             }
             if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
-            const int32_t p = dist_tensor_map_lookup(ctx.self->map, args.tensor(i).gm_ref());
+            const int32_t p = dist_tensor_map_lookup_for_task(*ctx.self, args.tensor(i).gm_ref(), ctx.task_id);
             dist_submit_add_fanin(fanin, fc, p);
         } else {
             const Tensor &t = args.tensor(i).ref();
@@ -571,7 +571,7 @@ PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const 
                 dist_submit_add_fanin(fanin, fc, static_cast<int32_t>(owner_raw & 0xFFFFFFFFu));
             }
             if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
-            const int32_t p = dist_tensor_map_lookup(ctx.self->map, t);
+            const int32_t p = dist_tensor_map_lookup_for_task(*ctx.self, t, ctx.task_id);
             dist_submit_add_fanin(fanin, fc, p);
         }
 #else
@@ -580,7 +580,7 @@ PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const 
         if (owner_raw != UINT64_MAX) dist_submit_add_fanin(fanin, fc, static_cast<int32_t>(owner_raw & 0xFFFFFFFFu));
         if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
         if (t.manual_dep) continue;
-        const int32_t p = dist_tensor_map_lookup(ctx.self->map, t);
+        const int32_t p = dist_tensor_map_lookup_for_task(*ctx.self, t, ctx.task_id);
         dist_submit_add_fanin(fanin, fc, p);
 #endif
     }
@@ -590,12 +590,12 @@ PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const 
 PTO_DEVICE_FUNC void dist_submit_insert_existing_tensor(DistSubmitCtx &ctx, const L0TaskArgs &args, int32_t i) {
 #if defined(__CCE_AICORE__)
     if (args.tensor(i).tensor_from_gm()) {
-        dist_tensor_map_insert(ctx.self->map, args.tensor(i).gm_ref(), ctx.task_id);
+        (void)dist_tensor_map_insert_for_task(*ctx.self, args.tensor(i).gm_ref(), ctx.task_id, ctx.won);
     } else {
-        dist_tensor_map_insert(ctx.self->map, args.tensor(i).ref(), ctx.task_id);
+        (void)dist_tensor_map_insert_for_task(*ctx.self, args.tensor(i).ref(), ctx.task_id, ctx.won);
     }
 #else
-    dist_tensor_map_insert(ctx.self->map, args.tensor(i).ref(), ctx.task_id);
+    (void)dist_tensor_map_insert_for_task(*ctx.self, args.tensor(i).ref(), ctx.task_id, ctx.won);
 #endif
 }
 

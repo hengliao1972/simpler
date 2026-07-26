@@ -20,7 +20,7 @@ PTO_DEVICE_FUNC void dist_core_reset(__gm__ DistCore &self, CoreType r, int32_t 
     self.sub_block_id = (lane_id == LANE_AIV1) ? 1 : 0;
     self.local_index = 0;
     self.heap_next = 0;
-    dist_tensor_map_reset(self.map);
+    dist_tensor_map_reset_worker(self);
     self.occupied_count = 0;
     self.owned_total = 0;
     self.swimlane_last_cycle = 0;

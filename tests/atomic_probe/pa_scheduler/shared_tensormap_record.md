@@ -6281,3 +6281,78 @@ clear 和真实计算输出。
 解释是：shared loser 不再进入完整 Finish 和 winner-only 重阶段外壳。
 这组数据达到 6/6 同向且超过 0.2% 的预设保留门槛，可以保留；它仍不能外推
 为真实 simpler 的同等收益，真实路径迁移后必须重新做同口径配对。
+
+### 2026-07-26：R1a 先抽取真实 TensorMap facade，并冻结 private 机器码
+
+R0 已经完成真实 private/shared 构建身份、缓存隔离和三镜像 ABI 防混用。
+进入数据结构迁移前，重新对照第 12 章、当前 production、standalone 和参考
+分支，发现不能把原计划中的“抽 facade”和“把 private 换成 128×128 ring”
+混在一个提交里：
+
+- 当前 production private 是 8,192 个 hash bucket 共享一个 16,384-entry
+  pool；某一个 bucket 理论上可以占用接近整个 pool；
+- standalone private 是 128 bucket × 128 slot，只有当前 PA Case1 证明
+  `H=64` 时最坏同桶存活量不超过 128；
+- production 允许 `PTO_DIST_H` 取 0～1,022，且一个 task 可以登记多个
+  INOUT/OUTPUT_EXISTING。对任意 callable，单桶存活量可能明显超过 128，
+  不能用 PA 特例替换全 runtime 容量合同；
+- 参考分支没有把 private map 换成 ring；其 shared ordinary-region 也是
+  永久 append 的有锁链表，没有 head/tail、绝对 seq、generation 或
+  reclaim，不能冒充第 12 章要求的有界 ring。
+
+因此 R1 拆成两个可独立取证的小步。R1a 只建立模式无关 facade，逐句保留
+旧 private 算法；R1b 才会在明确 production 容量、溢出和 host-visible
+错误传播之后更换存储。
+
+#### facade 边界
+
+原 `aicore/tensor_map.h` 拆为：
+
+```text
+private_tensor_map.h  既有 linked private backend
+tensor_map.h          Submit 和 scalar data access 唯一可见的 facade
+```
+
+facade 固定四类上下文：
+
+1. `reset_worker(worker)`：初始化当前模式的 worker/backend；
+2. `prepare_task(worker, task_id, H)`：按当前 task 推进回收；
+3. `lookup_for_task(worker, tensor, consumer_task_id)`：shared 后端必须用
+   consumer id 过滤未来 producer；
+4. `insert_for_task(worker, tensor, producer_task_id, task_won)`：shared
+   后端只能让唯一 winner 发布。
+
+`core_state.h`、Submit 的 PrepareMap/Fanin/Register 和
+`tensor_data_access.h` 已全部改走 facade；生产 aicore 目录中只有
+`private_tensor_map.h` 和 facade 本身还能直接访问 private helper 或
+`worker.map`。当前 shared 镜像仍在零 Submit 前 fail-closed，因此只为保证
+三镜像完整编译而实例化 private backend，绝不把它解释为 shared 可运行。
+
+旧 private 在 16,384-entry pool 耗尽时会静默丢弃 insert；R1a 有意不顺带
+改变这条历史语义，facade 的 bool 暂时固定返回 true。R1b 必须把容量失败
+从 backend 一路传到 Submit fatal，并最终变成 AICPU/Host 可见的非零结果；
+在此之前不能把“增加一个返回值”伪称成错误传播已闭合。
+
+#### 等价性证据
+
+| 检查 | 结果 |
+| --- | --- |
+| production private retire 差分测试 | 3/3 PASS |
+| 构建/cache/mode 相关 Python 单测 | 159 PASS；12 个 integration build 用例按本阶段范围排除 |
+| A5sim private/shared 三镜像 | 均构建通过 |
+| A5 CANN 9.1 private/shared Host、inner AICPU、AICore | 均构建通过 |
+| A5sim private PA Case1 | golden PASS；使用 example-exec-time，只作功能门槛 |
+| `git diff --check` | PASS |
+
+另外在 detached `9fc3681b` 上重新构建旧 private CCEC AICore，与 R1a 候选
+逐字节比较执行节：
+
+| ELF section | 大小 | 基线 SHA256 | 候选 SHA256 |
+| --- | ---: | --- | --- |
+| `.text` | 188,184 B | `6d5b7526cbb634f0c0220668fc25d1e3b66d102f4e36c4ccd9a042957dc671f0` | 相同 |
+| `.rodata` | 220 B | `6d0b106fffc043986f3225b6e08ce09edb66b75419cd02c41b57174e309699bc` | 相同 |
+
+因此 R1a 不只是“源码看起来等价”：当前 private CCEC 热路径和只读数据均未
+改变。该阶段不需要跑 A5 性能，也不提升 build ABI/layout version；下一提交
+只处理 private ring 的 production 容量与错误合同，不能同时接 shared
+ordinary-region、fresh symbol 或 PA region intent。

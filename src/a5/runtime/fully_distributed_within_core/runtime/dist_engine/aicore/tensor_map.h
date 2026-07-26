@@ -11,117 +11,46 @@
 
 #pragma once
 
+#include "dist_engine/aicore/private_tensor_map.h"
+
 namespace {
 
-PTO_DEVICE_FUNC void dist_tensor_map_reset(__gm__ DistTensorMap &self) {
-    self.free_head = -1;
-    self.high_water = 0;
-    self.alive_floor = 0;
-    self.cleaned_upto = 0;
-    for (int32_t i = 0; i < kMapBuckets; i++)
-        self.buckets[i] = -1;
-    for (int32_t i = 0; i < kTaskWindow; i++)
-        self.task_heads[i] = -1;
+/*
+ * Submit 只依赖这组模式无关入口，不再直接读取 DistCore::map。当前 shared
+ * 镜像仍在零 Submit 前 fail-closed，因此本阶段两种编译身份都复用既有
+ * private 实现来保证完整编译；解除门禁前会在这里接入真正的 shared
+ * backend，而不是让 shared 运行时沿用 private 语义。
+ *
+ * consumer_task_id 和 task_won 暂时不会改变 private 行为。它们是 shared
+ * 后端必须显式取得的两条上下文：lookup 需要过滤未来 producer，insert
+ * 只允许当前 task 的唯一 winner 发布。把上下文固定在 facade 参数中，
+ * 可避免后续在 Submit 各处散布 PTO_FDWIC_SHARED_MAP 分支。
+ */
+PTO_DEVICE_FUNC void dist_tensor_map_reset_worker(__gm__ DistCore &worker) {
+    dist_private_tensor_map_reset(worker.map);
 }
 
-PTO_DEVICE_FUNC uint32_t dist_tensor_map_hash(uint64_t addr) {
-    addr *= 0x9E3779B97F4A7C15ULL;
-    return static_cast<uint32_t>(addr >> (64 - kMapBucketShift));
-}
-
-template <typename TensorRef>
-PTO_DEVICE_FUNC void dist_tensor_map_byte_range(const TensorRef &t, uint64_t &addr, uint64_t &lo, uint64_t &hi) {
-    const uint64_t esz = get_element_size(t.dtype);
-    addr = t.buffer.addr;
-    lo = t.start_offset * esz;
-    uint64_t ext;
-    if (t.is_contiguous) {
-        ext = 1;
-        for (uint32_t i = 0; i < t.ndims; i++)
-            ext *= t.shapes[i];
-    } else {
-        ext = t.extent_elem_cache;
-    }
-    hi = (t.start_offset + ext) * esz;
-}
-
-PTO_DEVICE_FUNC int32_t dist_tensor_map_alloc_slot(__gm__ DistTensorMap &self) {
-    if (self.free_head >= 0) {
-        const int32_t s = self.free_head;
-        self.free_head = self.entries[s].next_in_bucket;
-        return s;
-    }
-    if (self.high_water < kMapCap) return self.high_water++;
-    return -1;
-}
-
-PTO_DEVICE_FUNC void dist_tensor_map_free_entry(__gm__ DistTensorMap &self, int32_t idx) {
-    __gm__ MapEntry &e = self.entries[idx];
-    if (e.prev_in_bucket < 0) self.buckets[e.bucket] = e.next_in_bucket;
-    else self.entries[e.prev_in_bucket].next_in_bucket = e.next_in_bucket;
-    if (e.next_in_bucket >= 0) self.entries[e.next_in_bucket].prev_in_bucket = e.prev_in_bucket;
-    e.bucket = -1;
-    e.next_in_bucket = self.free_head;
-    self.free_head = idx;
-}
-
-PTO_DEVICE_FUNC void dist_tensor_map_advance_retire(__gm__ DistTensorMap &self, int32_t N, int32_t H) {
-    const int32_t new_floor = N - H;
-    if (new_floor <= self.cleaned_upto) {
-        if (new_floor > self.alive_floor) self.alive_floor = new_floor;
-        return;
-    }
-    for (int32_t id = self.cleaned_upto; id < new_floor; id++) {
-        int32_t cur = self.task_heads[id & kTaskWindowMask];
-        // Empty heads are already normalized; avoid writing -1 back to GM.
-        if (cur == -1) continue;
-        while (cur >= 0) {
-            const int32_t nxt = self.entries[cur].next_in_task;
-            debug_assert(self.entries[cur].producer == id);
-            dist_tensor_map_free_entry(self, cur);
-            cur = nxt;
-        }
-        self.task_heads[id & kTaskWindowMask] = -1;
-    }
-    self.cleaned_upto = new_floor;
-    self.alive_floor = new_floor;
+PTO_DEVICE_FUNC void dist_tensor_map_prepare_task(__gm__ DistCore &worker, int32_t task_id, int32_t history) {
+    dist_private_tensor_map_advance_retire(worker.map, task_id, history);
 }
 
 template <typename TensorRef>
-PTO_DEVICE_FUNC void dist_tensor_map_insert(__gm__ DistTensorMap &self, const TensorRef &t, int32_t producer) {
-    uint64_t addr, lo, hi;
-    dist_tensor_map_byte_range(t, addr, lo, hi);
-    const int32_t s = dist_tensor_map_alloc_slot(self);
-    if (s < 0) return;
-    const uint32_t b = dist_tensor_map_hash(addr);
-    __gm__ MapEntry &e = self.entries[s];
-    e.buf_addr = addr;
-    e.lo = lo;
-    e.hi = hi;
-    e.producer = producer;
-    e.bucket = static_cast<int32_t>(b);
-    e.prev_in_bucket = -1;
-    e.next_in_bucket = self.buckets[b];
-    if (self.buckets[b] >= 0) self.entries[self.buckets[b]].prev_in_bucket = s;
-    self.buckets[b] = s;
-    const int32_t slot = producer & kTaskWindowMask;
-    e.next_in_task = self.task_heads[slot];
-    self.task_heads[slot] = s;
+PTO_DEVICE_FUNC int32_t
+dist_tensor_map_lookup_for_task(__gm__ DistCore &worker, const TensorRef &tensor, int32_t consumer_task_id) {
+    (void)consumer_task_id;
+    return dist_private_tensor_map_lookup(worker.map, tensor);
 }
 
 template <typename TensorRef>
-PTO_DEVICE_FUNC int32_t dist_tensor_map_lookup(__gm__ const DistTensorMap &self, const TensorRef &t) {
-    uint64_t addr, lo, hi;
-    dist_tensor_map_byte_range(t, addr, lo, hi);
-    int32_t best = -1;
-    for (int32_t cur = self.buckets[dist_tensor_map_hash(addr)]; cur >= 0; cur = self.entries[cur].next_in_bucket) {
-        __gm__ const MapEntry &e = self.entries[cur];
-        if (e.producer < self.alive_floor) continue;
-        if (e.buf_addr == addr && lo < e.hi && e.lo < hi) {
-            if (e.producer > best) best = e.producer;
-        }
-    }
-    return best;
+PTO_DEVICE_FUNC bool dist_tensor_map_insert_for_task(
+    __gm__ DistCore &worker, const TensorRef &tensor, int32_t producer_task_id, bool task_won
+) {
+    (void)task_won;
+    dist_private_tensor_map_insert(worker.map, tensor, producer_task_id);
+    // 既有 private backend 在容量耗尽时静默丢弃；facade 阶段不顺带改变
+    // 这条历史语义。ring 迁移会把可观察的容量失败与上层 fatal 传播作为
+    // 独立正确性提交闭合，再让该返回值承载真实结果。
+    return true;
 }
 
 }  // namespace
