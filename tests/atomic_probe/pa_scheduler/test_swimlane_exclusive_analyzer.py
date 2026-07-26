@@ -187,6 +187,43 @@ def _capture() -> dict[str, object]:
     return capture
 
 
+def _append_v4_g1_tail_tasks(rows: list[list[object]]) -> None:
+    """给历史 Alloc/QK fixture 补齐 SF/PV/UP 三个 loser。"""
+
+    for core_id in range(CORE_COUNT):
+        base = 1000 + core_id
+        for task_id in range(2, 5):
+            start = base + 220 + (task_id - 2) * 100
+            function_id = task_id - 1
+            rows.extend(
+                [
+                    _row(core_id, task_id, "EfDrain", start + 1, start + 11),
+                    _row(
+                        core_id,
+                        task_id,
+                        "Kernel",
+                        start + 3,
+                        start + 7,
+                        function_id=function_id,
+                    ),
+                    _row(core_id, task_id, "Claim", start + 14, start + 20, flags=0x2),
+                    _row(core_id, task_id, "Materialize", start + 24, start + 32),
+                    _row(core_id, task_id, "PrepareMap", start + 33, start + 37),
+                    _row(core_id, task_id, "Register", start + 43, start + 49),
+                    _row(
+                        core_id,
+                        task_id,
+                        "Atomic",
+                        start + 15,
+                        start + 17,
+                        flags=0x53,
+                        auxiliary=4,
+                    ),
+                    _row(core_id, task_id, "Submit", start, start + 80),
+                ]
+            )
+
+
 def _v4_capture() -> dict[str, object]:
     """在 v3 结构样本上替换真实尾动作，并补齐两个首尾相接的父 span。"""
 
@@ -276,13 +313,17 @@ def _v4_capture() -> dict[str, object]:
                 )
             )
 
+    # schema-v4 动态门槛必须使用完整 G1：在历史两 task fixture 后补齐
+    # SF/PV/UP 三个 loser。这样测试不会再依赖“截断到 QK 的非法 batch”。
+    _append_v4_g1_tail_tasks(rows)
+
     for core_id in range(CORE_COUNT):
         base = 1000 + core_id
         rows.extend(
             [
-                _row(core_id, -1, "OrchestrationReplay", base - 10, base + 210),
-                _row(core_id, -1, "FinalDrain", base + 210, base + 250),
-                _row(core_id, 1, "Kernel", base + 220, base + 230, function_id=0),
+                _row(core_id, -1, "OrchestrationReplay", base - 10, base + 510),
+                _row(core_id, -1, "FinalDrain", base + 510, base + 550),
+                _row(core_id, 4, "Kernel", base + 520, base + 530, function_id=3),
             ]
         )
     capture["fdwic_events"] = rows
@@ -378,33 +419,33 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
         self.assertIs(validation["worker_completion_partition_exact"], True)
 
         metrics = report["aggregate_core_work"]["metrics_cycles"]
-        self.assertEqual(metrics["submit_union"], 17_280)
+        self.assertEqual(metrics["submit_union"], 40_320)
         self.assertEqual(metrics["fanin"], 2)
         self.assertEqual(metrics["winner_build"], 10)
         self.assertEqual(metrics["alloc_complete"], 10)
-        self.assertEqual(metrics["submit_residual"], 9_194)
+        self.assertEqual(metrics["submit_residual"], 22_442)
         self.assertEqual(metrics["orchestration_setup"], 960)
         self.assertEqual(metrics["orchestration_tail"], 960)
-        self.assertEqual(metrics["orchestration_replay"], 21_120)
+        self.assertEqual(metrics["orchestration_replay"], 49_920)
         self.assertEqual(metrics["final_drain"], 3_840)
         self.assertEqual(metrics["final_drain_kernel_union"], 960)
         self.assertEqual(metrics["final_drain_residual"], 2_880)
-        self.assertEqual(metrics["worker_completion"], 24_960)
+        self.assertEqual(metrics["worker_completion"], 53_760)
         residual = report["residual_breakdown"]
-        self.assertEqual(residual["submit_internal_residual"]["total_cycles"], 2_689)
-        self.assertEqual(residual["submit_tail_residual"]["total_cycles"], 6_505)
-        self.assertEqual(residual["between_submit_residual"]["total_cycles"], 1_920)
+        self.assertEqual(residual["submit_internal_residual"]["total_cycles"], 7_009)
+        self.assertEqual(residual["submit_tail_residual"]["total_cycles"], 15_433)
+        self.assertEqual(residual["between_submit_residual"]["total_cycles"], 7_680)
         self.assertAlmostEqual(
             residual["submit_internal_residual"]["share_of_submit_union"],
-            2_689 / 17_280,
+            7_009 / 40_320,
         )
         self.assertAlmostEqual(
             residual["submit_tail_residual"]["share_of_submit_union"],
-            6_505 / 17_280,
+            15_433 / 40_320,
         )
         self.assertAlmostEqual(
             residual["between_submit_residual"]["share_of_submit_envelope"],
-            1_920 / 19_200,
+            7_680 / 48_000,
         )
         tail_boundaries = {
             segment["boundary"]
@@ -438,7 +479,7 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
             "worker_completion",
         ):
             self.assertIs(closure[name]["exact"], True)
-        self.assertEqual(report["kernel_containment"]["inside_efdrain_events"], 192)
+        self.assertEqual(report["kernel_containment"]["inside_efdrain_events"], 480)
         self.assertEqual(report["kernel_containment"]["inside_final_drain_events"], 96)
         self.assertEqual(report["kernel_containment"]["orphan_events"], 0)
         self.assertEqual(

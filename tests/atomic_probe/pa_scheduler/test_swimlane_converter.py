@@ -19,10 +19,10 @@ from pathlib import Path
 
 try:
     # `python -m unittest tests.atomic_probe...` 以 namespace package 导入。
-    from .swimlane_converter import convert
+    from .swimlane_converter import _derive_v4_task_kinds, convert
 except ImportError:
     # 也保留从本目录直接执行脚本的用法。
-    from swimlane_converter import convert
+    from swimlane_converter import _derive_v4_task_kinds, convert
 
 
 def _standalone_topology(core_id: int) -> tuple[int, int, str]:
@@ -114,10 +114,38 @@ def _v4_capture(
     if add_parents:
         for core_id in range(num_cores):
             block_id, lane, _ = _standalone_topology(core_id)
+            submit_ends = [
+                int(row[7])
+                for row in all_rows
+                if int(row[0]) == core_id and row[5] == "Submit"
+            ]
+            orchestration_end = max([200, *submit_ends])
             all_rows.extend(
                 [
-                    [core_id, block_id, lane, -1, -1, "OrchestrationReplay", 90, 200, 0, 0],
-                    [core_id, block_id, lane, -1, -1, "FinalDrain", 200, 220, 0, 0],
+                    [
+                        core_id,
+                        block_id,
+                        lane,
+                        -1,
+                        -1,
+                        "OrchestrationReplay",
+                        90,
+                        orchestration_end,
+                        0,
+                        0,
+                    ],
+                    [
+                        core_id,
+                        block_id,
+                        lane,
+                        -1,
+                        -1,
+                        "FinalDrain",
+                        orchestration_end,
+                        orchestration_end + 20,
+                        0,
+                        0,
+                    ],
                 ]
             )
     return {
@@ -199,6 +227,12 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
                 [0, 0, 0, 0, -1, "Submit", 100, 140, 0, 1],
                 [0, 0, 0, 1, -1, "Claim", 170, 180, 0x2, 0],
                 [0, 0, 0, 1, -1, "Submit", 160, 200, 0, 0],
+                [0, 0, 0, 2, -1, "Claim", 210, 220, 0x2, 0],
+                [0, 0, 0, 2, -1, "Submit", 200, 240, 0, 0],
+                [0, 0, 0, 3, -1, "Claim", 250, 260, 0x2, 0],
+                [0, 0, 0, 3, -1, "Submit", 240, 280, 0, 0],
+                [0, 0, 0, 4, -1, "Claim", 290, 300, 0x2, 0],
+                [0, 0, 0, 4, -1, "Submit", 280, 320, 0, 0],
             ]
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -215,8 +249,8 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
         between = [
             event for event in events if event.get("name") == "between_submit_residual"
         ]
-        self.assertEqual(len(internal), 2)
-        self.assertEqual(len(tails), 2)
+        self.assertEqual(len(internal), 5)
+        self.assertEqual(len(tails), 5)
         self.assertEqual(
             between,
             [
@@ -230,8 +264,8 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
                 }
             ],
         )
-        # 前缀/尾段只是重分类：合成事件总数仍为 5，没有扩大 merged。
-        self.assertEqual(len(internal) + len(tails) + len(between), 5)
+        # 每个完整 G1 task 仍只生成真实补集，不增加设备 raw 记录。
+        self.assertEqual(len(internal) + len(tails) + len(between), 11)
         for event in (*internal, *tails, *between):
             self.assertEqual(set(event), {"ph", "name", "pid", "tid", "ts", "dur"})
 
@@ -282,8 +316,17 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
     def test_v4_rejects_task_kind_that_disagrees_with_task_id(self) -> None:
         capture = _v4_capture(
             [
-                [0, 0, 0, 1, -1, "Claim", 110, 120, 0, 1],
-                [0, 0, 0, 1, -1, "Submit", 100, 140, 0, 1],
+                [0, 0, 0, 0, -1, "Claim", 101, 102, 0, 1],
+                [0, 0, 0, 0, -1, "Submit", 100, 105, 0, 1],
+                # Submit 给出的动态 plan 是 QK；Claim 篡改成 Alloc。
+                [0, 0, 0, 1, -1, "Claim", 111, 112, 0, 1],
+                [0, 0, 0, 1, -1, "Submit", 110, 115, 0, 0],
+                [0, 0, 0, 2, -1, "Claim", 121, 122, 0, 0],
+                [0, 0, 0, 2, -1, "Submit", 120, 125, 0, 0],
+                [0, 0, 0, 3, -1, "Claim", 131, 132, 0, 0],
+                [0, 0, 0, 3, -1, "Submit", 130, 135, 0, 0],
+                [0, 0, 0, 4, -1, "Claim", 141, 142, 0, 0],
+                [0, 0, 0, 4, -1, "Submit", 140, 145, 0, 0],
             ]
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -292,6 +335,55 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             input_path.write_text(json.dumps(capture), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "task-kind mismatch"):
                 convert(input_path, output_path)
+
+    def test_v4_derives_g0_g1_g2_g4_and_mixed_task_kinds(self) -> None:
+        """动态类型来自 Alloc 边界，不再把全局 task_id 按五取模。"""
+
+        # mixed=[G0,G1,G2,G4]，各 batch 的 task 数为 1/5/9/17。
+        group_counts = (0, 1, 2, 4)
+        alloc_task_ids: list[int] = []
+        expected_kinds: dict[int, int] = {}
+        next_task = 0
+        for group_count in group_counts:
+            alloc_task_ids.append(next_task)
+            expected_kinds[next_task] = 0
+            next_task += 1
+            for _group in range(group_count):
+                for kind_id in range(1, 5):
+                    expected_kinds[next_task] = kind_id
+                    next_task += 1
+
+        semantics = {
+            (core_id, task_id): (
+                False,
+                task_id in alloc_task_ids,
+            )
+            for core_id in range(3)
+            for task_id in range(next_task)
+        }
+        self.assertEqual(_derive_v4_task_kinds(semantics, 3), expected_kinds)
+        # G0 后紧邻下一个 batch Alloc，形成合法 Alloc->Alloc；随后 task 5
+        # 是该 G1 的 UP。旧全局 task_id % 5 会把两者分别错判为 QK/Alloc。
+        self.assertEqual([expected_kinds[0], expected_kinds[1]], [0, 0])
+        self.assertEqual(expected_kinds[5], 4)
+
+    def test_v4_rejects_cross_core_alloc_marker_disagreement(self) -> None:
+        semantics = {
+            (core_id, task_id): (False, task_id == 0)
+            for core_id in range(2)
+            for task_id in range(5)
+        }
+        semantics[(1, 1)] = (False, True)
+        with self.assertRaisesRegex(ValueError, "Alloc marker differs across cores"):
+            _derive_v4_task_kinds(semantics, 2)
+
+    def test_v4_rejects_incomplete_dynamic_group(self) -> None:
+        semantics = {
+            (0, task_id): (False, task_id == 0)
+            for task_id in range(4)
+        }
+        with self.assertRaisesRegex(ValueError, "complete QK/SF/PV/UP groups"):
+            _derive_v4_task_kinds(semantics, 1)
 
     def test_v4_requires_both_parent_spans(self) -> None:
         capture = _v4_capture(

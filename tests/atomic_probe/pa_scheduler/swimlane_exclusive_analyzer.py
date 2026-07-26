@@ -26,10 +26,20 @@ from typing import Any, cast
 
 try:
     # 包方式运行单测时复用同目录 converter 的完整 raw/schema 校验。
-    from .swimlane_converter import _load_and_validate, _standalone_topology
+    from .swimlane_converter import (
+        TASK_KIND_NAMES,
+        _derive_v4_task_kinds,
+        _load_and_validate,
+        _standalone_topology,
+    )
 except ImportError:
     # 也支持直接执行本脚本，不依赖仓库安装成 Python package。
-    from swimlane_converter import _load_and_validate, _standalone_topology
+    from swimlane_converter import (
+        TASK_KIND_NAMES,
+        _derive_v4_task_kinds,
+        _load_and_validate,
+        _standalone_topology,
+    )
 
 
 REPORT_SCHEMA_VERSION = 2
@@ -112,9 +122,6 @@ PHASE_TO_METRIC = {
     "WinnerBuild": "winner_build",
     "AllocComplete": "alloc_complete",
 }
-TASK_KIND_NAMES = ("Alloc", "QK", "SF", "PV", "UP")
-
-
 def _exclusive_phases(trace_schema_version: int) -> tuple[str, ...]:
     return (
         V4_EXCLUSIVE_SUBMIT_PHASES
@@ -695,6 +702,7 @@ def _add_residual_segment(
 def _residual_breakdown(
     submits_by_lane: dict[tuple[int, int], list[Event]],
     children_by_submit: dict[int, list[Event]],
+    task_kind_by_id: dict[int, int] | None,
 ) -> dict[str, Any]:
     """按相邻既有边界聚合 Submit 内和 Submit 间空白，保持输出规模恒定。"""
 
@@ -735,8 +743,15 @@ def _residual_breakdown(
 
         for previous, current in zip(submits, submits[1:]):
             gap = current.start_cycle - previous.end_cycle
-            previous_kind = TASK_KIND_NAMES[previous.task_id % len(TASK_KIND_NAMES)]
-            current_kind = TASK_KIND_NAMES[current.task_id % len(TASK_KIND_NAMES)]
+            if task_kind_by_id is None:
+                # schema-v3 只存在 private 固定五 task 流；保持历史报告逐字一致。
+                previous_kind_id = previous.task_id % len(TASK_KIND_NAMES)
+                current_kind_id = current.task_id % len(TASK_KIND_NAMES)
+            else:
+                previous_kind_id = task_kind_by_id[previous.task_id]
+                current_kind_id = task_kind_by_id[current.task_id]
+            previous_kind = TASK_KIND_NAMES[previous_kind_id]
+            current_kind = TASK_KIND_NAMES[current_kind_id]
             _add_residual_segment(
                 between_segments,
                 f"{previous_kind}->{current_kind}",
@@ -799,6 +814,19 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
         raise ValueError("block/lane to core mapping is incomplete")
 
     submits_by_lane, task_ids = _validate_and_group_submits(events)
+    task_kind_by_id: dict[int, int] | None = None
+    if trace_schema_version == 4:
+        # 只复用 Submit 已有 won/is_alloc 两个标量恢复动态 kind；不向
+        # 300 MiB 级 raw/merged 添加逐事件字段。
+        submit_semantics = {
+            (event.core_id, event.task_id): (
+                bool(event.flags & 1),
+                bool(event.auxiliary),
+            )
+            for event in events
+            if event.phase == "Submit"
+        }
+        task_kind_by_id = _derive_v4_task_kinds(submit_semantics, num_cores)
     exclusive_phases = _exclusive_phases(trace_schema_version)
     submit_partition_names = _submit_partition_metrics(trace_schema_version)
     role_metric_names = _role_metrics(trace_schema_version)
@@ -870,7 +898,9 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
         metric: sum(core["metrics_cycles"][metric] for core in per_core)
         for metric in role_metric_names
     }
-    residual_breakdown = _residual_breakdown(submits_by_lane, children_by_submit)
+    residual_breakdown = _residual_breakdown(
+        submits_by_lane, children_by_submit, task_kind_by_id
+    )
     if (
         residual_breakdown["submit_internal_residual"]["total_cycles"]
         + residual_breakdown["submit_tail_residual"]["total_cycles"]

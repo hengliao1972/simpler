@@ -5461,3 +5461,53 @@ host plan 初版虽然在业务上只服务 shared，但若把等价 helper、�
 下一阶段只处理动态 task identity 在 converter、exclusive analyzer 和
 submit-PMU host 加工链中的传播。完成前不做性能优化，也不把固定 `%5`
 的旧加工结果当作动态 shared 性能证据。
+
+### 2026-07-26：S6.4d 让泳道加工恢复动态 task identity
+
+本小步只修 raw→merged→exclusive 加工链，不改设备采集 ABI。schema-v4
+的每条 Submit 和 Claim 原本就记录了 `is_alloc`，winner 尾动作也原本
+就记录了 `WinnerBuild.function_id` 或 `AllocComplete`。因此新增设备
+字段或逐事件 metadata 既冗余，也会继续放大接近 300 MiB 的诊断文件。
+
+converter 现在从所有核的既有 Submit 记录独立恢复 task plan：
+
+1. 每核 task ID 必须是相同的连续 `0..N-1`；
+2. 同一 task 的 Alloc 标记必须在所有核上一致；
+3. task 0 必须是 Alloc；
+4. 相邻 Alloc 之间必须严格构成
+   `Alloc + 0..4 × (QK,SF,PV,UP)`；
+5. Claim/Submit 的 Alloc 与 winner 语义必须一致；
+6. winner 尾动作必须与推导出的 kind 对应：
+   Alloc 使用 `AllocComplete/-1`，其余使用
+   `WinnerBuild/QK|SF|PV|UP function`。
+
+这样固定五 task private、G0、G1、G2、G4 和 mixed 共用同一个离线
+校验机制，但不再使用全局 `task_id % 5`。exclusive analyzer 复用同一
+推导结果给 Submit 间空白命名；时间闭合公式和报告结构没有变化。动态
+mixed 中现在能正确区分：
+
+```text
+Alloc -> Alloc    空 batch 后进入下一 batch
+UP -> Alloc       一个 batch 结束后进入下一 batch
+UP -> QK          同一 batch 继续下一组
+```
+
+这一层只恢复 task kind 和 batch/group 边界。仅凭十列 raw，G2 partial
+的 8193 与 G2 full 的 16384 具有相同 kind 流，无法恢复末组真实 block
+数；本阶段不伪造这项身份。完整 context 身份会在下一步 submit-PMU
+host JSON 中由独立 host plan 显式导出，并由 Python 再计算。
+
+#### 回归结果
+
+| 门槛 | 结果 |
+| --- | --- |
+| converter/exclusive 及目录内全部 Python 单测 | 104 项 PASS |
+| CPU shared G0/G1/G2 partial/G2 full/G4 | raw、merged、exclusive 全部 PASS |
+| CPU shared mixed `0,8192,8193,32768` | 32 task、7 group，全部 PASS |
+| mixed Submit 间边界 | `Alloc->Alloc=96`、`UP->Alloc=192`、`UP->QK=384` |
+| private CCEC 既有 raw 重新生成 merged | 与旧文件逐字节相同 |
+| private CCEC 既有 raw 重新生成 exclusive | 与旧文件逐字节相同 |
+
+上述 CPU 运行只证明动态采集和离线加工闭合，不把 CPU Submit 时间当作
+A5 性能数据。设备 raw 字段数、记录数和 merged 每事件结构均未增加。
+下一小步再独立处理 submit-PMU 的 host/Python `batches×5` 固定假设。

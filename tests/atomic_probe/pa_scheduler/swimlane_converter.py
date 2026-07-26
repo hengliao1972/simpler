@@ -66,7 +66,13 @@ V4_EXCLUSIVE_SUBMIT_PHASES = {
     "WinnerBuild",
     "AllocComplete",
 }
-KERNEL_NAMES = {0: "QK", 1: "SF", 2: "PV", 3: "UP"}
+# TaskKind/function ABI 固定为五种“类型”，但 shared TensorMap 每个 batch
+# 可以有 0..4 组 QK/SF/PV/UP，运行时 task 数不再固定为五个。
+TASK_KIND_NAMES = ("Alloc", "QK", "SF", "PV", "UP")
+KERNEL_NAMES = {
+    function_id: task_kind
+    for function_id, task_kind in enumerate(TASK_KIND_NAMES[1:])
+}
 # 一个物理 mixed block 的三条 runtime lane：AIC、AIV0、AIV1。
 LANE_NAMES = {0: "AIC", 1: "AIV0", 2: "AIV1"}
 
@@ -157,6 +163,92 @@ def _integer(value: Any, label: str) -> int:
         return int(value)
     except (TypeError, ValueError) as error:
         raise ValueError(f"{label} is not an integer: {value!r}") from error
+
+
+def _derive_v4_task_kinds(
+    submit_semantics: dict[tuple[int, int], tuple[bool, bool]],
+    num_cores: int,
+) -> dict[int, int]:
+    """从每核 Submit 的既有 Alloc 标记恢复动态 task 类型流。
+
+    schema-v4 的 ``Submit.auxiliary`` 已逐核记录 ``is_alloc``，因此无需给
+    设备 raw 再增加 task-kind 字段。这里先要求 96 核（或测试给定核数）
+    具有完全一致的连续 task 流，再按相邻 Alloc 边界验证每个 batch 必须是
+    ``Alloc + 0..4 × (QK,SF,PV,UP)``。返回值使用稳定 TaskKind 编号：
+    Alloc=0，QK/SF/PV/UP=1..4。
+    """
+
+    if num_cores <= 0:
+        raise ValueError(f"schema-v4 task plan requires positive num_cores, got {num_cores}")
+
+    task_ids_by_core: dict[int, list[int]] = {
+        core_id: [] for core_id in range(num_cores)
+    }
+    for (core_id, task_id) in submit_semantics:
+        if core_id not in task_ids_by_core:
+            raise ValueError(
+                f"schema-v4 Submit task plan has out-of-range core {core_id}"
+            )
+        if task_id < 0:
+            raise ValueError(
+                f"schema-v4 Submit task plan has negative task_id {task_id}"
+            )
+        task_ids_by_core[core_id].append(task_id)
+
+    reference_task_ids: list[int] | None = None
+    for core_id in range(num_cores):
+        task_ids = sorted(task_ids_by_core[core_id])
+        if reference_task_ids is None:
+            if not task_ids or task_ids != list(range(task_ids[-1] + 1)):
+                raise ValueError(
+                    "schema-v4 Submit task IDs must be contiguous 0..N-1 on every "
+                    f"core: core={core_id} task_ids={task_ids}"
+                )
+            reference_task_ids = task_ids
+        elif task_ids != reference_task_ids:
+            raise ValueError(
+                "schema-v4 Submit task IDs differ across cores: "
+                f"core={core_id} task_ids={task_ids}"
+            )
+
+    assert reference_task_ids is not None
+    alloc_by_task: dict[int, bool] = {}
+    for task_id in reference_task_ids:
+        markers = {
+            submit_semantics[(core_id, task_id)][1]
+            for core_id in range(num_cores)
+        }
+        if len(markers) != 1:
+            raise ValueError(
+                "schema-v4 Submit Alloc marker differs across cores for "
+                f"task {task_id}"
+            )
+        alloc_by_task[task_id] = markers.pop()
+
+    alloc_task_ids = [
+        task_id for task_id in reference_task_ids if alloc_by_task[task_id]
+    ]
+    if not alloc_task_ids or alloc_task_ids[0] != 0:
+        raise ValueError("schema-v4 dynamic task plan must begin with task 0 Alloc")
+
+    task_kind_by_id: dict[int, int] = {}
+    interval_ends = [*alloc_task_ids[1:], len(reference_task_ids)]
+    for alloc_task_id, interval_end in zip(alloc_task_ids, interval_ends):
+        interval_length = interval_end - alloc_task_id
+        payload_tasks = interval_length - 1
+        if payload_tasks % 4 != 0 or not 0 <= payload_tasks // 4 <= 4:
+            raise ValueError(
+                "schema-v4 dynamic batch must contain Alloc plus 0..4 complete "
+                "QK/SF/PV/UP groups: "
+                f"alloc_task={alloc_task_id} interval_length={interval_length}"
+            )
+        task_kind_by_id[alloc_task_id] = 0
+        for offset in range(1, interval_length):
+            task_kind_by_id[alloc_task_id + offset] = 1 + (offset - 1) % 4
+
+    if set(task_kind_by_id) != set(reference_task_ids):
+        raise AssertionError("schema-v4 dynamic task plan derivation is incomplete")
+    return task_kind_by_id
 
 
 # 读取 raw JSON，校验十列结构、字段范围与可转整数值，并返回规范化视图。
@@ -299,7 +391,7 @@ def _load_and_validate(
     v4_claims: dict[tuple[int, int], tuple[bool, bool, bool]] = {}
     v4_submits: set[tuple[int, int]] = set()
     v4_submit_semantics: dict[tuple[int, int], tuple[bool, bool]] = {}
-    v4_tails: dict[tuple[int, int], str] = {}
+    v4_tails: dict[tuple[int, int], tuple[str, int]] = {}
     # 逐行在写输出前检查列数、范围和可转整数的字段。任一行不满足这些约束
     # 都会整体拒绝输入，不生成缺少关键阶段的“部分可看”泳道。
     for index, row in enumerate(rows):
@@ -475,17 +567,18 @@ def _load_and_validate(
                     raise ValueError(
                         f"core {core_id} has duplicate schema-v4 tail for task {task_id}"
                     )
-                if phase == "WinnerBuild":
-                    expected_function = task_id % 5 - 1
-                    if task_id % 5 == 0 or function_id != expected_function:
-                        raise ValueError(
-                            f"fdwic_events[{index}] WinnerBuild function/task mismatch"
-                        )
-                elif function_id != -1 or task_id % 5 != 0:
+                if phase == "WinnerBuild" and function_id not in KERNEL_NAMES:
                     raise ValueError(
-                        f"fdwic_events[{index}] AllocComplete must belong to an Alloc task"
+                        f"fdwic_events[{index}] WinnerBuild has invalid function_id "
+                        f"{function_id}"
                     )
-                v4_tails[task_key] = phase
+                if phase == "AllocComplete" and function_id != -1:
+                    raise ValueError(
+                        f"fdwic_events[{index}] AllocComplete requires function_id=-1"
+                    )
+                # task 类型必须等所有核的 Submit Alloc 标记齐全后再推导；
+                # 这里仅保存尾动作自己的权威 function，避免恢复固定 %5 假设。
+                v4_tails[task_key] = (phase, function_id)
         if start_cycle <= 0 or end_cycle < start_cycle:
             raise ValueError(
                 f"fdwic_events[{index}] has invalid cycles start={start_cycle} end={end_cycle}"
@@ -541,9 +634,11 @@ def _load_and_validate(
                     )
         if set(v4_claims) != v4_submits:
             raise ValueError("schema-v4 Claim keys do not match Submit keys")
+        task_kind_by_id = _derive_v4_task_kinds(v4_submit_semantics, num_cores)
         for task_key, (attempted, won, is_alloc) in v4_claims.items():
             submit_won, submit_alloc = v4_submit_semantics[task_key]
-            expected_alloc = task_key[1] % 5 == 0
+            task_kind = task_kind_by_id[task_key[1]]
+            expected_alloc = task_kind == 0
             if is_alloc != expected_alloc or submit_alloc != expected_alloc:
                 raise ValueError(
                     f"schema-v4 task-kind mismatch at {task_key}: "
@@ -553,7 +648,11 @@ def _load_and_validate(
                 raise ValueError(f"schema-v4 Claim won without attempt at {task_key}")
             if submit_won != won or submit_alloc != is_alloc:
                 raise ValueError(f"schema-v4 Submit/Claim semantics mismatch at {task_key}")
-            expected_tail = "AllocComplete" if is_alloc else "WinnerBuild"
+            expected_tail = (
+                ("AllocComplete", -1)
+                if is_alloc
+                else ("WinnerBuild", task_kind - 1)
+            )
             actual_tail = v4_tails.get(task_key)
             # 只为 winner 记录真实尾动作；loser 没有尾记录，其剩余时间
             # 由 Submit 的离线补集表示。
@@ -561,7 +660,8 @@ def _load_and_validate(
             if not tail_valid:
                 raise ValueError(
                     f"schema-v4 tail mismatch at {task_key}: "
-                    f"expected {expected_tail if won else 'no winner tail'}, got {actual_tail}"
+                    f"expected {expected_tail if won else 'no winner tail'}, "
+                    f"got {actual_tail}"
                 )
 
     if trace_schema_version >= 3:
