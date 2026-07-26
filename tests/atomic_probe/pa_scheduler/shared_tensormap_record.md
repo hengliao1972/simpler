@@ -6994,3 +6994,138 @@ AIC/AIV 后：
 `.text` 原始字节，而不是用整文件 hash 冒充热路径证据。结果证明该抽取没有
 改变 private AIC/AIV 指令内容；后续 shared/private 的依赖差异也不会来自两份
 逐渐漂移的 hash/range 算法。
+
+### 2026-07-26：S2b 独立实现 task-id 有序的 shared TensorMap 环原语
+
+本阶段新增 `shared_tensor_map.h`，但仍然**不从 facade/Submit 调用**，
+`kFdwicCompiledBackendReady` 继续让 shared artifact 在零 Submit 前明确
+退出。这样只验证共享环自身的状态机，不把 winner 选择、fatal 收敛或 PA
+region-intent 混进同一提交。
+
+#### 有序单追加者合同
+
+本轮沿用 standalone S2.5 已闭合的 exact-turn 方案，而不是第 12 章早期的
+通用 MPSC `reserve`：
+
+```text
+task N 的唯一 winner：
+  committed_tasks 必须恰好等于 N
+  -> 完成 N 的全部 lookup
+  -> reclaim_upto = max(-1, N-H-1)
+  -> 对本 task 全部 entry 做整批 preflight
+  -> 逐 entry 发布 payload/seq/tail
+  -> committed_tasks = N+1
+```
+
+落后 actor 看到 `committed_tasks>N` 属于陈旧调用并报协议错误；未来 actor
+看到 `<N` 只能等待，不能修改 reclaim/head/tail/slot。零 entry task 也必须
+推进 `committed_tasks`，否则任务序列会永久停在没有 TensorMap output 的
+普通 task。
+
+只有 exact-turn winner 读取 shared map；已经被其他核完成的慢速 replay
+actor 不再 lookup 或 publish。因此 task N 完成 lookup 后，未来仍可能执行
+lookup 的最小 task 是 N+1，其合法历史下界不小于 `N-H+1`，使用 inclusive
+`reclaim_upto=max(-1,N-H-1)` 不会回收未来 winner 仍需要的版本。这里没有
+重新引入已在 standalone S2.5 删除的 `core_progress[]`。
+
+#### lookup、整 task preflight 与错误口径
+
+lookup 只接受：
+
+```text
+producer ∈ [max(0,N-H), N)
+```
+
+每个候选槽按 `seq -> invalidate payload -> 本地 snapshot -> seq` 双检，
+两次 absolute seq 必须都等于 cursor；字段还必须满足
+`producer>=0`、`reserved==0` 和 `lo<hi`。正常查不到返回 `-1` 且
+`protocol_ok=true`；seq/游标/字段损坏返回 `-1` 且
+`protocol_ok=false`，调用层不能把协议错误伪装成无依赖。
+
+append 前先检查整个 task：
+
+- 所有 entry 的 `producer` 必须严格等于当前 task N；
+- 同 task 多 entry 落入同桶时，把更早 entry 计入预期占用和 cursor；
+- touched bucket 可以保留已经证明正确的单调 head/reclaim 推进；
+- 任一桶容量不足时，不得发布本 task 的任何 payload、seq、tail 或 commit；
+- `Ready`、`CapacityBlocked`、`ProtocolError` 三种结果保持独立。
+
+单槽 writer 顺序为：
+
+```text
+seq 置 -1
+-> invalidate payload line
+-> 写 32B 逻辑值
+-> flush 独占 payload line
+-> 发布 absolute seq
+-> 推进该桶 tail
+```
+
+全部 entry 成功后才发布 task commit。首圈目标槽旧 seq 必须为 `-1`，后续
+lap 必须为 `cursor-CAP`；这使固定物理槽复用时仍能识别 ABA。当前状态迁移
+先与 standalone 一致采用 Exchange，并通过返回旧值检测 exact-turn 合同。
+异常路径仍可能产生“写入后发现旧值不符”的瞬态，下一独立提交会把这些迁移
+改为 CAS；在 CAS 闭合前不会接入多核 Submit。
+
+#### 审查补出的边界
+
+初版 CPU UT 和 production TU 的 include 顺序掩盖了头文件对 `state.h` 的
+真实依赖；最终测试先只引入平台 `inner_kernel.h` 和
+`shared_tensor_map.h`，再引入 AICPU reset 头，锁定 shared header 自身可解析。
+
+另外 lookup 与所有写入口都统一拒绝 `N>=kFlagCap`，且任何环修改前完成
+该检查。写 cursor 必须严格小于 `INT64_MAX`，因为
+`cursor==INT64_MAX` 虽可表示，随后发布 `tail=cursor+1` 会发生有符号
+溢出；read-only cursor 仍允许等于该上界。
+
+容量测试不只覆盖“完全没有回收的满桶”：
+
+1. 满桶后只安全回收 producer 0，当前 task 仍要向同桶追加两个 entry；
+   结果允许 `reclaim/head` 前进，但所有 slot、tail 和 commit 不变；
+2. 满桶后精确回收 K 个旧槽，并由同一 task 向同桶追加 K 个 replacement，
+   验证 earlier-entry 计数和 absolute seq 的成功边界；
+3. 逆序到达的 future actor 对整张 map 零修改，轮次到达后按 task id
+   逐一且仅一次提交；重复到达的 stale actor 是协议错误而不是永久 Pending。
+
+#### 本阶段证据
+
+| 检查 | 结果 |
+| --- | --- |
+| CAP32/64/128/256/16384 shared ring UT | 5/5 PASS，共 13 类协议门槛 |
+| 所有相关 FDWIC C++ 目标 | 21/21 PASS |
+| GCC15 ASAN+UBSAN 同一组 FDWIC 目标 | 21/21 PASS，无报告 |
+| 固定种子 12,000-task lookup/reference 差分 | 五种 CAP 全部 PASS |
+| 修正后 shared CCEC + 显式 wrapper probe | 五种 CAP 的 AIC/AIV/final 全部链接通过 |
+| private production AIC `.text` | 94,600B，SHA256 `a8eae234f72f...`，与 S1 逐字节相同 |
+| private production AIV `.text` | 95,512B，SHA256 `5dbfda402594...`，与 S1 逐字节相同 |
+| `git diff --check` | PASS |
+
+CCEC probe 显式实例化
+`lookup_region/lookup_tensor/refresh_reclaim/check_task_append/`
+`append_prepared_task/publish_commit`，而不是只让 production TU 解析未使用
+的模板。五档证据位于：
+
+```text
+/tmp/fdwic-s2-shared-final-cap-matrix-20260726/
+```
+
+该目录的 combined/final 尺寸包含仓库外 probe，只能证明 CCEC
+primitive/template 可实例化和链接，不能作为正常 production ELF 的代码体积
+或性能数据。private 指令对比则使用：
+
+```text
+/tmp/fdwic-s2-private-final-text-compare-20260726/
+```
+
+比较对象是 ELF `.text` 原始字节，不是会受源码路径和调试元数据影响的完整
+`.o` hash。
+
+尝试构建 tests/ut/cpp 的全体无关目标时，仍会命中已记录的 A2/A3
+`PTO2TaskPayload` 结构断言：实际 offset 568、规范 576；本阶段精确构建并
+运行的 21 个 A5 FDWIC 目标全部通过，不能把全仓失败隐去，也不能把既有
+A2/A3 问题归因于本次 shared 实现。
+
+当前尚未证明 A5 多核跨 cache 可见性，也没有证明 Submit winner/fatal/drain
+收敛；CPU 事件账本只证明调用顺序，CCEC 只证明目标指令可以生成。下一阶段
+先用 CAS 消除状态迁移失败时的瞬态覆写，再接入 task-level
+prepare/append/commit，继续保持 shared 顶层门禁。

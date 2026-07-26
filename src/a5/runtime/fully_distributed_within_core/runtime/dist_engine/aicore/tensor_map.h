@@ -12,6 +12,9 @@
 #pragma once
 
 #include "dist_engine/aicore/private_tensor_map.h"
+#if PTO_FDWIC_SHARED_MAP
+#include "dist_engine/aicore/shared_tensor_map.h"
+#endif
 
 namespace {
 
