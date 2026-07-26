@@ -850,6 +850,7 @@ PA_DEVICE uint32_t CollectSharedFanin(
     int32_t fanin[kMaxFanin], bool &protocol_ok,
     uint32_t &ordinary_lookup_count,
     PA_GM volatile int32_t *fatal = nullptr,
+    int32_t chained_producer_task_id = -1,
     int32_t expected_shared_writer = -1
 ) {
     protocol_ok = true;
@@ -858,6 +859,40 @@ PA_DEVICE uint32_t CollectSharedFanin(
         args.tensor_count > static_cast<int32_t>(kMaxTaskTensors)) {
         protocol_ok = false;
         return 0;
+    }
+    if constexpr (ChainedWriter) {
+        // PA 的三个 accumulator 共用同一个 Alloc producer，后续每个 UP
+        // 同步推进这三个 slot。显式的 (producer,writer) 对只选择这一
+        // symbol cell；本组 SF/PV 等 fresh refs 仍按自己的 producer
+        // 校验。selector 必须至少命中一个消费引用，不能传错后静默退化。
+        if (chained_producer_task_id < 0 ||
+            chained_producer_task_id >= expected_shared_writer ||
+            expected_shared_writer >= task_id) {
+            protocol_ok = false;
+            return 0;
+        }
+        bool matched_chain_ref = false;
+        for (int32_t index = 0; index < args.tensor_count; ++index) {
+            const TensorArgType tag =
+                TaskTag(args, static_cast<uint32_t>(index));
+            if (tag == TensorArgType::Output ||
+                (tag != TensorArgType::Input &&
+                 tag != TensorArgType::Inout &&
+                 tag != TensorArgType::OutputExisting)) {
+                continue;
+            }
+            const TaskTensorRef &reference = args.tensors[index];
+            if (reference.kind != TensorRefKind::SharedOutputRef) {
+                continue;
+            }
+            matched_chain_ref |=
+                SharedOutputReference(reference).producer_task_id ==
+                    chained_producer_task_id;
+        }
+        if (!matched_chain_ref) {
+            protocol_ok = false;
+            return 0;
+        }
     }
 
     int32_t validated_fanin[kMaxFanin] = {};
@@ -925,11 +960,14 @@ PA_DEVICE uint32_t CollectSharedFanin(
                 }
             }
             // 默认实例保持单组 PA 原协议：writer 必须精确等于 descriptor
-            // producer。只有显式实例化 ChainedWriter 的多组 UP 才允许
-            // descriptor identity 不变、writer 精确等于调用者给出的前一
-            // UP；不能用“任意较早 task”掩盖跳级或陈旧 writer。
+            // producer。显式 ChainedWriter 用 producer identity 选择跨组
+            // accumulator；只有被选 cell 精确匹配前一 UP，本组 SF/PV
+            // 等 fresh refs 仍精确匹配各自 producer。
+            const bool chained_ref =
+                ChainedWriter &&
+                output_ref.producer_task_id == chained_producer_task_id;
             const int32_t expected_writer =
-                ChainedWriter
+                chained_ref
                     ? expected_shared_writer
                     : output_ref.producer_task_id;
             if (expected_writer < output_ref.producer_task_id ||
@@ -1083,7 +1121,9 @@ PA_DEVICE bool WaitForSharedWriterReady(
 
 // 只有任务的本地执行状态已经成功建立后，才提交它消费的 INOUT writer。
 // FetchMax 返回旧 writer；默认实例要求精确等于 descriptor producer，
-// 显式 ChainedWriter 实例则要求精确等于调用方给出的前一 writer。
+// 显式 ChainedWriter 实例按原 producer identity 选择链式 symbol，并要求
+// 其旧值精确等于调用方给出的前一 writer；其他 fresh symbol 仍匹配各自
+// producer。
 // 异常旧值即使被 FetchMax 推进也不回滚：该 RMW 已经线性化，多 symbol
 // 提交不是事务，伪造负向 RMW 会抹掉故障现场。调用者随后广播 fatal，
 // 整个调度不再继续消费该状态。
@@ -1091,11 +1131,47 @@ template <typename Ops, bool ChainedWriter = false>
 PA_DEVICE bool CommitSharedFaninWriters(
     PA_GM SharedTensorMapSidecar &map, const TaskArgs &args,
     int32_t task_id, LocalStats &stats,
+    int32_t chained_producer_task_id = -1,
     int32_t expected_shared_writer = -1
 ) {
     if (args.tensor_count < 0 ||
         args.tensor_count > static_cast<int32_t>(kMaxTaskTensors)) {
         return false;
+    }
+    if constexpr (ChainedWriter) {
+        if (chained_producer_task_id < 0 ||
+            chained_producer_task_id >= expected_shared_writer ||
+            expected_shared_writer >= task_id) {
+            return false;
+        }
+        // 先验证 selector 确实命中至少一个合法 shared 写引用，再执行任何
+        // FetchMax。调用参数错误不属于并发失败，不能留下半次 writer 推进。
+        bool matched_chain_writer = false;
+        for (int32_t index = 0; index < args.tensor_count; ++index) {
+            const TensorArgType tag =
+                TaskTag(args, static_cast<uint32_t>(index));
+            if (tag != TensorArgType::Inout &&
+                tag != TensorArgType::OutputExisting) {
+                continue;
+            }
+            const TaskTensorRef &reference = args.tensors[index];
+            if (reference.kind != TensorRefKind::SharedOutputRef) {
+                continue;
+            }
+            const FdwicOutputRef output_ref =
+                SharedOutputReference(reference);
+            if (!IsPlainSharedOutputRef(output_ref) ||
+                output_ref.producer_task_id < 0 ||
+                output_ref.producer_task_id >= task_id) {
+                return false;
+            }
+            matched_chain_writer |=
+                output_ref.producer_task_id ==
+                    chained_producer_task_id;
+        }
+        if (!matched_chain_writer) {
+            return false;
+        }
     }
     for (int32_t index = 0; index < args.tensor_count; ++index) {
         const TensorArgType tag =
@@ -1115,8 +1191,11 @@ PA_DEVICE bool CommitSharedFaninWriters(
             output_ref.producer_task_id >= task_id) {
             return false;
         }
+        const bool chained_ref =
+            ChainedWriter &&
+            output_ref.producer_task_id == chained_producer_task_id;
         const int32_t expected_writer =
-            ChainedWriter
+            chained_ref
                 ? expected_shared_writer
                 : output_ref.producer_task_id;
         if (expected_writer < output_ref.producer_task_id ||
@@ -1135,6 +1214,94 @@ PA_DEVICE bool CommitSharedFaninWriters(
             return false;
         }
         ++stats.result.shared_symbol_inout_commits;
+    }
+    return true;
+}
+
+// PA 的 non-final UP 在 winner Build 前登记 shared-output writer，并以
+// deps_prepared 放行同 task losers。这里只覆盖 PA 已知的三条 accumulator
+// symbol；普通 region writer 必须另走完整 region-intent 协议，不能被本
+// helper 静默忽略。成功时 context.fanin 已可供后续 winner Build 复用，
+// Finish 不得再次 Collect 或 Commit。
+template <typename Ops, bool ChainedWriter = false>
+PA_DEVICE bool PreparePaSharedWriterIntent(
+    PA_GM SchedulerState *state, const TaskArgs &args,
+    SubmitContext &context, LocalStats &stats,
+    int32_t chained_producer_task_id = -1,
+    int32_t expected_shared_writer = -1
+) {
+    const int32_t task_id = context.task_id;
+    if (state == nullptr || !context.won || task_id < 0 ||
+        task_id >= static_cast<int32_t>(kMaxTasks) ||
+        args.has_error ||
+        args.tensor_count < 0 ||
+        args.tensor_count > static_cast<int32_t>(kMaxTaskTensors) ||
+        args.scalar_count < 0 ||
+        args.scalar_count > static_cast<int32_t>(kMaxTaskScalars)) {
+        if (state != nullptr) {
+            SetFatal<Ops>(state, stats, task_id);
+        }
+        return false;
+    }
+
+    uint32_t shared_writer_refs = 0;
+    for (int32_t index = 0; index < args.tensor_count; ++index) {
+        const TensorArgType tag =
+            TaskTag(args, static_cast<uint32_t>(index));
+        if (tag != TensorArgType::Inout &&
+            tag != TensorArgType::OutputExisting) {
+            continue;
+        }
+        const TaskTensorRef &reference = args.tensors[index];
+        if (reference.kind == TensorRefKind::SharedOutputRef) {
+            ++shared_writer_refs;
+            continue;
+        }
+        // PA 的 output_view 是唯一非 symbol INOUT，并由 manual_dep
+        // 显式排除自动 hazard。任何普通 region writer 都不能借这个
+        // PA 专用快路越过登记。
+        bool manual_dep = false;
+        if (reference.kind == TensorRefKind::GmTensor &&
+            reference.pointer.gm_tensor != nullptr) {
+            manual_dep = reference.pointer.gm_tensor->manual_dep;
+        } else if (reference.kind == TensorRefKind::LocalTensor &&
+                   reference.pointer.local_tensor != nullptr) {
+            manual_dep = reference.pointer.local_tensor->manual_dep;
+        }
+        if (!manual_dep) {
+            SetFatal<Ops>(state, stats, task_id);
+            return false;
+        }
+    }
+    // 这是 PA UP 专用快路，不是 ordinary-region writer 的通用替代品。
+    // 三个 shared writer 必须正好对应 output/sum/max accumulator；缺失或
+    // 多出任意一个都拒绝发布门，避免后继在 writer 状态不完整时前进。
+    if (shared_writer_refs != 3) {
+        SetFatal<Ops>(state, stats, task_id);
+        return false;
+    }
+
+    bool protocol_ok = false;
+    uint32_t ordinary_lookup_count = 0;
+    context.fanin_count =
+        static_cast<int32_t>(CollectSharedFanin<Ops, ChainedWriter>(
+            state->shared_map, args, task_id,
+            static_cast<int32_t>(state->heap_window), stats,
+            context.fanin, protocol_ok, ordinary_lookup_count,
+            &state->fatal.value, chained_producer_task_id,
+            expected_shared_writer
+        ));
+    if (!protocol_ok || ordinary_lookup_count != 0) {
+        SetFatal<Ops>(state, stats, task_id);
+        return false;
+    }
+    if (!CommitSharedFaninWriters<Ops, ChainedWriter>(
+            state->shared_map, args, task_id, stats,
+            chained_producer_task_id, expected_shared_writer
+        ) ||
+        !PublishSharedWriterReady<Ops>(state, task_id)) {
+        SetFatal<Ops>(state, stats, task_id);
+        return false;
     }
     return true;
 }

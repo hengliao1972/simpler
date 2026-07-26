@@ -462,7 +462,7 @@ void TestPublishAndResolve() {
     const uint32_t successor_count = CollectSharedFanin<SymbolTestOps, true>(
         *map, successor_args, 3, kHeapWindow,
         successor_stats, successor_fanin, protocol_ok, ordinary_lookups,
-        nullptr, 2
+        nullptr, 0, 2
     );
     Check(protocol_ok, "post-INOUT successor resolves the same shared descriptor");
     Check(
@@ -475,7 +475,7 @@ void TestPublishAndResolve() {
     );
 }
 
-void TestWriterReadyGateSerializesTwoWriterStages() {
+void TestPaTwoGroupWriterReadyGate() {
     SchedulerState *state = MapSparseSchedulerState();
     if (state == nullptr) {
         ++g_failures;
@@ -483,47 +483,114 @@ void TestWriterReadyGateSerializesTwoWriterStages() {
     }
     ResetSharedState(state->shared_map);
     state->fatal.value = 0;
+    constexpr int32_t alloc = 0;
+    constexpr int32_t first_sf = 2;
+    constexpr int32_t first_pv = 3;
     constexpr int32_t first_up = 4;
+    constexpr int32_t second_sf = 6;
+    constexpr int32_t second_pv = 7;
     constexpr int32_t second_up = 8;
     state->tasks[first_up].deps_prepared = -1;
 
-    TensorDesc descriptors[3] = {
-        MakeTensor(0x310000000ULL, 0),
-        MakeTensor(0x310001000ULL, 0),
-        MakeTensor(0x310002000ULL, 0),
+    const auto OutputRef = [](int32_t producer, int16_t slot) {
+        return FdwicOutputRef{producer, slot, 0, 0, 0, 0};
     };
-    for (uint32_t slot = 0; slot < 3; ++slot) {
-        SharedOutputCell &cell = state->shared_map.shared_outputs[0];
-        cell.published[slot].value = 0;
-        cell.last_writer[slot].value = 0;
-        cell.tensors[slot] = descriptors[slot];
-    }
+    const auto SeedOutput = [&](int32_t producer, int16_t slot, uint64_t address) {
+        SharedOutputCell &cell =
+            state->shared_map.shared_outputs[
+                static_cast<uint32_t>(producer)
+            ];
+        cell.published[static_cast<uint32_t>(slot)].value = producer;
+        cell.last_writer[static_cast<uint32_t>(slot)].value = producer;
+        cell.tensors[static_cast<uint32_t>(slot)] =
+            MakeTensor(address, static_cast<uint32_t>(producer));
+    };
+    SeedOutput(alloc, 0, 0x310000000ULL);
+    SeedOutput(alloc, 1, 0x310001000ULL);
+    SeedOutput(alloc, 2, 0x310002000ULL);
+    SeedOutput(first_sf, 1, 0x320001000ULL);
+    SeedOutput(first_sf, 2, 0x320002000ULL);
+    SeedOutput(first_pv, 0, 0x330000000ULL);
+    SeedOutput(second_sf, 1, 0x340001000ULL);
+    SeedOutput(second_sf, 2, 0x340002000ULL);
+    SeedOutput(second_pv, 0, 0x350000000ULL);
 
-    TensorDesc manual_output = MakeTensor(0x320000000ULL, 0);
-    manual_output.manual_dep = true;
+    PaOrchestrationState first_orchestration{};
+    InitPaOrchestration(first_orchestration, 1, nullptr);
+    first_orchestration.current_batch = 0;
+    first_orchestration.current_sequence =
+        2ULL * kPaBlocksPerRequest * kPaBlockSize;
+    first_orchestration.current_blocks = 2ULL * kPaBlocksPerRequest;
+    PreparePaBlockGroup(first_orchestration, 0);
+    first_orchestration.accumulated_output = OutputRef(alloc, 0);
+    first_orchestration.accumulated_sum = OutputRef(alloc, 1);
+    first_orchestration.accumulated_max = OutputRef(alloc, 2);
+    first_orchestration.sf_max = OutputRef(first_sf, 1);
+    first_orchestration.sf_sum = OutputRef(first_sf, 2);
+    first_orchestration.pv_output = OutputRef(first_pv, 0);
+
     TaskArgs first_args;
-    ConstructTaskArgs(first_args);
-    TaskArgs second_args;
-    ConstructTaskArgs(second_args);
-    for (uint32_t slot = 0; slot < 3; ++slot) {
-        const FdwicOutputRef reference{
-            0, static_cast<int16_t>(slot), 0, 0, 0, 0,
-        };
-        AppendSharedOutputRef(first_args, reference, TensorArgType::Inout);
-        AppendSharedOutputRef(second_args, reference, TensorArgType::Inout);
-    }
-    AddLocalTensor(first_args, manual_output, TensorArgType::Inout);
-    AddLocalTensor(second_args, manual_output, TensorArgType::Inout);
+    LocalStats first_build_stats{};
+    Check(
+        BuildCallbackSubmitArgs<TaskKind::Up>(
+            first_orchestration, first_args, 0, first_build_stats
+        ),
+        "first PA group builds the real UP argument shape"
+    );
+    Check(
+        first_args.tensor_count == 7 && first_args.scalar_count == 2 &&
+            TaskTag(first_args, 0) == TensorArgType::Input &&
+            TaskTag(first_args, 1) == TensorArgType::Input &&
+            TaskTag(first_args, 2) == TensorArgType::Input &&
+            TaskTag(first_args, 3) == TensorArgType::Inout &&
+            TaskTag(first_args, 4) == TensorArgType::Inout &&
+            TaskTag(first_args, 5) == TensorArgType::Inout &&
+            TaskTag(first_args, 6) == TensorArgType::Inout,
+        "UP args contain 3 fresh INPUTs, 3 accumulator INOUTs, and output view"
+    );
+    Check(
+        first_args.scalars[0] == 1 && first_args.scalars[1] == 0,
+        "first PA group carries is_first=1 and is_last=0"
+    );
 
+    PaOrchestrationState second_orchestration = first_orchestration;
+    PreparePaBlockGroup(second_orchestration, kPaBlocksPerRequest);
+    second_orchestration.sf_max = OutputRef(second_sf, 1);
+    second_orchestration.sf_sum = OutputRef(second_sf, 2);
+    second_orchestration.pv_output = OutputRef(second_pv, 0);
+    TaskArgs second_args;
     std::atomic<bool> waiter_finished{false};
+    std::atomic<bool> second_build_started{false};
     bool waiter_ok = false;
+    bool second_build_ok = false;
+    bool second_protocol_ok = false;
+    uint32_t second_ordinary_lookups = UINT32_MAX;
+    uint32_t second_fanin_count = 0;
+    int32_t second_fanin[kMaxFanin] = {};
     LocalStats waiter_stats{};
+    LocalStats second_build_stats{};
+    LocalStats second_stats{};
     SymbolTestOps::wait_address = &state->tasks[first_up].deps_prepared;
     SymbolTestOps::wait_loads.store(0, std::memory_order_relaxed);
     std::thread loser([&]() {
         waiter_ok = WaitForSharedWriterReady<SymbolTestOps>(
             state, first_up, waiter_stats
         );
+        if (waiter_ok) {
+            second_build_started.store(true, std::memory_order_release);
+            second_build_ok = BuildCallbackSubmitArgs<TaskKind::Up>(
+                second_orchestration, second_args, 0, second_build_stats
+            );
+            if (second_build_ok) {
+                second_fanin_count =
+                    CollectSharedFanin<SymbolTestOps, true>(
+                        state->shared_map, second_args, second_up,
+                        kHeapWindow, second_stats, second_fanin,
+                        second_protocol_ok, second_ordinary_lookups,
+                        nullptr, alloc, first_up
+                    );
+            }
+        }
         waiter_finished.store(true, std::memory_order_release);
     });
     while (SymbolTestOps::wait_loads.load(std::memory_order_acquire) == 0) {
@@ -533,27 +600,59 @@ void TestWriterReadyGateSerializesTwoWriterStages() {
         std::this_thread::yield();
     }
     Check(
-        !waiter_finished.load(std::memory_order_acquire),
-        "UP loser cannot return before the winner publishes writer-ready"
+        !waiter_finished.load(std::memory_order_acquire) &&
+            !second_build_started.load(std::memory_order_acquire),
+        "UP loser cannot build the next group before writer intent is ready"
     );
 
     LocalStats first_stats{};
+    SubmitContext first_context{};
+    first_context.task_id = first_up;
+    first_context.won = true;
     Check(
-        CommitSharedFaninWriters<SymbolTestOps>(
-            state->shared_map, first_args, first_up, first_stats
+        PreparePaSharedWriterIntent<SymbolTestOps>(
+            state, first_args, first_context, first_stats
         ),
-        "first UP commits all three accumulator writers"
+        "first non-final UP prepares writer intent before winner Build"
     );
     Check(
-        PublishSharedWriterReady<SymbolTestOps>(state, first_up),
-        "first UP publishes writer-ready after its commits"
+        first_context.fanin_count == 3 &&
+            first_context.fanin[0] == first_sf &&
+            first_context.fanin[1] == first_pv &&
+            first_context.fanin[2] == alloc &&
+            first_stats.result.map_lookups == 0,
+        "first UP intent resolves SF/PV/Alloc and excludes manual output view"
     );
     loser.join();
     SymbolTestOps::wait_address = nullptr;
-    Check(waiter_ok, "UP loser observes the exact writer-ready task id");
     Check(
-        waiter_finished.load(std::memory_order_acquire),
-        "UP loser returns after writer-ready publication"
+        waiter_ok && waiter_finished.load(std::memory_order_acquire) &&
+            second_build_started.load(std::memory_order_acquire),
+        "UP loser observes the exact gate and then builds the second group"
+    );
+    Check(
+        state->tasks[first_up].flag == 0,
+        "writer-ready does not impersonate the first UP completion flag"
+    );
+    Check(
+        second_build_ok && second_args.tensor_count == 7 &&
+            second_args.scalar_count == 2 &&
+            second_args.scalars[0] == 0 &&
+            second_args.scalars[1] == 1,
+        "second PA group builds real UP args with is_first=0 and is_last=1"
+    );
+    Check(
+        second_protocol_ok && second_fanin_count == 3 &&
+            second_fanin[0] == second_sf &&
+            second_fanin[1] == second_pv &&
+            second_fanin[2] == first_up,
+        "second UP keeps fresh SF/PV producers and uses first UP for accumulators"
+    );
+    Check(
+        second_ordinary_lookups == 0 &&
+            first_stats.result.shared_symbol_input_loads == 3 &&
+            second_stats.result.shared_symbol_input_loads == 3,
+        "both UP intents resolve three symbolic INPUTs and no ordinary region"
     );
     Check(
         !PublishSharedWriterReady<SymbolTestOps>(state, first_up),
@@ -581,28 +680,10 @@ void TestWriterReadyGateSerializesTwoWriterStages() {
     );
     state->fatal.value = 0;
 
-    LocalStats second_stats{};
-    int32_t second_fanin[kMaxFanin] = {};
-    bool protocol_ok = false;
-    uint32_t ordinary_lookups = UINT32_MAX;
-    const uint32_t fanin_count = CollectSharedFanin<SymbolTestOps, true>(
-        state->shared_map, second_args, second_up, kHeapWindow,
-        second_stats, second_fanin, protocol_ok, ordinary_lookups,
-        nullptr, first_up
-    );
-    Check(protocol_ok, "second UP resolves all three rewritten accumulators");
-    Check(
-        fanin_count == 1 && second_fanin[0] == first_up,
-        "second UP deduplicates three refs to the immediately preceding UP"
-    );
-    Check(
-        ordinary_lookups == 0,
-        "manual output view stays outside shared ordinary-region intent"
-    );
     Check(
         CommitSharedFaninWriters<SymbolTestOps, true>(
             state->shared_map, second_args, second_up, second_stats,
-            first_up
+            alloc, first_up
         ),
         "second UP commits over the first UP writer"
     );
@@ -615,12 +696,54 @@ void TestWriterReadyGateSerializesTwoWriterStages() {
     Check(
         first_stats.result.shared_symbol_inout_commits == 3 &&
             second_stats.result.shared_symbol_inout_commits == 3,
-        "two writer stages commit exactly three shared writers each"
+        "two PA groups register exactly three shared writers each"
+    );
+
+    LocalStats missing_selector_stats{};
+    int32_t missing_selector_fanin[kMaxFanin] = {};
+    bool missing_selector_ok = true;
+    uint32_t missing_selector_lookups = UINT32_MAX;
+    Check(
+        CollectSharedFanin<SymbolTestOps, true>(
+            state->shared_map, second_args, 12, kHeapWindow,
+            missing_selector_stats, missing_selector_fanin,
+            missing_selector_ok, missing_selector_lookups,
+            nullptr, 1, second_up
+        ) == 0 && !missing_selector_ok,
+        "chained resolver rejects a producer selector that matches no ref"
+    );
+    Check(
+        !CommitSharedFaninWriters<SymbolTestOps, true>(
+            state->shared_map, second_args, 12,
+            missing_selector_stats, 1, second_up
+        ),
+        "chained commit rejects a selector with no writable match"
+    );
+    LocalStats unchanged_writer_stats{};
+    int32_t unchanged_writer_fanin[kMaxFanin] = {};
+    bool unchanged_writer_ok = true;
+    uint32_t unchanged_writer_lookups = UINT32_MAX;
+    Check(
+        CollectSharedFanin<SymbolTestOps, true>(
+            state->shared_map, second_args, second_up, kHeapWindow,
+            unchanged_writer_stats, unchanged_writer_fanin,
+            unchanged_writer_ok, unchanged_writer_lookups,
+            nullptr, alloc, alloc
+        ) == 0 && !unchanged_writer_ok,
+        "chained resolver rejects producer==writer as a non-chain"
+    );
+    Check(
+        !CommitSharedFaninWriters<SymbolTestOps, true>(
+            state->shared_map, second_args, 12,
+            unchanged_writer_stats, alloc, alloc
+        ),
+        "chained commit also rejects producer==writer before mutation"
     );
     LocalStats invalid_expected_stats{};
     Check(
         !CommitSharedFaninWriters<SymbolTestOps, true>(
-            state->shared_map, second_args, 12, invalid_expected_stats, -1
+            state->shared_map, second_args, 12, invalid_expected_stats,
+            alloc, -1
         ),
         "chained commit rejects an invalid expected writer before mutation"
     );
@@ -631,23 +754,188 @@ void TestWriterReadyGateSerializesTwoWriterStages() {
         "invalid expected writer leaves every accumulator unchanged"
     );
 
-    // 这里先验证可复用协议原语，并不把 second_up=8 冒充成当前主拓扑的
-    // TaskKind::Up（主拓扑仍是每 batch 五 task）。故意把三个 writer
-    // 回退为其他较早 task，确认多组实例只接受调用者指定的前一 UP。
+    // 该测试使用真实 PA 的 task-id 顺序和 UP 参数构造，但默认主循环仍
+    // 固定每 batch 五 task，GetTaskKind(8) 尚不会返回 UP。这里明确只
+    // 证明双组 orchestration 参数与 writer-intent 原语，不冒充完整 replay
+    // 已接通。故意回退 writer，确认不能跳过前一 UP。
     for (uint32_t slot = 0; slot < 3; ++slot) {
-        state->shared_map.shared_outputs[0].last_writer[slot].value = first_up - 1;
+        state->shared_map.shared_outputs[alloc]
+            .last_writer[slot].value = first_up - 1;
     }
     LocalStats stale_stats{};
     int32_t stale_fanin[kMaxFanin] = {};
-    protocol_ok = true;
-    ordinary_lookups = UINT32_MAX;
+    bool stale_protocol_ok = true;
+    uint32_t stale_ordinary_lookups = UINT32_MAX;
     Check(
         CollectSharedFanin<SymbolTestOps, true>(
             state->shared_map, second_args, second_up, kHeapWindow,
-            stale_stats, stale_fanin, protocol_ok, ordinary_lookups,
-            nullptr, first_up
-        ) == 0 && !protocol_ok,
+            stale_stats, stale_fanin, stale_protocol_ok,
+            stale_ordinary_lookups, nullptr, alloc, first_up
+        ) == 0 && !stale_protocol_ok,
         "chained resolver rejects a stale writer instead of skipping a stage"
+    );
+
+    UnmapSparseSchedulerState(state);
+}
+
+void TestPaWriterIntentPreGateFailuresDoNotPublishGate() {
+    SchedulerState *state = MapSparseSchedulerState();
+    if (state == nullptr) {
+        ++g_failures;
+        return;
+    }
+    ResetSharedState(state->shared_map);
+    state->fatal.value = 0;
+    state->heap_window = kHeapWindow;
+    constexpr int32_t producer = 0;
+    constexpr int32_t writer = 4;
+    state->tasks[writer].deps_prepared = -1;
+
+    SharedOutputCell &cell = state->shared_map.shared_outputs[producer];
+    TaskArgs damaged_writer_args;
+    ConstructTaskArgs(damaged_writer_args);
+    for (uint32_t slot = 0; slot < 3; ++slot) {
+        cell.published[slot].value = producer;
+        cell.last_writer[slot].value = producer;
+        cell.tensors[slot] =
+            MakeTensor(0x360000000ULL + slot * 0x1000ULL, producer);
+        AppendSharedOutputRef(
+            damaged_writer_args,
+            FdwicOutputRef{
+                producer, static_cast<int16_t>(slot), 0, 0, 0, 0,
+            },
+            TensorArgType::Inout
+        );
+    }
+    cell.last_writer[2].value = -1;
+    SubmitContext damaged_writer_context{};
+    damaged_writer_context.task_id = writer;
+    damaged_writer_context.won = true;
+    LocalStats damaged_writer_stats{};
+    Check(
+        !PreparePaSharedWriterIntent<SymbolTestOps>(
+            state, damaged_writer_args, damaged_writer_context,
+            damaged_writer_stats
+        ) &&
+            state->fatal.value == 1 &&
+            state->tasks[writer].deps_prepared == -1 &&
+            cell.last_writer[0].value == producer &&
+            cell.last_writer[1].value == producer &&
+            cell.last_writer[2].value == -1,
+        "read-only intent validation failure changes no writer and publishes no gate"
+    );
+
+    state->fatal.value = 0;
+    state->tasks[writer].deps_prepared = -1;
+    cell.last_writer[2].value = producer;
+    PublicationFaultOps::fetch_race_address = &cell.last_writer[1].value;
+    SubmitContext partial_commit_context{};
+    partial_commit_context.task_id = writer;
+    partial_commit_context.won = true;
+    LocalStats partial_commit_stats{};
+    Check(
+        !PreparePaSharedWriterIntent<PublicationFaultOps>(
+            state, damaged_writer_args, partial_commit_context,
+            partial_commit_stats
+        ) &&
+            state->fatal.value == 1 &&
+            state->tasks[writer].deps_prepared == -1 &&
+            cell.last_writer[0].value == writer &&
+            cell.last_writer[1].value == writer &&
+            cell.last_writer[2].value == producer,
+        "partial writer commit keeps terminal prefix evidence but publishes no gate"
+    );
+    PublicationFaultOps::fetch_race_address = nullptr;
+
+    state->fatal.value = 0;
+    state->tasks[writer].deps_prepared = -1;
+    cell.last_writer[0].value = producer;
+    cell.last_writer[1].value = producer;
+    cell.last_writer[2].value = producer;
+    TaskArgs missing_accumulator_args = damaged_writer_args;
+    missing_accumulator_args.tensor_count = 2;
+    SubmitContext missing_accumulator_context{};
+    missing_accumulator_context.task_id = writer;
+    missing_accumulator_context.won = true;
+    LocalStats missing_accumulator_stats{};
+    Check(
+        !PreparePaSharedWriterIntent<SymbolTestOps>(
+            state, missing_accumulator_args, missing_accumulator_context,
+            missing_accumulator_stats
+        ) &&
+            state->fatal.value == 1 &&
+            state->tasks[writer].deps_prepared == -1 &&
+            cell.last_writer[0].value == producer &&
+            cell.last_writer[1].value == producer &&
+            cell.last_writer[2].value == producer,
+        "missing PA accumulator rejects the fast path before mutation or gate"
+    );
+
+    state->fatal.value = 0;
+    state->tasks[writer].deps_prepared = -1;
+    TaskArgs errored_args = damaged_writer_args;
+    errored_args.has_error = true;
+    SubmitContext errored_context{};
+    errored_context.task_id = writer;
+    errored_context.won = true;
+    LocalStats errored_stats{};
+    Check(
+        !PreparePaSharedWriterIntent<SymbolTestOps>(
+            state, errored_args, errored_context, errored_stats
+        ) &&
+            state->fatal.value == 1 &&
+            state->tasks[writer].deps_prepared == -1 &&
+            cell.last_writer[0].value == producer &&
+            cell.last_writer[1].value == producer &&
+            cell.last_writer[2].value == producer,
+        "errored frontend args are rejected before writer mutation or gate"
+    );
+
+    state->fatal.value = 0;
+    state->tasks[writer].deps_prepared = -1;
+    TaskArgs invalid_scalar_args = damaged_writer_args;
+    invalid_scalar_args.scalar_count =
+        static_cast<int32_t>(kMaxTaskScalars) + 1;
+    SubmitContext invalid_scalar_context{};
+    invalid_scalar_context.task_id = writer;
+    invalid_scalar_context.won = true;
+    LocalStats invalid_scalar_stats{};
+    Check(
+        !PreparePaSharedWriterIntent<SymbolTestOps>(
+            state, invalid_scalar_args, invalid_scalar_context,
+            invalid_scalar_stats
+        ) &&
+            state->fatal.value == 1 &&
+            state->tasks[writer].deps_prepared == -1 &&
+            cell.last_writer[0].value == producer &&
+            cell.last_writer[1].value == producer &&
+            cell.last_writer[2].value == producer,
+        "invalid scalar count is rejected before writer mutation or gate"
+    );
+
+    state->fatal.value = 0;
+    state->tasks[writer].deps_prepared = -1;
+    TensorDesc ordinary_writer = MakeTensor(0x370000000ULL, producer);
+    ordinary_writer.manual_dep = false;
+    TaskArgs ordinary_writer_args = damaged_writer_args;
+    AddLocalTensor(
+        ordinary_writer_args, ordinary_writer, TensorArgType::Inout
+    );
+    SubmitContext ordinary_writer_context{};
+    ordinary_writer_context.task_id = writer;
+    ordinary_writer_context.won = true;
+    LocalStats ordinary_writer_stats{};
+    Check(
+        !PreparePaSharedWriterIntent<SymbolTestOps>(
+            state, ordinary_writer_args, ordinary_writer_context,
+            ordinary_writer_stats
+        ) &&
+            state->fatal.value == 1 &&
+            state->tasks[writer].deps_prepared == -1 &&
+            cell.last_writer[0].value == producer &&
+            cell.last_writer[1].value == producer &&
+            cell.last_writer[2].value == producer,
+        "PA fast path rejects ordinary region writers before mutation or gate"
     );
 
     UnmapSparseSchedulerState(state);
@@ -1464,7 +1752,8 @@ void TestInvalidReferencesFailClosed() {
 int main() {
     TestSharedCompletionPublishesWithoutFrontier();
     TestPublishAndResolve();
-    TestWriterReadyGateSerializesTwoWriterStages();
+    TestPaTwoGroupWriterReadyGate();
+    TestPaWriterIntentPreGateFailuresDoNotPublishGate();
     TestWriterCommitFailuresKeepTerminalEvidence();
     TestMultiWriterFailureKeepsPartialTerminalEvidence();
     TestFailedSealDiscardsBuiltTask();

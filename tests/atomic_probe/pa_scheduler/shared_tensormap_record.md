@@ -4954,3 +4954,115 @@ private 的“无影响”另做了 HEAD/候选逐段对照，而不是只看用
 writer-ready gate 接到非末组 UP 的 winner/loser Submit，并让下一组
 显式传入前一 UP task id。届时需要新增调度级 CPU/CCEC/A5 正确性用例；
 在此之前不能把本阶段描述成“真实 PA 双组已跑通”。
+
+### 2026-07-26：S6.2 用真实 PA 双组参数验证 shared writer intent
+
+本阶段继续只完善 shared 多级 writer 的正确性基础，不把尚未接通的九
+task replay 冒充成完整功能，也不让 private 或现有单组 Case1 执行未来
+协议。private TensorMap 没有 shared output cell、`last_writer` 或跨组
+writer-ready 问题，所以验收标准是生成代码零变化，而不是“性能影响很小”。
+
+#### 真实混合引用暴露并修正了单参数模型
+
+上一阶段的定向测试只构造了三个 INOUT，容易误以为第二组 UP 的全部
+shared 引用都应匹配前一 UP。真实 `BuildCallbackSubmitArgs<Up>()`
+生成 7 个 tensor：
+
+```text
+SF max INPUT, SF sum INPUT, PV output INPUT,
+accumulated output/sum/max INOUT, manual output_view INOUT
+```
+
+因此第二组同时包含两类 producer：
+
+- 本组 SF/PV 的 fresh INPUT 必须继续匹配 task 6/7；
+- 三个 accumulator 的 descriptor identity 仍为 Alloc task 0，但
+  `last_writer` 必须精确匹配前一 UP task 4。
+
+`ChainedWriter` 现显式接收
+`(chained_producer_task_id, expected_shared_writer)`。只有原 producer
+等于 `chained_producer_task_id` 的 shared ref 才采用前一 writer，其余
+ref 仍匹配自身 producer；同时要求
+`producer < expected_writer < current_task`，且 selector 至少命中一条
+消费引用和一条写引用。传错 selector、`producer == writer`、陈旧 writer
+或跳级 writer 均 fail-closed，不能静默退化成默认路径。
+
+#### PA 专用 pre-Build writer-intent 契约
+
+新增的 `PreparePaSharedWriterIntent()` 只供 shared、non-final UP winner
+在 Build 前调用，顺序固定为：
+
+```text
+校验真实前端状态
+  -> CollectSharedFanin，结果写入 SubmitContext::fanin
+  -> CommitSharedFaninWriters，登记本 UP 为三个 accumulator 的 writer
+  -> StoreBarrier
+  -> 发布本 task 的 deps_prepared
+```
+
+该 helper 明确拒绝：
+
+- `args.has_error`、越界 tensor/scalar count 或非 winner context；
+- shared writer 数量不是恰好三个；
+- 除 `manual_dep` output_view 之外的 ordinary-region writer；
+- 任何 publication、旧 writer、selector 或 ordinary lookup 异常。
+
+成功只表示 fanin 已解析且 writer intent 已登记，不表示本 UP 的 kernel
+已经执行；task completion 仍由原 `flag` 发布。后续 Finish 接线必须复用
+`context.fanin` 并跳过第二次 Collect/Commit，确保三个 writer FetchMax
+恰好执行一次。当前阶段尚未修改 Finish，因此只把 helper 作为隔离原语
+测试，不能在主路径提前调用。
+
+失败语义也按 atomic 线性化边界表述：
+
+- Collect 或参数校验失败时 writer 不变、gate 保持 `-1`；
+- Commit 中途失败时，已经线性化的 writer 前缀保留为终止现场，未触碰
+  的后缀不变，gate 仍保持 `-1`，随后广播 fatal；
+- gate 本身使用 Exchange。若旧 gate 已经异常，它会写入当前 task id 后
+  返回失败并广播 fatal；终止态不回滚。不能把这一情形写成“发布失败时
+  gate 从未短暂 ready”，除非未来另行引入 CAS，而那会改变成功热路。
+
+#### 当前双组测试证明什么
+
+定向 CPU 测试使用真实 PA 构参器建立：
+
+```text
+Alloc0
+group0: QK1, SF2, PV3, UP4
+group1: QK5, SF6, PV7, UP8
+```
+
+它证明：
+
+- UP0 参数为 7 tensors / 2 scalars，`is_first=1,is_last=0`；
+- loser 在 UP0 writer intent 发布前不能开始构造第二组；
+- UP0 fanin 精确为 `{SF2, PV3, Alloc0}`；
+- 发布 gate 后 UP0 completion flag 仍未完成；
+- UP1 参数为 7 tensors / 2 scalars，`is_first=0,is_last=1`；
+- UP1 fanin 精确为 `{SF6, PV7, UP4}`；
+- 两组各登记三个 accumulator writer，最终三槽 writer 均为 UP8；
+- 解析失败、第二条 writer 登记故障、缺少 accumulator、前端 error、
+  scalar count 越界和 ordinary writer 均不会发布 gate。
+
+它尚未证明默认 main loop 能运行 task 8。现有代码仍把
+`task_id % 5` 当作 TaskKind，task 8 会被误判为 PV；Materialize、split
+Finish 和 host oracle 也有同类五 task 假设。下一阶段必须为 shared-only
+双组测试引入显式 task kind/group 元数据，并证明 early Prepare 后 Finish
+只消费已准备的 fanin，不可只在 main 中机械追加四次 Submit。
+
+#### 本阶段回归
+
+| 验证 | 结果 |
+| --- | --- |
+| CPU shared 全部严格告警定向测试 | PASS |
+| CPU shared b1 real-compute，全部业务/协议断言 | PASS |
+| single-group shared 的 5 个 `deps_prepared` | 全部保持 `-1` |
+| CCEC shared perf-clock 构建与 manifest | PASS |
+| CCEC shared single-group `.text/.rodata` | 129,080B / 288B |
+| CCEC shared 段 hash | 仍为 `90f58e...fd26` / `239e99...2ded` |
+| CPU private 当前/HEAD 可执行文件 | 逐字节相同，SHA256 均为 `ffa19a...fae4` |
+| CCEC private perf-clock 七个 device 对象 | `.text/.rodata` 段大小与字节 hash 全部相同 |
+
+上述 shared 代码段与 S6.1 完全相同，证明新增 helper 和测试没有让当前
+单组 B256 多出恒假分支。private 的 CPU 整体产物和 CCEC 七个 device
+对象代码/常量段也都不变；含 DWARF 的 CCEC 整对象不作为比较口径。
