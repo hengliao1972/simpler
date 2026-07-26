@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "host_support.h"
+#include "winner_workload_host.h"
 
 #include <cstdio>
 #include <memory>
@@ -86,6 +86,45 @@ bool CheckSingleContext(
           first->kind == TaskKind::Alloc;
     ok &= last != nullptr && last->is_last_in_batch;
     ok &= plan.TaskAt(expected_tasks) == nullptr;
+    return ok;
+}
+
+bool CheckRealComputeActivityContract(SchedulerState *state) {
+    bool ok = true;
+    const int32_t g0_context = 0;
+    SharedHostTaskPlan plan;
+    ok &= SetContextsAndBuild(
+        state, &g0_context, 1, &plan
+    );
+    for (uint32_t worker = 0; worker < kWorkers; ++worker) {
+        state->results[worker] = WorkerResult{};
+        state->results[worker].role = static_cast<uint32_t>(
+            worker < kAicWorkers ? CoreRole::Aic : CoreRole::Aiv
+        );
+    }
+
+    WinnerWorkloadOptions workload;
+    std::vector<float> workspace_image;
+    std::vector<float> outputs;
+    InitializeWinnerWorkloadBuffers(
+        workload, &workspace_image, &outputs
+    );
+    std::fill(
+        outputs.begin(), outputs.end(),
+        winner_workload::kOutputSentinel
+    );
+    ok &= RealComputeActivityMatchesPlan(*state, 0);
+    ok &= !RealComputeActivityMatchesPlan(*state, 1);
+    ok &= ValidateRealComputeOutputs(
+        *state, workload, outputs, 1
+    );
+
+    const int32_t g1_context = 8192;
+    ok &= SetContextsAndBuild(
+        state, &g1_context, 1, &plan
+    );
+    ok &= !RealComputeActivityMatchesPlan(*state, 0);
+    ok &= RealComputeActivityMatchesPlan(*state, 1);
     return ok;
 }
 
@@ -180,6 +219,10 @@ int main() {
     ok &= Check(
         CheckSingleContext(state.get(), 32768, 4, 17),
         "G4 context=32768 -> four full groups"
+    );
+    ok &= Check(
+        CheckRealComputeActivityContract(state.get()),
+        "real-compute activity follows G0/nonzero shared plan"
     );
 
     const int32_t mixed_contexts[] = {

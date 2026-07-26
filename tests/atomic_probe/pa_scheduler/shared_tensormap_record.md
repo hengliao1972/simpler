@@ -5607,3 +5607,59 @@ outputs/shared_dynamic_submit_pmu_v6_20260726/
 生成 raw。这不是放宽 PMU 契约的理由；下一小步应让 shared G0 明确接受
 零 active tile，同时保持 private 和 shared 非零 group 的
 `active_tiles != 0` 门槛不变，然后再继续 A5 动态矩阵。
+
+### 2026-07-26：S6.4f 修正 shared G0 的零 compute 输出门槛
+
+S6.4e 的 G0 失败不是 scheduler 或 PMU 错误。`context_len=0` 的权威
+计划只有一个 Alloc，四类 compute task 和 kernel 都应为零；device
+返回的 192 个 workload output tile 也全部保持 sentinel。真正的问题
+是通用 host 输出校验仍带着 private 固定五 task 的旧前提：
+
+```text
+active_tiles != 0
+```
+
+private 的每个合法 batch 固定包含 QK/SF/PV/UP，这个条件正确；shared
+G0 则必须恰好为零。本阶段没有跳过输出校验，也没有伪造 compute task，
+而是新增 host-only 的计划一致性判断：
+
+```text
+shared: (host plan total_groups != 0) == (active_tiles != 0)
+private: active_tiles != 0
+```
+
+随后仍逐元素验证所有 active tile 的计算结果和所有 inactive tile 的
+sentinel，并要求 `active + inactive == 192`。因此：
+
+- shared G0 必须是零 active，任一被意外改写的 sentinel 仍会失败；
+- shared G1/G2/G4/mixed 必须至少有一个 active tile，全零不能冒充 G0；
+- private 预处理 `#else` 仍执行原来的 `active_tiles != 0`。
+
+门槛测试直接覆盖 G0 的 192 个 sentinel 输出，以及 G0/G1 对
+`active_tiles=0/1` 的相反要求。验证结果：
+
+| 门槛 | 结果 |
+| --- | --- |
+| CPU shared 全部 host/协议定向门槛 | PASS |
+| CPU shared G0 real-compute 完整调度 | 0 kernel、0 active、192 sentinel，PASS |
+| CPU private 构建与 ring 定向门槛 | PASS |
+| CCEC shared/private submit-PMU Claim 重建与 manifest | PASS |
+| A5 shared G0 Claim | 1 call/核、96 calls、0 active、192 sentinel，schema-v6/HTML PASS |
+| A5 shared G1 Claim | 5 calls/核、480 calls、4 active、188 sentinel，PASS |
+| A5 private B1 Claim | 5 calls/核、480 calls、4 active、188 sentinel，schema-v5 PASS |
+| PMU owner configure/restore/cleanup | 三次正式样本全部 PASS |
+
+G0 和 G1 的新证据位于：
+
+```text
+outputs/shared_dynamic_submit_pmu_v6_20260726/
+  g0_claim_icache_raw.json
+  g0_claim_icache_report.html
+  g1_claim_icache_raw.json
+  g1_claim_icache_report.html
+  private_g1_claim_after_g0_raw.json
+  private_g1_claim_after_g0_report.html
+```
+
+本阶段只改 host 校验和 host-only 定向测试，不改 device 代码、PMU 窗口
+或 raw schema。上述单轮 Submit 时间仍只作可执行性证据。

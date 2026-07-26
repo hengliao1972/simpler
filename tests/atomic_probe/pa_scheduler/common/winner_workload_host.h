@@ -274,6 +274,23 @@ inline float ExpectedRealComputeValue(
     return kind == TaskKind::Sf ? input_a + input_b : input_a * input_b;
 }
 
+inline bool RealComputeActivityMatchesPlan(
+    const SchedulerState &state, uint32_t active_tiles
+) {
+#if PTO_FDWIC_SHARED_MAP
+    // shared G0 只有 Alloc，没有 QK/SF/PV/UP；0 个 active tile 是计划要求，
+    // 不能沿用 private “至少执行一个 compute kernel”的固定前提。非零 group
+    // 仍必须观察到 active tile，避免把漏执行 kernel 放宽成合法 G0。
+    SharedHostTaskPlan plan;
+    if (!BuildSharedHostTaskPlan(state, &plan)) return false;
+    return (plan.total_groups != 0U) == (active_tiles != 0U);
+#else
+    // private 每个合法 batch 固定包含 QK/SF/PV/UP，保持原门槛不变。
+    (void)state;
+    return active_tiles != 0U;
+#endif
+}
+
 inline bool ValidateRealComputeOutputs(
     const SchedulerState &state, const WinnerWorkloadOptions &workload,
     const std::vector<float> &outputs, uint32_t run
@@ -327,7 +344,9 @@ inline bool ValidateRealComputeOutputs(
             inactive_tiles += active ? 0U : 1U;
         }
     }
-    const bool passed = active_tiles != 0 && active_tiles + inactive_tiles == kOutputTiles;
+    const bool passed =
+        RealComputeActivityMatchesPlan(state, active_tiles) &&
+        active_tiles + inactive_tiles == kOutputTiles;
     std::printf(
         "[ASSERT] %-48s %s (active_tiles=%u inactive_sentinel_tiles=%u)\n",
         "real-compute output tiles match role-specific engine results",
