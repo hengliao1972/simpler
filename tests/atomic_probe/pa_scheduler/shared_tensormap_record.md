@@ -6666,3 +6666,38 @@ mismatch；ABI 版本差异负责拒绝继续执行。
 不依赖 linked/ring 内部布局的逻辑 reference 门槛，再在独立提交中替换
 private backend；不能把 shared 的 `seq`、有序 tail、全局 reclaim 或
 region-indent 混入 private 存储迁移。
+
+### 2026-07-26：R1b-d 先冻结 linked/ring 共同逻辑语义
+
+直接替换 private 存储后，如果测试同时从“链指针断言”改成“ring 游标断言”，
+很容易让实现和测试一起改变而失去差分依据。因此本阶段只扩展 production
+CPU-sim UT，不改任何 runtime 文件。新增 `LogicalReferenceMap` 只保存：
+
+- 独立计算的 `{buffer, byte_lo, byte_hi}` 半开区间；
+- producer id；
+- 单调 `alive_floor`。
+
+reference 不调用 production 的 element-size、byte-range、hash、retire、
+free-list 或 lookup helper，也不描述 bucket/CAP。它只回答共同的外部语义：
+相邻半开区间不重叠、不同 buffer 不相关、所有重叠版本中返回最大 producer、
+`producer < N-H` 才退休而 `producer == N-H` 仍存活。
+
+四组门槛分别覆盖：
+
+1. 空表、半开区间首尾相接、真实重叠和不同 buffer；
+2. producer 3/5/7 按真实单调顺序登记，lookup 必须返回 7，不能依赖物理
+   遍历方向返回第一个命中；
+3. `N=20,H=10` 的精确边界、重复 floor 和倒退 floor 幂等；
+4. 固定种子连续 12,000 task、`H=15`，每步比较刚插入、窗口内历史项和
+   随机 query，跨越十余轮 1024-task 窗口复用。
+
+长程 workload 任意时刻最多只有 16 个全局存活 entry，小于计划支持的最小
+单桶 CAP=32。因此该用例中的 insert 失败只能表示实现错误，不会把未来
+per-bucket 容量差异误判为 linked/ring 语义差异。现有六个 linked 专属测试
+暂时原样保留；backend 真正迁移时再删除 free-list/next/prev 的内部断言，
+新增四个逻辑测试必须一行不改继续通过。
+
+本阶段 `test_fdwic_tensor_map_retire` 共 10 项全部通过，其中新增 12,000-task
+差分约 41 ms；`git diff --check` 通过。下一阶段先替换 `DistTensorMap`
+存储和 private helper，再把容量集成测试改成真实填满目标 bucket，不能在
+同一提交改变现有“多 output 前缀可已登记、失败 task 不 Build”的合同。
