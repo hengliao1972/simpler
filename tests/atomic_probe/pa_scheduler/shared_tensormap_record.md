@@ -4662,3 +4662,97 @@ fail-closed；在接入真实 shared facade/backend 前跑板只能重复证明
 抽取 private/shared 共用 facade，并把 standalone 已证明的 private
 ring 以不改变默认 private 行为的方式接入；shared 仍保持 fail-closed，
 直到它自己的 CPU/CCEC 协议测试闭合。
+
+### 2026-07-26：迁移 review 的适用边界与 standalone 后续顺序
+
+新增审查材料：
+
+```text
+shared_tensormap_swimlane_deps_migration_review.md
+```
+
+该文档固定审查的是
+`fdwic-swimlane-deps@1726a774 -> fdwic-shared-tensormap@351ef62e`
+两条 production 分支。它提供了有价值的接口、缓存顺序、DFX 和验证
+检查表，但不能直接当成当前 standalone 的缺陷清单：本目录在该快照之后
+已经独立完成多轮实现、撤销和 A5 配对，且目标只是对等模拟 PA Case1，
+不是宣称覆盖 production 的全部 joint、BlockWon 和动态拓扑。
+
+#### 当前仍成立的问题
+
+第一，shared atomic 观察尚未全量闭合。当前 `AtomicSite` 只有 0～14
+共 15 个 common/private 站点；以下 shared Case1 活跃操作仍直接调用
+`Ops::*`：
+
+- shared heap cursor/vend 的 load、reserve fetch-add 和 vend fetch-add；
+- output `published` 的 probe/wait load 与 publication exchange；
+- output `last_writer` 的 load、INPUT writer 更新和 INOUT writer commit。
+
+因此既有 `logical == direct + PollBatch polls` 只证明“已经进入 wrapper 的
+调用自洽”，即使 `dropped=0` 也不能解释成真实 shared atomic 全覆盖。
+S3.2a 已记录这一限制，本次 review 进一步确认它应成为下一阶段的首要
+观察闭环，不再把 shared b1 的既有 atomic 数量写成协议总量。
+
+第二，追加 shared site 前必须先修 PollBatch mask。当前 burst state 已经
+按 `AtomicPollBatchIndex()` 使用紧凑的 0～5 下标，但 region enable mask
+仍由 `1U << raw_site_id` 构造。只要新增 site 编号达到 32，就会发生错误
+移位或启用错误站点。正确顺序是：
+
+```text
+S5.1  enable mask 完全改用紧凑 poll index，并补 >31 site 单测
+S5.2  只追加 PA Case1 实际活跃的 shared atomic site/wrapper
+S5.3  CPU closure + CCEC manifest + shared b1 atomic 泳道
+```
+
+wrapper 在 DFX 关闭时必须内联回原始 `Ops`，不得新增 load、分支、屏障，
+也不得把 source-issue 操作强行改成 return-ready。
+
+第三，standalone submit-PMU 不能称为“纯 Submit scalar”。硬件 gate
+实际从 `InitPaOrchestration()` 前开始，到本 worker 最后一次 Submit
+返回后停止；窗口包含 orchestration 初始化，也包含 winner 执行的真实
+Cube/Vector workload。目前没有 linked-kernel pause/resume，也没有一份
+同 ELF 的 return-ready atomic 排除 sidecar。因此当前 total/scalar/
+I-cache 只能解释为该 **PMU gate 全窗** 的原始计数，不能冒充扣除了
+kernel、初始化和总线等待后的纯 scalar 代码成本。后续单独处理：
+
+1. 先把 PMU gate 与首/末 Submit 边界对齐；
+2. 再在同一 ELF 内建立 linked-kernel pause/resume 计数闭环；
+3. return-ready atomic 只有在同构建、同窗口、可闭合时才允许排除，
+   不能拿互斥的 atomic-swimlane ELF 跨运行相减；
+4. 最后才按当前 span 选择少量局部 phase，不机械复制 production 的
+   Resolve/joint 阶段清单。
+
+#### 已完成、不要重做
+
+- private heap H1 首圈快路已经位于 fatal 检查之后并保留；
+- TwoLevel16 分层 final barrier 已是 standalone 默认；
+- private/shared 已由 `PTO_FDWIC_SHARED_MAP` 生成互斥 CPU/CCEC 变体，
+  目录、manifest、ELF hash 和 host/kernel mode 都会闭合；
+- S4.9 shared no-wrap、S4.8 descriptor 直写和 S4.14b Vector8 已通过
+  A5 配对并保留；
+- Alloc 固定候选/早退、pure INPUT deferred、loser shortcut、
+  24-owner Alloc、Cube sidecar、Vector16 和 WorkerState 前置均已按
+  预登记门槛否决并撤销，不能因 review 读到过程提交而重新实现。
+
+review 建议“所有非 DFX 收敛后才补观察工具”不适用于本次既定开发过程。
+用户已明确要求先夯实 scalar/atomic/PMU 观察再优化，且 perf-clock、PMU
+构建已经在编译期移除泳道记录路径；S4.9/S4.14 的保留或撤销也依赖这些
+证据。正确做法是继续保持三类 ELF 互不混算，而不是删除已经证明有效的
+观察基础。
+
+#### 属于能力边界，不是当前 Case1 缺陷
+
+- standalone 明确拒绝 `active_count >= 2`，所以没有 production
+  BlockWon/joint/mix_coown；若以后宣称模拟这些业务，必须另立阶段补齐；
+- standalone ABI 固定 32 AIC + 64 AIV。production 工具必须支持最多
+  108 worker，不代表 PA 专用模型要为了泛化而改变当前可比拓扑；
+- task id 不复用、每 task output 上限为 8、shared heap 有界 no-wrap
+  都由 API 与 host oracle 显式校验，是模型约束而非静默缺陷；
+- ordinary-region ring 是隔离协议测试，PA Case1 不走该热路。其 atomic
+  不应伪装成当前漏采的动态调用，也不应先于活跃 output/heap 站点扩展；
+- production 原有 phase 14～17 与来源 schema 冲突是未来真实路径迁移
+  风险；standalone v4 内部对这些编号已有唯一解释，不存在本目录自冲突。
+
+后续因此先完成 S5.1/S5.2 的观察正确性，再处理 PMU 纯 scalar 口径；
+不在同一提交里叠加性能候选，也不把 production 的八组 smoke 门禁、
+ambient `CXXFLAGS` 脚本或旧 shared ring oracle 搬进 standalone。
