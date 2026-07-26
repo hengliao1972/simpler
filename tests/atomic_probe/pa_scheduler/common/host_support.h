@@ -513,7 +513,14 @@ inline const char *AtomicSiteName(uint32_t site) {
         "FaninFlagLoad", "CompletionVendExchange", "CompletionFlagExchange",
         "FrontierInitialLoad", "FrontierFlagLoad", "FrontierMax", "HeapFrontierLoad",
         "HeapVendLoad", "ReplayDoneIncrement", "ReplayDonePoll",
+        "SharedHeapVendLoad", "SharedHeapCursorLoad",
+        "SharedHeapCursorReserve", "SharedHeapVendAdvance",
     };
+    static_assert(
+        sizeof(names) / sizeof(names[0]) ==
+            static_cast<uint32_t>(AtomicSite::Count),
+        "AtomicSiteName must cover every atomic site"
+    );
     return site < sizeof(names) / sizeof(names[0]) ? names[site] : "Unknown";
 }
 
@@ -584,6 +591,11 @@ inline bool AtomicRecordSchemaValid(const TraceRecord &record, bool atomic_trace
         return false;
     }
     const AtomicSite site = static_cast<AtomicSite>(record.auxiliary);
+#if !PTO_FDWIC_SHARED_MAP
+    // private ELF 不得接受 shared-only raw site；否则混用产物或损坏记录会
+    // 在 Count/op 校验均通过后被误报成合法 private atomic。
+    if (AtomicSiteIsSharedOnly(site)) return false;
+#endif
     const uint32_t op = record.flags & kAtomicOpMask;
     if (op != static_cast<uint32_t>(AtomicSiteExpectedOp(site))) return false;
 

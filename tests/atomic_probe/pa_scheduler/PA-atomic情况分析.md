@@ -2366,3 +2366,31 @@ S4.16b 复用同一地址、容量和 state，只把 active 与热路径取模�
 布局整体。S4.16b 相对它仅 1/6 更快、中位数
 `+2.468us/+0.1049%`，第一层即失败；未执行第二轮或相对
 `319077a9` 的第二层。两阶段源码均已撤销，当前恢复 capacity8/active8。
+
+#### 7.5.29 S5.2a shared heap 观察闭环
+
+前述 0～14、15-site 表属于 O2 的 common/private 历史证据，不回写其
+编号或当时的计数。本阶段以 append-only 方式新增 shared heap 的
+15～18 四个 site：
+
+```text
+SharedHeapVendLoad          Load       5 × batches
+SharedHeapCursorLoad        Load       4 × batches
+SharedHeapCursorReserve     FetchAdd   4 × batches
+SharedHeapVendAdvance       FetchAdd   4 × batches
+```
+
+四类旧值都参与容量判断或 reservation 地址/累计进度计算，CCEC 必须标
+return-ready，不存在 source-issue 热调用。A5 shared b1 实测合计
+5/4/4/4，17 条 direct 记录全部为 return-ready；raw 4,143 条、
+dropped=0，logical/physical/PollBatch 公式和业务断言全部闭合。证据为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260726_034146_3041189/
+```
+
+该阶段不改变 atomic 次数，也不是性能优化；它只让既有 shared heap
+调用进入可见观察闭环。output `published/last_writer` 尚未接入，所以
+当前 19-site schema 仍不能称为 shared 完整 atomic 清单。完整实现边界、
+CPU/CCEC 验证和 append-only schema 说明见
+`shared_tensormap_record.md` 的 S5.2a 节。

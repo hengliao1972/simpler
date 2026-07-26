@@ -1402,9 +1402,10 @@ PA_DEVICE bool FinishCallbackSubmitBody(
     BeginSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(pmu_context);
     bool materialized = true;
     if (__builtin_expect(winner, 0)) {
-        materialized = MaterializeTask<Ops>(
+        materialized = MaterializeTask<Ops, true>(
             worker, task_id, args, context, state->shared_map,
-            state->heap_base, state->heap_size
+            state->heap_base, state->heap_size,
+            &stats.trace, &stats.result
         );
         if (materialized) {
             stats.result.materialized_outputs += context.result.count;

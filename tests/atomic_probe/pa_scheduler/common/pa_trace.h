@@ -62,6 +62,8 @@ PA_DEVICE AtomicOp TraceAtomicSiteExpectedOp(AtomicSite site) {
     switch (site) {
         case AtomicSite::StartupIncrement:
         case AtomicSite::ReplayDoneIncrement:
+        case AtomicSite::SharedHeapCursorReserve:
+        case AtomicSite::SharedHeapVendAdvance:
             return AtomicOp::FetchAdd;
         case AtomicSite::FatalSet:
         case AtomicSite::CompletionVendExchange:

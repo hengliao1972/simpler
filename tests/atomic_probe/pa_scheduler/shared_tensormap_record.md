@@ -4808,3 +4808,66 @@ final barrier 的 region mask 均已切换到紧凑索引。
 
 该修改不会增加 raw record 字段、atomic 调用、load、barrier 或热路径
 分支；它是 S5.2 追加 shared 热路径 atomic 站点前必须先完成的观察基础。
+
+### 2026-07-26：S5.2a 接入 shared heap 四类 atomic 观察
+
+本阶段只处理 shared Case1 已经实际执行的 heap reserve，不同时修改
+output publication/last-writer。`AtomicSite` 在既有 0～14 后追加：
+
+| id | site | op | 返回值用途 | b1 固定次数 |
+| ---: | --- | --- | --- | ---: |
+| 15 | `SharedHeapVendLoad` | Load | aggregate vend 合法性、容量与零输出进度 | 5 |
+| 16 | `SharedHeapCursorLoad` | Load | 分片 cursor 合法性与 no-wrap 容量 | 4 |
+| 17 | `SharedHeapCursorReserve` | FetchAdd | 旧 cursor 决定唯一物理区间 | 4 |
+| 18 | `SharedHeapVendAdvance` | FetchAdd | 旧 vend 决定累计进度 | 4 |
+
+UP 的输出字节为 0，仍需要读取 aggregate vend，但不会读取或推进 shard
+cursor；因此 vend load 是 `5 × batches`，其他三类各为
+`4 × batches`。四类返回值全部参与协议判断，CCEC 记录必须为
+return-ready；尤其两个 FetchAdd 显式传入 `result_used=true`，不能沿用
+发布型 wrapper 的默认 source-issue 口径。
+
+实现上将 `stats.trace/stats.result` 从 shared `MaterializeTask` 显式传到
+`ReserveSharedOutputHeap`。单元测试继续使用模板默认
+`ObserveAtomics=false`，真实 scheduler 显式实例化 `true`。perf-clock 与
+submit-PMU 的 trace-free 构建中 `TraceAtomic*` 在编译期直接退化为原
+`Ops::*`，没有新增 load、运行时开关或 barrier。private 编译不经过该
+shared 接口；host schema 也新增模式门禁，private raw 出现 15～18 会被
+拒绝。
+
+本次采用 append-only raw site registry，十列 `TraceRecord` 布局和
+schema-v4 phase 语义均未改变；0～14 的历史 raw 仍按原义转换。Python raw
+当前不携带 TensorMap mode，因此 mode 交叉校验由编译态 host 与 CCEC
+artifact manifest 负责，converter 只校验 site/op/result-used。该限制不
+应被描述成 Python 已独立证明模式一致。
+
+验证结果：
+
+| 验证 | 结果 |
+| --- | --- |
+| converter 28 项测试，含四个新 return-ready site 与 Count 外拒绝 | PASS |
+| CPU private/shared 严格告警构建与全部定向测试 | PASS |
+| CPU private b1 atomic raw 中 shared-only site 行数 | 0 |
+| CPU shared b1 atomic raw：5/4/4/4，业务断言、closure、dropped=0 | PASS |
+| CCEC private/shared swimlane 与 artifact manifest | PASS |
+| CPU/CCEC shared perf-clock；最终 ELF 无泳道 record writer | PASS |
+| A5 shared b1：四站点合计 17，全部 return-ready | PASS |
+| A5 shared b1：业务/协议断言、raw→merged→exclusive、dropped=0 | PASS |
+
+A5 b1 证据：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260726_034146_3041189/
+```
+
+该轮 raw 共 4,143 条，`logical_calls=4,517`、
+`physical_records=862`、`batched_poll_calls=3,878`、
+`poll_batch_records=223`，满足
+`physical = logical - batched + batch_records`。四个 heap site 的
+AIC/AIV 合计分别为 5/4/4/4，17 条 direct 记录的 return-ready 比例均为
+100%。诊断 Submit 为 84.578us，只用于证明 b1 观察闭环，不能当作关闭
+观察后的性能基线。
+
+S5.2a 只关闭 review 中的 shared heap 漏采。`published` 快速 probe/等待、
+publication Exchange、`last_writer` load/init/commit 仍是下一小步；
+在它们接入前不能宣称 shared atomic 已全量覆盖。

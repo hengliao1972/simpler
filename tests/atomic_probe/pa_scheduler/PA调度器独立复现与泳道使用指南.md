@@ -813,7 +813,8 @@ atomic.poll_batch.<site>.load×<call_count>
 名称中的 `call_count` 是实际执行的源码 wrapper 调用次数，
 不是采样或估算值。
 
-当前固定 schema 共有 15 个调用点：
+当前固定 schema 共有 19 个调用点。0～14 是既有 common/private
+调用点，15～18 是 shared heap 第一批已接入的调用点：
 
 | `site_id` | Perfetto `site` | `op` | 所属路径 |
 | ---: | --- | --- | --- |
@@ -832,10 +833,21 @@ atomic.poll_batch.<site>.load×<call_count>
 | 12 | `heap_vend_load` | `load` | HeapGuard vend |
 | 13 | `replay_done_increment` | `fetch_add` | 回放完成屏障到达计数 |
 | 14 | `replay_done_poll` | `load` | 最终 drain 中轮询回放完成 |
+| 15 | `shared_heap_vend_load` | `load` | shared aggregate vend 预检 |
+| 16 | `shared_heap_cursor_load` | `load` | shared 分片 cursor 预检 |
+| 17 | `shared_heap_cursor_reserve` | `fetch_add` | 取得本 task 分片物理区间 |
+| 18 | `shared_heap_vend_advance` | `fetch_add` | 推进并取得 aggregate vend |
 
-上表是源码调用点集合，不代表每轮都会出现 15 类事件；例如正常成功路径不应
+上表是源码调用点集合，不代表每轮都会出现全部 19 类事件；例如正常成功路径不应
 执行 `fatal_set`。standalone 也没有真实 PA 后续追加的 BlockWon site，不能把真实
 PA 的九类 load 加一类 exchange allowlist 照搬到这里。
+
+shared heap 四个站点的返回值都参与协议判断：vend/cursor Load 用于合法性
+与容量检查，两个 FetchAdd 的旧值分别决定物理地址和累计进度。因此 CCEC
+direct 记录均使用 return-ready 边界；它们不是发布后即丢弃返回值的
+source-issue 操作。PA Case1 每 batch 固定执行 5 次 vend load，以及各 4 次
+cursor load、cursor reserve 和 vend advance。output publication/last-writer
+仍按后续 S5.2 小步接入，不能把当前 19-site schema 宣称为 shared 全覆盖。
 
 standalone 只允许以下六类 observation load 在**匹配的显式等待区内**进入
 PollBatch；同一 site 在等待区外的一次性或 opportunistic 读取仍是 direct Atomic：
@@ -878,7 +890,8 @@ raw 十列记录复算。不把这些重复复制到 merged，是为了控制数
   `startup_increment/replay_done_increment/completion_vend_exchange/`
   `completion_flag_exchange/fatal_set`。结束时钟与旧值无依赖，只能表示
   源码发射包围区间。
-- `return_value_ready`：协议本来就会判断返回值的 `Load/FetchMax`。CCEC
+- `return_value_ready`：协议本来就会判断返回值的
+  `Load/FetchAdd/FetchMax/Exchange`。CCEC
   在 atomic 后生成紧邻的 `dependent MOV -> MOV SYS_CNT`；这证明旧值已可被
   本核 scalar 消费，不证明其他核已看到发布的新值。
 

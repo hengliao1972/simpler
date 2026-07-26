@@ -12,7 +12,7 @@
 #ifndef PA_SCHEDULER_COMMON_PA_SHARED_HEAP_H
 #define PA_SCHEDULER_COMMON_PA_SHARED_HEAP_H
 
-#include "pa_model.h"
+#include "pa_trace.h"
 
 namespace pa_scheduler {
 
@@ -33,6 +33,47 @@ PA_DEVICE bool SharedHeapAligned(uint64_t value) {
     return (value & (kOutputAlignment - 1)) == 0;
 }
 
+// 单元测试默认实例化 ObserveAtomics=false，保持原有简洁 Ops 接口；真实
+// scheduler 显式选择 true 并传入本 worker 独占 trace/result。trace-free
+// 构建中的 TraceAtomic* 会在编译期退化为原始 Ops，不给性能基线增加分支。
+template <typename Ops, bool ObserveAtomics>
+PA_DEVICE int64_t SharedHeapAtomicLoad(
+    PA_GM volatile int64_t *address, int32_t task_id, AtomicSite site,
+    TraceContext *trace, WorkerResult *result
+) {
+    if constexpr (ObserveAtomics) {
+        return TraceAtomicLoad<Ops>(
+            *trace, *result, task_id, site, address
+        );
+    } else {
+        (void)task_id;
+        (void)site;
+        (void)trace;
+        (void)result;
+        return Ops::Load(address);
+    }
+}
+
+template <typename Ops, bool ObserveAtomics>
+PA_DEVICE int64_t SharedHeapAtomicFetchAdd(
+    PA_GM volatile int64_t *address, int64_t value, int32_t task_id,
+    AtomicSite site, TraceContext *trace, WorkerResult *result
+) {
+    if constexpr (ObserveAtomics) {
+        // 两个 FetchAdd 的旧值都决定本次 reservation，必须使用
+        // return-ready 边界，不能按发布型 source-issue 观察。
+        return TraceAtomicFetchAdd<Ops>(
+            *trace, *result, task_id, site, address, value, true
+        );
+    } else {
+        (void)task_id;
+        (void)site;
+        (void)trace;
+        (void)result;
+        return Ops::FetchAdd(address, value);
+    }
+}
+
 // no-wrap 是本阶段的明确边界：每个 shard 的绝对 cursor 只能从 0 推进到
 // shard_span，绝不取模。FetchAdd 返回的旧 cursor 是当前 task 唯一的物理
 // 区间；合法并发 writer 可以让它不同于前置 Load 的观察值，不能因此回滚。
@@ -40,10 +81,11 @@ PA_DEVICE bool SharedHeapAligned(uint64_t value) {
 // 容量竞争若在 FetchAdd 后才被发现，则本轮进入 terminal fatal 并保留已经
 // 推进的控制字供 host 取证。并发 allocator 绝不能用 Exchange 恢复预检
 // 快照，否则会覆盖其他 winner 的合法进度。
-template <class Ops>
+template <class Ops, bool ObserveAtomics = false>
 PA_DEVICE bool ReserveSharedOutputHeap(
     PA_GM SharedTensorMapSidecar &map, uint32_t task_id, uint64_t total,
-    uint64_t heap_size, SharedHeapReservation &reservation
+    uint64_t heap_size, SharedHeapReservation &reservation,
+    TraceContext *trace = nullptr, WorkerResult *result = nullptr
 ) {
     reservation.task_base = 0;
     reservation.aggregate_vend = 0;
@@ -66,7 +108,11 @@ PA_DEVICE bool ReserveSharedOutputHeap(
     const uint64_t usable_capacity =
         shard_span * kSharedHeapShards;
 
-    const int64_t checked_vend = Ops::Load(&map.shared_heap_vend.value);
+    const int64_t checked_vend =
+        SharedHeapAtomicLoad<Ops, ObserveAtomics>(
+            &map.shared_heap_vend.value, static_cast<int32_t>(task_id),
+            AtomicSite::SharedHeapVendLoad, trace, result
+        );
     if (checked_vend < 0) {
         return false;
     }
@@ -104,7 +150,11 @@ PA_DEVICE bool ReserveSharedOutputHeap(
     const uint32_t shard = task_id % kSharedHeapShards;
     PA_GM volatile int64_t *cursor_address =
         &map.shared_heap_cursor[shard].value;
-    const int64_t signed_cursor_before = Ops::Load(cursor_address);
+    const int64_t signed_cursor_before =
+        SharedHeapAtomicLoad<Ops, ObserveAtomics>(
+            cursor_address, static_cast<int32_t>(task_id),
+            AtomicSite::SharedHeapCursorLoad, trace, result
+        );
     if (signed_cursor_before < 0) {
         return false;
     }
@@ -115,9 +165,12 @@ PA_DEVICE bool ReserveSharedOutputHeap(
         return false;
     }
 
-    const int64_t observed_cursor = Ops::FetchAdd(
-        cursor_address, static_cast<int64_t>(reserve)
-    );
+    const int64_t observed_cursor =
+        SharedHeapAtomicFetchAdd<Ops, ObserveAtomics>(
+            cursor_address, static_cast<int64_t>(reserve),
+            static_cast<int32_t>(task_id),
+            AtomicSite::SharedHeapCursorReserve, trace, result
+        );
     if (observed_cursor < 0) {
         return false;
     }
@@ -127,9 +180,12 @@ PA_DEVICE bool ReserveSharedOutputHeap(
     }
 
     PA_GM volatile int64_t *vend_address = &map.shared_heap_vend.value;
-    const int64_t observed_vend = Ops::FetchAdd(
-        vend_address, static_cast<int64_t>(reserve)
-    );
+    const int64_t observed_vend =
+        SharedHeapAtomicFetchAdd<Ops, ObserveAtomics>(
+            vend_address, static_cast<int64_t>(reserve),
+            static_cast<int32_t>(task_id),
+            AtomicSite::SharedHeapVendAdvance, trace, result
+        );
     if (observed_vend < 0) {
         return false;
     }

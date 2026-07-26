@@ -89,6 +89,10 @@ ATOMIC_SITE_NAMES = {
     12: "heap_vend_load",
     13: "replay_done_increment",
     14: "replay_done_poll",
+    15: "shared_heap_vend_load",
+    16: "shared_heap_cursor_load",
+    17: "shared_heap_cursor_reserve",
+    18: "shared_heap_vend_advance",
 }
 ATOMIC_OP_NAMES = {
     0: "load",
@@ -97,9 +101,9 @@ ATOMIC_OP_NAMES = {
     3: "fetch_max",
 }
 
-# schema-v3 的校验表必须与 standalone C++ 的稳定 AtomicSite 编号一致。
-# 这里只描述本独立调度器实际实现的 0..14；真实 PA 追加的 BlockWon site
-# 不属于本用例，不能为了兼容生产 converter 在这里凭空放宽输入。
+# schema-v3/4 的校验表必须与 standalone C++ 的稳定 AtomicSite 编号一致。
+# 0..14 是既有 common/private 站点，15..18 是 shared heap 的追加站点；
+# 真实 PA 的 BlockWon 不属于本用例，不能为了兼容生产 converter 凭空放宽。
 ATOMIC_SITE_OP_IDS = {
     0: 2,
     1: 0,
@@ -116,6 +120,10 @@ ATOMIC_SITE_OP_IDS = {
     12: 0,
     13: 2,
     14: 0,
+    15: 0,
+    16: 0,
+    17: 2,
+    18: 2,
 }
 # 这些发布型调用不消费 atomic 返回的旧值；其余 standalone site 的
 # 返回值都参与协议判断。v3 输入必须与源码语义完全一致。

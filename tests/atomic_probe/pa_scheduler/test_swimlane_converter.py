@@ -688,7 +688,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             (0x42, 0, -1),  # 未消费返回值不能声明 return-ready
             (0x73, 4, -1),  # value_zero 只属于 Load
             ((1 << 8) | 0x50, 1, -1),  # retry payload 只属于 FetchMax
-            (0x50, 15, -1),  # standalone 未定义生产 BlockWon site
+            (0x50, 19, -1),  # 当前 AtomicSite::Count 以外的未定义站点
             (0x53, 4, 0),  # Atomic 不携带 function id
         )
         for flags, site, func_id in cases:
@@ -701,6 +701,38 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
                 input_path.write_text(json.dumps(capture), encoding="utf-8")
                 with self.assertRaisesRegex(ValueError, "invalid direct Atomic"):
                     convert(input_path, output_path)
+
+    def test_v3_exports_shared_heap_return_ready_sites(self) -> None:
+        rows = [
+            [0, 0, 0, 7, -1, "Atomic", 100, 110, 0x50, 15],
+            [0, 0, 0, 7, -1, "Atomic", 111, 121, 0x50, 16],
+            [0, 0, 0, 7, -1, "Atomic", 122, 132, 0x52, 17],
+            [0, 0, 0, 7, -1, "Atomic", 133, 143, 0x52, 18],
+        ]
+        capture = _v3_capture(rows, dependency_applied=True)
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            convert(input_path, output_path)
+            events = json.loads(output_path.read_text(encoding="utf-8"))[
+                "traceEvents"
+            ]
+
+        names = {
+            event["name"]
+            for event in events
+            if event.get("cat") == "atomic.return_ready"
+        }
+        self.assertEqual(
+            names,
+            {
+                "atomic.return_ready.shared_heap_vend_load.load#7",
+                "atomic.return_ready.shared_heap_cursor_load.load#7",
+                "atomic.return_ready.shared_heap_cursor_reserve.fetch_add#7",
+                "atomic.return_ready.shared_heap_vend_advance.fetch_add#7",
+            },
+        )
 
     def test_v3_direct_boundary_must_match_core_clock_baseline(self) -> None:
         # baseline 声明该后端应用依赖钩子，消费返回值的直接 Atomic 却没有

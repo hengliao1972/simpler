@@ -1256,7 +1256,7 @@ PA_DEVICE bool SharedCreateInfoBytes(
 #endif
 
 #if PTO_FDWIC_SHARED_MAP
-template <typename Ops>
+template <typename Ops, bool ObserveSharedAtomics = false>
 #endif
 PA_DEVICE bool MaterializeTask(
     PA_GM WorkerState &worker, uint32_t task_id, const TaskArgs &args, SubmitContext &context,
@@ -1264,6 +1264,10 @@ PA_DEVICE bool MaterializeTask(
     PA_GM SharedTensorMapSidecar &shared_map,
 #endif
     uint64_t heap_base, uint64_t heap_size
+#if PTO_FDWIC_SHARED_MAP
+    , TraceContext *atomic_trace = nullptr,
+    WorkerResult *atomic_result = nullptr
+#endif
 ) {
     // 输入是 BeginCallbackSubmit 已绑定的 payload/context 与当前 worker.heap_next；成功输出
     // 包括本 task 的 GM TensorDesc 指针、output_bytes 和推进后的单调 heap_next。
@@ -1406,8 +1410,9 @@ PA_DEVICE bool MaterializeTask(
         return false;
     }
     SharedHeapReservation reservation{};
-    if (!ReserveSharedOutputHeap<Ops>(
-            shared_map, task_id, total, heap_size, reservation
+    if (!ReserveSharedOutputHeap<Ops, ObserveSharedAtomics>(
+            shared_map, task_id, total, heap_size, reservation,
+            atomic_trace, atomic_result
         )) {
         return false;
     }

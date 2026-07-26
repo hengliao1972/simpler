@@ -446,7 +446,13 @@ enum class AtomicSite : uint32_t {
     HeapVendLoad = 12,
     ReplayDoneIncrement = 13,
     ReplayDonePoll = 14,
-    Count = 15,
+    // shared heap 的预检 load 与两个返回型 FetchAdd 必须分开：前者只读
+    // 全局/分片控制字，后者的旧值直接决定本 task 的物理区间。
+    SharedHeapVendLoad = 15,
+    SharedHeapCursorLoad = 16,
+    SharedHeapCursorReserve = 17,
+    SharedHeapVendAdvance = 18,
+    Count = 19,
 };
 
 // Atomic 记录 flags 的低四位保存操作种类；bit4 表示返回值参与后续判断，
@@ -483,6 +489,8 @@ PA_MODEL_INLINE constexpr AtomicOp AtomicSiteExpectedOp(AtomicSite site) {
     switch (site) {
         case AtomicSite::StartupIncrement:
         case AtomicSite::ReplayDoneIncrement:
+        case AtomicSite::SharedHeapCursorReserve:
+        case AtomicSite::SharedHeapVendAdvance:
             return AtomicOp::FetchAdd;
         case AtomicSite::FatalSet:
         case AtomicSite::CompletionVendExchange:
@@ -504,9 +512,25 @@ PA_MODEL_INLINE constexpr bool AtomicSiteResultUsed(AtomicSite site) {
         case AtomicSite::CompletionFlagExchange:
         case AtomicSite::ReplayDoneIncrement:
             return false;
-        default:
+        case AtomicSite::StartupPoll:
+        case AtomicSite::FatalPoll:
+        case AtomicSite::ClaimMax:
+        case AtomicSite::FaninFlagLoad:
+        case AtomicSite::FrontierInitialLoad:
+        case AtomicSite::FrontierFlagLoad:
+        case AtomicSite::FrontierMax:
+        case AtomicSite::HeapFrontierLoad:
+        case AtomicSite::HeapVendLoad:
+        case AtomicSite::ReplayDonePoll:
+        case AtomicSite::SharedHeapVendLoad:
+        case AtomicSite::SharedHeapCursorLoad:
+        case AtomicSite::SharedHeapCursorReserve:
+        case AtomicSite::SharedHeapVendAdvance:
             return true;
+        case AtomicSite::Count:
+            return false;
     }
+    return false;
 }
 
 PA_MODEL_INLINE constexpr int32_t AtomicPollBatchIndex(AtomicSite site) {
@@ -549,6 +573,13 @@ PA_MODEL_INLINE constexpr AtomicSite AtomicPollBatchSite(uint32_t index) {
 
 PA_MODEL_INLINE constexpr bool AtomicSiteIsPollBatchable(AtomicSite site) {
     return AtomicPollBatchIndex(site) >= 0;
+}
+
+PA_MODEL_INLINE constexpr bool AtomicSiteIsSharedOnly(AtomicSite site) {
+    return static_cast<uint32_t>(site) >=
+               static_cast<uint32_t>(AtomicSite::SharedHeapVendLoad) &&
+           static_cast<uint32_t>(site) <
+               static_cast<uint32_t>(AtomicSite::Count);
 }
 
 PA_MODEL_INLINE constexpr uint32_t AtomicPollBatchMask(AtomicSite site) {

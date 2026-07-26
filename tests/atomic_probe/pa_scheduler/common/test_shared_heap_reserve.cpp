@@ -37,6 +37,19 @@ void Check(bool condition, const char *message) {
 }
 
 struct HeapTestOps {
+    static constexpr bool kAtomicReturnReadyObserved = false;
+    static uint64_t now;
+
+    static uint64_t Now() {
+        return now++;
+    }
+
+    template <typename T>
+    static uint64_t NowAfterAtomicResult(T value) {
+        (void)value;
+        return Now();
+    }
+
     static int64_t Load(volatile int64_t *address) {
         return __atomic_load_n(address, __ATOMIC_ACQUIRE);
     }
@@ -45,6 +58,8 @@ struct HeapTestOps {
         return __atomic_fetch_add(address, value, __ATOMIC_ACQ_REL);
     }
 };
+
+uint64_t HeapTestOps::now = 0;
 
 // 在 cursor 的前置 Load 与 FetchAdd 之间插入另一笔 reserve；它可以暂停在
 // cursor/vend 两条原子之间，也可以完整推进。helper 必须消费 FetchAdd 的
@@ -108,9 +123,90 @@ bool SameSnapshot(
     return map.shared_heap_vend.value == expected.vend;
 }
 
+struct HeapTraceFixture {
+    TraceCoreState core{};
+    TraceRecord records[8]{};
+    WorkerResult result{};
+    TraceContext trace{};
+
+    HeapTraceFixture() {
+        trace.core = &core;
+        trace.records = records;
+        trace.capacity =
+            static_cast<uint32_t>(sizeof(records) / sizeof(records[0]));
+        trace.atomics_enabled = true;
+    }
+};
+
 constexpr uint64_t kOutputBytes[kTasksPerBatch] = {
     10240, 524288, 264192, 8192, 0,
 };
+
+void TestAtomicTraceSites() {
+    auto map = std::make_unique<SharedTensorMapSidecar>();
+    ResetHeapState(*map);
+    HeapTraceFixture nonempty;
+    SharedHeapReservation reservation{};
+    HeapTestOps::now = 100;
+
+    Check(
+        ReserveSharedOutputHeap<HeapTestOps, true>(
+            *map, 0, kOutputAlignment, kHeapBytes, reservation,
+            &nonempty.trace, &nonempty.result
+        ),
+        "traced nonempty reservation succeeds"
+    );
+    const AtomicSite expected_sites[] = {
+        AtomicSite::SharedHeapVendLoad,
+        AtomicSite::SharedHeapCursorLoad,
+        AtomicSite::SharedHeapCursorReserve,
+        AtomicSite::SharedHeapVendAdvance,
+    };
+    Check(nonempty.core.count == 4, "nonempty reserve writes four atomic records");
+    Check(
+        nonempty.result.atomic_trace_calls == 4,
+        "nonempty reserve counts four logical atomic calls"
+    );
+    for (uint32_t index = 0; index < 4 && index < nonempty.core.count; ++index) {
+        const TraceRecord &record = nonempty.records[index];
+        const AtomicSite site = expected_sites[index];
+        Check(
+            record.auxiliary == static_cast<uint32_t>(site),
+            "shared heap atomic site order is stable"
+        );
+        Check(
+            (record.flags & kAtomicOpMask) ==
+                static_cast<uint32_t>(AtomicSiteExpectedOp(site)),
+            "shared heap atomic op matches schema"
+        );
+        Check(
+            (record.flags & kAtomicResultUsed) != 0,
+            "every shared heap atomic return value is consumed"
+        );
+    }
+
+    ResetHeapState(*map);
+    HeapTraceFixture empty;
+    reservation = SharedHeapReservation{};
+    HeapTestOps::now = 200;
+    Check(
+        ReserveSharedOutputHeap<HeapTestOps, true>(
+            *map, 4, 0, kHeapBytes, reservation,
+            &empty.trace, &empty.result
+        ),
+        "traced zero-output reservation succeeds"
+    );
+    Check(
+        empty.core.count == 1 &&
+            empty.records[0].auxiliary ==
+                static_cast<uint32_t>(AtomicSite::SharedHeapVendLoad),
+        "zero-output reserve observes only aggregate vend"
+    );
+    Check(
+        empty.result.atomic_trace_calls == 1,
+        "zero-output reserve counts one logical atomic call"
+    );
+}
 
 // 串行 reference 只校验 PA Case1 的业务字节总量、默认 shard 分布和 no-wrap
 // 容量；生产并发时同一 shard 内的 task 物理次序不由 task_id 决定。
@@ -619,6 +715,7 @@ void TestInterleavingAndTerminalCapacityRace() {
 }  // namespace
 
 int main() {
+    TestAtomicTraceSites();
     TestPaCase(1);
     TestPaCase(kDefaultBatches);
     TestAlignmentAndShardTail();
