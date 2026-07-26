@@ -128,6 +128,216 @@ bool CheckRealComputeActivityContract(SchedulerState *state) {
     return ok;
 }
 
+bool CheckHeapAdmission(SchedulerState *state) {
+    bool ok = true;
+    const auto check_repeated = [&](
+        int32_t context, uint32_t batches,
+        bool expected_admitted, uint64_t expected_total,
+        uint64_t expected_max_shard
+    ) {
+        std::vector<int32_t> contexts(batches, context);
+        SharedHostTaskPlan plan;
+        bool case_ok = SetContextsAndBuild(
+            state, contexts.data(), batches, &plan
+        );
+        uint64_t planned_by_shard[kSharedHeapShards] = {};
+        uint64_t planned_total = 0;
+        for (const SharedHostPlannedTask &task : plan.tasks) {
+            if (task.output_bytes == 0) {
+                continue;
+            }
+            const uint64_t reserve =
+                (task.output_bytes + kOutputAlignment - 1U) /
+                kOutputAlignment * kOutputAlignment;
+            planned_by_shard[
+                task.task_id % kSharedHeapShards
+            ] += reserve;
+            planned_total += reserve;
+        }
+        uint64_t planned_max_shard = 0;
+        for (uint32_t shard = 0;
+             shard < kSharedHeapShards; ++shard) {
+            planned_max_shard = std::max(
+                planned_max_shard, planned_by_shard[shard]
+            );
+        }
+        case_ok &= plan.canonical_heap_bytes == expected_total;
+        case_ok &= planned_total == expected_total;
+        case_ok &= planned_max_shard == expected_max_shard;
+        SharedHostHeapAdmission admission;
+        std::string error;
+        const bool admitted = case_ok &&
+            ValidateSharedHostHeapAdmission(
+                plan, kHeapBytes, &admission, &error
+            );
+        case_ok &= admitted == expected_admitted;
+        case_ok &= admission.admitted == expected_admitted;
+        if (expected_admitted) {
+            uint64_t maximum_shard = 0;
+            for (uint32_t shard = 0;
+                 shard < kSharedHeapShards; ++shard) {
+                maximum_shard = std::max(
+                    maximum_shard,
+                    admission.reserved_bytes_by_shard[shard]
+                );
+            }
+            case_ok &=
+                admission.total_reserved_bytes ==
+                expected_total;
+            case_ok &= maximum_shard == expected_max_shard;
+            case_ok &=
+                admission.first_failed_task == UINT32_MAX;
+            case_ok &=
+                admission.first_failed_shard == UINT32_MAX;
+        } else {
+            case_ok &= !error.empty();
+            case_ok &=
+                admission.first_failed_task != UINT32_MAX;
+            case_ok &=
+                admission.first_failed_shard <
+                kSharedHeapShards;
+        }
+        return case_ok;
+    };
+
+    ok &= check_repeated(0, 1, true, 10240, 10240);
+    ok &= check_repeated(
+        8192, 1, true, 806912, 524288
+    );
+    ok &= check_repeated(
+        8193, 1, true, 829440, 524288
+    );
+    ok &= check_repeated(
+        16384, 1, true, 1603584, 524288
+    );
+    ok &= check_repeated(
+        32768, 1, true, 3196928, 1048576
+    );
+    ok &= check_repeated(
+        0, kMaxBatches, true, 2621440, 327680
+    );
+    ok &= check_repeated(
+        8192, kMaxBatches, true,
+        206569472, 25821184
+    );
+    ok &= check_repeated(
+        8193, kMaxBatches, true,
+        212336640, 26542080
+    );
+    ok &= check_repeated(
+        16384, kMaxBatches, false,
+        410517504, 51314688
+    );
+    ok &= check_repeated(
+        32768, kMaxBatches, false,
+        818413568, 102301696
+    );
+
+    const int32_t mixed_contexts[] = {
+        0, 8192, 8193, 32768,
+    };
+    SharedHostTaskPlan mixed;
+    ok &= SetContextsAndBuild(
+        state, mixed_contexts, 4, &mixed
+    );
+    SharedHostHeapAdmission mixed_admission;
+    std::string mixed_error;
+    ok &= ValidateSharedHostHeapAdmission(
+        mixed, kHeapBytes, &mixed_admission, &mixed_error
+    );
+    const uint64_t expected_mixed_shards[
+        kSharedHeapShards
+    ] = {
+        1323008, 546816, 540672, 272384,
+        1062912, 536576, 26624, 534528,
+    };
+    ok &= mixed_admission.total_reserved_bytes == 4843520;
+    for (uint32_t shard = 0;
+         shard < kSharedHeapShards; ++shard) {
+        ok &=
+            mixed_admission.reserved_bytes_by_shard[shard] ==
+            expected_mixed_shards[shard];
+    }
+
+    std::vector<int32_t> g1_contexts(
+        kMaxBatches, 8192
+    );
+    SharedHostTaskPlan g1;
+    ok &= SetContextsAndBuild(
+        state, g1_contexts.data(), kMaxBatches, &g1
+    );
+    SharedHostHeapAdmission exact;
+    std::string exact_error;
+    ok &= ValidateSharedHostHeapAdmission(
+        g1, 206569472, &exact, &exact_error
+    );
+    SharedHostHeapAdmission one_byte_short;
+    std::string short_error;
+    ok &= !ValidateSharedHostHeapAdmission(
+        g1, 206569471, &one_byte_short, &short_error
+    );
+    ok &= !short_error.empty();
+
+    // 构造“总量仍放得下、但 task_id%8 的单个 shard 已溢出”的偏斜计划，
+    // 防止准入实现退化成只比较 aggregate heap。
+    std::vector<int32_t> skew_contexts(9, 0);
+    SharedHostTaskPlan skew;
+    ok &= SetContextsAndBuild(
+        state, skew_contexts.data(), 9, &skew
+    );
+    for (SharedHostPlannedTask &task : skew.tasks) {
+        task.output_bytes = 0;
+    }
+    const uint64_t shard_span =
+        (kHeapBytes / kSharedHeapShards) /
+        kOutputAlignment * kOutputAlignment;
+    skew.tasks[0].output_bytes = shard_span;
+    skew.tasks[8].output_bytes = kOutputAlignment;
+    skew.canonical_heap_bytes =
+        shard_span + kOutputAlignment;
+    SharedHostHeapAdmission skew_result;
+    std::string skew_error;
+    ok &= !ValidateSharedHostHeapAdmission(
+        skew, kHeapBytes, &skew_result, &skew_error
+    );
+    ok &= skew.canonical_heap_bytes <
+        shard_span * kSharedHeapShards;
+    ok &= skew_result.first_failed_task == 8;
+    ok &= skew_result.first_failed_shard == 0;
+    ok &= !skew_error.empty();
+
+    SharedHostHeapAdmission signed_overflow;
+    std::string signed_error;
+    ok &= !ValidateSharedHostHeapAdmission(
+        g1, static_cast<uint64_t>(INT64_MAX) + 1U,
+        &signed_overflow, &signed_error
+    );
+    ok &= !signed_error.empty();
+
+    SharedHostTaskPlan output_overflow = g1;
+    output_overflow.tasks[0].output_bytes = UINT64_MAX;
+    SharedHostHeapAdmission output_overflow_result;
+    std::string output_overflow_error;
+    ok &= !ValidateSharedHostHeapAdmission(
+        output_overflow, kHeapBytes,
+        &output_overflow_result, &output_overflow_error
+    );
+    ok &= output_overflow_result.first_failed_task == 0;
+    ok &= !output_overflow_error.empty();
+
+    SharedHostTaskPlan non_contiguous = g1;
+    non_contiguous.tasks[3].task_id = 4;
+    SharedHostHeapAdmission non_contiguous_result;
+    std::string non_contiguous_error;
+    ok &= !ValidateSharedHostHeapAdmission(
+        non_contiguous, kHeapBytes,
+        &non_contiguous_result, &non_contiguous_error
+    );
+    ok &= non_contiguous_result.first_failed_task == 4;
+    ok &= !non_contiguous_error.empty();
+    return ok;
+}
+
 bool CheckCli() {
     bool ok = true;
     {
@@ -223,6 +433,10 @@ int main() {
     ok &= Check(
         CheckRealComputeActivityContract(state.get()),
         "real-compute activity follows G0/nonzero shared plan"
+    );
+    ok &= Check(
+        CheckHeapAdmission(state.get()),
+        "shared heap admission rejects over-capacity plans before workers"
     );
 
     const int32_t mixed_contexts[] = {

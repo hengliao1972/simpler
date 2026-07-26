@@ -1857,6 +1857,30 @@ int main(int argc, char **argv) {
     PmuValidation pmu_json_validation;
     for (uint32_t run = 1; run <= options.runs; ++run) {
         pa_scheduler::host::InitializeState(state.get(), options);
+#if PTO_FDWIC_SHARED_MAP
+        pa_scheduler::host::SharedHostTaskPlan launch_plan;
+        pa_scheduler::host::SharedHostHeapAdmission heap_admission;
+        std::string admission_error;
+        if (!pa_scheduler::host::BuildSharedHostTaskPlan(
+                *state, &launch_plan, &admission_error
+            ) ||
+            !pa_scheduler::host::ValidateSharedHostHeapAdmission(
+                launch_plan, state->heap_size,
+                &heap_admission, &admission_error
+            )) {
+            std::fprintf(
+                stderr,
+                "Shared launch rejected before A5 worker start: %s\n",
+                admission_error.c_str()
+            );
+            execution_ok = false;
+            all_passed = false;
+            break;
+        }
+        pa_scheduler::host::PrintSharedHostHeapAdmission(
+            launch_plan, heap_admission
+        );
+#endif
         pa_scheduler::host::ConfigureTrace(state.get(), options, trace_device);
         ConfigurePmu(state.get(), pmu_options, pmu_registers_device);
         ConfigureWinnerWorkload(state.get(), workload_options, workload_device);

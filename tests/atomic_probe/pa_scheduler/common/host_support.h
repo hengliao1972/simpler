@@ -577,6 +577,143 @@ inline bool BuildSharedHostTaskPlan(
     }
     return true;
 }
+
+struct SharedHostHeapAdmission {
+    uint64_t heap_size = 0;
+    uint64_t shard_span = 0;
+    uint64_t usable_capacity = 0;
+    uint64_t total_reserved_bytes = 0;
+    uint64_t reserved_bytes_by_shard[kSharedHeapShards] = {};
+    uint32_t first_failed_task = UINT32_MAX;
+    uint32_t first_failed_shard = UINT32_MAX;
+    bool admitted = false;
+};
+
+inline bool ValidateSharedHostHeapAdmission(
+    const SharedHostTaskPlan &plan, uint64_t heap_size,
+    SharedHostHeapAdmission *admission,
+    std::string *error = nullptr
+) {
+    if (admission == nullptr) {
+        if (error != nullptr) {
+            *error = "null shared heap admission result";
+        }
+        return false;
+    }
+    *admission = SharedHostHeapAdmission{};
+    admission->heap_size = heap_size;
+    if (heap_size > static_cast<uint64_t>(INT64_MAX)) {
+        if (error != nullptr) {
+            *error = "shared heap size exceeds signed atomic range";
+        }
+        return false;
+    }
+    admission->shard_span =
+        (heap_size / kSharedHeapShards) /
+        kOutputAlignment * kOutputAlignment;
+    admission->usable_capacity =
+        admission->shard_span * kSharedHeapShards;
+
+    if (plan.tasks.size() != plan.total_tasks) {
+        if (error != nullptr) {
+            *error = "shared heap admission received an incomplete task plan";
+        }
+        return false;
+    }
+    for (const SharedHostPlannedTask &task : plan.tasks) {
+        if (task.task_id >= kMaxTasks ||
+            plan.TaskAt(task.task_id) != &task) {
+            admission->first_failed_task = task.task_id;
+            if (error != nullptr) {
+                *error =
+                    "shared heap admission task ids are not contiguous";
+            }
+            return false;
+        }
+        if (task.output_bytes == 0) {
+            continue;
+        }
+        if (task.output_bytes >
+            UINT64_MAX - (kOutputAlignment - 1U)) {
+            admission->first_failed_task = task.task_id;
+            if (error != nullptr) {
+                *error =
+                    "shared output byte count overflows alignment";
+            }
+            return false;
+        }
+        const uint64_t reserve =
+            (task.output_bytes + kOutputAlignment - 1U) /
+            kOutputAlignment * kOutputAlignment;
+        const uint32_t shard =
+            task.task_id % kSharedHeapShards;
+        admission->first_failed_task = task.task_id;
+        admission->first_failed_shard = shard;
+        if (reserve == 0 ||
+            reserve > static_cast<uint64_t>(INT64_MAX) ||
+            reserve > admission->shard_span ||
+            admission->reserved_bytes_by_shard[shard] >
+                admission->shard_span - reserve ||
+            admission->total_reserved_bytes >
+                admission->usable_capacity - reserve ||
+            admission->total_reserved_bytes >
+                static_cast<uint64_t>(INT64_MAX) - reserve) {
+            if (error != nullptr) {
+                *error =
+                    "shared heap capacity exceeded before worker/device start "
+                    "at task " + std::to_string(task.task_id) +
+                    ", shard " + std::to_string(shard);
+            }
+            return false;
+        }
+        admission->reserved_bytes_by_shard[shard] +=
+            reserve;
+        admission->total_reserved_bytes += reserve;
+    }
+    if (admission->total_reserved_bytes !=
+        plan.canonical_heap_bytes) {
+        if (error != nullptr) {
+            *error =
+                "shared heap admission disagrees with canonical plan bytes";
+        }
+        return false;
+    }
+    admission->first_failed_task = UINT32_MAX;
+    admission->first_failed_shard = UINT32_MAX;
+    admission->admitted = true;
+    return true;
+}
+
+inline void PrintSharedHostHeapAdmission(
+    const SharedHostTaskPlan &plan,
+    const SharedHostHeapAdmission &admission
+) {
+    uint64_t maximum_shard_bytes = 0;
+    for (uint32_t shard = 0;
+         shard < kSharedHeapShards; ++shard) {
+        maximum_shard_bytes = std::max(
+            maximum_shard_bytes,
+            admission.reserved_bytes_by_shard[shard]
+        );
+    }
+    std::printf(
+        "[HOST_HEAP_ADMISSION] batches=%u groups=%u tasks=%u "
+        "total_bytes=%llu max_shard_bytes=%llu "
+        "shard_capacity=%llu status=%s\n",
+        plan.batch_count, plan.total_groups,
+        plan.total_tasks,
+        static_cast<unsigned long long>(
+            admission.total_reserved_bytes
+        ),
+        static_cast<unsigned long long>(
+            maximum_shard_bytes
+        ),
+        static_cast<unsigned long long>(
+            admission.shard_span
+        ),
+        admission.admitted ? "PASS" : "FAIL"
+    );
+}
 #endif
 
 inline void InitializeState(SchedulerState *state, const Options &options) {

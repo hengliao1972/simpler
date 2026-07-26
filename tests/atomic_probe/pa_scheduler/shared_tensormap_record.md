@@ -5838,3 +5838,91 @@ B256 的无诊断量级因此仍是约 2.38 ms，与此前约 2.36 ms 的判断�
 构建显著扰动热路径，不能把 2,472.768 us 逐项归因给某一种记录操作，
 也不能拿两套 ELF 的绝对时间直接做候选收益。后续性能候选继续只由
 perf-clock 决定保留或撤销，泳道只解释收益落点。
+
+### 2026-07-26：S6.4i 在 worker 启动前完成 shared heap 容量准入
+
+S6.4a～h 已经允许 shared PA 按 `context_lens` 生成 G0～G4 动态 task
+图，但设备端仍只有固定 256 MiB、8 shard、no-wrap heap。原实现只能等
+winner 在设备上执行 `FetchAdd` reserve 时发现单 shard 越界，再广播
+terminal fatal。该路径可以阻止越界写，却把一个在 host 已完全可知的
+容量错误推迟到 96 个 worker 启动之后。
+
+本阶段没有放宽设备 allocator，也没有把资源判断塞回 task-plan builder。
+host 先用同一份权威 `SharedHostTaskPlan` 建图，再执行独立的
+`ValidateSharedHostHeapAdmission()`：
+
+```text
+shard_span = floor(heap_size / 8 / 1024) * 1024
+reserve(task) = ceil(output_bytes / 1024) * 1024
+shard(task) = task_id % 8
+```
+
+每个 task 只计一次 reservation，不乘 96 个 replay worker；逐 shard
+累计值必须不超过 `shard_span`，总 reservation 必须不超过八个可用
+shard，且 heap、单次 reserve 和 aggregate vend 都不得越过设备
+`int64_t` atomic 的可表达范围。最终累计还必须等于 host plan 的
+`canonical_heap_bytes`。这样既能拒绝总量超限，也能拒绝“总量仍够、
+但 task 分布偏斜导致某一 shard 先满”的计划。
+
+调用顺序固定为：
+
+```text
+InitializeState
+→ BuildSharedHostTaskPlan
+→ ValidateSharedHostHeapAdmission
+→ ConfigureTrace/PMU/workload
+→ 启动 CPU threads 或 launch A5 kernel
+```
+
+CCEC 的 ACL 资源准备仍发生在 runner 外层，但容量失败不会启动 A5
+worker；CPU 容量失败不会创建任何 worker thread。设备端 no-wrap
+reserve 校验继续保留为最终正确性防线，不依赖 host 永远无错。
+
+#### 固定 256 MiB heap 的准入矩阵
+
+| 输入 | B1 总 reservation | B1 最大 shard | B256 总 reservation | B256 最大 shard | B256 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| G0 `0` | 10,240 | 10,240 | 2,621,440 | 327,680 | PASS |
+| G1 `8192` | 806,912 | 524,288 | 206,569,472 | 25,821,184 | PASS |
+| G2 partial `8193` | 829,440 | 524,288 | 212,336,640 | 26,542,080 | PASS |
+| G2 full `16384` | 1,603,584 | 524,288 | 410,517,504 | 51,314,688 | REJECT |
+| G4 `32768` | 3,196,928 | 1,048,576 | 818,413,568 | 102,301,696 | REJECT |
+
+单元门槛还覆盖：
+
+- mixed `0,8192,8193,32768` 的 4,843,520 bytes 和八个精确 shard
+  累计；
+- G1 B256 在恰好 206,569,472-byte heap 上通过、少 1 byte 时因
+  shard span 向下对齐而拒绝；
+- aggregate 仍小于 usable heap、但 task 0/8 共同压满 shard 0 的偏斜
+  计划必须拒绝；
+- heap 大于 `INT64_MAX`、output 对齐加法溢出、非连续 task plan 均拒绝。
+
+实际 CCEC shared perf-clock 重新构建后，A5 B1/G1 在 launch 前打印：
+
+```text
+[HOST_HEAP_ADMISSION] batches=1 groups=1 tasks=5
+total_bytes=806912 max_shard_bytes=524288
+shard_capacity=33554432 status=PASS
+```
+
+随后 96 worker、5 task、4 kernel、8/5/3 symbol、5 条 dependency、
+806,912-byte vend 和真实计算结果全项 PASS。B256/G4 则在 task 1394、
+shard 2 首次超过容量时返回非零，`completed_runs=0`，没有 A5
+`HOST_PLAN`、worker 断言或 kernel 计数，证明拒绝发生在 device worker
+启动前。
+
+CPU 负向实跑曾暴露一个独立收尾缺陷：首轮在准入处退出时，汇总仍把
+空 `spans` 交给 `Median()`，导致准入错误之后再触发 SIGSEGV。现已让
+两种 CPU summary 显式处理 `completed_runs=0`，输出零耗时并干净返回
+`EXIT_FAILURE`；这不是用崩溃代替拒绝。
+
+private CPU/CCEC 都重新构建并通过 B1。private CCEC host 中不存在
+`HOST_HEAP_ADMISSION` 和 shared reject 字符串，shared host 中两者均
+存在，说明新增准入仍被 `PTO_FDWIC_SHARED_MAP` 编译期隔离。用户已明确
+当前只维护 CPU 与 CCEC，因此本阶段不扩展 AscendC。
+
+这项准入没有让 B256 G2 full/G4 “跑通”；它把固定 heap 的真实支持边界
+变成确定、可复核的 host 错误。若之后要求这两类 B256 输入运行，需要
+单独设计更大 heap、分批生命周期或 generation/reclaim 协议，不能通过
+删除设备端容量门槛解决。

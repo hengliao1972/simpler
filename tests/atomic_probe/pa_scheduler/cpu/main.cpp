@@ -340,6 +340,29 @@ int main(int argc, char **argv) {
     // runs>1 表示同进程热运行，不等价于多个独立首轮。
     for (uint32_t run = 1; run <= options.runs; ++run) {
         pa_scheduler::host::InitializeState(state.get(), options);
+#if PTO_FDWIC_SHARED_MAP
+        pa_scheduler::host::SharedHostTaskPlan launch_plan;
+        pa_scheduler::host::SharedHostHeapAdmission heap_admission;
+        std::string admission_error;
+        if (!pa_scheduler::host::BuildSharedHostTaskPlan(
+                *state, &launch_plan, &admission_error
+            ) ||
+            !pa_scheduler::host::ValidateSharedHostHeapAdmission(
+                launch_plan, state->heap_size,
+                &heap_admission, &admission_error
+            )) {
+            std::fprintf(
+                stderr,
+                "Shared launch rejected before CPU worker start: %s\n",
+                admission_error.c_str()
+            );
+            all_passed = false;
+            break;
+        }
+        pa_scheduler::host::PrintSharedHostHeapAdmission(
+            launch_plan, heap_admission
+        );
+#endif
         pa_scheduler::host::ConfigureTrace(state.get(), options, trace_memory);
         if (real_compute) {
             // runs>1 必须恢复所有输出 sentinel，避免上一轮 winner 的 tile 被误认
@@ -479,25 +502,51 @@ int main(int argc, char **argv) {
         }
     }
 
+    // host 准入可以在第一个 worker 启动前拒绝本轮，此时没有可统计样本。
+    // 显式输出 0 和 completed_runs=0，避免把空 vector 交给 Median()。
+    const double median_submit_span_us =
+        spans.empty() ? 0.0 : pa_scheduler::host::Median(spans);
 #if PA_BUILD_PERF_CLOCK
     std::printf(
-        "[SUMMARY] runs=%u final_shape=%s median_submit_span_us=%.3f "
+        "[SUMMARY] runs=%u completed_runs=%zu final_shape=%s "
+        "median_submit_span_us=%.3f "
         "lifecycle_timing=disabled semantic_status=%s postprocess_status=%s\n",
-        options.runs,
+        options.runs, spans.size(),
         pa_scheduler::host::FinalBarrierShapeName(options.final_barrier_shape),
-        pa_scheduler::host::Median(spans),
+        median_submit_span_us,
         all_passed ? "PASS" : "FAIL",
         postprocess_ok ? "PASS" : "FAIL"
     );
 #else
+    const double median_startup_barrier_us =
+        startup_barrier_spans.empty()
+            ? 0.0
+            : pa_scheduler::host::Median(startup_barrier_spans);
+    const double median_final_barrier_us =
+        final_barrier_spans.empty()
+            ? 0.0
+            : pa_scheduler::host::Median(final_barrier_spans);
+    const double median_final_drain_us =
+        final_drain_spans.empty()
+            ? 0.0
+            : pa_scheduler::host::Median(final_drain_spans);
+    const double median_lifecycle_us =
+        lifecycle_spans.empty()
+            ? 0.0
+            : pa_scheduler::host::Median(lifecycle_spans);
     std::printf(
-        "[SUMMARY] runs=%u final_shape=%s median_submit_span_us=%.3f median_startup_barrier_us=%.3f "
+        "[SUMMARY] runs=%u completed_runs=%zu final_shape=%s "
+        "median_submit_span_us=%.3f median_startup_barrier_us=%.3f "
         "median_final_barrier_us=%.3f median_final_drain_us=%.3f median_lifecycle_us=%.3f "
         "semantic_status=%s postprocess_status=%s\n",
-        options.runs, pa_scheduler::host::FinalBarrierShapeName(options.final_barrier_shape),
-        pa_scheduler::host::Median(spans), pa_scheduler::host::Median(startup_barrier_spans),
-        pa_scheduler::host::Median(final_barrier_spans), pa_scheduler::host::Median(final_drain_spans),
-        pa_scheduler::host::Median(lifecycle_spans), all_passed ? "PASS" : "FAIL", postprocess_ok ? "PASS" : "FAIL"
+        options.runs, spans.size(),
+        pa_scheduler::host::FinalBarrierShapeName(
+            options.final_barrier_shape
+        ),
+        median_submit_span_us, median_startup_barrier_us,
+        median_final_barrier_us, median_final_drain_us,
+        median_lifecycle_us, all_passed ? "PASS" : "FAIL",
+        postprocess_ok ? "PASS" : "FAIL"
     );
 #endif
     // std::free(nullptr) 合法，因此关闭泳道时也走同一条收尾路径。
