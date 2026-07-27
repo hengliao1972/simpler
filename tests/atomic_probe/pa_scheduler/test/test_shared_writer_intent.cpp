@@ -40,6 +40,9 @@ struct WriterIntentTestOps {
     static constexpr bool kAtomicReturnReadyObserved = false;
     static volatile int64_t *wait_address;
     static std::atomic<uint64_t> wait_loads;
+    static volatile int64_t *cas_trigger_address;
+    static volatile int64_t *cas_conflict_address;
+    static int64_t cas_conflict_value;
 
     static int32_t Load(volatile int32_t *address) {
         return __atomic_fetch_add(
@@ -84,6 +87,17 @@ struct WriterIntentTestOps {
         volatile int64_t *address, int64_t expected,
         int64_t desired
     ) {
+        // 只供多 symbol terminal-prefix 门槛：在第一项真正 CAS 前，
+        // 原子推进第二项，稳定制造“第一项成功、第二项冲突”的时序。
+        if (address == cas_trigger_address &&
+            cas_conflict_address != nullptr) {
+            __atomic_store_n(
+                cas_conflict_address, cas_conflict_value,
+                __ATOMIC_RELEASE
+            );
+            cas_trigger_address = nullptr;
+            cas_conflict_address = nullptr;
+        }
         int64_t observed = expected;
         (void)__atomic_compare_exchange_n(
             address, &observed, desired, false,
@@ -142,6 +156,11 @@ struct WriterIntentTestOps {
 
 volatile int64_t *WriterIntentTestOps::wait_address = nullptr;
 std::atomic<uint64_t> WriterIntentTestOps::wait_loads{0};
+volatile int64_t *WriterIntentTestOps::cas_trigger_address =
+    nullptr;
+volatile int64_t *WriterIntentTestOps::cas_conflict_address =
+    nullptr;
+int64_t WriterIntentTestOps::cas_conflict_value = -1;
 
 SchedulerState *MapSparseSchedulerState() {
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
@@ -216,34 +235,94 @@ bool WaitUntilObserved(std::atomic<uint64_t> &counter) {
     return true;
 }
 
+bool WaitUntilTrue(std::atomic<bool> &value) {
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::seconds(2);
+    while (!value.load(std::memory_order_acquire)) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+FdwicOutputRef PublishSingleTestSymbol(
+    SchedulerState &state, int32_t producer, uint64_t address
+) {
+    SharedOutputCell &cell =
+        state.shared_map.shared_outputs[
+            static_cast<uint32_t>(producer)
+        ];
+    cell.published[0].value = -1;
+    cell.last_writer[0].value = -1;
+    TensorDesc tensor = MakeTensor(
+        address, static_cast<uint64_t>(producer)
+    );
+    SubmitContext context{};
+    context.task_id = producer;
+    context.result.task_id = producer;
+    context.result.count = 1;
+    context.result.tensors[0] = &tensor;
+    context.shared_result.Reset(producer);
+    const bool ref_ok =
+        context.shared_result.AddOutputRef(producer, 0);
+    Check(ref_ok, "single test symbol accepts slot 0");
+    if (!ref_ok ||
+        !PublishSharedTaskOutputs<WriterIntentTestOps>(
+            state.shared_map, context, producer
+        )) {
+        Check(false, "single test symbol publishes descriptor");
+        return InvalidSharedOutputRef();
+    }
+    return context.shared_result.OutputRef(0);
+}
+
 void TestSymbolWriterIntentChain(SchedulerState &state) {
     constexpr int32_t kExistingDependency = 5;
     constexpr int32_t kProducer = 10;
     constexpr int32_t kWriter = 20;
     constexpr int32_t kReader = 30;
+    constexpr int32_t kFutureWriter = 40;
+    constexpr int32_t kFarFutureWriter = 50;
+    constexpr uint32_t kSymbolCount = 7;
     ResetTaskGate(state, kWriter);
+    ResetTaskGate(state, kFutureWriter);
+    ResetTaskGate(state, kFarFutureWriter);
 
     SharedOutputCell &cell =
         state.shared_map.shared_outputs[kProducer];
-    cell.published[0].value = -1;
-    cell.last_writer[0].value = -1;
+    for (uint32_t output = 0; output < kSymbolCount; ++output) {
+        cell.published[output].value = -1;
+        cell.last_writer[output].value = -1;
+    }
 
-    TensorDesc produced = MakeTensor(
-        0x410000000ULL,
-        static_cast<uint64_t>(kProducer)
-    );
+    TensorDesc produced[kSymbolCount] = {};
+    FdwicOutputRef output_refs[kSymbolCount] = {};
     SubmitContext producer_context{};
     producer_context.task_id = kProducer;
     producer_context.result.task_id = kProducer;
-    producer_context.result.count = 1;
-    producer_context.result.tensors[0] = &produced;
+    producer_context.result.count =
+        static_cast<int32_t>(kSymbolCount);
     producer_context.shared_result.Reset(kProducer);
-    Check(
-        producer_context.shared_result.AddOutputRef(
-            kProducer, 0
-        ),
-        "symbol producer accepts slot 0"
-    );
+    for (uint32_t output = 0; output < kSymbolCount; ++output) {
+        produced[output] = MakeTensor(
+            0x410000000ULL +
+                static_cast<uint64_t>(output) * 0x10000ULL,
+            static_cast<uint64_t>(kProducer)
+        );
+        producer_context.result.tensors[output] =
+            &produced[output];
+        Check(
+            producer_context.shared_result.AddOutputRef(
+                kProducer, static_cast<int16_t>(output)
+            ),
+            "symbol producer accepts history-test output"
+        );
+        output_refs[output] =
+            producer_context.shared_result.OutputRef(output);
+    }
     Check(
         PublishSharedTaskOutputs<WriterIntentTestOps>(
             state.shared_map, producer_context, kProducer
@@ -251,13 +330,15 @@ void TestSymbolWriterIntentChain(SchedulerState &state) {
         "symbol producer publishes descriptor"
     );
 
-    const FdwicOutputRef output_ref =
-        producer_context.shared_result.OutputRef(0);
+    const FdwicOutputRef output_ref = output_refs[0];
     TaskArgs writer_args;
     ConstructTaskArgs(writer_args);
-    AppendSharedOutputRef(
-        writer_args, output_ref, TensorArgType::Inout
-    );
+    for (uint32_t output = 0; output < kSymbolCount; ++output) {
+        AppendSharedOutputRef(
+            writer_args, output_refs[output],
+            TensorArgType::Inout
+        );
+    }
     bool required = false;
     Check(
         InspectSharedWriterIntent(writer_args, required) &&
@@ -280,6 +361,8 @@ void TestSymbolWriterIntentChain(SchedulerState &state) {
     );
 
     std::atomic<bool> reader_finished{false};
+    std::atomic<bool> reader_past_writer_gate{false};
+    std::atomic<bool> allow_reader_lookup{false};
     bool wait_ok = false;
     bool lookup_ok = false;
     uint32_t ordinary_lookups = UINT32_MAX;
@@ -296,6 +379,17 @@ void TestSymbolWriterIntentChain(SchedulerState &state) {
             &state, kWriter, reader_stats
         );
         if (wait_ok) {
+            // C 已经观察到 B 的 writer-ready，但故意停在 symbol lookup
+            // 之前；主线程随后让未来 writer D 覆盖 latest cache。这个
+            // 时序隔离“门补齐了 B”与“查询仍能找回 B”两项不同性质。
+            reader_past_writer_gate.store(
+                true, std::memory_order_release
+            );
+            while (!allow_reader_lookup.load(
+                std::memory_order_acquire
+            )) {
+                std::this_thread::yield();
+            }
             reader_fanin_count =
                 CollectSharedFanin<
                     WriterIntentTestOps, false, true
@@ -321,6 +415,96 @@ void TestSymbolWriterIntentChain(SchedulerState &state) {
         PrepareSharedWriterIntentSet<WriterIntentTestOps>(
             &state, writer_args, writer_context, writer_stats
         );
+
+    Check(
+        WaitUntilTrue(reader_past_writer_gate),
+        "symbol reader passes B gate before future D publishes"
+    );
+    TaskArgs future_writer_args;
+    ConstructTaskArgs(future_writer_args);
+    for (uint32_t output = 0; output < kSymbolCount; ++output) {
+        AppendSharedOutputRef(
+            future_writer_args, output_refs[output],
+            TensorArgType::Inout
+        );
+    }
+    SubmitContext future_writer_context{};
+    future_writer_context.task_id = kFutureWriter;
+    future_writer_context.won = true;
+    LocalStats future_writer_stats{};
+    const SharedWriterIntentResult future_prepared =
+        PrepareSharedWriterIntentSet<WriterIntentTestOps>(
+            &state, future_writer_args,
+            future_writer_context, future_writer_stats
+        );
+    TaskArgs far_future_writer_args;
+    ConstructTaskArgs(far_future_writer_args);
+    for (uint32_t output = 0; output < kSymbolCount; ++output) {
+        AppendSharedOutputRef(
+            far_future_writer_args, output_refs[output],
+            TensorArgType::Inout
+        );
+    }
+    SubmitContext far_future_writer_context{};
+    far_future_writer_context.task_id = kFarFutureWriter;
+    far_future_writer_context.won = true;
+    LocalStats far_future_writer_stats{};
+    const SharedWriterIntentResult far_future_prepared =
+        PrepareSharedWriterIntentSet<WriterIntentTestOps>(
+            &state, far_future_writer_args,
+            far_future_writer_context, far_future_writer_stats
+        );
+    uint32_t symbol_key = 0;
+    uint32_t seventh_symbol_key = 0;
+    const bool key_ok =
+        SharedSymbolHistoryKey(output_ref, symbol_key) &&
+        SharedSymbolHistoryKey(
+            output_refs[kSymbolCount - 1],
+            seventh_symbol_key
+        );
+    const SharedWriterHistoryCell &writer_history =
+        state.shared_map.writer_history[kWriter];
+    const SharedWriterHistoryCell &future_history =
+        state.shared_map.writer_history[kFutureWriter];
+    const SharedWriterHistoryCell &far_future_history =
+        state.shared_map.writer_history[kFarFutureWriter];
+    Check(
+        key_ok &&
+            writer_history.magic ==
+                kSharedWriterHistoryMagic &&
+            writer_history.writer_task == kWriter &&
+            writer_history.count == kSymbolCount &&
+            writer_history.entries[0].symbol_key ==
+                symbol_key &&
+            writer_history.entries[0].previous_writer ==
+                kProducer &&
+            writer_history.entries[kSymbolCount - 1].symbol_key ==
+                seventh_symbol_key,
+        "B publishes seven A predecessor records across two cache lines"
+    );
+    Check(
+        future_history.magic ==
+                kSharedWriterHistoryMagic &&
+            future_history.writer_task == kFutureWriter &&
+            future_history.count == kSymbolCount &&
+            future_history.entries[0].symbol_key ==
+                symbol_key &&
+            future_history.entries[0].previous_writer ==
+                kWriter,
+        "D publishes an immutable B predecessor record"
+    );
+    Check(
+        far_future_history.magic ==
+                kSharedWriterHistoryMagic &&
+            far_future_history.writer_task == kFarFutureWriter &&
+            far_future_history.count == kSymbolCount &&
+            far_future_history.entries[0].symbol_key ==
+                symbol_key &&
+            far_future_history.entries[0].previous_writer ==
+                kFutureWriter,
+        "E publishes an immutable D predecessor record"
+    );
+    allow_reader_lookup.store(true, std::memory_order_release);
     reader.join();
     WriterIntentTestOps::wait_address = nullptr;
 
@@ -335,9 +519,27 @@ void TestSymbolWriterIntentChain(SchedulerState &state) {
         "symbol writer retains existing fanin and deduplicates the previous writer"
     );
     Check(
-        cell.last_writer[0].value == kWriter &&
+        future_prepared == SharedWriterIntentResult::Published &&
+            future_writer_context.fanin_count == 1 &&
+            future_writer_context.fanin[0] == kWriter &&
+            state.tasks[kFutureWriter].deps_prepared ==
+                kFutureWriter,
+        "future symbol writer D consumes B before publishing"
+    );
+    Check(
+        far_future_prepared ==
+                SharedWriterIntentResult::Published &&
+            far_future_writer_context.fanin_count == 1 &&
+            far_future_writer_context.fanin[0] ==
+                kFutureWriter &&
+            state.tasks[kFarFutureWriter].deps_prepared ==
+                kFarFutureWriter,
+        "far-future symbol writer E consumes D before publishing"
+    );
+    Check(
+        cell.last_writer[0].value == kFarFutureWriter &&
             state.tasks[kWriter].deps_prepared == kWriter,
-        "symbol writer metadata precedes the ready gate"
+        "latest cache advances to E after all writer-ready gates"
     );
     Check(
         state.tasks[kWriter].flag == 0,
@@ -348,7 +550,132 @@ void TestSymbolWriterIntentChain(SchedulerState &state) {
             reader_fanin_count == 1 &&
             reader_fanin[0] == kWriter &&
             ordinary_lookups == 0,
-        "symbol reader resolves the latest writer after the gate"
+        "slow C follows E-to-D-to-B history after latest advances"
+    );
+}
+
+void TestOutOfOrderSymbolWriterFailsClosed(
+    SchedulerState &state
+) {
+    constexpr int32_t kProducer = 200;
+    constexpr int32_t kEarlierWriter = 220;
+    constexpr int32_t kLaterWriter = 240;
+    state.fatal.value = 0;
+    ResetTaskGate(state, kEarlierWriter);
+    ResetTaskGate(state, kLaterWriter);
+    const FdwicOutputRef output_ref =
+        PublishSingleTestSymbol(
+            state, kProducer, 0x440000000ULL
+        );
+
+    TaskArgs args;
+    ConstructTaskArgs(args);
+    AppendSharedOutputRef(
+        args, output_ref, TensorArgType::Inout
+    );
+    SubmitContext later_context{};
+    later_context.task_id = kLaterWriter;
+    later_context.won = true;
+    LocalStats later_stats{};
+    const SharedWriterIntentResult later_result =
+        PrepareSharedWriterIntentSet<WriterIntentTestOps>(
+            &state, args, later_context, later_stats
+        );
+
+    SubmitContext earlier_context{};
+    earlier_context.task_id = kEarlierWriter;
+    earlier_context.won = true;
+    LocalStats earlier_stats{};
+    const SharedWriterIntentResult earlier_result =
+        PrepareSharedWriterIntentSet<WriterIntentTestOps>(
+            &state, args, earlier_context, earlier_stats
+        );
+    const SharedOutputCell &cell =
+        state.shared_map.shared_outputs[kProducer];
+    Check(
+        later_result == SharedWriterIntentResult::Published &&
+            cell.last_writer[0].value == kLaterWriter,
+        "out-of-order setup publishes the later writer first"
+    );
+    Check(
+        earlier_result == SharedWriterIntentResult::Failed &&
+            state.fatal.value == 1 &&
+            state.tasks[kEarlierWriter].deps_prepared == -1 &&
+            cell.last_writer[0].value == kLaterWriter,
+        "skipped earlier writer fails closed without moving latest backward"
+    );
+}
+
+void TestMultiSymbolConflictKeepsTerminalPrefix(
+    SchedulerState &state
+) {
+    constexpr int32_t kProducer0 = 300;
+    constexpr int32_t kProducer1 = 301;
+    constexpr int32_t kConflictingWriter = 350;
+    constexpr int32_t kWriter = 400;
+    state.fatal.value = 0;
+    ResetTaskGate(state, kWriter);
+    const FdwicOutputRef output0 =
+        PublishSingleTestSymbol(
+            state, kProducer0, 0x450000000ULL
+        );
+    const FdwicOutputRef output1 =
+        PublishSingleTestSymbol(
+            state, kProducer1, 0x460000000ULL
+        );
+
+    TaskArgs args;
+    ConstructTaskArgs(args);
+    AppendSharedOutputRef(
+        args, output0, TensorArgType::Inout
+    );
+    AppendSharedOutputRef(
+        args, output1, TensorArgType::Inout
+    );
+    SubmitContext context{};
+    context.task_id = kWriter;
+    context.won = true;
+    LocalStats stats{};
+    volatile int64_t *first_latest =
+        &state.shared_map.shared_outputs[kProducer0]
+             .last_writer[0].value;
+    volatile int64_t *second_latest =
+        &state.shared_map.shared_outputs[kProducer1]
+             .last_writer[0].value;
+    WriterIntentTestOps::cas_trigger_address = first_latest;
+    WriterIntentTestOps::cas_conflict_address = second_latest;
+    WriterIntentTestOps::cas_conflict_value =
+        kConflictingWriter;
+    const SharedWriterIntentResult result =
+        PrepareSharedWriterIntentSet<WriterIntentTestOps>(
+            &state, args, context, stats
+        );
+    WriterIntentTestOps::cas_trigger_address = nullptr;
+    WriterIntentTestOps::cas_conflict_address = nullptr;
+
+    const SharedWriterHistoryCell &history =
+        state.shared_map.writer_history[kWriter];
+    Check(
+        result == SharedWriterIntentResult::Failed &&
+            state.fatal.value == 1 &&
+            state.tasks[kWriter].deps_prepared == -1,
+        "multi-symbol CAS conflict terminates without publishing ready"
+    );
+    Check(
+        *first_latest == kWriter &&
+            *second_latest == kConflictingWriter &&
+            stats.result.shared_symbol_inout_commits == 1,
+        "terminal failure preserves and counts only the linearized prefix"
+    );
+    Check(
+        history.magic == kSharedWriterHistoryMagic &&
+            history.writer_task == kWriter &&
+            history.count == 2 &&
+            history.entries[0].previous_writer ==
+                kProducer0 &&
+            history.entries[1].previous_writer ==
+                kProducer1,
+        "terminal prefix retains its immutable diagnostic history"
     );
 }
 
@@ -516,6 +843,8 @@ int main() {
     TestManualWriterNeedsNoGate(*state);
     const bool fatal_clean = state->fatal.value == 0;
     Check(fatal_clean, "all positive paths leave fatal clear");
+    TestOutOfOrderSymbolWriterFailsClosed(*state);
+    TestMultiSymbolConflictKeepsTerminalPrefix(*state);
     UnmapSparseSchedulerState(state);
     if (g_failures != 0) {
         std::fprintf(
@@ -525,8 +854,8 @@ int main() {
         return 1;
     }
     std::printf(
-        "[PASS] generic shared symbol/ordinary A->B->C "
-        "writer-intent tests\n"
+        "[PASS] generic shared symbol history, terminal-prefix, "
+        "and ordinary writer-intent tests\n"
     );
     return 0;
 }

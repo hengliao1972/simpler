@@ -59,7 +59,7 @@ static_assert(offsetof(SharedRegionSlot, seq) == 64, "shared seq cache line offs
 static_assert(sizeof(SharedBucketState) == 128, "shared bucket control ABI changed");
 static_assert(offsetof(SharedBucketState, tail) == 64, "shared head/tail cache lines merged");
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
-static_assert(sizeof(SharedTensorMapSidecar) == 11027648, "shared sidecar ABI changed");
+static_assert(sizeof(SharedTensorMapSidecar) == 12420288, "shared sidecar ABI changed");
 #endif
 static_assert(alignof(SharedTensorMapSidecar) == 64, "shared sidecar alignment changed");
 static_assert(offsetof(SharedTensorMapSidecar, buckets) == 128, "shared bucket offset changed");
@@ -86,6 +86,10 @@ static_assert(
 static_assert(
     offsetof(SharedTensorMapSidecar, shared_vector_cursor) == 11027136,
     "default shared Vector cursor offset changed"
+);
+static_assert(
+    offsetof(SharedTensorMapSidecar, writer_history) == 11027648,
+    "default shared writer-history offset changed"
 );
 #endif
 
@@ -235,6 +239,10 @@ void ResetSharedTensorMap(SharedTensorMapSidecar &map) {
             StoreControl(&map.shared_outputs[task].published[output].value, -1);
             StoreControl(&map.shared_outputs[task].last_writer[output].value, -1);
         }
+        map.writer_history[task].magic = 0;
+        map.writer_history[task].writer_task = 0;
+        map.writer_history[task].count = 0;
+        map.writer_history[task].reserved = 0;
     }
 }
 

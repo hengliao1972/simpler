@@ -827,7 +827,8 @@ inline void InitializeTraceHeader(TraceHeader *header) {
 
 // 巨大的 WorkerState 不参与每轮 H2D/D2H。private 仍只搬前缀、控制量和
 // 结果三个既有范围；shared 额外把 results 后的 map sidecar 作为第四个
-// 独立范围搬运，不能把约 2 MiB 状态混入 ControlBytes/ResultBytes。
+// 独立范围搬运：private 约 2 MiB，shared 含 output/history table 约
+// 12 MiB；不能把它混入 ControlBytes/ResultBytes。
 inline constexpr size_t StatePrefixBytes() { return offsetof(SchedulerState, workers); }
 
 inline constexpr size_t ControlBytes() {
@@ -840,7 +841,7 @@ inline constexpr size_t ResultBytes() { return sizeof(WorkerResult) * kWorkers; 
 
 inline constexpr size_t SharedSidecarBytes() { return sizeof(SharedTensorMapSidecar); }
 #if PTO_FDWIC_SHARED_MAP
-static_assert(SharedSidecarBytes() == 11027648, "shared TensorMap transfer size changed");
+static_assert(SharedSidecarBytes() == 12420288, "shared TensorMap transfer size changed");
 #else
 static_assert(SharedSidecarBytes() == 2113664, "private TensorMap transfer size changed");
 #endif
@@ -2132,6 +2133,16 @@ inline SharedTensorMapValidation ValidateSharedTensorMap(
         validation.protocol_ok &= std::memcmp(
             &map.slots[slot].payload, &zero_payload,
             sizeof(zero_payload)
+        ) == 0;
+    }
+    // 通用 WriterIntentSet 尚未接入真实 PA；本轮 PA 若触碰 history，
+    // 就说明专用/通用路径发生了非预期串线。整 cell 比较同时覆盖 header、
+    // record 与尾部 padding，不让未发布的过程写被计成“仍为零”。
+    const SharedWriterHistoryCell zero_history{};
+    for (uint32_t task = 0; task < kMaxTasks; ++task) {
+        validation.protocol_ok &= std::memcmp(
+            &map.writer_history[task], &zero_history,
+            sizeof(zero_history)
         ) == 0;
     }
     return validation;

@@ -161,9 +161,10 @@ else
     echo "[TEST] shared-output symbol self-test"
     "$BUILD_DIR/test_shared_output_symbols"
 
-    # 通用 writer-intent 门槛不使用 PA TaskKind/group/ticket：分别锁定
-    # shared symbol 与 ownerless ordinary region 的 A->B->C，证明 B
-    # metadata-ready 先于 loser/reader 放行，且不冒充 kernel completion。
+    # 通用 writer-intent 门槛不使用 PA TaskKind/group/ticket：symbol 锁定
+    # 多跳、跨 cache-line history、乱序和 partial-CAS 终止语义；
+    # ownerless ordinary region 锁定 A->B->C。两者都证明
+    # metadata-ready 不冒充 kernel completion。
     echo "[BUILD] generic shared writer-intent self-test"
     "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror -pthread \
         -DPTO_FDWIC_SHARED_MAP=1 \

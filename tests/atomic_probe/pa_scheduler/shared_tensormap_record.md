@@ -8440,3 +8440,138 @@ R4b 证明的是“较早 writer B 不会在 reader C lookup 前缺席”，不�
 | ordinary reader-progress reclaim | 未实现；初版错误方案已撤回 |
 | symbol future-writer 历史 | 未实现 |
 | A5 跨核动态用例 | 未执行 |
+
+### 2026-07-27：R4c 用不可变前驱链闭合 symbol future-writer 查询
+
+R4b 的 writer-ready 门只保证 B 的元数据不会在 C lookup 前缺席，不能阻止
+更快的未来 writer D 在慢 C 真正读取 `last_writer` 前把单 cell 覆盖。R4c
+先把这两个问题用独立时序拆开：
+
+```text
+A 发布 7 个 symbol
+  -> B 发布 writer metadata 和 writer-ready
+  -> 慢 C 已经越过 B gate，但停在 lookup 前
+  -> D、E 依次发布并把 latest cache 从 B 推进为 E
+  -> C 才 lookup，必须沿 E->D->B 返回 max(writer<C)=B
+```
+
+修改前该门槛只在最后一条断言失败：C 读到 `D>=C` 后 fail-closed，证明
+失败来自“没有历史”，不是 writer-ready 漏门。引入不可变前驱链后，同一
+门槛转为 PASS。
+
+#### 数据结构选择
+
+没有把 symbol history 混入 ordinary region ring：
+
+- 两者的 key 域和发布协议不同，混用需要给当前单一有序 append 原型补
+  MPSC reservation、publish hole 和独立容量证明；
+- 默认每桶 128 槽只证明了现有 ordinary 隔离用例，host admission 没有
+  证明任意 symbol/ordinary 混合计划不会形成热桶；
+- symbol 已有精确 `(descriptor producer, output slot)` 身份，不应先
+  hash 再为冲突和回收增加协议面。
+
+也没有复用 `SharedOutputCell::published[]` 的 56B cache-line padding。
+generic task 可以同时含 fresh `OUTPUT` 和 `INOUT`；若 history 普通 store
+与 atomic `published` 共线，DCCI clean-out 需要额外证明不会把陈旧控制字
+带回 GM。这会把正确性绑在脆弱的整 task 生命周期顺序上。
+
+最终在 `SharedTensorMapSidecar` 尾部追加 task-indexed table：
+
+```text
+SharedWriterHistoryCell[4352]
+  header: magic, writer_task, count, reserved       16 B
+  record[32]: packed_symbol_key, previous_writer   256 B
+  alignment padding                                 48 B
+  cell total                                       320 B
+```
+
+table 共增加 `4352×320=1,392,640 B`，sidecar 从 11,027,648 B 增至
+12,420,288 B。它位于既有 `shared_vector_cursor` 之后，region ring、
+output、heap 和 Vector cursor 的所有旧 offset 均不移动。shared build
+identity generation 从 6 升为 7，host 的整块 H2D/D2H 长度和 ABI 静态
+断言同步更新。
+
+`packed_symbol_key=(producer_task_id×8+output_slot)+1` 是可逆的无碰撞
+编码，0 保留为无效值；record 的 writer task 由 history cell 下标隐含。
+每 task 最多 32 条，直接由 `TaskArgs` 的既有上限约束，不另造容量常量。
+
+#### 发布与查询顺序
+
+winner 对本 task 的全部 symbol writer 做批量处理。这里有一个不可省略
+的调用前提：同一 symbol 的 writer 必须按 task id 单调发布；迁移 shared
+replay 时，后一个 writer 必须在前一个 writer-ready 之后才能进入本原语。
+CAS 能发现乱序并终止整轮，但不能补回一个已经被未来 writer 跨越的历史
+节点。
+
+1. 等待 fresh descriptor 发布，读取各 symbol 的 previous writer；
+2. 把 previous writer 去重并入本 task fanin；
+3. 写 header 和全部不可变 record，对实际使用的连续字节做一次
+   `FlushRegion`；
+4. 逐 symbol 执行 `CAS(previous -> current task)`，每成功一项就累计一
+   次实际线性化的 commit；
+5. ordinary metadata 也完成后，最后发布现有 `deps_prepared` gate。
+
+常见 PA 三条 writer record 连同 16B header 共 40B，只清出一条 cache
+line；history 不另加 count atomic。`last_writer` CAS 是对应 record 的发布
+边界：CCEC `FlushRegion` 已执行 cache-line out 和 `dsb`，reader 只有先
+原子观察到 future latest 后才会读取该 task 的 history。多 symbol CAS
+不是事务：若后项冲突，已线性化的前缀保留并计数，外层设置 `fatal`，且
+不发布本 task 的 `deps_prepared`；回滚已发布的共享控制字反而会破坏故障
+现场。
+
+reader 仍先读 `last_writer`：
+
+- `latest<reader_task`：直接返回，正常快路不增加 DCCI、循环或 atomic；
+- `latest>=reader_task`：按 latest 定位 task history，失效首行并校验
+  magic/task/count；按精确 key 取 predecessor，要求
+  `origin<=predecessor<latest`，严格递减直到 `<reader_task`；
+- 缺 record、重复 key、非法 header、非递减链或超过 task 数步数均
+  fail-closed。
+
+因此 history 是异常 run-ahead 时的慢路，不把所有纯 INPUT 都改成扫描
+table。
+
+#### 门槛与当前边界
+
+CPU 正向门槛使用 `A=10,B=20,C=30,D=40,E=50`，不读取 `TaskKind`、
+group 或 ticket。两个 release/acquire 测试门精确固定“C 已过 B gate、
+D/E 已发布、C 后 lookup”的顺序；每个 writer 同时更新 7 个 symbol，
+使 header 和最后一条 record 跨越第一条 cache line。门槛同时核对：
+
+- B history 为 7 条 `{symbol,A}`；
+- D/E history 分别为 7 条 `{symbol,B}`、`{symbol,D}`；
+- D 自身 fanin 为 B；
+- E 自身 fanin 为 D；
+- C 经过两次 future-history 回溯后最终 fanin 仍为 B；
+- B/D/E writer-ready 与 kernel completion flag 继续分离。
+
+另外增加两个故障门槛：
+
+- 让 D 先于 B 发布：D 可以形成 `A->D`，随后 B 必须因
+  `previous>=B` fail-closed，不能把 latest 倒退，也不能发布 B 的
+  writer-ready。这锁定“有序 replay 是硬前提、CAS 是检测而不是修复”；
+- 对含两个 symbol 的同一 task，在第一项 CAS 前人为推进第二项：第一项
+  保留为 current task，第二项保持冲突值，统计只记已线性化的一项，
+  `deps_prepared==-1` 且 `fatal==1`。这锁定 terminal-prefix 语义。
+
+默认 PA runtime 尚未调用通用 WriterIntentSet。host 因而额外验证真实 PA
+回放后的整张 history table 仍为零，防止本阶段意外改变 PA 热路径。ordinary
+ring 仍保持 append-only；reader-progress reclaim、split-region producer
+集合和 PA 专用分支迁移都没有被本阶段冒充完成。
+
+#### 验证结果
+
+| 检查 | 结果 |
+| --- | --- |
+| 修改前 A→B→慢 C→D 门槛 | 仅“C 应返回 B”失败，红灯定位准确 |
+| 修改后 symbol A→B→慢 C→D→E | PASS，C 经两跳返回 B |
+| 7 symbol 跨首条 history cache line | PASS |
+| 乱序 writer fail-closed | PASS，latest 不倒退且不发布 ready |
+| 多 symbol partial CAS | PASS，保留并计数成功前缀后终止 |
+| ordinary/manual 既有门槛 | PASS |
+| CPU shared 全套构建与自测 | PASS |
+| shared ring CAP=32/64/128/256/16384 | 全部 PASS |
+| CCEC AIC/AIV 通用模板显式实例化 | PASS |
+| CCEC AIC/AIV entry 与 split finish | 编译通过 |
+| mixed ELF / LOCAL helper / relocation / manifest | 全部 PASS |
+| A5 跨核 history DCCI 动态门槛 | 尚未执行，下一独立阶段补齐 |

@@ -72,7 +72,7 @@ constexpr TensorMapBuildMode kCompiledTensorMapMode =
     static_cast<TensorMapBuildMode>(PTO_FDWIC_SHARED_MAP);
 constexpr uint32_t kBuildIdentityMagic = 0x50414249U;  // "PABI"
 #if PTO_FDWIC_SHARED_MAP
-constexpr uint32_t kBuildIdentityAbiGeneration = 6;
+constexpr uint32_t kBuildIdentityAbiGeneration = 7;
 #else
 constexpr uint32_t kBuildIdentityAbiGeneration = 4;
 #endif
@@ -921,6 +921,42 @@ static_assert(alignof(SharedOutputCell) == 64, "shared output cell alignment cha
 static_assert(offsetof(SharedOutputCell, published) == 0, "shared output publish offset mismatch");
 static_assert(offsetof(SharedOutputCell, last_writer) == 512, "shared output writer offset mismatch");
 static_assert(offsetof(SharedOutputCell, tensors) == 1024, "shared output tensor offset mismatch");
+
+// latest writer 只是正常顺序 reader 的快取；慢 reader 若在查询前遇到
+// future writer，必须沿不可变前驱链回到严格早于自己的版本。每个 writer
+// task 独占一个 history cell，record 的 writer id 由 cell 下标隐含；
+// packed key 无哈希碰撞，可还原为 fresh descriptor 的 (producer, slot)。
+constexpr uint32_t kSharedWriterHistoryMaxPerTask = kMaxTaskTensors;
+constexpr uint32_t kSharedWriterHistoryMagic = 0x57484953U;  // "WHIS"
+struct SharedWriterHistoryRecord {
+    uint32_t symbol_key;
+    int32_t previous_writer;
+};
+static_assert(sizeof(SharedWriterHistoryRecord) == 8, "shared writer-history record size changed");
+static_assert(alignof(SharedWriterHistoryRecord) == 4, "shared writer-history record alignment changed");
+
+struct alignas(64) SharedWriterHistoryCell {
+    // header 与常见的三个 PA writer record 共处首条 cache line；唯一
+    // winner 一次写回这段不可变 payload，随后各 symbol 的 last_writer
+    // CAS 才是 reader 的发布边界，不额外增加 history atomic。
+    uint32_t magic;
+    int32_t writer_task;
+    uint32_t count;
+    uint32_t reserved;
+    SharedWriterHistoryRecord entries[kSharedWriterHistoryMaxPerTask];
+    uint8_t padding[48];
+};
+static_assert(sizeof(SharedWriterHistoryCell) == 320, "shared writer-history cell size changed");
+static_assert(alignof(SharedWriterHistoryCell) == 64, "shared writer-history cell alignment changed");
+static_assert(
+    offsetof(SharedWriterHistoryCell, entries) == 16,
+    "shared writer-history entries must follow their immutable header"
+);
+static_assert(
+    kSharedOutputMaxPerTask <= 8 &&
+        kMaxTasks <= UINT32_MAX / kSharedOutputMaxPerTask,
+    "packed shared symbol key no longer fits uint32"
+);
 #endif
 
 struct alignas(64) SharedTensorMapSidecar {
@@ -948,11 +984,15 @@ struct alignas(64) SharedTensorMapSidecar {
     // 已验证的 region/output/heap 字段仍不移动，且不宣称该地址与参考
     // DistGlobal 具有相同字节 offset。
     AtomicLine shared_vector_cursor[kSharedVectorCursorCapacity];
+    // 追加在全部既有字段之后，避免为通用 writer history 移动 PA 已测
+    // 热点控制字。当前 task id 在一轮内不复用，因此 history 不取模；
+    // 1.33 MiB 增量只影响启动期整块搬运，不改变 Submit 内旧字段地址。
+    SharedWriterHistoryCell writer_history[kMaxTasks];
 #endif
 };
 #if PTO_FDWIC_SHARED_MAP
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
-static_assert(sizeof(SharedTensorMapSidecar) == 11027648, "shared TensorMap sidecar size changed");
+static_assert(sizeof(SharedTensorMapSidecar) == 12420288, "shared TensorMap sidecar size changed");
 static_assert(
     offsetof(SharedTensorMapSidecar, shared_outputs) == 2113664,
     "shared output table offset mismatch"
@@ -968,6 +1008,10 @@ static_assert(
 static_assert(
     offsetof(SharedTensorMapSidecar, shared_vector_cursor) == 11027136,
     "shared Vector cursor offset mismatch"
+);
+static_assert(
+    offsetof(SharedTensorMapSidecar, writer_history) == 11027648,
+    "shared writer-history tail offset mismatch"
 );
 #endif
 #else
