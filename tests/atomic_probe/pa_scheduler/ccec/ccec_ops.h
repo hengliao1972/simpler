@@ -206,6 +206,17 @@ struct CcecOps {
         return atomicExch(const_cast<__gm__ uint64_t *>(address), value);
     }
 
+    __aicore__ static inline int64_t CompareExchange(
+        __gm__ volatile int64_t *address, int64_t expected, int64_t desired
+    ) {
+        // CCEC atomicCAS 与 production wrapper 同样返回操作前旧值。它只
+        // 负责控制字的原子线性化；相邻 payload 的发布仍由既有 DCCI
+        // Flush/Invalidate 协议负责，不能把 CAS 本身解释成数据屏障。
+        return atomicCAS(
+            const_cast<__gm__ int64_t *>(address), expected, desired
+        );
+    }
+
     __aicore__ static inline int64_t FetchAdd(__gm__ volatile int64_t *address, int64_t value) {
         // 返回递增前的计数；启动和 replay 屏障只关心全局累加结果，因此调用方不使用该返回值。
         return atomicAdd(const_cast<__gm__ int64_t *>(address), value);

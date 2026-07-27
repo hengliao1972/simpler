@@ -173,6 +173,19 @@ struct CpuOps {
         return __atomic_exchange_n(address, value, __ATOMIC_ACQ_REL);
     }
 
+    static inline int64_t CompareExchange(
+        volatile int64_t *address, int64_t expected, int64_t desired
+    ) {
+        // 与 production atomic wrapper 保持一致：返回线性化点观察到的
+        // 旧值，而不是 bool。失败时目标字保持原样，调用方据此保留现场。
+        int64_t observed = expected;
+        (void)__atomic_compare_exchange_n(
+            address, &observed, desired, false,
+            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE
+        );
+        return observed;
+    }
+
     static inline int64_t FetchAdd(volatile int64_t *address, int64_t value) {
         return __atomic_fetch_add(address, value, __ATOMIC_ACQ_REL);
     }

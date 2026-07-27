@@ -81,6 +81,17 @@ struct LoserFinishTestOps {
         return __atomic_exchange_n(address, value, __ATOMIC_ACQ_REL);
     }
 
+    static int64_t CompareExchange(
+        volatile int64_t *address, int64_t expected, int64_t desired
+    ) {
+        int64_t observed = expected;
+        (void)__atomic_compare_exchange_n(
+            address, &observed, desired, false,
+            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE
+        );
+        return observed;
+    }
+
     static int64_t FetchAdd(volatile int64_t *address, int64_t value) {
         return __atomic_fetch_add(address, value, __ATOMIC_ACQ_REL);
     }

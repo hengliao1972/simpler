@@ -8274,3 +8274,59 @@ exact-turn 时，才重新评估非末组 UP 的 writer-ready gate。
 TSan 仍报告仓库既有的 `atomic_thread_fence` 不受该工具完整支持的编译告警，
 所以该结果只证明宿主测试没有可见的普通 data race，不替代 A5 GM 可见性
 验证。
+
+### 2026-07-27：R4a 用 CAS 加固通用 writer-ready 发布门
+
+在把 PA 专用 writer 链改成通用 `WriterIntentSet` 之前，先单独加固所有
+方案都会复用的 `TaskCell::deps_prepared` 发布原语。旧实现使用
+`Exchange(-1 -> task_id)` 后再检查返回值；当 task cell 已被错误复用或
+存在重复 publisher 时，它会先把竞争值覆盖成一个合法 `task_id`，再报告
+失败。等待方可能在这个短窗口内被错误放行，且原故障值也被破坏。
+
+本阶段给 standalone 的 CPU/CCEC Ops 增加与 production atomic wrapper
+同口径的 `CompareExchange(int64_t)`：
+
+```text
+observed = CAS(address, expected=-1, desired=task_id)
+success  = (observed == -1)
+```
+
+接口返回线性化点观察到的旧值，不返回 bool。CPU 使用 strong
+`__atomic_compare_exchange_n`，成功/失败分别采用 AcqRel/Acquire；CCEC
+直接使用本机 CANN 9.1 已声明并可编译的 GM `atomicCAS<int64_t>`。CCEC
+CAS 只承担控制字的原子线性化，不能被描述成相邻 payload 的发布屏障；
+普通 payload 仍必须沿用既有 DCCI `FlushRegion/InvalidateRegion` 协议。
+
+定向门槛在竞争值已经存在时再次发布 writer-ready，并同时断言：
+
+- 发布返回失败；
+- `deps_prepared` 保持竞争值，不能被本 task 覆盖；
+- 后续 waiter 仍把错误 task id 识别为协议故障；
+- 正常首次发布、重复发布、PA G2 loser 等待和 post-gate fatal 路径不变。
+
+本阶段只加固通用控制门，不改变：
+
+- 哪些 task 需要 writer intent；
+- PA `has_following_group` 的临时判定；
+- symbol fanin/writer 提交；
+- ordinary region ring 或其 exact-turn 原型；
+- writer-ready 与 kernel completion 的职责分离。
+
+因此它是通用化的前置提交，不能单独解释为 ordinary region 的
+`A -> B -> C` 竞态已经解决。
+
+#### 验证结果
+
+| 检查 | 结果 |
+| --- | --- |
+| CPU shared 全套构建与门槛 | PASS |
+| writer-ready 竞争值不覆盖定向断言 | PASS |
+| CCEC shared AIC/AIV entry | 编译通过 |
+| CCEC split runtime / noinline finish | AIC/AIV 均编译通过 |
+| CCEC mixed ELF / LOCAL helper / relocation / manifest | 全部 PASS |
+| `git diff --check` | PASS |
+
+用户目录 GCC 15 与系统 binutils 2.42 的组合在后续独立自测目标生成
+`.base64` 汇编伪指令时失败；同一源码改用系统 GCC 13 后完整通过。这个
+工具链组合问题不属于 CAS 源码失败，也没有用来替代上述 CCEC 9.1 编译
+证据。

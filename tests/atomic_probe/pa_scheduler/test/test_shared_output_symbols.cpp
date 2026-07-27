@@ -65,6 +65,17 @@ struct SymbolTestOps {
         return __atomic_exchange_n(address, value, __ATOMIC_ACQ_REL);
     }
 
+    static int64_t CompareExchange(
+        volatile int64_t *address, int64_t expected, int64_t desired
+    ) {
+        int64_t observed = expected;
+        (void)__atomic_compare_exchange_n(
+            address, &observed, desired, false,
+            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE
+        );
+        return observed;
+    }
+
     static int64_t FetchMax(
         volatile int64_t *address, int64_t value, uint64_t &retries
     ) {
@@ -660,6 +671,13 @@ void TestPaTwoGroupWriterReadyGate() {
     );
     constexpr int32_t wrong_gate_task = 5;
     state->tasks[wrong_gate_task].deps_prepared = first_up;
+    Check(
+        !PublishSharedWriterReady<SymbolTestOps>(
+            state, wrong_gate_task
+        ) &&
+            state->tasks[wrong_gate_task].deps_prepared == first_up,
+        "writer-ready CAS mismatch preserves the competing gate value"
+    );
     LocalStats wrong_gate_stats{};
     Check(
         !WaitForSharedWriterReady<SymbolTestOps>(

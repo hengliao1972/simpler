@@ -1217,13 +1217,14 @@ PA_DEVICE bool PublishSharedWriterReady(
         task_id >= static_cast<int32_t>(kMaxTasks)) {
         return false;
     }
-    // 三个 INOUT writer 的登记必须先于门值对 loser 可见；本 task 是否
-    // 已经执行完成仍由它自己的 completion flag 表达，不能把
-    // deps_prepared 冒充成可执行/已完成。Exchange 的旧值只能是初始化
-    // sentinel；重复 winner 或错误 task-cell 复用保留现场并终止整轮。
+    // writer 登记必须先于门值对 loser 可见；本 task 是否已经执行完成
+    // 仍由它自己的 completion flag 表达，不能把 deps_prepared 冒充成
+    // 可执行/已完成。CAS 只允许初始化 sentinel -> task_id：重复 winner
+    // 或错误 task-cell 复用不会先写入一个合法门值再报告失败。
     Ops::StoreBarrier();
-    return Ops::Exchange(
+    return Ops::CompareExchange(
                &state->tasks[static_cast<uint32_t>(task_id)].deps_prepared,
+               static_cast<int64_t>(-1),
                static_cast<int64_t>(task_id)
            ) == -1;
 }
