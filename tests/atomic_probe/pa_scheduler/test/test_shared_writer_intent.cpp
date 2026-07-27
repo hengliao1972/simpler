@@ -793,6 +793,69 @@ void TestOrdinaryWriterIntentChain(SchedulerState &state) {
     );
 }
 
+void TestOrdinaryWriterRangeValidation() {
+    SharedRegionValue region{};
+    TensorDesc contiguous = MakeTensor(0x470000000ULL);
+    contiguous.ndims = 2;
+    contiguous.shapes[0] = 65535;
+    contiguous.shapes[1] = 65537;
+    Check(
+        MakeValidatedSharedWriterRegion(
+            contiguous, 200, region
+        ) &&
+            region.lo == 0 &&
+            region.hi ==
+                static_cast<uint64_t>(65535) * 65537 * 4,
+        "ordinary contiguous range accepts a uint32-representable shape product"
+    );
+
+    contiguous.shapes[0] = 65536;
+    contiguous.shapes[1] = 65536;
+    Check(
+        MakeValidatedSharedWriterRegion(
+            contiguous, 200, region
+        ) &&
+            region.hi == (uint64_t{1} << 34),
+        "ordinary contiguous range preserves a valid extent above uint32"
+    );
+
+    contiguous.ndims = 3;
+    contiguous.shapes[0] = UINT32_MAX;
+    contiguous.shapes[1] = UINT32_MAX;
+    contiguous.shapes[2] = 2;
+    Check(
+        !MakeValidatedSharedWriterRegion(
+            contiguous, 200, region
+        ),
+        "ordinary contiguous range rejects a true uint64 shape-product overflow"
+    );
+
+    TensorDesc noncontiguous = MakeTensor(0x480000000ULL);
+    noncontiguous.is_contiguous = false;
+    noncontiguous.dtype = DataType::Uint8;
+    noncontiguous.extent_elem_cache =
+        static_cast<uint64_t>(UINT32_MAX) + 1;
+    Check(
+        MakeValidatedSharedWriterRegion(
+            noncontiguous, 201, region
+        ) &&
+            region.lo == 0 &&
+            region.hi ==
+                static_cast<uint64_t>(UINT32_MAX) + 1,
+        "ordinary noncontiguous range preserves its uint64 cached extent"
+    );
+
+    noncontiguous.dtype = DataType::Uint64;
+    noncontiguous.start_offset = UINT64_MAX / 8;
+    noncontiguous.extent_elem_cache = 1;
+    Check(
+        !MakeValidatedSharedWriterRegion(
+            noncontiguous, 201, region
+        ),
+        "ordinary byte range rejects an end offset that overflows after dtype scaling"
+    );
+}
+
 void TestManualWriterNeedsNoGate(SchedulerState &state) {
     constexpr int32_t kTask = 160;
     ResetTaskGate(state, kTask);
@@ -840,6 +903,7 @@ int main() {
     ResetProtocolState(*state);
     TestSymbolWriterIntentChain(*state);
     TestOrdinaryWriterIntentChain(*state);
+    TestOrdinaryWriterRangeValidation();
     TestManualWriterNeedsNoGate(*state);
     const bool fatal_clean = state->fatal.value == 0;
     Check(fatal_clean, "all positive paths leave fatal clear");

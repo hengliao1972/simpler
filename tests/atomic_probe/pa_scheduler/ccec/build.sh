@@ -188,23 +188,48 @@ COMMON_FLAGS=(
 )
 
 # 普通 PA kernel 在迁移完成前不会调用通用 WriterIntentSet。shared 构建
-# 额外对模板做一次真实后端代码生成，分别锁定 cube/vector 的 CcecOps、
-# GM 地址空间、atomicCAS 与 DCCI 签名。输出直接写 /dev/null，且不加入
-# DEVICE_OBJECTS，因此不会改变最终设备 ELF、I-cache 布局或运行性能。
+# 额外对模板做真实后端代码生成和静态链接，分别锁定 cube/vector 的
+# CcecOps、GM 地址空间、atomicCAS、DCCI 以及“无未解析 compiler builtin”
+# 契约。probe 不加入 DEVICE_OBJECTS，检查后立即删除，因此不会改变正式
+# mixed ELF、I-cache 布局或运行性能。
 if [[ "$TENSORMAP_MODE" == "shared" ]]; then
+(
+    WRITER_INTENT_PROBE_AIC_OBJECT="$BUILD_DIR/.prepare_shared_writer_intent_aic.o"
+    WRITER_INTENT_PROBE_AIV_OBJECT="$BUILD_DIR/.prepare_shared_writer_intent_aiv.o"
+    WRITER_INTENT_PROBE_AIC_ELF="$BUILD_DIR/.prepare_shared_writer_intent_aic.elf"
+    WRITER_INTENT_PROBE_AIV_ELF="$BUILD_DIR/.prepare_shared_writer_intent_aiv.elf"
+    cleanup_writer_intent_probe() {
+        rm -f \
+            "$WRITER_INTENT_PROBE_AIC_OBJECT" \
+            "$WRITER_INTENT_PROBE_AIV_OBJECT" \
+            "$WRITER_INTENT_PROBE_AIC_ELF" \
+            "$WRITER_INTENT_PROBE_AIV_ELF"
+    }
+    # 独立子 shell 的 EXIT trap 不会覆盖正式 manifest 的原子发布 trap；
+    # 编译或链接任一步失败也会清掉隐藏 probe，不留下半成品混淆现场。
+    trap cleanup_writer_intent_probe EXIT
+    cleanup_writer_intent_probe
+
     echo "[CHECK] CCEC AIC generic WriterIntentSet instantiation"
     "$CCEC" "${COMMON_FLAGS[@]}" \
         --cce-aicore-arch=dav-c310-cube \
         -DPA_BUILD_AIC \
-        -o /dev/null \
+        -o "$WRITER_INTENT_PROBE_AIC_OBJECT" \
         "$SCRIPT_DIR/prepare_shared_writer_intent_compile_probe.cpp"
+    "$LD" -m aicorelinux -Ttext=0 -static \
+        -o "$WRITER_INTENT_PROBE_AIC_ELF" \
+        "$WRITER_INTENT_PROBE_AIC_OBJECT"
 
     echo "[CHECK] CCEC AIV generic WriterIntentSet instantiation"
     "$CCEC" "${COMMON_FLAGS[@]}" \
         --cce-aicore-arch=dav-c310-vec \
         -DPA_BUILD_AIV \
-        -o /dev/null \
+        -o "$WRITER_INTENT_PROBE_AIV_OBJECT" \
         "$SCRIPT_DIR/prepare_shared_writer_intent_compile_probe.cpp"
+    "$LD" -m aicorelinux -Ttext=0 -static \
+        -o "$WRITER_INTENT_PROBE_AIV_ELF" \
+        "$WRITER_INTENT_PROBE_AIV_OBJECT"
+)
 fi
 
 # CompeteFirstSplitRuntimeState 当前 ABI 为 1664B。只给 split 产物开启

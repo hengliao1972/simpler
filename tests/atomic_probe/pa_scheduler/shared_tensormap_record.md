@@ -8575,3 +8575,157 @@ ring 仍保持 append-only；reader-progress reclaim、split-region producer
 | CCEC AIC/AIV entry 与 split finish | 编译通过 |
 | mixed ELF / LOCAL helper / relocation / manifest | 全部 PASS |
 | A5 跨核 history DCCI 动态门槛 | 尚未执行，下一独立阶段补齐 |
+
+### 2026-07-27：R4d 用独立 mixed ELF 闭合 A5 symbol-history 可见性
+
+R4c 的 CPU 门槛只能证明不可变前驱链的状态机，CCEC compile-only probe
+也只证明模板能生成 object。R4d 不修改普通 PA kernel/host，新增一套
+shared-only 的独立 mixed AIC/AIV 门槛，专门验证跨物理核 DCache 可见性。
+
+#### 先修复 compile-only 掩盖的真实链接缺口
+
+把通用 `PrepareSharedWriterIntentSet<CcecOps>` 放入可启动 ELF 后，AIC/AIV
+object 最初各带有 24 个 `__multi3` relocation，`ld.lld -m aicorelinux`
+因符号未定义而失败。查验本机 CANN 9.1 后确认：
+
+- `ccec -print-libgcc-file-name` 返回的是宿主 x86_64 `libgcc.a`；
+- HCC 自带的是 AArch64 `libgcc.a`，与 `aicorelinux` 明确不兼容；
+- CANN 包中没有可供 AICore 静态链接的 compiler-rt/builtins；
+- `-rtlib` 对 device `-c` 不生效，不能把宿主运行库错链进 mixed ELF。
+
+微基准进一步把根因收敛到 CCEC 对
+“`UINT64_MAX/rhs` 溢出预检 + 64-bit 乘法”的宽乘融合，而不是普通的
+`uint64_t * uint32_t`。公共 ordinary-region 校验因此改用两次
+`u32×u32→u64` 的 limb 乘法：
+
+```text
+left = H*2^32 + L
+left*right =
+  (H*right + floor(L*right/2^32))*2^32
+  + low32(L*right)
+```
+
+只有 `H*right + carry <= UINT32_MAX` 时结果可由 `uint64_t` 表达。该写法
+保留原来的 64-bit extent 取值域，没有用“限制到 `UINT32_MAX`”绕开通用
+语义。byte range 的 dtype 大小只可能为 1/2/4/8，改用带上界检查的 shift，
+同样不需要宽乘 helper。CPU 定向门槛新增：
+
+- 恰好 `UINT32_MAX` 的连续 extent；
+- 大于 `UINT32_MAX` 但仍合法的连续 extent；
+- 真正超过 `UINT64_MAX` 的 shape product；
+- 大于 `UINT32_MAX` 的 non-contiguous cached extent；
+- dtype 缩放后的 byte-range overflow。
+
+普通 shared 构建也从“模板编译到 `/dev/null`”加强为 AIC/AIV 各自真实
+静态链接后再删除 probe。这样后续任何未解析 device builtin 都会直接阻止
+构建，不能再以 compile-only PASS 冒充可执行。
+
+#### 失效操作的编译器顺序
+
+对 CANN 9.1 生成的 LLVM intrinsic 属性和 AIC/AIV 机器码做了单独审计。
+当前 resolver 恰好生成：
+
+```text
+DCCI -> DSB -> load history header/record
+```
+
+但 DCCI/DSB 只声明访问 inaccessible memory，并不约束普通 GM load。
+最小反例中的“失效前 load、DCCI、DSB、失效后 load”会被 CCEC `-O3`
+合并成零次 GM load。为此在 `CcecOps::InvalidateRegion()` 的 DSB 后增加：
+
+```cpp
+__asm__ volatile("" ::: "memory");
+```
+
+它不生成设备指令，只建立源码级 compiler ordering，保证调用方的普通
+header/payload load 不会上提到失效之前。没有给热路径增加第二个 DSB，
+也没有改变 atomic 的发布/完成语义。
+
+#### A5 动态门槛的精确时序
+
+`ccec/history_litmus_*` 只依赖本目录的 `common/`、CCEC/ACL/runtime，
+artifact 固定在 `build/ccec/shared/history-litmus/`。每个 host 进程只跑
+一个方向，两个方向分别为：
+
+```text
+AIC block0/1 写 B/D/E -> AIV 物理 block4 的 reader C
+AIV block0/1 写 B/D/E -> AIC block2 的 reader C
+```
+
+每个方向都使用独立 task id。host 初始化 A 的 7 个 symbol，D/E history
+两条 cache line 全零；device 执行：
+
+```text
+B 发布 7 条 history + 7 次 latest CAS + writer-ready
+  -> C 越过 B gate
+  -> C 普通 load 预热 D/E header 和 record[6] 所在第二条线，必须读到零
+  -> C 发布 reader-past-B gate
+  -> D、E 依次发布 14 条 history/CAS
+  -> C 观察 future-done 后调用真实 CollectSharedFanin
+  -> resolver 失效 history，沿 E->D->B 返回 B
+```
+
+预热值直接决定 C 是否发布下一道 gate，并写入 device 独占结果行，不能被
+编译器删除或挪到 future writer 之后。host 不只看最终 sidecar，还逐项验证：
+
+- 预热两条线都为零；
+- B/D/E 共 21 次实际 symbol CAS；
+- 七个 latest 全部为 E；
+- B/D/E 三份 immutable history 的 21 条 key/predecessor；
+- C 的 device fanin 只有 B；
+- writer-ready 全部关闭而 kernel completion flag 保持零；
+- 反方向 task/history 和 ordinary region ring 均未触碰。
+
+构建和运行入口为：
+
+```bash
+./run.sh build-history-litmus ccec
+./run.sh history-litmus ccec --device 0 --runs 20
+```
+
+`--runs 20` 表示每个方向各启动 20 个全新 host 进程，不在同一 runtime
+会话里复用偶然状态。2026-07-27 的正式上板结果为 **20×2 全部 PASS**：
+40 个独立 host 进程都通过 12 项语义断言以及 ACL 资源清理；没有出现
+fatal、超时、错误 fanin、非零预热值或反方向/ordinary-ring 污染。
+
+提交前同时完成以下静态与主机回归：
+
+| 检查 | 结果 |
+| --- | --- |
+| `bash -n`：top-level run、history runner、CCEC build | PASS |
+| CPU shared 全套：五种 ring CAP、symbol/history、heap、Vector、materialize、loser | PASS |
+| ordinary 64-bit range：合法大 extent 与 dtype/shape overflow | PASS |
+| CCEC shared 正式构建：generic AIC/AIV probe 真实静态链接 | PASS |
+| 正式 1:2 mixed ELF：entry/metadata/LOCAL helper/state/relocation | PASS |
+| history mixed ELF：双 entry/metadata、无 `__multi3`、无未解析全局符号 | PASS |
+| A5 history：AIC writers→AIV reader，20 个新进程 | PASS |
+| A5 history：AIV writers→AIC reader，20 个新进程 | PASS |
+| manifest/trap 收口后重建并双向各复测 1 个新进程 | PASS |
+| `git diff --check` | PASS |
+
+CPU 首次误用本用户 plucky GCC 15 搭配系统 binutils 2.42，汇编器不识别
+编译器输出的 `.base64`；该轮在任何测试执行前即编译失败，不计作源码
+结果。CPU 有效全套回归显式使用仓库此前已验证的系统 GCC 13。CCEC device
+编译与 A5 上板仍全部使用本用户 CANN 9.1，host runner 使用系统 GCC 13；
+不能把 host 汇编器组合问题写成 device 协议失败。
+
+提交前独立复核没有发现阻断项；两个低风险工程缺口已当场收口：
+
+- generic probe 放入独立子 shell，并用 `EXIT` trap 清理四个隐藏 object/ELF，
+  任一步编译或链接失败都不会留下半成品，同时不覆盖后续 manifest trap；
+- history runner 从被 C++ `static_assert` 绑定当前 build identity 的共享头
+  读取 ABI generation；运行前要求 manifest 精确六行、双向标签和两个固定
+  artifact 名称，再验证 SHA256，避免未来 ABI 升级后标签静默漂移。
+
+本门槛是当前真实 DCCI/CollectSharedFanin 路径的正向跨核可见性证据，没有
+另造“去掉 DCCI”的负向镜像，因此不把结果越界解释成 DCCI 必要性的单变量
+因果证明。
+
+#### 本阶段边界
+
+- 普通 PA ELF 仍未调用通用 WriterIntentSet，故其性能/I-cache 布局未被
+  该门槛改变；
+- 本门槛只闭合 symbol immutable history，不冒充 ordinary region 的
+  reader-progress reclaim 已完成；
+- 下一步先设计 ordinary reader 进度的独立 cache-line 发布协议，再做
+  A→B→慢 reader→未来 writer→回收门槛，最后才迁移 PA 并删除专用分支。

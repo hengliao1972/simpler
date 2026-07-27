@@ -1538,6 +1538,31 @@ PA_DEVICE bool WaitForSharedWriterReady(
     }
 }
 
+PA_DEVICE bool CheckedMultiplyU64ByU32(
+    uint64_t left, uint32_t right, uint64_t &product
+) {
+    // CCEC 9.1 会把“UINT64_MAX/right 预检 + 64-bit 乘法”融合成
+    // AICore 环境没有运行库实现的 __multi3。按 32-bit limb 展开后只需
+    // 32x32->64 乘法，同时保留 generic TensorDesc 原有的 uint64 extent
+    // 取值域，不能为迁就编译器把合法的大 ordinary region 收窄到 32 bit。
+    const uint64_t low_product =
+        static_cast<uint64_t>(
+            static_cast<uint32_t>(left)
+        ) * right;
+    const uint64_t high_product =
+        static_cast<uint64_t>(
+            static_cast<uint32_t>(left >> 32)
+        ) * right;
+    const uint64_t carry = low_product >> 32;
+    if (high_product > UINT32_MAX - carry) {
+        return false;
+    }
+    product =
+        ((high_product + carry) << 32) |
+        static_cast<uint32_t>(low_product);
+    return true;
+}
+
 template <typename TensorReference>
 PA_DEVICE bool MakeValidatedSharedWriterRegion(
     const TensorReference &tensor, int32_t task_id,
@@ -1557,21 +1582,40 @@ PA_DEVICE bool MakeValidatedSharedWriterRegion(
         for (uint32_t dimension = 0;
              dimension < tensor.ndims; ++dimension) {
             const uint32_t shape = tensor.shapes[dimension];
-            if (shape == 0 || extent > UINT64_MAX / shape) {
+            uint64_t next_extent = 0;
+            if (shape == 0 ||
+                !CheckedMultiplyU64ByU32(
+                    extent, shape, next_extent
+                )) {
                 return false;
             }
-            extent *= shape;
+            extent = next_extent;
         }
     }
+    uint32_t element_shift = 0;
+    if (element_size == 8) {
+        element_shift = 3;
+    } else if (element_size == 4) {
+        element_shift = 2;
+    } else if (element_size == 2) {
+        element_shift = 1;
+    } else if (element_size != 1) {
+        return false;
+    }
     if (extent == 0 ||
-        tensor.start_offset > UINT64_MAX - extent ||
-        tensor.start_offset > UINT64_MAX / element_size ||
-        tensor.start_offset + extent > UINT64_MAX / element_size) {
+        tensor.start_offset > UINT64_MAX - extent) {
+        return false;
+    }
+    const uint64_t end_offset = tensor.start_offset + extent;
+    const uint64_t max_element_offset =
+        UINT64_MAX >> element_shift;
+    if (tensor.start_offset > max_element_offset ||
+        end_offset > max_element_offset) {
         return false;
     }
     region.buffer_addr = tensor.buffer_addr;
-    region.lo = tensor.start_offset * element_size;
-    region.hi = (tensor.start_offset + extent) * element_size;
+    region.lo = tensor.start_offset << element_shift;
+    region.hi = end_offset << element_shift;
     region.producer = task_id;
     region.reserved = 0;
     return region.lo < region.hi;

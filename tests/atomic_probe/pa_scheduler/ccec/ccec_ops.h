@@ -339,6 +339,10 @@ struct CcecOps {
             dcci(reinterpret_cast<__gm__ uint8_t *>(current), SINGLE_CACHE_LINE);
         }
         dsb((mem_dsb_t)0);
+        // CCEC 9.1 把 DCCI/DSB 标成只读写 inaccessible memory，不能据此
+        // 约束普通 GM load。后置 compiler barrier 不生成设备指令，只保证
+        // 调用方在失效后读取的 header/payload 不会被合并或上提到 DCCI 前。
+        __asm__ volatile("" ::: "memory");
     }
 
     __aicore__ static inline void FlushRegion(__gm__ void *address, uint64_t bytes) {

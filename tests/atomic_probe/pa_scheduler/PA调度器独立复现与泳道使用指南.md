@@ -209,17 +209,18 @@ cd /path/to/pa_scheduler
 
 source /home/q00473782/Ascend/cann-9.1.0-weekly-20260708/cann-9.1.0/set_env.sh
 
-export GCC15_ROOT=/home/q00473782/.local/gcc-15/root
-export PATH="$GCC15_ROOT/usr/bin:$PATH"
-export LD_LIBRARY_PATH="$GCC15_ROOT/usr/lib/x86_64-linux-gnu:$GCC15_ROOT/usr/lib/gcc/x86_64-linux-gnu/15${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export CXX="$GCC15_ROOT/usr/bin/g++-15"
+export CXX=/usr/bin/g++
 
-./run.sh build all --tensormap private
+./run.sh build ccec --tensormap private
+./run.sh build cpu --tensormap private
 ```
 
-组合构建严格按 CCEC、AscendC、CPU 的顺序执行。CCEC 构建会检查 1:2 mixed
-的两个入口和 metadata section；CANN 9.1 自带的 PTO 头可直接使用。若换用单独
-安装的 PTO ISA，可把 `PTO_ISA_ROOT` 指向包含
+当前开发门槛只要求 CCEC 与 CPU，不要求 AscendC。用户目录中从 Ubuntu
+plucky 解出的 GCC 15 会生成 binutils 2.42 不认识的 `.base64` 伪指令，
+standalone host/CPU 回归必须显式使用已验证的系统 GCC 13；GCC 15 仍属于
+A5sim 的独立工具链需求，不能把两种用途混为一谈。CCEC 构建会检查 1:2
+mixed 的两个入口和 metadata section；CANN 9.1 自带的 PTO 头可直接使用。
+若换用单独安装的 PTO ISA，可把 `PTO_ISA_ROOT` 指向包含
 `include/pto/common/kernel_meta.hpp` 的目录；同一 include tree 还必须具有
 `pto/pto-inst.hpp`、`pto/common/constants.hpp` 和 `pto/common/pto_tile.hpp`。
 
@@ -335,13 +336,20 @@ S3.2a 在 S3.1 的 4,735,104B output table 尾部追加 8 条 cache-line
 heap cursor 和 1 条 aggregate vend，因此 `SharedTensorMapSidecar`
 在 S4.9 为 4,735,680B；S4.14a 再在尾部追加 8 条物理 shared Vector
 Claim cursor，S4.14b 已启用全部 8 条。S4.16a/S4.16b 曾在数组
-尾部追加并启用另外 8 条，但因性能门槛失败已整体撤销。当前 sidecar
-恢复为 4,736,192B，热路径使用 `task_id%8`；当前 shared
-`SchedulerState` 的 CPU 非 split 布局为 1,011,852,160B，
-CCEC split 布局为 1,011,858,304B；sidecar
-位于 standalone 控制区和 `results` 之后，不移动 `WorkerState`、
-`RunConfig` 或既有结果字段。S4.15a 历史候选曾在末尾追加 512B
-Cube cursor，但已因性能门槛未通过而撤销，不属于当前传输布局。
+尾部追加并启用另外 8 条，但因性能门槛失败已整体撤销。S6.3 将 shared
+`kMaxTasks` 从 1,280 扩为 4,352，使 generation-6 sidecar 增至
+11,027,648B；region ring 和 `shared_outputs` 起点不变，heap/vend/Vector
+尾字段随 output table 扩容顺延。R4c 在 offset 11,027,648B 追加
+`writer_history[4352]`，每 cell 320B，共 1,392,640B；当前 sidecar 为
+12,420,288B，默认 CAP=128 的构建身份 ABI generation 为 7。R4c 的尾部
+追加不移动此前字段，Vector 热路径仍使用 `task_id%8`。当前 shared
+`SchedulerState` 的 CPU 非 split 布局为 1,019,536,256B；定义
+`PA_COMPETE_FIRST_SPLIT_FINISH` 的 CCEC 变体为 1,019,542,400B。sidecar 位于
+standalone 控制区和 `results` 之后，不移动 `WorkerState`、`RunConfig`
+或既有结果字段。普通 PA 仍走专用 writer-chain，不调用 generic
+WriterIntentSet，host 要求 history 整表保持零；所以 R4c 增加的是分配与
+启动期搬运长度，不改变 PA Submit 热路径。S4.15a 历史候选曾在末尾追加
+512B Cube cursor，但已因性能门槛未通过而撤销，不属于当前传输布局。
 
 S4.16a 的历史布局曾保持
 `shared_vector_cursor` 起点 4,735,680B、前八条线地址和热路径
@@ -355,7 +363,9 @@ S4.16b 第一层性能门槛失败；这些数字只属于历史候选，不是�
 
 每 task 最多八个 fresh output，以 16B
 `FdwicOutputRef` 表达 `(producer_task_id, output_slot)`，返回句柄为
-8B `SharedTaskOutputs`。构建身份 ABI 当前为 4。
+8B `SharedTaskOutputs`。当前构建身份 ABI generation 为 7；其中
+generation 7 的通用 history 仍是独立门槛能力，不能据此声称 PA 热路径
+已经从专用 writer-chain 迁到通用 WriterIntentSet。
 
 当前 shared 已完成 winner-only 重构参与 Materialize：所有 worker 仍先
 Claim 并独立声明同一组 output symbol；Alloc 暂时保留每核三个静态 Output
@@ -475,6 +485,43 @@ S2 的 2,119,808B sidecar（含 96 条 per-core progress）和 S2.5 的
 ordinary-region 原型，但已经从 PA Case1 运行路径断开；它的测试结果不能
 冒充当前 PA 热路径证据。S2/S2.5 的历史结构、失败实验和上板结果见
 `shared_tensormap_record.md`。
+
+#### 通用 symbol history 的独立 A5 门槛
+
+R4c 的通用 WriterIntentSet 为 future writer 覆盖 latest-cache 的场景追加
+task-indexed immutable history；R4d 用独立 mixed AIC/AIV ELF 验证跨物理核
+失效与回溯。它不启动普通 PA benchmark，也不改变 PA kernel/host。构建和
+运行前先 source 本用户 CANN 9.1，再在本目录执行：
+
+```bash
+./run.sh build-history-litmus ccec
+./run.sh history-litmus ccec --device 0 --runs 20
+```
+
+该 action 已固定为 shared-only，不能附加 `--tensormap shared`；`--runs 20`
+表示两个方向各启动 20 个全新 host 进程，共 40 个：
+
+```text
+AIC writers -> AIV reader
+AIV writers -> AIC reader
+```
+
+每个方向都先让 reader 普通读取并预热尚为零的 future-writer history 两条
+cache line，再由两个未来 writer 发布，最后调用真实
+`CollectSharedFanin()` 沿 `E -> D -> B` 回溯。host 会逐项校验预热值、
+21 条 history record 及 21 次成功 CAS、7 个 latest、最终 fanin、控制门
+和未触碰的 ordinary ring。产物固定在：
+
+```text
+build/ccec/shared/history-litmus/
+```
+
+普通 shared 构建还会把 AIC/AIV 的 generic WriterIntentSet probe 各自实际
+静态链接，拒绝 `__multi3` 或其他未解析 device builtin；probe 检查后删除，
+不会进入正式 mixed ELF。该门槛只证明 symbol history 可见性，不证明
+ordinary region 的 reader-progress/reclaim 已完成。
+history-litmus 自身虽是 CCEC mixed ELF，但没有定义 split-finish，因此其
+GM `SchedulerState` 使用 non-split 大小 1,019,536,256B。
 
 shared sidecar 的 atomic 当前会计入既有 Submit/业务阶段时间，但 heap
 cursor/vend、symbol writer/published 等尚未逐条接入 atomic 泳道 wrapper；
@@ -1764,21 +1811,25 @@ ClockBaseline，并继续以逐核容量、调用数、总记录数和 `dropped=
 `64 * 96 = 6,144` bytes。split ELF 另预留 AIC/AIV 两个 role-specific
 block-local runtime state，每个精确 1,664 bytes、最终 section 合计
 3,328 bytes；它们不属于 GM `SchedulerState`。以上 `SchedulerState` 数字
-是 private 模式；当前回退后的 S4.14b shared sidecar 为
-4,736,192 bytes，
-故 CPU non-split/CCEC split 总大小分别为
-1,011,852,160/1,011,858,304 bytes；既有 production prefix 和
+是 private 模式；当前 R4c shared sidecar 为 12,420,288 bytes，故 CPU
+non-split 与定义 `PA_COMPETE_FIRST_SPLIT_FINISH` 的 CCEC 变体总大小分别为
+1,019,536,256/1,019,542,400 bytes；swimlane、perf-clock 以及
+submit-PMU none/claim/efdrain 使用后者，submit-PMU
+materialize/register 和独立 history-litmus 使用 non-split 大小。既有
+production prefix 和
 standalone 控制字段 offset 不变。S4.15a/S4.16 历史候选都曾得到
 4,736,704B，但末尾 512B 分别是 Cube cursor 和
 `shared_vector_cursor[8..15]`，且均已撤销。S4.9 的
 4,735,680B、历史 S2.5 的 2,113,664B 和 S3.1 的 4,735,104B 也都
 不是当前 shared 构建的传输或分配口径。
 
-S4.16a 的 host/device `sizeof(SchedulerState)` 握手、manifest
-校验和相对重建 `319077a9` 的正式 b256 六区组配对已经完成。不能因
-字节数碰巧与 S4.15a 相同就混用历史产物；两份当前冻结件及配对路径
-见 `shared_tensormap_record.md`。S4.16b 沿用相同大小并闭合正确性，
-但第一层性能门槛失败；当前源码和传输大小均已恢复 S4.14b。
+S4.16a 的 host/device `sizeof(SchedulerState)` 握手、manifest 校验和
+相对重建 `319077a9` 的正式 b256 六区组配对已经完成。不能因历史候选
+字节数碰巧相同就混用产物；冻结件及配对路径见
+`shared_tensormap_record.md`。S4.16b 沿用相同历史大小并闭合正确性，
+但第一层性能门槛失败；当前源码保留 S4.14b 的八分片热路径，同时在尾部
+纳入 S6.3 的 output table 扩容并追加 R4c history，不能再把当前传输长度
+写成“恢复 S4.14b”。
 
 独立的 64 bytes PMU 配置和 64 bytes winner workload 配置各占一条
 cache line；二者都位于完整生产 DistGlobal 镜像之后，生产 DistGlobal/
