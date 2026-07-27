@@ -50,6 +50,32 @@ Tensor make_existing_tensor(uint64_t address) {
     return tensor;
 }
 
+Tensor make_owned_tensor(uint64_t address, int32_t owner) {
+    Tensor tensor = make_existing_tensor(address);
+    tensor.owner_task_id = PTO2TaskId::make(0, static_cast<uint32_t>(owner));
+    return tensor;
+}
+
+const RingSlot *find_built_slot(const DistCore &worker, int32_t task_id) {
+    for (int32_t index = 0; index < kPrivateSlots; ++index) {
+        const RingSlot &slot = worker.slots[index];
+        if (slot.occupied && slot.built && slot.task_id == task_id) {
+            return &slot;
+        }
+    }
+    return nullptr;
+}
+
+int32_t fanin_occurrences(const RingSlot &slot, int32_t producer) {
+    int32_t count = 0;
+    for (int32_t index = 0; index < slot.fanin_count; ++index) {
+        if (slot.fanin[index] == producer) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 class FdwicSharedSubmitWiringTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -160,6 +186,110 @@ TEST_F(FdwicSharedSubmitWiringTest, KernelWinnerCommitsWholeTaskAndBuildsItsSlot
     EXPECT_EQ(worker_->slots[0].task_id, 1);
     ASSERT_EQ(worker_->slots[0].fanin_count, 1);
     EXPECT_EQ(worker_->slots[0].fanin[0], 0);
+    EXPECT_EQ(std::memcmp(private_map_before.data(), &worker_->map, private_map_before.size()), 0);
+}
+
+TEST_F(FdwicSharedSubmitWiringTest, PaG2LatestInoutWriterFeedsFinalUp) {
+    constexpr int32_t kUpKernelId = 15;
+    Tensor mi_update = make_owned_tensor(0x510000, /*owner=*/0);
+    Tensor li_update = make_owned_tensor(0x520000, /*owner=*/0);
+    Tensor oi = make_owned_tensor(0x530000, /*owner=*/0);
+    Tensor out_view = make_existing_tensor(0x540000);
+    out_view.manual_dep = true;
+
+    const Tensor group0_mi = make_owned_tensor(0x610000, /*owner=*/2);
+    const Tensor group0_li = make_owned_tensor(0x620000, /*owner=*/2);
+    const Tensor group0_oi_new = make_owned_tensor(0x630000, /*owner=*/3);
+    const Tensor group1_mi = make_owned_tensor(0x710000, /*owner=*/6);
+    const Tensor group1_li = make_owned_tensor(0x720000, /*owner=*/6);
+    const Tensor group1_oi_new = make_owned_tensor(0x730000, /*owner=*/7);
+
+    // Real PA G2 starts with Alloc/QK/SF/PV. Fresh runtime outputs carry their
+    // creator IDs but do not enter the ordinary-region TensorMap. Task 1 gets
+    // one impossible poison entry for out_view only in this test: a wrong
+    // manual_dep lookup would add producer 1 to UP fan-in, while a wrong
+    // register would replace its latest producer with task 4 or 8.
+    publish_seed_task(nullptr, 0, /*task=*/0, kHDefault);
+    const SharedTensorMapValue manual_poison = dist_shared_tensor_map_make_value(out_view, /*producer=*/1);
+    publish_seed_task(&manual_poison, 1, /*task=*/1, kHDefault);
+    for (int32_t task = 2; task <= 3; ++task) {
+        publish_seed_task(nullptr, 0, task, kHDefault);
+    }
+    worker_->local_index = 4;
+
+    L0TaskArgs up0_args;
+    up0_args.add_input(group0_mi, group0_li, group0_oi_new);
+    up0_args.add_inout(mi_update, li_update, oi, out_view);
+    MixedKernels mixed;
+    mixed.aiv0_kernel_id = kUpKernelId;
+
+    std::vector<std::byte> private_map_before(sizeof(worker_->map));
+    std::memcpy(private_map_before.data(), &worker_->map, private_map_before.size());
+
+    const DistCompeteFirstTicket up0_ticket = dist_submit_compete_first_begin(nullptr, mixed);
+    ASSERT_EQ(up0_ticket.task_id, 4);
+    ASSERT_EQ(up0_ticket.won, 1);
+    (void)dist_submit_compete_first_finish(nullptr, mixed, up0_ticket, up0_args);
+
+    EXPECT_EQ(g_dist.fatal, 0);
+    EXPECT_EQ(g_dist.error_code, PTO2_ERROR_NONE);
+    EXPECT_EQ(g_dist.shared_tensor_map.committed_tasks.v, 5);
+    const RingSlot *up0_slot = find_built_slot(*worker_, 4);
+    ASSERT_NE(up0_slot, nullptr);
+    EXPECT_EQ(up0_slot->fanin_count, 3);
+    EXPECT_EQ(fanin_occurrences(*up0_slot, 0), 1);
+    EXPECT_EQ(fanin_occurrences(*up0_slot, 1), 0);
+    EXPECT_EQ(fanin_occurrences(*up0_slot, 2), 1);
+    EXPECT_EQ(fanin_occurrences(*up0_slot, 3), 1);
+
+    bool protocol_ok = false;
+    EXPECT_EQ(dist_shared_tensor_map_lookup_tensor(g_dist.shared_tensor_map, mi_update, 5, kHDefault, protocol_ok), 4);
+    EXPECT_TRUE(protocol_ok);
+    EXPECT_EQ(dist_shared_tensor_map_lookup_tensor(g_dist.shared_tensor_map, li_update, 5, kHDefault, protocol_ok), 4);
+    EXPECT_TRUE(protocol_ok);
+    EXPECT_EQ(dist_shared_tensor_map_lookup_tensor(g_dist.shared_tensor_map, oi, 5, kHDefault, protocol_ok), 4);
+    EXPECT_TRUE(protocol_ok);
+    EXPECT_EQ(dist_shared_tensor_map_lookup_tensor(g_dist.shared_tensor_map, out_view, 5, kHDefault, protocol_ok), 1);
+    EXPECT_TRUE(protocol_ok);
+
+    // QK/SF/PV of group 1 likewise advance the exact turn without publishing
+    // ordinary regions. The final UP must observe task 4 as the latest writer
+    // of all three accumulators before it publishes task 8.
+    for (int32_t task = 5; task <= 7; ++task) {
+        publish_seed_task(nullptr, 0, task, kHDefault);
+    }
+    worker_->local_index = 8;
+
+    L0TaskArgs up1_args;
+    up1_args.add_input(group1_mi, group1_li, group1_oi_new);
+    up1_args.add_inout(mi_update, li_update, oi, out_view);
+    const DistCompeteFirstTicket up1_ticket = dist_submit_compete_first_begin(nullptr, mixed);
+    ASSERT_EQ(up1_ticket.task_id, 8);
+    ASSERT_EQ(up1_ticket.won, 1);
+    (void)dist_submit_compete_first_finish(nullptr, mixed, up1_ticket, up1_args);
+
+    EXPECT_EQ(g_dist.fatal, 0);
+    EXPECT_EQ(g_dist.error_code, PTO2_ERROR_NONE);
+    EXPECT_EQ(g_dist.shared_tensor_map.committed_tasks.v, 9);
+    const RingSlot *up1_slot = find_built_slot(*worker_, 8);
+    ASSERT_NE(up1_slot, nullptr);
+    EXPECT_EQ(up1_slot->fanin_count, 4);
+    EXPECT_EQ(fanin_occurrences(*up1_slot, 0), 1);
+    EXPECT_EQ(fanin_occurrences(*up1_slot, 1), 0);
+    EXPECT_EQ(fanin_occurrences(*up1_slot, 4), 1);
+    EXPECT_EQ(fanin_occurrences(*up1_slot, 6), 1);
+    EXPECT_EQ(fanin_occurrences(*up1_slot, 7), 1);
+
+    EXPECT_EQ(dist_shared_tensor_map_lookup_tensor(g_dist.shared_tensor_map, mi_update, 9, kHDefault, protocol_ok), 8);
+    EXPECT_TRUE(protocol_ok);
+    EXPECT_EQ(dist_shared_tensor_map_lookup_tensor(g_dist.shared_tensor_map, li_update, 9, kHDefault, protocol_ok), 8);
+    EXPECT_TRUE(protocol_ok);
+    EXPECT_EQ(dist_shared_tensor_map_lookup_tensor(g_dist.shared_tensor_map, oi, 9, kHDefault, protocol_ok), 8);
+    EXPECT_TRUE(protocol_ok);
+    EXPECT_EQ(dist_shared_tensor_map_lookup_tensor(g_dist.shared_tensor_map, out_view, 9, kHDefault, protocol_ok), 1);
+    EXPECT_TRUE(protocol_ok);
+
+    EXPECT_EQ(worker_->occupied_count, 2);
     EXPECT_EQ(std::memcmp(private_map_before.data(), &worker_->map, private_map_before.size()), 0);
 }
 

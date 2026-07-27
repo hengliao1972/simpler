@@ -411,6 +411,15 @@ PTO_DEVICE_FUNC bool dist_submit_check_task_cap(const DistSubmitCtx &ctx, DistSu
     return false;
 }
 
+PTO_DEVICE_FUNC bool dist_submit_tensor_uses_manual_dependency(const L0TaskArgs &args, int32_t index) {
+#if defined(__CCE_AICORE__)
+    return args.tensor(index).tensor_from_gm() ? args.tensor(index).gm_ref().manual_dep :
+                                                 args.tensor(index).ref().manual_dep;
+#else
+    return args.tensor(index).ref().manual_dep;
+#endif
+}
+
 PTO_DEVICE_FUNC uint32_t
 calculate_output_layout(const L0TaskArgs &args, DistOutputLayout &layout, uint32_t &register_mask) {
     layout.total_output_size = 0;
@@ -418,7 +427,10 @@ calculate_output_layout(const L0TaskArgs &args, DistOutputLayout &layout, uint32
     uint32_t output_mask = 0;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         const TensorArgType tag = args.tag(i);
-        if (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING) register_mask |= 1u << i;
+        if ((tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING) &&
+            !dist_submit_tensor_uses_manual_dependency(args, i)) {
+            register_mask |= 1u << i;
+        }
         if (tag != TensorArgType::OUTPUT) continue;
         output_mask |= 1u << i;
         layout.buffer_sizes[i] = TensorCreateInfo::buffer_size_bytes(args.tensor(i).create_info());
@@ -570,6 +582,7 @@ PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const 
                 dist_submit_add_fanin(fanin, fc, static_cast<int32_t>(owner_raw & 0xFFFFFFFFu));
             }
             if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
+            if (args.tensor(i).gm_ref().manual_dep) continue;
 #if PTO_FDWIC_SHARED_MAP
             int32_t p = -1;
             if (!dist_tensor_map_lookup_for_submit_winner(*ctx.self, args.tensor(i).gm_ref(), ctx.task_id, p)) {
@@ -586,6 +599,7 @@ PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const 
                 dist_submit_add_fanin(fanin, fc, static_cast<int32_t>(owner_raw & 0xFFFFFFFFu));
             }
             if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
+            if (t.manual_dep) continue;
 #if PTO_FDWIC_SHARED_MAP
             int32_t p = -1;
             if (!dist_tensor_map_lookup_for_submit_winner(*ctx.self, t, ctx.task_id, p)) return false;

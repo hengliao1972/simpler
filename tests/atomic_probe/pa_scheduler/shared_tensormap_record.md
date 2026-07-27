@@ -8036,3 +8036,133 @@ task 4 发布完成后 task 8 才能解析到最新 writer 4；此时再额外�
 region-intent 会重复同步。只有后续同时迁移 shared-output stable symbol、
 winner-only 构参和 light loser、准备解除全局 exact-turn 时，才需要把
 “非末组 UP 的 writer-ready gate”与这些机制作为一个独立阶段引入。
+
+### 2026-07-27：R3c 固定 PA G2 writer 链并补齐 manual_dep 合同
+
+前述门槛只证明普通 region 事务和 joint 完成协议，没有覆盖 PA 多组
+online-update 对同一组 accumulator 的连续改写。当前阶段先构造最小真实
+G2 拓扑，再决定是否需要新增 region-intent，不能先凭推测增加一层同步。
+
+#### 最小 G2 业务拓扑
+
+真实 PA 在 `batch=1`、`num_heads=16`、`kv_head_num=1`、
+`block_size=128`、`context_len=8193` 时 `q_loop=1`、共有 65 个 block，
+因此形成两个 group、共 9 个 task：
+
+```text
+0 Alloc
+1 QK0 -> 2 SF0 -> 3 PV0 -> 4 UP0
+5 QK1 -> 6 SF1 -> 7 PV1 -> 8 UP1
+```
+
+task 4 的非末组 UP 以 INOUT 改写 `mi_update/li_update/oi`，task 8
+必须把 task 4 解析为这三个 region 的最新 writer，同时保留原始 creator 0
+和本组 QK/SF/PV 的 producer 6/7。最后一个 `out_view` 也是 INOUT，但 PA 用
+`Tensor::view(..., true)` 把它标成 `manual_dep`；其合同是 creator-only，
+不单独建立 ordinary-region 边。当前 PA 的跨组执行顺序由同一 UP 的三个
+普通 accumulator writer 链保证，不能把它描述成另有一条显式
+`out_view` 依赖。
+
+新用例 `PaG2LatestInoutWriterFeedsFinalUp` 直接调用 production shared
+Submit。为避免复制 QK/SF/PV 算子实现，task 0、2、3、5～7 直接调用
+shared map publish 原语种入零 entry commit 来推进 exact turn，不经过
+这些 task 的完整 Submit。task 1 额外种入一条 production 不会产生的
+`out_view -> producer 1` poison entry：错误 lookup 会把 1 加入 UP
+fan-in，错误 register 会把它覆盖成 4/8。task 4 和 task 8 则完整执行
+`Begin -> Fanin -> Register -> shared commit -> WinnerBuild`。它断言：
+
+- task 4 fan-in 精确为 producer 0、2、3；
+- task 8 fan-in 精确为 producer 0、4、6、7，其中 0 是 creator lifetime，
+  4 是 ordinary-region latest writer；
+- 三个 accumulator 在 task 4 后的 latest producer 为 4，在 task 8 后为
+  8；
+- `out_view` 的人工 latest producer 在两个时点都保持 1，且 producer 1
+  从未进入两个 UP 的 fan-in；
+- shared `committed_tasks` 依次为 5、9，本核构建两个真实 RingSlot；
+- private map 逐字节不变。
+
+该门槛证明的是 G2 的 TensorMap writer 链，不是完整 PA 数值用例：被种下的
+commit 不执行 QK/SF/PV kernel，poison entry 也不是业务数据；本用例不验证
+这些任务的 OUTPUT 地址或数值。
+
+#### 红灯揭示的公共 manual_dep 缺口
+
+在 production 修正前，三个 accumulator 的 writer 链已经正确，但
+`out_view` 的人工 latest producer 在 task 4、8 后分别被错误覆盖成 4、8，
+而不是保持 1。
+根因不是 shared exact-turn：
+
+- fan-in 的 CPU 分支已经在 lookup 前跳过 `manual_dep`；
+- `calculate_output_layout()` 却把所有 INOUT/OUTPUT_EXISTING 都加入
+  `register_mask`；
+- private Register 和 shared 整 task publish 共用这个 mask，因此两种
+  模式都会登记按 creator-only 合同本不应进入普通 TensorMap 的 region；
+- CCEC 的 GM/local fan-in 分支又缺少 CPU 已有的 `manual_dep` lookup
+  过滤，真机口径还比 CPU 多做一次无意义查询。
+
+修正为 Register 增加地址空间感知的
+`dist_submit_tensor_uses_manual_dependency()`：CCEC 对 GM tensor 读取
+`gm_ref().manual_dep`，对本地 tensor 读取 `ref().manual_dep`，CPU-sim
+沿用 `ref()`。Fanin 已经完成 GM/local 分流，因而直接读取对应引用的
+`manual_dep`，不重复判断一次地址空间。两处都遵守 canonical 顺序：
+
+```text
+保留 owner_task_id fan-in
+  -> manual_dep 时跳过普通 TensorMap lookup
+  -> OUTPUT 布局照常计算
+  -> manual_dep 时不加入 register_mask
+```
+
+因此修正没有删除 creator lifetime，也没有改变 OUTPUT materialize；它只
+补齐“manual_dep 不进入普通 TensorMap”的查、插合同。private 路径会少写
+每核无意义条目；shared 的整 task publish 和 commit CAS 次数不变，只把
+UP 发布的普通 entry 从 4 个减为 3 个，并少占对应 bucket 的一个 ring
+slot。本阶段没有单独测量该减法的性能收益，不把正确性修正宣称成已量化
+优化。
+
+private 对称门槛直接编译 production private Submit：先给 manual_dep
+INOUT 预置 creator 0 和 map producer 1，给另一个 bucket 的普通 INOUT
+预置 producer 2，再由 task 3 成功 Submit。最终 RingSlot 的 fan-in 精确为
+0/2，不含 1；manual region 的 latest 仍为 1，普通 region 更新为 3，并且
+恰好构建一个 task 3 RingSlot。因此它在 CPU private 路径同时动态证明
+creator retention、lookup skip、register skip 和普通 INOUT 正常查插。
+
+shared G2 的 poison entry 同样动态证明 CPU shared lookup/register skip。
+CCEC 证据则是与 canonical 源码逐支对齐、四类 artifact 编译，以及 A5
+private CaseB1 对本地 `out_view` 分支的实际执行；GM manual_dep 分支尚无
+独立动态用例。
+
+#### exact-turn 与 region-intent 的当前结论
+
+当前 shared Submit 要求 task N winner 只能在
+`committed_tasks == N` 时开始 lookup。于是 task 8 不可能越过尚未提交
+task 4 的事务；G2 定向用例已证明它随后取得 writer 4。此时新增
+region-intent 只会重复现有全局 turn 同步，并扩大协议和 atomic 面。
+
+所以当前阶段不加 region-intent。后续迁移 stable shared-output symbol、
+winner-only 构参和 light loser，并准备放松全局 exact-turn 时，必须重新
+评估非末组 UP 的 writer-ready gate；那时 region-intent 才有独立价值。
+
+#### 验证结果与边界
+
+| 检查 | 结果 |
+| --- | --- |
+| G2 red-first | accumulator writer 链正确；manual out_view 错误登记为 4/8 |
+| production private/shared CPU 门槛 | 24/24 FDWIC CTest PASS |
+| G2 定向重复 | 100/100 PASS |
+| private Submit 全组重复 | 100 轮 × 4 case PASS |
+| GCC15 ASan + UBSan | private 4/4、shared wiring 13/13 PASS，无报告 |
+| GCC15 TSan | private 4/4、shared wiring 13/13、shared multiworker 5/5 PASS，无数据竞态报告 |
+| private/shared × A5sim/A5 artifact | 4/4 Build complete，CCEC GM/local 分支均编译 |
+| A5 private PA CaseB1 golden | PASS |
+
+TSan 仍有项目既知的 `atomic_thread_fence` 不受该工具支持的编译告警，因此
+它可以排查宿主普通 data race，却不能完整建模 fence 同步，更不能替代 A5
+GM 可见性验证。shared 的
+`kFdwicCompiledBackendReady` 仍为 false，本阶段没有运行 shared A5sim/A5
+业务用例，也不把 artifact 构建成功写成 shared 上板正确性。
+
+下一小步应把同一 G2 writer-chain 放入多 worker 提前到达场景，证明 future
+winner 的等待、远端 task 4 commit、恢复 lookup 和最终 Build 在一个真实
+并发闭环内成立；完成后再审视解除 shared backend-ready 门禁所缺的
+A5 GM 可见性与完整 PA 条件。

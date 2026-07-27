@@ -5,7 +5,7 @@
  * Please refer to the License for details. You may not use this file except in compliance with the License.
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the LICENSE file.
+ * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
 
@@ -19,20 +19,30 @@
 #include <stdexcept>
 #include <vector>
 
-// 直接编译 production CPU-sim Submit 实现；只关闭诊断插桩，不复制 Claim、
-// Register、Build 或容量失败状态机。
+// Compile the production CPU-sim Submit implementation directly. Disable only
+// diagnostics rather than copying the Claim, Register, Build, or failure state machines.
 #define PTO_FDWIC_TRACE_ENABLED 0
 #include "dist_engine/aicore/dist_engine.cpp"  // NOLINT(build/include)
 
 [[noreturn]] void assert_impl(const char *condition, const char *, int) { throw std::logic_error(condition); }
 
-// CPU-sim production TU 声明了真实 orchestration 入口。该测试直接调用
-// compete-first Submit，不进入 orchestration replay，因此只需提供链接定义。
+// The production CPU-sim TU declares the real orchestration entry. These tests
+// call compete-first Submit directly, so only a link definition is required.
 extern "C" void aicpu_orchestration_entry(const L2TaskArgs &) {}
-// 完整 production TU 还包含未执行的 worker-finish/platform hooks；这两个
-// 链接桩只满足符号解析，不参与本测试的 Submit/Claim/Build 断言。
+// The full production TU also contains unused worker-finish and platform hooks.
+// These stubs satisfy linkage only and do not participate in the assertions.
 volatile uint8_t *sim_get_reg_base() { return nullptr; }
 uint32_t sim_get_physical_core_id() { return 0; }
+
+Runtime::Runtime() {
+    for (uint64_t &address : func_id_to_addr_) {
+        address = 0;
+    }
+    use_example_exec_time_ = false;
+    for (int32_t &duration : example_exec_time_ns_) {
+        duration = 0;
+    }
+}
 
 namespace {
 
@@ -65,8 +75,9 @@ void fill_output_bucket(DistTensorMap &map, const Tensor &tensor, uint32_t count
 class FdwicSubmitCapacityTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        // __CPU_SIM 下 production worker_state.h 默认不绑定 fallback；显式绑定
-        // 后，下面所有入口都读写真实 g_dist/g_self。
+        static_assert(PTO_FDWIC_SHARED_MAP == 0);
+        // Production worker_state.h does not bind the fallback under
+        // __CPU_SIM. Bind it explicitly so every entry uses real state.
         g_dist_ptr = &g_dist_fallback;
         g_self = worker_.get();
         g_fdwic_joint_submit_seen = false;
@@ -76,7 +87,7 @@ protected:
         g_dist.H = kHDefault;
         g_dist.heap_base = nullptr;
         g_dist.heap_size = 0;
-        g_dist.runtime = nullptr;
+        g_dist.runtime = &runtime_;
         g_dist.num_workers = 1;
         g_dist.num_blocks = 1;
         g_dist.fatal = 0;
@@ -97,12 +108,13 @@ protected:
         g_dist_ptr = nullptr;
     }
 
+    Runtime runtime_;
     std::unique_ptr<DistCore> worker_ = std::make_unique<DistCore>();
 };
 
 TEST_F(FdwicSubmitCapacityTest, RegisterFailureStopsBuildAndClosesFollowingClaimGate) {
-    // 把真实目标 bucket 填到 CAP-1。Register 的第一个
-    // OUTPUT_EXISTING 占用最后一槽，第二个精确撞到 per-bucket 上限。
+    // Fill the target bucket to CAP-1. The first OUTPUT_EXISTING consumes the
+    // last slot, and the second one reaches the exact per-bucket limit.
     const Tensor first_output = make_existing_output(0x100000);
     const Tensor second_output = first_output;
     const uint32_t bucket = dist_private_tensor_map_hash(first_output.buffer.addr);
@@ -133,8 +145,8 @@ TEST_F(FdwicSubmitCapacityTest, RegisterFailureStopsBuildAndClosesFollowingClaim
 
     (void)dist_submit_compete_first_finish(nullptr, mixed, ticket, args);
 
-    // 第一个 region 已占用本桶最后一槽，第二个 region 未被插入；
-    // Register 失败必须在 WinnerBuild/slot 分配之前返回。
+    // The first region consumes the final slot and the second is not inserted.
+    // Register failure must return before WinnerBuild or slot allocation.
     EXPECT_EQ(dist_private_tensor_map_load_head(worker_->map, bucket), 0U);
     EXPECT_EQ(dist_private_tensor_map_load_tail(worker_->map, bucket), kMapBucketCapacity);
     const uint32_t last_slot = dist_private_tensor_map_slot_index(bucket, kMapBucketCapacity - 1);
@@ -143,8 +155,8 @@ TEST_F(FdwicSubmitCapacityTest, RegisterFailureStopsBuildAndClosesFollowingClaim
     EXPECT_EQ(worker_->owned_total, owned_before);
     EXPECT_EQ(std::memcmp(slots_before.data(), worker_->slots, slots_before.size()), 0);
 
-    // 失败锁存复用 task-cap sentinel；AICPU 最终可从同一 fatal cache line
-    // 取得结构化容量错误。
+    // Failure latching reuses the task-cap sentinel. AICPU can retrieve the
+    // structured capacity error from the same fatal cache line.
     EXPECT_EQ(worker_->local_index, kFlagCap);
     EXPECT_EQ(g_dist.fatal, 1);
     EXPECT_EQ(g_dist.error_code, PTO2_ERROR_TENSORMAP_CAPACITY);
@@ -162,8 +174,8 @@ TEST_F(FdwicSubmitCapacityTest, RegisterFailureStopsBuildAndClosesFollowingClaim
 }
 
 TEST_F(FdwicSubmitCapacityTest, CrossBucketFailureKeepsTheExistingPrefixPublicationContract) {
-    // 当前 Register 合同不是整 task 事务：较早 output 可以先登记，后续
-    // output 满环后 task 会 fatal 且不 Build，但已发布前缀不回滚。
+    // Register is not a whole-task transaction. Earlier outputs may be
+    // published before a later full ring makes the task fail without Build.
     const Tensor full_output = make_existing_output(0x300000);
     const Tensor prefix_output = make_existing_output_in_another_bucket(full_output.buffer.addr);
     const uint32_t full_bucket = dist_private_tensor_map_hash(full_output.buffer.addr);
@@ -201,8 +213,8 @@ TEST_F(FdwicSubmitCapacityTest, CrossBucketFailureKeepsTheExistingPrefixPublicat
 }
 
 TEST_F(FdwicSubmitCapacityTest, FullBucketFirstStopsBeforeAFreeLaterOutput) {
-    // Register 按参数顺序处理并在首个失败处返回。满桶 output 位于前面时，
-    // 后续落在空闲桶的 output 不能被登记，也不能改写满桶的任何物理槽。
+    // Register follows argument order and returns on the first failure. When a
+    // full-bucket output comes first, no later free-bucket output is inserted.
     const Tensor full_output = make_existing_output(0x500000);
     const Tensor later_free_output = make_existing_output_in_another_bucket(full_output.buffer.addr);
     const uint32_t full_bucket = dist_private_tensor_map_hash(full_output.buffer.addr);
@@ -239,6 +251,68 @@ TEST_F(FdwicSubmitCapacityTest, FullBucketFirstStopsBeforeAFreeLaterOutput) {
     EXPECT_EQ(worker_->local_index, kFlagCap);
     EXPECT_EQ(g_dist.fatal, 1);
     EXPECT_EQ(g_dist.error_code, PTO2_ERROR_TENSORMAP_CAPACITY);
+}
+
+TEST_F(FdwicSubmitCapacityTest, ManualDependencyInoutKeepsCreatorButSkipsPrivateLookupAndRegister) {
+    Tensor manual_output = make_existing_output(0x700000);
+    manual_output.manual_dep = true;
+    manual_output.owner_task_id = PTO2TaskId::make(0, 0);
+    const Tensor normal_output = make_existing_output_in_another_bucket(manual_output.buffer.addr);
+    const uint32_t manual_bucket = dist_private_tensor_map_hash(manual_output.buffer.addr);
+    const uint32_t normal_bucket = dist_private_tensor_map_hash(normal_output.buffer.addr);
+    ASSERT_NE(manual_bucket, normal_bucket);
+    ASSERT_TRUE(dist_private_tensor_map_insert(worker_->map, manual_output, /*producer=*/1));
+    ASSERT_TRUE(dist_private_tensor_map_insert(worker_->map, normal_output, /*producer=*/2));
+    worker_->local_index = 3;
+
+    L0TaskArgs args;
+    args.add_inout(manual_output, normal_output);
+    ASSERT_EQ(args.tag(0), TensorArgType::INOUT);
+    ASSERT_EQ(args.tag(1), TensorArgType::INOUT);
+    ASSERT_TRUE(args.tensor(0).ref().manual_dep);
+    ASSERT_FALSE(args.tensor(1).ref().manual_dep);
+    MixedKernels mixed;
+    mixed.aiv0_kernel_id = 13;
+
+    const DistCompeteFirstTicket ticket = dist_submit_compete_first_begin(nullptr, mixed);
+    ASSERT_EQ(ticket.ready, 1);
+    ASSERT_EQ(ticket.won, 1);
+    ASSERT_EQ(ticket.task_id, 3);
+    (void)dist_submit_compete_first_finish(nullptr, mixed, ticket, args);
+
+    // manual_dep retains creator 0 but neither consumes map producer 1 nor
+    // registers task 3. The normal INOUT consumes producer 2 and registers 3.
+    EXPECT_EQ(g_dist.fatal, 0);
+    EXPECT_EQ(g_dist.error_code, PTO2_ERROR_NONE);
+    EXPECT_EQ(dist_private_tensor_map_load_head(worker_->map, manual_bucket), 0U);
+    EXPECT_EQ(dist_private_tensor_map_load_tail(worker_->map, manual_bucket), 1U);
+    EXPECT_EQ(dist_private_tensor_map_lookup(worker_->map, manual_output), 1);
+    EXPECT_EQ(dist_private_tensor_map_load_head(worker_->map, normal_bucket), 0U);
+    EXPECT_EQ(dist_private_tensor_map_load_tail(worker_->map, normal_bucket), 2U);
+    EXPECT_EQ(dist_private_tensor_map_lookup(worker_->map, normal_output), 3);
+    EXPECT_EQ(worker_->occupied_count, 1);
+    const RingSlot *built_slot = nullptr;
+    for (int32_t index = 0; index < kPrivateSlots; ++index) {
+        const RingSlot &slot = worker_->slots[index];
+        if (slot.occupied && slot.built && slot.task_id == 3) {
+            ASSERT_EQ(built_slot, nullptr);
+            built_slot = &slot;
+        }
+    }
+    ASSERT_NE(built_slot, nullptr);
+    ASSERT_EQ(built_slot->fanin_count, 2);
+    int32_t creator_count = 0;
+    int32_t manual_map_count = 0;
+    int32_t normal_map_count = 0;
+    for (int32_t index = 0; index < built_slot->fanin_count; ++index) {
+        creator_count += built_slot->fanin[index] == 0 ? 1 : 0;
+        manual_map_count += built_slot->fanin[index] == 1 ? 1 : 0;
+        normal_map_count += built_slot->fanin[index] == 2 ? 1 : 0;
+    }
+    EXPECT_EQ(creator_count, 1);
+    EXPECT_EQ(manual_map_count, 0);
+    EXPECT_EQ(normal_map_count, 1);
+    EXPECT_EQ(worker_->owned_total, 0);
 }
 
 }  // namespace
