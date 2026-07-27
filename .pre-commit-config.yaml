@@ -27,9 +27,10 @@ repos:
           entry: python tests/lint/check_english_only.py
           language: python
           language_version: python3
-          # This investigation log is intentionally maintained in Chinese for
-          # the device-performance workflow; production sources remain covered.
-          exclude: ^(3rdparty/|docs/zh-cn/|README\.zh-CN\.md|tests/atomic_probe/pa_scheduler/shared_tensormap_record\.md$)
+          # The standalone scheduler probe and its investigation records are
+          # intentionally maintained with Chinese annotations for the A5
+          # device-performance workflow; production sources remain covered.
+          exclude: ^(3rdparty/|docs/zh-cn/|README\.zh-CN\.md|tests/atomic_probe/pa_scheduler/)
 
     - repo: https://github.com/pre-commit/pre-commit-hooks
       rev: v4.6.0
@@ -45,7 +46,10 @@ repos:
       hooks:
         - id: clang-format
           types_or: [c++, c]
-          exclude: ^3rdparty/
+          # This self-contained probe preserves its hand-reviewed CCEC layout;
+          # formatting a touched legacy header rewrites thousands of unrelated
+          # lines and obscures the protocol delta under test.
+          exclude: ^(3rdparty/|tests/atomic_probe/pa_scheduler/)
 
     - repo: local
       hooks:
