@@ -504,6 +504,82 @@ PA_DEVICE bool SharedAppendPreparedTask(
     return true;
 }
 
+#if PTO_FDWIC_SHARED_MAP
+// 在调用本组合前，当前 worker 必须已经完成本 task 的全部 ordinary
+// lookup，并用 SharedAdvanceReaderDone() 恰好关闭一次 reader；append
+// actor 还必须由外层 writer-ready replay 保证唯一且按 task id 有序。
+//
+// 本组合不读取/推进 committed_tasks。正常路径先复用已发布的
+// reclaim_upto 做整 task 预检，Ready 时直接 append，不扫描 reader_done；
+// 只有容量不足才按固定 active-worker 前缀刷新 reader 回收边界并重试：
+// - Ready：整批预检和 append 均已成功；
+// - CapacityBlocked：当前 task 没有发布 payload/seq/tail，可在其他
+//   reader 前进后重试本函数；安全过期的 head/reclaim 可以保留；
+// - ProtocolError：调用层必须终止本轮，不得发布 writer-ready。
+// append 阶段若遭遇预检后协议破坏，可能已经发布物理前缀；唯一 writer
+// 合同下这不是合法竞争，不能尝试回滚。
+template <typename Ops>
+PA_DEVICE SharedAppendCheck SharedTryAppendReaderGatedTask(
+    PA_GM SharedTensorMapSidecar &map,
+    const SharedRegionValue *entries, uint32_t count,
+    uint32_t active_workers, int32_t heap_window
+) {
+    if (entries == nullptr && count != 0) {
+        return SharedAppendCheck::ProtocolError;
+    }
+    // 纯 symbol writer 没有 ordinary entry，不应为一个空 batch 读取
+    // reclaim 或扫描 reader 前沿。
+    if (count == 0) {
+        return SharedAppendCheck::Ready;
+    }
+    if (active_workers == 0 || active_workers > kWorkers ||
+        heap_window < 0) {
+        return SharedAppendCheck::ProtocolError;
+    }
+    int64_t reclaim_upto =
+        Ops::Load(&map.reclaim_upto.value);
+    if (reclaim_upto < -1) {
+        return SharedAppendCheck::ProtocolError;
+    }
+    SharedAppendCheck check =
+        SharedCheckTaskAppend<Ops>(
+            map, entries, count, reclaim_upto
+        );
+    if (check == SharedAppendCheck::ProtocolError) {
+        return check;
+    }
+    if (check == SharedAppendCheck::Ready) {
+        return SharedAppendPreparedTask<Ops>(
+                   map, entries, count
+               )
+                   ? SharedAppendCheck::Ready
+                   : SharedAppendCheck::ProtocolError;
+    }
+
+    int64_t candidate = -1;
+    if (!SharedComputeReaderReclaimCandidate<Ops>(
+            map, active_workers, heap_window, candidate
+        )) {
+        return SharedAppendCheck::ProtocolError;
+    }
+    if (!SharedPublishReclaimCandidate<Ops>(
+            map, candidate, reclaim_upto
+        )) {
+        return SharedAppendCheck::ProtocolError;
+    }
+    check =
+        SharedCheckTaskAppend<Ops>(
+            map, entries, count, reclaim_upto
+        );
+    if (check != SharedAppendCheck::Ready) {
+        return check;
+    }
+    return SharedAppendPreparedTask<Ops>(map, entries, count)
+               ? SharedAppendCheck::Ready
+               : SharedAppendCheck::ProtocolError;
+}
+#endif
+
 template <typename Ops>
 PA_DEVICE bool SharedPublishTaskCommit(
     PA_GM SharedTensorMapSidecar &map, int32_t task_id

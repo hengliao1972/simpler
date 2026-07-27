@@ -43,3 +43,11 @@ template bool pa_scheduler::SharedRefreshReaderReclaimForTask<
     __gm__ pa_scheduler::SharedTensorMapSidecar &,
     int32_t, uint32_t, int32_t, int64_t &
 );
+
+template pa_scheduler::SharedAppendCheck
+pa_scheduler::SharedTryAppendReaderGatedTask<
+    pa_scheduler_ccec::CcecOps>(
+    __gm__ pa_scheduler::SharedTensorMapSidecar &,
+    const pa_scheduler::SharedRegionValue *, uint32_t,
+    uint32_t, int32_t
+);

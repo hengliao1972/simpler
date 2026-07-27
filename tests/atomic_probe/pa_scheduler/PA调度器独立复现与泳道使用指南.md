@@ -385,6 +385,18 @@ PA/Submit。shared CCEC 的 AIC/AIV generic probe、正式 entry 和 1:2
 mixed ELF 已完成生成与静态链接，但没有把 CPU/编译结果冒充 A5 跨核
 可见性证据。
 
+R4e-d2 再把 reader 前沿、整 task 预检和 batch append 组合成
+`SharedTryAppendReaderGatedTask()`。它不读取或推进
+`committed_tasks`，`SharedAdvanceReaderDone()` 仍由调用者在最后一次
+ordinary lookup 之后恰好执行一次，避免把不可重复的 reader close 塞进
+可重试的容量慢路。空 ordinary batch 直接返回；非空 batch 先用已经发布的
+`reclaim_upto` 预检，能写入时不扫描 96 条 reader 线，只有
+`CapacityBlocked` 才聚合 reader 前沿、刷新 reclaim 并重试。五种 CAP 的
+满环门槛均证明：慢 reader 未关闭时整批不写，关闭后同一 batch 可重试
+成功；排在满桶项之前的独立桶项不会因后项容量阻塞或 seq 损坏而部分发布，
+且 `committed_tasks` 全程保持 0。该组合目前仍只由 ring CPU 门槛和 CCEC
+compile probe 调用，尚未接入 generic WriterIntentSet 或 PA/Submit。
+
 S4.15a 历史候选曾在末尾追加 512B Cube cursor，但已因性能门槛未通过而
 撤销，不属于当前传输布局。
 

@@ -9465,3 +9465,161 @@ lookup 不增加 atomic。设备当时已有其他任务，本阶段按用户要
 上板；因此结果不包含新的 A5 双向证据。下一小步再建立不依赖
 `committed_tasks` 的 reader-gated 整 task append 组合，并先做 CPU
 容量与慢 reader 门槛。
+
+### 2026-07-27：R4e-d2 建立无全局前缀的 reader-gated batch append
+
+R4e-d1 已让 lookup 能容忍合法旧前缀并发回收，但测试中的 future writer
+仍手工串接 candidate、reclaim、preflight 和 append。R4e-d2 只在 ring
+层增加一个最薄组合：
+
+```cpp
+SharedTryAppendReaderGatedTask(
+    map, entries, count, active_workers, heap_window
+)
+```
+
+它明确不调用两项旧 exact-turn 原语：
+
+```text
+SharedRefreshReaderReclaimForTask()
+SharedPublishTaskCommit()
+```
+
+因此不读取、不更新 `committed_tasks`。返回值继续复用已有
+`SharedAppendCheck`，避免再造一组同义状态：
+
+| 结果 | 本组合中的含义 |
+| --- | --- |
+| `Ready` | 整 task 预检通过，全部 entry 的 append 已返回成功 |
+| `CapacityBlocked` | 当前 task 没有发布 payload/seq/tail，可等 reader 前进后重试 |
+| `ProtocolError` | 不可重试，调用层必须终止本轮且不得发布 writer-ready |
+
+整 task 预检允许保留已经证明过期的 head 和单调 reclaim 更新；
+`CapacityBlocked` 只保证当前 task 的 entry 没有部分发布。若预检通过后
+唯一 writer 仍遭遇 slot/seq/tail 协议破坏，逐 entry append 可能已留下
+物理前缀；这不是合法容量竞争，不能回滚，只能终止本轮。该边界没有被
+`ProtocolError` 名称掩盖。
+
+#### reader close 与可重试 append 必须分开
+
+`SharedAdvanceReaderDone(worker,N)` 只允许一次 CAS `N-1 -> N`。
+如果把它合并进可重试 helper，第一次 `CapacityBlocked` 后的第二次调用
+会把重复 close 误判成协议错误。固定调用顺序因此是：
+
+```text
+完成本 task 全部 ordinary lookup
+  -> SharedAdvanceReaderDone(worker, task) 恰好一次
+  -> 唯一有序 writer 调用 SharedTryAppendReaderGatedTask()
+       CapacityBlocked: 等其他 reader 前进后只重试 append helper
+       Ready:           才允许后续 writer metadata/gate 发布
+       ProtocolError:   终止本轮
+```
+
+loser/空任务以后也必须连续关闭 reader，但它们不调用 append。真实接线时
+loser 必须先 close 再等待 writer-ready，否则 winner 可能等待 loser
+reader 前沿，而 loser 同时等待 winner gate，形成循环等待。本阶段没有
+接 PA/Submit，所以只冻结 ring 组合，不提前宣称出口顺序已闭合。
+
+#### 96 条 reader 线只属于容量慢路
+
+第一版直线组合按：
+
+```text
+扫描 reader_done -> 发布 reclaim -> preflight -> append
+```
+
+实现，CPU 正确性可以通过，但每个 writer 都会无条件增加
+`active_workers` 次 atomic load；96 核真实路径会把容量慢路成本带入正常
+热路径。独立性能审查在提交前指出这个问题，最终改成：
+
+```text
+count == 0
+  -> 直接 Ready，零 shared 访问
+
+count > 0
+  -> 读取当前 reclaim_upto
+  -> 整 task preflight
+       Ready:           直接 batch append
+       ProtocolError:   直接拒绝
+       CapacityBlocked:
+         扫描 reader_done
+         -> 单调刷新 reclaim_upto
+         -> 第二次整 task preflight
+         -> Ready 才 batch append
+```
+
+这样纯 symbol writer 的空 ordinary batch 不读取 reclaim，普通有空间的
+ordinary writer 也不扫描 reader_done。CPU 事件门槛直接要求：
+
+- 96 个 actor 先在观测窗外关闭 task 0，随后 `count=0` 返回 `Ready`
+  且事件列表为空；
+- 空环单 entry 在 `active_workers=96` 时写入成功，96 条
+  `reader_done` 地址均没有 Load；
+- 只有满桶 `CapacityBlocked` 路径才读取 reader 前沿。
+
+这只是避免无条件扫描，不改变容量慢路的正确性公式。`active_workers` 和
+`heap_window` 仍必须是整个 ring 生命周期的固定权威配置。
+
+#### 满环、整批和反例门槛
+
+五种 CAP 继续用每 task 八条 region 填满同一 bucket。fill 完成后立刻把
+`committed_tasks` 重置为 0，后续门槛全程要求它保持 0：
+
+```text
+worker 0: reader_done=1，停在 task 2 的 cursor-0 lookup 中
+worker 1: 连续关闭到 future writer 当前 task，满足 append actor 自身 close
+H=2
+batch:
+  [独立空桶 entry] + [满桶八条 replacement]
+```
+
+CAP=32/64/128/256 有多个 bucket，独立空桶 entry 故意排在满桶项之前；
+CAP=16384 是单桶形态，只验证同桶整批。slow reader 第一次 seq 检查后、
+payload 拷贝前触发 future writer：
+
+```text
+当前 reclaim=-1
+  -> 第一遍 preflight 在后项得到 CapacityBlocked
+  -> 独立桶 tail/seq 不变
+  -> 满桶 head/tail/slot/payload 不变
+  -> 无 Exchange、CAS 或 Flush
+```
+
+lookup 完整返回后，worker 0 才关闭 task 2。重试同一 helper 时
+`candidate=0`，只回收 producer 0，batch 整体返回 `Ready`；目标桶
+`head:0->8`、`tail:CAP->CAP+8`，独立桶 entry 同时发布，而
+`committed_tasks` 仍为 0。
+
+为覆盖只有一个 bucket 的 CAP=16384，五种 CAP 还共用一组同桶门槛：
+task 0 只写一条，后续 task 每批最多 32 条，按 task-id 有序填满；reader
+连续关闭到下一个 writer 当前 task，并令 `H=current_writer`，候选恰好
+为 0，只释放 task 0 的一个槽。同一 batch 提交两项时，第一项理论上可写、
+第二项容量不足。结果必须仍为 `CapacityBlocked`，允许 head 安全前进到
+1，但 tail、第一个可复用槽的 seq 和 payload 均不得发布，事件中不能
+出现 Flush。CAP=16384 时当前 writer 约为 513，仍远小于
+`kMaxTasks=4352`。
+
+另一个反例在后项目标 slot 写入错误 seq。整 task preflight 必须返回
+`ProtocolError`，排在前面的合法 entry 仍保持空 seq/tail，事件中不得出现
+任何 publication。既有容量 all-or-nothing 门槛也已改为直接调用新组合，
+不再用 exact-turn refresh 和单独 preflight 近似这条路径。
+
+#### 红灯、验证与边界
+
+测试先引用尚不存在的公共组合时，CAP=128 按预期只因
+`SharedTryAppendReaderGatedTask` 未声明而编译失败；补上组合后转绿。随后
+系统 GCC 13 下 CAP=32/64/128/256/16384 全部通过，完整 shared CPU build
+中的 host plan、sparse trace、shared-output、generic writer-intent、heap、
+Vector、materialize 和 split-finish loser 门槛也全部通过。
+
+CCEC generic compile probe 已显式实例化新组合，分别要求 AIC/AIV 后端生成
+并静态链接真实代码，正式 1:2 mixed ELF、metadata、零 relocation 和
+manifest/hash 检查也全部通过；probe 不进入正式 mixed ELF，不改变当前
+PA 的 I-cache 布局。设备已有其他任务，本阶段按用户要求不尝试上板，
+不用 CPU 或 CCEC 编译结果冒充 A5 动态证据。
+
+本阶段仍没有改写 `CommitOrdinarySharedWriterIntent()` 的逐项 lookup/append，
+也没有把 `reader_done` 接到 winner、loser、空任务和错误核型的真实出口。
+下一提交先增加独立 `requires_writer_ready` plan/ticket 位，再把 generic
+writer 拆成“收集全部 lookup/entry -> reader close -> 发布 symbol/ordinary
+metadata -> writer-ready”，最后才构造真实 Claim/replay A→B→C 门槛。

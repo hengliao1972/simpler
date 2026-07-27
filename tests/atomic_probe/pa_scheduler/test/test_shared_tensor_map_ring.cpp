@@ -48,6 +48,7 @@ using pa_scheduler::SharedRegionValue;
 using pa_scheduler::SharedRetireBucket;
 using pa_scheduler::SharedTensorMapSidecar;
 using pa_scheduler::SharedTensorMapSlotIndex;
+using pa_scheduler::SharedTryAppendReaderGatedTask;
 using pa_scheduler::TensorMapHash;
 using pa_scheduler::kMapBucketCapacity;
 using pa_scheduler::kMapBuckets;
@@ -433,13 +434,11 @@ struct SlowReaderReuseAttempt {
     const SharedRegionValue *replacements;
     uint32_t replacement_count;
     uint32_t bucket;
-    int32_t writer_task;
     uint32_t active_readers;
     int32_t heap_window;
     bool fired;
-    bool refresh_ok;
     int64_t reclaim_upto;
-    SharedAppendCheck append_check;
+    SharedAppendCheck append_result;
     int64_t head;
     int64_t tail;
     int64_t committed_tasks;
@@ -451,21 +450,14 @@ void AttemptReuseWhileReaderPaused(void *opaque) {
     auto &attempt =
         *static_cast<SlowReaderReuseAttempt *>(opaque);
     attempt.fired = true;
-    attempt.reclaim_upto = -2;
-    attempt.refresh_ok =
-        SharedRefreshReaderReclaimForTask<RecordingOps>(
-            *attempt.map, attempt.writer_task,
-            attempt.active_readers, attempt.heap_window,
-            attempt.reclaim_upto
+    attempt.append_result =
+        SharedTryAppendReaderGatedTask<RecordingOps>(
+            *attempt.map, attempt.replacements,
+            attempt.replacement_count,
+            attempt.active_readers, attempt.heap_window
         );
-    attempt.append_check =
-        attempt.refresh_ok
-            ? SharedCheckTaskAppend<RecordingOps>(
-                  *attempt.map, attempt.replacements,
-                  attempt.replacement_count,
-                  attempt.reclaim_upto
-              )
-            : SharedAppendCheck::ProtocolError;
+    attempt.reclaim_upto =
+        LoadControl(&attempt.map->reclaim_upto.value);
     attempt.head =
         LoadControl(
             &attempt.map->buckets[attempt.bucket].head.value
@@ -1054,6 +1046,67 @@ void TestAbsoluteSeqMultipleLapsAndAba() {
 
 void TestCapacityFailureIsAllOrNothing() {
     constexpr const char *kTest = "capacity-all-or-nothing";
+
+    // 空环正常写入只需既有 reclaim=-1，不应为了未来可能发生的容量反压
+    // 无条件扫描全部 reader_done。事件记录锁定 fast path 没有 reader load。
+    auto fast_map = NewMap();
+    bool fast_readers_closed = true;
+    for (uint32_t worker = 0;
+         worker < pa_scheduler::kWorkers; ++worker) {
+        fast_readers_closed &=
+            SharedAdvanceReaderDone<RecordingOps>(
+                *fast_map, worker, 0
+            );
+    }
+    Expect(
+        fast_readers_closed, kTest,
+        "all fast-path actors close task 0 before append"
+    );
+    RecordingOps::ResetEvents();
+    Expect(
+        SharedTryAppendReaderGatedTask<RecordingOps>(
+            *fast_map, nullptr, 0,
+            pa_scheduler::kWorkers, 2
+        ) == SharedAppendCheck::Ready &&
+            RecordingOps::events.empty(),
+        kTest, "empty ordinary batch performs no shared access"
+    );
+    const SharedRegionValue fast_entry =
+        MakeRegion(0x4F0000000ULL, 0, 8, 0);
+    RecordingOps::ResetEvents();
+    Expect(
+        SharedTryAppendReaderGatedTask<RecordingOps>(
+            *fast_map, &fast_entry, 1,
+            pa_scheduler::kWorkers, 2
+        ) == SharedAppendCheck::Ready,
+        kTest, "fast path appends without refreshing reader frontier"
+    );
+    bool loaded_reader_progress = false;
+    for (const Event &event : RecordingOps::events) {
+        if (event.kind != EventKind::Load) {
+            continue;
+        }
+        for (uint32_t worker = 0;
+             worker < pa_scheduler::kWorkers; ++worker) {
+            const void *const reader_address =
+                const_cast<const int64_t *>(
+                    &fast_map->reader_done[worker].value
+                );
+            loaded_reader_progress |=
+                event.address == reader_address;
+        }
+    }
+    Expect(
+        !loaded_reader_progress, kTest,
+        "ready fast path performs zero reader-progress loads"
+    );
+    ExpectEqual(
+        LoadControl(&fast_map->committed_tasks.value),
+        0, kTest,
+        "fast reader-gated append does not use global exact turn"
+    );
+    RecordingOps::DisableEvents();
+
     auto map = NewMap();
     RecordingOps::DisableEvents();
     const uint64_t full_address = 0x500000000ULL;
@@ -1095,21 +1148,17 @@ void TestCapacityFailureIsAllOrNothing() {
         MakeRegion(other_address, 0, 8, kMapBucketCapacity),
         MakeRegion(full_address, 4096, 4104, kMapBucketCapacity),
     };
+    // fill driver 只负责构造满桶，随后清掉它的旧 exact turn。active
+    // reader 尚未关闭任何 task，H=0 也只能得到 reclaim=-1。
+    StoreControl(&map->committed_tasks.value, 0);
     RecordingOps::ResetEvents();
-    int64_t reclaim_upto = -2;
     Expect(
-        SharedRefreshReclaimForTask<RecordingOps>(
-            *map, kMapBucketCapacity, kMapBucketCapacity, reclaim_upto
-        ),
-        kTest, "exact turn computes non-retiring boundary"
-    );
-    ExpectEqual(reclaim_upto, -1, kTest, "full-window reclaim boundary");
-    Expect(
-        SharedCheckTaskAppend<RecordingOps>(
+        SharedTryAppendReaderGatedTask<RecordingOps>(
             *map, overflowing.data(),
-            static_cast<uint32_t>(overflowing.size()), reclaim_upto
+            static_cast<uint32_t>(overflowing.size()), 1, 0
         ) == SharedAppendCheck::CapacityBlocked,
-        kTest, "preflight rejects task if any target bucket is full"
+        kTest,
+        "reader-gated batch rejects task if any target bucket is full"
     );
     for (const Event &event : RecordingOps::events) {
         if (event.kind == EventKind::Exchange || event.kind == EventKind::Flush) {
@@ -1123,8 +1172,8 @@ void TestCapacityFailureIsAllOrNothing() {
     Expect(SnapshotLogicalMap(*map, after), kTest, "snapshot after overflow");
     Expect(after == before, kTest, "failed preflight preserves all logical entries");
     ExpectEqual(
-        LoadControl(&map->committed_tasks.value), kMapBucketCapacity,
-        kTest, "failed task not committed"
+        LoadControl(&map->committed_tasks.value), 0,
+        kTest, "capacity failure does not use global exact turn"
     );
     ExpectEqual(
         LoadControl(&map->buckets[full_bucket].head.value), full_head,
@@ -1141,6 +1190,209 @@ void TestCapacityFailureIsAllOrNothing() {
     ExpectEqual(
         LoadControl(&map->slots[other_slot_index].seq.value), other_seq,
         kTest, "earlier preflight entry did not publish seq"
+    );
+
+    // 另建生产可达的有序写入历史：task 0 只写一条，后续 task 每批最多
+    // kMaxTaskTensors 条直至填满。下一 writer 的 reader 前沿只允许回收
+    // producer 0，恰好空出一个槽；同桶两项仍必须整批 CapacityBlocked。
+    constexpr uint32_t kOneSlotFillTasks =
+        1U +
+        (kMapBucketCapacity - 1U + kMaxTaskTensors - 1U) /
+            kMaxTaskTensors;
+    static_assert(
+        kOneSlotFillTasks < pa_scheduler::kMaxTasks,
+        "one-slot ordered history exceeds task domain"
+    );
+    auto one_slot_map = NewMap();
+    const uint64_t one_slot_address = 0x50A000000ULL;
+    const uint32_t one_slot_bucket =
+        TensorMapHash(one_slot_address);
+    uint32_t one_slot_cursor = 0;
+    int32_t one_slot_task = 0;
+    while (one_slot_cursor < kMapBucketCapacity) {
+        const uint32_t remaining =
+            kMapBucketCapacity - one_slot_cursor;
+        const uint32_t batch_count =
+            one_slot_task == 0
+                ? 1U
+                : (remaining < kMaxTaskTensors
+                       ? remaining
+                       : kMaxTaskTensors);
+        std::vector<SharedRegionValue> batch;
+        batch.reserve(batch_count);
+        for (uint32_t index = 0;
+             index < batch_count; ++index) {
+            const uint64_t lo =
+                static_cast<uint64_t>(
+                    one_slot_cursor + index
+                ) *
+                16U;
+            batch.push_back(MakeRegion(
+                one_slot_address, lo, lo + 8U,
+                one_slot_task
+            ));
+        }
+        if (TryCommitTask(
+                *one_slot_map, one_slot_task, batch
+            ) != CommitResult::Committed) {
+            std::fprintf(
+                stderr,
+                "[FAIL] shared TensorMap ring/%s: "
+                "one-slot fill failed task=%d\n",
+                kTest, one_slot_task
+            );
+            ++g_failures;
+            return;
+        }
+        one_slot_cursor += batch_count;
+        ++one_slot_task;
+    }
+    ExpectEqual(
+        one_slot_task, kOneSlotFillTasks, kTest,
+        "one-slot history uses the expected task count"
+    );
+    StoreControl(&one_slot_map->committed_tasks.value, 0);
+    bool one_slot_reader_closed = true;
+    for (int32_t task = 0;
+         task <= one_slot_task; ++task) {
+        one_slot_reader_closed &=
+            SharedAdvanceReaderDone<RecordingOps>(
+                *one_slot_map, 0, task
+            );
+    }
+    Expect(
+        one_slot_reader_closed, kTest,
+        "single reader closes the current ordered writer task"
+    );
+    const uint64_t next_lo =
+        static_cast<uint64_t>(kMapBucketCapacity) * 16U;
+    const std::vector<SharedRegionValue> two_for_one_slot = {
+        MakeRegion(
+            one_slot_address, next_lo, next_lo + 8U,
+            one_slot_task
+        ),
+        MakeRegion(
+            one_slot_address, next_lo + 16U,
+            next_lo + 24U, one_slot_task
+        ),
+    };
+    RecordingOps::ResetEvents();
+    Expect(
+        SharedTryAppendReaderGatedTask<RecordingOps>(
+            *one_slot_map, two_for_one_slot.data(),
+            static_cast<uint32_t>(two_for_one_slot.size()),
+            1, one_slot_task
+        ) == SharedAppendCheck::CapacityBlocked,
+        kTest,
+        "one free slot cannot partially accept a two-entry batch"
+    );
+    bool flushed_partial_entry = false;
+    for (const Event &event : RecordingOps::events) {
+        flushed_partial_entry |= event.kind == EventKind::Flush;
+    }
+    Expect(
+        !flushed_partial_entry, kTest,
+        "one-slot retry publishes no batch payload"
+    );
+    RecordingOps::DisableEvents();
+    ExpectEqual(
+        LoadControl(&one_slot_map->reclaim_upto.value),
+        0, kTest,
+        "closed reader exposes exactly producer 0"
+    );
+    ExpectEqual(
+        LoadControl(
+            &one_slot_map->buckets[one_slot_bucket].head.value
+        ),
+        1, kTest,
+        "one safe producer leaves exactly one free slot"
+    );
+    ExpectEqual(
+        LoadControl(
+            &one_slot_map->buckets[one_slot_bucket].tail.value
+        ),
+        kMapBucketCapacity, kTest,
+        "blocked two-entry batch preserves tail"
+    );
+    SharedRegionSlot &first_reusable_slot =
+        one_slot_map->slots[
+            SharedTensorMapSlotIndex(
+                one_slot_bucket, kMapBucketCapacity
+            )
+        ];
+    ExpectEqual(
+        LoadControl(&first_reusable_slot.seq.value),
+        0, kTest,
+        "blocked two-entry batch does not claim the one free slot"
+    );
+    ExpectEqual(
+        LoadControl(&one_slot_map->committed_tasks.value),
+        0, kTest,
+        "one-slot retry remains independent of exact turn"
+    );
+
+    // 容量反压之外，再锁定后项协议损坏同样不能让前项先发布。不同桶形态
+    // 使用第二桶 cursor 0；单桶 CAP=16384 形态使用同桶 cursor 1。
+    auto protocol_map = NewMap();
+    const uint64_t first_address = 0x511000000ULL;
+    const uint32_t first_bucket = TensorMapHash(first_address);
+    const uint64_t second_address =
+        FindAddressOutsideBucket(0x512000000ULL, first_bucket);
+    const uint32_t second_bucket = TensorMapHash(second_address);
+    const uint64_t second_cursor =
+        second_bucket == first_bucket ? 1U : 0U;
+    SharedRegionSlot &bad_slot =
+        protocol_map->slots[
+            SharedTensorMapSlotIndex(
+                second_bucket, second_cursor
+            )
+        ];
+    StoreControl(&bad_slot.seq.value, 7);
+    const std::vector<SharedRegionValue> invalid_batch = {
+        MakeRegion(first_address, 0, 8, 0),
+        MakeRegion(second_address, 16, 24, 0),
+    };
+    RecordingOps::ResetEvents();
+    Expect(
+        SharedTryAppendReaderGatedTask<RecordingOps>(
+            *protocol_map, invalid_batch.data(),
+            static_cast<uint32_t>(invalid_batch.size()), 1, 0
+        ) == SharedAppendCheck::ProtocolError,
+        kTest,
+        "later slot corruption rejects the whole reader-gated batch"
+    );
+    for (const Event &event : RecordingOps::events) {
+        if (event.kind == EventKind::Exchange ||
+            event.kind == EventKind::Flush ||
+            event.kind == EventKind::CompareExchange) {
+            Expect(
+                false, kTest,
+                "protocol rejection published an earlier batch entry"
+            );
+            break;
+        }
+    }
+    RecordingOps::DisableEvents();
+    ExpectEqual(
+        LoadControl(
+            &protocol_map->buckets[first_bucket].tail.value
+        ),
+        0, kTest,
+        "later protocol error preserves the earlier bucket tail"
+    );
+    SharedRegionSlot &first_protocol_slot =
+        protocol_map->slots[
+            SharedTensorMapSlotIndex(first_bucket, 0)
+        ];
+    ExpectEqual(
+        LoadControl(&first_protocol_slot.seq.value),
+        kSharedMapEmptySeq, kTest,
+        "later protocol error preserves the earlier slot seq"
+    );
+    ExpectEqual(
+        LoadControl(&protocol_map->committed_tasks.value),
+        0, kTest,
+        "protocol rejection does not use global exact turn"
     );
 }
 
@@ -1210,7 +1462,12 @@ void TestSlowReaderGatesFullBucketReuse() {
         static_cast<int32_t>(kFillTasks);
     ExpectEqual(
         LoadControl(&map->committed_tasks.value),
-        writer_task, kTest, "future writer owns exact turn"
+        writer_task, kTest, "fill driver reaches the future writer task"
+    );
+    StoreControl(&map->committed_tasks.value, 0);
+    ExpectEqual(
+        LoadControl(&map->committed_tasks.value),
+        0, kTest, "reader-gated writer has no global exact turn"
     );
     ExpectEqual(
         LoadControl(&map->buckets[bucket].head.value),
@@ -1230,7 +1487,7 @@ void TestSlowReaderGatesFullBucketReuse() {
                 *map, 0, task
             );
     }
-    for (int32_t task = 0; task < writer_task; ++task) {
+    for (int32_t task = 0; task <= writer_task; ++task) {
         reader_progress_ok &=
             SharedAdvanceReaderDone<RecordingOps>(
                 *map, 1, task
@@ -1246,12 +1503,37 @@ void TestSlowReaderGatesFullBucketReuse() {
     );
     ExpectEqual(
         LoadControl(&map->reader_done[1].value),
-        writer_task - 1, kTest,
-        "fast reader closes every task before the future writer"
+        writer_task, kTest,
+        "writer closes its own task before reader-gated append"
     );
 
+    const uint64_t independent_address =
+        FindAddressOutsideBucket(0x521000000ULL, bucket);
+    const uint32_t independent_bucket =
+        TensorMapHash(independent_address);
+    const int64_t independent_tail_before =
+        LoadControl(
+            &map->buckets[independent_bucket].tail.value
+        );
+    const uint32_t independent_slot_index =
+        SharedTensorMapSlotIndex(
+            independent_bucket,
+            static_cast<uint64_t>(independent_tail_before)
+        );
+    const int64_t independent_seq_before =
+        LoadControl(
+            &map->slots[independent_slot_index].seq.value
+        );
+
     std::vector<SharedRegionValue> replacements;
-    replacements.reserve(kEntriesPerTask);
+    replacements.reserve(kEntriesPerTask + 1U);
+    if constexpr (kMapBuckets > 1) {
+        // 独立空桶 entry 故意排在满桶 batch 前。若组合 helper 错误地
+        // 边检查边 append，它会在后项 CapacityBlocked 前留下部分发布。
+        replacements.push_back(MakeRegion(
+            independent_address, 0, 8, writer_task
+        ));
+    }
     for (uint32_t index = 0;
          index < kEntriesPerTask; ++index) {
         const uint64_t lo =
@@ -1271,11 +1553,10 @@ void TestSlowReaderGatesFullBucketReuse() {
     attempt.replacement_count =
         static_cast<uint32_t>(replacements.size());
     attempt.bucket = bucket;
-    attempt.writer_task = writer_task;
     attempt.active_readers = kActiveReaders;
     attempt.heap_window = kHeapWindow;
     attempt.reclaim_upto = -2;
-    attempt.append_check = SharedAppendCheck::ProtocolError;
+    attempt.append_result = SharedAppendCheck::ProtocolError;
     attempt.head = -2;
     attempt.tail = -2;
     attempt.committed_tasks = -2;
@@ -1303,16 +1584,15 @@ void TestSlowReaderGatesFullBucketReuse() {
     );
     Expect(attempt.fired, kTest, "paused-reader hook fired");
     Expect(
-        attempt.refresh_ok &&
-            attempt.reclaim_upto == -1,
+        attempt.reclaim_upto == -1,
         kTest,
         "slow reader keeps the global reclaim frontier at -1"
     );
     Expect(
-        attempt.append_check ==
+        attempt.append_result ==
             SharedAppendCheck::CapacityBlocked,
         kTest,
-        "full bucket blocks reuse while task 2 remains open"
+        "reader-gated batch remains retryable while task 2 is open"
     );
     ExpectEqual(
         attempt.head, 0, kTest,
@@ -1323,8 +1603,8 @@ void TestSlowReaderGatesFullBucketReuse() {
         "blocked reuse preserves bucket tail"
     );
     ExpectEqual(
-        attempt.committed_tasks, writer_task, kTest,
-        "blocked reuse preserves ordered writer turn"
+        attempt.committed_tasks, 0, kTest,
+        "blocked reuse remains independent of global exact turn"
     );
     ExpectEqual(
         attempt.slot_seq, 0, kTest,
@@ -1334,6 +1614,22 @@ void TestSlowReaderGatesFullBucketReuse() {
         attempt.slot_producer, 0, kTest,
         "blocked reuse preserves cursor-0 payload"
     );
+    if constexpr (kMapBuckets > 1) {
+        ExpectEqual(
+            LoadControl(
+                &map->buckets[independent_bucket].tail.value
+            ),
+            independent_tail_before, kTest,
+            "blocked later bucket does not append the earlier entry"
+        );
+        ExpectEqual(
+            LoadControl(
+                &map->slots[independent_slot_index].seq.value
+            ),
+            independent_seq_before, kTest,
+            "blocked later bucket does not publish earlier seq"
+        );
+    }
     for (const Event &event : RecordingOps::events) {
         if (event.kind == EventKind::Exchange ||
             event.kind == EventKind::Flush ||
@@ -1361,45 +1657,21 @@ void TestSlowReaderGatesFullBucketReuse() {
     );
     ExpectEqual(
         LoadControl(&map->reader_done[1].value),
-        writer_task - 1, kTest,
+        writer_task, kTest,
         "fast reader frontier remains unchanged"
     );
-    int64_t reclaim_upto = -2;
     Expect(
-        SharedRefreshReaderReclaimForTask<RecordingOps>(
-            *map, writer_task, kActiveReaders,
-            kHeapWindow, reclaim_upto
-        ),
-        kTest, "same ordered writer refreshes from closed readers"
-    );
-    ExpectEqual(
-        reclaim_upto, 0, kTest,
-        "closed readers expose producer-0 reclaim"
+        SharedTryAppendReaderGatedTask<RecordingOps>(
+            *map, replacements.data(),
+            static_cast<uint32_t>(replacements.size()),
+            kActiveReaders, kHeapWindow
+        ) == SharedAppendCheck::Ready,
+        kTest,
+        "closed reader makes the same whole batch appendable"
     );
     ExpectEqual(
         LoadControl(&map->reclaim_upto.value),
-        0, kTest, "reader candidate is published globally"
-    );
-    Expect(
-        SharedCheckTaskAppend<RecordingOps>(
-            *map, replacements.data(),
-            static_cast<uint32_t>(replacements.size()),
-            reclaim_upto
-        ) == SharedAppendCheck::Ready,
-        kTest, "retiring task-0 entries admits exact replacements"
-    );
-    Expect(
-        SharedAppendPreparedTask<RecordingOps>(
-            *map, replacements.data(),
-            static_cast<uint32_t>(replacements.size())
-        ),
-        kTest, "replacement payloads append after safe retire"
-    );
-    Expect(
-        SharedPublishTaskCommit<RecordingOps>(
-            *map, writer_task
-        ),
-        kTest, "future writer publishes its ordered commit"
+        0, kTest, "closed readers publish producer-0 reclaim"
     );
 
     ExpectEqual(
@@ -1414,9 +1686,18 @@ void TestSlowReaderGatesFullBucketReuse() {
     );
     ExpectEqual(
         LoadControl(&map->committed_tasks.value),
-        writer_task + 1, kTest,
-        "replacement task advances ordered turn"
+        0, kTest,
+        "successful reader-gated append does not publish exact turn"
     );
+    if constexpr (kMapBuckets > 1) {
+        ExpectEqual(
+            LoadControl(
+                &map->buckets[independent_bucket].tail.value
+            ),
+            independent_tail_before + 1, kTest,
+            "successful batch appends the independent first entry"
+        );
+    }
     ExpectEqual(
         LoadControl(&first_slot.seq.value),
         kMapBucketCapacity, kTest,
@@ -1450,8 +1731,11 @@ void TestSlowReaderGatesFullBucketReuse() {
         "logical snapshot after reader-gated reuse"
     );
     ExpectEqual(
-        snapshot.size(), kMapBucketCapacity, kTest,
-        "exact replacement batch keeps the bucket full"
+        snapshot.size(),
+        kMapBucketCapacity +
+            (kMapBuckets > 1 ? 1U : 0U),
+        kTest,
+        "whole batch keeps the target full and includes the independent entry"
     );
     const int32_t old_region =
         SharedLookupRegion<RecordingOps>(
