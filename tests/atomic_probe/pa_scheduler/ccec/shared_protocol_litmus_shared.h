@@ -16,7 +16,7 @@
 namespace pa_scheduler::shared_protocol_litmus {
 
 constexpr uint32_t kControlMagic = 0x5350524CU;
-constexpr uint32_t kControlVersion = 2;
+constexpr uint32_t kControlVersion = 3;
 constexpr uint32_t kSharedAbiGeneration = 8;
 constexpr uint32_t kSymbolCount = 7;
 constexpr uint64_t kResultMagic = 0x484953544F525900ULL;
@@ -28,11 +28,19 @@ static_assert(
 
 enum class Scenario : uint32_t {
     SymbolHistory = 1,
+    ReaderReclaim = 2,
 };
 
 enum class Direction : uint32_t {
     AicToAiv = 1,
     AivToAic = 2,
+};
+
+enum class ReaderOrdering : uint32_t {
+    NotApplicable = 0,
+    CompilerClobber = 1,
+    PayloadDependency = 2,
+    DsbAll = 3,
 };
 
 // 单次 launch 只选择一个场景和一个方向。后续场景共享同一 mixed ELF，
@@ -43,8 +51,10 @@ struct alignas(64) Control {
     uint32_t version;
     uint32_t scenario;
     uint32_t direction;
+    uint32_t reader_ordering;
+    uint32_t reserved0;
     uint64_t launch_nonce;
-    uint64_t reserved[5];
+    uint64_t reserved[4];
 };
 static_assert(
     sizeof(Control) == 64,
@@ -82,6 +92,39 @@ constexpr HistoryChain kAivToAic{
 constexpr uint64_t kWriterBStatus = 1;
 constexpr uint64_t kFutureWritersStatus = 0x0F;
 constexpr uint64_t kReaderStatus = 0x3F;
+
+struct ReaderReclaimChain {
+    uint32_t reader_worker;
+    uint32_t reclaimer_worker;
+    int32_t blocked_signal;
+    int32_t reuse_done_signal;
+    uint64_t result_tag;
+};
+
+// reader/reclaimer 与 history 场景使用互不重叠的 worker、result 和 task gate，
+// 使 host 能反向断言未选场景完全没有执行。
+constexpr ReaderReclaimChain kReaderReclaimAicToAiv{
+    3, 42, 200, 201, 0x40
+};
+constexpr ReaderReclaimChain kReaderReclaimAivToAic{
+    35, 4, 210, 211, 0x80
+};
+
+constexpr uint32_t kReaderReclaimActiveWorkers = 96;
+constexpr int32_t kReaderReclaimHeapWindow = 2;
+constexpr int32_t kReaderReclaimTask = 2;
+constexpr int32_t kReaderReclaimWriterTask = 5;
+constexpr int32_t kReaderReclaimInitialDone = 1;
+constexpr int32_t kReaderReclaimClosedDone = 2;
+constexpr uint64_t kReaderReclaimAddress = 0x700000000ULL;
+constexpr uint64_t kReaderReclaimLo = 0;
+constexpr uint64_t kReaderReclaimHi = 8;
+constexpr uint64_t kReaderReclaimReplacementAddress =
+    0x7000014C0ULL;
+constexpr uint64_t kReaderReclaimReplacementLo = 4096;
+constexpr uint64_t kReaderReclaimReplacementHi = 4128;
+constexpr uint64_t kReaderReclaimReaderStatus = 0x1F;
+constexpr uint64_t kReaderReclaimReclaimerStatus = 0xFF;
 
 }  // namespace pa_scheduler::shared_protocol_litmus
 

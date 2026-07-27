@@ -8814,7 +8814,7 @@ current-task 口径再多减 1。
 默认 CAP=128 的 shared build identity 从 generation 7 升到 8；
 private generation 4、2,113,664B sidecar 以及
 1,007,115,968/1,007,122,112B non-split/split `SchedulerState` 全部
-不变。host 正式初始化、ring/symbol fixture 和 history-litmus 专用 host
+不变。host 正式初始化、ring/symbol 测试初始化和 history-litmus 专用 host
 都显式写入 96 个 -1，不依赖 sidecar `memset(0)`。history manifest 从
 被 C++ `static_assert` 绑定当前 build identity 的共享头读取 generation 8，
 旧 generation-7 artifact 会在启动前被拒绝。
@@ -8926,7 +8926,8 @@ line，也不冒充 DCCI 证据。
 固定每 task 8 条很重要。开发中第一次把它写成
 `kMaxTaskTensors`，而当前该常量是 32；CAP=32 于是只产生一个 fill
 task，快 reader 实际只能完成到 0，关闭慢 reader 的 task 2 后候选当然
-仍为 -1。这个首个失败准确暴露的是夹具与注释不一致，不是回收公式错误。
+仍为 -1。这个首个失败准确暴露的是测试初始化状态与注释不一致，不是回收
+公式错误。
 修正后增加 `CAP/8>H` 的编译期断言，避免以后常量变化悄悄破坏交错前提。
 CAP=16384 时也只使用 2,048 个 task，仍小于 `kMaxTasks=4352`。
 
@@ -9117,3 +9118,194 @@ reader-reclaim 后，history 也必须在最终同一 artifact 上重新跑 20×
 该提交只证明泛化没有改变既有 history 行为。它没有新增 reader-progress
 设备证据，也没有据此宣称普通 GM payload 读取先于 `reader_done` CAS；
 后者仍是 R4e-c2b 的独立场景目标。
+
+### 2026-07-27：R4e-c2b 建立满环 ordinary reader→reclaimer A5 门槛
+
+R4e-a 只建立 reader 完成前沿，R4e-b 只在 CPU ring driver 闭合
+“慢 reader 阻塞复用→reader close→精确退休→绝对 seq 防 ABA”，R4e-c1
+也只证明模板能在 AIC/AIV 生成并链接。真实 PA 尚未接入这些 helper，因此
+本阶段继续使用 R4e-c2a 的独立 shared-protocol mixed ELF，不跳到 PA
+benchmark。
+
+#### 满环镜像只复刻 production-reachable ordinary-ring 切片
+
+目标 bucket 固定 CAP=128，初始 append 历史严格对应：
+
+```text
+task 0: cursor   0                    1 entry
+task 1: cursor   1..32               32 entries
+task 2: cursor  33..64               32 entries
+task 3: cursor  65..96               32 entries
+task 4: cursor  97..127              31 entries
+committed_tasks = 5
+head/tail = 0/128
+```
+
+合计 `1+32+32+32+31=128`，不是随意填满数组后脑补成生产状态。96 条
+`reader_done` 中，95 条由 host 预置为 task 2，只有被测 reader 停在
+task 1。`H=2` 时第一次
+`SharedRefreshReaderReclaimForTask(task=5)` 必须得到 `-1`，真实
+`SharedCheckTaskAppend()` 必须返回 `CapacityBlocked`。这只说明
+ordinary-ring 相关切片生产可达；未参与场景的整个 `SchedulerState` 仍按
+隔离门槛清零，不冒充完整 PA reset 镜像。
+
+旧 cursor 0 为：
+
+```text
+address=0x700000000, lo=0, hi=8, producer=0, reserved=0
+```
+
+replacement 为：
+
+```text
+address=0x7000014c0, lo=4096, hi=4128, producer=5, reserved=0
+```
+
+两地址真实 hash 到同一个 bucket，但除协议要求恒为零的 `reserved` 外，
+四个可变字段全部不同，避免只改 producer 后无法暴露其他字段的晚读。
+
+reader/reclaimer 固定用两组不同物理核双向执行：
+
+```text
+AIC reader worker 3  -> AIV reclaimer worker 42
+AIV reader worker 35 -> AIC reclaimer worker 4
+```
+
+reader 先等 reclaimer 取证 `CapacityBlocked`，再读取 cursor 0。reclaimer
+不借助另一个“reader 已完成”门，而是直接轮询真实
+`reader_done[reader_worker]`；观察 `1->2` 后重新 refresh，必须得到
+`reclaim=0`，随后真实 check/append/commit：
+
+```text
+head/tail:       0/128 -> 1/129
+physical slot 0: seq 0 -> 128
+committed_tasks: 5 -> 6
+```
+
+这里提交的是 writer task 5；`committed_tasks=6` 表示已提交计数前沿已经
+越过 task 5，不表示 task 6 已经提交。
+
+append 的 payload `FlushRegion()` 已包含 DCCI clean-out 与 DSB，随后
+seq、tail、commit 都消费 atomic 返回值。`reuse-done` 只有在 append 与
+commit 都返回成功后才 CAS 发布，不能在失败路径提前放行 reader。
+reader 等 gate 成功后把同一个动态 signal 传给 noinline snapshot
+validator；validator 自己由该 signal 计算 `TaskCell::deps_prepared` 地址，
+做第二次真实 atomic load，并只在 token 等于 signal 的 CFG 成功分支读取、
+校验本地旧快照。这避免把一个可被 CCEC 常量折叠的 bool 冒充“验证一定
+发生在复用之后”的证据。
+
+#### 三种 reader-close 口径
+
+device 侧 `CaptureReaderSnapshot()` 与生产 `SharedReadRegionSlot()` 使用
+同形 raw 顺序：
+
+```text
+seq_before atomic load
+payload DCCI invalidate + DSB + compiler clobber
+buffer_addr/lo/hi/producer/reserved 五字段普通 GM load
+seq_after atomic load
+```
+
+但它故意不在 CAS 前判断 seq/payload，而把判断推迟到复用完成后；否则控制
+流会先消费 payload，三种 close 就失去区分意义。因此这里验证的是这条
+有针对性的 raw 序列，不是直接调用生产 `SharedReadRegionSlot()`。
+
+| ordering | CAS 前约束 | 本阶段可解释口径 |
+| --- | --- | --- |
+| `compiler-clobber` | `noinline` close 调用，callee 内为空 asm memory clobber；无 device barrier | 当前 noinline artifact 的最弱动态对照 |
+| `payload-dependency` | 五字段作为 `3×i64+2×i32` noinline 实参，8 步 FNV checksum 经 tied MOV 形成 delta，CAS expected/desired 同时依赖 delta | scalar 值已被消费的窄依赖，不是全设备访存屏障 |
+| `dsb-all` | compiler clobber→`DSB_ALL`→compiler clobber | 三者中唯一有“全部访存指令”设备完成口径的兜底 |
+
+三个 close 都是 `noinline`；三条路径因此共享调用边界带来的 compiler
+ordering 和 call/return 延迟。该边界可能让未决 GM load 自然完成，所以
+compiler-clobber 通过只能归于当前 noinline artifact，不能外推为 inline
+空 clobber 充分。
+
+#### 从“存在函数”收紧为 O3 use-def 门槛
+
+构建为 AIC/AIV 分别增加与 object 同一源码和主体选项的 O3
+bitcode/textual IR；自动门槛检查 `.ll`。manifest 哈希 host、最终 mixed
+ELF 和 AIC/AIV `.ll`，不哈希 `.bc`；bitcode 仅作为可复查中间产物保留。
+自动门槛逐核检查：
+
+1. compiler 路必须是唯一 clobber 先于常量 `CAS(1,2)`，且没有 DSB；
+2. dependency helper ABI 必须保留三组 64b、两组 32b payload leaf；
+3. dependency 调用的五个 leaf 必须是直接 `addrspace(1)` GM load；
+4. 三组 64b 的上下半部和两组 32b 必须完整进入恰好 8 步 checksum；
+5. 最后一轮 checksum 必须依次到 tied MOV、delta、i64 扩展、
+   `1+delta/2+delta`，再成为 CAS 两个动态参数；
+6. DSB 路必须精确保持
+   `clobber→DSB_ALL→clobber→CAS(1,2)`；
+7. validator 用同一个动态 signal 选择 `TaskCell::deps_prepared`、执行
+   atomic load 并比较返回 token；
+8. token 比较成功块只能由比较的 true 边进入，seq 与五字段必须是 validator
+   全函数仅有的五次普通 payload load，并沿 AND 数据流共同决定唯一 result
+   phi 和最终返回；其他 phi 输入只能返回 false；
+9. 三个 close 和一个 validator 各保留唯一真实调用。
+
+额外用“成功块外增加 payload load、给成功块增加第二入口、让不完整检查
+进入 result phi、加入 `true` phi 旁路、增加额外 `ret true`”五种文本变异
+反向确认门槛都会拒绝。它仍不是最终 object 的机器码反汇编：`.ll` 与 `.o`
+是相同源码/主体选项下两次独立 CCEC 编译。动态 A5 执行补的是行为证据，
+不能把二者合写成精确机器指令证明。
+
+#### 过程中撤回的测试构造错误
+
+本小步按审计结果逐项收敛，而不是保留过程态：
+
+1. 初稿用 `committed_tasks=3` 配满 128 槽，无法由每 task 最多 32 条的
+   append 历史到达；已改为上述 task 0..4 的 1/32/32/32/31 分布。
+2. 初稿在 reader CAS 前判断 snapshot，等于测试代码自己先消费 payload；
+   已移到 cursor 128 复用并收到 reuse token 之后。
+3. 初稿 replacement 只改变 producer；已让 address/lo/hi/producer 全变。
+4. 初稿 `reuse-done` 无条件发布，可能在 append/commit 失败时让 reader
+   提前验证旧值；已改为成功返回值短路依赖。
+5. 初稿只检查阻塞槽 producer；已扩大到 seq、五字段、head/tail、commit。
+6. 初稿只检查非目标 bucket 控制；已补 16K 非目标 physical slots、反方向
+   reader-reclaim 结果/gate、全部 `shared_outputs.published/last_writer`
+   控制字和 `writer_history` header 未触碰断言。
+7. 初稿 IR 门槛只检查 helper 形状；已收紧为上述 leaf/use-def/token
+   数据流。
+
+#### 验证命令、结果与结论边界
+
+最终构建和正式重复使用同一个 manifest 身份：
+
+```bash
+source /home/q00473782/Ascend/cann-9.1.0-weekly-20260708/cann-9.1.0/set_env.sh
+export CXX=/usr/bin/g++
+./run.sh build-shared-protocol-litmus ccec
+./run.sh shared-protocol-litmus ccec \
+  --scenario all --ordering all --device 0 --runs 20
+```
+
+`scenario=all` 每轮先跑 history 两方向，再跑 reader-reclaim 的
+`2 directions × 3 orderings`，每个 tuple 都启动全新 host 进程。
+每个进程有 60 秒 host 上限，超时直接使整批失败且不自动重试，避免把 ACL
+stream 异常停滞或协议偶发等待静默跳过。
+
+正式结果只采用确认 device 0 无外部任务后的完整批次；此前与另一组
+`--device-id 0` 任务重叠的过程运行全部丢弃，不计入结论。冻结 artifact
+先完成 `runs=1` 的 8/8 个进程，再完成 `runs=20`：
+
+| 场景 | 展开方式 | 结果 |
+| --- | --- | --- |
+| symbol history | 20 轮 × 2 个方向 | 40/40 PASS |
+| reader-reclaim | 20 轮 × 2 个方向 × 3 种 ordering | 120/120 PASS |
+| 合计 | 160 个全新 host 进程 | 160/160 semantic PASS、cleanup PASS |
+
+整批失败行 0，60 秒上限未触发。manifest SHA-256 为
+`1c10093a2527fd2b80da6332bf8e03bc381b5bb08f740239264d0ffc98cd240d`。
+该结果证明当前固定双向物理核和受控场景在当前 A5/CANN artifact 上重复
+成立；不扩大下面的协议结论边界。
+
+即使三种 ordering 全部重复通过，也不证明 compiler-clobber 或
+payload-dependency 是 A5 架构充分条件，更不能直接决定生产方案。当前场景
+只覆盖 CAP=128、单 bucket、单 replacement、固定两组物理核，以及一次预期
+`CapacityBlocked`→close→成功 append/commit 链；不覆盖 `ProtocolError`、
+reader CAS 失败、append/commit 失败、多 reader 并发 close，或复用后的新
+device reader。
+production `SharedAdvanceReaderDone()` 仍没有 read→CAS 顺序，真实 PA 也
+尚未在每个 active worker、每个 task 的全部成功/loser/空任务出口连续发布
+前沿。下一阶段必须先在 generic ordinary flow 闭合
+“read-only lookup→reader-close→后继 append”，再讨论接入 PA。
