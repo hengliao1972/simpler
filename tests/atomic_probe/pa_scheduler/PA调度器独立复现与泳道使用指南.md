@@ -371,6 +371,20 @@ PA/Submit 调用者；其 `active_workers` 连续前缀和 `H` 也必须是整�
 接入 PA/Submit。因此生产 ordinary lookup→reader-close 的编译器/设备顺序
 和真实 PA 全出口前沿发布仍未闭合。
 
+R4e-d1 又先补上 production lookup 与合法回收并发时的 CPU 正确性边界。
+reader 保存旧 `head` 后，未来唯一 writer 可以回收低于该 reader 查询窗口
+的无关前缀，并复用对应物理槽。lookup 分别处理两种合法交错：若初始控制
+快照读到“旧 head + 新 tail”，只在二次读取的新 head 单调前进且能把
+跨度重新约束到 ring 容量内时接受；若扫描旧 cursor 时 seq 双检失败，只在
+新 head 位于初始扫描区间且已经越过失败 cursor 时跳到新 head。其余异常
+仍按协议错误拒绝。两次额外 head load 都只位于原本即将失败的异常分支，
+正常 lookup 不增加 atomic。CAP=32/64/128/256/16384 的两类确定性交错均
+通过，且门槛把 `committed_tasks` 固定为 0，证明恢复只依赖 reader 前沿
+和单调 head，不偷用全局 exact turn。该阶段仍没有把 `reader_done` 接入
+PA/Submit。shared CCEC 的 AIC/AIV generic probe、正式 entry 和 1:2
+mixed ELF 已完成生成与静态链接，但没有把 CPU/编译结果冒充 A5 跨核
+可见性证据。
+
 S4.15a 历史候选曾在末尾追加 512B Cube cursor，但已因性能门槛未通过而
 撤销，不属于当前传输布局。
 

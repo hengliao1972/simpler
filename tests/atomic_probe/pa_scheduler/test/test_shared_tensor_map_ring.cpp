@@ -32,10 +32,12 @@ using pa_scheduler::SharedAppendCheck;
 using pa_scheduler::SharedAdvanceReaderDone;
 using pa_scheduler::SharedBucketState;
 using pa_scheduler::SharedCheckTaskAppend;
+using pa_scheduler::SharedComputeReaderReclaimCandidate;
 using pa_scheduler::SharedComputeOrderedReclaimCandidate;
 using pa_scheduler::SharedHasExactTaskTurn;
 using pa_scheduler::SharedLookupRegion;
 using pa_scheduler::SharedPreflightTaskAppend;
+using pa_scheduler::SharedPublishReclaimCandidate;
 using pa_scheduler::SharedPublishTaskCommit;
 using pa_scheduler::SharedReadRegionSlot;
 using pa_scheduler::SharedRefreshReaderReclaimForTask;
@@ -124,6 +126,7 @@ struct Event {
 
 struct RecordingOps {
     using InvalidateHook = void (*)(void *);
+    using LoadHook = void (*)(void *);
 
     static std::vector<Event> events;
     static bool record;
@@ -134,8 +137,23 @@ struct RecordingOps {
     static const void *invalidate_hook_address;
     static InvalidateHook invalidate_hook;
     static void *invalidate_hook_context;
+    static const void *load_hook_address;
+    static LoadHook load_hook;
+    static void *load_hook_context;
 
     static int64_t Load(volatile int64_t *address) {
+        // load hook 在真正取值前执行，用来固定“reader 已读旧 head、尚未
+        // 读 tail”这一控制快照交错。先清空再回调，避免 writer 内部读取
+        // 同一 tail 时递归。
+        if (load_hook != nullptr &&
+            ConstAddress(address) == load_hook_address) {
+            const LoadHook callback = load_hook;
+            void *const context = load_hook_context;
+            load_hook_address = nullptr;
+            load_hook = nullptr;
+            load_hook_context = nullptr;
+            callback(context);
+        }
         // 与 CPU scheduler 相同，以 acquire atomic add-zero 表达协议观察；
         // 返回值只用于正确性，不解释为 A5 atomic 完成时延。
         const int64_t value =
@@ -218,6 +236,9 @@ struct RecordingOps {
         invalidate_hook_address = nullptr;
         invalidate_hook = nullptr;
         invalidate_hook_context = nullptr;
+        load_hook_address = nullptr;
+        load_hook = nullptr;
+        load_hook_context = nullptr;
     }
 
     static void DisableEvents() {
@@ -230,6 +251,9 @@ struct RecordingOps {
         invalidate_hook_address = nullptr;
         invalidate_hook = nullptr;
         invalidate_hook_context = nullptr;
+        load_hook_address = nullptr;
+        load_hook = nullptr;
+        load_hook_context = nullptr;
     }
 
 private:
@@ -247,6 +271,9 @@ bool RecordingOps::mutate_once = false;
 const void *RecordingOps::invalidate_hook_address = nullptr;
 RecordingOps::InvalidateHook RecordingOps::invalidate_hook = nullptr;
 void *RecordingOps::invalidate_hook_context = nullptr;
+const void *RecordingOps::load_hook_address = nullptr;
+RecordingOps::LoadHook RecordingOps::load_hook = nullptr;
+void *RecordingOps::load_hook_context = nullptr;
 
 int g_failures = 0;
 
@@ -455,6 +482,54 @@ void AttemptReuseWhileReaderPaused(void *opaque) {
         LoadControl(&attempt.map->slots[slot_index].seq.value);
     attempt.slot_producer =
         attempt.map->slots[slot_index].payload.value.producer;
+}
+
+struct ConcurrentSafeRetireAttempt {
+    SharedTensorMapSidecar *map;
+    const SharedRegionValue *replacements;
+    uint32_t replacement_count;
+    uint32_t active_readers;
+    int32_t heap_window;
+    bool fired;
+    bool candidate_ok;
+    bool publish_ok;
+    bool append_ok;
+    int64_t candidate;
+    int64_t reclaim_upto;
+    SharedAppendCheck append_check;
+};
+
+void RetireSafePrefixWhileReaderPaused(void *opaque) {
+    auto &attempt =
+        *static_cast<ConcurrentSafeRetireAttempt *>(opaque);
+    attempt.fired = true;
+    attempt.candidate = -2;
+    attempt.reclaim_upto = -2;
+    attempt.candidate_ok =
+        SharedComputeReaderReclaimCandidate<RecordingOps>(
+            *attempt.map, attempt.active_readers,
+            attempt.heap_window, attempt.candidate
+        );
+    attempt.publish_ok =
+        attempt.candidate_ok &&
+        SharedPublishReclaimCandidate<RecordingOps>(
+            *attempt.map, attempt.candidate,
+            attempt.reclaim_upto
+        );
+    attempt.append_check =
+        attempt.publish_ok
+            ? SharedCheckTaskAppend<RecordingOps>(
+                  *attempt.map, attempt.replacements,
+                  attempt.replacement_count,
+                  attempt.reclaim_upto
+              )
+            : SharedAppendCheck::ProtocolError;
+    attempt.append_ok =
+        attempt.append_check == SharedAppendCheck::Ready &&
+        SharedAppendPreparedTask<RecordingOps>(
+            *attempt.map, attempt.replacements,
+            attempt.replacement_count
+        );
 }
 
 struct LogicalTuple {
@@ -1389,6 +1464,384 @@ void TestSlowReaderGatesFullBucketReuse() {
     );
 }
 
+void TestLookupSkipsConcurrentlyRetiredSafePrefix() {
+    constexpr const char *kTest =
+        "lookup-skips-concurrently-retired-safe-prefix";
+    constexpr int32_t kReaderTask = 2;
+    constexpr int32_t kHeapWindow = 1;
+    constexpr uint32_t kEntriesPerTask = 8;
+    constexpr uint32_t kActiveReaders = 1;
+    static_assert(
+        kMapBucketCapacity % kEntriesPerTask == 0,
+        "safe-prefix interleave requires whole task batches"
+    );
+    constexpr uint32_t kFillTasks =
+        kMapBucketCapacity / kEntriesPerTask;
+    static_assert(
+        kFillTasks + 1U < pa_scheduler::kMaxTasks,
+        "safe-prefix writers must stay inside task domain"
+    );
+
+    auto map = NewMap();
+    RecordingOps::DisableEvents();
+    const uint64_t address = 0x530000000ULL;
+    const uint32_t bucket = TensorMapHash(address);
+
+    // 用真实整 task append 把一桶填满：cursor 0..7 属于 producer 0，
+    // cursor 8..15 属于 producer 1。task 2 的窗口下界为 1，因此前八条
+    // 已经失效，但 cursor 8 仍是本次查询必须返回的合法 producer。
+    for (uint32_t task = 0; task < kFillTasks; ++task) {
+        std::vector<SharedRegionValue> entries;
+        entries.reserve(kEntriesPerTask);
+        for (uint32_t index = 0;
+             index < kEntriesPerTask; ++index) {
+            const uint64_t cursor =
+                static_cast<uint64_t>(task) *
+                    kEntriesPerTask +
+                index;
+            const uint64_t lo = cursor * 32U;
+            entries.push_back(MakeRegion(
+                address, lo, lo + 8U,
+                static_cast<int32_t>(task)
+            ));
+        }
+        if (TryCommitTask(
+                *map, static_cast<int32_t>(task),
+                entries
+            ) != CommitResult::Committed) {
+            std::fprintf(
+                stderr,
+                "[FAIL] shared TensorMap ring/%s: "
+                "fill failed task=%u\n",
+                kTest, task
+            );
+            ++g_failures;
+            return;
+        }
+    }
+
+    // 本门槛刻意撤掉隔离 driver 的 exact-turn 前沿。下面的合法回收只由
+    // reader_done 推导，证明 lookup 的并发恢复不依赖 committed_tasks。
+    StoreControl(&map->committed_tasks.value, 0);
+    Expect(
+        SharedAdvanceReaderDone<RecordingOps>(
+            *map, 0, 0
+        ) &&
+            SharedAdvanceReaderDone<RecordingOps>(
+                *map, 0, 1
+            ),
+        kTest, "reader closes tasks before task 2"
+    );
+
+    const int32_t writer_task =
+        static_cast<int32_t>(kFillTasks);
+    std::vector<SharedRegionValue> replacements;
+    replacements.reserve(kEntriesPerTask);
+    for (uint32_t index = 0;
+         index < kEntriesPerTask; ++index) {
+        const uint64_t lo =
+            (static_cast<uint64_t>(kMapBucketCapacity) +
+             index) *
+            32U;
+        replacements.push_back(MakeRegion(
+            address, lo, lo + 8U, writer_task
+        ));
+    }
+
+    SharedRegionSlot &first_slot =
+        map->slots[SharedTensorMapSlotIndex(bucket, 0)];
+    ConcurrentSafeRetireAttempt attempt{};
+    attempt.map = map.get();
+    attempt.replacements = replacements.data();
+    attempt.replacement_count =
+        static_cast<uint32_t>(replacements.size());
+    attempt.active_readers = kActiveReaders;
+    attempt.heap_window = kHeapWindow;
+    attempt.candidate = -2;
+    attempt.reclaim_upto = -2;
+    attempt.append_check = SharedAppendCheck::ProtocolError;
+
+    // reader 已读旧 head=0、尚未读取 tail 时，让唯一 writer 回收
+    // producer 0 并提交八条 replacement。reader 随后会读到新
+    // tail=CAP+8，形成“旧 head + 新 tail”的合法混合快照；lookup 必须
+    // 重读 head=8 后继续，而不能因表面跨度大于 CAP 误报协议损坏。
+    RecordingOps::ResetEvents();
+    RecordingOps::load_hook_address =
+        const_cast<const int64_t *>(
+            &map->buckets[bucket].tail.value
+        );
+    RecordingOps::load_hook =
+        RetireSafePrefixWhileReaderPaused;
+    RecordingOps::load_hook_context = &attempt;
+    bool protocol_ok = false;
+    const uint64_t target_lo =
+        static_cast<uint64_t>(kEntriesPerTask) * 32U;
+    const int32_t producer =
+        SharedLookupRegion<RecordingOps>(
+            *map,
+            MakeRegion(
+                address, target_lo, target_lo + 8U, -1
+            ),
+            kReaderTask, kHeapWindow, protocol_ok
+        );
+
+    Expect(
+        attempt.fired, kTest,
+        "safe-retire hook fires between initial head and tail loads"
+    );
+    Expect(
+        attempt.candidate_ok && attempt.candidate == 0 &&
+            attempt.publish_ok &&
+            attempt.reclaim_upto == 0,
+        kTest, "reader frontier admits only producer 0"
+    );
+    Expect(
+        attempt.append_check == SharedAppendCheck::Ready &&
+            attempt.append_ok,
+        kTest, "writer retires and replaces the safe prefix"
+    );
+    Expect(
+        protocol_ok && producer == 1,
+        kTest,
+        "lookup repairs old-head/new-tail snapshot and returns producer 1"
+    );
+    ExpectEqual(
+        LoadControl(&map->buckets[bucket].head.value),
+        kEntriesPerTask, kTest,
+        "safe retire advances head past producer 0"
+    );
+    ExpectEqual(
+        LoadControl(&map->buckets[bucket].tail.value),
+        kMapBucketCapacity + kEntriesPerTask,
+        kTest, "replacement batch advances tail"
+    );
+    ExpectEqual(
+        LoadControl(&map->committed_tasks.value),
+        0, kTest,
+        "reader-gated append does not use global exact turn"
+    );
+    ExpectEqual(
+        LoadControl(&first_slot.seq.value),
+        kMapBucketCapacity, kTest,
+        "physical slot 0 carries the replacement absolute seq"
+    );
+
+    size_t head_exchange = RecordingOps::events.size();
+    size_t seq_invalidate = RecordingOps::events.size();
+    size_t payload_flush = RecordingOps::events.size();
+    size_t seq_publish = RecordingOps::events.size();
+    size_t tail_publish = RecordingOps::events.size();
+    const void *const head_address =
+        const_cast<const int64_t *>(
+            &map->buckets[bucket].head.value
+        );
+    const void *const seq_address =
+        const_cast<const int64_t *>(&first_slot.seq.value);
+    const void *const tail_address =
+        const_cast<const int64_t *>(
+            &map->buckets[bucket].tail.value
+        );
+    for (size_t index = 0;
+         index < RecordingOps::events.size(); ++index) {
+        const Event &event = RecordingOps::events[index];
+        if (event.kind == EventKind::Exchange &&
+            event.address == head_address &&
+            event.argument ==
+                static_cast<int64_t>(kEntriesPerTask) &&
+            head_exchange == RecordingOps::events.size()) {
+            head_exchange = index;
+        } else if (
+            event.kind == EventKind::Exchange &&
+            event.address == seq_address &&
+            event.argument == kSharedMapEmptySeq &&
+            seq_invalidate == RecordingOps::events.size()
+        ) {
+            seq_invalidate = index;
+        } else if (
+            event.kind == EventKind::Flush &&
+            event.address == &first_slot.payload &&
+            payload_flush == RecordingOps::events.size()
+        ) {
+            payload_flush = index;
+        } else if (
+            event.kind == EventKind::Exchange &&
+            event.address == seq_address &&
+            event.argument ==
+                static_cast<int64_t>(kMapBucketCapacity) &&
+            seq_publish == RecordingOps::events.size()
+        ) {
+            seq_publish = index;
+        } else if (
+            event.kind == EventKind::Exchange &&
+            event.address == tail_address &&
+            event.argument ==
+                static_cast<int64_t>(
+                    kMapBucketCapacity + 1U
+                ) &&
+            tail_publish == RecordingOps::events.size()
+        ) {
+            tail_publish = index;
+        }
+    }
+    Expect(
+        head_exchange < seq_invalidate &&
+            seq_invalidate < payload_flush &&
+            payload_flush < seq_publish &&
+            seq_publish < tail_publish,
+        kTest,
+        "head publication precedes slot reuse and tail publication"
+    );
+    RecordingOps::DisableEvents();
+
+    // 再固定更晚的交错：reader task 3 已读 cursor 8 的旧绝对 seq，
+    // 尚未拷 payload 时，writer 回收 producer 1 并用 cursor CAP+8
+    // 复用同一物理槽。第二次 seq 检查失败后，lookup 只能在新 head
+    // 确实越过 cursor 8 时跳到 cursor 16，并返回 producer 2。
+    Expect(
+        SharedAdvanceReaderDone<RecordingOps>(
+            *map, 0, 2
+        ),
+        kTest, "reader closes task 2 before task 3"
+    );
+    const int32_t second_writer_task = writer_task + 1;
+    std::vector<SharedRegionValue> second_replacements;
+    second_replacements.reserve(kEntriesPerTask);
+    for (uint32_t index = 0;
+         index < kEntriesPerTask; ++index) {
+        const uint64_t lo =
+            (static_cast<uint64_t>(kMapBucketCapacity) +
+             kEntriesPerTask + index) *
+            32U;
+        second_replacements.push_back(MakeRegion(
+            address, lo, lo + 8U, second_writer_task
+        ));
+    }
+    ConcurrentSafeRetireAttempt second_attempt{};
+    second_attempt.map = map.get();
+    second_attempt.replacements = second_replacements.data();
+    second_attempt.replacement_count =
+        static_cast<uint32_t>(second_replacements.size());
+    second_attempt.active_readers = kActiveReaders;
+    second_attempt.heap_window = kHeapWindow;
+    second_attempt.candidate = -2;
+    second_attempt.reclaim_upto = -2;
+    second_attempt.append_check =
+        SharedAppendCheck::ProtocolError;
+
+    SharedRegionSlot &second_retired_slot =
+        map->slots[
+            SharedTensorMapSlotIndex(bucket, kEntriesPerTask)
+        ];
+    RecordingOps::ResetEvents();
+    RecordingOps::invalidate_hook_address =
+        &second_retired_slot.payload;
+    RecordingOps::invalidate_hook =
+        RetireSafePrefixWhileReaderPaused;
+    RecordingOps::invalidate_hook_context = &second_attempt;
+    bool second_protocol_ok = false;
+    const uint64_t second_target_lo =
+        static_cast<uint64_t>(2U * kEntriesPerTask) * 32U;
+    const int32_t second_producer =
+        SharedLookupRegion<RecordingOps>(
+            *map,
+            MakeRegion(
+                address, second_target_lo,
+                second_target_lo + 8U, -1
+            ),
+            kReaderTask + 1, kHeapWindow,
+            second_protocol_ok
+        );
+    Expect(
+        second_attempt.fired, kTest,
+        "safe-retire hook fires between slot seq checks"
+    );
+    Expect(
+        second_attempt.candidate_ok &&
+            second_attempt.candidate == 1 &&
+            second_attempt.publish_ok &&
+            second_attempt.reclaim_upto == 1,
+        kTest, "next reader frontier admits only producer 1"
+    );
+    Expect(
+        second_attempt.append_check ==
+                SharedAppendCheck::Ready &&
+            second_attempt.append_ok,
+        kTest, "writer retires and replaces the next safe prefix"
+    );
+    Expect(
+        second_protocol_ok && second_producer == 2,
+        kTest,
+        "lookup skips concurrently reused cursor 8 and returns producer 2"
+    );
+    ExpectEqual(
+        LoadControl(&map->buckets[bucket].head.value),
+        2U * kEntriesPerTask, kTest,
+        "second safe retire advances head past producer 1"
+    );
+    ExpectEqual(
+        LoadControl(&map->buckets[bucket].tail.value),
+        kMapBucketCapacity + 2U * kEntriesPerTask,
+        kTest, "second replacement batch advances tail"
+    );
+    ExpectEqual(
+        LoadControl(&map->committed_tasks.value),
+        0, kTest,
+        "both reader-gated appends avoid global exact turn"
+    );
+    RecordingOps::DisableEvents();
+
+    // 不能把任意 seq 错误都吞成并发回收。head 已停在 cursor 16 时，
+    // 破坏 cursor 16 的 seq；二次读取 head 没有越过它，lookup 必须继续
+    // fail-closed。
+    SharedRegionSlot &target_slot =
+        map->slots[
+            SharedTensorMapSlotIndex(
+                bucket, 2U * kEntriesPerTask
+            )
+        ];
+    StoreControl(
+        &target_slot.seq.value,
+        static_cast<int64_t>(2U * kEntriesPerTask + 1U)
+    );
+    bool corrupt_protocol_ok = true;
+    const int32_t corrupt_result =
+        SharedLookupRegion<RecordingOps>(
+            *map,
+            MakeRegion(
+                address, second_target_lo,
+                second_target_lo + 8U, -1
+            ),
+            kReaderTask + 1, kHeapWindow,
+            corrupt_protocol_ok
+        );
+    Expect(
+        !corrupt_protocol_ok && corrupt_result == -1,
+        kTest,
+        "seq corruption without head advance remains a protocol error"
+    );
+
+    // 控制字段真实损坏也不能借异常恢复蒙混过去。没有并发 head 前进时，
+    // 人为制造 CAP+1 的跨度，二次读取仍是旧 head，必须直接拒绝。
+    auto oversized_map = NewMap();
+    const uint32_t oversized_bucket = TensorMapHash(address);
+    StoreControl(
+        &oversized_map->buckets[oversized_bucket].tail.value,
+        static_cast<int64_t>(kMapBucketCapacity + 1U)
+    );
+    bool oversized_protocol_ok = true;
+    const int32_t oversized_result =
+        SharedLookupRegion<RecordingOps>(
+            *oversized_map,
+            MakeRegion(address, 0, 8, -1),
+            1, kHeapWindow, oversized_protocol_ok
+        );
+    Expect(
+        !oversized_protocol_ok && oversized_result == -1,
+        kTest,
+        "oversized control span without head advance remains an error"
+    );
+}
+
 void TestFullBucketDoesNotBlockIndependentBucket() {
     constexpr const char *kTest = "full-bucket-independent-bucket";
     if constexpr (kMapBuckets == 1) {
@@ -1783,6 +2236,7 @@ int main() {
     TestAbsoluteSeqMultipleLapsAndAba();
     TestCapacityFailureIsAllOrNothing();
     TestSlowReaderGatesFullBucketReuse();
+    TestLookupSkipsConcurrentlyRetiredSafePrefix();
     TestFullBucketDoesNotBlockIndependentBucket();
     TestFullBucketRetireAndReuseExactCapacity();
     TestCapacityBlockedAfterSafeRetire();
@@ -1795,7 +2249,7 @@ int main() {
     std::printf(
         "[PASS] shared TensorMap ring CAP=%u buckets=%u: "
         "ABI, ordered commit, slow-reader reclaim, absolute seq, "
-        "ABA, overflow, logical differential\n",
+        "concurrent safe-prefix retire, ABA, overflow, logical differential\n",
         kMapBucketCapacity, kMapBuckets
     );
     std::printf(

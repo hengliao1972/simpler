@@ -89,21 +89,59 @@ PA_DEVICE int32_t SharedLookupRegion(
         return -1;
     }
     const uint32_t bucket = TensorMapHash(query.buffer_addr);
-    const int64_t signed_head = Ops::Load(&map.buckets[bucket].head.value);
+    int64_t signed_head = Ops::Load(&map.buckets[bucket].head.value);
     const int64_t signed_tail = Ops::Load(&map.buckets[bucket].tail.value);
-    if (signed_head < 0 || signed_tail < signed_head ||
-        static_cast<uint64_t>(signed_tail - signed_head) > kMapBucketCapacity) {
-        return -1;
+    if (__builtin_expect(
+            signed_head < 0 || signed_tail < signed_head ||
+                static_cast<uint64_t>(signed_tail - signed_head) >
+                    kMapBucketCapacity,
+            0
+        )) {
+        if (signed_head < 0 || signed_tail < 0) {
+            return -1;
+        }
+        // head/tail 是两个独立 control atomic。reader 先读旧 head 后，
+        // writer 可能合法回收前缀、复用槽并发布新 tail，从而让混合快照
+        // 暂时呈现 span>CAP。异常支路只重读一次 head；唯有 head 单调
+        // 前进后能把同一 tail 重新约束到容量内，才接受该快照。
+        const int64_t refreshed_head =
+            Ops::Load(&map.buckets[bucket].head.value);
+        if (refreshed_head < signed_head ||
+            refreshed_head > signed_tail ||
+            static_cast<uint64_t>(
+                signed_tail - refreshed_head
+            ) > kMapBucketCapacity) {
+            return -1;
+        }
+        signed_head = refreshed_head;
     }
 
     const int32_t lower =
         current_task > heap_window ? current_task - heap_window : 0;
     int32_t best = -1;
-    for (uint64_t cursor = static_cast<uint64_t>(signed_head);
-         cursor < static_cast<uint64_t>(signed_tail); ++cursor) {
+    uint64_t cursor = static_cast<uint64_t>(signed_head);
+    const uint64_t tail = static_cast<uint64_t>(signed_tail);
+    while (cursor < tail) {
         SharedRegionValue candidate{};
-        if (!SharedReadRegionSlot<Ops>(map, bucket, cursor, candidate)) {
-            return -1;
+        if (__builtin_expect(
+                !SharedReadRegionSlot<Ops>(
+                    map, bucket, cursor, candidate
+                ),
+                0
+            )) {
+            // reader 保存旧 head 后，未来唯一 writer 仍可合法回收
+            // producer < current_task-H 的无关前缀，并复用其物理槽。只有
+            // head 已单调越过当前 cursor，才能把 seq 双检失败解释为这类
+            // 合法复用；否则继续 fail-closed，不能吞掉真实 slot 损坏。
+            const int64_t refreshed_head =
+                Ops::Load(&map.buckets[bucket].head.value);
+            if (refreshed_head < signed_head ||
+                refreshed_head > signed_tail ||
+                cursor >= static_cast<uint64_t>(refreshed_head)) {
+                return -1;
+            }
+            cursor = static_cast<uint64_t>(refreshed_head);
+            continue;
         }
         if (candidate.producer >= lower &&
             candidate.producer < current_task &&
@@ -111,6 +149,7 @@ PA_DEVICE int32_t SharedLookupRegion(
             candidate.producer > best) {
             best = candidate.producer;
         }
+        ++cursor;
     }
     protocol_ok = true;
     return best;

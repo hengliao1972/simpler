@@ -9309,3 +9309,159 @@ production `SharedAdvanceReaderDone()` 仍没有 read→CAS 顺序，真实 PA �
 尚未在每个 active worker、每个 task 的全部成功/loser/空任务出口连续发布
 前沿。下一阶段必须先在 generic ordinary flow 闭合
 “read-only lookup→reader-close→后继 append”，再讨论接入 PA。
+
+### 2026-07-27：R4e-d1 消除合法前缀回收导致的两类 lookup 假失败
+
+R4e-c 已证明“reader 仍可能选择的 producer 不能被复用”，但 production
+`SharedLookupRegion()` 还隐含了另一个没有成立的假设：从第一次读取 bucket
+`head` 到扫描结束，head 不会变化。reader task `N` 尚未关闭时，未来唯一
+writer 仍可合法回收：
+
+```text
+producer <= N - 1 - H
+```
+
+而本 reader 的查询窗口下界为：
+
+```text
+producer >= N - H
+```
+
+前一集合严格位于查询窗口之外，回收本身没有数据依赖错误。但 reader 保存
+旧 head 后存在两类合法交错：
+
+1. writer 在 reader 读取 tail 前完成回收、复用和 tail 发布，reader 得到
+   “旧 head + 新 tail”，表面跨度超过 ring 容量；
+2. reader 已进入旧 cursor，writer 随后发布新 head 并复用物理槽，旧
+   cursor 的 absolute seq 双检失败。
+
+旧实现会在第一类交错的初始容量检查，或第二类交错的 seq 双检处直接返回
+协议错误，因此都会把合法回收误报为 fatal。
+
+#### 两个异常支路各自二次读取 head
+
+本阶段没有弱化控制跨度检查和 `SharedReadRegionSlot()` 的 seq 双检，也
+没有无条件重试。
+
+初始控制快照跨度超过容量时，再对同 bucket 的 head 做一次真实 atomic
+load。只有同时满足：
+
+```text
+old_head <= new_head <= tail
+tail - new_head <= CAP
+```
+
+才接受这个“旧 head + 新 tail”混合快照，并从 `new_head` 开始扫描。
+
+slot 读取失败时同样只二次读取一次 head。只有同时满足：
+
+```text
+head0 <= head1 <= tail0
+cursor < head1
+```
+
+才说明失败 cursor 已属于合法退休的旧前缀，扫描位置直接跳到 `head1`。
+其余情况仍返回协议错误。两个额外 load 都位于原本即将失败的异常分支；
+正常 lookup 不增加 atomic。
+
+这依赖现有唯一 writer 发布顺序：
+
+```text
+Exchange(head) 返回值验证成功
+  -> Exchange(seq, empty)
+  -> 写并 flush payload
+  -> Exchange(seq, absolute cursor)
+  -> Exchange(tail)
+```
+
+head 单调且 absolute seq 不会把新一轮物理槽伪装成旧 cursor。测试事件
+记录进一步要求目标 head Exchange 严格早于第一次 slot seq invalidate、
+payload flush、新 seq 发布和 tail 发布，防止只凭源码顺序作结论。
+
+#### 确定性交错
+
+CPU 门槛用每 task 八条 region 填满同一 bucket：
+
+```text
+cursor 0..7:   producer 0
+cursor 8..15:  producer 1
+...
+head/tail:     0/CAP
+```
+
+reader 处于 task 2，`H=1`，已经连续发布 `reader_done=1`。它查询
+cursor 8 对应的 region，正确结果应为 producer 1。第一种交错让 reader
+先读 `head=0`，在它读取 tail 前暂停；future writer 不读取或更新
+`committed_tasks`，只按生产 primitive 执行：
+
+```text
+reader candidate = 0
+  -> reclaim_upto = 0
+  -> head 0 -> 8
+  -> cursor CAP..CAP+7 复用物理槽 0..7
+  -> tail CAP -> CAP+8
+```
+
+reader 恢复后读取 `tail=CAP+8`，旧 head 与新 tail 的表面跨度为
+`CAP+8`；二次读取 `head=8` 后，真实跨度恢复为 CAP，并继续返回
+producer 1。
+
+随后 reader 连续发布 `reader_done=2`，以 task 3 查询 cursor 16 的
+producer 2。第二种交错让 reader 在 cursor 8 第一次 seq 检查后、payload
+拷贝前暂停；writer 推导 `candidate=1`，把 head 从 8 推到 16，并用
+cursor `CAP+8..CAP+15` 复用物理槽 8..15。reader 恢复后的第二次 seq
+检查失败，二次读取 `head=16`，跳过退休前缀并继续返回 producer 2。
+
+测试把 `committed_tasks` 在交错前重置为 0，两次回收和 append 后仍要求
+为 0，明确证明这两条 reader 恢复都不借助全局 exact-turn 前沿。
+
+同一门槛最后把 cursor 16 的 seq 改成错误值但保持 head=16。此时二次
+读取 head 没有越过失败 cursor，lookup 必须继续返回协议错误；不能把
+真实损坏吞成并发回收。另一个反例直接构造 `tail-head=CAP+1` 且二次
+读取 head 不前进，同样必须返回协议错误，锁定真实控制跨度损坏不能借
+混合快照恢复。
+
+#### 红灯、修正和回归
+
+先固定扫描期槽复用交错、尚未修改 lookup 时，CAP=128 全套只有一项失败：
+
+```text
+lookup skips retired cursor 0 and returns producer 1
+```
+
+加入扫描期 head 判定后该项转绿。独立审查随后指出初始混合快照缺口；
+只补对应测试时，CAP=128 又精确出现一项新失败：
+
+```text
+lookup repairs old-head/new-tail snapshot and returns producer 1
+```
+
+加入初始异常跨度的 head 二次判定后，该项转绿，扫描期交错仍保持通过。
+随后用系统 GCC 13、`-O2 -Wall -Wextra -Werror` 对共享普通 ring 的全部
+形态逐一重编并执行：
+
+| CAP | bucket 数 | 结果 |
+| ---: | ---: | --- |
+| 32 | 512 | PASS |
+| 64 | 256 | PASS |
+| 128 | 128 | PASS |
+| 256 | 64 | PASS |
+| 16384 | 1 | PASS |
+
+随后使用本用户 CANN 9.1 完成 shared CCEC 正式构建：generic protocol
+probe 在 AIC/AIV 各自实例化并静态链接，正式 AIC/AIV entry、split
+caller/runtime/finish、1:2 mixed ELF、LOCAL real-compute helper、零
+relocation和 artifact manifest 检查全部通过。该结果只证明新 lookup
+分支可以生成并链接设备代码，不等同于跨物理核动态执行。
+
+完整 shared CPU build 中，host task plan、五种 ring 容量、sparse trace、
+shared-output symbol、generic writer-intent、heap reserve、Vector Claim、
+winner materialize 和 split-finish loser 等门槛也全部通过。
+
+该阶段只修正 production lookup primitive 并增加 CPU 确定性交错，没有
+接入 PA/Submit，没有改变 private 模式、ABI、字段或 atomic 数量正常路径。
+head 二次读取只发生在原本已经要失败的控制跨度或 seq 异常分支，正常
+lookup 不增加 atomic。设备当时已有其他任务，本阶段按用户要求不再尝试
+上板；因此结果不包含新的 A5 双向证据。下一小步再建立不依赖
+`committed_tasks` 的 reader-gated 整 task append 组合，并先做 CPU
+容量与慢 reader 门槛。
