@@ -27,10 +27,10 @@ repos:
           entry: python tests/lint/check_english_only.py
           language: python
           language_version: python3
-          # The standalone scheduler probe and its investigation records are
-          # intentionally maintained with Chinese annotations for the A5
-          # device-performance workflow; production sources remain covered.
-          exclude: ^(3rdparty/|docs/zh-cn/|README\.zh-CN\.md|tests/atomic_probe/pa_scheduler/)
+          # The atomic-probe tree contains standalone probes, usage guides and
+          # investigation records that are intentionally maintained in Chinese
+          # for the A5 device-performance workflow.
+          exclude: ^(3rdparty/|docs/zh-cn/|README\.zh-CN\.md|tests/atomic_probe/)
 
     - repo: https://github.com/pre-commit/pre-commit-hooks
       rev: v4.6.0
