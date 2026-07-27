@@ -187,48 +187,48 @@ COMMON_FLAGS=(
     "${VARIANT_DEFINES[@]}"
 )
 
-# 普通 PA kernel 在迁移完成前不会调用通用 WriterIntentSet。shared 构建
-# 额外对模板做真实后端代码生成和静态链接，分别锁定 cube/vector 的
-# CcecOps、GM 地址空间、atomicCAS、DCCI 以及“无未解析 compiler builtin”
-# 契约。probe 不加入 DEVICE_OBJECTS，检查后立即删除，因此不会改变正式
-# mixed ELF、I-cache 布局或运行性能。
+# 普通 PA kernel 在迁移完成前不会调用通用 WriterIntentSet 或 reader
+# progress/reclaim。shared 构建额外对这些模板做真实后端代码生成和静态
+# 链接，分别锁定 cube/vector 的 CcecOps、GM 地址空间、atomicCAS、DCCI
+# 以及“无未解析 compiler builtin”契约。probe 不加入 DEVICE_OBJECTS，
+# 检查后立即删除，因此不会改变正式 mixed ELF、I-cache 布局或运行性能。
 if [[ "$TENSORMAP_MODE" == "shared" ]]; then
 (
-    WRITER_INTENT_PROBE_AIC_OBJECT="$BUILD_DIR/.prepare_shared_writer_intent_aic.o"
-    WRITER_INTENT_PROBE_AIV_OBJECT="$BUILD_DIR/.prepare_shared_writer_intent_aiv.o"
-    WRITER_INTENT_PROBE_AIC_ELF="$BUILD_DIR/.prepare_shared_writer_intent_aic.elf"
-    WRITER_INTENT_PROBE_AIV_ELF="$BUILD_DIR/.prepare_shared_writer_intent_aiv.elf"
-    cleanup_writer_intent_probe() {
+    SHARED_PROTOCOL_PROBE_AIC_OBJECT="$BUILD_DIR/.shared_protocol_probe_aic.o"
+    SHARED_PROTOCOL_PROBE_AIV_OBJECT="$BUILD_DIR/.shared_protocol_probe_aiv.o"
+    SHARED_PROTOCOL_PROBE_AIC_ELF="$BUILD_DIR/.shared_protocol_probe_aic.elf"
+    SHARED_PROTOCOL_PROBE_AIV_ELF="$BUILD_DIR/.shared_protocol_probe_aiv.elf"
+    cleanup_shared_protocol_probe() {
         rm -f \
-            "$WRITER_INTENT_PROBE_AIC_OBJECT" \
-            "$WRITER_INTENT_PROBE_AIV_OBJECT" \
-            "$WRITER_INTENT_PROBE_AIC_ELF" \
-            "$WRITER_INTENT_PROBE_AIV_ELF"
+            "$SHARED_PROTOCOL_PROBE_AIC_OBJECT" \
+            "$SHARED_PROTOCOL_PROBE_AIV_OBJECT" \
+            "$SHARED_PROTOCOL_PROBE_AIC_ELF" \
+            "$SHARED_PROTOCOL_PROBE_AIV_ELF"
     }
     # 独立子 shell 的 EXIT trap 不会覆盖正式 manifest 的原子发布 trap；
     # 编译或链接任一步失败也会清掉隐藏 probe，不留下半成品混淆现场。
-    trap cleanup_writer_intent_probe EXIT
-    cleanup_writer_intent_probe
+    trap cleanup_shared_protocol_probe EXIT
+    cleanup_shared_protocol_probe
 
-    echo "[CHECK] CCEC AIC generic WriterIntentSet instantiation"
+    echo "[CHECK] CCEC AIC generic shared protocol instantiation"
     "$CCEC" "${COMMON_FLAGS[@]}" \
         --cce-aicore-arch=dav-c310-cube \
         -DPA_BUILD_AIC \
-        -o "$WRITER_INTENT_PROBE_AIC_OBJECT" \
-        "$SCRIPT_DIR/prepare_shared_writer_intent_compile_probe.cpp"
+        -o "$SHARED_PROTOCOL_PROBE_AIC_OBJECT" \
+        "$SCRIPT_DIR/shared_protocol_compile_probe.cpp"
     "$LD" -m aicorelinux -Ttext=0 -static \
-        -o "$WRITER_INTENT_PROBE_AIC_ELF" \
-        "$WRITER_INTENT_PROBE_AIC_OBJECT"
+        -o "$SHARED_PROTOCOL_PROBE_AIC_ELF" \
+        "$SHARED_PROTOCOL_PROBE_AIC_OBJECT"
 
-    echo "[CHECK] CCEC AIV generic WriterIntentSet instantiation"
+    echo "[CHECK] CCEC AIV generic shared protocol instantiation"
     "$CCEC" "${COMMON_FLAGS[@]}" \
         --cce-aicore-arch=dav-c310-vec \
         -DPA_BUILD_AIV \
-        -o "$WRITER_INTENT_PROBE_AIV_OBJECT" \
-        "$SCRIPT_DIR/prepare_shared_writer_intent_compile_probe.cpp"
+        -o "$SHARED_PROTOCOL_PROBE_AIV_OBJECT" \
+        "$SCRIPT_DIR/shared_protocol_compile_probe.cpp"
     "$LD" -m aicorelinux -Ttext=0 -static \
-        -o "$WRITER_INTENT_PROBE_AIV_ELF" \
-        "$WRITER_INTENT_PROBE_AIV_OBJECT"
+        -o "$SHARED_PROTOCOL_PROBE_AIV_ELF" \
+        "$SHARED_PROTOCOL_PROBE_AIV_OBJECT"
 )
 fi
 

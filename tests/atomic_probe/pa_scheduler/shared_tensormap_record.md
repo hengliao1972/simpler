@@ -9012,3 +9012,42 @@ reclaimer 在另一物理核上一定看见最新 reader 前沿。下一阶段 R
 AIC/AIV 各自显式实例化新 helper，再用独立 mixed ELF 建立
 “reader 普通读取完成并发布 -> reclaimer 跨核观察 -> 允许/禁止复用”的
 A5 门槛；在该证据闭合前仍不迁移真实 PA。
+
+### 2026-07-27：R4e-c1 先闭合 reader/reclaimer 的 CCEC 代码生成
+
+R4e-b 的 shared 正式构建会解析 `pa_shared_tensormap.h`，但普通 PA
+kernel 尚无 reader-progress 调用者，模板体即使存在签名或 device builtin
+问题也可能从未实例化。R4e-c 不直接跳到动态上板，先把这一层单独闭合。
+
+原 `prepare_shared_writer_intent_compile_probe.cpp` 已扩为并更名为
+`shared_protocol_compile_probe.cpp`。同一个 TU 继续显式实例化
+`PrepareSharedWriterIntentSet<CcecOps>`，并新增：
+
+```cpp
+SharedAdvanceReaderDone<CcecOps>(...)
+SharedRefreshReaderReclaimForTask<CcecOps>(...)
+```
+
+CCEC build 对 dav-c310-cube 与 dav-c310-vec 分别生成 object，再各自用
+`ld.lld -m aicorelinux -static` 真实链接。四个隐藏 probe artifact 仍处于
+独立子 shell 的 `EXIT` trap 下，成功或失败都会删除；它们不加入正式
+`DEVICE_OBJECTS`，不会改变 PA mixed ELF、I-cache 布局或运行性能。
+
+本阶段同时把 build 内的变量、清理函数和日志从 writer-intent 专名改为
+shared-protocol，避免后续把 reader helper 的构建闭环误认为只覆盖 symbol
+writer。
+
+验证结果：
+
+| 检查 | 结果 |
+| --- | --- |
+| `bash -n ccec/build.sh` | PASS |
+| AIC generic shared-protocol object + static ELF | PASS |
+| AIV generic shared-protocol object + static ELF | PASS |
+| 正式 AIC/AIV entry 与 split-finish | 构建 PASS |
+| 正式 1:2 mixed ELF、LOCAL helper、relocation、manifest | 全部 PASS |
+
+这只证明真实 CcecOps 的 GM 地址空间、CAS 签名和 reader candidate 组合在
+AIC/AIV 上都能完成代码生成与静态链接。它没有运行 reader，也没有证明
+ordinary GM load、`reader_done` CAS 和远端 reclaimer 观察之间的
+compiler/device 顺序；R4e-c2 仍必须使用独立 mixed ELF 双向上板。

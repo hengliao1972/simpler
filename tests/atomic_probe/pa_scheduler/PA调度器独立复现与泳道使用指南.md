@@ -539,10 +539,12 @@ cache line，再由两个未来 writer 发布，最后调用真实
 build/ccec/shared/history-litmus/
 ```
 
-普通 shared 构建还会把 AIC/AIV 的 generic WriterIntentSet probe 各自实际
-静态链接，拒绝 `__multi3` 或其他未解析 device builtin；probe 检查后删除，
-不会进入正式 mixed ELF。该门槛只证明 symbol history 可见性，不证明
-ordinary region 的 reader-progress/reclaim 已完成。
+普通 shared 构建还会把 AIC/AIV 的 generic shared-protocol probe 各自实际
+静态链接。该 probe 同时显式实例化 WriterIntentSet、`reader_done` CAS 和
+reader-based reclaim refresh，拒绝 `__multi3` 或其他未解析 device
+builtin；检查后删除，不会进入正式 mixed ELF。静态链接只证明两种 CCEC
+后端能生成完整设备代码，不证明 ordinary region 的跨核
+reader-progress/reclaim 可见性已经闭合。
 history-litmus 自身虽是 CCEC mixed ELF，但没有定义 split-finish，因此其
 GM `SchedulerState` 使用当前 generation-8 non-split 大小
 1,019,542,400B；它会校验新追加的 96 条 `reader_done` 始终保持 -1。
