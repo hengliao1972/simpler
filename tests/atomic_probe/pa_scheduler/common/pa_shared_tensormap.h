@@ -250,22 +250,16 @@ PA_DEVICE bool SharedHasExactTaskTurn(
            Ops::Load(&map.committed_tasks.value) == current_task;
 }
 
-// 只有 exact committed turn 的 winner 可以推进 reclaim。先验证
-// committed_tasks==current_task，再计算当前任务的 inclusive 回收边界；
-// 逆序/陈旧 actor 在任何 head、tail 或 reclaim 写入前失败。
+// reclaim_upto 只允许唯一 ordered append actor 单调发布。这里不从 exact
+// turn 推导 actor 唯一性：调用方仍必须先完成 winner/turn 所有权收敛。
+// R4e-e 会在真实接线前单独比较 Exchange 与 CAS 的设备成本；当前保持
+// 既有单写者发布语义，不把性能选择混入 reader 正确性门槛。
 template <typename Ops>
-PA_DEVICE bool SharedRefreshReclaimForTask(
-    PA_GM SharedTensorMapSidecar &map, int32_t current_task,
-    int32_t heap_window,
+PA_DEVICE bool SharedPublishReclaimCandidate(
+    PA_GM SharedTensorMapSidecar &map, int64_t candidate,
     int64_t &reclaim_upto
 ) {
-    if (!SharedHasExactTaskTurn<Ops>(map, current_task)) {
-        return false;
-    }
-    int64_t candidate = -1;
-    if (!SharedComputeOrderedReclaimCandidate(
-            current_task, heap_window, candidate
-        )) {
+    if (candidate < -1) {
         return false;
     }
     const int64_t current = Ops::Load(&map.reclaim_upto.value);
@@ -283,6 +277,59 @@ PA_DEVICE bool SharedRefreshReclaimForTask(
     }
     reclaim_upto = candidate;
     return true;
+}
+
+#if PTO_FDWIC_SHARED_MAP
+// reader-based refresh 只组合 exact turn、最慢 reader 候选和既有单调发布；
+// 不扫描 bucket、不 append，也没有 PA/Submit 调用者。exact turn 仍不等于
+// 唯一 actor，外层必须先证明只有一个 ordered append actor 进入本原语。
+// active_workers 必须是本轮固定的连续活跃前缀，heap_window 也必须在 ring
+// 整个生命周期保持同一权威值；任一参数中途缩小都可能发布不可撤回的过激
+// 候选，随后再恢复真实配置已经无法找回被回收的槽。
+template <typename Ops>
+PA_DEVICE bool SharedRefreshReaderReclaimForTask(
+    PA_GM SharedTensorMapSidecar &map, int32_t current_task,
+    uint32_t active_workers, int32_t heap_window,
+    int64_t &reclaim_upto
+) {
+    if (!SharedHasExactTaskTurn<Ops>(map, current_task)) {
+        return false;
+    }
+    int64_t candidate = -1;
+    if (!SharedComputeReaderReclaimCandidate<Ops>(
+            map, active_workers, heap_window, candidate
+        )) {
+        return false;
+    }
+    return SharedPublishReclaimCandidate<Ops>(
+        map, candidate, reclaim_upto
+    );
+}
+#endif
+
+// 只有 exact committed turn 的 winner 可以推进 reclaim。先验证
+// committed_tasks==current_task，再计算当前任务的 inclusive 回收边界；
+// 逆序/陈旧 actor 在任何 head、tail 或 reclaim 写入前失败。该旧路径只
+// 服务单线程 ordered-ring 隔离 driver；generic 多 reader 使用上面的
+// reader-based refresh。
+template <typename Ops>
+PA_DEVICE bool SharedRefreshReclaimForTask(
+    PA_GM SharedTensorMapSidecar &map, int32_t current_task,
+    int32_t heap_window,
+    int64_t &reclaim_upto
+) {
+    if (!SharedHasExactTaskTurn<Ops>(map, current_task)) {
+        return false;
+    }
+    int64_t candidate = -1;
+    if (!SharedComputeOrderedReclaimCandidate(
+            current_task, heap_window, candidate
+        )) {
+        return false;
+    }
+    return SharedPublishReclaimCandidate<Ops>(
+        map, candidate, reclaim_upto
+    );
 }
 
 PA_DEVICE uint32_t SharedEarlierEntriesInBucket(

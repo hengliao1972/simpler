@@ -357,11 +357,17 @@ standalone 控制区和 `results` 之后，不移动 `WorkerState`、`RunConfig`
 ordinary-ring 读取，初值为 -1，只允许 CAS `D-1 -> D`。最慢完成值为
 `Dmin` 时，inclusive 回收候选为 `max(-1,Dmin-H)`。这与设计文档写的
 `R=min_progress-H-1` 并不矛盾：这里的下一任务进度
-`min_progress=Dmin+1`。R4e-a 只建立独立状态、严格 CAS 和纯公式 CPU
-门槛；普通 PA 仍走专用 writer-chain，不发布 `reader_done`，host 反向
-要求 96 条线保持 -1，region ring 也仍不启用运行时回收。A5 上的
-“ordinary 读取完成 -> reader_done 发布”顺序及跨核可见性要由后续独立
-门槛闭合，不能由当前 CPU 结果外推。
+`min_progress=Dmin+1`。R4e-a 建立独立状态、严格 CAS 和纯公式 CPU
+门槛；R4e-b 又在隔离 ring driver 中把 exact writer turn、reader 候选和
+单调 `reclaim_upto` 发布组合起来，并以满桶慢 reader 交错证明：task 2
+读取尚未结束时 future writer 只能得到 `CapacityBlocked`，读取返回并发布
+完成前沿后才可回收 producer 0、复用对应物理槽。该组合 helper 仍没有
+PA/Submit 调用者；其 `active_workers` 连续前缀和 `H` 也必须是整个 ring
+生命周期的固定权威配置，不能在已经发布回收边界后动态改变。普通 PA
+继续走专用 writer-chain，不发布
+`reader_done`，host 反向要求 96 条线保持 -1。A5 上的
+“ordinary 读取完成 -> reader_done 发布”编译器/设备顺序及跨核可见性
+仍要由后续独立门槛闭合，不能由当前 CPU 结果外推。
 
 S4.15a 历史候选曾在末尾追加 512B Cube cursor，但已因性能门槛未通过而
 撤销，不属于当前传输布局。

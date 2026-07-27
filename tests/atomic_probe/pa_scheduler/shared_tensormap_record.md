@@ -8862,3 +8862,153 @@ symbol 路径未受影响，不能冒充 reader-progress 的 A5 发布门槛。
 下一阶段用满桶和慢 reader 的确定性交错证明“未关闭 reader 时绝不复用，
 关闭并越过 H 后才可回收”；随后才增加独立 CCEC/A5 reader→reclaimer
 可见性门槛。
+
+### 2026-07-27：R4e-b 用满环交错闭合 CPU reader-gated reuse
+
+R4e-a 只证明 `reader_done` 的单调状态机和回收候选公式，没有把候选接到
+任何 bucket head。R4e-b 仍不接 PA/Submit，而是在 shared ordinary-ring
+隔离 driver 内补上最薄的组合层，回答一个更具体的问题：
+
+> future writer 已拿到 ordered turn、目标桶又恰好写满时，只要仍有一个
+> active reader 没有关闭其合法 lookup 窗口，是否可能提前回收并复用慢
+> reader 正在读取的物理槽？
+
+#### 最薄组合原语及其所有权边界
+
+既有 `SharedRefreshReclaimForTask()` 的 `current_task-H-1` 公式只适用于
+单线程 ordered-ring 旧 driver，不能拿来替代多 reader 完成证据。本阶段
+增加：
+
+```cpp
+SharedRefreshReaderReclaimForTask<Ops>(
+    map, current_task, active_workers, heap_window, reclaim_upto
+)
+```
+
+它只按顺序复用三项既有事实：
+
+1. `committed_tasks==current_task`，拒绝陈旧或超前 writer；
+2. `SharedComputeReaderReclaimCandidate()` 对固定 active-worker 前缀取
+   `max(-1,min(reader_done)-H)`；
+3. 把候选单调发布到 `reclaim_upto`。
+
+候选发布逻辑从旧 refresh 中原样抽为
+`SharedPublishReclaimCandidate()`，旧单线程 driver 继续走原公式，行为
+没有改变。当前发布仍使用既有单 writer `Exchange` 语义；exact turn
+本身不证明 actor 唯一，调用者必须已经完成 winner/turn 所有权收敛。若
+误让多个 actor 同时发布，`Exchange` 的失败检查不能自动恢复被覆盖的
+控制字，因此本 helper 绝不能被解释为多 writer 仲裁原语。R4e-e 会在真实
+接线前单独比较 CAS 与 Exchange 的设备成本，再决定最终发布方式。
+
+新 helper 不扫描 bucket、不 append、不设置 fatal，也没有 PA 调用者；
+因此本阶段没有改变默认 PA 的 atomic 次数、代码布局或性能。
+
+#### 确定性交错不是“先后调用”的近似
+
+测试在现有 `RecordingOps::InvalidateRegion()` 增加一次性回调。回调点
+位于 `SharedReadRegionSlot()` 第一次确认绝对 `seq` 之后、复制 payload
+之前；进入回调前先清空 hook，因此 future writer 的嵌套 preflight 可以
+读取同一物理槽而不会递归。它制造的是确定的源码级交错，不模拟 A5 cache
+line，也不冒充 DCCI 证据。
+
+五种 CAP 都使用同一组合同：
+
+| 参数 | 固定值或公式 |
+| --- | --- |
+| active reader | worker 0 和 worker 1 |
+| lookup 窗口 `H` | 2 |
+| 每个 fill task 的 region 数 | 固定 8，且编译期要求不超过 `kMaxTaskTensors` |
+| fill task 数 | `CAP/8` |
+| future writer task | `CAP/8` |
+| 目标 bucket | 所有 region 使用同一 `buffer_addr` |
+| replacement 数 | 8 |
+
+固定每 task 8 条很重要。开发中第一次把它写成
+`kMaxTaskTensors`，而当前该常量是 32；CAP=32 于是只产生一个 fill
+task，快 reader 实际只能完成到 0，关闭慢 reader 的 task 2 后候选当然
+仍为 -1。这个首个失败准确暴露的是夹具与注释不一致，不是回收公式错误。
+修正后增加 `CAP/8>H` 的编译期断言，避免以后常量变化悄悄破坏交错前提。
+CAP=16384 时也只使用 2,048 个 task，仍小于 `kMaxTasks=4352`。
+
+#### 慢 reader 未关闭时必须全量不写
+
+先用真实 shared append/commit primitive 把同一 bucket 精确填到 CAP：
+
+```text
+head=0
+tail=CAP
+committed_tasks=CAP/8
+reclaim_upto=-1
+physical slot 0: seq=0, producer=0
+```
+
+随后 worker 0 连续发布 `reader_done=1`，表示仍在 task 2 的 ordinary
+lookup；worker 1 连续发布到 future writer 前一 task。task 2 查询
+producer 0 时，在 cursor 0 的首次 seq 检查后触发 future writer：
+
+```text
+Dmin=min(1, future_task-1)=1
+candidate=max(-1,1-2)=-1
+```
+
+future writer 已持有 exact turn，但 refresh 只能保持全局
+`reclaim_upto=-1`；整任务 preflight 必须返回 `CapacityBlocked`。回调在
+reader 仍暂停时立即记录并断言：
+
+- `head=0`、`tail=CAP`、`committed_tasks=future_task`；
+- slot 0 仍是 `seq=0, producer=0`；
+- 事件账本没有 `Exchange`、`CompareExchange` 或 payload `Flush`；
+- 外层 lookup 恢复后仍返回 producer 0。
+
+这里不仅检查“最终没有 commit”，还检查 payload/seq/tail/head/reclaim
+均没有中间发布，避免把局部写入后回滚误判成 all-or-nothing。
+
+#### lookup 返回后才允许精确回收和回绕
+
+只有外层 lookup 完整返回后，worker 0 才以 CAS 把
+`reader_done:1->2`。此时：
+
+```text
+Dmin=2
+candidate=max(-1,2-2)=0
+```
+
+同一个唯一 ordered actor 发布 `reclaim_upto=0`。preflight 惰性推进
+`head:0->8`，恰好退休 task 0 的八条 region；随后八条 replacement
+依次追加到绝对 cursor `[CAP,CAP+8)` 并提交 future task。最终断言：
+
+- `tail=CAP+8`、逻辑 bucket 大小仍为 CAP；
+- cursor CAP 与 cursor 0 映射到同一 physical slot，但新绝对
+  `seq=CAP`、payload 只含 future producer；
+- 旧 cursor 0 读取失败，新 cursor CAP 读取成功；
+- task 3、`H=2` 的 lookup 继续遵守窗口下界，不接受 producer 0。
+
+最后一项只复核 lookup 时间窗，不能单独证明 producer 0 已经物理退休；
+退休证据来自此前的 `head=8`、slot 0 绝对 `seq=CAP` 和旧 cursor 读取
+失败三项组合。
+
+这闭合的是 CPU 状态机上的
+“慢读未关闭 -> 满桶阻塞 -> 读完发布 -> 精确回收 -> 绝对序号防 ABA”
+完整链路，不是仅验证一个候选整数。
+
+#### 验证结果与仍未闭合的设备事实
+
+| 检查 | 结果 |
+| --- | --- |
+| shared ring CAP=32/64/128/256/16384 | 全部 PASS |
+| 上述五档 ASan+UBSan | 全部 PASS，无越界或未定义行为 |
+| CPU shared 全套公共门槛 | PASS |
+| CPU private 五档 ring | PASS，无旁路回退或 shared 宏泄漏；private 不执行新 helper |
+| CCEC shared AIC/AIV、split finish、mixed ELF、manifest | 构建 PASS |
+| 新 reader refresh 的 CCEC 显式实例化 | 本阶段尚未增加 |
+| A5 reader→reclaimer 跨核动态门槛 | 本阶段尚未执行 |
+
+CPU 构建和 sanitizer 使用系统 GCC 13；CCEC/device 使用本用户 CANN 9.1，
+host 使用系统 GCC 13。本轮没有复用用户目录 GCC 15 与系统 binutils 2.42
+的不兼容组合。
+
+R4e-b 没有证明 ordinary GM 读取一定先于 `reader_done` CAS，也没有证明
+reclaimer 在另一物理核上一定看见最新 reader 前沿。下一阶段 R4e-c 先让
+AIC/AIV 各自显式实例化新 helper，再用独立 mixed ELF 建立
+“reader 普通读取完成并发布 -> reclaimer 跨核观察 -> 允许/禁止复用”的
+A5 门槛；在该证据闭合前仍不迁移真实 PA。
