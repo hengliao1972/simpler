@@ -340,16 +340,31 @@ Claim cursor，S4.14b 已启用全部 8 条。S4.16a/S4.16b 曾在数组
 `kMaxTasks` 从 1,280 扩为 4,352，使 generation-6 sidecar 增至
 11,027,648B；region ring 和 `shared_outputs` 起点不变，heap/vend/Vector
 尾字段随 output table 扩容顺延。R4c 在 offset 11,027,648B 追加
-`writer_history[4352]`，每 cell 320B，共 1,392,640B；当前 sidecar 为
-12,420,288B，默认 CAP=128 的构建身份 ABI generation 为 7。R4c 的尾部
-追加不移动此前字段，Vector 热路径仍使用 `task_id%8`。当前 shared
-`SchedulerState` 的 CPU 非 split 布局为 1,019,536,256B；定义
-`PA_COMPETE_FIRST_SPLIT_FINISH` 的 CCEC 变体为 1,019,542,400B。sidecar 位于
+`writer_history[4352]`，每 cell 320B，共 1,392,640B；R4c sidecar 为
+12,420,288B，默认 CAP=128 的构建身份当时为 ABI generation 7。
+
+R4e-a 又在该 offset 追加 `reader_done[96]`，每个 worker 独占 64B，
+合计 6,144B。当前 generation-8 sidecar 为 12,426,432B；CPU 非 split
+`SchedulerState` 为 1,019,542,400B，定义
+`PA_COMPETE_FIRST_SPLIT_FINISH` 的 CCEC split 布局为 1,019,548,544B。
+private sidecar 仍为 2,113,664B，private non-split/split
+`SchedulerState` 仍分别为 1,007,115,968B 和 1,007,122,112B。两次尾部
+追加都不移动此前字段，Vector 热路径仍使用 `task_id%8`；sidecar 仍位于
 standalone 控制区和 `results` 之后，不移动 `WorkerState`、`RunConfig`
-或既有结果字段。普通 PA 仍走专用 writer-chain，不调用 generic
-WriterIntentSet，host 要求 history 整表保持零；所以 R4c 增加的是分配与
-启动期搬运长度，不改变 PA Submit 热路径。S4.15a 历史候选曾在末尾追加
-512B Cube cursor，但已因性能门槛未通过而撤销，不属于当前传输布局。
+或既有结果字段。
+
+`reader_done[worker]=D` 表示该 worker 已经结束 task `[0,D]` 的全部
+ordinary-ring 读取，初值为 -1，只允许 CAS `D-1 -> D`。最慢完成值为
+`Dmin` 时，inclusive 回收候选为 `max(-1,Dmin-H)`。这与设计文档写的
+`R=min_progress-H-1` 并不矛盾：这里的下一任务进度
+`min_progress=Dmin+1`。R4e-a 只建立独立状态、严格 CAS 和纯公式 CPU
+门槛；普通 PA 仍走专用 writer-chain，不发布 `reader_done`，host 反向
+要求 96 条线保持 -1，region ring 也仍不启用运行时回收。A5 上的
+“ordinary 读取完成 -> reader_done 发布”顺序及跨核可见性要由后续独立
+门槛闭合，不能由当前 CPU 结果外推。
+
+S4.15a 历史候选曾在末尾追加 512B Cube cursor，但已因性能门槛未通过而
+撤销，不属于当前传输布局。
 
 S4.16a 的历史布局曾保持
 `shared_vector_cursor` 起点 4,735,680B、前八条线地址和热路径
@@ -363,9 +378,11 @@ S4.16b 第一层性能门槛失败；这些数字只属于历史候选，不是�
 
 每 task 最多八个 fresh output，以 16B
 `FdwicOutputRef` 表达 `(producer_task_id, output_slot)`，返回句柄为
-8B `SharedTaskOutputs`。当前构建身份 ABI generation 为 7；其中
-generation 7 的通用 history 仍是独立门槛能力，不能据此声称 PA 热路径
-已经从专用 writer-chain 迁到通用 WriterIntentSet。
+8B `SharedTaskOutputs`。当前构建身份 ABI generation 为 8。通用
+history 能力由 generation 7 引入，generation 8 只在其后追加
+`reader_done` 并重建同一 history 门槛；两项仍都是独立门槛能力，不能
+据此声称 PA 热路径已经迁到通用 WriterIntentSet 或 reader-progress
+reclaim。
 
 当前 shared 已完成 winner-only 重构参与 Materialize：所有 worker 仍先
 Claim 并独立声明同一组 output symbol；Alloc 暂时保留每核三个静态 Output
@@ -521,7 +538,8 @@ build/ccec/shared/history-litmus/
 不会进入正式 mixed ELF。该门槛只证明 symbol history 可见性，不证明
 ordinary region 的 reader-progress/reclaim 已完成。
 history-litmus 自身虽是 CCEC mixed ELF，但没有定义 split-finish，因此其
-GM `SchedulerState` 使用 non-split 大小 1,019,536,256B。
+GM `SchedulerState` 使用当前 generation-8 non-split 大小
+1,019,542,400B；它会校验新追加的 96 条 `reader_done` 始终保持 -1。
 
 shared sidecar 的 atomic 当前会计入既有 Submit/业务阶段时间，但 heap
 cursor/vend、symbol writer/published 等尚未逐条接入 atomic 泳道 wrapper；
@@ -1811,9 +1829,11 @@ ClockBaseline，并继续以逐核容量、调用数、总记录数和 `dropped=
 `64 * 96 = 6,144` bytes。split ELF 另预留 AIC/AIV 两个 role-specific
 block-local runtime state，每个精确 1,664 bytes、最终 section 合计
 3,328 bytes；它们不属于 GM `SchedulerState`。以上 `SchedulerState` 数字
-是 private 模式；当前 R4c shared sidecar 为 12,420,288 bytes，故 CPU
-non-split 与定义 `PA_COMPETE_FIRST_SPLIT_FINISH` 的 CCEC 变体总大小分别为
-1,019,536,256/1,019,542,400 bytes；swimlane、perf-clock 以及
+是 private 模式。R4c 的 shared sidecar 历史大小为 12,420,288 bytes；
+R4e-a 追加 96 条 reader-progress cache line 后，当前 generation-8
+sidecar 为 12,426,432 bytes。因此 CPU non-split 与定义
+`PA_COMPETE_FIRST_SPLIT_FINISH` 的 CCEC 变体总大小分别为
+1,019,542,400/1,019,548,544 bytes；swimlane、perf-clock 以及
 submit-PMU none/claim/efdrain 使用后者，submit-PMU
 materialize/register 和独立 history-litmus 使用 non-split 大小。既有
 production prefix 和
@@ -1828,8 +1848,8 @@ S4.16a 的 host/device `sizeof(SchedulerState)` 握手、manifest 校验和
 字节数碰巧相同就混用产物；冻结件及配对路径见
 `shared_tensormap_record.md`。S4.16b 沿用相同历史大小并闭合正确性，
 但第一层性能门槛失败；当前源码保留 S4.14b 的八分片热路径，同时在尾部
-纳入 S6.3 的 output table 扩容并追加 R4c history，不能再把当前传输长度
-写成“恢复 S4.14b”。
+纳入 S6.3 的 output table 扩容、R4c history 和 R4e-a
+`reader_done[96]`，不能再把当前传输长度写成“恢复 S4.14b”。
 
 独立的 64 bytes PMU 配置和 64 bytes winner workload 配置各占一条
 cache line；二者都位于完整生产 DistGlobal 镜像之后，生产 DistGlobal/

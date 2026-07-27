@@ -209,6 +209,9 @@ void ResetSharedState(SharedTensorMapSidecar &map) {
             map.shared_outputs[task].last_writer[slot].value = -1;
         }
     }
+    for (uint32_t worker = 0; worker < kWorkers; ++worker) {
+        map.reader_done[worker].value = -1;
+    }
 }
 
 SchedulerState *MapSparseSchedulerState() {

@@ -17,7 +17,7 @@ namespace pa_scheduler::history_litmus {
 
 constexpr uint32_t kControlMagic = 0x4853544CU;
 constexpr uint32_t kControlVersion = 1;
-constexpr uint32_t kSharedAbiGeneration = 7;
+constexpr uint32_t kSharedAbiGeneration = 8;
 constexpr uint32_t kSymbolCount = 7;
 constexpr uint64_t kResultMagic = 0x484953544F525900ULL;
 static_assert(

@@ -761,6 +761,12 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     for (uint32_t shard = 0; shard < kSharedVectorCursorCapacity; ++shard) {
         state->shared_map.shared_vector_cursor[shard].value = -1;
     }
+    // reader_done 是“ordinary 读取已经关闭”的完成前沿，不是 task 分配
+    // 游标；-1 表示本 worker 尚未关闭 task 0。R4e-a 尚未接入 PA 热路径，
+    // 因此真实 PA 回放后 host 还会要求 96 条线全部保持该初值。
+    for (uint32_t worker = 0; worker < kWorkers; ++worker) {
+        state->shared_map.reader_done[worker].value = -1;
+    }
 #endif
     state->heap_window = kHeapWindow;
     state->heap_base = kSyntheticHeapBase;
@@ -841,7 +847,7 @@ inline constexpr size_t ResultBytes() { return sizeof(WorkerResult) * kWorkers; 
 
 inline constexpr size_t SharedSidecarBytes() { return sizeof(SharedTensorMapSidecar); }
 #if PTO_FDWIC_SHARED_MAP
-static_assert(SharedSidecarBytes() == 12420288, "shared TensorMap transfer size changed");
+static_assert(SharedSidecarBytes() == 12426432, "shared TensorMap transfer size changed");
 #else
 static_assert(SharedSidecarBytes() == 2113664, "private TensorMap transfer size changed");
 #endif
@@ -2144,6 +2150,10 @@ inline SharedTensorMapValidation ValidateSharedTensorMap(
             &map.writer_history[task], &zero_history,
             sizeof(zero_history)
         ) == 0;
+    }
+    for (uint32_t worker = 0; worker < kWorkers; ++worker) {
+        validation.protocol_ok &=
+            map.reader_done[worker].value == -1;
     }
     return validation;
 }

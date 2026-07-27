@@ -72,7 +72,7 @@ constexpr TensorMapBuildMode kCompiledTensorMapMode =
     static_cast<TensorMapBuildMode>(PTO_FDWIC_SHARED_MAP);
 constexpr uint32_t kBuildIdentityMagic = 0x50414249U;  // "PABI"
 #if PTO_FDWIC_SHARED_MAP
-constexpr uint32_t kBuildIdentityAbiGeneration = 7;
+constexpr uint32_t kBuildIdentityAbiGeneration = 8;
 #else
 constexpr uint32_t kBuildIdentityAbiGeneration = 4;
 #endif
@@ -988,11 +988,29 @@ struct alignas(64) SharedTensorMapSidecar {
     // 热点控制字。当前 task id 在一轮内不复用，因此 history 不取模；
     // 1.33 MiB 增量只影响启动期整块搬运，不改变 Submit 内旧字段地址。
     SharedWriterHistoryCell writer_history[kMaxTasks];
+    // ordinary reader 的完成前沿不能复用 WorkerState::local_index：后者在
+    // 读取前就会推进，且 96 个字段分散在近 1 GiB 的 per-worker arena。
+    // 每个 worker 独占一条连续 cache line；初值 -1，值 N 只表示该 worker
+    // 已关闭 task [0,N] 的全部 ordinary-ring 读取。R4e-a 只建立状态与
+    // 纯公式门槛，尚不从 PA 或通用 Submit 热路径发布该字段。
+    AtomicLine reader_done[kWorkers];
 #endif
 };
 #if PTO_FDWIC_SHARED_MAP
+static_assert(
+    offsetof(SharedTensorMapSidecar, reader_done) ==
+        offsetof(SharedTensorMapSidecar, writer_history) +
+            sizeof(SharedWriterHistoryCell) * kMaxTasks,
+    "shared reader progress must immediately follow writer history"
+);
+static_assert(
+    sizeof(SharedTensorMapSidecar) ==
+        offsetof(SharedTensorMapSidecar, reader_done) +
+            sizeof(AtomicLine) * kWorkers,
+    "shared reader progress must remain the sidecar tail"
+);
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
-static_assert(sizeof(SharedTensorMapSidecar) == 12420288, "shared TensorMap sidecar size changed");
+static_assert(sizeof(SharedTensorMapSidecar) == 12426432, "shared TensorMap sidecar size changed");
 static_assert(
     offsetof(SharedTensorMapSidecar, shared_outputs) == 2113664,
     "shared output table offset mismatch"
@@ -1012,6 +1030,10 @@ static_assert(
 static_assert(
     offsetof(SharedTensorMapSidecar, writer_history) == 11027648,
     "shared writer-history tail offset mismatch"
+);
+static_assert(
+    offsetof(SharedTensorMapSidecar, reader_done) == 12420288,
+    "shared reader-progress tail offset mismatch"
 );
 #endif
 #else
@@ -1414,6 +1436,19 @@ static_assert(
         offsetof(SchedulerState, results) + sizeof(WorkerResult) * kWorkers,
     "shared TensorMap sidecar must follow the complete result array"
 );
+#if PTO_FDWIC_TENSORMAP_RING_CAP == 128
+#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+static_assert(
+    sizeof(SchedulerState) == 1019548544,
+    "shared split SchedulerState ABI changed"
+);
+#else
+static_assert(
+    sizeof(SchedulerState) == 1019542400,
+    "shared non-split SchedulerState ABI changed"
+);
+#endif
+#endif
 #endif
 static_assert(sizeof(SchedulerState) <= UINT32_MAX, "SchedulerState size must fit build identity");
 

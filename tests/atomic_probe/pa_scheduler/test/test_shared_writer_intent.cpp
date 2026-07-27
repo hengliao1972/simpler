@@ -197,6 +197,9 @@ void ResetProtocolState(SchedulerState &state) {
         state.shared_map.slots[slot].seq.value =
             kSharedMapEmptySeq;
     }
+    for (uint32_t worker = 0; worker < kWorkers; ++worker) {
+        state.shared_map.reader_done[worker].value = -1;
+    }
 }
 
 void ResetTaskGate(SchedulerState &state, int32_t task_id) {
@@ -246,6 +249,270 @@ bool WaitUntilTrue(std::atomic<bool> &value) {
         std::this_thread::yield();
     }
     return true;
+}
+
+int64_t LoadReaderDone(
+    SchedulerState &state, uint32_t worker
+) {
+    return WriterIntentTestOps::Load(
+        &state.shared_map.reader_done[worker].value
+    );
+}
+
+void StoreReaderDone(
+    SchedulerState &state, uint32_t worker, int64_t value
+) {
+    __atomic_store_n(
+        &state.shared_map.reader_done[worker].value,
+        value, __ATOMIC_RELEASE
+    );
+}
+
+void TestReaderProgressStateMachine(SchedulerState &state) {
+    bool reset_ok = true;
+    for (uint32_t worker = 0; worker < kWorkers; ++worker) {
+        reset_ok &= LoadReaderDone(state, worker) == -1;
+    }
+    Check(reset_ok, "all reader progress lines start at -1");
+
+    Check(
+        SharedAdvanceReaderDone<WriterIntentTestOps>(
+            state.shared_map, 0, 0
+        ),
+        "reader progress accepts the exact -1 to 0 transition"
+    );
+    Check(
+        !SharedAdvanceReaderDone<WriterIntentTestOps>(
+            state.shared_map, 0, 0
+        ) &&
+            LoadReaderDone(state, 0) == 0,
+        "reader progress rejects a duplicate without overwriting"
+    );
+    Check(
+        !SharedAdvanceReaderDone<WriterIntentTestOps>(
+            state.shared_map, 0, 2
+        ) &&
+            LoadReaderDone(state, 0) == 0,
+        "reader progress rejects a skipped task without overwriting"
+    );
+    Check(
+        SharedAdvanceReaderDone<WriterIntentTestOps>(
+            state.shared_map, 0, 1
+        ),
+        "reader progress accepts the next contiguous task"
+    );
+    Check(
+        !SharedAdvanceReaderDone<WriterIntentTestOps>(
+            state.shared_map, 0, 0
+        ) &&
+            LoadReaderDone(state, 0) == 1,
+        "reader progress rejects a backward task without overwriting"
+    );
+
+    StoreReaderDone(
+        state, 1, static_cast<int64_t>(kMaxTasks) - 2
+    );
+    Check(
+        SharedAdvanceReaderDone<WriterIntentTestOps>(
+            state.shared_map, 1,
+            static_cast<int32_t>(kMaxTasks) - 1
+        ) &&
+            LoadReaderDone(state, 1) ==
+                static_cast<int64_t>(kMaxTasks) - 1,
+        "reader progress accepts the last task in the shared task domain"
+    );
+    const int64_t worker0_before = LoadReaderDone(state, 0);
+    Check(
+        !SharedAdvanceReaderDone<WriterIntentTestOps>(
+            state.shared_map, kWorkers, 0
+        ),
+        "reader progress rejects an out-of-range worker"
+    );
+    Check(
+        !SharedAdvanceReaderDone<WriterIntentTestOps>(
+            state.shared_map, 0, -1
+        ),
+        "reader progress rejects a negative task"
+    );
+    Check(
+        !SharedAdvanceReaderDone<WriterIntentTestOps>(
+            state.shared_map, 0,
+            static_cast<int32_t>(kMaxTasks)
+        ),
+        "reader progress rejects a task above the shared domain"
+    );
+    Check(
+        LoadReaderDone(state, 0) == worker0_before,
+        "reader progress bounds failures do not touch state"
+    );
+
+    for (uint32_t worker = 0; worker < kWorkers; ++worker) {
+        StoreReaderDone(state, worker, -1);
+    }
+    const int32_t targets[] = {9, 5, 8};
+    bool sequence_ok = true;
+    for (uint32_t worker = 0; worker < 3; ++worker) {
+        for (int32_t task = 0; task <= targets[worker]; ++task) {
+            sequence_ok &=
+                SharedAdvanceReaderDone<WriterIntentTestOps>(
+                    state.shared_map, worker, task
+                );
+        }
+    }
+    Check(
+        sequence_ok,
+        "three active readers publish contiguous completion sequences"
+    );
+
+    // active worker 是连续前缀；前缀之外的脏值不得参与最小值。
+    StoreReaderDone(state, 3, -2);
+    int64_t candidate = -77;
+    Check(
+        SharedComputeReaderReclaimCandidate<WriterIntentTestOps>(
+            state.shared_map, 3, 0, candidate
+        ) &&
+            candidate == 5,
+        "H=0 exposes the exact active-prefix minimum"
+    );
+    candidate = -77;
+    Check(
+        SharedComputeReaderReclaimCandidate<WriterIntentTestOps>(
+            state.shared_map, 3, 2, candidate
+        ) &&
+            candidate == 3,
+        "reader minimum 5 and H=2 produce inclusive reclaim 3"
+    );
+    candidate = -77;
+    Check(
+        !SharedComputeReaderReclaimCandidate<WriterIntentTestOps>(
+            state.shared_map, 4, 2, candidate
+        ) &&
+            candidate == -77,
+        "an invalid active progress line fails without changing output"
+    );
+
+    Check(
+        SharedAdvanceReaderDone<WriterIntentTestOps>(
+            state.shared_map, 0, 10
+        ) &&
+            SharedAdvanceReaderDone<WriterIntentTestOps>(
+                state.shared_map, 2, 9
+            ),
+        "faster readers may move without changing the slow frontier"
+    );
+    candidate = -77;
+    Check(
+        SharedComputeReaderReclaimCandidate<WriterIntentTestOps>(
+            state.shared_map, 3, 2, candidate
+        ) &&
+            candidate == 3,
+        "faster-reader progress leaves the slow-reader reclaim unchanged"
+    );
+    Check(
+        SharedAdvanceReaderDone<WriterIntentTestOps>(
+            state.shared_map, 1, 6
+        ),
+        "the slow reader advances by one task"
+    );
+    candidate = -77;
+    Check(
+        SharedComputeReaderReclaimCandidate<WriterIntentTestOps>(
+            state.shared_map, 3, 2, candidate
+        ) &&
+            candidate == 4,
+        "the reclaim candidate advances only with the slow reader"
+    );
+
+    StoreReaderDone(
+        state, 1, static_cast<int64_t>(kMaxTasks)
+    );
+    candidate = -77;
+    Check(
+        !SharedComputeReaderReclaimCandidate<WriterIntentTestOps>(
+            state.shared_map, 3, 2, candidate
+        ) &&
+            candidate == -77,
+        "reader progress above the task domain fails without output"
+    );
+    StoreReaderDone(state, 1, 6);
+    candidate = -77;
+    Check(
+        !SharedComputeReaderReclaimCandidate<WriterIntentTestOps>(
+            state.shared_map, 0, 2, candidate
+        ) &&
+            candidate == -77,
+        "reader reclaim rejects an empty active prefix without output"
+    );
+    candidate = -77;
+    Check(
+        !SharedComputeReaderReclaimCandidate<WriterIntentTestOps>(
+            state.shared_map, kWorkers + 1, 2, candidate
+        ) &&
+            candidate == -77,
+        "reader reclaim rejects an oversized active prefix without output"
+    );
+    candidate = -77;
+    Check(
+        !SharedComputeReaderReclaimCandidate<WriterIntentTestOps>(
+            state.shared_map, 3, -1, candidate
+        ) &&
+            candidate == -77,
+        "reader reclaim rejects a negative window without output"
+    );
+    candidate = -77;
+    Check(
+        SharedComputeReaderReclaimCandidate<WriterIntentTestOps>(
+            state.shared_map, 3, INT32_MAX, candidate
+        ) &&
+            candidate == -1,
+        "a very wide legal window clamps the reclaim candidate to -1"
+    );
+
+    // BeginCallbackSubmit 会在 task 读取前推进 local_index。即使该普通字段
+    // 已到 6，task 5 的 ordinary lookup 仍可能尚未结束；真正完成前沿 4
+    // 在 H=2 时只能回收到 2，不能按 local_index 推到 3/4。
+    for (uint32_t worker = 0; worker < kWorkers; ++worker) {
+        StoreReaderDone(state, worker, -1);
+    }
+    bool local_progress_ok = true;
+    for (int32_t task = 0; task <= 4; ++task) {
+        local_progress_ok &=
+            SharedAdvanceReaderDone<WriterIntentTestOps>(
+                state.shared_map, 0, task
+            );
+    }
+    Check(
+        local_progress_ok,
+        "local-index counterexample prepares reader completion"
+    );
+    const int32_t saved_local_index =
+        state.workers[0].local_index;
+    state.workers[0].local_index = 5;
+    SubmitContext context{};
+    BeginCallbackSubmit(state.workers[0], context);
+    Check(
+        context.task_id == 5 &&
+            state.workers[0].local_index == 6,
+        "BeginCallbackSubmit advances local_index before task-5 reads"
+    );
+    candidate = -77;
+    Check(
+        SharedComputeReaderReclaimCandidate<WriterIntentTestOps>(
+            state.shared_map, 1, 2, candidate
+        ) &&
+            candidate == 2,
+        "reader reclaim is independent of the pre-read local_index"
+    );
+    state.workers[0].local_index = 100;
+    candidate = -77;
+    Check(
+        SharedComputeReaderReclaimCandidate<WriterIntentTestOps>(
+            state.shared_map, 1, 2, candidate
+        ) &&
+            candidate == 2,
+        "changing local_index cannot move the reader completion frontier"
+    );
+    state.workers[0].local_index = saved_local_index;
 }
 
 FdwicOutputRef PublishSingleTestSymbol(
@@ -901,6 +1168,8 @@ int main() {
         return 1;
     }
     ResetProtocolState(*state);
+    TestReaderProgressStateMachine(*state);
+    ResetProtocolState(*state);
     TestSymbolWriterIntentChain(*state);
     TestOrdinaryWriterIntentChain(*state);
     TestOrdinaryWriterRangeValidation();
@@ -918,8 +1187,8 @@ int main() {
         return 1;
     }
     std::printf(
-        "[PASS] generic shared symbol history, terminal-prefix, "
-        "and ordinary writer-intent tests\n"
+        "[PASS] generic shared reader progress, symbol history, "
+        "terminal-prefix, and ordinary writer-intent tests\n"
     );
     return 0;
 }

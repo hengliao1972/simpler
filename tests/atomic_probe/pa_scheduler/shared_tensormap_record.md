@@ -8729,3 +8729,136 @@ CPU 首次误用本用户 plucky GCC 15 搭配系统 binutils 2.42，汇编器�
   reader-progress reclaim 已完成；
 - 下一步先设计 ordinary reader 进度的独立 cache-line 发布协议，再做
   A→B→慢 reader→未来 writer→回收门槛，最后才迁移 PA 并删除专用分支。
+
+### 2026-07-27：R4e-a 建立独立 ordinary reader 完成前沿
+
+R4b 曾尝试从有序 writer turn 直接推导 ordinary ring 的安全回收上界，
+但 writer 已按 task 排序并不等于所有 reader 已经结束。R4e-a 先只解决
+“如何表达并验证 reader 已完成到哪里”这一项，不同时打开回收、改写通用
+Submit 或迁移真实 PA。
+
+#### 为什么不能复用 `WorkerState::local_index`
+
+`local_index` 是 task 分配/回放游标，不是 reader 完成前沿。
+`BeginCallbackSubmit()` 的第一步就是：
+
+```cpp
+const uint32_t task_id =
+    static_cast<uint32_t>(worker.local_index++);
+```
+
+此时该 task 的 Claim、参数构造、fanin 和 ordinary-ring lookup 都还没有
+发生。把 `local_index` 或 `local_index-1` 当成 reader 完成值，会在当前
+task 仍可能读取旧 producer 时提前回收。此外，96 个 `local_index` 分散在
+约 887MiB 的 worker arena 内，是普通 `int32_t`，没有独占 cache line、
+atomic 发布或 A5 DCache 可见性合同。
+
+因此 shared sidecar 尾部新增：
+
+```cpp
+AtomicLine reader_done[kWorkers];
+```
+
+每个 worker 独占 64B，初值为 -1；`reader_done[worker]=D` 只表示该
+worker 已关闭 task `[0,D]` 的全部 ordinary-ring 读取。当前普通 PA 没有
+调用发布原语，host 会反向要求所有 96 条线在运行后仍为 -1。
+
+#### 单调发布与回收候选
+
+`SharedAdvanceReaderDone<Ops>()` 只允许单次 CAS：
+
+```text
+expected = task_id - 1
+desired  = task_id
+```
+
+CAS 返回 observed；只有 `observed==expected` 才成功。重复、跳号和倒退
+都失败且不覆写现值，worker/task 越界在 atomic 前拒绝。原语自身不设置
+`fatal`：以后运行期调用者必须在拥有 `SchedulerState` 和 worker 上下文的
+层次统一终止，不能让底层 helper 猜测故障归属。
+
+活跃 worker 是连续前缀 `[0,active_workers)`。聚合 helper 只读取此前缀，
+要求每个值都在 `[-1,kMaxTasks)`，先在局部变量中完成全量校验，成功后才
+写输出。令最慢完成值为 `Dmin`、依赖窗口为 `H`，inclusive 安全回收上界为：
+
+```text
+candidate = max(-1, Dmin - H)
+```
+
+推导为：所有 worker 已完成到 `Dmin` 后，最早尚可能读取的 task 是
+`Dmin+1`；其 lookup 下界为 `Dmin+1-H`，故该下界之前的最后一个 producer
+是 `Dmin-H`。设计文档使用的
+`R=min_progress-H-1` 以“下一 task 进度”为口径，而这里
+`min_progress=Dmin+1`，两式等价。示例
+`reader_done={9,5,8}, H=2` 的最小值为 5，候选精确为 3；不能沿用旧
+current-task 口径再多减 1。
+
+扫描不需要同一时刻的一致快照：每条线只有对应 worker 单写并严格单调，
+逐行 load 得到的混合快照至多更保守，不会把尚未发布的 reader 进度凭空
+提前。该结论只覆盖状态机；A5 上真正使用前仍必须证明 ordinary 普通读取
+不能被编译器或设备重排到 `reader_done` 发布之后。
+
+#### ABI 与初始化
+
+新数组严格追加在 `writer_history` 之后，不移动任何既有字段：
+
+| 项目 | generation 8 当前值 |
+| --- | ---: |
+| `writer_history` offset | 11,027,648B |
+| `reader_done` offset | 12,420,288B |
+| `reader_done[96]` | 6,144B |
+| shared sidecar | 12,426,432B |
+| shared non-split `SchedulerState` | 1,019,542,400B |
+| shared split `SchedulerState` | 1,019,548,544B |
+
+默认 CAP=128 的 shared build identity 从 generation 7 升到 8；
+private generation 4、2,113,664B sidecar 以及
+1,007,115,968/1,007,122,112B non-split/split `SchedulerState` 全部
+不变。host 正式初始化、ring/symbol fixture 和 history-litmus 专用 host
+都显式写入 96 个 -1，不依赖 sidecar `memset(0)`。history manifest 从
+被 C++ `static_assert` 绑定当前 build identity 的共享头读取 generation 8，
+旧 generation-7 artifact 会在启动前被拒绝。
+
+#### CPU 门槛与设备边界
+
+CPU 门槛复用现有 `test_shared_writer_intent.cpp` 和
+`WriterIntentTestOps`，没有再造一份 Ops 或测试 executable。它覆盖：
+
+- 96 条线的 -1 初值；
+- `-1->0->1` 连续发布，以及重复、跳号、倒退不覆写；
+- 最后一个合法 task、worker/task 参数边界；
+- 三个 active reader 的最小值、inactive 脏值忽略和 active 脏值拒绝；
+- 快 reader 单独前进不改变候选，慢 reader 前进才推动候选；
+- 非法 worker count、负窗口、非法进度都不污染输出；
+- `BeginCallbackSubmit` 真实把 task 5 的 `local_index` 推到 6 时，
+  `reader_done=4,H=2` 仍只得到 candidate 2。
+
+本阶段的验证结果为：
+
+| 检查 | 结果 |
+| --- | --- |
+| CPU shared 五种 ring CAP 与全部公共自测 | PASS |
+| CPU private 五种 ring CAP 与公共自测 | PASS，private ABI 未改变 |
+| CCEC shared 既有 generic probe、AIC/AIV、split finish、mixed ELF、manifest | PASS；新 reader helper 尚未显式实例化 |
+| generation-8 history mixed ELF 重建 | PASS |
+| AIC writers→AIV reader，新 host 进程 1 次 | PASS |
+| AIV writers→AIC reader，新 host 进程 1 次 | PASS |
+| history 门槛保持 ordinary ring 与 96 条 progress 线不变 | PASS |
+| `git diff --check` | PASS |
+
+R4d 的 generation-7 20×2 上板结果仍是当时 symbol-history 可见性的历史
+证据；本轮 1×2 只验证 ABI 尾部变化、重新生成的 artifact 身份和既有
+symbol 路径未受影响，不能冒充 reader-progress 的 A5 发布门槛。
+
+#### 本阶段明确没有完成的事项
+
+- 没有从 PA 或 generic Submit 发布 `reader_done`；
+- 没有用 candidate 更新 `reclaim_upto`、bucket head 或复用任何 slot；
+- 没有改变 `CommitOrdinarySharedWriterIntent()` 的 append-only 行为；
+- 没有证明 A5 ordinary read、DCCI 与 progress CAS 的 compiler/device
+  顺序；
+- 没有解决 ordered append actor 与未来回收的完整组合。
+
+下一阶段用满桶和慢 reader 的确定性交错证明“未关闭 reader 时绝不复用，
+关闭并越过 H 后才可回收”；随后才增加独立 CCEC/A5 reader→reclaimer
+可见性门槛。

@@ -176,6 +176,10 @@ void InitializeState(
     );
     state->fatal.value = 0;
     state->heap_window = pa_scheduler::kHeapWindow;
+    for (uint32_t worker = 0;
+         worker < pa_scheduler::kWorkers; ++worker) {
+        state->shared_map.reader_done[worker].value = -1;
+    }
 
     ResetTaskGate(state, chain.writer_b);
     ResetTaskGate(state, chain.writer_d);
@@ -359,9 +363,14 @@ bool Validate(
             state.shared_map.buckets[bucket].head.value == 0 &&
             state.shared_map.buckets[bucket].tail.value == 0;
     }
+    for (uint32_t worker = 0;
+         worker < pa_scheduler::kWorkers; ++worker) {
+        ordinary_ring_untouched &=
+            state.shared_map.reader_done[worker].value == -1;
+    }
     passed &= Expect(
         ordinary_ring_untouched,
-        "symbol history litmus does not enter the ordinary region ring"
+        "symbol history litmus leaves ordinary ring/progress untouched"
     );
     return passed;
 }

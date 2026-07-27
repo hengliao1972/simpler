@@ -128,10 +128,10 @@ PA_DEVICE int32_t SharedLookupTensor(
 }
 
 // append 至少要求唯一、按 task_id 单调推进的 writer；exact turn 与
-// writer-ready replay 都可建立 writer 顺序。真正推进 head 还必须证明
-// 更早 reader 已结束；当前只有 exact-turn 路径具备该前提，通用 intent
-// 固定传 reclaim_upto=-1。多个无序 writer 或无 reader 前沿的回收都不
-// 属于本实现契约。
+// writer-ready replay 都可建立 writer 顺序。真正推进 head 还必须由
+// reader_done 证明所有更早 reader 已结束；仅有 writer exact turn 并不能
+// 证明这一点。通用 intent 仍固定传 reclaim_upto=-1，R4e-a 只先建立
+// reader progress 状态与纯公式，不打开任何运行时回收。
 template <typename Ops>
 PA_DEVICE bool SharedRetireBucket(
     PA_GM SharedTensorMapSidecar &map, uint32_t bucket, int64_t reclaim_upto
@@ -167,9 +167,66 @@ PA_DEVICE bool SharedRetireBucket(
     return observed == original_head;
 }
 
-// winner N 持有 committed_tasks==N 的唯一 append turn。它已经完成本任务
-// 的全部 lookup，后续任务最早只会读取 producer>=N-H，因此 N-H-1 可按
-// inclusive 上界回收。用 int64_t 计算，避免 int32_t 边界减法溢出。
+#if PTO_FDWIC_SHARED_MAP
+// reader_done[worker]=N 表示该 worker 已经关闭 task [0,N] 的全部
+// ordinary-ring 读取。CAS 只允许 N-1 -> N，重复、跳号和倒退都保留旧值；
+// 调用方必须先证明本 task 后续不会再访问 ring，并在 A5 接线前另外闭合
+// “读取完成 -> CAS”的编译器/设备顺序。R4e-a 本身不从 PA 热路径调用。
+template <typename Ops>
+PA_DEVICE bool SharedAdvanceReaderDone(
+    PA_GM SharedTensorMapSidecar &map, uint32_t worker,
+    int32_t task_id
+) {
+    if (worker >= kWorkers || task_id < 0 ||
+        task_id >= static_cast<int32_t>(kMaxTasks)) {
+        return false;
+    }
+    const int64_t expected =
+        static_cast<int64_t>(task_id) - 1;
+    return Ops::CompareExchange(
+               &map.reader_done[worker].value,
+               expected, static_cast<int64_t>(task_id)
+           ) == expected;
+}
+
+// 对连续 active worker 前缀取最慢完成值 Dmin。窗口 H 允许未来 reader
+// 查询 producer >= current_task-H；因此所有 worker 都完成到 Dmin 后，
+// inclusive 安全回收上界是 max(-1,Dmin-H)。inactive worker 不参与最小值。
+// 任一非法进度都 fail-closed，且失败时不修改 candidate。
+template <typename Ops>
+PA_DEVICE bool SharedComputeReaderReclaimCandidate(
+    PA_GM SharedTensorMapSidecar &map, uint32_t active_workers,
+    int32_t heap_window, int64_t &candidate
+) {
+    if (active_workers == 0 || active_workers > kWorkers ||
+        heap_window < 0) {
+        return false;
+    }
+    int64_t minimum_done = INT64_MAX;
+    for (uint32_t worker = 0; worker < active_workers; ++worker) {
+        const int64_t done =
+            Ops::Load(&map.reader_done[worker].value);
+        if (done < -1 ||
+            done >= static_cast<int64_t>(kMaxTasks)) {
+            return false;
+        }
+        if (done < minimum_done) {
+            minimum_done = done;
+        }
+    }
+    int64_t computed =
+        minimum_done - static_cast<int64_t>(heap_window);
+    if (computed < -1) {
+        computed = -1;
+    }
+    candidate = computed;
+    return true;
+}
+#endif
+
+// 以下 current_task 公式只保留给既有单线程 ordered-ring 隔离 driver，
+// 不能作为 generic 多 reader 回收依据。真实接线必须改用上面的最慢
+// reader_done 公式，并同时保持唯一 ordered append actor。
 PA_DEVICE bool SharedComputeOrderedReclaimCandidate(
     int32_t current_task, int32_t heap_window, int64_t &candidate
 ) {

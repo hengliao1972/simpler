@@ -59,7 +59,7 @@ static_assert(offsetof(SharedRegionSlot, seq) == 64, "shared seq cache line offs
 static_assert(sizeof(SharedBucketState) == 128, "shared bucket control ABI changed");
 static_assert(offsetof(SharedBucketState, tail) == 64, "shared head/tail cache lines merged");
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
-static_assert(sizeof(SharedTensorMapSidecar) == 12420288, "shared sidecar ABI changed");
+static_assert(sizeof(SharedTensorMapSidecar) == 12426432, "shared sidecar ABI changed");
 #endif
 static_assert(alignof(SharedTensorMapSidecar) == 64, "shared sidecar alignment changed");
 static_assert(offsetof(SharedTensorMapSidecar, buckets) == 128, "shared bucket offset changed");
@@ -74,6 +74,13 @@ static_assert(
         offsetof(SharedTensorMapSidecar, slots) +
         sizeof(SharedRegionSlot) * kMapCapacity,
     "shared output table must immediately follow the fixed 16K slot pool"
+);
+static_assert(
+    offsetof(SharedTensorMapSidecar, reader_done) ==
+        offsetof(SharedTensorMapSidecar, writer_history) +
+            sizeof(pa_scheduler::SharedWriterHistoryCell) *
+                pa_scheduler::kMaxTasks,
+    "shared reader progress must immediately follow writer history"
 );
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
 static_assert(offsetof(SharedTensorMapSidecar, slots) == 16512, "default shared slot offset changed");
@@ -90,6 +97,10 @@ static_assert(
 static_assert(
     offsetof(SharedTensorMapSidecar, writer_history) == 11027648,
     "default shared writer-history offset changed"
+);
+static_assert(
+    offsetof(SharedTensorMapSidecar, reader_done) == 12420288,
+    "default shared reader-progress offset changed"
 );
 #endif
 
@@ -243,6 +254,10 @@ void ResetSharedTensorMap(SharedTensorMapSidecar &map) {
         map.writer_history[task].writer_task = 0;
         map.writer_history[task].count = 0;
         map.writer_history[task].reserved = 0;
+    }
+    for (uint32_t worker = 0;
+         worker < pa_scheduler::kWorkers; ++worker) {
+        StoreControl(&map.reader_done[worker].value, -1);
     }
 }
 
@@ -415,6 +430,13 @@ void TestAbiResetAndZeroEntryCommit() {
     for (uint32_t slot = 0; slot < kMapCapacity; ++slot) {
         if (LoadControl(&map->slots[slot].seq.value) != kSharedMapEmptySeq) {
             Expect(false, kTest, "slot seq reset");
+            break;
+        }
+    }
+    for (uint32_t worker = 0;
+         worker < pa_scheduler::kWorkers; ++worker) {
+        if (LoadControl(&map->reader_done[worker].value) != -1) {
+            Expect(false, kTest, "reader progress reset");
             break;
         }
     }
