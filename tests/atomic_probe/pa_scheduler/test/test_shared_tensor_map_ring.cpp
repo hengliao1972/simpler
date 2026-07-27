@@ -623,6 +623,7 @@ void TestAbiResetAndZeroEntryCommit() {
     );
     ExpectEqual(LoadControl(&map->committed_tasks.value), 2, kTest, "empty commit sequencer");
     ExpectEqual(LoadControl(&map->reclaim_upto.value), -1, kTest, "empty commit reclaim");
+    RecordingOps::ResetEvents();
     Expect(
         !SharedPublishTaskCommit<RecordingOps>(*map, 1),
         kTest, "repeated commit is rejected"
@@ -631,7 +632,19 @@ void TestAbiResetAndZeroEntryCommit() {
         LoadControl(&map->committed_tasks.value), 2, kTest,
         "repeated commit preserves the advanced frontier"
     );
+    Expect(
+        RecordingOps::events.size() == 1 &&
+            RecordingOps::events[0].kind ==
+                EventKind::CompareExchange &&
+            RecordingOps::events[0].address ==
+                &map->committed_tasks.value &&
+            RecordingOps::events[0].argument == 2 &&
+            RecordingOps::events[0].result == 2,
+        kTest,
+        "repeated commit performs one non-mutating CAS"
+    );
     StoreControl(&map->committed_tasks.value, 0);
+    RecordingOps::ResetEvents();
     Expect(
         !SharedPublishTaskCommit<RecordingOps>(*map, 1),
         kTest, "future commit is rejected"
@@ -639,6 +652,17 @@ void TestAbiResetAndZeroEntryCommit() {
     ExpectEqual(
         LoadControl(&map->committed_tasks.value), 0, kTest,
         "future commit preserves the earlier frontier"
+    );
+    Expect(
+        RecordingOps::events.size() == 1 &&
+            RecordingOps::events[0].kind ==
+                EventKind::CompareExchange &&
+            RecordingOps::events[0].address ==
+                &map->committed_tasks.value &&
+            RecordingOps::events[0].argument == 2 &&
+            RecordingOps::events[0].result == 0,
+        kTest,
+        "future commit performs one non-mutating CAS"
     );
     for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
         if (LoadControl(&map->buckets[bucket].tail.value) != 0) {

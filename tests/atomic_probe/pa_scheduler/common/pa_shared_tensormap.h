@@ -587,17 +587,14 @@ PA_DEVICE bool SharedPublishTaskCommit(
     if (task_id < 0 || task_id == INT32_MAX) {
         return false;
     }
-    const int64_t previous = Ops::Exchange(
-        &map.committed_tasks.value, static_cast<int64_t>(task_id) + 1
-    );
-    if (previous == task_id) {
-        return true;
-    }
-    // 调用者必须持有 exact turn，因此失败分支不存在合法的并发 publisher。
-    // 无条件 Exchange 已经写入 task_id+1；恢复观测到的旧值，避免协议损坏时
-    // 把一个更大的前沿写小，或把尚未到达的前沿错误推进。
-    (void)Ops::Exchange(&map.committed_tasks.value, previous);
-    return false;
+    // Claim 已经保证同一 task 只有一个 owner；CAS 只允许 exact turn
+    // N -> N+1。重复、陈旧或未来 actor 失败时不修改控制字，避免旧
+    // Exchange+恢复路径短暂向其他核暴露错误前沿。
+    return Ops::CompareExchange(
+               &map.committed_tasks.value,
+               static_cast<int64_t>(task_id),
+               static_cast<int64_t>(task_id) + 1
+           ) == task_id;
 }
 
 }  // namespace pa_scheduler

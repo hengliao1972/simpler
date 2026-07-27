@@ -9623,3 +9623,33 @@ PA 的 I-cache 布局。设备已有其他任务，本阶段按用户要求不�
 下一提交先增加独立 `requires_writer_ready` plan/ticket 位，再把 generic
 writer 拆成“收集全部 lookup/entry -> reader close -> 发布 symbol/ordinary
 metadata -> writer-ready”，最后才构造真实 Claim/replay A→B→C 门槛。
+
+### 2026-07-27：R5a 将发布前沿改为失败不改状态的 CAS
+
+后续目标已重新对齐为：`Claim(N)` 的唯一 owner 同时负责 TensorMap
+插入、Build 和执行调度，但只把 TensorMap writer 元数据插入放进全局
+task-id 顺序；owner 发布插入前沿后再做 fanin lookup 和 Build，loser
+直接继续 replay。该目标取代上一节末尾的逐 task loser
+`writer-ready` 计划，后续不再增加对应 plan/ticket 位。
+
+接入 owner 热路径前先修正既有发布原语的失败语义。旧
+`SharedPublishTaskCommit()` 无条件执行：
+
+```text
+Exchange(N+1) -> 检查旧值 -> 失败时 Exchange(旧值)
+```
+
+重复、陈旧或未来 actor 会短暂把错误的 `N+1` 暴露给其他核；随后写回
+只能恢复最终值，不能撤销已经被观察到的错误前沿。新实现改成单次：
+
+```text
+CAS(expected=N, desired=N+1)
+```
+
+`Claim` 仍负责证明同一 task 只有一个 owner，CAS 负责拒绝非 exact-turn
+发布。失败时控制字从未改变，也不需要补偿写。CPU 事件门槛先在旧实现上
+精确得到两项失败，再要求重复和 future 发布都只产生一条
+`CompareExchange` 记录且保留原前沿；修改后 CAP=128 门槛转绿。
+
+本小步只加固控制原语，没有把 `committed_tasks` 接回 PA 热路径，没有
+改变 ABI、private 模式或 TensorMap 数据布局，也没有运行 A5。
