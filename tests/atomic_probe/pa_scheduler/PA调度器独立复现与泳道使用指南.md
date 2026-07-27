@@ -32,11 +32,12 @@ frontier 和 worker 状态，任一不符都会返回失败。
 
 两种 TensorMap 构建都先执行 `EfDrain` 和 `Claim`。private 随后保持
 compete-first eager：每核构造五类完整 `TaskArgs` 并执行 per-worker
-Materialize/map 前端。shared 则只保留 Alloc 的全员轻构参，QK/SF/PV/UP
-只有 winner 构参和 Materialize；loser 只声明稳定 output symbol，并闭合
-固定 finish/Submit 边界。CCEC 正式泳道构建将 orchestration caller、每核
-runtime state 和 noinline finish 拆分为独立 TU；CPU 使用同一公共业务模板
-做协议回归。本阶段只验收 CCEC 与 CPU，不把 AscendC 结果写进闭环证据。
+Materialize/map 前端。shared 的 Alloc/QK/SF/PV/UP 五类 task 都只有
+Claim owner 构参和 Materialize；loser 只声明稳定 output symbol，并闭合
+轻量 Submit 边界，不等待或访问 TensorMap。CCEC 正式泳道构建将
+orchestration caller、每核 runtime state 和 noinline finish 拆分为独立
+TU；CPU 使用同一公共业务模板做协议回归。本阶段只验收 CCEC 与 CPU，
+不把 AscendC 结果写进闭环证据。
 
 Case1 的 task 不是五个彼此独立的占位符。standalone 会从 Tensor descriptor 的
 owner 和当前构建模式的 TensorMap 收集 producer，去重后构造下列 fanin 图：
@@ -1366,7 +1367,7 @@ I-cache stall**：差值还混有同步等待、Cube/Vector/MTE 等 engine 等�
 
 这里的 PMU whole gate 从 orchestration 初始化前开始，到末次
 Submit 返回后停止，包含 Submit 内的 EfDrain、Claim、当前模式实际构参
-（private 全员 eager；shared Alloc 全员、其余 task winner-only）和
+（private 全员 eager；shared 五类 task 都是 owner-only）和
 finish，也包含 Submit 间的 `AcceptTaskOutputs()`/调用衔接，排除 FinalDrain。
 `submit_elapsed_ticks` 是每核首末 Submit 时间；顶部
 `submit_span_us` 则是 96 核共同墙钟范围。三者不能混用，详细定义见

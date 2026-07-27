@@ -732,10 +732,9 @@ struct alignas(64) TaskCell {
     volatile int64_t flag;
     volatile uint64_t vend;
 #if PTO_FDWIC_SHARED_MAP
-    // shared writer-ready 发布门：winner 完成“读取旧 writer → 登记本
-    // task 为新 writer”后写入 task_id；同 task 的 loser 必须等到该值，
-    // 才能继续构造后继 task。复用真实 DistTaskCell 的第三个 8B 字段，
-    // 不改变 64B task-cell ABI 或后续生产字段偏移。
+    // 历史 writer-ready 门保留在 64B task-cell ABI 中；新 ordered-insert
+    // 路径不再读写它，host 要求全程保持 -1。TensorMap 插入次序由
+    // sidecar 的 task 前沿表达，loser 不等待本字段。
     volatile int64_t deps_prepared;
     uint8_t padding[64 - 3 * sizeof(int64_t)];
 #else
@@ -960,13 +959,14 @@ static_assert(
 #endif
 
 struct alignas(64) SharedTensorMapSidecar {
-    // committed_tasks/reclaim_upto 只属于未来非空 ordinary-region 的有序
-    // ring 协议。PA Case1 的输入全部是 fresh symbol，唯一普通 output_view
-    // 又标记 manual_dep，因此运行期不再触碰这两个控制字。
+    // G=1 正确性基线中，committed_tasks 表示“下一个允许插入 writer
+    // 元数据的 task id”，初始为 0。每个 owner（包括空写集合）在
+    // ordinary/symbol/fresh-output 元数据完整可见后恰好推进 N -> N+1；
+    // fanin lookup、Build 与执行不属于这条串行链。
     AtomicLine committed_tasks;
     // reclaim_upto 是可回收 producer 的 inclusive 上界，初始 -1。
-    // 通用 ring 定向测试仍验证 exact-turn/reclaim helper，但不能把该测试
-    // 解释成 PA Case1 热路径仍经过全局 sequencer。
+    // insert-before-lookup 基线固定不回收 ordinary ring，因此保持 -1；
+    // reader-progress/reclaim 只由隔离测试覆盖，尚未接回当前热路径。
     AtomicLine reclaim_upto;
     SharedBucketState buckets[kMapBuckets];
     SharedRegionSlot slots[kMapCapacity];
@@ -1186,8 +1186,8 @@ struct alignas(64) WorkerResult {
     uint64_t wait_iterations[2];
 
     // 前端工作量计数不是性能填充：private 核对全员构参/物化；shared
-    // 区分全员 Alloc 轻构参、四个 task 的 winner-only 重构参与
-    // winner-only 物化。lookup、slot copy 和 fanin 也按 winner 业务量闭合。
+    // 的五类 task 都核对 owner-only 重构参与 owner-only 物化。lookup、
+    // slot copy 和 fanin 也按 owner 业务量闭合。
     uint64_t context_reads;
     uint64_t views_created;
     uint64_t dynamic_create_infos;

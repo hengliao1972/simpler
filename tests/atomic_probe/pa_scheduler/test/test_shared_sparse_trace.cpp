@@ -92,6 +92,13 @@ struct TaskTraceBuilder {
             )
         );
         uint64_t previous_end = materialize_begin + 3;
+        ok &= validator.Observe(
+            MakeRecord(
+                TracePhase::Register, static_cast<int32_t>(task_id),
+                function_id, previous_end, previous_end + 2, 0, 0
+            )
+        );
+        previous_end += 2;
         if (kind != TaskKind::Alloc) {
             ok &= validator.Observe(
                 MakeRecord(
@@ -101,14 +108,6 @@ struct TaskTraceBuilder {
             );
             previous_end += 2;
         }
-        ok &= validator.Observe(
-            MakeRecord(
-                TracePhase::Register, static_cast<int32_t>(task_id),
-                function_id, previous_end, previous_end + 2, 0,
-                kind == TaskKind::Alloc ? 0U : 1U
-            )
-        );
-        previous_end += 2;
         ok &= validator.Observe(
             MakeRecord(
                 kind == TaskKind::Alloc
@@ -131,8 +130,8 @@ struct TaskTraceBuilder {
     }
 
     bool FinishLoser(uint32_t task_id, TaskKind kind) {
-        // loser 的 Submit 父区间覆盖轻量返回；non-final UP 实际还会在
-        // 这里覆盖 writer-ready 等待，但不会产生 winner-only 子 span。
+        // loser 的 Submit 父区间只覆盖轻量返回；它不等待、不读取
+        // TensorMap，也不会产生任何 winner-only 子 span。
         const bool ok = validator.Observe(
             MakeRecord(
                 TracePhase::Submit, static_cast<int32_t>(task_id), -1,
@@ -328,8 +327,16 @@ void TestRejectsWinnerShapeDrift() {
             "Alloc Materialize is accepted"
         );
         Check(
+            validator.Observe(
+                MakeRecord(
+                    TracePhase::Register, 0, -1, 18, 19
+                )
+            ),
+            "Alloc Register is accepted before its tail"
+        );
+        Check(
             !validator.Observe(
-                MakeRecord(TracePhase::Fanin, 0, -1, 18, 19)
+                MakeRecord(TracePhase::Fanin, 0, -1, 19, 20)
             ),
             "Alloc winner cannot emit Fanin"
         );
@@ -352,10 +359,16 @@ void TestRejectsWinnerShapeDrift() {
             "ordinary Materialize is accepted"
         );
         Check(
-            !validator.Observe(
+            validator.Observe(
                 MakeRecord(TracePhase::Register, 1, 0, 21, 22, 0, 1)
             ),
-            "ordinary winner cannot skip Fanin"
+            "ordinary Register precedes Fanin"
+        );
+        Check(
+            !validator.Observe(
+                MakeRecord(TracePhase::WinnerBuild, 1, 0, 22, 23)
+            ),
+            "ordinary winner cannot skip Fanin after Register"
         );
     }
     {

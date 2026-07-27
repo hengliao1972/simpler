@@ -200,6 +200,21 @@ void ResetProtocolState(SchedulerState &state) {
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
         state.shared_map.reader_done[worker].value = -1;
     }
+    for (uint32_t task = 0; task < kMaxTasks; ++task) {
+        SharedOutputCell &outputs =
+            state.shared_map.shared_outputs[task];
+        for (uint32_t output = 0;
+             output < kSharedOutputMaxPerTask; ++output) {
+            outputs.published[output].value = -1;
+            outputs.last_writer[output].value = -1;
+        }
+        SharedWriterHistoryCell &history =
+            state.shared_map.writer_history[task];
+        history.magic = 0;
+        history.writer_task = 0;
+        history.count = 0;
+        history.reserved = 0;
+    }
 }
 
 void ResetTaskGate(SchedulerState &state, int32_t task_id) {
@@ -1060,6 +1075,711 @@ void TestOrdinaryWriterIntentChain(SchedulerState &state) {
     );
 }
 
+void TestWriterDeltaRequiresExactRegisterMask() {
+    TensorDesc tensor = MakeTensor(0x455000000ULL);
+    const FdwicOutputRef output{0, 0, 0, 0, 0, 0};
+    TaskArgs args;
+    ConstructTaskArgs(args);
+    AddGmTensor(args, tensor, TensorArgType::OutputExisting);
+    AddOutputHandleTensor(args, output, TensorArgType::Inout);
+
+    SubmitContext context{};
+    context.task_id = 1;
+    context.won = true;
+    context.result.task_id = 1;
+    context.shared_result.Reset(1);
+    SharedTaskWriterDelta delta{};
+
+    context.register_mask = 1;
+    Check(
+        !PrepareSharedTaskWriterDelta(args, context, delta),
+        "writer delta rejects a mask that omits one INOUT entry"
+    );
+    context.register_mask = 2;
+    Check(
+        !PrepareSharedTaskWriterDelta(args, context, delta),
+        "writer delta rejects a mask that omits one ordinary writer"
+    );
+    context.register_mask = 7;
+    Check(
+        !PrepareSharedTaskWriterDelta(args, context, delta),
+        "writer delta rejects a mask with an extra non-argument bit"
+    );
+    context.register_mask = 3;
+    Check(
+        PrepareSharedTaskWriterDelta(args, context, delta) &&
+            delta.ordinary_count == 1 &&
+            delta.writer_intent_required,
+        "writer delta accepts the exact writer mask"
+    );
+}
+
+void TestOrderedOrdinaryInsertBeforeLookup(
+    SchedulerState &state
+) {
+    ResetProtocolState(state);
+    TensorDesc tensor = MakeTensor(0x460000000ULL);
+
+    TaskArgs first_args;
+    ConstructTaskArgs(first_args);
+    AddGmTensor(
+        first_args, tensor, TensorArgType::OutputExisting
+    );
+    SubmitContext first_context{};
+    first_context.task_id = 0;
+    first_context.won = true;
+    first_context.register_mask = 1;
+    first_context.result.task_id = 0;
+    first_context.shared_result.Reset(0);
+    SharedTaskWriterDelta first_delta{};
+    LocalStats first_stats{};
+    Check(
+        PrepareSharedTaskWriterDelta(
+            first_args, first_context, first_delta
+        ) &&
+            first_delta.ordinary_count == 1 &&
+            first_delta.writer_intent_required,
+        "ordered ordinary task 0 prepares one writer entry"
+    );
+    Check(
+        PublishSharedTaskWriterDelta<WriterIntentTestOps>(
+            &state, first_args, first_context,
+            first_delta, first_stats
+        ) &&
+            state.shared_map.committed_tasks.value == 1,
+        "ordered ordinary task 0 publishes before lookup"
+    );
+
+    bool lookup_ok = false;
+    uint32_t lookup_count = UINT32_MAX;
+    int32_t fanin[kMaxFanin] = {};
+    const uint32_t first_fanin =
+        CollectSharedFanin<
+            WriterIntentTestOps, false, true
+        >(
+            state.shared_map, first_args, 0,
+            static_cast<int32_t>(state.heap_window),
+            first_stats, fanin, lookup_ok,
+            lookup_count, &state.fatal.value
+        );
+    Check(
+        lookup_ok && first_fanin == 0 &&
+            lookup_count == 1,
+        "task 0 lookup after its own insert excludes itself"
+    );
+
+    TaskArgs second_args;
+    ConstructTaskArgs(second_args);
+    AddGmTensor(second_args, tensor, TensorArgType::Inout);
+    SubmitContext second_context{};
+    second_context.task_id = 1;
+    second_context.won = true;
+    second_context.register_mask = 1;
+    second_context.result.task_id = 1;
+    second_context.shared_result.Reset(1);
+    SharedTaskWriterDelta second_delta{};
+    LocalStats second_stats{};
+    Check(
+        PrepareSharedTaskWriterDelta(
+            second_args, second_context, second_delta
+        ) &&
+            PublishSharedTaskWriterDelta<
+                WriterIntentTestOps
+            >(
+                &state, second_args, second_context,
+                second_delta, second_stats
+            ) &&
+            state.shared_map.committed_tasks.value == 2,
+        "ordered ordinary task 1 publishes its writer entry"
+    );
+    lookup_ok = false;
+    lookup_count = UINT32_MAX;
+    const uint32_t second_fanin =
+        CollectSharedFanin<
+            WriterIntentTestOps, false, true
+        >(
+            state.shared_map, second_args, 1,
+            static_cast<int32_t>(state.heap_window),
+            second_stats, fanin, lookup_ok,
+            lookup_count, &state.fatal.value
+        );
+    Check(
+        lookup_ok && second_fanin == 1 &&
+            fanin[0] == 0 && lookup_count == 1,
+        "task 1 lookup returns task 0 instead of itself"
+    );
+
+    TaskArgs reader_args;
+    ConstructTaskArgs(reader_args);
+    AddGmTensor(reader_args, tensor, TensorArgType::Input);
+    SubmitContext reader_context{};
+    reader_context.task_id = 2;
+    reader_context.won = true;
+    reader_context.result.task_id = 2;
+    reader_context.shared_result.Reset(2);
+    SharedTaskWriterDelta reader_delta{};
+    LocalStats reader_stats{};
+    Check(
+        PrepareSharedTaskWriterDelta(
+            reader_args, reader_context, reader_delta
+        ) &&
+            reader_delta.ordinary_count == 0 &&
+            PublishSharedTaskWriterDelta<
+                WriterIntentTestOps
+            >(
+                &state, reader_args, reader_context,
+                reader_delta, reader_stats
+            ) &&
+            state.shared_map.committed_tasks.value == 3,
+        "empty writer task still advances the ordered frontier"
+    );
+    lookup_ok = false;
+    lookup_count = UINT32_MAX;
+    const uint32_t reader_fanin =
+        CollectSharedFanin<
+            WriterIntentTestOps, false, true
+        >(
+            state.shared_map, reader_args, 2,
+            static_cast<int32_t>(state.heap_window),
+            reader_stats, fanin, lookup_ok,
+            lookup_count, &state.fatal.value
+        );
+    Check(
+        lookup_ok && reader_fanin == 1 &&
+            fanin[0] == 1 && lookup_count == 1,
+        "task 2 reader resolves the newest writer below task 2"
+    );
+}
+
+void TestOrderedSymbolInsertBeforeLookup(
+    SchedulerState &state
+) {
+    ResetProtocolState(state);
+    TensorDesc descriptor = MakeTensor(0x470000000ULL, 0);
+
+    TaskArgs producer_args;
+    ConstructTaskArgs(producer_args);
+    SubmitContext producer_context{};
+    producer_context.task_id = 0;
+    producer_context.won = true;
+    producer_context.result.task_id = 0;
+    producer_context.result.count = 1;
+    producer_context.result.tensors[0] = &descriptor;
+    producer_context.shared_result.Reset(0);
+    Check(
+        producer_context.shared_result.AddOutputRef(0, 0),
+        "fresh symbol test declares output slot 0"
+    );
+    SharedTaskWriterDelta producer_delta{};
+    LocalStats producer_stats{};
+    Check(
+        PrepareSharedTaskWriterDelta(
+            producer_args, producer_context, producer_delta
+        ) &&
+            PublishSharedTaskWriterDelta<
+                WriterIntentTestOps
+            >(
+                &state, producer_args, producer_context,
+                producer_delta, producer_stats
+            ) &&
+            state.shared_map.shared_outputs[0]
+                    .published[0].value == 0 &&
+            state.shared_map.committed_tasks.value == 1,
+        "fresh symbol descriptor is visible before turn 1"
+    );
+
+    const FdwicOutputRef output{
+        0, 0, 0, 0, 0, 0
+    };
+    TaskArgs writer_args;
+    ConstructTaskArgs(writer_args);
+    AddOutputHandleTensor(
+        writer_args, output, TensorArgType::Inout
+    );
+    SubmitContext writer_context{};
+    writer_context.task_id = 1;
+    writer_context.won = true;
+    writer_context.register_mask = 1;
+    writer_context.result.task_id = 1;
+    writer_context.shared_result.Reset(1);
+    SharedTaskWriterDelta writer_delta{};
+    LocalStats writer_stats{};
+    Check(
+        PrepareSharedTaskWriterDelta(
+            writer_args, writer_context, writer_delta
+        ) &&
+            writer_delta.writer_intent_required &&
+            PublishSharedTaskWriterDelta<
+                WriterIntentTestOps
+            >(
+                &state, writer_args, writer_context,
+                writer_delta, writer_stats
+            ) &&
+            state.shared_map.shared_outputs[0]
+                    .last_writer[0].value == 1 &&
+            state.shared_map.committed_tasks.value == 2,
+        "symbol INOUT publishes history before its own lookup"
+    );
+
+    bool lookup_ok = false;
+    uint32_t lookup_count = UINT32_MAX;
+    int32_t fanin[kMaxFanin] = {};
+    const uint32_t writer_fanin =
+        CollectSharedFanin<
+            WriterIntentTestOps, false, true
+        >(
+            state.shared_map, writer_args, 1,
+            static_cast<int32_t>(state.heap_window),
+            writer_stats, fanin, lookup_ok,
+            lookup_count, &state.fatal.value
+        );
+    Check(
+        lookup_ok && writer_fanin == 1 &&
+            fanin[0] == 0 && lookup_count == 0,
+        "symbol task 1 walks immutable history back to task 0"
+    );
+
+    TaskArgs reader_args;
+    ConstructTaskArgs(reader_args);
+    AddOutputHandleTensor(
+        reader_args, output, TensorArgType::Input
+    );
+    SubmitContext reader_context{};
+    reader_context.task_id = 2;
+    reader_context.won = true;
+    reader_context.result.task_id = 2;
+    reader_context.shared_result.Reset(2);
+    SharedTaskWriterDelta reader_delta{};
+    LocalStats reader_stats{};
+    Check(
+        PrepareSharedTaskWriterDelta(
+            reader_args, reader_context, reader_delta
+        ) &&
+            PublishSharedTaskWriterDelta<
+                WriterIntentTestOps
+            >(
+                &state, reader_args, reader_context,
+                reader_delta, reader_stats
+            ),
+        "symbol reader publishes an empty task transaction"
+    );
+    lookup_ok = false;
+    lookup_count = UINT32_MAX;
+    const uint32_t reader_fanin =
+        CollectSharedFanin<
+            WriterIntentTestOps, false, true
+        >(
+            state.shared_map, reader_args, 2,
+            static_cast<int32_t>(state.heap_window),
+            reader_stats, fanin, lookup_ok,
+            lookup_count, &state.fatal.value
+        );
+    Check(
+        lookup_ok && reader_fanin == 1 &&
+            fanin[0] == 1 && lookup_count == 0,
+        "symbol task 2 resolves task 1 as the latest prior writer"
+    );
+}
+
+void TestOrderedMixedWriterTransaction(
+    SchedulerState &state
+) {
+    ResetProtocolState(state);
+    TensorDesc ordinary = MakeTensor(0x478000000ULL);
+    TensorDesc seed_output = MakeTensor(0x478100000ULL, 0);
+
+    // task 0 同时建立 ordinary writer 与后续 INOUT 使用的 fresh
+    // descriptor。它先完整发布两类元数据，再把有序前沿推进到 1。
+    TaskArgs seed_args;
+    ConstructTaskArgs(seed_args);
+    AddGmTensor(
+        seed_args, ordinary, TensorArgType::OutputExisting
+    );
+    SubmitContext seed_context{};
+    seed_context.task_id = 0;
+    seed_context.won = true;
+    seed_context.register_mask = 1;
+    seed_context.result.task_id = 0;
+    seed_context.result.count = 1;
+    seed_context.result.tensors[0] = &seed_output;
+    seed_context.shared_result.Reset(0);
+    Check(
+        seed_context.shared_result.AddOutputRef(0, 0),
+        "mixed transaction seed declares fresh output"
+    );
+    SharedTaskWriterDelta seed_delta{};
+    LocalStats seed_stats{};
+    Check(
+        PrepareSharedTaskWriterDelta(
+            seed_args, seed_context, seed_delta
+        ) &&
+            PublishSharedTaskWriterDelta<
+                WriterIntentTestOps
+            >(
+                &state, seed_args, seed_context,
+                seed_delta, seed_stats
+            ),
+        "mixed transaction seed publishes ordinary and fresh metadata"
+    );
+
+    const FdwicOutputRef seed_ref{0, 0, 0, 0, 0, 0};
+    TensorDesc next_output = MakeTensor(0x478200000ULL, 1);
+    TaskArgs mixed_args;
+    ConstructTaskArgs(mixed_args);
+    AddGmTensor(
+        mixed_args, ordinary, TensorArgType::Inout
+    );
+    AddOutputHandleTensor(
+        mixed_args, seed_ref, TensorArgType::Inout
+    );
+    SubmitContext mixed_context{};
+    mixed_context.task_id = 1;
+    mixed_context.won = true;
+    mixed_context.register_mask = 3;
+    mixed_context.result.task_id = 1;
+    mixed_context.result.count = 1;
+    mixed_context.result.tensors[0] = &next_output;
+    mixed_context.shared_result.Reset(1);
+    Check(
+        mixed_context.shared_result.AddOutputRef(1, 0),
+        "mixed transaction declares its own fresh output"
+    );
+    SharedTaskWriterDelta mixed_delta{};
+    LocalStats mixed_stats{};
+    Check(
+        PrepareSharedTaskWriterDelta(
+            mixed_args, mixed_context, mixed_delta
+        ) &&
+            mixed_delta.ordinary_count == 1 &&
+            mixed_delta.writer_intent_required &&
+            PublishSharedTaskWriterDelta<
+                WriterIntentTestOps
+            >(
+                &state, mixed_args, mixed_context,
+                mixed_delta, mixed_stats
+            ),
+        "one ordered transaction publishes ordinary, symbol and fresh metadata"
+    );
+
+    const SharedOutputCell &seed_cell =
+        state.shared_map.shared_outputs[0];
+    const SharedOutputCell &mixed_cell =
+        state.shared_map.shared_outputs[1];
+    const SharedWriterHistoryCell &history =
+        state.shared_map.writer_history[1];
+    Check(
+        state.fatal.value == 0 &&
+            state.shared_map.committed_tasks.value == 2 &&
+            seed_cell.last_writer[0].value == 1 &&
+            history.magic == kSharedWriterHistoryMagic &&
+            history.writer_task == 1 &&
+            history.count == 1 &&
+            mixed_cell.published[0].value == 1 &&
+            mixed_cell.last_writer[0].value == 1 &&
+            mixed_cell.tensors[0].buffer_addr ==
+                next_output.buffer_addr,
+        "mixed transaction exposes all metadata before turn 2"
+    );
+
+    bool lookup_ok = false;
+    uint32_t lookup_count = UINT32_MAX;
+    int32_t fanin[kMaxFanin] = {};
+    const uint32_t mixed_fanin =
+        CollectSharedFanin<
+            WriterIntentTestOps, false, true
+        >(
+            state.shared_map, mixed_args, 1,
+            static_cast<int32_t>(state.heap_window),
+            mixed_stats, fanin, lookup_ok,
+            lookup_count, &state.fatal.value
+        );
+    Check(
+        lookup_ok && mixed_fanin == 1 &&
+            fanin[0] == 0 && lookup_count == 1,
+        "mixed transaction lookup deduplicates its two task-0 producers"
+    );
+
+    const FdwicOutputRef mixed_ref{1, 0, 0, 0, 0, 0};
+    TaskArgs reader_args;
+    ConstructTaskArgs(reader_args);
+    AddOutputHandleTensor(
+        reader_args, mixed_ref, TensorArgType::Input
+    );
+    SubmitContext reader_context{};
+    reader_context.task_id = 2;
+    reader_context.won = true;
+    reader_context.result.task_id = 2;
+    reader_context.shared_result.Reset(2);
+    SharedTaskWriterDelta reader_delta{};
+    LocalStats reader_stats{};
+    Check(
+        PrepareSharedTaskWriterDelta(
+            reader_args, reader_context, reader_delta
+        ) &&
+            PublishSharedTaskWriterDelta<
+                WriterIntentTestOps
+            >(
+                &state, reader_args, reader_context,
+                reader_delta, reader_stats
+            ),
+        "mixed transaction reader advances an empty writer turn"
+    );
+    lookup_ok = false;
+    lookup_count = UINT32_MAX;
+    const uint32_t reader_fanin =
+        CollectSharedFanin<
+            WriterIntentTestOps, false, true
+        >(
+            state.shared_map, reader_args, 2,
+            static_cast<int32_t>(state.heap_window),
+            reader_stats, fanin, lookup_ok,
+            lookup_count, &state.fatal.value
+        );
+    Check(
+        lookup_ok && reader_fanin == 1 &&
+            fanin[0] == 1 && lookup_count == 0,
+        "downstream reader consumes the fresh output from mixed task 1"
+    );
+}
+
+void TestStrictLatestFaninWindow(SchedulerState &state) {
+    ResetProtocolState(state);
+    constexpr int32_t kWindow = 2;
+    state.heap_window = kWindow;
+
+    // symbol origin 为 task 0，当前 latest writer 为 task 2。reader 4 的
+    // 左边界恰好是 2，必须接收；reader 5 的左边界是 3，必须把同一
+    // writer 当作窗口外历史，而不是继续塞进 fanin。
+    SharedOutputCell &symbol = state.shared_map.shared_outputs[0];
+    symbol.published[0].value = 0;
+    symbol.last_writer[0].value = 2;
+    SharedWriterHistoryCell &history =
+        state.shared_map.writer_history[2];
+    history.magic = kSharedWriterHistoryMagic;
+    history.writer_task = 2;
+    history.count = 1;
+    history.reserved = 0;
+    history.entries[0].symbol_key = 1;
+    history.entries[0].previous_writer = 0;
+
+    const FdwicOutputRef output{0, 0, 0, 0, 0, 0};
+    TaskArgs symbol_args;
+    ConstructTaskArgs(symbol_args);
+    AddOutputHandleTensor(
+        symbol_args, output, TensorArgType::Input
+    );
+    LocalStats symbol_stats{};
+    int32_t fanin[kMaxFanin] = {};
+    bool protocol_ok = false;
+    uint32_t lookup_count = UINT32_MAX;
+    const uint32_t boundary_count =
+        CollectSharedFanin<
+            WriterIntentTestOps, false, true
+        >(
+            state.shared_map, symbol_args, 4, kWindow,
+            symbol_stats, fanin, protocol_ok, lookup_count,
+            &state.fatal.value
+        );
+    Check(
+        protocol_ok && boundary_count == 1 &&
+            fanin[0] == 2 && lookup_count == 0,
+        "strict symbol lookup accepts producer exactly at N-H"
+    );
+    protocol_ok = false;
+    lookup_count = UINT32_MAX;
+    const uint32_t expired_count =
+        CollectSharedFanin<
+            WriterIntentTestOps, false, true
+        >(
+            state.shared_map, symbol_args, 5, kWindow,
+            symbol_stats, fanin, protocol_ok, lookup_count,
+            &state.fatal.value
+        );
+    Check(
+        protocol_ok && expired_count == 0 &&
+            lookup_count == 0,
+        "strict symbol lookup excludes producer below N-H"
+    );
+
+    // TensorDesc::owner_task_id 也属于 fanin 来源，必须使用同一窗口。
+    // ordinary ring 为空，因此下面结果只由显式 owner 决定。
+    TensorDesc owned = MakeTensor(
+        0x480000000ULL, 1
+    );
+    TaskArgs ordinary_args;
+    ConstructTaskArgs(ordinary_args);
+    AddGmTensor(
+        ordinary_args, owned, TensorArgType::Input
+    );
+    LocalStats ordinary_stats{};
+    protocol_ok = false;
+    lookup_count = UINT32_MAX;
+    const uint32_t owner_boundary_count =
+        CollectSharedFanin<
+            WriterIntentTestOps, false, true
+        >(
+            state.shared_map, ordinary_args, 3, kWindow,
+            ordinary_stats, fanin, protocol_ok, lookup_count,
+            &state.fatal.value
+        );
+    Check(
+        protocol_ok && owner_boundary_count == 1 &&
+            fanin[0] == 1 && lookup_count == 1,
+        "strict explicit owner accepts producer exactly at N-H"
+    );
+    protocol_ok = false;
+    lookup_count = UINT32_MAX;
+    const uint32_t owner_expired_count =
+        CollectSharedFanin<
+            WriterIntentTestOps, false, true
+        >(
+            state.shared_map, ordinary_args, 4, kWindow,
+            ordinary_stats, fanin, protocol_ok, lookup_count,
+            &state.fatal.value
+        );
+    Check(
+        protocol_ok && owner_expired_count == 0 &&
+            lookup_count == 1,
+        "strict explicit owner excludes producer below N-H"
+    );
+
+    owned.owner_task_id = 4;
+    protocol_ok = true;
+    lookup_count = UINT32_MAX;
+    const uint32_t self_count =
+        CollectSharedFanin<
+            WriterIntentTestOps, false, true
+        >(
+            state.shared_map, ordinary_args, 4, kWindow,
+            ordinary_stats, fanin, protocol_ok, lookup_count,
+            &state.fatal.value
+        );
+    Check(
+        !protocol_ok && self_count == 0,
+        "strict explicit owner rejects self and future producer"
+    );
+}
+
+void TestOrderedPublishRejectsFullBucketAtomically(
+    SchedulerState &state
+) {
+    ResetProtocolState(state);
+    constexpr uint64_t kAddress = 0x490000000ULL;
+    const uint32_t bucket = TensorMapHash(kAddress);
+    bool filled = true;
+    for (uint32_t cursor = 0;
+         cursor < kMapBucketCapacity; ++cursor) {
+        const SharedRegionValue entry{
+            kAddress, 0, 4096,
+            static_cast<int32_t>(cursor), 0
+        };
+        filled &=
+            SharedAppendPreparedEntry<WriterIntentTestOps>(
+                state.shared_map, entry
+            );
+    }
+    Check(filled, "full-bucket setup publishes exactly CAP live entries");
+
+    int64_t seq_before[kMapBucketCapacity] = {};
+    SharedRegionValue payload_before[kMapBucketCapacity] = {};
+    for (uint32_t cursor = 0;
+         cursor < kMapBucketCapacity; ++cursor) {
+        SharedRegionSlot &slot =
+            state.shared_map.slots[
+                SharedTensorMapSlotIndex(bucket, cursor)
+            ];
+        seq_before[cursor] = slot.seq.value;
+        payload_before[cursor] = slot.payload.value;
+    }
+    const int64_t head_before =
+        state.shared_map.buckets[bucket].head.value;
+    const int64_t tail_before =
+        state.shared_map.buckets[bucket].tail.value;
+
+    constexpr int32_t kBlockedTask =
+        static_cast<int32_t>(kMapBucketCapacity);
+    state.shared_map.committed_tasks.value = kBlockedTask;
+    TensorDesc tensor = MakeTensor(kAddress);
+    TaskArgs args;
+    ConstructTaskArgs(args);
+    AddGmTensor(args, tensor, TensorArgType::OutputExisting);
+    SharedOutputCell &symbol =
+        state.shared_map.shared_outputs[0];
+    symbol.published[0].value = 0;
+    symbol.last_writer[0].value = 0;
+    const FdwicOutputRef output{0, 0, 0, 0, 0, 0};
+    AddOutputHandleTensor(
+        args, output, TensorArgType::Inout
+    );
+    SubmitContext context{};
+    context.task_id = kBlockedTask;
+    context.won = true;
+    context.register_mask = 3;
+    context.result.task_id = kBlockedTask;
+    TensorDesc fresh = MakeTensor(
+        0x491000000ULL,
+        static_cast<uint64_t>(kBlockedTask)
+    );
+    context.result.count = 1;
+    context.result.tensors[0] = &fresh;
+    context.shared_result.Reset(kBlockedTask);
+    Check(
+        context.shared_result.AddOutputRef(kBlockedTask, 0),
+        "blocked mixed task declares a fresh output"
+    );
+    SharedTaskWriterDelta delta{};
+    LocalStats stats{};
+    Check(
+        PrepareSharedTaskWriterDelta(args, context, delta) &&
+            delta.ordinary_count == 1 &&
+            delta.writer_intent_required,
+        "blocked task prepares mixed ordinary and symbol writer intent"
+    );
+    Check(
+        !PublishSharedTaskWriterDelta<WriterIntentTestOps>(
+            &state, args, context, delta, stats
+        ),
+        "ordered publish rejects a full live bucket"
+    );
+
+    bool slots_unchanged = true;
+    for (uint32_t cursor = 0;
+         cursor < kMapBucketCapacity; ++cursor) {
+        const SharedRegionSlot &slot =
+            state.shared_map.slots[
+                SharedTensorMapSlotIndex(bucket, cursor)
+            ];
+        slots_unchanged &=
+            slot.seq.value == seq_before[cursor] &&
+            std::memcmp(
+                &slot.payload.value, &payload_before[cursor],
+                sizeof(SharedRegionValue)
+            ) == 0;
+    }
+    Check(
+        state.fatal.value == 1 &&
+            state.shared_map.committed_tasks.value ==
+                kBlockedTask &&
+            state.shared_map.buckets[bucket].head.value ==
+                head_before &&
+            state.shared_map.buckets[bucket].tail.value ==
+                tail_before &&
+            slots_unchanged &&
+            symbol.published[0].value == 0 &&
+            symbol.last_writer[0].value == 0 &&
+            state.shared_map.writer_history[kBlockedTask]
+                    .magic == 0 &&
+            state.shared_map.shared_outputs[kBlockedTask]
+                    .published[0].value == -1 &&
+            state.shared_map.shared_outputs[kBlockedTask]
+                    .last_writer[0].value == -1 &&
+            state.shared_map.shared_outputs[kBlockedTask]
+                    .tensors[0].buffer_addr == 0 &&
+            stats.result.map_inserts == 0,
+        "capacity failure keeps cursor, ring, symbol and fresh metadata unchanged"
+    );
+}
+
 void TestOrdinaryWriterRangeValidation() {
     SharedRegionValue region{};
     TensorDesc contiguous = MakeTensor(0x470000000ULL);
@@ -1172,10 +1892,16 @@ int main() {
     ResetProtocolState(*state);
     TestSymbolWriterIntentChain(*state);
     TestOrdinaryWriterIntentChain(*state);
+    TestWriterDeltaRequiresExactRegisterMask();
+    TestOrderedOrdinaryInsertBeforeLookup(*state);
+    TestOrderedSymbolInsertBeforeLookup(*state);
+    TestOrderedMixedWriterTransaction(*state);
+    TestStrictLatestFaninWindow(*state);
     TestOrdinaryWriterRangeValidation();
     TestManualWriterNeedsNoGate(*state);
     const bool fatal_clean = state->fatal.value == 0;
     Check(fatal_clean, "all positive paths leave fatal clear");
+    TestOrderedPublishRejectsFullBucketAtomically(*state);
     TestOutOfOrderSymbolWriterFailsClosed(*state);
     TestMultiSymbolConflictKeepsTerminalPrefix(*state);
     UnmapSparseSchedulerState(state);

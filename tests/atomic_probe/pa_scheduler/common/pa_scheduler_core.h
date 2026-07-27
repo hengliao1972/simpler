@@ -1029,6 +1029,33 @@ PA_DEVICE bool AddCollectedSharedFanin(
     return true;
 }
 
+template <bool Strict>
+PA_DEVICE bool AddCollectedSharedOwner(
+    int32_t fanin[kMaxFanin], uint32_t &count, uint64_t owner,
+    int32_t reader_task, int32_t reader_lower_bound
+) {
+    if (owner == kInvalidTaskId) {
+        return true;
+    }
+    const int32_t producer =
+        static_cast<int32_t>(owner & 0xFFFFFFFFU);
+    if constexpr (Strict) {
+        // 新 shared 路径只接受 [N-H,N) 内的真实前任。高 32 位非零、
+        // self/future owner 都是协议错误；已经落到窗口左侧的旧 owner
+        // 不再形成依赖，但后续 ordinary lookup 仍可找到窗口内的新 writer。
+        if (owner > static_cast<uint64_t>(INT32_MAX) ||
+            producer >= reader_task) {
+            return false;
+        }
+        if (producer < reader_lower_bound) {
+            return true;
+        }
+    }
+    return AddCollectedSharedFanin<Strict>(
+        fanin, count, producer
+    );
+}
+
 template <typename Ops>
 PA_DEVICE bool WaitForSharedOutputPublished(
     PA_GM SharedTensorMapSidecar &map, const FdwicOutputRef &output_ref,
@@ -1127,12 +1154,13 @@ template <typename Ops>
 PA_DEVICE bool ResolveSharedSymbolWriterBefore(
     PA_GM SharedTensorMapSidecar &map,
     const FdwicOutputRef &output_ref, int32_t reader_task,
-    int32_t &resolved_writer
+    int32_t reader_lower_bound, int32_t &resolved_writer
 ) {
     uint32_t symbol_key = 0;
     if (!SharedSymbolHistoryKey(output_ref, symbol_key) ||
         reader_task <= output_ref.producer_task_id ||
-        reader_task < 0) {
+        reader_task < 0 || reader_lower_bound < 0 ||
+        reader_lower_bound > reader_task) {
         return false;
     }
     PA_GM SharedOutputCell &origin =
@@ -1202,7 +1230,13 @@ PA_DEVICE bool ResolveSharedSymbolWriterBefore(
         latest >= reader_task) {
         return false;
     }
-    resolved_writer = static_cast<int32_t>(latest);
+    // 与 ordinary ring 使用同一半开窗口：[N-H,N)。history 仍需走到
+    // 第一个 <N 的 writer 才能验证链完整；若它已经早于左边界，则
+    // 返回 external/no-dependency，而不是把过期 producer 塞进 fanin。
+    resolved_writer =
+        latest < reader_lower_bound
+            ? -1
+            : static_cast<int32_t>(latest);
     return true;
 }
 
@@ -1225,11 +1259,14 @@ PA_DEVICE uint32_t CollectSharedFanin(
     );
     protocol_ok = true;
     ordinary_lookup_count = 0;
-    if (args.tensor_count < 0 ||
+    if (task_id < 0 || heap_window < 0 ||
+        args.tensor_count < 0 ||
         args.tensor_count > static_cast<int32_t>(kMaxTaskTensors)) {
         protocol_ok = false;
         return 0;
     }
+    const int32_t reader_lower_bound =
+        task_id > heap_window ? task_id - heap_window : 0;
     if constexpr (ChainedWriter) {
         // PA 的三个 accumulator 共用同一个 Alloc producer，后续每个 UP
         // 同步推进这三个 slot。显式的 (producer,writer) 对只选择这一
@@ -1334,9 +1371,11 @@ PA_DEVICE uint32_t CollectSharedFanin(
             int32_t writer = -1;
             if constexpr (AcceptLatestWriter) {
                 // latest cell 是零开销快取；若 future writer 已经覆盖它，
-                // 只在这一慢路沿不可变前驱链回到 max(writer<task_id)。
+                // 只在这一慢路沿不可变前驱链回到 max(writer<task_id)，
+                // 再与 ordinary lookup 一样过滤到 [N-H,N)。
                 if (!ResolveSharedSymbolWriterBefore<Ops>(
-                        map, output_ref, task_id, writer
+                        map, output_ref, task_id,
+                        reader_lower_bound, writer
                     )) {
                     protocol_ok = false;
                     return 0;
@@ -1385,16 +1424,14 @@ PA_DEVICE uint32_t CollectSharedFanin(
                 continue;
             }
             const uint64_t owner = tensor.owner_task_id;
-            if (owner != kInvalidTaskId) {
-                if (!AddCollectedSharedFanin<
-                        AcceptLatestWriter
-                    >(
-                    validated_fanin, validated_count,
-                    static_cast<int32_t>(owner & 0xFFFFFFFFU)
+            if (!AddCollectedSharedOwner<
+                    AcceptLatestWriter
+                >(
+                    validated_fanin, validated_count, owner,
+                    task_id, reader_lower_bound
                 )) {
-                    protocol_ok = false;
-                    return 0;
-                }
+                protocol_ok = false;
+                return 0;
             }
             if (tag == TensorArgType::Inout ||
                 tag == TensorArgType::OutputExisting ||
@@ -1424,16 +1461,14 @@ PA_DEVICE uint32_t CollectSharedFanin(
                 continue;
             }
             const uint64_t owner = tensor.owner_task_id;
-            if (owner != kInvalidTaskId) {
-                if (!AddCollectedSharedFanin<
-                        AcceptLatestWriter
-                    >(
-                    validated_fanin, validated_count,
-                    static_cast<int32_t>(owner & 0xFFFFFFFFU)
+            if (!AddCollectedSharedOwner<
+                    AcceptLatestWriter
+                >(
+                    validated_fanin, validated_count, owner,
+                    task_id, reader_lower_bound
                 )) {
-                    protocol_ok = false;
-                    return 0;
-                }
+                protocol_ok = false;
+                return 0;
             }
             if (tag == TensorArgType::Inout ||
                 tag == TensorArgType::OutputExisting ||
@@ -2235,9 +2270,9 @@ PA_DEVICE bool PreparePaSharedWriterIntent(
 }
 
 // fresh descriptor 的内容写入每 task 独占的 shared-output cell，并通过
-// FlushRegion 让 descriptor 与 writer 起点先于 published 可见。调用者
-// 必须已经成功 CompleteTask/BuildWinner；因此 published 表示 producer
-// Submit 已封口，而不再只是“descriptor 已经构造”。
+// FlushRegion 让 descriptor 与 writer 起点先于 published 可见。published
+// 只表示后继可以读取 descriptor，不表示 producer 已 Build 或执行完成；
+// kernel completion 仍由独立 completion flag 表达。
 template <typename Ops>
 PA_DEVICE_NOINLINE void RollbackSharedTaskOutputs(
     PA_GM SharedOutputCell &cell, uint32_t output_count
@@ -2470,8 +2505,8 @@ PA_DEVICE bool BuildCallbackSubmitArgs(
 ) {
     CallbackSubmitArgsBuilder builder(args, Kind);
     // 外层 callback 和所有参数 thunk 都只在这一调用点同步执行。调用者决定
-    // 是否构参：private 仍全员 eager；shared 的 Alloc 保留全员轻构参，
-    // QK/SF/PV/UP 则只由 Claim winner 进入这里。
+    // 是否构参：private 仍全员 eager；shared 的五类 task 都只由 Claim
+    // owner 进入这里。
     auto callback = [&](CallbackSubmitArgsBuilder &out) PA_CALLBACK_LAMBDA_DEVICE {
         out.Begin();
         if constexpr (Kind == TaskKind::Alloc) {
@@ -2633,8 +2668,8 @@ PA_DEVICE bool CloseSharedCallbackSubmit(
     const uint64_t submit_end = is_last_submit ? Ops::Now() : 0;
 #else
     // 参考前端的 rt_submit_loser 仍是一次真实轻量 Submit；保留既有父
-    // 区间用于覆盖稳定符号返回及 non-final UP writer-ready 等待，但
-    // loser 不再写任何 winner-only child。
+    // 区间用于覆盖稳定符号返回和轻量收尾；loser 不等待 TensorMap，
+    // 也不再写任何 winner-only child。
     const uint64_t submit_end =
         TraceTimestamp<Ops>(stats.trace, stats.result);
 #endif
@@ -2689,19 +2724,15 @@ PA_DEVICE bool FinishSharedLoserSubmit(
         return false;
     }
 
-    // non-final UP 的 loser 只保留这一条业务必需的等待：winner 先登记
-    // INOUT writer intent，loser 才能返回前端并构造下一组。它不读取
-    // TaskArgs，也不进入 Materialize/Fanin/Register/BuildWinner。
-    if (shared_task_meta.has_following_group &&
-        !WaitForSharedWriterReady<Ops>(
-            state, static_cast<int32_t>(task_id), stats
-        )) {
-        return false;
-    }
+    // loser 只完成本次 Submit 的轻量收尾。TensorMap 插入、前沿等待、
+    // fanin lookup 与 Build 全部只属于 Claim owner；loser 不读取任何
+    // TensorMap 控制字，也不再等待 writer-ready 门。
     return CloseSharedCallbackSubmit<Ops, Profile>(
         state, stats, ticket, shared_task_meta
     );
 }
+
+#include "pa_shared_submit_path.h"
 #endif
 
 template <typename Ops, bool Profile, typename PmuContext>
@@ -2710,6 +2741,12 @@ PA_DEVICE bool FinishCallbackSubmitBody(
     const TaskArgs &args, SubmitContext &context, LocalStats &stats,
     PmuContext &pmu_context, const CallbackSubmitTicket &ticket
 ) {
+#if PTO_FDWIC_SHARED_MAP
+    (void)task_count;
+    return FinishSharedWinnerSubmitBody<Ops, Profile>(
+        state, worker, args, context, stats, pmu_context, ticket
+    );
+#else
     const uint32_t task_id = ticket.task_id;
 #if PTO_FDWIC_SHARED_MAP
     SharedPaTaskMeta shared_task_meta{};
@@ -3038,6 +3075,7 @@ PA_DEVICE bool FinishCallbackSubmitBody(
     if (task_id + 1 == task_count) stats.result.submit_end = submit_end;
     return true;
 #endif
+#endif
 }
 
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
@@ -3231,18 +3269,10 @@ PA_DEVICE bool SubmitCallbackTask(
     }
 #endif
 #if PTO_FDWIC_SHARED_MAP
-    if constexpr (Kind == TaskKind::Alloc) {
-        // 为对齐参考 alloc_tensors(args) 的调用形状，并把本小步变量限定
-        // 在四个重构参 task，Alloc 暂保留全员三个静态 Output 参数。
-        // standalone 的 output symbol 已由上方独立声明，并不依赖这次构参。
-        if (!BuildCallbackSubmitArgs<Kind>(orch, args, batch, stats)) {
-            SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
-            return false;
-        }
-    } else if (__builtin_expect(claim.won, 0)) {
+    if (__builtin_expect(claim.won, 0)) {
         // shared loser 已在上方声明稳定 output symbol；它不需要构造本 task
-        // 的 descriptor/scalar 参数。finish 的 loser 分支只闭合边界，不读
-        // 这里留下的上一 task args。
+        // 的 descriptor/scalar 参数，Alloc 也不例外。finish 的 loser
+        // 分支只闭合边界，不读这里留下的上一 task args。
         if (!BuildCallbackSubmitArgs<Kind>(orch, args, batch, stats)) {
             SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
             return false;
@@ -3596,8 +3626,8 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         // CCEC 可在这里开启本 worker 私有 PMU 窗口；CPU/AscendC 适配层是空实现。
         // 窗口覆盖本 worker 的全部调度期：从 orchestration 初始化前开始，
         // 依次包含 EfDrain、Claim、当前模式实际执行的参数构造与后续 Submit
-        // 阶段，到末次 Submit 返回。private 为全员 eager；shared 仅 Alloc
-        // 全员构参，其余 task 由 winner 构参。
+        // 阶段，到末次 Submit 返回。private 为全员 eager；shared 五类
+        // task 都只由 Claim owner 构参。
         // 它与全局“首 Submit.begin～末 Submit.end”口径接近但不相同，host sidecar
         // 必须按 per-worker 累计解释。泳道父边界在 PMU-only 构建中会被编译为空，
         // 不应污染 Submit 取数。

@@ -83,9 +83,10 @@ echo "[TEST] atomic PollBatch boundary self-test"
 "$BUILD_DIR/test_atomic_poll_batch"
 
 # TensorMap 独立回归不启动 96 个 worker，也不运行模拟 kernel：private
-# 覆盖单线程 ring 的回收回绕与 reference 差分；shared ordered ring 只作为
-# 未来非空 ordinary-region 的隔离原型，覆盖 seq/ABA、回收与容量预检。
-# 当前 shared PA Case1 已绕过该原型，不能用本测试冒充热路径证据。
+# 覆盖单线程 ring 的回收回绕与 reference 差分；shared ring 是当前
+# ordered writer-delta 的 ordinary-region 原语，隔离覆盖 seq/ABA、回收
+# 与容量预检。PA Case1 当前 ordinary entry 为零，因此这些门槛仍不能
+# 代替后面的完整 96-worker Submit 测试。
 if [[ "$TENSORMAP_MODE" == "private" ]]; then
     # 同一生产 helper 在固定 16K 总槽下覆盖多组 CAP×bucket 形态；
     # 正式 scheduler 仍只编默认 128，隔离门槛不冒充运行期 auto。
@@ -217,23 +218,19 @@ else
     echo "[TEST] shared winner materialize self-test"
     "$BUILD_DIR/test_shared_materialize"
 
-    # S3.2b 允许 heavy-task loser 把上一 task 的非空 args 地址传进 split
-    # finish，但 finish 不得读取其内容。guard page 会把任何字段访问立即
-    # 转成测试失败。测试宏还会在 G2 task4 发布 writer-ready 后、Build
-    # 前注入 terminal failure，并启动完整 96 worker 验证 task8 在途 slot
-    # 被统一撤销；普通 CPU/CCEC 构建不定义该宏。
-    echo "[BUILD] shared split-finish loser protected-args self-test"
+    # 新 shared 合同只串行 TensorMap writer 插入。测试一方面逐地址计数
+    # loser 的 shared-map load 必须为零，另一方面在 task4 发布插入前沿后
+    # 暂停其 Build，证明 task8 仍可完成 lookup 与 Build。
+    echo "[BUILD] shared ordered-insert Submit self-test"
     "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \
         -DPA_BUILD_SWIMLANE=1 \
-        -DPA_COMPETE_FIRST_SPLIT_FINISH=1 \
-        -DPA_TEST_SHARED_POST_GATE_BUILD_FAILURE=1 \
         -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/test/test_shared_loser_finish.cpp" \
-        -o "$BUILD_DIR/test_shared_loser_finish"
+        "$ROOT_DIR/test/test_shared_ordered_submit.cpp" \
+        -o "$BUILD_DIR/test_shared_ordered_submit"
 
-    echo "[TEST] shared split-finish loser protected-args self-test"
-    timeout --foreground 15s "$BUILD_DIR/test_shared_loser_finish"
+    echo "[TEST] shared ordered-insert Submit self-test"
+    timeout --foreground 15s "$BUILD_DIR/test_shared_ordered_submit"
 fi
 
 # set -e 保证编译或链接失败时不会打印 complete，也不会在组合构建中继续

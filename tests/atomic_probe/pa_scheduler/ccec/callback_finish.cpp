@@ -24,7 +24,7 @@
 using pa_scheduler_ccec::CcecOps;
 
 // finish 保持唯一的 cross-TU noinline 边界。入口只转交固定 POD ticket 与
-// TaskArgs；协议校验、Materialize/Fanin/Register/Build 均在公共实现中完成。
+// TaskArgs；协议校验、Materialize/Register/Fanin/Build 均在公共实现中完成。
 extern "C" {
 #if defined(PA_BUILD_AIC)
 __attribute__((noinline)) __aicore__ uint32_t

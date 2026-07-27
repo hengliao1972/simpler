@@ -9653,3 +9653,215 @@ CAS(expected=N, desired=N+1)
 
 本小步只加固控制原语，没有把 `committed_tasks` 接回 PA 热路径，没有
 改变 ABI、private 模式或 TensorMap 数据布局，也没有运行 A5。
+
+### 2026-07-27：R5b 建立“仅插入串行”的 shared Submit 基线
+
+本阶段按照重新确认的合同，只修改 standalone，不修改 simpler 真实路径，
+也不维护 AscendC。shared Submit 不再继续堆叠在 private 热函数的条件
+分支中，而是独立放到：
+
+```text
+common/pa_shared_submit_path.h
+```
+
+private 路径保持原控制流；shared 的 Claim owner 进入独立 finish：
+
+```text
+Claim(task N)
+  loser
+    -> 声明稳定 output symbol
+    -> 不构造重参数
+    -> 不读取/等待 TensorMap
+    -> 关闭轻量 Submit 并继续 replay
+
+  owner
+    -> 构造本 task 参数
+    -> Materialize descriptor
+    -> 在 owner 私有状态中准备 writer delta
+    -> 等待 task N 的 exact insert turn
+    -> 发布 ordinary/symbol/fresh-output 元数据
+    -> StoreBarrier
+    -> CAS 发布 N -> N+1
+    -> fanin lookup
+    -> Build
+    -> slot/drain 执行
+```
+
+这里全局串行的只有“等待 exact turn 到发布 `N+1`”这一小段。前沿一旦
+离开 N，N+1 owner 就能插入；N 的 fanin lookup、Build 和执行不再占用
+这条链。空 writer delta 也必须推进 task turn，否则后续 owner 会永久
+等待。Alloc/QK/SF/PV/UP 五类 task 均只由 Claim owner 构造重参数；
+稳定 `FdwicOutputRef` 在 Claim 后按 task/slot 确定，不依赖 loser
+重构参。
+
+#### writer delta 与发布边界
+
+`SharedTaskWriterDelta` 只保存 owner 在有序通道外准备好的 ordinary region
+条目，以及本 task 是否存在 writer intent。准备函数要求
+`context.register_mask` 与全部 `Inout/OutputExisting` tag 精确相等：
+缺位会漏 writer，多位会把非 writer 当成 writer，两者都在触碰共享状态前
+拒绝。
+
+拿到 exact turn 后，发布顺序固定为：
+
+```text
+整 task ordinary 容量预检
+  -> symbol immutable history / latest
+  -> ordinary payload / seq / tail
+  -> fresh descriptor / published
+  -> StoreBarrier
+  -> committed_tasks: N -> N+1
+```
+
+insert-before-lookup 版本暂时不能使用本 task 的 reader 前沿回收自己仍可能
+查询的 `N-H`，因此 production helper 固定 `reclaim_upto=-1`。满桶时
+fail-closed：设置 fatal，但 cursor、head/tail、slot seq/payload、
+symbol latest/history 和 fresh published 均不推进。默认 PA B256/G1
+的普通 region ring 为空，因此不触发该容量边界；这不能被解释成通用
+ordinary ring 已经支持无限 task。
+
+这里的 CCEC 可见性不能归功于名字抽象的 `StoreBarrier()`：当前 CCEC
+实现中该接口本身为空。真实发布边界来自每类 payload 的
+`FlushRegion(DCCI + dsb)` 及其后被消费返回值的发布 atomic；最后的
+turn CAS 只能在这些具体发布动作之后执行。CPU 的 `StoreBarrier()` 是
+顺序一致 fence，只用于宿主并发模型。后续分组前沿不得省略或打乱这些
+payload 级发布边界。
+
+#### fanin 统一过滤到 `[N-H,N)`
+
+owner 在发布自己的 writer 后才查询，因此查询必须同时做到：
+
+1. 排除本 task 和 future writer；
+2. 允许沿 symbol immutable history 从 future/latest 回退；
+3. 只保留 `producer >= N-H`。
+
+当前三种 fanin 来源使用同一半开窗口：
+
+| 来源 | 过滤方式 |
+| --- | --- |
+| ordinary region ring | `SharedLookupRegion()` 选择 `[N-H,N)` 内最大重叠 producer |
+| shared output symbol | `ResolveSharedSymbolWriterBefore()` 先回退到 `<N`，再过滤左边界 |
+| `TensorDesc::owner_task_id` | self/future 和高位非法值直接拒绝，早于左边界则不形成边 |
+
+symbol 的 descriptor origin 可以早于窗口，只要 latest prior writer 位于
+窗口内仍可形成依赖；若最终 prior writer 已经早于左边界，则按 external/
+no-dependency 返回，而不是把过期 task id 写入 fanin。
+
+#### 并发门槛证明的内容
+
+`test_shared_ordered_submit.cpp` 使用真实 96 worker 和 split-finish 入口，
+分三项闭合边界：
+
+- loser 在 `committed_tasks=77` 的反例状态下直接返回，对
+  `SharedTensorMapSidecar` 地址发起的 `Ops::Load` 次数严格为 0；
+- B1/G4 暂停 task 4 的 post-insert、pre-lookup 位置，task 8 仍完成
+  lookup 和 Build，且 task 4 completion flag 仍为 0；
+- B2/G1 暂停 batch0 UP task 4，独立 batch1 QK task 6 已实际完成并把
+  completion flag 置 1 后才释放 task 4，证明执行也没有被插入链串行化。
+
+`test_shared_writer_intent.cpp` 另外覆盖：
+
+- ordinary 和 symbol 两类 INOUT 在“先插入自己、后查询”形态下均返回
+  前任而非自身；
+- 同一个 task 的一次 production publish 同时包含 ordinary writer、
+  symbol INOUT history 和 fresh output，并由后继 reader 闭环消费；
+- 空 writer task 仍推进前沿；
+- symbol 与显式 owner 在 `N-H` 边界接收、在 `N-H-1` 排除，并拒绝
+  self/future owner；
+- 混合 ordinary+symbol+fresh writer 遇到满桶时，production
+  `PublishSharedTaskWriterDelta()` 在整批容量预检处失败，不改 cursor、
+  ring、symbol history/latest 或 fresh descriptor/published；
+- register mask 缺位、多位和精确集合的正反例。
+
+旧 `test_shared_loser_finish.cpp` 固定的是“non-final UP loser 等
+writer-ready”的过渡合同，已经与当前目标矛盾且不再进入 build。本阶段
+删除该文件，不把失效红灯藏在构建列表之外；仍有价值的 loser 零访问、
+split finish、错误状态和并发边界已由新定向测试及 CCEC split 构建承担。
+
+#### 泳道与 host 校验联动
+
+新 winner 业务顺序为：
+
+```text
+Materialize -> Register(ordered insert) -> Fanin -> WinnerBuild
+```
+
+Alloc 没有 fanin lookup，因此不再生成零业务含义的 Fanin span。raw
+validator、稀疏 trace 正反例和记录数公式同步到该顺序；Register 的
+`auxiliary` 表示 ordinary writer 数，Alloc 要求 0，普通 task 接受
+`[0,kMaxTaskTensors]`，不再把旧 symbol writer 数硬编码为 1。
+
+CPU 开启泳道的 B1/G4 实测生成 6964 条 raw record，host 期望也是
+6964，逐 worker 数量、稀疏阶段顺序和零 dropped 全部通过。对应本轮
+临时验证产物为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260727_171927_799726/cpu/
+```
+
+该目录是本地验证产物，不进入代码提交。
+
+#### 本阶段验证结果
+
+最终源码下执行：
+
+```bash
+./run.sh build cpu --tensormap shared
+
+./run.sh run cpu --tensormap shared \
+  --batches 1 --shared-context-lens 32768 \
+  --runs 1 --no-swimlane \
+  --winner-workload scalar-nop --nop-count 1
+
+./run.sh run cpu --tensormap shared \
+  --batches 256 --shared-context-lens 8192 \
+  --runs 1 --no-swimlane \
+  --winner-workload scalar-nop --nop-count 1
+
+./run.sh swimlane cpu --tensormap shared \
+  --batches 1 --shared-context-lens 32768 \
+  --winner-workload scalar-nop --nop-count 1
+```
+
+全部通过。B1/G4 最终 `committed_tasks=17`；B256/G1 为 1280 task、
+1024 kernel，最终 `committed_tasks=1280`，96 核唯一 winner、依赖
+signature、INOUT history、heap cursor 和完成 flag 全部通过。CPU 的
+墙钟时间受宿主线程调度影响，只作为正确性执行证据，不用于推断 A5 性能。
+
+使用本用户 CANN 9.1：
+
+```bash
+source /home/q00473782/Ascend/cann-9.1.0-weekly-20260708/\
+cann-9.1.0/set_env.sh
+./run.sh build ccec --tensormap shared
+```
+
+AIC/AIV generic protocol、正式 entry、role-specific real-compute、
+split runtime/state/finish、1:2 mixed ELF、LOCAL helper、零 relocation
+和 artifact manifest 全部通过。该结果只证明 CCEC 能生成并链接当前
+路径；设备正在被其他任务使用，本阶段没有运行 A5，不能把编译成功写成
+上板成功。
+
+#### 下一阶段：先补观察，再做交错前沿
+
+当前 G=1 的 `committed_tasks` 是所有 future owner 轮询的同一 atomic
+地址。后续性能候选不是建立多条独立插入链，而是把同一前驱 token
+交错放到 G=1/2/4/8 条 cache line：
+
+```text
+task N 等 turn[N % G] == N
+发布完成后：
+  next = N + 1
+  CAS(
+      turn[next % G],
+      next >= G ? next - G : -1,
+      next
+  )
+```
+
+G=1 必须退化为当前完全相同的 `N -> N+1`。每 task 仍只有一次发布
+CAS，插入仍严格串行；变化只是 future owner 的等待 load 分散到不同
+地址。正式实现前先给 insert-turn wait/publish 增加最小聚合观察，确认
+每 task 发布 CAS 恰好一次并能比较各 lane 的轮询量，随后再用独立提交
+验证 G=1/2/4/8。不能把独立 shard cursor 当作等价方案，因为那会允许
+不同 shard 同时修改 TensorMap，破坏本阶段刚闭合的唯一有序插入合同。
