@@ -8166,3 +8166,111 @@ GM 可见性验证。shared 的
 winner 的等待、远端 task 4 commit、恢复 lookup 和最终 Build 在一个真实
 并发闭环内成立；完成后再审视解除 shared backend-ready 门禁所缺的
 A5 GM 可见性与完整 PA 条件。
+
+### 2026-07-27：R3d 闭合 PA G2 future winner 的跨核 writer-chain
+
+R3c 在单 worker 中证明了 task 4 与 task 8 的普通 region writer 链，但其
+提交顺序由测试线程串行推进，尚未证明 future winner 提前到达时会在远端
+事务提交后恢复。R3d 不先修改 runtime，而是新增聚焦门槛
+`PaG2FutureFinalUpWaitsForRemoteFirstUpWriterCommit`，直接验证现有
+exact-turn 是否已经提供所需语义。
+
+#### 并发顺序
+
+测试保持 R3c 的 G2 业务依赖：
+
+```text
+0 Alloc
+1 QK0 -> 2 SF0 -> 3 PV0 -> 4 UP0
+5 QK1 -> 6 SF1 -> 7 PV1 -> 8 UP1
+```
+
+具体执行顺序为：
+
+1. 直接提交 task 0～3 的 shared map 事务，把
+   `committed_tasks` 推进到 4；task 1 仍只种入用于检查
+   `manual_dep` 查、插过滤的 `out_view -> producer 1` 人工哨兵。
+2. AIV0 从 `local_index=4` 执行 task 4 的真实
+   `Begin`，完成 production Claim 后暂不调用 `Finish`。其参数方向与
+   PA UP 一致，并带 `is_first=1,is_last=0`。
+3. AIV1 从 `local_index=8` 执行 task 8 的真实
+   `Begin/Finish`，参数带 `is_first=0,is_last=1`；task 4 与 task 8 的
+   ID 都落在
+   `vector_cursor[0]`，因此 cursor 依次从 `-1` 推进到 4、8，两次
+   Claim 都是真实 winner Claim。
+4. task 8 在 `committed_tasks=4` 时进入 production
+   `dist_submit_wait_shared_tensor_map_turn()`。此时它没有返回，也不可能
+   进入后面的 Fanin、Register 或 Build。
+5. AIV0 调用真实 task 4 `Finish`，完成 Fanin、Register、shared
+   commit 和 WinnerBuild，把 commit 推进到 5。
+6. 测试先在 `committed_tasks=5` 时确认 task 8 仍继续执行 exact-turn
+   等待且 Finish 未返回，再依次直接提交 task 5～7 的空 shared map
+   事务；只有 task 7 把
+   commit 推进到 8 后，task 8 才恢复 lookup，取得 task 4 的最新 writer，
+   最终提交 task 8 并 Build。
+
+测试没有在 task 4 之前提前提交 task 5～7，因为那会破坏
+`0..N` 连续发布合同，制造 production 不允许的事务顺序。
+
+#### 精确业务断言
+
+| 检查点 | 断言 |
+| --- | --- |
+| task 8 等待时 | `committed_tasks=4`、`vector_cursor[0]=8`、Finish 未返回 |
+| task 4 提交后 | 三个 accumulator latest 都为 4，`out_view` latest 仍为 1 |
+| task 4 RingSlot | fanin 精确为 `{0,2,3}`，各一次，不含 1 |
+| task 8 RingSlot | fanin 精确为 `{0,4,6,7}`，各一次，不含 1 |
+| 最终 shared map | 三个 accumulator latest 都为 8，`out_view` latest 仍为 1 |
+| 最终提交状态 | `committed_tasks=9`、`vector_cursor[0]=8`、无 fatal/error |
+| worker 状态 | AIV0/AIV1 的 `local_index` 分别为 5/9，各只 Build 一个 task |
+| private 隔离 | 两个 worker 的 private TensorMap 都逐字节不变 |
+
+活跃 worker 期间，主线程只读取测试原子量、shared commit 和 Claim
+cursor，不读取可能仍被 worker 修改的 ticket、RingSlot、`local_index`
+等普通字段。任一释放异常或完成超时都会先发布 fatal，让 production wait
+退出并 join；所有普通状态都在 join 后断言。这一组织方式避免用测试自身的
+数据竞态或提前析构掩盖 runtime 问题。
+
+#### 证据边界
+
+该用例是“G2 future-turn/writer-chain 聚焦门槛”，不是完整 G2 多核 PA：
+
+- R3b 的通用两 task 门槛已用从 0 开始的真实 loser replay 证明
+  `local_index` 推进机制；它没有证明 G2 的 `0..8` 逐核回放。本用例手动
+  设置 4/8，只把 Claim、等待、远端提交、恢复 lookup 和 Build 放进同一
+  并发闭环，避免把两种证据混称为完整 replay。
+- task 0～3、5～7 只提交 shared map 事务，没有 Build 或执行对应
+  Alloc/QK/SF/PV kernel。
+- task 4/8 使用 PA UP 相同的七个 tensor 方向和两个
+  `is_first/is_last` scalar，但 tensor 地址与 producer 是测试构造；本用例
+  不覆盖 task 4/8 loser 或后续 light-loser 路径。
+- `out_view -> producer 1` 是错误查插探针，不是 PA 的真实 QK 输出。
+- 本用例不证明 96 核 replay、FinalDrain、数值 golden、A5 GM cache
+  可见性或 shared A5 后端已经可放行。
+
+在当前实现中，task N winner 只有等到 `committed_tasks == N` 才开始
+TensorMap lookup。R3d 已直接证明 task 8 不能越过 task 4 的事务，并会在
+远端 commit 后取得 writer 4。因此当前 exact-turn 下仍不需要额外
+region-intent；现在加入只会重复同步并扩大 atomic 面。只有后续引入
+stable shared-output、winner-only 构参和 light loser，并准备放松全局
+exact-turn 时，才重新评估非末组 UP 的 writer-ready gate。
+
+这里等待的是 task 4 的 TensorMap writer 元数据事务，而不是 task 4 kernel
+执行结束：production 顺序是 Register/shared commit 在 WinnerBuild 之前。
+该区分与 PA 跨组依赖一致——task 8 先取得 producer 4 作为 fanin，真正执行
+仍由 task flag 保证在 task 4 kernel 完成之后。
+
+#### 验证结果
+
+| 检查 | 结果 |
+| --- | --- |
+| 新 G2 future-turn 定向重复 | 100/100 PASS |
+| shared multiworker 全组 | 6/6 PASS |
+| FDWIC CPU CTest | 24/24 PASS |
+| GCC15 ASan + UBSan multiworker | 6/6 PASS，无报告 |
+| GCC15 TSan multiworker | 6/6 PASS，无普通数据竞态报告 |
+| production 源码 | 无修改 |
+
+TSan 仍报告仓库既有的 `atomic_thread_fence` 不受该工具完整支持的编译告警，
+所以该结果只证明宿主测试没有可见的普通 data race，不替代 A5 GM 可见性
+验证。

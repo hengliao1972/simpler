@@ -14,7 +14,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -111,6 +113,12 @@ Tensor make_existing_tensor(uint64_t address) {
     return tensor;
 }
 
+Tensor make_owned_tensor(uint64_t address, int32_t owner) {
+    Tensor tensor = make_existing_tensor(address);
+    tensor.owner_task_id = PTO2TaskId::make(0, static_cast<uint32_t>(owner));
+    return tensor;
+}
+
 void install_test_callable(
     Runtime &runtime, int32_t kernel_id, void (*kernel)(int64_t *), std::vector<uint8_t> &storage
 ) {
@@ -149,6 +157,16 @@ const RingSlot *find_built_slot(const DistCore &worker, int32_t task_id) {
         }
     }
     return nullptr;
+}
+
+int32_t fanin_occurrences(const RingSlot &slot, int32_t producer) {
+    int32_t count = 0;
+    for (int32_t index = 0; index < slot.fanin_count; ++index) {
+        if (slot.fanin[index] == producer) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 class FdwicSharedMultiworkerTest : public ::testing::Test {
@@ -221,6 +239,14 @@ protected:
         fdwic_shared_multiworker_test::g_limit_spins_after_remote_fatal = false;
         g_self = nullptr;
         g_dist_ptr = nullptr;
+    }
+
+    void publish_seed_task(const SharedTensorMapValue *entries, uint32_t count, int32_t task) {
+        ASSERT_EQ(
+            dist_shared_tensor_map_publish_task(g_dist.shared_tensor_map, entries, count, task, kHDefault),
+            DistSharedTensorMapTaskPublishResult::Committed
+        );
+        ASSERT_EQ(atomic_load(g_dist.shared_tensor_map.committed_tasks.v), task + 1);
     }
 
     Runtime runtime_;
@@ -325,6 +351,267 @@ TEST_F(FdwicSharedMultiworkerTest, FutureTurnWaitsForPriorCommitThenBuildsWithDe
     EXPECT_EQ(task0_slot->fanin_count, 0);
     ASSERT_EQ(task1_slot->fanin_count, 1);
     EXPECT_EQ(task1_slot->fanin[0], 0);
+}
+
+TEST_F(FdwicSharedMultiworkerTest, PaG2FutureFinalUpWaitsForRemoteFirstUpWriterCommit) {
+    constexpr int32_t kUpKernelId = 25;
+    Tensor mi_update = make_owned_tensor(0x510000, /*owner=*/0);
+    Tensor li_update = make_owned_tensor(0x520000, /*owner=*/0);
+    Tensor oi = make_owned_tensor(0x530000, /*owner=*/0);
+    Tensor out_view = make_existing_tensor(0x540000);
+    out_view.manual_dep = true;
+
+    const Tensor group0_mi = make_owned_tensor(0x610000, /*owner=*/2);
+    const Tensor group0_li = make_owned_tensor(0x620000, /*owner=*/2);
+    const Tensor group0_oi_new = make_owned_tensor(0x630000, /*owner=*/3);
+    const Tensor group1_mi = make_owned_tensor(0x710000, /*owner=*/6);
+    const Tensor group1_li = make_owned_tensor(0x720000, /*owner=*/6);
+    const Tensor group1_oi_new = make_owned_tensor(0x730000, /*owner=*/7);
+
+    // Seed only the exact-turn transactions for Alloc/QK/SF/PV. The task1
+    // out_view entry is an impossible PA value used to detect an accidental
+    // manual_dep lookup or register; it is not a model of QK output semantics.
+    ASSERT_NO_FATAL_FAILURE(publish_seed_task(nullptr, 0, /*task=*/0));
+    const SharedTensorMapValue manual_poison = dist_shared_tensor_map_make_value(out_view, /*producer=*/1);
+    ASSERT_NO_FATAL_FAILURE(publish_seed_task(&manual_poison, 1, /*task=*/1));
+    ASSERT_NO_FATAL_FAILURE(publish_seed_task(nullptr, 0, /*task=*/2));
+    ASSERT_NO_FATAL_FAILURE(publish_seed_task(nullptr, 0, /*task=*/3));
+
+    L0TaskArgs up0_args;
+    up0_args.add_input(group0_mi, group0_li, group0_oi_new);
+    up0_args.add_inout(mi_update, li_update, oi, out_view);
+    up0_args.add_scalar(/*is_first=*/1, /*is_last=*/0);
+    L0TaskArgs up1_args;
+    up1_args.add_input(group1_mi, group1_li, group1_oi_new);
+    up1_args.add_inout(mi_update, li_update, oi, out_view);
+    up1_args.add_scalar(/*is_first=*/0, /*is_last=*/1);
+    MixedKernels mixed;
+    mixed.aiv0_kernel_id = kUpKernelId;
+
+    std::vector<std::byte> task0_private_map_before(sizeof(task0_worker_->map));
+    std::vector<std::byte> task1_private_map_before(sizeof(task1_worker_->map));
+    std::memcpy(task0_private_map_before.data(), &task0_worker_->map, task0_private_map_before.size());
+    std::memcpy(task1_private_map_before.data(), &task1_worker_->map, task1_private_map_before.size());
+
+    // The existing sequential-replay gate proves local_index progression from
+    // zero. This focused gate starts directly at the two real G2 UP identities
+    // so both workers still perform production Claim and Finish.
+    task0_worker_->local_index = 4;
+    task1_worker_->local_index = 8;
+    const DistCompeteFirstTicket up0_ticket = dist_submit_compete_first_begin(nullptr, mixed);
+    ASSERT_EQ(up0_ticket.task_id, 4);
+    ASSERT_EQ(up0_ticket.ready, 1);
+    ASSERT_EQ(up0_ticket.claim_attempted, 1);
+    ASSERT_EQ(up0_ticket.won, 1);
+    ASSERT_EQ(atomic_load(g_dist.vector_cursor[0].v), 4);
+    ASSERT_EQ(atomic_load(g_dist.shared_tensor_map.committed_tasks.v), 4);
+
+    DistCompeteFirstTicket up1_ticket{};
+    std::exception_ptr up1_error;
+    std::atomic<bool> up1_finish_returned{false};
+    std::thread up1_thread([&]() {
+        try {
+            g_self = task1_worker_.get();
+            up1_ticket = dist_submit_compete_first_begin(nullptr, mixed);
+            fdwic_shared_multiworker_test::g_observe_turn_wait = true;
+            fdwic_shared_multiworker_test::g_limit_spins_after_remote_fatal = true;
+            (void)dist_submit_compete_first_finish(nullptr, mixed, up1_ticket, up1_args);
+        } catch (...) {
+            up1_error = std::current_exception();
+        }
+        fdwic_shared_multiworker_test::g_limit_spins_after_remote_fatal = false;
+        fdwic_shared_multiworker_test::g_observe_turn_wait = false;
+        up1_finish_returned.store(true, std::memory_order_release);
+        g_self = nullptr;
+    });
+
+    const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (fdwic_shared_multiworker_test::g_observed_turn_wait_spins.load(std::memory_order_acquire) == 0 &&
+           !up1_finish_returned.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < wait_deadline) {
+        std::this_thread::yield();
+    }
+
+    // The observation hook is enabled only around task8 Finish. Together with
+    // committed=4 and cursor=8, a positive count proves the future winner
+    // reached the production exact-turn loop before task4 was released.
+    const bool up1_entered_turn_wait =
+        fdwic_shared_multiworker_test::g_observed_turn_wait_spins.load(std::memory_order_acquire) != 0;
+    const bool up1_returned_before_release = up1_finish_returned.load(std::memory_order_acquire);
+    const int64_t committed_before_release = atomic_load(g_dist.shared_tensor_map.committed_tasks.v);
+    const int64_t vector_cursor_before_release = atomic_load(g_dist.vector_cursor[0].v);
+
+    std::exception_ptr release_error;
+    int64_t committed_after_up0 = -1;
+    std::array<int32_t, 4> latest_after_up0 = {-1, -1, -1, -1};
+    std::array<bool, 4> protocol_after_up0 = {false, false, false, false};
+    std::array<DistSharedTensorMapTaskPublishResult, 3> filler_results = {
+        DistSharedTensorMapTaskPublishResult::ProtocolError,
+        DistSharedTensorMapTaskPublishResult::ProtocolError,
+        DistSharedTensorMapTaskPublishResult::ProtocolError,
+    };
+    bool up1_waited_after_up0 = false;
+    bool up1_returned_after_up0 = true;
+    int64_t committed_while_waiting_after_up0 = -1;
+
+    try {
+        // task4 performs the real fanin/register/commit/Build path. Task8 must
+        // remain blocked at turn 8 while tasks 5-7 are still absent.
+        (void)dist_submit_compete_first_finish(nullptr, mixed, up0_ticket, up0_args);
+        committed_after_up0 = atomic_load(g_dist.shared_tensor_map.committed_tasks.v);
+        if (committed_after_up0 == 5 && !fatal_set()) {
+            latest_after_up0[0] = dist_shared_tensor_map_lookup_tensor(
+                g_dist.shared_tensor_map, mi_update, 5, kHDefault, protocol_after_up0[0]
+            );
+            latest_after_up0[1] = dist_shared_tensor_map_lookup_tensor(
+                g_dist.shared_tensor_map, li_update, 5, kHDefault, protocol_after_up0[1]
+            );
+            latest_after_up0[2] =
+                dist_shared_tensor_map_lookup_tensor(g_dist.shared_tensor_map, oi, 5, kHDefault, protocol_after_up0[2]);
+            latest_after_up0[3] = dist_shared_tensor_map_lookup_tensor(
+                g_dist.shared_tensor_map, out_view, 5, kHDefault, protocol_after_up0[3]
+            );
+        }
+    } catch (...) {
+        release_error = std::current_exception();
+    }
+
+    if (release_error == nullptr && committed_after_up0 == 5 && !fatal_set()) {
+        // Observe another exact-turn spin while commit is already five. This
+        // directly proves task8 does not resume merely because task4 became
+        // visible; turns 5-7 must still publish before its lookup can start.
+        const uint32_t spins_after_up0 =
+            fdwic_shared_multiworker_test::g_observed_turn_wait_spins.load(std::memory_order_acquire);
+        const auto continued_wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (fdwic_shared_multiworker_test::g_observed_turn_wait_spins.load(std::memory_order_acquire) ==
+                   spins_after_up0 &&
+               !up1_finish_returned.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < continued_wait_deadline) {
+            std::this_thread::yield();
+        }
+        up1_returned_after_up0 = up1_finish_returned.load(std::memory_order_acquire);
+        committed_while_waiting_after_up0 = atomic_load(g_dist.shared_tensor_map.committed_tasks.v);
+        up1_waited_after_up0 =
+            fdwic_shared_multiworker_test::g_observed_turn_wait_spins.load(std::memory_order_acquire) >
+                spins_after_up0 &&
+            !up1_returned_after_up0 && committed_while_waiting_after_up0 == 5;
+
+        try {
+            for (int32_t task = 5; task <= 7; ++task) {
+                filler_results[task - 5] =
+                    dist_shared_tensor_map_publish_task(g_dist.shared_tensor_map, nullptr, 0, task, kHDefault);
+            }
+        } catch (...) {
+            release_error = std::current_exception();
+        }
+    }
+
+    bool release_completed = release_error == nullptr && committed_after_up0 == 5;
+    for (const DistSharedTensorMapTaskPublishResult result : filler_results) {
+        release_completed &= result == DistSharedTensorMapTaskPublishResult::Committed;
+    }
+    if (!release_completed) {
+        set_fatal_code(PTO2_ERROR_EXPLICIT_ORCH_FATAL);
+        fdwic_shared_multiworker_test::g_remote_fatal_published.store(true, std::memory_order_release);
+    }
+
+    const auto completion_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!up1_finish_returned.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < completion_deadline) {
+        std::this_thread::yield();
+    }
+    const bool up1_timed_out = !up1_finish_returned.load(std::memory_order_acquire);
+    if (up1_timed_out) {
+        set_fatal_code(PTO2_ERROR_EXPLICIT_ORCH_FATAL);
+        fdwic_shared_multiworker_test::g_remote_fatal_published.store(true, std::memory_order_release);
+    }
+    up1_thread.join();
+
+    EXPECT_TRUE(up1_entered_turn_wait);
+    EXPECT_FALSE(up1_returned_before_release);
+    EXPECT_FALSE(up1_timed_out);
+    EXPECT_EQ(committed_before_release, 4);
+    EXPECT_EQ(vector_cursor_before_release, 8);
+    EXPECT_EQ(committed_after_up0, 5);
+    EXPECT_TRUE(up1_waited_after_up0);
+    EXPECT_FALSE(up1_returned_after_up0);
+    EXPECT_EQ(committed_while_waiting_after_up0, 5);
+    for (const bool protocol_ok : protocol_after_up0) {
+        EXPECT_TRUE(protocol_ok);
+    }
+    EXPECT_EQ(latest_after_up0[0], 4);
+    EXPECT_EQ(latest_after_up0[1], 4);
+    EXPECT_EQ(latest_after_up0[2], 4);
+    EXPECT_EQ(latest_after_up0[3], 1);
+    for (const DistSharedTensorMapTaskPublishResult result : filler_results) {
+        EXPECT_EQ(result, DistSharedTensorMapTaskPublishResult::Committed);
+    }
+
+    if (release_error != nullptr) {
+        try {
+            std::rethrow_exception(release_error);
+        } catch (const std::exception &error) {
+            ADD_FAILURE() << "task4 release threw: " << error.what();
+        } catch (...) {
+            ADD_FAILURE() << "task4 release threw a non-standard exception";
+        }
+    }
+    if (up1_error != nullptr) {
+        try {
+            std::rethrow_exception(up1_error);
+        } catch (const std::exception &error) {
+            ADD_FAILURE() << "task8 worker threw: " << error.what();
+        } catch (...) {
+            ADD_FAILURE() << "task8 worker threw a non-standard exception";
+        }
+    }
+
+    EXPECT_EQ(up1_ticket.task_id, 8);
+    EXPECT_EQ(up1_ticket.ready, 1);
+    EXPECT_EQ(up1_ticket.claim_attempted, 1);
+    EXPECT_EQ(up1_ticket.won, 1);
+    EXPECT_EQ(g_dist.fatal, 0);
+    EXPECT_EQ(g_dist.error_code, PTO2_ERROR_NONE);
+    EXPECT_EQ(atomic_load(g_dist.shared_tensor_map.committed_tasks.v), 9);
+    EXPECT_EQ(atomic_load(g_dist.vector_cursor[0].v), 8);
+    EXPECT_EQ(task0_worker_->local_index, 5);
+    EXPECT_EQ(task1_worker_->local_index, 9);
+
+    EXPECT_EQ(built_slot_count(*task0_worker_), 1);
+    EXPECT_EQ(built_slot_count(*task1_worker_), 1);
+    const RingSlot *up0_slot = find_built_slot(*task0_worker_, 4);
+    const RingSlot *up1_slot = find_built_slot(*task1_worker_, 8);
+    ASSERT_NE(up0_slot, nullptr);
+    ASSERT_NE(up1_slot, nullptr);
+    EXPECT_EQ(up0_slot->fanin_count, 3);
+    EXPECT_EQ(fanin_occurrences(*up0_slot, 0), 1);
+    EXPECT_EQ(fanin_occurrences(*up0_slot, 1), 0);
+    EXPECT_EQ(fanin_occurrences(*up0_slot, 2), 1);
+    EXPECT_EQ(fanin_occurrences(*up0_slot, 3), 1);
+    EXPECT_EQ(up0_slot->scalar_count, 2);
+    EXPECT_EQ(up0_slot->scalars[0], 1);
+    EXPECT_EQ(up0_slot->scalars[1], 0);
+    EXPECT_EQ(up1_slot->fanin_count, 4);
+    EXPECT_EQ(fanin_occurrences(*up1_slot, 0), 1);
+    EXPECT_EQ(fanin_occurrences(*up1_slot, 1), 0);
+    EXPECT_EQ(fanin_occurrences(*up1_slot, 4), 1);
+    EXPECT_EQ(fanin_occurrences(*up1_slot, 6), 1);
+    EXPECT_EQ(fanin_occurrences(*up1_slot, 7), 1);
+    EXPECT_EQ(up1_slot->scalar_count, 2);
+    EXPECT_EQ(up1_slot->scalars[0], 0);
+    EXPECT_EQ(up1_slot->scalars[1], 1);
+
+    bool protocol_ok = false;
+    EXPECT_EQ(dist_shared_tensor_map_lookup_tensor(g_dist.shared_tensor_map, mi_update, 9, kHDefault, protocol_ok), 8);
+    EXPECT_TRUE(protocol_ok);
+    EXPECT_EQ(dist_shared_tensor_map_lookup_tensor(g_dist.shared_tensor_map, li_update, 9, kHDefault, protocol_ok), 8);
+    EXPECT_TRUE(protocol_ok);
+    EXPECT_EQ(dist_shared_tensor_map_lookup_tensor(g_dist.shared_tensor_map, oi, 9, kHDefault, protocol_ok), 8);
+    EXPECT_TRUE(protocol_ok);
+    EXPECT_EQ(dist_shared_tensor_map_lookup_tensor(g_dist.shared_tensor_map, out_view, 9, kHDefault, protocol_ok), 1);
+    EXPECT_TRUE(protocol_ok);
+
+    EXPECT_EQ(std::memcmp(task0_private_map_before.data(), &task0_worker_->map, task0_private_map_before.size()), 0);
+    EXPECT_EQ(std::memcmp(task1_private_map_before.data(), &task1_worker_->map, task1_private_map_before.size()), 0);
 }
 
 TEST_F(FdwicSharedMultiworkerTest, RemoteFatalInterruptsSlotCapacityWait) {
