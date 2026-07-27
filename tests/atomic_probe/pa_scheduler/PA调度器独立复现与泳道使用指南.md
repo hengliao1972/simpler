@@ -34,7 +34,9 @@ frontier 和 worker 状态，任一不符都会返回失败。
 compete-first eager：每核构造五类完整 `TaskArgs` 并执行 per-worker
 Materialize/map 前端。shared 的 Alloc/QK/SF/PV/UP 五类 task 都只有
 Claim owner 构参和 Materialize；loser 只声明稳定 output symbol，并闭合
-轻量 Submit 边界，不等待或访问 TensorMap。CCEC 正式泳道构建将
+轻量 Submit 边界。这里的零访问从 Claim 已经判负后的 finish/replay 入口
+开始：该路径不等待或访问 TensorMap；Claim 自身仍会访问位于 shared
+sidecar 的 Vector cursor，不属于该断言。CCEC 正式泳道构建将
 orchestration caller、每核 runtime state 和 noinline finish 拆分为独立
 TU；CPU 使用同一公共业务模板做协议回归。本阶段只验收 CCEC 与 CPU，
 不把 AscendC 结果写进闭环证据。
@@ -43,7 +45,7 @@ Case1 的 task 不是五个彼此独立的占位符。standalone 会从 Tensor d
 owner 和当前构建模式的 TensorMap 收集 producer，去重后构造下列 fanin 图：
 
 | task | 直接 producer | fanin 数 |
-| --- | --- | ---: |
+| ---- | ------------- | -------: |
 | Alloc | 无 | 0 |
 | QK | 无；query/key/block-table 是外部输入 | 0 |
 | SF | QK | 1 |
@@ -86,7 +88,7 @@ Register、PrepareMap 或等待路径中插入虚假延时。
 时钟、winner 计算体和启动入口。
 
 | 后端 | 启动形式 | atomic load | Claim fetch-max | 当前 winner 负载 |
-| --- | --- | --- | --- | --- |
+| ---- | -------- | ----------- | --------------- | ---------------- |
 | CCEC | 1:2 mixed AIC/AIV ELF | `atomicAdd(addr, 0)` | `atomicMax` | `scalar-nop` 或 A5 Cube/Vector 真计算 |
 | AscendC | `__mix__(1, 2)` | `AtomicAdd(addr, 0)` | `AtomicMax` | `scalar-nop` 或 A5 Cube/Vector 真计算 |
 | CPU | 96 个 pthread | `fetch_add(0)` | C++17 CAS loop | `scalar-nop` 或 CPU 对等浮点算术 |
@@ -104,7 +106,7 @@ Cube/Vector 指令、流水线、GM 搬运和 PMU 语义，host pthread 耗时�
 真实 PA 最好泳道中四类 kernel 的 1 GHz counter 均值和当前 A5 NOP 校准值为：
 
 | Kernel | 目标时间 | `scalar-nop` 标定数 |
-| --- | ---: | ---: |
+| ------ | -------: | ------------------: |
 | QK | 44.170 us | 129,600 |
 | SF | 53.729 us | 157,900 |
 | PV | 27.626 us | 79,950 |
@@ -208,7 +210,7 @@ CCEC 与 AscendC 使用本用户安装的 CANN 9.1。非交互 shell 不保证�
 ```bash
 cd /path/to/pa_scheduler
 
-source /home/q00473782/Ascend/cann-9.1.0-weekly-20260708/cann-9.1.0/set_env.sh
+source "$HOME/Ascend/cann-9.1.0-weekly-20260708/cann-9.1.0/set_env.sh"
 
 export CXX=/usr/bin/g++
 
@@ -229,10 +231,10 @@ mixed 的两个入口和 metadata section；CANN 9.1 自带的 PTO 头可直接�
 代码的统一 CCEC ELF：
 
 | 构建 | 后端 | 内容 | 构建命令 | 产物目录 |
-| --- | --- | --- | --- | --- |
+| ---- | ---- | ---- | -------- | -------- |
 | `swimlane` | CCEC/AscendC/CPU | schema-v4 普通阶段、业务父区间、真实 Submit 尾动作与 atomic（direct + PollBatch）合并采集；不配置 PMU | `./run.sh build ccec --tensormap <mode>` 或 `./run.sh build all --tensormap <mode>` | `build/<backend>/<mode>/swimlane/` |
 | `perf-clock` | CCEC/CPU | 编译掉泳道、atomic 观察、phase-profile、PMU 和 kernel/lifecycle 计时；每核只新增首个 Submit 起点与末个 Submit 终点两个性能边界 | `./run.sh build-perf-clock ccec\|cpu --tensormap <mode>` | `build/<backend>/<mode>/perf-clock/` |
-| `submit-pmu` | 仅 CCEC | 每核完整 Submit PMU，并在编译期可选一个局部阶段；当前有 `none|claim|efdrain|materialize|register` | `./run.sh build-submit-pmu ccec <phase> --tensormap <mode>` | `build/ccec/<mode>/submit-pmu/<phase>/` |
+| `submit-pmu` | 仅 CCEC | 每核完整 Submit PMU，并在编译期可选一个局部阶段；当前有 `none\|claim\|efdrain\|materialize\|register` | `./run.sh build-submit-pmu ccec <phase> --tensormap <mode>` | `build/ccec/<mode>/submit-pmu/<phase>/` |
 
 `./run.sh build all` 只构建三后端的 `swimlane` 产物；`perf-clock`
 只支持当前验收范围内的 CCEC/CPU，必须逐后端构建；`submit-pmu` 必须按
@@ -244,8 +246,16 @@ benchmark 运行时参数；省略时默认 `private`。它与 `swimlane`/
 `perf-clock`/`submit-pmu` 正交，并进入产物目录、CCEC manifest 以及
 host/device `magic + ABI version + mode + build variant +
 sizeof(SchedulerState)` 握手。CCEC 的 swimlane/perf-clock 两件套和
-submit-pmu 四件套都必须通过 manifest 的模式、变体、阶段和 SHA256
-校验，才能启动 host。
+submit-pmu 四件套都必须通过 manifest 的模式、CAP、insert-turn G、变体、
+阶段和 SHA256 校验，才能启动 host。
+
+shared 构建还读取 `PA_SHARED_INSERT_TURN_GROUPS`，默认 1，只接受
+1/2/4/8；private 只允许 1。该值只在构建期生效，不是 benchmark 参数。
+默认 CAP=128 时，shared ABI generation 为 9，ABI version 为
+`(9<<8)|G`，即 turn-G1/G2/G4/G8 分别为
+`0x901/0x902/0x904/0x908`。host/device 握手和 schema-v3 manifest
+都会拒绝不同 G 的混件。turn-G2/G4/G8 只属于本阶段维护的 CPU/CCEC
+后端；AscendC 和 `all` 会在任何构建或设备动作前被拒绝。
 
 `perf-clock` 的“两个时间边界”专指新增的性能观察：task 0 在 EfDrain 前
 读取一次，末 task 完成 Submit 尾动作后读取一次。shared per-slot symbol
@@ -331,7 +341,7 @@ ASan/UBSan。CPU b1、CPU b256 的完整调度断言和 CCEC private 三镜像�
 同口径单次为 3,862.246 us，只作协议和规模回归记录，不是性能基线，也不
 替代后续配对多轮性能验证。
 
-### 4.2 当前 shared TensorMap：per-slot symbol、shared heap 与隔离的 region 原型
+### 4.2 当前 shared TensorMap：有序插入、writer history、shared heap 与 no-reclaim ring
 
 S3.2a 在 S3.1 的 4,735,104B output table 尾部追加 8 条 cache-line
 heap cursor 和 1 条 aggregate vend，因此 `SharedTensorMapSidecar`
@@ -345,14 +355,16 @@ Claim cursor，S4.14b 已启用全部 8 条。S4.16a/S4.16b 曾在数组
 12,420,288B，默认 CAP=128 的构建身份当时为 ABI generation 7。
 
 R4e-a 又在该 offset 追加 `reader_done[96]`，每个 worker 独占 64B，
-合计 6,144B。当前 generation-8 sidecar 为 12,426,432B；CPU 非 split
-`SchedulerState` 为 1,019,542,400B，定义
-`PA_COMPETE_FIRST_SPLIT_FINISH` 的 CCEC split 布局为 1,019,548,544B。
+合计 6,144B，形成 generation-8 的 12,426,432B sidecar。R5c 保留原
+`committed_tasks` 作为 insert-turn lane 0，又在 `reader_done` 后追加
+`insert_turn_extra[7]`，共 448B。当前 generation-9 sidecar 为
+12,426,880B；CPU 非 split `SchedulerState` 为 1,019,542,848B，定义
+`PA_COMPETE_FIRST_SPLIT_FINISH` 的 CCEC split 布局为 1,019,548,992B。
 private sidecar 仍为 2,113,664B，private non-split/split
-`SchedulerState` 仍分别为 1,007,115,968B 和 1,007,122,112B。两次尾部
-追加都不移动此前字段，Vector 热路径仍使用 `task_id%8`；sidecar 仍位于
-standalone 控制区和 `results` 之后，不移动 `WorkerState`、`RunConfig`
-或既有结果字段。
+`SchedulerState` 仍分别为 1,007,115,968B 和 1,007,122,112B。新增控制线
+只追加在尾部，不移动此前字段；Vector 热路径仍使用 `task_id%8`。sidecar
+仍位于 standalone 控制区和 `results` 之后，不移动 `WorkerState`、
+`RunConfig` 或既有结果字段。
 
 `reader_done[worker]=D` 表示该 worker 已经结束 task `[0,D]` 的全部
 ordinary-ring 读取，初值为 -1，只允许 CAS `D-1 -> D`。最慢完成值为
@@ -362,11 +374,12 @@ ordinary-ring 读取，初值为 -1，只允许 CAS `D-1 -> D`。最慢完成值
 门槛；R4e-b 又在隔离 ring driver 中把 exact writer turn、reader 候选和
 单调 `reclaim_upto` 发布组合起来，并以满桶慢 reader 交错证明：task 2
 读取尚未结束时 future writer 只能得到 `CapacityBlocked`，读取返回并发布
-完成前沿后才可回收 producer 0、复用对应物理槽。该组合 helper 仍没有
-PA/Submit 调用者；其 `active_workers` 连续前缀和 `H` 也必须是整个 ring
-生命周期的固定权威配置，不能在已经发布回收边界后动态改变。普通 PA
-继续走专用 writer-chain，不发布 `reader_done`，host 反向要求 96 条线
-保持 -1。R4e-c2b 已在独立 shared-protocol mixed ELF 中，以定向
+完成前沿后才可回收 producer 0、复用对应物理槽。该 reader-gated reclaim
+组合仍没有 PA/Submit 调用者；其 `active_workers` 连续前缀和 `H` 也必须是
+整个 ring 生命周期的固定权威配置，不能在已经发布回收边界后动态改变。
+当前 PA shared Submit 已复用 generic immutable writer history，但不发布
+`reader_done`，host 反向要求 96 条线保持 -1。R4e-c2b 已在独立
+shared-protocol mixed ELF 中，以定向
 `CaptureReaderSnapshot()`、单个动态 reader/reclaimer 和固定双向物理核
 建立 A5 动态证据；它没有直接调用生产 `SharedReadRegionSlot()`，也没有
 接入 PA/Submit。因此生产 ordinary lookup→reader-close 的编译器/设备顺序
@@ -413,34 +426,32 @@ S4.16b 第一层性能门槛失败；这些数字只属于历史候选，不是�
 
 每 task 最多八个 fresh output，以 16B
 `FdwicOutputRef` 表达 `(producer_task_id, output_slot)`，返回句柄为
-8B `SharedTaskOutputs`。当前构建身份 ABI generation 为 8。通用
-history 能力由 generation 7 引入，generation 8 只在其后追加
-`reader_done` 并重建同一 history 门槛；两项仍都是独立门槛能力，不能
-据此声称 PA 热路径已经迁到通用 WriterIntentSet 或 reader-progress
-reclaim。
+8B `SharedTaskOutputs`。当前构建身份 ABI generation 为 9。通用
+history 能力由 generation 7 引入，generation 8 追加 `reader_done`，
+generation 9 再追加七条 insert-turn 物理线，并把 active G 编入 build
+identity 和 artifact manifest。inactive lane 初始化并保持 -1。history、
+reader progress 与 insert turn 仍是不同协议能力，不能据此声称 PA 热路径
+已经接入 reader-progress reclaim。
 
-当前 shared 已完成 winner-only 重构参与 Materialize：所有 worker 仍先
-Claim 并独立声明同一组 output symbol；Alloc 暂时保留每核三个静态 Output
-参数，以对齐参考 `alloc_tensors(args)` 的调用形状。QK/SF/PV/UP 只有 winner
-执行 reset、view/CreateInfo 构造以及 tensor/scalar 参数添加。winner 随后
-独立预留 shared heap、生成 descriptor，只在自己实际依赖的
-`(producer_task_id, output_slot).published` 上等待并只读解析 fanin；本地
-执行状态建立后再提交 INOUT writer，最后发布 descriptor。PA Case1 不再
-读取或推进全局 `committed_tasks/reclaim_upto`。loser 仍以非空地址把上一
-task 的陈旧
-`TaskArgs` 传过 split ABI，但 finish 只闭合固定泳道/Submit 边界，不读参数
-内容，也不触碰 heap/map/payload。
+当前 shared 使用独立 Submit 路径。所有 worker 先 Claim；只有唯一 owner
+构造本 task 参数、Materialize descriptor 和 writer delta。owner 等待
+insert turn 后只在有序区内发布 ordinary/symbol/fresh writer 元数据，随后
+立即发布下一个 turn；fanin lookup、Build 和执行均在有序区外进行。lookup
+统一只接受 `producer∈[N-H,N)`。Claim 判负后的 loser finish/replay
+不等待 insert turn、不读取 TensorMap，也不构造重参数，关闭轻量 Submit
+后直接继续 replay；Claim 对 Vector cursor 的访问发生在该边界之前。
+当前生产 helper 固定 `reclaim_upto=-1`，尚未把 reader-progress reclaim
+接入这条路径。
 
 CPU guard-page 定向测试会把 loser 的 `TaskArgs` 页改成 `PROT_NONE`，依次
 通过 Alloc/QK/SF/PV/UP 五次 split finish；任一字段读取都会立即失败。逐核
 host oracle 还按实际 wins 精确核对四类重构参次数，防止只看全局总数而漏掉
 某个 loser 回退。S4.6 另有三组定向门禁：预置 terminal `fatal` 后 winner
 不得产生 heap/slot/completion/symbol 副作用；空 region 验证分别覆盖
-Local/GM 的 manual 与 ordinary writer；shared `PrepareMap` raw marker 的
-负向自测会拒绝非零时长、task 序列或身份漂移、未锚定 matching
-`Materialize.end`、非法 flags/aux、缺失和重复记录。后者复用 host 已有 raw
-扫描，并与既有逐核 Submit 数、精确记录数门禁共同闭合，不增加任何 device
-字段。
+Local/GM 的 manual 与 ordinary writer；shared raw 从源头不生成
+`PrepareMap`，转换器和排他分析器会拒绝任何伪造的 shared
+`PrepareMap` 记录。负向测试覆盖 winner 内外以及零时长记录，避免为了兼容
+旧分析器重新引入没有业务语义的 marker。
 
 shared heap 使用 `task_id % 8` 的有界绝对 cursor，物理 shard span 默认为
 32MiB；b256 每 shard 精确使用 25,821,184B，不 wrap、不复用 generation。
@@ -449,47 +460,38 @@ shared 不调用 private per-worker ring 的 HeapGuard。host 直接核对 8-sha
 实际 descriptor 地址，再以 canonical 连续地址比较 private/shared 的
 normalized writer signature。
 
-Materialize 只在 winner 上预留 heap 并生成本地 descriptor，不再提前发布。
-本地 `CompleteTask`/`BuildWinner` 成功后，winner 用 FetchMax 提交本 task
-消费的唯一 INOUT writer，再把本 task 的全部 output descriptor 复制到共享
-cell，执行 `FlushRegion`、存储屏障并发布 `published`。因此当前
-`published=N` 表示 producer Submit 已封口，而不只是 descriptor 已构造。
-没有依赖关系的 future task 可以先行封口；有依赖的 task 只受自己的 per-slot
-发布位和执行期 task completion flag 约束。
+Materialize 只在 owner 上预留 heap 并生成本地 descriptor。拿到 insert
+turn 后，owner 在同一个有序插入区间依次发布 symbol writer history/latest、
+ordinary writer entry 和本 task 的 fresh output descriptor；完成 flush 与
+存储屏障后才交出下一枚 turn。因此 `published=N` 只表示 task N 的 descriptor
+和 writer 元数据已经可供后继 lookup 使用，不表示 task N 的 Build、kernel
+或 completion 已完成。真正执行依赖仍由 fanin 对应的 task completion flag
+约束。
 
-重复发布或后槽异常不会覆盖既有 descriptor，也不会留下前槽的部分发布；
-若发布位 Exchange 观察到异常旧值，冷路径会撤回本 producer cell 的全部
-控制字并清空、flush descriptor。QK/SF/PV/UP 的构建后封口失败还会撤销本地
-built slot，避免 FinalDrain 执行失败任务；Alloc ready flag 已不可逆，只能
-广播 fatal 使整轮结果无效。loser 不读取 shared sidecar，也不等待 commit。
+fresh output 发布会先预检全部 slot，再预留全部 `last_writer`，最后复制并
+发布 descriptor；重复发布或后槽异常不得覆盖已经可见的 descriptor，也不能
+留下前槽的半次成功。后续 writer 通过每 task 不可变 history 记录前任，
+`last_writer` CAS 是该记录的发布边界。任一发布失败都广播 terminal `fatal`；
+Claim 判负后的 loser finish/replay 不读取 shared sidecar，也不等待
+insert turn；该表述不包含此前 Claim 对 Vector cursor 的访问。
 
 shared symbol resolver 只接受 flags/view 字段全零的 plain ref；其他形态显式
-失败，不能被悄悄降级为普通 descriptor。resolver 第一遍等待并校验全部引用，
-读取每个 symbol 的 `published` 和 `last_writer`，但不修改 writer、payload、
-统计或输出 fanin。PA Case1 当前每个 fresh symbol 只有一个后继 writer，
-所以 Input/Inout/OutputExisting 看到的 writer 都必须精确等于句柄声明的
-producer；同一 task 的重复写引用也会被拒绝。全部通过后才失效并复制
-descriptor 到本 task payload scratch，一次性提交 input-load 计数和按既有
-`AddFanin` 去重的 fanin。
+失败，不能被悄悄降级为普通 descriptor。由于本 task 的 INOUT writer 已在
+lookup 前发布，resolver 会从当前 `last_writer` 沿不可变 history 回退到严格
+小于 N 的最新 writer，再统一应用 `[N-H,N)` 窗口。定向测试覆盖
+`producer -> INOUT -> 后继 INPUT` 多级链，且同一窗口同时约束 symbol、
+ordinary ring 和显式 `owner_task_id`。同一 task 对同一 symbol 的重复写引用
+仍会被拒绝。
 
-INOUT/OutputExisting 的 writer 更新单独发生在本地执行状态成功建立后。
-FetchMax 的返回旧值必须精确等于 producer；成功项计入
-`inout_writer_commits`。异常 FetchMax 的终态不做负向 RMW 回滚，而是保留
-现场并广播 fatal；该 RMW 已经线性化，多 symbol 提交不是事务，不能伪造
-负向 RMW 抹掉故障现场。当前固定拓扑不支持
-`producer -> INOUT -> 后继 INPUT` 的多级 writer 链，定向测试要求该形态显式
-失败，不能把它误写成通用能力。
-
-符号和 `manual_dep=true` 的 output view 都不进入 region lookup/register。
-因此 PA Case1 完全绕过 shared region raw ring；host 要求
-`committed_tasks=0`、`reclaim_upto=-1`，全部 bucket/slot 保持初始化状态。
-Register 仍逐项验证 ordinary region entry 必须为零，发现非
-`manual_dep` 的普通 writer 会 fail-closed，而不是悄悄回退到未接线的 ring。
-host 将实际读取到的 fresh symbol 最终 writer
-投影为与 private region 相同的规范化 writer 序列，并按 Case1 约定补入
-manual output view；所以 raw 存储不同不妨碍两种模式使用同一规范化签名
-核对已观测 fresh-symbol writer。manual view 是约定投影，不是从 shared
-执行态独立取证，不能用该签名单独证明 manual view 对等。b1 的
+符号和 `manual_dep=true` 的 output view 不进入 ordinary region ring；
+非 `manual_dep` 的 GM/Local writer 则在同一有序插入区间发布到 ring。当前
+PA Case1 的 `ordinary_count=0`，host 要求 bucket/slot 保持初值；generic
+定向测试另外覆盖非空 ordinary delta。生产路径固定 `reclaim_upto=-1`，
+满桶时整 task 在写入前失败，不覆盖 live producer。host 按计划总 task 数
+校验完整八线 insert-turn 终态，并将 fresh-symbol writer 投影为跨模式
+规范化签名，另按约定补入 manual view；ordinary ring 由独立结构校验，
+不冒充该签名的输入。manual view 仍不是从 shared 执行态独立取证，不能用
+该签名单独证明它对等。b1 的
 dependency/normalized writer 签名为
 `5cb454393ed48dcb`/`3a3d526c9b23c3db`，b256 为
 `b7d985d6edb07078`/`556bec7ec8d0f323`。
@@ -497,7 +499,7 @@ dependency/normalized writer 签名为
 以下是 S3.1 当时的历史门禁，不是当前保留路径的提交顺序或统计口径：
 
 | 门禁 | 结果 |
-| --- | --- |
+| ---- | ---- |
 | CPU private/shared b1、b256 | 全部调度与终态断言 PASS |
 | shared symbol、shared ring ASan/UBSan/leak | PASS |
 | Python | 100 项 PASS |
@@ -533,10 +535,11 @@ shared b1 real-compute perf-clock 单样本为 `70.279 us`。同阶段较早 ELF
 
 S2 的 2,119,808B sidecar（含 96 条 per-core progress）和 S2.5 的
 2,113,664B sidecar（删除 progress）均只属于明确标注的历史阶段。S2.5
-确立的 ordered-winner ring helper 与定向自测仍保留为未来非空
-ordinary-region 原型，但已经从 PA Case1 运行路径断开；它的测试结果不能
-冒充当前 PA 热路径证据。S2/S2.5 的历史结构、失败实验和上板结果见
-`shared_tensormap_record.md`。
+建立的 ordered ring 原语现已被当前 owner-only ordered-insert 路径复用：
+非空 ordinary delta 会执行整 task 预检与批量 append；PA Case1 默认输入
+通常产生空 ordinary delta。仍未接入的是 reader-progress reclaim，因此
+满桶只允许在写入前终止，不允许覆盖 live producer。S2/S2.5 的历史结构、
+失败实验和上板结果见 `shared_tensormap_record.md`。
 
 #### shared protocol 的独立 A5 门槛
 
@@ -576,7 +579,7 @@ reader-reclaim 每轮在 `AIC reader -> AIV reclaimer` 与
 `AIV reader -> AIC reclaimer` 两个方向分别执行三种 reader-close 口径：
 
 | ordering | reader 读取后、`reader_done:1->2` 前的约束 | 能说明什么 |
-| --- | --- | --- |
+| -------- | ------------------------------------------ | ---------- |
 | `compiler-clobber` | `noinline` close 调用，callee 内为空 asm memory clobber；没有 device DSB | 当前 noinline A5/CANN artifact 的最弱动态对照；PASS 不能推出 inline 热路或架构通用充分性 |
 | `payload-dependency` | 五个 payload 字段进入 8 步 checksum，tied `MOV` 后让 CAS expected/desired 同时依赖该值 | scalar 已消费 payload 值的窄依赖证据；不等价于所有设备访存完成 |
 | `dsb-all` | 前后 compiler clobber，中间 `DSB_ALL` | 三者中唯一具有“全部访存指令”设备完成屏障口径的兜底对照 |
@@ -655,20 +658,22 @@ builtin；检查后删除，不会进入正式 mixed ELF。静态链接只证明
 后端能生成完整设备代码，不证明 ordinary region 的跨核
 reader-progress/reclaim 可见性已经闭合。
 shared-protocol-litmus 自身虽是 CCEC mixed ELF，但没有定义 split-finish，
-因此其
-GM `SchedulerState` 使用当前 generation-8 non-split 大小
-1,019,542,400B。history 场景会校验 96 条 `reader_done` 始终保持 -1；
+因此其 GM `SchedulerState` 使用当前 generation-9 non-split 大小
+1,019,542,848B。history 场景会校验 96 条 `reader_done` 始终保持 -1；
 reader-reclaim 场景则要求 96 条最终均为 task 2，且只允许被测 reader
-发生 `1->2`。
+发生 `1->2`。两种场景还校验完整八线 insert-turn 终态。
+
+当前 `shared-protocol-litmus` 固定使用 turn-G1；检查全部八条物理线是为了
+证明七条 inactive lane 保持 -1，并不表示该 litmus 覆盖 turn-G2/G4/G8。
+四种 turn-G 的 CCEC 证据由主 scheduler 构建矩阵提供。
 
 shared sidecar 的 atomic 当前会计入既有 Submit/业务阶段时间，但 heap
 cursor/vend、symbol writer/published 等尚未逐条接入 atomic 泳道 wrapper；
 所以这一版泳道不能声称完整列出了 shared 协议 atomic，也不能从现有事件拆出
 shared heap 或 symbol 单指令成本。这不影响 host 对 cursor/vend、descriptor、
-输出符号、依赖边和规范化 writer 签名的独立校验。为复用现有 analyzer，
-shared 泳道仍为每个 Submit 写一条零时长 `PrepareMap` 结构 marker；它不
-读钟、不访问 region sidecar，且在 perf-clock/submit-PMU 构建中编译消除，
-不能把该 marker 解读为 shared 模式仍有 PrepareMap 业务开销。
+输出符号、依赖边和规范化 writer 签名的独立校验。shared raw 不生成
+`PrepareMap`；converter/analyzer 直接按 shared 的真实稀疏阶段集合闭合，
+任何 `PrepareMap` 记录都会被当作协议错误。
 
 ## 5. 使用说明：运行、测量与泳道查看
 
@@ -676,14 +681,14 @@ shared 泳道仍为每个 Submit 写一条零时长 `PrepareMap` 结构 marker�
 环境并完成构建。主要 action 的用途如下：
 
 | action | 用途 | 是否生成泳道文件 |
-| --- | --- | --- |
+| ------ | ---- | ---------------- |
 | `build` | 构建指定后端 | 否 |
 | `smoke` | 固定 b1/r1/`scalar-nop=0` 的快速语义回归 | 否，只做内存记录校验 |
 | `run` | 自行控制 batch、run、winner 负载和诊断参数 | 仅显式传入 `--swimlane-json` 时生成 raw |
 | `swimlane` | 单轮运行并自动生成 raw、Perfetto merged JSON 和排他闭合分析 JSON | 是 |
 | `build-perf-clock` | 单独构建 CCEC 或 CPU 的低扰动首末 Submit 计时产物 | 否 |
 | `perf-clock` | 强制单进程单轮、关闭全部其他观察器，输出完整 Submit 全局跨度 | 否 |
-| `build-submit-pmu` | 构建指定 `none|claim|efdrain|materialize|register` 的 CCEC PMU-only ELF | 否 |
+| `build-submit-pmu` | 构建指定 `none\|claim\|efdrain\|materialize\|register` 的 CCEC PMU-only ELF | 否 |
 | `submit-pmu` | 单轮采集完整 Submit PMU，可选导出 JSON | 否，与泳道隔离 |
 
 `ccec|ascendc|cpu|all` 用于选择后端；`all` 始终按 CCEC、AscendC、CPU
@@ -1002,7 +1007,7 @@ atomic.poll_batch.<site>.load×<call_count>
 调用点，15～18 是 shared heap 第一批已接入的调用点：
 
 | `site_id` | Perfetto `site` | `op` | 所属路径 |
-| ---: | --- | --- | --- |
+| --------: | --------------- | ---- | -------- |
 | 0 | `startup_increment` | `fetch_add` | 启动屏障到达计数 |
 | 1 | `startup_poll` | `load` | 启动屏障轮询 |
 | 2 | `fatal_poll` | `load` | fatal 状态检查 |
@@ -1038,7 +1043,7 @@ standalone 只允许以下六类 observation load 在**匹配的显式等待区�
 PollBatch；同一 site 在等待区外的一次性或 opportunistic 读取仍是 direct Atomic：
 
 | `site_id` | `site` | `op` |
-| ---: | --- | --- |
+| --------: | ------ | ---- |
 | 1 | `startup_poll` | `load` |
 | 2 | `fatal_poll` | `load` |
 | 5 | `fanin_flag_load` | `load` |
@@ -1201,7 +1206,7 @@ outputs/pa_scheduler_swimlane_20260718_182725_4061524/ccec/
 记录数，不能与 `atomic_records` 混用：
 
 | 样本 | winner 负载 | `records` | 逻辑 `atomic_calls` | direct Atomic | 物理 `atomic_records` | `batched_poll_calls` | PollBatch | 单核记录峰值 | ClockBaseline | dropped | 首末 Submit |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ---- | ----------- | --------: | ------------------: | ------------: | --------------------: | -------------------: | --------: | -----------: | ------------: | ------: | ----------: |
 | b1 | `scalar-nop=0` | 4,414 | 1,031 | 613 | 850 | 418 | 237 | 57/65,536 | 192 | 0 | 54.056 us |
 | b256 | `real-compute/6,28,4,1` | 967,307 | 105,580 | 103,618 | 103,883 | 1,962 | 265 | 10,252/65,536 | 192 | 0 | 5,774.295 us |
 
@@ -1268,7 +1273,7 @@ PMU context 而采用 inline-finish 诊断 ELF。因此后两者与 `none`
 当前 `submit-pmu` 只支持：
 
 | phase | 编译期 ID | 局部边界 | 用途 |
-| --- | ---: | --- | --- |
+| ----- | --------: | -------- | ---- |
 | `none` | 0 | 不做任何中途 shadow counter 读取 | 完整 Submit 主基准，优先用于回答 AIC/AIV 每核 request/miss |
 | `claim` | 1 | 每次 `Claim()` 调用前后读取 shadow counter | 验证局部归因链路，输出带观察扰动的 running read-clear 下界和保守上界 |
 | `efdrain` | 2 | Submit 开头唯一的 EfDrain call-site 前后 | 归因 opportunistic drain，不包含 RingBackpressure/FinalDrain |
@@ -1302,12 +1307,13 @@ build/ccec/private/submit-pmu/register/
 ```
 
 每个目录都自包含同 phase 的 host、mixed kernel、PMU owner 和 dispatcher，
-不得跨 mode 或 phase 拼装。构建完成后才会原子发布包含 mode、variant、phase
-身份和四个 SHA256 的统一 manifest；`submit-pmu` action 在启动 host 前逐项
-复核，缺件、串 mode/phase 或内容变化都会直接拒绝。一次正式采集示例：
+不得跨 mode、turn-G 或 phase 拼装。构建完成后才会原子发布八行身份头：
+schema、mode、mode-id、CAP、insert-turn G、variant、phase、phase-id，
+随后记录四个 SHA256；`submit-pmu` action 在启动 host 前逐项复核，缺件、
+串 mode/G/phase 或内容变化都会直接拒绝。一次正式采集示例：
 
 ```bash
-export PYTHON=/home/q00473782/.venv/bin/python
+export PYTHON="$HOME/.venv/bin/python"
 OUT="./outputs/submit_pmu_none_$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$OUT"
 ./run.sh submit-pmu ccec none \
@@ -1497,7 +1503,7 @@ Path-A owner 配置 selector、保存并恢复 PMU 状态；kernel 在每个物�
 目录外探针或整任务 profiler 的计数结果。完整字段为：
 
 | sidecar 字段 | 寄存器 / selector | 原始事件含义 |
-| --- | --- | --- |
+| ------------ | ----------------- | ------------ |
 | `total_cycles` | 64-bit PMU total | gate 窗口的 PMU total 原始计数 |
 | `vector_busy` | `CNT0 = 0x501` | Vector pipe busy |
 | `cube_busy` | `CNT1 = 0x301` | Cube pipe busy |
@@ -1513,7 +1519,7 @@ Path-A owner 配置 selector、保存并恢复 PMU 状态；kernel 在每个物�
 将它们写零，不应解读为额外的 Submit 计数：
 
 | `WorkerResult` 原始字段 | 来源 | 含义 |
-| --- | --- | --- |
+| ----------------------- | ---- | ---- |
 | `pmu_window_ticks` | 1 GHz sys counter | cold 目标调用窗口，1 tick = 1 ns |
 | `pmu_warm_total_cycles` | 64-bit PMU total | 同核 warm 对照窗口原始 total |
 | `pmu_warm_window_ticks` | 1 GHz sys counter | warm 目标调用窗口 |
@@ -1548,7 +1554,7 @@ start/stop、`miss <= request`，以及 owner Restore 成功。
 观察链路校准；`submit-all` 是唯一正式的 Submit 取数窗口：
 
 | `--pmu-window` | 位置与窗口边界 | 用途 |
-| --- | --- | --- |
+| -------------- | -------------- | ---- |
 | `empty` | `RunScheduler` 完成后，baseline read-clear → start → stop → 末尾 snapshot | 量一段空 gate 底噪 |
 | `scalar` | `RunScheduler` 完成后，一个 gate 中执行 `--pmu-scalar-nops N` | 验证 scalar/I-cache 正向敏感性 |
 | `scalar-double` | `RunScheduler` 完成后，两段相同 NOP 中间只 stop/start、不读 counter | 验证暂停后继续累计 |
@@ -1684,7 +1690,7 @@ PMU-only 验收。该段保留的是切换默认模式之前的历史样本。Su
 `sum(cold_ticks-warm_ticks) / sum(cold_miss-warm_miss)` 计算，实测为：
 
 | 规模 | ALL median（range） | AIC median（range） | AIV median（range） |
-| --- | ---: | ---: | ---: |
+| ---- | ------------------: | ------------------: | ------------------: |
 | 64 trials/core × 10 | 86.596（86.532～86.792）ns/miss | 85.913（85.848～86.202）ns/miss | 86.938（86.861～87.086）ns/miss |
 | 128 trials/core × 5 | 89.629（89.615～89.648）ns/miss | 92.100（91.984～92.267）ns/miss | 88.410（88.310～88.440）ns/miss |
 
@@ -1732,7 +1738,7 @@ summary，而是从每份文件的 worker raw 记录重新计算 ALL/AIC/AIV 的
 同一次构建、同一观察参数的多个独立进程可直接聚合：
 
 ```bash
-source /home/q00473782/.venv/bin/activate
+source "$HOME/.venv/bin/activate"
 python pmu_sidecar_analyzer.py "$OUT"/run*.json
 python pmu_sidecar_analyzer.py --json "$OUT"/run*.json
 ```
@@ -1764,7 +1770,7 @@ python -m unittest -v \
 时间使用上表附近的校准 NOP：
 
 | 实现 | 首轮 `submit_span_us` | EfDrain/RingBp/FinalDrain |
-| --- | ---: | ---: |
+| ---- | --------------------: | ------------------------: |
 | 真实 simpler PA 最好泳道 | 5,096.685 us | 1011 / 0 / 13 |
 | standalone CCEC，3 个独立进程首轮中位数 | 4,830.184 us | 961 / 50 / 12 |
 | standalone AscendC，独立进程首轮 | 4,917.014 us | 1009 / 4 / 11 |
@@ -1777,7 +1783,7 @@ python -m unittest -v \
 四个重点阶段的一轮 CCEC 代表值为：
 
 | role | Claim | EfDrain | WaitForSlot | HeapGuard |
-| --- | ---: | ---: | ---: | ---: |
+| ---- | ----: | ------: | ----------: | --------: |
 | AIC 每 worker 累计中位数 | 470.503 us | 711.005 us | 234.063 us，43 次等待 | 21.349 us，约 1 次等待 |
 | AIV 每 worker 累计中位数 | 533.755 us | 401.962 us | 0.067 us，0 次等待 | 3.723 us，约 1 次等待 |
 
@@ -1835,7 +1841,7 @@ AscendC 按 CCEC 之后独立接入同一 workspace 和参数规则。AIC 路径
 写回完成。分层上板结果为：
 
 | 场景 | `submit_span_us` | QK/SF/PV/UP `[KERNEL] mean_us` | 数值输出 |
-| --- | ---: | --- | --- |
+| ---- | ---------------: | ------------------------------ | -------- |
 | b1，count=`1,1,1,1` | 59.280 | 8.837 / 14.267 / 8.342 / 11.307 | 4 active + 188 sentinel，PASS |
 | b8，count=`1,1,1,1` | 166.426 | 7.713 / 2.559 / 7.694 / 2.852 | 32 active + 160 sentinel，PASS |
 | b256，count=`6,28,4,1` | 3810.471 | 41.232 / 48.047 / 27.940 / 2.528 | 191 active + 1 sentinel，PASS |
@@ -1889,7 +1895,7 @@ CPU 上的 matmul/add/mul 是普通 x86 浮点循环，`[KERNEL]`、`submit_span
 4 个 active tile 与 188 个 inactive sentinel tile，全部 PASS：
 
 | 后端 | Submit span | QK/SF/PV/UP `[KERNEL] mean_us` | 结论 |
-| --- | ---: | --- | --- |
+| ---- | ----------: | ------------------------------ | ---- |
 | CCEC | 37.682 us | 9.172 / 3.819 / 7.415 / 2.512 | PTO Cube/Vector 数学与布局基准 PASS |
 | AscendC | 55.041 us | 8.478 / 4.211 / 20.801 / 3.008 | L1 错位、B 分形转置、ND/NZ 与 FIXPIPE 闭环 PASS |
 | CPU | 51.958 ms | 3.457 ms / 26.118 us / 3.390 ms / 17.349 us | host 期望公式与路由回归 PASS；不作 A5 性能数据 |
@@ -1950,14 +1956,13 @@ ClockBaseline，并继续以逐核容量、调用数、总记录数和 `dropped=
 block-local runtime state，每个精确 1,664 bytes、最终 section 合计
 3,328 bytes；它们不属于 GM `SchedulerState`。以上 `SchedulerState` 数字
 是 private 模式。R4c 的 shared sidecar 历史大小为 12,420,288 bytes；
-R4e-a 追加 96 条 reader-progress cache line 后，当前 generation-8
-sidecar 为 12,426,432 bytes。因此 CPU non-split 与定义
+R4e-a 追加 96 条 reader-progress cache line 后，generation-8 sidecar 为
+12,426,432 bytes。R5c 又在尾部追加七条 insert-turn cache line，当前
+generation-9 sidecar 为 12,426,880 bytes。因此 CPU non-split 与定义
 `PA_COMPETE_FIRST_SPLIT_FINISH` 的 CCEC 变体总大小分别为
-1,019,542,400/1,019,548,544 bytes；swimlane、perf-clock 以及
-submit-PMU none/claim/efdrain 使用后者，submit-PMU
-materialize/register 和独立 shared-protocol-litmus 使用 non-split 大小。
-既有
-production prefix 和
+1,019,542,848/1,019,548,992 bytes；swimlane、perf-clock 以及 submit-PMU
+none/claim/efdrain 使用后者，submit-PMU materialize/register 和独立
+shared-protocol-litmus 使用 non-split 大小。既有 production prefix 和
 standalone 控制字段 offset 不变。S4.15a/S4.16 历史候选都曾得到
 4,736,704B，但末尾 512B 分别是 Cube cursor 和
 `shared_vector_cursor[8..15]`，且均已撤销。S4.9 的
@@ -2003,6 +2008,39 @@ cd /tmp/pa_scheduler
 模式可在复制目录后显式执行
 `./run.sh build cpu --tensormap shared`；构建身份和产物目录会保持 shared，
 不会回退到 private。
+
+shared insert turn 默认使用 G=1。需要构建交错候选时，通过构建环境变量
+选择 G=2/4/8；该值同时进入 host/kernel build identity 和 CCEC manifest，
+不能在同一组产物上运行期切换：
+
+```bash
+PA_SHARED_INSERT_TURN_GROUPS=4 \
+  ./run.sh build cpu --tensormap shared
+
+PA_SHARED_INSERT_TURN_GROUPS=8 \
+  ./run.sh build ccec --tensormap shared
+
+PA_SHARED_INSERT_TURN_GROUPS=8 \
+  ./run.sh run ccec --tensormap shared --batches 1
+```
+
+这里的 PA-G 表示一个 batch 的 PA block-group 数；turn-G 表示 insert-turn
+使用的物理控制线数。二者含义独立。turn-G 只改变同一枚有序 token 的物理
+落点，不建立多条独立 writer 插入链。
+本阶段 turn-G2/G4/G8 只维护 CPU 与 CCEC；`run.sh` 会在任何构建、文件创建
+或设备动作前拒绝 AscendC 和 `all`。turn-G1 保留既有后端命令兼容性，但
+不把 AscendC 结果列入本阶段验证证据。
+standalone 各 G 顺序复用同一 variant 输出目录，因此比较时必须先构建目标
+G，再以相同环境变量消费该次 manifest 对应的 CCEC 产物；省略或写错 G
+会在启动设备前被拒绝。
+CPU 的 turn-G1 保留默认文件名 `pa_scheduler_cpu`；turn-G2/G4/G8 分别生成
+`pa_scheduler_cpu_turn_g2/g4/g8`，`run.sh` 按环境变量选择，避免后一次构建
+覆盖前一 G 后仍把旧命令结果误认成目标配置。
+
+本阶段 CPU 结果只作为语义与并发正确性证据，CCEC 结果只作为编译、链接、
+manifest 和 ABI 身份证据；尚未运行 R5c 的 A5 动态验证。上面的
+`run ccec` 只是复现命令示例，不是已经取得的上板结果。得到同一
+`perf-clock` 口径的交错多轮数据前，不宣称 turn-G2/G4/G8 有性能收益。
 
 CCEC/AscendC 只需再 source CANN 环境。本目录的构建脚本不会搜索 Git 根目录，
 也不会引用 `simpler/src`、`simpler/examples` 或其他仓内文件。泳道转换与排他

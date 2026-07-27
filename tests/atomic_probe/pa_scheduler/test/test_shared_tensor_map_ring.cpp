@@ -65,7 +65,7 @@ static_assert(offsetof(SharedRegionSlot, seq) == 64, "shared seq cache line offs
 static_assert(sizeof(SharedBucketState) == 128, "shared bucket control ABI changed");
 static_assert(offsetof(SharedBucketState, tail) == 64, "shared head/tail cache lines merged");
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
-static_assert(sizeof(SharedTensorMapSidecar) == 12426432, "shared sidecar ABI changed");
+static_assert(sizeof(SharedTensorMapSidecar) == 12426880, "shared sidecar ABI changed");
 #endif
 static_assert(alignof(SharedTensorMapSidecar) == 64, "shared sidecar alignment changed");
 static_assert(offsetof(SharedTensorMapSidecar, buckets) == 128, "shared bucket offset changed");
@@ -309,7 +309,7 @@ void ResetSharedTensorMap(SharedTensorMapSidecar &map) {
     // 与 scheduler 的正式 host reset 保持相同控制字初值。payload 保持
     // 惰性：seq=-1 时任何旧字节都不可见；正式 reset 额外清零整块
     // sidecar，只是为了让 host 诊断中的保留字节也确定。
-    StoreControl(&map.committed_tasks.value, 0);
+    pa_scheduler::InitializeSharedInsertTurns(map);
     StoreControl(&map.reclaim_upto.value, -1);
     for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
         StoreControl(&map.buckets[bucket].head.value, 0);
@@ -608,6 +608,16 @@ void TestAbiResetAndZeroEntryCommit() {
          worker < pa_scheduler::kWorkers; ++worker) {
         if (LoadControl(&map->reader_done[worker].value) != -1) {
             Expect(false, kTest, "reader progress reset");
+            break;
+        }
+    }
+    for (uint32_t lane = 1;
+         lane < pa_scheduler::kSharedInsertTurnCapacity;
+         ++lane) {
+        if (LoadControl(
+                &map->insert_turn_extra[lane - 1U].value
+            ) != -1) {
+            Expect(false, kTest, "inactive insert turn reset");
             break;
         }
     }
@@ -2533,6 +2543,57 @@ void TestDeterministicArrivalAndLogicalTupleDifference() {
     Expect(actual == expected, kTest, "logical tuple vector matches fixed reference");
 }
 
+void TestTailOverflowRejectedBeforeMutation() {
+    constexpr const char *kTest = "tail-overflow";
+    auto map = NewMap();
+    RecordingOps::DisableEvents();
+    const SharedRegionValue entry =
+        MakeRegion(0x6A0000000ULL, 0, 64, 7);
+    const uint32_t bucket =
+        TensorMapHash(entry.buffer_addr);
+    StoreControl(
+        &map->buckets[bucket].head.value, INT64_MAX
+    );
+    StoreControl(
+        &map->buckets[bucket].tail.value, INT64_MAX
+    );
+
+    RecordingOps::ResetEvents();
+    Expect(
+        SharedCheckTaskAppend<RecordingOps>(
+            *map, &entry, 1, -1
+        ) == SharedAppendCheck::ProtocolError,
+        kTest,
+        "preflight rejects a tail with no representable successor"
+    );
+    Expect(
+        !pa_scheduler::SharedAppendPreparedEntry<RecordingOps>(
+            *map, entry
+        ),
+        kTest,
+        "append rejects a tail with no representable successor"
+    );
+    for (const Event &event : RecordingOps::events) {
+        if (event.kind == EventKind::Exchange ||
+            event.kind == EventKind::Flush) {
+            Expect(
+                false, kTest,
+                "overflow rejection performed a state publication"
+            );
+            break;
+        }
+    }
+    RecordingOps::DisableEvents();
+    ExpectEqual(
+        LoadControl(&map->buckets[bucket].head.value),
+        INT64_MAX, kTest, "overflow rejection preserves head"
+    );
+    ExpectEqual(
+        LoadControl(&map->buckets[bucket].tail.value),
+        INT64_MAX, kTest, "overflow rejection preserves tail"
+    );
+}
+
 }  // namespace
 
 int main() {
@@ -2549,6 +2610,7 @@ int main() {
     TestFullBucketRetireAndReuseExactCapacity();
     TestCapacityBlockedAfterSafeRetire();
     TestDeterministicArrivalAndLogicalTupleDifference();
+    TestTailOverflowRejectedBeforeMutation();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "[FAIL] shared TensorMap ring: %d failure(s)\n", g_failures);

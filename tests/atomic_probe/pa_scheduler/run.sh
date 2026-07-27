@@ -32,6 +32,11 @@ Usage:
 Build identity option (consumed by run.sh and never forwarded to the benchmark):
   --tensormap private|shared   (default: private)
 
+Shared insert-turn build identity:
+  PA_SHARED_INSERT_TURN_GROUPS=1|2|4|8   (default: 1; shared only)
+  Use the same value when consuming a CCEC artifact; the manifest rejects a
+  different or omitted value instead of silently running another G.
+
 Benchmark options:
   --device N
   --batches 1..256
@@ -95,9 +100,25 @@ require_file() {
     # 缺失时明确提示对应 build action，而不是临时猜测编译命令。
     if [[ ! -f "$1" ]]; then
         echo "Missing build artifact: $1" >&2
-        echo "Run: $0 build $2 --tensormap $3" >&2
+        local build_prefix=""
+        if [[ "$3" == "shared" && "$2" == "cpu" ]]; then
+            build_prefix="PA_SHARED_INSERT_TURN_GROUPS=${PA_SHARED_INSERT_TURN_GROUPS:-1} "
+        fi
+        echo "Run: ${build_prefix}$0 build $2 --tensormap $3" >&2
         exit 1
     fi
+}
+
+cpu_executable_path() {
+    local tensormap_mode="$1"
+    local variant="$2"
+    local binary="pa_scheduler_cpu"
+    local groups="${PA_SHARED_INSERT_TURN_GROUPS:-1}"
+    if [[ "$tensormap_mode" == "shared" && "$groups" != "1" ]]; then
+        binary="pa_scheduler_cpu_turn_g${groups}"
+    fi
+    printf '%s/build/cpu/%s/%s/%s\n' \
+        "$SCRIPT_DIR" "$tensormap_mode" "$variant" "$binary"
 }
 
 build_backend() {
@@ -140,7 +161,8 @@ run_backend() {
             "$executable" "$@"
             ;;
         cpu)
-            local executable="$SCRIPT_DIR/build/cpu/$tensormap_mode/swimlane/pa_scheduler_cpu"
+            local executable
+            executable="$(cpu_executable_path "$tensormap_mode" swimlane)"
             require_file "$executable" cpu "$tensormap_mode"
             "$executable" "$@"
             ;;
@@ -166,13 +188,17 @@ ccec_artifact_failure() {
     local variant="$2"
     local phase="$3"
     local reason="$4"
+    local build_prefix=""
+    if [[ "$tensormap_mode" == "shared" ]]; then
+        build_prefix="PA_SHARED_INSERT_TURN_GROUPS=${PA_SHARED_INSERT_TURN_GROUPS:-1} "
+    fi
     echo "Invalid CCEC artifact set for mode '$tensormap_mode', variant '$variant', phase '$phase': $reason" >&2
     if [[ "$variant" == "submit-pmu" ]]; then
-        echo "Run: $0 build-submit-pmu ccec $phase --tensormap $tensormap_mode" >&2
+        echo "Run: ${build_prefix}$0 build-submit-pmu ccec $phase --tensormap $tensormap_mode" >&2
     elif [[ "$variant" == "perf-clock" ]]; then
-        echo "Run: $0 build-perf-clock ccec --tensormap $tensormap_mode" >&2
+        echo "Run: ${build_prefix}$0 build-perf-clock ccec --tensormap $tensormap_mode" >&2
     else
-        echo "Run: $0 build ccec --tensormap $tensormap_mode" >&2
+        echo "Run: ${build_prefix}$0 build ccec --tensormap $tensormap_mode" >&2
     fi
     return 1
 }
@@ -182,12 +208,27 @@ validate_ccec_artifacts() {
     local variant="$2"
     local phase="$3"
     local build_dir="$4"
+    local expected_insert_turn_groups="${PA_SHARED_INSERT_TURN_GROUPS:-1}"
+    case "$expected_insert_turn_groups" in
+        1|2|4|8) ;;
+        *)
+            ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" \
+                "PA_SHARED_INSERT_TURN_GROUPS must be 1, 2, 4, or 8"
+            return 1
+            ;;
+    esac
     local tensormap_mode_id
     case "$tensormap_mode" in
         private) tensormap_mode_id=0 ;;
         shared) tensormap_mode_id=1 ;;
         *) ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" "unsupported TensorMap mode"; return 1 ;;
     esac
+    if [[ "$tensormap_mode" != "shared" &&
+          "$expected_insert_turn_groups" != "1" ]]; then
+        ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" \
+            "PA_SHARED_INSERT_TURN_GROUPS only applies to shared TensorMap artifacts"
+        return 1
+    fi
     local phase_id
     case "$phase" in
         none) phase_id=0 ;;
@@ -246,20 +287,45 @@ validate_ccec_artifacts() {
         return 1
     fi
 
-    # 七行身份头固定 mode/CAP/variant/phase，后续校验和行按变体精确枚举。
+    # 八行身份头固定 mode/CAP/insert-turn/variant/phase，后续校验和行
+    # 按变体精确枚举。
     # 既拒绝跨模式复用，也拒绝漏项、增项、绝对路径和重复文件。
     local manifest_lines=()
     mapfile -t manifest_lines < "$manifest"
-    if [[ ${#manifest_lines[@]} -ne $((7 + ${#artifacts[@]})) ||
-          "${manifest_lines[0]}" != "# schema=pa_scheduler_artifacts/v2" ||
+    local manifest_insert_turn_groups=""
+    if [[ "${manifest_lines[4]:-}" == \
+          "# shared_insert_turn_groups="* ]]; then
+        manifest_insert_turn_groups="${manifest_lines[4]#*=}"
+    fi
+    if [[ ${#manifest_lines[@]} -ne $((8 + ${#artifacts[@]})) ||
+          "${manifest_lines[0]}" != "# schema=pa_scheduler_artifacts/v3" ||
           "${manifest_lines[1]}" != "# tensormap_mode=$tensormap_mode" ||
           "${manifest_lines[2]}" != "# tensormap_mode_id=$tensormap_mode_id" ||
           "${manifest_lines[3]}" != "# tensormap_ring_cap=128" ||
-          "${manifest_lines[4]}" != "# variant=$variant" ||
-          "${manifest_lines[5]}" != "# phase=$phase" ||
-          "${manifest_lines[6]}" != "# phase_id=$phase_id" ]]; then
+          "${manifest_lines[5]}" != "# variant=$variant" ||
+          "${manifest_lines[6]}" != "# phase=$phase" ||
+          "${manifest_lines[7]}" != "# phase_id=$phase_id" ]]; then
         ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" \
             "manifest schema, mode, variant, or phase metadata does not match"
+        return 1
+    fi
+    case "$manifest_insert_turn_groups" in
+        1|2|4|8) ;;
+        *)
+            ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" \
+                "manifest shared insert-turn groups are invalid"
+            return 1
+            ;;
+    esac
+    if [[ "$tensormap_mode" != "shared" &&
+          "$manifest_insert_turn_groups" != "1" ]]; then
+        ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" \
+            "private artifact cannot use shared insert-turn groups"
+        return 1
+    fi
+    if [[ "$manifest_insert_turn_groups" != "$expected_insert_turn_groups" ]]; then
+        ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" \
+            "manifest insert-turn groups are G=$manifest_insert_turn_groups, expected G=$expected_insert_turn_groups"
         return 1
     fi
     local index digest filename extra
@@ -267,7 +333,7 @@ validate_ccec_artifacts() {
         digest=""
         filename=""
         extra=""
-        read -r digest filename extra <<< "${manifest_lines[index + 7]}"
+        read -r digest filename extra <<< "${manifest_lines[index + 8]}"
         if [[ ! "$digest" =~ ^[[:xdigit:]]{64}$ ||
               "$filename" != "${artifacts[index]}" || -n "$extra" ]]; then
             ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" \
@@ -280,7 +346,7 @@ validate_ccec_artifacts() {
             "one or more artifact SHA256 values do not match"
         return 1
     fi
-    echo "[CHECK] CCEC artifact manifest verified: $manifest"
+    echo "[CHECK] CCEC artifact manifest verified: $manifest (G=$manifest_insert_turn_groups)"
 }
 
 reject_managed_submit_pmu_options() {
@@ -369,10 +435,15 @@ run_perf_clock() {
             "$host" --kernel "$kernel" --runs 1 --no-swimlane "$@"
             ;;
         cpu)
-            local executable="$SCRIPT_DIR/build/cpu/$tensormap_mode/perf-clock/pa_scheduler_cpu"
+            local executable
+            executable="$(cpu_executable_path "$tensormap_mode" perf-clock)"
             if [[ ! -x "$executable" ]]; then
                 echo "Missing CPU perf-clock artifact: $executable" >&2
-                echo "Run: $0 build-perf-clock cpu --tensormap $tensormap_mode" >&2
+                local build_prefix=""
+                if [[ "$tensormap_mode" == "shared" ]]; then
+                    build_prefix="PA_SHARED_INSERT_TURN_GROUPS=${PA_SHARED_INSERT_TURN_GROUPS:-1} "
+                fi
+                echo "Run: ${build_prefix}$0 build-perf-clock cpu --tensormap $tensormap_mode" >&2
                 return 1
             fi
             "$executable" --runs 1 --no-swimlane "$@"
@@ -458,6 +529,28 @@ consume_tensormap_option() {
     done
 }
 
+validate_insert_turn_scope() {
+    local backend="$1"
+    local tensormap_mode="$2"
+    local groups="${PA_SHARED_INSERT_TURN_GROUPS:-1}"
+    case "$groups" in
+        1|2|4|8) ;;
+        *)
+            echo "PA_SHARED_INSERT_TURN_GROUPS must be 1, 2, 4, or 8." >&2
+            exit 1
+            ;;
+    esac
+    if [[ "$tensormap_mode" != "shared" && "$groups" != "1" ]]; then
+        echo "PA_SHARED_INSERT_TURN_GROUPS only applies to shared TensorMap." >&2
+        exit 1
+    fi
+    if [[ "$groups" != "1" &&
+          "$backend" != "ccec" && "$backend" != "cpu" ]]; then
+        echo "turn-G$groups is implemented only for CPU and CCEC; backend '$backend' is outside this standalone target." >&2
+        exit 1
+    fi
+}
+
 # 顶层先解释 action/backend；run 的其余参数交给共享 parser，build、smoke 和
 # swimlane 再分别处理自己的约束或默认注入项。参数不足会在创建目录前失败。
 if [[ $# -lt 2 ]]; then
@@ -479,6 +572,7 @@ else
 fi
 
 # 后端约束必须早于 build/run/smoke/swimlane 的任何文件创建、构建或设备动作。
+validate_insert_turn_scope "$BACKEND" "$TENSORMAP_MODE"
 reject_ccec_pmu_options_for_non_ccec "$BACKEND" "$@"
 
 case "$ACTION" in

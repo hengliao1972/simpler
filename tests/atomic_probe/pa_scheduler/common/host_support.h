@@ -730,6 +730,11 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     // 上一轮 lap。S2.5 不再使用 per-core replay progress。
     std::memset(&state->shared_map, 0, sizeof(state->shared_map));
     state->shared_map.committed_tasks.value = 0;
+    for (uint32_t lane = 1;
+         lane < kSharedInsertTurnCapacity; ++lane) {
+        state->shared_map
+            .insert_turn_extra[lane - 1U].value = -1;
+    }
     state->shared_map.reclaim_upto.value = -1;
     for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
         state->shared_map.buckets[bucket].head.value = 0;
@@ -847,7 +852,7 @@ inline constexpr size_t ResultBytes() { return sizeof(WorkerResult) * kWorkers; 
 
 inline constexpr size_t SharedSidecarBytes() { return sizeof(SharedTensorMapSidecar); }
 #if PTO_FDWIC_SHARED_MAP
-static_assert(SharedSidecarBytes() == 12426432, "shared TensorMap transfer size changed");
+static_assert(SharedSidecarBytes() == 12426880, "shared TensorMap transfer size changed");
 #else
 static_assert(SharedSidecarBytes() == 2113664, "private TensorMap transfer size changed");
 #endif
@@ -2124,14 +2129,43 @@ struct SharedTensorMapValidation {
     uint64_t logical_signature = 1469598103934665603ULL;
 };
 
+inline int64_t SharedInsertTurnValueHost(
+    const SharedTensorMapSidecar &map, uint32_t lane
+) {
+    return lane == 0
+               ? map.committed_tasks.value
+               : map.insert_turn_extra[lane - 1U].value;
+}
+
+inline int64_t SharedExpectedInsertTurnHost(
+    uint32_t completed_tasks, uint32_t lane
+) {
+    if (lane >= kSharedInsertTurnGroups) {
+        return -1;
+    }
+    if (lane > completed_tasks) {
+        return lane == 0 ? 0 : -1;
+    }
+    return static_cast<int64_t>(
+        completed_tasks -
+        ((completed_tasks - lane) &
+         kSharedInsertTurnMask)
+    );
+}
+
 inline SharedTensorMapValidation ValidateSharedTensorMap(
     const SharedTensorMapSidecar &map,
     const SharedHostTaskPlan &plan
 ) {
     SharedTensorMapValidation validation;
-    validation.protocol_ok &=
-        map.committed_tasks.value ==
-            static_cast<int64_t>(plan.total_tasks);
+    for (uint32_t lane = 0;
+         lane < kSharedInsertTurnCapacity; ++lane) {
+        validation.protocol_ok &=
+            SharedInsertTurnValueHost(map, lane) ==
+            SharedExpectedInsertTurnHost(
+                plan.total_tasks, lane
+            );
+    }
     validation.protocol_ok &= map.reclaim_upto.value == -1;
 
     // PA 的 fresh Output 由 shared_outputs 直接定位，唯一 ordinary
@@ -3804,12 +3838,37 @@ inline Metrics Validate(
         &metrics
     );
     std::printf(
-        "[TENSORMAP] mode=shared committed=%lld reclaim_upto=%lld "
+        "[TENSORMAP] mode=shared insert_turn_groups=%u "
+        "completed_tasks=%u turns=[%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld] "
+        "reclaim_upto=%lld "
         "region_appends=%llu region_physical=%llu region_logical=%llu "
         "region_raw_signature=%016llx normalized_writer_signature=%016llx "
         "published_outputs=%llu normalized_projection_floor=%llu\n",
+        kSharedInsertTurnGroups,
+        shared_plan.total_tasks,
         static_cast<long long>(
-            state.shared_map.committed_tasks.value
+            SharedInsertTurnValueHost(state.shared_map, 0)
+        ),
+        static_cast<long long>(
+            SharedInsertTurnValueHost(state.shared_map, 1)
+        ),
+        static_cast<long long>(
+            SharedInsertTurnValueHost(state.shared_map, 2)
+        ),
+        static_cast<long long>(
+            SharedInsertTurnValueHost(state.shared_map, 3)
+        ),
+        static_cast<long long>(
+            SharedInsertTurnValueHost(state.shared_map, 4)
+        ),
+        static_cast<long long>(
+            SharedInsertTurnValueHost(state.shared_map, 5)
+        ),
+        static_cast<long long>(
+            SharedInsertTurnValueHost(state.shared_map, 6)
+        ),
+        static_cast<long long>(
+            SharedInsertTurnValueHost(state.shared_map, 7)
         ),
         static_cast<long long>(state.shared_map.reclaim_upto.value),
         static_cast<unsigned long long>(

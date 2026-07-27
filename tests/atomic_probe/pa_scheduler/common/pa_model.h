@@ -34,6 +34,25 @@
 #define PTO_FDWIC_TENSORMAP_RING_CAP 128
 #endif
 
+// shared writer 插入仍是一条全局 task-id 顺序链，只把相邻 token 交错
+// 放到 1/2/4/8 条独立 cache line，分散 future owner 的等待 load。
+// 该值是构建身份，不允许运行期改变；private 构建不会读取这些控制字。
+#ifndef PTO_FDWIC_SHARED_INSERT_TURN_GROUPS
+#define PTO_FDWIC_SHARED_INSERT_TURN_GROUPS 1
+#endif
+
+#if PTO_FDWIC_SHARED_INSERT_TURN_GROUPS != 1 && \
+    PTO_FDWIC_SHARED_INSERT_TURN_GROUPS != 2 && \
+    PTO_FDWIC_SHARED_INSERT_TURN_GROUPS != 4 && \
+    PTO_FDWIC_SHARED_INSERT_TURN_GROUPS != 8
+#error "PTO_FDWIC_SHARED_INSERT_TURN_GROUPS must be 1, 2, 4, or 8"
+#endif
+
+#if !PTO_FDWIC_SHARED_MAP && \
+    PTO_FDWIC_SHARED_INSERT_TURN_GROUPS != 1
+#error "shared insert-turn groups only apply to shared TensorMap builds"
+#endif
+
 // S0 的 fail-closed 门禁在 S2 接入真实 shared sidecar 后解除。模式仍由
 // 三镜像统一的构建身份与 manifest 锁定，不能把 shared 目录指向 private 实现。
 
@@ -72,20 +91,38 @@ constexpr TensorMapBuildMode kCompiledTensorMapMode =
     static_cast<TensorMapBuildMode>(PTO_FDWIC_SHARED_MAP);
 constexpr uint32_t kBuildIdentityMagic = 0x50414249U;  // "PABI"
 #if PTO_FDWIC_SHARED_MAP
-constexpr uint32_t kBuildIdentityAbiGeneration = 8;
+constexpr uint32_t kBuildIdentityAbiGeneration = 9;
 #else
 constexpr uint32_t kBuildIdentityAbiGeneration = 4;
 #endif
-// 默认 CAP=128 保留历史 ABI 值，避免仅为身份元数据让 AIC/AIV 入口多
-// 一条大立即数构造并改变后续代码对齐；manifest v2 另行显式锁定默认
-// CAP。非默认隔离变体才把 CAP 编进 ABI，防止彼此混用。
+// 默认 CAP=128 时，private 保留历史 ABI 值；shared generation 9 另把
+// active insert-turn G 编入低位。这样既避免 private AIC/AIV 入口因身份
+// 元数据多一条大立即数构造，也让 manifest v3 和 host/device 握手共同
+// 拒绝不同 G 的 shared 混件。非默认隔离变体继续把 CAP 编进 ABI。
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
+#if PTO_FDWIC_SHARED_MAP
+constexpr uint32_t kBuildIdentityAbiVersion =
+    (kBuildIdentityAbiGeneration << 8U) |
+    static_cast<uint32_t>(
+        PTO_FDWIC_SHARED_INSERT_TURN_GROUPS
+    );
+#else
 constexpr uint32_t kBuildIdentityAbiVersion =
     kBuildIdentityAbiGeneration;
+#endif
+#else
+#if PTO_FDWIC_SHARED_MAP
+constexpr uint32_t kBuildIdentityAbiVersion =
+    (kBuildIdentityAbiGeneration << 24U) |
+    (static_cast<uint32_t>(
+         PTO_FDWIC_SHARED_INSERT_TURN_GROUPS
+     ) << 16U) |
+    static_cast<uint32_t>(PTO_FDWIC_TENSORMAP_RING_CAP);
 #else
 constexpr uint32_t kBuildIdentityAbiVersion =
     (kBuildIdentityAbiGeneration << 16U) |
     static_cast<uint32_t>(PTO_FDWIC_TENSORMAP_RING_CAP);
+#endif
 #endif
 
 // private 与现有 shared 单组 Case1 每 batch 都回放五个 task。shared
@@ -134,6 +171,18 @@ static_assert(
 // shared 输出 heap 按 task_id 固定分成 8 个物理 shard。首版只做有界
 // 绝对递增分配，不在 shard 内回绕；该常量同时属于 host 地址 oracle。
 constexpr uint32_t kSharedHeapShards = 8;
+constexpr uint32_t kSharedInsertTurnCapacity = 8;
+constexpr uint32_t kSharedInsertTurnGroups =
+    static_cast<uint32_t>(
+        PTO_FDWIC_SHARED_INSERT_TURN_GROUPS
+    );
+constexpr uint32_t kSharedInsertTurnMask =
+    kSharedInsertTurnGroups - 1U;
+static_assert(
+    (kSharedInsertTurnGroups & kSharedInsertTurnMask) == 0 &&
+        kSharedInsertTurnGroups <= kSharedInsertTurnCapacity,
+    "shared insert-turn groups must be a supported power of two"
+);
 constexpr uint32_t kFinalBarrierMaxLeafGroups = 16;
 constexpr uint32_t kFinalBarrierMaxMiddleGroups = 4;
 // 每个 worker 私有 ring 有 4 个物理 slot，其中 2 个为 BlockWon 协议预留；
@@ -959,10 +1008,9 @@ static_assert(
 #endif
 
 struct alignas(64) SharedTensorMapSidecar {
-    // G=1 正确性基线中，committed_tasks 表示“下一个允许插入 writer
-    // 元数据的 task id”，初始为 0。每个 owner（包括空写集合）在
-    // ordinary/symbol/fresh-output 元数据完整可见后恰好推进 N -> N+1；
-    // fanin lookup、Build 与执行不属于这条串行链。
+    // lane 0 保留既有 committed_tasks 地址：G=1 时它仍表示下一个允许
+    // 插入 writer 元数据的 task id。G>1 时它只是交错 token 的 lane 0；
+    // 其余七条物理线追加在 sidecar 尾部，所有既有热点字段 offset 不动。
     AtomicLine committed_tasks;
     // reclaim_upto 是可回收 producer 的 inclusive 上界，初始 -1。
     // insert-before-lookup 基线固定不回收 ordinary ring，因此保持 -1；
@@ -994,6 +1042,13 @@ struct alignas(64) SharedTensorMapSidecar {
     // 已关闭 task [0,N] 的全部 ordinary-ring 读取。R4e-a 只建立状态与
     // 纯公式门槛，尚不从 PA 或通用 Submit 热路径发布该字段。
     AtomicLine reader_done[kWorkers];
+    // insert_turn_extra[0..6] 对应逻辑 lane 1..7。初始值全部为 -1；
+    // active G 只决定前 G 条逻辑 lane 的寻址，inactive 物理线始终保持
+    // -1。每个 owner（包括空写集合）发布完整元数据后，只把 baton 从
+    // task N 轮换为 N+1；fanin、Build 与执行不属于这条顺序链。
+    AtomicLine insert_turn_extra[
+        kSharedInsertTurnCapacity - 1
+    ];
 #endif
 };
 #if PTO_FDWIC_SHARED_MAP
@@ -1006,11 +1061,19 @@ static_assert(
 static_assert(
     sizeof(SharedTensorMapSidecar) ==
         offsetof(SharedTensorMapSidecar, reader_done) +
+            sizeof(AtomicLine) * kWorkers +
+            sizeof(AtomicLine) *
+                (kSharedInsertTurnCapacity - 1),
+    "shared insert-turn lines must remain the sidecar tail"
+);
+static_assert(
+    offsetof(SharedTensorMapSidecar, insert_turn_extra) ==
+        offsetof(SharedTensorMapSidecar, reader_done) +
             sizeof(AtomicLine) * kWorkers,
-    "shared reader progress must remain the sidecar tail"
+    "extra shared insert-turn lines must follow reader progress"
 );
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
-static_assert(sizeof(SharedTensorMapSidecar) == 12426432, "shared TensorMap sidecar size changed");
+static_assert(sizeof(SharedTensorMapSidecar) == 12426880, "shared TensorMap sidecar size changed");
 static_assert(
     offsetof(SharedTensorMapSidecar, shared_outputs) == 2113664,
     "shared output table offset mismatch"
@@ -1034,6 +1097,11 @@ static_assert(
 static_assert(
     offsetof(SharedTensorMapSidecar, reader_done) == 12420288,
     "shared reader-progress tail offset mismatch"
+);
+static_assert(
+    offsetof(SharedTensorMapSidecar, insert_turn_extra) ==
+        12426432,
+    "shared insert-turn tail offset mismatch"
 );
 #endif
 #else
@@ -1439,12 +1507,12 @@ static_assert(
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
 static_assert(
-    sizeof(SchedulerState) == 1019548544,
+    sizeof(SchedulerState) == 1019548992,
     "shared split SchedulerState ABI changed"
 );
 #else
 static_assert(
-    sizeof(SchedulerState) == 1019542400,
+    sizeof(SchedulerState) == 1019542848,
     "shared non-split SchedulerState ABI changed"
 );
 #endif

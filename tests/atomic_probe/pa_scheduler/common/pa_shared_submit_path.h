@@ -137,7 +137,7 @@ PA_DEVICE bool PublishSharedTaskWriterDelta(
         task_id >= static_cast<int32_t>(kMaxTasks) ||
         delta.ordinary_count > kMaxTaskTensors ||
         Ops::Load(&state->fatal.value) != 0 ||
-        !SharedHasExactTaskTurn<Ops>(
+        !SharedCanPublishTaskCommit<Ops>(
             state->shared_map, task_id
         )) {
         if (state != nullptr) {
@@ -202,7 +202,7 @@ PA_DEVICE bool PublishSharedTaskWriterDelta(
     // ordinary payload 的 DCCI、symbol history/latest 与 fresh descriptor
     // 都必须先于 N->N+1 对其他 owner 可见。
     Ops::StoreBarrier();
-    if (!SharedPublishTaskCommit<Ops>(
+    if (!SharedPublishTaskCommitAfterPreflight<Ops>(
             state->shared_map, task_id
         )) {
         SetFatal<Ops>(state, stats, task_id);
@@ -223,14 +223,15 @@ PA_DEVICE bool WaitForSharedTaskInsertTurn(
     const uint64_t begin = Ops::Now();
     uint32_t polls = 0;
     while (true) {
-        const int64_t observed =
-            Ops::Load(&state->shared_map.committed_tasks.value);
-        if (observed == task_id) {
+        const SharedInsertTurnState turn_state =
+            SharedInspectTaskTurn<Ops>(
+                state->shared_map, task_id
+            );
+        if (turn_state == SharedInsertTurnState::Ready) {
             return true;
         }
-        // 前沿只能从 0 单调递增；超过自己的 task 表示重复 owner、
-        // 错误初始化或越序发布，不能拿过期 delta 修改 TensorMap。
-        if (observed < 0 || observed > task_id) {
+        if (turn_state ==
+            SharedInsertTurnState::ProtocolError) {
             SetFatal<Ops>(state, stats, task_id);
             return false;
         }

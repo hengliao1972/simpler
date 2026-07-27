@@ -199,6 +199,7 @@ bool SealOrderOps::order_ok = true;
 
 void ResetSharedState(SharedTensorMapSidecar &map) {
     std::memset(&map, 0, sizeof(map));
+    InitializeSharedInsertTurns(map);
     map.reclaim_upto.value = -1;
     for (uint32_t index = 0; index < kMapCapacity; ++index) {
         map.slots[index].seq.value = -1;

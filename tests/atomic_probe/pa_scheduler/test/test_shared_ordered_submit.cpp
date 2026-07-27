@@ -45,7 +45,7 @@ struct OrderedSubmitTestOps {
     static inline SchedulerState *observed_state = nullptr;
     static inline OrderedSubmitHookMode hook_mode =
         OrderedSubmitHookMode::None;
-    static inline std::atomic<uint64_t> shared_map_loads{0};
+    static inline std::atomic<uint64_t> shared_map_accesses{0};
     static inline std::atomic<uint32_t> task4_insert_hook_calls{0};
     static inline std::atomic<uint32_t> task8_build_hook_calls{0};
     static inline std::atomic<uint32_t> independent_insert_hook_calls{0};
@@ -54,11 +54,19 @@ struct OrderedSubmitTestOps {
     static inline std::atomic<bool> task8_built_before_task4_completion{false};
     static inline std::atomic<bool> task6_executed_before_task4_build{false};
     static inline std::atomic<bool> hook_timed_out{false};
+    static inline std::atomic<uint32_t>
+        claim_attempts_by_task[kMaxTasks]{};
+    static inline std::atomic<uint32_t>
+        claim_wins_by_task[kMaxTasks]{};
+    static inline std::atomic<uint32_t>
+        insert_publish_by_token[kMaxTasks + 1U]{};
+    static inline std::atomic<uint32_t>
+        insert_publish_by_lane[kSharedInsertTurnCapacity]{};
 
     static void ResetHooks() {
         observed_state = nullptr;
         hook_mode = OrderedSubmitHookMode::None;
-        shared_map_loads.store(0, std::memory_order_relaxed);
+        shared_map_accesses.store(0, std::memory_order_relaxed);
         task4_insert_hook_calls.store(0, std::memory_order_relaxed);
         task8_build_hook_calls.store(0, std::memory_order_relaxed);
         independent_insert_hook_calls.store(0, std::memory_order_relaxed);
@@ -67,6 +75,26 @@ struct OrderedSubmitTestOps {
         task8_built_before_task4_completion.store(false, std::memory_order_relaxed);
         task6_executed_before_task4_build.store(false, std::memory_order_relaxed);
         hook_timed_out.store(false, std::memory_order_relaxed);
+        for (uint32_t task = 0; task < kMaxTasks; ++task) {
+            claim_attempts_by_task[task].store(
+                0, std::memory_order_relaxed
+            );
+            claim_wins_by_task[task].store(
+                0, std::memory_order_relaxed
+            );
+            insert_publish_by_token[task].store(
+                0, std::memory_order_relaxed
+            );
+        }
+        insert_publish_by_token[kMaxTasks].store(
+            0, std::memory_order_relaxed
+        );
+        for (uint32_t lane = 0;
+             lane < kSharedInsertTurnCapacity; ++lane) {
+            insert_publish_by_lane[lane].store(
+                0, std::memory_order_relaxed
+            );
+        }
     }
 
     static CompeteFirstSplitRuntimeState &
@@ -83,74 +111,161 @@ struct OrderedSubmitTestOps {
                >(ticket, args) == 1U;
     }
 
-    template <typename T>
-    static void CountSharedMapLoad(volatile T *address) {
+    static void CountSharedMapAccess(
+        const volatile void *address, uint64_t bytes
+    ) {
         if (observed_state == nullptr) {
             return;
         }
-        const uintptr_t current = reinterpret_cast<uintptr_t>(address);
-        const uintptr_t begin = reinterpret_cast<uintptr_t>(&observed_state->shared_map);
-        const uintptr_t end = begin + sizeof(SharedTensorMapSidecar);
-        if (current >= begin && current < end) {
-            shared_map_loads.fetch_add(1, std::memory_order_relaxed);
+        const uintptr_t current =
+            reinterpret_cast<uintptr_t>(address);
+        const uintptr_t access_end = current + bytes;
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(
+            &observed_state->shared_map
+        );
+        const uintptr_t end =
+            begin + sizeof(SharedTensorMapSidecar);
+        if (current < end && access_end > begin) {
+            shared_map_accesses.fetch_add(
+                1, std::memory_order_relaxed
+            );
         }
     }
 
     static int32_t Load(volatile int32_t *address) {
-        CountSharedMapLoad(address);
+        CountSharedMapAccess(address, sizeof(*address));
         return __atomic_fetch_add(address, static_cast<int32_t>(0), __ATOMIC_ACQUIRE);
     }
 
     static int64_t Load(volatile int64_t *address) {
-        CountSharedMapLoad(address);
+        CountSharedMapAccess(address, sizeof(*address));
         return __atomic_fetch_add(address, static_cast<int64_t>(0), __ATOMIC_ACQUIRE);
     }
 
     static uint64_t Load(volatile uint64_t *address) {
-        CountSharedMapLoad(address);
+        CountSharedMapAccess(address, sizeof(*address));
         return __atomic_fetch_add(address, static_cast<uint64_t>(0), __ATOMIC_ACQUIRE);
     }
 
     static int32_t Exchange(volatile int32_t *address, int32_t value) {
+        CountSharedMapAccess(address, sizeof(*address));
         return __atomic_exchange_n(address, value, __ATOMIC_ACQ_REL);
     }
 
     static int64_t Exchange(volatile int64_t *address, int64_t value) {
+        CountSharedMapAccess(address, sizeof(*address));
         return __atomic_exchange_n(address, value, __ATOMIC_ACQ_REL);
     }
 
     static uint64_t Exchange(volatile uint64_t *address, uint64_t value) {
+        CountSharedMapAccess(address, sizeof(*address));
         return __atomic_exchange_n(address, value, __ATOMIC_ACQ_REL);
     }
 
     static int64_t CompareExchange(
         volatile int64_t *address, int64_t expected, int64_t desired
     ) {
+        CountSharedMapAccess(address, sizeof(*address));
+        int32_t insert_lane = -1;
+        if (observed_state != nullptr) {
+            for (uint32_t lane = 0;
+                 lane < kSharedInsertTurnCapacity; ++lane) {
+                if (address ==
+                    &SharedInsertTurnLine(
+                        observed_state->shared_map, lane
+                    ).value) {
+                    insert_lane =
+                        static_cast<int32_t>(lane);
+                    break;
+                }
+            }
+        }
         int64_t observed = expected;
         (void)__atomic_compare_exchange_n(
             address, &observed, desired, false,
             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE
         );
+        if (insert_lane >= 0 && observed == expected &&
+            desired > 0 &&
+            desired <= static_cast<int64_t>(kMaxTasks)) {
+            insert_publish_by_token[
+                static_cast<uint32_t>(desired)
+            ].fetch_add(1, std::memory_order_relaxed);
+            insert_publish_by_lane[
+                static_cast<uint32_t>(insert_lane)
+            ].fetch_add(1, std::memory_order_relaxed);
+        }
         return observed;
     }
 
     static int64_t FetchAdd(volatile int64_t *address, int64_t value) {
+        CountSharedMapAccess(address, sizeof(*address));
         return __atomic_fetch_add(address, value, __ATOMIC_ACQ_REL);
     }
 
     static int64_t FetchMax(
         volatile int64_t *address, int64_t value, uint64_t &retries
     ) {
+        CountSharedMapAccess(address, sizeof(*address));
+        bool claim_cursor = false;
+        if (observed_state != nullptr) {
+            const uintptr_t current =
+                reinterpret_cast<uintptr_t>(address);
+            const auto in_lines =
+                [current](
+                    const AtomicLine *lines,
+                    uint32_t count
+                ) {
+                    const uintptr_t begin =
+                        reinterpret_cast<uintptr_t>(lines);
+                    const uintptr_t end =
+                        begin +
+                        static_cast<uintptr_t>(count) *
+                            sizeof(AtomicLine);
+                    return current >= begin && current < end &&
+                           (current - begin) %
+                                   sizeof(AtomicLine) ==
+                               0;
+                };
+            claim_cursor =
+                in_lines(
+                    observed_state->cube_cursor,
+                    kCursorShards
+                ) ||
+                in_lines(
+                    observed_state->alloc_cursor,
+                    kCursorShards
+                ) ||
+                in_lines(
+                    observed_state->shared_map
+                        .shared_vector_cursor,
+                    kSharedVectorCursorShards
+                );
+        }
+        if (claim_cursor && value >= 0 &&
+            value < static_cast<int64_t>(kMaxTasks)) {
+            claim_attempts_by_task[
+                static_cast<uint32_t>(value)
+            ].fetch_add(1, std::memory_order_relaxed);
+        }
         int64_t current = __atomic_load_n(address, __ATOMIC_ACQUIRE);
         retries = 0;
+        bool won = false;
         while (value > current) {
             if (__atomic_compare_exchange_n(
                     address, &current, value, true,
                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE
                 )) {
+                won = true;
                 break;
             }
             ++retries;
+        }
+        if (claim_cursor && won && value >= 0 &&
+            value < static_cast<int64_t>(kMaxTasks)) {
+            claim_wins_by_task[
+                static_cast<uint32_t>(value)
+            ].fetch_add(1, std::memory_order_relaxed);
         }
         return current;
     }
@@ -177,15 +292,20 @@ struct OrderedSubmitTestOps {
         std::this_thread::yield();
     }
 
-    static void InvalidateRegion(const void *, uint64_t) {
+    static void InvalidateRegion(
+        const void *address, uint64_t bytes
+    ) {
+        CountSharedMapAccess(address, bytes);
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
     }
 
-    static void FlushRegion(void *, uint64_t) {
+    static void FlushRegion(void *address, uint64_t bytes) {
+        CountSharedMapAccess(address, bytes);
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
     }
 
     static void Publish(uint64_t *address, uint64_t value) {
+        CountSharedMapAccess(address, sizeof(*address));
         __atomic_store_n(address, value, __ATOMIC_RELEASE);
     }
 
@@ -278,6 +398,106 @@ SchedulerState *MapSchedulerState() {
     return new (memory) SchedulerState{};
 }
 
+bool InsertTurnsMatch(
+    const SchedulerState &state, uint32_t completed_tasks
+) {
+    for (uint32_t lane = 0;
+         lane < kSharedInsertTurnCapacity; ++lane) {
+        const volatile int64_t *address =
+            lane == 0
+                ? &state.shared_map.committed_tasks.value
+                : &state.shared_map
+                       .insert_turn_extra[lane - 1U].value;
+        if (__atomic_load_n(address, __ATOMIC_ACQUIRE) !=
+            SharedInsertTurnTokenAfterTasks(
+                completed_tasks, lane
+            )) {
+            return false;
+        }
+    }
+    return true;
+}
+
+uint32_t ExpectedClaimAttempts(TaskKind kind) {
+    switch (kind) {
+        case TaskKind::Alloc:
+            return kWorkers;
+        case TaskKind::Qk:
+        case TaskKind::Pv:
+            return kAicWorkers;
+        case TaskKind::Sf:
+        case TaskKind::Up:
+            return kAivWorkers;
+        case TaskKind::Count:
+            return 0;
+    }
+    return 0;
+}
+
+bool ClaimAndInsertEvidenceMatches(
+    const SchedulerState &state, uint32_t task_count
+) {
+    uint32_t planned_tasks = 0;
+    bool exact = true;
+    for (uint32_t batch = 0;
+         batch < state.config.batches; ++batch) {
+        SharedPaBatchPlan plan{};
+        exact &= BuildSharedPaBatchPlan(
+            static_cast<uint64_t>(
+                state.context_lens[batch]
+            ),
+            planned_tasks, plan
+        );
+        if (!exact) {
+            return false;
+        }
+        for (uint32_t offset = 0;
+             offset < plan.task_count; ++offset) {
+            SharedPaPlannedTask task{};
+            exact &= SharedPaPlannedTaskAt(
+                plan, offset, task
+            );
+            const uint32_t task_id =
+                plan.batch_start + offset;
+            exact &=
+                OrderedSubmitTestOps::
+                    claim_attempts_by_task[task_id].load(
+                        std::memory_order_relaxed
+                    ) == ExpectedClaimAttempts(task.kind);
+            exact &=
+                OrderedSubmitTestOps::
+                    claim_wins_by_task[task_id].load(
+                        std::memory_order_relaxed
+                    ) == 1;
+            exact &=
+                OrderedSubmitTestOps::
+                    insert_publish_by_token[task_id + 1U]
+                        .load(std::memory_order_relaxed) == 1;
+        }
+        planned_tasks += plan.task_count;
+    }
+    exact &= planned_tasks == task_count;
+
+    uint32_t expected_lane_publishes[
+        kSharedInsertTurnCapacity
+    ] = {};
+    for (uint32_t token = 1;
+         token <= task_count; ++token) {
+        ++expected_lane_publishes[
+            token & kSharedInsertTurnMask
+        ];
+    }
+    for (uint32_t lane = 0;
+         lane < kSharedInsertTurnCapacity; ++lane) {
+        exact &=
+            OrderedSubmitTestOps::
+                insert_publish_by_lane[lane].load(
+                    std::memory_order_relaxed
+                ) == expected_lane_publishes[lane];
+    }
+    return exact;
+}
+
 bool RunLoserZeroTensorMapAccessTest() {
     SchedulerState *state = MapSchedulerState();
     if (state == nullptr) {
@@ -302,27 +522,51 @@ bool RunLoserZeroTensorMapAccessTest() {
         EncodeSharedPaTaskMeta(TaskKind::Up, 0, true, false)
     };
 
-    state->shared_map.committed_tasks.value = 77;
+    int64_t turns_before[kSharedInsertTurnCapacity] = {};
+    for (uint32_t lane = 0;
+         lane < kSharedInsertTurnCapacity; ++lane) {
+        volatile int64_t *address =
+            &SharedInsertTurnLine(
+                state->shared_map, lane
+            ).value;
+        turns_before[lane] =
+            static_cast<int64_t>(77U + lane);
+        __atomic_store_n(
+            address, turns_before[lane],
+            __ATOMIC_RELEASE
+        );
+    }
     OrderedSubmitTestOps::ResetHooks();
     OrderedSubmitTestOps::observed_state = state;
     const bool finished =
         FinishSharedLoserSubmit<OrderedSubmitTestOps, false>(
             state, context, stats, ticket
         );
+    bool turns_unchanged = true;
+    for (uint32_t lane = 0;
+         lane < kSharedInsertTurnCapacity; ++lane) {
+        turns_unchanged &=
+            __atomic_load_n(
+                &SharedInsertTurnLine(
+                    state->shared_map, lane
+                ).value,
+                __ATOMIC_ACQUIRE
+            ) == turns_before[lane];
+    }
     const bool ok =
         finished && state->fatal.value == 0 &&
         stats.result.submits == 1 &&
         stats.declared_task_count == 0 &&
-        state->shared_map.committed_tasks.value == 77 &&
+        turns_unchanged &&
         state->tasks[kTask].deps_prepared == -1 &&
-        OrderedSubmitTestOps::shared_map_loads.load(
+        OrderedSubmitTestOps::shared_map_accesses.load(
             std::memory_order_relaxed
         ) == 0;
     std::printf(
-        "[ORDERED_SUBMIT] loser_zero_map_access=%s loads=%llu\n",
+        "[ORDERED_SUBMIT] loser_zero_map_access=%s accesses=%llu\n",
         ok ? "PASS" : "FAIL",
         static_cast<unsigned long long>(
-            OrderedSubmitTestOps::shared_map_loads.load(
+            OrderedSubmitTestOps::shared_map_accesses.load(
                 std::memory_order_relaxed
             )
         )
@@ -348,6 +592,7 @@ bool RunInsertReleaseBeforeBuildTest() {
     OrderedSubmitTestOps::ResetHooks();
     OrderedSubmitTestOps::hook_mode =
         OrderedSubmitHookMode::BuildOverlap;
+    OrderedSubmitTestOps::observed_state = state;
 
     std::vector<std::thread> workers;
     workers.reserve(kWorkers);
@@ -397,8 +642,10 @@ bool RunInsertReleaseBeforeBuildTest() {
         );
     const bool ok =
         state->fatal.value == 0 &&
-        state->shared_map.committed_tasks.value ==
-            static_cast<int64_t>(kTaskCount) &&
+        InsertTurnsMatch(*state, kTaskCount) &&
+        ClaimAndInsertEvidenceMatches(
+            *state, kTaskCount
+        ) &&
         OrderedSubmitTestOps::task4_insert_hook_calls.load(
             std::memory_order_relaxed
         ) == 1 &&
@@ -417,8 +664,10 @@ bool RunInsertReleaseBeforeBuildTest() {
         );
     std::printf(
         "[ORDERED_SUBMIT] release_before_build=%s "
-        "cursor=%lld overlap=%u kernels=%llu,%llu,%llu,%llu\n",
+        "completed=%u turn0=%lld overlap=%u "
+        "kernels=%llu,%llu,%llu,%llu\n",
         ok ? "PASS" : "FAIL",
+        kTaskCount,
         static_cast<long long>(
             state->shared_map.committed_tasks.value
         ),
@@ -428,6 +677,7 @@ bool RunInsertReleaseBeforeBuildTest() {
         static_cast<unsigned long long>(kernel_counts[2]),
         static_cast<unsigned long long>(kernel_counts[3])
     );
+    OrderedSubmitTestOps::observed_state = nullptr;
     (void)munmap(state, sizeof(SchedulerState));
     return ok;
 }
@@ -448,6 +698,7 @@ bool RunIndependentKernelExecutionTest() {
     OrderedSubmitTestOps::ResetHooks();
     OrderedSubmitTestOps::hook_mode =
         OrderedSubmitHookMode::ExecutionOverlap;
+    OrderedSubmitTestOps::observed_state = state;
 
     std::vector<std::thread> workers;
     workers.reserve(kWorkers);
@@ -489,8 +740,10 @@ bool RunIndependentKernelExecutionTest() {
         );
     const bool ok =
         state->fatal.value == 0 &&
-        state->shared_map.committed_tasks.value ==
-            static_cast<int64_t>(kTaskCount) &&
+        InsertTurnsMatch(*state, kTaskCount) &&
+        ClaimAndInsertEvidenceMatches(
+            *state, kTaskCount
+        ) &&
         OrderedSubmitTestOps::independent_insert_hook_calls.load(
             std::memory_order_relaxed
         ) == 1 &&
@@ -506,8 +759,9 @@ bool RunIndependentKernelExecutionTest() {
         );
     std::printf(
         "[ORDERED_SUBMIT] independent_kernel_overlap=%s "
-        "cursor=%lld kernels=%llu,%llu,%llu,%llu\n",
+        "completed=%u turn0=%lld kernels=%llu,%llu,%llu,%llu\n",
         ok ? "PASS" : "FAIL",
+        kTaskCount,
         static_cast<long long>(
             state->shared_map.committed_tasks.value
         ),
@@ -516,6 +770,7 @@ bool RunIndependentKernelExecutionTest() {
         static_cast<unsigned long long>(kernel_counts[2]),
         static_cast<unsigned long long>(kernel_counts[3])
     );
+    OrderedSubmitTestOps::observed_state = nullptr;
     (void)munmap(state, sizeof(SchedulerState));
     return ok;
 }

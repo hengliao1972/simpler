@@ -1307,10 +1307,11 @@ PA_DEVICE uint32_t CollectSharedFanin(
     uint32_t validated_ordinary_lookups = 0;
     uint32_t validated_input_loads = 0;
 
-    // 只读取并校验，不修改 last_writer、统计或输出 fanin。final UP 与
-    // 普通任务在 Build 成功后提交 writer；non-final UP 则在 registration
-    // 校验后、Build 前提交 intent。两条路径都先完成本轮只读校验，后续
-    // 引用非法时不会留下半次 writer 更新。
+    // 只读取并校验，不修改 last_writer、统计或输出 fanin。旧 PA
+    // chained-writer 路径仍按自己的 registration/Build 边界提交；
+    // 独立 shared ordered-insert 路径则在进入这里前已经发布本 task
+    // writer history，所以 AcceptLatestWriter 必须沿 history 回退到 <N。
+    // 两种路径都先完成本轮只读校验，后续引用非法时不会再留下 writer 更新。
     for (int32_t index = 0; index < args.tensor_count; ++index) {
         const TensorArgType tag =
             TaskTag(args, static_cast<uint32_t>(index));
@@ -1670,8 +1671,12 @@ PA_DEVICE bool ValidateOrdinarySharedWriterReference(
     if (tensor.owner_task_id == kInvalidTaskId) {
         return true;
     }
+    if (tensor.owner_task_id >
+        static_cast<uint64_t>(INT32_MAX)) {
+        return false;
+    }
     const int32_t owner = static_cast<int32_t>(
-        tensor.owner_task_id & 0xFFFFFFFFU
+        tensor.owner_task_id
     );
     return owner >= 0 && owner < task_id;
 }
@@ -1760,10 +1765,15 @@ PA_DEVICE bool CommitOrdinarySharedWriterIntent(
         return true;
     }
     if (tensor.owner_task_id != kInvalidTaskId) {
+        if (tensor.owner_task_id >
+            static_cast<uint64_t>(INT32_MAX)) {
+            return false;
+        }
         const int32_t owner = static_cast<int32_t>(
-            tensor.owner_task_id & 0xFFFFFFFFU
+            tensor.owner_task_id
         );
-        if (!AddSharedWriterIntentFanin(
+        if (owner < 0 || owner >= task_id ||
+            !AddSharedWriterIntentFanin(
                 fanin, fanin_count, owner
             )) {
             return false;
@@ -1809,10 +1819,10 @@ PA_DEVICE bool CommitSymbolSharedWriterIntentSet(
     int32_t fanin[kMaxFanin], uint32_t &fanin_count,
     LocalStats &stats, PA_GM volatile int32_t *fatal
 ) {
-    // 调用方必须保证同一 symbol 的 writer 按 task_id 单调进入本函数；
-    // shared replay 迁移时由前一 writer 的 ready gate 建立这一顺序。
-    // CAS 负责发现违反协议的乱序或重复 winner，但不会替调用方补回
-    // 已被跨越的 writer。
+    // 调用方必须保证同一 symbol 的 writer 按 task_id 单调进入本函数。
+    // 独立 shared Submit 由全局 insert turn 建立这一顺序；仍保留的隔离
+    // driver 则必须提供等价的唯一 ordered writer 合同。CAS 负责发现
+    // 乱序或重复 owner，但不会替调用方补回已被跨越的 writer。
     if (task_id < 0 ||
         task_id >= static_cast<int32_t>(kMaxTasks)) {
         return false;

@@ -21,6 +21,14 @@ ARTIFACT_MANIFEST_NAME="pa_scheduler_artifacts.manifest"
 # 各自已接线的 TensorMap backend，manifest 会阻止两种产物交叉运行。
 TENSORMAP_MODE="private"
 TENSORMAP_RING_CAP=128
+SHARED_INSERT_TURN_GROUPS="${PA_SHARED_INSERT_TURN_GROUPS:-1}"
+case "$SHARED_INSERT_TURN_GROUPS" in
+    1|2|4|8) ;;
+    *)
+        echo "PA_SHARED_INSERT_TURN_GROUPS must be 1, 2, 4, or 8." >&2
+        exit 1
+        ;;
+esac
 if [[ "${1:-}" == "private" || "${1:-}" == "shared" ]]; then
     TENSORMAP_MODE="$1"
     shift
@@ -33,6 +41,11 @@ case "$TENSORMAP_MODE" in
         exit 1
         ;;
 esac
+if [[ "$TENSORMAP_MODE" != "shared" &&
+      "$SHARED_INSERT_TURN_GROUPS" != "1" ]]; then
+    echo "PA_SHARED_INSERT_TURN_GROUPS only applies to shared TensorMap builds." >&2
+    exit 1
+fi
 
 # CCEC 不生成跨证据链的统一 ELF。无 variant 保持兼容并等价于
 # swimlane；perf-clock 与 submit-pmu 分别拥有独立目录和编译身份。
@@ -119,6 +132,10 @@ fi
 # 正式 standalone CCEC 产物先固定使用已验证的 128×128 布局；CAP 仍
 # 显式进入三镜像编译身份和 manifest，避免默认值漂移后静默混件。
 VARIANT_DEFINES+=("-DPTO_FDWIC_TENSORMAP_RING_CAP=$TENSORMAP_RING_CAP")
+VARIANT_DEFINES+=(
+    "-DPTO_FDWIC_SHARED_INSERT_TURN_GROUPS=$SHARED_INSERT_TURN_GROUPS"
+)
+echo "[BUILD] shared insert-turn groups=$SHARED_INSERT_TURN_GROUPS"
 
 # 编译只依赖本目录源码与用户安装的 CANN/PTO 头，不引用 pa_scheduler 目录外的 simpler 构建产物。
 if [[ -z "${ASCEND_HOME_PATH:-}" ]]; then
@@ -806,10 +823,12 @@ cleanup_manifest_tmp() {
 }
 trap cleanup_manifest_tmp EXIT
 {
-    printf '# schema=pa_scheduler_artifacts/v2\n'
+    printf '# schema=pa_scheduler_artifacts/v3\n'
     printf '# tensormap_mode=%s\n' "$TENSORMAP_MODE"
     printf '# tensormap_mode_id=%u\n' "$TENSORMAP_MODE_ID"
     printf '# tensormap_ring_cap=%u\n' "$TENSORMAP_RING_CAP"
+    printf '# shared_insert_turn_groups=%u\n' \
+        "$SHARED_INSERT_TURN_GROUPS"
     printf '# variant=%s\n' "$BUILD_VARIANT"
     printf '# phase=%s\n' "$PHASE_NAME"
     printf '# phase_id=%u\n' "$PHASE_ID"

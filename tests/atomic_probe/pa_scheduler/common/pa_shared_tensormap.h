@@ -281,12 +281,166 @@ PA_DEVICE bool SharedComputeOrderedReclaimCandidate(
     return true;
 }
 
+PA_DEVICE uint32_t SharedInsertTurnLane(int32_t token) {
+    return static_cast<uint32_t>(token) &
+           kSharedInsertTurnMask;
+}
+
+PA_DEVICE PA_GM AtomicLine &SharedInsertTurnLine(
+    PA_GM SharedTensorMapSidecar &map, uint32_t lane
+) {
+    // lane 0 保持原 committed_tasks 地址，G=1 不移动热点控制字。
+    // 调用者只传 [0,kSharedInsertTurnCapacity)；active G 之外的物理线
+    // 仅供初始化和 host 终态校验。
+    if (lane == 0) {
+        return map.committed_tasks;
+    }
+    return map.insert_turn_extra[lane - 1U];
+}
+
+PA_DEVICE void InitializeSharedInsertTurns(
+    PA_GM SharedTensorMapSidecar &map
+) {
+    map.committed_tasks.value = 0;
+    for (uint32_t lane = 1;
+         lane < kSharedInsertTurnCapacity; ++lane) {
+        map.insert_turn_extra[lane - 1U].value = -1;
+    }
+}
+
+// completed_tasks=T 表示 token 0..T 已按序产生。每条 active lane 保存
+// 不大于 T 的最大同余 token；从未接收 token 的 lane 与全部 inactive
+// lane 保持 -1。该纯公式供 host 和独立测试建立权威终态。
+constexpr int64_t SharedInsertTurnTokenAfterTasks(
+    uint32_t completed_tasks, uint32_t lane
+) {
+    if (lane >= kSharedInsertTurnGroups) {
+        return -1;
+    }
+    if (lane > completed_tasks) {
+        return lane == 0 ? 0 : -1;
+    }
+    return static_cast<int64_t>(
+        completed_tasks -
+        ((completed_tasks - lane) & kSharedInsertTurnMask)
+    );
+}
+
+PA_DEVICE int64_t SharedInsertTurnPublishExpectedOld(
+    int32_t task_id
+) {
+    const int64_t next =
+        static_cast<int64_t>(task_id) + 1;
+    return next >=
+                   static_cast<int64_t>(
+                       kSharedInsertTurnGroups
+                   )
+               ? next -
+                     static_cast<int64_t>(
+                         kSharedInsertTurnGroups
+                     )
+               : -1;
+}
+
+enum class SharedInsertTurnState : uint32_t {
+    Ready = 0,
+    Pending = 1,
+    ProtocolError = 2,
+};
+
+// insert-turn 是不索引 SchedulerState::tasks 的绝对序列原语，隔离 ring
+// 门槛会用它覆盖超过 kMaxTasks 的多圈 cursor，因此这里只限制 int32
+// 可表达性。生产 Submit 在触碰任何共享状态前另行要求 task_id 落在
+// [0,kMaxTasks)，不能把两层合同合并后破坏大 CAP 原语门槛。
+template <typename Ops>
+PA_DEVICE SharedInsertTurnState SharedInspectTaskTurn(
+    PA_GM SharedTensorMapSidecar &map, int32_t current_task
+) {
+    if (current_task < 0) {
+        return SharedInsertTurnState::ProtocolError;
+    }
+    const uint32_t lane =
+        SharedInsertTurnLane(current_task);
+    const int64_t observed = Ops::Load(
+        &SharedInsertTurnLine(map, lane).value
+    );
+    if (observed == current_task) {
+        return SharedInsertTurnState::Ready;
+    }
+    if (observed < -1 || observed > current_task) {
+        return SharedInsertTurnState::ProtocolError;
+    }
+    // lane 0 从初始化起始终保存非负的 0 mod G token；其他 lane 在
+    // 第一次接收 token 前合法保持 -1。已发布旧 token 必须与本 lane
+    // 同余，否则表示初始化、越序写或地址计算已经损坏。
+    if (observed == -1) {
+        return lane == 0
+                   ? SharedInsertTurnState::ProtocolError
+                   : SharedInsertTurnState::Pending;
+    }
+    if ((static_cast<uint32_t>(observed) &
+         kSharedInsertTurnMask) != lane) {
+        return SharedInsertTurnState::ProtocolError;
+    }
+    return SharedInsertTurnState::Pending;
+}
+
 template <typename Ops>
 PA_DEVICE bool SharedHasExactTaskTurn(
     PA_GM SharedTensorMapSidecar &map, int32_t current_task
 ) {
-    return current_task >= 0 &&
-           Ops::Load(&map.committed_tasks.value) == current_task;
+    return SharedInspectTaskTurn<Ops>(
+               map, current_task
+           ) == SharedInsertTurnState::Ready;
+}
+
+// current lane 的 N 是进入有序通道的 grant；G>1 时它会保留到下一代
+// token 覆盖，不能单独充当“尚未发布”的锁。生产合同由 Claim 保证
+// 每 task 只有一个 owner，同时在写任何 TensorMap 元数据前预检目标
+// lane 仍是本 task 应覆盖的旧 token，拒绝已经完成的重复调用。
+template <typename Ops>
+PA_DEVICE bool SharedCanPublishTaskCommit(
+    PA_GM SharedTensorMapSidecar &map, int32_t task_id
+) {
+    if (task_id < 0 || task_id == INT32_MAX ||
+        !SharedHasExactTaskTurn<Ops>(map, task_id)) {
+        return false;
+    }
+    if (kSharedInsertTurnGroups == 1U) {
+        // current/next lane 是同一条线，exact N 已经同时证明 CAS 的
+        // expected_old=N；避免 G=1 基线多做一次相同地址 load。
+        return true;
+    }
+    const int32_t next = task_id + 1;
+    const uint32_t next_lane =
+        SharedInsertTurnLane(next);
+    const int64_t expected =
+        SharedInsertTurnPublishExpectedOld(task_id);
+    return Ops::Load(
+               &SharedInsertTurnLine(
+                    map, next_lane
+                ).value
+           ) == expected;
+}
+
+template <typename Ops>
+PA_DEVICE bool SharedPublishTaskCommitAfterPreflight(
+    PA_GM SharedTensorMapSidecar &map, int32_t task_id
+) {
+    if (task_id < 0 || task_id == INT32_MAX) {
+        return false;
+    }
+    const int32_t next = task_id + 1;
+    const uint32_t next_lane =
+        SharedInsertTurnLane(next);
+    const int64_t expected =
+        SharedInsertTurnPublishExpectedOld(task_id);
+    return Ops::CompareExchange(
+               &SharedInsertTurnLine(
+                    map, next_lane
+                ).value,
+               expected, static_cast<int64_t>(next)
+           ) == expected;
 }
 
 // reclaim_upto 只允许唯一 ordered append actor 单调发布。这里不从 exact
@@ -417,7 +571,9 @@ PA_DEVICE SharedAppendCheck SharedCheckTaskAppend(
             return SharedAppendCheck::CapacityBlocked;
         }
         const uint64_t cursor = static_cast<uint64_t>(tail) + earlier;
-        if (cursor > static_cast<uint64_t>(INT64_MAX)) {
+        // 该 entry 发布后 tail 必须递增；cursor==INT64_MAX 也没有
+        // 可表达的 next tail，必须在触碰 slot 前拒绝。
+        if (cursor >= static_cast<uint64_t>(INT64_MAX)) {
             return SharedAppendCheck::ProtocolError;
         }
         PA_GM SharedRegionSlot &slot =
@@ -455,10 +611,10 @@ PA_DEVICE bool SharedAppendPreparedEntry(
         static_cast<uint64_t>(tail - head) >= kMapBucketCapacity) {
         return false;
     }
-    const uint64_t cursor = static_cast<uint64_t>(tail);
-    if (cursor > static_cast<uint64_t>(INT64_MAX)) {
+    if (tail == INT64_MAX) {
         return false;
     }
+    const uint64_t cursor = static_cast<uint64_t>(tail);
     PA_GM SharedRegionSlot &slot =
         map.slots[SharedTensorMapSlotIndex(bucket, cursor)];
     const int64_t expected_old =
@@ -584,17 +740,21 @@ template <typename Ops>
 PA_DEVICE bool SharedPublishTaskCommit(
     PA_GM SharedTensorMapSidecar &map, int32_t task_id
 ) {
-    if (task_id < 0 || task_id == INT32_MAX) {
+    if (kSharedInsertTurnGroups == 1U) {
+        // 保持既有 G=1 原语恰好一次 CAS、零预检 load 的事件形状；
+        // CAS(N,N+1) 本身即可拒绝重复、陈旧和 future actor。
+        return SharedPublishTaskCommitAfterPreflight<Ops>(
+            map, task_id
+        );
+    }
+    if (!SharedCanPublishTaskCommit<Ops>(
+            map, task_id
+        )) {
         return false;
     }
-    // Claim 已经保证同一 task 只有一个 owner；CAS 只允许 exact turn
-    // N -> N+1。重复、陈旧或未来 actor 失败时不修改控制字，避免旧
-    // Exchange+恢复路径短暂向其他核暴露错误前沿。
-    return Ops::CompareExchange(
-               &map.committed_tasks.value,
-               static_cast<int64_t>(task_id),
-               static_cast<int64_t>(task_id) + 1
-           ) == task_id;
+    return SharedPublishTaskCommitAfterPreflight<Ops>(
+        map, task_id
+    );
 }
 
 }  // namespace pa_scheduler

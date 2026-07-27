@@ -49,6 +49,27 @@ esac
 BUILD_DIR="$ROOT_DIR/build/cpu/$TENSORMAP_MODE/$BUILD_VARIANT"
 CXX_BIN="${CXX:-g++}"
 TENSORMAP_RING_CAP=128
+SHARED_INSERT_TURN_GROUPS="${PA_SHARED_INSERT_TURN_GROUPS:-1}"
+case "$SHARED_INSERT_TURN_GROUPS" in
+    1|2|4|8) ;;
+    *)
+        echo "PA_SHARED_INSERT_TURN_GROUPS must be 1, 2, 4, or 8." >&2
+        exit 1
+        ;;
+esac
+if [[ "$TENSORMAP_MODE" != "shared" &&
+      "$SHARED_INSERT_TURN_GROUPS" != "1" ]]; then
+    echo "PA_SHARED_INSERT_TURN_GROUPS only applies to shared TensorMap builds." >&2
+    exit 1
+fi
+VARIANT_DEFINES+=(
+    "-DPTO_FDWIC_SHARED_INSERT_TURN_GROUPS=$SHARED_INSERT_TURN_GROUPS"
+)
+SCHEDULER_BINARY="pa_scheduler_cpu"
+if [[ "$TENSORMAP_MODE" == "shared" &&
+      "$SHARED_INSERT_TURN_GROUPS" != "1" ]]; then
+    SCHEDULER_BINARY="pa_scheduler_cpu_turn_g${SHARED_INSERT_TURN_GROUPS}"
+fi
 
 # CPU 后端只依赖 C++17、pthread 和本目录 common/，不需要 CANN。
 # CXX 可显式指向用户目录下的 g++-15，未设置时沿用当前 PATH 中的 g++。
@@ -58,6 +79,7 @@ TENSORMAP_RING_CAP=128
 mkdir -p "$BUILD_DIR"
 
 echo "[BUILD] CPU scheduler executable"
+echo "[BUILD] shared insert-turn groups=$SHARED_INSERT_TURN_GROUPS"
 # -pthread 同时提供编译期线程宏和链接期 pthread 支持；严格告警用于防止
 # CPU 等价层因类型或原子接口变化而静默偏离设备端公共协议。private/shared
 # 都实例化同一 scheduler，模式宏只选择各自已经接线的 TensorMap backend。
@@ -67,7 +89,7 @@ echo "[BUILD] CPU scheduler executable"
     "${VARIANT_DEFINES[@]}" \
     -I"$ROOT_DIR/common" \
     "$SCRIPT_DIR/main.cpp" \
-    -o "$BUILD_DIR/pa_scheduler_cpu"
+    -o "$BUILD_DIR/$SCHEDULER_BINARY"
 
 # PollBatch 是 common/ 中的设备/CPU 共用模板。这里用普通 C++17 编译器
 # 直接实例化并执行边界自测；任一断言失败都会借助 set -e 阻止构建成功。
@@ -105,6 +127,24 @@ if [[ "$TENSORMAP_MODE" == "private" ]]; then
         "$binary"
     done
 else
+    # insert-turn 是一枚全局 baton 在 G 条 cache line 之间轮换，不是 G
+    # 条独立插入链。同一生产 helper 分别编译 G=1/2/4/8，锁定初始化、
+    # rollover、错误状态、重复发布和完整八线终态。
+    for turn_groups in 1 2 4 8; do
+        binary="$BUILD_DIR/test_shared_insert_turn_g${turn_groups}"
+        echo "[BUILD] shared insert-turn self-test G=$turn_groups"
+        "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+            -DPTO_FDWIC_SHARED_MAP=1 \
+            "-DPTO_FDWIC_SHARED_INSERT_TURN_GROUPS=$turn_groups" \
+            -DPA_BUILD_SWIMLANE=1 \
+            -I"$ROOT_DIR/common" \
+            "$ROOT_DIR/test/test_shared_insert_turn.cpp" \
+            -o "$binary"
+
+        echo "[TEST] shared insert-turn self-test G=$turn_groups"
+        "$binary"
+    done
+
     # host 必须从最终 SchedulerState.context_lens 独立重建 shared task
     # plan，不能复用 device helper 形成同错 oracle。该测试覆盖 G0/G1/G2/G4、
     # mixed 累计 batch_start、TaskAt 元数据、partial group 输出字节、writer
@@ -166,16 +206,20 @@ else
     # 多跳、跨 cache-line history、乱序和 partial-CAS 终止语义；
     # ownerless ordinary region 锁定 A->B->C。两者都证明
     # metadata-ready 不冒充 kernel completion。
-    echo "[BUILD] generic shared writer-intent self-test"
-    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror -pthread \
-        -DPTO_FDWIC_SHARED_MAP=1 \
-        -DPA_BUILD_SWIMLANE=1 \
-        -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/test/test_shared_writer_intent.cpp" \
-        -o "$BUILD_DIR/test_shared_writer_intent"
+    for turn_groups in 1 8; do
+        binary="$BUILD_DIR/test_shared_writer_intent_g${turn_groups}"
+        echo "[BUILD] generic shared writer-intent self-test G=$turn_groups"
+        "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror -pthread \
+            -DPTO_FDWIC_SHARED_MAP=1 \
+            "-DPTO_FDWIC_SHARED_INSERT_TURN_GROUPS=$turn_groups" \
+            -DPA_BUILD_SWIMLANE=1 \
+            -I"$ROOT_DIR/common" \
+            "$ROOT_DIR/test/test_shared_writer_intent.cpp" \
+            -o "$binary"
 
-    echo "[TEST] generic shared writer-intent self-test"
-    timeout --foreground 15s "$BUILD_DIR/test_shared_writer_intent"
+        echo "[TEST] generic shared writer-intent self-test G=$turn_groups"
+        timeout --foreground 15s "$binary"
+    done
 
     # shared heap 与 region/symbol 协议分开验证：锁定 8 shard、1 KiB
     # 对齐、首版禁止 wrap、并发唯一分配及 terminal 容量竞争不回滚。
@@ -219,20 +263,24 @@ else
     "$BUILD_DIR/test_shared_materialize"
 
     # 新 shared 合同只串行 TensorMap writer 插入。测试一方面逐地址计数
-    # loser 的 shared-map load 必须为零，另一方面在 task4 发布插入前沿后
-    # 暂停其 Build，证明 task8 仍可完成 lookup 与 Build。
-    echo "[BUILD] shared ordered-insert Submit self-test"
-    "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
-        -DPTO_FDWIC_SHARED_MAP=1 \
-        -DPA_BUILD_SWIMLANE=1 \
-        -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/test/test_shared_ordered_submit.cpp" \
-        -o "$BUILD_DIR/test_shared_ordered_submit"
+    # post-Claim loser 的所有 shared-map Ops 访问必须为零，另一方面在
+    # task4 发布插入前沿后暂停其 Build，证明 task8 仍可完成 lookup 与 Build。
+    for turn_groups in 1 2 4 8; do
+        binary="$BUILD_DIR/test_shared_ordered_submit_g${turn_groups}"
+        echo "[BUILD] shared ordered-insert Submit self-test G=$turn_groups"
+        "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
+            -DPTO_FDWIC_SHARED_MAP=1 \
+            "-DPTO_FDWIC_SHARED_INSERT_TURN_GROUPS=$turn_groups" \
+            -DPA_BUILD_SWIMLANE=1 \
+            -I"$ROOT_DIR/common" \
+            "$ROOT_DIR/test/test_shared_ordered_submit.cpp" \
+            -o "$binary"
 
-    echo "[TEST] shared ordered-insert Submit self-test"
-    timeout --foreground 15s "$BUILD_DIR/test_shared_ordered_submit"
+        echo "[TEST] shared ordered-insert Submit self-test G=$turn_groups"
+        timeout --foreground 15s "$binary"
+    done
 fi
 
 # set -e 保证编译或链接失败时不会打印 complete，也不会在组合构建中继续
 # 后续步骤；只有成功退出的构建才被本脚本声明为可运行产物。
-echo "[BUILD] complete: $BUILD_DIR/pa_scheduler_cpu"
+echo "[BUILD] complete: $BUILD_DIR/$SCHEDULER_BINARY"

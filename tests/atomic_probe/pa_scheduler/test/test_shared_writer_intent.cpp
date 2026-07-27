@@ -187,7 +187,7 @@ void UnmapSparseSchedulerState(SchedulerState *state) {
 void ResetProtocolState(SchedulerState &state) {
     state.fatal.value = 0;
     state.heap_window = kHeapWindow;
-    state.shared_map.committed_tasks.value = 0;
+    InitializeSharedInsertTurns(state.shared_map);
     state.shared_map.reclaim_upto.value = -1;
     for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
         state.shared_map.buckets[bucket].head.value = 0;
@@ -215,6 +215,34 @@ void ResetProtocolState(SchedulerState &state) {
         history.count = 0;
         history.reserved = 0;
     }
+}
+
+void SetInsertTurnsAfterTasks(
+    SharedTensorMapSidecar &map, uint32_t completed_tasks
+) {
+    for (uint32_t lane = 0;
+         lane < kSharedInsertTurnCapacity; ++lane) {
+        SharedInsertTurnLine(map, lane).value =
+            SharedInsertTurnTokenAfterTasks(
+                completed_tasks, lane
+            );
+    }
+}
+
+bool InsertTurnsMatch(
+    SharedTensorMapSidecar &map, uint32_t completed_tasks
+) {
+    for (uint32_t lane = 0;
+         lane < kSharedInsertTurnCapacity; ++lane) {
+        if (WriterIntentTestOps::Load(
+                &SharedInsertTurnLine(map, lane).value
+            ) != SharedInsertTurnTokenAfterTasks(
+                     completed_tasks, lane
+                 )) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void ResetTaskGate(SchedulerState &state, int32_t task_id) {
@@ -1070,7 +1098,7 @@ void TestOrdinaryWriterIntentChain(SchedulerState &state) {
         "ownerless ordinary INPUT resolves the latest writer"
     );
     Check(
-        state.shared_map.committed_tasks.value == 0,
+        InsertTurnsMatch(state.shared_map, 0),
         "non-adjacent ordinary writers do not require exact task turn"
     );
 }
@@ -1112,6 +1140,21 @@ void TestWriterDeltaRequiresExactRegisterMask() {
             delta.writer_intent_required,
         "writer delta accepts the exact writer mask"
     );
+
+    // 低 32 位看似是合法前任的畸形 owner 也必须在 writer delta
+    // 准备阶段拒绝，不能截断成 task 0 后发布 ordinary 元数据。
+    tensor.owner_task_id = uint64_t{1} << 32;
+    context.task_id = 1;
+    context.result.task_id = 1;
+    Check(
+        !ValidateOrdinarySharedWriterReference(
+            tensor, context.task_id
+        ) &&
+            !PrepareSharedTaskWriterDelta(
+                args, context, delta
+            ),
+        "writer delta rejects owner ids with nonzero high 32 bits"
+    );
 }
 
 void TestOrderedOrdinaryInsertBeforeLookup(
@@ -1146,7 +1189,7 @@ void TestOrderedOrdinaryInsertBeforeLookup(
             &state, first_args, first_context,
             first_delta, first_stats
         ) &&
-            state.shared_map.committed_tasks.value == 1,
+            InsertTurnsMatch(state.shared_map, 1),
         "ordered ordinary task 0 publishes before lookup"
     );
 
@@ -1189,7 +1232,7 @@ void TestOrderedOrdinaryInsertBeforeLookup(
                 &state, second_args, second_context,
                 second_delta, second_stats
             ) &&
-            state.shared_map.committed_tasks.value == 2,
+            InsertTurnsMatch(state.shared_map, 2),
         "ordered ordinary task 1 publishes its writer entry"
     );
     lookup_ok = false;
@@ -1230,7 +1273,7 @@ void TestOrderedOrdinaryInsertBeforeLookup(
                 &state, reader_args, reader_context,
                 reader_delta, reader_stats
             ) &&
-            state.shared_map.committed_tasks.value == 3,
+            InsertTurnsMatch(state.shared_map, 3),
         "empty writer task still advances the ordered frontier"
     );
     lookup_ok = false;
@@ -1284,7 +1327,7 @@ void TestOrderedSymbolInsertBeforeLookup(
             ) &&
             state.shared_map.shared_outputs[0]
                     .published[0].value == 0 &&
-            state.shared_map.committed_tasks.value == 1,
+            InsertTurnsMatch(state.shared_map, 1),
         "fresh symbol descriptor is visible before turn 1"
     );
 
@@ -1317,7 +1360,7 @@ void TestOrderedSymbolInsertBeforeLookup(
             ) &&
             state.shared_map.shared_outputs[0]
                     .last_writer[0].value == 1 &&
-            state.shared_map.committed_tasks.value == 2,
+            InsertTurnsMatch(state.shared_map, 2),
         "symbol INOUT publishes history before its own lookup"
     );
 
@@ -1469,7 +1512,7 @@ void TestOrderedMixedWriterTransaction(
         state.shared_map.writer_history[1];
     Check(
         state.fatal.value == 0 &&
-            state.shared_map.committed_tasks.value == 2 &&
+            InsertTurnsMatch(state.shared_map, 2) &&
             seed_cell.last_writer[0].value == 1 &&
             history.magic == kSharedWriterHistoryMagic &&
             history.writer_task == 1 &&
@@ -1698,7 +1741,10 @@ void TestOrderedPublishRejectsFullBucketAtomically(
 
     constexpr int32_t kBlockedTask =
         static_cast<int32_t>(kMapBucketCapacity);
-    state.shared_map.committed_tasks.value = kBlockedTask;
+    SetInsertTurnsAfterTasks(
+        state.shared_map,
+        static_cast<uint32_t>(kBlockedTask)
+    );
     TensorDesc tensor = MakeTensor(kAddress);
     TaskArgs args;
     ConstructTaskArgs(args);
@@ -1758,8 +1804,10 @@ void TestOrderedPublishRejectsFullBucketAtomically(
     }
     Check(
         state.fatal.value == 1 &&
-            state.shared_map.committed_tasks.value ==
-                kBlockedTask &&
+            InsertTurnsMatch(
+                state.shared_map,
+                static_cast<uint32_t>(kBlockedTask)
+            ) &&
             state.shared_map.buckets[bucket].head.value ==
                 head_before &&
             state.shared_map.buckets[bucket].tail.value ==

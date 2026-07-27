@@ -195,6 +195,42 @@ bool ParseReaderOrdering(
     return false;
 }
 
+void SetInsertTurnsAfterTasks(
+    SchedulerState *state, uint32_t completed_tasks
+) {
+    for (uint32_t lane = 0;
+         lane < pa_scheduler::kSharedInsertTurnCapacity;
+         ++lane) {
+        pa_scheduler::SharedInsertTurnLine(
+            state->shared_map, lane
+        ).value =
+            pa_scheduler::SharedInsertTurnTokenAfterTasks(
+                completed_tasks, lane
+            );
+    }
+}
+
+bool InsertTurnsMatch(
+    const SchedulerState &state, uint32_t completed_tasks
+) {
+    for (uint32_t lane = 0;
+         lane < pa_scheduler::kSharedInsertTurnCapacity;
+         ++lane) {
+        const int64_t observed =
+            lane == 0
+                ? state.shared_map.committed_tasks.value
+                : state.shared_map
+                      .insert_turn_extra[lane - 1U].value;
+        if (observed !=
+            pa_scheduler::SharedInsertTurnTokenAfterTasks(
+                completed_tasks, lane
+            )) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void ResetTaskGate(SchedulerState *state, int32_t task_id) {
     pa_scheduler::TaskCell &task =
         state->tasks[static_cast<uint32_t>(task_id)];
@@ -242,6 +278,7 @@ void InitializeHistoryState(
     std::memset(
         &state->shared_map, 0, kSharedSidecarBytes
     );
+    SetInsertTurnsAfterTasks(state, 0);
     state->fatal.value = 0;
     state->heap_window = pa_scheduler::kHeapWindow;
     for (uint32_t worker = 0;
@@ -291,10 +328,11 @@ void InitializeReaderReclaimState(
     std::memset(
         &state->shared_map, 0, kSharedSidecarBytes
     );
+    SetInsertTurnsAfterTasks(
+        state, kReaderReclaimWriterTask
+    );
     state->fatal.value = 0;
     state->heap_window = kReaderReclaimHeapWindow;
-    state->shared_map.committed_tasks.value =
-        kReaderReclaimWriterTask;
     state->shared_map.reclaim_upto.value = -1;
 
     for (uint32_t slot = 0;
@@ -532,9 +570,11 @@ bool ValidateHistory(
         ordinary_ring_untouched &=
             state.shared_map.reader_done[worker].value == -1;
     }
+    ordinary_ring_untouched &=
+        InsertTurnsMatch(state, 0);
     passed &= Expect(
         ordinary_ring_untouched,
-        "symbol history litmus leaves ordinary ring/progress untouched"
+        "symbol history leaves ring/progress/inactive turns untouched"
     );
     const bool reader_reclaim_untouched =
         ResultPrefixIsZero(
@@ -728,9 +768,13 @@ bool ValidateReaderReclaim(
     );
     passed &= Expect(
         state.shared_map.reclaim_upto.value == 0 &&
-            state.shared_map.committed_tasks.value ==
-                kReaderReclaimWriterTask + 1,
-        "reader frontier publishes reclaim 0 and commit 6"
+            InsertTurnsMatch(
+                state,
+                static_cast<uint32_t>(
+                    kReaderReclaimWriterTask + 1
+                )
+            ),
+        "reader frontier publishes reclaim/commit and preserves inactive turns"
     );
     passed &= Expect(
         state.shared_map.buckets[bucket].head.value == 1 &&

@@ -3411,7 +3411,7 @@ offset 均不变。Host 仍通过 `SharedSidecarBytes()` 整块 H2D/D2H；
 
 当前已通过：
 
-- 用户 `/home/q00473782/.venv` 下 100 项 Python converter/analyzer/PMU
+- 用户 `$HOME/.venv` 下 100 项 Python converter/analyzer/PMU
   回归；
 - CPU shared 全部定向测试、shared b1/b256 完整回放，以及 private
   strict/perf-clock 回归；
@@ -3576,7 +3576,7 @@ device0、b256、`real-compute 6,28,4,1`、two-16 配对。首轮六区组
 
 - CPU shared 定向测试显式验证 task 2/14 分别落 shard 2/6，b256 每条
   sidecar 线恰有 4,096 次 attempted；shared b1/b256 完整回放通过；
-- 用户 `/home/q00473782/.venv` 下 100 项 Python 测试通过；
+- 用户 `$HOME/.venv` 下 100 项 Python 测试通过；
 - CCEC private/shared 的 14 种构建与 manifest 全部通过；shared
   perf-clock `.text=129,080B`、`.rodata=288B`，与 S4.14a 大小相同；
 - private perf-clock `.text=125,752B`、`.rodata=300B` 的内容 SHA
@@ -3728,7 +3728,7 @@ b256 中 QK/PV 的 Cube ClaimMax 固定为：
   继续锁定 Vector8 路由与 Alloc task0 的 prefix 地址；
 - CPU shared 96-worker b1/b256 完整回放、private 完整回归继续证明
   Alloc 四分片和 private 三类路由不变；用户
-  `/home/q00473782/.venv` 下观察工具测试全部通过；
+  `$HOME/.venv` 下观察工具测试全部通过；
 - CCEC private/shared 的 swimlane、perf-clock 和五种 submit-PMU
   共 14 种构建及 manifest 全部通过，private device 执行节与既有
   冻结件逐字节一致；
@@ -3776,7 +3776,7 @@ S4.15a 已按上述单一变量完成实现，提交前门禁结果如下：
 - 合并后的 Claim cursor 定向测试逐调用核对 FetchMax 地址；b256
   精确得到 Vector 32,768 次、Cube 16,384 次，两族 active line
   均为每线 4,096 次，Cube 后四条 inactive line 为 0 次且终值 -1；
-- 用户 `/home/q00473782/.venv` 下 PMU HTML、PMU sidecar、泳道转换和
+- 用户 `$HOME/.venv` 下 PMU HTML、PMU sidecar、泳道转换和
   exclusive analyzer 共 100 项 Python 测试通过；
 - CCEC private/shared 各自的 swimlane、perf-clock 和
   submit-PMU none/claim/efdrain/materialize/register 共 14 个构建
@@ -4341,7 +4341,7 @@ CPU 证据均使用显式 `CXX=/usr/bin/g++` 完整重建，避免用户 GCC 15
   kernel，不能把该动态 placement 数当作 A5 性能结论；
 - private perf-clock 重新构建并通过 PollBatch、private TensorMap ring
   和 b1 全部业务断言，状态仍为 1,007,115,968B；
-- 本用户 `/home/q00473782/.venv` 在按仓库文档设置
+- 本用户 `$HOME/.venv` 在按仓库文档设置
   `PYTHONPATH=$PWD:$PWD/python` 后，四个泳道/PMU 加工测试共 100 项全部
   通过。第一次未设置项目 `PYTHONPATH` 的调用在 conftest 导入阶段即
   失败，未进入收集，也未被记作测试证据。
@@ -4632,7 +4632,7 @@ sidecar 同时冻结最终 AICore、AIC/AIV combined object、Host runtime 和
 
 #### 已完成验证
 
-本用户 Python 环境统一使用 `/home/q00473782/.venv`：
+本用户 Python 环境统一使用 `$HOME/.venv`：
 
 - RuntimeBuilder、安装期预构建入口、KernelCompiler、SceneTest
   cache/CLI 和 submit-PMU provenance 共 387 项非上板测试通过，
@@ -5763,7 +5763,7 @@ CCEC 制品，未复用早于 S6.4d～g 的旧 ELF。两套 manifest 分别固�
 正式泳道命令显式使用：
 
 ```bash
-PYTHON=/home/q00473782/.venv/bin/python \
+PYTHON="$HOME/.venv/bin/python" \
 tests/atomic_probe/pa_scheduler/run.sh swimlane ccec \
   --tensormap shared --device 0 \
   --batches 256 --shared-context-lens 8192 \
@@ -8802,7 +8802,7 @@ current-task 口径再多减 1。
 
 新数组严格追加在 `writer_history` 之后，不移动任何既有字段：
 
-| 项目 | generation 8 当前值 |
+| 项目 | R4e-a generation 8 阶段值 |
 | --- | ---: |
 | `writer_history` offset | 11,027,648B |
 | `reader_done` offset | 12,420,288B |
@@ -8816,7 +8816,7 @@ private generation 4、2,113,664B sidecar 以及
 1,007,115,968/1,007,122,112B non-split/split `SchedulerState` 全部
 不变。host 正式初始化、ring/symbol 测试初始化和 history-litmus 专用 host
 都显式写入 96 个 -1，不依赖 sidecar `memset(0)`。history manifest 从
-被 C++ `static_assert` 绑定当前 build identity 的共享头读取 generation 8，
+被 C++ `static_assert` 绑定当时 build identity 的共享头读取 generation 8，
 旧 generation-7 artifact 会在启动前被拒绝。
 
 #### CPU 门槛与设备边界
@@ -9272,7 +9272,7 @@ ELF 和 AIC/AIV `.ll`，不哈希 `.bc`；bitcode 仅作为可复查中间产物
 最终构建和正式重复使用同一个 manifest 身份：
 
 ```bash
-source /home/q00473782/Ascend/cann-9.1.0-weekly-20260708/cann-9.1.0/set_env.sh
+source "$HOME/Ascend/cann-9.1.0-weekly-20260708/cann-9.1.0/set_env.sh"
 export CXX=/usr/bin/g++
 ./run.sh build-shared-protocol-litmus ccec
 ./run.sh shared-protocol-litmus ccec \
@@ -9716,7 +9716,7 @@ Claim(task N)
 insert-before-lookup 版本暂时不能使用本 task 的 reader 前沿回收自己仍可能
 查询的 `N-H`，因此 production helper 固定 `reclaim_upto=-1`。满桶时
 fail-closed：设置 fatal，但 cursor、head/tail、slot seq/payload、
-symbol latest/history 和 fresh published 均不推进。默认 PA B256/G1
+symbol latest/history 和 fresh published 均不推进。默认 PA B256/PA-G1
 的普通 region ring 为空，因此不触发该容量边界；这不能被解释成通用
 ordinary ring 已经支持无限 task。
 
@@ -9754,9 +9754,9 @@ no-dependency 返回，而不是把过期 task id 写入 fanin。
 
 - loser 在 `committed_tasks=77` 的反例状态下直接返回，对
   `SharedTensorMapSidecar` 地址发起的 `Ops::Load` 次数严格为 0；
-- B1/G4 暂停 task 4 的 post-insert、pre-lookup 位置，task 8 仍完成
+- B1/PA-G4 暂停 task 4 的 post-insert、pre-lookup 位置，task 8 仍完成
   lookup 和 Build，且 task 4 completion flag 仍为 0；
-- B2/G1 暂停 batch0 UP task 4，独立 batch1 QK task 6 已实际完成并把
+- B2/PA-G1 暂停 batch0 UP task 4，独立 batch1 QK task 6 已实际完成并把
   completion flag 置 1 后才释放 task 4，证明执行也没有被插入链串行化。
 
 `test_shared_writer_intent.cpp` 另外覆盖：
@@ -9791,7 +9791,7 @@ validator、稀疏 trace 正反例和记录数公式同步到该顺序；Registe
 `auxiliary` 表示 ordinary writer 数，Alloc 要求 0，普通 task 接受
 `[0,kMaxTaskTensors]`，不再把旧 symbol writer 数硬编码为 1。
 
-CPU 开启泳道的 B1/G4 实测生成 6964 条 raw record，host 期望也是
+CPU 开启泳道的 B1/PA-G4 实测生成 6964 条 raw record，host 期望也是
 6964，逐 worker 数量、稀疏阶段顺序和零 dropped 全部通过。对应本轮
 临时验证产物为：
 
@@ -9823,7 +9823,7 @@ outputs/pa_scheduler_shared_swimlane_20260727_171927_799726/cpu/
   --winner-workload scalar-nop --nop-count 1
 ```
 
-全部通过。B1/G4 最终 `committed_tasks=17`；B256/G1 为 1280 task、
+全部通过。B1/PA-G4 最终 `committed_tasks=17`；B256/PA-G1 为 1280 task、
 1024 kernel，最终 `committed_tasks=1280`，96 核唯一 winner、依赖
 signature、INOUT history、heap cursor 和完成 flag 全部通过。CPU 的
 墙钟时间受宿主线程调度影响，只作为正确性执行证据，不用于推断 A5 性能。
@@ -9831,8 +9831,7 @@ signature、INOUT history、heap cursor 和完成 flag 全部通过。CPU 的
 使用本用户 CANN 9.1：
 
 ```bash
-source /home/q00473782/Ascend/cann-9.1.0-weekly-20260708/\
-cann-9.1.0/set_env.sh
+source "$HOME/Ascend/cann-9.1.0-weekly-20260708/cann-9.1.0/set_env.sh"
 ./run.sh build ccec --tensormap shared
 ```
 
@@ -9842,7 +9841,7 @@ split runtime/state/finish、1:2 mixed ELF、LOCAL helper、零 relocation
 路径；设备正在被其他任务使用，本阶段没有运行 A5，不能把编译成功写成
 上板成功。
 
-#### 下一阶段：先补观察，再做交错前沿
+#### R5b 预登记：先补观察，再做交错前沿
 
 当前 G=1 的 `committed_tasks` 是所有 future owner 轮询的同一 atomic
 地址。后续性能候选不是建立多条独立插入链，而是把同一前驱 token
@@ -9865,3 +9864,306 @@ CAS，插入仍严格串行；变化只是 future owner 的等待 load 分散到
 每 task 发布 CAS 恰好一次并能比较各 lane 的轮询量，随后再用独立提交
 验证 G=1/2/4/8。不能把独立 shard cursor 当作等价方案，因为那会允许
 不同 shard 同时修改 TensorMap，破坏本阶段刚闭合的唯一有序插入合同。
+
+### 2026-07-27：R5c 交错分组同一枚插入前沿
+
+R5c 实现了上面的预登记候选，但没有把 writer 插入拆成 G 条独立顺序链。
+active turn-G 只决定同一枚全局 baton 落在哪条 cache line：
+
+```text
+初始：
+  turn[0] = 0
+  turn[1..7] = -1
+
+task N：
+  lane = N & (G - 1)
+  等待 turn[lane] == N
+
+writer 元数据完整发布后：
+  next = N + 1
+  target = next & (G - 1)
+  expected_old = next >= G ? next - G : -1
+  CAS(turn[target], expected_old, next)
+```
+
+task `N+1` 的 grant 仍只能由 task N 产生，所以任何时刻只有一个 owner
+能够修改 TensorMap writer 元数据。turn-G1 精确退化为原来的
+`CAS(N,N+1)`，每 task 仍只有一次发布 CAS；turn-G2/G4/G8 只是把未来
+owner 的等待 load 分散到 2/4/8 个地址。本文后续用 `PA-G4` 表示一个
+batch 的四个 PA block group，用 `turn-G4` 表示四条 insert-turn 物理线，
+避免两种 G 混淆。
+
+#### grant、重复调用与发布前检查
+
+turn-G>1 的旧 token 会保留到同余的下一代覆盖，因此它是 grant，不是
+读取后自动失效的锁。正确性继续依赖 Claim 对每 task 只产生一个 owner；
+不能为“消费 grant”再增加一次 CAS，否则每 task 会从一次发布 atomic
+变为两次。
+
+生产发布在写任何 TensorMap 元数据前同时检查：
+
+1. current lane 仍精确等于 N；
+2. target lane 仍等于本轮应覆盖的 `expected_old`。
+
+元数据发布结束后只执行已经预检过的目标 CAS。重复、陈旧、future 或
+损坏 token 都失败且不改控制线。turn-G1 的 publication preflight 是一次
+current-line load 加一次发布 CAS；在它之前，
+`WaitForSharedTaskInsertTurn()` 还会执行至少一次等待 load。turn-G>1
+只比 turn-G1 多一次 target-line preflight load；独立低层 G1 发布原语仍
+保持单 CAS、零预检 load 的事件形状。
+
+该设计不会改变 shared Submit 的业务边界：
+
+```text
+Claim 唯一 owner
+  -> Materialize 与 writer delta 准备
+  -> 等待并发布 writer 元数据
+  -> 交出 next token
+  -> fanin lookup
+  -> Build
+  -> ready 检查、执行或进入本核 winning slot
+```
+
+loser 的零访问门槛从“只统计 sidecar Load”扩大为统计所有落在
+`SharedTensorMapSidecar` 范围内的 Load、Exchange、CAS、FetchAdd、
+FetchMax、Invalidate、Flush 和 Publish。该断言从 Claim 已经判定 loser
+后的 finish 入口开始；Claim 自身的 Vector cursor 位于 sidecar，不属于
+“post-Claim loser 零访问”的范围。
+
+#### 固定八线布局和构建身份
+
+为保持 turn-G1 的热点地址与此前所有字段 offset，lane 0 继续使用原
+`committed_tasks`；lane 1～7 以 `insert_turn_extra[7]` 追加在
+`reader_done[96]` 后。所有 G 使用同一物理布局，inactive lane 始终为 -1：
+
+| 项目 | generation 9 当前值 |
+| --- | ---: |
+| `writer_history` offset | 11,027,648B |
+| `reader_done` offset | 12,420,288B |
+| `insert_turn_extra` offset | 12,426,432B |
+| 七条 extra line 增量 | 448B |
+| shared sidecar | 12,426,880B |
+| shared non-split `SchedulerState` | 1,019,542,848B |
+| shared split `SchedulerState` | 1,019,548,992B |
+
+private sidecar、private `SchedulerState` 以及非默认 CAP 的 private ABI
+公式均保持原值。默认 CAP=128 的 shared ABI version 为
+`(9<<8)|turn-G`，turn-G1/G2/G4/G8 分别为
+`0x901/0x902/0x904/0x908`。构建方式为：
+
+```bash
+PA_SHARED_INSERT_TURN_GROUPS=4 \
+  ./run.sh build cpu --tensormap shared
+
+PA_SHARED_INSERT_TURN_GROUPS=8 \
+  ./run.sh build ccec --tensormap shared
+
+PA_SHARED_INSERT_TURN_GROUPS=8 \
+  ./run.sh run ccec --tensormap shared --batches 1
+```
+
+CPU 正式 scheduler binary 使用构建时选择的 G；shared CPU build 还会
+独立编译所有 G 的控制原语和 96-worker 定向门槛。CCEC 每次只编译所选 G。
+CPU turn-G1 保留 `pa_scheduler_cpu`，G2/G4/G8 使用各自带 G 的文件名，
+`run.sh` 按环境变量选择。CCEC 各 G 顺序复用同一 variant 目录，因此
+schema-v3 manifest 显式记录 `shared_insert_turn_groups`，run 还要求环境变量
+与 manifest 完全一致。host/kernel ABI version 也包含 G，避免只靠相同
+`sizeof` 误把不同 G 产物拼在一起。
+
+#### 独立 oracle 与正确性门槛
+
+完成 T 个 task 后，active lane s 保存不大于 T 的最大同余 token。完整
+公式必须先处理 inactive 和尚未收到首个 token 的 lane：
+
+```text
+turn[s] =
+  -1                                  if s >= G or s > T
+  T - ((T - s) & (G - 1))            otherwise
+```
+
+lane 0 在 T=0 时由第二个分支得到 0。host 使用独立公式校验全部八线，
+不再把 lane 0
+`committed_tasks` 单值冒充整体前沿。典型终态为：
+
+| 完成数 | turn-G | 八线终态 |
+| ---: | ---: | --- |
+| 17 | 1 | `[17,-1,-1,-1,-1,-1,-1,-1]` |
+| 17 | 2 | `[16,17,-1,-1,-1,-1,-1,-1]` |
+| 17 | 4 | `[16,17,14,15,-1,-1,-1,-1]` |
+| 17 | 8 | `[16,17,10,11,12,13,14,15]` |
+| 1280 | 1 | `[1280,-1,-1,-1,-1,-1,-1,-1]` |
+| 1280 | 8 | `[1280,1273,1274,1275,1276,1277,1278,1279]` |
+
+新增 `test_shared_insert_turn.cpp`，在 turn-G1/G2/G4/G8 下分别覆盖脏值
+初始化、跨两轮 rollover、每步只改目标 lane、future pending、非法负值、
+错误同余、超前 token、target expected-old 不匹配和重复发布不改状态。
+
+`test_shared_ordered_submit.cpp` 在四种 G 下都启动真实 96 个 pthread，
+逐 task 反向核对：
+
+- Alloc/QK/SF/PV/UP 的 Claim attempt 数符合 96/32/64/32/64 的参与拓扑；
+- 每 task 恰好一个 Claim owner；
+- 每个 next token 恰好发布一次，且物理 lane 分布精确；
+- task 4 交出插入 token 后暂停，task 8 仍能跨 owner 完成 lookup 与 Build；
+- 独立 batch 的 task 6 kernel 能在 task 4 Build 前完成；
+- post-Claim loser 对 TensorMap 的所有 Ops 访问严格为 0。
+
+generic writer-intent 在 turn-G1 和 turn-G8 两端继续覆盖空写 task、
+ordinary/symbol INOUT、混合 ordinary+symbol+fresh 发布、严格
+`producer∈[N-H,N)` 和满环整批失败不改状态。CCEC shared-protocol litmus
+也按完整八线初始化并校验终态，不能让 inactive lane 的错误零值被 G1
+偶然掩盖。
+
+冻结前的边界审计还补了两项 fail-closed 门槛：ordinary ring 在
+`tail==INT64_MAX` 时没有可表达的下一 tail，必须在任何 slot/控制字写入前
+返回协议错误；普通 TensorDesc writer 的 `owner_task_id` 若高 32 位非零，
+必须在 writer-delta 预检阶段拒绝，不能截断低位后发布元数据。两项都有
+“失败后无 TensorMap 发布”的 CPU 负例。
+
+shared-protocol litmus 当前固定为 turn-G1，只承担已经建立的跨核
+memory-order 证据，不宣称覆盖 turn-G2/G4/G8。四种 G 的本阶段 CCEC 证据
+来自主 scheduler AIC/AIV、split finish、mixed ELF 和 manifest/ABI
+构建矩阵；在设备可用前仍不把编译证据写成上板结果。
+
+#### 验证口径和性能边界
+
+CPU B256 只证明 1,280 个 task 在真实 96-thread 回放下闭合 Claim、插入、
+fanin、Build 和完成语义。CPU wall time 受宿主线程调度支配，不能用来评价
+turn-G 的 A5 性能。CCEC 构建只证明 AIC/AIV、split finish、mixed ELF 和
+host 能以同一 G 生成、链接并通过 manifest/ABI 门槛，也不能冒充上板收益。
+
+turn-G>1 相比 turn-G1 每 task 多一次 target-lane 预检 load，这是旧 grant
+不会自动失效时拒绝重复发布所需的正确性成本；同时它把多个 future owner
+的轮询 load 分散到不同 cache line。候选成立的条件是后者减少的竞争和等待
+大于额外预检及更大数据工作集的成本，不能仅凭 atomic 次数推断净收益。
+
+本阶段没有向 production raw 增加逐 poll 事件或新泳道字段。96-worker
+门槛里的 Claim/publish 计数只存在于 CPU 测试，既证明唯一 owner/一次
+发布，也不扩大真实 profiling 文件。turn-G2/G4/G8 是否减少 A5 insert-turn
+等待和完整 Submit 时间，必须等设备可用后用同一 `perf-clock` 构建、
+相同 PA 工作量、同设备交错多轮比较；在得到该证据前，它们只是已闭合
+正确性的性能候选，不宣称收益。
+
+本阶段 turn-G2/G4/G8 只允许 CPU 与 CCEC。`run.sh` 会在任何构建、文件创建
+或设备动作前拒绝 AscendC/`all`，也会拒绝 private+G>1；因此本阶段没有
+悄悄维护或引用 AscendC 变体。
+
+#### 冻结源码最终验证矩阵
+
+2026-07-27 最终矩阵冻结的源码集合包括 `common/`、`ccec/`、`cpu/`、
+`test/` 下的 C/C++/shell 文件以及顶层 `run.sh`。构建前、每个 CPU
+正向用例结束后和全部 CCEC 构建结束后的被测聚合 SHA256 均为：
+
+```text
+4fd74b43afdc9588c2ef05dfd870a972d4d546135774fc2426a3e1aa6f1c884d
+```
+
+提交前 header 门禁只把新增
+`test/test_shared_insert_turn.cpp` 许可证注释中的 `license` 改为
+`License`；C++ token、生产源码和 CCEC 编译输入均未改变。最终暂存源码的
+逐字节聚合 SHA256 因这一个注释字符变化更新为：
+
+```text
+8cf5053a8c1e429c918200dffe541e2b981bc9955a4ad9ae45cd5fd75fb5a642
+```
+
+该最终暂存源码又完整执行一次 shared G1 CPU build；它会实际编译并运行
+turn-G1/G2/G4/G8 原语和 ordered-submit、writer-intent G1/G8、五档 CAP
+ring 及其他 shared 门槛，全部 PASS。因此下表没有把行为变化藏在
+提交前修正中。CPU 使用 GCC 13.3.0；CCEC 使用本用户 CANN 9.1 weekly
+2026-07-08 中的 clang/ccec 15.0.5。
+
+CPU 正向矩阵对每个 shared G 都执行一次完整构建和 96-worker、B256、
+1,280-task 回放：
+
+```bash
+PA_SHARED_INSERT_TURN_GROUPS=<G> \
+  ./run.sh build cpu --tensormap shared
+
+PA_SHARED_INSERT_TURN_GROUPS=<G> \
+  ./run.sh run cpu --tensormap shared \
+  --batches 256 --shared-context-lens 8192 \
+  --runs 1 --no-swimlane \
+  --winner-workload scalar-nop --nop-count 1
+```
+
+| turn-G | 实测八线终态 | normalized writer signature | 语义/后处理 |
+| ---: | --- | --- | --- |
+| 1 | `[1280,-1,-1,-1,-1,-1,-1,-1]` | `556bec7ec8d0f323` | PASS/PASS |
+| 2 | `[1280,1279,-1,-1,-1,-1,-1,-1]` | `556bec7ec8d0f323` | PASS/PASS |
+| 4 | `[1280,1277,1278,1279,-1,-1,-1,-1]` | `556bec7ec8d0f323` | PASS/PASS |
+| 8 | `[1280,1273,1274,1275,1276,1277,1278,1279]` | `556bec7ec8d0f323` | PASS/PASS |
+
+四种 G 的完整构建都会额外运行 turn-G1/G2/G4/G8 原语门槛、
+turn-G1/G8 generic writer-intent、turn-G1/G2/G4/G8 的 96-worker
+ordered-submit，以及 CAP=32/64/128/256/16384 ring 回归。关键实测值为：
+
+```text
+loser_zero_map_access=PASS accesses=0
+release_before_build=PASS completed=17 overlap=1 kernels=4,4,4,4
+independent_kernel_overlap=PASS completed=10 kernels=2,2,2,2
+```
+
+它们分别证明 Claim 判负后的 loser 对 sidecar 的全部 Ops 访问为零、
+task 4 交出 turn 后 task 8 可以跨 owner 完成 lookup/Build，以及独立
+batch 的 task 6 kernel 可以在 task 4 Build 之前完成。writer-intent
+端点门槛同时覆盖空写 task、ordinary/symbol INOUT、混合三类 writer、
+`producer∈[N-H,N)`、满环整批失败不改状态、`INT64_MAX` tail 和高 32 位
+owner 的 fail-closed 负例。
+
+private G1 也使用同一冻结源码完成完整构建和 B256 回放，实测
+`logical_entries=52`、`logical_floor=1215`，raw/normalized writer
+signature 均为 `556bec7ec8d0f323`，语义与后处理均 PASS。它没有读取
+新增 turn line，private ABI 和正式产物名保持不变。
+
+CCEC 在不启动设备的前提下完成下列构建、静态链接、mixed ELF、LOCAL
+helper、零 relocation、manifest 和 SHA 门槛：
+
+| 模式 | turn-G | ABI version | manifest | host/kernel SHA 校验 | 结果 |
+| --- | ---: | ---: | --- | --- | --- |
+| shared | 1 | `0x901` / 2305 | v3、G=1 | OK/OK | PASS |
+| shared | 2 | `0x902` / 2306 | v3、G=2 | OK/OK | PASS |
+| shared | 4 | `0x904` / 2308 | v3、G=4 | OK/OK | PASS |
+| shared | 8 | `0x908` / 2312 | v3、G=8 | OK/OK | PASS |
+| private | 1 | generation 4 | v3、G=1 | OK/OK | PASS |
+
+对应 artifact SHA256 为：
+
+```text
+shared G1 host=bf58a476adcc6f57b70435d8c41b935b63abb848483a24af040f0eaae23a189c
+          kernel=eab8afc65402361d77d44054f6f8a854767ca3b0ce3161e29e6803211b6865c8
+shared G2 host=e74f4358e5eabadc6e5eb2ee485240171cee559772b02733c1fcf32bb7bf6348
+          kernel=96ed43b3044adb1a94b41503992e25bb44bb3218d70564f3383dc852676bdaac
+shared G4 host=5c0070db80cd5d7f363c04ba78a8c2321b3775a1dbc110a5fe6f5fe11d7520e5
+          kernel=2578fd313903408886ae626fe6074a49ace405c8eb7cafeef5b82c682ccda748
+shared G8 host=6fb9ce3f8ef970be097414e2cec72e0871fa8e61d30c3a5c0225b56368e5a024
+          kernel=392f1e178a4bf2bd3ba5afe7ed917a2cdf3061eedf7d3827c8768ace644261fe
+private G1 host=b63b771c42f59ccf2c05f55feede8f46a11180092fe6936f82476949edfa6f9d
+           kernel=1f0c524a4a3c1bc5317e8f8163a855f6625409cb24523f8d7d1f38f7abb02367
+```
+
+固定布局探针在四种 shared G 下均得到 8 条物理 turn line、64B
+`AtomicLine`、12,426,880B sidecar、1,019,548,992B split
+`SchedulerState`，且 `committed_tasks`、`reader_done`、
+`insert_turn_extra` offset 分别为 0、12,420,288、12,426,432。
+
+`shared-protocol-litmus` 只以 turn-G1 完成 CCEC build 和静态 artifact
+核对；host 虽然编译成功，但本轮没有执行，也没有触发 ACL/kernel launch。
+其 manifest v2 记录 shared ABI generation 9，AIC/AIV IR、mixed kernel
+和 host 四项 SHA 均通过。该证据不覆盖 turn-G2/G4/G8 的动态 memory order。
+
+负向门槛均在进入后端构建、文件创建或设备动作前按预期 exit 1：
+
+| 请求 | 拒绝原因 |
+| --- | --- |
+| shared turn-G3 | G 只允许 1/2/4/8 |
+| private turn-G2 | 分组前沿只属于 shared |
+| AscendC turn-G2 | 本阶段只维护 CPU/CCEC |
+| `all` turn-G2 | 组合后端超出本阶段范围 |
+| G1 消费 G8 CCEC manifest | manifest G 与环境 G 不一致 |
+| 缺少精确 G2 CPU binary | 不回退到旧名或其他 G 产物 |
+
+本轮没有运行 A5，因此 turn-G1/G2/G4/G8 的 A5 正确性和性能行均为
+`NOT RUN`。CPU B256 的 submit span 受宿主线程调度和模拟执行影响；
+CCEC 构建也只证明代码生成、链接和产物身份。两者都不能用于比较
+turn-G 的 A5 性能，更不能据此宣称 G2/G4/G8 已获得收益。
