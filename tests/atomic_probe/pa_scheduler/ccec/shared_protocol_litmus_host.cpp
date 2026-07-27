@@ -10,7 +10,7 @@
  */
 
 #include "../common/pa_model.h"
-#include "history_litmus_shared.h"
+#include "shared_protocol_litmus_shared.h"
 
 #include "acl/acl.h"
 #include "runtime/rt.h"
@@ -32,18 +32,19 @@ using pa_scheduler::SharedWriterHistoryCell;
 using pa_scheduler::SharedWriterHistoryRecord;
 using pa_scheduler::TensorDesc;
 using pa_scheduler::WorkerResult;
-using pa_scheduler::history_litmus::Control;
-using pa_scheduler::history_litmus::Direction;
-using pa_scheduler::history_litmus::HistoryChain;
-using pa_scheduler::history_litmus::kAicToAiv;
-using pa_scheduler::history_litmus::kAivToAic;
-using pa_scheduler::history_litmus::kControlMagic;
-using pa_scheduler::history_litmus::kControlVersion;
-using pa_scheduler::history_litmus::kFutureWritersStatus;
-using pa_scheduler::history_litmus::kReaderStatus;
-using pa_scheduler::history_litmus::kResultMagic;
-using pa_scheduler::history_litmus::kSymbolCount;
-using pa_scheduler::history_litmus::kWriterBStatus;
+using pa_scheduler::shared_protocol_litmus::Control;
+using pa_scheduler::shared_protocol_litmus::Direction;
+using pa_scheduler::shared_protocol_litmus::HistoryChain;
+using pa_scheduler::shared_protocol_litmus::Scenario;
+using pa_scheduler::shared_protocol_litmus::kAicToAiv;
+using pa_scheduler::shared_protocol_litmus::kAivToAic;
+using pa_scheduler::shared_protocol_litmus::kControlMagic;
+using pa_scheduler::shared_protocol_litmus::kControlVersion;
+using pa_scheduler::shared_protocol_litmus::kFutureWritersStatus;
+using pa_scheduler::shared_protocol_litmus::kReaderStatus;
+using pa_scheduler::shared_protocol_litmus::kResultMagic;
+using pa_scheduler::shared_protocol_litmus::kSymbolCount;
+using pa_scheduler::shared_protocol_litmus::kWriterBStatus;
 
 constexpr size_t kStatePrefixBytes =
     offsetof(SchedulerState, workers);
@@ -125,12 +126,12 @@ bool ParseDirection(
 ) {
     const std::string name = text;
     if (name == "aic-to-aiv") {
-        *direction = Direction::AicWritersToAivReader;
+        *direction = Direction::AicToAiv;
         *chain = &kAicToAiv;
         return true;
     }
     if (name == "aiv-to-aic") {
-        *direction = Direction::AivWritersToAicReader;
+        *direction = Direction::AivToAic;
         *chain = &kAivToAic;
         return true;
     }
@@ -164,7 +165,7 @@ void InitializeDescriptor(
     tensor->extent_elem_cache = 1024;
 }
 
-void InitializeState(
+void InitializeHistoryState(
     SchedulerState *state, const HistoryChain &chain
 ) {
     // 约 1 GiB shadow 由匿名稀疏映射承载；只触碰实际 H2D/D2H 的前缀、
@@ -245,7 +246,7 @@ bool ResultMatches(
            static_cast<int64_t>(result.checksum) == fanin;
 }
 
-bool Validate(
+bool ValidateHistory(
     const SchedulerState &state, const HistoryChain &chain,
     const HistoryChain &inactive
 ) {
@@ -378,31 +379,38 @@ bool Validate(
 }  // namespace
 
 int main(int argc, char **argv) {
-    if (argc < 3 || argc > 4) {
+    if (argc < 4 || argc > 5) {
         std::fprintf(
             stderr,
-            "Usage: %s <history_litmus_kernel.o> "
-            "aic-to-aiv|aiv-to-aic [device]\n",
+            "Usage: %s <shared_protocol_litmus_kernel.o> "
+            "history aic-to-aiv|aiv-to-aic [device]\n",
             argv[0]
         );
         return EXIT_FAILURE;
     }
 
+    if (std::strcmp(argv[2], "history") != 0) {
+        std::fprintf(
+            stderr, "Invalid shared protocol scenario: %s\n",
+            argv[2]
+        );
+        return EXIT_FAILURE;
+    }
     Direction direction{};
     const HistoryChain *chain = nullptr;
-    if (!ParseDirection(argv[2], &direction, &chain)) {
+    if (!ParseDirection(argv[3], &direction, &chain)) {
         std::fprintf(
-            stderr, "Invalid history direction: %s\n", argv[2]
+            stderr, "Invalid history direction: %s\n", argv[3]
         );
         return EXIT_FAILURE;
     }
     const HistoryChain &inactive =
-        direction == Direction::AicWritersToAivReader
+        direction == Direction::AicToAiv
             ? kAivToAic
             : kAicToAiv;
     int32_t device = 0;
-    if (argc == 4 && !ParseDevice(argv[3], &device)) {
-        std::fprintf(stderr, "Invalid device id: %s\n", argv[3]);
+    if (argc == 5 && !ParseDevice(argv[4], &device)) {
+        std::fprintf(stderr, "Invalid device id: %s\n", argv[4]);
         return EXIT_FAILURE;
     }
     const std::vector<char> binary = ReadBinary(argv[1]);
@@ -417,10 +425,12 @@ int main(int argc, char **argv) {
     if (host_state == nullptr) {
         return EXIT_FAILURE;
     }
-    InitializeState(host_state, *chain);
+    InitializeHistoryState(host_state, *chain);
     Control host_control{};
     host_control.magic = kControlMagic;
     host_control.version = kControlVersion;
+    host_control.scenario =
+        static_cast<uint32_t>(Scenario::SymbolHistory);
     host_control.direction = static_cast<uint32_t>(direction);
     host_control.launch_nonce =
         static_cast<uint64_t>(chain->producer) << 32 |
@@ -598,7 +608,7 @@ int main(int argc, char **argv) {
             )) {
             break;
         }
-        execution_ok = Validate(
+        execution_ok = ValidateHistory(
             *host_state, *chain, inactive
         );
     } while (false);
@@ -647,9 +657,9 @@ int main(int argc, char **argv) {
     (void)munmap(host_state, sizeof(SchedulerState));
 
     std::printf(
-        "[HISTORY-LITMUS] direction=%s device=%d "
-        "semantic=%s cleanup=%s\n",
-        argv[2], device,
+        "[SHARED-PROTOCOL-LITMUS] scenario=%s direction=%s "
+        "device=%d semantic=%s cleanup=%s\n",
+        argv[2], argv[3], device,
         execution_ok ? "PASS" : "FAIL",
         cleanup_ok ? "PASS" : "FAIL"
     );

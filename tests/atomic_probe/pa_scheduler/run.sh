@@ -25,8 +25,8 @@ Usage:
   ./run.sh perf-clock ccec|cpu [--tensormap private|shared] [benchmark options]
   ./run.sh build-submit-pmu ccec none|claim|efdrain|materialize|register [--tensormap private|shared]
   ./run.sh submit-pmu ccec none|claim|efdrain|materialize|register [--tensormap private|shared] [benchmark options]
-  ./run.sh build-history-litmus ccec
-  ./run.sh history-litmus ccec [--device N] [--runs N]
+  ./run.sh build-shared-protocol-litmus ccec
+  ./run.sh shared-protocol-litmus ccec --scenario history [--device N] [--runs N]
 
 Build identity option (consumed by run.sh and never forwarded to the benchmark):
   --tensormap private|shared   (default: private)
@@ -597,23 +597,24 @@ case "$ACTION" in
         reject_managed_submit_pmu_options "$@"
         run_submit_pmu "$TENSORMAP_MODE" "$PHASE" "$@"
         ;;
-    build-history-litmus)
-        # history litmus 是独立的 shared-only A5 正确性门槛，不生成普通
-        # PA benchmark 变体，也不接受会误导产物身份的 TensorMap 选项。
+    build-shared-protocol-litmus)
+        # shared protocol litmus 是独立的 shared-only A5 正确性门槛，
+        # 不生成普通 PA benchmark 变体，也不接受会误导产物身份的
+        # TensorMap 选项。
         if [[ "$BACKEND" != "ccec" || $# -ne 0 ||
               "$TENSORMAP_OPTION_SEEN" -ne 0 ]]; then
-            echo "Usage: $0 build-history-litmus ccec" >&2
+            echo "Usage: $0 build-shared-protocol-litmus ccec" >&2
             exit 1
         fi
-        "$SCRIPT_DIR/ccec/history_litmus.sh" build
+        "$SCRIPT_DIR/ccec/shared_protocol_litmus.sh" build
         ;;
-    history-litmus)
+    shared-protocol-litmus)
         if [[ "$BACKEND" != "ccec" ||
               "$TENSORMAP_OPTION_SEEN" -ne 0 ]]; then
-            echo "Usage: $0 history-litmus ccec [--device N] [--runs N]" >&2
+            echo "Usage: $0 shared-protocol-litmus ccec --scenario history [--device N] [--runs N]" >&2
             exit 1
         fi
-        "$SCRIPT_DIR/ccec/history_litmus.sh" run "$@"
+        "$SCRIPT_DIR/ccec/shared_protocol_litmus.sh" run "$@"
         ;;
     *)
         # 未知 action 不尝试推断用户意图，也不会触发任何构建或设备操作。

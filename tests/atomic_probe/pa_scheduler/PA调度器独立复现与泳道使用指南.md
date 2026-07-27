@@ -509,20 +509,24 @@ ordinary-region 原型，但已经从 PA Case1 运行路径断开；它的测试
 冒充当前 PA 热路径证据。S2/S2.5 的历史结构、失败实验和上板结果见
 `shared_tensormap_record.md`。
 
-#### 通用 symbol history 的独立 A5 门槛
+#### shared protocol 的独立 A5 门槛
 
 R4c 的通用 WriterIntentSet 为 future writer 覆盖 latest-cache 的场景追加
 task-indexed immutable history；R4d 用独立 mixed AIC/AIV ELF 验证跨物理核
-失效与回溯。它不启动普通 PA benchmark，也不改变 PA kernel/host。构建和
-运行前先 source 本用户 CANN 9.1，再在本目录执行：
+失效与回溯。R4e-c 将该门槛泛化为 shared protocol 多场景载体，当前第一步
+只迁移原 history 场景，不改变其设备算法。它不启动普通 PA benchmark，也
+不改变 PA kernel/host。构建和运行前先 source 本用户 CANN 9.1，再在本目录
+执行：
 
 ```bash
-./run.sh build-history-litmus ccec
-./run.sh history-litmus ccec --device 0 --runs 20
+./run.sh build-shared-protocol-litmus ccec
+./run.sh shared-protocol-litmus ccec \
+  --scenario history --device 0 --runs 20
 ```
 
-该 action 已固定为 shared-only，不能附加 `--tensormap shared`；`--runs 20`
-表示两个方向各启动 20 个全新 host 进程，共 40 个：
+该 action 已固定为 shared-only，不能附加 `--tensormap shared`。scenario
+必须显式选择，避免后续增加协议门槛后默认运行错误路径；`--runs 20` 表示
+history 的两个方向各启动 20 个全新 host 进程，共 40 个：
 
 ```text
 AIC writers -> AIV reader
@@ -533,10 +537,11 @@ AIV writers -> AIC reader
 cache line，再由两个未来 writer 发布，最后调用真实
 `CollectSharedFanin()` 沿 `E -> D -> B` 回溯。host 会逐项校验预热值、
 21 条 history record 及 21 次成功 CAS、7 个 latest、最终 fanin、控制门
-和未触碰的 ordinary ring。产物固定在：
+和未触碰的 ordinary ring。host 内的 history 初始化与验证保持为独立函数，
+不能因后续场景共用 ACL/build 骨架而弱化断言。产物固定在：
 
 ```text
-build/ccec/shared/history-litmus/
+build/ccec/shared/shared-protocol-litmus/
 ```
 
 普通 shared 构建还会把 AIC/AIV 的 generic shared-protocol probe 各自实际
@@ -545,7 +550,8 @@ reader-based reclaim refresh，拒绝 `__multi3` 或其他未解析 device
 builtin；检查后删除，不会进入正式 mixed ELF。静态链接只证明两种 CCEC
 后端能生成完整设备代码，不证明 ordinary region 的跨核
 reader-progress/reclaim 可见性已经闭合。
-history-litmus 自身虽是 CCEC mixed ELF，但没有定义 split-finish，因此其
+shared-protocol-litmus 自身虽是 CCEC mixed ELF，但没有定义 split-finish，
+因此其
 GM `SchedulerState` 使用当前 generation-8 non-split 大小
 1,019,542,400B；它会校验新追加的 96 条 `reader_done` 始终保持 -1。
 
@@ -1843,7 +1849,8 @@ sidecar 为 12,426,432 bytes。因此 CPU non-split 与定义
 `PA_COMPETE_FIRST_SPLIT_FINISH` 的 CCEC 变体总大小分别为
 1,019,542,400/1,019,548,544 bytes；swimlane、perf-clock 以及
 submit-PMU none/claim/efdrain 使用后者，submit-PMU
-materialize/register 和独立 history-litmus 使用 non-split 大小。既有
+materialize/register 和独立 shared-protocol-litmus 使用 non-split 大小。
+既有
 production prefix 和
 standalone 控制字段 offset 不变。S4.15a/S4.16 历史候选都曾得到
 4,736,704B，但末尾 512B 分别是 Cube cursor 和

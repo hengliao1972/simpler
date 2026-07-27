@@ -8,40 +8,48 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#ifndef TESTS_ATOMIC_PROBE_PA_SCHEDULER_CCEC_HISTORY_LITMUS_SHARED_H
-#define TESTS_ATOMIC_PROBE_PA_SCHEDULER_CCEC_HISTORY_LITMUS_SHARED_H
+#ifndef TESTS_ATOMIC_PROBE_PA_SCHEDULER_CCEC_SHARED_PROTOCOL_LITMUS_SHARED_H
+#define TESTS_ATOMIC_PROBE_PA_SCHEDULER_CCEC_SHARED_PROTOCOL_LITMUS_SHARED_H
 
 #include <cstdint>
 
-namespace pa_scheduler::history_litmus {
+namespace pa_scheduler::shared_protocol_litmus {
 
-constexpr uint32_t kControlMagic = 0x4853544CU;
-constexpr uint32_t kControlVersion = 1;
+constexpr uint32_t kControlMagic = 0x5350524CU;
+constexpr uint32_t kControlVersion = 2;
 constexpr uint32_t kSharedAbiGeneration = 8;
 constexpr uint32_t kSymbolCount = 7;
 constexpr uint64_t kResultMagic = 0x484953544F525900ULL;
 static_assert(
     pa_scheduler::kBuildIdentityAbiGeneration ==
         kSharedAbiGeneration,
-    "history litmus manifest ABI must follow the shared build identity"
+    "shared protocol litmus manifest ABI must follow the shared build identity"
 );
 
-enum class Direction : uint32_t {
-    AicWritersToAivReader = 1,
-    AivWritersToAicReader = 2,
+enum class Scenario : uint32_t {
+    SymbolHistory = 1,
 };
 
-// 单次 launch 只选择一个方向，避免两组共享历史同时执行后互相掩盖故障。
+enum class Direction : uint32_t {
+    AicToAiv = 1,
+    AivToAic = 2,
+};
+
+// 单次 launch 只选择一个场景和一个方向。后续场景共享同一 mixed ELF，
+// 但各自独立初始化和断言，避免不同协议同时执行后互相掩盖故障。
 // control 独占一条 GM cache line；所有 worker 在读取前显式失效该行。
 struct alignas(64) Control {
     uint32_t magic;
     uint32_t version;
+    uint32_t scenario;
     uint32_t direction;
-    uint32_t reserved0;
     uint64_t launch_nonce;
     uint64_t reserved[5];
 };
-static_assert(sizeof(Control) == 64, "history litmus control must occupy one cache line");
+static_assert(
+    sizeof(Control) == 64,
+    "shared protocol litmus control must occupy one cache line"
+);
 
 struct HistoryChain {
     int32_t producer;
@@ -75,6 +83,6 @@ constexpr uint64_t kWriterBStatus = 1;
 constexpr uint64_t kFutureWritersStatus = 0x0F;
 constexpr uint64_t kReaderStatus = 0x3F;
 
-}  // namespace pa_scheduler::history_litmus
+}  // namespace pa_scheduler::shared_protocol_litmus
 
-#endif  // TESTS_ATOMIC_PROBE_PA_SCHEDULER_CCEC_HISTORY_LITMUS_SHARED_H
+#endif  // TESTS_ATOMIC_PROBE_PA_SCHEDULER_CCEC_SHARED_PROTOCOL_LITMUS_SHARED_H

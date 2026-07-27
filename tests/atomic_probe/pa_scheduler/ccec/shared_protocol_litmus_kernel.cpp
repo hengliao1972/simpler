@@ -19,20 +19,21 @@
 #define PA_GM __gm__
 #include "../common/pa_scheduler_core.h"
 #include "ccec_ops.h"
-#include "history_litmus_shared.h"
+#include "shared_protocol_litmus_shared.h"
 
 namespace {
 
 using pa_scheduler_ccec::CcecOps;
-using pa_scheduler::history_litmus::Control;
-using pa_scheduler::history_litmus::Direction;
-using pa_scheduler::history_litmus::HistoryChain;
-using pa_scheduler::history_litmus::kAicToAiv;
-using pa_scheduler::history_litmus::kAivToAic;
-using pa_scheduler::history_litmus::kControlMagic;
-using pa_scheduler::history_litmus::kControlVersion;
-using pa_scheduler::history_litmus::kResultMagic;
-using pa_scheduler::history_litmus::kSymbolCount;
+using pa_scheduler::shared_protocol_litmus::Control;
+using pa_scheduler::shared_protocol_litmus::Direction;
+using pa_scheduler::shared_protocol_litmus::HistoryChain;
+using pa_scheduler::shared_protocol_litmus::Scenario;
+using pa_scheduler::shared_protocol_litmus::kAicToAiv;
+using pa_scheduler::shared_protocol_litmus::kAivToAic;
+using pa_scheduler::shared_protocol_litmus::kControlMagic;
+using pa_scheduler::shared_protocol_litmus::kControlVersion;
+using pa_scheduler::shared_protocol_litmus::kResultMagic;
+using pa_scheduler::shared_protocol_litmus::kSymbolCount;
 
 static_assert(
     offsetof(pa_scheduler::SharedWriterHistoryCell, entries) +
@@ -267,20 +268,12 @@ __aicore__ inline void RunHistoryParticipant(
     __gm__ pa_scheduler::SchedulerState *state,
     __gm__ const Control *control, uint32_t worker
 ) {
-    CcecOps::InvalidateRegion(control, sizeof(Control));
-    if (control->magic != kControlMagic ||
-        control->version != kControlVersion) {
-        pa_scheduler::LocalStats stats{};
-        pa_scheduler::SetFatal<CcecOps>(state, stats, -1);
-        return;
-    }
     const HistoryChain *chain = nullptr;
     const Direction direction =
         static_cast<Direction>(control->direction);
-    if (direction == Direction::AicWritersToAivReader) {
+    if (direction == Direction::AicToAiv) {
         chain = &kAicToAiv;
-    } else if (direction ==
-               Direction::AivWritersToAicReader) {
+    } else if (direction == Direction::AivToAic) {
         chain = &kAivToAic;
     } else {
         pa_scheduler::LocalStats stats{};
@@ -297,6 +290,27 @@ __aicore__ inline void RunHistoryParticipant(
     }
 }
 
+__aicore__ inline void RunSharedProtocolParticipant(
+    __gm__ pa_scheduler::SchedulerState *state,
+    __gm__ const Control *control, uint32_t worker
+) {
+    CcecOps::InvalidateRegion(control, sizeof(Control));
+    if (control->magic != kControlMagic ||
+        control->version != kControlVersion) {
+        pa_scheduler::LocalStats stats{};
+        pa_scheduler::SetFatal<CcecOps>(state, stats, -1);
+        return;
+    }
+    const Scenario scenario =
+        static_cast<Scenario>(control->scenario);
+    if (scenario == Scenario::SymbolHistory) {
+        RunHistoryParticipant(state, control, worker);
+        return;
+    }
+    pa_scheduler::LocalStats stats{};
+    pa_scheduler::SetFatal<CcecOps>(state, stats, -1);
+}
+
 }  // namespace
 
 #if defined(PA_BUILD_AIC)
@@ -307,7 +321,7 @@ pa_scheduler_0_mix_aic(
     __gm__ pa_scheduler::SchedulerState *state,
     __gm__ const Control *control
 ) {
-    RunHistoryParticipant(
+    RunSharedProtocolParticipant(
         state, control,
         static_cast<uint32_t>(get_block_idx())
     );
@@ -325,7 +339,7 @@ pa_scheduler_0_mix_aiv(
             get_block_idx() * get_subblockdim() +
             get_subblockid()
     );
-    RunHistoryParticipant(
+    RunSharedProtocolParticipant(
         state, control,
         pa_scheduler::kAicWorkers + vector_id
     );

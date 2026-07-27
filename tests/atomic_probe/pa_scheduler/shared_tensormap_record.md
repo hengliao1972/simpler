@@ -9051,3 +9051,69 @@ writer。
 AIC/AIV 上都能完成代码生成与静态链接。它没有运行 reader，也没有证明
 ordinary GM load、`reader_done` CAS 和远端 reclaimer 观察之间的
 compiler/device 顺序；R4e-c2 仍必须使用独立 mixed ELF 双向上板。
+
+### 2026-07-27：R4e-c2a 先把 history 门槛泛化为 shared protocol 载体
+
+R4e-c2 需要新增 ordinary reader→reclaimer 场景，但原
+`history_litmus_*` 已包含约 1 GiB 稀疏 host state、ACL 生命周期、
+AIC/AIV mixed ELF 构建、artifact 哈希和跨进程运行框架。复制一套只会让
+两份初始化、清理和产物身份逻辑逐渐分叉。因此本小步只迁移基础设施，不加
+reader-reclaim 算法：
+
+```text
+history_litmus_{shared,kernel,host}.*
+  -> shared_protocol_litmus_{shared,kernel,host}.*
+history_litmus.sh
+  -> shared_protocol_litmus.sh
+```
+
+新 control 仍严格占一条 64B cache line，但 magic、version 和 schema 都
+重新建立身份，并显式携带 `scenario`：
+
+```cpp
+enum class Scenario : uint32_t {
+    SymbolHistory = 1,
+};
+```
+
+本阶段只接受 `history`。host CLI、device dispatcher 和 manifest 三处
+分别拒绝缺失或非法 scenario，不能静默落入 history；direction 也改为
+scenario 无关的 `AicToAiv/AivToAic`，为下一场景复用方向枚举。原
+history 初始化与验证分别改名为 `InitializeHistoryState()` 和
+`ValidateHistory()`，算法、participant 和 12 项语义断言保持独立，没有
+合并成带 optional 分支的弱验证函数。
+
+新的唯一入口和 artifact 为：
+
+```bash
+./run.sh build-shared-protocol-litmus ccec
+./run.sh shared-protocol-litmus ccec \
+  --scenario history --device 0 --runs 20
+```
+
+```text
+build/ccec/shared/shared-protocol-litmus/
+  shared_protocol_litmus_host
+  shared_protocol_litmus_kernel.o
+  shared_protocol_litmus_artifacts.manifest
+```
+
+旧 action 和旧脚本不保留第二份实现。R4d 的旧 commit/SHA 与 20×2 结果仍
+是当时 artifact 的历史证据；泛化后的 ELF 身份已经变化，所以后续新增
+reader-reclaim 后，history 也必须在最终同一 artifact 上重新跑 20×2，
+不能直接继承旧结论。
+
+本小步验证结果：
+
+| 检查 | 结果 |
+| --- | --- |
+| top-level runner 与新 litmus runner `bash -n` | PASS |
+| AIC/AIV `-O3` object，无 `__multi3`/未解析全局符号 | PASS |
+| mixed ELF 双入口、metadata、无额外 GLOBAL function/relocation | PASS |
+| host 构建与 manifest SHA 自校验 | PASS |
+| history AIC→AIV，新 host 进程 1 次、12 项语义断言与清理 | PASS |
+| history AIV→AIC，新 host 进程 1 次、12 项语义断言与清理 | PASS |
+
+该提交只证明泛化没有改变既有 history 行为。它没有新增 reader-progress
+设备证据，也没有据此宣称普通 GM payload 读取先于 `reader_done` CAS；
+后者仍是 R4e-c2b 的独立场景目标。
