@@ -8330,3 +8330,113 @@ CAS 只承担控制字的原子线性化，不能被描述成相邻 payload 的�
 `.base64` 汇编伪指令时失败；同一源码改用系统 GCC 13 后完整通过。这个
 工具链组合问题不属于 CAS 源码失败，也没有用来替代上述 CCEC 9.1 编译
 证据。
+
+### 2026-07-27：R4b 先建立不依赖 PA 拓扑的 WriterIntentSet 语义门槛
+
+R4a 只加固了 `deps_prepared` 的发布原语。R4b 开始把“某个 task 声明自己
+将复写哪些 tensor”从 PA 的 `TaskKind::Up`、group 数量、三个 accumulator
+和固定 `task_id-4` 中抽离，但本阶段刻意不把新入口接入 PA runtime。原因是
+先用独立 A→B→C 门槛验证公共语义，再处理多版本历史；不能一边替换真实
+PA 热路径，一边猜测通用协议是否成立。
+
+#### 本阶段公共接口
+
+`InspectSharedWriterIntent()` 只检查参数方向和引用类型：
+
+- 非 `manual_dep` 的 `INOUT` / `OUTPUT_EXISTING` 需要自动 writer intent；
+- plain shared-output symbol 和 ordinary GM/local region 使用同一入口；
+- `manual_dep` writer 继续由调用方显式管理，不发布 writer-ready；
+- 判定不读取 `TaskKind`、group、batch、后继 task 或 PA ticket。
+
+winner 调用 `PrepareSharedWriterIntentSet()` 时：
+
+1. 先校验全部 writer 引用，拒绝非法 tag、空指针、非法 shape/range、
+   future symbol 和同 task 重复 symbol writer；
+2. 复制并去重调用方已经解析出的 fanin，因而公共入口可以接在普通
+   `CollectSharedFanin()` 之后，不要求 PA 再保留一套 Commit-only 协议；
+3. symbol 用 `CAS(previous_writer -> current_task)` 发布当前 writer，并把
+   previous writer 加入本 task fanin；
+4. ordinary region 先 lookup previous writer，再追加当前 task 的不可变
+   region entry；
+5. 全部 metadata 完成后才发布 `deps_prepared=task_id`。kernel completion
+   仍只由 `task.flag` 表达。
+
+`CollectSharedFanin<..., AcceptLatestWriter=true>` 只供新的独立门槛使用：
+symbol 接受当前 cell 中落在
+`[descriptor producer,current task)` 的 writer；ownerless ordinary
+`INPUT` 也查询 shared region map。默认 PA 实例仍保持原来的精确 writer
+oracle，ownerless INPUT 的新增查询不会提前进入现有 PA 性能路径。
+
+#### 独立 A→B→C 门槛
+
+新增 `test/test_shared_writer_intent.cpp`，完全不使用 `TaskKind`、group、
+PA 参数构造器或 task ticket：
+
+- symbol：A 发布 fresh descriptor，B 以 INOUT 复写，C 在 B 的
+  writer-ready 前阻塞；B 发布后，C 解析到 B。B 同时保留并去重调用方既有
+  fanin，且 B 的 completion flag 仍为 0；
+- ordinary：ownerless external region 由 A `OUTPUT_EXISTING`、B
+  `INOUT`、C `INPUT` 构成同一链。task id 使用 100/120/140，且
+  `committed_tasks` 始终为 0，避免用连续 exact-turn 偶然掩盖接口耦合；
+- manual：纯 `manual_dep` INOUT 返回 `NotRequired`，不改 region ring，
+  也不发布 writer-ready。
+
+CPU shared 全套门槛通过。CCEC 新增独立 compile-only TU，对真实
+`PrepareSharedWriterIntentSet<CcecOps>` 分别做
+`dav-c310-cube` / `dav-c310-vec` 后端代码生成；输出写 `/dev/null`，不加入
+`DEVICE_OBJECTS`。最终 mixed ELF 中没有 probe 或该模板符号，因此这项
+编译取证不会改变运行期 `.text`、I-cache 布局或性能。
+
+#### 审查后明确撤回的错误推论
+
+初版曾尝试直接用 `current_task-H-1` 回收 ordinary ring，并用连续 writer
+跨越 CAP 验证回绕。审查发现“writer 单调追加”只排除了 writer/writer
+竞写，没有证明所有更早 reader 已经结束：
+
+```text
+慢 reader M 正在扫描旧槽
+  -> 快核进入 future writer N
+  -> N 按 task_id 推进 head 并复用槽
+  -> M 的 seq 双检失败或漏掉仍应可见的 producer
+```
+
+因此该回收实现和门槛已在提交前撤回。R4b 的 ordinary writer 固定传
+`reclaim_upto=-1`，保持 append-only；单桶容量耗尽会 terminal fail，不用
+不成立的回收证明换取表面上的无限容量。
+
+#### 当前尚未闭合的通用边界
+
+R4b 证明的是“较早 writer B 不会在 reader C lookup 前缺席”，不是完整
+多版本 TensorMap：
+
+1. shared symbol 仍只有一个 `last_writer` cell。若 future writer D 在慢
+   reader C 读取前把 cell 改成 D，C 会因 `D>=C` fail-closed；需要不可变
+   writer 历史或版本化句柄，不能把单 cell 称为历史查询。
+2. ordinary ring 尚无基于最慢 reader 进度的 reclaim，且只支持由
+   writer-ready replay 建立的单一有序 append actor，不支持任意 MPSC。
+3. ordinary lookup 仍只返回重叠 producer 的单一最大值；“A 写左半、
+   B 写右半、C 读全区”需要 producer 集，当前 A→B→C 全重叠门槛不覆盖。
+4. CPU acquire/release 只验证宿主状态机；CCEC compile-only 只验证设备
+   接口与代码生成，尚未提供 A5 跨核 DCCI 动态证据。
+5. 新公共入口尚未从 PA 调用；现有 PA 专用
+   `has_following_group` / `ChainedWriter` 路径仍是运行时权威。
+
+所以下一小步不是立即删除 PA 分支，而是先选择并验证通用历史策略：symbol
+必须能按 `writer < reader_task` 取最新过去版本；ordinary reclaim 必须由
+可证明的 reader progress 驱动，或在可证容量内继续 append-only。两项门槛
+闭合后，再让 PA 复用公共 WriterIntentSet，并单独删除其 task/group 特判。
+
+#### 验证结果
+
+| 检查 | 结果 |
+| --- | --- |
+| 独立 symbol/ordinary/manual A→B→C | PASS |
+| 既有 fanin 保留与 previous writer 去重 | PASS |
+| ownerless ordinary INPUT 查询 | 仅在显式通用模式 PASS，默认 PA 未改变 |
+| CPU shared 全套构建与门槛 | PASS |
+| CCEC AIC/AIV 通用模板显式实例化 | PASS |
+| CCEC mixed ELF / helper / relocation / manifest | 全部 PASS |
+| compile-only probe 泄漏到最终 ELF | 无 |
+| ordinary reader-progress reclaim | 未实现；初版错误方案已撤回 |
+| symbol future-writer 历史 | 未实现 |
+| A5 跨核动态用例 | 未执行 |

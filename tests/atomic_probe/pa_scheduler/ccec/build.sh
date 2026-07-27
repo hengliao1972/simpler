@@ -187,6 +187,26 @@ COMMON_FLAGS=(
     "${VARIANT_DEFINES[@]}"
 )
 
+# 普通 PA kernel 在迁移完成前不会调用通用 WriterIntentSet。shared 构建
+# 额外对模板做一次真实后端代码生成，分别锁定 cube/vector 的 CcecOps、
+# GM 地址空间、atomicCAS 与 DCCI 签名。输出直接写 /dev/null，且不加入
+# DEVICE_OBJECTS，因此不会改变最终设备 ELF、I-cache 布局或运行性能。
+if [[ "$TENSORMAP_MODE" == "shared" ]]; then
+    echo "[CHECK] CCEC AIC generic WriterIntentSet instantiation"
+    "$CCEC" "${COMMON_FLAGS[@]}" \
+        --cce-aicore-arch=dav-c310-cube \
+        -DPA_BUILD_AIC \
+        -o /dev/null \
+        "$SCRIPT_DIR/prepare_shared_writer_intent_compile_probe.cpp"
+
+    echo "[CHECK] CCEC AIV generic WriterIntentSet instantiation"
+    "$CCEC" "${COMMON_FLAGS[@]}" \
+        --cce-aicore-arch=dav-c310-vec \
+        -DPA_BUILD_AIV \
+        -o /dev/null \
+        "$SCRIPT_DIR/prepare_shared_writer_intent_compile_probe.cpp"
+fi
+
 # CompeteFirstSplitRuntimeState 当前 ABI 为 1664B。只给 split 产物开启
 # block-local relocation，并按精确尺寸预留，避免影响局部 PMU 的 inline ELF。
 SPLIT_STATE_BYTES=1664

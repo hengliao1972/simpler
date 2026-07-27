@@ -127,8 +127,11 @@ PA_DEVICE int32_t SharedLookupTensor(
     );
 }
 
-// 只有持有 task-order append turn 的 winner 可以调用回收/append 原语；
-// 多个无序 writer 同时更新 head/tail 不属于本实现契约。
+// append 至少要求唯一、按 task_id 单调推进的 writer；exact turn 与
+// writer-ready replay 都可建立 writer 顺序。真正推进 head 还必须证明
+// 更早 reader 已结束；当前只有 exact-turn 路径具备该前提，通用 intent
+// 固定传 reclaim_upto=-1。多个无序 writer 或无 reader 前沿的回收都不
+// 属于本实现契约。
 template <typename Ops>
 PA_DEVICE bool SharedRetireBucket(
     PA_GM SharedTensorMapSidecar &map, uint32_t bucket, int64_t reclaim_upto

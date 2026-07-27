@@ -161,6 +161,20 @@ else
     echo "[TEST] shared-output symbol self-test"
     "$BUILD_DIR/test_shared_output_symbols"
 
+    # 通用 writer-intent 门槛不使用 PA TaskKind/group/ticket：分别锁定
+    # shared symbol 与 ownerless ordinary region 的 A->B->C，证明 B
+    # metadata-ready 先于 loser/reader 放行，且不冒充 kernel completion。
+    echo "[BUILD] generic shared writer-intent self-test"
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror -pthread \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/test/test_shared_writer_intent.cpp" \
+        -o "$BUILD_DIR/test_shared_writer_intent"
+
+    echo "[TEST] generic shared writer-intent self-test"
+    timeout --foreground 15s "$BUILD_DIR/test_shared_writer_intent"
+
     # shared heap 与 region/symbol 协议分开验证：锁定 8 shard、1 KiB
     # 对齐、首版禁止 wrap、并发唯一分配及 terminal 容量竞争不回滚。
     echo "[BUILD] shared heap no-wrap reserve self-test"
