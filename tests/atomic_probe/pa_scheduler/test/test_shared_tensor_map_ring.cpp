@@ -2543,6 +2543,82 @@ void TestDeterministicArrivalAndLogicalTupleDifference() {
     Expect(actual == expected, kTest, "logical tuple vector matches fixed reference");
 }
 
+void TestNoRetirePreflightSkipsPublishedPayload() {
+    constexpr const char *kTest = "no-retire-preflight";
+    auto map = NewMap();
+    RecordingOps::DisableEvents();
+    const uint64_t address = 0x698000000ULL;
+    const SharedRegionValue published =
+        MakeRegion(address, 0, 64, 0);
+    const SharedRegionValue next =
+        MakeRegion(address, 64, 128, 1);
+    Expect(
+        TryCommitTask(*map, 0, {published}) ==
+            CommitResult::Committed,
+        kTest, "seed one published entry"
+    );
+
+    const uint32_t bucket = TensorMapHash(address);
+    SharedRegionSlot &published_slot =
+        map->slots[SharedTensorMapSlotIndex(bucket, 0)];
+    SharedRegionSlot &target_slot =
+        map->slots[SharedTensorMapSlotIndex(bucket, 1)];
+    const void *published_seq =
+        const_cast<const int64_t *>(
+            &published_slot.seq.value
+        );
+    const void *target_seq =
+        const_cast<const int64_t *>(&target_slot.seq.value);
+    const void *head =
+        const_cast<const int64_t *>(
+            &map->buckets[bucket].head.value
+        );
+    const void *tail =
+        const_cast<const int64_t *>(
+            &map->buckets[bucket].tail.value
+        );
+
+    RecordingOps::ResetEvents();
+    Expect(
+        SharedCheckTaskAppend<RecordingOps>(
+            *map, &next, 1, -1
+        ) == SharedAppendCheck::Ready,
+        kTest, "no-reclaim preflight remains ready"
+    );
+    Expect(
+        RecordingOps::events.size() == 3 &&
+            FindEvent(EventKind::Load, head, 0) <
+                RecordingOps::events.size() &&
+            FindEvent(EventKind::Load, tail, 0) <
+                RecordingOps::events.size() &&
+            FindEvent(EventKind::Load, target_seq, 0) <
+                RecordingOps::events.size(),
+        kTest,
+        "no-reclaim preflight keeps head/tail/target-seq checks"
+    );
+    Expect(
+        FindEvent(EventKind::Load, published_seq, 0) ==
+                RecordingOps::events.size() &&
+            FindEvent(
+                EventKind::Invalidate,
+                &published_slot.payload, 0
+            ) == RecordingOps::events.size(),
+        kTest,
+        "reclaim -1 does not read or invalidate a published payload"
+    );
+
+    RecordingOps::ResetEvents();
+    Expect(
+        SharedCheckTaskAppend<RecordingOps>(
+            *map, &next, 1, -2
+        ) == SharedAppendCheck::ProtocolError &&
+            RecordingOps::events.empty(),
+        kTest,
+        "invalid reclaim boundary fails before shared-state access"
+    );
+    RecordingOps::DisableEvents();
+}
+
 void TestTailOverflowRejectedBeforeMutation() {
     constexpr const char *kTest = "tail-overflow";
     auto map = NewMap();
@@ -2610,6 +2686,7 @@ int main() {
     TestFullBucketRetireAndReuseExactCapacity();
     TestCapacityBlockedAfterSafeRetire();
     TestDeterministicArrivalAndLogicalTupleDifference();
+    TestNoRetirePreflightSkipsPublishedPayload();
     TestTailOverflowRejectedBeforeMutation();
 
     if (g_failures != 0) {

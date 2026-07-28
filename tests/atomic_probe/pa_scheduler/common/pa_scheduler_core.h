@@ -1834,13 +1834,17 @@ PA_DEVICE bool CommitOrdinarySharedWriterIntent(
     return true;
 }
 
-template <typename Ops>
+template <typename Ops, bool RecordCommitStats = true>
 PA_DEVICE bool CommitSymbolSharedWriterIntentSet(
     PA_GM SharedTensorMapSidecar &map, const TaskArgs &args,
     int32_t task_id,
     int32_t fanin[kMaxFanin], uint32_t &fanin_count,
-    LocalStats &stats, PA_GM volatile int32_t *fatal
+    LocalStats &stats, PA_GM volatile int32_t *fatal,
+    uint32_t expected_commit_count = UINT32_MAX
 ) {
+    if constexpr (!RecordCommitStats) {
+        (void)stats;
+    }
     // 调用方必须保证同一 symbol 的 writer 按 task_id 单调进入本函数。
     // 独立 shared Submit 由全局 insert turn 建立这一顺序；仍保留的隔离
     // driver 则必须提供等价的唯一 ordered writer 合同。CAS 负责发现
@@ -1897,6 +1901,13 @@ PA_DEVICE bool CommitSymbolSharedWriterIntentSet(
             static_cast<int32_t>(previous);
         ++count;
     }
+    // ordered Submit 已在串行区外完整验证 args，并把预期 symbol 数量
+    // 固化在 owner-local delta。数量不符必须在写 history/CAS 前拒绝，
+    // 不能把输入变化变成部分发布。
+    if (expected_commit_count != UINT32_MAX &&
+        count != expected_commit_count) {
+        return false;
+    }
     if (count == 0) {
         return true;
     }
@@ -1937,9 +1948,12 @@ PA_DEVICE bool CommitSymbolSharedWriterIntentSet(
             ) != record.previous_writer) {
             return false;
         }
-        // 多 symbol 发布不是事务；若后项冲突，已经线性化的前缀不回滚。
-        // 逐项计数保留故障现场，外层随后设置 fatal 且不发布 ready gate。
-        ++stats.result.shared_symbol_inout_commits;
+        if constexpr (RecordCommitStats) {
+            // 旧公共调用保留逐项统计：若后项冲突，已经线性化的前缀
+            // 不回滚，计数继续作为故障现场。ordered Submit 则在
+            // task-level completion CAS 成功后一次性记录完整事务。
+            ++stats.result.shared_symbol_inout_commits;
+        }
     }
     return true;
 }

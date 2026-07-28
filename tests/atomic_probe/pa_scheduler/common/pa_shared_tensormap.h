@@ -584,7 +584,7 @@ PA_DEVICE SharedAppendCheck SharedCheckTaskAppend(
     PA_GM SharedTensorMapSidecar &map, const SharedRegionValue *entries,
     uint32_t count, int64_t reclaim_upto
 ) {
-    if (count > kMaxTaskTensors) {
+    if (count > kMaxTaskTensors || reclaim_upto < -1) {
         return SharedAppendCheck::ProtocolError;
     }
     for (uint32_t index = 0; index < count; ++index) {
@@ -594,7 +594,14 @@ PA_DEVICE SharedAppendCheck SharedCheckTaskAppend(
             return SharedAppendCheck::ProtocolError;
         }
         const uint32_t bucket = TensorMapHash(entry.buffer_addr);
-        if (!SharedRetireBucket<Ops>(map, bucket, reclaim_upto)) {
+        // 当前 ordered Submit 固定传 -1，明确表示不回收任何合法
+        // producer。该热路径无需读取旧 head slot、invalidate payload 和
+        // 双检 seq；下面仍完整执行 head/tail、容量和目标 seq 的
+        // fail-closed 预检。非负回收边界继续使用原 retire 协议。
+        if (reclaim_upto != -1 &&
+            !SharedRetireBucket<Ops>(
+                map, bucket, reclaim_upto
+            )) {
             return SharedAppendCheck::ProtocolError;
         }
         const int64_t head = Ops::Load(&map.buckets[bucket].head.value);

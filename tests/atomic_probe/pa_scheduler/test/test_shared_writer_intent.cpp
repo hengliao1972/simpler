@@ -1155,9 +1155,11 @@ void TestWriterDeltaRequiresExactRegisterMask() {
     context.register_mask = 3;
     Check(
         PrepareSharedTaskWriterDelta(args, context, delta) &&
+            delta.prepared_task_id == context.task_id &&
             delta.ordinary_count == 1 &&
+            delta.symbol_count == 1 &&
             delta.writer_intent_required,
-        "writer delta accepts the exact writer mask"
+        "writer delta freezes task identity and exact writer counts"
     );
 
     // 低 32 位看似是合法前任的畸形 owner 也必须在 writer delta
@@ -1199,7 +1201,9 @@ void TestOrderedOrdinaryInsertBeforeLookup(
         PrepareSharedTaskWriterDelta(
             first_args, first_context, first_delta
         ) &&
+            first_delta.prepared_task_id == 0 &&
             first_delta.ordinary_count == 1 &&
+            first_delta.symbol_count == 0 &&
             first_delta.writer_intent_required,
         "ordered ordinary task 0 prepares one writer entry"
     );
@@ -1208,7 +1212,9 @@ void TestOrderedOrdinaryInsertBeforeLookup(
             &state, first_args, first_context,
             first_delta, first_stats
         ) &&
-            InsertCompletionsMatch(state, 1),
+            InsertCompletionsMatch(state, 1) &&
+            first_stats.result.map_inserts == 1 &&
+            first_stats.result.shared_symbol_inout_commits == 0,
         "ordered ordinary task 0 publishes before lookup"
     );
 
@@ -1370,6 +1376,9 @@ void TestOrderedSymbolInsertBeforeLookup(
         PrepareSharedTaskWriterDelta(
             writer_args, writer_context, writer_delta
         ) &&
+            writer_delta.prepared_task_id == 1 &&
+            writer_delta.ordinary_count == 0 &&
+            writer_delta.symbol_count == 1 &&
             writer_delta.writer_intent_required &&
             PublishSharedTaskWriterDelta<
                 WriterIntentTestOps
@@ -1379,6 +1388,8 @@ void TestOrderedSymbolInsertBeforeLookup(
             ) &&
             state.shared_map.shared_outputs[0]
                     .last_writer[0].value == 1 &&
+            writer_stats.result.map_inserts == 0 &&
+            writer_stats.result.shared_symbol_inout_commits == 1 &&
             InsertCompletionsMatch(state, 2),
         "symbol INOUT publishes history before its own lookup"
     );
@@ -1512,7 +1523,9 @@ void TestOrderedMixedWriterTransaction(
         PrepareSharedTaskWriterDelta(
             mixed_args, mixed_context, mixed_delta
         ) &&
+            mixed_delta.prepared_task_id == 1 &&
             mixed_delta.ordinary_count == 1 &&
+            mixed_delta.symbol_count == 1 &&
             mixed_delta.writer_intent_required &&
             PublishSharedTaskWriterDelta<
                 WriterIntentTestOps
@@ -1538,6 +1551,8 @@ void TestOrderedMixedWriterTransaction(
             history.count == 1 &&
             mixed_cell.published[0].value == 1 &&
             mixed_cell.last_writer[0].value == 1 &&
+            mixed_stats.result.map_inserts == 1 &&
+            mixed_stats.result.shared_symbol_inout_commits == 1 &&
             mixed_cell.tensors[0].buffer_addr ==
                 next_output.buffer_addr,
         "mixed transaction exposes all metadata before task 1 completion"
@@ -1847,6 +1862,67 @@ void TestOrderedPublishRejectsFullBucketAtomically(
     );
 }
 
+void TestCommitStatsRequireCompletionCas(
+    SchedulerState &state
+) {
+    ResetProtocolState(state);
+    SetInsertCompletionsAfterTasks(state, 1);
+
+    TensorDesc ordinary = MakeTensor(0x492000000ULL);
+    TaskArgs args;
+    ConstructTaskArgs(args);
+    AddGmTensor(
+        args, ordinary, TensorArgType::OutputExisting
+    );
+    SharedOutputCell &symbol =
+        state.shared_map.shared_outputs[0];
+    symbol.published[0].value = 0;
+    symbol.last_writer[0].value = 0;
+    const FdwicOutputRef output{0, 0, 0, 0, 0, 0};
+    AddOutputHandleTensor(
+        args, output, TensorArgType::Inout
+    );
+
+    SubmitContext context{};
+    context.task_id = 1;
+    context.won = true;
+    context.register_mask = 3;
+    context.result.task_id = 1;
+    context.shared_result.Reset(1);
+    SharedTaskWriterDelta delta{};
+    LocalStats stats{};
+    Check(
+        PrepareSharedTaskWriterDelta(
+            args, context, delta
+        ) &&
+            delta.prepared_task_id == 1 &&
+            delta.ordinary_count == 1 &&
+            delta.symbol_count == 1,
+        "completion failure test prepares a mixed writer delta"
+    );
+
+    // metadata 可以完整落地，但 task-level completion CAS 必须因非法旧值
+    // 失败。成功统计只描述完成事务，不能把这个 terminal 前缀算进去。
+    state.tasks[1].deps_prepared = 77;
+    const uint32_t bucket = TensorMapHash(ordinary.buffer_addr);
+    Check(
+        !PublishSharedTaskWriterDelta<WriterIntentTestOps>(
+            &state, args, context, delta, stats
+        ),
+        "completion CAS conflict rejects the ordered transaction"
+    );
+    Check(
+        state.fatal.value == 1 &&
+            state.tasks[1].deps_prepared == 77 &&
+            state.shared_map.buckets[bucket].tail.value == 1 &&
+            symbol.last_writer[0].value == 1 &&
+            state.shared_map.writer_history[1].count == 1 &&
+            stats.result.map_inserts == 0 &&
+            stats.result.shared_symbol_inout_commits == 0,
+        "failed completion keeps metadata evidence but records no committed writers"
+    );
+}
+
 void TestOrdinaryWriterRangeValidation() {
     SharedRegionValue region{};
     TensorDesc contiguous = MakeTensor(0x470000000ULL);
@@ -1968,6 +2044,7 @@ int main() {
     TestManualWriterNeedsNoGate(*state);
     const bool fatal_clean = state->fatal.value == 0;
     Check(fatal_clean, "all positive paths leave fatal clear");
+    TestCommitStatsRequireCompletionCas(*state);
     TestOrderedPublishRejectsFullBucketAtomically(*state);
     TestOutOfOrderSymbolWriterFailsClosed(*state);
     TestMultiSymbolConflictKeepsTerminalPrefix(*state);

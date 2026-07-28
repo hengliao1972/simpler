@@ -10872,3 +10872,37 @@ tests/atomic_probe/pa_scheduler/test_record/2026-7-28-shard/
   per_task_deps_prepared_task_outputs_copy_flush_b256/
   per_task_deps_prepared_materialize_task_outputs_b256/
 ```
+
+### 2026-07-28：R5i 消减 ordered Register 的重复工作
+
+本轮先做不改变 shared TensorMap 总协议的低风险消减：
+
+- `PrepareSharedTaskWriterDelta()` 在串行区外冻结 task ID、ordinary 数量、
+  symbol 数量和 writer-intent 一致性；
+- `PublishSharedTaskWriterMetadata()` 不再重复执行
+  `InspectSharedWriterIntent()`、`ValidateSharedWriterIntentSet()` 和 ordinary
+  producer 扫描；
+- `reclaim_upto == -1` 明确走 no-retire 预检，只保留 head、tail、容量和
+  目标 seq 检查，不再读取或 invalidate 已发布的旧 payload；
+- `map_inserts` 与 `shared_symbol_inout_commits` 在
+  `task[N].deps_prepared` completion CAS 成功且 Register 取时结束后记账。
+
+最后一项区分“metadata 已经写出”和“完整 task 插入事务已经提交”：
+completion CAS 失败时保留 fatal、共享 metadata 和 observed value 作为故障
+现场，但不把该前缀计入成功统计。通用 writer-intent helper 仍保留原有
+“成功 CAS 前缀逐项计数”语义，只有正式 ordered Submit 使用延迟记账。
+
+定向测试证明：
+
+- `reclaim_upto == -1` 仍执行 append fail-closed 预检，但不会访问旧
+  payload；非法 `reclaim_upto < -1` 在共享访问前失败；
+- ordinary 与 symbol metadata 已发布、completion CAS 冲突时，两项成功
+  统计均保持 0；
+- 96-worker ordered Submit 继续满足 loser 零 TensorMap 访问、
+  completion-before-Build 释放和独立 kernel 重叠。
+
+系统 GCC 13 下的 shared CPU 全量门槛通过，包括五档 ring capacity、
+symbol history、writer-intent、heap、Claim、Materialize 和 ordered
+Submit。CCEC AIC/AIV generic probe、两类入口、compete-first 拆分 TU、
+mixed ELF 与 host runner 均构建通过。该阶段尚未单独生成 A5 B256 性能
+样本，因此这里只记录结构和构建结论，不宣称已有上板收益。
