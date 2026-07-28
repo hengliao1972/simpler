@@ -499,7 +499,10 @@ PA_DEVICE void CompleteTask(
 
 template <typename Ops>
 PA_DEVICE bool SlotReady(PA_GM SchedulerState *state, PA_GM LocalSlot &slot, LocalStats &stats) {
-    // 每个 fanin flag 都是跨核共享的完成条件；遇到第一个未就绪依赖即返回，后续 drain 会再次轮询。
+    // 每个 fanin flag 都是跨核共享的完成条件；在单轮 kernel 内，
+    // 完成值会单调保持 ready。shared 模式遇到第一个未就绪依赖时，
+    // 把此前已确认 ready 的前缀从本核私有 slot 中移除，避免后续
+    // 每次 EfDrain 都重复 atomic-load 同一前缀；private 模式保持原逻辑。
     for (uint32_t index = 0; index < slot.fanin_count; ++index) {
         const int32_t dependency = slot.fanin[index];
         if (TraceAtomicLoad<Ops>(
@@ -507,10 +510,25 @@ PA_DEVICE bool SlotReady(PA_GM SchedulerState *state, PA_GM LocalSlot &slot, Loc
                 &state->tasks[dependency].flag
             ) == 0) {
             ++stats.result.fanin_not_ready_loads;
+#if PTO_FDWIC_SHARED_MAP
+            if (index != 0) {
+                const uint32_t remaining =
+                    slot.fanin_count - index;
+                for (uint32_t pending = 0;
+                     pending < remaining; ++pending) {
+                    slot.fanin[pending] =
+                        slot.fanin[index + pending];
+                }
+                slot.fanin_count = remaining;
+            }
+#endif
             return false;
         }
         ++stats.result.fanin_ready_loads;
     }
+#if PTO_FDWIC_SHARED_MAP
+    slot.fanin_count = 0;
+#endif
     return true;
 }
 
@@ -906,8 +924,9 @@ PA_DEVICE bool DiscardSharedSlotsAfterReplayFatal(
 ) {
     // 只有所有 worker 都已退出 replay、不会再生产 slot 后才能调用。
     // fatal 表示本轮结果已经整体无效；此时未完成 fanin 不可能再获得
-    // completion，继续 FinalDrain 只会永久自旋。保留 slot 的 task/fanin
-    // 内容供诊断，只清除本地执行资格与占用计数。
+    // completion，继续 FinalDrain 只会永久自旋。保留 slot 的 task 与
+    // 尚未就绪 fanin 后缀供诊断；已确认 ready 的前缀可能已被 SlotReady
+    // 移除。这里只清除本地执行资格与占用计数。
     if (state == nullptr || Ops::Load(&state->fatal.value) == 0) {
         return false;
     }

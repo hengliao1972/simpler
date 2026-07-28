@@ -682,6 +682,76 @@ bool RunLoserZeroTensorMapAccessTest() {
     return ok;
 }
 
+bool RunReadyFaninPrefixCompactionTest() {
+    SchedulerState *state = MapSchedulerState();
+    if (state == nullptr) {
+        return false;
+    }
+    pa_scheduler::host::Options options;
+    options.batches = 1;
+    options.shared_context_lens = {8192};
+    options.trace_enabled = false;
+    pa_scheduler::host::InitializeState(state, options);
+    pa_scheduler::host::ConfigureTrace(state, options, nullptr);
+
+    LocalSlot blocked_at_front{};
+    blocked_at_front.fanin_count = 2;
+    blocked_at_front.fanin[0] = 4;
+    blocked_at_front.fanin[1] = 5;
+    state->tasks[4].flag = 0;
+    state->tasks[5].flag = 1;
+    LocalStats front_stats{};
+    const bool front_ready = SlotReady<OrderedSubmitTestOps>(
+        state, blocked_at_front, front_stats
+    );
+    const bool front_unchanged =
+        !front_ready && blocked_at_front.fanin_count == 2 &&
+        blocked_at_front.fanin[0] == 4 &&
+        blocked_at_front.fanin[1] == 5 &&
+        front_stats.result.fanin_ready_loads == 0 &&
+        front_stats.result.fanin_not_ready_loads == 1;
+
+    LocalSlot slot{};
+    slot.fanin_count = 4;
+    slot.fanin[0] = 0;
+    slot.fanin[1] = 1;
+    slot.fanin[2] = 2;
+    slot.fanin[3] = 3;
+    state->tasks[0].flag = 1;
+    state->tasks[1].flag = 0;
+    state->tasks[2].flag = 0;
+    state->tasks[3].flag = 0;
+    LocalStats stats{};
+    const bool stage1 =
+        !SlotReady<OrderedSubmitTestOps>(state, slot, stats) &&
+        slot.fanin_count == 3 &&
+        slot.fanin[0] == 1 && slot.fanin[1] == 2 &&
+        slot.fanin[2] == 3;
+    state->tasks[1].flag = 1;
+    const bool stage2 =
+        !SlotReady<OrderedSubmitTestOps>(state, slot, stats) &&
+        slot.fanin_count == 2 &&
+        slot.fanin[0] == 2 && slot.fanin[1] == 3;
+    state->tasks[2].flag = 1;
+    const bool stage3 =
+        !SlotReady<OrderedSubmitTestOps>(state, slot, stats) &&
+        slot.fanin_count == 1 && slot.fanin[0] == 3;
+    state->tasks[3].flag = 1;
+    const bool final_ready =
+        SlotReady<OrderedSubmitTestOps>(state, slot, stats);
+    const bool ok =
+        front_unchanged && stage1 && stage2 && stage3 &&
+        final_ready && slot.fanin_count == 0 &&
+        stats.result.fanin_ready_loads == 4 &&
+        stats.result.fanin_not_ready_loads == 3;
+    std::printf(
+        "[ORDERED_SUBMIT] ready_fanin_prefix_compaction=%s\n",
+        ok ? "PASS" : "FAIL"
+    );
+    (void)munmap(state, sizeof(SchedulerState));
+    return ok;
+}
+
 bool RunInsertReleaseBeforeBuildTest() {
     SchedulerState *state = MapSchedulerState();
     if (state == nullptr) {
@@ -892,10 +962,13 @@ bool RunIndependentKernelExecutionTest() {
 
 int main() {
     const bool loser_ok = RunLoserZeroTensorMapAccessTest();
+    const bool fanin_compaction_ok =
+        RunReadyFaninPrefixCompactionTest();
     const bool overlap_ok = RunInsertReleaseBeforeBuildTest();
     const bool execution_ok =
         RunIndependentKernelExecutionTest();
-    if (!loser_ok || !overlap_ok || !execution_ok) {
+    if (!loser_ok || !fanin_compaction_ok ||
+        !overlap_ok || !execution_ok) {
         std::fprintf(
             stderr, "[FAIL] shared ordered-insert Submit tests\n"
         );

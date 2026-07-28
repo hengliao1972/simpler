@@ -3688,12 +3688,21 @@ inline Metrics Validate(
         frontier_worker_counts_ok &= result.frontier_initial_loads == worker_completions;
         frontier_worker_counts_ok &= result.frontier_terminal_loads == result.frontier_initial_loads;
 #endif
-        fanin_worker_counts_ok &= result.fanin_ready_loads >= result.fanin_edges;
+#if PTO_FDWIC_SHARED_MAP
+        // shared SlotReady 会永久移除已观察为 ready 的本核私有 fanin
+        // 前缀；完成 flag 在单轮 kernel 内单调，因此每条真实依赖
+        // 只应命中一次 ready。
+        fanin_worker_counts_ok &=
+            result.fanin_ready_loads == result.fanin_edges;
+#else
+        fanin_worker_counts_ok &=
+            result.fanin_ready_loads >= result.fanin_edges;
         if (result.fanin_ready_loads >= result.fanin_edges) {
             // PA 最大 fanin 为 3；每次失败检查最多先重读两个 ready 前缀，再遇到一个 not-ready。
             fanin_worker_counts_ok &=
                 result.fanin_ready_loads - result.fanin_edges <= 2 * result.fanin_not_ready_loads;
         }
+#endif
         for (uint32_t kind = 0; kind < 5; ++kind)
             wins_by_kind[kind] += result.wins[kind];
         for (uint32_t kind = 0; kind < 4; ++kind) {
@@ -3841,9 +3850,18 @@ inline Metrics Validate(
         &metrics
     );
     Expect(
-        fanin_worker_counts_ok && fanin_ready_loads >= fanin_edges &&
-            fanin_ready_loads - fanin_edges <= 2 * fanin_not_ready_loads,
-        "fanin ready/failure load classification is complete", &metrics
+        fanin_worker_counts_ok &&
+#if PTO_FDWIC_SHARED_MAP
+            fanin_ready_loads == fanin_edges,
+#else
+            fanin_ready_loads >= fanin_edges &&
+            fanin_ready_loads - fanin_edges <=
+                2 * fanin_not_ready_loads,
+#endif
+        kCompiledTensorMapMode == TensorMapBuildMode::Shared
+            ? "shared fanin ready loads match each dependency edge exactly once"
+            : "fanin ready/failure load classification is complete",
+        &metrics
     );
 #if PTO_FDWIC_SHARED_MAP
     Expect(

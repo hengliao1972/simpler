@@ -11196,3 +11196,356 @@ trace-free 结果和泳道中 SubmitTransition 的结构性消减，不用单次
 候选本身。该版本没有达到“性能收益方向独立于运行顺序”的保留门槛，
 已经完整撤回；同时保留原动态 active-mask/popcount 路由，使 standalone
 继续贴近生产 Claim，而不是为了未证明的微小收益固化 PA 特例。
+
+#### 已撤回：由 orchestration 直接生成稳定 output symbol
+
+第五个候选利用 shared fresh-output handle 只由 `(task_id, slot)` 决定
+这一事实：loser 不再初始化 `context.shared_result`，而是在每个 Submit
+返回后由 orchestration 直接生成同一组稳定 symbol；winner 仍完整构造
+`shared_result`，供 Materialize、publish 与 split finish 校验使用。
+
+该候选通过 shared CPU 全量门槛、CPU B256、CCEC swimlane/perf-clock
+两类构建和 A5 B256 全部正确性断言。AIC/AIV perf-clock 入口分别从
+`698,120/700,072 B` 降至 `681,216/685,224 B`。带泳道样本也精确命中
+预期的 post-Claim loser 尾部：
+
+| loser 区域 | R5k | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| post-Claim mean | 427.163 ns | 385.089 ns | -9.850% |
+| post-Claim median | 408 ns | 376 ns | -7.843% |
+| post-Claim p95 | 679 ns | 608 ns | -10.457% |
+| Submit mean | 1,758.220 ns | 1,726.561 ns | -1.801% |
+| 1～2 us Submit 占比 | 53.820% | 51.558% | -2.262 个百分点 |
+
+候选泳道位于：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260728_163004_1799490/ccec/
+```
+
+但是无泳道 perf-clock 的三组对称 `baseline,candidate,candidate,baseline`
+区组全部回退：
+
+| 区组 | 基线均值 | 候选均值 | 候选减基线 |
+| ---: | ---: | ---: | ---: |
+| 1 | 2,443.101 us | 2,449.460 us | +6.359 us |
+| 2 | 2,442.733 us | 2,461.654 us | +18.921 us |
+| 3 | 2,433.365 us | 2,459.288 us | +25.923 us |
+
+六个样本总体均值为 `2,439.733 -> 2,456.800 us`，回退
+`17.068 us（0.700%）`；中位数回退 `25.923 us（1.065%）`。这说明
+泳道里少掉的约 42 ns 尾部工作没有转化为端到端收益，反而改变了代码
+布局、寄存器活跃值或 orchestration 热路径成本。性能保留门槛以
+trace-free 结果为准，因此该候选已经完整撤回，不能仅凭目标区域变短
+而保留。
+
+#### 已撤回：shared Claim 改为每 task 独占原子行
+
+第六个候选没有减少 ClaimMax 次数，而是把 shared 的 Cube/Vector/Alloc
+类型高水位 cursor 改为 `task_claim[task_id]`：每个逻辑 task 独占一条
+64-byte atomic-only cache line，private 继续使用原分片 cursor。该布局
+把 ownership、`deps_prepared` 插入完成、`flag/vend` 执行完成和
+shared-output 发布四类状态彻底分离。
+
+候选在 sidecar 尾部增加 `4,352 × 64 = 278,528 B`，不移动既有热点字段；
+shared ABI generation 从 11 升到 12。正确性门槛不仅验证最终值，还覆盖：
+
+- 五种 task 的精确候选数、每 task 唯一 winner 和合法 replay；
+- 先 Claim `N+8`、再 Claim 旧 cursor 同 shard 的 `N`，两者分别获胜；
+- `task_id == kMaxTasks` 在发 atomic 前拒绝；
+- 旧值仅允许 `-1` 或本 task id，其他值触发 fatal；
+- active/unused task claim 行和四类旧 cursor 的终态逐项核对；
+- CPU B256 的完整依赖签名、TensorMap、Build/执行并发和 host oracle。
+
+CPU 全量门槛、两类 CCEC 构建与 A5 B256 全部 PASS；ClaimMax 仍精确
+73,728 次。A5 泳道位于：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260728_165441_1825631/ccec/
+```
+
+单条 ClaimMax 的改善是真实且明显的：
+
+| ClaimMax | R5k | per-task 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| mean | 376.778 ns | 297.980 ns | -20.913% |
+| median | 299 ns | 264 ns | -11.706% |
+| p95 | 740 ns | 455 ns | -38.514% |
+
+但无泳道 perf-clock 的三个对称
+`baseline,candidate,candidate,baseline` 区组全部回退：
+
+| 区组 | 基线均值 | 候选均值 | 候选减基线 |
+| ---: | ---: | ---: | ---: |
+| 1 | 2,444.538 us | 2,494.114 us | +49.576 us / +2.028% |
+| 2 | 2,432.577 us | 2,499.022 us | +66.445 us / +2.731% |
+| 3 | 2,446.668 us | 2,496.608 us | +49.940 us / +2.041% |
+
+六个样本总体均值 `2,441.261 -> 2,496.581 us`，回退
+`55.320 us（2.266%）`；中位数回退 `50.216 us（2.055%）`。同一批
+样本的 fanin loads 中位数还从 `54,241.5` 增至 `67,743.5`，
+增加 `24.893%`。这与 per-task Claim 允许不同 worker 更自由地跨 task
+超前、从而增加后续依赖轮询的机制一致；但当前证据只能把它写成同轮伴随
+变化，不能把全部墙钟回退唯一归因于 fanin。
+
+结论是：类型高水位 cursor 的跨 task 共享确实拖慢单条 atomic，却同时
+提供了有益的进度约束。完全 per-task 化优化了局部 ClaimMax、恶化了完整
+调度，因此已经连同 ABI、状态、测试和 host oracle 修改一起撤回。以后
+若重试，应显式设计受控 run-ahead 窗口，而不是仅以 atomic 延迟更低为由
+恢复该候选。
+
+#### 已撤回：shared loser 不写 winner-only context 字段
+
+第七个候选只消减 shared loser 在 Claim 后对 `SubmitContext::won` 和
+`kernel_id` 的两次写回。winner 在跨 TU 前仍写入这两个字段；loser
+收尾改为直接信任同一 caller 刚构造的 ticket，不再把 Claim 的 SSA
+结果写入 context 后立刻读回校验。private 路径完全不变。
+
+候选通过 shared CPU 全量门槛、CPU B256、private CPU 门槛、两类 CCEC
+构建与 A5 B256 全部正确性断言；CPU loser 门槛还刻意给 context 留入
+陈旧 winner 值，证明 loser 收尾不再读取这两个字段。CCEC perf-clock
+mixed `.text` 减少 `3,072 B`。A5 泳道位于：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260728_170451_1834681/ccec/
+```
+
+带观测 loser 尾部仅有轻微变化，且其他区间的采集波动更大：
+
+| loser 区域 | R5k | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| post-Claim mean | 427.163 ns | 424.074 ns | -0.723% |
+| post-Claim median | 408 ns | 430 ns | +5.392% |
+| Submit mean | 1,758.220 ns | 1,766.675 ns | +0.481% |
+
+决定去留的无观测 perf-clock 采用三组对称
+`baseline,candidate,candidate,baseline`：
+
+| 区组 | 基线均值 | 候选均值 | 候选减基线 |
+| ---: | ---: | ---: | ---: |
+| 1 | 2,434.303 us | 2,460.785 us | +26.482 us / +1.088% |
+| 2 | 2,453.409 us | 2,464.873 us | +11.464 us / +0.467% |
+| 3 | 2,449.121 us | 2,451.124 us | +2.003 us / +0.082% |
+
+三组方向全部回退。六样本总体均值从 `2,445.611 us` 增至
+`2,458.927 us`，回退 `13.316 us（0.544%）`；中位数回退
+`16.766 us（0.686%）`。因此 `.text` 更小不能作为保留依据，该候选
+已经完整撤回，winner/loser 继续共同写入并校验 `won/kernel_id`。
+
+#### 已撤回：loser 不再逐次检查 split ticket 交接字
+
+第八个候选把 `RecordSharedSplitReplayTask` 中每个 Submit 对
+`runtime.reserved` 的读取延后：该字只用于本核同步 caller→finish 的
+协议诊断，不参与调度；winner 的 `ArmSharedSplitTicket` 在覆盖前仍拒绝
+非零旧值，最终 split 封口仍要求它为零。若旧 winner 根本没有完成
+Finish，下一 task 还会因 `task_id != submits` 立即失败；若只剩 loser，
+异常最晚在最终协议封口报出。
+
+CPU 门槛覆盖了正常 B256 依赖、TensorMap 与 split 状态，并用陈旧 binding
+证明后续 winner 不会覆盖旧值。CCEC perf-clock 构建和 12 次 A5 B256
+均通过全部语义断言。但三组对称 ABBA 没有形成稳定收益：
+
+| 区组 | 基线均值 | 候选均值 | 候选减基线 |
+| ---: | ---: | ---: | ---: |
+| 1 | 2,437.893 us | 2,437.335 us | -0.558 us / -0.023% |
+| 2 | 2,447.406 us | 2,435.244 us | -12.162 us / -0.497% |
+| 3 | 2,433.457 us | 2,448.029 us | +14.572 us / +0.599% |
+
+六样本总体均值 `2,439.585 -> 2,440.202 us`，候选回退
+`0.617 us（0.025%）`；中位数回退 `6.477 us（0.266%）`。方向随区组
+翻转且总体为中性，因此不能把它记录成收益。为保持异常路径尽早诊断，
+候选代码和临时故障注入门槛均已撤回。
+
+#### 已撤回：热路径消费已验证 batch plan 的轻量访问器
+
+第九个候选针对 Submit 起点前的纯 scalar 工作：每批
+`BuildSharedPaBatchPlan` 已经校验 context、group/task 公式和容量，但
+96 个 replay actor 的每个 Submit 又通过 `SharedPaPlannedTaskAt` 重复
+检查同一 plan。候选抽出只恢复 kind/group/last 元数据的轻量访问器；
+热路径仍检查 offset 上界、模板 Kind 和递增 task id，防御性接口继续供
+host oracle 与门槛测试使用。
+
+只读调用图审计确认 plan 是每批栈上局部值，仅在 Build 全部检查成功并
+一次写全三个字段后，以 const 引用同步传入；Build 失败直接 fatal 并退出，
+不存在未初始化或部分初始化 plan 被消费。shared CPU 全量门槛和 B256
+完整依赖/TensorMap 核对均 PASS。CCEC perf-clock 的 AIC/AIV 入口从
+`698,120/700,072 B` 降至 `695,768/699,072 B`。
+
+先跑三组 `B-C-C-B` 时总体曾呈现 `-3.999 us（-0.164%）`，但换成三组
+反向 `C-B-B-C` 后变为 `+4.852 us（+0.199%）`。六组汇总如下：
+
+| 区组 | 基线均值 | 候选均值 | 候选减基线 |
+| ---: | ---: | ---: | ---: |
+| 1 | 2,447.160 us | 2,448.720 us | +1.560 us / +0.064% |
+| 2 | 2,439.560 us | 2,432.793 us | -6.767 us / -0.277% |
+| 3 | 2,447.746 us | 2,440.956 us | -6.789 us / -0.277% |
+| 4 | 2,429.345 us | 2,448.917 us | +19.572 us / +0.806% |
+| 5 | 2,442.860 us | 2,435.432 us | -7.428 us / -0.304% |
+| 6 | 2,452.550 us | 2,454.960 us | +2.410 us / +0.098% |
+
+12 个基线与 12 个候选样本总体均值为
+`2,443.203 -> 2,443.629 us`，回退 `0.426 us（0.017%）`；中位数回退
+`1.609 us（0.066%）`。代码尺寸下降没有转化为顺序无关的端到端收益，
+因此该候选已撤回，继续保留每次 Submit 的独立 plan 校验。
+
+#### 已撤回：shared Claim 尝试数按 batch 聚合
+
+第十个候选消减每个参与 Claim 的 replay actor 对
+`claim_attempts` 的逐次累加。shared 每批 task 形状为
+`Alloc + G×(QK,SF,PV,UP)`；每个 AIC 尝试 Alloc/QK/PV，每个 AIV
+尝试 Alloc/SF/UP，因此两种角色都可由已验证 plan 精确得到
+`1 + 2G`。候选改为每批累加一次；winner、retry、每条 atomic 泳道与
+private 路径不变。
+
+CPU 全量门槛通过，另以 mixed `G0/G1/G2/G4` 四批验证全局 claims 精确为
+`1,728`，完整依赖和 TensorMap 也全部 PASS。CCEC perf-clock 的 AIC/AIV
+入口从 `698,120/700,072 B` 降至 `691,896/694,640 B`。但两组对称
+ABBA 都出现明显端到端回退：
+
+| 区组 | 基线均值 | 候选均值 | 候选减基线 |
+| ---: | ---: | ---: | ---: |
+| 1 | 2,437.978 us | 2,495.231 us | +57.253 us / +2.348% |
+| 2 | 2,441.531 us | 2,509.778 us | +68.247 us / +2.795% |
+
+方向和量级已足够明确，未继续浪费第三组设备时间。该候选也会让 fatal
+中途退出时的 claims 表示整批计划数、而非实际已发射数，降低错误定位
+精度。综合端到端回退和诊断语义减弱，代码已完整撤回。
+
+#### 已撤回：稳定 output symbol 直接写入 count
+
+第十一个候选利用 `SharedTaskOutputs` 的真实布局：对象只保存
+`producer_task_id` 与 `output_count`，`OutputRef(index)` 在读取时才恢复
+句柄，并没有逐槽数组。因而 `PrepareSharedTaskOutputs` 中顺序调用
+0～3 次 `AddOutputRef` 在语义上可等价为一次经过上限校验的 count 写入。
+
+shared CPU 全量门槛全部 PASS，其中 shared-output symbol、B256 依赖签名
+与 TensorMap 精确核对均覆盖该对象。CCEC perf-clock AIC/AIV 入口分别从
+`698,120/700,072 B` 降至 `696,456/698,560 B`。但两组对称 ABBA 均回退：
+
+| 区组 | 基线均值 | 候选均值 | 候选减基线 |
+| ---: | ---: | ---: | ---: |
+| 1 | 2,441.379 us | 2,459.832 us | +18.453 us / +0.756% |
+| 2 | 2,438.103 us | 2,456.129 us | +18.027 us / +0.739% |
+
+两组方向与量级一致，无需继续消耗第三组设备时间。伴随样本中候选的
+fanin load 也系统性偏高，说明 replay actor 更快越过 output 准备后，
+可能改变后续依赖轮询的相对推进节奏；现有证据不能把全部回退唯一归因于
+fanin，但足以否决候选。代码已恢复为顺序 `AddOutputRef`。
+
+### 2026-07-28：R5l 消除 shared EfDrain 对 ready fanin 前缀的重复读取
+
+#### 先解释泳道中的 1～2 us
+
+R5k B256 原始泳道中共有 121,600 次 loser Submit。按 loser 区域拆解后，
+典型耗时并不是一个独立的“loser 业务函数”：
+
+| loser 区域 | mean | median | p95 |
+| --- | ---: | ---: | ---: |
+| 完整 Submit | 1,758 ns | 1,289 ns | 3,189 ns |
+| Submit 开头 EfDrain | 718 ns | 210 ns | 1,812 ns |
+| Claim | 613 ns | 614 ns | 1,087 ns |
+| Claim 后收尾 | 427 ns | 408 ns | 679 ns |
+
+其中只有 1,008/121,600 次 loser EfDrain 真正取走一个已就绪 kernel，
+它们解释了约 55～65 us 的长尾；常见的 1～2 us 并没有对应额外 kernel。
+逐条检查原始记录还确认，泳道写记录本身跨越了业务边界：
+
+- EfDrain 结束记录的写入进入后续 Claim 区间；
+- Claim 的 atomic/阶段记录进入 Claim 区间；
+- Claim 结束记录进入 loser 收尾；
+- Submit 结束记录进入下一次 SubmitTransition。
+
+因此带泳道的单次 loser 数值包含必要的观察开销，不能解释为
+“一次 atomic 竞争加一次空 EfDrain 的真实净耗时”。泳道继续用于判断
+工作落点；候选去留仍由编译期移除泳道和 atomic 观察的 perf-clock 决定。
+
+#### 保留：已 ready 的 fanin 在单轮内只读取一次
+
+shared 的 `LocalSlot::fanin` 是执行 winner 的本核私有待执行依赖列表；
+对应 completion flag 在单轮 kernel 内只会从 0 变为 1。原 `SlotReady`
+每次从索引 0 重新扫描，若依赖形态为 `[ready, ready, not-ready]`，每次
+EfDrain 都会再次对前两个 flag 执行 `atomicAdd(0)`。这部分既不是新的
+依赖判断，也不是 kernel 等待的必要工作。
+
+R5l 在 shared 模式中采用如下收敛：
+
+1. 遇到第一个 not-ready fanin 时，移除本次已经确认 ready 的前缀，
+   只保留 blocker 及其后的未检查后缀；
+2. 所有 fanin ready 时将 `fanin_count` 归零；
+3. private 模式保持原扫描和数组内容不变；
+4. 不增加共享状态、ABI 字段、原子指令或泳道记录。
+
+前向重叠复制的源索引始终大于目标索引，且 PA fanin 是小有界数组，因此
+不会覆盖尚未复制的元素。优化也不会提前执行 task：每次调用仍会先遇到并
+读取当前 blocker，只有它变为 ready 后才继续检查后缀。
+
+host oracle 对 shared 收紧为
+`fanin_ready_loads == fanin_edges`，把“每条真实依赖恰好命中一次 ready”
+作为正确性与性能共同门槛。独立 CPU 门槛覆盖：
+
+- 第 0 项未就绪时数组和计数完全不变；
+- 四条依赖分三次解除时连续压缩；
+- 最后一次全部 ready 后计数归零；
+- 累计 `ready=4`、`not_ready=3` 精确匹配调用过程。
+
+fatal 清理的诊断语义也同步说明为“保留尚未就绪的 fanin 后缀”；已经
+确认 ready 并从本核 slot 删除的前缀不再伪装成仍待处理的依赖。
+
+#### 正确性与 A5 B256 结果
+
+shared CPU 全量门槛、CPU B256、private CPU 全量门槛与 private b1 均
+PASS。shared CPU B256 的依赖签名仍为 `b7d985d6edb07078`，
+`fanin_ready=1280 == fanin_edges=1280`；private 继续使用原来的重复扫描
+分类规则。CCEC perf-clock、swimlane 两类构建也均 PASS。
+
+候选 A5 B256 泳道位于：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260728_174438_1874062/ccec/
+```
+
+与 R5k 同为带完整阶段和 atomic 观察的 B256 样本，loser 的目标区域变化
+如下：
+
+| loser 区域 | R5k | R5l | 变化 |
+| --- | ---: | ---: | ---: |
+| Submit mean | 1,758.220 ns | 1,722.102 ns | -36.118 ns / -2.054% |
+| Submit median | 1,289 ns | 1,257 ns | -32 ns / -2.483% |
+| EfDrain mean | 718.365 ns | 687.718 ns | -30.647 ns / -4.266% |
+| EfDrain median | 210 ns | 198 ns | -12 ns / -5.714% |
+| ClaimMax atomic mean | 376.778 ns | 374.440 ns | -0.620% |
+
+ClaimMax 本身基本不变，收益明确落在反复调用 `SlotReady` 的 EfDrain，
+而不是通过改变 Claim atomic 伪造。带泳道的 B256 还得到
+`fanin_ready=1280`、`fanin_not_ready=18,661`、总 fanin loads=19,941，
+依赖、TensorMap、输出结果、73,728 次 Claim 和 1,280 个 winner 全部
+精确通过。
+
+最终净性能采用六组对称 ABBA；前三组为
+`baseline,candidate,candidate,baseline`，后三组反转运行次序。六组均
+同向改善：
+
+| 组 | R5k 基线均值 | R5l 候选均值 | 候选减基线 |
+| ---: | ---: | ---: | ---: |
+| 1 | 2,435.526 us | 2,407.691 us | -27.836 us / -1.143% |
+| 2 | 2,438.107 us | 2,424.129 us | -13.978 us / -0.573% |
+| 3 | 2,427.100 us | 2,415.404 us | -11.696 us / -0.482% |
+| 4 | 2,440.746 us | 2,405.283 us | -35.463 us / -1.453% |
+| 5 | 2,448.964 us | 2,432.211 us | -16.753 us / -0.684% |
+| 6 | 2,430.577 us | 2,414.200 us | -16.377 us / -0.674% |
+
+12 个基线与 12 个候选样本总体均值为
+`2,436.837 -> 2,416.486 us`，改善 `20.350 us（0.835%）`；中位数为
+`2,430.577 -> 2,415.203 us`，改善 `15.374 us（0.633%）`。
+`fanin_ready` 均值从 7,283.9 精确收敛到每次 1,280，下降 82.427%；
+总 fanin loads 均值从 51,284.2 降到 44,278.4，下降 13.661%。
+
+在加入精确 host 断言后，以最终源码重新构建并补跑的一次 A5 B256
+perf-clock 为 `2,431.319 us`，`fanin_ready=1280`、全部语义断言 PASS。
+这次优化不是要求 loser 不做 EfDrain，而是删除 EfDrain 中已经获得确定
+答案的重复原子读取；仍未 ready 的 blocker 轮询和真实 kernel drain
+继续完整保留。
