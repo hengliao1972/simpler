@@ -18,11 +18,14 @@
 
 struct SharedTaskWriterDelta {
     // ordinary entry 先在 owner 私有上下文中完整准备；只有拿到 task 的
-    // exact insert turn 后才批量预检和发布。symbol writer 不复制
-    // descriptor，只记录本 task 需要更新的不可变 writer-history 数量。
+    // exact insert turn 后才批量预检和发布。bucket/同桶序号及 symbol
+    // packed key 都在等待前计算；串行区只消费这份不可变提交计划。
     // prepared_task_id 只在全部结构检查通过后写入；Publish 阶段据此确认
     // 这份 owner-local delta 属于当前 task，不再在串行区重复扫描 args。
     SharedRegionValue ordinary_entries[kMaxTaskTensors];
+    uint32_t symbol_keys[kMaxTaskTensors];
+    uint16_t ordinary_buckets[kMaxTaskTensors];
+    uint8_t ordinary_bucket_ordinals[kMaxTaskTensors];
     int32_t prepared_task_id;
     uint32_t ordinary_count;
     uint32_t symbol_count;
@@ -31,6 +34,10 @@ struct SharedTaskWriterDelta {
 static_assert(
     __is_trivially_constructible(SharedTaskWriterDelta),
     "shared task writer delta must remain trivial for CCEC local state"
+);
+static_assert(
+    kMapBuckets <= 65536 && kMaxTaskTensors <= 256,
+    "prepared bucket and ordinal metadata no longer cover the build"
 );
 
 PA_DEVICE bool PrepareSharedTaskWriterDelta(
@@ -84,12 +91,20 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
         }
         const TaskTensorRef &reference = args.tensors[index];
         if (reference.kind == TensorRefKind::SharedOutputRef) {
-            if (!IsPlainSharedOutputRef(
-                    SharedOutputReference(reference)
-                ) ||
+            const FdwicOutputRef output_ref =
+                SharedOutputReference(reference);
+            uint32_t symbol_key = 0;
+            if (!SharedSymbolHistoryKey(output_ref, symbol_key) ||
                 delta.symbol_count >= kMaxTaskTensors) {
                 return false;
             }
+            for (uint32_t previous = 0;
+                 previous < delta.symbol_count; ++previous) {
+                if (delta.symbol_keys[previous] == symbol_key) {
+                    return false;
+                }
+            }
+            delta.symbol_keys[delta.symbol_count] = symbol_key;
             ++delta.symbol_count;
         } else if (reference.kind == TensorRefKind::GmTensor) {
             PA_GM const TensorDesc &tensor =
@@ -104,6 +119,26 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
                     )) {
                     return false;
                 }
+                const uint32_t bucket = TensorMapHash(
+                    delta.ordinary_entries[
+                        delta.ordinary_count
+                    ].buffer_addr
+                );
+                uint32_t ordinal = 0;
+                for (uint32_t previous = 0;
+                     previous < delta.ordinary_count;
+                     ++previous) {
+                    ordinal +=
+                        delta.ordinary_buckets[previous] == bucket
+                            ? 1U
+                            : 0U;
+                }
+                delta.ordinary_buckets[
+                    delta.ordinary_count
+                ] = static_cast<uint16_t>(bucket);
+                delta.ordinary_bucket_ordinals[
+                    delta.ordinary_count
+                ] = static_cast<uint8_t>(ordinal);
                 ++delta.ordinary_count;
             }
         } else if (reference.kind ==
@@ -120,6 +155,26 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
                     )) {
                     return false;
                 }
+                const uint32_t bucket = TensorMapHash(
+                    delta.ordinary_entries[
+                        delta.ordinary_count
+                    ].buffer_addr
+                );
+                uint32_t ordinal = 0;
+                for (uint32_t previous = 0;
+                     previous < delta.ordinary_count;
+                     ++previous) {
+                    ordinal +=
+                        delta.ordinary_buckets[previous] == bucket
+                            ? 1U
+                            : 0U;
+                }
+                delta.ordinary_buckets[
+                    delta.ordinary_count
+                ] = static_cast<uint16_t>(bucket);
+                delta.ordinary_bucket_ordinals[
+                    delta.ordinary_count
+                ] = static_cast<uint8_t>(ordinal);
                 ++delta.ordinary_count;
             }
         } else {
@@ -147,8 +202,7 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
 
 template <typename Ops>
 PA_DEVICE bool PublishSharedTaskWriterMetadata(
-    PA_GM SchedulerState *state, const TaskArgs &args,
-    const SubmitContext &context,
+    PA_GM SchedulerState *state, const SubmitContext &context,
     const SharedTaskWriterDelta &delta, LocalStats &stats
 ) {
     const int32_t task_id = context.task_id;
@@ -172,28 +226,27 @@ PA_DEVICE bool PublishSharedTaskWriterMetadata(
     // insert-before-lookup 不能用本 task 的 reader_done 回收自己仍可能
     // 消费的 N-H。首版只使用已经证明正确的 -1 前沿；容量不足明确
     // 终止，绝不覆盖 live producer 或错误推进 task turn。
-    if (SharedCheckTaskAppend<Ops>(
+    if (SharedCheckPreparedTaskAppend<Ops>(
             state->shared_map, delta.ordinary_entries,
+            delta.ordinary_buckets,
+            delta.ordinary_bucket_ordinals,
             delta.ordinary_count, -1
         ) != SharedAppendCheck::Ready) {
         SetFatal<Ops>(state, stats, task_id);
         return false;
     }
 
-    int32_t ignored_fanin[kMaxFanin] = {};
-    uint32_t ignored_fanin_count = 0;
     if (delta.symbol_count != 0 &&
-        !CommitSymbolSharedWriterIntentSet<Ops, false>(
-            state->shared_map, args, task_id,
-            ignored_fanin, ignored_fanin_count, stats,
-            &state->fatal.value, delta.symbol_count
+        !CommitPreparedSymbolSharedWriterIntentSet<Ops>(
+            state->shared_map, delta.symbol_keys,
+            delta.symbol_count, task_id, &state->fatal.value
         )) {
         SetFatal<Ops>(state, stats, task_id);
         return false;
     }
     if (!SharedAppendPreparedTask<Ops>(
             state->shared_map, delta.ordinary_entries,
-            delta.ordinary_count
+            delta.ordinary_buckets, delta.ordinary_count
         )) {
         SetFatal<Ops>(state, stats, task_id);
         return false;
@@ -277,8 +330,7 @@ PA_DEVICE bool WaitForSharedTaskInsertTurn(
 
 template <typename Ops>
 PA_DEVICE bool PublishSharedTaskWriterDelta(
-    PA_GM SchedulerState *state, const TaskArgs &args,
-    const SubmitContext &context,
+    PA_GM SchedulerState *state, const SubmitContext &context,
     const SharedTaskWriterDelta &delta, LocalStats &stats
 ) {
     // fresh output cell 由本 task 的唯一 Claim winner 独占，不参与
@@ -313,7 +365,7 @@ PA_DEVICE bool PublishSharedTaskWriterDelta(
         return false;
     }
     if (!PublishSharedTaskWriterMetadata<Ops>(
-            state, args, context, delta, stats
+            state, context, delta, stats
         )) {
         RollbackSharedTaskOutputs<Ops>(
             state->shared_map.shared_outputs[
@@ -541,7 +593,7 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     const bool metadata_published =
         turn_ready &&
         PublishSharedTaskWriterMetadata<Ops>(
-            state, args, context, writer_delta, stats
+            state, context, writer_delta, stats
         );
     const uint64_t metadata_end = metadata_published
         ? TraceTimestamp<Ops>(stats.trace, stats.result)

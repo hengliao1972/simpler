@@ -41,6 +41,7 @@ struct SymbolTestOps {
     static volatile int64_t *wait_address;
     static std::atomic<uint64_t> wait_loads;
     static std::atomic<uint64_t> now_calls;
+    static std::atomic<uint64_t> spin_calls;
 
     static int32_t Load(volatile int32_t *address) {
         return __atomic_fetch_add(address, int32_t{0}, __ATOMIC_ACQUIRE);
@@ -121,6 +122,7 @@ struct SymbolTestOps {
     }
 
     static void SpinHint() {
+        spin_calls.fetch_add(1, std::memory_order_relaxed);
         std::this_thread::yield();
     }
 };
@@ -128,6 +130,7 @@ struct SymbolTestOps {
 volatile int64_t *SymbolTestOps::wait_address = nullptr;
 std::atomic<uint64_t> SymbolTestOps::wait_loads{0};
 std::atomic<uint64_t> SymbolTestOps::now_calls{0};
+std::atomic<uint64_t> SymbolTestOps::spin_calls{0};
 
 // 把第二次读钟直接推进到 watchdog 期限之后，避免用真实 2 秒等待测试
 // timeout 终止语义。
@@ -1662,6 +1665,131 @@ void TestConsumerWaitsForDelayedPublication() {
     );
 }
 
+void TestOrderedPreparedSymbolUsesSinglePublicationCheck() {
+    auto map = std::make_unique<SharedTensorMapSidecar>();
+    ResetSharedState(*map);
+
+    constexpr int32_t kProducer = 0;
+    constexpr int32_t kWriter = 1;
+    constexpr int32_t kReader = 2;
+    TensorDesc output = MakeTensor(0x381000000ULL, kProducer);
+    SubmitContext producer{};
+    producer.task_id = kProducer;
+    producer.result.task_id = kProducer;
+    producer.result.count = 1;
+    producer.result.tensors[0] = &output;
+    producer.shared_result.Reset(kProducer);
+    Check(
+        producer.shared_result.AddOutputRef(kProducer, 0) &&
+            PublishSharedTaskOutputs<SymbolTestOps>(
+                *map, producer, kProducer
+            ),
+        "ordered symbol setup publishes the producer descriptor"
+    );
+    const FdwicOutputRef output_ref =
+        producer.shared_result.OutputRef(0);
+    uint32_t symbol_key = 0;
+    Check(
+        SharedSymbolHistoryKey(output_ref, symbol_key),
+        "ordered symbol setup precomputes one packed key"
+    );
+
+    volatile int32_t fatal = 0;
+    SymbolTestOps::wait_address =
+        &map->shared_outputs[kProducer].published[0].value;
+    SymbolTestOps::wait_loads.store(0, std::memory_order_relaxed);
+    SymbolTestOps::now_calls.store(0, std::memory_order_relaxed);
+    SymbolTestOps::spin_calls.store(0, std::memory_order_relaxed);
+    const bool committed =
+        CommitPreparedSymbolSharedWriterIntentSet<SymbolTestOps>(
+            *map, &symbol_key, 1, kWriter, &fatal
+        );
+    SymbolTestOps::wait_address = nullptr;
+
+    const SharedWriterHistoryCell &history =
+        map->writer_history[kWriter];
+    Check(committed && fatal == 0, "ordered prepared symbol commit succeeds");
+    Check(
+        SymbolTestOps::wait_loads.load(std::memory_order_relaxed) == 1,
+        "ordered prepared commit checks published exactly once"
+    );
+    Check(
+        SymbolTestOps::now_calls.load(std::memory_order_relaxed) == 0 &&
+            SymbolTestOps::spin_calls.load(std::memory_order_relaxed) == 0,
+        "ordered prepared commit never opens a watchdog or spins"
+    );
+    Check(
+        history.magic == kSharedWriterHistoryMagic &&
+            history.writer_task == kWriter &&
+            history.count == 1 &&
+            history.entries[0].symbol_key == symbol_key &&
+            history.entries[0].previous_writer == kProducer &&
+            map->shared_outputs[kProducer].last_writer[0].value ==
+                kWriter,
+        "ordered prepared commit publishes the exact immutable history"
+    );
+    TaskArgs reader_args;
+    ConstructTaskArgs(reader_args);
+    AppendSharedOutputRef(
+        reader_args, output_ref, TensorArgType::Input
+    );
+    LocalStats reader_stats{};
+    int32_t fanin[kMaxFanin] = {};
+    bool protocol_ok = false;
+    uint32_t ordinary_lookups = UINT32_MAX;
+    SymbolTestOps::wait_address =
+        &map->shared_outputs[kProducer].published[0].value;
+    SymbolTestOps::wait_loads.store(0, std::memory_order_relaxed);
+    SymbolTestOps::now_calls.store(0, std::memory_order_relaxed);
+    SymbolTestOps::spin_calls.store(0, std::memory_order_relaxed);
+    const uint32_t fanin_count =
+        CollectSharedFanin<SymbolTestOps, false, true>(
+            *map, reader_args, kReader, kHeapWindow,
+            reader_stats, fanin, protocol_ok, ordinary_lookups,
+            &fatal
+        );
+    SymbolTestOps::wait_address = nullptr;
+    Check(
+        protocol_ok && fanin_count == 1 &&
+            fanin[0] == kWriter && ordinary_lookups == 0,
+        "ordered latest-writer lookup still resolves the prepared writer"
+    );
+    Check(
+        SymbolTestOps::wait_loads.load(std::memory_order_relaxed) == 1 &&
+            SymbolTestOps::now_calls.load(std::memory_order_relaxed) == 0 &&
+            SymbolTestOps::spin_calls.load(std::memory_order_relaxed) == 0,
+        "ordered latest-writer lookup also uses one check without waiting"
+    );
+
+    ResetSharedState(*map);
+    fatal = 0;
+    SymbolTestOps::wait_address =
+        &map->shared_outputs[kProducer].published[0].value;
+    SymbolTestOps::wait_loads.store(0, std::memory_order_relaxed);
+    SymbolTestOps::now_calls.store(0, std::memory_order_relaxed);
+    SymbolTestOps::spin_calls.store(0, std::memory_order_relaxed);
+    const bool missing_rejected =
+        !CommitPreparedSymbolSharedWriterIntentSet<SymbolTestOps>(
+            *map, &symbol_key, 1, kWriter, &fatal
+        );
+    SymbolTestOps::wait_address = nullptr;
+    Check(
+        missing_rejected && fatal == 1,
+        "ordered prepared commit rejects an unpublished producer immediately"
+    );
+    Check(
+        SymbolTestOps::wait_loads.load(std::memory_order_relaxed) == 1 &&
+            SymbolTestOps::now_calls.load(std::memory_order_relaxed) == 0 &&
+            SymbolTestOps::spin_calls.load(std::memory_order_relaxed) == 0,
+        "unpublished ordered producer fails after one load without waiting"
+    );
+    Check(
+        map->writer_history[kWriter].magic == 0 &&
+            map->shared_outputs[kProducer].last_writer[0].value == -1,
+        "unpublished rejection preserves history and writer"
+    );
+}
+
 void TestPublicationWaitFailuresFailClosed() {
     auto map = std::make_unique<SharedTensorMapSidecar>();
     const FdwicOutputRef output_ref{0, 0, 0, 0, 0, 0};
@@ -1878,6 +2006,7 @@ int main() {
     TestPublicationPreflightIsAllOrNothing();
     TestPublicationCommitFaultsRollback();
     TestConsumerWaitsForDelayedPublication();
+    TestOrderedPreparedSymbolUsesSinglePublicationCheck();
     TestPublicationWaitFailuresFailClosed();
     TestInvalidReferencesFailClosed();
     if (g_failures != 0) {

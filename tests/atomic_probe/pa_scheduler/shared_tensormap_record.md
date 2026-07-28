@@ -10906,3 +10906,113 @@ symbol history、writer-intent、heap、Claim、Materialize 和 ordered
 Submit。CCEC AIC/AIV generic probe、两类入口、compete-first 拆分 TU、
 mixed ELF 与 host runner 均构建通过。该阶段尚未单独生成 A5 B256 性能
 样本，因此这里只记录结构和构建结论，不宣称已有上板收益。
+
+### 2026-07-28：R5j 把静态提交计划移出 ordered Register
+
+第二批把只有 winner-local 输入参与的计算移到 predecessor 等待之前：
+
+- ordinary writer 预计算 bucket 和同 bucket 局部序号；正式 preflight
+  直接使用 `tail + ordinal`，不再执行 `TensorMapHash()` 或
+  `SharedEarlierEntriesInBucket()`；
+- symbol writer 预计算 packed key 并在本地拒绝重复 key；取得 insert
+  turn 后只读取当时最新的 `last_writer`，写 history 并发布 CAS；
+- 正式 symbol commit 不再分配、清零、去重和写入随后立即丢弃的
+  `ignored_fanin[kMaxFanin]`。completion CAS 之后的权威
+  `CollectSharedFanin()` 仍负责完整依赖收集和容量校验；
+- ordinary append 增加按预计算 bucket 发布的专用入口；通用 ring helper
+  继续按地址 hash，隔离测试和旧调用不改变。
+
+bucket 使用 `uint16_t`，不是只按默认 128 buckets 取 `uint8_t`。原因是
+CPU ring 门槛还会编译 CAP=32、512 buckets 的真实变体；同 bucket 序号
+最多 31，继续使用 `uint8_t`。默认 CAP=128 时新增 winner-local plan 为
+32 个 symbol key、32 个 bucket 和 32 个 ordinal，不修改任何 shared ABI。
+
+#### output published 单次检查的前提
+
+producer P 的正式顺序为：
+
+```text
+descriptor copy
+-> FlushRegion
+-> published[P][slot] atomic
+-> task[P].deps_prepared completion
+```
+
+task completion 又按 `P -> P+1 -> ... -> N-1` 逐 task 传递。task N 只有在
+观察到 `task[N-1].deps_prepared` 后才能进入 writer metadata，因此任意合法
+`P < N` 的 published 必须已经成立。正式 prepared symbol commit 和
+`CollectSharedFanin<false, true>` 据此各执行一次 atomic Load：精确命中
+即继续，未命中立即作为协议错误终止，不再打开 SYS_CNT watchdog 或 spin。
+
+没有取得 insert-turn 前提的通用 `WaitForSharedOutputPublished()` 保持原样，
+其延迟发布、fatal 和 watchdog 测试也全部保留。这里不是全局删除等待，
+而是用两个不同 API 明确区分“状态仍可能变为合法”和“前序完成链已证明
+状态必须合法”。
+
+#### 正确性和构建证据
+
+CPU 定向门槛新增并通过：
+
+- ordinary `A,B,A,A` 计划得到 `0,0,1,2` 局部序号，prepared 与 generic
+  路径生成相同逻辑 map；容量失败不产生部分发布；
+- CAP=32/64/128/256/16384 五档 ring 全部通过，包含 512 buckets 与单
+  bucket 两端；
+- prepared symbol commit 与 ordered latest-writer lookup 都恰好读取一次
+  published，`Now()` 和 `SpinHint()` 调用为 0；未发布值一次读取后立即
+  失败；
+- 96-worker ordered Submit 继续满足 loser 零 map 访问、insert completion
+  先于 Build 释放和独立 kernel 重叠。
+
+CCEC shared swimlane 与 perf-clock 的 AIC/AIV generic probe、入口、
+compete-first split finish、mixed ELF 和 host runner 均构建通过。相对 R5i
+的 swimlane 构建，AIC/AIV 入口对象大小保持
+`1,552,384 / 1,535,152 B` 不变；finish AIC/AIV 分别从
+`752,728 / 751,680 B` 降至 `741,544 / 740,560 B`，mixed kernel 从
+`2,829,232 B` 降至 `2,815,456 B`。因此当前证据没有显示预计算 plan
+造成设备代码膨胀，反而因移除慢路径重复逻辑而缩小。
+
+#### A5 B256 最终验证
+
+最终源码重新构建了 shared G1 的 swimlane 与 perf-clock CCEC
+artifact。架构预检因本机没有 `npu-smi` 而无法自动识别 silicon，
+`task-submit` 也不在 PATH；沿用本仓库前序记录中的用户明确授权，在已知
+A5 的 device 0 上各执行一次无锁验证。这里诚实记录为无锁样本，不声称
+取得设备独占。
+
+swimlane B256 固定 1,280 tasks、96 workers、context 8192、
+real-compute `6,28,4,1` 和 final barrier `two-16`，结果为：
+
+- execution、semantic、postprocess、依赖签名、fresh-output descriptor、
+  writer history、per-task completion 和 real-compute 输出全部 PASS；
+- 485,925 条 raw record，drop 0；exclusive analyzer 的全部闭合检查
+  PASS；
+- Submit 为 `3,392.893 us`。
+
+与 R5h 完成后、R5i/R5j 之前的同口径泳道相比：
+
+| 指标 | R5h 基线 | R5i+R5j | 变化 |
+| --- | ---: | ---: | ---: |
+| Submit wall-clock | 3,464.587 us | 3,392.893 us | -2.069% |
+| Register 累计 core-work | 15,678,761 cycles | 8,365,867 cycles | -46.642% |
+| predecessor wait | 12,665,626 cycles | 6,169,187 cycles | -51.292% |
+| writer metadata | 2,409,396 cycles | 1,537,416 cycles | -36.191% |
+| insert completion | 603,739 cycles | 659,264 cycles | +9.197% |
+
+这组分解证明串行区消减确实落在 Register metadata 与连带等待上；
+insert-completion 的小幅增加没有对应代码扩张，只按单次无锁样本记录，
+不解释为稳定回退。两份泳道分别位于：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260728_105926_1598639/ccec/
+  pa_scheduler_shared_swimlane_20260728_131823_1696692/ccec/
+```
+
+最终源码的独立 perf-clock B256 同样全部 PASS，Submit 为
+`2,482.874 us`。它关闭泳道、atomic trace、PMU、phase 与 kernel timing；
+相对 R5h 的四样本中位数 `2,940.2265 us` 方向一致，但本次只有一个无锁
+样本，不能把 `-15.555%` 当作完成交错复测后的稳定净收益。
+
+现有未提交 ordinary-ring visibility probe 只覆盖普通区域 ring，不覆盖
+fresh-output descriptor、per-task completion 与单次 published Load 的
+完整传递链，因而没有拿它替代本次正式 shared PA B256 验证。

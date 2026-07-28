@@ -31,6 +31,7 @@ using pa_scheduler::SharedAppendPreparedTask;
 using pa_scheduler::SharedAppendCheck;
 using pa_scheduler::SharedAdvanceReaderDone;
 using pa_scheduler::SharedBucketState;
+using pa_scheduler::SharedCheckPreparedTaskAppend;
 using pa_scheduler::SharedCheckTaskAppend;
 using pa_scheduler::SharedComputeReaderReclaimCandidate;
 using pa_scheduler::SharedComputeOrderedReclaimCandidate;
@@ -384,6 +385,14 @@ uint64_t FindAddressOutsideBucket(uint64_t seed, uint32_t excluded_bucket) {
     }
     uint64_t address = seed;
     while (TensorMapHash(address) == excluded_bucket) {
+        address += 64;
+    }
+    return address;
+}
+
+uint64_t FindAddressInsideBucket(uint64_t seed, uint32_t wanted_bucket) {
+    uint64_t address = seed;
+    while (TensorMapHash(address) != wanted_bucket) {
         address += 64;
     }
     return address;
@@ -2543,6 +2552,134 @@ void TestDeterministicArrivalAndLogicalTupleDifference() {
     Expect(actual == expected, kTest, "logical tuple vector matches fixed reference");
 }
 
+void TestPreparedBucketPlanMatchesGenericPath() {
+    constexpr const char *kTest = "prepared-bucket-plan";
+    auto generic_map = NewMap();
+    auto prepared_map = NewMap();
+    RecordingOps::DisableEvents();
+
+    const uint64_t address_a0 = 0x690000000ULL;
+    const uint32_t bucket_a = TensorMapHash(address_a0);
+    const uint64_t address_b = FindAddressOutsideBucket(
+        0x691000000ULL, bucket_a
+    );
+    const uint32_t bucket_b = TensorMapHash(address_b);
+    const uint64_t address_a1 = FindAddressInsideBucket(
+        0x692000000ULL, bucket_a
+    );
+    const uint64_t address_a2 = FindAddressInsideBucket(
+        address_a1 + 64, bucket_a
+    );
+    const SharedRegionValue entries[4] = {
+        MakeRegion(address_a0, 0, 64, 7),
+        MakeRegion(address_b, 64, 128, 7),
+        MakeRegion(address_a1, 128, 192, 7),
+        MakeRegion(address_a2, 192, 256, 7),
+    };
+    const uint16_t buckets[4] = {
+        static_cast<uint16_t>(bucket_a),
+        static_cast<uint16_t>(bucket_b),
+        static_cast<uint16_t>(bucket_a),
+        static_cast<uint16_t>(bucket_a),
+    };
+    const uint8_t ordinals[4] = {
+        0,
+        static_cast<uint8_t>(kMapBuckets == 1 ? 1 : 0),
+        static_cast<uint8_t>(kMapBuckets == 1 ? 2 : 1),
+        static_cast<uint8_t>(kMapBuckets == 1 ? 3 : 2),
+    };
+
+    Expect(
+        SharedCheckTaskAppend<RecordingOps>(
+            *generic_map, entries, 4, -1
+        ) == SharedAppendCheck::Ready &&
+            SharedCheckPreparedTaskAppend<RecordingOps>(
+                *prepared_map, entries, buckets, ordinals, 4, -1
+            ) == SharedAppendCheck::Ready,
+        kTest, "generic and prepared preflight both accept the plan"
+    );
+    Expect(
+        SharedAppendPreparedTask<RecordingOps>(
+            *generic_map, entries, 4
+        ) &&
+            SharedAppendPreparedTask<RecordingOps>(
+                *prepared_map, entries, buckets, 4
+            ),
+        kTest, "generic and prepared append both publish the plan"
+    );
+
+    std::vector<LogicalTuple> generic_snapshot;
+    std::vector<LogicalTuple> prepared_snapshot;
+    Expect(
+        SnapshotLogicalMap(*generic_map, generic_snapshot) &&
+            SnapshotLogicalMap(*prepared_map, prepared_snapshot) &&
+            generic_snapshot == prepared_snapshot,
+        kTest, "prepared plan preserves the generic logical map"
+    );
+    ExpectEqual(
+        LoadControl(
+            &prepared_map->buckets[bucket_a].tail.value
+        ),
+        kMapBuckets == 1 ? 4 : 3,
+        kTest, "prepared A bucket tail"
+    );
+    if constexpr (kMapBuckets > 1) {
+        ExpectEqual(
+            LoadControl(
+                &prepared_map->buckets[bucket_b].tail.value
+            ),
+            1, kTest, "prepared B bucket tail"
+        );
+    }
+
+    auto blocked_map = NewMap();
+    RecordingOps::DisableEvents();
+    StoreControl(
+        &blocked_map->buckets[bucket_a].head.value, 0
+    );
+    StoreControl(
+        &blocked_map->buckets[bucket_a].tail.value,
+        static_cast<int64_t>(kMapBucketCapacity - 1)
+    );
+    for (uint32_t cursor = 0;
+         cursor + 1 < kMapBucketCapacity; ++cursor) {
+        StoreControl(
+            &blocked_map
+                 ->slots[
+                     SharedTensorMapSlotIndex(bucket_a, cursor)
+                 ]
+                 .seq.value,
+            static_cast<int64_t>(cursor)
+        );
+    }
+    const int64_t tail_before = LoadControl(
+        &blocked_map->buckets[bucket_a].tail.value
+    );
+    RecordingOps::ResetEvents();
+    Expect(
+        SharedCheckPreparedTaskAppend<RecordingOps>(
+            *blocked_map, entries, buckets, ordinals, 4, -1
+        ) == SharedAppendCheck::CapacityBlocked,
+        kTest, "prepared preflight rejects an over-capacity bucket"
+    );
+    bool mutation_seen = false;
+    for (const Event &event : RecordingOps::events) {
+        mutation_seen |=
+            event.kind == EventKind::Exchange ||
+            event.kind == EventKind::CompareExchange ||
+            event.kind == EventKind::Flush ||
+            event.kind == EventKind::Invalidate;
+    }
+    Expect(
+        !mutation_seen &&
+            LoadControl(
+                &blocked_map->buckets[bucket_a].tail.value
+            ) == tail_before,
+        kTest, "capacity failure performs no partial publication"
+    );
+    RecordingOps::DisableEvents();
+}
+
 void TestNoRetirePreflightSkipsPublishedPayload() {
     constexpr const char *kTest = "no-retire-preflight";
     auto map = NewMap();
@@ -2686,6 +2823,7 @@ int main() {
     TestFullBucketRetireAndReuseExactCapacity();
     TestCapacityBlockedAfterSafeRetire();
     TestDeterministicArrivalAndLogicalTupleDifference();
+    TestPreparedBucketPlanMatchesGenericPath();
     TestNoRetirePreflightSkipsPublishedPayload();
     TestTailOverflowRejectedBeforeMutation();
 

@@ -298,7 +298,7 @@ void TestEmptyWriterStillCompletes(SchedulerState &state) {
         CompletionTestOps::ResetTrace(state);
         exact &= PrepareSharedTaskWriterDelta(args, context, delta) && delta.ordinary_count == 0 &&
                  !delta.writer_intent_required &&
-                 PublishSharedTaskWriterDelta<CompletionTestOps>(&state, args, context, delta, stats) &&
+                 PublishSharedTaskWriterDelta<CompletionTestOps>(&state, context, delta, stats) &&
                  state.tasks[static_cast<uint32_t>(task)].deps_prepared == task &&
                  CompletionTestOps::cas_calls.load(std::memory_order_relaxed) == 1 &&
                  AddressEquals(
@@ -351,7 +351,7 @@ void TestOutputsPublishBeforePredecessorWait(
     std::thread owner([&]() {
         publish_ok =
             PublishSharedTaskWriterDelta<CompletionTestOps>(
-                &state, args, context, delta, task_stats
+                &state, context, delta, task_stats
             );
         publish_finished.store(true, std::memory_order_release);
     });

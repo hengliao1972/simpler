@@ -287,6 +287,23 @@ TensorDesc MakeTensor(
     return tensor;
 }
 
+uint64_t FindAddressForBucket(
+    uint64_t begin, uint32_t wanted_bucket,
+    uint32_t skip_matches = 0
+) {
+    for (uint64_t address = begin;
+         address < begin + (1ULL << 28); address += 4096) {
+        if (TensorMapHash(address) != wanted_bucket) {
+            continue;
+        }
+        if (skip_matches == 0) {
+            return address;
+        }
+        --skip_matches;
+    }
+    return 0;
+}
+
 bool WaitUntilObserved(std::atomic<uint64_t> &counter) {
     const auto deadline =
         std::chrono::steady_clock::now() +
@@ -1158,8 +1175,28 @@ void TestWriterDeltaRequiresExactRegisterMask() {
             delta.prepared_task_id == context.task_id &&
             delta.ordinary_count == 1 &&
             delta.symbol_count == 1 &&
+            delta.ordinary_buckets[0] ==
+                TensorMapHash(tensor.buffer_addr) &&
+            delta.ordinary_bucket_ordinals[0] == 0 &&
+            delta.symbol_keys[0] == 1 &&
             delta.writer_intent_required,
-        "writer delta freezes task identity and exact writer counts"
+        "writer delta freezes task identity, writer counts, buckets and symbol keys"
+    );
+
+    TaskArgs duplicate_args;
+    ConstructTaskArgs(duplicate_args);
+    AddOutputHandleTensor(
+        duplicate_args, output, TensorArgType::Inout
+    );
+    AddOutputHandleTensor(
+        duplicate_args, output, TensorArgType::OutputExisting
+    );
+    context.register_mask = 3;
+    Check(
+        !PrepareSharedTaskWriterDelta(
+            duplicate_args, context, delta
+        ),
+        "writer delta rejects a duplicate precomputed symbol key"
     );
 
     // 低 32 位看似是合法前任的畸形 owner 也必须在 writer delta
@@ -1167,6 +1204,7 @@ void TestWriterDeltaRequiresExactRegisterMask() {
     tensor.owner_task_id = uint64_t{1} << 32;
     context.task_id = 1;
     context.result.task_id = 1;
+    context.register_mask = 3;
     Check(
         !ValidateOrdinarySharedWriterReference(
             tensor, context.task_id
@@ -1175,6 +1213,77 @@ void TestWriterDeltaRequiresExactRegisterMask() {
                 args, context, delta
             ),
         "writer delta rejects owner ids with nonzero high 32 bits"
+    );
+}
+
+void TestWriterDeltaPrecomputesInterleavedBuckets(
+    SchedulerState &state
+) {
+    ResetProtocolState(state);
+    constexpr uint64_t kBase = 0x458000000ULL;
+    const uint32_t bucket_a = TensorMapHash(kBase);
+    const uint32_t bucket_b =
+        (bucket_a + 1U) % kMapBuckets;
+    const uint64_t address_a1 =
+        FindAddressForBucket(kBase + 4096, bucket_a);
+    const uint64_t address_a2 =
+        FindAddressForBucket(address_a1 + 4096, bucket_a);
+    const uint64_t address_b =
+        FindAddressForBucket(kBase + 4096, bucket_b);
+    Check(
+        address_a1 != 0 && address_a2 != 0 &&
+            address_b != 0,
+        "interleaved bucket test finds distinct addresses"
+    );
+    if (address_a1 == 0 || address_a2 == 0 ||
+        address_b == 0) {
+        return;
+    }
+
+    TensorDesc tensors[4] = {
+        MakeTensor(kBase),
+        MakeTensor(address_b),
+        MakeTensor(address_a1),
+        MakeTensor(address_a2)
+    };
+    TaskArgs args;
+    ConstructTaskArgs(args);
+    for (TensorDesc &tensor : tensors) {
+        AddGmTensor(
+            args, tensor, TensorArgType::OutputExisting
+        );
+    }
+    SubmitContext context{};
+    context.task_id = 0;
+    context.won = true;
+    context.register_mask = 15;
+    context.result.task_id = 0;
+    context.shared_result.Reset(0);
+    SharedTaskWriterDelta delta{};
+    LocalStats stats{};
+    Check(
+        PrepareSharedTaskWriterDelta(
+            args, context, delta
+        ) &&
+            delta.ordinary_count == 4 &&
+            delta.ordinary_buckets[0] == bucket_a &&
+            delta.ordinary_buckets[1] == bucket_b &&
+            delta.ordinary_buckets[2] == bucket_a &&
+            delta.ordinary_buckets[3] == bucket_a &&
+            delta.ordinary_bucket_ordinals[0] == 0 &&
+            delta.ordinary_bucket_ordinals[1] == 0 &&
+            delta.ordinary_bucket_ordinals[2] == 1 &&
+            delta.ordinary_bucket_ordinals[3] == 2,
+        "writer delta precomputes A,B,A,A buckets and 0,0,1,2 ordinals"
+    );
+    Check(
+        PublishSharedTaskWriterDelta<WriterIntentTestOps>(
+            &state, context, delta, stats
+        ) &&
+            state.shared_map.buckets[bucket_a].tail.value == 3 &&
+            state.shared_map.buckets[bucket_b].tail.value == 1 &&
+            stats.result.map_inserts == 4,
+        "prepared interleaved metadata publishes without reordering"
     );
 }
 
@@ -1204,13 +1313,15 @@ void TestOrderedOrdinaryInsertBeforeLookup(
             first_delta.prepared_task_id == 0 &&
             first_delta.ordinary_count == 1 &&
             first_delta.symbol_count == 0 &&
+            first_delta.ordinary_buckets[0] ==
+                TensorMapHash(tensor.buffer_addr) &&
+            first_delta.ordinary_bucket_ordinals[0] == 0 &&
             first_delta.writer_intent_required,
         "ordered ordinary task 0 prepares one writer entry"
     );
     Check(
         PublishSharedTaskWriterDelta<WriterIntentTestOps>(
-            &state, first_args, first_context,
-            first_delta, first_stats
+            &state, first_context, first_delta, first_stats
         ) &&
             InsertCompletionsMatch(state, 1) &&
             first_stats.result.map_inserts == 1 &&
@@ -1254,8 +1365,8 @@ void TestOrderedOrdinaryInsertBeforeLookup(
             PublishSharedTaskWriterDelta<
                 WriterIntentTestOps
             >(
-                &state, second_args, second_context,
-                second_delta, second_stats
+                &state, second_context, second_delta,
+                second_stats
             ) &&
             InsertCompletionsMatch(state, 2),
         "ordered ordinary task 1 publishes its writer entry"
@@ -1295,8 +1406,8 @@ void TestOrderedOrdinaryInsertBeforeLookup(
             PublishSharedTaskWriterDelta<
                 WriterIntentTestOps
             >(
-                &state, reader_args, reader_context,
-                reader_delta, reader_stats
+                &state, reader_context, reader_delta,
+                reader_stats
             ) &&
             InsertCompletionsMatch(state, 3),
         "empty writer task still publishes its per-task completion"
@@ -1347,8 +1458,8 @@ void TestOrderedSymbolInsertBeforeLookup(
             PublishSharedTaskWriterDelta<
                 WriterIntentTestOps
             >(
-                &state, producer_args, producer_context,
-                producer_delta, producer_stats
+                &state, producer_context, producer_delta,
+                producer_stats
             ) &&
             state.shared_map.shared_outputs[0]
                     .published[0].value == 0 &&
@@ -1379,12 +1490,13 @@ void TestOrderedSymbolInsertBeforeLookup(
             writer_delta.prepared_task_id == 1 &&
             writer_delta.ordinary_count == 0 &&
             writer_delta.symbol_count == 1 &&
+            writer_delta.symbol_keys[0] == 1 &&
             writer_delta.writer_intent_required &&
             PublishSharedTaskWriterDelta<
                 WriterIntentTestOps
             >(
-                &state, writer_args, writer_context,
-                writer_delta, writer_stats
+                &state, writer_context, writer_delta,
+                writer_stats
             ) &&
             state.shared_map.shared_outputs[0]
                     .last_writer[0].value == 1 &&
@@ -1431,8 +1543,8 @@ void TestOrderedSymbolInsertBeforeLookup(
             PublishSharedTaskWriterDelta<
                 WriterIntentTestOps
             >(
-                &state, reader_args, reader_context,
-                reader_delta, reader_stats
+                &state, reader_context, reader_delta,
+                reader_stats
             ),
         "symbol reader publishes an empty task transaction"
     );
@@ -1489,8 +1601,7 @@ void TestOrderedMixedWriterTransaction(
             PublishSharedTaskWriterDelta<
                 WriterIntentTestOps
             >(
-                &state, seed_args, seed_context,
-                seed_delta, seed_stats
+                &state, seed_context, seed_delta, seed_stats
             ),
         "mixed transaction seed publishes ordinary and fresh metadata"
     );
@@ -1530,8 +1641,8 @@ void TestOrderedMixedWriterTransaction(
             PublishSharedTaskWriterDelta<
                 WriterIntentTestOps
             >(
-                &state, mixed_args, mixed_context,
-                mixed_delta, mixed_stats
+                &state, mixed_context, mixed_delta,
+                mixed_stats
             ),
         "one ordered transaction publishes ordinary, symbol and fresh metadata"
     );
@@ -1549,6 +1660,8 @@ void TestOrderedMixedWriterTransaction(
             history.magic == kSharedWriterHistoryMagic &&
             history.writer_task == 1 &&
             history.count == 1 &&
+            history.entries[0].symbol_key ==
+                mixed_delta.symbol_keys[0] &&
             mixed_cell.published[0].value == 1 &&
             mixed_cell.last_writer[0].value == 1 &&
             mixed_stats.result.map_inserts == 1 &&
@@ -1596,8 +1709,8 @@ void TestOrderedMixedWriterTransaction(
             PublishSharedTaskWriterDelta<
                 WriterIntentTestOps
             >(
-                &state, reader_args, reader_context,
-                reader_delta, reader_stats
+                &state, reader_context, reader_delta,
+                reader_stats
             ),
         "mixed transaction reader publishes an empty completion"
     );
@@ -1817,7 +1930,7 @@ void TestOrderedPublishRejectsFullBucketAtomically(
     );
     Check(
         !PublishSharedTaskWriterDelta<WriterIntentTestOps>(
-            &state, args, context, delta, stats
+            &state, context, delta, stats
         ),
         "ordered publish rejects a full live bucket"
     );
@@ -1907,7 +2020,7 @@ void TestCommitStatsRequireCompletionCas(
     const uint32_t bucket = TensorMapHash(ordinary.buffer_addr);
     Check(
         !PublishSharedTaskWriterDelta<WriterIntentTestOps>(
-            &state, args, context, delta, stats
+            &state, context, delta, stats
         ),
         "completion CAS conflict rejects the ordered transaction"
     );
@@ -2036,6 +2149,7 @@ int main() {
     TestSymbolWriterIntentChain(*state);
     TestOrdinaryWriterIntentChain(*state);
     TestWriterDeltaRequiresExactRegisterMask();
+    TestWriterDeltaPrecomputesInterleavedBuckets(*state);
     TestOrderedOrdinaryInsertBeforeLookup(*state);
     TestOrderedSymbolInsertBeforeLookup(*state);
     TestOrderedMixedWriterTransaction(*state);

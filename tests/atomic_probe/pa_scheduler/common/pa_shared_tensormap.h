@@ -635,6 +635,73 @@ PA_DEVICE SharedAppendCheck SharedCheckTaskAppend(
     return SharedAppendCheck::Ready;
 }
 
+// 正式 ordered Submit 专用预检。bucket 与同 bucket 的局部序号已经由
+// winner 在等待 predecessor 前算好；取得 insert turn 后只读取共享
+// cursor/seq，不再重复 hash，也不再扫描此前 entry。prepared 数组是
+// owner-local 不可变 delta 的一部分，不能把任意外部输入直接传入这里。
+template <typename Ops>
+PA_DEVICE SharedAppendCheck SharedCheckPreparedTaskAppend(
+    PA_GM SharedTensorMapSidecar &map,
+    const SharedRegionValue *entries, const uint16_t *buckets,
+    const uint8_t *bucket_ordinals, uint32_t count,
+    int64_t reclaim_upto
+) {
+    if (count > kMaxTaskTensors || reclaim_upto < -1 ||
+        (count != 0 &&
+         (entries == nullptr || buckets == nullptr ||
+          bucket_ordinals == nullptr))) {
+        return SharedAppendCheck::ProtocolError;
+    }
+    for (uint32_t index = 0; index < count; ++index) {
+        const SharedRegionValue &entry = entries[index];
+        const uint32_t bucket = buckets[index];
+        const uint32_t ordinal = bucket_ordinals[index];
+        if (entry.producer < 0 || entry.reserved != 0 ||
+            entry.lo >= entry.hi || bucket >= kMapBuckets ||
+            ordinal > index) {
+            return SharedAppendCheck::ProtocolError;
+        }
+        // 同一 bucket 在一份 task delta 中只需要回收一次。正式路径当前
+        // 固定 -1，因而连第一次也跳过；保留非负参数是为了与 generic
+        // preflight 共用相同的容量/seq 合同。
+        if (ordinal == 0 && reclaim_upto != -1 &&
+            !SharedRetireBucket<Ops>(
+                map, bucket, reclaim_upto
+            )) {
+            return SharedAppendCheck::ProtocolError;
+        }
+        const int64_t head =
+            Ops::Load(&map.buckets[bucket].head.value);
+        const int64_t tail =
+            Ops::Load(&map.buckets[bucket].tail.value);
+        if (head < 0 || tail < head) {
+            return SharedAppendCheck::ProtocolError;
+        }
+        const uint64_t occupied =
+            static_cast<uint64_t>(tail - head) + ordinal;
+        if (occupied >= kMapBucketCapacity) {
+            return SharedAppendCheck::CapacityBlocked;
+        }
+        const uint64_t cursor =
+            static_cast<uint64_t>(tail) + ordinal;
+        if (cursor >= static_cast<uint64_t>(INT64_MAX)) {
+            return SharedAppendCheck::ProtocolError;
+        }
+        PA_GM SharedRegionSlot &slot =
+            map.slots[SharedTensorMapSlotIndex(bucket, cursor)];
+        const int64_t expected_old =
+            cursor < kMapBucketCapacity
+                ? kSharedMapEmptySeq
+                : static_cast<int64_t>(
+                      cursor - kMapBucketCapacity
+                  );
+        if (Ops::Load(&slot.seq.value) != expected_old) {
+            return SharedAppendCheck::ProtocolError;
+        }
+    }
+    return SharedAppendCheck::Ready;
+}
+
 template <typename Ops>
 PA_DEVICE bool SharedPreflightTaskAppend(
     PA_GM SharedTensorMapSidecar &map, const SharedRegionValue *entries,
@@ -646,10 +713,13 @@ PA_DEVICE bool SharedPreflightTaskAppend(
 }
 
 template <typename Ops>
-PA_DEVICE bool SharedAppendPreparedEntry(
-    PA_GM SharedTensorMapSidecar &map, const SharedRegionValue &entry
+PA_DEVICE bool SharedAppendPreparedEntryAtBucket(
+    PA_GM SharedTensorMapSidecar &map,
+    const SharedRegionValue &entry, uint32_t bucket
 ) {
-    const uint32_t bucket = TensorMapHash(entry.buffer_addr);
+    if (bucket >= kMapBuckets) {
+        return false;
+    }
     PA_GM SharedBucketState &controls = map.buckets[bucket];
     const int64_t head = Ops::Load(&controls.head.value);
     const int64_t tail = Ops::Load(&controls.tail.value);
@@ -694,12 +764,43 @@ PA_DEVICE bool SharedAppendPreparedEntry(
 }
 
 template <typename Ops>
+PA_DEVICE bool SharedAppendPreparedEntry(
+    PA_GM SharedTensorMapSidecar &map,
+    const SharedRegionValue &entry
+) {
+    return SharedAppendPreparedEntryAtBucket<Ops>(
+        map, entry, TensorMapHash(entry.buffer_addr)
+    );
+}
+
+template <typename Ops>
 PA_DEVICE bool SharedAppendPreparedTask(
     PA_GM SharedTensorMapSidecar &map, const SharedRegionValue *entries,
     uint32_t count
 ) {
     for (uint32_t index = 0; index < count; ++index) {
         if (!SharedAppendPreparedEntry<Ops>(map, entries[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <typename Ops>
+PA_DEVICE bool SharedAppendPreparedTask(
+    PA_GM SharedTensorMapSidecar &map,
+    const SharedRegionValue *entries, const uint16_t *buckets,
+    uint32_t count
+) {
+    if (count > kMaxTaskTensors ||
+        (count != 0 &&
+         (entries == nullptr || buckets == nullptr))) {
+        return false;
+    }
+    for (uint32_t index = 0; index < count; ++index) {
+        if (!SharedAppendPreparedEntryAtBucket<Ops>(
+                map, entries[index], buckets[index]
+            )) {
             return false;
         }
     }
