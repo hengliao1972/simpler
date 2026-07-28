@@ -41,9 +41,11 @@ shared 性能基线为回退提交 `319077a9`，其运行行为与 `ee42b8c1`
 - 优化没有改变通用 atomic 语义，也没有把任务推迟到最终 drain 来制造
   表面收益。F1 的 fanin 顺序重排已经证明性能回退并撤销；下一步先精确区分
   fanin 成功/失败 load 与 frontier 重复前推，再进行单变量消减。
-- standalone `swimlane` 使用 schema-v4 合并排他业务阶段与 atomic
-  （direct Atomic 加 PollBatch）泳道；atomic flags、weighted call 和
-  PollBatch ABI 沿用已验证的 schema-v3 语义。
+- standalone `swimlane` 当前使用 schema-v5 合并排他业务阶段与 atomic
+  （direct Atomic 加 PollBatch）泳道；相对 schema-v4 新增 shared
+  Register writer-metadata detail，以及 Materialize 中 fresh-output
+  发布、descriptor copy 和 flush detail。atomic flags、weighted call
+  和 PollBatch ABI 沿用已验证的既有语义。
 
 环境安装、编译和基线复现过程见
 [A5 FDWIC Paged Attention 安装与复现指南](../a5_fdwic_atomic_swimlane_repo.md)。

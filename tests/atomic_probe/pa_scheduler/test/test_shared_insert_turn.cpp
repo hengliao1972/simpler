@@ -13,26 +13,21 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <new>
 #include <sys/mman.h>
+#include <thread>
 
 namespace {
 
 using namespace pa_scheduler;
 
-static_assert(
-    kSharedInsertTurnGroups ==
-        static_cast<uint32_t>(
-            PTO_FDWIC_SHARED_INSERT_TURN_GROUPS
-        ),
-    "shared insert-turn test compiled with inconsistent G"
-);
-static_assert(
-    kSharedInsertTurnCapacity == 8,
-    "shared insert-turn test expects eight physical lines"
-);
+static_assert(kSharedInsertTurnCapacity == 128, "completion-chain test expects the full legacy sidecar");
+
+constexpr uint32_t kSequentialTasks = 260;
+using LegacyTurnSnapshot = std::array<int64_t, kSharedInsertTurnCapacity>;
 
 int g_failures = 0;
 
@@ -40,442 +35,446 @@ void Check(bool condition, const char *message) {
     if (condition) {
         return;
     }
-    std::fprintf(
-        stderr, "[FAIL] shared insert turn G=%u: %s\n",
-        kSharedInsertTurnGroups, message
-    );
+    std::fprintf(stderr, "[FAIL] shared per-task insert completion: %s\n", message);
     ++g_failures;
 }
 
-void CheckLaneValue(
-    int64_t actual, int64_t expected, uint32_t lane,
-    const char *stage
-) {
-    if (actual == expected) {
-        return;
+struct CompletionTestOps {
+    static constexpr bool kAtomicReturnReadyObserved = false;
+    static inline SchedulerState *observed_state = nullptr;
+    static inline std::atomic<uint64_t> load_calls{0};
+    static inline std::atomic<uint64_t> cas_calls{0};
+    static inline std::atomic<uint64_t> legacy_turn_touches{0};
+    static inline std::atomic<uintptr_t> last_load_address{0};
+    static inline std::atomic<uintptr_t> last_cas_address{0};
+
+    static bool IsLegacyTurnAddress(const volatile int64_t *address) {
+        if (observed_state == nullptr) {
+            return false;
+        }
+        for (uint32_t lane = 0; lane < kSharedInsertTurnCapacity; ++lane) {
+            if (address == &SharedInsertTurnLine(observed_state->shared_map, lane).value) {
+                return true;
+            }
+        }
+        return false;
     }
-    std::fprintf(
-        stderr,
-        "[FAIL] shared insert turn G=%u: %s lane=%u "
-        "actual=%lld expected=%lld\n",
-        kSharedInsertTurnGroups, stage, lane,
-        static_cast<long long>(actual),
-        static_cast<long long>(expected)
-    );
-    ++g_failures;
-}
 
-// 这里只模拟生产 helper 所需的 acquire load 与 CAS；测试不涉及
-// TensorMap payload，也不把宿主原子内存序冒充为 A5 DCache 证据。
-struct TurnTestOps {
+    static int32_t Load(volatile int32_t *address) {
+        return __atomic_fetch_add(address, static_cast<int32_t>(0), __ATOMIC_ACQUIRE);
+    }
+
     static int64_t Load(volatile int64_t *address) {
-        return __atomic_load_n(address, __ATOMIC_ACQUIRE);
+        load_calls.fetch_add(1, std::memory_order_relaxed);
+        last_load_address.store(reinterpret_cast<uintptr_t>(address), std::memory_order_relaxed);
+        if (IsLegacyTurnAddress(address)) {
+            legacy_turn_touches.fetch_add(1, std::memory_order_relaxed);
+        }
+        return __atomic_fetch_add(address, static_cast<int64_t>(0), __ATOMIC_ACQUIRE);
     }
 
-    static int64_t CompareExchange(
-        volatile int64_t *address, int64_t expected,
-        int64_t desired
-    ) {
+    static int32_t Exchange(volatile int32_t *address, int32_t value) {
+        return __atomic_exchange_n(address, value, __ATOMIC_ACQ_REL);
+    }
+
+    static int64_t Exchange(volatile int64_t *address, int64_t value) {
+        return __atomic_exchange_n(address, value, __ATOMIC_ACQ_REL);
+    }
+
+    static uint64_t Exchange(volatile uint64_t *address, uint64_t value) {
+        return __atomic_exchange_n(address, value, __ATOMIC_ACQ_REL);
+    }
+
+    static int64_t CompareExchange(volatile int64_t *address, int64_t expected, int64_t desired) {
+        cas_calls.fetch_add(1, std::memory_order_relaxed);
+        last_cas_address.store(reinterpret_cast<uintptr_t>(address), std::memory_order_relaxed);
+        if (IsLegacyTurnAddress(address)) {
+            legacy_turn_touches.fetch_add(1, std::memory_order_relaxed);
+        }
         int64_t observed = expected;
-        (void)__atomic_compare_exchange_n(
-            address, &observed, desired, false,
-            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE
-        );
+        (void)__atomic_compare_exchange_n(address, &observed, desired, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
         return observed;
+    }
+
+    static int64_t FetchMax(volatile int64_t *address, int64_t value, uint64_t &retries) {
+        int64_t current = __atomic_load_n(address, __ATOMIC_ACQUIRE);
+        retries = 0;
+        while (value > current) {
+            if (__atomic_compare_exchange_n(address, &current, value, true, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                break;
+            }
+            ++retries;
+        }
+        return current;
+    }
+
+    static void StoreBarrier() { std::atomic_thread_fence(std::memory_order_seq_cst); }
+
+    static void FlushRegion(void *, uint64_t) { StoreBarrier(); }
+
+    static void InvalidateRegion(const void *, uint64_t) { StoreBarrier(); }
+
+    static uint64_t Now() {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count()
+        );
+    }
+
+    template <typename T>
+    static uint64_t NowAfterAtomicResult(T value) {
+        asm volatile("" : "+r"(value));
+        return Now();
+    }
+
+    static void SpinHint() { std::this_thread::yield(); }
+
+    static void ResetTrace(SchedulerState &state) {
+        observed_state = &state;
+        load_calls.store(0, std::memory_order_relaxed);
+        cas_calls.store(0, std::memory_order_relaxed);
+        legacy_turn_touches.store(0, std::memory_order_relaxed);
+        last_load_address.store(0, std::memory_order_relaxed);
+        last_cas_address.store(0, std::memory_order_relaxed);
     }
 };
 
-using TurnVector =
-    std::array<int64_t, kSharedInsertTurnCapacity>;
-
-SharedTensorMapSidecar *AllocateMap() {
+SchedulerState *MapSparseSchedulerState() {
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #ifdef MAP_NORESERVE
     flags |= MAP_NORESERVE;
 #endif
-    void *memory = mmap(
-        nullptr, sizeof(SharedTensorMapSidecar),
-        PROT_READ | PROT_WRITE, flags, -1, 0
-    );
+    void *memory = mmap(nullptr, sizeof(SchedulerState), PROT_READ | PROT_WRITE, flags, -1, 0);
     if (memory == MAP_FAILED) {
-        std::perror("mmap SharedTensorMapSidecar");
+        std::perror("mmap SchedulerState");
         return nullptr;
     }
-    return ::new (memory) SharedTensorMapSidecar;
+    return ::new (memory) SchedulerState;
 }
 
-void FreeMap(SharedTensorMapSidecar *map) {
-    if (map == nullptr) {
-        return;
+void UnmapSparseSchedulerState(SchedulerState *state) {
+    if (state != nullptr) {
+        (void)munmap(state, sizeof(*state));
     }
-    map->~SharedTensorMapSidecar();
-    (void)munmap(map, sizeof(SharedTensorMapSidecar));
 }
 
-int64_t LoadLane(
-    SharedTensorMapSidecar &map, uint32_t lane
-) {
-    return TurnTestOps::Load(
-        &SharedInsertTurnLine(map, lane).value
-    );
-}
-
-void StoreLane(
-    SharedTensorMapSidecar &map, uint32_t lane,
-    int64_t value
-) {
-    __atomic_store_n(
-        &SharedInsertTurnLine(map, lane).value,
-        value, __ATOMIC_RELEASE
-    );
-}
-
-TurnVector SnapshotTurns(SharedTensorMapSidecar &map) {
-    TurnVector snapshot{};
-    for (uint32_t lane = 0;
-         lane < kSharedInsertTurnCapacity; ++lane) {
-        snapshot[lane] = LoadLane(map, lane);
+LegacyTurnSnapshot SeedLegacyTurns(SchedulerState &state) {
+    LegacyTurnSnapshot snapshot{};
+    for (uint32_t lane = 0; lane < kSharedInsertTurnCapacity; ++lane) {
+        snapshot[lane] = -10000 - static_cast<int64_t>(lane);
+        SharedInsertTurnLine(state.shared_map, lane).value = snapshot[lane];
     }
     return snapshot;
 }
 
-void ExpectNoChange(
-    SharedTensorMapSidecar &map,
-    const TurnVector &before, const char *stage
-) {
-    const TurnVector after = SnapshotTurns(map);
-    for (uint32_t lane = 0;
-         lane < kSharedInsertTurnCapacity; ++lane) {
-        CheckLaneValue(
-            after[lane], before[lane], lane, stage
-        );
-    }
-}
-
-// 独立 oracle 不调用生产终态公式：active lane 保存不大于 T 的最大
-// 同余 token；尚未接收 token 的 lane 以及 inactive lane 都是 -1。
-int64_t ExpectedTokenAfterTasks(
-    uint32_t completed_tasks, uint32_t lane
-) {
-    if (lane >= kSharedInsertTurnGroups) {
-        return -1;
-    }
-    if (lane > completed_tasks) {
-        return lane == 0 ? 0 : -1;
-    }
-    const uint32_t distance =
-        (completed_tasks - lane) %
-        kSharedInsertTurnGroups;
-    return static_cast<int64_t>(
-        completed_tasks - distance
-    );
-}
-
-void ExpectTurnVector(
-    SharedTensorMapSidecar &map,
-    uint32_t completed_tasks, const char *stage
-) {
-    for (uint32_t lane = 0;
-         lane < kSharedInsertTurnCapacity; ++lane) {
-        const int64_t expected =
-            ExpectedTokenAfterTasks(completed_tasks, lane);
-        CheckLaneValue(
-            LoadLane(map, lane), expected, lane, stage
-        );
-        CheckLaneValue(
-            SharedInsertTurnTokenAfterTasks(
-                completed_tasks, lane
-            ),
-            expected, lane, "生产终态公式"
-        );
-    }
-}
-
-void TestInitialization(SharedTensorMapSidecar &map) {
-    // 先写入脏值，防止 mmap 的零页偶然掩盖未初始化的 extra lane。
-    for (uint32_t lane = 0;
-         lane < kSharedInsertTurnCapacity; ++lane) {
-        StoreLane(
-            map, lane,
-            static_cast<int64_t>(100U + lane)
-        );
-    }
-    InitializeSharedInsertTurns(map);
-    ExpectTurnVector(map, 0, "初始化");
-    Check(
-        SharedInspectTaskTurn<TurnTestOps>(map, 0) ==
-            SharedInsertTurnState::Ready,
-        "初始化后 task 0 应拿到 exact turn"
-    );
-    Check(
-        SharedInspectTaskTurn<TurnTestOps>(map, 1) ==
-            SharedInsertTurnState::Pending,
-        "初始化后的 future task 应处于 pending"
-    );
-}
-
-void TestRolloverAndFinalVector(
-    SharedTensorMapSidecar &map
-) {
-    InitializeSharedInsertTurns(map);
-    const int32_t last_task =
-        static_cast<int32_t>(
-            2U * kSharedInsertTurnGroups + 2U
-        );
-
-    for (int32_t task = 0; task <= last_task; ++task) {
-        Check(
-            SharedInspectTaskTurn<TurnTestOps>(
-                map, task
-            ) == SharedInsertTurnState::Ready,
-            "顺序 task 发布前必须拿到 exact turn"
-        );
-        Check(
-            SharedCanPublishTaskCommit<TurnTestOps>(
-                map, task
-            ),
-            "顺序 task 的 target lane 预检应成功"
-        );
-
-        const TurnVector before = SnapshotTurns(map);
-        const int32_t next = task + 1;
-        const uint32_t target_lane =
-            SharedInsertTurnLane(next);
-        CheckLaneValue(
-            before[target_lane],
-            SharedInsertTurnPublishExpectedOld(task),
-            target_lane, "发布前 expected_old"
-        );
-        Check(
-            SharedPublishTaskCommit<TurnTestOps>(
-                map, task
-            ),
-            "顺序 task 发布失败"
-        );
-
-        const TurnVector after = SnapshotTurns(map);
-        for (uint32_t lane = 0;
-             lane < kSharedInsertTurnCapacity; ++lane) {
-            const int64_t expected =
-                lane == target_lane
-                    ? static_cast<int64_t>(next)
-                    : before[lane];
-            CheckLaneValue(
-                after[lane], expected, lane,
-                "每步只能修改 next token 的目标 lane"
-            );
+bool LegacyTurnsMatch(const SchedulerState &state, const LegacyTurnSnapshot &snapshot) {
+    for (uint32_t lane = 0; lane < kSharedInsertTurnCapacity; ++lane) {
+        const volatile int64_t *address =
+            &SharedInsertTurnLine(const_cast<SharedTensorMapSidecar &>(state.shared_map), lane).value;
+        if (__atomic_load_n(address, __ATOMIC_ACQUIRE) != snapshot[lane]) {
+            return false;
         }
-        ExpectTurnVector(
-            map, static_cast<uint32_t>(next),
-            "逐步 rollover"
-        );
+    }
+    return true;
+}
 
-        // G>1 时 current token 可能仍留在原 lane，不能仅凭 exact
-        // current 判断重复调用；target-lane preflight 必须拒绝它。
-        const TurnVector completed = SnapshotTurns(map);
-        Check(
-            !SharedCanPublishTaskCommit<TurnTestOps>(
-                map, task
-            ),
-            "重复 task 的 target-lane 预检必须失败"
+void ResetCompletionWords(SchedulerState &state, uint32_t count) {
+    state.fatal.value = 0;
+    for (uint32_t task = 0; task < count; ++task) {
+        state.tasks[task].deps_prepared = -1;
+    }
+}
+
+bool AddressEquals(uintptr_t observed, volatile int64_t *expected) {
+    return observed == reinterpret_cast<uintptr_t>(expected);
+}
+
+void TestSequentialCompletionChain(SchedulerState &state) {
+    ResetCompletionWords(state, kSequentialTasks + 1U);
+    const LegacyTurnSnapshot legacy = SeedLegacyTurns(state);
+    bool exact = true;
+
+    for (uint32_t task = 0; task < kSequentialTasks; ++task) {
+        CompletionTestOps::ResetTrace(state);
+        LocalStats wait_stats{};
+        int64_t ready_observed = INT64_MIN;
+        uint64_t load_count = UINT64_MAX;
+        const bool ready = WaitForSharedTaskInsertTurn<CompletionTestOps>(
+            &state, static_cast<int32_t>(task), wait_stats, ready_observed, load_count
         );
-        Check(
-            !SharedPublishTaskCommit<TurnTestOps>(
-                map, task
-            ),
-            "重复 task 不得再次发布"
+        exact &= ready && state.fatal.value == 0;
+        if (task == 0) {
+            exact &= ready_observed == -1 && load_count == 0 &&
+                     CompletionTestOps::load_calls.load(std::memory_order_relaxed) == 0;
+        } else {
+            exact &= ready_observed == static_cast<int64_t>(task - 1U) && load_count == 1 &&
+                     CompletionTestOps::load_calls.load(std::memory_order_relaxed) == 1 &&
+                     AddressEquals(
+                         CompletionTestOps::last_load_address.load(std::memory_order_relaxed),
+                         &state.tasks[task - 1U].deps_prepared
+                     );
+        }
+        exact &= CompletionTestOps::cas_calls.load(std::memory_order_relaxed) == 0 &&
+                 CompletionTestOps::legacy_turn_touches.load(std::memory_order_relaxed) == 0;
+
+        CompletionTestOps::ResetTrace(state);
+        LocalStats publish_stats{};
+        int64_t cas_observed = INT64_MIN;
+        const bool published = HandoffSharedTaskInsertTurn<CompletionTestOps>(
+            &state, static_cast<int32_t>(task), publish_stats, cas_observed
         );
-        ExpectNoChange(
-            map, completed, "重复 task 失败后状态"
-        );
+        exact &=
+            published && cas_observed == -1 && state.tasks[task].deps_prepared == static_cast<int64_t>(task) &&
+            CompletionTestOps::cas_calls.load(std::memory_order_relaxed) == 1 &&
+            AddressEquals(
+                CompletionTestOps::last_cas_address.load(std::memory_order_relaxed), &state.tasks[task].deps_prepared
+            ) &&
+            CompletionTestOps::legacy_turn_touches.load(std::memory_order_relaxed) == 0 &&
+            LegacyTurnsMatch(state, legacy);
     }
 
-    ExpectTurnVector(
-        map, static_cast<uint32_t>(last_task + 1),
-        "0..2G+2 发布后的最终向量"
+    for (uint32_t task = 0; task < kSequentialTasks; ++task) {
+        exact &= state.tasks[task].deps_prepared == static_cast<int64_t>(task);
+    }
+    exact &= state.tasks[kSequentialTasks].deps_prepared == -1;
+    Check(
+        exact, "task 0 skips predecessor; every N waits only N-1, "
+               "publishes only N, and never touches legacy turns"
     );
 }
 
-void TestFuturePending(SharedTensorMapSidecar &map) {
-    InitializeSharedInsertTurns(map);
-    const TurnVector before = SnapshotTurns(map);
+void TestPendingOwnerWakesOnPredecessor(SchedulerState &state) {
+    ResetCompletionWords(state, 2);
+    const LegacyTurnSnapshot legacy = SeedLegacyTurns(state);
+    CompletionTestOps::ResetTrace(state);
+    std::atomic<bool> wait_finished{false};
+    bool wait_ok = false;
+    int64_t ready_observed = INT64_MIN;
+    uint64_t load_count = 0;
+    LocalStats wait_stats{};
+    std::thread waiter([&]() {
+        wait_ok = WaitForSharedTaskInsertTurn<CompletionTestOps>(&state, 1, wait_stats, ready_observed, load_count);
+        wait_finished.store(true, std::memory_order_release);
+    });
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (CompletionTestOps::load_calls.load(std::memory_order_acquire) == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    const bool observed_pending = CompletionTestOps::load_calls.load(std::memory_order_acquire) != 0 &&
+                                  !wait_finished.load(std::memory_order_acquire);
+
+    LocalStats publish_stats{};
+    int64_t cas_observed = INT64_MIN;
+    const bool published = HandoffSharedTaskInsertTurn<CompletionTestOps>(&state, 0, publish_stats, cas_observed);
+    waiter.join();
+
     Check(
-        SharedInspectTaskTurn<TurnTestOps>(map, 1) ==
-            SharedInsertTurnState::Pending,
-        "尚未轮到的 task 1 应返回 pending"
+        observed_pending && published && cas_observed == -1 && wait_ok && ready_observed == 0 && load_count >= 2 &&
+            state.tasks[0].deps_prepared == 0 && state.tasks[1].deps_prepared == -1 && state.fatal.value == 0 &&
+            CompletionTestOps::legacy_turn_touches.load(std::memory_order_relaxed) == 0 &&
+            LegacyTurnsMatch(state, legacy),
+        "task 1 remains pending until task 0 publishes its "
+        "per-task completion word"
     );
-    Check(
-        !SharedCanPublishTaskCommit<TurnTestOps>(map, 1),
-        "future task 不得通过发布预检"
-    );
-    Check(
-        !SharedPublishTaskCommit<TurnTestOps>(map, 1),
-        "future task 不得修改 token"
-    );
-    ExpectNoChange(map, before, "future pending");
 }
 
-void TestProtocolErrors(SharedTensorMapSidecar &map) {
-    InitializeSharedInsertTurns(map);
-    TurnVector before = SnapshotTurns(map);
-    Check(
-        SharedInspectTaskTurn<TurnTestOps>(map, -1) ==
-            SharedInsertTurnState::ProtocolError,
-        "负 task id 必须报告协议错误"
-    );
-    Check(
-        !SharedPublishTaskCommit<TurnTestOps>(map, -1),
-        "负 task id 不得发布"
-    );
-    ExpectNoChange(map, before, "负 task id");
+void TestEmptyWriterStillCompletes(SchedulerState &state) {
+    ResetCompletionWords(state, 2);
+    const LegacyTurnSnapshot legacy = SeedLegacyTurns(state);
+    bool exact = true;
 
-    // -1 仅允许尚未接收首个 token 的非零 lane；-2 在任何 lane
-    // 都是损坏值，不能被当作“前序尚未完成”继续等待。
-    InitializeSharedInsertTurns(map);
-    StoreLane(map, 0, -2);
-    before = SnapshotTurns(map);
-    Check(
-        SharedInspectTaskTurn<TurnTestOps>(map, 0) ==
-            SharedInsertTurnState::ProtocolError,
-        "非法负 token 必须报告协议错误"
-    );
-    Check(
-        !SharedPublishTaskCommit<TurnTestOps>(map, 0),
-        "非法负 token 不得发布"
-    );
-    ExpectNoChange(map, before, "非法负 token");
-
-    // G=1 只有一个同余类，不存在“非负但 residue 错误”的 token；
-    // G>1 显式把 lane 1 写成属于 lane 0 的 token 0。
-    if (kSharedInsertTurnGroups > 1U) {
-        InitializeSharedInsertTurns(map);
-        StoreLane(map, 1, 0);
-        before = SnapshotTurns(map);
-        Check(
-            SharedInspectTaskTurn<TurnTestOps>(map, 1) ==
-                SharedInsertTurnState::ProtocolError,
-            "错误 residue 必须报告协议错误"
-        );
-        Check(
-            !SharedPublishTaskCommit<TurnTestOps>(map, 1),
-            "错误 residue 不得发布"
-        );
-        ExpectNoChange(map, before, "错误 residue");
+    for (int32_t task = 0; task < 2; ++task) {
+        TaskArgs args;
+        ConstructTaskArgs(args);
+        SubmitContext context{};
+        context.task_id = task;
+        context.won = true;
+        context.result.task_id = task;
+        context.shared_result.Reset(task);
+        SharedTaskWriterDelta delta{};
+        LocalStats stats{};
+        CompletionTestOps::ResetTrace(state);
+        exact &= PrepareSharedTaskWriterDelta(args, context, delta) && delta.ordinary_count == 0 &&
+                 !delta.writer_intent_required &&
+                 PublishSharedTaskWriterDelta<CompletionTestOps>(&state, args, context, delta, stats) &&
+                 state.tasks[static_cast<uint32_t>(task)].deps_prepared == task &&
+                 CompletionTestOps::cas_calls.load(std::memory_order_relaxed) == 1 &&
+                 AddressEquals(
+                     CompletionTestOps::last_cas_address.load(std::memory_order_relaxed),
+                     &state.tasks[static_cast<uint32_t>(task)].deps_prepared
+                 ) &&
+                 CompletionTestOps::legacy_turn_touches.load(std::memory_order_relaxed) == 0;
     }
 
-    // 同余关系正确但 token 已经超过查询 task，也不是 pending。
-    InitializeSharedInsertTurns(map);
-    const uint32_t future_lane =
-        SharedInsertTurnLane(1);
-    StoreLane(
-        map, future_lane,
-        static_cast<int64_t>(
-            1U + kSharedInsertTurnGroups
-        )
-    );
-    before = SnapshotTurns(map);
     Check(
-        SharedInspectTaskTurn<TurnTestOps>(map, 1) ==
-            SharedInsertTurnState::ProtocolError,
-        "超过 current task 的 future token 必须报告协议错误"
+        exact && state.fatal.value == 0 && LegacyTurnsMatch(state, legacy),
+        "empty metadata transactions still publish one "
+        "completion per task without a sidecar baton"
     );
-    Check(
-        !SharedPublishTaskCommit<TurnTestOps>(map, 1),
-        "future token 损坏状态不得发布"
-    );
-    ExpectNoChange(map, before, "future token 损坏状态");
 }
 
-void TestTargetExpectedOldMismatch(
-    SharedTensorMapSidecar &map
+void TestOutputsPublishBeforePredecessorWait(
+    SchedulerState &state
 ) {
-    InitializeSharedInsertTurns(map);
-    const int32_t task = 0;
-    const int32_t next = task + 1;
-    const uint32_t target_lane =
-        SharedInsertTurnLane(next);
+    ResetCompletionWords(state, 2);
+    const LegacyTurnSnapshot legacy = SeedLegacyTurns(state);
+    SharedOutputCell &cell = state.shared_map.shared_outputs[1];
+    cell.published[0].value = -1;
+    cell.last_writer[0].value = -1;
+    TensorDesc descriptor{};
+    descriptor.buffer_addr = 0x510000000ULL;
+    descriptor.ndims = 1;
+    descriptor.shapes[0] = 16;
+    descriptor.strides[0] = 1;
 
-    // 把 target lane 提前写成 desired next，稳定制造 expected_old
-    // 不匹配。G=1 时 current 与 target 是同一物理线，因此直接调用
-    // AfterPreflight 才能隔离验证最终 CAS 仍然 fail-closed。
-    StoreLane(map, target_lane, next);
-    const TurnVector before = SnapshotTurns(map);
+    TaskArgs args;
+    ConstructTaskArgs(args);
+    SubmitContext context{};
+    context.task_id = 1;
+    context.won = true;
+    context.result.task_id = 1;
+    context.result.count = 1;
+    context.result.tensors[0] = &descriptor;
+    context.shared_result.Reset(1);
+    const bool output_ref_ok =
+        context.shared_result.AddOutputRef(1, 0);
+    SharedTaskWriterDelta delta{};
+    const bool delta_ok =
+        PrepareSharedTaskWriterDelta(args, context, delta);
+
+    CompletionTestOps::ResetTrace(state);
+    std::atomic<bool> publish_finished{false};
+    bool publish_ok = false;
+    LocalStats task_stats{};
+    std::thread owner([&]() {
+        publish_ok =
+            PublishSharedTaskWriterDelta<CompletionTestOps>(
+                &state, args, context, delta, task_stats
+            );
+        publish_finished.store(true, std::memory_order_release);
+    });
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (
+        __atomic_load_n(
+            &cell.published[0].value, __ATOMIC_ACQUIRE
+        ) != 1 &&
+        std::chrono::steady_clock::now() < deadline
+    ) {
+        std::this_thread::yield();
+    }
+    const bool visible_before_turn =
+        __atomic_load_n(
+            &cell.published[0].value, __ATOMIC_ACQUIRE
+        ) == 1 &&
+        __atomic_load_n(
+            &state.tasks[1].deps_prepared, __ATOMIC_ACQUIRE
+        ) == -1 &&
+        !publish_finished.load(std::memory_order_acquire);
+
+    LocalStats predecessor_stats{};
+    int64_t predecessor_observed = INT64_MIN;
+    const bool predecessor_published =
+        HandoffSharedTaskInsertTurn<CompletionTestOps>(
+            &state, 0, predecessor_stats,
+            predecessor_observed
+        );
+    owner.join();
+
     Check(
-        !SharedCanPublishTaskCommit<TurnTestOps>(
-            map, task
-        ),
-        "target expected_old 不符时预检必须失败"
-    );
-    Check(
-        !SharedPublishTaskCommitAfterPreflight<TurnTestOps>(
-            map, task
-        ),
-        "target expected_old 不符时 CAS 必须失败"
-    );
-    Check(
-        !SharedPublishTaskCommit<TurnTestOps>(
-            map, task
-        ),
-        "target expected_old 不符时完整发布必须失败"
-    );
-    ExpectNoChange(
-        map, before, "target expected_old 不符"
+        output_ref_ok && delta_ok && visible_before_turn &&
+            predecessor_published &&
+            predecessor_observed == -1 && publish_ok &&
+            state.fatal.value == 0 &&
+            state.tasks[0].deps_prepared == 0 &&
+            state.tasks[1].deps_prepared == 1 &&
+            cell.tensors[0].buffer_addr ==
+                descriptor.buffer_addr &&
+            LegacyTurnsMatch(state, legacy),
+        "fresh output is visible while task 1 still waits for task 0, "
+        "and deps_prepared closes only after serialized metadata"
     );
 }
 
-void TestRepeatedTask(SharedTensorMapSidecar &map) {
-    InitializeSharedInsertTurns(map);
+void TestCorruptionAndDuplicateFailClosed(SchedulerState &state) {
+    bool exact = true;
+
+    ResetCompletionWords(state, 5);
+    LegacyTurnSnapshot legacy = SeedLegacyTurns(state);
+    state.tasks[2].deps_prepared = -2;
+    CompletionTestOps::ResetTrace(state);
+    LocalStats corrupt_predecessor_stats{};
+    int64_t ready_observed = INT64_MIN;
+    uint64_t load_count = 0;
+    exact &= !WaitForSharedTaskInsertTurn<CompletionTestOps>(
+                 &state, 3, corrupt_predecessor_stats, ready_observed, load_count
+             ) &&
+             state.fatal.value == 1 && state.tasks[2].deps_prepared == -2 &&
+             CompletionTestOps::cas_calls.load(std::memory_order_relaxed) == 0 &&
+             CompletionTestOps::legacy_turn_touches.load(std::memory_order_relaxed) == 0 &&
+             LegacyTurnsMatch(state, legacy);
+
+    ResetCompletionWords(state, 2);
+    legacy = SeedLegacyTurns(state);
+    LocalStats first_stats{};
+    int64_t first_observed = INT64_MIN;
+    exact &=
+        HandoffSharedTaskInsertTurn<CompletionTestOps>(&state, 0, first_stats, first_observed) && first_observed == -1;
+    state.fatal.value = 0;
+    CompletionTestOps::ResetTrace(state);
+    LocalStats duplicate_stats{};
+    int64_t duplicate_observed = INT64_MIN;
+    exact &= !HandoffSharedTaskInsertTurn<CompletionTestOps>(&state, 0, duplicate_stats, duplicate_observed) &&
+             duplicate_observed == 0 && state.tasks[0].deps_prepared == 0 && state.fatal.value == 1 &&
+             CompletionTestOps::cas_calls.load(std::memory_order_relaxed) == 1 &&
+             CompletionTestOps::legacy_turn_touches.load(std::memory_order_relaxed) == 0 &&
+             LegacyTurnsMatch(state, legacy);
+
+    ResetCompletionWords(state, 2);
+    legacy = SeedLegacyTurns(state);
+    state.tasks[1].deps_prepared = 99;
+    CompletionTestOps::ResetTrace(state);
+    LocalStats bad_current_stats{};
+    int64_t bad_current_observed = INT64_MIN;
+    exact &= !HandoffSharedTaskInsertTurn<CompletionTestOps>(&state, 1, bad_current_stats, bad_current_observed) &&
+             bad_current_observed == 99 && state.tasks[1].deps_prepared == 99 && state.fatal.value == 1 &&
+             CompletionTestOps::cas_calls.load(std::memory_order_relaxed) == 1 &&
+             CompletionTestOps::legacy_turn_touches.load(std::memory_order_relaxed) == 0 &&
+             LegacyTurnsMatch(state, legacy);
+
     Check(
-        SharedPublishTaskCommit<TurnTestOps>(map, 0),
-        "重复发布测试的首次 task 0 发布失败"
+        exact, "corrupt predecessor, duplicate completion, and "
+               "unexpected current value all set fatal without overwrite"
     );
-    const TurnVector before = SnapshotTurns(map);
-    Check(
-        !SharedCanPublishTaskCommit<TurnTestOps>(map, 0),
-        "已完成 task 0 不得再次通过预检"
-    );
-    Check(
-        !SharedPublishTaskCommit<TurnTestOps>(map, 0),
-        "已完成 task 0 不得再次发布"
-    );
-    Check(
-        !SharedPublishTaskCommitAfterPreflight<TurnTestOps>(
-            map, 0
-        ),
-        "重复 task 即使绕过预检也不得覆盖 target lane"
-    );
-    ExpectNoChange(map, before, "重复 task");
 }
 
 }  // namespace
 
 int main() {
-    SharedTensorMapSidecar *map = AllocateMap();
-    if (map == nullptr) {
+    SchedulerState *state = MapSparseSchedulerState();
+    if (state == nullptr) {
         return 1;
     }
 
-    TestInitialization(*map);
-    TestRolloverAndFinalVector(*map);
-    TestFuturePending(*map);
-    TestProtocolErrors(*map);
-    TestTargetExpectedOldMismatch(*map);
-    TestRepeatedTask(*map);
+    TestSequentialCompletionChain(*state);
+    TestPendingOwnerWakesOnPredecessor(*state);
+    TestEmptyWriterStillCompletes(*state);
+    TestOutputsPublishBeforePredecessorWait(*state);
+    TestCorruptionAndDuplicateFailClosed(*state);
 
-    FreeMap(map);
+    UnmapSparseSchedulerState(state);
     if (g_failures != 0) {
         std::fprintf(
             stderr,
-            "[FAIL] shared insert-turn self-test G=%u: "
+            "[FAIL] shared per-task insert completion tests: "
             "%d failure(s)\n",
-            kSharedInsertTurnGroups, g_failures
+            g_failures
         );
         return 1;
     }
-    std::printf(
-        "[PASS] shared insert-turn initialization, rollover, "
-        "protocol-error, and final-vector tests G=%u\n",
-        kSharedInsertTurnGroups
-    );
+    std::printf("[PASS] shared per-task insert completion chain tests\n");
     return 0;
 }

@@ -136,10 +136,7 @@ PA_DEVICE bool PublishSharedTaskWriterMetadata(
     if (state == nullptr || !context.won || task_id < 0 ||
         task_id >= static_cast<int32_t>(kMaxTasks) ||
         delta.ordinary_count > kMaxTaskTensors ||
-        Ops::Load(&state->fatal.value) != 0 ||
-        !SharedCanPublishTaskCommit<Ops>(
-            state->shared_map, task_id
-        )) {
+        Ops::Load(&state->fatal.value) != 0) {
         if (state != nullptr) {
             SetFatal<Ops>(state, stats, task_id);
         }
@@ -191,14 +188,6 @@ PA_DEVICE bool PublishSharedTaskWriterMetadata(
         return false;
     }
     stats.result.map_inserts += delta.ordinary_count;
-
-    if (!PublishSharedTaskOutputs<Ops>(
-            state->shared_map, context,
-            static_cast<uint32_t>(task_id)
-        )) {
-        SetFatal<Ops>(state, stats, task_id);
-        return false;
-    }
     return true;
 }
 
@@ -213,16 +202,58 @@ PA_DEVICE bool HandoffSharedTaskInsertTurn(
         return false;
     }
     // ordinary payload 的 DCCI、symbol history/latest 与 fresh descriptor
-    // 都必须先于 N->N+1 对其他 owner 可见。
+    // 都必须先于本 task 的插入完成字对 N+1 owner 可见。每个 task 使用
+    // 自己的 TaskCell，不再把一枚 baton 在 G 条 sidecar 线上轮换。
     Ops::StoreBarrier();
-    if (!SharedPublishTaskCommitAfterPreflightObserved<Ops>(
-            state->shared_map, task_id, cas_observed
-        )) {
+    cas_observed = Ops::CompareExchange(
+        &state->tasks[static_cast<uint32_t>(task_id)]
+             .deps_prepared,
+        static_cast<int64_t>(-1),
+        static_cast<int64_t>(task_id)
+    );
+    if (cas_observed != -1) {
         SetFatal<Ops>(state, stats, task_id);
         return false;
     }
     return true;
 }
+
+#if !PA_BUILD_TRACE_FREE
+template <typename Ops>
+PA_DEVICE bool TraceHandoffSharedTaskInsertTurn(
+    PA_GM SchedulerState *state, int32_t task_id, LocalStats &stats,
+    int64_t &cas_observed, uint64_t &cas_trace_begin,
+    uint64_t &cas_trace_end
+) {
+    cas_trace_begin = 0;
+    cas_trace_end = 0;
+    if (state == nullptr || task_id < 0 ||
+        task_id >= static_cast<int32_t>(kMaxTasks)) {
+        cas_observed = INT64_MIN;
+        return false;
+    }
+    Ops::StoreBarrier();
+    cas_observed = CaptureAtomicCompareExchange<Ops>(
+        stats.trace,
+        &state->tasks[static_cast<uint32_t>(task_id)]
+             .deps_prepared,
+        static_cast<int64_t>(-1),
+        static_cast<int64_t>(task_id),
+        cas_trace_begin, cas_trace_end
+    );
+    if (cas_observed != -1) {
+        SetFatal<Ops>(state, stats, task_id);
+        return false;
+    }
+    return true;
+}
+#endif
+
+template <typename Ops>
+PA_DEVICE bool WaitForSharedTaskInsertTurn(
+    PA_GM SchedulerState *state, int32_t task_id,
+    LocalStats &stats, int64_t &ready_observed
+);
 
 template <typename Ops>
 PA_DEVICE bool PublishSharedTaskWriterDelta(
@@ -230,42 +261,106 @@ PA_DEVICE bool PublishSharedTaskWriterDelta(
     const SubmitContext &context,
     const SharedTaskWriterDelta &delta, LocalStats &stats
 ) {
+    // fresh output cell 由本 task 的唯一 Claim winner 独占，不参与
+    // ordinary/symbol 的 task-ID 串行插入。先发布 descriptor，再等待
+    // predecessor；最终 deps_prepared handoff 仍同时封口两类发布。
+    if (state == nullptr || !context.won || context.task_id < 0 ||
+        context.task_id >= static_cast<int32_t>(kMaxTasks) ||
+        Ops::Load(&state->fatal.value) != 0 ||
+        !PublishSharedTaskOutputs<Ops>(
+            state->shared_map, context,
+            static_cast<uint32_t>(context.task_id)
+        )) {
+        if (state != nullptr) {
+            SetFatal<Ops>(state, stats, context.task_id);
+        }
+        return false;
+    }
+    // 隔离测试和复用调用必须走与正式 Submit 相同的资格门：task 0
+    // 直接进入，其余 task 只等待 N-1。Metadata helper 本身不再重复
+    // atomic load，避免正式热路径把一次前驱等待测成三次原子访问。
+    int64_t ignored_ready_observed = -1;
+    if (!WaitForSharedTaskInsertTurn<Ops>(
+            state, context.task_id, stats,
+            ignored_ready_observed
+        )) {
+        RollbackSharedTaskOutputs<Ops>(
+            state->shared_map.shared_outputs[
+                static_cast<uint32_t>(context.task_id)
+            ],
+            context.result.count
+        );
+        return false;
+    }
     if (!PublishSharedTaskWriterMetadata<Ops>(
             state, args, context, delta, stats
         )) {
+        RollbackSharedTaskOutputs<Ops>(
+            state->shared_map.shared_outputs[
+                static_cast<uint32_t>(context.task_id)
+            ],
+            context.result.count
+        );
         return false;
     }
     int64_t ignored_cas_observed = INT64_MIN;
-    return HandoffSharedTaskInsertTurn<Ops>(
+    const bool inserted = HandoffSharedTaskInsertTurn<Ops>(
         state, context.task_id, stats, ignored_cas_observed
     );
+    if (!inserted) {
+        RollbackSharedTaskOutputs<Ops>(
+            state->shared_map.shared_outputs[
+                static_cast<uint32_t>(context.task_id)
+            ],
+            context.result.count
+        );
+    }
+    return inserted;
 }
 
 template <typename Ops>
 PA_DEVICE bool WaitForSharedTaskInsertTurn(
     PA_GM SchedulerState *state, int32_t task_id, LocalStats &stats,
-    int64_t &ready_observed
+    int64_t &ready_observed, uint64_t &load_count
 ) {
     ready_observed = -1;
+    load_count = 0;
     if (state == nullptr || task_id < 0 ||
         task_id >= static_cast<int32_t>(kMaxTasks)) {
         return false;
     }
 
+    // task 0 没有前驱，直接进入有序插入段。它完成后仍必须把自己的
+    // deps_prepared 从 -1 发布为 0，供 task 1 建立真实跨核依赖。
+    if (task_id == 0) {
+        ready_observed = -1;
+        return true;
+    }
+
+    PA_GM volatile int64_t *predecessor =
+        &state->tasks[static_cast<uint32_t>(task_id - 1)]
+             .deps_prepared;
     const uint64_t begin = Ops::Now();
     uint32_t polls = 0;
     while (true) {
-        int64_t observed = -1;
-        const SharedInsertTurnState turn_state =
-            SharedInspectTaskTurnObserved<Ops, true>(
-                state->shared_map, task_id, observed
-            );
-        if (turn_state == SharedInsertTurnState::Ready) {
-            ready_observed = observed;
+        const int64_t observed = Ops::Load(predecessor);
+        int64_t compare_observed = observed;
+        int64_t dependency_observed = observed;
+#if PA_BUILD_SWIMLANE && \
+    (defined(PA_BUILD_AIC) || defined(PA_BUILD_AIV))
+        // 分支判定和 SYS_CNT 依赖边界从同一个 atomic 返回寄存器派生，
+        // 防止 CCEC 在 ready 分支把 ready_observed 常量折叠掉。
+        compare_observed = Ops::ForkAtomicResultForBranch(
+            observed, dependency_observed
+        );
+#endif
+        if (compare_observed ==
+            static_cast<int64_t>(task_id - 1)) {
+            ready_observed = dependency_observed;
+            load_count = static_cast<uint64_t>(polls) + 1;
             return true;
         }
-        if (turn_state ==
-            SharedInsertTurnState::ProtocolError) {
+        if (compare_observed != -1) {
             SetFatal<Ops>(state, stats, task_id);
             return false;
         }
@@ -283,6 +378,18 @@ PA_DEVICE bool WaitForSharedTaskInsertTurn(
             return false;
         }
     }
+}
+
+template <typename Ops>
+PA_DEVICE bool WaitForSharedTaskInsertTurn(
+    PA_GM SchedulerState *state, int32_t task_id, LocalStats &stats,
+    int64_t &ready_observed
+) {
+    uint64_t ignored_load_count = 0;
+    return WaitForSharedTaskInsertTurn<Ops>(
+        state, task_id, stats, ready_observed,
+        ignored_load_count
+    );
 }
 
 template <typename Ops>
@@ -353,34 +460,58 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
+#if PA_BUILD_TRACE_FREE
+    const bool task_outputs_published =
+        PublishSharedTaskOutputs<Ops>(
+            state->shared_map, context, task_id
+        );
+#else
+    uint64_t task_outputs_begin =
+        TraceTimestamp<Ops>(stats.trace, stats.result);
+    uint64_t task_outputs_copy_begin = task_outputs_begin;
+    uint64_t task_outputs_copy_end = task_outputs_begin;
+    uint64_t task_outputs_flush_begin = task_outputs_begin;
+    uint64_t task_outputs_flush_end = task_outputs_begin;
+    const bool task_outputs_published =
+        PublishSharedTaskOutputs<Ops>(
+            state->shared_map, context, task_id, &stats,
+            &task_outputs_copy_begin, &task_outputs_copy_end,
+            &task_outputs_flush_begin, &task_outputs_flush_end
+        );
+    const uint64_t task_outputs_end =
+        TraceTimestamp<Ops>(stats.trace, stats.result);
+#endif
+    if (!task_outputs_published) {
+        EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(
+            pmu_context
+        );
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
     EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(
         pmu_context
     );
     const uint64_t materialize_end =
         TraceTimestamp<Ops>(stats.trace, stats.result);
-    WriteTrace<Profile>(
-        stats.trace, stats.result, static_cast<int32_t>(task_id),
-        function_id, TracePhase::Materialize,
-        ProfilePhase::Materialize, materialize_begin,
-        materialize_end, 0,
-        kind == TaskKind::Alloc ? 1U : 0U
-    );
 
-    // 仅这一段全局串行：等 N-1 的 writer 元数据发布完，插入 N 的
-    // ordinary/symbol/fresh-output 元数据，再把前沿从 N 推到 N+1。
-    // 空写集合也必须推进，loser 完全不参与。
+    // 仅这一段全局串行：N>0 只等待 task[N-1].deps_prepared，随后插入
+    // N 的 ordinary/symbol writer 元数据，再发布 task[N].deps_prepared。
+    // fresh output descriptor 已在 Materialize 尾部按 task-cell 独占发布；
+    // 空 writer 集合也必须推进，loser 完全不参与。
     const uint64_t register_begin = materialize_end;
     BeginSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(
         pmu_context
     );
     int64_t ready_observed = -1;
+    uint64_t insert_turn_load_count = 0;
     const bool turn_ready = WaitForSharedTaskInsertTurn<Ops>(
         state, static_cast<int32_t>(task_id), stats,
-        ready_observed
+        ready_observed, insert_turn_load_count
     );
     // wait_end 对最后一次返回 Ready 的 atomic Load 建立数据依赖。只在
     // swimlane 构建读取 SYS_CNT；trace-free 的 PMU/性能构建预处理后为 0。
-    const uint64_t metadata_begin = turn_ready
+    const uint64_t metadata_begin =
+        turn_ready && insert_turn_load_count != 0
         ? TraceTimestampAfterAtomicResult<Ops>(
               stats.trace, stats.result, ready_observed
           )
@@ -395,14 +526,26 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         : metadata_begin;
 
     int64_t cas_observed = INT64_MIN;
+#if PA_BUILD_TRACE_FREE
     const bool inserted =
         metadata_published &&
         HandoffSharedTaskInsertTurn<Ops>(
             state, static_cast<int32_t>(task_id), stats,
             cas_observed
         );
-    // 正常路径的父区间终点依赖 CAS 返回值，表示本核已经取得 N->N+1
-    // handoff 的返回结果；不加 DSB，也不把它解释成跨核全局可见时刻。
+#else
+    uint64_t cas_trace_begin = 0;
+    uint64_t cas_trace_end = 0;
+    const bool inserted =
+        metadata_published &&
+        TraceHandoffSharedTaskInsertTurn<Ops>(
+            state, static_cast<int32_t>(task_id), stats,
+            cas_observed, cas_trace_begin, cas_trace_end
+        );
+#endif
+    // 正常路径的父区间终点依赖 CAS 返回值，表示本核已经取得
+    // task[N].deps_prepared 的发布结果；不加 DSB，也不把它解释成
+    // N+1 已经完成读取的时刻。
     const uint64_t register_end = metadata_published
         ? TraceTimestampAfterAtomicResult<Ops>(
               stats.trace, stats.result, cas_observed
@@ -411,8 +554,42 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     EndSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(
         pmu_context
     );
-    // raw 顺序保持父记录在前。唯一 detail 的两个端点把 Register 离线
-    // 拆成 wait / metadata publish / handoff 三段，不逐 poll 扩张记录。
+    // 所有端点完成后再按业务顺序写 raw，避免写 trace 本身落入
+    // Materialize/Register 的测量区间。Materialize 的 output detail
+    // 还原独占 cell 发布；Register 只闭合 wait、writer metadata 与
+    // handoff，不逐 poll 扩张记录。
+    WriteTrace<Profile>(
+        stats.trace, stats.result, static_cast<int32_t>(task_id),
+        function_id, TracePhase::Materialize,
+        ProfilePhase::Materialize, materialize_begin,
+        materialize_end, 0,
+        kind == TaskKind::Alloc ? 1U : 0U
+    );
+#if !PA_BUILD_TRACE_FREE
+    if (task_outputs_published) {
+        WriteTrace<false>(
+            stats.trace, stats.result,
+            static_cast<int32_t>(task_id), function_id,
+            TracePhase::SharedMaterializePublishTaskOutputs,
+            ProfilePhase::Materialize, task_outputs_begin,
+            task_outputs_end
+        );
+        WriteTrace<false>(
+            stats.trace, stats.result,
+            static_cast<int32_t>(task_id), function_id,
+            TracePhase::SharedMaterializePublishTaskOutputsCopy,
+            ProfilePhase::Materialize, task_outputs_copy_begin,
+            task_outputs_copy_end
+        );
+        WriteTrace<false>(
+            stats.trace, stats.result,
+            static_cast<int32_t>(task_id), function_id,
+            TracePhase::SharedMaterializePublishTaskOutputsFlush,
+            ProfilePhase::Materialize, task_outputs_flush_begin,
+            task_outputs_flush_end
+        );
+    }
+#endif
     WriteTrace<Profile>(
         stats.trace, stats.result, static_cast<int32_t>(task_id),
         function_id, TracePhase::Register,
@@ -424,7 +601,38 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         function_id, TracePhase::SharedRegisterPublishMetadata,
         ProfilePhase::Register, metadata_begin, metadata_end
     );
+#if !PA_BUILD_TRACE_FREE
+    // 记录动作延后到 Register 的全部时间端点之后，避免 64B raw 写入
+    // 被误计入 metadata publish 或 handoff。循环内只累计本地 polls，
+    // 每个成功 winner 固定至多增加这一条物理 PollBatch。
+    if (turn_ready && insert_turn_load_count != 0) {
+        (void)WriteAggregateAtomicPollBatch(
+            stats.trace, stats.result,
+            AtomicSite::SharedInsertTurnPoll,
+            register_begin, metadata_begin,
+            insert_turn_load_count,
+            Ops::kAtomicReturnReadyObserved
+        );
+    }
+    if (metadata_published && stats.trace.atomics_enabled) {
+        WriteAtomicTrace<Ops>(
+            stats.trace, stats.result,
+            static_cast<int32_t>(task_id),
+            AtomicSite::SharedInsertTurnHandoff,
+            AtomicOp::CompareExchange,
+            cas_trace_begin, cas_trace_end,
+            true, Ops::kAtomicReturnReadyObserved
+        );
+    }
+#endif
     if (!inserted) {
+        // output cell 虽已在串行等待前短暂可见，但完成字尚未发布；失败路径
+        // 恢复本 task 独占 cell，保留原有 fail-closed 终态。正常路径无额外
+        // rollback 分支开销。
+        RollbackSharedTaskOutputs<Ops>(
+            state->shared_map.shared_outputs[task_id],
+            context.result.count
+        );
         return false;
     }
 #if defined(PA_TEST_SHARED_SUBMIT_HOOKS)
@@ -436,8 +644,8 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     );
 #endif
 
-    // 前沿已经离开 N，后继 owner 可以插入 N+1；当前 owner 的 fanin
-    // lookup、Build 和 slot 执行不再占住全局有序通道。
+    // task[N] 的插入完成字已经发布，N+1 owner 可以进入有序插入段；
+    // 当前 owner 的 fanin lookup、Build 和 slot 执行不再占住该链。
     uint64_t build_begin = register_end;
     if (kind != TaskKind::Alloc) {
         const uint64_t fanin_begin = register_end;

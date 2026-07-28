@@ -28,6 +28,7 @@ using pa_scheduler::AtomicPollRegionBegin;
 using pa_scheduler::AtomicPollRegionEnd;
 using pa_scheduler::AtomicSite;
 using pa_scheduler::AccumulateAtomicPollCall;
+using pa_scheduler::CaptureAtomicCompareExchange;
 using pa_scheduler::TraceAtomicLoad;
 using pa_scheduler::TraceAtomicPollBatchMask;
 using pa_scheduler::TraceAtomicPollBatchIndex;
@@ -36,9 +37,14 @@ using pa_scheduler::TraceCoreState;
 using pa_scheduler::TracePhase;
 using pa_scheduler::TraceRecord;
 using pa_scheduler::WorkerResult;
+using pa_scheduler::WriteAggregateAtomicPollBatch;
+using pa_scheduler::WriteAtomicTrace;
+using pa_scheduler::kAtomicOpMask;
 using pa_scheduler::kAtomicPollBatch;
 using pa_scheduler::kAtomicPollCountMax;
 using pa_scheduler::kAtomicPollCountShift;
+using pa_scheduler::kAtomicResultUsed;
+using pa_scheduler::kAtomicReturnReady;
 
 int g_failures = 0;
 
@@ -66,9 +72,24 @@ struct TestOps {
     static T Load(volatile T *address) {
         return *address;
     }
+
+    static int64_t CompareExchange(
+        volatile int64_t *address, int64_t expected,
+        int64_t desired
+    ) {
+        const int64_t observed = *address;
+        if (observed == expected) {
+            *address = desired;
+        }
+        return observed;
+    }
 };
 
 uint64_t TestOps::now = 0;
+
+struct ReturnReadyTestOps : TestOps {
+    static constexpr bool kAtomicReturnReadyObserved = true;
+};
 
 struct Fixture {
     TraceCoreState core{};
@@ -280,6 +301,136 @@ void TestRawSiteIdNeverBecomesTheEnableMaskBit() {
         TraceAtomicPollBatchMask(AtomicSite::FaninFlagLoad) == (1U << 2),
         "Fanin 的 enable bit 必须来自 compact index 2，而不是 raw site 5"
     );
+    Expect(
+        TraceAtomicPollBatchIndex(
+            AtomicSite::SharedInsertTurnPoll
+        ) == -1 &&
+            TraceAtomicPollBatchMask(
+                AtomicSite::SharedInsertTurnPoll
+            ) == 0,
+        "aggregate-only insert-turn poll 不得扩张热循环 compact state"
+    );
+}
+
+void TestAggregateInsertTurnPollBatch() {
+    Fixture fixture;
+    constexpr uint64_t kBegin = 4000;
+    constexpr uint64_t kEnd = 4500;
+    constexpr uint64_t kCalls = 37;
+    const bool written = WriteAggregateAtomicPollBatch(
+        fixture.trace, fixture.result,
+        AtomicSite::SharedInsertTurnPoll,
+        kBegin, kEnd, kCalls, true
+    );
+    Expect(written, "insert-turn aggregate PollBatch 应写入一条记录");
+    Expect(fixture.core.count == 1, "aggregate PollBatch 物理记录数不是 1");
+    Expect(
+        fixture.result.atomic_trace_calls == kCalls &&
+            fixture.trace.poll_calls == kCalls,
+        "aggregate PollBatch 没有一次性累计精确 logical calls"
+    );
+    Expect(
+        fixture.trace.poll_batch_records == 1,
+        "aggregate PollBatch 物理 batch 计数不是 1"
+    );
+    const TraceRecord &record = fixture.records[0];
+    Expect(
+        record.start_cycle == kBegin &&
+            record.end_cycle == kEnd,
+        "aggregate PollBatch 没有复用传入的 Register/Ready 边界"
+    );
+    Expect(
+        record.auxiliary ==
+            static_cast<uint32_t>(
+                AtomicSite::SharedInsertTurnPoll
+            ),
+        "aggregate PollBatch site 不正确"
+    );
+    Expect(
+        (record.flags & kAtomicOpMask) ==
+                static_cast<uint32_t>(AtomicOp::Load) &&
+            (record.flags & kAtomicResultUsed) != 0 &&
+            (record.flags & kAtomicPollBatch) != 0 &&
+            (record.flags & kAtomicReturnReady) != 0,
+        "aggregate PollBatch 的 Load/result/poll/return-ready 标志不闭合"
+    );
+    Expect(
+        record.flags >> kAtomicPollCountShift == kCalls,
+        "aggregate PollBatch 未编码精确 logical call_count"
+    );
+
+    Fixture overflow;
+    const bool overflow_written = WriteAggregateAtomicPollBatch(
+        overflow.trace, overflow.result,
+        AtomicSite::SharedInsertTurnPoll,
+        kBegin, kEnd,
+        static_cast<uint64_t>(kAtomicPollCountMax) + 1,
+        true
+    );
+    Expect(
+        !overflow_written && overflow.core.count == 0 &&
+            overflow.result.atomic_trace_calls == 0 &&
+            overflow.trace.poll_calls == 0 &&
+            overflow.trace.atomic_counter_overflow,
+        "超过 24-bit 的聚合调用数必须 fail-closed，不能饱和或拆批"
+    );
+}
+
+void TestInsertTurnHandoffCompareExchange() {
+    Fixture fixture;
+    volatile int64_t token = 7;
+    uint64_t trace_begin = 0;
+    uint64_t trace_end = 0;
+    TestOps::now = 5000;
+    const int64_t observed =
+        CaptureAtomicCompareExchange<ReturnReadyTestOps>(
+            fixture.trace, &token, 7, 8,
+            trace_begin, trace_end
+        );
+    Expect(
+        observed == 7 && token == 8,
+        "handoff CompareExchange 返回值或目标 token 不正确"
+    );
+    Expect(
+        fixture.core.count == 0 &&
+            fixture.result.atomic_trace_calls == 0,
+        "CAS 捕获阶段不得提前写 raw 或更新 logical counter"
+    );
+    WriteAtomicTrace<ReturnReadyTestOps>(
+        fixture.trace, fixture.result, 7,
+        AtomicSite::SharedInsertTurnHandoff,
+        AtomicOp::CompareExchange,
+        trace_begin, trace_end, true, true
+    );
+    Expect(
+        fixture.core.count == 1 &&
+            fixture.result.atomic_trace_calls == 1,
+        "父/detail 端点固定后，handoff CAS 必须恰好写一条 direct atomic"
+    );
+    const TraceRecord &record = fixture.records[0];
+    Expect(
+        record.task_id == 7 &&
+            record.auxiliary ==
+                static_cast<uint32_t>(
+                    AtomicSite::SharedInsertTurnHandoff
+                ),
+        "handoff CAS 没有保留 task/site 身份"
+    );
+    Expect(
+        (record.flags & kAtomicOpMask) ==
+                static_cast<uint32_t>(
+                    AtomicOp::CompareExchange
+                ) &&
+            (record.flags & kAtomicResultUsed) != 0 &&
+            (record.flags & kAtomicReturnReady) != 0 &&
+            (record.flags & kAtomicPollBatch) == 0,
+        "handoff CAS 的 op/result/return-ready/direct 标志不正确"
+    );
+    Expect(
+        trace_end == record.end_cycle &&
+            record.end_cycle >= record.start_cycle,
+        "handoff CAS 记录没有使用捕获的返回依赖边界"
+    );
 }
 
 }  // namespace
@@ -289,6 +440,8 @@ int main() {
     TestNestedRegionRestoresMask();
     TestNonAllowlistedSiteStaysDirect();
     TestRawSiteIdNeverBecomesTheEnableMaskBit();
+    TestAggregateInsertTurnPollBatch();
+    TestInsertTurnHandoffCompareExchange();
     if (g_failures != 0) {
         std::fprintf(stderr, "[FAIL] atomic PollBatch self-test failures=%d\n", g_failures);
         return EXIT_FAILURE;

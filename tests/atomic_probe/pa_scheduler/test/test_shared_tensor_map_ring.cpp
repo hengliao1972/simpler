@@ -65,7 +65,7 @@ static_assert(offsetof(SharedRegionSlot, seq) == 64, "shared seq cache line offs
 static_assert(sizeof(SharedBucketState) == 128, "shared bucket control ABI changed");
 static_assert(offsetof(SharedBucketState, tail) == 64, "shared head/tail cache lines merged");
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
-static_assert(sizeof(SharedTensorMapSidecar) == 12426880, "shared sidecar ABI changed");
+static_assert(sizeof(SharedTensorMapSidecar) == 12434560, "shared sidecar ABI changed");
 #endif
 static_assert(alignof(SharedTensorMapSidecar) == 64, "shared sidecar alignment changed");
 static_assert(offsetof(SharedTensorMapSidecar, buckets) == 128, "shared bucket offset changed");

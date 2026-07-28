@@ -187,7 +187,12 @@ void UnmapSparseSchedulerState(SchedulerState *state) {
 void ResetProtocolState(SchedulerState &state) {
     state.fatal.value = 0;
     state.heap_window = kHeapWindow;
-    InitializeSharedInsertTurns(state.shared_map);
+    for (uint32_t lane = 0;
+         lane < kSharedInsertTurnCapacity; ++lane) {
+        SharedInsertTurnLine(
+            state.shared_map, lane
+        ).value = -10000 - static_cast<int64_t>(lane);
+    }
     state.shared_map.reclaim_upto.value = -1;
     for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
         state.shared_map.buckets[bucket].head.value = 0;
@@ -201,6 +206,7 @@ void ResetProtocolState(SchedulerState &state) {
         state.shared_map.reader_done[worker].value = -1;
     }
     for (uint32_t task = 0; task < kMaxTasks; ++task) {
+        state.tasks[task].deps_prepared = -1;
         SharedOutputCell &outputs =
             state.shared_map.shared_outputs[task];
         for (uint32_t output = 0;
@@ -217,28 +223,41 @@ void ResetProtocolState(SchedulerState &state) {
     }
 }
 
-void SetInsertTurnsAfterTasks(
-    SharedTensorMapSidecar &map, uint32_t completed_tasks
+void SetInsertCompletionsAfterTasks(
+    SchedulerState &state, uint32_t completed_tasks
 ) {
-    for (uint32_t lane = 0;
-         lane < kSharedInsertTurnCapacity; ++lane) {
-        SharedInsertTurnLine(map, lane).value =
-            SharedInsertTurnTokenAfterTasks(
-                completed_tasks, lane
-            );
+    for (uint32_t task = 0; task < completed_tasks;
+         ++task) {
+        state.tasks[task].deps_prepared =
+            static_cast<int64_t>(task);
     }
 }
 
-bool InsertTurnsMatch(
-    SharedTensorMapSidecar &map, uint32_t completed_tasks
+bool InsertCompletionsMatch(
+    SchedulerState &state, uint32_t completed_tasks
 ) {
+    for (uint32_t task = 0; task < completed_tasks;
+         ++task) {
+        if (WriterIntentTestOps::Load(
+                &state.tasks[task].deps_prepared
+            ) != static_cast<int64_t>(task)) {
+            return false;
+        }
+    }
+    if (completed_tasks < kMaxTasks &&
+        WriterIntentTestOps::Load(
+            &state.tasks[completed_tasks].deps_prepared
+        ) != -1) {
+        return false;
+    }
     for (uint32_t lane = 0;
          lane < kSharedInsertTurnCapacity; ++lane) {
         if (WriterIntentTestOps::Load(
-                &SharedInsertTurnLine(map, lane).value
-            ) != SharedInsertTurnTokenAfterTasks(
-                     completed_tasks, lane
-                 )) {
+                &SharedInsertTurnLine(
+                    state.shared_map, lane
+                ).value
+            ) !=
+            -10000 - static_cast<int64_t>(lane)) {
             return false;
         }
     }
@@ -1098,8 +1117,8 @@ void TestOrdinaryWriterIntentChain(SchedulerState &state) {
         "ownerless ordinary INPUT resolves the latest writer"
     );
     Check(
-        InsertTurnsMatch(state.shared_map, 0),
-        "non-adjacent ordinary writers do not require exact task turn"
+        InsertCompletionsMatch(state, 0),
+        "non-adjacent writer-intent preparation leaves the completion chain untouched"
     );
 }
 
@@ -1189,7 +1208,7 @@ void TestOrderedOrdinaryInsertBeforeLookup(
             &state, first_args, first_context,
             first_delta, first_stats
         ) &&
-            InsertTurnsMatch(state.shared_map, 1),
+            InsertCompletionsMatch(state, 1),
         "ordered ordinary task 0 publishes before lookup"
     );
 
@@ -1232,7 +1251,7 @@ void TestOrderedOrdinaryInsertBeforeLookup(
                 &state, second_args, second_context,
                 second_delta, second_stats
             ) &&
-            InsertTurnsMatch(state.shared_map, 2),
+            InsertCompletionsMatch(state, 2),
         "ordered ordinary task 1 publishes its writer entry"
     );
     lookup_ok = false;
@@ -1273,8 +1292,8 @@ void TestOrderedOrdinaryInsertBeforeLookup(
                 &state, reader_args, reader_context,
                 reader_delta, reader_stats
             ) &&
-            InsertTurnsMatch(state.shared_map, 3),
-        "empty writer task still advances the ordered frontier"
+            InsertCompletionsMatch(state, 3),
+        "empty writer task still publishes its per-task completion"
     );
     lookup_ok = false;
     lookup_count = UINT32_MAX;
@@ -1327,8 +1346,8 @@ void TestOrderedSymbolInsertBeforeLookup(
             ) &&
             state.shared_map.shared_outputs[0]
                     .published[0].value == 0 &&
-            InsertTurnsMatch(state.shared_map, 1),
-        "fresh symbol descriptor is visible before turn 1"
+            InsertCompletionsMatch(state, 1),
+        "fresh symbol descriptor is visible before task 0 completion"
     );
 
     const FdwicOutputRef output{
@@ -1360,7 +1379,7 @@ void TestOrderedSymbolInsertBeforeLookup(
             ) &&
             state.shared_map.shared_outputs[0]
                     .last_writer[0].value == 1 &&
-            InsertTurnsMatch(state.shared_map, 2),
+            InsertCompletionsMatch(state, 2),
         "symbol INOUT publishes history before its own lookup"
     );
 
@@ -1512,7 +1531,7 @@ void TestOrderedMixedWriterTransaction(
         state.shared_map.writer_history[1];
     Check(
         state.fatal.value == 0 &&
-            InsertTurnsMatch(state.shared_map, 2) &&
+            InsertCompletionsMatch(state, 2) &&
             seed_cell.last_writer[0].value == 1 &&
             history.magic == kSharedWriterHistoryMagic &&
             history.writer_task == 1 &&
@@ -1521,7 +1540,7 @@ void TestOrderedMixedWriterTransaction(
             mixed_cell.last_writer[0].value == 1 &&
             mixed_cell.tensors[0].buffer_addr ==
                 next_output.buffer_addr,
-        "mixed transaction exposes all metadata before turn 2"
+        "mixed transaction exposes all metadata before task 1 completion"
     );
 
     bool lookup_ok = false;
@@ -1565,7 +1584,7 @@ void TestOrderedMixedWriterTransaction(
                 &state, reader_args, reader_context,
                 reader_delta, reader_stats
             ),
-        "mixed transaction reader advances an empty writer turn"
+        "mixed transaction reader publishes an empty completion"
     );
     lookup_ok = false;
     lookup_count = UINT32_MAX;
@@ -1741,8 +1760,8 @@ void TestOrderedPublishRejectsFullBucketAtomically(
 
     constexpr int32_t kBlockedTask =
         static_cast<int32_t>(kMapBucketCapacity);
-    SetInsertTurnsAfterTasks(
-        state.shared_map,
+    SetInsertCompletionsAfterTasks(
+        state,
         static_cast<uint32_t>(kBlockedTask)
     );
     TensorDesc tensor = MakeTensor(kAddress);
@@ -1804,8 +1823,8 @@ void TestOrderedPublishRejectsFullBucketAtomically(
     }
     Check(
         state.fatal.value == 1 &&
-            InsertTurnsMatch(
-                state.shared_map,
+            InsertCompletionsMatch(
+                state,
                 static_cast<uint32_t>(kBlockedTask)
             ) &&
             state.shared_map.buckets[bucket].head.value ==

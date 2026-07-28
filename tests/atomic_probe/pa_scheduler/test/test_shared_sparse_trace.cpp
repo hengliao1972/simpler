@@ -18,6 +18,14 @@ namespace {
 using pa_scheduler::TaskKind;
 using pa_scheduler::TracePhase;
 using pa_scheduler::TraceRecord;
+using pa_scheduler::AtomicOp;
+using pa_scheduler::AtomicSite;
+using pa_scheduler::kAtomicOpMask;
+using pa_scheduler::kAtomicPollBatch;
+using pa_scheduler::kAtomicPollCountShift;
+using pa_scheduler::kAtomicResultUsed;
+using pa_scheduler::kAtomicReturnReady;
+using pa_scheduler::host::AtomicRecordSchemaValid;
 using pa_scheduler::host::SharedSparseTraceValidator;
 
 int g_failures = 0;
@@ -91,6 +99,27 @@ struct TaskTraceBuilder {
                 0, IsAlloc(kind)
             )
         );
+        ok &= validator.Observe(
+            MakeRecord(
+                TracePhase::SharedMaterializePublishTaskOutputs,
+                static_cast<int32_t>(task_id), function_id,
+                materialize_begin + 1, materialize_begin + 3
+            )
+        );
+        ok &= validator.Observe(
+            MakeRecord(
+                TracePhase::SharedMaterializePublishTaskOutputsCopy,
+                static_cast<int32_t>(task_id), function_id,
+                materialize_begin + 1, materialize_begin + 2
+            )
+        );
+        ok &= validator.Observe(
+            MakeRecord(
+                TracePhase::SharedMaterializePublishTaskOutputsFlush,
+                static_cast<int32_t>(task_id), function_id,
+                materialize_begin + 2, materialize_begin + 3
+            )
+        );
         uint64_t previous_end = materialize_begin + 3;
         ok &= validator.Observe(
             MakeRecord(
@@ -150,10 +179,10 @@ struct TaskTraceBuilder {
     }
 };
 
-bool OpenAllocWinnerRegister(
+bool OpenAllocWinnerMaterialize(
     SharedSparseTraceValidator &validator,
-    uint64_t register_begin = 18,
-    uint64_t register_end = 24
+    uint64_t materialize_begin = 15,
+    uint64_t materialize_end = 18
 ) {
     return validator.Observe(
                MakeRecord(TracePhase::EfDrain, 0, -1, 10, 12)
@@ -169,8 +198,50 @@ bool OpenAllocWinnerRegister(
            validator.Observe(
                MakeRecord(
                    TracePhase::Materialize, 0, -1,
-                   15, register_begin, 0, 1
+                   materialize_begin, materialize_end, 0, 1
                )
+           );
+}
+
+// outputs 包络内固定 copy → flush 两层；copy.end 必须等于 flush.start。
+bool ObserveSharedMaterializeOutputNest(
+    SharedSparseTraceValidator &validator,
+    int32_t task_id,
+    int32_t function_id,
+    uint64_t outputs_begin,
+    uint64_t outputs_end,
+    uint64_t copy_end
+) {
+    return validator.Observe(
+               MakeRecord(
+                   TracePhase::SharedMaterializePublishTaskOutputs,
+                   task_id, function_id, outputs_begin, outputs_end
+               )
+           ) &&
+           validator.Observe(
+               MakeRecord(
+                   TracePhase::SharedMaterializePublishTaskOutputsCopy,
+                   task_id, function_id, outputs_begin, copy_end
+               )
+           ) &&
+           validator.Observe(
+               MakeRecord(
+                   TracePhase::SharedMaterializePublishTaskOutputsFlush,
+                   task_id, function_id, copy_end, outputs_end
+               )
+           );
+}
+
+bool OpenAllocWinnerRegister(
+    SharedSparseTraceValidator &validator,
+    uint64_t register_begin = 18,
+    uint64_t register_end = 24
+) {
+    return OpenAllocWinnerMaterialize(
+               validator, 15, register_begin
+           ) &&
+           ObserveSharedMaterializeOutputNest(
+               validator, 0, -1, 16, register_begin, 17
            ) &&
            validator.Observe(
                MakeRecord(
@@ -217,6 +288,7 @@ void TestAcceptsSparseWinnerAndLoserFlow() {
             validator.FaninCount() == 1 &&
             validator.RegisterCount() == 2 &&
             validator.RegisterMetadataCount() == 2 &&
+            validator.MaterializeTaskOutputsCount() == 2 &&
             validator.WinnerTailCount() == 2 &&
             validator.SubmitCount() == 5,
         "sparse flow counts every Submit parent but only winner-only children"
@@ -281,6 +353,9 @@ void TestRejectsEveryLoserOnlyForbiddenPhase() {
         TracePhase::Fanin,
         TracePhase::Register,
         TracePhase::SharedRegisterPublishMetadata,
+        TracePhase::SharedMaterializePublishTaskOutputs,
+        TracePhase::SharedMaterializePublishTaskOutputsCopy,
+        TracePhase::SharedMaterializePublishTaskOutputsFlush,
         TracePhase::WinnerBuild,
         TracePhase::AllocComplete,
     };
@@ -366,7 +441,10 @@ void TestRejectsWinnerShapeDrift() {
             "Alloc Materialize is accepted"
         );
         Check(
-            validator.Observe(
+            ObserveSharedMaterializeOutputNest(
+                validator, 0, -1, 16, 18, 17
+            ) &&
+                validator.Observe(
                 MakeRecord(
                     TracePhase::Register, 0, -1, 18, 20
                 )
@@ -377,7 +455,7 @@ void TestRejectsWinnerShapeDrift() {
                         0, -1, 19, 19
                     )
                 ),
-            "Alloc Register and its metadata detail are accepted before the tail"
+            "Alloc Register details are accepted before the tail"
         );
         Check(
             !validator.Observe(
@@ -404,7 +482,10 @@ void TestRejectsWinnerShapeDrift() {
             "ordinary Materialize is accepted"
         );
         Check(
-            validator.Observe(
+            ObserveSharedMaterializeOutputNest(
+                validator, 1, 0, 19, 21, 20
+            ) &&
+                validator.Observe(
                 MakeRecord(TracePhase::Register, 1, 0, 21, 24, 0, 1)
             ) &&
                 validator.Observe(
@@ -413,7 +494,7 @@ void TestRejectsWinnerShapeDrift() {
                         1, 0, 22, 23
                     )
                 ),
-            "ordinary Register metadata detail precedes Fanin"
+            "ordinary Register details precede Fanin"
         );
         Check(
             !validator.Observe(
@@ -435,6 +516,9 @@ void TestRejectsWinnerShapeDrift() {
                     TracePhase::Materialize, 0, -1, 15, 18, 0, 1
                 )
             ) &&
+                ObserveSharedMaterializeOutputNest(
+                    validator, 0, -1, 16, 18, 17
+                ) &&
                 validator.Observe(
                     MakeRecord(
                         TracePhase::Register, 0, -1, 18, 20
@@ -465,6 +549,135 @@ void TestRejectsWinnerShapeDrift() {
         Check(
             !validator.Closed(),
             "winner cannot close before all winner-only phases and Submit"
+        );
+    }
+}
+
+void TestMaterializeOutputDetailContract() {
+    {
+        SharedSparseTraceValidator validator;
+        Check(
+            OpenAllocWinnerMaterialize(validator),
+            "Materialize parent opens the missing-output test"
+        );
+        Check(
+            !validator.Observe(
+                MakeRecord(TracePhase::Register, 0, -1, 18, 24)
+            ),
+            "winner cannot enter Register before output publication closes"
+        );
+    }
+    {
+        SharedSparseTraceValidator validator;
+        Check(
+            OpenAllocWinnerMaterialize(validator) &&
+                ObserveSharedMaterializeOutputNest(
+                    validator, 0, -1, 16, 18, 17
+                ),
+            "one output nest contained by Materialize is accepted"
+        );
+        Check(
+            !validator.Observe(
+                MakeRecord(
+                    TracePhase::SharedMaterializePublishTaskOutputs,
+                    0, -1, 16, 18
+                )
+            ),
+            "duplicate Materialize output detail is rejected"
+        );
+    }
+    {
+        SharedSparseTraceValidator validator;
+        Check(
+            OpenAllocWinnerMaterialize(validator) &&
+                validator.Observe(
+                    MakeRecord(
+                        TracePhase::SharedMaterializePublishTaskOutputs,
+                        0, -1, 16, 18
+                    )
+                ),
+            "output parent opens the missing-copy test"
+        );
+        Check(
+            !validator.Observe(
+                MakeRecord(TracePhase::Register, 0, -1, 18, 24)
+            ),
+            "winner cannot omit output copy detail"
+        );
+    }
+    {
+        SharedSparseTraceValidator validator;
+        Check(
+            OpenAllocWinnerMaterialize(validator) &&
+                validator.Observe(
+                    MakeRecord(
+                        TracePhase::SharedMaterializePublishTaskOutputs,
+                        0, -1, 16, 18
+                    )
+                ) &&
+                validator.Observe(
+                    MakeRecord(
+                        TracePhase::SharedMaterializePublishTaskOutputsCopy,
+                        0, -1, 16, 17
+                    )
+                ),
+            "copy detail opens the missing-flush test"
+        );
+        Check(
+            !validator.Observe(
+                MakeRecord(TracePhase::Register, 0, -1, 18, 24)
+            ),
+            "winner cannot omit output flush detail"
+        );
+    }
+    {
+        SharedSparseTraceValidator validator;
+        Check(
+            OpenAllocWinnerMaterialize(validator) &&
+                validator.Observe(
+                    MakeRecord(
+                        TracePhase::SharedMaterializePublishTaskOutputs,
+                        0, -1, 16, 18
+                    )
+                ) &&
+                validator.Observe(
+                    MakeRecord(
+                        TracePhase::SharedMaterializePublishTaskOutputsCopy,
+                        0, -1, 16, 17
+                    )
+                ),
+            "copy detail opens the flush-adjacency test"
+        );
+        Check(
+            !validator.Observe(
+                MakeRecord(
+                    TracePhase::SharedMaterializePublishTaskOutputsFlush,
+                    0, -1, 18, 18
+                )
+            ),
+            "flush must start exactly at copy end"
+        );
+    }
+    for (int variant = 0; variant < 4; ++variant) {
+        SharedSparseTraceValidator validator;
+        Check(
+            OpenAllocWinnerMaterialize(validator),
+            "Materialize opens output containment/identity test"
+        );
+        TraceRecord output = MakeRecord(
+            TracePhase::SharedMaterializePublishTaskOutputs,
+            0, -1, 16, 18
+        );
+        if (variant == 0) output.start_cycle = 14;
+        if (variant == 1) output.task_id = 1;
+        if (variant == 2) output.function_id = 0;
+        if (variant == 3) {
+            output.flags = 1;
+            output.auxiliary = 1;
+        }
+        Check(
+            !validator.Observe(output),
+            "Materialize output detail rejects bad boundary, identity, or payload"
         );
     }
 }
@@ -588,6 +801,61 @@ void TestRegisterMetadataDetailContract() {
     }
 }
 
+void TestSharedInsertTurnAtomicSchema() {
+    TraceRecord poll = MakeRecord(
+        TracePhase::Atomic, -1, -1, 100, 200,
+        static_cast<uint32_t>(AtomicOp::Load) |
+            kAtomicResultUsed | kAtomicPollBatch |
+            kAtomicReturnReady |
+            (17U << kAtomicPollCountShift),
+        static_cast<uint32_t>(
+            AtomicSite::SharedInsertTurnPoll
+        )
+    );
+    Check(
+        AtomicRecordSchemaValid(poll, true),
+        "shared insert-turn aggregate PollBatch schema is accepted"
+    );
+    TraceRecord direct_poll = poll;
+    direct_poll.flags =
+        static_cast<uint32_t>(AtomicOp::Load) |
+        kAtomicResultUsed | kAtomicReturnReady;
+    direct_poll.task_id = 3;
+    Check(
+        !AtomicRecordSchemaValid(direct_poll, true),
+        "shared insert-turn poll cannot masquerade as a direct Load"
+    );
+
+    TraceRecord handoff = MakeRecord(
+        TracePhase::Atomic, 3, -1, 200, 230,
+        static_cast<uint32_t>(
+            AtomicOp::CompareExchange
+        ) |
+            kAtomicResultUsed | kAtomicReturnReady,
+        static_cast<uint32_t>(
+            AtomicSite::SharedInsertTurnHandoff
+        )
+    );
+    Check(
+        AtomicRecordSchemaValid(handoff, true),
+        "shared insert-turn handoff CAS schema is accepted"
+    );
+    TraceRecord anonymous_handoff = handoff;
+    anonymous_handoff.task_id = -1;
+    Check(
+        !AtomicRecordSchemaValid(anonymous_handoff, true),
+        "handoff CAS requires its shared winner task identity"
+    );
+    TraceRecord wrong_handoff_op = handoff;
+    wrong_handoff_op.flags =
+        (wrong_handoff_op.flags & ~kAtomicOpMask) |
+        static_cast<uint32_t>(AtomicOp::Exchange);
+    Check(
+        !AtomicRecordSchemaValid(wrong_handoff_op, true),
+        "handoff site rejects a non-CAS atomic op"
+    );
+}
+
 void TestPlanClosesAllLogicalTasks() {
     // SchedulerState 保留真实 DistGlobal 约 1 GiB ABI，不能放在线程栈上。
     // 静态零初始化只映射本用例实际触碰的 config/context_lens 页面。
@@ -637,7 +905,9 @@ int main() {
     TestRejectsEveryLoserOnlyForbiddenPhase();
     TestRejectsPrepareMapForWinnerAndOutsideSubmit();
     TestRejectsWinnerShapeDrift();
+    TestMaterializeOutputDetailContract();
     TestRegisterMetadataDetailContract();
+    TestSharedInsertTurnAtomicSchema();
     TestPlanClosesAllLogicalTasks();
     if (g_failures != 0) {
         std::fprintf(

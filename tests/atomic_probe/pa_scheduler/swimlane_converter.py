@@ -47,18 +47,42 @@ PHASE_NAMES = {
     "WinnerBuild": "winner_build",
     "AllocComplete": "alloc_complete",
     "SharedRegisterPublishMetadata": "register.publish_metadata",
+    "SharedMaterializePublishTaskOutputs": (
+        "materialize.publish_task_outputs"
+    ),
+    "SharedMaterializePublishTaskOutputsCopy": (
+        "materialize.publish_task_outputs.copy"
+    ),
+    "SharedMaterializePublishTaskOutputsFlush": (
+        "materialize.publish_task_outputs.flush"
+    ),
+    # 兼容迁移前已经落盘的 schema-v5 raw；新采集只会写上面的
+    # SharedMaterialize* 名称，旧名称仍按其当时的 Register 归属解释。
+    "SharedRegisterPublishTaskOutputs": "register.publish_task_outputs",
+    "SharedRegisterPublishTaskOutputsCopy": (
+        "register.publish_task_outputs.copy"
+    ),
+    "SharedRegisterPublishTaskOutputsFlush": (
+        "register.publish_task_outputs.flush"
+    ),
 }
 LEGACY_LAP_PHASES = {"Alloc", "Build", "Replay"}
-V4_PHASES = {
+V5_PHASES = {
     "OrchestrationReplay",
     "FinalDrain",
     "WinnerBuild",
     "AllocComplete",
     "SharedRegisterPublishMetadata",
+    "SharedMaterializePublishTaskOutputs",
+    "SharedMaterializePublishTaskOutputsCopy",
+    "SharedMaterializePublishTaskOutputsFlush",
+    "SharedRegisterPublishTaskOutputs",
+    "SharedRegisterPublishTaskOutputsCopy",
+    "SharedRegisterPublishTaskOutputsFlush",
 }
-# schema-v4 已有区间足以在离线侧取补集；这些 phase 之外的
+# schema-v5 已有区间足以在离线侧取补集；这些 phase 之外的
 # Atomic、Kernel、RingBp 等是嵌套或 Overlay，不能再从 Submit 扣一次。
-V4_EXCLUSIVE_SUBMIT_PHASES = {
+V5_EXCLUSIVE_SUBMIT_PHASES = {
     "EfDrain",
     "Materialize",
     "PrepareMap",
@@ -101,17 +125,21 @@ ATOMIC_SITE_NAMES = {
     16: "shared_heap_cursor_load",
     17: "shared_heap_cursor_reserve",
     18: "shared_heap_vend_advance",
+    19: "shared_insert_predecessor_poll",
+    20: "shared_insert_completion_publish",
 }
 ATOMIC_OP_NAMES = {
     0: "load",
     1: "exchange",
     2: "fetch_add",
     3: "fetch_max",
+    4: "compare_exchange",
 }
 
 # schema-v3/4 的校验表必须与 standalone C++ 的稳定 AtomicSite 编号一致。
-# 0..14 是既有 common/private 站点，15..18 是 shared heap 的追加站点；
-# 真实 PA 的 BlockWon 不属于本用例，不能为了兼容生产 converter 凭空放宽。
+# 0..14 是既有 common/private 站点，15..18 是 shared heap，19/20 是
+# shared Register 插入轮次的等待 Load 与交接 CAS；真实 PA 的 BlockWon
+# 不属于本用例，不能为了兼容生产 converter 凭空放宽。
 ATOMIC_SITE_OP_IDS = {
     0: 2,
     1: 0,
@@ -132,13 +160,26 @@ ATOMIC_SITE_OP_IDS = {
     16: 0,
     17: 2,
     18: 2,
+    19: 0,
+    20: 4,
 }
 # 这些发布型调用不消费 atomic 返回的旧值；其余 standalone site 的
 # 返回值都参与协议判断。v3 输入必须与源码语义完全一致。
 ATOMIC_RESULT_UNUSED_SITE_IDS = {0, 3, 6, 7, 13}
-# 只有显式 scheduler 等待区中的六类 observation load 可以合并。
-# frontier 扫描和 Claim 即使调用很多次也必须继续保留逐调用记录。
-POLL_BATCH_SITE_OP_IDS = {1: 0, 2: 0, 5: 0, 11: 0, 12: 0, 14: 0}
+# common/private 的六类等待 Load 与 shared Register insert-turn Load 可以
+# 合并；frontier 扫描和 Claim 即使调用很多次也必须继续保留逐调用记录。
+POLL_BATCH_SITE_OP_IDS = {
+    1: 0,
+    2: 0,
+    5: 0,
+    11: 0,
+    12: 0,
+    14: 0,
+    19: 0,
+}
+SHARED_REGISTER_ATOMIC_SITE_IDS = {19, 20}
+SHARED_INSERT_TURN_POLL_SITE_ID = 19
+SHARED_INSERT_TURN_HANDOFF_SITE_ID = 20
 
 ATOMIC_RESULT_USED = 1 << 4
 ATOMIC_VALUE_ZERO = 1 << 5
@@ -173,7 +214,7 @@ def _derive_v4_task_kinds(
 ) -> dict[int, int]:
     """从每核 Submit 的既有 Alloc 标记恢复动态 task 类型流。
 
-    schema-v4 的 ``Submit.auxiliary`` 已逐核记录 ``is_alloc``，因此无需给
+    schema-v5 的 ``Submit.auxiliary`` 已逐核记录 ``is_alloc``，因此无需给
     设备 raw 再增加 task-kind 字段。这里先要求 96 核（或测试给定核数）
     具有完全一致的连续 task 流，再按相邻 Alloc 边界验证每个 batch 必须是
     ``Alloc + 0..4 × (QK,SF,PV,UP)``。返回值使用稳定 TaskKind 编号：
@@ -181,7 +222,7 @@ def _derive_v4_task_kinds(
     """
 
     if num_cores <= 0:
-        raise ValueError(f"schema-v4 task plan requires positive num_cores, got {num_cores}")
+        raise ValueError(f"schema-v5 task plan requires positive num_cores, got {num_cores}")
 
     task_ids_by_core: dict[int, list[int]] = {
         core_id: [] for core_id in range(num_cores)
@@ -189,11 +230,11 @@ def _derive_v4_task_kinds(
     for (core_id, task_id) in submit_semantics:
         if core_id not in task_ids_by_core:
             raise ValueError(
-                f"schema-v4 Submit task plan has out-of-range core {core_id}"
+                f"schema-v5 Submit task plan has out-of-range core {core_id}"
             )
         if task_id < 0:
             raise ValueError(
-                f"schema-v4 Submit task plan has negative task_id {task_id}"
+                f"schema-v5 Submit task plan has negative task_id {task_id}"
             )
         task_ids_by_core[core_id].append(task_id)
 
@@ -203,13 +244,13 @@ def _derive_v4_task_kinds(
         if reference_task_ids is None:
             if not task_ids or task_ids != list(range(task_ids[-1] + 1)):
                 raise ValueError(
-                    "schema-v4 Submit task IDs must be contiguous 0..N-1 on every "
+                    "schema-v5 Submit task IDs must be contiguous 0..N-1 on every "
                     f"core: core={core_id} task_ids={task_ids}"
                 )
             reference_task_ids = task_ids
         elif task_ids != reference_task_ids:
             raise ValueError(
-                "schema-v4 Submit task IDs differ across cores: "
+                "schema-v5 Submit task IDs differ across cores: "
                 f"core={core_id} task_ids={task_ids}"
             )
 
@@ -222,7 +263,7 @@ def _derive_v4_task_kinds(
         }
         if len(markers) != 1:
             raise ValueError(
-                "schema-v4 Submit Alloc marker differs across cores for "
+                "schema-v5 Submit Alloc marker differs across cores for "
                 f"task {task_id}"
             )
         alloc_by_task[task_id] = markers.pop()
@@ -231,7 +272,7 @@ def _derive_v4_task_kinds(
         task_id for task_id in reference_task_ids if alloc_by_task[task_id]
     ]
     if not alloc_task_ids or alloc_task_ids[0] != 0:
-        raise ValueError("schema-v4 dynamic task plan must begin with task 0 Alloc")
+        raise ValueError("schema-v5 dynamic task plan must begin with task 0 Alloc")
 
     task_kind_by_id: dict[int, int] = {}
     interval_ends = [*alloc_task_ids[1:], len(reference_task_ids)]
@@ -240,7 +281,7 @@ def _derive_v4_task_kinds(
         payload_tasks = interval_length - 1
         if payload_tasks % 4 != 0 or not 0 <= payload_tasks // 4 <= 4:
             raise ValueError(
-                "schema-v4 dynamic batch must contain Alloc plus 0..4 complete "
+                "schema-v5 dynamic batch must contain Alloc plus 0..4 complete "
                 "QK/SF/PV/UP groups: "
                 f"alloc_task={alloc_task_id} interval_length={interval_length}"
             )
@@ -249,7 +290,7 @@ def _derive_v4_task_kinds(
             task_kind_by_id[alloc_task_id + offset] = 1 + (offset - 1) % 4
 
     if set(task_kind_by_id) != set(reference_task_ids):
-        raise AssertionError("schema-v4 dynamic task plan derivation is incomplete")
+        raise AssertionError("schema-v5 dynamic task plan derivation is incomplete")
     return task_kind_by_id
 
 
@@ -276,28 +317,30 @@ def _load_and_validate(
     if frequency_hz <= 0:
         raise ValueError("metadata.clock_freq_hz must be positive")
     # v1 是旧 raw，Claim flags 只有 winner bit；v2 追加 attempted bit；
-    # v3 再加入精确计数 PollBatch；v4 追加排他父区间与真实尾动作 span，
-    # 并要求 phase-only/atomic 两种观察级别都带 producer summary。
+    # v3 再加入精确计数 PollBatch；v5 追加排他父区间、真实尾动作 span
+    # 以及 Materialize→task outputs 与 Register→metadata detail。迁移前
+    # 已落盘的 v5 Register→metadata→task outputs 仍只读兼容。v4 raw 不再接受，
+    # 避免缺少 task-outputs 边界的旧采集被伪装成新细分。
     # 不认识的新版本直接拒绝，避免把新 flags 按旧语义误读。
     trace_schema_version = _integer(metadata.get("trace_schema_version", 1), "metadata.trace_schema_version")
-    if trace_schema_version not in (1, 2, 3, 4):
+    if trace_schema_version not in (1, 2, 3, 5):
         raise ValueError(f"unsupported metadata.trace_schema_version: {trace_schema_version}")
     if trace_schema_version == 3 and level != 4:
         raise ValueError("metadata.trace_schema_version=3 requires l2_swimlane_level=4")
-    if trace_schema_version == 4 and level not in (1, 4):
+    if trace_schema_version == 5 and level not in (1, 4):
         raise ValueError(
-            "metadata.trace_schema_version=4 requires l2_swimlane_level=1 or 4"
+            "metadata.trace_schema_version=5 requires l2_swimlane_level=1 or 4"
         )
     tensormap_mode = metadata.get("tensormap_mode")
-    if trace_schema_version == 4:
+    if trace_schema_version == 5:
         if tensormap_mode not in ("private", "shared"):
             raise ValueError(
                 "metadata.tensormap_mode must be private or shared for "
-                "trace_schema_version=4"
+                "trace_schema_version=5"
             )
     elif tensormap_mode is not None:
         raise ValueError(
-            "metadata.tensormap_mode is only valid for trace_schema_version=4"
+            "metadata.tensormap_mode is only valid for trace_schema_version=5"
         )
     num_cores = _integer(metadata.get("num_cores"), "metadata.num_cores")
     if num_cores <= 0:
@@ -397,6 +440,7 @@ def _load_and_validate(
         for core_id in range(num_cores)
     }
     v3_result_used_direct_rows: list[tuple[int, int, bool]] = []
+    v3_insert_turn_poll_batch_rows: list[tuple[int, int, bool]] = []
     v4_parent_counts: dict[int, dict[str, int]] = {
         core_id: {"OrchestrationReplay": 0, "FinalDrain": 0}
         for core_id in range(num_cores)
@@ -405,8 +449,24 @@ def _load_and_validate(
     v4_submits: set[tuple[int, int]] = set()
     v4_submit_semantics: dict[tuple[int, int], tuple[bool, bool]] = {}
     v4_tails: dict[tuple[int, int], tuple[str, int]] = {}
+    v4_materializes: dict[
+        tuple[int, int], list[tuple[Any, ...]]
+    ] = {}
     v4_registers: dict[tuple[int, int], list[tuple[Any, ...]]] = {}
     v4_shared_register_details: dict[
+        tuple[int, int], list[tuple[Any, ...]]
+    ] = {}
+    v4_shared_register_output_details: dict[
+        tuple[int, int], list[tuple[Any, ...]]
+    ] = {}
+    v4_shared_register_output_copy_details: dict[
+        tuple[int, int], list[tuple[Any, ...]]
+    ] = {}
+    v4_shared_register_output_flush_details: dict[
+        tuple[int, int], list[tuple[Any, ...]]
+    ] = {}
+    v4_shared_insert_turn_polls: list[tuple[Any, ...]] = []
+    v4_shared_insert_turn_handoffs: dict[
         tuple[int, int], list[tuple[Any, ...]]
     ] = {}
     # 逐行在写输出前检查列数、范围和可转整数的字段。任一行不满足这些约束
@@ -432,17 +492,17 @@ def _load_and_validate(
             raise ValueError(f"fdwic_events[{index}] has invalid lane {lane}")
         if phase not in PHASE_NAMES:
             raise ValueError(f"fdwic_events[{index}] has unknown phase {phase!r}")
-        if trace_schema_version == 4 and phase in LEGACY_LAP_PHASES:
+        if trace_schema_version == 5 and phase in LEGACY_LAP_PHASES:
             raise ValueError(
-                f"fdwic_events[{index}] schema-v4 forbids legacy lap phase {phase!r}"
+                f"fdwic_events[{index}] schema-v5 forbids legacy lap phase {phase!r}"
             )
-        if trace_schema_version == 4 and phase == "DrainWon":
+        if trace_schema_version == 5 and phase == "DrainWon":
             raise ValueError(
-                f"fdwic_events[{index}] schema-v4 forbids unused legacy phase 'DrainWon'"
+                f"fdwic_events[{index}] schema-v5 forbids unused legacy phase 'DrainWon'"
             )
-        if trace_schema_version < 4 and phase in V4_PHASES:
+        if trace_schema_version < 5 and phase in V5_PHASES:
             raise ValueError(
-                f"fdwic_events[{index}] phase {phase!r} requires trace_schema_version=4"
+                f"fdwic_events[{index}] phase {phase!r} requires trace_schema_version=5"
             )
         if trace_schema_version >= 3:
             if task_id < -1 or function_id < -1 or auxiliary < 0:
@@ -476,15 +536,33 @@ def _load_and_validate(
             value_zero = bool(flags & ATOMIC_VALUE_ZERO)
             return_ready = bool(flags & ATOMIC_RETURN_READY)
             payload = (flags >> ATOMIC_PAYLOAD_SHIFT) & ATOMIC_PAYLOAD_MASK
+            if auxiliary in SHARED_REGISTER_ATOMIC_SITE_IDS and not (
+                trace_schema_version == 5 and tensormap_mode == "shared"
+            ):
+                raise ValueError(
+                    f"fdwic_events[{index}] shared Register Atomic site={auxiliary} "
+                    "requires shared schema-v5"
+                )
+            if (
+                auxiliary == SHARED_INSERT_TURN_POLL_SITE_ID
+                and not poll_batch
+            ):
+                raise ValueError(
+                    f"fdwic_events[{index}] SharedInsertTurnPoll must use PollBatch"
+                )
             if poll_batch:
+                return_ready_valid = (
+                    not return_ready
+                    or auxiliary == SHARED_INSERT_TURN_POLL_SITE_ID
+                )
                 if (
-                    trace_schema_version not in (3, 4)
+                    trace_schema_version not in (3, 5)
                     or level != 4
                     or payload == 0
                     or POLL_BATCH_SITE_OP_IDS.get(auxiliary) != atomic_op
                     or not result_used
                     or value_zero
-                    or return_ready
+                    or not return_ready_valid
                     or task_id != -1
                     or function_id != -1
                 ):
@@ -492,7 +570,11 @@ def _load_and_validate(
                         f"fdwic_events[{index}] has invalid Atomic PollBatch "
                         f"site={auxiliary} flags=0x{flags:x}"
                     )
-            elif trace_schema_version in (3, 4):
+                if auxiliary == SHARED_INSERT_TURN_POLL_SITE_ID:
+                    v3_insert_turn_poll_batch_rows.append(
+                        (index, core_id, return_ready)
+                    )
+            elif trace_schema_version in (3, 5):
                 if level != 4:
                     raise ValueError(
                         f"fdwic_events[{index}] Atomic requires l2_swimlane_level=4"
@@ -508,6 +590,10 @@ def _load_and_validate(
                     or (value_zero and atomic_op != 0)
                     or (payload and atomic_op != 3)
                     or function_id != -1
+                    or (
+                        auxiliary == SHARED_INSERT_TURN_HANDOFF_SITE_ID
+                        and task_id < 0
+                    )
                 ):
                     raise ValueError(
                         f"fdwic_events[{index}] has invalid direct Atomic "
@@ -522,9 +608,31 @@ def _load_and_validate(
                 observed_summary["poll_batch_records"] += 1
             else:
                 observed_summary["atomic_calls"] += 1
+            if trace_schema_version == 5 and auxiliary in (
+                SHARED_INSERT_TURN_POLL_SITE_ID,
+                SHARED_INSERT_TURN_HANDOFF_SITE_ID,
+            ):
+                atomic_record = (
+                    core_id,
+                    block_id,
+                    lane,
+                    task_id,
+                    function_id,
+                    phase,
+                    start_cycle,
+                    end_cycle,
+                    flags,
+                    auxiliary,
+                )
+                if auxiliary == SHARED_INSERT_TURN_POLL_SITE_ID:
+                    v4_shared_insert_turn_polls.append(atomic_record)
+                else:
+                    v4_shared_insert_turn_handoffs.setdefault(
+                        (core_id, task_id), []
+                    ).append(atomic_record)
         elif phase == "ClockBaseline":
             observed_summary["clock_baseline_records"] += 1
-            if trace_schema_version in (3, 4):
+            if trace_schema_version in (3, 5):
                 if level != 4:
                     raise ValueError(
                         f"fdwic_events[{index}] ClockBaseline requires l2_swimlane_level=4"
@@ -548,11 +656,11 @@ def _load_and_validate(
                     clock_state["return_ready"] = dependency_applied
                 else:
                     clock_state["plain"] = int(clock_state["plain"]) + 1
-        if trace_schema_version == 4:
+        if trace_schema_version == 5:
             task_key = (core_id, task_id)
             if tensormap_mode == "shared" and phase == "PrepareMap":
                 raise ValueError(
-                    f"fdwic_events[{index}] shared schema-v4 must not contain PrepareMap"
+                    f"fdwic_events[{index}] shared schema-v5 must not contain PrepareMap"
                 )
             if phase == "SharedRegisterPublishMetadata":
                 if tensormap_mode != "shared":
@@ -579,30 +687,112 @@ def _load_and_validate(
                         auxiliary,
                     )
                 )
+            elif phase in (
+                "SharedMaterializePublishTaskOutputs",
+                "SharedRegisterPublishTaskOutputs",
+            ):
+                if tensormap_mode != "shared":
+                    raise ValueError(
+                        f"fdwic_events[{index}] {phase} "
+                        "is only valid for shared TensorMap"
+                    )
+                if task_id < 0 or flags != 0 or auxiliary != 0:
+                    raise ValueError(
+                        f"fdwic_events[{index}] has invalid {phase} fields"
+                    )
+                v4_shared_register_output_details.setdefault(
+                    task_key, []
+                ).append(
+                    (
+                        core_id,
+                        block_id,
+                        lane,
+                        task_id,
+                        function_id,
+                        phase,
+                        start_cycle,
+                        end_cycle,
+                        flags,
+                        auxiliary,
+                    )
+                )
+            elif phase in (
+                "SharedMaterializePublishTaskOutputsCopy",
+                "SharedMaterializePublishTaskOutputsFlush",
+                "SharedRegisterPublishTaskOutputsCopy",
+                "SharedRegisterPublishTaskOutputsFlush",
+            ):
+                if tensormap_mode != "shared":
+                    raise ValueError(
+                        f"fdwic_events[{index}] {phase} "
+                        "is only valid for shared TensorMap"
+                    )
+                if task_id < 0 or flags != 0 or auxiliary != 0:
+                    raise ValueError(
+                        f"fdwic_events[{index}] has invalid {phase} fields"
+                    )
+                bucket = (
+                    v4_shared_register_output_copy_details
+                    if phase.endswith("Copy")
+                    else v4_shared_register_output_flush_details
+                )
+                bucket.setdefault(task_key, []).append(
+                    (
+                        core_id,
+                        block_id,
+                        lane,
+                        task_id,
+                        function_id,
+                        phase,
+                        start_cycle,
+                        end_cycle,
+                        flags,
+                        auxiliary,
+                    )
+                )
             if phase in ("OrchestrationReplay", "FinalDrain"):
                 if task_id != -1 or function_id != -1 or flags != 0 or auxiliary != 0:
                     raise ValueError(
-                        f"fdwic_events[{index}] has invalid schema-v4 parent {phase} fields"
+                        f"fdwic_events[{index}] has invalid schema-v5 parent {phase} fields"
                     )
                 v4_parent_counts[core_id][phase] += 1
             elif phase == "Submit":
                 if task_id < 0 or flags > 1 or auxiliary > 1:
                     raise ValueError(
-                        f"fdwic_events[{index}] has invalid schema-v4 Submit fields"
+                        f"fdwic_events[{index}] has invalid schema-v5 Submit fields"
                     )
                 if task_key in v4_submits:
                     raise ValueError(
-                        f"core {core_id} has duplicate schema-v4 Submit for task {task_id}"
+                        f"core {core_id} has duplicate schema-v5 Submit for task {task_id}"
                     )
                 v4_submits.add(task_key)
                 v4_submit_semantics[task_key] = (bool(flags & 1), bool(auxiliary))
             elif phase == "Claim":
                 if task_id < 0 or task_key in v4_claims:
                     raise ValueError(
-                        f"core {core_id} has invalid or duplicate schema-v4 Claim for task {task_id}"
+                        f"core {core_id} has invalid or duplicate schema-v5 Claim for task {task_id}"
                     )
                 v4_claims[task_key] = (
                     bool(flags & 0x2), bool(flags & 0x1), bool(auxiliary)
+                )
+            elif phase == "Materialize":
+                if task_id < 0:
+                    raise ValueError(
+                        f"fdwic_events[{index}] Materialize requires non-negative task_id"
+                    )
+                v4_materializes.setdefault(task_key, []).append(
+                    (
+                        core_id,
+                        block_id,
+                        lane,
+                        task_id,
+                        function_id,
+                        phase,
+                        start_cycle,
+                        end_cycle,
+                        flags,
+                        auxiliary,
+                    )
                 )
             elif phase == "Register":
                 if task_id < 0:
@@ -626,11 +816,11 @@ def _load_and_validate(
             elif phase in ("WinnerBuild", "AllocComplete"):
                 if task_id < 0 or flags != 0 or auxiliary != 0:
                     raise ValueError(
-                        f"fdwic_events[{index}] has invalid schema-v4 tail {phase} fields"
+                        f"fdwic_events[{index}] has invalid schema-v5 tail {phase} fields"
                     )
                 if task_key in v4_tails:
                     raise ValueError(
-                        f"core {core_id} has duplicate schema-v4 tail for task {task_id}"
+                        f"core {core_id} has duplicate schema-v5 tail for task {task_id}"
                     )
                 if phase == "WinnerBuild" and function_id not in KERNEL_NAMES:
                     raise ValueError(
@@ -671,9 +861,11 @@ def _load_and_validate(
         )
 
     assert base_cycle is not None
-    if trace_schema_version in (3, 4) and level == 4:
+    if trace_schema_version in (3, 5) and level == 4:
         # 每核两条基线同时证明采集完整性和该后端是否真正应用了
         # atomic 返回值依赖；所有消费返回值的直接记录必须与本核证据一致。
+        # SharedInsertTurnPoll 的最终 PollBatch 可以额外带 return_ready，
+        # 但它仍表示整个轮询 episode，不能解释成单次 Load 延迟。
         for core_id, clock_state in v3_clock_rows.items():
             if clock_state["plain"] != 1 or clock_state["dependency"] != 1:
                 raise ValueError(
@@ -689,16 +881,25 @@ def _load_and_validate(
                     f"does not match core {core_id} ClockBaseline "
                     f"dependency_applied={expected_return_ready}"
                 )
+        for row_index, core_id, return_ready in v3_insert_turn_poll_batch_rows:
+            expected_return_ready = bool(v3_clock_rows[core_id]["return_ready"])
+            if return_ready != expected_return_ready:
+                raise ValueError(
+                    f"fdwic_events[{row_index}] PollBatch "
+                    f"return_ready={return_ready} "
+                    f"does not match core {core_id} ClockBaseline "
+                    f"dependency_applied={expected_return_ready}"
+                )
 
-    if trace_schema_version == 4:
+    if trace_schema_version == 5:
         for core_id, counts in v4_parent_counts.items():
             for phase, count in counts.items():
                 if count != 1:
                     raise ValueError(
-                        f"core {core_id} requires exactly one schema-v4 {phase}: count={count}"
+                        f"core {core_id} requires exactly one schema-v5 {phase}: count={count}"
                     )
         if set(v4_claims) != v4_submits:
-            raise ValueError("schema-v4 Claim keys do not match Submit keys")
+            raise ValueError("schema-v5 Claim keys do not match Submit keys")
         task_kind_by_id = _derive_v4_task_kinds(v4_submit_semantics, num_cores)
         for task_key, (attempted, won, is_alloc) in v4_claims.items():
             submit_won, submit_alloc = v4_submit_semantics[task_key]
@@ -706,13 +907,13 @@ def _load_and_validate(
             expected_alloc = task_kind == 0
             if is_alloc != expected_alloc or submit_alloc != expected_alloc:
                 raise ValueError(
-                    f"schema-v4 task-kind mismatch at {task_key}: "
+                    f"schema-v5 task-kind mismatch at {task_key}: "
                     f"expected_alloc={expected_alloc}"
                 )
             if won and not attempted:
-                raise ValueError(f"schema-v4 Claim won without attempt at {task_key}")
+                raise ValueError(f"schema-v5 Claim won without attempt at {task_key}")
             if submit_won != won or submit_alloc != is_alloc:
-                raise ValueError(f"schema-v4 Submit/Claim semantics mismatch at {task_key}")
+                raise ValueError(f"schema-v5 Submit/Claim semantics mismatch at {task_key}")
             expected_tail = (
                 ("AllocComplete", -1)
                 if is_alloc
@@ -724,23 +925,24 @@ def _load_and_validate(
             tail_valid = actual_tail == expected_tail if won else actual_tail is None
             if not tail_valid:
                 raise ValueError(
-                    f"schema-v4 tail mismatch at {task_key}: "
+                    f"schema-v5 tail mismatch at {task_key}: "
                     f"expected {expected_tail if won else 'no winner tail'}, "
                     f"got {actual_tail}"
                 )
             if tensormap_mode == "shared":
+                materializes = v4_materializes.get(task_key, [])
                 parents = v4_registers.get(task_key, [])
                 expected_parent_count = 1 if won else 0
                 if len(parents) != expected_parent_count:
                     raise ValueError(
-                        "shared schema-v4 requires exactly one Register parent "
+                        "shared schema-v5 requires exactly one Register parent "
                         "for each winner and none for losers at "
                         f"{task_key}: count={len(parents)} won={won}"
                     )
                 details = v4_shared_register_details.get(task_key, [])
                 if len(details) != (1 if won else 0):
                     raise ValueError(
-                        "shared schema-v4 requires exactly one "
+                        "shared schema-v5 requires exactly one "
                         "SharedRegisterPublishMetadata for each winner and none "
                         f"for losers at {task_key}: count={len(details)} won={won}"
                 )
@@ -748,10 +950,44 @@ def _load_and_validate(
                     continue
                 parent = parents[0]
                 detail = details[0]
+                output_details = v4_shared_register_output_details.get(
+                    task_key, []
+                )
+                if len(output_details) != 1:
+                    raise ValueError(
+                        "shared schema-v5 requires exactly one "
+                        "SharedRegisterPublishTaskOutputs or "
+                        "SharedMaterializePublishTaskOutputs for each winner "
+                        "and none "
+                        f"for losers at {task_key}: "
+                        f"count={len(output_details)} won={won}"
+                    )
+                output_detail = output_details[0]
+                output_phase = str(output_detail[5])
+                outputs_in_materialize = (
+                    output_phase ==
+                    "SharedMaterializePublishTaskOutputs"
+                )
+                if outputs_in_materialize and len(materializes) != 1:
+                    raise ValueError(
+                        "shared schema-v5 requires exactly one Materialize parent "
+                        "for each winner using Materialize task-output publication "
+                        f"at {task_key}: count={len(materializes)}"
+                    )
                 if parent[:5] != detail[:5]:
                     raise ValueError(
-                        "shared schema-v4 Register detail identity differs from "
+                        "shared schema-v5 Register detail identity differs from "
                         f"its parent at {task_key}"
+                    )
+                output_parent = (
+                    materializes[0]
+                    if outputs_in_materialize
+                    else detail
+                )
+                if output_parent[:5] != output_detail[:5]:
+                    raise ValueError(
+                        "shared schema-v5 task-outputs detail identity differs "
+                        f"from {output_parent[5]} at {task_key}"
                     )
                 parent_start, parent_end = int(parent[6]), int(parent[7])
                 detail_start, detail_end = int(detail[6]), int(detail[7])
@@ -762,23 +998,244 @@ def _load_and_validate(
                     <= parent_end
                 ):
                     raise ValueError(
-                        "shared schema-v4 SharedRegisterPublishMetadata is outside "
+                        "shared schema-v5 SharedRegisterPublishMetadata is outside "
                         f"Register parent at {task_key}"
                     )
+                output_start = int(output_detail[6])
+                output_end = int(output_detail[7])
+                output_parent_start = int(output_parent[6])
+                output_parent_end = int(output_parent[7])
+                if not (
+                    output_parent_start
+                    <= output_start
+                    <= output_end
+                    <= output_parent_end
+                ):
+                    raise ValueError(
+                        f"shared schema-v5 {output_phase} is outside "
+                        f"{output_parent[5]} at {task_key}"
+                    )
+                copy_details = v4_shared_register_output_copy_details.get(
+                    task_key, []
+                )
+                flush_details = v4_shared_register_output_flush_details.get(
+                    task_key, []
+                )
+                if len(copy_details) != 1:
+                    raise ValueError(
+                        "shared schema-v5 requires exactly one "
+                        "SharedRegisterPublishTaskOutputsCopy for each winner "
+                        f"and none for losers at {task_key}: "
+                        f"count={len(copy_details)} won={won}"
+                    )
+                if len(flush_details) != 1:
+                    raise ValueError(
+                        "shared schema-v5 requires exactly one "
+                        "SharedRegisterPublishTaskOutputsFlush for each winner "
+                        f"and none for losers at {task_key}: "
+                        f"count={len(flush_details)} won={won}"
+                    )
+                copy_detail = copy_details[0]
+                flush_detail = flush_details[0]
+                expected_copy_phase = (
+                    "SharedMaterializePublishTaskOutputsCopy"
+                    if outputs_in_materialize
+                    else "SharedRegisterPublishTaskOutputsCopy"
+                )
+                expected_flush_phase = (
+                    "SharedMaterializePublishTaskOutputsFlush"
+                    if outputs_in_materialize
+                    else "SharedRegisterPublishTaskOutputsFlush"
+                )
+                if (
+                    copy_detail[5] != expected_copy_phase
+                    or flush_detail[5] != expected_flush_phase
+                ):
+                    raise ValueError(
+                        "shared schema-v5 task-output detail families are mixed "
+                        f"at {task_key}: parent={output_phase} "
+                        f"copy={copy_detail[5]} flush={flush_detail[5]}"
+                    )
+                if output_detail[:5] != copy_detail[:5]:
+                    raise ValueError(
+                        "shared schema-v5 task-outputs copy identity differs "
+                        f"from {output_phase} at {task_key}"
+                    )
+                if output_detail[:5] != flush_detail[:5]:
+                    raise ValueError(
+                        "shared schema-v5 task-outputs flush identity differs "
+                        f"from {output_phase} at {task_key}"
+                    )
+                copy_start = int(copy_detail[6])
+                copy_end = int(copy_detail[7])
+                flush_start = int(flush_detail[6])
+                flush_end = int(flush_detail[7])
+                if not (
+                    output_start
+                    <= copy_start
+                    <= copy_end
+                    == flush_start
+                    <= flush_end
+                    <= output_end
+                ):
+                    raise ValueError(
+                        "shared schema-v5 task-outputs copy/flush nesting is "
+                        f"invalid at {task_key}: "
+                        f"outputs=[{output_start},{output_end}) "
+                        f"copy=[{copy_start},{copy_end}) "
+                        f"flush=[{flush_start},{flush_end})"
+                    )
+                if level == 4:
+                    matching_polls = [
+                        poll
+                        for poll in v4_shared_insert_turn_polls
+                        if poll[:3] == parent[:3]
+                        and int(poll[6]) == parent_start
+                        and int(poll[7]) == detail_start
+                    ]
+                    # per-task predecessor chain 中 task 0 没有前驱，不执行
+                    # insert-turn Load；其余 task 的 winner 各产生一条聚合
+                    # PollBatch。Register 的前段仍由父/detail 边界表示，
+                    # 不能因为 task 0 没有 atomic 就删掉该闭合区间。
+                    expected_poll_count = 0 if task_key[1] == 0 else 1
+                    if len(matching_polls) != expected_poll_count:
+                        raise ValueError(
+                            "shared schema-v5 level4 requires exactly one "
+                            "SharedInsertTurnPoll PollBatch for every nonzero-task "
+                            "winner and none for task 0 on "
+                            "Register.start->metadata.start at "
+                            f"{task_key}: count={len(matching_polls)} "
+                            f"expected={expected_poll_count}"
+                        )
+                    handoffs = v4_shared_insert_turn_handoffs.get(
+                        task_key, []
+                    )
+                    if len(handoffs) != 1:
+                        raise ValueError(
+                            "shared schema-v5 level4 requires exactly one "
+                            "SharedInsertTurnHandoff direct CAS per winner at "
+                            f"{task_key}: count={len(handoffs)}"
+                        )
+                    handoff = handoffs[0]
+                    handoff_start = int(handoff[6])
+                    handoff_end = int(handoff[7])
+                    if handoff[:3] != parent[:3] or not (
+                        detail_end
+                        <= handoff_start
+                        <= handoff_end
+                        <= parent_end
+                    ):
+                        raise ValueError(
+                            "shared schema-v5 SharedInsertTurnHandoff identity "
+                            "or boundary is outside metadata.end->Register.end "
+                            f"at {task_key}"
+                        )
 
         if tensormap_mode == "shared":
             orphan_parent_keys = set(v4_registers) - set(v4_claims)
             if orphan_parent_keys:
                 raise ValueError(
-                    "shared schema-v4 Register parents have no matching Claim: "
+                    "shared schema-v5 Register parents have no matching Claim: "
                     f"{sorted(orphan_parent_keys)[:8]}"
                 )
             orphan_detail_keys = set(v4_shared_register_details) - set(v4_claims)
             if orphan_detail_keys:
                 raise ValueError(
-                    "shared schema-v4 Register details have no matching Claim: "
+                    "shared schema-v5 Register details have no matching Claim: "
                     f"{sorted(orphan_detail_keys)[:8]}"
                 )
+            orphan_output_detail_keys = (
+                set(v4_shared_register_output_details) - set(v4_claims)
+            )
+            if orphan_output_detail_keys:
+                raise ValueError(
+                    "shared schema-v5 task-output details have no matching Claim: "
+                    f"{sorted(orphan_output_detail_keys)[:8]}"
+                )
+            orphan_copy_detail_keys = (
+                set(v4_shared_register_output_copy_details) - set(v4_claims)
+            )
+            if orphan_copy_detail_keys:
+                raise ValueError(
+                    "shared schema-v5 task-output copy details have no matching "
+                    f"Claim: {sorted(orphan_copy_detail_keys)[:8]}"
+                )
+            orphan_flush_detail_keys = (
+                set(v4_shared_register_output_flush_details) - set(v4_claims)
+            )
+            if orphan_flush_detail_keys:
+                raise ValueError(
+                    "shared schema-v5 task-output flush details have no matching "
+                    f"Claim: {sorted(orphan_flush_detail_keys)[:8]}"
+                )
+            for task_key, output_details in (
+                v4_shared_register_output_details.items()
+            ):
+                won = v4_claims.get(task_key, (False, False, False))[1]
+                if len(output_details) != (1 if won else 0):
+                    raise ValueError(
+                        "shared schema-v5 requires exactly one "
+                        "SharedRegisterPublishTaskOutputs for each winner and none "
+                        f"for losers at {task_key}: "
+                        f"count={len(output_details)} won={won}"
+                    )
+            for task_key, copy_details in (
+                v4_shared_register_output_copy_details.items()
+            ):
+                won = v4_claims.get(task_key, (False, False, False))[1]
+                if len(copy_details) != (1 if won else 0):
+                    raise ValueError(
+                        "shared schema-v5 requires exactly one "
+                        "SharedRegisterPublishTaskOutputsCopy for each winner "
+                        f"and none for losers at {task_key}: "
+                        f"count={len(copy_details)} won={won}"
+                    )
+            for task_key, flush_details in (
+                v4_shared_register_output_flush_details.items()
+            ):
+                won = v4_claims.get(task_key, (False, False, False))[1]
+                if len(flush_details) != (1 if won else 0):
+                    raise ValueError(
+                        "shared schema-v5 requires exactly one "
+                        "SharedRegisterPublishTaskOutputsFlush for each winner "
+                        f"and none for losers at {task_key}: "
+                        f"count={len(flush_details)} won={won}"
+                    )
+            if level == 4:
+                winner_count = sum(
+                    won for _attempted, won, _is_alloc in v4_claims.values()
+                )
+                nonzero_task_winner_count = sum(
+                    1
+                    for (_core_id, task_id), (
+                        _attempted,
+                        won,
+                        _is_alloc,
+                    ) in v4_claims.items()
+                    if won and task_id > 0
+                )
+                if (
+                    len(v4_shared_insert_turn_polls)
+                    != nonzero_task_winner_count
+                ):
+                    raise ValueError(
+                        "shared schema-v5 level4 has orphan or duplicate "
+                        "SharedInsertTurnPoll records: "
+                        f"records={len(v4_shared_insert_turn_polls)} "
+                        "expected_nonzero_task_winners="
+                        f"{nonzero_task_winner_count} "
+                        f"all_winners={winner_count}"
+                    )
+                handoff_count = sum(
+                    len(items)
+                    for items in v4_shared_insert_turn_handoffs.values()
+                )
+                if handoff_count != winner_count:
+                    raise ValueError(
+                        "shared schema-v5 level4 has orphan or duplicate "
+                        "SharedInsertTurnHandoff records: "
+                        f"records={handoff_count} winners={winner_count}"
+                    )
 
     if trace_schema_version >= 3:
         producer_summary = metadata.get("fdwic_summary")
@@ -807,7 +1264,7 @@ def _emit_event(output: TextIO, event: dict[str, Any], first: bool) -> bool:
     return False
 
 
-def _iter_v4_residual_spans(
+def _iter_v5_residual_spans(
     rows: list[tuple[Any, ...]],
 ) -> Iterator[tuple[int, int, int, int, int, str]]:
     """只用既有 Submit/child 边界生成逐段补集，不改 raw ABI。"""
@@ -822,15 +1279,15 @@ def _iter_v4_residual_spans(
         if phase == "Submit":
             submits_by_lane.setdefault(lane_key, []).append(row)
             if task_key in submit_by_task:
-                raise ValueError(f"schema-v4 residual synthesis found duplicate Submit {task_key}")
+                raise ValueError(f"schema-v5 residual synthesis found duplicate Submit {task_key}")
             submit_by_task[task_key] = row
-        elif phase in V4_EXCLUSIVE_SUBMIT_PHASES:
+        elif phase in V5_EXCLUSIVE_SUBMIT_PHASES:
             children_by_task.setdefault(task_key, []).append(row)
 
     orphan_child_keys = set(children_by_task) - set(submit_by_task)
     if orphan_child_keys:
         raise ValueError(
-            "schema-v4 residual synthesis found children without matching Submit: "
+            "schema-v5 residual synthesis found children without matching Submit: "
             f"{sorted(orphan_child_keys)[:8]}"
         )
 
@@ -843,7 +1300,7 @@ def _iter_v4_residual_spans(
             previous_end = int(previous[7])
             current_start = int(current[6])
             if current_start < previous_end:
-                raise ValueError(f"schema-v4 Submit spans overlap on core/lane {lane_key}")
+                raise ValueError(f"schema-v5 Submit spans overlap on core/lane {lane_key}")
             if current_start > previous_end:
                 yield (
                     int(previous[0]),
@@ -872,11 +1329,11 @@ def _iter_v4_residual_spans(
             child_end = int(child[7])
             if child_start < submit_start or child_end > submit_end:
                 raise ValueError(
-                    f"schema-v4 {child[5]} child is outside Submit {task_key}"
+                    f"schema-v5 {child[5]} child is outside Submit {task_key}"
                 )
             if child_start < cursor:
                 raise ValueError(
-                    f"schema-v4 exclusive children overlap in Submit {task_key}"
+                    f"schema-v5 exclusive children overlap in Submit {task_key}"
                 )
             if child_start > cursor:
                 yield (
@@ -900,18 +1357,19 @@ def _iter_v4_residual_spans(
             )
 
 
-def _iter_v4_shared_register_derived_spans(
+def _iter_v5_shared_register_derived_spans(
     rows: list[tuple[Any, ...]],
 ) -> Iterator[tuple[int, int, int, int, int, str]]:
-    """用 Register 父区间和唯一设备细分记录补出等待、交棒两段。
+    """用 Register 与 metadata 边界补出非 raw 串行段。
 
-    ``SharedRegisterPublishMetadata`` 是设备端唯一新增的 raw 记录；另外两段
-    只复用父子边界离线生成，因此每个 winner 的 raw 固定只增加一行。
-    输入在写 merged 前已经完成基数、身份与包含关系校验。
+    新采集的 task outputs 已属于 Materialize，因此 Register 只合成等待、
+    writer metadata 与交棒。迁移前 raw 仍按旧 outputs 子区间恢复 metadata
+    epilogue，保证历史泳道可重放。
     """
 
     parents: dict[tuple[int, int], tuple[Any, ...]] = {}
     details: dict[tuple[int, int], tuple[Any, ...]] = {}
+    output_details: dict[tuple[int, int], tuple[Any, ...]] = {}
     for row in rows:
         core_id, _block_id, _lane, task_id, _function_id, phase, *_rest = row
         task_key = (int(core_id), int(task_id))
@@ -919,10 +1377,16 @@ def _iter_v4_shared_register_derived_spans(
             parents[task_key] = row
         elif phase == "SharedRegisterPublishMetadata":
             details[task_key] = row
+        elif phase in (
+            "SharedMaterializePublishTaskOutputs",
+            "SharedRegisterPublishTaskOutputs",
+        ):
+            output_details[task_key] = row
 
     for task_key in sorted(details):
         parent = parents[task_key]
         detail = details[task_key]
+        output_detail = output_details[task_key]
         core_id, block_id, lane, task_id = (
             int(parent[0]),
             int(parent[1]),
@@ -935,15 +1399,41 @@ def _iter_v4_shared_register_derived_spans(
             lane,
             int(parent[6]),
             int(detail[6]),
-            f"register.wait_insert_turn#{task_id}",
+            f"register.wait_predecessor_insert#{task_id}",
         )
+        if output_detail[5] == "SharedRegisterPublishTaskOutputs":
+            yield (
+                core_id,
+                block_id,
+                lane,
+                int(detail[6]),
+                int(output_detail[6]),
+                f"register.publish_writer_metadata#{task_id}",
+            )
+            yield (
+                core_id,
+                block_id,
+                lane,
+                int(output_detail[7]),
+                int(detail[7]),
+                f"register.publish_metadata_epilogue#{task_id}",
+            )
+        else:
+            yield (
+                core_id,
+                block_id,
+                lane,
+                int(detail[6]),
+                int(detail[7]),
+                f"register.publish_writer_metadata#{task_id}",
+            )
         yield (
             core_id,
             block_id,
             lane,
             int(detail[7]),
             int(parent[7]),
-            f"register.handoff_next_turn#{task_id}",
+            f"register.publish_insert_completion#{task_id}",
         )
 
 
@@ -1096,10 +1586,25 @@ def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
                         atomic_call_count = (
                             flags >> ATOMIC_PAYLOAD_SHIFT
                         ) & ATOMIC_PAYLOAD_MASK
-                        name = (
-                            f"atomic.poll_batch.{atomic_site}.{atomic_op}"
-                            f"×{atomic_call_count}"
-                        )
+                        if (
+                            atomic_site_id
+                            == SHARED_INSERT_TURN_POLL_SITE_ID
+                        ):
+                            poll_boundary_tag = (
+                                "return_ready"
+                                if flags & ATOMIC_RETURN_READY
+                                else "source_issue"
+                            )
+                            name = (
+                                f"atomic.poll_batch.{poll_boundary_tag}."
+                                f"{atomic_site}.{atomic_op}"
+                                f"×{atomic_call_count}"
+                            )
+                        else:
+                            name = (
+                                f"atomic.poll_batch.{atomic_site}.{atomic_op}"
+                                f"×{atomic_call_count}"
+                            )
                     else:
                         # 边界直接写入 span 名称，打开泳道后无需点开 args
                         # 就能区分“本核返回值可消费”和“只包围源码发射”。
@@ -1246,8 +1751,8 @@ def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
                         "execution_unit": "scalar",
                     }
                     event["cat"] = "scalar_clock"
-                if trace_schema_version == 4:
-                    # schema-v4 的 merged 只承担可视化：阶段、atomic site/op/
+                if trace_schema_version == 5:
+                    # schema-v5 的 merged 只承担可视化：阶段、atomic site/op/
                     # boundary、task 和 poll 次数均已编码在 name，轨道与时间由
                     # pid/tid/ts/dur 给出。十列权威字段完整保留在同目录 raw，
                     # 不再逐事件复制近 100 MiB 的 args/cat。
@@ -1255,10 +1760,11 @@ def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
                     event.pop("cat", None)
                 first = _emit_event(output, event, first)
                 emitted += 1
-            if trace_schema_version == 4:
-                # shared Register 的设备端只记录元数据发布中段；等待插入前沿
-                # 和向下一 task 交棒两段由父子边界离线补出，均为 6 字段 X
-                # event。它们是 Register 内部拆分，绝不能加入 Submit 补集扣除。
+            if trace_schema_version == 5:
+                # shared Register 记录 metadata 子区间；等待、writer
+                # metadata 与交棒由边界离线补出。新采集的 task outputs 是
+                # Materialize detail；历史 v5 仍按旧 Register 嵌套兼容。
+                # 这些 detail 都不能加入 Submit 补集重复扣除。
                 for (
                     _core_id,
                     block_id,
@@ -1266,7 +1772,7 @@ def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
                     start,
                     end,
                     name,
-                ) in _iter_v4_shared_register_derived_spans(rows):
+                ) in _iter_v5_shared_register_derived_spans(rows):
                     first = _emit_event(
                         output,
                         {
@@ -1283,7 +1789,7 @@ def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
                 # 补集是纯离线合成件：不增加设备 trace record、SYS_CNT
                 # 或 raw 字段。事件只保留 Perfetto X 必需的 6 个字段，
                 # 不复制每条 raw 已有的 args，控制 merged 体积增量。
-                for _core_id, block_id, lane, start, end, name in _iter_v4_residual_spans(rows):
+                for _core_id, block_id, lane, start, end, name in _iter_v5_residual_spans(rows):
                     first = _emit_event(
                         output,
                         {

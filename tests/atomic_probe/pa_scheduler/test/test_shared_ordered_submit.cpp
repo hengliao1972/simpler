@@ -10,6 +10,7 @@
  */
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -59,9 +60,15 @@ struct OrderedSubmitTestOps {
     static inline std::atomic<uint32_t>
         claim_wins_by_task[kMaxTasks]{};
     static inline std::atomic<uint32_t>
-        insert_publish_by_token[kMaxTasks + 1U]{};
+        completion_loads_by_cell[kMaxTasks]{};
     static inline std::atomic<uint32_t>
-        insert_publish_by_lane[kSharedInsertTurnCapacity]{};
+        completion_cas_by_task[kMaxTasks]{};
+    static inline std::atomic<uint32_t>
+        completion_publish_by_task[kMaxTasks]{};
+    static inline std::atomic<uint32_t>
+        bad_completion_cas{0};
+    static inline std::atomic<uint32_t>
+        legacy_turn_atomic_accesses{0};
 
     static void ResetHooks() {
         observed_state = nullptr;
@@ -82,19 +89,22 @@ struct OrderedSubmitTestOps {
             claim_wins_by_task[task].store(
                 0, std::memory_order_relaxed
             );
-            insert_publish_by_token[task].store(
+            completion_loads_by_cell[task].store(
+                0, std::memory_order_relaxed
+            );
+            completion_cas_by_task[task].store(
+                0, std::memory_order_relaxed
+            );
+            completion_publish_by_task[task].store(
                 0, std::memory_order_relaxed
             );
         }
-        insert_publish_by_token[kMaxTasks].store(
+        bad_completion_cas.store(
             0, std::memory_order_relaxed
         );
-        for (uint32_t lane = 0;
-             lane < kSharedInsertTurnCapacity; ++lane) {
-            insert_publish_by_lane[lane].store(
-                0, std::memory_order_relaxed
-            );
-        }
+        legacy_turn_atomic_accesses.store(
+            0, std::memory_order_relaxed
+        );
     }
 
     static CompeteFirstSplitRuntimeState &
@@ -139,6 +149,18 @@ struct OrderedSubmitTestOps {
 
     static int64_t Load(volatile int64_t *address) {
         CountSharedMapAccess(address, sizeof(*address));
+        const int32_t task_cell =
+            CompletionTaskCell(address);
+        if (task_cell >= 0) {
+            completion_loads_by_cell[
+                static_cast<uint32_t>(task_cell)
+            ].fetch_add(1, std::memory_order_relaxed);
+        }
+        if (IsLegacyTurnAddress(address)) {
+            legacy_turn_atomic_accesses.fetch_add(
+                1, std::memory_order_relaxed
+            );
+        }
         return __atomic_fetch_add(address, static_cast<int64_t>(0), __ATOMIC_ACQUIRE);
     }
 
@@ -166,33 +188,36 @@ struct OrderedSubmitTestOps {
         volatile int64_t *address, int64_t expected, int64_t desired
     ) {
         CountSharedMapAccess(address, sizeof(*address));
-        int32_t insert_lane = -1;
-        if (observed_state != nullptr) {
-            for (uint32_t lane = 0;
-                 lane < kSharedInsertTurnCapacity; ++lane) {
-                if (address ==
-                    &SharedInsertTurnLine(
-                        observed_state->shared_map, lane
-                    ).value) {
-                    insert_lane =
-                        static_cast<int32_t>(lane);
-                    break;
-                }
+        const int32_t completion_task =
+            CompletionTaskCell(address);
+        if (completion_task >= 0) {
+            const uint32_t task =
+                static_cast<uint32_t>(completion_task);
+            completion_cas_by_task[task].fetch_add(
+                1, std::memory_order_relaxed
+            );
+            if (expected != -1 ||
+                desired != completion_task) {
+                bad_completion_cas.fetch_add(
+                    1, std::memory_order_relaxed
+                );
             }
+        }
+        if (IsLegacyTurnAddress(address)) {
+            legacy_turn_atomic_accesses.fetch_add(
+                1, std::memory_order_relaxed
+            );
         }
         int64_t observed = expected;
         (void)__atomic_compare_exchange_n(
             address, &observed, desired, false,
             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE
         );
-        if (insert_lane >= 0 && observed == expected &&
-            desired > 0 &&
-            desired <= static_cast<int64_t>(kMaxTasks)) {
-            insert_publish_by_token[
-                static_cast<uint32_t>(desired)
-            ].fetch_add(1, std::memory_order_relaxed);
-            insert_publish_by_lane[
-                static_cast<uint32_t>(insert_lane)
+        if (completion_task >= 0 &&
+            observed == expected && expected == -1 &&
+            desired == completion_task) {
+            completion_publish_by_task[
+                static_cast<uint32_t>(completion_task)
             ].fetch_add(1, std::memory_order_relaxed);
         }
         return observed;
@@ -207,43 +232,13 @@ struct OrderedSubmitTestOps {
         volatile int64_t *address, int64_t value, uint64_t &retries
     ) {
         CountSharedMapAccess(address, sizeof(*address));
-        bool claim_cursor = false;
-        if (observed_state != nullptr) {
-            const uintptr_t current =
-                reinterpret_cast<uintptr_t>(address);
-            const auto in_lines =
-                [current](
-                    const AtomicLine *lines,
-                    uint32_t count
-                ) {
-                    const uintptr_t begin =
-                        reinterpret_cast<uintptr_t>(lines);
-                    const uintptr_t end =
-                        begin +
-                        static_cast<uintptr_t>(count) *
-                            sizeof(AtomicLine);
-                    return current >= begin && current < end &&
-                           (current - begin) %
-                                   sizeof(AtomicLine) ==
-                               0;
-                };
-            claim_cursor =
-                in_lines(
-                    observed_state->cube_cursor,
-                    kCursorShards
-                ) ||
-                in_lines(
-                    observed_state->alloc_cursor,
-                    kCursorShards
-                ) ||
-                in_lines(
-                    observed_state->shared_map
-                        .shared_vector_cursor,
-                    kSharedVectorCursorShards
-                );
-        }
-        if (claim_cursor && value >= 0 &&
-            value < static_cast<int64_t>(kMaxTasks)) {
+        const bool valid_task =
+            value >= 0 &&
+            value < static_cast<int64_t>(kMaxTasks);
+        const bool claim_address =
+            observed_state != nullptr && valid_task &&
+            IsClaimCursorAddress(address);
+        if (claim_address) {
             claim_attempts_by_task[
                 static_cast<uint32_t>(value)
             ].fetch_add(1, std::memory_order_relaxed);
@@ -261,13 +256,83 @@ struct OrderedSubmitTestOps {
             }
             ++retries;
         }
-        if (claim_cursor && won && value >= 0 &&
-            value < static_cast<int64_t>(kMaxTasks)) {
+        if (claim_address && won) {
             claim_wins_by_task[
                 static_cast<uint32_t>(value)
             ].fetch_add(1, std::memory_order_relaxed);
         }
         return current;
+    }
+
+    static bool IsLegacyTurnAddress(
+        const volatile int64_t *address
+    ) {
+        if (observed_state == nullptr) {
+            return false;
+        }
+        for (uint32_t lane = 0;
+             lane < kSharedInsertTurnCapacity; ++lane) {
+            if (address ==
+                &SharedInsertTurnLine(
+                    observed_state->shared_map, lane
+                ).value) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static int32_t CompletionTaskCell(
+        const volatile int64_t *address
+    ) {
+        if (observed_state == nullptr) {
+            return -1;
+        }
+        const uintptr_t current =
+            reinterpret_cast<uintptr_t>(address);
+        const uintptr_t begin =
+            reinterpret_cast<uintptr_t>(
+                &observed_state->tasks[0].deps_prepared
+            );
+        if (current < begin) {
+            return -1;
+        }
+        const uintptr_t delta = current - begin;
+        if (delta % sizeof(TaskCell) != 0) {
+            return -1;
+        }
+        const uintptr_t task = delta / sizeof(TaskCell);
+        return task < kMaxTasks
+            ? static_cast<int32_t>(task)
+            : -1;
+    }
+
+    static bool IsClaimCursorAddress(
+        const volatile int64_t *address
+    ) {
+        if (observed_state == nullptr) {
+            return false;
+        }
+        for (uint32_t shard = 0; shard < kCursorShards;
+             ++shard) {
+            if (address ==
+                    &observed_state
+                         ->cube_cursor[shard].value ||
+                address ==
+                    &observed_state
+                         ->alloc_cursor[shard].value) {
+                return true;
+            }
+        }
+        for (uint32_t shard = 0;
+             shard < kSharedVectorCursorShards; ++shard) {
+            if (address ==
+                &observed_state->shared_map
+                     .shared_vector_cursor[shard].value) {
+                return true;
+            }
+        }
+        return false;
     }
 
     static void StoreBarrier() {
@@ -398,20 +463,42 @@ SchedulerState *MapSchedulerState() {
     return new (memory) SchedulerState{};
 }
 
-bool InsertTurnsMatch(
-    const SchedulerState &state, uint32_t completed_tasks
+using LegacyTurnSnapshot =
+    std::array<int64_t, kSharedInsertTurnCapacity>;
+
+LegacyTurnSnapshot SeedLegacyTurns(
+    SchedulerState &state
+) {
+    LegacyTurnSnapshot snapshot{};
+    for (uint32_t lane = 0;
+         lane < kSharedInsertTurnCapacity; ++lane) {
+        snapshot[lane] =
+            -10000 - static_cast<int64_t>(lane);
+        __atomic_store_n(
+            &SharedInsertTurnLine(
+                state.shared_map, lane
+            ).value,
+            snapshot[lane], __ATOMIC_RELEASE
+        );
+    }
+    return snapshot;
+}
+
+bool LegacyTurnsMatch(
+    const SchedulerState &state,
+    const LegacyTurnSnapshot &snapshot
 ) {
     for (uint32_t lane = 0;
          lane < kSharedInsertTurnCapacity; ++lane) {
-        const volatile int64_t *address =
-            lane == 0
-                ? &state.shared_map.committed_tasks.value
-                : &state.shared_map
-                       .insert_turn_extra[lane - 1U].value;
-        if (__atomic_load_n(address, __ATOMIC_ACQUIRE) !=
-            SharedInsertTurnTokenAfterTasks(
-                completed_tasks, lane
-            )) {
+        if (__atomic_load_n(
+                &SharedInsertTurnLine(
+                    const_cast<SharedTensorMapSidecar &>(
+                        state.shared_map
+                    ),
+                    lane
+                ).value,
+                __ATOMIC_ACQUIRE
+            ) != snapshot[lane]) {
             return false;
         }
     }
@@ -470,32 +557,51 @@ bool ClaimAndInsertEvidenceMatches(
                         std::memory_order_relaxed
                     ) == 1;
             exact &=
+                state.tasks[task_id].deps_prepared ==
+                static_cast<int64_t>(task_id);
+            exact &=
                 OrderedSubmitTestOps::
-                    insert_publish_by_token[task_id + 1U]
+                    completion_cas_by_task[task_id]
                         .load(std::memory_order_relaxed) == 1;
+            exact &=
+                OrderedSubmitTestOps::
+                    completion_publish_by_task[task_id]
+                        .load(std::memory_order_relaxed) == 1;
+            const uint32_t completion_loads =
+                OrderedSubmitTestOps::
+                    completion_loads_by_cell[task_id]
+                        .load(std::memory_order_relaxed);
+            exact &= task_id + 1U < task_count
+                ? completion_loads != 0
+                : completion_loads == 0;
         }
         planned_tasks += plan.task_count;
     }
     exact &= planned_tasks == task_count;
-
-    uint32_t expected_lane_publishes[
-        kSharedInsertTurnCapacity
-    ] = {};
-    for (uint32_t token = 1;
-         token <= task_count; ++token) {
-        ++expected_lane_publishes[
-            token & kSharedInsertTurnMask
-        ];
-    }
-    for (uint32_t lane = 0;
-         lane < kSharedInsertTurnCapacity; ++lane) {
+    for (uint32_t task = task_count;
+         task < kMaxTasks; ++task) {
         exact &=
             OrderedSubmitTestOps::
-                insert_publish_by_lane[lane].load(
+                completion_cas_by_task[task].load(
                     std::memory_order_relaxed
-                ) == expected_lane_publishes[lane];
+                ) == 0 &&
+            OrderedSubmitTestOps::
+                completion_publish_by_task[task].load(
+                    std::memory_order_relaxed
+                ) == 0 &&
+            OrderedSubmitTestOps::
+                completion_loads_by_cell[task].load(
+                    std::memory_order_relaxed
+                ) == 0;
     }
-    return exact;
+    return exact &&
+           OrderedSubmitTestOps::bad_completion_cas.load(
+               std::memory_order_relaxed
+           ) == 0 &&
+           OrderedSubmitTestOps::
+                   legacy_turn_atomic_accesses.load(
+                       std::memory_order_relaxed
+                   ) == 0;
 }
 
 bool RunLoserZeroTensorMapAccessTest() {
@@ -589,6 +695,8 @@ bool RunInsertReleaseBeforeBuildTest() {
     options.final_barrier_shape = FinalBarrierShape::TwoLevel16;
     pa_scheduler::host::InitializeState(state, options);
     pa_scheduler::host::ConfigureTrace(state, options, nullptr);
+    const LegacyTurnSnapshot legacy =
+        SeedLegacyTurns(*state);
     OrderedSubmitTestOps::ResetHooks();
     OrderedSubmitTestOps::hook_mode =
         OrderedSubmitHookMode::BuildOverlap;
@@ -624,10 +732,12 @@ bool RunInsertReleaseBeforeBuildTest() {
     }
 
     bool all_tasks_ready = true;
-    bool loser_gates_untouched = true;
+    bool claim_cells_match = true;
     for (uint32_t task = 0; task < kTaskCount; ++task) {
         all_tasks_ready &= state->tasks[task].flag == 1;
-        loser_gates_untouched &= state->tasks[task].deps_prepared == -1;
+        claim_cells_match &=
+            state->tasks[task].deps_prepared ==
+            static_cast<int64_t>(task);
     }
     bool final_writers_ok = true;
     for (uint32_t slot = 0; slot < 3; ++slot) {
@@ -642,7 +752,7 @@ bool RunInsertReleaseBeforeBuildTest() {
         );
     const bool ok =
         state->fatal.value == 0 &&
-        InsertTurnsMatch(*state, kTaskCount) &&
+        LegacyTurnsMatch(*state, legacy) &&
         ClaimAndInsertEvidenceMatches(
             *state, kTaskCount
         ) &&
@@ -656,7 +766,7 @@ bool RunInsertReleaseBeforeBuildTest() {
             std::memory_order_relaxed
         ) &&
         overlap && worker_results_ok && all_tasks_ready &&
-        loser_gates_untouched && final_writers_ok &&
+        claim_cells_match && final_writers_ok &&
         kernel_counts[0] == 4 && kernel_counts[1] == 4 &&
         kernel_counts[2] == 4 && kernel_counts[3] == 4 &&
         pa_scheduler::host::FinalBarrierStateMatches(
@@ -664,7 +774,7 @@ bool RunInsertReleaseBeforeBuildTest() {
         );
     std::printf(
         "[ORDERED_SUBMIT] release_before_build=%s "
-        "completed=%u turn0=%lld overlap=%u "
+        "completed=%u legacy_turn0=%lld overlap=%u "
         "kernels=%llu,%llu,%llu,%llu\n",
         ok ? "PASS" : "FAIL",
         kTaskCount,
@@ -695,6 +805,8 @@ bool RunIndependentKernelExecutionTest() {
     options.final_barrier_shape = FinalBarrierShape::TwoLevel16;
     pa_scheduler::host::InitializeState(state, options);
     pa_scheduler::host::ConfigureTrace(state, options, nullptr);
+    const LegacyTurnSnapshot legacy =
+        SeedLegacyTurns(*state);
     OrderedSubmitTestOps::ResetHooks();
     OrderedSubmitTestOps::hook_mode =
         OrderedSubmitHookMode::ExecutionOverlap;
@@ -740,7 +852,7 @@ bool RunIndependentKernelExecutionTest() {
         );
     const bool ok =
         state->fatal.value == 0 &&
-        InsertTurnsMatch(*state, kTaskCount) &&
+        LegacyTurnsMatch(*state, legacy) &&
         ClaimAndInsertEvidenceMatches(
             *state, kTaskCount
         ) &&
@@ -759,7 +871,8 @@ bool RunIndependentKernelExecutionTest() {
         );
     std::printf(
         "[ORDERED_SUBMIT] independent_kernel_overlap=%s "
-        "completed=%u turn0=%lld kernels=%llu,%llu,%llu,%llu\n",
+        "completed=%u legacy_turn0=%lld "
+        "kernels=%llu,%llu,%llu,%llu\n",
         ok ? "PASS" : "FAIL",
         kTaskCount,
         static_cast<long long>(

@@ -262,7 +262,7 @@ def _v4_capture(*, tensormap_mode: str = "shared") -> dict[str, object]:
     capture["l2_swimlane_level"] = 4
     metadata = capture["metadata"]
     assert isinstance(metadata, dict)
-    metadata["trace_schema_version"] = 4
+    metadata["trace_schema_version"] = 5
     metadata["tensormap_mode"] = tensormap_mode
     source_rows = capture["fdwic_events"]
     assert isinstance(source_rows, list)
@@ -278,7 +278,7 @@ def _v4_capture(*, tensormap_mode: str = "shared") -> dict[str, object]:
         base = 1000 + core_id
         submit_start = base + (0 if task_id == 0 else 120)
         if phase == "Claim":
-            # schema-v4 跟随 compete-first eager 生产路径：Claim 先于
+            # schema-v5 跟随 compete-first eager 生产路径：Claim 先于
             # callback 构参与 Materialize。两类 task 都保留 v3 fixture
             # 的 Claim 时长，只调整边界顺序。
             row[6:8] = (
@@ -344,24 +344,89 @@ def _v4_capture(*, tensormap_mode: str = "shared") -> dict[str, object]:
             )
 
     if tensormap_mode == "shared":
-        # Register 父区间只增加一条元数据发布 detail。等待有序插入轮次和
-        # 交接下一轮由分析器使用父区间前后补集恢复，不增加两条 raw 记录。
+        # Register 父区间固定带 metadata 父 detail 和 task-output 子 detail。
+        # 等待前驱、writer metadata、metadata 收尾和完成发布均由端点补集恢复，
+        # 不为这些区域继续扩张 raw。
         register_rows = [row for row in rows if row[5] == "Register"]
         for register in register_rows:
             start = int(register[6])
             end = int(register[7])
+            publish_start = start + 1
+            publish_end = end - 1
+            outputs_start = start + 3
+            outputs_end = end - 2
             rows.append(
                 _row(
                     int(register[0]),
                     int(register[3]),
                     "SharedRegisterPublishMetadata",
-                    start + 2,
-                    end - 2,
+                    publish_start,
+                    publish_end,
                     function_id=int(register[4]),
                 )
             )
+            rows.append(
+                _row(
+                    int(register[0]),
+                    int(register[3]),
+                    "SharedRegisterPublishTaskOutputs",
+                    outputs_start,
+                    outputs_end,
+                    function_id=int(register[4]),
+                )
+            )
+            copy_end = outputs_start + max(1, (outputs_end - outputs_start) // 2)
+            if copy_end > outputs_end:
+                copy_end = outputs_end
+            rows.append(
+                _row(
+                    int(register[0]),
+                    int(register[3]),
+                    "SharedRegisterPublishTaskOutputsCopy",
+                    outputs_start,
+                    copy_end,
+                    function_id=int(register[4]),
+                )
+            )
+            rows.append(
+                _row(
+                    int(register[0]),
+                    int(register[3]),
+                    "SharedRegisterPublishTaskOutputsFlush",
+                    copy_end,
+                    outputs_end,
+                    function_id=int(register[4]),
+                )
+            )
+            # per-task predecessor chain 中 task 0 没有前驱，因此只有
+            # task>0 的 winner 才产生 insert-turn PollBatch。
+            if int(register[3]) > 0:
+                rows.append(
+                    _row(
+                        int(register[0]),
+                        -1,
+                        "Atomic",
+                        start,
+                        publish_start,
+                        flags=(3 << 8) | 0xD0,
+                        auxiliary=19,
+                    )
+                )
+            # 每个 winner（包括 task 0）都用 completion CAS 发布本 task
+            # 的 metadata 已完成，使 Register 后段和父区间保持闭合。
+            rows.append(
+                _row(
+                    int(register[0]),
+                    int(register[3]),
+                    "Atomic",
+                    publish_end,
+                    end,
+                    flags=0x54,
+                    auxiliary=20,
+                )
+            )
 
-    # schema-v4 动态门槛必须使用完整 G1：在历史两 task fixture 后补齐
+    # schema-v5 动态门槛必须使用完整 G1：在历史两 task fixture 后补齐
     # SF/PV/UP 三个 loser。这样测试不会再依赖“截断到 QK 的非法 batch”。
     _append_v4_g1_tail_tasks(rows, tensormap_mode)
 
@@ -372,6 +437,74 @@ def _v4_capture(*, tensormap_mode: str = "shared") -> dict[str, object]:
                 _row(core_id, -1, "OrchestrationReplay", base - 10, base + 510),
                 _row(core_id, -1, "FinalDrain", base + 510, base + 550),
                 _row(core_id, 4, "Kernel", base + 520, base + 530, function_id=3),
+            ]
+        )
+    capture["fdwic_events"] = rows
+    _refresh_summary(capture)
+    return capture
+
+
+def _v5_materialize_output_capture() -> dict[str, object]:
+    """把 legacy v5 fixture 迁移成 output publication 位于 Materialize。"""
+
+    capture = _v4_capture()
+    source_rows = capture["fdwic_events"]
+    assert isinstance(source_rows, list)
+    materializes = {
+        (int(row[0]), int(row[3])): row
+        for row in source_rows
+        if row[5] == "Materialize"
+    }
+    metadata_tasks = {
+        (int(row[0]), int(row[3]))
+        for row in source_rows
+        if row[5] == "SharedRegisterPublishMetadata"
+    }
+    rows = [
+        row
+        for row in source_rows
+        if row[5]
+        not in {
+            "SharedRegisterPublishTaskOutputs",
+            "SharedRegisterPublishTaskOutputsCopy",
+            "SharedRegisterPublishTaskOutputsFlush",
+        }
+    ]
+    for task_key in sorted(metadata_tasks):
+        materialize = materializes[task_key]
+        output_start = int(materialize[7]) - 4
+        output_end = int(materialize[7]) - 1
+        core_id, task_id, function_id = (
+            int(materialize[0]),
+            int(materialize[3]),
+            int(materialize[4]),
+        )
+        rows.extend(
+            [
+                _row(
+                    core_id,
+                    task_id,
+                    "SharedMaterializePublishTaskOutputs",
+                    output_start,
+                    output_end,
+                    function_id=function_id,
+                ),
+                _row(
+                    core_id,
+                    task_id,
+                    "SharedMaterializePublishTaskOutputsCopy",
+                    output_start,
+                    output_start + 1,
+                    function_id=function_id,
+                ),
+                _row(
+                    core_id,
+                    task_id,
+                    "SharedMaterializePublishTaskOutputsFlush",
+                    output_start + 1,
+                    output_end - 1,
+                    function_id=function_id,
+                ),
             ]
         )
     capture["fdwic_events"] = rows
@@ -447,7 +580,7 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
         self.assertEqual(len(report["per_core"]), 96)
         self.assertIsNone(report["kernel_containment"]["orphan_events"])
         self.assertEqual(
-            report["kernel_containment"]["unclassified_without_v4_parent_events"],
+            report["kernel_containment"]["unclassified_without_v5_parent_events"],
             0,
         )
 
@@ -456,7 +589,8 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
             path = self._write(directory, _v4_capture())
             report = analyze_capture(path)
 
-        self.assertEqual(report["capture"]["trace_schema_version"], 4)
+        self.assertEqual(report["schema_version"], 3)
+        self.assertEqual(report["capture"]["trace_schema_version"], 5)
         self.assertEqual(report["capture"]["tensormap_mode"], "shared")
         self.assertEqual(
             report["semantics"]["exclusive_submit_children"][-2:],
@@ -539,24 +673,44 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
         self.assertEqual(report["kernel_containment"]["inside_final_drain_events"], 96)
         self.assertEqual(report["kernel_containment"]["orphan_events"], 0)
         self.assertEqual(
-            report["kernel_containment"]["unclassified_without_v4_parent_events"],
+            report["kernel_containment"]["unclassified_without_v5_parent_events"],
             0,
         )
         register = report["register_breakdown"]
         self.assertIsNotNone(register)
-        self.assertEqual(register["event_count"], 2)
-        register_metrics = register["aggregate_core_work"]["metrics_cycles"]
         self.assertEqual(
-            register_metrics,
+            register["event_count"],
             {
-                "parent": 13,
-                "register_wait_insert_turn": 4,
-                "register_publish_metadata": 5,
-                "register_handoff_next_turn": 4,
+                "metadata": 2,
+                "task_outputs": 2,
+                "task_outputs_copy": 2,
+                "task_outputs_flush": 2,
             },
         )
+        register_metrics = register["aggregate_core_work"]["metrics_cycles"]
+        # task_outputs=3 cycles 拆成 copy+flush+residual，且 residual 非负。
+        self.assertEqual(register_metrics["parent"], 13)
+        self.assertEqual(register_metrics["register_wait_predecessor_insert"], 2)
+        self.assertEqual(register_metrics["register_publish_metadata"], 9)
+        self.assertEqual(register_metrics["register_publish_writer_metadata"], 4)
+        self.assertEqual(register_metrics["register_publish_task_outputs"], 3)
+        self.assertEqual(
+            register_metrics["register_publish_task_outputs_copy"]
+            + register_metrics["register_publish_task_outputs_flush"]
+            + register_metrics["register_publish_task_outputs_residual"],
+            register_metrics["register_publish_task_outputs"],
+        )
+        self.assertGreaterEqual(
+            register_metrics["register_publish_task_outputs_residual"], 0
+        )
+        self.assertEqual(register_metrics["register_publish_metadata_epilogue"], 2)
+        self.assertEqual(register_metrics["register_publish_insert_completion"], 2)
         self.assertIs(
-            register["aggregate_core_work"]["closure"]["exact"],
+            register["aggregate_core_work"]["closure"]["register"]["exact"],
+            True,
+        )
+        self.assertIs(
+            register["aggregate_core_work"]["closure"]["metadata"]["exact"],
             True,
         )
         self.assertEqual(register_metrics["parent"], metrics["register"])
@@ -564,9 +718,13 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
             "SharedRegisterPublishMetadata",
             report["semantics"]["exclusive_submit_children"],
         )
+        self.assertNotIn(
+            "SharedRegisterPublishTaskOutputs",
+            report["semantics"]["exclusive_submit_children"],
+        )
         self.assertIs(
             report["semantics"][
-                "register_internal_detail_is_exclusive_submit_child"
+                "register_internal_details_are_exclusive_submit_children"
             ],
             False,
         )
@@ -588,14 +746,134 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
             metrics["submit_union"],
         )
         for core in register["per_core"]:
-            self.assertIs(core["closure"]["exact"], True)
+            self.assertIs(core["closure"]["register"]["exact"], True)
+            self.assertIs(core["closure"]["metadata"]["exact"], True)
             self.assertEqual(
-                core["closure"]["parent_cycles"],
-                core["closure"]["children_cycles"],
+                core["closure"]["register"]["parent_cycles"],
+                core["closure"]["register"]["flat_children_cycles"],
+            )
+            self.assertEqual(
+                core["closure"]["metadata"]["parent_cycles"],
+                core["closure"]["metadata"]["children_cycles"],
             )
         self.assertEqual(
             set(register["per_role_core_statistics"]),
             {"aic", "aiv"},
+        )
+        atomic_overlay = report["overlays"]["Atomic"]
+        # 480 条 Claim atomic + task1 的一条 predecessor PollBatch +
+        # task0/task1 各一条 completion CAS。
+        self.assertEqual(atomic_overlay["event_count"], 483)
+        self.assertEqual(atomic_overlay["aggregate_duration_cycles"], 963)
+        self.assertIs(atomic_overlay["included_in_additive_totals"], False)
+
+    def test_v5_moves_task_outputs_into_materialize_breakdown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(
+                directory, _v5_materialize_output_capture()
+            )
+            report = analyze_capture(path)
+
+        self.assertEqual(
+            report["validation"]["task_output_placement"],
+            "materialize",
+        )
+        materialize = report["materialize_breakdown"]
+        self.assertIsNotNone(materialize)
+        materialize_metrics = materialize[
+            "aggregate_core_work"
+        ]["metrics_cycles"]
+        self.assertEqual(
+            materialize_metrics,
+            {
+                "parent": 18,
+                "materialize_before_publish_task_outputs": 10,
+                "materialize_publish_task_outputs": 6,
+                "materialize_publish_task_outputs_copy": 2,
+                "materialize_publish_task_outputs_flush": 2,
+                "materialize_publish_task_outputs_residual": 2,
+                "materialize_after_publish_task_outputs": 2,
+            },
+        )
+        self.assertIs(
+            materialize["aggregate_core_work"]["closure"][
+                "materialize"
+            ]["exact"],
+            True,
+        )
+        self.assertIs(
+            materialize["aggregate_core_work"]["closure"][
+                "task_outputs"
+            ]["exact"],
+            True,
+        )
+
+        register = report["register_breakdown"]
+        self.assertIsNotNone(register)
+        register_metrics = register[
+            "aggregate_core_work"
+        ]["metrics_cycles"]
+        self.assertEqual(register_metrics["parent"], 13)
+        self.assertEqual(
+            register_metrics["register_publish_metadata"], 9
+        )
+        self.assertEqual(
+            register_metrics["register_publish_writer_metadata"], 9
+        )
+        for metric in (
+            "register_publish_task_outputs",
+            "register_publish_task_outputs_copy",
+            "register_publish_task_outputs_flush",
+            "register_publish_task_outputs_residual",
+            "register_publish_metadata_epilogue",
+        ):
+            self.assertEqual(register_metrics[metric], 0)
+        self.assertEqual(
+            report["semantics"]["materialize_internal_output_detail"],
+            "SharedMaterializePublishTaskOutputs",
+        )
+        self.assertNotIn(
+            "register_internal_output_detail", report["semantics"]
+        )
+
+    def test_v4_shared_register_atomic_overlay_never_changes_exclusive_totals(
+        self,
+    ) -> None:
+        atomic_capture = _v4_capture()
+        phase_only_capture = _v4_capture()
+        phase_only_capture["l2_swimlane_level"] = 1
+        phase_only_rows = phase_only_capture["fdwic_events"]
+        assert isinstance(phase_only_rows, list)
+        phase_only_capture["fdwic_events"] = [
+            row
+            for row in phase_only_rows
+            if row[5] not in {"Atomic", "ClockBaseline"}
+        ]
+        _refresh_summary(phase_only_capture)
+
+        with tempfile.TemporaryDirectory() as directory:
+            phase_only_path = self._write(directory, phase_only_capture)
+            phase_only = analyze_capture(phase_only_path)
+            atomic_path = Path(directory) / "atomic.json"
+            atomic_path.write_text(
+                json.dumps(atomic_capture),
+                encoding="utf-8",
+            )
+            atomic = analyze_capture(atomic_path)
+
+        self.assertEqual(
+            phase_only["aggregate_core_work"]["metrics_cycles"],
+            atomic["aggregate_core_work"]["metrics_cycles"],
+        )
+        self.assertEqual(
+            phase_only["register_breakdown"],
+            atomic["register_breakdown"],
+        )
+        self.assertEqual(phase_only["overlays"]["Atomic"]["event_count"], 0)
+        self.assertEqual(atomic["overlays"]["Atomic"]["event_count"], 483)
+        self.assertIs(
+            atomic["overlays"]["Atomic"]["included_in_additive_totals"],
+            False,
         )
 
     def test_v4_private_keeps_rectangular_frontend_contract(self) -> None:
@@ -745,7 +1023,7 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
             path = self._write(directory, capture)
             with self.assertRaisesRegex(
                 ValueError,
-                "only valid for shared schema-v4|forbids "
+                "only valid for shared schema-v5|forbids "
                 "SharedRegisterPublishMetadata|only valid for shared TensorMap",
             ):
                 analyze_capture(path)
@@ -825,7 +1103,7 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = self._write(directory, capture)
             with self.assertRaisesRegex(
-                ValueError, "shared schema-v4 must not contain PrepareMap"
+                ValueError, "shared schema-v5 must not contain PrepareMap"
             ):
                 analyze_capture(path)
 

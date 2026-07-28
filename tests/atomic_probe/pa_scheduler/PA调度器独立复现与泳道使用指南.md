@@ -232,7 +232,7 @@ mixed 的两个入口和 metadata section；CANN 9.1 自带的 PTO 头可直接�
 
 | 构建 | 后端 | 内容 | 构建命令 | 产物目录 |
 | ---- | ---- | ---- | -------- | -------- |
-| `swimlane` | CCEC/AscendC/CPU | schema-v4 普通阶段、业务父区间、真实 Submit 尾动作与 atomic（direct + PollBatch）合并采集；不配置 PMU | `./run.sh build ccec --tensormap <mode>` 或 `./run.sh build all --tensormap <mode>` | `build/<backend>/<mode>/swimlane/` |
+| `swimlane` | CCEC/AscendC/CPU | schema-v5 普通阶段、业务父区间、真实 Submit 尾动作与 atomic（direct + PollBatch）合并采集；shared Materialize 另含 task-output/copy/flush detail，Register 含 writer-metadata detail；不配置 PMU | `./run.sh build ccec --tensormap <mode>` 或 `./run.sh build all --tensormap <mode>` | `build/<backend>/<mode>/swimlane/` |
 | `perf-clock` | CCEC/CPU | 编译掉泳道、atomic 观察、phase-profile、PMU 和 kernel/lifecycle 计时；每核只新增首个 Submit 起点与末个 Submit 终点两个性能边界 | `./run.sh build-perf-clock ccec\|cpu --tensormap <mode>` | `build/<backend>/<mode>/perf-clock/` |
 | `submit-pmu` | 仅 CCEC | 每核完整 Submit PMU，并在编译期可选一个局部阶段；当前有 `none\|claim\|efdrain\|materialize\|register` | `./run.sh build-submit-pmu ccec <phase> --tensormap <mode>` | `build/ccec/<mode>/submit-pmu/<phase>/` |
 
@@ -250,12 +250,11 @@ submit-pmu 四件套都必须通过 manifest 的模式、CAP、insert-turn G、�
 阶段和 SHA256 校验，才能启动 host。
 
 shared 构建还读取 `PA_SHARED_INSERT_TURN_GROUPS`，默认 1，只接受
-1/2/4/8；private 只允许 1。该值只在构建期生效，不是 benchmark 参数。
-默认 CAP=128 时，shared ABI generation 为 9，ABI version 为
-`(9<<8)|G`，即 turn-G1/G2/G4/G8 分别为
-`0x901/0x902/0x904/0x908`。host/device 握手和 schema-v3 manifest
-都会拒绝不同 G 的混件。turn-G2/G4/G8 只属于本阶段维护的 CPU/CCEC
-后端；AscendC 和 `all` 会在任何构建或设备动作前被拒绝。
+1/2/4/8/16/32/64/128；private 只允许 1。该值只在构建期生效，不是
+benchmark 参数。默认 CAP=128 时，shared ABI generation 为 11，
+ABI version 为 `(11<<8)|G`；host/device 握手和 schema-v3 manifest
+都会拒绝不同 G 的混件。turn-G>1 只属于本阶段维护的 CPU/CCEC 后端；
+AscendC 和 `all` 会在任何构建或设备动作前被拒绝。
 
 `perf-clock` 的“两个时间边界”专指新增的性能观察：task 0 在 EfDrain 前
 读取一次，末 task 完成 Submit 尾动作后读取一次。shared per-slot symbol
@@ -357,14 +356,18 @@ Claim cursor，S4.14b 已启用全部 8 条。S4.16a/S4.16b 曾在数组
 R4e-a 又在该 offset 追加 `reader_done[96]`，每个 worker 独占 64B，
 合计 6,144B，形成 generation-8 的 12,426,432B sidecar。R5c 保留原
 `committed_tasks` 作为 insert-turn lane 0，又在 `reader_done` 后追加
-`insert_turn_extra[7]`，共 448B。当前 generation-9 sidecar 为
-12,426,880B；CPU 非 split `SchedulerState` 为 1,019,542,848B，定义
-`PA_COMPETE_FIRST_SPLIT_FINISH` 的 CCEC split 布局为 1,019,548,992B。
-private sidecar 仍为 2,113,664B，private non-split/split
-`SchedulerState` 仍分别为 1,007,115,968B 和 1,007,122,112B。新增控制线
-只追加在尾部，不移动此前字段；Vector 热路径仍使用 `task_id%8`。sidecar
-仍位于 standalone 控制区和 `results` 之后，不移动 `WorkerState`、
-`RunConfig` 或既有结果字段。
+`insert_turn_extra[7]`，形成历史 generation-9 的 12,426,880B sidecar。
+当前 generation-10 将同一尾数组扩为 `insert_turn_extra[127]`，比
+generation-9 再增加 7,680B，sidecar 为 12,434,560B。shared standalone
+的 batch 输入容量同时从 256 扩到 512，因此 CPU 非 split
+`SchedulerState` 为 1,019,551,552B，定义
+`PA_COMPETE_FIRST_SPLIT_FINISH` 的 CCEC split 布局为 1,019,557,696B。
+private 的 batch 上限仍为 256，sidecar 仍为 2,113,664B，
+non-split/split `SchedulerState` 仍分别为 1,007,115,968B 和
+1,007,122,112B。新增 turn 控制线只追加在 shared sidecar 尾部，
+不移动此前 sidecar 字段；Vector 热路径仍使用 `task_id%8`。sidecar
+仍位于 standalone 控制区和 `results` 之后，不移动 `WorkerState`
+或 `RunConfig`。
 
 `reader_done[worker]=D` 表示该 worker 已经结束 task `[0,D]` 的全部
 ordinary-ring 读取，初值为 -1，只允许 CAS `D-1 -> D`。最慢完成值为
@@ -426,20 +429,28 @@ S4.16b 第一层性能门槛失败；这些数字只属于历史候选，不是�
 
 每 task 最多八个 fresh output，以 16B
 `FdwicOutputRef` 表达 `(producer_task_id, output_slot)`，返回句柄为
-8B `SharedTaskOutputs`。当前构建身份 ABI generation 为 9。通用
+8B `SharedTaskOutputs`。当前构建身份 ABI generation 为 11。通用
 history 能力由 generation 7 引入，generation 8 追加 `reader_done`，
-generation 9 再追加七条 insert-turn 物理线，并把 active G 编入 build
-identity 和 artifact manifest。inactive lane 初始化并保持 -1。history、
-reader progress 与 insert turn 仍是不同协议能力，不能据此声称 PA 热路径
-已经接入 reader-progress reclaim。
+generation 9 追加七条 insert-turn 物理线，generation 10 再将物理容量
+扩为 128 条并把 active G 扩到 128；generation 11 将 shared 热路径的
+有序插入完成链迁到 `TaskCell::deps_prepared`：task N 只等待
+`task[N-1]`，发布完整 writer 元数据后再用 CAS 发布 `task[N]=N`。
+Claim 仍使用原有 Cube/Alloc 四分片与 shared Vector 八分片 cursor。
+generation 11 暂时保留 generation 10 的 sidecar 物理线和 manifest
+字段作为历史 ABI，默认 G1 构建要求这些线保持初值，生产热路径不再访问
+它们。history、reader progress 与 per-task 插入完成链仍是不同协议能力，
+不能据此声称 PA 热路径已经接入 reader-progress reclaim。
 
 当前 shared 使用独立 Submit 路径。所有 worker 先 Claim；只有唯一 owner
-构造本 task 参数、Materialize descriptor 和 writer delta。owner 等待
-insert turn 后只在有序区内发布 ordinary/symbol/fresh writer 元数据，随后
-立即发布下一个 turn；fanin lookup、Build 和执行均在有序区外进行。lookup
-统一只接受 `producer∈[N-H,N)`。Claim 判负后的 loser finish/replay
-不等待 insert turn、不读取 TensorMap，也不构造重参数，关闭轻量 Submit
-后直接继续 replay；Claim 对 Vector cursor 的访问发生在该边界之前。
+构造本 task 参数、Materialize descriptor 和 writer delta。fresh output
+descriptor 在 Materialize 尾部写入 task 独占的
+`shared_outputs[task_id]`，不占用全局有序插入区。随后 owner 等待前一
+task 的 `deps_prepared`，只在有序区内发布 ordinary/symbol writer
+元数据，再发布本 task 的 `deps_prepared`；fanin lookup、Build 和执行
+均在有序区外进行。lookup 统一只接受 `producer∈[N-H,N)`。Claim 判负后
+的 loser finish/replay 不等待 per-task 插入完成字、不读取 TensorMap，
+也不构造重参数，关闭轻量 Submit 后直接继续 replay；Claim 对 Vector
+cursor 的访问发生在该边界之前。
 当前生产 helper 固定 `reclaim_upto=-1`，尚未把 reader-progress reclaim
 接入这条路径。
 
@@ -488,7 +499,7 @@ ordinary ring 和显式 `owner_task_id`。同一 task 对同一 symbol 的重复
 PA Case1 的 `ordinary_count=0`，host 要求 bucket/slot 保持初值；generic
 定向测试另外覆盖非空 ordinary delta。生产路径固定 `reclaim_upto=-1`，
 满桶时整 task 在写入前失败，不覆盖 live producer。host 按计划总 task 数
-校验完整八线 insert-turn 终态，并将 fresh-symbol writer 投影为跨模式
+校验完整 128 线 insert-turn 终态，并将 fresh-symbol writer 投影为跨模式
 规范化签名，另按约定补入 manual view；ordinary ring 由独立结构校验，
 不冒充该签名的输入。manual view 仍不是从 shared 执行态独立取证，不能用
 该签名单独证明它对等。b1 的
@@ -658,14 +669,14 @@ builtin；检查后删除，不会进入正式 mixed ELF。静态链接只证明
 后端能生成完整设备代码，不证明 ordinary region 的跨核
 reader-progress/reclaim 可见性已经闭合。
 shared-protocol-litmus 自身虽是 CCEC mixed ELF，但没有定义 split-finish，
-因此其 GM `SchedulerState` 使用当前 generation-9 non-split 大小
-1,019,542,848B。history 场景会校验 96 条 `reader_done` 始终保持 -1；
+因此其 GM `SchedulerState` 使用当前 generation-11 non-split 大小
+1,019,551,552B。history 场景会校验 96 条 `reader_done` 始终保持 -1；
 reader-reclaim 场景则要求 96 条最终均为 task 2，且只允许被测 reader
-发生 `1->2`。两种场景还校验完整八线 insert-turn 终态。
+发生 `1->2`。两种场景还校验完整 128 线 insert-turn 终态。
 
-当前 `shared-protocol-litmus` 固定使用 turn-G1；检查全部八条物理线是为了
-证明七条 inactive lane 保持 -1，并不表示该 litmus 覆盖 turn-G2/G4/G8。
-四种 turn-G 的 CCEC 证据由主 scheduler 构建矩阵提供。
+当前 `shared-protocol-litmus` 固定使用 turn-G1；检查全部 128 条物理线是
+为了证明 127 条 inactive lane 保持 -1，并不表示该 litmus 覆盖其他 G。
+各 turn-G 的 CCEC 证据由主 scheduler 构建矩阵提供。
 
 shared sidecar 的 atomic 当前会计入既有 Submit/业务阶段时间，但 heap
 cursor/vend、symbol writer/published 等尚未逐条接入 atomic 泳道 wrapper；
@@ -767,7 +778,7 @@ semantic_status=PASS postprocess_status=PASS
   --real-compute-count 1
 ```
 
-`swimlane` 是唯一的正式泳道构建口径，固定合并 schema-v4
+`swimlane` 是唯一的正式泳道构建口径，固定合并 schema-v5
 普通阶段、业务父区间、真实 Submit 尾动作与 atomic 记录（direct
 Atomic 加 PollBatch）；
 无需再显式传 `--trace-atomics`。该 action 会管理 `--runs 1` 和输出路径，因此不要再传
@@ -794,7 +805,7 @@ A5 b1；b256 只用于阶段性规模/容量收口或明确指定的长负载结
 
 - `l2_swimlane_records.json`：与真实 PA 相同的十列 `fdwic_events`
   权威原始件，所有字段复算以它为准；
-- `merged_swimlane.json`：只用于 Perfetto 可视化。schema-v4 的 duration
+- `merged_swimlane.json`：只用于 Perfetto 可视化。schema-v5 的 duration
   事件只保留 `ph/name/pid/tid/ts/dur` 六个必需字段，不再逐事件
   复制 raw 中的 `args/cat`；拖入 <https://ui.perfetto.dev/> 即可查看；
 - `swimlane_exclusive_analysis.json`：以原始整数 cycle 校验并汇总
@@ -803,7 +814,7 @@ A5 b1；b256 只用于阶段性规模/容量收口或明确指定的长负载结
   聚合。完整父子层级、排他角色和数值统计以该报告为准，不再逐事件
   塞入 merged。
 
-schema-v4 禁止产生历史 `Alloc/Build/Replay` lap 与未使用的
+schema-v5 禁止产生历史 `Alloc/Build/Replay` lap 与未使用的
 `DrainWon`，只用 `AllocComplete/WinnerBuild` 表达真实 Submit winner
 尾动作。loser 没有可单独计时的业务动作，不生成 `LoserReplay`
 伪阶段；其未归因尾段只由离线 residual 展示。每个 Kernel 还必须唯一归入 EfDrain、WinnerBuild、AllocComplete 或
@@ -811,26 +822,64 @@ FinalDrain；孤儿、越界或多重归属都会使排他分析失败。
 除 Kernel 可以执行前序 task 外，所有 Submit 前端和尾动作的 `task_id` 必须与
 包含它的 Submit 一致。
 
-shared TensorMap 的 `Register` 还会在父区间内显示三段：
+shared TensorMap 会分别细化 Materialize 中的 fresh-output 发布和
+Register 中的有序 writer 元数据发布。
 
-- `register.wait_insert_turn#N`：Register 前段，以等待 task N 取得有序
-  TensorMap 插入轮次为主；为保持业务阶段连续闭合，该段还包含上一条
-  Materialize trace 落盘和 Register 边界的少量观察代码，不能把其中每个
-  tick 都解释成 atomic 轮询；
-- `register.publish_metadata#N`：预检并发布 ordinary、symbol 和 fresh-output
-  writer 元数据；
-- `register.handoff_next_turn#N`：发布顺序并把插入轮次交给 task N+1。
+Materialize 显示：
 
-设备每个 winner 只新增一条 `SharedRegisterPublishMetadata` raw 记录，
-等待段和交接段由 `Register` 父区间与该记录的端点离线还原，不记录逐次
-poll。三段只用于拆解 `Register`，不能再次加入 Submit 排他总和。
+- `materialize.before_publish_task_outputs#N`：descriptor/heap
+  Materialize 和 writer delta 准备；
+- `materialize.publish_task_outputs#N`：精确包住 task 独占
+  `SharedOutputCell` 的预检、writer 起点、descriptor 发布和
+  `published` 更新；它是父 overlay，不重复加入 Submit 排他总和；
+- `materialize.publish_task_outputs.copy#N`：整批复制
+  `TensorDesc` 到 `shared_outputs[N].tensors[]`；
+- `materialize.publish_task_outputs.flush#N`：整批
+  `FlushRegion`，位于 copy 之后、`StoreBarrier`/`published` 之前；
+- `materialize.publish_task_outputs.residual#N`：由父子端点离线得到的
+  预检、`last_writer`、barrier 和 published 开销；
+- `materialize.after_publish_task_outputs#N`：发布完成后的 Materialize
+  收尾。
+
+Register 显示：
+
+- `register.wait_predecessor_insert#N`：等待 task N-1 发布 TensorMap
+  插入完成；task 0 直接进入下一段；
+- `register.publish_metadata#N`：metadata 总区间的 overlay，只用于显示
+  父子关系，不加入可加总阶段；
+- `register.publish_writer_metadata#N`：资格检查，并发布 ordinary、
+  symbol 和 writer 元数据；
+- `register.publish_insert_completion#N`：CAS 发布 task N 的插入完成字，
+  供 task N+1 的 owner 轮询。
+
+设备每个成功 winner 固定写一条 `SharedRegisterPublishMetadata`，以及
+`SharedMaterializePublishTaskOutputs`、`Copy`、`Flush` 三条
+Materialize raw detail；loser 不写这些 detail。等待、Materialize
+前后段、outputs residual、writer metadata 和完成发布均由父子端点离线
+还原，不记录逐次 poll。raw detail 都是 overlay，不能再次加入 Submit
+排他总和。
 CCEC 在每次 turn Load 后用一条 MOV 派生互不等同的比较值和计时依赖值，
 避免 O3 利用 `Ready => observed == task_id` 把后者常量传播成 task id；
 AIC/AIV 优化 IR 都必须保持
 `atomic Load -> dependency fork -> Ready branch / SYS_CNT`。该处理只存在于
 swimlane 构建，不增加 DSB、GM 访问或 SYS_CNT 读取。
-`swimlane_exclusive_analysis.json` 的 `register_breakdown` 会独立校验
-`Register = wait + publish + handoff`，并给出整体、AIC/AIV 和逐核整数闭合。
+`swimlane_exclusive_analysis.json` 会独立校验：
+
+```text
+Materialize =
+    before_publish_task_outputs
+  + publish_task_outputs
+  + after_publish_task_outputs
+
+publish_task_outputs =
+    copy + flush + residual
+
+Register = wait_predecessor_insert + metadata + publish_insert_completion
+```
+
+当前 placement 下 `metadata == writer_metadata`，Register 中历史
+task-output 字段必须精确为零。报告同时给出整体、AIC/AIV 和逐核整数
+闭合。
 
 runner 结束时会打印准确目录：
 
@@ -985,7 +1034,7 @@ generation/reclaim 协议，不能沿用 no-wrap 结论。
 结果区，不为诊断新增共享 atomic。它们仍会增加少量 scalar 指令，因此优化 A/B
 必须使用相同的计数布局；不能把启用分类后的绝对时间直接与旧二进制比较。
 
-### 5.6 合并泳道中的 atomic schema-v4 语义边界
+### 5.6 合并泳道中的 atomic schema-v5 语义边界
 
 正式 `swimlane` action 固定记录 standalone 调度器中的 atomic **逻辑调用**，
 不只记录 winner 或慢样本。普通 direct Atomic 仍是一条源码调用对应一条物理记录；
@@ -1001,7 +1050,7 @@ generation/reclaim 协议，不能沿用 no-wrap 结论。
 只有使用低层 `run` action 手工导出 raw 时，才需要显式传入
 `--trace-atomics`；该兼容入口不代表存在第二种 atomic-swimlane 构建。
 
-schema-v4 raw 的 `metadata.trace_schema_version` 必须为 4，且顶层
+schema-v5 raw 的 `metadata.trace_schema_version` 必须为 5，且顶层
 `l2_swimlane_level` 必须为 4。转换后 direct Atomic、PollBatch 和
 ClockBaseline 都放在对应 AIC/AIV 的原 scalar lane；它们属于 scalar
 调度观察，不再伪装成与 scalar 并行的独立子轨。Kernel 仍放在独立计算单元轨。
@@ -1024,8 +1073,9 @@ atomic.poll_batch.<site>.load×<call_count>
 名称中的 `call_count` 是实际执行的源码 wrapper 调用次数，
 不是采样或估算值。
 
-当前固定 schema 共有 19 个调用点。0～14 是既有 common/private
-调用点，15～18 是 shared heap 第一批已接入的调用点：
+当前固定 schema 共有 21 个调用点。0～14 是既有 common/private
+调用点，15～18 是 shared heap 调用点，19～20 是 per-task TensorMap
+插入完成链：
 
 | `site_id` | Perfetto `site` | `op` | 所属路径 |
 | --------: | --------------- | ---- | -------- |
@@ -1048,8 +1098,10 @@ atomic.poll_batch.<site>.load×<call_count>
 | 16 | `shared_heap_cursor_load` | `load` | shared 分片 cursor 预检 |
 | 17 | `shared_heap_cursor_reserve` | `fetch_add` | 取得本 task 分片物理区间 |
 | 18 | `shared_heap_vend_advance` | `fetch_add` | 推进并取得 aggregate vend |
+| 19 | `shared_insert_predecessor_poll` | `load` | task N 等待 task N-1 的插入完成字 |
+| 20 | `shared_insert_completion_publish` | `compare_exchange` | CAS 发布 task N 的插入完成字 |
 
-上表是源码调用点集合，不代表每轮都会出现全部 19 类事件；例如正常成功路径不应
+上表是源码调用点集合，不代表每轮都会出现全部 21 类事件；例如正常成功路径不应
 执行 `fatal_set`。standalone 也没有真实 PA 后续追加的 BlockWon site，不能把真实
 PA 的九类 load 加一类 exchange allowlist 照搬到这里。
 
@@ -1060,7 +1112,7 @@ source-issue 操作。PA Case1 每 batch 固定执行 5 次 vend load，以及�
 cursor load、cursor reserve 和 vend advance。output publication/last-writer
 仍按后续 S5.2 小步接入，不能把当前 19-site schema 宣称为 shared 全覆盖。
 
-standalone 只允许以下六类 observation load 在**匹配的显式等待区内**进入
+standalone 的通用等待区只允许以下六类 observation load 在匹配窗口内进入
 PollBatch；同一 site 在等待区外的一次性或 opportunistic 读取仍是 direct Atomic：
 
 | `site_id` | `site` | `op` |
@@ -1072,6 +1124,10 @@ PollBatch；同一 site 在等待区外的一次性或 opportunistic 读取仍�
 | 12 | `heap_vend_load` | `load` |
 | 14 | `replay_done_poll` | `load` |
 
+site 19 是额外的专用聚合路径：每个 task 的 predecessor Wait episode
+最多写一条 PollBatch，不占用上述六类通用等待槽；task 0 没有前驱，
+因此不伪造该记录。
+
 一个等待区可以同时累积多个 site，所以不同 site 的 PollBatch 时间窗可以重叠；
 等待区内也可以交错 direct Atomic。direct record 写入不能隐式关闭 PollBatch，
 否则这些自然交错会把同一个等待 episode 人为切碎。
@@ -1080,7 +1136,8 @@ PollBatch；同一 site 在等待区外的一次性或 opportunistic 读取仍�
 `site_id`，`flags` 使用以下 ABI：
 
 - direct Atomic：bit 7 为 0；低 4 bit 是 `op_id`
-  （Load/Exchange/FetchAdd/FetchMax 依次为 0/1/2/3），bit 4 表示返回旧值参与
+  （Load/Exchange/FetchAdd/FetchMax/CompareExchange 依次为
+  0/1/2/3/4），bit 4 表示返回旧值参与
   后续逻辑，bit 5 仅对 Load 表示本次读到零，bit 6 表示是否取得
   “返回值本核可消费”边界；bits 8..31 只对 direct FetchMax 表示软件 retry，
   不能解释为调用次数；
@@ -1089,7 +1146,7 @@ PollBatch；同一 site 在等待区外的一次性或 opportunistic 读取仍�
   `1..0xFFFFFF`。达到上限时先落盘，再从 1 开启下一条 batch，不允许饱和后
   丢失调用数；`task_id=-1`、`function_id=-1`。
 
-schema-v4 merged 只保留可视化必需的六个 duration 字段。direct 的
+schema-v5 merged 只保留可视化必需的六个 duration 字段。direct 的
 `site/op/boundary/task_id` 和 PollBatch 的 `site/op/call_count` 均在名称中；
 `site_id/op_id`、原始整数 cycle、flags、retry 和 value-zero 等精确值从同目录
 raw 十列记录复算。不把这些重复复制到 merged，是为了控制数百万
@@ -1119,7 +1176,7 @@ PollBatch 的 `duration`/`poll_window_cycles` 是从该 site 在显式等待区�
 
 - 显式等待区退出时关闭匹配的 PollBatch；
 - `TraceTimestamp` 在写 phase begin/end 前关闭全部活跃 batch；
-- schema-v4 producer 不再生成旧 `Alloc/Build/Replay` lap；历史 helper
+- schema-v5 producer 不再生成旧 `Alloc/Build/Replay` lap；历史 helper
   仍有自身关闭规则，但不得出现在当前 raw 中；
 - Kernel begin/end 也通过 `TraceTimestamp`，所以 PollBatch 不能跨入或跨出 Kernel；
 - 最终 flush 只作防御性兜底，不能替代上述语义边界。
@@ -1133,7 +1190,7 @@ PollBatch 的 `duration`/`poll_window_cycles` 是从该 site 在显式等待区�
 `[TRACE_ATOMIC_POLL]` 单独输出 PollBatch 的 episode 数、精确逻辑调用数和等待包络
 分布，二者不会混算。
 
-schema-v4 level-4 raw 必须按逻辑调用与物理记录两套口径闭合。设 direct 物理记录数为
+schema-v5 level-4 raw 必须按逻辑调用与物理记录两套口径闭合。设 direct 物理记录数为
 `direct_atomic_records`，则逐核和全局都必须满足：
 
 ```text
@@ -1978,13 +2035,17 @@ block-local runtime state，每个精确 1,664 bytes、最终 section 合计
 3,328 bytes；它们不属于 GM `SchedulerState`。以上 `SchedulerState` 数字
 是 private 模式。R4c 的 shared sidecar 历史大小为 12,420,288 bytes；
 R4e-a 追加 96 条 reader-progress cache line 后，generation-8 sidecar 为
-12,426,432 bytes。R5c 又在尾部追加七条 insert-turn cache line，当前
-generation-9 sidecar 为 12,426,880 bytes。因此 CPU non-split 与定义
+12,426,432 bytes。R5c 在尾部追加七条 insert-turn cache line，形成历史
+generation-9 的 12,426,880 bytes；generation-10 将该尾数组扩为
+127 条 extra line，sidecar 为 12,434,560 bytes，当前 generation-11
+保留同一物理布局但不再从热路径访问这些 turn line。shared batch 输入
+数组扩到 512 后，CPU non-split 与定义
 `PA_COMPETE_FIRST_SPLIT_FINISH` 的 CCEC 变体总大小分别为
-1,019,542,848/1,019,548,992 bytes；swimlane、perf-clock 以及 submit-PMU
+1,019,551,552/1,019,557,696 bytes；swimlane、perf-clock 以及 submit-PMU
 none/claim/efdrain 使用后者，submit-PMU materialize/register 和独立
 shared-protocol-litmus 使用 non-split 大小。既有 production prefix 和
-standalone 控制字段 offset 不变。S4.15a/S4.16 历史候选都曾得到
+`WorkerState`/`RunConfig` offset 不变；`context_lens` 后的 standalone
+字段因数组扩容顺延 1,024B。S4.15a/S4.16 历史候选都曾得到
 4,736,704B，但末尾 512B 分别是 Cube cursor 和
 `shared_vector_cursor[8..15]`，且均已撤销。S4.9 的
 4,735,680B、历史 S2.5 的 2,113,664B 和 S3.1 的 4,735,104B 也都
@@ -2031,37 +2092,37 @@ cd /tmp/pa_scheduler
 不会回退到 private。
 
 shared insert turn 默认使用 G=1。需要构建交错候选时，通过构建环境变量
-选择 G=2/4/8；该值同时进入 host/kernel build identity 和 CCEC manifest，
-不能在同一组产物上运行期切换：
+选择 G=2/4/8/16/32/64/128；该值同时进入 host/kernel build identity
+和 CCEC manifest，不能在同一组产物上运行期切换：
 
 ```bash
-PA_SHARED_INSERT_TURN_GROUPS=4 \
+PA_SHARED_INSERT_TURN_GROUPS=32 \
   ./run.sh build cpu --tensormap shared
 
-PA_SHARED_INSERT_TURN_GROUPS=8 \
+PA_SHARED_INSERT_TURN_GROUPS=128 \
   ./run.sh build ccec --tensormap shared
 
-PA_SHARED_INSERT_TURN_GROUPS=8 \
-  ./run.sh run ccec --tensormap shared --batches 1
+PA_SHARED_INSERT_TURN_GROUPS=128 \
+  ./run.sh perf-clock ccec --tensormap shared --batches 512
 ```
 
 这里的 PA-G 表示一个 batch 的 PA block-group 数；turn-G 表示 insert-turn
 使用的物理控制线数。二者含义独立。turn-G 只改变同一枚有序 token 的物理
 落点，不建立多条独立 writer 插入链。
-本阶段 turn-G2/G4/G8 只维护 CPU 与 CCEC；`run.sh` 会在任何构建、文件创建
+本阶段 turn-G>1 只维护 CPU 与 CCEC；`run.sh` 会在任何构建、文件创建
 或设备动作前拒绝 AscendC 和 `all`。turn-G1 保留既有后端命令兼容性，但
 不把 AscendC 结果列入本阶段验证证据。
 standalone 各 G 顺序复用同一 variant 输出目录，因此比较时必须先构建目标
 G，再以相同环境变量消费该次 manifest 对应的 CCEC 产物；省略或写错 G
 会在启动设备前被拒绝。
-CPU 的 turn-G1 保留默认文件名 `pa_scheduler_cpu`；turn-G2/G4/G8 分别生成
-`pa_scheduler_cpu_turn_g2/g4/g8`，`run.sh` 按环境变量选择，避免后一次构建
+CPU 的 turn-G1 保留默认文件名 `pa_scheduler_cpu`；turn-G>1 生成
+`pa_scheduler_cpu_turn_g<G>`，`run.sh` 按环境变量选择，避免后一次构建
 覆盖前一 G 后仍把旧命令结果误认成目标配置。
 
-本阶段 CPU 结果只作为语义与并发正确性证据，CCEC 结果只作为编译、链接、
-manifest 和 ABI 身份证据；尚未运行 R5c 的 A5 动态验证。上面的
-`run ccec` 只是复现命令示例，不是已经取得的上板结果。得到同一
-`perf-clock` 口径的交错多轮数据前，不宣称 turn-G2/G4/G8 有性能收益。
+CPU 结果只作为语义与并发正确性证据；A5 性能必须使用无诊断
+`perf-clock`。2026-07-28 已完成 B256 六轮以及同 artifact 的 B256/B512
+四轮交错矩阵；实测数据、artifact hash 和未安装 `task-submit`/`npu-smi`
+的执行边界见 `shared_tensormap_record.md`。
 
 CCEC/AscendC 只需再 source CANN 环境。本目录的构建脚本不会搜索 Git 根目录，
 也不会引用 `simpler/src`、`simpler/examples` 或其他仓内文件。泳道转换与排他

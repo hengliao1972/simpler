@@ -23,9 +23,9 @@ TENSORMAP_MODE="private"
 TENSORMAP_RING_CAP=128
 SHARED_INSERT_TURN_GROUPS="${PA_SHARED_INSERT_TURN_GROUPS:-1}"
 case "$SHARED_INSERT_TURN_GROUPS" in
-    1|2|4|8) ;;
+    1|2|4|8|16|32|64|128) ;;
     *)
-        echo "PA_SHARED_INSERT_TURN_GROUPS must be 1, 2, 4, or 8." >&2
+        echo "PA_SHARED_INSERT_TURN_GROUPS must be a power of two from 1 through 128." >&2
         exit 1
         ;;
 esac

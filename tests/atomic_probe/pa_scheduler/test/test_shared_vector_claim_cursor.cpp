@@ -9,10 +9,14 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <new>
 #include <sys/mman.h>
+#include <thread>
+#include <vector>
 
 #define PA_DEVICE inline
 #define PA_GM
@@ -22,28 +26,31 @@ namespace {
 
 using namespace pa_scheduler;
 
+constexpr std::array<TaskKind, 5> kTaskKinds = {
+    TaskKind::Alloc, TaskKind::Qk, TaskKind::Sf, TaskKind::Pv, TaskKind::Up,
+};
+constexpr std::array<uint32_t, 5> kTaskIds = {
+    100, 101, 102, 103, 104,
+};
+
 int g_failures = 0;
 
-// 只实现 Claim/atomic trace 会触及的最小 Ops 接口，同时记录 FetchMax
-// 地址和次数，避免定向测试仅凭最终 cursor 猜测实际走过的路径。
 struct ClaimTestOps {
     static constexpr bool kAtomicReturnReadyObserved = false;
-    static inline uint64_t tick = 0;
-    static inline uint64_t fetch_max_calls = 0;
-    static inline volatile int64_t *last_fetch_max_address = nullptr;
+    static inline thread_local uint64_t fetch_max_calls = 0;
+    static inline thread_local volatile int64_t *last_fetch_max_address = nullptr;
 
-    static int64_t FetchMax(
-        volatile int64_t *address, int64_t value, uint64_t &retries
-    ) {
+    static int32_t Exchange(volatile int32_t *address, int32_t value) {
+        return __atomic_exchange_n(address, value, __ATOMIC_ACQ_REL);
+    }
+
+    static int64_t FetchMax(volatile int64_t *address, int64_t value, uint64_t &retries) {
         ++fetch_max_calls;
         last_fetch_max_address = address;
         int64_t current = __atomic_load_n(address, __ATOMIC_ACQUIRE);
         retries = 0;
         while (value > current) {
-            if (__atomic_compare_exchange_n(
-                    address, &current, value, true, __ATOMIC_ACQ_REL,
-                    __ATOMIC_ACQUIRE
-                )) {
+            if (__atomic_compare_exchange_n(address, &current, value, true, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
                 break;
             }
             ++retries;
@@ -51,20 +58,30 @@ struct ClaimTestOps {
         return current;
     }
 
-    static uint64_t Now() {
-        return ++tick;
-    }
+    static uint64_t Now() { return 0; }
 
     template <typename T>
-    static uint64_t NowAfterAtomicResult(T value) {
-        asm volatile("" : "+r"(value));
-        return Now();
+    static uint64_t NowAfterAtomicResult(T) {
+        return 0;
     }
 
-    static void ResetFetchMaxTrace() {
+    static void ResetThreadTrace() {
         fetch_max_calls = 0;
         last_fetch_max_address = nullptr;
     }
+};
+
+struct ClaimEvidence {
+    ClaimOutcome outcome{};
+    uint64_t fetch_max_calls = 0;
+    volatile int64_t *fetch_max_address = nullptr;
+};
+
+struct CursorValues {
+    std::array<int64_t, kCursorShards> cube{};
+    std::array<int64_t, kCursorShards> vector{};
+    std::array<int64_t, kCursorShards> alloc{};
+    std::array<int64_t, kSharedVectorCursorCapacity> shared_vector{};
 };
 
 void Check(bool condition, const char *message) {
@@ -81,229 +98,183 @@ T *MapSparseObject() {
 #ifdef MAP_NORESERVE
     flags |= MAP_NORESERVE;
 #endif
-    void *memory = mmap(
-        nullptr, sizeof(T), PROT_READ | PROT_WRITE, flags, -1, 0
-    );
+    void *memory = mmap(nullptr, sizeof(T), PROT_READ | PROT_WRITE, flags, -1, 0);
     if (memory == MAP_FAILED) {
         return nullptr;
     }
     return ::new (memory) T;
 }
 
-void InitializeClaimCursors(SchedulerState *state) {
+void InitializeClaimCursors(SchedulerState &state, CursorValues &expected) {
+    expected.cube.fill(-1);
+    expected.vector.fill(-1);
+    expected.alloc.fill(-1);
+    expected.shared_vector.fill(-1);
     for (uint32_t shard = 0; shard < kCursorShards; ++shard) {
-        state->cube_cursor[shard].value = -1;
-        state->vector_cursor[shard].value = -1;
-        state->alloc_cursor[shard].value = -1;
+        state.cube_cursor[shard].value = -1;
+        state.vector_cursor[shard].value = -1;
+        state.alloc_cursor[shard].value = -1;
     }
     for (uint32_t shard = 0; shard < kSharedVectorCursorCapacity; ++shard) {
-        state->shared_map.shared_vector_cursor[shard].value = -1;
+        state.shared_map.shared_vector_cursor[shard].value = -1;
     }
 }
 
-bool PrefixVectorUntouched(const SchedulerState &state) {
+volatile int64_t *ExpectedClaimAddress(SchedulerState &state, uint32_t task_id, TaskKind kind) {
+    if (kind == TaskKind::Alloc) {
+        return &state.alloc_cursor[task_id % kCursorShards].value;
+    }
+    if (kind == TaskKind::Qk || kind == TaskKind::Pv) {
+        return &state.cube_cursor[task_id % kCursorShards].value;
+    }
+    return &state.shared_map.shared_vector_cursor[task_id % kSharedVectorCursorShards].value;
+}
+
+void RecordExpectedCursor(CursorValues &expected, uint32_t task_id, TaskKind kind) {
+    if (kind == TaskKind::Alloc) {
+        expected.alloc[task_id % kCursorShards] = task_id;
+    } else if (kind == TaskKind::Qk || kind == TaskKind::Pv) {
+        expected.cube[task_id % kCursorShards] = task_id;
+    } else {
+        expected.shared_vector[task_id % kSharedVectorCursorShards] = task_id;
+    }
+}
+
+bool CursorsMatch(const SchedulerState &state, const CursorValues &expected) {
     for (uint32_t shard = 0; shard < kCursorShards; ++shard) {
-        if (state.vector_cursor[shard].value != -1) {
+        if (state.cube_cursor[shard].value != expected.cube[shard] ||
+            state.vector_cursor[shard].value != expected.vector[shard] ||
+            state.alloc_cursor[shard].value != expected.alloc[shard]) {
+            return false;
+        }
+    }
+    for (uint32_t shard = 0; shard < kSharedVectorCursorCapacity; ++shard) {
+        if (state.shared_map.shared_vector_cursor[shard].value != expected.shared_vector[shard]) {
             return false;
         }
     }
     return true;
 }
 
-void TestSharedVectorRouting() {
-    SchedulerState *state = MapSparseObject<SchedulerState>();
-    WorkerState *worker = MapSparseObject<WorkerState>();
-    Check(
-        state != nullptr && worker != nullptr,
-        "sparse shared Vector Claim fixtures map successfully"
-    );
-    if (state == nullptr || worker == nullptr) {
-        if (state != nullptr) munmap(state, sizeof(*state));
-        if (worker != nullptr) munmap(worker, sizeof(*worker));
-        return;
+uint32_t ExpectedCandidates(TaskKind kind) {
+    switch (kind) {
+    case TaskKind::Alloc:
+        return kWorkers;
+    case TaskKind::Qk:
+    case TaskKind::Pv:
+        return kAicWorkers;
+    case TaskKind::Sf:
+    case TaskKind::Up:
+        return kAivWorkers;
+    case TaskKind::Count:
+        return 0;
     }
-
-    InitializeClaimCursors(state);
-    worker->role = CoreRole::Aiv;
-    LocalStats stats{};
-    ClaimTestOps::ResetFetchMaxTrace();
-
-    const ClaimOutcome sf = Claim<ClaimTestOps>(
-        state, *worker, 2, TaskKind::Sf, stats
-    );
-    Check(
-        sf.attempted && sf.won &&
-            state->shared_map.shared_vector_cursor[2].value == 2,
-        "SF Claim advances the active-shard modulo sidecar Vector cursor"
-    );
-    Check(
-        ClaimTestOps::fetch_max_calls == 1 &&
-            ClaimTestOps::last_fetch_max_address ==
-                &state->shared_map.shared_vector_cursor[2].value,
-        "SF Claim issues one FetchMax to the expected sidecar address"
-    );
-
-    // S4.14b 在相同 sidecar 上把 active 4→8：task 14 改落 shard 6，
-    // task 2 仍落 shard 2，正好锁定新增的取模范围。
-    const ClaimOutcome up = Claim<ClaimTestOps>(
-        state, *worker, 14, TaskKind::Up, stats
-    );
-    Check(
-        up.attempted && up.won &&
-            state->shared_map.shared_vector_cursor[2].value == 2 &&
-            state->shared_map.shared_vector_cursor[6].value == 14,
-        "active eight-shard routing separates task 2 and task 14"
-    );
-
-    const ClaimOutcome same_shard = Claim<ClaimTestOps>(
-        state, *worker, 34, TaskKind::Up, stats
-    );
-    const ClaimOutcome replay = Claim<ClaimTestOps>(
-        state, *worker, 34, TaskKind::Up, stats
-    );
-    Check(
-        same_shard.attempted && same_shard.won &&
-            replay.attempted && !replay.won &&
-            state->shared_map.shared_vector_cursor[2].value == 34,
-        "same-shard task advances once and a repeated candidate becomes loser"
-    );
-    Check(
-        PrefixVectorUntouched(*state),
-        "shared Vector Claim never touches the production-prefix Vector cursor"
-    );
-
-    worker->role = CoreRole::Aic;
-    const uint64_t calls_before_wrong_role = ClaimTestOps::fetch_max_calls;
-    const ClaimOutcome wrong_role = Claim<ClaimTestOps>(
-        state, *worker, 42, TaskKind::Sf, stats
-    );
-    Check(
-        !wrong_role.attempted && !wrong_role.won &&
-            ClaimTestOps::fetch_max_calls == calls_before_wrong_role,
-        "AIC worker neither issues atomicMax nor changes a Vector cursor"
-    );
-
-    const ClaimOutcome qk = Claim<ClaimTestOps>(
-        state, *worker, 1, TaskKind::Qk, stats
-    );
-    const ClaimOutcome alloc = Claim<ClaimTestOps>(
-        state, *worker, 0, TaskKind::Alloc, stats
-    );
-    Check(
-        qk.attempted && qk.won && state->cube_cursor[1].value == 1,
-        "shared Cube Claim retains the production-prefix four-shard cursor"
-    );
-    Check(
-        alloc.attempted && alloc.won && state->alloc_cursor[0].value == 0,
-        "shared Alloc Claim retains the production-prefix four-shard cursor"
-    );
-
-    munmap(worker, sizeof(*worker));
-    munmap(state, sizeof(*state));
+    return 0;
 }
 
-void TestB256VectorCursorFinalState() {
+bool IsCandidate(TaskKind kind, uint32_t worker_id) {
+    if (kind == TaskKind::Alloc) {
+        return true;
+    }
+    const bool is_aic = worker_id < kAicWorkers;
+    return kind == TaskKind::Qk || kind == TaskKind::Pv ? is_aic : !is_aic;
+}
+
+bool RunConcurrentClaim(SchedulerState &state, uint32_t task_id, TaskKind kind) {
+    state.tasks[task_id].deps_prepared = -1;
+    state.fatal.value = 0;
+    std::array<ClaimEvidence, kWorkers> evidence{};
+    std::atomic<uint32_t> ready{0};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> threads;
+    threads.reserve(kWorkers);
+
+    for (uint32_t worker_id = 0; worker_id < kWorkers; ++worker_id) {
+        WorkerState &worker = state.workers[worker_id];
+        worker.role = worker_id < kAicWorkers ? CoreRole::Aic : CoreRole::Aiv;
+        threads.emplace_back([&state, &worker, &evidence, &ready, &start, worker_id, task_id, kind]() {
+            ClaimTestOps::ResetThreadTrace();
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) {}
+            LocalStats stats{};
+            evidence[worker_id].outcome = Claim<ClaimTestOps>(&state, worker, task_id, kind, stats);
+            evidence[worker_id].fetch_max_calls = ClaimTestOps::fetch_max_calls;
+            evidence[worker_id].fetch_max_address = ClaimTestOps::last_fetch_max_address;
+        });
+    }
+
+    while (ready.load(std::memory_order_acquire) != kWorkers) {}
+    start.store(true, std::memory_order_release);
+    for (std::thread &thread : threads) {
+        thread.join();
+    }
+
+    uint32_t attempts = 0;
+    uint32_t winners = 0;
+    bool exact = true;
+    volatile int64_t *expected_address = ExpectedClaimAddress(state, task_id, kind);
+    for (uint32_t worker_id = 0; worker_id < kWorkers; ++worker_id) {
+        const bool candidate = IsCandidate(kind, worker_id);
+        const ClaimEvidence &entry = evidence[worker_id];
+        attempts += entry.outcome.attempted ? 1U : 0U;
+        winners += entry.outcome.won ? 1U : 0U;
+        exact &= entry.outcome.attempted == candidate && entry.fetch_max_calls == (candidate ? 1U : 0U) &&
+                 entry.fetch_max_address == (candidate ? expected_address : nullptr);
+        if (entry.outcome.won) {
+            exact &= kind == TaskKind::Alloc ? entry.outcome.function_id == -1 :
+                                               entry.outcome.function_id == FunctionId(kind);
+        } else {
+            exact &= entry.outcome.function_id == -1;
+        }
+    }
+    return exact && attempts == ExpectedCandidates(kind) && winners == 1 &&
+           *expected_address == static_cast<int64_t>(task_id) && state.tasks[task_id].deps_prepared == -1 &&
+           state.fatal.value == 0;
+}
+
+void TestAllTaskKindsUseCursorClaim() {
     SchedulerState *state = MapSparseObject<SchedulerState>();
-    WorkerState *worker = MapSparseObject<WorkerState>();
-    Check(
-        state != nullptr && worker != nullptr,
-        "b256 shared Vector Claim fixtures map successfully"
-    );
-    if (state == nullptr || worker == nullptr) {
-        if (state != nullptr) munmap(state, sizeof(*state));
-        if (worker != nullptr) munmap(worker, sizeof(*worker));
+    Check(state != nullptr, "sparse shared cursor Claim fixture maps successfully");
+    if (state == nullptr) {
         return;
     }
 
-    InitializeClaimCursors(state);
-    LocalStats stats{};
-    ClaimTestOps::ResetFetchMaxTrace();
-    int64_t expected[kSharedVectorCursorCapacity] = {
-        -1, -1, -1, -1, -1, -1, -1, -1
-    };
-    uint32_t attempts_by_worker[kWorkers] = {};
-    uint32_t attempts_by_shard[kSharedVectorCursorCapacity] = {};
-    uint32_t winners = 0;
-    bool topology_exact = true;
-    for (uint32_t task_id = 0;
-         task_id < kMaxBatches * kTasksPerBatch; ++task_id) {
-        const TaskKind kind =
-            static_cast<TaskKind>(task_id % kTasksPerBatch);
-        if (kind != TaskKind::Sf && kind != TaskKind::Up) {
-            continue;
+    CursorValues expected{};
+    InitializeClaimCursors(*state, expected);
+    bool exact = true;
+    for (uint32_t index = 0; index < kTaskKinds.size(); ++index) {
+        exact &= RunConcurrentClaim(*state, kTaskIds[index], kTaskKinds[index]);
+        RecordExpectedCursor(expected, kTaskIds[index], kTaskKinds[index]);
+        exact &= CursorsMatch(*state, expected);
+        for (uint32_t observed = 0; observed <= index; ++observed) {
+            exact &= state->tasks[kTaskIds[observed]].deps_prepared == -1;
         }
-        uint32_t task_attempts = 0;
-        uint32_t task_winners = 0;
-        for (uint32_t worker_id = 0; worker_id < kWorkers; ++worker_id) {
-            worker->role =
-                worker_id < kAicWorkers ? CoreRole::Aic : CoreRole::Aiv;
-            const ClaimOutcome claim =
-                Claim<ClaimTestOps>(state, *worker, task_id, kind, stats);
-            if (claim.attempted) {
-                ++task_attempts;
-                ++attempts_by_worker[worker_id];
-                ++attempts_by_shard[
-                    task_id % kSharedVectorCursorShards
-                ];
-                topology_exact &=
-                    ClaimTestOps::last_fetch_max_address ==
-                        &state->shared_map.shared_vector_cursor[
-                            task_id % kSharedVectorCursorShards
-                        ].value;
-            }
-            task_winners += claim.won;
-        }
-        topology_exact &=
-            task_attempts == kAivWorkers && task_winners == 1;
-        winners += task_winners;
-        expected[task_id % kSharedVectorCursorShards] = task_id;
     }
 
-    for (uint32_t worker_id = 0; worker_id < kWorkers; ++worker_id) {
-        topology_exact &=
-            attempts_by_worker[worker_id] ==
-                (worker_id < kAicWorkers ? 0U : kMaxBatches * 2U);
-    }
-    bool exact =
-        topology_exact && winners == kMaxBatches * 2U &&
-        PrefixVectorUntouched(*state);
-    for (uint32_t shard = 0; shard < kSharedVectorCursorCapacity; ++shard) {
-        const uint32_t expected_attempts =
-            shard < kSharedVectorCursorShards
-                ? kMaxBatches * 2U * kAivWorkers /
-                    kSharedVectorCursorShards
-                : 0U;
-        exact &=
-            state->shared_map.shared_vector_cursor[shard].value ==
-                expected[shard] &&
-            attempts_by_shard[shard] == expected_attempts;
-    }
-    Check(
-        ClaimTestOps::fetch_max_calls ==
-            static_cast<uint64_t>(kMaxBatches) * 2U * kAivWorkers,
-        "b256 issues exactly 32768 Vector Claim atomics"
-    );
-    Check(
-        exact,
-        "b256 preserves 64 AIV candidates, one winner, 4096 attempts per shard, and exact high watermarks"
-    );
+    WorkerState &replay_worker = state->workers[0];
+    replay_worker.role = CoreRole::Aic;
+    ClaimTestOps::ResetThreadTrace();
+    LocalStats replay_stats{};
+    const ClaimOutcome replay = Claim<ClaimTestOps>(state, replay_worker, kTaskIds[1], TaskKind::Qk, replay_stats);
+    exact &= replay.attempted && !replay.won && replay.function_id == -1 && ClaimTestOps::fetch_max_calls == 1 &&
+             ClaimTestOps::last_fetch_max_address == ExpectedClaimAddress(*state, kTaskIds[1], TaskKind::Qk) &&
+             state->fatal.value == 0 && CursorsMatch(*state, expected);
 
-    munmap(worker, sizeof(*worker));
-    munmap(state, sizeof(*state));
+    Check(
+        exact, "all task kinds keep cursor routing, exact candidates, "
+               "one winner, legal replay, and untouched deps_prepared"
+    );
+    (void)munmap(state, sizeof(*state));
 }
 
 }  // namespace
 
 int main() {
-    TestSharedVectorRouting();
-    TestB256VectorCursorFinalState();
+    TestAllTaskKindsUseCursorClaim();
     if (g_failures != 0) {
-        std::fprintf(
-            stderr, "[FAIL] shared Vector Claim cursor tests: %d\n",
-            g_failures
-        );
+        std::fprintf(stderr, "[FAIL] shared cursor Claim tests: %d\n", g_failures);
         return 1;
     }
-    std::printf("[PASS] shared Vector Claim cursor tests\n");
+    std::printf("[PASS] shared cursor Claim tests\n");
     return 0;
 }

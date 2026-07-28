@@ -33,13 +33,14 @@ Build identity option (consumed by run.sh and never forwarded to the benchmark):
   --tensormap private|shared   (default: private)
 
 Shared insert-turn build identity:
-  PA_SHARED_INSERT_TURN_GROUPS=1|2|4|8   (default: 1; shared only)
+  PA_SHARED_INSERT_TURN_GROUPS=1|2|4|8|16|32|64|128
+                                      (default: 1; shared only)
   Use the same value when consuming a CCEC artifact; the manifest rejects a
   different or omitted value instead of silently running another G.
 
 Benchmark options:
   --device N
-  --batches 1..256
+  --batches 1..512  (shared; private remains 1..256)
   --shared-context-lens C0[,C1...]  (shared standalone test only; one value broadcasts,
                                      otherwise count must equal --batches; default 8192)
   --runs N
@@ -210,10 +211,10 @@ validate_ccec_artifacts() {
     local build_dir="$4"
     local expected_insert_turn_groups="${PA_SHARED_INSERT_TURN_GROUPS:-1}"
     case "$expected_insert_turn_groups" in
-        1|2|4|8) ;;
+        1|2|4|8|16|32|64|128) ;;
         *)
             ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" \
-                "PA_SHARED_INSERT_TURN_GROUPS must be 1, 2, 4, or 8"
+                "PA_SHARED_INSERT_TURN_GROUPS must be a power of two from 1 through 128"
             return 1
             ;;
     esac
@@ -310,7 +311,7 @@ validate_ccec_artifacts() {
         return 1
     fi
     case "$manifest_insert_turn_groups" in
-        1|2|4|8) ;;
+        1|2|4|8|16|32|64|128) ;;
         *)
             ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" \
                 "manifest shared insert-turn groups are invalid"
@@ -534,9 +535,9 @@ validate_insert_turn_scope() {
     local tensormap_mode="$2"
     local groups="${PA_SHARED_INSERT_TURN_GROUPS:-1}"
     case "$groups" in
-        1|2|4|8) ;;
+        1|2|4|8|16|32|64|128) ;;
         *)
-            echo "PA_SHARED_INSERT_TURN_GROUPS must be 1, 2, 4, or 8." >&2
+            echo "PA_SHARED_INSERT_TURN_GROUPS must be a power of two from 1 through 128." >&2
             exit 1
             ;;
     esac

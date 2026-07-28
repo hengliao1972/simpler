@@ -10286,3 +10286,589 @@ Materialize trace 落盘和边界代码的少量观察开销；不应把每个 t
 402,660,160B 设备 trace 分配没有扩大。结构性新增恰为 1,280 条 detail，
 另外两段只在 merged 离线生成；其余 record 波动来自运行时 PollBatch
 合并数，不是新增业务 phase。
+
+### 2026-07-28：R5d 扩展 turn-G32/G64/G128，并以 B512 复核规模效应
+
+本轮回答两个明确问题：
+
+1. 在已经有 turn-G1/G8 数据的基础上，继续测 G32/G64/G128，判断把
+   future owner 的轮询 load 分散到更多 cache line 后，完整 Submit
+   是否仍有收益；
+2. 保持每个 batch 的 PA-G1 业务不变，仅把 batch 从 256 增至 512，
+   即把总 task 从 1,280 增至 2,560，再检查各 G 的相对关系和总耗时
+   是否随 task 数近似线性增长。
+
+这里的 turn-G 仍不是 G 条独立 writer 链。全局插入次序始终只有一条：
+task N 完成元数据发布后，才把 task N+1 的 grant 写到
+`turn[(N+1)&(G-1)]`。G 只改变同一枚 baton 的物理落点，因而本轮数据
+不能解释为放宽 TensorMap writer 顺序。
+
+#### 实现边界与 ABI
+
+物理 turn 容量从 8 扩到 128，构建期允许
+`G=1/2/4/8/16/32/64/128`。lane 0 继续复用 `committed_tasks`，
+lane 1～127 位于尾部 `insert_turn_extra[127]`；所有 G 使用相同物理
+布局，inactive lane 初始化并保持 -1。shared ABI generation 从 9
+升级为 10，默认 CAP=128 时 ABI version 为 `(10<<8)|G`，manifest
+仍把 active G 作为不可混用的构建身份。
+
+当前关键布局为：
+
+| 项目 | generation 10 |
+| --- | ---: |
+| `insert_turn_extra` offset | 12,426,432B |
+| shared sidecar | 12,434,560B |
+| shared non-split `SchedulerState` | 1,019,551,552B |
+| shared split `SchedulerState` | 1,019,557,696B |
+
+shared standalone 的 batch 输入容量从 256 扩到 512，但默认仍是 256；
+private 继续保持 256。
+`kMaxTasks` 保留 4,352-task 物理布局：它同时容纳 B256/PA-G4 的最坏
+计划和 B512/PA-G1 的 2,560-task 计划；B512 多组计划若超过 4,352，
+会在 worker/device 启动前失败，不把“batch 上限 512”误写成所有
+context 都可达。B512 的 synthetic heap 逻辑容量为 512MiB，实测
+reservation 为 413,138,944B，每个 shard 51,642,368B。real-compute
+访问的是独立 workspace，不会分配或解引用这段 synthetic heap。
+
+B512 首次 CPU 回放还暴露了一个 host oracle 假失败：2,048-slot payload
+arena 回绕后，`ndims=1` 的合法 descriptor 会保留 inactive
+`strides[1]` 的旧字节。PA 构造器和消费者都只定义、读取
+`[0,ndims)`，因此校验改为只比较 active shape/stride，同时继续拒绝
+`ndims>5`、active 字段损坏、地址/大小/owner 错误。定向测试分别证明
+inactive 尾字节不影响语义，active 维损坏仍会失败；没有为了让测试变绿
+而在设备热路径增加清零 store。
+
+#### 测量口径与环境边界
+
+性能构建固定为 CCEC `perf-clock`，关闭泳道、atomic trace 和 PMU；
+device 0、shared TensorMap、默认 context 8192、PA-G1、
+`real-compute 6,28,4,1`、final barrier `two-16`。一条可复现命令为：
+
+```bash
+PA_SHARED_INSERT_TURN_GROUPS=<G> \
+  ./run.sh perf-clock ccec --tensormap shared \
+  --device 0 --batches <256或512> --shared-context-lens 8192 \
+  --winner-workload real-compute --real-compute-counts 6,28,4,1 \
+  --final-barrier two-16
+```
+
+计时值是首个 Submit 起点到最后一个 Submit 终点的 wall-clock，不是
+96 核 duration 求和，也不包含泳道观察开销。环境使用 CANN
+9.1 weekly 2026-07-08，CCEC 目标为 `dav-c310`。本机没有安装
+`npu-smi` 和 `task-submit`，因此测试按用户允许直接在 device 0
+无锁执行；运行结果能证明该设备上的 kernel/host 语义和计时，但本文
+不凭工具缺失臆造设备锁状态或独立确认芯片型号。
+
+#### 正确性与构建门槛
+
+CPU shared 构建逐项运行 G1/G2/G4/G8/G16/G32/G64/G128 的低层
+insert-turn 原语和 96-worker ordered-submit；generic writer-intent
+以 G1/G128 两个端点覆盖空写、ordinary/symbol INOUT、混合 writer、
+满环失败不改状态和 owner/overflow 负例。B512/G128 完整 CPU 回放
+闭合 2,560 task、96 worker、全部业务输出和 128 条 turn 终态。
+
+五档正式性能候选都通过 CCEC AIC/AIV、role-specific real-compute、
+split caller/runtime/finish、1:2 mixed ELF、LOCAL helper、零
+relocation、schema-v3 manifest 和 host/kernel SHA 校验。最终又用
+G128 artifact 运行 B1 设备门槛，manifest 精确识别 G128，5 task、
+8 个 published output、4 个 active real-compute tile 和所有语义断言
+PASS，Submit 为 80.392us；该 B1 仅证明最终产物可执行，不参与 B256/B512
+性能统计。private batch 上限收紧回原有 256 后，CPU B1 仍以原
+1,007,115,968B state 通过全部断言。
+
+#### 第一轮：B256 六轮交错矩阵
+
+每个 G 先运行一个不计入统计的 warm-up，再执行 6 个独立进程样本；
+各轮旋转 G 顺序，避免把固定运行次序当成 G 的效果。所有 30 个正式
+样本均通过 execution、semantic、postprocess、real-compute 输出、
+writer signature 和完整 128-line turn 终态校验。
+
+| turn-G | n | Submit median | mean | min～max | 相对 G1 median |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 6 | 57,116.065 us | 57,184.516 us | 56,975.478～57,565.335 us | 基线 |
+| 8 | 6 | 25,020.867 us | 24,974.136 us | 24,670.165～25,103.450 us | -56.193% |
+| 32 | 6 | 14,257.828 us | 14,226.053 us | 14,022.699～14,369.782 us | -75.037% |
+| 64 | 6 | 11,368.688 us | 11,386.716 us | 11,323.154～11,485.594 us | -80.095% |
+| 128 | 6 | 9,412.827 us | 9,405.942 us | 9,367.675～9,420.272 us | -83.520% |
+
+按相邻档位的 median，G32 相比 G8 约再降 43.0%，G64 相比 G32
+约再降 20.3%，G128 相比 G64 约再降 17.2%。G128 是本轮已测范围
+内的最优点；这不等于已经证明继续增加物理线仍会获益。
+
+#### 第二轮：同一最终源码下的 B256/B512 配对
+
+完成 B512 容量和 oracle 修正后，五种 G 全部重新构建。每轮对同一 G
+相邻运行 B256/B512，四轮中交替 batch 顺序，并旋转、反转 G 顺序。
+因此下表的 B256 是最终 B512-capable artifact 的独立复测，不与上一节
+旧 artifact 的六轮样本混算：
+
+| turn-G | B256 median（n=4） | B512 median（n=4） | B512/B256 | B512 相对 G1 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 57,730.850 us | 117,391.969 us | 2.0334× | 基线 |
+| 8 | 25,386.679 us | 51,317.179 us | 2.0214× | -56.286% |
+| 32 | 14,198.940 us | 28,649.012 us | 2.0177× | -75.595% |
+| 64 | 11,494.984 us | 23,090.927 us | 2.0088× | -80.330% |
+| 128 | 9,341.260 us | 18,630.268 us | 1.9944× | -84.130% |
+
+B512 每档的 min～max 和标准差为：
+
+| turn-G | mean | min～max | sample SD |
+| ---: | ---: | ---: | ---: |
+| 1 | 117,221.275 us | 116,498.038～117,603.127 us | 496.065 us |
+| 8 | 51,278.908 us | 51,098.560～51,382.715 us | 130.252 us |
+| 32 | 28,596.962 us | 28,322.863～28,766.962 us | 197.351 us |
+| 64 | 23,067.335 us | 22,898.211～23,189.274 us | 122.587 us |
+| 128 | 18,633.632 us | 18,600.818～18,673.176 us | 31.573 us |
+
+task 数精确从 1,280 翻到 2,560 后，五档中位数倍率落在
+1.9944×～2.0334×；没有出现只在 B256 偶然成立的拐点。B512 内部相邻
+档位的中位数变化为 G32/G8 -44.173%、G64/G32 -19.401%、
+G128/G64 -19.318%，G128 仍为已测最优。B512 最终闭合
+2,560 task、4,096 个 published output、413,138,944B reservation，
+normalized writer signature 为 `e2107e7bc78ff5d4`。
+
+#### 产物身份与静态差异
+
+最终 B512-capable perf-clock artifact 的 SHA256 为：
+
+```text
+G1   host=7fad76a055ed8656eff7ee6325800493ea7b6d5bb7c9f234fa4b745f0f4b161b
+     kernel=3c5312572d613d40b573de9ecf712c709c8f475c977da191702a7f9b7fec239d
+G8   host=85ce78fc7c74d02e2b3969c707cb81ce6a2463c4cfc2ebce75299c67fa376ece
+     kernel=0e85d4cdf9a345197bedf1956c4aa40402c4919381cd73484ce79e5d6437342a
+G32  host=c9655a7c2c636eb25d352f187d03a88264828dd957cdd5d89597f1ef9b4c4a5d
+     kernel=59f376b6034ce7f30a56eaa2dba5fb74cad06dec49b3c0d48364b3c2c124c589
+G64  host=61da81157e0e4ec39fb3395dc9054c49dcdfd2e48ad27947430bb6dbcaa80055
+     kernel=29ec1ee052036ad83123b1372acb3e8b3dc3e1c6c27b8577e629f072086ae10e
+G128 host=d5094f3bc4cf404ead843191b0667779fb6a27c59a8cdd2e00af4b40dc520ea1
+     kernel=4f8e20e87a272a74453f74740199ec6f134b1a32f5fba4a3efcbc58e8baa294e
+```
+
+G1 kernel `.text/.rodata` 为 157,496/496B；G8/G32/G64/G128 均为
+158,008/496B。因而 G8 之后四档具有相同 section 大小，G32→G64→G128
+的实测差异不能归因于 `.text` 或 `.rodata` 继续增长。
+
+#### 结论和边界
+
+在本用例的 96-worker、单条全局 writer baton 模型下，主要代价确实来自
+future owner 对少数 turn cache line 的轮询竞争。把 token 交错到更多
+物理线没有减少 task 数、writer 发布次数或全局有序语义，却显著缩短完整
+Submit；从 B256 到 B512，收益排序和相对幅度保持稳定。当前工程判断是：
+在已测集合中优先选择 G128 做后续 shared TensorMap 候选。
+
+该判断只覆盖 standalone PA Case1、当前任务到达模式和 G≤128。它没有
+证明 production 主流程必然获得同等比例，也没有把下降全部归因于某一种
+硬件 atomic 事件；要迁移到主流程，仍需单独核对 state 成本、真实任务图
+到达顺序和 production 的兼容边界。
+
+### 2026-07-28：R5e 用 per-task 完成字替代 insert-turn baton
+
+#### 目标纠正
+
+本轮先撤回了一个错误过程态：不能把 Claim 的竞争地址改成
+`TaskCell::deps_prepared` 后又保留 G128 insert-turn；那既混用了
+`deps_prepared` 的职责，也没有消除真正昂贵的插入等待。最终协议保持
+Claim 不变，只替换 TensorMap 插入完成链：
+
+```text
+Claim:
+  Alloc        -> alloc_cursor[task % 4]
+  QK / PV      -> cube_cursor[task % 4]
+  SF / UP      -> shared_vector_cursor[task % 8]
+
+唯一 Claim owner:
+  Materialize + 构造 writer delta
+  task 0: 直接进入插入段
+  task N>0: 只 atomic-load task[N-1].deps_prepared
+  发布 task N 的 ordinary / symbol / fresh-output writer 元数据
+  CAS task[N].deps_prepared: -1 -> N
+  离开有序段
+  fanin lookup -> Build -> slot / 执行
+
+Claim loser:
+  不读 deps_prepared
+  不读 TensorMap
+  直接完成轻量 Submit / replay
+```
+
+因此只有 writer 元数据插入保持严格 `N -> N+1`；N 发布自己的完成字后，
+N+1 owner 可以开始插入，而 N 的 fanin lookup、Build 和任务执行可以与
+后续 owner 并行。lookup 仍只接受 `producer∈[N-H,N)`，不会因共享表中
+已经存在更晚 task 的信息而越界消费。
+
+generation 11 暂时保留 generation 10 的 128 条 sidecar turn 物理线和
+manifest-v3 字段，默认 G1 只用于历史 ABI 身份。host 与 CPU 门槛要求
+`committed_tasks==0`、其余 127 条线均为 -1，且生产热路径对这些地址的
+atomic load/CAS 次数均为 0。彻底删除这段 sidecar 属于未来
+generation 12 / manifest-v4 的 ABI 清理，不与本轮热路径实验混做。
+
+`deps_prepared` 与 `flag/vend` 共处 64B `TaskCell`，但本路径不对该
+cache line 执行 DCCI：前驱使用 atomicAdd(0) 读取，当前 task 使用
+atomicCAS 发布。writer descriptor/history/ordinary payload 各自沿用已有
+FlushRegion/DCCI 发布协议。这样不落入 `ATOMIC_USAGE_GUIDE.md` 已证实的
+“同一 dirty cache line 后续 DCCI 覆盖 atomic 新值”场景；若以后新增
+TaskCell DCCI，必须重新验证，不能沿用本结论。
+
+#### 原子访问闭合
+
+正式热路径只保留一次资格检查：
+
+- task 0 没有前驱 load；
+- task N>0 的一次 Wait episode 只访问
+  `task[N-1].deps_prepared`，循环次数聚合成一条 PollBatch；
+- 每个 task 恰好一次 CAS 发布自己的完成字；
+- metadata helper 不再重复读取前驱或自身完成字。
+
+泳道沿用数字 site 19/20 和既有十列 raw ABI，但显示名改为
+`shared_insert_predecessor_poll` 与
+`shared_insert_completion_publish`；Register 三段相应为：
+
+```text
+register.wait_predecessor_insert
+register.publish_metadata
+register.publish_insert_completion
+```
+
+task 0 仍保留第一段时间边界用于 Register 整数闭合，但不伪造 PollBatch。
+converter 对每个 winner 逐 task 校验：task 0 必须 0 条前驱 PollBatch，
+task>0 必须 1 条，每个 task 必须 1 条 completion CAS。
+
+#### 正确性门槛
+
+CPU 定向测试覆盖并通过：
+
+- Alloc/QK/SF/PV/UP 原 Claim 地址、候选核数、唯一 winner 与重复 loser；
+- Claim 全程不触碰 `deps_prepared`；
+- task 0 零前驱读取，N 只读 N-1，CAS 只允许 `-1 -> N`；
+- 260-task 顺序、pending 后唤醒、空 writer 集合推进；
+- 损坏前驱、预置当前值和重复发布均 fail-closed；
+- 96-worker 完整 Submit 的 Claim、每 task 完成字、业务 flag、final
+  writer、真实任务、barrier 与 Build/执行 overlap；
+- 旧 sidecar 128 条 canary 终值和原子访问计数均保持初值。
+
+完整 `./cpu/build.sh shared swimlane` 通过。converter 与 analyzer 的
+141 项 Python 回归通过。CCEC AIC/AIV generic protocol、mixed ELF、
+split finish 与 host runner 构建通过。
+
+A5 B1 先行门槛的 5 个完成字精确为 0…4，旧 sidecar 为
+`[0,-1,-1,-1,-1,-1,-1,-1]`，全部业务断言、真实计算、泳道和后处理
+均 PASS。
+
+#### A5 B256 泳道与性能
+
+固定参数为 shared TensorMap、context 8192、real-compute
+`6,28,4,1`、final barrier `two-16`、96 workers。
+
+泳道结果：
+
+- 1,280 tasks、73,728 Claim；
+- 481,198 raw records，0 drop；
+- 1,279 条前驱 PollBatch；
+- 1,280 条完成 CAS；
+- Submit 9,091.529 us；
+- execution / semantic / postprocess 全部 PASS。
+
+与同口径历史 G128 泳道的 Submit 10,193.173 us 相比，新图减少
+1,101.644 us（10.8077%）。Register 前驱等待的 aggregate core-work
+由 634,904,949 cycles 降到 550,131,603 cycles，减少 84,773,346
+cycles（13.3521%）；metadata 发布与完成 CAS 的记录口径保持独立。
+这与优化目标同向，但 aggregate core-work 不是 wall-clock，不能把
+84.8M cycles 直接换算成 1.10 ms 的端到端收益。
+
+三次独立 trace-free `perf-clock`：
+
+| run | Submit |
+| ---: | ---: |
+| 1 | 8,406.504 us |
+| 2 | 8,326.011 us |
+| 3 | 8,376.102 us |
+| 中位数 | 8,376.102 us |
+
+迁移前同设备、同业务参数的 G128 历史中位数为 9,371.635 us；新协议
+减少 995.533 us，即 10.6228%。两边构建都关闭泳道、atomic trace、PMU
+和 kernel 计时；新协议 manifest 中虽然仍写默认 G1，但 G 已不参与生产
+热路径。该对照支持保留 per-task 完成链，不能外推成 simpler 真实路径
+已有同等收益。
+
+归档位于：
+
+```text
+tests/atomic_probe/pa_scheduler/test_record/2026-7-28-shard/
+  per_task_deps_prepared_b256/
+  manifests/per_task_deps_prepared_swimlane_artifacts.manifest
+  manifests/per_task_deps_prepared_perf_clock_artifacts.manifest
+```
+
+### 2026-07-28：R5f 细分 Register 的 writer metadata 与 task outputs
+
+#### 观察目标与边界
+
+R5e 的 Register 只能看到前序等待、metadata 总区间和插入完成发布，
+其中 metadata 仍把 writer metadata 与 `PublishSharedTaskOutputs`
+混在一起。本轮不改 shared TensorMap 协议，只补充一条最小 raw
+子区间，回答这两类工作各占多少：
+
+```text
+Register
+├─ register.wait_predecessor_insert
+├─ SharedRegisterPublishMetadata
+│  ├─ register.publish_writer_metadata
+│  ├─ SharedRegisterPublishTaskOutputs
+│  └─ register.publish_metadata_epilogue
+└─ register.publish_insert_completion
+```
+
+这不是“本核私有工作”和“其他核发布”的区分。上述动作都由当前
+Claim winner 所在的 scalar 执行；writer metadata 也会访问 shared GM、
+执行 writer intent/append/symbol 发布，`PublishSharedTaskOutputs` 则专门
+发布 fresh-output cell。准确的区分是“owner 侧 writer metadata 路径”
+与“fresh shared task outputs 发布路径”。
+
+设备端只新增
+`TracePhase::SharedRegisterPublishTaskOutputs`，每个成功 winner 固定一条
+64B record。现有 `SharedRegisterPublishMetadata` 继续作为父 detail；
+Register、metadata、outputs 的所有时间端点读取完以后，才依次写
+`R -> M -> O` raw。没有逐 helper 或逐 poll 追加记录，B256 只增加
+1,280 条有效 raw，约 80 KiB；固定 trace allocation 不变。
+
+raw schema 从 4 升为 5，排他分析报告从 2 升为 3。当前采集和加工是一体
+版本，不给旧 schema-v4 猜测或补造 outputs 区间。host、converter 和
+analyzer 共同强制：
+
+- 每个 shared winner 恰好一个 M 和一个 O，loser 为零；
+- R、M、O 的 `(core, lane, task, function)` 完全一致；
+- `R.start <= M.start <= O.start <= O.end <= M.end <= R.end`；
+- `M = writer metadata + task outputs + metadata epilogue`；
+- `R = predecessor wait + M + insertion completion`；
+- M/O 只是 overlay，不重复加入 Submit 的可加总阶段。
+
+#### 正确性与构建门槛
+
+CPU shared swimlane、shared trace-free、private swimlane 和 sparse-trace
+负例门槛全部通过；负例覆盖 outputs 缺失、重复、越过 metadata、
+task/function 不一致和非零 payload。用户本地 Python 环境运行全部
+143 项 `pa_scheduler` Python 回归通过。CCEC shared swimlane 的 AIC/AIV、
+split runtime/finish、mixed ELF、LOCAL helper、无 relocation 和
+artifact manifest 门槛通过。
+
+本轮遵照要求不运行 A5 B1，CCEC 构建后直接运行 A5 B256。
+
+#### A5 B256 结果
+
+固定参数仍为 shared TensorMap、context 8192、real-compute
+`6,28,4,1`、final barrier `two-16`、96 workers。结果为：
+
+- 1,280 tasks，1,280 Register；
+- metadata detail 1,280 条，task-output detail 1,280 条；
+- 1,279 条前序 PollBatch，1,280 条完成 CAS；
+- raw records 482,387，expected 482,387，drop 0；
+- Submit 9,405.962 us；
+- execution、semantic、postprocess 和 analysis validation 全部 PASS。
+
+按 96 核累计的 Register core-work：
+
+| 区域 | cycles | 父区间占比 |
+|---|---:|---:|
+| Register parent | 587,885,050 | 100% |
+| 前序插入完成等待 | 578,829,069 | Register 的 98.460% |
+| metadata 总区间 | 8,365,557 | Register 的 1.423% |
+| 插入完成发布 | 690,424 | Register 的 0.117% |
+| writer metadata | 2,311,441 | metadata 的 27.630% |
+| `PublishSharedTaskOutputs` | 5,963,620 | metadata 的 71.288% |
+| metadata 收尾 | 90,496 | metadata 的 1.082% |
+
+两层整数 cycle 闭合和五段扁平闭合均精确成立。最直接的结论是：
+Register 的主要累计开销仍是等待 N-1 完成插入；去掉等待后，metadata
+内部以 `PublishSharedTaskOutputs` 为主，约占 71.3%。这里是
+aggregate core-work，不是 wall-clock；不能把 578.8M cycles 换算成
+Submit 可直接减少的微秒数。
+
+新增边界本身包含两次取时，并新增一条 raw。新图 Submit 比 R5e 旧图
+9,091.529 us 高 314.433 us，不能据此宣称业务回退；本轮没有生成新的
+trace-free 性能样本，结论只用于 Register 内部归因。
+
+归档位于：
+
+```text
+tests/atomic_probe/pa_scheduler/test_record/2026-7-28-shard/
+  per_task_deps_prepared_register_detail_b256/
+  manifests/per_task_deps_prepared_register_detail_swimlane_artifacts.manifest
+```
+
+### 2026-07-28：R5g 细分 fresh-output descriptor copy 与 flush
+
+#### 观察目标与实现边界
+
+R5f 已证明 `PublishSharedTaskOutputs` 是 Register metadata 内的主要非等待
+工作，但它仍把 descriptor copy、DCCI flush、writer 起点和 published
+控制协议混在同一包络。本轮只细分观测，不改变输出身份和跨核可见性协议：
+
+```text
+SharedRegisterPublishTaskOutputs
+├─ SharedRegisterPublishTaskOutputsCopy
+├─ SharedRegisterPublishTaskOutputsFlush
+└─ residual
+```
+
+实现先整批把每个 128B `TensorDesc` 复制到
+`shared_outputs[task_id].tensors[]`，再对连续 descriptor 区域统一
+`FlushRegion`，随后保持原有 `StoreBarrier -> published Exchange`。
+`residual` 由父子端点离线计算，覆盖完整预检、`last_writer` 预留、
+barrier、published 和返回路径；它不是新增的设备 trace。零输出 task
+仍保留零时长 copy/flush 边界，保证每个 winner 的 raw 结构固定。
+
+converter 和 analyzer 同时验证：
+
+- 每个 shared winner 恰有一组 outputs/copy/flush，loser 为零；
+- `copy.end == flush.start`，二者严格位于 outputs 父区间；
+- `outputs = copy + flush + residual` 按整数 cycle 精确闭合；
+- 这些 detail 都是 overlay，不进入 Submit 排他阶段的二次加总。
+
+#### A5 B256 结果
+
+测试参数继续固定为 shared TensorMap、context 8192、real-compute
+`6,28,4,1`、final barrier `two-16`、96 workers。结果为：
+
+- 1,280 tasks，raw records 485,028，drop 0；
+- execution、semantic、postprocess 和 analysis validation 全部 PASS；
+- Submit 9,466.451 us。
+
+按 96 核累计 core-work：
+
+| outputs 内区域 | cycles | 占 outputs |
+| --- | ---: | ---: |
+| `PublishSharedTaskOutputs` | 6,067,592 | 100% |
+| descriptor copy | 2,094,172 | 34.514% |
+| `FlushRegion` | 588,668 | 9.702% |
+| residual | 3,384,752 | 55.784% |
+
+这里证明的是同一包络内部的相对组成。该版本比 R5f 多两条 raw 和内部取时，
+不能用两个泳道的绝对 Submit 差值推导业务性能变化。
+
+### 2026-07-28：R5h 将 fresh-output 发布移出全局有序插入区
+
+#### 业务语义
+
+fresh output 的关联键在 Claim 后已经固定为
+`(producer_task_id, output_slot)`。每个 task 只有一个 Claim winner，且
+winner 只写自己独占的 `shared_outputs[task_id]`，因此 descriptor 发布
+不依赖 ordinary region 或 symbol writer 的全局 task-ID 插入轮次。
+
+最终顺序调整为：
+
+```text
+唯一 winner:
+  Materialize descriptor + writer delta
+  PublishSharedTaskOutputs 到 task 独占 cell
+    copy -> flush -> StoreBarrier -> published
+
+  task 0: 直接进入有序 writer 区
+  task N: 等待 task[N-1].deps_prepared
+  发布 ordinary / symbol writer metadata
+  CAS task[N].deps_prepared: -1 -> N
+
+  fanin lookup -> Build -> slot / 执行
+```
+
+这里没有删除 `PublishSharedTaskOutputs`，也没有减少其 128B descriptor
+copy、flush、`last_writer` 或 published 控制操作；只是把这组独占 cell
+工作从 Register 串行等待之后提前到 Materialize 尾部，使不同 task 的
+输出发布能够并发。后续 INOUT/OutputExisting 的 writer history 和
+`last_writer` 更新仍位于有序 writer 元数据协议内。
+
+失败路径仍然 fail-closed：output 发布失败立即设置 fatal；若后续 writer
+metadata 或 completion handoff 失败，则回滚本 task 独占 cell，不发布
+成功的 `deps_prepared`。`published` 只表示 descriptor 可读，不表示
+producer kernel 已执行完成；执行依赖仍由 fanin 和独立 completion flag
+表达。
+
+#### A5 B256 trace-free 性能
+
+为避免用带观察开销的泳道判断净性能，本轮在完全关闭泳道、
+atomic trace、PMU、phase 和 kernel timing 的 `perf-clock` 构建上做
+同机交错 A/B。两侧都固定为 256 batches、1,280 tasks、96 workers、
+shared TensorMap、context 8192、real-compute `6,28,4,1` 和 final
+barrier `two-16`；每个进程的运行期断言都确认这些观察能力保持关闭，
+execution、semantic 和 postprocess 均为 PASS。
+
+| 版本 | 四个正式样本（ms） | 中位数 |
+| --- | --- | ---: |
+| outputs 仍位于 Register 串行区 | 8.356157 / 8.356489 / 8.351957 / 8.355702 | 8.3559295 ms |
+| outputs 移到 Materialize | 2.906899 / 2.941103 / 2.939350 / 2.951372 | 2.9402265 ms |
+
+中位数减少 5.4157030 ms，即下降 64.8127%，前后比为 2.8419×。after
+四个样本落在 2.906899～2.951372 ms；这不是单次偶然值，也不是把
+level-4 泳道时间误写成性能。原始日志位于：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  output_publish_move_ab_20260728_104448/
+```
+
+该结果是本轮“把 fresh-output 独占 cell 发布移出全局 writer 串行区”的
+主要性能证据。R5e 的 8.376102 ms 是只完成 per-task completion 链时的
+旧中间基线，不能代替最终版本约 2.94 ms 的结果。
+
+#### 泳道口径与 A5 B256 结果
+
+raw detail 相应更名并迁入 Materialize：
+
+```text
+Materialize
+├─ materialize.before_publish_task_outputs
+├─ materialize.publish_task_outputs
+│  ├─ materialize.publish_task_outputs.copy
+│  ├─ materialize.publish_task_outputs.flush
+│  └─ materialize.publish_task_outputs.residual
+└─ materialize.after_publish_task_outputs
+
+Register
+├─ register.wait_predecessor_insert
+├─ register.publish_writer_metadata
+└─ register.publish_insert_completion
+```
+
+同一固定参数下的最新泳道结果：
+
+- 1,280 tasks，raw records 486,416，drop 0；
+- 每个 winner 恰有一组 Materialize outputs/copy/flush；
+- Register 内三类历史 task-output detail 计数均为 0；
+- execution、semantic、postprocess 和 analysis validation 全部 PASS；
+- Submit 3,464.587 us。
+
+按 96 核累计 core-work：
+
+| Materialize 区域 | cycles | 占 Materialize |
+| --- | ---: | ---: |
+| Materialize 总区间 | 12,743,376 | 100% |
+| output 发布前 | 6,591,184 | 51.722% |
+| `PublishSharedTaskOutputs` | 6,026,512 | 47.291% |
+| output 发布后 | 125,680 | 0.986% |
+
+| outputs 内区域 | cycles | 占 outputs |
+| --- | ---: | ---: |
+| descriptor copy | 2,071,279 | 34.369% |
+| `FlushRegion` | 603,020 | 10.006% |
+| residual | 3,352,213 | 55.624% |
+
+| Register 区域 | cycles | 占 Register |
+| --- | ---: | ---: |
+| Register 总区间 | 15,678,761 | 100% |
+| 前序插入完成等待 | 12,665,626 | 80.782% |
+| writer metadata | 2,409,396 | 15.367% |
+| 插入完成发布 | 603,739 | 3.851% |
+| Register 内 task outputs | 0 | 0% |
+
+迁移后的 output 包络为 6,026,512 cycles，和迁移前的 6,067,592 cycles
+同量级，证明工作被移动而不是被漏记。3,464.587 us 是
+level-4/atomic-trace 观测构建的端到端结果，不用于计算净收益；净性能以
+上一节四组无泳道 A/B 的 8.3559295 -> 2.9402265 ms 为准。两种独立口径
+方向一致，同时分别回答“性能是否改善”和“原工作是否被漏记”。
+
+归档位于：
+
+```text
+tests/atomic_probe/pa_scheduler/test_record/2026-7-28-shard/
+  per_task_deps_prepared_task_outputs_copy_flush_b256/
+  per_task_deps_prepared_materialize_task_outputs_b256/
+```

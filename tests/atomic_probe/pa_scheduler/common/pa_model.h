@@ -35,7 +35,8 @@
 #endif
 
 // shared writer 插入仍是一条全局 task-id 顺序链，只把相邻 token 交错
-// 放到 1/2/4/8 条独立 cache line，分散 future owner 的等待 load。
+// 放到 1/2/4/8/16/32/64/128 条独立 cache line，分散 future owner
+// 的等待 load。
 // 该值是构建身份，不允许运行期改变；private 构建不会读取这些控制字。
 #ifndef PTO_FDWIC_SHARED_INSERT_TURN_GROUPS
 #define PTO_FDWIC_SHARED_INSERT_TURN_GROUPS 1
@@ -44,8 +45,12 @@
 #if PTO_FDWIC_SHARED_INSERT_TURN_GROUPS != 1 && \
     PTO_FDWIC_SHARED_INSERT_TURN_GROUPS != 2 && \
     PTO_FDWIC_SHARED_INSERT_TURN_GROUPS != 4 && \
-    PTO_FDWIC_SHARED_INSERT_TURN_GROUPS != 8
-#error "PTO_FDWIC_SHARED_INSERT_TURN_GROUPS must be 1, 2, 4, or 8"
+    PTO_FDWIC_SHARED_INSERT_TURN_GROUPS != 8 && \
+    PTO_FDWIC_SHARED_INSERT_TURN_GROUPS != 16 && \
+    PTO_FDWIC_SHARED_INSERT_TURN_GROUPS != 32 && \
+    PTO_FDWIC_SHARED_INSERT_TURN_GROUPS != 64 && \
+    PTO_FDWIC_SHARED_INSERT_TURN_GROUPS != 128
+#error "PTO_FDWIC_SHARED_INSERT_TURN_GROUPS must be a power of two from 1 through 128"
 #endif
 
 #if !PTO_FDWIC_SHARED_MAP && \
@@ -91,11 +96,11 @@ constexpr TensorMapBuildMode kCompiledTensorMapMode =
     static_cast<TensorMapBuildMode>(PTO_FDWIC_SHARED_MAP);
 constexpr uint32_t kBuildIdentityMagic = 0x50414249U;  // "PABI"
 #if PTO_FDWIC_SHARED_MAP
-constexpr uint32_t kBuildIdentityAbiGeneration = 9;
+constexpr uint32_t kBuildIdentityAbiGeneration = 11;
 #else
 constexpr uint32_t kBuildIdentityAbiGeneration = 4;
 #endif
-// 默认 CAP=128 时，private 保留历史 ABI 值；shared generation 9 另把
+// 默认 CAP=128 时，private 保留历史 ABI 值；shared generation 11 另把
 // active insert-turn G 编入低位。这样既避免 private AIC/AIV 入口因身份
 // 元数据多一条大立即数构造，也让 manifest v3 和 host/device 握手共同
 // 拒绝不同 G 的 shared 混件。非默认隔离变体继续把 CAP 编进 ABI。
@@ -130,17 +135,30 @@ constexpr uint32_t kBuildIdentityAbiVersion =
 // task；ticket 的两个 group bit 与 PA 256/64=4 组上限一致。实际组数
 // 仍由每个 batch 的 context_len 决定，不是编译期固定为四组。
 constexpr uint32_t kDefaultBatches = 256;
-constexpr uint32_t kMaxBatches = 256;
+#if PTO_FDWIC_SHARED_MAP
+// shared standalone 扩展到 512 batch，用于保持每 batch 的默认 PA-G1
+// 业务不变并把总 task 从 1,280 增至 2,560。shared 多 group 仍受独立
+// kMaxTasks 总容量约束，不能把 batch 上限误解为任意 context 都可达；
+// private 继续保持原有 256-batch ABI 和测试边界。
+constexpr uint32_t kMaxBatches = 512;
+#else
+constexpr uint32_t kMaxBatches = kDefaultBatches;
+#endif
 constexpr uint32_t kTasksPerBatch = 5;
 #if PTO_FDWIC_SHARED_MAP
 constexpr uint32_t kSharedPaMaxBlockGroups = 4;
 constexpr uint32_t kSharedPaMaxTasksPerBatch =
     1U + 4U * kSharedPaMaxBlockGroups;
+// 保留现有 4,352-task output/history 物理布局；它既覆盖原 256 batch
+// 的 PA-G4 最坏计划，也覆盖新增 512 batch 的默认 PA-G1 计划。
+// 512 batch 的多 group 计划若超过该总量，会由 host/device plan
+// 在触碰共享状态前 fail closed。
 constexpr uint32_t kMaxTasks =
-    kMaxBatches * kSharedPaMaxTasksPerBatch;
+    kDefaultBatches * kSharedPaMaxTasksPerBatch;
 static_assert(
-    kSharedPaMaxTasksPerBatch == 17 && kMaxTasks == 4352,
-    "shared PA task capacity no longer covers four block groups"
+    kSharedPaMaxTasksPerBatch == 17 && kMaxTasks == 4352 &&
+        kMaxTasks >= kMaxBatches * kTasksPerBatch,
+    "shared PA task capacity no longer covers PA-G4/B256 and PA-G1/B512"
 );
 #else
 constexpr uint32_t kMaxTasks = kMaxBatches * kTasksPerBatch;
@@ -171,7 +189,7 @@ static_assert(
 // shared 输出 heap 按 task_id 固定分成 8 个物理 shard。首版只做有界
 // 绝对递增分配，不在 shard 内回绕；该常量同时属于 host 地址 oracle。
 constexpr uint32_t kSharedHeapShards = 8;
-constexpr uint32_t kSharedInsertTurnCapacity = 8;
+constexpr uint32_t kSharedInsertTurnCapacity = 128;
 constexpr uint32_t kSharedInsertTurnGroups =
     static_cast<uint32_t>(
         PTO_FDWIC_SHARED_INSERT_TURN_GROUPS
@@ -195,6 +213,11 @@ constexpr uint32_t kMaxFanin = 16;
 // heap_next 使用单调逻辑地址；真正落到 256 MiB 环形 heap 时才取模，因而可判断覆盖风险。
 constexpr uint32_t kHeapWindow = 64;
 constexpr uint64_t kHeapBytes = 256ULL << 20;
+// B512/PA-G1 的逻辑 reservation 为 B256 的两倍，超过默认 256 MiB
+// no-wrap heap。standalone 只在 batches>kDefaultBatches 时使用该扩展
+// 逻辑容量；real-compute 仍访问独立 workspace，不分配或解引用这段
+// synthetic heap。
+constexpr uint64_t kExtendedBatchHeapBytes = 512ULL << 20;
 constexpr uint64_t kSyntheticHeapBase = 0x100000000ULL;
 constexpr uint64_t kOutputAlignment = 1024;
 constexpr uint32_t kMaxTensorDims = 5;
@@ -523,7 +546,7 @@ enum class TracePhase : int32_t {
     // 逐 atomic 诊断构建中，每个 worker 只记录一次连续两次 SYS_CNT 的
     // 空括号，用来给出同一二进制、同一物理核上的计时分辨率下限。
     ClockBaseline = 15,
-    // schema-v4 追加的父区间与真实动作区间。loser 没有可单列的真实动作，
+    // schema-v5 的父区间与真实动作区间。loser 没有可单列的真实动作，
     // 其时间直接归入离线计算的 Submit residual，不占用 raw 记录。
     OrchestrationReplay = 16,
     FinalDrain = 17,
@@ -533,7 +556,16 @@ enum class TracePhase : int32_t {
     // 等待 insert turn 和把 turn 交给 N+1 的两段由父/子端点离线还原，
     // 避免为每个 winner 再扩张两条 raw 记录，更不能逐 poll 记录。
     SharedRegisterPublishMetadata = 20,
-    Count = 21,
+    // Materialize 尾部精确包住 fresh shared-output cell 的预检、writer
+    // 预留、descriptor flush 与 published 发布。该 cell 按 task_id
+    // 独占，不进入后续 ordinary/symbol 的全局串行插入区。
+    SharedMaterializePublishTaskOutputs = 21,
+    // PublishTaskOutputs 内再拆两层：先整批 copy descriptor，再整批
+    // FlushRegion。两端点仍由正式 Materialize 调用点写 raw，通用 helper
+    // 只回传时间戳，不自行 WriteTrace。
+    SharedMaterializePublishTaskOutputsCopy = 22,
+    SharedMaterializePublishTaskOutputsFlush = 23,
+    Count = 24,
 };
 
 // AtomicSite 按 standalone PA 中真实出现的源码调用点分类。编号写入 TraceRecord::auxiliary，
@@ -560,7 +592,11 @@ enum class AtomicSite : uint32_t {
     SharedHeapCursorLoad = 16,
     SharedHeapCursorReserve = 17,
     SharedHeapVendAdvance = 18,
-    Count = 19,
+    // shared Register 的 insert-turn 等待只按一次 Wait episode 聚合，
+    // 不为循环内每次 Load 写 raw；handoff CAS 则保留一条 return-ready。
+    SharedInsertTurnPoll = 19,
+    SharedInsertTurnHandoff = 20,
+    Count = 21,
 };
 
 // Atomic 记录 flags 的低四位保存操作种类；bit4 表示返回值参与后续判断，
@@ -572,6 +608,7 @@ enum class AtomicOp : uint32_t {
     Exchange = 1,
     FetchAdd = 2,
     FetchMax = 3,
+    CompareExchange = 4,
 };
 constexpr uint32_t kAtomicOpMask = 0x0fU;
 constexpr uint32_t kAtomicResultUsed = 1U << 4;
@@ -607,6 +644,8 @@ PA_MODEL_INLINE constexpr AtomicOp AtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::ClaimMax:
         case AtomicSite::FrontierMax:
             return AtomicOp::FetchMax;
+        case AtomicSite::SharedInsertTurnHandoff:
+            return AtomicOp::CompareExchange;
         default:
             return AtomicOp::Load;
     }
@@ -634,6 +673,8 @@ PA_MODEL_INLINE constexpr bool AtomicSiteResultUsed(AtomicSite site) {
         case AtomicSite::SharedHeapCursorLoad:
         case AtomicSite::SharedHeapCursorReserve:
         case AtomicSite::SharedHeapVendAdvance:
+        case AtomicSite::SharedInsertTurnPoll:
+        case AtomicSite::SharedInsertTurnHandoff:
             return true;
         case AtomicSite::Count:
             return false;
@@ -680,7 +721,10 @@ PA_MODEL_INLINE constexpr AtomicSite AtomicPollBatchSite(uint32_t index) {
 }
 
 PA_MODEL_INLINE constexpr bool AtomicSiteIsPollBatchable(AtomicSite site) {
-    return AtomicPollBatchIndex(site) >= 0;
+    // insert-turn 使用 Wait 已有 polls 一次性写聚合记录，不占用
+    // AtomicPollBurst compact slot，也绝不进入逐调用 TraceAtomicLoad。
+    return AtomicPollBatchIndex(site) >= 0 ||
+           site == AtomicSite::SharedInsertTurnPoll;
 }
 
 PA_MODEL_INLINE constexpr bool AtomicSiteIsSharedOnly(AtomicSite site) {
@@ -694,6 +738,14 @@ PA_MODEL_INLINE constexpr uint32_t AtomicPollBatchMask(AtomicSite site) {
     const int32_t index = AtomicPollBatchIndex(site);
     return index >= 0 && index < 32 ? 1U << static_cast<uint32_t>(index) : 0U;
 }
+
+static_assert(
+    AtomicSiteIsSharedOnly(AtomicSite::SharedInsertTurnPoll) &&
+        AtomicSiteIsSharedOnly(
+            AtomicSite::SharedInsertTurnHandoff
+        ),
+    "insert-turn atomic sites must remain shared-only"
+);
 
 #undef PA_MODEL_INLINE
 
@@ -785,9 +837,11 @@ struct alignas(64) TaskCell {
     volatile int64_t flag;
     volatile uint64_t vend;
 #if PTO_FDWIC_SHARED_MAP
-    // 历史 writer-ready 门保留在 64B task-cell ABI 中；新 ordered-insert
-    // 路径不再读写它，host 要求全程保持 -1。TensorMap 插入次序由
-    // sidecar 的 task 前沿表达，loser 不等待本字段。
+    // shared 热路径把该字作为 per-task TensorMap 插入完成原子：初值
+    // -1，task N 的唯一 Claim owner 完成 writer 元数据发布后用 CAS
+    // 写成 N；N+1 owner 只轮询这一字。它与 flag/vend 共处 TaskCell，
+    // 但当前热路径不对该 cache line 执行 DCCI。旧 writer-ready helper
+    // 只供隔离协议测试，不能与本热路径混用。
     volatile int64_t deps_prepared;
     uint8_t padding[64 - 3 * sizeof(int64_t)];
 #else
@@ -1046,7 +1100,7 @@ struct alignas(64) SharedTensorMapSidecar {
     // 已关闭 task [0,N] 的全部 ordinary-ring 读取。R4e-a 只建立状态与
     // 纯公式门槛，尚不从 PA 或通用 Submit 热路径发布该字段。
     AtomicLine reader_done[kWorkers];
-    // insert_turn_extra[0..6] 对应逻辑 lane 1..7。初始值全部为 -1；
+    // insert_turn_extra[0..126] 对应逻辑 lane 1..127。初始值全部为 -1；
     // active G 只决定前 G 条逻辑 lane 的寻址，inactive 物理线始终保持
     // -1。每个 owner（包括空写集合）发布完整元数据后，只把 baton 从
     // task N 轮换为 N+1；fanin、Build 与执行不属于这条顺序链。
@@ -1077,7 +1131,7 @@ static_assert(
     "extra shared insert-turn lines must follow reader progress"
 );
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
-static_assert(sizeof(SharedTensorMapSidecar) == 12426880, "shared TensorMap sidecar size changed");
+static_assert(sizeof(SharedTensorMapSidecar) == 12434560, "shared TensorMap sidecar size changed");
 static_assert(
     offsetof(SharedTensorMapSidecar, shared_outputs) == 2113664,
     "shared output table offset mismatch"
@@ -1454,7 +1508,7 @@ struct alignas(64) SchedulerState {
     WinnerWorkloadConfig winner_workload;
     // Context lengths are the only PA input elements read by orchestration;
     // keeping them in GM preserves the per-batch descriptor-based load.
-    // 除这 256 个长度值外，其余 tensor 仅需稳定的合成地址来复现
+    // 除这些 batch 长度值外，其余 tensor 仅需稳定的合成地址来复现
     // descriptor、依赖和 heap 行为，不会解引用成真实计算数据。
     volatile int32_t context_lens[kMaxBatches];
     // standalone 的 final 分层实验状态位于完整生产 DistGlobal 镜像之后，
@@ -1511,12 +1565,12 @@ static_assert(
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
 static_assert(
-    sizeof(SchedulerState) == 1019548992,
+    sizeof(SchedulerState) == 1019557696,
     "shared split SchedulerState ABI changed"
 );
 #else
 static_assert(
-    sizeof(SchedulerState) == 1019542848,
+    sizeof(SchedulerState) == 1019551552,
     "shared non-split SchedulerState ABI changed"
 );
 #endif

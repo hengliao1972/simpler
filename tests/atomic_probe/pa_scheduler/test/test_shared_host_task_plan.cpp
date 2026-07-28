@@ -128,12 +128,36 @@ bool CheckRealComputeActivityContract(SchedulerState *state) {
     return ok;
 }
 
+bool CheckTensorDescSemanticMatch() {
+    TensorDesc expected{};
+    expected.buffer_addr = kSyntheticHeapBase;
+    expected.buffer_size = 64;
+    expected.owner_task_id = 17;
+    expected.ndims = 1;
+    expected.dtype = DataType::Float32;
+    expected.is_contiguous = true;
+    expected.shapes[0] = 16;
+    expected.strides[0] = 1;
+    expected.extent_elem_cache = 16;
+
+    TensorDesc actual = expected;
+    actual.shapes[1] = 99;
+    actual.strides[1] = 7;
+    bool ok = TensorDescFieldsMatch(actual, expected);
+    actual.strides[0] = 2;
+    ok &= !TensorDescFieldsMatch(actual, expected);
+    actual.strides[0] = 1;
+    actual.ndims = kMaxTensorDims + 1U;
+    ok &= !TensorDescFieldsMatch(actual, expected);
+    return ok;
+}
+
 bool CheckHeapAdmission(SchedulerState *state) {
     bool ok = true;
     const auto check_repeated = [&](
         int32_t context, uint32_t batches,
         bool expected_admitted, uint64_t expected_total,
-        uint64_t expected_max_shard
+        uint64_t expected_max_shard, uint64_t heap_size
     ) {
         std::vector<int32_t> contexts(batches, context);
         SharedHostTaskPlan plan;
@@ -168,7 +192,7 @@ bool CheckHeapAdmission(SchedulerState *state) {
         std::string error;
         const bool admitted = case_ok &&
             ValidateSharedHostHeapAdmission(
-                plan, kHeapBytes, &admission, &error
+                plan, heap_size, &admission, &error
             );
         case_ok &= admitted == expected_admitted;
         case_ok &= admission.admitted == expected_admitted;
@@ -200,37 +224,48 @@ bool CheckHeapAdmission(SchedulerState *state) {
         return case_ok;
     };
 
-    ok &= check_repeated(0, 1, true, 10240, 10240);
     ok &= check_repeated(
-        8192, 1, true, 806912, 524288
+        0, 1, true, 10240, 10240, kHeapBytes
     );
     ok &= check_repeated(
-        8193, 1, true, 829440, 524288
+        8192, 1, true, 806912, 524288, kHeapBytes
     );
     ok &= check_repeated(
-        16384, 1, true, 1603584, 524288
+        8193, 1, true, 829440, 524288, kHeapBytes
     );
     ok &= check_repeated(
-        32768, 1, true, 3196928, 1048576
+        16384, 1, true, 1603584, 524288, kHeapBytes
     );
     ok &= check_repeated(
-        0, kMaxBatches, true, 2621440, 327680
+        32768, 1, true, 3196928, 1048576, kHeapBytes
+    );
+    ok &= check_repeated(
+        0, kDefaultBatches, true,
+        2621440, 327680, kHeapBytes
+    );
+    ok &= check_repeated(
+        8192, kDefaultBatches, true,
+        206569472, 25821184, kHeapBytes
+    );
+    ok &= check_repeated(
+        8193, kDefaultBatches, true,
+        212336640, 26542080, kHeapBytes
+    );
+    ok &= check_repeated(
+        16384, kDefaultBatches, false,
+        410517504, 51314688, kHeapBytes
+    );
+    ok &= check_repeated(
+        32768, kDefaultBatches, false,
+        818413568, 102301696, kHeapBytes
+    );
+    ok &= check_repeated(
+        0, kMaxBatches, true,
+        5242880, 655360, kExtendedBatchHeapBytes
     );
     ok &= check_repeated(
         8192, kMaxBatches, true,
-        206569472, 25821184
-    );
-    ok &= check_repeated(
-        8193, kMaxBatches, true,
-        212336640, 26542080
-    );
-    ok &= check_repeated(
-        16384, kMaxBatches, false,
-        410517504, 51314688
-    );
-    ok &= check_repeated(
-        32768, kMaxBatches, false,
-        818413568, 102301696
+        413138944, 51642368, kExtendedBatchHeapBytes
     );
 
     const int32_t mixed_contexts[] = {
@@ -260,11 +295,11 @@ bool CheckHeapAdmission(SchedulerState *state) {
     }
 
     std::vector<int32_t> g1_contexts(
-        kMaxBatches, 8192
+        kDefaultBatches, 8192
     );
     SharedHostTaskPlan g1;
     ok &= SetContextsAndBuild(
-        state, g1_contexts.data(), kMaxBatches, &g1
+        state, g1_contexts.data(), kDefaultBatches, &g1
     );
     SharedHostHeapAdmission exact;
     std::string exact_error;
@@ -277,6 +312,43 @@ bool CheckHeapAdmission(SchedulerState *state) {
         g1, 206569471, &one_byte_short, &short_error
     );
     ok &= !short_error.empty();
+
+    std::vector<int32_t> extended_g1_contexts(
+        kMaxBatches, 8192
+    );
+    SharedHostTaskPlan extended_g1;
+    ok &= SetContextsAndBuild(
+        state, extended_g1_contexts.data(),
+        kMaxBatches, &extended_g1
+    );
+    ok &= extended_g1.total_tasks == 2560;
+    SharedHostHeapAdmission extended_exact;
+    std::string extended_exact_error;
+    ok &= ValidateSharedHostHeapAdmission(
+        extended_g1, 413138944,
+        &extended_exact, &extended_exact_error
+    );
+    SharedHostHeapAdmission extended_short;
+    std::string extended_short_error;
+    ok &= !ValidateSharedHostHeapAdmission(
+        extended_g1, 413138943,
+        &extended_short, &extended_short_error
+    );
+    ok &= !extended_short_error.empty();
+
+    // B512 只为默认 PA-G1 翻倍模型扩容；不能让 batch 上限绕过
+    // 既有 4,352-task output/history 物理容量。
+    state->config.batches = kMaxBatches;
+    for (uint32_t batch = 0; batch < kMaxBatches; ++batch) {
+        state->context_lens[batch] = 32768;
+    }
+    SharedHostTaskPlan extended_g4;
+    std::string extended_g4_error;
+    ok &= !BuildSharedHostTaskPlan(
+        *state, &extended_g4, &extended_g4_error
+    );
+    ok &= extended_g4.total_tasks == 0;
+    ok &= !extended_g4_error.empty();
 
     // 构造“总量仍放得下、但 task_id%8 的单个 shard 已溢出”的偏斜计划，
     // 防止准入实现退化成只比较 aggregate heap。
@@ -435,6 +507,10 @@ int main() {
         "real-compute activity follows G0/nonzero shared plan"
     );
     ok &= Check(
+        CheckTensorDescSemanticMatch(),
+        "descriptor oracle ignores inactive payload bytes but rejects active corruption"
+    );
+    ok &= Check(
         CheckHeapAdmission(state.get()),
         "shared heap admission rejects over-capacity plans before workers"
     );
@@ -584,8 +660,17 @@ int main() {
     default_options.batches = 1;
     InitializeState(state.get(), default_options);
     ok &= Check(
-        state->context_lens[0] == 8192,
-        "InitializeState keeps the shared default context_len=8192"
+        state->context_lens[0] == 8192 &&
+            state->heap_size == kHeapBytes,
+        "InitializeState keeps the shared default context_len and 256 MiB heap"
+    );
+    Options extended_options;
+    extended_options.batches = kMaxBatches;
+    InitializeState(state.get(), extended_options);
+    ok &= Check(
+        state->context_lens[kMaxBatches - 1U] == 8192 &&
+            state->heap_size == kExtendedBatchHeapBytes,
+        "B512 defaults to PA-G1 and the 512 MiB no-wrap heap"
     );
     Options mixed_options;
     mixed_options.batches = 4;

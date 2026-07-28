@@ -744,8 +744,8 @@ PA_DEVICE ClaimOutcome Claim(
     LocalStats &stats
 ) {
     // Claim 在单调 cursor 上执行 atomicMax。private/Cube/Alloc 使用
-    // production-prefix 四分片；S4.14b shared Vector 使用 sidecar 中
-    // 的八分片 cursor。同一 task 只有观察到旧值更小的竞争者获胜。
+    // production-prefix 四分片；shared Vector 使用 sidecar 中的八分片
+    // cursor。同一 task 只有观察到旧值更小的竞争者获胜。
     // Alloc 由全部 96 个 worker 竞争；QK/PV 仅 32 个 AIC、
     // SF/UP 仅 64 个 AIV 发 atomicMax。
     ClaimOutcome outcome{false, false, 0, -1};
@@ -792,7 +792,8 @@ PA_DEVICE ClaimOutcome Claim(
         }
     }
     outcome.attempted = true;
-    // atomicMax 返回写入前的 cursor：old<task_id 表示本核完成首次推进并获胜，old>=task_id 则必须 Replay。
+    // atomicMax 返回写入前的 cursor：old<task_id 表示本核完成首次推进
+    // 并获胜，old>=task_id 则必须 Replay。
     const int64_t old = TraceAtomicFetchMax<Ops>(
         stats.trace, stats.result, static_cast<int32_t>(task_id), AtomicSite::ClaimMax,
         &cursor->value, static_cast<int64_t>(task_id), outcome.retries
@@ -2334,10 +2335,14 @@ PA_DEVICE_NOINLINE void RollbackSharedTaskOutputs(
     }
 }
 
+// 可选时间戳 out-param 只在正式 Materialize 泳道路径传入；单元测试与
+// 其它 helper 继续走默认空指针，不强制携带 LocalStats。
 template <typename Ops>
 PA_DEVICE bool PublishSharedTaskOutputs(
     PA_GM SharedTensorMapSidecar &map, const SubmitContext &context,
-    uint32_t task_id
+    uint32_t task_id, LocalStats *stats = nullptr,
+    uint64_t *copy_begin = nullptr, uint64_t *copy_end = nullptr,
+    uint64_t *flush_begin = nullptr, uint64_t *flush_end = nullptr
 ) {
     if (task_id >= kMaxTasks || context.shared_result.TaskId() != static_cast<int32_t>(task_id) ||
         context.shared_result.Size() != context.result.count ||
@@ -2377,11 +2382,64 @@ PA_DEVICE bool PublishSharedTaskOutputs(
             return false;
         }
     }
+    // 把原先“每 slot copy 后立刻 flush”拆成两段整批动作，便于泳道单独
+    // 展示 copy 与 flush；语义不变：全部 desc 写完后再统一 flush，再
+    // barrier + published。零输出 task 也保留零时长边界，保证每个
+    // winner 的 raw 子层数量固定。
+#if !PA_BUILD_TRACE_FREE
+    if (copy_begin != nullptr) {
+        *copy_begin = stats != nullptr
+            ? TraceTimestamp<Ops>(stats->trace, stats->result)
+            : 0;
+    }
+#else
+    (void)stats;
+    if (copy_begin != nullptr) {
+        *copy_begin = 0;
+    }
+#endif
     for (uint32_t output = 0; output < context.result.count; ++output) {
         PA_GM TensorDesc *source = context.result.tensors[output];
         CopyGmTensor(cell.tensors[output], *source);
-        Ops::FlushRegion(&cell.tensors[output], sizeof(TensorDesc));
     }
+#if !PA_BUILD_TRACE_FREE
+    if (copy_end != nullptr || flush_begin != nullptr) {
+        const uint64_t boundary = stats != nullptr
+            ? TraceTimestamp<Ops>(stats->trace, stats->result)
+            : 0;
+        if (copy_end != nullptr) {
+            *copy_end = boundary;
+        }
+        if (flush_begin != nullptr) {
+            *flush_begin = boundary;
+        }
+    }
+#else
+    if (copy_end != nullptr) {
+        *copy_end = 0;
+    }
+    if (flush_begin != nullptr) {
+        *flush_begin = 0;
+    }
+#endif
+    if (context.result.count != 0) {
+        Ops::FlushRegion(
+            &cell.tensors[0],
+            static_cast<uint64_t>(context.result.count) *
+                sizeof(TensorDesc)
+        );
+    }
+#if !PA_BUILD_TRACE_FREE
+    if (flush_end != nullptr) {
+        *flush_end = stats != nullptr
+            ? TraceTimestamp<Ops>(stats->trace, stats->result)
+            : 0;
+    }
+#else
+    if (flush_end != nullptr) {
+        *flush_end = 0;
+    }
+#endif
     Ops::StoreBarrier();
     for (uint32_t output = 0; output < context.result.count; ++output) {
         if (Ops::Exchange(

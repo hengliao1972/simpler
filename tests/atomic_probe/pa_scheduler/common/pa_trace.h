@@ -72,6 +72,8 @@ PA_DEVICE AtomicOp TraceAtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::ClaimMax:
         case AtomicSite::FrontierMax:
             return AtomicOp::FetchMax;
+        case AtomicSite::SharedInsertTurnHandoff:
+            return AtomicOp::CompareExchange;
         default:
             return AtomicOp::Load;
     }
@@ -116,7 +118,8 @@ PA_DEVICE AtomicSite TraceAtomicPollBatchSite(uint32_t index) {
 }
 
 PA_DEVICE bool TraceAtomicSiteIsPollBatchable(AtomicSite site) {
-    return TraceAtomicPollBatchIndex(site) >= 0;
+    return TraceAtomicPollBatchIndex(site) >= 0 ||
+           site == AtomicSite::SharedInsertTurnPoll;
 }
 
 PA_DEVICE uint32_t TraceAtomicPollBatchMask(AtomicSite site) {
@@ -181,7 +184,8 @@ PA_DEVICE void WriteTrace(
 #if !PA_BUILD_TRACE_FREE
 PA_DEVICE_NOINLINE bool WritePollBatchRecordRaw(
     PA_GM TraceCoreState *core, PA_GM TraceRecord *records, uint32_t capacity,
-    uint64_t start_cycle, uint64_t end_cycle, uint32_t call_count, uint32_t site_id
+    uint64_t start_cycle, uint64_t end_cycle, uint32_t call_count,
+    uint32_t site_id, bool return_ready_end = false
 ) {
     if (core == nullptr || records == nullptr || capacity == 0) {
         return false;
@@ -203,6 +207,7 @@ PA_DEVICE_NOINLINE bool WritePollBatchRecordRaw(
     const AtomicSite site = static_cast<AtomicSite>(site_id);
     record.flags = static_cast<uint32_t>(TraceAtomicSiteExpectedOp(site)) |
                    kAtomicResultUsed | kAtomicPollBatch |
+                   (return_ready_end ? kAtomicReturnReady : 0U) |
                    (call_count << kAtomicPollCountShift);
     record.auxiliary = site_id;
     // count 最后更新，使其始终指向下一空槽；单写者条件下无需 reserve/commit 两阶段。
@@ -238,6 +243,55 @@ PA_DEVICE void CountAtomicCall(
         return;
     }
     ++trace.poll_calls;
+}
+
+// insert-turn 等待已经在生产循环中维护精确 polls；这里一次性把
+// pending polls + 最终 Ready Load 聚合成一条 PollBatch，避免在最热循环
+// 内为每次 Load 做 trace 分支、计数和起始状态维护。24-bit 编码不足时
+// 明确令本次 trace 闭合失败，不饱和、不拆成随轮询数增长的多条记录。
+PA_DEVICE bool WriteAggregateAtomicPollBatch(
+    TraceContext &trace, WorkerResult &result, AtomicSite site,
+    uint64_t start_cycle, uint64_t end_cycle, uint64_t call_count,
+    bool return_ready_end
+) {
+#if PA_BUILD_TRACE_FREE
+    (void)trace;
+    (void)result;
+    (void)site;
+    (void)start_cycle;
+    (void)end_cycle;
+    (void)call_count;
+    (void)return_ready_end;
+    return false;
+#else
+    if (!trace.atomics_enabled) return false;
+    if (!TraceAtomicSiteIsPollBatchable(site) ||
+        TraceAtomicSiteExpectedOp(site) != AtomicOp::Load ||
+        call_count == 0 || call_count > kAtomicPollCountMax ||
+        end_cycle < start_cycle ||
+        (return_ready_end &&
+         site != AtomicSite::SharedInsertTurnPoll) ||
+        result.atomic_trace_calls > UINT64_MAX - call_count ||
+        trace.poll_calls > UINT64_MAX - call_count) {
+        trace.atomic_counter_overflow = true;
+        return false;
+    }
+    result.atomic_trace_calls += call_count;
+    trace.poll_calls += call_count;
+    const bool written = WritePollBatchRecordRaw(
+        trace.core, trace.records, trace.capacity,
+        start_cycle, end_cycle, static_cast<uint32_t>(call_count),
+        static_cast<uint32_t>(site), return_ready_end
+    );
+    if (written) {
+        if (trace.poll_batch_records == UINT64_MAX) {
+            trace.atomic_counter_overflow = true;
+        } else {
+            ++trace.poll_batch_records;
+        }
+    }
+    return written;
+#endif
 }
 
 template <typename Ops>
@@ -429,6 +483,34 @@ PA_DEVICE T TraceAtomicExchange(
     WriteAtomicTrace<Ops>(
         trace, result, task_id, site, AtomicOp::Exchange, begin, end, result_used, return_ready
     );
+    return old;
+#endif
+}
+
+// Handoff 先只捕获 CAS 的 source/return-ready 边界。调用方完成成功判断并
+// 固定 Register 父区间后才写 raw，避免 64B 记录写入污染父区间，同时
+// 不把 CAS 后的比较和函数返回从 RegisterHandoffNextTurn 中删掉。
+template <typename Ops>
+PA_DEVICE int64_t CaptureAtomicCompareExchange(
+    TraceContext &trace, PA_GM volatile int64_t *address,
+    int64_t expected, int64_t desired,
+    uint64_t &trace_begin, uint64_t &trace_end
+) {
+#if PA_BUILD_TRACE_FREE
+    (void)trace;
+    trace_begin = 0;
+    trace_end = 0;
+    return Ops::CompareExchange(address, expected, desired);
+#else
+    if (!trace.atomics_enabled) {
+        trace_begin = 0;
+        trace_end = 0;
+        return Ops::CompareExchange(address, expected, desired);
+    }
+    trace_begin = Ops::Now();
+    const int64_t old =
+        Ops::CompareExchange(address, expected, desired);
+    trace_end = Ops::NowAfterAtomicResult(old);
     return old;
 #endif
 }
