@@ -2717,6 +2717,36 @@ PA_DEVICE void BeginCallbackSubmit(PA_GM WorkerState &worker, SubmitContext &con
     context.joint_count = 0;
 }
 
+#if PTO_FDWIC_SHARED_MAP
+PA_DEVICE void BeginSharedCallbackSubmit(
+    PA_GM WorkerState &worker, SubmitContext &context
+) {
+    // shared replay 的 96 个 actor 都要先取得同一个逻辑 task_id，但只有
+    // Claim owner 会进入 Materialize/Build。loser 在 Claim 后只需要
+    // task 身份与稳定 output symbol，因此这里不再为每个 replay actor
+    // 清零整份 408-byte SubmitContext 的 winner-only 字段。
+    const uint32_t task_id =
+        static_cast<uint32_t>(worker.local_index++);
+    context.task_id = static_cast<int32_t>(task_id);
+    context.shared_result.Reset(static_cast<int32_t>(task_id));
+}
+
+PA_DEVICE void PrepareSharedWinnerContext(
+    PA_GM WorkerState &worker, uint32_t task_id,
+    SubmitContext &context
+) {
+    // 这些字段都只会被 shared winner 的 Materialize/Fanin/Build 消费。
+    // tensor/scalar/register/output_bytes 由 MaterializeTask 在读取前覆盖；
+    // joint 字段属于 private BlockWon 路径，shared 单 lane PA 不读取。
+    context.self = &worker;
+    context.payload =
+        &worker.payloads[task_id & kPayloadMask];
+    context.result.task_id = task_id;
+    context.result.count = 0;
+    context.fanin_count = 0;
+}
+#endif
+
 #if defined(__CCE_AICORE__) || defined(__NPU_ARCH__)
 #define PA_CALLBACK_LAMBDA_DEVICE __aicore__
 #else
@@ -3415,7 +3445,11 @@ PA_DEVICE bool SubmitCallbackTask(
     uint32_t shared_task_offset
 #endif
 ) {
+#if PTO_FDWIC_SHARED_MAP
+    BeginSharedCallbackSubmit(worker, context);
+#else
     BeginCallbackSubmit(worker, context);
+#endif
     const uint32_t task_id = static_cast<uint32_t>(context.task_id);
 #if PTO_FDWIC_SHARED_MAP
     SharedPaPlannedTask shared_planned_task{};
@@ -3497,6 +3531,9 @@ PA_DEVICE bool SubmitCallbackTask(
         // shared loser 已在上方声明稳定 output symbol；它不需要构造本 task
         // 的 descriptor/scalar 参数，Alloc 也不例外。finish 的 loser
         // 分支只闭合边界，不读这里留下的上一 task args。
+        PrepareSharedWinnerContext(
+            worker, task_id, context
+        );
         if (!BuildCallbackSubmitArgs<Kind>(orch, args, batch, stats)) {
             SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
             return false;

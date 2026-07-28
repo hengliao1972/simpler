@@ -11016,3 +11016,183 @@ tests/atomic_probe/pa_scheduler/outputs/
 现有未提交 ordinary-ring visibility probe 只覆盖普通区域 ring，不覆盖
 fresh-output descriptor、per-task completion 与单次 published Load 的
 完整传递链，因而没有拿它替代本次正式 shared PA B256 验证。
+
+### 2026-07-28：R5k 消减 shared loser 的 winner-only 上下文初始化
+
+#### 先把 1～2 us 拆成真实路径
+
+基线 raw：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260728_131823_1696692/ccec/
+```
+
+该 B256 样本共有 1,280 个 winner 和 121,600 个 loser。loser 的
+Submit 中位数为 1.305 us，严格闭合为：
+
+| 区域 | 中位数 | loser 累计 core-work 占比 |
+| --- | ---: | ---: |
+| EfDrain | 0.200 us | 40.089% |
+| Claim | 0.624 us | 35.292% |
+| Claim.end 到 Submit.end | 0.429 us | 24.619% |
+
+只有 1,008 个 loser Submit（0.829%）在 EfDrain 中捎带执行真实
+kernel；它们解释 55～64 us 长尾，不能解释常见的 1～2 us。严格落在
+1～2 us 的 66,714 个 loser 中没有 kernel，也没有 EfDrain
+`fanin_flag_load`；其中 78.187% 执行过 ClaimMax。
+
+泳道边界还包含观察代码本身：
+
+- `efdrain_end` 之后写入的 64-byte EfDrain raw record 落入外层 Claim；
+- ClaimMax 返回端点之后写入的 atomic record 也落入外层 Claim；
+- `claim_end` 之后写入的 Claim record 落入 Claim-to-SubmitEnd 尾部；
+- Submit record 在 `submit_end` 之后写入，落入下一段 SubmitTransition。
+
+因此 1～2 us 不是“loser 又执行了 TensorMap/Build”。源码审计确认
+post-Claim loser 没有 TensorMap 访问、参数构造、DCCI、kernel 或新的
+atomic；它只建立稳定 output symbol，执行 split replay 记账、紧凑协议
+校验和 Submit 收尾。
+
+#### 已撤回：只缩短泳道尾部、没有净性能收益的候选
+
+第一版曾把 0/1/3 个稳定 output slot 改为一次性计数，并让同 TU loser
+复用已校验的 batch plan，跳过 ticket meta 的再次解码。B256 泳道中
+post-Claim 中位数从 429 ns 降到 392 ns，约下降 8.6%；但 10 个独立
+perf-clock 样本没有同向变化：
+
+| 版本 | 中位数 | 均值 |
+| --- | ---: | ---: |
+| 基线 | 2,458.6665 us | 2,458.9239 us |
+| direct-close 候选 | 2,461.4920 us | 2,459.9551 us |
+
+中位数差 `+0.115%`、均值差 `+0.042%`，均在本轮波动内。该候选只让
+带泳道的观察结果变短，没有证明 trace-free 业务执行变快，因此已经完整
+撤回，不作为性能优化保留。
+
+#### 保留：shared actor 只初始化自己实际消费的字段
+
+原 `BeginCallbackSubmit()` 在所有 96 个 replay actor、每个 task 上都
+清零整份 shared `SubmitContext`，其中 payload/result/fanin/joint 等字段
+只会被 1 个 Claim owner 消费。新路径拆为：
+
+```text
+所有 shared actor：
+  local_index++
+  context.task_id = task_id
+  context.shared_result.Reset(task_id)
+
+仅 Claim owner：
+  绑定 worker/payload
+  初始化 result.task_id/result.count
+  初始化 fanin_count
+  构造 TaskArgs，进入 Materialize/Fanin/Build
+```
+
+`context.won` 和 `context.kernel_id` 仍由 Claim 结果对所有 actor 明确
+覆盖；`tensor_count/scalar_count/register_mask/output_bytes` 在 winner
+读取前由 `MaterializeTask()` 覆盖；joint 字段只属于 private BlockWon，
+shared 单 lane PA 不读取。private 继续使用完整
+`BeginCallbackSubmit()`，没有改变原语义。
+
+#### 正确性、泳道与净性能
+
+shared CPU 全量门槛通过，包括 5 档 ordinary ring、symbol history、
+writer intent、heap、Claim、Materialize 和 96-worker ordered Submit。
+CPU B256 G1 的完整 host oracle、依赖签名和最终 TensorMap 投影全部 PASS。
+CCEC shared swimlane/perf-clock 的 AIC/AIV 入口、split runtime/finish、
+mixed ELF、host runner 和 manifest 校验全部通过。
+
+最新 A5 B256 泳道：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260728_155832_1767994/ccec/
+```
+
+- execution、semantic、postprocess 和 exclusive analysis 全部 PASS；
+- 485,796 条 raw record，drop 0；
+- Submit wall-clock 为 3,364.474 us；
+- loser Submit 内部中位数仍为 1.289 us，符合本次不移动 Submit
+  时间边界的预期；
+- loser 后继 SubmitTransition 中位数由 399 ns 降到 335 ns，
+  累计 core-work 从 67,378,398 降到 61,702,342 cycles，下降 8.424%。
+
+这证明被删除的清零工作位于相邻 Submit 之间，而不是被伪装成 Claim 或
+loser tail。
+
+当前源码的 10 个独立 perf-clock 样本为：
+
+```text
+2444.000, 2428.917, 2459.165, 2417.391, 2436.721,
+2457.734, 2482.708, 2432.841, 2421.812, 2436.210 us
+```
+
+中位数 2,436.4655 us、均值 2,441.7499 us。相对修改前同轮 10 样本，
+中位数下降 22.201 us（0.903%），均值下降 17.174 us（0.698%）。
+
+为避免把先后运行的状态漂移当成收益，又在同一 device 0 顺序执行 6 组
+`baseline -> candidate`：
+
+| 组 | 基线 | 候选 | 差值 |
+| ---: | ---: | ---: | ---: |
+| 1 | 2,436.254 us | 2,447.698 us | +11.444 us |
+| 2 | 2,460.574 us | 2,413.855 us | -46.719 us |
+| 3 | 2,485.481 us | 2,418.374 us | -67.107 us |
+| 4 | 2,484.331 us | 2,437.374 us | -46.957 us |
+| 5 | 2,469.693 us | 2,409.075 us | -60.618 us |
+| 6 | 2,460.075 us | 2,426.713 us | -33.362 us |
+
+5/6 组同向改善，配对差值中位数为 `-46.838 us`；相对基线中位数
+2,465.1335 us 为 `-1.900%`。本机仍缺少 `npu-smi` 和 `task-submit`，
+以上设备运行均明确属于 device 0 无锁样本；性能结论同时依赖配对方向、
+trace-free 结果和泳道中 SubmitTransition 的结构性消减，不用单次
+3.364 ms 泳道值冒充净收益。
+
+#### 已撤回：把 split `task_id_sum` 移到回放封口
+
+随后验证了第二个看似直接的 loser-tail 消减：保留每 task 的
+`task_id == stats.submits` 顺序断言，删除
+`runtime.task_id_sum += task_id`，并在回放结束时按实际完成 Submit 数一次
+生成 `N(N-1)/2`。从协议逻辑看，两者等价，而且逐 task 的精确 ID 比总和
+更强。
+
+但 CCEC perf-clock 的同设备顺序交错结果明确回退：
+
+| 组 | R5k 基线 | 封口求和候选 | 差值 |
+| ---: | ---: | ---: | ---: |
+| 1 | 2,420.071 us | 2,491.181 us | +71.110 us |
+| 2 | 2,412.474 us | 2,491.746 us | +79.272 us |
+| 3 | 2,432.161 us | 2,489.907 us | +57.746 us |
+| 4 | 2,419.581 us | 2,485.778 us | +66.197 us |
+| 5 | 2,418.929 us | 2,498.761 us | +79.832 us |
+| 6 | 2,439.582 us | 2,494.907 us | +55.325 us |
+
+6/6 组回退，配对差值中位数 `+68.6535 us`，相对基线中位数
+2,419.826 us 为 `+2.837%`。候选虽然少一次热路径加法，却改变了 CCEC
+代码布局、活跃值和最终封口代码；实测总代价更高。该候选已经完整撤回，
+继续保留原逐 task 求和。这里不能用源码指令条数推翻设备结果，也不能把
+单次带泳道的 3,291.510 us 当成反证。
+
+#### 已撤回：把固定 PA Claim 改成编译期 Kind 路由
+
+第四个候选为五个 `SubmitCallbackTask<Kind>` 调用点分别实例化
+`ClaimForKind`，直接固化 role、function 和 cursor；动态 `Claim(kind)`
+只留给隔离门槛。该实现语义和现有单 lane PA 一致，CPU 全量门槛及 CCEC
+两类构建也全部通过。
+
+单次 B256 泳道中，loser Claim 累计 core-work 只从 74,503,213 降到
+74,313,310 cycles，下降 0.255%；Submit 为 3,347.626 us。这个量级不足以
+单独证明净收益。随后固定同一 device 做两种顺序的 perf-clock 交错：
+
+- 6 组 `baseline -> candidate`：5/6 改善，配对差值中位数
+  `-22.645 us`；
+- 4 组 `candidate -> baseline`：0/4 改善，candidate 相对后跑 baseline
+  的配对差值中位数 `+20.4365 us`；
+- 合并 10 组后仅 5/10 改善，candidate-minus-baseline 中位数
+  `-7.7365 us`、均值 `-6.2392 us`。
+
+正反顺序结论相反，说明相邻进程约 20 us 的顺序/热状态影响已经大于
+候选本身。该版本没有达到“性能收益方向独立于运行顺序”的保留门槛，
+已经完整撤回；同时保留原动态 active-mask/popcount 路由，使 standalone
+继续贴近生产 Claim，而不是为了未证明的微小收益固化 PA 特例。
