@@ -211,6 +211,276 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "must not contain PrepareMap"):
                 convert(input_path, output_path)
 
+    def test_v4_shared_register_detail_splits_parent_with_one_raw_row(self) -> None:
+        rows = [
+            [0, 0, 0, 0, -1, "Claim", 110, 115, 0x3, 1],
+            [0, 0, 0, 0, -1, "Materialize", 115, 120, 0, 1],
+            [0, 0, 0, 0, -1, "Register", 120, 140, 0, 0],
+            [
+                0,
+                0,
+                0,
+                0,
+                -1,
+                "SharedRegisterPublishMetadata",
+                124,
+                134,
+                0,
+                0,
+            ],
+            [0, 0, 0, 0, -1, "AllocComplete", 140, 145, 0, 0],
+            [0, 0, 0, 0, -1, "Submit", 100, 150, 1, 1],
+        ]
+        capture = _v4_capture(rows, tensormap_mode="shared")
+        raw_rows = capture["fdwic_events"]
+        assert isinstance(raw_rows, list)
+        # 两条 parent 由 helper 加入；Register 拆分本身只多一个设备 raw。
+        self.assertEqual(len(raw_rows), len(rows) + 2)
+        self.assertEqual(
+            sum(row[5] == "SharedRegisterPublishMetadata" for row in raw_rows),
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            convert(input_path, output_path)
+            events = json.loads(output_path.read_text(encoding="utf-8"))["traceEvents"]
+
+        parent = next(event for event in events if event.get("name") == "register#0")
+        child_names = (
+            "register.wait_insert_turn#0",
+            "register.publish_metadata#0",
+            "register.handoff_next_turn#0",
+        )
+        children = {
+            event["name"]: event
+            for event in events
+            if event.get("name") in child_names
+        }
+        self.assertEqual(set(children), set(child_names))
+        for child in children.values():
+            self.assertEqual(
+                set(child), {"ph", "name", "pid", "tid", "ts", "dur"}
+            )
+        self.assertEqual(
+            children["register.wait_insert_turn#0"]["ts"], parent["ts"]
+        )
+        self.assertAlmostEqual(
+            children["register.wait_insert_turn#0"]["ts"]
+            + children["register.wait_insert_turn#0"]["dur"],
+            children["register.publish_metadata#0"]["ts"],
+        )
+        self.assertAlmostEqual(
+            children["register.publish_metadata#0"]["ts"]
+            + children["register.publish_metadata#0"]["dur"],
+            children["register.handoff_next_turn#0"]["ts"],
+        )
+        self.assertAlmostEqual(
+            children["register.handoff_next_turn#0"]["ts"]
+            + children["register.handoff_next_turn#0"]["dur"],
+            parent["ts"] + parent["dur"],
+        )
+        self.assertAlmostEqual(
+            sum(child["dur"] for child in children.values()), parent["dur"]
+        )
+
+    def test_v4_shared_register_detail_is_required_exactly_once_for_winner(
+        self,
+    ) -> None:
+        base_rows = [
+            [0, 0, 0, 0, -1, "Claim", 110, 115, 0x3, 1],
+            [0, 0, 0, 0, -1, "Register", 120, 140, 0, 0],
+            [0, 0, 0, 0, -1, "AllocComplete", 140, 145, 0, 0],
+            [0, 0, 0, 0, -1, "Submit", 100, 150, 1, 1],
+        ]
+        detail = [
+            0,
+            0,
+            0,
+            0,
+            -1,
+            "SharedRegisterPublishMetadata",
+            124,
+            134,
+            0,
+            0,
+        ]
+        cases = {
+            "missing": base_rows,
+            "duplicate": [*base_rows, detail, list(detail)],
+        }
+        for label, rows in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                capture = _v4_capture(rows, tensormap_mode="shared")
+                input_path = Path(directory) / "raw.json"
+                output_path = Path(directory) / "merged.json"
+                input_path.write_text(json.dumps(capture), encoding="utf-8")
+                with self.assertRaisesRegex(
+                    ValueError, "requires exactly one SharedRegisterPublishMetadata"
+                ):
+                    convert(input_path, output_path)
+
+    def test_v4_shared_register_detail_rejects_bad_boundary_or_identity(
+        self,
+    ) -> None:
+        base_rows = [
+            [0, 0, 0, 0, -1, "Claim", 110, 115, 0x3, 1],
+            [0, 0, 0, 0, -1, "Register", 120, 140, 0, 0],
+            [0, 0, 0, 0, -1, "AllocComplete", 140, 145, 0, 0],
+            [0, 0, 0, 0, -1, "Submit", 100, 150, 1, 1],
+        ]
+        cases = {
+            "outside_parent": [
+                0,
+                0,
+                0,
+                0,
+                -1,
+                "SharedRegisterPublishMetadata",
+                119,
+                134,
+                0,
+                0,
+            ],
+            "different_function": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                "SharedRegisterPublishMetadata",
+                124,
+                134,
+                0,
+                0,
+            ],
+        }
+        for label, detail in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                capture = _v4_capture(
+                    [*base_rows, detail], tensormap_mode="shared"
+                )
+                input_path = Path(directory) / "raw.json"
+                output_path = Path(directory) / "merged.json"
+                input_path.write_text(json.dumps(capture), encoding="utf-8")
+                expected = (
+                    "outside Register parent"
+                    if label == "outside_parent"
+                    else "identity differs"
+                )
+                with self.assertRaisesRegex(ValueError, expected):
+                    convert(input_path, output_path)
+
+    def test_v4_rejects_shared_register_detail_in_private_mode(self) -> None:
+        capture = _v4_capture(
+            [
+                [0, 0, 0, 0, -1, "Claim", 110, 115, 0x3, 1],
+                [0, 0, 0, 0, -1, "Register", 120, 140, 0, 0],
+                [
+                    0,
+                    0,
+                    0,
+                    0,
+                    -1,
+                    "SharedRegisterPublishMetadata",
+                    124,
+                    134,
+                    0,
+                    0,
+                ],
+                [0, 0, 0, 0, -1, "AllocComplete", 140, 145, 0, 0],
+                [0, 0, 0, 0, -1, "Submit", 100, 150, 1, 1],
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError, "only valid for shared TensorMap"
+            ):
+                convert(input_path, output_path)
+
+    def test_v4_shared_register_detail_is_forbidden_for_loser(self) -> None:
+        capture = _v4_capture(
+            [
+                [0, 0, 0, 0, -1, "Claim", 110, 115, 0x2, 1],
+                [
+                    0,
+                    0,
+                    0,
+                    0,
+                    -1,
+                    "SharedRegisterPublishMetadata",
+                    124,
+                    134,
+                    0,
+                    0,
+                ],
+                [0, 0, 0, 0, -1, "Submit", 100, 150, 0, 1],
+            ],
+            tensormap_mode="shared",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "and none for losers"):
+                convert(input_path, output_path)
+
+    def test_v4_shared_register_parent_is_forbidden_for_loser(self) -> None:
+        capture = _v4_capture(
+            [
+                [0, 0, 0, 0, -1, "Claim", 110, 115, 0x2, 1],
+                [0, 0, 0, 0, -1, "Register", 120, 140, 0, 0],
+                [0, 0, 0, 0, -1, "Submit", 100, 150, 0, 1],
+            ],
+            tensormap_mode="shared",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError, "Register parent for each winner and none for losers"
+            ):
+                convert(input_path, output_path)
+
+    def test_v4_shared_rejects_register_parent_without_claim(self) -> None:
+        capture = _v4_capture(
+            [
+                [0, 0, 0, 0, -1, "Claim", 110, 115, 0x3, 1],
+                [0, 0, 0, 0, -1, "Register", 120, 140, 0, 0],
+                [
+                    0,
+                    0,
+                    0,
+                    0,
+                    -1,
+                    "SharedRegisterPublishMetadata",
+                    124,
+                    134,
+                    0,
+                    0,
+                ],
+                [0, 0, 0, 0, -1, "AllocComplete", 140, 145, 0, 0],
+                [0, 0, 0, 0, -1, "Submit", 100, 150, 1, 1],
+                # task 9 没有 Claim/Submit，不能让独立 converter 静默接收。
+                [0, 0, 0, 9, -1, "Register", 151, 152, 0, 0],
+            ],
+            tensormap_mode="shared",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError, "Register parents have no matching Claim"
+            ):
+                convert(input_path, output_path)
+
     def test_v4_splits_internal_and_tail_residual_without_repeated_fields(self) -> None:
         capture = _v4_capture(
             [

@@ -1014,7 +1014,7 @@ inline const char *TracePhaseName(uint32_t phase) {
         "Kernel", "Alloc", "Build", "DrainWon", "Replay", "RingBp", "EfDrain", "Commit",
         "Submit", "Materialize", "PrepareMap", "Claim", "Fanin", "Register", "Atomic",
         "ClockBaseline", "OrchestrationReplay", "FinalDrain", "WinnerBuild",
-        "AllocComplete",
+        "AllocComplete", "SharedRegisterPublishMetadata",
     };
     static_assert(
         sizeof(names) / sizeof(names[0]) == static_cast<uint32_t>(TracePhase::Count),
@@ -1142,10 +1142,13 @@ inline bool ClockRecordSchemaValid(const TraceRecord &record) {
 // shared 的真实回放边界是稀疏的：每个逻辑 task 都记录连续的
 // EfDrain -> Claim，并都用 Submit 父区间覆盖本次轻量或完整调用；winner
 // 才继续记录 Materialize、Register、Fanin（非 Alloc）和
-// WinnerBuild/AllocComplete 子区间。
+// WinnerBuild/AllocComplete 子区间。每个 Register 父区间后紧跟唯一
+// SharedRegisterPublishMetadata detail；其端点与父端点共同还原 wait、
+// metadata publish、handoff 三段，但不为 wait poll 逐次写记录。
 // PrepareMap 属于 private TensorMap，不得以零时长 marker 混入 shared raw。
-// 这里复用现有字段逐核闭合身份、顺序、次数和相邻时间边界，不扩张
-// device 记录。private 编译仍保持无约束，避免改变既有行为。
+// 这里复用现有字段逐核闭合身份、顺序、次数和相邻时间边界；每个 winner
+// 只增加一条 detail，不增加 TraceRecord 字段，更不按 poll 扩张记录。
+// private 编译仍保持无约束，避免改变既有行为。
 struct SharedSparseTraceValidator {
 #if PTO_FDWIC_SHARED_MAP
     explicit SharedSparseTraceValidator(
@@ -1238,11 +1241,26 @@ struct SharedSparseTraceValidator {
                 record.end_cycle < record.start_cycle) {
                 return false;
             }
+            register_begin_ = record.start_cycle;
+            register_end_ = record.end_cycle;
             previous_end_ = record.end_cycle;
+            state_ = State::AwaitRegisterMetadata;
+            ++register_count_;
+        } else if (
+            phase == TracePhase::SharedRegisterPublishMetadata
+        ) {
+            if (state_ != State::AwaitRegisterMetadata ||
+                !SameWinnerTask(record) || record.flags != 0 ||
+                record.auxiliary != 0 ||
+                record.start_cycle < register_begin_ ||
+                record.end_cycle < record.start_cycle ||
+                record.end_cycle > register_end_) {
+                return false;
+            }
             state_ = kind_ == TaskKind::Alloc
                 ? State::AwaitWinnerTail
                 : State::AwaitFanin;
-            ++register_count_;
+            ++register_metadata_count_;
         } else if (phase == TracePhase::WinnerBuild ||
                    phase == TracePhase::AllocComplete) {
             const TracePhase expected =
@@ -1289,6 +1307,7 @@ struct SharedSparseTraceValidator {
                efdrain_count_ == claim_count_ &&
                materialize_count_ == winner_count_ &&
                register_count_ == winner_count_ &&
+               register_metadata_count_ == winner_count_ &&
                fanin_count_ + alloc_winner_count_ ==
                    winner_count_ &&
                winner_tail_count_ == winner_count_ &&
@@ -1324,6 +1343,10 @@ struct SharedSparseTraceValidator {
         return register_count_;
     }
 
+    uint32_t RegisterMetadataCount() const {
+        return register_metadata_count_;
+    }
+
     uint32_t WinnerTailCount() const {
         return winner_tail_count_;
     }
@@ -1340,6 +1363,7 @@ private:
         AwaitMaterialize,
         AwaitFanin,
         AwaitRegister,
+        AwaitRegisterMetadata,
         AwaitWinnerTail,
         AwaitWinnerSubmit,
         AwaitLoserSubmit,
@@ -1387,6 +1411,8 @@ private:
     bool winner_ = false;
     uint64_t efdrain_begin_ = 0;
     uint64_t previous_end_ = 0;
+    uint64_t register_begin_ = 0;
+    uint64_t register_end_ = 0;
     uint32_t efdrain_count_ = 0;
     uint32_t claim_count_ = 0;
     uint32_t winner_count_ = 0;
@@ -1394,6 +1420,7 @@ private:
     uint32_t materialize_count_ = 0;
     uint32_t fanin_count_ = 0;
     uint32_t register_count_ = 0;
+    uint32_t register_metadata_count_ = 0;
     uint32_t winner_tail_count_ = 0;
     uint32_t submit_count_ = 0;
 };
@@ -1693,7 +1720,7 @@ inline bool ExportSwimlaneRecords(
                 "poll_calls=%llu/%u poll_batches=%u/%u clock=%u plain=%u dependency=%u "
                 "dependency_applied=%s direct_ready=%s direct_issue=%s "
                 "efdrains=%u claims=%u winners=%u materializes=%u fanins=%u "
-                "registers=%u tails=%u submits=%u\n",
+                "registers=%u register_metadata=%u tails=%u submits=%u\n",
                 worker, core_atomic_records, static_cast<unsigned long long>(core_atomic_calls),
                 core.atomic_calls, static_cast<unsigned long long>(core_poll_calls), core.poll_calls,
                 core_poll_batch_records, core.poll_batch_records, core_clock_records,
@@ -1706,6 +1733,7 @@ inline bool ExportSwimlaneRecords(
                 sparse_trace_validator.MaterializeCount(),
                 sparse_trace_validator.FaninCount(),
                 sparse_trace_validator.RegisterCount(),
+                sparse_trace_validator.RegisterMetadataCount(),
                 sparse_trace_validator.WinnerTailCount(),
                 sparse_trace_validator.SubmitCount()
             );
@@ -1904,13 +1932,15 @@ inline bool AnalyzeSwimlaneRecords(
                 stderr,
                 "swimlane analysis rejected an unclosed shared sparse flow on "
                 "worker=%u: efdrains=%u claims=%u winners=%u "
-                "materializes=%u fanins=%u registers=%u tails=%u submits=%u\n",
+                "materializes=%u fanins=%u registers=%u "
+                "register_metadata=%u tails=%u submits=%u\n",
                 worker, sparse_trace_validator.EfDrainCount(),
                 sparse_trace_validator.ClaimCount(),
                 sparse_trace_validator.WinnerCount(),
                 sparse_trace_validator.MaterializeCount(),
                 sparse_trace_validator.FaninCount(),
                 sparse_trace_validator.RegisterCount(),
+                sparse_trace_validator.RegisterMetadataCount(),
                 sparse_trace_validator.WinnerTailCount(),
                 sparse_trace_validator.SubmitCount()
             );
@@ -4048,8 +4078,9 @@ inline Metrics Validate(
                 const uint64_t worker_expected =
 #if PTO_FDWIC_SHARED_MAP
                     // 每个逻辑 task 都有 EfDrain+Claim+Submit；winner 追加
-                    // Materialize/Register/tail，非 Alloc 再追加 Fanin。
-                    3 * result.submits + 4 * result.claim_wins - result.wins[0] +
+                    // Materialize/Register/metadata-detail/tail，非 Alloc
+                    // 再追加 Fanin。
+                    3 * result.submits + 5 * result.claim_wins - result.wins[0] +
 #else
                     6 * result.submits + 2 * result.claim_wins - result.wins[0] +
 #endif
@@ -4061,12 +4092,12 @@ inline Metrics Validate(
             }
         }
 #if PTO_FDWIC_SHARED_MAP
-        // 除三条逐 task 前端记录外：每 batch 的 Alloc winner 有 3 条，
-        // 每 group 的四个普通 winner 子区间有 16 条、四个实际 kernel
-        // 的 Kernel/Commit 有 8 条，合计 24 条。
+        // 除三条逐 task 前端记录外：每 batch 的 Alloc winner 有 4 条；
+        // 每 group 的四个普通 winner 子区间有 20 条，四个实际 kernel
+        // 的 Kernel/Commit 有 8 条，合计 28 条。
         const uint64_t expected_shared_extra_records =
-            3ULL * static_cast<uint64_t>(batches) +
-            24ULL * static_cast<uint64_t>(group_count);
+            4ULL * static_cast<uint64_t>(batches) +
+            28ULL * static_cast<uint64_t>(group_count);
         const uint64_t expected_trace_records =
             3ULL * expected_submits +
             expected_shared_extra_records +
@@ -4083,9 +4114,10 @@ inline Metrics Validate(
                  : 0);
 #endif
         // shared 每个逻辑 task 固定 EfDrain+Claim+Submit 三条，loser 没有
-        // 业务子区间；Alloc winner 追加 Materialize/Register/AllocComplete
-        // 三条，每个普通 winner追加 Materialize/Register/Fanin/WinnerBuild
-        // 四条；每组四个实际 kernel 再各有 Kernel+Commit 两条。private
+        // 业务子区间；Alloc winner 追加 Materialize/Register/detail/
+        // AllocComplete 四条，每个普通 winner 追加 Materialize/Register/
+        // detail/Fanin/WinnerBuild 五条；每组四个实际 kernel 再各有
+        // Kernel+Commit 两条。private
         // 仍保持既有固定六条 Submit 记录。两个父 span 每核固定增加 2 条，
         // 真实等待按运行时次数加入。
         Expect(trace_shape_ok, "swimlane header and per-worker capacities are valid", &metrics);

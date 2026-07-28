@@ -115,6 +115,27 @@ PA_DEVICE uint64_t TraceTimestamp(TraceContext &trace, WorkerResult &result) {
 #endif
 }
 
+template <typename Ops, typename T>
+PA_DEVICE uint64_t TraceTimestampAfterAtomicResult(
+    TraceContext &trace, WorkerResult &result, T value
+) {
+#if PA_BUILD_TRACE_FREE
+    // submit-pmu/perf-clock/纯性能构建必须在预处理后完全没有额外时钟读取；
+    // value 也只用于保持模板调用形态，不在这些构建中制造返回依赖指令。
+    (void)trace;
+    (void)result;
+    (void)value;
+    return 0;
+#else
+    (void)result;
+    // 与 TraceTimestamp 保持相同 PollBatch 边界，但让 SYS_CNT 真正依赖
+    // atomic 返回值：该时间表示本核 scalar 已能消费返回值，不宣称跨核可见。
+    const uint64_t cycle = Ops::NowAfterAtomicResult(value);
+    AtomicPollBoundaryAt<Ops>(trace, cycle);
+    return cycle;
+#endif
+}
+
 PA_DEVICE uint32_t KindIndex(TaskKind kind) { return static_cast<uint32_t>(kind); }
 
 #if PTO_FDWIC_SHARED_MAP

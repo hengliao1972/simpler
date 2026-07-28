@@ -352,37 +352,63 @@ enum class SharedInsertTurnState : uint32_t {
 // 门槛会用它覆盖超过 kMaxTasks 的多圈 cursor，因此这里只限制 int32
 // 可表达性。生产 Submit 在触碰任何共享状态前另行要求 task_id 落在
 // [0,kMaxTasks)，不能把两层合同合并后破坏大 CAP 原语门槛。
-template <typename Ops>
-PA_DEVICE SharedInsertTurnState SharedInspectTaskTurn(
-    PA_GM SharedTensorMapSidecar &map, int32_t current_task
+template <typename Ops, bool PreserveReadyDependency = false>
+PA_DEVICE SharedInsertTurnState SharedInspectTaskTurnObserved(
+    PA_GM SharedTensorMapSidecar &map, int32_t current_task,
+    int64_t &observed
 ) {
     if (current_task < 0) {
+        observed = -1;
         return SharedInsertTurnState::ProtocolError;
     }
     const uint32_t lane =
         SharedInsertTurnLane(current_task);
-    const int64_t observed = Ops::Load(
+    observed = Ops::Load(
         &SharedInsertTurnLine(map, lane).value
     );
-    if (observed == current_task) {
+    int64_t compare_observed = observed;
+#if PA_BUILD_SWIMLANE && \
+    (defined(PA_BUILD_AIC) || defined(PA_BUILD_AIV))
+    if constexpr (PreserveReadyDependency) {
+        // Ready 分支会向编译器透露 compare_observed == current_task。CCEC
+        // 因此只为真正需要计时的 wait 调用，从同一个 atomic 返回寄存器
+        // 派生两个编译器不可等同的值：一个只作分支判定，一个通过
+        // observed 带到 SYS_CNT 依赖边界。其他协议检查不承担这条 MOV。
+        compare_observed = Ops::ForkAtomicResultForBranch(
+            observed, observed
+        );
+    }
+#endif
+    if (compare_observed == current_task) {
         return SharedInsertTurnState::Ready;
     }
-    if (observed < -1 || observed > current_task) {
+    if (compare_observed < -1 ||
+        compare_observed > current_task) {
         return SharedInsertTurnState::ProtocolError;
     }
     // lane 0 从初始化起始终保存非负的 0 mod G token；其他 lane 在
     // 第一次接收 token 前合法保持 -1。已发布旧 token 必须与本 lane
     // 同余，否则表示初始化、越序写或地址计算已经损坏。
-    if (observed == -1) {
+    if (compare_observed == -1) {
         return lane == 0
                    ? SharedInsertTurnState::ProtocolError
                    : SharedInsertTurnState::Pending;
     }
-    if ((static_cast<uint32_t>(observed) &
+    if ((static_cast<uint32_t>(compare_observed) &
          kSharedInsertTurnMask) != lane) {
         return SharedInsertTurnState::ProtocolError;
     }
     return SharedInsertTurnState::Pending;
+}
+
+template <typename Ops>
+PA_DEVICE SharedInsertTurnState SharedInspectTaskTurn(
+    PA_GM SharedTensorMapSidecar &map, int32_t current_task
+) {
+    int64_t ignored_observed = -1;
+    return SharedInspectTaskTurnObserved<Ops>(
+        map, current_task, ignored_observed
+    );
 }
 
 template <typename Ops>
@@ -424,10 +450,12 @@ PA_DEVICE bool SharedCanPublishTaskCommit(
 }
 
 template <typename Ops>
-PA_DEVICE bool SharedPublishTaskCommitAfterPreflight(
-    PA_GM SharedTensorMapSidecar &map, int32_t task_id
+PA_DEVICE bool SharedPublishTaskCommitAfterPreflightObserved(
+    PA_GM SharedTensorMapSidecar &map, int32_t task_id,
+    int64_t &observed
 ) {
     if (task_id < 0 || task_id == INT32_MAX) {
+        observed = INT64_MIN;
         return false;
     }
     const int32_t next = task_id + 1;
@@ -435,12 +463,23 @@ PA_DEVICE bool SharedPublishTaskCommitAfterPreflight(
         SharedInsertTurnLane(next);
     const int64_t expected =
         SharedInsertTurnPublishExpectedOld(task_id);
-    return Ops::CompareExchange(
+    observed = Ops::CompareExchange(
                &SharedInsertTurnLine(
                     map, next_lane
                 ).value,
                expected, static_cast<int64_t>(next)
-           ) == expected;
+           );
+    return observed == expected;
+}
+
+template <typename Ops>
+PA_DEVICE bool SharedPublishTaskCommitAfterPreflight(
+    PA_GM SharedTensorMapSidecar &map, int32_t task_id
+) {
+    int64_t ignored_observed = INT64_MIN;
+    return SharedPublishTaskCommitAfterPreflightObserved<Ops>(
+        map, task_id, ignored_observed
+    );
 }
 
 // reclaim_upto 只允许唯一 ordered append actor 单调发布。这里不从 exact

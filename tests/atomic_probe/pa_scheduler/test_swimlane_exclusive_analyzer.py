@@ -343,6 +343,24 @@ def _v4_capture(*, tensormap_mode: str = "shared") -> dict[str, object]:
                 )
             )
 
+    if tensormap_mode == "shared":
+        # Register 父区间只增加一条元数据发布 detail。等待有序插入轮次和
+        # 交接下一轮由分析器使用父区间前后补集恢复，不增加两条 raw 记录。
+        register_rows = [row for row in rows if row[5] == "Register"]
+        for register in register_rows:
+            start = int(register[6])
+            end = int(register[7])
+            rows.append(
+                _row(
+                    int(register[0]),
+                    int(register[3]),
+                    "SharedRegisterPublishMetadata",
+                    start + 2,
+                    end - 2,
+                    function_id=int(register[4]),
+                )
+            )
+
     # schema-v4 动态门槛必须使用完整 G1：在历史两 task fixture 后补齐
     # SF/PV/UP 三个 loser。这样测试不会再依赖“截断到 QK 的非法 batch”。
     _append_v4_g1_tail_tasks(rows, tensormap_mode)
@@ -524,6 +542,61 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
             report["kernel_containment"]["unclassified_without_v4_parent_events"],
             0,
         )
+        register = report["register_breakdown"]
+        self.assertIsNotNone(register)
+        self.assertEqual(register["event_count"], 2)
+        register_metrics = register["aggregate_core_work"]["metrics_cycles"]
+        self.assertEqual(
+            register_metrics,
+            {
+                "parent": 13,
+                "register_wait_insert_turn": 4,
+                "register_publish_metadata": 5,
+                "register_handoff_next_turn": 4,
+            },
+        )
+        self.assertIs(
+            register["aggregate_core_work"]["closure"]["exact"],
+            True,
+        )
+        self.assertEqual(register_metrics["parent"], metrics["register"])
+        self.assertNotIn(
+            "SharedRegisterPublishMetadata",
+            report["semantics"]["exclusive_submit_children"],
+        )
+        self.assertIs(
+            report["semantics"][
+                "register_internal_detail_is_exclusive_submit_child"
+            ],
+            False,
+        )
+        # detail 只拆 Register，不可作为额外 Submit child 重复相加。
+        self.assertEqual(
+            sum(
+                metrics[name]
+                for name in (
+                    "efdrain",
+                    "materialize",
+                    "claim",
+                    "fanin",
+                    "register",
+                    "winner_build",
+                    "alloc_complete",
+                    "submit_residual",
+                )
+            ),
+            metrics["submit_union"],
+        )
+        for core in register["per_core"]:
+            self.assertIs(core["closure"]["exact"], True)
+            self.assertEqual(
+                core["closure"]["parent_cycles"],
+                core["closure"]["children_cycles"],
+            )
+        self.assertEqual(
+            set(register["per_role_core_statistics"]),
+            {"aic", "aiv"},
+        )
 
     def test_v4_private_keeps_rectangular_frontend_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -542,6 +615,7 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
         self.assertEqual(metrics["prepare_map"], 2_016)
         self.assertEqual(metrics["register"], 2_976)
         self.assertEqual(metrics["submit_residual"], 22_442)
+        self.assertIsNone(report["register_breakdown"])
 
         capture = _v4_capture(tensormap_mode="private")
         rows = capture["fdwic_events"]
@@ -559,6 +633,123 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
             ):
                 analyze_capture(path)
 
+    def test_v4_shared_register_detail_is_required_exactly_once(self) -> None:
+        capture = _v4_capture()
+        rows = capture["fdwic_events"]
+        assert isinstance(rows, list)
+        detail = next(
+            row
+            for row in rows
+            if row[0] == 0
+            and row[3] == 0
+            and row[5] == "SharedRegisterPublishMetadata"
+        )
+        capture["fdwic_events"] = [row for row in rows if row is not detail]
+        _refresh_summary(capture)
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, capture)
+            with self.assertRaisesRegex(
+                ValueError,
+                "requires exactly one SharedRegisterPublishMetadata|"
+                "missing_register_rows",
+            ):
+                analyze_capture(path)
+
+        capture = _v4_capture()
+        rows = capture["fdwic_events"]
+        assert isinstance(rows, list)
+        detail = next(
+            row
+            for row in rows
+            if row[0] == 0
+            and row[3] == 0
+            and row[5] == "SharedRegisterPublishMetadata"
+        )
+        rows.append(list(detail))
+        _refresh_summary(capture)
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, capture)
+            with self.assertRaisesRegex(
+                ValueError,
+                "duplicate SharedRegisterPublishMetadata|"
+                "requires exactly one SharedRegisterPublishMetadata",
+            ):
+                analyze_capture(path)
+
+    def test_v4_shared_register_detail_must_be_contained_and_match_identity(
+        self,
+    ) -> None:
+        capture = _v4_capture()
+        rows = capture["fdwic_events"]
+        assert isinstance(rows, list)
+        detail = next(
+            row
+            for row in rows
+            if row[0] == 0
+            and row[3] == 0
+            and row[5] == "SharedRegisterPublishMetadata"
+        )
+        detail[6] = int(detail[6]) - 4
+        _refresh_summary(capture)
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, capture)
+            with self.assertRaisesRegex(
+                ValueError,
+                "crosses Register|outside every Register|"
+                "must be contained by Register|outside Register parent",
+            ):
+                analyze_capture(path)
+
+        capture = _v4_capture()
+        rows = capture["fdwic_events"]
+        assert isinstance(rows, list)
+        detail = next(
+            row
+            for row in rows
+            if row[0] == 0
+            and row[3] == 0
+            and row[5] == "SharedRegisterPublishMetadata"
+        )
+        detail[4] = 0
+        _refresh_summary(capture)
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, capture)
+            with self.assertRaisesRegex(
+                ValueError,
+                "identity does not match|must match Register identity|"
+                "identity differs from its parent",
+            ):
+                analyze_capture(path)
+
+    def test_v4_private_forbids_shared_register_detail(self) -> None:
+        capture = _v4_capture(tensormap_mode="private")
+        rows = capture["fdwic_events"]
+        assert isinstance(rows, list)
+        parent = next(
+            row
+            for row in rows
+            if row[0] == 0 and row[3] == 0 and row[5] == "Register"
+        )
+        rows.append(
+            _row(
+                0,
+                0,
+                "SharedRegisterPublishMetadata",
+                int(parent[6]) + 1,
+                int(parent[7]) - 1,
+                function_id=int(parent[4]),
+            )
+        )
+        _refresh_summary(capture)
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, capture)
+            with self.assertRaisesRegex(
+                ValueError,
+                "only valid for shared schema-v4|forbids "
+                "SharedRegisterPublishMetadata|only valid for shared TensorMap",
+            ):
+                analyze_capture(path)
+
     def test_v4_shared_loser_rejects_winner_only_frontend(self) -> None:
         for phase, start, end in (
             ("Materialize", 1144, 1152),
@@ -569,12 +760,26 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
                 rows = capture["fdwic_events"]
                 assert isinstance(rows, list)
                 rows.append(_row(0, 1, phase, start, end))
+                if phase == "Register":
+                    rows.append(
+                        _row(
+                            0,
+                            1,
+                            "SharedRegisterPublishMetadata",
+                            start + 1,
+                            end - 1,
+                        )
+                    )
                 _refresh_summary(capture)
                 with tempfile.TemporaryDirectory() as directory:
                     path = self._write(directory, capture)
                     with self.assertRaisesRegex(
                         ValueError,
-                        rf"shared loser path requires 0 {phase} spans",
+                        rf"shared loser path requires 0 {phase} spans|"
+                        "requires exactly one Register parent for each winner "
+                        "and none for losers|"
+                        "requires exactly one SharedRegisterPublishMetadata "
+                        "for each winner and none for losers",
                     ):
                         analyze_capture(path)
 
@@ -590,7 +795,13 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
                     if not (
                         row[0] == 0
                         and row[3] == 0
-                        and row[5] == phase
+                        and (
+                            row[5] == phase
+                            or (
+                                phase == "Register"
+                                and row[5] == "SharedRegisterPublishMetadata"
+                            )
+                        )
                     )
                 ]
                 _refresh_summary(capture)
@@ -598,7 +809,11 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
                     path = self._write(directory, capture)
                     with self.assertRaisesRegex(
                         ValueError,
-                        rf"shared winner path requires 1 {phase} spans",
+                        rf"shared winner path requires 1 {phase} spans|"
+                        "requires exactly one Register parent for each winner "
+                        "and none for losers|"
+                        "requires exactly one SharedRegisterPublishMetadata "
+                        "for each winner and none for losers",
                     ):
                         analyze_capture(path)
 

@@ -263,6 +263,28 @@ struct CcecOps {
         return cycle;
     }
 
+    template <typename T>
+    __aicore__ static inline T ForkAtomicResultForBranch(
+        T value, T &dependency_value
+    ) {
+        static_assert(
+            sizeof(T) == 4 || sizeof(T) == 8,
+            "atomic dependency fork expects a scalar result"
+        );
+        T compare_value = value;
+        // 一个 atomic 返回值同时用于 Ready 判定和随后 SYS_CNT 取时。
+        // 若直接把同一 SSA 值跨过 `observed == task_id` 分支继续传递，
+        // O3 会利用 true 分支事实把它常量传播成 task_id，切断真实返回
+        // 依赖。这里用一条 MOV 生成两个编译器不可证明相等、硬件值完全
+        // 相同的输出：compare_value 只参与分支，dependency_value 只
+        // 参与 Ready 路径取时。该序列不读时钟、不访问 GM，也不加屏障。
+        asm volatile(
+            "MOV %1, %0\n"
+            : "+l"(compare_value), "=&l"(dependency_value)
+        );
+        return compare_value;
+    }
+
     __aicore__ static inline void ExecuteKernel(
         __gm__ pa_scheduler::SchedulerState *state, __gm__ pa_scheduler::WorkerState &worker,
         pa_scheduler::TaskKind kind, uint32_t nop_count

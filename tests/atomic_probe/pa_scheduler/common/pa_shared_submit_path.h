@@ -127,7 +127,7 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
 }
 
 template <typename Ops>
-PA_DEVICE bool PublishSharedTaskWriterDelta(
+PA_DEVICE bool PublishSharedTaskWriterMetadata(
     PA_GM SchedulerState *state, const TaskArgs &args,
     const SubmitContext &context,
     const SharedTaskWriterDelta &delta, LocalStats &stats
@@ -199,11 +199,24 @@ PA_DEVICE bool PublishSharedTaskWriterDelta(
         SetFatal<Ops>(state, stats, task_id);
         return false;
     }
+    return true;
+}
+
+template <typename Ops>
+PA_DEVICE bool HandoffSharedTaskInsertTurn(
+    PA_GM SchedulerState *state, int32_t task_id, LocalStats &stats,
+    int64_t &cas_observed
+) {
+    if (state == nullptr || task_id < 0 ||
+        task_id >= static_cast<int32_t>(kMaxTasks)) {
+        cas_observed = INT64_MIN;
+        return false;
+    }
     // ordinary payload 的 DCCI、symbol history/latest 与 fresh descriptor
     // 都必须先于 N->N+1 对其他 owner 可见。
     Ops::StoreBarrier();
-    if (!SharedPublishTaskCommitAfterPreflight<Ops>(
-            state->shared_map, task_id
+    if (!SharedPublishTaskCommitAfterPreflightObserved<Ops>(
+            state->shared_map, task_id, cas_observed
         )) {
         SetFatal<Ops>(state, stats, task_id);
         return false;
@@ -212,9 +225,28 @@ PA_DEVICE bool PublishSharedTaskWriterDelta(
 }
 
 template <typename Ops>
-PA_DEVICE bool WaitForSharedTaskInsertTurn(
-    PA_GM SchedulerState *state, int32_t task_id, LocalStats &stats
+PA_DEVICE bool PublishSharedTaskWriterDelta(
+    PA_GM SchedulerState *state, const TaskArgs &args,
+    const SubmitContext &context,
+    const SharedTaskWriterDelta &delta, LocalStats &stats
 ) {
+    if (!PublishSharedTaskWriterMetadata<Ops>(
+            state, args, context, delta, stats
+        )) {
+        return false;
+    }
+    int64_t ignored_cas_observed = INT64_MIN;
+    return HandoffSharedTaskInsertTurn<Ops>(
+        state, context.task_id, stats, ignored_cas_observed
+    );
+}
+
+template <typename Ops>
+PA_DEVICE bool WaitForSharedTaskInsertTurn(
+    PA_GM SchedulerState *state, int32_t task_id, LocalStats &stats,
+    int64_t &ready_observed
+) {
+    ready_observed = -1;
     if (state == nullptr || task_id < 0 ||
         task_id >= static_cast<int32_t>(kMaxTasks)) {
         return false;
@@ -223,11 +255,13 @@ PA_DEVICE bool WaitForSharedTaskInsertTurn(
     const uint64_t begin = Ops::Now();
     uint32_t polls = 0;
     while (true) {
+        int64_t observed = -1;
         const SharedInsertTurnState turn_state =
-            SharedInspectTaskTurn<Ops>(
-                state->shared_map, task_id
+            SharedInspectTaskTurnObserved<Ops, true>(
+                state->shared_map, task_id, observed
             );
         if (turn_state == SharedInsertTurnState::Ready) {
+            ready_observed = observed;
             return true;
         }
         if (turn_state ==
@@ -249,6 +283,16 @@ PA_DEVICE bool WaitForSharedTaskInsertTurn(
             return false;
         }
     }
+}
+
+template <typename Ops>
+PA_DEVICE bool WaitForSharedTaskInsertTurn(
+    PA_GM SchedulerState *state, int32_t task_id, LocalStats &stats
+) {
+    int64_t ignored_ready_observed = -1;
+    return WaitForSharedTaskInsertTurn<Ops>(
+        state, task_id, stats, ignored_ready_observed
+    );
 }
 
 template <typename Ops, bool Profile, typename PmuContext>
@@ -329,23 +373,56 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     BeginSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(
         pmu_context
     );
-    const bool inserted =
-        WaitForSharedTaskInsertTurn<Ops>(
-            state, static_cast<int32_t>(task_id), stats
-        ) &&
-        PublishSharedTaskWriterDelta<Ops>(
+    int64_t ready_observed = -1;
+    const bool turn_ready = WaitForSharedTaskInsertTurn<Ops>(
+        state, static_cast<int32_t>(task_id), stats,
+        ready_observed
+    );
+    // wait_end 对最后一次返回 Ready 的 atomic Load 建立数据依赖。只在
+    // swimlane 构建读取 SYS_CNT；trace-free 的 PMU/性能构建预处理后为 0。
+    const uint64_t metadata_begin = turn_ready
+        ? TraceTimestampAfterAtomicResult<Ops>(
+              stats.trace, stats.result, ready_observed
+          )
+        : TraceTimestamp<Ops>(stats.trace, stats.result);
+    const bool metadata_published =
+        turn_ready &&
+        PublishSharedTaskWriterMetadata<Ops>(
             state, args, context, writer_delta, stats
         );
+    const uint64_t metadata_end = metadata_published
+        ? TraceTimestamp<Ops>(stats.trace, stats.result)
+        : metadata_begin;
+
+    int64_t cas_observed = INT64_MIN;
+    const bool inserted =
+        metadata_published &&
+        HandoffSharedTaskInsertTurn<Ops>(
+            state, static_cast<int32_t>(task_id), stats,
+            cas_observed
+        );
+    // 正常路径的父区间终点依赖 CAS 返回值，表示本核已经取得 N->N+1
+    // handoff 的返回结果；不加 DSB，也不把它解释成跨核全局可见时刻。
+    const uint64_t register_end = metadata_published
+        ? TraceTimestampAfterAtomicResult<Ops>(
+              stats.trace, stats.result, cas_observed
+          )
+        : metadata_end;
     EndSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(
         pmu_context
     );
-    const uint64_t register_end =
-        TraceTimestamp<Ops>(stats.trace, stats.result);
+    // raw 顺序保持父记录在前。唯一 detail 的两个端点把 Register 离线
+    // 拆成 wait / metadata publish / handoff 三段，不逐 poll 扩张记录。
     WriteTrace<Profile>(
         stats.trace, stats.result, static_cast<int32_t>(task_id),
         function_id, TracePhase::Register,
         ProfilePhase::Register, register_begin, register_end,
         0, writer_delta.ordinary_count
+    );
+    WriteTrace<false>(
+        stats.trace, stats.result, static_cast<int32_t>(task_id),
+        function_id, TracePhase::SharedRegisterPublishMetadata,
+        ProfilePhase::Register, metadata_begin, metadata_end
     );
     if (!inserted) {
         return false;

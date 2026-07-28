@@ -811,6 +811,27 @@ FinalDrain；孤儿、越界或多重归属都会使排他分析失败。
 除 Kernel 可以执行前序 task 外，所有 Submit 前端和尾动作的 `task_id` 必须与
 包含它的 Submit 一致。
 
+shared TensorMap 的 `Register` 还会在父区间内显示三段：
+
+- `register.wait_insert_turn#N`：Register 前段，以等待 task N 取得有序
+  TensorMap 插入轮次为主；为保持业务阶段连续闭合，该段还包含上一条
+  Materialize trace 落盘和 Register 边界的少量观察代码，不能把其中每个
+  tick 都解释成 atomic 轮询；
+- `register.publish_metadata#N`：预检并发布 ordinary、symbol 和 fresh-output
+  writer 元数据；
+- `register.handoff_next_turn#N`：发布顺序并把插入轮次交给 task N+1。
+
+设备每个 winner 只新增一条 `SharedRegisterPublishMetadata` raw 记录，
+等待段和交接段由 `Register` 父区间与该记录的端点离线还原，不记录逐次
+poll。三段只用于拆解 `Register`，不能再次加入 Submit 排他总和。
+CCEC 在每次 turn Load 后用一条 MOV 派生互不等同的比较值和计时依赖值，
+避免 O3 利用 `Ready => observed == task_id` 把后者常量传播成 task id；
+AIC/AIV 优化 IR 都必须保持
+`atomic Load -> dependency fork -> Ready branch / SYS_CNT`。该处理只存在于
+swimlane 构建，不增加 DSB、GM 访问或 SYS_CNT 读取。
+`swimlane_exclusive_analysis.json` 的 `register_breakdown` 会独立校验
+`Register = wait + publish + handoff`，并给出整体、AIC/AIV 和逐核整数闭合。
+
 runner 结束时会打印准确目录：
 
 ```text

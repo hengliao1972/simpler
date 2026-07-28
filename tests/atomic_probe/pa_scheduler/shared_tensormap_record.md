@@ -10167,3 +10167,122 @@ private G1 host=b63b771c42f59ccf2c05f55feede8f46a11180092fe6936f82476949edfa6f9d
 `NOT RUN`。CPU B256 的 submit span 受宿主线程调度和模拟执行影响；
 CCEC 构建也只证明代码生成、链接和产物身份。两者都不能用于比较
 turn-G 的 A5 性能，更不能据此宣称 G2/G4/G8 已获得收益。
+
+### 2026-07-28：把 shared Register 拆成等待、发布与交接三段
+
+前一轮 turn-G8 B256 泳道中，`Register` 的单事件中位数约为
+1.779 ms，累计 core-work 为 2,054.096 ms，占 SubmitUnion 的主要部分。
+旧边界把等待插入前沿、发布 writer 元数据和交接下一 task 混在一起，
+无法判断长时间来自真实 scalar 发布代码还是有序前沿等待。
+
+本轮保留原 `Register` 父区间和 `auxiliary=ordinary_count`，每个 shared
+winner 只新增一条 `SharedRegisterPublishMetadata` raw 记录。四个端点形成：
+
+```text
+Register.start
+  -> wait_insert_turn
+SharedRegisterPublishMetadata.start
+  -> publish_metadata
+SharedRegisterPublishMetadata.end
+  -> handoff_next_turn
+Register.end
+```
+
+等待结束时间依赖最后一次返回 Ready 的 atomic Load；交接结束时间依赖
+N→N+1 CAS 的返回值。首次 AIC/AIV O3 IR 核验发现，单纯在 Ready 分支后把
+`observed` 传给 `NowAfterAtomicResult()` 并不可靠：编译器利用
+`Ready => observed == task_id`，把 SYS_CNT inline asm 的输入替换成了
+`task_id`。最终实现先用一条 MOV 从同一个 atomic 返回寄存器派生两个
+编译器不可证明相等的输出，比较值只进入 Ready 分支，独立依赖值只进入
+SYS_CNT inline asm。修正后的 AIC 与 AIV 优化 IR 均保持：
+
+```text
+llvm.hivm.atom.ADD.G.s64
+  -> asm "MOV dependency, compare"
+  -> compare == task_id
+  -> asm "MOV dependency, dependency; MOV cycle, SYS_CNT"
+```
+
+该序列每次 turn 轮询只增加一条 MOV，不增加逐 poll SYS_CNT、GM 访问或
+DSB；计时边界仍只表示返回值已可被本核 scalar 消费，不表示跨核全局
+可见。`PA_BUILD_TRACE_FREE` 下 fork、额外 SYS_CNT 和返回依赖均在预处理
+后完全不存在，因此 submit-PMU、perf-clock 与纯性能构建不承担该观察开销。
+
+转换器直接展示中间的 `register.publish_metadata#N`，再仅用父子端点离线
+生成 `register.wait_insert_turn#N` 和
+`register.handoff_next_turn#N`。三个子段不进入 Submit 排他 child 集合；
+排他分析器新增 `register_breakdown`，从 raw 整数边界逐事件、逐核和整体
+验证：
+
+```text
+Register = wait_insert_turn + publish_metadata + handoff_next_turn
+```
+
+#### 正确性与规模门槛
+
+- shared 每个 winner 恰好一条 detail，loser 为零；
+- detail 必须与父 Register 的 core/lane/task/function 一致且完整包含于父；
+- 缺失、重复、越界、身份错误和非零 flags/aux 均拒绝；
+- private TensorMap 禁止出现该 shared-only phase；
+- 每核记录公式更新为
+  `3*submits + 5*wins - alloc_wins + kernel/wait/parent/atomic`；
+- B256 的固定 shared 业务增量为 `4*batches + 28*groups`；
+- 不记录任意一次 poll，只增加一条 64B detail/winner。
+
+CPU shared 完整构建已通过 sparse trace、writer intent、ring，以及
+turn-G1/G2/G4/G8 的 96-worker ordered-submit 门槛。converter/analyzer
+共 69 项 Python 单测通过；converter 还会独立拒绝没有对应 Claim 的孤立
+Register 父记录。CCEC turn-G8 swimlane 重新构建、mixed ELF、manifest
+与 host/kernel 身份门槛通过。
+
+B1 A5 先行门槛全部 PASS：5 个 winner 对应 5 条 detail，
+`2,719/2,719` records、0 drop；完整 Submit 为 97.248 us。该次 B1 只作为
+正确性和记录闭合门槛，不用于推导 B256 占比。
+
+#### turn-G8 B256 实测
+
+完整产物位于：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260728_012832_1184418/ccec/
+```
+
+运行语义、writer signature、输出 tile、插入前沿和后处理均 PASS；
+`472,067/472,067` records、0 drop，1,280 个 Register 父区间与 1,280
+个 metadata detail 精确对应。完整 Submit wall-clock 为 25.361069 ms。
+本轮相邻诊断样本在 24.792–25.361 ms 间波动；最后一次源码变化只从
+非计时协议检查中删去多余 MOV，因此不能把 0.569 ms 的单样本差异归因给
+这条修改。泳道样本用于结构和占比取证，不承担候选性能裁决。
+
+下表为 1 GHz SYS_CNT 的 aggregate core-work；它不是 1.65 GHz PMU cycle，
+也不是跨核 wall-clock：
+
+| Register 分段 | aggregate core-work | 占 Register | 占 SubmitUnion |
+| --- | ---: | ---: | ---: |
+| Register parent | 2,107.066118 ms | 100.000% | 90.756% |
+| 等待插入轮次 | 2,085.986114 ms | 99.000% | 89.848% |
+| 发布元数据 | 16.674066 ms | 0.791% | 0.718% |
+| 交接下一 task | 4.405938 ms | 0.209% | 0.190% |
+
+1,280 个 winner 单事件分布为：
+
+| 分段 | median | p95 | max |
+| --- | ---: | ---: | ---: |
+| Register parent | 1,842.136 us | 2,027.973 us | 2,176.496 us |
+| 等待插入轮次 | 1,824.032 us | 2,003.527 us | 2,163.026 us |
+| 发布元数据 | 12.023 us | 23.697 us | 38.779 us |
+| 交接下一 task | 2.233 us | 11.526 us | 22.267 us |
+
+结论已经从推测变为直接取证：当前 `Register` 长尾几乎全部来自等待有序
+插入轮次，而不是 writer 元数据发布代码或最终 CAS 交接。后续若优化
+shared B256，应优先分析 owner 到达顺序、前沿推进与等待竞争；不应先对
+只占 Register 约 1.00% 的 publish+handoff 做大范围 scalar 改写。这里的
+`wait_insert_turn` 是 Register 前段，以轮询等待为主，但还包含上一条
+Materialize trace 落盘和边界代码的少量观察开销；不应把每个 tick 都解释
+成 atomic 总线等待。
+
+记录规模保持受控。相比前一份 G8 样本，raw 从 30,605,471B 变为
+30,695,570B，merged 从 60,444,501B 变为 60,779,006B；固定
+402,660,160B 设备 trace 分配没有扩大。结构性新增恰为 1,280 条 detail，
+另外两段只在 merged 离线生成；其余 record 波动来自运行时 PollBatch
+合并数，不是新增业务 phase。

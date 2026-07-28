@@ -46,6 +46,7 @@ PHASE_NAMES = {
     "FinalDrain": "final_drain",
     "WinnerBuild": "winner_build",
     "AllocComplete": "alloc_complete",
+    "SharedRegisterPublishMetadata": "register.publish_metadata",
 }
 LEGACY_LAP_PHASES = {"Alloc", "Build", "Replay"}
 V4_PHASES = {
@@ -53,6 +54,7 @@ V4_PHASES = {
     "FinalDrain",
     "WinnerBuild",
     "AllocComplete",
+    "SharedRegisterPublishMetadata",
 }
 # schema-v4 已有区间足以在离线侧取补集；这些 phase 之外的
 # Atomic、Kernel、RingBp 等是嵌套或 Overlay，不能再从 Submit 扣一次。
@@ -403,6 +405,10 @@ def _load_and_validate(
     v4_submits: set[tuple[int, int]] = set()
     v4_submit_semantics: dict[tuple[int, int], tuple[bool, bool]] = {}
     v4_tails: dict[tuple[int, int], tuple[str, int]] = {}
+    v4_registers: dict[tuple[int, int], list[tuple[Any, ...]]] = {}
+    v4_shared_register_details: dict[
+        tuple[int, int], list[tuple[Any, ...]]
+    ] = {}
     # 逐行在写输出前检查列数、范围和可转整数的字段。任一行不满足这些约束
     # 都会整体拒绝输入，不生成缺少关键阶段的“部分可看”泳道。
     for index, row in enumerate(rows):
@@ -548,6 +554,31 @@ def _load_and_validate(
                 raise ValueError(
                     f"fdwic_events[{index}] shared schema-v4 must not contain PrepareMap"
                 )
+            if phase == "SharedRegisterPublishMetadata":
+                if tensormap_mode != "shared":
+                    raise ValueError(
+                        f"fdwic_events[{index}] SharedRegisterPublishMetadata "
+                        "is only valid for shared TensorMap"
+                    )
+                if task_id < 0 or flags != 0 or auxiliary != 0:
+                    raise ValueError(
+                        f"fdwic_events[{index}] has invalid "
+                        "SharedRegisterPublishMetadata fields"
+                    )
+                v4_shared_register_details.setdefault(task_key, []).append(
+                    (
+                        core_id,
+                        block_id,
+                        lane,
+                        task_id,
+                        function_id,
+                        phase,
+                        start_cycle,
+                        end_cycle,
+                        flags,
+                        auxiliary,
+                    )
+                )
             if phase in ("OrchestrationReplay", "FinalDrain"):
                 if task_id != -1 or function_id != -1 or flags != 0 or auxiliary != 0:
                     raise ValueError(
@@ -572,6 +603,25 @@ def _load_and_validate(
                     )
                 v4_claims[task_key] = (
                     bool(flags & 0x2), bool(flags & 0x1), bool(auxiliary)
+                )
+            elif phase == "Register":
+                if task_id < 0:
+                    raise ValueError(
+                        f"fdwic_events[{index}] Register requires non-negative task_id"
+                    )
+                v4_registers.setdefault(task_key, []).append(
+                    (
+                        core_id,
+                        block_id,
+                        lane,
+                        task_id,
+                        function_id,
+                        phase,
+                        start_cycle,
+                        end_cycle,
+                        flags,
+                        auxiliary,
+                    )
                 )
             elif phase in ("WinnerBuild", "AllocComplete"):
                 if task_id < 0 or flags != 0 or auxiliary != 0:
@@ -677,6 +727,57 @@ def _load_and_validate(
                     f"schema-v4 tail mismatch at {task_key}: "
                     f"expected {expected_tail if won else 'no winner tail'}, "
                     f"got {actual_tail}"
+                )
+            if tensormap_mode == "shared":
+                parents = v4_registers.get(task_key, [])
+                expected_parent_count = 1 if won else 0
+                if len(parents) != expected_parent_count:
+                    raise ValueError(
+                        "shared schema-v4 requires exactly one Register parent "
+                        "for each winner and none for losers at "
+                        f"{task_key}: count={len(parents)} won={won}"
+                    )
+                details = v4_shared_register_details.get(task_key, [])
+                if len(details) != (1 if won else 0):
+                    raise ValueError(
+                        "shared schema-v4 requires exactly one "
+                        "SharedRegisterPublishMetadata for each winner and none "
+                        f"for losers at {task_key}: count={len(details)} won={won}"
+                )
+                if not won:
+                    continue
+                parent = parents[0]
+                detail = details[0]
+                if parent[:5] != detail[:5]:
+                    raise ValueError(
+                        "shared schema-v4 Register detail identity differs from "
+                        f"its parent at {task_key}"
+                    )
+                parent_start, parent_end = int(parent[6]), int(parent[7])
+                detail_start, detail_end = int(detail[6]), int(detail[7])
+                if not (
+                    parent_start
+                    <= detail_start
+                    <= detail_end
+                    <= parent_end
+                ):
+                    raise ValueError(
+                        "shared schema-v4 SharedRegisterPublishMetadata is outside "
+                        f"Register parent at {task_key}"
+                    )
+
+        if tensormap_mode == "shared":
+            orphan_parent_keys = set(v4_registers) - set(v4_claims)
+            if orphan_parent_keys:
+                raise ValueError(
+                    "shared schema-v4 Register parents have no matching Claim: "
+                    f"{sorted(orphan_parent_keys)[:8]}"
+                )
+            orphan_detail_keys = set(v4_shared_register_details) - set(v4_claims)
+            if orphan_detail_keys:
+                raise ValueError(
+                    "shared schema-v4 Register details have no matching Claim: "
+                    f"{sorted(orphan_detail_keys)[:8]}"
                 )
 
     if trace_schema_version >= 3:
@@ -797,6 +898,53 @@ def _iter_v4_residual_spans(
                 # 与旧 "submit_residual" 等长，重分类后不增加 merged 字节。
                 "submit_tail_gap",
             )
+
+
+def _iter_v4_shared_register_derived_spans(
+    rows: list[tuple[Any, ...]],
+) -> Iterator[tuple[int, int, int, int, int, str]]:
+    """用 Register 父区间和唯一设备细分记录补出等待、交棒两段。
+
+    ``SharedRegisterPublishMetadata`` 是设备端唯一新增的 raw 记录；另外两段
+    只复用父子边界离线生成，因此每个 winner 的 raw 固定只增加一行。
+    输入在写 merged 前已经完成基数、身份与包含关系校验。
+    """
+
+    parents: dict[tuple[int, int], tuple[Any, ...]] = {}
+    details: dict[tuple[int, int], tuple[Any, ...]] = {}
+    for row in rows:
+        core_id, _block_id, _lane, task_id, _function_id, phase, *_rest = row
+        task_key = (int(core_id), int(task_id))
+        if phase == "Register":
+            parents[task_key] = row
+        elif phase == "SharedRegisterPublishMetadata":
+            details[task_key] = row
+
+    for task_key in sorted(details):
+        parent = parents[task_key]
+        detail = details[task_key]
+        core_id, block_id, lane, task_id = (
+            int(parent[0]),
+            int(parent[1]),
+            int(parent[2]),
+            int(parent[3]),
+        )
+        yield (
+            core_id,
+            block_id,
+            lane,
+            int(parent[6]),
+            int(detail[6]),
+            f"register.wait_insert_turn#{task_id}",
+        )
+        yield (
+            core_id,
+            block_id,
+            lane,
+            int(detail[7]),
+            int(parent[7]),
+            f"register.handoff_next_turn#{task_id}",
+        )
 
 
 # 完成一次 raw 到 merged 的转换，成功时返回事件数、block 数和基准 cycle。
@@ -1108,6 +1256,30 @@ def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
                 first = _emit_event(output, event, first)
                 emitted += 1
             if trace_schema_version == 4:
+                # shared Register 的设备端只记录元数据发布中段；等待插入前沿
+                # 和向下一 task 交棒两段由父子边界离线补出，均为 6 字段 X
+                # event。它们是 Register 内部拆分，绝不能加入 Submit 补集扣除。
+                for (
+                    _core_id,
+                    block_id,
+                    lane,
+                    start,
+                    end,
+                    name,
+                ) in _iter_v4_shared_register_derived_spans(rows):
+                    first = _emit_event(
+                        output,
+                        {
+                            "ph": "X",
+                            "name": name,
+                            "pid": block_id,
+                            "tid": lane,
+                            "ts": round((start - base_cycle) * factor, 3),
+                            "dur": round((end - start) * factor, 3),
+                        },
+                        first,
+                    )
+                    emitted += 1
                 # 补集是纯离线合成件：不增加设备 trace record、SYS_CNT
                 # 或 raw 字段。事件只保留 Perfetto X 必需的 6 个字段，
                 # 不复制每条 raw 已有的 args，控制 merged 体积增量。

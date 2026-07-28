@@ -529,7 +529,11 @@ enum class TracePhase : int32_t {
     FinalDrain = 17,
     WinnerBuild = 18,
     AllocComplete = 19,
-    Count = 20,
+    // shared Register 父区间内只增加这一条真实 metadata 发布边界。
+    // 等待 insert turn 和把 turn 交给 N+1 的两段由父/子端点离线还原，
+    // 避免为每个 winner 再扩张两条 raw 记录，更不能逐 poll 记录。
+    SharedRegisterPublishMetadata = 20,
+    Count = 21,
 };
 
 // AtomicSite 按 standalone PA 中真实出现的源码调用点分类。编号写入 TraceRecord::auxiliary，

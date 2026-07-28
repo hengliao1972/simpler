@@ -69,6 +69,13 @@ PRIVATE_REQUIRED_ON_EVERY_SUBMIT = (
 )
 SHARED_REQUIRED_ON_EVERY_SUBMIT = ("EfDrain", "Claim")
 SHARED_WINNER_ONLY_PHASES = ("Materialize", "Register")
+SHARED_REGISTER_DETAIL_PHASE = "SharedRegisterPublishMetadata"
+REGISTER_BREAKDOWN_METRICS = (
+    "parent",
+    "register_wait_insert_turn",
+    "register_publish_metadata",
+    "register_handoff_next_turn",
+)
 
 # 这些记录仍保留调用次数和 aggregate duration，但明确不进入任何闭合式。
 OVERLAY_PHASES = (
@@ -401,6 +408,230 @@ def _associate_exclusive_children(
             )
         children[parent.row_index].append(event)
     return children
+
+
+def _associate_shared_register_details(
+    events: Sequence[Event],
+    children_by_submit: dict[int, list[Event]],
+    trace_schema_version: int,
+    tensormap_mode: str,
+) -> dict[int, Event]:
+    """把 shared Register 内部 detail 严格归入唯一的 Register 父区间。
+
+    raw 只增加元数据发布区间。等待插入轮次与向下一轮交接分别由父区间
+    的前、后补集得到，三者因此能在整数 cycle 上完整闭合 Register。
+    """
+
+    registers = [
+        child
+        for children in children_by_submit.values()
+        for child in children
+        if child.phase == "Register"
+    ]
+    details = [
+        event for event in events if event.phase == SHARED_REGISTER_DETAIL_PHASE
+    ]
+    if trace_schema_version != 4 or tensormap_mode != "shared":
+        if details:
+            raise ValueError(
+                f"{SHARED_REGISTER_DETAIL_PHASE} is only valid for shared schema-v4"
+            )
+        return {}
+
+    registers_by_lane: dict[tuple[int, int], list[Event]] = defaultdict(list)
+    for register in registers:
+        registers_by_lane[register.lane_key].append(register)
+    for lane_registers in registers_by_lane.values():
+        lane_registers.sort(
+            key=lambda event: (event.start_cycle, event.end_cycle, event.row_index)
+        )
+    starts = {
+        lane_key: [event.start_cycle for event in lane_registers]
+        for lane_key, lane_registers in registers_by_lane.items()
+    }
+
+    detail_by_register: dict[int, Event] = {}
+    for detail in details:
+        lane_registers = registers_by_lane.get(detail.lane_key, [])
+        parent = _find_containing_parent(
+            detail,
+            lane_registers,
+            starts.get(detail.lane_key, []),
+            parent_name="Register",
+        )
+        if parent is None:
+            raise ValueError(
+                f"row {detail.row_index} {detail.phase} is outside every Register "
+                f"on core/lane {detail.lane_key}"
+            )
+        if (
+            detail.core_id != parent.core_id
+            or detail.lane != parent.lane
+            or detail.task_id != parent.task_id
+            or detail.function_id != parent.function_id
+        ):
+            raise ValueError(
+                f"row {detail.row_index} {detail.phase} identity does not match "
+                f"Register row {parent.row_index}: "
+                f"detail=(core={detail.core_id},lane={detail.lane},"
+                f"task={detail.task_id},function={detail.function_id}) "
+                f"parent=(core={parent.core_id},lane={parent.lane},"
+                f"task={parent.task_id},function={parent.function_id})"
+            )
+        previous = detail_by_register.setdefault(parent.row_index, detail)
+        if previous is not detail:
+            raise ValueError(
+                f"Register row {parent.row_index} has duplicate "
+                f"{SHARED_REGISTER_DETAIL_PHASE} rows "
+                f"{previous.row_index} and {detail.row_index}"
+            )
+    missing = [
+        register.row_index
+        for register in registers
+        if register.row_index not in detail_by_register
+    ]
+    if missing:
+        raise ValueError(
+            "shared schema-v4 requires exactly one "
+            f"{SHARED_REGISTER_DETAIL_PHASE} per Register: "
+            f"missing_register_rows={missing[:8]}"
+        )
+    if len(detail_by_register) != len(registers):
+        raise AssertionError("shared Register detail association is not one-to-one")
+    return detail_by_register
+
+
+def _build_register_breakdown(
+    children_by_submit: dict[int, list[Event]],
+    detail_by_register: dict[int, Event],
+    num_cores: int,
+    trace_schema_version: int,
+    tensormap_mode: str,
+) -> dict[str, Any] | None:
+    """由 raw 整数边界独立构造 shared Register 的三段闭合报告。"""
+
+    if trace_schema_version != 4 or tensormap_mode != "shared":
+        return None
+
+    registers_by_core: dict[int, list[Event]] = defaultdict(list)
+    for children in children_by_submit.values():
+        for child in children:
+            if child.phase == "Register":
+                registers_by_core[child.core_id].append(child)
+
+    per_core: list[dict[str, Any]] = []
+    for core_id in range(num_cores):
+        metrics = {name: 0 for name in REGISTER_BREAKDOWN_METRICS}
+        register_count = 0
+        for parent in registers_by_core.get(core_id, []):
+            detail = detail_by_register[parent.row_index]
+            wait_cycles = detail.start_cycle - parent.start_cycle
+            publish_cycles = detail.duration
+            handoff_cycles = parent.end_cycle - detail.end_cycle
+            if min(wait_cycles, publish_cycles, handoff_cycles) < 0:
+                raise ValueError(
+                    f"Register row {parent.row_index} internal partition has "
+                    "a negative raw-cycle segment"
+                )
+            if wait_cycles + publish_cycles + handoff_cycles != parent.duration:
+                raise ValueError(
+                    f"Register row {parent.row_index} internal partition does not "
+                    "close in raw cycles"
+                )
+            metrics["parent"] += parent.duration
+            metrics["register_wait_insert_turn"] += wait_cycles
+            metrics["register_publish_metadata"] += publish_cycles
+            metrics["register_handoff_next_turn"] += handoff_cycles
+            register_count += 1
+
+        child_sum = sum(
+            metrics[name] for name in REGISTER_BREAKDOWN_METRICS if name != "parent"
+        )
+        if child_sum != metrics["parent"]:
+            raise ValueError(
+                f"core {core_id} aggregate Register partition does not close"
+            )
+        block_id, lane, role = _standalone_topology(core_id)
+        per_core.append(
+            {
+                "core_id": core_id,
+                "block_id": block_id,
+                "lane": lane,
+                "role": role,
+                "register_count": register_count,
+                "metrics_cycles": metrics,
+                "closure": {
+                    "parent_cycles": metrics["parent"],
+                    "children_cycles": child_sum,
+                    "exact": True,
+                },
+            }
+        )
+
+    aggregate = {
+        metric: sum(core["metrics_cycles"][metric] for core in per_core)
+        for metric in REGISTER_BREAKDOWN_METRICS
+    }
+    aggregate_children = sum(
+        aggregate[name] for name in REGISTER_BREAKDOWN_METRICS if name != "parent"
+    )
+    if aggregate_children != aggregate["parent"]:
+        raise AssertionError("aggregate Register internal partition does not close")
+
+    role_statistics: dict[str, Any] = {}
+    for role, expected_count in (
+        ("aic", EXPECTED_AIC_CORES),
+        ("aiv", EXPECTED_AIV_CORES),
+    ):
+        role_cores = [core for core in per_core if core["role"] == role]
+        if len(role_cores) != expected_count:
+            raise ValueError(
+                f"Register breakdown role {role} has {len(role_cores)} cores, "
+                f"expected {expected_count}"
+            )
+        role_statistics[role] = {
+            "core_count": len(role_cores),
+            "metrics": {
+                metric: _distribution(
+                    [core["metrics_cycles"][metric] for core in role_cores]
+                )
+                for metric in REGISTER_BREAKDOWN_METRICS
+            },
+        }
+
+    return {
+        "semantics": {
+            "parent": "the existing exclusive Register span",
+            "register_wait_insert_turn": (
+                "Register.start to SharedRegisterPublishMetadata.start; "
+                "wait until this task owns the ordered TensorMap insertion turn"
+            ),
+            "register_publish_metadata": (
+                "the unique SharedRegisterPublishMetadata raw detail; validate and "
+                "publish ordinary, symbol, and fresh-writer metadata"
+            ),
+            "register_handoff_next_turn": (
+                "SharedRegisterPublishMetadata.end to Register.end; publish ordering "
+                "and hand off the next TensorMap insertion turn"
+            ),
+            "raw_arithmetic": "integer cycle boundaries; merged swimlane is not read",
+            "included_in_submit_additive_totals": {
+                "parent": True,
+                SHARED_REGISTER_DETAIL_PHASE: False,
+            },
+        },
+        "event_count": len(detail_by_register),
+        "aggregate_core_work": {
+            "metrics_cycles": aggregate,
+            "closure": {
+                "parent_cycles": aggregate["parent"],
+                "children_cycles": aggregate_children,
+                "exact": True,
+            },
+        },
+        "per_role_core_statistics": role_statistics,
+        "per_core": per_core,
+    }
 
 
 def _associate_kernels_to_parents(
@@ -892,6 +1123,19 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
     children_by_submit = _associate_exclusive_children(
         events, submits_by_lane, exclusive_phases
     )
+    detail_by_register = _associate_shared_register_details(
+        events,
+        children_by_submit,
+        trace_schema_version,
+        tensormap_mode,
+    )
+    register_breakdown = _build_register_breakdown(
+        children_by_submit,
+        detail_by_register,
+        num_cores,
+        trace_schema_version,
+        tensormap_mode,
+    )
     kernels_by_efdrain, efdrain_kernel_rows = _associate_efdrain_kernels(
         events, children_by_submit
     )
@@ -958,6 +1202,14 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
         metric: sum(core["metrics_cycles"][metric] for core in per_core)
         for metric in role_metric_names
     }
+    if (
+        register_breakdown is not None
+        and register_breakdown["aggregate_core_work"]["metrics_cycles"]["parent"]
+        != aggregate_metrics["register"]
+    ):
+        raise AssertionError(
+            "Register breakdown parent does not match the exclusive Submit Register total"
+        )
     residual_breakdown = _residual_breakdown(
         submits_by_lane, children_by_submit, task_kind_by_id
     )
@@ -1139,6 +1391,15 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
                 "kernel_unique_parent_complete": True,
             }
         )
+        if tensormap_mode == "shared":
+            validation.update(
+                {
+                    "register_publish_metadata_exactly_one_per_register": True,
+                    "register_detail_identity_matches_parent": True,
+                    "register_internal_partition_exact": True,
+                    "register_detail_excluded_from_submit_additive_totals": True,
+                }
+            )
 
     semantics: dict[str, Any] = {
         "cycle_arithmetic": "raw_integer_cycles",
@@ -1185,6 +1446,18 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
                 ],
             }
         )
+        if tensormap_mode == "shared":
+            semantics.update(
+                {
+                    "register_internal_detail": SHARED_REGISTER_DETAIL_PHASE,
+                    "register_internal_children": [
+                        "RegisterWaitInsertTurn",
+                        "RegisterPublishMetadata",
+                        "RegisterHandoffNextTurn",
+                    ],
+                    "register_internal_detail_is_exclusive_submit_child": False,
+                }
+            )
 
     return {
         "schema_version": REPORT_SCHEMA_VERSION,
@@ -1211,6 +1484,7 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
             "closure": closure,
             "semantics": "sum of per-core cycles; not wall-clock duration",
         },
+        "register_breakdown": register_breakdown,
         "residual_breakdown": residual_breakdown,
         "per_role_core_statistics": role_statistics,
         "kernel_containment": {

@@ -95,10 +95,17 @@ struct TaskTraceBuilder {
         ok &= validator.Observe(
             MakeRecord(
                 TracePhase::Register, static_cast<int32_t>(task_id),
-                function_id, previous_end, previous_end + 2, 0, 0
+                function_id, previous_end, previous_end + 3, 0, 0
             )
         );
-        previous_end += 2;
+        ok &= validator.Observe(
+            MakeRecord(
+                TracePhase::SharedRegisterPublishMetadata,
+                static_cast<int32_t>(task_id), function_id,
+                previous_end + 1, previous_end + 2
+            )
+        );
+        previous_end += 3;
         if (kind != TaskKind::Alloc) {
             ok &= validator.Observe(
                 MakeRecord(
@@ -143,6 +150,36 @@ struct TaskTraceBuilder {
     }
 };
 
+bool OpenAllocWinnerRegister(
+    SharedSparseTraceValidator &validator,
+    uint64_t register_begin = 18,
+    uint64_t register_end = 24
+) {
+    return validator.Observe(
+               MakeRecord(TracePhase::EfDrain, 0, -1, 10, 12)
+           ) &&
+           validator.Observe(
+               MakeRecord(
+                   TracePhase::Claim, 0, -1, 12, 13,
+                   pa_scheduler::kClaimWon |
+                       pa_scheduler::kClaimAttempted,
+                   1
+               )
+           ) &&
+           validator.Observe(
+               MakeRecord(
+                   TracePhase::Materialize, 0, -1,
+                   15, register_begin, 0, 1
+               )
+           ) &&
+           validator.Observe(
+               MakeRecord(
+                   TracePhase::Register, 0, -1,
+                   register_begin, register_end
+               )
+           );
+}
+
 void TestAcceptsSparseWinnerAndLoserFlow() {
     SharedSparseTraceValidator validator;
     TaskTraceBuilder trace{validator};
@@ -179,6 +216,7 @@ void TestAcceptsSparseWinnerAndLoserFlow() {
             validator.MaterializeCount() == 2 &&
             validator.FaninCount() == 1 &&
             validator.RegisterCount() == 2 &&
+            validator.RegisterMetadataCount() == 2 &&
             validator.WinnerTailCount() == 2 &&
             validator.SubmitCount() == 5,
         "sparse flow counts every Submit parent but only winner-only children"
@@ -242,6 +280,7 @@ void TestRejectsEveryLoserOnlyForbiddenPhase() {
         TracePhase::PrepareMap,
         TracePhase::Fanin,
         TracePhase::Register,
+        TracePhase::SharedRegisterPublishMetadata,
         TracePhase::WinnerBuild,
         TracePhase::AllocComplete,
     };
@@ -329,14 +368,20 @@ void TestRejectsWinnerShapeDrift() {
         Check(
             validator.Observe(
                 MakeRecord(
-                    TracePhase::Register, 0, -1, 18, 19
+                    TracePhase::Register, 0, -1, 18, 20
                 )
-            ),
-            "Alloc Register is accepted before its tail"
+            ) &&
+                validator.Observe(
+                    MakeRecord(
+                        TracePhase::SharedRegisterPublishMetadata,
+                        0, -1, 19, 19
+                    )
+                ),
+            "Alloc Register and its metadata detail are accepted before the tail"
         );
         Check(
             !validator.Observe(
-                MakeRecord(TracePhase::Fanin, 0, -1, 19, 20)
+                MakeRecord(TracePhase::Fanin, 0, -1, 20, 21)
             ),
             "Alloc winner cannot emit Fanin"
         );
@@ -360,13 +405,19 @@ void TestRejectsWinnerShapeDrift() {
         );
         Check(
             validator.Observe(
-                MakeRecord(TracePhase::Register, 1, 0, 21, 22, 0, 1)
-            ),
-            "ordinary Register precedes Fanin"
+                MakeRecord(TracePhase::Register, 1, 0, 21, 24, 0, 1)
+            ) &&
+                validator.Observe(
+                    MakeRecord(
+                        TracePhase::SharedRegisterPublishMetadata,
+                        1, 0, 22, 23
+                    )
+                ),
+            "ordinary Register metadata detail precedes Fanin"
         );
         Check(
             !validator.Observe(
-                MakeRecord(TracePhase::WinnerBuild, 1, 0, 22, 23)
+                MakeRecord(TracePhase::WinnerBuild, 1, 0, 24, 25)
             ),
             "ordinary winner cannot skip Fanin after Register"
         );
@@ -388,6 +439,12 @@ void TestRejectsWinnerShapeDrift() {
                     MakeRecord(
                         TracePhase::Register, 0, -1, 18, 20
                     )
+                ) &&
+                validator.Observe(
+                    MakeRecord(
+                        TracePhase::SharedRegisterPublishMetadata,
+                        0, -1, 19, 19
+                    )
                 ),
             "Alloc winner reaches its tail"
         );
@@ -408,6 +465,125 @@ void TestRejectsWinnerShapeDrift() {
         Check(
             !validator.Closed(),
             "winner cannot close before all winner-only phases and Submit"
+        );
+    }
+}
+
+void TestRegisterMetadataDetailContract() {
+    {
+        SharedSparseTraceValidator validator;
+        Check(
+            OpenAllocWinnerRegister(validator),
+            "Register parent opens the missing-detail test"
+        );
+        Check(
+            !validator.Observe(
+                MakeRecord(TracePhase::AllocComplete, 0, -1, 24, 28)
+            ) &&
+                !validator.Closed(),
+            "winner cannot omit its Register metadata detail"
+        );
+    }
+    {
+        SharedSparseTraceValidator validator;
+        Check(
+            OpenAllocWinnerRegister(validator) &&
+                validator.Observe(
+                    MakeRecord(
+                        TracePhase::SharedRegisterPublishMetadata,
+                        0, -1, 20, 22
+                    )
+                ),
+            "one contained Register metadata detail is accepted"
+        );
+        Check(
+            !validator.Observe(
+                MakeRecord(
+                    TracePhase::SharedRegisterPublishMetadata,
+                    0, -1, 20, 22
+                )
+            ),
+            "duplicate Register metadata detail is rejected"
+        );
+    }
+    {
+        SharedSparseTraceValidator validator;
+        Check(
+            OpenAllocWinnerRegister(validator),
+            "Register parent opens the early-boundary test"
+        );
+        Check(
+            !validator.Observe(
+                MakeRecord(
+                    TracePhase::SharedRegisterPublishMetadata,
+                    0, -1, 17, 20
+                )
+            ),
+            "Register metadata cannot begin before its parent"
+        );
+    }
+    {
+        SharedSparseTraceValidator validator;
+        Check(
+            OpenAllocWinnerRegister(validator),
+            "Register parent opens the late-boundary test"
+        );
+        Check(
+            !validator.Observe(
+                MakeRecord(
+                    TracePhase::SharedRegisterPublishMetadata,
+                    0, -1, 20, 25
+                )
+            ),
+            "Register metadata cannot end after its parent"
+        );
+    }
+    {
+        SharedSparseTraceValidator validator;
+        Check(
+            OpenAllocWinnerRegister(validator),
+            "Register parent opens the wrong-task test"
+        );
+        Check(
+            !validator.Observe(
+                MakeRecord(
+                    TracePhase::SharedRegisterPublishMetadata,
+                    1, -1, 20, 22
+                )
+            ),
+            "Register metadata must keep the parent task identity"
+        );
+    }
+    {
+        SharedSparseTraceValidator validator;
+        Check(
+            OpenAllocWinnerRegister(validator),
+            "Register parent opens the wrong-function test"
+        );
+        Check(
+            !validator.Observe(
+                MakeRecord(
+                    TracePhase::SharedRegisterPublishMetadata,
+                    0, 0, 20, 22
+                )
+            ),
+            "Register metadata must keep the parent function identity"
+        );
+    }
+    {
+        SharedSparseTraceValidator validator;
+        Check(
+            OpenAllocWinnerRegister(validator),
+            "Register parent opens the payload-shape test"
+        );
+        Check(
+            !validator.Observe(
+                MakeRecord(
+                    TracePhase::SharedRegisterPublishMetadata,
+                    0, -1, 20, 22, 1, 1
+                )
+            ),
+            "Register metadata detail requires zero flags and auxiliary"
         );
     }
 }
@@ -461,6 +637,7 @@ int main() {
     TestRejectsEveryLoserOnlyForbiddenPhase();
     TestRejectsPrepareMapForWinnerAndOutsideSubmit();
     TestRejectsWinnerShapeDrift();
+    TestRegisterMetadataDetailContract();
     TestPlanClosesAllLogicalTasks();
     if (g_failures != 0) {
         std::fprintf(
