@@ -27,7 +27,9 @@ load/store 和 atomic 的代码。API 定义来自本机 CANN 头文件，行为
    stale dirty line，另一个核更新该目标后，前者再对这条 64B line 执行 DCCI，仍可能用旧快照覆盖
    已经成功完成的 atomic 更新。
 4. 基于上述实测，本仓采用保守布局规则：atomic 控制字与被 DCCI 的 data 分 cacheline；关键 atomic
-   默认一变量独占一条 64B line；其整条 line 按 atomic-only 管理，不混入普通 scalar store/DCCI。
+   默认一变量独占一条 64B line；其整条 line 按 atomic-only 管理，不混入普通 scalar store。
+   当前专项用例中，对仅经 atomic 访问的独占 line 执行 SINGLE OUT DCCI 后新值 `100/100` 保留，
+   但该 DCCI 没有业务必要性，默认仍不对 atomic 控制 line 执行 DCCI。
 5. 所有跨核共享的可变控制状态和交权动作都必须使用 atomic 或已有明确契约的硬件同步原语，包括
    `lock/state/phase/ready/done/remaining/refcount/cursor`。普通 scalar store、`st_dev`、DCCI、DSB
    都不能替代 atomic 交权。该规则不要求业务 payload 的每个 word 都执行 atomic：payload 可以在
@@ -183,6 +185,11 @@ HCCL 的 `FlushDataCache` helper 和本仓 fdwic 的 cache-region helper 都采�
 作为本机实际用法的佐证，不能代替 API/ISA 契约。反过来也要注意：DSB 只等待发指令核的相关 memory
 access，不提供跨核会合或 coherence，更不能修复一个本来就会覆盖其他核新值的 stale dirty DCCI。
 
+这不表示每一条 DCCI 指令后都必须机械追加一条 DSB。连续发出多条 DCCI、期间没有动作依赖其完成时，
+可以在依赖边界前统一执行一次 DSB。本手册的 TaskCell 专项探针固定使用
+`SINGLE_CACHE_LINE + CACHELINE_OUT + DSB_ALL`，是为了让随后发布的 `phase=2` 精确表示“DCCI 已经
+完成”；若去掉 DSB，后续观察只能说明 DCCI 已发射或正在处理，不能用于判定完成后的目标值。
+
 ## 3. `st_dev` / bypass load-store
 
 ### 3.1 API
@@ -310,7 +317,10 @@ line 内的 atomic target 仍会被旧快照覆盖。它没有直接测试“loc
 - 不能在存在 ENTIRE DCCI 的并发区域中仅依赖地址分-line隔离。
 
 这些规则用于规避已经实测的 stale dirty writeback 风险，不表示当前用例已经证明它们对所有
-atomic 类型和所有硬件时序都是必要且充分条件。clean atomic-only line 上执行 DCCI 也没有专项用例。
+atomic 类型和所有硬件时序都是必要且充分条件。现在已有“仅经 atomic 访问的独占 line”专项用例：
+CAS 发布的新值先被另一 AIV 看见，再由发布核执行 SINGLE OUT DCCI + DSB，当前 A5 上 `100/100`
+保持新值且整行 guard 完整。该结果排除了这一精确时序下的覆盖，不能外推为其他 selector、atomic
+类型、普通访问混入或 ENTIRE DCCI 的通用保证；工程默认仍不对 atomic-only line 执行无必要的 DCCI。
 
 默认建议：
 
@@ -322,6 +332,53 @@ atomic 类型和所有硬件时序都是必要且充分条件。clean atomic-onl
 整条 line 永不进入普通 scalar store/DCCI 路径。当前两个 AIV 对同-line不同 slot 重复
 `AtomicExch` 的三组路径均为 `0/4000`，这是该特定模式的支持证据，不是所有 atomic 类型和时序的
 通用证明。
+
+### 4.4 `TaskCell::deps_prepared` 五场景 AIV 专项实测
+
+2026-07-28 在当前 A5 device 0、CANN 9.1 上执行了 CCEC AIV-only 专项用例。runner 显式关闭 scalar
+自动 DCCI 和 kernel-end DCCI；一次 kernel 只启动两个 AIV，五个场景各执行 100 轮。每个
+`(scenario, trial)` 使用一份从未被 device 访问过的 640B 独立存储，其中被测 line、三个握手
+atomic line、角色领取 line、结果和 guard 均按 64B 隔离。每轮由两个 AIV 动态领取 writer/reader
+角色。写入侧使用 `ordinary/CAS -> compiler barrier -> DSB -> compiler barrier -> phase=1` 闭合
+发布边界；reader 在 DCCI 后的第一次目标访问固定为 `atomicAdd(address, 0)`，随后才允许整行
+`ld_dev` 快照。当前 shell 未找到 `npu-smi` 和 `task-submit`，本次按用户指定直接使用 device 0，
+没有外部资源隔离；本文记录的是逐字段正确性结果，不使用这组运行推导性能。最终版本独立完整运行
+两次，每次每场景 100 轮且汇总完全一致；下表列出单次运行结果，对应合计 200 轮也没有新增失败。
+
+| 场景 | writer 路径 | DCCI 前 reader 看见新值 | DCCI 后 reader 看见新值 | 完整快照/host 新值 | 精确判定 |
+|---|---|---:|---:|---:|---|
+| 0：TaskCell 共线 atomic | ordinary 构造含旧 `deps` 的 dirty TaskCell；CAS 发布新值；再 DCCI TaskCell line | 100/100 | 0/100 | 0/100 | 新值被完整旧快照覆盖 100/100 |
+| 1：TaskCell 共线普通写 | ordinary 构造 TaskCell 并直接写新 `deps`；再 DCCI TaskCell line | 0/100 | 100/100 | 100/100 | 100/100 通过 |
+| 2：`deps` 独占行 atomic | CAS 发布新值；对仅经 atomic 访问的独占 line 做 DCCI | 100/100 | 100/100 | 100/100 | 100/100 通过 |
+| 3：`deps` 独占行普通写 | ordinary 写新值；再 DCCI 独占 line | 0/100 | 100/100 | 100/100 | 100/100 通过 |
+| 4：`deps` 独占行普通写且无 DCCI | ordinary 写新值；不做 DCCI | 0/100 | 0/100 | 0/100 | 100/100 单调合法 |
+
+场景 0 的“覆盖”不是只看最终 word：每轮都要求 CAS 返回旧值、远端确实先看见新值、DCCI 后远端
+第一次读取回到旧值、完整 64B TaskCell 的其余字段保持 writer 构造值，且独立 guard 全部正确。
+这证明问题来自同一条 ordinary dirty 快照后续写回，而不是 atomic 没有成功。
+
+场景 1 和 3 说明当前精确时序下普通 scalar 写在 DCCI 前不会被远端 atomic poll 看见、在
+DCCI+DSB 后会被看见。场景 4 的 `0/100` 只是本次“不做 DCCI”对照的观测，不是“普通写永远不可见”
+的架构保证；自然 writeback/eviction 可能改变其他运行的观察值，因此判定器允许旧值到新值的单调
+变化，只拒绝第三值、撕裂和新值回退。
+
+场景 2 说明把 `deps_prepared` 独立为 atomic-only cacheline 后，本次 SINGLE OUT DCCI 没有冲掉
+atomic 新值。它与场景 0 的差别不是“atomic 写法不同”，而是该独占 line 从未形成 ordinary dirty
+旧快照。仍应优先省掉 atomic 控制 line 上无必要的 DCCI，而不是把这 100 轮结果扩大为任意 DCCI
+组合都可用。
+
+复现命令：
+
+```bash
+PTO_ISA_ROOT="$PWD/build/pto-isa" \
+  tests/atomic_probe/ccec/run_all.sh taskcell_atomic_dcci
+```
+
+用例入口：
+
+- `ccec/taskcell_atomic_dcci.cpp`：五类设备时序、有限握手和精确取证；
+- `ccec/taskcell_atomic_dcci_host.cpp`：100 轮初始化、全字段判定和汇总；
+- `ccec/taskcell_atomic_dcci_shared.h`：64B 布局、常量和 host/device 共用结构。
 
 ## 5. 推荐的 cacheline 所有权协议
 
@@ -405,6 +462,10 @@ repeated `st_dev` 终值问题，也不能使 `st_dev` 写路径重新可用。�
 | 两 AIV repeated `st_dev`，各写独占 line | 高频或低频复现终值错误 | 分 line 不能修复；业务写路径仍禁用 |
 | 两 AIV `AtomicExch`，同/分 line | 当前三路径均 `0/4000` | 可作已测 atomic 对照，仍遵守 atomic-only line |
 | 多个纯 atomic word 共 line | AtomicExch 特定压力未复现问题 | 可审计后使用；关键变量仍建议独占 line |
+| dirty TaskCell 内 `deps` 先 CAS、后对同 line DCCI | 远端先见新值，随后 `100/100` 被旧 dirty 快照覆盖 | 禁止这种同-line混用 |
+| 独占 atomic-only `deps` line 先 CAS、后 SINGLE OUT DCCI | 当前 `100/100` 保持新值且 guard 完整 | 排除本精确时序的覆盖；默认仍省掉无必要 DCCI |
+| ordinary `deps` 写后 SINGLE OUT DCCI | 共线与独占行均由 DCCI 前 `0/100` 变为后 `100/100` | ordinary payload 必须按所有权协议发布 |
+| ordinary `deps` 写且无 DCCI | 当前窗口和最终快照均 `0/100` 可见 | 只作负对照，不外推“永不自然写回” |
 
 ## 7. DSB 与跨核同步
 
@@ -486,6 +547,8 @@ CCEC runner 对全部 probe 显式关闭；AscendC runner 当前只对 `mb8_dcci
 - repeated `st_dev` 分-line独立压力：`ascendc/st_dev_separate_line_stress.asc`、
   `ccec/st_dev_separate_line_stress.cpp`
 - AtomicExch 同构对照：`ascendc/atomic_exch_same_line.asc`、`ccec/atomic_exch_same_line.cpp`
+- TaskCell `deps_prepared` 五场景：`ccec/taskcell_atomic_dcci.cpp`、
+  `ccec/taskcell_atomic_dcci_host.cpp`
 
 本机 CANN 定义依据：
 

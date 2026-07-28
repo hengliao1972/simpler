@@ -82,6 +82,7 @@ PROBES=(
     "st_dev_single_core_stress.cpp:st_dev_single_core_stress_kernel.o:st_dev_single_core_stress_host.cpp:st_dev_single_core_stress_host"
     "ld_dev_fanout_publish.cpp:ld_dev_fanout_publish_kernel.o:ld_dev_fanout_publish_host.cpp:ld_dev_fanout_publish_host"
     "cacheline_matrix.cpp:cacheline_matrix_kernel.o:cacheline_matrix_host.cpp:cacheline_matrix_host"
+    "taskcell_atomic_dcci.cpp:taskcell_atomic_dcci_kernel.o:taskcell_atomic_dcci_host.cpp:taskcell_atomic_dcci_host"
 )
 
 # These caller-capture build-shape probes are selectable by name but are not
