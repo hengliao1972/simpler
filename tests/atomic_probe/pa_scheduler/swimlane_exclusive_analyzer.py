@@ -138,6 +138,16 @@ MATERIALIZE_BREAKDOWN_METRICS = (
     "materialize_publish_task_outputs_residual",
     "materialize_after_publish_task_outputs",
 )
+ACTOR_CYCLE_METRICS = (
+    "gross",
+    "control",
+    "submit",
+    "efdrain_control",
+    "claim",
+    "post_claim_tail",
+    "post_transition",
+    "kernel_union",
+)
 
 # 这些记录仍保留调用次数和 aggregate duration，但明确不进入任何闭合式。
 OVERLAY_PHASES = (
@@ -344,6 +354,22 @@ def _distribution(values: Sequence[int]) -> dict[str, int | float]:
         "median_cycles": _median(ordered),
         "p95_cycles": ordered[p95_index],
         "max_cycles": ordered[-1],
+    }
+
+
+def _actor_distribution(values: Sequence[int]) -> dict[str, int | float]:
+    """actor 汇总同时保留总量与单次分布；全部闭合仍使用整数总量。"""
+
+    if not values:
+        raise ValueError("cannot summarize an empty actor class")
+    ordered = sorted(values)
+    total = sum(ordered)
+    p95_index = math.ceil(0.95 * len(ordered)) - 1
+    return {
+        "sum_cycles": total,
+        "mean_cycles": total / len(ordered),
+        "median_cycles": _median(ordered),
+        "p95_cycles": ordered[p95_index],
     }
 
 
@@ -1659,6 +1685,330 @@ def _analyze_core(
     return result
 
 
+def _build_v5_actor_closure(
+    submits_by_lane: dict[tuple[int, int], list[Event]],
+    children_by_submit: dict[int, list[Event]],
+    kernels_by_efdrain: dict[int, list[Event]],
+    orchestrations_by_lane: dict[tuple[int, int], list[Event]],
+    *,
+    core_count: int,
+    task_count_per_core: int,
+) -> dict[str, Any]:
+    """按当前 task 的 Submit 加其后 transition 统计 winner/loser actor。
+
+    ``Submit`` 的结束点会随源码边界移动，不能单独用来衡量 loser。actor
+    固定从本次 Submit.start 延伸到下一次 Submit.start；末 task 延伸到
+    OrchestrationReplay.end。这样把工作从 Submit 尾搬到 transition 只会在
+    两个明细间移动，不会改变 gross/control。
+    """
+
+    buckets: dict[str, dict[str, Any]] = {
+        actor_class: {
+            "metrics": {
+                metric: [] for metric in ACTOR_CYCLE_METRICS
+            },
+            "kernel_event_count": 0,
+            "actors_with_kernel": 0,
+        }
+        for actor_class in ("winner", "loser")
+    }
+    orchestration_replay_cycles = 0
+    orchestration_setup_cycles = 0
+    actor_count = 0
+
+    for lane_key, submits in submits_by_lane.items():
+        orchestration_rows = orchestrations_by_lane.get(lane_key, [])
+        if len(orchestration_rows) != 1:
+            raise ValueError(
+                "schema-v5 actor closure requires exactly one "
+                f"OrchestrationReplay on core/lane {lane_key}"
+            )
+        orchestration = orchestration_rows[0]
+        orchestration_replay_cycles += orchestration.duration
+        setup = submits[0].start_cycle - orchestration.start_cycle
+        if setup < 0:
+            raise ValueError(
+                f"core/lane {lane_key} actor setup starts before OrchestrationReplay"
+            )
+        orchestration_setup_cycles += setup
+
+        for index, submit in enumerate(submits):
+            actor_end = (
+                submits[index + 1].start_cycle
+                if index + 1 < len(submits)
+                else orchestration.end_cycle
+            )
+            post_transition = actor_end - submit.end_cycle
+            gross = actor_end - submit.start_cycle
+            if post_transition < 0 or gross != submit.duration + post_transition:
+                raise ValueError(
+                    f"core/lane {lane_key} task {submit.task_id} "
+                    "Submit + post-transition actor window does not close"
+                )
+
+            children = children_by_submit[submit.row_index]
+            efdrains = [
+                child for child in children if child.phase == "EfDrain"
+            ]
+            claims = [
+                child for child in children if child.phase == "Claim"
+            ]
+            if len(efdrains) != 1 or len(claims) != 1:
+                raise ValueError(
+                    f"core/lane {lane_key} task {submit.task_id} actor "
+                    "requires exactly one EfDrain and one Claim"
+                )
+            efdrain = efdrains[0]
+            claim = claims[0]
+            if efdrain.end_cycle > claim.start_cycle:
+                raise ValueError(
+                    f"core/lane {lane_key} task {submit.task_id} "
+                    "EfDrain must finish before Claim starts"
+                )
+
+            kernels = kernels_by_efdrain[efdrain.row_index]
+            kernel_union = _interval_union_cycles(
+                [
+                    (kernel.start_cycle, kernel.end_cycle)
+                    for kernel in kernels
+                ]
+            )
+            efdrain_control = efdrain.duration - kernel_union
+            post_claim_tail = (
+                submit.duration - efdrain.duration - claim.duration
+            )
+            control = gross - kernel_union
+            if efdrain_control < 0 or post_claim_tail < 0 or control < 0:
+                raise ValueError(
+                    f"core/lane {lane_key} task {submit.task_id} "
+                    "actor control partition has a negative component"
+                )
+            if (
+                control
+                != efdrain_control
+                + claim.duration
+                + post_claim_tail
+                + post_transition
+            ):
+                raise ValueError(
+                    f"core/lane {lane_key} task {submit.task_id} "
+                    "actor control partition does not close"
+                )
+            if gross != control + kernel_union:
+                raise ValueError(
+                    f"core/lane {lane_key} task {submit.task_id} "
+                    "actor KernelUnion partition does not close"
+                )
+
+            actor_class = "winner" if submit.flags & 1 else "loser"
+            bucket = buckets[actor_class]
+            values = {
+                "gross": gross,
+                "control": control,
+                "submit": submit.duration,
+                "efdrain_control": efdrain_control,
+                "claim": claim.duration,
+                "post_claim_tail": post_claim_tail,
+                "post_transition": post_transition,
+                "kernel_union": kernel_union,
+            }
+            for metric, value in values.items():
+                bucket["metrics"][metric].append(value)
+            bucket["kernel_event_count"] += len(kernels)
+            bucket["actors_with_kernel"] += int(bool(kernels))
+            actor_count += 1
+
+    expected_actor_count = core_count * task_count_per_core
+    if actor_count != expected_actor_count:
+        raise AssertionError(
+            "winner/loser actor count does not match core × task identity"
+        )
+
+    actors: dict[str, Any] = {}
+    for actor_class, bucket in buckets.items():
+        metric_values = bucket["metrics"]
+        actor_class_count = len(metric_values["gross"])
+        metrics = {
+            metric: _actor_distribution(metric_values[metric])
+            for metric in ACTOR_CYCLE_METRICS
+        }
+        gross_sum = int(metrics["gross"]["sum_cycles"])
+        control_sum = int(metrics["control"]["sum_cycles"])
+        submit_sum = int(metrics["submit"]["sum_cycles"])
+        transition_sum = int(
+            metrics["post_transition"]["sum_cycles"]
+        )
+        efdrain_control_sum = int(
+            metrics["efdrain_control"]["sum_cycles"]
+        )
+        claim_sum = int(metrics["claim"]["sum_cycles"])
+        post_claim_tail_sum = int(
+            metrics["post_claim_tail"]["sum_cycles"]
+        )
+        kernel_union_sum = int(
+            metrics["kernel_union"]["sum_cycles"]
+        )
+        if gross_sum != submit_sum + transition_sum:
+            raise AssertionError(
+                f"{actor_class} actor gross aggregate does not close"
+            )
+        if (
+            control_sum
+            != efdrain_control_sum
+            + claim_sum
+            + post_claim_tail_sum
+            + transition_sum
+        ):
+            raise AssertionError(
+                f"{actor_class} actor control aggregate does not close"
+            )
+        if gross_sum != control_sum + kernel_union_sum:
+            raise AssertionError(
+                f"{actor_class} actor KernelUnion aggregate does not close"
+            )
+        actors[actor_class] = {
+            "actor_count": actor_class_count,
+            "metrics_cycles": metrics,
+            "kernel": {
+                "event_count": bucket["kernel_event_count"],
+                "actor_count_with_kernel": bucket[
+                    "actors_with_kernel"
+                ],
+                "union_cycles": metrics["kernel_union"],
+            },
+            "closure": {
+                "gross": {
+                    "parent_cycles": gross_sum,
+                    "submit_plus_post_transition_cycles":
+                        submit_sum + transition_sum,
+                    "exact": True,
+                },
+                "control": {
+                    "parent_cycles": control_sum,
+                    "efdrain_control_plus_claim_plus_post_claim_tail_plus_"
+                    "transition_cycles":
+                        efdrain_control_sum
+                        + claim_sum
+                        + post_claim_tail_sum
+                        + transition_sum,
+                    "exact": True,
+                },
+                "kernel": {
+                    "parent_cycles": gross_sum,
+                    "control_plus_kernel_union_cycles":
+                        control_sum + kernel_union_sum,
+                    "exact": True,
+                },
+            },
+        }
+
+    winner_count = actors["winner"]["actor_count"]
+    loser_count = actors["loser"]["actor_count"]
+    winner_gross = int(
+        actors["winner"]["metrics_cycles"]["gross"]["sum_cycles"]
+    )
+    loser_gross = int(
+        actors["loser"]["metrics_cycles"]["gross"]["sum_cycles"]
+    )
+    winner_control = int(
+        actors["winner"]["metrics_cycles"]["control"]["sum_cycles"]
+    )
+    loser_control = int(
+        actors["loser"]["metrics_cycles"]["control"]["sum_cycles"]
+    )
+    winner_kernel = int(
+        actors["winner"]["metrics_cycles"]["kernel_union"][
+            "sum_cycles"
+        ]
+    )
+    loser_kernel = int(
+        actors["loser"]["metrics_cycles"]["kernel_union"][
+            "sum_cycles"
+        ]
+    )
+    gross_partition = (
+        orchestration_setup_cycles + winner_gross + loser_gross
+    )
+    control_partition = (
+        orchestration_setup_cycles
+        + winner_control
+        + loser_control
+        + winner_kernel
+        + loser_kernel
+    )
+    if gross_partition != orchestration_replay_cycles:
+        raise AssertionError(
+            "winner + loser actor gross does not close OrchestrationReplay"
+        )
+    if control_partition != orchestration_replay_cycles:
+        raise AssertionError(
+            "winner + loser actor control does not close OrchestrationReplay"
+        )
+
+    return {
+        "fixed_counts": {
+            "core_count": core_count,
+            "task_count_per_core": task_count_per_core,
+            "expected_actor_count": expected_actor_count,
+            "actor_count": actor_count,
+            "winner_actor_count": winner_count,
+            "loser_actor_count": loser_count,
+            "winner_plus_loser_actor_count": winner_count + loser_count,
+        },
+        "actors": actors,
+        "aggregate_core_work": {
+            "orchestration_replay_cycles":
+                orchestration_replay_cycles,
+            "orchestration_setup_cycles":
+                orchestration_setup_cycles,
+            "closure": {
+                "gross": {
+                    "parent_cycles": orchestration_replay_cycles,
+                    "setup_plus_winner_plus_loser_cycles":
+                        gross_partition,
+                    "exact": True,
+                },
+                "control": {
+                    "parent_cycles": orchestration_replay_cycles,
+                    "setup_plus_winner_plus_loser_control_plus_"
+                    "kernel_union_cycles":
+                        control_partition,
+                    "exact": True,
+                },
+            },
+        },
+        "semantics": {
+            "fixed_counts": (
+                "observed winner/loser classifications plus the exact "
+                "core_count × task_count total; these counts are comparison "
+                "populations, not a new one-winner-per-task protocol oracle"
+            ),
+            "actor_window": (
+                "Submit_i.start through Submit_{i+1}.start; the final "
+                "task ends at OrchestrationReplay.end"
+            ),
+            "gross": "Submit duration plus post-transition duration",
+            "control": (
+                "gross minus the interval union of Kernel events inside "
+                "this Submit's EfDrain"
+            ),
+            "post_claim_tail": (
+                "remaining Submit control after removing EfDrain and "
+                "Claim; it includes all later frontend/tail work and any "
+                "unattributed Submit gaps"
+            ),
+            "post_transition": (
+                "current Submit.end through the next Submit.start, or "
+                "through OrchestrationReplay.end for the final task"
+            ),
+            "distribution": (
+                "sum/mean/median and nearest-rank p95 over fixed actor "
+                "instances"
+            ),
+        },
+    }
+
+
 def _add_residual_segment(
     segments: dict[str, dict[str, int]],
     key: str,
@@ -1914,6 +2264,18 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
             )
         )
 
+    winner_loser_actor_closure = (
+        _build_v5_actor_closure(
+            submits_by_lane,
+            children_by_submit,
+            kernels_by_efdrain,
+            orchestrations_by_lane,
+            core_count=num_cores,
+            task_count_per_core=len(task_ids),
+        )
+        if trace_schema_version == 5
+        else None
+    )
     aggregate_metrics = {
         metric: sum(core["metrics_cycles"][metric] for core in per_core)
         for metric in role_metric_names
@@ -2116,6 +2478,9 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
                 "final_drain_partition_exact": True,
                 "worker_completion_partition_exact": True,
                 "kernel_unique_parent_complete": True,
+                "winner_loser_actor_total_count_exact": True,
+                "winner_loser_actor_gross_partition_exact": True,
+                "winner_loser_actor_control_partition_exact": True,
             }
         )
         if tensormap_mode == "shared":
@@ -2234,7 +2599,7 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
                     }
                 )
 
-    return {
+    report = {
         "schema_version": REPORT_SCHEMA_VERSION,
         "input": str(input_path),
         "capture": {
@@ -2282,6 +2647,11 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
         "overlays": overlays,
         "per_core": per_core,
     }
+    if winner_loser_actor_closure is not None:
+        report["winner_loser_actor_closure"] = (
+            winner_loser_actor_closure
+        )
+    return report
 
 
 def write_analysis(input_path: Path, output_path: Path) -> Path:

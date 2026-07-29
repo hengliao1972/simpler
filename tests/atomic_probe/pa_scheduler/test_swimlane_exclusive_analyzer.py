@@ -767,6 +767,139 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
         self.assertEqual(atomic_overlay["aggregate_duration_cycles"], 963)
         self.assertIs(atomic_overlay["included_in_additive_totals"], False)
 
+    def test_v5_actor_closure_keeps_transition_work_and_removes_kernel_union(
+        self,
+    ) -> None:
+        baseline_capture = _v4_capture()
+        shifted_capture = _v4_capture()
+        shifted_rows = shifted_capture["fdwic_events"]
+        assert isinstance(shifted_rows, list)
+        shifted_submit = next(
+            row
+            for row in shifted_rows
+            if row[0] == 2
+            and row[3] == 0
+            and row[5] == "Submit"
+        )
+        self.assertEqual(int(shifted_submit[8]) & 1, 0)
+        # 把十个 cycle 从 loser Submit 尾部搬到其后的 transition。
+        # actor 的下一 Submit 起点不变，因此 gross/control 都不得下降。
+        shifted_submit[7] = int(shifted_submit[7]) - 10
+        _refresh_summary(shifted_capture)
+
+        with tempfile.TemporaryDirectory() as directory:
+            baseline_path = self._write(
+                directory, baseline_capture
+            )
+            baseline = analyze_capture(baseline_path)
+            shifted_path = Path(directory) / "shifted.json"
+            shifted_path.write_text(
+                json.dumps(shifted_capture, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            shifted = analyze_capture(shifted_path)
+
+        actor = baseline["winner_loser_actor_closure"]
+        counts = actor["fixed_counts"]
+        self.assertEqual(
+            counts,
+            {
+                "core_count": 96,
+                "task_count_per_core": 5,
+                "expected_actor_count": 480,
+                "actor_count": 480,
+                "winner_actor_count": 2,
+                "loser_actor_count": 478,
+                "winner_plus_loser_actor_count": 480,
+            },
+        )
+        self.assertIn(
+            "not a new one-winner-per-task protocol oracle",
+            actor["semantics"]["fixed_counts"],
+        )
+        winner = actor["actors"]["winner"]
+        loser = actor["actors"]["loser"]
+        self.assertEqual(
+            winner["metrics_cycles"]["gross"]["sum_cycles"], 220
+        )
+        self.assertEqual(
+            winner["metrics_cycles"]["control"]["sum_cycles"], 206
+        )
+        self.assertEqual(winner["kernel"]["event_count"], 2)
+        self.assertEqual(
+            winner["kernel"]["union_cycles"]["sum_cycles"], 14
+        )
+        self.assertEqual(
+            loser["metrics_cycles"]["gross"]["sum_cycles"], 48_740
+        )
+        self.assertEqual(
+            loser["metrics_cycles"]["control"]["sum_cycles"], 46_258
+        )
+        self.assertEqual(loser["kernel"]["event_count"], 478)
+        self.assertEqual(
+            loser["kernel"]["union_cycles"]["sum_cycles"], 2_482
+        )
+        for actor_class in ("winner", "loser"):
+            for metric in ("gross", "control"):
+                self.assertEqual(
+                    set(
+                        actor["actors"][actor_class][
+                            "metrics_cycles"
+                        ][metric]
+                    ),
+                    {
+                        "sum_cycles",
+                        "mean_cycles",
+                        "median_cycles",
+                        "p95_cycles",
+                    },
+                )
+            for closure in ("gross", "control", "kernel"):
+                self.assertIs(
+                    actor["actors"][actor_class]["closure"][
+                        closure
+                    ]["exact"],
+                    True,
+                )
+        self.assertIs(
+            actor["aggregate_core_work"]["closure"]["gross"]["exact"],
+            True,
+        )
+        self.assertIs(
+            actor["aggregate_core_work"]["closure"]["control"][
+                "exact"
+            ],
+            True,
+        )
+
+        shifted_actor = shifted["winner_loser_actor_closure"]
+        baseline_loser = actor["actors"]["loser"]["metrics_cycles"]
+        shifted_loser = shifted_actor["actors"]["loser"][
+            "metrics_cycles"
+        ]
+        self.assertEqual(
+            shifted_loser["gross"], baseline_loser["gross"]
+        )
+        self.assertEqual(
+            shifted_loser["control"], baseline_loser["control"]
+        )
+        self.assertEqual(
+            shifted_loser["kernel_union"],
+            baseline_loser["kernel_union"],
+        )
+        self.assertEqual(
+            shifted_loser["submit"]["sum_cycles"],
+            baseline_loser["submit"]["sum_cycles"] - 10,
+        )
+        self.assertEqual(
+            shifted_loser["post_claim_tail"]["sum_cycles"],
+            baseline_loser["post_claim_tail"]["sum_cycles"] - 10,
+        )
+        self.assertEqual(
+            shifted_loser["post_transition"]["sum_cycles"],
+            baseline_loser["post_transition"]["sum_cycles"] + 10,
+        )
+
     def test_v5_moves_task_outputs_into_materialize_breakdown(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = self._write(
