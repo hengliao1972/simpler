@@ -2057,7 +2057,10 @@ PA_DEVICE bool CommitSymbolSharedWriterIntentSet(
 // 丢弃的 fanin；previous writer 仍必须在取得 turn 后读取，才能写入当前
 // task 的不可变 history。通用 CommitSymbolSharedWriterIntentSet 继续保留
 // 原有等待 publication、收集 fanin 和逐项统计的合同，二者不能互换。
-template <typename Ops, bool ObserveAtomics = false>
+template <
+    typename Ops, bool ObserveAtomics = false,
+    bool CheckOutputPublished = true
+>
 PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
     PA_GM SharedTensorMapSidecar &map,
     const uint32_t *symbol_keys, uint32_t symbol_count,
@@ -2083,15 +2086,22 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
         const uint32_t symbol_key = symbol_keys[index];
         const FdwicOutputRef output_ref =
             SharedSymbolHistoryReference(symbol_key);
-        if (!IsPlainSharedOutputRef(output_ref) ||
-            output_ref.producer_task_id >= task_id ||
-            !CheckSharedOutputPublishedAfterInsertTurn<
-                Ops, ObserveAtomics
-            >(
-                map, output_ref, task_id,
-                AtomicSite::SharedMetadataOutputPublishedLoad,
-                stats
-            )) {
+        const bool valid_ref =
+            IsPlainSharedOutputRef(output_ref) &&
+            output_ref.producer_task_id < task_id;
+        bool published = true;
+        if constexpr (CheckOutputPublished) {
+            published =
+                valid_ref &&
+                CheckSharedOutputPublishedAfterInsertTurn<
+                    Ops, ObserveAtomics
+                >(
+                    map, output_ref, task_id,
+                    AtomicSite::SharedMetadataOutputPublishedLoad,
+                    stats
+                );
+        }
+        if (!valid_ref || !published) {
             if (fatal != nullptr) {
                 (void)TraceConfiguredAtomicExchange<
                     Ops, ObserveAtomics

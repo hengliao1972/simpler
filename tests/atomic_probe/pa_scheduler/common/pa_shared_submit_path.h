@@ -200,7 +200,10 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
     return true;
 }
 
-template <typename Ops, bool CheckFatal = true>
+template <
+    typename Ops, bool CheckFatal = true,
+    bool CheckOutputPublished = true
+>
 PA_DEVICE bool PublishSharedTaskWriterMetadata(
     PA_GM SchedulerState *state, const SubmitContext &context,
     const SharedTaskWriterDelta &delta, LocalStats &stats
@@ -248,7 +251,9 @@ PA_DEVICE bool PublishSharedTaskWriterMetadata(
     }
 
     if (delta.symbol_count != 0 &&
-        !CommitPreparedSymbolSharedWriterIntentSet<Ops, true>(
+        !CommitPreparedSymbolSharedWriterIntentSet<
+            Ops, true, CheckOutputPublished
+        >(
             state->shared_map, delta.symbol_keys,
             delta.symbol_count, task_id, &state->fatal.value,
             &stats
@@ -613,7 +618,11 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         : TraceTimestamp<Ops>(stats.trace, stats.result);
     const bool metadata_published =
         turn_ready &&
-        PublishSharedTaskWriterMetadata<Ops, false>(
+        // 当前 owner 已取得 task N 的 insert turn。producer P 的
+        // descriptor/published 先于 P 的 deps_prepared，逐 task handoff
+        // 又把该可见性传递到 N；这里保留 ref/task-id 校验，不再为三个
+        // UP symbol 重读已经由有序链证明就绪的 published 控制字。
+        PublishSharedTaskWriterMetadata<Ops, false, false>(
             state, context, writer_delta, stats
         );
     const uint64_t metadata_end = metadata_published

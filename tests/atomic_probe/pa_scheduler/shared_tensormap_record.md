@@ -11913,3 +11913,90 @@ last-writer load、一次 history DCCI 和三组 CAS；重复 fatal 原子读已
 
 这项修改只消减正式路径中可证明重复的原子读，不改变 writer history
 发布顺序，也不改变通用 helper 的防御性合同，作为第一项低风险优化保留。
+
+### 2026-07-29：正式插入链不再重复读取 output published
+
+#### 可省略范围与顺序依据
+
+本次只处理已经成功取得 task N insert turn 的正式 Finish 路径。对任意
+合法 producer P < N，设备路径的发布顺序为：
+
+```text
+P 写 descriptor
+→ descriptor DCCI clean-out + DSB
+→ published[P,slot] Exchange 成功
+→ P 发布 writer metadata
+→ deps_prepared[P] CAS(-1 → P)
+→ 每个后继只在读到 deps_prepared[K-1] == K-1 后发布 K
+→ N 读到 deps_prepared[N-1] == N-1
+```
+
+因此 N 取得 turn 时，所有 P < N 的 output publication 已经由逐 task
+completion 链传递。metadata 再对三个 INOUT symbol 各执行一次
+`published atomicAdd(0)`，只能重复验证已经成立的前置条件。
+
+删除这三次读取后仍保留：
+
+- `IsPlainSharedOutputRef` 和 `producer_task_id < task_id`；
+- symbol key、数量、delta/task-id 和 writer-intent 一致性检查；
+- `last_writer` 必须落在 `[producer_task_id, task_id)` 的范围检查；
+- immutable history 的 DCCI + DSB；
+- 三个 `last_writer` CAS 的 expected-old 校验；
+- descriptor 真正复制到 Build slot 前的独立 DCCI invalidate；
+- 通用 helper 默认的 publication 检查和未发布立即失败合同。
+
+`last_writer` 的范围检查仍会拒绝 producer 没有实际创建的 slot。producer
+output、metadata 或 handoff 任一步失败都不会发布自己的
+`deps_prepared`；成功 handoff 后也不再回滚合法 output。因此该优化没有
+把错误状态伪装成完成状态。
+
+实现上为 `CommitPreparedSymbolSharedWriterIntentSet` 和
+`PublishSharedTaskWriterMetadata` 增加编译期
+`CheckOutputPublished`：
+
+- 公共入口默认 `true`；
+- 只有正式 `FinishSharedWinnerSubmitBody` 在取得 turn 后传 `false`；
+- CPU 定向测试锁定公共入口仍恰好读取一次并拒绝未发布 producer；
+- 可信实例锁定 published 地址零次读取，同时仍正确发布 history 和
+  last-writer。
+
+#### A5 B256 结果
+
+候选 full-swimlane 位于：
+
+`outputs/pa_scheduler_shared_swimlane_20260729_173425_2768106/ccec`
+
+raw 中 metadata site 24
+`SharedMetadataOutputPublishedLoad` 从 `768` 条精确降为 `0`；site 26/27
+`SharedMetadataLastWriterLoad/Commit` 仍各为 `768` 条。256 个 UP task
+的结果为：
+
+| 指标 | 上一阶段 | 本阶段 | 变化 |
+| --- | ---: | ---: | ---: |
+| UP metadata mean | 3.993 us | 3.087 us | -0.906 us / -22.7% |
+| UP metadata median | 3.972 us | 3.081 us | -0.891 us / -22.4% |
+| UP metadata p95 | 4.320 us | 3.512 us | -0.808 us / -18.7% |
+| full-swimlane Submit | 2467.129 us | 2452.175 us | -14.954 us / -0.61% |
+
+perf-clock 独立运行 10 次：
+
+`2303.545、2312.347、2294.210、2301.891、2302.700、2330.868、`
+`2318.855、2329.035、2320.704、2328.191 us`
+
+中位数为 `2315.601 us`，范围为 `2294.210～2330.868 us`。相对上一阶段
+中位数 `2326.027 us` 改善 `10.426 us（0.448%）`。两组范围存在重叠，
+所以不能把该端到端幅度描述成大收益；但串行区删去 768 次读取、UP
+metadata 局部约 22% 的改善和 perf-clock 同向，具备保留价值。
+
+相对最初精确基线，本阶段累计把 UP metadata mean 从 `4.330 us` 降到
+`3.087 us（-28.7%）`，perf-clock 中位数从 `2501.246 us` 降到
+`2315.601 us（-7.42%）`。
+
+正确性验证：
+
+- CPU shared 全套门槛和新增可信实例零 published-load 测试通过；
+- A5 B256 full-swimlane 的 execution、semantic、history、fanin、
+  output、projection 与后处理检查全部通过；
+- A5 mixed context `0,8192,16384,32768` 覆盖 G0/G1/G2/G4 和连续 UP
+  history，全部检查通过；
+- 10 个候选 perf-clock B256 独立进程全部通过。

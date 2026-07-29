@@ -1788,6 +1788,35 @@ void TestOrderedPreparedSymbolUsesSinglePublicationCheck() {
             map->shared_outputs[kProducer].last_writer[0].value == -1,
         "unpublished rejection preserves history and writer"
     );
+
+    // 正式 Finish 只有在取得 task N 的 insert turn 后才使用该编译期
+    // 分支；前驱 handoff 已经传递 producer descriptor/published 的
+    // 可见性。这里刻意只建立后续 last_writer 前置条件并保持 published
+    // 为 -1，锁定 helper 本身不会偷偷恢复一次 publication load。
+    ResetSharedState(*map);
+    map->shared_outputs[kProducer].last_writer[0].value = kProducer;
+    fatal = 0;
+    SymbolTestOps::wait_address =
+        &map->shared_outputs[kProducer].published[0].value;
+    SymbolTestOps::wait_loads.store(0, std::memory_order_relaxed);
+    const bool trusted_committed =
+        CommitPreparedSymbolSharedWriterIntentSet<
+            SymbolTestOps, false, false
+        >(
+            *map, &symbol_key, 1, kWriter, &fatal
+        );
+    SymbolTestOps::wait_address = nullptr;
+    Check(
+        trusted_committed && fatal == 0 &&
+            SymbolTestOps::wait_loads.load(
+                std::memory_order_relaxed
+            ) == 0 &&
+            map->writer_history[kWriter].magic ==
+                kSharedWriterHistoryMagic &&
+            map->shared_outputs[kProducer].last_writer[0].value ==
+                kWriter,
+        "insert-turn trusted commit omits only the publication load"
+    );
 }
 
 void TestPublicationWaitFailuresFailClosed() {
