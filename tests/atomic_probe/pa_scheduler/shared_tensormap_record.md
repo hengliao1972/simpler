@@ -12385,3 +12385,68 @@ mean/median 为 `2306.750/2307.458 us`，范围
 - mixed context `0,8192,16384,32768` 覆盖 G0/G1/G2/G4、首组 Alloc
   previous 与连续 `task_id-4` previous，全部通过；
 - 10 个 B256 perf-clock 独立进程全部通过。
+
+### 2026-07-29：把正式 PA writer 形状校验移出有序发布段
+
+#### 修改边界
+
+上一阶段已经证明正式 PA 的 writer delta 在 Materialize 尾部具有稳定
+形状，但 Register 内仍再次检查 UP 的三项 key/count。`writer_delta`
+属于 winner 本核栈对象，从准备完成到 Register 发布只按 `const&`
+传递；等待前序 TensorMap 插入不会改写它。因此本阶段：
+
+- 在 `PrepareSharedTaskWriterDelta()` 后、任何 output/history GM 发布前，
+  完整校验 task id、ordinary/symbol 数量、writer 标志以及 UP 的
+  `2/1/0` 精确 key；
+- 失败时仍先设置 fatal，再退出，不产生部分 writer history 或
+  `deps_prepared` 发布；
+- 正式 PA 实例用编译期参数复用这份已完成的证明，从 Register 有序段
+  删除重复形状扫描；
+- generic helper 默认仍执行原有防御校验，不把 PA 的强合同扩散到通用
+  调用；
+- 不新增共享字段，不改变 TensorMap、trace raw、atomic 或 DCCI ABI。
+
+CPU 门槛补充了正确 UP、乱序 UP、把 UP delta 冒充非 UP，以及合法空
+SF 四类输入；原有缺项、重复、错误 producer 和部分发布负例继续保留。
+
+#### A5 B256 结果
+
+候选 full-swimlane 位于：
+
+`outputs/pa_scheduler_shared_swimlane_20260729_192312_2877206/ccec`
+
+| 指标 | 上一阶段 | 本阶段 | 变化 |
+| --- | ---: | ---: | ---: |
+| UP metadata mean | 1.714 us | 1.706 us | -0.008 us / -0.5% |
+| UP metadata median | 1.701 us | 1.695 us | -0.006 us / -0.4% |
+| metadata 起点至 history DCCI | 0.427 us | 0.329 us | -0.098 us / -23.0% |
+| writer CAS mean | 0.244 us | 0.241 us | 仍精确为 768 次 |
+| history DCCI mean | 0.151 us | 0.145 us | 仍精确为 256 次 |
+| AIV Finish `.text` | `0xda20` | `0xda90` | +112 B / +0.20% |
+| full-swimlane Submit | 2431.177 us | 2443.128 us | +0.49%，单次波动 |
+
+局部证据表明约 `98 ns/UP` 的纯本地校验已经离开全局有序段；父区间只
+下降约 `8 ns`，原因是本次 DCCI 后 raw 观察写入和 CAS 区间合计上浮，
+不能把它解释为协议回退，也不能宣称端到端收益。
+
+perf-clock 独立运行 10 次：
+
+`2318.025、2316.407、2305.898、2306.525、2320.822、2292.844、`
+`2320.433、2298.236、2326.158、2304.084 us`
+
+mean/median 为 `2310.943/2311.466 us`，范围
+`2292.844～2326.158 us`；上一阶段为 `2306.750/2307.458 us`。median
+变化 `+4.008 us（+0.174%）`，取值范围高度重叠且远低于 1% 门槛，
+判为端到端中性。本阶段保留的依据是：有序段内本地工作明确减少、错误
+输入更早失败、通用路径合同未削弱；不把中性的 perf-clock 结果写成性能
+收益。
+
+正确性验证：
+
+- CPU shared 全套门槛和新增预校验正负例全部通过；
+- CCEC AIC/AIV 模板、正式 mixed ELF、swimlane 与 perf-clock 构建通过；
+- A5 B256 execution、semantic、history、projection、atomic/DCCI
+  closure 和后处理全部通过；
+- mixed context `0,8192,8193,32768` 覆盖 G0/G1/G2-partial/G4，全部
+  通过；
+- 10 个 B256 perf-clock 独立进程全部通过。

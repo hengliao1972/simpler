@@ -2061,7 +2061,8 @@ template <
     typename Ops, bool ObserveAtomics = false,
     bool CheckOutputPublished = true,
     bool UseExpectedPrevious = false,
-    bool UsePaUpShape = false
+    bool UsePaUpShape = false,
+    bool TrustPreparedPaShape = false
 >
 PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
     PA_GM SharedTensorMapSidecar &map,
@@ -2084,6 +2085,10 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
         !UsePaUpShape || UseExpectedPrevious,
         "PA UP shape requires an expected previous writer"
     );
+    static_assert(
+        !TrustPreparedPaShape || UsePaUpShape,
+        "only the PA UP path can trust a prepared writer shape"
+    );
     if (symbol_count == 0) {
         if constexpr (!UsePaUpShape) {
             return true;
@@ -2103,7 +2108,7 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
     // Alloc producer 的 slot 2/1/0。收紧为精确顺序后无需在有序区做
     // 三次除法/取模、去重或 packed-slot 搬运；任何漂移仍在首次 GM
     // history 写之前失败。
-    if constexpr (UsePaUpShape) {
+    if constexpr (UsePaUpShape && !TrustPreparedPaShape) {
         const bool producer_valid =
             expected_producer >= 0 &&
             expected_producer < task_id &&

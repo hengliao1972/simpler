@@ -200,11 +200,50 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
     return true;
 }
 
+// 正式 PA 在进入全局有序 Register 之前校验 owner-local writer delta。
+// 该对象此后只按 const 引用传递，predecessor wait 也不会修改本核栈，
+// 因而 Register 可以复用这份证明，不必在串行区重复解码三个 key。
+PA_DEVICE bool ValidatePreparedPaWriterShape(
+    const SharedTaskWriterDelta &delta, TaskKind kind,
+    int32_t task_id, int32_t expected_previous,
+    int32_t expected_producer
+) {
+    if (task_id < 0 ||
+        task_id >= static_cast<int32_t>(kMaxTasks) ||
+        delta.prepared_task_id != task_id ||
+        delta.ordinary_count != 0) {
+        return false;
+    }
+    if (kind != TaskKind::Up) {
+        return expected_previous == -1 &&
+            delta.symbol_count == 0 &&
+            !delta.writer_intent_required;
+    }
+    if (expected_producer < 0 ||
+        expected_producer >= task_id ||
+        expected_producer >=
+            static_cast<int32_t>(kMaxTasks) ||
+        expected_previous < expected_producer ||
+        expected_previous >= task_id ||
+        delta.symbol_count != 3 ||
+        !delta.writer_intent_required) {
+        return false;
+    }
+    const uint32_t key_base =
+        static_cast<uint32_t>(expected_producer) *
+            kSharedOutputMaxPerTask +
+        1U;
+    return delta.symbol_keys[0] == key_base + 2U &&
+        delta.symbol_keys[1] == key_base + 1U &&
+        delta.symbol_keys[2] == key_base;
+}
+
 template <
     typename Ops, bool CheckFatal = true,
     bool CheckOutputPublished = true,
     bool UseExpectedPrevious = false,
-    bool UsePaUpShape = false
+    bool UsePaUpShape = false,
+    bool TrustPreparedPaShape = false
 >
 PA_DEVICE bool PublishSharedTaskWriterMetadata(
     PA_GM SchedulerState *state, const SubmitContext &context,
@@ -215,6 +254,10 @@ PA_DEVICE bool PublishSharedTaskWriterMetadata(
     static_assert(
         !UsePaUpShape || UseExpectedPrevious,
         "PA UP metadata requires an expected previous writer"
+    );
+    static_assert(
+        !TrustPreparedPaShape || UsePaUpShape,
+        "only the PA path can trust a prepared writer shape"
     );
     const int32_t task_id = context.task_id;
     bool fatal_clear = true;
@@ -249,13 +292,16 @@ PA_DEVICE bool PublishSharedTaskWriterMetadata(
         // symbol。expected_previous 由 PA 计划在 Materialize 前推导，
         // 它非负即表示当前 task 是 UP；据此把“合法非 UP 空集合”和
         // “异常 UP 丢失三个 symbol”严格区分。错误形状不回退通用路径。
-        const bool expects_pa_up = expected_previous >= 0;
-        if (delta.ordinary_count != 0 ||
-            delta.symbol_count != (expects_pa_up ? 3U : 0U)) {
-            SetFatal<Ops>(state, stats, task_id);
-            return false;
+        if constexpr (!TrustPreparedPaShape) {
+            const bool expects_pa_up = expected_previous >= 0;
+            if (delta.ordinary_count != 0 ||
+                delta.symbol_count !=
+                    (expects_pa_up ? 3U : 0U)) {
+                SetFatal<Ops>(state, stats, task_id);
+                return false;
+            }
         }
-        if (!expects_pa_up) {
+        if (delta.symbol_count == 0) {
             return true;
         }
     }
@@ -279,7 +325,8 @@ PA_DEVICE bool PublishSharedTaskWriterMetadata(
     if (delta.symbol_count != 0 &&
         !CommitPreparedSymbolSharedWriterIntentSet<
             Ops, true, CheckOutputPublished,
-            UseExpectedPrevious, UsePaUpShape
+            UseExpectedPrevious, UsePaUpShape,
+            TrustPreparedPaShape
         >(
             state->shared_map, delta.symbol_keys,
             delta.symbol_count, task_id, &state->fatal.value,
@@ -590,6 +637,11 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     SharedTaskWriterDelta writer_delta{};
     if (!PrepareSharedTaskWriterDelta(
             args, context, writer_delta
+        ) ||
+        !ValidatePreparedPaWriterShape(
+            writer_delta, kind, static_cast<int32_t>(task_id),
+            expected_previous,
+            static_cast<int32_t>(task_meta.batch_start)
         )) {
         EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(
             pmu_context
@@ -672,7 +724,7 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         // 又把该可见性传递到 N；这里保留 ref/task-id 校验，不再为三个
         // UP symbol 重读已经由有序链证明就绪的 published 控制字。
         PublishSharedTaskWriterMetadata<
-            Ops, false, false, true, true
+            Ops, false, false, true, true, true
         >(
             state, context, writer_delta, stats,
             expected_previous,

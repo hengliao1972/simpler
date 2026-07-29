@@ -612,6 +612,10 @@ void TestPaTwoGroupWriterReadyGate() {
         PrepareSharedTaskWriterDelta(
             first_args, delta_context, exact_delta
         ) &&
+            ValidatePreparedPaWriterShape(
+                exact_delta, TaskKind::Up, first_up,
+                alloc, alloc
+            ) &&
             exact_delta.ordinary_count == 0 &&
             exact_delta.symbol_count == 3 &&
             exact_delta.symbol_keys[0] ==
@@ -622,6 +626,29 @@ void TestPaTwoGroupWriterReadyGate() {
                 alloc_key_base &&
             exact_delta.writer_intent_required,
         "UP writer delta preserves the exact 2/1/0 callback order"
+    );
+    SharedTaskWriterDelta malformed_delta = exact_delta;
+    const uint32_t saved_middle_key =
+        malformed_delta.symbol_keys[1];
+    malformed_delta.symbol_keys[1] =
+        malformed_delta.symbol_keys[2];
+    malformed_delta.symbol_keys[2] = saved_middle_key;
+    SharedTaskWriterDelta empty_delta{};
+    empty_delta.prepared_task_id = first_sf;
+    Check(
+        !ValidatePreparedPaWriterShape(
+            malformed_delta, TaskKind::Up, first_up,
+            alloc, alloc
+        ) &&
+            !ValidatePreparedPaWriterShape(
+                exact_delta, TaskKind::Qk, first_up,
+                /*expected_previous=*/-1, alloc
+            ) &&
+            ValidatePreparedPaWriterShape(
+                empty_delta, TaskKind::Sf, first_sf,
+                /*expected_previous=*/-1, alloc
+            ),
+        "PA writer prevalidation rejects malformed UP and accepts an empty non-UP"
     );
     Check(
         first_args.scalars[0] == 1 && first_args.scalars[1] == 0,
