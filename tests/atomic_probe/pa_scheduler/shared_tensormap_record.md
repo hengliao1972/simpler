@@ -12078,3 +12078,73 @@ perf-clock 独立运行 10 次：
 - A5 B256 full-swimlane 全部检查通过；
 - A5 mixed G0/G1/G2/G4 全部检查通过；
 - 10 个候选 B256 perf-clock 独立进程全部通过。
+
+### 2026-07-29：提前预取本 task 独占的 writer-history 行
+
+#### 放置依据
+
+每个 task 的 `SharedWriterHistoryCell` 独占一个 cache line，UP 在 Register
+中会先普通写入该行，再执行 clean-out + DSB，随后提交三个
+last-writer CAS。此前受控测试只复刻了 task 独占、40 B
+writer-history destination 和写后 clean-out 的物理形态；它证明该位置值得
+做真实业务 A/B，不能把微基准百分比当成预期收益。真实 history 由标量值写入，
+不是探针中的 GM-to-GM 逐 byte copy，目标缓存驻留状态也不相同。
+
+本次只在以下条件同时成立时发出 hint：
+
+- shared 正式 winner 路径；
+- `PublishSharedTaskOutputs` 已成功；
+- `writer_delta.symbol_count != 0`，即当前 PA 中的 UP；
+- 目标是 `writer_history[task_id]`，不存在跨 task 共用 cache line。
+
+预取位于 Materialize 尾部、等待 predecessor insert turn 之前。等待过程
+为硬件提供 preload lead，且 hint 不进入全局有序写入区。它不承担任何
+正确性职责，原有 history 普通写、DCCI clean-out、DSB、三个
+expected-old CAS 和 completion publication 全部保留。CPU Ops 和 CPU
+定向测试 Ops 只提供 no-op 接口，因此 CPU 继续只验证协议。
+
+#### A5 B256 局部与端到端结果
+
+候选 full-swimlane 位于：
+
+`outputs/pa_scheduler_shared_swimlane_20260729_180113_2795665/ccec`
+
+与上一提交的
+`outputs/pa_scheduler_shared_swimlane_20260729_174753_2781678/ccec`
+相比：
+
+| 指标 | 上一阶段 | 本阶段 | 变化 |
+| --- | ---: | ---: | ---: |
+| UP metadata mean | 2.440 us | 2.201 us | -0.239 us / -9.8% |
+| UP metadata median | 2.436 us | 2.210 us | -0.226 us / -9.3% |
+| UP metadata p95 | 2.754 us | 2.431 us | -0.323 us / -11.7% |
+| history DCCI mean | 0.153 us | 0.152 us | 基本不变 |
+| full-swimlane Submit | 2449.341 us | 2467.469 us | +18.128 us / +0.74% |
+
+三个 writer CAS 的均值由 `0.246 us` 轻微变为 `0.253 us`，history DCCI
+没有变化；因此约 `0.239 us/task` 的局部收益来自原先没有被 Atomic/DCCI
+子 span 覆盖的 history 首次写入与后续标量处理区，而不是通过删除同步
+动作取得。
+
+perf-clock 独立运行 10 次：
+
+`2312.615、2330.554、2287.095、2322.409、2306.505、2309.960、`
+`2283.669、2297.918、2318.766、2317.000 us`
+
+mean/median 为 `2308.649/2311.288 us`，范围
+`2283.669～2330.554 us`；上一提交中位数为 `2305.632 us`。中位数变化
+`+5.656 us（+0.245%）`，取值范围高度重叠，不能宣称端到端收益，也没有
+形成可分辨的端到端回退。该阶段的结论严格限定为：
+
+- 256 个 UP 样本的 metadata 分布稳定下移约 9%～12%；
+- perf-clock 端到端中性；
+- 预取只是一条性能 hint，删除它不影响协议正确性。
+
+正确性验证：
+
+- CPU shared 全套门槛通过；
+- A5 B256 full-swimlane 的 execution、semantic、history、fanin、
+  output、projection 与后处理检查全部通过；
+- A5 mixed context `0,8192,16384,32768` 覆盖 G0/G1/G2/G4 和连续
+  writer history，全部检查通过；
+- 10 个候选 B256 perf-clock 独立进程全部通过。

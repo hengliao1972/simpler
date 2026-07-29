@@ -599,6 +599,14 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
+    if (writer_delta.symbol_count != 0) {
+        // history cell 按 task 独占。趁本 task 尚未进入全局 insert turn，
+        // 先把其首条 cache line 预取到本核 DCache；后续 predecessor wait
+        // 提供异步 lead。该 hint 不替代 metadata 的 DCCI/DSB/CAS。
+        Ops::PreloadDataCache(
+            &state->shared_map.writer_history[task_id]
+        );
+    }
     EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(
         pmu_context
     );

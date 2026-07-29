@@ -357,6 +357,10 @@ struct OrderedSubmitTestOps {
         std::this_thread::yield();
     }
 
+    static void PreloadDataCache(void *) {
+        // CPU 定向测试不模拟 A5 DCache hint。
+    }
+
     static void InvalidateRegion(
         const void *address, uint64_t bytes
     ) {

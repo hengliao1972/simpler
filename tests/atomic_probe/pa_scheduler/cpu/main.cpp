@@ -253,6 +253,10 @@ struct CpuOps {
 
     static inline void SpinHint() {}
 
+    static inline void PreloadDataCache(void *) {
+        // CPU 只回归协议；不模拟 A5 DCache preload hint。
+    }
+
     static inline void InvalidateRegion(const void *, uint64_t) {
         // CPU 没有 A5 DCache line 失效指令；这里仅提供保守的本线程顺序边界，
         // 接口占位但不模拟设备 cache line 行为。共享状态本身仍使用 atomic。

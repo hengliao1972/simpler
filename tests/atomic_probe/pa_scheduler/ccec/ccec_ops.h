@@ -351,6 +351,17 @@ struct CcecOps {
     // 同理不额外插入 nop，让等待循环保留真实 PA 内核“不主动退避”的指令成本。
     __aicore__ static inline void SpinHint() {}
 
+    __aicore__ static inline void PreloadDataCache(
+        __gm__ void *address
+    ) {
+        // 只提供性能 hint，不承担可见性或顺序语义；调用点仍必须保留
+        // 原有普通写、DCCI clean-out、DSB 与 atomic publication。
+        dc_preload(
+            reinterpret_cast<__gm__ uint64_t *>(address),
+            static_cast<int64_t>(0)
+        );
+    }
+
     __aicore__ static inline void InvalidateRegion(__gm__ const void *address, uint64_t bytes) {
         // 逐 cache line 失效并以 dsb 收口：既供 worker 读取 host 写入的
         // standalone 控制区，也供 shared TensorMap reader 观察跨核 payload。
