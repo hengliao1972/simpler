@@ -1817,6 +1817,59 @@ void TestOrderedPreparedSymbolUsesSinglePublicationCheck() {
                 kWriter,
         "insert-turn trusted commit omits only the publication load"
     );
+
+    // PA 正式路径还从 batch/group 元数据得到精确 previous writer，并
+    // 继续由 CAS expected-old 校验共享状态。把 last_writer 地址设为
+    // Load 探针，证明该实例不再做 CAS 前预读。
+    ResetSharedState(*map);
+    map->shared_outputs[kProducer].last_writer[0].value = kProducer;
+    fatal = 0;
+    SymbolTestOps::wait_address =
+        &map->shared_outputs[kProducer].last_writer[0].value;
+    SymbolTestOps::wait_loads.store(0, std::memory_order_relaxed);
+    const bool expected_previous_committed =
+        CommitPreparedSymbolSharedWriterIntentSet<
+            SymbolTestOps, false, false, true
+        >(
+            *map, &symbol_key, 1, kWriter, &fatal,
+            nullptr, kProducer
+        );
+    SymbolTestOps::wait_address = nullptr;
+    Check(
+        expected_previous_committed && fatal == 0 &&
+            SymbolTestOps::wait_loads.load(
+                std::memory_order_relaxed
+            ) == 0 &&
+            map->writer_history[kWriter].entries[0].previous_writer ==
+                kProducer &&
+            map->shared_outputs[kProducer].last_writer[0].value ==
+                kWriter,
+        "PA expected-previous commit omits the last-writer preload"
+    );
+
+    ResetSharedState(*map);
+    map->shared_outputs[kProducer].last_writer[0].value = kProducer;
+    fatal = 0;
+    SymbolTestOps::wait_address =
+        &map->shared_outputs[kProducer].last_writer[0].value;
+    SymbolTestOps::wait_loads.store(0, std::memory_order_relaxed);
+    const bool wrong_previous_rejected =
+        !CommitPreparedSymbolSharedWriterIntentSet<
+            SymbolTestOps, false, false, true
+        >(
+            *map, &symbol_key, 1, kReader, &fatal,
+            nullptr, kWriter
+        );
+    SymbolTestOps::wait_address = nullptr;
+    Check(
+        wrong_previous_rejected &&
+            SymbolTestOps::wait_loads.load(
+                std::memory_order_relaxed
+            ) == 0 &&
+            map->shared_outputs[kProducer].last_writer[0].value ==
+                kProducer,
+        "PA expected-previous CAS rejects a mismatched writer"
+    );
 }
 
 void TestPublicationWaitFailuresFailClosed() {

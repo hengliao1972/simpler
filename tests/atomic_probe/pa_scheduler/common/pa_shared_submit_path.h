@@ -202,11 +202,13 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
 
 template <
     typename Ops, bool CheckFatal = true,
-    bool CheckOutputPublished = true
+    bool CheckOutputPublished = true,
+    bool UseExpectedPrevious = false
 >
 PA_DEVICE bool PublishSharedTaskWriterMetadata(
     PA_GM SchedulerState *state, const SubmitContext &context,
-    const SharedTaskWriterDelta &delta, LocalStats &stats
+    const SharedTaskWriterDelta &delta, LocalStats &stats,
+    int32_t expected_previous = -1
 ) {
     const int32_t task_id = context.task_id;
     bool fatal_clear = true;
@@ -252,11 +254,12 @@ PA_DEVICE bool PublishSharedTaskWriterMetadata(
 
     if (delta.symbol_count != 0 &&
         !CommitPreparedSymbolSharedWriterIntentSet<
-            Ops, true, CheckOutputPublished
+            Ops, true, CheckOutputPublished,
+            UseExpectedPrevious
         >(
             state->shared_map, delta.symbol_keys,
             delta.symbol_count, task_id, &state->fatal.value,
-            &stats
+            &stats, expected_previous
         )) {
         SetFatal<Ops>(state, stats, task_id);
         return false;
@@ -526,6 +529,14 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     const TaskKind kind = task_meta.kind;
     const int32_t function_id =
         static_cast<int32_t>(ticket.function_id);
+    // 在进入 Materialize/Register 之前从 PA 计划推导 previous writer，
+    // 避免把这段确定性标量计算放进全局有序插入区。
+    const int32_t expected_previous =
+        kind == TaskKind::Up
+        ? (task_meta.group_index == 0
+              ? static_cast<int32_t>(task_meta.batch_start)
+              : static_cast<int32_t>(task_id) - 4)
+        : -1;
 
     // Claim owner 先构造 descriptor 和 writer delta；这一段不查询
     // TensorMap，也不占用有序插入通道。
@@ -616,14 +627,21 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
               stats.trace, stats.result, ready_observed
           )
         : TraceTimestamp<Ops>(stats.trace, stats.result);
+    // PA 的三个 accumulator symbol 共用同一 writer 链。首组 UP 的
+    // previous writer 是本 batch Alloc；后续组是前一 UP（task-4）。
+    // CAS 仍使用该值作 expected-old 并返回实际旧值，因此这里只省略
+    // CAS 前的三次重复 Load，不跳过共享状态一致性校验。
     const bool metadata_published =
         turn_ready &&
         // 当前 owner 已取得 task N 的 insert turn。producer P 的
         // descriptor/published 先于 P 的 deps_prepared，逐 task handoff
         // 又把该可见性传递到 N；这里保留 ref/task-id 校验，不再为三个
         // UP symbol 重读已经由有序链证明就绪的 published 控制字。
-        PublishSharedTaskWriterMetadata<Ops, false, false>(
-            state, context, writer_delta, stats
+        PublishSharedTaskWriterMetadata<
+            Ops, false, false, true
+        >(
+            state, context, writer_delta, stats,
+            expected_previous
         );
     const uint64_t metadata_end = metadata_published
         ? TraceTimestamp<Ops>(stats.trace, stats.result)

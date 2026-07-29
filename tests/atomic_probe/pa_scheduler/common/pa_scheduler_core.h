@@ -2059,13 +2059,15 @@ PA_DEVICE bool CommitSymbolSharedWriterIntentSet(
 // 原有等待 publication、收集 fanin 和逐项统计的合同，二者不能互换。
 template <
     typename Ops, bool ObserveAtomics = false,
-    bool CheckOutputPublished = true
+    bool CheckOutputPublished = true,
+    bool UseExpectedPrevious = false
 >
 PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
     PA_GM SharedTensorMapSidecar &map,
     const uint32_t *symbol_keys, uint32_t symbol_count,
     int32_t task_id, PA_GM volatile int32_t *fatal,
-    LocalStats *stats = nullptr
+    LocalStats *stats = nullptr,
+    int32_t expected_previous = -1
 ) {
     // 正式 ordered Submit 在 task-level completion 成功后统一记录完整
     // transaction；本 helper 固定不产生逐项成功统计，避免部分 CAS 前缀
@@ -2078,6 +2080,12 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
     }
     if (symbol_count == 0) {
         return true;
+    }
+    if constexpr (UseExpectedPrevious) {
+        if (expected_previous < 0 ||
+            expected_previous >= task_id) {
+            return false;
+        }
     }
 
     PA_GM SharedWriterHistoryCell &history =
@@ -2116,21 +2124,28 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
             return false;
         }
 
-        PA_GM volatile int64_t *last_writer =
-            &map.shared_outputs[
-                 static_cast<uint32_t>(
-                     output_ref.producer_task_id
-                 )
-             ].last_writer[
-                 static_cast<uint32_t>(output_ref.output_slot)
-             ].value;
-        const int64_t previous =
-            TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
-                stats == nullptr ? nullptr : &stats->trace,
-                stats == nullptr ? nullptr : &stats->result,
-                task_id, AtomicSite::SharedMetadataLastWriterLoad,
-                last_writer
-            );
+        int64_t previous =
+            static_cast<int64_t>(expected_previous);
+        if constexpr (!UseExpectedPrevious) {
+            PA_GM volatile int64_t *last_writer =
+                &map.shared_outputs[
+                     static_cast<uint32_t>(
+                         output_ref.producer_task_id
+                     )
+                 ].last_writer[
+                     static_cast<uint32_t>(
+                         output_ref.output_slot
+                     )
+                 ].value;
+            previous =
+                TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
+                    stats == nullptr ? nullptr : &stats->trace,
+                    stats == nullptr ? nullptr : &stats->result,
+                    task_id,
+                    AtomicSite::SharedMetadataLastWriterLoad,
+                    last_writer
+                );
+        }
         if (previous < output_ref.producer_task_id ||
             previous >= task_id) {
             return false;

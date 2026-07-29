@@ -12000,3 +12000,81 @@ metadata 局部约 22% 的改善和 perf-clock 同向，具备保留价值。
 - A5 mixed context `0,8192,16384,32768` 覆盖 G0/G1/G2/G4 和连续 UP
   history，全部检查通过；
 - 10 个候选 perf-clock B256 独立进程全部通过。
+
+### 2026-07-29：由 PA 计划推导 previous writer，保留 CAS 校验
+
+#### 推导合同
+
+上一阶段之后，每个 UP metadata 仍有三次
+`SharedMetadataLastWriterLoad`。它们读取的 previous writer 在当前 PA
+计划中并不是未知值：
+
+- group 0 的三个 accumulator symbol 都由本 batch Alloc 创建，预期
+  previous writer 为 `batch_start`；
+- group N（N > 0）继续写同三个 Alloc-origin symbol，预期 previous
+  writer 为前一组 UP，即 `task_id - 4`；
+- 三个 symbol 共用同一 writer 链。
+
+该规则已经同时存在于 device `SharedPaTaskMeta`、host task plan、依赖签名
+和 writer-history oracle 中。本次在进入 Materialize/Register 前由
+`batch_start/group_index` 计算一次 `expected_previous`，写 history 时直接
+使用它。
+
+真正的共享状态一致性检查没有删除：三个
+`SharedMetadataLastWriterCommit` CAS 仍以推导值为 expected-old，并消费
+返回值。若实际 last-writer 不一致，CAS 不改写控制字，metadata 返回失败，
+外层发布 fatal 且不 handoff 本 task。因此这是“省略 CAS 前的重复预读”，
+不是“相信本地值后直接覆盖共享状态”。
+
+通用 helper 仍默认从共享 last-writer 读取 previous；只有正式 PA Finish
+实例启用 `UseExpectedPrevious`。CPU 定向测试覆盖：
+
+- 推导实例对 last-writer 地址执行零次 Load；
+- 正确 expected-old 可以发布 history 和 writer；
+- 错误 expected-old 被 CAS 拒绝，last-writer 保持不变。
+
+#### A5 B256 与混合分组结果
+
+候选 full-swimlane 位于：
+
+`outputs/pa_scheduler_shared_swimlane_20260729_174753_2781678/ccec`
+
+site 24/26 `SharedMetadataOutputPublishedLoad/LastWriterLoad` 均为 `0`；
+site 27 `SharedMetadataLastWriterCommit` 仍精确为 `768`。host 对 256 份
+UP history 的 symbol key、previous writer 和最终 projection 全部检查
+通过。
+
+| 指标 | 上一阶段 | 本阶段 | 变化 |
+| --- | ---: | ---: | ---: |
+| UP metadata mean | 3.087 us | 2.440 us | -0.647 us / -21.0% |
+| UP metadata median | 3.081 us | 2.436 us | -0.646 us / -21.0% |
+| UP metadata p95 | 3.512 us | 2.754 us | -0.758 us / -21.6% |
+| full-swimlane Submit | 2452.175 us | 2449.341 us | -2.834 us / -0.12% |
+
+B256 默认 G1 只能覆盖 `previous=batch_start`。另行运行 mixed context
+`0,8192,16384,32768`，覆盖 G0/G1/G2/G4 和连续三次
+`previous=task_id-4`，host history、依赖签名、projection、真实计算与所有
+终态检查全部通过。
+
+perf-clock 独立运行 10 次：
+
+`2307.920、2307.626、2287.493、2323.688、2297.714、2299.457、`
+`2308.189、2315.809、2297.450、2303.637 us`
+
+本阶段 mean/median 为 `2304.898/2305.632 us`，范围
+`2287.493～2323.688 us`；上一阶段为
+`2314.235/2315.601 us`，范围 `2294.210～2330.868 us`。mean 改善
+`9.336 us（0.403%）`，median 改善 `9.970 us（0.431%）`。端到端幅度
+仍小且区间重叠，但 768 次串行区原子预读被精确消除，UP 局部约 21% 的
+改善清晰，且 CAS 保留了实际共享状态校验，因此保留。
+
+相对最初精确基线，三阶段累计把 UP metadata mean 从 `4.330 us` 降到
+`2.440 us（-43.6%）`，perf-clock 中位数从 `2501.246 us` 降到
+`2305.632 us（-7.82%）`。
+
+正确性验证：
+
+- CPU shared 全套门槛及 expected-previous 正/负向测试通过；
+- A5 B256 full-swimlane 全部检查通过；
+- A5 mixed G0/G1/G2/G4 全部检查通过；
+- 10 个候选 B256 perf-clock 独立进程全部通过。
