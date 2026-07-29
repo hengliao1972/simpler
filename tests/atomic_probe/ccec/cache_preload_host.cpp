@@ -30,6 +30,7 @@ struct KernelArgs {
 
 struct Sample {
     cache_preload::ProbeResult result{};
+    uint64_t target_value = 0;
 };
 
 static_assert(sizeof(KernelArgs) == sizeof(uint64_t), "unexpected CCEC kernel argument ABI");
@@ -55,6 +56,14 @@ const char *ModeName(cache_preload::Mode mode) {
         return "dcache-baseline";
     case cache_preload::Mode::DCachePreload:
         return "dcache-preload";
+    case cache_preload::Mode::DCacheStoreBaseline:
+        return "dstore-only-baseline";
+    case cache_preload::Mode::DCacheStorePreload:
+        return "dstore-only-preload";
+    case cache_preload::Mode::DCachePublishBaseline:
+        return "dpublish-gm-baseline";
+    case cache_preload::Mode::DCachePublishPreload:
+        return "dpublish-gm-preload";
     case cache_preload::Mode::ICacheColdBaseline:
         return "icache-cold";
     case cache_preload::Mode::ICacheCurrentPcAsync:
@@ -66,6 +75,20 @@ const char *ModeName(cache_preload::Mode mode) {
     }
     return "unknown";
 }
+
+bool IsDCacheReadMode(cache_preload::Mode mode) {
+    return mode == cache_preload::Mode::DCacheBaseline || mode == cache_preload::Mode::DCachePreload;
+}
+
+bool IsDCacheStoreMode(cache_preload::Mode mode) {
+    return mode == cache_preload::Mode::DCacheStoreBaseline || mode == cache_preload::Mode::DCacheStorePreload;
+}
+
+bool IsDCachePublishMode(cache_preload::Mode mode) {
+    return mode == cache_preload::Mode::DCachePublishBaseline || mode == cache_preload::Mode::DCachePublishPreload;
+}
+
+bool IsDCacheWriteMode(cache_preload::Mode mode) { return IsDCacheStoreMode(mode) || IsDCachePublishMode(mode); }
 
 uint64_t Median(std::vector<uint64_t> values) {
     std::sort(values.begin(), values.end());
@@ -86,6 +109,20 @@ bool RunOne(
     auto *state_bytes = reinterpret_cast<uint8_t *>(state_device);
     void *control_device = state_bytes + offsetof(cache_preload::ProbeState, control);
     void *result_device = state_bytes + offsetof(cache_preload::ProbeState, result);
+    void *target_device =
+        state_bytes + offsetof(cache_preload::ProbeState, data) + static_cast<size_t>(target_word) * sizeof(uint64_t);
+    if (IsDCacheWriteMode(mode)) {
+        const uint64_t initial_value = cache_preload::DataValue(target_word);
+        if (!Check(
+                aclrtMemcpy(
+                    target_device, sizeof(initial_value), &initial_value, sizeof(initial_value),
+                    ACL_MEMCPY_HOST_TO_DEVICE
+                ),
+                "aclrtMemcpy(H2D write target reset)"
+            )) {
+            return false;
+        }
+    }
     if (!Check(
             aclrtMemcpy(control_device, sizeof(control), &control, sizeof(control), ACL_MEMCPY_HOST_TO_DEVICE),
             "aclrtMemcpy(H2D control)"
@@ -110,6 +147,15 @@ bool RunOne(
             ),
             "aclrtMemcpy(D2H result)"
         )) {
+        return false;
+    }
+    if (IsDCacheWriteMode(mode) && !Check(
+                                       aclrtMemcpy(
+                                           &sample->target_value, sizeof(sample->target_value), target_device,
+                                           sizeof(sample->target_value), ACL_MEMCPY_DEVICE_TO_HOST
+                                       ),
+                                       "aclrtMemcpy(D2H write target)"
+                                   )) {
         return false;
     }
     return true;
@@ -137,14 +183,37 @@ bool ValidateSample(
         return false;
     }
 
-    if (mode == cache_preload::Mode::DCacheBaseline || mode == cache_preload::Mode::DCachePreload) {
+    if (IsDCacheReadMode(mode)) {
         if (result.value != cache_preload::DataValue(target_word)) {
             *reason = "dcache-load-value";
             return false;
         }
         if (result.preparation_checksum != 0 || result.icache_immediate_status != 0 ||
-            result.icache_final_status != 0 || result.icache_polls != 0) {
+            result.icache_final_status != 0 || result.icache_polls != 0 || result.store_flush_ticks != 0) {
             *reason = "dcache-unexpected-icache-fields";
+            return false;
+        }
+    } else if (IsDCacheWriteMode(mode)) {
+        const uint64_t expected_value = cache_preload::WriteValue(target_word, seed, expected_gap);
+        if (result.preparation_checksum != expected_value) {
+            *reason = "dcache-writer-local-value";
+            return false;
+        }
+        if (result.value != expected_value) {
+            *reason = "dcache-bypass-value-after-cleanup";
+            return false;
+        }
+        if (sample.target_value != expected_value) {
+            *reason = "dcache-host-visible-value";
+            return false;
+        }
+        if ((IsDCacheStoreMode(mode) && result.store_flush_ticks != 0) ||
+            (IsDCachePublishMode(mode) && result.store_flush_ticks == 0)) {
+            *reason = "dcache-store-flush-window";
+            return false;
+        }
+        if (result.icache_immediate_status != 0 || result.icache_final_status != 0 || result.icache_polls != 0) {
+            *reason = "dcache-write-unexpected-icache-fields";
             return false;
         }
     } else {
@@ -161,6 +230,10 @@ bool ValidateSample(
             *reason = "icache-wait-did-not-reach-idle";
             return false;
         }
+        if (result.store_flush_ticks != 0) {
+            *reason = "icache-unexpected-store-flush";
+            return false;
+        }
     }
 
     if (result.access_or_work_ticks == 0 || result.total_ticks == 0) {
@@ -173,6 +246,7 @@ bool ValidateSample(
 void PrintSummary(cache_preload::Mode mode, const std::vector<Sample> &samples) {
     std::vector<uint64_t> issue;
     std::vector<uint64_t> access_or_work;
+    std::vector<uint64_t> store_flush;
     std::vector<uint64_t> total;
     std::vector<uint64_t> polls;
     uint32_t immediate_busy = 0;
@@ -180,16 +254,18 @@ void PrintSummary(cache_preload::Mode mode, const std::vector<Sample> &samples) 
     for (const Sample &sample : samples) {
         issue.push_back(sample.result.issue_ticks);
         access_or_work.push_back(sample.result.access_or_work_ticks);
+        store_flush.push_back(sample.result.store_flush_ticks);
         total.push_back(sample.result.total_ticks);
         polls.push_back(sample.result.icache_polls);
         immediate_busy += sample.result.icache_immediate_status != 0 ? 1U : 0U;
         final_busy += sample.result.icache_final_status != 0 ? 1U : 0U;
     }
     std::printf(
-        "%-19s issue=%6llu access/work=%6llu total=%6llu polls=%5llu "
+        "%-21s issue=%6llu access/work=%6llu store->gm=%6llu total=%6llu polls=%5llu "
         "immediate_busy=%u/%zu final_busy=%u/%zu\n",
         ModeName(mode), static_cast<unsigned long long>(Median(std::move(issue))),
         static_cast<unsigned long long>(Median(std::move(access_or_work))),
+        static_cast<unsigned long long>(Median(std::move(store_flush))),
         static_cast<unsigned long long>(Median(std::move(total))),
         static_cast<unsigned long long>(Median(std::move(polls))), immediate_busy, samples.size(), final_busy,
         samples.size()
@@ -252,12 +328,14 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
-    constexpr std::array<cache_preload::Mode, 5> kModes = {
-        cache_preload::Mode::DCacheBaseline,      cache_preload::Mode::DCachePreload,
-        cache_preload::Mode::ICacheColdBaseline,  cache_preload::Mode::ICacheCurrentPcAsync,
+    constexpr std::array<cache_preload::Mode, 9> kModes = {
+        cache_preload::Mode::DCacheBaseline,        cache_preload::Mode::DCachePreload,
+        cache_preload::Mode::DCacheStoreBaseline,   cache_preload::Mode::DCacheStorePreload,
+        cache_preload::Mode::DCachePublishBaseline, cache_preload::Mode::DCachePublishPreload,
+        cache_preload::Mode::ICacheColdBaseline,    cache_preload::Mode::ICacheCurrentPcAsync,
         cache_preload::Mode::ICacheCurrentPcWait,
     };
-    std::array<std::vector<Sample>, 5> samples;
+    std::array<std::vector<Sample>, 9> samples;
     bool launch_ok = true;
     bool semantic_ok = true;
     for (uint32_t sample_index = 0; sample_index < cache_preload::kSamples; ++sample_index) {
@@ -274,11 +352,13 @@ int main(int argc, char **argv) {
                 std::fprintf(
                     stderr,
                     "[MISMATCH] sample=%u mode=%s reason=%s value=0x%llx "
-                    "issue=%llu access/work=%llu total=%llu immediate=%llu "
+                    "target=0x%llx issue=%llu access/work=%llu store->gm=%llu total=%llu immediate=%llu "
                     "final=%llu polls=%llu\n",
                     sample_index, ModeName(mode), reason.c_str(), static_cast<unsigned long long>(sample.result.value),
+                    static_cast<unsigned long long>(sample.target_value),
                     static_cast<unsigned long long>(sample.result.issue_ticks),
                     static_cast<unsigned long long>(sample.result.access_or_work_ticks),
+                    static_cast<unsigned long long>(sample.result.store_flush_ticks),
                     static_cast<unsigned long long>(sample.result.total_ticks),
                     static_cast<unsigned long long>(sample.result.icache_immediate_status),
                     static_cast<unsigned long long>(sample.result.icache_final_status),
@@ -293,7 +373,7 @@ int main(int argc, char **argv) {
 
     atomic_probe::Result result;
     result.Expect(launch_ok, "CCEC cache preload launches and result copies");
-    result.Expect(semantic_ok, "CCEC cache preload values and status contract");
+    result.Expect(semantic_ok, "CCEC cache preload values, write publication, and status contract");
 
     std::printf(
         "=== A5 pure CCEC Cache Preload Usage Probe ===\n"

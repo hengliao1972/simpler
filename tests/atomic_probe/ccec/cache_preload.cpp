@@ -55,6 +55,28 @@ __aicore__ __attribute__((always_inline)) inline uint64_t CycleAfterValue(uint64
     return cycle;
 }
 
+__aicore__ __attribute__((always_inline)) inline uint64_t CycleBeforeStore(uint64_t &address, uint64_t &value) {
+    uint64_t cycle = 0;
+    asm volatile("MOV %2, SYS_CNT\n"
+                 "MOV %0, %0\n"
+                 "MOV %1, %1\n"
+                 : "+l"(address), "+l"(value), "=&l"(cycle)
+                 :
+                 : "memory");
+    return cycle;
+}
+
+__aicore__ __attribute__((always_inline)) inline uint64_t CycleAfterStore(uint64_t &address, uint64_t &value) {
+    uint64_t cycle = 0;
+    asm volatile("MOV %0, %0\n"
+                 "MOV %1, %1\n"
+                 "MOV %2, SYS_CNT\n"
+                 : "+l"(address), "+l"(value), "=&l"(cycle)
+                 :
+                 : "memory");
+    return cycle;
+}
+
 __aicore__ __attribute__((always_inline)) inline uint64_t OpaqueIdentity(uint64_t value) {
     asm volatile("MOV %0, %0\n" : "+l"(value) : : "memory");
     return value;
@@ -62,14 +84,16 @@ __aicore__ __attribute__((always_inline)) inline uint64_t OpaqueIdentity(uint64_
 
 __aicore__ __attribute__((always_inline)) inline void PublishResult(
     __gm__ cache_preload::ProbeResult *result, uint64_t value, uint64_t preparation_checksum, uint64_t gap_checksum,
-    uint64_t issue_ticks, uint64_t access_or_work_ticks, uint64_t total_ticks, uint64_t immediate_status,
-    uint64_t final_status, uint64_t polls, uint32_t mode, uint32_t target_word, uint32_t gap_rounds
+    uint64_t issue_ticks, uint64_t access_or_work_ticks, uint64_t store_flush_ticks, uint64_t total_ticks,
+    uint64_t immediate_status, uint64_t final_status, uint64_t polls, uint32_t mode, uint32_t target_word,
+    uint32_t gap_rounds
 ) {
     st_dev_b64(&result->value, value);
     st_dev_b64(&result->preparation_checksum, preparation_checksum);
     st_dev_b64(&result->gap_checksum, gap_checksum);
     st_dev_b64(&result->issue_ticks, issue_ticks);
     st_dev_b64(&result->access_or_work_ticks, access_or_work_ticks);
+    st_dev_b64(&result->store_flush_ticks, store_flush_ticks);
     st_dev_b64(&result->total_ticks, total_ticks);
     st_dev_b64(&result->icache_immediate_status, immediate_status);
     st_dev_b64(&result->icache_final_status, final_status);
@@ -156,7 +180,7 @@ extern "C" __aicore__ __attribute__((noinline, used, aligned(128))) void cache_p
     const uint64_t work_end = CycleAfterValue(work_value);
 
     PublishResult(
-        result, work_value, preparation_checksum, gap_checksum, issue_ticks, work_end - work_begin,
+        result, work_value, preparation_checksum, gap_checksum, issue_ticks, work_end - work_begin, 0,
         work_end - total_begin, immediate_status, final_status, polls, mode_value, target_word, gap_rounds
     );
 }
@@ -208,8 +232,75 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(cache_preload)(__gm__ cache_p
         const uint64_t access_end = CycleAfterValue(value);
 
         PublishResult(
-            result, value, 0, gap_checksum, issue_ticks, access_end - access_begin, access_end - total_begin, 0, 0, 0,
-            mode_value, target_word, gap_rounds
+            result, value, 0, gap_checksum, issue_ticks, access_end - access_begin, 0, access_end - total_begin, 0, 0,
+            0, mode_value, target_word, gap_rounds
+        );
+        return;
+    }
+
+    if (mode_value == static_cast<uint32_t>(cache_preload::Mode::DCacheStoreBaseline) ||
+        mode_value == static_cast<uint32_t>(cache_preload::Mode::DCacheStorePreload) ||
+        mode_value == static_cast<uint32_t>(cache_preload::Mode::DCachePublishBaseline) ||
+        mode_value == static_cast<uint32_t>(cache_preload::Mode::DCachePublishPreload)) {
+        __gm__ uint64_t *target = &state->data[target_word];
+
+        // Both write scenarios start from the same cold, clean cache line.
+        // Host resets the target word before every launch. This DCCI/DSB pair
+        // is setup outside the timed interval.
+        dcci(target, SINGLE_CACHE_LINE);
+        dsb(DSB_ALL);
+
+        const bool use_preload = mode_value == static_cast<uint32_t>(cache_preload::Mode::DCacheStorePreload) ||
+                                 mode_value == static_cast<uint32_t>(cache_preload::Mode::DCachePublishPreload);
+        const bool publish_to_gm = mode_value == static_cast<uint32_t>(cache_preload::Mode::DCachePublishBaseline) ||
+                                   mode_value == static_cast<uint32_t>(cache_preload::Mode::DCachePublishPreload);
+
+        const uint64_t total_begin = ReadOrderedCycle();
+        uint64_t issue_ticks = 0;
+        if (use_preload) {
+            const uint64_t issue_begin = ReadOrderedCycle();
+            const int64_t byte_offset = static_cast<int64_t>(target_word) * sizeof(uint64_t);
+            dc_preload(state->data, byte_offset);
+            const uint64_t issue_end = ReadOrderedCycle();
+            issue_ticks = issue_end - issue_begin;
+        }
+
+        const uint64_t gap_checksum = cache_preload_gap(seed, gap_rounds);
+        const uint64_t opaque_gap = OpaqueIdentity(gap_checksum);
+        const uint64_t address_delta = opaque_gap - gap_checksum;
+        uint64_t target_address = reinterpret_cast<uint64_t>(target) + address_delta;
+        uint64_t store_value = cache_preload::WriteValue(target_word, seed, gap_checksum);
+        volatile __gm__ uint64_t *volatile_target = reinterpret_cast<volatile __gm__ uint64_t *>(target_address);
+
+        const uint64_t store_begin = CycleBeforeStore(target_address, store_value);
+        *volatile_target = store_value;
+        const uint64_t store_end = CycleAfterStore(target_address, store_value);
+
+        uint64_t total_end = store_end;
+        uint64_t store_flush_ticks = 0;
+        if (publish_to_gm) {
+            // This is part of the publish-to-GM scenario only. The official
+            // CACHELINE_OUT contract makes the DCache line consistent with
+            // GM; DSB completes that measured publication sequence.
+            dcci(target, SINGLE_CACHE_LINE, CACHELINE_OUT);
+            dsb(DSB_ALL);
+            total_end = ReadOrderedCycle();
+            store_flush_ticks = total_end - store_begin;
+        }
+
+        // The ordinary read validates the writer core's cached value. For the
+        // store-only scenario, publication is deliberately deferred until
+        // after total_end and is probe cleanup, not measured business work.
+        const uint64_t local_value = *volatile_target;
+        if (!publish_to_gm) {
+            dcci(target, SINGLE_CACHE_LINE, CACHELINE_OUT);
+            dsb(DSB_ALL);
+        }
+        const uint64_t gm_value = ld_dev_b64(target);
+
+        PublishResult(
+            result, gm_value, local_value, gap_checksum, issue_ticks, store_end - store_begin, store_flush_ticks,
+            total_end - total_begin, 0, 0, 0, mode_value, target_word, gap_rounds
         );
         return;
     }

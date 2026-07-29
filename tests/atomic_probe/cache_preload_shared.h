@@ -38,14 +38,22 @@ constexpr uint32_t kICacheEvictorNops = 8192;
 enum class Mode : uint32_t {
     DCacheBaseline = 0,
     DCachePreload = 1,
-    ICacheColdBaseline = 2,
-    ICacheCurrentPcAsync = 3,
-    ICacheCurrentPcWait = 4,
-    Count = 5,
+    DCacheStoreBaseline = 2,
+    DCacheStorePreload = 3,
+    DCachePublishBaseline = 4,
+    DCachePublishPreload = 5,
+    ICacheColdBaseline = 6,
+    ICacheCurrentPcAsync = 7,
+    ICacheCurrentPcWait = 8,
+    Count = 9,
 };
 
 CACHE_PRELOAD_SHARED_FN constexpr uint64_t DataValue(uint32_t index) {
     return 0xa500000000000000ULL ^ (static_cast<uint64_t>(index) * 0x9e3779b97f4a7c15ULL);
+}
+
+CACHE_PRELOAD_SHARED_FN constexpr uint64_t WriteValue(uint32_t index, uint64_t seed, uint64_t gap_checksum) {
+    return 0x5a00000000000000ULL ^ (static_cast<uint64_t>(index) * 0xd6e8feb86659fd93ULL) ^ seed ^ gap_checksum;
 }
 
 // This intentionally remains a runtime loop in each device kernel: gap_rounds is
@@ -93,15 +101,16 @@ struct alignas(64) ProbeResult {
     uint64_t gap_checksum;
     uint64_t issue_ticks;
     uint64_t access_or_work_ticks;
+    uint64_t store_flush_ticks;
     uint64_t total_ticks;
     uint64_t icache_immediate_status;
-    uint64_t icache_final_status;
 
+    uint64_t icache_final_status;
     uint64_t icache_polls;
     uint64_t mode_echo;
     uint64_t target_word_echo;
     uint64_t gap_rounds_echo;
-    uint64_t reserved[4];
+    uint64_t reserved[3];
 };
 
 struct alignas(64) ProbeState {
