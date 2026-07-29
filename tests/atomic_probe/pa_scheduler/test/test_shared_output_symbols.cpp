@@ -1749,6 +1749,144 @@ void TestConsumerWaitsForDelayedPublication() {
     );
 }
 
+void TestPaUpSplitWriterPublicationStages() {
+    SchedulerState *state = MapSparseSchedulerState();
+    if (state == nullptr) {
+        ++g_failures;
+        return;
+    }
+    ResetSharedState(state->shared_map);
+    constexpr int32_t kProducer = 0;
+    constexpr int32_t kPredecessor = 3;
+    constexpr int32_t kWriter = 4;
+    state->tasks[kPredecessor].deps_prepared = -1;
+    state->tasks[kWriter].deps_prepared = -1;
+    SharedOutputCell &cell =
+        state->shared_map.shared_outputs[kProducer];
+    for (uint32_t slot = 0; slot < 3; ++slot) {
+        cell.published[slot].value = kProducer;
+        cell.last_writer[slot].value = kProducer;
+    }
+    const uint32_t key_base =
+        static_cast<uint32_t>(kProducer) *
+            kSharedOutputMaxPerTask +
+        1U;
+    const uint32_t symbol_keys[3] = {
+        key_base + 2U, key_base + 1U, key_base
+    };
+    LocalStats stats{};
+
+    Check(
+        PublishTrustedPaUpWriterHistoryPayload<SymbolTestOps>(
+            state->shared_map, symbol_keys, kWriter,
+            kProducer, kProducer, &stats
+        ),
+        "PA UP split path prepares immutable history before the turn"
+    );
+    const SharedWriterHistoryCell &history =
+        state->shared_map.writer_history[kWriter];
+    bool prepared_but_unpublished =
+        history.magic == kSharedWriterHistoryMagic &&
+        history.writer_task == kWriter &&
+        history.count == 3 &&
+        state->tasks[kWriter].deps_prepared == -1;
+    for (uint32_t index = 0; index < 3; ++index) {
+        prepared_but_unpublished &=
+            history.entries[index].symbol_key ==
+                symbol_keys[index] &&
+            history.entries[index].previous_writer ==
+                kProducer &&
+            cell.last_writer[index].value == kProducer;
+    }
+    Check(
+        prepared_but_unpublished,
+        "prepared PA UP history remains unreachable before last-writer CAS"
+    );
+
+    TaskArgs early_reader_args;
+    ConstructTaskArgs(early_reader_args);
+    AppendSharedOutputRef(
+        early_reader_args,
+        FdwicOutputRef{kProducer, 0, 0, 0, 0, 0},
+        TensorArgType::Input
+    );
+    int32_t early_fanin[kMaxFanin] = {};
+    bool early_protocol_ok = false;
+    uint32_t early_ordinary_lookups = UINT32_MAX;
+    LocalStats early_stats{};
+    const uint32_t early_count =
+        CollectSharedFanin<SymbolTestOps, false, true>(
+            state->shared_map, early_reader_args,
+            /*task_id=*/2, kHeapWindow, early_stats,
+            early_fanin, early_protocol_ok,
+            early_ordinary_lookups
+        );
+    Check(
+        early_protocol_ok && early_count == 1 &&
+            early_fanin[0] == kProducer &&
+            cell.last_writer[0].value == kProducer,
+        "reader cannot discover a pre-turn orphan history"
+    );
+
+    state->tasks[kPredecessor].deps_prepared = kPredecessor;
+    int64_t ready_observed = -1;
+    Check(
+        WaitForSharedTaskInsertTurn<SymbolTestOps>(
+            state, kWriter, stats, ready_observed
+        ) &&
+            ready_observed == kPredecessor &&
+            CommitTrustedPaUpLastWriters<SymbolTestOps>(
+                state->shared_map, kWriter,
+                kProducer, kProducer, &stats
+            ),
+        "PA UP split path publishes three writers only after acquiring the turn"
+    );
+    int32_t later_fanin[kMaxFanin] = {};
+    bool later_protocol_ok = false;
+    uint32_t later_ordinary_lookups = UINT32_MAX;
+    LocalStats later_stats{};
+    const uint32_t later_count =
+        CollectSharedFanin<SymbolTestOps, false, true>(
+            state->shared_map, early_reader_args,
+            /*task_id=*/5, kHeapWindow, later_stats,
+            later_fanin, later_protocol_ok,
+            later_ordinary_lookups
+        );
+    Check(
+        later_protocol_ok && later_count == 1 &&
+            later_fanin[0] == kWriter &&
+            cell.last_writer[0].value == kWriter,
+        "reader discovers the prepared history only after last-writer CAS"
+    );
+
+    ResetSharedState(state->shared_map);
+    for (uint32_t slot = 0; slot < 3; ++slot) {
+        cell.published[slot].value = kProducer;
+        cell.last_writer[slot].value = kProducer;
+    }
+    Check(
+        PublishTrustedPaUpWriterHistoryPayload<SymbolTestOps>(
+            state->shared_map, symbol_keys, kWriter,
+            kProducer, kProducer, &stats
+        ),
+        "partial-CAS setup republishes the immutable history"
+    );
+    cell.last_writer[1].value = 1;
+    Check(
+        !CommitTrustedPaUpLastWriters<SymbolTestOps>(
+            state->shared_map, kWriter,
+            kProducer, kProducer, &stats
+        ) &&
+            state->shared_map.writer_history[kWriter].magic ==
+                kSharedWriterHistoryMagic &&
+            cell.last_writer[2].value == kWriter &&
+            cell.last_writer[1].value == 1 &&
+            cell.last_writer[0].value == kProducer,
+        "split PA UP commit preserves its terminal partial-CAS prefix"
+    );
+    UnmapSparseSchedulerState(state);
+}
+
 void TestOrderedPreparedSymbolUsesSinglePublicationCheck() {
     auto map = std::make_unique<SharedTensorMapSidecar>();
     ResetSharedState(*map);
@@ -2346,6 +2484,7 @@ int main() {
     TestPublicationPreflightIsAllOrNothing();
     TestPublicationCommitFaultsRollback();
     TestConsumerWaitsForDelayedPublication();
+    TestPaUpSplitWriterPublicationStages();
     TestOrderedPreparedSymbolUsesSinglePublicationCheck();
     TestPublicationWaitFailuresFailClosed();
     TestInvalidReferencesFailClosed();

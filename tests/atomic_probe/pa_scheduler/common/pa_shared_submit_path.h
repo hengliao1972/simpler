@@ -683,14 +683,6 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
-    if (writer_delta.symbol_count != 0) {
-        // history cell 按 task 独占。趁本 task 尚未进入全局 insert turn，
-        // 先把其首条 cache line 预取到本核 DCache；后续 predecessor wait
-        // 提供异步 lead。该 hint 不替代 metadata 的 DCCI/DSB/CAS。
-        Ops::PreloadDataCache(
-            &state->shared_map.writer_history[task_id]
-        );
-    }
 #if !PA_BUILD_TRACE_FREE
     // 只初始化实际会写入的计数；每组端点在对应 DCCI/CAS 执行时覆盖，
     // 避免为每个非 UP winner 清零整块 72B 本地对象。
@@ -698,6 +690,26 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     writer_metadata_trace.history_dcci_lines = 0;
     writer_metadata_trace.writer_cas_count = 0;
 #endif
+    // UP history cell 由本 task 独占，payload 又已经通过上面的 PA shape
+    // 校验。先在并行 Materialize 尾部写入 header+3 records 并完成原有
+    // 单行 DCCI；它在 last_writer CAS 前不可达，不提前发布 writer。
+    const bool writer_history_prepared =
+        writer_delta.symbol_count == 0 ||
+        PublishTrustedPaUpWriterHistoryPayload<Ops, true>(
+            state->shared_map, writer_delta.symbol_keys,
+            static_cast<int32_t>(task_id), expected_previous,
+            static_cast<int32_t>(task_meta.batch_start), &stats
+#if !PA_BUILD_TRACE_FREE
+            , &writer_metadata_trace
+#endif
+        );
+    if (!writer_history_prepared) {
+        EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(
+            pmu_context
+        );
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
     EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(
         pmu_context
     );
@@ -732,20 +744,24 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     // CAS 前的三次重复 Load，不跳过共享状态一致性校验。
     const bool metadata_published =
         turn_ready &&
-        // 当前 owner 已取得 task N 的 insert turn。producer P 的
-        // descriptor/published 先于 P 的 deps_prepared，逐 task handoff
-        // 又把该可见性传递到 N；这里保留 ref/task-id 校验，不再为三个
-        // UP symbol 重读已经由有序链证明就绪的 published 控制字。
-        PublishSharedTaskWriterMetadata<
-            Ops, false, false, true, true, true
-        >(
-            state, context, writer_delta, stats,
+        (writer_delta.symbol_count == 0 ||
+         // history payload 已在 Materialize 尾部完成 DCCI；取得 turn 后
+         // 只用三次 return-ready CAS 发布各 accumulator 的 latest writer。
+         CommitTrustedPaUpLastWriters<Ops, true>(
+            state->shared_map, static_cast<int32_t>(task_id),
             expected_previous,
-            static_cast<int32_t>(task_meta.batch_start)
+            static_cast<int32_t>(task_meta.batch_start), &stats
 #if !PA_BUILD_TRACE_FREE
             , &writer_metadata_trace
 #endif
+        ));
+    if (turn_ready && !metadata_published) {
+        // 三项 CAS 不是事务；冲突时保留已经线性化的前缀，但整轮必须
+        // 进入 terminal fatal，且不得发布本 task 的 insert completion。
+        SetFatal<Ops>(
+            state, stats, static_cast<int32_t>(task_id)
         );
+    }
     const uint64_t metadata_end = metadata_published
         ? TraceTimestamp<Ops>(stats.trace, stats.result)
         : metadata_begin;

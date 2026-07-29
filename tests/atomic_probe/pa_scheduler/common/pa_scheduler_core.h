@@ -2072,6 +2072,146 @@ PA_DEVICE bool CommitSymbolSharedWriterIntentSet(
     return true;
 }
 
+// 正式 PA-UP 专路的第一段：writer shape 已在 Materialize 尾部验证，
+// 本 task 又独占 writer_history[task_id]，所以可以在等待 predecessor
+// 之前发布 immutable payload。它此时只是不可达的准备态；各 symbol 的
+// last_writer CAS 仍是 reader 唯一的发布边界。
+template <typename Ops, bool ObserveDcci = false>
+PA_DEVICE bool PublishTrustedPaUpWriterHistoryPayload(
+    PA_GM SharedTensorMapSidecar &map,
+    const uint32_t *symbol_keys, int32_t task_id,
+    int32_t expected_previous, int32_t expected_producer,
+    LocalStats *stats = nullptr
+#if !PA_BUILD_TRACE_FREE
+    , DeferredSharedWriterMetadataTrace *deferred_trace = nullptr
+#endif
+) {
+    if (symbol_keys == nullptr || task_id < 0 ||
+        task_id >= static_cast<int32_t>(kMaxTasks) ||
+        expected_producer < 0 ||
+        expected_producer >= task_id ||
+        expected_previous < expected_producer ||
+        expected_previous >= task_id) {
+        return false;
+    }
+    const uint32_t key_base =
+        static_cast<uint32_t>(expected_producer) *
+            kSharedOutputMaxPerTask +
+        1U;
+    if (symbol_keys[0] != key_base + 2U ||
+        symbol_keys[1] != key_base + 1U ||
+        symbol_keys[2] != key_base) {
+        return false;
+    }
+
+    PA_GM SharedWriterHistoryCell &history =
+        map.writer_history[static_cast<uint32_t>(task_id)];
+    PA_LOOP_NOUNROLL
+    for (uint32_t index = 0; index < 3; ++index) {
+        history.entries[index].symbol_key = symbol_keys[index];
+        history.entries[index].previous_writer =
+            expected_previous;
+    }
+    history.magic = kSharedWriterHistoryMagic;
+    history.writer_task = task_id;
+    history.count = 3;
+    history.reserved = 0;
+    constexpr uint64_t kHistoryBytes =
+        offsetof(SharedWriterHistoryCell, entries) +
+        3U * sizeof(SharedWriterHistoryRecord);
+#if PA_BUILD_TRACE_FREE
+    (void)TraceConfiguredDcciFlush<Ops, ObserveDcci>(
+        stats == nullptr ? nullptr : &stats->trace,
+        task_id, -1, DcciSite::SharedWriterHistoryFlush,
+        &history, kHistoryBytes
+    );
+#else
+    if (deferred_trace != nullptr && stats != nullptr) {
+        deferred_trace->history_dcci_lines =
+            CaptureDcciFlush<Ops>(
+                stats->trace, &history, kHistoryBytes,
+                deferred_trace->history_dcci_begin,
+                deferred_trace->history_dcci_end
+            );
+    } else {
+        (void)TraceConfiguredDcciFlush<Ops, ObserveDcci>(
+            stats == nullptr ? nullptr : &stats->trace,
+            task_id, -1, DcciSite::SharedWriterHistoryFlush,
+            &history, kHistoryBytes
+        );
+    }
+#endif
+    Ops::StoreBarrier();
+    return true;
+}
+
+// 正式 PA-UP 专路的第二段：上面的 payload 已经 DCCI+DSB 完成，且
+// predecessor turn 已由调用方取得。成功路径只按固定 2/1/0 顺序执行
+// 三次 return-ready CAS；不再读取或写回 writer_history。
+template <typename Ops, bool ObserveAtomics = false>
+PA_DEVICE bool CommitTrustedPaUpLastWriters(
+    PA_GM SharedTensorMapSidecar &map, int32_t task_id,
+    int32_t expected_previous, int32_t expected_producer,
+    LocalStats *stats = nullptr
+#if !PA_BUILD_TRACE_FREE
+    , DeferredSharedWriterMetadataTrace *deferred_trace = nullptr
+#endif
+) {
+    PA_LOOP_NOUNROLL
+    for (uint32_t index = 0; index < 3; ++index) {
+        PA_GM volatile int64_t *last_writer =
+            &map.shared_outputs[
+                 static_cast<uint32_t>(expected_producer)
+             ].last_writer[2U - index].value;
+#if PA_BUILD_TRACE_FREE
+        if (TraceConfiguredAtomicCompareExchange<
+                Ops, ObserveAtomics
+            >(
+                stats == nullptr ? nullptr : &stats->trace,
+                stats == nullptr ? nullptr : &stats->result,
+                task_id,
+                AtomicSite::SharedMetadataLastWriterCommit,
+                last_writer,
+                static_cast<int64_t>(expected_previous),
+                static_cast<int64_t>(task_id)
+            ) != expected_previous) {
+            return false;
+        }
+#else
+        int64_t observed = INT64_MIN;
+        if (deferred_trace != nullptr && stats != nullptr &&
+            deferred_trace->writer_cas_count < 3) {
+            const uint32_t capture_index =
+                deferred_trace->writer_cas_count++;
+            observed = CaptureAtomicCompareExchange<Ops>(
+                stats->trace, last_writer,
+                static_cast<int64_t>(expected_previous),
+                static_cast<int64_t>(task_id),
+                deferred_trace->writer_cas_begin[capture_index],
+                deferred_trace->writer_cas_end[capture_index]
+            );
+        } else {
+            observed =
+                TraceConfiguredAtomicCompareExchange<
+                    Ops, ObserveAtomics
+                >(
+                    stats == nullptr ? nullptr : &stats->trace,
+                    stats == nullptr ? nullptr : &stats->result,
+                    task_id,
+                    AtomicSite::SharedMetadataLastWriterCommit,
+                    last_writer,
+                    static_cast<int64_t>(expected_previous),
+                    static_cast<int64_t>(task_id)
+                );
+        }
+        if (observed != expected_previous) {
+            return false;
+        }
+#endif
+    }
+    return true;
+}
+
 // ordered Submit 专用入口：调用方已经在 insert turn 外完成 symbol ref
 // 校验、去重和 packed-key 生成。这里不再扫描 args，也不构造随后会被
 // 丢弃的 fanin；previous writer 仍必须在取得 turn 后读取，才能写入当前

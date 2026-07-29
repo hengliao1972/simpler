@@ -12513,3 +12513,87 @@ mixed kernel 的 `.text` 十六进制内容，五项均逐字节相同。整 ELF
 - mixed context `0,8192,8193,32768` 全部通过，7 条 history DCCI 与
   21 次 writer CAS 保持原闭合关系；
 - trace-free 五个关键 `.text` 与上一提交逐字节相同。
+
+### 2026-07-29：把 UP writer history 移出全局有序段
+
+#### 协议依据与实现
+
+`writer_history[N]` 按 task 独占，写入后保持 immutable。设备 reader
+不会扫描 history magic；它先 atomic-load 某个 symbol 的
+`last_writer`，只有该值指向 N 时才可能读取 `writer_history[N]`。因此
+真正使 history 可达的线性化边界是三次 `last_writer` CAS，不是 payload
+本身的普通写或 DCCI。
+
+据此把正式 PA-UP 专路拆成两段：
+
+1. Materialize 尾部在本 task 独占 cell 中写 header 和三个
+   `2/1/0` history record，沿用原有单行 `CACHELINE_OUT + DSB`；
+2. 等待 `task[N-1].deps_prepared` 并取得插入顺序后，只按固定
+   `2/1/0` 顺序执行三次 return-ready CAS；
+3. 三项均成功后才发布 `task[N].deps_prepared`，随后 lookup/Build
+   继续离开全局有序链。
+
+多个 future owner 可以并行准备各自不可达的 history，但 CAS 与
+`deps_prepared` 仍按 task id 严格推进。若前序 fatal/timeout，允许留下
+magic 有效但没有任何 `last_writer` 引用的 orphan；若中途 CAS 冲突，
+继续保留已线性化前缀并设置 fatal，不回滚可能已经被 reader 看见的
+history。下一轮 `InitializeState` 统一清零。generic writer helper、
+非 UP、共享布局、DSB 数量和 raw ABI 均未修改。
+
+CPU 新门槛按阶段验证：
+
+- Wait 前 history 已完整准备，但三个 latest writer 和
+  `deps_prepared` 均未变化，reader 仍只得到旧 producer；
+- 前序完成字放行后，三次 CAS 才让后续 reader 得到当前 UP；
+- 第二次 CAS 冲突时保留完整 history、第一次 CAS 前缀和后续旧值，
+  正式 Finish 设置 fatal 且不发布本 task completion。
+
+#### A5 B256 结果
+
+候选 full-swimlane 位于：
+
+`outputs/pa_scheduler_shared_swimlane_20260729_195313_2907150/ccec`
+
+| 指标 | history 在 Register | history 在 Materialize | 变化 |
+| --- | ---: | ---: | ---: |
+| UP metadata mean | 1.547 us | 0.948 us | -0.598 us / -38.7% |
+| UP metadata median | 1.546 us | 0.892 us | -0.654 us / -42.3% |
+| UP Materialize mean | 5.006 us | 5.611 us | +0.605 us |
+| writer CAS mean | 0.256 us | 0.249 us | 仍精确为 768 次 |
+| history DCCI mean | 0.170 us | 0.174 us | 仍精确为 256 次 |
+| AIV Finish `.text` | `0xddb0` | `0xdd00` | -176 B |
+| full-swimlane Submit | 2451.922 us | 2421.040 us | -30.882 us / -1.26% |
+
+逐 task 时间关系检查全部闭合：
+
+- `256/256` 条 history DCCI 均完整落在对应 UP Materialize；
+- `256/256` 条 DCCI 均在 Register 开始前结束；
+- `256/256` 个 metadata 内没有 DCCI，并且恰好包含三次 writer CAS。
+
+Materialize 增量与 Register 减量近似相等，证明工作只是离开了全局串行
+链；full-swimlane 的 Submit 改善来自下一 owner 更早取得 turn，而不是
+删除 history 发布。
+
+perf-clock 独立运行 10 次：
+
+`2298.211、2313.275、2313.393、2310.601、2310.114、2333.388、`
+`2313.512、2315.097、2296.331、2311.873 us`
+
+mean/median 为 `2311.580/2312.574 us`，范围
+`2296.331～2333.388 us`；上一阶段为 `2310.943/2311.466 us`。mean
+变化 `+0.636 us（+0.028%）`，median 变化
+`+1.108 us（+0.048%）`，判为端到端中性。该结果符合“工作量不变、只
+缩短有序占用”的预期，也远低于 1% 回退门槛。
+
+相对最初精确基线，累计把 UP metadata mean 从 `4.330 us` 降至
+`0.948 us（-78.1%）`。
+
+正确性验证：
+
+- CPU shared 全套门槛及新增三阶段可见性/terminal 测试全部通过；
+- CCEC AIC/AIV 完整构建、split runtime/finish、mixed ELF 与零
+  relocation 检查通过；
+- A5 B256 execution、semantic、history、projection、atomic/DCCI
+  closure 和 Perfetto/exclusive 后处理全部通过；
+- mixed context `0,8192,8193,32768` 全部通过；
+- 10 个 B256 perf-clock 独立进程全部通过。
