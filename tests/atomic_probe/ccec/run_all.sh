@@ -14,8 +14,9 @@
 # runs it. Probes are AIV-only except the explicit caller-capture compiler
 # probes, which target AIC to match the affected orchestration build.
 #
-# All kernels are pure-CCEC (ccec_utils.h + lowercase builtins); no
-# kernel_operator.h, no AscendC APIs.
+# All kernels are pure CCEC; no kernel_operator.h or AscendC APIs. The shared
+# TensorMap visibility probe additionally includes and calls the production
+# FDWIC CCEC headers instead of copying their state machine.
 #
 # Usage:
 #   ./run_all.sh                 # build + run all
@@ -83,6 +84,7 @@ PROBES=(
     "ld_dev_fanout_publish.cpp:ld_dev_fanout_publish_kernel.o:ld_dev_fanout_publish_host.cpp:ld_dev_fanout_publish_host"
     "cacheline_matrix.cpp:cacheline_matrix_kernel.o:cacheline_matrix_host.cpp:cacheline_matrix_host"
     "taskcell_atomic_dcci.cpp:taskcell_atomic_dcci_kernel.o:taskcell_atomic_dcci_host.cpp:taskcell_atomic_dcci_host"
+    "shared_tensor_map_visibility_probe.cpp:shared_tensor_map_visibility_probe_kernel.o:shared_tensor_map_visibility_probe_host.cpp:shared_tensor_map_visibility_probe_host"
 )
 
 # These caller-capture build-shape probes are selectable by name but are not
@@ -134,8 +136,37 @@ build_one() {
     tag="$(basename "$ko" .o)"
 
     local probe_flags=(-DCCEC_SYNC_AIV_ONLY)
+    local kernel_inc_flags=("${INC_FLAGS[@]}")
+    local host_inc_flags=()
+    local host_definition_flags=()
     if [[ "$ks" == "cacheline_matrix.cpp" ]]; then
         probe_flags+=(-DCCEC_MATRIX_AIV_ONLY)
+    fi
+    if [[ "$ks" == "shared_tensor_map_visibility_probe.cpp" ]]; then
+        local repo_root
+        repo_root="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+        local fdwic_inc_flags=(
+            -I"$repo_root/src/a5/platform/onboard/aicore"
+            -I"$repo_root/src/a5/platform/include"
+            -I"$repo_root/src/common/platform/include"
+            -I"$repo_root/src/common/task_interface"
+            -I"$repo_root/src/common/log/include"
+            -I"$repo_root/src/common"
+            -I"$repo_root/src/a5/runtime/fully_distributed_within_core/runtime"
+            -I"$repo_root/src/a5/runtime/fully_distributed_within_core/common"
+            -I"$repo_root/src/a5/runtime/fully_distributed_within_core/orchestration"
+            -I"$repo_root/src/a5/runtime"
+        )
+        kernel_inc_flags+=("${fdwic_inc_flags[@]}")
+        host_inc_flags+=("${fdwic_inc_flags[@]}")
+        probe_flags+=(
+            -DPTO_FDWIC_SHARED_MAP=1
+            -DPTO_FDWIC_TENSORMAP_RING_CAP=128
+        )
+        host_definition_flags+=(
+            -DPTO_FDWIC_SHARED_MAP=1
+            -DPTO_FDWIC_TENSORMAP_RING_CAP=128
+        )
     fi
 
     local kernel_objects=()
@@ -191,7 +222,7 @@ build_one() {
     else
         echo "=== [$tag] Compiling AIV-only (dav-c310-vec) ==="
         "$CCEC" "${CCEC_FLAGS[@]}" --cce-aicore-arch=dav-c310-vec \
-            "${probe_flags[@]}" "${INC_FLAGS[@]}" \
+            "${probe_flags[@]}" "${kernel_inc_flags[@]}" \
             -o "$BUILD_DIR/${tag}_vec.o" "$SCRIPT_DIR/$ks"
         kernel_objects+=("$BUILD_DIR/${tag}_vec.o")
     fi
@@ -231,6 +262,8 @@ build_one() {
     echo "=== [$tag] Compiling host ==="
     g++ -O2 -std=c++17 \
         -I"$ASCEND_HOME_PATH/include" \
+        "${host_definition_flags[@]}" \
+        "${host_inc_flags[@]}" \
         "$SCRIPT_DIR/$hs" \
         -L"$ASCEND_HOME_PATH/x86_64-linux/lib64" \
         -Wl,-rpath,"$ASCEND_HOME_PATH/x86_64-linux/lib64" \
