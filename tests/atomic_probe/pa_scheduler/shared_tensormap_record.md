@@ -12218,3 +12218,92 @@ mean/median 为 `2311.087/2307.247 us`，范围
 - mixed context `0,8192,16384,32768` 覆盖 G0/G1/G2/G4、首组 Alloc
   previous 与后续 `task_id-4` previous，全部通过；
 - 10 个 B256 perf-clock 独立进程全部通过。
+
+### 2026-07-29：为 PA UP 收敛三 writer 紧凑发布路径
+
+#### 先证伪“只固定循环次数”
+
+第一版候选只把 symbol 循环上界固定为 3。AIV Finish `.text` 从
+`0xee80` 增至 `0xf200`，增加 `896 B（1.47%）`；UP metadata mean
+从 `2.055 us` 回退到 `2.154 us（+4.8%）`。这说明编译器展开三套
+atomic trace 与 key 解码代码会同时造成代码膨胀和局部回退，该候选已完整
+撤销，未混入正式结果。
+
+#### 保留的紧凑专路
+
+正式 PA 的 UP writer 集合具有比通用 writer helper 更强的合同：
+
+- 恰好三个 symbol；
+- 三项都属于同一个 batch Alloc producer；
+- slot 恰好覆盖 `0/1/2`，不能重复；
+- 三项共用由 PA task plan 推导出的 `expected_previous`；
+- standalone PA 的 ordinary writer 集合恒为空。
+
+本次在首次 history GM 写之前完整验证该形状，并按原 key index 把 slot
+压入一个 owner-local `uint32_t`。DCCI 后直接使用共同 producer、对应 slot
+和 `expected_previous` 计算三个 CAS 目标，不再逐项重新解码 key；history
+仍按原顺序完整发布，第二项 CAS 冲突时仍保留第一项已线性化的发布前缀。
+同时，PA 专路不再调用两个 count 为 0 的 ordinary preflight/append helper。
+
+空 writer 不能仅凭 `symbol_count==0` 判断合法性。正式 Finish 已在
+Materialize 前推导：
+
+- UP：`expected_previous >= 0`；
+- 非 UP：`expected_previous == -1`。
+
+Publisher 据此强制 UP 必须恰好三个 symbol、非 UP 必须为零，避免异常
+UP 丢失全部 writer 后仍 handoff `deps_prepared`。CPU 门槛同时覆盖：
+
+- 非 UP 空集合成功；
+- UP 空集合在 history/deps_prepared 发布前失败；
+- 数量为 2、slot 重复、producer 错误均在首次 history 写前失败；
+- `2/0/1` 乱序合法集合仍保持 history 与 CAS target 同 index 对应；
+- 第二项 CAS 冲突仍保留既有非事务前缀语义。
+
+只有 PA 形状预检循环保留 `NOUNROLL`；history 写与 CAS 公共循环不施加
+额外编译指令，避免把 PA 的代码生成选择扩散到 generic 实例。
+
+#### A5 B256 结果
+
+修正空 writer 合同并隔离 generic 循环后的 full-swimlane 位于：
+
+`outputs/pa_scheduler_shared_swimlane_20260729_184727_2843037/ccec`
+
+| 指标 | 上一阶段 | 本阶段 | 变化 |
+| --- | ---: | ---: | ---: |
+| UP metadata mean | 2.055 us | 1.983 us | -0.072 us / -3.5% |
+| UP metadata median | 2.065 us | 1.970 us | -0.095 us / -4.6% |
+| UP metadata p95 | 2.284 us | 2.210 us | -0.074 us / -3.2% |
+| writer CAS mean | 0.243 us | 0.248 us | 仍精确为 768 次 |
+| history DCCI mean | 0.145 us | 0.144 us | 仍精确为 256 次 |
+| AIV Finish `.text` | `0xee80` | `0xdf30` | -3920 B / -6.4% |
+| full-swimlane Submit | 2429.239 us | 2436.679 us | +0.31%，单次波动 |
+
+UP metadata 中 DCCI 与三次 return-ready CAS 合计约 `0.887 us`，没有被
+删除；本阶段消减的是形状已知后仍存在的通用 key 解码、地址准备和空
+ordinary helper 控制流。
+
+perf-clock 独立运行 10 次：
+
+`2323.086、2337.556、2315.328、2322.767、2301.722、2285.220、`
+`2306.933、2301.885、2321.115、2305.778 us`
+
+mean/median 为 `2312.139/2311.131 us`，范围
+`2285.220～2337.556 us`；上一阶段为 `2311.087/2307.247 us`。mean
+变化 `+1.052 us（+0.046%）`，median 变化 `+3.884 us（+0.168%）`，
+范围高度重叠，因此端到端判为中性，不宣称收益或回退。局部 256 个样本
+稳定下移、CCEC 热代码明显缩小且协议门槛加强，因此保留。
+
+相对最初精确基线，累计把 UP metadata mean 从 `4.330 us` 降至
+`1.983 us（-54.2%）`；perf-clock 中位数从 `2501.246 us` 降至
+`2311.131 us（-7.60%）`。
+
+正确性验证：
+
+- CPU shared 全套门槛和新增 Publisher/Commit 形状正负例通过；
+- CCEC AIC/AIV 模板与最终混合 ELF 编译检查通过；
+- A5 B256 execution、semantic、history、projection、atomic/DCCI
+  closure 和后处理全部通过；
+- mixed context `0,8192,16384,32768` 覆盖 G0/G1/G2/G4 与连续 writer
+  history，全部通过；
+- 10 个 B256 perf-clock 独立进程全部通过。

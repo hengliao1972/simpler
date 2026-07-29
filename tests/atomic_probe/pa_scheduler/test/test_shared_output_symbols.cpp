@@ -1847,6 +1847,169 @@ void TestOrderedPreparedSymbolUsesSinglePublicationCheck() {
         "PA expected-previous commit omits the last-writer preload"
     );
 
+    // 正式 PA UP 专路要求三个 key 同属 batch Alloc producer，slot
+    // 恰好覆盖 0/1/2。故意使用 2/0/1 顺序，锁定 history 原序、
+    // owner-local packed slot 与 CAS 目标按同一 index 对应。
+    constexpr int16_t kPaSlotOrder[3] = {2, 0, 1};
+    uint32_t pa_up_keys[3] = {};
+    for (uint32_t index = 0; index < 3; ++index) {
+        FdwicOutputRef pa_ref = output_ref;
+        pa_ref.output_slot = kPaSlotOrder[index];
+        Check(
+            SharedSymbolHistoryKey(pa_ref, pa_up_keys[index]),
+            "PA UP setup derives each packed symbol key"
+        );
+    }
+    ResetSharedState(*map);
+    for (uint32_t slot = 0; slot < 3; ++slot) {
+        map->shared_outputs[kProducer]
+            .last_writer[slot].value = kProducer;
+    }
+    fatal = 0;
+    const bool pa_up_committed =
+        CommitPreparedSymbolSharedWriterIntentSet<
+            SymbolTestOps, false, false, true, true
+        >(
+            *map, pa_up_keys, 3, kReader, &fatal,
+            nullptr, kProducer, kProducer
+        );
+    bool pa_up_exact =
+        pa_up_committed && fatal == 0 &&
+        map->writer_history[kReader].count == 3;
+    for (uint32_t index = 0; index < 3; ++index) {
+        pa_up_exact &=
+            map->writer_history[kReader]
+                .entries[index].symbol_key ==
+                pa_up_keys[index] &&
+            map->writer_history[kReader]
+                .entries[index].previous_writer ==
+                kProducer;
+    }
+    for (uint32_t slot = 0; slot < 3; ++slot) {
+        pa_up_exact &=
+            map->shared_outputs[kProducer]
+                .last_writer[slot].value == kReader;
+    }
+    Check(
+        pa_up_exact,
+        "PA UP compact path keeps history and CAS targets index-aligned"
+    );
+
+    // 数量或 slot 集合不精确时，必须在 history 首次写入前失败。
+    ResetSharedState(*map);
+    for (uint32_t slot = 0; slot < 3; ++slot) {
+        map->shared_outputs[kProducer]
+            .last_writer[slot].value = kProducer;
+    }
+    fatal = 0;
+    const bool pa_up_empty_rejected =
+        !CommitPreparedSymbolSharedWriterIntentSet<
+            SymbolTestOps, false, false, true, true
+        >(
+            *map, nullptr, 0, kReader, &fatal,
+            nullptr, kProducer, kProducer
+        );
+    Check(
+        pa_up_empty_rejected && fatal == 1 &&
+            map->writer_history[kReader].magic == 0 &&
+            map->shared_outputs[kProducer]
+                .last_writer[0].value == kProducer &&
+            map->shared_outputs[kProducer]
+                .last_writer[1].value == kProducer &&
+            map->shared_outputs[kProducer]
+                .last_writer[2].value == kProducer,
+        "PA UP compact path rejects a missing writer set before GM publication"
+    );
+
+    ResetSharedState(*map);
+    for (uint32_t slot = 0; slot < 3; ++slot) {
+        map->shared_outputs[kProducer]
+            .last_writer[slot].value = kProducer;
+    }
+    fatal = 0;
+    const bool pa_up_count_rejected =
+        !CommitPreparedSymbolSharedWriterIntentSet<
+            SymbolTestOps, false, false, true, true
+        >(
+            *map, pa_up_keys, 2, kReader, &fatal,
+            nullptr, kProducer, kProducer
+        );
+    const uint32_t duplicate_keys[3] = {
+        pa_up_keys[0], pa_up_keys[0], pa_up_keys[2]
+    };
+    fatal = 0;
+    const bool pa_up_duplicate_rejected =
+        !CommitPreparedSymbolSharedWriterIntentSet<
+            SymbolTestOps, false, false, true, true
+        >(
+            *map, duplicate_keys, 3, kReader, &fatal,
+            nullptr, kProducer, kProducer
+        );
+    FdwicOutputRef wrong_producer_ref = output_ref;
+    wrong_producer_ref.producer_task_id = kWriter;
+    wrong_producer_ref.output_slot = 0;
+    uint32_t wrong_producer_key = 0;
+    Check(
+        SharedSymbolHistoryKey(
+            wrong_producer_ref, wrong_producer_key
+        ),
+        "PA UP negative setup derives a different producer key"
+    );
+    const uint32_t wrong_producer_keys[3] = {
+        pa_up_keys[0], wrong_producer_key, pa_up_keys[2]
+    };
+    fatal = 0;
+    const bool pa_up_producer_rejected =
+        !CommitPreparedSymbolSharedWriterIntentSet<
+            SymbolTestOps, false, false, true, true
+        >(
+            *map, wrong_producer_keys, 3, kReader, &fatal,
+            nullptr, kProducer, kProducer
+        );
+    Check(
+        pa_up_count_rejected && pa_up_duplicate_rejected &&
+            pa_up_producer_rejected &&
+            map->writer_history[kReader].magic == 0 &&
+            map->shared_outputs[kProducer]
+                .last_writer[0].value == kProducer &&
+            map->shared_outputs[kProducer]
+                .last_writer[1].value == kProducer &&
+            map->shared_outputs[kProducer]
+                .last_writer[2].value == kProducer,
+        "PA UP compact path rejects wrong shape before GM publication"
+    );
+
+    // 多 symbol CAS 保留原有非事务语义：第二项冲突时第一项已经发布，
+    // 后续项保持旧值，history 仍完整描述这一故障现场。
+    ResetSharedState(*map);
+    for (uint32_t slot = 0; slot < 3; ++slot) {
+        map->shared_outputs[kProducer]
+            .last_writer[slot].value = kProducer;
+    }
+    map->shared_outputs[kProducer]
+        .last_writer[0].value = kWriter;
+    fatal = 0;
+    const bool pa_up_partial_rejected =
+        !CommitPreparedSymbolSharedWriterIntentSet<
+            SymbolTestOps, false, false, true, true
+        >(
+            *map, pa_up_keys, 3, kReader, &fatal,
+            nullptr, kProducer, kProducer
+        );
+    Check(
+        pa_up_partial_rejected &&
+            map->writer_history[kReader].magic ==
+                kSharedWriterHistoryMagic &&
+            map->writer_history[kReader].count == 3 &&
+            map->shared_outputs[kProducer]
+                .last_writer[2].value == kReader &&
+            map->shared_outputs[kProducer]
+                .last_writer[0].value == kWriter &&
+            map->shared_outputs[kProducer]
+                .last_writer[1].value == kProducer,
+        "PA UP compact path preserves a failed CAS publication prefix"
+    );
+
     ResetSharedState(*map);
     map->shared_outputs[kProducer].last_writer[0].value = kProducer;
     fatal = 0;

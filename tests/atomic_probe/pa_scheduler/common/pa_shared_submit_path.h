@@ -203,13 +203,19 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
 template <
     typename Ops, bool CheckFatal = true,
     bool CheckOutputPublished = true,
-    bool UseExpectedPrevious = false
+    bool UseExpectedPrevious = false,
+    bool UsePaUpShape = false
 >
 PA_DEVICE bool PublishSharedTaskWriterMetadata(
     PA_GM SchedulerState *state, const SubmitContext &context,
     const SharedTaskWriterDelta &delta, LocalStats &stats,
-    int32_t expected_previous = -1
+    int32_t expected_previous = -1,
+    int32_t expected_producer = -1
 ) {
+    static_assert(
+        !UsePaUpShape || UseExpectedPrevious,
+        "PA UP metadata requires an expected previous writer"
+    );
     const int32_t task_id = context.task_id;
     bool fatal_clear = true;
     if constexpr (CheckFatal) {
@@ -238,39 +244,59 @@ PA_DEVICE bool PublishSharedTaskWriterMetadata(
         return false;
     }
 
+    if constexpr (UsePaUpShape) {
+        // standalone PA 的 ordinary writer 集合恒为空；非 UP task 也没有
+        // symbol。expected_previous 由 PA 计划在 Materialize 前推导，
+        // 它非负即表示当前 task 是 UP；据此把“合法非 UP 空集合”和
+        // “异常 UP 丢失三个 symbol”严格区分。错误形状不回退通用路径。
+        const bool expects_pa_up = expected_previous >= 0;
+        if (delta.ordinary_count != 0 ||
+            delta.symbol_count != (expects_pa_up ? 3U : 0U)) {
+            SetFatal<Ops>(state, stats, task_id);
+            return false;
+        }
+        if (!expects_pa_up) {
+            return true;
+        }
+    }
+
     // insert-before-lookup 不能用本 task 的 reader_done 回收自己仍可能
     // 消费的 N-H。首版只使用已经证明正确的 -1 前沿；容量不足明确
     // 终止，绝不覆盖 live producer 或错误推进 task turn。
-    if (SharedCheckPreparedTaskAppend<Ops, true>(
-            state->shared_map, delta.ordinary_entries,
-            delta.ordinary_buckets,
-            delta.ordinary_bucket_ordinals,
-            delta.ordinary_count, -1, task_id,
-            &stats.trace, &stats.result
-        ) != SharedAppendCheck::Ready) {
-        SetFatal<Ops>(state, stats, task_id);
-        return false;
+    if constexpr (!UsePaUpShape) {
+        if (SharedCheckPreparedTaskAppend<Ops, true>(
+                state->shared_map, delta.ordinary_entries,
+                delta.ordinary_buckets,
+                delta.ordinary_bucket_ordinals,
+                delta.ordinary_count, -1, task_id,
+                &stats.trace, &stats.result
+            ) != SharedAppendCheck::Ready) {
+            SetFatal<Ops>(state, stats, task_id);
+            return false;
+        }
     }
 
     if (delta.symbol_count != 0 &&
         !CommitPreparedSymbolSharedWriterIntentSet<
             Ops, true, CheckOutputPublished,
-            UseExpectedPrevious
+            UseExpectedPrevious, UsePaUpShape
         >(
             state->shared_map, delta.symbol_keys,
             delta.symbol_count, task_id, &state->fatal.value,
-            &stats, expected_previous
+            &stats, expected_previous, expected_producer
         )) {
         SetFatal<Ops>(state, stats, task_id);
         return false;
     }
-    if (!SharedAppendPreparedTask<Ops, true>(
-            state->shared_map, delta.ordinary_entries,
-            delta.ordinary_buckets, delta.ordinary_count,
-            task_id, &stats.trace, &stats.result
-        )) {
-        SetFatal<Ops>(state, stats, task_id);
-        return false;
+    if constexpr (!UsePaUpShape) {
+        if (!SharedAppendPreparedTask<Ops, true>(
+                state->shared_map, delta.ordinary_entries,
+                delta.ordinary_buckets, delta.ordinary_count,
+                task_id, &stats.trace, &stats.result
+            )) {
+            SetFatal<Ops>(state, stats, task_id);
+            return false;
+        }
     }
     return true;
 }
@@ -646,10 +672,11 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         // 又把该可见性传递到 N；这里保留 ref/task-id 校验，不再为三个
         // UP symbol 重读已经由有序链证明就绪的 published 控制字。
         PublishSharedTaskWriterMetadata<
-            Ops, false, false, true
+            Ops, false, false, true, true
         >(
             state, context, writer_delta, stats,
-            expected_previous
+            expected_previous,
+            static_cast<int32_t>(task_meta.batch_start)
         );
     const uint64_t metadata_end = metadata_published
         ? TraceTimestamp<Ops>(stats.trace, stats.result)

@@ -756,6 +756,57 @@ bool RunReadyFaninPrefixCompactionTest() {
     return ok;
 }
 
+bool RunPaUpWriterShapeContractTest() {
+    SchedulerState *state = MapSchedulerState();
+    if (state == nullptr) {
+        return false;
+    }
+    pa_scheduler::host::Options options;
+    options.batches = 1;
+    options.shared_context_lens = {8192};
+    options.trace_enabled = false;
+    pa_scheduler::host::InitializeState(state, options);
+    pa_scheduler::host::ConfigureTrace(state, options, nullptr);
+
+    constexpr int32_t kTask = 4;
+    SubmitContext context{};
+    context.task_id = kTask;
+    context.won = true;
+    SharedTaskWriterDelta empty_delta{};
+    empty_delta.prepared_task_id = kTask;
+    LocalStats stats{};
+
+    // 非 UP 的空 writer 集合合法；同一空集合若由非负 previous 标明
+    // 当前 task 是 UP，则必须在发布 history/deps_prepared 前拒绝。
+    const bool non_up_empty_ok =
+        PublishSharedTaskWriterMetadata<
+            OrderedSubmitTestOps, false, false, true, true
+        >(
+            state, context, empty_delta, stats,
+            /*expected_previous=*/-1,
+            /*expected_producer=*/0
+        );
+    const bool up_empty_rejected =
+        !PublishSharedTaskWriterMetadata<
+            OrderedSubmitTestOps, false, false, true, true
+        >(
+            state, context, empty_delta, stats,
+            /*expected_previous=*/0,
+            /*expected_producer=*/0
+        );
+    const bool ok =
+        non_up_empty_ok && up_empty_rejected &&
+        state->fatal.value == 1 &&
+        state->shared_map.writer_history[kTask].magic == 0 &&
+        state->tasks[kTask].deps_prepared == -1;
+    std::printf(
+        "[ORDERED_SUBMIT] pa_up_writer_shape_contract=%s\n",
+        ok ? "PASS" : "FAIL"
+    );
+    (void)munmap(state, sizeof(SchedulerState));
+    return ok;
+}
+
 bool RunInsertReleaseBeforeBuildTest() {
     SchedulerState *state = MapSchedulerState();
     if (state == nullptr) {
@@ -968,10 +1019,12 @@ int main() {
     const bool loser_ok = RunLoserZeroTensorMapAccessTest();
     const bool fanin_compaction_ok =
         RunReadyFaninPrefixCompactionTest();
+    const bool pa_up_shape_ok =
+        RunPaUpWriterShapeContractTest();
     const bool overlap_ok = RunInsertReleaseBeforeBuildTest();
     const bool execution_ok =
         RunIndependentKernelExecutionTest();
-    if (!loser_ok || !fanin_compaction_ok ||
+    if (!loser_ok || !fanin_compaction_ok || !pa_up_shape_ok ||
         !overlap_ok || !execution_ok) {
         std::fprintf(
             stderr, "[FAIL] shared ordered-insert Submit tests\n"

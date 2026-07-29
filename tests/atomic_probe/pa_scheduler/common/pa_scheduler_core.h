@@ -2060,14 +2060,16 @@ PA_DEVICE bool CommitSymbolSharedWriterIntentSet(
 template <
     typename Ops, bool ObserveAtomics = false,
     bool CheckOutputPublished = true,
-    bool UseExpectedPrevious = false
+    bool UseExpectedPrevious = false,
+    bool UsePaUpShape = false
 >
 PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
     PA_GM SharedTensorMapSidecar &map,
     const uint32_t *symbol_keys, uint32_t symbol_count,
     int32_t task_id, PA_GM volatile int32_t *fatal,
     LocalStats *stats = nullptr,
-    int32_t expected_previous = -1
+    int32_t expected_previous = -1,
+    int32_t expected_producer = -1
 ) {
     // 正式 ordered Submit 在 task-level completion 成功后统一记录完整
     // transaction；本 helper 固定不产生逐项成功统计，避免部分 CAS 前缀
@@ -2078,8 +2080,16 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
         (symbol_count != 0 && symbol_keys == nullptr)) {
         return false;
     }
+    static_assert(
+        !UsePaUpShape || UseExpectedPrevious,
+        "PA UP shape requires an expected previous writer"
+    );
     if (symbol_count == 0) {
-        return true;
+        if constexpr (!UsePaUpShape) {
+            return true;
+        }
+        // PA UP 专路不能把“应有三个 writer、实际一个都没有”误认成
+        // 合法的空 writer task；继续进入形状校验并在首次 GM 写前失败。
     }
     if constexpr (UseExpectedPrevious) {
         if (expected_previous < 0 ||
@@ -2088,28 +2098,48 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
         }
     }
 
-    PA_GM SharedWriterHistoryCell &history =
-        map.writer_history[static_cast<uint32_t>(task_id)];
-    for (uint32_t index = 0; index < symbol_count; ++index) {
-        const uint32_t symbol_key = symbol_keys[index];
-        const FdwicOutputRef output_ref =
-            SharedSymbolHistoryReference(symbol_key);
-        const bool valid_ref =
-            IsPlainSharedOutputRef(output_ref) &&
-            output_ref.producer_task_id < task_id;
-        bool published = true;
-        if constexpr (CheckOutputPublished) {
-            published =
-                valid_ref &&
-                CheckSharedOutputPublishedAfterInsertTurn<
-                    Ops, ObserveAtomics
-                >(
-                    map, output_ref, task_id,
-                    AtomicSite::SharedMetadataOutputPublishedLoad,
-                    stats
-                );
+    // 正式 PA UP 的 writer 集合固定为同一 Alloc producer 的 slot 0/1/2。
+    // 先完整验证三项并按原 index 保存 slot，任何形状错误都在首次 GM
+    // history 写之前失败。packed slot 只存在于 owner-local 标量寄存器，
+    // 不改变共享布局，也不重排部分 CAS 失败时保留的发布前缀。
+    uint32_t pa_up_packed_slots = 0;
+    if constexpr (UsePaUpShape) {
+        bool shape_valid =
+            symbol_count == 3 &&
+            expected_producer >= 0 &&
+            expected_producer < task_id &&
+            expected_producer <
+                static_cast<int32_t>(kMaxTasks) &&
+            expected_previous >= expected_producer;
+        uint32_t seen_slots = 0;
+        PA_LOOP_NOUNROLL
+        for (uint32_t index = 0;
+             index < symbol_count && shape_valid; ++index) {
+            const uint32_t symbol_key = symbol_keys[index];
+            if (symbol_key == 0) {
+                shape_valid = false;
+                break;
+            }
+            const uint32_t packed_key = symbol_key - 1U;
+            const uint32_t producer =
+                packed_key / kSharedOutputMaxPerTask;
+            const uint32_t slot =
+                packed_key % kSharedOutputMaxPerTask;
+            const uint32_t slot_bit =
+                slot < 3 ? (1U << slot) : 0U;
+            if (producer !=
+                    static_cast<uint32_t>(expected_producer) ||
+                slot_bit == 0 ||
+                (seen_slots & slot_bit) != 0) {
+                shape_valid = false;
+                break;
+            }
+            seen_slots |= slot_bit;
+            pa_up_packed_slots |=
+                slot << (index * 2U);
         }
-        if (!valid_ref || !published) {
+        shape_valid &= seen_slots == 0x7U;
+        if (!shape_valid) {
             if (fatal != nullptr) {
                 (void)TraceConfiguredAtomicExchange<
                     Ops, ObserveAtomics
@@ -2123,32 +2153,74 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
             }
             return false;
         }
+    }
 
+    PA_GM SharedWriterHistoryCell &history =
+        map.writer_history[static_cast<uint32_t>(task_id)];
+    for (uint32_t index = 0; index < symbol_count; ++index) {
+        const uint32_t symbol_key = symbol_keys[index];
         int64_t previous =
             static_cast<int64_t>(expected_previous);
-        if constexpr (!UseExpectedPrevious) {
-            PA_GM volatile int64_t *last_writer =
-                &map.shared_outputs[
-                     static_cast<uint32_t>(
-                         output_ref.producer_task_id
-                     )
-                 ].last_writer[
-                     static_cast<uint32_t>(
-                         output_ref.output_slot
-                     )
-                 ].value;
-            previous =
-                TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
-                    stats == nullptr ? nullptr : &stats->trace,
-                    stats == nullptr ? nullptr : &stats->result,
-                    task_id,
-                    AtomicSite::SharedMetadataLastWriterLoad,
-                    last_writer
-                );
-        }
-        if (previous < output_ref.producer_task_id ||
-            previous >= task_id) {
-            return false;
+        if constexpr (!UsePaUpShape) {
+            const FdwicOutputRef output_ref =
+                SharedSymbolHistoryReference(symbol_key);
+            const bool valid_ref =
+                IsPlainSharedOutputRef(output_ref) &&
+                output_ref.producer_task_id < task_id;
+            bool published = true;
+            if constexpr (CheckOutputPublished) {
+                published =
+                    valid_ref &&
+                    CheckSharedOutputPublishedAfterInsertTurn<
+                        Ops, ObserveAtomics
+                    >(
+                        map, output_ref, task_id,
+                        AtomicSite::SharedMetadataOutputPublishedLoad,
+                        stats
+                    );
+            }
+            if (!valid_ref || !published) {
+                if (fatal != nullptr) {
+                    (void)TraceConfiguredAtomicExchange<
+                        Ops, ObserveAtomics
+                    >(
+                        stats == nullptr ? nullptr : &stats->trace,
+                        stats == nullptr ? nullptr : &stats->result,
+                        task_id, AtomicSite::FatalSet,
+                        fatal, static_cast<int32_t>(1),
+                        /*result_used=*/false
+                    );
+                }
+                return false;
+            }
+            if constexpr (!UseExpectedPrevious) {
+                PA_GM volatile int64_t *last_writer =
+                    &map.shared_outputs[
+                         static_cast<uint32_t>(
+                             output_ref.producer_task_id
+                         )
+                     ].last_writer[
+                         static_cast<uint32_t>(
+                             output_ref.output_slot
+                         )
+                     ].value;
+                previous =
+                    TraceConfiguredAtomicLoad<
+                        Ops, ObserveAtomics
+                    >(
+                        stats == nullptr
+                            ? nullptr : &stats->trace,
+                        stats == nullptr
+                            ? nullptr : &stats->result,
+                        task_id,
+                        AtomicSite::SharedMetadataLastWriterLoad,
+                        last_writer
+                    );
+            }
+            if (previous < output_ref.producer_task_id ||
+                previous >= task_id) {
+                return false;
+            }
         }
         history.entries[index].symbol_key = symbol_key;
         history.entries[index].previous_writer =
@@ -2173,7 +2245,17 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
     for (uint32_t index = 0; index < symbol_count; ++index) {
         uint32_t symbol_key = 0;
         int64_t previous = -1;
-        if constexpr (UseExpectedPrevious) {
+        uint32_t producer = 0;
+        uint32_t slot = 0;
+        if constexpr (UsePaUpShape) {
+            producer =
+                static_cast<uint32_t>(expected_producer);
+            slot =
+                (pa_up_packed_slots >> (index * 2U)) &
+                0x3U;
+            previous =
+                static_cast<int64_t>(expected_previous);
+        } else if constexpr (UseExpectedPrevious) {
             // 正式 PA 已在 flush 前验证并保留 owner-local key/previous。
             // clean-out 后不再从刚发布的 GM history 回读同一份记录；
             // history 仍完整写回，供跨核 reader 沿 writer 链读取。
@@ -2187,19 +2269,22 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
                 record.previous_writer
             );
         }
-        const FdwicOutputRef output_ref =
-            SharedSymbolHistoryReference(symbol_key);
-        if (!IsPlainSharedOutputRef(output_ref)) {
-            return false;
+        if constexpr (!UsePaUpShape) {
+            const FdwicOutputRef output_ref =
+                SharedSymbolHistoryReference(symbol_key);
+            if (!IsPlainSharedOutputRef(output_ref)) {
+                return false;
+            }
+            producer = static_cast<uint32_t>(
+                output_ref.producer_task_id
+            );
+            slot = static_cast<uint32_t>(
+                output_ref.output_slot
+            );
         }
         PA_GM volatile int64_t *last_writer =
-            &map.shared_outputs[
-                 static_cast<uint32_t>(
-                     output_ref.producer_task_id
-                 )
-             ].last_writer[
-                 static_cast<uint32_t>(output_ref.output_slot)
-             ].value;
+            &map.shared_outputs[producer]
+                 .last_writer[slot].value;
         if (TraceConfiguredAtomicCompareExchange<
                 Ops, ObserveAtomics
             >(
