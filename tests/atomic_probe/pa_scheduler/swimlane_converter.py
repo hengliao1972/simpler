@@ -41,6 +41,7 @@ PHASE_NAMES = {
     "Fanin": "fanin",
     "Register": "register",
     "Atomic": "atomic",
+    "Dcci": "dcci",
     "ClockBaseline": "clock_baseline",
     "OrchestrationReplay": "orchestration_replay",
     "FinalDrain": "final_drain",
@@ -48,13 +49,13 @@ PHASE_NAMES = {
     "AllocComplete": "alloc_complete",
     "SharedRegisterPublishMetadata": "register.publish_metadata",
     "SharedMaterializePublishTaskOutputs": (
-        "materialize.publish_task_outputs"
+        "materialize.publish_shared_output_descriptors"
     ),
     "SharedMaterializePublishTaskOutputsCopy": (
-        "materialize.publish_task_outputs.copy"
+        "materialize.publish_shared_output_descriptors.copy_tensor_descs"
     ),
     "SharedMaterializePublishTaskOutputsFlush": (
-        "materialize.publish_task_outputs.flush"
+        "materialize.publish_shared_output_descriptors.flush_tensor_descs"
     ),
     # 兼容迁移前已经落盘的 schema-v5 raw；新采集只会写上面的
     # SharedMaterialize* 名称，旧名称仍按其当时的 Register 归属解释。
@@ -79,6 +80,7 @@ V5_PHASES = {
     "SharedRegisterPublishTaskOutputs",
     "SharedRegisterPublishTaskOutputsCopy",
     "SharedRegisterPublishTaskOutputsFlush",
+    "Dcci",
 }
 # schema-v5 已有区间足以在离线侧取补集；这些 phase 之外的
 # Atomic、Kernel、RingBp 等是嵌套或 Overlay，不能再从 Submit 扣一次。
@@ -127,6 +129,25 @@ ATOMIC_SITE_NAMES = {
     18: "shared_heap_vend_advance",
     19: "shared_insert_predecessor_poll",
     20: "shared_insert_completion_publish",
+    21: "shared_winner_fatal_guard_load",
+    22: "shared_metadata_fatal_guard_load",
+    23: "shared_output_ref_fanin_output_published_load",
+    24: "shared_output_ref_metadata_output_published_load",
+    25: "shared_output_ref_fanin_last_writer_load",
+    26: "shared_output_ref_metadata_last_writer_load",
+    27: "shared_output_ref_last_writer_commit",
+    28: "shared_output_writer_reserve",
+    29: "shared_output_published_exchange",
+    30: "shared_tensormap_lookup_head_load",
+    31: "shared_tensormap_lookup_tail_load",
+    32: "shared_tensormap_lookup_seq_load",
+    33: "shared_tensormap_append_head_load",
+    34: "shared_tensormap_append_tail_load",
+    35: "shared_tensormap_append_seq_load",
+    36: "shared_tensormap_append_seq_reset_exchange",
+    37: "shared_tensormap_append_seq_publish_exchange",
+    38: "shared_tensormap_append_tail_exchange",
+    39: "shared_output_rollback_exchange",
 }
 ATOMIC_OP_NAMES = {
     0: "load",
@@ -162,10 +183,29 @@ ATOMIC_SITE_OP_IDS = {
     18: 2,
     19: 0,
     20: 4,
+    21: 0,
+    22: 0,
+    23: 0,
+    24: 0,
+    25: 0,
+    26: 0,
+    27: 4,
+    28: 3,
+    29: 1,
+    30: 0,
+    31: 0,
+    32: 0,
+    33: 0,
+    34: 0,
+    35: 0,
+    36: 1,
+    37: 1,
+    38: 1,
+    39: 1,
 }
 # 这些发布型调用不消费 atomic 返回的旧值；其余 standalone site 的
 # 返回值都参与协议判断。v3 输入必须与源码语义完全一致。
-ATOMIC_RESULT_UNUSED_SITE_IDS = {0, 3, 6, 7, 13}
+ATOMIC_RESULT_UNUSED_SITE_IDS = {0, 3, 6, 7, 13, 39}
 # common/private 的六类等待 Load 与 shared Register insert-turn Load 可以
 # 合并；frontier 扫描和 Claim 即使调用很多次也必须继续保留逐调用记录。
 POLL_BATCH_SITE_OP_IDS = {
@@ -178,6 +218,7 @@ POLL_BATCH_SITE_OP_IDS = {
     19: 0,
 }
 SHARED_REGISTER_ATOMIC_SITE_IDS = {19, 20}
+SCHEMA_V5_SHARED_ATOMIC_SITE_IDS = set(range(19, 40))
 SHARED_INSERT_TURN_POLL_SITE_ID = 19
 SHARED_INSERT_TURN_HANDOFF_SITE_ID = 20
 
@@ -187,6 +228,48 @@ ATOMIC_RETURN_READY = 1 << 6
 ATOMIC_POLL_BATCH = 1 << 7
 ATOMIC_PAYLOAD_SHIFT = 8
 ATOMIC_PAYLOAD_MASK = 0xFFFFFF
+
+# DCCI raw ABI 与 Atomic 独立复用 flags/aux。一次区域原语只生成一条
+# 记录；observer 最终导出把 records/core 两次 clean 聚合成一条 terminal
+# 记录，因此 call_count 与物理 row 数不能混为一谈。
+DCCI_SITE_NAMES = {
+    0: "shared_output_ref_fanin_history_invalidate",
+    1: "shared_output_ref_writer_history_flush",
+    2: "shared_output_rollback_flush",
+    3: "shared_output_descriptor_flush",
+    4: "shared_region_read_invalidate",
+    5: "shared_region_append_invalidate",
+    6: "shared_region_append_flush",
+    7: "shared_winner_build_descriptor_invalidate",
+    8: "observer_trace_export",
+    9: "startup_config_invalidate",
+}
+DCCI_OP_NAMES = {
+    0: "invalidate",
+    1: "clean_out",
+}
+DCCI_SITE_OP_IDS = {
+    0: 0,
+    1: 1,
+    2: 1,
+    3: 1,
+    4: 0,
+    5: 0,
+    6: 1,
+    7: 0,
+    8: 1,
+    9: 0,
+}
+DCCI_SHARED_ONLY_SITE_IDS = set(range(8))
+DCCI_OBSERVER_SITE_ID = 8
+DCCI_STARTUP_SITE_ID = 9
+DCCI_OP_MASK = 0x3
+DCCI_TRAILING_DSB = 1 << 2
+DCCI_CALL_COUNT_SHIFT = 3
+DCCI_CALL_COUNT_MASK = 0xF
+DCCI_RESERVED_BIT = 1 << 7
+DCCI_LINE_COUNT_SHIFT = 8
+DCCI_LINE_COUNT_MASK = 0xFFFFFF
 
 
 # schema-v3 只由本目录的 standalone producer 生成；其 worker 编号与
@@ -431,6 +514,9 @@ def _load_and_validate(
         "atomic_calls": 0,
         "batched_poll_calls": 0,
         "poll_batch_records": 0,
+        "dcci_records": 0,
+        "dcci_calls": 0,
+        "dcci_lines": 0,
         # dropped 无法从已经导出的有效行反推；v3+ 必须由 producer summary
         # 明确承诺为零，下面再逐字段核对。
         "dropped_records": 0,
@@ -441,6 +527,7 @@ def _load_and_validate(
     }
     v3_result_used_direct_rows: list[tuple[int, int, bool]] = []
     v3_insert_turn_poll_batch_rows: list[tuple[int, int, bool]] = []
+    v5_observer_dcci_rows = {core_id: 0 for core_id in range(num_cores)}
     v4_parent_counts: dict[int, dict[str, int]] = {
         core_id: {"OrchestrationReplay": 0, "FinalDrain": 0}
         for core_id in range(num_cores)
@@ -536,12 +623,13 @@ def _load_and_validate(
             value_zero = bool(flags & ATOMIC_VALUE_ZERO)
             return_ready = bool(flags & ATOMIC_RETURN_READY)
             payload = (flags >> ATOMIC_PAYLOAD_SHIFT) & ATOMIC_PAYLOAD_MASK
-            if auxiliary in SHARED_REGISTER_ATOMIC_SITE_IDS and not (
+            if auxiliary in SCHEMA_V5_SHARED_ATOMIC_SITE_IDS and not (
                 trace_schema_version == 5 and tensormap_mode == "shared"
             ):
                 raise ValueError(
-                    f"fdwic_events[{index}] shared Register Atomic site={auxiliary} "
-                    "requires shared schema-v5"
+                    f"fdwic_events[{index}] has invalid direct Atomic "
+                    f"site={auxiliary}: shared schema-v5 site requires "
+                    "shared schema-v5"
                 )
             if (
                 auxiliary == SHARED_INSERT_TURN_POLL_SITE_ID
@@ -656,6 +744,61 @@ def _load_and_validate(
                     clock_state["return_ready"] = dependency_applied
                 else:
                     clock_state["plain"] = int(clock_state["plain"]) + 1
+        elif phase == "Dcci":
+            if trace_schema_version != 5:
+                raise ValueError(
+                    f"fdwic_events[{index}] Dcci requires trace_schema_version=5"
+                )
+            op_id = flags & DCCI_OP_MASK
+            call_count = (
+                flags >> DCCI_CALL_COUNT_SHIFT
+            ) & DCCI_CALL_COUNT_MASK
+            line_count = (
+                flags >> DCCI_LINE_COUNT_SHIFT
+            ) & DCCI_LINE_COUNT_MASK
+            if (
+                auxiliary not in DCCI_SITE_OP_IDS
+                or DCCI_SITE_OP_IDS[auxiliary] != op_id
+                or op_id not in DCCI_OP_NAMES
+                or flags & DCCI_RESERVED_BIT
+                or not flags & DCCI_TRAILING_DSB
+                or call_count == 0
+                or line_count < call_count
+            ):
+                raise ValueError(
+                    f"fdwic_events[{index}] has invalid Dcci "
+                    f"site={auxiliary} flags=0x{flags:x}"
+                )
+            if auxiliary == DCCI_OBSERVER_SITE_ID:
+                expected_observer_calls = (
+                    3 if tensormap_mode == "shared" else 2
+                )
+                if (
+                    call_count != expected_observer_calls
+                    or task_id != -1
+                    or function_id != -1
+                ):
+                    raise ValueError(
+                        f"fdwic_events[{index}] has invalid observer Dcci fields"
+                    )
+                v5_observer_dcci_rows[core_id] += 1
+            elif auxiliary == DCCI_STARTUP_SITE_ID:
+                if call_count != 1 or task_id != -1 or function_id != -1:
+                    raise ValueError(
+                        f"fdwic_events[{index}] has invalid startup Dcci fields"
+                    )
+            elif (
+                tensormap_mode != "shared"
+                or auxiliary not in DCCI_SHARED_ONLY_SITE_IDS
+                or call_count != 1
+                or task_id < 0
+            ):
+                raise ValueError(
+                    f"fdwic_events[{index}] has invalid shared Dcci fields"
+                )
+            observed_summary["dcci_records"] += 1
+            observed_summary["dcci_calls"] += call_count
+            observed_summary["dcci_lines"] += line_count
         if trace_schema_version == 5:
             task_key = (core_id, task_id)
             if tensormap_mode == "shared" and phase == "PrepareMap":
@@ -1243,7 +1386,38 @@ def _load_and_validate(
             raise ValueError(
                 "metadata.fdwic_summary is required for trace_schema_version>=3"
             )
+        dcci_keys = ("dcci_records", "dcci_calls", "dcci_lines")
+        dcci_declared = any(key in producer_summary for key in dcci_keys)
+        if observed_summary["dcci_records"] != 0 and not dcci_declared:
+            raise ValueError(
+                "raw Dcci records require dcci_records/dcci_calls/dcci_lines "
+                "in metadata.fdwic_summary"
+            )
+        if dcci_declared:
+            if not all(key in producer_summary for key in dcci_keys):
+                raise ValueError(
+                    "metadata.fdwic_summary must declare all three DCCI counters"
+                )
+            if trace_schema_version != 5:
+                raise ValueError(
+                    "DCCI summary counters require trace_schema_version=5"
+                )
+            invalid = {
+                core_id: count
+                for core_id, count in v5_observer_dcci_rows.items()
+                if count != 1
+            }
+            if invalid:
+                raise ValueError(
+                    "schema-v5 DCCI capture requires exactly one "
+                    "ObserverTraceExport record per core; "
+                    f"invalid={invalid}"
+                )
         for key, observed_value in observed_summary.items():
+            # 迁移前 schema-v5 capture 没有 DCCI 行，也没有三项 summary。
+            # 一旦任一新字段出现，就必须按上面的完整合同严格闭合。
+            if key in dcci_keys and not dcci_declared:
+                continue
             producer_value = _integer(
                 producer_summary.get(key), f"metadata.fdwic_summary.{key}"
             )
@@ -1253,6 +1427,93 @@ def _load_and_validate(
                     f"does not match raw value {observed_value}"
                 )
     return frequency_hz, trace_schema_version, rows, core_by_block_lane, base_cycle, metadata
+
+
+def _restore_v5_shared_efdrain(
+    rows: list[tuple[Any, ...]],
+    trace_schema_version: int,
+    tensormap_mode: str | None,
+) -> None:
+    """用 Submit.start 与 Claim.start 离线恢复 shared EfDrain。
+
+    新 shared raw 不再为每个 Submit 写一条 EfDrain 记录。该区间的两端
+    已分别由 Submit 和 Claim 权威记录，离线恢复既不扩张 raw ABI，也不会
+    污染设备侧 ``fdwic_summary.records``。采集与加工使用同一份代码，
+    因此 shared schema-v5 一旦出现显式 EfDrain 就直接拒绝，避免同时
+    维护设备记录与离线派生两个口径。
+    """
+
+    if trace_schema_version != 5 or tensormap_mode != "shared":
+        return
+
+    submits: dict[tuple[int, int], tuple[Any, ...]] = {}
+    claims: dict[tuple[int, int], tuple[Any, ...]] = {}
+    for row in rows:
+        phase = str(row[5])
+        if phase == "EfDrain":
+            raise ValueError(
+                "shared schema-v5 raw must not contain explicit EfDrain"
+            )
+        if phase not in ("Submit", "Claim"):
+            continue
+        key = (int(row[0]), int(row[3]))
+        bucket = submits if phase == "Submit" else claims
+        if key in bucket:
+            raise ValueError(
+                f"shared schema-v5 has duplicate {phase} for {key}"
+            )
+        bucket[key] = row
+
+    if set(claims) != set(submits):
+        missing = sorted(set(submits) - set(claims))
+        orphan = sorted(set(claims) - set(submits))
+        raise ValueError(
+            "shared schema-v5 EfDrain derivation requires exactly one Claim "
+            f"per Submit: missing={missing[:8]} orphan={orphan[:8]}"
+        )
+
+    for key in sorted(submits):
+        submit = submits[key]
+        claim = claims[key]
+        if tuple(int(value) for value in claim[:5]) != tuple(
+            int(value) for value in submit[:5]
+        ):
+            raise ValueError(
+                "shared schema-v5 Claim identity differs from Submit for "
+                f"{key}"
+            )
+        submit_start = int(submit[6])
+        submit_end = int(submit[7])
+        claim_start = int(claim[6])
+        claim_end = int(claim[7])
+        if not (
+            submit_start
+            <= claim_start
+            <= claim_end
+            <= submit_end
+        ):
+            raise ValueError(
+                "shared schema-v5 cannot derive EfDrain because Claim is "
+                f"outside or inverted relative to Submit at {key}: "
+                f"Submit=[{submit_start},{submit_end}) "
+                f"Claim=[{claim_start},{claim_end})"
+            )
+
+        expected = (
+            int(submit[0]),
+            int(submit[1]),
+            int(submit[2]),
+            int(submit[3]),
+            # EfDrain 是 Submit 前端的 scalar 控制区，不属于某个计算
+            # function；历史设备记录和新离线事件都固定使用 -1。
+            -1,
+            "EfDrain",
+            submit_start,
+            claim_start,
+            0,
+            0,
+        )
+        rows.append(expected)
 
 
 # 写一个 Chrome Trace Event，并统一处理数组元素间的逗号。
@@ -1363,8 +1624,10 @@ def _iter_v5_shared_register_derived_spans(
     """用 Register 与 metadata 边界补出非 raw 串行段。
 
     新采集的 task outputs 已属于 Materialize，因此 Register 只合成等待、
-    writer metadata 与交棒。迁移前 raw 仍按旧 outputs 子区间恢复 metadata
-    epilogue，保证历史泳道可重放。
+    writer metadata 与插入完成发布。writer 名称复用 Register raw 已有的
+    auxiliary，直接显示 ordinary TensorMap entry 数，不增加设备字段。
+    迁移前 raw 仍按旧 outputs 子区间恢复 metadata epilogue，保证历史
+    泳道可重放。
     """
 
     parents: dict[tuple[int, int], tuple[Any, ...]] = {}
@@ -1399,7 +1662,13 @@ def _iter_v5_shared_register_derived_spans(
             lane,
             int(parent[6]),
             int(detail[6]),
-            f"register.wait_predecessor_insert#{task_id}",
+            f"register.wait_predecessor_tensormap_insert#{task_id}",
+        )
+        ordinary_tensormap_entries = int(parent[9])
+        writer_metadata_name = (
+            "register.publish_writer_metadata"
+            f"[ordinary_tensormap_entries={ordinary_tensormap_entries}]"
+            f"#{task_id}"
         )
         if output_detail[5] == "SharedRegisterPublishTaskOutputs":
             yield (
@@ -1408,7 +1677,7 @@ def _iter_v5_shared_register_derived_spans(
                 lane,
                 int(detail[6]),
                 int(output_detail[6]),
-                f"register.publish_writer_metadata#{task_id}",
+                writer_metadata_name,
             )
             yield (
                 core_id,
@@ -1425,7 +1694,7 @@ def _iter_v5_shared_register_derived_spans(
                 lane,
                 int(detail[6]),
                 int(detail[7]),
-                f"register.publish_writer_metadata#{task_id}",
+                writer_metadata_name,
             )
         yield (
             core_id,
@@ -1433,8 +1702,50 @@ def _iter_v5_shared_register_derived_spans(
             lane,
             int(detail[7]),
             int(parent[7]),
-            f"register.publish_insert_completion#{task_id}",
+            f"register.publish_tensormap_insert_completion#{task_id}",
         )
+
+
+def _merged_item_sort_key(
+    item: tuple[Any, ...],
+) -> tuple[int, int, int, int, int, str]:
+    """按物理轨道建立父区间优先的确定性导入顺序。
+
+    设备在阶段结束时才写父记录，所以 raw 的物理顺序天然是“子事件在前、
+    父区间在后”。Perfetto 的同轨 slice 建栈不能直接使用这个落盘顺序。
+    这里仅重排离线 merged：同一轨道 start 升序、end 降序，保证外层先
+    导入；完全同区间时业务 span 先于 Atomic/DCCI overlay。
+    """
+
+    if item and item[0] == "derived":
+        _, _core_id, block_id, lane, start, end, name = item
+        return (
+            int(block_id), int(lane), int(start), -int(end),
+            0, str(name),
+        )
+    (
+        _core_id,
+        block_id,
+        lane,
+        _task_id,
+        _function_id,
+        phase_raw,
+        start,
+        end,
+        _flags,
+        _auxiliary,
+    ) = item
+    phase = PHASE_NAMES[str(phase_raw)]
+    thread_id = (
+        int(lane) + 3
+        if phase == "kernel" or phase == "commit"
+        else int(lane)
+    )
+    overlay_priority = 2 if phase in ("atomic", "dcci") else 1
+    return (
+        int(block_id), thread_id, int(start), -int(end),
+        overlay_priority, str(phase_raw),
+    )
 
 
 # 完成一次 raw 到 merged 的转换，成功时返回事件数、block 数和基准 cycle。
@@ -1447,6 +1758,11 @@ def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
         base_cycle,
         capture_metadata,
     ) = _load_and_validate(input_path)
+    _restore_v5_shared_efdrain(
+        rows,
+        trace_schema_version,
+        capture_metadata.get("tensormap_mode"),
+    )
     # 禁止原地转换；否则创建临时文件或最终 replace 时可能破坏唯一一份 raw。
     if input_path.resolve() == output_path.resolve():
         raise ValueError("input and output paths must differ")
@@ -1473,6 +1789,40 @@ def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
             if auxiliary == 4:  # AtomicSite::ClaimMax
                 key = (core_id, block_id, lane, task_id)
                 legacy_claim_max_spans.setdefault(key, []).append((start, end))
+    # 新布局已经把 output descriptor 发布移入 Materialize。对应 Register
+    # metadata raw 与离线合成的 writer span 使用完全相同的边界；merged
+    # 只保留带 ordinary TensorMap 数量的合成事件，避免同轨同区间互相遮挡。
+    # 旧 Register-placement raw 不在此集合中，仍按历史嵌套结构完整输出。
+    materialize_output_tasks = {
+        (int(row[0]), int(row[3]))
+        for row in rows
+        if row[5] == "SharedMaterializePublishTaskOutputs"
+    }
+    # merged 的顺序是显示合同的一部分：先收集 raw 引用与离线派生 span，
+    # 再按物理轨道做父区间优先排序。这里只增加轻量 tuple/reference，
+    # 不构造数十万份 event dict；JSON 仍逐事件流式写出。
+    ordered_items: list[tuple[Any, ...]] = [
+        row
+        for row in rows
+        if not (
+            trace_schema_version == 5
+            and row[5] == "SharedRegisterPublishMetadata"
+            and (int(row[0]), int(row[3]))
+                in materialize_output_tasks
+        )
+    ]
+    if trace_schema_version == 5:
+        ordered_items.extend(
+            ("derived", *span)
+            for span in _iter_v5_shared_register_derived_spans(
+                rows
+            )
+        )
+        ordered_items.extend(
+            ("derived", *span)
+            for span in _iter_v5_residual_spans(rows)
+        )
+    ordered_items.sort(key=_merged_item_sort_key)
     first = True
     emitted = 0
     # 临时文件的整个生命周期都在 try 内；包括 Ctrl-C 在内的异常都会先清理
@@ -1535,7 +1885,36 @@ def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
                             },
                             first,
                         )
-            for row in rows:
+            for item in ordered_items:
+                if item[0] == "derived":
+                    (
+                        _derived,
+                        _core_id,
+                        block_id,
+                        lane,
+                        start,
+                        end,
+                        name,
+                    ) = item
+                    first = _emit_event(
+                        output,
+                        {
+                            "ph": "X",
+                            "name": name,
+                            "pid": block_id,
+                            "tid": lane,
+                            "ts": round(
+                                (start - base_cycle) * factor, 3
+                            ),
+                            "dur": round(
+                                (end - start) * factor, 3
+                            ),
+                        },
+                        first,
+                    )
+                    emitted += 1
+                    continue
+                row = item
                 core_id, block_id, lane, task_id, function_id, phase_raw, start, end, flags, auxiliary = row
                 phase = PHASE_NAMES[phase_raw]
                 # Kernel/Commit 放到 lane+3 的计算单元子泳道；Atomic/ClockBaseline
@@ -1617,6 +1996,27 @@ def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
                             f"atomic.{atomic_boundary_tag}.{atomic_site}."
                             f"{atomic_op}#{task_id}"
                         )
+                    thread_id = lane
+                elif phase == "dcci":
+                    dcci_site_id = auxiliary
+                    dcci_op_id = flags & DCCI_OP_MASK
+                    dcci_site = DCCI_SITE_NAMES.get(
+                        dcci_site_id, f"site_{dcci_site_id}"
+                    )
+                    dcci_op = DCCI_OP_NAMES.get(
+                        dcci_op_id, f"op_{dcci_op_id}"
+                    )
+                    dcci_call_count = (
+                        flags >> DCCI_CALL_COUNT_SHIFT
+                    ) & DCCI_CALL_COUNT_MASK
+                    dcci_line_count = (
+                        flags >> DCCI_LINE_COUNT_SHIFT
+                    ) & DCCI_LINE_COUNT_MASK
+                    name = (
+                        f"dcci.{dcci_site}.{dcci_op}"
+                        f"×{dcci_call_count}.lines{dcci_line_count}"
+                        f"#{task_id}"
+                    )
                     thread_id = lane
                 elif phase == "clock_baseline":
                     name = (
@@ -1721,6 +2121,24 @@ def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
                             event["args"]["retries"] = (
                                 flags >> ATOMIC_PAYLOAD_SHIFT
                             ) & ATOMIC_PAYLOAD_MASK
+                elif phase == "dcci":
+                    event["args"] = {
+                        "phase": phase,
+                        "task_id": task_id,
+                        "func_id": function_id,
+                        "core": core_id,
+                        "site": dcci_site,
+                        "site_id": dcci_site_id,
+                        "op": dcci_op,
+                        "op_id": dcci_op_id,
+                        "call_count": dcci_call_count,
+                        "cache_line_count": dcci_line_count,
+                        "trailing_dsb": bool(flags & DCCI_TRAILING_DSB),
+                        "cycles": end - start,
+                        "execution_unit": "scalar",
+                        "flags": flags,
+                    }
+                    event["cat"] = "dcci"
                 elif phase == "claim":
                     event["args"] = {
                         "phase": phase,
@@ -1760,49 +2178,6 @@ def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
                     event.pop("cat", None)
                 first = _emit_event(output, event, first)
                 emitted += 1
-            if trace_schema_version == 5:
-                # shared Register 记录 metadata 子区间；等待、writer
-                # metadata 与交棒由边界离线补出。新采集的 task outputs 是
-                # Materialize detail；历史 v5 仍按旧 Register 嵌套兼容。
-                # 这些 detail 都不能加入 Submit 补集重复扣除。
-                for (
-                    _core_id,
-                    block_id,
-                    lane,
-                    start,
-                    end,
-                    name,
-                ) in _iter_v5_shared_register_derived_spans(rows):
-                    first = _emit_event(
-                        output,
-                        {
-                            "ph": "X",
-                            "name": name,
-                            "pid": block_id,
-                            "tid": lane,
-                            "ts": round((start - base_cycle) * factor, 3),
-                            "dur": round((end - start) * factor, 3),
-                        },
-                        first,
-                    )
-                    emitted += 1
-                # 补集是纯离线合成件：不增加设备 trace record、SYS_CNT
-                # 或 raw 字段。事件只保留 Perfetto X 必需的 6 个字段，
-                # 不复制每条 raw 已有的 args，控制 merged 体积增量。
-                for _core_id, block_id, lane, start, end, name in _iter_v5_residual_spans(rows):
-                    first = _emit_event(
-                        output,
-                        {
-                            "ph": "X",
-                            "name": name,
-                            "pid": block_id,
-                            "tid": lane,
-                            "ts": round((start - base_cycle) * factor, 3),
-                            "dur": round((end - start) * factor, 3),
-                        },
-                        first,
-                    )
-                    emitted += 1
             output.write("\n]}\n")
             output.flush()
             os.fsync(output.fileno())

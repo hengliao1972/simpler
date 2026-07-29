@@ -436,15 +436,31 @@ int main(int argc, char **argv) {
         // 分析器和 raw JSON writer 因而可以与设备后端共用同一回调接口。
         const auto read_trace_records =
             [trace_memory](uint32_t worker, uint32_t count, pa_scheduler::TraceRecord *records) {
-                const uint64_t offset = sizeof(pa_scheduler::TraceHeader) +
-                                        static_cast<uint64_t>(worker) * pa_scheduler::kTraceRecordsPerCore *
-                                            sizeof(pa_scheduler::TraceRecord);
+                const size_t offset =
+                    pa_scheduler::TraceRecordsOffset(worker);
                 std::memcpy(
                     records, static_cast<uint8_t *>(trace_memory) + offset,
                     static_cast<size_t>(count) * sizeof(pa_scheduler::TraceRecord)
                 );
                 return true;
             };
+#if PTO_FDWIC_SHARED_MAP
+        const auto read_submit_claim_records =
+            [trace_memory](
+                uint32_t worker, uint32_t count,
+                pa_scheduler::SharedSubmitClaimTraceRecord *records
+            ) {
+                const size_t offset =
+                    pa_scheduler::TraceSubmitClaimOffset(worker);
+                std::memcpy(
+                    records,
+                    static_cast<uint8_t *>(trace_memory) + offset,
+                    static_cast<size_t>(count) *
+                        sizeof(pa_scheduler::SharedSubmitClaimTraceRecord)
+                );
+                return true;
+            };
+#endif
         // 先完成严格语义校验，再允许写出；失败运行不会生成可误认成有效
         // 基线的泳道 JSON。
         const pa_scheduler::host::Metrics metrics = pa_scheduler::host::Validate(
@@ -478,7 +494,12 @@ int main(int argc, char **argv) {
         // 分析只打印统计，导出则写 raw JSON；两者失败都标记 postprocess，
         // 与调度语义失败分开报告，便于区分协议问题和产物问题。
         if (options.analyze_swimlane &&
-            !pa_scheduler::host::AnalyzeSwimlaneRecords(*trace_header, *state, read_trace_records)) {
+            !pa_scheduler::host::AnalyzeSwimlaneRecords(
+                *trace_header, *state, read_trace_records
+#if PTO_FDWIC_SHARED_MAP
+                , read_submit_claim_records
+#endif
+            )) {
             postprocess_ok = false;
             break;
         }
@@ -508,6 +529,9 @@ int main(int argc, char **argv) {
                         : "none",
                     options.final_barrier_shape, options.trace_atomics,
                     read_trace_records
+#if PTO_FDWIC_SHARED_MAP
+                    , read_submit_claim_records
+#endif
                 )) {
                 postprocess_ok = false;
                 break;

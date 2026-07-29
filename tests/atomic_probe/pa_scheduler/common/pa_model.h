@@ -76,8 +76,36 @@
 #define PA_BUILD_PERF_CLOCK 0
 #endif
 
+#ifndef PA_BUILD_ATOMIC_SWIMLANE
+#define PA_BUILD_ATOMIC_SWIMLANE 0
+#endif
+
+#ifndef PA_BUILD_COMPACT_GENERIC_TRACE
+#define PA_BUILD_COMPACT_GENERIC_TRACE 0
+#endif
+
+#if PA_BUILD_COMPACT_GENERIC_TRACE != 0 && \
+    PA_BUILD_COMPACT_GENERIC_TRACE != 1
+#error "PA_BUILD_COMPACT_GENERIC_TRACE must be 0 or 1"
+#endif
+
 #if (PA_BUILD_SWIMLANE + PA_BUILD_SUBMIT_PMU + PA_BUILD_PERF_CLOCK) > 1
 #error "swimlane, submit-pmu, and perf-clock builds are mutually exclusive"
+#endif
+
+#if PA_BUILD_ATOMIC_SWIMLANE && !PA_BUILD_SWIMLANE
+#error "the compile-time atomic trace specialization requires a swimlane build"
+#endif
+
+#if PA_BUILD_COMPACT_GENERIC_TRACE && \
+    (!PTO_FDWIC_SHARED_MAP || !PA_BUILD_SWIMLANE || \
+     !PA_BUILD_ATOMIC_SWIMLANE)
+#error "compact generic trace is restricted to shared full-swimlane builds"
+#endif
+
+#if PA_BUILD_COMPACT_GENERIC_TRACE && \
+    PTO_FDWIC_TENSORMAP_RING_CAP != 128
+#error "compact generic trace currently supports only the production CAP=128 ABI"
 #endif
 
 // submit-pmu 与 perf-clock 都不允许把阶段泳道、atomic 包围计时或
@@ -95,6 +123,8 @@ enum class TensorMapBuildMode : uint32_t {
 constexpr TensorMapBuildMode kCompiledTensorMapMode =
     static_cast<TensorMapBuildMode>(PTO_FDWIC_SHARED_MAP);
 constexpr uint32_t kBuildIdentityMagic = 0x50414249U;  // "PABI"
+constexpr uint32_t kBuildIdentityCompactGenericTraceBit =
+    1U << 31U;
 #if PTO_FDWIC_SHARED_MAP
 constexpr uint32_t kBuildIdentityAbiGeneration = 11;
 #else
@@ -102,7 +132,7 @@ constexpr uint32_t kBuildIdentityAbiGeneration = 4;
 #endif
 // 默认 CAP=128 时，private 保留历史 ABI 值；shared generation 11 另把
 // active insert-turn G 编入低位。这样既避免 private AIC/AIV 入口因身份
-// 元数据多一条大立即数构造，也让 manifest v3 和 host/device 握手共同
+// 元数据多一条大立即数构造，也让 manifest v4 和 host/device 握手共同
 // 拒绝不同 G 的 shared 混件。非默认隔离变体继续把 CAP 编进 ABI。
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
 #if PTO_FDWIC_SHARED_MAP
@@ -110,7 +140,10 @@ constexpr uint32_t kBuildIdentityAbiVersion =
     (kBuildIdentityAbiGeneration << 8U) |
     static_cast<uint32_t>(
         PTO_FDWIC_SHARED_INSERT_TURN_GROUPS
-    );
+    ) |
+    (PA_BUILD_COMPACT_GENERIC_TRACE
+         ? kBuildIdentityCompactGenericTraceBit
+         : 0U);
 #else
 constexpr uint32_t kBuildIdentityAbiVersion =
     kBuildIdentityAbiGeneration;
@@ -129,6 +162,14 @@ constexpr uint32_t kBuildIdentityAbiVersion =
     static_cast<uint32_t>(PTO_FDWIC_TENSORMAP_RING_CAP);
 #endif
 #endif
+static_assert(
+    (kBuildIdentityAbiVersion &
+     kBuildIdentityCompactGenericTraceBit) ==
+        (PA_BUILD_COMPACT_GENERIC_TRACE
+             ? kBuildIdentityCompactGenericTraceBit
+             : 0U),
+    "build identity does not encode the compact trace format"
+);
 
 // private 与现有 shared 单组 Case1 每 batch 都回放五个 task。shared
 // 多组请求复用一次 Alloc，随后每个 block group 增加 QK/SF/PV/UP 四
@@ -273,7 +314,36 @@ constexpr size_t kRealTasksOffset = 896;
 constexpr size_t kRealFatalOffset = 4195264;
 constexpr size_t kRealReplayDoneOffset = 10043776;
 constexpr size_t kRealStartedCountOffset = 10043840;
+// shared 把每个 task/core 固定存在的 Claim+Submit 端点移到 32B 专用区。
+// 通用区容量固定为 28,416 条：默认 32B 格式仍恰好占满 1 MiB/worker；
+// CCEC full-swimlane 的 16B 格式只缩短物理 stride，不扩大事件容量。
+constexpr uint32_t kTraceLogicalRecordSizeBytes = 32;
+#if PTO_FDWIC_SHARED_MAP
+constexpr uint32_t kTraceSubmitClaimRecordSizeBytes = 32;
+constexpr uint32_t kTraceRecordsPerCore = 28416;
+constexpr uint32_t kTraceRecordSizeBytes =
+    PA_BUILD_COMPACT_GENERIC_TRACE ? 16U : 32U;
+constexpr size_t kTraceWorkerBytes =
+    static_cast<size_t>(kMaxTasks) *
+        kTraceSubmitClaimRecordSizeBytes +
+    static_cast<size_t>(kTraceRecordsPerCore) *
+        kTraceRecordSizeBytes;
+static_assert(
+    kTraceWorkerBytes ==
+        (PA_BUILD_COMPACT_GENERIC_TRACE ? 593920U : (1U << 20)),
+    "shared trace worker stride changed"
+);
+#else
+constexpr uint32_t kTraceSubmitClaimRecordSizeBytes = 0;
 constexpr uint32_t kTraceRecordsPerCore = 1U << 16;
+constexpr uint32_t kTraceRecordSizeBytes = 32;
+constexpr size_t kTraceWorkerBytes =
+    static_cast<size_t>(kTraceRecordsPerCore) * 32U;
+#endif
+static_assert(
+    kTraceWorkerBytes % 64U == 0,
+    "each trace worker partition must remain cache-line aligned"
+);
 static_assert((kPayloadSlots & kPayloadMask) == 0, "payload slots must be a power of two");
 static_assert(
     kMapBucketCapacity >= 32 && kMapBucketCapacity <= kMapCapacity,
@@ -565,7 +635,10 @@ enum class TracePhase : int32_t {
     // 只回传时间戳，不自行 WriteTrace。
     SharedMaterializePublishTaskOutputsCopy = 22,
     SharedMaterializePublishTaskOutputsFlush = 23,
-    Count = 24,
+    // 区域级 DCCI 记录是 scalar 调度泳道的 overlay；它不参与 Submit
+    // 排他分段，也不复用 Atomic 的 flags/auxiliary 编号。
+    Dcci = 24,
+    Count = 25,
 };
 
 // AtomicSite 按 standalone PA 中真实出现的源码调用点分类。编号写入 TraceRecord::auxiliary，
@@ -596,7 +669,33 @@ enum class AtomicSite : uint32_t {
     // 不为循环内每次 Load 写 raw；handoff CAS 则保留一条 return-ready。
     SharedInsertTurnPoll = 19,
     SharedInsertTurnHandoff = 20,
-    Count = 21,
+    // shared 正式 Submit 中原先绕过 TraceAtomic* 的固定调用点。读取类按
+    // 业务位置拆开，避免把 Fanin、metadata 串行区和 output 发布混成一项；
+    // 编号继续 append-only，旧 raw 的 0..20 语义不变。
+    SharedWinnerFatalGuardLoad = 21,
+    SharedMetadataFatalGuardLoad = 22,
+    SharedFaninOutputPublishedLoad = 23,
+    SharedMetadataOutputPublishedLoad = 24,
+    SharedFaninLastWriterLoad = 25,
+    SharedMetadataLastWriterLoad = 26,
+    SharedMetadataLastWriterCommit = 27,
+    SharedOutputWriterReserve = 28,
+    SharedOutputPublishedExchange = 29,
+    SharedMapLookupHeadLoad = 30,
+    SharedMapLookupTailLoad = 31,
+    // ordinary-region ring 的 lookup/preflight/append 控制字。lookup 的
+    // 两次 seq 双检复用同一站点；append 的 reset/publish/tail 分开，
+    // 便于直接看出串行 Register 中是哪一步在等待共享 cache line。
+    SharedMapLookupSeqLoad = 32,
+    SharedMapAppendHeadLoad = 33,
+    SharedMapAppendTailLoad = 34,
+    SharedMapAppendSeqLoad = 35,
+    SharedMapAppendSeqResetExchange = 36,
+    SharedMapAppendSeqPublishExchange = 37,
+    SharedMapAppendTailExchange = 38,
+    // 仅在失败回滚中出现，返回旧值不参与协议判断。
+    SharedOutputRollbackExchange = 39,
+    Count = 40,
 };
 
 // Atomic 记录 flags 的低四位保存操作种类；bit4 表示返回值参与后续判断，
@@ -620,6 +719,45 @@ constexpr uint32_t kAtomicPollCountShift = 8;
 constexpr uint32_t kAtomicPollCountMax = 0x00ffffffU;
 constexpr uint32_t kAtomicPollBatchSiteCount = 6;
 static_assert(kAtomicPollBatchSiteCount <= 32, "PollBatch enable mask supports at most 32 compact indices");
+
+// DCCI 与 Atomic 使用同一个 32B TraceRecord，但拥有完全独立的 raw ABI。
+// 每条记录描述一个区域原语或一组同 op 的聚合区域原语：
+// - bits[1:0]：DcciOp；
+// - bit2：每个区域原语末尾都执行 trailing DSB；
+// - bits[6:3]：logical call_count（1..15）；
+// - bit7：保留，必须为 0；
+// - bits[31:8]：实际覆盖的 64B cache-line 总数。
+enum class DcciOp : uint32_t {
+    Invalidate = 0,
+    CleanOut = 1,
+    Count = 2,
+};
+
+enum class DcciSite : uint32_t {
+    SharedFaninHistoryInvalidate = 0,
+    SharedWriterHistoryFlush = 1,
+    SharedOutputRollbackFlush = 2,
+    SharedOutputDescriptorFlush = 3,
+    SharedRegionReadInvalidate = 4,
+    SharedRegionAppendInvalidate = 5,
+    SharedRegionAppendFlush = 6,
+    SharedWinnerBuildDescriptorInvalidate = 7,
+    // observer 自身的 records clean 与 core-state clean 必须聚合为一条
+    // terminal row，不能在 FlushRegion 内递归写 trace。
+    ObserverTraceExport = 8,
+    // RunConfig DCCI 发生在 AttachTrace 之前；正常握手成功后用已保存的
+    // begin/end 补记这一条。它同时存在于 private/shared 构建。
+    StartupConfigInvalidate = 9,
+    Count = 10,
+};
+
+constexpr uint32_t kDcciOpMask = 0x03U;
+constexpr uint32_t kDcciTrailingDsb = 1U << 2;
+constexpr uint32_t kDcciCallCountShift = 3;
+constexpr uint32_t kDcciCallCountMask = 0x0fU;
+constexpr uint32_t kDcciReservedBit = 1U << 7;
+constexpr uint32_t kDcciLineCountShift = 8;
+constexpr uint32_t kDcciLineCountMax = 0x00ffffffU;
 
 // 这些映射是 raw ABI 的一部分，同时被 device 聚合器与 host 闭环校验使用。
 // 0..14 与真实 PA 保持稳定；BlockWon 尚未在 standalone 中实现，不能只为
@@ -645,7 +783,16 @@ PA_MODEL_INLINE constexpr AtomicOp AtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::FrontierMax:
             return AtomicOp::FetchMax;
         case AtomicSite::SharedInsertTurnHandoff:
+        case AtomicSite::SharedMetadataLastWriterCommit:
             return AtomicOp::CompareExchange;
+        case AtomicSite::SharedOutputWriterReserve:
+            return AtomicOp::FetchMax;
+        case AtomicSite::SharedOutputPublishedExchange:
+        case AtomicSite::SharedMapAppendSeqResetExchange:
+        case AtomicSite::SharedMapAppendSeqPublishExchange:
+        case AtomicSite::SharedMapAppendTailExchange:
+        case AtomicSite::SharedOutputRollbackExchange:
+            return AtomicOp::Exchange;
         default:
             return AtomicOp::Load;
     }
@@ -658,6 +805,7 @@ PA_MODEL_INLINE constexpr bool AtomicSiteResultUsed(AtomicSite site) {
         case AtomicSite::CompletionVendExchange:
         case AtomicSite::CompletionFlagExchange:
         case AtomicSite::ReplayDoneIncrement:
+        case AtomicSite::SharedOutputRollbackExchange:
             return false;
         case AtomicSite::StartupPoll:
         case AtomicSite::FatalPoll:
@@ -675,6 +823,24 @@ PA_MODEL_INLINE constexpr bool AtomicSiteResultUsed(AtomicSite site) {
         case AtomicSite::SharedHeapVendAdvance:
         case AtomicSite::SharedInsertTurnPoll:
         case AtomicSite::SharedInsertTurnHandoff:
+        case AtomicSite::SharedWinnerFatalGuardLoad:
+        case AtomicSite::SharedMetadataFatalGuardLoad:
+        case AtomicSite::SharedFaninOutputPublishedLoad:
+        case AtomicSite::SharedMetadataOutputPublishedLoad:
+        case AtomicSite::SharedFaninLastWriterLoad:
+        case AtomicSite::SharedMetadataLastWriterLoad:
+        case AtomicSite::SharedMetadataLastWriterCommit:
+        case AtomicSite::SharedOutputWriterReserve:
+        case AtomicSite::SharedOutputPublishedExchange:
+        case AtomicSite::SharedMapLookupHeadLoad:
+        case AtomicSite::SharedMapLookupTailLoad:
+        case AtomicSite::SharedMapLookupSeqLoad:
+        case AtomicSite::SharedMapAppendHeadLoad:
+        case AtomicSite::SharedMapAppendTailLoad:
+        case AtomicSite::SharedMapAppendSeqLoad:
+        case AtomicSite::SharedMapAppendSeqResetExchange:
+        case AtomicSite::SharedMapAppendSeqPublishExchange:
+        case AtomicSite::SharedMapAppendTailExchange:
             return true;
         case AtomicSite::Count:
             return false;
@@ -739,12 +905,38 @@ PA_MODEL_INLINE constexpr uint32_t AtomicPollBatchMask(AtomicSite site) {
     return index >= 0 && index < 32 ? 1U << static_cast<uint32_t>(index) : 0U;
 }
 
+PA_MODEL_INLINE constexpr DcciOp DcciSiteExpectedOp(DcciSite site) {
+    switch (site) {
+        case DcciSite::SharedWriterHistoryFlush:
+        case DcciSite::SharedOutputRollbackFlush:
+        case DcciSite::SharedOutputDescriptorFlush:
+        case DcciSite::SharedRegionAppendFlush:
+        case DcciSite::ObserverTraceExport:
+            return DcciOp::CleanOut;
+        default:
+            return DcciOp::Invalidate;
+    }
+}
+
+PA_MODEL_INLINE constexpr bool DcciSiteIsSharedOnly(DcciSite site) {
+    return static_cast<uint32_t>(site) <
+           static_cast<uint32_t>(DcciSite::ObserverTraceExport);
+}
+
 static_assert(
     AtomicSiteIsSharedOnly(AtomicSite::SharedInsertTurnPoll) &&
         AtomicSiteIsSharedOnly(
             AtomicSite::SharedInsertTurnHandoff
         ),
     "insert-turn atomic sites must remain shared-only"
+);
+static_assert(
+    !DcciSiteIsSharedOnly(DcciSite::ObserverTraceExport),
+    "observer trace export must remain available in both TensorMap modes"
+);
+static_assert(
+    !DcciSiteIsSharedOnly(DcciSite::StartupConfigInvalidate),
+    "startup config invalidate must remain available in both TensorMap modes"
 );
 
 #undef PA_MODEL_INLINE
@@ -762,16 +954,23 @@ struct alignas(64) TraceCoreState {
     volatile uint32_t atomic_calls;
     volatile uint32_t poll_calls;
     volatile uint32_t poll_batch_records;
-    // 拓扑在一个 worker 分区内恒定；当前仍保留 64B TraceRecord 兼容布局，
-    // 但在 core state 再保存一份权威身份，host 会验证每条记录与之相符。
+    // 拓扑在一个 worker 分区内恒定；只在 core state 保存一份权威身份，
+    // 32B TraceRecord 不再为每条事件重复写入这 12B。
     volatile int32_t core_idx;
     volatile int32_t block_id;
     volatile int32_t lane;
-    uint32_t padding[8];
+    // 复用 core-state 既有 32B 尾部，不扩大 header。calls/lines 是
+    // logical 总量，records 是实际落盘的 Dcci row 数。
+    volatile uint32_t dcci_calls;
+    volatile uint32_t dcci_lines;
+    volatile uint32_t dcci_records;
+    uint32_t padding[5];
 };
 // 每个 worker 独占一个计数 cache line 和一段定长 records，不需要为了写 trace
 // 再引入跨核 atomic；满容量后只增加本 worker 的 dropped。
 static_assert(sizeof(TraceCoreState) == 64, "trace core state must occupy one cache line");
+static_assert(offsetof(TraceCoreState, dcci_calls) == 32, "DCCI counters must reuse the core-state tail");
+static_assert(offsetof(TraceCoreState, dcci_records) == 40, "DCCI counter layout changed");
 
 struct alignas(64) TraceHeader {
     uint32_t magic;
@@ -779,30 +978,211 @@ struct alignas(64) TraceHeader {
     uint32_t num_cores;
     uint32_t records_per_core;
     uint64_t frequency_hz;
+    // 占用首条 header cache line 的既有 padding，不移动 cores。host/device
+    // 都据此拒绝把旧 64B record 缓冲误解为当前构建的物理 generic ABI。
+    uint32_t record_size_bytes;
     TraceCoreState cores[kRuntimeMaxWorkers];
 };
 // 本 benchmark 固定物理分配 kWorkers=96 个定长 record 分区，合法 header 也要求
 // num_cores==96；其 header/record 布局和 phase 编号可转换为真实泳道使用的 JSON。
+static_assert(offsetof(TraceHeader, record_size_bytes) == 24, "trace record-size offset changed");
+static_assert(offsetof(TraceHeader, cores) == 64, "trace core states must start at the second cache line");
 static_assert(sizeof(TraceHeader) == 6976, "trace header must match PA swimlane layout");
 
-struct alignas(64) TraceRecord {
+struct alignas(32) TraceRecord {
     uint64_t start_cycle;
     uint64_t end_cycle;
     int32_t task_id;
     int32_t function_id;
-    int32_t phase;
-    int32_t lane;
-    int32_t block_id;
-    int32_t core_idx;
     uint32_t flags;
-    uint32_t auxiliary;
+    uint16_t phase;
+    uint16_t auxiliary;
 };
-// start/end 保留原始 1 GHz counter；task/function/物理 lane 用于离线还原轨道。
-// flags/aux 的含义由 phase 决定，例如 winner、Alloc 或 RingBp 类型，不参与调度决策。
-static_assert(sizeof(TraceRecord) == 64, "trace record must occupy one cache line");
+// 与真实 FDWIC 的生产 record 同形：每条只保留事件自身字段，物理
+// core/block/lane 由所属分区的 TraceCoreState 在 host 导出时回填。
+static_assert(offsetof(TraceRecord, flags) == 24, "trace flags offset changed");
+static_assert(offsetof(TraceRecord, phase) == 28, "trace phase offset changed");
+static_assert(offsetof(TraceRecord, auxiliary) == 30, "trace auxiliary offset changed");
+static_assert(
+    sizeof(TraceRecord) == kTraceLogicalRecordSizeBytes,
+    "logical trace record must occupy half a cache line"
+);
+static_assert(alignof(TraceRecord) == 32, "trace record alignment changed");
+static_assert(
+    static_cast<uint32_t>(TracePhase::Count) <= UINT16_MAX,
+    "trace phase does not fit the 16-bit raw ABI"
+);
+static_assert(
+    static_cast<uint32_t>(AtomicSite::Count) <= UINT16_MAX,
+    "atomic site does not fit the 16-bit raw ABI"
+);
+static_assert(
+    static_cast<uint32_t>(DcciSite::Count) <= UINT16_MAX,
+    "DCCI site does not fit the 16-bit raw ABI"
+);
+
+// shared CCEC full-swimlane 的通用物理记录只保留低 32-bit 时钟与一个
+// 紧凑业务字；host 回读后恢复成上面的 32B 逻辑 TraceRecord。flags
+// 完整保留 32 bit，Atomic/DCCI 的既有 raw ABI 不发生裁剪。
+struct alignas(16) CompactTraceRecord16 {
+    uint32_t start_cycle_low;
+    uint32_t end_cycle_low;
+    uint32_t flags;
+    uint32_t packed;
+};
+static_assert(
+    sizeof(CompactTraceRecord16) == 16 &&
+        alignof(CompactTraceRecord16) == 16,
+    "compact generic trace record must occupy 16 bytes"
+);
+static_assert(
+    offsetof(CompactTraceRecord16, start_cycle_low) == 0 &&
+        offsetof(CompactTraceRecord16, end_cycle_low) == 4 &&
+        offsetof(CompactTraceRecord16, flags) == 8 &&
+        offsetof(CompactTraceRecord16, packed) == 12,
+    "compact generic trace offsets changed"
+);
+
+constexpr uint32_t kCompactTraceTaskBits = 13;
+constexpr uint32_t kCompactTraceTaskMask =
+    (1U << kCompactTraceTaskBits) - 1U;
+constexpr uint32_t kCompactTraceTaskSentinel =
+    kCompactTraceTaskMask;
+constexpr uint32_t kCompactTraceFunctionShift = 13;
+constexpr uint32_t kCompactTraceFunctionBits = 3;
+constexpr uint32_t kCompactTraceFunctionMask =
+    (1U << kCompactTraceFunctionBits) - 1U;
+constexpr uint32_t kCompactTraceFunctionSentinel =
+    kCompactTraceFunctionMask;
+constexpr uint32_t kCompactTracePhaseShift = 16;
+constexpr uint32_t kCompactTracePhaseBits = 5;
+constexpr uint32_t kCompactTracePhaseMask =
+    (1U << kCompactTracePhaseBits) - 1U;
+constexpr uint32_t kCompactTraceAuxiliaryShift = 21;
+constexpr uint32_t kCompactTraceAuxiliaryBits = 11;
+constexpr uint32_t kCompactTraceAuxiliaryMask =
+    (1U << kCompactTraceAuxiliaryBits) - 1U;
+
+static_assert(
+    kMaxTasks <= kCompactTraceTaskSentinel,
+    "compact trace task field cannot encode every PA task"
+);
+static_assert(
+    static_cast<uint32_t>(TracePhase::Count) <=
+        kCompactTracePhaseMask + 1U,
+    "compact trace phase field is too narrow"
+);
+static_assert(
+    static_cast<uint32_t>(AtomicSite::Count) <=
+            kCompactTraceAuxiliaryMask + 1U &&
+        static_cast<uint32_t>(DcciSite::Count) <=
+            kCompactTraceAuxiliaryMask + 1U &&
+        kMaxTaskTensors <= kCompactTraceAuxiliaryMask &&
+        kMaxFanin <= kCompactTraceAuxiliaryMask,
+    "compact trace auxiliary field is too narrow"
+);
+
+#ifdef PA_DEVICE
+#define PA_TRACE_ABI_INLINE PA_DEVICE
+#else
+#define PA_TRACE_ABI_INLINE inline
+#endif
+
+PA_TRACE_ABI_INLINE bool CompactTraceFieldsFit(
+    int32_t task_id, int32_t function_id,
+    TracePhase phase, uint32_t auxiliary
+) {
+    return task_id >= -1 &&
+           task_id < static_cast<int32_t>(kMaxTasks) &&
+           function_id >= -1 && function_id <= 3 &&
+           static_cast<uint32_t>(phase) <
+               static_cast<uint32_t>(TracePhase::Count) &&
+           auxiliary <= kCompactTraceAuxiliaryMask;
+}
+
+PA_TRACE_ABI_INLINE uint32_t PackCompactTraceFields(
+    int32_t task_id, int32_t function_id,
+    TracePhase phase, uint32_t auxiliary
+) {
+    return
+        (static_cast<uint32_t>(task_id) &
+         kCompactTraceTaskMask) |
+        ((static_cast<uint32_t>(function_id) &
+          kCompactTraceFunctionMask)
+         << kCompactTraceFunctionShift) |
+        (static_cast<uint32_t>(phase) <<
+         kCompactTracePhaseShift) |
+        (auxiliary << kCompactTraceAuxiliaryShift);
+}
+
+#undef PA_TRACE_ABI_INLINE
+
+#if PA_BUILD_COMPACT_GENERIC_TRACE
+using TraceStorageRecord = CompactTraceRecord16;
+#else
+using TraceStorageRecord = TraceRecord;
+#endif
+static_assert(
+    sizeof(TraceStorageRecord) == kTraceRecordSizeBytes,
+    "generic trace storage size disagrees with the build identity"
+);
+
+struct alignas(32) SharedSubmitClaimTraceRecord {
+    uint64_t claim_begin;
+    // SYS_CNT 在 watchdog 窗口内不会触及 bit63；复用该位保存 winner，
+    // 不为逐 task 固定存在的布尔值扩张记录。
+    uint64_t claim_end_and_winner;
+    uint64_t submit_begin;
+    uint64_t submit_end;
+};
+constexpr uint64_t kSharedClaimWinnerBit = 1ULL << 63;
+static_assert(
+    sizeof(SharedSubmitClaimTraceRecord) == 32 &&
+        alignof(SharedSubmitClaimTraceRecord) == 32,
+    "shared Submit/Claim record must remain 32 bytes"
+);
+static_assert(
+    offsetof(SharedSubmitClaimTraceRecord, claim_begin) == 0 &&
+        offsetof(SharedSubmitClaimTraceRecord, claim_end_and_winner) == 8 &&
+        offsetof(SharedSubmitClaimTraceRecord, submit_begin) == 16 &&
+        offsetof(SharedSubmitClaimTraceRecord, submit_end) == 24,
+    "shared compact Submit/Claim offsets changed"
+);
+#if PTO_FDWIC_SHARED_MAP
+static_assert(
+    kTraceSubmitClaimRecordSizeBytes ==
+        sizeof(SharedSubmitClaimTraceRecord),
+    "shared Submit/Claim layout constant changed"
+);
+#endif
+
+constexpr size_t kTraceSubmitClaimBytesPerCore =
+    static_cast<size_t>(kMaxTasks) *
+    kTraceSubmitClaimRecordSizeBytes;
+constexpr size_t kTraceGenericBytesPerCore =
+    static_cast<size_t>(kTraceRecordsPerCore) *
+    sizeof(TraceStorageRecord);
+static_assert(
+    kTraceSubmitClaimBytesPerCore +
+            kTraceGenericBytesPerCore ==
+        kTraceWorkerBytes,
+    "per-worker trace regions must exactly fill their partition"
+);
+constexpr size_t TraceWorkerOffset(uint32_t worker) {
+    return sizeof(TraceHeader) +
+           static_cast<size_t>(worker) * kTraceWorkerBytes;
+}
+constexpr size_t TraceSubmitClaimOffset(uint32_t worker) {
+    return TraceWorkerOffset(worker);
+}
+constexpr size_t TraceRecordsOffset(uint32_t worker) {
+    return TraceWorkerOffset(worker) +
+           kTraceSubmitClaimBytesPerCore;
+}
 
 constexpr size_t kTraceBytes =
-    sizeof(TraceHeader) + static_cast<size_t>(kWorkers) * kTraceRecordsPerCore * sizeof(TraceRecord);
+    sizeof(TraceHeader) +
+    static_cast<size_t>(kWorkers) * kTraceWorkerBytes;
 
 struct alignas(64) AtomicLine {
     volatile int64_t value;

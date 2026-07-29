@@ -1681,6 +1681,7 @@ PA_DEVICE void PopulateSlotPayload(
     uint32_t fanin_count,
 #if PTO_FDWIC_SHARED_MAP
     PA_GM SharedTensorMapSidecar *shared_map,
+    TraceContext *dcci_trace,
 #endif
     int32_t sub_block_id, bool is_multicore, int32_t won_block,
     int32_t won_slot
@@ -1706,7 +1707,12 @@ PA_DEVICE void PopulateSlotPayload(
                             output_ref.producer_task_id
                         )
                     ].tensors[output_ref.output_slot];
-                SharedCopyOps::InvalidateRegion(
+                (void)TraceConfiguredDcciInvalidate<
+                    SharedCopyOps, SharedDescriptorsDirect
+                >(
+                    dcci_trace, slot.task_id,
+                    static_cast<int32_t>(slot.kind),
+                    DcciSite::SharedWinnerBuildDescriptorInvalidate,
                     &shared_tensor, sizeof(shared_tensor)
                 );
                 CopyGmTensor(slot.tensors[index], shared_tensor);
@@ -1763,6 +1769,7 @@ PA_DEVICE void BuildSlotPayload(
     uint32_t fanin_count,
 #if PTO_FDWIC_SHARED_MAP
     PA_GM SharedTensorMapSidecar &shared_map,
+    TraceContext *dcci_trace = nullptr,
 #endif
     int32_t sub_block_id = 0,
     bool is_multicore = false, int32_t won_block = -1, int32_t won_slot = -1
@@ -1778,8 +1785,8 @@ PA_DEVICE void BuildSlotPayload(
     slot.built = 1;
 #if PTO_FDWIC_SHARED_MAP
     PopulateSlotPayloadImpl<SharedCopyOps, SharedDescriptorsDirect>(
-        slot, args, context, fanin, fanin_count, &shared_map, sub_block_id,
-        is_multicore, won_block, won_slot
+        slot, args, context, fanin, fanin_count, &shared_map, dcci_trace,
+        sub_block_id, is_multicore, won_block, won_slot
     );
 #else
     PopulateSlotPayload(
@@ -1802,7 +1809,8 @@ PA_DEVICE void BuildSlotPayload(
     // false 实例按旧契约从 context.payload 取 shared descriptor，编译期
     // 丢弃 direct 分支，因此内部空 map 不会产生读取或运行时判断。
     PopulateSlotPayloadImpl<void, false>(
-        slot, args, context, fanin, fanin_count, nullptr, 0, false, -1, -1
+        slot, args, context, fanin, fanin_count, nullptr, nullptr,
+        0, false, -1, -1
     );
 #else
     PopulateSlotPayload(

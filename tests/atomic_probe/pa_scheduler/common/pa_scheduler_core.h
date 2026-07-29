@@ -105,13 +105,12 @@ PA_DEVICE uint64_t TraceTimestamp(TraceContext &trace, WorkerResult &result) {
     (void)result;
     return 0;
 #else
+    (void)trace;
     (void)result;
-    // 对齐真实 FDWIC 的 TRACE_SPAN_BEGIN/END：取一次时间后立即以同一
-    // cycle 关闭活跃 PollBatch。不能在 WriteTrace 中统一关闭，否则直接
-    // Atomic 记录也会错误切断等待 episode。
-    const uint64_t cycle = Ops::Now();
-    AtomicPollBoundaryAt<Ops>(trace, cycle);
-    return cycle;
+    // PollBatch 只允许存在于显式 AtomicPollRegionBegin/End 区间，region
+    // end 已用自己的结束时钟完整收口。普通阶段边界只负责取时钟，避免
+    // 每个 Submit 的四个主端点都重复读取 active_mask。
+    return Ops::Now();
 #endif
 }
 
@@ -127,12 +126,12 @@ PA_DEVICE uint64_t TraceTimestampAfterAtomicResult(
     (void)value;
     return 0;
 #else
+    (void)trace;
     (void)result;
-    // 与 TraceTimestamp 保持相同 PollBatch 边界，但让 SYS_CNT 真正依赖
-    // atomic 返回值：该时间表示本核 scalar 已能消费返回值，不宣称跨核可见。
-    const uint64_t cycle = Ops::NowAfterAtomicResult(value);
-    AtomicPollBoundaryAt<Ops>(trace, cycle);
-    return cycle;
+    // 与 TraceTimestamp 一样不触碰已经由显式 region 管理的 PollBatch；
+    // 这里只让 SYS_CNT 真正依赖 atomic 返回值。该时间表示本核 scalar
+    // 已能消费返回值，不宣称跨核可见。
+    return Ops::NowAfterAtomicResult(value);
 #endif
 }
 
@@ -314,7 +313,15 @@ PA_DEVICE int32_t LoadLine(
 }
 
 template <typename Ops>
-PA_DEVICE void SetFatal(PA_GM SchedulerState *state, LocalStats &stats, int32_t task_id = -1) {
+#if defined(PA_COMPETE_FIRST_SPLIT_FINISH) && PA_BUILD_SWIMLANE
+PA_DEVICE_NOINLINE __attribute__((cold))
+#else
+PA_DEVICE
+#endif
+void SetFatal(
+    PA_GM SchedulerState *state, LocalStats &stats,
+    int32_t task_id = -1
+) {
     // fatal 只从 0 单调置 1，重复 Exchange 不会把其他 worker 已观察到的失败状态清除。
     TraceAtomicExchange<Ops>(
         stats.trace, stats.result, task_id, AtomicSite::FatalSet, &state->fatal.value,
@@ -613,7 +620,9 @@ PA_DEVICE void WaitForSlot(
     // 只聚合这个显式背压等待区中的 fanin 观察；每次 Submit 开头的
     // opportunistic EfDrain 仍保留逐条 Atomic，不能仅凭 site 名称全局聚合。
     const uint32_t poll_region = AtomicPollRegionBegin<Ops>(
-        stats.trace, stats.result, TraceAtomicPollBatchMask(AtomicSite::FaninFlagLoad)
+        stats.trace, stats.result,
+        TraceAtomicPollBatchMask(AtomicSite::FaninFlagLoad) |
+            TraceAtomicPollBatchMask(AtomicSite::FatalPoll)
     );
     // 退出条件只有 occupied_count 重新低于可用容量；依赖尚未 ready 时 SpinHint 后继续重试。
     while (worker.occupied_count >= kUsableSlots) {
@@ -627,7 +636,9 @@ PA_DEVICE void WaitForSlot(
             // ready 的后继 slot 顶满。每 1024 次无进展轮询一次 fatal，
             // 只影响真正的背压慢路，不给正常 winner 热路增加原子读取。
             if ((stats.result.wait_iterations[0] & 1023ULL) == 0 &&
-                Ops::Load(&state->fatal.value) != 0) {
+                IsFatal<Ops>(
+                    state, stats, static_cast<int32_t>(task_id)
+                )) {
                 fatal_exit = true;
                 break;
             }
@@ -813,8 +824,9 @@ PA_DEVICE ClaimOutcome Claim(
     // atomicMax 返回写入前的 cursor：old<task_id 表示本核完成首次推进
     // 并获胜，old>=task_id 则必须 Replay。
     const int64_t old = TraceAtomicFetchMax<Ops>(
-        stats.trace, stats.result, static_cast<int32_t>(task_id), AtomicSite::ClaimMax,
-        &cursor->value, static_cast<int64_t>(task_id), outcome.retries
+        stats.trace, stats.result, static_cast<int32_t>(task_id),
+        AtomicSite::ClaimMax, &cursor->value,
+        static_cast<int64_t>(task_id), outcome.retries
     );
     outcome.won = old < static_cast<int64_t>(task_id);
     if (!outcome.won) outcome.function_id = -1;
@@ -879,7 +891,7 @@ PA_DEVICE bool BuildWinner(
 #if PTO_FDWIC_SHARED_MAP
     BuildSlotPayload<Ops, true>(
         slot, task_id, static_cast<uint32_t>(FunctionId(kind)), 0, args, context, fanin, fanin_count,
-        state->shared_map, sub_block_id
+        state->shared_map, &stats.trace, sub_block_id
     );
 #else
     BuildSlotPayload(
@@ -920,14 +932,16 @@ PA_DEVICE bool DiscardBuiltTask(
 
 template <typename Ops>
 PA_DEVICE bool DiscardSharedSlotsAfterReplayFatal(
-    PA_GM SchedulerState *state, PA_GM WorkerState &worker
+    PA_GM SchedulerState *state, PA_GM WorkerState &worker,
+    LocalStats &stats
 ) {
     // 只有所有 worker 都已退出 replay、不会再生产 slot 后才能调用。
     // fatal 表示本轮结果已经整体无效；此时未完成 fanin 不可能再获得
     // completion，继续 FinalDrain 只会永久自旋。保留 slot 的 task 与
     // 尚未就绪 fanin 后缀供诊断；已确认 ready 的前缀可能已被 SlotReady
     // 移除。这里只清除本地执行资格与占用计数。
-    if (state == nullptr || Ops::Load(&state->fatal.value) == 0) {
+    if (state == nullptr ||
+        !IsFatal<Ops>(state, stats, /*task_id=*/-1)) {
         return false;
     }
     uint32_t occupied_slots = 0;
@@ -1110,12 +1124,14 @@ PA_DEVICE bool WaitForSharedOutputPublished(
          ].published[output_ref.output_slot].value;
     const int64_t expected =
         static_cast<int64_t>(output_ref.producer_task_id);
+    // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 旧通用 output 等待仅由隔离测试使用；正式 ordered Submit 走带观察的单次校验
     int64_t observed = Ops::Load(published);
     if (observed == expected) {
         return true;
     }
     if (observed != -1) {
         if (fatal != nullptr) {
+            // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 旧通用 output 等待的隔离测试失败出口
             (void)Ops::Exchange(fatal, static_cast<int32_t>(1));
         }
         return false;
@@ -1128,12 +1144,14 @@ PA_DEVICE bool WaitForSharedOutputPublished(
     uint32_t polls = 0;
     while (true) {
         Ops::SpinHint();
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 旧通用 output 等待的隔离测试轮询
         observed = Ops::Load(published);
         if (observed == expected) {
             return true;
         }
         if (observed != -1) {
             if (fatal != nullptr) {
+                // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 旧通用 output 等待的隔离测试失败出口
                 (void)Ops::Exchange(fatal, static_cast<int32_t>(1));
             }
             return false;
@@ -1142,11 +1160,13 @@ PA_DEVICE bool WaitForSharedOutputPublished(
         if ((polls & 1023U) != 0) {
             continue;
         }
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 旧通用 output 等待的隔离测试 watchdog
         if (fatal != nullptr && Ops::Load(fatal) != 0) {
             return false;
         }
         if (Ops::Now() - begin > kWatchdogTicks) {
             if (fatal != nullptr) {
+                // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 旧通用 output 等待的隔离测试超时出口
                 (void)Ops::Exchange(fatal, static_cast<int32_t>(1));
             }
             return false;
@@ -1159,10 +1179,11 @@ PA_DEVICE bool WaitForSharedOutputPublished(
 // completion；逐 task predecessor completion 链又先于 N 取得 turn。因此
 // 此处若仍未观察到精确的 P，不存在继续轮询后可恢复的正常时序，只能把它
 // 视为协议错误。未取得该前提的通用路径必须继续使用上面的 Wait helper。
-template <typename Ops>
+template <typename Ops, bool ObserveAtomics = false>
 PA_DEVICE bool CheckSharedOutputPublishedAfterInsertTurn(
     PA_GM SharedTensorMapSidecar &map,
-    const FdwicOutputRef &output_ref
+    const FdwicOutputRef &output_ref, int32_t task_id,
+    AtomicSite site, LocalStats *stats
 ) {
     if (!IsPlainSharedOutputRef(output_ref)) {
         return false;
@@ -1173,7 +1194,11 @@ PA_DEVICE bool CheckSharedOutputPublishedAfterInsertTurn(
          ].published[
              static_cast<uint32_t>(output_ref.output_slot)
          ].value;
-    return Ops::Load(published) ==
+    return TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
+               stats == nullptr ? nullptr : &stats->trace,
+               stats == nullptr ? nullptr : &stats->result,
+               task_id, site, published
+           ) ==
            static_cast<int64_t>(output_ref.producer_task_id);
 }
 
@@ -1218,7 +1243,8 @@ template <typename Ops>
 PA_DEVICE bool ResolveSharedSymbolWriterBefore(
     PA_GM SharedTensorMapSidecar &map,
     const FdwicOutputRef &output_ref, int32_t reader_task,
-    int32_t reader_lower_bound, int32_t &resolved_writer
+    int32_t reader_lower_bound, int32_t &resolved_writer,
+    LocalStats &stats
 ) {
     uint32_t symbol_key = 0;
     if (!SharedSymbolHistoryKey(output_ref, symbol_key) ||
@@ -1234,7 +1260,9 @@ PA_DEVICE bool ResolveSharedSymbolWriterBefore(
             )
         ];
     int64_t latest =
-        Ops::Load(
+        TraceAtomicLoad<Ops>(
+            stats.trace, stats.result, reader_task,
+            AtomicSite::SharedFaninLastWriterLoad,
             &origin.last_writer[
                 static_cast<uint32_t>(output_ref.output_slot)
             ].value
@@ -1251,7 +1279,11 @@ PA_DEVICE bool ResolveSharedSymbolWriterBefore(
         // latest CAS 是这份 immutable history 的发布边界。先失效首行
         // 取得 header；若该 task 有超过六个 symbol writer，再只失效
         // 余下实际使用的连续 record 行。
-        Ops::InvalidateRegion(&history, 64);
+        (void)TraceConfiguredDcciInvalidate<Ops, true>(
+            &stats.trace, reader_task, -1,
+            DcciSite::SharedFaninHistoryInvalidate,
+            &history, 64
+        );
         const uint32_t count = history.count;
         if (history.magic != kSharedWriterHistoryMagic ||
             history.writer_task != latest ||
@@ -1265,7 +1297,9 @@ PA_DEVICE bool ResolveSharedSymbolWriterBefore(
             static_cast<uint64_t>(count) *
                 sizeof(SharedWriterHistoryRecord);
         if (used_bytes > 64) {
-            Ops::InvalidateRegion(
+            (void)TraceConfiguredDcciInvalidate<Ops, true>(
+                &stats.trace, reader_task, -1,
+                DcciSite::SharedFaninHistoryInvalidate,
                 &history.entries[6], used_bytes - 64
             );
         }
@@ -1401,8 +1435,12 @@ PA_DEVICE uint32_t CollectSharedFanin(
                 // predecessor completion 链已经证明 producer 完成了 output
                 // 发布，未就绪只能立即按协议错误返回，不能重新打开轮询。
                 output_published =
-                    CheckSharedOutputPublishedAfterInsertTurn<Ops>(
-                        map, output_ref
+                    CheckSharedOutputPublishedAfterInsertTurn<
+                        Ops, true
+                    >(
+                        map, output_ref, task_id,
+                        AtomicSite::SharedFaninOutputPublishedLoad,
+                        &stats
                     );
             } else {
                 output_published =
@@ -1453,7 +1491,7 @@ PA_DEVICE uint32_t CollectSharedFanin(
                 // 再与 ordinary lookup 一样过滤到 [N-H,N)。
                 if (!ResolveSharedSymbolWriterBefore<Ops>(
                         map, output_ref, task_id,
-                        reader_lower_bound, writer
+                        reader_lower_bound, writer, stats
                     )) {
                     protocol_ok = false;
                     return 0;
@@ -1471,6 +1509,7 @@ PA_DEVICE uint32_t CollectSharedFanin(
                         ? expected_shared_writer
                         : output_ref.producer_task_id;
                 writer = static_cast<int32_t>(
+                    // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - AcceptLatestWriter=false 的旧 PA oracle 分支不进入当前 shared scheduler
                     Ops::Load(
                         &cell.last_writer[
                             output_ref.output_slot
@@ -1516,8 +1555,10 @@ PA_DEVICE uint32_t CollectSharedFanin(
                 (tag == TensorArgType::Input &&
                  (owner != kInvalidTaskId || AcceptLatestWriter))) {
                 bool lookup_ok = false;
-                const int32_t producer = SharedLookupTensor<Ops>(
-                    map, tensor, task_id, heap_window, lookup_ok
+                const int32_t producer =
+                    SharedLookupTensor<Ops, true>(
+                    map, tensor, task_id, heap_window, lookup_ok,
+                    &stats.trace, &stats.result
                 );
                 if (!lookup_ok) {
                     protocol_ok = false;
@@ -1553,8 +1594,10 @@ PA_DEVICE uint32_t CollectSharedFanin(
                 (tag == TensorArgType::Input &&
                  (owner != kInvalidTaskId || AcceptLatestWriter))) {
                 bool lookup_ok = false;
-                const int32_t producer = SharedLookupTensor<Ops>(
-                    map, tensor, task_id, heap_window, lookup_ok
+                const int32_t producer =
+                    SharedLookupTensor<Ops, true>(
+                    map, tensor, task_id, heap_window, lookup_ok,
+                    &stats.trace, &stats.result
                 );
                 if (!lookup_ok) {
                     protocol_ok = false;
@@ -1599,6 +1642,7 @@ PA_DEVICE bool PublishSharedWriterReady(
     // 可执行/已完成。CAS 只允许初始化 sentinel -> task_id：重复 winner
     // 或错误 task-cell 复用不会先写入一个合法门值再报告失败。
     Ops::StoreBarrier();
+    // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 旧 writer-ready 协议只供隔离门槛，正式路径直接发布 task completion
     return Ops::CompareExchange(
                &state->tasks[static_cast<uint32_t>(task_id)].deps_prepared,
                static_cast<int64_t>(-1),
@@ -1616,6 +1660,7 @@ PA_DEVICE bool WaitForSharedWriterReady(
     }
     PA_GM volatile int64_t *prepared =
         &state->tasks[static_cast<uint32_t>(task_id)].deps_prepared;
+    // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 旧 writer-ready 等待只供隔离门槛
     int64_t observed = Ops::Load(prepared);
     if (observed == task_id) {
         return true;
@@ -1629,6 +1674,7 @@ PA_DEVICE bool WaitForSharedWriterReady(
     uint32_t polls = 0;
     while (true) {
         Ops::SpinHint();
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 旧 writer-ready 等待只供隔离门槛
         observed = Ops::Load(prepared);
         if (observed == task_id) {
             return true;
@@ -1858,8 +1904,9 @@ PA_DEVICE bool CommitOrdinarySharedWriterIntent(
     }
 
     bool lookup_ok = false;
-    const int32_t previous = SharedLookupTensor<Ops>(
-        map, tensor, task_id, heap_window, lookup_ok
+    const int32_t previous = SharedLookupTensor<Ops, true>(
+        map, tensor, task_id, heap_window, lookup_ok,
+        &stats.trace, &stats.result
     );
     if (!lookup_ok ||
         !AddSharedWriterIntentFanin(
@@ -1938,6 +1985,7 @@ PA_DEVICE bool CommitSymbolSharedWriterIntentSet(
              ].last_writer[
                  static_cast<uint32_t>(output_ref.output_slot)
              ].value;
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - generic writer-intent helper 不进入当前 prepared ordered Submit
         const int64_t previous = Ops::Load(last_writer);
         if (previous < output_ref.producer_task_id ||
             previous >= task_id ||
@@ -1964,7 +2012,11 @@ PA_DEVICE bool CommitSymbolSharedWriterIntentSet(
         offsetof(SharedWriterHistoryCell, entries) +
         static_cast<uint64_t>(count) *
             sizeof(SharedWriterHistoryRecord);
-    Ops::FlushRegion(&history, history_bytes);
+    (void)TraceConfiguredDcciFlush<Ops, false>(
+        nullptr, task_id, -1,
+        DcciSite::SharedWriterHistoryFlush,
+        &history, history_bytes
+    );
     Ops::StoreBarrier();
 
     // last_writer CAS 是每条前驱记录的发布边界。history 已整体写回，
@@ -1985,6 +2037,7 @@ PA_DEVICE bool CommitSymbolSharedWriterIntentSet(
              ].last_writer[
                  static_cast<uint32_t>(output_ref.output_slot)
              ].value;
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - generic writer-intent helper 不进入当前 prepared ordered Submit
         if (Ops::CompareExchange(
                 last_writer,
                 static_cast<int64_t>(record.previous_writer),
@@ -2004,11 +2057,12 @@ PA_DEVICE bool CommitSymbolSharedWriterIntentSet(
 // 丢弃的 fanin；previous writer 仍必须在取得 turn 后读取，才能写入当前
 // task 的不可变 history。通用 CommitSymbolSharedWriterIntentSet 继续保留
 // 原有等待 publication、收集 fanin 和逐项统计的合同，二者不能互换。
-template <typename Ops>
+template <typename Ops, bool ObserveAtomics = false>
 PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
     PA_GM SharedTensorMapSidecar &map,
     const uint32_t *symbol_keys, uint32_t symbol_count,
-    int32_t task_id, PA_GM volatile int32_t *fatal
+    int32_t task_id, PA_GM volatile int32_t *fatal,
+    LocalStats *stats = nullptr
 ) {
     // 正式 ordered Submit 在 task-level completion 成功后统一记录完整
     // transaction；本 helper 固定不产生逐项成功统计，避免部分 CAS 前缀
@@ -2031,12 +2085,22 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
             SharedSymbolHistoryReference(symbol_key);
         if (!IsPlainSharedOutputRef(output_ref) ||
             output_ref.producer_task_id >= task_id ||
-            !CheckSharedOutputPublishedAfterInsertTurn<Ops>(
-                map, output_ref
+            !CheckSharedOutputPublishedAfterInsertTurn<
+                Ops, ObserveAtomics
+            >(
+                map, output_ref, task_id,
+                AtomicSite::SharedMetadataOutputPublishedLoad,
+                stats
             )) {
             if (fatal != nullptr) {
-                (void)Ops::Exchange(
-                    fatal, static_cast<int32_t>(1)
+                (void)TraceConfiguredAtomicExchange<
+                    Ops, ObserveAtomics
+                >(
+                    stats == nullptr ? nullptr : &stats->trace,
+                    stats == nullptr ? nullptr : &stats->result,
+                    task_id, AtomicSite::FatalSet,
+                    fatal, static_cast<int32_t>(1),
+                    /*result_used=*/false
                 );
             }
             return false;
@@ -2050,7 +2114,13 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
              ].last_writer[
                  static_cast<uint32_t>(output_ref.output_slot)
              ].value;
-        const int64_t previous = Ops::Load(last_writer);
+        const int64_t previous =
+            TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
+                stats == nullptr ? nullptr : &stats->trace,
+                stats == nullptr ? nullptr : &stats->result,
+                task_id, AtomicSite::SharedMetadataLastWriterLoad,
+                last_writer
+            );
         if (previous < output_ref.producer_task_id ||
             previous >= task_id) {
             return false;
@@ -2068,7 +2138,11 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
         offsetof(SharedWriterHistoryCell, entries) +
         static_cast<uint64_t>(symbol_count) *
             sizeof(SharedWriterHistoryRecord);
-    Ops::FlushRegion(&history, history_bytes);
+    (void)TraceConfiguredDcciFlush<Ops, ObserveAtomics>(
+        stats == nullptr ? nullptr : &stats->trace,
+        task_id, -1, DcciSite::SharedWriterHistoryFlush,
+        &history, history_bytes
+    );
     Ops::StoreBarrier();
 
     for (uint32_t index = 0; index < symbol_count; ++index) {
@@ -2087,7 +2161,13 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
              ].last_writer[
                  static_cast<uint32_t>(output_ref.output_slot)
              ].value;
-        if (Ops::CompareExchange(
+        if (TraceConfiguredAtomicCompareExchange<
+                Ops, ObserveAtomics
+            >(
+                stats == nullptr ? nullptr : &stats->trace,
+                stats == nullptr ? nullptr : &stats->result,
+                task_id,
+                AtomicSite::SharedMetadataLastWriterCommit,
                 last_writer,
                 static_cast<int64_t>(record.previous_writer),
                 static_cast<int64_t>(task_id)
@@ -2129,6 +2209,7 @@ PA_DEVICE SharedWriterIntentResult PrepareSharedWriterIntentSet(
         context.fanin_count < 0 ||
         context.fanin_count > static_cast<int32_t>(kMaxFanin) ||
         !ValidateSharedWriterIntentSet(args, task_id) ||
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - generic writer-intent helper 不进入当前 prepared ordered Submit
         Ops::Load(&state->fatal.value) != 0) {
         SetFatal<Ops>(state, stats, task_id);
         return SharedWriterIntentResult::Failed;
@@ -2286,6 +2367,7 @@ PA_DEVICE bool CommitSharedFaninWriters(
             return false;
         }
         uint64_t retries = 0;
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 旧 PA writer-intent 路径只由隔离测试覆盖
         const int64_t observed = Ops::FetchMax(
             &map.shared_outputs[
                  static_cast<uint32_t>(output_ref.producer_task_id)
@@ -2461,16 +2543,29 @@ PA_DEVICE bool PreparePaSharedWriterIntent(
 // kernel completion 仍由独立 completion flag 表达。
 template <typename Ops>
 PA_DEVICE_NOINLINE void RollbackSharedTaskOutputs(
-    PA_GM SharedOutputCell &cell, uint32_t output_count
+    PA_GM SharedOutputCell &cell, uint32_t output_count,
+    int32_t task_id = -1, LocalStats *stats = nullptr
 ) {
     // 此入口只处理唯一 producer cell 出现非法竞争后的冷失败路径。先撤销发布位，
     // 使任何非法越界 reader 都不能继续消费，再恢复 writer 与 descriptor
     // 的未发布状态；正常 Submit 不执行这些额外 atomic/DCCI。
     for (uint32_t output = 0; output < output_count; ++output) {
-        (void)Ops::Exchange(&cell.published[output].value, -1);
+        (void)TraceOptionalAtomicExchange<Ops>(
+            stats == nullptr ? nullptr : &stats->trace,
+            stats == nullptr ? nullptr : &stats->result,
+            task_id, AtomicSite::SharedOutputRollbackExchange,
+            &cell.published[output].value, static_cast<int64_t>(-1),
+            /*result_used=*/false
+        );
     }
     for (uint32_t output = 0; output < output_count; ++output) {
-        (void)Ops::Exchange(&cell.last_writer[output].value, -1);
+        (void)TraceOptionalAtomicExchange<Ops>(
+            stats == nullptr ? nullptr : &stats->trace,
+            stats == nullptr ? nullptr : &stats->result,
+            task_id, AtomicSite::SharedOutputRollbackExchange,
+            &cell.last_writer[output].value, static_cast<int64_t>(-1),
+            /*result_used=*/false
+        );
     }
     for (uint32_t output = 0; output < output_count; ++output) {
         PA_GM volatile uint8_t *descriptor =
@@ -2482,7 +2577,9 @@ PA_DEVICE_NOINLINE void RollbackSharedTaskOutputs(
         }
     }
     if (output_count != 0) {
-        Ops::FlushRegion(
+        (void)TraceConfiguredDcciFlush<Ops, true>(
+            stats == nullptr ? nullptr : &stats->trace,
+            task_id, -1, DcciSite::SharedOutputRollbackFlush,
             &cell.tensors[0],
             static_cast<uint64_t>(output_count) * sizeof(TensorDesc)
         );
@@ -2491,7 +2588,7 @@ PA_DEVICE_NOINLINE void RollbackSharedTaskOutputs(
 
 // 可选时间戳 out-param 只在正式 Materialize 泳道路径传入；单元测试与
 // 其它 helper 继续走默认空指针，不强制携带 LocalStats。
-template <typename Ops>
+template <typename Ops, bool ObserveAtomics = false>
 PA_DEVICE bool PublishSharedTaskOutputs(
     PA_GM SharedTensorMapSidecar &map, const SubmitContext &context,
     uint32_t task_id, LocalStats *stats = nullptr,
@@ -2520,18 +2617,40 @@ PA_DEVICE bool PublishSharedTaskOutputs(
     // FetchMax 预留全部 writer 控制字，并在异常旧值时撤回本次已预留项。
     for (uint32_t output = 0; output < context.result.count; ++output) {
         uint64_t retries = 0;
-        const int64_t observed = Ops::FetchMax(
+        const int64_t observed =
+            TraceConfiguredAtomicFetchMax<Ops, ObserveAtomics>(
+            stats == nullptr ? nullptr : &stats->trace,
+            stats == nullptr ? nullptr : &stats->result,
+            static_cast<int32_t>(task_id),
+            AtomicSite::SharedOutputWriterReserve,
             &cell.last_writer[output].value,
             static_cast<int64_t>(task_id), retries
         );
         if (observed != -1) {
             // atomicMax 在 observed<task_id 时已经改写当前 slot；无论旧值
             // 大小都显式恢复，前面已成功预留的 slot 则回到 -1。
-            (void)Ops::Exchange(
-                &cell.last_writer[output].value, observed
+            (void)TraceConfiguredAtomicExchange<
+                Ops, ObserveAtomics
+            >(
+                stats == nullptr ? nullptr : &stats->trace,
+                stats == nullptr ? nullptr : &stats->result,
+                static_cast<int32_t>(task_id),
+                AtomicSite::SharedOutputRollbackExchange,
+                &cell.last_writer[output].value, observed,
+                /*result_used=*/false
             );
             for (uint32_t previous = 0; previous < output; ++previous) {
-                (void)Ops::Exchange(&cell.last_writer[previous].value, -1);
+                (void)TraceConfiguredAtomicExchange<
+                    Ops, ObserveAtomics
+                >(
+                    stats == nullptr ? nullptr : &stats->trace,
+                    stats == nullptr ? nullptr : &stats->result,
+                    static_cast<int32_t>(task_id),
+                    AtomicSite::SharedOutputRollbackExchange,
+                    &cell.last_writer[previous].value,
+                    static_cast<int64_t>(-1),
+                    /*result_used=*/false
+                );
             }
             return false;
         }
@@ -2577,14 +2696,24 @@ PA_DEVICE bool PublishSharedTaskOutputs(
     }
 #endif
     if (context.result.count != 0) {
-        Ops::FlushRegion(
+        const uint64_t known_begin =
+            flush_begin == nullptr ? 0 : *flush_begin;
+        const uint64_t dcci_end =
+            TraceConfiguredDcciFlush<Ops, ObserveAtomics>(
+            stats == nullptr ? nullptr : &stats->trace,
+            static_cast<int32_t>(task_id), -1,
+            DcciSite::SharedOutputDescriptorFlush,
             &cell.tensors[0],
             static_cast<uint64_t>(context.result.count) *
-                sizeof(TensorDesc)
+                sizeof(TensorDesc),
+            nullptr, known_begin
         );
+        if (flush_end != nullptr) {
+            *flush_end = dcci_end;
+        }
     }
 #if !PA_BUILD_TRACE_FREE
-    if (flush_end != nullptr) {
+    if (flush_end != nullptr && context.result.count == 0) {
         *flush_end = stats != nullptr
             ? TraceTimestamp<Ops>(stats->trace, stats->result)
             : 0;
@@ -2596,10 +2725,19 @@ PA_DEVICE bool PublishSharedTaskOutputs(
 #endif
     Ops::StoreBarrier();
     for (uint32_t output = 0; output < context.result.count; ++output) {
-        if (Ops::Exchange(
-                &cell.published[output].value, static_cast<int64_t>(task_id)
+        if (TraceConfiguredAtomicExchange<Ops, ObserveAtomics>(
+                stats == nullptr ? nullptr : &stats->trace,
+                stats == nullptr ? nullptr : &stats->result,
+                static_cast<int32_t>(task_id),
+                AtomicSite::SharedOutputPublishedExchange,
+                &cell.published[output].value,
+                static_cast<int64_t>(task_id),
+                /*result_used=*/true
             ) != -1) {
-            RollbackSharedTaskOutputs<Ops>(cell, context.result.count);
+            RollbackSharedTaskOutputs<Ops>(
+                cell, context.result.count,
+                static_cast<int32_t>(task_id), stats
+            );
             return false;
         }
     }
@@ -2923,9 +3061,6 @@ PA_DEVICE bool CloseSharedCallbackSubmit(
     const SharedPaTaskMeta &shared_task_meta
 ) {
     const uint32_t task_id = ticket.task_id;
-    const int32_t function_id =
-        static_cast<int32_t>(ticket.function_id);
-    const bool winner = ticket.won != 0;
     ++stats.result.submits;
 
     // shared 的总 task 数取决于每批 context_len。末次身份由调用者在
@@ -2946,11 +3081,9 @@ PA_DEVICE bool CloseSharedCallbackSubmit(
     const uint64_t submit_end =
         TraceTimestamp<Ops>(stats.trace, stats.result);
 #endif
-    WriteTrace<Profile>(
-        stats.trace, stats.result, static_cast<int32_t>(task_id),
-        function_id, TracePhase::Submit, ProfilePhase::Submit,
-        ticket.submit_begin, submit_end, winner ? 1U : 0U,
-        shared_task_meta.kind == TaskKind::Alloc ? 1U : 0U
+    WriteSharedSubmitTrace<Profile>(
+        stats.trace, stats.result, task_id,
+        ticket.submit_begin, submit_end
     );
     if (!is_last_submit) {
         return true;
@@ -3057,6 +3190,7 @@ PA_DEVICE bool FinishCallbackSubmitBody(
     // 删除 exact-turn 不能连带删除它成功出口的终止态检查：若其他核已经
     // 广播 fatal，本 winner 不得继续预留 heap、构建 slot 或发布 symbol。
     // 这里直接使用 Ops，不扩张 atomic 泳道记录，也不恢复任何全局前沿。
+    // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 该分支位于 private 外层中的不可达 shared 旧实现
     if (Ops::Load(&state->fatal.value) != 0) {
         return false;
     }
@@ -3514,25 +3648,46 @@ PA_DEVICE bool SubmitCallbackTask(
     DrainReady<Ops>(state, worker, DrainPlace::EfDrain, stats);
     EndSubmitPmuPhase<SubmitPmuPhase::EfDrain, Ops>(pmu_context);
     const uint64_t efdrain_end = TraceTimestamp<Ops>(stats.trace, stats.result);
+#if PTO_FDWIC_SHARED_MAP
+    // shared 的 EfDrain 边界与现有父子记录严格重合：
+    //   begin = Submit.start，end = Claim.start。
+    // 设备不再为它单写一条 32B raw；converter/analyzer 用这两个既有
+    // 端点精确还原泳道。Profile 聚合与 submit-pmu 的原始边界保持不变。
+    AccumulatePhase<Profile>(
+        stats.result, ProfilePhase::EfDrain,
+        efdrain_begin, efdrain_end
+    );
+#else
     WriteTrace<Profile>(
         stats.trace, stats.result, static_cast<int32_t>(task_id), -1,
         TracePhase::EfDrain, ProfilePhase::EfDrain, efdrain_begin, efdrain_end
     );
+#endif
 
     const uint64_t claim_begin = efdrain_end;
     BeginSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
-    const ClaimOutcome claim = Claim<Ops>(state, worker, task_id, Kind, stats);
+    const ClaimOutcome claim =
+        Claim<Ops>(state, worker, task_id, Kind, stats);
     context.won = claim.won;
     context.kernel_id = claim.function_id;
     RecordClaimOutcome(stats, Kind, claim);
     EndSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
     const uint64_t claim_end = TraceTimestamp<Ops>(stats.trace, stats.result);
+#if PTO_FDWIC_SHARED_MAP
+    WriteSharedClaimTrace<Profile>(
+        stats.trace, stats.result, task_id,
+        claim_begin, claim_end, claim.won
+    );
+#else
     WriteTrace<Profile>(
-        stats.trace, stats.result, static_cast<int32_t>(task_id), claim.function_id,
-        TracePhase::Claim, ProfilePhase::Claim, claim_begin, claim_end,
-        (claim.won ? kClaimWon : 0U) | (claim.attempted ? kClaimAttempted : 0U),
+        stats.trace, stats.result, static_cast<int32_t>(task_id),
+        claim.function_id, TracePhase::Claim,
+        ProfilePhase::Claim, claim_begin, claim_end,
+        (claim.won ? kClaimWon : 0U) |
+            (claim.attempted ? kClaimAttempted : 0U),
         Kind == TaskKind::Alloc ? 1U : 0U
     );
+#endif
 
 #if PTO_FDWIC_SHARED_MAP
     // fresh Output 的返回值是 task/slot 符号，不依赖哪个 worker 获胜。
@@ -3772,9 +3927,15 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     // 在解释任何可能随 TensorMap 模式变化的 WorkerState 之前，先失效 host
     // 写入的控制区并核对稳定构建身份；混合 host/kernel 会置 fatal 后退出，
     // 不允许继续用错误 sizeof 或模式解释 GM。
-    Ops::InvalidateRegion(
+    constexpr uint64_t kStartupConfigBytes =
+        sizeof(state->config) + sizeof(state->pmu_probe) +
+        sizeof(state->winner_workload);
+    uint64_t startup_dcci_begin = 0;
+    uint64_t startup_dcci_end = 0;
+    CapturePreAttachDcciInvalidate<Ops>(
         &state->config,
-        sizeof(state->config) + sizeof(state->pmu_probe) + sizeof(state->winner_workload)
+        kStartupConfigBytes,
+        startup_dcci_begin, startup_dcci_end
     );
     const bool build_identity_matches =
         state->config.build_identity_magic == kBuildIdentityMagic &&
@@ -3783,7 +3944,9 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         state->config.scheduler_state_size == static_cast<uint32_t>(sizeof(SchedulerState)) &&
         state->pmu_probe.build_variant == kCompiledBuildVariant;
     if (!build_identity_matches) {
-        (void)Ops::Exchange(&state->fatal.value, static_cast<int32_t>(1));
+        (void)PreAttachAtomicExchange<Ops>(
+            &state->fatal.value, static_cast<int32_t>(1)
+        );
         return;
     }
     PA_GM WorkerState &worker = state->workers[worker_id];
@@ -3837,6 +4000,42 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     stats.result.role = static_cast<uint32_t>(role);
     stats.result.checksum = 0;
     stats.trace = AttachTrace<Ops>(state, worker, worker_id);
+#if PA_BUILD_ATOMIC_SWIMLANE
+    // 完整泳道产物把阶段、Atomic 与 DCCI 视为同一构建合同。入口一次性
+    // 验证 host 配置与 raw header；成功后各条记录可省掉重复附着判断。
+    if (stats.trace.core == nullptr ||
+        stats.trace.records == nullptr ||
+        stats.trace.capacity != kTraceRecordsPerCore ||
+        !stats.trace.atomics_enabled) {
+        (void)PreAttachAtomicExchange<Ops>(
+            &state->fatal.value, static_cast<int32_t>(1)
+        );
+        return;
+    }
+#endif
+#if !PA_BUILD_TRACE_FREE
+    if (TraceStorageAttached(stats.trace)) {
+        const uint32_t startup_dcci_lines =
+            DcciRegionCacheLineCount(
+                &state->config, kStartupConfigBytes
+            );
+        if (startup_dcci_lines != 0) {
+            (void)WriteDcciTrace(
+                stats.trace, -1, -1,
+                DcciSite::StartupConfigInvalidate,
+                DcciOp::Invalidate,
+                /*trailing_dsb=*/true,
+                startup_dcci_lines,
+                startup_dcci_begin, startup_dcci_end
+            );
+        } else {
+            stats.trace.dcci_counter_overflow = true;
+        }
+    }
+#else
+    (void)startup_dcci_begin;
+    (void)startup_dcci_end;
+#endif
 
     // startup 严格保持生产 flat 语义；本实验只改变 replay 尾部的 final 汇合。
     // 96 个参与者全部完成本地状态初始化后再进入 task 0，主要用于压低启动偏斜对
@@ -4130,7 +4329,8 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     const uint32_t final_poll_region = AtomicPollRegionBegin<Ops>(
         stats.trace, stats.result,
         TraceAtomicPollBatchMask(AtomicSite::ReplayDonePoll) |
-            TraceAtomicPollBatchMask(AtomicSite::FaninFlagLoad)
+            TraceAtomicPollBatchMask(AtomicSite::FaninFlagLoad) |
+            TraceAtomicPollBatchMask(AtomicSite::FatalPoll)
     );
     bool leaf_forwarded = false;
     bool middle_forwarded = false;
@@ -4168,7 +4368,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             ++final_stall_polls;
             if ((final_stall_polls & 1023U) == 0) {
                 (void)DiscardSharedSlotsAfterReplayFatal<Ops>(
-                    state, worker
+                    state, worker, stats
                 );
             }
         } else {
@@ -4202,7 +4402,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     );
 
 #if !PA_BUILD_TRACE_FREE
-    if (stats.trace.atomics_enabled) {
+    if (AtomicSwimlaneEnabled(stats.trace)) {
         // 两条基线都放在最终 drain 之后。第一条量连续
         // SYS_CNT，第二条量返回依赖钩子的固定成本；它们只描述计时底噪，不能
         // 从每条 atomic 中机械相减后宣称得到跨核全局可见性延迟。
@@ -4245,6 +4445,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #else
     const bool finish_state_matches =
         task_count == 0
+            // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - private split-finish 诊断不属于 standalone shared scheduler
             ? Ops::Load(&state->fatal.value) != 0 &&
                   split_runtime.finish_calls == 0 &&
                   split_runtime.finish_state_address == 0

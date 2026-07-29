@@ -184,6 +184,22 @@ else
     echo "[TEST] shared sparse raw-trace self-test"
     "$BUILD_DIR/test_shared_sparse_trace"
 
+    # CCEC full-swimlane 的 16B generic raw 仍由 host 恢复成既有 32B
+    # 逻辑记录。该纯主机门槛独立锁定 packed 字段、low32 前/后向回绕、
+    # 生命周期拒绝和 terminal 4B 更新的 cache-line 邻值不变。
+    echo "[BUILD] shared compact generic-trace codec self-test"
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -DPA_BUILD_ATOMIC_SWIMLANE=1 \
+        -DPA_BUILD_COMPACT_GENERIC_TRACE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/test/test_shared_compact_generic_trace.cpp" \
+        -o "$BUILD_DIR/test_shared_compact_generic_trace"
+
+    echo "[TEST] shared compact generic-trace codec self-test"
+    "$BUILD_DIR/test_shared_compact_generic_trace"
+
     # fresh-output symbol 与 region ring 是两条独立协议。该用例单独锁定
     # descriptor 最终封口、只读 fanin、ready descriptor 直写 slot、
     # 构建后 INOUT writer commit、失败 slot 撤销及非法引用 fail-closed，

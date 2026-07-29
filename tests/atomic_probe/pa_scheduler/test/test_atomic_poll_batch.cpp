@@ -100,7 +100,8 @@ struct Fixture {
     Fixture() {
         trace.core = &core;
         trace.records = records;
-        trace.capacity = static_cast<uint32_t>(sizeof(records) / sizeof(records[0]));
+        trace.capacity =
+            static_cast<uint32_t>(sizeof(records) / sizeof(records[0]));
         trace.atomics_enabled = true;
     }
 };
@@ -126,7 +127,7 @@ void TestSplitAtMaximumCount() {
     // 第 0xFFFFFF 次调用属于第一条记录，并在达到 24-bit 上限时立即落盘。
     AccumulateAtomicPollCall<TestOps>(fixture.trace, fixture.result, kSite, kFirstStart);
 
-    Expect(fixture.core.count == 1U, "达到最大计数时应立即写出第一条记录");
+    Expect(fixture.trace.record_count == 1U, "达到最大计数时应立即写出第一条记录");
     Expect(fixture.trace.poll_batch_records == 1U, "第一条 PollBatch 物理记录计数错误");
     Expect(fixture.trace.poll_burst.active_mask == 0U, "达到上限后 active mask 应清零");
     Expect(
@@ -164,7 +165,7 @@ void TestSplitAtMaximumCount() {
     );
     AtomicPollBoundaryAt<TestOps>(fixture.trace, kSecondEnd);
 
-    Expect(fixture.core.count == 2U, "max+1 次调用应写出两条记录");
+    Expect(fixture.trace.record_count == 2U, "max+1 次调用应写出两条记录");
     Expect(fixture.trace.poll_batch_records == 2U, "max+1 次调用的物理 batch 数错误");
     Expect(fixture.trace.poll_burst.active_mask == 0U, "第二条记录关闭后 active mask 未清零");
     Expect(
@@ -188,7 +189,7 @@ void TestSplitAtMaximumCount() {
         represented_calls == static_cast<uint64_t>(kAtomicPollCountMax) + 1U,
         "两条记录的加权调用数没有闭合到 max+1"
     );
-    Expect(fixture.core.dropped == 0U, "边界拆批不应丢记录");
+    Expect(fixture.trace.dropped_records == 0U, "边界拆批不应丢记录");
     Expect(!fixture.trace.atomic_counter_overflow, "边界拆批不应报告计数溢出");
 }
 
@@ -220,14 +221,14 @@ void TestNestedRegionRestoresMask() {
         fixture.trace.poll_burst.enabled_mask == (startup_mask | fanin_mask),
         "内层 region 没有合并两层 mask"
     );
-    Expect(fixture.core.count == 1U, "内层 begin 没有关闭外层 active batch");
+    Expect(fixture.trace.record_count == 1U, "内层 begin 没有关闭外层 active batch");
     (void)TraceAtomicLoad<TestOps>(
         fixture.trace, fixture.result, -1, AtomicSite::FaninFlagLoad, &fanin_value
     );
 
     AtomicPollRegionEnd<TestOps>(fixture.trace, fixture.result, inner_previous);
     Expect(fixture.trace.poll_burst.enabled_mask == startup_mask, "内层 end 没有还原外层 mask");
-    Expect(fixture.core.count == 2U, "内层 end 没有关闭内层 active batch");
+    Expect(fixture.trace.record_count == 2U, "内层 end 没有关闭内层 active batch");
     (void)TraceAtomicLoad<TestOps>(
         fixture.trace, fixture.result, -1, AtomicSite::StartupPoll, &startup_value
     );
@@ -235,7 +236,7 @@ void TestNestedRegionRestoresMask() {
     AtomicPollRegionEnd<TestOps>(fixture.trace, fixture.result, outer_previous);
     Expect(fixture.trace.poll_burst.enabled_mask == 0U, "最外层 end 没有还原初始 mask");
     Expect(fixture.trace.poll_burst.active_mask == 0U, "嵌套 region 结束后仍有 active batch");
-    Expect(fixture.core.count == 3U, "嵌套 region 应按三个边界写出三条 batch");
+    Expect(fixture.trace.record_count == 3U, "嵌套 region 应按三个边界写出三条 batch");
     Expect(fixture.trace.poll_batch_records == 3U, "嵌套 region 的物理 batch 计数错误");
     Expect(fixture.trace.poll_calls == 3U, "嵌套 region 的逻辑 poll 调用数错误");
     Expect(fixture.result.atomic_trace_calls == 3U, "嵌套 region 的逻辑 atomic 调用数错误");
@@ -245,7 +246,7 @@ void TestNestedRegionRestoresMask() {
             fixture.records[2].auxiliary == static_cast<uint32_t>(AtomicSite::StartupPoll),
         "嵌套 region 的 batch site 顺序错误"
     );
-    Expect(fixture.core.dropped == 0U, "嵌套 region 不应丢记录");
+    Expect(fixture.trace.dropped_records == 0U, "嵌套 region 不应丢记录");
     Expect(!fixture.trace.atomic_counter_overflow, "嵌套 region 不应报告计数溢出");
 }
 
@@ -269,7 +270,7 @@ void TestNonAllowlistedSiteStaysDirect() {
     AtomicPollRegionEnd<TestOps>(fixture.trace, fixture.result, previous);
 
     Expect(observed == frontier_flag, "非 allowlist direct load 返回值错误");
-    Expect(fixture.core.count == 1U, "非 allowlist load 应写一条 direct 记录");
+    Expect(fixture.trace.record_count == 1U, "非 allowlist load 应写一条 direct 记录");
     Expect(fixture.trace.poll_calls == 0U, "非 allowlist load 不得增加 batched poll 调用数");
     Expect(fixture.trace.poll_batch_records == 0U, "非 allowlist load 不得写 PollBatch 记录");
     Expect(fixture.result.atomic_trace_calls == 1U, "非 allowlist direct load 的逻辑调用计数错误");
@@ -283,7 +284,7 @@ void TestNonAllowlistedSiteStaysDirect() {
         "非 allowlist direct load 的 site 错误"
     );
     Expect(fixture.trace.poll_burst.active_mask == 0U, "非 allowlist load 不应留下 active batch");
-    Expect(fixture.core.dropped == 0U, "非 allowlist direct load 不应丢记录");
+    Expect(fixture.trace.dropped_records == 0U, "非 allowlist direct load 不应丢记录");
     Expect(!fixture.trace.atomic_counter_overflow, "非 allowlist direct load 不应报告溢出");
 }
 
@@ -323,7 +324,7 @@ void TestAggregateInsertTurnPollBatch() {
         kBegin, kEnd, kCalls, true
     );
     Expect(written, "insert-turn aggregate PollBatch 应写入一条记录");
-    Expect(fixture.core.count == 1, "aggregate PollBatch 物理记录数不是 1");
+    Expect(fixture.trace.record_count == 1, "aggregate PollBatch 物理记录数不是 1");
     Expect(
         fixture.result.atomic_trace_calls == kCalls &&
             fixture.trace.poll_calls == kCalls,
@@ -368,7 +369,7 @@ void TestAggregateInsertTurnPollBatch() {
         true
     );
     Expect(
-        !overflow_written && overflow.core.count == 0 &&
+        !overflow_written && overflow.trace.record_count == 0 &&
             overflow.result.atomic_trace_calls == 0 &&
             overflow.trace.poll_calls == 0 &&
             overflow.trace.atomic_counter_overflow,
@@ -392,7 +393,7 @@ void TestInsertTurnHandoffCompareExchange() {
         "handoff CompareExchange 返回值或目标 token 不正确"
     );
     Expect(
-        fixture.core.count == 0 &&
+        fixture.trace.record_count == 0 &&
             fixture.result.atomic_trace_calls == 0,
         "CAS 捕获阶段不得提前写 raw 或更新 logical counter"
     );
@@ -403,7 +404,7 @@ void TestInsertTurnHandoffCompareExchange() {
         trace_begin, trace_end, true, true
     );
     Expect(
-        fixture.core.count == 1 &&
+        fixture.trace.record_count == 1 &&
             fixture.result.atomic_trace_calls == 1,
         "父/detail 端点固定后，handoff CAS 必须恰好写一条 direct atomic"
     );

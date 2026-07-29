@@ -216,7 +216,11 @@ PA_DEVICE bool PublishSharedTaskWriterMetadata(
         delta.writer_intent_required !=
             (delta.ordinary_count != 0 ||
              delta.symbol_count != 0) ||
-        Ops::Load(&state->fatal.value) != 0) {
+        TraceAtomicLoad<Ops>(
+            stats.trace, stats.result, task_id,
+            AtomicSite::SharedMetadataFatalGuardLoad,
+            &state->fatal.value
+        ) != 0) {
         if (state != nullptr) {
             SetFatal<Ops>(state, stats, task_id);
         }
@@ -226,27 +230,30 @@ PA_DEVICE bool PublishSharedTaskWriterMetadata(
     // insert-before-lookup 不能用本 task 的 reader_done 回收自己仍可能
     // 消费的 N-H。首版只使用已经证明正确的 -1 前沿；容量不足明确
     // 终止，绝不覆盖 live producer 或错误推进 task turn。
-    if (SharedCheckPreparedTaskAppend<Ops>(
+    if (SharedCheckPreparedTaskAppend<Ops, true>(
             state->shared_map, delta.ordinary_entries,
             delta.ordinary_buckets,
             delta.ordinary_bucket_ordinals,
-            delta.ordinary_count, -1
+            delta.ordinary_count, -1, task_id,
+            &stats.trace, &stats.result
         ) != SharedAppendCheck::Ready) {
         SetFatal<Ops>(state, stats, task_id);
         return false;
     }
 
     if (delta.symbol_count != 0 &&
-        !CommitPreparedSymbolSharedWriterIntentSet<Ops>(
+        !CommitPreparedSymbolSharedWriterIntentSet<Ops, true>(
             state->shared_map, delta.symbol_keys,
-            delta.symbol_count, task_id, &state->fatal.value
+            delta.symbol_count, task_id, &state->fatal.value,
+            &stats
         )) {
         SetFatal<Ops>(state, stats, task_id);
         return false;
     }
-    if (!SharedAppendPreparedTask<Ops>(
+    if (!SharedAppendPreparedTask<Ops, true>(
             state->shared_map, delta.ordinary_entries,
-            delta.ordinary_buckets, delta.ordinary_count
+            delta.ordinary_buckets, delta.ordinary_count,
+            task_id, &stats.trace, &stats.result
         )) {
         SetFatal<Ops>(state, stats, task_id);
         return false;
@@ -278,6 +285,7 @@ PA_DEVICE bool HandoffSharedTaskInsertTurn(
     // 都必须先于本 task 的插入完成字对 N+1 owner 可见。每个 task 使用
     // 自己的 TaskCell，不再把一枚 baton 在 G 条 sidecar 线上轮换。
     Ops::StoreBarrier();
+    // PA_ATOMIC_DCCI_SOURCE_EXEMPT: trace-free - swimlane 构建走 CaptureAtomicCompareExchange；这里只是无泳道构建和隔离测试出口
     cas_observed = Ops::CompareExchange(
         &state->tasks[static_cast<uint32_t>(task_id)]
              .deps_prepared,
@@ -338,6 +346,7 @@ PA_DEVICE bool PublishSharedTaskWriterDelta(
     // predecessor；最终 deps_prepared handoff 仍同时封口两类发布。
     if (state == nullptr || !context.won || context.task_id < 0 ||
         context.task_id >= static_cast<int32_t>(kMaxTasks) ||
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - generic 组合入口只供隔离测试，正式 winner 入口已使用 SharedWinnerFatalGuardLoad
         Ops::Load(&state->fatal.value) != 0 ||
         !PublishSharedTaskOutputs<Ops>(
             state->shared_map, context,
@@ -360,7 +369,7 @@ PA_DEVICE bool PublishSharedTaskWriterDelta(
             state->shared_map.shared_outputs[
                 static_cast<uint32_t>(context.task_id)
             ],
-            context.result.count
+            context.result.count, context.task_id, &stats
         );
         return false;
     }
@@ -371,7 +380,7 @@ PA_DEVICE bool PublishSharedTaskWriterDelta(
             state->shared_map.shared_outputs[
                 static_cast<uint32_t>(context.task_id)
             ],
-            context.result.count
+            context.result.count, context.task_id, &stats
         );
         return false;
     }
@@ -384,7 +393,7 @@ PA_DEVICE bool PublishSharedTaskWriterDelta(
             state->shared_map.shared_outputs[
                 static_cast<uint32_t>(context.task_id)
             ],
-            context.result.count
+            context.result.count, context.task_id, &stats
         );
         return false;
     }
@@ -417,6 +426,7 @@ PA_DEVICE bool WaitForSharedTaskInsertTurn(
     const uint64_t begin = Ops::Now();
     uint32_t polls = 0;
     while (true) {
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: aggregate - 循环结束后以 SharedInsertTurnPoll 单条 PollBatch 记录精确 load_count
         const int64_t observed = Ops::Load(predecessor);
         int64_t compare_observed = observed;
         int64_t dependency_observed = observed;
@@ -492,7 +502,12 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         ) ||
         context.task_id != static_cast<int32_t>(task_id) ||
         !context.won ||
-        Ops::Load(&state->fatal.value) != 0) {
+        TraceAtomicLoad<Ops>(
+            stats.trace, stats.result,
+            static_cast<int32_t>(task_id),
+            AtomicSite::SharedWinnerFatalGuardLoad,
+            &state->fatal.value
+        ) != 0) {
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
@@ -536,8 +551,8 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     }
 #if PA_BUILD_TRACE_FREE
     const bool task_outputs_published =
-        PublishSharedTaskOutputs<Ops>(
-            state->shared_map, context, task_id
+        PublishSharedTaskOutputs<Ops, true>(
+            state->shared_map, context, task_id, &stats
         );
 #else
     uint64_t task_outputs_begin =
@@ -547,7 +562,7 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     uint64_t task_outputs_flush_begin = task_outputs_begin;
     uint64_t task_outputs_flush_end = task_outputs_begin;
     const bool task_outputs_published =
-        PublishSharedTaskOutputs<Ops>(
+        PublishSharedTaskOutputs<Ops, true>(
             state->shared_map, context, task_id, &stats,
             &task_outputs_copy_begin, &task_outputs_copy_end,
             &task_outputs_flush_begin, &task_outputs_flush_end
@@ -676,7 +691,7 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         ProfilePhase::Register, metadata_begin, metadata_end
     );
 #if !PA_BUILD_TRACE_FREE
-    // 记录动作延后到 Register 的全部时间端点之后，避免 64B raw 写入
+    // 记录动作延后到 Register 的全部时间端点之后，避免 32B raw 写入
     // 被误计入 metadata publish 或 handoff。循环内只累计本地 polls，
     // 每个成功 winner 固定至多增加这一条物理 PollBatch。
     if (turn_ready && insert_turn_load_count != 0) {
@@ -688,7 +703,7 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
             Ops::kAtomicReturnReadyObserved
         );
     }
-    if (metadata_published && stats.trace.atomics_enabled) {
+    if (metadata_published && AtomicSwimlaneEnabled(stats.trace)) {
         WriteAtomicTrace<Ops>(
             stats.trace, stats.result,
             static_cast<int32_t>(task_id),
@@ -705,7 +720,8 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         // rollback 分支开销。
         RollbackSharedTaskOutputs<Ops>(
             state->shared_map.shared_outputs[task_id],
-            context.result.count
+            context.result.count,
+            static_cast<int32_t>(task_id), &stats
         );
         return false;
     }

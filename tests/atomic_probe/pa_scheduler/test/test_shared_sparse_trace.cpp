@@ -10,6 +10,7 @@
  */
 
 #include <cstdio>
+#include <vector>
 
 #include "host_support.h"
 
@@ -17,7 +18,9 @@ namespace {
 
 using pa_scheduler::TaskKind;
 using pa_scheduler::TracePhase;
+using pa_scheduler::TraceHeader;
 using pa_scheduler::TraceRecord;
+using pa_scheduler::SharedSubmitClaimTraceRecord;
 using pa_scheduler::AtomicOp;
 using pa_scheduler::AtomicSite;
 using pa_scheduler::kAtomicOpMask;
@@ -25,8 +28,17 @@ using pa_scheduler::kAtomicPollBatch;
 using pa_scheduler::kAtomicPollCountShift;
 using pa_scheduler::kAtomicResultUsed;
 using pa_scheduler::kAtomicReturnReady;
+using pa_scheduler::kTraceRecordSizeBytes;
+using pa_scheduler::kTraceRecordsPerCore;
+using pa_scheduler::kTraceSubmitClaimBytesPerCore;
+using pa_scheduler::kTraceSubmitClaimRecordSizeBytes;
+using pa_scheduler::kTraceWorkerBytes;
 using pa_scheduler::host::AtomicRecordSchemaValid;
+using pa_scheduler::host::ExpandSharedTraceRecords;
+using pa_scheduler::host::InitializeTraceHeader;
+using pa_scheduler::host::SharedHostTaskPlan;
 using pa_scheduler::host::SharedSparseTraceValidator;
+using pa_scheduler::host::ValidateTraceHeader;
 
 int g_failures = 0;
 
@@ -52,6 +64,86 @@ TraceRecord MakeRecord(
     return record;
 }
 
+bool SameRecord(const TraceRecord &left, const TraceRecord &right) {
+    return left.start_cycle == right.start_cycle &&
+           left.end_cycle == right.end_cycle &&
+           left.task_id == right.task_id &&
+           left.function_id == right.function_id &&
+           left.flags == right.flags &&
+           left.phase == right.phase &&
+           left.auxiliary == right.auxiliary;
+}
+
+void TestTraceBinaryLayoutAndHeaderGate() {
+    Check(
+        sizeof(TraceRecord) == 32 &&
+            alignof(TraceRecord) == 32 &&
+            kTraceRecordSizeBytes == 32,
+        "device trace record must remain a 32-byte half-cache-line"
+    );
+    Check(
+        offsetof(TraceHeader, cores) == 64 &&
+            sizeof(TraceHeader) == 6976,
+        "record-size field must not move or grow the header core array"
+    );
+    constexpr size_t partition_bytes =
+        static_cast<size_t>(kTraceRecordsPerCore) *
+        sizeof(TraceRecord);
+    Check(
+        sizeof(TraceHeader) % 64 == 0 &&
+            partition_bytes % 64 == 0,
+        "header and every worker record partition must start on a cache line"
+    );
+    Check(
+        (0U % 64U) + sizeof(TraceRecord) <= 64U &&
+            (32U % 64U) + sizeof(TraceRecord) <= 64U &&
+            0U / 64U == 32U / 64U &&
+            64U / 64U != 32U / 64U,
+        "two trace records must fit exactly in one cache line"
+    );
+    Check(
+        sizeof(SharedSubmitClaimTraceRecord) == 32 &&
+            alignof(SharedSubmitClaimTraceRecord) == 32 &&
+            kTraceSubmitClaimRecordSizeBytes == 32,
+        "shared Submit/Claim record must remain 32-byte aligned"
+    );
+    Check(
+        kTraceSubmitClaimBytesPerCore ==
+                static_cast<size_t>(pa_scheduler::kMaxTasks) *
+                    sizeof(SharedSubmitClaimTraceRecord) &&
+            kTraceSubmitClaimBytesPerCore +
+                    static_cast<size_t>(kTraceRecordsPerCore) *
+                        sizeof(TraceRecord) ==
+                kTraceWorkerBytes &&
+            kTraceWorkerBytes == (1U << 20),
+        "shared compact and generic regions must exactly fill one 1 MiB worker partition"
+    );
+    Check(
+        pa_scheduler::TraceSubmitClaimOffset(0) % 64U == 0 &&
+            pa_scheduler::TraceRecordsOffset(0) % 64U == 0 &&
+            pa_scheduler::TraceRecordsOffset(0) -
+                    pa_scheduler::TraceSubmitClaimOffset(0) ==
+                kTraceSubmitClaimBytesPerCore &&
+            pa_scheduler::TraceWorkerOffset(1) -
+                    pa_scheduler::TraceWorkerOffset(0) ==
+                kTraceWorkerBytes,
+        "shared compact and generic worker regions must keep cache-line isolation"
+    );
+
+    TraceHeader header{};
+    InitializeTraceHeader(&header);
+    Check(
+        header.record_size_bytes == 32 &&
+            ValidateTraceHeader(header, "trace ABI self-test"),
+        "initialized header must publish and accept a 32-byte raw ABI"
+    );
+    header.record_size_bytes = 64;
+    Check(
+        !ValidateTraceHeader(header, "trace ABI negative self-test"),
+        "header validation must reject the old 64-byte record ABI"
+    );
+}
+
 int32_t FunctionId(TaskKind kind) {
     return kind == TaskKind::Alloc
         ? -1
@@ -62,30 +154,340 @@ uint32_t IsAlloc(TaskKind kind) {
     return kind == TaskKind::Alloc ? 1U : 0U;
 }
 
+struct CompactTraceWindow {
+    uint64_t submit_begin;
+    uint64_t submit_end;
+    uint64_t claim_begin;
+    uint64_t claim_end;
+};
+
+CompactTraceWindow WindowForTask(
+    uint64_t base_cycle, uint32_t task_id
+) {
+    const uint64_t task_base =
+        base_cycle + static_cast<uint64_t>(task_id) * 100U;
+    return CompactTraceWindow{
+        task_base + 10U,
+        task_base + 60U,
+        task_base + 20U,
+        task_base + 25U,
+    };
+}
+
+SharedSubmitClaimTraceRecord MakeCompactRecord(
+    const CompactTraceWindow &window, bool winner
+) {
+    return SharedSubmitClaimTraceRecord{
+        window.claim_begin,
+        window.claim_end |
+            (winner
+                 ? pa_scheduler::kSharedClaimWinnerBit
+                 : 0ULL),
+        window.submit_begin,
+        window.submit_end,
+    };
+}
+
+SharedHostTaskPlan MakeCompactTracePlan() {
+    constexpr TaskKind kinds[] = {
+        TaskKind::Alloc,
+        TaskKind::Qk,
+        TaskKind::Sf,
+        TaskKind::Pv,
+        TaskKind::Up,
+    };
+    SharedHostTaskPlan plan;
+    plan.total_tasks =
+        static_cast<uint32_t>(
+            sizeof(kinds) / sizeof(kinds[0])
+        );
+    plan.tasks.resize(plan.total_tasks);
+    for (uint32_t task_id = 0;
+         task_id < plan.total_tasks; ++task_id) {
+        plan.tasks[task_id].task_id = task_id;
+        plan.tasks[task_id].kind = kinds[task_id];
+    }
+    return plan;
+}
+
+void TestSharedCompactReconstruction() {
+    constexpr uint32_t worker = 0;
+    constexpr uint64_t base_cycle = 5000;
+    const SharedHostTaskPlan plan = MakeCompactTracePlan();
+    constexpr bool winners[] = {
+        true, false, false, true, false,
+    };
+    constexpr bool attempted[] = {
+        true, true, false, true, false,
+    };
+    std::vector<SharedSubmitClaimTraceRecord> compact(
+        plan.total_tasks
+    );
+    std::vector<TraceRecord> generic;
+    for (uint32_t task_id = 0;
+         task_id < plan.total_tasks; ++task_id) {
+        const CompactTraceWindow window =
+            WindowForTask(base_cycle, task_id);
+        compact[task_id] =
+            MakeCompactRecord(window, winners[task_id]);
+        if (attempted[task_id]) {
+            generic.push_back(
+                MakeRecord(
+                    TracePhase::Atomic,
+                    static_cast<int32_t>(task_id), -1,
+                    window.claim_begin + 1U,
+                    window.claim_begin + 2U,
+                    static_cast<uint32_t>(
+                        AtomicOp::FetchMax
+                    ) |
+                        kAtomicResultUsed |
+                        kAtomicReturnReady,
+                    static_cast<uint32_t>(
+                        AtomicSite::ClaimMax
+                    )
+                )
+            );
+        }
+    }
+
+    std::vector<TraceRecord> logical;
+    Check(
+        ExpandSharedTraceRecords(
+            worker, generic.data(),
+            static_cast<uint32_t>(generic.size()),
+            compact.data(), plan, &logical
+        ),
+        "four-endpoint records and generic ClaimMax rows reconstruct"
+    );
+    Check(
+        logical.size() ==
+            generic.size() + 2U * plan.total_tasks,
+        "reconstruction preserves every generic row and adds Claim/Submit"
+    );
+    if (logical.size() !=
+        generic.size() + 2U * plan.total_tasks) {
+        return;
+    }
+
+    size_t index = 0;
+    for (uint32_t task_id = 0;
+         task_id < plan.total_tasks; ++task_id) {
+        if (attempted[task_id]) {
+            Check(
+                logical[index].phase ==
+                        static_cast<uint16_t>(
+                            TracePhase::Atomic
+                        ) &&
+                    logical[index].task_id ==
+                        static_cast<int32_t>(task_id) &&
+                    logical[index].auxiliary ==
+                        static_cast<uint16_t>(
+                            AtomicSite::ClaimMax
+                        ) &&
+                    AtomicRecordSchemaValid(
+                        logical[index], true
+                    ),
+                "generic ClaimMax remains an exact return-ready Atomic row"
+            );
+            ++index;
+        }
+        const TraceRecord &claim = logical[index++];
+        const TraceRecord &submit = logical[index++];
+        const CompactTraceWindow window =
+            WindowForTask(base_cycle, task_id);
+        Check(
+            claim.phase ==
+                    static_cast<uint16_t>(TracePhase::Claim) &&
+                claim.start_cycle == window.claim_begin &&
+                claim.end_cycle == window.claim_end &&
+                claim.flags ==
+                    ((winners[task_id]
+                          ? pa_scheduler::kClaimWon
+                          : 0U) |
+                     (attempted[task_id]
+                          ? pa_scheduler::kClaimAttempted
+                          : 0U)),
+            "Claim reconstructs absolute endpoints and role-derived attempted"
+        );
+        Check(
+            submit.phase ==
+                    static_cast<uint16_t>(
+                        TracePhase::Submit
+                    ) &&
+                submit.start_cycle == window.submit_begin &&
+                submit.end_cycle == window.submit_end &&
+                submit.flags ==
+                    (winners[task_id]
+                         ? pa_scheduler::kClaimWon
+                         : 0U),
+            "Submit reconstructs absolute endpoints and winner"
+        );
+    }
+}
+
+void TestSharedCompactStageOnlyReconstruction() {
+    constexpr uint32_t worker = 0;
+    constexpr uint64_t base_cycle = 6000;
+    const SharedHostTaskPlan plan = MakeCompactTracePlan();
+    std::vector<SharedSubmitClaimTraceRecord> compact(
+        plan.total_tasks
+    );
+    for (uint32_t task_id = 0;
+         task_id < plan.total_tasks; ++task_id) {
+        compact[task_id] = MakeCompactRecord(
+            WindowForTask(base_cycle, task_id), false
+        );
+    }
+    TraceRecord unused_generic{};
+    std::vector<TraceRecord> logical;
+    Check(
+        ExpandSharedTraceRecords(
+            worker, &unused_generic, 0,
+            compact.data(), plan, &logical
+        ) &&
+            logical.size() == 2U * plan.total_tasks,
+        "stage-only records expand to Claim/Submit without Atomic"
+    );
+}
+
+void TestSharedCompactGenericMergeOrder() {
+    constexpr uint32_t worker = 0;
+    constexpr uint64_t base_cycle = 7000;
+    const SharedHostTaskPlan plan = MakeCompactTracePlan();
+    std::vector<SharedSubmitClaimTraceRecord> compact(
+        plan.total_tasks
+    );
+    for (uint32_t task_id = 0;
+         task_id < plan.total_tasks; ++task_id) {
+        compact[task_id] = MakeCompactRecord(
+            WindowForTask(base_cycle, task_id), false
+        );
+    }
+    const CompactTraceWindow task0 =
+        WindowForTask(base_cycle, 0);
+    std::vector<TraceRecord> generic{
+        MakeRecord(
+            TracePhase::Atomic, 0, -1,
+            task0.claim_begin + 1U,
+            task0.claim_begin + 2U,
+            static_cast<uint32_t>(AtomicOp::FetchMax) |
+                kAtomicResultUsed | kAtomicReturnReady,
+            static_cast<uint32_t>(AtomicSite::ClaimMax)
+        ),
+        MakeRecord(
+            TracePhase::RingBp, 0, 9,
+            task0.claim_end + 1U,
+            task0.claim_end + 2U
+        ),
+    };
+    std::vector<TraceRecord> logical;
+    Check(
+        ExpandSharedTraceRecords(
+            worker, generic.data(),
+            static_cast<uint32_t>(generic.size()),
+            compact.data(), plan, &logical
+        ) &&
+            logical.size() ==
+                generic.size() + 2U * plan.total_tasks &&
+            SameRecord(logical[0], generic[0]) &&
+            logical[1].phase ==
+                static_cast<uint16_t>(TracePhase::Claim) &&
+            SameRecord(logical[2], generic[1]) &&
+            logical[3].phase ==
+                static_cast<uint16_t>(TracePhase::Submit),
+        "generic rows merge stably before their enclosing Claim/Submit endpoint"
+    );
+}
+
+void TestRejectsBadSharedCompactRecords() {
+    constexpr uint32_t worker = 0;
+    constexpr uint64_t base_cycle = 8000;
+    const SharedHostTaskPlan plan = MakeCompactTracePlan();
+    std::vector<SharedSubmitClaimTraceRecord> valid(
+        plan.total_tasks
+    );
+    for (uint32_t task_id = 0;
+         task_id < plan.total_tasks; ++task_id) {
+        valid[task_id] = MakeCompactRecord(
+            WindowForTask(base_cycle, task_id), false
+        );
+    }
+    TraceRecord unused_generic{};
+    auto rejected = [&](
+        const std::vector<SharedSubmitClaimTraceRecord> &records
+    ) {
+        std::vector<TraceRecord> logical;
+        return !ExpandSharedTraceRecords(
+            worker, &unused_generic, 0,
+            records.data(), plan, &logical
+        );
+    };
+
+    std::vector<SharedSubmitClaimTraceRecord> bad = valid;
+    bad[0].submit_begin = 0;
+    Check(rejected(bad), "missing Submit.begin is rejected");
+
+    bad = valid;
+    bad[0].claim_end_and_winner =
+        bad[0].submit_end + 1U;
+    Check(rejected(bad), "Claim outside Submit is rejected");
+
+    bad = valid;
+    bad[2].claim_end_and_winner |=
+        pa_scheduler::kSharedClaimWinnerBit;
+    Check(
+        rejected(bad),
+        "winner on a role-ineligible Claim is rejected"
+    );
+
+    bad = valid;
+    bad[0].submit_end |=
+        pa_scheduler::kSharedClaimWinnerBit;
+    Check(
+        rejected(bad),
+        "winner marker is forbidden in Submit endpoints"
+    );
+
+    std::vector<TraceRecord> forbidden{
+        MakeRecord(
+            TracePhase::Claim, 0, -1,
+            base_cycle + 21U, base_cycle + 22U,
+            pa_scheduler::kClaimAttempted, 1
+        ),
+    };
+    std::vector<TraceRecord> logical;
+    Check(
+        !ExpandSharedTraceRecords(
+            worker, forbidden.data(), 1,
+            valid.data(), plan, &logical
+        ),
+        "generic stream cannot duplicate dedicated Claim rows"
+    );
+}
+
 struct TaskTraceBuilder {
     SharedSparseTraceValidator &validator;
     uint64_t tick = 10;
+    uint64_t current_submit_begin = 0;
+    uint64_t current_claim_begin = 0;
+    uint64_t last_efdrain_begin = 0;
+    uint64_t last_efdrain_end = 0;
 
     bool Begin(uint32_t task_id, TaskKind kind, bool winner, bool attempted = true) {
-        const uint64_t submit_begin = tick;
-        const uint64_t efdrain_end = tick + 2;
-        bool ok = validator.Observe(
-            MakeRecord(
-                TracePhase::EfDrain, static_cast<int32_t>(task_id), -1,
-                submit_begin, efdrain_end
-            )
-        );
+        current_submit_begin = tick;
+        current_claim_begin = tick + 2;
         const uint32_t flags =
             (winner ? pa_scheduler::kClaimWon : 0U) |
             (attempted ? pa_scheduler::kClaimAttempted : 0U);
-        ok &= validator.Observe(
+        const bool ok = validator.Observe(
             MakeRecord(
                 TracePhase::Claim, static_cast<int32_t>(task_id),
                 winner ? FunctionId(kind) : -1,
-                efdrain_end, efdrain_end + 1, flags, IsAlloc(kind)
+                current_claim_begin, current_claim_begin + 1,
+                flags, IsAlloc(kind)
             )
         );
-        tick = efdrain_end + 1;
+        tick = current_claim_begin + 1;
         return ok;
     }
 
@@ -157,10 +559,12 @@ struct TaskTraceBuilder {
         ok &= validator.Observe(
             MakeRecord(
                 TracePhase::Submit, static_cast<int32_t>(task_id),
-                function_id, tick - 3, previous_end + 1,
+                function_id, current_submit_begin, previous_end + 1,
                 pa_scheduler::kClaimWon, IsAlloc(kind)
             )
         );
+        last_efdrain_begin = current_submit_begin;
+        last_efdrain_end = current_claim_begin;
         tick = previous_end + 1;
         return ok;
     }
@@ -171,9 +575,11 @@ struct TaskTraceBuilder {
         const bool ok = validator.Observe(
             MakeRecord(
                 TracePhase::Submit, static_cast<int32_t>(task_id), -1,
-                tick - 3, tick + 1, 0, IsAlloc(kind)
+                current_submit_begin, tick + 1, 0, IsAlloc(kind)
             )
         );
+        last_efdrain_begin = current_submit_begin;
+        last_efdrain_end = current_claim_begin;
         ++tick;
         return ok;
     }
@@ -185,9 +591,6 @@ bool OpenAllocWinnerMaterialize(
     uint64_t materialize_end = 18
 ) {
     return validator.Observe(
-               MakeRecord(TracePhase::EfDrain, 0, -1, 10, 12)
-           ) &&
-           validator.Observe(
                MakeRecord(
                    TracePhase::Claim, 0, -1, 12, 13,
                    pa_scheduler::kClaimWon |
@@ -262,12 +665,12 @@ void TestAcceptsSparseWinnerAndLoserFlow() {
     Check(
         trace.Begin(1, TaskKind::Qk, false) &&
             trace.FinishLoser(1, TaskKind::Qk),
-        "attempted QK loser keeps only its Submit parent"
+        "attempted QK loser keeps only its Claim/Submit pair"
     );
     Check(
         trace.Begin(2, TaskKind::Sf, false, false) &&
             trace.FinishLoser(2, TaskKind::Sf),
-        "role-not-attempted SF loser also keeps only its Submit parent"
+        "role-not-attempted SF loser also keeps only its Claim/Submit pair"
     );
     Check(
         trace.Begin(3, TaskKind::Pv, true) &&
@@ -282,6 +685,8 @@ void TestAcceptsSparseWinnerAndLoserFlow() {
     Check(validator.Closed(), "mixed sparse flow is fully closed");
     Check(
         validator.EfDrainCount() == 5 &&
+            validator.LastEfDrainBegin() == trace.last_efdrain_begin &&
+            validator.LastEfDrainEnd() == trace.last_efdrain_end &&
             validator.ClaimCount() == 5 &&
             validator.WinnerCount() == 2 &&
             validator.MaterializeCount() == 2 &&
@@ -291,7 +696,7 @@ void TestAcceptsSparseWinnerAndLoserFlow() {
             validator.MaterializeTaskOutputsCount() == 2 &&
             validator.WinnerTailCount() == 2 &&
             validator.SubmitCount() == 5,
-        "sparse flow counts every Submit parent but only winner-only children"
+        "sparse flow derives every EfDrain boundary and counts only winner children"
     );
 }
 
@@ -300,16 +705,16 @@ void TestRejectsReplayPrefixDrift() {
         SharedSparseTraceValidator validator;
         Check(
             !validator.Observe(
-                MakeRecord(TracePhase::Claim, 0, -1, 10, 11)
+                MakeRecord(TracePhase::EfDrain, 0, -1, 10, 12)
             ),
-            "Claim cannot appear before the task EfDrain"
+            "shared sparse raw rejects an explicit EfDrain record"
         );
     }
     {
         SharedSparseTraceValidator validator;
         Check(
             !validator.Observe(
-                MakeRecord(TracePhase::EfDrain, 1, -1, 10, 12)
+                MakeRecord(TracePhase::Claim, 1, -1, 12, 13)
             ),
             "the first per-core task must be task 0"
         );
@@ -317,16 +722,10 @@ void TestRejectsReplayPrefixDrift() {
     {
         SharedSparseTraceValidator validator;
         Check(
-            validator.Observe(
-                MakeRecord(TracePhase::EfDrain, 0, -1, 10, 12)
-            ),
-            "EfDrain opens the non-contiguous Claim test"
-        );
-        Check(
             !validator.Observe(
-                MakeRecord(TracePhase::Claim, 0, -1, 13, 14)
+                MakeRecord(TracePhase::Claim, 0, -1, 13, 12)
             ),
-            "Claim must start exactly at EfDrain.end"
+            "Claim rejects an inverted time boundary"
         );
     }
     {
@@ -339,9 +738,75 @@ void TestRejectsReplayPrefixDrift() {
         );
         Check(
             !validator.Observe(
-                MakeRecord(TracePhase::EfDrain, 2, -1, 20, 22)
+                MakeRecord(TracePhase::Claim, 2, -1, 20, 21)
             ),
             "a skipped task_id is rejected after a loser"
+        );
+    }
+    {
+        SharedSparseTraceValidator validator;
+        Check(
+            validator.Observe(
+                MakeRecord(
+                    TracePhase::Claim, 0, -1, 12, 13,
+                    pa_scheduler::kClaimAttempted, 1
+                )
+            ),
+            "valid Claim opens the derived-EfDrain inversion test"
+        );
+        Check(
+            !validator.Observe(
+                MakeRecord(
+                    TracePhase::Submit, 0, -1, 13, 14, 0, 1
+                )
+            ),
+            "Submit.start cannot be later than Claim.start"
+        );
+    }
+}
+
+void TestRejectsMissingSubmit() {
+    {
+        SharedSparseTraceValidator validator;
+        TaskTraceBuilder trace{validator};
+        Check(
+            trace.Begin(0, TaskKind::Alloc, false),
+            "loser Claim opens the missing-Submit test"
+        );
+        Check(
+            !validator.Closed() &&
+                !validator.Observe(
+                    MakeRecord(
+                        TracePhase::Claim, 1, -1, 20, 21,
+                        pa_scheduler::kClaimAttempted, 0
+                    )
+                ),
+            "loser must close Submit before the next task Claim"
+        );
+    }
+    {
+        SharedSparseTraceValidator validator;
+        Check(
+            OpenAllocWinnerRegister(validator) &&
+                validator.Observe(
+                    MakeRecord(
+                        TracePhase::SharedRegisterPublishMetadata,
+                        0, -1, 20, 22
+                    )
+                ) &&
+                validator.Observe(
+                    MakeRecord(
+                        TracePhase::AllocComplete, 0, -1, 24, 28
+                    )
+                ),
+            "winner reaches the state that only permits Submit"
+        );
+        Check(
+            !validator.Closed() &&
+                !validator.Observe(
+                    MakeRecord(TracePhase::Claim, 1, -1, 30, 31)
+                ),
+            "winner must close Submit before the next task Claim"
         );
     }
 }
@@ -900,8 +1365,14 @@ void TestPlanClosesAllLogicalTasks() {
 }  // namespace
 
 int main() {
+    TestTraceBinaryLayoutAndHeaderGate();
+    TestSharedCompactReconstruction();
+    TestSharedCompactStageOnlyReconstruction();
+    TestSharedCompactGenericMergeOrder();
+    TestRejectsBadSharedCompactRecords();
     TestAcceptsSparseWinnerAndLoserFlow();
     TestRejectsReplayPrefixDrift();
+    TestRejectsMissingSubmit();
     TestRejectsEveryLoserOnlyForbiddenPhase();
     TestRejectsPrepareMapForWinnerAndOutsideSubmit();
     TestRejectsWinnerShapeDrift();

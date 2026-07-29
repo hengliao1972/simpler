@@ -265,6 +265,31 @@ validate_ccec_artifacts() {
             return 1
             ;;
     esac
+
+    # 这里独立于 build.sh 推导 consumer 期望，不能读取 manifest 再相信
+    # manifest 自己。private 保留原 32B 通用区；shared 只有 full-swimlane
+    # 使用 16B generic record，Submit/Claim 专区始终保持 32B。
+    local expected_generic_record_bytes
+    local expected_submit_claim_record_bytes
+    local expected_records_per_core
+    local expected_worker_stride_bytes
+    if [[ "$tensormap_mode" == "shared" ]]; then
+        expected_submit_claim_record_bytes=32
+        expected_records_per_core=28416
+        if [[ "$variant" == "swimlane" ]]; then
+            expected_generic_record_bytes=16
+            expected_worker_stride_bytes=593920
+        else
+            expected_generic_record_bytes=32
+            expected_worker_stride_bytes=1048576
+        fi
+    else
+        expected_generic_record_bytes=32
+        expected_submit_claim_record_bytes=0
+        expected_records_per_core=65536
+        expected_worker_stride_bytes=2097152
+    fi
+
     if [[ ! -x "$build_dir/${artifacts[0]}" ]]; then
         ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" \
             "host runner is missing, empty, or not executable"
@@ -288,8 +313,8 @@ validate_ccec_artifacts() {
         return 1
     fi
 
-    # 八行身份头固定 mode/CAP/insert-turn/variant/phase，后续校验和行
-    # 按变体精确枚举。
+    # 十二行身份头固定 mode/CAP/insert-turn/物理泳道布局/variant/phase，
+    # 后续校验和行按变体精确枚举。
     # 既拒绝跨模式复用，也拒绝漏项、增项、绝对路径和重复文件。
     local manifest_lines=()
     mapfile -t manifest_lines < "$manifest"
@@ -298,16 +323,20 @@ validate_ccec_artifacts() {
           "# shared_insert_turn_groups="* ]]; then
         manifest_insert_turn_groups="${manifest_lines[4]#*=}"
     fi
-    if [[ ${#manifest_lines[@]} -ne $((8 + ${#artifacts[@]})) ||
-          "${manifest_lines[0]}" != "# schema=pa_scheduler_artifacts/v3" ||
+    if [[ ${#manifest_lines[@]} -ne $((12 + ${#artifacts[@]})) ||
+          "${manifest_lines[0]}" != "# schema=pa_scheduler_artifacts/v4" ||
           "${manifest_lines[1]}" != "# tensormap_mode=$tensormap_mode" ||
           "${manifest_lines[2]}" != "# tensormap_mode_id=$tensormap_mode_id" ||
           "${manifest_lines[3]}" != "# tensormap_ring_cap=128" ||
-          "${manifest_lines[5]}" != "# variant=$variant" ||
-          "${manifest_lines[6]}" != "# phase=$phase" ||
-          "${manifest_lines[7]}" != "# phase_id=$phase_id" ]]; then
+          "${manifest_lines[5]}" != "# generic_record_bytes=$expected_generic_record_bytes" ||
+          "${manifest_lines[6]}" != "# submit_claim_record_bytes=$expected_submit_claim_record_bytes" ||
+          "${manifest_lines[7]}" != "# records_per_core=$expected_records_per_core" ||
+          "${manifest_lines[8]}" != "# worker_stride_bytes=$expected_worker_stride_bytes" ||
+          "${manifest_lines[9]}" != "# variant=$variant" ||
+          "${manifest_lines[10]}" != "# phase=$phase" ||
+          "${manifest_lines[11]}" != "# phase_id=$phase_id" ]]; then
         ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" \
-            "manifest schema, mode, variant, or phase metadata does not match"
+            "manifest schema, mode, trace layout, variant, or phase metadata does not match"
         return 1
     fi
     case "$manifest_insert_turn_groups" in
@@ -334,7 +363,7 @@ validate_ccec_artifacts() {
         digest=""
         filename=""
         extra=""
-        read -r digest filename extra <<< "${manifest_lines[index + 8]}"
+        read -r digest filename extra <<< "${manifest_lines[index + 12]}"
         if [[ ! "$digest" =~ ^[[:xdigit:]]{64}$ ||
               "$filename" != "${artifacts[index]}" || -n "$extra" ]]; then
             ccec_artifact_failure "$tensormap_mode" "$variant" "$phase" \
@@ -347,7 +376,8 @@ validate_ccec_artifacts() {
             "one or more artifact SHA256 values do not match"
         return 1
     fi
-    echo "[CHECK] CCEC artifact manifest verified: $manifest (G=$manifest_insert_turn_groups)"
+    printf '%s\n' \
+        "[CHECK] CCEC artifact manifest verified: $manifest (G=$manifest_insert_turn_groups, generic=${expected_generic_record_bytes}B, submit/claim=${expected_submit_claim_record_bytes}B, records/core=$expected_records_per_core, stride=$expected_worker_stride_bytes)"
 }
 
 reject_managed_submit_pmu_options() {

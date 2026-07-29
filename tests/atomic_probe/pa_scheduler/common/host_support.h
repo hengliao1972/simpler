@@ -58,7 +58,11 @@ struct Options {
     FinalBarrierShape final_barrier_shape = FinalBarrierShape::TwoLevel16;
     bool profile_phases = false;
     bool trace_enabled = true;
-    bool trace_atomics = false;
+    // CCEC full-swimlane 已在编译期把普通阶段、Atomic 与 DCCI 固定为同一
+    // 观察合同；host 默认必须与 device ELF 一致，否则普通 run/smoke
+    // 会在调度入口因 atomics_enabled=false fail-closed。trace-free、
+    // submit-pmu、perf-clock 和 CPU 主程序的该宏均为 0。
+    bool trace_atomics = PA_BUILD_ATOMIC_SWIMLANE != 0;
     bool analyze_swimlane = false;
 };
 
@@ -840,6 +844,159 @@ inline void InitializeTraceHeader(TraceHeader *header) {
     header->num_cores = kWorkers;
     header->records_per_core = kTraceRecordsPerCore;
     header->frequency_hz = kSystemCounterHz;
+    header->record_size_bytes = kTraceRecordSizeBytes;
+}
+
+inline bool EncodeCompactTraceRecord(
+    const TraceRecord &logical, CompactTraceRecord16 *compact
+) {
+    if (compact == nullptr ||
+        logical.end_cycle < logical.start_cycle ||
+        !CompactTraceFieldsFit(
+            logical.task_id, logical.function_id,
+            static_cast<TracePhase>(logical.phase),
+            logical.auxiliary
+        )) {
+        return false;
+    }
+    compact->start_cycle_low =
+        static_cast<uint32_t>(logical.start_cycle);
+    compact->end_cycle_low =
+        static_cast<uint32_t>(logical.end_cycle);
+    compact->flags = logical.flags;
+    compact->packed = PackCompactTraceFields(
+        logical.task_id, logical.function_id,
+        static_cast<TracePhase>(logical.phase),
+        logical.auxiliary
+    );
+    return true;
+}
+
+inline bool UnfoldCompactClockAfter(
+    uint32_t low, uint64_t anchor, uint64_t *unfolded
+) {
+    if (unfolded == nullptr) return false;
+    const uint64_t delta = static_cast<uint32_t>(
+        low - static_cast<uint32_t>(anchor)
+    );
+    if (anchor > UINT64_MAX - delta) return false;
+    *unfolded = anchor + delta;
+    return true;
+}
+
+inline bool UnfoldCompactClockBefore(
+    uint32_t low, uint64_t anchor, uint64_t *unfolded
+) {
+    if (unfolded == nullptr) return false;
+    const uint64_t delta = static_cast<uint32_t>(
+        static_cast<uint32_t>(anchor) - low
+    );
+    if (delta > anchor) return false;
+    *unfolded = anchor - delta;
+    return true;
+}
+
+inline bool DecodeCompactTraceRecord(
+    const CompactTraceRecord16 &compact,
+    uint64_t startup_barrier_begin, uint64_t finish_cycle,
+    TraceRecord *logical
+) {
+    constexpr uint64_t kCompactClockWindow = UINT64_C(1) << 32U;
+    if (logical == nullptr || startup_barrier_begin == 0 ||
+        finish_cycle < startup_barrier_begin ||
+        finish_cycle - startup_barrier_begin >=
+            kCompactClockWindow) {
+        return false;
+    }
+
+    const uint32_t task_code =
+        compact.packed & kCompactTraceTaskMask;
+    const uint32_t function_code =
+        (compact.packed >> kCompactTraceFunctionShift) &
+        kCompactTraceFunctionMask;
+    const uint32_t phase_code =
+        (compact.packed >> kCompactTracePhaseShift) &
+        kCompactTracePhaseMask;
+    const uint32_t auxiliary =
+        (compact.packed >> kCompactTraceAuxiliaryShift) &
+        kCompactTraceAuxiliaryMask;
+    if ((task_code != kCompactTraceTaskSentinel &&
+         task_code >= kMaxTasks) ||
+        (function_code != kCompactTraceFunctionSentinel &&
+         function_code > 3U) ||
+        phase_code >= static_cast<uint32_t>(TracePhase::Count)) {
+        return false;
+    }
+
+    TraceRecord decoded{};
+    decoded.task_id =
+        task_code == kCompactTraceTaskSentinel
+            ? -1
+            : static_cast<int32_t>(task_code);
+    decoded.function_id =
+        function_code == kCompactTraceFunctionSentinel
+            ? -1
+            : static_cast<int32_t>(function_code);
+    decoded.flags = compact.flags;
+    decoded.phase = static_cast<uint16_t>(phase_code);
+    decoded.auxiliary = static_cast<uint16_t>(auxiliary);
+
+    const bool startup_config =
+        phase_code == static_cast<uint32_t>(TracePhase::Dcci) &&
+        auxiliary ==
+            static_cast<uint32_t>(
+                DcciSite::StartupConfigInvalidate
+            );
+    const bool clocks_ok = startup_config
+        ? UnfoldCompactClockBefore(
+              compact.start_cycle_low, startup_barrier_begin,
+              &decoded.start_cycle
+          ) &&
+          UnfoldCompactClockBefore(
+              compact.end_cycle_low, startup_barrier_begin,
+              &decoded.end_cycle
+          ) &&
+          decoded.start_cycle <= decoded.end_cycle &&
+          decoded.end_cycle < startup_barrier_begin
+        : UnfoldCompactClockAfter(
+              compact.start_cycle_low, startup_barrier_begin,
+              &decoded.start_cycle
+          ) &&
+          UnfoldCompactClockAfter(
+              compact.end_cycle_low, startup_barrier_begin,
+              &decoded.end_cycle
+          ) &&
+          decoded.start_cycle >= startup_barrier_begin &&
+          decoded.start_cycle <= decoded.end_cycle &&
+          decoded.end_cycle <= finish_cycle;
+    if (!clocks_ok) return false;
+    *logical = decoded;
+    return true;
+}
+
+inline bool DecodeTraceStorageRecords(
+    const TraceStorageRecord *physical, uint32_t count,
+    uint64_t startup_barrier_begin, uint64_t finish_cycle,
+    TraceRecord *logical
+) {
+    if ((count != 0 && (physical == nullptr || logical == nullptr))) {
+        return false;
+    }
+    for (uint32_t index = 0; index < count; ++index) {
+#if PA_BUILD_COMPACT_GENERIC_TRACE
+        if (!DecodeCompactTraceRecord(
+                physical[index], startup_barrier_begin,
+                finish_cycle, &logical[index]
+            )) {
+            return false;
+        }
+#else
+        (void)startup_barrier_begin;
+        (void)finish_cycle;
+        logical[index] = physical[index];
+#endif
+    }
+    return true;
 }
 
 // 巨大的 WorkerState 不参与每轮 H2D/D2H。private 仍只搬前缀、控制量和
@@ -1024,6 +1181,7 @@ inline const char *TracePhaseName(uint32_t phase) {
         "SharedMaterializePublishTaskOutputs",
         "SharedMaterializePublishTaskOutputsCopy",
         "SharedMaterializePublishTaskOutputsFlush",
+        "Dcci",
     };
     static_assert(
         sizeof(names) / sizeof(names[0]) == static_cast<uint32_t>(TracePhase::Count),
@@ -1042,6 +1200,25 @@ inline const char *AtomicSiteName(uint32_t site) {
         "SharedHeapVendLoad", "SharedHeapCursorLoad",
         "SharedHeapCursorReserve", "SharedHeapVendAdvance",
         "SharedInsertPredecessorPoll", "SharedInsertCompletionPublish",
+        "SharedWinnerFatalGuardLoad",
+        "SharedMetadataFatalGuardLoad",
+        "SharedFaninOutputPublishedLoad",
+        "SharedMetadataOutputPublishedLoad",
+        "SharedFaninLastWriterLoad",
+        "SharedMetadataLastWriterLoad",
+        "SharedMetadataLastWriterCommit",
+        "SharedOutputWriterReserve",
+        "SharedOutputPublishedExchange",
+        "SharedMapLookupHeadLoad",
+        "SharedMapLookupTailLoad",
+        "SharedMapLookupSeqLoad",
+        "SharedMapAppendHeadLoad",
+        "SharedMapAppendTailLoad",
+        "SharedMapAppendSeqLoad",
+        "SharedMapAppendSeqResetExchange",
+        "SharedMapAppendSeqPublishExchange",
+        "SharedMapAppendTailExchange",
+        "SharedOutputRollbackExchange",
     };
     static_assert(
         sizeof(names) / sizeof(names[0]) ==
@@ -1059,6 +1236,41 @@ inline const char *AtomicOpName(uint32_t op) {
     return op < sizeof(names) / sizeof(names[0]) ? names[op] : "Unknown";
 }
 
+inline const char *DcciSiteName(uint32_t site) {
+    const char *names[] = {
+        "SharedFaninHistoryInvalidate",
+        "SharedWriterHistoryFlush",
+        "SharedOutputRollbackFlush",
+        "SharedOutputDescriptorFlush",
+        "SharedRegionReadInvalidate",
+        "SharedRegionAppendInvalidate",
+        "SharedRegionAppendFlush",
+        "SharedWinnerBuildDescriptorInvalidate",
+        "ObserverTraceExport",
+        "StartupConfigInvalidate",
+    };
+    static_assert(
+        sizeof(names) / sizeof(names[0]) ==
+            static_cast<uint32_t>(DcciSite::Count),
+        "DcciSiteName must cover every DCCI site"
+    );
+    return site < sizeof(names) / sizeof(names[0])
+        ? names[site]
+        : "Unknown";
+}
+
+inline const char *DcciOpName(uint32_t op) {
+    const char *names[] = {"Invalidate", "CleanOut"};
+    static_assert(
+        sizeof(names) / sizeof(names[0]) ==
+            static_cast<uint32_t>(DcciOp::Count),
+        "DcciOpName must cover every DCCI op"
+    );
+    return op < sizeof(names) / sizeof(names[0])
+        ? names[op]
+        : "Unknown";
+}
+
 inline AtomicOp AtomicSiteOp(AtomicSite site) {
     return AtomicSiteExpectedOp(site);
 }
@@ -1066,9 +1278,12 @@ inline AtomicOp AtomicSiteOp(AtomicSite site) {
 inline bool ValidateTraceHeader(const TraceHeader &header, const char *operation) {
     // 在任何 D2H record 搬运前先验证容量和 dropped，防止损坏 header 导致 scratch 越界或导出残缺泳道。
     // 频率也要求精确为 1 GHz，否则后续 ns/us 换算即使 JSON 合法也没有性能意义。
-    const bool valid = header.magic == 0x4653574cU && header.version == 5 &&
+    const bool valid =
+                       header.magic == 0x4653574cU &&
+                       header.version == 5 &&
                        header.num_cores == kWorkers && header.records_per_core == kTraceRecordsPerCore &&
-                       header.frequency_hz == kSystemCounterHz;
+                       header.frequency_hz == kSystemCounterHz &&
+                       header.record_size_bytes == kTraceRecordSizeBytes;
     bool core_states_valid = true;
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
         const TraceCoreState &core = header.cores[worker];
@@ -1077,15 +1292,23 @@ inline bool ValidateTraceHeader(const TraceHeader &header, const char *operation
         core_states_valid &= core.poll_calls <= core.atomic_calls;
         core_states_valid &= (core.poll_calls == 0) == (core.poll_batch_records == 0);
         const uint64_t physical_atomic =
-            static_cast<uint64_t>(core.atomic_calls) - core.poll_calls + core.poll_batch_records;
+            static_cast<uint64_t>(core.atomic_calls) -
+            core.poll_calls + core.poll_batch_records;
         core_states_valid &= physical_atomic <= core.count;
+        core_states_valid &= core.dcci_records <= core.dcci_calls;
+        core_states_valid &= (core.dcci_calls == 0) == (core.dcci_lines == 0);
+        core_states_valid &= (core.dcci_calls == 0) == (core.dcci_records == 0);
+        core_states_valid &= core.dcci_lines >= core.dcci_calls;
+        core_states_valid &= core.dcci_records <= core.count;
     }
     if (!valid || !core_states_valid) {
         std::fprintf(
             stderr,
             "%s rejected an invalid trace header: magic=0x%08x version=%u cores=%u "
-            "records_per_core=%u frequency_hz=%llu core_states_valid=%s\n",
+            "records_per_core=%u record_size_bytes=%u frequency_hz=%llu "
+            "core_states_valid=%s\n",
             operation, header.magic, header.version, header.num_cores, header.records_per_core,
+            header.record_size_bytes,
             static_cast<unsigned long long>(header.frequency_hz), core_states_valid ? "yes" : "no"
         );
     }
@@ -1099,6 +1322,9 @@ struct TraceExportSummary {
     uint64_t atomic_calls = 0;
     uint64_t poll_calls = 0;
     uint64_t poll_batch_records = 0;
+    uint64_t dcci_records = 0;
+    uint64_t dcci_calls = 0;
+    uint64_t dcci_lines = 0;
     uint64_t dropped_records = 0;
 };
 
@@ -1107,6 +1333,9 @@ inline bool SameTraceSummary(const TraceExportSummary &left, const TraceExportSu
            left.clock_baseline_records == right.clock_baseline_records &&
            left.atomic_calls == right.atomic_calls && left.poll_calls == right.poll_calls &&
            left.poll_batch_records == right.poll_batch_records &&
+           left.dcci_records == right.dcci_records &&
+           left.dcci_calls == right.dcci_calls &&
+           left.dcci_lines == right.dcci_lines &&
            left.dropped_records == right.dropped_records;
 }
 
@@ -1161,8 +1390,60 @@ inline bool ClockRecordSchemaValid(const TraceRecord &record) {
            record.function_id == -1 && record.auxiliary == 0;
 }
 
-// shared 的真实回放边界是稀疏的：每个逻辑 task 都记录连续的
-// EfDrain -> Claim，并都用 Submit 父区间覆盖本次轻量或完整调用；winner
+inline uint32_t DcciRecordCallCount(const TraceRecord &record) {
+    return (record.flags >> kDcciCallCountShift) &
+           kDcciCallCountMask;
+}
+
+inline uint32_t DcciRecordLineCount(const TraceRecord &record) {
+    return record.flags >> kDcciLineCountShift;
+}
+
+inline bool DcciRecordSchemaValid(const TraceRecord &record) {
+    if (record.auxiliary >=
+        static_cast<uint32_t>(DcciSite::Count)) {
+        return false;
+    }
+    const DcciSite site =
+        static_cast<DcciSite>(record.auxiliary);
+#if !PTO_FDWIC_SHARED_MAP
+    if (DcciSiteIsSharedOnly(site)) {
+        return false;
+    }
+#endif
+    const uint32_t op_id = record.flags & kDcciOpMask;
+    if (op_id >= static_cast<uint32_t>(DcciOp::Count) ||
+        static_cast<DcciOp>(op_id) != DcciSiteExpectedOp(site) ||
+        (record.flags & kDcciReservedBit) != 0) {
+        return false;
+    }
+    const uint32_t call_count = DcciRecordCallCount(record);
+    const uint32_t line_count = DcciRecordLineCount(record);
+    if (call_count == 0 || line_count < call_count) {
+        return false;
+    }
+    if (site == DcciSite::ObserverTraceExport) {
+        return call_count ==
+#if PTO_FDWIC_SHARED_MAP
+                   3 &&
+#else
+                   2 &&
+#endif
+               (record.flags & kDcciTrailingDsb) != 0 &&
+               record.task_id == -1 &&
+               record.function_id == -1;
+    }
+    if (site == DcciSite::StartupConfigInvalidate) {
+        return call_count == 1 &&
+               (record.flags & kDcciTrailingDsb) != 0 &&
+               record.task_id == -1 &&
+               record.function_id == -1;
+    }
+    return call_count == 1 && record.task_id >= 0;
+}
+
+// shared 的真实回放边界是稀疏的：每个逻辑 task 只记录 Claim 和 Submit，
+// EfDrain 由 Submit.start -> Claim.start 两个既有端点精确还原；winner
 // 才继续记录 Materialize、Register、Fanin（非 Alloc）和
 // WinnerBuild/AllocComplete 子区间。每个 Materialize 父区间后依次紧跟
 // fresh-output publish 及其 copy/flush 两层 detail；每个 Register 后只
@@ -1184,14 +1465,13 @@ struct SharedSparseTraceValidator {
     bool Observe(const TraceRecord &record) {
 #if PTO_FDWIC_SHARED_MAP
         const auto phase = static_cast<TracePhase>(record.phase);
-        if (phase == TracePhase::PrepareMap) {
+        if (phase == TracePhase::PrepareMap ||
+            phase == TracePhase::EfDrain) {
             return false;
         }
-        if (phase == TracePhase::EfDrain) {
-            if (state_ != State::AwaitEfDrain ||
+        if (phase == TracePhase::Claim) {
+            if (state_ != State::AwaitClaim ||
                 record.task_id != next_task_id_ ||
-                record.function_id != -1 || record.flags != 0 ||
-                record.auxiliary != 0 ||
                 record.end_cycle < record.start_cycle) {
                 return false;
             }
@@ -1201,16 +1481,8 @@ struct SharedSparseTraceValidator {
             }
             task_id_ = record.task_id;
             kind_ = task->kind;
-            efdrain_begin_ = record.start_cycle;
-            previous_end_ = record.end_cycle;
-            state_ = State::AwaitClaim;
-            ++efdrain_count_;
-        } else if (phase == TracePhase::Claim) {
-            if (state_ != State::AwaitClaim ||
-                !SameTask(record) ||
-                record.start_cycle != previous_end_ ||
-                record.end_cycle < record.start_cycle ||
-                (record.flags & ~(kClaimWon | kClaimAttempted)) != 0 ||
+            claim_begin_ = record.start_cycle;
+            if ((record.flags & ~(kClaimWon | kClaimAttempted)) != 0 ||
                 ((record.flags & kClaimWon) != 0 &&
                  (record.flags & kClaimAttempted) == 0) ||
                 record.auxiliary !=
@@ -1364,11 +1636,14 @@ struct SharedSparseTraceValidator {
                 record.flags != (winner_ ? kClaimWon : 0U) ||
                 record.auxiliary !=
                     (kind_ == TaskKind::Alloc ? 1U : 0U) ||
-                record.start_cycle != efdrain_begin_ ||
+                record.start_cycle > claim_begin_ ||
                 record.end_cycle < previous_end_) {
                 return false;
             }
-            state_ = State::AwaitEfDrain;
+            last_efdrain_begin_ = record.start_cycle;
+            last_efdrain_end_ = claim_begin_;
+            ++efdrain_count_;
+            state_ = State::AwaitClaim;
             ++submit_count_;
         }
 #else
@@ -1379,7 +1654,7 @@ struct SharedSparseTraceValidator {
 
     bool Closed() const {
 #if PTO_FDWIC_SHARED_MAP
-        return state_ == State::AwaitEfDrain &&
+        return state_ == State::AwaitClaim &&
                efdrain_count_ == claim_count_ &&
                materialize_count_ == winner_count_ &&
                materialize_task_outputs_count_ == winner_count_ &&
@@ -1402,6 +1677,14 @@ struct SharedSparseTraceValidator {
 
     uint32_t EfDrainCount() const {
         return efdrain_count_;
+    }
+
+    uint64_t LastEfDrainBegin() const {
+        return last_efdrain_begin_;
+    }
+
+    uint64_t LastEfDrainEnd() const {
+        return last_efdrain_end_;
     }
 
     uint32_t ClaimCount() const {
@@ -1451,7 +1734,6 @@ struct SharedSparseTraceValidator {
 private:
 #if PTO_FDWIC_SHARED_MAP
     enum class State {
-        AwaitEfDrain,
         AwaitClaim,
         AwaitMaterialize,
         AwaitMaterializeTaskOutputs,
@@ -1498,14 +1780,16 @@ private:
 
     const SharedHostTaskPlan *plan_;
     SharedHostPlannedTask fallback_task_{};
-    State state_ = State::AwaitEfDrain;
+    State state_ = State::AwaitClaim;
 #endif
     int32_t next_task_id_ = 0;
     int32_t task_id_ = -1;
     int32_t function_id_ = -1;
     TaskKind kind_ = TaskKind::Count;
     bool winner_ = false;
-    uint64_t efdrain_begin_ = 0;
+    uint64_t claim_begin_ = 0;
+    uint64_t last_efdrain_begin_ = 0;
+    uint64_t last_efdrain_end_ = 0;
     uint64_t previous_end_ = 0;
     uint64_t materialize_begin_ = 0;
     uint64_t materialize_end_ = 0;
@@ -1540,7 +1824,167 @@ inline void ExpectedTraceTopology(uint32_t worker, int32_t *block_id, int32_t *l
     *lane = static_cast<int32_t>(1 + vector_id % 2);
 }
 
-template <typename ReadRecords>
+#if PTO_FDWIC_SHARED_MAP
+inline bool SharedTraceClaimAttempted(
+    uint32_t worker, TaskKind kind
+) {
+    if (kind == TaskKind::Alloc) {
+        return true;
+    }
+    const bool aic = worker < kAicWorkers;
+    return aic
+        ? kind == TaskKind::Qk || kind == TaskKind::Pv
+        : kind == TaskKind::Sf || kind == TaskKind::Up;
+}
+
+inline int32_t SharedTraceFunctionId(TaskKind kind) {
+    return kind == TaskKind::Alloc
+        ? -1
+        : static_cast<int32_t>(
+              static_cast<uint32_t>(kind) - 1U
+          );
+}
+
+inline bool ExpandSharedTraceRecords(
+    uint32_t worker,
+    const TraceRecord *generic_records,
+    uint32_t generic_count,
+    const SharedSubmitClaimTraceRecord *submit_claim_records,
+    const SharedHostTaskPlan &plan,
+    std::vector<TraceRecord> *logical_records
+) {
+    if (generic_records == nullptr ||
+        submit_claim_records == nullptr ||
+        logical_records == nullptr) {
+        return false;
+    }
+    logical_records->clear();
+    logical_records->reserve(
+        static_cast<size_t>(generic_count) +
+        2U * plan.total_tasks
+    );
+    uint32_t generic_index = 0;
+    for (uint32_t task_id = 0;
+         task_id < plan.total_tasks; ++task_id) {
+        const SharedHostPlannedTask *task =
+            plan.TaskAt(task_id);
+        const SharedSubmitClaimTraceRecord &endpoints =
+            submit_claim_records[task_id];
+        const bool winner =
+            (endpoints.claim_end_and_winner &
+             kSharedClaimWinnerBit) != 0;
+        const bool attempted =
+            task != nullptr &&
+            SharedTraceClaimAttempted(worker, task->kind);
+        const uint64_t claim_begin =
+            endpoints.claim_begin;
+        const uint64_t claim_end =
+            endpoints.claim_end_and_winner &
+            ~kSharedClaimWinnerBit;
+        const uint64_t submit_begin =
+            endpoints.submit_begin;
+        const uint64_t submit_end =
+            endpoints.submit_end;
+        if (task == nullptr ||
+            submit_begin == 0 ||
+            claim_begin == 0 ||
+            (claim_begin & kSharedClaimWinnerBit) != 0 ||
+            (submit_begin & kSharedClaimWinnerBit) != 0 ||
+            (submit_end & kSharedClaimWinnerBit) != 0 ||
+            submit_end < submit_begin ||
+            claim_end < claim_begin ||
+            submit_begin > claim_begin ||
+            claim_end > submit_end ||
+            (winner && !attempted)) {
+            return false;
+        }
+
+        while (generic_index < generic_count &&
+               generic_records[generic_index].end_cycle <=
+                   claim_end) {
+            const TraceRecord &record =
+                generic_records[generic_index++];
+            if (record.phase ==
+                    static_cast<uint16_t>(TracePhase::Claim) ||
+                record.phase ==
+                    static_cast<uint16_t>(TracePhase::Submit) ||
+                record.phase ==
+                    static_cast<uint16_t>(TracePhase::EfDrain)) {
+                return false;
+            }
+            logical_records->push_back(record);
+        }
+
+        const int32_t function_id = winner
+            ? SharedTraceFunctionId(task->kind)
+            : -1;
+        const uint16_t is_alloc =
+            task->kind == TaskKind::Alloc ? 1U : 0U;
+        TraceRecord claim{};
+        claim.start_cycle = claim_begin;
+        claim.end_cycle = claim_end;
+        claim.task_id = static_cast<int32_t>(task_id);
+        claim.function_id = function_id;
+        claim.flags =
+            (winner ? kClaimWon : 0U) |
+            (attempted ? kClaimAttempted : 0U);
+        claim.phase =
+            static_cast<uint16_t>(TracePhase::Claim);
+        claim.auxiliary = is_alloc;
+        logical_records->push_back(claim);
+
+        while (generic_index < generic_count &&
+               generic_records[generic_index].end_cycle <=
+                   submit_end) {
+            const TraceRecord &record =
+                generic_records[generic_index++];
+            if (record.phase ==
+                    static_cast<uint16_t>(TracePhase::Claim) ||
+                record.phase ==
+                    static_cast<uint16_t>(TracePhase::Submit) ||
+                record.phase ==
+                    static_cast<uint16_t>(TracePhase::EfDrain)) {
+                return false;
+            }
+            logical_records->push_back(record);
+        }
+
+        TraceRecord submit{};
+        submit.start_cycle = submit_begin;
+        submit.end_cycle = submit_end;
+        submit.task_id = static_cast<int32_t>(task_id);
+        submit.function_id = function_id;
+        submit.flags = winner ? kClaimWon : 0U;
+        submit.phase =
+            static_cast<uint16_t>(TracePhase::Submit);
+        submit.auxiliary = is_alloc;
+        logical_records->push_back(submit);
+    }
+    while (generic_index < generic_count) {
+        const TraceRecord &record =
+            generic_records[generic_index++];
+        if (record.phase ==
+                static_cast<uint16_t>(TracePhase::Claim) ||
+            record.phase ==
+                static_cast<uint16_t>(TracePhase::Submit) ||
+            record.phase ==
+                static_cast<uint16_t>(TracePhase::EfDrain)) {
+            return false;
+        }
+        logical_records->push_back(record);
+    }
+    return logical_records->size() ==
+           static_cast<size_t>(generic_count) +
+               2U * plan.total_tasks;
+}
+#endif
+
+template <
+    typename ReadRecords
+#if PTO_FDWIC_SHARED_MAP
+    , typename ReadSubmitClaimRecords
+#endif
+>
 inline bool ExportSwimlaneRecords(
 #if PTO_FDWIC_SHARED_MAP
     const TraceHeader &header, const SchedulerState &state,
@@ -1551,6 +1995,9 @@ inline bool ExportSwimlaneRecords(
     WinnerWorkloadMode workload_mode, const WorkloadCounts &workload_counts,
     const char *workload_pattern, FinalBarrierShape final_barrier_shape,
     bool atomic_trace_enabled, ReadRecords read_records
+#if PTO_FDWIC_SHARED_MAP
+    , ReadSubmitClaimRecords read_submit_claim_records
+#endif
 ) {
     if (!ValidateTraceHeader(header, "swimlane export")) return false;
 #if PTO_FDWIC_SHARED_MAP
@@ -1598,10 +2045,20 @@ inline bool ExportSwimlaneRecords(
             );
             return false;
         }
+        // core.count 只统计 generic 区的物理记录；shared 的每个
+        // Submit/Claim 在专用 32B 四端点区保存一条，导出后会展开成两个
+        // 逻辑事件，因此 summary 必须继续保持 JSON 事件数口径。
         producer_summary.records += core.count;
+#if PTO_FDWIC_SHARED_MAP
+        producer_summary.records +=
+            2ULL * shared_plan.total_tasks;
+#endif
         producer_summary.atomic_calls += core.atomic_calls;
         producer_summary.poll_calls += core.poll_calls;
         producer_summary.poll_batch_records += core.poll_batch_records;
+        producer_summary.dcci_records += core.dcci_records;
+        producer_summary.dcci_calls += core.dcci_calls;
+        producer_summary.dcci_lines += core.dcci_lines;
         producer_summary.dropped_records += core.dropped;
         if (!atomic_trace_enabled) {
             if (core.atomic_calls != 0 || core.poll_calls != 0 || core.poll_batch_records != 0) {
@@ -1624,7 +2081,8 @@ inline bool ExportSwimlaneRecords(
             return false;
         }
         producer_summary.atomic_records +=
-            static_cast<uint64_t>(core.atomic_calls) - core.poll_calls + core.poll_batch_records;
+            static_cast<uint64_t>(core.atomic_calls) -
+            core.poll_calls + core.poll_batch_records;
     }
     producer_summary.clock_baseline_records = atomic_trace_enabled ? 2ULL * kWorkers : 0;
 
@@ -1679,6 +2137,8 @@ inline bool ExportSwimlaneRecords(
         "],\"fdwic_summary\":{\"records\":%llu,\"atomic_records\":%llu,"
         "\"clock_baseline_records\":%llu,\"atomic_calls\":%llu,"
         "\"batched_poll_calls\":%llu,\"poll_batch_records\":%llu,"
+        "\"dcci_records\":%llu,\"dcci_calls\":%llu,"
+        "\"dcci_lines\":%llu,"
         "\"dropped_records\":%llu}",
         static_cast<unsigned long long>(producer_summary.records),
         static_cast<unsigned long long>(producer_summary.atomic_records),
@@ -1686,6 +2146,9 @@ inline bool ExportSwimlaneRecords(
         static_cast<unsigned long long>(producer_summary.atomic_calls),
         static_cast<unsigned long long>(producer_summary.poll_calls),
         static_cast<unsigned long long>(producer_summary.poll_batch_records),
+        static_cast<unsigned long long>(producer_summary.dcci_records),
+        static_cast<unsigned long long>(producer_summary.dcci_calls),
+        static_cast<unsigned long long>(producer_summary.dcci_lines),
         static_cast<unsigned long long>(producer_summary.dropped_records)
     );
     std::fprintf(
@@ -1699,10 +2162,18 @@ inline bool ExportSwimlaneRecords(
     bool first_record = true;
     uint64_t exported_records = 0;
     TraceExportSummary observed_summary;
-    std::vector<TraceRecord> scratch(kTraceRecordsPerCore);
+    std::vector<TraceStorageRecord>
+        physical_scratch(kTraceRecordsPerCore);
+    std::vector<TraceRecord>
+        decoded_scratch(kTraceRecordsPerCore);
+#if PTO_FDWIC_SHARED_MAP
+    std::vector<SharedSubmitClaimTraceRecord>
+        submit_claim_scratch(shared_plan.total_tasks);
+    std::vector<TraceRecord> logical_scratch;
+#endif
     constexpr int32_t kTracePhaseCount = static_cast<int32_t>(TracePhase::Count);
     for (uint32_t worker = 0; worker < kWorkers && success; ++worker) {
-        // 每次只读取一个 worker 的有效区间；完整 384 MiB trace 缓冲无需整体回拷。
+        // 每次只读取一个 worker 的有效区间；完整 trace 缓冲无需整体回拷。
         const uint32_t available = header.cores[worker].count;
         if (available > header.records_per_core) {
             std::fprintf(
@@ -1712,10 +2183,79 @@ inline bool ExportSwimlaneRecords(
             success = false;
             break;
         }
-        if (available != 0 && !read_records(worker, available, scratch.data())) {
+        if (available != 0 &&
+            !read_records(
+                worker, available, physical_scratch.data()
+            )) {
             success = false;
             break;
         }
+        uint64_t decode_anchor = 0;
+        uint64_t decode_finish = 0;
+#if PA_BUILD_COMPACT_GENERIC_TRACE
+        decode_anchor =
+            state.results[worker].startup_barrier_begin;
+        decode_finish = state.results[worker].finish_cycle;
+#endif
+        if (!DecodeTraceStorageRecords(
+                physical_scratch.data(), available,
+                decode_anchor, decode_finish,
+                decoded_scratch.data()
+            )) {
+            std::fprintf(
+                stderr,
+                "Trace core %u has an invalid compact generic "
+                "record stream.\n",
+                worker
+            );
+            success = false;
+            break;
+        }
+#if PTO_FDWIC_SHARED_MAP
+        if (state.results[worker].submits !=
+            shared_plan.total_tasks) {
+            std::fprintf(
+                stderr,
+                "Trace core %u submit count %llu does not match "
+                "shared plan size %u.\n",
+                worker,
+                static_cast<unsigned long long>(
+                    state.results[worker].submits
+                ),
+                shared_plan.total_tasks
+            );
+            success = false;
+            break;
+        }
+        if (shared_plan.total_tasks != 0 &&
+            !read_submit_claim_records(
+                worker, shared_plan.total_tasks,
+                submit_claim_scratch.data()
+            )) {
+            success = false;
+            break;
+        }
+        if (!ExpandSharedTraceRecords(
+                worker, decoded_scratch.data(), available,
+                submit_claim_scratch.data(), shared_plan,
+                &logical_scratch
+            )) {
+            std::fprintf(
+                stderr,
+                "Trace core %u has an invalid shared "
+                "Submit/Claim endpoint stream.\n",
+                worker
+            );
+            success = false;
+            break;
+        }
+        const TraceRecord *records = logical_scratch.data();
+        const uint32_t logical_available =
+            static_cast<uint32_t>(logical_scratch.size());
+#else
+        const TraceRecord *records = decoded_scratch.data();
+        const uint32_t logical_available = available;
+#endif
         const TraceCoreState &core = header.cores[worker];
         uint64_t core_atomic_calls = 0;
         uint64_t core_poll_calls = 0;
@@ -1724,6 +2264,10 @@ inline bool ExportSwimlaneRecords(
         uint32_t core_clock_records = 0;
         uint32_t core_plain_clock_records = 0;
         uint32_t core_dependency_clock_records = 0;
+        uint32_t core_dcci_records = 0;
+        uint32_t core_observer_dcci_records = 0;
+        uint64_t core_dcci_calls = 0;
+        uint64_t core_dcci_lines = 0;
         bool dependency_applied = false;
         bool direct_result_used_return_ready = false;
         bool direct_result_used_source_issue = false;
@@ -1734,11 +2278,15 @@ inline bool ExportSwimlaneRecords(
 #else
         SharedSparseTraceValidator sparse_trace_validator;
 #endif
-        for (uint32_t index = 0; index < available; ++index) {
-            const TraceRecord &record = scratch[index];
+        for (uint32_t index = 0;
+             index < logical_available; ++index) {
+            const TraceRecord &record = records[index];
             const bool atomic_record = record.phase == static_cast<int32_t>(TracePhase::Atomic);
             const bool claim_record = record.phase == static_cast<int32_t>(TracePhase::Claim);
             const bool clock_record = record.phase == static_cast<int32_t>(TracePhase::ClockBaseline);
+            const bool dcci_record =
+                record.phase ==
+                static_cast<int32_t>(TracePhase::Dcci);
             const bool atomic_schema_valid = !atomic_record ||
                 AtomicRecordSchemaValid(record, atomic_trace_enabled);
             const bool claim_schema_valid = !claim_record ||
@@ -1747,23 +2295,26 @@ inline bool ExportSwimlaneRecords(
                  record.auxiliary <= 1);
             const bool clock_schema_valid = !clock_record ||
                 (atomic_trace_enabled && ClockRecordSchemaValid(record));
-            bool record_valid = record.end_cycle >= record.start_cycle && record.phase >= 0 &&
+            const bool dcci_schema_valid =
+                !dcci_record || DcciRecordSchemaValid(record);
+            bool record_valid = record.end_cycle >= record.start_cycle &&
                                 record.phase < kTracePhaseCount && record.task_id >= -1 &&
-                                record.function_id >= -1 && record.lane == core.lane &&
-                                record.block_id == core.block_id &&
-                                record.core_idx == core.core_idx && atomic_schema_valid &&
-                                claim_schema_valid && clock_schema_valid;
+                                record.function_id >= -1 && atomic_schema_valid &&
+                                claim_schema_valid && clock_schema_valid &&
+                                dcci_schema_valid;
             if (record_valid && !sparse_trace_validator.Observe(record)) {
                 record_valid = false;
             }
             if (!record_valid) {
                 std::fprintf(
                     stderr,
-                    "Invalid trace record at worker=%u index=%u: phase=%d lane=%d block=%d core=%d "
+                    "Invalid trace record at worker=%u index=%u: phase=%u lane=%d block=%d core=%d "
                     "start=%llu end=%llu flags=0x%08x aux=%u\n",
-                    worker, index, record.phase, record.lane, record.block_id, record.core_idx,
+                    worker, index, static_cast<unsigned>(record.phase),
+                    core.lane, core.block_id, core.core_idx,
                     static_cast<unsigned long long>(record.start_cycle),
-                    static_cast<unsigned long long>(record.end_cycle), record.flags, record.auxiliary
+                    static_cast<unsigned long long>(record.end_cycle), record.flags,
+                    static_cast<unsigned>(record.auxiliary)
                 );
                 success = false;
                 break;
@@ -1790,14 +2341,25 @@ inline bool ExportSwimlaneRecords(
                 } else {
                     ++core_plain_clock_records;
                 }
+            } else if (dcci_record) {
+                ++core_dcci_records;
+                if (record.auxiliary ==
+                    static_cast<uint32_t>(
+                        DcciSite::ObserverTraceExport
+                    )) {
+                    ++core_observer_dcci_records;
+                }
+                core_dcci_calls += DcciRecordCallCount(record);
+                core_dcci_lines += DcciRecordLineCount(record);
             }
             std::fprintf(
                 output,
                 "%s[%d,%d,%d,%d,%d,\"%s\",%llu,%llu,%u,%u]",
-                first_record ? "" : ",\n", record.core_idx, record.block_id, record.lane, record.task_id,
+                first_record ? "" : ",\n", core.core_idx, core.block_id, core.lane, record.task_id,
                 record.function_id, TracePhaseName(static_cast<uint32_t>(record.phase)),
                 static_cast<unsigned long long>(record.start_cycle),
-                static_cast<unsigned long long>(record.end_cycle), record.flags, record.auxiliary
+                static_cast<unsigned long long>(record.end_cycle), record.flags,
+                static_cast<unsigned>(record.auxiliary)
             );
             first_record = false;
             ++exported_records;
@@ -1818,17 +2380,31 @@ inline bool ExportSwimlaneRecords(
                           core_poll_batch_records == 0 && core_clock_records == 0;
         }
         core_closed &= sparse_trace_validator.Closed();
+        core_closed &=
+            core_dcci_records == core.dcci_records &&
+            core_observer_dcci_records == 1 &&
+            core_dcci_calls == core.dcci_calls &&
+            core_dcci_lines == core.dcci_lines;
         if (!core_closed) {
             std::fprintf(
                 stderr,
                 "swimlane closure failed on worker=%u: physical_atomic=%u logical_atomic=%llu/%u "
-                "poll_calls=%llu/%u poll_batches=%u/%u clock=%u plain=%u dependency=%u "
+                "poll_calls=%llu/%u poll_batches=%u/%u "
+                "dcci_records=%u/%u observer_dcci=%u/1 "
+                "dcci_calls=%llu/%u "
+                "dcci_lines=%llu/%u clock=%u plain=%u dependency=%u "
                 "dependency_applied=%s direct_ready=%s direct_issue=%s "
                 "efdrains=%u claims=%u winners=%u materializes=%u fanins=%u "
                 "registers=%u register_metadata=%u tails=%u submits=%u\n",
                 worker, core_atomic_records, static_cast<unsigned long long>(core_atomic_calls),
                 core.atomic_calls, static_cast<unsigned long long>(core_poll_calls), core.poll_calls,
-                core_poll_batch_records, core.poll_batch_records, core_clock_records,
+                core_poll_batch_records, core.poll_batch_records,
+                core_dcci_records, core.dcci_records,
+                core_observer_dcci_records,
+                static_cast<unsigned long long>(core_dcci_calls),
+                core.dcci_calls,
+                static_cast<unsigned long long>(core_dcci_lines),
+                core.dcci_lines, core_clock_records,
                 core_plain_clock_records, core_dependency_clock_records,
                 dependency_applied ? "yes" : "no", direct_result_used_return_ready ? "yes" : "no",
                 direct_result_used_source_issue ? "yes" : "no",
@@ -1845,19 +2421,25 @@ inline bool ExportSwimlaneRecords(
             success = false;
             break;
         }
-        observed_summary.records += available;
+        observed_summary.records += logical_available;
         observed_summary.atomic_records += core_atomic_records;
         observed_summary.clock_baseline_records += core_clock_records;
         observed_summary.atomic_calls += core_atomic_calls;
         observed_summary.poll_calls += core_poll_calls;
         observed_summary.poll_batch_records += core_poll_batch_records;
+        observed_summary.dcci_records += core_dcci_records;
+        observed_summary.dcci_calls += core_dcci_calls;
+        observed_summary.dcci_lines += core_dcci_lines;
         observed_summary.dropped_records += core.dropped;
     }
     if (success && !SameTraceSummary(producer_summary, observed_summary)) {
         std::fprintf(
             stderr,
             "swimlane producer/raw summary mismatch: records=%llu/%llu atomic_records=%llu/%llu "
-            "atomic_calls=%llu/%llu poll_calls=%llu/%llu poll_batches=%llu/%llu clock=%llu/%llu\n",
+            "atomic_calls=%llu/%llu poll_calls=%llu/%llu "
+            "poll_batches=%llu/%llu dcci_records=%llu/%llu "
+            "dcci_calls=%llu/%llu dcci_lines=%llu/%llu "
+            "clock=%llu/%llu\n",
             static_cast<unsigned long long>(observed_summary.records),
             static_cast<unsigned long long>(producer_summary.records),
             static_cast<unsigned long long>(observed_summary.atomic_records),
@@ -1868,6 +2450,12 @@ inline bool ExportSwimlaneRecords(
             static_cast<unsigned long long>(producer_summary.poll_calls),
             static_cast<unsigned long long>(observed_summary.poll_batch_records),
             static_cast<unsigned long long>(producer_summary.poll_batch_records),
+            static_cast<unsigned long long>(observed_summary.dcci_records),
+            static_cast<unsigned long long>(producer_summary.dcci_records),
+            static_cast<unsigned long long>(observed_summary.dcci_calls),
+            static_cast<unsigned long long>(producer_summary.dcci_calls),
+            static_cast<unsigned long long>(observed_summary.dcci_lines),
+            static_cast<unsigned long long>(producer_summary.dcci_lines),
             static_cast<unsigned long long>(observed_summary.clock_baseline_records),
             static_cast<unsigned long long>(producer_summary.clock_baseline_records)
         );
@@ -1899,9 +2487,18 @@ inline bool ExportSwimlaneRecords(
     return true;
 }
 
-template <typename ReadRecords>
+template <
+    typename ReadRecords
+#if PTO_FDWIC_SHARED_MAP
+    , typename ReadSubmitClaimRecords
+#endif
+>
 inline bool AnalyzeSwimlaneRecords(
-    const TraceHeader &header, const SchedulerState &state, ReadRecords read_records
+    const TraceHeader &header, const SchedulerState &state,
+    ReadRecords read_records
+#if PTO_FDWIC_SHARED_MAP
+    , ReadSubmitClaimRecords read_submit_claim_records
+#endif
 ) {
     if (!ValidateTraceHeader(header, "swimlane analysis")) return false;
 #if PTO_FDWIC_SHARED_MAP
@@ -1924,6 +2521,10 @@ inline bool AnalyzeSwimlaneRecords(
     constexpr TracePhase kDetailedPhases[] = {
         TracePhase::EfDrain, TracePhase::Claim, TracePhase::Materialize, TracePhase::Register,
     };
+    static_assert(
+        kDetailedPhases[0] == TracePhase::EfDrain,
+        "inferred EfDrain task distribution expects detail slot zero"
+    );
     uint64_t cycles[kWorkers][kTracePhaseCount] = {};
     uint64_t counts[kWorkers][kTracePhaseCount] = {};
 #if PTO_FDWIC_SHARED_MAP
@@ -1940,7 +2541,15 @@ inline bool AnalyzeSwimlaneRecords(
     std::vector<uint64_t> clock_baselines[2];
     std::vector<uint64_t> clock_dependency_baselines[2];
     uint64_t clock_dependency_applied[2] = {};
-    std::vector<TraceRecord> scratch(kTraceRecordsPerCore);
+    std::vector<TraceStorageRecord>
+        physical_scratch(kTraceRecordsPerCore);
+    std::vector<TraceRecord>
+        decoded_scratch(kTraceRecordsPerCore);
+#if PTO_FDWIC_SHARED_MAP
+    std::vector<SharedSubmitClaimTraceRecord>
+        submit_claim_scratch(shared_plan.total_tasks);
+    std::vector<TraceRecord> logical_scratch;
+#endif
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
 #if PTO_FDWIC_SHARED_MAP
         SharedSparseTraceValidator sparse_trace_validator(
@@ -1951,12 +2560,78 @@ inline bool AnalyzeSwimlaneRecords(
 #endif
         const uint32_t available = header.cores[worker].count;
         const uint32_t count = std::min(available, header.records_per_core);
-        if (count != 0 && !read_records(worker, count, scratch.data())) {
+        if (count != 0 &&
+            !read_records(
+                worker, count, physical_scratch.data()
+            )) {
             return false;
         }
-        for (uint32_t index = 0; index < count; ++index) {
-            const TraceRecord &record = scratch[index];
-            if (record.phase < 0 || record.phase >= static_cast<int32_t>(kTracePhaseCount) ||
+        uint64_t decode_anchor = 0;
+        uint64_t decode_finish = 0;
+#if PA_BUILD_COMPACT_GENERIC_TRACE
+        decode_anchor =
+            state.results[worker].startup_barrier_begin;
+        decode_finish = state.results[worker].finish_cycle;
+#endif
+        if (!DecodeTraceStorageRecords(
+                physical_scratch.data(), count,
+                decode_anchor, decode_finish,
+                decoded_scratch.data()
+            )) {
+            std::fprintf(
+                stderr,
+                "swimlane analysis rejected worker %u invalid "
+                "compact generic record stream.\n",
+                worker
+            );
+            return false;
+        }
+#if PTO_FDWIC_SHARED_MAP
+        if (state.results[worker].submits !=
+            shared_plan.total_tasks) {
+            std::fprintf(
+                stderr,
+                "swimlane analysis rejected worker %u submit "
+                "count %llu; shared plan has %u tasks.\n",
+                worker,
+                static_cast<unsigned long long>(
+                    state.results[worker].submits
+                ),
+                shared_plan.total_tasks
+            );
+            return false;
+        }
+        if (shared_plan.total_tasks != 0 &&
+            !read_submit_claim_records(
+                worker, shared_plan.total_tasks,
+                submit_claim_scratch.data()
+            )) {
+            return false;
+        }
+        if (!ExpandSharedTraceRecords(
+                worker, decoded_scratch.data(), count,
+                submit_claim_scratch.data(), shared_plan,
+                &logical_scratch
+            )) {
+            std::fprintf(
+                stderr,
+                "swimlane analysis rejected worker %u invalid "
+                "shared Submit/Claim endpoint stream.\n",
+                worker
+            );
+            return false;
+        }
+        const TraceRecord *records = logical_scratch.data();
+        const uint32_t logical_count =
+            static_cast<uint32_t>(logical_scratch.size());
+#else
+        const TraceRecord *records = decoded_scratch.data();
+        const uint32_t logical_count = count;
+#endif
+        for (uint32_t index = 0;
+             index < logical_count; ++index) {
+            const TraceRecord &record = records[index];
+            if (record.phase >= kTracePhaseCount ||
                 record.end_cycle < record.start_cycle) {
                 // 分析器面对单条坏记录选择跳过；严格导出路径会直接拒绝，二者服务于不同诊断目的。
                 continue;
@@ -1976,6 +2651,42 @@ inline bool AnalyzeSwimlaneRecords(
             }
             const uint32_t phase = static_cast<uint32_t>(record.phase);
             const uint64_t duration = record.end_cycle - record.start_cycle;
+#if PTO_FDWIC_SHARED_MAP
+            // shared raw 不再为 EfDrain 单写记录。Submit 在状态机中闭合时，
+            // 用 Submit.start -> Claim.start 恢复同一业务区间，使控制台
+            // phase 聚合与 task 分布继续保持原口径。
+            if (record.phase ==
+                static_cast<uint16_t>(TracePhase::Submit)) {
+                const uint64_t efdrain_begin =
+                    sparse_trace_validator.LastEfDrainBegin();
+                const uint64_t efdrain_end =
+                    sparse_trace_validator.LastEfDrainEnd();
+                if (efdrain_end < efdrain_begin) {
+                    return false;
+                }
+                const uint64_t efdrain_duration =
+                    efdrain_end - efdrain_begin;
+                const uint32_t efdrain_phase =
+                    static_cast<uint32_t>(TracePhase::EfDrain);
+                cycles[worker][efdrain_phase] += efdrain_duration;
+                ++counts[worker][efdrain_phase];
+                const uint32_t role_index =
+                    state.results[worker].role ==
+                            static_cast<uint64_t>(CoreRole::Aic)
+                        ? 0U
+                        : 1U;
+                const SharedHostPlannedTask *task =
+                    shared_plan.TaskAt(
+                        static_cast<uint32_t>(record.task_id)
+                    );
+                if (task == nullptr) {
+                    return false;
+                }
+                task_durations[role_index][
+                    static_cast<uint32_t>(task->kind)
+                ][0].push_back(efdrain_duration);
+            }
+#endif
             const bool atomic_poll_batch =
                 record.phase == static_cast<int32_t>(TracePhase::Atomic) &&
                 (record.flags & kAtomicPollBatch) != 0;
@@ -4272,11 +4983,15 @@ inline Metrics Validate(
     if (state.config.trace_enabled != 0) {
         // 固定阶段记录数加上动态等待记录数，应与所有 worker 的 header count 精确相等。
         bool trace_shape_ok = trace_header != nullptr;
-        uint64_t trace_records = 0;
+        uint64_t physical_trace_records = 0;
+        uint64_t logical_trace_records = 0;
         uint64_t trace_dropped = 0;
         uint64_t physical_atomic_records = 0;
         uint64_t batched_poll_calls = 0;
         uint64_t poll_batch_records = 0;
+        uint64_t dcci_records = 0;
+        uint64_t dcci_calls = 0;
+        uint64_t dcci_lines = 0;
         bool per_worker_trace_counts_ok = true;
         if (trace_header != nullptr) {
             trace_shape_ok &= trace_header->magic == 0x4653574cU;
@@ -4284,9 +4999,11 @@ inline Metrics Validate(
             trace_shape_ok &= trace_header->num_cores == kWorkers;
             trace_shape_ok &= trace_header->records_per_core == kTraceRecordsPerCore;
             trace_shape_ok &= trace_header->frequency_hz == kSystemCounterHz;
+            trace_shape_ok &= trace_header->record_size_bytes == kTraceRecordSizeBytes;
             for (uint32_t worker = 0; worker < kWorkers; ++worker) {
                 const TraceCoreState &core = trace_header->cores[worker];
-                trace_records += core.count;
+                physical_trace_records += core.count;
+                logical_trace_records += core.count;
                 trace_dropped += core.dropped;
                 trace_shape_ok &= core.count <= kTraceRecordsPerCore;
                 int32_t expected_block = -1;
@@ -4295,7 +5012,25 @@ inline Metrics Validate(
                 trace_shape_ok &= core.core_idx == static_cast<int32_t>(worker);
                 trace_shape_ok &= core.block_id == expected_block;
                 trace_shape_ok &= core.lane == expected_lane;
+                trace_shape_ok &= core.dcci_records <= core.dcci_calls;
+                trace_shape_ok &=
+                    (core.dcci_calls == 0) ==
+                    (core.dcci_lines == 0);
+                trace_shape_ok &=
+                    (core.dcci_calls == 0) ==
+                    (core.dcci_records == 0);
+                trace_shape_ok &= core.dcci_lines >= core.dcci_calls;
+                dcci_records += core.dcci_records;
+                dcci_calls += core.dcci_calls;
+                dcci_lines += core.dcci_lines;
                 const WorkerResult &result = state.results[worker];
+#if PTO_FDWIC_SHARED_MAP
+                // Submit/Claim 专用区按已完成 Submit 数写入 32B 四端点行，
+                // host 展开后恢复为两个 32B 逻辑事件。它不进入
+                // TraceCoreState::count，但必须进入最终 JSON 事件数。
+                trace_shape_ok &= result.submits <= kMaxTasks;
+                logical_trace_records += 2ULL * result.submits;
+#endif
                 const uint64_t worker_kernels = result.kernel_counts[0] + result.kernel_counts[1] +
                                                 result.kernel_counts[2] + result.kernel_counts[3];
                 uint64_t worker_physical_atomic = 0;
@@ -4304,7 +5039,10 @@ inline Metrics Validate(
                     trace_shape_ok &= core.poll_calls <= core.atomic_calls;
                     trace_shape_ok &= (core.poll_calls == 0) == (core.poll_batch_records == 0);
                     worker_physical_atomic =
-                        static_cast<uint64_t>(core.atomic_calls) - core.poll_calls + core.poll_batch_records;
+                        static_cast<uint64_t>(
+                            core.atomic_calls
+                        ) - core.poll_calls +
+                        core.poll_batch_records;
                     physical_atomic_records += worker_physical_atomic;
                     batched_poll_calls += core.poll_calls;
                     poll_batch_records += core.poll_batch_records;
@@ -4314,15 +5052,17 @@ inline Metrics Validate(
                 }
                 const uint64_t worker_expected =
 #if PTO_FDWIC_SHARED_MAP
-                    // 每个逻辑 task 都有 EfDrain+Claim+Submit；winner 追加
+                    // core.count 只覆盖 generic 物理区：Claim/Submit 已迁到
+                    // 专用 32B 区，不能再计入这个物理公式。winner 追加
                     // Materialize/Register/metadata/outputs/copy/flush/tail，
                     // 非 Alloc 再追加 Fanin。Alloc 为 7 条、普通为 8 条，
                     // 即 8*wins - alloc_wins。
-                    3 * result.submits + 8 * result.claim_wins - result.wins[0] +
+                    8 * result.claim_wins - result.wins[0] +
 #else
                     6 * result.submits + 2 * result.claim_wins - result.wins[0] +
 #endif
                     2 * worker_kernels + result.wait_events[0] + result.wait_events[1] + 2 +
+                    core.dcci_records +
                     (((state.config.trace_enabled & kTraceAtomicsEnabled) != 0)
                          ? worker_physical_atomic + 2
                          : 0);
@@ -4330,28 +5070,34 @@ inline Metrics Validate(
             }
         }
 #if PTO_FDWIC_SHARED_MAP
-        // 除三条逐 task 前端记录外：每 batch 的 Alloc winner 有 7 条；
-        // 每 group 的四个普通 winner 子区间有 32 条，四个实际 kernel
-        // 的 Kernel/Commit 有 8 条，合计 40 条。
+        // generic 物理区内：每 batch 的 Alloc winner 有 7 条；每 group
+        // 的四个普通 winner 子区间有 32 条，四个实际 kernel 的
+        // Kernel/Commit 有 8 条，合计 40 条。Claim/Submit 专用区
+        // 不进入 physical_expected_trace_records。
         const uint64_t expected_shared_extra_records =
             7ULL * static_cast<uint64_t>(batches) +
             40ULL * static_cast<uint64_t>(group_count);
-        const uint64_t expected_trace_records =
-            3ULL * expected_submits +
+        const uint64_t physical_expected_trace_records =
             expected_shared_extra_records +
-            trace_wait_records + 2 * kWorkers +
+            trace_wait_records + 2 * kWorkers + dcci_records +
             (((state.config.trace_enabled & kTraceAtomicsEnabled) != 0)
                  ? physical_atomic_records + 2 * kWorkers
                  : 0);
+        const uint64_t logical_expected_trace_records =
+            physical_expected_trace_records +
+            2ULL * expected_submits;
 #else
-        const uint64_t expected_trace_records =
+        const uint64_t physical_expected_trace_records =
             static_cast<uint64_t>(batches) * (static_cast<uint64_t>(kWorkers) * 30 + 17) +
-            trace_wait_records + 2 * kWorkers +
+            trace_wait_records + 2 * kWorkers + dcci_records +
             (((state.config.trace_enabled & kTraceAtomicsEnabled) != 0)
                  ? physical_atomic_records + 2 * kWorkers
                  : 0);
+        const uint64_t logical_expected_trace_records =
+            physical_expected_trace_records;
 #endif
-        // shared 每个逻辑 task 固定 EfDrain+Claim+Submit 三条，loser 没有
+        // shared 每个逻辑 task固定 Claim+Submit 两条；EfDrain 由
+        // Submit.start -> Claim.start 离线还原，loser 没有
         // 业务子区间；Alloc winner 追加 Materialize/Register/metadata/
         // outputs/copy/flush/AllocComplete 七条，每个普通 winner 追加
         // Materialize/Register/metadata/outputs/copy/flush/Fanin/
@@ -4360,17 +5106,57 @@ inline Metrics Validate(
         // 增加 2 条，真实等待按运行时次数加入。
         Expect(trace_shape_ok, "swimlane header and per-worker capacities are valid", &metrics);
         Expect(trace_dropped == 0, "swimlane records fit without drops", &metrics);
-        Expect(trace_records == expected_trace_records, "swimlane record count matches PA phase flow", &metrics);
-        Expect(per_worker_trace_counts_ok, "every worker swimlane record count is exact", &metrics);
+        Expect(
+            physical_trace_records ==
+                physical_expected_trace_records,
+            "physical generic swimlane record count matches PA phase flow",
+            &metrics
+        );
+        Expect(
+            logical_trace_records ==
+                logical_expected_trace_records,
+            "expanded logical swimlane record count matches PA phase flow",
+            &metrics
+        );
+        Expect(
+            per_worker_trace_counts_ok,
+            "every worker physical generic swimlane record count is exact",
+            &metrics
+        );
         if ((state.config.trace_enabled & kTraceAtomicsEnabled) != 0) {
             Expect(atomic_trace_calls != 0, "atomic trace captured source-level calls", &metrics);
         } else {
             Expect(atomic_trace_calls == 0, "atomic trace counters stay zero when disabled", &metrics);
         }
+        Expect(
+            dcci_records >= kWorkers &&
+                dcci_calls ==
+                    dcci_records +
+#if PTO_FDWIC_SHARED_MAP
+                        2ULL * kWorkers &&
+#else
+                        kWorkers &&
+#endif
+                dcci_lines >= dcci_calls,
+            "DCCI closure includes one observer export record per worker",
+            &metrics
+        );
         std::printf(
-            "[TRACE] records=%llu expected=%llu dropped=%llu bytes=%zu\n",
-            static_cast<unsigned long long>(trace_records),
-            static_cast<unsigned long long>(expected_trace_records),
+            "[TRACE] physical_generic_records=%llu "
+            "physical_expected=%llu logical_records=%llu "
+            "logical_expected=%llu dropped=%llu bytes=%zu\n",
+            static_cast<unsigned long long>(
+                physical_trace_records
+            ),
+            static_cast<unsigned long long>(
+                physical_expected_trace_records
+            ),
+            static_cast<unsigned long long>(
+                logical_trace_records
+            ),
+            static_cast<unsigned long long>(
+                logical_expected_trace_records
+            ),
             static_cast<unsigned long long>(trace_dropped), kTraceBytes
         );
         std::printf(
@@ -4382,6 +5168,15 @@ inline Metrics Validate(
             static_cast<unsigned long long>(physical_atomic_records),
             static_cast<unsigned long long>(batched_poll_calls),
             static_cast<unsigned long long>(poll_batch_records)
+        );
+        std::printf(
+            "[DCCI_TRACE] logical_calls=%llu cache_lines=%llu "
+            "physical_records=%llu "
+            "closure=calls=sum(record.call_count),"
+            "lines=sum(record.line_count)\n",
+            static_cast<unsigned long long>(dcci_calls),
+            static_cast<unsigned long long>(dcci_lines),
+            static_cast<unsigned long long>(dcci_records)
         );
     }
 

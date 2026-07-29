@@ -197,9 +197,18 @@ def _append_v4_g1_tail_tasks(
         for task_id in range(2, 5):
             start = base + 220 + (task_id - 2) * 100
             function_id = task_id - 1
+            if tensormap_mode == "private":
+                rows.append(
+                    _row(
+                        core_id,
+                        task_id,
+                        "EfDrain",
+                        start + 1,
+                        start + 11,
+                    )
+                )
             rows.extend(
                 [
-                    _row(core_id, task_id, "EfDrain", start + 1, start + 11),
                     _row(
                         core_id,
                         task_id,
@@ -208,7 +217,14 @@ def _append_v4_g1_tail_tasks(
                         start + 7,
                         function_id=function_id,
                     ),
-                    _row(core_id, task_id, "Claim", start + 14, start + 20, flags=0x2),
+                    _row(
+                        core_id,
+                        task_id,
+                        "Claim",
+                        start + 14,
+                        start + 20,
+                        flags=0x2,
+                    ),
                 ]
             )
             if tensormap_mode == "private":
@@ -245,6 +261,9 @@ def _skip_v4_source_phase(
 
     return (
         phase in {"Build", "Replay", "Alloc"}
+        # 新 shared raw 不再写 EfDrain；分析器必须由同一 Submit.start 和
+        # Claim.start 离线恢复。private fixture 继续保留显式记录。
+        or (tensormap_mode == "shared" and phase == "EfDrain")
         or (tensormap_mode == "shared" and phase == "PrepareMap")
         or (
             tensormap_mode == "shared"
@@ -585,13 +604,21 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
         )
 
     def test_v4_closes_true_tails_and_worker_parent_hierarchy(self) -> None:
+        capture = _v4_capture()
+        raw_rows = capture["fdwic_events"]
+        assert isinstance(raw_rows, list)
+        raw_event_count = len(raw_rows)
+        self.assertFalse(any(row[5] == "EfDrain" for row in raw_rows))
         with tempfile.TemporaryDirectory() as directory:
-            path = self._write(directory, _v4_capture())
+            path = self._write(directory, capture)
             report = analyze_capture(path)
 
         self.assertEqual(report["schema_version"], 3)
         self.assertEqual(report["capture"]["trace_schema_version"], 5)
         self.assertEqual(report["capture"]["tensormap_mode"], "shared")
+        self.assertEqual(
+            report["capture"]["event_count"], raw_event_count + 96 * 5
+        )
         self.assertEqual(
             report["semantics"]["exclusive_submit_children"][-2:],
             ["WinnerBuild", "AllocComplete"],
@@ -613,7 +640,8 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
         self.assertEqual(metrics["materialize"], 18)
         self.assertEqual(metrics["prepare_map"], 0)
         self.assertEqual(metrics["register"], 13)
-        self.assertEqual(metrics["submit_residual"], 31_435)
+        self.assertEqual(metrics["efdrain"], 7_776)
+        self.assertEqual(metrics["submit_residual"], 29_419)
         self.assertEqual(metrics["orchestration_setup"], 960)
         self.assertEqual(metrics["orchestration_tail"], 960)
         self.assertEqual(metrics["orchestration_replay"], 49_920)
@@ -622,12 +650,12 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
         self.assertEqual(metrics["final_drain_residual"], 2_880)
         self.assertEqual(metrics["worker_completion"], 53_760)
         residual = report["residual_breakdown"]
-        self.assertEqual(residual["submit_internal_residual"]["total_cycles"], 2_045)
+        self.assertEqual(residual["submit_internal_residual"]["total_cycles"], 29)
         self.assertEqual(residual["submit_tail_residual"]["total_cycles"], 29_390)
         self.assertEqual(residual["between_submit_residual"]["total_cycles"], 7_680)
         self.assertAlmostEqual(
             residual["submit_internal_residual"]["share_of_submit_union"],
-            2_045 / 40_320,
+            29 / 40_320,
         )
         self.assertAlmostEqual(
             residual["submit_tail_residual"]["share_of_submit_union"],
@@ -766,6 +794,21 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
         self.assertEqual(atomic_overlay["event_count"], 483)
         self.assertEqual(atomic_overlay["aggregate_duration_cycles"], 963)
         self.assertIs(atomic_overlay["included_in_additive_totals"], False)
+
+    def test_v5_shared_rejects_any_explicit_efdrain_before_closure(
+        self,
+    ) -> None:
+        capture = _v4_capture()
+        rows = capture["fdwic_events"]
+        assert isinstance(rows, list)
+        rows.append(_row(0, 0, "EfDrain", 1000, 1024))
+        _refresh_summary(capture)
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, capture)
+            with self.assertRaisesRegex(
+                ValueError, "must not contain explicit EfDrain"
+            ):
+                analyze_capture(path)
 
     def test_v5_actor_closure_keeps_transition_work_and_removes_kernel_union(
         self,
@@ -1459,7 +1502,9 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
                 analyze_capture(path)
 
     def test_exclusive_child_task_must_match_containing_submit(self) -> None:
-        capture = _v4_capture()
+        # private 保留显式 EfDrain，专门隔离“child 被错误 Submit 包含”的
+        # 原分析器门禁；shared 的 Claim 越界会更早被派生边界门禁拒绝。
+        capture = _v4_capture(tensormap_mode="private")
         rows = capture["fdwic_events"]
         assert isinstance(rows, list)
         first_claim = next(

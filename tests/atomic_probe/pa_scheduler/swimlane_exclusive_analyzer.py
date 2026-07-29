@@ -30,6 +30,7 @@ try:
         TASK_KIND_NAMES,
         _derive_v4_task_kinds,
         _load_and_validate,
+        _restore_v5_shared_efdrain,
         _standalone_topology,
     )
 except ImportError:
@@ -38,6 +39,7 @@ except ImportError:
         TASK_KIND_NAMES,
         _derive_v4_task_kinds,
         _load_and_validate,
+        _restore_v5_shared_efdrain,
         _standalone_topology,
     )
 
@@ -2129,6 +2131,11 @@ def analyze_capture(input_path: Path) -> dict[str, Any]:
         _base_cycle,
         metadata,
     ) = _load_and_validate(input_path)
+    _restore_v5_shared_efdrain(
+        rows,
+        trace_schema_version,
+        metadata.get("tensormap_mode"),
+    )
     # 原始 b256 接近百万行；原地替换规范化 tuple，避免再同时保留一整份 Event
     # 列表。slots 也避免每条 dataclass 单独分配 __dict__。
     for index, row in enumerate(rows):

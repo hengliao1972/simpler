@@ -51,6 +51,7 @@ fi
 # swimlane；perf-clock 与 submit-pmu 分别拥有独立目录和编译身份。
 BUILD_VARIANT="${1:-swimlane}"
 SPLIT_FINISH=0
+COMPACT_GENERIC_TRACE=0
 case "$BUILD_VARIANT" in
     swimlane)
         if [[ $# -gt 1 ]]; then
@@ -60,9 +61,12 @@ case "$BUILD_VARIANT" in
         PHASE_NAME="none"
         PHASE_ID=0
         BUILD_DIR="$ROOT_DIR/build/ccec/$TENSORMAP_MODE/swimlane"
+        COMPACT_GENERIC_TRACE="$TENSORMAP_MODE_ID"
         VARIANT_DEFINES=(
             "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID"
             -DPA_BUILD_SWIMLANE=1
+            -DPA_BUILD_ATOMIC_SWIMLANE=1
+            "-DPA_BUILD_COMPACT_GENERIC_TRACE=$COMPACT_GENERIC_TRACE"
             -DPA_BUILD_SUBMIT_PMU=0
             -DPA_BUILD_PERF_CLOCK=0
             -DPA_SUBMIT_PMU_PHASE_ID=0
@@ -80,6 +84,7 @@ case "$BUILD_VARIANT" in
         VARIANT_DEFINES=(
             "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID"
             -DPA_BUILD_SWIMLANE=0
+            -DPA_BUILD_COMPACT_GENERIC_TRACE=0
             -DPA_BUILD_SUBMIT_PMU=0
             -DPA_BUILD_PERF_CLOCK=1
             -DPA_SUBMIT_PMU_PHASE_ID=0
@@ -109,6 +114,7 @@ case "$BUILD_VARIANT" in
         VARIANT_DEFINES=(
             "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID"
             -DPA_BUILD_SWIMLANE=0
+            -DPA_BUILD_COMPACT_GENERIC_TRACE=0
             -DPA_BUILD_SUBMIT_PMU=1
             -DPA_BUILD_PERF_CLOCK=0
             "-DPA_SUBMIT_PMU_PHASE_ID=$PHASE_ID"
@@ -129,6 +135,28 @@ esac
 if [[ "$SPLIT_FINISH" -eq 1 ]]; then
     VARIANT_DEFINES+=(-DPA_COMPETE_FIRST_SPLIT_FINISH=1)
 fi
+
+# 物理泳道布局与传给三镜像的 compact 编译宏来自同一组 build-side
+# 变量。run.sh 会按 mode/variant 独立推导并逐字段核对，避免 producer
+# 和 consumer 共用同一处错误。trace-free 变体虽然不分配泳道缓冲，仍
+# 固化其编译 ABI，防止 host/kernel 交叉复用。
+if [[ "$TENSORMAP_MODE" == "shared" ]]; then
+    TRACE_SUBMIT_CLAIM_RECORD_BYTES=32
+    TRACE_RECORDS_PER_CORE=28416
+    if [[ "$COMPACT_GENERIC_TRACE" -eq 1 ]]; then
+        TRACE_GENERIC_RECORD_BYTES=16
+        TRACE_WORKER_STRIDE_BYTES=593920
+    else
+        TRACE_GENERIC_RECORD_BYTES=32
+        TRACE_WORKER_STRIDE_BYTES=1048576
+    fi
+else
+    TRACE_GENERIC_RECORD_BYTES=32
+    TRACE_SUBMIT_CLAIM_RECORD_BYTES=0
+    TRACE_RECORDS_PER_CORE=65536
+    TRACE_WORKER_STRIDE_BYTES=2097152
+fi
+
 # 正式 standalone CCEC 产物先固定使用已验证的 128×128 布局；CAP 仍
 # 显式进入三镜像编译身份和 manifest，避免默认值漂移后静默混件。
 VARIANT_DEFINES+=("-DPTO_FDWIC_TENSORMAP_RING_CAP=$TENSORMAP_RING_CAP")
@@ -788,7 +816,8 @@ echo "[BUILD] CCEC host runner"
     -o "$BUILD_DIR/pa_scheduler_host"
 
 # host 和 kernel 全部成功后才发布统一 manifest。swimlane 的两件套与
-# submit-pmu 的四件套都由同一 schema 固化 mode/variant/phase 和 SHA256；
+# submit-pmu 的四件套都由 v4 十二行身份头固化 mode/variant/phase、
+# 物理泳道布局和 SHA256；
 # run.sh 只消费带完整 manifest 的目录，因此中断重编不会混用新旧镜像。
 if [[ "$BUILD_VARIANT" == "submit-pmu" ]]; then
     ARTIFACTS=(
@@ -823,12 +852,20 @@ cleanup_manifest_tmp() {
 }
 trap cleanup_manifest_tmp EXIT
 {
-    printf '# schema=pa_scheduler_artifacts/v3\n'
+    printf '# schema=pa_scheduler_artifacts/v4\n'
     printf '# tensormap_mode=%s\n' "$TENSORMAP_MODE"
     printf '# tensormap_mode_id=%u\n' "$TENSORMAP_MODE_ID"
     printf '# tensormap_ring_cap=%u\n' "$TENSORMAP_RING_CAP"
     printf '# shared_insert_turn_groups=%u\n' \
         "$SHARED_INSERT_TURN_GROUPS"
+    printf '# generic_record_bytes=%u\n' \
+        "$TRACE_GENERIC_RECORD_BYTES"
+    printf '# submit_claim_record_bytes=%u\n' \
+        "$TRACE_SUBMIT_CLAIM_RECORD_BYTES"
+    printf '# records_per_core=%u\n' \
+        "$TRACE_RECORDS_PER_CORE"
+    printf '# worker_stride_bytes=%u\n' \
+        "$TRACE_WORKER_STRIDE_BYTES"
     printf '# variant=%s\n' "$BUILD_VARIANT"
     printf '# phase=%s\n' "$PHASE_NAME"
     printf '# phase_id=%u\n' "$PHASE_ID"

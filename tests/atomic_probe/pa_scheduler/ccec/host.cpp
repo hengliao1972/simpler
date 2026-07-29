@@ -1837,7 +1837,9 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
-    // 泳道区按 96 worker 各 65536 条记录预留，约 384 MiB；关闭泳道时不申请，也不会传递有效 base。
+    // 泳道区大小由当前构建 ABI 的 kTraceBytes 决定：private 约
+    // 192 MiB，shared compact full-swimlane 约 54.4 MiB。关闭泳道时
+    // 不申请，也不会传递有效 base。
     // 该分配先于 PMU owner 配置，失败时不会留下需要恢复的 selector/MMIO 会话。
     void *trace_device = nullptr;
     if (options.trace_enabled &&
@@ -1940,7 +1942,8 @@ int main(int argc, char **argv) {
             break;
         }
         if (options.trace_enabled) {
-            // 每轮只需重置约 7 KiB header；各 worker 会从 count=0 覆盖自己的记录区，无需清零整块 384 MiB。
+            // 每轮只需重置约 7 KiB header；各 worker 会从 count=0
+            // 覆盖自己的物理记录区，无需清零整块 trace 缓冲。
             pa_scheduler::host::InitializeTraceHeader(&trace_header);
             if (!CheckAcl(
                     aclrtMemcpy(
@@ -2098,21 +2101,48 @@ int main(int argc, char **argv) {
         }
         // 常规校验只需 header 中的 per-worker count；真实 records 在分析或导出时才按核、按实际 count 懒加载。
         const auto read_trace_records =
-            [trace_device](uint32_t worker, uint32_t count, pa_scheduler::TraceRecord *records) {
+            [trace_device](
+                uint32_t worker, uint32_t count,
+                pa_scheduler::TraceStorageRecord *records
+            ) {
                 // 每核记录区采用固定容量 stride；只复制 header 声明的实际 count，避免 D2H 未使用的尾部空间。
-                const uint64_t offset = sizeof(pa_scheduler::TraceHeader) +
-                                        static_cast<uint64_t>(worker) * pa_scheduler::kTraceRecordsPerCore *
-                                            sizeof(pa_scheduler::TraceRecord);
+                const size_t offset =
+                    pa_scheduler::TraceRecordsOffset(worker);
                 return CheckAcl(
                     aclrtMemcpy(
-                        records, static_cast<size_t>(count) * sizeof(pa_scheduler::TraceRecord),
+                        records,
+                        static_cast<size_t>(count) *
+                            sizeof(pa_scheduler::TraceStorageRecord),
                         static_cast<uint8_t *>(trace_device) + offset,
-                        static_cast<size_t>(count) * sizeof(pa_scheduler::TraceRecord),
+                        static_cast<size_t>(count) *
+                            sizeof(pa_scheduler::TraceStorageRecord),
                         ACL_MEMCPY_DEVICE_TO_HOST
                     ),
                     "aclrtMemcpy(D2H swimlane records)"
                 );
             };
+#if PTO_FDWIC_SHARED_MAP
+        const auto read_submit_claim_records =
+            [trace_device](
+                uint32_t worker, uint32_t count,
+                pa_scheduler::SharedSubmitClaimTraceRecord *records
+            ) {
+                const size_t offset =
+                    pa_scheduler::TraceSubmitClaimOffset(worker);
+                return CheckAcl(
+                    aclrtMemcpy(
+                        records,
+                        static_cast<size_t>(count) *
+                            sizeof(pa_scheduler::SharedSubmitClaimTraceRecord),
+                        static_cast<uint8_t *>(trace_device) + offset,
+                        static_cast<size_t>(count) *
+                            sizeof(pa_scheduler::SharedSubmitClaimTraceRecord),
+                        ACL_MEMCPY_DEVICE_TO_HOST
+                    ),
+                    "aclrtMemcpy(D2H Submit/Claim endpoint records)"
+                );
+            };
+#endif
         // 先完成共享状态、拓扑、计数和 trace header 的语义校验，再允许 raw JSON 成为性能证据。
         const pa_scheduler::host::Metrics metrics = pa_scheduler::host::Validate(
             *state, run, host_us, options.trace_enabled ? &trace_header : nullptr
@@ -2150,7 +2180,12 @@ int main(int argc, char **argv) {
             pmu_json_validation = pmu_validation;
         }
         if (options.analyze_swimlane &&
-            !pa_scheduler::host::AnalyzeSwimlaneRecords(trace_header, *state, read_trace_records)) {
+            !pa_scheduler::host::AnalyzeSwimlaneRecords(
+                trace_header, *state, read_trace_records
+#if PTO_FDWIC_SHARED_MAP
+                , read_submit_claim_records
+#endif
+            )) {
             // 后处理错误使用 break 汇入统一 cleanup；与初始化/launch 失败的进程级立即返回语义区分开。
             postprocess_ok = false;
             break;
@@ -2180,6 +2215,9 @@ int main(int argc, char **argv) {
                         : "none",
                     options.final_barrier_shape, options.trace_atomics,
                     read_trace_records
+#if PTO_FDWIC_SHARED_MAP
+                    , read_submit_claim_records
+#endif
                 )) {
                 postprocess_ok = false;
                 break;

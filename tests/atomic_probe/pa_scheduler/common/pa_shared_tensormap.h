@@ -50,10 +50,11 @@ PA_DEVICE SharedRegionValue MakeSharedRegionValue(
 // 读侧协议固定为：原子观察绝对 seq、失效 payload、拷出本地快照、再次
 // 原子观察同一 seq。任一检查失败都返回 false；上层不得把协议失败静默
 // 解释成“没有 producer”。
-template <typename Ops>
+template <typename Ops, bool ObserveAtomics = false>
 PA_DEVICE bool SharedReadRegionSlot(
     PA_GM SharedTensorMapSidecar &map, uint32_t bucket, uint64_t cursor,
-    SharedRegionValue &snapshot
+    SharedRegionValue &snapshot, int32_t task_id = -1,
+    TraceContext *trace = nullptr, WorkerResult *result = nullptr
 ) {
     if (bucket >= kMapBuckets || cursor > static_cast<uint64_t>(INT64_MAX)) {
         return false;
@@ -61,16 +62,28 @@ PA_DEVICE bool SharedReadRegionSlot(
     PA_GM SharedRegionSlot &slot =
         map.slots[SharedTensorMapSlotIndex(bucket, cursor)];
     const int64_t expected = static_cast<int64_t>(cursor);
-    if (Ops::Load(&slot.seq.value) != expected) {
+    if (TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
+            trace, result, task_id,
+            AtomicSite::SharedMapLookupSeqLoad,
+            &slot.seq.value
+        ) != expected) {
         return false;
     }
-    Ops::InvalidateRegion(&slot.payload, sizeof(slot.payload));
+    (void)TraceConfiguredDcciInvalidate<Ops, ObserveAtomics>(
+        trace, task_id, -1,
+        DcciSite::SharedRegionReadInvalidate,
+        &slot.payload, sizeof(slot.payload)
+    );
     snapshot.buffer_addr = slot.payload.value.buffer_addr;
     snapshot.lo = slot.payload.value.lo;
     snapshot.hi = slot.payload.value.hi;
     snapshot.producer = slot.payload.value.producer;
     snapshot.reserved = slot.payload.value.reserved;
-    if (Ops::Load(&slot.seq.value) != expected) {
+    if (TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
+            trace, result, task_id,
+            AtomicSite::SharedMapLookupSeqLoad,
+            &slot.seq.value
+        ) != expected) {
         return false;
     }
     return snapshot.producer >= 0 && snapshot.reserved == 0 &&
@@ -79,18 +92,29 @@ PA_DEVICE bool SharedReadRegionSlot(
 
 // lookup 的权威时间窗为 [current_task-H, current_task)。即使更快 winner
 // 已经发布未来 entry，也不能把 producer>=current_task 引入本核 fanin。
-template <typename Ops>
+template <typename Ops, bool ObserveAtomics = false>
 PA_DEVICE int32_t SharedLookupRegion(
     PA_GM SharedTensorMapSidecar &map, const SharedRegionValue &query,
-    int32_t current_task, int32_t heap_window, bool &protocol_ok
+    int32_t current_task, int32_t heap_window, bool &protocol_ok,
+    TraceContext *trace = nullptr, WorkerResult *result = nullptr
 ) {
     protocol_ok = false;
     if (current_task < 0 || heap_window < 0 || query.lo >= query.hi) {
         return -1;
     }
     const uint32_t bucket = TensorMapHash(query.buffer_addr);
-    int64_t signed_head = Ops::Load(&map.buckets[bucket].head.value);
-    const int64_t signed_tail = Ops::Load(&map.buckets[bucket].tail.value);
+    int64_t signed_head =
+        TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
+        trace, result, current_task,
+        AtomicSite::SharedMapLookupHeadLoad,
+        &map.buckets[bucket].head.value
+    );
+    const int64_t signed_tail =
+        TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
+        trace, result, current_task,
+        AtomicSite::SharedMapLookupTailLoad,
+        &map.buckets[bucket].tail.value
+    );
     if (__builtin_expect(
             signed_head < 0 || signed_tail < signed_head ||
                 static_cast<uint64_t>(signed_tail - signed_head) >
@@ -105,7 +129,11 @@ PA_DEVICE int32_t SharedLookupRegion(
         // 暂时呈现 span>CAP。异常支路只重读一次 head；唯有 head 单调
         // 前进后能把同一 tail 重新约束到容量内，才接受该快照。
         const int64_t refreshed_head =
-            Ops::Load(&map.buckets[bucket].head.value);
+            TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
+                trace, result, current_task,
+                AtomicSite::SharedMapLookupHeadLoad,
+                &map.buckets[bucket].head.value
+            );
         if (refreshed_head < signed_head ||
             refreshed_head > signed_tail ||
             static_cast<uint64_t>(
@@ -124,8 +152,9 @@ PA_DEVICE int32_t SharedLookupRegion(
     while (cursor < tail) {
         SharedRegionValue candidate{};
         if (__builtin_expect(
-                !SharedReadRegionSlot<Ops>(
-                    map, bucket, cursor, candidate
+                !SharedReadRegionSlot<Ops, ObserveAtomics>(
+                    map, bucket, cursor, candidate,
+                    current_task, trace, result
                 ),
                 0
             )) {
@@ -134,7 +163,11 @@ PA_DEVICE int32_t SharedLookupRegion(
             // head 已单调越过当前 cursor，才能把 seq 双检失败解释为这类
             // 合法复用；否则继续 fail-closed，不能吞掉真实 slot 损坏。
             const int64_t refreshed_head =
-                Ops::Load(&map.buckets[bucket].head.value);
+                TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
+                    trace, result, current_task,
+                    AtomicSite::SharedMapLookupHeadLoad,
+                    &map.buckets[bucket].head.value
+                );
             if (refreshed_head < signed_head ||
                 refreshed_head > signed_tail ||
                 cursor >= static_cast<uint64_t>(refreshed_head)) {
@@ -155,14 +188,19 @@ PA_DEVICE int32_t SharedLookupRegion(
     return best;
 }
 
-template <typename Ops, typename TensorReference>
+template <
+    typename Ops, bool ObserveAtomics = false,
+    typename TensorReference
+>
 PA_DEVICE int32_t SharedLookupTensor(
     PA_GM SharedTensorMapSidecar &map, const TensorReference &tensor,
-    int32_t current_task, int32_t heap_window, bool &protocol_ok
+    int32_t current_task, int32_t heap_window, bool &protocol_ok,
+    TraceContext *trace = nullptr, WorkerResult *result = nullptr
 ) {
     const SharedRegionValue query = MakeSharedRegionValue(tensor, -1);
-    return SharedLookupRegion<Ops>(
-        map, query, current_task, heap_window, protocol_ok
+    return SharedLookupRegion<Ops, ObserveAtomics>(
+        map, query, current_task, heap_window, protocol_ok,
+        trace, result
     );
 }
 
@@ -179,7 +217,9 @@ PA_DEVICE bool SharedRetireBucket(
         return false;
     }
     PA_GM SharedBucketState &controls = map.buckets[bucket];
+    // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - reader 回收协议仅由 ring/litmus 门槛使用，当前 ordered Submit 固定 reclaim=-1
     const int64_t original_head = Ops::Load(&controls.head.value);
+    // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - reader 回收协议仅由 ring/litmus 门槛使用，当前 ordered Submit 固定 reclaim=-1
     const int64_t tail = Ops::Load(&controls.tail.value);
     if (original_head < 0 || tail < original_head ||
         static_cast<uint64_t>(tail - original_head) > kMapBucketCapacity) {
@@ -202,6 +242,7 @@ PA_DEVICE bool SharedRetireBucket(
     if (head == original_head) {
         return true;
     }
+    // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - reader 回收协议仅由 ring/litmus 门槛使用，当前 ordered Submit 固定 reclaim=-1
     const int64_t observed = Ops::Exchange(&controls.head.value, head);
     return observed == original_head;
 }
@@ -222,6 +263,7 @@ PA_DEVICE bool SharedAdvanceReaderDone(
     }
     const int64_t expected =
         static_cast<int64_t>(task_id) - 1;
+    // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - reader_done 协议仅由 ring/litmus 门槛使用，尚未接入当前 scheduler
     return Ops::CompareExchange(
                &map.reader_done[worker].value,
                expected, static_cast<int64_t>(task_id)
@@ -244,6 +286,7 @@ PA_DEVICE bool SharedComputeReaderReclaimCandidate(
     int64_t minimum_done = INT64_MAX;
     for (uint32_t worker = 0; worker < active_workers; ++worker) {
         const int64_t done =
+            // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - reader_done 回收候选仅由 ring/litmus 门槛使用
             Ops::Load(&map.reader_done[worker].value);
         if (done < -1 ||
             done >= static_cast<int64_t>(kMaxTasks)) {
@@ -363,6 +406,7 @@ PA_DEVICE SharedInsertTurnState SharedInspectTaskTurnObserved(
     }
     const uint32_t lane =
         SharedInsertTurnLane(current_task);
+    // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 旧分组 insert-turn 协议仅由 ring/litmus 门槛使用
     observed = Ops::Load(
         &SharedInsertTurnLine(map, lane).value
     );
@@ -442,6 +486,7 @@ PA_DEVICE bool SharedCanPublishTaskCommit(
         SharedInsertTurnLane(next);
     const int64_t expected =
         SharedInsertTurnPublishExpectedOld(task_id);
+    // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 旧分组 insert-turn 预检仅由 ring/litmus 门槛使用
     return Ops::Load(
                &SharedInsertTurnLine(
                     map, next_lane
@@ -463,6 +508,7 @@ PA_DEVICE bool SharedPublishTaskCommitAfterPreflightObserved(
         SharedInsertTurnLane(next);
     const int64_t expected =
         SharedInsertTurnPublishExpectedOld(task_id);
+    // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 旧分组 insert-turn 交接仅由 ring/litmus 门槛使用
     observed = Ops::CompareExchange(
                &SharedInsertTurnLine(
                     map, next_lane
@@ -494,6 +540,7 @@ PA_DEVICE bool SharedPublishReclaimCandidate(
     if (candidate < -1) {
         return false;
     }
+    // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - reclaim 发布仅由 ring/litmus 门槛使用，当前 ordered Submit 固定 -1
     const int64_t current = Ops::Load(&map.reclaim_upto.value);
     if (current < -1 || candidate < current) {
         return false;
@@ -503,6 +550,7 @@ PA_DEVICE bool SharedPublishReclaimCandidate(
         return true;
     }
     const int64_t observed =
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - reclaim 发布仅由 ring/litmus 门槛使用，当前 ordered Submit 固定 -1
         Ops::Exchange(&map.reclaim_upto.value, candidate);
     if (observed != current) {
         return false;
@@ -604,7 +652,9 @@ PA_DEVICE SharedAppendCheck SharedCheckTaskAppend(
             )) {
             return SharedAppendCheck::ProtocolError;
         }
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - generic append preflight 仅由旧 writer-intent 与 ring/litmus 门槛使用
         const int64_t head = Ops::Load(&map.buckets[bucket].head.value);
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - generic append preflight 仅由旧 writer-intent 与 ring/litmus 门槛使用
         const int64_t tail = Ops::Load(&map.buckets[bucket].tail.value);
         if (head < 0 || tail < head) {
             return SharedAppendCheck::ProtocolError;
@@ -628,6 +678,7 @@ PA_DEVICE SharedAppendCheck SharedCheckTaskAppend(
             cursor < kMapBucketCapacity
                 ? kSharedMapEmptySeq
                 : static_cast<int64_t>(cursor - kMapBucketCapacity);
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - generic append preflight 仅由旧 writer-intent 与 ring/litmus 门槛使用
         if (Ops::Load(&slot.seq.value) != expected_old) {
             return SharedAppendCheck::ProtocolError;
         }
@@ -639,12 +690,13 @@ PA_DEVICE SharedAppendCheck SharedCheckTaskAppend(
 // winner 在等待 predecessor 前算好；取得 insert turn 后只读取共享
 // cursor/seq，不再重复 hash，也不再扫描此前 entry。prepared 数组是
 // owner-local 不可变 delta 的一部分，不能把任意外部输入直接传入这里。
-template <typename Ops>
+template <typename Ops, bool ObserveAtomics = false>
 PA_DEVICE SharedAppendCheck SharedCheckPreparedTaskAppend(
     PA_GM SharedTensorMapSidecar &map,
     const SharedRegionValue *entries, const uint16_t *buckets,
     const uint8_t *bucket_ordinals, uint32_t count,
-    int64_t reclaim_upto
+    int64_t reclaim_upto, int32_t task_id = -1,
+    TraceContext *trace = nullptr, WorkerResult *result = nullptr
 ) {
     if (count > kMaxTaskTensors || reclaim_upto < -1 ||
         (count != 0 &&
@@ -671,9 +723,17 @@ PA_DEVICE SharedAppendCheck SharedCheckPreparedTaskAppend(
             return SharedAppendCheck::ProtocolError;
         }
         const int64_t head =
-            Ops::Load(&map.buckets[bucket].head.value);
+            TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
+                trace, result, task_id,
+                AtomicSite::SharedMapAppendHeadLoad,
+                &map.buckets[bucket].head.value
+            );
         const int64_t tail =
-            Ops::Load(&map.buckets[bucket].tail.value);
+            TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
+                trace, result, task_id,
+                AtomicSite::SharedMapAppendTailLoad,
+                &map.buckets[bucket].tail.value
+            );
         if (head < 0 || tail < head) {
             return SharedAppendCheck::ProtocolError;
         }
@@ -695,7 +755,11 @@ PA_DEVICE SharedAppendCheck SharedCheckPreparedTaskAppend(
                 : static_cast<int64_t>(
                       cursor - kMapBucketCapacity
                   );
-        if (Ops::Load(&slot.seq.value) != expected_old) {
+        if (TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
+                trace, result, task_id,
+                AtomicSite::SharedMapAppendSeqLoad,
+                &slot.seq.value
+            ) != expected_old) {
             return SharedAppendCheck::ProtocolError;
         }
     }
@@ -712,17 +776,29 @@ PA_DEVICE bool SharedPreflightTaskAppend(
     ) == SharedAppendCheck::Ready;
 }
 
-template <typename Ops>
+template <typename Ops, bool ObserveAtomics = false>
 PA_DEVICE bool SharedAppendPreparedEntryAtBucket(
     PA_GM SharedTensorMapSidecar &map,
-    const SharedRegionValue &entry, uint32_t bucket
+    const SharedRegionValue &entry, uint32_t bucket,
+    int32_t task_id = -1, TraceContext *trace = nullptr,
+    WorkerResult *result = nullptr
 ) {
     if (bucket >= kMapBuckets) {
         return false;
     }
     PA_GM SharedBucketState &controls = map.buckets[bucket];
-    const int64_t head = Ops::Load(&controls.head.value);
-    const int64_t tail = Ops::Load(&controls.tail.value);
+    const int64_t head =
+        TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
+            trace, result, task_id,
+            AtomicSite::SharedMapAppendHeadLoad,
+            &controls.head.value
+        );
+    const int64_t tail =
+        TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
+            trace, result, task_id,
+            AtomicSite::SharedMapAppendTailLoad,
+            &controls.tail.value
+        );
     if (head < 0 || tail < head ||
         static_cast<uint64_t>(tail - head) >= kMapBucketCapacity) {
         return false;
@@ -738,12 +814,21 @@ PA_DEVICE bool SharedAppendPreparedEntryAtBucket(
             ? kSharedMapEmptySeq
             : static_cast<int64_t>(cursor - kMapBucketCapacity);
     const int64_t invalidated =
-        Ops::Exchange(&slot.seq.value, kSharedMapEmptySeq);
+        TraceConfiguredAtomicExchange<Ops, ObserveAtomics>(
+            trace, result, task_id,
+            AtomicSite::SharedMapAppendSeqResetExchange,
+            &slot.seq.value, kSharedMapEmptySeq,
+            /*result_used=*/true
+        );
     if (invalidated != expected_old) {
         return false;
     }
 
-    Ops::InvalidateRegion(&slot.payload, sizeof(slot.payload));
+    (void)TraceConfiguredDcciInvalidate<Ops, ObserveAtomics>(
+        trace, task_id, -1,
+        DcciSite::SharedRegionAppendInvalidate,
+        &slot.payload, sizeof(slot.payload)
+    );
     slot.payload.value.buffer_addr = entry.buffer_addr;
     slot.payload.value.lo = entry.lo;
     slot.payload.value.hi = entry.hi;
@@ -751,46 +836,68 @@ PA_DEVICE bool SharedAppendPreparedEntryAtBucket(
     slot.payload.value.reserved = 0;
     // padding 不承载协议字段，也没有 reader/host 消费者；只写完整的
     // 32B value，避免为 cache-line 填充字节增加无意义的 scalar store。
-    Ops::FlushRegion(&slot.payload, sizeof(slot.payload));
+    (void)TraceConfiguredDcciFlush<Ops, ObserveAtomics>(
+        trace, task_id, -1,
+        DcciSite::SharedRegionAppendFlush,
+        &slot.payload, sizeof(slot.payload)
+    );
 
     const int64_t before_publish =
-        Ops::Exchange(&slot.seq.value, static_cast<int64_t>(cursor));
+        TraceConfiguredAtomicExchange<Ops, ObserveAtomics>(
+            trace, result, task_id,
+            AtomicSite::SharedMapAppendSeqPublishExchange,
+            &slot.seq.value, static_cast<int64_t>(cursor),
+            /*result_used=*/true
+        );
     if (before_publish != kSharedMapEmptySeq) {
         return false;
     }
     const int64_t previous_tail =
-        Ops::Exchange(&controls.tail.value, tail + 1);
+        TraceConfiguredAtomicExchange<Ops, ObserveAtomics>(
+            trace, result, task_id,
+            AtomicSite::SharedMapAppendTailExchange,
+            &controls.tail.value, tail + 1,
+            /*result_used=*/true
+        );
     return previous_tail == tail;
 }
 
-template <typename Ops>
+template <typename Ops, bool ObserveAtomics = false>
 PA_DEVICE bool SharedAppendPreparedEntry(
     PA_GM SharedTensorMapSidecar &map,
-    const SharedRegionValue &entry
+    const SharedRegionValue &entry, int32_t task_id = -1,
+    TraceContext *trace = nullptr, WorkerResult *result = nullptr
 ) {
-    return SharedAppendPreparedEntryAtBucket<Ops>(
-        map, entry, TensorMapHash(entry.buffer_addr)
+    return SharedAppendPreparedEntryAtBucket<
+        Ops, ObserveAtomics
+    >(
+        map, entry, TensorMapHash(entry.buffer_addr),
+        task_id, trace, result
     );
 }
 
-template <typename Ops>
+template <typename Ops, bool ObserveAtomics = false>
 PA_DEVICE bool SharedAppendPreparedTask(
     PA_GM SharedTensorMapSidecar &map, const SharedRegionValue *entries,
-    uint32_t count
+    uint32_t count, int32_t task_id = -1,
+    TraceContext *trace = nullptr, WorkerResult *result = nullptr
 ) {
     for (uint32_t index = 0; index < count; ++index) {
-        if (!SharedAppendPreparedEntry<Ops>(map, entries[index])) {
+        if (!SharedAppendPreparedEntry<Ops, ObserveAtomics>(
+                map, entries[index], task_id, trace, result
+            )) {
             return false;
         }
     }
     return true;
 }
 
-template <typename Ops>
+template <typename Ops, bool ObserveAtomics = false>
 PA_DEVICE bool SharedAppendPreparedTask(
     PA_GM SharedTensorMapSidecar &map,
     const SharedRegionValue *entries, const uint16_t *buckets,
-    uint32_t count
+    uint32_t count, int32_t task_id = -1,
+    TraceContext *trace = nullptr, WorkerResult *result = nullptr
 ) {
     if (count > kMaxTaskTensors ||
         (count != 0 &&
@@ -798,8 +905,11 @@ PA_DEVICE bool SharedAppendPreparedTask(
         return false;
     }
     for (uint32_t index = 0; index < count; ++index) {
-        if (!SharedAppendPreparedEntryAtBucket<Ops>(
-                map, entries[index], buckets[index]
+        if (!SharedAppendPreparedEntryAtBucket<
+                Ops, ObserveAtomics
+            >(
+                map, entries[index], buckets[index],
+                task_id, trace, result
             )) {
             return false;
         }
@@ -840,6 +950,7 @@ PA_DEVICE SharedAppendCheck SharedTryAppendReaderGatedTask(
         return SharedAppendCheck::ProtocolError;
     }
     int64_t reclaim_upto =
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - reader-gated append 组合尚未接入当前 scheduler
         Ops::Load(&map.reclaim_upto.value);
     if (reclaim_upto < -1) {
         return SharedAppendCheck::ProtocolError;

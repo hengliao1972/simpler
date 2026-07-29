@@ -162,12 +162,12 @@ void TestAtomicTraceSites() {
         AtomicSite::SharedHeapCursorReserve,
         AtomicSite::SharedHeapVendAdvance,
     };
-    Check(nonempty.core.count == 4, "nonempty reserve writes four atomic records");
+    Check(nonempty.trace.record_count == 4, "nonempty reserve writes four atomic records");
     Check(
         nonempty.result.atomic_trace_calls == 4,
         "nonempty reserve counts four logical atomic calls"
     );
-    for (uint32_t index = 0; index < 4 && index < nonempty.core.count; ++index) {
+    for (uint32_t index = 0; index < 4 && index < nonempty.trace.record_count; ++index) {
         const TraceRecord &record = nonempty.records[index];
         const AtomicSite site = expected_sites[index];
         Check(
@@ -197,7 +197,7 @@ void TestAtomicTraceSites() {
         "traced zero-output reservation succeeds"
     );
     Check(
-        empty.core.count == 1 &&
+        empty.trace.record_count == 1 &&
             empty.records[0].auxiliary ==
                 static_cast<uint32_t>(AtomicSite::SharedHeapVendLoad),
         "zero-output reserve observes only aggregate vend"

@@ -19,10 +19,18 @@ from pathlib import Path
 
 try:
     # `python -m unittest tests.atomic_probe...` 以 namespace package 导入。
-    from .swimlane_converter import _derive_v4_task_kinds, convert
+    from .swimlane_converter import (
+        _derive_v4_task_kinds,
+        _restore_v5_shared_efdrain,
+        convert,
+    )
 except ImportError:
     # 也保留从本目录直接执行脚本的用法。
-    from swimlane_converter import _derive_v4_task_kinds, convert
+    from swimlane_converter import (
+        _derive_v4_task_kinds,
+        _restore_v5_shared_efdrain,
+        convert,
+    )
 
 
 def _standalone_topology(core_id: int) -> tuple[int, int, str]:
@@ -183,7 +191,8 @@ def _refresh_summary(capture: dict[str, object]) -> None:
     atomic_rows = [row for row in rows if row[5] == "Atomic"]
     batch_rows = [row for row in atomic_rows if int(row[8]) & 0x80]
     batch_calls = sum((int(row[8]) >> 8) & 0xFFFFFF for row in batch_rows)
-    metadata["fdwic_summary"] = {
+    dcci_rows = [row for row in rows if row[5] == "Dcci"]
+    summary = {
         "records": len(rows),
         "atomic_records": len(atomic_rows),
         "clock_baseline_records": sum(
@@ -194,6 +203,20 @@ def _refresh_summary(capture: dict[str, object]) -> None:
         "poll_batch_records": len(batch_rows),
         "dropped_records": 0,
     }
+    if dcci_rows:
+        summary.update(
+            {
+                "dcci_records": len(dcci_rows),
+                "dcci_calls": sum(
+                    (int(row[8]) >> 3) & 0xF for row in dcci_rows
+                ),
+                "dcci_lines": sum(
+                    (int(row[8]) >> 8) & 0xFFFFFF
+                    for row in dcci_rows
+                ),
+            }
+        )
+    metadata["fdwic_summary"] = summary
 
 
 def _v5_shared_register_atomic_capture(
@@ -420,6 +443,204 @@ def _v5_shared_register_atomic_capture(
 
 
 class SwimlaneConverterLayoutTest(unittest.TestCase):
+    def test_v5_shared_restores_efdrain_without_raw_record_growth(
+        self,
+    ) -> None:
+        capture = _v5_shared_register_atomic_capture()
+        rows = capture["fdwic_events"]
+        metadata = capture["metadata"]
+        assert isinstance(rows, list)
+        assert isinstance(metadata, dict)
+        raw_count = len(rows)
+        self.assertFalse(any(row[5] == "EfDrain" for row in rows))
+        self.assertEqual(metadata["fdwic_summary"]["records"], raw_count)
+        restored_rows = [tuple(row) for row in rows]
+        _restore_v5_shared_efdrain(restored_rows, 5, "shared")
+        restored_efdrains = [
+            row for row in restored_rows if row[5] == "EfDrain"
+        ]
+        self.assertEqual(len(restored_efdrains), 5)
+        # 五个 task 都是 winner；EfDrain 属于 scalar Submit 前端，不把
+        # QK/SF/PV/UP 的 function_id 错挂到派生事件上。
+        self.assertTrue(all(row[4] == -1 for row in restored_efdrains))
+
+        def converted_efdrains(
+            directory: str,
+            source: dict[str, object],
+        ) -> list[tuple[str, float, float]]:
+            input_path = Path(directory) / "derived.raw.json"
+            output_path = Path(directory) / "derived.merged.json"
+            input_path.write_text(json.dumps(source), encoding="utf-8")
+            convert(input_path, output_path)
+            merged = json.loads(output_path.read_text(encoding="utf-8"))
+            return sorted(
+                (
+                    str(event["name"]),
+                    float(event["ts"]),
+                    float(event["dur"]),
+                )
+                for event in merged["traceEvents"]
+                if str(event.get("name", "")).startswith("efdrain#")
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            derived = converted_efdrains(directory, capture)
+
+        self.assertEqual(len(derived), 5)
+        self.assertEqual(
+            [name for name, _start, _duration in derived],
+            [f"efdrain#{task_id}" for task_id in range(5)],
+        )
+        self.assertTrue(
+            all(duration == 0.01 for _name, _start, duration in derived)
+        )
+
+    def test_v5_shared_efdrain_derivation_rejects_invalid_evidence(
+        self,
+    ) -> None:
+        for label, expected_error in (
+            ("missing_claim", "Claim keys do not match Submit keys"),
+            ("inverted_boundary", "Claim is outside or inverted"),
+            ("explicit_efdrain", "must not contain explicit EfDrain"),
+        ):
+            with self.subTest(label=label):
+                capture = _v5_shared_register_atomic_capture()
+                rows = capture["fdwic_events"]
+                assert isinstance(rows, list)
+                if label == "missing_claim":
+                    rows[:] = [
+                        row
+                        for row in rows
+                        if not (
+                            row[0] == 0
+                            and row[3] == 0
+                            and row[5] == "Claim"
+                        )
+                    ]
+                elif label == "inverted_boundary":
+                    claim = next(
+                        row
+                        for row in rows
+                        if row[0] == 0
+                        and row[3] == 0
+                        and row[5] == "Claim"
+                    )
+                    claim[6:8] = [95, 99]
+                else:
+                    rows.append(
+                        [0, 0, 0, 0, -1, "EfDrain", 100, 110, 0, 0]
+                    )
+                _refresh_summary(capture)
+
+                with tempfile.TemporaryDirectory() as directory:
+                    input_path = Path(directory) / "raw.json"
+                    output_path = Path(directory) / "merged.json"
+                    input_path.write_text(
+                        json.dumps(capture), encoding="utf-8"
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, expected_error
+                    ):
+                        convert(input_path, output_path)
+
+    def test_v5_private_accepts_startup_and_terminal_dcci_rows(self) -> None:
+        capture = _v5_capture(
+            [
+                [0, 0, 0, 0, -1, "Claim", 110, 120, 0x3, 1],
+                [0, 0, 0, 0, -1, "AllocComplete", 120, 130, 0, 0],
+                [0, 0, 0, 0, -1, "Submit", 100, 140, 1, 1],
+            ]
+        )
+        rows = capture["fdwic_events"]
+        assert isinstance(rows, list)
+        # startup: invalidate + DSB, one call across three lines。
+        rows.append([0, 0, 0, -1, -1, "Dcci", 92, 96, 0x30C, 9])
+        # terminal observer: clean + DSB, two calls across two lines。
+        rows.append([0, 0, 0, -1, -1, "Dcci", 220, 224, 0x215, 8])
+        _refresh_summary(capture)
+
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            convert(input_path, output_path)
+            merged = json.loads(output_path.read_text(encoding="utf-8"))
+
+        names = {
+            event.get("name") for event in merged["traceEvents"]
+        }
+        self.assertIn(
+            "dcci.startup_config_invalidate.invalidate×1.lines3#-1",
+            names,
+        )
+        self.assertIn(
+            "dcci.observer_trace_export.clean_out×2.lines2#-1",
+            names,
+        )
+        summary = merged["metadata"]["fdwic_summary"]
+        self.assertEqual(summary["dcci_records"], 2)
+        self.assertEqual(summary["dcci_calls"], 3)
+        self.assertEqual(summary["dcci_lines"], 5)
+
+    def test_v5_shared_accepts_three_region_terminal_dcci_row(self) -> None:
+        capture = _v5_shared_register_atomic_capture()
+        rows = capture["fdwic_events"]
+        assert isinstance(rows, list)
+        # shared observer 依次 clean 专用 Submit/Claim 区、通用记录区和
+        # core state，因此一条聚合 row 表示三次区域原语。
+        rows.extend(
+            [
+                [0, 0, 0, -1, -1, "Dcci", 92, 96, 0x30C, 9],
+                [0, 0, 0, -1, -1, "Dcci", 420, 424, 0x31D, 8],
+            ]
+        )
+        _refresh_summary(capture)
+
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            convert(input_path, output_path)
+            merged = json.loads(output_path.read_text(encoding="utf-8"))
+
+        names = {
+            event.get("name") for event in merged["traceEvents"]
+        }
+        self.assertIn(
+            "dcci.observer_trace_export.clean_out×3.lines3#-1",
+            names,
+        )
+        summary = merged["metadata"]["fdwic_summary"]
+        self.assertEqual(summary["dcci_records"], 2)
+        self.assertEqual(summary["dcci_calls"], 4)
+        self.assertEqual(summary["dcci_lines"], 6)
+
+    def test_v5_rejects_invalid_startup_dcci_identity(self) -> None:
+        capture = _v5_capture(
+            [
+                [0, 0, 0, 0, -1, "Claim", 110, 120, 0x3, 1],
+                [0, 0, 0, 0, -1, "AllocComplete", 120, 130, 0, 0],
+                [0, 0, 0, 0, -1, "Submit", 100, 140, 1, 1],
+            ]
+        )
+        rows = capture["fdwic_events"]
+        assert isinstance(rows, list)
+        rows.extend(
+            [
+                [0, 0, 0, 0, -1, "Dcci", 92, 96, 0x30C, 9],
+                [0, 0, 0, -1, -1, "Dcci", 220, 224, 0x215, 8],
+            ]
+        )
+        _refresh_summary(capture)
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError, "invalid startup Dcci fields"
+            ):
+                convert(input_path, output_path)
+
     def test_v4_requires_explicit_tensormap_mode(self) -> None:
         capture = _v5_capture(
             [
@@ -554,11 +775,12 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
 
         parent = next(event for event in events if event.get("name") == "register#0")
         flat_child_names = (
-            "register.wait_predecessor_insert#0",
-            "register.publish_writer_metadata#0",
+            "register.wait_predecessor_tensormap_insert#0",
+            "register.publish_writer_metadata"
+            "[ordinary_tensormap_entries=0]#0",
             "register.publish_task_outputs#0",
             "register.publish_metadata_epilogue#0",
-            "register.publish_insert_completion#0",
+            "register.publish_tensormap_insert_completion#0",
         )
         nested_output_names = (
             "register.publish_task_outputs.copy#0",
@@ -595,16 +817,28 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
                 set(child), {"ph", "name", "pid", "tid", "ts", "dur"}
             )
         self.assertEqual(
-            children["register.wait_predecessor_insert#0"]["ts"], parent["ts"]
+            children["register.wait_predecessor_tensormap_insert#0"]["ts"],
+            parent["ts"],
         )
         self.assertAlmostEqual(
-            children["register.wait_predecessor_insert#0"]["ts"]
-            + children["register.wait_predecessor_insert#0"]["dur"],
-            children["register.publish_writer_metadata#0"]["ts"],
+            children["register.wait_predecessor_tensormap_insert#0"]["ts"]
+            + children[
+                "register.wait_predecessor_tensormap_insert#0"
+            ]["dur"],
+            children[
+                "register.publish_writer_metadata"
+                "[ordinary_tensormap_entries=0]#0"
+            ]["ts"],
         )
         self.assertAlmostEqual(
-            children["register.publish_writer_metadata#0"]["ts"]
-            + children["register.publish_writer_metadata#0"]["dur"],
+            children[
+                "register.publish_writer_metadata"
+                "[ordinary_tensormap_entries=0]#0"
+            ]["ts"]
+            + children[
+                "register.publish_writer_metadata"
+                "[ordinary_tensormap_entries=0]#0"
+            ]["dur"],
             children["register.publish_task_outputs#0"]["ts"],
         )
         self.assertAlmostEqual(
@@ -615,11 +849,13 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
         self.assertAlmostEqual(
             children["register.publish_metadata_epilogue#0"]["ts"]
             + children["register.publish_metadata_epilogue#0"]["dur"],
-            children["register.publish_insert_completion#0"]["ts"],
+            children["register.publish_tensormap_insert_completion#0"]["ts"],
         )
         self.assertAlmostEqual(
-            children["register.publish_insert_completion#0"]["ts"]
-            + children["register.publish_insert_completion#0"]["dur"],
+            children["register.publish_tensormap_insert_completion#0"]["ts"]
+            + children[
+                "register.publish_tensormap_insert_completion#0"
+            ]["dur"],
             parent["ts"] + parent["dur"],
         )
         self.assertAlmostEqual(
@@ -630,7 +866,8 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             sum(
                 children[name]["dur"]
                 for name in (
-                    "register.publish_writer_metadata#0",
+                    "register.publish_writer_metadata"
+                    "[ordinary_tensormap_entries=0]#0",
                     "register.publish_task_outputs#0",
                     "register.publish_metadata_epilogue#0",
                 )
@@ -680,6 +917,9 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
                 0,
                 0,
             ],
+            # descriptor flush 与业务 flush span 使用完全相同的端点；
+            # merged 必须先输出业务父区间，再输出 DCCI overlay。
+            [0, 0, 0, 0, -1, "Dcci", 121, 123, 0x10D, 3],
             [0, 0, 0, 0, -1, "Register", 125, 140, 0, 0],
             [
                 0,
@@ -693,10 +933,21 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
                 0,
                 0,
             ],
+            # SharedOutputRef 的 writer commit 会消费 CAS 返回值，因此泳道
+            # 必须明确显示为 return_ready；相邻 DCCI 仍归属同一个 Register
+            # writer metadata 子区间。
+            [0, 0, 0, 0, -1, "Atomic", 130, 131, 0x54, 27],
+            [0, 0, 0, 0, -1, "Dcci", 131, 132, 0x10D, 1],
+            [0, 0, 0, 0, -1, "Atomic", 136, 137, 0x54, 20],
             [0, 0, 0, 0, -1, "AllocComplete", 140, 145, 0, 0],
             [0, 0, 0, 0, -1, "Submit", 100, 150, 1, 1],
+            [0, 0, 0, -1, -1, "ClockBaseline", 10, 11, 0, 0],
+            [0, 0, 0, -1, -1, "ClockBaseline", 12, 13, 0x3, 0],
+            [0, 0, 0, -1, -1, "Dcci", 220, 224, 0x31D, 8],
         ]
         capture = _v5_capture(rows, tensormap_mode="shared")
+        capture["l2_swimlane_level"] = 4
+        _refresh_summary(capture)
         with tempfile.TemporaryDirectory() as directory:
             input_path = Path(directory) / "raw.json"
             output_path = Path(directory) / "merged.json"
@@ -707,16 +958,83 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             )["traceEvents"]
 
         names = {event.get("name") for event in events}
-        self.assertIn("materialize.publish_task_outputs#0", names)
+        positions = {
+            event.get("name"): index
+            for index, event in enumerate(events)
+        }
         self.assertIn(
-            "materialize.publish_task_outputs.copy#0", names
+            "materialize.publish_shared_output_descriptors#0", names
         )
         self.assertIn(
-            "materialize.publish_task_outputs.flush#0", names
+            "materialize.publish_shared_output_descriptors"
+            ".copy_tensor_descs#0",
+            names,
         )
-        self.assertIn("register.wait_predecessor_insert#0", names)
-        self.assertIn("register.publish_writer_metadata#0", names)
-        self.assertIn("register.publish_insert_completion#0", names)
+        self.assertIn(
+            "materialize.publish_shared_output_descriptors"
+            ".flush_tensor_descs#0",
+            names,
+        )
+        self.assertIn(
+            "register.wait_predecessor_tensormap_insert#0", names
+        )
+        self.assertIn(
+            "register.publish_writer_metadata"
+            "[ordinary_tensormap_entries=0]#0",
+            names,
+        )
+        self.assertIn(
+            "register.publish_tensormap_insert_completion#0", names
+        )
+        self.assertIn(
+            "atomic.return_ready.shared_output_ref_last_writer_commit"
+            ".compare_exchange#0",
+            names,
+        )
+        self.assertIn(
+            "dcci.shared_output_ref_writer_history_flush"
+            ".clean_out×1.lines1#0",
+            names,
+        )
+        self.assertIn(
+            "dcci.shared_output_descriptor_flush"
+            ".clean_out×1.lines1#0",
+            names,
+        )
+        self.assertLess(
+            positions["materialize#0"],
+            positions[
+                "materialize.publish_shared_output_descriptors#0"
+            ],
+        )
+        self.assertLess(
+            positions[
+                "materialize.publish_shared_output_descriptors"
+                ".flush_tensor_descs#0"
+            ],
+            positions[
+                "dcci.shared_output_descriptor_flush"
+                ".clean_out×1.lines1#0"
+            ],
+        )
+        self.assertLess(
+            positions["register#0"],
+            positions[
+                "register.publish_writer_metadata"
+                "[ordinary_tensormap_entries=0]#0"
+            ],
+        )
+        self.assertLess(
+            positions[
+                "register.publish_writer_metadata"
+                "[ordinary_tensormap_entries=0]#0"
+            ],
+            positions[
+                "dcci.shared_output_ref_writer_history_flush"
+                ".clean_out×1.lines1#0"
+            ],
+        )
+        self.assertNotIn("register.publish_metadata#0", names)
         self.assertNotIn("register.publish_task_outputs#0", names)
         self.assertNotIn("register.publish_metadata_epilogue#0", names)
 
