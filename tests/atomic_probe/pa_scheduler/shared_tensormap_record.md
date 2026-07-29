@@ -11013,9 +11013,26 @@ tests/atomic_probe/pa_scheduler/outputs/
 相对 R5h 的四样本中位数 `2,940.2265 us` 方向一致，但本次只有一个无锁
 样本，不能把 `-15.555%` 当作完成交错复测后的稳定净收益。
 
-现有未提交 ordinary-ring visibility probe 只覆盖普通区域 ring，不覆盖
-fresh-output descriptor、per-task completion 与单次 published Load 的
-完整传递链，因而没有拿它替代本次正式 shared PA B256 验证。
+本轮把 ordinary-ring visibility probe 接入 CCEC 探针集合，并直接复用
+production shared TensorMap 的 publish/read/lookup helper。两个 AIV
+轮换 writer/reader；reader 在发布前以普通 scalar load 预热旧
+commit/reclaim/head/tail/seq/payload cache line，只观察 production
+`committed_tasks` 交权，窗口内不增加额外 DCCI、DSB 或全核同步。
+
+device 0 连续运行 20 个独立 launch，每次 394 task，覆盖空 task、同 bucket
+双 entry、跨 bucket 双 entry、writer 轮换以及 CAP=128 三次以上回绕：
+
+- 7,880 个 task 全部完成，timeout、overshoot 和 first error 均为 0；
+- 20/20 的 commit、reclaim、head、tail、sequence、payload、read 和
+  lookup 精确匹配；
+- A bucket 推进 394 个 entry（3.078 圈），B bucket 推进 392 个 entry
+  （3.062 圈）；
+- `protocol_failures=0`、`semantic_failures=0`。
+
+该探针证明 ordinary region 在“旧 cache line 已预热”的受控场景下，现有
+production 发布链能跨核稳定传递。它仍不覆盖 fresh-output descriptor、
+per-task completion 与单次 published Load 的完整组合，因此不能替代正式
+shared PA B256 验证；两条证据链保留各自边界。
 
 ### 2026-07-28：R5k 消减 shared loser 的 winner-only 上下文初始化
 
@@ -11586,3 +11603,215 @@ R5m 的 12 个逐区组差值全部为正，均值回退的近似 95% 区间为
 loser 闭合工作，但超过新的 1% 端到端门槛，因此提交 `755397b0` 连同
 对应运行时代码不再进入待推送分支。R5k 与 R5l 均为端到端改善，继续
 保留。
+
+### 2026-07-29：按 PA task 类型解释 ordered Register 的性能差异
+
+#### 先区分三类发布对象
+
+当前 shared PA 不是把每个 output 都重复写入 ordinary TensorMap，而是按
+对象语义使用三条发布路径：
+
+1. Alloc/QK/SF/PV 创建的 fresh output 使用
+   `(producer_task_id, output_slot)` 形式的 `SharedOutputRef`。winner 在
+   Materialize 尾部把 `TensorDesc` 写入
+   `shared_outputs[task].tensors[slot]`，整批执行
+   `shared_output_descriptor_flush`，再经过 StoreBarrier 用
+   `published[slot]` Atomic 发布。
+2. 普通 `GmTensor/LocalTensor` writer 才在 Register 中追加 ordinary
+   TensorMap region slot，并执行 append invalidate/flush。本次 PA B256
+   的 `ordinary_count` 始终为 0，因此不存在 ordinary TensorMap append
+   DCCI。
+3. UP 的三个 accumulator 是 INOUT `SharedOutputRef`，不会创建 fresh
+   descriptor。UP 在 Register 中写不可变 writer-history，整批执行一次
+   `shared_output_ref_writer_history_flush`，再用三个 CAS 把对应
+   `last_writer` 推进到当前 task。
+
+因此 QK/SF/PV 的 Register 没有 TensorMap append DCCI 是协议事实，不是
+泳道漏采。它们需要的 descriptor DCCI 已经位于 Materialize。UP 需要的
+DCCI 也不是 ordinary TensorMap flush，而是 writer-history 的发布边界：
+若没有这次 flush，其他核可能先观察到新的 `last_writer`，却读到尚未写回
+的旧 history。
+
+consumer Build 在读取 `SharedOutputRef` descriptor 前还会执行
+`shared_winner_build_descriptor_invalidate`。完整的可见性链为：
+
+```text
+producer 普通写 descriptor
+  -> descriptor DCCI clean-out
+  -> StoreBarrier
+  -> published Atomic
+  -> consumer 检查 published
+  -> descriptor DCCI invalidate
+  -> consumer 复制 descriptor 到执行 slot
+```
+
+UP 的版本链则为：
+
+```text
+读取三个 symbol 的 last_writer
+  -> 普通写本 task 的三条 writer-history
+  -> 一次 history DCCI clean-out
+  -> StoreBarrier
+  -> 三次 last_writer CAS
+```
+
+#### B256 全量事件闭合
+
+取证样本为：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260729_154301_2671167/ccec/
+```
+
+这是一份带普通阶段、Atomic 和 DCCI 的观察构建，只用于区域与调用次数
+归因，不作为 trace-free 净性能结论。1,280 个 task 的 Register 记录完整
+闭合：
+
+| 事件 | 数量 | 说明 |
+| --- | ---: | --- |
+| Register parent | 1,280 | 每个 task 一个 |
+| wait predecessor 子区间 | 1,280 | task 0 保留真实近零边界 |
+| predecessor PollBatch | 1,279 | 全局 task 0 没有前驱 |
+| writer metadata 子区间 | 1,280 | 名称中的计数只表示 ordinary entry |
+| insert completion 子区间 | 1,280 | 每个 task 一个 |
+| insert completion CAS | 1,280 | 每个 task 一个 |
+| descriptor flush | 1,024 | Alloc/QK/SF/PV 各 256 次 |
+| ordinary TensorMap append flush | 0 | 本用例没有 ordinary writer entry |
+| UP writer-history flush | 256 | 每个 UP 整批一次 |
+| UP output-published load | 768 | 三个 INOUT × 256 |
+| UP previous-writer load | 768 | 三个 INOUT × 256 |
+| UP last-writer CAS | 768 | 三个 INOUT × 256 |
+
+`register.publish_writer_metadata[ordinary_tensormap_entries=0]` 不能解释为
+metadata 没有工作：这个现有标签只复用 Register raw 中的
+`ordinary_count`，没有额外记录 `symbol_count`。UP 虽然也显示 ordinary
+为 0，内部仍有三组 symbol writer 操作和一次 history DCCI；Atomic/DCCI
+子区间才是这部分工作的直接证据。
+
+#### 各 task 类型的 Register 分解
+
+以下均为单 task 事件中位数，单位为微秒。`task_id % 5` 依次对应
+Alloc/QK/SF/PV/UP。
+
+| task 类型 | Register | 等前驱插入 | writer metadata | completion | metadata 的主要实际工作 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Alloc | 71.165 | 69.991 | 0.788 | 0.388 | 空 ordinary/symbol 集合校验 |
+| QK | 29.786 | 28.834 | 0.582 | 0.439 | 空 ordinary/symbol 集合校验 |
+| SF | 70.162 | 68.918 | 0.777 | 0.375 | 空 ordinary/symbol 集合校验 |
+| PV | 27.992 | 26.936 | 0.580 | 0.372 | 空 ordinary/symbol 集合校验 |
+| UP | 80.848 | 76.170 | 4.316 | 0.388 | 三个 INOUT writer-history 与 last-writer CAS |
+
+所有类型的 Register 长度都主要由
+`wait_predecessor_tensormap_insert` 决定。不同类型的等待中位数反映本次
+多核回放中 owner 到达全局有序插入链的相对时机，不能当成对应 metadata
+函数的纯 scalar 成本。只有 UP 的 metadata 稳定更重，可以直接归因于三个
+INOUT symbol 的版本链发布。
+
+三个具体 task 可以说明泳道视觉差异：
+
+- task 36（QK）：Register 37.789 us，其中等前驱 36.427 us、metadata
+  0.917 us、completion 0.445 us。长区间几乎全部是轮询等待。
+- task 4（UP）：Register 19.071 us，其中等前驱 13.406 us、metadata
+  5.002 us、completion 0.663 us。metadata 内可见三组 load/load/CAS
+  和一次 DCCI。
+- task 0（Alloc）：没有前驱，wait 只有 0.017 us，completion 只有
+  0.338 us；在较粗缩放下视觉上近似只剩 writer metadata，但原始记录并
+  未缺少另外两个子区间。
+
+#### 后续优化边界
+
+1. 不应为了让 QK/SF/PV 的 Register 看起来“完整”而增加无意义的
+   TensorMap DCCI；这会重复发布 fresh descriptor 并污染性能。
+2. Register 长尾的第一优化对象仍是 predecessor wait 的形成原因和插入链
+   推进节奏，而不是不到 1 us 的空 metadata。
+3. UP metadata 可以单独研究 writer-history 的布局、批量发布和三个
+   last-writer 控制字的访问，但必须保留“history 先可见、CAS 后发布”的
+   顺序合同。
+4. 后续若 PA 引入真实 ordinary writer，泳道必须同时出现 region append
+   invalidate、payload flush、seq 发布和 tail 发布；否则才应按漏采或协议
+   缺失调查。
+
+### 2026-07-29：shared full-swimlane 通用记录压缩为 16B
+
+#### 只压缩物理存储，不改变逻辑泳道
+
+本阶段针对的是观察构建写入 GM 的通用泳道记录，不改变调度协议和最终
+JSON 事件语义。shared full-swimlane 使用两种物理记录：
+
+- Submit/Claim 继续使用每 task 一条 32B 四端点记录，保留两者严格配对的
+  起止边界；
+- 其余通用事件由 32B `TraceRecord` 压缩为 16B
+  `CompactTraceRecord16`，host 回读后再恢复为原来的逻辑
+  `TraceRecord`。
+
+16B 通用记录保存：
+
+- `start_cycle`、`end_cycle` 的低 32 位；
+- 原有 32 位 flags；
+- 由 task、function、phase 和 auxiliary 组成的 32 位打包字段。
+
+host 使用每核 `startup_barrier_begin` 和 `finish_cycle` 展开低 32 位时钟。
+构建期和 host 后处理同时检查 task、function、phase、auxiliary 的可编码
+范围，以及一次调度窗口小于 `2^32` tick；任何字段越界、时钟无法展开或
+记录落在合法窗口之外都会使后处理失败，不允许静默截断。
+
+压缩只用于 shared swimlane：
+
+| 构建 | 通用记录 | Submit/Claim | 每核通用容量 | 每核物理 stride |
+| --- | ---: | ---: | ---: | ---: |
+| shared swimlane | 16B | 32B | 28,416 | 593,920B |
+| shared perf-clock / submit-pmu | 32B | 32B | 28,416 | 1,048,576B |
+| private | 32B | 无专用区 | 65,536 | 2,097,152B |
+
+因此 private、perf-clock 和 submit-pmu 的编译路径不受本次压缩影响；
+converter/analyzer 继续消费完全展开后的同一逻辑 schema。
+
+#### 构建产物必须声明真实物理布局
+
+CCEC artifact manifest 升级为 v4，并在 mode、variant、phase 之外固定
+记录：
+
+- `generic_record_bytes`；
+- `submit_claim_record_bytes`；
+- `records_per_core`；
+- `worker_stride_bytes`。
+
+`build.sh` 从实际传给三份 device 镜像的 compact 宏推导上述字段；
+`run.sh` 则根据 mode/variant 独立计算期望值并逐字段核对。这样即使
+producer 和 consumer 某一侧修改错误，也不能因共用同一份常量而把
+16B/32B 混件误判为合法。旧 schema、字段重排、额外身份行、任一布局字段
+篡改和 artifact SHA 不一致均由独立门槛测试拒绝。
+
+#### A5 B256 对称 A/B
+
+基线和候选从同一源码构建，唯一差异是 shared full-swimlane 通用记录为
+32B 或 16B；Submit/Claim 专用记录、逻辑事件、Atomic/DCCI 观察和所有
+正确性门槛保持一致。两版均先预热，随后运行五组
+`32B,16B,16B,32B` 的对称 ABBA，共各 10 个独立 B256 进程。每次均满足：
+
+- execution、semantic、postprocess 全部 PASS；
+- 依赖签名为 `b7d985d6edb07078`；
+- dropped records 为 0；
+- Atomic/DCCI 与 Submit/Claim 闭合式全部通过。
+
+| 组 | 32B 均值 | 16B 均值 | 16B 相对变化 |
+| ---: | ---: | ---: | ---: |
+| 1 | 2,773.395 us | 2,734.988 us | -38.407 us / -1.385% |
+| 2 | 2,799.339 us | 2,740.293 us | -59.046 us / -2.109% |
+| 3 | 2,798.697 us | 2,739.219 us | -59.478 us / -2.125% |
+| 4 | 2,789.271 us | 2,744.362 us | -44.909 us / -1.610% |
+| 5 | 2,771.184 us | 2,757.860 us | -13.324 us / -0.481% |
+
+汇总结果：
+
+| 布局 | 样本数 | mean | median | min～max |
+| --- | ---: | ---: | ---: | ---: |
+| 32B | 10 | 2,786.377 us | 2,789.133 us | 2,759.049～2,808.885 us |
+| 16B | 10 | 2,743.345 us | 2,743.488 us | 2,726.481～2,761.876 us |
+
+16B 的 mean 改善 `43.033 us（1.544%）`，median 改善
+`45.645 us（1.637%）`，五组全部同向。96 核 trace 物理分配从
+`100,670,272B` 降为 `57,023,296B`，减少
+`43,646,976B（43.35%）`。这同时减少每条通用事件的 GM 写入量和完整
+trace 缓冲规模，收益达到当前 1% 端到端门槛，因此保留 16B 方案。
