@@ -2,7 +2,7 @@
 
 ## 1. 当前交付边界
 
-本目录现在提供三套可独立构建和运行的用例：
+本目录现在提供四套可独立构建和运行的用例：
 
 - CCEC 用例直接调用编译器 intrinsic，不包含 `kernel_operator.h`；
 - AscendC 的被测 preload 调用使用公开 `kernel_operator.h` API；冷态构造、发布边界和
@@ -11,7 +11,11 @@
   raw `SYS_CNT` 统计口径，以便区分“API 用法差异”和“测试模型差异”；
 - 第三套是纯 CCEC 的 `1:2` mixed 持续写探针，用与 PA 泳道相同的 32 B
   七字段 record、独占 cacheline 和最终逐行发布口径，专门回答单条 store
-  microprobe 没有覆盖的连续写问题。
+  microprobe 没有覆盖的连续写问题；
+- 第四套是纯 CCEC 的 PA shared 物理模型，不接入调度主流程，只复刻当前
+  `writer_history` 的 40 B destination footprint、1/3 个 `TensorDesc` 的 128/384 B 发布、
+  descriptor 的 invalidate 后普通读取，以及 current-PC ICache preload
+  跨函数与同目标两种放置方式。
 
 用户口语中的 `icache_pretch`、`dcache_pretch` 不是当前 CANN 头文件中的符号。正确检索词是：
 
@@ -35,6 +39,11 @@
   `512 -> 206`，AscendC 为 `343 -> 121` raw ticks；
 - CCEC ICache 同一物理指令区中位数为 `975 -> 484`，AscendC 为
   `1085 -> 743` raw ticks；
+- PA shared 物理模型中，128 B/384 B descriptor 发布即使没有额外 overlap
+  gap，96 核关键核总窗口也分别稳定下降约 `9%`/`25%`；保留约 725 raw ticks
+  独立 gap 后分别下降约 `22%`/`28%`；
+- 同一 4,644 B ICache 目标区中，在与目标不相邻的 caller 发起 preload 时关键核
+  总窗口仅变化约 `-1%~-2%`，在目标函数内部发起时两轮均下降约 `41%`；
 - 两套实现的两个 ICache preload mode 都在发起后立即得到 `9/9 busy`，独立 gap
   之后均得到 `9/9 idle`；
 - 立即轮询等待没有降低目标工作区间；两次有效运行中完整区间的微小差异方向并不
@@ -60,6 +69,10 @@
 | `ccec/trace_write_preload.cpp` | 1:2 mixed CCEC kernel；复刻七字段顺序写与最终逐行发布 |
 | `ccec/trace_write_preload_host.cpp` | 96 核/单核策略矩阵、payload 全量回读和容量拐点校验 |
 | `ccec/run_trace_write_preload.sh` | 持续泳道写探针的独立构建、mixed ELF 门禁和运行入口 |
+| `shared_preload_model_shared.h` | PA shared 物理粒度、控制块、结果和 payload oracle |
+| `ccec/shared_preload_model.cpp` | 1:2 mixed CCEC kernel；发布/消费与 ICache 放置模型 |
+| `ccec/shared_preload_model_host.cpp` | 交错策略矩阵、96 核结果和 payload 全量校验 |
+| `ccec/run_shared_preload_model.sh` | shared 模型构建、最终 ICache 布局门禁和 A5 运行入口 |
 
 从仓库根目录运行：
 
@@ -67,6 +80,7 @@
 tests/atomic_probe/ccec/run_cache_preload.sh
 tests/atomic_probe/ascendc/run_cache_preload.sh
 tests/atomic_probe/ccec/run_trace_write_preload.sh
+tests/atomic_probe/ccec/run_shared_preload_model.sh
 ```
 
 三套脚本都可以拆开：
@@ -80,13 +94,18 @@ tests/atomic_probe/ascendc/run_cache_preload.sh run
 
 tests/atomic_probe/ccec/run_trace_write_preload.sh build
 tests/atomic_probe/ccec/run_trace_write_preload.sh run
+
+tests/atomic_probe/ccec/run_shared_preload_model.sh build
+tests/atomic_probe/ccec/run_shared_preload_model.sh run
 ```
 
-三个脚本都是独立入口，没有修改 `ccec/run_all.sh`，也不会误跑目录内其他探针。
+四个脚本都是独立入口，没有修改 `ccec/run_all.sh`，也不会误跑目录内其他探针。
 AscendC runner 会从可执行文件提取 `.aicore_binary`，再对实际执行的 `.vector`
 符号做尺寸、对齐和地址不重叠检查，不能用 host ELF 的表面尺寸替代该门禁。持续写
 runner 则检查最终 ELF 同时存在 AIC/AIV 入口及其 `1:2` mixed metadata，32 个物理
-block 实际形成 32 AIC + 64 AIV。
+block 实际形成 32 AIC + 64 AIV。shared 模型 runner 还要求 4 KiB 以上的 ICache
+目标区、32 KiB 以上的 evictor 均在最终 ELF 中保留且按 128 B 对齐，并证明远端
+caller 的 4 KiB forward preload 窗口不覆盖目标函数。
 
 ## 3. 已查证的接口语义
 
@@ -576,6 +595,199 @@ set，不等价于对所有地址映射、关联冲突和未来 SKU 声明精确
 - preload 不减少最终发布成本，也不能替代 DCCI/DSB；
 - 当前约 30% 是隔离的紧凑连续写模型收益，不能直接写成 PA Submit 收益。真实
   TraceWriter 仍需以编译开关接入相同策略，并用同一业务输入做 level 4 端到端 A/B。
+
+### 5.4 PA shared 路径的定向模型
+
+#### 5.4.1 先从最新泳道确定真实对象
+
+本节只参考用户指定的最新 shared 捕获：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260729_151323_2641728/ccec/
+    merged_swimlane.json
+    swimlane_exclusive_analysis.json
+```
+
+该捕获是 schema-v5、96 核、shared TensorMap、1 GHz trace clock、Case1
+real-compute。全局 Submit makespan 为 `2,794.331 us`。下面的 Materialize、
+Register 等数值若标为 aggregate core-work，都是 96 核各自 duration 的求和，
+不能与 `2,794.331 us` 墙钟直接相减。
+
+| 最新泳道项目 | aggregate core-work | 每 task 均值 | 业务语义 |
+| --- | ---: | ---: | --- |
+| Materialize | 11,559,850 | 9,031.133 | 构造当前 task 参数、writer delta，并发布 fresh output |
+| output publication | 6,194,703 | 4,839.612 | 预检、writer reserve、descriptor copy/flush、barrier、published |
+| 其中 descriptor copy | 2,067,321 | 1,615.095 | `TensorDesc` 从 task payload 复制到独占 shared-output cell |
+| 其中 descriptor flush | 572,004 | 446.878 | `FlushRegion`；不含后续全部 atomic/residual |
+| output publication residual | 3,555,378 | 2,777.639 | 预检、FetchMax、StoreBarrier、published Exchange 等 |
+| Register | 83,051,504 | 64,883.988 | 等前驱 insert 完成，再发布 writer metadata 并交棒 |
+| 其中 predecessor wait | 80,687,004 | 63,036.722 | 串行 insert-turn 等待 |
+| 其中 writer metadata | 1,868,256 | 1,459.575 | ordinary/symbol writer 元数据发布 |
+| 其中 insert completion | 496,244 | 387.691 | 向后继发布本 task 已完成插入 |
+| Winner Build | 7,381,717 | 5,766.966 | 组装执行 slot；其中包含 shared descriptor invalidate/copy |
+
+`merged_swimlane.json` 还能把物理粒度锁得更精确：
+
+| 对象 | 次数 | 大小/line | 同类事件均值 |
+| --- | ---: | ---: | ---: |
+| 零 output task | 256 | 0 | output publication `0.140930 us` |
+| 一个 `TensorDesc` 的 output task | 512 | 128 B / 2 lines | copy `1.211871 us`；完整 publication `3.633336 us` |
+| 三个 `TensorDesc` 的 output task | 512 | 384 B / 6 lines | copy `2.825551 us`；完整 publication `8.395229 us` |
+| output descriptor clean-out | 512 + 512 | 2 lines / 6 lines | `0.340762 us` / `0.776129 us` |
+| winner 读取 shared descriptor | 2,048 | 每次 128 B / 2 lines | invalidate overlay `0.032448 us`；copy 未单独打点 |
+| 三 symbol writer history 发布 | 256 | 40 B / 1 line | clean-out overlay `0.204328 us` |
+| writer history 读取 | 768 | 1 line | invalidate overlay `0.100422 us` |
+
+这里的零 output 数量是 `1,280 - 512 - 512` 的事件闭合结果。DCCI overlay
+只包 DCCI/DSB 自身，不能拿 `0.032448 us` 解释后续 128 B 普通读取的总成本。
+
+对应源码语义为：
+
+- `PublishSharedTaskOutputs()` 对 `shared_outputs[task_id]` 的独占 cell 做整批
+  `CopyGmTensor()`，随后保留 `FlushRegion -> StoreBarrier -> published Exchange`；
+- `PopulateSlotPayloadImpl()` 在观察到 producer 已发布后，对每个
+  `SharedOutputRef` 执行 descriptor invalidate，再立即普通复制到 winner slot；
+- 三 symbol UP writer 写本 task 独占的 40 B history，clean-out 后才用
+  `last_writer` CAS 发布；
+- `published`、`last_writer`、`deps_prepared` 和 insert turn 是 atomic
+  控制线，不属于普通 DCache load/store 优化对象。
+
+捕获 metadata 没有保存 kernel SHA256，旁边的 `build/` 也是可变目录，因此不能把
+某个后来重建的 ELF 冒充该捕获的精确二进制。分析期间相邻 shared swimlane ELF 的
+两次检查均显示 `.text` 大于 270 KiB，AIC/AIV orchestration 单函数约
+76～82 KiB；这只证明当前代码存在 ICache 压力的结构条件，不证明本次
+`2,794.331 us` 的瓶颈已经由 ICache miss 主导。
+
+#### 5.4.2 探针如何保持与 shared 业务对等
+
+新增 `shared_preload_model` 不 include PA 调度主流程，也没有改动 shared
+生产代码。它只固定下面的物理模型：
+
+1. `publish`：
+   source 先在本核变为 hot，destination 保持 cold；可选对 destination 每条
+   cacheline 发起 `dc_preload`，再逐 byte volatile copy，最后始终执行原有语义的
+   `DCCI(CACHELINE_OUT) + DSB`；
+2. `consume`：
+   destination 先变为 hot；计时窗内始终先对 source 执行
+   `DCCI invalidate + DSB`，之后才可选 preload，再逐 byte复制；用于 host
+   校验的 destination clean-out 放在计时窗外；
+3. 大小只取当前业务真实出现的 40 B、128 B 和 384 B；
+4. `gap_rounds=0` 不放额外独立业务，只保留相同函数/时钟括号；
+   `gap_rounds=64` 在 preload 与 copy 之间放运行时 noinline 标量工作，本次
+   DCache 两轮中位数约 724～729 raw ticks；
+5. 每种 DCache A/B 各 11 个交错样本、每个样本 96 worker；`critical` 先取每次
+   launch 的最慢核，再跨样本取中位数；
+6. 每次 launch 都恢复完整 source/destination，回读 96 核 payload 逐 byte
+   校验；preload 不能参与正确性；
+7. ICache 三种 mode 共用同一 4,644 B target；32,836 B evictor 先构造 cold
+   状态。最终 ELF 门禁确认 172 B caller 的 forward 4 KiB preload 窗口不覆盖
+   target；每种 mode 各 13 个交错样本、64 个 AIV。
+
+其中 128/384 B output publish 与 128 B consume 都按当前 `CopyGmTensor()` 的
+GM-to-GM 逐 byte volatile copy 建模。40 B history case 只锁定“一个独占
+destination cacheline 被写后 clean-out”的物理问题；真实 history 是把 header
+和三个 atomic 结果从标量寄存器写入 GM，不执行 40 B GM-to-GM copy。因此 history
+百分比只能证明 destination preload 值得做业务 A/B，不能当成该 helper 的预计降幅。
+
+publish 中 source-hot 用来模拟同一 winner 刚完成 payload materialization；
+consume 中 destination-hot 用来隔离 shared source 的冷读。这两个 residency
+条件是明确的测试假设，最新泳道本身没有 DCache residency PMU，不能声称每个真实
+task 都满足。后续业务 A/B 必须覆盖真实 slot 复用和核间调度状态。
+
+最终探针身份如下：
+
+| 项目 | 值 |
+| --- | --- |
+| 日期 | `2026-07-29` |
+| Git HEAD | `0f51a06fab5e6316f0cc8aa7dd5ae0c140140636` |
+| CANN/CCEC | `9.1.0-weekly-20260708` / clang 15.0.5 |
+| mixed kernel SHA256 | `947dce0e240316827d0718b6dbcd3451f7d120fc313c579b8ab38264b4b3cae9` |
+| topology | DCache：32 AIC + 64 AIV；ICache：64 AIV |
+| 计时 | raw `SYS_CNT`；下表百分比不依赖频率换算 |
+| 设备隔离 | shell 无 `task-submit`/`npu-smi`；按已有用户授权在 device 0 未加锁运行 |
+| 完整有效运行 | 两轮；payload、oracle、status、topology、cleanup 全部 PASS |
+
+#### 5.4.3 DCache 结果
+
+下表给出第一轮代表性 raw 值，并用“复测变化”列给出第二轮关键核 total 的变化；
+两轮都来自删除 timed-copy checksum 后的最终代码。
+
+| shared 模型 | overlap | 第一轮 critical total baseline → preload | 第一轮变化 | 第二轮变化 |
+| --- | --- | ---: | ---: | ---: |
+| history-line write model，40 B | 无额外 gap | `784 -> 759` | -3.189% | -3.258% |
+| history-line write model，40 B | 64-round gap | `1,490 -> 1,142` | -23.356% | -23.518% |
+| 1-desc publish，128 B | 无额外 gap | `1,275 -> 1,153` | -9.569% | -8.830% |
+| 1-desc publish，128 B | 64-round gap | `1,964 -> 1,542` | -21.487% | -22.150% |
+| 3-desc publish，384 B | 无额外 gap | `3,496 -> 2,612` | -25.286% | -25.561% |
+| 3-desc publish，384 B | 64-round gap | `4,209 -> 3,026` | -28.106% | -28.681% |
+| 1-desc consume，128 B | 无额外 gap | `964 -> 841` | -12.759% | -12.369% |
+| 1-desc consume，128 B | 64-round gap | `1,666 -> 1,224` | -26.531% | -26.221% |
+
+当前生产 consume 是逐个 128 B descriptor invalidate/copy，所以表中的 128 B
+是直接对等项。探针也测了 384 B 批量 consume：无 gap 两轮 critical total
+分别下降 `31.699%`、`32.816%`，有 gap 分别下降 `35.014%`、`35.196%`；
+它只用于评估未来“先处理多个引用、再批量 copy”的可能性，不是当前源码已有动作。
+
+三条可以直接成立的观察：
+
+- output/history destination 都是当前 task 独占，预取不会引入同地址 writer
+  竞争；多 line copy 即使没有合成 gap，后续 line 也能获得前面 copy 提供的自然
+  lead，因此 384 B 比 40 B 的无-gap 收益稳定得多；
+- preload 降低的是 ordinary copy/写入部分。128 B gap 模型的 publish 中位数
+  两轮分别保持 `256 -> 256`、`257 -> 257` raw ticks；384 B 同样基本不变，
+  没有证据表明 DCCI/DSB 被加速；
+- consume 的 preload 必须位于既有 invalidate **之后**。在 invalidate 之前
+  preload 随后会被失效，且无论放在哪里都不能替代 producer publication、
+  DCCI、DSB 或 atomic ready 检查。
+
+因此 DCache 有真实的 shared 接入候选，但优先级不同：
+
+| 候选位置 | 可行性 | 原因与边界 |
+| --- | --- | --- |
+| Materialize 的 fresh output destination | 高 | 512 个 128 B 和 512 个 384 B 任务直接命中模型；cell 独占，地址和 output count 已知，保留原 flush/barrier/published |
+| Register 的 40 B writer-history destination | 中 | cell 独占，可在三组 published/last-writer atomic 检查前发 hint；但 Register 的 64.884 us/task 主要是 63.037 us predecessor wait，不能把 history microprobe 当成 Register 总收益 |
+| Winner Build 的 128 B descriptor source | 中 | 无-gap 模型已有稳定下降；更长 lead 需要把当前“invalidate 后立即 copy”改成 prepass/分批处理，必须另做语义和端到端验证 |
+| fanin 的 writer-history source | 低 | 单 line 且只在 future-writer 慢路使用；最新图中 invalidate overlay 很小，普通 scan 又没有单独边界 |
+| `published`/`last_writer`/insert turn 等 atomic line | 不建议 | 当前访问是 atomic/bypass 同步协议，不是普通 DCache cold load；preload 不能提供新鲜度或顺序 |
+
+#### 5.4.4 ICache 结果
+
+| placement | 第一轮 critical work | 第一轮 critical total | 第二轮 critical total | 结论 |
+| --- | ---: | ---: | ---: | --- |
+| 远端 caller current-PC | `1,559 -> 1,493`，-4.233% | `2,520 -> 2,487`，-1.310% | `2,559 -> 2,499`，-2.345% | 目标不在 preload 窗口，差异只能当布局/波动，不能宣称有效预取 |
+| target 内 current-PC | `1,559 -> 421`，-72.996% | `2,520 -> 1,485`，-41.071% | `2,559 -> 1,510`，-40.993% | 对同一 cold 顺序目标区有稳定收益 |
+
+两轮 caller/target preload 都是发起后 `832/832 immediate busy`、独立 gap 后
+`0/832 final busy`。这说明“hint 完成”与“hint 覆盖了即将执行的目标”是两件事：
+caller 的请求也完整结束，但由于最终 ELF 已证明其 forward 窗口不含 target，
+没有得到 target 内放置的收益。
+
+对 shared 主流程只能得出条件性建议：
+
+- 当前超大 orchestration `.text` 使 ICache 优化值得继续查，但最新泳道没有 PMU，
+  还不能断言 Materialize/Register 的长时间就是 ICache miss；
+- `icache_preload(2)` 必须放在最终 linked ELF 中即将顺序执行的目标块内部或紧邻
+  前方。源码上“调用关系接近”不够，跨 noinline helper、冷失败块和分支重排都可能
+  让 current-PC 窗口指错位置；
+- 不应在热路径新增 status 轮询。已有基础探针和本模型都没有证明等待 hint 完成
+  能优于让真实独立工作与其重叠；
+- 后续 session 若试接入，必须保存 baseline/preload 两个最终 ELF 的目标符号地址、
+  `.text` 大小与反汇编边界，并用 submit-PMU 或等价配对证据确认 miss 下降，再看
+  trace-free Submit 墙钟是否下降。
+
+#### 5.4.5 本轮不能外推的内容
+
+- 不能把上述 `-9%`、`-28%` 或 `-41%` 直接乘到 PA Submit；microprobe 每核从
+  cold 状态启动，而真实 task 在不同核、不同时间交错，cache residency 不同；
+- 不能把 6,194,703 output-publication core-work 减去某个 probe 百分比后，称为
+  `2,794.331 us` wall-clock 的预计收益；前者是各核求和，后者是跨核 envelope；
+- 不能把 Register metadata 的改善等同于去掉 predecessor serialization。最多只可能
+ 让当前 task 更早交棒，真实链式收益必须由完整泳道重测；
+- 不能用 ICache target microprobe 证明当前 shared 已经发生同等 miss，也不能只看
+  `.text` 大就决定加 hint；
+- 不能删、移动或弱化任何 DCCI、DSB、StoreBarrier、published、last_writer、
+  deps_prepared 或 insert-turn 协议来换取 microbenchmark 数字。
 
 ## 6. Preload 不能替代什么
 
