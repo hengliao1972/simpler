@@ -12759,3 +12759,79 @@ mean/median 为 `2307.679/2306.211 us`，范围
 下降 `6.363 us（0.275%）`。幅度仍处于设备波动量级，不能宣称明确的
 端到端收益，但方向没有回退且远低于 1% 撤回门槛；结合物理 CAS 次数和
 有序区局部耗时的确定性下降，本阶段保留。
+
+### 2026-07-29：在 predecessor wait 前预取 group-writer 原子线
+
+单 group-CAS 后，UP metadata 内除 CAS 外只剩约 17 ns，因此本阶段不再
+改普通 scalar bookkeeping，只实验是否能降低这一次共享原子访问。保留
+调用点满足以下边界：
+
+1. `PublishTrustedPaUpWriterHistoryPayload()` 已完成 history DCCI+DSB；
+2. 仅当正式 PA `writer_delta.symbol_count != 0` 时，预取本 batch Alloc
+   `shared_outputs[batch_start].last_writer[0]`；
+3. 随后才进入 predecessor wait，让等待区间提供 preload 提前量；
+4. preload 只是性能 hint，不替代、提前确认或改变后续 expected-old
+   return-ready CAS。
+
+不把 hint 放在 history DCCI 前，是因为随后的 DSB 可能耗尽提前量；不放在
+wait 后，是因为既没有可重叠工作，也会把 hint 直接塞进全局串行 metadata。
+目标严格是独占的 group-writer cache line，不预取 slot1/2、当前 task cell
+或 generic shared writer。CPU Ops 仍为空操作，generic 协议、raw 字段、
+AtomicSite 和 ABI 均不改变。
+
+正确性验证包括：
+
+- CPU shared 全套门槛与 CCEC full-swimlane 构建通过；
+- mixed context `0,8192,8193,32768` 覆盖 G0/G1/G2-partial/G4，
+  execution/semantic/postprocess 全部 PASS；
+- 7 个 UP 仍精确产生 7 条 return-ready group CAS 和 21 个逻辑 symbol
+  commit，history、fanin、normalized projection 与最终状态全部闭合；
+- B256 仍为 256 条物理 CAS、768 个逻辑 commit，`cas_retries=0`。
+
+mixed 采集位于：
+
+`outputs/pa_scheduler_shared_swimlane_20260729_205437_2966247/ccec`
+
+B256 正式 Perfetto 采集位于：
+
+`outputs/pa_scheduler_shared_swimlane_20260729_205446_2966243/ccec`
+
+该正式 B256 图中：
+
+| 指标 | 无 preload | group-line preload | 变化 |
+| --- | ---: | ---: | ---: |
+| UP metadata mean | 0.269 us | 0.238 us | -0.031 us / -11.6% |
+| UP metadata median | 0.271 us | 0.249 us | -0.022 us / -8.1% |
+| group CAS mean | 0.252 us | 0.220 us | -0.032 us / -12.6% |
+| group CAS p95 | 0.311 us | 0.307 us | -0.004 us |
+| site27 / history DCCI | 256 / 256 | 256 / 256 | 不变 |
+
+为排除单图波动，又在同一时段分别构建有、无 preload ELF，各跑五轮
+B256 full-swimlane raw 分析。每轮 256 条 CAS 的 mean 为：
+
+- 无 preload：`252.770、248.578、247.070、248.598、243.816 ns`；
+- 有 preload：`226.949、229.227、217.805、227.621、216.578 ns`。
+
+五轮总均值为 `248.166 -> 223.636 ns`，下降
+`24.530 ns（9.885%）`。对应 full-swimlane Submit mean/median 为
+`2436.857/2434.835 -> 2441.996/2444.737 us`，变化
+`+0.211%/+0.407%`，仍在泳道构建波动内且低于 1% 撤回门槛。
+
+perf-clock 10 个独立进程为：
+
+`2300.780、2309.113、2312.493、2325.048、2321.697、2303.674、`
+`2295.933、2293.964、2335.269、2300.508 us`
+
+mean/median 为 `2309.848/2306.394 us`；无 preload 的上一阶段为
+`2307.679/2306.211 us`，变化仅 `+2.169 us（0.094%）` /
+`+0.183 us（0.008%）`。不能宣称端到端加速，但也没有可辨识回退。
+
+代码体积方面，AIV Finish `.text` 在 full-swimlane 中由 `0xdc18` 增至
+`0xdcd8`（+192 B），在 perf-clock 中由 `0x6780` 增至 `0x6798`
+（+24 B）；没有形成需要用 ICache 风险抵消局部收益的大幅膨胀。
+
+本阶段因此按“局部 CAS 确定下降、完整 Submit 中性”保留。到这里，UP
+metadata 的物理工作只剩一次必须消费返回值的 expected-old CAS；把它改成
+source-issue Exchange、普通 store 或删掉 publication 会失去 fail-closed
+共享状态校验，不属于可接受的性能优化。继续调整 scalar 指令最多只作用于
+约十几纳秒父子区间差，已没有与改动风险匹配的空间。

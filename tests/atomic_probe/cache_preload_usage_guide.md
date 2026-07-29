@@ -749,7 +749,16 @@ task 都满足。后续业务 A/B 必须覆盖真实 slot 复用和核间调度�
 | Register 的 40 B writer-history destination | 中 | cell 独占，可在三组 published/last-writer atomic 检查前发 hint；但 Register 的 64.884 us/task 主要是 63.037 us predecessor wait，不能把 history microprobe 当成 Register 总收益 |
 | Winner Build 的 128 B descriptor source | 中 | 无-gap 模型已有稳定下降；更长 lead 需要把当前“invalidate 后立即 copy”改成 prepass/分批处理，必须另做语义和端到端验证 |
 | fanin 的 writer-history source | 低 | 单 line 且只在 future-writer 慢路使用；最新图中 invalidate overlay 很小，普通 scan 又没有单独边界 |
-| `published`/`last_writer`/insert turn 等 atomic line | 不建议 | 当前访问是 atomic/bypass 同步协议，不是普通 DCache cold load；preload 不能提供新鲜度或顺序 |
+| `published`/`last_writer`/insert turn 等 atomic line | 默认不建议；仅保留已实测专例 | preload 不能提供新鲜度或顺序；generation-12 PA group-writer 在原协议不变时已有配对实测，不能外推到其他 atomic line |
+
+这里的专例只指正式 PA-UP 的 Alloc `last_writer[0]`。调用点位于
+writer-history DCCI+DSB 之后、predecessor wait 之前，使 hint 有等待区间可
+重叠；后续仍执行并消费原 return-ready CAS，preload 不参与正确性。A5 B256
+同一时段五轮配对中，单次 group CAS 均值从 `248.166 ns` 降至
+`223.636 ns`，下降 `24.530 ns（9.885%）`；perf-clock 10 次 mean/median
+相对无 hint 仅变化 `+0.094%/+0.008%`。因此它是“局部确定改善、端到端
+中性”的窄特例，不构成对 `published`、insert turn 或 generic
+`last_writer` 增加 preload 的依据。
 
 #### 5.4.4 ICache 结果
 

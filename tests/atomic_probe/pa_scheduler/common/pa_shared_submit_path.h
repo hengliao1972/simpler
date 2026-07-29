@@ -710,6 +710,16 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
+    if (writer_delta.symbol_count != 0) {
+        // history 的 DCCI+DSB 已结束，此时预取稍后唯一会 CAS 的 Alloc
+        // group-writer cache line，并用 predecessor wait 提供提前量。它只
+        // 是性能 hint；正确性仍完全依赖后面的 return-ready CAS。
+        Ops::PreloadDataCache(
+            &state->shared_map.shared_outputs[
+                 static_cast<uint32_t>(task_meta.batch_start)
+             ].last_writer[0]
+        );
+    }
     EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(
         pmu_context
     );
