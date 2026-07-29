@@ -12148,3 +12148,73 @@ mean/median 为 `2308.649/2311.288 us`，范围
 - A5 mixed context `0,8192,16384,32768` 覆盖 G0/G1/G2/G4 和连续
   writer history，全部检查通过；
 - 10 个候选 B256 perf-clock 独立进程全部通过。
+
+### 2026-07-29：DCCI 后复用 owner-local writer 记录
+
+#### 消减内容
+
+`CommitPreparedSymbolSharedWriterIntentSet` 在 DCCI 前已经完成每个 symbol
+key 的合法性校验，并在 `UseExpectedPrevious=true` 的正式 PA 实例中持有
+由 task plan 推导出的 `expected_previous`。旧实现把相同的 key/previous
+写入 task 独占 history、clean-out 后，又从刚发布的 GM history 逐项回读，
+再计算 last-writer 地址并执行 CAS。
+
+本次只在 `UseExpectedPrevious=true` 的编译期分支中，把 DCCI 后的输入改为：
+
+- `symbol_key = symbol_keys[index]`；
+- `previous = expected_previous`。
+
+通用默认实例仍从 GM history 读取，协议与防御性检查不变。正式实例仍然：
+
+- 在 DCCI 前验证 key、producer 和 previous 范围；
+- 把完整 header 与三条 `(key, previous)` 写入 GM history；
+- 对实际 40 B history 执行 DCCI clean-out + DSB 和 StoreBarrier；
+- 根据同一 key 计算共享 last-writer 地址；
+- 执行三次 return-ready CAS，逐项消费实际返回值；
+- CAS 中途失败时保留已线性化前缀、外层置 fatal 且不发布 task handoff。
+
+因此删除的是 owner 对自身刚写 history 的重复 GM 回读，不是删除跨核
+history，也没有把 CAS 降级为普通写。
+
+#### A5 B256 结果
+
+候选 full-swimlane 位于：
+
+`outputs/pa_scheduler_shared_swimlane_20260729_181135_2808180/ccec`
+
+| 指标 | 预取阶段 | 本阶段 | 变化 |
+| --- | ---: | ---: | ---: |
+| UP metadata mean | 2.201 us | 2.055 us | -0.145 us / -6.6% |
+| UP metadata median | 2.210 us | 2.065 us | -0.145 us / -6.6% |
+| UP metadata p95 | 2.431 us | 2.284 us | -0.147 us / -6.0% |
+| writer CAS mean | 0.253 us | 0.243 us | 数量仍为 768 |
+| history DCCI mean | 0.152 us | 0.145 us | 数量仍为 256 |
+| full-swimlane Submit | 2467.469 us | 2429.239 us | -38.230 us / -1.55% |
+
+单次 full-swimlane 总时间受 worker 排布与最终 drain 波动影响，不能单独
+作为端到端收益；256 个 UP 局部样本分布整体下移，且与删除 clean-out 后
+回读的代码位置一致。
+
+perf-clock 独立运行 10 次：
+
+`2292.466、2326.114、2308.757、2301.480、2294.224、2363.801、`
+`2308.202、2306.291、2315.806、2293.730 us`
+
+mean/median 为 `2311.087/2307.247 us`，范围
+`2292.466～2363.801 us`；预取阶段中位数为 `2311.288 us`。中位数改善
+`4.041 us（0.175%）`，但存在一个 `2363.801 us` 长尾且两阶段范围重叠，
+所以端到端仍只判为中性偏好，不夸大为确定收益。
+
+相对最初精确基线，累计把 UP metadata mean 从 `4.330 us` 降至
+`2.055 us（-52.5%）`；perf-clock 中位数从 `2501.246 us` 降至
+`2307.247 us（-7.76%）`。
+
+正确性验证：
+
+- CPU shared 全套门槛与 expected-previous 正/负向测试通过；
+- CCEC AIC/AIV 正式模板和最终混合 ELF 编译检查通过；
+- A5 B256 history、fanin、output、projection、atomic/DCCI closure 和
+  后处理全部通过；
+- mixed context `0,8192,16384,32768` 覆盖 G0/G1/G2/G4、首组 Alloc
+  previous 与后续 `task_id-4` previous，全部通过；
+- 10 个 B256 perf-clock 独立进程全部通过。

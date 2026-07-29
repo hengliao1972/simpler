@@ -2171,10 +2171,24 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
     Ops::StoreBarrier();
 
     for (uint32_t index = 0; index < symbol_count; ++index) {
-        PA_GM const SharedWriterHistoryRecord &record =
-            history.entries[index];
+        uint32_t symbol_key = 0;
+        int64_t previous = -1;
+        if constexpr (UseExpectedPrevious) {
+            // 正式 PA 已在 flush 前验证并保留 owner-local key/previous。
+            // clean-out 后不再从刚发布的 GM history 回读同一份记录；
+            // history 仍完整写回，供跨核 reader 沿 writer 链读取。
+            symbol_key = symbol_keys[index];
+            previous = static_cast<int64_t>(expected_previous);
+        } else {
+            PA_GM const SharedWriterHistoryRecord &record =
+                history.entries[index];
+            symbol_key = record.symbol_key;
+            previous = static_cast<int64_t>(
+                record.previous_writer
+            );
+        }
         const FdwicOutputRef output_ref =
-            SharedSymbolHistoryReference(record.symbol_key);
+            SharedSymbolHistoryReference(symbol_key);
         if (!IsPlainSharedOutputRef(output_ref)) {
             return false;
         }
@@ -2194,9 +2208,9 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
                 task_id,
                 AtomicSite::SharedMetadataLastWriterCommit,
                 last_writer,
-                static_cast<int64_t>(record.previous_writer),
+                previous,
                 static_cast<int64_t>(task_id)
-            ) != record.previous_writer) {
+            ) != previous) {
             return false;
         }
     }
