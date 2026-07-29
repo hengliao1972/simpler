@@ -12307,3 +12307,81 @@ mean/median 为 `2312.139/2311.131 us`，范围
 - mixed context `0,8192,16384,32768` 覆盖 G0/G1/G2/G4 与连续 writer
   history，全部通过；
 - 10 个 B256 perf-clock 独立进程全部通过。
+
+### 2026-07-29：按正式 UP 参数顺序消除通用 slot 解码
+
+#### 精确顺序合同
+
+上一阶段只证明三个 slot 是 `0/1/2` 的任意排列，因此仍在 Register
+串行区逐 key 做除法、取模、去重并保存 packed slot。沿正式代码逐层核对
+后，可以使用更强且已经存在的业务合同：
+
+1. Alloc 按 slot `0/1/2` 声明 output；
+2. orchestration 固定保存为
+   `accumulated_output/sum/max = slot 0/1/2`；
+3. UP callback 按 `max/sum/output` 构造三个 INOUT，参数索引依次为
+   `3/4/5`，因此 slot 精确为 `2/1/0`；
+4. Materialize 与 `PrepareSharedTaskWriterDelta` 都按参数 index 递增扫描，
+   不排序；最后一个 manual-dependency output view 不进入 ordinary writer；
+5. split callback 在跨 TU 传递和 Finish 中始终使用 `const TaskArgs *`，
+   中间没有改序路径。
+
+因此正式 UP 的 symbol key 必须精确为
+`key_base+2、key_base+1、key_base`。本次改为三个直接比较，CAS target
+slot 由 `2-index` 得到，删除三次 producer/slot 解码、去重位图和
+packed-slot 搬运。顺序异常仍在首次 history GM 写入前失败，不回退通用
+路径。
+
+门槛同步收紧：
+
+- CPU builder 直接检查三个 INOUT 的 producer 与 slot 为 `2/1/0`；
+- writer delta 检查 `ordinary_count=0`、`symbol_count=3` 及三个 key
+  精确有序；
+- Commit 负例把正确 key 打乱后必须在 history 写入前失败；
+- host B256/mixed oracle 不再只检查 slot 集合，而是逐 history index
+  检查 `slot == 2-index`；
+- count 缺失、重复 key、错误 producer 和部分 CAS 前缀门槛继续保留。
+
+#### A5 B256 结果
+
+候选 full-swimlane 位于：
+
+`outputs/pa_scheduler_shared_swimlane_20260729_190252_2858209/ccec`
+
+| 指标 | 任意排列专路 | 精确 2/1/0 专路 | 变化 |
+| --- | ---: | ---: | ---: |
+| UP metadata mean | 1.983 us | 1.714 us | -0.269 us / -13.6% |
+| UP metadata median | 1.970 us | 1.701 us | -0.270 us / -13.7% |
+| UP metadata p95 | 2.210 us | 1.976 us | -0.234 us / -10.6% |
+| writer CAS mean | 0.248 us | 0.244 us | 仍精确为 768 次 |
+| history DCCI mean | 0.144 us | 0.151 us | 仍精确为 256 次 |
+| AIV Finish `.text` | `0xdf30` | `0xda20` | -1296 B / -2.3% |
+| full-swimlane Submit | 2436.679 us | 2431.177 us | -0.23%，单次波动 |
+
+CAS 与 DCCI 合计约 `0.883 us`，本阶段没有减少同步动作；约
+`0.269 us/task` 的局部收益来自被删除的纯标量 key 解码与形状处理，
+与修改位置一致。
+
+perf-clock 独立运行 10 次：
+
+`2307.481、2298.217、2310.642、2310.858、2305.647、2308.700、`
+`2300.010、2305.664、2307.435、2312.848 us`
+
+mean/median 为 `2306.750/2307.458 us`，范围
+`2298.217～2312.848 us`；上一阶段为 `2312.139/2311.131 us`。mean
+改善 `5.389 us（0.233%）`，median 改善 `3.673 us（0.159%）`。端到端
+幅度仍小，但局部下降清晰、热代码继续缩小且取值范围整体收窄，因此保留。
+
+相对最初精确基线，累计把 UP metadata mean 从 `4.330 us` 降至
+`1.714 us（-60.4%）`；perf-clock 中位数从 `2501.246 us` 降至
+`2307.458 us（-7.75%）`。
+
+正确性验证：
+
+- CPU shared 全套门槛及 builder/delta/Commit 精确顺序正负例通过；
+- CCEC AIC/AIV 模板和最终混合 ELF 编译检查通过；
+- A5 B256 的精确 history 顺序、projection、atomic/DCCI closure 和全部
+  后处理检查通过；
+- mixed context `0,8192,16384,32768` 覆盖 G0/G1/G2/G4、首组 Alloc
+  previous 与连续 `task_id-4` previous，全部通过；
+- 10 个 B256 perf-clock 独立进程全部通过。

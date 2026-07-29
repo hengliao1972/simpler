@@ -3047,7 +3047,6 @@ inline SharedTensorMapValidation ValidateSharedTensorMap(
             history.writer_task == static_cast<int32_t>(task) &&
             history.count == 3 &&
             history.reserved == 0;
-        bool slots_seen[3] = {};
         for (uint32_t index = 0;
              index < history.count && index < 3; ++index) {
             const SharedWriterHistoryRecord &record =
@@ -3056,23 +3055,11 @@ inline SharedTensorMapValidation ValidateSharedTensorMap(
                 planned->batch_start *
                     kSharedOutputMaxPerTask +
                 1U;
-            const bool key_ok =
-                record.symbol_key >= key_base &&
-                record.symbol_key < key_base + 3U;
             validation.protocol_ok &=
-                key_ok &&
+                record.symbol_key ==
+                    key_base + (2U - index) &&
                 record.previous_writer == expected_previous;
-            if (key_ok) {
-                const uint32_t slot =
-                    record.symbol_key - key_base;
-                validation.protocol_ok &=
-                    !slots_seen[slot];
-                slots_seen[slot] = true;
-            }
         }
-        validation.protocol_ok &=
-            slots_seen[0] && slots_seen[1] &&
-            slots_seen[2];
     }
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
         validation.protocol_ok &=

@@ -566,6 +566,63 @@ void TestPaTwoGroupWriterReadyGate() {
             TaskTag(first_args, 6) == TensorArgType::Inout,
         "UP args contain 3 fresh INPUTs, 3 accumulator INOUTs, and output view"
     );
+    const bool up_refs_have_expected_kind =
+        first_args.tensors[3].kind ==
+            TensorRefKind::SharedOutputRef &&
+        first_args.tensors[4].kind ==
+            TensorRefKind::SharedOutputRef &&
+        first_args.tensors[5].kind ==
+            TensorRefKind::SharedOutputRef;
+    const FdwicOutputRef up_max = up_refs_have_expected_kind
+        ? SharedOutputReference(first_args.tensors[3])
+        : InvalidSharedOutputRef();
+    const FdwicOutputRef up_sum = up_refs_have_expected_kind
+        ? SharedOutputReference(first_args.tensors[4])
+        : InvalidSharedOutputRef();
+    const FdwicOutputRef up_output = up_refs_have_expected_kind
+        ? SharedOutputReference(first_args.tensors[5])
+        : InvalidSharedOutputRef();
+    Check(
+        up_refs_have_expected_kind &&
+            up_max.producer_task_id == alloc &&
+            up_max.output_slot == 2 &&
+            up_sum.producer_task_id == alloc &&
+            up_sum.output_slot == 1 &&
+            up_output.producer_task_id == alloc &&
+            up_output.output_slot == 0 &&
+            first_args.tensors[6].kind ==
+                TensorRefKind::LocalTensor &&
+            first_args.tensors[6].pointer.local_tensor != nullptr &&
+            first_args.tensors[6]
+                .pointer.local_tensor->manual_dep,
+        "UP builder fixes accumulator writer order to max/sum/output slots 2/1/0"
+    );
+    SubmitContext delta_context{};
+    delta_context.task_id = first_up;
+    delta_context.won = true;
+    delta_context.register_mask = 0x78U;
+    delta_context.result.task_id = first_up;
+    delta_context.shared_result.Reset(first_up);
+    SharedTaskWriterDelta exact_delta{};
+    const uint32_t alloc_key_base =
+        static_cast<uint32_t>(alloc) *
+            kSharedOutputMaxPerTask +
+        1U;
+    Check(
+        PrepareSharedTaskWriterDelta(
+            first_args, delta_context, exact_delta
+        ) &&
+            exact_delta.ordinary_count == 0 &&
+            exact_delta.symbol_count == 3 &&
+            exact_delta.symbol_keys[0] ==
+                alloc_key_base + 2U &&
+            exact_delta.symbol_keys[1] ==
+                alloc_key_base + 1U &&
+            exact_delta.symbol_keys[2] ==
+                alloc_key_base &&
+            exact_delta.writer_intent_required,
+        "UP writer delta preserves the exact 2/1/0 callback order"
+    );
     Check(
         first_args.scalars[0] == 1 && first_args.scalars[1] == 0,
         "first PA group carries is_first=1 and is_last=0"
@@ -1847,10 +1904,9 @@ void TestOrderedPreparedSymbolUsesSinglePublicationCheck() {
         "PA expected-previous commit omits the last-writer preload"
     );
 
-    // 正式 PA UP 专路要求三个 key 同属 batch Alloc producer，slot
-    // 恰好覆盖 0/1/2。故意使用 2/0/1 顺序，锁定 history 原序、
-    // owner-local packed slot 与 CAS 目标按同一 index 对应。
-    constexpr int16_t kPaSlotOrder[3] = {2, 0, 1};
+    // 正式 PA UP callback 按 max/sum/output 构造参数，因此专路要求
+    // 三个 key 同属 batch Alloc producer且 slot 精确为 2/1/0。
+    constexpr int16_t kPaSlotOrder[3] = {2, 1, 0};
     uint32_t pa_up_keys[3] = {};
     for (uint32_t index = 0; index < 3; ++index) {
         FdwicOutputRef pa_ref = output_ref;
@@ -1892,7 +1948,7 @@ void TestOrderedPreparedSymbolUsesSinglePublicationCheck() {
     }
     Check(
         pa_up_exact,
-        "PA UP compact path keeps history and CAS targets index-aligned"
+        "PA UP compact path keeps the exact callback order index-aligned"
     );
 
     // 数量或 slot 集合不精确时，必须在 history 首次写入前失败。
@@ -1934,6 +1990,17 @@ void TestOrderedPreparedSymbolUsesSinglePublicationCheck() {
             *map, pa_up_keys, 2, kReader, &fatal,
             nullptr, kProducer, kProducer
         );
+    const uint32_t wrong_order_keys[3] = {
+        pa_up_keys[0], pa_up_keys[2], pa_up_keys[1]
+    };
+    fatal = 0;
+    const bool pa_up_order_rejected =
+        !CommitPreparedSymbolSharedWriterIntentSet<
+            SymbolTestOps, false, false, true, true
+        >(
+            *map, wrong_order_keys, 3, kReader, &fatal,
+            nullptr, kProducer, kProducer
+        );
     const uint32_t duplicate_keys[3] = {
         pa_up_keys[0], pa_up_keys[0], pa_up_keys[2]
     };
@@ -1967,7 +2034,8 @@ void TestOrderedPreparedSymbolUsesSinglePublicationCheck() {
             nullptr, kProducer, kProducer
         );
     Check(
-        pa_up_count_rejected && pa_up_duplicate_rejected &&
+        pa_up_count_rejected && pa_up_order_rejected &&
+            pa_up_duplicate_rejected &&
             pa_up_producer_rejected &&
             map->writer_history[kReader].magic == 0 &&
             map->shared_outputs[kProducer]
@@ -2006,7 +2074,7 @@ void TestOrderedPreparedSymbolUsesSinglePublicationCheck() {
             map->shared_outputs[kProducer]
                 .last_writer[0].value == kWriter &&
             map->shared_outputs[kProducer]
-                .last_writer[1].value == kProducer,
+                .last_writer[1].value == kReader,
         "PA UP compact path preserves a failed CAS publication prefix"
     );
 

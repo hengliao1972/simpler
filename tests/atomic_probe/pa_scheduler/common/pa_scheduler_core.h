@@ -2098,47 +2098,29 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
         }
     }
 
-    // 正式 PA UP 的 writer 集合固定为同一 Alloc producer 的 slot 0/1/2。
-    // 先完整验证三项并按原 index 保存 slot，任何形状错误都在首次 GM
-    // history 写之前失败。packed slot 只存在于 owner-local 标量寄存器，
-    // 不改变共享布局，也不重排部分 CAS 失败时保留的发布前缀。
-    uint32_t pa_up_packed_slots = 0;
+    // 正式 PA UP 的 callback 按 accumulated_max/sum/output 构造参数，
+    // Prepare 又按参数 index 原序收集，所以 writer key 必须精确对应同一
+    // Alloc producer 的 slot 2/1/0。收紧为精确顺序后无需在有序区做
+    // 三次除法/取模、去重或 packed-slot 搬运；任何漂移仍在首次 GM
+    // history 写之前失败。
     if constexpr (UsePaUpShape) {
-        bool shape_valid =
-            symbol_count == 3 &&
+        const bool producer_valid =
             expected_producer >= 0 &&
             expected_producer < task_id &&
             expected_producer <
-                static_cast<int32_t>(kMaxTasks) &&
-            expected_previous >= expected_producer;
-        uint32_t seen_slots = 0;
-        PA_LOOP_NOUNROLL
-        for (uint32_t index = 0;
-             index < symbol_count && shape_valid; ++index) {
-            const uint32_t symbol_key = symbol_keys[index];
-            if (symbol_key == 0) {
-                shape_valid = false;
-                break;
-            }
-            const uint32_t packed_key = symbol_key - 1U;
-            const uint32_t producer =
-                packed_key / kSharedOutputMaxPerTask;
-            const uint32_t slot =
-                packed_key % kSharedOutputMaxPerTask;
-            const uint32_t slot_bit =
-                slot < 3 ? (1U << slot) : 0U;
-            if (producer !=
-                    static_cast<uint32_t>(expected_producer) ||
-                slot_bit == 0 ||
-                (seen_slots & slot_bit) != 0) {
-                shape_valid = false;
-                break;
-            }
-            seen_slots |= slot_bit;
-            pa_up_packed_slots |=
-                slot << (index * 2U);
-        }
-        shape_valid &= seen_slots == 0x7U;
+                static_cast<int32_t>(kMaxTasks);
+        const uint32_t key_base = producer_valid
+            ? static_cast<uint32_t>(expected_producer) *
+                  kSharedOutputMaxPerTask +
+                  1U
+            : 0U;
+        const bool shape_valid =
+            symbol_count == 3 &&
+            producer_valid &&
+            expected_previous >= expected_producer &&
+            symbol_keys[0] == key_base + 2U &&
+            symbol_keys[1] == key_base + 1U &&
+            symbol_keys[2] == key_base;
         if (!shape_valid) {
             if (fatal != nullptr) {
                 (void)TraceConfiguredAtomicExchange<
@@ -2250,9 +2232,7 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
         if constexpr (UsePaUpShape) {
             producer =
                 static_cast<uint32_t>(expected_producer);
-            slot =
-                (pa_up_packed_slots >> (index * 2U)) &
-                0x3U;
+            slot = 2U - index;
             previous =
                 static_cast<int64_t>(expected_previous);
         } else if constexpr (UseExpectedPrevious) {
