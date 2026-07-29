@@ -11815,3 +11815,101 @@ producer 和 consumer 某一侧修改错误，也不能因共用同一份常量�
 `100,670,272B` 降为 `57,023,296B`，减少
 `43,646,976B（43.35%）`。这同时减少每条通用事件的 GM 写入量和完整
 trace 缓冲规模，收益达到当前 1% 端到端门槛，因此保留 16B 方案。
+
+### 2026-07-29：消减 UP writer metadata 的重复 fatal 原子读
+
+#### 当前精确基线
+
+以当前 HEAD 重新构建并运行 shared full-swimlane B256，避免把历史 ELF
+与当前源码混算。基线结果位于：
+
+`outputs/pa_scheduler_shared_swimlane_20260729_171333_2746921/ccec`
+
+256 个 UP task 的 `register.publish_writer_metadata` 全部落在 AIV：
+
+| 指标 | min | median | p95 | max | mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 耗时（us） | 3.866 | 4.321 | 4.735 | 5.245 | 4.330 |
+
+每个 UP metadata 的固定操作形态为：
+
+- metadata fatal guard load × 1；
+- output published load × 3；
+- last-writer load × 3；
+- writer-history 单 cache line DCCI + DSB × 1；
+- last-writer CAS × 3。
+
+其中原子区间平均 `2.620 us（60.51%）`，DCCI 区间平均
+`0.231 us（5.33%）`，其余区间平均 `1.479 us（34.16%）`。DCCI 结束到
+首个 CAS 开始平均 `0.439 us`。这里的“其余区间”还包含 atomic/DCCI
+子记录自身的观察写入开销，不能全部解释成业务代码。
+
+对应的无泳道 perf-clock 基线独立运行 10 次：
+
+`2494.787、2483.266、2502.578、2516.449、2498.114、2511.163、`
+`2499.913、2530.074、2502.780、2487.401 us`
+
+中位数为 `2501.246 us`，范围为 `2483.266～2530.074 us`。
+
+#### 撤销方案：DCCI 后不回读 GM writer history
+
+第一项尝试是在 DCCI 前把三个 previous-writer 保存在本地数组中，DCCI
+后直接使用本地值发 CAS，避免再次从 GM history 读取。候选结果位于：
+
+`outputs/pa_scheduler_shared_swimlane_20260729_171849_2752513/ccec`
+
+DCCI 到首个 CAS 的间隔从 `0.439 us` 降到 `0.432 us`，但 metadata
+mean/median 为 `4.332/4.321 us`，没有实际改善；其余区间反而从
+`1.479 us` 增至 `1.548 us`。原因是 32 项本地数组、初始化和动态索引的
+开销抵消了仅三个 GM 回读的收益。该实现已完整撤销，不进入正式代码。
+
+#### 保留方案：正式 Finish 路径复用入口 fatal 判定
+
+正式 `FinishSharedWinnerSubmitBody` 在入口已经读取 fatal；随后任一
+Materialize、writer delta、output publish 或 turn wait 失败都会立即
+返回并发布 fatal，metadata 内部失败也仍会发布 fatal。因此，在这条已
+建立前置条件的正式路径里，再读取一次 metadata fatal guard 不能形成新的
+正确性边界，只会增加一次 return-ready atomic。
+
+本次把 `PublishSharedTaskWriterMetadata` 增加为带编译期
+`CheckFatal` 的模板：
+
+- 通用入口默认仍为 `CheckFatal=true`，保留独立调用和故障测试合同；
+- 只有正式 Finish 路径使用 `CheckFatal=false`；
+- 参数、task id、winner、delta 完整性等结构校验全部保留；
+- metadata 内的任一实际错误仍调用 `SetFatal`。
+
+候选 B256 full-swimlane 位于：
+
+`outputs/pa_scheduler_shared_swimlane_20260729_172328_2757209/ccec`
+
+| 指标 | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| UP metadata mean | 4.330 us | 3.993 us | -0.337 us / -7.8% |
+| UP metadata median | 4.321 us | 3.972 us | -0.349 us / -8.1% |
+| UP metadata p95 | 4.735 us | 4.320 us | -0.415 us / -8.8% |
+| full-swimlane Submit | 2736.331 us | 2467.129 us | -269.202 us / -9.8% |
+
+泳道中每个 UP metadata 现在严格为三组 published load、三组
+last-writer load、一次 history DCCI 和三组 CAS；重复 fatal 原子读已经
+消失。
+
+候选 perf-clock 独立运行 10 次：
+
+`2331.046、2343.805、2348.251、2302.317、2319.111、2321.833、`
+`2299.893、2345.928、2319.951、2330.220 us`
+
+中位数为 `2326.027 us`，范围为 `2299.893～2348.251 us`。相对基线
+中位数改善 `175.219 us（7.005%）`，两组 10 次取值范围完全分离。
+
+正确性验证：
+
+- CPU shared 全套门槛测试通过；
+- A5 shared full-swimlane B256 的 execution、semantic、history、
+  fanin、output 和后处理检查全部通过；
+- A5 mixed context `0,8192,16384,32768` 覆盖 G0/G1/G2/G4、连续 UP
+  history，execution、semantic、history 和 projection 全部通过；
+- 两组 perf-clock 共 20 个 B256 独立进程全部通过。
+
+这项修改只消减正式路径中可证明重复的原子读，不改变 writer history
+发布顺序，也不改变通用 helper 的防御性合同，作为第一项低风险优化保留。

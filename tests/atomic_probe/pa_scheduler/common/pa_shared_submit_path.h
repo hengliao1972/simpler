@@ -200,12 +200,22 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
     return true;
 }
 
-template <typename Ops>
+template <typename Ops, bool CheckFatal = true>
 PA_DEVICE bool PublishSharedTaskWriterMetadata(
     PA_GM SchedulerState *state, const SubmitContext &context,
     const SharedTaskWriterDelta &delta, LocalStats &stats
 ) {
     const int32_t task_id = context.task_id;
+    bool fatal_clear = true;
+    if constexpr (CheckFatal) {
+        fatal_clear =
+            state != nullptr &&
+            TraceAtomicLoad<Ops>(
+                stats.trace, stats.result, task_id,
+                AtomicSite::SharedMetadataFatalGuardLoad,
+                &state->fatal.value
+            ) == 0;
+    }
     if (state == nullptr || !context.won || task_id < 0 ||
         task_id >= static_cast<int32_t>(kMaxTasks) ||
         delta.prepared_task_id != task_id ||
@@ -216,11 +226,7 @@ PA_DEVICE bool PublishSharedTaskWriterMetadata(
         delta.writer_intent_required !=
             (delta.ordinary_count != 0 ||
              delta.symbol_count != 0) ||
-        TraceAtomicLoad<Ops>(
-            stats.trace, stats.result, task_id,
-            AtomicSite::SharedMetadataFatalGuardLoad,
-            &state->fatal.value
-        ) != 0) {
+        !fatal_clear) {
         if (state != nullptr) {
             SetFatal<Ops>(state, stats, task_id);
         }
@@ -607,7 +613,7 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         : TraceTimestamp<Ops>(stats.trace, stats.result);
     const bool metadata_published =
         turn_ready &&
-        PublishSharedTaskWriterMetadata<Ops>(
+        PublishSharedTaskWriterMetadata<Ops, false>(
             state, context, writer_delta, stats
         );
     const uint64_t metadata_end = metadata_published
