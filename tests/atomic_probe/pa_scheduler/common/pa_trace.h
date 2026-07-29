@@ -476,6 +476,38 @@ PA_DEVICE uint32_t DcciRegionCacheLineCount(
         : static_cast<uint32_t>(lines);
 }
 
+#if !PA_BUILD_TRACE_FREE
+// 与 CaptureAtomicCompareExchange 相同，该 helper 只执行真实 DCCI 并
+// 捕获端点，不在当前调用点写 raw。调用方可在业务发布边界完成后再调用
+// WriteDcciTrace，避免观察记录本身落入全局有序协议区。
+template <typename Ops, typename Pointer>
+PA_DEVICE uint32_t CaptureDcciFlush(
+    TraceContext &trace, Pointer address, uint64_t bytes,
+    uint64_t &trace_begin, uint64_t &trace_end
+) {
+    const uint32_t line_count =
+        DcciRegionCacheLineCount(address, bytes);
+    // 这里必须与 TraceConfiguredDcciRegion 使用相同的显式 attached
+    // 判定，不能调用 full-swimlane 下恒 true 的 TraceStorageAttached；
+    // 同一 artifact 关闭泳道运行时仍要执行真实 DCCI，但不能读写空 raw。
+    const bool observable =
+        trace.core != nullptr && trace.records != nullptr &&
+        trace.capacity != 0;
+    trace_begin = observable ? Ops::Now() : 0;
+    Ops::FlushRegion(address, bytes);
+    if (!observable) {
+        trace_end = 0;
+        return 0;
+    }
+    trace_end = Ops::Now();
+    if (line_count == 0) {
+        trace.dcci_counter_overflow = true;
+        return 0;
+    }
+    return line_count;
+}
+#endif
+
 // 区域级观察只在原 DCCI 前后各取一次时钟，并且无论区域覆盖多少条
 // cache line 都只写一条 generic 物理记录（当前构建为 16B 或 32B）。
 // begin/end 可选回传给已经存在的业务 detail span，避免同一

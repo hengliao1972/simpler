@@ -12450,3 +12450,66 @@ mean/median 为 `2310.943/2311.466 us`，范围
 - mixed context `0,8192,8193,32768` 覆盖 G0/G1/G2-partial/G4，全部
   通过；
 - 10 个 B256 perf-clock 独立进程全部通过。
+
+### 2026-07-29：延后 writer DCCI/atomic 泳道记录写入
+
+#### 观察边界
+
+上一阶段的 UP metadata 分解中，history DCCI 结束到首个 writer CAS
+开始仍约 `0.415 us`。沿代码核对后确认，这段不仅含业务地址准备，还含
+`WriteDcciRecordRaw()` 对本核泳道缓冲区的写入；三个 CAS 之间也夹有
+各自的 atomic raw 写入。因此原泳道会把“记录这条操作”的开销继续算进
+全局有序发布链。
+
+本阶段只修改 full-swimlane 观察路径：
+
+- history DCCI 与三个 return-ready CAS 仍在原位置逐条执行并读取真实
+  begin/end；
+- owner-local 临时对象只保存一组 DCCI 端点和三组 CAS 端点；
+- `deps_prepared` handoff 与 Register 业务终点完成后，再按原业务顺序
+  写一条 DCCI raw 和三条 atomic raw；
+- CAS 失败仍记录已实际执行的前缀；非 UP 不读取未初始化端点；
+- raw ABI、site/op/flags、事件数量和 converter 均不变；
+- 无 trace storage 时仍执行真实 DCCI/CAS，只是不写 raw；
+- `PA_BUILD_TRACE_FREE` 分支保持修改前的直接 DCCI/CAS 源码。
+
+该变化只减少泳道观察对有序链的扰动，不改变 shared TensorMap 协议，
+也不应被解释为真实 perf-clock 业务优化。
+
+#### A5 B256 结果
+
+候选 full-swimlane 位于：
+
+`outputs/pa_scheduler_shared_swimlane_20260729_193933_2893960/ccec`
+
+| 指标 | 延后 raw 前 | 延后 raw 后 | 变化 |
+| --- | ---: | ---: | ---: |
+| UP metadata mean | 1.706 us | 1.547 us | -0.159 us / -9.3% |
+| UP metadata median | 1.695 us | 1.546 us | -0.149 us / -8.8% |
+| DCCI end → first CAS begin | 0.415 us | 0.128 us | -0.287 us / -69.2% |
+| three writer CAS sum | 0.722 us | 0.767 us | 本轮设备波动 |
+| two CAS gaps | 0.071 us | 0.156 us | 本地端点保存仍有成本 |
+| writer CAS records | 768 | 768 | 不变 |
+| history DCCI records | 256 | 256 | 不变 |
+| AIV Finish `.text` | `0xda90` | `0xddb0` | +800 B / +1.4% |
+| full-swimlane Submit | 2443.128 us | 2451.922 us | +0.36%，单次波动 |
+
+`DCCI end → first CAS` 的 `287 ns/UP` 降幅与记录写入的原位置完全一致，
+说明本阶段确实移走了观察扰动，而不是删除了 DCCI 或 atomic。父区间只
+下降 `159 ns/UP`，因为端点缓存和三次 CAS 本身仍留在区间内。
+
+perf-clock 不用跨 ELF 时间值间接推断：在临时 detached worktree 中用
+上一提交重新构建后，逐项比较正式 AIC、AIV、两份 Finish object 和最终
+mixed kernel 的 `.text` 十六进制内容，五项均逐字节相同。整 ELF 哈希
+会受重链接元数据影响，不作为机器码证据。临时 worktree 已删除。
+
+正确性验证：
+
+- CPU shared 全套门槛全部通过；
+- CCEC shared full-swimlane 和 perf-clock 的 AIC/AIV 协议实例化、
+  split runtime/finish、mixed ELF 与零 relocation 检查通过；
+- A5 B256 的 execution、semantic、history、projection、atomic/DCCI
+  closure 和 Perfetto/exclusive 后处理全部通过；
+- mixed context `0,8192,8193,32768` 全部通过，7 条 history DCCI 与
+  21 次 writer CAS 保持原闭合关系；
+- trace-free 五个关键 `.text` 与上一提交逐字节相同。

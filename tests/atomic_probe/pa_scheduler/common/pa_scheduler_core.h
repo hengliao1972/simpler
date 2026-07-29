@@ -39,6 +39,26 @@ struct LocalStats {
     TraceContext trace;
 };
 
+#if PTO_FDWIC_SHARED_MAP && !PA_BUILD_TRACE_FREE
+// 正式 PA-UP 的 history DCCI 与三个 writer CAS 仍逐项捕获端点，但 raw
+// 写入要等 task-level handoff 之后。该对象只存在于 full-swimlane 的
+// owner 本地栈，不进入 SchedulerState、trace raw 或 host/device ABI。
+struct DeferredSharedWriterMetadataTrace {
+    uint64_t history_dcci_begin;
+    uint64_t history_dcci_end;
+    uint64_t writer_cas_begin[3];
+    uint64_t writer_cas_end[3];
+    uint32_t history_dcci_lines;
+    uint32_t writer_cas_count;
+};
+static_assert(
+    __is_trivially_constructible(
+        DeferredSharedWriterMetadataTrace
+    ),
+    "deferred writer metadata trace must remain owner-local"
+);
+#endif
+
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
 // runtime-entry TU 按核型各自拥有一份 external [[block_local]] 实例。
 // orchestration caller 与 noinline finish 只交换固定 ticket/TaskArgs，Submit
@@ -2071,6 +2091,9 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
     LocalStats *stats = nullptr,
     int32_t expected_previous = -1,
     int32_t expected_producer = -1
+#if !PA_BUILD_TRACE_FREE
+    , DeferredSharedWriterMetadataTrace *deferred_trace = nullptr
+#endif
 ) {
     // 正式 ordered Submit 在 task-level completion 成功后统一记录完整
     // transaction；本 helper 固定不产生逐项成功统计，避免部分 CAS 前缀
@@ -2222,11 +2245,28 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
         offsetof(SharedWriterHistoryCell, entries) +
         static_cast<uint64_t>(symbol_count) *
             sizeof(SharedWriterHistoryRecord);
+#if PA_BUILD_TRACE_FREE
     (void)TraceConfiguredDcciFlush<Ops, ObserveAtomics>(
         stats == nullptr ? nullptr : &stats->trace,
         task_id, -1, DcciSite::SharedWriterHistoryFlush,
         &history, history_bytes
     );
+#else
+    if (deferred_trace != nullptr && stats != nullptr) {
+        deferred_trace->history_dcci_lines =
+            CaptureDcciFlush<Ops>(
+                stats->trace, &history, history_bytes,
+                deferred_trace->history_dcci_begin,
+                deferred_trace->history_dcci_end
+            );
+    } else {
+        (void)TraceConfiguredDcciFlush<Ops, ObserveAtomics>(
+            stats == nullptr ? nullptr : &stats->trace,
+            task_id, -1, DcciSite::SharedWriterHistoryFlush,
+            &history, history_bytes
+        );
+    }
+#endif
     Ops::StoreBarrier();
 
     for (uint32_t index = 0; index < symbol_count; ++index) {
@@ -2270,6 +2310,7 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
         PA_GM volatile int64_t *last_writer =
             &map.shared_outputs[producer]
                  .last_writer[slot].value;
+#if PA_BUILD_TRACE_FREE
         if (TraceConfiguredAtomicCompareExchange<
                 Ops, ObserveAtomics
             >(
@@ -2283,6 +2324,36 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
             ) != previous) {
             return false;
         }
+#else
+        int64_t observed = INT64_MIN;
+        if (deferred_trace != nullptr && stats != nullptr &&
+            deferred_trace->writer_cas_count < 3) {
+            const uint32_t capture_index =
+                deferred_trace->writer_cas_count++;
+            observed = CaptureAtomicCompareExchange<Ops>(
+                stats->trace, last_writer, previous,
+                static_cast<int64_t>(task_id),
+                deferred_trace->writer_cas_begin[capture_index],
+                deferred_trace->writer_cas_end[capture_index]
+            );
+        } else {
+            observed =
+                TraceConfiguredAtomicCompareExchange<
+                    Ops, ObserveAtomics
+                >(
+                    stats == nullptr ? nullptr : &stats->trace,
+                    stats == nullptr ? nullptr : &stats->result,
+                    task_id,
+                    AtomicSite::SharedMetadataLastWriterCommit,
+                    last_writer,
+                    previous,
+                    static_cast<int64_t>(task_id)
+                );
+        }
+        if (observed != previous) {
+            return false;
+        }
+#endif
     }
     return true;
 }

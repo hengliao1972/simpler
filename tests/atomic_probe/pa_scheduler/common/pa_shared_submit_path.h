@@ -250,6 +250,9 @@ PA_DEVICE bool PublishSharedTaskWriterMetadata(
     const SharedTaskWriterDelta &delta, LocalStats &stats,
     int32_t expected_previous = -1,
     int32_t expected_producer = -1
+#if !PA_BUILD_TRACE_FREE
+    , DeferredSharedWriterMetadataTrace *deferred_trace = nullptr
+#endif
 ) {
     static_assert(
         !UsePaUpShape || UseExpectedPrevious,
@@ -331,6 +334,9 @@ PA_DEVICE bool PublishSharedTaskWriterMetadata(
             state->shared_map, delta.symbol_keys,
             delta.symbol_count, task_id, &state->fatal.value,
             &stats, expected_previous, expected_producer
+#if !PA_BUILD_TRACE_FREE
+            , deferred_trace
+#endif
         )) {
         SetFatal<Ops>(state, stats, task_id);
         return false;
@@ -685,6 +691,13 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
             &state->shared_map.writer_history[task_id]
         );
     }
+#if !PA_BUILD_TRACE_FREE
+    // 只初始化实际会写入的计数；每组端点在对应 DCCI/CAS 执行时覆盖，
+    // 避免为每个非 UP winner 清零整块 72B 本地对象。
+    DeferredSharedWriterMetadataTrace writer_metadata_trace;
+    writer_metadata_trace.history_dcci_lines = 0;
+    writer_metadata_trace.writer_cas_count = 0;
+#endif
     EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(
         pmu_context
     );
@@ -729,6 +742,9 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
             state, context, writer_delta, stats,
             expected_previous,
             static_cast<int32_t>(task_meta.batch_start)
+#if !PA_BUILD_TRACE_FREE
+            , &writer_metadata_trace
+#endif
         );
     const uint64_t metadata_end = metadata_published
         ? TraceTimestamp<Ops>(stats.trace, stats.result)
@@ -763,6 +779,37 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     EndSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(
         pmu_context
     );
+#if !PA_BUILD_TRACE_FREE
+    // task[N].deps_prepared 已经完成 CAS handoff，下一 owner 可开始推进；
+    // 现在才落 history DCCI 和三个 writer CAS 的 raw，既保留逐操作端点
+    // 与事件数量，也不再让 16B 记录写入延长全局有序发布链。
+    if (writer_metadata_trace.history_dcci_lines != 0) {
+        (void)WriteDcciTrace(
+            stats.trace, static_cast<int32_t>(task_id), -1,
+            DcciSite::SharedWriterHistoryFlush,
+            DcciOp::CleanOut, /*trailing_dsb=*/true,
+            writer_metadata_trace.history_dcci_lines,
+            writer_metadata_trace.history_dcci_begin,
+            writer_metadata_trace.history_dcci_end
+        );
+    }
+    if (AtomicSwimlaneEnabled(stats.trace)) {
+        PA_LOOP_NOUNROLL
+        for (uint32_t index = 0;
+             index < writer_metadata_trace.writer_cas_count;
+             ++index) {
+            WriteAtomicTrace<Ops>(
+                stats.trace, stats.result,
+                static_cast<int32_t>(task_id),
+                AtomicSite::SharedMetadataLastWriterCommit,
+                AtomicOp::CompareExchange,
+                writer_metadata_trace.writer_cas_begin[index],
+                writer_metadata_trace.writer_cas_end[index],
+                true, Ops::kAtomicReturnReadyObserved
+            );
+        }
+    }
+#endif
     // 所有端点完成后再按业务顺序写 raw，避免写 trace 本身落入
     // Materialize/Register 的测量区间。Materialize 的 output detail
     // 还原独占 cell 发布；Register 只闭合 wait、writer metadata 与
