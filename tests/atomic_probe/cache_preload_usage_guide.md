@@ -2,13 +2,16 @@
 
 ## 1. 当前交付边界
 
-本目录现在提供两套可独立构建和运行的对等用例：
+本目录现在提供三套可独立构建和运行的用例：
 
 - CCEC 用例直接调用编译器 intrinsic，不包含 `kernel_operator.h`；
 - AscendC 的被测 preload 调用使用公开 `kernel_operator.h` API；冷态构造、发布边界和
   校验还显式使用 `dcci`、`dsb` 与 bypass load/store；
-- 两者复用同一套 mode、host/device ABI、输入、checksum oracle、冷态构造和
-  raw `SYS_CNT` 统计口径，以便区分“API 用法差异”和“测试模型差异”。
+- 上述两者复用同一套 mode、host/device ABI、输入、checksum oracle、冷态构造和
+  raw `SYS_CNT` 统计口径，以便区分“API 用法差异”和“测试模型差异”；
+- 第三套是纯 CCEC 的 `1:2` mixed 持续写探针，用与 PA 泳道相同的 32 B
+  七字段 record、独占 cacheline 和最终逐行发布口径，专门回答单条 store
+  microprobe 没有覆盖的连续写问题。
 
 用户口语中的 `icache_pretch`、`dcache_pretch` 不是当前 CANN 头文件中的符号。正确检索词是：
 
@@ -24,6 +27,10 @@
 - CCEC DCache 普通 GM load 中位数为 `316 -> 5`，AscendC 为 `295 -> 5` raw ticks；
 - store-only 场景只计到普通 store 被接受：CCEC、AscendC 均为 `2 -> 2`
   raw ticks，完整区间没有收益；
+- 新增的持续顺序写探针复刻泳道记录的物理形态：96 核各写 120 KiB、每条
+  32 B、每 cacheline 两条记录；提前 16 条 cacheline 的 `dc_preload`
+  使最慢核 store 发射窗口下降 `40.436%`，包含最终逐行
+  `CACHELINE_OUT + DSB` 的总窗口下降 `30.460%`；
 - publish-to-GM 场景包含 `CACHELINE_OUT + DSB`：CCEC 的 `store->GM` 为
   `512 -> 206`，AscendC 为 `343 -> 121` raw ticks；
 - CCEC ICache 同一物理指令区中位数为 `975 -> 484`，AscendC 为
@@ -33,9 +40,11 @@
 - 立即轮询等待没有降低目标工作区间；两次有效运行中完整区间的微小差异方向并不
   一致，不能解释为 wait 收益。
 
-因此当前证据必须按场景表述：preload 对本探针的普通读和“普通 store 后发布到
-GM”的完整序列有效，但没有证明 store-only 受益。这些是当前 microprobe 的真机
-观察，不是 PA 或其他业务的固定收益承诺。
+因此当前证据必须按场景表述：单条 cold-line store 被 Scalar/store queue 接受的
+窗口没有观察到收益；这不能外推为持续写也无收益。持续顺序写超过每核 DCache
+容量后，提前预取未来 cacheline 可以减少 store-side 停顿，但没有降低最终
+`DCCI + DSB` 发布段。这些仍是 microprobe 的真机观察，不是 PA Submit 的固定收益
+承诺；真实泳道路径还需要带编译开关的端到端 A/B。
 
 ## 2. 文件与运行方式
 
@@ -47,15 +56,20 @@ GM”的完整序列有效，但没有证明 store-only 受益。这些是当前
 | `ccec/run_cache_preload.sh` | CCEC 独立构建、最终 ELF 门禁和定向运行 |
 | `ascendc/cache_preload_probe.asc` | AscendC AIV kernel、host launcher 和校验 |
 | `ascendc/run_cache_preload.sh` | AscendC 独立构建、嵌入 AICore ELF 门禁和定向运行 |
+| `trace_write_preload_shared.h` | 持续泳道写探针的 32 B record、控制块和结果 ABI |
+| `ccec/trace_write_preload.cpp` | 1:2 mixed CCEC kernel；复刻七字段顺序写与最终逐行发布 |
+| `ccec/trace_write_preload_host.cpp` | 96 核/单核策略矩阵、payload 全量回读和容量拐点校验 |
+| `ccec/run_trace_write_preload.sh` | 持续泳道写探针的独立构建、mixed ELF 门禁和运行入口 |
 
 从仓库根目录运行：
 
 ```bash
 tests/atomic_probe/ccec/run_cache_preload.sh
 tests/atomic_probe/ascendc/run_cache_preload.sh
+tests/atomic_probe/ccec/run_trace_write_preload.sh
 ```
 
-两套脚本都可以拆开：
+三套脚本都可以拆开：
 
 ```bash
 tests/atomic_probe/ccec/run_cache_preload.sh build
@@ -63,11 +77,16 @@ tests/atomic_probe/ccec/run_cache_preload.sh run
 
 tests/atomic_probe/ascendc/run_cache_preload.sh build
 tests/atomic_probe/ascendc/run_cache_preload.sh run
+
+tests/atomic_probe/ccec/run_trace_write_preload.sh build
+tests/atomic_probe/ccec/run_trace_write_preload.sh run
 ```
 
-脚本是独立入口，没有修改 `ccec/run_all.sh`，也不会误跑目录内其他探针。AscendC
-runner 会从可执行文件提取 `.aicore_binary`，再对实际执行的 `.vector` 符号做尺寸、
-对齐和地址不重叠检查，不能用 host ELF 的表面尺寸替代该门禁。
+三个脚本都是独立入口，没有修改 `ccec/run_all.sh`，也不会误跑目录内其他探针。
+AscendC runner 会从可执行文件提取 `.aicore_binary`，再对实际执行的 `.vector`
+符号做尺寸、对齐和地址不重叠检查，不能用 host ELF 的表面尺寸替代该门禁。持续写
+runner 则检查最终 ELF 同时存在 AIC/AIV 入口及其 `1:2` mixed metadata，32 个物理
+block 实际形成 32 AIC + 64 AIV。
 
 ## 3. 已查证的接口语义
 
@@ -318,6 +337,50 @@ evictor，再从同一个 current-PC path 进入以下三种动态路径：
 所有结果都报告 raw `SYS_CNT` delta。本轮没有把 raw tick 按 1 GHz、1.65 GHz 或其他假设频率换算
 成 ns。
 
+### 4.5 持续泳道写与 DCache 容量对照
+
+单条 store 的 `2 -> 2` 只能回答“一个 ordinary store 何时能继续执行后续 Scalar
+指令”，不能覆盖以下持续写行为：
+
+- 连续触及新的 cold cacheline；
+- dirty line 超出 DCache 容量后逐步被替换；
+- store queue、DCache miss 和写回流量形成反压；
+- 最后对完整有效区间逐行执行 `DCCI(CACHELINE_OUT)`，再以一次 DSB 收口。
+
+因此持续写探针不复用单 word mode，而是建立与当前 PA trace 相同的物理 record：
+
+```cpp
+struct alignas(32) TraceRecord {
+    uint64_t start_cycle;
+    uint64_t end_cycle;
+    int32_t task_id;
+    int32_t function_id;
+    uint32_t flags;
+    uint16_t phase;
+    uint16_t auxiliary;
+};
+static_assert(sizeof(TraceRecord) == 32);
+```
+
+每条 record 分别执行 7 个 ordinary scalar GM 字段 store；两个连续 record 恰好填满
+一条 64 B cacheline。每核拥有独立且 64 B 对齐的 128 KiB 区间，不存在跨核同 line
+竞争。被测窗口分成：
+
+1. `issue`：从第一条 record 写入前到最后一条 ordinary store 之后；
+2. `flush`：对全部有效 cacheline 逐行 `CACHELINE_OUT`，再执行 DSB；
+3. `total = issue + flush`。
+
+preload 策略写成 `dN-cM`：`dN` 表示预取当前写位置之后 N 条 cacheline，`cM`
+表示每 M 条 cacheline 发起一次 hint。例如 `d16-c1` 是每写一条 line 时，为未来
+第 16 条 line 发起一次 `dc_preload`。预取指令本身包含在 `issue` 窗口内，不能靠
+移出计时区间制造收益。每个策略的首轮还会把所有有效 record 从 GM 全量回读，逐字段
+验证预期值；每次 launch 都校验 96 个 mixed worker 的结果或未参与者零值。
+
+同一探针还提供随机依赖 pointer-cycle 容量扫描。每条 cacheline 只保存下一条 line
+编号，下一次 load 地址依赖上一次结果，从而避免把顺序硬件预取误认为 DCache 容量。
+每个 working set 先 cold 遍历一次，再立即重复遍历 8 次；这里只用复用延迟的容量
+拐点判断有效 resident set，不把单次 raw tick 直接换算为 ns。
+
 ## 5. 2026-07-29 A5 实测结果
 
 环境：
@@ -403,8 +466,9 @@ PASS。
   `+16`、`-6` raw ticks，方向反转；CCEC 分别为 `+53`、`+16`，只能判为小开销或波动，
   不能证明 wait 有收益。
 
-两套实现的变化方向一致：提前 preload 对普通读和本探针的 publish-to-GM 序列有
-收益，但对 store-only 没有可见净收益。本轮数据也不支持 ICache preload 后立即等待。
+两套单 word 实现的变化方向一致：提前 preload 对普通读和本探针的 publish-to-GM
+序列有收益，但对单条 store-only 没有可见净收益。本轮数据也不支持 ICache
+preload 后立即等待。这里不能替代 5.3 节对持续顺序写的独立结论。
 
 publish-to-GM 的下降与“预先把 line 带入 DCache，随后普通 store 和 dirty-line clean
 不再从 cold line 起步”这一解释相符，但探针没有直接观测内部 write-allocate/store
@@ -417,13 +481,101 @@ CCEC 与 AscendC 的绝对 tick 不应彼此直接做 API 成本归因。两者�
 ### 5.2 不能下的结论
 
 - 不能把任一 microprobe 的下降幅度外推成 PA Submit 的固定收益；
-- 不能用 publish-to-GM 的收益证明 store-only、bypass store、atomic、整 line 写或
-  多次连续写也会受益；
+- 不能只用单 word publish-to-GM 的收益证明 store-only、bypass store、atomic、整
+  line 写或多次连续写也会受益；持续顺序写的证据来自 5.3 节独立探针；
 - 不能假设每次 preload 都会执行；官方明确允许 DCache hint 在拥塞时按 NOP 处理；
 - 不能把 preload 当成数据一致性、发布、内存顺序或跨核同步；
 - 不能把 raw tick 未经计数器频率校准直接换成时间；
 - 不能把 CCEC/AscendC 绝对值之差只归因于 API wrapper；
 - 不能只看 ICache miss 降低而忽略新增指令和 `.text` 布局变化。
+
+### 5.3 持续顺序写的补充实验
+
+运行环境和证据身份：
+
+| 项目 | 值 |
+| --- | --- |
+| 实验日期 | `2026-07-29` |
+| 运行时 Git HEAD | `f0903f6f68743606e70bba983923aec4a476f3b6` |
+| 分支 | `fdwic-swimlane-exclusive`，跟踪 `origin/fdwic-swimlane-deps` |
+| CANN/CCEC | `9.1.0-weekly-20260708` / clang 15.0.5 |
+| 最终 mixed kernel SHA256 | `b98c6c912d3533d19705e23e13c9b298a5915a62651f9ec02d19949a4d8a34c6` |
+| topology | 32 个物理 block，`1 AIC : 2 AIV`，总计 96 worker |
+| 主工作集 | 每核 120 KiB，即 3,840 records / 1,920 cachelines |
+| 计时单位 | raw `SYS_CNT`；百分比不依赖频率换算 |
+| 设备隔离 | 当前 shell 没有 `task-submit`/`npu-smi`；按已有用户授权在 device 0 未加锁直跑 |
+
+第一轮用 9 个交错样本扫描预取距离和发起密度。下表的 `critical` 是每次 launch
+先取 96 核最大值、再跨样本取中位数；它不会把所有核的 duration 相加。
+
+| 策略 | critical issue | critical total | 相对 baseline total |
+| --- | ---: | ---: | ---: |
+| baseline | 85,903 | 114,491 | 0 |
+| `d1-c1` | 89,498 | 117,812 | +2.901% |
+| `d2-c1` | 67,650 | 95,821 | -16.307% |
+| `d4-c1` | 54,502 | 83,081 | -27.435% |
+| `d8-c1` | 53,912 | 82,248 | -28.162% |
+| `d16-c1` | 51,097 | 79,561 | **-30.509%** |
+| `d4-c4` | 63,771 | 92,264 | -19.414% |
+| `d8-c4` | 64,811 | 93,471 | -18.359% |
+| `d16-c4` | 67,469 | 95,979 | -16.169% |
+
+`d1-c1` 说明“调用了 preload”不等于会加速：只提前一条 line 时，hint 成本已经进入
+关键路径，却没有留下足够的重叠窗口。`d16-c1` 是本次已测试集合中的最优点，不是
+所有代码布局、记录密度或硬件负载下的固定参数。
+
+随后将 baseline 与 `d16-c1` 交错运行 21 个确认样本：
+
+| 96 核、每核 120 KiB | baseline | `d16-c1` | 变化 |
+| --- | ---: | ---: | ---: |
+| critical issue | 85,888 | 51,158 | **-40.436%** |
+| 每核 issue 中位数 | 83,552 | 49,589 | -40.649% |
+| 每核最终 flush 中位数 | 27,787 | 27,735 | -0.187% |
+| critical total | 114,519 | 79,636 | **-30.460%** |
+| 设备阶段完整 span | 115,171 | 80,254 | -30.318% |
+| host launch + stream sync 中位数 | 132.268 us | 99.988 us | -24.405% |
+
+最终 flush 段基本不变，把收益边界定位在 ordinary store 发射阶段，而不是
+`DCCI(CACHELINE_OUT)+DSB`。这与“提前把未来 cold line 带入本核 DCache，持续写时
+减少 store-side 等待/反压”的机制解释一致；本探针没有采集 DCache miss 或 store
+queue PMU，因此不能把该内部原因写成直接观测事实。
+
+工作集和核类型对照同样保持相同方向：
+
+| 对照 | critical issue 变化 | critical total 变化 |
+| --- | ---: | ---: |
+| 96 核、每核 96 KiB，13 样本 | `69,141 -> 40,696`，-41.141% | `96,873 -> 68,251`，-29.546% |
+| 单 AIC、每核 120 KiB，13 样本 | `84,695 -> 50,163`，-40.772% | `112,232 -> 77,630`，-30.831% |
+| 单 AIV、每核 120 KiB，13 样本 | `85,329 -> 50,491`，-40.828% | `113,024 -> 78,114`，-30.887% |
+
+每个策略首个样本都全量回读有效 record 并校验七个字段；所有 launch 的 mixed
+topology、结果 echo、GM publication、pointer cycle 和 cleanup 均为 PASS。
+
+随机依赖容量扫描得到：
+
+| working set | AIC reuse ticks/load | AIV reuse ticks/load |
+| --- | ---: | ---: |
+| 4 KiB | 246.148 | 246.133 |
+| 8 KiB | 246.103 | 246.100 |
+| 12 KiB | 246.083 | 246.087 |
+| 16 KiB | 246.076 | 246.078 |
+| 20 KiB | 295.791 | 296.135 |
+| 24 KiB | 328.494 | 328.778 |
+| 32 KiB | 329.346 | 331.048 |
+| 64 KiB | 328.449 | 329.654 |
+
+16 KiB 以内复用延迟稳定，20 KiB 开始退化，24 KiB 后已经接近本探针约
+`325-331 ticks/load` 的 cold traversal。因此本机 A5 的 AIC/AIV Scalar DCache 在该
+随机依赖访问模型下都呈现约 **16 KiB 有效容量拐点**。这是实测 effective resident
+set，不等价于对所有地址映射、关联冲突和未来 SKU 声明精确架构容量。
+
+这组实验修正了“纯写不能 preload”的过度结论：
+
+- 单条 ordinary store 没有收益，只代表其立即接受窗口；
+- 大于 DCache 容量的持续、独占、顺序 cold-line 写可以从足够提前的 preload 获益；
+- preload 不减少最终发布成本，也不能替代 DCCI/DSB；
+- 当前约 30% 是隔离的紧凑连续写模型收益，不能直接写成 PA Submit 收益。真实
+  TraceWriter 仍需以编译开关接入相同策略，并用同一业务输入做 level 4 端到端 A/B。
 
 ## 6. Preload 不能替代什么
 
@@ -458,7 +610,8 @@ CCEC 与 AscendC 的绝对 tick 不应彼此直接做 API 成本归因。两者�
 - 要求 dirty line 在本次发布到 GM 时，应看 `dpublish-gm-*` 的 `store->GM` 和
   `total`，且业务仍必须保留既有 DCCI/DSB；
 - 单次 store 探针不覆盖连续写把 store queue 压满后的吞吐，也不覆盖 bypass store、
-  atomic 或多核同 line 写。
+  atomic 或多核同 line 写；连续、独占、顺序 cacheline 写应使用本目录的
+  `trace_write_preload` 探针，但它仍不覆盖跨核同 line 竞争。
 
 ICache A/B 要特别检查 `.text` 扰动。新增 preload、状态读取或诊断打点都会改变指令数和分支地址；
 不能用还包含其他代码差异的两个 ELF，把全部变化归因给 preload。
