@@ -747,7 +747,7 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         (writer_delta.symbol_count == 0 ||
          // history payload 已在 Materialize 尾部完成 DCCI；取得 turn 后
          // 只用三次 return-ready CAS 发布各 accumulator 的 latest writer。
-         CommitTrustedPaUpLastWriters<Ops, true>(
+         CommitTrustedPaUpLastWriters<Ops, true, true>(
             state->shared_map, static_cast<int32_t>(task_id),
             expected_previous,
             static_cast<int32_t>(task_meta.batch_start), &stats

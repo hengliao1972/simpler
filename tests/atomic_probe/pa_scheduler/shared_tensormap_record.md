@@ -12597,3 +12597,56 @@ mean/median 为 `2311.580/2312.574 us`，范围
   closure 和 Perfetto/exclusive 后处理全部通过；
 - mixed context `0,8192,8193,32768` 全部通过；
 - 10 个 B256 perf-clock 独立进程全部通过。
+
+### 2026-07-29：收敛 full-swimlane 的三次 CAS 端点捕获
+
+#### 修改范围
+
+history 移出有序段后，UP metadata 的两段 CAS 间隙仍合计约
+`0.141 us`。正式 full-swimlane 已经保证传入 owner-local deferred
+capture，因此不需要在每次 CAS 前重复执行：
+
+- `deferred_trace != nullptr`；
+- `stats != nullptr`；
+- `writer_cas_count < 3`；
+- 成功路径逐项读取并递增 count。
+
+本阶段保留原 `NOUNROLL` 三次循环，直接按固定 `index` 写入 begin/end；
+三项全成功后一次设置 `writer_cas_count=3`，失败时才保存
+`index+1`。没有显式展开三套 CAS；此前固定次数展开曾造成
+`.text +896 B`、metadata 回退 4.8%，本次不重复该负例。raw、时间端点、
+部分 CAS 记录和协议操作均不变，trace-free 继续使用原分支。
+
+#### A5 B256 结果
+
+正式 Perfetto 采集位于：
+
+`outputs/pa_scheduler_shared_swimlane_20260729_200444_2918917/ccec`
+
+| 指标 | 通用 deferred 判断 | 可信 deferred 专路 | 变化 |
+| --- | ---: | ---: | ---: |
+| UP metadata mean | 0.948 us | 0.851 us | -0.097 us / -10.2% |
+| UP metadata median | 0.892 us | 0.865 us | -0.028 us / -3.1% |
+| two CAS gaps mean | 0.141 us | 0.039 us | -0.103 us / -72.5% |
+| three writer CAS sum | 0.746 us | 0.768 us | 本轮设备波动 |
+| AIV Finish `.text` | `0xdd00` | `0xdc10` | -240 B |
+
+为避免用单次 Submit 波动掩盖整体影响，另跑两次不做 Perfetto 转换的
+完整 B256 raw。三次 metadata mean 为
+`0.851、0.846、0.847 us`，分布稳定；三次 full-swimlane Submit 为
+`2452.023、2456.902、2435.237 us`，中位数 `2452.023 us`，与候选前
+单次 `2451.922 us` 基本一致。该阶段减少的是观察端点 bookkeeping，
+不改变总业务工作。
+
+在修改前保存 perf-clock 五个关键 object 的 `.text` 哈希，修改后重构建
+逐项比较：正式 AIC、AIV、两份 Finish 和最终 mixed kernel 全部逐字节
+相同。因此不重复运行与本候选无关的 perf-clock 时间采样。
+
+正确性验证：
+
+- CPU shared 全套门槛全部通过；
+- CCEC shared full-swimlane 与 perf-clock 构建全部通过；
+- 三次 A5 B256 的 execution、semantic、history、projection 和
+  atomic/DCCI closure 全部通过；
+- writer CAS 与 history DCCI 数量保持 `768/256`；
+- trace-free 五个关键 `.text` 逐字节不变。

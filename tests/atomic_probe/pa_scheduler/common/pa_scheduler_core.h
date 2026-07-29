@@ -2148,7 +2148,10 @@ PA_DEVICE bool PublishTrustedPaUpWriterHistoryPayload(
 // 正式 PA-UP 专路的第二段：上面的 payload 已经 DCCI+DSB 完成，且
 // predecessor turn 已由调用方取得。成功路径只按固定 2/1/0 顺序执行
 // 三次 return-ready CAS；不再读取或写回 writer_history。
-template <typename Ops, bool ObserveAtomics = false>
+template <
+    typename Ops, bool ObserveAtomics = false,
+    bool TrustDeferredTrace = false
+>
 PA_DEVICE bool CommitTrustedPaUpLastWriters(
     PA_GM SharedTensorMapSidecar &map, int32_t task_id,
     int32_t expected_previous, int32_t expected_producer,
@@ -2179,8 +2182,20 @@ PA_DEVICE bool CommitTrustedPaUpLastWriters(
         }
 #else
         int64_t observed = INT64_MIN;
-        if (deferred_trace != nullptr && stats != nullptr &&
-            deferred_trace->writer_cas_count < 3) {
+        if constexpr (TrustDeferredTrace) {
+            // 正式 full-swimlane 调用已经提供 owner-local capture。直接用
+            // 固定循环 index 保存端点，避免在三次 CAS 之间重复判空、
+            // 读取 count 和逐项递增；循环仍禁止展开，防止复制三套
+            // atomic 观察代码。
+            observed = CaptureAtomicCompareExchange<Ops>(
+                stats->trace, last_writer,
+                static_cast<int64_t>(expected_previous),
+                static_cast<int64_t>(task_id),
+                deferred_trace->writer_cas_begin[index],
+                deferred_trace->writer_cas_end[index]
+            );
+        } else if (deferred_trace != nullptr && stats != nullptr &&
+                   deferred_trace->writer_cas_count < 3) {
             const uint32_t capture_index =
                 deferred_trace->writer_cas_count++;
             observed = CaptureAtomicCompareExchange<Ops>(
@@ -2205,10 +2220,18 @@ PA_DEVICE bool CommitTrustedPaUpLastWriters(
                 );
         }
         if (observed != expected_previous) {
+            if constexpr (TrustDeferredTrace) {
+                deferred_trace->writer_cas_count = index + 1U;
+            }
             return false;
         }
 #endif
     }
+#if !PA_BUILD_TRACE_FREE
+    if constexpr (TrustDeferredTrace) {
+        deferred_trace->writer_cas_count = 3U;
+    }
+#endif
     return true;
 }
 
