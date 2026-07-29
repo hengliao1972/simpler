@@ -12650,3 +12650,112 @@ capture，因此不需要在每次 CAS 前重复执行：
   atomic/DCCI closure 全部通过；
 - writer CAS 与 history DCCI 数量保持 `768/256`；
 - trace-free 五个关键 `.text` 逐字节不变。
+
+### 2026-07-29：PA accumulator 使用单 group-writer CAS
+
+#### 为什么可以合并
+
+正式 PA 的三个 accumulator 都由同一 batch Alloc 产生，UP callback
+固定按 `max/sum/output`，即 slot `2/1/0`，同时把三者推进到同一个
+writer task。现有 shape 门槛还逐项证明：
+
+- writer key 恰好是同一 Alloc producer 的 slot `2/1/0`；
+- 三条 history 的 `previous_writer` 完全相同；
+- 每组恰好一个 UP owner，且 owner 取得严格 task-id insert turn 后才
+  发布 latest writer。
+
+因此这三条 writer 链在正式 PA 中没有合法的部分推进状态。generation 12
+只把 Alloc `last_writer[0]` 解释为这组三个 accumulator 的 group latest：
+
+1. Materialize 仍写入三条 slot-specific immutable history record，并
+   保留原单行 DCCI + DSB；
+2. Register 取得前序 insert completion 后，只对
+   `Alloc.last_writer[0]` 做一次 expected-old CAS；
+3. 正式 PA resolver 对“producer 等于本 batch Alloc 且 slot<3”的引用
+   统一读取 group word，但沿 history 回退时仍使用原 slot key；
+4. generic shared resolver/writer 继续逐 slot 读写，未改成 group 语义。
+
+单次 CAS 仍消费并校验返回值；若 observed 不等于 expected previous，
+整轮进入 terminal fatal 且不发布本 task 的 insert completion。相比旧
+三 CAS 协议，失败不再存在“前一两槽已经发布、后一槽失败”的部分前缀。
+不能为了再省约 0.25 us 改成不消费返回值的 Exchange/普通 store：那会
+失去 expected-old 校验，并把协议破坏推迟到后继或 host 才发现。
+
+物理布局、raw trace schema、AtomicSite 编号和 WorkerResult 大小均不变；
+但 `last_writer[1/2]` 的正式 PA 解释已经改变，因此 shared ABI generation
+从 11 升到 12，private 仍为 4。host 最终态要求：
+
+- Alloc slot0 为该 batch 的 final UP；
+- Alloc slot1/2 保持 Alloc task id；
+- normalized writer signature 将 slot0 的同一 group writer 投影到三个
+  canonical accumulator，继续与 private 的业务签名对等。
+
+`shared_symbol_inout_commits` 仍统计三次逻辑 symbol 提交；物理 site27
+则从每组 3 次降为每组 1 次。host 分析不增加任何 raw 字段，直接用现有
+atomic 事件闭合 `AIC=0、AIV=total_groups`，避免混淆两种口径。
+
+#### CPU、CCEC 与混合形态门槛
+
+新增/调整的 CPU 门槛覆盖：
+
+- 成功路径只调用一次 CAS，地址精确为 Alloc slot0；
+- slot1/2 保持 producer，正式 PA 的三个引用仍都解析到当前 writer；
+- 当前 writer 查询自身输入时，三条原 symbol key 都能沿 history 回到
+  previous writer；
+- CAS mismatch 不产生任何部分 symbol 发布；
+- generic slot1 resolver 仍看到真实 slot1，而不是 PA group word；
+- ordered-submit 仍允许后续 owner 的 lookup/Build 越过前序 Build，
+  17 个 task、四类 kernel 和依赖签名全部闭合。
+
+CPU shared 全套门槛、CCEC AIC/AIV generic probe、split runtime/finish、
+最终 mixed ELF、perf-clock 构建及 generation-12 shared-protocol-litmus
+均通过。A5 mixed context `0,8192,8193,32768` 覆盖
+G0/G1/G2-partial/G4，共 7 个 UP，实测 site27 为 `7`、逻辑 symbol
+commit 为 `21`，7 条 CAS 全部是 return-ready，execution/semantic/
+postprocess 均 PASS。
+
+#### A5 B256 泳道结果
+
+正式 Perfetto 采集位于：
+
+`outputs/pa_scheduler_shared_swimlane_20260729_202747_2943001/ccec`
+
+| 指标 | 三次 per-slot CAS | 单次 group CAS | 变化 |
+| --- | ---: | ---: | ---: |
+| UP metadata mean | 0.851 us | 0.269 us | -0.583 us / -68.4% |
+| UP metadata median | 0.865 us | 0.272 us | -0.593 us / -68.6% |
+| UP metadata p95 | 1.041 us | 0.329 us | -0.712 us / -68.4% |
+| 每 UP writer CAS 合计 mean | 0.768 us | 0.252 us | -0.516 us / -67.2% |
+| site27 物理 CAS | 768 | 256 | -66.7% |
+| history DCCI | 256 | 256 | 不变 |
+| AIV Finish `.text` | `0xdc10` | `0xdc18` | +8 B |
+| full-swimlane Submit | 2452.023 us（三次中位） | 2453.661 us（单次） | 基本相同 |
+
+逐 task 关系也精确闭合：256 个 UP metadata 各包含且只包含一条同 task、
+同 lane 的 group CAS；全部 256 条 CAS 都落在对应 metadata 内。history
+DCCI 仍是 256 条、每条一次调用和一条 cache line，没有用删 history
+或观察记录来伪造收益。
+
+以用户指定的原始对照
+`pa_scheduler_shared_swimlane_20260729_154301_2671167` 重新取数，
+UP metadata mean 为 `4.347 us`；当前为 `0.269 us`，累计下降
+`4.078 us（93.8%）`。
+
+当前 metadata 内的 group CAS mean 为 `0.252 us`，父区间 mean 为
+`0.269 us`，除真实 return-ready CAS 外只剩约 `0.017 us`。因此后续
+若继续针对这一父区间，只应实验能降低这一次 CAS 访存代价的候选；继续
+消减普通 scalar bookkeeping 已没有足够空间。
+
+#### perf-clock 端到端
+
+10 个独立 B256 进程：
+
+`2321.516、2305.680、2300.143、2304.867、2319.485、2289.008、`
+`2306.741、2283.941、2313.181、2332.230 us`
+
+mean/median 为 `2307.679/2306.211 us`，范围
+`2283.941～2332.230 us`。上一阶段同口径 10 次为
+`2311.580/2312.574 us`；mean 下降 `3.901 us（0.169%）`，median
+下降 `6.363 us（0.275%）`。幅度仍处于设备波动量级，不能宣称明确的
+端到端收益，但方向没有回退且远低于 1% 撤回门槛；结合物理 CAS 次数和
+有序区局部耗时的确定性下降，本阶段保留。

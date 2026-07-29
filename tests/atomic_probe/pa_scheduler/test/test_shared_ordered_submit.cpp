@@ -864,12 +864,16 @@ bool RunInsertReleaseBeforeBuildTest() {
             state->tasks[task].deps_prepared ==
             static_cast<int64_t>(task);
     }
-    bool final_writers_ok = true;
-    for (uint32_t slot = 0; slot < 3; ++slot) {
-        final_writers_ok &=
-            state->shared_map.shared_outputs[0]
-                .last_writer[slot].value == 16;
-    }
+    // 正式 PA 将三个 lockstep accumulator 的 latest 收敛为 slot0 的
+    // group word；slot1/2 保持 Alloc producer，供 generic slot-specific
+    // resolver 继续遵守原合同。
+    const bool final_group_writer_ok =
+        state->shared_map.shared_outputs[0]
+            .last_writer[0].value == 16 &&
+        state->shared_map.shared_outputs[0]
+            .last_writer[1].value == 0 &&
+        state->shared_map.shared_outputs[0]
+            .last_writer[2].value == 0;
 
     const bool overlap =
         OrderedSubmitTestOps::task8_built_before_task4_completion.load(
@@ -891,7 +895,7 @@ bool RunInsertReleaseBeforeBuildTest() {
             std::memory_order_relaxed
         ) &&
         overlap && worker_results_ok && all_tasks_ready &&
-        claim_cells_match && final_writers_ok &&
+        claim_cells_match && final_group_writer_ok &&
         kernel_counts[0] == 4 && kernel_counts[1] == 4 &&
         kernel_counts[2] == 4 && kernel_counts[3] == 4 &&
         pa_scheduler::host::FinalBarrierStateMatches(

@@ -132,6 +132,24 @@ std::atomic<uint64_t> SymbolTestOps::wait_loads{0};
 std::atomic<uint64_t> SymbolTestOps::now_calls{0};
 std::atomic<uint64_t> SymbolTestOps::spin_calls{0};
 
+// 定向验证 PA group-writer 只触发一次物理 CAS，且目标固定为 Alloc
+// output cell 的 slot0；通用 symbol helper 继续使用 SymbolTestOps。
+struct GroupWriterCountingOps : SymbolTestOps {
+    static std::atomic<uint32_t> compare_exchange_calls;
+    static volatile int64_t *compare_exchange_address;
+
+    static int64_t CompareExchange(
+        volatile int64_t *address, int64_t expected, int64_t desired
+    ) {
+        compare_exchange_address = address;
+        compare_exchange_calls.fetch_add(1, std::memory_order_relaxed);
+        return SymbolTestOps::CompareExchange(address, expected, desired);
+    }
+};
+
+std::atomic<uint32_t> GroupWriterCountingOps::compare_exchange_calls{0};
+volatile int64_t *GroupWriterCountingOps::compare_exchange_address = nullptr;
+
 // 把第二次读钟直接推进到 watchdog 期限之后，避免用真实 2 秒等待测试
 // timeout 终止语义。
 struct ExpiredWaitOps : SymbolTestOps {
@@ -1805,21 +1823,24 @@ void TestPaUpSplitWriterPublicationStages() {
 
     TaskArgs early_reader_args;
     ConstructTaskArgs(early_reader_args);
-    AppendSharedOutputRef(
-        early_reader_args,
-        FdwicOutputRef{kProducer, 0, 0, 0, 0, 0},
-        TensorArgType::Input
-    );
+    for (int16_t slot = 0; slot < 3; ++slot) {
+        AppendSharedOutputRef(
+            early_reader_args,
+            FdwicOutputRef{kProducer, slot, 0, 0, 0, 0},
+            TensorArgType::Input
+        );
+    }
     int32_t early_fanin[kMaxFanin] = {};
     bool early_protocol_ok = false;
     uint32_t early_ordinary_lookups = UINT32_MAX;
     LocalStats early_stats{};
     const uint32_t early_count =
-        CollectSharedFanin<SymbolTestOps, false, true>(
+        CollectSharedFanin<SymbolTestOps, false, true, true>(
             state->shared_map, early_reader_args,
             /*task_id=*/2, kHeapWindow, early_stats,
             early_fanin, early_protocol_ok,
-            early_ordinary_lookups
+            early_ordinary_lookups, nullptr,
+            -1, -1, kProducer
         );
     Check(
         early_protocol_ok && early_count == 1 &&
@@ -1830,33 +1851,111 @@ void TestPaUpSplitWriterPublicationStages() {
 
     state->tasks[kPredecessor].deps_prepared = kPredecessor;
     int64_t ready_observed = -1;
+    GroupWriterCountingOps::compare_exchange_calls.store(
+        0, std::memory_order_relaxed
+    );
+    GroupWriterCountingOps::compare_exchange_address = nullptr;
+#if !PA_BUILD_TRACE_FREE
+    DeferredSharedWriterMetadataTrace writer_trace{};
+#endif
     Check(
         WaitForSharedTaskInsertTurn<SymbolTestOps>(
             state, kWriter, stats, ready_observed
         ) &&
             ready_observed == kPredecessor &&
-            CommitTrustedPaUpLastWriters<SymbolTestOps>(
+            CommitTrustedPaUpGroupWriter<
+                GroupWriterCountingOps, true, true
+            >(
                 state->shared_map, kWriter,
                 kProducer, kProducer, &stats
+#if !PA_BUILD_TRACE_FREE
+                , &writer_trace
+#endif
             ),
-        "PA UP split path publishes three writers only after acquiring the turn"
+        "PA UP split path publishes the group writer after acquiring the turn"
     );
+    bool trace_count_ok = true;
+#if !PA_BUILD_TRACE_FREE
+    trace_count_ok = writer_trace.writer_cas_count == 1;
+#endif
+    Check(
+        GroupWriterCountingOps::compare_exchange_calls.load(
+            std::memory_order_relaxed
+        ) == 1 &&
+            GroupWriterCountingOps::compare_exchange_address ==
+                &cell.last_writer[0].value &&
+            trace_count_ok &&
+            cell.last_writer[0].value == kWriter &&
+            cell.last_writer[1].value == kProducer &&
+            cell.last_writer[2].value == kProducer,
+        "PA UP group publication performs and records one CAS on Alloc slot0"
+    );
+
+    // 当前 UP 在 group latest 中看到自己，必须仍按三个原始 symbol key
+    // 分别穿过同一份 history，回到本次写入前的 producer。
+    int32_t writer_fanin[kMaxFanin] = {};
+    bool writer_protocol_ok = false;
+    uint32_t writer_ordinary_lookups = UINT32_MAX;
+    LocalStats writer_stats{};
+    const uint32_t writer_count =
+        CollectSharedFanin<SymbolTestOps, false, true, true>(
+            state->shared_map, early_reader_args,
+            kWriter, kHeapWindow, writer_stats,
+            writer_fanin, writer_protocol_ok,
+            writer_ordinary_lookups, nullptr,
+            -1, -1, kProducer
+        );
+    Check(
+        writer_protocol_ok && writer_count == 1 &&
+            writer_fanin[0] == kProducer,
+        "PA UP group reader preserves three slot-specific history records"
+    );
+
     int32_t later_fanin[kMaxFanin] = {};
     bool later_protocol_ok = false;
     uint32_t later_ordinary_lookups = UINT32_MAX;
     LocalStats later_stats{};
     const uint32_t later_count =
-        CollectSharedFanin<SymbolTestOps, false, true>(
+        CollectSharedFanin<SymbolTestOps, false, true, true>(
             state->shared_map, early_reader_args,
             /*task_id=*/5, kHeapWindow, later_stats,
             later_fanin, later_protocol_ok,
-            later_ordinary_lookups
+            later_ordinary_lookups, nullptr,
+            -1, -1, kProducer
         );
     Check(
         later_protocol_ok && later_count == 1 &&
             later_fanin[0] == kWriter &&
-            cell.last_writer[0].value == kWriter,
-        "reader discovers the prepared history only after last-writer CAS"
+            cell.last_writer[0].value == kWriter &&
+            cell.last_writer[1].value == kProducer &&
+            cell.last_writer[2].value == kProducer,
+        "PA reader resolves every accumulator slot through the group word"
+    );
+
+    // generic latest-writer resolver 仍读取真实 slot；slot1 没有被 PA group
+    // CAS 改写，因此它必须继续解析为 producer，证明公共语义未被改动。
+    TaskArgs generic_slot1_args;
+    ConstructTaskArgs(generic_slot1_args);
+    AppendSharedOutputRef(
+        generic_slot1_args,
+        FdwicOutputRef{kProducer, 1, 0, 0, 0, 0},
+        TensorArgType::Input
+    );
+    int32_t generic_fanin[kMaxFanin] = {};
+    bool generic_protocol_ok = false;
+    uint32_t generic_ordinary_lookups = UINT32_MAX;
+    LocalStats generic_stats{};
+    const uint32_t generic_count =
+        CollectSharedFanin<SymbolTestOps, false, true>(
+            state->shared_map, generic_slot1_args,
+            /*task_id=*/5, kHeapWindow, generic_stats,
+            generic_fanin, generic_protocol_ok,
+            generic_ordinary_lookups
+        );
+    Check(
+        generic_protocol_ok && generic_count == 1 &&
+            generic_fanin[0] == kProducer,
+        "generic latest-writer lookup remains slot-specific"
     );
 
     ResetSharedState(state->shared_map);
@@ -1869,20 +1968,29 @@ void TestPaUpSplitWriterPublicationStages() {
             state->shared_map, symbol_keys, kWriter,
             kProducer, kProducer, &stats
         ),
-        "partial-CAS setup republishes the immutable history"
+        "group-CAS mismatch setup republishes the immutable history"
     );
-    cell.last_writer[1].value = 1;
+    cell.last_writer[0].value = 1;
+    GroupWriterCountingOps::compare_exchange_calls.store(
+        0, std::memory_order_relaxed
+    );
+    GroupWriterCountingOps::compare_exchange_address = nullptr;
     Check(
-        !CommitTrustedPaUpLastWriters<SymbolTestOps>(
+        !CommitTrustedPaUpGroupWriter<GroupWriterCountingOps>(
             state->shared_map, kWriter,
             kProducer, kProducer, &stats
         ) &&
             state->shared_map.writer_history[kWriter].magic ==
                 kSharedWriterHistoryMagic &&
-            cell.last_writer[2].value == kWriter &&
-            cell.last_writer[1].value == 1 &&
-            cell.last_writer[0].value == kProducer,
-        "split PA UP commit preserves its terminal partial-CAS prefix"
+            GroupWriterCountingOps::compare_exchange_calls.load(
+                std::memory_order_relaxed
+            ) == 1 &&
+            GroupWriterCountingOps::compare_exchange_address ==
+                &cell.last_writer[0].value &&
+            cell.last_writer[0].value == 1 &&
+            cell.last_writer[1].value == kProducer &&
+            cell.last_writer[2].value == kProducer,
+        "PA UP group CAS mismatch leaves no partial symbol publication"
     );
     UnmapSparseSchedulerState(state);
 }
@@ -2011,10 +2119,11 @@ void TestOrderedPreparedSymbolUsesSinglePublicationCheck() {
         "unpublished rejection preserves history and writer"
     );
 
-    // 正式 Finish 只有在取得 task N 的 insert turn 后才使用该编译期
-    // 分支；前驱 handoff 已经传递 producer descriptor/published 的
-    // 可见性。这里刻意只建立后续 last_writer 前置条件并保持 published
-    // 为 -1，锁定 helper 本身不会偷偷恢复一次 publication load。
+    // 保留的 generic prepared helper 可在取得 task N 的 insert turn 后
+    // 使用该编译期分支；前驱 handoff 已经传递 producer descriptor/
+    // published 的可见性。正式 PA generation 12 不再用它发布 accumulator
+    // latest，而走单 group-CAS 专路。这里仍锁定 generic helper 不会偷偷
+    // 恢复一次 publication load。
     ResetSharedState(*map);
     map->shared_outputs[kProducer].last_writer[0].value = kProducer;
     fatal = 0;
@@ -2040,9 +2149,9 @@ void TestOrderedPreparedSymbolUsesSinglePublicationCheck() {
         "insert-turn trusted commit omits only the publication load"
     );
 
-    // PA 正式路径还从 batch/group 元数据得到精确 previous writer，并
-    // 继续由 CAS expected-old 校验共享状态。把 last_writer 地址设为
-    // Load 探针，证明该实例不再做 CAS 前预读。
+    // generic helper 的 PA-shaped 隔离实例由调用方提供精确 previous
+    // writer，并继续由逐槽 CAS expected-old 校验共享状态。把
+    // last_writer 地址设为 Load 探针，证明该实例不再做 CAS 前预读。
     ResetSharedState(*map);
     map->shared_outputs[kProducer].last_writer[0].value = kProducer;
     fatal = 0;
@@ -2066,11 +2175,13 @@ void TestOrderedPreparedSymbolUsesSinglePublicationCheck() {
                 kProducer &&
             map->shared_outputs[kProducer].last_writer[0].value ==
                 kWriter,
-        "PA expected-previous commit omits the last-writer preload"
+        "PA-shaped generic commit omits the last-writer preload"
     );
 
-    // 正式 PA UP callback 按 max/sum/output 构造参数，因此专路要求
-    // 三个 key 同属 batch Alloc producer且 slot 精确为 2/1/0。
+    // 该 legacy/generic 逐槽 helper 仍保留 PA-shaped 的形状门槛：
+    // 三个 key 同属 batch Alloc producer且 slot 精确为 2/1/0。正式 PA
+    // Finish 已改走 CommitTrustedPaUpGroupWriter；这里不能据此误判正式
+    // 路径仍执行三次物理 CAS。
     constexpr int16_t kPaSlotOrder[3] = {2, 1, 0};
     uint32_t pa_up_keys[3] = {};
     for (uint32_t index = 0; index < 3; ++index) {

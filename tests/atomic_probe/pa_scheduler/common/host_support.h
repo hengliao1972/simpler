@@ -2836,6 +2836,41 @@ inline bool AnalyzeSwimlaneRecords(
             );
         }
     }
+#if PTO_FDWIC_SHARED_MAP
+    if ((state.config.trace_enabled &
+         kTraceAtomicsEnabled) != 0) {
+        constexpr uint32_t kWriterCommitSite =
+            static_cast<uint32_t>(
+                AtomicSite::SharedMetadataLastWriterCommit
+            );
+        const uint64_t aic_events =
+            atomic_durations[0][kWriterCommitSite].size();
+        const uint64_t aiv_events =
+            atomic_durations[1][kWriterCommitSite].size();
+        // 正式 PA 的 UP 只由 AIV winner 发布 writer metadata；generation
+        // 12 每组只允许一条物理 group CAS。逻辑上仍提交三个 symbol，
+        // 因而不能拿 shared_symbol_inout_commits 代替本闭环。
+        if (aic_events != 0 ||
+            aiv_events != shared_plan.total_groups) {
+            std::fprintf(
+                stderr,
+                "shared PA writer group-CAS closure failed: "
+                "AIC=%llu AIV=%llu expected=0/%u\n",
+                static_cast<unsigned long long>(aic_events),
+                static_cast<unsigned long long>(aiv_events),
+                shared_plan.total_groups
+            );
+            return false;
+        }
+        std::printf(
+            "[TRACE_ATOMIC_CLOSURE] "
+            "site=SharedMetadataLastWriterCommit "
+            "physical_group_cas=%llu logical_symbol_commits=%u\n",
+            static_cast<unsigned long long>(aiv_events),
+            shared_plan.total_groups * 3U
+        );
+    }
+#endif
     // 等待聚合只报告 episode 数、精确逻辑调用数与包络分布。window 不能除以
     // calls 当作单次 atomic latency，也不能与 Submit 墙钟直接相加。
     for (uint32_t role_index = 0; role_index < 2; ++role_index) {
@@ -3466,7 +3501,11 @@ inline SharedOutputValidation ValidateSharedOutputs(
                         false, task_id, slot,
                         "missing batch plan"
                     );
-                } else if (batch->group_count != 0) {
+                } else if (batch->group_count != 0 &&
+                           slot == 0) {
+                    // 正式 PA 的三个 accumulator 同步推进，generation 12
+                    // 只以 Alloc slot0 保存 group latest。slot1/2 的
+                    // descriptor 仍有效，但不再是 writer 链发布字。
                     expected_writer =
                         static_cast<int64_t>(
                             batch->final_up_task_id
@@ -3750,7 +3789,7 @@ inline uint64_t SharedNormalizedWriterSignature(
                 alloc->group_block_count,
                 alloc->canonical_task_base
             ),
-            static_cast<uint32_t>(cell.last_writer[2].value)
+            static_cast<uint32_t>(cell.last_writer[0].value)
         );
         AddNormalizedWriter(
             by_bucket,
@@ -3759,7 +3798,7 @@ inline uint64_t SharedNormalizedWriterSignature(
                 alloc->group_block_count,
                 alloc->canonical_task_base
             ),
-            static_cast<uint32_t>(cell.last_writer[1].value)
+            static_cast<uint32_t>(cell.last_writer[0].value)
         );
         AddNormalizedWriter(
             by_bucket,
@@ -4704,12 +4743,12 @@ inline Metrics Validate(
 #else
             0,
 #endif
-        "shared symbol INPUT-load / INOUT-writer-commit totals are exact", &metrics
+        "shared symbol INPUT-load / logical INOUT-symbol-commit totals are exact", &metrics
     );
 #if PTO_FDWIC_SHARED_MAP
     std::printf(
         "[SHARED_SYMBOL] published_outputs=%llu input_loads=%llu "
-        "inout_writer_commits=%llu\n",
+        "logical_inout_symbol_commits=%llu\n",
         static_cast<unsigned long long>(
             shared_output_validation.published_outputs
         ),

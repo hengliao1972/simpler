@@ -40,9 +40,11 @@ struct LocalStats {
 };
 
 #if PTO_FDWIC_SHARED_MAP && !PA_BUILD_TRACE_FREE
-// 正式 PA-UP 的 history DCCI 与三个 writer CAS 仍逐项捕获端点，但 raw
-// 写入要等 task-level handoff 之后。该对象只存在于 full-swimlane 的
-// owner 本地栈，不进入 SchedulerState、trace raw 或 host/device ABI。
+// 正式 PA-UP 的 history DCCI 与 group-writer CAS 先捕获端点，raw 写入
+// 要等 task-level handoff 之后。数组保留三项是为了复用 generic helper
+// 的本地承载形状；generation 12 正式 PA 只使用下标 0 且 count=1。
+// 该对象只存在于 full-swimlane 的 owner 本地栈，不进入 SchedulerState、
+// trace raw 或 host/device ABI。
 struct DeferredSharedWriterMetadataTrace {
     uint64_t history_dcci_begin;
     uint64_t history_dcci_end;
@@ -1259,12 +1261,16 @@ PA_DEVICE FdwicOutputRef SharedSymbolHistoryReference(uint32_t key) {
 // 保持不可变。latest cache 若指向 reader 的未来 task，就按该 task 的
 // 精确 symbol key 取前驱，直到回到 reader 的过去；正常 latest<reader
 // 快路完全不读取 history。
-template <typename Ops>
+template <
+    typename Ops,
+    bool UsePaAccumulatorGroupWriter = false
+>
 PA_DEVICE bool ResolveSharedSymbolWriterBefore(
     PA_GM SharedTensorMapSidecar &map,
     const FdwicOutputRef &output_ref, int32_t reader_task,
     int32_t reader_lower_bound, int32_t &resolved_writer,
-    LocalStats &stats
+    LocalStats &stats,
+    int32_t pa_accumulator_producer = -1
 ) {
     uint32_t symbol_key = 0;
     if (!SharedSymbolHistoryKey(output_ref, symbol_key) ||
@@ -1273,19 +1279,36 @@ PA_DEVICE bool ResolveSharedSymbolWriterBefore(
         reader_lower_bound > reader_task) {
         return false;
     }
+    if constexpr (UsePaAccumulatorGroupWriter) {
+        // 正式 PA 的三个 accumulator 由同一 Alloc 产生，并由每个 UP
+        // 同步推进。该 specialization 只把这三个 symbol 的 latest 快取
+        // 收敛到 slot0；history 查询仍使用原始 slot key，不能把三条依赖
+        // 记录合并成一条。
+        if (pa_accumulator_producer < 0 ||
+            pa_accumulator_producer >= reader_task) {
+            return false;
+        }
+    }
     PA_GM SharedOutputCell &origin =
         map.shared_outputs[
             static_cast<uint32_t>(
                 output_ref.producer_task_id
             )
         ];
+    uint32_t last_writer_slot =
+        static_cast<uint32_t>(output_ref.output_slot);
+    if constexpr (UsePaAccumulatorGroupWriter) {
+        if (output_ref.producer_task_id ==
+                pa_accumulator_producer &&
+            last_writer_slot < 3U) {
+            last_writer_slot = 0;
+        }
+    }
     int64_t latest =
         TraceAtomicLoad<Ops>(
             stats.trace, stats.result, reader_task,
             AtomicSite::SharedFaninLastWriterLoad,
-            &origin.last_writer[
-                static_cast<uint32_t>(output_ref.output_slot)
-            ].value
+            &origin.last_writer[last_writer_slot].value
         );
     uint32_t steps = 0;
     while (latest >= reader_task) {
@@ -1360,7 +1383,8 @@ PA_DEVICE bool ResolveSharedSymbolWriterBefore(
 
 template <
     typename Ops, bool ChainedWriter = false,
-    bool AcceptLatestWriter = false
+    bool AcceptLatestWriter = false,
+    bool UsePaAccumulatorGroupWriter = false
 >
 PA_DEVICE uint32_t CollectSharedFanin(
     PA_GM SharedTensorMapSidecar &map, const TaskArgs &args,
@@ -1369,11 +1393,16 @@ PA_DEVICE uint32_t CollectSharedFanin(
     uint32_t &ordinary_lookup_count,
     PA_GM volatile int32_t *fatal = nullptr,
     int32_t chained_producer_task_id = -1,
-    int32_t expected_shared_writer = -1
+    int32_t expected_shared_writer = -1,
+    int32_t pa_accumulator_producer = -1
 ) {
     static_assert(
         !(ChainedWriter && AcceptLatestWriter),
         "generic latest-writer lookup must not use the PA chained selector"
+    );
+    static_assert(
+        !UsePaAccumulatorGroupWriter || AcceptLatestWriter,
+        "PA accumulator group writer requires latest-writer history lookup"
     );
     protocol_ok = true;
     ordinary_lookup_count = 0;
@@ -1382,6 +1411,13 @@ PA_DEVICE uint32_t CollectSharedFanin(
         args.tensor_count > static_cast<int32_t>(kMaxTaskTensors)) {
         protocol_ok = false;
         return 0;
+    }
+    if constexpr (UsePaAccumulatorGroupWriter) {
+        if (pa_accumulator_producer < 0 ||
+            pa_accumulator_producer >= task_id) {
+            protocol_ok = false;
+            return 0;
+        }
     }
     const int32_t reader_lower_bound =
         task_id > heap_window ? task_id - heap_window : 0;
@@ -1509,9 +1545,12 @@ PA_DEVICE uint32_t CollectSharedFanin(
                 // latest cell 是零开销快取；若 future writer 已经覆盖它，
                 // 只在这一慢路沿不可变前驱链回到 max(writer<task_id)，
                 // 再与 ordinary lookup 一样过滤到 [N-H,N)。
-                if (!ResolveSharedSymbolWriterBefore<Ops>(
+                if (!ResolveSharedSymbolWriterBefore<
+                        Ops, UsePaAccumulatorGroupWriter
+                    >(
                         map, output_ref, task_id,
-                        reader_lower_bound, writer, stats
+                        reader_lower_bound, writer, stats,
+                        pa_accumulator_producer
                     )) {
                     protocol_ok = false;
                     return 0;
@@ -2074,8 +2113,8 @@ PA_DEVICE bool CommitSymbolSharedWriterIntentSet(
 
 // 正式 PA-UP 专路的第一段：writer shape 已在 Materialize 尾部验证，
 // 本 task 又独占 writer_history[task_id]，所以可以在等待 predecessor
-// 之前发布 immutable payload。它此时只是不可达的准备态；各 symbol 的
-// last_writer CAS 仍是 reader 唯一的发布边界。
+// 之前发布 immutable payload。它此时只是不可达的准备态；随后对 Alloc
+// slot0 的 group-writer CAS 才统一发布三条 symbol history。
 template <typename Ops, bool ObserveDcci = false>
 PA_DEVICE bool PublishTrustedPaUpWriterHistoryPayload(
     PA_GM SharedTensorMapSidecar &map,
@@ -2146,13 +2185,14 @@ PA_DEVICE bool PublishTrustedPaUpWriterHistoryPayload(
 }
 
 // 正式 PA-UP 专路的第二段：上面的 payload 已经 DCCI+DSB 完成，且
-// predecessor turn 已由调用方取得。成功路径只按固定 2/1/0 顺序执行
-// 三次 return-ready CAS；不再读取或写回 writer_history。
+// predecessor turn 已由调用方取得。三个 accumulator 在 PA 中始终同步
+// 推进，因此只用 Alloc cell.last_writer[0] 作为 group latest，并执行
+// 一次 return-ready CAS；三条原始 symbol history 仍完整保留。
 template <
     typename Ops, bool ObserveAtomics = false,
     bool TrustDeferredTrace = false
 >
-PA_DEVICE bool CommitTrustedPaUpLastWriters(
+PA_DEVICE bool CommitTrustedPaUpGroupWriter(
     PA_GM SharedTensorMapSidecar &map, int32_t task_id,
     int32_t expected_previous, int32_t expected_producer,
     LocalStats *stats = nullptr
@@ -2160,14 +2200,48 @@ PA_DEVICE bool CommitTrustedPaUpLastWriters(
     , DeferredSharedWriterMetadataTrace *deferred_trace = nullptr
 #endif
 ) {
-    PA_LOOP_NOUNROLL
-    for (uint32_t index = 0; index < 3; ++index) {
-        PA_GM volatile int64_t *last_writer =
-            &map.shared_outputs[
-                 static_cast<uint32_t>(expected_producer)
-             ].last_writer[2U - index].value;
+    PA_GM volatile int64_t *last_writer =
+        &map.shared_outputs[
+             static_cast<uint32_t>(expected_producer)
+         ].last_writer[0].value;
 #if PA_BUILD_TRACE_FREE
-        if (TraceConfiguredAtomicCompareExchange<
+    return TraceConfiguredAtomicCompareExchange<
+            Ops, ObserveAtomics
+        >(
+            stats == nullptr ? nullptr : &stats->trace,
+            stats == nullptr ? nullptr : &stats->result,
+            task_id,
+            AtomicSite::SharedMetadataLastWriterCommit,
+            last_writer,
+            static_cast<int64_t>(expected_previous),
+            static_cast<int64_t>(task_id)
+        ) == expected_previous;
+#else
+    int64_t observed = INT64_MIN;
+    if constexpr (TrustDeferredTrace) {
+        // 正式 full-swimlane 调用提供 owner-local capture；只保存一次
+        // group CAS 的发射与返回就绪端点，随后在串行区外写 raw。
+        observed = CaptureAtomicCompareExchange<Ops>(
+            stats->trace, last_writer,
+            static_cast<int64_t>(expected_previous),
+            static_cast<int64_t>(task_id),
+            deferred_trace->writer_cas_begin[0],
+            deferred_trace->writer_cas_end[0]
+        );
+        deferred_trace->writer_cas_count = 1U;
+    } else if (deferred_trace != nullptr && stats != nullptr &&
+               deferred_trace->writer_cas_count == 0) {
+        observed = CaptureAtomicCompareExchange<Ops>(
+            stats->trace, last_writer,
+            static_cast<int64_t>(expected_previous),
+            static_cast<int64_t>(task_id),
+            deferred_trace->writer_cas_begin[0],
+            deferred_trace->writer_cas_end[0]
+        );
+        deferred_trace->writer_cas_count = 1U;
+    } else {
+        observed =
+            TraceConfiguredAtomicCompareExchange<
                 Ops, ObserveAtomics
             >(
                 stats == nullptr ? nullptr : &stats->trace,
@@ -2177,62 +2251,10 @@ PA_DEVICE bool CommitTrustedPaUpLastWriters(
                 last_writer,
                 static_cast<int64_t>(expected_previous),
                 static_cast<int64_t>(task_id)
-            ) != expected_previous) {
-            return false;
-        }
-#else
-        int64_t observed = INT64_MIN;
-        if constexpr (TrustDeferredTrace) {
-            // 正式 full-swimlane 调用已经提供 owner-local capture。直接用
-            // 固定循环 index 保存端点，避免在三次 CAS 之间重复判空、
-            // 读取 count 和逐项递增；循环仍禁止展开，防止复制三套
-            // atomic 观察代码。
-            observed = CaptureAtomicCompareExchange<Ops>(
-                stats->trace, last_writer,
-                static_cast<int64_t>(expected_previous),
-                static_cast<int64_t>(task_id),
-                deferred_trace->writer_cas_begin[index],
-                deferred_trace->writer_cas_end[index]
             );
-        } else if (deferred_trace != nullptr && stats != nullptr &&
-                   deferred_trace->writer_cas_count < 3) {
-            const uint32_t capture_index =
-                deferred_trace->writer_cas_count++;
-            observed = CaptureAtomicCompareExchange<Ops>(
-                stats->trace, last_writer,
-                static_cast<int64_t>(expected_previous),
-                static_cast<int64_t>(task_id),
-                deferred_trace->writer_cas_begin[capture_index],
-                deferred_trace->writer_cas_end[capture_index]
-            );
-        } else {
-            observed =
-                TraceConfiguredAtomicCompareExchange<
-                    Ops, ObserveAtomics
-                >(
-                    stats == nullptr ? nullptr : &stats->trace,
-                    stats == nullptr ? nullptr : &stats->result,
-                    task_id,
-                    AtomicSite::SharedMetadataLastWriterCommit,
-                    last_writer,
-                    static_cast<int64_t>(expected_previous),
-                    static_cast<int64_t>(task_id)
-                );
-        }
-        if (observed != expected_previous) {
-            if constexpr (TrustDeferredTrace) {
-                deferred_trace->writer_cas_count = index + 1U;
-            }
-            return false;
-        }
-#endif
     }
-#if !PA_BUILD_TRACE_FREE
-    if constexpr (TrustDeferredTrace) {
-        deferred_trace->writer_cas_count = 3U;
-    }
+    return observed == expected_previous;
 #endif
-    return true;
 }
 
 // ordered Submit 专用入口：调用方已经在 insert turn 外完成 symbol ref

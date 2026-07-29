@@ -740,14 +740,14 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         : TraceTimestamp<Ops>(stats.trace, stats.result);
     // PA 的三个 accumulator symbol 共用同一 writer 链。首组 UP 的
     // previous writer 是本 batch Alloc；后续组是前一 UP（task-4）。
-    // CAS 仍使用该值作 expected-old 并返回实际旧值，因此这里只省略
-    // CAS 前的三次重复 Load，不跳过共享状态一致性校验。
+    // group CAS 仍使用该值作 expected-old 并返回实际旧值，因此不跳过
+    // 共享状态一致性校验；三个 slot 的原始 history 记录继续分别保留。
     const bool metadata_published =
         turn_ready &&
         (writer_delta.symbol_count == 0 ||
          // history payload 已在 Materialize 尾部完成 DCCI；取得 turn 后
-         // 只用三次 return-ready CAS 发布各 accumulator 的 latest writer。
-         CommitTrustedPaUpLastWriters<Ops, true, true>(
+         // 只用一次 return-ready CAS 发布 accumulator group latest。
+         CommitTrustedPaUpGroupWriter<Ops, true, true>(
             state->shared_map, static_cast<int32_t>(task_id),
             expected_previous,
             static_cast<int32_t>(task_meta.batch_start), &stats
@@ -756,8 +756,8 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
 #endif
         ));
     if (turn_ready && !metadata_published) {
-        // 三项 CAS 不是事务；冲突时保留已经线性化的前缀，但整轮必须
-        // 进入 terminal fatal，且不得发布本 task 的 insert completion。
+        // 单次 group CAS 冲突时没有部分发布前缀；整轮进入 terminal
+        // fatal，且不得发布本 task 的 insert completion。
         SetFatal<Ops>(
             state, stats, static_cast<int32_t>(task_id)
         );
@@ -797,7 +797,7 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     );
 #if !PA_BUILD_TRACE_FREE
     // task[N].deps_prepared 已经完成 CAS handoff，下一 owner 可开始推进；
-    // 现在才落 history DCCI 和三个 writer CAS 的 raw，既保留逐操作端点
+    // 现在才落 history DCCI 和单次 group writer CAS 的 raw，既保留端点
     // 与事件数量，也不再让 16B 记录写入延长全局有序发布链。
     if (writer_metadata_trace.history_dcci_lines != 0) {
         (void)WriteDcciTrace(
@@ -934,12 +934,14 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         // latest 沿不可变 history 回退到 max(writer < task_id)。这同时
         // 覆盖首组与后续组，不再依赖 PA 专用 chained-writer 特判。
         context.fanin_count = static_cast<int32_t>(
-            CollectSharedFanin<Ops, false, true>(
+            CollectSharedFanin<Ops, false, true, true>(
                 state->shared_map, args,
                 static_cast<int32_t>(task_id),
                 static_cast<int32_t>(state->heap_window),
                 stats, context.fanin, lookup_protocol_ok,
-                ordinary_lookup_count, &state->fatal.value
+                ordinary_lookup_count, &state->fatal.value,
+                -1, -1,
+                static_cast<int32_t>(task_meta.batch_start)
             )
         );
         if (!lookup_protocol_ok) {

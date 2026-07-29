@@ -126,11 +126,11 @@ constexpr uint32_t kBuildIdentityMagic = 0x50414249U;  // "PABI"
 constexpr uint32_t kBuildIdentityCompactGenericTraceBit =
     1U << 31U;
 #if PTO_FDWIC_SHARED_MAP
-constexpr uint32_t kBuildIdentityAbiGeneration = 11;
+constexpr uint32_t kBuildIdentityAbiGeneration = 12;
 #else
 constexpr uint32_t kBuildIdentityAbiGeneration = 4;
 #endif
-// 默认 CAP=128 时，private 保留历史 ABI 值；shared generation 11 另把
+// 默认 CAP=128 时，private 保留历史 ABI 值；shared generation 12 另把
 // active insert-turn G 编入低位。这样既避免 private AIC/AIV 入口因身份
 // 元数据多一条大立即数构造，也让 manifest v4 和 host/device 握手共同
 // 拒绝不同 G 的 shared 混件。非默认隔离变体继续把 CAP 编进 ABI。
@@ -1395,6 +1395,8 @@ static_assert(offsetof(SharedBucketState, tail) == 64, "shared head/tail must no
 // fresh Output 不再借助 region map 按地址查找，而是由
 // (producer_task_id, output_slot) 直接定位。descriptor 发布位、writer 链
 // 和不可变 descriptor 分属独立 cache line 区域，避免三种访问彼此伪共享。
+// generic shared 仍逐 slot 使用 last_writer；正式 PA generation 12 证明
+// 三个 accumulator lockstep 后，仅把 Alloc slot0 解释为 group latest。
 // shared 最大覆盖 256 batch × 4 block group；本轮 task_id 不复用，
 // 因此外层表直接寻址，不做取模，也不在这里提前引入 generation。
 struct alignas(64) SharedOutputCell {
@@ -1793,8 +1795,9 @@ struct alignas(64) WorkerResult {
     uint64_t final_barrier_end;
     // 复用原 barrier_reserved[3] 的 24B，不扩大 WorkerResult。dependency
     // signature 继续闭合 fanin 拓扑；后两项统计 shared symbol 的
-    // last_writer INPUT load 和构建后 INOUT writer commit，private 构建
-    // 必须保持零。
+    // last_writer INPUT load 和构建后逻辑 INOUT symbol commit，private
+    // 构建必须保持零。正式 PA generation 12 的三个 lockstep symbol
+    // 共用一次物理 group CAS，但逻辑提交数仍为三。
     uint64_t dependency_signature;
     uint64_t shared_symbol_input_loads;
     uint64_t shared_symbol_inout_commits;

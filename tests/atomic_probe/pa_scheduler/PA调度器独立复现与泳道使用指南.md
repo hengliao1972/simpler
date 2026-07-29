@@ -251,8 +251,8 @@ submit-pmu 四件套都必须通过 manifest 的模式、CAP、insert-turn G、�
 
 shared 构建还读取 `PA_SHARED_INSERT_TURN_GROUPS`，默认 1，只接受
 1/2/4/8/16/32/64/128；private 只允许 1。该值只在构建期生效，不是
-benchmark 参数。默认 CAP=128 时，shared ABI generation 为 11，
-ABI version 为 `(11<<8)|G`；host/device 握手和 schema-v3 manifest
+benchmark 参数。默认 CAP=128 时，shared ABI generation 为 12，
+ABI version 为 `(12<<8)|G`；host/device 握手和 schema-v4 manifest
 都会拒绝不同 G 的混件。turn-G>1 只属于本阶段维护的 CPU/CCEC 后端；
 AscendC 和 `all` 会在任何构建或设备动作前被拒绝。
 
@@ -429,7 +429,7 @@ S4.16b 第一层性能门槛失败；这些数字只属于历史候选，不是�
 
 每 task 最多八个 fresh output，以 16B
 `FdwicOutputRef` 表达 `(producer_task_id, output_slot)`，返回句柄为
-8B `SharedTaskOutputs`。当前构建身份 ABI generation 为 11。通用
+8B `SharedTaskOutputs`。当前构建身份 ABI generation 为 12。通用
 history 能力由 generation 7 引入，generation 8 追加 `reader_done`，
 generation 9 追加七条 insert-turn 物理线，generation 10 再将物理容量
 扩为 128 条并把 active G 扩到 128；generation 11 将 shared 热路径的
@@ -438,7 +438,12 @@ generation 9 追加七条 insert-turn 物理线，generation 10 再将物理容�
 Claim 仍使用原有 Cube/Alloc 四分片与 shared Vector 八分片 cursor。
 generation 11 暂时保留 generation 10 的 sidecar 物理线和 manifest
 字段作为历史 ABI，默认 G1 构建要求这些线保持初值，生产热路径不再访问
-它们。history、reader progress 与 per-task 插入完成链仍是不同协议能力，
+它们。generation 12 不改变物理布局，而是把正式 PA 的三个 lockstep
+accumulator latest writer 收敛到 Alloc `last_writer[0]`：每个 UP 只做
+一次 group CAS，slot1/2 保持 Alloc producer。三条 slot2/1/0 history 和
+三个逻辑 INOUT commit 仍完整保留，generic shared resolver 也继续使用
+逐 slot writer；因此旧新 ELF 的字段解释不同，必须用 generation 拒绝
+混件。history、reader progress 与 per-task 插入完成链仍是不同协议能力，
 不能据此声称 PA 热路径已经接入 reader-progress reclaim。
 
 当前 shared 使用独立 Submit 路径。所有 worker 先 Claim；只有唯一 owner
@@ -471,13 +476,16 @@ shared 不调用 private per-worker ring 的 HeapGuard。host 直接核对 8-sha
 实际 descriptor 地址，再以 canonical 连续地址比较 private/shared 的
 normalized writer signature。
 
-Materialize 只在 owner 上预留 heap 并生成本地 descriptor。拿到 insert
-turn 后，owner 在同一个有序插入区间依次发布 symbol writer history/latest、
-ordinary writer entry 和本 task 的 fresh output descriptor；完成 flush 与
-存储屏障后才交出下一枚 turn。因此 `published=N` 只表示 task N 的 descriptor
-和 writer 元数据已经可供后继 lookup 使用，不表示 task N 的 Build、kernel
-或 completion 已完成。真正执行依赖仍由 fanin 对应的 task completion flag
-约束。
+Materialize 只在 owner 上预留 heap、生成本地 descriptor，并把本 task 的
+fresh output descriptor 发布到独占 task cell。正式 PA-UP 还在
+Materialize 尾部写入三条 slot-specific immutable writer history，并完成
+单行 DCCI+DSB；此时 history 尚不可达。取得 insert turn 后，有序区只发布
+ordinary writer entry 和 latest writer，再用 `deps_prepared[N]` 交出下一
+枚 turn。generation 12 的三个 accumulator latest 由 Alloc
+`last_writer[0]` 的一次 group CAS 统一发布。因此 `published=N` 只表示
+task N 的 descriptor 已可见，不能单独代表 writer metadata、Build、kernel
+或 completion 已完成；后几项分别由 group/latest 发布、fanin 与 task
+completion flag 约束。
 
 fresh output 发布会先预检全部 slot，再预留全部 `last_writer`，最后复制并
 发布 descriptor；重复发布或后槽异常不得覆盖已经可见的 descriptor，也不能
@@ -488,8 +496,10 @@ insert turn；该表述不包含此前 Claim 对 Vector cursor 的访问。
 
 shared symbol resolver 只接受 flags/view 字段全零的 plain ref；其他形态显式
 失败，不能被悄悄降级为普通 descriptor。由于本 task 的 INOUT writer 已在
-lookup 前发布，resolver 会从当前 `last_writer` 沿不可变 history 回退到严格
-小于 N 的最新 writer，再统一应用 `[N-H,N)` 窗口。定向测试覆盖
+lookup 前发布，正式 PA accumulator 先读取 Alloc `last_writer[0]` 的 group
+latest，再按引用原本的 slot key 沿不可变 history 回退到严格小于 N 的最新
+writer；generic shared resolver 仍逐 slot 读取 `last_writer`。两条路径最后
+都应用 `[N-H,N)` 窗口。定向测试覆盖
 `producer -> INOUT -> 后继 INPUT` 多级链，且同一窗口同时约束 symbol、
 ordinary ring 和显式 `owner_task_id`。同一 task 对同一 symbol 的重复写引用
 仍会被拒绝。
@@ -669,7 +679,7 @@ builtin；检查后删除，不会进入正式 mixed ELF。静态链接只证明
 后端能生成完整设备代码，不证明 ordinary region 的跨核
 reader-progress/reclaim 可见性已经闭合。
 shared-protocol-litmus 自身虽是 CCEC mixed ELF，但没有定义 split-finish，
-因此其 GM `SchedulerState` 使用当前 generation-11 non-split 大小
+因此其 GM `SchedulerState` 使用当前 generation-12 non-split 大小
 1,019,551,552B。history 场景会校验 96 条 `reader_done` 始终保持 -1；
 reader-reclaim 场景则要求 96 条最终均为 task 2，且只允许被测 reader
 发生 `1->2`。两种场景还校验完整 128 线 insert-turn 终态。
@@ -2037,8 +2047,9 @@ block-local runtime state，每个精确 1,664 bytes、最终 section 合计
 R4e-a 追加 96 条 reader-progress cache line 后，generation-8 sidecar 为
 12,426,432 bytes。R5c 在尾部追加七条 insert-turn cache line，形成历史
 generation-9 的 12,426,880 bytes；generation-10 将该尾数组扩为
-127 条 extra line，sidecar 为 12,434,560 bytes，当前 generation-11
-保留同一物理布局但不再从热路径访问这些 turn line。shared batch 输入
+127 条 extra line，sidecar 为 12,434,560 bytes；generation 11
+停止从热路径访问这些 turn line，当前 generation 12 继续保留同一物理
+布局并引入 PA accumulator group-writer 语义。shared batch 输入
 数组扩到 512 后，CPU non-split 与定义
 `PA_COMPETE_FIRST_SPLIT_FINISH` 的 CCEC 变体总大小分别为
 1,019,551,552/1,019,557,696 bytes；swimlane、perf-clock 以及 submit-PMU
