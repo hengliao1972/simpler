@@ -64,6 +64,133 @@ void TestSharedContextLengthUsesBackingPointer() {
     );
 }
 
+bool SameOutputRef(FdwicOutputRef lhs, FdwicOutputRef rhs) {
+    return lhs.producer_task_id == rhs.producer_task_id &&
+           lhs.output_slot == rhs.output_slot &&
+           lhs.flags == rhs.flags &&
+           lhs.view_ndims == rhs.view_ndims &&
+           lhs.view_shape0 == rhs.view_shape0 &&
+           lhs.view_offset0 == rhs.view_offset0;
+}
+
+void PoisonOutputHandles(
+    PaOrchestrationState &orchestration, FdwicOutputRef poison
+) {
+    orchestration.accumulated_output = poison;
+    orchestration.accumulated_sum = poison;
+    orchestration.accumulated_max = poison;
+    orchestration.qk_scores = poison;
+    orchestration.sf_probs = poison;
+    orchestration.sf_max = poison;
+    orchestration.sf_sum = poison;
+    orchestration.pv_output = poison;
+}
+
+void TestRoleAwareAcceptTaskOutputs() {
+    constexpr FdwicOutputRef poison{-91, -7, 1, 1, 17, 19};
+    PaOrchestrationState orchestration{};
+    SharedTaskOutputs outputs{};
+
+    outputs.Reset(0);
+    Check(
+        outputs.AddOutputRef(0, 0) &&
+            outputs.AddOutputRef(0, 1) &&
+            outputs.AddOutputRef(0, 2),
+        "Alloc output symbols are prepared"
+    );
+    PoisonOutputHandles(orchestration, poison);
+    AcceptTaskOutputs(
+        orchestration, TaskKind::Alloc, outputs, CoreRole::Aic
+    );
+    Check(
+        SameOutputRef(orchestration.accumulated_output, poison) &&
+            SameOutputRef(orchestration.accumulated_sum, poison) &&
+            SameOutputRef(orchestration.accumulated_max, poison),
+        "AIC skips Alloc handles that only AIV UP consumes"
+    );
+    AcceptTaskOutputs(
+        orchestration, TaskKind::Alloc, outputs, CoreRole::Aiv
+    );
+    Check(
+        orchestration.accumulated_output.producer_task_id == 0 &&
+            orchestration.accumulated_output.output_slot == 0 &&
+            orchestration.accumulated_sum.producer_task_id == 0 &&
+            orchestration.accumulated_sum.output_slot == 1 &&
+            orchestration.accumulated_max.producer_task_id == 0 &&
+            orchestration.accumulated_max.output_slot == 2,
+        "AIV retains all Alloc handles consumed by UP"
+    );
+
+    outputs.Reset(1);
+    Check(outputs.AddOutputRef(1, 0), "QK output symbol is prepared");
+    PoisonOutputHandles(orchestration, poison);
+    AcceptTaskOutputs(
+        orchestration, TaskKind::Qk, outputs, CoreRole::Aic
+    );
+    Check(
+        SameOutputRef(orchestration.qk_scores, poison),
+        "AIC skips the QK handle that only AIV SF consumes"
+    );
+    AcceptTaskOutputs(
+        orchestration, TaskKind::Qk, outputs, CoreRole::Aiv
+    );
+    Check(
+        orchestration.qk_scores.producer_task_id == 1 &&
+            orchestration.qk_scores.output_slot == 0,
+        "AIV retains the QK handle consumed by SF"
+    );
+
+    outputs.Reset(2);
+    Check(
+        outputs.AddOutputRef(2, 0) &&
+            outputs.AddOutputRef(2, 1) &&
+            outputs.AddOutputRef(2, 2),
+        "SF output symbols are prepared"
+    );
+    PoisonOutputHandles(orchestration, poison);
+    AcceptTaskOutputs(
+        orchestration, TaskKind::Sf, outputs, CoreRole::Aic
+    );
+    Check(
+        orchestration.sf_probs.producer_task_id == 2 &&
+            orchestration.sf_probs.output_slot == 0 &&
+            SameOutputRef(orchestration.sf_max, poison) &&
+            SameOutputRef(orchestration.sf_sum, poison),
+        "AIC retains only the SF probability handle consumed by PV"
+    );
+    PoisonOutputHandles(orchestration, poison);
+    AcceptTaskOutputs(
+        orchestration, TaskKind::Sf, outputs, CoreRole::Aiv
+    );
+    Check(
+        SameOutputRef(orchestration.sf_probs, poison) &&
+            orchestration.sf_max.producer_task_id == 2 &&
+            orchestration.sf_max.output_slot == 1 &&
+            orchestration.sf_sum.producer_task_id == 2 &&
+            orchestration.sf_sum.output_slot == 2,
+        "AIV retains only the SF max/sum handles consumed by UP"
+    );
+
+    outputs.Reset(3);
+    Check(outputs.AddOutputRef(3, 0), "PV output symbol is prepared");
+    PoisonOutputHandles(orchestration, poison);
+    AcceptTaskOutputs(
+        orchestration, TaskKind::Pv, outputs, CoreRole::Aic
+    );
+    Check(
+        SameOutputRef(orchestration.pv_output, poison),
+        "AIC skips the PV handle that only AIV UP consumes"
+    );
+    AcceptTaskOutputs(
+        orchestration, TaskKind::Pv, outputs, CoreRole::Aiv
+    );
+    Check(
+        orchestration.pv_output.producer_task_id == 3 &&
+            orchestration.pv_output.output_slot == 0,
+        "AIV retains the PV handle consumed by UP"
+    );
+}
+
 // 该 Ops 只验证公共 symbol helper 的原子状态机和 descriptor 搬运。
 // fence 不模拟 A5 DCache；设备缓存可见性仍必须由 CCEC 上板门禁证明。
 struct SymbolTestOps {
@@ -2614,6 +2741,7 @@ void TestInvalidReferencesFailClosed() {
 
 int main() {
     TestSharedContextLengthUsesBackingPointer();
+    TestRoleAwareAcceptTaskOutputs();
     TestSharedCompletionPublishesWithoutFrontier();
     TestPublishAndResolve();
     TestPaTwoGroupWriterReadyGate();

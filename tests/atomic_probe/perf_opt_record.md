@@ -3897,3 +3897,56 @@ not-attempted AIV tail 另有 `+5.641%` 回退，全部 122,784 条 Transition
 仅依赖显式 task id 和 `shared_result`；winner 侧的多层身份校验不变。
 完整试验拆分、IR、固定人口与四段闭合见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.14 shared 按角色保存 output handle
+
+**[已保留] 删除 73,728 次无本核消费者的句柄赋值**
+
+shared 的 8 个 orchestration output handle 只有后继 winner
+`BuildCallbackSubmitArgs()` 消费。AIC 只可能构造 QK/PV，因此只需
+`sf_probs`；AIV 只可能构造 SF/UP，因此只需其余 7 个。候选不改
+`PaOrchestrationState`、shared-result、symbol、TensorMap 或跨核 ABI，
+只让 `AcceptTaskOutputs()` 按已有 `CoreRole` 省略没有本核消费者的
+本地赋值：
+
+```text
+AIC: 32 × 256 × 7 = 57,344
+AIV: 64 × 256 × 1 = 16,384
+合计:                  73,728 次 handle 赋值
+```
+
+角色毒值测试、CPU shared 全量/B256/mixed、CPU private、CCEC
+shared/private 及两份 A5 B256 完整泳道全部通过。辅助 O3 IR 中 AIC/AIV
+分别准确减少 `14/2` 条 store，branch 与 alloca 不变；标准 caller
+分别缩小 `244/36 B`。shared runtime/winner Finish 及 private 7 个
+相关对象去调试信息后逐字相同，atomic 在同一 O3 管线下零增量。
+
+直接边界是前一 Submit 返回后执行 `Accept` 的
+`Submit.end→下一 Submit.start`。四份 raw 的 122,784 条 transition
+与 `Atomic∪Kernel` 零交集：
+
+| 前一 task | AIC 变化 | AIV 变化 |
+| --- | ---: | ---: |
+| Alloc | **-15.622%** | +3.120% |
+| QK | **-10.590%** | -0.634% |
+| SF | **-6.203%** | **-7.950%** |
+| PV | **-8.104%** | +0.098% |
+| UP（无 Accept） | -1.907% | -2.649% |
+
+AIC 四个真实受影响类型两轮逐一同向；AIV 只有 SF 实际少写一个 handle，
+该区间两轮分别下降 `7.955%/7.945%`。固定全 nonwinner 的 Transition
+在 AIC/AIV/全核分别下降 `8.155%/1.606%/3.936%`，完整四段 actor
+下降 `4.489%/0.133%/1.538%`。not-attempted AIV 完整 actor 的
+`+0.684%` 和 AIV Alloc transition 的 `+3.120%` 作为布局反向保留。
+
+三次 perf-clock `2,269.215/2,264.932/2,258.848 us` 只作背景。候选
+泳道：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_173939_67785/ccec/
+  pa_scheduler_shared_swimlane_20260730_174032_69047/ccec/
+```
+
+消费者闭合、测试矩阵、IR 证据和完整固定人口分段见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。

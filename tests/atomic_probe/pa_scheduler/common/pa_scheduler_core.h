@@ -4564,7 +4564,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             }
             AcceptTaskOutputs(
                 orchestration, TaskKind::Alloc,
-                OrchestrationOutputs(context)
+                OrchestrationOutputs(context), role
             );
 
             for (uint32_t group = 0;
@@ -4583,7 +4583,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 }
                 AcceptTaskOutputs(
                     orchestration, TaskKind::Qk,
-                    OrchestrationOutputs(context)
+                    OrchestrationOutputs(context), role
                 );
 
                 if (!SubmitCallbackTask<
@@ -4600,7 +4600,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 }
                 AcceptTaskOutputs(
                     orchestration, TaskKind::Sf,
-                    OrchestrationOutputs(context)
+                    OrchestrationOutputs(context), role
                 );
 
                 if (!SubmitCallbackTask<
@@ -4617,7 +4617,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 }
                 AcceptTaskOutputs(
                     orchestration, TaskKind::Pv,
-                    OrchestrationOutputs(context)
+                    OrchestrationOutputs(context), role
                 );
 
                 if (!SubmitCallbackTask<

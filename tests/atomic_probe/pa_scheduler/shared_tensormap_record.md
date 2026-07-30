@@ -15234,3 +15234,163 @@ nonwinner 合计 tail 和完整 actor 也都改善。
 同时不把该阶段描述成全区域无回退：not-attempted AIV tail 和
 SubmitTransition 存在明确布局反向。后续候选仍须在完整 actor 闭合中
 承担这些搬移成本，不能只引用被删除条件所在的局部 span。
+
+### 2026-07-30：shared orchestration 只保留本角色会消费的 output handle
+
+#### 消费者审计与消减边界
+
+`PaOrchestrationState` 长期保存 8 个 `FdwicOutputRef`，原实现让 96 个
+replay actor 在 Alloc/QK/SF/PV 返回后都完整写入。全仓生产消费者审计
+表明，这 8 个字段只被后续 `BuildCallbackSubmitArgs<Kind>()` 读取：
+
+| 核型 | 可能构造的计算 task | 实际读取的 output handle |
+| --- | --- | --- |
+| AIC | QK、PV | `sf_probs` |
+| AIV | SF、UP | `qk_scores`、三个 accumulator、`sf_max/sf_sum`、`pv_output` |
+
+没有 host 校验、泳道、统计、Finalize 或跨批隐藏消费者。Alloc 的三个
+accumulator 只由同批 AIV UP 读取；每组 QK/SF/PV 的句柄都在消费者前
+覆盖；下一批 Alloc 又会覆盖 accumulator。Submit 失败时调用方不会执行
+`AcceptTaskOutputs()`。
+
+本阶段因此只给 shared `AcceptTaskOutputs()` 增加已有 `CoreRole` 参数：
+
+- AIC 对 Alloc/QK/PV 不保存句柄，SF 只保存 `sf_probs`；
+- AIV 对 Alloc/QK/PV 保持原写入，SF 只保存 `sf_max/sf_sum`；
+- `context.shared_result` 仍由全部 actor 完整
+  `Reset/AddOutputRef`，Materialize、shared-output 发布、winner Finish
+  和 Submit 返回后的实际消费者协议都不变；
+- `PaOrchestrationState`、`FdwicOutputRef`、`SubmitContext` 和跨核 ABI
+  均不改变。
+
+B256/G1 的准确源级动态消减为：
+
+```text
+AIC: 32 × 256 × (Alloc 3 + QK 1 + SF 2 + PV 1) = 57,344
+AIV: 64 × 256 × (SF 1)                         = 16,384
+合计:                                                73,728 次 handle 赋值
+```
+
+这与先前撤回的“把 16B handle 压成 8B”不是同一个候选：本阶段不改
+状态表示、不在 winner Build 恢复引用，也不改变寻址和 ABI，只省略已有
+结构中没有本角色消费者的赋值。
+
+#### 定向正确性和代码生成
+
+`test_shared_output_symbols.cpp` 新增角色毒值测试。测试分别准备
+Alloc/QK/SF/PV 的真实连续 output symbol，把 8 个 orchestration 字段
+全部写成不同于合法 symbol 的 poison 引用，然后验证：
+
+- AIC 只更新 SF slot0，其他未消费字段保持 poison；
+- AIV 更新 Alloc 三项、QK slot0、SF slot1/2 和 PV slot0，
+  `sf_probs` 保持 poison。
+
+相同 CCEC O3 辅助 IR 中：
+
+| 项目 | AIC | AIV |
+| --- | ---: | ---: |
+| caller store | 1530→1516，-14 | 1549→1547，-2 |
+| 对应 handle | 删除 7 个×2 store | 删除 1 个×2 store |
+| branch | 1027→1027 | 1058→1058 |
+| alloca | 5→5 | 5→5 |
+
+最终标准 CCEC caller 符号分别由 `70,064→69,820 B` 和
+`70,992→70,956 B`。shared runtime 与 winner Finish 去调试信息后
+逐字相同。private caller/runtime/finish 和 mixed kernel 共 7 个对象
+去调试信息后也逐字相同，证明 private 机器码没有被条件接口改动带动。
+
+相同辅助 O3 管线下，基线/候选和 AIC/AIV 的 atomic intrinsic 类型与
+数量逐项相同；源码也没有修改任何 atomic 调用点、地址或协议。这里没有
+把辅助管线的绝对 atomic 数冒充成标准 hiipu 对象的绝对统计，只把它用作
+同管线零增量证明。
+
+#### 构建和动态语义闭合
+
+以下均通过：
+
+- CPU shared 全量协议自测和新的角色毒值测试；
+- CPU shared B256/G1 real-compute-count1，依赖签名
+  `b7d985d6edb07078`；
+- CPU shared mixed G0/G1/G2/G4，依赖签名
+  `6437bff09d8f8a11`；
+- CPU private 全量构建；
+- CCEC shared full-swimlane/perf-clock 和 private full-swimlane；
+- 两次 A5 B256/G1 完整泳道。
+
+候选泳道：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_173939_67785/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_174032_69047/ccec/
+```
+
+两份均保持 96 核、1,280 task、73,728 attempted Claim、1,280
+winner、1,024 kernel、依赖签名 `b7d985d6edb07078` 和 drop 0；
+execution、semantic、postprocess 及 real-compute 结果全部 PASS。
+
+三次 perf-clock 为
+`2,269.215/2,264.932/2,258.848 us`，只记录运行背景，不参与本阶段
+保留裁决。
+
+#### SubmitTransition 直接 non-atomic 结果
+
+基线复用上一保留阶段：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_171458_24748/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_171555_26271/ccec/
+```
+
+`AcceptTaskOutputs()` 位于前一个 Submit 返回后、下一个 Submit 开始前，
+所以直接边界是按“前一个 task kind”分组的
+`Submit.end→下一 Submit.start`。四份 raw 的全部 122,784 条
+transition 与逐核 `Atomic∪Kernel` 均为零交集，不需要用扣除近似解释
+结果。
+
+两轮 tick 均值如下；1 tick 是本泳道的 1 ns system-counter tick：
+
+| 前一 task | AIC 基线→候选 | AIC 变化 | AIV 基线→候选 | AIV 变化 |
+| --- | ---: | ---: | ---: | ---: |
+| Alloc | 142.469→120.212 ns | **-15.622%** | 120.575→124.337 ns | +3.120% |
+| QK | 98.116→87.725 ns | **-10.590%** | 83.984→83.452 ns | -0.634% |
+| SF | 97.333→91.295 ns | **-6.203%** | 112.543→103.596 ns | **-7.950%** |
+| PV | 135.718→124.719 ns | **-8.104%** | 104.399→104.501 ns | +0.098% |
+| UP | 193.466→189.777 ns | -1.907% | 189.226→184.214 ns | -2.649% |
+
+这里 AIC 的 Alloc/QK/SF/PV 都实际删除赋值，四项在两轮逐一同向；
+AIV 只有 SF 实际删除一个 handle，SF 两轮分别下降
+`7.955%/7.945%`。AIV Alloc 的 `+3.120%`、PV 的近似持平以及没有
+`Accept` 的 UP 变化都作为布局对照保留，不能被 SF 的直接收益掩盖。
+
+四份 raw 共同且有下一 actor 的固定 nonwinner 人口为 117,852：
+
+```text
+true-loser 68,732
+not-attempted 49,120
+```
+
+逐 actor 把 EfDrain、Claim outer、post-Claim tail 与
+SubmitTransition 都扣除 `Atomic∪Kernel` 后，四段精确闭合：
+
+| 固定人口 | 核型 | Transition | 完整四段 actor |
+| --- | --- | ---: | ---: |
+| true-loser | AIC | **-12.261%** | **-6.224%** |
+| true-loser | AIV | **-2.286%** | **-0.618%** |
+| true-loser | 全核 | **-5.357%** | **-2.377%** |
+| not-attempted | AIC | **-3.349%** | **-1.861%** |
+| not-attempted | AIV | -0.228% | +0.684% |
+| not-attempted | 全核 | **-1.585%** | -0.174% |
+| 全 nonwinner | AIC | **-8.155%** | **-4.489%** |
+| 全 nonwinner | AIV | **-1.606%** | -0.133% |
+| 全 nonwinner | 全核 | **-3.936%** | **-1.538%** |
+
+#### 决策
+
+本阶段保留。直接消费者边界与静态消减完全对应：AIC 四类受影响
+transition 全部改善，AIV 唯一受影响的 SF transition 两轮稳定改善；
+固定 true-loser、全 nonwinner 的 Transition 和完整 actor 也都下降。
+
+同时明确保留反向证据：AIV Alloc transition 回退 `3.120%`，
+not-attempted AIV 完整 actor 回退 `0.684%`。它们没有推翻实际消费者
+边界和全 nonwinner 闭合，但说明代码布局仍会搬移未改业务区域，后续
+候选继续按相同分角色直接口径裁决。
