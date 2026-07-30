@@ -16049,3 +16049,134 @@ non-atomic 闭合。
 atomic、Claim 或失败路径语义；CCEC O3 精确删除五类 task 对旧和的 GM
 读取，两轮 A5 的 tail 与相邻 Transition 同时闭合，AIC/AIV 均未把
 收益搬到下一 Submit。
+
+### 2026-07-30：只跳过 UP 未参选核的零输出重复校验
+
+#### 可证明的支配关系
+
+shared Submit 在 Claim 前调用 `BeginSharedCallbackSubmit()`，把本 actor
+的 `shared_result` 重置为 `(task_id, 0)`。UP 的 fresh output 数量为
+编译期常量 0；从这次重置到 Claim 返回之间没有代码写
+`shared_result`。因此，同时满足下列条件时，Claim 后再次读取
+`producer/count` 并与 `(task_id, 0)` 比较是重复工作：
+
+- 当前 task 是 UP；
+- 当前核没有参与 Claim，即 `claim.attempted == false`；
+- 未参选核不可能成为 winner。
+
+原 96/32/64 角色合同下，AIC 不参与 UP Claim，AIV 参与 UP Claim。
+最终实现据此增加 `PrepareSharedTaskOutputsAfterClaim<Kind>()`：只对
+UP not-attempted 直接返回；UP true-loser、winner 以及其他 task
+仍执行完整 `PrepareSharedTaskOutputs()`。这不是按运行结果猜测输出
+状态，而是复用同一 Submit 内 Claim 前已完成的 reset。
+
+#### 两个已撤回的过宽候选
+
+第一版按 `!claim.won` 跳过全部 UP nonwinner 的重复检查。它让 AIC
+not-attempted 的最小闭合区间下降约 28.35%，但 AIV true-loser 的
+`tail + SubmitTransition` 一致回退约 8.81%。增加
+`__builtin_expect(!won, 1)` 后，AIV 回退仍约 8.82%。这说明 true-loser
+路径虽能删除两次读取，却改变了 AIV 相邻代码布局，收益被搬到下一
+Submit；两版都已撤回。
+
+对应过程数据为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_210050_398121/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_210145_399196/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_210743_406457/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_210835_407513/ccec/
+```
+
+最终版收窄到 `!claim.attempted`，不再触碰 AIV true-loser 的检查路径。
+
+#### CCEC O3 与 atomic 冻结证据
+
+最终 full-swimlane AIC/AIV O3 IR 与上一保留提交逐项比较：
+
+- AIC UP not-attempted 路径删除 Claim 后对 `producer/count` 的两次
+  GM 读取及比较；
+- AIV UP participant 路径仍保留完整身份和空输出检查；
+- AIC caller `.text` 从 `71,872 B` 降至 `71,704 B`，减少 `168 B`；
+  AIV caller 保持 `73,528 B`；
+- AIC/AIV alloca 均保持 5；
+- 两个核型的 atomic 调用均保持 92 个：
+  `ADD.G.s32=9`、`ADD.G.s64=65`、`EXCH.G.s32=3`、
+  `EXCH.G.s64=6`、`EXCH.G.u64=6`、`MAX.G.s64=3`；
+- atomic 调用类型、参数形态和顺序不变，本阶段没有修改 Claim、
+  TensorMap 发布或完成协议。
+
+#### 正确性与完整泳道
+
+CPU shared 全量协议门槛、B256/G1 和 mixed G0/G1/G2/G4 均通过。
+定向用例另外证明：
+
+- UP not-attempted 复用 Begin 写入的 `(task_id, 0)`；
+- UP participant 遇到错误 task id 或非空输出时仍拒绝；
+- 其他 task 继续使用原完整检查。
+
+CCEC shared/private 构建均通过。两份 A5 B256/G1 完整泳道为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_211205_414313/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_211353_416628/ccec/
+```
+
+两份均保持 96 核、1,280 task、73,728 attempted Claim、1,280 winner、
+1,024 Kernel、4,288 DCCI、依赖签名 `b7d985d6edb07078` 和 drop 0；
+execution、semantic、postprocess 与 real-compute 全部 PASS。
+
+#### 固定人口的直接 non-atomic 结果
+
+基线为上一三角前缀提交的两份完整泳道：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_202756_347202/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_203014_349705/ccec/
+```
+
+四份 raw 固定同一 `(core, task, attempted 状态)` 的 UP nonwinner，并
+排除没有下一 Submit 的末 task，共得到每轮 23,483 个 actor：
+
+- AIC not-attempted：8,160 个，即 `32 × 255`；
+- AIV true-loser：15,323 个，作为未修改路径的角色负对照。
+
+逐核先合并 `Atomic∪Kernel`，再扣除与
+`Claim.end→Submit.end`、`Submit.end→next Submit.start` 的交集。
+四轮所有目标区间的 Atomic/Kernel overlap 都为 0，且逐 actor 的
+`tail + Transition = closure` 精确成立。
+
+| 固定 UP nonwinner | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| 全体 tail | 50.392 ns | 45.995 ns | **-8.726%** |
+| 全体 SubmitTransition | 214.566 ns | 193.797 ns | **-9.679%** |
+| 全体闭合 | 264.958 ns | 239.792 ns | **-9.498%** |
+| AIC not-attempted tail | 40.708 ns | 26.905 ns | **-33.907%** |
+| AIC not-attempted SubmitTransition | 206.766 ns | 150.089 ns | **-27.411%** |
+| AIC not-attempted 闭合 | 247.474 ns | 176.994 ns | **-28.480%** |
+| AIV true-loser tail | 55.549 ns | 56.161 ns | +1.101% |
+| AIV true-loser SubmitTransition | 218.719 ns | 217.073 ns | -0.752% |
+| AIV true-loser 闭合 | 274.268 ns | 273.234 ns | -0.377% |
+
+全体闭合两轮分别下降 `9.413%/9.583%`，AIC 分别下降
+`28.366%/28.593%`。AIV tail 两轮均小幅增加，但紧邻 Transition
+完整抵消，闭合两轮分别下降 `0.282%/0.471%`；因此只能表述为
+“AIV 基本持平、无明确回退”，不把它宣称成显著收益。
+
+10 个独立低扰动 perf-clock 进程为：
+
+```text
+2246.021, 2245.303, 2265.050, 2305.534, 2344.111,
+2276.140, 2281.573, 2260.927, 2260.584, 2304.703 us
+```
+
+中位数 `2270.595 us`，范围 `2245.303～2344.111 us`。全部运行的
+execution、semantic、postprocess 均 PASS。整体时间只作 atomic 与
+winner 时序波动下的背景，不参与本阶段裁决。
+
+#### 决策
+
+本阶段保留。修改只消费 Claim 已有的 `attempted` 结果，不新增状态，
+不改变 atomic、角色人口、winner 或失败路径；直接消费者 AIC
+not-attempted 的最小 non-atomic 闭合两轮稳定下降约 28.48%，而未修改
+的 AIV true-loser 闭合恢复到基本持平，避免了过宽候选的 8.8% 回退。

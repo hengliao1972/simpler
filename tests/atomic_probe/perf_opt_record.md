@@ -4195,3 +4195,45 @@ CPU shared 全量/B256/mixed、CCEC shared/private、两份完整 A5 泳道和
 task 0～3、拒绝路径、最大 task-id 定向测试均通过。详细的失败语义、
 IR 字段路径、分核型结果和撤回路线见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.20 UP 未参选核复用 Claim 前的零输出状态
+
+**[已保留] 只删除 AIC UP not-attempted 的重复 producer/count 校验**
+
+UP 不产生 fresh output。`BeginSharedCallbackSubmit()` 已在 Claim 前把
+本 actor 的 `shared_result` 重置为 `(task_id, 0)`；原角色合同下 AIC
+不参与 UP Claim，也不可能成为 winner。最终候选只在
+`Kind==Up && !claim.attempted` 时复用这个已建立的状态，UP
+true-loser/winner 和其他 task 仍走完整检查。
+
+曾尝试按 `!claim.won` 覆盖全部 UP nonwinner：AIC 闭合下降约 28.35%，
+但 AIV true-loser 闭合一致回退约 8.81%；分支提示不能消除该回退，
+两版均撤回。收窄版不再修改 AIV participant 路径。
+
+CCEC O3 中，AIC caller 删除两次 GM 读取并缩小 `168 B`，AIV caller
+大小不变；AIC/AIV alloca 均保持 5，atomic intrinsic 均保持 92 个，
+类型、参数形态和顺序不变。CPU shared 全量/B256/mixed、CCEC
+shared/private 构建及两份 A5 B256/G1 完整泳道全部通过。
+
+最终泳道：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_211205_414313/ccec/
+  pa_scheduler_shared_swimlane_20260730_211353_416628/ccec/
+```
+
+与上一三角前缀提交的两份基线固定 23,483 个相同 UP nonwinner，并逐核
+扣除 `Atomic∪Kernel` 后：
+
+| 最小闭合口径 | 全体 | AIC not-attempted | AIV true-loser |
+| --- | ---: | ---: | ---: |
+| post-Claim tail | -8.726% | **-33.907%** | +1.101% |
+| SubmitTransition | -9.679% | **-27.411%** | -0.752% |
+| tail + Transition | **-9.498%** | **-28.480%** | -0.377% |
+
+AIC 闭合两轮均下降约 28%；AIV tail 虽小幅增加，但相邻 Transition
+完整抵消，闭合两轮分别下降 `0.282%/0.471%`，只能判为基本持平、
+没有明确回退。10 次 perf-clock 中位数 `2270.595 us`，仅作整体背景。
+完整支配关系、两版撤回结果、静态证据和逐轮数据见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。

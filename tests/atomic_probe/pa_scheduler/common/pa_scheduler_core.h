@@ -4126,8 +4126,9 @@ PA_DEVICE bool SubmitCallbackTask(
     // fresh Output 的返回值是 task/slot 符号，不依赖哪个 worker 获胜。
     // 在跨 TU finish 前为所有 replay actor 建立同一句柄集，保证 loser
     // 返回后也能继续构造本核后续 task 的输入引用。
-    if (!PrepareSharedTaskOutputs(
-            context.shared_result, static_cast<int32_t>(task_id), Kind
+    if (!PrepareSharedTaskOutputsAfterClaim<Kind>(
+            context.shared_result, static_cast<int32_t>(task_id),
+            claim.attempted
         )) {
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;

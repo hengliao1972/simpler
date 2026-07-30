@@ -820,6 +820,38 @@ bool RunLoserZeroTensorMapAccessTest() {
             TaskKind::Sf
         );
 
+    WorkerState up_worker{};
+    up_worker.local_index = kTask;
+    SubmitContext up_context{};
+    up_context.shared_result.Reset(91);
+    BeginSharedCallbackSubmit(up_worker, up_context);
+    const bool up_not_attempted_prepared =
+        PrepareSharedTaskOutputsAfterClaim<TaskKind::Up>(
+            up_context.shared_result,
+            static_cast<int32_t>(kTask), false
+        );
+    const bool up_not_attempted_keeps_reset_state =
+        up_not_attempted_prepared &&
+        up_context.shared_result.TaskId() ==
+            static_cast<int32_t>(kTask) &&
+        up_context.shared_result.Empty();
+
+    SharedTaskOutputs poisoned_up{};
+    poisoned_up.Reset(static_cast<int32_t>(kTask + 1U));
+    const bool up_participant_rejects_wrong_task =
+        !PrepareSharedTaskOutputsAfterClaim<TaskKind::Up>(
+            poisoned_up, static_cast<int32_t>(kTask), true
+        );
+    poisoned_up.Reset(static_cast<int32_t>(kTask));
+    const bool poisoned_up_seeded =
+        poisoned_up.AddOutputRef(
+            static_cast<int32_t>(kTask), 0
+        );
+    const bool up_participant_rejects_nonempty =
+        !PrepareSharedTaskOutputsAfterClaim<TaskKind::Up>(
+            poisoned_up, static_cast<int32_t>(kTask), true
+        );
+
     const bool ok =
         outputs_prepared && finished &&
         state->fatal.value == 0 &&
@@ -840,6 +872,10 @@ bool RunLoserZeroTensorMapAccessTest() {
         output2.output_slot == 2 &&
         wrong_task_rejected && seeded &&
         nonempty_rejected &&
+        up_not_attempted_keeps_reset_state &&
+        up_participant_rejects_wrong_task &&
+        poisoned_up_seeded &&
+        up_participant_rejects_nonempty &&
         stats.result.submits == 1 &&
         stats.declared_task_count == 0 &&
         turns_unchanged &&

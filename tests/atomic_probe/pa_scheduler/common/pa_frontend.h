@@ -272,6 +272,20 @@ PA_DEVICE bool PrepareSharedTaskOutputs(
     }
     return outputs.Size() == output_count;
 }
+
+template <TaskKind Kind>
+PA_DEVICE bool PrepareSharedTaskOutputsAfterClaim(
+    SharedTaskOutputs &outputs, int32_t task_id, bool attempted
+) {
+    // UP 不产生 fresh output。BeginSharedCallbackSubmit 已在 Claim 前把
+    // 本 actor 的 (producer,count) 重置为 (task_id,0)；没有参与 Claim
+    // 的核不可能成为 winner，因此无需在 Claim 后重新读取这两个字段。
+    // true-loser 和 winner 仍走完整检查，保持参与 Claim 路径原有诊断。
+    if constexpr (Kind == TaskKind::Up) {
+        if (__builtin_expect(!attempted, 0)) return true;
+    }
+    return PrepareSharedTaskOutputs(outputs, task_id, Kind);
+}
 #endif
 
 // TaskArgs 同时容纳 orchestration 栈上的 descriptor、GM 中已物化的 descriptor，
