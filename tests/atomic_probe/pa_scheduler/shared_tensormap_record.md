@@ -15905,3 +15905,147 @@ perf-clock 为 `2308.338/2287.742/2253.520 us`，中位数
 删除 `slot0-only` 的第二个 header 读取；两轮 A5 固定同核同 task、
 相同入口形态和 atomic 形态后，直接 non-atomic EfDrain 在 AIC/AIV
 分别下降约 `11.0%/13.4%`。正确性矩阵、完整泳道和宽人口结果均已闭合。
+
+### 2026-07-30：用三角前缀覆盖 split replay 的 task-id 累计校验值
+
+#### 问题与两条撤回路线
+
+shared split caller 每成功记录一个 task，原实现都会执行：
+
+```cpp
+runtime.task_id_sum += task_id;
+```
+
+`task_id_sum` 只在 replay 结束后的协议闭合中证明本核确实重放了
+`0..N-1`；winner Finish、Claim、TensorMap 和 kernel 都不消费中间值。
+因此首先尝试把精确求和保留在 caller 局部变量，统一出口只写回一次。
+
+这条路线的语义可以闭合，但运行形态失败：
+
+| 局部累计形态 | tail | SubmitTransition | tail + Transition |
+| --- | ---: | ---: | ---: |
+| `uint64_t`，两轮固定人口 | **-10.194%** | +7.050% | **+0.601%** |
+| `uint32_t`，一轮固定人口 | **-9.560%** | +6.354% | **+0.406%** |
+
+两种宽度都把第二个 SSA 值从 replay 入口携带到统一出口。`uint64_t`
+候选使 AIC caller `.text` 增加 `232 B`；改成 `uint32_t` 后反而相对
+原基线增加 `480/256 B`（AIC/AIV）。tail 的表面收益被紧邻的纯
+non-atomic Transition 吞回，因此两版都完整撤回。四段 closure 中
+未修改的 EfDrain 波动不能用来掩盖这个最小闭合区间回退。
+
+这也不同于历史上“replay 结束后按完成数计算 `N(N-1)/2`”的候选：
+后者无法精确区分 Record 前失败和 Record 后、Finish 前失败，而且已有
+6/6 perf-clock 回退记录，本轮没有恢复它。
+
+#### 保留修改：在每个成功记录点覆盖三角前缀
+
+`RecordSharedSplitReplayTask()` 在写 `task_id_sum` 前已经严格验证：
+
+```text
+runtime.reserved == 0
+task_id == runtime.stats.result.submits
+```
+
+因此 task `N` 成功记录时，此前成功序列必为 `0..N-1`，当前精确和可以
+直接写成：
+
+```cpp
+uint64_t n = task_id;
+runtime.task_id_sum = n * (n + 1) / 2;
+```
+
+它仍在每个 Record 成功点保存精确故障前缀：
+
+- Record 前失败或 Record 拒绝：保留前一个成功前缀；
+- Record 成功、随后 Close/Finish 失败：已经包含当前 task；
+- 正常完整 replay：最终仍为 `N(N-1)/2`。
+
+与 caller 局部累计不同，该写法不增加跨 task 活跃的 SSA，只把每个
+task 的 block-local `load + add + store` 换成基于已有 task id 的
+`add + mul + shift + store`。定向测试覆盖 task 0～3、`reserved`
+拒绝、跳号拒绝和 `kMaxTasks-1` 上界，最终上界和为 `9,467,776`。
+
+#### CCEC O3 与 atomic 冻结证据
+
+使用与正式 full-swimlane 相同的 CCEC `-O3` 参数生成 AIC/AIV IR：
+
+- AIC/AIV 五类 task 的 `task_id_sum` GM load 全部消失；
+- 每类只留下 task-id 的 `add nuw`、`mul nuw`、`lshr` 和一次 GM store；
+- 没有新增 alloca，也没有第二个 replay 长活跃累计量；
+- caller `.text` 从 AIC `71,864→71,872 B`，只增加 `8 B`；
+  AIV 保持 `73,528 B`；
+- atomic intrinsic 仍各为 92 个调用：
+  `ADD.G.s32=9`、`ADD.G.s64=65`、`EXCH.G.s32=3`、
+  `EXCH.G.s64=6`、`EXCH.G.u64=6`、`MAX.G.s64=3`；
+  规范化的调用类型、参数形态和顺序逐项相同；
+- private AIC/AIV caller、split runtime、Finish 六个 `.text` 与基线
+  逐字相同。
+
+#### 正确性与固定 nonwinner 结果
+
+CPU shared 全量协议门槛、B256/G1、mixed context、CCEC shared/private
+构建和两份 A5 B256/G1 完整泳道全部通过。候选泳道为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_202756_347202/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_203014_349705/ccec/
+```
+
+两份均保持 96 核、1,280 task、73,728 Claim、1,280 winner、1,024
+Kernel、依赖签名 `b7d985d6edb07078` 和 drop 0；execution、semantic、
+postprocess 与 real-compute 全部 PASS。
+
+基线复用上一保留阶段：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_194709_278089/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_194821_280225/ccec/
+```
+
+四份 raw 固定相同 `(core,task,status)` 且有下一 Submit 的 117,830 个
+nonwinner。逐核合并并扣除 `Atomic∪Kernel`；tail 和 Transition 的
+交集均为零：
+
+| 固定 nonwinner | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| post-Claim tail | 73.959 ns | 73.112 ns | **-1.145%** |
+| SubmitTransition | 123.789 ns | 119.189 ns | **-3.716%** |
+| tail + Transition | 197.748 ns | 192.301 ns | **-2.755%** |
+
+按核型闭合的 `tail + Transition`：
+
+| 核型 | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| AIC，38,975 个 actor | 193.960 ns | 192.621 ns | **-0.690%** |
+| AIV，78,855 个 actor | 199.621 ns | 192.144 ns | **-3.746%** |
+
+继续拆分 Claim 结果后，true-loser 的 AIC/AIV 两段闭合分别变化
+`-0.251%/-5.845%`；not-attempted AIC 为 `-1.231%`，但
+not-attempted AIV 为 `+0.616%`。直接 tail 也并非每个子类都同向：
+true-loser AIC Alloc、AIV Alloc、AIV SF 分别为
+`+2.568%/+1.181%/+6.537%`。这些反向子类完整保留；保留依据是修改会
+同时影响代码布局的最小相邻闭合区间，在全核及 AIC/AIV 聚合上均同向，
+不是宣称每个 task 类别的 tail 都下降。
+
+完整四段 actor 的 AIC/AIV/全核变化为
+`-0.436%/-6.555%/-4.671%`。其中 EfDrain 和 Claim outer 不是本候选
+修改目标，只作为宽边界披露；保留决定采用直接受影响且能防止边界搬移的
+`tail + Transition`。
+
+10 个独立低扰动 perf-clock 进程为：
+
+```text
+2296.864, 2254.122, 2289.972, 2274.020, 2280.303,
+2269.871, 2289.313, 2275.582, 2276.348, 2281.879 us
+```
+
+中位数 `2278.326 us`，范围 `2254.122～2296.864 us`。它没有显示整体
+回退，但仍只作 atomic/winner 时序波动下的背景证据，不替代固定
+non-atomic 闭合。
+
+#### 决策
+
+本阶段保留。它没有把逐 task 诊断状态延迟到统一出口，也没有改变任何
+atomic、Claim 或失败路径语义；CCEC O3 精确删除五类 task 对旧和的 GM
+读取，两轮 A5 的 tail 与相邻 Transition 同时闭合，AIC/AIV 均未把
+收益搬到下一 Submit。

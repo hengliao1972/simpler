@@ -584,6 +584,61 @@ bool RunLocalClaimAttemptAccountingTest() {
     return ok;
 }
 
+bool RunSplitReplayTaskIdPrefixTest() {
+    CompeteFirstSplitRuntimeState runtime{};
+    runtime.task_id_sum = 99;
+
+    runtime.stats.result.submits = 0;
+    const bool task0_ok =
+        RecordSharedSplitReplayTask(runtime, 0) &&
+        runtime.task_id_sum == 0;
+
+    runtime.stats.result.submits = 1;
+    const bool task1_ok =
+        RecordSharedSplitReplayTask(runtime, 1) &&
+        runtime.task_id_sum == 1;
+
+    runtime.stats.result.submits = 2;
+    const bool task2_ok =
+        RecordSharedSplitReplayTask(runtime, 2) &&
+        runtime.task_id_sum == 3;
+
+    runtime.stats.result.submits = 3;
+    runtime.reserved = 7;
+    const bool reserved_rejected =
+        !RecordSharedSplitReplayTask(runtime, 3) &&
+        runtime.task_id_sum == 3;
+
+    runtime.reserved = 0;
+    runtime.stats.result.submits = 4;
+    const bool skipped_task_rejected =
+        !RecordSharedSplitReplayTask(runtime, 3) &&
+        runtime.task_id_sum == 3;
+
+    runtime.stats.result.submits = 3;
+    const bool task3_ok =
+        RecordSharedSplitReplayTask(runtime, 3) &&
+        runtime.task_id_sum == 6;
+
+    runtime.stats.result.submits = kMaxTasks - 1U;
+    const bool max_task_ok =
+        RecordSharedSplitReplayTask(runtime, kMaxTasks - 1U) &&
+        runtime.task_id_sum ==
+            static_cast<uint64_t>(kMaxTasks - 1U) *
+                kMaxTasks / 2U;
+
+    const bool ok =
+        task0_ok && task1_ok && task2_ok &&
+        reserved_rejected && skipped_task_rejected &&
+        task3_ok && max_task_ok;
+    std::printf(
+        "[ORDERED_SUBMIT] split_task_id_prefix=%s sum=%llu\n",
+        ok ? "PASS" : "FAIL",
+        static_cast<unsigned long long>(runtime.task_id_sum)
+    );
+    return ok;
+}
+
 bool ClaimAndInsertEvidenceMatches(
     const SchedulerState &state, uint32_t task_count
 ) {
@@ -1142,6 +1197,8 @@ bool RunIndependentKernelExecutionTest() {
 int main() {
     const bool claim_accounting_ok =
         RunLocalClaimAttemptAccountingTest();
+    const bool task_id_prefix_ok =
+        RunSplitReplayTaskIdPrefixTest();
     const bool loser_ok = RunLoserZeroTensorMapAccessTest();
     const bool fanin_compaction_ok =
         RunReadyFaninPrefixCompactionTest();
@@ -1150,7 +1207,7 @@ int main() {
     const bool overlap_ok = RunInsertReleaseBeforeBuildTest();
     const bool execution_ok =
         RunIndependentKernelExecutionTest();
-    if (!claim_accounting_ok || !loser_ok ||
+    if (!claim_accounting_ok || !task_id_prefix_ok || !loser_ok ||
         !fanin_compaction_ok || !pa_up_shape_ok ||
         !overlap_ok || !execution_ok) {
         std::fprintf(

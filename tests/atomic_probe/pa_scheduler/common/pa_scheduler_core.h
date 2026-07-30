@@ -3265,7 +3265,11 @@ PA_DEVICE bool RecordSharedSplitReplayTask(
             runtime.stats.result.submits) {
         return false;
     }
-    runtime.task_id_sum += task_id;
+    // 顺序检查已经证明此前成功记录的是 0..task_id-1。直接覆盖当前
+    // 三角前缀，保留每个成功点的故障现场，同时省掉 block-local 旧值读取。
+    const uint64_t task_id_u64 = task_id;
+    runtime.task_id_sum =
+        task_id_u64 * (task_id_u64 + 1U) / 2U;
     return true;
 }
 #endif

@@ -4142,3 +4142,56 @@ raw 中相同 `(core,task)` 的 `slot0-only`、无 Kernel、相同旧 slot kind
 本阶段按“直接受影响的非 atomic 区域决定保留”的规则通过；完整的
 入口分布、CFG、测试矩阵与离线重放口径见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.19 shared split replay task-id 累计校验值改为三角前缀覆盖
+
+**[已保留] 删除每个 task 对 block-local 旧和的读取，不引入长活跃累计量**
+
+`task_id_sum` 只用于 replay 结束后的协议闭合。原 shared caller 在每个
+task 成功记录点执行一次 block-local `load + add + store`。先尝试过
+caller 局部精确累计、统一出口写回：
+
+| 已撤回候选 | tail | SubmitTransition | tail + Transition |
+| --- | ---: | ---: | ---: |
+| `uint64_t` 局部累计 | **-10.194%** | +7.050% | **+0.601%** |
+| `uint32_t` 局部累计 | **-9.560%** | +6.354% | **+0.406%** |
+
+两版都因 replay 长活跃 SSA 和代码布局把 tail 收益搬到下一 Submit，
+因此没有保留。
+
+最终候选复用 Record 已有的 `task_id == submits` 顺序证明，在每个成功点
+直接覆盖 `task_id*(task_id+1)/2`。这样保留 Record 前后失败的精确前缀，
+同时把五类 task 的旧值 RMW 改成 `add + mul + shift + store`，没有统一
+出口写回和第二个长活跃值。
+
+CCEC O3 中 AIC/AIV 五组 `task_id_sum` load 均消失；caller `.text`
+仅为 AIC `+8 B`、AIV 不变。atomic intrinsic 各 92 个调用的类型、数量
+和规范化顺序完全相同；private caller/runtime/Finish 六个 `.text`
+逐字相同。
+
+两份候选 A5 B256 泳道：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_202756_347202/ccec/
+  pa_scheduler_shared_swimlane_20260730_203014_349705/ccec/
+```
+
+均保持 73,728 Claim、1,280 winner、1,024 Kernel、依赖签名和 drop 0。
+与上一提交两份基线固定 117,830 个相同 nonwinner，并扣除
+`Atomic∪Kernel` 后：
+
+| 最小闭合边界 | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| post-Claim tail | 73.959 ns | 73.112 ns | **-1.145%** |
+| SubmitTransition | 123.789 ns | 119.189 ns | **-3.716%** |
+| tail + Transition | 197.748 ns | 192.301 ns | **-2.755%** |
+
+AIC/AIV 的 `tail + Transition` 分别下降 `0.690%/3.746%`，没有出现局部
+累计版的边界搬移回退。10 个独立 perf-clock 进程中位数为
+`2278.326 us`、范围 `2254.122～2296.864 us`，只作整体背景。
+
+CPU shared 全量/B256/mixed、CCEC shared/private、两份完整 A5 泳道和
+task 0～3、拒绝路径、最大 task-id 定向测试均通过。详细的失败语义、
+IR 字段路径、分核型结果和撤回路线见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
