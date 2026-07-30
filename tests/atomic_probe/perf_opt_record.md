@@ -3410,14 +3410,19 @@ cache 与实际加载 host SO SHA 一致，所有真机门禁随即闭合。后�
 - 96 个 worker 全量回放同一任务计划；
 - Alloc/QK-PV/SF-UP 分别保持 `96/32/64` 个 Claim 候选；
 - ClaimMax 的类型、地址选择和候选人口冻结；
-- perf-clock 决定端到端护栏，full-swimlane 负责区分 atomic、Kernel 与
-  非 atomic loser 控制工作；
-- 当前保留条件为 loser 非 atomic 工作有效下降，同时端到端回退不超过
-  约 2%。
+- full-swimlane 负责区分 Atomic、Kernel 与非 atomic loser/nonwinner
+  控制工作，扣除 Atomic 与 Kernel 后的固定人口 core-time 是本轮唯一
+  性能裁决指标；
+- perf-clock 和完整 Submit 总时间只记录运行背景，不再作为候选保留或
+  撤回的门槛；atomic 到达与轮询波动也不能否定已经闭合的非 atomic 收益；
+- 当前保留条件为正确性合同不变，且候选直接影响的非 atomic 区域及其
+  合计出现可复核下降。
 
 true-loser 定义为 `Claim attempted && !won`。EfDrain 非 atomic 时间从
 父区间扣除 Kernel 与 Atomic 的区间并集；Claim outer 从 Claim 父区间
-扣除 atomic；不把 atomic 总线等待冒充 scalar 指令消减。
+扣除 Atomic；不把 atomic 总线等待冒充 scalar 指令消减。比较同时报告
+固定 all-nonwinner、true-loser、not-attempted 人口及 true-loser actor
+交集，避免 winner 身份变化制造伪收益。
 
 ### 13.2 shared DrainReady 两槽扫描
 
@@ -3456,8 +3461,42 @@ ClaimMax 调用保持 `73,728`，但动态轮询使所有 logical atomic calls �
 12+12 个独立 perf-clock 样本中，基线/候选 mean 为
 `2,292.263/2,304.011 us`，候选回退 `0.513%`；median 回退
 `0.361%`。其中位置对称的后 4+4 样本 mean/median 回退
-`0.246%/0.238%`。非 atomic loser 降幅明确且端到端低于 2% 护栏，
-因此保留。
+`0.246%/0.238%`。这些总时钟数据仅保留为运行背景；本阶段保留的依据是
+目标 true-loser 非 atomic 工作下降 `3.541%`，交集 actor 同向下降
+`3.504%`。
 
 更完整的正确性证明、逐区域均值、动态 atomic 变化和产物说明见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.3 orchestration 输出句柄压缩
+
+**[已撤回] shared 状态内部 16B 引用压缩为 8B**
+
+候选保持 `SharedTaskOutputs`、`TaskArgs`、`SubmitContext` 和跨核
+shared-output ABI 不变，只把 `PaOrchestrationState` 内长期保存的 8 个
+纯 `(task_id, slot)` 引用从 16B 压为 8B，并在 winner 构参时恢复完整
+引用。shared 状态从 1472B 降至 1408B，private 完全不变。
+
+CPU shared/private、CCEC shared/private 和完整 B256 泳道的正确性门槛均
+通过，但性能闭合不支持保留：
+
+- 真正受影响的 Alloc/QK/SF/PV 四类 all-nonwinner 非 atomic
+  transition 合计回退 `0.200%`；
+- 多输出保存区变短，后继完整引用恢复区变长，表现为成本搬移；
+- 无句柄操作的 UP 负对照变化 `+28.746%`，动态 poll 也发生明显变化；
+- 72,448 个 true-loser 的四类非 atomic 工作合计回退 `3.067%`，
+  相同 actor 交集仍回退 `3.050%`；
+- 6 组紧邻交错 perf-clock 的候选/HEAD mean 为
+  `2288.519/2288.654 us`，只作为运行背景记录，不参与撤回裁决。
+
+候选、HEAD 对照泳道分别为：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_134451_3711242/ccec/
+  pa_scheduler_shared_swimlane_20260730_134934_3717013/ccec/
+```
+
+候选已完整撤回。缩小结构体不能替代目标区域收益；后续不再重复该方向。
+完整逐 transition、正确性合同和交错样本见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。

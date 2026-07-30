@@ -14006,3 +14006,131 @@ atomic 协议，也解释了非 atomic 工作下降没有直接变成端到端�
 约 `3.54%`，而端到端回退约 `0.24%～0.51%`。这符合“优先消减 loser
 本地控制工作，允许工作和等待迁移到 winner/atomic，但总时间不得回退
 超过 2%”的当前验收口径。
+
+### 2026-07-30：压缩 orchestration 输出句柄（撤回）
+
+#### 候选边界
+
+shared `PaOrchestrationState` 原本长期保存 8 个完整的 16B
+`FdwicOutputRef`。PA Case1 在这层只使用 flags/view 全零的直接引用，
+因此本地候选曾增加 8B 的
+`(producer_task_id, output_slot, reserved)` 内部句柄：
+
+- `AcceptTaskOutputs()` 仍消费已经完成 `Reset/AddOutputRef` 和数量校验的
+  `SharedTaskOutputs`，随后压缩保存；
+- SF/PV/UP winner 构造后继 `TaskArgs` 时再恢复完整 16B 引用；
+- `TaskArgs`、`SubmitContext`、shared-output 跨核 ABI、loser 的
+  `shared_result` 维护和校验全部不变；
+- private 仍保存 descriptor 指针；
+- shared `PaOrchestrationState` 从 1472B 缩小到 1408B。
+
+该方案不同于历史上已经否决的“按 task id 直接重建 symbol、删除 loser
+结果维护”候选。它保留完整返回对象合同，只试图减少每个 actor 在
+Submit 之间搬运未使用 view 字段的工作。
+
+按 B256/G1 的固定任务计划，每核在 Alloc/QK/SF/PV 后分别保存
+`3/1/3/1` 个句柄，全局共 196,608 次保存；完整句柄恢复仅发生在 winner
+消费路径，全局 2,048 次。UP 后没有句柄保存或恢复，可作为负对照。
+
+#### 正确性与构建门槛
+
+过程态曾增加以下门槛，均通过后才进入性能测试：
+
+- shared compact type 的 size、alignment、offset 和 trivial ABI；
+- shared 状态 1408B、private 状态 1408B 及 private 指针布局；
+- `SharedTaskOutputs -> compact -> FdwicOutputRef -> TaskArgs` 往返；
+- SF/PV/UP 的 8 个保存字段和 UP 六个 INPUT/INOUT 引用顺序；
+- 缺失输出、越界 producer/slot、非零 reserved 均 fail-closed；
+- CPU shared symbol/依赖全套测试和 CPU private 全套测试；
+- CCEC shared/private perf-clock、shared full-swimlane 的 AIC/AIV、
+  split runtime/finish、mixed ELF 和 manifest。
+
+候选源码最终已全部撤回，上述过程态测试也随候选类型一并删除；现有正式
+ABI 与测试回到本阶段开始前。
+
+#### 低扰动 perf-clock 背景记录
+
+候选先独立运行 12 次，mean/median 为
+`2,298.883/2,298.601 us`；此前 HEAD 的 12 次记录为
+`2,304.011/2,301.019 us`。由于两组并非紧邻交错，这个约
+`0.10%～0.22%` 的表面差值不用于解释非 atomic 收益。
+
+随后保留候选和 HEAD 两套已编译 artifact，做 6 组紧邻
+“候选 -> HEAD”交错：
+
+| 组 | 候选 | HEAD | 候选减 HEAD |
+| --- | ---: | ---: | ---: |
+| 1 | 2298.795 us | 2309.387 us | -10.592 us |
+| 2 | 2264.700 us | 2270.060 us | -5.360 us |
+| 3 | 2293.829 us | 2294.197 us | -0.368 us |
+| 4 | 2300.177 us | 2286.831 us | +13.346 us |
+| 5 | 2276.154 us | 2281.315 us | -5.161 us |
+| 6 | 2297.457 us | 2290.133 us | +7.324 us |
+| mean | 2288.519 us | 2288.654 us | -0.135 us / -0.006% |
+
+候选端到端没有回退，但也没有超过运行波动的可测收益。按本轮修正后的
+目标，完整 Submit 总时间只作为背景记录，不参与候选去留。
+
+#### 紧邻泳道与成本搬移
+
+候选完整泳道：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_134451_3711242/ccec/
+```
+
+紧邻 HEAD 对照：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_134934_3717013/ccec/
+```
+
+两者 B256/G1 均为 PASS、drop 0，Submit makespan 分别为
+`2,350.688/2,354.747 us`。固定 all-nonwinner transition 为当前
+Submit end 到下一 Submit start，末 task 则到 OrchestrationReplay end：
+
+| transition | HEAD mean | 候选 mean | 变化 |
+| --- | ---: | ---: | ---: |
+| Alloc -> QK，保存 3 个 | 176.490 ns | 159.685 ns | -9.522% |
+| QK -> SF，保存 1 个、恢复 1 个 | 95.273 ns | 105.509 ns | +10.744% |
+| SF -> PV，保存 3 个、恢复 1 个 | 94.147 ns | 85.934 ns | -8.724% |
+| PV -> UP，保存 1 个、恢复 6 个 | 164.207 ns | 180.052 ns | +9.649% |
+| UP -> next，无句柄操作 | 224.527 ns | 289.070 ns | +28.746% |
+
+真正可能受候选影响的前四类 core-time 合计为
+`12.892450 -> 12.918277 ms`，回退 `0.200%`，实质没有收益。
+多输出保存区变短、后继恢复区变长的交替形状，说明候选主要搬移了成本；
+UP 负对照的大幅变化则同时暴露代码布局、cache 和 worker 到达形态的扰动。
+另一份历史 HEAD 泳道 `130222` 与候选比较时，前四类合计变化也只有
+`-0.088%`，结论一致。
+
+72,448 个 true-loser 扣除 Kernel 与 Atomic 后：
+
+| 非 atomic 区域 | HEAD | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| EfDrain control | 6.066472 ms | 5.058975 ms | -16.608% |
+| Claim outer | 6.353490 ms | 8.544258 ms | +34.481% |
+| post-Claim tail | 11.586674 ms | 10.652600 ms | -8.062% |
+| SubmitTransition | 11.860105 ms | 12.710942 ms | +7.174% |
+| 合计 | 35.866741 ms | 36.966775 ms | +3.067% |
+
+两图共有的 71,196 个 true-loser actor 单独比较仍回退 `3.050%`。
+Claim 合同严格保持 122,880 次 actor、73,728 次 attempted、
+1,280 个 winner、72,448 个 true-loser 和 49,152 个
+not-attempted；动态 atomic poll 从 199,184 变为 195,521，进一步说明
+候选改变了到达和等待时序，不能用单张泳道的局部正值替代总体闭合。
+
+#### 决策
+
+该候选撤回，不形成代码提交。原因是：
+
+1. 目标前四类 SubmitTransition 合计没有下降；
+2. 完整 true-loser 非 atomic 工作反而回退约 3.07%；
+3. 8B 内部类型、winner 展开和未来 view 扩展约束增加了维护成本；
+4. 缩小状态本身不是目标，只有可复核的 loser/nonwinner 工作下降才值得
+   保留。
+
+后续继续从保留的两槽 `DrainReady()` 基线推进，不再重复
+orchestration 输出句柄压缩。perf-clock、Submit makespan 和动态 atomic
+poll 继续保留在记录中用于说明运行背景，但不再作为本轮非 atomic 候选的
+保留或撤回门槛。
