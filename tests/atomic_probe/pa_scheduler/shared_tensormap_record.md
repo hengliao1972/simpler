@@ -15522,3 +15522,108 @@ AIV 没有 O3 运行指令消减，它的变化只作为布局对照，不归因
 两轮独立 raw 严格对应，tail 的均值与中位数都稳定下降；固定 AIC 和
 全核完整 actor 也闭合改善。该修改不触碰 atomic，不以整体 Submit
 波动代替非 atomic 证据。
+
+### 2026-07-30：shared output symbol 同源恢复三种候选均撤回
+
+#### 出发点和统一裁决边界
+
+`PrepareSharedTaskOutputs()` 已经生成并验证稳定的
+`(producer_task_id, output_slot)`，Submit 成功返回后
+`AcceptTaskOutputs()` 又从 `shared_result` 恢复相同句柄。CCEC O3
+证明，基线真正还存在的运行冗余只位于 AIV：
+
+- Alloc：每次读取一次 `output_count` 和一次 `producer_task_id`，
+  再为三个 slot 生成边界比较和 invalid 选择链；
+- SF：读取相同两个字段，再为两个 slot 生成选择链；
+- AIC SF、AIV QK/PV 已经由 O3 复用现有值，不存在可归因的字段复读。
+
+B256 的直接目标各有 16,384 条 AIV Transition：
+`Alloc→QK` 和 `SF→PV`。四份基线/候选 raw 中，每份完整闭合
+122,784 条 `Submit.end→下一 Submit.start`；所有这些 Transition
+与 Atomic、Kernel、DCCI 都是零交叠，因此结果就是纯 non-atomic
+控制和访存时间，不需要再做扣除近似。基线固定为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_180511_110699/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_180604_112276/ccec/
+```
+
+#### 候选一：从 batch plan 直接传 task id
+
+第一版在外层保存 QK/SF/PV/UP offset，并在 Submit 成功后用
+`batch_start + offset` 直接构造句柄。CPU shared 全量、B256、mixed
+和 CPU private 均通过；两份 A5 完整泳道也保持 96 核、1,280 task、
+73,728 Claim、1,280 winner、1,024 kernel、依赖签名和 drop 0：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_182723_150343/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_182815_151380/ccec/
+```
+
+但 offset 的活跃区间跨过了整个内联 Submit 和 split Finish，使标准
+orchestration 主函数反而膨胀：AIC `+588 B`、AIV `+412 B`。
+两轮直接结果为：
+
+| 区域 | 变化 |
+| --- | ---: |
+| AIV Alloc→QK | **+13.259%** |
+| AIV SF→PV | -28.423% |
+| 全部 122,784 条 Transition | **+5.498%** |
+
+固定 Claim 结果后，AIV Alloc true-loser 仍回退 `15.584%`，不是
+winner 迁移造成的假象。SF 的局部改善不能覆盖 Alloc 和全体回退，
+候选完整撤回。
+
+#### 候选二：仅在 Alloc/SF 复用 context.task_id
+
+第二版不再延长 plan offset 的生命周期，只在两个真实 O3 目标处读取
+刚完成身份校验、且 Finish 不会改写的 `context.task_id`。静态结果看似
+更好：AIC orchestration 与基线逐字同形，AIV 主函数缩小 `52 B`；
+CPU shared 全量、B256、mixed 和 CPU private 均通过。两份 A5 泳道：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_184704_179689/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_184759_181132/ccec/
+```
+
+直接结果却再次否定候选：
+
+| 区域 | 变化 |
+| --- | ---: |
+| AIV Alloc→QK | **+4.281%** |
+| AIV SF→PV | **+13.459%** |
+| 全部 122,784 条 Transition | **+7.033%** |
+
+固定 true-loser 人口中的 Alloc/SF 也分别回退 `4.663%/14.152%`。
+机器码缩小不能替代运行区域结果，候选完整撤回。
+
+#### 候选三：保留 producer 读取，只删除 count/slot 复核
+
+第三版不引入任何新 task-id 来源，只从已 Prepare 的
+`shared_result.producer_task_id` 构造已知 slot，删除 count 读取和
+invalid 选择链。AIC 主函数仍与基线同尺寸，AIV 同样缩小 `52 B`，但
+机器码哈希与候选二不同。CPU shared 全量测试通过后，首份 A5 泳道为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_185311_189868/ccec/
+```
+
+单轮直接目标已经同时显著回退：
+
+| 区域 | 变化 |
+| --- | ---: |
+| AIV Alloc→QK | **+4.536%** |
+| AIV SF→PV | **+13.220%** |
+| 全部 122,784 条 Transition | **+7.631%** |
+
+两个主目标都越过止损条件，因此没有浪费设备时间再跑第二轮，也没有进入
+perf-clock。候选完整撤回。
+
+#### 阶段结论
+
+这三种写法都保持 Claim 人口和 atomic 类型、地址、调用点不变，也都通过
+相应正确性闭合；失败原因是直接 non-atomic Transition 回退，而不是整体
+Submit 的 atomic 波动。当前 HEAD 继续保留经 O3 和 A5 实测更优的
+`OutputHandleAt(shared_result, slot)`。后续不要仅凭“少 load、少检查或
+代码更小”恢复这组候选；若再研究同源句柄，只能采用新的调用形态并重新
+闭合 tail 与 Transition，不能复用这三种已经否定的源码布局。

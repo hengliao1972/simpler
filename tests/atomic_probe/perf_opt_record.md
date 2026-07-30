@@ -4000,3 +4000,32 @@ tests/atomic_probe/pa_scheduler/outputs/
 
 完整支配证明、分 kind 数据、测试矩阵和对象证据见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.16 shared output symbol 同源恢复候选
+
+**[已撤回] 三种静态消减均导致直接 non-atomic Transition 回退**
+
+CCEC O3 基线中，`AcceptTaskOutputs()` 真正还会重复读取
+`shared_result` 的只有 AIV Alloc/SF。两类 B256 直接人口各为 16,384，
+对应 `Alloc→QK` 和 `SF→PV` Transition。所有对比 raw 的 122,784 条
+Transition 与 Atomic、Kernel、DCCI 均为零交叠。
+
+依次验证了三种单变量形态：
+
+| 候选 | AIV Alloc→QK | AIV SF→PV | 全 Transition | 决策 |
+| --- | ---: | ---: | ---: | --- |
+| plan task-id 直传，两轮 | +13.259% | -28.423% | +5.498% | 撤回 |
+| 仅 Alloc/SF 读取 `context.task_id`，两轮 | +4.281% | +13.459% | +7.033% | 撤回 |
+| 保留 producer、仅删 count/slot 检查，一轮 | +4.536% | +13.220% | +7.631% | 撤回 |
+
+第一版使 AIC/AIV 主函数膨胀 `588/412 B`；后两版虽然让 AIC 与基线
+同尺寸、AIV 主函数缩小 `52 B`，直接运行区域仍稳定回退，说明机器码
+尺寸不能代替 A5 分段结果。第三版两个目标首轮已同时显著回退，因此按
+止损条件不再跑第二轮。
+
+所有候选均通过相应 CPU shared 协议/B256/mixed 检查；前两版两份 A5
+均保持 96 核、1,280 task、73,728 Claim、1,280 winner、1,024 kernel、
+依赖签名和 drop 0。没有进入 perf-clock，因为本轮唯一裁决门槛——直接
+非 atomic 区域——已经失败。源码全部恢复到上一保留提交
+`4f375cec`。完整路径、固定 Claim 人口和静态证据见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
