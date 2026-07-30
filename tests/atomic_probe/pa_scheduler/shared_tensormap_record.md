@@ -13724,3 +13724,109 @@ true-loser control 收益。
 收益 `0.703%` 可以直接恢复”的推断：旧结果不能替代当前源码、当前构建
 和当前设备时序下的重测。后续停止更换 Claim 原子种类，转向不改变
 FetchMax 竞争协议的等价消减，优先检查 Claim 路由和 loser 返回路径。
+
+### 2026-07-30：按端到端优先口径恢复 context_lens 直读（保留）
+
+#### 重新评估范围
+
+前文“直接读取 context_lens backing pointer（已撤回）”保留原始实验
+和当时的决策，不改写历史。本轮依据随后明确的“perf-clock 端到端优先”
+口径，在当前正式代码上重新实现并验证同一等价消减：
+
+- shared replay 从 backend 已保存的连续 Int32 GM backing pointer
+  读取 `context_lens_data[batch]`；
+- private replay 继续按 descriptor 的 `buffer_addr/start_offset/stride`
+  恢复地址，代码路径不变；
+- 每个 worker、每个 batch 仍只执行一次 volatile GM load，不缓存
+  context 值；
+- task plan、Claim 候选人口、winner 协议和 TensorMap 发布协议均不变。
+
+定向测试把 descriptor 临时改指向另一份合法缓冲，锁定 shared 热路径
+必须读取 backend backing pointer；同时核对四组 context length
+`0/8192/8193/32768` 及其派生 block 数 `0/64/65/256`。旧实现会读到
+descriptor alias，测试失败；修改后通过。
+
+#### 正确性与构建
+
+- 当前源码重新构建后的 shared-output CPU 定向测试通过；
+- CPU shared 96-worker B256 保持 1,280 tasks、73,728 Claim 和
+  `b7d985d6edb07078` 依赖签名，完整语义与后处理通过；
+- atomic/DCCI 源码覆盖与泳道 converter 回归通过；
+- CCEC shared perf-clock/full-swimlane 的 AIC/AIV 入口、split runtime、
+  split finish、mixed ELF 和 manifest 均通过；
+- A5 的 16 个正式 perf-clock 进程及完整泳道全部通过执行、语义和
+  后处理检查，Claim 恒为 73,728、winner 恒为 1,280；
+- 完整泳道物理 generic 记录 149,570 条、逻辑记录 395,330 条，
+  dropped record 为 0。
+
+CPU 整体 perf-clock 构建仍会触发前文已经记录的 trace-free
+`pa_trace.h` 未使用变量告警；本轮没有用旧 CPU 二进制替代验证，
+而是单独重建并执行受影响的定向测试。
+
+#### A5 perf-clock：8＋8 平衡交错
+
+冻结基线为独立 worktree 中的 `5e2aa425`，候选为当前源码。两套产物
+使用相同 CANN 9.1、B256 real-compute 和 final-barrier 配置，在同一
+device 上按四组对称顺序运行：
+
+| 构建 | mean | median | 范围 |
+| --- | ---: | ---: | ---: |
+| backing pointer 直读前 | 2,307.329 us | 2,305.835 us | 2,295.185～2,319.074 us |
+| backing pointer 直读后 | 2,290.719 us | 2,290.862 us | 2,274.105～2,307.686 us |
+| 变化 | -16.609 us / -0.720% | -14.974 us / -0.649% | — |
+
+四个对称区组的 candidate-minus-baseline 分别为
+`-1.137%/-0.803%/+0.100%/-1.037%`，3/4 区组改善。候选的
+fanin load 数略高，说明更快进入下一批改变了到达时序；端到端收益
+并不是靠减少业务任务或 Claim 人口获得。
+
+#### 完整泳道中的时间迁移
+
+冻结基线：
+
+`outputs/pa_scheduler_shared_swimlane_20260730_050015_3301011/ccec`
+
+当前候选：
+
+`outputs/pa_scheduler_shared_swimlane_20260730_113145_3544887/ccec`
+
+候选 Submit makespan 为 `2,367.119 us`，基线为 `2,416.793 us`。
+这是同类诊断构建的单次结果，只用于辅助归因，不替代 perf-clock
+的多轮保留判断。
+
+两份泳道使用完全相同的 72,448 个 `(core, task)` true-loser。
+按父区间、kernel interval union 和 atomic 子区间重新闭合：
+
+| 固定 true-loser 口径 | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| EfDrain control | 13.688 ms | 12.198 ms | -10.887% |
+| Claim atomic bracket | 54.365 ms | 74.370 ms | +36.798% |
+| Claim 外层 | 6.796 ms | 6.846 ms | +0.735% |
+| Claim 合计 | 61.162 ms | 81.217 ms | +32.790% |
+| post-Claim tail | 13.560 ms | 11.298 ms | -16.680% |
+| SubmitTransition | 18.714 ms | 12.656 ms | -32.369% |
+| true-loser control 合计 | 107.124 ms | 117.369 ms | +9.564% |
+
+该迁移与历史三组泳道一致：batch 前缀缩短后，下一批到达更集中，
+transition 和 tail 的收益部分转化成 Claim 竞争。它说明这不是一项
+“Claim/true-loser 局部优化”，但不能推翻低扰动 perf-clock 中稳定的
+端到端收益。
+
+归档泳道位于：
+
+`test_record/2026-7-30/`
+`shared_b256_context_lens_direct_2367us_merged_swimlane.json`
+
+#### 决策
+
+本阶段保留。理由是：
+
+1. shared/private 的数据合同和一次 volatile GM load 语义不变；
+2. Claim 人口、winner 数、依赖、heap 和发布协议完全等价；
+3. 8＋8 perf-clock 的 mean/median 分别改善 `0.720%/0.649%`，
+   且 3/4 对称区组同向；
+4. 完整泳道清楚记录了收益迁移，没有用局部指标掩盖 Claim 竞争增加；
+5. 当前保留规则明确由 perf-clock 决定有效候选，泳道负责解释而非否决。
+
+后续若继续消减 true-loser，应在保留本项端到端收益的基础上处理
+Claim 到达聚集，不能重新加入 descriptor 恢复工作来人为拉散 worker。

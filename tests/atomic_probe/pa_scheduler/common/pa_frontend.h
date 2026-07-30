@@ -501,8 +501,8 @@ struct PaOrchestrationState {
     TensorCreateInfo qk_create_info;
     TensorCreateInfo sf_create_info;
 
-    // The pointer is supplied by the standalone backend. On A5 it must point
-    // at GM so every batch performs the same descriptor-based load as PA.
+    // standalone backend 提供指向连续 Int32 GM backing buffer 的指针。
+    // shared replay 直接复用该地址；private 保留原 descriptor 地址恢复路径。
     PA_GM const volatile int32_t *context_lens_data;
     uint64_t scale_bits;
     uint64_t current_sequence;
@@ -865,12 +865,22 @@ PA_DEVICE uint64_t ReadPaContextLength(const PaOrchestrationState &orch, uint32_
         // 只用于不具备该缓冲区的兼容后端。
         return kPaBlocksPerRequest * kPaBlockSize;
     }
+#if PTO_FDWIC_SHARED_MAP
+    // InitPaOrchestration 已用同一地址建立 context_lens descriptor。shared
+    // backend 又显式保存了连续 Int32 backing pointer，因此不必在每批、
+    // 每核重复读取 descriptor 字段并恢复同一地址；仍然只执行一次 GM
+    // volatile load，不缓存 context 值。
+    return static_cast<uint64_t>(
+        orch.context_lens_data[batch]
+    );
+#else
     const uint64_t flat_index = orch.context_lens.start_offset +
                                 static_cast<uint64_t>(batch) * orch.context_lens.strides[0];
     PA_GM const volatile int32_t *value = reinterpret_cast<PA_GM const volatile int32_t *>(
         orch.context_lens.buffer_addr + flat_index * ElementSize(DataType::Int32)
     );
     return static_cast<uint64_t>(*value);
+#endif
 }
 
 PA_DEVICE void PreparePaBlockGroup(PaOrchestrationState &orch, uint64_t block_offset) {

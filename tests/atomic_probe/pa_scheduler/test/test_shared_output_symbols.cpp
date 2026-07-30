@@ -34,6 +34,36 @@ void Check(bool condition, const char *message) {
     ++g_failures;
 }
 
+void TestSharedContextLengthUsesBackingPointer() {
+    volatile int32_t context_lens[] = {
+        0, 8192, 8193, 32768,
+    };
+    volatile int32_t descriptor_alias[] = {
+        1, 2, 3, 4,
+    };
+    const uint64_t expected_blocks[] = {
+        0, 64, 65, 256,
+    };
+    PaOrchestrationState orchestration{};
+    InitPaOrchestration(orchestration, 4, context_lens);
+    // shared backend 已经保存同一 GM backing pointer。把 descriptor
+    // 临时指向另一份合法缓冲，锁定热路径不再重复恢复等价地址。
+    orchestration.context_lens.buffer_addr =
+        reinterpret_cast<uint64_t>(descriptor_alias);
+    bool exact = true;
+    for (uint32_t batch = 0; batch < 4; ++batch) {
+        BeginPaBatchForCallback(orchestration, batch);
+        exact &=
+            orchestration.current_sequence ==
+                static_cast<uint64_t>(context_lens[batch]) &&
+            orchestration.current_blocks == expected_blocks[batch];
+    }
+    Check(
+        exact,
+        "shared context length reads the backend GM backing pointer"
+    );
+}
+
 // 该 Ops 只验证公共 symbol helper 的原子状态机和 descriptor 搬运。
 // fence 不模拟 A5 DCache；设备缓存可见性仍必须由 CCEC 上板门禁证明。
 struct SymbolTestOps {
@@ -2583,6 +2613,7 @@ void TestInvalidReferencesFailClosed() {
 }  // namespace
 
 int main() {
+    TestSharedContextLengthUsesBackingPointer();
     TestSharedCompletionPublishesWithoutFrontier();
     TestPublishAndResolve();
     TestPaTwoGroupWriterReadyGate();
