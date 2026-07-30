@@ -14572,3 +14572,116 @@ logical calls 为 `187,746/183,642`。三次 perf-clock 为
 本阶段保留。它删除了 98,304 次确定冗余的 GM role 读取，IR、精确
 relocation 和动态 Claim 人口共同证明 atomic 协议未变；AIC/AIV 的直接
 Claim non-atomic 与完整 actor non-atomic 都重复改善。
+
+### 2026-07-30：shared nonwinner 不再写 winner-only context
+
+#### 冗余状态与等价边界
+
+`SubmitContext::won` 和 `SubmitContext::kernel_id` 只由跨 TU 的 winner
+finish 校验、Build 和执行路径消费。shared true-loser 与 not-attempted
+已经在 `SubmitCallbackTask()` 所在 TU 内直接收尾；原实现仍让每个
+nonwinner 在 Claim 后把本次 `false/function_id` 写入这两个字段，随后
+只在同 TU loser helper 中把刚写入的值与 Claim 结果做一次自校验。
+
+本阶段把两个写入下沉到 `claim.won` 分支，并删除 loser helper 对这两个
+winner-only 字段的冗余校验。loser 仍校验：
+
+- `context.task_id` 与当前 task 一致；
+- `shared_result.TaskId()` 与当前 task 一致；
+- 本 task 的 output symbol 数量与 `Kind` 合同一致。
+
+测试刻意把 loser 入口的 `context.won/kernel_id` 预置为上一 Submit
+winner 的陈旧值，证明 loser 不读取或依赖这两个字段。private 路径保持
+原有逐 Submit 赋值行为。
+
+B256/G1 中有 `72,448` 个 true-loser 和 `49,152` 个 not-attempted，共
+`121,600` 个 nonwinner；因此源码语义上删除 `243,200` 次 winner-only
+字段写入。
+
+#### IR 与 atomic 冻结证明
+
+相同 CCEC 优化参数下，AIC/AIV 主入口中
+`context.won/context.kernel_id` 的静态 store 均由 `14` 降到 `6`
+（7 对降到 3 对）。候选保留的 3 对全部位于 `old < task_id` 的 winner
+边，nonwinner 动态写入由每 actor 2 次降为 0。
+
+atomic 协议没有变化：
+
+- AIC/AIV 都仍有 3 个 `llvm.hivm.atom.MAX.G.s64`；
+- AIC 为 Alloc cursor 1 个、cube cursor 2 个；
+- AIV 为 Alloc cursor 1 个、shared-vector cursor 2 个；
+- Claim 地址、类型、候选人口和 `old < task_id` 判定不变。
+
+跨 TU finish 的优化 IR 没有差异；AIC/AIV finish `.text` 与
+`.rela.text` 逐字相同，finish 调用 relocation 仍各为 3。后端栈均保持
+1952B，最终 ELF `.text` 保持 259,896B 且没有 relocation。主对象因代码
+布局变化表现为 AIC `.text` `71,888→72,080B`、AIV
+`73,784→73,528B`，因此本阶段不以源码删除量推断性能，而以完整动态
+区间裁决。
+
+#### 正确性与 A5 闭合
+
+以下均通过：
+
+- CPU shared 全量协议自测以及 G0、G2、G4、mixed
+  `0,8192,8193,32768`、B256/G1；
+- CPU private 全量构建与 B256/G1；
+- CCEC shared/private full-swimlane，CCEC shared perf-clock；
+- 两次 A5 B256/G1 完整泳道。
+
+候选泳道为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_154311_3996206/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_154407_3998986/ccec/
+```
+
+两次都保持 96 核、1,280 task、73,728 attempted Claim、1,280 winner、
+72,448 true-loser、49,152 not-attempted、依赖签名
+`b7d985d6edb07078`、drop 0，execution/semantic/postprocess 全部 PASS。
+
+#### 非 atomic 性能证据
+
+对照使用本阶段修改前、提交 `3f8171ae` 对应的两份泳道：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_151659_3926376/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_151758_3929172/ccec/
+```
+
+四份 raw 都完整闭合 `96×1,280=122,880` 个 actor。固定交集按相同
+`(core, task_id)` 建立；先逐核合并所有 Atomic∪Kernel 区间，再从
+`Claim.start→Submit.end` 和完整 actor 区间裁剪扣除。没有缺失边界、
+负时间、分段代数错误或 dropped record。
+
+| 固定人口 | 核型 | Claim+post-Claim tail | 完整 actor |
+| --- | --- | ---: | ---: |
+| 68,776 true-loser | AIC | -2.892% | +0.385% |
+|  | AIV | -6.745% | -0.968% |
+|  | 全核 | **-5.427%** | **-0.563%** |
+| 45,201 non-Alloc true-loser | AIC | -5.715% | -0.835% |
+|  | AIV | -11.178% | -1.635% |
+|  | 全核 | **-9.346%** | **-1.414%** |
+| 49,152 not-attempted | AIC | +3.829% | +0.042% |
+|  | AIV | +10.842% | -0.862% |
+|  | 全核 | +8.881% | **-0.553%** |
+| 117,928 全 nonwinner | AIC | **-1.296%** | +0.249% |
+|  | AIV | **-1.570%** | **-0.931%** |
+|  | 全核 | **-1.481%** | **-0.559%** |
+
+直接受影响的 `Claim+post-Claim tail` 在 AIC/AIV 的全 nonwinner
+人口中均下降，收益主要来自 true-loser；not-attempted 的局部区间发生
+回退，但其完整 actor 仍下降。AIC 完整 actor 的 `+0.249%` 视为近似
+持平并完整披露，不宣称所有子群均同向改善。
+
+候选三次 perf-clock 为 `2,322.782/2,348.786/2,279.671 us`；上一提交
+对应为 `2,304.456/2,327.258/2,289.625 us`。该端到端差异受动态 atomic
+轮询影响，只记录运行背景，不参与本阶段去留。
+
+#### 决策
+
+本阶段保留。它在不改变 atomic、Claim 人口、TensorMap、Build、kernel
+和跨 TU winner finish 的前提下，删除全部 shared nonwinner 对两个
+winner-only 字段的写入；直接目标区在 AIC/AIV 均改善，完整
+all-nonwinner 区间也闭合为下降。局部 not-attempted 回退作为后续代码
+布局优化线索保留。

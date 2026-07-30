@@ -623,8 +623,10 @@ bool RunLoserZeroTensorMapAccessTest() {
     constexpr uint32_t kTask = 4;
     SubmitContext context{};
     context.task_id = static_cast<int32_t>(kTask);
-    context.won = false;
-    context.kernel_id = -1;
+    // 模拟同一 worker 上一 Submit 曾经获胜：shared loser 不会重置或消费
+    // 这两个 winner-only 字段，收尾只能依赖本次 task/output 身份。
+    context.won = true;
+    context.kernel_id = 17;
     context.shared_result.Reset(static_cast<int32_t>(kTask));
     LocalStats stats{};
     constexpr uint64_t kSubmitBegin = 1;
@@ -649,8 +651,7 @@ bool RunLoserZeroTensorMapAccessTest() {
         FinishSharedLoserSubmit<
             TaskKind::Up, OrderedSubmitTestOps, false
         >(
-            state, context, stats, kTask, -1, false,
-            false,
+            state, context, stats, kTask, false,
             kSubmitBegin
         );
     bool turns_unchanged = true;

@@ -3655,3 +3655,50 @@ tests/atomic_probe/pa_scheduler/outputs/
 
 完整分段、IR 尺寸、correctness 与 private/shared relocation 差异见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.8 shared winner-only context 写入下沉
+
+**[已保留] nonwinner 不再覆写 `won/kernel_id`**
+
+`SubmitContext::won` 和 `kernel_id` 只供跨 TU winner finish 及后续
+winner 路径消费。shared loser 已在调用 TU 内完成收尾，原有的
+`false/function_id` 写入及随后的同值自校验没有跨阶段语义。
+
+本阶段只在 `claim.won` 分支写这两个字段，并让 loser 继续使用 task ID、
+output task ID 和 output 数量完成正确性闭合。针对性测试使用上一 task
+遗留的 `won=true/kernel_id=17` 调用 loser helper，验证这两个字段确实
+不再是 loser 合同。private 行为保持不变。
+
+B256/G1 共删除 `121,600×2=243,200` 次 nonwinner 字段写入。CCEC O3
+IR 中 AIC/AIV 的对应静态 store 都由 14 降到 6，剩余 3 对全部位于
+winner 边；Claim atomic 仍各为原来的 3 个，跨 TU finish IR、`.text`、
+`.rela.text`、3 条 finish relocation 和 1952B 栈均不变。
+
+CPU shared G0/G2/G4/mixed/B256、CPU private B256、CCEC
+shared/private 构建和两次 A5 B256 完整语义全部通过。四份泳道固定 actor
+并扣除 Atomic∪Kernel 后：
+
+| 固定人口 | Claim+post-Claim tail | 完整 actor |
+| --- | ---: | ---: |
+| 68,776 true-loser | **-5.427%** | **-0.563%** |
+| 45,201 non-Alloc true-loser | **-9.346%** | **-1.414%** |
+| 49,152 not-attempted | +8.881% | **-0.553%** |
+| 117,928 全 nonwinner | **-1.481%** | **-0.559%** |
+
+全 nonwinner 的直接目标区在 AIC/AIV 分别下降
+`1.296%/1.570%`。AIC 完整 actor `+0.249%`，AIV
+`-0.931%`；前者视为近似持平，不掩盖 not-attempted 局部区间的布局
+回退。
+
+候选泳道：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_154311_3996206/ccec/
+  pa_scheduler_shared_swimlane_20260730_154407_3998986/ccec/
+```
+
+三次 perf-clock `2,322.782/2,348.786/2,279.671 us` 只作运行背景；
+本阶段只按固定人口 non-atomic 区间保留。详细测试矩阵、分核数据和
+IR/relocation 证明见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。

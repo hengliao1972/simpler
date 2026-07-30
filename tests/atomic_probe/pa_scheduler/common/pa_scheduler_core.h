@@ -3492,18 +3492,11 @@ template <TaskKind Kind, typename Ops, bool Profile>
 PA_DEVICE bool FinishSharedLoserSubmit(
     PA_GM SchedulerState *state, SubmitContext &context,
     LocalStats &stats, uint32_t task_id,
-    int32_t function_id, bool won,
     bool is_last_submit,
     uint64_t submit_begin
 ) {
     const bool valid =
-        !won &&
-        SharedPaFunctionIdMatches(
-            Kind, false, function_id
-        ) &&
         context.task_id == static_cast<int32_t>(task_id) &&
-        !context.won &&
-        context.kernel_id == function_id &&
         context.shared_result.TaskId() ==
             static_cast<int32_t>(task_id) &&
         context.shared_result.Size() ==
@@ -4054,8 +4047,10 @@ PA_DEVICE bool SubmitCallbackTask(
     BeginSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
     const ClaimOutcome claim =
         Claim<Ops>(state, role, task_id, Kind, stats);
+#if !PTO_FDWIC_SHARED_MAP
     context.won = claim.won;
     context.kernel_id = claim.function_id;
+#endif
     RecordClaimOutcome(stats, Kind, claim);
     EndSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
     const uint64_t claim_end = TraceTimestamp<Ops>(stats.trace, stats.result);
@@ -4090,7 +4085,10 @@ PA_DEVICE bool SubmitCallbackTask(
     if (__builtin_expect(claim.won, 0)) {
         // shared loser 已在上方声明稳定 output symbol；它不需要构造本 task
         // 的 descriptor/scalar 参数，Alloc 也不例外。finish 的 loser
-        // 分支只闭合边界，不读这里留下的上一 task args。
+        // 分支只闭合边界，不读这里留下的上一 task args/won/function。
+        // 这两个字段只由跨 TU winner finish 校验，因此也只由 winner 写。
+        context.won = true;
+        context.kernel_id = claim.function_id;
         PrepareSharedWinnerContext(
             worker, task_id, context
         );
@@ -4129,7 +4127,6 @@ PA_DEVICE bool SubmitCallbackTask(
     if (!claim.won) {
         return FinishSharedLoserSubmit<Kind, Ops, Profile>(
             state, context, stats, task_id,
-            claim.function_id, claim.won,
             shared_is_last_submit, submit_begin
         );
     }
@@ -4167,7 +4164,6 @@ PA_DEVICE bool SubmitCallbackTask(
     if (!claim.won) {
         return FinishSharedLoserSubmit<Kind, Ops, Profile>(
             state, context, stats, task_id,
-            claim.function_id, claim.won,
             shared_is_last_submit, submit_begin
         );
     }
