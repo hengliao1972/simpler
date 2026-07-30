@@ -13648,3 +13648,79 @@ B256 real-compute/final-barrier 配置独立构建。当前环境没有
 中位数回退 `2.916%`，超过纯 loser 候选约 `2%` 的保留门槛，因此生产
 代码、临时 atomic site、converter 映射和定向计数改动全部撤回，仅保留
 本节数据。后续不再用“原子次数减少”代替端到端性能判断。
+
+### 2026-07-30：按新保留口径重建 CAS 高水位候选（撤回）
+
+#### 重建范围与正确性
+
+为核实前述第一轮 CAS 数组候选在“perf-clock 优先”口径下是否值得保留，
+本轮从原 FetchMax 基线重新实现了每 worker、每物理 cursor 的观察高水位：
+
+- eligible actor 先执行 `CAS(predicted, max(predicted, task_id))`；
+- 预测落后且观察值仍小于 `task_id` 时，才回退原 `FetchMax`；
+- 旧 task replay 使用不回退 cursor 的同值 CAS；
+- Alloc/QK-PV/SF-UP 的 `96/32/64` 候选人口保持不变。
+
+CPU 定向测试覆盖预测落后、CAS 与 fallback 之间的竞争、旧 task replay、
+五种 task 和并发唯一 winner。CPU B256、atomic/DCCI 源码覆盖、
+converter 门槛、CCEC split ABI 和产物检查全部通过。A5 full-swimlane
+得到精确的：
+
+- `73,728` 个逻辑 Claim；
+- `73,728` 条 CAS；
+- `0` 条 fallback FetchMax；
+- `1,280` 个唯一 winner；
+- `72,448` 个 true loser 和 `49,152` 个 not-attempted；
+- 依赖签名、heap/TensorMap 终态和丢记录检查全部通过。
+
+重建版 split state 由 `1,664 B` 增至 `1,728 B`。相对原 FetchMax 基线，
+AIC/AIV orchestration `.text` 分别增加 `872/768 B`，final `.text`
+增加 `1,792 B`。
+
+#### A5 perf-clock
+
+以 commit `5e2aa425` 的独立 worktree 产物为冻结基线，两套构建在同一
+CANN 9.1、相同 B256 real-compute/final-barrier 配置下按 8+8 交错运行：
+
+| 构建 | mean | median | 范围 |
+| --- | ---: | ---: | ---: |
+| 原 FetchMax 基线 | 2,295.318 us | 2,295.335 us | 2,286.409～2,303.686 us |
+| CAS 高水位候选 | 2,306.265 us | 2,306.808 us | 2,290.317～2,322.108 us |
+| 变化 | +10.947 us / +0.477% | +11.473 us / +0.500% | — |
+
+端到端回退没有超过纯 loser 候选约 `2%` 的上限，因此继续运行完整泳道，
+判断这 `0.5%` 是否换来了真实 loser 路径下降。
+
+#### 固定人口 full-swimlane
+
+候选泳道：
+
+`outputs/pa_scheduler_shared_swimlane_20260730_110529_3524421/ccec/merged_swimlane.json`
+
+冻结基线：
+
+`outputs/pa_scheduler_shared_swimlane_20260730_050015_3301011/ccec/merged_swimlane.json`
+
+两份数据使用完全相同的 `72,448` 个 `(core, task)` true-loser 集合。按
+父子区间做 union 后：
+
+| 固定 true-loser 口径 | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| atomic return-ready bracket | 54.365 ms | 52.605 ms | -3.238% |
+| Claim 外层非 atomic | 6.796 ms | 11.891 ms | +74.959% |
+| Claim 合计 | 61.162 ms | 64.496 ms | +5.451% |
+| EfDrain control | 13.688 ms | 13.607 ms | -0.592% |
+| post-Claim tail | 13.560 ms | 14.395 ms | +6.159% |
+| SubmitTransition | 18.714 ms | 18.962 ms | +1.324% |
+| true-loser control 合计 | 107.124 ms | 111.460 ms | +4.048% |
+
+CAS bracket 的下降被预测值维护、返回判断和机器码布局造成的 Claim 外层
+放大完全吞没；损失还继续传到 tail。候选既没有端到端收益，也没有固定
+true-loser control 收益。
+
+#### 结论
+
+该重建版全部撤回，只保留测量记录。它同时修正了“历史数组候选端到端
+收益 `0.703%` 可以直接恢复”的推断：旧结果不能替代当前源码、当前构建
+和当前设备时序下的重测。后续停止更换 Claim 原子种类，转向不改变
+FetchMax 竞争协议的等价消减，优先检查 Claim 路由和 loser 返回路径。
