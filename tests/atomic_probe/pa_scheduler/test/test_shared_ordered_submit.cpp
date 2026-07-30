@@ -510,19 +510,7 @@ bool LegacyTurnsMatch(
 }
 
 uint32_t ExpectedClaimAttempts(TaskKind kind) {
-    switch (kind) {
-        case TaskKind::Alloc:
-            return kWorkers;
-        case TaskKind::Qk:
-        case TaskKind::Pv:
-            return kAicWorkers;
-        case TaskKind::Sf:
-        case TaskKind::Up:
-            return kAivWorkers;
-        case TaskKind::Count:
-            return 0;
-    }
-    return 0;
+    return SharedClaimParticipantCount(kind);
 }
 
 bool ClaimAndInsertEvidenceMatches(

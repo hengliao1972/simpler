@@ -12835,3 +12835,148 @@ metadata 的物理工作只剩一次必须消费返回值的 expected-old CAS；
 source-issue Exchange、普通 store 或删掉 publication 会失去 fail-closed
 共享状态校验，不属于可接受的性能优化。继续调整 scalar 指令最多只作用于
 约十几纳秒父子区间差，已没有与改动风险匹配的空间。
+
+### 2026-07-30：按 Claim cursor shard 筛选动态候选
+
+#### 为什么先处理 loser Claim
+
+以正式 B256 泳道
+`outputs/pa_scheduler_shared_swimlane_20260729_205446_2966243/ccec`
+为基线，完整剔除 EfDrain 内真实 QK/SF/PV/UP Kernel 后，121,600 个
+loser actor 的控制时间合计为 `140.217 ms core-time`：
+
+| 区域 | core-time | 占 loser 控制时间 |
+| --- | ---: | ---: |
+| Claim | 62.394 ms | 44.50% |
+| Submit 后续 task 切换 | 28.094 ms | 20.04% |
+| Claim 后轻量收尾 | 26.461 ms | 18.87% |
+| EfDrain 控制部分 | 23.269 ms | 16.59% |
+
+其中 72,448 条 true-loser `ClaimMax` 自身累计 `53.454 ms`，
+mean/median/p95 为 `737.8/403/2624 ns`；Alloc 的 24,320 条
+true-loser `ClaimMax` 又占其中 `34.738 ms`。因此第一优先级是减少
+必输 atomic 的数量与同一 cache line 上的竞争，而不是继续缩短已经很薄
+的 loser C++ 外壳。
+
+历史实验已经证明不能简单改成 per-task atomic，也不能固定单一 owner：
+前者虽然曾把 ClaimMax 降低 20.9%，却因 fanin 等后续开销增加而让
+perf-clock 回退 2.27%；后者会把 winner/负载集中到少数 worker。本阶段
+没有重走这两条路线。
+
+#### 协议修改
+
+保留现有跨 task 高水位结构和实际 `FetchMax`：
+
+- Alloc：4 路 `alloc_cursor`；
+- QK/PV：共用 4 路 `cube_cursor`；
+- SF/UP：共用 8 路 `shared_vector_cursor`。
+
+只有映射到同一 cursor shard 的 worker 发 Claim atomic：
+
+- Alloc：`worker_id % 4 == task_id % 4`，每 task 24 个动态候选；
+- QK/PV：AIC 且 `worker_id % 4 == task_id % 4`，每 task 8 个候选；
+- SF/UP：AIV 且
+  `(worker_id - 32) % 8 == task_id % 8`，每 task 8 个候选。
+
+所有 96 个 worker 仍按 task-id 顺序回放每次 Submit、执行 EfDrain
+并推进本地 winning slot；筛选只让不属于本 cursor shard 的 actor 不再
+发射必输的 `atomicMax`。这不是固定 owner：同一 task 仍由 24 或 8 个
+worker 动态竞争 winner。它也不是 per-task atomic：同一 cursor 链仍保持
+原来的跨 task 单调高水位约束。
+
+该合同成立的关键是同一 cursor 链上的候选集合固定不变。例如 QK/PV
+共用 cube shard，同 shard 的后续 task 仍由同一组 AIC 候选竞争。worker
+又按 task-id 单调回放，所以能到达后项的候选必然已经尝试过前项；
+`FetchMax` 继续保证至多一个 winner，非空候选集合与有序回放共同保证每
+task 恰好一个 winner。
+
+B256/G1 的实际 Claim 次数从：
+
+`256 × 96 + 256 × (32 + 64 + 32 + 64) = 73,728`
+
+降为：
+
+`256 × 24 + 256 × (8 + 8 + 8 + 8) = 14,336`
+
+即减少 `80.56%`。host 不只检查全局 14,336，还从权威 task plan 独立
+重建每个 worker 的候选次数逐核核对，防止不同 shard 的多发/少发在总数
+上相互抵消。
+
+#### 正确性门槛
+
+- CPU shared 全套门槛通过；
+- cursor Claim 门槛覆盖五种 task、24/8/8 精确候选、每 task 唯一
+  winner、旧 task replay 判输，以及 QK→PV、SF→UP、Alloc→Alloc
+  的同 shard 跨 task 推进；
+- compact raw 重建门槛分别覆盖 AIC/AIV 的 role 合法但 shard 不合法
+  负例和匹配 shard 正例；
+- CCEC AIC/AIV probe、split runtime/finish、mixed ELF 与 perf-clock
+  构建通过；
+- A5 B256 的逐核 Claim、winner、fanin、依赖签名、TensorMap/history、
+  heap、completion、真实计算结果与最终状态全部通过。
+
+#### perf-clock 端到端
+
+使用修改前冻结的 `e9f59d16` perf-clock ELF 与候选 ELF 做 6 组
+ABBA/BAAB 平衡交替，共 12+12 个独立 B256 进程。每次均完成完整语义
+校验：
+
+| 构建 | mean | median | 范围 |
+| --- | ---: | ---: | ---: |
+| 修改前 | 2306.135 us | 2309.430 us | 2286.159～2321.521 us |
+| shard-affine 候选 | 1575.844 us | 1574.751 us | 1549.284～1610.645 us |
+| 变化 | **-730.291 us / -31.67%** | **-734.680 us / -31.81%** | 6 组全部改善 |
+
+修改前 12 次：
+
+`2286.159、2308.245、2314.008、2295.344、2321.521、2292.007、`
+`2319.616、2310.615、2312.120、2311.138、2307.226、2295.623 us`
+
+候选 12 次：
+
+`1577.270、1572.231、1578.035、1556.365、1570.427、1549.284、`
+`1605.443、1569.676、1582.781、1610.645、1552.609、1585.362 us`
+
+候选的 fanin load mean/median 从
+`35,679/35,542` 增至 `61,329/61,295`，约增加 72%。这是 winner
+执行相对更快后，更多 worker 在依赖尚未完成时进入 EfDrain 的真实代价；
+但它只抵消部分 Claim 收益，端到端仍稳定改善 31% 以上。
+
+#### B256 泳道归因
+
+候选正式泳道位于：
+
+`outputs/pa_scheduler_shared_swimlane_20260730_002136_3047643/ccec`
+
+两份图的总 actor 都是 122,880，winner 都是 1,280；true loser 从
+72,448 降到 13,056，其余 108,544 个 actor 为未发 Claim atomic 的
+not-attempted。排除 Kernel 后：
+
+| loser 区域 | 修改前 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| Claim | 62.394 ms | 13.902 ms | **-48.492 ms / -77.72%** |
+| EfDrain 控制部分 | 23.269 ms | 28.478 ms | +5.210 ms |
+| Claim 后轻量收尾 | 26.461 ms | 26.759 ms | +0.299 ms |
+| Submit 后续 task 切换 | 28.094 ms | 32.112 ms | +4.018 ms |
+| loser 控制合计 | 140.217 ms | 101.252 ms | **-38.965 ms / -27.79%** |
+
+true-loser ClaimMax 精确从 72,448 条降到 13,056 条：
+
+| 指标 | 修改前 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| 累计 core-time | 53.454 ms | 3.578 ms | -93.31% |
+| mean | 737.8 ns | 274.0 ns | -62.86% |
+| median | 403 ns | 268 ns | -33.50% |
+| p95 | 2624 ns | 433 ns | -83.50% |
+
+因此收益没有被移动到其他名字：Claim 净节省 `48.492 ms
+core-time`，虽被 EfDrain 与 task 切换合计约 `9.23 ms` 的增加部分
+抵消，最终 loser 控制时间仍净降 `27.79%`。Kernel union 仅从
+`31.507 ms` 变为 `31.662 ms（+0.49%）`，也没有用计算负载变化伪造
+收益。
+
+本阶段结论是：shard-affine 动态候选同时减少了 ClaimMax 次数和单次
+竞争长尾，是确定有效的第一阶段 loser 优化。下一阶段需要扫描每个 shard
+保留的候选宽度，判断继续减少 Claim 竞争是否会因 winner 集中和 fanin
+轮询反噬；EfDrain 与 UP 后 task 切换已成为新的相对热点，但在候选宽度
+收敛前不混入其他代码改动。

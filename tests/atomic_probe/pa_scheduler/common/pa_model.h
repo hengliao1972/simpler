@@ -422,6 +422,77 @@ enum class TaskKind : uint32_t {
     Count = 5,
 };
 
+#if PTO_FDWIC_SHARED_MAP
+// shared Claim 继续使用现有 4/4/8 条跨 task 高水位 cursor，但每条
+// cursor 只由映射到同一 shard 的 worker 子集竞争。与固定单 owner 不同，
+// 每个 shard 内仍有多个动态候选；与 per-task atomic 不同，后续 task
+// 仍受同一高水位链约束，不会放大无界 run-ahead。
+constexpr uint32_t kSharedAllocClaimParticipants =
+    kWorkers / kCursorShards;
+constexpr uint32_t kSharedAicClaimParticipants =
+    kAicWorkers / kCursorShards;
+constexpr uint32_t kSharedAivClaimParticipants =
+    kAivWorkers / kSharedVectorCursorShards;
+static_assert(
+    kWorkers % kCursorShards == 0 &&
+        kAicWorkers % kCursorShards == 0 &&
+        kAivWorkers % kSharedVectorCursorShards == 0,
+    "shared Claim participant groups must divide the worker topology"
+);
+
+#ifdef PA_DEVICE
+#define PA_SHARED_CLAIM_INLINE PA_DEVICE
+#else
+#define PA_SHARED_CLAIM_INLINE inline
+#endif
+
+PA_SHARED_CLAIM_INLINE constexpr uint32_t
+SharedClaimParticipantCount(TaskKind kind) {
+    switch (kind) {
+        case TaskKind::Alloc:
+            return kSharedAllocClaimParticipants;
+        case TaskKind::Qk:
+        case TaskKind::Pv:
+            return kSharedAicClaimParticipants;
+        case TaskKind::Sf:
+        case TaskKind::Up:
+            return kSharedAivClaimParticipants;
+        case TaskKind::Count:
+            return 0;
+    }
+    return 0;
+}
+
+PA_SHARED_CLAIM_INLINE constexpr bool IsSharedClaimParticipant(
+    uint32_t worker_id, uint32_t task_id, TaskKind kind
+) {
+    if (worker_id >= kWorkers ||
+        task_id >= kTaskCellCapacity) {
+        return false;
+    }
+    if (kind == TaskKind::Alloc) {
+        return worker_id % kCursorShards ==
+               task_id % kCursorShards;
+    }
+    if (kind == TaskKind::Qk ||
+        kind == TaskKind::Pv) {
+        return worker_id < kAicWorkers &&
+               worker_id % kCursorShards ==
+                   task_id % kCursorShards;
+    }
+    if (kind == TaskKind::Sf ||
+        kind == TaskKind::Up) {
+        return worker_id >= kAicWorkers &&
+               (worker_id - kAicWorkers) %
+                       kSharedVectorCursorShards ==
+                   task_id % kSharedVectorCursorShards;
+    }
+    return false;
+}
+
+#undef PA_SHARED_CLAIM_INLINE
+#endif
+
 // 记录 kernel 最终在哪次 drain 中落地：Submit 开头、slot/heap 背压期间，或
 // 所有 worker 回放结束后的最终清空。三者之和必须等于实际 kernel 数。
 enum class DrainPlace : uint32_t {

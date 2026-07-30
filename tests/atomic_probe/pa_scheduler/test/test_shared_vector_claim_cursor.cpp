@@ -26,11 +26,12 @@ namespace {
 
 using namespace pa_scheduler;
 
-constexpr std::array<TaskKind, 5> kTaskKinds = {
-    TaskKind::Alloc, TaskKind::Qk, TaskKind::Sf, TaskKind::Pv, TaskKind::Up,
+constexpr std::array<TaskKind, 8> kTaskKinds = {
+    TaskKind::Alloc, TaskKind::Qk, TaskKind::Sf, TaskKind::Pv,
+    TaskKind::Up, TaskKind::Pv, TaskKind::Alloc, TaskKind::Up,
 };
-constexpr std::array<uint32_t, 5> kTaskIds = {
-    100, 101, 102, 103, 104,
+constexpr std::array<uint32_t, 8> kTaskIds = {
+    100, 101, 102, 103, 104, 105, 108, 110,
 };
 
 int g_failures = 0;
@@ -157,27 +158,15 @@ bool CursorsMatch(const SchedulerState &state, const CursorValues &expected) {
 }
 
 uint32_t ExpectedCandidates(TaskKind kind) {
-    switch (kind) {
-    case TaskKind::Alloc:
-        return kWorkers;
-    case TaskKind::Qk:
-    case TaskKind::Pv:
-        return kAicWorkers;
-    case TaskKind::Sf:
-    case TaskKind::Up:
-        return kAivWorkers;
-    case TaskKind::Count:
-        return 0;
-    }
-    return 0;
+    return SharedClaimParticipantCount(kind);
 }
 
-bool IsCandidate(TaskKind kind, uint32_t worker_id) {
-    if (kind == TaskKind::Alloc) {
-        return true;
-    }
-    const bool is_aic = worker_id < kAicWorkers;
-    return kind == TaskKind::Qk || kind == TaskKind::Pv ? is_aic : !is_aic;
+bool IsCandidate(
+    TaskKind kind, uint32_t worker_id, uint32_t task_id
+) {
+    return IsSharedClaimParticipant(
+        worker_id, task_id, kind
+    );
 }
 
 bool RunConcurrentClaim(SchedulerState &state, uint32_t task_id, TaskKind kind) {
@@ -192,6 +181,7 @@ bool RunConcurrentClaim(SchedulerState &state, uint32_t task_id, TaskKind kind) 
     for (uint32_t worker_id = 0; worker_id < kWorkers; ++worker_id) {
         WorkerState &worker = state.workers[worker_id];
         worker.role = worker_id < kAicWorkers ? CoreRole::Aic : CoreRole::Aiv;
+        worker.core_idx = static_cast<int32_t>(worker_id);
         threads.emplace_back([&state, &worker, &evidence, &ready, &start, worker_id, task_id, kind]() {
             ClaimTestOps::ResetThreadTrace();
             ready.fetch_add(1, std::memory_order_release);
@@ -214,7 +204,8 @@ bool RunConcurrentClaim(SchedulerState &state, uint32_t task_id, TaskKind kind) 
     bool exact = true;
     volatile int64_t *expected_address = ExpectedClaimAddress(state, task_id, kind);
     for (uint32_t worker_id = 0; worker_id < kWorkers; ++worker_id) {
-        const bool candidate = IsCandidate(kind, worker_id);
+        const bool candidate =
+            IsCandidate(kind, worker_id, task_id);
         const ClaimEvidence &entry = evidence[worker_id];
         attempts += entry.outcome.attempted ? 1U : 0U;
         winners += entry.outcome.won ? 1U : 0U;
@@ -251,8 +242,14 @@ void TestAllTaskKindsUseCursorClaim() {
         }
     }
 
-    WorkerState &replay_worker = state->workers[0];
+    // 后三项分别复用 QK101 的 cube shard、Alloc100 的 alloc
+    // shard 和 SF102 的 shared-vector shard。它们仍各自产生唯一
+    // winner，证明筛选后的固定候选集合能完整推进同一高水位链。
+    // 再回放较旧的 QK101 时，cube cursor 已被 PV105 推进到 105，
+    // 本 shard 候选必须正常发 atomic 并判输。
+    WorkerState &replay_worker = state->workers[1];
     replay_worker.role = CoreRole::Aic;
+    replay_worker.core_idx = 1;
     ClaimTestOps::ResetThreadTrace();
     LocalStats replay_stats{};
     const ClaimOutcome replay = Claim<ClaimTestOps>(state, replay_worker, kTaskIds[1], TaskKind::Qk, replay_stats);
@@ -262,7 +259,8 @@ void TestAllTaskKindsUseCursorClaim() {
 
     Check(
         exact, "all task kinds keep cursor routing, exact candidates, "
-               "one winner, legal replay, and untouched deps_prepared"
+               "shard-affine participants, one winner, legal replay, "
+               "and untouched deps_prepared"
     );
     (void)munmap(state, sizeof(*state));
 }
