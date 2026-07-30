@@ -16307,3 +16307,81 @@ plan 计算 task id 会让 plan-vs-task 的独立检查变成同源恒真；若�
 读取 `local_index` 保留检查，又没有访存收益。因此本阶段不采用
 plan-derived 或 store 合并。剩余同类空间只剩 UP-only 单点，需要在
 下一阶段独立验证，不能与本次收益混算。
+
+### 2026-07-30：撤回 UP 前驱身份复用并结束 task 前沿读写消减
+
+#### 隔离候选
+
+在已提交的 PV-only 基线上，只让 UP 再从紧邻 PV 的
+`context.task_id+1` 取得 task id；下一 Alloc 仍从
+`WorkerState.local_index` 重新锚定。CPU shared 全量、B256/G1、
+mixed G0/G1/G2/G4、CCEC shared 和两份 A5 B256/G1 完整泳道均通过。
+
+CCEC O3 证明增量范围精确：
+
+- `worker.local_index` load 从 7 降到 6，store 仍为 6；
+- block-local `context.task_id` load 从 1 增到 2；
+- PV 机器码路径不变，唯一新增替换位于 UP Begin；
+- 没有长活跃 SSA，alloca 和 1952 B frame 不变；
+- AIC/AIV atomic 均保持 92 个，类型、参数与顺序不变；
+- AIC orchestration 大小不变，AIV 增加 28 B，mixed ELF `.text`
+  不变。
+
+候选两份泳道为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_222703_543246/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_222750_543176/ccec/
+```
+
+基线是 PV-only：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_221211_521079/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_221258_521012/ccec/
+```
+
+四份 raw 均保持完整结构、drop 0，固定 transition 与
+`Atomic∪Kernel` 的交集为 0。候选没有产生直接收益：
+
+| 固定边界 | AIC | AIV | 全部 |
+| --- | ---: | ---: | ---: |
+| PV→UP 目标 | +2.725% | +0.469% | **+1.149%** |
+| UP→下一 Alloc | -0.899% | +21.988% | **+15.656%** |
+
+目标 PV→UP 两轮全体分别回退 `1.263%/1.036%`。严格固定同核六个
+Claim status 的 18,907 个完整 group 后：
+
+| 核型 | PV→UP + UP 尾部 | 五段闭合 |
+| --- | ---: | ---: |
+| AIC | +0.627% | -0.577% |
+| AIV | **+15.412%** | **+10.786%** |
+| 全部 | **+11.513%** | **+7.314%** |
+
+全体五段两轮分别回退 `7.550%/7.077%`。整体 Submit 两轮为
+`-1.692%/+1.372%`，方向相反，只能反映背景波动，不能掩盖固定人口
+non-atomic 边界的明确回退。候选源码已完整撤回，工作树恢复到
+PV-only 提交 `1ffde2b3`。
+
+#### 该候选族的终止结论
+
+在下列合同同时保持时，task 前沿读写的等价消减已经基本穷尽：
+
+- 每次 Begin 必须立即保存 attempted 前沿；
+- Alloc/QK/SF/UP 继续提供独立 `WorkerState` 锚点；
+- plan、replay、ticket/context 与批末 cursor 校验不能同源化；
+- Claim/atomic 协议和 96/32/64 人口冻结。
+
+原因是：
+
+1. PV-only 是五种粒度中唯一穿过全体五段闭合的读消减；
+2. SF-only 和 UP-only 都把代价显著推到紧邻边界；
+3. 删除或合并 store 会破坏中途失败时的精确 attempted 前沿；
+4. plan-derived id 会削弱独立顺序证据；重新读取 cursor 复核则没有
+   访存收益；
+5. 新增 block-local mirror、参数或 prefetch 只会重复现有 context
+   机制或增加热路径指令。
+
+因此后续不再组合更多 cursor 变体。SubmitTransition 若继续优化，
+必须寻找与 task-id 前沿无关的独立工作项，并继续使用固定人口的完整
+相邻闭合作为裁决依据。

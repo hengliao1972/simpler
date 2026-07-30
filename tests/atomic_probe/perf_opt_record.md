@@ -4277,3 +4277,29 @@ AIC/AIV/全体分别下降 `6.272%/3.785%/4.701%`。严格固定六个 status
 `2252.752～2329.632 us`，只作整体背景。完整四版撤回数据、静态
 证据、固定人口边界和剩余设计空间见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.22 撤回 UP 前驱身份复用
+
+**[已撤回] PV-only 基线上继续删除 UP Begin 的 GM 前沿读取**
+
+该候选静态上只把 `worker.local_index` load 从 7 减到 6，store
+保持 6；没有长活跃 SSA、栈或 atomic 变化。CPU/CCEC/A5 正确性和
+两份完整 B256 泳道均通过：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_222703_543246/ccec/
+  pa_scheduler_shared_swimlane_20260730_222750_543176/ccec/
+```
+
+但是固定 Claim status 并扣除 `Atomic∪Kernel` 后，直接目标 PV→UP
+已经回退 `1.149%`；UP→下一 Alloc 回退 `15.656%`。严格固定六个
+status 的 18,907 个完整 group 中，PV→UP 加 UP 尾部回退
+`11.513%`，五段闭合回退 `7.314%`，两轮分别为
+`7.550%/7.077%`。
+
+源码已恢复到 PV-only 提交 `1ffde2b3`。结合此前 group-wide、
+SF/PV/UP、SF/PV 和 SF-only 的否决证据，在“每次 Begin 立即保存
+前沿、保留独立顺序校验、冻结 Claim/atomic”约束下，该 task 前沿
+load/store 候选族到此终止。详细逐边界绝对值与静态审计见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
