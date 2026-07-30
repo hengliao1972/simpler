@@ -3974,7 +3974,8 @@ PA_DEVICE bool SubmitCallbackTask(
     SubmitContext &context, LocalStats &stats, PmuContext &pmu_context
 #if PTO_FDWIC_SHARED_MAP
     , const SharedPaBatchPlan &shared_batch_plan,
-    uint32_t shared_task_offset
+    uint32_t shared_task_offset,
+    uint32_t shared_batch_count
 #endif
 ) {
 #if PTO_FDWIC_SHARED_MAP
@@ -3984,8 +3985,11 @@ PA_DEVICE bool SubmitCallbackTask(
 #endif
     const uint32_t task_id = static_cast<uint32_t>(context.task_id);
 #if PTO_FDWIC_SHARED_MAP
+    // RunSchedulerImpl 已在 replay 外读取同一份 batch 数，并把它作为
+    // 本轮 replay 上界；沿用该 SSA 值，使每次 Submit 不再从只读
+    // RunConfig 回取相同字段。
     SharedPaPlannedTask shared_planned_task{};
-    if (batch >= state->config.batches ||
+    if (batch >= shared_batch_count ||
         !SharedPaPlannedTaskAt(
             shared_batch_plan, shared_task_offset,
             shared_planned_task
@@ -3999,7 +4003,7 @@ PA_DEVICE bool SubmitCallbackTask(
     }
     const bool shared_is_last_submit =
         shared_planned_task.is_last_in_batch &&
-        batch + 1U == state->config.batches;
+        batch + 1U == shared_batch_count;
     const uint8_t shared_task_meta = EncodeSharedPaTaskMeta(
         Kind, shared_planned_task.group_index,
         shared_planned_task.has_following_group,
@@ -4555,7 +4559,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             if (!SubmitCallbackTask<TaskKind::Alloc, Ops, Profile>(
                     state, worker, role, task_count, orchestration, args,
                     batch, context, stats, pmu_context,
-                    batch_plan, 0
+                    batch_plan, 0, batches
                 )) {
                 break;
             }
@@ -4572,7 +4576,8 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                         state, worker, role, task_count, orchestration,
                         args, batch, context, stats, pmu_context,
                         batch_plan,
-                        SharedPaTaskOffset(TaskKind::Qk, group)
+                        SharedPaTaskOffset(TaskKind::Qk, group),
+                        batches
                     )) {
                     replay_ok = false;
                     break;
@@ -4588,7 +4593,8 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                         state, worker, role, task_count, orchestration,
                         args, batch, context, stats, pmu_context,
                         batch_plan,
-                        SharedPaTaskOffset(TaskKind::Sf, group)
+                        SharedPaTaskOffset(TaskKind::Sf, group),
+                        batches
                     )) {
                     replay_ok = false;
                     break;
@@ -4604,7 +4610,8 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                         state, worker, role, task_count, orchestration,
                         args, batch, context, stats, pmu_context,
                         batch_plan,
-                        SharedPaTaskOffset(TaskKind::Pv, group)
+                        SharedPaTaskOffset(TaskKind::Pv, group),
+                        batches
                     )) {
                     replay_ok = false;
                     break;
@@ -4620,7 +4627,8 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                         state, worker, role, task_count, orchestration,
                         args, batch, context, stats, pmu_context,
                         batch_plan,
-                        SharedPaTaskOffset(TaskKind::Up, group)
+                        SharedPaTaskOffset(TaskKind::Up, group),
+                        batches
                     )) {
                     replay_ok = false;
                     break;

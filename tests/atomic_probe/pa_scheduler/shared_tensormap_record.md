@@ -14830,3 +14830,121 @@ outputs/pa_scheduler_shared_swimlane_20260730_154407_3998986/ccec/
 角色相关代码布局变化使 AIV 直接目标区稳定回退；不能用 AIC 局部改善、
 删指令数量或端到端近似持平替代直接 non-atomic 证据。后续不再重复该
 方向。
+
+### 2026-07-30：shared Submit 复用 batch-count SSA
+
+#### 重复读取与等价边界
+
+`RunSchedulerImpl()` 已在 replay 外把 `state->config.batches` 读取为
+`const uint32_t batches`，并用它初始化 orchestration、控制 batch 循环。
+原 shared `SubmitCallbackTask()` 仍在每次 Submit 中重新从同一只读
+`RunConfig` 读取该字段，用于：
+
+1. 检查当前 `batch` 未超过 replay 上界；
+2. 判断当前 task 是否为全局最后一次 Submit。
+
+host 在 kernel 启动前写完 `RunConfig`，worker 执行期间只读；而外层
+replay 本来也不会支持运行中动态修改 batch 数。因此本阶段只在 shared
+模板参数区增加 `shared_batch_count`，由 Alloc/QK/SF/PV/UP 五个调用点
+传入现有 `batches` SSA。private 预处理后的函数签名和五个调用点保持
+原样；没有新增状态字段，也没有修改 ticket/Finish/trace ABI。
+
+默认 B256/G1 每个 worker 回放 `256×5=1,280` 次 Submit，准确动态消减
+为：
+
+```text
+96 × 1,280 = 122,880 次 RunConfig GM load
+```
+
+源码中每次 Submit 的两次引用原本已被 O3 合并为一次读取，因此不能把
+消减量写成两倍。每核 replay 入口的一次读取仍保留，全局共 96 次。
+
+#### 代码生成与 atomic 冻结
+
+相同 CCEC shared perf-clock O3 参数下，AIC 对
+`SchedulerState.config.batches` 的静态 GM load 由 6 个降为 1 个：
+入口读取保留，五类 Submit 的静态读取全部消失。AIC
+`llvm.hivm.atom.*` 静态调用保持 `56→56`。
+
+AIV 候选已成功生成非空 O3 对象；其 LLVM 15 bitcode 含本机 LLVM 19
+无法识别的自定义 attribute 96，因此没有把 AIC 的文本 IR 数字冒充成
+AIV 实测。AIC/AIV 正式 CCEC mixed ELF 都完整构建、两入口和各自
+block-local state 均通过检查，最终 ELF 无 relocation。
+
+#### 正确性与构建闭合
+
+以下均通过：
+
+- CPU shared 全量协议自测；
+- CPU shared 动态 B256/G1，96 核、1,280 task、依赖签名
+  `b7d985d6edb07078`；
+- CPU private 全量构建；
+- CCEC shared full-swimlane/perf-clock；
+- CCEC private full-swimlane；
+- 两次 A5 B256/G1 完整泳道。
+
+候选泳道：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_164316_4144100/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_164410_4145749/ccec/
+```
+
+两次均保持 96 核、1,280 task、73,728 attempted Claim、1,280 winner、
+72,448 true-loser、49,152 not-attempted、1,024 kernel、drop 0，
+execution/semantic/postprocess 全部 PASS。Claim 候选人口、atomic 类型、
+地址、调用点和完成协议均未修改。
+
+#### SubmitTransition 直接 non-atomic 结果
+
+基线：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_154311_3996206/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_154407_3998986/ccec/
+```
+
+直接区间定义为每核 `Submit.end → 下一 Submit.start`。task 1～1279
+形成 `96×1,279=122,784` 条 transition；task 0 前的
+`Orchestration.start → Submit0.start` 单列。四份 raw 在这些区间内都
+没有 Atomic 或 Kernel 事件，因此直接结果不依赖扣除近似。
+
+| 122,784 条 SubmitTransition | 基线均值 | 候选均值 | 变化 |
+| --- | ---: | ---: | ---: |
+| AIC | 151.129 tick | 126.706 tick | **-16.160%** |
+| AIV | 154.722 tick | 121.359 tick | **-21.563%** |
+| 全核 | 153.524 tick | 123.141 tick | **-19.790%** |
+
+两份候选区间与两份基线区间完全不重叠。按下一次 Submit 的 task kind
+分层，全核也全部同向：
+
+| 下一 task kind | Alloc | QK | SF | PV | UP |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| transition 变化 | -17.983% | -17.983% | -27.235% | -27.968% | -10.454% |
+
+AIC/AIV 的每个 kind 也全部下降，没有角色或 task 类型反向层。task 0
+前缀的 96 个区间全核另下降 `5.502%`。
+
+固定人口的四段完整 non-atomic actor 继续逐核扣除
+`Atomic∪Kernel`，且逐 actor 满足四段之和等于完整区间：
+
+| 固定人口 | AIC | AIV | 全核 |
+| --- | ---: | ---: | ---: |
+| 68,707 true-loser | -6.576% | -11.484% | **-9.998%** |
+| 49,120 not-attempted | -5.961% | -3.496% | **-4.343%** |
+
+true-loser 的 EfDrain/Claim/tail 有局部布局变化，但直接 transition
+下降 `21.725%`，完整 actor 仍下降 `9.998%`；not-attempted 的直接
+transition 下降 `17.668%`，完整 actor 下降 `4.343%`。winner 的物理
+核随 Claim 竞争变化，四份 `(core,task)` 固定交集为 0，因此没有伪造
+固定 winner 分核对比。
+
+候选三次 perf-clock 为
+`2,259.519/2,310.570/2,283.806 us`，只作运行背景，不参与去留。
+
+#### 决策
+
+本阶段保留。它没有改变 atomic 或业务协议，真实后端删除了默认
+B256/G1 的 122,880 次重复 GM 配置读取；直接 SubmitTransition 在
+AIC/AIV、五种 task 类型和两轮样本中全部稳定改善，完整 true-loser 与
+not-attempted non-atomic actor 也同向下降。

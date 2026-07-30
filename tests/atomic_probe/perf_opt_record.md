@@ -3769,3 +3769,44 @@ tests/atomic_probe/pa_scheduler/outputs/
 
 完整协议审计、对象尺寸和分核数据见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.11 shared Submit 复用 batch-count SSA
+
+**[已保留] 删除每次 Submit 对只读 RunConfig 的重复 GM 读取**
+
+`RunSchedulerImpl()` 已在 replay 外读取 `state->config.batches` 并用作
+循环上界。shared 五类 `SubmitCallbackTask()` 现在直接接收这份 SSA，
+不再为 batch 上界和末次 Submit 判断逐次回取同一字段。private
+预处理分支、ticket/Finish/trace ABI、Claim 和 atomic 协议全部不变。
+
+默认 B256/G1 精确删除 `96×1,280=122,880` 次 GM load，只保留每核
+入口一次。CCEC AIC shared perf-clock O3 IR 中该字段的静态 load
+`6→1`，`llvm.hivm.atom.*` 保持 `56→56`；AIV 正式对象与 mixed ELF
+构建通过，但因 LLVM 15 自定义 attribute 无法用本机 LLVM 19可靠转成
+文本，没有冒充 AIV IR 数字。
+
+CPU shared 全量及动态 B256/G1、CPU private、CCEC shared
+full-swimlane/perf-clock、CCEC private和两次 A5 B256/G1 完整语义均
+通过。两份基线与两份候选中，全部 122,784 条
+`Submit.end→下一 Submit.start` 都没有 Atomic/Kernel 交集：
+
+| SubmitTransition | AIC | AIV | 全核 |
+| --- | ---: | ---: | ---: |
+| 平均 tick 变化 | **-16.160%** | **-21.563%** | **-19.790%** |
+
+按下一 task 的 Alloc/QK/SF/PV/UP 分层全部下降。固定 true-loser 的完整
+non-atomic actor 在 AIC/AIV/全核分别下降
+`6.576%/11.484%/9.998%`；固定 not-attempted 分别下降
+`5.961%/3.496%/4.343%`。候选三次 perf-clock
+`2,259.519/2,310.570/2,283.806 us` 只作背景。
+
+候选产物：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_164316_4144100/ccec/
+  pa_scheduler_shared_swimlane_20260730_164410_4145749/ccec/
+```
+
+完整调用链、动态次数、分 kind 数据和四段闭合见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
