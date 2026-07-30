@@ -13596,3 +13596,55 @@ CAS 方向到此停止并完整撤回，原因不是“CAS 一定慢”，而是
 FetchMax 是基于完整 loser control 的决定，不是只比较单条原子指令。
 若未来硬件、cursor 分片或 arrival 形态变化，应重新做隔离微基准和完整
 泳道，不直接恢复本轮任一过程态。
+
+### 2026-07-30：修正 loser 候选的保留口径
+
+上一节把“true-loser control 必须下降”放在 perf-clock 端到端结果之前，
+会错误撤回真实 Submit 已经受益的候选。后续统一使用如下口径：
+
+1. `perf-clock` 是候选保留或撤回的首要依据；端到端有稳定收益就保留；
+2. 完整泳道用于解释收益迁移到了 winner、loser、transition 还是 atomic，
+   不能用观察构建中的局部回退否定低扰动构建的端到端收益；
+3. 纯 loser 候选允许端到端小幅回退，但中位数回退不得超过约 `2%`；
+4. Claim 人口、winner 数、依赖签名和发布协议仍必须完全等价。
+
+因此上一节第一轮数组 predictor 的 perf-clock 中位数收益 `0.703%` 应重新
+作为保留候选验证，而不是因为完整泳道 true-loser control 回退就直接判废。
+本记录保留当时四轮原始数据，不改写历史测量；后续恢复第一轮源码后重新做
+同设备成对测试，再形成新的最终决策。
+
+### 2026-07-30：Claim 游标预读后条件 FetchMax（撤回）
+
+#### 候选
+
+每个 shared eligible actor 先对原 Claim cursor 执行一次
+`atomicAdd(0)`：
+
+- 若读到 `cursor >= task_id`，该 actor 必然是 loser，直接跳过 FetchMax；
+- 若读到 `cursor < task_id`，继续执行原 FetchMax；即使两条原子之间被
+  其他核推进，FetchMax 的返回旧值仍保证唯一 winner。
+
+该候选没有裁剪候选核：B256 仍为 `73,728` 次逻辑 Claim、
+`1,280` 个 winner，Alloc/QK-PV/SF-UP 仍使用原始 `96/32/64` 人口。
+CPU 定向并发测试、shared ordered-submit 门槛和 B256 全回放均通过。
+
+#### A5 perf-clock
+
+以 commit `5e2aa425` 为冻结基线，两套产物使用同一 CANN 9.1 和相同
+B256 real-compute/final-barrier 配置独立构建。当前环境没有
+`task-submit` 和 `npu-smi`，按本会话已确认的 A5 独占条件在 device 0
+直接串行交替运行。去掉各自一次冒烟后，按平衡顺序采集 8+8 个进程：
+
+| 构建 | mean | median | 范围 |
+| --- | ---: | ---: | ---: |
+| 原 FetchMax 基线 | 2,313.873 us | 2,303.827 us | 2,280.439～2,381.820 us |
+| Load＋条件 FetchMax | 2,371.689 us | 2,371.005 us | 2,348.513～2,399.903 us |
+| 变化 | +57.816 us / +2.499% | +67.178 us / +2.916% | — |
+
+#### 结论
+
+尽管预读能减少物理 FetchMax 数量，但它把每个 eligible actor 都变成至少
+一次 atomic，并让仍可能获胜的 actor 串行执行两次 atomic。A5 端到端
+中位数回退 `2.916%`，超过纯 loser 候选约 `2%` 的保留门槛，因此生产
+代码、临时 atomic site、converter 映射和定向计数改动全部撤回，仅保留
+本节数据。后续不再用“原子次数减少”代替端到端性能判断。
