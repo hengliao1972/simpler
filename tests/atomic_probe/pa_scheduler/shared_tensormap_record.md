@@ -13403,3 +13403,196 @@ makespan 更短，也不能接受 true-loser control 连续回退
 `8.72%～11.90%`。后续 Claim 优化若能消除这种到达聚集反噬，可以重新
 评估 direct context load；在此之前不能把“局部 transition 变短”写成
 完整 loser 优化。
+
+### 2026-07-30：CAS＋条件 FetchMax 的四轮 Claim 实验（全部撤回）
+
+#### 目标与不变合同
+
+本轮只替换 shared Claim 的物理原子实现，不改变：
+
+- Alloc/QK-PV/SF-UP 的原始 `96/32/64` eligible 人口；
+- B256 的 `73,728` 次逻辑 Claim、`1,280` 个 winner、
+  `72,448` 个 true loser 和 `49,152` 个 not-attempted；
+- 四条 Alloc/Cube cursor 与八条 shared Vector cursor 的地址和终态；
+- loser 不读 TensorMap、winner-only Build/Materialize/Register、
+  依赖签名、heap、writer history 与 completion 合同。
+
+候选利用默认 G1 PA 的固定五 task 周期，预测同一物理 cursor 的前任：
+
+| task | 前任距离 |
+| --- | ---: |
+| Alloc | 20 |
+| QK | 8 |
+| SF | 8 |
+| PV | 12 |
+| UP | 32 |
+
+正常路径先执行 `CAS(expected_predecessor, task_id)`。若 CAS 看到
+`observed < task_id` 且不等于预测前任，才补一次原 `FetchMax`；若
+`observed >= task_id` 则直接判 loser。旧 task replay 的 desired 使用
+`max(predicted, task_id)`，防止把单调 cursor 从 future task 写回旧值。
+
+动态 G0/G1/G2/G4 混合计划中，公式不匹配时由 FetchMax 保持通用语义。
+CPU 混合样本精确得到 `1,728 CAS + 26～52 fallback` 并全部 PASS；
+默认 B256 则始终为 `73,728 CAS + 0 fallback`。
+
+#### 正确性与观察能力
+
+实验期间曾临时增加独立 atomic site：
+
+- `SharedClaimCompareExchange`：主路 CAS；
+- 既有 `ClaimMax`：只表示真实 fallback FetchMax。
+
+因此完整泳道能明确核对 `CAS=73,728 / fallback=0`，不会把逻辑 Claim
+次数与物理 RMW 次数混在一起。定向 CPU 用例覆盖：
+
+- CAS winner、同 task loser、cursor 已超前；
+- 预测落后时 fallback winner；
+- CAS 与 fallback 之间由另一核推进时，fallback 按返回旧值判输；
+- 旧 task replay 不回写 cursor；
+- shared ordered-submit 的动态 G4 计划与 private CPU 全套门槛。
+
+四轮代码均通过相应 CPU shared 门槛、CCEC perf-clock/full-swimlane
+构建和 A5 B256 语义验证。最终决定撤回后，上述临时 atomic site、计数
+字段、converter 映射、测试和生产实现均已删除，避免留下无收益过程态。
+
+#### 第一轮：每 worker、每物理 cursor 的 block-local predictor
+
+第一轮在 `LocalStats` 中保存 `4 + 8` 个 `uint32_t` 前任，split state
+由 `1,664 B` 增至 `1,728 B`。反汇编确认 AIC/AIV 各有五条 CAS 和五条
+条件保护的 fallback MAX；正常 B256 fallback 为 0。
+
+机器码变化：
+
+| 产物 | atomicMax 基线 | 数组 predictor | 变化 |
+| --- | ---: | ---: | ---: |
+| AIC `.text` | 46,336 B | 47,792 B | +1,456 B |
+| AIV `.text` | 47,928 B | 49,464 B | +1,536 B |
+| final `.text` | 147,000 B | 150,072 B | +3,072 B |
+
+完整泳道：
+
+`outputs/pa_scheduler_shared_swimlane_20260730_074343_3392665/ccec`
+
+相对冻结基线
+`outputs/pa_scheduler_shared_swimlane_20260730_050015_3301011/ccec`：
+
+| 固定 actor 口径 | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| true-loser atomic bracket | 54.365 ms | 49.597 ms | -8.771% |
+| Claim 外层 | 6.796 ms | 13.416 ms | +97.390% |
+| true-loser Claim | 61.162 ms | 63.013 ms | +3.027% |
+| true-loser control | 107.124 ms | 111.046 ms | +3.662% |
+| all-nonwinner control | 138.251 ms | 144.491 ms | +4.513% |
+
+CAS 原子本身变短，但 block-local predictor、分支、阶段记录和到达时序
+共同形成的外层区间新增 `6.619 ms`，超过原子节省的 `4.768 ms`。这里
+只能把增加量解释为整个外层包围区间，不能全部硬归因到 predictor 指令。
+
+同一设备交错运行 8+8 个独立 perf-clock 进程：
+
+| 构建 | mean | median | 范围 |
+| --- | ---: | ---: | ---: |
+| atomicMax 基线 | 2,312.889 us | 2,316.173 us | 2,291.889～2,333.059 us |
+| CAS 数组候选 | 2,299.422 us | 2,299.899 us | 2,283.759～2,319.675 us |
+| 变化 | -13.467 us / -0.582% | -16.274 us / -0.703% | — |
+
+端到端虽更快，但目标要求 loser control 下降，不能以 perf-clock 改善掩盖
+固定 true-loser 人口的回退，因此不保留。
+
+#### 第二轮：无状态公式内联，fallback 慢路外提
+
+第二轮删除 64 B predictor，以固定周期公式直接得到 expected，并把五份
+fallback MAX 收敛为每个 role 一份 16 B noinline helper。split state
+恢复 `1,664 B`，final `.text` 为 `148,536 B`：比数组版少 `1,536 B`，
+但仍比 atomicMax 基线多 `1,536 B`。
+
+反汇编确认：
+
+- AIC/AIV orchestration 各五条 CAS、零条 MAX；
+- 每个 role 只有一个 fallback helper，内部一条 MAX；
+- 五种 Kind 已折叠为 `20/8/8/12/32` 立即数；
+- 正常 B256 仍是 `73,728 CAS / 0 fallback`。
+
+泳道：
+
+`outputs/pa_scheduler_shared_swimlane_20260730_080727_3416869/ccec`
+
+| 固定 actor 口径 | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| true-loser atomic bracket | 54.365 ms | 47.390 ms | -12.830% |
+| Claim 外层 | 6.796 ms | 9.636 ms | +41.773% |
+| true-loser Claim | 61.162 ms | 57.025 ms | -6.763% |
+| true-loser control | 107.124 ms | 111.319 ms | +3.917% |
+| not-attempted Claim | 1.876 ms | 7.052 ms | +275.852% |
+| all-nonwinner control | 138.251 ms | 152.112 ms | +10.026% |
+
+本轮首次证明 CAS 可以同时降低 atomic bracket 和完整 true-loser Claim；
+但 expected 计算位于 role 过滤之前，使 49,152 个 not-attempted actor
+每个多约 105 ns。true-loser 中 transition 又增加 `5.080 ms`、tail
+增加 `2.063 ms`，完整 control 仍回退。
+
+#### 第三轮：把公式移到 eligibility 之后
+
+第三轮只让 eligible actor 计算前任，动态计划仍由 fallback 保持正确性。
+泳道：
+
+`outputs/pa_scheduler_shared_swimlane_20260730_081713_3427695/ccec`
+
+| 固定 actor 口径 | 变化 |
+| --- | ---: |
+| true-loser atomic bracket | -6.731% |
+| Claim 外层 | +52.484% |
+| true-loser Claim | -0.151% |
+| true-loser control | +5.681% |
+| not-attempted Claim | +231.802% |
+| all-nonwinner control | +12.197% |
+
+源码虽然不再让 not-attempted 执行公式，但五个内联 CAS 路径仍改变公共
+Claim 的机器码布局和外层执行形状；泳道中的 not-attempted 开销没有恢复。
+不能用“源码分支没执行”推翻设备结果。
+
+#### 第四轮：attempted-only noinline CAS＋fallback
+
+最后把 CAS、判定和 fallback 整体外提；inline 路径只完成原 role 路由，
+eligible actor 才调用一个 noinline 原子 helper。泳道：
+
+`outputs/pa_scheduler_shared_swimlane_20260730_082337_3434169/ccec`
+
+该版成功隔离 not-attempted：
+
+| 固定 actor 口径 | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| not-attempted Claim | 1.876 ms | 0.981 ms | -47.707% |
+| not-attempted control | 31.128 ms | 31.006 ms | -0.392% |
+
+但 attempted Claim 本身明显回退：
+
+| 固定 actor 口径 | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| true-loser atomic bracket | 54.365 ms | 65.160 ms | +19.857% |
+| Claim 外层 | 6.796 ms | 6.816 ms | +0.285% |
+| true-loser Claim | 61.162 ms | 71.976 ms | +17.682% |
+| true-loser control | 107.124 ms | 119.003 ms | +11.089% |
+| all-nonwinner control | 138.251 ms | 150.009 ms | +8.504% |
+
+回退主要来自高竞争 Alloc：其 true-loser Claim 约增加 `31.404%`，
+atomic bracket 约增加 30%。global Submit 为
+`2,416.656 us`，与基线 `2,416.793 us` 基本相同；端点中性不能掩盖
+固定 true-loser control 增加 `11.879 ms core-time`。
+
+#### 最终决策
+
+CAS 方向到此停止并完整撤回，原因不是“CAS 一定慢”，而是四种实现已把
+主要可疑因素逐一分离：
+
+1. 数组 predictor：CAS bracket 更快，但 block-local/外层反噬；
+2. 无状态公式：true-loser Claim 更快，但 not-attempted 与后续阶段反噬；
+3. eligibility 内移：源码少做工作，设备上的公共外壳仍未恢复；
+4. attempted-only noinline：not-attempted 已恢复，但高竞争 Alloc CAS
+   本身显著回退。
+
+因此当前 A5/PA 拓扑下，没有证据支持用 CAS 替换 ClaimMax。保留原
+FetchMax 是基于完整 loser control 的决定，不是只比较单条原子指令。
+若未来硬件、cursor 分片或 arrival 形态变化，应重新做隔离微基准和完整
+泳道，不直接恢复本轮任一过程态。
