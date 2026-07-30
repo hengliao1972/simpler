@@ -3735,3 +3735,37 @@ tests/atomic_probe/pa_scheduler/outputs/
 
 语言边界、IR 门槛、placement 归一化和完整原始数据见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.10 shared `DrainReady` built guard
+
+**[已撤回] 删除语义冗余检查后 AIV 直接 non-atomic 区间回退**
+
+当前同步 shared slot 生命周期可证明合法 `DrainReady()` 入口满足
+`occupied => built`：本 worker 在同一调用链内完成占位和 payload
+构造，失败路径在返回 replay 前清槽，private 路径保持原检查。因此候选
+只在 shared 构建删除 `!slot.built`，没有改变 atomic、Claim 人口、
+TensorMap、Build 或 kernel 语义。
+
+CCEC O3 IR 中 AIC kernel 删除 6 组 built GM load/compare/branch，
+AIC/AIV finish 各删除 1 组；kernel/finish atomic 分别保持 `92/44`，
+alloca 保持 `5/3`。CPU shared、B256/G1、CCEC 和两次 A5 完整泳道均
+通过，但四份 raw 扣除逐核 `Atomic∪Kernel` 后的直接证据明确反向：
+
+| 直接口径 | AIC | AIV | 全核 |
+| --- | ---: | ---: | ---: |
+| 受影响 drain 父区间 non-atomic | -0.601% | **+16.697%** | **+12.244%** |
+| 每次 built-check | -2.32% | **+19.55%** | **+13.46%** |
+| 共同 EfDrain 固定交集 | +10.475% | **+19.790%** | **+18.009%** |
+
+完整固定人口 non-atomic actor 中，true-loser 全核回退 `4.341%`，
+not-attempted 回退 `2.692%`；主要回退均来自 AIV。候选已完整撤回，
+不把三次近似持平的 perf-clock 或指令删除量作为保留理由。候选产物：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_162101_4095280/ccec/
+  pa_scheduler_shared_swimlane_20260730_162148_4095223/ccec/
+```
+
+完整协议审计、对象尺寸和分核数据见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。

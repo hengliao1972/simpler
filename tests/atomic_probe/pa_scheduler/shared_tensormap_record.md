@@ -14751,3 +14751,82 @@ Atomic∪Kernel 区间并集。
 仍不是充分的性能证据：虽然 IR 精确少了 1,024 条 GM store，但 AIV 和
 全核直接目标区间均回退。后续不重复该方向，转向动态次数约 4 万次的
 shared `built` guard 读取/分支。
+
+### 2026-07-30：删除 shared `built` guard 试验撤回
+
+#### 语义审计与代码生成
+
+`DrainReady()` 原先依次检查：
+
+```cpp
+slot.occupied && slot.built && SlotReady(...)
+```
+
+shared slot 只由所属 worker 的同一个 scalar 同步生产和消费。
+`BuildWinner()` 先设置 `occupied=true,built=false`，随后在同一调用链
+调用 `BuildSlotPayload()` 完成 payload 并设置 `built=true`；中间没有
+`DrainReady()`、replay 重入或跨 scalar 消费。Build 后封口失败会在返回
+replay 前调用 `DiscardBuiltTask()` 清槽。因此当前合法的 shared
+`DrainReady()` 可观察入口满足 `occupied => built`。private 仍有独立的
+生产状态机，候选没有修改 private 分支。
+
+候选据此仅在 shared 构建删除 `!slot.built`。CCEC O3 IR 证明：
+
+- AIC kernel 的 built GM load/compare/branch 内联点由 6 个降为 0；
+- AIC/AIV finish 各额外删除 1 个 built 检查；
+- kernel atomic intrinsic 保持 `92→92`，finish 保持 `44→44`；
+- kernel/finish alloca 分别保持 5/3；
+- 目标文件尺寸发生角色相关布局变化，不能用删指令数量推断性能：
+  AIC kernel `.text` 增加 336 B，AIV kernel 减少 512 B，
+  AIC/AIV finish 分别减少 80/424 B。
+
+CPU shared 全量自测及 B256/G1、CCEC shared full-swimlane、两次 A5
+B256/G1 完整泳道均通过。两份候选保持 96 核、1,280 task、原始
+96/32/64 Claim 人口、依赖签名 `b7d985d6edb07078`、drop 0，
+execution/semantic/postprocess 全部 PASS：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_162101_4095280/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_162148_4095223/ccec/
+```
+
+三次候选 perf-clock 为
+`2,332.290/2,287.361/2,324.944 us`，与基线分布重叠，只作背景记录。
+
+#### 直接 non-atomic 结果
+
+基线复用上一保留阶段的两份泳道：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_154311_3996206/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_154407_3998986/ccec/
+```
+
+统计先逐核合并 `Atomic∪Kernel`，再从含 `FaninFlagLoad` 或 `Kernel`
+的 EfDrain/FinalDrain 父区间扣除交集。两轮均值如下：
+
+| 直接受影响父区间 non-atomic | AIC | AIV | 全核 |
+| --- | ---: | ---: | ---: |
+| 基线 → 候选 | 1,883,456.5→1,872,138.5 tick | 5,433,358.0→6,340,552.5 tick | 7,316,814.5→8,212,691.0 tick |
+| 变化 | -0.601% | **+16.697%** | **+12.244%** |
+
+按动态 built-check 次数归一后，AIC 每检查约改善 `2.32%`，AIV回退
+`19.55%`，全核由 `182.147` 增至 `206.661 tick/check`，回退
+`13.46%`。四份 raw 的共同受影响 EfDrain `(core,task)` 固定交集为
+1,024 个，AIC/AIV/全核也分别回退
+`10.475%/19.790%/18.009%`。
+
+固定人口的完整 non-atomic actor 同样不支持保留：
+
+| 固定人口 | AIC | AIV | 全核 |
+| --- | ---: | ---: | ---: |
+| 68,774 true-loser | -0.307% | **+6.358%** | **+4.341%** |
+| 49,152 not-attempted | +0.078% | **+4.062%** | **+2.692%** |
+
+#### 决策
+
+候选撤回，生产源码恢复为同时检查 `occupied` 与 `built`。该试验说明
+`occupied => built` 在当前同步实现中虽然语义成立，但删除检查引起的
+角色相关代码布局变化使 AIV 直接目标区稳定回退；不能用 AIC 局部改善、
+删指令数量或端到端近似持平替代直接 non-atomic 证据。后续不再重复该
+方向。
