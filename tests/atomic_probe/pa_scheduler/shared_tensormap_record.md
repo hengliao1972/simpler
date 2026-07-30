@@ -12984,6 +12984,32 @@ loser 优化。被筛掉的 worker 在原 `96/32/64` 合同下仍可能成为 wi
 因此 31% 的端到端改善主要来自改变工作量和 winner 可选集合，不能作为
 后续优化基线。该方案现已撤回，数据仅保留为负面实验记录。
 
+#### 非等价候选收窄的最优完整泳道留档
+
+对所有现存 B256 shared full-swimlane 重新按 ClaimMax 数量、winner、
+true loser、not-attempted、PASS 和 drop 0 做独立核对后，非等价候选
+收窄过程中的最快完整泳道不是前述用于详细归因的 `2028.832 us` 样本，
+而是后续 `12/8/8` 样本：
+
+`outputs/pa_scheduler_shared_swimlane_20260730_022809_3165284/ccec`
+
+该图的 Submit 为 `1750.044 us`，ClaimMax 为 `11,264`，其中 winner
+`1,280`、true loser `9,984`、not-attempted `111,616`；validation
+为 PASS，drop 为 0。
+
+在 `5d34768a` 修改之前实际生成、仍采用原始 `96/32/64` 合同的现存最快
+完整泳道为：
+
+`outputs/pa_scheduler_shared_swimlane_20260729_195313_2907150/ccec`
+
+该图的 Submit 为 `2421.040 us`，ClaimMax 为 `73,728`，其中 winner
+`1,280`、true loser `72,448`、not-attempted `49,152`；同样为 PASS、
+drop 0。两份图的差值为 `-670.996 us（-27.71%）`，但它衡量的是取消
+大量 worker Claim 资格后的工作量变化，不能记作等价优化收益。
+
+两份 merged 泳道和 exclusive 分析已用包含 Claim 合同与时间的名字归档
+到 `test_record/2026-7-30/`，详细口径见同目录《本次结果说明》。
+
 ### 2026-07-30：撤回八路 Alloc 高水位的 12/8/8 过程态
 
 在 24/8/8 基础上曾提交 `f7e2ee98`：把 shared 中闲置的四路 legacy
