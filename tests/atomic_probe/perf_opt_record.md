@@ -4303,3 +4303,47 @@ SF/PV/UP、SF/PV 和 SF-only 的否决证据，在“每次 Begin 立即保存
 前沿、保留独立顺序校验、冻结 Claim/atomic”约束下，该 task 前沿
 load/store 候选族到此终止。详细逐边界绝对值与静态审计见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.23 撤回 Submit-entry EfDrain PollBatch 恒假判断消减
+
+**[已撤回] 静态删分支成立，但两次收窄都未通过 non-atomic 闭合**
+
+Submit-entry EfDrain 从不进入 FaninFlagLoad PollBatch region。全核
+候选在该调用点传常量 `false`，保留同一 direct atomic/raw，只删除
+`enabled_mask` 和恒假分支。CCEC O3 中 AIC/AIV `.text` 分别由
+`71,760/73,528 B` 降为 `70,600/72,248 B`，WaitForSlot、HeapGuard
+和 FinalDrain 的 PollBatch 路径不变。CPU/CCEC 与两份 A5 B256 完整
+正确性均通过：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_230254_602051/ccec/
+  pa_scheduler_shared_swimlane_20260730_230534_606179/ccec/
+```
+
+但四份 raw 固定 slot0-only、旧 task kind、Claim status、atomic
+site/flags 并扣除 `Atomic∪Kernel` 后，AIC 下降 `31.391%`，AIV
+回退 `62.130%`，全体回退 `47.726%`。因此全核版撤回。
+
+继续收窄成 AIC-only 后，AIV `.text` 与基线逐字节相同。两份泳道为：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_231215_614856/ccec/
+  pa_scheduler_shared_swimlane_20260730_231307_616051/ccec/
+```
+
+严格固定 509 个 actor 后：
+
+| AIC-only | AIC | AIV | 全部 |
+| --- | ---: | ---: | ---: |
+| EfDrain non-atomic | **-7.321%** | +9.320% | +5.820% |
+| 四段闭合 | **-2.326%** | +4.727% | +3.265% |
+
+字节未改的 AIV 仍两轮增加 `6.964%/11.362%`，证明 AIC 到达时序会
+把代价传到其他核，不能只裁决直接改码的核型。两版源码均已完整撤回，
+未运行 perf-clock；直接 non-atomic 证据已经足以否决。
+
+结合已保留的入口占用数提前退出，本轮确认 EfDrain 的 header/control
+低风险等价消减基本穷尽。详细静态读取数、样本筛选、宽人口对照和终止
+边界见 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。

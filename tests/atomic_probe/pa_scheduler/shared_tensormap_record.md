@@ -16385,3 +16385,110 @@ PV-only 提交 `1ffde2b3`。
 因此后续不再组合更多 cursor 变体。SubmitTransition 若继续优化，
 必须寻找与 task-id 前沿无关的独立工作项，并继续使用固定人口的完整
 相邻闭合作为裁决依据。
+
+### 2026-07-30：撤回 Submit-entry EfDrain 的 PollBatch 恒假判断消减
+
+#### 静态上成立的等价候选
+
+Submit 开头的 opportunistic EfDrain 不位于任何
+`FaninFlagLoad` PollBatch region 内；只有 WaitForSlot、HeapGuard
+慢路和 FinalDrain 会显式打开该 region。因此先给
+`TraceAtomicLoad()`、`SlotReady()` 和 `DrainReady()` 增加默认开启的
+`allow_poll_batch` 参数，只在 Submit-entry EfDrain 传常量
+`false`。该版本仍执行同一 `atomicAdd(addr, 0)`，仍写相同
+FaninFlagLoad direct raw；它只删除读取恒为零的 `enabled_mask` 以及
+后续恒假分支。
+
+CCEC full-swimlane O3 证明三层调用全部内联，常量跨层传播：
+
+- AIC/AIV 的 `enabled_mask` 静态读取均从 26 处降为 21 处，正好对应
+  五种 Submit 实例；
+- `active_mask` 访问从 49 处降为 39 处；
+- WaitForSlot、HeapGuard 和 FinalDrain 的 21/39 处判断完整保留；
+- AIC `.text` 从 71,760B 降到 70,600B，AIV 从 73,528B 降到
+  72,248B；
+- direct raw 的 site、op、result-used、return-ready 和 value-zero
+  口径不变。
+
+CPU shared 全量协议门槛、B256/G1、mixed G0/G1/G2/G4、CCEC
+full-swimlane 构建和两份 A5 B256 完整泳道均通过。候选泳道为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_230254_602051/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_230534_606179/ccec/
+```
+
+两份均保持 96 核、1,280 task、73,728 attempted Claim、1,280
+winner、1,024 Kernel、依赖签名 `b7d985d6edb07078` 和 drop 0。
+
+#### 全核候选的动态否决证据
+
+基线为 PV-only 的两份泳道：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_221211_521079/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_221258_521012/ccec/
+```
+
+四份 raw 逐核重放 WinnerBuild/Commit，固定同一
+`(core, task, Claim status)`，并要求入口均为 `slot0-only`、旧 slot
+task kind 与 EfDrain 内 atomic site/flags 序列相同、无 Kernel。逐核
+合并并扣除 `Atomic∪Kernel` 后，严格样本为 164 个：
+
+| 固定 slot0-only EfDrain | AIC | AIV | 全部 |
+| --- | ---: | ---: | ---: |
+| 样本数 | 22 | 142 | 164 |
+| non-atomic 变化 | **-31.391%** | **+62.130%** | **+47.726%** |
+
+AIV 两轮分别回退 `42.879%/83.297%`；放宽到固定 shape/status 且
+无 Kernel 的 684 个样本后，AIV 仍回退 `59.840%`。更宽的 27,450
+个固定 nonwinner 中，EfDrain 回退 `6.110%`。因此不能用 AIC 的局部
+改善或 `.text` 缩小掩盖直接目标在主要 AIV 人口上的明确回退。
+
+#### AIC-only 收窄版仍未闭合
+
+第二版只在 AIC 传常量 `false`，AIV 恢复原判断。静态对象证明：
+
+- AIC 继续使用 70,600B 的消减版 `.text`；
+- AIV `.text` 恢复为 73,528B，且与基线 `.text` 的字节哈希完全相同。
+
+两份 A5 B256 泳道为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_231215_614856/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_231307_616051/ccec/
+```
+
+按同一严格口径固定 509 个 slot0-only actor：
+
+| AIC-only 候选 | AIC，112 个 | AIV，397 个 | 全部 |
+| --- | ---: | ---: | ---: |
+| EfDrain non-atomic | **-7.321%** | +9.320% | +5.820% |
+| EfDrain+Claim+tail+Transition | **-2.326%** | +4.727% | +3.265% |
+
+AIC 直接目标两轮下降 `8.973%/5.784%`，但字节完全未改的 AIV 对照
+两轮仍增加 `6.964%/11.362%`。这说明 AIC 到达时序变化会通过共享
+atomic/记录资源改变其他核的非 atomic 外壳；把 AIV 当作“未修改所以
+可忽略”会漏掉系统级搬移。更宽固定 nonwinner 的 EfDrain 也增加
+`1.701%`，四段闭合增加 `0.192%`。
+
+#### 决策与 EfDrain 当前边界
+
+全核版和 AIC-only 版均撤回，源码恢复到提交 `e47b9151`。本阶段没有
+运行 perf-clock，因为直接 non-atomic 目标已经否决候选，整体时间不能
+推翻该证据。
+
+结合此前已经保留的“按入口 occupied 数提前结束 header 扫描”以及静态
+审计，当前 EfDrain 剩余边界为：
+
+1. `occupied_count` 只读取一次，`remaining_occupied` 全程为 SSA；
+2. slot0-only 不再读取 slot1 header；
+3. occupied/built 检查不能在保持异常状态语义时继续删除；
+4. Submit-entry PollBatch 恒假判断虽然可静态删除，但动态 non-atomic
+   闭合失败；
+5. 不再尝试清零/恢复 mask、伪造新 AtomicSite、关闭 result-used 或
+   复制 direct trace helper，这些方案分别会增加热路工作、改变观察
+   语义或扩大代码。
+
+在 atomic 协议、Claim 人口和泳道口径冻结的前提下，EfDrain 的低风险
+等价消减到此基本穷尽。
