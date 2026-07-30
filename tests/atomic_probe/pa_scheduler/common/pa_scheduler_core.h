@@ -4097,6 +4097,18 @@ PA_DEVICE bool SubmitCallbackTask(
         PrepareSharedWinnerContext(
             worker, task_id, context
         );
+        if constexpr (Kind != TaskKind::Alloc) {
+            // block-group 派生量只被本 task 的参数构造读取。shared 下每种
+            // task 的 Claim owner 可能不同，因此由当前 winner 按已校验的
+            // 动态 plan 独立准备；其余 replay actor 不再写无消费者状态。
+            // private 仍在外层按原合同每组准备一次。
+            PreparePaBlockGroup(
+                orch,
+                static_cast<uint64_t>(
+                    shared_planned_task.group_index
+                ) * kPaBlocksPerRequest
+            );
+        }
         if (!BuildCallbackSubmitArgs<Kind>(orch, args, batch, stats)) {
             SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
             return false;
@@ -4561,10 +4573,6 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 
             for (uint32_t group = 0;
                  group < batch_plan.group_count; ++group) {
-                const uint64_t block_offset =
-                    static_cast<uint64_t>(group) *
-                    kPaBlocksPerRequest;
-                PreparePaBlockGroup(orchestration, block_offset);
                 if (!SubmitCallbackTask<
                         TaskKind::Qk, Ops, Profile
                     >(

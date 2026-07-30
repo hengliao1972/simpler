@@ -3500,3 +3500,39 @@ tests/atomic_probe/pa_scheduler/outputs/
 候选已完整撤回。缩小结构体不能替代目标区域收益；后续不再重复该方向。
 完整逐 transition、正确性合同和交错样本见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.4 shared block-group 状态改为 winner-only
+
+**[已保留] nonwinner 不再准备只供构参消费的 group 派生量**
+
+`PreparePaBlockGroup()` 的三个结果字段只由 QK/SF/PV/UP winner 构参
+读取。shared 修改为每种 task 的 Claim winner 在构参前按已验证
+`group_index` 独立准备；private 外层调用保持不变。B256/G1 的调用数由
+24,576 次降为 1,024 次，不改变任何 atomic、Claim 人口、TensorMap、
+heap、fanin、Build 或 kernel 合同。
+
+CPU shared G2/G4/B256、private B256、CCEC full-swimlane 以及两次 A5
+B256 完整语义均通过。直接受影响的 `Alloc -> QK` 非 atomic
+SubmitTransition 复核如下：
+
+| 人口 | 两份 HEAD mean | 两份候选 mean | 变化 |
+| --- | ---: | ---: | ---: |
+| 全 96 核 QK | 179.820/180.069 ns | 168.037/167.884 ns | **-6.55%～-6.77%** |
+| AIC QK | 170.323/170.965 ns | 179.016/179.758 ns | +4.71%～+5.54% |
+| 16,384 个 AIV QK not-attempted | 184.568/184.621 ns | 162.548/161.946 ns | **-11.93%～-12.28%** |
+
+全核中位数由 `119/120 ns` 降至两次均为 `104 ns`。AIC 回退显式保留，
+但真实 32:64 加权的直接目标区重复改善约 6.7%，因此按本轮只看
+non-atomic 收益的口径保留。
+
+候选泳道：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_141916_3768782/ccec/
+  pa_scheduler_shared_swimlane_20260730_142626_3783564/ccec/
+```
+
+完整非 atomic 闭合、动态 G2/G4 证明、背景 Submit/atomic 数据和角色
+差异见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。

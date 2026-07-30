@@ -14134,3 +14134,102 @@ not-attempted；动态 atomic poll 从 199,184 变为 195,521，进一步说明
 orchestration 输出句柄压缩。perf-clock、Submit makespan 和动态 atomic
 poll 继续保留在记录中用于说明运行背景，但不再作为本轮非 atomic 候选的
 保留或撤回门槛。
+
+### 2026-07-30：block-group 派生量只由 shared winner 准备（保留）
+
+#### 被消减的重复工作
+
+`PreparePaBlockGroup()` 只写
+`current_block_offset/current_nblocks/current_valid_len` 三个本核字段。
+全仓使用关系核对表明，这三个字段只由 QK/SF/PV/UP winner 的
+`BuildCallbackSubmitArgs<Kind>()` 读取；Claim、EfDrain、Accept、
+TensorMap、Finish 和 loser close 都不消费它们。
+
+修改前，shared replay 在每个 group 的 QK Submit 之前由 96 个 actor
+统一执行一次派生计算。修改后：
+
+- QK/SF/PV/UP 各自的 Claim winner 在构参前，根据已经校验的
+  `shared_planned_task.group_index` 独立准备；
+- true-loser 与 not-attempted 不再写没有消费者的 group 状态；
+- private 路径仍在原外层位置每组准备一次，没有改变 eager 构参合同；
+- Claim candidate、atomic 类型/地址/调用点、TensorMap、heap、fanin、
+  Build 和 kernel 协议都不变。
+
+因此 B256/G1 的调用数由 `96 × 256 = 24,576` 次，收敛为
+`4 × 256 = 1,024` 次。即使同一个 worker 连续赢得同组多个 task，
+也按当前 task 重建，避免依赖上一 winner 留下的本地状态。
+
+#### 正确性与构建验证
+
+以下验证全部通过：
+
+- CPU shared G2 `context_len=8193`，覆盖完整首组和单 block 尾组；
+- CPU shared G4 `context_len=32768`；
+- CPU shared B256/G1 与 private B256；
+- shared/private 的 TensorMap、依赖、heap、descriptor、writer 和
+  normalized signature 门槛；
+- CCEC shared full-swimlane 的 AIC/AIV、split runtime/finish、mixed
+  ELF 和 manifest；
+- 两次 A5 B256/G1 完整泳道，均保持 96 核、1,280 tasks、
+  73,728 attempted Claim、1,280 winner、72,448 true-loser、
+  49,152 not-attempted、依赖签名 `b7d985d6edb07078`、drop 0，
+  execution/semantic/postprocess 全部 PASS。
+
+候选两次泳道为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_141916_3768782/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_142626_3783564/ccec/
+```
+
+复核使用的两份既有 HEAD 泳道为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_130222_3656488/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_134934_3717013/ccec/
+```
+
+#### 直接受影响的非 atomic 区域
+
+G1 中 group 准备原来位于 `Alloc -> QK` SubmitTransition。最干净的
+固定人口是 64 个 AIV × 256 个 QK，即 16,384 个
+`claim.not_attempted` actor：该区间没有 Claim atomic，且
+`(core,task)` 跨版本完全相同。32 个 AIC × 256 个 QK 和全 96 核同时
+列出，避免只报告改善角色。
+
+| 人口 | HEAD-1 mean | HEAD-2 mean | 候选-1 mean | 候选-2 mean | 两次候选相对 HEAD |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 全 96 核 QK | 179.820 ns | 180.069 ns | 168.037 ns | 167.884 ns | **-6.55%～-6.77%** |
+| AIC QK | 170.323 ns | 170.965 ns | 179.016 ns | 179.758 ns | +4.71%～+5.54% |
+| AIV QK not-attempted | 184.568 ns | 184.621 ns | 162.548 ns | 161.946 ns | **-11.93%～-12.28%** |
+
+全 96 核中位数由 `119/120 ns` 稳定降至两次均为 `104 ns`；AIV
+中位数由 `124/125 ns` 降至 `104 ns`。AIC 回退没有被隐藏：下沉后
+winner 分支代码布局和少量 QK winner 新增计算会改变 AIC 的局部
+I-cache/流水形态，后续候选需要继续针对 AIC，而不能宣称两种角色都改善。
+但按真实 32:64 拓扑，全核直接目标区在两份 HEAD 与两份候选之间均稳定
+下降约 6.7%。
+
+以最新 HEAD 和第二份候选比较，并从四个父区间扣除 Atomic 与 Kernel
+区间并集，完整非 atomic 闭合为：
+
+| 固定交集人口 | EfDrain | Claim outer | post-Claim tail | SubmitTransition | 合计 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 71,197 true-loser | -26.080% | -40.842% | -26.303% | -4.557% | **-21.643%** |
+| 49,152 not-attempted | -26.933% | +31.871% | -23.114% | +3.668% | **-12.320%** |
+
+这张完整闭合表只说明本次 full-swimlane 中非 atomic 总工作同向下降，
+不把 EfDrain、Claim outer 和 tail 的大幅变化全部归因于三字段消减；
+代码布局、cache 状态和 worker 到达形态都会改变这些非直接区域。候选的
+保留依据仍是两份稳定 HEAD 与两份候选在直接 `Alloc -> QK`
+非 atomic 区域上的重复结果。
+
+两次候选 Submit makespan 为 `2,339.415/2,322.304 us`，动态 atomic
+logical calls 为 `193,117/193,802`。这些数值只记录运行背景；本阶段
+没有修改 atomic 协议，也不以整体 Submit 或动态 poll 波动判定去留。
+
+#### 决策
+
+本阶段保留。它删除了 nonwinner 确定无消费者的纯 scalar 状态派生，
+全核直接目标区重复改善约 6.7%，AIV 固定人口改善约 12%，同时保持动态
+G2/G4、B256 和 private 合同闭合。AIC 局部回退作为后续优化约束完整保留。
