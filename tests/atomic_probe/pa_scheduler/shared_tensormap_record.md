@@ -14346,3 +14346,89 @@ Atomic/Kernel 交集的固定人口 loser tail。
 本阶段保留。它只删除 loser 同 TU 的纯 scalar 自编码回读，两个角色、
 true-loser 与 not-attempted 均重复改善约 19%～26%；winner ticket ABI、
 atomic 协议和业务正确性没有变化。
+
+### 2026-07-30：winner-only task-meta Encode 三种布局均撤回
+
+#### 试验目的与不变量
+
+上一阶段已经让 loser 不再解码同 TU 自生成的 task meta，但
+`EncodeSharedPaTaskMeta()` 仍在 Claim 前执行。该字节只有 winner 的
+16B `CallbackSubmitTicket` 会跨 TU 消费，因此本轮尝试把编码下沉到
+winner 分支，同时冻结以下合同：
+
+- 96/32/64 Claim 候选人口、Claim atomic 类型、地址和调用点不变；
+- loser 继续直接使用已经校验的模板 `Kind` 与
+  `shared_is_last_submit`；
+- winner ticket 的 16B ABI、split binding 和跨 TU Decode 不变；
+- TensorMap、依赖、Build、kernel 和回放顺序不变。
+
+三种布局都通过了对应的 CPU shared 动态计划门槛、CCEC AIC/AIV
+full-swimlane 构建和 A5 B256 完整语义检查。A2c 还重新覆盖了
+G0、mixed 与 B256。说明撤回原因不是正确性失败，而是实际 non-atomic
+scalar 工作出现回退。
+
+#### A2a：在早期 winner 分支中执行完整 Encode
+
+编码与完整合同检查被移动到早期 `claim.won` 分支，并位于 winner
+context/Build 之前。A5 产物：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_145429_3858035/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_145525_3861475/ccec/
+```
+
+与紧邻的 A1 对照比较，直接 post-Claim transition 中 true-loser 改善
+约 `1.6%～2.0%`，not-attempted 改善约 `1.1%～1.7%`；但扣除
+Atomic∪Kernel 后的完整 actor non-atomic 窗口中，true-loser 回退
+`0.44%～1.29%`，not-attempted 回退 `5.29%～5.93%`。局部删除没有转化
+为完整 scalar 收益。
+
+#### A2b：在 loser 返回之后、ticket 构造之前执行完整 Encode
+
+第二种布局进一步延后编码，并在 split/non-split winner 分支中分别
+执行。A5 产物：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_145912_3876838/ccec/
+```
+
+直接 transition 已转为回退：true-loser `+0.61%～+0.83%`，
+not-attempted `+2.34%～+2.54%`。完整 actor non-atomic 中
+true-loser 回退 `6.85%～7.36%`；not-attempted 约持平。该布局没有保留
+价值。
+
+#### A2c：复用已校验 plan，winner 只做无分支 Pack
+
+第三种布局证明 `SharedPaPlannedTaskAt()` 已覆盖 Encode 的全部输入
+合同，在 winner 中只进行位打包，跨 TU 入口仍完整 Decode。A5 产物：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_150349_3891554/ccec/
+```
+
+直接 pre-Submit transition 内 Atomic/Kernel 交集为 0：
+
+| 固定人口 | 全核 | AIC | AIV |
+| --- | ---: | ---: | ---: |
+| 69,880 个共同 true-loser | -4.74%～-4.95% | +4.07%～+4.18% | -8.86%～-9.20% |
+| 49,152 个 not-attempted | +1.74%～+1.94% | -1.59%～-1.62% | +3.16%～+3.43% |
+| 122,784 个共同 transition | -2.30%～-2.50% | 约 +2.17% | -4.32%～-4.65% |
+
+但把每个 actor 的完整非 atomic 窗口扣除 Atomic∪Kernel 后，结果方向
+相反：
+
+| 固定人口 | 全核 | AIC | AIV |
+| --- | ---: | ---: | ---: |
+| 69,973 个共同 true-loser | +6.62%～+7.13% | 约 +0.72% | +9.03%～+9.73% |
+| 49,152 个 not-attempted | +3.73%～+3.75% | +1.01%～+1.52% | +4.78%～+5.05% |
+| 122,880 个完整 actor | +3.46%～+3.79% | +0.24%～+0.34% | +4.90%～+5.33% |
+
+#### 决策
+
+三种源码布局全部撤回，生产代码完整恢复到上一阶段
+`aebb69ab`。本轮说明：从 loser 源码路径删除一次 Encode，并不足以证明
+实际 non-atomic 工作下降；分支布局和 I-cache/流水形态会把成本转移到
+更大的 actor 窗口，AIV 尤其敏感。
+
+裁决只使用扣除 Atomic∪Kernel 后的固定人口区间。Submit makespan 和动态
+atomic 波动仅作为运行背景，未参与保留或撤回判断。

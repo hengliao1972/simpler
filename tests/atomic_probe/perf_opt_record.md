@@ -3570,3 +3570,43 @@ tests/atomic_probe/pa_scheduler/outputs/
 
 完整调用链、全角色数据和正确性证明见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.6 winner-only task-meta Encode 布局试验
+
+**[已撤回] 三种下沉布局均未降低完整 actor 的 non-atomic 工作**
+
+winner ticket 是 task-meta 编码字节的唯一跨 TU 消费者，因此依次验证：
+
+1. 在早期 winner 分支执行完整 Encode；
+2. loser 返回后、ticket 构造前执行完整 Encode；
+3. 复用已校验 batch plan，winner 只执行无分支 Pack。
+
+三种方案都保持 96/32/64 Claim 合同、atomic 类型/地址/调用点、16B
+ticket ABI、跨 TU Decode、TensorMap、Build 和 kernel 不变，并通过
+对应的 CPU、CCEC 与 A5 B256 正确性验证。
+
+直接 transition 与完整 actor 的结果并不一致：
+
+| 布局 | 直接受影响区 | 完整 actor non-atomic | 决策 |
+| --- | ---: | ---: | --- |
+| 早期 winner Encode | true-loser -1.6%～-2.0% | true-loser +0.44%～+1.29%；not-attempted +5.29%～+5.93% | 撤回 |
+| loser 返回后 Encode | true-loser +0.61%～+0.83% | true-loser +6.85%～+7.36% | 撤回 |
+| winner 无分支 Pack | 全 transition -2.30%～-2.50% | 全 actor +3.46%～+3.79%；AIV +4.90%～+5.33% | 撤回 |
+
+最后一种方案的直接区间明确没有 Atomic/Kernel 交集；完整 actor 数据也
+明确扣除了 Atomic∪Kernel。它仍表现为局部变短、完整 scalar 工作增加，
+说明源码删除被代码布局和 I-cache/流水成本抵消，不能只看一个尾部 span
+保留候选。
+
+相关产物：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_145429_3858035/ccec/
+  pa_scheduler_shared_swimlane_20260730_145525_3861475/ccec/
+  pa_scheduler_shared_swimlane_20260730_145912_3876838/ccec/
+  pa_scheduler_shared_swimlane_20260730_150349_3891554/ccec/
+```
+
+生产源码已恢复到 `aebb69ab`。整体 Submit 与 atomic 计数只作背景，本轮
+裁决完全依据 non-atomic 固定人口证据。
