@@ -620,7 +620,7 @@ bool RunLoserZeroTensorMapAccessTest() {
     pa_scheduler::host::InitializeState(state, options);
     pa_scheduler::host::ConfigureTrace(state, options, nullptr);
 
-    constexpr uint32_t kTask = 4;
+    constexpr uint32_t kTask = 2;
     WorkerState &worker = state->workers[0];
     worker.local_index = kTask;
     SubmitContext context{};
@@ -633,9 +633,15 @@ bool RunLoserZeroTensorMapAccessTest() {
     BeginSharedCallbackSubmit(worker, context);
     const uint32_t task_id =
         static_cast<uint32_t>(context.task_id);
+    const bool outputs_prepared =
+        PrepareSharedTaskOutputs(
+            context.shared_result,
+            static_cast<int32_t>(task_id),
+            TaskKind::Sf
+        );
     // Begin 仍按所有 actor 的原合同写入当前 task id；在调用 loser
     // 收尾前重新放入毒值，证明该 helper 只依赖显式 task_id 和
-    // shared_result，不会再次从 loser 不需要的 context 字段取身份。
+    // 前序 Prepare 成功合同，不会再次从 context 取身份或数量。
     context.task_id = 91;
     LocalStats stats{};
     constexpr uint64_t kSubmitBegin = 1;
@@ -658,7 +664,7 @@ bool RunLoserZeroTensorMapAccessTest() {
     OrderedSubmitTestOps::observed_state = state;
     const bool finished =
         FinishSharedLoserSubmit<
-            TaskKind::Up, OrderedSubmitTestOps, false
+            TaskKind::Sf, OrderedSubmitTestOps, false
         >(
             state, context, stats, task_id, false,
             kSubmitBegin
@@ -674,11 +680,52 @@ bool RunLoserZeroTensorMapAccessTest() {
                 __ATOMIC_ACQUIRE
             ) == turns_before[lane];
     }
+    const FdwicOutputRef output0 =
+        context.shared_result.OutputRef(0);
+    const FdwicOutputRef output1 =
+        context.shared_result.OutputRef(1);
+    const FdwicOutputRef output2 =
+        context.shared_result.OutputRef(2);
+
+    SharedTaskOutputs wrong_task{};
+    wrong_task.Reset(static_cast<int32_t>(kTask + 1U));
+    const bool wrong_task_rejected =
+        !PrepareSharedTaskOutputs(
+            wrong_task, static_cast<int32_t>(kTask),
+            TaskKind::Sf
+        );
+    SharedTaskOutputs nonempty{};
+    nonempty.Reset(static_cast<int32_t>(kTask));
+    const bool seeded =
+        nonempty.AddOutputRef(
+            static_cast<int32_t>(kTask), 0
+        );
+    const bool nonempty_rejected =
+        !PrepareSharedTaskOutputs(
+            nonempty, static_cast<int32_t>(kTask),
+            TaskKind::Sf
+        );
+
     const bool ok =
-        finished && state->fatal.value == 0 &&
+        outputs_prepared && finished &&
+        state->fatal.value == 0 &&
         task_id == kTask &&
         worker.local_index == kTask + 1U &&
         context.task_id == 91 &&
+        context.shared_result.TaskId() ==
+            static_cast<int32_t>(kTask) &&
+        context.shared_result.Size() == 3 &&
+        output0.producer_task_id ==
+            static_cast<int32_t>(kTask) &&
+        output0.output_slot == 0 &&
+        output1.producer_task_id ==
+            static_cast<int32_t>(kTask) &&
+        output1.output_slot == 1 &&
+        output2.producer_task_id ==
+            static_cast<int32_t>(kTask) &&
+        output2.output_slot == 2 &&
+        wrong_task_rejected && seeded &&
+        nonempty_rejected &&
         stats.result.submits == 1 &&
         stats.declared_task_count == 0 &&
         turns_unchanged &&

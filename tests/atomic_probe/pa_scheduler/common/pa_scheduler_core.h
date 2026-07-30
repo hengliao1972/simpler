@@ -3495,17 +3495,11 @@ PA_DEVICE bool FinishSharedLoserSubmit(
     bool is_last_submit,
     uint64_t submit_begin
 ) {
-    const bool valid =
-        context.shared_result.TaskId() ==
-            static_cast<int32_t>(task_id) &&
-        context.shared_result.Size() ==
-            FrontendTaskOutputCount(Kind);
-    if (!valid) {
-        SetFatal<Ops>(
-            state, stats, static_cast<int32_t>(task_id)
-        );
-        return false;
-    }
+    // 同一调用链已用当前 task_id/Kind 成功执行
+    // PrepareSharedTaskOutputs；失败会在进入本 helper 前终止，期间也没有
+    // shared_result 写者。loser 不再重复读取它的 TaskId/Size；完整
+    // symbol 仍保留给 Submit 返回后的 orchestration 消费。
+    (void)context;
 
     // loser 只完成本次 Submit 的轻量收尾。TensorMap 插入、前沿等待、
     // fanin lookup 与 Build 全部只属于 Claim owner；loser 不读取任何

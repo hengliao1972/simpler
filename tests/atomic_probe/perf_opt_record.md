@@ -3950,3 +3950,53 @@ tests/atomic_probe/pa_scheduler/outputs/
 
 消费者闭合、测试矩阵、IR 证据和完整固定人口分段见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.15 shared loser 输出准备结果复用
+
+**[已保留] 删除 Prepare 成功后同一调用链中的 TaskId/Size 二次复核**
+
+shared 每个 actor 都在 Claim 后先完成
+`PrepareSharedTaskOutputs(shared_result, task_id, Kind)`。该函数已经
+验证 task-id、空结果、逐 slot 写入和最终 output 数量；失败会在进入
+loser 收尾前置 fatal 并终止，期间也没有 `shared_result` 写者。因此
+`FinishSharedLoserSubmit()` 再读 `TaskId()` 和 `Size()` 属于同源重复
+复核。
+
+候选只删除这两个 loser 检查；Prepare、完整 symbol 返回、winner
+Finish、private 路径和全部 atomic 协议保持不变。定向测试覆盖 SF 三
+输出保留、错误 task-id、非空结果拒绝、毒化 context 身份和 loser 零
+TensorMap 访问。
+
+源码层涉及 121,600 个 nonwinner，但 CCEC O3 基线已经消掉大多数检查。
+真实运行操作只在 AIC QK true-loser 保留并被候选删除：每次少 2 个 GM
+load、2 个比较、1 个 select 和 1 个条件分支；AIV 五类路径运行代码
+不变。atomic intrinsic 类型与数量逐项相同，shared winner
+runtime/Finish 和 private 七个对象去调试信息后逐字相同。
+
+CPU shared 全量/B256/mixed、CPU private、CCEC shared/private 和两份
+A5 B256/G1 泳道全部通过。候选产物：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_180511_110699/ccec/
+  pa_scheduler_shared_swimlane_20260730_180604_112276/ccec/
+```
+
+与上一保留阶段两份基线做固定人口配对，并逐核扣除
+`Atomic∪Kernel` 后，直接受影响的 7,211 个 AIC QK true-loser tail
+没有 Atomic/Kernel 交集：
+
+| 直接口径 | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| tail 两轮均值 | 107.006 ns | 77.642 ns | **-27.442%** |
+| tail 两轮中位数 | 104/104 ns | 74/74 ns | 稳定下降 |
+| 四段完整 actor | 285.049 ns | 248.657 ns | **-12.767%** |
+
+全部固定 nonwinner 的 post-Claim tail 和四段完整 actor 分别下降
+`3.505%/1.523%`；AIC 分别下降 `8.663%/4.481%`。AIC PV tail
+`+2.723%`、AIC fixed EfDrain `+1.702%` 等布局反向已纳入完整闭合，
+没有隐去。三次 perf-clock
+`2,285.913/2,280.474/2,298.703 us` 只作背景，不参与裁决。
+
+完整支配证明、分 kind 数据、测试矩阵和对象证据见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。

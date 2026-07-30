@@ -15394,3 +15394,131 @@ transition 全部改善，AIV 唯一受影响的 SF transition 两轮稳定改�
 not-attempted AIV 完整 actor 回退 `0.684%`。它们没有推翻实际消费者
 边界和全 nonwinner 闭合，但说明代码布局仍会搬移未改业务区域，后续
 候选继续按相同分角色直接口径裁决。
+
+### 2026-07-30：shared loser 复用前序输出准备结果
+
+#### 支配关系与修改边界
+
+shared 的每个 replay actor 在 Claim 后都先调用
+`PrepareSharedTaskOutputs(shared_result, task_id, Kind)`。该函数已经
+完整验证并建立下面的合同：
+
+1. `shared_result.TaskId()` 必须等于当前 `task_id`；
+2. 进入时结果必须为空；
+3. 按当前 `Kind` 写入准确数量的 `(producer_task_id, output_slot)`；
+4. 返回前再次确认最终 `Size()` 等于该 task 的 output 数量；
+5. 任一步失败都会先置 fatal 并终止，不会进入 loser 收尾。
+
+从这次 Prepare 成功到 `FinishSharedLoserSubmit()` 之间没有
+`shared_result` 写者，且 `SubmitContext` 是当前 worker 的 block-local
+状态。因此 loser 收尾再次读取 `TaskId()` 和 `Size()` 只是在同一调用链
+中复核刚刚成功建立的结果，不提供新的跨核发布、内存一致性或业务正确性
+保证。
+
+本阶段只删除 loser 收尾里的这两项复核。以下均保持不变：
+
+- `BeginSharedCallbackSubmit()` 对 `shared_result.Reset(task_id)` 的写入；
+- `PrepareSharedTaskOutputs()` 的入口、逐 slot 构造和最终数量检查；
+- loser 返回后 orchestration 对完整 output symbol 的消费；
+- winner 的跨 TU ticket、`shared_result` 身份/数量复核和 Finish；
+- Claim 人口、atomic 调用点、地址、类型及协议；
+- private TensorMap 路径。
+
+定向测试改为真实执行 SF 的三输出 Prepare，再毒化
+`context.task_id` 后进入 loser 收尾，同时验证三个 output reference
+保持完整可用。测试还独立证明错误 task-id 和非空结果仍在
+`PrepareSharedTaskOutputs()` 被拒绝，且 loser 的 TensorMap 访问保持
+为 0。
+
+#### CCEC O3 的实际消减
+
+源码层默认 B256 有 121,600 个 nonwinner，看起来删除
+`121,600 × 2` 次字段复核。但不能把源码次数冒充机器实际开销：
+CCEC O3 已经在基线中消掉绝大多数重复检查。
+
+同一 shared full-swimlane O3 管线的前后对照为：
+
+| 核型 | 实际仍存在的路径 | O3 运行操作变化 |
+| --- | --- | --- |
+| AIC | QK true-loser | `load -2`、`icmp -2`、`select -1`、条件分支 `-1` |
+| AIV | 无 | 五种 TaskKind 的复核在基线中已全部消除 |
+
+四份 raw 固定人口中有 7,211 个 AIC QK true-loser；完整 B256 的理论
+动态人口为 `256 × 31 = 7,936`。因此标准运行代码的真实消减只应描述为
+这条 AIC QK loser 路径每次少两次 GM load、两次比较、一个 select 和
+一个条件分支，不能把 IR operation 一一冒充成不可解码的 HIIPU ISA
+指令。
+
+辅助 O3 管线的 atomic intrinsic 前后均为 91，且各类型逐项相同。
+shared runtime 和 winner Finish 去调试信息后逐字相同；private
+caller/runtime/finish/mixed 七个对象也逐字相同。标准对象受布局影响：
+swimlane AIC caller `69,820→69,868 B`，perf-clock AIC
+`36,208→36,144 B`；AIV 两种构建尺寸均不变。这些尺寸变化只作布局
+证据，不作为性能结论。
+
+#### 正确性、泳道与直接 non-atomic 结果
+
+以下全部通过：
+
+- CPU shared 全量协议测试、B256/G1、mixed G0/G1/G2/G4；
+- 新的 loser 三输出、错误 task、非空结果和零 TensorMap 访问测试；
+- CPU private 全量构建；
+- CCEC shared full-swimlane/perf-clock 与 CCEC private；
+- 两次 A5 B256/G1 完整泳道。
+
+候选泳道：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_180511_110699/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_180604_112276/ccec/
+```
+
+两份均保持 96 核、1,280 task、73,728 attempted Claim、1,280 winner、
+1,024 kernel、依赖签名 `b7d985d6edb07078` 和 drop 0；
+execution、semantic、postprocess 与 real-compute 全部 PASS。
+
+基线为上一保留阶段：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_173939_67785/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_174032_69047/ccec/
+```
+
+四份 raw 共同且 Claim 结果固定的 nonwinner 有 117,842 个，其中
+68,722 个 true-loser、49,120 个 not-attempted。逐核先合并
+`Atomic∪Kernel`，再从每个业务区间扣除交集。直接受影响的 AIC QK
+true-loser post-Claim tail 没有任何 Atomic 或 Kernel 交集：
+
+| AIC QK true-loser tail | 基线 | 候选 |
+| --- | ---: | ---: |
+| run1 平均 | 107.304 ns | 78.010 ns |
+| run2 平均 | 106.709 ns | 77.273 ns |
+| 两轮均值 | 107.006 ns | 77.642 ns |
+| 两轮中位数 | 104/104 ns | 74/74 ns |
+
+直接 tail 两轮均值下降 **27.442%**；同一固定人口的
+EfDrain、Claim outer、tail、Transition 四段完整 actor 由
+`285.049→248.657 ns`，下降 **12.767%**。
+
+更宽的闭合结果为：
+
+| 固定 nonwinner 口径 | AIC | AIV | 全核 |
+| --- | ---: | ---: | ---: |
+| post-Claim tail | **-8.663%** | -1.104% | **-3.505%** |
+| 四段完整 actor | **-4.481%** | -0.177% | **-1.523%** |
+
+AIV 没有 O3 运行指令消减，它的变化只作为布局对照，不归因给本次源码
+删除。AIC PV true-loser tail 回退 `2.723%`，AIC fixed EfDrain 回退
+`1.702%`，也作为布局反向完整保留；它们已被计入全 AIC 和全核四段
+闭合，未用局部最优值掩盖。
+
+候选 perf-clock 为
+`2,285.913/2,280.474/2,298.703 us`，仅记录低扰动运行背景，不参与
+本阶段保留判断。
+
+#### 决策
+
+本阶段保留。真实 O3 消减、直接受影响的 AIC QK true-loser 路径和
+两轮独立 raw 严格对应，tail 的均值与中位数都稳定下降；固定 AIC 和
+全核完整 actor 也闭合改善。该修改不触碰 atomic，不以整体 Submit
+波动代替非 atomic 证据。
