@@ -16492,3 +16492,105 @@ atomic/记录资源改变其他核的非 atomic 外壳；把 AIV 当作“未修
 
 在 atomic 协议、Claim 人口和泳道口径冻结的前提下，EfDrain 的低风险
 等价消减到此基本穷尽。
+
+### 2026-07-30：撤回 shared Claim logical atomic 逐次计数消减
+
+#### 候选边界
+
+前一阶段已经把 `claim_attempts` 改为 caller 局部精确累计，但完整
+atomic 泳道仍在每次 direct `ClaimMax` 写 raw 后，对 block-local
+`WorkerResult.atomic_trace_calls` 执行一次普通 load/add/store。该字段
+只用于 host 端核对 logical atomic 总数，Claim、TensorMap、Build 和
+kernel 均不消费。
+
+本候选保持 `TraceAtomicFetchMax()` 的原 atomic 指令、地址、返回值依赖
+计时和 direct raw 写入不变，只对 shared `ClaimMax` 延迟 logical call
+计数；公共 replay 出口复用已经精确累计的 `shared_claim_attempts`，
+一次性追加到原总数。private 和其他 atomic site 继续逐调用计数。
+
+CCEC O3 证据为：
+
+- AIC/AIV 都仍有三个真实 `llvm.hivm.atom.MAX.G.s64` 调用；
+- `atomic_trace_calls` 字段的 load/add/store 组合均由 36 组降为
+  33 组，恰好只删除 Alloc 和两个本核参与 task 的三组 Claim 更新；
+- 公共出口新增一组 `old_count + shared_claim_attempts` 写回；
+- alloca 数保持 5，没有新增栈槽；
+- AIC orchestration `.text` 缩小 36B，AIV 缩小 88B；AIV 整个
+  `.text` 因后续对齐保持同样大小；
+- private caller/runtime/Finish 六份 `.text` 前后逐字相同。
+
+CPU shared/private 全量协议测试、B256/G1、mixed G0/G1/G2/G4、CPU
+private B1 完整泳道、CCEC shared/private 构建均通过。定向测试还证明：
+
+1. 延迟计数仍原样写出 direct ClaimMax raw；
+2. trace 关闭时不追加 logical count；
+3. trace 开启时保留其他 atomic 的原计数，再追加实际 attempted 数。
+
+#### A5 完整泳道与 raw 闭合
+
+两份候选 B256/G1 完整泳道为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_234326_660404/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_234419_661804/ccec/
+```
+
+两份均保持 96 核、1,280 task、73,728 attempted Claim、1,280
+winner、1,024 kernel、依赖签名 `b7d985d6edb07078` 和 drop 0。
+ClaimMax direct raw 均为精确的 73,728 条，host 的
+`raw logical calls == TraceCoreState.atomic_calls ==
+WorkerResult.atomic_trace_calls` 闭合通过。容器当时没有
+`task-submit`，两轮在确认设备节点无计算进程后串行运行，不把整体
+Submit 波动作为裁决依据。
+
+基线为当前 PV-only 提交的两份泳道：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_221211_521079/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_221258_521012/ccec/
+```
+
+四份 raw 固定同一 `(core, task, Claim status)`，逐核合并并扣除
+`Atomic∪Kernel`。固定 true-loser 为 68,769 个，固定
+not-attempted 为 49,152 个。
+
+直接 `Claim.start→Claim.end` 的 true-loser 确有收益：
+
+| fixed true-loser Claim outer | 第一组 A/B | 第二组 A/B |
+| --- | ---: | ---: |
+| AIC | **-3.781%** | **-4.480%** |
+| AIV | **-10.965%** | **-11.171%** |
+| 全部 | **-8.701%** | **-9.073%** |
+
+但相邻区间没有闭合：
+
+| fixed true-loser | 第一组 A/B | 第二组 A/B |
+| --- | ---: | ---: |
+| Claim outer | **-8.701%** | **-9.073%** |
+| post-Claim tail | +0.705% | +0.379% |
+| SubmitTransition | **+7.199%** | **+6.413%** |
+| Claim + tail + Transition | **+3.061%** | **+2.484%** |
+
+回退集中在主要 AIV 人口：AIV 的三段闭合连续增加
+`4.632%/3.763%`；SF Transition 连续增加
+`26.319%/25.717%`，UP Transition 增加
+`11.053%/8.880%`。未发 Claim atomic 的负对照也连续回退
+`1.639%/1.656%`。其中 AIC-UP not-attempted 的 Claim 空边界均值由
+`0.604/0.623 tick` 变为 `6.112/6.453 tick`，两轮各约 544 个样本
+出现 78～100 tick 长尾。该路径没有 Claim atomic，因此这是候选代码
+布局或到达时序引入的 scalar 长尾；本轮没有 PMU 证据把它进一步定性为
+I-cache miss。
+
+公共写回位于 `OrchestrationReplay.end == FinalDrain.start` 之后、
+首个 `ReplayDoneIncrement` atomic 之前。把该窄前缀摊回全部 attempted
+Claim 后，Claim 目标仍下降 `8.595%/8.958%`，说明一次出口写回没有
+吞掉直接收益；否决原因是每 task 的 AIV SF/UP Transition 和
+not-attempted 路径稳定回退。
+
+#### 决策
+
+候选完整撤回，源码恢复为每个 direct atomic 原地更新 logical count。
+没有运行 perf-clock：固定人口、扣除 `Atomic∪Kernel` 后的相邻闭合已经
+连续两轮否决，整体时间不能推翻该证据。后续若继续消减 Claim 观察开销，
+必须找到不会改变 AIC-UP 空路径取指布局、且能穿过
+`Claim+tail+Transition` 闭合的新实现；不能只复用本次“出口聚合”写法。

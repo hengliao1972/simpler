@@ -4347,3 +4347,39 @@ tests/atomic_probe/pa_scheduler/outputs/
 结合已保留的入口占用数提前退出，本轮确认 EfDrain 的 header/control
 低风险等价消减基本穷尽。详细静态读取数、样本筛选、宽人口对照和终止
 边界见 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.24 撤回 shared Claim logical atomic 出口聚合
+
+**[已撤回] Claim 直接区间改善，但相邻 Transition 与负对照稳定回退**
+
+候选复用已有的 caller-local `shared_claim_attempts`：shared ClaimMax
+继续发射相同 atomic、消费相同返回值并逐条写相同 raw，只把
+`atomic_trace_calls` 从每次 Claim 的 block-local load/add/store 改成
+公共 replay 出口一次追加。private 与其他 atomic site 不改。
+
+CCEC O3 中 AIC/AIV 的三个 ClaimMax intrinsic 均保持，logical count
+字段的 load/add/store 各精确减少三组，公共出口增加一组；private 六份
+`.text` 逐字相同。CPU shared/private、B256/mixed、CCEC 构建以及两份
+A5 B256 完整泳道全部通过，且每份均有精确 73,728 条 ClaimMax raw：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_234326_660404/ccec/
+  pa_scheduler_shared_swimlane_20260730_234419_661804/ccec/
+```
+
+与 `221211_521079/221258_521012` 两份基线固定相同
+`(core, task, Claim status)` 并扣除 `Atomic∪Kernel` 后，68,769 个
+true-loser 的 Claim outer 两轮下降 `8.701%/9.073%`；但相邻
+SubmitTransition 增加 `7.199%/6.413%`，三段闭合反而增加
+`3.061%/2.484%`。AIV 三段闭合增加 `4.632%/3.763%`，主要来自
+SF/UP Transition。49,152 个 not-attempted 负对照也连续增加
+`1.639%/1.656%`；AIC-UP 空 Claim 路径出现稳定的 78～100 tick
+scalar 长尾。该路径没有 Claim atomic，本轮也没有用 PMU 把长尾进一步
+归因到 I-cache。
+
+公共 FinalDrain 前缀摊回全部 Claim 后，直接目标仍改善约 8.6%～9.0%，
+所以不是出口单次写回吞掉收益，而是热代码布局把代价推入每 task 相邻
+路径。候选已完整撤回；直接 non-atomic 闭合已经否决，因此没有用
+perf-clock 整体波动重复裁决。完整静态证据、逐角色数据与出口定位见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
