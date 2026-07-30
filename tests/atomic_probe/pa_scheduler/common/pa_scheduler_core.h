@@ -866,14 +866,33 @@ PA_DEVICE ClaimOutcome Claim(
     return outcome;
 }
 
-PA_DEVICE void RecordClaimOutcome(LocalStats &stats, TaskKind kind, const ClaimOutcome &outcome) {
-    if (outcome.attempted) ++stats.result.claim_attempts;
+PA_DEVICE void RecordClaimOutcome(
+    LocalStats &stats, TaskKind kind, const ClaimOutcome &outcome
+#if PTO_FDWIC_SHARED_MAP
+    , uint64_t &shared_claim_attempts
+#endif
+) {
+    if (outcome.attempted) {
+#if PTO_FDWIC_SHARED_MAP
+        ++shared_claim_attempts;
+#else
+        ++stats.result.claim_attempts;
+#endif
+    }
     stats.result.cas_retries += outcome.retries;
     if (outcome.won) {
         ++stats.result.claim_wins;
         ++stats.result.wins[KindIndex(kind)];
     }
 }
+
+#if PTO_FDWIC_SHARED_MAP
+PA_DEVICE void FinalizeSharedClaimAttempts(
+    LocalStats &stats, uint64_t shared_claim_attempts
+) {
+    stats.result.claim_attempts = shared_claim_attempts;
+}
+#endif
 
 template <typename Ops, bool Profile>
 PA_DEVICE bool BuildWinner(
@@ -3966,7 +3985,8 @@ PA_DEVICE bool SubmitCallbackTask(
     PaOrchestrationState &orch, TaskArgs &args, uint32_t batch,
     SubmitContext &context, LocalStats &stats, PmuContext &pmu_context
 #if PTO_FDWIC_SHARED_MAP
-    , const SharedPaBatchPlan &shared_batch_plan,
+    , uint64_t &shared_claim_attempts,
+    const SharedPaBatchPlan &shared_batch_plan,
     uint32_t shared_task_offset,
     uint32_t shared_batch_count
 #endif
@@ -4048,7 +4068,12 @@ PA_DEVICE bool SubmitCallbackTask(
     context.won = claim.won;
     context.kernel_id = claim.function_id;
 #endif
-    RecordClaimOutcome(stats, Kind, claim);
+    RecordClaimOutcome(
+        stats, Kind, claim
+#if PTO_FDWIC_SHARED_MAP
+        , shared_claim_attempts
+#endif
+    );
     EndSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
     const uint64_t claim_end = TraceTimestamp<Ops>(stats.trace, stats.result);
 #if PTO_FDWIC_SHARED_MAP
@@ -4412,6 +4437,12 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #else
     LocalStats stats{};
 #endif
+#if PTO_FDWIC_SHARED_MAP
+    // 逐次尝试数在 caller 自动对象中精确累计；相比 block-local
+    // WorkerResult 的每次 RMW，它不会被 winner Finish 访问或发布。
+    // 回放统一出口再写回一次，fatal 中途退出仍只统计已发射的 Claim。
+    uint64_t shared_claim_attempts = 0;
+#endif
     stats.result.worker_id = worker_id;
     stats.result.role = static_cast<uint32_t>(role);
     stats.result.checksum = 0;
@@ -4552,6 +4583,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             if (!SubmitCallbackTask<TaskKind::Alloc, Ops, Profile>(
                     state, worker, role, task_count, orchestration, args,
                     batch, context, stats, pmu_context,
+                    shared_claim_attempts,
                     batch_plan, 0, batches
                 )) {
                 break;
@@ -4568,6 +4600,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                     >(
                         state, worker, role, task_count, orchestration,
                         args, batch, context, stats, pmu_context,
+                        shared_claim_attempts,
                         batch_plan,
                         SharedPaTaskOffset(TaskKind::Qk, group),
                         batches
@@ -4585,6 +4618,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                     >(
                         state, worker, role, task_count, orchestration,
                         args, batch, context, stats, pmu_context,
+                        shared_claim_attempts,
                         batch_plan,
                         SharedPaTaskOffset(TaskKind::Sf, group),
                         batches
@@ -4602,6 +4636,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                     >(
                         state, worker, role, task_count, orchestration,
                         args, batch, context, stats, pmu_context,
+                        shared_claim_attempts,
                         batch_plan,
                         SharedPaTaskOffset(TaskKind::Pv, group),
                         batches
@@ -4619,6 +4654,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                     >(
                         state, worker, role, task_count, orchestration,
                         args, batch, context, stats, pmu_context,
+                        shared_claim_attempts,
                         batch_plan,
                         SharedPaTaskOffset(TaskKind::Up, group),
                         batches
@@ -4723,6 +4759,11 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         split_runtime.task_count = task_count;
 #endif
     }
+    // 正常回放、Submit/plan 失败和启动前 fatal 都已在这里汇合；把
+    // caller 中按实际 attempted 累计的值一次写回原 WorkerResult 字段。
+    FinalizeSharedClaimAttempts(
+        stats, shared_claim_attempts
+    );
 #endif
 
     // replay_done 表示所有 worker 已退出回放循环（成功路径即完整提交）；之后仍需 drain 到本核 slot 为空。

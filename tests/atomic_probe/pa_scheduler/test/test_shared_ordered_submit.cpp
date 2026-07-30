@@ -525,6 +525,65 @@ uint32_t ExpectedClaimAttempts(TaskKind kind) {
     return 0;
 }
 
+bool RunLocalClaimAttemptAccountingTest() {
+    LocalStats zero_attempts{};
+    FinalizeSharedClaimAttempts(zero_attempts, 0);
+    LocalStats stats{};
+    uint64_t local_attempts = 0;
+    const ClaimOutcome skipped{false, false, 0, -1};
+    const ClaimOutcome loser{true, false, 3, -1};
+    const ClaimOutcome winner{
+        true, true, 2, FunctionId(TaskKind::Qk)
+    };
+
+    RecordClaimOutcome(
+        stats, TaskKind::Alloc, skipped, local_attempts
+    );
+    const bool skipped_not_counted =
+        local_attempts == 0 &&
+        stats.result.claim_attempts == 0 &&
+        stats.result.cas_retries == 0 &&
+        stats.result.claim_wins == 0;
+    RecordClaimOutcome(
+        stats, TaskKind::Qk, loser, local_attempts
+    );
+    const bool loser_counted =
+        local_attempts == 1 &&
+        stats.result.claim_attempts == 0 &&
+        stats.result.cas_retries == 3 &&
+        stats.result.claim_wins == 0;
+    RecordClaimOutcome(
+        stats, TaskKind::Qk, winner, local_attempts
+    );
+
+    const bool before_publish =
+        skipped_not_counted && loser_counted &&
+        local_attempts == 2 &&
+        stats.result.claim_attempts == 0 &&
+        stats.result.cas_retries == 5 &&
+        stats.result.claim_wins == 1 &&
+        stats.result.wins[KindIndex(TaskKind::Qk)] == 1;
+    FinalizeSharedClaimAttempts(stats, local_attempts);
+    const bool ok =
+        zero_attempts.result.claim_attempts == 0 &&
+        before_publish && stats.result.claim_attempts == 2;
+    std::printf(
+        "[ORDERED_SUBMIT] local_claim_attempt_accounting=%s "
+        "attempts=%llu retries=%llu wins=%llu\n",
+        ok ? "PASS" : "FAIL",
+        static_cast<unsigned long long>(
+            stats.result.claim_attempts
+        ),
+        static_cast<unsigned long long>(
+            stats.result.cas_retries
+        ),
+        static_cast<unsigned long long>(
+            stats.result.claim_wins
+        )
+    );
+    return ok;
+}
+
 bool ClaimAndInsertEvidenceMatches(
     const SchedulerState &state, uint32_t task_count
 ) {
@@ -1081,6 +1140,8 @@ bool RunIndependentKernelExecutionTest() {
 }  // namespace
 
 int main() {
+    const bool claim_accounting_ok =
+        RunLocalClaimAttemptAccountingTest();
     const bool loser_ok = RunLoserZeroTensorMapAccessTest();
     const bool fanin_compaction_ok =
         RunReadyFaninPrefixCompactionTest();
@@ -1089,7 +1150,8 @@ int main() {
     const bool overlap_ok = RunInsertReleaseBeforeBuildTest();
     const bool execution_ok =
         RunIndependentKernelExecutionTest();
-    if (!loser_ok || !fanin_compaction_ok || !pa_up_shape_ok ||
+    if (!claim_accounting_ok || !loser_ok ||
+        !fanin_compaction_ok || !pa_up_shape_ok ||
         !overlap_ok || !execution_ok) {
         std::fprintf(
             stderr, "[FAIL] shared ordered-insert Submit tests\n"

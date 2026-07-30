@@ -15627,3 +15627,145 @@ Submit 的 atomic 波动。当前 HEAD 继续保留经 O3 和 A5 实测更优的
 `OutputHandleAt(shared_result, slot)`。后续不要仅凭“少 load、少检查或
 代码更小”恢复这组候选；若再研究同源句柄，只能采用新的调用形态并重新
 闭合 tail 与 Transition，不能复用这三种已经否定的源码布局。
+
+### 2026-07-30：shared Claim 尝试次数改为 caller 本地精确累计
+
+#### 修改边界与计数语义
+
+`claim_attempts` 只用于最终 host 正确性闭合，winner Finish、构参、
+TensorMap 和 kernel 都不消费它。原 shared 路径在每次实际参与 Claim
+后，都会对外部 `[[block_local]]` split runtime 中的
+`stats.result.claim_attempts` 做一次 load/add/store。B256/G1 的固定
+Claim 合同为 73,728 次，因此这项诊断计数本身位于高频 Claim outer
+路径。
+
+本阶段只在 shared caller 中增加一个 `uint64_t` 局部累计量：
+
+1. `Claim()` 返回后，只有 `outcome.attempted` 为真时才加一；
+2. loser、winner 和后续 Prepare/Finish 失败都不会漏掉已经实际发射的
+   Claim；
+3. plan 失败或启动后 fatal 若发生在 Claim 前，不会预记尚未执行的
+   Claim；
+4. 正常回放与所有 replay 失败路径在公共出口汇合后，一次写回原
+   `WorkerResult` 字段；
+5. private TensorMap 继续逐次更新原字段，源码和生成代码均不改变。
+
+这与早期按计划公式预加 `1+2G` 的批量计数不同：当前累计的是实际
+`ClaimOutcome.attempted`，中途失败也只保存已经发生的次数。源码控制流
+审计确认 `RunSchedulerImpl()` 中三个直接返回都位于任何 Claim 之前；
+本文不把这一审计写成“CPU 已动态注入所有失败出口”。
+
+CPU 定向测试逐步检查：
+
+```text
+not-attempted  0 -> 0
+true loser     0 -> 1
+true winner    1 -> 2
+写回前 WorkerResult.claim_attempts == 0
+写回后 WorkerResult.claim_attempts == 2
+```
+
+同时继续核对 `cas_retries=5`、`claim_wins=1` 和 QK winner 计数，避免
+优化一个字段时破坏相邻统计。
+
+#### CCEC O3 代码生成证据
+
+使用与正式 shared full-swimlane 相同的 CCEC `-O3` 参数，对提交
+`4f375cec` 的冻结基线和候选分别生成 AIC/AIV LLVM IR。block-local
+runtime 中 `claim_attempts` 的字段路径为
+`CompeteFirstSplitRuntimeState.stats.result[5]`：
+
+| 核型 | 基线热路径 | 候选热路径 | 公共出口与最终发布 |
+| --- | --- | --- | --- |
+| AIC | Alloc/QK/PV 各 1 组 load/add/store | 三组全部消失 | 两个互斥出口 store，执行时只走一个；最终发布仍 1 次 load |
+| AIV | Alloc/SF/UP 各 1 组 load/add/store | 三组全部消失 | 两个互斥出口 store，执行时只走一个；最终发布仍 1 次 load |
+
+候选局部计数由 replay 控制流的 `phi i64` 传递，AIC/AIV orchestration
+的 alloca 数均保持 5，没有新增计数栈槽。全部非 debug LLVM intrinsic
+清单前后逐项相同，ClaimMax 等 atomic intrinsic 没有增删。
+
+shared caller 因新增跨 replay 的 SSA 合流，`.text` 分别增加
+`168 B/256 B`；这项代码布局代价完整保留。split runtime 和 winner
+Finish 的 `.text` 前后逐字相同。重新构建 private 后，AIC/AIV 的
+caller、runtime、Finish 六个 `.text` 全部与候选前逐字相同。
+
+#### 正确性与 A5 完整泳道
+
+以下验证全部通过：
+
+- CPU shared 全量协议门槛和收紧后的 `0→1→2` 定向计数测试；
+- CPU private 全量构建与实际 scheduler smoke；
+- CPU shared B256/G1：73,728 Claim，依赖签名
+  `b7d985d6edb07078`；
+- CPU shared mixed G0/G1/G2/G4：1,728 Claim，依赖签名
+  `6437bff09d8f8a11`；
+- CCEC shared full-swimlane/perf-clock 与 CCEC private
+  full-swimlane 构建；
+- 两次 A5 B256/G1 完整泳道。
+
+候选泳道为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_191205_222452/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_191253_223677/ccec/
+```
+
+两份均保持 96 核、1,280 task、73,728 attempted Claim、1,280
+winner、1,024 kernel、依赖签名 `b7d985d6edb07078` 和 drop 0；
+execution、semantic、postprocess 与 real-compute 全部 PASS。
+
+#### Claim outer 的直接 non-atomic 结果
+
+基线复用上一保留阶段：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_180511_110699/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_180604_112276/ccec/
+```
+
+每份 raw 的 73,728 个 attempted actor 人口按核型和 task kind 都完全
+固定。逐核先合并 `Atomic∪Kernel`，再从 Claim 父区间扣除交集；两轮
+均值为：
+
+| attempted Claim outer | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| AIC，24,576 次/轮 | 35.518 ns | 28.404 ns | **-20.029%** |
+| AIV，49,152 次/轮 | 38.630 ns | 31.659 ns | **-18.045%** |
+| 全部 73,728 次/轮 | 37.593 ns | 30.574 ns | **-18.670%** |
+
+六个真实参与组合全部同向：
+
+| 核型/task | 变化 |
+| --- | ---: |
+| AIC Alloc | **-28.034%** |
+| AIC QK | **-21.363%** |
+| AIC PV | **-11.417%** |
+| AIV Alloc | **-24.098%** |
+| AIV SF | **-20.884%** |
+| AIV UP | **-11.133%** |
+
+四份 raw 共同存在的 68,718 个 true-loser 中，AIC/AIV Claim outer
+分别下降 `20.773%/18.367%`，全核加权下降约 `19.11%`。不执行
+Claim 的 49,152 个 not-attempted actor 是负对照，其 Claim outer
+仅由空边界组成，两轮均值变化 `+0.586%`。
+
+统一出口的单次写回位于 Submit replay 后、FinalDrain 总边界内。扣除
+`Atomic∪Kernel` 后，96 核 FinalDrain 平均值反而由
+`1305.318→1258.401 ns/core`，变化 `-3.594%`；没有观察到把 Claim
+收益搬成尾部回退。这个宽区域受 barrier/drain 时序影响，只用于排除
+明显搬移，不作为单次 store 的精确成本。
+
+固定 nonwinner 的四段完整 actor 仍受 EfDrain、tail、Transition 布局
+波动影响，全核为 `+0.656%`；该反向证据保留，但这些区域没有源码业务
+修改，不能用其波动否定六个直接 Claim 目标全部同向的结果。
+
+三次低扰动 perf-clock 为
+`2279.085/2324.883/2308.079 us`，中位数 `2308.079 us`，只作整体
+运行背景，不参与本阶段裁决。
+
+#### 决策
+
+本阶段保留。它在原始 `96/32/64` Claim 人口、atomic 类型、地址与
+调用点全部不变的前提下，删除了 AIC/AIV 六条高频 attempted 路径对
+block-local 统计字段的逐次读改写。O3 静态消减、两轮 A5 直接
+non-atomic Claim outer、固定 true-loser 和最终 Claim 总数互相闭合。

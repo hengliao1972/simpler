@@ -4029,3 +4029,64 @@ Transition 与 Atomic、Kernel、DCCI 均为零交叠。
 非 atomic 区域——已经失败。源码全部恢复到上一保留提交
 `4f375cec`。完整路径、固定 Claim 人口和静态证据见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.17 shared Claim 尝试次数本地精确累计
+
+**[已保留] 删除 attempted Claim 对 block-local 统计字段的逐次读改写**
+
+`claim_attempts` 只由最终 host 正确性检查消费，原 shared 路径却在每次
+实际 Claim 后更新 split runtime 中的 `WorkerResult`。候选改为在
+caller 的局部 `uint64_t` 中按真实 `outcome.attempted` 累计，正常与
+失败 replay 的公共出口一次写回；不是按计划任务数预记，因此中途失败
+仍保持实际次数。private 路径完全不变。
+
+CCEC O3 证明：
+
+- AIC Alloc/QK/PV 和 AIV Alloc/SF/UP 共六个热路径中的
+  block-local load/add/store 全部消失；
+- 局部计数由 SSA `phi` 传递，AIC/AIV alloca 均保持 5；
+- 公共出口因控制流形成两个互斥 store，每核运行只执行一个，最终
+  `PublishResult` 的一次 load 保留；
+- 非 debug LLVM intrinsic 清单完全相同，atomic 协议没有增删；
+- shared runtime/Finish `.text` 不变；private AIC/AIV 的
+  caller/runtime/Finish 六个 `.text` 全部不变；
+- shared caller `.text` 因 SSA 合流增加 `168/256 B`，作为布局代价
+  保留记录。
+
+CPU shared/private 全量、shared B256/G1、mixed G0/G1/G2/G4、private
+smoke、CCEC 三类构建及两份 A5 B256/G1 泳道全部通过。CPU 定向用例
+逐步证明 not-attempted、loser、winner 的局部计数为 `0→1→2`，写回前
+原字段为 0、写回后为 2。
+
+候选泳道：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_191205_222452/ccec/
+  pa_scheduler_shared_swimlane_20260730_191253_223677/ccec/
+```
+
+两份均保持 73,728 attempted Claim、1,280 winner、1,024 kernel、
+依赖签名 `b7d985d6edb07078` 和 drop 0。逐核扣除
+`Atomic∪Kernel` 后：
+
+| Claim outer 直接口径 | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| AIC | 35.518 ns | 28.404 ns | **-20.029%** |
+| AIV | 38.630 ns | 31.659 ns | **-18.045%** |
+| 全部 attempted | 37.593 ns | 30.574 ns | **-18.670%** |
+
+AIC Alloc/QK/PV 和 AIV Alloc/SF/UP 六类均下降 `11.133%～28.034%`；
+固定 true-loser 的 AIC/AIV Claim outer 分别下降
+`20.773%/18.367%`。49,152 个 not-attempted 负对照变化
+`+0.586%`。
+
+一次性写回位于 FinalDrain 总边界内；该区域扣除
+`Atomic∪Kernel` 后没有回退，均值变化 `-3.594%`。固定 nonwinner
+四段完整 actor 因未修改的 EfDrain/tail/Transition 布局波动为
+`+0.656%`，同样保留披露，但不替代直接消费者边界。
+
+三次 perf-clock 为 `2279.085/2324.883/2308.079 us`，只作运行背景。
+本阶段按当前“直接受影响的 non-atomic 区域决定保留”的规则通过。完整
+控制流、IR 字段路径、分 task 数据和测试矩阵见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
