@@ -3849,3 +3849,51 @@ tests/atomic_probe/pa_scheduler/outputs/
 
 完整本地状态口径、毒值测试、IR 与分段数据见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.13 shared loser 删除同源 task-id 复核
+
+**[已保留] 消减 121,600 次 nonwinner GM load/compare**
+
+shared Begin 仍为每个 actor 把同一个 `task_id` 写入
+`context.task_id` 和 `shared_result`。loser 收尾已有显式 task-id
+参数，并继续校验 `shared_result.TaskId()` 与当前 TaskKind 的 output
+数量，因此再次从 GM 回读 `context.task_id` 比较属于同源复核。
+
+第一版曾同时下沉 Begin 的 task-id store。直接分区证明该 store 属于
+上一 actor 的 SubmitTransition，删除后 122,784 条 Transition 全核
+回退 `7.021%`，所以完整恢复；最终生产改动只删除 loser 收尾的一项
+load/compare。
+
+默认 B256 有 121,600 个 nonwinner。CCEC shared O3 中，AIC/AIV 五个
+TaskKind 内联点的目标 GM load/icmp 均 `5→0`，Begin store 仍
+`5→5`；caller 函数分别缩小 200/244 B。AIC/AIV atomic 均保持 56 个
+且逐类分布一致，winner Finish/runtime 逐字相同；private 去调试信息后
+所有相关对象也逐字相同。
+
+CPU shared 全量、B256/G1、mixed G0/G1/G2/G4、CPU private、CCEC
+shared/private 和两次 A5 B256/G1 完整泳道均通过。候选产物：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_171458_24748/ccec/
+  pa_scheduler_shared_swimlane_20260730_171555_26271/ccec/
+```
+
+固定人口逐核扣除 `Atomic∪Kernel` 后：
+
+| non-atomic 区域 | AIC | AIV | 全核 |
+| --- | ---: | ---: | ---: |
+| true-loser post-Claim tail | **-14.664%** | **-17.631%** | **-16.588%** |
+| 全 nonwinner post-Claim tail | **-13.258%** | **-8.057%** | **-9.756%** |
+| 全 nonwinner 完整四段 actor | **-2.322%** | **-2.158%** | **-2.211%** |
+| 全 nonwinner SubmitTransition | +6.678% | +0.470% | +2.593% |
+
+not-attempted AIV tail 另有 `+5.641%` 回退，全部 122,784 条 Transition
+全核回退 `2.202%`；这些布局反向没有被隐去，且已经包含在完整 actor
+仍改善 `2.211%` 的结果中。三次 perf-clock
+`2,265.081/2,291.182/2,270.259 us` 只作背景。
+
+定向测试在真实 Begin 后毒化 `context.task_id`，证明 loser helper
+仅依赖显式 task id 和 `shared_result`；winner 侧的多层身份校验不变。
+完整试验拆分、IR、固定人口与四段闭合见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。

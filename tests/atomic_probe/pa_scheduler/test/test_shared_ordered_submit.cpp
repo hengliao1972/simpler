@@ -621,13 +621,22 @@ bool RunLoserZeroTensorMapAccessTest() {
     pa_scheduler::host::ConfigureTrace(state, options, nullptr);
 
     constexpr uint32_t kTask = 4;
+    WorkerState &worker = state->workers[0];
+    worker.local_index = kTask;
     SubmitContext context{};
-    context.task_id = static_cast<int32_t>(kTask);
-    // 模拟同一 worker 上一 Submit 曾经获胜：shared loser 不会重置或消费
-    // 这两个 winner-only 字段，收尾只能依赖本次 task/output 身份。
+    // 模拟同一 worker 上一 Submit 曾经获胜：Begin 必须把所有 actor
+    // 的 task_id 更新为本次值；loser 不会重置或消费上一 winner
+    // 留下的 won/kernel_id。
+    context.task_id = 91;
     context.won = true;
     context.kernel_id = 17;
-    context.shared_result.Reset(static_cast<int32_t>(kTask));
+    BeginSharedCallbackSubmit(worker, context);
+    const uint32_t task_id =
+        static_cast<uint32_t>(context.task_id);
+    // Begin 仍按所有 actor 的原合同写入当前 task id；在调用 loser
+    // 收尾前重新放入毒值，证明该 helper 只依赖显式 task_id 和
+    // shared_result，不会再次从 loser 不需要的 context 字段取身份。
+    context.task_id = 91;
     LocalStats stats{};
     constexpr uint64_t kSubmitBegin = 1;
 
@@ -651,7 +660,7 @@ bool RunLoserZeroTensorMapAccessTest() {
         FinishSharedLoserSubmit<
             TaskKind::Up, OrderedSubmitTestOps, false
         >(
-            state, context, stats, kTask, false,
+            state, context, stats, task_id, false,
             kSubmitBegin
         );
     bool turns_unchanged = true;
@@ -667,6 +676,9 @@ bool RunLoserZeroTensorMapAccessTest() {
     }
     const bool ok =
         finished && state->fatal.value == 0 &&
+        task_id == kTask &&
+        worker.local_index == kTask + 1U &&
+        context.task_id == 91 &&
         stats.result.submits == 1 &&
         stats.declared_task_count == 0 &&
         turns_unchanged &&

@@ -15044,3 +15044,193 @@ actor 背景虽分别改善 `1.775%/2.911%`，但它们不是 current_batch 的
 减少了本地状态读写和少量机器码，但 AIV 跨 batch 主边界以及 QK/PV
 直接构参边界都稳定回退；不能用宽路径 actor 的偶然改善或代码尺寸缩小
 替代直接消费者证据。后续不再重复该方向。
+
+### 2026-07-30：shared loser 收尾删除同源 task-id 复核
+
+#### 合同审计与试验拆分
+
+shared Begin 对每个 actor 执行两项同源初始化：
+
+1. 从 `worker.local_index++` 得到本次 `task_id`，写入
+   `context.task_id`；
+2. 用同一个值重置 `context.shared_result` 的 task 身份。
+
+`SubmitCallbackTask()` 随即把 `context.task_id` 读到当前调用的
+`task_id` SSA。Claim 之后，loser 把这个显式参数传给
+`FinishSharedLoserSubmit()`；两点之间没有任何 `context.task_id` 写者。
+原 loser 收尾仍同时验证：
+
+```text
+context.task_id == task_id
+shared_result.TaskId() == task_id
+shared_result.Size() == 当前 TaskKind 的固定 output 数
+```
+
+第一项和本次 Begin、显式参数完全同源，不能发现后两项已经正确时的新增
+协议错误。winner 则不同：它会跨 TU 进入运行和 Finish，现有
+`context.task_id`、ticket、runtime 和 Finish body 的多层身份校验全部
+保留。
+
+最初曾把两项消减放在同一候选中：
+
+- Begin 不再为 nonwinner 写 `context.task_id`；
+- loser 收尾不再回读并比较该字段。
+
+两份组合候选泳道为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_170652_8558/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_170903_12168/ccec/
+```
+
+分区取证证明两项落点不同。Begin 的写入发生在 `Submit.start` 之前，
+准确落在上一 Submit 的 Transition；删除后 122,784 条 Transition 的
+AIC/AIV/全核分别回退 `0.620%/10.362%/7.021%`。loser 复核则落在
+当前 Submit 的 post-Claim tail，true-loser 和 not-attempted 分别改善
+`21.335%/8.401%`。因此没有保留组合写法，而是恢复 Begin 的原始
+void 形状和每 actor 写入，只隔离后一个候选重新构建、上板和统计。
+
+#### 最终源码变化与定向正确性
+
+最终生产代码只删除
+`FinishSharedLoserSubmit()` 中这一项条件：
+
+```text
+context.task_id == static_cast<int32_t>(task_id)
+```
+
+Begin、Claim、Atomic、shared output、winner ticket 和 Finish 路径均不
+修改。默认 B256 有 `1,280×96=122,880` 个 actor、每 task 一个 winner，
+因此准确动态消减为：
+
+```text
+1,280 × 95 = 121,600 次 nonwinner GM load + compare
+```
+
+定向 CPU 测试现在真实调用 `BeginSharedCallbackSubmit()`，先确认
+`local_index=4` 产生 task 4 并推进到 5，再把
+`context.task_id` 毒化为 91。loser helper 仍必须依赖显式 task 4 和
+`shared_result` 正常完成，且不得访问 TensorMap；这样直接证明删除后的
+helper 合同，而不是手工拼出一个只适用于测试的 context。
+
+#### CCEC O3、Atomic 与 private 隔离
+
+用同一绝对源码路径和同一 CANN 比较提交 `f46ed3e1` 与最终候选：
+
+- AIC/AIV 五个 TaskKind 内联点的 `context.task_id` GM store 均保持
+  `5→5`；
+- 精确 loser 校验 GM load 和对应 `icmp` 均为 `5→0`；
+- AIC 全函数 load `357→352`、store `907→907`、icmp `296→291`，
+  caller 函数缩小 200 B；
+- AIV 全函数 load `361→356`、store `931→931`、icmp `363→358`，
+  caller 函数缩小 244 B；
+- AIC/AIV alloca 都保持 5。
+
+Atomic 调用在 AIC、AIV、基线和候选四者中完全一致，均为 56 个：
+
+```text
+ADD.G.s32=3
+ADD.G.s64=29
+EXCH.G.s32=9
+EXCH.G.s64=6
+EXCH.G.u64=6
+MAX.G.s64=3
+```
+
+runtime 对象逐字相同；AIC/AIV winner Finish 的函数尺寸和 `.text`
+哈希也逐字相同。private 的预处理 token 完全同哈希，去掉调试信息后
+caller/runtime/finish/mixed 七个对象逐一同哈希，证明 private 机器码
+没有被 shared-only 修改带动。
+
+#### 构建与动态语义闭合
+
+以下均通过：
+
+- CPU shared 全量协议自测和新的 loser 毒值测试；
+- CPU shared B256/G1 real-compute-count1，依赖签名
+  `b7d985d6edb07078`；
+- CPU shared mixed G0/G1/G2/G4，依赖签名
+  `6437bff09d8f8a11`；
+- CPU private 全量构建；
+- CCEC shared full-swimlane/perf-clock；
+- CCEC private full-swimlane；
+- 两次 A5 B256/G1 完整泳道。
+
+最终两份候选泳道为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_171458_24748/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_171555_26271/ccec/
+```
+
+两次均保持原始 96/32/64 Claim 合同、73,728 attempted Claim、
+1,280 winner、72,448 true-loser、49,152 not-attempted、1,024
+kernel、依赖签名 `b7d985d6edb07078` 和 drop 0；execution、semantic
+与 postprocess 全部 PASS。
+
+#### 直接 non-atomic 结果
+
+基线仍为上一保留阶段：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_164316_4144100/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_164410_4145749/ccec/
+```
+
+统计对四份 raw 逐核合并 `Atomic∪Kernel` 后再扣除区间交集。四份共同且
+有下一 actor 的固定 nonwinner 人口为 117,846：
+
+```text
+AIC 38,956
+AIV 78,890
+```
+
+两轮总 tick 均值和每 actor 结果如下：
+
+| 固定 nonwinner 区域 | AIC | AIV | 全核 |
+| --- | ---: | ---: | ---: |
+| EfDrain control | 62.076→58.646，-5.525% | 75.523→76.029，+0.670% | 71.078→70.283，-1.118% |
+| Claim outer | 21.052→21.513，+2.190% | 22.686→22.521，-0.727% | 22.146→22.188，+0.190% |
+| post-Claim tail | 92.606→80.328，**-13.258%** | 94.211→86.620，**-8.057%** | 93.680→84.540，**-9.756%** |
+| SubmitTransition | 124.079→132.364，+6.678% | 117.868→118.422，+0.470% | 119.921→123.031，+2.593% |
+| 四段完整 actor | 299.813→292.853，**-2.322%** | 310.287→303.592，**-2.158%** | 306.825→300.042，**-2.211%** |
+| Claim outer + tail | 113.658→101.842，**-10.396%** | 116.896→109.141，**-6.634%** | 115.826→106.728，**-7.855%** |
+
+三种角色汇总都满足四段总和逐 tick 等于完整 actor；post-Claim loser
+路径本身没有 Atomic 或 Kernel，统一扣除仍得到零交集。
+
+分开看固定子群，直接目标不是所有格子都同向：
+
+| post-Claim tail | AIC | AIV | 全核 |
+| --- | ---: | ---: | ---: |
+| 68,726 true-loser | **-14.664%** | **-17.631%** | **-16.588%** |
+| 49,120 not-attempted | **-10.561%** | +5.641% | +0.975% |
+
+true-loser 是本次删除校验实际执行的主要竞争失败路径，AIC/AIV 两角色
+和两轮 raw 都强同向。not-attempted 的 AIV tail 回退必须保留在结论中，
+不能把组合试验曾出现的 not-attempted 改善错误归因给最终删除。
+
+全部 122,784 条 Transition 没有任何 Atomic/Kernel 交集，但仍表现为
+AIC/AIV/全核 `+5.262%/+0.605%/+2.202%`；这是删除条件带来的代码布局
+搬移，不是 Atomic 波动。固定 nonwinner 的 Transition 回退已包含在
+上表完整 actor 中，最终 AIC/AIV/全核完整路径仍分别改善
+`2.322%/2.158%/2.211%`。
+
+候选三次 perf-clock 为：
+
+```text
+2,265.081 / 2,291.182 / 2,270.259 us
+```
+
+它只记录低扰动运行背景，不参与保留裁决。
+
+#### 决策
+
+最终 isolated 候选保留。它严格冻结 Atomic、winner Finish、private
+机器码和原始 Claim 人口，准确删除 121,600 次 nonwinner 的同源 GM
+读取与比较；true-loser 直接 tail 在 AIC/AIV 均大幅下降，固定
+nonwinner 合计 tail 和完整 actor 也都改善。
+
+同时不把该阶段描述成全区域无回退：not-attempted AIV tail 和
+SubmitTransition 存在明确布局反向。后续候选仍须在完整 actor 闭合中
+承担这些搬移成本，不能只引用被删除条件所在的局部 span。

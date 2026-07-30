@@ -3496,7 +3496,6 @@ PA_DEVICE bool FinishSharedLoserSubmit(
     uint64_t submit_begin
 ) {
     const bool valid =
-        context.task_id == static_cast<int32_t>(task_id) &&
         context.shared_result.TaskId() ==
             static_cast<int32_t>(task_id) &&
         context.shared_result.Size() ==
