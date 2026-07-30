@@ -3957,7 +3957,7 @@ inline Metrics Validate(
         static_cast<uint64_t>(batches) * (kWorkers + kAicWorkers + kAivWorkers + kAicWorkers + kAivWorkers);
 #endif
     // 上式依次对应 Alloc、QK、SF、PV、UP 的 shard-affine 候选数；
-    // shared 默认 256 batch/G1 时为 11,264，private 仍为 73,728。
+    // shared 默认 256 batch/G1 时为 14,336，private 仍为 73,728。
 
     // 聚合量分为调度核心计数、kernel 分布、前端操作数和最终状态四组，便于定位语义偏差。
     uint64_t first_submit = UINT64_MAX;
@@ -4950,17 +4950,11 @@ inline Metrics Validate(
     );
 
     // private 三类 Claim cursor 均为 production-prefix 四分片；shared
-    // Alloc 复用四路 legacy Vector 与四路 Alloc cursor 合成八分片，
-    // shared Vector 继续使用 sidecar 的八条物理线。逐 task 重新推导
-    // 每条 cursor 的最终高水位。
+    // Vector 使用 sidecar 的八条物理线，Cube/Alloc 保持四分片。逐 task
+    // 重新推导每条 cursor 的最终高水位。
     int64_t expected_cube[kCursorShards] = {-1, -1, -1, -1};
 #if PTO_FDWIC_SHARED_MAP
-    int64_t expected_legacy_vector[kCursorShards] = {
-        -1, -1, -1, -1
-    };
-    int64_t expected_shared_vector[
-        kSharedVectorCursorCapacity
-    ] = {
+    int64_t expected_vector[kSharedVectorCursorCapacity] = {
         -1, -1, -1, -1, -1, -1, -1, -1
     };
 #else
@@ -4983,24 +4977,12 @@ inline Metrics Validate(
         const TaskKind kind = static_cast<TaskKind>(task_id % kTasksPerBatch);
 #endif
         if (kind == TaskKind::Alloc) {
-#if PTO_FDWIC_SHARED_MAP
-            const uint32_t shard =
-                task_id % kSharedAllocCursorShards;
-            if (shard < kCursorShards) {
-                expected_alloc[shard] = task_id;
-            } else {
-                expected_legacy_vector[
-                    shard - kCursorShards
-                ] = task_id;
-            }
-#else
             expected_alloc[task_id % kCursorShards] = task_id;
-#endif
         } else if (kind == TaskKind::Qk || kind == TaskKind::Pv) {
             expected_cube[task_id % kCursorShards] = task_id;
         } else {
 #if PTO_FDWIC_SHARED_MAP
-            expected_shared_vector[
+            expected_vector[
                 task_id % kSharedVectorCursorShards
             ] = task_id;
 #else
@@ -5014,9 +4996,8 @@ inline Metrics Validate(
     for (uint32_t shard = 0; shard < kCursorShards; ++shard) {
         cursors_ok &= state.cube_cursor[shard].value == expected_cube[shard];
 #if PTO_FDWIC_SHARED_MAP
-        cursors_ok &=
-            state.vector_cursor[shard].value ==
-                expected_legacy_vector[shard];
+        // shared Vector 不应触碰旧 production-prefix vector cursor。
+        cursors_ok &= state.vector_cursor[shard].value == -1;
 #else
         cursors_ok &= state.vector_cursor[shard].value == expected_vector[shard];
 #endif
@@ -5026,7 +5007,7 @@ inline Metrics Validate(
     for (uint32_t shard = 0; shard < kSharedVectorCursorCapacity; ++shard) {
         cursors_ok &=
             state.shared_map.shared_vector_cursor[shard].value ==
-                expected_shared_vector[shard];
+                expected_vector[shard];
     }
 #endif
     Expect(

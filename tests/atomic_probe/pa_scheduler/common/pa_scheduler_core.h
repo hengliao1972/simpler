@@ -801,8 +801,8 @@ PA_DEVICE bool IsSharedClaimParticipantDevice(
         return false;
     }
     if (kind == TaskKind::Alloc) {
-        return worker_id % kSharedAllocCursorShards ==
-               task_id % kSharedAllocCursorShards;
+        return worker_id % kCursorShards ==
+               task_id % kCursorShards;
     }
     if (kind == TaskKind::Qk ||
         kind == TaskKind::Pv) {
@@ -830,9 +830,9 @@ PA_DEVICE ClaimOutcome Claim(
     // production-prefix 四分片；shared Vector 使用 sidecar 中的八分片
     // cursor。同一 task 只有观察到旧值更小的竞争者获胜。
     // private 保持 Alloc 96、QK/PV 32 个 AIC、SF/UP 64 个 AIV
-    // 的完整竞争；shared 再按 cursor shard 收敛为 12/8/8 个动态
-    // 候选。Alloc 复用 shared 下闲置的四路 legacy vector cursor，
-    // 与四路 alloc cursor 合成八路高水位。
+    // 的完整竞争；shared 按显式 worker/cursor shard 策略把候选
+    // 收敛为 24/8/8。该策略改变 winner 可选集合，不把被筛掉的
+    // worker 误称为原协议下必输。
     ClaimOutcome outcome{false, false, 0, -1};
     if (task_id >= kTaskCellCapacity) {
         return outcome;
@@ -851,17 +851,7 @@ PA_DEVICE ClaimOutcome Claim(
 #endif
     PA_GM AtomicLine *cursor = nullptr;
     if (kind == TaskKind::Alloc) {
-#if PTO_FDWIC_SHARED_MAP
-        const uint32_t shard =
-            task_id % kSharedAllocCursorShards;
-        cursor = shard < kCursorShards
-            ? &state->alloc_cursor[shard]
-            : &state->vector_cursor[
-                  shard - kCursorShards
-              ];
-#else
         cursor = &state->alloc_cursor[task_id % kCursorShards];
-#endif
     } else {
         // Mirror MixedKernels::to_active_mask(), core_mask(), popcount(),
         // lane_active(), and self->role routing inside the real Claim span.

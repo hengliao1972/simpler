@@ -12855,8 +12855,9 @@ loser actor 的控制时间合计为 `140.217 ms core-time`：
 其中 72,448 条 true-loser `ClaimMax` 自身累计 `53.454 ms`，
 mean/median/p95 为 `737.8/403/2624 ns`；Alloc 的 24,320 条
 true-loser `ClaimMax` 又占其中 `34.738 ms`。因此第一优先级是减少
-必输 atomic 的数量与同一 cache line 上的竞争，而不是继续缩短已经很薄
-的 loser C++ 外壳。
+实际 loser atomic 的数量与同一 cache line 上的竞争，而不是继续缩短
+已经很薄的 loser C++ 外壳。这里的“减少”是修改候选资格策略，不是证明
+某个 worker 在原协议下必然失败后做等价删除。
 
 历史实验已经证明不能简单改成 per-task atomic，也不能固定单一 owner：
 前者虽然曾把 ClaimMax 降低 20.9%，却因 fanin 等后续开销增加而让
@@ -12880,9 +12881,11 @@ perf-clock 回退 2.27%；后者会把 winner/负载集中到少数 worker。本
 
 所有 96 个 worker 仍按 task-id 顺序回放每次 Submit、执行 EfDrain
 并推进本地 winning slot；筛选只让不属于本 cursor shard 的 actor 不再
-发射必输的 `atomicMax`。这不是固定 owner：同一 task 仍由 24 或 8 个
-worker 动态竞争 winner。它也不是 per-task atomic：同一 cursor 链仍保持
-原来的跨 task 单调高水位约束。
+发射 `atomicMax`。这会改变原来 96/32/64 合同下的 winner 可选集合：
+被筛掉的 actor 原本也可能赢，因此它是新的调度策略而非透明的 atomic
+消除。这不是固定 owner：同一 task 仍由 24 或 8 个 worker 动态竞争
+winner。它也不是 per-task atomic：同一 cursor 链仍保持原来的跨 task
+单调高水位约束。
 
 该合同成立的关键是同一 cursor 链上的候选集合固定不变。例如 QK/PV
 共用 cube shard，同 shard 的后续 task 仍由同一组 AIC 候选竞争。worker
@@ -12981,136 +12984,34 @@ core-time`，虽被 EfDrain 与 task 切换合计约 `9.23 ms` 的增加部分
 轮询反噬；EfDrain 与 UP 后 task 切换已成为新的相对热点，但在候选宽度
 收敛前不混入其他代码改动。
 
-### 2026-07-30：用八路 Alloc 高水位均匀收敛到 12/8/8
+### 2026-07-30：撤回八路 Alloc 高水位的 12/8/8 过程态
 
-#### 候选宽度扫描
+在 24/8/8 基础上曾提交 `f7e2ee98`：把 shared 中闲置的四路 legacy
+`vector_cursor` 与四路 `alloc_cursor` 合成八路逻辑 Alloc 高水位，
+使 Alloc 候选从 24 降至 12，QK/PV 与 SF/UP 继续保持 8。该过程态的
+B256 Claim 从 14,336 降至 11,264，泳道中 loser Claim 下降 10.38%、
+loser 控制总量下降 1.35%。
 
-第一阶段的 `24/8/8` 仍有 13,056 个 attempted loser，因此继续单独扫描
-Claim 候选宽度，没有同时修改 EfDrain、tail 或 transition。扫描先得到
-两个明确反例：
+复审后撤回，原因不是功能门槛失败，而是收益与语义风险不匹配：
 
-- `12/4/4` 把总 Claim 降到 7,168，但 B256 perf-clock 回退到
-  `2.74～2.76 ms`；
-- `24/4/4` 保持 Alloc、只收窄四类计算 task，总 Claim 为 10,240，
-  perf-clock 仍回退到 `2.77～2.90 ms`。
+- 12+12 次交错 perf-clock 的 mean/median 从
+  `1571.361/1570.859 us` 变为 `1577.919/1579.672 us`，
+  分别回退 0.417%/0.561%，没有端到端收益；
+- 它不只减少竞争者，还把 Alloc 从四条 `task_id % 4` 高水位链拆成
+  八条 `task_id % 8` 链，改变了跨 task 的推进约束；
+- 被排除的 12 个 worker 并非原协议下必输，只是新策略取消了资格；
+- 当前固定 PA B256 的唯一 winner、依赖、TensorMap 和计算结果通过，
+  不能据此证明任意任务图、候选核阻塞或 winning-slot 压力下与原合同
+  等价。
 
-这证明 QK/PV/SF/UP 的 8 个动态候选已经是当前负载下的有效下界，继续
-减少会把 winner 尾延迟和后续 fanin/slot 压力放大，不能只按 atomic
-数量选择方案。
+因此当前正式状态恢复为 24/8/8：四路 Alloc、四路 cube、八路
+shared-vector 高水位都保持不变，只保留 `5d34768a` 引入的 cursor-shard
+候选策略。后者同样被明确标记为调度策略变化，不能再称为“删除必输
+atomic”；迁往真实 simpler 前必须独立确认其 winner 资格合同。
 
-Alloc 方向还实验过在原四路 cursor 内保留 18 或 21 个低编号 rank。
-`21/8/8` 的完整泳道确实把 attempted loser 从 13,056 降到 12,288，
-但新增 rank 判定后，loser Claim 父区间反而从 `13.902 ms` 增至
-`14.054 ms（+1.09%）`，总 loser 控制时间只下降 `0.71%`；同时排除
-尾部 worker 会让候选集合不再均匀覆盖 96 核。因此没有把这个过程态写入
-正式合同。
-
-#### 最终协议
-
-shared 模式下原本有四路 legacy `vector_cursor` 长期保持 `-1`，因为
-SF/UP 已经迁到 sidecar 的八路 `shared_vector_cursor`。最终候选不增加
-字段，而是把这四路闲置高水位与四路 `alloc_cursor` 合成八路逻辑 Alloc
-cursor：
-
-| task 类别 | 高水位路由 | 候选条件 | 每 task 候选数 |
-| --- | --- | --- | ---: |
-| Alloc，逻辑 shard 0～3 | `alloc_cursor[shard]` | `worker_id % 8 == task_id % 8` | 12 |
-| Alloc，逻辑 shard 4～7 | `vector_cursor[shard-4]` | `worker_id % 8 == task_id % 8` | 12 |
-| QK/PV | `cube_cursor[task_id%4]` | AIC 且同 mod-4 shard | 8 |
-| SF/UP | `shared_vector_cursor[task_id%8]` | AIV 且同 mod-8 shard | 8 |
-
-每条 Alloc 物理线仍只承载固定 task residue，并由固定的 12 个 worker
-按 task-id 顺序回放；`FetchMax` 的唯一 winner 和跨 task 高水位语义均
-不变。与在四路 cursor 内裁 rank 不同，八个 Alloc shard 合计仍让全部
-96 个 worker 轮流参与 Alloc Claim，没有固定 owner 或尾部 worker
-永久退出。
-
-B256/G1 的精确 Claim 数变为：
-
-`256 × 12 + 256 × (8 + 8 + 8 + 8) = 11,264`
-
-相对 `24/8/8` 减少 3,072 次，即 `21.43%`；attempted loser 从
-13,056 降到 9,984，即 `23.53%`。所有 96 个 worker 仍执行完整 Submit
-和 EfDrain，非候选 actor 只是不再发 ClaimMax。
-
-物理布局和 offset 没有变化，但 legacy vector cursor 从“shared 必须为
-`-1`”变成 Alloc shard 4～7，属于 host/device 字段语义变化。因此 shared
-构建身份从 ABI generation 12 升到 13，private generation 继续为 4，
-trace schema 继续为 5；旧新混件在执行前由构建身份拒绝。
-
-#### 正确性闭环
-
-- CPU shared 全套门槛通过；
-- Claim 门槛同时覆盖 Alloc 逻辑 shard 0～3 的 `alloc_cursor` 路由和
-  shard 4～7 的 legacy `vector_cursor` 路由，以及五类 task 的精确候选、
-  唯一 winner、同 shard 高水位推进和旧 task replay；
-- ordered-submit 的 atomic 地址识别同步纳入 legacy vector cursor，
-  loser 零 TensorMap 访问、独立 kernel 重叠和有序插入门槛全部通过；
-- host 从权威 task plan 逐 worker 重建 Claim 次数，并分别重建八路
-  Alloc、四路 cube 和八路 shared-vector 的最终高水位；
-- CCEC AIC/AIV probe、split runtime/finish 和 mixed ELF 构建通过；
-- A5 B256 的 11,264 次 Claim、1,280 个 winner、96 个 active worker、
-  fanin、依赖签名、TensorMap/history、heap、completion、真实计算结果
-  和最终状态全部 PASS。
-
-#### perf-clock：不宣称端到端加速
-
-冻结 `5d34768a` 的 `24/8/8` ELF，与八路 `12/8/8` ELF 做六组 ABBA，
-共 12+12 个独立 B256 进程：
-
-| 构建 | mean | median | 范围 |
-| --- | ---: | ---: | ---: |
-| `24/8/8` | 1571.361 us | 1570.859 us | 1553.972～1588.870 us |
-| 八路 `12/8/8` | 1577.919 us | 1579.672 us | 1540.680～1619.455 us |
-| 变化 | +6.558 us / +0.417% | +8.813 us / +0.561% | — |
-
-`24/8/8` 的 12 次为：
-
-`1572.172、1569.454、1554.267、1583.215、1568.303、1579.497、`
-`1578.020、1569.546、1588.870、1553.972、1558.318、1580.694 us`
-
-八路 `12/8/8` 的 12 次为：
-
-`1555.335、1619.455、1540.680、1558.678、1591.086、1578.478、`
-`1558.432、1580.866、1612.677、1557.070、1586.069、1596.198 us`
-
-因此该候选没有可辨识的端到端加速；mean/median 均小幅回退，但仍低于
-本轮为“减少 loser 工作”预先约定的 2% 上限。保留与否必须继续由同源
-泳道中的 loser 控制时间决定，不能拿 Claim 次数直接宣布收益。
-
-#### B256 泳道：loser 目标得到净改善
-
-八路 `12/8/8` 正式采集位于：
-
-`outputs/pa_scheduler_shared_swimlane_20260730_015221_3133946/ccec`
-
-对照仍为：
-
-`outputs/pa_scheduler_shared_swimlane_20260730_002136_3047643/ccec`
-
-两图均为 B256、G1、完整 atomic+DCCI 泳道，全部断言 PASS、drop 0。
-winner 均为 1,280；true loser 为 `13,056 -> 9,984`，相应
-not-attempted 为 `108,544 -> 111,616`。排除 EfDrain 内真实 Kernel 后：
-
-| loser 控制区域 | `24/8/8` | 八路 `12/8/8` | 变化 |
-| --- | ---: | ---: | ---: |
-| Claim | 13.902 ms | 12.459 ms | -1.443 ms / -10.38% |
-| EfDrain 控制部分 | 28.478 ms | 28.581 ms | +0.102 ms / +0.36% |
-| Claim 后轻量收尾 | 26.759 ms | 26.423 ms | -0.336 ms / -1.26% |
-| Submit 后续 task 切换 | 32.112 ms | 32.421 ms | +0.309 ms / +0.96% |
-| loser 控制合计 | 101.252 ms | 99.884 ms | **-1.368 ms / -1.35%** |
-
-全部 ClaimMax 的物理调用从 14,336 降到 11,264，atomic
-return-ready 包围时间从 `3.911 ms` 降到 `2.901 ms（-25.82%）`，
-单次 mean 也从 `272.8 ns` 降到 `257.5 ns（-5.58%）`。这说明八分片
-不仅少发 atomic，也略微减轻了同一行的竞争；同时 EfDrain 和 transition
-没有出现足以吞掉 Claim 收益的反向增长。
-
-本阶段按既定判据保留：目标指标 loser 控制时间确定下降 `1.35%`，
-perf-clock 回退仅 `0.42%`、低于 2% 上限。结论只能表述为“以很小的
-端到端代价继续减少了 loser 控制工作”，不能表述为端到端加速。
-
-Claim 宽度到这里停止继续收窄：计算 task 的 4 候选已经证明严重回退，
-Alloc 再靠 rank 裁剪只有很小收益且会破坏均匀性。下一阶段转向当前
-loser EfDrain 中反复读取未就绪 fanin 的高频成本，并保持每个候选独立
-A/B，不与 transition 或观察代码改动混合。
+回退后使用系统 GCC 13 重新执行 CPU shared/private 全套门槛，shared
+cursor Claim、ordered-submit、TensorMap/history、heap、稀疏泳道编码及
+private ring 全部通过。GCC 15.0.1 与本机 binutils 2.42 在生成
+`.base64` 汇编伪指令时不兼容；CPU `perf-clock` 还触发当前基线
+`pa_trace.h` 的 trace-free 未使用变量告警，这两项均未混入本次 Claim
+协议修改。

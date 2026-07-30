@@ -16,14 +16,17 @@
 - 96 个 worker 都回放全部 Submit。private 中 Alloc 由 96 个
   worker 竞争，QK/PV 由 32 个 AIC 竞争，SF/UP 由 64 个 AIV
   竞争；shared 先按实际 Claim cursor shard 筛选动态候选，每个
-  Alloc/QK-PV/SF-UP task 分别由 12/8/8 个同 shard worker 发
+  Alloc/QK-PV/SF-UP task 分别由 24/8/8 个同 shard worker 发
   `atomicMax`；
+- shared 的 24/8/8 是明确引入的候选资格策略，不是对原协议中
+  “必然失败”调用的等价删除：被筛掉的 worker 在原 96/32/64
+  合同下本来也可能成为 winner。它只由当前 standalone 的正确性与
+  性能门槛支持，迁入其他实现前必须重新确认调度合同；
 - private 使用 production-prefix 的 4 路 Alloc/cube/vector Claim
-  cursor；当前 shared 的 QK/PV 使用 4 路 cube cursor，SF/UP 使用
-  sidecar 中全部 8 路 vector cursor，Alloc 则把 4 路 alloc cursor
-  与 shared 下闲置的 4 路 legacy vector cursor 合成 8 路高水位。
-  shared 同一 cursor 链上的 task 使用相同候选集合，仍由实际
-  `atomicMax` 动态决定 winner；
+  cursor；当前 shared 让 Vector 使用 sidecar 中全部 8 个 active
+  shard，Cube/Alloc 仍使用 production-prefix 4 路。shared 同一
+  cursor 链上的 task 使用相同候选集合，仍由实际 `atomicMax`
+  动态决定 winner；
 - PA 的 TaskArgs、Tensor、TaskPayload、DistSubmitCtx、DistCore/DistGlobal 关键 ABI 布局；
 - tensor tag 扫描、输出 layout、materialize，以及按构建模式选择的 private
   每核有界桶环或 shared 有序桶环的 retire/lookup/insert、register mask；
@@ -32,7 +35,7 @@
 - 与真实 PA 相同的单 lane 优化：Case1 不执行 BlockWon 轮询；
 - 与真实泳道格式对齐的阶段记录及严格的结束状态校验。
 
-默认工作量在 private/shared 中分别产生 73,728/11,264 次实际 Claim
+默认工作量在 private/shared 中分别产生 73,728/14,336 次实际 Claim
 atomic，两种模式都产生 1,280 个 winner 和 1,024 次 kernel 执行。每次
 运行都会校验总数、shared 逐 worker 候选次数以及最终 TensorMap、heap、
 cursor、flag、vend、frontier 和 worker 状态，任一不符都会返回失败。
@@ -258,8 +261,8 @@ submit-pmu 四件套都必须通过 manifest 的模式、CAP、insert-turn G、�
 
 shared 构建还读取 `PA_SHARED_INSERT_TURN_GROUPS`，默认 1，只接受
 1/2/4/8/16/32/64/128；private 只允许 1。该值只在构建期生效，不是
-benchmark 参数。默认 CAP=128 时，shared ABI generation 为 13，
-ABI version 为 `(13<<8)|G`；host/device 握手和 schema-v4 manifest
+benchmark 参数。默认 CAP=128 时，shared ABI generation 为 12，
+ABI version 为 `(12<<8)|G`；host/device 握手和 schema-v4 manifest
 都会拒绝不同 G 的混件。turn-G>1 只属于本阶段维护的 CPU/CCEC 后端；
 AscendC 和 `all` 会在任何构建或设备动作前被拒绝。
 
@@ -436,7 +439,7 @@ S4.16b 第一层性能门槛失败；这些数字只属于历史候选，不是�
 
 每 task 最多八个 fresh output，以 16B
 `FdwicOutputRef` 表达 `(producer_task_id, output_slot)`，返回句柄为
-8B `SharedTaskOutputs`。当前构建身份 ABI generation 为 13。通用
+8B `SharedTaskOutputs`。当前构建身份 ABI generation 为 12。通用
 history 能力由 generation 7 引入，generation 8 追加 `reader_done`，
 generation 9 追加七条 insert-turn 物理线，generation 10 再将物理容量
 扩为 128 条并把 active G 扩到 128；generation 11 将 shared 热路径的
@@ -450,11 +453,7 @@ accumulator latest writer 收敛到 Alloc `last_writer[0]`：每个 UP 只做
 一次 group CAS，slot1/2 保持 Alloc producer。三条 slot2/1/0 history 和
 三个逻辑 INOUT commit 仍完整保留，generic shared resolver 也继续使用
 逐 slot writer；因此旧新 ELF 的字段解释不同，必须用 generation 拒绝
-混件。generation 13 继续保持相同物理布局，但把 shared 下原本必须保持
-`-1` 的四路 legacy vector cursor 解释为 Alloc 逻辑 shard 4～7，与
-四路 alloc cursor 合成八路 Alloc 高水位；旧 host 无法按新语义校验终态，
-因此同样必须由 generation 在执行前拒绝混件。history、reader progress
-与 per-task 插入完成链仍是不同协议能力，
+混件。history、reader progress 与 per-task 插入完成链仍是不同协议能力，
 不能据此声称 PA 热路径已经接入 reader-progress reclaim。
 
 当前 shared 使用独立 Submit 路径。所有 worker 先 Claim；只有唯一 owner
@@ -690,7 +689,7 @@ builtin；检查后删除，不会进入正式 mixed ELF。静态链接只证明
 后端能生成完整设备代码，不证明 ordinary region 的跨核
 reader-progress/reclaim 可见性已经闭合。
 shared-protocol-litmus 自身虽是 CCEC mixed ELF，但没有定义 split-finish，
-因此其 GM `SchedulerState` 使用当前 generation-13 non-split 大小
+因此其 GM `SchedulerState` 使用当前 generation-12 non-split 大小
 1,019,551,552B。history 场景会校验 96 条 `reader_done` 始终保持 -1；
 reader-reclaim 场景则要求 96 条最终均为 task 2，且只允许被测 reader
 发生 `1->2`。两种场景还校验完整 128 线 insert-turn 终态。
@@ -2059,10 +2058,8 @@ R4e-a 追加 96 条 reader-progress cache line 后，generation-8 sidecar 为
 12,426,432 bytes。R5c 在尾部追加七条 insert-turn cache line，形成历史
 generation-9 的 12,426,880 bytes；generation-10 将该尾数组扩为
 127 条 extra line，sidecar 为 12,434,560 bytes；generation 11
-停止从热路径访问这些 turn line，generation 12 继续保留同一物理
-布局并引入 PA accumulator group-writer 语义；当前 generation 13
-再复用四路 legacy vector cursor 承载 Alloc 逻辑 shard 4～7，结构大小
-仍然不变。shared batch 输入
+停止从热路径访问这些 turn line，当前 generation 12 继续保留同一物理
+布局并引入 PA accumulator group-writer 语义。shared batch 输入
 数组扩到 512 后，CPU non-split 与定义
 `PA_COMPETE_FIRST_SPLIT_FINISH` 的 CCEC 变体总大小分别为
 1,019,551,552/1,019,557,696 bytes；swimlane、perf-clock 以及 submit-PMU

@@ -26,13 +26,12 @@ namespace {
 
 using namespace pa_scheduler;
 
-constexpr std::array<TaskKind, 9> kTaskKinds = {
+constexpr std::array<TaskKind, 8> kTaskKinds = {
     TaskKind::Alloc, TaskKind::Qk, TaskKind::Sf, TaskKind::Pv,
     TaskKind::Up, TaskKind::Pv, TaskKind::Alloc, TaskKind::Up,
-    TaskKind::Alloc,
 };
-constexpr std::array<uint32_t, 9> kTaskIds = {
-    100, 101, 102, 103, 104, 105, 108, 110, 112,
+constexpr std::array<uint32_t, 8> kTaskIds = {
+    100, 101, 102, 103, 104, 105, 108, 110,
 };
 
 int g_failures = 0;
@@ -124,13 +123,7 @@ void InitializeClaimCursors(SchedulerState &state, CursorValues &expected) {
 
 volatile int64_t *ExpectedClaimAddress(SchedulerState &state, uint32_t task_id, TaskKind kind) {
     if (kind == TaskKind::Alloc) {
-        const uint32_t shard =
-            task_id % kSharedAllocCursorShards;
-        return shard < kCursorShards
-            ? &state.alloc_cursor[shard].value
-            : &state.vector_cursor[
-                  shard - kCursorShards
-              ].value;
+        return &state.alloc_cursor[task_id % kCursorShards].value;
     }
     if (kind == TaskKind::Qk || kind == TaskKind::Pv) {
         return &state.cube_cursor[task_id % kCursorShards].value;
@@ -140,15 +133,7 @@ volatile int64_t *ExpectedClaimAddress(SchedulerState &state, uint32_t task_id, 
 
 void RecordExpectedCursor(CursorValues &expected, uint32_t task_id, TaskKind kind) {
     if (kind == TaskKind::Alloc) {
-        const uint32_t shard =
-            task_id % kSharedAllocCursorShards;
-        if (shard < kCursorShards) {
-            expected.alloc[shard] = task_id;
-        } else {
-            expected.vector[
-                shard - kCursorShards
-            ] = task_id;
-        }
+        expected.alloc[task_id % kCursorShards] = task_id;
     } else if (kind == TaskKind::Qk || kind == TaskKind::Pv) {
         expected.cube[task_id % kCursorShards] = task_id;
     } else {
@@ -257,11 +242,9 @@ void TestAllTaskKindsUseCursorClaim() {
         }
     }
 
-    // PV105、Alloc108、UP110 分别复用 QK101 的 cube shard、
-    // Alloc100 的上半路由 vector shard 和 SF102 的 shared-vector
-    // shard；Alloc112 额外覆盖下半路由的 alloc_cursor。它们仍各自
-    // 产生唯一 winner，证明筛选后的固定候选集合能完整推进两类
-    // Alloc 路由和其他高水位链。
+    // 后三项分别复用 QK101 的 cube shard、Alloc100 的 alloc
+    // shard 和 SF102 的 shared-vector shard。它们仍各自产生唯一
+    // winner，证明筛选后的固定候选集合能完整推进同一高水位链。
     // 再回放较旧的 QK101 时，cube cursor 已被 PV105 推进到 105，
     // 本 shard 候选必须正常发 atomic 并判输。
     WorkerState &replay_worker = state->workers[1];
