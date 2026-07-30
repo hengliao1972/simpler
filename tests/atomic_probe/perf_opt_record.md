@@ -3702,3 +3702,36 @@ tests/atomic_probe/pa_scheduler/outputs/
 本阶段只按固定人口 non-atomic 区间保留。详细测试矩阵、分核数据和
 IR/relocation 证明见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.9 shared slot 头清零合并
+
+**[已撤回] 两条 byte store 合并为一条 16-bit store**
+
+候选仅把 shared `DrainReady()` 成功后的
+`built=false; occupied=false` 合并为从完整 `LocalSlot` 对象起始地址
+执行的 2B object-representation 清零。最终写法没有 bool 子对象越界、
+strict-alias 或 `__gm__` 地址空间问题。
+
+CCEC O3 IR 中 AIC/AIV 的 6 个内联点都由两条 `i8` GM store 变成一条
+`i16` GM store，atomic intrinsic、alloca 和 finish TU 均不变。每份
+B256 动态执行 1,024 次，AIC/AIV 各 512 次。
+
+但两份基线与两份候选泳道扣除 Atomic∪Kernel 后，直接目标区间不支持
+保留：
+
+| kernel 所在 drain 区域 | AIC | AIV | 全核 |
+| --- | ---: | ---: | ---: |
+| 父区间 non-atomic | +0.273% | +2.397% | +1.357% |
+| kernel.end 后 tail | -0.416% | +2.696% | +1.098% |
+
+完整 actor 背景全核虽为 `-0.117%`，但 AIV 为 `+0.001%`，不能用该微小
+背景变化掩盖直接区域回退。候选已完整撤回。A5 候选产物：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_160425_4051214/ccec/
+  pa_scheduler_shared_swimlane_20260730_160513_4051144/ccec/
+```
+
+语言边界、IR 门槛、placement 归一化和完整原始数据见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。

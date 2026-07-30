@@ -14685,3 +14685,69 @@ outputs/pa_scheduler_shared_swimlane_20260730_151758_3929172/ccec/
 winner-only 字段的写入；直接目标区在 AIC/AIV 均改善，完整
 all-nonwinner 区间也闭合为下降。局部 not-attempted 回退作为后续代码
 布局优化线索保留。
+
+### 2026-07-30：合并 shared slot 头清零试验撤回
+
+#### 试验与代码生成
+
+每次 `DrainReady()` 成功执行 kernel 后，原实现依次执行：
+
+```cpp
+slot.built = false;
+slot.occupied = false;
+```
+
+两字段位于 `LocalSlot` offset 1/0，属于本 worker 私有 slot，中间没有
+消费者。候选仅在 shared 构建中从完整 `LocalSlot` 对象起始地址清零前
+2B：
+
+```cpp
+__builtin_memset(&slot, 0, 2);
+```
+
+该写法不越过完整对象边界，也不使用违反 strict-alias 的
+`uint16_t*` 转换。最初尝试的 `&slot.occupied` 会跨 bool 子对象边界，
+GCC 高强度边界诊断会告警，已明确排除。最终合法写法与最初写法的
+AIC/AIV `.text` 逐字相同，因此下述 A5 数据对应同一条实际指令序列。
+
+CCEC O3 IR 中，AIC/AIV 的 6 个 `DrainReady` 内联点都从两条 `i8` GM
+store 收敛为一条 `i16` GM store，合计从 12 条降到 6 条；全 TU atomic
+intrinsic 均保持 `92→92`，alloca 均保持 `5→5`，finish TU 不实例化该
+路径。CPU shared/private 和 CCEC shared/private 构建均通过。
+
+#### A5 直接目标区间
+
+基线：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_154311_3996206/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_154407_3998986/ccec/
+```
+
+候选：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_160425_4051214/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_160513_4051144/ccec/
+```
+
+四份 raw 均为 96×1,280 actor 完整闭合、drop 0、1,024 个 Kernel，
+AIC/AIV 各固定 512 个。Kernel 只落在 EfDrain 或 FinalDrain；为消除两者
+placement 的小幅漂移，直接口径合并两类父区间，再逐核扣除
+Atomic∪Kernel 区间并集。
+
+| 直接口径 | AIC | AIV | 全核 |
+| --- | ---: | ---: | ---: |
+| kernel 所在父区间 non-atomic | +0.273% | +2.397% | +1.357% |
+| kernel.end 后的 non-atomic tail | -0.416% | +2.696% | +1.098% |
+
+所有 actor 的完整 non-atomic 背景为 AIC `-0.371%`、AIV `+0.001%`、
+全核 `-0.117%`。该微小全局变化不能覆盖直接 kernel 后处理区间的回退，
+也不能用端到端波动替代直接区域裁决。
+
+#### 决策
+
+候选撤回，生产源码恢复为两次 bool 赋值。该试验证明“指令条数减少”
+仍不是充分的性能证据：虽然 IR 精确少了 1,024 条 GM store，但 AIV 和
+全核直接目标区间均回退。后续不重复该方向，转向动态次数约 4 万次的
+shared `built` guard 读取/分支。
