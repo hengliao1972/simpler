@@ -281,7 +281,17 @@ fi
 # CompeteFirstSplitRuntimeState 当前 ABI 为 1664B。只给 split 产物开启
 # block-local relocation，并按精确尺寸预留，避免影响局部 PMU 的 inline ELF。
 SPLIT_STATE_BYTES=1664
-SPLIT_FINISH_CALL_SITES=5
+if [[ "$TENSORMAP_MODE" == "shared" ]]; then
+    # shared nonwinner 在 caller 内直接收尾，因此 AIC 只保留
+    # Alloc/QK/PV，AIV 只保留 Alloc/SF/UP 三条跨 TU winner finish。
+    # 入口已经把 role 作为 SSA 常量传入 Claim，错误核型的两个调用点
+    # 必须被后端删除。
+    SPLIT_FINISH_CALL_SITES=3
+else
+    # private 五类 task 都要完成每核 eager TensorMap/Materialize；
+    # 即使 Claim 不参与，仍必须跨 TU 进入通用 finish。
+    SPLIT_FINISH_CALL_SITES=5
+fi
 if [[ "$SPLIT_FINISH" -eq 1 ]]; then
     COMMON_FLAGS+=(
         -mllvm -cce-block-local-relocate=true
@@ -382,7 +392,7 @@ check_split_role_objects() {
     done
     if [[ "$(text_relocation_count_for_symbol "$caller" "$finish_symbol")" -ne \
           "$SPLIT_FINISH_CALL_SITES" ]]; then
-        echo "Caller must contain exactly $SPLIT_FINISH_CALL_SITES all-task finish .rela.text relocations: $caller" >&2
+        echo "Caller must contain exactly $SPLIT_FINISH_CALL_SITES role-compatible finish .rela.text relocations: $caller" >&2
         exit 1
     fi
     if [[ "$(text_relocation_count_for_symbol "$caller" "$state_symbol")" -eq 0 ]]; then

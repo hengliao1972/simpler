@@ -800,7 +800,7 @@ struct ClaimOutcome {
 
 template <typename Ops>
 PA_DEVICE ClaimOutcome Claim(
-    PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_id, TaskKind kind,
+    PA_GM SchedulerState *state, CoreRole role, uint32_t task_id, TaskKind kind,
     LocalStats &stats
 ) {
     // Claim 在单调 cursor 上执行 atomicMax。private/Cube/Alloc 使用
@@ -808,6 +808,8 @@ PA_DEVICE ClaimOutcome Claim(
     // cursor。同一 task 只有观察到旧值更小的竞争者获胜。
     // Alloc 由全部 96 个 worker 竞争；QK/PV 仅 32 个 AIC、
     // SF/UP 仅 64 个 AIV 发 atomicMax。
+    // role 来自 RunSchedulerImpl 的入口 SSA 值；不能在每个 task 中再从
+    // WorkerState GM 回读同一字段，否则 B256 会产生 98,304 次冗余读取。
     ClaimOutcome outcome{false, false, 0, -1};
     if (task_id >= kTaskCellCapacity) {
         return outcome;
@@ -834,11 +836,11 @@ PA_DEVICE ClaimOutcome Claim(
             return outcome;
         }
         if ((core_mask & 1U) != 0) {
-            if (worker.role != CoreRole::Aic) return outcome;
+            if (role != CoreRole::Aic) return outcome;
             cursor = &state->cube_cursor[task_id % kCursorShards];
             outcome.function_id = aic_kernel;
         } else if ((core_mask & 6U) != 0) {
-            if (worker.role != CoreRole::Aiv) return outcome;
+            if (role != CoreRole::Aiv) return outcome;
 #if PTO_FDWIC_SHARED_MAP
             cursor = &state->shared_map.shared_vector_cursor[
                 task_id % kSharedVectorCursorShards
@@ -3973,7 +3975,8 @@ PA_DEVICE uint32_t FinishSplitCallbackSubmitFromRuntime(
 
 template <TaskKind Kind, typename Ops, bool Profile, typename PmuContext>
 PA_DEVICE bool SubmitCallbackTask(
-    PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_count,
+    PA_GM SchedulerState *state, PA_GM WorkerState &worker, CoreRole role,
+    uint32_t task_count,
     PaOrchestrationState &orch, TaskArgs &args, uint32_t batch,
     SubmitContext &context, LocalStats &stats, PmuContext &pmu_context
 #if PTO_FDWIC_SHARED_MAP
@@ -4050,7 +4053,7 @@ PA_DEVICE bool SubmitCallbackTask(
     const uint64_t claim_begin = efdrain_end;
     BeginSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
     const ClaimOutcome claim =
-        Claim<Ops>(state, worker, task_id, Kind, stats);
+        Claim<Ops>(state, role, task_id, Kind, stats);
     context.won = claim.won;
     context.kernel_id = claim.function_id;
     RecordClaimOutcome(stats, Kind, claim);
@@ -4554,7 +4557,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 break;
             }
             if (!SubmitCallbackTask<TaskKind::Alloc, Ops, Profile>(
-                    state, worker, task_count, orchestration, args,
+                    state, worker, role, task_count, orchestration, args,
                     batch, context, stats, pmu_context,
                     batch_plan, 0
                 )) {
@@ -4570,7 +4573,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 if (!SubmitCallbackTask<
                         TaskKind::Qk, Ops, Profile
                     >(
-                        state, worker, task_count, orchestration,
+                        state, worker, role, task_count, orchestration,
                         args, batch, context, stats, pmu_context,
                         batch_plan,
                         SharedPaTaskOffset(TaskKind::Qk, group)
@@ -4586,7 +4589,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 if (!SubmitCallbackTask<
                         TaskKind::Sf, Ops, Profile
                     >(
-                        state, worker, task_count, orchestration,
+                        state, worker, role, task_count, orchestration,
                         args, batch, context, stats, pmu_context,
                         batch_plan,
                         SharedPaTaskOffset(TaskKind::Sf, group)
@@ -4602,7 +4605,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 if (!SubmitCallbackTask<
                         TaskKind::Pv, Ops, Profile
                     >(
-                        state, worker, task_count, orchestration,
+                        state, worker, role, task_count, orchestration,
                         args, batch, context, stats, pmu_context,
                         batch_plan,
                         SharedPaTaskOffset(TaskKind::Pv, group)
@@ -4618,7 +4621,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 if (!SubmitCallbackTask<
                         TaskKind::Up, Ops, Profile
                     >(
-                        state, worker, task_count, orchestration,
+                        state, worker, role, task_count, orchestration,
                         args, batch, context, stats, pmu_context,
                         batch_plan,
                         SharedPaTaskOffset(TaskKind::Up, group)
@@ -4645,7 +4648,8 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             BeginPaBatchForCallback(orchestration, batch);
             ++stats.result.context_reads;
             if (!SubmitCallbackTask<TaskKind::Alloc, Ops, Profile>(
-                    state, worker, task_count, orchestration, args, batch, context, stats,
+                    state, worker, role, task_count, orchestration, args,
+                    batch, context, stats,
                     pmu_context
                 )) {
                 break;
@@ -4656,7 +4660,8 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 
             PreparePaBlockGroup(orchestration, 0);
             if (!SubmitCallbackTask<TaskKind::Qk, Ops, Profile>(
-                    state, worker, task_count, orchestration, args, batch, context, stats,
+                    state, worker, role, task_count, orchestration, args,
+                    batch, context, stats,
                     pmu_context
                 )) {
                 break;
@@ -4666,7 +4671,8 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             );
 
             if (!SubmitCallbackTask<TaskKind::Sf, Ops, Profile>(
-                    state, worker, task_count, orchestration, args, batch, context, stats,
+                    state, worker, role, task_count, orchestration, args,
+                    batch, context, stats,
                     pmu_context
                 )) {
                 break;
@@ -4676,7 +4682,8 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             );
 
             if (!SubmitCallbackTask<TaskKind::Pv, Ops, Profile>(
-                    state, worker, task_count, orchestration, args, batch, context, stats,
+                    state, worker, role, task_count, orchestration, args,
+                    batch, context, stats,
                     pmu_context
                 )) {
                 break;
@@ -4686,7 +4693,8 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             );
 
             if (!SubmitCallbackTask<TaskKind::Up, Ops, Profile>(
-                    state, worker, task_count, orchestration, args, batch, context, stats,
+                    state, worker, role, task_count, orchestration, args,
+                    batch, context, stats,
                     pmu_context
                 )) {
                 break;

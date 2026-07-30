@@ -3610,3 +3610,48 @@ tests/atomic_probe/pa_scheduler/outputs/
 
 生产源码已恢复到 `aebb69ab`。整体 Submit 与 atomic 计数只作背景，本轮
 裁决完全依据 non-atomic 固定人口证据。
+
+### 13.7 Claim 复用入口 role SSA
+
+**[已保留] 消除 B256 中 98,304 次 WorkerState.role GM 回读**
+
+`RunSchedulerImpl()` 已知 AIC/AIV 入口 role，修改前四种 non-Alloc task
+的 Claim 仍逐次从 GM 读取同一 `worker.role`。现在由
+`SubmitCallbackTask()` 透传入口 SSA role，Claim 不再读取
+`WorkerState`；ClaimMax 类型、地址、候选人口和 `old < task_id` 判定
+不变。
+
+IR 与目标文件证明：
+
+- AIC/AIV hot Claim 的 role GM load/compare/branch 均从 4 降为 0；
+- AIC 只保留 Alloc/QK/PV 三个 ClaimMax，AIV 只保留
+  Alloc/SF/UP 三个；
+- shared 每角色 finish relocation 从 5 精确降为 3，private eager
+  路径仍保持 5；
+- AIC/AIV `.text` 分别缩小 `6.328%/4.632%`，后端栈不变。
+
+CPU shared G0/G2/G4/mixed/B256、CPU private B256、CCEC shared
+full-swimlane/perf-clock、CCEC private 和两次 A5 B256 均通过。动态合同
+仍为 73,728 attempted Claim、1,280 winner、72,448 true-loser、
+49,152 not-attempted。
+
+两份 HEAD 与两份候选的固定人口 non-atomic 对比：
+
+| 指标 | 全核 | AIC | AIV |
+| --- | ---: | ---: | ---: |
+| non-Alloc true-loser Claim outer | **-30.579%** | -26.448% | -31.960% |
+| not-attempted Claim outer | **-85.608%** | -89.907% | -83.675% |
+| non-Alloc true-loser 完整 actor | **-5.230%** | -4.517% | -5.500% |
+| not-attempted 完整 actor | **-16.515%** | -11.323% | -18.978% |
+
+所有区间均扣除 Atomic∪Kernel。full-swimlane Submit、动态 atomic 和三次
+perf-clock 只作运行背景，未参与保留判断。候选产物：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_151659_3926376/ccec/
+  pa_scheduler_shared_swimlane_20260730_151758_3929172/ccec/
+```
+
+完整分段、IR 尺寸、correctness 与 private/shared relocation 差异见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。

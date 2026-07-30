@@ -14432,3 +14432,143 @@ outputs/pa_scheduler_shared_swimlane_20260730_150349_3891554/ccec/
 
 裁决只使用扣除 Atomic∪Kernel 后的固定人口区间。Submit makespan 和动态
 atomic 波动仅作为运行背景，未参与保留或撤回判断。
+
+### 2026-07-30：Claim 复用入口 role SSA（保留）
+
+#### 冗余 GM 读取
+
+`RunSchedulerImpl()` 的 AIC/AIV 入口已经以参数形式取得常量 `role`，随后
+只在初始化时把它写入 `worker.role`。修改前，QK/SF/PV/UP 的每次
+`Claim()` 又从 GM 中读取 `worker.role`，再判断本核是否属于该 task 的
+候选角色。B256/G1 因此产生：
+
+```text
+96 workers × 4 non-Alloc tasks × 256 batches
+= 98,304 次重复 WorkerState.role GM 读取
+```
+
+该读取只筛选是否发出既有 ClaimMax，不参与 cursor 计算、winner 判定或
+任何跨核发布。
+
+#### 修改与构建门槛
+
+本阶段做了三个等价收敛：
+
+- `Claim()` 直接接收 `CoreRole role`，不再接收只为读取 role 而使用的
+  `WorkerState&`；
+- `SubmitCallbackTask()` 从 `RunSchedulerImpl()` 透传入口 SSA role；
+- Claim 独立测试显式传入测试 worker 已设置的 `worker.role`。
+
+CCEC 优化后会删除错误核型的 shared winner finish 调用点，因此构建门槛
+也按真实合同精确区分：
+
+- shared：AIC 只允许 Alloc/QK/PV，AIV 只允许 Alloc/SF/UP，每个 ELF
+  恰好 3 条跨 TU finish relocation；
+- private：五类 task 都要完成每核 eager TensorMap/Materialize，仍恰好
+  保留 5 条 finish relocation。
+
+这不是改变 Claim 人口。源码仍由 96 个 worker 回放全部 task；错误核型
+只在编译后的当前角色镜像中直接成为 not-attempted。
+
+#### IR 与目标文件证明
+
+基线从不可变提交 `e97ebe24` 单独归档编译，候选从最终工作树使用相同
+shared/full-swimlane flags 编译：
+
+| 项目 | AIC 基线 → 候选 | AIV 基线 → 候选 |
+| --- | ---: | ---: |
+| hot Claim role GM load/compare/branch | 4 → 0 | 4 → 0 |
+| 静态 ClaimMax 站点 | 5 → 3（Alloc/QK/PV） | 5 → 3（Alloc/SF/UP） |
+| shared finish relocation | 5 → 3 | 5 → 3 |
+| `.text` | 76,744 → 71,888 B（-6.328%） | 77,368 → 73,784 B（-4.632%） |
+| 主入口 | 75,068 → 70,212 B（-6.469%） | 74,760 → 71,192 B（-4.773%） |
+
+保留下来的 cursor 路由仍是：
+
+- Alloc：`alloc_cursor[task_id % 4]`；
+- QK/PV：`cube_cursor[task_id % 4]`；
+- SF/UP：`shared_vector_cursor[task_id % 8]`。
+
+三个 surviving atomic 的返回值仍直接执行 `old < task_id`。AIC/AIV
+后端栈 CFA 均保持 1952B，`.text.unlikely` 均保持 408B，warning 数不变，
+没有新增异常路径或栈开销。
+
+#### 正确性验证
+
+以下均通过：
+
+- CPU shared 全量构建与所有协议自测；
+- CPU shared G0、G2、G4、mixed `0,8192,8193,32768` 和 B256/G1；
+- CPU private 全量构建与 B256；
+- CCEC shared full-swimlane、perf-clock 以及 private full-swimlane；
+- 两次 A5 B256/G1 完整泳道。
+
+两份 A5 产物为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_151659_3926376/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_151758_3929172/ccec/
+```
+
+两次均保持 96 核、1,280 task、73,728 attempted Claim、1,280 winner、
+72,448 true-loser、49,152 not-attempted、依赖签名
+`b7d985d6edb07078`、drop 0，execution/semantic/postprocess 全部 PASS。
+
+#### 非 atomic 性能证据
+
+对照使用上一保留阶段的两份泳道：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_143901_3820411/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_144239_3829393/ccec/
+```
+
+每个 actor 被严格分为 EfDrain、Claim outer、post-Claim tail 和
+SubmitTransition；每段都扣除与它相交的 Atomic∪Kernel 区间并集，四段
+之和必须等于完整 actor non-atomic 时间。
+
+直接目标包含四份泳道共同存在的 45,213 个 non-Alloc true-loser，以及
+身份固定的 49,152 个 not-attempted。Claim outer 的结果为：
+
+| 固定人口 | 两份 HEAD mean | 两份候选 mean | 两份均值变化 |
+| --- | ---: | ---: | ---: |
+| non-Alloc true-loser 全核 | 59.997/59.527 ns | 41.490/41.485 ns | **-30.579%** |
+| non-Alloc true-loser AIC | 46.967/46.752 ns | 34.477/34.456 ns | **-26.448%** |
+| non-Alloc true-loser AIV | 66.114/65.524 ns | 44.782/44.784 ns | **-31.960%** |
+| not-attempted 全核 | 32.258/32.295 ns | 4.626/4.664 ns | **-85.608%** |
+| not-attempted AIC | 29.895/30.177 ns | 3.032/3.031 ns | **-89.907%** |
+| not-attempted AIV | 33.440/33.354 ns | 5.424/5.480 ns | **-83.675%** |
+
+完整 actor non-atomic 没有发生局部收益被其他区域吞掉的问题：
+
+| 固定人口 | 两份 HEAD mean | 两份候选 mean | 两份均值变化 |
+| --- | ---: | ---: | ---: |
+| non-Alloc true-loser 全核 | 399.642/397.252 ns | 378.315/376.902 ns | **-5.230%** |
+| non-Alloc true-loser AIC | 343.223/342.787 ns | 327.536/327.489 ns | **-4.517%** |
+| non-Alloc true-loser AIV | 426.127/422.819 ns | 402.153/400.097 ns | **-5.500%** |
+| not-attempted 全核 | 352.097/352.029 ns | 294.493/293.346 ns | **-16.515%** |
+| not-attempted AIC | 339.015/340.705 ns | 302.013/300.742 ns | **-11.323%** |
+| not-attempted AIV | 358.638/357.691 ns | 290.733/289.649 ns | **-18.978%** |
+
+全核分段均值变化如下：
+
+| 固定人口 | EfDrain | Claim outer | post-Claim tail | SubmitTransition | 完整 actor |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| non-Alloc true-loser | -8.065% | **-30.579%** | +10.877% | -3.989% | **-5.230%** |
+| not-attempted | -1.468% | **-85.608%** | -31.608% | +2.106% | **-16.515%** |
+
+true-loser tail 的增长被完整披露，但完整 actor 仍在两种角色上稳定改善。
+把 Alloc true-loser 负对照也纳入后，68,784 个共同 true-loser 的完整
+non-atomic 时间仍改善 `5.334%`；AIC/AIV 分别改善
+`1.786%/6.775%`。
+
+候选 full-swimlane Submit 为 `2,304.638/2,357.062 us`，动态 atomic
+logical calls 为 `187,746/183,642`。三次 perf-clock 为
+`2,304.456/2,327.258/2,289.625 us`。这些值只记录运行背景，不参与
+本阶段裁决。
+
+#### 决策
+
+本阶段保留。它删除了 98,304 次确定冗余的 GM role 读取，IR、精确
+relocation 和动态 Claim 人口共同证明 atomic 协议未变；AIC/AIV 的直接
+Claim non-atomic 与完整 actor non-atomic 都重复改善。

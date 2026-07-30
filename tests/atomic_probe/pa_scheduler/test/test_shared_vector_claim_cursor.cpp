@@ -203,7 +203,10 @@ bool RunConcurrentClaim(SchedulerState &state, uint32_t task_id, TaskKind kind) 
             ready.fetch_add(1, std::memory_order_release);
             while (!start.load(std::memory_order_acquire)) {}
             LocalStats stats{};
-            evidence[worker_id].outcome = Claim<ClaimTestOps>(&state, worker, task_id, kind, stats);
+            evidence[worker_id].outcome =
+                Claim<ClaimTestOps>(
+                    &state, worker.role, task_id, kind, stats
+                );
             evidence[worker_id].fetch_max_calls = ClaimTestOps::fetch_max_calls;
             evidence[worker_id].fetch_max_address = ClaimTestOps::last_fetch_max_address;
         });
@@ -268,7 +271,10 @@ void TestAllTaskKindsUseCursorClaim() {
     replay_worker.core_idx = 1;
     ClaimTestOps::ResetThreadTrace();
     LocalStats replay_stats{};
-    const ClaimOutcome replay = Claim<ClaimTestOps>(state, replay_worker, kTaskIds[1], TaskKind::Qk, replay_stats);
+    const ClaimOutcome replay = Claim<ClaimTestOps>(
+        state, replay_worker.role, kTaskIds[1],
+        TaskKind::Qk, replay_stats
+    );
     exact &= replay.attempted && !replay.won && replay.function_id == -1 && ClaimTestOps::fetch_max_calls == 1 &&
              ClaimTestOps::last_fetch_max_address == ExpectedClaimAddress(*state, kTaskIds[1], TaskKind::Qk) &&
              state->fatal.value == 0 && CursorsMatch(*state, expected);
