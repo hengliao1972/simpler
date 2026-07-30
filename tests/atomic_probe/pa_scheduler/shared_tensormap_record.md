@@ -13830,3 +13830,73 @@ transition 和 tail 的收益部分转化成 Claim 竞争。它说明这不是�
 
 后续若继续消减 true-loser，应在保留本项端到端收益的基础上处理
 Claim 到达聚集，不能重新加入 descriptor 恢复工作来人为拉散 worker。
+
+### 2026-07-30：Claim 前准备 stable output symbol（撤回）
+
+#### 候选边界
+
+本地过程态曾把 shared 路径的 `PrepareSharedTaskOutputs()` 从 Claim 后
+移动到 Claim 前。该函数只根据已经校验的 `task_id` 和 task kind 构造稳定
+的 `(producer_task_id, output_slot)` 引用，因此移动前后功能结果相同，
+也不改变：
+
+- 原始 `96/32/64` Claim 候选资格；
+- `73,728` 次逻辑 Claim、`1,280` 个 winner 和 `72,448` 个
+  true-loser；
+- FetchMax 的种类、地址和调用次数；
+- TensorMap、writer history、heap、fanin 和 kernel 执行协议。
+
+这个候选没有删除指令。它只是让所有 actor 在 FetchMax 前先执行原本
+Claim 后必做的 stable output 准备，希望利用真实本地工作拉开到达时间。
+因此它本质上是 Claim 到达形态实验，不是非 atomic 工作消减。
+
+#### 已有验证
+
+CPU 门槛、CCEC 构建和 A5 B256 正确性均通过。8＋8 个平衡交错的
+perf-clock 进程为：
+
+| 构建 | mean | median |
+| ---- | ---: | -----: |
+| 移动前 | 2,304.620 us | 2,299.707 us |
+| Claim 前准备 | 2,295.809 us | 2,295.780 us |
+| 变化 | -0.382% | -0.171% |
+
+四个对称区组中三个改善，但幅度较小。
+
+完整泳道位于：
+
+`outputs/pa_scheduler_shared_swimlane_20260730_120118_3576480/ccec`
+
+该图为 B256/G1、PASS、drop 0，Submit makespan 为 `2,429.428 us`。
+与保留的 context-lens 直读泳道
+`outputs/pa_scheduler_shared_swimlane_20260730_113145_3544887/ccec`
+使用相同的 `72,448` 个 true-loser。两图的 true-loser 分项为：
+
+| 区域 | 移动前 | Claim 前准备 | 变化 |
+| ---- | -----: | -----------: | ---: |
+| EfDrain control | 12.198 ms | 14.065 ms | +15.31% |
+| Claim atomic bracket | 74.370 ms | 65.980 ms | -11.28% |
+| Claim 外层 | 6.846 ms | 8.879 ms | +29.70% |
+| post-Claim tail | 11.298 ms | 11.675 ms | +3.34% |
+| SubmitTransition | 12.656 ms | 12.206 ms | -3.56% |
+| true-loser control 合计 | 117.369 ms | 112.805 ms | -3.89% |
+
+把 atomic bracket 排除后，四个非 atomic 区域从约 `42.998 ms`
+增加到约 `46.825 ms`，回退约 `8.90%`。完整 true-loser 的下降来自
+FetchMax bracket 缩短，不是 scalar 外壳被消减；同时 Claim 父区间也不再
+保持“轻量外壳包围 Claim atomic”的清晰业务边界。
+
+#### 决策
+
+该过程态撤回，生产代码恢复为 Claim 后准备 stable output symbol。
+
+原因不是正确性失败，而是：
+
+1. 没有减少非 atomic 指令，只是移动工作；
+2. 已观察到的主要收益来自 atomic 到达离散度，属于另一个优化课题；
+3. 非 atomic true-loser 累计工作反而增加；
+4. 它会污染 Claim 泳道和 Claim PMU 的业务边界；
+5. `-0.171%` 的 perf-clock 中位数不足以抵消上述分析歧义。
+
+后续非 atomic loser 优化从保留的 `fd463c4c` 基线继续，不再通过在
+FetchMax 前插入额外工作来人为拉散 Claim。
