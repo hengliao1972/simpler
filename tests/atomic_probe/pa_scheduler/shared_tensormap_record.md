@@ -13306,3 +13306,100 @@ not-attempted 同样不再物化 ticket，固定 49,152 个 actor 的 tail 累�
 
 后续 Submit transition 必须单独实验，不能把本阶段 tail 收益与下一批
 公共 orchestration 工作混在同一个提交中。
+
+### 2026-07-30：直接读取 context_lens backing pointer（已撤回）
+
+#### 候选与理论收益
+
+`InitPaOrchestration` 同时保存 `context_lens_data` GM 指针，并用它初始化
+`start_offset=0 / stride=1 / Int32` 的 descriptor。候选把每批一次的
+`ReadPaContextLength` 从 descriptor 地址恢复：
+
+`buffer_addr + (start_offset + batch * stride) * sizeof(int32_t)`
+
+收敛为 `context_lens_data[batch]`。两种写法仍对同一 GM backing store
+执行一次 `volatile` load，不缓存 context 值，也不改变 batch、task plan、
+Claim 资格或 winner 协议。
+
+CPU 定向用例用 `0、8192、8193、32768` 四种长度逐批核对 sequence 和
+block 数，并覆盖 null fallback。CPU shared/private 回放、CCEC 构建以及
+A5 B256 完整泳道均通过。候选 perf-clock caller object 的 text 相比
+ticket-only 基线缩小：
+
+| role | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| AIC | 46,572 B | 43,332 B | -3,240 B |
+| AIV | 48,036 B | 44,708 B | -3,328 B |
+
+这说明 descriptor 恢复被多处内联，候选确实消除了实际机器码，而不是
+只做源码等价改写。
+
+#### perf-clock 与局部 transition
+
+冻结 `4e021065` 的 ticket-only ELF，与候选按平衡顺序运行 12+12 个
+B256 独立进程。所有样本都保持 Claim `73,728`、winner `1,280` 并通过
+完整语义校验：
+
+| 构建 | mean | median | 范围 |
+| --- | ---: | ---: | ---: |
+| ticket-only 基线 | 2,309.301 us | 2,309.364 us | 2,293.732～2,320.464 us |
+| direct context load | 2,297.982 us | 2,292.021 us | 2,275.248～2,369.568 us |
+| 变化 | -11.319 us / -0.490% | -17.343 us / -0.751% | — |
+
+完整泳道也精确定位到预期位置。每个 worker 只在 UP 结束后进入下一批
+`BeginPaBatch`，三组 A/B 中：
+
+- AIV UP true-loser transition mean 稳定下降约 `54.9%～55.3%`；
+- AIC UP not-attempted transition mean 稳定下降约 `74.5%～74.8%`；
+- AIV UP winner transition mean 稳定下降约 `54.1%～54.3%`；
+- 第一组全部 UP actor 的 transition 累计减少 `10.194 ms core-time`，
+  占全体 actor transition 减少量的 `92.64%`。
+
+因此“直接读取消除了 UP→下一 batch 的地址恢复”已经由代码、机器码和
+局部时间三条证据共同证明。
+
+#### 三组完整泳道暴露的 Claim 反噬
+
+局部变短没有直接作为保留依据。三组 B256/G1、完整 atomic+DCCI 泳道
+均为原始 `96/32/64` 合同、Claim `73,728`、winner `1,280`、
+true loser `72,448`、not-attempted `49,152`、drop 0。按固定 actor
+口径比较结果如下：
+
+| A/B | Submit | AIV UP true-loser transition | true-loser Claim | true-loser control 合计 | 全部 nonwinner control |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `050015 → 070835` | -0.395% | -55.27% | +36.99% | **+11.90%** | **+5.45%** |
+| `071708 → 071608` | -3.067% | -54.90% | +30.34% | **+8.74%** | **+3.19%** |
+| `071816 → 071909` | -3.379% | -54.96% | +30.50% | **+8.72%** | **+2.98%** |
+
+第二行按时间顺序先跑候选、后跑基线，表中仍统一写成“基线→候选”。
+三组方向和幅度接近：公共 batch 前缀变短后，更多 worker 更集中地到达
+下一批 Alloc Claim；节省的 transition 时间转化为更长的 Claim 原子竞争。
+这是由重复分项结果支持的解释，不把它冒充硬件流水级证明。
+
+三组对应产物：
+
+- ticket-only 基线：
+  `outputs/pa_scheduler_shared_swimlane_20260730_050015_3301011/ccec`
+- 候选一：
+  `outputs/pa_scheduler_shared_swimlane_20260730_070835_3358670/ccec`
+- 候选二：
+  `outputs/pa_scheduler_shared_swimlane_20260730_071608_3366422/ccec`
+- 相邻基线二：
+  `/home/q00473782/atomic/private/gpt/simpler-context-direct-baseline/`
+  `tests/atomic_probe/pa_scheduler/outputs/`
+  `pa_scheduler_shared_swimlane_20260730_071708_3367494/ccec`
+- 相邻基线三：
+  `/home/q00473782/atomic/private/gpt/simpler-context-direct-baseline/`
+  `tests/atomic_probe/pa_scheduler/outputs/`
+  `pa_scheduler_shared_swimlane_20260730_071816_3368416/ccec`
+- 候选三：
+  `outputs/pa_scheduler_shared_swimlane_20260730_071909_3369196/ccec`
+
+#### 决策
+
+本候选撤回，生产代码和定向测试均不保留，只保留本节实验记录。理由是
+当前目标明确要求减少 loser 控制时间：即使 perf-clock 和 Submit
+makespan 更短，也不能接受 true-loser control 连续回退
+`8.72%～11.90%`。后续 Claim 优化若能消除这种到达聚集反噬，可以重新
+评估 direct context load；在此之前不能把“局部 transition 变短”写成
+完整 loser 优化。
