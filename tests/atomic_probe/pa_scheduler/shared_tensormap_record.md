@@ -13050,3 +13050,90 @@ loser 优化的 perf-clock 权威基线。
 GCC 15.0.1 与本机 binutils 2.42 在生成 `.base64` 汇编伪指令时不兼容；
 CPU `perf-clock` 还触发当前基线 `pa_trace.h` 的 trace-free 未使用变量
 告警。这两项既有工具链问题没有混入 Claim 协议修改。
+
+### 2026-07-30：单槽 EfDrain 隔次轮询实验（已撤回）
+
+#### 实验动机与边界
+
+恢复 `96/32/64` Claim 合同后，继续只处理 loser 的高频控制工作，不再
+取消任何 worker 的 winner 资格。候选针对 Submit 开头的 opportunistic
+EfDrain：本核只有一个 winning slot、完整轮询后 fanin 仍未就绪时，下一
+个 Submit 跳过一次，再下一个 Submit 强制重试。提示位复用
+`WorkerState::payload_padding[0]`，没有扩大状态、raw 或 ABI。
+
+两槽、RingBackpressure 和 FinalDrain 都强制 drain；CPU 定向门槛覆盖：
+
+- 单槽 `poll → skip → poll`，依赖 ready 后最多多等一个 Submit；
+- 两槽都 ready 时不允许跳过；
+- 两槽只释放一槽后，剩余单槽下一次必须立即 poll，不能继承旧提示；
+- RingBackpressure 清除旧提示并强制取得进展；
+- private 预处理后完全不包含该状态机。
+
+CPU shared/private 全套和 CCEC perf-clock/full-swimlane 构建均通过。
+A5 B256 的 73,728 次 Claim、1,280 个 winner、依赖签名、TensorMap、
+heap、completion 和真实计算全部闭合。
+
+#### perf-clock：端到端没有回退
+
+使用原始 `e9f59d16` 冻结 ELF 和精确候选源码做 8+8 个独立 B256
+进程交错对照：
+
+| 构建 | mean | median | 范围 | fanin load mean |
+| --- | ---: | ---: | ---: | ---: |
+| 原始 EfDrain | 2310.302 us | 2310.663 us | 2287.803～2332.899 us | 35,556.25 |
+| 单槽隔次轮询 | 2300.023 us | 2297.309 us | 2281.760～2321.098 us | 22,387.13 |
+| 变化 | -0.445% | -0.578% | — | **-37.04%** |
+
+候选没有触发端到端 `+2%` 撤销线，但本阶段目标是减少 loser 控制时间；
+端到端中性或略快不能代替泳道归因。
+
+#### 同时段完整泳道：EfDrain 收益被 Alloc Claim 竞争反噬
+
+原始合同基线：
+
+`/home/q00473782/atomic/private/gpt/simpler-original-claim-perf-clock/`
+`tests/atomic_probe/pa_scheduler/outputs/`
+`pa_scheduler_shared_swimlane_20260730_040655_3254297/ccec`
+
+精确候选：
+
+`outputs/pa_scheduler_shared_swimlane_20260730_040839_3255446/ccec`
+
+两图都是 B256/G1、`96/32/64`、完整 atomic+DCCI 泳道，均 PASS、
+drop 0。基线/候选 Submit 分别为 `2448.100/2359.525 us`，fanin load
+为 `36,739/20,598`。按 Claim 的 attempted 位继续拆开，固定人口为
+72,448 个 true loser 和 49,152 个 role 不匹配的 not-attempted：
+
+| true-loser 控制区域 | 原始 EfDrain | 单槽隔次轮询 | 变化 |
+| --- | ---: | ---: | ---: |
+| EfDrain 控制部分 | 13.699 ms | 10.517 ms | **-23.23%** |
+| Claim | 60.916 ms | 86.357 ms | **+41.76%** |
+| Claim 后轻量收尾 | 16.066 ms | 10.637 ms | -33.79% |
+| Submit 后续 task 切换 | 17.936 ms | 17.277 ms | -3.67% |
+| true-loser 控制合计 | 108.617 ms | 124.788 ms | **+14.89%** |
+
+not-attempted 控制时间从 `31.595 ms` 降至 `24.115 ms（-23.68%）`，
+因此把两类非 winner 混在一起只看到 `140.212 → 148.903 ms
+（+6.20%）`，会弱化 true loser 的实际回退，不能用作保留理由。
+
+Claim 按 task 类型继续拆分：
+
+| task | true-loser Claim 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| Alloc | 36.603 ms | 62.087 ms | **+69.62%** |
+| QK | 3.819 ms | 3.408 ms | -10.76% |
+| SF | 8.006 ms | 8.764 ms | +9.47% |
+| PV | 3.798 ms | 3.405 ms | -10.35% |
+| UP | 8.690 ms | 8.694 ms | +0.05% |
+
+Claim 源码和 73,728 次调用数都没有变化。与更早的一组独立泳道中
+`EfDrain -25.60% / Claim +38.75% / loser 控制 +5.35%` 的方向一致，
+因此不是单次异常。最符合现有证据的解释是：隔次跳过 fanin poll 后，
+更多 worker 更接近同一时刻抵达下一次 Claim；Alloc 由全部 96 核竞争，
+对这种到达聚集最敏感，于是原子长尾吞掉 EfDrain 收益。这是由分项和
+重复实验支持的因果推断，不把它冒充硬件流水级证明。
+
+本候选按预登记目标撤回：它减少了 fanin load 和 not-attempted 外壳，
+但 true-loser 控制时间增加 `14.89%`。后续 EfDrain 优化不能只减少轮询
+次数，还必须保持或增加到达 Claim 的时间离散度；否则只是在两个 atomic
+热点之间搬移等待。
