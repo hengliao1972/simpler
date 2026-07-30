@@ -14233,3 +14233,116 @@ logical calls 为 `193,117/193,802`。这些数值只记录运行背景；本阶
 本阶段保留。它删除了 nonwinner 确定无消费者的纯 scalar 状态派生，
 全核直接目标区重复改善约 6.7%，AIV 固定人口改善约 12%，同时保持动态
 G2/G4、B256 和 private 合同闭合。AIC 局部回退作为后续优化约束完整保留。
+
+### 2026-07-30：loser 不再解码同 TU 自生成 task meta（保留）
+
+#### 重复工作的来源
+
+shared 的每个 actor 在 `SubmitCallbackTask<Kind>()` 中先通过
+`SharedPaPlannedTaskAt()` 取得并校验动态计划：
+
+- 计划中的 `kind` 必须等于编译期模板参数 `Kind`；
+- `task_id` 必须等于 `batch_start + task_offset`；
+- `shared_is_last_submit` 必须同时满足“本批最后一个 task”和“最后一批”。
+
+修改前，调用点随后把这些已知量编码到 `shared_task_meta`。winner 需要把
+编码放进 16B `CallbackSubmitTicket`，跨 TU 的 finish 会重新解码并校验，
+这条 ABI 不能删除。但 nonwinner 不跨 TU，却仍在
+`FinishSharedLoserSubmit()` 中立即解码同一函数刚生成的字节：
+
+```text
+validated plan
+→ EncodeSharedPaTaskMeta
+→ Claim
+→ loser DecodeSharedPaTaskMeta
+→ SharedPaTaskOffset
+→ 只消费 kind 与 is_last_submit
+```
+
+Decode 恢复出的 `group_index/batch_start/has_following_group/chained_writer`
+都没有 loser 消费者，`SharedPaTaskOffset()` 也只用于生成未被读取的
+`batch_start`。
+
+#### 修改后的合同
+
+本阶段只改同 TU loser：
+
+- `FinishSharedLoserSubmit` 以 `TaskKind Kind` 模板参数校验 function 和
+  output count；
+- 调用点直接传已经校验的 `shared_is_last_submit`；
+- `CloseSharedCallbackSubmit` 的公共入口只接收它实际消费的
+  `is_last_submit`；
+- winner 仍编码完整 ticket，split binding、跨 TU Decode、ticket 大小和
+  `reserved` 字节语义全部不变；
+- Claim、atomic 类型/地址/调用点、候选人口、TensorMap 和 Build 都不变。
+
+这里必须传 `shared_is_last_submit`，不能只传
+`shared_planned_task.is_last_in_batch`。后者在多批场景中会把每一批的
+末 task 都误判为完整回放的最后一个 Submit。最终
+`FinalizeSharedReplayTaskCount()` 仍要求声明的末次 task 数与实际
+`worker.local_index` 完全一致。
+
+#### 正确性与构建验证
+
+以下均通过：
+
+- CPU shared 全量自测，包含 loser 零 TensorMap 访问门槛；
+- CPU shared G0，验证单个 Alloc 同时是最后一个 Submit；
+- CPU mixed `0,8192,8193,32768`，验证累计 batch start 和唯一全局末次；
+- CPU shared G2、G4、B256/G1；
+- CPU private 全量构建与自测；
+- CCEC shared full-swimlane 的 AIC/AIV、split runtime/finish、mixed ELF
+  与 manifest；
+- 两次 A5 B256/G1 完整泳道，均为 96 核、1,280 tasks、
+  73,728 attempted Claim、1,280 winner、72,448 true-loser、
+  49,152 not-attempted、drop 0，业务语义和后处理全部 PASS。
+
+候选泳道为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_143901_3820411/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_144239_3829393/ccec/
+```
+
+对照使用上一提交的两份泳道：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_141916_3768782/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_142626_3783564/ccec/
+```
+
+#### 直接非 atomic 收益
+
+直接目标是 `Claim.end → Submit.end` 的 post-Claim loser tail。对四份 raw
+逐 `(core,task)` 重新核对后，该区间内的 Atomic 和 Kernel 交集事件数均为
+0，因此下表不含 atomic 波动，也没有把计算 kernel 算成 scalar 收益。
+
+true-loser 使用四份泳道共同存在的 68,755 个固定 `(core,task)`；
+not-attempted 的 49,152 个键天然完全固定：
+
+| 人口 | HEAD-1 mean | HEAD-2 mean | 候选-1 mean | 候选-2 mean | 候选相对 HEAD |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| true-loser 全核 | 117.451 ns | 117.337 ns | 94.077 ns | 93.947 ns | **-19.82%～-20.01%** |
+| true-loser AIC | 135.717 ns | 135.639 ns | 107.415 ns | 107.488 ns | **-20.75%～-20.85%** |
+| true-loser AIV | 108.512 ns | 108.380 ns | 87.549 ns | 87.320 ns | **-19.22%～-19.53%** |
+| not-attempted 全核 | 130.785 ns | 130.612 ns | 101.967 ns | 101.843 ns | **-21.93%～-22.13%** |
+| not-attempted AIC | 112.296 ns | 112.291 ns | 82.927 ns | 82.983 ns | **-26.10%～-26.15%** |
+| not-attempted AIV | 140.029 ns | 139.773 ns | 111.487 ns | 111.273 ns | **-20.24%～-20.54%** |
+
+固定 true-loser 的尾部 core-time 合计由
+`8,075.347/8,067.480 us` 降到 `6,468.260/6,459.317 us`，全核中位数
+由两次均约 `92 ns` 降到 `85 ns`。not-attempted 合计由
+`6,428.336/6,419.849 us` 降到 `5,011.877/5,005.792 us`，中位数由
+`127 ns` 降到 `92 ns`。
+
+两次候选 Submit makespan 为 `2,342.289/2,357.050 us`，动态 atomic
+logical calls 为 `185,637/186,579`；两份 HEAD 对应为
+`2,339.415/2,322.304 us` 和 `193,117/193,802`。这些值只说明调度到达
+形态和 atomic 竞争发生了波动，不参与本阶段去留。判据只采用上面没有
+Atomic/Kernel 交集的固定人口 loser tail。
+
+#### 决策
+
+本阶段保留。它只删除 loser 同 TU 的纯 scalar 自编码回读，两个角色、
+true-loser 与 not-attempted 均重复改善约 19%～26%；winner ticket ABI、
+atomic 协议和业务正确性没有变化。

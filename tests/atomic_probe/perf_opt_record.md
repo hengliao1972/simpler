@@ -3536,3 +3536,37 @@ tests/atomic_probe/pa_scheduler/outputs/
 完整非 atomic 闭合、动态 G2/G4 证明、背景 Submit/atomic 数据和角色
 差异见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.5 loser 直接复用已校验 task 元信息
+
+**[已保留] 去掉同 TU loser 的 task-meta Decode/Offset**
+
+shared 调用点已经用 `SharedPaPlannedTaskAt()` 校验计划、模板 `Kind`、
+task ID 和全局末次 Submit。修改前 nonwinner 仍会解码同一函数刚编码的
+ticket 字节，并计算没有消费者的 group/batch 派生量。现在 loser 直接
+使用模板 `Kind` 和 `shared_is_last_submit`；winner 的 16B ticket、跨 TU
+Decode、Claim 和所有 atomic 合同保持不变。
+
+CPU shared G0/G2/G4/mixed/B256、CPU private、CCEC split 构建和两次 A5
+B256 完整语义全部通过。直接 `Claim.end → Submit.end` loser tail 中，
+四份对照的 Atomic/Kernel 交集事件数均为 0：
+
+| 固定人口 | 两份 HEAD mean | 两份候选 mean | 变化 |
+| --- | ---: | ---: | ---: |
+| 68,755 个共同 true-loser | 117.451/117.337 ns | 94.077/93.947 ns | **-19.82%～-20.01%** |
+| 49,152 个 not-attempted | 130.785/130.612 ns | 101.967/101.843 ns | **-21.93%～-22.13%** |
+
+AIC/AIV 的 true-loser 分别改善约 20.8%/19.4%，not-attempted 分别改善
+约 26.1%/20.4%。整体 Submit 与动态 atomic 数只作运行背景，不参与
+本阶段去留。
+
+候选泳道：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_143901_3820411/ccec/
+  pa_scheduler_shared_swimlane_20260730_144239_3829393/ccec/
+```
+
+完整调用链、全角色数据和正确性证明见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。

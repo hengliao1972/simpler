@@ -3433,14 +3433,13 @@ template <typename Ops, bool Profile>
 PA_DEVICE bool CloseSharedCallbackSubmit(
     PA_GM SchedulerState *state, LocalStats &stats,
     uint32_t task_id, uint64_t submit_begin,
-    const SharedPaTaskMeta &shared_task_meta
+    bool is_last_submit
 ) {
     ++stats.result.submits;
 
-    // shared 的总 task 数取决于每批 context_len。末次身份由调用者在
-    // 既有 ticket bit 中显式携带，避免 96 个 worker 为了一个计时边界
-    // 额外预扫整份 context_lens。
-    const bool is_last_submit = shared_task_meta.is_last_submit;
+    // shared 的总 task 数取决于每批 context_len。winner 从 ticket 恢复
+    // 末次身份，同 TU loser 直接使用已经校验的 batch plan 结果，避免
+    // 96 个 worker 为了一个计时边界额外预扫整份 context_lens。
 #if PA_BUILD_PERF_CLOCK
     // 与真实 FDWIC perf-clock 相同：只有末个逻辑 Submit 完成后才读取
     // 一次专用性能边界；loser 也必须闭合自己的全量重放窗口。
@@ -3483,27 +3482,22 @@ PA_DEVICE bool CloseSharedCallbackSubmit(
     // task_id/submit_begin，避免迫使同 TU loser 也物化该 POD。
     return CloseSharedCallbackSubmit<Ops, Profile>(
         state, stats, ticket.task_id, ticket.submit_begin,
-        shared_task_meta
+        shared_task_meta.is_last_submit
     );
 }
 
-template <typename Ops, bool Profile>
+template <TaskKind Kind, typename Ops, bool Profile>
 PA_DEVICE bool FinishSharedLoserSubmit(
     PA_GM SchedulerState *state, SubmitContext &context,
     LocalStats &stats, uint32_t task_id,
     int32_t function_id, bool won,
-    uint8_t encoded_task_meta,
+    bool is_last_submit,
     uint64_t submit_begin
 ) {
-    SharedPaTaskMeta shared_task_meta{};
     const bool valid =
         !won &&
-        DecodeSharedPaTaskMeta(
-            encoded_task_meta, task_id, shared_task_meta
-        ) &&
         SharedPaFunctionIdMatches(
-            shared_task_meta.kind, false,
-            function_id
+            Kind, false, function_id
         ) &&
         context.task_id == static_cast<int32_t>(task_id) &&
         !context.won &&
@@ -3511,7 +3505,7 @@ PA_DEVICE bool FinishSharedLoserSubmit(
         context.shared_result.TaskId() ==
             static_cast<int32_t>(task_id) &&
         context.shared_result.Size() ==
-            FrontendTaskOutputCount(shared_task_meta.kind);
+            FrontendTaskOutputCount(Kind);
     if (!valid) {
         SetFatal<Ops>(
             state, stats, static_cast<int32_t>(task_id)
@@ -3523,7 +3517,7 @@ PA_DEVICE bool FinishSharedLoserSubmit(
     // fanin lookup 与 Build 全部只属于 Claim owner；loser 不读取任何
     // TensorMap 控制字，也不再等待 writer-ready 门。
     return CloseSharedCallbackSubmit<Ops, Profile>(
-        state, stats, task_id, submit_begin, shared_task_meta
+        state, stats, task_id, submit_begin, is_last_submit
     );
 }
 
@@ -4130,10 +4124,10 @@ PA_DEVICE bool SubmitCallbackTask(
         return false;
     }
     if (!claim.won) {
-        return FinishSharedLoserSubmit<Ops, Profile>(
+        return FinishSharedLoserSubmit<Kind, Ops, Profile>(
             state, context, stats, task_id,
             claim.function_id, claim.won,
-            shared_task_meta, submit_begin
+            shared_is_last_submit, submit_begin
         );
     }
     // 只有 winner 才跨 TU；把 16B ticket 的物化下沉到本分支，loser
@@ -4168,10 +4162,10 @@ PA_DEVICE bool SubmitCallbackTask(
 #else
 #if PTO_FDWIC_SHARED_MAP
     if (!claim.won) {
-        return FinishSharedLoserSubmit<Ops, Profile>(
+        return FinishSharedLoserSubmit<Kind, Ops, Profile>(
             state, context, stats, task_id,
             claim.function_id, claim.won,
-            shared_task_meta, submit_begin
+            shared_is_last_submit, submit_begin
         );
     }
     const CallbackSubmitTicket ticket{
