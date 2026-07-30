@@ -289,6 +289,20 @@ std::atomic<uint64_t> SymbolTestOps::wait_loads{0};
 std::atomic<uint64_t> SymbolTestOps::now_calls{0};
 std::atomic<uint64_t> SymbolTestOps::spin_calls{0};
 
+// DrainReady 定向用例只记录实际执行次数；其余原子、时钟与 fence 行为
+// 继续复用 SymbolTestOps，避免为 slot 扫描另造一套调度语义。
+struct DrainTestOps : SymbolTestOps {
+    static uint32_t execute_calls;
+
+    static void ExecuteKernel(
+        SchedulerState *, WorkerState &, TaskKind, uint32_t
+    ) {
+        ++execute_calls;
+    }
+};
+
+uint32_t DrainTestOps::execute_calls = 0;
+
 // 定向验证 PA group-writer 只触发一次物理 CAS，且目标固定为 Alloc
 // output cell 的 slot0；通用 symbol helper 继续使用 SymbolTestOps。
 struct GroupWriterCountingOps : SymbolTestOps {
@@ -448,6 +462,169 @@ void TestSharedCompletionPublishesWithoutFrontier() {
     Check(
         stats.result.cas_retries == 0,
         "shared completion adds no hidden frontier CAS retries"
+    );
+    UnmapSparseSchedulerState(state);
+}
+
+void ResetDrainSlots(WorkerState &worker) {
+    for (uint32_t index = 0; index < kPrivateSlots; ++index) {
+        worker.slots[index] = LocalSlot{};
+    }
+    worker.occupied_count = 0;
+}
+
+void PrepareDrainSlot(
+    WorkerState &worker, uint32_t slot_index, uint32_t task_id,
+    TaskKind kind, bool built
+) {
+    LocalSlot &slot = worker.slots[slot_index];
+    slot.occupied = true;
+    slot.built = built;
+    slot.task_id = task_id;
+    slot.kind = KindIndex(kind) - 1;
+    slot.fanin_count = 0;
+    ++worker.occupied_count;
+}
+
+void TestSharedDrainUsesEntryOccupancySnapshot() {
+    SchedulerState *state = MapSparseSchedulerState();
+    if (state == nullptr) {
+        ++g_failures;
+        return;
+    }
+    WorkerState &worker = state->workers[0];
+    worker.heap_next = 4096;
+    LocalStats stats{};
+    DrainTestOps::execute_calls = 0;
+
+    Check(
+        DrainReady<DrainTestOps>(
+            state, worker, DrainPlace::EfDrain, stats
+        ) == 0,
+        "empty shared drain returns without executing a slot"
+    );
+
+    PrepareDrainSlot(worker, 0, 0, TaskKind::Qk, true);
+    Check(
+        DrainReady<DrainTestOps>(
+            state, worker, DrainPlace::EfDrain, stats
+        ) == 1 &&
+            worker.occupied_count == 0 &&
+            !worker.slots[0].occupied &&
+            !worker.slots[0].built &&
+            state->tasks[0].flag == 1 &&
+            state->tasks[0].vend == worker.heap_next &&
+            DrainTestOps::execute_calls == 1,
+        "slot0-only shared drain frees the only occupied slot"
+    );
+
+    ResetDrainSlots(worker);
+    // 空洞 header 故意保留 built/task/kind 毒值，验证 occupied 才是
+    // 是否消费 slot 的唯一入口条件。
+    worker.slots[0].built = true;
+    worker.slots[0].task_id = 16;
+    worker.slots[0].kind = KindIndex(TaskKind::Up) - 1;
+    PrepareDrainSlot(worker, 1, 1, TaskKind::Sf, true);
+    Check(
+        DrainReady<DrainTestOps>(
+            state, worker, DrainPlace::EfDrain, stats
+        ) == 1 &&
+            worker.occupied_count == 0 &&
+            !worker.slots[1].occupied &&
+            !worker.slots[1].built &&
+            state->tasks[1].flag == 1 &&
+            state->tasks[16].flag == 0 &&
+            state->tasks[16].vend == 0 &&
+            DrainTestOps::execute_calls == 2,
+        "shared drain crosses an empty slot0 to find occupied slot1"
+    );
+
+    ResetDrainSlots(worker);
+    PrepareDrainSlot(worker, 0, 2, TaskKind::Pv, false);
+    PrepareDrainSlot(worker, 1, 3, TaskKind::Up, true);
+    Check(
+        DrainReady<DrainTestOps>(
+            state, worker, DrainPlace::EfDrain, stats
+        ) == 1 &&
+            worker.occupied_count == 1 &&
+            worker.slots[0].occupied &&
+            !worker.slots[0].built &&
+            !worker.slots[1].occupied &&
+            !worker.slots[1].built &&
+            state->tasks[2].flag == 0 &&
+            state->tasks[2].vend == 0 &&
+            state->tasks[3].flag == 1 &&
+            DrainTestOps::execute_calls == 3,
+        "unbuilt slot0 does not hide a ready occupied slot1"
+    );
+    worker.slots[0].built = true;
+    Check(
+        DrainReady<DrainTestOps>(
+            state, worker, DrainPlace::EfDrain, stats
+        ) == 1 &&
+            worker.occupied_count == 0 &&
+            !worker.slots[0].occupied &&
+            !worker.slots[0].built &&
+            state->tasks[2].flag == 1 &&
+            DrainTestOps::execute_calls == 4,
+        "remaining slot0 is drained on the next pass"
+    );
+
+    ResetDrainSlots(worker);
+    PrepareDrainSlot(worker, 0, 4, TaskKind::Qk, true);
+    PrepareDrainSlot(worker, 1, 5, TaskKind::Sf, false);
+    Check(
+        DrainReady<DrainTestOps>(
+            state, worker, DrainPlace::EfDrain, stats
+        ) == 1 &&
+            worker.occupied_count == 1 &&
+            !worker.slots[0].occupied &&
+            !worker.slots[0].built &&
+            worker.slots[1].occupied &&
+            !worker.slots[1].built &&
+            state->tasks[4].flag == 1 &&
+            state->tasks[5].flag == 0 &&
+            state->tasks[5].vend == 0 &&
+            DrainTestOps::execute_calls == 5,
+        "freeing slot0 does not mutate the entry snapshot scan boundary"
+    );
+    worker.slots[1].built = true;
+    Check(
+        DrainReady<DrainTestOps>(
+            state, worker, DrainPlace::EfDrain, stats
+        ) == 1 &&
+            worker.occupied_count == 0 &&
+            !worker.slots[1].occupied &&
+            !worker.slots[1].built &&
+            state->tasks[5].flag == 1 &&
+            DrainTestOps::execute_calls == 6,
+        "slot1 remains discoverable after slot0 was freed"
+    );
+
+    ResetDrainSlots(worker);
+    PrepareDrainSlot(worker, 0, 6, TaskKind::Qk, true);
+    PrepareDrainSlot(worker, 1, 7, TaskKind::Sf, true);
+    Check(
+        DrainReady<DrainTestOps>(
+            state, worker, DrainPlace::EfDrain, stats
+        ) == 2 &&
+            worker.occupied_count == 0 &&
+            !worker.slots[0].occupied &&
+            !worker.slots[0].built &&
+            !worker.slots[1].occupied &&
+            !worker.slots[1].built &&
+            state->tasks[6].flag == 1 &&
+            state->tasks[7].flag == 1 &&
+            DrainTestOps::execute_calls == 8,
+        "entry snapshot lets one drain release both ready slots"
+    );
+
+    Check(
+        DrainTestOps::execute_calls == 8 &&
+            stats.result.placement[
+                static_cast<uint32_t>(DrainPlace::EfDrain)
+            ] == 8,
+        "shared drain snapshot preserves exact execution accounting"
     );
     UnmapSparseSchedulerState(state);
 }
@@ -2743,6 +2920,7 @@ int main() {
     TestSharedContextLengthUsesBackingPointer();
     TestRoleAwareAcceptTaskOutputs();
     TestSharedCompletionPublishesWithoutFrontier();
+    TestSharedDrainUsesEntryOccupancySnapshot();
     TestPublishAndResolve();
     TestPaTwoGroupWriterReadyGate();
     TestPaWriterIntentPreGateFailuresDoNotPublishGate();

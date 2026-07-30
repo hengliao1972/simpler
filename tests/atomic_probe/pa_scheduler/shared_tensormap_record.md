@@ -15769,3 +15769,139 @@ Claim 的 49,152 个 not-attempted actor 是负对照，其 Claim outer
 调用点全部不变的前提下，删除了 AIC/AIV 六条高频 attempted 路径对
 block-local 统计字段的逐次读改写。O3 静态消减、两轮 A5 直接
 non-atomic Claim outer、固定 true-loser 和最终 Claim 总数互相闭合。
+
+### 2026-07-30：shared EfDrain 按入口占用数停止扫描空 slot
+
+#### 问题与等价修改
+
+shared PA 的可用 winning slot 只有 `slot0/slot1`。原
+`DrainReady()` 只要入口 `occupied_count != 0`，就固定读取两个 slot
+header；因此最常见的 `slot0-only` 形态在已经检查唯一 occupied slot
+后，仍会读取已知为空的 `slot1`。
+
+本阶段只在 shared 路径读取一次入口 `occupied_count`，并把它保存为
+局部快照 `remaining_occupied`。扫描遇到一个 `occupied` header 就把
+快照减一；已找到入口时刻的全部 occupied header 后，在取得下一个 slot
+地址和读取 header 前退出。执行期间释放 slot 只修改
+`worker.occupied_count`，不会改变本轮入口快照：
+
+- `slot0-only`：检查 slot0 后直接退出，不再读 slot1；
+- `slot1-only`：slot0 为空时不减快照，仍会继续找到 slot1；
+- `slot0` unbuilt、`slot1` ready：两者都被检查，slot1 可正常执行；
+- 两槽都 ready：同一次 Drain 释放两槽，不会因释放 slot0 而提前退出。
+
+private 路径仍保留原有四槽循环。Claim 人口、atomic 操作、kernel、
+fanin ready 判断、slot 选择与完成发布均未修改。
+
+七份既有 B256 raw 离线重放得到 860,160 个 EfDrain 入口：
+
+| 入口形态 | 数量 | 占全部入口 |
+| --- | ---: | ---: |
+| empty | 598,831 | 69.62% |
+| slot0-only | 238,046 | 27.68% |
+| slot1-only | 15,087 | 1.75% |
+| 两槽占用 | 8,196 | 0.95% |
+
+对非空入口，原循环需要 522,658 次 header 探测；新边界按上述分布只需
+284,612 次，理论上减少 45.545%。这只是静态工作量推导，保留与否仍由
+A5 直接 non-atomic 区间决定。
+
+#### CCEC O3 控制流证据
+
+AIC/AIV 各六份内联 `DrainReady()` 都形成同构控制流：
+
+1. 入口只读取一次 `occupied_count`，零值直接返回；
+2. `remaining_occupied` 由 loop `phi`、occupied 分支的 `add -1`
+   和 latch `phi` 传递；
+3. `slot0-only` 时，第一次迭代把 remaining 变为零，loop latch 在
+   第二次动态 slot GEP/header load 之前退出；
+4. slot0 为空时 remaining 原值回到 latch，第二次迭代仍会生成
+   `index=1` 并读取 slot1；
+5. remaining 全程为 SSA，没有新增 alloca；最终栈帧和保存寄存器集合
+   不变。
+
+基线/候选实际 atomic call inventory 在 AIC/AIV 都保持 92 次：
+`ADD.G.s32=9`、`ADD.G.s64=65`、`EXCH.G.s32=3`、
+`EXCH.G.s64=6`、`EXCH.G.u64=6`、`MAX.G.s64=3`；规范化调用顺序
+哈希也逐核型相同。shared orchestration `.text` 为
+AIC `+152 B`、AIV `-200 B`。shared split runtime 逐字不变；
+split Finish 也会在 WaitForSlot/HeapGuard 慢路内联 `DrainReady()`，
+因此 AIC/AIV Finish `.text` 均增加 `32 B`，其中导出 Finish 主体均
+增加 `36 B`。这不是把候选误写成只覆盖 Submit 入口 EfDrain：修改会
+统一作用于三个 Drain 调用位置。private AIC/AIV 的 caller、runtime、
+Finish 六份 `.text` 则全部与基线逐字相同。
+
+#### 定向与完整正确性
+
+定向测试覆盖 empty、slot0-only、带毒 header 的 slot1-only 空洞、
+slot0 unbuilt + slot1 ready、slot0 ready + slot1 unbuilt，以及两槽
+同时 ready。逐例核对：
+
+- 单次返回的 freed 数；
+- `occupied_count` 与两个 slot 的 `occupied/built` 状态；
+- unbuilt task 不得发布 `flag/vend`；
+- ready task 的完成状态、kernel 次数与 placement 精确一致。
+
+CPU shared 全量协议、B256/G1、mixed G0/G1/G2/G4、CPU private 回放和
+CCEC shared full-swimlane/perf-clock 构建均通过。两份 A5 完整泳道为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_194709_278089/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_194821_280225/ccec/
+```
+
+两份均保持 96 核、1,280 task、73,728 attempted Claim、1,280 winner、
+1,024 Kernel、依赖签名 `b7d985d6edb07078` 和 drop 0；execution、
+semantic、postprocess 与 real-compute 全部 PASS。
+
+#### 直接 non-atomic 结果
+
+基线为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_191205_222452/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_191253_223677/ccec/
+```
+
+不用新增 raw 字段，离线按每核 task 顺序重放
+`Submit/Claim/WinnerBuild/Commit` 即可恢复每个 Submit 入口的两个 slot
+状态。主样本固定四份 raw 共同存在的同一 `(core,task)`，要求：
+
+- 入口均为 `slot0-only`；
+- EfDrain 内无 Kernel；
+- slot 中旧 task kind 相同；
+- EfDrain 内 atomic site/flags 序列相同。
+
+EfDrain 边界为 `Submit.start→Claim.start`。每核先合并
+`Atomic∪Kernel`，再扣除与该边界的 union overlap，不能把 atomic 与
+kernel 分别相加，也不能直接使用只扣 Kernel 的旧 exclusive analyzer。
+结果为：
+
+| 固定 slot0-only 直接区间 | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| AIC，46 个同核同 task | 138.489 ns | 123.283 ns | **-10.980%** |
+| AIV，232 个同核同 task | 199.569 ns | 172.897 ns | **-13.365%** |
+| 全核，278 个同核同 task | 189.462 ns | 164.687 ns | **-13.077%** |
+
+放宽到只固定 `slot0-only` 的 997 个同核同 task，AIC/AIV/全核分别为
+`-5.458%/-11.172%/-10.917%`；固定无 Kernel 的 917 个样本全核为
+`-10.731%`。最严格主样本的 paired delta 中位数为 `-8 tick`，AIC、
+AIV 均同向。
+
+更宽的 117,823 个固定 nonwinner 因混合 empty、slot1-only、双槽和
+不同 ready 时序，EfDrain 仍下降 `4.098%`，四段完整 actor 下降
+`1.806%`。其中 true-loser AIV EfDrain 因入口形态和 ready 工作量迁移
+为 `+3.800%`，作为宽人口反向结果保留；它不替代对修改直接消费者形态
+的固定比较。
+
+两次 full-swimlane Submit 为 `2306.913/2362.157 us`。三次低扰动
+perf-clock 为 `2308.338/2287.742/2253.520 us`，中位数
+`2287.742 us`。这些整体时间受 atomic 与 winner 时序波动影响，只记录
+运行背景，不参与本阶段裁决。
+
+#### 决策
+
+本阶段保留。它没有改变 atomic 协议或 Claim 业务语义，CCEC O3 明确
+删除 `slot0-only` 的第二个 header 读取；两轮 A5 固定同核同 task、
+相同入口形态和 atomic 形态后，直接 non-atomic EfDrain 在 AIC/AIV
+分别下降约 `11.0%/13.4%`。正确性矩阵、完整泳道和宽人口结果均已闭合。

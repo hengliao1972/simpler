@@ -4090,3 +4090,55 @@ AIC Alloc/QK/PV 和 AIV Alloc/SF/UP 六类均下降 `11.133%～28.034%`；
 本阶段按当前“直接受影响的 non-atomic 区域决定保留”的规则通过。完整
 控制流、IR 字段路径、分 task 数据和测试矩阵见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.18 shared EfDrain 按入口占用数提前停止 header 扫描
+
+**[已保留] `slot0-only` 不再读取已知为空的 slot1**
+
+shared PA 的 winning slot 只有两个。原 `DrainReady()` 对任意非空入口
+都固定扫描 slot0/slot1；候选只读取一次入口 `occupied_count`，随后用
+局部 SSA 快照记录本轮尚未见到的 occupied header 数。找到入口时刻的
+全部 occupied header 后，在读取下一个 slot 前退出。empty、
+slot1-only、unbuilt+ready 混合和两槽同时 ready 的语义均保持不变；
+private 四槽路径不改。
+
+七份既有 B256 raw 的 860,160 个 EfDrain 入口中，`slot0-only` 占
+27.68%，占全部非空入口的 91.09%。按真实分布，非空入口 header 探测从
+522,658 次降为 284,612 次，静态减少 45.545%。
+
+CCEC O3 在 AIC/AIV 各六份内联 Drain 中都形成同样的提前退出 CFG：
+slot0 occupied 后 remaining 变零并在 slot1 GEP/load 前退出；slot0
+为空则 remaining 不减，slot1 仍可达。remaining 保持 SSA，无新增
+alloca；atomic 类型、数量和调用顺序与基线完全相同。shared split
+runtime 逐字不变；Finish 因 WaitForSlot/HeapGuard 慢路也内联
+`DrainReady()`，AIC/AIV `.text` 各增加 `32 B`。private AIC/AIV 的
+caller/runtime/Finish 六份 `.text` 全部逐字不变。
+
+两份候选泳道：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_194709_278089/ccec/
+  pa_scheduler_shared_swimlane_20260730_194821_280225/ccec/
+```
+
+均保持 96 核、1,280 task、73,728 Claim、1,280 winner、1,024 Kernel、
+依赖签名 `b7d985d6edb07078` 和 drop 0。离线重放 slot 状态，固定四份
+raw 中相同 `(core,task)` 的 `slot0-only`、无 Kernel、相同旧 slot kind
+和相同 EfDrain atomic site/flags，并扣除 `Atomic∪Kernel` 后：
+
+| 直接 non-atomic EfDrain | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| AIC | 138.489 ns | 123.283 ns | **-10.980%** |
+| AIV | 199.569 ns | 172.897 ns | **-13.365%** |
+| 全核 | 189.462 ns | 164.687 ns | **-13.077%** |
+
+宽口径固定 nonwinner 的 EfDrain 与四段完整 actor 分别下降
+`4.098%/1.806%`。true-loser AIV 混合入口的 EfDrain 为 `+3.800%`，
+作为 occupancy/ready 形态迁移造成的反向宽结果保留，不用它覆盖直接
+受影响形态的固定比较。
+
+三次 perf-clock 为 `2308.338/2287.742/2253.520 us`，只作运行背景。
+本阶段按“直接受影响的非 atomic 区域决定保留”的规则通过；完整的
+入口分布、CFG、测试矩阵与离线重放口径见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。

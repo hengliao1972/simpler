@@ -585,9 +585,18 @@ PA_DEVICE uint32_t DrainReady(
 ) {
     // 同一套 drain 被三个位置复用：每次 Submit 开头的 EfDrain、ring 背压等待和所有 Submit 后的最终 drain。
     // slot 属于当前 worker；只有其全部跨核 fanin 已 ready 时才执行所选 winner 负载、发布完成并释放 slot。
+#if PTO_FDWIC_SHARED_MAP
+    // shared 路径后续还要用这份入口值约束 header 扫描，因此只读取一次；
+    // 不依赖编译器把两次 GM 读取自动合并。
+    const uint32_t occupied_at_entry = worker.occupied_count;
+    if (occupied_at_entry == 0) {
+        return 0;
+    }
+#else
     if (worker.occupied_count == 0) {
         return 0;
     }
+#endif
     uint32_t freed = 0;
     // shared 单 lane PA 在 occupied_count 达到 kUsableSlots 前必先等待并
     // drain，FindFreeSlot 又总取最低空槽，因此正常协议只会占用 slot 0/1。
@@ -599,9 +608,26 @@ PA_DEVICE uint32_t DrainReady(
 #else
         kPrivateSlots;
 #endif
+#if PTO_FDWIC_SHARED_MAP
+    // occupied_count 是进入本次 drain 时两个可用 slot 的精确快照。
+    // 找齐这些 occupied header 后，余下物理 slot 已知为空；使用快照而
+    // 不是执行中递减的 worker.occupied_count，避免释放 slot 后改变边界。
+    uint32_t remaining_occupied = occupied_at_entry;
+#endif
     for (uint32_t index = 0; index < kDrainSlotCount; ++index) {
+#if PTO_FDWIC_SHARED_MAP
+        if (remaining_occupied == 0) {
+            break;
+        }
+#endif
         PA_GM LocalSlot &slot = worker.slots[index];
-        if (!slot.occupied || !slot.built || !SlotReady<Ops>(state, slot, stats)) {
+        if (!slot.occupied) {
+            continue;
+        }
+#if PTO_FDWIC_SHARED_MAP
+        --remaining_occupied;
+#endif
+        if (!slot.built || !SlotReady<Ops>(state, slot, stats)) {
             continue;
         }
         const TaskKind kind = static_cast<TaskKind>(slot.kind + 1);
