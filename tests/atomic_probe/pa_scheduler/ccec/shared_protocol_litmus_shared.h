@@ -17,7 +17,7 @@ namespace pa_scheduler::shared_protocol_litmus {
 
 constexpr uint32_t kControlMagic = 0x5350524CU;
 constexpr uint32_t kControlVersion = 3;
-constexpr uint32_t kSharedAbiGeneration = 12;
+constexpr uint32_t kSharedAbiGeneration = 13;
 constexpr uint32_t kSymbolCount = 7;
 constexpr uint64_t kResultMagic = 0x484953544F525900ULL;
 static_assert(

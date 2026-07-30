@@ -320,7 +320,10 @@ struct OrderedSubmitTestOps {
                          ->cube_cursor[shard].value ||
                 address ==
                     &observed_state
-                         ->alloc_cursor[shard].value) {
+                         ->alloc_cursor[shard].value ||
+                address ==
+                    &observed_state
+                         ->vector_cursor[shard].value) {
                 return true;
             }
         }

@@ -126,7 +126,7 @@ constexpr uint32_t kBuildIdentityMagic = 0x50414249U;  // "PABI"
 constexpr uint32_t kBuildIdentityCompactGenericTraceBit =
     1U << 31U;
 #if PTO_FDWIC_SHARED_MAP
-constexpr uint32_t kBuildIdentityAbiGeneration = 12;
+constexpr uint32_t kBuildIdentityAbiGeneration = 13;
 #else
 constexpr uint32_t kBuildIdentityAbiGeneration = 4;
 #endif
@@ -424,20 +424,30 @@ enum class TaskKind : uint32_t {
 
 #if PTO_FDWIC_SHARED_MAP
 // shared Claim 继续使用现有 4/4/8 条跨 task 高水位 cursor，但每条
-// cursor 只由映射到同一 shard 的 worker 子集竞争。与固定单 owner 不同，
-// 每个 shard 内仍有多个动态候选；与 per-task atomic 不同，后续 task
-// 仍受同一高水位链约束，不会放大无界 run-ahead。
+// cursor 只由映射到同一 shard 的 worker 子集竞争。shared 中闲置的
+// 四路 legacy vector cursor 与四路 alloc cursor 合成八路 Alloc
+// 高水位，使 Alloc/QK-PV/SF-UP 分别保留 12/8/8 个动态候选。与
+// 固定单 owner 不同，每个 shard 内仍有多个候选；与 per-task atomic
+// 不同，后续 task 仍受同一高水位链约束，不会放大无界 run-ahead。
+constexpr uint32_t kSharedAllocCursorShards =
+    2U * kCursorShards;
 constexpr uint32_t kSharedAllocClaimParticipants =
-    kWorkers / kCursorShards;
+    kWorkers / kSharedAllocCursorShards;
 constexpr uint32_t kSharedAicClaimParticipants =
     kAicWorkers / kCursorShards;
 constexpr uint32_t kSharedAivClaimParticipants =
     kAivWorkers / kSharedVectorCursorShards;
 static_assert(
-    kWorkers % kCursorShards == 0 &&
+    kWorkers % kSharedAllocCursorShards == 0 &&
         kAicWorkers % kCursorShards == 0 &&
         kAivWorkers % kSharedVectorCursorShards == 0,
     "shared Claim participant groups must divide the worker topology"
+);
+static_assert(
+    kSharedAllocClaimParticipants == 12U &&
+        kSharedAicClaimParticipants == 8U &&
+        kSharedAivClaimParticipants == 8U,
+    "shared Claim participant widths changed unexpectedly"
 );
 
 #ifdef PA_DEVICE
@@ -471,8 +481,8 @@ PA_SHARED_CLAIM_INLINE constexpr bool IsSharedClaimParticipant(
         return false;
     }
     if (kind == TaskKind::Alloc) {
-        return worker_id % kCursorShards ==
-               task_id % kCursorShards;
+        return worker_id % kSharedAllocCursorShards ==
+               task_id % kSharedAllocCursorShards;
     }
     if (kind == TaskKind::Qk ||
         kind == TaskKind::Pv) {
