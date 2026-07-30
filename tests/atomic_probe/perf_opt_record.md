@@ -3810,3 +3810,42 @@ tests/atomic_probe/pa_scheduler/outputs/
 
 完整调用链、动态次数、分 kind 数据和四段闭合见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.12 shared `current_batch` 镜像
+
+**[已撤回] 停止维护本地 batch 镜像后直接消费者回退**
+
+候选让 shared QK/PV 直接使用 `BuildCallbackSubmitArgs()` 已有的
+`batch` SSA，并停止 `BeginPaBatchForCallback()` 每批写
+`PaOrchestrationState::current_batch`。毒值测试证明 QK/PV 位置标量
+不依赖镜像，且全仓没有其他隐藏消费者。
+
+该字段位于设备标量栈/本地状态，并非 GM。CCEC O3 中：
+
+- AIC 删除 QK/PV 两次静态 load 和每批 store，函数减少 8 B；
+- AIV 只删除每批 store，函数减少 4 B；
+- atomic、alloca 和分支数量不变。
+
+CPU shared 全量、B256/G1、mixed G0/G1/G2/G4、CCEC shared 及两次 A5
+完整泳道均通过，但直接 non-atomic 结果不支持保留：
+
+| 直接区域 | AIC | AIV | 全核 |
+| --- | ---: | ---: | ---: |
+| 跨 batch UP→Alloc transition | -0.506% | **+6.804%** | **+4.284%** |
+| task0 前缀 | -6.113% | **+9.572%** | **+4.064%** |
+
+逐区间扣除 Atomic∪Kernel 后，QK/PV winner 的
+`Claim.end→Materialize.start` 也分别回退 `5.712%/6.424%`。固定
+true-loser/not-attempted 完整 actor 的宽路径背景改善不能覆盖两个真实
+消费者和 AIV 主边界同时回退。
+
+候选已完整撤回。A5 产物：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_165524_4180287/ccec/
+  pa_scheduler_shared_swimlane_20260730_165616_4182634/ccec/
+```
+
+完整本地状态口径、毒值测试、IR 与分段数据见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。

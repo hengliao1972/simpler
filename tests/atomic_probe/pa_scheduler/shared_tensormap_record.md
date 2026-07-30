@@ -14948,3 +14948,99 @@ transition 下降 `17.668%`，完整 actor 下降 `4.343%`。winner 的物理
 B256/G1 的 122,880 次重复 GM 配置读取；直接 SubmitTransition 在
 AIC/AIV、五种 task 类型和两轮样本中全部稳定改善，完整 true-loser 与
 not-attempted non-atomic actor 也同向下降。
+
+### 2026-07-30：停止维护 shared `current_batch` 试验撤回
+
+#### 试验边界与定向测试
+
+`PaOrchestrationState::current_batch` 只有四处真实语义：
+
+1. 初始化为 0；
+2. `BeginPaBatchForCallback()` 每批写入；
+3. QK 构参读取它生成位置标量；
+4. PV 构参读取它生成同一位置标量。
+
+`BuildCallbackSubmitArgs()` 本来已经接收当前 `batch` 参数，query/output
+view 也一直直接使用该参数。候选因此在 shared 构建中停止每批维护
+`current_batch`，让 QK/PV 直接消费 `batch` SSA；结构字段、布局与 ABI
+保留，private 继续使用原镜像语义。
+
+定向 CPU 测试把 `current_batch` 预置为 `UINT32_MAX`，随后用
+`batch=3` 构造 QK/PV，验证两者的第二个 scalar 都精确等于
+`3×kPaMaxBlocksPerRequest+block_offset`，并验证 batch begin 不改写
+毒值。全仓审计没有发现 Init/Begin/QK/PV 之外的隐藏消费者。
+
+#### 代码生成
+
+`PaOrchestrationState` 是 `RunSchedulerImpl()` 的设备标量栈/本地状态
+（LLVM AS0 alloca），不是 SchedulerState 中的 GM 对象，不能把这项
+试验描述成 GM 消减。
+
+相同 shared perf-clock O3 参数下：
+
+- AIC 的 current_batch 从“init store、每批 store、QK load、PV load”
+  收敛为只剩 init store；全 TU load `357→355`、store `907→906`，
+  orchestration 函数 `36,748→36,740 B`；
+- AIV 不实例化 QK/PV 构参，只删除每批 store；store `931→930`，
+  orchestration 函数 `38,600→38,596 B`；
+- AIC/AIV alloca 都保持 5，atomic intrinsic 类型与静态数量完全不变；
+- 试验写法虽保持 private 运行语义，却因局部 lambda 捕获影响 private
+  优化布局，AIC/AIV `.text` 哈希均变化。若性能成立，本应进一步改成
+  预处理分流以严格冻结 private；由于 A5 已否决，未继续扩展改动。
+
+CPU shared 全量协议、动态 B256/G1、mixed G0/G1/G2/G4、CCEC shared
+full-swimlane/perf-clock 及两次 A5 B256/G1 完整泳道均通过。候选：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_165524_4180287/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_165616_4182634/ccec/
+```
+
+两份均保持原始 96/32/64 Claim 人口、1,280 winner、1,024 kernel、
+依赖签名 `b7d985d6edb07078`、drop 0，完整语义通过。
+
+#### 直接 non-atomic 结果
+
+基线为上一保留阶段：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_164316_4144100/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_164410_4145749/ccec/
+```
+
+每批 store 的直接边界为前一批 UP `Submit.end` 到下一批 Alloc
+`Submit.start`，共 `96×255=24,480` 条；四份区间都没有 Atomic 或
+Kernel：
+
+| 跨 batch transition | AIC | AIV | 全核 |
+| --- | ---: | ---: | ---: |
+| 基线均值→候选均值 | 195.291→194.303 tick | 185.585→198.212 tick | 188.820→196.909 tick |
+| 变化 | -0.506% | **+6.804%** | **+4.284%** |
+
+task 0 前缀也表现为 AIC `-6.113%`、AIV `+9.572%`、全核
+`+4.064%`。
+
+QK/PV winner 的精确 ArgBuild 口径为
+`Claim.end→Materialize.start`。winner 物理核随竞争变化，因此只对每轮
+固定的 256 个 task 语义聚合，不伪称 `(core,task)` 固定人口。逐区间
+扣除 Atomic∪Kernel 后：
+
+| winner ArgBuild | 基线均值 | 候选均值 | 变化 |
+| --- | ---: | ---: | ---: |
+| QK | 867.410 tick/task | 916.953 tick/task | **+5.712%** |
+| PV | 837.344 tick/task | 891.139 tick/task | **+6.424%** |
+
+扩大到 `Claim.end→Submit.end` 后，QK/PV 仍分别回退
+`1.831%/0.981%`。固定 true-loser 与 not-attempted 的完整 non-atomic
+actor 背景虽分别改善 `1.775%/2.911%`，但它们不是 current_batch 的
+消费者，不能覆盖跨 batch 主边界和 QK/PV 直接消费者同时回退。
+
+候选三次 perf-clock 为
+`2,307.263/2,298.240/2,284.321 us`，只作运行背景。
+
+#### 决策
+
+候选完整撤回，源码和定向测试均恢复到提交 `c1a5ee84`。这项试验真实
+减少了本地状态读写和少量机器码，但 AIV 跨 batch 主边界以及 QK/PV
+直接构参边界都稳定回退；不能用宽路径 actor 的偶然改善或代码尺寸缩小
+替代直接消费者证据。后续不再重复该方向。
