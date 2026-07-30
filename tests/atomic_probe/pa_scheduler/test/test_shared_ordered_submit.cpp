@@ -627,10 +627,9 @@ bool RunLoserZeroTensorMapAccessTest() {
     context.kernel_id = -1;
     context.shared_result.Reset(static_cast<int32_t>(kTask));
     LocalStats stats{};
-    const CallbackSubmitTicket ticket{
-        1, kTask, -1, 0,
-        EncodeSharedPaTaskMeta(TaskKind::Up, 0, true, false)
-    };
+    constexpr uint64_t kSubmitBegin = 1;
+    const uint8_t task_meta =
+        EncodeSharedPaTaskMeta(TaskKind::Up, 0, true, false);
 
     int64_t turns_before[kSharedInsertTurnCapacity] = {};
     for (uint32_t lane = 0;
@@ -650,7 +649,9 @@ bool RunLoserZeroTensorMapAccessTest() {
     OrderedSubmitTestOps::observed_state = state;
     const bool finished =
         FinishSharedLoserSubmit<OrderedSubmitTestOps, false>(
-            state, context, stats, ticket
+            state, context, stats, kTask, -1, false,
+            task_meta,
+            kSubmitBegin
         );
     bool turns_unchanged = true;
     for (uint32_t lane = 0;

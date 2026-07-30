@@ -13163,3 +13163,146 @@ Claim 源码和 73,728 次调用数都没有变化。与更早的一组独立泳
 但 true-loser 控制时间增加 `14.89%`。后续 EfDrain 优化不能只减少轮询
 次数，还必须保持或增加到达 Claim 的时间离散度；否则只是在两个 atomic
 热点之间搬移等待。
+
+### 2026-07-30：只在 winner 路径物化跨 TU ticket
+
+#### 问题与等价边界
+
+CCEC shared callback 构建把 winner finish 拆到独立 TU，并使用固定 16B
+`CallbackSubmitTicket` 传递 `submit_begin/task_id/function_id/won/meta`。
+修改前，五种 `SubmitCallbackTask<Kind>` 都在检查 `claim.won` 之前启动
+ticket lifetime 并写入五个字段；true loser 和 not-attempted 不会跨 TU，
+却仍支付这些本地写入。
+
+本阶段只改变 ticket 的物化位置：
+
+- shared loser 继续在 caller 内执行原有 task meta、function、context、
+  output count、split replay 和 Submit 闭合校验；
+- loser 直接使用 caller 已有的 SSA 标量，不再构造只为跨 TU 设计的 POD；
+- shared winner 进入分支后才构造并 Arm 完整 ticket；
+- winner 的 16B ABI、五个 finish 调用点、finish 实现和 private 路径不变。
+
+因此它没有修改 Claim 候选资格、Claim atomic、winner 判定、TensorMap、
+fanin、输出发布、任务执行或泳道字段。
+
+#### 编译结果审计
+
+对相同 CCEC shared perf-clock 参数生成 AIC/AIV `-O3` IR，并与冻结基线
+逐块核对：
+
+- orchestration 入口仍保留五个静态 ticket frame slot；不能误写成 alloca
+  已被移入 winner；
+- 真正下沉的是每个 ticket 的 `lifetime.start(16)` 和五个字段 store；
+- AIC/AIV 各五组运行时初始化都只位于 `claim.won` successor；
+- 十个 loser successor 均不再包含对应 ticket 的 lifetime、字段 store
+  或外部 finish 调用；
+- caller 仍各有五条匹配 role 的 finish relocation，wrong-role 为 0；
+- AIC/AIV finish `.text` 与基线逐字节相同，split runtime state 仍为
+  1664B，`CallbackSubmitTicket` 的 size/offset static_assert 全部通过。
+
+代码尺寸和后端栈没有回退：
+
+| 项目 | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| AIC caller `.text` | 46,504B | 46,336B | -168B |
+| AIV caller `.text` | 48,184B | 47,928B | -256B |
+| AIC orchestration 栈 | 3,224B | 3,216B | -8B |
+| AIV orchestration 栈 | 3,208B | 3,208B | 不变 |
+
+#### A5 perf-clock
+
+冻结原始 `96/32/64` ELF 与精确候选按四组平衡顺序运行 8+8 个独立
+B256 进程。每次都保持 Claim `73,728`、winner `1,280`，并通过完整
+语义校验：
+
+| 构建 | mean | median | 范围 |
+| --- | ---: | ---: | ---: |
+| 基线 | 2302.605 us | 2301.989 us | 2285.403～2320.882 us |
+| winner-only ticket | 2308.991 us | 2308.919 us | 2296.065～2323.797 us |
+| 变化 | +6.386 us / +0.277% | +6.931 us / +0.301% | 低于 +2% 上限 |
+
+四个区组的 mean 变化依次为
+`+0.886%、-0.046%、+0.107%、+0.166%`。端到端没有形成加速证据，但
+回退远低于本轮预登记的 2% 保留上限；本阶段是否保留继续由 true-loser
+目标区间决定。
+
+#### 完整泳道的 true-loser 归因
+
+冻结基线：
+
+`/home/q00473782/atomic/private/gpt/simpler-original-claim-perf-clock/`
+`tests/atomic_probe/pa_scheduler/outputs/`
+`pa_scheduler_shared_swimlane_20260730_040655_3254297/ccec`
+
+精确候选：
+
+`outputs/pa_scheduler_shared_swimlane_20260730_050015_3301011/ccec`
+
+两份图都为 B256/G1、PASS、drop 0，且精确闭合：
+
+- attempted Claim `73,728`；
+- winner `1,280`；
+- true loser `72,448`；
+- role 不匹配的 not-attempted `49,152`。
+
+固定对每个 `(core, task)` 计算
+`Submit.end - Claim.end`，true-loser tail 得到：
+
+| 指标 | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| 累计 core-time | 16.066299 ms | 13.559775 ms | **-15.601%** |
+| mean | 221.763 ns | 187.166 ns | **-15.601%** |
+| median | 213 ns | 165 ns | **-22.535%** |
+| p95 | 358 ns | 345 ns | -3.631% |
+| max | 1,043 ns | 760 ns | -27.133% |
+
+按 task 拆分累计 tail：
+
+| task | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| Alloc | 4.983354 ms | 3.051590 ms | **-38.764%** |
+| QK | 2.779982 ms | 2.678674 ms | -3.644% |
+| SF | 3.113208 ms | 2.623657 ms | -15.725% |
+| PV | 1.913555 ms | 1.738960 ms | -9.124% |
+| UP | 3.276200 ms | 3.466894 ms | +5.821% |
+
+UP 的单图 mean/p95 分别回涨 `5.821%/6.728%`，因此不能宣称每种 task
+都改善；但其 median 从 167ns 降到 165ns、max 从 726ns 降到 615ns，
+而固定 72,448 个 true loser 的总体 sum/mean/median 均明确下降。Alloc
+中的 AIC/AIV true-loser 人口相差五个，是五个 winner 在两图间换核；
+合并后的 Alloc 人口仍精确为 24,320，不是丢记录。
+
+not-attempted 同样不再物化 ticket，固定 49,152 个 actor 的 tail 累计从
+`10.170750 ms` 降到 `8.364118 ms（-17.763%）`，median 从 211ns 降到
+142ns。true-loser 与 not-attempted 的 tail 合计分别精确等于 analyzer
+原有 loser post-claim tail，证明拆分没有漏算或重复。
+
+#### 正确性验证
+
+- `/usr/bin/g++` 下 CPU shared/private 全套构建门槛均通过；
+- shared ordered-submit 定向门槛确认
+  `loser_zero_map_access=PASS / accesses=0`，并通过 ready fanin prefix、
+  PA-UP writer shape、release-before-build 和独立 kernel overlap；
+- CPU shared/private 的 B1、B256 96-worker 完整回放均为
+  `semantic_status=PASS / postprocess_status=PASS`；
+- shared B256 保持 1,280 tasks、73,728 Claim、2,048 published outputs，
+  依赖、writer、insert completion、heap、symbol 和 terminal 全闭合；
+- private B256 同样保持 1,280 tasks、73,728 Claim，依赖与 normalized
+  writer signature 和 shared 一致；
+- CCEC shared perf-clock/full-swimlane 的 AIC/AIV、split runtime、
+  split finish、mixed ELF 与 manifest 均通过；
+- A5 B256 候选完整计算、依赖、TensorMap、heap、completion、泳道闭合
+  和后处理全部 PASS。
+
+#### 决策
+
+本阶段保留。依据不是代码尺寸或单次 Submit 变快，而是：
+
+1. 原始 `96/32/64` 候选资格和所有 actor 人口完全不变；
+2. IR 直接证明被删除的是 non-winner 不会消费的跨 TU ticket 初始化；
+3. true-loser 目标区间累计下降 `15.60%`、中位数下降 `22.54%`；
+4. perf-clock 端到端回退 `0.277%`，低于用户预先接受的 `+2%` 上限；
+5. winner ABI、finish 机器码、状态尺寸和栈均无回退。
+
+后续 Submit transition 必须单独实验，不能把本阶段 tail 收益与下一批
+公共 orchestration 工作混在同一个提交中。

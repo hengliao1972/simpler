@@ -3198,17 +3198,18 @@ PA_DEVICE bool ArmSharedSplitTicket(
 
 PA_DEVICE bool RecordSharedSplitReplayTask(
     CompeteFirstSplitRuntimeState &runtime,
-    const CallbackSubmitTicket &ticket
+    uint32_t task_id
 ) {
     // task_id_sum 描述 caller 确实按 0..N-1 重放了完整前端序列，
     // 与只有 winner 才跨 TU 的 finish_calls 是两条不同的协议证据。
-    // loser 不再 Arm ticket，因此这一步必须留在 caller。
+    // loser 不再构造或 Arm 跨 TU ticket，因此这里只消费已经存在的
+    // task_id SSA 值，仍在 caller 中逐 task 校验。
     if (runtime.reserved != 0 ||
-        static_cast<uint64_t>(ticket.task_id) !=
+        static_cast<uint64_t>(task_id) !=
             runtime.stats.result.submits) {
         return false;
     }
-    runtime.task_id_sum += ticket.task_id;
+    runtime.task_id_sum += task_id;
     return true;
 }
 #endif
@@ -3422,10 +3423,9 @@ PA_DEVICE bool BuildCallbackSubmitArgs(
 template <typename Ops, bool Profile>
 PA_DEVICE bool CloseSharedCallbackSubmit(
     PA_GM SchedulerState *state, LocalStats &stats,
-    const CallbackSubmitTicket &ticket,
+    uint32_t task_id, uint64_t submit_begin,
     const SharedPaTaskMeta &shared_task_meta
 ) {
-    const uint32_t task_id = ticket.task_id;
     ++stats.result.submits;
 
     // shared 的总 task 数取决于每批 context_len。末次身份由调用者在
@@ -3448,7 +3448,7 @@ PA_DEVICE bool CloseSharedCallbackSubmit(
 #endif
     WriteSharedSubmitTrace<Profile>(
         stats.trace, stats.result, task_id,
-        ticket.submit_begin, submit_end
+        submit_begin, submit_end
     );
     if (!is_last_submit) {
         return true;
@@ -3465,25 +3465,40 @@ PA_DEVICE bool CloseSharedCallbackSubmit(
 }
 
 template <typename Ops, bool Profile>
+PA_DEVICE bool CloseSharedCallbackSubmit(
+    PA_GM SchedulerState *state, LocalStats &stats,
+    const CallbackSubmitTicket &ticket,
+    const SharedPaTaskMeta &shared_task_meta
+) {
+    // winner 的跨 TU ABI 继续传递完整 ticket；公共收尾只消费实际需要的
+    // task_id/submit_begin，避免迫使同 TU loser 也物化该 POD。
+    return CloseSharedCallbackSubmit<Ops, Profile>(
+        state, stats, ticket.task_id, ticket.submit_begin,
+        shared_task_meta
+    );
+}
+
+template <typename Ops, bool Profile>
 PA_DEVICE bool FinishSharedLoserSubmit(
     PA_GM SchedulerState *state, SubmitContext &context,
-    LocalStats &stats, const CallbackSubmitTicket &ticket
+    LocalStats &stats, uint32_t task_id,
+    int32_t function_id, bool won,
+    uint8_t encoded_task_meta,
+    uint64_t submit_begin
 ) {
     SharedPaTaskMeta shared_task_meta{};
-    const uint32_t task_id = ticket.task_id;
     const bool valid =
-        ticket.won == 0 &&
+        !won &&
         DecodeSharedPaTaskMeta(
-            ticket.reserved, task_id, shared_task_meta
+            encoded_task_meta, task_id, shared_task_meta
         ) &&
         SharedPaFunctionIdMatches(
             shared_task_meta.kind, false,
-            static_cast<int32_t>(ticket.function_id)
+            function_id
         ) &&
         context.task_id == static_cast<int32_t>(task_id) &&
         !context.won &&
-        context.kernel_id ==
-            static_cast<int32_t>(ticket.function_id) &&
+        context.kernel_id == function_id &&
         context.shared_result.TaskId() ==
             static_cast<int32_t>(task_id) &&
         context.shared_result.Size() ==
@@ -3499,7 +3514,7 @@ PA_DEVICE bool FinishSharedLoserSubmit(
     // fanin lookup 与 Build 全部只属于 Claim owner；loser 不读取任何
     // TensorMap 控制字，也不再等待 writer-ready 门。
     return CloseSharedCallbackSubmit<Ops, Profile>(
-        state, stats, ticket, shared_task_meta
+        state, stats, task_id, submit_begin, shared_task_meta
     );
 }
 
@@ -4085,34 +4100,42 @@ PA_DEVICE bool SubmitCallbackTask(
         return false;
     }
 #endif
-    const CallbackSubmitTicket ticket{
-        submit_begin,
-        task_id,
-        static_cast<int16_t>(claim.function_id),
-        static_cast<uint8_t>(claim.won ? 1 : 0),
-#if PTO_FDWIC_SHARED_MAP
-        shared_task_meta,
-#else
-        0,
-#endif
-    };
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
 #if PTO_FDWIC_SHARED_MAP
     CompeteFirstSplitRuntimeState &split_runtime =
         Ops::CompeteFirstSplitState();
-    if (!RecordSharedSplitReplayTask(split_runtime, ticket)) {
+    if (!RecordSharedSplitReplayTask(split_runtime, task_id)) {
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
     if (!claim.won) {
         return FinishSharedLoserSubmit<Ops, Profile>(
-            state, context, stats, ticket
+            state, context, stats, task_id,
+            claim.function_id, claim.won,
+            shared_task_meta, submit_begin
         );
     }
+    // 只有 winner 才跨 TU；把 16B ticket 的物化下沉到本分支，loser
+    // 继续用现有 SSA 标量完成同 TU 收尾。
+    const CallbackSubmitTicket ticket{
+        submit_begin,
+        task_id,
+        static_cast<int16_t>(claim.function_id),
+        1,
+        shared_task_meta
+    };
     if (!ArmSharedSplitTicket(split_runtime, ticket)) {
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
+#else
+    const CallbackSubmitTicket ticket{
+        submit_begin,
+        task_id,
+        static_cast<int16_t>(claim.function_id),
+        static_cast<uint8_t>(claim.won ? 1 : 0),
+        0
+    };
 #endif
     (void)state;
     (void)worker;
@@ -4125,9 +4148,26 @@ PA_DEVICE bool SubmitCallbackTask(
 #if PTO_FDWIC_SHARED_MAP
     if (!claim.won) {
         return FinishSharedLoserSubmit<Ops, Profile>(
-            state, context, stats, ticket
+            state, context, stats, task_id,
+            claim.function_id, claim.won,
+            shared_task_meta, submit_begin
         );
     }
+    const CallbackSubmitTicket ticket{
+        submit_begin,
+        task_id,
+        static_cast<int16_t>(claim.function_id),
+        1,
+        shared_task_meta
+    };
+#else
+    const CallbackSubmitTicket ticket{
+        submit_begin,
+        task_id,
+        static_cast<int16_t>(claim.function_id),
+        static_cast<uint8_t>(claim.won ? 1 : 0),
+        0
+    };
 #endif
     return FinishCallbackSubmitBody<Ops, Profile>(
         state, worker, task_count, args, context, stats, pmu_context, ticket
