@@ -3314,6 +3314,20 @@ PA_DEVICE void BeginSharedCallbackSubmit(
     context.shared_result.Reset(static_cast<int32_t>(task_id));
 }
 
+PA_DEVICE void BeginSharedPvCallbackSubmit(
+    PA_GM WorkerState &worker, SubmitContext &context
+) {
+    // SF 已从 WorkerState 取得当前 group 后半段的独立 task-id 锚点。PV
+    // 紧邻 SF，直接沿用 context 中只由 Begin 写入的身份，
+    // 避免再次读取 GM local_index；每次仍立即写回 attempted 前沿，
+    // 因而后续 plan/Claim/Finish 失败时的 WorkerState 现场不变。
+    const uint32_t task_id =
+        static_cast<uint32_t>(context.task_id) + 1U;
+    worker.local_index = static_cast<int32_t>(task_id + 1U);
+    context.task_id = static_cast<int32_t>(task_id);
+    context.shared_result.Reset(static_cast<int32_t>(task_id));
+}
+
 PA_DEVICE void PrepareSharedWinnerContext(
     PA_GM WorkerState &worker, uint32_t task_id,
     SubmitContext &context
@@ -4022,7 +4036,13 @@ PA_DEVICE bool SubmitCallbackTask(
 #endif
 ) {
 #if PTO_FDWIC_SHARED_MAP
-    BeginSharedCallbackSubmit(worker, context);
+    if constexpr (Kind == TaskKind::Pv) {
+        BeginSharedPvCallbackSubmit(worker, context);
+    } else {
+        // Alloc 是 batch 锚点，QK 是 group 入口锚点，SF/UP 保留后半段
+        // 锚点；四者从 WorkerState 读取，复核后续顺序。
+        BeginSharedCallbackSubmit(worker, context);
+    }
 #else
     BeginCallbackSubmit(worker, context);
 #endif

@@ -4237,3 +4237,43 @@ AIC 闭合两轮均下降约 28%；AIV tail 虽小幅增加，但相邻 Transiti
 没有明确回退。10 次 perf-clock 中位数 `2270.595 us`，仅作整体背景。
 完整支配关系、两版撤回结果、静态证据和逐轮数据见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.21 PV 复用紧邻 SF 的 task 身份
+
+**[已保留] 删除 PV Begin 对本核 GM task 前沿的一次重复读取**
+
+SF Begin 已把当前 task id 保存到 block-local `SubmitContext`；PV
+紧邻 SF，因此用 `context.task_id+1` 得到自己的 id，同时仍立即写回
+`worker.local_index=id+1`。Alloc/QK/SF/UP 继续读取
+`WorkerState` 锚点，所有独立 plan/replay/ticket/批末校验均保留。
+
+本轮按从宽到窄依次撤回了 group-wide、SF/PV/UP、SF/PV 和 SF-only
+四版。最典型的 SF-only 虽让 QK→SF 下降 5.333%，却使紧邻 SF→PV
+增加 15.655%，同 group 五段闭合回退 3.318%；这证明 transition
+不能只看被改名的单段。
+
+最终 PV-only 的 CCEC O3 只把 `worker.local_index` load 从 8 减到
+7，store 保持 6；没有长活跃 SSA、栈或 atomic 变化。两份 A5 B256
+完整泳道为：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_221211_521079/ccec/
+  pa_scheduler_shared_swimlane_20260730_221258_521012/ccec/
+```
+
+固定相同 Claim status 并扣除 `Atomic∪Kernel` 后，SF→PV 的
+AIC/AIV/全体分别下降 `6.272%/3.785%/4.701%`。严格固定六个 status
+的 18,920 个完整 group 中：
+
+| 核型 | 五段闭合 |
+| --- | ---: |
+| AIC | **-1.521%** |
+| AIV | +0.218% |
+| 全部 | **-0.320%** |
+
+全体两轮分别下降 `0.247%/0.394%`；AIV 约 1.27 ns/group 的轻微
+反向如实保留。10 次 perf-clock 中位数 `2265.640 us`、范围
+`2252.752～2329.632 us`，只作整体背景。完整四版撤回数据、静态
+证据、固定人口边界和剩余设计空间见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。

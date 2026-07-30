@@ -16180,3 +16180,130 @@ winner 时序波动下的背景，不参与本阶段裁决。
 不改变 atomic、角色人口、winner 或失败路径；直接消费者 AIC
 not-attempted 的最小 non-atomic 闭合两轮稳定下降约 28.48%，而未修改
 的 AIV true-loser 闭合恢复到基本持平，避免了过宽候选的 8.8% 回退。
+
+### 2026-07-30：只让 PV 沿用紧邻 SF 的 task 身份
+
+#### 问题与保持不变的合同
+
+shared replay 的每次 Begin 原先都从本核 `WorkerState.local_index`
+读取当前 task id，并立即写回 `task_id+1`。该字段由本核单写；SF
+成功完成 Begin 后，`SubmitContext.task_id` 已保存同一个 task id，
+紧邻的 PV 可以从它加一得到自己的 id。
+
+本轮只消减读取，不改变写前沿：
+
+- Alloc、QK、SF、UP 仍从 `WorkerState.local_index` 取得独立锚点；
+- 只有 PV 从刚结束的 SF `context.task_id+1` 得到 task id；
+- PV Begin 仍立即写 `worker.local_index=task_id+1`，中途失败现场不变；
+- plan、`stats.result.submits`、split replay、ticket/context 和批末
+  `local_index` 校验全部保留；
+- Claim 角色、96/32/64 人口和所有 atomic 调用完全不变。
+
+这不是把整个 group 的 cursor 长期放在 SSA 中，也没有用 plan
+自身推导 id 后再用同源表达式冒充顺序校验。
+
+#### 逐步收窄的四个撤回版本
+
+每版都先通过 CPU/CCEC/A5 正确性，再固定四份 raw 中相同
+`(core, task, 当前/下一 Claim status)`，逐核扣除
+`Atomic∪Kernel`。结果证明“少一次 GM load”不能脱离相邻完整区间
+单独判断：
+
+| 撤回版本 | 直接目标 | 同 group 五段或相邻闭合 | 否决原因 |
+| --- | ---: | ---: | --- |
+| 一个 group 共用 QK/SF/PV/UP cursor | 三个目标合计 +0.863% | UP→下一 Alloc +15.186% | 目标自身已回退，且 cursor 跨 Finish 长活跃 |
+| SF/PV/UP 沿用前驱 context | 三个目标 -0.835% | 五段 +8.478% | UP→下一 Alloc +21.403%，收益明显搬移 |
+| SF/PV 沿用前驱 context | 两个目标 +0.815% | 五段 +6.004% | QK→SF 的收益被 SF→PV 回退吞掉 |
+| 仅 SF 沿用 QK context | QK→SF -5.333% | 五段 +3.318% | SF→PV +15.655%，只是改写边界位置 |
+
+SF-only 两轮完整泳道为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_220607_511642/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_220653_511585/ccec/
+```
+
+其目标 QK→SF 两轮分别下降 `5.805%/4.858%`，但严格固定六个
+Claim status 的 18,909 个完整 group 中，五段闭合连续回退
+`3.454%/3.181%`，因此已完整撤回。
+
+#### 最终 PV-only 静态证据
+
+与上一保留提交逐项比较 CCEC O3：
+
+- AIC/AIV 的 `worker.local_index` 静态 load 均从 8 降到 7，
+  store 仍为 6；
+- 只新增一次 block-local `context.task_id` load；
+- O3 指令位置证明 Alloc/QK/SF/UP 不变，只有 PV Begin 换掉一次
+  GM load；
+- 派生值只活在 PV Submit 内，不跨 Submit/Finish；
+- AIC/AIV alloca 均保持 5，frame 仍为 1952 B；
+- atomic 均保持 92 个，类型、参数形态与顺序逐项相同；
+- AIC/AIV orchestration `.text` 分别变化 `+60/-44 B`，最终 mixed
+  ELF `.text` 不变。
+
+CPU shared 全量门槛、B256/G1、mixed G0/G1/G2/G4、CCEC shared
+构建以及两份 A5 B256/G1 完整泳道均通过。定向用例证明 SF→PV
+推进会重置输出状态并立即保存 attempted 前沿；完整回放另外逐核
+检查最终 `local_index==task_count`。
+
+最终泳道为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_221211_521079/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_221258_521012/ccec/
+```
+
+两份均保持 96 核、1,280 task、73,728 attempted Claim、1,280
+winner、1,024 Kernel、依赖签名 `b7d985d6edb07078` 和 drop 0；
+所有目标 transition 与 `Atomic∪Kernel` 的交集均为 0。
+
+#### 固定人口的 non-atomic 结果
+
+基线复用上一保留提交的两份完整泳道：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_211205_414313/ccec/
+outputs/pa_scheduler_shared_swimlane_20260730_211353_416628/ccec/
+```
+
+直接目标 SF→PV 在两种核型都连续两轮下降：
+
+| 固定 SF→PV | 第 1 轮 | 第 2 轮 | 两轮合并 |
+| --- | ---: | ---: | ---: |
+| AIC | -5.684% | -6.854% | **-6.272%** |
+| AIV | -4.032% | -3.538% | **-3.785%** |
+| 全部 | -4.638% | -4.764% | **-4.701%** |
+
+严格固定同核 `Alloc、QK、SF、PV、UP、下一 Alloc` 六个 Claim
+status，保留 18,920 个完整 group。五段闭合结果为：
+
+| 核型 | 目标变化 | 四个相邻边界变化 | 五段闭合 |
+| --- | ---: | ---: | ---: |
+| AIC | -5.791 ns | -2.226 ns | **-8.017 ns，-1.521%** |
+| AIV | -3.823 ns | +5.096 ns | +1.273 ns，+0.218% |
+| 全部 | -4.476 ns | +2.667 ns | **-1.808 ns，-0.320%** |
+
+全体五段两轮分别下降 `0.247%/0.394%`。AIV 五段两轮分别增加
+`0.168%/0.268%`，约 1.27 ns/group，必须记录为轻微反向，不能声称
+每种核型的完整 group 都变快；保留依据是直接消费者 AIC/AIV 均稳定
+改善，且全体固定人口的完整五段两轮均未发生边界搬移回退。
+
+低扰动 perf-clock 的 10 个独立进程为：
+
+```text
+2329.632, 2270.252, 2261.027, 2258.445, 2278.117,
+2258.707, 2260.544, 2252.752, 2282.876, 2300.216 us
+```
+
+中位数 `2265.640 us`，范围 `2252.752～2329.632 us`。整体时间只作
+atomic/winner 时序波动下的背景，不替代上述固定 non-atomic 闭合。
+
+#### 当前边界
+
+本阶段保留 PV-only。`local_index` store 必须维持“每次 Begin
+立即写 attempted 前沿”的失败语义，不能合并到 group 尾。直接用
+plan 计算 task id 会让 plan-vs-task 的独立检查变成同源恒真；若重新
+读取 `local_index` 保留检查，又没有访存收益。因此本阶段不采用
+plan-derived 或 store 合并。剩余同类空间只剩 UP-only 单点，需要在
+下一阶段独立验证，不能与本次收益混算。

@@ -897,6 +897,42 @@ bool RunLoserZeroTensorMapAccessTest() {
     return ok;
 }
 
+bool RunPvTaskIdentityContractTest() {
+    constexpr uint32_t kSfTask = 12;
+    constexpr uint32_t kPvTask = kSfTask + 1U;
+    WorkerState worker{};
+    worker.local_index = kSfTask;
+    SubmitContext context{};
+
+    BeginSharedCallbackSubmit(worker, context);
+    const bool sf_anchor_ok =
+        context.task_id == static_cast<int32_t>(kSfTask) &&
+        context.shared_result.TaskId() ==
+            static_cast<int32_t>(kSfTask) &&
+        context.shared_result.Empty() &&
+        worker.local_index ==
+            static_cast<int32_t>(kSfTask + 1U);
+
+    // PV 从 SF 身份推进；先放入毒 output，证明 Begin 会建立当前
+    // task 的空输出状态，并立即保存 attempted 前沿。
+    context.shared_result.Reset(-77);
+    BeginSharedPvCallbackSubmit(worker, context);
+    const bool pv_advance_ok =
+        context.task_id == static_cast<int32_t>(kPvTask) &&
+        context.shared_result.TaskId() ==
+            static_cast<int32_t>(kPvTask) &&
+        context.shared_result.Empty() &&
+        worker.local_index ==
+            static_cast<int32_t>(kPvTask + 1U);
+
+    const bool ok = sf_anchor_ok && pv_advance_ok;
+    std::printf(
+        "[ORDERED_SUBMIT] pv_task_identity=%s final=%d\n",
+        ok ? "PASS" : "FAIL", context.task_id
+    );
+    return ok;
+}
+
 bool RunReadyFaninPrefixCompactionTest() {
     SchedulerState *state = MapSchedulerState();
     if (state == nullptr) {
@@ -1059,6 +1095,8 @@ bool RunInsertReleaseBeforeBuildTest() {
         worker_results_ok &=
             result.worker_id == worker_id &&
             result.submits == kTaskCount &&
+            state->workers[worker_id].local_index ==
+                static_cast<int32_t>(kTaskCount) &&
             result.finish_cycle != 0 &&
             result.final_occupied == 0 &&
             result.completion_duplicates == 0;
@@ -1175,6 +1213,8 @@ bool RunIndependentKernelExecutionTest() {
         worker_results_ok &=
             result.worker_id == worker_id &&
             result.submits == kTaskCount &&
+            state->workers[worker_id].local_index ==
+                static_cast<int32_t>(kTaskCount) &&
             result.finish_cycle != 0 &&
             result.final_occupied == 0 &&
             result.completion_duplicates == 0;
@@ -1236,6 +1276,8 @@ int main() {
     const bool task_id_prefix_ok =
         RunSplitReplayTaskIdPrefixTest();
     const bool loser_ok = RunLoserZeroTensorMapAccessTest();
+    const bool pv_task_identity_ok =
+        RunPvTaskIdentityContractTest();
     const bool fanin_compaction_ok =
         RunReadyFaninPrefixCompactionTest();
     const bool pa_up_shape_ok =
@@ -1244,6 +1286,7 @@ int main() {
     const bool execution_ok =
         RunIndependentKernelExecutionTest();
     if (!claim_accounting_ok || !task_id_prefix_ok || !loser_ok ||
+        !pv_task_identity_ok ||
         !fanin_compaction_ok || !pa_up_shape_ok ||
         !overlap_ok || !execution_ok) {
         std::fprintf(
