@@ -13900,3 +13900,109 @@ FetchMax bracket 缩短，不是 scalar 外壳被消减；同时 Claim 父区间
 
 后续非 atomic loser 优化从保留的 `fd463c4c` 基线继续，不再通过在
 FetchMax 前插入额外工作来人为拉散 Claim。
+
+### 2026-07-30：shared DrainReady 只扫描普通可用槽（保留）
+
+#### 候选边界与正确性依据
+
+本阶段冻结 Claim、fanin、completion 等 atomic 协议，只消减 shared
+worker 在 `DrainReady()` 中对不可能被普通 PA winner 使用的物理 slot
+执行的重复检查。
+
+当前 slot 合同为：
+
+- `WorkerState` 仍保留 4 个物理 slot；
+- shared 单 lane PA 的普通容量为 `kUsableSlots == 2`；
+- `WaitForSlot()` 在 `occupied_count >= 2` 时先 drain，不能继续 Build；
+- `FindFreeSlot()` 始终返回最低编号的空 slot。
+
+因此正常 shared PA 只可能占用 slot 0/1。slot 2/3 是尚未接入本图的
+`BlockWon` 语义预留位，不应由每次 EfDrain、RingBackpressure 和
+FinalDrain 重复读取。本阶段将 shared `DrainReady()` 的扫描上界从 4
+收敛为 2，同时保持：
+
+- private `DrainReady()` 继续扫描 4 个 slot；
+- `DiscardBuiltTask()` 与 replay-fatal 清理继续扫描 4 个物理 slot；
+- 物理 ABI、可用容量、Build/执行次序及错误处理不变；
+- ClaimMax 的候选人口、地址、操作种类和调用次数不变。
+
+CCEC AIC/AIV 的优化后 LLVM IR 已独立生成并比较，循环终止条件确实由
+`index == 4` 变为 `index == 2`，不是只在源码层改变常量而被后端重新
+还原。
+
+#### 正确性与构建验证
+
+以下检查均通过：
+
+- CPU shared 全套门槛及 96-worker ordered Submit；
+- CPU private 全套门槛，确认模式宏没有改变 private 行为；
+- CCEC shared perf-clock 与 full-swimlane 的 AIC/AIV、split
+  runtime/finish、mixed ELF 和 manifest；
+- B256/G1、context 8192、real-compute `6,28,4,1` 的完整 A5 泳道：
+  96 核、1,280 tasks、73,728 Claim、1,280 winner、依赖签名
+  `b7d985d6edb07078`、TensorMap、heap、真实计算和后处理全部 PASS，
+  dropped record 为 0；
+- converter、exclusive analyzer、atomic/DCCI 源码覆盖和 artifact
+  manifest 共 97 项 Python 回归。
+
+候选泳道位于：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260730_130222_3656488/ccec/
+```
+
+其 Submit makespan 为 `2,376.858 us`。对照泳道
+`outputs/pa_scheduler_shared_swimlane_20260730_113145_3544887/ccec/`
+为 `2,367.119 us`；单次诊断构建只用于归因，不替代 perf-clock
+裁决。
+
+#### true-loser 非 atomic 归因
+
+两份泳道各有 72,448 个 true-loser。统计口径为：
+
+- EfDrain 从父区间中扣除 Kernel 与 Atomic 的区间并集；
+- Claim outer 从 Claim 父区间中扣除 Claim atomic；
+- tail 和 SubmitTransition 内两份数据均没有 Kernel/Atomic。
+
+| 非 atomic 区域 | 基线 core-time / 均值 | 候选 core-time / 均值 | 变化 |
+| --- | ---: | ---: | ---: |
+| EfDrain control | 6.525702 ms / 90.074 ns | 6.137015 ms / 84.709 ns | -5.956% |
+| Claim outer | 6.846398 ms / 94.501 ns | 6.374741 ms / 87.991 ns | -6.889% |
+| post-Claim tail | 11.297971 ms / 155.946 ns | 11.615971 ms / 160.335 ns | +2.815% |
+| SubmitTransition | 12.656433 ms / 174.697 ns | 11.877174 ms / 163.941 ns | -6.157% |
+| 合计 | 37.326504 ms / 515.218 ns | 36.004901 ms / 496.976 ns | -3.541% |
+
+合计减少 `1.321603 ms` 全核累计工作量，即每个 true-loser 减少
+`18.242 ns`。
+
+竞争时序改变后，winner 核身份也会变化。两份泳道的 true-loser 集合
+交集为 71,203，各有 1,245 个独有 actor；只比较交集 actor，非 atomic
+合计仍下降 `3.504%`，方向一致。因此上表不是伪装成逐 actor 配对的结果，
+但其人口结构与交集敏感性都支持同一结论。
+
+ClaimMax 的逻辑调用严格保持 `73,728 -> 73,728`，其中 true-loser
+均为 72,448。所有 atomic 总次数并不相等：logical calls 从 193,894
+变为 200,902，physical records 从 132,866 变为 134,333；差异只来自
+startup、fatal、fanin、replay-done 和 insert-predecessor 五类动态
+轮询。该变化是 worker 到达时序和依赖就绪时刻的结果，不是本阶段修改了
+atomic 协议，也解释了非 atomic 工作下降没有直接变成端到端净收益。
+
+#### perf-clock 与决定
+
+当前源码基线和候选各运行 12 个独立 B256 perf-clock 进程，其中后 4+4
+按位置对称顺序交错：
+
+| 构建 | mean | median | 范围 |
+| --- | ---: | ---: | ---: |
+| 基线 | 2,292.263 us | 2,292.732 us | 2,266.771～2,310.091 us |
+| 两槽扫描 | 2,304.011 us | 2,301.019 us | 2,269.191～2,359.725 us |
+| 变化 | +11.748 us / +0.513% | +8.287 us / +0.361% | — |
+
+仅看位置对称的后 4+4 个样本，候选均值回退 `0.246%`、中位数回退
+`0.238%`。两个口径均低于此前明确的约 2% 端到端护栏。
+
+本阶段保留。它没有取得端到端净收益，但在原始 `96/32/64` Claim 合同和
+完全相同的业务任务数下，使目标 true-loser 非 atomic 工作稳定下降
+约 `3.54%`，而端到端回退约 `0.24%～0.51%`。这符合“优先消减 loser
+本地控制工作，允许工作和等待迁移到 winner/atomic，但总时间不得回退
+超过 2%”的当前验收口径。

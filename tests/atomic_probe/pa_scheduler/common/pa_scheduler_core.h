@@ -589,8 +589,17 @@ PA_DEVICE uint32_t DrainReady(
         return 0;
     }
     uint32_t freed = 0;
-    // 一次调用遍历完本核全部私有 slot；未就绪项保留 occupied/built，已完成项立即清槽并继续扫描。
-    for (uint32_t index = 0; index < kPrivateSlots; ++index) {
+    // shared 单 lane PA 在 occupied_count 达到 kUsableSlots 前必先等待并
+    // drain，FindFreeSlot 又总取最低空槽，因此正常协议只会占用 slot 0/1。
+    // slot 2/3 是 BlockWon 预留位，不应在每次 EfDrain/FinalDrain 热路重复
+    // 读取；fatal 清理仍单独扫描全部 kPrivateSlots。private 保持原边界。
+    constexpr uint32_t kDrainSlotCount =
+#if PTO_FDWIC_SHARED_MAP
+        kUsableSlots;
+#else
+        kPrivateSlots;
+#endif
+    for (uint32_t index = 0; index < kDrainSlotCount; ++index) {
         PA_GM LocalSlot &slot = worker.slots[index];
         if (!slot.occupied || !slot.built || !SlotReady<Ops>(state, slot, stats)) {
             continue;

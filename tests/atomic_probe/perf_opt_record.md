@@ -1,8 +1,10 @@
+<!-- markdownlint-disable MD060 -->
+
 # A5 PA Submit 性能优化全过程记录
 
 ## 1. 文档目的与状态约定
 
-本文持续记录 A5 FDWIC Paged Attention `Case1` 的 Submit 调度性能优化过程。**当前性能优化目标只包含真实 simpler PA 路径**；`tests/atomic_probe/pa_scheduler` standalone 只保留为已经完成的历史方法验证、负结果和模型边界证据，不再作为当前待办或下一阶段优化对象。目标是让后续真实 PA 优化能够从可复核的源码、提交、实测数据和产物继续推进，而不是仅保留最终结论。
+本文持续记录 A5 FDWIC Paged Attention `Case1` 的 Submit 调度性能优化过程。2026-07-21 阶段曾只推进真实 simpler PA；自 2026-07-30 起，当前任务重新以 `tests/atomic_probe/pa_scheduler` standalone shared TensorMap 为对象，在原始 `96/32/64` Claim 合同下冻结 atomic 协议，先消减并验证 loser/nonwinner 的非 atomic 控制开销，再决定是否迁移真实路径。目标是让后续优化能够从可复核的源码、提交、实测数据和产物继续推进，而不是仅保留最终结论。
 
 本文使用以下状态标签：
 
@@ -16,7 +18,7 @@
 | **[设计中]** | 只有经过源码核对的方案，尚无完成提交或性能结论 |
 | **[验证中]** | 候选已落盘并通过部分门禁，但尚未完成真实 A5 正确性或性能裁决 |
 
-记录更新至 2026-07-21。当前分支为 `fdwic-swimlane-exclusive`，本阶段开始时 HEAD 为 `9f6140c1`，跟踪 `origin/fdwic-swimlane-deps`。后续每完成一个合理阶段，都应按第 12 节模板更新本文并形成一条带详细中文说明的本地提交。
+记录更新至 2026-07-30。当前分支为 `fdwic-swimlane-exclusive`，跟踪 `origin/fdwic-swimlane-deps`。后续每完成一个合理阶段，都应按第 12 节模板更新本文并形成一条带详细中文说明的本地提交。
 
 更细的专题资料分别见：
 
@@ -2736,7 +2738,7 @@ perf-clock 的 Case2 负测试不属于上述缺口：其每核实际 576 次与
 - 详细正文摘要：
 ```
 
-### 12.1 当前下一阶段：只推进真实 simpler PA
+### 12.1 2026-07-21 当时的下一阶段：只推进真实 simpler PA
 
 当前只进入真实 PA 观察基础设施阶段，不继续修改 standalone，也不立即猜测新的业务优化：
 
@@ -3397,3 +3399,65 @@ AICPU、Claim phase AICore、none AICore 和 host runtime 都完成真实 CANN/A
 `RuntimeBuilder("a5").get_binaries("fully_distributed_within_core", build=True)` 重建并落盘后，
 cache 与实际加载 host SO SHA 一致，所有真机门禁随即闭合。后续 ABI 变更必须核对实际加载件，
 不能只看 build cache 或把 host/device ABI 不一致误判成 PMU 行为。
+
+## 13. 2026-07-30 standalone shared loser 非 atomic 优化
+
+### 13.1 固定合同与观察口径
+
+本阶段只修改 `tests/atomic_probe/pa_scheduler` standalone shared 路径，
+不迁移真实 simpler。固定合同为：
+
+- 96 个 worker 全量回放同一任务计划；
+- Alloc/QK-PV/SF-UP 分别保持 `96/32/64` 个 Claim 候选；
+- ClaimMax 的类型、地址选择和候选人口冻结；
+- perf-clock 决定端到端护栏，full-swimlane 负责区分 atomic、Kernel 与
+  非 atomic loser 控制工作；
+- 当前保留条件为 loser 非 atomic 工作有效下降，同时端到端回退不超过
+  约 2%。
+
+true-loser 定义为 `Claim attempted && !won`。EfDrain 非 atomic 时间从
+父区间扣除 Kernel 与 Atomic 的区间并集；Claim outer 从 Claim 父区间
+扣除 atomic；不把 atomic 总线等待冒充 scalar 指令消减。
+
+### 13.2 shared DrainReady 两槽扫描
+
+**[已保留] shared 正常 drain 只扫描两个普通可用 slot**
+
+shared 单 lane PA 在 `occupied_count >= kUsableSlots == 2` 时先等待并
+drain，`FindFreeSlot()` 又总取最低空槽，因此正常路径只能占用 slot 0/1。
+候选只把 shared `DrainReady()` 的扫描上界从 4 收敛为 2；private 和
+fatal 清理仍扫描全部 4 个物理 slot。CCEC AIC/AIV 优化后 IR 已确认终止
+条件由 4 变为 2。
+
+CPU shared/private、CCEC perf-clock/full-swimlane、A5 B256 完整语义与
+后处理、97 项 Python 工具回归均通过。候选泳道：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260730_130222_3656488/ccec/
+```
+
+72,448 个 true-loser 的非 atomic core-time：
+
+| 区域 | 基线 | 候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| EfDrain control | 6.525702 ms | 6.137015 ms | -5.956% |
+| Claim outer | 6.846398 ms | 6.374741 ms | -6.889% |
+| post-Claim tail | 11.297971 ms | 11.615971 ms | +2.815% |
+| SubmitTransition | 12.656433 ms | 11.877174 ms | -6.157% |
+| 合计 | 37.326504 ms | 36.004901 ms | -3.541% |
+
+平均每个 true-loser 从 `515.218 ns` 降至 `496.976 ns`。两份泳道的
+true-loser 集合交集为 71,203；只比较交集仍下降 `3.504%`。
+
+ClaimMax 调用保持 `73,728`，但动态轮询使所有 logical atomic calls 从
+193,894 增至 200,902。因此该阶段没有宣称 atomic 次数整体下降。
+
+12+12 个独立 perf-clock 样本中，基线/候选 mean 为
+`2,292.263/2,304.011 us`，候选回退 `0.513%`；median 回退
+`0.361%`。其中位置对称的后 4+4 样本 mean/median 回退
+`0.246%/0.238%`。非 atomic loser 降幅明确且端到端低于 2% 护栏，
+因此保留。
+
+更完整的正确性证明、逐区域均值、动态 atomic 变化和产物说明见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
