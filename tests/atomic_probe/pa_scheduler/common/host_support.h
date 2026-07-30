@@ -1826,11 +1826,15 @@ inline void ExpectedTraceTopology(uint32_t worker, int32_t *block_id, int32_t *l
 
 #if PTO_FDWIC_SHARED_MAP
 inline bool SharedTraceClaimAttempted(
-    uint32_t worker, uint32_t task_id, TaskKind kind
+    uint32_t worker, TaskKind kind
 ) {
-    return IsSharedClaimParticipant(
-        worker, task_id, kind
-    );
+    if (kind == TaskKind::Alloc) {
+        return true;
+    }
+    const bool aic = worker < kAicWorkers;
+    return aic
+        ? kind == TaskKind::Qk || kind == TaskKind::Pv
+        : kind == TaskKind::Sf || kind == TaskKind::Up;
 }
 
 inline int32_t SharedTraceFunctionId(TaskKind kind) {
@@ -1871,9 +1875,7 @@ inline bool ExpandSharedTraceRecords(
              kSharedClaimWinnerBit) != 0;
         const bool attempted =
             task != nullptr &&
-            SharedTraceClaimAttempted(
-                worker, task_id, task->kind
-            );
+            SharedTraceClaimAttempted(worker, task->kind);
         const uint64_t claim_begin =
             endpoints.claim_begin;
         const uint64_t claim_end =
@@ -3932,32 +3934,14 @@ inline Metrics Validate(
     const uint64_t expected_submits = static_cast<uint64_t>(kWorkers) * task_count;
 #if PTO_FDWIC_SHARED_MAP
     const uint64_t expected_claims =
-        static_cast<uint64_t>(batches) *
-            kSharedAllocClaimParticipants +
+        static_cast<uint64_t>(batches) * kWorkers +
         static_cast<uint64_t>(group_count) *
-            (2U * kSharedAicClaimParticipants +
-             2U * kSharedAivClaimParticipants);
-    uint64_t expected_claims_by_worker[kWorkers] = {};
-    if (shared_plan_ok) {
-        for (const SharedHostPlannedTask &task :
-             shared_plan.tasks) {
-            for (uint32_t worker = 0;
-                 worker < kWorkers; ++worker) {
-                expected_claims_by_worker[worker] +=
-                    IsSharedClaimParticipant(
-                        worker, task.task_id, task.kind
-                    )
-                        ? 1U
-                        : 0U;
-            }
-        }
-    }
+            (2U * kAicWorkers + 2U * kAivWorkers);
 #else
     const uint64_t expected_claims =
         static_cast<uint64_t>(batches) * (kWorkers + kAicWorkers + kAivWorkers + kAicWorkers + kAivWorkers);
 #endif
-    // 上式依次对应 Alloc、QK、SF、PV、UP 的 shard-affine 候选数；
-    // shared 默认 256 batch/G1 时为 14,336，private 仍为 73,728。
+    // 上式依次对应 Alloc、QK、SF、PV、UP 的 active worker 数，默认 256 batch 时为 73728。
 
     // 聚合量分为调度核心计数、kernel 分布、前端操作数和最终状态四组，便于定位语义偏差。
     uint64_t first_submit = UINT64_MAX;
@@ -4016,9 +4000,6 @@ inline Metrics Validate(
     uint32_t winning_workers = 0;
     uint64_t max_worker_wins = 0;
     bool worker_shape_ok = true;
-#if PTO_FDWIC_SHARED_MAP
-    bool claim_worker_counts_ok = true;
-#endif
     bool submit_timestamps_ok = true;
     bool lifecycle_timestamps_ok = true;
 #if PA_BUILD_PERF_CLOCK
@@ -4262,14 +4243,6 @@ inline Metrics Validate(
 #endif
         submits += result.submits;
         claims += result.claim_attempts;
-#if PTO_FDWIC_SHARED_MAP
-        // 总 Claim 数只能证明候选数量，没有证明候选落在了正确 worker。
-        // 这里按 host 独立重建的 task plan 逐核核对 shard-affine 映射，
-        // 防止某个 shard 多发、另一个 shard 少发后总数恰好抵消。
-        claim_worker_counts_ok &=
-            result.claim_attempts ==
-                expected_claims_by_worker[index];
-#endif
         wins += result.claim_wins;
         if (result.claim_wins != 0) ++winning_workers;
         max_worker_wins = std::max(max_worker_wins, result.claim_wins);
@@ -4560,13 +4533,6 @@ inline Metrics Validate(
     );
     Expect(submits == expected_submits, "replay count is workers * tasks", &metrics);
     Expect(claims == expected_claims, "Claim attempt count matches PA topology", &metrics);
-#if PTO_FDWIC_SHARED_MAP
-    Expect(
-        claim_worker_counts_ok,
-        "each worker Claim count matches shard-affine task routing",
-        &metrics
-    );
-#endif
     Expect(wins == task_count, "exactly one winner per task", &metrics);
 #if PTO_FDWIC_SHARED_MAP
     Expect(

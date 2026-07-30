@@ -12836,7 +12836,7 @@ source-issue Exchange、普通 store 或删掉 publication 会失去 fail-closed
 共享状态校验，不属于可接受的性能优化。继续调整 scalar 指令最多只作用于
 约十几纳秒父子区间差，已没有与改动风险匹配的空间。
 
-### 2026-07-30：按 Claim cursor shard 筛选动态候选
+### 2026-07-30：按 Claim cursor shard 筛选动态候选（已撤回）
 
 #### 为什么先处理 loser Claim
 
@@ -12864,7 +12864,7 @@ true-loser `ClaimMax` 又占其中 `34.738 ms`。因此第一优先级是减少
 perf-clock 回退 2.27%；后者会把 winner/负载集中到少数 worker。本阶段
 没有重走这两条路线。
 
-#### 协议修改
+#### 实验性协议修改
 
 保留现有跨 task 高水位结构和实际 `FetchMax`：
 
@@ -12978,11 +12978,11 @@ core-time`，虽被 EfDrain 与 task 切换合计约 `9.23 ms` 的增加部分
 `31.507 ms` 变为 `31.662 ms（+0.49%）`，也没有用计算负载变化伪造
 收益。
 
-本阶段结论是：shard-affine 动态候选同时减少了 ClaimMax 次数和单次
-竞争长尾，是确定有效的第一阶段 loser 优化。下一阶段需要扫描每个 shard
-保留的候选宽度，判断继续减少 Claim 竞争是否会因 winner 集中和 fanin
-轮询反噬；EfDrain 与 UP 后 task 切换已成为新的相对热点，但在候选宽度
-收敛前不混入其他代码改动。
+这组数据只能证明：直接收窄 winner 候选资格会同时减少 ClaimMax 次数和
+竞争长尾，并显著缩短当前固定 B256。它不能证明这是与原调度合同等价的
+loser 优化。被筛掉的 worker 在原 `96/32/64` 合同下仍可能成为 winner，
+因此 31% 的端到端改善主要来自改变工作量和 winner 可选集合，不能作为
+后续优化基线。该方案现已撤回，数据仅保留为负面实验记录。
 
 ### 2026-07-30：撤回八路 Alloc 高水位的 12/8/8 过程态
 
@@ -13004,14 +13004,49 @@ loser 控制总量下降 1.35%。
   不能据此证明任意任务图、候选核阻塞或 winning-slot 压力下与原合同
   等价。
 
-因此当前正式状态恢复为 24/8/8：四路 Alloc、四路 cube、八路
-shared-vector 高水位都保持不变，只保留 `5d34768a` 引入的 cursor-shard
-候选策略。后者同样被明确标记为调度策略变化，不能再称为“删除必输
-atomic”；迁往真实 simpler 前必须独立确认其 winner 资格合同。
+继续复审 `24/8/8` 后确认，它与 `12/8/8` 一样改变 winner 资格，只是
+没有改变四路 Alloc、四路 cube、八路 shared-vector 的物理 cursor 数量。
+固定 B256 的功能闭合不足以证明任意调度条件下与原合同等价，因此
+`5d34768a` 的候选过滤也一并撤回。
 
-回退后使用系统 GCC 13 重新执行 CPU shared/private 全套门槛，shared
-cursor Claim、ordered-submit、TensorMap/history、heap、稀疏泳道编码及
-private ring 全部通过。GCC 15.0.1 与本机 binutils 2.42 在生成
-`.base64` 汇编伪指令时不兼容；CPU `perf-clock` 还触发当前基线
-`pa_trace.h` 的 trace-free 未使用变量告警，这两项均未混入本次 Claim
-协议修改。
+当前正式状态恢复为原始 `96/32/64`：
+
+- Alloc 由全部 96 个 worker 参与 Claim；
+- QK/PV 由全部 32 个 AIC 参与 Claim；
+- SF/UP 由全部 64 个 AIV 参与 Claim；
+- 仍分别使用四路 Alloc、四路 cube、八路 shared-vector 高水位 cursor；
+- B256 实际 Claim 恢复为 73,728 次。
+
+后续 loser 优化不得通过取消原有 worker 的 winner 资格来减少 Claim。
+任何数据布局、轮询或观察代码候选都必须在这份原始合同上重新做
+正确性、泳道和 perf-clock A/B；此前基于 `24/8/8` 得到的 EfDrain
+数据只能作为探索线索，不能直接作为保留证据。
+
+#### 恢复后的门槛与权威基线
+
+恢复后，Claim 运行时代码、host oracle、compact raw 重建和现行使用说明
+均回到 `e9f59d16` 的 `96/32/64` 合同；只额外保留同 cursor 跨 task
+高水位推进的 CPU 正确性覆盖。
+
+- 系统 GCC 13 下 CPU shared/private 全套门槛通过，包括 cursor Claim、
+  ordered-submit、TensorMap/history、heap、稀疏泳道编码和 private ring；
+- 当前源码的 CCEC shared perf-clock 完整构建通过；
+- Python converter/analyzer 等 160 项回归通过；
+- A5 B256/G1 首个恢复样本为 `2303.206 us`，Claim 精确为 73,728，
+  所有调度、依赖、TensorMap、heap、completion 和真实计算断言均通过；
+- 随后 10 个独立进程全部
+  `execution_status=PASS / semantic_status=PASS /
+  postprocess_status=PASS`。
+
+10 次 Submit 时间为：
+
+`2315.797、2291.816、2311.828、2319.741、2317.660、2299.137、`
+`2300.600、2308.441、2293.263、2297.681 us`
+
+mean/median 为 `2305.596/2304.520 us`，范围为
+`2291.816～2319.741 us`。这组约 `2.306 ms` 的结果重新成为所有后续
+loser 优化的 perf-clock 权威基线。
+
+GCC 15.0.1 与本机 binutils 2.42 在生成 `.base64` 汇编伪指令时不兼容；
+CPU `perf-clock` 还触发当前基线 `pa_trace.h` 的 trace-free 未使用变量
+告警。这两项既有工具链问题没有混入 Claim 协议修改。

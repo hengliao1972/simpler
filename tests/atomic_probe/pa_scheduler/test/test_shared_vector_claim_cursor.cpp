@@ -158,15 +158,31 @@ bool CursorsMatch(const SchedulerState &state, const CursorValues &expected) {
 }
 
 uint32_t ExpectedCandidates(TaskKind kind) {
-    return SharedClaimParticipantCount(kind);
+    switch (kind) {
+    case TaskKind::Alloc:
+        return kWorkers;
+    case TaskKind::Qk:
+    case TaskKind::Pv:
+        return kAicWorkers;
+    case TaskKind::Sf:
+    case TaskKind::Up:
+        return kAivWorkers;
+    case TaskKind::Count:
+        return 0;
+    }
+    return 0;
 }
 
 bool IsCandidate(
-    TaskKind kind, uint32_t worker_id, uint32_t task_id
+    TaskKind kind, uint32_t worker_id, uint32_t
 ) {
-    return IsSharedClaimParticipant(
-        worker_id, task_id, kind
-    );
+    if (kind == TaskKind::Alloc) {
+        return true;
+    }
+    const bool is_aic = worker_id < kAicWorkers;
+    return kind == TaskKind::Qk || kind == TaskKind::Pv
+        ? is_aic
+        : !is_aic;
 }
 
 bool RunConcurrentClaim(SchedulerState &state, uint32_t task_id, TaskKind kind) {
@@ -244,7 +260,7 @@ void TestAllTaskKindsUseCursorClaim() {
 
     // 后三项分别复用 QK101 的 cube shard、Alloc100 的 alloc
     // shard 和 SF102 的 shared-vector shard。它们仍各自产生唯一
-    // winner，证明筛选后的固定候选集合能完整推进同一高水位链。
+    // winner，证明完整 role 候选集合能推进同一高水位链。
     // 再回放较旧的 QK101 时，cube cursor 已被 PV105 推进到 105，
     // 本 shard 候选必须正常发 atomic 并判输。
     WorkerState &replay_worker = state->workers[1];
@@ -259,7 +275,7 @@ void TestAllTaskKindsUseCursorClaim() {
 
     Check(
         exact, "all task kinds keep cursor routing, exact candidates, "
-               "shard-affine participants, one winner, legal replay, "
+               "role participants, one winner, legal replay, "
                "and untouched deps_prepared"
     );
     (void)munmap(state, sizeof(*state));

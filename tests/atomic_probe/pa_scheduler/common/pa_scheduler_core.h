@@ -789,38 +789,6 @@ struct ClaimOutcome {
     int32_t function_id;
 };
 
-#if PTO_FDWIC_SHARED_MAP
-PA_DEVICE bool IsSharedClaimParticipantDevice(
-    uint32_t worker_id, uint32_t task_id, TaskKind kind
-) {
-    // CCEC 的正式 kernel 会在定义 PA_DEVICE 前先包含 winner_workload.h，
-    // 因此这里保留一份真正的 device helper；host/raw oracle 使用
-    // pa_model.h 中相同公式的 constexpr 版本。
-    if (worker_id >= kWorkers ||
-        task_id >= kTaskCellCapacity) {
-        return false;
-    }
-    if (kind == TaskKind::Alloc) {
-        return worker_id % kCursorShards ==
-               task_id % kCursorShards;
-    }
-    if (kind == TaskKind::Qk ||
-        kind == TaskKind::Pv) {
-        return worker_id < kAicWorkers &&
-               worker_id % kCursorShards ==
-                   task_id % kCursorShards;
-    }
-    if (kind == TaskKind::Sf ||
-        kind == TaskKind::Up) {
-        return worker_id >= kAicWorkers &&
-               (worker_id - kAicWorkers) %
-                       kSharedVectorCursorShards ==
-                   task_id % kSharedVectorCursorShards;
-    }
-    return false;
-}
-#endif
-
 template <typename Ops>
 PA_DEVICE ClaimOutcome Claim(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_id, TaskKind kind,
@@ -829,26 +797,12 @@ PA_DEVICE ClaimOutcome Claim(
     // Claim 在单调 cursor 上执行 atomicMax。private/Cube/Alloc 使用
     // production-prefix 四分片；shared Vector 使用 sidecar 中的八分片
     // cursor。同一 task 只有观察到旧值更小的竞争者获胜。
-    // private 保持 Alloc 96、QK/PV 32 个 AIC、SF/UP 64 个 AIV
-    // 的完整竞争；shared 按显式 worker/cursor shard 策略把候选
-    // 收敛为 24/8/8。该策略改变 winner 可选集合，不把被筛掉的
-    // worker 误称为原协议下必输。
+    // Alloc 由全部 96 个 worker 竞争；QK/PV 仅 32 个 AIC、
+    // SF/UP 仅 64 个 AIV 发 atomicMax。
     ClaimOutcome outcome{false, false, 0, -1};
     if (task_id >= kTaskCellCapacity) {
         return outcome;
     }
-#if PTO_FDWIC_SHARED_MAP
-    // 先按现有 cursor shard 过滤候选，再进入生产 active-mask 路由。
-    // 所有 worker 仍完整重放每个 Submit；非本 shard 的 actor 只是不再
-    // 发射必输的 atomicMax。private 的候选集合保持不变。
-    if (worker.core_idx < 0 ||
-        !IsSharedClaimParticipantDevice(
-            static_cast<uint32_t>(worker.core_idx),
-            task_id, kind
-        )) {
-        return outcome;
-    }
-#endif
     PA_GM AtomicLine *cursor = nullptr;
     if (kind == TaskKind::Alloc) {
         cursor = &state->alloc_cursor[task_id % kCursorShards];

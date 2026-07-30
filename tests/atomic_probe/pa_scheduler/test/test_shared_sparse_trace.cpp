@@ -215,10 +215,10 @@ void TestSharedCompactReconstruction() {
     constexpr uint64_t base_cycle = 5000;
     const SharedHostTaskPlan plan = MakeCompactTracePlan();
     constexpr bool winners[] = {
-        true, false, false, false, false,
+        true, false, false, true, false,
     };
     constexpr bool attempted[] = {
-        true, false, false, false, false,
+        true, true, false, true, false,
     };
     std::vector<SharedSubmitClaimTraceRecord> compact(
         plan.total_tasks
@@ -413,20 +413,14 @@ void TestRejectsBadSharedCompactRecords() {
         );
     }
     TraceRecord unused_generic{};
-    auto accepted_by = [&](
-        uint32_t observed_worker,
-        const std::vector<SharedSubmitClaimTraceRecord> &records
-    ) {
-        std::vector<TraceRecord> logical;
-        return ExpandSharedTraceRecords(
-            observed_worker, &unused_generic, 0,
-            records.data(), plan, &logical
-        );
-    };
     auto rejected = [&](
         const std::vector<SharedSubmitClaimTraceRecord> &records
     ) {
-        return !accepted_by(worker, records);
+        std::vector<TraceRecord> logical;
+        return !ExpandSharedTraceRecords(
+            worker, &unused_generic, 0,
+            records.data(), plan, &logical
+        );
     };
 
     std::vector<SharedSubmitClaimTraceRecord> bad = valid;
@@ -444,30 +438,6 @@ void TestRejectsBadSharedCompactRecords() {
     Check(
         rejected(bad),
         "winner on a role-ineligible Claim is rejected"
-    );
-
-    bad = valid;
-    bad[1].claim_end_and_winner |=
-        pa_scheduler::kSharedClaimWinnerBit;
-    Check(
-        rejected(bad),
-        "winner on a role-eligible but wrong-shard AIC Claim is rejected"
-    );
-    Check(
-        accepted_by(1, bad),
-        "winner on the matching AIC Claim shard is accepted"
-    );
-
-    bad = valid;
-    bad[2].claim_end_and_winner |=
-        pa_scheduler::kSharedClaimWinnerBit;
-    Check(
-        accepted_by(pa_scheduler::kAicWorkers + 2U, bad),
-        "winner on the matching AIV-local Claim shard is accepted"
-    );
-    Check(
-        !accepted_by(pa_scheduler::kAicWorkers + 3U, bad),
-        "winner on a role-eligible but wrong-shard AIV Claim is rejected"
     );
 
     bad = valid;
