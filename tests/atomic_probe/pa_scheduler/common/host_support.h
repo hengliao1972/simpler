@@ -1847,9 +1847,8 @@ inline bool SharedTraceClaimAttempted(
     uint32_t worker, uint32_t task_id, TaskKind kind
 ) {
     if (kind == TaskKind::Alloc) {
-        return worker < kWorkers &&
-               worker % kCursorShards ==
-                   task_id % kCursorShards;
+        (void)task_id;
+        return worker < kWorkers;
     }
     const bool aic = worker < kAicWorkers;
     return aic
@@ -3964,8 +3963,8 @@ inline Metrics Validate(
     const uint64_t expected_claims =
         static_cast<uint64_t>(batches) * (kWorkers + kAicWorkers + kAivWorkers + kAicWorkers + kAivWorkers);
 #endif
-    // shared 只把 Alloc 从 96 收窄到 24；QK/SF/PV/UP 仍保持
-    // 32/64/32/64，默认 B256/G1 共 55,296 次 Claim。
+    // shared Alloc 恢复全部 96 核候选；QK/SF/PV/UP 保持
+    // 32/64/32/64，默认 B256/G1 共 73,728 次 Claim。
 
     // 聚合量分为调度核心计数、kernel 分布、前端操作数和最终状态四组，便于定位语义偏差。
     uint64_t first_submit = UINT64_MAX;

@@ -211,7 +211,10 @@ SharedHostTaskPlan MakeCompactTracePlan() {
 }
 
 void TestSharedCompactReconstruction() {
-    constexpr uint32_t worker = 0;
+    // worker 1 不属于旧 task0%4 的 24 核分片。用它作为
+    // Alloc winner 锁定当前 96 核全候选合同，避免 host 转换器
+    // 沿用旧 role-derived attempted 判断而拒绝有效设备记录。
+    constexpr uint32_t worker = 1;
     constexpr uint64_t base_cycle = 5000;
     const SharedHostTaskPlan plan = MakeCompactTracePlan();
     constexpr bool winners[] = {

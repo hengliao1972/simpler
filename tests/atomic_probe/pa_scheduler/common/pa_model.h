@@ -211,22 +211,25 @@ constexpr uint32_t kAivWorkers = 64;
 constexpr uint32_t kWorkers = kAicWorkers + kAivWorkers;
 constexpr uint32_t kRuntimeMaxWorkers = 108;
 constexpr uint32_t kCursorShards = 4;
-// shared Alloc 试验只收窄 Alloc 的动态候选集合：映射到本 task
-// alloc_cursor shard 的 24 个 worker 参与 Claim。Cube/Vector 仍保持
-// 全部合法核型分别 32/64 个竞争者，不能复用旧 24/8/8 合同。
-constexpr uint32_t kSharedAllocClaimParticipants =
-    kWorkers / kCursorShards;
+// shared Alloc 恢复全部 96 个 worker 参与 Claim。两级 Tournament
+// 仍把同地址竞争分散到八个 local 节点，但不再用 task-id
+// 分片剥夺空闲非候选核的接管机会。Cube/Vector 仍按合法核型
+// 分别保持 32/64 个竞争者。
+constexpr uint32_t kSharedAllocClaimParticipants = kWorkers;
 static_assert(
-    kWorkers % kCursorShards == 0 &&
-        kSharedAllocClaimParticipants == 24,
-    "shared Alloc Claim participants must stay 24"
+    kSharedAllocClaimParticipants == 96,
+    "shared Alloc Claim participants must cover all workers"
 );
 #if PTO_FDWIC_SHARED_MAP
-// shared owner 仲裁保持原有 24/32/64 个合法候选，只把它们分散到
+// shared owner 仲裁保持 96/32/64 个合法候选，只把它们分散到
 // per-task 两级 Tournament：每组先选一个 local owner，各 local owner
 // 再竞争唯一 root owner。组数来自 A5 同地址竞争探针的实测候选，不能
 // 解释为缩减 Submit 参与核数。
-constexpr uint32_t kSharedAllocClaimTournamentGroups = 4;
+// Alloc 恢复 96 候选后使用 8 组，把两级同地址宽度从
+// G4 的 24/4 收敛为 12/8。G12 的 A5 mean 只比 G8 改善
+// 0.029%，无法覆盖四个额外 local 节点带来的状态增量；因此
+// 复用已有 8 个 local 节点，不增加 SchedulerState 大小。
+constexpr uint32_t kSharedAllocClaimTournamentGroups = 8;
 constexpr uint32_t kSharedAicClaimTournamentGroups = 6;
 constexpr uint32_t kSharedAivClaimTournamentGroups = 8;
 constexpr uint32_t kSharedClaimTournamentMaxGroups =
@@ -236,9 +239,9 @@ constexpr uint32_t kSharedClaimTournamentMaxGroups =
 // 节点不与普通 store/DCCI 数据共线。
 constexpr uint32_t kSharedClaimTournamentNodeStride = 512;
 static_assert(
-    kSharedAllocClaimParticipants == 24 &&
+    kSharedAllocClaimParticipants == 96 &&
         kAicWorkers == 32 && kAivWorkers == 64,
-    "shared Claim candidate populations must remain 24/32/64"
+    "shared Claim candidate populations must remain 96/32/64"
 );
 static_assert(
     kSharedAllocClaimTournamentGroups > 0 &&

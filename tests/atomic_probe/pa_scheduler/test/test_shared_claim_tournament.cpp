@@ -198,8 +198,8 @@ bool IsCandidate(
     TaskKind kind, uint32_t worker_id, uint32_t task_id
 ) {
     if (kind == TaskKind::Alloc) {
-        return worker_id % kCursorShards ==
-               task_id % kCursorShards;
+        (void)task_id;
+        return worker_id < kWorkers;
     }
     const bool is_aic = worker_id < kAicWorkers;
     return kind == TaskKind::Qk || kind == TaskKind::Pv
@@ -211,7 +211,7 @@ uint32_t CandidateRank(
     TaskKind kind, uint32_t worker_id
 ) {
     if (kind == TaskKind::Alloc) {
-        return worker_id / kCursorShards;
+        return worker_id;
     }
     return kind == TaskKind::Qk || kind == TaskKind::Pv
         ? worker_id
@@ -380,7 +380,7 @@ void TestAllTaskKindsAndReplay() {
 
     Check(
         exact,
-        "all task kinds preserve 24/32/64 candidates, exact-one "
+        "all task kinds preserve 96/32/64 candidates, exact-one "
         "owner, immediate replay losers, untouched deps_prepared, "
         "and untouched legacy cursors"
     );

@@ -13,14 +13,13 @@
 - 32 个 AIC worker、64 个 AIV worker，物理启动比例为 1:2；
 - 默认 256 个 batch，每 batch 依次提交 Alloc、QK、SF、PV、UP 五个 task；
 - 96 个 worker 各自回放 1,280 次 Submit，共 122,880 次 Submit；
-- 96 个 worker 都回放全部 Submit。private Alloc 保持 96 个
-  worker 竞争；shared Alloc 仅由映射到同一 alloc cursor shard 的
-  24 个 worker 竞争。QK/PV 仍由 32 个 AIC 竞争，SF/UP 仍由
-  64 个 AIV 竞争；
-- private 使用 production-prefix 的 4 路 Alloc/cube/vector Claim
-  cursor；当前 shared 让 Vector 使用 sidecar 中全部 8 个 active
-  shard，Cube/Alloc 仍使用 production-prefix 4 路；两种模式都执行
-  实际 `atomicMax` Claim；
+- 96 个 worker 都回放全部 Submit。private/shared Alloc 均保持
+  全部 96 个 worker 为合法候选；QK/PV 由 32 个 AIC 竞争，
+  SF/UP 由 64 个 AIV 竞争；
+- private 使用 production-prefix 的 4 路 Alloc/cube/vector `atomicMax`
+  cursor。shared 不再使用这些旧 cursor 认领 task，而是使用
+  per-task 两级 CAS Tournament：Alloc/QK-PV/SF-UP 分别使用
+  8/6/8 个 local 组，最终产生唯一 owner；
 - PA 的 TaskArgs、Tensor、TaskPayload、DistSubmitCtx、DistCore/DistGlobal 关键 ABI 布局；
 - tensor tag 扫描、输出 layout、materialize，以及按构建模式选择的 private
   每核有界桶环或 shared 有序桶环的 retire/lookup/insert、register mask；
@@ -29,9 +28,10 @@
 - 与真实 PA 相同的单 lane 优化：Case1 不执行 BlockWon 轮询；
 - 与真实泳道格式对齐的阶段记录及严格的结束状态校验。
 
-默认工作量在 private 模式产生 73,728 次 Claim，在 shared 模式
-产生 55,296 次 Claim；两种模式都产生 1,280 个 winner 和 1,024 次
-kernel 执行。每次运行都会校验这些数量以及最终 TensorMap、heap、
+默认工作量在 private/shared 两种模式都产生 73,728 次
+逻辑 Claim；shared Tournament 另外产生 9,216 次 root CAS，因此
+共有 82,944 次物理 CAS。两种模式都产生 1,280 个 winner 和
+1,024 次 kernel 执行。每次运行都会校验这些数量以及最终 TensorMap、heap、
 cursor、flag、vend、frontier 和 worker 状态，任一不符都会返回失败。
 
 两种 TensorMap 构建都先执行 `EfDrain` 和 `Claim`。private 随后保持
@@ -39,8 +39,9 @@ compete-first eager：每核构造五类完整 `TaskArgs` 并执行 per-worker
 Materialize/map 前端。shared 的 Alloc/QK/SF/PV/UP 五类 task 都只有
 Claim owner 构参和 Materialize；loser 只声明稳定 output symbol，并闭合
 轻量 Submit 边界。这里的零访问从 Claim 已经判负后的 finish/replay 入口
-开始：该路径不等待或访问 TensorMap；Claim 自身仍会访问位于 shared
-sidecar 的 Vector cursor，不属于该断言。CCEC 正式泳道构建将
+开始：该路径不等待或访问 TensorMap；Claim 自身仍会访问 shared
+sidecar 中当前 task 的 local/root Tournament 节点，不属于该断言。
+CCEC 正式泳道构建将
 orchestration caller、每核 runtime state 和 noinline finish 拆分为独立
 TU；CPU 使用同一公共业务模板做协议回归。本阶段只验收 CCEC 与 CPU，
 不把 AscendC 结果写进闭环证据。

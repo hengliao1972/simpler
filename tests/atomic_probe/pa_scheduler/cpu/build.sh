@@ -245,7 +245,7 @@ else
     "$BUILD_DIR/test_shared_heap_reserve"
 
     # shared Claim 使用每 task 两级 CAS Tournament：96 worker 锁定
-    # 24/32/64 候选数、每组一个 root 竞争者、最终唯一 owner、重复
+    # 96/32/64 候选数、每组一个 root 竞争者、最终唯一 owner、重复
     # replay 全输，并证明未来 task 不会覆盖延迟的前序 task。Claim 仍不
     # 触碰 deps_prepared；TensorMap 顺序由独立 completion 链门槛验证。
     echo "[BUILD] shared Claim Tournament self-test"

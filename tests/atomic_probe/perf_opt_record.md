@@ -4793,3 +4793,90 @@ B256 perf-clock 进程；30/30 轮全部语义 PASS：
 12.6 倍。该结果证明拓扑改造已显著降低对候选数的敏感性，但当前
 业务合同仍保留已提交的 24 候选版；96 代码只用于本次 A/B，已完整
 撤回并重建 24 候选的 CCEC 产物。
+
+### 14.7 恢复 Alloc 96 候选并重新选择 Tournament 分组
+
+#### 14.7.1 为什么不再保留 24 候选
+
+24 候选并不是永久固定的 24 个核：旧映射按
+`task_id % 4` 在四个互斥集合之间轮转，B256 中每个集合都
+承担 64 个 Alloc。但对任意一个具体 Alloc，仍然只有当次的
+24 个核能执行 Claim，其余 72 个核即使先到也只能记为
+`not_attempted`，没有接管通道。
+
+在 2026-07-31 的 `N24/G4` 完整泳道中，对 256 个 Alloc 逐任务
+比较“96 核中最早 Claim 起点”与“24 个合法候选中最早
+attempted Claim 起点”，候选到达差为：
+
+| 指标 | 候选到达差 |
+| --- | ---: |
+| mean | 2.070 us |
+| median | 0.638 us |
+| p95 | 8.533 us |
+| max | 17.735 us（task 1060） |
+| `> 1 us` / `> 5 us` / `> 10 us` | 113 / 39 / 8 个 task |
+
+该指标包含真实 worker 到达偏斜与泳道观察影响，不是单条 atomic
+延迟；它回答的是更直接的调度问题：部分非候选核确实已经到达
+Alloc，但合法候选尚未到达。当前所有 worker 都会有限时间回放
+完整 DAG，因此它在已测 PA 中主要是长尾和负载倾斜风险，不是已复现
+的漏 winner。但 shared TensorMap 的 `deps_prepared` 严格插入链会把某个
+延迟 owner 传导到后续 metadata 提交，因此主线不再以缩小合法
+候选人口换取性能。
+
+#### 14.7.2 `N96/G4` 不是合理的最终形状
+
+恢复 96 候选时，如果直接复用 G4，一次 Alloc 的物理操作为
+`96 local CAS + 4 root CAS`，但两级同地址竞争宽度为
+`24/4`：第一级明显过重。这个 G4 只适合隔离“候选人口”变量的
+历史 A/B，不应直接成为主线。
+
+本轮在相同 CANN、B256、real-compute、perf-clock 构建下继续
+比较 G8 与 G12。G4 复用 14.6 的 10 轮独立进程数据；G8/G12
+各重新运行 10 个独立进程，30/30 轮全部语义 PASS：
+
+| Alloc 形状 | 两级竞争宽度 | mean | median | range |
+| --- | ---: | ---: | ---: | ---: |
+| N96/G4 | 24/4 | 1,503.231 us | 1,501.308 us | 1,493.809～1,514.861 us |
+| N96/G8 | 12/8 | 1,496.085 us | 1,496.302 us | 1,478.561～1,516.854 us |
+| N96/G12 | 8/12 | 1,495.651 us | 1,494.720 us | 1,477.646～1,512.517 us |
+
+G8 相对 G4 的 mean/median 分别改善 `7.145/5.006 us`，即
+`0.475%/0.333%`。G12 相对 G8 的 mean 只改善 `0.434 us`
+（`0.029%`），median 改善 `1.582 us`（`0.106%`），区间高度重叠，
+不足以证明可重复收益。
+
+G8 复用原有 8 个 local 节点，Tournament 传输保持
+`20,054,016 B`。G12 需要 `28,966,912 B`，额外增加
+`8,912,896 B`；这个状态代价没有对应的可辨识性能收益，因此
+G12 已撤回，不再继续盲目枚举需要扩容的 G10。
+
+#### 14.7.3 最终主线合同
+
+- Alloc/QK-PV/SF-UP 的合法候选人口为 `96/32/64`；
+- local 组数为 `8/6/8`，同地址竞争宽度为
+  Alloc `12/8`、AIC 任务约 `6/6`、AIV 任务 `8/8`；
+- B256 逻辑 Claim 为 `73,728`，root CAS 为 `9,216`，物理
+  CAS 合计 `82,944`；
+- owner 仲裁与 `deps_prepared` 严格 TensorMap 插入链继续解耦；
+- CPU 96 线程 Tournament 门槛和完整 B256 语义回归均 PASS；
+- CCEC AIC/AIV 通用实例、split finish、混合 ELF 与 manifest 均通过。
+
+G8 实测原始日志位于 `/tmp/pa_n96_g8.6i0LiD`，G12 否定试验位于
+`/tmp/pa_n96_g12.GCkb6t`。两者都是临时取证目录；可持久结论以本节
+数值与后续归档泳道为准。
+
+最终 `N96/G8` 的完整 atomic/DCCI 泳道为：
+
+```text
+tests/atomic_probe/pa_scheduler/test_record/2026-8-1/
+  shared_b256_tournament_alloc96_g8_cube32_g6_vector64_g8_1704612us_merged_swimlane.json
+```
+
+该轮 Submit 为 `1,704.612 us`，local/root CAS 分别精确为
+`73,728/9,216`，共 `82,944` 次；validation PASS，drop 为 0。
+首轮设备执行虽然通过，host 转换器仍用旧
+`worker % 4 == task_id % 4` 判定 Alloc attempted，因而错误拒绝了
+非旧分片核产生的合法 winner。修正 `SharedTraceClaimAttempted()` 为
+96 核全候选后，转换和 exclusive analyzer 均通过；CPU 回归另用
+worker 1 作为 task 0 Alloc winner，专门锁定这个跨旧分片语义。

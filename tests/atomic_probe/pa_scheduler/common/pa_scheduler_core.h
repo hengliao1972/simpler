@@ -823,7 +823,7 @@ PA_DEVICE ClaimOutcome Claim(
 ) {
     // private 继续在单调 cursor 上执行 atomicMax；shared 则用每 task
     // 独立的两级 CAS Tournament 选出唯一 owner。两种模式都保持既有
-    // 候选合同：shared Alloc/QK-PV/SF-UP 分别为 24/32/64，private
+    // 候选合同：shared Alloc/QK-PV/SF-UP 分别为 96/32/64，private
     // Alloc 仍为 96。shared 的 TensorMap 严格插入顺序不由 Claim 承担，
     // 而由 winner 后续的 deps_prepared commit chain 单独保证。
     // role 来自 RunSchedulerImpl 的入口 SSA 值；不能在每个 task 中再从
@@ -843,14 +843,14 @@ PA_DEVICE ClaimOutcome Claim(
 #endif
     if (kind == TaskKind::Alloc) {
 #if PTO_FDWIC_SHARED_MAP
-        if (worker_id >= kWorkers ||
-            worker_id % kCursorShards !=
-                task_id % kCursorShards) {
+        if (worker_id >= kWorkers) {
             return outcome;
         }
-        // 候选 worker 是 task_id%4, task_id%4+4, ...；除以四得到
-        // 稳定的 [0,24) rank，再轮转到四个 local 节点。
-        candidate_rank = worker_id / kCursorShards;
+        // Alloc 的 96 个 worker 全部可候选；worker_id 本身就是
+        // 稳定的 [0,96) rank，取模后八个 local 节点各承担
+        // 12 个候选。这只改变 owner 仲裁人口，不改变后续
+        // deps_prepared 严格插入链。
+        candidate_rank = worker_id;
         tournament_groups =
             kSharedAllocClaimTournamentGroups;
 #else
@@ -913,7 +913,7 @@ PA_DEVICE ClaimOutcome Claim(
 
     // 每个候选只等待自己唯一一次 local CAS 的返回。失败者立即返回；
     // 每组唯一 local owner 才继续访问 root，因此 root 同地址竞争者从
-    // 24/32/64 收敛为 4/6/8。
+    // 96/32/64 收敛为 8/6/8。
     const int64_t local_observed =
         TraceAtomicCompareExchange<Ops>(
             stats.trace, stats.result,
