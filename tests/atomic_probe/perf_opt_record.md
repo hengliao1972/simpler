@@ -3426,7 +3426,12 @@ true-loser 定义为 `Claim attempted && !won`。EfDrain 非 atomic 时间从
 
 ### 13.2 shared DrainReady 两槽扫描
 
-**[已保留] shared 正常 drain 只扫描两个普通可用 slot**
+**[泛化复审后撤销] shared 正常 drain 只扫描两个普通可用 slot**
+
+2026-07-31 按全算子合同复审后，本项不再保留。MIX/BlockWon follower
+可能使用 slot2/3，`DrainReady()` 不能因为当前 PA 单 lane 用例只出现
+slot0/1 就缩小扫描上界。当前实现恢复扫描全部 `kPrivateSlots`，仅保留
+13.18 中与算子无关的 `occupied_count` 提前结束机制。
 
 shared 单 lane PA 在 `occupied_count >= kUsableSlots == 2` 时先等待并
 drain，`FindFreeSlot()` 又总取最低空槽，因此正常路径只能占用 slot 0/1。
@@ -3503,7 +3508,13 @@ tests/atomic_probe/pa_scheduler/outputs/
 
 ### 13.4 shared block-group 状态改为 winner-only
 
-**[已保留] nonwinner 不再准备只供构参消费的 group 派生量**
+**[泛化复审后撤销] nonwinner 不再准备只供构参消费的 group 派生量**
+
+2026-07-31 二次按全算子合同复审后，本项不再保留。它虽然不改变 PA
+语义且有明确局部收益，但 `PreparePaBlockGroup()`、固定四阶段 group
+和 Alloc→QK 人口都属于 PA 参数布局，不能作为 shared runtime 的通用
+优化，也不能移到 PA adapter 后继续保留。当前恢复为所有 replay actor
+按 PA 原有流程推进 group 状态。
 
 `PreparePaBlockGroup()` 的三个结果字段只由 QK/SF/PV/UP winner 构参
 读取。shared 修改为每种 task 的 Claim winner 在构参前按已验证
@@ -3522,8 +3533,8 @@ SubmitTransition 复核如下：
 | 16,384 个 AIV QK not-attempted | 184.568/184.621 ns | 162.548/161.946 ns | **-11.93%～-12.28%** |
 
 全核中位数由 `119/120 ns` 降至两次均为 `104 ns`。AIC 回退显式保留，
-但真实 32:64 加权的直接目标区重复改善约 6.7%，因此按本轮只看
-non-atomic 收益的口径保留。
+但真实 32:64 加权的直接目标区重复改善约 6.7%。这些数据继续作为历史
+取证，不能覆盖本轮“所有算子可用”的准入条件。
 
 候选泳道：
 
@@ -3900,7 +3911,12 @@ not-attempted AIV tail 另有 `+5.641%` 回退，全部 122,784 条 Transition
 
 ### 13.14 shared 按角色保存 output handle
 
-**[已保留] 删除 73,728 次无本核消费者的句柄赋值**
+**[泛化复审后撤销] 删除 73,728 次无本核消费者的句柄赋值**
+
+2026-07-31 按全算子合同复审后，本项不再保留。AIC/AIV 的消费者矩阵
+只是当前 PA task 图的活跃字段集合，不是 shared runtime 的通用不变量。
+当前 `AcceptTaskOutputs()` 对所有 replay actor 保存完整逻辑输出状态，
+其他算子改变 task 所有权或后继关系时不会读到遗留句柄。
 
 shared 的 8 个 orchestration output handle 只有后继 winner
 `BuildCallbackSubmitArgs()` 消费。AIC 只可能构造 QK/PV，因此只需
@@ -4095,6 +4111,12 @@ AIC Alloc/QK/PV 和 AIV Alloc/SF/UP 六类均下降 `11.133%～28.034%`；
 
 **[已保留] `slot0-only` 不再读取已知为空的 slot1**
 
+2026-07-31 的泛化改写保留入口 `occupied_count` 快照和“找到全部
+occupied header 后提前退出”，但循环上界恢复为全部
+`kPrivateSlots`。新增 slot3 定向门槛，证明普通自领任务以及
+MIX/BlockWon follower 位于任意物理槽时都不会漏扫。下文百分比描述的是
+改写前 PA 单 lane 的历史 A5 结果，不能直接当作当前泛化实现的收益。
+
 shared PA 的 winning slot 只有两个。原 `DrainReady()` 对任意非空入口
 都固定扫描 slot0/slot1；候选只读取一次入口 `occupied_count`，随后用
 局部 SSA 快照记录本轮尚未见到的 occupied header 数。找到入口时刻的
@@ -4198,7 +4220,13 @@ IR 字段路径、分核型结果和撤回路线见
 
 ### 13.20 UP 未参选核复用 Claim 前的零输出状态
 
-**[已保留] 只删除 AIC UP not-attempted 的重复 producer/count 校验**
+**[泛化复审后撤销] 只删除 AIC UP not-attempted 的重复 producer/count
+校验**
+
+2026-07-31 按全算子合同复审后，本项不再保留。`AIC + UP +
+not-attempted` 是当前 PA 的 task 名称、输出数量和 Claim 角色组合，
+不能作为通用 shared-output 合同。当前全部 task、角色和 Claim 状态都
+经过同一 `PrepareSharedTaskOutputs()` 完整校验。
 
 UP 不产生 fresh output。`BeginSharedCallbackSubmit()` 已在 Claim 前把
 本 actor 的 `shared_result` 重置为 `(task_id, 0)`；原角色合同下 AIC
@@ -4240,7 +4268,12 @@ AIC 闭合两轮均下降约 28%；AIV tail 虽小幅增加，但相邻 Transiti
 
 ### 13.21 PV 复用紧邻 SF 的 task 身份
 
-**[已保留] 删除 PV Begin 对本核 GM task 前沿的一次重复读取**
+**[泛化复审后撤销] 删除 PV Begin 对本核 GM task 前沿的一次重复读取**
+
+2026-07-31 按全算子合同复审后，本项不再保留。`SF→PV` 紧邻只属于
+当前 PA task 图；动态 task 图和其他算子必须让每个 task 从通用 replay
+前沿取得自己的独立身份。当前所有 task 统一调用
+`BeginSharedCallbackSubmit()`。
 
 SF Begin 已把当前 task id 保存到 block-local `SubmitContext`；PV
 紧邻 SF，因此用 `context.task_id+1` 得到自己的 id，同时仍立即写回
@@ -4472,3 +4505,141 @@ tests/atomic_probe/pa_scheduler/outputs/
 perf-clock：两轮 AIV 与全核双侧闭合已经明确否决。完整静态 IR、
 失败现场、左右边界和负对照见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.27 当前保留优化、累计收益与风险汇总
+
+#### 状态快照与裁决口径
+
+截至 2026-07-31，当前工作区在 `33a3164e` 之上完成全算子泛化复审。
+历史 27 个本地提交按当前实际生产行为重新分类为：
+
+- 10 个提交的优化仍保留；
+- 5 个此前在 PA 上有效的优化已因缺乏全算子泛化性而撤销或改写；
+- 11 个提交只记录已撤回候选及其否决证据；
+- 1 个提交说明 shared-output 快路边界。
+
+泛化复审采用比 PA 性能门槛更高的准入规则：
+
+1. 可以依赖 shared runtime 明确定义的数据结构、发布、顺序和
+   winner/loser 合同；
+2. 可以依赖显式 task metadata，例如 output count、core mask 和
+   is-last 标记；
+3. 不允许依赖 PA 的具体 task 名称、相邻顺序、当前 AIC/AIV 消费矩阵，
+   也不允许依赖“该用例没有 MIX/BlockWon”；
+4. 硬件级 AIC/AIV 代码生成差异只有在对所有算子保持同一语义时才允许。
+
+原性能裁决仍以固定 `(core, task, Claim status)` actor 为人口，逐核
+扣除 `Atomic∪Kernel` 后闭合 EfDrain、Claim outer、post-Claim tail 和
+SubmitTransition。当前泛化改写尚未重新取得 A5 泳道，因此不能沿用
+旧 PA 特例版本的累计百分比作为当前收益。
+
+#### 当前生效的 10 项优化
+
+| 区域 | 提交 | 优化思路 | 已验证的直接收益 | 主要风险与约束 |
+| --- | --- | --- | --- | --- |
+| loser tail | `aebb69ab` | loser 复用同 TU 已验证的 task kind 与末次任务标记，不再 Decode ticket 和计算无消费者派生量 | true-loser 约 `-20%`；not-attempted 约 `-22%` | 新增 loser 消费者或修改 ticket 语义后必须重新审计 |
+| Claim | `3f8171ae` | Claim 复用 worker 入口已经确定的 AIC/AIV role SSA，不再逐 task 回读 `WorkerState.role` | non-Alloc true-loser Claim outer `-30.579%` | 依赖 worker role 在 replay 期间不可变，新增调用点必须传入正确 role |
+| loser tail | `10b2c671` | `SubmitContext::won/kernel_id` 只在 winner 路径写入 | 全 nonwinner tail `-1.481%`；完整 actor `-0.559%` | loser 返回时字段保留旧值，后续诊断或消费者不能把它们当成已清零字段 |
+| Transition | `c1a5ee84` | 复用 replay 外已经读取的 `config.batches` SSA，Submit 不再重复从 GM 读取 | SubmitTransition `-19.790%` | 依赖 batches 在一次 replay 中不动态改变 |
+| loser tail | `1de2b60e` | 删除 Begin 与 loser close 之间同源的 `context.task_id` 二次复核 | true-loser tail `-16.588%`；完整 actor `-2.211%` | 减少一层冗余错误检测；相邻 Transition 曾增加 `2.593%`，但完整四段仍改善 |
+| loser tail | `4f375cec` | loser 复用 `PrepareSharedTaskOutputs()` 已完成的 TaskId/Size/slot 校验 | AIC-QK 目标 tail `-27.442%`；完整 actor `-12.767%` | 依赖 Prepare 成功严格支配 loser 分支，且中间没有其他 writer |
+| Claim | `c9d54c52` | `claim_attempts` 在 caller 局部 SSA 中按真实 attempted 累计，公共出口一次写回 | attempted Claim outer `-18.670%` | 新增提前退出路径时必须正确写回；caller 代码体积增加，宽口径完整 actor 曾波动 `+0.656%` |
+| EfDrain | `2f9bc67b` 泛化改写 | 扫描全部物理槽，但用入口 `occupied_count` 快照在找到全部 occupied header 后提前退出 | 旧 PA `slot0-only` 直接区曾 `-13.077%`；当前泛化版尚未上板量化 | 依赖 occupied count 与本核 slot header 生命周期一致；slot3 定向门槛已覆盖 |
+| tail/Transition | `1ea42791` | 利用严格顺序提交合同，直接用 `task_id*(task_id+1)/2` 覆盖诊断前缀，删除旧和读取 | tail+Transition `-2.755%` | 依赖 task-id 连续、无跳号，且 Record 成功前缀语义不变；支持跳过或重试 task 时必须重做 |
+| loser tail | `ce892a78` | 仅 CCEC AIC 用合法 `memcpy` 一次取得 producer/count 的 8B header 快照 | AIC tail+Transition 约 `-7.2%`；全体 `-2.004%～-2.343%` | 依赖 8B header 布局；AIV 版本已证明回退，必须保持 AIC-only；历史非交错 perf-clock 中位数约 `+1.263%` |
+
+以上百分比是每项提交在各自固定基线上的直接证据，不能逐行相加。部分
+优化存在 AIC/AIV 或局部边界反向，但保留时都已经把反向区间纳入相邻
+闭合；表中明确列出这些限制，后续不能只引用改善的一侧。
+
+#### 泛化复审前 PA 特例版本的历史累计结果
+
+使用 `fd463c4c` 的完整 B256/PA-G1 泳道作为 GitHub 基线，并与
+`ce892a78` 的两份完整泳道固定 119,025 个共同 nonwinner actor。逐核
+扣除 `Atomic∪Kernel` 后，历史累计结果如下。该版本仍包含本节随后列出
+的五项 PA 特例，因而这些数字只用于解释撤销了哪些旧收益，不能描述
+当前泛化工作区：
+
+| non-atomic 区域 | 历史 PA 特例版本相对基线变化 |
+| --- | ---: |
+| EfDrain control | `-35.194%` |
+| Claim outer | `-72.753%` |
+| post-Claim tail | `-58.823%` |
+| SubmitTransition | `-28.552%` |
+| 四段闭合合计 | `-46.052%` |
+| AIC 四段闭合 | `-51.561%` |
+| AIV 四段闭合 | `-43.395%` |
+
+泛化复审前，原始 `96/32/64` Claim 合同下完整 B256/PA-G1
+full-swimlane 最短 Submit 为 `2276.037 us`，对应：
+
+```text
+tests/atomic_probe/pa_scheduler/test_record/2026-7-31/
+  shared_b256_g1_original_claim_96_32_64_best_2276037us_merged_swimlane.json
+```
+
+同一历史代码的 10 个独立 perf-clock 进程中位数为 `2294.260 us`，
+范围 `2249.776～2315.671 us`。full-swimlane 与 perf-clock 是不同
+构建，二者绝对时间不能直接相减。泛化改写后的新基线必须重新采集，
+不能从旧结果中扣减五项历史收益估算。
+
+撤销全部五项并移除 loser helper 的无效 task/context 接口后，A5
+B256/G1 full-swimlane 为 `2309.218 us`：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260731_023614_893010/ccec/
+```
+
+该轮 1,280 winner、1,024 Kernel、依赖签名、TensorMap/heap 和 drop 0
+全部闭合。它证明最终泛化源码能够动态运行；与历史最短值仍不是交错
+A/B，不能用单轮表面差值分摊五项撤销的成本。
+
+#### 因缺乏全算子泛化性而撤销或改写的五项
+
+| 原提交 | 旧优化 | 泛化问题 | 当前处理 |
+| --- | --- | --- | --- |
+| `8c3cf8ef` | PA block-group 派生量下沉到 winner | 收益依赖 PA 固定 group 参数布局，不属于所有算子共享的调度合同 | 恢复 PA 原有 group 状态推进；不把捷径留在 adapter |
+| `223a880a` | shared Drain 只扫描 slot0/1 | MIX/BlockWon follower 可能位于 slot2/3；PA 没出现不等于通用路径不可达 | 恢复扫描全部 `kPrivateSlots`；保留按实际 occupied 数提前退出 |
+| `b05b76b9` | 按 AIC/AIV 消费矩阵少存 output handle | 消费矩阵属于 PA task 图，其他算子的所有权和后继关系可以不同 | 所有 replay actor 保存完整逻辑 output 状态 |
+| `f5c3c6c1` | `AIC + UP + !attempted` 跳过零输出校验 | 同时硬编码 PA task 名、输出数量和角色 Claim 合同 | 所有 task/角色统一执行完整 shared-output 校验 |
+| `1ffde2b3` | PV 用前一 SF 的身份推导 task-id | 依赖 PA 的固定相邻拓扑，动态 task 图或其他算子不成立 | 每个 task 独立读取并推进通用 replay 前沿 |
+
+泛化收口同时删除 `FinishSharedLoserSubmit()` 无效的 `TaskKind` 模板参数
+和 `SubmitContext` 参数。loser 公共出口现在只消费通用的 task-id、
+末次标记和计时边界，不再保留 PA task 特化的接口形态。
+
+#### 已撤回、当前不改变生产行为的候选
+
+以下 11 个本地提交只保留试验和否决证据，候选源码均已恢复：
+
+| 提交 | 已撤回方向 | 否决原因摘要 |
+| --- | --- | --- |
+| `c744cf84` | Claim 前移动 shared output 准备 | 属于过程态，未形成可保留的等价收益 |
+| `5d6cb949` | orchestration output handle 从 16B 压到 8B | 保存区缩短但恢复区变长，四类 transition 和完整 true-loser 闭合回退 |
+| `e97ebe24` | task-meta Encode 下沉到 winner-only | 三种布局均把局部收益搬到完整 actor，AIV 或 not-attempted 稳定回退 |
+| `c9b19e30` | 两个 slot header byte store 合成 16-bit store | AIV 直接 drain 区域回退 |
+| `1a830540` | 删除 shared `DrainReady()` 的 built guard | AIV 直接区域回退约 `16.7%～19.8%` |
+| `f46ed3e1` | 停止维护 `current_batch` 镜像 | AIV 跨 batch Transition 和真实 winner 消费边界回退 |
+| `d178bde4` | 从 plan/context 恢复 output symbol | 三种恢复方式均使 Alloc→QK 或 SF→PV Transition 回退 |
+| `e47b9151` | UP 复用 PV 前驱 task-id | PV→UP、UP→Alloc 和完整 group 闭合均回退 |
+| `e4218d98` | Submit-entry EfDrain 将 PollBatch 恒假条件静态化 | 全核版和 AIC-only 版都通过正确性，但跨核到达关系使 AIV/完整闭合回退 |
+| `636ebe9f` | Claim logical atomic 观察计数移到 replay 出口 | Claim 直接区改善，但相邻 Transition 和 not-attempted 负对照稳定回退 |
+| `33a3164e` | 用 `batch+1` 覆盖 `context_reads` | AIC 改善，但 AIV 和全核双侧闭合连续回退 |
+
+另外，`2a16ba90` 只说明 PA 当前 shared-output 快路为什么不走 ordinary
+TensorMap，不属于生产优化。
+
+#### 当前风险排序
+
+从后续维护角度，当前保留项可按风险分为三组：
+
+1. 较低风险：入口 role SSA、batch-count SSA。两者复用 replay 期间
+   不变的只读值，语义边界最清楚。
+2. 中等风险：winner-only 参数派生、loser 重复检查消减、Claim 本地
+   累计和三角前缀。这些优化依赖显式 winner/loser、连续 task-id 或失败
+   前缀合同，但不再依赖具体 PA task 名称和边关系。
+3. 需要重点关注：按 occupied count 提前停止 slot 扫描，以及 AIC-only
+   8B header 快照。前者依赖 slot 生命周期不变量，后者依赖结构布局并
+   引入 AIC/AIV 代码生成差异；未来修改相关数据结构或角色合同时必须先
+   跑定向正确性、CCEC O3 静态对照和两轮完整泳道。

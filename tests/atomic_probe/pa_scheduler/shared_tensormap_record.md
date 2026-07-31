@@ -16830,3 +16830,67 @@ intra-batch 负对照也发现 AIV `SF→PV` 的 `L+T` 连续增加
 长循环的寄存器和分支布局仍可能让 AIV 付出更高成本。后续不再重复
 `context_reads` 的 induction 覆盖方向，继续寻找不引入跨批布局搬移的
 独立 SubmitTransition 消减点。
+
+### 2026-07-31：撤销 PA adapter 内的角色与拓扑特例
+
+#### 复审原则
+
+PA 只是 standalone 中用于压测 shared 调度协议的一张具体 task 图。
+PA adapter 可以描述任务参数、输入输出数量和依赖关系，但不能利用
+`UP/PV/AIC/AIV` 的固定组合改变 shared runtime 的正确性合同，也不能
+把只对当前 PA 成立的捷径留在 adapter 中。优化只有满足以下条件才可
+继续保留：
+
+1. 依赖所有算子共同遵守的 Submit、Claim、slot、发布或 replay 合同；
+2. 或依赖每个 task 显式携带、由通用 runtime 消费的 metadata；
+3. 不依赖 PA task 名称、相邻顺序、固定核型消费者矩阵或“当前用例未
+   出现某种 slot 状态”。
+
+#### 撤销或改写的五项
+
+1. 撤销 PA block-group 派生量只由 Claim winner 准备的捷径。
+   `PreparePaBlockGroup()` 恢复为所有 replay actor 按 PA 原有流程执行；
+   它的历史收益依赖固定四阶段 group 参数布局，不能移到 adapter 后
+   继续冒充通用调度优化。
+2. 删除按 AIC/AIV 消费矩阵裁剪 output handle 的逻辑。
+   `AcceptTaskOutputs()` 重新对所有 replay actor 保存完整逻辑输出
+   状态。其他算子改变 task 所有权或后继关系时，不会读到上一 task 的
+   遗留句柄。
+3. 删除 `AIC + UP + not-attempted` 的零输出校验特例。所有 task、
+   core role 和 Claim 状态统一经过 `PrepareSharedTaskOutputs()`。
+4. 删除用紧邻 SF 推导 PV task-id 的特例。每个 task 都从通用 replay
+   前沿独立取得并推进自己的 task 身份。
+5. 撤销 shared Drain 只扫描 slot0/1 的假设。`DrainReady()` 恢复扫描
+   全部 `kPrivateSlots`，避免漏掉 MIX/BlockWon follower 使用的
+   slot2/3；仍保留与算子无关的入口 `occupied_count` 快照，找齐入口
+   时刻的全部 occupied header 后即可提前退出。
+
+没有把以上逻辑搬到 PA adapter，也没有新增 PA 专用开关。相应 CPU
+门槛改为验证完整 output 状态和 slot3 drain，从合同层面约束后续修改。
+`FinishSharedLoserSubmit()` 也不再携带无效的 `TaskKind` 模板参数或
+`SubmitContext` 参数；通用 loser 收尾只消费 task-id、末次标记和计时
+边界，不再保留 PA task 特化的接口外形。
+
+#### 验证结果
+
+- CPU shared 全量协议测试：PASS；
+- CPU private 全量协议及 CAP=32/64/128/256/16384 ring 测试：PASS；
+- CCEC shared AIC/AIV 全量构建及 artifact 生成：PASS；
+- CCEC private AIC/AIV 全量构建及 artifact 生成：PASS；
+- 泳道转换、exclusive/PMU 加工、artifact manifest 和 atomic/DCCI
+  源码覆盖共 160 项：PASS；
+- slot3 定向 drain 门槛：PASS；
+- Alloc/QK/SF/PV 完整 output handle 保存门槛：PASS。
+
+撤销全部五项并移除 loser helper 的无效 task/context 接口后，A5
+B256/G1 完整泳道为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260731_023614_893010/ccec/
+```
+
+该轮 Submit 为 `2309.218 us`，保持原 96/32/64 Claim 人口、1,280
+winner、1,024 Kernel、依赖签名 `b7d985d6edb07078`、TensorMap/heap
+断言全部通过且 drop 0。此前 `2276.037 us` 的最短泳道和相应累计
+百分比包含上述 PA 特例，只能作为历史取证；两者不是交错 A/B，不能
+用单轮 `+33.181 us` 的表面差值分摊五项撤销的成本。

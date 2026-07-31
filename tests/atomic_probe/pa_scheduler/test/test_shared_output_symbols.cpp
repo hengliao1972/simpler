@@ -64,15 +64,6 @@ void TestSharedContextLengthUsesBackingPointer() {
     );
 }
 
-bool SameOutputRef(FdwicOutputRef lhs, FdwicOutputRef rhs) {
-    return lhs.producer_task_id == rhs.producer_task_id &&
-           lhs.output_slot == rhs.output_slot &&
-           lhs.flags == rhs.flags &&
-           lhs.view_ndims == rhs.view_ndims &&
-           lhs.view_shape0 == rhs.view_shape0 &&
-           lhs.view_offset0 == rhs.view_offset0;
-}
-
 void PoisonOutputHandles(
     PaOrchestrationState &orchestration, FdwicOutputRef poison
 ) {
@@ -86,7 +77,7 @@ void PoisonOutputHandles(
     orchestration.pv_output = poison;
 }
 
-void TestRoleAwareAcceptTaskOutputs() {
+void TestAcceptTaskOutputsPreservesCompleteState() {
     constexpr FdwicOutputRef poison{-91, -7, 1, 1, 17, 19};
     PaOrchestrationState orchestration{};
     SharedTaskOutputs outputs{};
@@ -100,16 +91,7 @@ void TestRoleAwareAcceptTaskOutputs() {
     );
     PoisonOutputHandles(orchestration, poison);
     AcceptTaskOutputs(
-        orchestration, TaskKind::Alloc, outputs, CoreRole::Aic
-    );
-    Check(
-        SameOutputRef(orchestration.accumulated_output, poison) &&
-            SameOutputRef(orchestration.accumulated_sum, poison) &&
-            SameOutputRef(orchestration.accumulated_max, poison),
-        "AIC skips Alloc handles that only AIV UP consumes"
-    );
-    AcceptTaskOutputs(
-        orchestration, TaskKind::Alloc, outputs, CoreRole::Aiv
+        orchestration, TaskKind::Alloc, outputs
     );
     Check(
         orchestration.accumulated_output.producer_task_id == 0 &&
@@ -118,26 +100,19 @@ void TestRoleAwareAcceptTaskOutputs() {
             orchestration.accumulated_sum.output_slot == 1 &&
             orchestration.accumulated_max.producer_task_id == 0 &&
             orchestration.accumulated_max.output_slot == 2,
-        "AIV retains all Alloc handles consumed by UP"
+        "Alloc preserves every output handle for arbitrary successors"
     );
 
     outputs.Reset(1);
     Check(outputs.AddOutputRef(1, 0), "QK output symbol is prepared");
     PoisonOutputHandles(orchestration, poison);
     AcceptTaskOutputs(
-        orchestration, TaskKind::Qk, outputs, CoreRole::Aic
-    );
-    Check(
-        SameOutputRef(orchestration.qk_scores, poison),
-        "AIC skips the QK handle that only AIV SF consumes"
-    );
-    AcceptTaskOutputs(
-        orchestration, TaskKind::Qk, outputs, CoreRole::Aiv
+        orchestration, TaskKind::Qk, outputs
     );
     Check(
         orchestration.qk_scores.producer_task_id == 1 &&
             orchestration.qk_scores.output_slot == 0,
-        "AIV retains the QK handle consumed by SF"
+        "QK preserves its output handle for arbitrary successors"
     );
 
     outputs.Reset(2);
@@ -149,45 +124,28 @@ void TestRoleAwareAcceptTaskOutputs() {
     );
     PoisonOutputHandles(orchestration, poison);
     AcceptTaskOutputs(
-        orchestration, TaskKind::Sf, outputs, CoreRole::Aic
+        orchestration, TaskKind::Sf, outputs
     );
     Check(
         orchestration.sf_probs.producer_task_id == 2 &&
             orchestration.sf_probs.output_slot == 0 &&
-            SameOutputRef(orchestration.sf_max, poison) &&
-            SameOutputRef(orchestration.sf_sum, poison),
-        "AIC retains only the SF probability handle consumed by PV"
-    );
-    PoisonOutputHandles(orchestration, poison);
-    AcceptTaskOutputs(
-        orchestration, TaskKind::Sf, outputs, CoreRole::Aiv
-    );
-    Check(
-        SameOutputRef(orchestration.sf_probs, poison) &&
             orchestration.sf_max.producer_task_id == 2 &&
             orchestration.sf_max.output_slot == 1 &&
             orchestration.sf_sum.producer_task_id == 2 &&
             orchestration.sf_sum.output_slot == 2,
-        "AIV retains only the SF max/sum handles consumed by UP"
+        "SF preserves every output handle for arbitrary successors"
     );
 
     outputs.Reset(3);
     Check(outputs.AddOutputRef(3, 0), "PV output symbol is prepared");
     PoisonOutputHandles(orchestration, poison);
     AcceptTaskOutputs(
-        orchestration, TaskKind::Pv, outputs, CoreRole::Aic
-    );
-    Check(
-        SameOutputRef(orchestration.pv_output, poison),
-        "AIC skips the PV handle that only AIV UP consumes"
-    );
-    AcceptTaskOutputs(
-        orchestration, TaskKind::Pv, outputs, CoreRole::Aiv
+        orchestration, TaskKind::Pv, outputs
     );
     Check(
         orchestration.pv_output.producer_task_id == 3 &&
             orchestration.pv_output.output_slot == 0,
-        "AIV retains the PV handle consumed by UP"
+        "PV preserves its output handle for arbitrary successors"
     );
 }
 
@@ -619,11 +577,28 @@ void TestSharedDrainUsesEntryOccupancySnapshot() {
         "entry snapshot lets one drain release both ready slots"
     );
 
+    ResetDrainSlots(worker);
+    // 通用调度还要覆盖 BlockWon/follower 可能使用的预留物理槽。即使
+    // slot0/1 都为空，也必须跨过它们找到 slot3；不能把当前 PA 单 lane
+    // 的常见分布固化成扫描上界。
+    PrepareDrainSlot(worker, 3, 8, TaskKind::Pv, true);
     Check(
-        DrainTestOps::execute_calls == 8 &&
+        DrainReady<DrainTestOps>(
+            state, worker, DrainPlace::EfDrain, stats
+        ) == 1 &&
+            worker.occupied_count == 0 &&
+            !worker.slots[3].occupied &&
+            !worker.slots[3].built &&
+            state->tasks[8].flag == 1 &&
+            DrainTestOps::execute_calls == 9,
+        "shared drain scans every physical slot for generic followers"
+    );
+
+    Check(
+        DrainTestOps::execute_calls == 9 &&
             stats.result.placement[
                 static_cast<uint32_t>(DrainPlace::EfDrain)
-            ] == 8,
+            ] == 9,
         "shared drain snapshot preserves exact execution accounting"
     );
     UnmapSparseSchedulerState(state);
@@ -2918,7 +2893,7 @@ void TestInvalidReferencesFailClosed() {
 
 int main() {
     TestSharedContextLengthUsesBackingPointer();
-    TestRoleAwareAcceptTaskOutputs();
+    TestAcceptTaskOutputsPreservesCompleteState();
     TestSharedCompletionPublishesWithoutFrontier();
     TestSharedDrainUsesEntryOccupancySnapshot();
     TestPublishAndResolve();

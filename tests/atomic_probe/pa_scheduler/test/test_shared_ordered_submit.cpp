@@ -777,11 +777,8 @@ bool RunLoserZeroTensorMapAccessTest() {
     OrderedSubmitTestOps::ResetHooks();
     OrderedSubmitTestOps::observed_state = state;
     const bool finished =
-        FinishSharedLoserSubmit<
-            TaskKind::Sf, OrderedSubmitTestOps, false
-        >(
-            state, context, stats, task_id, false,
-            kSubmitBegin
+        FinishSharedLoserSubmit<OrderedSubmitTestOps, false>(
+            state, stats, task_id, false, kSubmitBegin
         );
     bool turns_unchanged = true;
     for (uint32_t lane = 0;
@@ -820,38 +817,6 @@ bool RunLoserZeroTensorMapAccessTest() {
             TaskKind::Sf
         );
 
-    WorkerState up_worker{};
-    up_worker.local_index = kTask;
-    SubmitContext up_context{};
-    up_context.shared_result.Reset(91);
-    BeginSharedCallbackSubmit(up_worker, up_context);
-    const bool up_not_attempted_prepared =
-        PrepareSharedTaskOutputsAfterClaim<TaskKind::Up>(
-            up_context.shared_result,
-            static_cast<int32_t>(kTask), false
-        );
-    const bool up_not_attempted_keeps_reset_state =
-        up_not_attempted_prepared &&
-        up_context.shared_result.TaskId() ==
-            static_cast<int32_t>(kTask) &&
-        up_context.shared_result.Empty();
-
-    SharedTaskOutputs poisoned_up{};
-    poisoned_up.Reset(static_cast<int32_t>(kTask + 1U));
-    const bool up_participant_rejects_wrong_task =
-        !PrepareSharedTaskOutputsAfterClaim<TaskKind::Up>(
-            poisoned_up, static_cast<int32_t>(kTask), true
-        );
-    poisoned_up.Reset(static_cast<int32_t>(kTask));
-    const bool poisoned_up_seeded =
-        poisoned_up.AddOutputRef(
-            static_cast<int32_t>(kTask), 0
-        );
-    const bool up_participant_rejects_nonempty =
-        !PrepareSharedTaskOutputsAfterClaim<TaskKind::Up>(
-            poisoned_up, static_cast<int32_t>(kTask), true
-        );
-
     const bool ok =
         outputs_prepared && finished &&
         state->fatal.value == 0 &&
@@ -872,10 +837,6 @@ bool RunLoserZeroTensorMapAccessTest() {
         output2.output_slot == 2 &&
         wrong_task_rejected && seeded &&
         nonempty_rejected &&
-        up_not_attempted_keeps_reset_state &&
-        up_participant_rejects_wrong_task &&
-        poisoned_up_seeded &&
-        up_participant_rejects_nonempty &&
         stats.result.submits == 1 &&
         stats.declared_task_count == 0 &&
         turns_unchanged &&
@@ -1020,42 +981,6 @@ bool RunSharedOutputPrepareContractTest() {
         exact ? "PASS" : "FAIL"
     );
     return exact;
-}
-
-bool RunPvTaskIdentityContractTest() {
-    constexpr uint32_t kSfTask = 12;
-    constexpr uint32_t kPvTask = kSfTask + 1U;
-    WorkerState worker{};
-    worker.local_index = kSfTask;
-    SubmitContext context{};
-
-    BeginSharedCallbackSubmit(worker, context);
-    const bool sf_anchor_ok =
-        context.task_id == static_cast<int32_t>(kSfTask) &&
-        context.shared_result.TaskId() ==
-            static_cast<int32_t>(kSfTask) &&
-        context.shared_result.Empty() &&
-        worker.local_index ==
-            static_cast<int32_t>(kSfTask + 1U);
-
-    // PV 从 SF 身份推进；先放入毒 output，证明 Begin 会建立当前
-    // task 的空输出状态，并立即保存 attempted 前沿。
-    context.shared_result.Reset(-77);
-    BeginSharedPvCallbackSubmit(worker, context);
-    const bool pv_advance_ok =
-        context.task_id == static_cast<int32_t>(kPvTask) &&
-        context.shared_result.TaskId() ==
-            static_cast<int32_t>(kPvTask) &&
-        context.shared_result.Empty() &&
-        worker.local_index ==
-            static_cast<int32_t>(kPvTask + 1U);
-
-    const bool ok = sf_anchor_ok && pv_advance_ok;
-    std::printf(
-        "[ORDERED_SUBMIT] pv_task_identity=%s final=%d\n",
-        ok ? "PASS" : "FAIL", context.task_id
-    );
-    return ok;
 }
 
 bool RunReadyFaninPrefixCompactionTest() {
@@ -1403,8 +1328,6 @@ int main() {
     const bool loser_ok = RunLoserZeroTensorMapAccessTest();
     const bool output_prepare_ok =
         RunSharedOutputPrepareContractTest();
-    const bool pv_task_identity_ok =
-        RunPvTaskIdentityContractTest();
     const bool fanin_compaction_ok =
         RunReadyFaninPrefixCompactionTest();
     const bool pa_up_shape_ok =
@@ -1414,7 +1337,6 @@ int main() {
         RunIndependentKernelExecutionTest();
     if (!claim_accounting_ok || !task_id_prefix_ok || !loser_ok ||
         !output_prepare_ok ||
-        !pv_task_identity_ok ||
         !fanin_compaction_ok || !pa_up_shape_ok ||
         !overlap_ok || !execution_ok) {
         std::fprintf(

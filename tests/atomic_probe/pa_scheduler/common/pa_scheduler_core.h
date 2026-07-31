@@ -598,23 +598,15 @@ PA_DEVICE uint32_t DrainReady(
     }
 #endif
     uint32_t freed = 0;
-    // shared 单 lane PA 在 occupied_count 达到 kUsableSlots 前必先等待并
-    // drain，FindFreeSlot 又总取最低空槽，因此正常协议只会占用 slot 0/1。
-    // slot 2/3 是 BlockWon 预留位，不应在每次 EfDrain/FinalDrain 热路重复
-    // 读取；fatal 清理仍单独扫描全部 kPrivateSlots。private 保持原边界。
-    constexpr uint32_t kDrainSlotCount =
 #if PTO_FDWIC_SHARED_MAP
-        kUsableSlots;
-#else
-        kPrivateSlots;
-#endif
-#if PTO_FDWIC_SHARED_MAP
-    // occupied_count 是进入本次 drain 时两个可用 slot 的精确快照。
-    // 找齐这些 occupied header 后，余下物理 slot 已知为空；使用快照而
-    // 不是执行中递减的 worker.occupied_count，避免释放 slot 后改变边界。
+    // occupied_count 是进入本次 drain 时全部物理 slot 的精确快照。
+    // 找齐这些 occupied header 后即可提前退出；仍遍历 kPrivateSlots，
+    // 因此普通自领任务和 BlockWon/follower 使用任意物理槽都不会漏扫。
+    // 使用入口快照而不是执行中递减的 worker.occupied_count，避免释放
+    // slot 后改变本轮扫描边界。
     uint32_t remaining_occupied = occupied_at_entry;
 #endif
-    for (uint32_t index = 0; index < kDrainSlotCount; ++index) {
+    for (uint32_t index = 0; index < kPrivateSlots; ++index) {
 #if PTO_FDWIC_SHARED_MAP
         if (remaining_occupied == 0) {
             break;
@@ -3314,20 +3306,6 @@ PA_DEVICE void BeginSharedCallbackSubmit(
     context.shared_result.Reset(static_cast<int32_t>(task_id));
 }
 
-PA_DEVICE void BeginSharedPvCallbackSubmit(
-    PA_GM WorkerState &worker, SubmitContext &context
-) {
-    // SF 已从 WorkerState 取得当前 group 后半段的独立 task-id 锚点。PV
-    // 紧邻 SF，直接沿用 context 中只由 Begin 写入的身份，
-    // 避免再次读取 GM local_index；每次仍立即写回 attempted 前沿，
-    // 因而后续 plan/Claim/Finish 失败时的 WorkerState 现场不变。
-    const uint32_t task_id =
-        static_cast<uint32_t>(context.task_id) + 1U;
-    worker.local_index = static_cast<int32_t>(task_id + 1U);
-    context.task_id = static_cast<int32_t>(task_id);
-    context.shared_result.Reset(static_cast<int32_t>(task_id));
-}
-
 PA_DEVICE void PrepareSharedWinnerContext(
     PA_GM WorkerState &worker, uint32_t task_id,
     SubmitContext &context
@@ -3551,10 +3529,9 @@ PA_DEVICE bool CloseSharedCallbackSubmit(
     );
 }
 
-template <TaskKind Kind, typename Ops, bool Profile>
+template <typename Ops, bool Profile>
 PA_DEVICE bool FinishSharedLoserSubmit(
-    PA_GM SchedulerState *state, SubmitContext &context,
-    LocalStats &stats, uint32_t task_id,
+    PA_GM SchedulerState *state, LocalStats &stats, uint32_t task_id,
     bool is_last_submit,
     uint64_t submit_begin
 ) {
@@ -3562,8 +3539,6 @@ PA_DEVICE bool FinishSharedLoserSubmit(
     // PrepareSharedTaskOutputs；失败会在进入本 helper 前终止，期间也没有
     // shared_result 写者。loser 不再重复读取它的 TaskId/Size；完整
     // symbol 仍保留给 Submit 返回后的 orchestration 消费。
-    (void)context;
-
     // loser 只完成本次 Submit 的轻量收尾。TensorMap 插入、前沿等待、
     // fanin lookup 与 Build 全部只属于 Claim owner；loser 不读取任何
     // TensorMap 控制字，也不再等待 writer-ready 门。
@@ -4036,13 +4011,10 @@ PA_DEVICE bool SubmitCallbackTask(
 #endif
 ) {
 #if PTO_FDWIC_SHARED_MAP
-    if constexpr (Kind == TaskKind::Pv) {
-        BeginSharedPvCallbackSubmit(worker, context);
-    } else {
-        // Alloc 是 batch 锚点，QK 是 group 入口锚点，SF/UP 保留后半段
-        // 锚点；四者从 WorkerState 读取，复核后续顺序。
-        BeginSharedCallbackSubmit(worker, context);
-    }
+    // 每个 task 都从通用 replay 前沿取得独立身份。不能利用当前 PA 的
+    // SF→PV 邻接关系推导 task-id，否则动态 task 图或其他算子会失去
+    // 自己的顺序锚点。
+    BeginSharedCallbackSubmit(worker, context);
 #else
     BeginCallbackSubmit(worker, context);
 #endif
@@ -4146,9 +4118,8 @@ PA_DEVICE bool SubmitCallbackTask(
     // fresh Output 的返回值是 task/slot 符号，不依赖哪个 worker 获胜。
     // 在跨 TU finish 前为所有 replay actor 建立同一句柄集，保证 loser
     // 返回后也能继续构造本核后续 task 的输入引用。
-    if (!PrepareSharedTaskOutputsAfterClaim<Kind>(
-            context.shared_result, static_cast<int32_t>(task_id),
-            claim.attempted
+    if (!PrepareSharedTaskOutputs(
+            context.shared_result, static_cast<int32_t>(task_id), Kind
         )) {
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
@@ -4165,18 +4136,6 @@ PA_DEVICE bool SubmitCallbackTask(
         PrepareSharedWinnerContext(
             worker, task_id, context
         );
-        if constexpr (Kind != TaskKind::Alloc) {
-            // block-group 派生量只被本 task 的参数构造读取。shared 下每种
-            // task 的 Claim owner 可能不同，因此由当前 winner 按已校验的
-            // 动态 plan 独立准备；其余 replay actor 不再写无消费者状态。
-            // private 仍在外层按原合同每组准备一次。
-            PreparePaBlockGroup(
-                orch,
-                static_cast<uint64_t>(
-                    shared_planned_task.group_index
-                ) * kPaBlocksPerRequest
-            );
-        }
         if (!BuildCallbackSubmitArgs<Kind>(orch, args, batch, stats)) {
             SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
             return false;
@@ -4198,8 +4157,8 @@ PA_DEVICE bool SubmitCallbackTask(
         return false;
     }
     if (!claim.won) {
-        return FinishSharedLoserSubmit<Kind, Ops, Profile>(
-            state, context, stats, task_id,
+        return FinishSharedLoserSubmit<Ops, Profile>(
+            state, stats, task_id,
             shared_is_last_submit, submit_begin
         );
     }
@@ -4235,8 +4194,8 @@ PA_DEVICE bool SubmitCallbackTask(
 #else
 #if PTO_FDWIC_SHARED_MAP
     if (!claim.won) {
-        return FinishSharedLoserSubmit<Kind, Ops, Profile>(
-            state, context, stats, task_id,
+        return FinishSharedLoserSubmit<Ops, Profile>(
+            state, stats, task_id,
             shared_is_last_submit, submit_begin
         );
     }
@@ -4641,11 +4600,18 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             }
             AcceptTaskOutputs(
                 orchestration, TaskKind::Alloc,
-                OrchestrationOutputs(context), role
+                OrchestrationOutputs(context)
             );
 
             for (uint32_t group = 0;
                  group < batch_plan.group_count; ++group) {
+                // 这是 PA adapter 的正常 group 状态推进，不作为 shared
+                // runtime 的 winner-only 特例。所有 replay actor 保持同一
+                // orchestration 状态，通用调度优化不依赖 PA 参数布局。
+                const uint64_t block_offset =
+                    static_cast<uint64_t>(group) *
+                    kPaBlocksPerRequest;
+                PreparePaBlockGroup(orchestration, block_offset);
                 if (!SubmitCallbackTask<
                         TaskKind::Qk, Ops, Profile
                     >(
@@ -4661,7 +4627,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 }
                 AcceptTaskOutputs(
                     orchestration, TaskKind::Qk,
-                    OrchestrationOutputs(context), role
+                    OrchestrationOutputs(context)
                 );
 
                 if (!SubmitCallbackTask<
@@ -4679,7 +4645,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 }
                 AcceptTaskOutputs(
                     orchestration, TaskKind::Sf,
-                    OrchestrationOutputs(context), role
+                    OrchestrationOutputs(context)
                 );
 
                 if (!SubmitCallbackTask<
@@ -4697,7 +4663,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 }
                 AcceptTaskOutputs(
                     orchestration, TaskKind::Pv,
-                    OrchestrationOutputs(context), role
+                    OrchestrationOutputs(context)
                 );
 
                 if (!SubmitCallbackTask<

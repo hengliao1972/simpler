@@ -323,20 +323,6 @@ PA_DEVICE bool PrepareSharedTaskOutputs(
     );
 #endif
 }
-
-template <TaskKind Kind>
-PA_DEVICE bool PrepareSharedTaskOutputsAfterClaim(
-    SharedTaskOutputs &outputs, int32_t task_id, bool attempted
-) {
-    // UP 不产生 fresh output。BeginSharedCallbackSubmit 已在 Claim 前把
-    // 本 actor 的 (producer,count) 重置为 (task_id,0)；没有参与 Claim
-    // 的核不可能成为 winner，因此无需在 Claim 后重新读取这两个字段。
-    // true-loser 和 winner 仍走完整检查，保持参与 Claim 路径原有诊断。
-    if constexpr (Kind == TaskKind::Up) {
-        if (__builtin_expect(!attempted, 0)) return true;
-    }
-    return PrepareSharedTaskOutputs(outputs, task_id, Kind);
-}
 #endif
 
 // TaskArgs 同时容纳 orchestration 栈上的 descriptor、GM 中已物化的 descriptor，
@@ -1137,51 +1123,11 @@ private:
 PA_DEVICE void AcceptTaskOutputs(
     PaOrchestrationState &orch, TaskKind kind,
     const OrchestrationTaskOutputs &outputs
-#if PTO_FDWIC_SHARED_MAP
-    , CoreRole role
-#endif
 ) {
-#if PTO_FDWIC_SHARED_MAP
-    // shared 的符号句柄只在本核后续 winner Build 时被读取。AIC 只会构造
-    // QK/PV，因此只需保留 PV 输入 sf_probs；AIV 只会构造 SF/UP，
-    // 因此保留 qk_scores、三个 accumulator、sf_max/sf_sum 和 pv_output。
-    // context.shared_result 仍由所有 actor 完整准备；这里只消除本核
-    // PaOrchestrationState 中没有消费者的重复句柄写入，不改变共享发布协议。
-    const bool is_aiv = role == CoreRole::Aiv;
-    switch (kind) {
-        case TaskKind::Alloc:
-            if (is_aiv) {
-                orch.accumulated_output = OutputHandleAt(outputs, 0);
-                orch.accumulated_sum = OutputHandleAt(outputs, 1);
-                orch.accumulated_max = OutputHandleAt(outputs, 2);
-            }
-            break;
-        case TaskKind::Qk:
-            if (is_aiv) {
-                orch.qk_scores = OutputHandleAt(outputs, 0);
-            }
-            break;
-        case TaskKind::Sf:
-            if (is_aiv) {
-                orch.sf_max = OutputHandleAt(outputs, 1);
-                orch.sf_sum = OutputHandleAt(outputs, 2);
-            } else {
-                orch.sf_probs = OutputHandleAt(outputs, 0);
-            }
-            break;
-        case TaskKind::Pv:
-            if (is_aiv) {
-                orch.pv_output = OutputHandleAt(outputs, 0);
-            }
-            break;
-        default:
-            // UP 只更新既有 Inout，没有新 Output symbol 需要传给下一阶段。
-            break;
-    }
-#else
-    // private 保存本 worker payload 中的 descriptor 指针。所有 worker
-    // 仍按原合同 eager 构参，因此继续完整保存每个阶段产生的
-    // output handle。
+    // 所有 replay actor 都保存完整的逻辑输出状态；不能根据当前 PA 的
+    // AIC/AIV 消费矩阵裁掉字段，否则其他算子改变 task 所有权或后继关系
+    // 后会读取到上一 task 遗留值。private 保存 descriptor 指针，shared
+    // 保存 (producer_task_id, output_slot) 符号，两种模式使用相同语义。
     switch (kind) {
         case TaskKind::Alloc:
             orch.accumulated_output = OutputHandleAt(outputs, 0);
@@ -1200,10 +1146,9 @@ PA_DEVICE void AcceptTaskOutputs(
             orch.pv_output = OutputHandleAt(outputs, 0);
             break;
         default:
-            // UP 只更新既有 Inout，没有新 Output descriptor 需要传给下一阶段。
+            // 当前 UP 只更新既有 Inout，没有新 Output。
             break;
     }
-#endif
 }
 
 PA_DEVICE PA_GM uint64_t &TensorMapBucketHead(
