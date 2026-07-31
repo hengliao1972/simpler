@@ -30,14 +30,37 @@ namespace pa_scheduler {
 
 struct LocalStats {
     WorkerResult result;
-    uint32_t max_occupied;
 #if PTO_FDWIC_SHARED_MAP
+    // shared 的物理 slot 固定为极小有界数组；16bit 足以保存精确高水位，
+    // 并与下面的本地退避位合计复用原先 max_occupied 的 4B，不扩大
+    // CCEC [[block_local]] split runtime。
+    uint16_t max_occupied;
+    // opportunistic EfDrain 的单槽退避只属于当前 worker 的本地调度状态，
+    // 不进入 GM WorkerState，也不改变设备/host ABI。一次完整轮询没有
+    // 取得进展后，只跳过下一次 Submit 开头的可选 drain；两槽背压和
+    // FinalDrain 始终走强制轮询。
+    uint16_t efdrain_skip_budget;
     // 只在末个 shared Submit 成功收尾时写入 task_id+1；回放结束后与
     // local_index 对照，证明 ticket 的 last bit 没有提前或遗漏。
     uint32_t declared_task_count;
+#else
+    uint32_t max_occupied;
 #endif
     TraceContext trace;
 };
+#if PTO_FDWIC_SHARED_MAP
+static_assert(
+    kPrivateSlots <= 0xFFFFU,
+    "shared local occupancy must fit the packed local counter"
+);
+// 单槽无进展后允许跳过的 Submit 次数。该常量只调节非必需的
+// opportunistic EfDrain 采样频率，不改变 WaitForSlot/FinalDrain 的推进协议。
+constexpr uint16_t kSharedEfDrainNoProgressSkipSubmits = 1;
+static_assert(
+    kSharedEfDrainNoProgressSkipSubmits != 0,
+    "shared EfDrain backoff must retain a finite retry interval"
+);
+#endif
 
 #if PTO_FDWIC_SHARED_MAP && !PA_BUILD_TRACE_FREE
 // 正式 PA-UP 的 history DCCI 与 group-writer CAS 先捕获端点，raw 写入
@@ -645,6 +668,41 @@ PA_DEVICE uint32_t DrainReady(
     }
     return freed;
 }
+
+#if PTO_FDWIC_SHARED_MAP
+template <typename Ops>
+PA_DEVICE uint32_t OpportunisticDrainReady(
+    PA_GM SchedulerState *state, PA_GM WorkerState &worker,
+    LocalStats &stats
+) {
+    // 单槽长期等待时，相邻 Submit 往往反复读取同一个尚未完成的 fanin。
+    // 这里仅对“不承担活性责任”的 EfDrain 做一次有界退避：
+    //   poll(no progress) -> skip N submits -> poll。
+    // 两槽状态可能马上进入 WaitForSlot，必须立即检查；显式背压和最终
+    // drain 仍直接调用 DrainReady，因此不会丢失完成通知或改变依赖语义。
+    if (worker.occupied_count == 0) {
+        stats.efdrain_skip_budget = 0;
+        return 0;
+    }
+    const bool single_slot = worker.occupied_count == 1;
+    if (single_slot && stats.efdrain_skip_budget != 0) {
+        --stats.efdrain_skip_budget;
+        return 0;
+    }
+    // 保持唯一的 DrainReady 调用点，避免 CCEC 把完整 slot 扫描体复制到
+    // single/full 两个 successor 中而放大每种 Submit 实例的指令体积。
+    stats.efdrain_skip_budget = 0;
+    const uint32_t freed = DrainReady<Ops>(
+        state, worker, DrainPlace::EfDrain, stats
+    );
+    stats.efdrain_skip_budget =
+        single_slot && freed == 0 &&
+            worker.occupied_count == 1
+        ? kSharedEfDrainNoProgressSkipSubmits
+        : 0U;
+    return freed;
+}
+#endif
 
 PA_DEVICE int32_t FindFreeSlot(PA_GM WorkerState &worker) {
     for (uint32_t index = 0; index < kPrivateSlots; ++index) {
@@ -4142,7 +4200,11 @@ PA_DEVICE bool SubmitCallbackTask(
 
     const uint64_t efdrain_begin = submit_begin;
     BeginSubmitPmuPhase<SubmitPmuPhase::EfDrain, Ops>(pmu_context);
+#if PTO_FDWIC_SHARED_MAP
+    OpportunisticDrainReady<Ops>(state, worker, stats);
+#else
     DrainReady<Ops>(state, worker, DrainPlace::EfDrain, stats);
+#endif
     EndSubmitPmuPhase<SubmitPmuPhase::EfDrain, Ops>(pmu_context);
     const uint64_t efdrain_end = TraceTimestamp<Ops>(stats.trace, stats.result);
 #if PTO_FDWIC_SHARED_MAP

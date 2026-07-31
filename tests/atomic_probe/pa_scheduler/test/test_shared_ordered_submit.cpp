@@ -1097,6 +1097,93 @@ bool RunReadyFaninPrefixCompactionTest() {
     return ok;
 }
 
+bool RunOpportunisticEfDrainBackoffTest() {
+    SchedulerState *state = MapSchedulerState();
+    if (state == nullptr) {
+        return false;
+    }
+    WorkerState &worker = state->workers[0];
+    LocalSlot &slot = worker.slots[0];
+    worker.occupied_count = 1;
+    slot.occupied = true;
+    slot.built = true;
+    slot.task_id = 11;
+    slot.kind = 0;
+    slot.fanin_count = 1;
+    slot.fanin[0] = 7;
+    state->tasks[7].flag = 0;
+    LocalStats stats{};
+
+    const uint32_t first = OpportunisticDrainReady<
+        OrderedSubmitTestOps
+    >(state, worker, stats);
+    const bool first_poll =
+        first == 0 && worker.occupied_count == 1 &&
+        stats.efdrain_skip_budget ==
+            kSharedEfDrainNoProgressSkipSubmits &&
+        stats.result.fanin_not_ready_loads == 1;
+
+    // 依赖在两次 Submit 之间 ready 时，后续调用逐次消费本核预算；
+    // 预算耗尽后的下一次调用必须重新 poll 并执行，额外延迟严格有界。
+    state->tasks[7].flag = 1;
+    bool bounded_skips = true;
+    for (uint16_t remaining = kSharedEfDrainNoProgressSkipSubmits;
+         remaining != 0; --remaining) {
+        const uint32_t skipped = OpportunisticDrainReady<
+            OrderedSubmitTestOps
+        >(state, worker, stats);
+        bounded_skips =
+            bounded_skips && skipped == 0 &&
+            worker.occupied_count == 1 &&
+            stats.efdrain_skip_budget == remaining - 1 &&
+            stats.result.fanin_ready_loads == 0;
+    }
+    const uint32_t retry = OpportunisticDrainReady<
+        OrderedSubmitTestOps
+    >(state, worker, stats);
+    const bool retry_completes =
+        retry == 1 && worker.occupied_count == 0 &&
+        !slot.occupied && state->tasks[11].flag == 1 &&
+        stats.efdrain_skip_budget == 0 &&
+        stats.result.fanin_ready_loads == 1 &&
+        stats.result.placement[
+            static_cast<uint32_t>(DrainPlace::EfDrain)
+        ] == 1;
+
+    // 两槽已经承担背压风险，旧提示即使存在也必须清零并立即检查。
+    worker = WorkerState{};
+    worker.occupied_count = 2;
+    worker.slots[0].occupied = true;
+    worker.slots[0].built = true;
+    worker.slots[0].task_id = 12;
+    worker.slots[0].kind = 0;
+    worker.slots[1].occupied = true;
+    worker.slots[1].built = true;
+    worker.slots[1].task_id = 13;
+    worker.slots[1].kind = 0;
+    LocalStats full_stats{};
+    full_stats.efdrain_skip_budget =
+        kSharedEfDrainNoProgressSkipSubmits;
+    const uint32_t full = OpportunisticDrainReady<
+        OrderedSubmitTestOps
+    >(state, worker, full_stats);
+    const bool full_never_skips =
+        full == 2 && worker.occupied_count == 0 &&
+        full_stats.efdrain_skip_budget == 0 &&
+        state->tasks[12].flag == 1 &&
+        state->tasks[13].flag == 1;
+
+    const bool ok =
+        first_poll && bounded_skips && retry_completes &&
+        full_never_skips;
+    std::printf(
+        "[ORDERED_SUBMIT] opportunistic_efdrain_backoff=%s\n",
+        ok ? "PASS" : "FAIL"
+    );
+    (void)munmap(state, sizeof(SchedulerState));
+    return ok;
+}
+
 bool RunPaUpWriterShapeContractTest() {
     SchedulerState *state = MapSchedulerState();
     if (state == nullptr) {
@@ -1374,6 +1461,8 @@ int main() {
         RunSharedOutputPrepareContractTest();
     const bool fanin_compaction_ok =
         RunReadyFaninPrefixCompactionTest();
+    const bool efdrain_skip_ok =
+        RunOpportunisticEfDrainBackoffTest();
     const bool pa_up_shape_ok =
         RunPaUpWriterShapeContractTest();
     const bool overlap_ok = RunInsertReleaseBeforeBuildTest();
@@ -1381,7 +1470,8 @@ int main() {
         RunIndependentKernelExecutionTest();
     if (!claim_accounting_ok || !task_id_prefix_ok || !loser_ok ||
         !output_prepare_ok ||
-        !fanin_compaction_ok || !pa_up_shape_ok ||
+        !fanin_compaction_ok || !efdrain_skip_ok ||
+        !pa_up_shape_ok ||
         !overlap_ok || !execution_ok) {
         std::fprintf(
             stderr, "[FAIL] shared ordered-insert Submit tests\n"

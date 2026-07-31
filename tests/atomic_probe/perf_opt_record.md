@@ -4880,3 +4880,111 @@ tests/atomic_probe/pa_scheduler/test_record/2026-8-1/
 非旧分片核产生的合法 winner。修正 `SharedTraceClaimAttempted()` 为
 96 核全候选后，转换和 exclusive analyzer 均通过；CPU 回归另用
 worker 1 作为 task 0 Alloc winner，专门锁定这个跨旧分片语义。
+
+## 15. 2026-07-31 shared fanin 完成标志的有限轮询降频
+
+### 15.1 热点事实与修改边界
+
+最终 `N96/G8` 基线完整泳道中，`fanin_flag_load` 的逻辑调用为
+`59,027` 次，其中 `57,428` 次来自每个 Submit 开头的
+opportunistic EfDrain，只有 `1,599` 次来自 FinalDrain 的批量轮询；
+WaitForSlot 与 RingBackpressure 在该轮均未产生 fanin 轮询。直接记录的
+`57,428` 条 `atomic.return_ready.fanin_flag_load.load` 累计占用
+`14.786 ms` core-time，单条 mean/median/p95 分别为
+`257.46/257/381 ns`。因此主要问题不是单条原子异常变慢，而是一个
+worker 只有一个未 ready winning slot 时，相邻 Submit 会重复读取同一个
+尚未完成的 producer flag。
+
+本轮只减少这种重复观察，不改变以下合同：
+
+- Alloc/QK-PV/SF-UP 的合法候选仍为 `96/32/64`，B256 Claim 始终为
+  `73,728` 次；
+- 每任务两级 Tournament、winner 数量和 `deps_prepared` 严格插入链不变；
+- WaitForSlot、RingBackpressure 和 FinalDrain 继续每次强制调用
+  `DrainReady()`，它们承担推进责任，不能跳过；
+- 两个 occupied slot 时立即轮询，避免把可释放 slot 推迟到真正背压之后；
+- 实现只读取通用的 slot 数量和本次 drain 是否取得进展，不判断 PA task
+  kind、task-id 模式或特定依赖图。
+
+### 15.2 最终通用状态机
+
+shared worker 在本地 `LocalStats` 中保存一个有限预算。单 slot 的一次完整
+EfDrain 没有释放任务后，下一次 Submit 开头跳过轮询；再下一次必须重试：
+
+```text
+occupied == 0                 -> 清零预算，不轮询
+occupied >= 2                 -> 立即 DrainReady
+occupied == 1 && budget == 0  -> DrainReady
+                                 ├─ 有进展：保持 budget=0
+                                 └─ 无进展：设置 budget=1
+occupied == 1 && budget == 1  -> budget=0，本次跳过
+WaitForSlot / RingBp / Final  -> 始终直接 DrainReady
+```
+
+如果依赖恰好在被跳过的 Submit 之前 ready，任务最多延迟一个 Submit 被发现；
+回放结束时 FinalDrain 不看该预算，因而不会遗漏最后的 ready task。CPU 定向
+门槛覆盖了 `poll(no progress) -> skip -> retry and execute`、跳过期间依赖
+变 ready，以及两 slot 即使残留预算也必须立即 drain 三种情况。
+
+CCEC 的 `[[block_local]]` split runtime 原本为 `1,664 B`。直接新增一个
+`uint32_t` 会因 64 B 对齐把它扩大到 `1,728 B`，超过预留空间。最终将
+shared 模式下最大只可能为 4 的 `max_occupied` 精确收窄为 `uint16_t`，与
+`uint16_t` 预算复用原 4 B；private 布局不变，也没有增加 GM WorkerState
+字段或 host/device ABI。
+
+早期实现曾在两个分支各写一个 `DrainReady()` 调用，CCEC 将完整扫描体复制
+后，AIC/AIV `.text` 分别膨胀到约 `58.6/61.2 KiB`。最终保持唯一调用点，
+相对基线的 `.text` 变化收敛为：AIC `38,872 -> 39,920 B`、AIV
+`41,016 -> 42,040 B`、混合 kernel `132,920 -> 134,968 B`。
+
+### 15.3 深度 1 与深度 2 的取舍
+
+所有数据均为同一设备、B256、real-compute、无泳道 perf-clock 构建，并以
+基线和候选各一次的方式交错运行 8 组。绝对时间只在同一构建口径内比较。
+
+| 候选 | baseline mean | candidate mean | mean 变化 | baseline median | candidate median | fanin load 变化 | 改善组数 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 无进展后跳过 1 次 | 1,498.045 us | 1,472.265 us | -1.721% | 1,492.657 us | 1,465.178 us | 65,614 -> 44,184（-32.66%） | 6/8 |
+| 无进展后跳过 2 次 | 1,493.053 us | 1,499.789 us | +0.451% | 1,491.101 us | 1,500.577 us | 65,767 -> 39,311（-40.23%） | 2/8 |
+
+深度 2 虽然继续减少约 7.4% 的 fanin load，但更晚发现已经 ready 的 task，
+把成本移动到后续执行和 drain，端到端反而回退。因此最终常量固定为 1；
+不能把“原子调用数下降”单独当成保留优化的依据。
+
+### 15.4 最终完整泳道归因
+
+最终紧凑实现与未修改基线各取一份相同的 full-swimlane 构建：
+
+| 指标 | N96/G8 基线 | 最终候选 | 变化 |
+| --- | ---: | ---: | ---: |
+| Submit wall time | 1,704.612 us | 1,667.041 us | -2.204% |
+| fanin logical load | 59,027 | 35,430 | -39.98% |
+| 直接 fanin atomic | 57,428 | 33,910 | -40.95% |
+| 直接 fanin atomic core-time | 14.786 ms | 8.564 ms | -42.08% |
+| EfDrain control core-time | 29.348 ms | 21.471 ms | -26.84% |
+| Submit union core-time | 139.293 ms | 135.165 ms | -2.96% |
+| worker completion core-time | 165.019 ms | 161.412 ms | -2.19% |
+| replay 到 FinalDrain 结束的全核时间范围 | 1,784.643 us | 1,722.777 us | -3.47% |
+
+候选的 local/root Claim CAS 仍精确为 `73,728/9,216`。local CAS
+core-time 为 `18.741 -> 18.810 ms`，root CAS 为
+`2.389 -> 2.376 ms`，均属于同量级波动，没有出现旧 flat FetchMax
+协议中“loser 变轻后抵达同步、反而放大 Claim 竞争”的转移。
+
+较低的 opportunistic 轮询频率会改变 ready task 在 EfDrain 与 FinalDrain
+之间的落点：本轮 FinalDrain core-time 从 `7.449` 增到 `9.270 ms`，但包含
+FinalDrain 的 worker completion 和全核结束时间仍分别改善 `2.19%` 与
+`3.47%`。这也是选择深度 1、拒绝深度 2 的原因之一。
+
+最终本地泳道文件为：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260731_201346_1314666/ccec/
+    merged_swimlane.json
+    swimlane_exclusive_analysis.json
+```
+
+泳道 JSON 仅保留在本地 ignored outputs 中，不进入 GitHub。该轮
+validation 全部 PASS、drop 为 0；CPU shared 全套、B256 语义断言、CCEC
+AIC/AIV 构建和 manifest 检查也全部通过。
