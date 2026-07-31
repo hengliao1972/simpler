@@ -28,7 +28,7 @@ outputs
 tmp
 
 # Local PA scheduler profiling artifacts (large, never commit)
-tests/atomic_probe/pa_scheduler/test_record/**/*merged_swimlane*.json
+tests/atomic_probe/pa_scheduler/test_record/**/*swimlane*.json
 tests/atomic_probe/pa_scheduler/test_record/**/*exclusive_analysis*.json
 
 # Mid-work documentation
