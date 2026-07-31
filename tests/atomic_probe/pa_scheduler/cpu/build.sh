@@ -244,19 +244,20 @@ else
     echo "[TEST] shared heap no-wrap reserve self-test"
     "$BUILD_DIR/test_shared_heap_reserve"
 
-    # Claim 保持原 cursor 协议：Alloc/Cube 使用 prefix 四分片，Vector
-    # 使用 shared sidecar 八分片；96 worker 锁定 role 候选数、唯一
-    # winner、重复 loser，并要求 Claim 不触碰 deps_prepared。
-    echo "[BUILD] shared cursor Claim self-test"
+    # shared Claim 使用每 task 两级 CAS Tournament：96 worker 锁定
+    # 24/32/64 候选数、每组一个 root 竞争者、最终唯一 owner、重复
+    # replay 全输，并证明未来 task 不会覆盖延迟的前序 task。Claim 仍不
+    # 触碰 deps_prepared；TensorMap 顺序由独立 completion 链门槛验证。
+    echo "[BUILD] shared Claim Tournament self-test"
     "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \
         -DPA_BUILD_SWIMLANE=1 \
         -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/test/test_shared_vector_claim_cursor.cpp" \
-        -o "$BUILD_DIR/test_shared_vector_claim_cursor"
+        "$ROOT_DIR/test/test_shared_claim_tournament.cpp" \
+        -o "$BUILD_DIR/test_shared_claim_tournament"
 
-    echo "[TEST] shared cursor Claim self-test"
-    "$BUILD_DIR/test_shared_vector_claim_cursor"
+    echo "[TEST] shared Claim Tournament self-test"
+    "$BUILD_DIR/test_shared_claim_tournament"
 
     # Materialize 在触碰 shared cursor 前必须完成数量、引用、shape/stride
     # 和地址区间预检；这些 reserve 前拒绝路径不能推进 heap。FetchAdd 后

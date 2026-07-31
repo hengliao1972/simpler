@@ -221,6 +221,36 @@ static_assert(
         kSharedAllocClaimParticipants == 24,
     "shared Alloc Claim participants must stay 24"
 );
+#if PTO_FDWIC_SHARED_MAP
+// shared owner 仲裁保持原有 24/32/64 个合法候选，只把它们分散到
+// per-task 两级 Tournament：每组先选一个 local owner，各 local owner
+// 再竞争唯一 root owner。组数来自 A5 同地址竞争探针的实测候选，不能
+// 解释为缩减 Submit 参与核数。
+constexpr uint32_t kSharedAllocClaimTournamentGroups = 4;
+constexpr uint32_t kSharedAicClaimTournamentGroups = 6;
+constexpr uint32_t kSharedAivClaimTournamentGroups = 8;
+constexpr uint32_t kSharedClaimTournamentMaxGroups =
+    kSharedAivClaimTournamentGroups;
+// A5 探针中，同一轮 local 节点相隔 512B 时取得当前最短结果。每个节点
+// 只有首 8B 是 atomic 状态，其余字节只负责把并发热点映射到不同地址；
+// 节点不与普通 store/DCCI 数据共线。
+constexpr uint32_t kSharedClaimTournamentNodeStride = 512;
+static_assert(
+    kSharedAllocClaimParticipants == 24 &&
+        kAicWorkers == 32 && kAivWorkers == 64,
+    "shared Claim candidate populations must remain 24/32/64"
+);
+static_assert(
+    kSharedAllocClaimTournamentGroups > 0 &&
+        kSharedAllocClaimTournamentGroups <=
+            kSharedAllocClaimParticipants &&
+        kSharedAicClaimTournamentGroups > 0 &&
+        kSharedAicClaimTournamentGroups <= kAicWorkers &&
+        kSharedAivClaimTournamentGroups > 0 &&
+        kSharedAivClaimTournamentGroups <= kAivWorkers,
+    "every shared Claim Tournament group must have a candidate"
+);
+#endif
 // S4.14a 已建立 shared Vector 四分片迁址对照；S4.14b 继续使用相同的
 // sidecar 地址、物理容量和代码骨架，只启用此前预留的后四条物理线。
 // device 热路径仍使用同一取模表达式，唯一数值变量是 active shards
@@ -310,7 +340,8 @@ constexpr uint64_t kWatchdogTicks = 2 * kSystemCounterHz;
 constexpr uint32_t kTracePhasesEnabled = 1U << 0;
 constexpr uint32_t kTraceAtomicsEnabled = 1U << 1;
 // Claim trace flags 是独立 raw ABI：bit0 表示获胜，bit1 表示已经通过
-// AIC/AIV role 路由并真正执行 atomicMax。未 attempted 的 Claim 仍保留
+// AIC/AIV role 路由并真正进入 owner 仲裁。private 使用 atomicMax，shared
+// 使用 per-task 两级 CAS Tournament；未 attempted 的 Claim 仍保留
 // role-selection 开销，但转换器会明确标成 claim.not_attempted。
 constexpr uint32_t kClaimWon = 1U << 0;
 constexpr uint32_t kClaimAttempted = 1U << 1;
@@ -705,7 +736,12 @@ enum class AtomicSite : uint32_t {
     SharedMapAppendTailExchange = 38,
     // 仅在失败回滚中出现，返回旧值不参与协议判断。
     SharedOutputRollbackExchange = 39,
-    Count = 40,
+    // shared Claim 的两级 per-task Tournament。local CAS 从每组候选中
+    // 选出一人，root CAS 再产生整个 task 的唯一 owner；二者返回旧值
+    // 都参与胜负判断，必须按 return-ready 边界观察。
+    SharedClaimTournamentLocal = 40,
+    SharedClaimTournamentRoot = 41,
+    Count = 42,
 };
 
 // Atomic 记录 flags 的低四位保存操作种类；bit4 表示返回值参与后续判断，
@@ -794,6 +830,8 @@ PA_MODEL_INLINE constexpr AtomicOp AtomicSiteExpectedOp(AtomicSite site) {
             return AtomicOp::FetchMax;
         case AtomicSite::SharedInsertTurnHandoff:
         case AtomicSite::SharedMetadataLastWriterCommit:
+        case AtomicSite::SharedClaimTournamentLocal:
+        case AtomicSite::SharedClaimTournamentRoot:
             return AtomicOp::CompareExchange;
         case AtomicSite::SharedOutputWriterReserve:
             return AtomicOp::FetchMax;
@@ -851,6 +889,8 @@ PA_MODEL_INLINE constexpr bool AtomicSiteResultUsed(AtomicSite site) {
         case AtomicSite::SharedMapAppendSeqResetExchange:
         case AtomicSite::SharedMapAppendSeqPublishExchange:
         case AtomicSite::SharedMapAppendTailExchange:
+        case AtomicSite::SharedClaimTournamentLocal:
+        case AtomicSite::SharedClaimTournamentRoot:
             return true;
         case AtomicSite::Count:
             return false;
@@ -1201,6 +1241,44 @@ struct alignas(64) AtomicLine {
 // 热点共享量各占一个 cache line，保持生产代码的地址隔离，避免 standalone
 // 因伪共享额外放大 Claim/frontier/start barrier 的竞争。
 static_assert(sizeof(AtomicLine) == 64, "AtomicLine must occupy one cache line");
+
+#if PTO_FDWIC_SHARED_MAP
+// 每个 task 使用全新的仲裁节点，后续 task 无法像单调 cursor 那样越过并
+// 覆盖尚未完成 root 仲裁的前序 task。root/local 都是 atomic-only 状态：
+// 初值 -1，唯一成功 CAS 将其写成自己的 task_id，本轮不复用也不 DCCI。
+struct alignas(64) SharedClaimTournamentNode {
+    AtomicLine owner;
+    uint8_t padding[
+        kSharedClaimTournamentNodeStride - sizeof(AtomicLine)
+    ];
+};
+static_assert(
+    sizeof(SharedClaimTournamentNode) ==
+        kSharedClaimTournamentNodeStride,
+    "shared Claim Tournament node stride changed"
+);
+static_assert(
+    offsetof(SharedClaimTournamentNode, owner) == 0,
+    "shared Claim Tournament owner must start its node"
+);
+
+struct alignas(64) SharedClaimTournamentTask {
+    SharedClaimTournamentNode root;
+    SharedClaimTournamentNode
+        local[kSharedClaimTournamentMaxGroups];
+};
+static_assert(
+    sizeof(SharedClaimTournamentTask) ==
+        kSharedClaimTournamentNodeStride *
+            (1U + kSharedClaimTournamentMaxGroups),
+    "shared per-task Claim Tournament layout changed"
+);
+static_assert(
+    offsetof(SharedClaimTournamentTask, local) ==
+        kSharedClaimTournamentNodeStride,
+    "shared Claim local nodes must follow the root"
+);
+#endif
 
 // final 分层汇合把 arrival 与 release 分到不同 cache line：等待 release
 // 的 add-zero 不会反向堵塞尚未到达的 worker。最多 16 个叶组、4 个中间组；
@@ -1912,6 +1990,9 @@ struct alignas(64) SchedulerState {
     // shared 后端状态只追加在完整 production prefix、standalone controls
     // 和 results 之后，不移动 RunConfig、WorkerState 或任何被测生产字段。
     SharedTensorMapSidecar shared_map;
+    // standalone-only owner-election 状态继续追加在 shared TensorMap 后面；
+    // 它既不改变 production prefix，也不混入需要 DCCI 的 metadata。
+    SharedClaimTournamentTask claim_tournament[kMaxTasks];
 #endif
 };
 static_assert(offsetof(SchedulerState, cube_cursor) == 0, "cube cursor offset must match PA DistGlobal");
@@ -1955,15 +2036,25 @@ static_assert(
         offsetof(SchedulerState, results) + sizeof(WorkerResult) * kWorkers,
     "shared TensorMap sidecar must follow the complete result array"
 );
+static_assert(
+    offsetof(SchedulerState, claim_tournament) ==
+        offsetof(SchedulerState, shared_map) +
+            sizeof(SharedTensorMapSidecar),
+    "shared Claim Tournament must follow the TensorMap sidecar"
+);
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
 static_assert(
-    sizeof(SchedulerState) == 1019557696,
+    sizeof(SchedulerState) ==
+        1019557696ULL +
+            sizeof(SharedClaimTournamentTask) * kMaxTasks,
     "shared split SchedulerState ABI changed"
 );
 #else
 static_assert(
-    sizeof(SchedulerState) == 1019551552,
+    sizeof(SchedulerState) ==
+        1019551552ULL +
+            sizeof(SharedClaimTournamentTask) * kMaxTasks,
     "shared non-split SchedulerState ABI changed"
 );
 #endif

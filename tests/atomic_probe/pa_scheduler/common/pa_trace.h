@@ -124,6 +124,8 @@ PA_DEVICE AtomicOp TraceAtomicSiteExpectedOp(AtomicSite site) {
             return AtomicOp::FetchMax;
         case AtomicSite::SharedInsertTurnHandoff:
         case AtomicSite::SharedMetadataLastWriterCommit:
+        case AtomicSite::SharedClaimTournamentLocal:
+        case AtomicSite::SharedClaimTournamentRoot:
             return AtomicOp::CompareExchange;
         case AtomicSite::SharedOutputWriterReserve:
             return AtomicOp::FetchMax;
@@ -521,8 +523,6 @@ PA_DEVICE uint64_t TraceConfiguredDcciRegion(
     DcciSite site, Pointer address, uint64_t bytes,
     uint64_t *begin_out = nullptr, uint64_t begin_override = 0
 ) {
-    constexpr DcciOp op =
-        IsInvalidate ? DcciOp::Invalidate : DcciOp::CleanOut;
 #if PA_BUILD_TRACE_FREE
     (void)trace;
     (void)task_id;
@@ -539,6 +539,8 @@ PA_DEVICE uint64_t TraceConfiguredDcciRegion(
     }
     return 0;
 #else
+    constexpr DcciOp op =
+        IsInvalidate ? DcciOp::Invalidate : DcciOp::CleanOut;
     if constexpr (!ObserveDcci) {
         (void)trace;
         (void)task_id;

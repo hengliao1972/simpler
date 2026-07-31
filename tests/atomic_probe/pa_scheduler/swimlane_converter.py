@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# pyright: reportArgumentType=false
 # Copyright (c) PyPTO Contributors.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
@@ -22,6 +23,10 @@ import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, TextIO
+
+# 该 standalone converter 刻意保留与 raw ABI 审计对齐的手工换行；
+# 全文重排会产生上千行无语义 diff，掩盖真实协议改动。
+# fmt: off
 
 # 与真实 PA swimlane converter 使用同一套阶段命名。这里保留 ringbp、
 # efdrain 等既有拼写，避免同一阶段在两类泳道中被 Perfetto 分成不同名称。
@@ -148,6 +153,8 @@ ATOMIC_SITE_NAMES = {
     37: "shared_tensormap_append_seq_publish_exchange",
     38: "shared_tensormap_append_tail_exchange",
     39: "shared_output_rollback_exchange",
+    40: "shared_claim_tournament_local",
+    41: "shared_claim_tournament_root",
 }
 ATOMIC_OP_NAMES = {
     0: "load",
@@ -202,6 +209,8 @@ ATOMIC_SITE_OP_IDS = {
     37: 1,
     38: 1,
     39: 1,
+    40: 4,
+    41: 4,
 }
 # 这些发布型调用不消费 atomic 返回的旧值；其余 standalone site 的
 # 返回值都参与协议判断。v3 输入必须与源码语义完全一致。
@@ -218,9 +227,10 @@ POLL_BATCH_SITE_OP_IDS = {
     19: 0,
 }
 SHARED_REGISTER_ATOMIC_SITE_IDS = {19, 20}
-SCHEMA_V5_SHARED_ATOMIC_SITE_IDS = set(range(19, 40))
+SCHEMA_V5_SHARED_ATOMIC_SITE_IDS = set(range(19, 42))
 SHARED_INSERT_TURN_POLL_SITE_ID = 19
 SHARED_INSERT_TURN_HANDOFF_SITE_ID = 20
+SHARED_CLAIM_TOURNAMENT_SITE_IDS = {40, 41}
 
 ATOMIC_RESULT_USED = 1 << 4
 ATOMIC_VALUE_ZERO = 1 << 5
@@ -378,7 +388,7 @@ def _derive_v4_task_kinds(
 
 
 # 读取 raw JSON，校验十列结构、字段范围与可转整数值，并返回规范化视图。
-def _load_and_validate(
+def _load_and_validate(  # noqa: PLR0912, PLR0915
     input_path: Path,
 ) -> tuple[int, int, list[tuple[Any, ...]], dict[tuple[int, int], int], int, dict[str, Any]]:
     # raw 文件沿用真实 l2_swimlane_records.json 的十列 fdwic_events ABI：
@@ -679,7 +689,10 @@ def _load_and_validate(
                     or (payload and atomic_op != 3)
                     or function_id != -1
                     or (
-                        auxiliary == SHARED_INSERT_TURN_HANDOFF_SITE_ID
+                        auxiliary in (
+                            {SHARED_INSERT_TURN_HANDOFF_SITE_ID}
+                            | SHARED_CLAIM_TOURNAMENT_SITE_IDS
+                        )
                         and task_id < 0
                     )
                 ):
@@ -1738,7 +1751,7 @@ def _merged_item_sort_key(
     phase = PHASE_NAMES[str(phase_raw)]
     thread_id = (
         int(lane) + 3
-        if phase == "kernel" or phase == "commit"
+        if phase in {"kernel", "commit"}
         else int(lane)
     )
     overlay_priority = 2 if phase in ("atomic", "dcci") else 1
@@ -1749,7 +1762,9 @@ def _merged_item_sort_key(
 
 
 # 完成一次 raw 到 merged 的转换，成功时返回事件数、block 数和基准 cycle。
-def convert(input_path: Path, output_path: Path) -> tuple[int, int, int]:
+def convert(  # noqa: PLR0912, PLR0915
+    input_path: Path, output_path: Path
+) -> tuple[int, int, int]:
     (
         frequency_hz,
         trace_schema_version,

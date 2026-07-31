@@ -821,19 +821,26 @@ PA_DEVICE ClaimOutcome Claim(
     PA_GM SchedulerState *state, uint32_t worker_id, CoreRole role,
     uint32_t task_id, TaskKind kind, LocalStats &stats
 ) {
-    // Claim 在单调 cursor 上执行 atomicMax。private/Cube/Alloc 使用
-    // production-prefix 四分片；shared Vector 使用 sidecar 中的八分片
-    // cursor。同一 task 只有观察到旧值更小的竞争者获胜。
-    // shared Alloc 试验只允许映射到同一 alloc_cursor shard 的 24 个
-    // worker 竞争；QK/PV 仍由全部 32 个 AIC、SF/UP 仍由全部
-    // 64 个 AIV 发 atomicMax。private Alloc 继续保持 96 个竞争者。
+    // private 继续在单调 cursor 上执行 atomicMax；shared 则用每 task
+    // 独立的两级 CAS Tournament 选出唯一 owner。两种模式都保持既有
+    // 候选合同：shared Alloc/QK-PV/SF-UP 分别为 24/32/64，private
+    // Alloc 仍为 96。shared 的 TensorMap 严格插入顺序不由 Claim 承担，
+    // 而由 winner 后续的 deps_prepared commit chain 单独保证。
     // role 来自 RunSchedulerImpl 的入口 SSA 值；不能在每个 task 中再从
     // WorkerState GM 回读同一字段，否则 B256 会产生 98,304 次冗余读取。
     ClaimOutcome outcome{false, false, 0, -1};
+#if PTO_FDWIC_SHARED_MAP
+    if (task_id >= kMaxTasks) {
+        return outcome;
+    }
+    uint32_t candidate_rank = 0;
+    uint32_t tournament_groups = 0;
+#else
     if (task_id >= kTaskCellCapacity) {
         return outcome;
     }
     PA_GM AtomicLine *cursor = nullptr;
+#endif
     if (kind == TaskKind::Alloc) {
 #if PTO_FDWIC_SHARED_MAP
         if (worker_id >= kWorkers ||
@@ -841,10 +848,15 @@ PA_DEVICE ClaimOutcome Claim(
                 task_id % kCursorShards) {
             return outcome;
         }
+        // 候选 worker 是 task_id%4, task_id%4+4, ...；除以四得到
+        // 稳定的 [0,24) rank，再轮转到四个 local 节点。
+        candidate_rank = worker_id / kCursorShards;
+        tournament_groups =
+            kSharedAllocClaimTournamentGroups;
 #else
         (void)worker_id;
-#endif
         cursor = &state->alloc_cursor[task_id % kCursorShards];
+#endif
     } else {
         // Mirror MixedKernels::to_active_mask(), core_mask(), popcount(),
         // lane_active(), and self->role routing inside the real Claim span.
@@ -865,14 +877,24 @@ PA_DEVICE ClaimOutcome Claim(
         }
         if ((core_mask & 1U) != 0) {
             if (role != CoreRole::Aic) return outcome;
+#if PTO_FDWIC_SHARED_MAP
+            if (worker_id >= kAicWorkers) return outcome;
+            candidate_rank = worker_id;
+            tournament_groups =
+                kSharedAicClaimTournamentGroups;
+#else
             cursor = &state->cube_cursor[task_id % kCursorShards];
+#endif
             outcome.function_id = aic_kernel;
         } else if ((core_mask & 6U) != 0) {
             if (role != CoreRole::Aiv) return outcome;
 #if PTO_FDWIC_SHARED_MAP
-            cursor = &state->shared_map.shared_vector_cursor[
-                task_id % kSharedVectorCursorShards
-            ];
+            if (worker_id < kAicWorkers || worker_id >= kWorkers) {
+                return outcome;
+            }
+            candidate_rank = worker_id - kAicWorkers;
+            tournament_groups =
+                kSharedAivClaimTournamentGroups;
 #else
             cursor = &state->vector_cursor[task_id % kCursorShards];
 #endif
@@ -882,6 +904,52 @@ PA_DEVICE ClaimOutcome Claim(
         }
     }
     outcome.attempted = true;
+#if PTO_FDWIC_SHARED_MAP
+    PA_GM SharedClaimTournamentTask *tournament =
+        &state->claim_tournament[task_id];
+    const uint32_t group = candidate_rank % tournament_groups;
+    const int64_t expected = -1;
+    const int64_t desired = static_cast<int64_t>(task_id);
+
+    // 每个候选只等待自己唯一一次 local CAS 的返回。失败者立即返回；
+    // 每组唯一 local owner 才继续访问 root，因此 root 同地址竞争者从
+    // 24/32/64 收敛为 4/6/8。
+    const int64_t local_observed =
+        TraceAtomicCompareExchange<Ops>(
+            stats.trace, stats.result,
+            static_cast<int32_t>(task_id),
+            AtomicSite::SharedClaimTournamentLocal,
+            &tournament->local[group].owner.value,
+            expected, desired
+        );
+    if (local_observed != expected) {
+        if (local_observed != desired) {
+            SetFatal<Ops>(
+                state, stats, static_cast<int32_t>(task_id)
+            );
+        }
+        outcome.function_id = -1;
+        return outcome;
+    }
+
+    const int64_t root_observed =
+        TraceAtomicCompareExchange<Ops>(
+            stats.trace, stats.result,
+            static_cast<int32_t>(task_id),
+            AtomicSite::SharedClaimTournamentRoot,
+            &tournament->root.owner.value,
+            expected, desired
+        );
+    outcome.won = root_observed == expected;
+    if (!outcome.won) {
+        if (root_observed != desired) {
+            SetFatal<Ops>(
+                state, stats, static_cast<int32_t>(task_id)
+            );
+        }
+        outcome.function_id = -1;
+    }
+#else
     // atomicMax 返回写入前的 cursor：old<task_id 表示本核完成首次推进
     // 并获胜，old>=task_id 则必须 Replay。
     const int64_t old = TraceAtomicFetchMax<Ops>(
@@ -891,6 +959,7 @@ PA_DEVICE ClaimOutcome Claim(
     );
     outcome.won = old < static_cast<int64_t>(task_id);
     if (!outcome.won) outcome.function_id = -1;
+#endif
     return outcome;
 }
 

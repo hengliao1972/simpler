@@ -768,8 +768,8 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
         state->shared_map.shared_heap_cursor[shard].value = 0;
     }
     state->shared_map.shared_heap_vend.value = 0;
-    // shared Claim 仍使用八条 Vector cursor；它与 per-task 插入完成链
-    // 是两套独立状态，每轮都从 -1 开始。
+    // 旧 shared Vector cursor 已退出 owner 仲裁，但继续作为 canary 保留
+    // 在既有 sidecar 地址；每轮恢复 -1，host 要求执行后仍未被触碰。
     for (uint32_t shard = 0; shard < kSharedVectorCursorCapacity; ++shard) {
         state->shared_map.shared_vector_cursor[shard].value = -1;
     }
@@ -779,6 +779,12 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
         state->shared_map.reader_done[worker].value = -1;
     }
+    // 每个 task 的 root/local 节点只在线性化一次；整表置为 -1 后，本轮
+    // 不复用、不普通写，也不对这些 atomic-only 地址执行 DCCI。
+    std::memset(
+        state->claim_tournament, 0xff,
+        sizeof(state->claim_tournament)
+    );
 #endif
     state->heap_window = kHeapWindow;
     state->heap_base = kSyntheticHeapBase;
@@ -1000,9 +1006,9 @@ inline bool DecodeTraceStorageRecords(
 }
 
 // 巨大的 WorkerState 不参与每轮 H2D/D2H。private 仍只搬前缀、控制量和
-// 结果三个既有范围；shared 额外把 results 后的 map sidecar 作为第四个
-// 独立范围搬运：private 约 2 MiB，shared 含 output/history table 约
-// 12 MiB；不能把它混入 ControlBytes/ResultBytes。
+// 结果三个既有范围；shared 额外把 results 后的 map sidecar 和其后的
+// per-task Claim Tournament 作为两个独立范围搬运。它们都不能混入
+// ControlBytes/ResultBytes，也不能因避免 1 GiB worker arena 而漏传。
 inline constexpr size_t StatePrefixBytes() { return offsetof(SchedulerState, workers); }
 
 inline constexpr size_t ControlBytes() {
@@ -1018,6 +1024,16 @@ inline constexpr size_t SharedSidecarBytes() { return sizeof(SharedTensorMapSide
 static_assert(SharedSidecarBytes() == 12434560, "shared TensorMap transfer size changed");
 #else
 static_assert(SharedSidecarBytes() == 2113664, "private TensorMap transfer size changed");
+#endif
+
+#if PTO_FDWIC_SHARED_MAP
+inline constexpr size_t SharedClaimTournamentBytes() {
+    return sizeof(SharedClaimTournamentTask) * kMaxTasks;
+}
+static_assert(
+    SharedClaimTournamentBytes() == 20054016,
+    "shared Claim Tournament transfer size changed"
+);
 #endif
 
 inline constexpr size_t FinalBarrierStateBytes() { return sizeof(FinalBarrierState); }
@@ -1219,6 +1235,8 @@ inline const char *AtomicSiteName(uint32_t site) {
         "SharedMapAppendSeqPublishExchange",
         "SharedMapAppendTailExchange",
         "SharedOutputRollbackExchange",
+        "SharedClaimTournamentLocal",
+        "SharedClaimTournamentRoot",
     };
     static_assert(
         sizeof(names) / sizeof(names[0]) ==
@@ -4921,72 +4939,92 @@ inline Metrics Validate(
         &metrics
     );
 
-    // private 三类 Claim cursor 均为 production-prefix 四分片；shared
-    // Vector 使用 sidecar 的八条物理线，Cube/Alloc 保持四分片。逐 task
-    // 重新推导每条 cursor 的最终高水位。
-    int64_t expected_cube[kCursorShards] = {-1, -1, -1, -1};
+    // private 三类 Claim 继续核对 production-prefix 四分片 cursor 的
+    // 最终高水位；shared 改为逐 task 核对两级 Tournament，并要求所有
+    // 旧 cursor 保持初值，防止新旧仲裁协议在同一轮混用。
 #if PTO_FDWIC_SHARED_MAP
-    int64_t expected_vector[kSharedVectorCursorCapacity] = {
-        -1, -1, -1, -1, -1, -1, -1, -1
+    bool claim_state_ok = true;
+    auto claim_groups_for_kind = [](TaskKind kind) -> uint32_t {
+        switch (kind) {
+            case TaskKind::Alloc:
+                return kSharedAllocClaimTournamentGroups;
+            case TaskKind::Qk:
+            case TaskKind::Pv:
+                return kSharedAicClaimTournamentGroups;
+            case TaskKind::Sf:
+            case TaskKind::Up:
+                return kSharedAivClaimTournamentGroups;
+            case TaskKind::Count:
+                return 0;
+        }
+        return 0;
     };
-#else
-    int64_t expected_vector[kCursorShards] = {-1, -1, -1, -1};
-#endif
-    int64_t expected_alloc[kCursorShards] = {-1, -1, -1, -1};
-#if PTO_FDWIC_SHARED_MAP
-    bool cursors_ok = true;
-#endif
-    for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
-#if PTO_FDWIC_SHARED_MAP
+    for (uint32_t task_id = 0; task_id < kMaxTasks; ++task_id) {
+        const bool active = task_id < task_count;
         const SharedHostPlannedTask *planned_task =
-            shared_plan.TaskAt(task_id);
-        const TaskKind kind =
-            planned_task == nullptr
-                ? TaskKind::Count
-                : planned_task->kind;
-        cursors_ok &= planned_task != nullptr;
+            active ? shared_plan.TaskAt(task_id) : nullptr;
+        claim_state_ok &= !active || planned_task != nullptr;
+        const uint32_t groups = planned_task == nullptr
+            ? 0
+            : claim_groups_for_kind(planned_task->kind);
+        const int64_t expected_owner = active
+            ? static_cast<int64_t>(task_id)
+            : -1;
+        claim_state_ok &=
+            state.claim_tournament[task_id].root.owner.value ==
+                expected_owner;
+        for (uint32_t group = 0;
+             group < kSharedClaimTournamentMaxGroups; ++group) {
+            const int64_t expected_local =
+                active && group < groups
+                ? static_cast<int64_t>(task_id)
+                : -1;
+            claim_state_ok &=
+                state.claim_tournament[task_id]
+                    .local[group].owner.value == expected_local;
+        }
+    }
+    for (uint32_t shard = 0; shard < kCursorShards; ++shard) {
+        claim_state_ok &= state.cube_cursor[shard].value == -1;
+        claim_state_ok &= state.vector_cursor[shard].value == -1;
+        claim_state_ok &= state.alloc_cursor[shard].value == -1;
+    }
+    for (uint32_t shard = 0;
+         shard < kSharedVectorCursorCapacity; ++shard) {
+        claim_state_ok &=
+            state.shared_map.shared_vector_cursor[shard].value == -1;
+    }
+    Expect(
+        claim_state_ok,
+        "all shared per-task Claim Tournaments elect one owner and legacy cursors stay unused",
+        &metrics
+    );
 #else
+    int64_t expected_cube[kCursorShards] = {-1, -1, -1, -1};
+    int64_t expected_vector[kCursorShards] = {-1, -1, -1, -1};
+    int64_t expected_alloc[kCursorShards] = {-1, -1, -1, -1};
+    for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
         const TaskKind kind = static_cast<TaskKind>(task_id % kTasksPerBatch);
-#endif
         if (kind == TaskKind::Alloc) {
             expected_alloc[task_id % kCursorShards] = task_id;
         } else if (kind == TaskKind::Qk || kind == TaskKind::Pv) {
             expected_cube[task_id % kCursorShards] = task_id;
         } else {
-#if PTO_FDWIC_SHARED_MAP
-            expected_vector[
-                task_id % kSharedVectorCursorShards
-            ] = task_id;
-#else
             expected_vector[task_id % kCursorShards] = task_id;
-#endif
         }
     }
-#if !PTO_FDWIC_SHARED_MAP
     bool cursors_ok = true;
-#endif
     for (uint32_t shard = 0; shard < kCursorShards; ++shard) {
         cursors_ok &= state.cube_cursor[shard].value == expected_cube[shard];
-#if PTO_FDWIC_SHARED_MAP
-        // shared Vector 不应触碰旧 production-prefix vector cursor。
-        cursors_ok &= state.vector_cursor[shard].value == -1;
-#else
         cursors_ok &= state.vector_cursor[shard].value == expected_vector[shard];
-#endif
         cursors_ok &= state.alloc_cursor[shard].value == expected_alloc[shard];
     }
-#if PTO_FDWIC_SHARED_MAP
-    for (uint32_t shard = 0; shard < kSharedVectorCursorCapacity; ++shard) {
-        cursors_ok &=
-            state.shared_map.shared_vector_cursor[shard].value ==
-                expected_vector[shard];
-    }
-#endif
     Expect(
         cursors_ok,
         "all sharded Claim cursors reach their exact final task",
         &metrics
     );
+#endif
 
     if (state.config.profile_phases != 0) {
         // profile 开关关闭时这些字段允许保持零，避免把可选诊断本身变成语义门禁。

@@ -4643,3 +4643,123 @@ TensorMap，不属于生产优化。
    8B header 快照。前者依赖 slot 生命周期不变量，后者依赖结构布局并
    引入 AIC/AIV 代码生成差异；未来修改相关数据结构或角色合同时必须先
    跑定向正确性、CCEC O3 静态对照和两轮完整泳道。
+
+## 14. 2026-07-31 shared Claim 两级 Tournament
+
+### 14.1 问题与不变量
+
+基线 `e276a9c1` 已把 shared Alloc 的合法候选固定为 24 核；QK/PV 与
+SF/UP 仍分别由 32 个 AIC、64 个 AIV 参与。B256 的逻辑 Claim 人口为：
+
+| 类别 | 每 task 候选 | task 数 | Claim | winner |
+| --- | ---: | ---: | ---: | ---: |
+| Alloc | 24（8 AIC + 16 AIV） | 256 | 6,144 | 256 |
+| QK/PV | 32 AIC | 512 | 16,384 | 512 |
+| SF/UP | 64 AIV | 512 | 32,768 | 512 |
+| 合计 | - | 1,280 | 55,296 | 1,280 |
+
+本轮不再缩减候选人口，也不把候选改成固定 owner。需要同时保持：
+
+1. 每个 task 恰好一个执行 owner；
+2. 54,016 个 true loser 不进入轮询；
+3. owner 仲裁不承担 TensorMap 顺序，严格插入继续由
+   `TaskCell::deps_prepared` 完成链保证；
+4. future task 的认领不能覆盖尚未完成仲裁的 earlier task；
+5. private TensorMap 的原 FetchMax 路径不变。
+
+### 14.2 A5 原子拓扑探针
+
+`ccec/atomic_max_topology.cpp` 和对应 host 在相同候选人口、相同返回依赖
+下，对比 flat、group-only 与 two-level 三种地址拓扑，并同时覆盖
+FetchMax、CAS 和 Exchange。128 轮、7 次独立重复全部通过 winner 数与
+调用次数检查。代表性中位结果如下：
+
+| 候选数 | flat FetchMax | two-level | local 组数 | 改善 |
+| ---: | ---: | ---: | ---: | ---: |
+| 24 | 4,392.4 tick/round | 1,270.8 tick/round | 4 | 71.1% |
+| 32 | 5,793.9 tick/round | 1,419.8 tick/round | 6 | 75.5% |
+| 64 | 11,410.1 tick/round | 1,755.6 tick/round | 8 | 84.6% |
+
+同一拓扑下三种原子原语只相差约 0.1%，决定性变量是同一地址的竞争宽度。
+64 B 节点间距明显较差，128 B 已消除主要干扰，256/512 B 继续有小幅收益；
+当前选择实测最短的 512 B，不把缓存内部实现猜测写成事实。
+
+### 14.3 最终协议
+
+shared 每个 task 拥有独立的 root 节点和 8 个 local 节点，节点均为
+atomic-only，初值为 `-1`：
+
+```text
+所有合法候选：CAS(local[group], -1, task_id)
+  ├─ 失败：立即返回 loser
+  └─ 成功：CAS(root, -1, task_id)
+       ├─ 失败：立即返回 loser
+       └─ 成功：成为唯一执行 owner
+```
+
+Alloc、AIC、AIV 分别使用 4/6/8 个 local 组，root 同址竞争宽度由
+24/32/64 降为 4/6/8。CAS 返回值被控制流消费，因此两个站点都按
+`return_ready` 记录。一次 B256 的物理 CAS 为：
+
+```text
+local 55,296 + root 8,192 = 63,488
+```
+
+物理调用数比 flat FetchMax 多 8,192，但每个地址的排队显著缩短。每 task
+独立状态使 later task 无法覆盖 earlier task；每个 non-empty local 组恰有
+一个 root 竞争者，因此 root CAS 又恰有一个成功者。协议不需要 resolved
+状态，也不让 local loser 等待 root 结果。
+
+Tournament 数组增加 20,054,016 B `SchedulerState` 空间。CCEC host 仍按
+稀疏分段传输约 1 GiB 状态，因此必须把该数组显式加入 H2D/D2H 列表；首轮
+漏传导致 task 0 正确性失败，补齐传输后 host 同时检查所有 active 节点、
+unused 节点和旧 cursor canary。
+
+### 14.4 A5 性能结果
+
+无泳道的 10 个独立 B256 perf-clock 进程全部通过 55,296 次 Claim、1,280
+个 owner、1,024 个 kernel 及 TensorMap/heap/依赖检查：
+
+| 指标 | FetchMax 基线 | Tournament | 变化 |
+| --- | ---: | ---: | ---: |
+| mean | 1,762.728 us | 1,461.146 us | -17.109% |
+| median | 1,757.651 us | 1,458.332 us | -17.030% |
+| Tournament range | - | 1,452.002～1,477.541 us | - |
+
+完整 atomic/DCCI 泳道也来自相同的 `24/32/64` 候选合同：
+
+| 指标 | FetchMax | Tournament | 变化 |
+| --- | ---: | ---: | ---: |
+| Submit wall time | 1,817.290 us | 1,662.340 us | -8.527% |
+| Claim atomic core-time | 46.041 ms | 16.168 ms | -64.883% |
+| 单条 local/root atomic mean | 832.63 ns | 253.92/259.67 ns | - |
+| Claim non-atomic core-time | 3.747 ms | 4.302 ms | +14.821% |
+
+Claim non-atomic 外壳因分组路由和第二级分支略增，但远小于 atomic
+core-time 的下降。core-time 是所有核区间之和，不能与 Submit wall time
+直接加减；两类构建的绝对时间也不能交叉相减。
+
+新泳道 raw 位于：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260731_175816_1183691/ccec/
+```
+
+其中 local/root 分别为 55,296/8,192 条，flags 均为 `0x54`，即
+CompareExchange、返回值被消费、`return_ready`；drop 为 0。
+
+### 14.5 回归与适用边界
+
+- CPU 96 线程门槛覆盖 24/32/64 候选、每组唯一 local owner、全局唯一
+  root owner、重复 replay 全输、future-before-earlier 乱序，以及
+  `deps_prepared` 与旧 cursor 零触碰；
+- shared ordered Submit、shared/private CPU 全套均通过；
+- shared/private CCEC perf-clock、AIC/AIV 通用协议实例、split finish、
+  mixed ELF 与 manifest 均通过；
+- 泳道转换器显式识别 local/root 两个 CAS 站点，并拒绝错误 op、缺失
+  task-id 或非 shared schema-v5 输入。
+
+该机制依赖稳定、可索引的 task-id 和非空候选组，但不依赖 PA 的具体依赖图
+或 TensorMap 内容。若未来支持 task-id 回绕或动态复用，必须先增加 generation
+协议；当前有界任务数组在一次调度中不复用，因此不需要清零热路径。

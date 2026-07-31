@@ -184,10 +184,56 @@ struct OrderedSubmitTestOps {
         return __atomic_exchange_n(address, value, __ATOMIC_ACQ_REL);
     }
 
+    static bool ClaimTournamentAddress(
+        const volatile int64_t *address,
+        uint32_t &task_id, bool &is_root
+    ) {
+        if (observed_state == nullptr) {
+            return false;
+        }
+        const uintptr_t current =
+            reinterpret_cast<uintptr_t>(address);
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(
+            &observed_state->claim_tournament[0]
+        );
+        const uintptr_t end = begin +
+            sizeof(observed_state->claim_tournament);
+        if (current < begin || current >= end) {
+            return false;
+        }
+        const uintptr_t delta = current - begin;
+        task_id = static_cast<uint32_t>(
+            delta / sizeof(SharedClaimTournamentTask)
+        );
+        const uintptr_t task_offset =
+            delta % sizeof(SharedClaimTournamentTask);
+        if (task_offset % kSharedClaimTournamentNodeStride != 0) {
+            return false;
+        }
+        const uint32_t node = static_cast<uint32_t>(
+            task_offset / kSharedClaimTournamentNodeStride
+        );
+        if (node > kSharedClaimTournamentMaxGroups) {
+            return false;
+        }
+        is_root = node == 0;
+        return true;
+    }
+
     static int64_t CompareExchange(
         volatile int64_t *address, int64_t expected, int64_t desired
     ) {
         CountSharedMapAccess(address, sizeof(*address));
+        uint32_t claim_task = 0;
+        bool claim_root = false;
+        const bool claim_address = ClaimTournamentAddress(
+            address, claim_task, claim_root
+        );
+        if (claim_address && !claim_root) {
+            claim_attempts_by_task[claim_task].fetch_add(
+                1, std::memory_order_relaxed
+            );
+        }
         const int32_t completion_task =
             CompletionTaskCell(address);
         if (completion_task >= 0) {
@@ -220,6 +266,13 @@ struct OrderedSubmitTestOps {
                 static_cast<uint32_t>(completion_task)
             ].fetch_add(1, std::memory_order_relaxed);
         }
+        if (claim_address && claim_root &&
+            observed == expected && expected == -1 &&
+            desired == static_cast<int64_t>(claim_task)) {
+            claim_wins_by_task[claim_task].fetch_add(
+                1, std::memory_order_relaxed
+            );
+        }
         return observed;
     }
 
@@ -232,34 +285,16 @@ struct OrderedSubmitTestOps {
         volatile int64_t *address, int64_t value, uint64_t &retries
     ) {
         CountSharedMapAccess(address, sizeof(*address));
-        const bool valid_task =
-            value >= 0 &&
-            value < static_cast<int64_t>(kMaxTasks);
-        const bool claim_address =
-            observed_state != nullptr && valid_task &&
-            IsClaimCursorAddress(address);
-        if (claim_address) {
-            claim_attempts_by_task[
-                static_cast<uint32_t>(value)
-            ].fetch_add(1, std::memory_order_relaxed);
-        }
         int64_t current = __atomic_load_n(address, __ATOMIC_ACQUIRE);
         retries = 0;
-        bool won = false;
         while (value > current) {
             if (__atomic_compare_exchange_n(
                     address, &current, value, true,
                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE
                 )) {
-                won = true;
                 break;
             }
             ++retries;
-        }
-        if (claim_address && won) {
-            claim_wins_by_task[
-                static_cast<uint32_t>(value)
-            ].fetch_add(1, std::memory_order_relaxed);
         }
         return current;
     }
@@ -305,34 +340,6 @@ struct OrderedSubmitTestOps {
         return task < kMaxTasks
             ? static_cast<int32_t>(task)
             : -1;
-    }
-
-    static bool IsClaimCursorAddress(
-        const volatile int64_t *address
-    ) {
-        if (observed_state == nullptr) {
-            return false;
-        }
-        for (uint32_t shard = 0; shard < kCursorShards;
-             ++shard) {
-            if (address ==
-                    &observed_state
-                         ->cube_cursor[shard].value ||
-                address ==
-                    &observed_state
-                         ->alloc_cursor[shard].value) {
-                return true;
-            }
-        }
-        for (uint32_t shard = 0;
-             shard < kSharedVectorCursorShards; ++shard) {
-            if (address ==
-                &observed_state->shared_map
-                     .shared_vector_cursor[shard].value) {
-                return true;
-            }
-        }
-        return false;
     }
 
     static void StoreBarrier() {
@@ -525,6 +532,22 @@ uint32_t ExpectedClaimAttempts(TaskKind kind) {
     return 0;
 }
 
+uint32_t ExpectedClaimGroups(TaskKind kind) {
+    switch (kind) {
+        case TaskKind::Alloc:
+            return kSharedAllocClaimTournamentGroups;
+        case TaskKind::Qk:
+        case TaskKind::Pv:
+            return kSharedAicClaimTournamentGroups;
+        case TaskKind::Sf:
+        case TaskKind::Up:
+            return kSharedAivClaimTournamentGroups;
+        case TaskKind::Count:
+            return 0;
+    }
+    return 0;
+}
+
 bool RunLocalClaimAttemptAccountingTest() {
     LocalStats zero_attempts{};
     FinalizeSharedClaimAttempts(zero_attempts, 0);
@@ -674,6 +697,20 @@ bool ClaimAndInsertEvidenceMatches(
                     claim_wins_by_task[task_id].load(
                         std::memory_order_relaxed
                     ) == 1;
+            const SharedClaimTournamentTask &tournament =
+                state.claim_tournament[task_id];
+            exact &= tournament.root.owner.value ==
+                static_cast<int64_t>(task_id);
+            const uint32_t groups =
+                ExpectedClaimGroups(task.kind);
+            for (uint32_t group = 0;
+                 group < kSharedClaimTournamentMaxGroups;
+                 ++group) {
+                exact &= tournament.local[group].owner.value ==
+                    (group < groups
+                         ? static_cast<int64_t>(task_id)
+                         : -1);
+            }
             exact &=
                 state.tasks[task_id].deps_prepared ==
                 static_cast<int64_t>(task_id);
@@ -698,6 +735,13 @@ bool ClaimAndInsertEvidenceMatches(
     exact &= planned_tasks == task_count;
     for (uint32_t task = task_count;
          task < kMaxTasks; ++task) {
+        exact &=
+            state.claim_tournament[task].root.owner.value == -1;
+        for (uint32_t group = 0;
+             group < kSharedClaimTournamentMaxGroups; ++group) {
+            exact &= state.claim_tournament[task]
+                .local[group].owner.value == -1;
+        }
         exact &=
             OrderedSubmitTestOps::
                 completion_cas_by_task[task].load(

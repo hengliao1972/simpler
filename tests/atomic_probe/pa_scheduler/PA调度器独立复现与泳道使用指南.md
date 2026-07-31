@@ -1087,9 +1087,9 @@ atomic.poll_batch.<site>.load×<call_count>
 名称中的 `call_count` 是实际执行的源码 wrapper 调用次数，
 不是采样或估算值。
 
-当前固定 schema 共有 21 个调用点。0～14 是既有 common/private
-调用点，15～18 是 shared heap 调用点，19～20 是 per-task TensorMap
-插入完成链：
+当前固定 schema 共有 42 个调用点。0～14 是既有 common/private
+调用点，15～41 是 shared heap、TensorMap、shared output 和 Claim
+调用点：
 
 | `site_id` | Perfetto `site` | `op` | 所属路径 |
 | --------: | --------------- | ---- | -------- |
@@ -1114,8 +1114,29 @@ atomic.poll_batch.<site>.load×<call_count>
 | 18 | `shared_heap_vend_advance` | `fetch_add` | 推进并取得 aggregate vend |
 | 19 | `shared_insert_predecessor_poll` | `load` | task N 等待 task N-1 的插入完成字 |
 | 20 | `shared_insert_completion_publish` | `compare_exchange` | CAS 发布 task N 的插入完成字 |
+| 21 | `shared_winner_fatal_guard_load` | `load` | shared winner 的 fatal 防护读取 |
+| 22 | `shared_metadata_fatal_guard_load` | `load` | metadata 发布的 fatal 防护读取 |
+| 23 | `shared_output_ref_fanin_output_published_load` | `load` | fanin 等待 shared output descriptor |
+| 24 | `shared_output_ref_metadata_output_published_load` | `load` | metadata 路径读取 output published |
+| 25 | `shared_output_ref_fanin_last_writer_load` | `load` | fanin 读取 symbol writer history |
+| 26 | `shared_output_ref_metadata_last_writer_load` | `load` | metadata 读取 symbol last writer |
+| 27 | `shared_output_ref_last_writer_commit` | `compare_exchange` | 提交 symbol last writer |
+| 28 | `shared_output_writer_reserve` | `fetch_max` | 预留 shared output writer |
+| 29 | `shared_output_published_exchange` | `exchange` | 发布 shared output descriptor 就绪 |
+| 30 | `shared_tensormap_lookup_head_load` | `load` | TensorMap lookup 读 head |
+| 31 | `shared_tensormap_lookup_tail_load` | `load` | TensorMap lookup 读 tail |
+| 32 | `shared_tensormap_lookup_seq_load` | `load` | TensorMap lookup 读 slot seq |
+| 33 | `shared_tensormap_append_head_load` | `load` | TensorMap append 读 head |
+| 34 | `shared_tensormap_append_tail_load` | `load` | TensorMap append 读 tail |
+| 35 | `shared_tensormap_append_seq_load` | `load` | TensorMap append 读 slot seq |
+| 36 | `shared_tensormap_append_seq_reset_exchange` | `exchange` | 重置 append slot seq |
+| 37 | `shared_tensormap_append_seq_publish_exchange` | `exchange` | 发布 append slot seq |
+| 38 | `shared_tensormap_append_tail_exchange` | `exchange` | 推进 TensorMap tail |
+| 39 | `shared_output_rollback_exchange` | `exchange` | 撤销失败的 output 预留 |
+| 40 | `shared_claim_tournament_local` | `compare_exchange` | per-task 组内 owner 仲裁 |
+| 41 | `shared_claim_tournament_root` | `compare_exchange` | per-task 唯一执行 owner 仲裁 |
 
-上表是源码调用点集合，不代表每轮都会出现全部 21 类事件；例如正常成功路径不应
+上表是源码调用点集合，不代表每轮都会出现全部 42 类事件；例如正常成功路径不应
 执行 `fatal_set`。standalone 也没有真实 PA 后续追加的 BlockWon site，不能把真实
 PA 的九类 load 加一类 exchange allowlist 照搬到这里。
 
@@ -1123,8 +1144,9 @@ shared heap 四个站点的返回值都参与协议判断：vend/cursor Load 用
 与容量检查，两个 FetchAdd 的旧值分别决定物理地址和累计进度。因此 CCEC
 direct 记录均使用 return-ready 边界；它们不是发布后即丢弃返回值的
 source-issue 操作。PA Case1 每 batch 固定执行 5 次 vend load，以及各 4 次
-cursor load、cursor reserve 和 vend advance。output publication/last-writer
-仍按后续 S5.2 小步接入，不能把当前 19-site schema 宣称为 shared 全覆盖。
+cursor load、cursor reserve 和 vend advance。shared output、TensorMap
+和 Claim Tournament 已各自使用独立站点；“有站点”只表示已接入观察，不代表
+任一具体 PA 图会执行所有路径。
 
 standalone 的通用等待区只允许以下六类 observation load 在匹配窗口内进入
 PollBatch；同一 site 在等待区外的一次性或 opportunistic 读取仍是 direct Atomic：

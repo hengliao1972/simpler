@@ -1882,7 +1882,7 @@ int main(int argc, char **argv) {
 
     // host shadow 保留约 1 GiB 总跨度以便按关键 offset 寻址。private 每轮
     // 只传共享前缀、控制区和结果区；shared 再单独传 results 后的 map
-    // sidecar，既有三个范围的大小和边界均不改变。
+    // sidecar 和 per-task Claim Tournament；所有范围都避开 worker arena。
     std::unique_ptr<pa_scheduler::SchedulerState> state(new pa_scheduler::SchedulerState);
     pa_scheduler::TraceHeader trace_header{};
     std::vector<double> spans;
@@ -1994,8 +1994,9 @@ int main(int argc, char **argv) {
         }
 #endif
 #if PTO_FDWIC_SHARED_MAP
-        // shared map 位于 results 之后，不能扩大 ControlBytes 或把它重复混入
-        // 每核结果范围；初始化搬运仍发生在 launch 计时开始之前。
+        // shared map 与 Claim Tournament 位于 results 之后，不能扩大
+        // ControlBytes 或把它们混入每核结果范围；两次初始化搬运都发生
+        // 在 launch 计时开始之前。
         if (!CheckAcl(
                 aclrtMemcpy(
                     &static_cast<pa_scheduler::SchedulerState *>(state_device)->shared_map,
@@ -2003,6 +2004,16 @@ int main(int argc, char **argv) {
                     pa_scheduler::host::SharedSidecarBytes(), ACL_MEMCPY_HOST_TO_DEVICE
                 ),
                 "aclrtMemcpy(H2D shared TensorMap sidecar)"
+            ) ||
+            !CheckAcl(
+                aclrtMemcpy(
+                    &static_cast<pa_scheduler::SchedulerState *>(state_device)->claim_tournament,
+                    pa_scheduler::host::SharedClaimTournamentBytes(),
+                    &state->claim_tournament,
+                    pa_scheduler::host::SharedClaimTournamentBytes(),
+                    ACL_MEMCPY_HOST_TO_DEVICE
+                ),
+                "aclrtMemcpy(H2D shared Claim Tournament)"
             )) {
             execution_ok = false;
             break;
@@ -2065,6 +2076,16 @@ int main(int argc, char **argv) {
                     pa_scheduler::host::SharedSidecarBytes(), ACL_MEMCPY_DEVICE_TO_HOST
                 ),
                 "aclrtMemcpy(D2H shared TensorMap sidecar)"
+            ) ||
+            !CheckAcl(
+                aclrtMemcpy(
+                    &state->claim_tournament,
+                    pa_scheduler::host::SharedClaimTournamentBytes(),
+                    &static_cast<pa_scheduler::SchedulerState *>(state_device)->claim_tournament,
+                    pa_scheduler::host::SharedClaimTournamentBytes(),
+                    ACL_MEMCPY_DEVICE_TO_HOST
+                ),
+                "aclrtMemcpy(D2H shared Claim Tournament)"
             )) {
             execution_ok = false;
             break;

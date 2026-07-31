@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# pyright: reportArgumentType=false, reportIndexIssue=false
 # Copyright (c) PyPTO Contributors.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
@@ -16,6 +17,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+
+# 测试数据故意使用松散 JSON object 并与 converter 的 raw 换行对齐；
+# 保留当前审计格式，避免单个站点回归引起整文件机械重排。
+# fmt: off
 
 try:
     # `python -m unittest tests.atomic_probe...` 以 namespace package 导入。
@@ -1802,6 +1807,43 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
         }
         self.assertFalse(any("·atomic" in name for name in thread_names))
 
+    def test_v5_shared_claim_tournament_atomics_are_named(self) -> None:
+        capture = _v5_shared_register_atomic_capture()
+        rows = capture["fdwic_events"]
+        assert isinstance(rows, list)
+        # 两级 CAS 都消费返回值来判断 local/root owner，因此必须显示为
+        # return_ready；task_id 后缀让它们能和同一个 Claim 直接对应。
+        rows.extend(
+            [
+                [0, 0, 0, 0, -1, "Atomic", 111, 112, 0x54, 40],
+                [0, 0, 0, 0, -1, "Atomic", 112, 113, 0x54, 41],
+            ]
+        )
+        _refresh_summary(capture)
+
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            convert(input_path, output_path)
+            merged = json.loads(output_path.read_text(encoding="utf-8"))
+
+        atomic_names = {
+            event["name"]
+            for event in merged["traceEvents"]
+            if str(event.get("name", "")).startswith("atomic.return_ready.")
+        }
+        self.assertIn(
+            "atomic.return_ready.shared_claim_tournament_local."
+            "compare_exchange#0",
+            atomic_names,
+        )
+        self.assertIn(
+            "atomic.return_ready.shared_claim_tournament_root."
+            "compare_exchange#0",
+            atomic_names,
+        )
+
     def test_v4_shared_task_zero_forbids_insert_turn_poll_batch(self) -> None:
         capture = _v5_shared_register_atomic_capture()
         rows = capture["fdwic_events"]
@@ -2279,7 +2321,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             (0x42, 0, -1),  # 未消费返回值不能声明 return-ready
             (0x73, 4, -1),  # value_zero 只属于 Load
             ((1 << 8) | 0x50, 1, -1),  # retry payload 只属于 FetchMax
-            (0x50, 21, -1),  # 当前 AtomicSite::Count 以外的未定义站点
+            (0x50, 42, -1),  # 当前 AtomicSite::Count 以外的未定义站点
             (0x53, 4, 0),  # Atomic 不携带 function id
         )
         for flags, site, func_id in cases:
