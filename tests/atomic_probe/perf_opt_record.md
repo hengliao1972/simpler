@@ -4429,3 +4429,46 @@ tests/atomic_probe/pa_scheduler/outputs/
 保留依据是两轮固定 actor、相邻边界和零 atomic 交集的 non-atomic
 一致改善。完整失败语义、静态对象和逐切片数据见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.26 撤回 shared context-read 的 batch 前缀覆盖
+
+**[已撤回] AIC 直接 Transition 改善，但 AIV 与双侧闭合稳定回退**
+
+`context_reads` 是每核最终正确性计数。shared replay 连续按
+`batch=0..N-1` 进入，候选用 `batch+1` 直接覆盖该字段，替代每批对旧值
+执行 `load+add+store`；正常与失败前缀语义等价，private 不变。
+
+CCEC O3 证明每批精确删除一次 block-local load 和一次独立 add，B256
+全局各删除 24,576 次；atomic、DCCI、Claim 人口、runtime/Finish 和
+private 产物均未改变。CPU shared B256/mixed、临时第二批失败前缀测试、
+CCEC shared/private 及两份 A5 完整泳道全部通过：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260731_013043_808827/ccec/
+  pa_scheduler_shared_swimlane_20260731_013136_810392/ccec/
+```
+
+两份泳道均保持 122,880 Submit/Claim、73,728 attempted、1,280 winner、
+1,024 Kernel、原 96/32/64 Claim 合同、依赖签名和 drop 0。
+
+固定 23,483 个跨 batch UP nonwinner，逐核扣除
+`Atomic∪Kernel`，并从左侧 UP tail 闭合到右侧下一 Alloc Claim 前：
+
+| 口径 | 第一组 A/B | 第二组 A/B |
+| --- | ---: | ---: |
+| AIC 直接 Transition | **-2.957%** | **-2.505%** |
+| AIC 双侧闭合 | **-1.754%** | **-1.653%** |
+| AIV 直接 Transition | +0.407% | +1.261% |
+| AIV 双侧闭合 | **+2.229%** | **+2.162%** |
+| 全核直接 Transition | -0.368% | +0.389% |
+| 全核双侧闭合 | **+1.258%** | **+1.226%** |
+
+直接 Transition 与左闭合的 Atomic/Kernel 交集为 0；右侧 EfDrain 的
+交集也已按物理核区间并集扣除。候选整体 Submit
+`2341.953/2300.034 us` 只作背景，没有用于替代非 atomic 裁决。
+
+源码和候选专用测试均已撤回，恢复到 `ce892a78`。本轮不运行
+perf-clock：两轮 AIV 与全核双侧闭合已经明确否决。完整静态 IR、
+失败现场、左右边界和负对照见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。

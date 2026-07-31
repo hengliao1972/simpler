@@ -16719,3 +16719,114 @@ non-atomic 收益。
 的重复标量读取；AIV/CPU、Claim/atomic、TensorMap、winner Finish 和
 ticket ABI 均未改变。全核版的失败也再次确认：后续不能只看局部 span，
 必须继续闭合到下一 Submit 边界并检查字节未改核型的系统级对照。
+
+### 2026-07-31：撤回 shared context-read 计数的 batch 前缀覆盖
+
+#### 候选语义与静态收益
+
+`WorkerResult::context_reads` 只用于 host 校验每核确实读取了全部 batch
+上下文，不参与 Claim、TensorMap、Build 或执行调度。shared replay 按
+`batch=0..N-1` 连续进入，任一 plan/Submit 失败都会结束循环，因此进入
+第 `batch` 轮时，原计数旧值必为 `batch`。候选把：
+
+```cpp
+++stats.result.context_reads;
+```
+
+改为：
+
+```cpp
+stats.result.context_reads =
+    static_cast<uint64_t>(batch) + 1U;
+```
+
+正常结束和 Build/任一 Submit 失败现场都保持相同的精确前缀。private
+独立 replay 仍保留原自增。
+
+CCEC O3 中，基线 AIC/AIV 每批均保留
+`load context_reads + add 1 + store`，另有循环 induction add；候选
+直接复用 `batch+1` 同时完成 store 和下一轮 induction。B256 全局精确
+删除 24,576 次 block-local 旧值读取和 24,576 次独立加法：
+
+- AIC：`32×256=8,192` 次；
+- AIV：`64×256=16,384` 次。
+
+AIC orchestration symbol 从 `0x11270` 缩至 `0x1126c`，AIV 保持
+`0x11564`；atomic intrinsic 类型/数量、DCCI/DSB、split
+runtime/Finish 和 private 产物均不变。
+
+#### 正确性验证
+
+进入 A5 前完成了以下验证：
+
+- CPU shared 全量协议测试；
+- CPU B256/G1 与 mixed G0/G1/G2/G4；
+- 定向 B2 成功路径逐核 `context_reads==2`；
+- 临时故障注入把第二批 `context_len` 改为 `-1`，确认至少一个 worker
+  在 task5 Submit 前发布 `context_reads==2`，且 task5 的 Claim、
+  completion CAS 和 publication 均为 0；
+- CCEC shared/private full-swimlane 构建；
+- artifact manifest 与 atomic/DCCI 源码覆盖。
+
+故障注入测试只服务本候选等价性取证；候选否决后与生产改动一起撤回，
+没有把过程测试长期留在仓库。
+
+两份候选 A5 B256/G1 泳道为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260731_013043_808827/ccec/
+outputs/pa_scheduler_shared_swimlane_20260731_013136_810392/ccec/
+```
+
+每份均保持 96 核、122,880 Submit/Claim、73,728 attempted、
+1,280 winner、72,448 true-loser、49,152 not-attempted、
+1,024 Kernel、4,288 条 DCCI 记录、依赖签名和 drop 0。
+
+#### 跨 batch SubmitTransition 闭合
+
+B256 每核 256 次计数更新中，第一次位于首 Submit 前缀，余下 255 次
+位于上一批 UP 与下一批 Alloc 之间，因此跨 batch 区间覆盖
+`96×255=24,480` 次，占动态更新的 99.61%。裁决定义：
+
+```text
+L = UP Claim.end → UP Submit.end
+T = UP Submit.end → 下一 Alloc Submit.start
+R = 下一 Alloc Submit.start → 下一 Alloc Claim.start
+```
+
+四份 raw 固定同一 `(core, UP task, Claim status)` 后得到 23,483 个
+nonwinner actor，其中 AIC 8,160 个、AIV 15,323 个。所有区间都先按
+物理核合并并扣除 `Atomic∪Kernel`；`T` 和 `L+T` 的交集严格为 0，
+`R` 中的 EfDrain 交集也已逐 actor 扣除。结果为：
+
+| 固定人口 | 区间 | 第一组 A/B | 第二组 A/B |
+| --- | --- | ---: | ---: |
+| AIC | T | **-2.957%** | **-2.505%** |
+| AIC | L+T+R | **-1.754%** | **-1.653%** |
+| AIV | T | +0.407% | +1.261% |
+| AIV | L+T | +0.652% | +1.232% |
+| AIV | T+R | +2.353% | +2.368% |
+| AIV | L+T+R | **+2.229%** | **+2.162%** |
+| 全核 | T | -0.368% | +0.389% |
+| 全核 | L+T+R | **+1.258%** | **+1.226%** |
+
+AIC 的静态消减确实转化为直接收益，但 AIV 的直接区间、左右闭合和
+双侧闭合均稳定回退，最终使全核双侧闭合连续回退。未修改业务语义的
+intra-batch 负对照也发现 AIV `SF→PV` 的 `L+T` 连续增加
+`0.598%/0.927%`，支持代码布局发生系统级搬移，而不是只看一个边界的
+统计偶然。
+
+候选完整泳道 Submit 为 `2341.953/2300.034 us`，基线为
+`2294.604/2276.037 us`。整体值包含动态 atomic，只作背景，不参与
+上述 non-atomic 否决。
+
+#### 决策
+
+候选完整撤回，源码恢复到 AIC-only 8B output header 提交
+`ce892a78`。没有运行 perf-clock：AIV 直接目标和双侧闭合已经在两轮
+固定人口中同向回退，整体时间不能推翻这条证据。
+
+本轮确认：即使语义等价且静态精确删除每批一次 load/add，跨 batch
+长循环的寄存器和分支布局仍可能让 AIV 付出更高成本。后续不再重复
+`context_reads` 的 induction 覆盖方向，继续寻找不引入跨批布局搬移的
+独立 SubmitTransition 消减点。
