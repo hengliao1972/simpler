@@ -179,14 +179,19 @@ struct CcecOps {
     static constexpr bool kAtomicReturnReadyObserved = true;
 
     // 该适配层把平台无关调度器需要的原子、计时、NOP 和 cache 操作逐一映射到 CCEC intrinsic。
-    // A5 上 PA 的共享“读取”使用 atomicAdd(addr, 0)，不是普通 GM load；这里保留其 RMW 竞争语义。
+    // A5 上 PA 的共享“读取”是返回旧值的恒等 RMW，不是普通 GM load；
+    // 每种宽度仍必须保留原子竞争和返回就绪语义。
     __aicore__ static inline int32_t Load(__gm__ volatile int32_t *address) {
         // atomicAdd 返回加法发生前的值；加数为 0，因此它就是本次共享读取的结果。
         return atomicAdd(const_cast<__gm__ int32_t *>(address), static_cast<int32_t>(0));
     }
 
     __aicore__ static inline int64_t Load(__gm__ volatile int64_t *address) {
-        return atomicAdd(const_cast<__gm__ int64_t *>(address), static_cast<int64_t>(0));
+        // atomicMax(INT64_MIN) 对任意 int64_t 都是恒等 RMW，返回值仍是
+        // 操作前旧值。这里只替换平台 load primitive，不改变调用点、
+        // 参与核数或共享协议；是否保留由完整调度器的交错 A/B 决定。
+        constexpr int64_t identity = (-9223372036854775807LL - 1LL);
+        return atomicMax(const_cast<__gm__ int64_t *>(address), identity);
     }
 
     __aicore__ static inline uint64_t Load(__gm__ volatile uint64_t *address) {

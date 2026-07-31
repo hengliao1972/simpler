@@ -236,6 +236,12 @@ const char *ModeName(atomic_scalar_pmu::Mode mode) {
         case atomic_scalar_pmu::Mode::DependentAtomicLoad64: return "DEPENDENT_ATOMIC_LOAD64";
         case atomic_scalar_pmu::Mode::ScalarLoadControl32: return "SCALAR_LOAD_CONTROL32";
         case atomic_scalar_pmu::Mode::DependentAtomicLoad32: return "DEPENDENT_ATOMIC_LOAD32";
+        case atomic_scalar_pmu::Mode::DependentAtomicLoad64CasIdentity:
+            return "DEPENDENT_ATOMIC_LOAD64_CAS_IDENTITY";
+        case atomic_scalar_pmu::Mode::DependentAtomicLoad64MaxIdentity:
+            return "DEPENDENT_ATOMIC_LOAD64_MAX_IDENTITY";
+        case atomic_scalar_pmu::Mode::DependentAtomicLoad64MinIdentity:
+            return "DEPENDENT_ATOMIC_LOAD64_MIN_IDENTITY";
         default: return "UNKNOWN";
     }
 }
@@ -324,7 +330,10 @@ bool IsLoad32Mode(atomic_scalar_pmu::Mode mode) {
 
 bool IsLoad64Mode(atomic_scalar_pmu::Mode mode) {
     return mode == atomic_scalar_pmu::Mode::ScalarLoadControl64 ||
-        mode == atomic_scalar_pmu::Mode::DependentAtomicLoad64;
+        mode == atomic_scalar_pmu::Mode::DependentAtomicLoad64 ||
+        mode == atomic_scalar_pmu::Mode::DependentAtomicLoad64CasIdentity ||
+        mode == atomic_scalar_pmu::Mode::DependentAtomicLoad64MaxIdentity ||
+        mode == atomic_scalar_pmu::Mode::DependentAtomicLoad64MinIdentity;
 }
 
 uint64_t RepeatedChecksum(uint64_t value, uint32_t rounds) {
@@ -559,6 +568,32 @@ void PrintRoundSummary(
             rounds, metric.name, width64, width32, width32 - width64, relative
         );
     }
+
+    const auto &cas_identity = samples[static_cast<uint32_t>(
+        atomic_scalar_pmu::Mode::DependentAtomicLoad64CasIdentity
+    )];
+    const auto &max_identity = samples[static_cast<uint32_t>(
+        atomic_scalar_pmu::Mode::DependentAtomicLoad64MaxIdentity
+    )];
+    const auto &min_identity = samples[static_cast<uint32_t>(
+        atomic_scalar_pmu::Mode::DependentAtomicLoad64MinIdentity
+    )];
+    for (const Metric &metric : metrics) {
+        const double cas_minus_add = PairedDeltaPerOperation(
+            cas_identity, atomic_load64, metric.member, rounds
+        );
+        const double max_minus_add = PairedDeltaPerOperation(
+            max_identity, atomic_load64, metric.member, rounds
+        );
+        const double min_minus_add = PairedDeltaPerOperation(
+            min_identity, atomic_load64, metric.member, rounds
+        );
+        std::printf(
+            "[ATOMIC_LOAD_PRIMITIVE] rounds=%u metric=%s cas_identity_minus_add0=%.6f "
+            "max_identity_minus_add0=%.6f min_identity_minus_add0=%.6f\n",
+            rounds, metric.name, cas_minus_add, max_minus_add, min_minus_add
+        );
+    }
 }
 
 }  // namespace
@@ -677,7 +712,7 @@ int main(int argc, char **argv) {
         device, repeats, static_cast<unsigned long long>(seed)
     );
     bool all_passed = true;
-    constexpr std::array<atomic_scalar_pmu::Mode, 7> kForwardModes = {
+    constexpr std::array<atomic_scalar_pmu::Mode, 10> kForwardModes = {
         atomic_scalar_pmu::Mode::Empty,
         atomic_scalar_pmu::Mode::ScalarControl,
         atomic_scalar_pmu::Mode::DependentAtomicAdd,
@@ -685,8 +720,11 @@ int main(int argc, char **argv) {
         atomic_scalar_pmu::Mode::DependentAtomicLoad64,
         atomic_scalar_pmu::Mode::ScalarLoadControl32,
         atomic_scalar_pmu::Mode::DependentAtomicLoad32,
+        atomic_scalar_pmu::Mode::DependentAtomicLoad64CasIdentity,
+        atomic_scalar_pmu::Mode::DependentAtomicLoad64MaxIdentity,
+        atomic_scalar_pmu::Mode::DependentAtomicLoad64MinIdentity,
     };
-    constexpr std::array<atomic_scalar_pmu::Mode, 7> kReverseWidthModes = {
+    constexpr std::array<atomic_scalar_pmu::Mode, 10> kReverseWidthModes = {
         atomic_scalar_pmu::Mode::Empty,
         atomic_scalar_pmu::Mode::ScalarControl,
         atomic_scalar_pmu::Mode::DependentAtomicAdd,
@@ -694,6 +732,9 @@ int main(int argc, char **argv) {
         atomic_scalar_pmu::Mode::DependentAtomicLoad32,
         atomic_scalar_pmu::Mode::ScalarLoadControl64,
         atomic_scalar_pmu::Mode::DependentAtomicLoad64,
+        atomic_scalar_pmu::Mode::DependentAtomicLoad64MinIdentity,
+        atomic_scalar_pmu::Mode::DependentAtomicLoad64MaxIdentity,
+        atomic_scalar_pmu::Mode::DependentAtomicLoad64CasIdentity,
     };
     for (const uint32_t rounds : round_values) {
         std::array<

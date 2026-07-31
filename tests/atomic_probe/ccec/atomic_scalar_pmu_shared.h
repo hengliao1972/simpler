@@ -20,7 +20,9 @@ namespace atomic_scalar_pmu {
 // 所有路径使用同一份 kernel 和同一个 PMU 读数协议，只替换 gate 内的固定次数工作负载：
 // EMPTY 量 gate/read 固有开销；SCALAR_CONTROL 量与 atomic 路径相同的标量递推；
 // DEPENDENT_ATOMIC_ADD 让后一条 atomicAdd 的加数依赖前一条返回值，避免多条 atomic 并行掩盖等待时间；
-// LOAD32/64 使用运行时恒零 mask 形成同址 atomicAdd(0) 的返回值依赖链，专门比较完成标志宽度。
+// LOAD32/64 使用运行时恒零 mask 形成同址返回值依赖链；除比较完成标志宽度外，
+// 64-bit 还比较 atomicAdd(0)、恒等 CAS、atomicMax(INT64_MIN) 与
+// atomicMin(INT64_MAX) 四种逻辑读取。
 enum class Mode : uint32_t {
     Empty = 0,
     ScalarControl = 1,
@@ -29,7 +31,10 @@ enum class Mode : uint32_t {
     DependentAtomicLoad64 = 4,
     ScalarLoadControl32 = 5,
     DependentAtomicLoad32 = 6,
-    Count = 7,
+    DependentAtomicLoad64CasIdentity = 7,
+    DependentAtomicLoad64MaxIdentity = 8,
+    DependentAtomicLoad64MinIdentity = 9,
+    Count = 10,
 };
 
 // Host launch 前只写本 cache line；kernel 在测量窗口中只读。PMU MMIO base 表

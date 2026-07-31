@@ -185,6 +185,46 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(atomic_scalar_pmu)(
             checksum += old;
             addend = old & zero_mask32;
         }
+    } else if (mode_value == static_cast<uint32_t>(Mode::DependentAtomicLoad64CasIdentity)) {
+        __gm__ int64_t *target = reinterpret_cast<__gm__ int64_t *>(
+            const_cast<__gm__ uint64_t *>(&state->target64.value)
+        );
+        int64_t identity = 0;
+        for (uint32_t round = 0; round < rounds; ++round) {
+            const int64_t old = atomicCAS(target, identity, identity);
+            checksum += static_cast<uint64_t>(old);
+            // CAS(expected, expected) 对任意目标值都是恒等变换；运行时
+            // 恒零 mask 仅保留相邻 atomic 的返回值数据依赖。
+            identity = static_cast<int64_t>(
+                static_cast<uint64_t>(old) & zero_mask64
+            );
+        }
+    } else if (mode_value == static_cast<uint32_t>(Mode::DependentAtomicLoad64MaxIdentity)) {
+        __gm__ int64_t *target = reinterpret_cast<__gm__ int64_t *>(
+            const_cast<__gm__ uint64_t *>(&state->target64.value)
+        );
+        uint64_t operand_bits = uint64_t{1} << 63U;
+        for (uint32_t round = 0; round < rounds; ++round) {
+            const int64_t old = atomicMax(
+                target, static_cast<int64_t>(operand_bits)
+            );
+            checksum += static_cast<uint64_t>(old);
+            operand_bits = (uint64_t{1} << 63U) |
+                (static_cast<uint64_t>(old) & zero_mask64);
+        }
+    } else if (mode_value == static_cast<uint32_t>(Mode::DependentAtomicLoad64MinIdentity)) {
+        __gm__ int64_t *target = reinterpret_cast<__gm__ int64_t *>(
+            const_cast<__gm__ uint64_t *>(&state->target64.value)
+        );
+        uint64_t operand_bits = (uint64_t{1} << 63U) - 1U;
+        for (uint32_t round = 0; round < rounds; ++round) {
+            const int64_t old = atomicMin(
+                target, static_cast<int64_t>(operand_bits)
+            );
+            checksum += static_cast<uint64_t>(old);
+            operand_bits = ((uint64_t{1} << 63U) - 1U) ^
+                (static_cast<uint64_t>(old) & zero_mask64);
+        }
     }
     // Empty 和非法 mode 都保持空窗；host 只会发布 enum 中声明的合法值。
 

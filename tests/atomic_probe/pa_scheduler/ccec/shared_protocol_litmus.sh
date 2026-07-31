@@ -539,8 +539,12 @@ validate_reader_ordering_ir() {
 
     require_ir_text \
         "$validate_block" \
-        '@llvm.hivm.atom.ADD.G.s64' \
+        '@llvm.hivm.atom.MAX.G.s64' \
         "$core_label post-reuse gate reload"
+    require_ir_text \
+        "$validate_block" \
+        'i64 -9223372036854775808, i32 0' \
+        "$core_label post-reuse identity operand"
     local validation_calls
     validation_calls="$(
         grep -c \
@@ -602,7 +606,7 @@ validate_reader_ordering_ir() {
     validate_token="$(
         unique_ir_result \
             "$validate_block" \
-            " = (tail )?call i64 @llvm\\.hivm\\.atom\\.ADD\\.G\\.s64\\(ptr addrspace\\(1\\) $validate_gate_pointer, i64 0, i32 0\\)" \
+            " = (tail )?call i64 @llvm\\.hivm\\.atom\\.MAX\\.G\\.s64\\(ptr addrspace\\(1\\) $validate_gate_pointer, i64 -9223372036854775808, i32 0\\)" \
             "$core_label same-signal gate atomic reload"
     )"
     local validate_compare

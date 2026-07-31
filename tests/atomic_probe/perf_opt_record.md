@@ -5152,3 +5152,168 @@ skip3 已完整撤回。由此停止继续枚举更深固定间隔：其边际 a
 读写点，却不降低 A5 return-ready 原子延迟，也不减少 cache line 数量。
 后续不再用字段宽度解释 `fanin_flag_load`，继续从通用轮询协议和 ready
 发现时机寻找收益。
+
+### 15.10 ready 后重复读取上界：不增加本地 ready cache
+
+继续使用 §15.7 的最终 adaptive24 泳道，并把每条直接
+`fanin_flag_load` 按 producer completion flag 的 Exchange 结束时刻分类。
+这里把 Exchange 的 source-issue span 结束当作 producer 已发布的偏保守
+上界；它不能证明全系统可见时刻，只适合回答“在这个上界之后是否还有
+同 worker 对同 producer 的重复读取”。重新用 `jq` 对原始事件取数得到：
+
+| 项目 | 数量 |
+| --- | ---: |
+| 直接 `fanin_flag_load` | 29,556 |
+| completion 上界之前 | 28,472 |
+| completion 上界之后 | 1,084 |
+| 找不到对应 completion | 0 |
+| 上界之后的 `(worker, producer)` 组 | 1,084 |
+| 同组最大读取次数 | 1 |
+| 同组重复读取次数大于 1 | 0 |
+
+结果说明 shared `SlotReady` 的 ready-prefix compaction 已经把“观察为 ready
+后还反复读取同一依赖”的直接路径消除：上界之后每个 worker 对每个 producer
+恰好只读取一次。本地 ready cache 无法删除这 1,084 次首次观察；而上界之前
+的 false 结果也不能缓存为永久状态。该泳道另有 43 条 Fanin PollBatch 物理
+记录，合计 1,576 次逻辑调用，但压缩记录不携带 producer task-id；即使把它们
+全部当作可疑上界，也不足以推翻直接事件中“零次 post-ready 重复”的结论。
+
+因此不增加 per-worker bitmap、哈希表或额外 slot 字段。它们会增加初始化、
+地址计算和 I-cache/D-cache 压力，却没有直接事件级可删除调用。后续优化应
+降低每次仍然必要的返回型 atomic 成本，或改变未 ready 期间的发现节奏；不能
+再以“缓存已经 ready 的 producer”为名增加冗余状态。
+
+### 15.11 返回型 atomic 的发射重叠与恒等原语
+
+在改变公共调度器前，先扩展单 AIV `ccec/atomic_scalar_pmu` 做同一 ELF、
+同一调用点的硬件取证。所有目标独占 cache line，后一轮操作数通过 host
+发布的 runtime-zero mask 依赖上一轮返回值；checksum、目标终值、physical
+core、PMU gate 和配置恢复均为硬门槛。
+
+第一组隔离诊断把一条 `atomicAdd(0)` 的返回值消费分别放在固定独立 scalar
+NOP 段之前和之后。延后消费能把大量独立 scalar 指令与约 200 ns 的返回等待
+重叠，说明 A5 scalar 并非在返回型 atomic 发射后完全停发。但把两条不同
+cache line 的返回型 atomic 连续发射、最后再消费，只得到约 10 ns/对的微小
+差值；在扩大 ELF 后该差值还会随代码布局换向，远没有隐藏第二条约 200 ns
+操作。因此拒绝把 fanin load 提到 Claim atomic 之前：两条 atomic 基本串行，
+这种重排只会扩大控制流和寄存器活跃区，不能获得理论上的整条重叠收益。
+
+第二组在同一 64-bit 目标上比较四种返回旧值的恒等 RMW：
+
+```text
+atomicAdd(address, 0)
+atomicCAS(address, identity, identity)       // identity 运行时恒为 0
+atomicMax(address, INT64_MIN)
+atomicMin(address, INT64_MAX)
+```
+
+`CAS(expected, expected)` 无论比较成功还是失败都不改变目标；对任意有符号
+64-bit 值，`max(x, INT64_MIN) == x`、`min(x, INT64_MAX) == x` 也都是
+严格恒等式。`0`、`INT64_MAX`、`INT64_MIN`、`-1` 四个边界 seed 的返回
+checksum 和最终目标值全部 PASS，证明三种候选都不是只对 PA 完成标志
+`0/1` 成立的特例。
+
+扩展过程中的大诊断 ELF 曾显示 Max 比 Add0 短约 `5 ns/op`；继续加入 Min
+路径后，同一个约 `5 ns/op` 台阶却从 Max 移到了 Min。该现象会随无关代码
+加入而换位，说明它混入了循环排布、分支位置或 I-cache 代码布局，不能当成
+某种 atomic opcode 的固有延迟。
+
+最终在主目录紧凑探针中固定同一 ELF、同一调用点，执行 15 组 × 1,024 次
+依赖操作。相对 Add0 的配对差为：
+
+| 候选 | SYS_CNT 差值 | PMU total 差值 |
+| --- | ---: | ---: |
+| CAS(identity, identity) | -0.048828 ns/op | -0.080078 cycle/op |
+| Max(INT64_MIN) | +0.013672 ns/op | +0.010742 cycle/op |
+| Min(INT64_MAX) | +0.062500 ns/op | +0.080078 cycle/op |
+
+四条路径在紧凑微基准里实际持平，差值不超过 `0.08 ns/op` 或
+`0.08 cycle/op`，I-cache miss 均为 0。因此后续不再宣称 Max/Min 指令
+本身快约 5 ns；是否保留只能由冻结完整 scheduler ELF 后的端到端交错
+对照决定。
+
+### 15.12 完整 scheduler 的恒等读取候选
+
+把 Add0、Max(INT64_MIN)、Min(INT64_MAX) 三种版本分别完整编译为 shared
+B256 perf-clock kernel，冻结产物后由同一个 host 直接加载。三者只替换
+`CcecOps::Load(int64_t *)`；合法参与人口仍为 `96/32/64`，Claim 拓扑、
+调用点和 shared 协议均不变。`size` 报告的混合 kernel text 为 Add0
+`137,448 B`，Max/Min 均为 `138,216 B`。
+
+每组三种 ELF 各运行一个全新进程，按 `Add-Max-Min`、`Max-Min-Add`、
+`Min-Add-Max` 轮换先后顺序，共 12 组。所有 36 轮的执行、语义和后处理
+状态均为 PASS：
+
+| 版本 | mean | median | min | max |
+| --- | ---: | ---: | ---: | ---: |
+| Add0 | 1,480.289 us | 1,475.479 us | 1,459.594 us | 1,512.872 us |
+| Max(INT64_MIN) | 1,466.810 us | 1,462.207 us | 1,452.393 us | 1,526.469 us |
+| Min(INT64_MAX) | 1,469.054 us | 1,464.553 us | 1,449.630 us | 1,517.979 us |
+
+逐组配对结果为：
+
+| 候选相对 Add0 | 改善组数 | 配对差 mean | 配对差 median | 相对差 median |
+| --- | ---: | ---: | ---: | ---: |
+| Max(INT64_MIN) | 11/12 | -13.479 us | -12.346 us | -0.839% |
+| Min(INT64_MAX) | 8/12 | -11.236 us | -3.558 us | -0.243% |
+
+因此选择 Max 候选。这里的收益是当前完整 scheduler 代码形态和 A5 竞争尾部
+共同作用的端到端结果，不是微基准已经证明的 opcode 固有优势；未来大幅改变
+ELF 排布后需要重新复核。该候选仍是对所有 `int64_t` 值严格恒等的通用平台
+原语，不判断 PA task kind、task-id 或 role，也不减少任何核的合法参与。
+
+本机 CANN 9.1 编译器头文件还确认：64-bit GM 原子直接暴露 Add、Min、Max、
+CAS；And/Or/Xor 只覆盖 32-bit `int/uint` 且后端使用软实现。因此最后补测
+同样严格恒等、并且 text 大小与 Add0 相同的 `CAS(0, 0)`。仍按三种顺序轮换
+12 组，每轮一个全新进程：
+
+| 版本 | mean | median | min | max |
+| --- | ---: | ---: | ---: | ---: |
+| Add0 | 1,481.297 us | 1,477.023 us | 1,460.569 us | 1,526.322 us |
+| Max(INT64_MIN) | 1,467.009 us | 1,465.791 us | 1,450.961 us | 1,498.574 us |
+| CAS(0, 0) | 1,484.874 us | 1,481.054 us | 1,456.733 us | 1,510.182 us |
+
+CAS 相对 Max 只有 `1/12` 组改善，配对差中位数为 `+11.642 us`，即 CAS
+回退约 `0.785%`；相对 Add0 也只有 `5/12` 组改善，配对差中位数为
+`+9.235 us`。由此否定 CAS，不再继续枚举没有 64-bit 硬件直接实现的按位
+恒等操作。
+
+把两次独立 12 组实验合并，Max 相对 Add0 共 `19/24` 组改善，配对差
+mean/median 为 `-13.883/-11.839 us`，相对差 mean/median 为
+`-0.920%/-0.804%`。最终 Max ELF 重新构建后，`.text` 的 SHA-256 与交错
+实测冻结产物完全一致；AIC/AIV O3 IR 门槛均确认
+`atomic.MAX.s64(INT64_MIN)`，没有退化为普通 GM load 或软实现。
+
+正确性方面，CPU shared 全套门槛重新通过；A5 上 history 双方向、
+reader-reclaim 双方向 × compiler-clobber/payload-dependency/dsb-all 三种
+排序各运行 20 次，共 160 个独立进程，全部 `semantic=PASS`、
+`cleanup=PASS`。这组验证覆盖发布历史、同一完成字校验、慢 reader 回收和
+跨 AIC/AIV 方向，证明 Max 候选没有用性能收益掩盖 shared 发布协议变化。
+
+### 15.13 最终诊断泳道的解释
+
+最终 Max full-swimlane 的本地文件为：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260731_233927_1481586/ccec/
+    merged_swimlane.json
+    swimlane_exclusive_analysis.json
+```
+
+该轮 `96/32/64` 参与人口、`73,728` 次 Claim、`1,280` 个 winner、
+`1,024` 个 kernel 均精确闭合，全部执行/语义/后处理断言 PASS，trace drop
+为 0。泳道 JSON 只保留在本地 ignored `outputs`，不提交到 GitHub。
+
+与 §15.7 的 Add0 诊断泳道比较，Max 的直接 fanin 事件为 `29,504` 条，
+Add0 为 `29,556` 条；Max 的 direct core-time/mean/median 为
+`7.540 ms/0.255575 us/0.256 us`，Add0 为
+`7.495 ms/0.253595 us/0.256 us`。两者逐条耗时在观察分辨率内持平，Max
+并没有在带 trace 的 ELF 中表现为单条 atomic 延迟下降。Max 本轮完整
+fanin logical load 为 `30,968`，Add0 为 `31,132`，只少 `164` 次；Submit
+也为 `1,678.931` 对 `1,678.435 us`，基本持平。
+
+这与微基准结论一致：不能把 Max 描述成硬件单条延迟更低。保留依据是两个
+无泳道 perf-clock 实验合计 24 对中的稳定端到端收益；full-swimlane 只证明
+业务拓扑、atomic 数量级和协议均未变化。诊断 ELF 中大量记录写入会重排
+winner 到达和竞争尾部，三种构建的绝对时间不得互相相减。
