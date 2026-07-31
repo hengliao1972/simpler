@@ -211,6 +211,16 @@ constexpr uint32_t kAivWorkers = 64;
 constexpr uint32_t kWorkers = kAicWorkers + kAivWorkers;
 constexpr uint32_t kRuntimeMaxWorkers = 108;
 constexpr uint32_t kCursorShards = 4;
+// shared Alloc 试验只收窄 Alloc 的动态候选集合：映射到本 task
+// alloc_cursor shard 的 24 个 worker 参与 Claim。Cube/Vector 仍保持
+// 全部合法核型分别 32/64 个竞争者，不能复用旧 24/8/8 合同。
+constexpr uint32_t kSharedAllocClaimParticipants =
+    kWorkers / kCursorShards;
+static_assert(
+    kWorkers % kCursorShards == 0 &&
+        kSharedAllocClaimParticipants == 24,
+    "shared Alloc Claim participants must stay 24"
+);
 // S4.14a 已建立 shared Vector 四分片迁址对照；S4.14b 继续使用相同的
 // sidecar 地址、物理容量和代码骨架，只启用此前预留的后四条物理线。
 // device 热路径仍使用同一取模表达式，唯一数值变量是 active shards

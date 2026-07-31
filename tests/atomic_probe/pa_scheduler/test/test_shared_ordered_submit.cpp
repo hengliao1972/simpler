@@ -512,7 +512,7 @@ bool LegacyTurnsMatch(
 uint32_t ExpectedClaimAttempts(TaskKind kind) {
     switch (kind) {
         case TaskKind::Alloc:
-            return kWorkers;
+            return kSharedAllocClaimParticipants;
         case TaskKind::Qk:
         case TaskKind::Pv:
             return kAicWorkers;

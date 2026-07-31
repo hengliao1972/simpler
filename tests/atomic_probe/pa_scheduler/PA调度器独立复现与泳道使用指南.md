@@ -13,8 +13,10 @@
 - 32 个 AIC worker、64 个 AIV worker，物理启动比例为 1:2；
 - 默认 256 个 batch，每 batch 依次提交 Alloc、QK、SF、PV、UP 五个 task；
 - 96 个 worker 各自回放 1,280 次 Submit，共 122,880 次 Submit；
-- 96 个 worker 都回放全部 Submit。Alloc 由 96 个 worker 竞争，
-  QK/PV 由 32 个 AIC 竞争，SF/UP 由 64 个 AIV 竞争；
+- 96 个 worker 都回放全部 Submit。private Alloc 保持 96 个
+  worker 竞争；shared Alloc 仅由映射到同一 alloc cursor shard 的
+  24 个 worker 竞争。QK/PV 仍由 32 个 AIC 竞争，SF/UP 仍由
+  64 个 AIV 竞争；
 - private 使用 production-prefix 的 4 路 Alloc/cube/vector Claim
   cursor；当前 shared 让 Vector 使用 sidecar 中全部 8 个 active
   shard，Cube/Alloc 仍使用 production-prefix 4 路；两种模式都执行
@@ -27,9 +29,10 @@
 - 与真实 PA 相同的单 lane 优化：Case1 不执行 BlockWon 轮询；
 - 与真实泳道格式对齐的阶段记录及严格的结束状态校验。
 
-默认工作量固定产生 73,728 次 Claim、1,280 个 winner 和 1,024 次 kernel
-执行。每次运行都会校验这些数量以及最终 TensorMap、heap、cursor、flag、vend、
-frontier 和 worker 状态，任一不符都会返回失败。
+默认工作量在 private 模式产生 73,728 次 Claim，在 shared 模式
+产生 55,296 次 Claim；两种模式都产生 1,280 个 winner 和 1,024 次
+kernel 执行。每次运行都会校验这些数量以及最终 TensorMap、heap、
+cursor、flag、vend、frontier 和 worker 状态，任一不符都会返回失败。
 
 两种 TensorMap 构建都先执行 `EfDrain` 和 `Claim`。private 随后保持
 compete-first eager：每核构造五类完整 `TaskArgs` 并执行 per-worker

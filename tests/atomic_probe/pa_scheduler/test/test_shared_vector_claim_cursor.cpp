@@ -160,7 +160,7 @@ bool CursorsMatch(const SchedulerState &state, const CursorValues &expected) {
 uint32_t ExpectedCandidates(TaskKind kind) {
     switch (kind) {
     case TaskKind::Alloc:
-        return kWorkers;
+        return kSharedAllocClaimParticipants;
     case TaskKind::Qk:
     case TaskKind::Pv:
         return kAicWorkers;
@@ -174,10 +174,11 @@ uint32_t ExpectedCandidates(TaskKind kind) {
 }
 
 bool IsCandidate(
-    TaskKind kind, uint32_t worker_id, uint32_t
+    TaskKind kind, uint32_t worker_id, uint32_t task_id
 ) {
     if (kind == TaskKind::Alloc) {
-        return true;
+        return worker_id % kCursorShards ==
+               task_id % kCursorShards;
     }
     const bool is_aic = worker_id < kAicWorkers;
     return kind == TaskKind::Qk || kind == TaskKind::Pv
@@ -205,7 +206,8 @@ bool RunConcurrentClaim(SchedulerState &state, uint32_t task_id, TaskKind kind) 
             LocalStats stats{};
             evidence[worker_id].outcome =
                 Claim<ClaimTestOps>(
-                    &state, worker.role, task_id, kind, stats
+                    &state, worker_id, worker.role,
+                    task_id, kind, stats
                 );
             evidence[worker_id].fetch_max_calls = ClaimTestOps::fetch_max_calls;
             evidence[worker_id].fetch_max_address = ClaimTestOps::last_fetch_max_address;
@@ -263,7 +265,8 @@ void TestAllTaskKindsUseCursorClaim() {
 
     // 后三项分别复用 QK101 的 cube shard、Alloc100 的 alloc
     // shard 和 SF102 的 shared-vector shard。它们仍各自产生唯一
-    // winner，证明完整 role 候选集合能推进同一高水位链。
+    // winner；Alloc 由同 shard 的 24 个动态候选推进，Cube/Vector
+    // 则继续证明完整 role 候选集合能推进同一高水位链。
     // 再回放较旧的 QK101 时，cube cursor 已被 PV105 推进到 105，
     // 本 shard 候选必须正常发 atomic 并判输。
     WorkerState &replay_worker = state->workers[1];
@@ -272,7 +275,8 @@ void TestAllTaskKindsUseCursorClaim() {
     ClaimTestOps::ResetThreadTrace();
     LocalStats replay_stats{};
     const ClaimOutcome replay = Claim<ClaimTestOps>(
-        state, replay_worker.role, kTaskIds[1],
+        state, static_cast<uint32_t>(replay_worker.core_idx),
+        replay_worker.role, kTaskIds[1],
         TaskKind::Qk, replay_stats
     );
     exact &= replay.attempted && !replay.won && replay.function_id == -1 && ClaimTestOps::fetch_max_calls == 1 &&

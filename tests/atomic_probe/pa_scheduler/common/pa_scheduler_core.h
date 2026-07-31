@@ -818,14 +818,15 @@ struct ClaimOutcome {
 
 template <typename Ops>
 PA_DEVICE ClaimOutcome Claim(
-    PA_GM SchedulerState *state, CoreRole role, uint32_t task_id, TaskKind kind,
-    LocalStats &stats
+    PA_GM SchedulerState *state, uint32_t worker_id, CoreRole role,
+    uint32_t task_id, TaskKind kind, LocalStats &stats
 ) {
     // Claim 在单调 cursor 上执行 atomicMax。private/Cube/Alloc 使用
     // production-prefix 四分片；shared Vector 使用 sidecar 中的八分片
     // cursor。同一 task 只有观察到旧值更小的竞争者获胜。
-    // Alloc 由全部 96 个 worker 竞争；QK/PV 仅 32 个 AIC、
-    // SF/UP 仅 64 个 AIV 发 atomicMax。
+    // shared Alloc 试验只允许映射到同一 alloc_cursor shard 的 24 个
+    // worker 竞争；QK/PV 仍由全部 32 个 AIC、SF/UP 仍由全部
+    // 64 个 AIV 发 atomicMax。private Alloc 继续保持 96 个竞争者。
     // role 来自 RunSchedulerImpl 的入口 SSA 值；不能在每个 task 中再从
     // WorkerState GM 回读同一字段，否则 B256 会产生 98,304 次冗余读取。
     ClaimOutcome outcome{false, false, 0, -1};
@@ -834,6 +835,15 @@ PA_DEVICE ClaimOutcome Claim(
     }
     PA_GM AtomicLine *cursor = nullptr;
     if (kind == TaskKind::Alloc) {
+#if PTO_FDWIC_SHARED_MAP
+        if (worker_id >= kWorkers ||
+            worker_id % kCursorShards !=
+                task_id % kCursorShards) {
+            return outcome;
+        }
+#else
+        (void)worker_id;
+#endif
         cursor = &state->alloc_cursor[task_id % kCursorShards];
     } else {
         // Mirror MixedKernels::to_active_mask(), core_mask(), popcount(),
@@ -4085,7 +4095,10 @@ PA_DEVICE bool SubmitCallbackTask(
     const uint64_t claim_begin = efdrain_end;
     BeginSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
     const ClaimOutcome claim =
-        Claim<Ops>(state, role, task_id, Kind, stats);
+        Claim<Ops>(
+            state, static_cast<uint32_t>(worker.core_idx),
+            role, task_id, Kind, stats
+        );
 #if !PTO_FDWIC_SHARED_MAP
     context.won = claim.won;
     context.kernel_id = claim.function_id;
