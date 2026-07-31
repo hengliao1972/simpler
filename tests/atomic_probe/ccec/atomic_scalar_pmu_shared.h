@@ -17,14 +17,19 @@
 
 namespace atomic_scalar_pmu {
 
-// 三条路径使用同一份 kernel 和同一个 PMU 读数协议，只替换 gate 内的固定次数工作负载：
+// 所有路径使用同一份 kernel 和同一个 PMU 读数协议，只替换 gate 内的固定次数工作负载：
 // EMPTY 量 gate/read 固有开销；SCALAR_CONTROL 量与 atomic 路径相同的标量递推；
-// DEPENDENT_ATOMIC_ADD 让后一条 atomicAdd 的加数依赖前一条返回值，避免多条 atomic 并行掩盖等待时间。
+// DEPENDENT_ATOMIC_ADD 让后一条 atomicAdd 的加数依赖前一条返回值，避免多条 atomic 并行掩盖等待时间；
+// LOAD32/64 使用运行时恒零 mask 形成同址 atomicAdd(0) 的返回值依赖链，专门比较完成标志宽度。
 enum class Mode : uint32_t {
     Empty = 0,
     ScalarControl = 1,
     DependentAtomicAdd = 2,
-    Count = 3,
+    ScalarLoadControl64 = 3,
+    DependentAtomicLoad64 = 4,
+    ScalarLoadControl32 = 5,
+    DependentAtomicLoad32 = 6,
+    Count = 7,
 };
 
 // Host launch 前只写本 cache line；kernel 在测量窗口中只读。PMU MMIO base 表
@@ -37,10 +42,16 @@ struct alignas(64) ProbeControl {
     uint64_t reserved[5];
 };
 
-// Atomic 目标独占 cache line，排除 result/control 的普通 GM 写或 DCCI 对原子值的影响。
-struct alignas(64) AtomicTarget {
+// 32/64-bit Atomic 目标分别独占 cache line，排除两种宽度相互竞争，也排除
+// result/control 的普通 GM 写或 DCCI 对原子值的影响。
+struct alignas(64) AtomicTarget64 {
     volatile uint64_t value;
     uint64_t reserved[7];
+};
+
+struct alignas(64) AtomicTarget32 {
+    volatile uint32_t value;
+    uint32_t reserved[15];
 };
 
 // 单 AIV 独占写结果 cache line。sys_cycles 是 get_sys_cnt() 前后差；其余四项是同一
@@ -58,16 +69,19 @@ struct alignas(64) ProbeResult {
 
 struct alignas(64) ProbeState {
     ProbeControl control;
-    AtomicTarget target;
+    AtomicTarget64 target64;
+    AtomicTarget32 target32;
     ProbeResult result;
 };
 
 static_assert(sizeof(ProbeControl) == 64, "probe control must occupy one cache line");
-static_assert(sizeof(AtomicTarget) == 64, "atomic target must occupy one cache line");
+static_assert(sizeof(AtomicTarget64) == 64, "64-bit atomic target must occupy one cache line");
+static_assert(sizeof(AtomicTarget32) == 64, "32-bit atomic target must occupy one cache line");
 static_assert(sizeof(ProbeResult) == 64, "probe result must occupy one cache line");
-static_assert(offsetof(ProbeState, target) == 64, "atomic target must start on its own cache line");
-static_assert(offsetof(ProbeState, result) == 128, "probe result must start on its own cache line");
-static_assert(sizeof(ProbeState) == 192, "probe state ABI changed unexpectedly");
+static_assert(offsetof(ProbeState, target64) == 64, "64-bit atomic target must start on its own cache line");
+static_assert(offsetof(ProbeState, target32) == 128, "32-bit atomic target must start on its own cache line");
+static_assert(offsetof(ProbeState, result) == 192, "probe result must start on its own cache line");
+static_assert(sizeof(ProbeState) == 256, "probe state ABI changed unexpectedly");
 
 }  // namespace atomic_scalar_pmu
 

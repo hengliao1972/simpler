@@ -19,12 +19,13 @@
 //      或 DCCI，始终保持为一条独占 cache line 的 raw atomic 目标。
 //   2. 按 physical core id 从 host 传入的寄存器基址表取本 AIV PMU base，然后用
 //      read-to-clear 清空所有 counter。
-//   3. 同一个 get_sys_cnt 时间窗内执行 metrics_prof_start/stop；三种 mode 只替换
+//   3. 同一个 get_sys_cnt 时间窗内执行 metrics_prof_start/stop；各 mode 只替换
 //      gate 内部的固定 rounds 工作负载：
 //        EMPTY：不做工作，测 gate 与计时固有开销；
-//        SCALAR_CONTROL：只在 scalar 寄存器中执行与 atomic 相同的数据依赖递推；
-//        DEPENDENT_ATOMIC_ADD：对独占 target 执行 atomicAdd，下一轮 addend 由上一轮
-//        atomicAdd 的返回值计算，不允许多条 atomic 并行隐藏单条等待。
+//        SCALAR_CONTROL / DEPENDENT_ATOMIC_ADD：保留原有 64-bit 增量递推；
+//        SCALAR_LOAD_CONTROL32/64 / DEPENDENT_ATOMIC_LOAD32/64：用 host 写入但编译器
+//        不知道为零的 mask，让下一轮 addend 依赖上一轮返回值，同时运行时保持
+//        atomicAdd(target, 0)，精确比较完成标志的 32/64-bit 返回就绪路径。
 //   4. 关闭 PMU 后才读 total/scalar/request/miss，最后仅用 st_dev 把结果发布到
 //      result 独占 cache line，并用 DSB 收口。
 //
@@ -113,6 +114,10 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(atomic_scalar_pmu)(
     const uint32_t mode_value = state->control.mode;
     const uint32_t rounds = state->control.rounds;
     const uint64_t seed = state->control.seed;
+    // Host 必须发布零；从 GM 运行时读取可阻止编译器把 old & mask 化简成常量，
+    // 从而保留“上一条返回值 -> 下一条 atomic addend”的真实数据依赖。
+    const uint64_t zero_mask64 = state->control.reserved[0];
+    const uint32_t zero_mask32 = static_cast<uint32_t>(zero_mask64);
     const uint32_t physical_core_id = static_cast<uint32_t>(get_coreid()) & 0x0fffU;
 
     uint64_t register_base = 0;
@@ -140,15 +145,48 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(atomic_scalar_pmu)(
             delta = 1 + (old & 1U);
         }
     } else if (mode_value == static_cast<uint32_t>(Mode::DependentAtomicAdd)) {
-        __gm__ uint64_t *target = const_cast<__gm__ uint64_t *>(&state->target.value);
+        __gm__ uint64_t *target = const_cast<__gm__ uint64_t *>(&state->target64.value);
         for (uint32_t round = 0; round < rounds; ++round) {
             // delta 直接依赖上一轮 old；除第一轮外，后一条 atomic 必须等前一条返回。
             const uint64_t old = atomicAdd(target, delta);
             checksum += old;
             delta = 1 + (old & 1U);
         }
+    } else if (mode_value == static_cast<uint32_t>(Mode::ScalarLoadControl64)) {
+        uint64_t addend = 0;
+        for (uint32_t round = 0; round < rounds; ++round) {
+            const uint64_t old = scalar_value;
+            scalar_value += addend;
+            checksum += old;
+            addend = old & zero_mask64;
+        }
+    } else if (mode_value == static_cast<uint32_t>(Mode::DependentAtomicLoad64)) {
+        __gm__ uint64_t *target = const_cast<__gm__ uint64_t *>(&state->target64.value);
+        uint64_t addend = 0;
+        for (uint32_t round = 0; round < rounds; ++round) {
+            const uint64_t old = atomicAdd(target, addend);
+            checksum += old;
+            addend = old & zero_mask64;
+        }
+    } else if (mode_value == static_cast<uint32_t>(Mode::ScalarLoadControl32)) {
+        uint32_t scalar_value32 = static_cast<uint32_t>(seed);
+        uint32_t addend = 0;
+        for (uint32_t round = 0; round < rounds; ++round) {
+            const uint32_t old = scalar_value32;
+            scalar_value32 += addend;
+            checksum += old;
+            addend = old & zero_mask32;
+        }
+    } else if (mode_value == static_cast<uint32_t>(Mode::DependentAtomicLoad32)) {
+        __gm__ uint32_t *target = const_cast<__gm__ uint32_t *>(&state->target32.value);
+        uint32_t addend = 0;
+        for (uint32_t round = 0; round < rounds; ++round) {
+            const uint32_t old = atomicAdd(target, addend);
+            checksum += old;
+            addend = old & zero_mask32;
+        }
     }
-    // Empty 和非法 mode 都保持空窗；host 仅会发布 enum 中的三个合法值。
+    // Empty 和非法 mode 都保持空窗；host 只会发布 enum 中声明的合法值。
 
     bisheng::cce::metrics_prof_stop();
     const uint64_t sys_end = static_cast<uint64_t>(get_sys_cnt());

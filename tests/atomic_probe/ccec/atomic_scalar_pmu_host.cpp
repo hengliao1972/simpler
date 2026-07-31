@@ -10,12 +10,14 @@
  */
 
 // 单 AIV、无轮询、固定操作数的 atomic/标量 PMU 对照 host。
-// 每个 rounds 都重复 EMPTY -> SCALAR_CONTROL -> DEPENDENT_ATOMIC_ADD：
+// 每个 rounds 都重复原有 dependent-add 三路径，并补充 32/64-bit
+// dependent atomicAdd(0) 与各自 scalar control：
 //   1. EMPTY 给出同位置 PMU gate/read 的固定成本；
 //   2. SCALAR_CONTROL 执行与 atomic 路径完全相同的返回值递推和 checksum；
 //   3. DEPENDENT_ATOMIC_ADD 让下一条 atomicAdd 的 addend 依赖上一条返回值。
 // 因而 (ATOMIC-CONTROL)/rounds 直接回答 atomic 等待周期落在 PMU total、scalar busy
-// 中的哪一项，而不混入多核竞争、轮询次数变化或未消费返回值的并行发射。
+// 中的哪一项；LOAD32/64 的 paired delta 还可在同一 ELF、同一物理 AIV、同一 PMU
+// 会话内比较完成标志宽度，不混入多核竞争或未消费返回值的并行发射。
 
 #include "atomic_scalar_pmu_shared.h"
 #include "pmu_probe_host_support.h"
@@ -230,6 +232,10 @@ const char *ModeName(atomic_scalar_pmu::Mode mode) {
         case atomic_scalar_pmu::Mode::Empty: return "EMPTY";
         case atomic_scalar_pmu::Mode::ScalarControl: return "SCALAR_CONTROL";
         case atomic_scalar_pmu::Mode::DependentAtomicAdd: return "DEPENDENT_ATOMIC_ADD";
+        case atomic_scalar_pmu::Mode::ScalarLoadControl64: return "SCALAR_LOAD_CONTROL64";
+        case atomic_scalar_pmu::Mode::DependentAtomicLoad64: return "DEPENDENT_ATOMIC_LOAD64";
+        case atomic_scalar_pmu::Mode::ScalarLoadControl32: return "SCALAR_LOAD_CONTROL32";
+        case atomic_scalar_pmu::Mode::DependentAtomicLoad32: return "DEPENDENT_ATOMIC_LOAD32";
         default: return "UNKNOWN";
     }
 }
@@ -307,22 +313,52 @@ Oracle Simulate(uint64_t seed, uint32_t rounds) {
 
 struct Sample {
     atomic_scalar_pmu::ProbeResult result{};
-    uint64_t final_value = 0;
+    uint64_t final_value64 = 0;
+    uint32_t final_value32 = 0;
 };
+
+bool IsLoad32Mode(atomic_scalar_pmu::Mode mode) {
+    return mode == atomic_scalar_pmu::Mode::ScalarLoadControl32 ||
+        mode == atomic_scalar_pmu::Mode::DependentAtomicLoad32;
+}
+
+bool IsLoad64Mode(atomic_scalar_pmu::Mode mode) {
+    return mode == atomic_scalar_pmu::Mode::ScalarLoadControl64 ||
+        mode == atomic_scalar_pmu::Mode::DependentAtomicLoad64;
+}
+
+uint64_t RepeatedChecksum(uint64_t value, uint32_t rounds) {
+    uint64_t checksum = 0;
+    for (uint32_t round = 0; round < rounds; ++round) checksum += value;
+    return checksum;
+}
 
 bool ValidateSample(
     const Sample &sample, atomic_scalar_pmu::Mode mode, uint32_t rounds, uint64_t seed,
     const atomic_probe::pmu::PmuControl &pmu_control, std::string *reason
 ) {
     const Oracle oracle = Simulate(seed, rounds);
-    const uint64_t expected_checksum = mode == atomic_scalar_pmu::Mode::Empty ? 0 : oracle.checksum;
-    const uint64_t expected_final = mode == atomic_scalar_pmu::Mode::DependentAtomicAdd ? oracle.final_value : seed;
+    uint64_t expected_checksum = oracle.checksum;
+    if (mode == atomic_scalar_pmu::Mode::Empty) {
+        expected_checksum = 0;
+    } else if (IsLoad32Mode(mode)) {
+        expected_checksum = RepeatedChecksum(static_cast<uint32_t>(seed), rounds);
+    } else if (IsLoad64Mode(mode)) {
+        expected_checksum = RepeatedChecksum(seed, rounds);
+    }
+    const uint64_t expected_final64 =
+        mode == atomic_scalar_pmu::Mode::DependentAtomicAdd ? oracle.final_value : seed;
+    const uint32_t expected_final32 = static_cast<uint32_t>(seed);
     if (sample.result.checksum != expected_checksum) {
         *reason = "checksum";
         return false;
     }
-    if (sample.final_value != expected_final) {
-        *reason = "target-final";
+    if (sample.final_value64 != expected_final64) {
+        *reason = "target64-final";
+        return false;
+    }
+    if (sample.final_value32 != expected_final32) {
+        *reason = "target32-final";
         return false;
     }
     if (sample.result.physical_core_id >= kPhysicalSubcoreCount) {
@@ -360,7 +396,9 @@ bool RunOne(
     state.control.mode = static_cast<uint32_t>(mode);
     state.control.rounds = rounds;
     state.control.seed = seed;
-    state.target.value = seed;
+    state.control.reserved[0] = 0;
+    state.target64.value = seed;
+    state.target32.value = static_cast<uint32_t>(seed);
     if (!CheckAcl(
             aclrtMemcpy(
                 state_device, sizeof(state), &state, sizeof(state), ACL_MEMCPY_HOST_TO_DEVICE
@@ -387,19 +425,21 @@ bool RunOne(
     }
 
     sample->result = state.result;
-    sample->final_value = state.target.value;
+    sample->final_value64 = state.target64.value;
+    sample->final_value32 = state.target32.value;
     std::string reason;
     const bool semantic_ok = ValidateSample(*sample, mode, rounds, seed, pmu_control, &reason);
     std::printf(
         "[RAW] repeat=%u rounds=%u mode=%s sys_cycles=%llu total=%llu scalar=%llu "
-        "icache_req=%llu icache_miss=%llu checksum=%llu final=%llu physical=%llu ctrl=0x%llx status=%s%s%s\n",
+        "icache_req=%llu icache_miss=%llu checksum=%llu final64=%llu final32=%u physical=%llu "
+        "ctrl=0x%llx status=%s%s%s\n",
         repeat, rounds, ModeName(mode), static_cast<unsigned long long>(sample->result.sys_cycles),
         static_cast<unsigned long long>(sample->result.pmu_total_cycles),
         static_cast<unsigned long long>(sample->result.pmu_scalar_busy),
         static_cast<unsigned long long>(sample->result.pmu_icache_request),
         static_cast<unsigned long long>(sample->result.pmu_icache_miss),
         static_cast<unsigned long long>(sample->result.checksum),
-        static_cast<unsigned long long>(sample->final_value),
+        static_cast<unsigned long long>(sample->final_value64), sample->final_value32,
         static_cast<unsigned long long>(sample->result.physical_core_id),
         static_cast<unsigned long long>(sample->result.pmu_ctrl_after_stop), semantic_ok ? "PASS" : "FAIL",
         semantic_ok ? "" : " reason=", semantic_ok ? "" : reason.c_str()
@@ -438,7 +478,10 @@ double PairedDeltaPerOperation(
 }
 
 void PrintRoundSummary(
-    uint32_t rounds, const std::array<std::vector<Sample>, 3> &samples
+    uint32_t rounds,
+    const std::array<
+        std::vector<Sample>, static_cast<size_t>(atomic_scalar_pmu::Mode::Count)
+    > &samples
 ) {
     struct Metric {
         const char *name;
@@ -493,6 +536,29 @@ void PrintRoundSummary(
         "pmu_total_cycles_per_op=%.6f scalar_busy_cycles_per_op=%.6f scalar_share=%.9f\n",
         rounds, atomic_sys_ns, atomic_total_cycles, atomic_scalar_cycles, scalar_share
     );
+
+    const auto &load_control64 =
+        samples[static_cast<uint32_t>(atomic_scalar_pmu::Mode::ScalarLoadControl64)];
+    const auto &atomic_load64 =
+        samples[static_cast<uint32_t>(atomic_scalar_pmu::Mode::DependentAtomicLoad64)];
+    const auto &load_control32 =
+        samples[static_cast<uint32_t>(atomic_scalar_pmu::Mode::ScalarLoadControl32)];
+    const auto &atomic_load32 =
+        samples[static_cast<uint32_t>(atomic_scalar_pmu::Mode::DependentAtomicLoad32)];
+    for (const Metric &metric : metrics) {
+        const double width64 = PairedDeltaPerOperation(
+            atomic_load64, load_control64, metric.member, rounds
+        );
+        const double width32 = PairedDeltaPerOperation(
+            atomic_load32, load_control32, metric.member, rounds
+        );
+        const double relative = width64 == 0.0 ? 0.0 : (width32 / width64 - 1.0) * 100.0;
+        std::printf(
+            "[ATOMIC_LOAD_WIDTH] rounds=%u metric=%s width64_minus_control=%.6f "
+            "width32_minus_control=%.6f delta32_minus64=%.6f relative=%.6f%%\n",
+            rounds, metric.name, width64, width32, width32 - width64, relative
+        );
+    }
 }
 
 }  // namespace
@@ -611,19 +677,38 @@ int main(int argc, char **argv) {
         device, repeats, static_cast<unsigned long long>(seed)
     );
     bool all_passed = true;
+    constexpr std::array<atomic_scalar_pmu::Mode, 7> kForwardModes = {
+        atomic_scalar_pmu::Mode::Empty,
+        atomic_scalar_pmu::Mode::ScalarControl,
+        atomic_scalar_pmu::Mode::DependentAtomicAdd,
+        atomic_scalar_pmu::Mode::ScalarLoadControl64,
+        atomic_scalar_pmu::Mode::DependentAtomicLoad64,
+        atomic_scalar_pmu::Mode::ScalarLoadControl32,
+        atomic_scalar_pmu::Mode::DependentAtomicLoad32,
+    };
+    constexpr std::array<atomic_scalar_pmu::Mode, 7> kReverseWidthModes = {
+        atomic_scalar_pmu::Mode::Empty,
+        atomic_scalar_pmu::Mode::ScalarControl,
+        atomic_scalar_pmu::Mode::DependentAtomicAdd,
+        atomic_scalar_pmu::Mode::ScalarLoadControl32,
+        atomic_scalar_pmu::Mode::DependentAtomicLoad32,
+        atomic_scalar_pmu::Mode::ScalarLoadControl64,
+        atomic_scalar_pmu::Mode::DependentAtomicLoad64,
+    };
     for (const uint32_t rounds : round_values) {
-        std::array<std::vector<Sample>, 3> samples;
+        std::array<
+            std::vector<Sample>, static_cast<size_t>(atomic_scalar_pmu::Mode::Count)
+        > samples;
         for (uint32_t repeat = 1; repeat <= repeats; ++repeat) {
-            for (uint32_t mode_index = 0; mode_index < static_cast<uint32_t>(atomic_scalar_pmu::Mode::Count);
-                 ++mode_index) {
+            const auto &mode_order = (repeat & 1U) != 0 ? kForwardModes : kReverseWidthModes;
+            for (const atomic_scalar_pmu::Mode mode : mode_order) {
                 Sample sample;
-                const auto mode = static_cast<atomic_scalar_pmu::Mode>(mode_index);
                 const bool passed = RunOne(
                     function, stream, state_device, reinterpret_cast<uint64_t>(pmu_regs_device), mode, rounds,
                     repeat, seed, pmu_control, &sample
                 );
                 all_passed &= passed;
-                samples[mode_index].push_back(sample);
+                samples[static_cast<uint32_t>(mode)].push_back(sample);
                 if (!passed) break;
             }
             if (!all_passed) break;

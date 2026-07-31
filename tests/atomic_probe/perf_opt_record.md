@@ -5115,3 +5115,40 @@ skip3 已完整撤回。由此停止继续枚举更深固定间隔：其边际 a
 研究 producer 主动通知或反向依赖计数等新协议；这类方案会新增每边发布、
 早完成与后注册竞态、fanout 容量和 generation 复用合同，不能伪装成当前
 轮询循环的一行低风险优化。
+
+### 15.9 32-bit 完成标志宽度候选：无收益，不迁移
+
+`TaskCell::flag` 当前是独占 64 B cache line 内的 `int64_t`，协议值域只使用
+`0/1`；fanin 读取是返回值参与控制流的 `atomicAdd<int64_t>(0)`，完成发布是
+`atomicExch<int64_t>(1)`。从值域看可以收窄为 32 bit，但字段宽度变化既不减少
+`TaskCell` 的 64 B stride，也不能减少一次原子事务触及的 cache line，是否能
+降低返回就绪延迟必须由 A5 直接测量。
+
+复用 `ccec/atomic_scalar_pmu`，在同一 ELF 中增加 32/64-bit
+`DEPENDENT_ATOMIC_LOAD` 与各自的 scalar control：
+
+- 两种宽度的目标分别独占 cache line；
+- host 发布一个运行时为零、编译期未知的 mask；第 N 次 atomic 返回值与该
+  mask 相与，作为第 N+1 次 addend，运行时始终执行同址 `atomicAdd(0)`，同时
+  保证后一次不能越过前一次返回值；
+- 32/64-bit 测试顺序按 repeat 交替，避免固定先后顺序把会话漂移混入宽度差；
+- 每个模式执行 `8,192` 次，每会话 `15` 组；checksum、32/64-bit 最终值、
+  physical core、PMU gate 和配置恢复全部硬校验。
+
+三个独立进程会话均固定在同一个 physical AIV，结果如下。SYS_CNT 是
+`ns/op`；PMU total/scalar 是 AICore cycle/op，均已扣除各自 scalar control：
+
+| 会话 | 64-bit SYS_CNT | 32-bit SYS_CNT | 32-64 | 相对变化 | PMU total 32-64 | scalar 32-64 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 192.208252 | 192.216064 | +0.007812 ns | +0.004065% | +0.010010 cycle | +0.011108 cycle |
+| 2 | 192.213989 | 192.221436 | +0.007446 ns | +0.003874% | +0.010864 cycle | +0.011841 cycle |
+| 3 | 192.206299 | 192.213989 | +0.007690 ns | +0.004001% | +0.021973 cycle | +0.022095 cycle |
+
+三轮的 32-bit 路径都没有改善，差值只有约 `0.004%`，远小于任何可用的
+端到端收益；两种宽度的 I-cache miss 都是 0。探针合入主工作树后另做
+`7` 组复核，32-bit SYS_CNT 相对变化为 `-0.001461%`，方向反转但仍同样
+接近零，进一步说明前述万分之一级差异不具备可用收益。由此拒绝把
+`TaskCell::flag` 收窄为 32 bit：该修改会改变公共 host/device ABI 和所有
+读写点，却不降低 A5 return-ready 原子延迟，也不减少 cache line 数量。
+后续不再用字段宽度解释 `fanin_flag_load`，继续从通用轮询协议和 ready
+发现时机寻找收益。
