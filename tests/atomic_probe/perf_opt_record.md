@@ -4383,3 +4383,49 @@ scalar 长尾。该路径没有 Claim atomic，本轮也没有用 PMU 把长尾�
 路径。候选已完整撤回；直接 non-atomic 闭合已经否决，因此没有用
 perf-clock 整体波动重复裁决。完整静态证据、逐角色数据与出口定位见
 [shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。
+
+### 13.25 AIC 单独使用 8B shared output header 快照
+
+**[已保留] 两次 32-bit 读取合为一次 64-bit 快照，并通过相邻闭合**
+
+`SharedTaskOutputs` 的 producer/count 恰好组成 8B block-local
+header。候选用 `__builtin_memcpy` 合法取得单份快照，保留原 producer、
+空 count、非法 task id 和 output 上限检查；没有改 ABI、Claim、
+atomic、TensorMap 或 winner Finish。
+
+全核版本虽然让 post-Claim tail 两轮下降 `13.674%/13.949%`，但
+`tail+Transition` 连续回退 `0.491%/0.255%`，AIV 回退
+`3.365%/3.008%`，因此撤回。最终只在 CCEC AIC 编译实例使用 8B
+快照；AIV 和 CPU 公开路径保留原实现。AIV caller `.text` 与重新构建
+的冻结基线逐字相同，runtime/Finish、private 和 atomic intrinsic
+也全部不变。
+
+最终两份 A5 B256 泳道为：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260731_004258_752918/ccec/
+  pa_scheduler_shared_swimlane_20260731_004351_754170/ccec/
+```
+
+四轮固定 109,728 个直接目标 tail actor，109,668 个具有下一 Submit。
+逐核扣除 `Atomic∪Kernel` 后：
+
+| AIC-only 8B 快照 | 第一组 A/B | 第二组 A/B |
+| --- | ---: | ---: |
+| 全体 tail | **-5.504%** | **-6.013%** |
+| 全体 tail + Transition | **-2.004%** | **-2.343%** |
+| AIC tail + Transition | **-7.474%** | **-7.155%** |
+| AIV tail + Transition | -0.044% | -0.627% |
+
+目标区间与 `Atomic∪Kernel` 的交集均为零，96/32/64 Claim 人口、
+1,280 winner、1,024 Kernel、依赖签名和 drop 0 全部闭合。已知的
+“前序 QK/PV winner 后 AIC-UP 空 Claim”布局门也保持最大 1 tick，
+没有长尾。
+
+10 个独立 perf-clock 进程中位数为 `2294.260 us`、范围
+`2249.776～2315.671 us`，相对历史 PV-only 中位数高约 1.263%。
+由于整体值包含波动的 atomic 且并非交错 A/B，本轮按既定口径只作旁证；
+保留依据是两轮固定 actor、相邻边界和零 atomic 交集的 non-atomic
+一致改善。完整失败语义、静态对象和逐切片数据见
+[shared TensorMap 开发记录](pa_scheduler/shared_tensormap_record.md)。

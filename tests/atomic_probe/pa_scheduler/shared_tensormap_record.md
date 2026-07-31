@@ -16594,3 +16594,128 @@ not-attempted 路径稳定回退。
 连续两轮否决，整体时间不能推翻该证据。后续若继续消减 Claim 观察开销，
 必须找到不会改变 AIC-UP 空路径取指布局、且能穿过
 `Claim+tail+Transition` 闭合的新实现；不能只复用本次“出口聚合”写法。
+
+### 2026-07-31：AIC 单独合并 shared output header 读取
+
+#### 目标与等价边界
+
+shared replay 的每个 actor 都在 Claim 后调用
+`PrepareSharedTaskOutputs()`。入口只需确认本核 block-local
+`SharedTaskOutputs` 仍为 `(task_id, 0)`，再把生产 task 的固定 output
+数量写回。原实现分别读取 32-bit producer/count，并通过顺序
+`AddOutputRef(0..N-1)` 形成最终 count；CCEC O3 虽已折叠追加循环，
+仍保留两次 32-bit header 读取。
+
+候选用 `__builtin_memcpy` 把同一个 8B 对象合法复制到 `uint64_t`，
+再从单份快照解码 producer/count。它不使用破坏别名或对齐合同的
+`uint64_t*` 强转，也没有借 Claim 前的 Reset 支配关系删除错误现场
+检查。正常路径最终 8B 状态、非法 task id、错误 producer、非空
+count 和返回值均与原顺序实现逐项一致。
+
+CPU 定向测试用独立旧算法作参考，对以下组合穷举比较了返回值和完整
+8B 最终状态：
+
+- task id：`-1/17`；
+- producer：`-1/16/17/18`；
+- count：`0..kSharedOutputMaxPerTask+1`；
+- kind：Alloc/QK/SF/PV/UP。
+
+公开 CPU 路径和 CCEC AIV 最终仍调用原逐字段实现；测试另外显式实例化
+8B 快照，防止 AIC 专用分支只通过编译、没有合同覆盖。
+
+#### 全核版已撤回
+
+第一版让 AIC/AIV 都使用 8B 快照。CCEC IR 中 AIC 四个动态入口由
+八次 `i32` load 变为四次 `i64` load，AIV 六个入口由十二次
+`i32` load 变为六次 `i64` load；alloca、atomic intrinsic 类型和
+数量均不变。CPU shared/private、B256/mixed、CCEC shared/private
+构建和两份 A5 B256 完整泳道均通过：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260731_002626_722959/ccec/
+outputs/pa_scheduler_shared_swimlane_20260731_002722_724952/ccec/
+```
+
+四份 raw 均闭合为 96 核、1,280 task、73,728 attempted Claim、
+1,280 winner、1,024 Kernel 和 drop 0。与 PV-only 基线
+`221211_521079/221258_521012` 固定四轮都保持相同
+`(core, task, Claim status)` 的九个直接目标切片，并逐核扣除
+`Atomic∪Kernel` 后：
+
+| 全核 8B 快照 | 第一组 A/B | 第二组 A/B |
+| --- | ---: | ---: |
+| post-Claim tail | **-13.674%** | **-13.949%** |
+| tail + Transition | +0.491% | +0.255% |
+| AIC tail + Transition | **-7.518%** | **-7.455%** |
+| AIV tail + Transition | +3.365% | +3.008% |
+
+所有目标 tail/Transition 与 `Atomic∪Kernel` 的交集均为零。回退主要
+来自 AIV QK not-attempted 和 SF true-loser：两者相邻闭合分别连续
+增加约 `25%～26%`。因此该版只缩短了被命名为 tail 的局部区间，
+代价稳定移入下一 Submit 前缀，已撤回。
+
+同核前序 QK/PV winner 后的 AIC-UP not-attempted 负对照仍为每轮
+512 个样本，Claim 最大值为 1 tick、`>8 tick` 为 0；这证明全核版
+没有重现 Claim 计数聚合候选的取指长尾，否决原因就是直接目标的相邻
+搬移，不是旧问题误报。
+
+#### 最终 AIC-only 实现
+
+最终版本复用构建已有的 `PA_BUILD_AIC`：
+
+- CCEC AIC 使用单次 8B 快照；
+- CCEC AIV 和 CPU 公开路径保留原逐字段/顺序追加实现；
+- 不新增构建宏、状态字段、运行期核型分支或跨 TU 参数。
+
+冻结基线和候选从各自源树重新完整构建后：
+
+| CCEC caller | 基线 `.text` | 候选 `.text` | 结论 |
+| --- | ---: | ---: | --- |
+| AIC | 71,760 B | 71,928 B | 保留单次 `i64` load，布局改变 |
+| AIV | 73,528 B | 73,528 B | `.text` SHA256 逐字相同 |
+
+AIC 机器码增加 168B，因此不能把“少一次读取”等同于代码体积缩小；
+动态裁决只看固定 actor 的相邻闭合。runtime/Finish AIC/AIV 和 private
+六个关键对象均与基线逐字相同，atomic intrinsic 的类型、数量和调用
+形态也不变。
+
+CPU shared 全量协议测试、B256/G1、mixed G0/G1/G2/G4，CCEC
+shared/private 构建、artifact manifest 和 atomic/DCCI 源码覆盖测试
+全部通过。最终两份 A5 B256 完整泳道为：
+
+```text
+outputs/pa_scheduler_shared_swimlane_20260731_004258_752918/ccec/
+outputs/pa_scheduler_shared_swimlane_20260731_004351_754170/ccec/
+```
+
+每份均保持原 96/32/64 Claim 人口、1,280 winner、1,024 Kernel、
+依赖签名 `b7d985d6edb07078`、TensorMap/heap/signature 全部断言和
+drop 0。四轮固定人口包括 109,728 个直接目标 tail actor，其中
+109,668 个具有下一 Submit、可形成 `tail+Transition`：
+
+| AIC-only 8B 快照 | 第一组 A/B | 第二组 A/B |
+| --- | ---: | ---: |
+| 全体 tail | **-5.504%** | **-6.013%** |
+| 全体 tail + Transition | **-2.004%** | **-2.343%** |
+| AIC tail + Transition | **-7.474%** | **-7.155%** |
+| AIV tail + Transition | -0.044% | -0.627% |
+
+全部目标 tail 与闭合区间均和 `Atomic∪Kernel` 零交集。AIC-UP
+前序 winner 布局负对照每轮仍为 512 个样本，Claim 最大值为 1 tick，
+没有 `>8/>64 tick` 长尾。字节未改的 AIV 个别 kind 有约 1%～2%
+反向波动，但 AIV 总体两轮均未回退，九切片没有连续超过 2 tick 且
+2% 的相邻回退，故系统级门槛通过。
+
+10 个独立 perf-clock 进程全部通过，Submit 中位数
+`2294.260 us`、范围 `2249.776～2315.671 us`。它比历史 PV-only
+中位数 `2265.640 us` 高约 1.263%，但两组并非交错运行，而且
+perf-clock 仍包含会波动的 atomic 等待；本轮按用户明确口径，只把它
+作为低扰动整体旁证，不用整体值推翻两轮固定人口、零 atomic 交集的
+non-atomic 收益。
+
+#### 当前结论
+
+保留 AIC-only 版本。该阶段等价删除的是 AIC post-Claim output header
+的重复标量读取；AIV/CPU、Claim/atomic、TensorMap、winner Finish 和
+ticket ABI 均未改变。全核版的失败也再次确认：后续不能只看局部 span，
+必须继续闭合到下一 Submit 边界并检查字节未改核型的系统级对照。

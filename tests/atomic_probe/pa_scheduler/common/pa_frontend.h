@@ -129,6 +129,10 @@ static_assert(alignof(SharedTaskOutputs) == 4, "SharedTaskOutputs ABI alignment 
 static_assert(offsetof(SharedTaskOutputs, producer_task_id) == 0, "shared result task offset mismatch");
 static_assert(offsetof(SharedTaskOutputs, output_count) == 4, "shared result count offset mismatch");
 static_assert(
+    __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+    "shared result 8B snapshot requires the A5/x86 little-endian ABI"
+);
+static_assert(
     __is_trivially_constructible(SharedTaskOutputs),
     "SharedTaskOutputs must remain trivial for CCEC block-local state"
 );
@@ -254,12 +258,45 @@ PA_DEVICE bool SharedPaTaskKindInBatch(
 }
 #endif
 
-PA_DEVICE bool PrepareSharedTaskOutputs(
+template <bool SingleHeaderSnapshot>
+PA_DEVICE bool PrepareSharedTaskOutputsImpl(
     SharedTaskOutputs &outputs, int32_t task_id, TaskKind kind
 ) {
     // loser 也必须把同一组 (producer,slot) 句柄交给本核后续 orchestration；
     // 这里仅声明稳定符号，不读取 winner 私有 payload，也不物化 descriptor。
-    if (task_id < 0 || outputs.TaskId() != task_id || !outputs.Empty()) {
+    if constexpr (SingleHeaderSnapshot) {
+        // producer/count 是同一个 8B block-local header。用合法的对象复制
+        // 取得单份快照，再逐字段执行原有校验；不能用 uint64_t* 强转破坏
+        // 别名或对齐合同，也不能借 Begin 的 Reset 删除错误现场检查。
+        uint64_t header = 0;
+        __builtin_memcpy(&header, &outputs, sizeof(header));
+        const uint32_t snapshot_task_id =
+            static_cast<uint32_t>(header);
+        const uint32_t snapshot_count =
+            static_cast<uint32_t>(header >> 32U);
+        if (task_id < 0 ||
+            snapshot_task_id != static_cast<uint32_t>(task_id) ||
+            snapshot_count != 0) {
+            return false;
+        }
+        const uint32_t output_count =
+            FrontendTaskOutputCount(kind);
+        if (output_count > kSharedOutputMaxPerTask) {
+            return false;
+        }
+        // SharedTaskOutputs 不保存逐 slot 数组；OutputRef(index) 根据
+        // (producer,index) 即时恢复句柄。一次发布 count 与顺序
+        // AddOutputRef(0..N-1) 的最终 8B 状态完全一致。
+        outputs.output_count = output_count;
+        return true;
+    }
+
+    // AIV 与 CPU 参考路径保留修改前的字段读取和顺序追加形态。A5 完整
+    // 泳道证明，AIV 使用 8B 快照虽缩短本段 tail，却会把更多时间推到
+    // 紧邻 Transition；这里按核型实例化，避免为了局部数字改变 AIV
+    // caller 代码布局。
+    if (task_id < 0 || outputs.TaskId() != task_id ||
+        !outputs.Empty()) {
         return false;
     }
     const uint32_t output_count = FrontendTaskOutputCount(kind);
@@ -271,6 +308,20 @@ PA_DEVICE bool PrepareSharedTaskOutputs(
         }
     }
     return outputs.Size() == output_count;
+}
+
+PA_DEVICE bool PrepareSharedTaskOutputs(
+    SharedTaskOutputs &outputs, int32_t task_id, TaskKind kind
+) {
+#if defined(PA_BUILD_AIC)
+    return PrepareSharedTaskOutputsImpl<true>(
+        outputs, task_id, kind
+    );
+#else
+    return PrepareSharedTaskOutputsImpl<false>(
+        outputs, task_id, kind
+    );
+#endif
 }
 
 template <TaskKind Kind>

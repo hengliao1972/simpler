@@ -897,6 +897,131 @@ bool RunLoserZeroTensorMapAccessTest() {
     return ok;
 }
 
+bool RunSharedOutputPrepareContractTest() {
+    constexpr int32_t kTask = 17;
+    constexpr TaskKind kinds[] = {
+        TaskKind::Alloc,
+        TaskKind::Qk,
+        TaskKind::Sf,
+        TaskKind::Pv,
+        TaskKind::Up,
+    };
+    constexpr uint32_t expected_counts[] = {3, 1, 3, 1, 0};
+    const auto reference_prepare = [](
+        SharedTaskOutputs &outputs, int32_t task_id, TaskKind kind
+    ) {
+        if (task_id < 0 || outputs.TaskId() != task_id ||
+            !outputs.Empty()) {
+            return false;
+        }
+        const uint32_t output_count =
+            FrontendTaskOutputCount(kind);
+        for (uint32_t slot = 0; slot < output_count; ++slot) {
+            if (!outputs.AddOutputRef(
+                    task_id, static_cast<int16_t>(slot)
+                )) {
+                return false;
+            }
+        }
+        return outputs.Size() == output_count;
+    };
+
+    bool exact = true;
+    for (uint32_t index = 0;
+         index < sizeof(kinds) / sizeof(kinds[0]); ++index) {
+        SharedTaskOutputs outputs{};
+        outputs.Reset(kTask);
+        exact &=
+            PrepareSharedTaskOutputs(outputs, kTask, kinds[index]);
+        exact &= outputs.TaskId() == kTask;
+        exact &= outputs.Size() == expected_counts[index];
+        for (uint32_t slot = 0;
+             slot < expected_counts[index]; ++slot) {
+            const FdwicOutputRef output = outputs.OutputRef(slot);
+            exact &= output.producer_task_id == kTask;
+            exact &= output.output_slot ==
+                static_cast<int16_t>(slot);
+        }
+        exact &=
+            outputs.OutputRef(expected_counts[index])
+                .producer_task_id == -1;
+    }
+
+    // 快路径必须保留原来的失败现场：producer 不匹配、进入时非空或
+    // task id 非法时都返回 false，且完整 8B header 不发生局部改写。
+    SharedTaskOutputs wrong_producer{kTask + 1, 0};
+    exact &= !PrepareSharedTaskOutputs(
+        wrong_producer, kTask, TaskKind::Sf
+    );
+    exact &= wrong_producer.producer_task_id == kTask + 1;
+    exact &= wrong_producer.output_count == 0;
+
+    for (uint32_t count = 1;
+         count <= kSharedOutputMaxPerTask + 1U; ++count) {
+        SharedTaskOutputs nonempty{kTask, count};
+        exact &= !PrepareSharedTaskOutputs(
+            nonempty, kTask, TaskKind::Sf
+        );
+        exact &= nonempty.producer_task_id == kTask;
+        exact &= nonempty.output_count == count;
+    }
+
+    SharedTaskOutputs negative_task{-1, 0};
+    exact &= !PrepareSharedTaskOutputs(
+        negative_task, -1, TaskKind::Qk
+    );
+    exact &= negative_task.producer_task_id == -1;
+    exact &= negative_task.output_count == 0;
+
+    // 用修改前的顺序 AddOutputRef 合同作独立参考，对生产 TaskKind、
+    // 合法/非法 task id、producer 和 count 组合逐项比较返回值与最终
+    // 8B 状态，防止单快照版本只覆盖正常输入而改变失败语义。
+    constexpr int32_t task_ids[] = {-1, kTask};
+    constexpr int32_t producers[] = {
+        -1, kTask - 1, kTask, kTask + 1,
+    };
+    for (int32_t task_id : task_ids) {
+        for (int32_t producer : producers) {
+            for (uint32_t count = 0;
+                 count <= kSharedOutputMaxPerTask + 1U; ++count) {
+                for (TaskKind kind : kinds) {
+                    SharedTaskOutputs expected{producer, count};
+                    SharedTaskOutputs actual{producer, count};
+                    SharedTaskOutputs packed{producer, count};
+                    const bool expected_ok = reference_prepare(
+                        expected, task_id, kind
+                    );
+                    const bool actual_ok = PrepareSharedTaskOutputs(
+                        actual, task_id, kind
+                    );
+                    const bool packed_ok =
+                        PrepareSharedTaskOutputsImpl<true>(
+                            packed, task_id, kind
+                        );
+                    exact &= actual_ok == expected_ok;
+                    exact &= packed_ok == expected_ok;
+                    exact &=
+                        actual.producer_task_id ==
+                            expected.producer_task_id &&
+                        actual.output_count ==
+                            expected.output_count;
+                    exact &=
+                        packed.producer_task_id ==
+                            expected.producer_task_id &&
+                        packed.output_count ==
+                            expected.output_count;
+                }
+            }
+        }
+    }
+
+    std::printf(
+        "[ORDERED_SUBMIT] shared_output_prepare_contract=%s\n",
+        exact ? "PASS" : "FAIL"
+    );
+    return exact;
+}
+
 bool RunPvTaskIdentityContractTest() {
     constexpr uint32_t kSfTask = 12;
     constexpr uint32_t kPvTask = kSfTask + 1U;
@@ -1276,6 +1401,8 @@ int main() {
     const bool task_id_prefix_ok =
         RunSplitReplayTaskIdPrefixTest();
     const bool loser_ok = RunLoserZeroTensorMapAccessTest();
+    const bool output_prepare_ok =
+        RunSharedOutputPrepareContractTest();
     const bool pv_task_identity_ok =
         RunPvTaskIdentityContractTest();
     const bool fanin_compaction_ok =
@@ -1286,6 +1413,7 @@ int main() {
     const bool execution_ok =
         RunIndependentKernelExecutionTest();
     if (!claim_accounting_ok || !task_id_prefix_ok || !loser_ok ||
+        !output_prepare_ok ||
         !pv_task_identity_ok ||
         !fanin_compaction_ok || !pa_up_shape_ok ||
         !overlap_ok || !execution_ok) {
