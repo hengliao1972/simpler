@@ -1121,6 +1121,7 @@ bool RunOpportunisticEfDrainBackoffTest() {
         first == 0 && worker.occupied_count == 1 &&
         stats.efdrain_skip_budget ==
             kSharedEfDrainNoProgressSkipSubmits &&
+        stats.efdrain_no_progress_polls == 1 &&
         stats.result.fanin_not_ready_loads == 1;
 
     // 依赖在两次 Submit 之间 ready 时，后续调用逐次消费本核预算；
@@ -1145,10 +1146,74 @@ bool RunOpportunisticEfDrainBackoffTest() {
         retry == 1 && worker.occupied_count == 0 &&
         !slot.occupied && state->tasks[11].flag == 1 &&
         stats.efdrain_skip_budget == 0 &&
+        stats.efdrain_no_progress_polls == 0 &&
         stats.result.fanin_ready_loads == 1 &&
         stats.result.placement[
             static_cast<uint32_t>(DrainPlace::EfDrain)
         ] == 1;
+
+    // 只有连续多轮完整 poll 都没有进展，才把间隔增加到两个 Submit；
+    // 阈值之前始终保持当前短等待的单次跳过节奏。
+    worker = WorkerState{};
+    worker.occupied_count = 1;
+    worker.slots[0].occupied = true;
+    worker.slots[0].built = true;
+    worker.slots[0].task_id = 14;
+    worker.slots[0].kind = 0;
+    worker.slots[0].fanin_count = 1;
+    worker.slots[0].fanin[0] = 8;
+    state->tasks[8].flag = 0;
+    LocalStats long_wait_stats{};
+    bool adaptive_interval = true;
+    for (uint8_t poll = 1;
+         poll <= kSharedEfDrainLongWaitPollThreshold; ++poll) {
+        const uint32_t stalled = OpportunisticDrainReady<
+            OrderedSubmitTestOps
+        >(state, worker, long_wait_stats);
+        const uint8_t expected_budget =
+            poll == kSharedEfDrainLongWaitPollThreshold
+            ? kSharedEfDrainLongWaitSkipSubmits
+            : kSharedEfDrainNoProgressSkipSubmits;
+        adaptive_interval =
+            adaptive_interval && stalled == 0 &&
+            long_wait_stats.efdrain_no_progress_polls == poll &&
+            long_wait_stats.efdrain_skip_budget == expected_budget &&
+            long_wait_stats.result.fanin_not_ready_loads == poll;
+        for (uint8_t skip = expected_budget; skip != 0; --skip) {
+            const uint32_t skipped = OpportunisticDrainReady<
+                OrderedSubmitTestOps
+            >(state, worker, long_wait_stats);
+            adaptive_interval =
+                adaptive_interval && skipped == 0 &&
+                long_wait_stats.efdrain_skip_budget == skip - 1 &&
+            long_wait_stats.result.fanin_not_ready_loads == poll;
+        }
+    }
+    const uint32_t saturated_poll = OpportunisticDrainReady<
+        OrderedSubmitTestOps
+    >(state, worker, long_wait_stats);
+    adaptive_interval =
+        adaptive_interval && saturated_poll == 0 &&
+        long_wait_stats.efdrain_no_progress_polls ==
+            kSharedEfDrainLongWaitPollThreshold &&
+        long_wait_stats.efdrain_skip_budget ==
+            kSharedEfDrainLongWaitSkipSubmits &&
+        long_wait_stats.result.fanin_not_ready_loads ==
+            kSharedEfDrainLongWaitPollThreshold + 1;
+    for (uint8_t skip = kSharedEfDrainLongWaitSkipSubmits;
+         skip != 0; --skip) {
+        (void)OpportunisticDrainReady<OrderedSubmitTestOps>(
+            state, worker, long_wait_stats
+        );
+    }
+    state->tasks[8].flag = 1;
+    const uint32_t long_retry = OpportunisticDrainReady<
+        OrderedSubmitTestOps
+    >(state, worker, long_wait_stats);
+    const bool long_wait_completes =
+        long_retry == 1 && worker.occupied_count == 0 &&
+        long_wait_stats.efdrain_no_progress_polls == 0 &&
+        long_wait_stats.efdrain_skip_budget == 0;
 
     // 两槽已经承担背压风险，旧提示即使存在也必须清零并立即检查。
     worker = WorkerState{};
@@ -1164,17 +1229,21 @@ bool RunOpportunisticEfDrainBackoffTest() {
     LocalStats full_stats{};
     full_stats.efdrain_skip_budget =
         kSharedEfDrainNoProgressSkipSubmits;
+    full_stats.efdrain_no_progress_polls =
+        kSharedEfDrainLongWaitPollThreshold;
     const uint32_t full = OpportunisticDrainReady<
         OrderedSubmitTestOps
     >(state, worker, full_stats);
     const bool full_never_skips =
         full == 2 && worker.occupied_count == 0 &&
         full_stats.efdrain_skip_budget == 0 &&
+        full_stats.efdrain_no_progress_polls == 0 &&
         state->tasks[12].flag == 1 &&
         state->tasks[13].flag == 1;
 
     const bool ok =
         first_poll && bounded_skips && retry_completes &&
+        adaptive_interval && long_wait_completes &&
         full_never_skips;
     std::printf(
         "[ORDERED_SUBMIT] opportunistic_efdrain_backoff=%s\n",

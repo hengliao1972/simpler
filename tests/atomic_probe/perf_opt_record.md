@@ -4906,7 +4906,7 @@ worker 只有一个未 ready winning slot 时，相邻 Submit 会重复读取同
 - 实现只读取通用的 slot 数量和本次 drain 是否取得进展，不判断 PA task
   kind、task-id 模式或特定依赖图。
 
-### 15.2 最终通用状态机
+### 15.2 第一阶段通用状态机
 
 shared worker 在本地 `LocalStats` 中保存一个有限预算。单 slot 的一次完整
 EfDrain 没有释放任务后，下一次 Submit 开头跳过轮询；再下一次必须重试：
@@ -4927,7 +4927,7 @@ WaitForSlot / RingBp / Final  -> 始终直接 DrainReady
 变 ready，以及两 slot 即使残留预算也必须立即 drain 三种情况。
 
 CCEC 的 `[[block_local]]` split runtime 原本为 `1,664 B`。直接新增一个
-`uint32_t` 会因 64 B 对齐把它扩大到 `1,728 B`，超过预留空间。最终将
+`uint32_t` 会因 64 B 对齐把它扩大到 `1,728 B`，超过预留空间。第一阶段将
 shared 模式下最大只可能为 4 的 `max_occupied` 精确收窄为 `uint16_t`，与
 `uint16_t` 预算复用原 4 B；private 布局不变，也没有增加 GM WorkerState
 字段或 host/device ABI。
@@ -4948,14 +4948,14 @@ shared 模式下最大只可能为 4 的 `max_occupied` 精确收窄为 `uint16_
 | 无进展后跳过 2 次 | 1,493.053 us | 1,499.789 us | +0.451% | 1,491.101 us | 1,500.577 us | 65,767 -> 39,311（-40.23%） | 2/8 |
 
 深度 2 虽然继续减少约 7.4% 的 fanin load，但更晚发现已经 ready 的 task，
-把成本移动到后续执行和 drain，端到端反而回退。因此最终常量固定为 1；
+把成本移动到后续执行和 drain，端到端反而回退。因此第一阶段先固定为 1；
 不能把“原子调用数下降”单独当成保留优化的依据。
 
-### 15.4 最终完整泳道归因
+### 15.4 第一阶段完整泳道归因
 
-最终紧凑实现与未修改基线各取一份相同的 full-swimlane 构建：
+第一阶段紧凑实现与未修改基线各取一份相同的 full-swimlane 构建：
 
-| 指标 | N96/G8 基线 | 最终候选 | 变化 |
+| 指标 | N96/G8 基线 | 第一阶段候选 | 变化 |
 | --- | ---: | ---: | ---: |
 | Submit wall time | 1,704.612 us | 1,667.041 us | -2.204% |
 | fanin logical load | 59,027 | 35,430 | -39.98% |
@@ -4976,7 +4976,7 @@ core-time 为 `18.741 -> 18.810 ms`，root CAS 为
 FinalDrain 的 worker completion 和全核结束时间仍分别改善 `2.19%` 与
 `3.47%`。这也是选择深度 1、拒绝深度 2 的原因之一。
 
-最终本地泳道文件为：
+第一阶段本地泳道文件为：
 
 ```text
 tests/atomic_probe/pa_scheduler/outputs/
@@ -4988,3 +4988,130 @@ tests/atomic_probe/pa_scheduler/outputs/
 泳道 JSON 仅保留在本地 ignored outputs 中，不进入 GitHub。该轮
 validation 全部 PASS、drop 为 0；CPU shared 全套、B256 语义断言、CCEC
 AIC/AIV 构建和 manifest 检查也全部通过。
+
+### 15.5 长等待自适应轮询
+
+第一阶段泳道仍有 `33,910` 条直接 fanin atomic。按
+`(worker, producer task)` 聚合为 `1,233` 个等待组后，`787` 组至少
+轮询 16 次，`430` 组至少轮询 32 次，最长为 70 次。短等待和长等待
+混用同一个固定间隔，是继续降低次数却不能直接采用全局深度 2 的原因。
+
+第二阶段保留第一阶段的短等待节奏，只在同一个 worker 连续完整轮询多次
+仍无进展时增加间隔：
+
+```text
+单 slot，连续无进展次数 < 24：poll -> skip 1 Submit -> poll
+单 slot，连续无进展次数 = 24：计数在 24 饱和，改为
+                                 poll -> skip 2 Submits -> poll
+slot 释放、变空或进入多 slot：清零连续计数与预算
+WaitForSlot / RingBp / Final：始终直接 DrainReady
+```
+
+连续计数与预算各用一个 `uint8_t`，仍与 `uint16_t max_occupied` 合计复用
+原 4 B，split runtime 保持 `1,664 B`。该状态只描述“本 worker 的单 slot
+连续多少次没有进展”，不读取 task kind、role、task-id 距离或 PA 依赖图。
+依赖在长等待跳过期间变 ready 时，额外发现延迟最多为两个 Submit；任何
+slot 压力和回放结束仍由强制 drain 保证推进。
+
+CPU 门槛新增两类检查：阈值前每轮只消费一个跳过预算，达到阈值后恰好
+消费两个；依赖随后 ready 时下一次 poll 必须执行并清零状态。两 slot
+路径即使带有长等待状态也必须立即 drain。
+
+### 15.6 阈值取舍与 perf-clock 结果
+
+阈值 8、16、24 均与已提交的固定深度 1 ELF 成对交错运行；所有轮次保持
+`96/32/64` 合法候选、`73,728` 次 Claim、`1,280` 个 winner 和
+`1,024` 个 kernel，语义检查全部 PASS：
+
+| 长等待阈值 | 配对数 | 改善组数 | fanin load | mean 变化 | median 变化 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 8 | 4/8 | -18.29% | -0.291% | -0.885% |
+| 16 | 16 | 10/16 | -18.06% | -0.967% | -0.782% |
+| 24 | 16 | 14/16 | -16.24% | -0.828% | -1.151% |
+
+阈值 8 过早接近全局深度 2，胜率只有一半；阈值 16 的均值更低，但
+阈值 24 在 16 对中有 14 对改善，median 和配对差中位数也更好。最终选择
+阈值 24，其配对数据为：
+
+```text
+fixed skip1 mean/median = 1472.974 / 1474.448 us
+adaptive24 mean/median  = 1460.776 / 1457.476 us
+paired delta median     = -18.611 us
+fanin mean              = 44,247 -> 37,060
+```
+
+把计数器改为在 24 饱和后，最终代码又以 8 对复测，7/8 对改善；该组
+baseline 整体偏慢，mean 改善 `1.949%`，只用于确认方向，不替换上面更
+保守的 16 对结果。相对未做任何 EfDrain 降频的 `N96/G8`，另 8 对累计
+对照为：
+
+| 指标 | 原 N96/G8 | adaptive24 | 变化 |
+| --- | ---: | ---: | ---: |
+| mean | 1,491.305 us | 1,466.346 us | -1.674% |
+| median | 1,490.718 us | 1,457.171 us | -2.25% |
+| fanin load mean | 65,811 | 37,265 | -43.38% |
+| 配对改善数 | - | 7/8 | - |
+
+最终自适应逻辑相对第一阶段固定深度 1 的 `.text` 增量为：AIC
+`1,088 B`、AIV `1,024 B`、混合 kernel `2,048 B`。计数在阈值饱和比
+一直增长到 255 的过程版本少 `512 B` 混合 kernel 代码。
+
+### 15.7 诊断泳道的解释边界
+
+最终代码的本地完整泳道为：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_shared_swimlane_20260731_210422_1357808/ccec/
+    merged_swimlane.json
+    swimlane_exclusive_analysis.json
+```
+
+它与同一时段重新生成的固定深度 1 诊断 ELF 对比如下：
+
+| 指标 | fixed skip1 | adaptive24 | 变化 |
+| --- | ---: | ---: | ---: |
+| 直接 fanin atomic | 34,024 | 29,556 | -13.13% |
+| 直接 fanin atomic core-time | 8.748 ms | 7.495 ms | -14.33% |
+| EfDrain control core-time | 21.740 ms | 21.171 ms | -2.62% |
+| Register 前序插入等待 core-time | 19.393 ms | 21.615 ms | +11.46% |
+| Submit wall time | 1,671.035 us | 1,678.435 us | +0.44% |
+| lifecycle wall time | 1,756.964 us | 1,778.793 us | +1.24% |
+
+这份诊断构建证明 fanin 次数和 EfDrain 自身确实下降，也显示更改轮询节奏会
+改变带大量 trace 写入时的 winner 到达和严格 TensorMap 插入等待分布。
+因此它不能推翻无泳道 perf-clock 的 16 对结果，也不能被用来宣称诊断 ELF
+本身提速；三种 ELF 的绝对时间仍不得互相相减。最终泳道的 local/root
+Claim CAS 仍精确为 `73,728/9,216`，validation 全部 PASS、drop 为 0。
+泳道 JSON 继续只保留在本地 ignored outputs，不进入 GitHub。
+
+### 15.8 更深长等待间隔的终止条件
+
+对最终 adaptive24 泳道重新按 `(worker, producer task)` 聚合：`29,556`
+条直接 load 分布在 `1,233` 个等待组，其中 `28,472` 条发生在 producer
+发布 completion flag 之前。`702` 个组至少轮询 24 次，承担 `27,161`
+条 load；这说明剩余次数仍可机械压低，但不能说明端到端还能受益。
+
+相邻直接 poll 的间隔中位数为 `1.549 us`；对于确实跨过 producer 完成点
+的等待组，最后一次未 ready poll 距 completion 的中位数为 `1.304 us`。
+当前 skip2 已接近一个明确拐点：继续多跳一个 Submit 只能省下一条约
+`0.25 us` 的 atomic，却很容易在 producer 即将完成时额外延迟约半个到
+一个 Submit。
+
+为验证该判断，保持阈值 24 不变，只把长等待间隔从 skip2 改成 skip3，
+与已提交 adaptive24 ELF 交错运行 8 对：
+
+| 指标 | adaptive24 skip2 | 临时 skip3 | 变化 |
+| --- | ---: | ---: | ---: |
+| mean | 1,469.332 us | 1,493.808 us | +1.666% |
+| median | 1,465.948 us | 1,493.513 us | +1.88% |
+| fanin load mean | 38,473 | 38,022 | -1.17% |
+| 配对改善数 | - | 2/8 | - |
+
+skip3 已完整撤回。由此停止继续枚举更深固定间隔：其边际 atomic 降幅只剩
+`1.17%`，ready 发现延迟却已经主导整体性能。普通 GM load 或 `ld_dev`
+也不能替代这里被控制流消费的跨核 `atomicAdd(0)`，其正确性边界已由
+`ATOMIC_USAGE_GUIDE.md` 的 A5 实测限定。若未来继续减少剩余 load，需要
+研究 producer 主动通知或反向依赖计数等新协议；这类方案会新增每边发布、
+早完成与后注册竞态、fanout 容量和 generation 复用合同，不能伪装成当前
+轮询循环的一行低风险优化。

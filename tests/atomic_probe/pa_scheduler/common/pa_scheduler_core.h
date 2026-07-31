@@ -35,11 +35,11 @@ struct LocalStats {
     // 并与下面的本地退避位合计复用原先 max_occupied 的 4B，不扩大
     // CCEC [[block_local]] split runtime。
     uint16_t max_occupied;
-    // opportunistic EfDrain 的单槽退避只属于当前 worker 的本地调度状态，
-    // 不进入 GM WorkerState，也不改变设备/host ABI。一次完整轮询没有
-    // 取得进展后，只跳过下一次 Submit 开头的可选 drain；两槽背压和
-    // FinalDrain 始终走强制轮询。
-    uint16_t efdrain_skip_budget;
+    // opportunistic EfDrain 的单槽轮询状态只属于当前 worker，既不进入
+    // GM WorkerState，也不改变设备/host ABI。短等待每次只跳过一个
+    // Submit；连续长等待才增加到两个。两槽背压和 FinalDrain 始终强制轮询。
+    uint8_t efdrain_skip_budget;
+    uint8_t efdrain_no_progress_polls;
     // 只在末个 shared Submit 成功收尾时写入 task_id+1；回放结束后与
     // local_index 对照，证明 ticket 的 last bit 没有提前或遗漏。
     uint32_t declared_task_count;
@@ -55,10 +55,21 @@ static_assert(
 );
 // 单槽无进展后允许跳过的 Submit 次数。该常量只调节非必需的
 // opportunistic EfDrain 采样频率，不改变 WaitForSlot/FinalDrain 的推进协议。
-constexpr uint16_t kSharedEfDrainNoProgressSkipSubmits = 1;
+constexpr uint8_t kSharedEfDrainNoProgressSkipSubmits = 1;
+constexpr uint8_t kSharedEfDrainLongWaitSkipSubmits = 2;
+constexpr uint8_t kSharedEfDrainLongWaitPollThreshold = 24;
 static_assert(
     kSharedEfDrainNoProgressSkipSubmits != 0,
     "shared EfDrain backoff must retain a finite retry interval"
+);
+static_assert(
+    kSharedEfDrainLongWaitSkipSubmits >=
+        kSharedEfDrainNoProgressSkipSubmits,
+    "long-wait EfDrain interval must not poll more frequently"
+);
+static_assert(
+    kSharedEfDrainLongWaitPollThreshold != 0,
+    "long-wait EfDrain threshold must require observed stalls"
 );
 #endif
 
@@ -676,12 +687,13 @@ PA_DEVICE uint32_t OpportunisticDrainReady(
     LocalStats &stats
 ) {
     // 单槽长期等待时，相邻 Submit 往往反复读取同一个尚未完成的 fanin。
-    // 这里仅对“不承担活性责任”的 EfDrain 做一次有界退避：
-    //   poll(no progress) -> skip N submits -> poll。
+    // 这里仅降低“不承担活性责任”的 EfDrain 轮询频率：短等待采用
+    // poll/skip1，连续长等待才采用 poll/skip2。
     // 两槽状态可能马上进入 WaitForSlot，必须立即检查；显式背压和最终
     // drain 仍直接调用 DrainReady，因此不会丢失完成通知或改变依赖语义。
     if (worker.occupied_count == 0) {
         stats.efdrain_skip_budget = 0;
+        stats.efdrain_no_progress_polls = 0;
         return 0;
     }
     const bool single_slot = worker.occupied_count == 1;
@@ -692,14 +704,27 @@ PA_DEVICE uint32_t OpportunisticDrainReady(
     // 保持唯一的 DrainReady 调用点，避免 CCEC 把完整 slot 扫描体复制到
     // single/full 两个 successor 中而放大每种 Submit 实例的指令体积。
     stats.efdrain_skip_budget = 0;
+    if (!single_slot) {
+        stats.efdrain_no_progress_polls = 0;
+    }
     const uint32_t freed = DrainReady<Ops>(
         state, worker, DrainPlace::EfDrain, stats
     );
-    stats.efdrain_skip_budget =
-        single_slot && freed == 0 &&
-            worker.occupied_count == 1
-        ? kSharedEfDrainNoProgressSkipSubmits
-        : 0U;
+    if (single_slot && freed == 0 &&
+        worker.occupied_count == 1) {
+        if (stats.efdrain_no_progress_polls <
+            kSharedEfDrainLongWaitPollThreshold) {
+            ++stats.efdrain_no_progress_polls;
+        }
+        const bool long_wait =
+            stats.efdrain_no_progress_polls ==
+                kSharedEfDrainLongWaitPollThreshold;
+        stats.efdrain_skip_budget = long_wait
+            ? kSharedEfDrainLongWaitSkipSubmits
+            : kSharedEfDrainNoProgressSkipSubmits;
+    } else {
+        stats.efdrain_no_progress_polls = 0;
+    }
     return freed;
 }
 #endif
