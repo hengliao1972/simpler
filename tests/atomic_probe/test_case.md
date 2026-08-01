@@ -43,6 +43,11 @@ DCCI、`st_dev` 与 atomic 的 API 功能、隔离规则和代码评审清单见
   WARM/COLD 同一 target。三个独立会话共 33 对都是 `WARM miss=0`、
   `COLD miss=68`；COLD-WARM 只增加 48 scalar busy cycle，但增加 `2309..2312`
   total cycle，证明本场景中 I-cache refill 等待的绝大多数周期不计入 scalar busy。
+- 2026-08-01：新增 CCEC `atomic_poll_exchange_contention`，用一写多读的精确 phase
+  对照验证 31 次 identity RMW flag load 对 completion `AtomicExch` 的影响。device 0
+  上 1/7 个 reader、两种 opcode、四种地址关系共八种模式均通过地址、计数、旧值、轮次和
+  拓扑门禁；同地址 atomic 严格串行，同 cacheline 异 word 不进入该同址串行顺序，已经完成
+  并离开的 31 次读取也没有给后续同址写留下按 31 次累加的残余罚时。
 - 原始环境与定量结果记录在 `tests/ATOMIC_MINIBENCH_ONBOARD_LOG.md` 的 2026-07-11 与 2026-07-13 小节。
 
 ## 权威覆盖矩阵
@@ -519,6 +524,99 @@ cd tests/atomic_probe/ccec
 ./run_icache_scalar_pmu.sh
 ```
 
+## Atomic poll 对 completion write 的影响
+
+`ccec/atomic_poll_exchange_contention.cpp` 回答的是 PA `fanin_flag_load ×31`
+这类场景中一个容易混淆的问题：reader 对同一个 flag 反复做返回值 RMW load，是否会让另一个
+核随后执行的 completion `AtomicExch` 再承担一份按 31 次线性累加的写入罚时。
+
+测试固定 block 0 为唯一 writer，其余 AIV 为 reader。每轮 reader 必须先完成精确 31 次
+identity RMW load，再对独立 ready line 加一；writer 看到全部 ready 后空转 2 us，确保 reader
+已经进入后续轮询，再测一次 target `AtomicExch(0 -> token)`。每种 load opcode 都有四种地址关系：
+
+1. `different line`：writer 写 `target.value`，reader 轮询相隔 64 B 的 `signal.value`；
+2. `same line, different word`：writer 写 line 内 offset 0 的 `target.value`，reader 轮询同一
+   64 B line 内 offset 8 的 `target.neighbor`；
+3. `target ×31 then away`：reader 先对 `target.value` 精确读取 31 次，之后改为轮询
+   `signal.value`，检查已经结束的历史同址读取是否仍拖慢 target write；
+4. `same address continuous`：reader 对 `target.value` 完成 31 次预读后继续同址轮询，测量
+   严格串行的同址 reader RMW 与 completion write。
+
+`atomicAdd(0)` 覆盖仓库基线 int64 atomic load，`atomicMax(INT64_MIN)` 覆盖 signed int64
+identity max 方案。target line、signal、epoch、ready、ack、每轮 timing 和每核结果各自占独立
+64 B cache line；只有 `target.neighbor` 被刻意放在 target line 的第二个 8 B word。writer 的
+结束时间复用生产 PA 的返回值依赖边界：同一个 inline asm 先消费 `AtomicExch` 返回值，再读取
+`SYS_CNT`；它表示返回值已经能被本核 scalar 使用，不额外插入 DSB，也不冒充跨核全局可见时刻。
+A5 上 `SYS_CNT` 为 1 ns/tick。
+
+2026-08-01 在 device 0 上，每种模式执行 3 次 launch × 256 轮，即每格 768 个 writer 样本。
+表中数值为 target `AtomicExch` 的 `p50 / p95`，单位 ns：
+
+| reader load | reader 数 | 异 64B line | 同 line 异 8B word | 同址 ×31 后离开 | 同地址持续串行 |
+|---|---:|---:|---:|---:|---:|
+| `atomicAdd(0)` | 1 | 359 / 451 | 190 / 198 | 359 / 455 | 377 / 413 |
+| `atomicMax(INT64_MIN)` | 1 | 358 / 454 | 190 / 260 | 358 / 451 | 381 / 412 |
+| `atomicAdd(0)` | 7 | 1406 / 1747 | 1295 / 1957 | 1400 / 1762 | 1294 / 1946 |
+| `atomicMax(INT64_MIN)` | 7 | 1399 / 1718 | 1303 / 1930 | 1311 / 1959 | 1353 / 1720 |
+
+单 reader 同地址持续串行时，writer 延迟呈明显双峰，而不是围绕一个均值连续抖动：
+
+| reader load | p10 | p25 | p50 | p75 | p95 | ≤224 ns | 225～319 ns | 320～383 ns | 384～447 ns |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `atomicAdd(0)` | 190 | 191 | 377 | 405 | 413 | 42.8% | 3.6% | 9.5% | 44.0% |
+| `atomicMax(INT64_MIN)` | 190 | 191 | 381 | 406 | 412 | 39.6% | 3.8% | 8.2% | 48.4% |
+
+同 line 异 word 对照没有这个双峰：`atomicAdd(0)` 的 96.6%、`atomicMax(INT64_MIN)`
+的 91.7% 样本都不超过 224 ns。它们是不同 atomic 地址，不进入 `target.value` 的同址严格
+串行顺序；本轮没有观察到“只要共 64 B cacheline 就让 writer 多排一个 atomic”的现象。
+
+1-reader 每种模式都精确完成 `23,808 = 3 × 1 × 256 × 31` 次预读和 768 次
+token observe；7-reader 每种模式都精确完成 `166,656 = 3 × 7 × 256 × 31`
+次预读和 5,376 次 observe。所有 reader timeout、writer ready/ack timeout、旧值错误和
+语义失败均为 0。
+
+本轮数据支持以下限定结论：
+
+- **同地址 atomic 严格串行。** 单 reader 数据对应两个主要队列状态：writer 前面没有 reader
+  atomic 时约 190 ns；前面已有一个 reader RMW 时约 400 ns。若把 `>319 ns` 粗分为已有同址
+  排队，`atomicAdd/atomicMax` 两组占比分别约 53.5%/56.6%，与实测 mean 306/314 ns 闭合。
+- 因而单 reader 的直观 writer 模型可写为
+  `T_write ≈ 190 ns + I(前面已有一个同址 RMW) × 210 ns`。若只需要数量级，写成
+  “约 200 ns / 约 400 ns 两档”比精确声称 `160 ns / 320 ns` 更符合本轮 exchange 数据；
+  后者可以作粗略倍数概念，但会低估本探针的两个峰值。
+- `target ×31 then away` 在 writer 计时窗内已经改为异 line 轮询；它和异 line 对照处于同一
+  延迟量级。因此，**已经返回并停止的 31 次同址 identity RMW load 不会留下可按 31 次累加的
+  writer residual penalty**。
+- 7-reader 时四种地址关系的 writer p50 都在 1.29～1.41 us。共 cacheline 没有额外变慢，
+  所以先前约 1.30 us 不能归因于 64 B line 冲突。这个量级与
+  `(7 readers + 1 writer) × 160 ns = 1.28 us` 接近，符合多路 atomic 共享执行资源的压力尺度；
+  但不同地址不进入同地址严格串行顺序，本探针也不把更上游资源臆断为某个 cache、bank 或互连结构。
+- `atomicAdd(0)` 与 `atomicMax(INT64_MIN)` 的双峰和并发方向一致，没有形成 opcode 级差异。
+
+用于当前 scalar 泳道的直观归因口径仍然是：
+
+```text
+T_poll_scalar_est_ns = fanin_flag_load_count × 160 ns
+31 次 fanin_flag_load ≈ 31 × 160 ns = 4.96 us
+```
+
+这个约 5 us 是 reader 自己执行 31 次 atomic load 的一阶 scalar 估算，不应再给 writer 机械增加
+另一份 5 us。若实际泳道证明多个 reader 在 completion write 当下仍同时 tight-poll，则应使用对应
+并发度的实测写入分布；不能把历史 poll 总次数乘以 160 ns 当作 writer delay。
+
+复现命令如下；默认不设置 `ATOMIC_PROBE_MODE` 时会顺序运行八种模式：
+
+```bash
+PTO_ISA_ROOT="$PWD/build/pto-isa" \
+  tests/atomic_probe/ccec/run_all.sh atomic_poll_exchange_contention build
+
+PTO_ISA_ROOT="$PWD/build/pto-isa" ATOMIC_PROBE_DEVICE=0 ATOMIC_PROBE_AIVS=2 \
+  tests/atomic_probe/ccec/run_all.sh atomic_poll_exchange_contention run
+
+PTO_ISA_ROOT="$PWD/build/pto-isa" ATOMIC_PROBE_DEVICE=0 ATOMIC_PROBE_AIVS=8 \
+  tests/atomic_probe/ccec/run_all.sh atomic_poll_exchange_contention run
+```
+
 ## 其余探针
 
 | 文件 | 类型 | 验证内容 |
@@ -536,6 +634,7 @@ cd tests/atomic_probe/ccec
 | `ccec/ld_dev_fanout_publish.cpp` | regression gating + timing | 唯一 writer 以 ordinary+DSB、st_dev+DSB、AtomicExch 三种方式逐轮发布；其余全部 AIV 只用 ld_dev 读取完整序列，并记录 writer/全读者周期 |
 | `ccec/atomic_scalar_pmu.cpp` | gating + PMU classification | 单 AIV dependent atomicAdd 完成延迟与同构 scalar control 对照；核实 atomic 等待是否计入 scalar busy |
 | `ccec/icache_scalar_pmu.cpp` | gating + PMU classification | 单 AIV 同一 target 的 WARM/COLD I-cache 对照；核实 miss 回填等待是否计入 scalar busy |
+| `ccec/atomic_poll_exchange_contention.cpp` | gating + controlled timing | 一写多读、四种地址关系、两种 identity RMW load；区分异 line、同 line 异 word、已结束 31 次同址预读和持续同址串行对 completion exchange 的影响 |
 | `ascendc/dcci_atomic_stress.asc` | legacy observation | 旧的混合 stress；不再作为 DCCI selector 语义证据 |
 | `ccec/dcci_clean_clobber.cpp` | gating | 有序 dirty/clean line 的 dcci clobber 与 control |
 | `ascendc/mb2_flags_clobber.asc` | gating + observation | AtomicMax flags 无丢失；store+dcci 仅统计 |

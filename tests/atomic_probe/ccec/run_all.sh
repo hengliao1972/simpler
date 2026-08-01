@@ -83,6 +83,7 @@ PROBES=(
     "st_dev_separate_line_stress.cpp:st_dev_separate_line_stress_kernel.o:st_dev_separate_line_stress_host.cpp:st_dev_separate_line_stress_host"
     "st_dev_single_core_stress.cpp:st_dev_single_core_stress_kernel.o:st_dev_single_core_stress_host.cpp:st_dev_single_core_stress_host"
     "ld_dev_fanout_publish.cpp:ld_dev_fanout_publish_kernel.o:ld_dev_fanout_publish_host.cpp:ld_dev_fanout_publish_host"
+    "atomic_poll_exchange_contention.cpp:atomic_poll_exchange_contention_kernel.o:atomic_poll_exchange_contention_host.cpp:atomic_poll_exchange_contention_host"
     "cacheline_matrix.cpp:cacheline_matrix_kernel.o:cacheline_matrix_host.cpp:cacheline_matrix_host"
     "taskcell_atomic_dcci.cpp:taskcell_atomic_dcci_kernel.o:taskcell_atomic_dcci_host.cpp:taskcell_atomic_dcci_host"
     "shared_tensor_map_visibility_probe.cpp:shared_tensor_map_visibility_probe_kernel.o:shared_tensor_map_visibility_probe_host.cpp:shared_tensor_map_visibility_probe_host"
@@ -446,6 +447,19 @@ run_one() {
         fi
         for probe_mode in "${probe_modes[@]}"; do
             echo "--- CCEC ld-dev fanout publish mode=$probe_mode ---"
+            if ! ATOMIC_PROBE_MODE="$probe_mode" \
+                timeout "$RUN_TIMEOUT" "$BUILD_DIR/$hb" "$BUILD_DIR/$ko"; then
+                probe_failures=$((probe_failures + 1))
+            fi
+        done
+    elif [[ "$tag" == "atomic_poll_exchange_contention_kernel" ]]; then
+        if [[ -n "${ATOMIC_PROBE_MODE:-}" ]]; then
+            probe_modes=("$ATOMIC_PROBE_MODE")
+        else
+            probe_modes=(0 1 2 3 4 5 6 7)
+        fi
+        for probe_mode in "${probe_modes[@]}"; do
+            echo "--- CCEC atomic-poll exchange contention mode=$probe_mode ---"
             if ! ATOMIC_PROBE_MODE="$probe_mode" \
                 timeout "$RUN_TIMEOUT" "$BUILD_DIR/$hb" "$BUILD_DIR/$ko"; then
                 probe_failures=$((probe_failures + 1))
