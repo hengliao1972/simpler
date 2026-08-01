@@ -1,10 +1,10 @@
 """Runtime-side assertions shared by the atomic minibench ST cases.
 
 The minibench environment variables are diagnostic controls, not correctness
-oracles by themselves.  A runtime that ignores ``PTO_DIST_DEPSIG`` or
-``PTO_DIST_TENSORMAP_MODE`` can therefore pass the numerical golden while the
-feature under test is absent.  This mixin makes the diagnostics observable and
-fails the case when the runtime does not report them.
+oracles by themselves. A runtime that ignores ``PTO_DIST_DEPSIG`` can
+therefore pass the numerical golden while the feature under test is absent.
+This mixin makes the diagnostics observable and fails the case when the
+runtime does not report them.
 
 The host simulator writes diagnostics to the captured process output.  On
 hardware, AICore ``fprintf`` output is normally flushed to the per-device CANN
@@ -33,9 +33,9 @@ _TMOPS_RE = re.compile(
 def _capture_host_fds():
     """Capture C/C++ writes for the standalone SceneTestCase entry point.
 
-    Pytest supplies ``capfd``.  ``python test_mb5_shared_map.py -p a5sim``
-    does not, but the runtime diagnostics still need to be checked rather than
-    silently skipped.  This narrow fallback only surrounds one worker run.
+    Pytest supplies ``capfd``. Direct-script runs do not, but the runtime
+    diagnostics still need to be checked rather than silently skipped. This
+    narrow fallback only surrounds one worker run.
     """
 
     captured = {"text": ""}
@@ -70,10 +70,9 @@ class _DistRecord:
 class DistRuntimeContractMixin:
     """Add runtime diagnostic checks to a ``SceneTestCase``.
 
-    The subclass may put a ``runtime_env`` mapping in a case.  It is merged
-    with the class-level ``RUNTIME_ENV`` for that case only.  This is used by
-    MB-5 to run private and shared with the identical graph, and by MB-7 to
-    sweep the run-ahead bound without relying on a shell-side environment.
+    The subclass may put a ``runtime_env`` mapping in a case. It is merged
+    with the class-level ``RUNTIME_ENV`` for that case only. MB-7 uses this to
+    sweep the run-ahead bound without relying on shell-side environment.
     """
 
     # MB-5 needs TMOPS on the host simulator.  TMOPS is intentionally a
@@ -190,8 +189,7 @@ class DistRuntimeContractMixin:
             self._dist_case_env = {}
 
             if not run_error:
-                default_mode = getattr(self, "RUNTIME_ENV", {}).get("PTO_DIST_TENSORMAP_MODE", self.DIST_DEFAULT_MODE)
-                expected_mode = case.get("runtime_env", {}).get("PTO_DIST_TENSORMAP_MODE", default_mode)
+                expected_mode = self.DIST_DEFAULT_MODE
                 if record.depsig is None:
                     raise AssertionError(
                         f"{type(self).__name__}/{case['name']} did not emit the runtime DEPSIG oracle; "
@@ -222,8 +220,8 @@ class DistRuntimeContractMixin:
             raise AssertionError("minibench runtime contract collected no case records")
 
         # Scheduling/throttling may change the winner, but not the dependency
-        # graph.  Group by reported mode so MB-5 can compare private/shared and
-        # MB-7 can compare multiple shared run-ahead settings.
+        # graph. Group by the reported artifact mode so repeated private
+        # run-ahead settings remain comparable.
         by_group_mode: dict[str, dict[str, set[tuple[str, int]]]] = {}
         for record in self._dist_records:
             assert record.depsig is not None
@@ -236,35 +234,15 @@ class DistRuntimeContractMixin:
         }
         if inconsistent:
             raise AssertionError(f"DEPSIG changed across identical minibench graphs: {inconsistent}")
-        for group, modes in by_group_mode.items():
-            if "private" in modes and "shared" in modes and modes["private"] != modes["shared"]:
-                raise AssertionError(
-                    f"private/shared DEPSIG mismatch for {group}: "
-                    f"private={modes['private']}, shared={modes['shared']}"
-                )
-
-        # The shared/private overhead distinction is the point of TMOPS.  Do
-        # not assert a fixed ratio because task grouping and core count vary;
-        # require positive work and, when both modes ran, fewer shared inserts.
-        tmops_by_group_mode: dict[str, dict[str, list[tuple[int, int, int]]]] = {}
+        # If a private minibench requests TMOPS, require positive work. Shared
+        # PA uses its dedicated schema-v5 tests and is not compared to this
+        # legacy private counter model.
         for record in self._dist_records:
             if record.tmops is None:
                 continue
-            mode, _cores, inserts, lookups, scans = record.tmops
+            _mode, _cores, inserts, lookups, scans = record.tmops
             if inserts <= 0 or lookups <= 0 or scans <= 0:
                 raise AssertionError(f"non-positive TensorMap counters in {record.case_name}: {record.tmops}")
-            tmops_by_group_mode.setdefault(record.oracle_group, {}).setdefault(mode, []).append(
-                (inserts, lookups, scans)
-            )
-        for group, modes in tmops_by_group_mode.items():
-            if "private" in modes and "shared" in modes:
-                private_inserts = min(v[0] for v in modes["private"])
-                shared_inserts = min(v[0] for v in modes["shared"])
-                if not shared_inserts < private_inserts:
-                    raise AssertionError(
-                        f"shared TensorMap did not reduce inserts for {group}: "
-                        f"private={private_inserts}, shared={shared_inserts}"
-                    )
 
     def test_run(self, st_platform, st_worker, request, capfd):
         self._dist_records = []

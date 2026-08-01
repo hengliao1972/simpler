@@ -15,6 +15,7 @@
 #include <cstdint>
 
 #include "dist_engine/common/target.h"
+#include "dist_engine/common/swimlane_types.h"
 
 #include "dist_engine/dist_engine.h"
 #include "common/core_type.h"
@@ -38,8 +39,12 @@ constexpr int32_t kPrivateSlots = 4;
 constexpr int32_t kWonReserve = 2;
 constexpr int32_t kMaxFanin = 16;
 constexpr int32_t kMapCap = 16384;
-constexpr uint32_t kMapBucketCapacity = kFdwicTensorMapRingCap;
-constexpr uint32_t kMapBuckets = kFdwicTensorMapRingBuckets;
+// DistCore keeps its historical private-map bytes in both artifacts so the
+// AICPU lifecycle and following core offsets stay frozen. Shared PA never
+// reads this storage; these two constants describe only that physical ABI and
+// therefore must not use the shared build-identity fields (which are zero).
+constexpr uint32_t kMapBucketCapacity = static_cast<uint32_t>(PTO_FDWIC_TENSORMAP_RING_CAP);
+constexpr uint32_t kMapBuckets = static_cast<uint32_t>(kMapCap) / kMapBucketCapacity;
 constexpr uint32_t kMapBaseControlBuckets = 128;
 constexpr uint32_t kMapBucketSlotMask = kMapBucketCapacity - 1;
 constexpr uint32_t kMapBucketMask = kMapBuckets - 1;
@@ -163,7 +168,20 @@ enum class TracePhase : int32_t {
     FinalDrain = 17,
     WinnerBuild = 18,
     AllocComplete = 19,
+#if PTO_FDWIC_SHARED_MAP
+    SharedRegisterPublishMetadata = 20,
+    SharedMaterializePublishTaskOutputs = 21,
+    SharedMaterializePublishTaskOutputsCopy = 22,
+    SharedMaterializePublishTaskOutputsFlush = 23,
+    Dcci = 24,
+    SharedRegisterWaitInsertTurnBypassLoad = 25,
+    Count = 26,
+    // Kept only so stale private code remains parsable during the compile-time
+    // backend split. The selected raw ABI rejects this value in shared mode.
+    LoserReplay = 0x7fff,
+#else
     LoserReplay = 20,
+#endif
 };
 
 struct RingSlot {
@@ -313,103 +331,138 @@ struct PaddedCursor {
 };
 static_assert(sizeof(PaddedCursor) == kCacheLine, "PaddedCursor must occupy one cacheline");
 
-// shared TensorMap 与 private 共用 bucket/CAP/hash/逻辑 region 语义，但不
-// 借用 private MapEntry 的 16B ABI reserve。专属 32B value 的 reserved
-// 必须由 writer 写 0、reader 校验 0，协议字段边界与 standalone 一致。
-struct SharedTensorMapValue {
-    uint64_t buf_addr;
-    uint64_t lo;
-    uint64_t hi;
-    int32_t producer;
+// Phase-1 shared PA is deliberately narrower than the private region map:
+// exactly one Alloc+QK+SF+PV+UP group per batch and at most 256 batches.
+// There is no task-id generation or wrap in this contract.
+constexpr uint32_t kFdwicSharedPaBatches = 256;
+constexpr uint32_t kFdwicSharedPaTasksPerBatch = 5;
+constexpr uint32_t kFdwicSharedPaTaskCapacity = kFdwicSharedPaBatches * kFdwicSharedPaTasksPerBatch;
+constexpr uint32_t kFdwicSharedOutputMaxPerTask = 8;
+constexpr uint32_t kFdwicSharedHeapShards = 8;
+constexpr uint32_t kFdwicSharedVectorCursorShards = 8;
+constexpr uint64_t kFdwicSharedHeapBytes = 256ULL << 20;
+constexpr uint64_t kFdwicSharedHeapShardBytes = kFdwicSharedHeapBytes / kFdwicSharedHeapShards;
+constexpr uint32_t kFdwicSharedWriterHistoryMagic = 0x57484953U;  // "WHIS"
+
+static_assert(kFdwicSharedPaTaskCapacity == 1280, "phase-1 shared PA task capacity changed");
+static_assert(kFdwicSharedWorkers == 96, "phase-1 shared PA worker topology changed");
+static_assert(
+    kFdwicSharedAllocClaimTournamentGroups <= kFdwicSharedWorkers &&
+        kFdwicSharedAicClaimTournamentGroups <= kFdwicSharedAicWorkers &&
+        kFdwicSharedAivClaimTournamentGroups <= kFdwicSharedAivWorkers,
+    "every shared Claim tournament group must have a candidate"
+);
+static_assert(kFdwicSharedHeapShardBytes == (32ULL << 20), "shared PA heap shard size changed");
+static_assert(
+    (kFdwicSharedHeapShards & (kFdwicSharedHeapShards - 1U)) == 0,
+    "shared PA heap shards must be a power of two"
+);
+static_assert(
+    (kFdwicSharedVectorCursorShards & (kFdwicSharedVectorCursorShards - 1U)) == 0,
+    "shared PA Vector cursor shards must be a power of two"
+);
+
+// Fresh outputs are addressed directly by (producer_task_id, output_slot).
+// Publication flags, writer caches, and immutable Tensor descriptors occupy
+// disjoint cache-line regions.
+struct alignas(kCacheLine) SharedOutputCell {
+    PaddedCursor published[kFdwicSharedOutputMaxPerTask];
+    PaddedCursor last_writer[kFdwicSharedOutputMaxPerTask];
+    Tensor tensors[kFdwicSharedOutputMaxPerTask];
+};
+static_assert(sizeof(SharedOutputCell) == 2048, "shared output cell size changed");
+static_assert(alignof(SharedOutputCell) == kCacheLine, "shared output cell alignment changed");
+static_assert(offsetof(SharedOutputCell, published) == 0, "shared output publish offset changed");
+static_assert(offsetof(SharedOutputCell, last_writer) == 512, "shared output writer offset changed");
+static_assert(offsetof(SharedOutputCell, tensors) == 1024, "shared output descriptor offset changed");
+
+struct SharedWriterHistoryRecord {
+    uint32_t symbol_key;
+    int32_t previous_writer;
+};
+static_assert(sizeof(SharedWriterHistoryRecord) == 8, "shared writer-history record size changed");
+
+// One immutable payload belongs to one writer task. PA-UP writes three
+// records; the physical capacity remains MAX_TENSOR_ARGS for strict checking.
+struct alignas(kCacheLine) SharedWriterHistoryCell {
+    uint32_t magic;
+    int32_t writer_task;
+    uint32_t count;
     uint32_t reserved;
+    SharedWriterHistoryRecord entries[MAX_TENSOR_ARGS];
+    uint8_t padding[48];
 };
-static_assert(sizeof(SharedTensorMapValue) == 32, "shared TensorMap logical value size changed");
-static_assert(offsetof(SharedTensorMapValue, buf_addr) == 0, "shared TensorMap buffer offset changed");
-static_assert(offsetof(SharedTensorMapValue, lo) == 8, "shared TensorMap lower-bound offset changed");
-static_assert(offsetof(SharedTensorMapValue, hi) == 16, "shared TensorMap upper-bound offset changed");
-static_assert(offsetof(SharedTensorMapValue, producer) == 24, "shared TensorMap producer offset changed");
-static_assert(offsetof(SharedTensorMapValue, reserved) == 28, "shared TensorMap reserve offset changed");
-
-// payload 与发布 seq 必须分处独占 cache line。A5 的 atomic seq 访问和
-// 普通 payload cache writeback 若落在同一行，可能互相覆盖；两行分离后，
-// writer 可按“payload flush -> seq publish”建立明确的跨核可见性边界。
-struct alignas(kCacheLine) SharedTensorMapPayloadLine {
-    SharedTensorMapValue value;
-    uint8_t pad[kCacheLine - sizeof(SharedTensorMapValue)];
-};
-static_assert(sizeof(SharedTensorMapPayloadLine) == kCacheLine, "shared TensorMap payload must occupy one cacheline");
-static_assert(offsetof(SharedTensorMapPayloadLine, value) == 0, "shared TensorMap payload value offset changed");
-
-struct alignas(kCacheLine) SharedTensorMapSequenceLine {
-    volatile int64_t v;
-    uint8_t pad[kCacheLine - sizeof(int64_t)];
-};
-static_assert(offsetof(SharedTensorMapSequenceLine, v) == 0, "shared TensorMap sequence value offset changed");
-static_assert(sizeof(SharedTensorMapSequenceLine) == kCacheLine, "shared TensorMap sequence must occupy one cacheline");
-
-struct alignas(kCacheLine) SharedTensorMapSlot {
-    SharedTensorMapPayloadLine payload;
-    SharedTensorMapSequenceLine sequence;
-};
-static_assert(sizeof(SharedTensorMapSlot) == 2 * kCacheLine, "shared TensorMap slot size changed");
+static_assert(sizeof(SharedWriterHistoryCell) == 320, "shared writer-history cell size changed");
+static_assert(alignof(SharedWriterHistoryCell) == kCacheLine, "shared writer-history cell alignment changed");
 static_assert(
-    offsetof(SharedTensorMapSlot, sequence) == kCacheLine,
-    "shared TensorMap sequence must not share the payload cacheline"
+    offsetof(SharedWriterHistoryCell, entries) == 16,
+    "shared writer-history records must immediately follow their header"
 );
 
-constexpr int64_t kSharedTensorMapInvalidSequence = -1;
-// writer 必须先用 CAS 从旧 lap seq 取得 WRITING 所有权，再修改 payload。
-// 不能复用 -1：首圈 expected_old 本来就是 -1，CAS(-1,-1) 无法排除非法
-// 双 writer。有效 absolute cursor 恒非负，因此 INT64_MIN 可作为独立哨兵。
-constexpr int64_t kSharedTensorMapWritingSequence = (-9223372036854775807LL - 1);
-constexpr int64_t kSharedTensorMapInitialCommit = 0;
-constexpr int64_t kSharedTensorMapInitialReclaim = -1;
-
-struct alignas(kCacheLine) SharedTensorMapBucketState {
-    PaddedCursor head;
-    PaddedCursor tail;
+// Every task owns fresh, never-reused Claim nodes. All legal candidates first
+// contend on one of G local nodes; only each local winner reaches the root.
+// The 512B stride is the A5 probe-selected address spacing and keeps the hot
+// atomic word isolated from descriptor/history cache lines.
+struct alignas(kCacheLine) SharedClaimTournamentNode {
+    PaddedCursor owner;
+    uint8_t padding[kFdwicSharedClaimTournamentNodeStride - sizeof(PaddedCursor)];
 };
-static_assert(sizeof(SharedTensorMapBucketState) == 2 * kCacheLine, "shared TensorMap bucket controls changed");
 static_assert(
-    offsetof(SharedTensorMapBucketState, tail) == kCacheLine,
-    "shared TensorMap head and tail must not share a cacheline"
+    sizeof(SharedClaimTournamentNode) == kFdwicSharedClaimTournamentNodeStride,
+    "shared Claim tournament node stride changed"
+);
+static_assert(offsetof(SharedClaimTournamentNode, owner) == 0);
+
+struct alignas(kCacheLine) SharedClaimTournamentTask {
+    SharedClaimTournamentNode root;
+    SharedClaimTournamentNode local[kFdwicSharedClaimTournamentMaxGroups];
+};
+static_assert(
+    sizeof(SharedClaimTournamentTask) ==
+        kFdwicSharedClaimTournamentNodeStride * (1U + kFdwicSharedClaimTournamentMaxGroups),
+    "shared per-task Claim tournament layout changed"
+);
+static_assert(
+    offsetof(SharedClaimTournamentTask, local) == kFdwicSharedClaimTournamentNodeStride,
+    "shared Claim local nodes must follow the root"
 );
 
-struct alignas(kCacheLine) SharedTensorMapState {
-    // committed_tasks 是下一个允许发布的 task id；即使任务没有 region，
-    // ordered commit 也必须从 N 推进到 N+1。
-    PaddedCursor committed_tasks;
-    // 已可回收的最大 producer id，初值 -1。只有 exact-turn winner 会
-    // 访问 map，因此在完成 task N lookup 后可直接用 N-H-1 单调推进；
-    // loser 不读 map，也不需要 per-core progress。
-    PaddedCursor reclaim_upto;
-    // 每桶 head/tail 各占一行且彼此相邻。第一版采用 task-id 有序单
-    // 追加者，因而不需要 MPSC reserve 游标或全局 free-list。
-    SharedTensorMapBucketState buckets[kMapBuckets];
-    // 与 private 完全相同的连续分桶下标：
-    // bucket * CAP + (absolute_cursor & (CAP - 1))。
-    SharedTensorMapSlot slots[kMapCap];
+// The old shared region ring is intentionally absent. Phase 1 keeps only
+// stable output symbols, no-wrap heap controls, immutable writer history, and
+// the per-task two-level Claim tournament.
+struct alignas(kCacheLine) SharedPaTensorMapState {
+    SharedOutputCell shared_outputs[kFdwicSharedPaTaskCapacity];
+    PaddedCursor shared_heap_cursor[kFdwicSharedHeapShards];
+    PaddedCursor shared_heap_vend;
+    PaddedCursor shared_vector_cursor[kFdwicSharedVectorCursorShards];
+    SharedWriterHistoryCell writer_history[kFdwicSharedPaTaskCapacity];
+    SharedClaimTournamentTask claim_tournament[kFdwicSharedPaTaskCapacity];
 };
-static_assert(offsetof(SharedTensorMapState, committed_tasks) == 0);
-static_assert(offsetof(SharedTensorMapState, reclaim_upto) == kCacheLine);
-static_assert(offsetof(SharedTensorMapState, buckets) == 2 * kCacheLine);
-static_assert(
-    offsetof(SharedTensorMapState, slots) == 2 * kCacheLine + sizeof(SharedTensorMapBucketState) * kMapBuckets,
-    "shared TensorMap slots must immediately follow bucket controls"
-);
-static_assert(sizeof(SharedTensorMapState) % kCacheLine == 0);
-#if PTO_FDWIC_TENSORMAP_RING_CAP == 128
-static_assert(offsetof(SharedTensorMapState, buckets) == 128);
-static_assert(offsetof(SharedTensorMapState, slots) == 16512);
-static_assert(sizeof(SharedTensorMapState) == 2113664);
-#endif
+static_assert(offsetof(SharedPaTensorMapState, shared_outputs) == 0);
+static_assert(offsetof(SharedPaTensorMapState, shared_heap_cursor) == 2621440);
+static_assert(offsetof(SharedPaTensorMapState, shared_heap_vend) == 2621952);
+static_assert(offsetof(SharedPaTensorMapState, shared_vector_cursor) == 2622016);
+static_assert(offsetof(SharedPaTensorMapState, writer_history) == 2622528);
+static_assert(offsetof(SharedPaTensorMapState, claim_tournament) == 3032128);
+static_assert(sizeof(SharedPaTensorMapState) == 8930368, "shared PA TensorMap sidecar size changed");
+static_assert(alignof(SharedPaTensorMapState) == kCacheLine, "shared PA TensorMap alignment changed");
 
 struct DistTaskCell {
     volatile int64_t flag;
     volatile uint64_t vend;
+#if PTO_FDWIC_SHARED_MAP
+    // Winner N publishes N only after descriptors and writer metadata are
+    // visible. Winner N+1 waits on this exact cell; losers never hand off.
+    volatile int64_t deps_prepared;
+    uint8_t pad[kCacheLine - 3 * sizeof(int64_t)];
+#else
     uint8_t pad[kCacheLine - sizeof(int64_t) - sizeof(uint64_t)];
+#endif
 };
 static_assert(sizeof(DistTaskCell) == kCacheLine);
+#if PTO_FDWIC_SHARED_MAP
+static_assert(offsetof(DistTaskCell, deps_prepared) == 16, "shared dependency handoff offset changed");
+#endif
 
 struct alignas(kCacheLine) FinalBarrierArrival {
     volatile int64_t v;
@@ -477,9 +530,9 @@ struct DistGlobal {
     // grows for the fixed two-level G=16 final barrier.
     FinalBarrierState final_barrier;
 #if PTO_FDWIC_SHARED_MAP
-    // shared 专属 sidecar 只追加在旧 DistGlobal 尾部；private artifact 不
-    // 实例化这 2MiB 状态，且所有旧热字段与 per-core map offset 均不移动。
-    SharedTensorMapState shared_tensor_map;
+    // The shared-only state starts at the frozen private tail. Existing
+    // AICPU/native fields and per-core offsets remain unchanged.
+    SharedPaTensorMapState shared_pa;
 #endif
 };
 static_assert(offsetof(DistGlobal, frontier) % 64 == 0, "DistGlobal frontier must be cacheline-aligned");
@@ -497,8 +550,8 @@ static_assert(
     offsetof(DistGlobal, final_barrier) % 64 == 0, "DistGlobal final barrier must be cacheline-aligned"
 );
 
-// 68f51451 已冻结的 private DistGlobal 尾边界。shared sidecar 只能从该
-// offset 追加，不能把 mode-specific 字段插进旧热布局。
+// 68f51451 froze the private DistGlobal tail. Mode-specific state may append
+// here but must not move the AICPU/native prefix.
 constexpr size_t kFdwicSharedTensorMapOffset = 1007026048;
 static_assert(
     offsetof(DistGlobal, final_barrier) + sizeof(FinalBarrierState) == kFdwicSharedTensorMapOffset,
@@ -506,12 +559,12 @@ static_assert(
 );
 #if PTO_FDWIC_SHARED_MAP
 static_assert(
-    offsetof(DistGlobal, shared_tensor_map) == kFdwicSharedTensorMapOffset,
-    "shared TensorMap sidecar must append after the frozen DistGlobal tail"
+    offsetof(DistGlobal, shared_pa) == kFdwicSharedTensorMapOffset,
+    "shared PA TensorMap sidecar must append after the frozen DistGlobal tail"
 );
 static_assert(
-    sizeof(DistGlobal) == kFdwicSharedTensorMapOffset + sizeof(SharedTensorMapState),
-    "shared DistGlobal may only grow by its TensorMap sidecar"
+    sizeof(DistGlobal) == 1015956416,
+    "shared DistGlobal must contain exactly the phase-1 PA TensorMap and Claim sidecar"
 );
 #else
 static_assert(

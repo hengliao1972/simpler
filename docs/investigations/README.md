@@ -84,6 +84,7 @@ that ...".
 
 Newest first.
 
+- [2026-07 — Shared PA Case1: standalone 2.3 ms is not an equivalent baseline; five micro-optimizations dropped](2026-07-shared-pa-case1-performance-gap.md)
 - [2026-07 — fdwic: removing `RingSlot::scalars` from submit slot build](2026-07-fdwic-ring-slot-scalar-copy.md)
 - [2026-06 — Replacing COND with GM+dcci for AICore→AICPU notification](2026-06-cond-vs-gm-notification.md)
 - [2026-06 — Letting AICore directly read or write the SPR MMIO window](2026-06-aicore-mmio-to-spr.md)

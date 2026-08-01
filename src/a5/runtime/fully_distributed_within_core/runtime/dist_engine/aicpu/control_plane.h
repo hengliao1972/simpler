@@ -25,6 +25,50 @@ int32_t dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int n
         DIST_ERRF("[dist_engine] invalid runtime/worker configuration: runtime=%p workers=%d\n", runtime, num_workers);
         return runtime_status_from_error_codes(PTO2_ERROR_DIST_CONFIG_INVALID, PTO2_ERROR_NONE);
     }
+#if PTO_FDWIC_SHARED_MAP
+    // The shared PA backend deliberately supports one fixed deployment shape.
+    // Reject it before writing DistGlobal so a mismatched launch cannot publish
+    // a partially initialized shared backend to any worker.
+    constexpr int32_t kSharedPaExpectedAicWorkers = 32;
+    constexpr int32_t kSharedPaExpectedAivWorkers = 64;
+    constexpr int32_t kSharedPaExpectedWorkers = kSharedPaExpectedAicWorkers + kSharedPaExpectedAivWorkers;
+    if (rt->gm_heap_size != kFdwicSharedHeapBytes) {
+        DIST_ERRF(
+            "[dist_engine] shared PA requires a fixed 256 MiB GM heap: bytes=%llu expected=%llu\n",
+            static_cast<unsigned long long>(rt->gm_heap_size), static_cast<unsigned long long>(kFdwicSharedHeapBytes)
+        );
+        return runtime_status_from_error_codes(PTO2_ERROR_DIST_CONFIG_INVALID, PTO2_ERROR_NONE);
+    }
+    if (num_workers != kSharedPaExpectedWorkers) {
+        DIST_ERRF("[dist_engine] shared PA requires 96 workers (32 AIC + 64 AIV): workers=%d\n", num_workers);
+        return runtime_status_from_error_codes(PTO2_ERROR_DIST_CONFIG_INVALID, PTO2_ERROR_NONE);
+    }
+    int32_t shared_aic_workers = 0;
+    int32_t shared_aiv_workers = 0;
+    for (int32_t i = 0; i < num_workers; ++i) {
+        const CoreType core_type = runtime->workers[i].core_type;
+        if (core_type == CoreType::AIC) {
+            ++shared_aic_workers;
+        } else if (core_type == CoreType::AIV) {
+            ++shared_aiv_workers;
+        } else {
+            DIST_ERRF(
+                "[dist_engine] shared PA worker %d has invalid core type %d\n", i, static_cast<int32_t>(core_type)
+            );
+            return runtime_status_from_error_codes(PTO2_ERROR_DIST_CONFIG_INVALID, PTO2_ERROR_NONE);
+        }
+    }
+    // The topology builder below maps AIC[n], AIV[2n], and AIV[2n+1] to
+    // block n. Exact 32/64 role counts therefore establish 32 complete
+    // 1-AIC + 2-AIV blocks without changing the existing mapping rule.
+    if (shared_aic_workers != kSharedPaExpectedAicWorkers || shared_aiv_workers != kSharedPaExpectedAivWorkers) {
+        DIST_ERRF(
+            "[dist_engine] shared PA requires 32 complete 1-AIC + 2-AIV blocks: AIC=%d AIV=%d\n", shared_aic_workers,
+            shared_aiv_workers
+        );
+        return runtime_status_from_error_codes(PTO2_ERROR_DIST_CONFIG_INVALID, PTO2_ERROR_NONE);
+    }
+#endif
     int32_t configured_history = kHDefault;
     if (const char *e = getenv("PTO_DIST_H")) {
         if (!dist_parse_history_window(e, kTaskWindow - 2, configured_history)) {
@@ -34,6 +78,19 @@ int32_t dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int n
             return runtime_status_from_error_codes(PTO2_ERROR_DIST_CONFIG_INVALID, PTO2_ERROR_NONE);
         }
     }
+#if PTO_FDWIC_SHARED_MAP
+    // A phase-1 PA group is Alloc,QK,SF,PV,UP.  UP reads the Alloc symbols at
+    // distance four, so a smaller history window would silently omit a real
+    // fan-in edge instead of merely reducing retained history.
+    constexpr int32_t kSharedPaMinimumHistory = 4;
+    if (configured_history < kSharedPaMinimumHistory) {
+        DIST_ERRF(
+            "[dist_engine] shared PA requires PTO_DIST_H >= %d to cover UP -> Alloc: H=%d\n",
+            kSharedPaMinimumHistory, configured_history
+        );
+        return runtime_status_from_error_codes(PTO2_ERROR_DIST_CONFIG_INVALID, PTO2_ERROR_NONE);
+    }
+#endif
 
     g_dist_ptr = reinterpret_cast<DistGlobal *>(rt->dist_global);
     g_dist.heap_base = static_cast<uint8_t *>(rt->gm_heap);
@@ -68,11 +125,9 @@ int32_t dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int n
     g_dist.final_barrier.root_arrival.expected = 0;
     atomic_exchange(g_dist.final_barrier.root_release.v, int64_t{0}, __ATOMIC_RELAXED);
 #if PTO_FDWIC_SHARED_MAP
-    // The upper backend-ready gate still rejects normal shared execution before
-    // the first Submit. Keep one-time initialization on the real AICPU setup
-    // path so enabling the backend needs no second reset path; worker reset must
-    // never clear this global single copy concurrently.
-    dist_shared_tensor_map_reset(g_dist.shared_tensor_map);
+    // This is the sole reset point for the global shared PA sidecar. Workers
+    // only attach after AICPU publishes the initialized runtime.
+    dist_shared_pa_tensor_map_reset(g_dist.shared_pa);
 #endif
     g_dist.orch_args = orch_args;
     g_dist.rt = rt;

@@ -37,6 +37,7 @@ from conftest import _configure_fdwic_profile, _configure_fdwic_tensormap
 from simpler_setup.scene_test import (
     _aicore_override_cache,
     _assert_fdwic_perf_clock_elf,
+    _assert_fdwic_shared_pa_role_entries,
     _assert_fdwic_submit_pmu_elf,
     _assert_fdwic_submit_pmu_host_elf,
     _assert_fdwic_swimlane_elf,
@@ -1006,6 +1007,77 @@ def test_swimlane_elf_gate_accepts_merged_phase_atomic_observer(monkeypatch, tmp
     _assert_fdwic_swimlane_elf(tmp_path / "aicore_kernel.o")
 
 
+def test_shared_pa_role_entry_gate_accepts_two_exact_role_entries(monkeypatch, tmp_path):
+    symbol_table = (
+        "1: 0000000000001000 64 FUNC WEAK DEFAULT 1 aicpu_orchestration_entry_aic\n"
+        "2: 0000000000002000 64 FUNC WEAK DEFAULT 1 aicpu_orchestration_entry_aiv\n"
+        "3: 0000000000003000 30 OBJECT LOCAL DEFAULT 2 __FUNCTION__.aicpu_orchestration_entry_aic\n"
+        "4: 0000000000000008 8 OBJECT LOCAL DEFAULT 17 _ZL6g_self\n"
+        "5: 0000000000000010 8 OBJECT LOCAL DEFAULT 17 _ZL10g_dist_ptr\n"
+    )
+    monkeypatch.setattr(
+        _scene_test_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=symbol_table, stderr=""),
+    )
+
+    _assert_fdwic_shared_pa_role_entries(tmp_path / "aicore_kernel.o")
+
+
+@pytest.mark.parametrize(
+    ("symbol_table", "message"),
+    [
+        (
+            "1: 0 64 FUNC WEAK DEFAULT 1 aicpu_orchestration_entry_aic\n",
+            "aicpu_orchestration_entry_aiv=0",
+        ),
+        (
+            "1: 0 64 FUNC WEAK DEFAULT 1 aicpu_orchestration_entry_aic\n"
+            "2: 0 64 FUNC WEAK DEFAULT 1 aicpu_orchestration_entry_aic\n"
+            "3: 0 64 FUNC WEAK DEFAULT 1 aicpu_orchestration_entry_aiv\n",
+            "aicpu_orchestration_entry_aic=2",
+        ),
+        (
+            "1: 0 64 FUNC WEAK DEFAULT 1 aicpu_orchestration_entry_aic\n"
+            "2: 0 64 FUNC WEAK DEFAULT 1 aicpu_orchestration_entry_aiv\n"
+            "3: 8 8 OBJECT LOCAL DEFAULT 17 _ZL6g_self\n"
+            "4: 16 8 OBJECT LOCAL DEFAULT 17 _ZL10g_dist_ptr\n"
+            "5: 72 8 OBJECT LOCAL DEFAULT 17 _ZL6g_self\n"
+            "6: 80 8 OBJECT LOCAL DEFAULT 17 _ZL10g_dist_ptr\n",
+            "expected exactly one attached runtime state.*g_self=2, g_dist_ptr=2",
+        ),
+        (
+            "1: 0 64 FUNC WEAK DEFAULT 1 aicpu_orchestration_entry_aic\n"
+            "2: 0 64 FUNC WEAK DEFAULT 1 aicpu_orchestration_entry_aiv\n"
+            "3: 0 64 FUNC WEAK DEFAULT 1 aicpu_orchestration_entry\n"
+            "4: 8 8 OBJECT LOCAL DEFAULT 17 _ZL6g_self\n"
+            "5: 16 8 OBJECT LOCAL DEFAULT 17 _ZL10g_dist_ptr\n",
+            "generic aicpu_orchestration_entry is still present",
+        ),
+        (
+            "1: 0 64 FUNC WEAK DEFAULT 1 aicpu_orchestration_entry_aic\n"
+            "2: 0 64 FUNC WEAK DEFAULT 1 aicpu_orchestration_entry_aiv\n"
+            "3: 8 8 OBJECT LOCAL DEFAULT 17 _ZL6g_self\n"
+            "4: 16 8 OBJECT LOCAL DEFAULT 17 _ZL10g_dist_ptr\n"
+            "5: 24 8 OBJECT LOCAL DEFAULT 17 _ZL23g_fdwic_perf_clock_core\n"
+            "6: 32 8 OBJECT LOCAL DEFAULT 17 _ZL23g_fdwic_perf_clock_core\n",
+            "duplicate role-local worker state.*g_fdwic_perf_clock_core=2",
+        ),
+    ],
+)
+def test_shared_pa_role_entry_gate_rejects_incomplete_or_deduplicated_image(
+    monkeypatch, tmp_path, symbol_table, message
+):
+    monkeypatch.setattr(
+        _scene_test_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=symbol_table, stderr=""),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        _assert_fdwic_shared_pa_role_entries(tmp_path / "aicore_kernel.o")
+
+
 @pytest.mark.parametrize(
     ("symbol_table", "message"),
     [
@@ -1110,7 +1182,11 @@ def test_standalone_shared_tensormap_rejects_mixed_runtime_or_l3_classes():
     fdwic_l2 = type(
         "FdwicL2",
         (),
-        {"_st_level": 2, "_st_runtime": "fully_distributed_within_core"},
+        {
+            "_st_level": 2,
+            "_st_runtime": "fully_distributed_within_core",
+            "FDWIC_SHARED_SUPPORTED_CASES": frozenset({"Case1"}),
+        },
     )
     fdwic_l3 = type(
         "FdwicL3",
@@ -1118,11 +1194,30 @@ def test_standalone_shared_tensormap_rejects_mixed_runtime_or_l3_classes():
         {"_st_level": 3, "_st_runtime": "fully_distributed_within_core"},
     )
     other_l2 = type("OtherL2", (), {"_st_level": 2, "_st_runtime": "host_build_graph"})
+    case1 = {"name": "Case1"}
 
-    _validate_fdwic_tensormap_test_classes("private", [fdwic_l3, other_l2])
-    _validate_fdwic_tensormap_test_classes("shared", [fdwic_l2])
+    _validate_fdwic_tensormap_test_classes("private", {fdwic_l3: [case1], other_l2: [case1]})
+    _validate_fdwic_tensormap_test_classes("shared", {fdwic_l2: [case1]})
     with pytest.raises(ValueError, match=r"FdwicL3, OtherL2"):
-        _validate_fdwic_tensormap_test_classes("shared", [fdwic_l2, other_l2, fdwic_l3])
+        _validate_fdwic_tensormap_test_classes(
+            "shared",
+            {fdwic_l2: [case1], other_l2: [case1], fdwic_l3: [case1]},
+        )
+    with pytest.raises(ValueError, match=r"FdwicL2::Case2"):
+        _validate_fdwic_tensormap_test_classes("shared", {fdwic_l2: [{"name": "Case2"}]})
+
+
+def test_shared_tensormap_uses_mode_local_pa_block_dim(monkeypatch):
+    case = _scene_test_module.SceneTestCase()
+    case._st_level = 2
+    case._st_runtime = "fully_distributed_within_core"
+    config_dict = {"block_dim": 0, "fdwic_shared_block_dim": 32}
+
+    monkeypatch.setenv("PTO_FDWIC_TENSORMAP_MODE", "shared")
+    assert case._build_config(config_dict).block_dim == 32
+
+    monkeypatch.delenv("PTO_FDWIC_TENSORMAP_MODE", raising=False)
+    assert case._build_config(config_dict).block_dim == 0
 
 
 @pytest.mark.parametrize(
@@ -1187,9 +1282,9 @@ def test_strict_fdwic_v4_converter_propagates_validation_failure(monkeypatch, tm
         _run_swimlane_converter(input_path=raw, strict_fdwic_v4=True)
 
 
-def test_strict_fdwic_v4_case_requires_raw_artifact(tmp_path):
-    with pytest.raises(RuntimeError, match="required FDWIC schema-v4 raw artifact was not produced"):
-        _convert_case_swimlane("Case", tmp_path, strict_fdwic_v4=True)
+def test_strict_fdwic_case_requires_raw_artifact(tmp_path):
+    with pytest.raises(RuntimeError, match="required FDWIC raw artifact was not produced"):
+        _convert_case_swimlane("Case", tmp_path, strict_fdwic=True)
 
 
 def test_device_failure_keeps_original_error_and_disables_strict_conversion(monkeypatch, tmp_path):
@@ -1207,7 +1302,7 @@ def test_device_failure_keeps_original_error_and_disables_strict_conversion(monk
     monkeypatch.setattr(
         _scene_test_module,
         "_convert_case_swimlane",
-        lambda *args, strict_fdwic_v4=False, **kwargs: strict_values.append(strict_fdwic_v4),
+        lambda *args, strict_fdwic=False, **kwargs: strict_values.append(strict_fdwic),
     )
 
     with pytest.raises(ValueError, match="device execution failed"):

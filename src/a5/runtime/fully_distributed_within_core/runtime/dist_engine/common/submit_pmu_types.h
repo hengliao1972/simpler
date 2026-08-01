@@ -55,13 +55,15 @@ enum class FdwicSubmitPmuPhase : uint16_t {
     // 引入的空区间经验观察指纹，不代表任何业务 phase 或数学最小值。
     EmptyBracket = 2,
     // 当前泳道 Materialize.begin 到 Materialize.end：task-cap 检查与
-    // dist_submit_materialize_args 主体；每个 Submit 固定调用一次。
+    // dist_submit_materialize_args 主体。private 每个 Submit 固定调用一次；
+    // shared compete-first 只有 task winner 调用。
     Materialize = 3,
     // 当前泳道 Claim.begin 到 Claim.end：compete-first 还包含 Claim 前的
     // task-cap 检查；每个 Submit 固定调用一次。
     Claim = 4,
     // dist_submit_register_outputs() 调用入口到返回。刻意排除前一阶段
-    // record 发布和 caller 衔接；每个 Submit 固定调用一次。
+    // record 发布和 caller 衔接。private 每个 Submit 固定调用一次；
+    // shared compete-first 只有 task winner 调用。
     Register = 5,
     // 上一次 Submit 返回前到下一次 dist_submit_begin() 完成。首个 Submit
     // 没有前驱、末个 Submit 没有后继，因此每核固定 expected_submits - 1 次。
@@ -123,7 +125,11 @@ constexpr uint16_t fdwic_submit_pmu_mode_for_phase(FdwicSubmitPmuPhase phase) {
 }
 
 PTO_DEVICE_FUNC constexpr bool fdwic_submit_pmu_phase_has_dynamic_calls(FdwicSubmitPmuPhase phase) {
-    return phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild ||
+    return
+#if PTO_FDWIC_SHARED_MAP
+           phase == FdwicSubmitPmuPhase::Materialize || phase == FdwicSubmitPmuPhase::Register ||
+#endif
+           phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild ||
            phase == FdwicSubmitPmuPhase::AllocComplete || phase == FdwicSubmitPmuPhase::LoserReplay;
 }
 
@@ -148,6 +154,12 @@ constexpr uint32_t fdwic_submit_pmu_batch_count(uint32_t expected_submits) {
 }
 
 constexpr uint64_t fdwic_submit_pmu_expected_dynamic_calls_all(FdwicSubmitPmuPhase phase, uint32_t expected_submits) {
+#if PTO_FDWIC_SHARED_MAP
+    if (phase == FdwicSubmitPmuPhase::Materialize || phase == FdwicSubmitPmuPhase::Register) {
+        // shared PA 的每个逻辑 task 恰有一个 winner。
+        return expected_submits;
+    }
+#endif
     const uint64_t batches = fdwic_submit_pmu_batch_count(expected_submits);
     if (phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild) return 4U * batches;
     if (phase == FdwicSubmitPmuPhase::LoserReplay) {
@@ -176,6 +188,12 @@ constexpr uint64_t fdwic_submit_pmu_expected_dynamic_calls_aiv(FdwicSubmitPmuPha
 
 PTO_DEVICE_FUNC constexpr uint32_t
 fdwic_submit_pmu_dynamic_calls_max_per_core(FdwicSubmitPmuPhase phase, uint32_t expected_submits) {
+#if PTO_FDWIC_SHARED_MAP
+    if (phase == FdwicSubmitPmuPhase::Materialize || phase == FdwicSubmitPmuPhase::Register) {
+        // winner 的逐核分布不固定；极端情况下同一核可以赢得全部 task。
+        return expected_submits;
+    }
+#endif
     const uint32_t batches = expected_submits != 0 && expected_submits % 5U == 0 ? expected_submits / 5U : 0U;
     if (phase == FdwicSubmitPmuPhase::Fanin || phase == FdwicSubmitPmuPhase::WinnerBuild) return 2U * batches;
     if (phase == FdwicSubmitPmuPhase::LoserReplay) return 4U * batches;

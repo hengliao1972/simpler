@@ -25,12 +25,12 @@
 namespace {
 
 template <typename T>
-PTO_DEVICE_FUNC inline uint64_t fdwic_atomic_result_ready_tick(T value) {
+PTO_DEVICE_FUNC inline uint64_t fdwic_scalar_result_ready_tick(T value) {
 #if defined(__CCE_AICORE__)
-    static_assert(sizeof(T) == 4 || sizeof(T) == 8, "atomic dependency expects a scalar result");
+    static_assert(sizeof(T) == 4 || sizeof(T) == 8, "result dependency expects a scalar value");
     uint64_t cycle = 0;
-    // 在读取 SYS_CNT 的同一汇编块中消费 atomic 返回值，形成局部
-    // return-ready 边界；这不是跨核可见性屏障，也不会引入 DSB。
+    // Consume a scalar result in the same asm block as SYS_CNT. This creates
+    // a local result-ready boundary; it is not a cross-core visibility barrier.
     asm volatile("MOV %0, %0\n"
                  "MOV %1, SYS_CNT\n"
                  : "+l"(value), "=&l"(cycle));
@@ -42,6 +42,11 @@ PTO_DEVICE_FUNC inline uint64_t fdwic_atomic_result_ready_tick(T value) {
     (void)value;
     return 0;
 #endif
+}
+
+template <typename T>
+PTO_DEVICE_FUNC inline uint64_t fdwic_atomic_result_ready_tick(T value) {
+    return fdwic_scalar_result_ready_tick(value);
 }
 
 #if DIST_TRACE_ENABLED
@@ -76,6 +81,15 @@ PTO_DEVICE_FUNC inline void fdwic_swimlane_attach(__gm__ Runtime *runtime) {
     g_fdwic_swimlane_core = nullptr;
     g_fdwic_swimlane_records = nullptr;
     g_fdwic_swimlane_records_per_core = 0;
+#if PTO_FDWIC_SHARED_MAP
+    g_fdwic_swimlane_record_count = 0;
+    g_fdwic_swimlane_dropped_records = 0;
+    g_fdwic_swimlane_shared_submit_count = 0;
+    g_fdwic_dcci_calls = 0;
+    g_fdwic_dcci_lines = 0;
+    g_fdwic_dcci_records = 0;
+    g_fdwic_dcci_counter_overflow = false;
+#endif
     g_fdwic_atomic_poll_burst.active_mask = 0;
     g_fdwic_atomic_poll_burst.enabled_mask = 0;
     g_fdwic_atomic_calls = 0;
@@ -97,15 +111,42 @@ PTO_DEVICE_FUNC inline void fdwic_swimlane_attach(__gm__ Runtime *runtime) {
     // Do not invalidate the whole header: other cores update their own states.
     dist_aicore_invalidate_region(g_fdwic_swimlane_header, 64);
 #endif
+#if PTO_FDWIC_SHARED_MAP
+    if (g_fdwic_swimlane_header->magic != kFdwicSwimlaneMagic ||
+        g_fdwic_swimlane_header->version != kFdwicSwimlaneVersion ||
+        g_fdwic_swimlane_header->record_size_bytes != kFdwicSwimlaneRecordSizeBytes ||
+        g_fdwic_swimlane_header->records_per_core != records_per_core) {
+        g_fdwic_swimlane_header = nullptr;
+        return;
+    }
+#endif
     g_fdwic_swimlane_records_per_core = records_per_core;
     g_fdwic_swimlane_level = level;
 }
 
-PTO_DEVICE_FUNC inline __gm__ FdwicSwimlaneRecord *fdwic_swimlane_detail_records(__gm__ FdwicSwimlaneHeader *header) {
-    return reinterpret_cast<__gm__ FdwicSwimlaneRecord *>(
-        reinterpret_cast<__gm__ uint8_t *>(header) + sizeof(FdwicSwimlaneHeader)
+PTO_DEVICE_FUNC inline __gm__ FdwicSwimlaneStorageRecord *
+fdwic_swimlane_detail_records(__gm__ FdwicSwimlaneHeader *header, uint32_t core_idx) {
+#if PTO_FDWIC_SHARED_MAP
+    return reinterpret_cast<__gm__ FdwicSwimlaneStorageRecord *>(
+        reinterpret_cast<__gm__ uint8_t *>(header) + sizeof(FdwicSwimlaneHeader) +
+        static_cast<uint64_t>(core_idx) * kFdwicSwimlaneWorkerBytes + kFdwicSharedSubmitClaimBytesPerCore
+    );
+#else
+    return reinterpret_cast<__gm__ FdwicSwimlaneStorageRecord *>(
+        reinterpret_cast<__gm__ uint8_t *>(header) + sizeof(FdwicSwimlaneHeader) +
+        static_cast<uint64_t>(core_idx) * kFdwicSwimlaneWorkerBytes
+    );
+#endif
+}
+
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC inline __gm__ FdwicSharedSubmitClaimRecord *
+fdwic_swimlane_shared_submit_claim_records(__gm__ FdwicSwimlaneStorageRecord *records) {
+    return reinterpret_cast<__gm__ FdwicSharedSubmitClaimRecord *>(
+        reinterpret_cast<__gm__ uint8_t *>(records) - kFdwicSharedSubmitClaimBytesPerCore
     );
 }
+#endif
 
 PTO_DEVICE_FUNC inline void fdwic_swimlane_reset_core(__gm__ DistCore *self) {
     if (!fdwic_swimlane_enabled() || self == nullptr) return;
@@ -113,9 +154,16 @@ PTO_DEVICE_FUNC inline void fdwic_swimlane_reset_core(__gm__ DistCore *self) {
     if (header == nullptr) return;
     if (self->core_idx < 0 || self->core_idx >= static_cast<int32_t>(header->num_cores)) return;
     g_fdwic_swimlane_core = &header->cores[self->core_idx];
-    __gm__ FdwicSwimlaneRecord *records = fdwic_swimlane_detail_records(header);
-    const uint64_t record_offset = static_cast<uint64_t>(self->core_idx) * g_fdwic_swimlane_records_per_core;
-    g_fdwic_swimlane_records = records + record_offset;
+    g_fdwic_swimlane_records = fdwic_swimlane_detail_records(header, static_cast<uint32_t>(self->core_idx));
+#if PTO_FDWIC_SHARED_MAP
+    g_fdwic_swimlane_record_count = 0;
+    g_fdwic_swimlane_dropped_records = 0;
+    g_fdwic_swimlane_shared_submit_count = 0;
+    g_fdwic_dcci_calls = 0;
+    g_fdwic_dcci_lines = 0;
+    g_fdwic_dcci_records = 0;
+    g_fdwic_dcci_counter_overflow = false;
+#else
     g_fdwic_swimlane_core->count = 0;
     g_fdwic_swimlane_core->dropped = 0;
     g_fdwic_swimlane_core->atomic_calls = 0;
@@ -124,6 +172,7 @@ PTO_DEVICE_FUNC inline void fdwic_swimlane_reset_core(__gm__ DistCore *self) {
     g_fdwic_swimlane_core->core_idx = self->core_idx;
     g_fdwic_swimlane_core->block_id = self->block_id;
     g_fdwic_swimlane_core->lane = self->lane;
+#endif
     g_fdwic_atomic_poll_burst.active_mask = 0;
     g_fdwic_atomic_poll_burst.enabled_mask = 0;
     g_fdwic_atomic_calls = 0;
@@ -140,6 +189,25 @@ PTO_DEVICE_FUNC inline bool fdwic_swimlane_detail_write_record(
     const uint32_t records_per_core = g_fdwic_swimlane_records_per_core;
     __gm__ FdwicSwimlaneCoreState *core = g_fdwic_swimlane_core;
     if (core == nullptr || g_fdwic_swimlane_records == nullptr || records_per_core == 0) return false;
+#if PTO_FDWIC_SHARED_MAP
+    if (end_cycle < start_cycle ||
+        end_cycle - start_cycle > UINT32_MAX ||
+        !fdwic_compact_trace_fields_fit(task_id, func_id, phase, aux)) {
+        if (g_fdwic_swimlane_dropped_records != UINT32_MAX) ++g_fdwic_swimlane_dropped_records;
+        return false;
+    }
+    const uint32_t slot = g_fdwic_swimlane_record_count;
+    if (slot >= records_per_core) {
+        if (g_fdwic_swimlane_dropped_records != UINT32_MAX) ++g_fdwic_swimlane_dropped_records;
+        return false;
+    }
+    __gm__ FdwicSwimlaneStorageRecord *record = &g_fdwic_swimlane_records[slot];
+    record->start_cycle_low = static_cast<uint32_t>(start_cycle);
+    record->end_cycle_low = static_cast<uint32_t>(end_cycle);
+    record->flags = flags;
+    record->packed = fdwic_pack_compact_trace_fields(task_id, func_id, phase, aux);
+    g_fdwic_swimlane_record_count = slot + 1;
+#else
     const uint32_t slot = core->count;
     if (slot >= records_per_core) {
         if (core->dropped != UINT32_MAX) core->dropped = core->dropped + 1;
@@ -154,13 +222,66 @@ PTO_DEVICE_FUNC inline bool fdwic_swimlane_detail_write_record(
     record->phase = static_cast<uint16_t>(phase);
     record->aux = static_cast<uint16_t>(aux);
     core->count = slot + 1;
+#endif
     return true;
 }
+
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC inline bool fdwic_swimlane_record_shared_claim(
+    __gm__ DistCore *self, int32_t task_id, uint64_t start_cycle, uint64_t end_cycle, bool winner
+) {
+    if (!fdwic_swimlane_enabled() || self == nullptr || g_fdwic_swimlane_records == nullptr ||
+        task_id < 0 || task_id >= static_cast<int32_t>(kFdwicSharedTraceTaskCapacity) ||
+        start_cycle == 0 || end_cycle < start_cycle || (end_cycle & kFdwicSharedClaimWinnerBit) != 0) {
+        if (fdwic_swimlane_enabled() && g_fdwic_swimlane_dropped_records != UINT32_MAX) {
+            ++g_fdwic_swimlane_dropped_records;
+        }
+        return false;
+    }
+    __gm__ FdwicSharedSubmitClaimRecord *records =
+        fdwic_swimlane_shared_submit_claim_records(g_fdwic_swimlane_records);
+    records[task_id].claim_begin = start_cycle;
+    records[task_id].claim_end_and_winner = end_cycle | (winner ? kFdwicSharedClaimWinnerBit : 0U);
+    return true;
+}
+
+PTO_DEVICE_FUNC inline bool fdwic_swimlane_record_shared_submit(
+    __gm__ DistCore *self, int32_t task_id, uint64_t start_cycle, uint64_t end_cycle
+) {
+    if (!fdwic_swimlane_enabled() || self == nullptr || g_fdwic_swimlane_records == nullptr ||
+        task_id < 0 || task_id >= static_cast<int32_t>(kFdwicSharedTraceTaskCapacity) ||
+        start_cycle == 0 || end_cycle < start_cycle || (end_cycle & kFdwicSharedClaimWinnerBit) != 0) {
+        if (fdwic_swimlane_enabled() && g_fdwic_swimlane_dropped_records != UINT32_MAX) {
+            ++g_fdwic_swimlane_dropped_records;
+        }
+        return false;
+    }
+    __gm__ FdwicSharedSubmitClaimRecord *records =
+        fdwic_swimlane_shared_submit_claim_records(g_fdwic_swimlane_records);
+    records[task_id].submit_begin = start_cycle;
+    records[task_id].submit_end = end_cycle;
+    const uint32_t next = static_cast<uint32_t>(task_id) + 1U;
+    if (next > g_fdwic_swimlane_shared_submit_count) g_fdwic_swimlane_shared_submit_count = next;
+    return true;
+}
+#endif
 
 PTO_DEVICE_FUNC inline void fdwic_swimlane_detail_record(
     __gm__ DistCore *self, int32_t task_id, int32_t func_id, FdwicSwimlanePhase phase, uint64_t start_cycle,
     uint64_t end_cycle, uint32_t flags = 0, uint32_t aux = 0
 ) {
+#if PTO_FDWIC_SHARED_MAP
+    if (phase == FdwicSwimlanePhase::Claim) {
+        (void)fdwic_swimlane_record_shared_claim(
+            self, task_id, start_cycle, end_cycle, (flags & kFdwicClaimWon) != 0
+        );
+        return;
+    }
+    if (phase == FdwicSwimlanePhase::Submit) {
+        (void)fdwic_swimlane_record_shared_submit(self, task_id, start_cycle, end_cycle);
+        return;
+    }
+#endif
     (void)fdwic_swimlane_detail_write_record(self, task_id, func_id, phase, start_cycle, end_cycle, flags, aux);
 }
 
@@ -180,13 +301,22 @@ PTO_DEVICE_FUNC inline uint32_t fdwic_atomic_poll_trace_flags(FdwicAtomicSite si
 }
 
 PTO_DEVICE_FUNC inline uint32_t fdwic_atomic_site_mask(FdwicAtomicSite site) {
+#if PTO_FDWIC_SHARED_MAP
+    const int32_t index = fdwic_atomic_poll_batch_index(site);
+    return index >= 0 ? 1U << static_cast<uint32_t>(index) : 0U;
+#else
     return 1U << static_cast<uint32_t>(site);
+#endif
 }
 
 PTO_DEVICE_FUNC inline uint32_t fdwic_atomic_block_won_poll_mask() {
+#if PTO_FDWIC_SHARED_MAP
+    return 0;
+#else
     return fdwic_atomic_site_mask(FdwicAtomicSite::WonAnyLoad) | fdwic_atomic_site_mask(FdwicAtomicSite::WonStateLoad) |
            fdwic_atomic_site_mask(FdwicAtomicSite::WonLaneClaimExchange) |
            fdwic_atomic_site_mask(FdwicAtomicSite::WonDrainedLoad);
+#endif
 }
 
 PTO_DEVICE_FUNC inline void fdwic_swimlane_count_atomic_call(bool poll_batch) {
@@ -282,12 +412,126 @@ PTO_DEVICE_FUNC inline void fdwic_swimlane_accumulate_poll_call(FdwicAtomicSite 
     if (call_count == kFdwicAtomicPollCountMax) fdwic_atomic_poll_boundary();
 }
 
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC inline uint32_t fdwic_dcci_trace_flags(
+    FdwicDcciOp op, bool trailing_dsb, uint32_t call_count, uint32_t line_count
+) {
+    return static_cast<uint32_t>(op) | (trailing_dsb ? kFdwicDcciTrailingDsb : 0U) |
+           (call_count << kFdwicDcciCallCountShift) | (line_count << kFdwicDcciLineCountShift);
+}
+
+template <typename Pointer>
+PTO_DEVICE_FUNC inline uint32_t fdwic_dcci_region_cache_line_count(Pointer address, uint64_t bytes) {
+    if (address == nullptr || bytes == 0) return 0;
+    const uint64_t begin = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(address));
+    if (bytes > UINT64_MAX - begin || begin + bytes > UINT64_MAX - 63U) return 0;
+    const uint64_t aligned_begin = begin & ~UINT64_C(63);
+    const uint64_t aligned_end = (begin + bytes + 63U) & ~UINT64_C(63);
+    const uint64_t lines = (aligned_end - aligned_begin) / 64U;
+    return lines == 0 || lines > kFdwicDcciLineCountMax ? 0 : static_cast<uint32_t>(lines);
+}
+
+PTO_DEVICE_FUNC inline bool fdwic_swimlane_record_dcci(
+    __gm__ DistCore *self, int32_t task_id, int32_t func_id, FdwicDcciSite site, FdwicDcciOp op,
+    bool trailing_dsb, uint32_t call_count, uint32_t line_count, uint64_t start_cycle, uint64_t end_cycle
+) {
+    if (!fdwic_atomic_swimlane_enabled()) return false;
+    const bool shape_valid =
+        static_cast<uint32_t>(site) < static_cast<uint32_t>(FdwicDcciSite::Count) &&
+        static_cast<uint32_t>(op) < static_cast<uint32_t>(FdwicDcciOp::Count) &&
+        op == fdwic_dcci_site_op(site) && call_count > 0 && call_count <= kFdwicDcciCallCountMask &&
+        line_count >= call_count && line_count <= kFdwicDcciLineCountMax && trailing_dsb &&
+        end_cycle >= start_cycle;
+    const bool counters_fit =
+        g_fdwic_dcci_calls <= UINT32_MAX - call_count && g_fdwic_dcci_lines <= UINT32_MAX - line_count &&
+        g_fdwic_dcci_records != UINT32_MAX;
+    if (!shape_valid || !counters_fit) {
+        g_fdwic_dcci_counter_overflow = true;
+        return false;
+    }
+    const bool written = fdwic_swimlane_detail_write_record(
+        self, task_id, func_id, FdwicSwimlanePhase::Dcci, start_cycle, end_cycle,
+        fdwic_dcci_trace_flags(op, trailing_dsb, call_count, line_count), static_cast<uint32_t>(site)
+    );
+    if (!written) return false;
+    g_fdwic_dcci_calls += call_count;
+    g_fdwic_dcci_lines += line_count;
+    ++g_fdwic_dcci_records;
+    return true;
+}
+
+PTO_DEVICE_FUNC inline bool fdwic_swimlane_record_dcci(
+    __gm__ DistCore *self, int32_t task_id, int32_t func_id, FdwicDcciSite site, bool trailing_dsb,
+    uint32_t line_count, uint64_t start_cycle, uint64_t end_cycle
+) {
+    return fdwic_swimlane_record_dcci(
+        self, task_id, func_id, site, fdwic_dcci_site_op(site), trailing_dsb, 1, line_count, start_cycle, end_cycle
+    );
+}
+#endif
+
 PTO_DEVICE_FUNC inline void fdwic_swimlane_flush_core(__gm__ DistCore *self) {
     if (!fdwic_swimlane_enabled() || self == nullptr) return;
     fdwic_atomic_poll_boundary();
     const uint32_t records_per_core = g_fdwic_swimlane_records_per_core;
     __gm__ FdwicSwimlaneCoreState *core = g_fdwic_swimlane_core;
     if (core == nullptr || g_fdwic_swimlane_records == nullptr || records_per_core == 0) return;
+#if PTO_FDWIC_SHARED_MAP
+    uint32_t observer_slot = UINT32_MAX;
+    if (g_fdwic_swimlane_shared_submit_count != kFdwicSharedTracePhase1TaskCount &&
+        g_fdwic_swimlane_dropped_records != UINT32_MAX) {
+        ++g_fdwic_swimlane_dropped_records;
+    }
+    if (fdwic_atomic_swimlane_enabled()) {
+        const uint64_t generic_bytes =
+            static_cast<uint64_t>(g_fdwic_swimlane_record_count + 1U) * sizeof(FdwicSwimlaneStorageRecord);
+        const uint64_t submit_bytes =
+            static_cast<uint64_t>(g_fdwic_swimlane_shared_submit_count) * sizeof(FdwicSharedSubmitClaimRecord);
+        const uint64_t generic_lines = (generic_bytes + 63U) / 64U;
+        const uint64_t submit_lines = (submit_bytes + 63U) / 64U;
+        const uint64_t total_lines = generic_lines + submit_lines + 1U;
+        const uint64_t observer_cycle = fdwic_swimlane_detail_now();
+        const uint32_t candidate_slot = g_fdwic_swimlane_record_count;
+        if (total_lines > kFdwicDcciLineCountMax ||
+            !fdwic_swimlane_record_dcci(
+                self, -1, -1, FdwicDcciSite::ObserverTraceExport, FdwicDcciOp::CleanOut,
+                /*trailing_dsb=*/true, /*call_count=*/3, static_cast<uint32_t>(total_lines),
+                observer_cycle, observer_cycle
+            )) {
+            g_fdwic_dcci_counter_overflow = true;
+        } else {
+            observer_slot = candidate_slot;
+        }
+    }
+    if ((g_fdwic_atomic_counter_overflow || g_fdwic_dcci_counter_overflow) &&
+        g_fdwic_swimlane_dropped_records != UINT32_MAX) {
+        ++g_fdwic_swimlane_dropped_records;
+    }
+    core->count = g_fdwic_swimlane_record_count;
+    core->dropped = g_fdwic_swimlane_dropped_records;
+    core->atomic_calls = g_fdwic_atomic_calls;
+    core->poll_calls = g_fdwic_poll_calls;
+    core->poll_batch_records = g_fdwic_poll_batch_records;
+    core->core_idx = self->core_idx;
+    core->block_id = self->block_id;
+    core->lane = self->lane;
+    core->dcci_calls = g_fdwic_dcci_calls;
+    core->dcci_lines = g_fdwic_dcci_lines;
+    core->dcci_records = g_fdwic_dcci_records;
+    const uint32_t count =
+        g_fdwic_swimlane_record_count < records_per_core ? g_fdwic_swimlane_record_count : records_per_core;
+    if (count > 0) {
+        dist_aicore_flush_region(
+            g_fdwic_swimlane_records, static_cast<uint64_t>(count) * sizeof(FdwicSwimlaneStorageRecord)
+        );
+    }
+    if (g_fdwic_swimlane_shared_submit_count > 0) {
+        dist_aicore_flush_region(
+            fdwic_swimlane_shared_submit_claim_records(g_fdwic_swimlane_records),
+            static_cast<uint64_t>(g_fdwic_swimlane_shared_submit_count) * sizeof(FdwicSharedSubmitClaimRecord)
+        );
+    }
+#else
     core->atomic_calls = g_fdwic_atomic_calls;
     core->poll_calls = g_fdwic_poll_calls;
     core->poll_batch_records = g_fdwic_poll_batch_records;
@@ -296,7 +540,22 @@ PTO_DEVICE_FUNC inline void fdwic_swimlane_flush_core(__gm__ DistCore *self) {
     if (count > 0) {
         dist_aicore_flush_region(g_fdwic_swimlane_records, static_cast<uint64_t>(count) * sizeof(FdwicSwimlaneRecord));
     }
+#endif
     dist_aicore_flush_region(core, sizeof(FdwicSwimlaneCoreState));
+#if PTO_FDWIC_SHARED_MAP
+    if (observer_slot != UINT32_MAX && observer_slot < g_fdwic_swimlane_record_count) {
+        __gm__ FdwicSwimlaneStorageRecord *observer = &g_fdwic_swimlane_records[observer_slot];
+        const uint32_t observer_end = static_cast<uint32_t>(fdwic_swimlane_detail_now());
+#if defined(__CCE_AICORE__)
+        // The terminal row was already included in the generic-region clean.
+        // Publish only its low32 end point through the diagnostic bypass path;
+        // a cached read/modify/write here could overwrite neighboring rows.
+        __builtin_cce_st_dev(observer_end, &observer->end_cycle_low, 0);
+#else
+        observer->end_cycle_low = observer_end;
+#endif
+    }
+#endif
 }
 
 // Atomic 记录落盘是 level-4 诊断冷路径。保持它为单一设备函数，避免完整的
@@ -313,6 +572,64 @@ PTO_DEVICE_FUNC __attribute__((noinline)) void fdwic_swimlane_detail_record_atom
         fdwic_atomic_trace_flags(op, result_used, return_ready, value_zero, retries), static_cast<uint32_t>(site)
     );
 }
+
+#if PTO_FDWIC_SHARED_MAP
+// Some shared-map call sites must keep the measured atomic boundary free of
+// trace-record stores. Capture start/end next to the atomic, then invoke this
+// API after the surrounding scheduler state has been published. The call
+// writes one raw row immediately; it does not defer or retain the endpoints.
+PTO_DEVICE_FUNC inline bool fdwic_swimlane_record_captured_atomic(
+    int32_t task_id, FdwicAtomicSite site, FdwicAtomicOp op, uint64_t start_cycle, uint64_t end_cycle,
+    bool result_used, bool return_ready, bool value_zero = false, uint64_t retries = 0
+) {
+    if (!fdwic_atomic_swimlane_enabled()) return false;
+    const bool shape_valid =
+        static_cast<uint32_t>(site) < static_cast<uint32_t>(FdwicAtomicSite::Count) &&
+        static_cast<uint32_t>(op) <= static_cast<uint32_t>(FdwicAtomicOp::CompareExchange) &&
+        site != FdwicAtomicSite::SharedInsertTurnPoll && op == fdwic_atomic_site_op(site) &&
+        result_used == fdwic_atomic_site_result_used(site) &&
+        return_ready == (result_used && fdwic_atomic_return_ready_observed()) &&
+        (!value_zero || op == FdwicAtomicOp::Load) &&
+        (retries == 0 || op == FdwicAtomicOp::FetchMax) && end_cycle >= start_cycle;
+    if (!shape_valid) {
+        g_fdwic_atomic_counter_overflow = true;
+        return false;
+    }
+    fdwic_swimlane_count_atomic_call(false);
+    return fdwic_swimlane_detail_write_record(
+        g_self, task_id, -1, FdwicSwimlanePhase::Atomic, start_cycle, end_cycle,
+        fdwic_atomic_trace_flags(op, result_used, return_ready, value_zero, retries), static_cast<uint32_t>(site)
+    );
+}
+
+PTO_DEVICE_FUNC inline bool fdwic_swimlane_record_aggregate_atomic_poll(
+    FdwicAtomicSite site, uint64_t start_cycle, uint64_t end_cycle, uint32_t call_count, bool return_ready_end
+) {
+    if (!fdwic_atomic_swimlane_enabled()) return false;
+    if (site != FdwicAtomicSite::SharedInsertTurnPoll || call_count == 0 ||
+        call_count > kFdwicAtomicPollCountMax || end_cycle < start_cycle ||
+        return_ready_end != fdwic_atomic_return_ready_observed() ||
+        g_fdwic_atomic_calls > UINT32_MAX - call_count || g_fdwic_poll_calls > UINT32_MAX - call_count) {
+        g_fdwic_atomic_counter_overflow = true;
+        return false;
+    }
+    const uint32_t flags =
+        static_cast<uint32_t>(FdwicAtomicOp::Load) | kFdwicAtomicResultUsed | kFdwicAtomicPollBatch |
+        (return_ready_end ? kFdwicAtomicReturnReady : 0U) | (call_count << kFdwicAtomicPollCountShift);
+    const bool written = fdwic_swimlane_detail_write_record(
+        g_self, -1, -1, FdwicSwimlanePhase::Atomic, start_cycle, end_cycle, flags, static_cast<uint32_t>(site)
+    );
+    if (!written) return false;
+    g_fdwic_atomic_calls += call_count;
+    g_fdwic_poll_calls += call_count;
+    if (g_fdwic_poll_batch_records == UINT32_MAX) {
+        g_fdwic_atomic_counter_overflow = true;
+        return false;
+    }
+    ++g_fdwic_poll_batch_records;
+    return true;
+}
+#endif
 
 // Direct atomics remain one row per source call but do not split an active
 // PollBatch. A batch is a logical wait-region window and may contain these
@@ -420,6 +737,27 @@ PTO_DEVICE_FUNC inline T fdwic_trace_atomic_fetch_max(
     return old;
 }
 
+#if PTO_FDWIC_SHARED_MAP
+template <typename T>
+PTO_DEVICE_FUNC inline T fdwic_trace_atomic_compare_exchange(
+    int32_t task_id, FdwicAtomicSite site, __gm__ volatile T &value, T expected, T desired,
+    bool result_used = true, int success_memorder = __ATOMIC_ACQ_REL, int failure_memorder = __ATOMIC_ACQUIRE
+) {
+    if (!fdwic_atomic_swimlane_enabled()) {
+        return atomic_compare_exchange(value, expected, desired, success_memorder, failure_memorder);
+    }
+    const uint64_t begin = fdwic_swimlane_detail_now();
+    const T old = atomic_compare_exchange(value, expected, desired, success_memorder, failure_memorder);
+    const bool return_ready = result_used && fdwic_atomic_return_ready_observed();
+    const uint64_t end = result_used ? fdwic_atomic_result_ready_tick(old) : fdwic_swimlane_detail_now();
+    fdwic_swimlane_count_atomic_call(false);
+    fdwic_swimlane_detail_record_atomic(
+        task_id, site, FdwicAtomicOp::CompareExchange, begin, end, result_used, return_ready
+    );
+    return old;
+}
+#endif
+
 PTO_DEVICE_FUNC inline bool fdwic_trace_is_fatal(int32_t task_id = -1) {
     return fdwic_trace_atomic_load(task_id, FdwicAtomicSite::FatalPoll, g_dist.fatal) != 0;
 }
@@ -471,7 +809,12 @@ fdwic_swimlane_lap(__gm__ DistCore *self, int32_t task_id, int32_t func_id, Fdwi
 PTO_DEVICE_FUNC inline void fdwic_swimlane_attach(__gm__ Runtime *) {}
 
 PTO_DEVICE_FUNC constexpr uint32_t fdwic_atomic_site_mask(FdwicAtomicSite site) {
+#if PTO_FDWIC_SHARED_MAP
+    (void)site;
+    return 0;
+#else
     return 1U << static_cast<uint32_t>(site);
+#endif
 }
 
 PTO_DEVICE_FUNC inline uint32_t fdwic_atomic_block_won_poll_mask() { return 0; }
@@ -537,6 +880,56 @@ PTO_DEVICE_FUNC inline T fdwic_trace_atomic_fetch_max(
     if (token != 0) fdwic_submit_pmu_return_ready_atomic_end(token, fdwic_atomic_result_ready_tick(old));
     return old;
 }
+
+#if PTO_FDWIC_SHARED_MAP
+template <typename T>
+PTO_DEVICE_FUNC inline T fdwic_trace_atomic_compare_exchange(
+    int32_t, FdwicAtomicSite site, __gm__ volatile T &value, T expected, T desired, bool result_used = true,
+    int success_memorder = __ATOMIC_ACQ_REL, int failure_memorder = __ATOMIC_ACQUIRE
+) {
+    const bool observe_return_ready = result_used && fdwic_atomic_site_result_used(site);
+    const uint32_t token = observe_return_ready ? fdwic_submit_pmu_return_ready_atomic_begin() : 0;
+    const T old = atomic_compare_exchange(value, expected, desired, success_memorder, failure_memorder);
+    if (token != 0) fdwic_submit_pmu_return_ready_atomic_end(token, fdwic_atomic_result_ready_tick(old));
+    return old;
+}
+
+PTO_DEVICE_FUNC inline bool fdwic_swimlane_record_shared_claim(
+    __gm__ DistCore *, int32_t, uint64_t, uint64_t, bool
+) {
+    return false;
+}
+
+PTO_DEVICE_FUNC inline bool fdwic_swimlane_record_shared_submit(
+    __gm__ DistCore *, int32_t, uint64_t, uint64_t
+) {
+    return false;
+}
+
+PTO_DEVICE_FUNC inline bool fdwic_swimlane_record_captured_atomic(
+    int32_t, FdwicAtomicSite, FdwicAtomicOp, uint64_t, uint64_t, bool, bool, bool = false, uint64_t = 0
+) {
+    return false;
+}
+
+PTO_DEVICE_FUNC inline bool fdwic_swimlane_record_aggregate_atomic_poll(
+    FdwicAtomicSite, uint64_t, uint64_t, uint32_t, bool
+) {
+    return false;
+}
+
+PTO_DEVICE_FUNC inline bool fdwic_swimlane_record_dcci(
+    __gm__ DistCore *, int32_t, int32_t, FdwicDcciSite, FdwicDcciOp, bool, uint32_t, uint32_t, uint64_t, uint64_t
+) {
+    return false;
+}
+
+PTO_DEVICE_FUNC inline bool fdwic_swimlane_record_dcci(
+    __gm__ DistCore *, int32_t, int32_t, FdwicDcciSite, bool, uint32_t, uint64_t, uint64_t
+) {
+    return false;
+}
+#endif
 
 PTO_DEVICE_FUNC inline bool fdwic_trace_is_fatal(int32_t = -1) {
     return fdwic_trace_atomic_load(-1, FdwicAtomicSite::FatalPoll, g_dist.fatal) != 0;

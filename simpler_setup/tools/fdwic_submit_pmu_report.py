@@ -185,6 +185,10 @@ PHASE_CONFIG_BY_MODE = {
 DYNAMIC_PHASE_CAPTURE_MODES = frozenset(
     {FANIN_CAPTURE_MODE, WINNER_BUILD_CAPTURE_MODE, ALLOC_COMPLETE_CAPTURE_MODE, LOSER_REPLAY_CAPTURE_MODE}
 )
+# shared compete-first 只让 task winner 执行 Materialize/Register；private
+# 仍是逐核固定调用。二者共用 capture mode，因此由 raw phase.call_shape
+# 明确区分，而不能仅按 mode 猜测。
+OPTIONAL_DYNAMIC_PHASE_CAPTURE_MODES = frozenset({MATERIALIZE_CAPTURE_MODE, REGISTER_CAPTURE_MODE})
 FIXED_ROLE_DYNAMIC_PHASE_CAPTURE_MODES = frozenset(
     {FANIN_CAPTURE_MODE, WINNER_BUILD_CAPTURE_MODE, LOSER_REPLAY_CAPTURE_MODE}
 )
@@ -202,6 +206,12 @@ def _expected_compile_definitions(profile: str, tensormap_mode: str = "private")
     if profile != NONE_CAPTURE_MODE:
         definitions.append(f"PTO_FDWIC_SUBMIT_PMU_PHASE_ID={PHASE_CONFIG_BY_MODE[profile]['id']}")
     definitions.append("PTO_FDWIC_TRACE_ENABLED=0")
+    if tensormap_mode == "shared":
+        # The phase-1 shared PA image is a per-callable unity build.  This
+        # definition is part of the source-state fingerprint and therefore
+        # must be covered by the same fail-closed provenance equality as the
+        # mode/profile gates above.
+        definitions.append("PTO_FDWIC_SHARED_PA_UNITY=1")
     return tuple(definitions)
 
 
@@ -537,6 +547,8 @@ def _expected_phase_calls(mode: str, expected_submits: int) -> int:
 
 
 def _expected_dynamic_phase_calls(mode: str, expected_submits: int) -> dict[str, int]:
+    if mode in OPTIONAL_DYNAMIC_PHASE_CAPTURE_MODES:
+        return {"all": expected_submits}
     if expected_submits % 5:
         _fail(f"{mode} requires expected_submits_per_core divisible by 5")
     batches = expected_submits // 5
@@ -554,6 +566,8 @@ def _expected_dynamic_phase_calls(mode: str, expected_submits: int) -> dict[str,
 
 
 def _dynamic_phase_max_calls_per_core(mode: str, expected_submits: int) -> int:
+    if mode in OPTIONAL_DYNAMIC_PHASE_CAPTURE_MODES:
+        return expected_submits
     batches = expected_submits // 5
     if mode == LOSER_REPLAY_CAPTURE_MODE:
         return 4 * batches
@@ -569,7 +583,9 @@ def _phase_business_calls(record: Mapping[str, Any], mode: str) -> int:
     return begin_reads - int(record["phase_excluded_kernel_calls"])
 
 
-def _validate_capture_header(data: dict[str, Any]) -> tuple[str, dict[str, Any], int, dict[str, float]]:
+def _validate_capture_header(
+    data: dict[str, Any],
+) -> tuple[str, dict[str, Any], int, dict[str, float], bool]:
     _require_equal(data.get("schema"), SCHEMA_NAME, "schema")
     capture = _object(data.get("capture"), "capture")
     mode = capture.get("mode")
@@ -595,8 +611,13 @@ def _validate_capture_header(data: dict[str, Any]) -> tuple[str, dict[str, Any],
     if mode == NONE_CAPTURE_MODE:
         if "phase" in configuration:
             _fail(f"configuration must not contain phase in {NONE_CAPTURE_MODE}")
+        dynamic_calls = False
     else:
-        if mode in DYNAMIC_PHASE_CAPTURE_MODES:
+        supplied_phase = _object(configuration.get("phase"), "configuration.phase")
+        dynamic_calls = mode in DYNAMIC_PHASE_CAPTURE_MODES or (
+            mode in OPTIONAL_DYNAMIC_PHASE_CAPTURE_MODES and "call_shape" in supplied_phase
+        )
+        if dynamic_calls:
             call_shape = "dynamic_balanced" if mode in FIXED_ROLE_DYNAMIC_PHASE_CAPTURE_MODES else "dynamic_global"
             expected_phase = {
                 **PHASE_CONFIG_BY_MODE[mode],
@@ -648,7 +669,7 @@ def _validate_capture_header(data: dict[str, Any]) -> tuple[str, dict[str, Any],
         name: _number(frequency_data.get(name), f"configuration.pmu_cycles_per_ns.{name}", positive=True)
         for name in GROUP_NAMES
     }
-    return mode, configuration, expected_submits, frequencies
+    return mode, configuration, expected_submits, frequencies, dynamic_calls
 
 
 def _validate_phase_elapsed_shape(
@@ -737,6 +758,7 @@ def _validate_phase_record(
     expected_calls: int | None,
     scalar_submit_elapsed: int,
     expected_phase_id: int,
+    dynamic_calls: bool,
 ) -> None:
     _require_equal(record.get("phase_id"), expected_phase_id, f"{prefix}.phase_id")
     phase_elapsed = _integer(record.get("phase_elapsed_ticks"), f"{prefix}.phase_elapsed_ticks")
@@ -758,7 +780,6 @@ def _validate_phase_record(
     )
     begin_reads = _integer(record.get("phase_begin_reads"), f"{prefix}.phase_begin_reads")
     end_reads = _integer(record.get("phase_end_reads"), f"{prefix}.phase_end_reads")
-    dynamic_calls = mode in DYNAMIC_PHASE_CAPTURE_MODES
     business_begin_calls = _validate_phase_read_shape(
         record=record,
         prefix=prefix,
@@ -836,6 +857,7 @@ def _validate_record(
     logical_core_id: int,
     expected_submits: int,
     mode: str,
+    dynamic_calls: bool,
 ) -> dict[str, Any]:
     record = _object(record_data, f"records[{logical_core_id}]")
     prefix = f"records[{logical_core_id}]"
@@ -879,7 +901,7 @@ def _validate_record(
     else:
         if any(field in record for field in DEPRECATED_PHASE_BOUND_FIELDS):
             _fail(f"{prefix} must use observed phase fields, not lower/upper-bound names")
-        expected_calls = None if mode in DYNAMIC_PHASE_CAPTURE_MODES else _expected_phase_calls(mode, expected_submits)
+        expected_calls = None if dynamic_calls else _expected_phase_calls(mode, expected_submits)
         _validate_phase_record(
             record,
             prefix,
@@ -887,6 +909,7 @@ def _validate_record(
             expected_calls,
             scalar_elapsed,
             PHASE_CONFIG_BY_MODE[mode]["id"],
+            dynamic_calls,
         )
     programmable = (scalar, requests, misses, *shadow_programmable)
     if any(value >= PROGRAMMABLE_COUNTER_RISK_THRESHOLD for value in programmable):
@@ -1153,7 +1176,7 @@ def _validate_host_summary(data: dict[str, Any], computed: Mapping[str, dict[str
             )
 
 
-def _validate_producer_summary(data: dict[str, Any], mode: str) -> None:
+def _validate_producer_summary(data: dict[str, Any], mode: str, dynamic_calls: bool) -> None:
     validation = _object(data.get("validation"), "validation")
     kernel_exclusion_validation = "phase_kernel_exclusion_closed_records"
     dynamic_call_validation = "phase_global_call_count_closed"
@@ -1208,7 +1231,7 @@ def _validate_producer_summary(data: dict[str, Any], mode: str) -> None:
             f"validation.{kernel_exclusion_validation} is only valid in "
             f"{sorted(KERNEL_EXCLUDING_PHASE_CAPTURE_MODES)!r}"
         )
-    if mode in DYNAMIC_PHASE_CAPTURE_MODES:
+    if dynamic_calls:
         required[dynamic_call_validation] = True
     elif dynamic_call_validation in validation:
         _fail(f"validation.{dynamic_call_validation} is only valid in dynamic phase profiles")
@@ -1220,8 +1243,9 @@ def _validate_dynamic_phase_call_totals(
     records: Sequence[dict[str, Any]],
     mode: str,
     expected_submits: int,
+    dynamic_calls: bool,
 ) -> None:
-    if mode not in DYNAMIC_PHASE_CAPTURE_MODES:
+    if not dynamic_calls:
         return
     expected = _expected_dynamic_phase_calls(mode, expected_submits)
     actual = {
@@ -1251,13 +1275,14 @@ def load_capture(input_path: Path | str) -> SubmitPmuCapture:
     raw_bytes = path.read_bytes()
     decoded = json.loads(raw_bytes)
     data = _object(decoded, "root")
-    mode, _, expected_submits, _ = _validate_capture_header(data)
+    mode, _, expected_submits, _, dynamic_calls = _validate_capture_header(data)
 
     record_data = _array(data.get("records"), "records")
     if len(record_data) != EXPECTED_CORES:
         _fail("records must contain exactly 96 cores")
     records = tuple(
-        _validate_record(value, logical_id, expected_submits, mode) for logical_id, value in enumerate(record_data)
+        _validate_record(value, logical_id, expected_submits, mode, dynamic_calls)
+        for logical_id, value in enumerate(record_data)
     )
     role_counts = Counter(record["role"] for record in records)
     if role_counts != Counter({"aic": EXPECTED_AIC_CORES, "aiv": EXPECTED_AIV_CORES}):
@@ -1267,8 +1292,8 @@ def load_capture(input_path: Path | str) -> SubmitPmuCapture:
     _validate_logical_layout(records)
     _validate_owner(data, physical_ids)
     _validate_window(data, records)
-    _validate_producer_summary(data, mode)
-    _validate_dynamic_phase_call_totals(records, mode, expected_submits)
+    _validate_producer_summary(data, mode, dynamic_calls)
+    _validate_dynamic_phase_call_totals(records, mode, expected_submits, dynamic_calls)
 
     groups = {
         "all": records,
@@ -2094,7 +2119,7 @@ def _phase_overview(
                 f"{_format_integer(group['phase_business_calls'])} 次；排除 linked Kernel 调用 "
                 f"{_format_integer(group['phase_excluded_kernel_calls'])} 次</small>"
             )
-        if capture.data["capture"]["mode"] in DYNAMIC_PHASE_CAPTURE_MODES:
+        if "call_shape" in capture.data["configuration"]["phase"]:
             calls = group["phase_calls_per_core"]
             reads += (
                 f"<br><small>逐核 {_format_integer(calls['min'])}–{_format_integer(calls['max'])}；"

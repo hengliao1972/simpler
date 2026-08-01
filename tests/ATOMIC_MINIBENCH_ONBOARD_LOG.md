@@ -1,5 +1,13 @@
 # Atomic Minibench 上板移植与修复记录（2026-07-10，更新 2026-07-13 v10）
 
+> 本文件是历史上板日志，不表示其中列出的测试仍在当前测试矩阵中。MB-5
+> shared-map 用例及其旧 shared ring 实现已经退役；对应文件
+> `test_dist_atomic_mb5_shared_map.cpp` 和 `test_mb5_shared_map.py` 已删除。
+> 当前阶段一由 PA 专用的 `test_fdwic_shared_pa_tensor_map_state`、
+> `test_fdwic_shared_pa_heap`、`test_fdwic_shared_pa_register`、
+> `test_fdwic_shared_pa_submit` 和 `test_fdwic_shared_pa_lifecycle` 覆盖状态、
+> 分配、注册、提交与生命周期合同。下文 MB-5 数字只保留历史复现实录。
+
 ## 2026-07-13 单 AIV repeated `st_dev` 独立压力
 
 执行环境：base HEAD `2391ed1841fb466ff7938a4aae47b1a57162dc4b`、dirty worktree、CANN 9.1、

@@ -62,6 +62,22 @@ PTO_DEVICE_FUNC inline FdwicSwimlanePhase trace_phase_to_swimlane_phase(TracePha
         return FdwicSwimlanePhase::WinnerBuild;
     case TracePhase::AllocComplete:
         return FdwicSwimlanePhase::AllocComplete;
+#if PTO_FDWIC_SHARED_MAP
+    case TracePhase::SharedRegisterPublishMetadata:
+        return FdwicSwimlanePhase::SharedRegisterPublishMetadata;
+    case TracePhase::SharedMaterializePublishTaskOutputs:
+        return FdwicSwimlanePhase::SharedMaterializePublishTaskOutputs;
+    case TracePhase::SharedMaterializePublishTaskOutputsCopy:
+        return FdwicSwimlanePhase::SharedMaterializePublishTaskOutputsCopy;
+    case TracePhase::SharedMaterializePublishTaskOutputsFlush:
+        return FdwicSwimlanePhase::SharedMaterializePublishTaskOutputsFlush;
+    case TracePhase::Dcci:
+        return FdwicSwimlanePhase::Dcci;
+    case TracePhase::SharedRegisterWaitInsertTurnBypassLoad:
+        return FdwicSwimlanePhase::SharedRegisterWaitInsertTurnBypassLoad;
+    case TracePhase::Count:
+        break;
+#endif
     case TracePhase::LoserReplay:
         return FdwicSwimlanePhase::LoserReplay;
     }

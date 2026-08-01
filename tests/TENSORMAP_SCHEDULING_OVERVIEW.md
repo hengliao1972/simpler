@@ -1,6 +1,25 @@
 # TensorMap 与全分布式调度：private/shared 实现导读
 
-本文面向第一次接触本仓调度运行时的开发者，目标是回答以下问题：
+本文面向第一次接触本仓调度运行时的开发者。后续正文主体主要记录基线
+`57841544` 与对比 checkout `68649810` 的历史分析；其中“当前”均指该历史基线，
+不是 2026-07-30 的工作树状态。
+
+当前 A5 阶段一边界如下：
+
+- private 通用路径仍保留每 worker region TensorMap，原生 AICPU
+  setup/attach/wait/teardown 能力不变。
+- shared 已落为 PA Case1 专用编译产物，只支持 batch 256、单 q-head group、
+  96 workers 和 1280 tasks；其他选择在编译或运行前明确失败。
+- shared PA 不使用本历史文档描述的 region ring、`seq`、reclaim 或
+  `core_progress[]`。它通过 `(producer_task_id, output_slot)` 直接共享不可变
+  Tensor descriptor，并维护 UP writer history、8 个 no-wrap heap shard 和
+  8 个 vector claim shard。
+- 当前入口是 `--fdwic-tensormap {private|shared}`，scene 层记录
+  `PTO_FDWIC_TENSORMAP_MODE` 并构建不同产物；不存在
+  `PTO_DIST_TENSORMAP_MODE` 所描述的运行时双模分支，也不要求 private/shared
+  复用同一种 TensorMap。
+
+历史分析回答以下问题：
 
 1. TensorMap 到底保存什么，为什么调度器需要它？
 2. 当前仓库的 private TensorMap 如何参与一次任务的提交和执行？
@@ -10,7 +29,7 @@
 5. 两份实现距离 [`atomic_minibench.md`](../../atomic_minibench.md) 定义的总体目标
    还有哪些差距？
 
-## 0. 文档范围与结论
+## 0. 历史文档范围与结论
 
 本文核对的代码基线如下：
 
@@ -1222,9 +1241,9 @@ private 模式生成同一依赖图，而不是在没有诊断的情况下直接
 runtime 识别了 shared mode、DEPSIG 和 TMOPS。那份结果可以作为历史基础运行记录，不能
 作为当前完整契约已经通过的证据。
 
-### 9.2 为什么新增严格断言是必要防护
+### 9.2 历史基线为什么新增严格断言
 
-例如测试设置：
+历史 checkout 的测试曾设置：
 
 ```text
 PTO_DIST_TENSORMAP_MODE=shared
@@ -1232,11 +1251,15 @@ PTO_DIST_DEPSIG=1
 PTO_DIST_OVERHEAD=1
 ```
 
-如果 runtime 根本没有读取这些变量，普通数值 workload 仍可能使用 private 模式并输出
-正确结果。没有 marker/DEPSIG/TMOPS 断言时，测试会把“环境变量被忽略”误判为“shared
-模式通过”。
+如果当时的 runtime 根本没有读取这些变量，普通数值 workload 仍可能使用 private
+模式并输出正确结果。没有 marker/DEPSIG/TMOPS 断言时，测试会把“环境变量被忽略”
+误判为“shared 模式通过”。
 
-因此 shared 验收至少要同时满足：
+当前阶段一改用 `--fdwic-tensormap shared`；scene 层记录
+`PTO_FDWIC_TENSORMAP_MODE=shared`，校验 class/case 后构建 PA 专用产物。
+`PTO_DIST_TENSORMAP_MODE`、DEPSIG 和 TMOPS 不再构成当前 shared PA 的接口。
+
+因此当时的通用 shared ring 验收至少要同时满足：
 
 1. runtime 明确打印/导出实际模式；
 2. private/shared 最终数值都匹配 golden；

@@ -94,6 +94,7 @@ foreach(SRC_FILE ${ALL_SOURCES})
     add_custom_command(
         OUTPUT ${OBJ_AIC}
         COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS} --cce-aicore-arch=dav-c310-cube
+                -DPTO_FDWIC_SHARED_PA_BUILD_ROLE=0
                 ${CMAKE_CUSTOM_COMPILE_DEFINITION_FLAGS}
                 -o ${OBJ_AIC} ${SRC_FILE}
         DEPENDS ${SRC_FILE}
@@ -104,6 +105,7 @@ foreach(SRC_FILE ${ALL_SOURCES})
     add_custom_command(
         OUTPUT ${OBJ_AIV}
         COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS} --cce-aicore-arch=dav-c310-vec
+                -DPTO_FDWIC_SHARED_PA_BUILD_ROLE=1
                 ${CMAKE_CUSTOM_COMPILE_DEFINITION_FLAGS}
                 -o ${OBJ_AIV} ${SRC_FILE}
         DEPENDS ${SRC_FILE}

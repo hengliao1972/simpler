@@ -66,6 +66,110 @@ enum class PTO2ScopeMode : uint8_t {
     MANUAL = 1,
 };
 
+#ifndef PTO_FDWIC_SHARED_MAP
+#define PTO_FDWIC_SHARED_MAP 0
+#endif
+
+#if PTO_FDWIC_SHARED_MAP
+/**
+ * Stable reference to one fresh output of a shared PA task.
+ *
+ * Phase 1 accepts only the plain form: flags/view fields must all be zero.
+ * The reserved view fields keep the ABI extensible without making an
+ * unsupported view silently look like its producer's whole descriptor.
+ */
+struct FdwicOutputRef {
+    int32_t producer_task_id;
+    int16_t output_slot;
+    uint8_t flags;
+    uint8_t view_ndims;
+    uint32_t view_shape0;
+    uint32_t view_offset0;
+};
+
+static_assert(sizeof(FdwicOutputRef) == 16, "FdwicOutputRef ABI size changed");
+static_assert(alignof(FdwicOutputRef) == 4, "FdwicOutputRef ABI alignment changed");
+static_assert(offsetof(FdwicOutputRef, producer_task_id) == 0, "shared output producer offset changed");
+static_assert(offsetof(FdwicOutputRef, output_slot) == 4, "shared output slot offset changed");
+static_assert(offsetof(FdwicOutputRef, flags) == 6, "shared output flags offset changed");
+static_assert(offsetof(FdwicOutputRef, view_ndims) == 7, "shared output view rank offset changed");
+static_assert(offsetof(FdwicOutputRef, view_shape0) == 8, "shared output view shape offset changed");
+static_assert(offsetof(FdwicOutputRef, view_offset0) == 12, "shared output view offset changed");
+static_assert(
+    std::is_trivially_default_constructible_v<FdwicOutputRef>,
+    "FdwicOutputRef must remain trivial for AICore replay-local state"
+);
+
+PTO_DEVICE_FUNC inline FdwicOutputRef fdwic_invalid_output_ref() {
+    return FdwicOutputRef{-1, -1, 0, 0, 0, 0};
+}
+
+PTO_DEVICE_FUNC inline bool fdwic_plain_output_ref(const FdwicOutputRef &ref) {
+    return ref.producer_task_id >= 0 && ref.output_slot >= 0 && ref.flags == 0 && ref.view_ndims == 0 &&
+           ref.view_shape0 == 0 && ref.view_offset0 == 0;
+}
+
+/**
+ * Replay-visible output set for the shared backend.
+ *
+ * Every actor receives the same stable symbols, while only the Claim winner
+ * materializes and publishes their Tensor descriptors. No constructor or
+ * default member initializer is allowed: orchestration reuses this POD in its
+ * hot loop and the runtime initializes both fields explicitly.
+ */
+struct SharedTaskOutputs {
+    int32_t producer_task_id;
+    uint32_t output_count;
+
+    PTO_DEVICE_FUNC void reset(int32_t task_id) {
+        producer_task_id = task_id;
+        output_count = 0;
+    }
+
+    PTO_DEVICE_FUNC bool add_output_ref(int32_t task_id, int16_t slot) {
+        if (task_id < 0 || task_id != producer_task_id || output_count >= 8 ||
+            slot != static_cast<int16_t>(output_count)) {
+            return false;
+        }
+        ++output_count;
+        return true;
+    }
+
+    PTO_DEVICE_FUNC bool empty() const { return output_count == 0; }
+    PTO_DEVICE_FUNC uint32_t size() const { return output_count; }
+
+    PTO_DEVICE_FUNC PTO2TaskId task_id() const {
+        return producer_task_id < 0 ? PTO2TaskId::invalid() :
+                                      PTO2TaskId::make(0, static_cast<uint32_t>(producer_task_id));
+    }
+
+    PTO_DEVICE_FUNC FdwicOutputRef output_ref(uint32_t index) const {
+        always_assert(producer_task_id >= 0 && index < output_count);
+        return FdwicOutputRef{
+            producer_task_id,
+            static_cast<int16_t>(index),
+            0,
+            0,
+            0,
+            0,
+        };
+    }
+};
+
+static_assert(sizeof(SharedTaskOutputs) == 8, "SharedTaskOutputs ABI size changed");
+static_assert(alignof(SharedTaskOutputs) == 4, "SharedTaskOutputs ABI alignment changed");
+static_assert(
+    std::is_trivially_default_constructible_v<SharedTaskOutputs>,
+    "SharedTaskOutputs must remain trivial for AICore replay-local state"
+);
+
+PTO_DEVICE_FUNC inline SharedTaskOutputs fdwic_invalid_shared_outputs() {
+    SharedTaskOutputs outputs;
+    outputs.reset(-1);
+    return outputs;
+}
+#endif
+
 /**
  * TaskOutputTensors — returned by submit, holds materialized output Tensors.
  *
@@ -163,6 +267,9 @@ class TensorRef {
         __gm__ const Tensor *gm_ptr_;
 #endif
         const TensorCreateInfo *create_info_;
+#if PTO_FDWIC_SHARED_MAP
+        FdwicOutputRef shared_output_ref_;
+#endif
     };
     uint8_t kind_;
 
@@ -170,6 +277,9 @@ class TensorRef {
         kTensor = 0,
         kGmTensor = 1,
         kCreateInfo = 2,
+#if PTO_FDWIC_SHARED_MAP
+        kSharedOutputRef = 3,
+#endif
     };
 
 public:
@@ -192,6 +302,13 @@ public:
         kind_ = kCreateInfo;
         return *this;
     }
+#if PTO_FDWIC_SHARED_MAP
+    PTO_DEVICE_FUNC TensorRef &operator=(const FdwicOutputRef &ref) {
+        shared_output_ref_ = ref;
+        kind_ = kSharedOutputRef;
+        return *this;
+    }
+#endif
 #if defined(__CCE_AICORE__)
     PTO_DEVICE_FUNC TensorRef &set_gm_tensor(__gm__ const Tensor *p) {
         gm_ptr_ = p;
@@ -204,7 +321,29 @@ public:
     PTO_DEVICE_FUNC __gm__ const Tensor &gm_ref() const { return *gm_ptr_; }
 #endif
     PTO_DEVICE_FUNC const TensorCreateInfo &create_info() const { return *create_info_; }
+    PTO_DEVICE_FUNC bool tensor_from_local() const { return kind_ == kTensor; }
     PTO_DEVICE_FUNC bool tensor_from_gm() const { return kind_ == kGmTensor; }
+    PTO_DEVICE_FUNC bool tensor_from_create_info() const { return kind_ == kCreateInfo; }
+    // Shared TensorRef carries both LM and GM pointer alternatives. CCEC
+    // 15.0.5 cube codegen must keep this discriminator check out of callers;
+    // inlining both pointer-null paths can synthesize a forbidden AS1 -> AS0
+    // cast. Private mode and non-CCEC builds retain normal inlining.
+    PTO_DEVICE_FUNC
+#if defined(__CCE_AICORE__) && defined(__DAV_CUBE__) && PTO_FDWIC_SHARED_MAP
+    __attribute__((noinline))
+#endif
+    bool has_existing_tensor() const {
+#if defined(__CCE_AICORE__)
+        return (kind_ == kTensor && ptr_ != nullptr) || (kind_ == kGmTensor && gm_ptr_ != nullptr);
+#else
+        return kind_ == kTensor && ptr_ != nullptr;
+#endif
+    }
+    PTO_DEVICE_FUNC bool has_create_info() const { return kind_ == kCreateInfo && create_info_ != nullptr; }
+#if PTO_FDWIC_SHARED_MAP
+    PTO_DEVICE_FUNC bool tensor_from_shared_output() const { return kind_ == kSharedOutputRef; }
+    PTO_DEVICE_FUNC FdwicOutputRef shared_output_ref() const { return shared_output_ref_; }
+#endif
     PTO_DEVICE_FUNC bool refers_to(const Tensor *t) const { return ptr_ == t; }
     PTO_DEVICE_FUNC bool refers_to(const TensorCreateInfo *ci) const { return create_info_ == ci; }
 };
@@ -639,7 +778,17 @@ private:
                 "add_output: all arguments must be the same type (all Tensor or all TensorCreateInfo)"
             );
         } else {
-            static_assert((std::is_same_v<std::decay_t<Args>, Tensor> && ...), "all arguments must be Tensor");
+            static_assert(
+#if PTO_FDWIC_SHARED_MAP
+                ((std::is_same_v<std::decay_t<Args>, Tensor> ||
+                  std::is_same_v<std::decay_t<Args>, FdwicOutputRef>) &&
+                 ...),
+                "all arguments must be Tensor or FdwicOutputRef"
+#else
+                (std::is_same_v<std::decay_t<Args>, Tensor> && ...),
+                "all arguments must be Tensor"
+#endif
+            );
         }
 #endif
     }
@@ -687,6 +836,14 @@ private:
         tensor_count_++;
     }
 
+#if PTO_FDWIC_SHARED_MAP
+    PTO_DEVICE_FUNC void add_tensor_ref(const FdwicOutputRef &ref, TensorArgType tag) {
+        tensors_[tensor_count_] = ref;
+        tags_[tensor_count_] = tag;
+        tensor_count_++;
+    }
+#endif
+
 #if defined(__CCE_AICORE__)
     PTO_DEVICE_FUNC void add_tensor_ref(__gm__ const Tensor &tensor, TensorArgType tag) {
         tensors_[tensor_count_].set_gm_tensor(&tensor);
@@ -731,6 +888,14 @@ private:
         tensor_count_++;
     }
 
+#if PTO_FDWIC_SHARED_MAP
+    PTO_DEVICE_FUNC void add_tensor_arg(const FdwicOutputRef &ref, TensorArgType tag) {
+        tensors_[tensor_count_] = ref;
+        set_tag_slot(tensor_count_, tag);
+        tensor_count_++;
+    }
+#endif
+
 #if defined(__CCE_AICORE__)
     PTO_DEVICE_FUNC void add_tensor_arg(__gm__ const Tensor &tensor, TensorArgType tag) {
         tensors_[tensor_count_].set_gm_tensor(&tensor);
@@ -773,6 +938,13 @@ private:
 //   orchestration (small, stack-friendly).
 using L0TaskArgs = Arg<MAX_TENSOR_ARGS, MAX_SCALAR_ARGS>;
 static_assert(sizeof(L0TaskArgs) % 64 == 0, "L0TaskArgs size must be cacheline padded");
+#if PTO_FDWIC_SHARED_MAP
+static_assert(sizeof(TensorRef) == 24, "shared TensorRef ABI size changed");
+static_assert(sizeof(L0TaskArgs) == 1280, "shared L0TaskArgs ABI size changed");
+#else
+static_assert(sizeof(TensorRef) == 16, "private TensorRef ABI size changed");
+static_assert(sizeof(L0TaskArgs) == 1024, "private L0TaskArgs ABI size changed");
+#endif
 static_assert(
     sizeof(Arg<CHIP_MAX_TENSOR_ARGS, CHIP_MAX_SCALAR_ARGS>) % 64 == 0, "L2 Arg size must be cacheline padded"
 );

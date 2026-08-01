@@ -241,9 +241,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
             // Validate the stable Runtime prefix before reading DistHandoff or
             // PTO2Runtime state. A mismatch means the Host/AICPU images came
-            // from different TensorMap artifact families. The shared backend
-            // is intentionally fail-closed until its real implementation is
-            // connected in the next stage.
+            // from different TensorMap artifact families.
             cache_invalidate_range(&runtime->fdwic_build_identity, sizeof(runtime->fdwic_build_identity));
             bool dispatch_dist_run =
                 fdwic_build_identity_matches(runtime->fdwic_build_identity, static_cast<uint32_t>(sizeof(Runtime)));
@@ -266,8 +264,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 run_rc = -1;
             } else if (!kFdwicCompiledBackendReady) {
                 LOG_ERROR(
-                    "Thread %d: FDWIC shared TensorMap artifact is ABI-valid but its runtime backend "
-                    "is not connected yet; aborting before Submit",
+                    "Thread %d: FDWIC artifact is ABI-valid but its compiled runtime backend "
+                    "is unavailable; aborting before Submit",
                     thread_idx
                 );
                 __atomic_fetch_or(

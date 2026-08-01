@@ -12,6 +12,26 @@
 API（`rt_submit_aic_task` / `rt_submit_aiv_task`，`pto_orchestration_api.h`）参见
 `src/{arch}/runtime/` 下的 `tensormap_and_ringbuffer` runtime。
 
+## 当前 A5 实现边界（2026-07-30）
+
+本文保留了通用 private/shared TensorMap 的设计推演和早期 ring 实验记录。当前
+A5 阶段一实现的边界更窄，不能把后文的通用 shared ring 方案当成已落地接口：
+
+- `private` 仍是默认的通用 fully-distributed 路径，继续使用每 worker 私有的
+  region TensorMap；原生 AICPU 的 setup、attach、wait 和 teardown 能力也保持不变。
+- `shared` 是单独编译的 PA 专用协议，目前只接受
+  `TestPagedAttentionUnroll::Case1`：batch 256、单 q-head group、96 workers
+  （32 AIC + 64 AIV），固定 1280 个 task。不支持的 class/case 会在编译和上板前
+  明确报错，不会静默回退到 private。
+- 该 PA 协议没有 shared region ring。新 output 以
+  `(producer_task_id, output_slot)` 直接索引不可变 Tensor descriptor，并单独维护
+  UP writer history；还使用 8 个 no-wrap heap shard（总计 256 MiB）和 8 个
+  vector claim shard。
+- 模式由 scene-test/build 层的 `--fdwic-tensormap` 选择，并记录为
+  `PTO_FDWIC_TENSORMAP_MODE`。它生成不同的编译产物，不是旧
+  `PTO_DIST_TENSORMAP_MODE` 所描述的运行时双模分支。private 与阶段一 shared
+  也不再要求复用同一种 TensorMap 数据结构。
+
 ---
 
 # 第一部分 — 系统设计
@@ -1269,9 +1289,13 @@ int32_t cur = atomicMax(&cursor[T], INT32_MIN);  // 恒不推进（任何真值 
   动态配对方案（跨 block 均衡 MIX 工作；亦即 §3.2 讨论并暂不采用的“block 内先到先得代发布”等
   思路的归宿）**仅在未来核解除该硬件绑定时**才需要，届时再行设计，**本节不予裁定**。
 
-## 12. TensorMap 构建与 Private / Shared 双模式（统一 ring-per-bucket）
+## 12. TensorMap 构建与 Private / Shared 双模式（历史通用 ring 方案）
 
-本章新增一个**正交的运行模式开关**：TensorMap（§4、§8.2、§9）既可以保持"每核全量复制"形态
+本章记录旧的通用 ring-per-bucket 设计及 a2a3 实验，不是当前 A5 阶段一
+shared PA 的实现合同。阶段一边界以文首“当前 A5 实现边界”为准；以下关于两模式
+共用 ring、运行时切换、回收和 run-ahead 的内容仅保留为设计背景。
+
+旧方案在本章提出一个**正交的运行模式开关**：TensorMap（§4、§8.2、§9）既可以保持"每核全量复制"形态
 （private），也可以改为"全局共享一份"（shared）。二者由**命令行开关**在运行启动时一次性选定，
 贯穿整次运行不再切换。本章先回顾 TensorMap 如何被构建，再**论证两种模式统一采用同一套
 ring-per-bucket 数据结构**（§12.3 的 链表 vs ring 性能分析），随后定义两种模式仅有的差异、重点分析
@@ -1308,26 +1332,22 @@ TensorMap 把一个 tensor 区域 `[lo, hi)` 映射到其 **producer 任务 id**
 两种模式的差异不在于"构建原语"或"数据结构"本身（统一为 ring），而只在于：**insert/lookup 作用在
 哪一份 map 上、由谁来执行、以及跨核可见性如何保证**（四点差异见 §12.3.2）。
 
-### 12.2 命令行开关
+### 12.2 当前 A5 阶段一模式选择
 
-新增一个启动期开关（环境变量与 CLI 同义，沿用 §6.3 的 `--bind` 风格）：
+当前 scene-test 入口使用：
 
+```text
+--fdwic-tensormap {private|shared}
 ```
---tensormap-mode {private|shared}        # 等价环境变量 PTO_DIST_TENSORMAP_MODE
---tensormap-ring-cap {N|auto}            # 等价环境变量 PTO_DIST_TENSORMAP_RING_CAP；private/shared 均生效
-```
 
-- `private`（**默认**）：每核一份全量复制 map，数据结构为 ring-per-bucket（每核私有、单线程纪律，§12.3.2）。
-- `shared`：全核共享**唯一一份** TensorMap，数据结构同为 ring-per-bucket（并发纪律 + per-slot `seq`，§12.7.1）。
-- `--tensormap-ring-cap`：**两种模式均生效**（两者都用 ring），设定每桶 ring 的定长槽数 `CAP`（2 的幂）。
-  默认 `auto` = 由依赖跨度 `H`（private）或 `Δ+H`（shared）与该桶静态区域分布推导（§12.7.2）。**`auto`
-  在两种模式下都能给出可证充分的容量**（§12.7.2.3）。
+pytest/scene 层将选择记录为 `PTO_FDWIC_TENSORMAP_MODE`，并为 private 或
+shared PA 分别构建匹配的 host、AICPU 和 AICore 产物。shared 只接受文首列出的
+PA Case1；它不是可供任意 orchestration 使用的运行时开关。
 
-开关在 runtime 初始化阶段被读取一次，据此构造对应形态的 TensorMap 句柄（§12.9）并选择对应的
-insert/lookup 实现。**运行期不切换**，避免中途一致性灾难。所有 per-core 编排循环（§6）通过同一
-组抽象 API（`tm_insert` / `tm_lookup`）访问 map，由句柄分发到 private 或 shared 的 ring 实现——上层
-伪代码不变。`--tensormap-ring-cap` 影响两种模式每桶 ring 的分配尺寸，完整论证（含 `auto` 安全性）
-见 §12.7.2。
+旧设计中的 `--tensormap-mode`、`PTO_DIST_TENSORMAP_MODE` 和
+`PTO_DIST_TENSORMAP_RING_CAP` 不属于当前 A5 阶段一接口。当前固定的
+`PTO_FDWIC_TENSORMAP_RING_CAP` 只描述 private region-map 的编译期 ABI；shared PA
+保留这段 private ABI 空间，但协议本身不读取该 ring。
 
 ### 12.3 为何统一到 ring-per-bucket：链表 vs ring 性能分析
 
@@ -2059,7 +2079,10 @@ lookup 一次 acquire"，使 shared 的单槽扫描逼近 private 的纯本地�
 不可消除（单份共享的固有对价，private 靠复制 N 份规避）。**验证**：改动后 6 核（`sig=358074ac…`）与 24 核
 （`sig=c01c01e9…`）的 `PTO_DIST_DEPSIG` 依旧与 private **逐位一致**，private 侧签名不变（`8a877fd1…`）。
 
-**命令行 / 环境变量。**
+**历史 a2a3 ring 实验的命令行 / 环境变量。**
+
+下表只用于解释本节保留的实验记录，不是当前 A5 阶段一 shared PA 的接口。
+当前选择方式见 §12.2。
 
 | 变量 | 作用 |
 | ---- | ---- |

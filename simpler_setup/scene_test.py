@@ -28,6 +28,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -104,19 +105,30 @@ def _fdwic_tensormap_mode() -> str:
     return mode
 
 
-def _validate_fdwic_tensormap_test_classes(mode: str, classes) -> None:
-    """Keep standalone shared selection on the same L2 FDWIC scope as pytest."""
+def _validate_fdwic_tensormap_test_classes(mode: str, selected_by_cls) -> None:
+    """Reject every shared selection outside the explicitly supported PA cases."""
     if mode != _FDWIC_TENSORMAP_SHARED:
         return
     incompatible = sorted(
         cls.__name__
-        for cls in classes
+        for cls in selected_by_cls
         if getattr(cls, "_st_level", None) != 2 or getattr(cls, "_st_runtime", None) != "fully_distributed_within_core"
     )
     if incompatible:
         raise ValueError(
             "--fdwic-tensormap shared only accepts level-2 "
             "fully_distributed_within_core tests; incompatible class(es): " + ", ".join(incompatible)
+        )
+    unsupported = sorted(
+        f"{cls.__name__}::{case['name']}"
+        for cls, cases in selected_by_cls.items()
+        for case in cases
+        if case["name"] not in getattr(cls, "FDWIC_SHARED_SUPPORTED_CASES", ())
+    )
+    if unsupported:
+        raise ValueError(
+            "--fdwic-tensormap shared phase 1 only supports explicitly declared "
+            "single-group PA cases; unsupported selection(s): " + ", ".join(unsupported)
         )
 
 
@@ -488,6 +500,58 @@ def _assert_fdwic_swimlane_elf(binary: Path) -> None:
         raise RuntimeError(f"Invalid FDWIC swimlane AICore image {binary}: {'; '.join(details)}")
 
 
+def _assert_fdwic_shared_pa_role_entries(binary: Path) -> None:
+    """Prove a real-A5 shared-PA image has both entries and one runtime state.
+
+    AIC and AIV objects are linked into one relocatable image.  Giving both
+    role builds the same weak ``aicpu_orchestration_entry`` name lets the
+    linker retain just one role body, so one worker class executes the wrong
+    specialization.  Conversely, compiling one unity implementation per role
+    gives each entry a different TU-local ``g_self``/``g_dist_ptr`` even though
+    the linker retains only one weak ``dist_core_main``; the second state is
+    never attached.  Reject either malformed image before launch.
+    """
+    symbol_rows = _fdwic_elf_symbol_rows(binary)
+    required = ("aicpu_orchestration_entry_aic", "aicpu_orchestration_entry_aiv")
+    definition_counts = {
+        symbol: sum(
+            kind == "FUNC" and ndx != "UND" and name == symbol for kind, ndx, name in symbol_rows
+        )
+        for symbol in required
+    }
+    invalid = [f"{symbol}={definition_counts[symbol]}" for symbol in required if definition_counts[symbol] != 1]
+    runtime_state_counts: dict[str, int] = {}
+    for kind, ndx, name in symbol_rows:
+        if kind != "OBJECT" or ndx == "UND":
+            continue
+        match = re.fullmatch(r"_ZL\d+(g_(?:self|dist_ptr|ccec_.*|fdwic_.*))", name)
+        if match is not None:
+            logical_name = match.group(1)
+            runtime_state_counts[logical_name] = runtime_state_counts.get(logical_name, 0) + 1
+    invalid_state = [
+        f"{symbol}={runtime_state_counts.get(symbol, 0)}"
+        for symbol in ("g_self", "g_dist_ptr")
+        if runtime_state_counts.get(symbol, 0) != 1
+    ]
+    duplicate_state = [
+        f"{symbol}={count}"
+        for symbol, count in sorted(runtime_state_counts.items())
+        if count != 1 and symbol not in {"g_self", "g_dist_ptr"}
+    ]
+    generic_present = any(name == "aicpu_orchestration_entry" for _kind, _ndx, name in symbol_rows)
+    if invalid or invalid_state or duplicate_state or generic_present:
+        details = []
+        if invalid:
+            details.append(f"expected exactly one defined role entry ({', '.join(invalid)})")
+        if invalid_state:
+            details.append(f"expected exactly one attached runtime state ({', '.join(invalid_state)})")
+        if duplicate_state:
+            details.append(f"duplicate role-local worker state ({', '.join(duplicate_state)})")
+        if generic_present:
+            details.append("generic aicpu_orchestration_entry is still present")
+        raise RuntimeError(f"Invalid shared-PA AICore image {binary}: {'; '.join(details)}")
+
+
 def maybe_build_aicore_override(
     cache_key,
     platform: str,
@@ -515,8 +579,14 @@ def maybe_build_aicore_override(
     # Keep PTO2_PROFILING at its normal value because it also owns the public
     # Arg layout. Each isolated evidence profile independently removes the dist
     # swimlane/atomic path without changing orchestration/incore ABI.
-    compile_definitions = _fdwic_compile_definitions(profile)
     tensormap_mode = _fdwic_tensormap_mode()
+    compile_definitions = list(_fdwic_compile_definitions(profile) or ())
+    if tensormap_mode == _FDWIC_TENSORMAP_SHARED:
+        # Shared phase 1 admits only the explicitly declared PA callable.
+        # Its CCEC image uses one AIC-owned unity source that emits both role
+        # bodies; the AIV orchestration translation unit is intentionally empty.
+        # The runtime dispatches to two distinct role entry symbols after attach.
+        compile_definitions.append("PTO_FDWIC_SHARED_PA_UNITY=1")
     builder = RuntimeBuilder(platform, fdwic_tensormap_mode=tensormap_mode)
     binary = builder.build_aicore_with_extra_sources(
         runtime,
@@ -525,6 +595,8 @@ def maybe_build_aicore_override(
         pto_isa_root=pto_isa_root,
         compile_definitions=compile_definitions,
     )
+    if platform == "a5" and tensormap_mode == _FDWIC_TENSORMAP_SHARED:
+        _assert_fdwic_shared_pa_role_entries(binary)
     if profile in _FDWIC_PERF_CLOCK_PROFILES:
         _assert_fdwic_perf_clock_elf(binary, profile)
     elif profile in _FDWIC_SUBMIT_PMU_PROFILES:
@@ -1227,7 +1299,8 @@ def _run_swimlane_converter(
     func_names_path: Path | None = None,
     enable_overhead: bool = False,
     *,
-    strict_fdwic_v4: bool = False,
+    strict_fdwic: bool = False,
+    strict_fdwic_v4: bool | None = None,
 ) -> None:
     """Invoke the bundled swimlane converter as a subprocess.
 
@@ -1239,11 +1312,16 @@ def _run_swimlane_converter(
     8 Overhead Analysis counter tracks (per-engine idle/ready/overhead + system
     all/has overhead) under the AICPU Scheduler process. Needs deps.json; the
     converter silently no-ops if deps is absent.
+
+    ``strict_fdwic_v4`` is a compatibility spelling for older callers. Strict
+    conversion now covers both production schema-v4 and shared schema-v5.
     """
     import logging  # noqa: PLC0415
     import subprocess  # noqa: PLC0415
 
     logger = logging.getLogger(__name__)
+    if strict_fdwic_v4 is not None:
+        strict_fdwic = strict_fdwic_v4
     cmd = [sys.executable, "-m", "simpler_setup.tools.swimlane_converter"]
     if input_path is not None:
         cmd.append(str(input_path))
@@ -1255,9 +1333,9 @@ def _run_swimlane_converter(
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
         if result.stdout:
             logger.info(result.stdout)
-        if strict_fdwic_v4:
+        if strict_fdwic:
             if input_path is None:
-                raise RuntimeError("strict FDWIC schema-v4 conversion requires an explicit raw input path")
+                raise RuntimeError("strict FDWIC conversion requires an explicit raw input path")
             required_outputs = (
                 input_path.parent / "merged_swimlane.json",
                 input_path.parent / "swimlane_exclusive_analysis.json",
@@ -1265,13 +1343,13 @@ def _run_swimlane_converter(
             missing_outputs = [str(path) for path in required_outputs if not path.is_file() or path.stat().st_size == 0]
             if missing_outputs:
                 raise RuntimeError(
-                    "FDWIC schema-v4 conversion did not publish required artifact(s): " + ", ".join(missing_outputs)
+                    "FDWIC conversion did not publish required artifact(s): " + ", ".join(missing_outputs)
                 )
         logger.info("Swimlane JSON generation completed")
     except subprocess.CalledProcessError as e:
-        if strict_fdwic_v4:
+        if strict_fdwic:
             details = e.stderr.strip() or e.stdout.strip() or str(e)
-            raise RuntimeError(f"FDWIC schema-v4 conversion/closure validation failed: {details}") from e
+            raise RuntimeError(f"FDWIC conversion/closure validation failed: {details}") from e
         logger.warning(f"Failed to generate swimlane JSON: {e}")
         if e.stdout:
             logger.debug(f"stdout: {e.stdout}")
@@ -1289,7 +1367,8 @@ def _convert_case_swimlane(
     callable_spec: dict | None = None,
     enable_overhead: bool = False,
     *,
-    strict_fdwic_v4: bool = False,
+    strict_fdwic: bool = False,
+    strict_fdwic_v4: bool | None = None,
 ) -> None:
     """Post-case: invoke the swimlane converter on the perf file the runtime
     just wrote into ``<output_prefix>/l2_swimlane_records.json``. No diff/rename
@@ -1298,10 +1377,12 @@ def _convert_case_swimlane(
     import logging  # noqa: PLC0415
 
     logger = logging.getLogger(__name__)
+    if strict_fdwic_v4 is not None:
+        strict_fdwic = strict_fdwic_v4
     perf_file = output_prefix / "l2_swimlane_records.json"
     if not perf_file.exists():
-        if strict_fdwic_v4:
-            raise RuntimeError(f"[{case_label}] required FDWIC schema-v4 raw artifact was not produced: {perf_file}")
+        if strict_fdwic:
+            raise RuntimeError(f"[{case_label}] required FDWIC raw artifact was not produced: {perf_file}")
         logger.warning(f"[{case_label}] {perf_file} not produced; skipping conversion")
         return
 
@@ -1316,7 +1397,7 @@ def _convert_case_swimlane(
         input_path=perf_file,
         func_names_path=func_names_path,
         enable_overhead=enable_overhead,
-        strict_fdwic_v4=strict_fdwic_v4,
+        strict_fdwic=strict_fdwic,
     )
 
 
@@ -1694,7 +1775,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
             raise
         finally:
             if enable_l2_swimlane:
-                strict_fdwic_v4 = (
+                strict_fdwic = (
                     case_succeeded
                     and enable_l2_swimlane == 4
                     and getattr(cls_inst, "_st_runtime", None) == "fully_distributed_within_core"
@@ -1705,7 +1786,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                     prefix,
                     callable_spec=callable_spec,
                     enable_overhead=enable_swimlane_overhead,
-                    strict_fdwic_v4=strict_fdwic_v4,
+                    strict_fdwic=strict_fdwic,
                 )
             if enable_dep_gen:
                 _graph_case_dep_gen(case_label, prefix, callable_spec=callable_spec)
@@ -1918,6 +1999,16 @@ class SceneTestCase:
         # at run() time. Cases that need a specific value still set it
         # explicitly in their config dict.
         config.block_dim = config_dict.get("block_dim", 0)
+        if (
+            self._st_level == 2
+            and self._st_runtime == "fully_distributed_within_core"
+            and _fdwic_tensormap_mode() == _FDWIC_TENSORMAP_SHARED
+            and "fdwic_shared_block_dim" in config_dict
+        ):
+            # A shared backend may deliberately use a topology narrower than
+            # the private runtime's auto-selected maximum. Keep that override
+            # mode-local so the same case retains its private behavior.
+            config.block_dim = config_dict["fdwic_shared_block_dim"]
         config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 3)
         # Per-task ring sizing (tensormap_and_ringbuffer only; 0 = unset),
         # nested under the "runtime_env" key. Takes precedence over the
@@ -2268,14 +2359,6 @@ class SceneTestCase:
                 enable_scope_stats = False
 
         cls_name = type(self).__name__
-        callable_obj = self.build_callable(st_platform)
-        sub_handles = getattr(type(self), "_st_sub_handles", {})
-        # For L3, use registered chip handles instead of raw ChipCallable
-        # objects.
-        chip_handles = getattr(type(self), "_st_chip_handles", {})
-        if self._st_level == 3 and chip_handles:
-            callable_obj = {**chip_handles}
-
         matched = []
         for case in self.CASES:
             if st_platform not in case["platforms"]:
@@ -2293,6 +2376,17 @@ class SceneTestCase:
             import pytest  # noqa: PLC0415
 
             pytest.skip(f"No cases matched {cls_name} (platform={st_platform}, manual={manual_mode})")
+
+        _validate_fdwic_tensormap_test_classes(
+            _fdwic_tensormap_mode(), {type(self): matched}
+        )
+        callable_obj = self.build_callable(st_platform)
+        sub_handles = getattr(type(self), "_st_sub_handles", {})
+        # For L3, use registered chip handles instead of raw ChipCallable
+        # objects.
+        chip_handles = getattr(type(self), "_st_chip_handles", {})
+        if self._st_level == 3 and chip_handles:
+            callable_obj = {**chip_handles}
 
         run_class_cases(
             st_worker,

@@ -35,8 +35,17 @@
 [[block_local]] static uint32_t g_fdwic_swimlane_level;
 [[block_local]] static __gm__ FdwicSwimlaneHeader *g_fdwic_swimlane_header;
 [[block_local]] static __gm__ FdwicSwimlaneCoreState *g_fdwic_swimlane_core;
-[[block_local]] static __gm__ FdwicSwimlaneRecord *g_fdwic_swimlane_records;
+[[block_local]] static __gm__ FdwicSwimlaneStorageRecord *g_fdwic_swimlane_records;
 [[block_local]] static uint32_t g_fdwic_swimlane_records_per_core;
+#if PTO_FDWIC_SHARED_MAP
+[[block_local]] static uint32_t g_fdwic_swimlane_record_count;
+[[block_local]] static uint32_t g_fdwic_swimlane_dropped_records;
+[[block_local]] static uint32_t g_fdwic_swimlane_shared_submit_count;
+[[block_local]] static uint32_t g_fdwic_dcci_calls;
+[[block_local]] static uint32_t g_fdwic_dcci_lines;
+[[block_local]] static uint32_t g_fdwic_dcci_records;
+[[block_local]] static bool g_fdwic_dcci_counter_overflow;
+#endif
 [[block_local]] static FdwicAtomicPollBurst g_fdwic_atomic_poll_burst;
 [[block_local]] static uint32_t g_fdwic_atomic_calls;
 [[block_local]] static uint32_t g_fdwic_poll_calls;
@@ -94,8 +103,17 @@ thread_local bool g_fdwic_joint_submit_seen = false;
 thread_local uint32_t g_fdwic_swimlane_level = 0;
 thread_local FdwicSwimlaneHeader *g_fdwic_swimlane_header = nullptr;
 thread_local FdwicSwimlaneCoreState *g_fdwic_swimlane_core = nullptr;
-thread_local FdwicSwimlaneRecord *g_fdwic_swimlane_records = nullptr;
+thread_local FdwicSwimlaneStorageRecord *g_fdwic_swimlane_records = nullptr;
 thread_local uint32_t g_fdwic_swimlane_records_per_core = 0;
+#if PTO_FDWIC_SHARED_MAP
+thread_local uint32_t g_fdwic_swimlane_record_count = 0;
+thread_local uint32_t g_fdwic_swimlane_dropped_records = 0;
+thread_local uint32_t g_fdwic_swimlane_shared_submit_count = 0;
+thread_local uint32_t g_fdwic_dcci_calls = 0;
+thread_local uint32_t g_fdwic_dcci_lines = 0;
+thread_local uint32_t g_fdwic_dcci_records = 0;
+thread_local bool g_fdwic_dcci_counter_overflow = false;
+#endif
 thread_local FdwicAtomicPollBurst g_fdwic_atomic_poll_burst = {};
 thread_local uint32_t g_fdwic_atomic_calls = 0;
 thread_local uint32_t g_fdwic_poll_calls = 0;
@@ -152,8 +170,17 @@ thread_local bool g_fdwic_joint_submit_seen = false;
 thread_local uint32_t g_fdwic_swimlane_level = 0;
 thread_local FdwicSwimlaneHeader *g_fdwic_swimlane_header = nullptr;
 thread_local FdwicSwimlaneCoreState *g_fdwic_swimlane_core = nullptr;
-thread_local FdwicSwimlaneRecord *g_fdwic_swimlane_records = nullptr;
+thread_local FdwicSwimlaneStorageRecord *g_fdwic_swimlane_records = nullptr;
 thread_local uint32_t g_fdwic_swimlane_records_per_core = 0;
+#if PTO_FDWIC_SHARED_MAP
+thread_local uint32_t g_fdwic_swimlane_record_count = 0;
+thread_local uint32_t g_fdwic_swimlane_dropped_records = 0;
+thread_local uint32_t g_fdwic_swimlane_shared_submit_count = 0;
+thread_local uint32_t g_fdwic_dcci_calls = 0;
+thread_local uint32_t g_fdwic_dcci_lines = 0;
+thread_local uint32_t g_fdwic_dcci_records = 0;
+thread_local bool g_fdwic_dcci_counter_overflow = false;
+#endif
 thread_local FdwicAtomicPollBurst g_fdwic_atomic_poll_burst = {};
 thread_local uint32_t g_fdwic_atomic_calls = 0;
 thread_local uint32_t g_fdwic_poll_calls = 0;

@@ -537,6 +537,24 @@ def _valid_register_capture() -> dict[str, Any]:
     return capture
 
 
+def _valid_shared_winner_only_register_capture() -> dict[str, Any]:
+    capture = _valid_register_capture()
+    phase = capture["configuration"]["phase"]
+    phase.pop("expected_calls_per_core")
+    phase.update({"call_shape": "dynamic_global", "expected_calls": {"all": 5}})
+    capture["validation"]["phase_global_call_count_closed"] = True
+    for logical_core_id, record in enumerate(capture["records"]):
+        calls = int(logical_core_id < 5)
+        record["phase_elapsed_ticks"] = 75 * calls
+        record["phase_total_cycles_observed"] = 300 * calls
+        record["phase_scalar_busy_observed"] = 180 * calls
+        record["phase_icache_requests_observed"] = 40 * calls
+        record["phase_icache_misses_observed"] = 2 * calls
+        record["phase_begin_reads"] = calls
+        record["phase_end_reads"] = calls
+    return capture
+
+
 def _valid_submit_transition_capture() -> dict[str, Any]:
     capture = _valid_arg_build_capture()
     capture["capture"]["mode"] = SUBMIT_TRANSITION_CAPTURE_MODE
@@ -701,6 +719,8 @@ def _fake_build_identity(
     if profile != "submit-pmu-none":
         compile_definitions.append(f"PTO_FDWIC_SUBMIT_PMU_PHASE_ID={report_module.PHASE_CONFIG_BY_MODE[profile]['id']}")
     compile_definitions.append("PTO_FDWIC_TRACE_ENABLED=0")
+    if tensormap_mode == "shared":
+        compile_definitions.append("PTO_FDWIC_SHARED_PA_UNITY=1")
     frozen_compile_definitions = tuple(compile_definitions)
     definitions_sha256 = hashlib.sha256(repr(compile_definitions).encode()).hexdigest()
     source_state = f"source-v2:{'1' * 40}:{'2' * 64}:{definitions_sha256}"
@@ -1287,6 +1307,39 @@ def test_prepare_map_rejects_wrong_record_phase_id(tmp_path: Path) -> None:
     capture["records"][0]["phase_id"] = 3
 
     with pytest.raises(ValueError, match=r"records\[0\]\.phase_id must equal 8"):
+        load_capture(_write_capture(tmp_path, capture))
+
+
+def test_valid_shared_register_accepts_winner_distributed_call_shape(tmp_path: Path) -> None:
+    raw_path = _write_capture(tmp_path, _valid_shared_winner_only_register_capture())
+
+    capture = load_capture(raw_path)
+
+    assert capture.phase_summary is not None
+    assert capture.phase_summary["all"]["phase_business_calls"] == 5
+    assert capture.phase_summary["all"]["phase_zero_call_cores"] == 91
+    document = render_report(raw_path)
+    assert "call_shape=dynamic_global" in document
+    assert "expected_calls=ALL 5（角色不锁定）" in document
+    assert "零调用核 91" in document
+
+
+def test_shared_register_rejects_wrong_global_winner_count(tmp_path: Path) -> None:
+    capture = _valid_shared_winner_only_register_capture()
+    winner = capture["records"][4]
+    winner.update(
+        {
+            "phase_elapsed_ticks": 0,
+            "phase_total_cycles_observed": 0,
+            "phase_scalar_busy_observed": 0,
+            "phase_icache_requests_observed": 0,
+            "phase_icache_misses_observed": 0,
+            "phase_begin_reads": 0,
+            "phase_end_reads": 0,
+        }
+    )
+
+    with pytest.raises(ValueError, match="dynamic phase call totals: global call total must equal 5"):
         load_capture(_write_capture(tmp_path, capture))
 
 
@@ -2382,6 +2435,7 @@ def test_shared_tensormap_provenance_closes_cache_key_definitions_and_html(
     assert provenance["build"]["tensormap_mode"] == "shared"
     assert provenance["build"]["profiled_cache_key"][-2:] == ["shared", "submit-pmu-none"]
     assert provenance["build"]["compile_definitions"][0] == "PTO_FDWIC_SHARED_MAP=1"
+    assert provenance["build"]["compile_definitions"][-1] == "PTO_FDWIC_SHARED_PA_UNITY=1"
     assert "<code>shared</code>" in output_path.read_text(encoding="utf-8")
 
 

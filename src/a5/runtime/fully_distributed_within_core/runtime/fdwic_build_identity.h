@@ -47,18 +47,24 @@ enum class FdwicTensorMapMode : uint32_t {
 };
 
 inline constexpr uint64_t kFdwicBuildIdentityMagic = 0x46445749434d4150ULL;  // "FDWICMAP"
-inline constexpr uint32_t kFdwicBuildAbiVersion = 4;
-inline constexpr uint32_t kFdwicDistGlobalLayoutVersion = 4;
+inline constexpr uint32_t kFdwicBuildAbiVersion = PTO_FDWIC_SHARED_MAP ? 6U : 4U;
+inline constexpr uint32_t kFdwicDistGlobalLayoutVersion = PTO_FDWIC_SHARED_MAP ? 6U : 4U;
 inline constexpr FdwicTensorMapMode kFdwicCompiledTensorMapMode = static_cast<FdwicTensorMapMode>(PTO_FDWIC_SHARED_MAP);
-inline constexpr uint32_t kFdwicTensorMapRingCap = PTO_FDWIC_TENSORMAP_RING_CAP;
+// The replacement shared PA backend has no address-region ring. Keep the
+// identity field for the stable 64-byte cross-image prefix, but publish zero
+// rather than pretending the private CAP controls shared semantics.
+#if PTO_FDWIC_SHARED_MAP
+inline constexpr uint32_t kFdwicTensorMapRingCap = 0;
+inline constexpr uint32_t kFdwicTensorMapRingBuckets = 0;
+#else
+inline constexpr uint32_t kFdwicTensorMapRingCap = static_cast<uint32_t>(PTO_FDWIC_TENSORMAP_RING_CAP);
 inline constexpr uint32_t kFdwicTensorMapRingBuckets = 16384U / kFdwicTensorMapRingCap;
+#endif
 
-// Basic shared Submit transactions are wired, but multi-worker convergence,
-// PA region-intent, visibility, and device gates are not complete. Shared
-// images may compile and run ABI/integration gates, but normal execution must
-// still stop before the first Submit and may never fall back to private map
-// semantics.
-inline constexpr bool kFdwicCompiledBackendReady = PTO_FDWIC_SHARED_MAP == 0;
+// Both artifact families have an executable backend. The shared image is
+// deliberately narrower: only the fixed single-group PA protocol is accepted,
+// while generic shared Submit and unsupported launch shapes fail closed.
+inline constexpr bool kFdwicCompiledBackendReady = true;
 
 enum FdwicBuildError : uint32_t {
     FdwicBuildErrorNone = 0,

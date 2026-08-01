@@ -18,8 +18,9 @@
 // Block i occupies sij[i*M : (i+1)*M, 0:N].
 //
 // Optimizations:
-//   - qi TLOAD hoisted before the loop (constant across all iterations)
-//   - Double-buffered L1 B tiles: prefetch next kj during current TMATMUL+TSTORE
+//   - qi is staged into L0A once (TMATMUL only reads its operands)
+//   - L1/L0B/L0C use precise ping-pong dependencies so adjacent blocks can
+//     overlap MTE2, MTE1, M and FIX without a loop-wide PIPE_ALL barrier
 //
 // Supports two tile configurations via runtime dispatch:
 //   Case1: (16, 128) @ (128, 128).T -> (16, 128)
@@ -62,73 +63,91 @@ static __aicore__ void qk_matmul_n_impl(
     using RightTile = TileRight<bfloat16_t, K, N, K, N>;
     using AccTile = TileAcc<float, M, N, M, N>;
 
-    // Double-buffered L1 B tiles for kj prefetching
+    // Double-buffer the changing B operand and each independent result.  The
+    // constant A operand is copied into L0A only once before the loop.
     constexpr int kBBytes = K * N * static_cast<int>(sizeof(bfloat16_t));
+    constexpr int kCBytes = M * N * static_cast<int>(sizeof(float));
     TileMatA aMatTile;
-    TileMatB bMatTile_A;
-    TileMatB bMatTile_B;
+    TileMatB bMatTile[2];
     TASSIGN(aMatTile, 0x0);
-    TASSIGN(bMatTile_A, 0x20000);
-    TASSIGN(bMatTile_B, 0x20000 + kBBytes);
+    TASSIGN(bMatTile[0], 0x20000);
+    TASSIGN(bMatTile[1], 0x20000 + kBBytes);
 
     LeftTile aTile;
-    RightTile bTile;
-    AccTile cTile;
+    RightTile bTile[2];
+    AccTile cTile[2];
     TASSIGN(aTile, 0x0);
-    TASSIGN(bTile, 0x0);
-    TASSIGN(cTile, 0x0);
+    TASSIGN(bTile[0], 0x0);
+    TASSIGN(bTile[1], kBBytes);
+    TASSIGN(cTile[0], 0x0);
+    TASSIGN(cTile[1], kCBytes);
 
-    // Hoist qi TLOAD before the loop (qi is constant across all blocks)
+    // Stage the immutable query through L1 into L0A once.  TMATMUL declares
+    // both operands as inputs, so later blocks may safely reuse the same L0A
+    // tile without copying it again.
     GlobalA qiGlobal(qi_base);
     TLOAD(aMatTile, qiGlobal);
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID2);
+    wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID2);
+    TMOV(aTile, aMatTile);
+    set_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
+    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
 
-    // Pre-load first kj into buffer A
-    GlobalB kjGlobal_0(key_base + bt[bt_offset + 0] * N * K);
-    TLOAD(bMatTile_A, kjGlobal_0);
+    // Prime the three reverse dependencies.  Each slot is initially free:
+    //   MTE1 -> MTE2 releases an L1 B slot after TMOV;
+    //   M    -> MTE1 releases an L0B slot after TMATMUL;
+    //   FIX  -> M releases an L0C slot after TSTORE.
+    set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+    set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
 
     for (uint64_t i = 0; i < n_blocks; i++) {
+        const int cur = static_cast<int>(i % 2);
+        const ::event_t event = static_cast<::event_t>(cur);
+        GlobalB kjGlobal(key_base + bt[bt_offset + i] * N * K);
         GlobalOut sijGlobal(sij_base + i * M * N);
 
-        // Wait for current kj TLOAD to complete
-        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+        // Stage 1: GM -> L1[cur].  Do not overwrite this slot until its
+        // previous L1 -> L0B transfer has completed.
+        wait_flag(PIPE_MTE1, PIPE_MTE2, event);
+        TLOAD(bMatTile[cur], kjGlobal);
+        set_flag(PIPE_MTE2, PIPE_MTE1, event);
 
-        // TMOV qi L1→L0A and kj L1→L0B from current buffer
-        TMOV(aTile, aMatTile);
-        if (i % 2 == 0) {
-            TMOV(bTile, bMatTile_A);
-        } else {
-            TMOV(bTile, bMatTile_B);
-        }
+        // Stage 2: L1[cur] -> L0B[cur].  The forward event waits for this
+        // block's load; the reverse event protects the previous user.
+        wait_flag(PIPE_M, PIPE_MTE1, event);
+        wait_flag(PIPE_MTE2, PIPE_MTE1, event);
+        TMOV(bTile[cur], bMatTile[cur]);
+        set_flag(PIPE_MTE1, PIPE_MTE2, event);
+        set_flag(PIPE_MTE1, PIPE_M, event);
 
-        // Prefetch next kj into alternate L1 buffer (overlaps with MTE1→M→FIX)
-        if (i + 1 < n_blocks) {
-            GlobalB kjGlobal_next(key_base + bt[bt_offset + i + 1] * N * K);
-            if (i % 2 == 0) {
-                TLOAD(bMatTile_B, kjGlobal_next);
-            } else {
-                TLOAD(bMatTile_A, kjGlobal_next);
-            }
-        }
+        // Stage 3: L0A x L0B[cur] -> L0C[cur].  FIX releases the accumulator
+        // slot only after the prior TSTORE has consumed it.
+        wait_flag(PIPE_FIX, PIPE_M, event);
+        wait_flag(PIPE_MTE1, PIPE_M, event);
+        TMATMUL(cTile[cur], aTile, bTile[cur]);
+        set_flag(PIPE_M, PIPE_MTE1, event);
+        set_flag(PIPE_M, PIPE_FIX, event);
 
-        set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
-        wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
-
-        TMATMUL(cTile, aTile, bTile);
-
-        set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
-        wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
-
-        TSTORE(sijGlobal, cTile);
-
-        if (i + 1 < n_blocks) {
-            // Drain all pipes before next iteration:
-            //   - FIX/MTE3: ensures TSTORE data path (L0C→UB→GM) fully completes
-            //   - MTE2: prefetch TLOAD likely already done (ran during TMATMUL+TSTORE)
-            // The prefetch TLOAD overlaps with compute, so barrier cost is minimal.
-            pipe_barrier(PIPE_ALL);
-        }
+        // Stage 4: L0C[cur] -> GM.  The reverse event lets M reuse this slot
+        // two iterations later without draining unrelated pipelines.
+        wait_flag(PIPE_M, PIPE_FIX, event);
+        TSTORE(sijGlobal, cTile[cur]);
+        set_flag(PIPE_FIX, PIPE_M, event);
     }
+
+    // Consume the final release token for every ping-pong slot.  This also
+    // drains the last in-flight iteration without leaking event state into
+    // the next linked kernel invocation.
+    wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
     pipe_sync();
 }
 

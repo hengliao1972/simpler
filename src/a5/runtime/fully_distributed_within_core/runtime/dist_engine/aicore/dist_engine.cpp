@@ -10,6 +10,13 @@
  */
 
 #include "dist_engine/common/target.h"
+
+// The phase-1 shared PA callable compiles this implementation together with
+// its orchestration body. The ordinary source entry stays in the build graph
+// as an empty object for that image, while baseline/private/AICPU builds keep
+// their established translation-unit boundaries.
+#if !PTO_FDWIC_SHARED_PA_UNITY || defined(PTO_FDWIC_SHARED_PA_UNITY_IMPLEMENTATION)
+
 #include "callable.h"
 #include "inner_kernel.h"
 #include "pto_runtime2.h"
@@ -30,7 +37,18 @@ extern "C" PTO_DEVICE_FUNC __attribute__((weak)) void *memcpy(void *dst, const v
     return aicore_memcpy(dst, src, n);
 }
 
+#if PTO_FDWIC_SHARED_PA_UNITY
+// The final AICore image contains both architecture objects. A single weak
+// aicpu_orchestration_entry would be deduplicated to one role-specialized
+// body, so shared PA gives each role a unique internal symbol and dispatches
+// after the runtime has attached the authoritative DistCore identity.
+extern "C" PTO_DEVICE_FUNC void
+aicpu_orchestration_entry_aic(const L2TaskArgs &orch_args) __attribute__((weak));
+extern "C" PTO_DEVICE_FUNC void
+aicpu_orchestration_entry_aiv(const L2TaskArgs &orch_args) __attribute__((weak));
+#else
 extern "C" PTO_DEVICE_FUNC void aicpu_orchestration_entry(const L2TaskArgs &orch_args) __attribute__((weak));
+#endif
 extern "C" PTO_DEVICE_FUNC int32_t pto_call_linked_kernel_aic(int32_t func_id, __gm__ int64_t *args)
     __attribute__((weak));
 extern "C" PTO_DEVICE_FUNC int32_t pto_call_linked_kernel_aiv(int32_t func_id, __gm__ int64_t *args)
@@ -57,3 +75,5 @@ extern "C" PTO_DEVICE_FUNC void aicpu_orchestration_entry(const L2TaskArgs &orch
 #include "dist_engine/aicore/backend.h"             // NOLINT(build/include_subdir)
 #include "dist_engine/aicore/submit_runtime.h"      // NOLINT(build/include_subdir)
 #include "dist_engine/aicore/core_main.h"           // NOLINT(build/include_subdir)
+
+#endif  // !PTO_FDWIC_SHARED_PA_UNITY || PTO_FDWIC_SHARED_PA_UNITY_IMPLEMENTATION

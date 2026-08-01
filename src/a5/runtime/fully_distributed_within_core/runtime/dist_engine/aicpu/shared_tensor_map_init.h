@@ -16,20 +16,34 @@
 
 namespace {
 
-// shared sidecar 只能由 AICPU setup thread 在唤醒 worker 前初始化一次。
-// payload 无需清零：reader 只接受与 absolute cursor 相等的非负 seq；
-// -1 和 WRITING 都不可读，reset 统一恢复为 -1，且随后 AICPU 会把整个
-// DistGlobal flush 到 GM。显式重置所有控制字可以支持同一 arena 的重复 run，
-// 也避免把 slot 0 的合法 seq=0 与零填充状态混为一谈。
-inline void dist_shared_tensor_map_reset(SharedTensorMapState &state) {
-    atomic_exchange(state.committed_tasks.v, int64_t{kSharedTensorMapInitialCommit}, __ATOMIC_RELAXED);
-    atomic_exchange(state.reclaim_upto.v, int64_t{kSharedTensorMapInitialReclaim}, __ATOMIC_RELAXED);
-    for (uint32_t bucket = 0; bucket < kMapBuckets; ++bucket) {
-        atomic_exchange(state.buckets[bucket].head.v, int64_t{0}, __ATOMIC_RELAXED);
-        atomic_exchange(state.buckets[bucket].tail.v, int64_t{0}, __ATOMIC_RELAXED);
+// Only the AICPU setup thread may reset the shared PA sidecar, before workers
+// are released. Descriptor/history payload bytes need not be cleared: their
+// publication controls return to -1, and every writer overwrites a complete
+// payload before publishing it. Resetting every control word supports repeated
+// runs in the same runtime arena without introducing a generation protocol.
+inline void dist_shared_pa_tensor_map_reset(SharedPaTensorMapState &state) {
+    for (uint32_t task = 0; task < kFdwicSharedPaTaskCapacity; ++task) {
+        for (uint32_t output = 0; output < kFdwicSharedOutputMaxPerTask; ++output) {
+            atomic_exchange(state.shared_outputs[task].published[output].v, int64_t{-1}, __ATOMIC_RELAXED);
+            atomic_exchange(state.shared_outputs[task].last_writer[output].v, int64_t{-1}, __ATOMIC_RELAXED);
+        }
+        state.writer_history[task].magic = 0;
+        state.writer_history[task].writer_task = -1;
+        state.writer_history[task].count = 0;
+        state.writer_history[task].reserved = 0;
+        atomic_exchange(state.claim_tournament[task].root.owner.v, int64_t{-1}, __ATOMIC_RELAXED);
+        for (uint32_t group = 0; group < kFdwicSharedClaimTournamentMaxGroups; ++group) {
+            atomic_exchange(
+                state.claim_tournament[task].local[group].owner.v, int64_t{-1}, __ATOMIC_RELAXED
+            );
+        }
     }
-    for (int32_t slot = 0; slot < kMapCap; ++slot) {
-        atomic_exchange(state.slots[slot].sequence.v, int64_t{kSharedTensorMapInvalidSequence}, __ATOMIC_RELAXED);
+    for (uint32_t shard = 0; shard < kFdwicSharedHeapShards; ++shard) {
+        atomic_exchange(state.shared_heap_cursor[shard].v, int64_t{0}, __ATOMIC_RELAXED);
+    }
+    atomic_exchange(state.shared_heap_vend.v, int64_t{0}, __ATOMIC_RELAXED);
+    for (uint32_t shard = 0; shard < kFdwicSharedVectorCursorShards; ++shard) {
+        atomic_exchange(state.shared_vector_cursor[shard].v, int64_t{-1}, __ATOMIC_RELAXED);
     }
 }
 

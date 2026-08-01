@@ -24,6 +24,12 @@ PTO_DEVICE_FUNC void dist_core_reset(__gm__ DistCore &self, CoreType r, int32_t 
     self.occupied_count = 0;
     self.owned_total = 0;
     self.swimlane_last_cycle = 0;
+#if PTO_FDWIC_SHARED_MAP
+    // Shared reuses two bytes from the existing pre-slot padding for local
+    // opportunistic-EfDrain backoff. No DistCore offset or size changes.
+    self.slots_pad[0] = 0;
+    self.slots_pad[1] = 0;
+#endif
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         self.slots[i].occupied = false;
         self.slots[i].built = false;

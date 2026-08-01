@@ -446,6 +446,31 @@ target_include_directories(test_fdwic_swimlane_poll_batch BEFORE PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
 )
 
+# Shared schema-v5 uses a different physical record type from the logical
+# 32-byte JSON row. Compile the production writer APIs in that exact mode and
+# lock fixed Submit/Claim routing, compact packing, delayed atomic recording,
+# and DCCI counter closure.
+add_a5_test(test_fdwic_shared_swimlane_v5 a5/test_fdwic_shared_swimlane_v5.cpp)
+target_sources(test_fdwic_shared_swimlane_v5 PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/host/fdwic_swimlane.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/host_log.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/unified_log_host.cpp
+)
+target_compile_definitions(test_fdwic_shared_swimlane_v5 PRIVATE
+    __CPU_SIM=1
+    PTO_FDWIC_SHARED_MAP=1
+    PTO_FDWIC_TENSORMAP_RING_CAP=128
+    SIMPLER_PLATFORM_NAME="a5sim"
+)
+target_include_directories(test_fdwic_shared_swimlane_v5 BEFORE PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log
+)
+set_tests_properties(test_fdwic_shared_swimlane_v5 PROPERTIES LABELS "no_hardware")
+
 # DistTensorMap ring 是 header-only production 实现。同一源码先锁默认
 # CAP=128，再重编译四个结构边界，覆盖额外 bucket control、普通固定前缀
 # 和单桶 hash 特例；reference 只比较逻辑语义，不复制被测 ring。
@@ -470,15 +495,16 @@ add_fdwic_tensor_map_ring_test(test_fdwic_tensor_map_ring_cap64 64)
 add_fdwic_tensor_map_ring_test(test_fdwic_tensor_map_ring_cap256 256)
 add_fdwic_tensor_map_ring_test(test_fdwic_tensor_map_ring_cap16384 16384)
 
-# shared sidecar 先独立验证布局和 AICPU 一次性初始化，production 顶层仍
-# fail-closed。五个 CAP 覆盖 bucket-control 长度变化，额外 private 目标
-# 锁住“只在 shared DistGlobal 尾部追加”的 ABI 边界。
-function(add_fdwic_shared_tensor_map_state_test name shared_map ring_cap)
+# The shared PA sidecar no longer contains an address-region ring, so private
+# CAP permutations do not describe its behavior. Compile the exact state/reset
+# test once per artifact mode: private freezes the old DistGlobal tail, shared
+# freezes the appended layout plus its publication controls and stable refs.
+function(add_fdwic_tensor_map_state_test name shared_map)
     add_a5_test(${name} a5/test_fdwic_shared_tensor_map_state.cpp)
     target_compile_definitions(${name} PRIVATE
         __CPU_SIM=1
         PTO_FDWIC_SHARED_MAP=${shared_map}
-        PTO_FDWIC_TENSORMAP_RING_CAP=${ring_cap}
+        PTO_FDWIC_TENSORMAP_RING_CAP=128
     )
     target_include_directories(${name} BEFORE PRIVATE
         ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
@@ -489,37 +515,82 @@ function(add_fdwic_shared_tensor_map_state_test name shared_map ring_cap)
     set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
 endfunction()
 
-add_fdwic_shared_tensor_map_state_test(test_fdwic_private_tensor_map_state_layout 0 128)
-add_fdwic_shared_tensor_map_state_test(test_fdwic_shared_tensor_map_state 1 128)
-add_fdwic_shared_tensor_map_state_test(test_fdwic_shared_tensor_map_state_cap32 1 32)
-add_fdwic_shared_tensor_map_state_test(test_fdwic_shared_tensor_map_state_cap64 1 64)
-add_fdwic_shared_tensor_map_state_test(test_fdwic_shared_tensor_map_state_cap256 1 256)
-add_fdwic_shared_tensor_map_state_test(test_fdwic_shared_tensor_map_state_cap16384 1 16384)
+add_fdwic_tensor_map_state_test(test_fdwic_private_tensor_map_state_layout 0)
+add_fdwic_tensor_map_state_test(test_fdwic_shared_pa_tensor_map_state 1)
 
-# shared ring primitive 仍不接 Submit；五种 CAP 都直接实例化 production
-# 状态机，验证 exact-turn、窗口 lookup、整 task preflight、seq 发布/复用与
-# 独立 reference 差分。
-function(add_fdwic_shared_tensor_map_ring_test name ring_cap)
-    add_a5_test(${name} a5/test_fdwic_shared_tensor_map_ring.cpp)
-    target_compile_definitions(${name} PRIVATE
-        __CPU_SIM=1
-        PTO_FDWIC_SHARED_MAP=1
-        PTO_FDWIC_TENSORMAP_RING_CAP=${ring_cap}
-    )
-    target_include_directories(${name} BEFORE PRIVATE
-        ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
-        ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
-        ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
-        ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
-    )
-    set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
-endfunction()
+# Instantiate the production no-wrap reservation template with host atomics.
+# This exercises eight fixed 32-MiB shards and the 256-MiB aggregate boundary
+# without compiling or emulating AICore cache-maintenance intrinsics.
+add_a5_test(test_fdwic_shared_pa_heap a5/test_fdwic_shared_pa_heap.cpp)
+target_compile_definitions(test_fdwic_shared_pa_heap PRIVATE
+    __CPU_SIM=1
+    PTO_FDWIC_SHARED_MAP=1
+    PTO_FDWIC_TENSORMAP_RING_CAP=128
+)
+target_include_directories(test_fdwic_shared_pa_heap BEFORE PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
+)
+set_tests_properties(test_fdwic_shared_pa_heap PROPERTIES LABELS "no_hardware")
 
-add_fdwic_shared_tensor_map_ring_test(test_fdwic_shared_tensor_map_ring 128)
-add_fdwic_shared_tensor_map_ring_test(test_fdwic_shared_tensor_map_ring_cap32 32)
-add_fdwic_shared_tensor_map_ring_test(test_fdwic_shared_tensor_map_ring_cap64 64)
-add_fdwic_shared_tensor_map_ring_test(test_fdwic_shared_tensor_map_ring_cap256 256)
-add_fdwic_shared_tensor_map_ring_test(test_fdwic_shared_tensor_map_ring_cap16384 16384)
+# Compile the production AICPU registration path in the fixed shared-PA
+# artifact. This locks fail-closed validation before workers can observe a
+# partially initialized shared backend.
+add_a5_test(test_fdwic_shared_pa_register a5/test_fdwic_shared_pa_register.cpp)
+target_compile_definitions(test_fdwic_shared_pa_register PRIVATE
+    __CPU_SIM=1
+    PTO_FDWIC_SHARED_MAP=1
+    PTO_FDWIC_TENSORMAP_RING_CAP=128
+)
+target_include_directories(test_fdwic_shared_pa_register BEFORE PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
+)
+set_tests_properties(test_fdwic_shared_pa_register PROPERTIES LABELS "no_hardware")
+
+# Compile the production shared PA Submit TU and replay one five-task batch
+# concurrently on representative AIC/AIV workers. This locks winner-only
+# argument construction, direct descriptor publication, ordered metadata
+# handoff, symbol fanin, and explicit rejection of the generic shared API.
+add_a5_test(test_fdwic_shared_pa_submit a5/test_fdwic_shared_pa_submit.cpp)
+target_compile_definitions(test_fdwic_shared_pa_submit PRIVATE
+    __CPU_SIM=1
+    PTO_FDWIC_SHARED_MAP=1
+    PTO_FDWIC_TENSORMAP_RING_CAP=128
+)
+target_include_directories(test_fdwic_shared_pa_submit BEFORE PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/orchestration
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
+)
+set_tests_properties(test_fdwic_shared_pa_submit PROPERTIES LABELS "no_hardware")
+
+# Exercise the production shared PA lifecycle waits under real host threads.
+# The test-only SPIN_WAIT_HINT hook observes entry into each blocking loop;
+# remote fatal publication happens only after that handshake, and a target
+# timeout prevents a broken convergence path from hanging the test suite.
+add_a5_test(test_fdwic_shared_pa_lifecycle a5/test_fdwic_shared_pa_lifecycle.cpp)
+target_compile_definitions(test_fdwic_shared_pa_lifecycle PRIVATE
+    __CPU_SIM=1
+    PTO_FDWIC_SHARED_MAP=1
+    PTO_FDWIC_TENSORMAP_RING_CAP=128
+)
+target_include_directories(test_fdwic_shared_pa_lifecycle BEFORE PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
+)
+set_tests_properties(test_fdwic_shared_pa_lifecycle PROPERTIES
+    LABELS "no_hardware"
+    TIMEOUT 15
+)
 
 # 容量错误必须在真实 Register→Build 边界中止，并让后续 eager Begin 在
 # Claim 前返回。该目标直接编译 production CPU-sim dist_engine TU，避免
@@ -537,58 +608,6 @@ target_include_directories(test_fdwic_submit_capacity BEFORE PRIVATE
 )
 set_tests_properties(test_fdwic_submit_capacity PROPERTIES LABELS "no_hardware")
 
-# The shared Submit adapter owns the mapping from task-transaction outcomes to
-# structured fatal codes. This target compiles the production CPU-sim TU under
-# the shared build identity without opening the AICPU backend-ready gate.
-add_a5_test(test_fdwic_shared_submit_contract a5/test_fdwic_shared_submit_contract.cpp)
-target_compile_definitions(test_fdwic_shared_submit_contract PRIVATE
-    __CPU_SIM=1
-    PTO_FDWIC_SHARED_MAP=1
-    PTO_FDWIC_TENSORMAP_RING_CAP=128
-)
-target_include_directories(test_fdwic_shared_submit_contract BEFORE PRIVATE
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
-)
-set_tests_properties(test_fdwic_shared_submit_contract PROPERTIES LABELS "no_hardware")
-
-# This gate executes the production compete-first Submit flow under the shared
-# build identity. It verifies transaction ordering at the Kernel/Alloc/joint
-# boundaries instead of testing the ring primitive or result adapter alone.
-add_a5_test(test_fdwic_shared_submit_wiring a5/test_fdwic_shared_submit_wiring.cpp)
-target_compile_definitions(test_fdwic_shared_submit_wiring PRIVATE
-    __CPU_SIM=1
-    PTO_FDWIC_SHARED_MAP=1
-    PTO_FDWIC_TENSORMAP_RING_CAP=128
-)
-target_include_directories(test_fdwic_shared_submit_wiring BEFORE PRIVATE
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
-)
-set_tests_properties(test_fdwic_shared_submit_wiring PROPERTIES LABELS "no_hardware")
-
-# This multi-worker gate compiles the same production CPU-sim Submit TU and
-# proves that a future-turn winner waits for committed_tasks before fanin,
-# publication, and Build. SPIN_WAIT_HINT is observed only by the test.
-add_a5_test(test_fdwic_shared_multiworker a5/test_fdwic_shared_multiworker.cpp)
-target_compile_definitions(test_fdwic_shared_multiworker PRIVATE
-    __CPU_SIM=1
-    PTO_FDWIC_SHARED_MAP=1
-    PTO_FDWIC_TENSORMAP_RING_CAP=128
-    PTO_FDWIC_TRACE_ENABLED=0
-)
-target_include_directories(test_fdwic_shared_multiworker BEFORE PRIVATE
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
-)
-set_tests_properties(test_fdwic_shared_multiworker PROPERTIES LABELS "no_hardware" TIMEOUT 15)
-
 # PTO_DIST_H 是 AICPU 控制面的纯配置输入。独立目标直接编译生产解析
 # helper，锁定仅 ASCII 十进制数字串和闭区间边界，不引入设备或 runtime。
 add_executable(test_fdwic_config_parse a5/test_fdwic_config_parse.cpp)
@@ -604,9 +623,8 @@ target_link_libraries(test_fdwic_config_parse PRIVATE
 add_test(NAME test_fdwic_config_parse COMMAND test_fdwic_config_parse)
 set_tests_properties(test_fdwic_config_parse PROPERTIES LABELS "no_hardware")
 
-# Stable Host/AICPU/AICore identity is compiled in both artifact modes.  The
-# shared target intentionally verifies that the first-stage backend remains
-# fail-closed while its ABI identity is still well-formed.
+# Stable Host/AICPU/AICore identity is compiled in both executable artifact
+# modes, while their mode-specific ABI fields remain distinct.
 function(add_fdwic_build_identity_test name shared_map)
     add_executable(${name} a5/test_fdwic_build_identity.cpp)
     target_compile_definitions(${name} PRIVATE
@@ -671,11 +689,11 @@ target_link_libraries(test_host_log_off PRIVATE
 add_test(NAME test_host_log_off COMMAND test_host_log_off)
 
 # ---------------------------------------------------------------------------
-# Standalone distributed-atomic minibench tests (MB-1/3/5/9)
+# Standalone distributed-atomic minibench tests (MB-1/3/9)
 # ---------------------------------------------------------------------------
 # These tests re-implement the core data structures (claim cursor, frontier
-# CAS, SharedTensorMap ring, private replica) from scratch using std::atomic
-# and std::thread. No dist_engine.cpp dependency — pure host, pure logic.
+# CAS, private replica) from scratch using std::atomic and std::thread. No
+# dist_engine.cpp dependency — pure host, pure logic.
 function(add_standalone_dist_test name src)
     add_executable(${name} ${src})
     target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/../../../src/common)
@@ -687,7 +705,6 @@ endfunction()
 add_standalone_dist_test(test_dist_tensormap_ring a2a3/test_dist_tensormap_ring.cpp)
 add_standalone_dist_test(test_dist_atomic_mb1_claim a5/test_dist_atomic_mb1_claim.cpp)
 add_standalone_dist_test(test_dist_atomic_mb3_frontier a5/test_dist_atomic_mb3_frontier.cpp)
-add_standalone_dist_test(test_dist_atomic_mb5_shared_map a5/test_dist_atomic_mb5_shared_map.cpp)
 add_standalone_dist_test(test_dist_atomic_mb9_private_det a5/test_dist_atomic_mb9_private_det.cpp)
 
 # Hardware-gated tests.  Block is only entered when the project is configured

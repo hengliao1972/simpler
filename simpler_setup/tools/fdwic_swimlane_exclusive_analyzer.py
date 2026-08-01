@@ -23,20 +23,18 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from .fdwic_shared_swimlane_schema import validate_and_partition_v5
     from .fdwic_swimlane_schema import (
         KERNEL_EXECUTION_CHILD_PHASES,
-        OVERLAY_PHASES,
-        V4_EXCLUSIVE_SUBMIT_PHASES,
         Event,
         FdwicV4Model,
         find_containing_event,
         validate_and_partition_v4,
     )
 except ImportError:
+    from fdwic_shared_swimlane_schema import validate_and_partition_v5  # type: ignore[no-redef]
     from fdwic_swimlane_schema import (  # type: ignore[no-redef]
         KERNEL_EXECUTION_CHILD_PHASES,
-        OVERLAY_PHASES,
-        V4_EXCLUSIVE_SUBMIT_PHASES,
         Event,
         FdwicV4Model,
         find_containing_event,
@@ -186,10 +184,19 @@ def analyze_data(  # noqa: PLR0912, PLR0915
 ) -> dict[str, Any]:
     """Analyze the validated reader output without converting cycles to float first."""
 
-    if int(data.get("trace_schema_version", 0)) != 4:
-        raise ValueError("exclusive FDWIC analysis requires trace_schema_version=4")
+    trace_schema_version = int(data.get("trace_schema_version", 0))
+    if trace_schema_version not in (4, 5):
+        raise ValueError("exclusive FDWIC analysis requires trace_schema_version=4 or shared schema-v5")
     events = data.get("fdwic_events") or []
-    model = validate_and_partition_v4(events, int(data.get("num_cores", 0)), data.get("core_types") or [])
+    if trace_schema_version == 4:
+        model = validate_and_partition_v4(events, int(data.get("num_cores", 0)), data.get("core_types") or [])
+    else:
+        model = validate_and_partition_v5(
+            events,
+            int(data.get("num_cores", 0)),
+            data.get("core_types") or [],
+            int(data.get("l2_swimlane_level", 0)),
+        )
     frequency_hz = int(data.get("clock_freq_hz", 0))
     if frequency_hz <= 0:
         raise ValueError("exclusive FDWIC analysis requires a positive clock frequency")
@@ -350,7 +357,7 @@ def analyze_data(  # noqa: PLR0912, PLR0915
             **model.overlay_statistics[phase],
             "included_in_additive_totals": False,
         }
-        for phase in OVERLAY_PHASES
+        for phase in model.overlay_statistics
     }
     residual_breakdown = {
         "submit_internal_residual": {
@@ -382,7 +389,7 @@ def analyze_data(  # noqa: PLR0912, PLR0915
         "schema_version": REPORT_SCHEMA_VERSION,
         "input": str(input_path) if input_path is not None else None,
         "capture": {
-            "trace_schema_version": 4,
+            "trace_schema_version": trace_schema_version,
             "clock_freq_hz": frequency_hz,
             "core_count": len(model.cores),
             "task_count_per_core": len(model.task_ids),
@@ -402,7 +409,14 @@ def analyze_data(  # noqa: PLR0912, PLR0915
         },
         "semantics": {
             "cycle_arithmetic": "raw_integer_cycles",
-            "exclusive_submit_children": sorted(V4_EXCLUSIVE_SUBMIT_PHASES),
+            "exclusive_submit_children": sorted(
+                {
+                    child.phase
+                    for core in model.cores
+                    for partition in core.submits
+                    for child in partition.children
+                }
+            ),
             "kernel_execution_submit_children": sorted(KERNEL_EXECUTION_CHILD_PHASES),
             "kernel_execution_top_level_residual": "OrchestrationReplay outside Submit, or FinalDrain",
             "submit_boundary": (
@@ -436,9 +450,21 @@ def analyze_data(  # noqa: PLR0912, PLR0915
             ],
             "final_drain_children": ["KernelUnion", "FinalDrainResidual"],
             "worker_completion_children": ["OrchestrationReplay", "FinalDrain"],
-            "legacy_lap_phases_forbidden": ["Alloc", "Build", "Replay"],
-            "drain_won": "real nested BlockWon action; retained as a non-additive overlay",
-            "loser_replay": "real kernel-loser drain_block_won call; exclusive Submit child",
+            "legacy_lap_phases_forbidden": (
+                ["Alloc", "Build", "Replay", "DrainWon", "EfDrain", "PrepareMap", "LoserReplay"]
+                if trace_schema_version == 5
+                else ["Alloc", "Build", "Replay"]
+            ),
+            "drain_won": (
+                "absent in shared schema-v5"
+                if trace_schema_version == 5
+                else "real nested BlockWon action; retained as a non-additive overlay"
+            ),
+            "loser_replay": (
+                "absent in shared schema-v5; loser remainder stays in Submit residual"
+                if trace_schema_version == 5
+                else "real kernel-loser drain_block_won call; exclusive Submit child"
+            ),
             "alloc_loser_tail": "no fabricated action; remains Submit tail residual",
             "overlays_are_additive": False,
             "p95_method": "nearest_rank",
@@ -550,7 +576,7 @@ def write_analysis(input_path: Path, output_path: Path) -> Path:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input", type=Path, help="schema-v4 l2_swimlane_records.json")
+    parser.add_argument("input", type=Path, help="schema-v4 or shared schema-v5 l2_swimlane_records.json")
     parser.add_argument(
         "-o",
         "--output",

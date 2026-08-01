@@ -60,7 +60,16 @@ PTO_DEVICE_FUNC bool dist_submit_claim_kernel(const MixedKernels &mixed, DistSub
     if (lane_active(M, LANE_AIV0) || lane_active(M, LANE_AIV1)) {
         if (ctx.self->role != CoreType::AIV) return false;
         ctx.claim_attempted = true;
+#if PTO_FDWIC_SHARED_MAP
+        ctx.won = claim(
+            g_dist.shared_pa
+                .shared_vector_cursor[ctx.task_id % static_cast<int32_t>(kFdwicSharedVectorCursorShards)]
+                .v,
+            ctx.task_id
+        );
+#else
         ctx.won = claim(g_dist.vector_cursor[ctx.task_id % kCursorShards].v, ctx.task_id);
+#endif
         if (!ctx.won) return false;
         const int32_t own_lane = lane_active(M, LANE_AIV0) ? LANE_AIV0 : LANE_AIV1;
         ctx.kernel_id = kernel_id_for_lane(mixed, own_lane);
@@ -111,26 +120,35 @@ PTO_DEVICE_FUNC void dist_submit_wait_slot_capacity(__gm__ DistCore *self, int32
     const uint32_t slot_poll_region = fdwic_atomic_poll_region_begin(
         fdwic_atomic_site_mask(FdwicAtomicSite::FaninFlagLoad) |
 #if PTO_FDWIC_SHARED_MAP
-        fdwic_atomic_site_mask(FdwicAtomicSite::FatalPoll) |
-#endif
+        fdwic_atomic_site_mask(FdwicAtomicSite::FatalPoll)
+#else
         fdwic_atomic_block_won_poll_mask()
+#endif
     );
+#if PTO_FDWIC_SHARED_MAP
+    uint32_t no_progress_polls = 0;
+#endif
     while (self->occupied_count >= kPrivateSlots - kWonReserve) {
         waited = true;
+#if !PTO_FDWIC_SHARED_MAP
+        drain_block_won(self);
+#endif
+        if (drain_phase_b(self) != 0) continue;
 #if PTO_FDWIC_SHARED_MAP
-        // Another winner may terminate the shared run while this worker is
-        // blocked behind slots whose fan-in can no longer complete. Consume
-        // fatal only on the existing backpressure loop, so the no-wait winner
-        // path gains no extra atomic load.
-        if (fdwic_trace_is_fatal(task_id)) {
+        // Fatal is a failure-only escape from a full ring. Throttle the global
+        // load so the successful dependency wait does not serialize on it.
+        ++no_progress_polls;
+        if ((no_progress_polls & 1023U) == 0 &&
+            fdwic_trace_is_fatal(task_id)) {
             fdwic_atomic_poll_region_end(slot_poll_region);
-            TRACE_SPAN_END(ring_bp_trace, self, task_id, -1, TracePhase::RingBp, 0, 0);
+            TRACE_SPAN_END(
+                ring_bp_trace, self, task_id, -1, TracePhase::RingBp, 0, 0
+            );
             self->local_index = kFlagCap;
             return false;
         }
 #endif
-        drain_block_won(self);
-        if (drain_phase_b(self) == 0) SPIN_WAIT_HINT();
+        SPIN_WAIT_HINT();
     }
     fdwic_atomic_poll_region_end(slot_poll_region);
     if (waited) {
@@ -204,27 +222,6 @@ PTO_DEVICE_FUNC bool dist_submit_wait_heap_capacity(DistSubmitCtx &ctx, DistSubm
     return false;
 }
 
-#if PTO_FDWIC_SHARED_MAP
-PTO_DEVICE_FUNC bool dist_submit_wait_shared_tensor_map_turn(DistSubmitCtx &ctx) {
-    if (ctx.self == nullptr || !ctx.won) {
-        return dist_submit_handle_shared_tensor_map_result(ctx, DistSharedTensorMapTaskPublishResult::ProtocolError);
-    }
-    while (!fatal_set()) {
-        const int64_t next_task = dist_tensor_map_next_publish_task();
-        if (next_task == ctx.task_id) return true;
-        if (next_task < 0 || next_task > ctx.task_id) {
-            return dist_submit_handle_shared_tensor_map_result(
-                ctx, DistSharedTensorMapTaskPublishResult::ProtocolError
-            );
-        }
-        drain_block_won(ctx.self);
-        if (drain_phase_b(ctx.self) == 0) SPIN_WAIT_HINT();
-    }
-    ctx.self->local_index = kFlagCap;
-    return false;
-}
-#endif
-
 PTO_DEVICE_FUNC void publish_joint_deposits(DistSubmitCtx &ctx, const MixedKernels &mixed, const L0TaskArgs &args) {
     if (!ctx.joint) return;
     __gm__ WonSlot &w = g_dist.blocks[ctx.joint_block].slots[ctx.joint_slot];
@@ -265,44 +262,61 @@ PTO_DEVICE_FUNC int32_t wait_alloc_won_slot(__gm__ DistCore *self, int32_t block
     return won_slot;
 }
 
-PTO_DEVICE_FUNC bool dist_submit_build_winner_slot(DistSubmitCtx &ctx, const L0TaskArgs &args, __gm__ RingSlot *slot) {
+PTO_DEVICE_FUNC bool
+dist_submit_build_winner_slot(DistSubmitCtx &ctx, const L0TaskArgs &args, __gm__ RingSlot *slot) {
     if (slot == nullptr || ctx.payload == nullptr) return false;
     const int32_t sub_block_id = ctx.self != nullptr && ctx.self->lane == LANE_AIV1 ? 1 : 0;
     const uint64_t fn_addr = dist_aicore_slot_function_addr(g_dist.runtime, ctx.kernel_id);
-    build_ring_slot_from_submit(
+    return build_ring_slot_from_submit(
         *slot, ctx.task_id, ctx.kernel_id, fn_addr, args, ctx, ctx.fanin, ctx.fanin_count, sub_block_id, ctx.joint,
         ctx.joint_block, ctx.joint_slot
     );
-    return true;
 }
 
-PTO_DEVICE_FUNC void
+PTO_DEVICE_FUNC bool
 dist_submit_build_winner_task(DistSubmitCtx &ctx, const MixedKernels &mixed, const L0TaskArgs &args) {
-    if (ctx.self == nullptr) return;
+    if (ctx.self == nullptr) return false;
 #if PTO_FDWIC_SHARED_MAP
-    if (!dist_submit_wait_slot_capacity(ctx.self, ctx.task_id)) return;
+    if (!dist_submit_wait_slot_capacity(ctx.self, ctx.task_id)) return false;
 #else
     dist_submit_wait_slot_capacity(ctx.self, ctx.task_id);
 #endif
-    if (!dist_submit_wait_heap_capacity(ctx, DistSubmitKind::Kernel)) return;
+#if !PTO_FDWIC_SHARED_MAP
+    if (!dist_submit_wait_heap_capacity(ctx, DistSubmitKind::Kernel)) return false;
+#else
+    // dist_shared_pa_reserve_heap() already performed the no-wrap shard
+    // reservation and capacity check during Materialize.
+#endif
     if (ctx.joint && ctx.joint_slot < 0) {
         ctx.joint_slot = wait_alloc_won_slot(ctx.self, ctx.joint_block, ctx.task_id);
-        if (ctx.joint_slot < 0) return;
+        if (ctx.joint_slot < 0) return false;
     }
     __gm__ RingSlot *slot = dist_submit_alloc_slot(ctx.self);
-    if (slot == nullptr) return;
+    if (slot == nullptr) return false;
 
     if (ctx.joint) publish_joint_deposits(ctx, mixed, args);
-    if (!dist_submit_build_winner_slot(ctx, args, slot)) return;
-}
-
-PTO_DEVICE_FUNC void dist_submit_complete_alloc(DistSubmitCtx &ctx) {
-    if (ctx.won) {
-        if (!dist_submit_wait_heap_capacity(ctx, DistSubmitKind::Alloc)) return;
-        if (ctx.self != nullptr) complete_executed_task(ctx.self, ctx.task_id);
+    if (!dist_submit_build_winner_slot(ctx, args, slot)) {
+        slot->built = false;
+        slot->occupied = false;
+        --ctx.self->occupied_count;
+        return false;
     }
+    return true;
 }
 
+PTO_DEVICE_FUNC bool dist_submit_complete_alloc(DistSubmitCtx &ctx) {
+    if (!ctx.won || ctx.self == nullptr) return false;
+#if !PTO_FDWIC_SHARED_MAP
+    if (!dist_submit_wait_heap_capacity(ctx, DistSubmitKind::Alloc)) return false;
+#else
+    // Shared Alloc uses the same bounded no-wrap reservation as Kernel tasks;
+    // the private ring-capacity guard has no additional successful-path work.
+#endif
+    complete_executed_task(ctx.self, ctx.task_id);
+    return true;
+}
+
+#if !PTO_FDWIC_SHARED_MAP
 PTO_DEVICE_FUNC DistCompeteFirstTicket
 dist_submit_make_ticket(const DistSubmitCtx &ctx, DistSubmitKind kind, uint64_t submit_begin, bool ready) {
     DistCompeteFirstTicket ticket;
@@ -371,12 +385,7 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_finish_kernel_tail(
 ) {
     uint64_t register_begin = tail_begin;
     if (ctx.won) {
-#if PTO_FDWIC_SHARED_MAP
-        if (!dist_submit_wait_shared_tensor_map_turn(ctx)) return ctx.result;
-        const bool fanin_ok = dist_submit_collect_fanin(args, ctx, ctx.fanin, ctx.fanin_count);
-#else
         ctx.fanin_count = dist_submit_collect_fanin(args, ctx, ctx.fanin);
-#endif
         fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Fanin>();
         TRACE_TIMESTAMP(fanin_end);
         TRACE_SPAN_RECORD(
@@ -384,12 +393,6 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_finish_kernel_tail(
             static_cast<uint32_t>(ctx.fanin_count)
         );
         register_begin = fanin_end;
-#if PTO_FDWIC_SHARED_MAP
-        if (__builtin_expect(!fanin_ok, 0)) {
-            (void)dist_submit_handle_shared_tensor_map_result(ctx, DistSharedTensorMapTaskPublishResult::ProtocolError);
-            return ctx.result;
-        }
-#endif
     }
     // The Register PMU window covers only the real RegisterOutputs call, not
     // the preceding Fanin/Claim record publication or caller transition.
@@ -445,10 +448,6 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_submit_finish_kernel_tail(
 PTO_DEVICE_FUNC TaskOutputTensors
 dist_submit_finish_alloc_tail(DistSubmitCtx &ctx, uint64_t completion_begin, uint64_t submit_begin) {
     if (__builtin_expect(ctx.won, 0)) {
-#if PTO_FDWIC_SHARED_MAP
-        if (!dist_submit_wait_shared_tensor_map_turn(ctx)) return ctx.result;
-        if (!dist_submit_commit_empty_shared_tensor_map_task(ctx)) return ctx.result;
-#endif
         dist_submit_complete_alloc(ctx);
         fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::AllocComplete>();
         TRACE_TIMESTAMP(alloc_complete_end);
@@ -466,6 +465,9 @@ dist_submit_finish_alloc_tail(DistSubmitCtx &ctx, uint64_t completion_begin, uin
     );
     return ctx.result;
 }
+#endif
+
+#include "dist_engine/aicore/shared_submit_path.h"
 
 #include "dist_engine/aicore/run_state.h"
 
@@ -519,27 +521,47 @@ PTO_DEVICE_FUNC void dist_submit_drain_to_completion(__gm__ DistCore *self) {
     bool root_released = false;
     bool leaf_released = false;
     bool global_release_observed = false;
+#if PTO_FDWIC_SHARED_MAP
+    uint32_t idle_polls = 0;
+#endif
     while (true) {
+#if !PTO_FDWIC_SHARED_MAP
         drain_block_won(self);
+#endif
         const int32_t freed = drain_phase_b(self);
         if (!global_release_observed) {
             global_release_observed = dist_final_barrier_progress(self, leaf_forwarded, root_released, leaf_released);
         }
         const bool ring_empty = self->occupied_count == 0;
+#if PTO_FDWIC_SHARED_MAP
+        // Phase-1 shared PA rejects joint/multilane tasks before Claim, so no
+        // BlockWon state can exist. Avoid polling those generic block slots on
+        // every FinalDrain iteration; the private/AICPU-capable path below is
+        // unchanged. Successful shared completion is exactly barrier release
+        // plus this worker's two usable private slots becoming empty.
+        if (global_release_observed && ring_empty) break;
+#else
         const bool pending = has_pending_won(self);
         if (global_release_observed && ring_empty && !pending) break;
+#endif
         if (freed == 0) {
 #if PTO_FDWIC_SHARED_MAP
             // A worker that reaches FinalDrain before a remote fatal cannot
             // wait for the missing worker's barrier arrival: core_main skips
-            // FinalDrain after observing fatal. Poll only on an idle drain
-            // iteration so successful progress does not pay an extra load.
-            if (fdwic_trace_is_fatal()) {
+            // FinalDrain after observing fatal. As in standalone, batch this
+            // diagnostic poll instead of issuing a contended fatal load on
+            // every successful-run spin iteration.
+            ++idle_polls;
+            if ((idle_polls & 1023U) == 0 && fdwic_trace_is_fatal()) {
                 self->local_index = kFlagCap;
                 break;
             }
 #endif
             SPIN_WAIT_HINT();
+#if PTO_FDWIC_SHARED_MAP
+        } else {
+            idle_polls = 0;
+#endif
         }
     }
     fdwic_atomic_poll_region_end(final_poll_region);
@@ -552,9 +574,19 @@ PTO_DEVICE_FUNC void dist_submit_replay_orch(__gm__ Runtime *runtime) {
     dist_aicore_invalidate_region(runtime->dist.ccec_orch_tensors, sizeof(runtime->dist.ccec_orch_tensors));
     dist_aicore_invalidate_region(runtime->dist.ccec_orch_scalars, sizeof(runtime->dist.ccec_orch_scalars));
     dist_aicore_invalidate_region(const_cast<__gm__ const int32_t *>(&runtime->dist.ccec_orch_tensor_count), 64);
-    if (aicpu_orchestration_entry == nullptr || !ccec_is_valid_worker()) {
+    if (self == nullptr || !ccec_is_valid_worker()) {
         return;
     }
+#if PTO_FDWIC_SHARED_PA_UNITY
+    if ((self->role == CoreType::AIC && aicpu_orchestration_entry_aic == nullptr) ||
+        (self->role == CoreType::AIV && aicpu_orchestration_entry_aiv == nullptr) ||
+        (self->role != CoreType::AIC && self->role != CoreType::AIV)) {
+        (void)dist_shared_pa_fail(self, PTO2_ERROR_DIST_CONFIG_INVALID);
+        return;
+    }
+#else
+    if (aicpu_orchestration_entry == nullptr) return;
+#endif
     L2TaskArgs local_args;
     Tensor local_tensors[CHIP_MAX_TENSOR_ARGS];
     const int32_t tensor_count = runtime->dist.ccec_orch_tensor_count;
@@ -567,7 +599,15 @@ PTO_DEVICE_FUNC void dist_submit_replay_orch(__gm__ Runtime *runtime) {
         const uint64_t scalar = runtime->dist.ccec_orch_scalars[i];
         local_args.add_scalar(scalar);
     }
+#if PTO_FDWIC_SHARED_PA_UNITY
+    if (self->role == CoreType::AIC) {
+        aicpu_orchestration_entry_aic(local_args);
+    } else {
+        aicpu_orchestration_entry_aiv(local_args);
+    }
+#else
     aicpu_orchestration_entry(local_args);
+#endif
 #else
     (void)runtime;
     if (g_dist.orch_args != nullptr && !fdwic_trace_is_fatal()) {
@@ -580,6 +620,7 @@ PTO_DEVICE_FUNC void dist_submit_replay_orch(__gm__ Runtime *runtime) {
 
 }  // namespace
 
+#if !PTO_FDWIC_SHARED_MAP
 DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors
 dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &args) {
     const ActiveMask active = mixed.to_active_mask();
@@ -763,3 +804,138 @@ dist_alloc_compete_first_finish(PTO2Runtime *, const DistCompeteFirstTicket &tic
     TRACE_SPAN_RECORD(prepare_map_end, register_end, ctx.self, ctx.task_id, -1, TracePhase::Register, 0, 0);
     return dist_submit_finish_alloc_tail(ctx, register_end, ticket.submit_begin);
 }
+#else
+
+namespace {
+
+PTO_DEVICE_FUNC TaskOutputTensors dist_shared_pa_reject_generic_submit() {
+    set_fatal_code(PTO2_ERROR_TENSORMAP_PROTOCOL);
+    if (g_self != nullptr) g_self->local_index = kFlagCap;
+    return TaskOutputTensors{};
+}
+
+PTO_DEVICE_FUNC DistCompeteFirstTicket dist_shared_pa_invalid_ticket(DistCompeteFirstKind kind) {
+    (void)kind;
+    DistCompeteFirstTicket ticket{};
+    ticket.task_id = kFlagCap;
+    ticket.kernel_id = static_cast<int16_t>(INVALID_KERNEL_ID);
+    ticket.won = 0;
+    ticket.ready = 0;
+    return ticket;
+}
+
+PTO_DEVICE_FUNC bool dist_shared_pa_validate_finish(
+    DistSharedPaReplayContext replay, const DistCompeteFirstTicket &ticket,
+    DistSharedPaTaskKind kind, const MixedKernels *mixed, const L0TaskArgs *winner_args
+) {
+    __gm__ DistCore *self = g_self;
+    const bool replay_ok = replay.ready() && self != nullptr;
+    const bool ticket_ok =
+        replay_ok && ticket.ready == 1 && ticket.won <= 1 &&
+        ticket.task_id >= 0 &&
+        static_cast<uint32_t>(ticket.task_id) < kFdwicSharedPaTaskCapacity &&
+        self->local_index == ticket.task_id + 1 &&
+        dist_shared_pa_kind_matches_task(ticket.task_id, kind) &&
+        ((ticket.won != 0) == (winner_args != nullptr));
+    const bool kernel_ok = kind == DistSharedPaTaskKind::Alloc ?
+            (mixed == nullptr && ticket.kernel_id == INVALID_KERNEL_ID) :
+            (mixed != nullptr && dist_shared_pa_kernel_shape(*mixed, kind) &&
+             (ticket.won != 0 ?
+                  ticket.kernel_id == dist_shared_pa_expected_kernel_id(*mixed, kind) :
+                  ticket.kernel_id == INVALID_KERNEL_ID));
+    // The replay token removes repeated role/block GM loads from Claim.
+    // Re-read authoritative identity only for the 1,280 winners before they
+    // publish any shared state; losers are already closed inside Begin.
+    const bool winner_identity_ok =
+        ticket.won == 0 ||
+        (replay_ok && self->role == replay.role() && self->block_id == replay.block_id());
+    if (ticket_ok && kernel_ok && winner_identity_ok) return true;
+    return dist_shared_pa_fail(self, PTO2_ERROR_TENSORMAP_PROTOCOL);
+}
+
+}  // namespace
+
+DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors
+dist_submit_impl(PTO2Runtime *, const MixedKernels &, const L0TaskArgs &) {
+    return dist_shared_pa_reject_generic_submit();
+}
+
+DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors
+dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &) {
+    return dist_shared_pa_reject_generic_submit();
+}
+
+DIST_API_ATTR PTO_DEVICE_FUNC DistCompeteFirstTicket
+dist_submit_compete_first_begin(PTO2Runtime *, const MixedKernels &) {
+    (void)dist_shared_pa_reject_generic_submit();
+    return dist_shared_pa_invalid_ticket(DistCompeteFirstKind::Kernel);
+}
+
+DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_compete_first_finish(
+    PTO2Runtime *, const MixedKernels &, const DistCompeteFirstTicket &, const L0TaskArgs &
+) {
+    return dist_shared_pa_reject_generic_submit();
+}
+
+DIST_API_ATTR PTO_DEVICE_FUNC DistCompeteFirstTicket dist_alloc_compete_first_begin(PTO2Runtime *) {
+    (void)dist_shared_pa_reject_generic_submit();
+    return dist_shared_pa_invalid_ticket(DistCompeteFirstKind::Alloc);
+}
+
+DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors
+dist_alloc_compete_first_finish(PTO2Runtime *, const DistCompeteFirstTicket &, const L0TaskArgs &) {
+    return dist_shared_pa_reject_generic_submit();
+}
+
+#if !PTO_FDWIC_SHARED_PA_UNITY
+DIST_API_ATTR PTO_DEVICE_FUNC DistCompeteFirstTicket dist_shared_pa_submit_begin(
+    PTO2Runtime *, DistSharedPaReplayContext replay,
+    const MixedKernels &mixed, DistSharedPaTaskKind kind
+) {
+    if (kind == DistSharedPaTaskKind::Alloc || kind == DistSharedPaTaskKind::Count) {
+        set_fatal_code(PTO2_ERROR_TENSORMAP_PROTOCOL);
+        if (g_self != nullptr) g_self->local_index = kFlagCap;
+        return dist_shared_pa_invalid_ticket(DistCompeteFirstKind::Kernel);
+    }
+    return dist_shared_pa_begin_ticket(replay, kind, &mixed);
+}
+#endif
+
+DIST_API_ATTR PTO_DEVICE_FUNC bool dist_shared_pa_submit_finish(
+    PTO2Runtime *, DistSharedPaReplayContext replay,
+    const MixedKernels &mixed, DistSharedPaTaskKind kind,
+    const DistCompeteFirstTicket &ticket, const L0TaskArgs *winner_args
+) {
+    if (!dist_shared_pa_validate_finish(replay, ticket, kind, &mixed, winner_args)) return false;
+    if (ticket.won == 0) return true;
+    DistSubmitCtx ctx;
+    dist_shared_pa_restore_winner_ticket(ticket, ctx);
+    return dist_shared_pa_finish_winner(ctx, ticket, &mixed, kind, *winner_args);
+}
+
+#if !PTO_FDWIC_SHARED_PA_UNITY
+DIST_API_ATTR PTO_DEVICE_FUNC DistCompeteFirstTicket dist_shared_pa_alloc_begin(
+    PTO2Runtime *, DistSharedPaReplayContext replay
+) {
+    return dist_shared_pa_begin_ticket(replay, DistSharedPaTaskKind::Alloc, nullptr);
+}
+#endif
+
+DIST_API_ATTR PTO_DEVICE_FUNC bool dist_shared_pa_alloc_finish(
+    PTO2Runtime *, DistSharedPaReplayContext replay,
+    const DistCompeteFirstTicket &ticket, const L0TaskArgs *winner_args
+) {
+    if (!dist_shared_pa_validate_finish(
+            replay, ticket, DistSharedPaTaskKind::Alloc, nullptr, winner_args
+        )) {
+        return false;
+    }
+    if (ticket.won == 0) return true;
+    DistSubmitCtx ctx;
+    dist_shared_pa_restore_winner_ticket(ticket, ctx);
+    return dist_shared_pa_finish_winner(
+        ctx, ticket, nullptr, DistSharedPaTaskKind::Alloc, *winner_args
+    );
+}
+
+#endif

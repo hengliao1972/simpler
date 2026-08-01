@@ -84,6 +84,9 @@ PTO_DEVICE_FUNC void reset_task_cell(int32_t task_id) {
     __gm__ DistTaskCell &cell = task_cell(task_id);
     atomic_exchange(cell.flag, int64_t{0}, __ATOMIC_RELAXED);
     atomic_exchange(cell.vend, uint64_t{0}, __ATOMIC_RELAXED);
+#if PTO_FDWIC_SHARED_MAP
+    atomic_exchange(cell.deps_prepared, int64_t{-1}, __ATOMIC_RELAXED);
+#endif
 }
 
 }  // namespace

@@ -21,6 +21,10 @@ from simpler_setup.goldens.paged_attention import generate_inputs as _pa_generat
 class TestPagedAttentionUnroll(SceneTestCase):
     RTOL = 1e-3
     ATOL = 1e-3
+    # The phase-1 shared artifact is a deliberately narrow PA specialization.
+    # Scene-test entry points reject every other class/case before compilation
+    # or device execution instead of falling back to private TensorMap logic.
+    FDWIC_SHARED_SUPPORTED_CASES = frozenset({"Case1"})
 
     CALLABLE = {
         "orchestration": {
@@ -84,7 +88,11 @@ class TestPagedAttentionUnroll(SceneTestCase):
         {
             "name": "Case1",
             "platforms": ["a5sim", "a5"],
-            "config": {"aicpu_thread_num": 4},
+            # Phase-1 shared PA is intentionally fixed to 32 physical blocks:
+            # 32 AIC + 64 AIV replay workers. Pin the same topology on a5sim;
+            # its automatic maximum would otherwise select 36/72. The
+            # mode-local key leaves private Case1 on its original auto topology.
+            "config": {"aicpu_thread_num": 4, "fdwic_shared_block_dim": 32},
             "params": {
                 "batch": 256,
                 "num_heads": 16,

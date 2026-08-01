@@ -36,6 +36,25 @@ PTO_DEVICE_FUNC inline T atomic_load(__gm__ volatile T &value, int memorder = __
 #endif
 }
 
+// The shared A5 scheduler uses a returned-value RMW as its cross-core load.
+// Keep private/native builds on their established atomicAdd(0) primitive, but
+// match the standalone shared scheduler's validated signed-64-bit identity:
+// max(x, INT64_MIN) == x for the complete int64_t domain.  This changes only
+// the CCEC opcode; call sites, addresses, return dependencies, and CPU/AICPU
+// memory-order semantics remain unchanged.
+PTO_DEVICE_FUNC inline int64_t atomic_load(
+    __gm__ volatile int64_t &value, int memorder = __ATOMIC_ACQUIRE
+) {
+#if defined(__CCE_AICORE__) && PTO_FDWIC_SHARED_MAP
+    (void)memorder;
+    constexpr int64_t identity = (-9223372036854775807LL - 1LL);
+    __gm__ int64_t *addr = const_cast<__gm__ int64_t *>(&value);
+    return atomicMax(addr, identity);
+#else
+    return atomic_load<int64_t>(value, memorder);
+#endif
+}
+
 template <typename T, typename V>
 PTO_DEVICE_FUNC inline T atomic_exchange(__gm__ volatile T &value, V desired, int memorder = __ATOMIC_ACQ_REL) {
 #if defined(__CCE_AICORE__)

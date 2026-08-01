@@ -13,13 +13,37 @@
 // Per-core entry point invoked by each AICore worker thread.
 // -----------------------------------------------------------------------------
 DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int core_idx, int core_type_int) {
-    __gm__ DistCore *self = dist_aicore_attach_worker(runtime, core_idx, core_type_int);
+    uint64_t startup_config_invalidate_begin = 0;
+    uint64_t startup_config_invalidate_end = 0;
+    __gm__ DistCore *self = dist_aicore_attach_worker(
+        runtime, core_idx, core_type_int,
+        startup_config_invalidate_begin, startup_config_invalidate_end
+    );
     if (self == nullptr) return;
     g_fdwic_joint_submit_seen = false;
     fdwic_perf_clock_attach(runtime, self);
     fdwic_submit_pmu_attach(runtime, self);
     fdwic_swimlane_attach(runtime);
     trace_reset_core(self);
+#if DIST_TRACE_ENABLED && PTO_FDWIC_SHARED_MAP
+    if (fdwic_atomic_swimlane_enabled()) {
+        const uint32_t startup_config_lines =
+            fdwic_dcci_region_cache_line_count(&runtime->dist.shared_addr, 64);
+        if (startup_config_lines != 1 ||
+            !fdwic_swimlane_record_dcci(
+                self, -1, -1, FdwicDcciSite::StartupConfigInvalidate,
+                FdwicDcciOp::Invalidate, /*trailing_dsb=*/true,
+                /*call_count=*/1, startup_config_lines,
+                startup_config_invalidate_begin,
+                startup_config_invalidate_end
+            )) {
+            g_fdwic_dcci_counter_overflow = true;
+        }
+    }
+#else
+    (void)startup_config_invalidate_begin;
+    (void)startup_config_invalidate_end;
+#endif
 
     if (!fdwic_trace_is_fatal()) {
         (void)fdwic_trace_atomic_fetch_add<int64_t>(

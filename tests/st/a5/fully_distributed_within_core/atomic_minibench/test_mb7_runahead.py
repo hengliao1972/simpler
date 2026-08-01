@@ -11,7 +11,7 @@
 
 Reuses the benchmark_bgemm workload with fake exec times to create unbalanced
 core speeds, and sweeps PTO_DIST_RUNAHEAD to verify the backpressure window
-constraint holds (no deadlock, no shared-ring overflow, DEPSIG unchanged).
+constraint holds (no deadlock, no task-window overflow, DEPSIG unchanged).
 
 Criteria (docs MB-7):
   - max(local_index) - min(local_index) <= runahead_max (sampled)
@@ -22,7 +22,6 @@ Criteria (docs MB-7):
 Env knobs:
   PTO_DIST_RUNAHEAD=N        — run-ahead bound (0=disable, small=tight backpressure)
   PTO_DIST_FAKE_EXEC_NS=N    — uniform fake exec time (makes all cores equal speed)
-  PTO_DIST_TENSORMAP_MODE=shared — shared mode (run-ahead backpressure is meaningful)
   PTO_DIST_DEPSIG=1          — dependency-graph signature (internal assert)
 """
 
@@ -44,7 +43,6 @@ class TestMB7Runahead(DistRuntimeContractMixin, SceneTestCase):
     ATOL = 1e-3
 
     RUNTIME_ENV = {
-        "PTO_DIST_TENSORMAP_MODE": "shared",
         "PTO_DIST_DEPSIG": "1",
     }
 

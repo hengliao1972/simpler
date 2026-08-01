@@ -18,9 +18,20 @@ namespace {
 #if !defined(__CCE_AICORE__)
 // AICore sim orchestration replay shares the submit runtime path, so scalar
 // reads/writes must drain the worker's own queue until the producer is complete.
-PTO_DEVICE_FUNC void wait_producer_ready(DistCore *self, const Tensor &t) {
+PTO_DEVICE_FUNC bool wait_producer_ready(DistCore *self, const Tensor &t) {
+#if PTO_FDWIC_SHARED_MAP
+    // Phase-1 shared PA performs scalar access only on immutable orchestration
+    // inputs such as context_lens. They have no producer and require no map
+    // lookup. A produced Tensor descriptor would need its original stable
+    // FdwicOutputRef to resolve history, which this Tensor-only API does not
+    // carry, so reject that unsupported shape explicitly.
+    if (t.owner_task_id.is_invalid()) return true;
+    set_fatal_code(PTO2_ERROR_TENSORMAP_PROTOCOL);
+    if (self != nullptr) self->local_index = kFlagCap;
+    return false;
+#else
     const int32_t p = dist_tensor_map_lookup_for_task(*self, t, self->local_index);
-    if (p < 0) return;
+    if (p < 0) return true;
     uint64_t wd = 0;
     const uint32_t producer_poll_region = fdwic_atomic_poll_region_begin(
         fdwic_atomic_site_mask(FdwicAtomicSite::FatalPoll) | fdwic_atomic_site_mask(FdwicAtomicSite::FaninFlagLoad) |
@@ -35,15 +46,25 @@ PTO_DEVICE_FUNC void wait_producer_ready(DistCore *self, const Tensor &t) {
         }
     }
     fdwic_atomic_poll_region_end(producer_poll_region);
+    return true;
+#endif
 }
 #endif
 
-PTO_DEVICE_FUNC void wait_tensor_data_access_ready(const Tensor &tensor) {
+PTO_DEVICE_FUNC bool wait_tensor_data_access_ready(const Tensor &tensor) {
 #if !defined(__CCE_AICORE__)
     DistCore *self = g_self;
-    if (self != nullptr) wait_producer_ready(self, tensor);
+    return self == nullptr || wait_producer_ready(self, tensor);
+#else
+#if PTO_FDWIC_SHARED_MAP
+    if (tensor.owner_task_id.is_invalid()) return true;
+    set_fatal_code(PTO2_ERROR_TENSORMAP_PROTOCOL);
+    if (g_self != nullptr) g_self->local_index = kFlagCap;
+    return false;
 #else
     (void)tensor;
+    return true;
+#endif
 #endif
 }
 
@@ -52,12 +73,7 @@ PTO_DEVICE_FUNC void wait_tensor_data_access_ready(const Tensor &tensor) {
 DIST_API_ATTR PTO_DEVICE_FUNC uint64_t
 dist_get_tensor_data_impl(PTO2Runtime *, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
     if (tensor.buffer.addr == 0) return 0;
-    wait_tensor_data_access_ready(tensor);
-#if PTO_FDWIC_SHARED_MAP && !defined(__CCE_AICORE__)
-    // Shared CPU-sim scalar access has no Claim/exact-turn proof. Its map
-    // facade latches a protocol error, so the underlying buffer must not be read.
-    if (fatal_set()) return 0;
-#endif
+    if (!wait_tensor_data_access_ready(tensor)) return 0;
     return dist_read_tensor_scalar_raw(tensor, ndims, indices);
 }
 
@@ -65,10 +81,6 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_set_tensor_data_impl(
     PTO2Runtime *, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
 ) {
     if (tensor.buffer.addr == 0) return;
-    wait_tensor_data_access_ready(tensor);
-#if PTO_FDWIC_SHARED_MAP && !defined(__CCE_AICORE__)
-    // Match the read path: fail before mutating tensor storage.
-    if (fatal_set()) return;
-#endif
+    if (!wait_tensor_data_access_ready(tensor)) return;
     dist_write_tensor_scalar_raw(tensor, ndims, indices, value);
 }

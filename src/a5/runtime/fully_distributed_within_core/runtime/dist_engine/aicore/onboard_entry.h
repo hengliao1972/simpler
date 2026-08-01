@@ -13,11 +13,29 @@
 
 #include "dist_engine/common/target.h"
 
-PTO_DEVICE_FUNC __gm__ DistCore *dist_aicore_attach_worker(__gm__ Runtime *runtime, int core_idx, int core_type_int) {
+PTO_DEVICE_FUNC __gm__ DistCore *dist_aicore_attach_worker(
+    __gm__ Runtime *runtime, int core_idx, int core_type_int,
+    uint64_t &startup_config_invalidate_begin,
+    uint64_t &startup_config_invalidate_end
+) {
+    startup_config_invalidate_begin = 0;
+    startup_config_invalidate_end = 0;
     if (runtime == nullptr || core_idx < 0 || core_idx >= RUNTIME_MAX_WORKER) return nullptr;
 
+#if DIST_TRACE_ENABLED && PTO_FDWIC_SHARED_MAP
+    // This control line must be coherent before its swimlane configuration can
+    // be interpreted, so capture the real pre-attach DCCI endpoints now and
+    // publish them only after fdwic_swimlane_attach() establishes local state.
+    startup_config_invalidate_begin = fdwic_swimlane_detail_now();
+#endif
+    dist_aicore_invalidate_region(
+        const_cast<__gm__ uint64_t *>(&runtime->dist.shared_addr), 64
+    );
+#if DIST_TRACE_ENABLED && PTO_FDWIC_SHARED_MAP
+    startup_config_invalidate_end = fdwic_swimlane_detail_now();
+#endif
+
 #if defined(__CCE_AICORE__)
-    dist_aicore_invalidate_region(const_cast<__gm__ uint64_t *>(&runtime->dist.shared_addr), 64);
     g_dist_ptr = reinterpret_cast<__gm__ DistGlobal *>(runtime->dist.shared_addr);
 #else
     g_dist_ptr = reinterpret_cast<DistGlobal *>(runtime->dist.shared_addr);

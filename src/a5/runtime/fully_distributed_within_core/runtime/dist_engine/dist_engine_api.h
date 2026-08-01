@@ -62,9 +62,45 @@ enum class DistCompeteFirstKind : uint8_t {
     Alloc = 1,
 };
 
+// Phase-1 shared backend contract. A batch is exactly
+// Alloc -> QK -> SF -> PV -> UP; a second group is rejected explicitly.
+enum class DistSharedPaTaskKind : uint8_t {
+    Alloc = 0,
+    Qk = 1,
+    Sf = 2,
+    Pv = 3,
+    Up = 4,
+    Count = 5,
+};
+
+PTO_DEVICE_FUNC inline uint32_t dist_shared_pa_output_count(DistSharedPaTaskKind kind) {
+    switch (kind) {
+    case DistSharedPaTaskKind::Alloc:
+        return 3;
+    case DistSharedPaTaskKind::Qk:
+        return 1;
+    case DistSharedPaTaskKind::Sf:
+        return 3;
+    case DistSharedPaTaskKind::Pv:
+        return 1;
+    case DistSharedPaTaskKind::Up:
+    case DistSharedPaTaskKind::Count:
+        return 0;
+    }
+    return 0;
+}
+
 struct DistCompeteFirstTicket {
     uint64_t submit_begin;
     int32_t task_id;
+#if PTO_FDWIC_SHARED_MAP
+    // PA-G1 has no joint/multilane state. Kind is supplied by the dedicated
+    // Finish API, and Claim tracing is closed in Begin, so the cross-callback
+    // ticket only carries the winner's function identity and two state bits.
+    int16_t kernel_id;
+    uint8_t won;
+    uint8_t ready;
+#else
     int32_t kernel_id;
     int32_t joint_block;
     int32_t joint_count;
@@ -75,13 +111,64 @@ struct DistCompeteFirstTicket {
     uint8_t ready;
     uint8_t kind;
     uint16_t reserved;
+#endif
 };
 
+#if PTO_FDWIC_SHARED_MAP
+static_assert(sizeof(DistCompeteFirstTicket) == 16, "shared PA compete-first ticket ABI must remain 16 bytes");
+static_assert(offsetof(DistCompeteFirstTicket, submit_begin) == 0, "shared PA ticket timestamp ABI mismatch");
+static_assert(offsetof(DistCompeteFirstTicket, task_id) == 8, "shared PA ticket task ABI mismatch");
+static_assert(offsetof(DistCompeteFirstTicket, kernel_id) == 12, "shared PA ticket function ABI mismatch");
+static_assert(offsetof(DistCompeteFirstTicket, won) == 14, "shared PA ticket winner ABI mismatch");
+
+/**
+ * Runtime-owned Claim routing token for one complete shared-PA replay.
+ *
+ * `g_self` is translation-unit local in the engine and therefore must not be
+ * read by orchestration headers.  The engine snapshots its authoritative
+ * attach result once before PA enters the 1,280-submit loop; orchestration
+ * then carries this 8-byte value unchanged through every shared wrapper.
+ * Claim only needs role and physical block; core index/lane remain owned by
+ * `g_self` and are validated once while minting the token. In particular,
+ * role is not inferred from `__DAV_*`, task kind, or lane.
+ */
+class DistSharedPaReplayContext {
+public:
+    PTO_DEVICE_FUNC DistSharedPaReplayContext() :
+        role_(CoreType::AIC),
+        block_id_(-1) {}
+
+    PTO_DEVICE_FUNC bool ready() const {
+        return (role_ == CoreType::AIC || role_ == CoreType::AIV) && block_id_ >= 0;
+    }
+    PTO_DEVICE_FUNC CoreType role() const { return role_; }
+    PTO_DEVICE_FUNC int32_t block_id() const { return block_id_; }
+
+private:
+    // Only the runtime getter can mint a ready token. Orchestration receives
+    // an immutable view, preventing accidental same-pointer role/block
+    // forgery without reloading authoritative GM fields per Submit.
+    friend PTO_DEVICE_FUNC DistSharedPaReplayContext dist_shared_pa_replay_context();
+    friend struct DistSharedPaReplayContextAbi;
+
+    CoreType role_;
+    int32_t block_id_;
+};
+
+struct DistSharedPaReplayContextAbi {
+    static constexpr size_t role = offsetof(DistSharedPaReplayContext, role_);
+    static constexpr size_t block_id = offsetof(DistSharedPaReplayContext, block_id_);
+};
+static_assert(sizeof(DistSharedPaReplayContext) == 8, "shared PA replay context ABI must remain 8 bytes");
+static_assert(DistSharedPaReplayContextAbi::role == 0, "shared PA replay context role ABI mismatch");
+static_assert(DistSharedPaReplayContextAbi::block_id == 4, "shared PA replay context block ABI mismatch");
+#else
 static_assert(sizeof(DistCompeteFirstTicket) == 32, "compete-first ticket ABI must remain 32 bytes");
 static_assert(offsetof(DistCompeteFirstTicket, submit_begin) == 0, "compete-first timestamp ABI mismatch");
 static_assert(offsetof(DistCompeteFirstTicket, task_id) == 8, "compete-first task ABI mismatch");
 static_assert(offsetof(DistCompeteFirstTicket, won) == 24, "compete-first state ABI mismatch");
 static_assert(offsetof(DistCompeteFirstTicket, reserved) == 30, "compete-first reserved ABI mismatch");
+#endif
 
 // Task submission and allocation. Host/sim definitions use the per-core g_self
 // stashed by dist_core_main / thread_local sim. CCEC definitions use the same
@@ -103,6 +190,30 @@ PTO_DEVICE_FUNC DistCompeteFirstTicket dist_alloc_compete_first_begin(PTO2Runtim
 PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_compete_first_finish(
     PTO2Runtime *rt, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args
 );
+
+#if PTO_FDWIC_SHARED_MAP
+// Shared PA split submit. Begin performs Claim, closes a nonwinner, and
+// returns stable identity. Finish accepts args only for the winner. A direct
+// caller may validate a nonwinner by passing nullptr to Finish, but the
+// orchestration wrapper skips that redundant cross-TU call.
+PTO_DEVICE_FUNC DistSharedPaReplayContext dist_shared_pa_replay_context();
+PTO_DEVICE_FUNC DistCompeteFirstTicket dist_shared_pa_submit_begin(
+    PTO2Runtime *rt, DistSharedPaReplayContext replay,
+    const MixedKernels &mixed, DistSharedPaTaskKind kind
+);
+PTO_DEVICE_FUNC bool dist_shared_pa_submit_finish(
+    PTO2Runtime *rt, DistSharedPaReplayContext replay,
+    const MixedKernels &mixed, DistSharedPaTaskKind kind,
+    const DistCompeteFirstTicket &ticket, const L0TaskArgs *winner_args
+);
+PTO_DEVICE_FUNC DistCompeteFirstTicket dist_shared_pa_alloc_begin(
+    PTO2Runtime *rt, DistSharedPaReplayContext replay
+);
+PTO_DEVICE_FUNC bool dist_shared_pa_alloc_finish(
+    PTO2Runtime *rt, DistSharedPaReplayContext replay,
+    const DistCompeteFirstTicket &ticket, const L0TaskArgs *winner_args
+);
+#endif
 
 // perf-clock 专用构建由具体 orchestration 显式声明本核应重放的 Submit
 // 总数。普通构建中该接口编译为空操作，不改变公开 submit ABI。
