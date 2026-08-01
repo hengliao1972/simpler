@@ -7,7 +7,7 @@
 
 说明：**主因是固定公共外壳三段叠加**，以及其中有多少来自 **泳道图生成（插桩）本身**。
 
-相关代码：`common/pa_scheduler_core.h` 的 `SubmitCallbackTask` /
+相关代码：`same_core/common/pa_scheduler_core.h` 的 `SubmitCallbackTask` /
 `FinishSharedLoserSubmit` / `CloseSharedCallbackSubmit`。
 
 ---
@@ -330,9 +330,9 @@ Submit 父区间             ~1.3 µs
 | 项 | 位置 |
 | --- | --- |
 | 本文依据泳道 | `per_task_deps_prepared_register_writer_partition_r5ij_b256_merged_swimlane.json` |
-| Submit / Claim / loser 收尾 | `common/pa_scheduler_core.h` |
-| `PrepareSharedTaskOutputs` / `SharedTaskOutputs` | `common/pa_frontend.h`（§2.1） |
+| Submit / Claim / loser 收尾 | `same_core/common/pa_scheduler_core.h` |
+| `PrepareSharedTaskOutputs` / `SharedTaskOutputs` | `same_core/common/pa_frontend.h`（§2.1） |
 | Winner 物化 / 发布 descriptor | `MaterializeTask`、`PublishSharedTaskOutputs`（`pa_shared_submit_path.h` 等） |
-| TraceTimestamp / ClaimMax bracket | `common/pa_scheduler_core.h`, `common/pa_trace.h` |
+| TraceTimestamp / ClaimMax bracket | `same_core/common/pa_scheduler_core.h`, `same_core/common/pa_trace.h` |
 | §12 vs 实现差异 | `shared_tensormap_imp_analysis.md` |
 | 泳道残余语义 | `swimlane_opt_anal.md`（`submit_tail_gap` 等） |

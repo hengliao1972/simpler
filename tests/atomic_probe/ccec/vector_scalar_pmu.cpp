@@ -137,7 +137,7 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(vector_scalar_pmu)(__gm__ vec
         RunScalarNops(rounds);
     } else if (mode == static_cast<uint32_t>(Mode::VectorAdd)) {
         // Keep this body mechanically identical to RunRealVectorWorkload<false>
-        // in pa_scheduler/ccec/ccec_ops.h.
+        // in pa_scheduler/same_core/ccec/ccec_ops.h.
         for (uint32_t iteration = 0U; iteration < rounds; ++iteration) {
             IssueVectorAdd(
                 input_a_global, input_b_global, output_global,

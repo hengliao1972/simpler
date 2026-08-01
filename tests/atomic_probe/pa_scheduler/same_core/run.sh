@@ -10,9 +10,10 @@
 
 set -euo pipefail
 
-# 用脚本自身位置锚定所有构建产物、转换器和输出目录；从任意 cwd 调用都
-# 不会回退到 simpler 仓库中的同名工具。
+# 当前实现的源码和构建产物固定在 same_core/ 内；公共的泳道、PMU
+# 加工工具以及采集输出仍固定在 pa_scheduler/ 根目录。
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PA_SCHEDULER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 usage() {
     cat <<'EOF'
@@ -427,11 +428,11 @@ run_submit_pmu() {
             echo "Python executable not found for PMU HTML report: $python_bin" >&2
             return 1
         fi
-        if [[ ! -f "$SCRIPT_DIR/pmu_html_report.py" ]]; then
-            echo "Missing local PMU HTML report generator: $SCRIPT_DIR/pmu_html_report.py" >&2
+        if [[ ! -f "$PA_SCHEDULER_DIR/pmu_html_report.py" ]]; then
+            echo "Missing local PMU HTML report generator: $PA_SCHEDULER_DIR/pmu_html_report.py" >&2
             return 1
         fi
-        "$python_bin" "$SCRIPT_DIR/pmu_html_report.py" "$pmu_json"
+        "$python_bin" "$PA_SCHEDULER_DIR/pmu_html_report.py" "$pmu_json"
     fi
 }
 
@@ -650,23 +651,23 @@ case "$ACTION" in
         # 已原子发布的完整文件，便于定位失败边界。
         reject_managed_swimlane_options "$@"
         # 仅需要 Python 标准库；允许用户用 PYTHON 指向自己的虚拟环境，
-        # 但转换和排他分析脚本始终取自当前 pa_scheduler 目录。
+        # 但转换和排他分析脚本始终取自 pa_scheduler 根目录。
         PYTHON_BIN="${PYTHON:-python3}"
         if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
             echo "Python executable not found: $PYTHON_BIN" >&2
             exit 1
         fi
-        if [[ ! -f "$SCRIPT_DIR/swimlane_converter.py" ]]; then
-            echo "Missing local converter: $SCRIPT_DIR/swimlane_converter.py" >&2
+        if [[ ! -f "$PA_SCHEDULER_DIR/swimlane_converter.py" ]]; then
+            echo "Missing local converter: $PA_SCHEDULER_DIR/swimlane_converter.py" >&2
             exit 1
         fi
-        if [[ ! -f "$SCRIPT_DIR/swimlane_exclusive_analyzer.py" ]]; then
-            echo "Missing local analyzer: $SCRIPT_DIR/swimlane_exclusive_analyzer.py" >&2
+        if [[ ! -f "$PA_SCHEDULER_DIR/swimlane_exclusive_analyzer.py" ]]; then
+            echo "Missing local analyzer: $PA_SCHEDULER_DIR/swimlane_exclusive_analyzer.py" >&2
             exit 1
         fi
         # UTC 秒级时间加当前 shell PID 避免并行采集目录冲突；所有产物保持
-        # 在本目录 outputs/ 下，复制 pa_scheduler 后仍可原样工作。
-        OUTPUT_ROOT="$SCRIPT_DIR/outputs/pa_scheduler_${TENSORMAP_MODE}_swimlane_$(date -u +%Y%m%d_%H%M%S)_$$"
+        # 在 pa_scheduler/outputs 下，与实现子目录解耦，便于不同实现共用加工链。
+        OUTPUT_ROOT="$PA_SCHEDULER_DIR/outputs/pa_scheduler_${TENSORMAP_MODE}_swimlane_$(date -u +%Y%m%d_%H%M%S)_$$"
         mkdir -p "$OUTPUT_ROOT"
         # all 模式下每个 backend 使用独立子目录，避免同名 raw/merged 互相覆盖；
         # 某一后端失败后 set -e 停止，之前已完成后端的产物仍可单独检查。
@@ -682,8 +683,8 @@ case "$ACTION" in
             # 只是幂等布尔开关，不会产生两份记录；直接 run 仍可选择 phase-only。
             run_backend "$backend" "$TENSORMAP_MODE" \
                 --runs 1 --trace-atomics --swimlane-json "$RAW_JSON" "$@"
-            "$PYTHON_BIN" "$SCRIPT_DIR/swimlane_converter.py" "$RAW_JSON" -o "$MERGED_JSON"
-            "$PYTHON_BIN" "$SCRIPT_DIR/swimlane_exclusive_analyzer.py" \
+            "$PYTHON_BIN" "$PA_SCHEDULER_DIR/swimlane_converter.py" "$RAW_JSON" -o "$MERGED_JSON"
+            "$PYTHON_BIN" "$PA_SCHEDULER_DIR/swimlane_exclusive_analyzer.py" \
                 "$RAW_JSON" -o "$EXCLUSIVE_JSON"
         done
         echo "[SWIMLANE] output_root=$OUTPUT_ROOT"

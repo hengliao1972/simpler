@@ -37,12 +37,12 @@
 | task 是否执行完成 | task id | task completion flag | 否 |
 
 `SharedOutputRef` 的 ABI 定义在
-`common/pa_frontend.h`。它保存稳定的
+`same_core/common/pa_frontend.h`。它保存稳定的
 `producer_task_id` 和 `output_slot`，当前 PA 只接受 view/flags 全零的
 plain ref。`SharedTaskOutputs` 只保存当前 task id 和 output count，并在
 需要时恢复这些稳定引用，不携带 winner 私有的 `TensorDesc *`。
 
-`SharedOutputCell` 定义在 `common/pa_model.h`。每个 task 独占一格，
+`SharedOutputCell` 定义在 `same_core/common/pa_model.h`。每个 task 独占一格，
 `published[]`、`last_writer[]` 和 descriptor payload 分开布置，避免三类
 访问共享同一条 cache line。
 

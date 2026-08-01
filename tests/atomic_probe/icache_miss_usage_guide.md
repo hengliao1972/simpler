@@ -1473,46 +1473,47 @@ export PYTHON=/home/q00473782/.venv/bin/python
 构建 Submit-all 整窗基准：
 
 ```bash
-./run.sh build-submit-pmu ccec none
+./same_core/run.sh build-submit-pmu ccec none
 ```
 
 需要 Claim 局部归因时另行构建：
 
 ```bash
-./run.sh build-submit-pmu ccec claim
+./same_core/run.sh build-submit-pmu ccec claim
 ```
 
 需要 EfDrain 局部归因时独立构建：
 
 ```bash
-./run.sh build-submit-pmu ccec efdrain
+./same_core/run.sh build-submit-pmu ccec efdrain
 ```
 
 需要 Materialize 局部归因时独立构建：
 
 ```bash
-./run.sh build-submit-pmu ccec materialize
+./same_core/run.sh build-submit-pmu ccec materialize
 ```
 
 需要 Register 局部归因时独立构建：
 
 ```bash
-./run.sh build-submit-pmu ccec register
+./same_core/run.sh build-submit-pmu ccec register
 ```
 
 产物分别位于：
 
 ```text
-build/ccec/submit-pmu/none/
-build/ccec/submit-pmu/claim/
-build/ccec/submit-pmu/efdrain/
-build/ccec/submit-pmu/materialize/
-build/ccec/submit-pmu/register/
+same_core/build/ccec/private/submit-pmu/none/
+same_core/build/ccec/private/submit-pmu/claim/
+same_core/build/ccec/private/submit-pmu/efdrain/
+same_core/build/ccec/private/submit-pmu/materialize/
+same_core/build/ccec/private/submit-pmu/register/
 ```
 
 每个 phase 目录中的 `pa_scheduler_host`、`pa_scheduler_kernel.o`、`libpa_scheduler_pmu_owner_aicpu.so` 和 `libpa_scheduler_pmu_owner_dispatcher.so` 是一个不可拆分的构建集。host 会按 kernel 所在目录加载两个 SO；不得从另一个 phase 目录复制或拼接产物。构建只在四件套全部完成后原子发布 `submit_pmu_artifacts.manifest`；`run.sh` 在启动 host 前核对 schema、phase、固定文件列表和四个 SHA256。
 
-`swimlane` 的 CCEC 产物仍在 `build/ccec/`，不是 PMU 产物。
+`swimlane` 的 CCEC private 产物在
+`same_core/build/ccec/private/swimlane/`，不是 PMU 产物。
 
 ## 5. 采集 Submit-all 整窗与局部 phase
 
@@ -1522,7 +1523,7 @@ build/ccec/submit-pmu/register/
 OUT="./outputs/submit_pmu_none_$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$OUT"
 
-./run.sh submit-pmu ccec none \
+./same_core/run.sh submit-pmu ccec none \
   --device 0 --batches 1 \
   --winner-workload real-compute --real-compute-counts 6,28,4,1 \
   --pmu-json "$OUT/submit_icache_raw.json"
@@ -1533,11 +1534,11 @@ mkdir -p "$OUT"
 ```bash
 mkdir -p "$OUT/capture_02" "$OUT/capture_03"
 
-./run.sh submit-pmu ccec none --device 0 --batches 1 \
+./same_core/run.sh submit-pmu ccec none --device 0 --batches 1 \
   --winner-workload real-compute --real-compute-counts 6,28,4,1 \
   --pmu-json "$OUT/capture_02/submit_icache_raw.json"
 
-./run.sh submit-pmu ccec none --device 0 --batches 1 \
+./same_core/run.sh submit-pmu ccec none --device 0 --batches 1 \
   --winner-workload real-compute --real-compute-counts 6,28,4,1 \
   --pmu-json "$OUT/capture_03/submit_icache_raw.json"
 ```
@@ -1548,7 +1549,7 @@ mkdir -p "$OUT/capture_02" "$OUT/capture_03"
 OUT_CLAIM="./outputs/submit_pmu_claim_$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$OUT_CLAIM"
 
-./run.sh submit-pmu ccec claim \
+./same_core/run.sh submit-pmu ccec claim \
   --device 0 --batches 1 \
   --winner-workload real-compute --real-compute-counts 6,28,4,1 \
   --pmu-json "$OUT_CLAIM/submit_icache_raw.json"
@@ -1560,7 +1561,7 @@ mkdir -p "$OUT_CLAIM"
 OUT_EFDRAIN="./outputs/submit_pmu_efdrain_$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$OUT_EFDRAIN"
 
-./run.sh submit-pmu ccec efdrain \
+./same_core/run.sh submit-pmu ccec efdrain \
   --device 0 --batches 1 \
   --winner-workload real-compute --real-compute-counts 6,28,4,1 \
   --pmu-json "$OUT_EFDRAIN/submit_icache_raw.json"
@@ -1576,7 +1577,7 @@ mkdir -p "$OUT_EFDRAIN"
 OUT_MAT_B1="./outputs/submit_pmu_materialize_$(date -u +%Y%m%dT%H%M%SZ)_b1"
 mkdir -p "$OUT_MAT_B1"
 
-./run.sh submit-pmu ccec materialize \
+./same_core/run.sh submit-pmu ccec materialize \
   --device 0 --batches 1 \
   --winner-workload real-compute --real-compute-counts 6,28,4,1 \
   --pmu-json "$OUT_MAT_B1/submit_icache_raw.json"
@@ -1603,7 +1604,7 @@ running read-clear 的硬门禁是 96/96 `shadow≤primary`，不是要求 96/96
 OUT_REG_B1="./outputs/submit_pmu_register_$(date -u +%Y%m%dT%H%M%SZ)_b1"
 mkdir -p "$OUT_REG_B1"
 
-./run.sh submit-pmu ccec register \
+./same_core/run.sh submit-pmu ccec register \
   --device 0 --batches 1 \
   --winner-workload real-compute --real-compute-counts 6,28,4,1 \
   --pmu-json "$OUT_REG_B1/submit_icache_raw.json"
@@ -1696,7 +1697,7 @@ cd tests/atomic_probe/ccec
 ```
 
 测试基线是 `fdwic-swimlane-deps@7bd59a8f`。被测 `VECTOR_ADD` 循环与
-`pa_scheduler/ccec/ccec_ops.h` 的 `RunRealVectorWorkload<false>` 保持相同
+`pa_scheduler/same_core/ccec/ccec_ops.h` 的 `RunRealVectorWorkload<false>` 保持相同
 流水顺序，tile 为 `128 x 128 x float`：
 
 ```text
@@ -2090,12 +2091,12 @@ pa_scheduler/outputs/scalar_observation_final_20260718/pmu_submit_all_ccec_b256_
 
 新 phase 不能只增加一个 CLI 字符串。最小完整修改包括：
 
-1. `pa_scheduler/common/pa_model.h`：在 `SubmitPmuPhase` 尾部追加稳定 id，不重排已有 `None=0/Claim=1/EfDrain=2/Materialize=4/Register=5`。
-2. `pa_scheduler/ccec/pmu_probe.h`：为 `SubmitPmuPhaseName()` 增加名称映射，并核对 phase status/边界闭合定义。
-3. `pa_scheduler/ccec/build.sh`：在白名单中将 phase 名映射到稳定 `PA_SUBMIT_PMU_PHASE_ID`；先校验名称，再用于输出目录。
-4. `pa_scheduler/run.sh`：同步 `build-submit-pmu/submit-pmu` 的 phase 白名单和 usage。
-5. `pa_scheduler/common/pa_scheduler_core.h`：在真实目标代码段前后放置 `BeginSubmitPmuPhase<...>()` / `EndSubmitPmuPhase<...>()`。必须检查所有早退、winner/loser 和 Alloc/非 Alloc 分支，不得留下只 begin 不 end 的路径。
-6. `pa_scheduler/ccec/host.cpp`：增加该 phase 的预期 calls/begin/end 形状。如果它不是每次 Submit 都调用，不能复用 `batches * 5 * 96`。
+1. `pa_scheduler/same_core/common/pa_model.h`：在 `SubmitPmuPhase` 尾部追加稳定 id，不重排已有 `None=0/Claim=1/EfDrain=2/Materialize=4/Register=5`。
+2. `pa_scheduler/same_core/ccec/pmu_probe.h`：为 `SubmitPmuPhaseName()` 增加名称映射，并核对 phase status/边界闭合定义。
+3. `pa_scheduler/same_core/ccec/build.sh`：在白名单中将 phase 名映射到稳定 `PA_SUBMIT_PMU_PHASE_ID`；先校验名称，再用于输出目录。
+4. `pa_scheduler/same_core/run.sh`：同步 `build-submit-pmu/submit-pmu` 的 phase 白名单和 usage。
+5. `pa_scheduler/same_core/common/pa_scheduler_core.h`：在真实目标代码段前后放置 `BeginSubmitPmuPhase<...>()` / `EndSubmitPmuPhase<...>()`。必须检查所有早退、winner/loser 和 Alloc/非 Alloc 分支，不得留下只 begin 不 end 的路径。
+6. `pa_scheduler/same_core/ccec/host.cpp`：增加该 phase 的预期 calls/begin/end 形状。如果它不是每次 Submit 都调用，不能复用 `batches * 5 * 96`。
 7. `pa_scheduler/pmu_sidecar_analyzer.py`：同步 phase 名/id 和配置指纹，保证不同 phase 输入不会被聚合。
 8. 补充 host/analyzer 回归：`none` 验证 96/96 primary-shadow 精确相等；running phase 验证逐核 bounded、loss/upper 公式、begin/end/calls 和语义，任一 shadow 反向大于 primary 都必须拒绝。新增 phase 的构建、门禁和迭代默认只跑 A5 b1。普通泳道仍复用相邻既有 end，不为了对齐 PMU 而额外增加泳道 `SYS_CNT`。
 
@@ -2108,15 +2109,17 @@ pa_scheduler/outputs/scalar_observation_final_20260718/pmu_submit_all_ccec_b256_
 确认 phase 名与构建命令一致：
 
 ```bash
-./run.sh build-submit-pmu ccec none
-./run.sh submit-pmu ccec none --device 0 --batches 1
+./same_core/run.sh build-submit-pmu ccec none
+./same_core/run.sh submit-pmu ccec none --device 0 --batches 1
 ```
 
-不要用 `./run.sh build ccec` 代替；后者生成的是 `swimlane` 产物。
+不要用 `./same_core/run.sh build ccec` 代替；后者生成的是 `swimlane` 产物。
 
 ### host 提示 swimlane 构建不能采 PMU
 
-这表示运行了 `build/ccec/pa_scheduler_host`。应通过 `./run.sh submit-pmu ...` 启动 phase 目录内的 host/kernel/SO 整套产物，不要手工指向根目录 kernel。
+这表示运行了 `same_core/build/ccec/<mode>/swimlane/pa_scheduler_host`。
+应通过 `./same_core/run.sh submit-pmu ...` 启动 phase 目录内的
+host/kernel/SO 整套产物，不要手工指向 swimlane kernel。
 
 ### shadow miss 始终为 0
 

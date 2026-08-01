@@ -27,7 +27,7 @@ case "$TENSORMAP_MODE" in
 esac
 BUILD_DIR="$ROOT_DIR/build/ascendc/$TENSORMAP_MODE/swimlane"
 
-# 所有源码和公共头都从 pa_scheduler 目录解析；外部只需要用户安装的
+# 所有源码和公共头都从 pa_scheduler/same_core 目录解析；外部只需要用户安装的
 # CANN 工具链和运行库，不搜索 simpler 仓库根目录。
 
 if [[ -z "${ASCEND_HOME_PATH:-}" ]]; then
@@ -44,7 +44,7 @@ if [[ ! -x "$BISHENG" ]]; then
     exit 1
 fi
 
-# build 产物固定放回 pa_scheduler/build/ascendc；目录可重复创建，重新构建会
+# build 产物固定放回 pa_scheduler/same_core/build/ascendc；目录可重复创建，重新构建会
 # 原位替换可执行文件，不向源码目录散落中间产物。
 mkdir -p "$BUILD_DIR"
 

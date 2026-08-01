@@ -6,7 +6,7 @@
 > 状态：代码分析结论；不表示 view symbol 已经实现。
 
 下文 PA 头文件默认位于
-`tests/atomic_probe/pa_scheduler/common/`，A5 runtime 头文件默认位于
+`tests/atomic_probe/pa_scheduler/same_core/common/`，A5 runtime 头文件默认位于
 `src/a5/runtime/fully_distributed_within_core/runtime/dist_engine/aicore/`。
 
 ## 1. 问题和直接结论

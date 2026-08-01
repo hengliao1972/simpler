@@ -24,7 +24,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
-PA_CCEC_DIR="$SCRIPT_DIR/../pa_scheduler/ccec"
+PA_CCEC_DIR="$SCRIPT_DIR/../pa_scheduler/same_core/ccec"
 BUILD_DIR="$SCRIPT_DIR/build/vector_scalar_pmu"
 ACTION="${1:-all}"
 if [[ "$ACTION" != "all" && "$ACTION" != "build" && "$ACTION" != "run" ]]; then

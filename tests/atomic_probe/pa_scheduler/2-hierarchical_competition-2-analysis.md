@@ -57,7 +57,7 @@ FUNCTION ClaimD(task_id, cursor):
 这里的 `AtomicLoad` 不能被含混地理解成普通 scalar load。正确性和性能
 必须分别基于其真实实现讨论。
 
-当前 CCEC 后端在 `ccec/ccec_ops.h` 中明确实现为：
+当前 CCEC 后端在 `same_core/ccec/ccec_ops.h` 中明确实现为：
 
 ```cpp
 Load(address) == atomicAdd(address, 0)

@@ -2,7 +2,8 @@
 
 ## 1. 目标与边界
 
-本目录复现的是 A5 FDWIC Paged Attention Case1 的 **PA Submit 调度行为**，
+本目录的 `same_core/` 实现复现 A5 FDWIC Paged Attention Case1 的
+**PA Submit 调度行为**，
 不是把 PA 简化成普通 NOP 并发压测。整个目录复制到 `simpler` 代码仓之外后，
 不再包含对 simpler 头文件、库、Python、PyTorch 或虚拟环境的编译和链接依赖。
 泳道转换脚本也位于本目录，仅使用 Python 标准库，不 import `simpler_setup`
@@ -87,9 +88,19 @@ BlockWon 发布、claim、drain 和剩余计数协议后再谈语义对等。
 因此，约 5 ms 是性能参考，不是通过条件。不能为了命中 5 ms 而在 Claim、
 Register、PrepareMap 或等待路径中插入虚假延时。
 
-## 2. 三种实现
+## 2. 当前 same-core 实现的三种后端
 
-三种后端共用 `common/` 中完全相同的 PA 模型和调度器，只分别实现原子指令、
+目录层次为：
+
+- `same_core/common/`：当前“构建 owner 同时执行 task”的公共模型和调度器；
+- `same_core/ccec/`、`same_core/ascendc/`、`same_core/cpu/`：后端实现；
+- `same_core/test/`：与该实现直接绑定的 C++ 协议门槛；
+- `same_core/run.sh`：唯一构建和运行入口，产物放在 `same_core/build/`；
+- `pa_scheduler/` 根目录：不绑定某个调度实现的文档、泳道/PMU 加工工具、
+  `outputs/` 和 `test_record/`。
+
+三种后端共用 `same_core/common/` 中完全相同的 PA 模型和调度器，
+只分别实现原子指令、
 时钟、winner 计算体和启动入口。
 
 | 后端 | 启动形式 | atomic load | Claim fetch-max | 当前 winner 负载 |
@@ -121,8 +132,8 @@ Alloc 没有模拟 kernel body。NOP 数是 A5 实测校准量，不应解释为
 可以在运行时覆盖：
 
 ```bash
-./run.sh run ccec --winner-workload scalar-nop --nop-count 100000
-./run.sh run ccec --winner-workload scalar-nop \
+./same_core/run.sh run ccec --winner-workload scalar-nop --nop-count 100000
+./same_core/run.sh run ccec --winner-workload scalar-nop \
   --nop-counts 129600,157900,79950,2400
 ```
 
@@ -137,7 +148,7 @@ QK、SF、PV、UP，允许范围为 0 到 10,000,000。兼容旧命令时，显�
 `all` 按 CCEC、AscendC、CPU 的顺序统一运行；命令中显式写出模式仍然有效：
 
 ```bash
-./run.sh run all \
+./same_core/run.sh run all \
   --winner-workload real-compute --batches 8 --runs 1 \
   --real-compute-count 1 --no-swimlane
 ```
@@ -145,9 +156,9 @@ QK、SF、PV、UP，允许范围为 0 到 10,000,000。兼容旧命令时，显�
 也可单独选择后端：
 
 ```bash
-./run.sh run ccec   --winner-workload real-compute --batches 256 --runs 1 --no-swimlane
-./run.sh run ascendc --winner-workload real-compute --batches 256 --runs 1 --no-swimlane
-./run.sh run cpu    --winner-workload real-compute --batches 1 --runs 1 \
+./same_core/run.sh run ccec   --winner-workload real-compute --batches 256 --runs 1 --no-swimlane
+./same_core/run.sh run ascendc --winner-workload real-compute --batches 256 --runs 1 --no-swimlane
+./same_core/run.sh run cpu    --winner-workload real-compute --batches 1 --runs 1 \
   --real-compute-count 1 --no-swimlane
 ```
 
@@ -165,8 +176,8 @@ CCEC 的 A5 标定；AscendC 需用自身实测解读，CPU 只复用参数含�
 可以统一或分类型覆盖，范围为 1 到 128：
 
 ```bash
-./run.sh run all --winner-workload real-compute --real-compute-count 1 --no-swimlane
-./run.sh run ascendc --winner-workload real-compute --real-compute-counts 6,28,4,1
+./same_core/run.sh run all --winner-workload real-compute --real-compute-count 1 --no-swimlane
+./same_core/run.sh run ascendc --winner-workload real-compute --real-compute-counts 6,28,4,1
 ```
 
 `--real-compute-count*` 与 `--nop-count*` 不能混用；三后端全部使用相同的
@@ -174,7 +185,7 @@ CCEC 的 A5 标定；AscendC 需用自身实测解读，CPU 只复用参数含�
 真计算默认使用 `constant` 输入模式做性能测量；需要核验矩阵布局时使用：
 
 ```bash
-./run.sh run all \
+./same_core/run.sh run all \
   --winner-workload real-compute --real-compute-count 1 \
   --real-compute-pattern layout-diagnostic --batches 1 --runs 1 --no-swimlane
 ```
@@ -219,8 +230,8 @@ source "$HOME/Ascend/cann-9.1.0-weekly-20260708/cann-9.1.0/set_env.sh"
 
 export CXX=/usr/bin/g++
 
-./run.sh build ccec --tensormap private
-./run.sh build cpu --tensormap private
+./same_core/run.sh build ccec --tensormap private
+./same_core/run.sh build cpu --tensormap private
 ```
 
 当前开发门槛只要求 CCEC 与 CPU，不要求 AscendC。用户目录中从 Ubuntu
@@ -237,11 +248,11 @@ mixed 的两个入口和 metadata section；CANN 9.1 自带的 PTO 头可直接�
 
 | 构建 | 后端 | 内容 | 构建命令 | 产物目录 |
 | ---- | ---- | ---- | -------- | -------- |
-| `swimlane` | CCEC/AscendC/CPU | schema-v5 普通阶段、业务父区间、真实 Submit 尾动作与 atomic（direct + PollBatch）合并采集；shared Materialize 另含 task-output/copy/flush detail，Register 含 writer-metadata detail；不配置 PMU | `./run.sh build ccec --tensormap <mode>` 或 `./run.sh build all --tensormap <mode>` | `build/<backend>/<mode>/swimlane/` |
-| `perf-clock` | CCEC/CPU | 编译掉泳道、atomic 观察、phase-profile、PMU 和 kernel/lifecycle 计时；每核只新增首个 Submit 起点与末个 Submit 终点两个性能边界 | `./run.sh build-perf-clock ccec\|cpu --tensormap <mode>` | `build/<backend>/<mode>/perf-clock/` |
-| `submit-pmu` | 仅 CCEC | 每核完整 Submit PMU，并在编译期可选一个局部阶段；当前有 `none\|claim\|efdrain\|materialize\|register` | `./run.sh build-submit-pmu ccec <phase> --tensormap <mode>` | `build/ccec/<mode>/submit-pmu/<phase>/` |
+| `swimlane` | CCEC/AscendC/CPU | schema-v5 普通阶段、业务父区间、真实 Submit 尾动作与 atomic（direct + PollBatch）合并采集；shared Materialize 另含 task-output/copy/flush detail，Register 含 writer-metadata detail；不配置 PMU | `./same_core/run.sh build ccec --tensormap <mode>` 或 `./same_core/run.sh build all --tensormap <mode>` | `same_core/build/<backend>/<mode>/swimlane/` |
+| `perf-clock` | CCEC/CPU | 编译掉泳道、atomic 观察、phase-profile、PMU 和 kernel/lifecycle 计时；每核只新增首个 Submit 起点与末个 Submit 终点两个性能边界 | `./same_core/run.sh build-perf-clock ccec\|cpu --tensormap <mode>` | `same_core/build/<backend>/<mode>/perf-clock/` |
+| `submit-pmu` | 仅 CCEC | 每核完整 Submit PMU，并在编译期可选一个局部阶段；当前有 `none\|claim\|efdrain\|materialize\|register` | `./same_core/run.sh build-submit-pmu ccec <phase> --tensormap <mode>` | `same_core/build/ccec/<mode>/submit-pmu/<phase>/` |
 
-`./run.sh build all` 只构建三后端的 `swimlane` 产物；`perf-clock`
+`./same_core/run.sh build all` 只构建三后端的 `swimlane` 产物；`perf-clock`
 只支持当前验收范围内的 CCEC/CPU，必须逐后端构建；`submit-pmu` 必须按
 phase 另行构建。`none` 是不做局部边界读取的完整 Submit PMU 窗口，
 不能替代 `perf-clock`。
@@ -577,10 +588,10 @@ PA benchmark，也不改变 PA kernel/host。构建和运行前先 source 本用
 CANN 9.1，再在本目录执行：
 
 ```bash
-./run.sh build-shared-protocol-litmus ccec
-./run.sh shared-protocol-litmus ccec \
+./same_core/run.sh build-shared-protocol-litmus ccec
+./same_core/run.sh shared-protocol-litmus ccec \
   --scenario history --device 0 --runs 20
-./run.sh shared-protocol-litmus ccec \
+./same_core/run.sh shared-protocol-litmus ccec \
   --scenario reader-reclaim --ordering all \
   --device 0 --runs 20
 ```
@@ -657,7 +668,7 @@ host 进程；也可用下面的合并命令在同一最终 artifact 上先跑 h
 reader-reclaim，共 160 个全新进程：
 
 ```bash
-./run.sh shared-protocol-litmus ccec \
+./same_core/run.sh shared-protocol-litmus ccec \
   --scenario all --ordering all --device 0 --runs 20
 ```
 
@@ -674,7 +685,7 @@ host 除了结果和状态转换，还反向断言未选方向、history/symbol 
 bucket 及其 physical slots 未被触碰。产物固定在：
 
 ```text
-build/ccec/shared/shared-protocol-litmus/
+same_core/build/ccec/shared/shared-protocol-litmus/
 ```
 
 普通 shared 构建还会把 AIC/AIV 的 generic shared-protocol probe 各自实际
@@ -730,10 +741,10 @@ CCEC、AscendC 和 CPU 的 `run/swimlane` 都可使用
 低扰动 b1 门禁使用：
 
 ```bash
-./run.sh build-perf-clock cpu  --tensormap private
-./run.sh perf-clock       cpu  --tensormap private --batches 1
-./run.sh build-perf-clock ccec --tensormap private
-./run.sh perf-clock       ccec --tensormap private --batches 1
+./same_core/run.sh build-perf-clock cpu  --tensormap private
+./same_core/run.sh perf-clock       cpu  --tensormap private --batches 1
+./same_core/run.sh build-perf-clock ccec --tensormap private
+./same_core/run.sh perf-clock       ccec --tensormap private --batches 1
 ```
 
 shared 时只替换 `--tensormap shared`。`perf-clock` action 自己固定
@@ -745,7 +756,7 @@ shared 时只替换 `--tensormap shared`。`perf-clock` action 自己固定
 先做三后端快速语义回归：
 
 ```bash
-./run.sh smoke all --device 0
+./same_core/run.sh smoke all --device 0
 ```
 
 通过标准是所有 `[ASSERT]` 为 `PASS`，最终同时出现：
@@ -762,11 +773,11 @@ semantic_status=PASS postprocess_status=PASS
 再在真实 A5 上测完整 CCEC 或 AscendC：
 
 ```bash
-./run.sh run ccec \
+./same_core/run.sh run ccec \
   --device 0 --batches 256 --runs 5 \
   --analyze-swimlane
 
-./run.sh run ascendc \
+./same_core/run.sh run ascendc \
   --device 0 --batches 256 --runs 5 \
   --profile-phases --analyze-swimlane
 ```
@@ -785,10 +796,10 @@ semantic_status=PASS postprocess_status=PASS
 生成可直接载入 Perfetto 的泳道文件时使用独立的 `swimlane` action：
 
 ```bash
-./run.sh swimlane ccec \
+./same_core/run.sh swimlane ccec \
   --device 0 --batches 1 --winner-workload real-compute
 
-./run.sh swimlane ascendc \
+./same_core/run.sh swimlane ascendc \
   --device 0 --batches 1 --winner-workload real-compute \
   --real-compute-count 1
 ```
@@ -810,7 +821,7 @@ export PYTHON=/path/to/venv/bin/python
 排他闭合报告。
 
 修改 C++ 头文件或 kernel 后必须先执行
-`./run.sh build ccec --tensormap private`，
+`./same_core/run.sh build ccec --tensormap private`，
 `swimlane` action 只消费已有构建件，不会隐式重编译。日常边界迭代默认只跑
 A5 b1；b256 只用于阶段性规模/容量收口或明确指定的长负载结论。
 
@@ -959,7 +970,7 @@ python3 ./swimlane_exclusive_analyzer.py \
 
 ```bash
 mkdir -p ./outputs/manual
-./run.sh run ccec --device 0 --batches 256 --runs 1 \
+./same_core/run.sh run ccec --device 0 --batches 256 --runs 1 \
   --swimlane-json ./outputs/manual/l2_swimlane_records.json
 ```
 
@@ -975,7 +986,7 @@ mkdir -p ./outputs/manual
 CPU 完整协议回归建议关闭大泳道缓冲区：
 
 ```bash
-./run.sh run cpu \
+./same_core/run.sh run cpu \
   --batches 256 --runs 1 --nop-count 0 \
   --profile-phases --no-swimlane
 ```
@@ -1061,7 +1072,7 @@ generation/reclaim 协议，不能沿用 no-wrap 结论。
 生成带文字分析的 CCEC 合并泳道可直接执行：
 
 ```bash
-./run.sh swimlane ccec \
+./same_core/run.sh swimlane ccec \
   --device 0 --batches 1 \
   --analyze-swimlane
 ```
@@ -1411,27 +1422,27 @@ PMU context 而采用 inline-finish 诊断 ELF。因此后两者与 `none`
 分别构建：
 
 ```bash
-./run.sh build-submit-pmu ccec none
-./run.sh build-submit-pmu ccec claim
-./run.sh build-submit-pmu ccec efdrain
-./run.sh build-submit-pmu ccec materialize
-./run.sh build-submit-pmu ccec register
+./same_core/run.sh build-submit-pmu ccec none
+./same_core/run.sh build-submit-pmu ccec claim
+./same_core/run.sh build-submit-pmu ccec efdrain
+./same_core/run.sh build-submit-pmu ccec materialize
+./same_core/run.sh build-submit-pmu ccec register
 ```
 
 上面省略了默认的 `--tensormap private`；显式写法例如：
 
 ```bash
-./run.sh build-submit-pmu ccec none --tensormap private
+./same_core/run.sh build-submit-pmu ccec none --tensormap private
 ```
 
 产物完全分开：
 
 ```text
-build/ccec/private/submit-pmu/none/
-build/ccec/private/submit-pmu/claim/
-build/ccec/private/submit-pmu/efdrain/
-build/ccec/private/submit-pmu/materialize/
-build/ccec/private/submit-pmu/register/
+same_core/build/ccec/private/submit-pmu/none/
+same_core/build/ccec/private/submit-pmu/claim/
+same_core/build/ccec/private/submit-pmu/efdrain/
+same_core/build/ccec/private/submit-pmu/materialize/
+same_core/build/ccec/private/submit-pmu/register/
 ```
 
 每个目录都自包含同 phase 的 host、mixed kernel、PMU owner 和 dispatcher，
@@ -1444,7 +1455,7 @@ schema、mode、mode-id、CAP、insert-turn G、variant、phase、phase-id，
 export PYTHON="$HOME/.venv/bin/python"
 OUT="./outputs/submit_pmu_none_$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$OUT"
-./run.sh submit-pmu ccec none \
+./same_core/run.sh submit-pmu ccec none \
   --tensormap private \
   --device 0 --batches 1 \
   --winner-workload real-compute --real-compute-counts 6,28,4,1 \
@@ -1525,7 +1536,7 @@ outputs/submit_pmu_boundary_sync_b1_20260719/{none,claim,efdrain,materialize,reg
 for phase in materialize register; do
   OUT="./outputs/submit_pmu_${phase}_$(date -u +%Y%m%dT%H%M%SZ)"
   mkdir -p "$OUT"
-  ./run.sh submit-pmu ccec "$phase" \
+  ./same_core/run.sh submit-pmu ccec "$phase" \
     --device 0 --batches 1 \
     --winner-workload real-compute --real-compute-counts 6,28,4,1 \
     --pmu-json "$OUT/submit_icache_raw.json"
@@ -1656,7 +1667,7 @@ Path-A owner 配置 selector、保存并恢复 PMU 状态；kernel 在每个物�
 
 #### 历史：Main AICPU Path-A owner
 
-owner 已自包含在 `ccec/`：构建会同时产出 dispatcher 和 owner AArch64 SO。host
+owner 已自包含在 `same_core/ccec/`：构建会同时产出 dispatcher 和 owner AArch64 SO。host
 通过 CANN 9.1 已验证的 Main AICPU Path-A 完成 bootstrap 和 mode-0 注册，运行时
 调用 `simpler_aicpu_exec` 执行 Configure/Restore；不要求用户另行启动 PMU 配置进程。
 owner 对本轮会话独占的 PMU 状态先保存、再配置并读回，结束时只按成功 bitmap 从
@@ -1702,7 +1713,7 @@ start/stop、`miss <= request`，以及 owner Restore 成功。
 `icache-single` 的可执行标定命令为：
 
 ```bash
-./run.sh run ccec \
+./same_core/run.sh run ccec \
   --device 0 --batches 1 --runs 1 --nop-count 0 --no-swimlane \
   --pmu-window icache-single --pmu-icache-trials 64
 ```
@@ -1724,11 +1735,11 @@ icache_pairs=96/96 calibrated_cores=96/96
 正式 sidecar 使用单轮、独立进程和唯一输出路径：
 
 ```bash
-./run.sh build ccec
+./same_core/run.sh build ccec
 
 OUT="./outputs/pmu_submit_all_$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$OUT"
-./run.sh run ccec \
+./same_core/run.sh run ccec \
   --device 0 --batches 256 --runs 1 --no-swimlane \
   --pmu-window submit-all \
   --pmu-json "$OUT/pmu_submit_all.json"
@@ -1739,7 +1750,7 @@ mkdir -p "$OUT"
 例如已用于 count 倍增取证的 b8 命令：
 
 ```bash
-./run.sh run ccec \
+./same_core/run.sh run ccec \
   --device 0 --batches 8 --runs 1 --no-swimlane \
   --winner-workload real-compute --real-compute-count 1 \
   --pmu-window submit-all --pmu-json "$OUT/pmu_real_b8_count1.json"
@@ -2128,18 +2139,19 @@ CPU 后端只在 host 侧分配相同 workspace，不存在 device 内存口径�
 runner、converter 与 analyzer 都使用临时文件后原子替换自己的目标，失败时
 不会把半截文件冒充完整产物。
 
-脱离 simpler 时必须复制整个目录，因为三个后端共用 `common/`：
+脱离 simpler 时必须保留整个 `pa_scheduler/` 层次：三个后端共用
+`same_core/common/`，`same_core/run.sh` 还会调用根目录的泳道和 PMU 加工工具：
 
 ```bash
 cp -a tests/atomic_probe/pa_scheduler /tmp/pa_scheduler
 cd /tmp/pa_scheduler
-./run.sh build cpu
-./run.sh smoke cpu
+./same_core/run.sh build cpu
+./same_core/run.sh smoke cpu
 ```
 
 上面两条省略 `--tensormap private`，与显式写出 private 等价。shared
 模式可在复制目录后显式执行
-`./run.sh build cpu --tensormap shared`；构建身份和产物目录会保持 shared，
+`./same_core/run.sh build cpu --tensormap shared`；构建身份和产物目录会保持 shared，
 不会回退到 private。
 
 shared insert turn 默认使用 G=1。需要构建交错候选时，通过构建环境变量
@@ -2148,13 +2160,13 @@ shared insert turn 默认使用 G=1。需要构建交错候选时，通过构建
 
 ```bash
 PA_SHARED_INSERT_TURN_GROUPS=32 \
-  ./run.sh build cpu --tensormap shared
+  ./same_core/run.sh build cpu --tensormap shared
 
 PA_SHARED_INSERT_TURN_GROUPS=128 \
-  ./run.sh build ccec --tensormap shared
+  ./same_core/run.sh build ccec --tensormap shared
 
 PA_SHARED_INSERT_TURN_GROUPS=128 \
-  ./run.sh perf-clock ccec --tensormap shared --batches 512
+  ./same_core/run.sh perf-clock ccec --tensormap shared --batches 512
 ```
 
 这里的 PA-G 表示一个 batch 的 PA block-group 数；turn-G 表示 insert-turn
@@ -2177,5 +2189,5 @@ CPU 结果只作为语义与并发正确性证据；A5 性能必须使用无诊�
 
 CCEC/AscendC 只需再 source CANN 环境。本目录的构建脚本不会搜索 Git 根目录，
 也不会引用 `simpler/src`、`simpler/examples` 或其他仓内文件。泳道转换与排他
-分析都只需 Python 3 标准库；复制后的 `./run.sh swimlane ...` 仍使用当前目录内的
+分析都只需 Python 3 标准库；复制后的 `./same_core/run.sh swimlane ...` 仍使用当前目录内的
 `swimlane_converter.py` 和 `swimlane_exclusive_analyzer.py`。

@@ -1005,8 +1005,8 @@ Host 在 raw 发布前还会校验共享 flag/vend/frontier、Claim/winner 计�
 
 ```bash
 cd tests/atomic_probe/pa_scheduler
-./run.sh build ccec
-./run.sh swimlane ccec --batches 256
+./same_core/run.sh build ccec
+./same_core/run.sh swimlane ccec --batches 256
 ```
 
 CCEC 才是本文 A5 mixed-core 路径的性能证据入口。CPU backend 用于协议和算术
@@ -1094,25 +1094,26 @@ kernel duration 直接当成主场景 kernel duration。
 
 建议按以下顺序阅读，先建立业务图，再进入平台细节：
 
-1. [common/pa_model.h](common/pa_model.h)
+1. [same_core/common/pa_model.h](same_core/common/pa_model.h)
 
    查看拓扑常量、TaskKind、共享/私有状态、TracePhase 和 raw ABI。
 
-2. [common/pa_frontend.h](common/pa_frontend.h)
+2. [same_core/common/pa_frontend.h](same_core/common/pa_frontend.h)
 
    查看 descriptor、TensorMap、Materialize、Fanin、Register 和 slot payload。
 
-3. [common/pa_scheduler_core.h](common/pa_scheduler_core.h)
+3. [same_core/common/pa_scheduler_core.h](same_core/common/pa_scheduler_core.h)
 
    从 `RunSchedulerImpl` 进入，再读 `SubmitCallbackTask`、
    `FinishCallbackSubmitBody`、`DrainReady`、`CompleteTask`。
 
-4. [ccec/callback_runtime_entry.cpp](ccec/callback_runtime_entry.cpp) 与
-   [ccec/callback_finish.cpp](ccec/callback_finish.cpp)
+4. [same_core/ccec/callback_runtime_entry.cpp](same_core/ccec/callback_runtime_entry.cpp) 与
+   [same_core/ccec/callback_finish.cpp](same_core/ccec/callback_finish.cpp)
 
    查看 CCEC worker 入口和 compete-first split finish 边界。
 
-5. [ccec/host.cpp](ccec/host.cpp) 与 [run.sh](run.sh)
+5. [same_core/ccec/host.cpp](same_core/ccec/host.cpp) 与
+   [same_core/run.sh](same_core/run.sh)
 
    查看 Host launch、D2H 校验、raw 发布和三段后处理流水线。
 

@@ -12,7 +12,7 @@
 #include "vector_scalar_pmu_shared.h"
 #include "pmu_probe_host_support.h"
 #include "../probe_host.h"
-#include "../pa_scheduler/ccec/pmu_owner_host.h"
+#include "../pa_scheduler/same_core/ccec/pmu_owner_host.h"
 
 #include "acl/acl.h"
 

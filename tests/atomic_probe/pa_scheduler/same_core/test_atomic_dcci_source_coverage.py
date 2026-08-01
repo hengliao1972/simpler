@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parent
 COMMON = ROOT / "common"
 MODEL = COMMON / "pa_model.h"
 HOST_SUPPORT = COMMON / "host_support.h"
-CONVERTER = ROOT / "swimlane_converter.py"
+CONVERTER = ROOT.parent / "swimlane_converter.py"
 
 CONTROLLED_OPS: Sequence[str] = (
     "Load",

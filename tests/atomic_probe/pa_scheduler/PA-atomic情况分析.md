@@ -485,7 +485,7 @@ ring      = 268,435,456 B
 以及 256 batch、零 NOP、开启四阶段统计、关闭泳道大缓冲区的完整运行：
 
 ```bash
-./run.sh run all --device 0 --batches 256 --runs 1 \
+./same_core/run.sh run all --device 0 --batches 256 --runs 1 \
   --nop-count 0 --profile-phases --no-swimlane
 ```
 

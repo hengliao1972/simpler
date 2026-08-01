@@ -4166,9 +4166,9 @@ RingBp 和 CAS retry 均为 0，依赖签名固定
 `-0.5136%` 就留下临时容量控制。
 
 S4.16a/S4.16b 的源码、ABI 和测试已整体撤销。回退后对
-`common/pa_model.h`、`common/host_support.h`、
-`test/test_shared_tensor_map_ring.cpp`、
-`test/test_shared_vector_claim_cursor.cpp` 和 `cpu/build.sh` 执行
+`same_core/common/pa_model.h`、`same_core/common/host_support.h`、
+`same_core/test/test_shared_tensor_map_ring.cpp`、
+`same_core/test/test_shared_vector_claim_cursor.cpp` 和 `same_core/cpu/build.sh` 执行
 `git diff --exit-code 319077a9 -- ...` 无差异，当前恢复：
 
 ```text
@@ -4314,7 +4314,7 @@ standalone 数字而重复已否决方向。
 #### S4.17 实现与正确性实测
 
 S4.17 已按预登记的 shared-only 布局实现，源码只改动
-`common/pa_model.h`：
+`same_core/common/pa_model.h`：
 
 - shared 的 `occupied_count/owned_total/swimlane_last_cycle` 分别移动到
   32/36/40B，`map` 移到 48B；
@@ -4469,7 +4469,7 @@ outputs/perf_clock_pair_82c0828d_vs_319077a9_20260725_191435/
 一伴随变化解释成热字段前置的确定因果。
 
 S4.17 的 shared 字段移动、条件 ABI v5 和新增 offset 断言已全部撤销。
-回退后的 `common/pa_model.h` 与 `bf7a7076` 逐字节无差异，当前重新恢复：
+回退后的 `same_core/common/pa_model.h` 与 `bf7a7076` 逐字节无差异，当前重新恢复：
 
 ```text
 shared/private build ABI = v4
@@ -5764,7 +5764,7 @@ CCEC 制品，未复用早于 S6.4d～g 的旧 ELF。两套 manifest 分别固�
 
 ```bash
 PYTHON="$HOME/.venv/bin/python" \
-tests/atomic_probe/pa_scheduler/run.sh swimlane ccec \
+tests/atomic_probe/pa_scheduler/same_core/run.sh swimlane ccec \
   --tensormap shared --device 0 \
   --batches 256 --shared-context-lens 8192 \
   --winner-workload real-compute \
@@ -8369,7 +8369,7 @@ oracle，ownerless INPUT 的新增查询不会提前进入现有 PA 性能路径
 
 #### 独立 A→B→C 门槛
 
-新增 `test/test_shared_writer_intent.cpp`，完全不使用 `TaskKind`、group、
+新增 `same_core/test/test_shared_writer_intent.cpp`，完全不使用 `TaskKind`、group、
 PA 参数构造器或 task ticket：
 
 - symbol：A 发布 fresh descriptor，B 以 INOUT 复写，C 在 B 的
@@ -8644,7 +8644,7 @@ header/payload load 不会上提到失效之前。没有给热路径增加第二
 #### A5 动态门槛的精确时序
 
 `ccec/history_litmus_*` 只依赖本目录的 `common/`、CCEC/ACL/runtime，
-artifact 固定在 `build/ccec/shared/history-litmus/`。每个 host 进程只跑
+artifact 固定在 `same_core/build/ccec/shared/history-litmus/`。每个 host 进程只跑
 一个方向，两个方向分别为：
 
 ```text
@@ -8679,8 +8679,8 @@ B 发布 7 条 history + 7 次 latest CAS + writer-ready
 构建和运行入口为：
 
 ```bash
-./run.sh build-history-litmus ccec
-./run.sh history-litmus ccec --device 0 --runs 20
+./same_core/run.sh build-history-litmus ccec
+./same_core/run.sh history-litmus ccec --device 0 --runs 20
 ```
 
 `--runs 20` 表示每个方向各启动 20 个全新 host 进程，不在同一 runtime
@@ -9042,7 +9042,7 @@ writer。
 
 | 检查 | 结果 |
 | --- | --- |
-| `bash -n ccec/build.sh` | PASS |
+| `bash -n same_core/ccec/build.sh` | PASS |
 | AIC generic shared-protocol object + static ELF | PASS |
 | AIV generic shared-protocol object + static ELF | PASS |
 | 正式 AIC/AIV entry 与 split-finish | 构建 PASS |
@@ -9087,13 +9087,13 @@ history 初始化与验证分别改名为 `InitializeHistoryState()` 和
 新的唯一入口和 artifact 为：
 
 ```bash
-./run.sh build-shared-protocol-litmus ccec
-./run.sh shared-protocol-litmus ccec \
+./same_core/run.sh build-shared-protocol-litmus ccec
+./same_core/run.sh shared-protocol-litmus ccec \
   --scenario history --device 0 --runs 20
 ```
 
 ```text
-build/ccec/shared/shared-protocol-litmus/
+same_core/build/ccec/shared/shared-protocol-litmus/
   shared_protocol_litmus_host
   shared_protocol_litmus_kernel.o
   shared_protocol_litmus_artifacts.manifest
@@ -9274,8 +9274,8 @@ ELF 和 AIC/AIV `.ll`，不哈希 `.bc`；bitcode 仅作为可复查中间产物
 ```bash
 source "$HOME/Ascend/cann-9.1.0-weekly-20260708/cann-9.1.0/set_env.sh"
 export CXX=/usr/bin/g++
-./run.sh build-shared-protocol-litmus ccec
-./run.sh shared-protocol-litmus ccec \
+./same_core/run.sh build-shared-protocol-litmus ccec
+./same_core/run.sh shared-protocol-litmus ccec \
   --scenario all --ordering all --device 0 --runs 20
 ```
 
@@ -9661,7 +9661,7 @@ CAS(expected=N, desired=N+1)
 分支中，而是独立放到：
 
 ```text
-common/pa_shared_submit_path.h
+same_core/common/pa_shared_submit_path.h
 ```
 
 private 路径保持原控制流；shared 的 Claim owner 进入独立 finish：
@@ -9806,19 +9806,19 @@ outputs/pa_scheduler_shared_swimlane_20260727_171927_799726/cpu/
 最终源码下执行：
 
 ```bash
-./run.sh build cpu --tensormap shared
+./same_core/run.sh build cpu --tensormap shared
 
-./run.sh run cpu --tensormap shared \
+./same_core/run.sh run cpu --tensormap shared \
   --batches 1 --shared-context-lens 32768 \
   --runs 1 --no-swimlane \
   --winner-workload scalar-nop --nop-count 1
 
-./run.sh run cpu --tensormap shared \
+./same_core/run.sh run cpu --tensormap shared \
   --batches 256 --shared-context-lens 8192 \
   --runs 1 --no-swimlane \
   --winner-workload scalar-nop --nop-count 1
 
-./run.sh swimlane cpu --tensormap shared \
+./same_core/run.sh swimlane cpu --tensormap shared \
   --batches 1 --shared-context-lens 32768 \
   --winner-workload scalar-nop --nop-count 1
 ```
@@ -9832,7 +9832,7 @@ signature、INOUT history、heap cursor 和完成 flag 全部通过。CPU 的
 
 ```bash
 source "$HOME/Ascend/cann-9.1.0-weekly-20260708/cann-9.1.0/set_env.sh"
-./run.sh build ccec --tensormap shared
+./same_core/run.sh build ccec --tensormap shared
 ```
 
 AIC/AIV generic protocol、正式 entry、role-specific real-compute、
@@ -9953,13 +9953,13 @@ private sidecar、private `SchedulerState` 以及非默认 CAP 的 private ABI
 
 ```bash
 PA_SHARED_INSERT_TURN_GROUPS=4 \
-  ./run.sh build cpu --tensormap shared
+  ./same_core/run.sh build cpu --tensormap shared
 
 PA_SHARED_INSERT_TURN_GROUPS=8 \
-  ./run.sh build ccec --tensormap shared
+  ./same_core/run.sh build ccec --tensormap shared
 
 PA_SHARED_INSERT_TURN_GROUPS=8 \
-  ./run.sh run ccec --tensormap shared --batches 1
+  ./same_core/run.sh run ccec --tensormap shared --batches 1
 ```
 
 CPU 正式 scheduler binary 使用构建时选择的 G；shared CPU build 还会
@@ -10059,7 +10059,7 @@ turn-G>1 相比 turn-G1 每 task 多一次 target-lane 预检 load，这是旧 g
 ```
 
 提交前 header 门禁只把新增
-`test/test_shared_insert_turn.cpp` 许可证注释中的 `license` 改为
+`same_core/test/test_shared_insert_turn.cpp` 许可证注释中的 `license` 改为
 `License`；C++ token、生产源码和 CCEC 编译输入均未改变。最终暂存源码的
 逐字节聚合 SHA256 因这一个注释字符变化更新为：
 
@@ -10078,10 +10078,10 @@ CPU 正向矩阵对每个 shared G 都执行一次完整构建和 96-worker、B2
 
 ```bash
 PA_SHARED_INSERT_TURN_GROUPS=<G> \
-  ./run.sh build cpu --tensormap shared
+  ./same_core/run.sh build cpu --tensormap shared
 
 PA_SHARED_INSERT_TURN_GROUPS=<G> \
-  ./run.sh run cpu --tensormap shared \
+  ./same_core/run.sh run cpu --tensormap shared \
   --batches 256 --shared-context-lens 8192 \
   --runs 1 --no-swimlane \
   --winner-workload scalar-nop --nop-count 1
@@ -10346,7 +10346,7 @@ device 0、shared TensorMap、默认 context 8192、PA-G1、
 
 ```bash
 PA_SHARED_INSERT_TURN_GROUPS=<G> \
-  ./run.sh perf-clock ccec --tensormap shared \
+  ./same_core/run.sh perf-clock ccec --tensormap shared \
   --device 0 --batches <256或512> --shared-context-lens 8192 \
   --winner-workload real-compute --real-compute-counts 6,28,4,1 \
   --final-barrier two-16
@@ -10546,7 +10546,7 @@ CPU 定向测试覆盖并通过：
   writer、真实任务、barrier 与 Build/执行 overlap；
 - 旧 sidecar 128 条 canary 终值和原子访问计数均保持初值。
 
-完整 `./cpu/build.sh shared swimlane` 通过。converter 与 analyzer 的
+完整 `./same_core/cpu/build.sh shared swimlane` 通过。converter 与 analyzer 的
 141 项 Python 回归通过。CCEC AIC/AIV generic protocol、mixed ELF、
 split finish 与 host runner 构建通过。
 

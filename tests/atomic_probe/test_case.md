@@ -640,7 +640,7 @@ PTO_ISA_ROOT="$PWD/build/pto-isa" ATOMIC_PROBE_DEVICE=0 ATOMIC_PROBE_AIVS=8 \
 | `ascendc/mb2_flags_clobber.asc` | gating + observation | AtomicMax flags 无丢失；store+dcci 仅统计 |
 | `ascendc/mb8_dcci_seam.asc` / `ccec/dcci_seam.cpp` | gating | clean reader 的 DEFAULT/ALL/OUT/ATOMIC/no-DCCI 五模式精确对照 |
 | `ascendc/dcci_atomic_clobber.asc` / `ccec/dcci_atomic_clobber.cpp` | regression gating + control | 同-line 三 selector 当前明确失败；分-line 与 no-DCCI 五模式精确通过 |
-| `pa_scheduler/ccec/kernel.cpp` | calibration | cold/warm 同核配对；每个 cold trial 严格增加一个 CNT7 I-cache miss，建立 scalar 时间标尺 |
+| `pa_scheduler/same_core/ccec/kernel.cpp` | calibration | cold/warm 同核配对；每个 cold trial 严格增加一个 CNT7 I-cache miss，建立 scalar 时间标尺 |
 | `cpu/cpu_atomicity.cpp` | gating + observation | coherent CPU 同/异 cacheline 同构 control、atomic、snapshot、spinlock |
 
 ### PA I-cache 单 miss 实测数据

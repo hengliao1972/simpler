@@ -5,8 +5,8 @@
 方案。目标：缩短 Claim 热路径上 `atomicMax` 的尾延迟，同时保持
 「同一 cursor 上每个 `task_id` 至多一个 winner」的语义。
 
-相关现状代码：`common/pa_scheduler_core.h` 的 `Claim()`；cursor
-定义见 `common/pa_model.h`
+相关现状代码：`same_core/common/pa_scheduler_core.h` 的 `Claim()`；cursor
+定义见 `same_core/common/pa_model.h`
 （`alloc_cursor` / `cube_cursor` /
 `shared_vector_cursor` 等）。
 
@@ -385,7 +385,7 @@ Alloc 96）。这正是分层要补的洞——**不能**靠再加大 `S` 消除
 
 ## 6. 参考
 
-- 现网 Claim：`common/pa_scheduler_core.h` → `Claim()`
+- 现网 Claim：`same_core/common/pa_scheduler_core.h` → `Claim()`
 - 分片与历史对照：`shared_tensormap_record.md`（S4.14 Vector
   cursor 等）
 - Loser Submit 中 ClaimMax 占比：`loser_overhead.md`
