@@ -954,12 +954,17 @@ args 中保留 `call_count=1`、整数 `cycles`、site/op、
 `value_zero` 和 FetchMax 的 `retries`。Perfetto 的浮点微秒显示不用于
 替代 raw 整数 tick。
 
-PollBatch 名称为 `atomic.poll_batch.<site>.load×<call_count>`，category 为
-`atomic.poll_batch`；args 还明确给出 `poll_window_cycles`、
+PollBatch 在 merged 中是同轨 duration 区间，名称为
+`atomic.poll_batch.<site>.load×<call_count>`，category 为
+`atomic.poll_batch`；未精简 args 的兼容 schema 还明确给出 `poll_window_cycles`、
 `batch_semantics=observation_load_calls`、
 `duration_semantics=logical_poll_episode_envelope_not_single_atomic_latency` 和
 `may_contain_interleaved_direct_atomics=true`。一个等待区可以同时累计多个 site，
-所以不同 PollBatch 窗口可以重叠，窗口内也可能交错 direct Atomic。
+所以 raw 中不同 PollBatch 窗口可以重叠，窗口内也可能交错
+direct Atomic 或 `task.execute`。converter 按起点升序、终点降序导入同轨
+区间，使确有包含关系的 `FinalDrain`、多类 PollBatch 和 `task.execute`
+形成上下层 slice。PollBatch 的实心区间仍只表示逻辑等待包络，不是独占
+scalar 时间；不能与内部区间重复累加，也不能按次数均分。
 host 文字分析也保持两套口径：`[TRACE_ATOMIC]` 只统计 direct bracket，
 `[TRACE_ATOMIC_POLL]` 只统计 episode 数、精确逻辑调用数和等待包络分布。
 
@@ -1020,14 +1025,15 @@ duration 不直接包含自己的 record 写入；但这次写入和附加指令
 关闭活跃 PollBatch，否则等待区内自然交错的发布/推进 atomic 会把一个逻辑等待
 episode 人为切碎。
 
-PollBatch 使用另一种时间语义：`duration`/`poll_window_cycles` 是从该 site 在显式
+PollBatch raw 使用另一种时间语义：`duration`/`poll_window_cycles` 是从该 site 在显式
 等待区内首次累计调用到边界关闭的逻辑等待 episode 包络。它不是独占 scalar 时间，
 不是 `call_count` 次 atomic 延迟之和，也不是其中某次 load 的 return-ready 延迟；
 不同 site 的窗口可以重叠，窗口内还可能包含 direct Atomic，不能把 PollBatch 混入
-direct 单次延迟的 median/p95。
+direct 单次延迟的 median/p95。merged 用带 `call_count` 的 duration 区间
+显示完整包络并建立包含层级；精确整数 cycle 和统计仍以 raw 与 host 输出为准。
 
 以下是历史 schema-v3 边界实现复用真实 PA 规则时的约束；其中 lap helper 仍保留
-历史兼容能力，但当前 standalone schema-v4 producer 已不再调用
+历史兼容能力，但当前 standalone schema-v5 producer 已不再调用
 `ResetTraceLap/WriteTraceLap`：
 
 1. 显式等待区退出时关闭与该 region 匹配的 PollBatch；

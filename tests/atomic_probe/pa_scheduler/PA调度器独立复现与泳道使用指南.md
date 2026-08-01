@@ -821,8 +821,9 @@ A5 b1；b256 只用于阶段性规模/容量收口或明确指定的长负载结
 - `l2_swimlane_records.json`：与真实 PA 相同的十列 `fdwic_events`
   权威原始件，所有字段复算以它为准；
 - `merged_swimlane.json`：只用于 Perfetto 可视化。schema-v5 的 duration
-  事件只保留 `ph/name/pid/tid/ts/dur` 六个必需字段，不再逐事件
-  复制 raw 中的 `args/cat`；拖入 <https://ui.perfetto.dev/> 即可查看；
+  事件只保留 `ph/name/pid/tid/ts/dur`，不再逐事件复制 raw 中的
+  `args/cat`；
+  拖入 <https://ui.perfetto.dev/> 即可查看；
 - `swimlane_exclusive_analysis.json`：以原始整数 cycle 校验并汇总
   Submit、EfDrain、OrchestrationReplay、FinalDrain 和 WorkerCompletion
   排他闭合关系，并将 Submit 内和 Submit 间的 residual 按相邻边界小表
@@ -918,11 +919,14 @@ runner 结束时会打印准确目录：
 3. 每个 `block0` 至 `block31` 是一个物理 1AIC+2AIV block；
 4. `AIC`、`AIV0`、`AIV1` 轨展示 OrchestrationReplay、Submit、Claim、
    EfDrain、WinnerBuild、AllocComplete、FinalDrain、Residual 和 RingBp
-   等 runtime 阶段，带 `·kernel` 的轨展示 QK、SF、PV、UP；
+   等 runtime 阶段；`DrainReady` 同步执行的 task 还会以
+   `task.execute.<kind>#<task_id>` 投影到该 scalar 轨，带 `·kernel`
+   的轨保留同一原始边界的 QK、SF、PV、UP 计算单元视图；
 5. direct Atomic、PollBatch 及 ClockBaseline 固定画在对应
    `AIC/AIV` scalar lane；direct 名称显式区分 `return_ready` 和
-   `source_issue`，PollBatch 单独标识逻辑轮询 episode；不生成带 `·atomic` 的
-   伪并行子轨；
+   `source_issue`，PollBatch 以带精确次数的区间标识逻辑轮询 episode；
+   同轨区间按 raw 起止周期形成 `FinalDrain -> PollBatch -> task.execute`
+   等真实包含层级，不生成带 `·atomic` 的伪并行子轨；
 6. merged 事件名保留 phase/task，atomic 名还保留
    `site/op/boundary/call_count`；需要 `func_id/core/flags/aux` 等精确字段时
    查同目录 raw，Atomic 的解读边界见 5.6 节。
@@ -1068,7 +1072,9 @@ generation/reclaim 协议，不能沿用 no-wrap 结论。
 schema-v5 raw 的 `metadata.trace_schema_version` 必须为 5，且顶层
 `l2_swimlane_level` 必须为 4。转换后 direct Atomic、PollBatch 和
 ClockBaseline 都放在对应 AIC/AIV 的原 scalar lane；它们属于 scalar
-调度观察，不再伪装成与 scalar 并行的独立子轨。Kernel 仍放在独立计算单元轨。
+调度观察，不再伪装成与 scalar 并行的独立子轨。Kernel 仍放在独立计算单元轨，
+同一 `ExecuteKernel` 同步括号还会以 `task.execute.<kind>#<task_id>`
+投影到 scalar 轨；两者是同一段 raw 时间的两个视图，不可重复累加。
 direct Atomic 事件名显式区分两种边界：
 
 ```text
@@ -1079,14 +1085,19 @@ atomic.source_issue.<site>.<op>#<task_id>
 边界已编码在事件名中，可在 Perfetto 中按名称搜索或过滤，
 无需为每条事件保留 category/args。
 
-PollBatch 转换为：
+PollBatch 转换为同轨 duration 区间：
 
 ```text
 atomic.poll_batch.<site>.load×<call_count>
 ```
 
 名称中的 `call_count` 是实际执行的源码 wrapper 调用次数，
-不是采样或估算值。
+不是采样或估算值。raw 仍保留首次调用到 region 关闭的完整等待
+包络，merged 用这个包络建立父子层级：例如 `FinalDrain` 包含
+`fanin_flag_load`，后者再包含起点更晚、终点不越界的
+`replay_done_poll` 和 `task.execute`。该区间表示等待 episode，不是
+连续独占 scalar 时间；不能把它与内部区间重复累加，也不能用
+`duration/call_count` 推导单次 atomic 成本。
 
 当前固定 schema 共有 42 个调用点。0～14 是既有 common/private
 调用点，15～41 是 shared heap、TensorMap、shared output 和 Claim
@@ -1204,18 +1215,20 @@ raw 十列记录复算。不把这些重复复制到 merged，是为了控制数
 加 DSB/ISB/额外 GM load；这些操作要么后端不支持，要么会明显改写
 被测路径。两种 bracket 都不能直接称为跨核可见或 atomic retire 延迟。
 
-PollBatch 的 `duration`/`poll_window_cycles` 是从该 site 在显式等待区内首次累计
+PollBatch raw 的 `duration`/`poll_window_cycles` 是从该 site 在显式等待区内首次累计
 调用到边界关闭的**逻辑等待 episode 包络**。它不是独占 scalar 时间，不是
 `call_count` 次 atomic 延迟之和，也不是其中任意一次 load 的单次延迟；因此不能把
 它放进 direct atomic 的 median/p95，或用 `duration/call_count` 推导单次成本。
 
-边界关闭规则与 phase/lap 共用同一次 cycle 采样：
+现行边界关闭规则为：
 
-- 显式等待区退出时关闭匹配的 PollBatch；
-- `TraceTimestamp` 在写 phase begin/end 前关闭全部活跃 batch；
+- 进入新的显式等待区前先收口已活跃 batch；
+- 显式等待区退出时关闭本 region 内的 PollBatch；
+- 单条 batch 达到 24-bit 计数上限时收口，下次轮询重新开启；
+- `TraceTimestamp` 只取阶段边界，不切碎显式 region 管理的 PollBatch，
+  所以 raw 包络允许跨过 `task.execute`、direct Atomic 和其他 Scalar 工作；
 - schema-v5 producer 不再生成旧 `Alloc/Build/Replay` lap；历史 helper
   仍有自身关闭规则，但不得出现在当前 raw 中；
-- Kernel begin/end 也通过 `TraceTimestamp`，所以 PollBatch 不能跨入或跨出 Kernel；
 - 最终 flush 只作防御性兜底，不能替代上述语义边界。
 
 开启该诊断时，每个 worker 在最终 drain 之后还会写两条

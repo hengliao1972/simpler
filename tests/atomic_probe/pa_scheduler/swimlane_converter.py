@@ -1747,6 +1747,31 @@ def _merged_item_sort_key(
             int(block_id), _scalar_thread_id(int(lane)), int(start), -int(end),
             0, str(name),
         )
+    if item and item[0] == "scalar_task":
+        (
+            _scalar_task,
+            _core_id,
+            block_id,
+            lane,
+            task_id,
+            function_id,
+            _phase_raw,
+            start,
+            end,
+            _flags,
+            _auxiliary,
+        ) = item
+        kernel_name = KERNEL_NAMES.get(
+            int(function_id), f"f{int(function_id)}"
+        )
+        return (
+            int(block_id),
+            _scalar_thread_id(int(lane)),
+            int(start),
+            -int(end),
+            3,
+            f"task.execute.{kernel_name}#{int(task_id)}",
+        )
     (
         _core_id,
         block_id,
@@ -1756,7 +1781,7 @@ def _merged_item_sort_key(
         phase_raw,
         start,
         end,
-        _flags,
+        flags,
         _auxiliary,
     ) = item
     phase = PHASE_NAMES[str(phase_raw)]
@@ -1765,7 +1790,14 @@ def _merged_item_sort_key(
         if phase in {"kernel", "commit"}
         else _scalar_thread_id(int(lane))
     )
-    overlay_priority = 2 if phase in ("atomic", "dcci") else 1
+    if phase == "atomic" and int(flags) & ATOMIC_POLL_BATCH:
+        # PollBatch 是等待 episode 的父包络；完全同端点时也必须先于
+        # task.execute 与 direct Atomic 导入，才能形成稳定的嵌套层级。
+        overlay_priority = 2
+    elif phase in ("atomic", "dcci"):
+        overlay_priority = 4
+    else:
+        overlay_priority = 1
     return (
         int(block_id), thread_id, int(start), -int(end),
         overlay_priority, str(phase_raw),
@@ -1837,6 +1869,16 @@ def convert(  # noqa: PLR0912, PLR0915
                 in materialize_output_tasks
         )
     ]
+    if trace_schema_version >= 4:
+        # DrainReady 在 scalar 控制流中同步调用 ExecuteKernel。Kernel raw 的
+        # begin/end 因而也是该 task 占用 scalar 调度路径的权威边界；除了
+        # 计算单元轨，还要把同一区间投影到 scalar 轨。这里只复用 raw，
+        # 不新增设备记录，也不把投影冒充第二份物理执行。
+        ordered_items.extend(
+            ("scalar_task", *row)
+            for row in rows
+            if row[5] == "Kernel" and int(row[4]) >= 0
+        )
     if trace_schema_version == 5:
         ordered_items.extend(
             ("derived", *span)
@@ -1918,6 +1960,51 @@ def convert(  # noqa: PLR0912, PLR0915
                             first,
                         )
             for item in ordered_items:
+                if item[0] == "scalar_task":
+                    (
+                        _scalar_task,
+                        core_id,
+                        block_id,
+                        lane,
+                        task_id,
+                        function_id,
+                        _phase_raw,
+                        start,
+                        end,
+                        _flags,
+                        _auxiliary,
+                    ) = item
+                    kernel_name = KERNEL_NAMES.get(
+                        int(function_id), f"f{int(function_id)}"
+                    )
+                    event = {
+                        "ph": "X",
+                        "name": (
+                            f"task.execute.{kernel_name}#{int(task_id)}"
+                        ),
+                        "pid": int(block_id),
+                        "tid": _scalar_thread_id(int(lane)),
+                        "ts": round((int(start) - base_cycle) * factor, 3),
+                        "dur": round((int(end) - int(start)) * factor, 3),
+                        "args": {
+                            "phase": "scalar_task_execution",
+                            "task_id": int(task_id),
+                            "func_id": int(function_id),
+                            "core": int(core_id),
+                            "kernel": kernel_name,
+                            "execution_unit": "scalar",
+                            "projection_source": (
+                                "synchronous_execute_kernel_bracket"
+                            ),
+                        },
+                        "cat": "scalar_task",
+                    }
+                    if trace_schema_version == 5:
+                        event.pop("args")
+                        event.pop("cat")
+                    first = _emit_event(output, event, first)
+                    emitted += 1
+                    continue
                 if item[0] == "derived":
                     (
                         _derived,
@@ -2092,9 +2179,12 @@ def convert(  # noqa: PLR0912, PLR0915
                     },
                 }
                 if phase == "atomic":
-                    # PollBatch 表示显式等待区内的逻辑调用次数；它的 span
-                    # 只是 episode 包络，可能与其他 site 或直接 Atomic 交错，
-                    # 因而绝不能伪装成一次 atomic 的 completion boundary。
+                    # PollBatch 的 start/end 是逻辑等待 episode 包络，
+                    # 不是单次 atomic completion boundary，也不是其中
+                    # call_count 次 load 的独占耗时。保留 X 区间是为了让
+                    # Perfetto 按真实包含关系把其他 poll、task.execute 和
+                    # direct Atomic 画到下层；不得用 dur/call_count 估算单次
+                    # atomic 延迟。
                     if atomic_poll_batch:
                         event["args"] = {
                             "phase": "atomic_poll_batch",

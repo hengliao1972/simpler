@@ -971,6 +971,11 @@ converter 会：
 - 校验 schema、时钟、32 AIC + 64 AIV 拓扑和 producer summary；
 - 把每个 mixed block 建成一个 Perfetto process；
 - 为每条硬件 lane 拆出 runtime 和 kernel 子泳道；
+- 把同步 `ExecuteKernel` 的原始边界投影为 runtime 轨上的
+  `task.execute.<kind>#<task_id>`，使 `FinalDrain` 内的 Scalar task 时间可见；
+- 把 PollBatch 的精确次数和首末调用包络画在同一 scalar 轨，并按
+  raw 包含关系嵌套 `FinalDrain`、其他 PollBatch 与 `task.execute`；
+  包络只表示逻辑等待 episode，不作为连续独占 scalar 时间累加；
 - 根据 raw flags 标注 claim won/lost/not-attempted；
 - 只用已有父子边界合成 `between_submit_residual`、`submit_residual` 和
   `submit_tail_gap`；

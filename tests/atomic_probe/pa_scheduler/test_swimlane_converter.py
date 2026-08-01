@@ -1790,11 +1790,13 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
         self.assertEqual((poll["pid"], poll["tid"]), (0, 1))
         self.assertEqual((handoff["pid"], handoff["tid"]), (0, 1))
         self.assertEqual((register["pid"], register["tid"]), (0, 1))
-        # schema-v5 为控制近 300 MiB 产物，只保留 Perfetto X 必需字段；
-        # poll_batch/return_ready/site/op/call_count 已完整编码在可见名称中。
+        # schema-v5 为控制近 300 MiB 产物，只保留 Perfetto duration
+        # 必需字段；poll_batch/return_ready/site/op/call_count 已完整编码
+        # 在可见名称中。
         self.assertEqual(
             set(poll), {"ph", "name", "pid", "tid", "ts", "dur"}
         )
+        self.assertEqual(poll["ph"], "X")
         self.assertEqual(
             set(handoff), {"ph", "name", "pid", "tid", "ts", "dur"}
         )
@@ -2218,6 +2220,8 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
                     batch["name"], f"atomic.poll_batch.{site_name}.load×{call_count}"
                 )
                 self.assertEqual((batch["pid"], batch["tid"]), (0, 1))
+                self.assertEqual(batch["ph"], "X")
+                self.assertAlmostEqual(batch["dur"], 0.8)
                 self.assertEqual(batch["args"]["call_count"], call_count)
                 self.assertEqual(batch["args"]["poll_window_cycles"], 800)
                 self.assertEqual(
@@ -2237,6 +2241,83 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
                     merged["metadata"]["fdwic_summary"]["atomic_calls"],
                     call_count,
                 )
+
+    def test_v5_final_drain_nests_poll_windows_and_scalar_task(self) -> None:
+        capture = _v5_shared_register_atomic_capture()
+        rows = capture["fdwic_events"]
+        assert isinstance(rows, list)
+        # helper 的 FinalDrain=[350,370)。两类 PollBatch 和 task.execute
+        # 都有 raw 权威区间，且严格形成父子包含关系；merged 应按同一
+        # scalar tid 的嵌套 slice 展示，而不是把 poll 压成单点。
+        rows.extend(
+            [
+                [0, 0, 0, -1, -1, "Atomic", 351, 369, (11 << 8) | 0x90, 5],
+                [0, 0, 0, -1, -1, "Atomic", 352, 368, (19 << 8) | 0x90, 14],
+                [0, 0, 0, 2, 1, "Kernel", 355, 365, 0, 0],
+                [0, 0, 0, 2, 1, "Commit", 366, 366, 0, 0],
+            ]
+        )
+        _refresh_summary(capture)
+
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            convert(input_path, output_path)
+            events = json.loads(output_path.read_text(encoding="utf-8"))[
+                "traceEvents"
+            ]
+
+        final_drain = next(
+            event for event in events if event.get("name") == "final_drain"
+        )
+        scalar_task = next(
+            event
+            for event in events
+            if event.get("name") == "task.execute.SF#2"
+        )
+        kernel = next(
+            event for event in events if event.get("name") == "SF#2"
+        )
+        fanin_poll = next(
+            event
+            for event in events
+            if event.get("name")
+            == "atomic.poll_batch.fanin_flag_load.load×11"
+        )
+        replay_poll = next(
+            event
+            for event in events
+            if event.get("name")
+            == "atomic.poll_batch.replay_done_poll.load×19"
+        )
+
+        self.assertEqual((final_drain["pid"], final_drain["tid"]), (0, 1))
+        self.assertEqual((scalar_task["pid"], scalar_task["tid"]), (0, 1))
+        self.assertEqual((kernel["pid"], kernel["tid"]), (0, 2))
+        self.assertEqual(
+            (scalar_task["ts"], scalar_task["dur"]),
+            (kernel["ts"], kernel["dur"]),
+        )
+        self.assertLessEqual(final_drain["ts"], scalar_task["ts"])
+        self.assertGreaterEqual(
+            final_drain["ts"] + final_drain["dur"],
+            scalar_task["ts"] + scalar_task["dur"],
+        )
+        for outer, inner in (
+            (final_drain, fanin_poll),
+            (fanin_poll, replay_poll),
+            (replay_poll, scalar_task),
+        ):
+            self.assertEqual((outer["pid"], outer["tid"]), (0, 1))
+            self.assertEqual((inner["pid"], inner["tid"]), (0, 1))
+            self.assertEqual((outer["ph"], inner["ph"]), ("X", "X"))
+            self.assertLessEqual(outer["ts"], inner["ts"])
+            self.assertGreaterEqual(
+                outer["ts"] + outer["dur"],
+                inner["ts"] + inner["dur"],
+            )
+            self.assertLess(events.index(outer), events.index(inner))
 
     def test_v3_poll_batch_accepts_maximum_24_bit_count(self) -> None:
         call_count = 0xFFFFFF
