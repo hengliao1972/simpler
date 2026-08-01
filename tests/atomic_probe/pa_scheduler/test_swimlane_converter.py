@@ -1394,7 +1394,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
         self.assertEqual(
             residuals,
             [
-                {"ph": "X", "name": "submit_residual", "pid": 0, "tid": 0, "ts": 0.01, "dur": 0.01},
+                {"ph": "X", "name": "submit_residual", "pid": 0, "tid": 1, "ts": 0.01, "dur": 0.01},
             ],
         )
         self.assertEqual(
@@ -1404,7 +1404,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
                     "ph": "X",
                     "name": "submit_tail_gap",
                     "pid": 0,
-                    "tid": 0,
+                    "tid": 1,
                     "ts": 0.04,
                     "dur": 0.01,
                 }
@@ -1451,7 +1451,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
                     "ph": "X",
                     "name": "between_submit_residual",
                     "pid": 0,
-                    "tid": 0,
+                    "tid": 1,
                     "ts": 0.05,
                     "dur": 0.02,
                 }
@@ -1682,7 +1682,9 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             self.assertFalse(output_path.exists())
 
     def test_atomic_and_clock_share_the_scalar_lane(self) -> None:
-        # 同一 mixed block 放一条 AIC 和一条 AIV0；Atomic 是 AIC scalar
+        # pid=4 的 mixed block 放一条 AIC 和一条 AIV0；这会复现旧版
+        # AIC tid=0 被 Perfetto 映射到主线程 tid=pid=4、再与 AIV0 kernel
+        # tid=4 碰撞的问题。Atomic 是 AIC scalar
         # 上 Claim 的子区间，ClockBaseline 也是 AIV0 scalar 指令，而
         # Kernel 是 AIV0 计算单元上的独立区间。
         capture = {
@@ -1695,16 +1697,16 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             },
             "fdwic_events": [
                 # Claim flags: attempted(bit1)，本核输了所以 winner(bit0)=0。
-                [0, 0, 0, 7, -1, "Claim", 100, 200, 0x2, 0],
+                [0, 4, 0, 7, -1, "Claim", 100, 200, 0x2, 0],
                 # flags: FetchMax(3) | result-used(bit4) | return-ready(bit6)。
-                [0, 0, 0, 7, -1, "Atomic", 120, 160, 0x53, 4],
+                [0, 4, 0, 7, -1, "Atomic", 120, 160, 0x53, 4],
                 # Exchange(1) 的旧值未消费，只能标 source-issue。
-                [0, 0, 0, 7, -1, "Atomic", 161, 162, 0x01, 7],
+                [0, 4, 0, 7, -1, "Atomic", 161, 162, 0x01, 7],
                 # flags: dependency-hook(bit0) | dependency-applied(bit1)。
-                [1, 0, 1, -1, -1, "ClockBaseline", 101, 102, 0x3, 0],
-                [1, 0, 1, 7, 0, "Kernel", 140, 180, 0, 0],
+                [1, 4, 1, -1, -1, "ClockBaseline", 101, 102, 0x3, 0],
+                [1, 4, 1, 7, 0, "Kernel", 140, 180, 0, 0],
                 # 同一 AIV0 上的 role-filtered Claim，没有 atomic。
-                [1, 0, 1, 8, -1, "Claim", 201, 220, 0x0, 0],
+                [1, 4, 1, 8, -1, "Claim", 201, 220, 0x0, 0],
             ],
         }
 
@@ -1722,19 +1724,21 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             for event in events
             if event.get("ph") == "M" and event.get("name") == "thread_name"
         }
-        self.assertEqual(thread_names[(0, 0)], "AIC (core0)")
-        self.assertEqual(thread_names[(0, 1)], "AIV0 (core1)")
-        self.assertEqual(thread_names[(0, 4)], "AIV0·kernel (core1)")
+        self.assertEqual(thread_names[(4, 1)], "AIC (core0)")
+        self.assertEqual(thread_names[(4, 2)], "AIC·kernel (core0)")
+        self.assertEqual(thread_names[(4, 3)], "AIV0 (core1)")
+        self.assertEqual(thread_names[(4, 4)], "AIV0·kernel (core1)")
+        self.assertNotIn((4, 0), thread_names)
         self.assertFalse(any("·atomic" in name for name in thread_names.values()))
 
         ready_atomic = next(event for event in events if event.get("cat") == "atomic.return_ready")
         issue_atomic = next(event for event in events if event.get("cat") == "atomic.source_issue")
         clock = next(event for event in events if event.get("cat") == "scalar_clock")
         kernel = next(event for event in events if event.get("name") == "QK#7")
-        self.assertEqual((ready_atomic["pid"], ready_atomic["tid"]), (0, 0))
-        self.assertEqual((issue_atomic["pid"], issue_atomic["tid"]), (0, 0))
-        self.assertEqual((clock["pid"], clock["tid"]), (0, 1))
-        self.assertEqual((kernel["pid"], kernel["tid"]), (0, 4))
+        self.assertEqual((ready_atomic["pid"], ready_atomic["tid"]), (4, 1))
+        self.assertEqual((issue_atomic["pid"], issue_atomic["tid"]), (4, 1))
+        self.assertEqual((clock["pid"], clock["tid"]), (4, 3))
+        self.assertEqual((kernel["pid"], kernel["tid"]), (4, 4))
         self.assertEqual(
             ready_atomic["name"], "atomic.return_ready.claim_max.fetch_max#7"
         )
@@ -1783,9 +1787,9 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
         register = next(
             event for event in events if event.get("name") == "register#0"
         )
-        self.assertEqual((poll["pid"], poll["tid"]), (0, 0))
-        self.assertEqual((handoff["pid"], handoff["tid"]), (0, 0))
-        self.assertEqual((register["pid"], register["tid"]), (0, 0))
+        self.assertEqual((poll["pid"], poll["tid"]), (0, 1))
+        self.assertEqual((handoff["pid"], handoff["tid"]), (0, 1))
+        self.assertEqual((register["pid"], register["tid"]), (0, 1))
         # schema-v5 为控制近 300 MiB 产物，只保留 Perfetto X 必需字段；
         # poll_batch/return_ready/site/op/call_count 已完整编码在可见名称中。
         self.assertEqual(
@@ -2213,7 +2217,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
                 self.assertEqual(
                     batch["name"], f"atomic.poll_batch.{site_name}.load×{call_count}"
                 )
-                self.assertEqual((batch["pid"], batch["tid"]), (0, 0))
+                self.assertEqual((batch["pid"], batch["tid"]), (0, 1))
                 self.assertEqual(batch["args"]["call_count"], call_count)
                 self.assertEqual(batch["args"]["poll_window_cycles"], 800)
                 self.assertEqual(

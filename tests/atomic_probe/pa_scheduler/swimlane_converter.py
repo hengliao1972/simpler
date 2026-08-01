@@ -109,6 +109,17 @@ KERNEL_NAMES = {
 # 一个物理 mixed block 的三条 runtime lane：AIC、AIV0、AIV1。
 LANE_NAMES = {0: "AIC", 1: "AIV0", 2: "AIV1"}
 
+
+def _scalar_thread_id(lane: int) -> int:
+    """返回避开 Perfetto 主线程保留值 0 的 scalar track id。"""
+    return lane * 2 + 1
+
+
+def _kernel_thread_id(lane: int) -> int:
+    """返回与对应 scalar 相邻且不冲突的 kernel track id。"""
+    return lane * 2 + 2
+
+
 # Atomic raw ABI：auxiliary 存放调用点，flags 低 4 位存放操作类型。这里的
 # 数值必须与 standalone C++ AtomicSite/AtomicOp 枚举保持一致；未知值仍会
 # 以 site_<id>/op_<id> 完整导出，便于识别版本不匹配，不会伪装成已知操作。
@@ -1733,7 +1744,7 @@ def _merged_item_sort_key(
     if item and item[0] == "derived":
         _, _core_id, block_id, lane, start, end, name = item
         return (
-            int(block_id), int(lane), int(start), -int(end),
+            int(block_id), _scalar_thread_id(int(lane)), int(start), -int(end),
             0, str(name),
         )
     (
@@ -1750,9 +1761,9 @@ def _merged_item_sort_key(
     ) = item
     phase = PHASE_NAMES[str(phase_raw)]
     thread_id = (
-        int(lane) + 3
+        _kernel_thread_id(int(lane))
         if phase in {"kernel", "commit"}
-        else int(lane)
+        else _scalar_thread_id(int(lane))
     )
     overlay_priority = 2 if phase in ("atomic", "dcci") else 1
     return (
@@ -1886,8 +1897,14 @@ def convert(  # noqa: PLR0912, PLR0915
                     if core_id is None:
                         continue
                     for thread_id, thread_name in (
-                        (lane, f"{lane_name} (core{core_id})"),
-                        (lane + 3, f"{lane_name}·kernel (core{core_id})"),
+                        (
+                            _scalar_thread_id(lane),
+                            f"{lane_name} (core{core_id})",
+                        ),
+                        (
+                            _kernel_thread_id(lane),
+                            f"{lane_name}·kernel (core{core_id})",
+                        ),
                     ):
                         first = _emit_event(
                             output,
@@ -1917,7 +1934,7 @@ def convert(  # noqa: PLR0912, PLR0915
                             "ph": "X",
                             "name": name,
                             "pid": block_id,
-                            "tid": lane,
+                            "tid": _scalar_thread_id(lane),
                             "ts": round(
                                 (start - base_cycle) * factor, 3
                             ),
@@ -1932,10 +1949,13 @@ def convert(  # noqa: PLR0912, PLR0915
                 row = item
                 core_id, block_id, lane, task_id, function_id, phase_raw, start, end, flags, auxiliary = row
                 phase = PHASE_NAMES[phase_raw]
-                # Kernel/Commit 放到 lane+3 的计算单元子泳道；Atomic/ClockBaseline
+                scalar_thread_id = _scalar_thread_id(lane)
+                kernel_thread_id = _kernel_thread_id(lane)
+                # Kernel/Commit 放到对应计算单元子泳道；Atomic/ClockBaseline
                 # 都是 AIC/AIV 对应 scalar 上执行的指令，必须与 runtime 阶段共用
-                # lane 0..2。这样 atomic span 作为 Claim/Fanin/轮询等阶段的子区间
-                # 叠加显示，不会伪装成 AIC/AIV 之外的第三类执行单元。
+                # 非零 scalar TID。这样既避免 tid=0 被 Perfetto 重映射为主线程，
+                # 又让 atomic span 作为 Claim/Fanin/轮询等阶段的子区间叠加显示，
+                # 不会伪装成 AIC/AIV 之外的第三类执行单元。
                 if phase == "claim":
                     claim_attempted: bool | None
                     claim_attempted_source: str
@@ -1967,7 +1987,7 @@ def convert(  # noqa: PLR0912, PLR0915
                         name = f"claim.{'won' if claim_won else 'lost'}#{task_id}"
                     else:
                         name = f"claim#{task_id}"
-                    thread_id = lane
+                    thread_id = scalar_thread_id
                 elif phase == "atomic":
                     atomic_site_id = auxiliary
                     atomic_op_id = flags & 0xF
@@ -2011,7 +2031,7 @@ def convert(  # noqa: PLR0912, PLR0915
                             f"atomic.{atomic_boundary_tag}.{atomic_site}."
                             f"{atomic_op}#{task_id}"
                         )
-                    thread_id = lane
+                    thread_id = scalar_thread_id
                 elif phase == "dcci":
                     dcci_site_id = auxiliary
                     dcci_op_id = flags & DCCI_OP_MASK
@@ -2032,26 +2052,26 @@ def convert(  # noqa: PLR0912, PLR0915
                         f"×{dcci_call_count}.lines{dcci_line_count}"
                         f"#{task_id}"
                     )
-                    thread_id = lane
+                    thread_id = scalar_thread_id
                 elif phase == "clock_baseline":
                     name = (
                         "clock.atomic_return_dependency_hook"
                         if flags & 1
                         else "clock.consecutive_sys_cnt_reads"
                     )
-                    thread_id = lane
+                    thread_id = scalar_thread_id
                 elif phase == "kernel" and function_id >= 0:
                     name = f"{KERNEL_NAMES.get(function_id, f'f{function_id}')}#{task_id}"
-                    thread_id = lane + 3
+                    thread_id = kernel_thread_id
                 elif phase == "commit":
                     name = f"commit#{task_id}"
-                    thread_id = lane + 3
+                    thread_id = kernel_thread_id
                 elif phase in ("orchestration_replay", "final_drain"):
                     name = phase
-                    thread_id = lane
+                    thread_id = scalar_thread_id
                 else:
                     name = f"{phase}#{task_id}"
-                    thread_id = lane
+                    thread_id = scalar_thread_id
                 event = {
                     "ph": "X",
                     "name": name,
