@@ -22,15 +22,17 @@ constexpr uint32_t kTileCols = 128U;
 constexpr uint32_t kTileElements = kTileRows * kTileCols;
 constexpr uint32_t kTileBytes = kTileElements * sizeof(float);
 
-// EMPTY measures only the PMU gate. LOOP_CONTROL keeps the same runtime loop
-// shape but replaces the pipeline body with one scalar NOP. VECTOR_ADD is the
-// exact TLOAD -> MTE2/V -> TADD -> V/MTE3 -> TSTORE -> MTE3/S sequence used by
-// the pa_scheduler AIV real workload.
+// EMPTY measures only the PMU gate. LOOP_CONTROL keeps a runtime scalar loop.
+// VECTOR_ADD is the exact synchronous PA vector loop. The two *_SCALAR modes
+// issue one vector add and run `rounds` scalar NOPs either after the final
+// MTE3->S wait (serial control) or before that wait (deferred-wait candidate).
 enum class Mode : uint32_t {
     Empty = 0U,
     LoopControl = 1U,
     VectorAdd = 2U,
-    Count = 3U,
+    VectorThenScalar = 3U,
+    VectorOverlapScalar = 4U,
+    Count = 5U,
 };
 
 struct alignas(64) ProbeControl {

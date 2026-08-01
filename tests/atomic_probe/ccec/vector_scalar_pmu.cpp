@@ -23,6 +23,7 @@
 #include <pto/pto-inst.hpp>
 
 #include "vector_scalar_pmu_shared.h"
+#include "scalar_pmu_device.h"
 // ccec_utils defines legacy sync flag macros, so include it only after PTO's
 // same-named constexpr declarations have been parsed.
 #include "ccec_utils.h"
@@ -33,60 +34,54 @@ namespace {
 
 using namespace pto;
 
-constexpr uint32_t kPmuPhysicalSubcores = 108U;
-constexpr uint64_t kPmuCounterBlockOffset = 0x4200ULL;
-constexpr uint64_t kPmuSelectorBlockOffset = 0x2400ULL;
-
-__aicore__ __attribute__((always_inline)) inline int32_t *PmuCounterBase(uint64_t register_base) {
-    return reinterpret_cast<int32_t *>(register_base + kPmuCounterBlockOffset);
-}
-
-__aicore__ __attribute__((always_inline)) inline int32_t *PmuSelectorBase(uint64_t register_base) {
-    return reinterpret_cast<int32_t *>(register_base + kPmuSelectorBlockOffset);
-}
-
-__aicore__ __attribute__((always_inline)) inline void ClearPmuCounters(uint64_t register_base) {
-    int32_t *base = PmuCounterBase(register_base);
-    (void)ld_dev(base, 0x10);
-    (void)ld_dev(base, 0x18);
-    (void)ld_dev(base, 0x20);
-    (void)ld_dev(base, 0x28);
-    (void)ld_dev(base, 0x30);
-    (void)ld_dev(base, 0x38);
-    (void)ld_dev(base, 0x40);
-    (void)ld_dev(base, 0x48);
-    (void)ld_dev(base, 0x50);
-    (void)ld_dev(base, 0x54);
-    (void)ld_dev(base, 0x60);
-    (void)ld_dev(base, 0x64);
-}
-
-template <int16_t Offset>
-__aicore__ __attribute__((always_inline)) inline uint64_t ReadCounter(uint64_t register_base) {
-    return static_cast<uint32_t>(ld_dev(PmuCounterBase(register_base), Offset));
-}
-
-__aicore__ __attribute__((always_inline)) inline uint64_t ReadPmuTotal(uint64_t register_base) {
-    int32_t *base = PmuCounterBase(register_base);
-    const uint64_t low = static_cast<uint32_t>(ld_dev(base, 0x60));
-    const uint64_t high = static_cast<uint32_t>(ld_dev(base, 0x64));
-    return low | (high << 32U);
-}
-
 __aicore__ __attribute__((always_inline)) inline uint64_t ReadSelectorStatus(uint64_t register_base) {
-    int32_t *base = PmuSelectorBase(register_base);
-    uint64_t status = 0U;
-    status |= static_cast<uint32_t>(ld_dev(base, 0x100)) == 0x501U ? vector_scalar_pmu::kSelectorVector : 0U;
-    status |= static_cast<uint32_t>(ld_dev(base, 0x108)) == 0x001U ? vector_scalar_pmu::kSelectorScalar : 0U;
-    status |= static_cast<uint32_t>(ld_dev(base, 0x110)) == 0x202U ? vector_scalar_pmu::kSelectorMte2 : 0U;
-    status |= static_cast<uint32_t>(ld_dev(base, 0x114)) == 0x203U ? vector_scalar_pmu::kSelectorMte3 : 0U;
-    status |= static_cast<uint32_t>(ld_dev(base, 0x118)) == 0x034U ? vector_scalar_pmu::kSelectorIcacheRequest : 0U;
-    status |= static_cast<uint32_t>(ld_dev(base, 0x11c)) == 0x035U ? vector_scalar_pmu::kSelectorIcacheMiss : 0U;
+    const uint64_t common = atomic_probe::scalar_pmu::ReadSelectorStatus(
+        register_base
+    );
+    uint64_t status = 0;
+    status |= (common & atomic_probe::scalar_pmu::kSelectorVector) != 0
+        ? vector_scalar_pmu::kSelectorVector : 0U;
+    status |= (common & atomic_probe::scalar_pmu::kSelectorScalar) != 0
+        ? vector_scalar_pmu::kSelectorScalar : 0U;
+    status |= (common & atomic_probe::scalar_pmu::kSelectorMte2) != 0
+        ? vector_scalar_pmu::kSelectorMte2 : 0U;
+    status |= (common & atomic_probe::scalar_pmu::kSelectorMte3) != 0
+        ? vector_scalar_pmu::kSelectorMte3 : 0U;
+    status |= (common & atomic_probe::scalar_pmu::kSelectorIcacheRequest) != 0
+        ? vector_scalar_pmu::kSelectorIcacheRequest : 0U;
+    status |= (common & atomic_probe::scalar_pmu::kSelectorIcacheMiss) != 0
+        ? vector_scalar_pmu::kSelectorIcacheMiss : 0U;
     return status;
 }
 
-__aicore__ __attribute__((always_inline)) inline void Publish64(__gm__ uint64_t *address, uint64_t value) {
-    __builtin_cce_st_dev(value, address, 0);
+template <typename GlobalData, typename TileData>
+__aicore__ __attribute__((always_inline)) inline void IssueVectorAdd(
+    GlobalData &input_a_global, GlobalData &input_b_global, GlobalData &output_global,
+    TileData &input_a_tile, TileData &input_b_tile, TileData &output_tile
+) {
+    TLOAD(input_a_tile, input_a_global);
+    TLOAD(input_b_tile, input_b_global);
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    TADD(output_tile, input_a_tile, input_b_tile);
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    TSTORE(output_global, output_tile);
+    // 这里只把 MTE3 完成事件发布给 scalar；调用方决定立即等待，还是
+    // 先执行与输出无关的 scalar 工作。EVENT_ID7 在等待前不得复用。
+    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+}
+
+__aicore__ __attribute__((always_inline)) inline void WaitVectorAddCompletion() {
+    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+}
+
+// 串行对照与延后等待必须调用同一份机器码；若让 O3 分别内联，后端可能
+// 对两个分支采用不同展开因子，把循环代码生成差异误判成流水重叠。
+__aicore__ __attribute__((noinline, used)) void RunScalarNops(uint32_t rounds) {
+    for (uint32_t iteration = 0U; iteration < rounds; ++iteration) {
+        asm volatile("nop");
+    }
 }
 
 }  // namespace
@@ -107,7 +102,8 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(vector_scalar_pmu)(__gm__ vec
     const uint32_t physical_core_id = static_cast<uint32_t>(get_coreid()) & 0x0fffU;
 
     uint64_t register_base = 0U;
-    if (state->control.pmu_register_bases != 0U && physical_core_id < kPmuPhysicalSubcores) {
+    if (state->control.pmu_register_bases != 0U &&
+        physical_core_id < atomic_probe::scalar_pmu::kPhysicalSubcores) {
         __gm__ uint64_t *register_bases = reinterpret_cast<__gm__ uint64_t *>(state->control.pmu_register_bases);
         register_base = register_bases[physical_core_id];
     }
@@ -130,33 +126,39 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(vector_scalar_pmu)(__gm__ vec
     uint64_t selector_status = 0U;
     if (register_base != 0U) {
         selector_status = ReadSelectorStatus(register_base);
-        ClearPmuCounters(register_base);
+        atomic_probe::scalar_pmu::ClearCounters(register_base);
     }
 
     const uint64_t sys_begin = static_cast<uint64_t>(get_sys_cnt());
     bisheng::cce::metrics_prof_start();
 
     if (mode == static_cast<uint32_t>(Mode::LoopControl)) {
-        for (uint32_t iteration = 0U; iteration < rounds; ++iteration) {
-            // Preserve one runtime loop iteration without issuing work to V,
-            // MTE2 or MTE3. The NOP prevents the loop from being deleted.
-            asm volatile("nop");
-        }
+        // Preserve one runtime loop without issuing work to V, MTE2 or MTE3.
+        RunScalarNops(rounds);
     } else if (mode == static_cast<uint32_t>(Mode::VectorAdd)) {
         // Keep this body mechanically identical to RunRealVectorWorkload<false>
         // in pa_scheduler/ccec/ccec_ops.h.
         for (uint32_t iteration = 0U; iteration < rounds; ++iteration) {
-            TLOAD(input_a_tile, input_a_global);
-            TLOAD(input_b_tile, input_b_global);
-            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            TADD(output_tile, input_a_tile, input_b_tile);
-            set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-            wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-            TSTORE(output_global, output_tile);
-            set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
-            wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+            IssueVectorAdd(
+                input_a_global, input_b_global, output_global,
+                input_a_tile, input_b_tile, output_tile
+            );
+            WaitVectorAddCompletion();
         }
+    } else if (mode == static_cast<uint32_t>(Mode::VectorThenScalar)) {
+        IssueVectorAdd(
+            input_a_global, input_b_global, output_global,
+            input_a_tile, input_b_tile, output_tile
+        );
+        WaitVectorAddCompletion();
+        RunScalarNops(rounds);
+    } else if (mode == static_cast<uint32_t>(Mode::VectorOverlapScalar)) {
+        IssueVectorAdd(
+            input_a_global, input_b_global, output_global,
+            input_a_tile, input_b_tile, output_tile
+        );
+        RunScalarNops(rounds);
+        WaitVectorAddCompletion();
     }
 
     bisheng::cce::metrics_prof_stop();
@@ -171,16 +173,19 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(vector_scalar_pmu)(__gm__ vec
     uint64_t icache_request = 0U;
     uint64_t icache_miss = 0U;
     if (register_base != 0U) {
-        vector_busy = ReadCounter<0x10>(register_base);
-        scalar_busy = ReadCounter<0x20>(register_base);
-        mte2_busy = ReadCounter<0x30>(register_base);
-        mte3_busy = ReadCounter<0x38>(register_base);
-        icache_request = ReadCounter<0x40>(register_base);
-        icache_miss = ReadCounter<0x48>(register_base);
-        total = ReadPmuTotal(register_base);
+        const auto snapshot =
+            atomic_probe::scalar_pmu::ReadSnapshot(register_base);
+        vector_busy = snapshot.vector_busy;
+        scalar_busy = snapshot.scalar_busy;
+        mte2_busy = snapshot.mte2_busy;
+        mte3_busy = snapshot.mte3_busy;
+        icache_request = snapshot.icache_request;
+        icache_miss = snapshot.icache_miss;
+        total = snapshot.total;
     }
 
     __gm__ vector_scalar_pmu::ProbeResult *result = &state->result;
+    using atomic_probe::scalar_pmu::Publish64;
     Publish64(&result->sys_ticks, sys_end - sys_begin);
     Publish64(&result->pmu_total_cycles, total);
     Publish64(&result->pmu_vector_busy, vector_busy);

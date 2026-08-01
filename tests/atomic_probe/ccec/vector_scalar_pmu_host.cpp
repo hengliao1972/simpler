@@ -32,6 +32,7 @@ using atomic_probe::pmu::CheckAcl;
 constexpr double kAicoreCyclesPerNanosecond = 1.65;
 constexpr uint32_t kMeasuredRepeats = 5U;
 constexpr std::array<uint32_t, 2U> kRoundValues = {16U, 128U};
+constexpr std::array<uint32_t, 5U> kOverlapScalarNops = {0U, 1024U, 4096U, 16384U, 65536U};
 
 const char *ModeName(vector_scalar_pmu::Mode mode) {
     switch (mode) {
@@ -41,9 +42,19 @@ const char *ModeName(vector_scalar_pmu::Mode mode) {
         return "LOOP_CONTROL";
     case vector_scalar_pmu::Mode::VectorAdd:
         return "VECTOR_ADD";
+    case vector_scalar_pmu::Mode::VectorThenScalar:
+        return "VECTOR_THEN_SCALAR";
+    case vector_scalar_pmu::Mode::VectorOverlapScalar:
+        return "VECTOR_OVERLAP_SCALAR";
     default:
         return "UNKNOWN";
     }
+}
+
+bool IsVectorMode(vector_scalar_pmu::Mode mode) {
+    return mode == vector_scalar_pmu::Mode::VectorAdd ||
+           mode == vector_scalar_pmu::Mode::VectorThenScalar ||
+           mode == vector_scalar_pmu::Mode::VectorOverlapScalar;
 }
 
 struct Sample {
@@ -86,12 +97,12 @@ bool ValidateSample(
         *reason = "icache-miss-exceeds-request";
         return false;
     }
-    if (mode == vector_scalar_pmu::Mode::VectorAdd && (result.pmu_vector_busy == 0U || result.pmu_scalar_busy == 0U ||
-                                                       result.pmu_mte2_busy == 0U || result.pmu_mte3_busy == 0U)) {
+    if (IsVectorMode(mode) && (result.pmu_vector_busy == 0U || result.pmu_scalar_busy == 0U ||
+                               result.pmu_mte2_busy == 0U || result.pmu_mte3_busy == 0U)) {
         *reason = "vector-pipeline-counter-zero";
         return false;
     }
-    if (mode == vector_scalar_pmu::Mode::VectorAdd && !sample.output_ok) {
+    if (IsVectorMode(mode) && !sample.output_ok) {
         *reason = "vector-output";
         return false;
     }
@@ -116,7 +127,7 @@ bool RunOne(
         )) {
         return false;
     }
-    if (mode == vector_scalar_pmu::Mode::VectorAdd &&
+    if (IsVectorMode(mode) &&
         !CheckAcl(
             aclrtMemset(output_device, vector_scalar_pmu::kTileBytes, 0xff, vector_scalar_pmu::kTileBytes),
             "aclrtMemset(vector output sentinel)"
@@ -141,8 +152,8 @@ bool RunOne(
     }
 
     sample->result = state.result;
-    sample->output_ok = mode != vector_scalar_pmu::Mode::VectorAdd;
-    if (mode == vector_scalar_pmu::Mode::VectorAdd) {
+    sample->output_ok = !IsVectorMode(mode);
+    if (IsVectorMode(mode)) {
         std::vector<float> output(vector_scalar_pmu::kTileElements);
         if (!CheckAcl(
                 aclrtMemcpy(
@@ -238,7 +249,7 @@ void PrintRoundSummary(uint32_t rounds, const std::array<std::vector<Sample>, 3>
         {"icache_miss", &vector_scalar_pmu::ProbeResult::pmu_icache_miss},
     };
 
-    for (uint32_t mode_index = 0U; mode_index < static_cast<uint32_t>(vector_scalar_pmu::Mode::Count); ++mode_index) {
+    for (uint32_t mode_index = 0U; mode_index < samples.size(); ++mode_index) {
         const auto mode = static_cast<vector_scalar_pmu::Mode>(mode_index);
         std::printf("[MEDIAN] rounds=%u mode=%s", rounds, ModeName(mode));
         for (const Metric &metric : metrics) {
@@ -281,6 +292,45 @@ void PrintRoundSummary(uint32_t rounds, const std::array<std::vector<Sample>, 3>
         static_cast<double>(median_total) / kAicoreCyclesPerNanosecond, static_cast<unsigned long long>(median_scalar),
         static_cast<unsigned long long>(median_total - median_scalar), scalar_ratio, residual_ratio,
         scalar_ratio > residual_ratio ? "scalar_busy" : "non_scalar_residual"
+    );
+}
+
+void PrintOverlapSummary(uint32_t scalar_nops, const std::array<std::vector<Sample>, 3> &samples) {
+    const auto &scalar_only = samples[0U];
+    const auto &serial = samples[1U];
+    const auto &overlap = samples[2U];
+    const uint64_t scalar_total = MedianCounter(scalar_only, &vector_scalar_pmu::ProbeResult::pmu_total_cycles);
+    const uint64_t serial_total = MedianCounter(serial, &vector_scalar_pmu::ProbeResult::pmu_total_cycles);
+    const uint64_t overlap_total = MedianCounter(overlap, &vector_scalar_pmu::ProbeResult::pmu_total_cycles);
+    const uint64_t serial_ticks = MedianCounter(serial, &vector_scalar_pmu::ProbeResult::sys_ticks);
+    const uint64_t overlap_ticks = MedianCounter(overlap, &vector_scalar_pmu::ProbeResult::sys_ticks);
+
+    std::vector<double> total_gains;
+    std::vector<double> tick_gains;
+    std::vector<double> total_gain_ratios;
+    total_gains.reserve(serial.size());
+    tick_gains.reserve(serial.size());
+    total_gain_ratios.reserve(serial.size());
+    for (size_t index = 0U; index < serial.size(); ++index) {
+        const double serial_cycles = static_cast<double>(serial[index].result.pmu_total_cycles);
+        const double overlap_cycles = static_cast<double>(overlap[index].result.pmu_total_cycles);
+        total_gains.push_back(serial_cycles - overlap_cycles);
+        tick_gains.push_back(
+            static_cast<double>(serial[index].result.sys_ticks) -
+            static_cast<double>(overlap[index].result.sys_ticks)
+        );
+        total_gain_ratios.push_back((serial_cycles - overlap_cycles) / serial_cycles);
+    }
+
+    std::printf(
+        "[OVERLAP] scalar_nops=%u scalar_only_total=%llu serial_total=%llu overlap_total=%llu "
+        "paired_total_gain_cycles=%.3f paired_total_gain_ns=%.3f paired_total_gain_ratio=%.6f "
+        "serial_sys_ticks=%llu overlap_sys_ticks=%llu paired_sys_gain_ns=%.3f status=%s\n",
+        scalar_nops, static_cast<unsigned long long>(scalar_total),
+        static_cast<unsigned long long>(serial_total), static_cast<unsigned long long>(overlap_total),
+        Median(total_gains), Median(total_gains) / kAicoreCyclesPerNanosecond, Median(total_gain_ratios),
+        static_cast<unsigned long long>(serial_ticks), static_cast<unsigned long long>(overlap_ticks),
+        Median(tick_gains), Median(total_gains) > 0.0 && Median(tick_gains) > 0.0 ? "OVERLAP_VISIBLE" : "NO_GAIN"
     );
 }
 
@@ -388,10 +438,10 @@ int main(int argc, char **argv) {
     );
 
     bool all_passed = true;
-    // One unreported warm-up per mode removes first-launch/runtime setup from
-    // the measured samples. It remains outside every reported paired repeat.
+    // 第一组保持原有 scalar-busy 分类口径，避免新增 overlap 试验改变历史
+    // 基线。每个模式先做一次不打印的预热。
     for (const uint32_t rounds : kRoundValues) {
-        for (uint32_t mode_index = 0U; mode_index < static_cast<uint32_t>(vector_scalar_pmu::Mode::Count);
+        for (uint32_t mode_index = 0U; mode_index <= static_cast<uint32_t>(vector_scalar_pmu::Mode::VectorAdd);
              ++mode_index) {
             Sample warmup;
             all_passed &= RunOne(
@@ -404,7 +454,7 @@ int main(int argc, char **argv) {
 
         std::array<std::vector<Sample>, 3> samples;
         for (uint32_t repeat = 1U; repeat <= kMeasuredRepeats && all_passed; ++repeat) {
-            for (uint32_t mode_index = 0U; mode_index < static_cast<uint32_t>(vector_scalar_pmu::Mode::Count);
+            for (uint32_t mode_index = 0U; mode_index <= static_cast<uint32_t>(vector_scalar_pmu::Mode::VectorAdd);
                  ++mode_index) {
                 Sample sample;
                 const bool passed = RunOne(
@@ -418,6 +468,49 @@ int main(int argc, char **argv) {
             }
         }
         if (all_passed) PrintRoundSummary(rounds, samples);
+    }
+
+    // 第二组只改变最终 MTE3->S wait 与独立 scalar NOP 的先后顺序。
+    // 奇偶轮交替 serial/overlap 的运行顺序，避免温度或频率单向漂移被
+    // 误判成延后 wait 的收益。
+    constexpr std::array<vector_scalar_pmu::Mode, 3U> overlap_modes = {
+        vector_scalar_pmu::Mode::LoopControl,
+        vector_scalar_pmu::Mode::VectorThenScalar,
+        vector_scalar_pmu::Mode::VectorOverlapScalar,
+    };
+    for (const uint32_t scalar_nops : kOverlapScalarNops) {
+        for (const auto mode : overlap_modes) {
+            Sample warmup;
+            all_passed &= RunOne(
+                function, stream, state_device, input_a_device, input_b_device, output_device,
+                owner.RegisterTableDeviceAddress(), mode, scalar_nops, 0U, owner.Control(), &warmup, false
+            );
+        }
+        if (!all_passed) break;
+
+        std::array<std::vector<Sample>, 3U> samples;
+        for (uint32_t repeat = 1U; repeat <= kMeasuredRepeats && all_passed; ++repeat) {
+            Sample scalar_sample;
+            all_passed &= RunOne(
+                function, stream, state_device, input_a_device, input_b_device, output_device,
+                owner.RegisterTableDeviceAddress(), vector_scalar_pmu::Mode::LoopControl, scalar_nops, repeat,
+                owner.Control(), &scalar_sample, true
+            );
+            samples[0U].push_back(scalar_sample);
+
+            const std::array<size_t, 2U> order =
+                (repeat & 1U) != 0U ? std::array<size_t, 2U>{1U, 2U} : std::array<size_t, 2U>{2U, 1U};
+            for (const size_t mode_slot : order) {
+                Sample sample;
+                all_passed &= RunOne(
+                    function, stream, state_device, input_a_device, input_b_device, output_device,
+                    owner.RegisterTableDeviceAddress(), overlap_modes[mode_slot], scalar_nops, repeat,
+                    owner.Control(), &sample, true
+                );
+                samples[mode_slot].push_back(sample);
+            }
+        }
+        if (all_passed) PrintOverlapSummary(scalar_nops, samples);
     }
 
     const bool owner_cleanup_ok = owner.Finalize();
