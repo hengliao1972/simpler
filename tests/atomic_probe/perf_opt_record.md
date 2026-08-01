@@ -50,10 +50,10 @@
 | Driver | `7.0.t9.0.B798`，ascendhal `7.35.23` |
 | CANN | 用户目录下 9.1.0 weekly 20260708 |
 | CCEC | clang 15.0.5 |
-| Python | `/home/q00473782/.venv`，Python 3.12.3 |
+| Python | `$HOME/.venv`，Python 3.12.3 |
 | PyTorch | 2.6.0+cpu |
 | pytest | 7.4.4 |
-| GCC 15 | `/home/q00473782/.local/gcc-15/root`，15.0.1 |
+| GCC 15 | `$HOME/.local/gcc-15/root`，15.0.1 |
 | PTO-ISA | `ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8` |
 
 非交互 shell 不能假设自动读取 `.bashrc`。正式复测应显式 source 用户 CANN，激活本用户 `.venv`，并显式设置用户 GCC 15 的 `PATH`、`LD_LIBRARY_PATH` 和 `CXX`。完整命令以安装复现指南为准。
@@ -669,7 +669,7 @@ PTO_FDWIC_TRACE_ENABLED=0
 在完成第 2.2 节环境准备后，最小复现命令为：
 
 ```bash
-source /home/q00473782/.venv/bin/activate
+source "$HOME/.venv/bin/activate"
 python -m pytest examples/a5/fully_distributed_within_core/paged_attention_unroll/test_paged_attention_unroll.py \
   --platform a5 --case CaseB1 --manual include \
   --fdwic-profile perf-clock --rounds 1 -s -v
@@ -5317,3 +5317,335 @@ fanin logical load 为 `30,968`，Add0 为 `31,132`，只少 `164` 次；Submit
 无泳道 perf-clock 实验合计 24 对中的稳定端到端收益；full-swimlane 只证明
 业务拓扑、atomic 数量级和协议均未变化。诊断 ELF 中大量记录写入会重排
 winner 到达和竞争尾部，三种构建的绝对时间不得互相相减。
+
+### 15.14 Claim Tournament 三轮候选：仅作验证，全部撤回
+
+在 §14 已保留的 per-task 两轮 Tournament 上继续验证第三层：合法候选人口
+仍为 Alloc/AIC/AIV=`96/32/64`，local 组仍为 `8/6/8`，TensorMap 的严格
+插入顺序仍由独立 `deps_prepared` commit chain 保证。新增两个 per-task
+middle 节点，local 组按奇偶号汇入 `2` 个 middle owner，再由二者竞争
+root。B256 下两轮的物理 CAS 为 `73,728 local + 9,216 root = 82,944`；
+全三轮变为 `73,728 local + 9,216 middle + 2,560 root = 85,504`。
+
+为避免旧泳道混算，基线从 `HEAD=36676327` 的独立临时 worktree 重新构建；
+三轮与基线均使用 shared B256 full-swimlane、相同 CANN/PTO 和真实负载，
+两轮/三轮的 trace drop 均为 0。逐层返回型 CAS 的累计 core-time 为：
+
+| 拓扑 | local | middle | root | 合计 |
+| --- | ---: | ---: | ---: | ---: |
+| 两轮 `2/2/2` | 18,674.006 us | - | 2,382.819 us | 21,056.825 us |
+| 全三轮 `3/3/3` | 18,965.116 us | 2,336.649 us | 657.010 us | 21,958.775 us |
+
+root 降并发节省 `1,725.809 us`，但新增 middle 本身需要 `2,336.649 us`，
+且 local 因代码/布局扰动增加 `291.110 us`；总 atomic core-time 反而增加
+`901.950 us`（`+4.28%`）。两组无泳道 perf-clock 也分别回退
+`+4.222/+23.438 us`，因此全三轮立即否定。
+
+随后按任务角色拆分，只对 96 路 Alloc 使用三轮，AIC/AIV 继续 local 直达
+root。该 `3/2/2` 候选的 Alloc root 从 `545.915 us` 降到 `129.557 us`，
+但新增 middle 为 `521.223 us`；仅这两项已经净增 `104.865 us`。计入 local
+后，Alloc 每 task 的 atomic core-work 平均增加约 `1.012 us`，虽然从最早
+local 开始到最终 root 返回的任务仲裁范围平均缩短约 `1.120 us`，说明降并发
+确实缩短关键等待，但新增返回型 CAS 基本抵消了收益。
+
+`3/2/2` 与冻结两轮 ELF 交错运行 6 对，只有 `3/6` 改善；配对差 mean 为
+`-0.475 us`，median 为 `+0.337 us`，属于无稳定收益。全三轮泳道还显示
+AIV 的 SF/UP 仲裁范围各增加约 `2.6 us/task`，因此没有再运行会重新引入
+AIV middle 的 `3/2/3`。最终撤回全部 middle 状态、atomic site、转换器和
+测试改动，保留 §14 的两轮 Tournament。后续不再靠增加 Tournament 层数
+微调同一批 CAS，而转向通用 grouped completion bitmask，目标是减少
+`fanin_flag_load` 的必要返回型 atomic 调用数量。
+
+### 15.15 Grouped completion bitmask：调用减少但同地址竞争更重，全部撤回
+
+沿 §15.14 的结论继续验证通用完成位分组，不判断 PA task kind、role 或
+具体 fanin 形态。候选把相邻 task 的完成状态放入一个独占 cache line 的
+64-bit atomic word，每个 task 只占低 32 位中的一个 bit；唯一完成者用
+`atomicAdd(1 << bit)` 发布。由于每个 bit 严格只发布一次，幂次加法在该
+合同下与按位 OR 等价。消费者一次读取当前首个 pending fanin 所在 group，
+并从本核私有 slot 中删除该 word 已确认完成的全部依赖。
+
+第一步保留旧 per-task flag Exchange，额外镜像 group bit，以隔离量取
+“少做返回型读取”能否覆盖“一次额外 source-issue 发布”。B256 单轮结果为：
+
+| 每组 task 数 | fanin 物理读取 | Submit | 相对趋势 |
+| ---: | ---: | ---: | --- |
+| 4 | 38,092 | 1,534.004 us | 读取基本未降，回退 |
+| 8 | 32,301 | 1,507.396 us | 读取下降，仍回退 |
+| 16 | 27,476 | 1,726.064 us | 明显回退 |
+| 32 | 19,420 | 1,932.276 us | 严重回退 |
+
+同一轮冻结两级基线为 `36,569` 次 fanin 读取、`1,450.480 us`。G32 少做
+约 `17.1K` 次返回型读取，却慢约 `482 us`；这直接证明 A5 上不能只按 atomic
+调用数量估算收益。多个仍可并发的 task 被压到同一 completion cache line
+后，发布和轮询共同制造新的同地址竞争，单次 atomic 延迟的增长超过调用数
+下降。G4/G8 再与冻结基线交错 4 轮，G4 每轮回退，差值为
+`+47.718/+36.370/+79.005/+28.755 us`，平均 `+48.0 us`；G8 每轮回退，
+差值为 `+87.987/+59.469/+59.757/+69.908 us`，平均 `+69.3 us`。
+
+第二步只保留最有可能的边界：删除旧 per-task flag Exchange，用 G4 group
+bit 一对一替代 completion publication。这样每个 task 的 source-issue
+发布 atomic 数量恢复与基线相同，host 同时要求所有 active bit 精确为 1、
+inactive bit 为 0、旧 task flag 保持 0。A5 执行、语义和后处理闭环全部
+PASS，但 6 轮交错差值仍为：
+
+```text
+-20.993, +28.574, -5.487, +10.074, +36.622, +11.615 us
+```
+
+只有 `2/6` 改善，配对 mean/median 为 `+10.068/+10.845 us`，仍是稳定性
+不足且总体回退。G8 一对一替换虽然把 fanin 读取降到 `32,372`，Submit
+仍为 `1,538.112 us`，无需继续扩大配对样本。
+
+因此 grouped completion 的问题不是单纯多出一次旧 flag 镜像，而是把本来
+分散在 per-task cache line 的完成流量重新汇聚到热点地址。按当前 A5 同地址
+atomic 特性，分组越大越差；分组足够小时又省不下足够的读取。全部候选代码、
+sidecar、atomic site、转换器和构建参数撤回，继续保留逐 task completion
+flag。后续若重启该方向，必须先有能让依赖相关 task 聚合、同时让独立 task
+保持不同物理地址的通用图分区机制；不能再用连续 task-id 固定打包。
+
+### 15.16 插入完成字独占 cache line：假共享不是主要矛盾，撤回
+
+当前 `TaskCell` 恰好为 64 B，`flag`、`vend` 和 shared TensorMap 的
+`deps_prepared` 插入完成字分别位于 offset `0/8/16`。为验证 completion
+发布与严格插入链是否因共用 cache line 互相干扰，候选新增逐 task 独占的
+`AtomicLine shared_insert_completion[kMaxTasks]`，只把插入前驱轮询和插入
+完成 CAS 迁到新地址；Claim、fanin、completion flag/vend、候选人口和所有
+业务协议均不变。代价是 SchedulerState 增加 `278,528 B`。
+
+候选与冻结两轮基线交错运行 8 对 perf-clock，候选减基线为：
+
+```text
++9.252, +5.854, -18.666, +1.199,
+-7.278, -12.585, +4.032, +11.050 us
+```
+
+仅 `3/8` 改善；配对 mean 为 `-0.893 us`，但 median 为 `+2.616 us`，没有
+稳定端到端收益。随后各跑一轮完整 atomic 泳道，二者均为 B256 shared、
+真实负载、trace drop 0 且全部语义断言 PASS。关键点位如下：
+
+| 点位 | 两轮基线 calls / core-time | 独占行 calls / core-time | 变化 |
+| --- | ---: | ---: | ---: |
+| fanin flag load（site 5） | 31,062 / 12,116.621 us | 30,892 / 11,609.679 us | 调用随机少 170，不能归因于行隔离 |
+| completion vend（site 6） | 1,280 / 271.300 us | 1,280 / 269.968 us | -1.332 us |
+| completion flag（site 7） | 1,280 / 266.777 us | 1,280 / 262.953 us | -3.824 us |
+| insert predecessor wait（site 19） | 68,940 / 21,108.450 us | 70,071 / 21,313.873 us | +1,131 calls，+205.423 us |
+| insert completion publish（site 20） | 1,280 / 427.648 us | 1,280 / 419.617 us | -8.031 us |
+
+独占行并未压低主要的 insert predecessor wait，反而在该轮增加轮询和累计
+等待；site 6/7/20 的微小变化远不足以覆盖新增状态和布局扰动。由此可排除
+“`deps_prepared` 与 flag/vend 共行导致主要假共享”这一假设：当前严格插入
+链的主要成本仍是前驱尚未发布时的真实同址轮询，而不是 cache-line 布局。
+候选的模型、host 搬运、初始化、校验和热路径改动全部撤回。
+
+### 15.17 Fanin 本地缓存与统一 NOP 退避：均无可消减空间
+
+首先用 §15.14 的两轮基线 raw 按 `(worker, dependency)` 和时间顺序回放
+`fanin_flag_load`。本轮有 `29,471` 条物理记录、`31,062` 次逻辑 load、
+`1,279` 个 `(worker, dependency)` 组合。只有观察到 ready 后才可把 producer
+放入本核单调完成缓存；但 raw 中该时刻之后的重复读取为 **0**。这与
+`SlotReady` 的实现闭合：shared 路径会立即删掉 ready fanin 前缀，全部 fanin
+ready 后清零 `fanin_count`。因此哪怕使用无限容量本地 bitset，也一条 atomic
+都省不掉；没有修改代码。
+
+随后验证“轮询失败后插入少量 scalar NOP”。候选只把 CCEC `SpinHint()`
+从空实现改为 `8/32/128` 条 NOP，正确性和参与人口不变。四种冻结 ELF 先按
+四种循环顺序各运行一轮；三种候选都出现 `3/4` 改善，但基线四轮本身落在
+`1,451.656–1,485.363 us` 两个波动簇，不能据此保留。对最轻的 8-NOP 再做
+8 组正反顺序配对，候选减基线为：
+
+```text
++25.652, -1.483, +1.362, -7.884,
++14.784, +2.174, -2.645, +10.351 us
+```
+
+只有 `3/8` 改善，配对 mean/median 为 `+5.289/+1.768 us`，即总体回退。
+而且 8-NOP 的 fanin load 没有稳定减少，说明全局 `SpinHint` 同时改变启动、
+严格插入、fanin 和最终 drain 的到达关系，不能当作单一热点的退避旋钮。
+
+最后各取一轮完整 atomic 泳道验证局部机理。8-NOP 相对无退避基线：
+
+| 点位 | 无退避 calls / core-time | 8-NOP calls / core-time | 变化 |
+| --- | ---: | ---: | ---: |
+| fanin flag load | 31,062 / 12,116.621 us | 30,941 / 13,113.227 us | -121 calls，+996.606 us |
+| insert predecessor wait | 68,940 / 21,108.450 us | 70,585 / 21,871.460 us | +1,645 calls，+763.010 us |
+| replay-done poll | 5,504 / 8,289.000 us | 6,788 / 10,535.007 us | +1,284 calls，+2,246.007 us |
+
+退避既没有减少主等待点的逻辑调用，也提高了单次发现 ready 的延迟；统一
+退避方向因此撤回，`CcecOps::SpinHint()` 恢复为空实现。若未来只针对某个
+轮询点重启退避实验，必须独立量取该点的调用数和唤醒延迟，不能再次修改
+所有等待循环共用的 hook。
+
+### 15.18 通用 DAG fanin 传递约简：边数下降但等待转移，撤回
+
+在不修改 Claim Tournament、严格 TensorMap 插入链和 PA task kind 的前提下，
+验证了一版通用的窗口内 DAG 传递约简。每个 task 在既有 64-task 窗口内发布
+63-bit 祖先摘要；consumer 只依据更年轻 direct producer 已发布的祖先关系
+删除传递冗余的执行等待边。恰好相距 64 的边明确 fail-open。摘要未发布时
+也必须保留原边，不能等待：首版等待实现被完整 shared Submit 门槛抓出会把
+“task 4 已离开插入链但尚未 Build”和“task 8 继续 Build”重新串行化；改成
+一次机会式读取后，`release_before_build` 与 independent-kernel overlap
+门槛重新通过。
+
+CPU shared 全套、泳道转换器 57 项及 atomic/DCCI 源码覆盖 4 项均通过。
+A5 B1 的逻辑依赖签名保持不变，执行边从 5 降到 4。B256 中每组 UP 的
+`SF -> UP` 可由 `SF -> PV -> UP` 证明为传递冗余，因此执行边从
+`1,280` 精确降到 `1,024`，而原 TensorMap 逻辑签名继续保持
+`b7d985d6edb07078`。候选代价是每个 direct producer 一次返回型摘要读取，
+以及每个 task 一次不消费返回值的摘要发布。
+
+与冻结 `7e87fa1a` perf-clock ELF 交错运行 6 对，候选减基线为：
+
+```text
++10.216, +29.786, +7.804, -0.901, +20.561, +21.995 us
+```
+
+只有 `1/6` 改善，配对差平均为 `+14.910 us`，约回退 `1.02%`。六轮基线
+`fanin_loads` 为 `36,639/36,730/36,110/37,017/37,159/37,630`，候选为
+`35,879/36,104/36,211/35,817/35,255/35,540`；没有出现从原泳道推测的
+约 11K 次降幅。
+
+原因不是约简判断失效，而是等待对象发生了转移：UP 原先按顺序先轮询较早
+完成的 SF、再轮询较晚完成的 PV；删除 `SF -> UP` 后，只是更早开始轮询
+PV。被删除的一条依赖最多稳定省掉最终 ready 读取，无法删除直到 PV 完成
+之前的等待周期，新增的摘要 atomic 与代码体积因而成为净成本。该候选源码、
+TaskCell 字段、atomic 站点、host 校验和独立测试均已撤回。后续不能再把
+“执行边数下降”等同于“返回型轮询工作下降”；候选必须直接改变等待期间可做
+的工作，或降低同一 completion 条件的物理观察成本。
+
+### 15.19 fanin 按年轻 producer 优先检查：等待地址改变但工作量不降，撤回
+
+基线泳道中 UP 按原 TensorMap 返回顺序先检查 SF、再检查 PV；`SF -> UP`
+共有 `11,141` 次直接读取，而 `PV -> UP` 只有 `1,013` 次。为避免 UP 与
+PV 同时反复读取 SF completion flag，验证了一个不判断 task kind 的通用
+候选：Build slot 前按 producer task-id 从大到小排列 fanin，依赖集合、
+TensorMap 结果和完成协议均不变。该排序只对多 fanin winner 做少量本地比较，
+不增加共享状态或 atomic。CPU shared 全套门槛通过，包括 youngest-first
+顺序、ready-prefix compaction、插入后 Build overlap 和独立 kernel overlap。
+
+与同一冻结 `7e87fa1a` perf-clock ELF 先交错 6 对，候选减基线为：
+
+```text
++65.599, -7.720, +0.269, +9.301, -5.374, -10.329 us
+```
+
+只有 `3/6` 改善。考虑到候选没有新增 atomic，又补了 8 对：
+
+```text
+-32.865, +11.186, -23.322, +10.459,
+-0.099, +1.114, +10.973, +22.345 us
+```
+
+补样仍只有 `3/8` 改善，配对差中位数为 `+5.787 us`。14 对合看没有稳定
+收益，候选 `fanin_loads` 也没有系统性下降。机理与 §15.18 一致：先查 PV
+只是把原先落在 SF 的等待读取迁到 PV；当前调度到达顺序下，同地址竞争降低
+不足以形成可重复的端到端收益。候选排序及测试改动已撤回，没有生成诊断
+泳道，也不进入正式代码。
+
+### 15.20 scalar 与 AIV 最终写回尾部重叠：微基准确认存在约 3.5 us 窗口
+
+沿 §15.18 的结论，不再继续调整 fanin 边或轮询地址，而先回答一个更基础的
+问题：winner 发射真实 vector 工作后，scalar 是否必须立即阻塞在最后一个
+`MTE3 -> S wait_flag`，还是可以先执行与该输出无关的调度工作，再在发布
+task completion 前收口。
+
+首先审计了本机 CANN 9.1 头文件和 CCEC builtin。公开的 `try_wait(id,
+sync_mode)` 最终生成 `TRY_WAIT/TRY_WAITI`，其 mode 只有
+`CROSS_CORE/INTRA_BLOCK/BUFFER_ID/RESERVED`。本阶段只验证了把
+`EVENT_ID7` 直接交给 `try_wait` 的错误用法，因此当时采用“先发射、后续
+检查点再阻塞 wait”的保守合同。后续 §15.22 已补齐正确用法：用
+`get_buf/rls_buf` 给最终 FIX/MTE3 工作绑定 buffer id，再以
+`try_wait(buffer_id, BUFFER_ID)` 做非阻塞完成查询。直接查询 EVENT_ID 的
+否定结论仍成立，但“没有可用动态查询手段”的推断已被修正。
+
+复用 `tests/atomic_probe/ccec/vector_scalar_pmu` 做受控验证。两个路径发射
+完全相同的一次 AIV TLOAD/TADD/TSTORE，只交换最终
+`MTE3 -> S wait_flag(EVENT_ID7)` 与一段独立 scalar NOP 的顺序：
+
+```text
+串行对照：issue vector -> wait final store -> scalar work
+重叠候选：issue vector -> scalar work -> wait final store
+```
+
+首版曾观察到约 50% 的表面收益，但反汇编确认 O3 对两个分支采用了不同的
+scalar 循环展开形态；这不是流水重叠，已判为无效数据。修正后，串行与重叠
+路径都调用同一份 `noinline, used` scalar 循环机器码，并交替两种模式的
+进程内运行顺序。每个 vector 输出都逐元素验证为 `5.0`，PMU restore 和
+cleanup 也全部 PASS。五档 scalar 工作的配对中位数为：
+
+| scalar NOP 数 | PMU total 收益 | 按 1.65 GHz 换算 | sys-counter 方向 |
+| ---: | ---: | ---: | --- |
+| 0 | -37 cycles | 无收益 | 无收益 |
+| 1,024 | 5,803 cycles | 3,516.970 ns | 同向 |
+| 4,096 | 5,790 cycles | 3,509.091 ns | 同向 |
+| 16,384 | 5,708 cycles | 3,459.394 ns | 同向 |
+| 65,536 | 5,760 cycles | 3,490.909 ns | 同向 |
+
+因此可以确认：当前真实 AIV 模拟负载的最后一次 GM 写回存在稳定约
+`5.7K--5.8K` PMU cycles、即 `3.46--3.52 us` 的 pipeline 尾部；只要
+scalar 在消费该输出和发布 completion 之前还有独立工作，这段尾部可以被
+覆盖。该结果不表示完整约 50 us vector 计算都能隐藏，也不能外推为 AIC
+`FIX -> S` 已具有相同收益。
+
+下一步必须先用 CPU 定向假实现锁定通用两阶段语义：launch 后 slot 仍占用、
+task completion 不得发布、同一 worker 最多一个 engine task 在途；后续
+drain 执行最终 wait 后才允许 CompleteTask 和释放 slot。同时 launch 必须
+算作 opportunistic drain 的“有进展”，但不能冒充已释放容量。只有这些
+门槛闭合后，才把延后 wait 接到 standalone CCEC AIV；Claim Tournament、
+shared TensorMap 严格插入链和 fanin 集合均保持不变。
+
+### 15.21 正式调度改动暂停，先闭合独立 scalar coroutine 基础探针
+
+在 §15.20 之后重新对齐了实施顺序：第二次 win 前挂起当前调度、以及在
+`MTE3/FIX -> S` 可用前继续调度，本质上都依赖显式 continuation 的保存与
+恢复。为避免一边修改 `pa_scheduler` 一边猜测上下文合同，已完整撤回过程态
+正式调度 wiring，改在 `tests/atomic_probe/ccec` 新增不 include scheduler 的
+独立探针。详细合同、运行方法和完整结果见
+`scalar调度与算子执行重叠机制验证.md`。
+
+探针用两份 128B frame 建模 engine continuation 与第二个 winner
+continuation。第一份保存后主动毒化原 context；device 恢复结果还必须通过
+host 独立计算的 signature、replay checksum 和 `resume_sequence=1->2`
+校验。完成标志在最终 `FIX/MTE3 -> S wait` 前始终为 0。AIC 输出逐元素为
+768，AIV 输出逐元素为 5，所有语义、PMU selector、stop、restore 和 ACL
+cleanup 均通过。
+
+最终窗口把两次 save、两次 restore 都计入。0-iteration `ContextFifo` 的整段
+基础成本为 AIC 1,284 cycles、AIV 1,282 cycles，按 1.65 GHz 约 0.78 us；
+它不是单次切换成本。加入相同 loser replay 后，串行与 overlap 的 scalar
+busy 基本不变，而 PMU total 与 SYS_CNT 同向下降：AIC 在 replay 足够长时
+稳定隐藏约 8.3--8.4 us，AIV 稳定隐藏约 3.5--3.6 us。该结果证明的是最终
+pipeline 尾部可被独立 scalar 工作覆盖，不是完整约 50 us kernel 都能隐藏。
+
+当前仅闭合“一份在途 engine，第二次 win 时保存新 continuation，按 task-age
+FIFO 先收口旧 engine”的最小机制。任意深度、多 engine、event/buffer/slot
+所有权、真实 Claim/TensorMap/fanin 均未接入；在这些状态机约束继续通过独立
+门槛前，不修改 standalone 或 simpler 的正式调度路径。
+
+### 15.22 `try_wait` 正确用法闭合：buffer-token 可动态查询 engine 尾部
+
+重新审计 CCEC builtin、A5 simulator 的 `execute_try_wait` 和 buffer dispatch/
+release 计数后，确认 `BUFFER_ID` 查询的对象不是 `EVENT_ID`，而是
+`get_buf/rls_buf` 协议。探针分别在 AIV 的 MTE3、AIC 的 FIX 上把最终
+TSTORE 包围为：
+
+```text
+get_buf(final_pipe, buffer_id, 0)
+TSTORE
+rls_buf(final_pipe, buffer_id, 0)
+```
+
+随后由 scalar 执行 `try_wait(buffer_id, BUFFER_ID)`。AIC/AIV 的单 buffer
+均稳定表现为发射前 0、发射后 1、长 replay 后 0、最终 wait 后 0。常量 ID
+31 与运行时 ID 24/25 结果一致，说明 acquire、release 和 query 都支持运行时
+buffer id。连续按返回值轮询能从 1 自然过渡到 0；四个 ID 24--27 同时标记
+时，发射后 pending mask 为 `0xf`，长 replay 后为 `0x0`。所有输出、显式
+continuation、FIFO 恢复、PMU stop/restore 和 host oracle 均 PASS，三次完整
+进程复测保持一致。
+
+已完成 buffer 上 4,096 次动态查询相对 0 次窗口的稳态摊销约为 4 PMU
+cycles/次，即 1.65 GHz 下约 2.43 ns/次。该数字是紧循环吞吐口径，不是孤立
+指令延迟。正式状态机仍必须保存 `Issued` 状态，因为返回 0 同时表示未发射和
+已完成；`try_wait` 只负责选择何时恢复 continuation，恢复后继续执行原
+`wait_flag` 再发布 completion。当前四 ID 用例只给同一个最终 TSTORE 叠加
+四个 token，尚未证明四个不同 engine task 同时在途。

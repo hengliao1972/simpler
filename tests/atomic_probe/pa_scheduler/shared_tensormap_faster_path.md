@@ -292,3 +292,194 @@ task scheduler：Claim、deps_prepared、fanin completion 与执行 slot
 
 只有第一类在当前 PA Case1 中为零。后两类仍是 shared 方案的真实成本和
 后续优化对象。
+
+## 12. 当前机制能否成为后续通用快速路径
+
+### 12.1 结论
+
+可以，但需要区分“可复用的协议”与“当前 PA 专用实现”。
+
+可以沉淀为通用快速路径的是下面这条协议：
+
+```text
+稳定的 root symbol = (producer_task_id, output_slot)
+  -> task-indexed descriptor 发布
+  -> O(1) last_writer
+  -> 不可变 writer history
+  -> reader N 只接受 writer < N
+```
+
+它适合表达“整个逻辑 tensor 只有一条有序 writer 链”的场景。此时 symbol
+身份已经比地址 region 更精确，consumer 无需进入 ordinary TensorMap。
+
+但是，当前代码中的下列条件只是 PA Case1 的业务形状，不能直接写进通用
+快速路径：
+
+- 只有 UP 才发布 INOUT writer；
+- UP 恰好有三个 accumulator symbol；
+- 三个 symbol 使用固定 slot 和固定分组；
+- 通过 `TaskKind::Up`、`batch_start` 或 `task_id - 4` 推导前驱；
+- `output_view` 固定由 `manual_dep` 覆盖。
+
+通用实现必须根据 tensor 的依赖语义选择路径，不能根据 PA task 类型选择
+路径。
+
+### 12.2 通用快速路径的适用合同
+
+一个对象只有同时满足以下条件，才能进入 `WholeSymbolFastPath`：
+
+1. 对象有跨核稳定且无歧义的 root symbol；
+2. descriptor 可以通过 `(producer_task_id, output_slot)` 直接定位；
+3. writer 修改的是整个逻辑对象，或系统明确允许把局部写保守地视为整对象写；
+4. 该 root 的所有 writer 可以组成一条按 task id 排序的链；
+5. reader 需要的前驱可以表示为唯一的 `max(writer_task < reader_task)`；
+6. output cell 和 writer history 在 reader 使用期间不会被无 generation 地复用；
+7. descriptor payload、history payload 和原子完成字具有完整的发布/获取协议。
+
+在该合同下，通用 lookup 可以保持为：
+
+```text
+读取 root.last_writer
+  -> 若 writer >= reader，则沿不可变 history 回退
+  -> 得到唯一的 max(writer < reader)
+  -> 将该 task completion 加入 fanin
+```
+
+这不是 PA 特例，而是一个可证明正确的“whole-object 单 writer-chain”协议。
+
+### 12.3 为什么不能只看当前引用是否为 plain ref
+
+快速路径不能仅根据 reader 当前拿到的引用是否为 plain
+`SharedOutputRef` 来决定。
+
+考虑下面的历史：
+
+```text
+task N     写 root 的一个 view
+task N+1   以 plain root ref 读取整个对象
+```
+
+虽然 `N+1` 的引用本身没有 view 信息，但它仍然必须依赖 `N`。如果 `N`
+只登记在 region 路径，而 `N+1` 仅查询 symbol history，reader 就会漏掉真实
+writer。
+
+因此，路径选择必须属于 **root 对象的持久语义状态**，而不能是单次参数的
+局部判断。概念上至少需要：
+
+```text
+WholeSymbol
+  root 的全部 writer 都由 symbol 单链表达
+
+RegionAware
+  root 曾出现需要精确处理的 view/alias writer，reader 必须走 region 依赖
+```
+
+从 `WholeSymbol` 向 `RegionAware` 的切换必须单向、可发布，并且不能允许
+后续 plain reader 绕开已经登记的 view writer。
+
+### 12.4 view 场景有两种正确处理方式
+
+#### 方式一：保守投影到 root symbol
+
+第一阶段可以把任意 view writer 都投影为“写整个 root”：
+
+```text
+root.view(offset, shape) 的 writer
+  -> 仍向 root symbol writer history 提交一次 writer
+```
+
+优点：
+
+- 继续复用当前 O(1) `last_writer + history` 协议；
+- plain root reader 不会漏掉 view writer；
+- 不需要立即引入 region producer set；
+- 容易用 CPU 门槛测试证明正确性。
+
+代价是产生假依赖。例如两个互不重叠的 view 本可并发，投影后会被同一条
+root writer 链串行化。它是正确性优先的通用快速路径，不是最终的精确
+region 方案。
+
+#### 方式二：进入精确 RegionAware 路径
+
+如果需要保留不相交 view 的并行性，就必须按 region 记录和查询 writer。
+这时一个 full-root reader 可能同时依赖多个互不重叠的最近 writer：
+
+```text
+task N     写 root[0:K]
+task N+1   写 root[K:2K]
+task N+2   读完整 root
+```
+
+`N+2` 必须同时依赖 `N` 和 `N+1`。单个 `last_writer` 无法表达这个 producer
+集合，因此不能继续把 symbol 单链冒充精确 region 语义。此时需要 ordinary
+TensorMap 或等价的 region producer-set 数据结构。
+
+### 12.5 可选的 writer-group 快路
+
+当前 PA 的三个 accumulator 经常一起推进，但“恰好三个”不是通用事实。
+如果后续希望保留类似优化，应显式建模为 `WriterGroupFastPath`：
+
+- frontend/算子声明一组 symbol 始终由同一批 task lockstep 写入；
+- scheduler 校验组内 writer task 完全一致；
+- history 可以整组发布，完成字也可以整组共享；
+- 任一校验失败就退回逐 symbol 协议，不能按 task 类型猜测。
+
+因此 writer-group 是 whole-symbol 快路上的可选压缩层，不是 PA 的三个 slot
+特判。
+
+### 12.6 建议的最终分层
+
+```text
+Tensor 依赖入口
+  |
+  +-- WholeSymbolFastPath
+  |     稳定 task/slot 身份
+  |     whole-object 单 writer-chain
+  |     O(1) latest + immutable history
+  |
+  +-- WriterGroupFastPath（可选）
+  |     显式声明并校验的 lockstep symbol group
+  |     批量发布 whole-symbol metadata
+  |
+  +-- RegionAwarePath
+        view、alias、部分覆盖、多 producer
+        ordinary TensorMap 或等价 region producer set
+```
+
+三条路径最终都应产生统一的 fanin task-id 集合，Build 和执行 slot 不需要
+知道 fanin 来自 symbol 还是 region 查询。这样可以复用调度后半段，又不会
+强迫两种依赖表示共用同一套查找结构。
+
+### 12.7 推荐的落地顺序
+
+1. 先用 CPU 门槛测试定义 `WholeSymbol` 的语义合同，不改 A5 热路径；
+2. 将当前 symbol lookup/publish 从 PA task 类型判断中抽离为公共协议；
+3. 保持当前 PA 行为和数量闭合不变，证明抽离没有引入性能回退；
+4. 对 view 先实现保守 root 投影，验证正确性和假依赖代价；
+5. 只有明确需要 view 并行性时，再实现 `RegionAware` producer set；
+6. writer-group 压缩最后单独验证，不与基础正确性改造混在同一提交。
+
+至少应覆盖以下正确性门槛：
+
+- 连续 whole-object INOUT writer 的前驱链；
+- 慢 reader 看到未来 `last_writer` 后正确回退；
+- view writer 之后的 plain root reader 不漏依赖；
+- 两个不相交 view writer 之后的 full-root reader；
+- output cell/history 复用时的 generation 或窗口约束；
+- payload DCCI 完成后才发布原子完成字；
+- 不满足快速路径合同的输入明确失败或进入 region 路径。
+
+### 12.8 对当前 PA 实现的定位
+
+当前方案应被视为 `WholeSymbolFastPath` 的一个已跑通实例，而不是通用实现
+本身：
+
+- `shared_outputs[]`、`last_writer` 和 immutable history 是可复用机制；
+- PA 三 accumulator、UP 类型判断和 `manual_dep output_view` 是适配层事实；
+- 当前 plain `SharedOutputRef` 的 fail-closed 校验必须继续保留；
+- 在通用 view 合同建立前，不能因为 PA Case1 正确就宣称任意 view/alias
+  已被支持。
+
+换句话说，后续泛化方向不是把 PA 特判扩散到更多算子，而是把 PA 已验证的
+协议提炼成语义驱动的 whole-symbol 快路，并让不能满足合同的对象明确进入
+保守 root 投影或精确 region 路径。
