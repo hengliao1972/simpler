@@ -1,0 +1,10 @@
+# schema=pa_scheduler_artifacts/v3
+# tensormap_mode=shared
+# tensormap_mode_id=1
+# tensormap_ring_cap=128
+# shared_insert_turn_groups=1
+# variant=swimlane
+# phase=none
+# phase_id=0
+2ee695e11dd9484cbc47e971d4d5f7ae2372c6bc8dbd3fa201050c7620ac500f  pa_scheduler_host
+fcddf9be92798c1fa1abc0559fdf1da79743391781205309669e7f5956c61665  pa_scheduler_kernel.o

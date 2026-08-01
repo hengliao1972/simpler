@@ -1,0 +1,10 @@
+# schema=pa_scheduler_artifacts/v3
+# tensormap_mode=shared
+# tensormap_mode_id=1
+# tensormap_ring_cap=128
+# shared_insert_turn_groups=1
+# variant=perf-clock
+# phase=none
+# phase_id=0
+bdfe21417a022e8bbad770aedf354929a1a9d6c97c66b7fcbf5872d7a62228dd  pa_scheduler_host
+1e2ce9561cce51af5365cd6065d44f3da73e94a69c0eee2bb6137d08287d124d  pa_scheduler_kernel.o
