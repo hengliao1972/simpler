@@ -1725,9 +1725,9 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             if event.get("ph") == "M" and event.get("name") == "thread_name"
         }
         self.assertEqual(thread_names[(4, 1)], "AIC (core0)")
-        self.assertEqual(thread_names[(4, 2)], "AIC·kernel (core0)")
-        self.assertEqual(thread_names[(4, 3)], "AIV0 (core1)")
-        self.assertEqual(thread_names[(4, 4)], "AIV0·kernel (core1)")
+        self.assertEqual(thread_names[(4, 2)], "AIV0 (core1)")
+        self.assertEqual(thread_names[(4, 4)], "AIC·kernel (core0)")
+        self.assertEqual(thread_names[(4, 5)], "AIV0·kernel (core1)")
         self.assertNotIn((4, 0), thread_names)
         self.assertFalse(any("·atomic" in name for name in thread_names.values()))
 
@@ -1737,8 +1737,8 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
         kernel = next(event for event in events if event.get("name") == "QK#7")
         self.assertEqual((ready_atomic["pid"], ready_atomic["tid"]), (4, 1))
         self.assertEqual((issue_atomic["pid"], issue_atomic["tid"]), (4, 1))
-        self.assertEqual((clock["pid"], clock["tid"]), (4, 3))
-        self.assertEqual((kernel["pid"], kernel["tid"]), (4, 4))
+        self.assertEqual((clock["pid"], clock["tid"]), (4, 2))
+        self.assertEqual((kernel["pid"], kernel["tid"]), (4, 5))
         self.assertEqual(
             ready_atomic["name"], "atomic.return_ready.claim_max.fetch_max#7"
         )
@@ -1755,6 +1755,65 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
         self.assertTrue(attempted_claim["args"]["claim_attempted"])
         self.assertFalse(skipped_claim["args"]["claim_attempted"])
         self.assertEqual(attempted_claim["args"]["claim_attempted_source"], "raw_flag")
+
+    def test_block_tracks_keep_scalar_then_kernel_order(self) -> None:
+        # 每条物理 lane 只需出现一条 scalar 记录，converter 就应为该
+        # block 建齐对应的 scalar/kernel 两条轨道，并通过显式 sort index
+        # 固定为 AIC/AIV0/AIV1 scalar 在前、三条 kernel 在后。
+        capture = {
+            "l2_swimlane_level": 4,
+            "metadata": {
+                "clock_freq_hz": 1_000_000_000,
+                "num_cores": 3,
+                "trace_schema_version": 2,
+                "core_types": ["AIC", "AIV", "AIV"],
+            },
+            "fdwic_events": [
+                [0, 7, 0, 0, -1, "Claim", 100, 110, 0, 0],
+                [1, 7, 1, 0, -1, "Claim", 100, 110, 0, 0],
+                [2, 7, 2, 0, -1, "Claim", 100, 110, 0, 0],
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            convert(input_path, output_path)
+            merged = json.loads(output_path.read_text(encoding="utf-8"))
+
+        events = merged["traceEvents"]
+        thread_names = {
+            (event["pid"], event["tid"]): event["args"]["name"]
+            for event in events
+            if event.get("ph") == "M" and event.get("name") == "thread_name"
+        }
+        thread_sort_indices = {
+            (event["pid"], event["tid"]): event["args"]["sort_index"]
+            for event in events
+            if event.get("ph") == "M"
+            and event.get("name") == "thread_sort_index"
+        }
+        expected_names = [
+            "AIC (core0)",
+            "AIV0 (core1)",
+            "AIV1 (core2)",
+            "AIC·kernel (core0)",
+            "AIV0·kernel (core1)",
+            "AIV1·kernel (core2)",
+        ]
+        ordered_tracks = sorted(
+            thread_names,
+            key=lambda track: thread_sort_indices[track],
+        )
+        self.assertEqual(ordered_tracks, [(7, tid) for tid in range(1, 7)])
+        self.assertEqual(
+            [thread_names[track] for track in ordered_tracks], expected_names
+        )
+        self.assertEqual(
+            [thread_sort_indices[track] for track in ordered_tracks],
+            list(range(1, 7)),
+        )
 
     def test_v4_shared_register_atomics_are_named_on_scalar_lane(self) -> None:
         capture = _v5_shared_register_atomic_capture()
@@ -2294,7 +2353,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
 
         self.assertEqual((final_drain["pid"], final_drain["tid"]), (0, 1))
         self.assertEqual((scalar_task["pid"], scalar_task["tid"]), (0, 1))
-        self.assertEqual((kernel["pid"], kernel["tid"]), (0, 2))
+        self.assertEqual((kernel["pid"], kernel["tid"]), (0, 4))
         self.assertEqual(
             (scalar_task["ts"], scalar_task["dur"]),
             (kernel["ts"], kernel["dur"]),

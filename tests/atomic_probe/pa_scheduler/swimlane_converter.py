@@ -112,12 +112,12 @@ LANE_NAMES = {0: "AIC", 1: "AIV0", 2: "AIV1"}
 
 def _scalar_thread_id(lane: int) -> int:
     """返回避开 Perfetto 主线程保留值 0 的 scalar track id。"""
-    return lane * 2 + 1
+    return lane + 1
 
 
 def _kernel_thread_id(lane: int) -> int:
-    """返回与对应 scalar 相邻且不冲突的 kernel track id。"""
-    return lane * 2 + 2
+    """返回排在全部 scalar 轨道之后的 kernel track id。"""
+    return lane + 4
 
 
 # Atomic raw ABI：auxiliary 存放调用点，flags 低 4 位存放操作类型。这里的
@@ -1934,31 +1934,51 @@ def convert(  # noqa: PLR0912, PLR0915
                     },
                     first,
                 )
+                # 同一 block 固定先列出三条 scalar，再列出三条 kernel。
+                # thread_sort_index 是 Perfetto 的权威显示顺序；TID 也采用
+                # 同样的 1..6 排列，确保不识别该元数据的查看器仍能稳定回退。
+                thread_tracks: list[tuple[int, str]] = []
                 for lane, lane_name in LANE_NAMES.items():
                     core_id = core_by_block_lane.get((block_id, lane))
-                    if core_id is None:
-                        continue
-                    for thread_id, thread_name in (
-                        (
-                            _scalar_thread_id(lane),
-                            f"{lane_name} (core{core_id})",
-                        ),
-                        (
-                            _kernel_thread_id(lane),
-                            f"{lane_name}·kernel (core{core_id})",
-                        ),
-                    ):
-                        first = _emit_event(
-                            output,
-                            {
-                                "ph": "M",
-                                "name": "thread_name",
-                                "pid": block_id,
-                                "tid": thread_id,
-                                "args": {"name": thread_name},
-                            },
-                            first,
+                    if core_id is not None:
+                        thread_tracks.append(
+                            (
+                                _scalar_thread_id(lane),
+                                f"{lane_name} (core{core_id})",
+                            )
                         )
+                for lane, lane_name in LANE_NAMES.items():
+                    core_id = core_by_block_lane.get((block_id, lane))
+                    if core_id is not None:
+                        thread_tracks.append(
+                            (
+                                _kernel_thread_id(lane),
+                                f"{lane_name}·kernel (core{core_id})",
+                            )
+                        )
+                for thread_id, thread_name in thread_tracks:
+                    first = _emit_event(
+                        output,
+                        {
+                            "ph": "M",
+                            "name": "thread_name",
+                            "pid": block_id,
+                            "tid": thread_id,
+                            "args": {"name": thread_name},
+                        },
+                        first,
+                    )
+                    first = _emit_event(
+                        output,
+                        {
+                            "ph": "M",
+                            "name": "thread_sort_index",
+                            "pid": block_id,
+                            "tid": thread_id,
+                            "args": {"sort_index": thread_id},
+                        },
+                        first,
+                    )
             for item in ordered_items:
                 if item[0] == "scalar_task":
                     (
