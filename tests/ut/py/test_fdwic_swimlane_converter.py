@@ -238,20 +238,20 @@ def test_atomic_and_clock_stay_on_scalar_lane_and_preserve_atomic_count(tmp_path
         for event in events
         if event.get("ph") == "M" and event.get("name") == "thread_name"
     }
-    assert thread_names[0] == "AIC (core0)"
-    assert thread_names[1] == "AIV0 (core1)"
-    assert thread_names[4] == "AIV0·kernel (core1)"
+    assert thread_names[1] == "AIC (core0)"
+    assert thread_names[2] == "AIV0 (core1)"
+    assert thread_names[5] == "AIV0·kernel (core1)"
     assert not any("·atomic" in name for name in thread_names.values())
 
     atomic_events = [event for event in events if event.get("args", {}).get("phase") == "atomic"]
     clock = next(event for event in events if event.get("cat") == "scalar_clock")
     kernel = next(event for event in events if event.get("name") == "f0#7")
     assert len(atomic_events) == sum(row[5] == "Atomic" for row in rows)
-    assert all(event["tid"] == 0 for event in atomic_events)
-    assert clock["tid"] == 1
+    assert all(event["tid"] == 1 for event in atomic_events)
+    assert clock["tid"] == 2
     assert clock["args"]["ticks"] == 1
     assert clock["args"]["clock_freq_hz"] == 1_000_000_000
-    assert kernel["tid"] == 4
+    assert kernel["tid"] == 5
 
     fetch_sub = next(event for event in atomic_events if event["args"]["op"] == "fetch_sub")
     assert fetch_sub["name"] == "atomic.return_ready.won_remaining_fetch_sub.fetch_sub#7"
@@ -262,6 +262,37 @@ def test_atomic_and_clock_stay_on_scalar_lane_and_preserve_atomic_count(tmp_path
     assert fetch_sub["args"]["call_count"] == 1
     assert isinstance(fetch_sub["args"]["cycles"], int)
     assert fetch_sub["args"]["execution_unit"] == "scalar"
+
+
+def test_block_tracks_keep_scalar_then_kernel_order_without_tid_zero(tmp_path):
+    rows = [
+        [12 + lane, 4, lane, 7, -1, "Claim", 100, 200, 0x2, 0]
+        for lane in range(3)
+    ]
+    _, events = _convert(tmp_path, _capture(rows, trace_schema_version=2, num_cores=15))
+
+    thread_names = {
+        (event["pid"], event["tid"]): event["args"]["name"]
+        for event in events
+        if event.get("ph") == "M" and event.get("name") == "thread_name"
+    }
+    sort_indices = {
+        (event["pid"], event["tid"]): event["args"]["sort_index"]
+        for event in events
+        if event.get("ph") == "M" and event.get("name") == "thread_sort_index"
+    }
+    ordered_tracks = sorted(thread_names, key=lambda track: sort_indices[track])
+
+    assert ordered_tracks == [(4, tid) for tid in range(1, 7)]
+    assert [thread_names[track] for track in ordered_tracks] == [
+        "AIC (core12)",
+        "AIV0 (core13)",
+        "AIV1 (core14)",
+        "AIC·kernel (core12)",
+        "AIV0·kernel (core13)",
+        "AIV1·kernel (core14)",
+    ]
+    assert [sort_indices[track] for track in ordered_tracks] == list(range(1, 7))
 
 
 @pytest.mark.parametrize(
@@ -291,7 +322,7 @@ def test_v3_poll_batch_preserves_exact_call_count_without_fake_atomic_latency(
     assert data["trace_schema_version"] == 3
     batch = next(event for event in events if event.get("cat") == "atomic.poll_batch")
     assert batch["name"] == f"atomic.poll_batch.{site_name}.{op_name}×{poll_count}"
-    assert batch["tid"] == 0
+    assert batch["tid"] == 1
     assert batch["args"]["call_count"] == poll_count
     assert batch["args"]["phase"] == "atomic_poll_batch"
     assert batch["args"]["is_poll_batch"] is True
@@ -641,16 +672,56 @@ def test_v4_production_hierarchy_generates_thin_events_and_exact_residuals(tmp_p
     assert sum(event["name"] == "between_submit_residual" for event in residuals) == 3
 
 
+def test_v4_final_drain_nests_poll_windows_and_scalar_task_projection(tmp_path):
+    rows = _v4_rows()
+    final_drain = next(row for row in rows if row[0] == 0 and row[5] == "FinalDrain")
+    rows.remove(final_drain)
+    rows.extend(
+        [
+            [0, 0, 0, -1, -1, "Atomic", 301, 359, (11 << 8) | 0x90, 5],
+            [0, 0, 0, -1, -1, "Atomic", 305, 340, (19 << 8) | 0x90, 14],
+            # Parent is deliberately last, matching completion-order raw output.
+            final_drain,
+        ]
+    )
+    _, events = _convert(
+        tmp_path,
+        _capture(rows, trace_schema_version=4, num_cores=3, level=4),
+    )
+
+    outer = next(event for event in events if event.get("name") == "final_drain" and event["pid"] == 0)
+    fanin_poll = next(
+        event for event in events if event.get("name") == "atomic.poll_batch.fanin_flag_load.load×11"
+    )
+    replay_poll = next(
+        event for event in events if event.get("name") == "atomic.poll_batch.replay_done_poll.load×19"
+    )
+    scalar_task = next(event for event in events if event.get("name") == "task.execute.f9#77")
+    kernel = next(event for event in events if event.get("name") == "f9#77")
+
+    assert (outer["pid"], outer["tid"]) == (0, 1)
+    assert (scalar_task["pid"], scalar_task["tid"]) == (0, 1)
+    assert (kernel["pid"], kernel["tid"]) == (0, 4)
+    assert (scalar_task["ts"], scalar_task["dur"]) == (kernel["ts"], kernel["dur"])
+    scalar_sequence = [outer, fanin_poll, replay_poll, scalar_task]
+    sequence_indices = [events.index(event) for event in scalar_sequence]
+    assert sequence_indices == sorted(sequence_indices)
+    for parent, child in zip(scalar_sequence, scalar_sequence[1:]):
+        assert (parent["pid"], parent["tid"]) == (child["pid"], child["tid"]) == (0, 1)
+        assert parent["ts"] <= child["ts"]
+        assert parent["ts"] + parent["dur"] >= child["ts"] + child["dur"]
+
+
 def test_v4_business_and_atomic_overlays_merge_without_changing_exclusive_partition(
     tmp_path, v4_business_and_atomic_capture
 ):
     data, events = _convert(tmp_path, v4_business_and_atomic_capture)
 
-    claim = next(event for event in events if event.get("name") == "claim.won#0" and event["tid"] == 0)
+    claim = next(event for event in events if event.get("name") == "claim.won#0" and event["tid"] == 1)
     direct = next(event for event in events if event.get("name") == "atomic.return_ready.claim_max.fetch_max#0")
     poll = next(event for event in events if event.get("name") == "atomic.poll_batch.fanin_flag_load.load×7")
     assert claim["pid"] == direct["pid"] == poll["pid"] == 0
-    assert claim["tid"] == direct["tid"] == poll["tid"] == 0
+    assert claim["tid"] == direct["tid"] == poll["tid"] == 1
     assert claim["ts"] <= direct["ts"] < direct["ts"] + direct["dur"] <= claim["ts"] + claim["dur"]
     assert data["fdwic_summary"]["atomic_records"] == 2
     assert data["fdwic_summary"]["atomic_calls"] == 8
@@ -697,7 +768,7 @@ def test_v4_residuals_reuse_the_combined_reader_time_origin(tmp_path):
     between = next(
         event
         for event in events
-        if event.get("name") == "between_submit_residual" and event["pid"] == 0 and event["tid"] == 0
+        if event.get("name") == "between_submit_residual" and event["pid"] == 0 and event["tid"] == 1
     )
     assert between["ts"] == pytest.approx(0.14)
     assert between["dur"] == pytest.approx(0.01)

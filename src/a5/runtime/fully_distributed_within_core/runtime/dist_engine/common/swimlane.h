@@ -634,7 +634,8 @@ PTO_DEVICE_FUNC inline bool fdwic_swimlane_record_aggregate_atomic_poll(
 // Direct atomics remain one row per source call but do not split an active
 // PollBatch. A batch is a logical wait-region window and may contain these
 // interleaved rows; only its call_count, not its duration, represents atomic
-// work. Region/phase/lap/final boundaries still close every active batch.
+// work. Explicit region end, lap and final flush close every active batch;
+// ordinary phase timestamps deliberately do not inspect or split it.
 
 template <typename T>
 PTO_DEVICE_FUNC inline T fdwic_trace_atomic_load(

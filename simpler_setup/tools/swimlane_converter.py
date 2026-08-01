@@ -103,6 +103,18 @@ _FDWIC_PHASE_NAMES = {
     "Dcci": "dcci",
 }
 
+
+def _fdwic_scalar_thread_id(lane):
+    """Return a scalar track id that does not collide with Perfetto's tid=0."""
+
+    return int(lane) + 1
+
+
+def _fdwic_kernel_thread_id(lane):
+    """Place kernel tracks after all three scalar tracks in one mixed block."""
+
+    return int(lane) + 4
+
 # IDs 0..14 are the standalone PA ABI. Real PA only appends IDs so archived
 # captures and the standalone calibration keep the same names.
 _FDWIC_ATOMIC_SITE_NAMES = {
@@ -383,29 +395,75 @@ def _append_fdwic_dist_engine_events(  # noqa: PLR0912, PLR0915
         lane = int(e["lane"])
         core_by_block_lane.setdefault((block_id, lane), int(e["core_id"]))
 
+    # Runtime records are written when a phase ends, so their raw order is
+    # commonly child-before-parent. Perfetto builds same-track nesting in
+    # import order; retain cycle-domain boundaries here and emit outer spans
+    # first after all raw and derived events have been collected.
+    duration_events = []
+
+    def append_duration_event(event, start_cycle, end_cycle, priority):
+        duration_events.append(
+            (
+                int(event["pid"]),
+                int(event["tid"]),
+                int(start_cycle),
+                -int(end_cycle),
+                int(priority),
+                str(event["name"]),
+                event,
+            )
+        )
+
     for block_id in blocks:
         events.append({"ph": "M", "name": "process_name", "pid": block_id, "args": {"name": f"block{block_id}"}})
         events.append({"ph": "M", "name": "process_sort_index", "pid": block_id, "args": {"sort_index": block_id}})
+        # Keep all scalar tracks before all kernel tracks. Non-zero tids avoid
+        # Perfetto remapping tid=0 to the process main thread (tid=pid), which
+        # used to merge unrelated lanes for blocks whose pid was 1..5.
         for lane in (0, 1, 2):
             core_id = core_by_block_lane.get((block_id, lane))
             if core_id is None:
                 continue
+            tid = _fdwic_scalar_thread_id(lane)
             events.append(
                 {
                     "ph": "M",
                     "name": "thread_name",
                     "pid": block_id,
-                    "tid": lane,
+                    "tid": tid,
                     "args": {"name": f"{lane_name(lane)} (core{core_id})"},
                 }
             )
             events.append(
                 {
                     "ph": "M",
+                    "name": "thread_sort_index",
+                    "pid": block_id,
+                    "tid": tid,
+                    "args": {"sort_index": tid},
+                }
+            )
+        for lane in (0, 1, 2):
+            core_id = core_by_block_lane.get((block_id, lane))
+            if core_id is None:
+                continue
+            tid = _fdwic_kernel_thread_id(lane)
+            events.append(
+                {
+                    "ph": "M",
                     "name": "thread_name",
                     "pid": block_id,
-                    "tid": lane + 3,
+                    "tid": tid,
                     "args": {"name": f"{lane_name(lane)}·kernel (core{core_id})"},
+                }
+            )
+            events.append(
+                {
+                    "ph": "M",
+                    "name": "thread_sort_index",
+                    "pid": block_id,
+                    "tid": tid,
+                    "args": {"sort_index": tid},
                 }
             )
 
@@ -451,7 +509,7 @@ def _append_fdwic_dist_engine_events(  # noqa: PLR0912, PLR0915
                 name = f"claim.{'won' if claim_won else 'lost'}#{task_id}"
             else:
                 name = f"claim#{task_id}"
-            tid = lane
+            tid = _fdwic_scalar_thread_id(lane)
         elif phase == "atomic":
             atomic_site_id = aux
             atomic_op_id = flags & 0xF
@@ -474,30 +532,30 @@ def _append_fdwic_dist_engine_events(  # noqa: PLR0912, PLR0915
             else:
                 atomic_boundary_tag = "return_ready" if flags & (1 << 6) else "source_issue"
                 name = f"atomic.{atomic_boundary_tag}.{atomic_site}.{atomic_op}#{task_id}"
-            tid = lane
+            tid = _fdwic_scalar_thread_id(lane)
         elif phase == "clock_baseline":
             name = "clock.atomic_return_dependency_hook" if flags & 1 else "clock.consecutive_sys_cnt_reads"
-            tid = lane
+            tid = _fdwic_scalar_thread_id(lane)
         elif phase == "dcci":
             dcci_site = _FDWIC_SHARED_V5_DCCI_SITE_NAMES.get(aux, f"site_{aux}")
             dcci_op = _FDWIC_SHARED_V5_DCCI_OP_NAMES.get(flags & 0x3, f"op_{flags & 0x3}")
             name = f"dcci.{dcci_site}.{dcci_op}#{task_id}"
-            tid = lane
+            tid = _fdwic_scalar_thread_id(lane)
         elif phase == "register.wait_insert_turn.ld_dev":
             name = f"{phase}×{aux}#{task_id}"
-            tid = lane
+            tid = _fdwic_scalar_thread_id(lane)
         elif phase == "kernel" and func_id >= 0:
             name = f"{kernel_name(func_id)}#{task_id}"
-            tid = lane + 3
+            tid = _fdwic_kernel_thread_id(lane)
         elif phase == "commit":
             name = f"{phase}#{task_id}"
-            tid = lane + 3
+            tid = _fdwic_kernel_thread_id(lane)
         elif phase in ("orchestration_replay", "final_drain"):
             name = phase
-            tid = lane
+            tid = _fdwic_scalar_thread_id(lane)
         else:
             name = f"{phase}#{task_id}"
-            tid = lane
+            tid = _fdwic_scalar_thread_id(lane)
         event = {
             "ph": "X",
             "name": name,
@@ -614,34 +672,80 @@ def _append_fdwic_dist_engine_events(  # noqa: PLR0912, PLR0915
             # identity is already encoded in the event name.
             event.pop("args", None)
             event.pop("cat", None)
-        events.append(event)
+        if phase == "atomic" and atomic_poll_batch:
+            priority = 2
+        elif phase in ("atomic", "dcci"):
+            priority = 4
+        else:
+            priority = 1
+        append_duration_event(event, e["start_cycles"], e["end_cycles"], priority)
+
+        if trace_schema_version >= 4 and phase == "kernel" and func_id >= 0:
+            # ExecuteKernel runs synchronously on the scalar control path. The
+            # raw Kernel bracket is therefore also the authoritative interval
+            # during which this task occupies that path. Project the same raw
+            # interval onto the scalar track while retaining the real compute
+            # event on the kernel track; this is a view, not extra execution.
+            scalar_task = {
+                "ph": "X",
+                "name": f"task.execute.{kernel_name(func_id)}#{task_id}",
+                "pid": int(e["block_id"]),
+                "tid": _fdwic_scalar_thread_id(lane),
+                "ts": round(float(e["start_time_us"]), 3),
+                "dur": round(float(e["duration_us"]), 3),
+                "args": {
+                    "phase": "scalar_task_execution",
+                    "task_id": task_id,
+                    "func_id": func_id,
+                    "core": int(e["core_id"]),
+                    "kernel": kernel_name(func_id),
+                    "execution_unit": "scalar",
+                    "projection_source": "synchronous_execute_kernel_bracket",
+                },
+                "cat": "scalar_task",
+            }
+            if trace_schema_version in (4, 5):
+                scalar_task.pop("args", None)
+                scalar_task.pop("cat", None)
+            append_duration_event(scalar_task, e["start_cycles"], e["end_cycles"], 3)
 
     if hierarchy_model is not None:
         if trace_schema_version == 5:
             for core in hierarchy_model.cores:
                 for partition in core.submits:
                     efdrain = next(child for child in partition.children if child.phase == "EfDrain")
-                    events.append(
-                        {
-                            "ph": "X",
-                            "name": f"efdrain#{efdrain.task_id}",
-                            "pid": efdrain.block_id,
-                            "tid": efdrain.lane,
-                            "ts": round(cycle_time_us[efdrain.start_cycle], 3),
-                            "dur": round(efdrain.duration * residual_factor, 3),
-                        }
+                    event = {
+                        "ph": "X",
+                        "name": f"efdrain#{efdrain.task_id}",
+                        "pid": efdrain.block_id,
+                        "tid": _fdwic_scalar_thread_id(efdrain.lane),
+                        "ts": round(cycle_time_us[efdrain.start_cycle], 3),
+                        "dur": round(efdrain.duration * residual_factor, 3),
+                    }
+                    append_duration_event(
+                        event,
+                        efdrain.start_cycle,
+                        efdrain.start_cycle + efdrain.duration,
+                        0,
                     )
         for residual in iter_v4_residual_spans(hierarchy_model):
-            events.append(
-                {
-                    "ph": "X",
-                    "name": residual.name,
-                    "pid": residual.block_id,
-                    "tid": residual.lane,
-                    "ts": round(cycle_time_us[residual.start_cycle], 3),
-                    "dur": round((residual.end_cycle - residual.start_cycle) * residual_factor, 3),
-                }
+            event = {
+                "ph": "X",
+                "name": residual.name,
+                "pid": residual.block_id,
+                "tid": _fdwic_scalar_thread_id(residual.lane),
+                "ts": round(cycle_time_us[residual.start_cycle], 3),
+                "dur": round((residual.end_cycle - residual.start_cycle) * residual_factor, 3),
+            }
+            append_duration_event(
+                event,
+                residual.start_cycle,
+                residual.end_cycle,
+                0,
             )
+
+    duration_events.sort(key=lambda item: item[:-1])
+    events.extend(item[-1] for item in duration_events)
 
 
 def normalize_pto2_task_id_int(v):

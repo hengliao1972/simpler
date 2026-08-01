@@ -115,14 +115,14 @@ PTO_DEVICE_FUNC inline void trace_span_impl(
 PTO_DEVICE_FUNC inline void
 trace_instant_impl(__gm__ DistCore *self, int32_t task_id, int32_t func_id, TracePhase phase, uint32_t flags = 0) {
     const uint64_t cycle = fdwic_swimlane_detail_now();
-    fdwic_atomic_poll_boundary_at(cycle);
     trace_span_impl(self, task_id, func_id, phase, cycle, cycle, flags, 0);
 }
 
 PTO_DEVICE_FUNC inline uint64_t trace_span_begin_impl() {
-    const uint64_t cycle = fdwic_swimlane_detail_now();
-    fdwic_atomic_poll_boundary_at(cycle);
-    return cycle;
+    // PollBatch 只允许存在于显式 fdwic_atomic_poll_region_begin/end
+    // 区间。普通阶段边界只读取 SYS_CNT，不能为每个 Submit 的主端点
+    // 重复检查 level/active_mask，也不能把一个显式等待 episode 截断。
+    return fdwic_swimlane_detail_now();
 }
 
 #define TRACE_LAP(self, task_id, func_id, phase) trace_lap_impl((self), (task_id), (func_id), (phase))

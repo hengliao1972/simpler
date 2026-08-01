@@ -15,7 +15,7 @@
 
 #include "inner_kernel.h"
 #include "runtime.h"
-#include "dist_engine/common/swimlane.h"
+#include "dist_engine/common/trace.h"
 
 namespace {
 
@@ -120,6 +120,35 @@ TEST_F(FdwicPollBatchTest, SplitsAtMaximum24BitCountAndReopensExactly) {
     EXPECT_EQ(represented_calls, static_cast<uint64_t>(kFdwicAtomicPollCountMax) + 1);
     EXPECT_EQ(core_.dropped, 0U);
     EXPECT_FALSE(g_fdwic_atomic_counter_overflow);
+}
+
+TEST_F(FdwicPollBatchTest, PhaseTimestampDoesNotSplitExplicitPollRegion) {
+    constexpr FdwicAtomicSite kSite = FdwicAtomicSite::StartupPoll;
+    constexpr uint32_t kBatchIndex = 0;
+    constexpr uint32_t kBatchBit = 1U << kBatchIndex;
+    constexpr uint64_t kStart = 444;
+
+    g_fdwic_atomic_poll_burst.enabled_mask = kBatchBit;
+    g_fdwic_atomic_poll_burst.active_mask = kBatchBit;
+    g_fdwic_atomic_poll_burst.start_cycle[kBatchIndex] = kStart;
+    g_fdwic_atomic_poll_burst.call_count[kBatchIndex] = 3;
+
+    const uint64_t phase_tick = trace_span_begin_impl();
+
+    EXPECT_GT(phase_tick, 0U);
+    EXPECT_EQ(core_.count, 0U);
+    EXPECT_EQ(g_fdwic_poll_batch_records, 0U);
+    EXPECT_EQ(g_fdwic_atomic_poll_burst.active_mask, kBatchBit);
+    EXPECT_EQ(g_fdwic_atomic_poll_burst.call_count[kBatchIndex], 3U);
+
+    fdwic_atomic_poll_region_end(0);
+
+    ASSERT_EQ(core_.count, 1U);
+    EXPECT_EQ(g_fdwic_poll_batch_records, 1U);
+    EXPECT_EQ(g_fdwic_atomic_poll_burst.active_mask, 0U);
+    EXPECT_EQ(records_[0].start_cycle, kStart);
+    EXPECT_GE(records_[0].end_cycle, phase_tick);
+    EXPECT_EQ(records_[0].flags >> kFdwicAtomicPollCountShift, 3U);
 }
 
 }  // namespace
