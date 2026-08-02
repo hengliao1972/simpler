@@ -3478,6 +3478,55 @@ constexpr uint64_t kHostSyntheticValueBase = UINT64_C(0x400000000);
 constexpr uint64_t kHostSyntheticBlockTableBase = UINT64_C(0x500000000);
 constexpr uint64_t kHostPaScaleBits = UINT64_C(0x3F800000);
 
+// Host 必须独立复算 S3b owner，不能调用 device adapter 的
+// FixedPaExecuteOwner；否则两边复制了同一错误时，终态 oracle 仍会误判
+// 为正确。这里故意只依赖公开拓扑常量和最终 cell control。
+inline bool HostExecOwnerMatchesEngine(
+    uint32_t owner, cross_core::ExecEngineClass engine
+) {
+    if (engine == cross_core::ExecEngineClass::Aic) {
+        return owner < kAicWorkers;
+    }
+    if (engine == cross_core::ExecEngineClass::Aiv) {
+        return owner >= kAicWorkers && owner < kWorkers;
+    }
+    return false;
+}
+
+inline bool HostExpectedFixedPaExecuteOwner(
+    uint32_t task_id, uint32_t build_owner,
+    cross_core::ExecEngineClass engine,
+    uint32_t *expected_execute_owner
+) {
+    if (expected_execute_owner == nullptr) {
+        return false;
+    }
+    *expected_execute_owner = cross_core::kExecUnboundOwner;
+    if (!HostExecOwnerMatchesEngine(build_owner, engine)) {
+        return false;
+    }
+
+    uint32_t primary = cross_core::kExecUnboundOwner;
+    uint32_t secondary = cross_core::kExecUnboundOwner;
+    if (engine == cross_core::ExecEngineClass::Aic) {
+        primary = task_id % kAicWorkers;
+        secondary = (primary + 1U) % kAicWorkers;
+    } else if (engine == cross_core::ExecEngineClass::Aiv) {
+        const uint32_t primary_local = task_id % kAivWorkers;
+        primary = kAicWorkers + primary_local;
+        secondary = kAicWorkers +
+            ((primary_local + 2U) % kAivWorkers);
+    } else {
+        return false;
+    }
+    *expected_execute_owner = build_owner == primary
+        ? secondary : primary;
+    return *expected_execute_owner != build_owner &&
+           HostExecOwnerMatchesEngine(
+               *expected_execute_owner, engine
+           );
+}
+
 inline TensorDesc HostExternalTensorDescriptor(
     uint64_t address, uint32_t shape0, uint32_t shape1,
     DataType dtype
@@ -3747,6 +3796,18 @@ ValidateCrossCoreExecPayloads(
                     task.kind == TaskKind::Pv
                 ? cross_core::ExecEngineClass::Aic
                 : cross_core::ExecEngineClass::Aiv;
+        uint32_t expected_execute_owner =
+            cross_core::kExecUnboundOwner;
+        const bool owner_mapping_ok =
+            HostExpectedFixedPaExecuteOwner(
+                task.task_id, decoded.build_owner,
+                expected_engine, &expected_execute_owner
+            ) &&
+            decoded.execute_owner == expected_execute_owner &&
+            decoded.build_owner != decoded.execute_owner &&
+            HostExecOwnerMatchesEngine(
+                decoded.execute_owner, expected_engine
+            );
         const bool layout_ok =
             cross_core::ComputeExecPayloadLayout(
                 expected_tensors, expected_scalars,
@@ -3760,6 +3821,10 @@ ValidateCrossCoreExecPayloads(
                 decoded.engine_class == expected_engine &&
                 decoded.payload_lines == layout.payload_lines,
             task.task_id, "control"
+        );
+        record(
+            owner_mapping_ok,
+            task.task_id, "fixed_execute_owner"
         );
         record(
             (cell.payload.words[0] >> 32U) == 0 &&
@@ -4445,12 +4510,12 @@ inline Metrics Validate(
         static_cast<uint64_t>(group_count) *
             (2U * kAicWorkers + 2U * kAivWorkers);
 
-    // S3a 的 host oracle 直接检查 task-indexed cell，而不依赖新增的
-    // WorkerResult 计数：Alloc 不产生执行包；其余 task 必须 DONE，且第一版
-    // 明确要求 build owner 就是 execute owner。这样既不扩大/移动既有
-    // WorkerResult ABI，也能在 S3b 放开跨核 owner 前精确捕获语义漂移。
+    // S3b 的 host oracle 直接检查 task-indexed cell，不依赖新增的
+    // WorkerResult 计数：Alloc 不产生执行包；其余 task 必须 DONE，并由
+    // host 独立复算两候选预路由的唯一 executor。该公式不能调用 device
+    // adapter，避免 device/host 同错后相互放行。
     bool cross_core_exec_cells_ok = shared_plan_ok;
-    bool cross_core_exec_same_owner_ok = shared_plan_ok;
+    bool cross_core_exec_fixed_owner_ok = shared_plan_ok;
     uint32_t first_bad_exec_task = UINT32_MAX;
     for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
         const SharedHostPlannedTask *planned_task =
@@ -4469,12 +4534,27 @@ inline Metrics Validate(
                         planned_task->kind == TaskKind::Pv
                     ? cross_core::ExecEngineClass::Aic
                     : cross_core::ExecEngineClass::Aiv;
+            uint32_t expected_execute_owner =
+                cross_core::kExecUnboundOwner;
+            const bool owner_ok =
+                HostExpectedFixedPaExecuteOwner(
+                    task_id, decoded.build_owner,
+                    expected_engine, &expected_execute_owner
+                ) &&
+                HostExecOwnerMatchesEngine(
+                    decoded.build_owner, expected_engine
+                ) &&
+                HostExecOwnerMatchesEngine(
+                    decoded.execute_owner, expected_engine
+                ) &&
+                decoded.build_owner != decoded.execute_owner &&
+                decoded.execute_owner == expected_execute_owner;
             cell_ok &=
                 decoded.phase == cross_core::ExecPhase::Done &&
                 decoded.task_id == task_id &&
-                decoded.engine_class == expected_engine;
-            cross_core_exec_same_owner_ok &=
-                decoded.build_owner == decoded.execute_owner;
+                decoded.engine_class == expected_engine &&
+                owner_ok;
+            cross_core_exec_fixed_owner_ok &= owner_ok;
         }
         cross_core_exec_cells_ok &= cell_ok;
         if (!cell_ok && first_bad_exec_task == UINT32_MAX) {
@@ -4640,8 +4720,11 @@ inline Metrics Validate(
     bool worker_checksums_ok = true;
 #if !PTO_FDWIC_SHARED_MAP
     uint64_t private_logical_map_signature = 0;
-#endif
     bool fanin_worker_counts_ok = true;
+#else
+    uint64_t fanin_ready_loads_by_role[2] = {};
+    uint64_t fanin_edges_by_role[2] = {};
+#endif
     bool frontier_worker_counts_ok = true;
     bool role_kernel_routing_ok = true;
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
@@ -4936,6 +5019,22 @@ inline Metrics Validate(
         slot_tensor_copies += result.slot_tensor_copies;
         slot_scalar_copies += result.slot_scalar_copies;
         fanin_edges += result.fanin_edges;
+#if PTO_FDWIC_SHARED_MAP
+        // Build 核记录 payload 中的 fanin_edges，异核 executor 记录
+        // fanin_ready_loads；跨核后逐 worker 不再相等，但两端始终保持同
+        // engine role，因此按 AIC/AIV 聚合仍必须严格守恒。
+        if (result.role == static_cast<uint32_t>(CoreRole::Aic)) {
+            fanin_edges_by_role[0] += result.fanin_edges;
+            fanin_ready_loads_by_role[0] +=
+                result.fanin_ready_loads;
+        } else if (
+            result.role == static_cast<uint32_t>(CoreRole::Aiv)
+        ) {
+            fanin_edges_by_role[1] += result.fanin_edges;
+            fanin_ready_loads_by_role[1] +=
+                result.fanin_ready_loads;
+        }
+#endif
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
         const CoreRole expected_role = index < kAicWorkers ? CoreRole::Aic : CoreRole::Aiv;
         compete_first_split_runtime_oracle_ok &= result.worker_id == index;
@@ -5092,13 +5191,7 @@ inline Metrics Validate(
         frontier_worker_counts_ok &= result.frontier_initial_loads == worker_completions;
         frontier_worker_counts_ok &= result.frontier_terminal_loads == result.frontier_initial_loads;
 #endif
-#if PTO_FDWIC_SHARED_MAP
-        // shared SlotReady 会永久移除已观察为 ready 的本核私有 fanin
-        // 前缀；完成 flag 在单轮 kernel 内单调，因此每条真实依赖
-        // 只应命中一次 ready。
-        fanin_worker_counts_ok &=
-            result.fanin_ready_loads == result.fanin_edges;
-#else
+#if !PTO_FDWIC_SHARED_MAP
         fanin_worker_counts_ok &=
             result.fanin_ready_loads >= result.fanin_edges;
         if (result.fanin_ready_loads >= result.fanin_edges) {
@@ -5127,6 +5220,23 @@ inline Metrics Validate(
     }
     for (bool seen : worker_ids)
         worker_shape_ok &= seen;
+
+#if PTO_FDWIC_SHARED_MAP
+    // 每个 group 的 PV 有 1 条 AIC fanin；SF+UP 有 1+3 条 AIV
+    // fanin。builder 与 executor 可以是不同 worker，但不能改变同角色与
+    // 全局的业务总量；这里同时锁定 ready 端和 payload 发布端。
+    const uint64_t expected_aic_fanin_edges = group_count;
+    const uint64_t expected_aiv_fanin_edges =
+        static_cast<uint64_t>(group_count) * 4U;
+    const bool shared_fanin_aggregate_counts_ok =
+        fanin_edges_by_role[0] == expected_aic_fanin_edges &&
+        fanin_ready_loads_by_role[0] == expected_aic_fanin_edges &&
+        fanin_edges_by_role[1] == expected_aiv_fanin_edges &&
+        fanin_ready_loads_by_role[1] == expected_aiv_fanin_edges &&
+        fanin_edges ==
+            expected_aic_fanin_edges + expected_aiv_fanin_edges &&
+        fanin_ready_loads == fanin_edges;
+#endif
 
     uint32_t ready_flags = 0;
     for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
@@ -5214,8 +5324,8 @@ inline Metrics Validate(
         &metrics
     );
     Expect(
-        cross_core_exec_same_owner_ok,
-        "S3a keeps build owner and execute owner identical",
+        cross_core_exec_fixed_owner_ok,
+        "S3b uses the host-independent fixed different-core executor",
         &metrics
     );
     Expect(
@@ -5295,16 +5405,16 @@ inline Metrics Validate(
         &metrics
     );
     Expect(
-        fanin_worker_counts_ok &&
 #if PTO_FDWIC_SHARED_MAP
-            fanin_ready_loads == fanin_edges,
+        shared_fanin_aggregate_counts_ok,
 #else
+        fanin_worker_counts_ok &&
             fanin_ready_loads >= fanin_edges &&
             fanin_ready_loads - fanin_edges <=
                 2 * fanin_not_ready_loads,
 #endif
         kCompiledTensorMapMode == TensorMapBuildMode::Shared
-            ? "shared fanin ready loads match each dependency edge exactly once"
+            ? "shared fanin edges and ready loads match exact AIC/AIV and global totals"
             : "fanin ready/failure load classification is complete",
         &metrics
     );

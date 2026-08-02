@@ -898,6 +898,9 @@ bool RunLoserZeroTensorMapAccessTest() {
     // 前序 Prepare 成功合同，不会再次从 context 取身份或数量。
     context.task_id = 91;
     LocalStats stats{};
+    // 本隔离用例从 task 2 截取 loser 收尾；生产协议要求 Close 前缀与
+    // task id 连续，因此显式表示 task 0/1 已经在此前成功闭合。
+    stats.result.submits = kTask;
     constexpr uint64_t kSubmitBegin = 1;
 
     int64_t turns_before[kSharedInsertTurnCapacity] = {};
@@ -918,7 +921,8 @@ bool RunLoserZeroTensorMapAccessTest() {
     OrderedSubmitTestOps::observed_state = state;
     const bool finished =
         FinishSharedLoserSubmit<OrderedSubmitTestOps, false>(
-            state, stats, task_id, false, kSubmitBegin
+            state, stats, task_id, TaskKind::Sf,
+            false, kSubmitBegin
         );
     bool turns_unchanged = true;
     for (uint32_t lane = 0;
@@ -977,7 +981,7 @@ bool RunLoserZeroTensorMapAccessTest() {
         output2.output_slot == 2 &&
         wrong_task_rejected && seeded &&
         nonempty_rejected &&
-        stats.result.submits == 1 &&
+        stats.result.submits == kTask + 1U &&
         stats.declared_task_count == 0 &&
         turns_unchanged &&
         state->tasks[kTask].deps_prepared == -1 &&

@@ -18,7 +18,7 @@
 | S0 | 固定跨核执行包 ABI、状态机和 cacheline 所有权 | standalone portable ABI 已闭合；真实 TensorDesc 对照留到 S3 |
 | S1 | CPU 确定性交错测试闭合协议正确性 | 已完成 |
 | S2 | CCEC 最小 A5 跨核发布/领取探针 | 已完成 |
-| S3 | standalone PA 接入构建/执行分离 | 进行中：S3a 已闭合；S3b 两候选映射已证明，全核 plan 游标过程态因 A5 反例撤销，正改为 Submit 当场登记本地候选任务 |
+| S3 | standalone PA 接入构建/执行分离 | 进行中：S3a 已闭合；S3b 已完成 Submit 当场登记的 CPU 状态机门槛，尚需闭合 fatal 边界与 CCEC/A5 B1 |
 | S4 | 泳道、PMU 与 perf-clock 三条证据链 | 未开始 |
 | S5 | 根据证据优化非 atomic 路径 | 未开始 |
 | S6 | 评估并迁移到 Simpler 真实路径 | 未开始 |
@@ -349,3 +349,66 @@ batch plan。CPU 和 CCEC 编译均通过，但 A5 B1 连续运行已给出否�
 因此不对两个 16-bit 游标做局部修补，也不进入 B256。两候选映射保留，
 全核事后重建 plan 的代码撤销；下一步先用 CPU 证明“Submit 成功闭合时登记
 owner-local 候选位，EfDrain 只消费这份本地序列”，再重新构建 CCEC/A5。
+
+## 2026-08-02：S3b Submit 当场登记的 CPU 门槛
+
+### 实际落地的数据结构
+
+每个 worker 不再保存 `task/batch/offset` 三元组，也不再重建 PA 计划。
+当前 Submit 成功闭合时已经直接持有 `(task_id, Kind)`，因此只在本 worker
+属于该 task 的 primary/secondary 时设置 owner-local candidate bit。
+
+固定映射下，每核只可能命中两个 task-id 余数类：
+
+- AIC worker `w` 命中 `task_id % 32 ∈ {w, w-1}`，最多 272 个潜在槽；
+- AIV local worker `v` 命中 `task_id % 64 ∈ {v, v-2}`，最多 136 个潜在槽；
+- 统一使用 9 个 `uint32_t`、共 288 bit，覆盖 AIC 最坏值并避免 16-bit
+  设备访存假设。
+
+位图和单调 slot 游标都属于 Scalar owner-local 状态，不是共享发布对象，
+因此不需要 DCCI。新增字段复用了 `LocalStats` 的既有对齐空间：非 split
+仍为 1152 B，split 仍为 1216 B，`CompeteFirstSplitRuntimeState` 仍为
+1728 B；但 trace 在结构内的偏移发生变化，所以所有 CCEC TU 必须整套重编，
+不能混用旧对象文件。
+
+### 连续前缀合同
+
+candidate scanner 只允许越过本 worker 已成功 Close 的连续 Submit 前缀。
+生产 Close 现在强制：
+
+```text
+task_id == stats.result.submits
+登记 candidate bit
+stats.result.submits++
+```
+
+登记 helper 还会拒绝 `candidate_slot < exec_candidate_slot`。这两层门槛防止
+乱序或重复 Close 把已经越过的旧 bit 重新置回，导致 scanner 永远不回头、
+FinalDrain 永远无法排空。该合同依赖当前 PA task id 从 0 开始连续递增；
+后续若改为稀疏 task id，必须显式改成独立连续前沿，不能继续借用 Submit 数。
+
+### CPU 定向证据
+
+严格告警构建下，execution scanner/drain 门槛已覆盖并通过：
+
+- 96 worker × 全 `kMaxTasks` 的 potential slot 单调性和 task↔slot 往返；
+- 真实连续 Submit Close 只为 kernel task 的 primary/secondary 登记，Alloc
+  和其余 94 个 worker 不登记；
+- 96 核面对同一个 `EMPTY` cell 时只有两个候选各发出一次测试 control load；
+- `EMPTY` 保留队头，`BUILDING` 由非 target 越过而 target 等待，`BUILT`
+  只由 target Claim；
+- `CLAIMED/DONE` 的非 target 收敛、无效 control fail-closed、busy token
+  恢复扫描、最后一个 task 与 96 核 execution drain closure；
+- 跳号 Close、重复 Close、越过后重登和未越过时重复登记均被拒绝。
+
+完整 `cross_core/run.sh build cpu` 也已通过，包括 PA adapter、ordered
+Submit、TensorMap、SharedOutput、writer intent、heap、Claim Tournament
+和 Materialize 等全部既有 CPU 门槛。CPU B1 的 host oracle 同时证明固定
+异核 owner、四类 payload、fanin、vend、completion、token 复位和终态均通过。
+
+### 当前仍未宣称的内容
+
+本阶段只证明候选映射和 owner-local 发现状态机的 CPU 语义。global fatal
+仍需在 Claim、kernel 发射与 completion 等不可逆边界收敛；新的 CCEC
+整套编译和 A5 B1 多轮也尚未执行。因此此处不宣称 S3b 已完成，更不使用
+旧的 849 ms 异常二进制进入 B256。

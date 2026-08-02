@@ -31,10 +31,6 @@ namespace {
 using namespace pa_scheduler;
 using namespace pa_scheduler::cross_core;
 
-constexpr uint32_t kAicWorker = 3;
-constexpr uint32_t kAivWorker = 40;
-constexpr uint32_t kForeignWorker = 17;
-
 int g_failures = 0;
 
 void Check(bool condition, const char *test, const char *message) {
@@ -51,10 +47,19 @@ struct ExecScanTestOps {
     static constexpr bool kAtomicReturnReadyObserved = false;
     static inline uint32_t execute_calls = 0;
     static inline std::array<uint32_t, 8> executed_tasks{};
+    static inline volatile int64_t *watched_control = nullptr;
+    static inline uint32_t watched_control_loads = 0;
 
     static void ResetObservations() {
         execute_calls = 0;
         executed_tasks.fill(UINT32_MAX);
+        watched_control = nullptr;
+        watched_control_loads = 0;
+    }
+
+    static void WatchControl(volatile int64_t *control) {
+        watched_control = control;
+        watched_control_loads = 0;
     }
 
     static int32_t Load(volatile int32_t *address) {
@@ -64,6 +69,9 @@ struct ExecScanTestOps {
     }
 
     static int64_t Load(volatile int64_t *address) {
+        if (address == watched_control) {
+            ++watched_control_loads;
+        }
         return __atomic_fetch_add(
             address, int64_t{0}, __ATOMIC_ACQUIRE
         );
@@ -121,6 +129,14 @@ struct ExecScanTestOps {
 
     static void StoreBarrier() {
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    }
+
+    static uint64_t PerfClockNow() {
+        return 0;
+    }
+
+    static uint64_t Now() {
+        return 0;
     }
 
     static void StorePayloadWord(
@@ -305,198 +321,788 @@ bool FatalMatches(
            fatal.reporter_owner == reporter;
 }
 
-void TestOpenSubmitIsNotScanned() {
-    constexpr const char *kTest = "open-submit-not-scanned";
+CoreRole RoleForWorker(uint32_t worker_id) {
+    return worker_id < kAicWorkers ? CoreRole::Aic : CoreRole::Aiv;
+}
+
+void InitLocalStats(
+    LocalStats &stats, uint32_t worker_id, CoreRole role
+) {
+    stats = {};
+    stats.result.worker_id = worker_id;
+    stats.result.role = static_cast<uint32_t>(role);
+}
+
+bool CloseSyntheticSubmit(
+    SchedulerState &state, LocalStats &stats,
+    uint32_t task_id, TaskKind kind
+) {
+    // 走生产 Close 边界来登记候选，避免测试直接预填 bitmap 后
+    // 错把测试搭建方式当成真实 Submit 合同。
+    return CloseSharedCallbackSubmit<ExecScanTestOps, false>(
+        &state, stats, task_id, kind,
+        /*submit_begin=*/0, /*is_last_submit=*/false
+    );
+}
+
+bool RegisterLocalCandidate(
+    LocalStats &stats, uint32_t task_id, TaskKind kind
+) {
+    // 状态机局部用例没有重放完整 Submit 流，只验证给定 closed prefix
+    // 内的扫描行为。这里直接走生产登记原语；调用方仍从 slot 0 开始，
+    // 或显式证明当前 task 的 slot 没有落在游标之后。
+    return RegisterCrossCoreExecCandidate(stats, task_id, kind);
+}
+
+bool PlannedOwners(
+    uint32_t task_id, TaskKind kind, uint32_t build_owner,
+    uint32_t &primary, uint32_t &secondary, uint32_t &execute_owner
+) {
+    PaExecRoute route{};
+    return ResolvePaExecRoute(kind, FunctionId(kind), route) &&
+           FixedPaExecuteCandidates(
+               task_id, route.engine_class, primary, secondary
+           ) &&
+           FixedPaExecuteOwner(
+               task_id, build_owner, route.engine_class,
+               execute_owner
+           );
+}
+
+bool CandidateBitForTask(
+    const LocalStats &stats, uint32_t worker_id,
+    CoreRole role, uint32_t task_id
+) {
+    uint32_t candidate_slot = kCrossCoreExecMaxCandidateSlots;
+    return CrossCoreExecPotentialSlotForTask(
+               worker_id, role, task_id, candidate_slot
+           ) &&
+           CrossCoreExecCandidateRegistered(stats, candidate_slot);
+}
+
+bool SetTerminalKernelCell(
+    SchedulerState &state, uint32_t task_id,
+    TaskKind kind, uint32_t build_owner
+) {
+    PaExecRoute route{};
+    uint32_t execute_owner = kExecUnboundOwner;
+    if (!ResolvePaExecRoute(kind, FunctionId(kind), route) ||
+        !FixedPaExecuteOwner(
+            task_id, build_owner, route.engine_class, execute_owner
+        )) {
+        return false;
+    }
+    SetCellState(
+        state, task_id, ExecPhase::Done,
+        build_owner, execute_owner, route.engine_class, 1
+    );
+    state.tasks[task_id].flag = 1;
+    return true;
+}
+
+void TestPotentialSlotRoundTrip() {
+    constexpr const char *kTest = "candidate-slot-round-trip";
+    bool all_ok = true;
+
+    for (uint32_t worker_id = 0;
+         worker_id < kWorkers; ++worker_id) {
+        const CoreRole role = RoleForWorker(worker_id);
+        uint32_t previous_task = 0;
+        bool has_previous = false;
+        uint32_t mapped_slots = 0;
+        for (uint32_t slot = 0;
+             slot < kCrossCoreExecMaxCandidateSlots; ++slot) {
+            uint32_t task_id = kMaxTasks;
+            if (!CrossCoreExecPotentialTaskAt(
+                    worker_id, role, slot, task_id
+                )) {
+                break;
+            }
+            uint32_t reverse_slot =
+                kCrossCoreExecMaxCandidateSlots;
+            all_ok &= task_id < kMaxTasks &&
+                (!has_previous || task_id > previous_task) &&
+                CrossCoreExecPotentialSlotForTask(
+                    worker_id, role, task_id, reverse_slot
+                ) &&
+                reverse_slot == slot;
+            previous_task = task_id;
+            has_previous = true;
+            ++mapped_slots;
+        }
+        all_ok &= mapped_slots != 0 &&
+            mapped_slots <= kCrossCoreExecMaxCandidateSlots;
+    }
+
+    constexpr std::array<ExecEngineClass, 2> kEngines{
+        ExecEngineClass::Aic, ExecEngineClass::Aiv
+    };
+    for (uint32_t task_id = 0; task_id < kMaxTasks; ++task_id) {
+        for (ExecEngineClass engine : kEngines) {
+            uint32_t primary = kExecUnboundOwner;
+            uint32_t secondary = kExecUnboundOwner;
+            all_ok &= FixedPaExecuteCandidates(
+                task_id, engine, primary, secondary
+            );
+            for (uint32_t worker_id :
+                 std::array<uint32_t, 2>{primary, secondary}) {
+                const CoreRole role = RoleForWorker(worker_id);
+                uint32_t slot = kCrossCoreExecMaxCandidateSlots;
+                uint32_t round_trip_task = kMaxTasks;
+                all_ok &= CrossCoreExecPotentialSlotForTask(
+                              worker_id, role, task_id, slot
+                          ) &&
+                    CrossCoreExecPotentialTaskAt(
+                        worker_id, role, slot, round_trip_task
+                    ) &&
+                    round_trip_task == task_id;
+            }
+        }
+    }
+
+    Check(
+        all_ok, kTest,
+        "all compact candidate slots are ordered and reversible"
+    );
+    std::printf("[PASS] %s\n", kTest);
+}
+
+TaskKind SyntheticKind(uint32_t task_id) {
+    constexpr std::array<TaskKind, 5> kKinds{
+        TaskKind::Alloc, TaskKind::Qk, TaskKind::Sf,
+        TaskKind::Pv, TaskKind::Up
+    };
+    return kKinds[task_id % kKinds.size()];
+}
+
+void TestSubmitCloseRegistersOnlyCandidates() {
+    constexpr const char *kTest =
+        "submit-close-candidate-registration";
     MappedSchedulerState mapping;
     SchedulerState *state = mapping.Get();
     Check(state != nullptr, kTest, "state mapping");
-    if (state == nullptr) {
-        return;
+    if (state == nullptr) return;
+
+    std::array<LocalStats, kWorkers> stats{};
+    for (uint32_t worker_id = 0;
+         worker_id < kWorkers; ++worker_id) {
+        InitLocalStats(
+            stats[worker_id], worker_id, RoleForWorker(worker_id)
+        );
     }
+
+    constexpr uint32_t kSyntheticTasks = 137;
+    bool all_ok = true;
+    for (uint32_t task_id = 0;
+         task_id < kSyntheticTasks; ++task_id) {
+        const TaskKind kind = SyntheticKind(task_id);
+        PaExecRoute route{};
+        uint32_t primary = kExecUnboundOwner;
+        uint32_t secondary = kExecUnboundOwner;
+        const bool kernel = kind != TaskKind::Alloc;
+        if (kernel) {
+            all_ok &= ResolvePaExecRoute(
+                          kind, FunctionId(kind), route
+                      ) &&
+                FixedPaExecuteCandidates(
+                    task_id, route.engine_class, primary, secondary
+                );
+        }
+        uint32_t registered_workers = 0;
+        for (uint32_t worker_id = 0;
+             worker_id < kWorkers; ++worker_id) {
+            all_ok &= CloseSyntheticSubmit(
+                *state, stats[worker_id], task_id, kind
+            );
+            const bool registered = CandidateBitForTask(
+                stats[worker_id], worker_id,
+                RoleForWorker(worker_id), task_id
+            );
+            const bool expected = kernel &&
+                (worker_id == primary || worker_id == secondary);
+            all_ok &= registered == expected &&
+                stats[worker_id].result.submits == task_id + 1U;
+            registered_workers += registered ? 1U : 0U;
+        }
+        all_ok &= registered_workers == (kernel ? 2U : 0U);
+    }
+
+    Check(
+        all_ok && NoFatal(*state), kTest,
+        "real Close path registers two kernel candidates and no Alloc"
+    );
+    std::printf("[PASS] %s\n", kTest);
+}
+
+void TestCloseAndRegistrationRejectHistoryRewrite() {
+    constexpr const char *kTest =
+        "close-and-registration-reject-history-rewrite";
+    bool all_ok = true;
+
+    // Close 的 task id 必须恰好等于已经成功闭合的 Submit 数；不能从
+    // task 1 起步，也不能把已经闭合的 task 0 再闭合一次。
+    {
+        MappedSchedulerState mapping;
+        SchedulerState *state = mapping.Get();
+        all_ok &= state != nullptr;
+        if (state != nullptr) {
+            LocalStats stats{};
+            InitLocalStats(stats, 1, CoreRole::Aic);
+            const bool out_of_order = CloseSyntheticSubmit(
+                *state, stats, 1, TaskKind::Qk
+            );
+            all_ok &= !out_of_order &&
+                stats.result.submits == 0 &&
+                state->fatal.value == 1;
+        }
+    }
+    {
+        MappedSchedulerState mapping;
+        SchedulerState *state = mapping.Get();
+        all_ok &= state != nullptr;
+        if (state != nullptr) {
+            LocalStats stats{};
+            InitLocalStats(stats, 1, CoreRole::Aic);
+            const bool first = CloseSyntheticSubmit(
+                *state, stats, 0, TaskKind::Alloc
+            );
+            const bool duplicate = CloseSyntheticSubmit(
+                *state, stats, 0, TaskKind::Alloc
+            );
+            all_ok &= first && !duplicate &&
+                stats.result.submits == 1 &&
+                state->fatal.value == 1;
+        }
+    }
+
+    // worker 2 的第一个潜在 AIC task 是 task 1。scanner 已将这个
+    // 未登记槽永久越过后，登记原语必须拒绝把历史 bit 写回游标后方。
+    {
+        MappedSchedulerState mapping;
+        SchedulerState *state = mapping.Get();
+        all_ok &= state != nullptr;
+        if (state != nullptr) {
+            constexpr uint32_t kWorker = 2;
+            WorkerState &worker = PrepareWorker(
+                *state, kWorker, CoreRole::Aic
+            );
+            LocalStats stats{};
+            InitLocalStats(stats, kWorker, CoreRole::Aic);
+            const uint32_t progressed =
+                ProgressCrossCoreExec<ExecScanTestOps>(
+                    state, worker, 2,
+                    /*production_closed=*/false,
+                    DrainPlace::EfDrain, stats
+                );
+            const bool late_registration =
+                RegisterLocalCandidate(stats, 1, TaskKind::Qk);
+            all_ok &= progressed == 0 &&
+                stats.exec_candidate_slot == 1 &&
+                !late_registration &&
+                CrossCoreExecCandidateBitmapEmpty(stats) &&
+                NoFatal(*state);
+        }
+    }
+
+    // 尚未越过的同一候选也不能重复置位，防止一次 Submit 被消费两次。
+    {
+        LocalStats stats{};
+        InitLocalStats(stats, 2, CoreRole::Aic);
+        const bool first =
+            RegisterLocalCandidate(stats, 1, TaskKind::Qk);
+        const bool duplicate =
+            RegisterLocalCandidate(stats, 1, TaskKind::Qk);
+        all_ok &= first && !duplicate &&
+            CandidateBitForTask(
+                stats, 2, CoreRole::Aic, 1
+            );
+    }
+
+    Check(
+        all_ok, kTest,
+        "out-of-order/duplicate Close and stale candidate bit fail"
+    );
+    std::printf("[PASS] %s\n", kTest);
+}
+
+void TestOnlyTwoCandidatesObserveControl() {
+    constexpr const char *kTest = "two-candidates-only";
+    MappedSchedulerState mapping;
+    SchedulerState *state = mapping.Get();
+    Check(state != nullptr, kTest, "state mapping");
+    if (state == nullptr) return;
+
+    constexpr std::array<TaskKind, 4> kKernelKinds{
+        TaskKind::Qk, TaskKind::Sf, TaskKind::Pv, TaskKind::Up
+    };
+    bool all_workers_ok = true;
+    for (uint32_t kind_index = 0;
+         kind_index < kKernelKinds.size(); ++kind_index) {
+        const uint32_t task_id = kind_index + 1U;
+        uint32_t primary = kExecUnboundOwner;
+        uint32_t secondary = kExecUnboundOwner;
+        uint32_t execute_owner = kExecUnboundOwner;
+        const bool aic_task = kKernelKinds[kind_index] == TaskKind::Qk ||
+            kKernelKinds[kind_index] == TaskKind::Pv;
+        const uint32_t build_owner =
+            aic_task ? task_id : kAicWorkers + task_id;
+        all_workers_ok &= PlannedOwners(
+            task_id, kKernelKinds[kind_index], build_owner,
+            primary, secondary, execute_owner
+        );
+        uint32_t observer_workers = 0;
+        uint32_t total_control_loads = 0;
+        for (uint32_t worker_id = 0;
+             worker_id < kWorkers; ++worker_id) {
+            WorkerState &worker = PrepareWorker(
+                *state, worker_id, RoleForWorker(worker_id)
+            );
+            LocalStats stats{};
+            InitLocalStats(
+                stats, worker_id, RoleForWorker(worker_id)
+            );
+            all_workers_ok &= RegisterLocalCandidate(
+                stats, task_id, kKernelKinds[kind_index]
+            );
+            ExecScanTestOps::ResetObservations();
+            ExecScanTestOps::WatchControl(
+                &state->exec_cells[task_id].control.state
+            );
+            const uint32_t progressed =
+                ProgressCrossCoreExec<ExecScanTestOps>(
+                    state, worker, task_id + 1U,
+                    /*production_closed=*/false,
+                    DrainPlace::EfDrain, stats
+                );
+            const bool candidate =
+                worker_id == primary || worker_id == secondary;
+            observer_workers +=
+                ExecScanTestOps::watched_control_loads != 0 ? 1U : 0U;
+            total_control_loads +=
+                ExecScanTestOps::watched_control_loads;
+            all_workers_ok &= progressed == 0 &&
+                ExecScanTestOps::execute_calls == 0 &&
+                ExecScanTestOps::watched_control_loads ==
+                    (candidate ? 1U : 0U);
+            if (candidate) {
+                all_workers_ok &= CandidateBitForTask(
+                    stats, worker_id, RoleForWorker(worker_id),
+                    task_id
+                );
+            }
+        }
+        all_workers_ok &= observer_workers == 2 &&
+            total_control_loads == 2;
+    }
+    Check(
+        all_workers_ok && NoFatal(*state),
+        kTest,
+        "each kernel task has two observers and 94 zero-load workers"
+    );
+    std::printf("[PASS] %s\n", kTest);
+}
+
+void TestMappedEmptyDelayedPublication() {
+    constexpr const char *kTest = "mapped-empty-delayed-publish";
+    MappedSchedulerState mapping;
+    SchedulerState *state = mapping.Get();
+    Check(state != nullptr, kTest, "state mapping");
+    if (state == nullptr) return;
+    uint32_t primary = 0;
+    uint32_t secondary = 0;
+    uint32_t target = 0;
+    Check(
+        PlannedOwners(
+            1, TaskKind::Qk, 1, primary, secondary, target
+        ) && target == secondary,
+        kTest, "resolve delayed QK target"
+    );
     WorkerState &worker = PrepareWorker(
-        *state, kAicWorker, CoreRole::Aic
+        *state, target, RoleForWorker(target)
     );
     LocalStats stats{};
-    ExecScanTestOps::ResetObservations();
+    InitLocalStats(stats, target, RoleForWorker(target));
     Check(
-        PublishKernelCell(
-            *state, 1, kAicWorker, TaskKind::Qk
-        ),
-        kTest, "publish open task 1"
+        RegisterLocalCandidate(stats, 1, TaskKind::Qk),
+        kTest, "register delayed QK candidate"
+    );
+    ExecScanTestOps::ResetObservations();
+    const uint32_t empty_progress =
+        ProgressCrossCoreExec<ExecScanTestOps>(
+            state, worker, 2, /*production_closed=*/false,
+            DrainPlace::EfDrain, stats
+        );
+    Check(
+        empty_progress == 0 &&
+            CandidateBitForTask(
+                stats, target, RoleForWorker(target), 1
+            ) &&
+            ExecScanTestOps::execute_calls == 0 && NoFatal(*state),
+        kTest, "mapped candidate waits at EMPTY"
     );
 
-    // local_index 已经前移也不能授权扫描；唯一上界必须是成功 Close 的
-    // replay_closed_exclusive。task 0 是已闭合 Alloc EMPTY，task 1 已经
-    // BUILT 但仍属于当前尚未 Close 的 Submit。
-    worker.local_index = 2;
-    const uint32_t open_progress =
+    Check(
+        PublishKernelCell(*state, 1, 1, TaskKind::Qk),
+        kTest, "builder publishes delayed QK"
+    );
+    const uint32_t built_progress =
         ProgressCrossCoreExec<ExecScanTestOps>(
-            state, worker, 1, DrainPlace::EfDrain, stats
+            state, worker, 2, /*production_closed=*/false,
+            DrainPlace::EfDrain, stats
         );
-    const DecodedExecState still_built = DecodeExecState(
+    const DecodedExecState done = DecodeExecState(
         state->exec_cells[1].control.state
     );
     Check(
-        open_progress == 0 && stats.exec_scan_task == 1 &&
-            ExecScanTestOps::execute_calls == 0 &&
-            still_built.valid &&
-            still_built.phase == ExecPhase::Built &&
-            state->tasks[1].flag == 0 && NoFatal(*state),
-        kTest, "open Submit stays outside the scan prefix"
-    );
-
-    const uint32_t closed_progress =
-        ProgressCrossCoreExec<ExecScanTestOps>(
-            state, worker, 2, DrainPlace::EfDrain, stats
-        );
-    Check(
-        closed_progress == 1 && stats.exec_scan_task == 2 &&
+        built_progress == 1 &&
+            !CandidateBitForTask(
+                stats, target, RoleForWorker(target), 1
+            ) &&
             ExecScanTestOps::execute_calls == 1 &&
-            ExecScanTestOps::executed_tasks[0] == 1 &&
-            DecodeExecState(
-                state->exec_cells[1].control.state
-            ).phase == ExecPhase::Done &&
-            state->tasks[1].flag == 1 && NoFatal(*state),
-        kTest, "the same task becomes visible only after Close"
+            done.valid && done.phase == ExecPhase::Done &&
+            done.build_owner == 1 && done.execute_owner == target &&
+            state->tasks[1].flag == 1 &&
+            CrossCoreExecWorkerDrained(
+                state, worker, 2, stats
+            ) && NoFatal(*state),
+        kTest, "delayed BUILT is claimed exactly once"
     );
     std::printf("[PASS] %s\n", kTest);
 }
 
-void TestAllocEmptyHoleIsSkipped() {
-    constexpr const char *kTest = "alloc-empty-hole-skipped";
+void TestMappedBuildingDelayedPublication() {
+    constexpr const char *kTest = "mapped-building-delayed-publish";
     MappedSchedulerState mapping;
     SchedulerState *state = mapping.Get();
     Check(state != nullptr, kTest, "state mapping");
-    if (state == nullptr) {
-        return;
-    }
-    WorkerState &worker = PrepareWorker(
-        *state, kAicWorker, CoreRole::Aic
-    );
-    LocalStats stats{};
-    ExecScanTestOps::ResetObservations();
+    if (state == nullptr) return;
+    state->tasks[1].flag = 1;
 
-    const uint32_t progressed =
+    uint32_t primary = 0;
+    uint32_t secondary = 0;
+    uint32_t target = 0;
+    Check(
+        PlannedOwners(
+            2, TaskKind::Sf, 34,
+            primary, secondary, target
+        ) && target == secondary,
+        kTest, "resolve delayed SF target"
+    );
+    Check(
+        PublishKernelCell(
+            *state, 2, 34, TaskKind::Sf, {1}
+        ),
+        kTest, "prepare delayed SF payload"
+    );
+    const int64_t built_state =
+        state->exec_cells[2].control.state;
+    SetCellState(
+        *state, 2, ExecPhase::Building, 34,
+        kExecUnboundOwner, ExecEngineClass::None, 0
+    );
+
+    WorkerState &target_worker = PrepareWorker(
+        *state, target, RoleForWorker(target)
+    );
+    LocalStats target_stats{};
+    InitLocalStats(
+        target_stats, target, RoleForWorker(target)
+    );
+    Check(
+        RegisterLocalCandidate(
+            target_stats, 2, TaskKind::Sf
+        ),
+        kTest, "register target SF candidate"
+    );
+    ExecScanTestOps::ResetObservations();
+    const uint32_t waiting =
         ProgressCrossCoreExec<ExecScanTestOps>(
-            state, worker, 1, DrainPlace::EfDrain, stats
+            state, target_worker, 3,
+            /*production_closed=*/false,
+            DrainPlace::EfDrain, target_stats
         );
     Check(
-        progressed == 0 && stats.exec_scan_task == 1 &&
-            ExecScanTestOps::execute_calls == 0 &&
-            DecodeExecState(
-                state->exec_cells[0].control.state
-            ).phase == ExecPhase::Empty &&
+        waiting == 0 &&
+            CandidateBitForTask(
+                target_stats, target, RoleForWorker(target), 2
+            ) &&
+            ExecScanTestOps::execute_calls == 0 && NoFatal(*state),
+        kTest, "actual target waits at BUILDING"
+    );
+
+    WorkerState &other_worker = PrepareWorker(
+        *state, primary, RoleForWorker(primary)
+    );
+    LocalStats other_stats{};
+    InitLocalStats(
+        other_stats, primary, RoleForWorker(primary)
+    );
+    Check(
+        RegisterLocalCandidate(
+            other_stats, 2, TaskKind::Sf
+        ),
+        kTest, "register alternate SF candidate"
+    );
+    const uint32_t skipped =
+        ProgressCrossCoreExec<ExecScanTestOps>(
+            state, other_worker, 3,
+            /*production_closed=*/false,
+            DrainPlace::EfDrain, other_stats
+        );
+    Check(
+        skipped == 0 &&
+            !CandidateBitForTask(
+                other_stats, primary, RoleForWorker(primary), 2
+            ) &&
             NoFatal(*state),
-        kTest, "EMPTY Alloc does not block the closed prefix"
+        kTest, "other candidate skips known-target BUILDING"
+    );
+
+    state->exec_cells[2].control.state = built_state;
+    const uint32_t published =
+        ProgressCrossCoreExec<ExecScanTestOps>(
+            state, target_worker, 3,
+            /*production_closed=*/false,
+            DrainPlace::EfDrain, target_stats
+        );
+    const DecodedExecState done = DecodeExecState(
+        state->exec_cells[2].control.state
+    );
+    Check(
+        published == 1 &&
+            !CandidateBitForTask(
+                target_stats, target, RoleForWorker(target), 2
+            ) &&
+            ExecScanTestOps::execute_calls == 1 &&
+            done.valid && done.phase == ExecPhase::Done &&
+            done.build_owner == 34 &&
+            done.execute_owner == target && NoFatal(*state),
+        kTest, "target observes later BUILT without losing the task"
     );
     std::printf("[PASS] %s\n", kTest);
 }
 
-void RunForeignHoleFollowerCase(
-    ExecPhase hole_phase, const char *test
-) {
-    MappedSchedulerState mapping;
-    SchedulerState *state = mapping.Get();
-    Check(state != nullptr, test, "state mapping");
-    if (state == nullptr) {
-        return;
-    }
-    WorkerState &worker = PrepareWorker(
-        *state, kAicWorker, CoreRole::Aic
-    );
-    LocalStats stats{};
-    ExecScanTestOps::ResetObservations();
-    if (hole_phase == ExecPhase::Building) {
-        SetCellState(
-            *state, 0, ExecPhase::Building,
-            kForeignWorker, kExecUnboundOwner,
-            ExecEngineClass::None, 0
-        );
-    }
-    Check(
-        PublishKernelCell(
-            *state, 1, kAicWorker, TaskKind::Qk
-        ),
-        test, "publish the local follower"
-    );
-
-    const uint32_t progressed =
-        ProgressCrossCoreExec<ExecScanTestOps>(
-            state, worker, 2, DrainPlace::EfDrain, stats
-        );
-    Check(
-        progressed == 1 && stats.exec_scan_task == 2 &&
-            ExecScanTestOps::execute_calls == 1 &&
-            ExecScanTestOps::executed_tasks[0] == 1 &&
-            DecodeExecState(
-                state->exec_cells[1].control.state
-            ).phase == ExecPhase::Done &&
-            NoFatal(*state),
-        test,
-        "foreign hole cannot permanently hide a later local task"
-    );
-    std::printf("[PASS] %s\n", test);
-}
-
-void TestForeignHolesDoNotHideFollowers() {
-    RunForeignHoleFollowerCase(
-        ExecPhase::Empty, "foreign-empty-follower-discovered"
-    );
-    RunForeignHoleFollowerCase(
-        ExecPhase::Building,
-        "foreign-building-follower-discovered"
-    );
-}
-
-void RunSelfTransitionalFailClosedCase(
+void RunOtherCandidateTerminalStateCase(
     ExecPhase phase, const char *test
 ) {
     MappedSchedulerState mapping;
     SchedulerState *state = mapping.Get();
     Check(state != nullptr, test, "state mapping");
-    if (state == nullptr) {
-        return;
-    }
+    if (state == nullptr) return;
+    uint32_t primary = 0;
+    uint32_t secondary = 0;
+    uint32_t target = 0;
+    Check(
+        PlannedOwners(
+            1, TaskKind::Qk, 1,
+            primary, secondary, target
+        ) && target == secondary,
+        test, "resolve QK target"
+    );
+    SetCellState(
+        *state, 1, phase, /*build_owner=*/1, target,
+        ExecEngineClass::Aic, /*payload_lines=*/1
+    );
     WorkerState &worker = PrepareWorker(
-        *state, kAicWorker, CoreRole::Aic
+        *state, primary, CoreRole::Aic
     );
     LocalStats stats{};
+    InitLocalStats(stats, primary, CoreRole::Aic);
+    Check(
+        RegisterLocalCandidate(stats, 1, TaskKind::Qk),
+        test, "register alternate QK candidate"
+    );
     ExecScanTestOps::ResetObservations();
-    if (phase == ExecPhase::Building) {
-        SetCellState(
-            *state, 0, phase, kAicWorker,
-            kExecUnboundOwner, ExecEngineClass::None, 0
-        );
-    } else {
-        SetCellState(
-            *state, 0, phase, kAicWorker,
-            kAicWorker, ExecEngineClass::Aic, 1
-        );
-    }
-
+    ExecScanTestOps::WatchControl(
+        &state->exec_cells[1].control.state
+    );
     const uint32_t progressed =
         ProgressCrossCoreExec<ExecScanTestOps>(
-            state, worker, 1, DrainPlace::EfDrain, stats
+            state, worker, 2, /*production_closed=*/false,
+            DrainPlace::EfDrain, stats
         );
     Check(
-        progressed == 0 && stats.exec_scan_task == 0 &&
-            ExecScanTestOps::execute_calls == 0 &&
-            FatalMatches(
-                *state, ExecFatalReason::InvalidBuiltControl,
-                0, kAicWorker
-            ),
-        test, "self transitional state fails closed"
+        progressed == 0 &&
+            !CandidateBitForTask(
+                stats, primary, CoreRole::Aic, 1
+            ) &&
+            ExecScanTestOps::watched_control_loads == 1 &&
+            ExecScanTestOps::execute_calls == 0 && NoFatal(*state),
+        test, "non-target candidate validates and advances"
     );
     std::printf("[PASS] %s\n", test);
 }
 
-void TestSelfTransitionalStatesFailClosed() {
-    RunSelfTransitionalFailClosedCase(
-        ExecPhase::Building, "self-building-fails-closed"
+void TestOtherCandidateSkipsClaimedAndDone() {
+    RunOtherCandidateTerminalStateCase(
+        ExecPhase::Claimed, "other-candidate-skips-claimed"
     );
-    RunSelfTransitionalFailClosedCase(
-        ExecPhase::Claimed, "self-claimed-fails-closed"
+    RunOtherCandidateTerminalStateCase(
+        ExecPhase::Done, "other-candidate-skips-done"
     );
+}
+
+void TestInvalidStatesFailClosed() {
+    constexpr const char *kTest = "invalid-state-fail-closed";
+    bool all_cases_ok = true;
+
+    {
+        MappedSchedulerState mapping;
+        SchedulerState *state = mapping.Get();
+        all_cases_ok &= state != nullptr;
+        if (state != nullptr) {
+            SetCellState(
+                *state, 1, ExecPhase::Built, 1,
+                kExecUnboundOwner, ExecEngineClass::Aiv, 1
+            );
+            WorkerState &worker = PrepareWorker(
+                *state, 1, CoreRole::Aic
+            );
+            LocalStats stats{};
+            InitLocalStats(stats, 1, CoreRole::Aic);
+            all_cases_ok &= RegisterLocalCandidate(
+                stats, 1, TaskKind::Qk
+            );
+            (void)ProgressCrossCoreExec<ExecScanTestOps>(
+                state, worker, 2, false,
+                DrainPlace::EfDrain, stats
+            );
+            all_cases_ok &= FatalMatches(
+                *state, ExecFatalReason::InvalidBuiltControl, 1, 1
+            );
+        }
+    }
+    {
+        MappedSchedulerState mapping;
+        SchedulerState *state = mapping.Get();
+        all_cases_ok &= state != nullptr;
+        if (state != nullptr) {
+            SetCellState(
+                *state, 1, ExecPhase::Done, 1, 1,
+                ExecEngineClass::Aic, 1
+            );
+            WorkerState &worker = PrepareWorker(
+                *state, 1, CoreRole::Aic
+            );
+            LocalStats stats{};
+            InitLocalStats(stats, 1, CoreRole::Aic);
+            all_cases_ok &= RegisterLocalCandidate(
+                stats, 1, TaskKind::Qk
+            );
+            (void)ProgressCrossCoreExec<ExecScanTestOps>(
+                state, worker, 2, false,
+                DrainPlace::EfDrain, stats
+            );
+            all_cases_ok &= FatalMatches(
+                *state, ExecFatalReason::InvalidBuiltControl, 1, 1
+            );
+        }
+    }
+    {
+        MappedSchedulerState mapping;
+        SchedulerState *state = mapping.Get();
+        all_cases_ok &= state != nullptr;
+        if (state != nullptr) {
+            SetCellState(
+                *state, 1, ExecPhase::Done, 1, 2,
+                ExecEngineClass::Aic, 1
+            );
+            WorkerState &worker = PrepareWorker(
+                *state, 2, CoreRole::Aic
+            );
+            LocalStats stats{};
+            InitLocalStats(stats, 2, CoreRole::Aic);
+            all_cases_ok &= RegisterLocalCandidate(
+                stats, 1, TaskKind::Qk
+            );
+            (void)ProgressCrossCoreExec<ExecScanTestOps>(
+                state, worker, 2, false,
+                DrainPlace::EfDrain, stats
+            );
+            all_cases_ok &= FatalMatches(
+                *state, ExecFatalReason::InvalidBuiltControl, 1, 2
+            );
+        }
+    }
+    {
+        MappedSchedulerState mapping;
+        SchedulerState *state = mapping.Get();
+        all_cases_ok &= state != nullptr;
+        if (state != nullptr) {
+            SetCellState(
+                *state, 1, ExecPhase::Claimed, 1, 2,
+                ExecEngineClass::Aic, 1
+            );
+            WorkerState &worker = PrepareWorker(
+                *state, 2, CoreRole::Aic
+            );
+            LocalStats stats{};
+            InitLocalStats(stats, 2, CoreRole::Aic);
+            all_cases_ok &= RegisterLocalCandidate(
+                stats, 1, TaskKind::Qk
+            );
+            (void)ProgressCrossCoreExec<ExecScanTestOps>(
+                state, worker, 2, false,
+                DrainPlace::EfDrain, stats
+            );
+            all_cases_ok &= FatalMatches(
+                *state, ExecFatalReason::InvalidBuiltControl, 1, 2
+            );
+        }
+    }
+    {
+        MappedSchedulerState mapping;
+        SchedulerState *state = mapping.Get();
+        all_cases_ok &= state != nullptr;
+        if (state != nullptr) {
+            WorkerState &worker = PrepareWorker(
+                *state, 1, CoreRole::Aic
+            );
+            LocalStats stats{};
+            InitLocalStats(stats, 1, CoreRole::Aic);
+            all_cases_ok &= RegisterLocalCandidate(
+                stats, 1, TaskKind::Qk
+            );
+            (void)ProgressCrossCoreExec<ExecScanTestOps>(
+                state, worker, 2, true,
+                DrainPlace::FinalDrain, stats
+            );
+            all_cases_ok &= FatalMatches(
+                *state, ExecFatalReason::InvalidBuiltControl, 1, 1
+            );
+        }
+    }
+    {
+        MappedSchedulerState mapping;
+        SchedulerState *state = mapping.Get();
+        all_cases_ok &= state != nullptr;
+        if (state != nullptr) {
+            SetCellState(
+                *state, 1, ExecPhase::Building, 1,
+                kExecUnboundOwner, ExecEngineClass::None, 0
+            );
+            WorkerState &worker = PrepareWorker(
+                *state, 2, CoreRole::Aic
+            );
+            LocalStats stats{};
+            InitLocalStats(stats, 2, CoreRole::Aic);
+            all_cases_ok &= RegisterLocalCandidate(
+                stats, 1, TaskKind::Qk
+            );
+            (void)ProgressCrossCoreExec<ExecScanTestOps>(
+                state, worker, 2, true,
+                DrainPlace::FinalDrain, stats
+            );
+            all_cases_ok &= FatalMatches(
+                *state, ExecFatalReason::InvalidBuiltControl, 1, 2
+            );
+        }
+    }
+    Check(
+        all_cases_ok, kTest,
+        "wrong engine/mapping, lost target cursor and closed holes fail"
+    );
+    std::printf("[PASS] %s\n", kTest);
 }
 
 void TestBusyTokenResumesScanning() {
@@ -504,87 +1110,91 @@ void TestBusyTokenResumesScanning() {
     MappedSchedulerState mapping;
     SchedulerState *state = mapping.Get();
     Check(state != nullptr, kTest, "state mapping");
-    if (state == nullptr) {
-        return;
-    }
-    WorkerState &worker = PrepareWorker(
-        *state, kAivWorker, CoreRole::Aiv
-    );
-    LocalStats stats{};
-    ExecScanTestOps::ResetObservations();
+    if (state == nullptr) return;
+    state->tasks[0].flag = 1;
     Check(
         PublishKernelCell(
-            *state, 1, kAivWorker, TaskKind::Sf, {0}
+            *state, 2, 34, TaskKind::Sf, {1}
         ) &&
+            SetTerminalKernelCell(
+                *state, 3, TaskKind::Pv, 3
+            ) &&
             PublishKernelCell(
-                *state, 2, kAivWorker, TaskKind::Sf, {0}
+                *state, 4, 40, TaskKind::Up, {2, 3, 0}
             ),
-        kTest, "publish blocked task and its follower"
+        kTest, "publish blocked SF and later UP"
     );
+    const uint32_t executor = 36;
+    WorkerState &worker = PrepareWorker(
+        *state, executor, CoreRole::Aiv
+    );
+    LocalStats stats{};
+    InitLocalStats(stats, executor, CoreRole::Aiv);
+    Check(
+        RegisterLocalCandidate(stats, 2, TaskKind::Sf) &&
+            RegisterLocalCandidate(stats, 4, TaskKind::Up),
+        kTest, "register both executor candidates"
+    );
+    ExecScanTestOps::ResetObservations();
 
     const uint32_t first =
         ProgressCrossCoreExec<ExecScanTestOps>(
-            state, worker, 3, DrainPlace::EfDrain, stats
+            state, worker, 5, false,
+            DrainPlace::EfDrain, stats
         );
     Check(
-        first == 0 && stats.exec_scan_task == 2 &&
-            state->exec_tokens[kAivWorker].control.phase ==
+        first == 0 && stats.exec_candidate_slot == 1 &&
+            CandidateBitForTask(
+                stats, executor, CoreRole::Aiv, 4
+            ) &&
+            state->exec_tokens[executor].control.phase ==
                 ExecTokenPhase::WaitingFanin &&
             DecodeExecState(
-                state->exec_cells[1].control.state
+                state->exec_cells[2].control.state
             ).phase == ExecPhase::Claimed &&
             DecodeExecState(
-                state->exec_cells[2].control.state
+                state->exec_cells[4].control.state
             ).phase == ExecPhase::Built &&
             ExecScanTestOps::execute_calls == 0 && NoFatal(*state),
-        kTest, "busy token pauses before scanning the follower"
+        kTest, "busy token pauses before later candidate task"
     );
-
     const uint32_t still_blocked =
         ProgressCrossCoreExec<ExecScanTestOps>(
-            state, worker, 3, DrainPlace::EfDrain, stats
+            state, worker, 5, false,
+            DrainPlace::EfDrain, stats
         );
     Check(
-        still_blocked == 0 && stats.exec_scan_task == 2 &&
+        still_blocked == 0 && stats.exec_candidate_slot == 1 &&
             ExecScanTestOps::execute_calls == 0 && NoFatal(*state),
-        kTest, "repeated poll retains the discovery cursor"
+        kTest, "repeated fanin poll keeps candidate cursor"
     );
 
     __atomic_store_n(
-        &state->tasks[0].flag, int64_t{1}, __ATOMIC_RELEASE
+        &state->tasks[1].flag, int64_t{1}, __ATOMIC_RELEASE
     );
     const uint32_t resumed =
         ProgressCrossCoreExec<ExecScanTestOps>(
-            state, worker, 3, DrainPlace::EfDrain, stats
+            state, worker, 5, false,
+            DrainPlace::EfDrain, stats
         );
     Check(
-        resumed == 2 && stats.exec_scan_task == 3 &&
-            state->exec_tokens[kAivWorker].control.phase ==
+        resumed == 2 && stats.exec_candidate_slot == 2 &&
+            CrossCoreExecCandidateBitmapEmpty(stats) &&
+            state->exec_tokens[executor].control.phase ==
                 ExecTokenPhase::Idle &&
             ExecScanTestOps::execute_calls == 2 &&
-            ExecScanTestOps::executed_tasks[0] == 1 &&
-            ExecScanTestOps::executed_tasks[1] == 2 &&
-            DecodeExecState(
-                state->exec_cells[1].control.state
-            ).phase == ExecPhase::Done &&
+            ExecScanTestOps::executed_tasks[0] == 2 &&
+            ExecScanTestOps::executed_tasks[1] == 4 &&
             DecodeExecState(
                 state->exec_cells[2].control.state
             ).phase == ExecPhase::Done &&
+            DecodeExecState(
+                state->exec_cells[4].control.state
+            ).phase == ExecPhase::Done &&
             NoFatal(*state),
-        kTest, "ready token completes before the follower is rediscovered"
+        kTest, "ready token completes before later task is claimed"
     );
     std::printf("[PASS] %s\n", kTest);
-}
-
-void SetTerminalKernelCell(
-    SchedulerState &state, uint32_t task_id,
-    ExecEngineClass engine
-) {
-    SetCellState(
-        state, task_id, ExecPhase::Done,
-        kForeignWorker, kForeignWorker, engine, 1
-    );
-    state.tasks[task_id].flag = 1;
 }
 
 void TestFinalDrainClosesLastTask() {
@@ -592,54 +1202,48 @@ void TestFinalDrainClosesLastTask() {
     MappedSchedulerState mapping;
     SchedulerState *state = mapping.Get();
     Check(state != nullptr, kTest, "state mapping");
-    if (state == nullptr) {
-        return;
-    }
-    WorkerState &worker = PrepareWorker(
-        *state, kAivWorker, CoreRole::Aiv
-    );
-    LocalStats stats{};
-    ExecScanTestOps::ResetObservations();
-
-    // context_length=1 对应真实一组 PA 计划：Alloc/QK/SF/PV/UP。
+    if (state == nullptr) return;
     state->config.batches = 1;
     state->context_lens[0] = 1;
     state->tasks[0].flag = 1;
-    SetTerminalKernelCell(*state, 1, ExecEngineClass::Aic);
-    SetTerminalKernelCell(*state, 2, ExecEngineClass::Aiv);
-    SetTerminalKernelCell(*state, 3, ExecEngineClass::Aic);
     Check(
-        PublishKernelCell(
-            *state, 4, kAivWorker, TaskKind::Up, {2, 3, 0}
-        ),
-        kTest, "publish the last UP task"
+        SetTerminalKernelCell(*state, 1, TaskKind::Qk, 1) &&
+            SetTerminalKernelCell(*state, 2, TaskKind::Sf, 34) &&
+            SetTerminalKernelCell(*state, 3, TaskKind::Pv, 3) &&
+            PublishKernelCell(
+                *state, 4, 40, TaskKind::Up, {2, 3, 0}
+            ),
+        kTest, "prepare fixed-owner terminal prefix"
     );
 
-    const uint32_t replay_progress =
-        ProgressCrossCoreExec<ExecScanTestOps>(
-            state, worker, 4, DrainPlace::EfDrain, stats
-        );
+    const uint32_t executor = 36;
+    WorkerState &worker = PrepareWorker(
+        *state, executor, CoreRole::Aiv
+    );
+    LocalStats stats{};
+    InitLocalStats(stats, executor, CoreRole::Aiv);
+    Check(
+        RegisterLocalCandidate(stats, 4, TaskKind::Up),
+        kTest, "register the pending last task"
+    );
+    ExecScanTestOps::ResetObservations();
     uint32_t first_bad_task = UINT32_MAX;
     Check(
-        replay_progress == 0 && stats.exec_scan_task == 4 &&
-            ExecScanTestOps::execute_calls == 0 &&
-            DecodeExecState(
-                state->exec_cells[4].control.state
-            ).phase == ExecPhase::Built &&
-            !ValidateCrossCoreExecTerminalCells<ExecScanTestOps>(
-                state, 5, first_bad_task
-            ) &&
-            first_bad_task == 4 && NoFatal(*state),
-        kTest, "replay prefix leaves the open last task for FinalDrain"
+        !ValidateCrossCoreExecTerminalCells<ExecScanTestOps>(
+            state, 5, first_bad_task
+        ) && first_bad_task == 4 && NoFatal(*state),
+        kTest, "open last task is not yet terminal"
     );
 
     const uint32_t final_progress =
         ProgressCrossCoreExec<ExecScanTestOps>(
-            state, worker, 5, DrainPlace::FinalDrain, stats
+            state, worker, 5, /*production_closed=*/true,
+            DrainPlace::FinalDrain, stats
         );
     first_bad_task = UINT32_MAX;
     Check(
-        final_progress == 1 && stats.exec_scan_task == 5 &&
+        final_progress == 1 &&
+            CrossCoreExecCandidateBitmapEmpty(stats) &&
             ExecScanTestOps::execute_calls == 1 &&
             ExecScanTestOps::executed_tasks[0] == 4 &&
             stats.result.placement[
@@ -653,32 +1257,39 @@ void TestFinalDrainClosesLastTask() {
                 state, worker, 5, stats
             ) &&
             CrossCoreExecTokenFullyReset(
-                state->exec_tokens[kAivWorker]
+                state->exec_tokens[executor]
             ) &&
             ValidateCrossCoreExecTerminalCells<ExecScanTestOps>(
                 state, 5, first_bad_task
             ) &&
             first_bad_task == 5 && NoFatal(*state),
-        kTest, "FinalDrain executes and validates the last task"
+        kTest, "FinalDrain executes fixed mapped last task"
     );
 
-    // 以确定性单线程顺序让 96 个真实 worker 各到达一次；前 95 个不能
-    // 发布 release，最后到达者必须先走 terminal validator。
     std::array<bool, kWorkers> arrived{};
+    std::array<LocalStats, kWorkers> arrival_stats{};
     bool all_arrivals_ok = true;
     for (uint32_t worker_id = 0;
          worker_id < kWorkers; ++worker_id) {
         WorkerState &arrival_worker = PrepareWorker(
-            *state, worker_id,
-            worker_id < kAicWorkers
-                ? CoreRole::Aic : CoreRole::Aiv
+            *state, worker_id, RoleForWorker(worker_id)
         );
-        LocalStats arrival_stats{};
-        arrival_stats.exec_scan_task = 5;
+        InitLocalStats(
+            arrival_stats[worker_id], worker_id,
+            RoleForWorker(worker_id)
+        );
+        // 汇合测试只需要把本核所有未登记的潜在槽交给生产 scanner
+        // 越过；不能再伪造一个全局 task cursor。
+        (void)ProgressCrossCoreExec<ExecScanTestOps>(
+            state, arrival_worker, 5,
+            /*production_closed=*/true,
+            DrainPlace::FinalDrain, arrival_stats[worker_id]
+        );
         bool released = false;
         const bool closure_ok =
             ProgressCrossCoreExecDrainClosure<ExecScanTestOps>(
-                state, arrival_worker, 5, arrival_stats,
+                state, arrival_worker, 5,
+                arrival_stats[worker_id],
                 arrived[worker_id], released
             );
         all_arrivals_ok &= closure_ok && arrived[worker_id] &&
@@ -691,22 +1302,20 @@ void TestFinalDrainClosesLastTask() {
             state->exec_drain.arrived ==
                 static_cast<int64_t>(kWorkers) &&
             state->exec_drain.release == 1 && NoFatal(*state),
-        kTest, "last arrival publishes drain closure"
+        kTest, "last arrival validates fixed-owner terminal cells"
     );
 
-    LocalStats repeat_stats{};
-    repeat_stats.exec_scan_task = 5;
     bool repeat_released = false;
     const bool repeat_ok =
         ProgressCrossCoreExecDrainClosure<ExecScanTestOps>(
-            state, state->workers[0], 5, repeat_stats,
+            state, state->workers[0], 5, arrival_stats[0],
             arrived[0], repeat_released
         );
     Check(
         repeat_ok && repeat_released &&
             state->exec_drain.arrived ==
                 static_cast<int64_t>(kWorkers),
-        kTest, "an arrived worker cannot increment arrival twice"
+        kTest, "one worker cannot increment drain twice"
     );
     std::printf("[PASS] %s\n", kTest);
 }
@@ -714,10 +1323,14 @@ void TestFinalDrainClosesLastTask() {
 }  // namespace
 
 int main() {
-    TestOpenSubmitIsNotScanned();
-    TestAllocEmptyHoleIsSkipped();
-    TestForeignHolesDoNotHideFollowers();
-    TestSelfTransitionalStatesFailClosed();
+    TestPotentialSlotRoundTrip();
+    TestSubmitCloseRegistersOnlyCandidates();
+    TestCloseAndRegistrationRejectHistoryRewrite();
+    TestOnlyTwoCandidatesObserveControl();
+    TestMappedEmptyDelayedPublication();
+    TestMappedBuildingDelayedPublication();
+    TestOtherCandidateSkipsClaimedAndDone();
+    TestInvalidStatesFailClosed();
     TestBusyTokenResumesScanning();
     TestFinalDrainClosesLastTask();
 

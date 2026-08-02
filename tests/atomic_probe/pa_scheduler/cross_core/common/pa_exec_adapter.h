@@ -141,6 +141,62 @@ PA_DEVICE bool ResolvePaExecRoute(
            route.engine_class != ExecEngineClass::Joint;
 }
 
+// S3b 先由 task_id 选出两个固定同角色候选，扫描器无需让 96 个 worker
+// 同时读取同一 exec control。AIV 连续编号按 AIV0/AIV1 交错，因此候选
+// 相隔 2 才会保持 lane 并移动到下一物理 block。
+PA_DEVICE bool FixedPaExecuteCandidates(
+    uint32_t task_id, ExecEngineClass engine_class,
+    uint32_t &primary_owner, uint32_t &secondary_owner
+) {
+    primary_owner = kExecUnboundOwner;
+    secondary_owner = kExecUnboundOwner;
+    if (task_id >= kMaxTasks) {
+        return false;
+    }
+    switch (engine_class) {
+        case ExecEngineClass::Aic:
+            primary_owner = task_id % kAicWorkers;
+            secondary_owner = (primary_owner + 1U) % kAicWorkers;
+            return true;
+        case ExecEngineClass::Aiv:
+            primary_owner = kAicWorkers + task_id % kAivWorkers;
+            secondary_owner = kAicWorkers +
+                ((primary_owner - kAicWorkers + 2U) % kAivWorkers);
+            return true;
+        case ExecEngineClass::None:
+        case ExecEngineClass::Joint:
+            return false;
+    }
+    return false;
+}
+
+// Build winner 仍来自原有完整候选拓扑。若它恰好是 primary，就把执行权
+// 交给 secondary；其余情况交给 primary，因此合法输入始终 build!=exec。
+// 失败时清空输出，调用方不能误用旧 owner。
+PA_DEVICE bool FixedPaExecuteOwner(
+    uint32_t task_id, uint32_t build_owner,
+    ExecEngineClass engine_class, uint32_t &execute_owner
+) {
+    execute_owner = kExecUnboundOwner;
+    const bool aic_owner = build_owner < kAicWorkers;
+    if ((engine_class == ExecEngineClass::Aic && !aic_owner) ||
+        (engine_class == ExecEngineClass::Aiv &&
+         (aic_owner || build_owner >= kWorkers))) {
+        return false;
+    }
+    uint32_t primary_owner = kExecUnboundOwner;
+    uint32_t secondary_owner = kExecUnboundOwner;
+    if (!FixedPaExecuteCandidates(
+            task_id, engine_class,
+            primary_owner, secondary_owner
+        )) {
+        return false;
+    }
+    execute_owner = build_owner == primary_owner
+        ? secondary_owner : primary_owner;
+    return execute_owner != build_owner;
+}
+
 union PaExecTensorAddress {
     const TensorDesc *local_tensor;
     PA_GM const TensorDesc *gm_tensor;

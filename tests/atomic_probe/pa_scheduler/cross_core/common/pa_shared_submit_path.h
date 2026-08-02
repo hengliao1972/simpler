@@ -1005,7 +1005,7 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     );
 
     return CloseSharedCallbackSubmit<Ops, Profile>(
-        state, stats, ticket, task_meta
+        state, stats, ticket, task_meta, kind
     );
 }
 

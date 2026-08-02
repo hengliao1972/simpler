@@ -33,7 +33,7 @@ using namespace pa_scheduler;
 using namespace pa_scheduler::cross_core;
 
 constexpr uint32_t kBuildOwnerAic = 3;
-constexpr uint32_t kBuildOwnerAiv = 40;
+constexpr uint32_t kBuildOwnerAiv = 41;
 
 int g_failures = 0;
 
@@ -46,6 +46,169 @@ void Check(bool condition, TaskKind kind, const char *message) {
         static_cast<uint32_t>(kind), message
     );
     ++g_failures;
+}
+
+void CheckMapping(bool condition, const char *message) {
+    if (condition) {
+        return;
+    }
+    std::fprintf(
+        stderr, "[FAIL] PA fixed execute owner: %s\n", message
+    );
+    ++g_failures;
+}
+
+uint32_t WorkerLane(uint32_t owner) {
+    return owner < kAicWorkers
+        ? 0U : 1U + (owner - kAicWorkers) % 2U;
+}
+
+uint32_t WorkerBlock(uint32_t owner) {
+    return owner < kAicWorkers
+        ? owner : (owner - kAicWorkers) / 2U;
+}
+
+uint32_t WorkerSubBlock(uint32_t owner) {
+    return WorkerLane(owner) == 2U ? 1U : 0U;
+}
+
+bool MatchesFixedExecuteOwner(
+    uint32_t task_id, uint32_t build_owner,
+    ExecEngineClass engine,
+    uint32_t execute_owner
+) {
+    uint32_t mapped_owner = kExecUnboundOwner;
+    return FixedPaExecuteOwner(
+               task_id, build_owner, engine, mapped_owner
+           ) && mapped_owner == execute_owner;
+}
+
+void ConfigureWorkerIdentity(WorkerState &worker, uint32_t owner) {
+    worker.core_idx = static_cast<int32_t>(owner);
+    worker.role = owner < kAicWorkers
+        ? CoreRole::Aic : CoreRole::Aiv;
+    worker.block_id = static_cast<int32_t>(WorkerBlock(owner));
+    worker.lane = static_cast<int32_t>(WorkerLane(owner));
+    worker.sub_block_id = static_cast<int32_t>(WorkerSubBlock(owner));
+}
+
+bool TestFixedExecuteOwnerMapping() {
+    constexpr uint32_t kRoutingPeriod = kAivWorkers;
+    std::array<bool, kWorkers> candidate_destinations{};
+    std::array<bool, kWorkers> actual_destinations{};
+    bool exact = true;
+    for (ExecEngineClass engine : {
+             ExecEngineClass::Aic, ExecEngineClass::Aiv}) {
+        const uint32_t role_begin = engine == ExecEngineClass::Aic
+            ? 0U : kAicWorkers;
+        const uint32_t role_end = engine == ExecEngineClass::Aic
+            ? kAicWorkers : kWorkers;
+        for (uint32_t task_id = 0;
+             task_id < kRoutingPeriod; ++task_id) {
+            uint32_t primary = kExecUnboundOwner;
+            uint32_t secondary = kExecUnboundOwner;
+            const bool candidates_ok = FixedPaExecuteCandidates(
+                task_id, engine, primary, secondary
+            );
+            exact &= candidates_ok &&
+                primary >= role_begin && primary < role_end &&
+                secondary >= role_begin && secondary < role_end &&
+                primary != secondary &&
+                WorkerBlock(primary) != WorkerBlock(secondary);
+            if (engine == ExecEngineClass::Aiv) {
+                exact &= WorkerLane(primary) == WorkerLane(secondary) &&
+                    WorkerSubBlock(primary) ==
+                        WorkerSubBlock(secondary);
+            }
+            if (candidates_ok && primary < kWorkers &&
+                secondary < kWorkers) {
+                candidate_destinations[primary] = true;
+                candidate_destinations[secondary] = true;
+            }
+
+            for (uint32_t build_owner = role_begin;
+                 build_owner < role_end; ++build_owner) {
+                uint32_t execute_owner = kExecUnboundOwner;
+                const bool resolved = FixedPaExecuteOwner(
+                    task_id, build_owner, engine, execute_owner
+                );
+                const uint32_t expected = build_owner == primary
+                    ? secondary : primary;
+                const uint32_t wrong_owner = execute_owner == primary
+                    ? secondary : primary;
+                exact &= resolved && execute_owner == expected &&
+                    execute_owner >= role_begin &&
+                    execute_owner < role_end &&
+                    execute_owner != build_owner &&
+                    (execute_owner == primary ||
+                     execute_owner == secondary) &&
+                    MatchesFixedExecuteOwner(
+                        task_id, build_owner, engine, execute_owner
+                    ) &&
+                    !MatchesFixedExecuteOwner(
+                        task_id, build_owner, engine, build_owner
+                    ) &&
+                    !MatchesFixedExecuteOwner(
+                        task_id, build_owner, engine, wrong_owner
+                    );
+                if (resolved && execute_owner < kWorkers) {
+                    actual_destinations[execute_owner] = true;
+                }
+            }
+        }
+    }
+    for (uint32_t owner = 0; owner < kWorkers; ++owner) {
+        exact &= candidate_destinations[owner] &&
+            actual_destinations[owner];
+    }
+
+    uint32_t primary = 0;
+    uint32_t secondary = 0;
+    exact &= !FixedPaExecuteCandidates(
+                 7, ExecEngineClass::None, primary, secondary
+             ) &&
+             primary == kExecUnboundOwner &&
+             secondary == kExecUnboundOwner;
+    exact &= !FixedPaExecuteCandidates(
+                 7, ExecEngineClass::Joint, primary, secondary
+             ) &&
+             primary == kExecUnboundOwner &&
+             secondary == kExecUnboundOwner;
+    exact &= !FixedPaExecuteCandidates(
+                 kMaxTasks, ExecEngineClass::Aic,
+                 primary, secondary
+             ) &&
+             primary == kExecUnboundOwner &&
+             secondary == kExecUnboundOwner;
+
+    uint32_t rejected_owner = 0;
+    exact &= !FixedPaExecuteOwner(
+                 7, kAicWorkers, ExecEngineClass::Aic,
+                 rejected_owner
+             ) && rejected_owner == kExecUnboundOwner;
+    exact &= !FixedPaExecuteOwner(
+                 7, kAicWorkers - 1U, ExecEngineClass::Aiv,
+                 rejected_owner
+             ) && rejected_owner == kExecUnboundOwner;
+    exact &= !FixedPaExecuteOwner(
+                 7, kWorkers, ExecEngineClass::Aic,
+                 rejected_owner
+             ) && rejected_owner == kExecUnboundOwner;
+    exact &= !FixedPaExecuteOwner(
+                 7, kWorkers, ExecEngineClass::Aiv,
+                 rejected_owner
+             ) && rejected_owner == kExecUnboundOwner;
+    exact &= !FixedPaExecuteOwner(
+                 7, 0, ExecEngineClass::None, rejected_owner
+             ) && rejected_owner == kExecUnboundOwner;
+    exact &= !FixedPaExecuteOwner(
+                 7, 0, ExecEngineClass::Joint, rejected_owner
+             ) && rejected_owner == kExecUnboundOwner;
+    CheckMapping(
+        exact,
+        "two candidates and selected owners cover both role populations"
+    );
+    return exact;
 }
 
 // 该 Ops 只承担 CPU 上的协议顺序与精确搬运门槛，不模拟 A5 DCache。
@@ -778,20 +941,28 @@ bool FinalValidatorRejectsMalformedShape(
 }
 
 bool RunCase(SchedulerState &state, const CaseShape &shape) {
-    const uint32_t owner = shape.engine == ExecEngineClass::Aic
+    const uint32_t build_owner = shape.engine == ExecEngineClass::Aic
         ? kBuildOwnerAic : kBuildOwnerAiv;
-    WorkerState &worker = state.workers[owner];
-    worker.core_idx = static_cast<int32_t>(owner);
-    worker.role = shape.engine == ExecEngineClass::Aic
-        ? CoreRole::Aic : CoreRole::Aiv;
-    worker.sub_block_id = static_cast<int32_t>(shape.task_id & 1U);
+    uint32_t execute_owner = kExecUnboundOwner;
+    const bool mapped = FixedPaExecuteOwner(
+        shape.task_id, build_owner, shape.engine, execute_owner
+    );
+    Check(mapped, shape.kind, "fixed different-core owner mapping");
+    if (!mapped) {
+        return false;
+    }
+    WorkerState &builder = state.workers[build_owner];
+    WorkerState &executor = state.workers[execute_owner];
+    ConfigureWorkerIdentity(builder, build_owner);
+    ConfigureWorkerIdentity(executor, execute_owner);
     const uint64_t completion_vend =
         UINT64_C(0x100000) +
         static_cast<uint64_t>(shape.task_id) * kOutputAlignment;
-    worker.heap_next = completion_vend;
+    builder.heap_next = completion_vend;
+    executor.heap_next = completion_vend + kOutputAlignment;
 
     CaseFixture fixture{};
-    BuildCaseArgs(shape, state, worker, fixture);
+    BuildCaseArgs(shape, state, builder, fixture);
     PaExecShape contract{};
     Check(
         ResolvePaExecShape(shape.kind, contract) &&
@@ -815,7 +986,7 @@ bool RunCase(SchedulerState &state, const CaseShape &shape) {
     PaExecPayloadSource source{};
     const bool prepared =
         PreparePaExecPublicationAfterFanin<AdapterTestOps>(
-            state, worker, fixture.args, fixture.context,
+            state, builder, fixture.args, fixture.context,
             shape.task_id, shape.kind,
             static_cast<int32_t>(shape.function_id),
             /*function_address=*/0, spec, source
@@ -830,21 +1001,21 @@ bool RunCase(SchedulerState &state, const CaseShape &shape) {
              ShapeField::Fanin}) {
         Check(
             MakeRejectsMalformedShape(
-                shape, worker, fixture.args, fixture.context, field
+                shape, builder, fixture.args, fixture.context, field
             ),
             shape.kind,
             MakeRejectMessage(field)
         );
         Check(
             ClaimBindingRejectsMalformedShape(
-                shape, worker, spec, source, field
+                shape, builder, spec, source, field
             ),
             shape.kind,
             BindRejectMessage(field)
         );
         Check(
             FinalValidatorRejectsMalformedShape(
-                shape, worker, spec, source, field
+                shape, builder, spec, source, field
             ),
             shape.kind,
             FinalRejectMessage(field)
@@ -863,7 +1034,7 @@ bool RunCase(SchedulerState &state, const CaseShape &shape) {
 
     const ExecBuildResult build =
         BuildAndPublishExecPayload<AdapterTestOps>(
-            cell, owner, spec, source, fatal
+            cell, build_owner, spec, source, fatal
         );
     Check(
         build == ExecBuildResult::Published &&
@@ -880,7 +1051,7 @@ bool RunCase(SchedulerState &state, const CaseShape &shape) {
     Check(
         built.valid && built.phase == ExecPhase::Built &&
             built.task_id == shape.task_id &&
-            built.build_owner == owner &&
+            built.build_owner == build_owner &&
             built.execute_owner == kExecUnboundOwner &&
             built.engine_class == shape.engine &&
             built.payload_lines == shape.payload_lines,
@@ -899,7 +1070,7 @@ bool RunCase(SchedulerState &state, const CaseShape &shape) {
     std::array<uint64_t, kExecMaxPayloadWords> snapshot{};
     SnapshotPayload(cell.payload, snapshot);
     PolluteBuilderSources(
-        state, worker, shape, fixture, source
+        state, builder, shape, fixture, source
     );
     Check(
         PayloadEqualsSnapshot(cell.payload, snapshot),
@@ -909,12 +1080,12 @@ bool RunCase(SchedulerState &state, const CaseShape &shape) {
 
     const ExecClaimResult claim =
         ClaimAndBindExecPayload<AdapterTestOps>(
-            cell, shape.task_id, owner, shape.engine,
+            cell, shape.task_id, execute_owner, shape.engine,
             token, fatal
         );
     const bool bound =
         claim == ExecClaimResult::Claimed &&
-        BindPaExecutionTokenDispatchAfterClaim(token, worker);
+        BindPaExecutionTokenDispatchAfterClaim(token, executor);
     Check(bound, shape.kind, "Claim and PA dispatch binding");
     if (!bound) {
         return false;
@@ -925,21 +1096,22 @@ bool RunCase(SchedulerState &state, const CaseShape &shape) {
     Check(
         claimed.valid && claimed.phase == ExecPhase::Claimed &&
             claimed.task_id == shape.task_id &&
-            claimed.build_owner == owner &&
-            claimed.execute_owner == owner &&
+            claimed.build_owner == build_owner &&
+            claimed.execute_owner == execute_owner &&
+            claimed.build_owner != claimed.execute_owner &&
             claimed.engine_class == shape.engine,
-        shape.kind, "CLAIMED retains the S3a owner relation"
+        shape.kind, "CLAIMED retains fixed different-core owners"
     );
     Check(
         TokenDispatchMatches(
-            token, shape, fixture, worker, completion_vend
+            token, shape, fixture, executor, completion_vend
         ),
         shape.kind,
         "token payload, self pointers and PA contexts"
     );
     token.control.phase = ExecTokenPhase::EngineInflight;
     Check(
-        ValidatePaExecutionTokenDispatch(token, worker, shape.kind),
+        ValidatePaExecutionTokenDispatch(token, executor, shape.kind),
         shape.kind, "valid exact-shape dispatch passes final validator"
     );
     token.control.phase = ExecTokenPhase::WaitingFanin;
@@ -966,7 +1138,7 @@ int main() {
         return 1;
     }
 
-    bool all_cases_ran = true;
+    bool all_cases_ran = TestFixedExecuteOwnerMapping();
     for (const CaseShape &shape : kCases) {
         all_cases_ran &= RunCase(*state, shape);
     }
