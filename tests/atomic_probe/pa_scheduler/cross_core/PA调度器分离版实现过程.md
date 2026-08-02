@@ -1283,3 +1283,20 @@ ccec/merged_swimlane.json
 虽然协议最终仍能闭合，但现有数据不足以用更宽的时序状态空间交换最多
 1280 次 control load。生产代码和临时测试断言已经撤回；下一阶段转向能改变
 Claim 返回型原子竞争规模的结构性候选。
+
+## 2026-08-02：S6.9 先验证 one-shot Claim 预过滤
+
+真实 Claim 暂未改动。独立 CCEC AIV 微基准先复刻当前 local tournament
+的关键拓扑：12 个候选竞争一条 per-task、初值为 `-1`、只发布一次 task id
+且不复用的 atomic-only 状态。一个轮换首选候选直接 CAS，其他候选用
+`ld_dev` 做一次保守预过滤，读到旧值时仍回退 CAS。
+
+100 NOP 的版本把每轮 CAS 从 `12.0` 降至 `4.4`，loop/round 中位从
+`2309.3` 降至 `1392.3` tick，分别减少约 `63.3%` 和 `39.7%`。首选候选
+延后 1000 NOP 的对照中首选胜率为 0，但其他候选仍恰好选出一个 winner，
+证明它不是静态 owner。所有变体 semantic failure 为 0。
+
+该机制的正确性依据是 stale-low 只会增加 CAS，不会丢任务；因此只能用于
+一次性 per-task node。下一阶段接入 local Claim 时保持 root CAS、96 核
+资格和严格 TensorMap 插入不变，先看真实 B256 能否把微基准收益转化为
+perf-clock 收益。

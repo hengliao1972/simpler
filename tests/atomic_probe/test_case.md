@@ -593,6 +593,32 @@ token observe；7-reader 每种模式都精确完成 `166,656 = 3 × 7 × 256 ×
   但不同地址不进入同地址严格串行顺序，本探针也不把更上游资源臆断为某个 cache、bank 或互连结构。
 - `atomicAdd(0)` 与 `atomicMax(INT64_MIN)` 的双峰和并发方向一致，没有形成 opcode 级差异。
 
+## 单次 per-task CAS 的 `ld_dev` 预过滤
+
+`ccec/atomic_max_topology.cpp` 增加 `prefilter` 模式，针对 shared scheduler
+当前“一条 per-task 状态只从 `-1` 单调发布为本 task id、生命周期内不复用”
+的精确前提，比较 12 个候选直接同地址 CAS 与以下两段式路径：
+
+1. 每轮轮换一个首选候选，首选候选直接 CAS；
+2. 其余候选短暂执行本地 NOP 后用 `ld_dev` 读取同一 atomic-only word；
+3. 只有仍读到 `-1` 才回退 CAS，读到本 task id 则跳过；
+4. winner 始终只由 CAS 返回值裁定，`ld_dev` 不承担互斥或发布语义。
+
+该条件下，`ld_dev` 的 stale-low 只会多发一次 CAS，不会漏掉 winner；测试
+不把该结论外推到会复用或回退 token 的全局 cursor。2026-08-02 在 A5 AIV、
+每个变体 256 轮且 host 内部 5 次重复的结果为：
+
+| N | 模式 | 非首选/首选 NOP | 每轮 CAS | 每轮跳过 | loop/round 中位 tick | 结果 |
+|---:|---|---:|---:|---:|---:|---|
+| 12 | flat CAS | 0/0 | 12.0 | 0.0 | 2309.3 | 恰好一个 winner |
+| 12 | prefilter | 100/0 | 4.4 | 7.6 | 1392.3 | 恰好一个 winner |
+| 12 | 首选晚到接管 | 0/1000 | 12.0 | 0.0 | 2704.5 | 首选胜率 0，仍恰好一个 winner |
+
+100 NOP 版本把返回型 CAS 数量减少约 `63.3%`，整轮中位 tick 减少约
+`39.7%`。首选晚到对照证明其他 11 个候选仍能接管，并未改变“所有候选
+都有获胜资格”的合同。该结果只证明局部单次选举值得进入 PA 调度器 A/B；
+真实 Submit 是否受益仍必须由独立 perf-clock 和完整业务终态判断。
+
 用于当前 scalar 泳道的直观归因口径仍然是：
 
 ```text

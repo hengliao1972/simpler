@@ -34,6 +34,7 @@ namespace {
 constexpr uint32_t kModeFlat = 0;
 constexpr uint32_t kModeGrouped = 1;
 constexpr uint32_t kModeTwoLevel = 2;
+constexpr uint32_t kModeBypassPrefilter = 3;
 constexpr uint32_t kOpFetchMax = 0;
 constexpr uint32_t kOpCompareExchange = 1;
 constexpr uint32_t kOpExchange = 2;
@@ -51,7 +52,10 @@ struct alignas(64) ProbeResult {
     uint32_t root_wins;
     uint32_t participant;
     uint32_t completed_rounds;
-    uint8_t padding[16];
+    uint32_t atomic_attempts;
+    uint32_t bypass_skips;
+    uint32_t preferred_wins;
+    uint8_t padding[4];
 };
 static_assert(sizeof(ProbeResult) == 64, "one result must occupy one cache line");
 
@@ -68,7 +72,9 @@ struct alignas(64) ProbeConfig {
     uint32_t stride_bytes;
     uint32_t rounds;
     uint32_t operation;
-    uint8_t padding[40];
+    uint32_t prefilter_nops;
+    uint32_t preferred_nops;
+    uint8_t padding[32];
 };
 static_assert(sizeof(ProbeConfig) == 64, "config must occupy one cache line");
 
@@ -78,6 +84,8 @@ struct Variant {
     uint32_t groups;
     uint32_t stride;
     uint32_t operation;
+    uint32_t prefilter_nops = 0;
+    uint32_t preferred_nops = 0;
 };
 
 struct Sample {
@@ -90,6 +98,9 @@ struct Sample {
     uint64_t root_wins;
     uint64_t expected_local;
     uint64_t expected_root;
+    uint64_t atomic_attempts;
+    uint64_t bypass_skips;
+    uint64_t preferred_wins;
 };
 
 void Check(aclError error, const char *message) {
@@ -112,6 +123,7 @@ uint64_t Median(std::vector<uint64_t> values) {
 const char *ModeName(uint32_t mode) {
     if (mode == kModeFlat) return "flat";
     if (mode == kModeGrouped) return "grouped";
+    if (mode == kModeBypassPrefilter) return "prefilter";
     return "two-level";
 }
 
@@ -127,7 +139,9 @@ Sample RunOnce(
     std::vector<uint8_t> storage(kStorageBytes, 0);
     std::vector<ProbeResult> host_results(variant.participants);
     const ProbeConfig config{
-        kConfigMagic, variant.mode, variant.groups, variant.stride, kRounds, variant.operation, {},
+        kConfigMagic, variant.mode,      variant.groups,         variant.stride,
+        kRounds,      variant.operation, variant.prefilter_nops, variant.preferred_nops,
+        {},
     };
     std::memcpy(storage.data(), &config, sizeof(config));
     Check(
@@ -162,6 +176,9 @@ Sample RunOnce(
     uint64_t local_wins = 0;
     uint64_t root_wins = 0;
     uint64_t checksum = 0;
+    uint64_t atomic_attempts = 0;
+    uint64_t bypass_skips = 0;
+    uint64_t preferred_wins = 0;
     bool per_core_valid = true;
     for (uint32_t participant = 0; participant < variant.participants; ++participant) {
         const ProbeResult &core = host_results[participant];
@@ -171,15 +188,28 @@ Sample RunOnce(
         local_wins += core.local_wins;
         root_wins += core.root_wins;
         checksum ^= core.checksum + participant;
+        atomic_attempts += core.atomic_attempts;
+        bypass_skips += core.bypass_skips;
+        preferred_wins += core.preferred_wins;
         per_core_valid &= core.participant == participant;
         per_core_valid &= core.completed_rounds == kRounds;
     }
 
-    const uint64_t expected_local = variant.mode == kModeFlat ? 0ULL : static_cast<uint64_t>(variant.groups) * kRounds;
+    const uint64_t expected_local = variant.mode == kModeGrouped || variant.mode == kModeTwoLevel ?
+                                        static_cast<uint64_t>(variant.groups) * kRounds :
+                                        0ULL;
     const uint64_t expected_root = variant.mode == kModeGrouped ? 0ULL : kRounds;
     // checksum 只用于强制消费 atomic 返回值；不同核异或后允许自然抵消为
     // 零，不能把聚合 checksum 非零误当成协议正确性条件。
-    const bool exact = per_core_valid && local_wins == expected_local && root_wins == expected_root;
+    const uint64_t total_candidates = static_cast<uint64_t>(variant.participants) * kRounds;
+    const bool attempt_shape = variant.mode == kModeBypassPrefilter ?
+                                   atomic_attempts >= kRounds && atomic_attempts <= total_candidates &&
+                                       atomic_attempts + bypass_skips == total_candidates :
+                                   bypass_skips == 0;
+    const bool fallback_exercised =
+        variant.mode != kModeBypassPrefilter || variant.preferred_nops == 0U || preferred_wins < root_wins;
+    const bool exact = per_core_valid && local_wins == expected_local && root_wins == expected_root && attempt_shape &&
+                       fallback_exercised;
     return Sample{
         static_cast<double>(candidate_ticks) / (static_cast<double>(variant.participants) * kRounds),
         static_cast<double>(loop_max_ticks) / kRounds,
@@ -190,6 +220,9 @@ Sample RunOnce(
         root_wins,
         expected_local,
         expected_root,
+        atomic_attempts,
+        bypass_skips,
+        preferred_wins,
     };
 }
 
@@ -200,6 +233,9 @@ void RunVariant(
     std::vector<double> candidate_means;
     std::vector<double> loop_per_round;
     std::vector<uint64_t> candidate_maxima;
+    std::vector<double> attempts_per_round;
+    std::vector<double> skips_per_round;
+    std::vector<double> preferred_wins_per_round;
     bool all_exact = true;
     Sample first_failure{};
     bool has_failure = false;
@@ -208,6 +244,9 @@ void RunVariant(
         candidate_means.push_back(sample.candidate_mean_ticks);
         loop_per_round.push_back(sample.loop_ticks_per_round);
         candidate_maxima.push_back(sample.candidate_max_ticks);
+        attempts_per_round.push_back(static_cast<double>(sample.atomic_attempts) / kRounds);
+        skips_per_round.push_back(static_cast<double>(sample.bypass_skips) / kRounds);
+        preferred_wins_per_round.push_back(static_cast<double>(sample.preferred_wins) / kRounds);
         all_exact &= sample.exact;
         if (!sample.exact && !has_failure) {
             first_failure = sample;
@@ -217,27 +256,34 @@ void RunVariant(
     if (has_failure) {
         std::fprintf(
             stderr,
-            "[DETAIL] N=%u op=%s mode=%s G=%u stride=%u "
-            "per_core_valid=%u local=%llu/%llu root=%llu/%llu\n",
+            "[DETAIL] N=%u op=%s mode=%s G=%u stride=%u delay=%u/%u "
+            "per_core_valid=%u local=%llu/%llu root=%llu/%llu "
+            "attempts=%llu skips=%llu preferred_wins=%llu\n",
             variant.participants, OperationName(variant.operation), ModeName(variant.mode), variant.groups,
-            variant.stride, first_failure.per_core_valid ? 1U : 0U,
+            variant.stride, variant.prefilter_nops, variant.preferred_nops, first_failure.per_core_valid ? 1U : 0U,
             static_cast<unsigned long long>(first_failure.local_wins),
             static_cast<unsigned long long>(first_failure.expected_local),
             static_cast<unsigned long long>(first_failure.root_wins),
-            static_cast<unsigned long long>(first_failure.expected_root)
+            static_cast<unsigned long long>(first_failure.expected_root),
+            static_cast<unsigned long long>(first_failure.atomic_attempts),
+            static_cast<unsigned long long>(first_failure.bypass_skips),
+            static_cast<unsigned long long>(first_failure.preferred_wins)
         );
     }
     char assertion[192];
     std::snprintf(
-        assertion, sizeof(assertion), "atomic topology exact N=%u op=%s mode=%s G=%u stride=%u", variant.participants,
-        OperationName(variant.operation), ModeName(variant.mode), variant.groups, variant.stride
+        assertion, sizeof(assertion), "atomic topology exact N=%u op=%s mode=%s G=%u stride=%u delay=%u/%u",
+        variant.participants, OperationName(variant.operation), ModeName(variant.mode), variant.groups, variant.stride,
+        variant.prefilter_nops, variant.preferred_nops
     );
     result.Expect(all_exact, assertion);
 
     std::printf(
-        "%2u %-8s %-9s %2u %4u %18.1f %19.1f %19llu\n", variant.participants, OperationName(variant.operation),
-        ModeName(variant.mode), variant.groups, variant.stride, Median(candidate_means), Median(loop_per_round),
-        static_cast<unsigned long long>(Median(candidate_maxima))
+        "%2u %-8s %-9s %2u %4u %5u/%-5u %18.1f %19.1f %19llu %13.1f %10.1f %13.1f\n", variant.participants,
+        OperationName(variant.operation), ModeName(variant.mode), variant.groups, variant.stride,
+        variant.prefilter_nops, variant.preferred_nops, Median(candidate_means), Median(loop_per_round),
+        static_cast<unsigned long long>(Median(candidate_maxima)), Median(attempts_per_round), Median(skips_per_round),
+        Median(preferred_wins_per_round)
     );
 }
 
@@ -283,11 +329,34 @@ int main(int argc, char **argv) {
     std::printf("=== A5 AIV atomicMax address-topology probe ===\n");
     std::printf("rounds=%u repeats=%u sys-counter values are reported as raw ticks\n", kRounds, kRepeats);
     std::printf(
-        "%2s %-8s %-9s %2s %4s %18s %19s %19s\n", "N", "op", "mode", "G", "gap", "candidate median",
-        "loop/round median", "candidate max median"
+        "%2s %-8s %-9s %2s %4s %-11s %18s %19s %19s %13s %10s %13s\n", "N", "op", "mode", "G", "gap", "delay n/p",
+        "candidate median", "loop/round median", "candidate max median", "atomic/round", "skip/round", "preferred/round"
     );
 
     atomic_probe::Result result;
+    RunVariant(
+        function, stream, storage_device, results_device, Variant{12, kModeFlat, 1, 512, kOpCompareExchange}, result
+    );
+    const uint32_t prefilter_delays[] = {0, 10, 50, 100};
+    for (uint32_t delay : prefilter_delays) {
+        RunVariant(
+            function, stream, storage_device, results_device,
+            Variant{
+                12,
+                kModeBypassPrefilter,
+                1,
+                512,
+                kOpCompareExchange,
+                delay,
+            },
+            result
+        );
+    }
+    // 首选核人为晚到时，其他候选必须仍能通过 CAS 回退接管。
+    RunVariant(
+        function, stream, storage_device, results_device,
+        Variant{12, kModeBypassPrefilter, 1, 512, kOpCompareExchange, 0, 1000}, result
+    );
     const uint32_t populations[] = {24, 32, 64};
     for (uint32_t population : populations) {
         RunVariant(

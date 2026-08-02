@@ -27,6 +27,7 @@ namespace {
 constexpr uint32_t kModeFlat = 0;
 constexpr uint32_t kModeGrouped = 1;
 constexpr uint32_t kModeTwoLevel = 2;
+constexpr uint32_t kModeBypassPrefilter = 3;
 constexpr uint32_t kOpFetchMax = 0;
 constexpr uint32_t kOpCompareExchange = 1;
 constexpr uint32_t kOpExchange = 2;
@@ -41,7 +42,9 @@ struct alignas(64) ProbeConfig {
     uint32_t stride_bytes;
     uint32_t rounds;
     uint32_t operation;
-    uint8_t padding[40];
+    uint32_t prefilter_nops;
+    uint32_t preferred_nops;
+    uint8_t padding[32];
 };
 static_assert(sizeof(ProbeConfig) == 64, "config must occupy one cache line");
 
@@ -54,7 +57,10 @@ struct alignas(64) ProbeResult {
     uint32_t root_wins;
     uint32_t participant;
     uint32_t completed_rounds;
-    uint8_t padding[16];
+    uint32_t atomic_attempts;
+    uint32_t bypass_skips;
+    uint32_t preferred_wins;
+    uint8_t padding[4];
 };
 static_assert(sizeof(ProbeResult) == 64, "one result must occupy one cache line");
 
@@ -75,6 +81,26 @@ __aicore__ inline int64_t Elect(__gm__ int64_t *address, int64_t token, uint32_t
     return token;
 }
 
+template <uint32_t Count>
+__aicore__ inline void EmitNops() {
+#pragma unroll
+    for (uint32_t index = 0; index < Count; ++index) {
+        asm volatile("nop");
+    }
+}
+
+__aicore__ inline void DelayByNops(uint32_t count) {
+    if (count == 10U) {
+        EmitNops<10>();
+    } else if (count == 50U) {
+        EmitNops<50>();
+    } else if (count == 100U) {
+        EmitNops<100>();
+    } else if (count == 1000U) {
+        EmitNops<1000>();
+    }
+}
+
 }  // namespace
 
 extern "C" __global__ __aicore__ void
@@ -89,6 +115,8 @@ KERNEL_ENTRY(atomic_max_topology)(__gm__ uint8_t *storage, __gm__ ProbeResult *r
     const uint32_t stride_bytes = ld_dev_b32(&config_words[3]);
     const uint32_t rounds = ld_dev_b32(&config_words[4]);
     const uint32_t operation = ld_dev_b32(&config_words[5]);
+    const uint32_t prefilter_nops = ld_dev_b32(&config_words[6]);
+    const uint32_t preferred_nops = ld_dev_b32(&config_words[7]);
     const uint32_t participant = static_cast<uint32_t>(get_block_idx());
     const uint32_t participants = static_cast<uint32_t>(get_block_num());
     __gm__ ProbeResult *result = &results[participant];
@@ -98,12 +126,19 @@ KERNEL_ENTRY(atomic_max_topology)(__gm__ uint8_t *storage, __gm__ ProbeResult *r
     uint64_t checksum = 0;
     uint32_t local_wins = 0;
     uint32_t root_wins = 0;
+    uint32_t atomic_attempts = 0;
+    uint32_t bypass_skips = 0;
+    uint32_t preferred_wins = 0;
 
     // 参数错误也必须让所有核走相同控制流，避免部分核进入 SyncAll 后挂住。
-    const bool valid = magic == kConfigMagic && participants != 0 && participants <= 64 && rounds != 0 &&
-                       stride_bytes >= 64 && (stride_bytes & 63U) == 0 && operation <= kOpExchange &&
-                       ((mode == kModeFlat && group_count == 1) || ((mode == kModeGrouped || mode == kModeTwoLevel) &&
-                                                                    group_count != 0 && group_count <= participants));
+    const bool valid =
+        magic == kConfigMagic && participants != 0 && participants <= 64 && rounds != 0 && stride_bytes >= 64 &&
+        (stride_bytes & 63U) == 0 && operation <= kOpExchange &&
+        ((mode == kModeFlat && group_count == 1) ||
+         ((mode == kModeGrouped || mode == kModeTwoLevel) && group_count != 0 && group_count <= participants) ||
+         (mode == kModeBypassPrefilter && group_count == 1 && operation == kOpCompareExchange &&
+          (prefilter_nops == 0U || prefilter_nops == 10U || prefilter_nops == 50U || prefilter_nops == 100U) &&
+          (preferred_nops == 0U || preferred_nops == 1000U)));
 
     ccec_sync_all();
     const uint64_t loop_begin = static_cast<uint64_t>(get_sys_cnt());
@@ -117,18 +152,46 @@ KERNEL_ENTRY(atomic_max_topology)(__gm__ uint8_t *storage, __gm__ ProbeResult *r
             const uint64_t begin = static_cast<uint64_t>(get_sys_cnt());
 
             if (mode == kModeFlat) {
+                ++atomic_attempts;
                 const int64_t old = Elect(root, token, operation);
                 const bool won = old < token;
                 root_wins += won ? 1U : 0U;
                 checksum += static_cast<uint64_t>(old + token + (won ? 1 : 0));
+            } else if (mode == kModeBypassPrefilter) {
+                // 每轮轮换一个首选候选。首选直接 CAS；其余候选只在短暂
+                // 本地延后后仍观察到旧 token 时才回退 CAS。ld_dev 读到
+                // 旧值只会增加 CAS，最终 owner 仍完全由 CAS 返回值裁定。
+                const uint32_t preferred = round % participants;
+                bool should_attempt = participant == preferred;
+                int64_t observed = token - 1;
+                if (should_attempt) {
+                    DelayByNops(preferred_nops);
+                } else {
+                    DelayByNops(prefilter_nops);
+                    observed = static_cast<int64_t>(ld_dev_b64(reinterpret_cast<__gm__ uint64_t *>(root)));
+                    should_attempt = observed < token;
+                }
+                if (should_attempt) {
+                    ++atomic_attempts;
+                    const int64_t old = atomicCAS(root, token - 1, token);
+                    const bool won = old == token - 1;
+                    root_wins += won ? 1U : 0U;
+                    preferred_wins += won && participant == preferred ? 1U : 0U;
+                    checksum += static_cast<uint64_t>(old + token + (won ? 11 : 0));
+                } else {
+                    ++bypass_skips;
+                    checksum += static_cast<uint64_t>(observed + token + 13);
+                }
             } else {
                 __gm__ int64_t *local = LineAt(storage, group, stride_bytes);
+                ++atomic_attempts;
                 const int64_t local_old = Elect(local, token, operation);
                 const bool local_won = local_old < token;
                 local_wins += local_won ? 1U : 0U;
                 checksum += static_cast<uint64_t>(local_old + token + (local_won ? 3 : 0));
 
                 if (mode == kModeTwoLevel && local_won) {
+                    ++atomic_attempts;
                     const int64_t root_old = Elect(root, token, operation);
                     const bool root_won = root_old < token;
                     root_wins += root_won ? 1U : 0U;
@@ -154,6 +217,9 @@ KERNEL_ENTRY(atomic_max_topology)(__gm__ uint8_t *storage, __gm__ ProbeResult *r
     result->root_wins = root_wins;
     result->participant = participant;
     result->completed_rounds = valid ? rounds : 0;
+    result->atomic_attempts = atomic_attempts;
+    result->bypass_skips = bypass_skips;
+    result->preferred_wins = preferred_wins;
     dcci(result, SINGLE_CACHE_LINE, CACHELINE_OUT);
     dsb(DSB_ALL);
 }

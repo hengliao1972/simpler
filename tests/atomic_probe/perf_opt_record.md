@@ -5994,3 +5994,29 @@ median = 3.648742 ms
 一次 scanner 调用即可观察终态的 CPU 场景需要额外推进一次。它不是正确性
 缺陷，但为最多 1280 次共享读取引入了更宽的时序状态空间，收益证据不足。
 代码与定向断言已完整撤回，只保留本节结论。
+
+### 15.31 S6.9 基础取证：one-shot CAS 的旁路读取预过滤
+
+在改动真实 Claim 前，先扩展独立 A5 AIV 地址拓扑探针。目标对象与当前
+per-task local tournament node 一致：每个 task 独占地址，初值 `-1`，只做
+一次 `-1 -> task_id` CAS，之后不复用。每轮轮换一个首选候选直接 CAS；
+其余 11 个候选短暂本地延后，再用 `ld_dev` 读取 atomic-only word，只有仍
+看到 `-1` 才回退 CAS。`ld_dev` 不决定 winner，也不替代 CAS。
+
+受控结果如下：
+
+```text
+N12 flat CAS:             12.0 CAS/round, 2309.3 tick/round
+N12 prefilter nop100:      4.4 CAS/round, 1392.3 tick/round
+N12 preferred nop1000:    12.0 CAS/round, 2704.5 tick/round,
+                           preferred wins 0, exact winner PASS
+```
+
+预过滤把返回型 CAS 数量减少约 `63.3%`，整轮中位耗时减少约 `39.7%`。
+首选核晚到时其他候选能立即回退 CAS 并接管，保留了全部候选的活性。这个
+结论严格依赖 per-task one-shot、单调状态和 12 核局部 fanout；不能用于会
+复用 token 的全局 cursor，也不能扩成 96 核持续 `ld_dev` 轮询。
+
+该阶段只建立硬件机制与边界，不宣称 PA Submit 已获益。下一阶段才把它接入
+local tournament，并用 B256 perf-clock、完整终态和泳道 atomic 数量决定
+保留或撤回。最终验收线仍是 B256 perf-clock 稳定不高于 `1.0 ms`。

@@ -380,6 +380,23 @@ PTO_ISA_ROOT="$PWD/build/pto-isa" \
 - `ccec/taskcell_atomic_dcci_host.cpp`：100 轮初始化、全字段判定和汇总；
 - `ccec/taskcell_atomic_dcci_shared.h`：64B 布局、常量和 host/device 共用结构。
 
+### 4.5 `ld_dev` 只能作为 one-shot atomic 的保守预过滤
+
+2026-08-02 的 `atomic_max_topology` A5 AIV 探针验证了一个窄而有用的边界：
+当状态字独占 atomic-only cache line、每个 task 独占地址、只允许
+`-1 -> task_id` 一次单调转换且不复用时，非首选候选可以先用 `ld_dev`
+读取状态，仅在仍观察到 `-1` 时回退 CAS。最终所有权仍由 CAS 决定。
+
+这个模式对旧值不敏感：stale-low 最多造成额外 CAS；只有看到精确的
+`task_id` 才跳过。12 个候选、100 NOP 的受控样本把每轮 CAS 从 `12.0`
+降至 `4.4`，loop/round 从 `2309.3` 降至 `1392.3` tick；把首选候选
+人为延后 1000 NOP 时，首选胜率为 0，其他候选仍恰好选出一个 winner。
+
+以下情况不能套用该结论：地址在不同 task 间复用、token 会回退或重置、
+读到任意大于当前值就跳过、`ld_dev` 本身被当作锁，或所有 96 核持续轮询
+同一地址。当前已有 72 个持续 reader 的进展失败证据，因此生产候选只允许
+在 12 核局部分组的一次性选举上试用，并保留 CAS 回退。
+
 ## 5. 推荐的 cacheline 所有权协议
 
 ### 5.1 内存布局
