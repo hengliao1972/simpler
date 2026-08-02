@@ -7,6 +7,7 @@
 - 每完成一个阶段，立即补充实现范围、验证命令、结果和未闭合问题。
 - CPU、CCEC IR、A5 动态结果分别记录，不能互相替代。
 - 性能结论必须同时给出对照版本、运行参数和结果文件；正确性阶段不提前宣称性能收益。
+- 每个功能阶段闭合后都做一次轻量性能/泳道抽查：普通增量先记录后继续功能；出现倍数级回退、单一区域吞掉大部分时间或明显违背协议预期时，必须先定位和修正，不带着结构性异常进入下一阶段。
 - 当前只实现 CPU 与 CCEC，暂不实现 AscendC。
 - 当前目录是便于验证机制的 standalone；第一版不修改 Simpler 真实 PA 路径。
 
@@ -17,7 +18,7 @@
 | S0 | 固定跨核执行包 ABI、状态机和 cacheline 所有权 | standalone portable ABI 已闭合；真实 TensorDesc 对照留到 S3 |
 | S1 | CPU 确定性交错测试闭合协议正确性 | 已完成 |
 | S2 | CCEC 最小 A5 跨核发布/领取探针 | 已完成 |
-| S3 | standalone PA 接入构建/执行分离 | 进行中：S3a 同 owner 构建/执行已接线，S3b 异 owner 执行尚未实现 |
+| S3 | standalone PA 接入构建/执行分离 | 进行中：S3a 已闭合；S3b 两候选映射已证明，全核 plan 游标过程态因 A5 反例撤销，正改为 Submit 当场登记本地候选任务 |
 | S4 | 泳道、PMU 与 perf-clock 三条证据链 | 未开始 |
 | S5 | 根据证据优化非 atomic 路径 | 未开始 |
 | S6 | 评估并迁移到 Simpler 真实路径 | 未开始 |
@@ -326,9 +327,25 @@ EfDrain 的长尾。
 
 - Build owner 不是 primary 时，由 primary 执行；
 - Build owner 等于 primary 时，由 secondary 执行；
-- 非候选仅推进本地计划游标，不读取 shared control；
+- 每核在真实 Submit 已知 `(task_id, Kind)` 的调用点判断候选身份；非候选不登记、不读 shared control；
+- 候选记录只进入 Scalar owner-local 紧凑位图/队列，不再用 `batch/offset` 重建历史 PA plan；
 - 两个候选可以观察发布状态，但只有唯一实际 target 发射 Claim CAS。
 
 该规则不减少现有 Build Claim 候选，确定性保证 Build/Execute 异核，并把
-每 task 的 control observer 上限从 96 降到 2。它仍需经过 CPU 定向交错、
-A5 B1/B256 与泳道实测；在这些证据完成前只记为正在实现的 S3b 合同。
+热发现路径每 task 的 control observer 上限从 96 降到 2。设备收口时的 terminal
+validator 是另一条一次性证明路径，不应混入 EfDrain observer 计数。
+
+### A5 反例与过程态撤销
+
+首个 S3b 实现没有立即复用 Submit 当下的 `Kind`，而是给每个 worker
+增加 `exec_scan_task/exec_scan_batch/exec_scan_batch_offset`，在 EfDrain 中先重建
+batch plan。CPU 和 CCEC 编译均通过，但 A5 B1 连续运行已给出否定证据：
+
+- 一轮语义全通过，Submit 却达 **849245.117 us**，不是可接受的普通波动；
+- 下一轮在 task 2 发布 `invalid-built-control`，reporter 是 worker 63；
+- task 2 为 SF，按同一映射独立计算的 AIV observer 是 34/36，worker 63 不是候选；
+- 失败时 cell 仍是 `EMPTY`，且该错误发生在 scanner 读 cell 之前，直接指向本地 plan 游标/解析失配。
+
+因此不对两个 16-bit 游标做局部修补，也不进入 B256。两候选映射保留，
+全核事后重建 plan 的代码撤销；下一步先用 CPU 证明“Submit 成功闭合时登记
+owner-local 候选位，EfDrain 只消费这份本地序列”，再重新构建 CCEC/A5。

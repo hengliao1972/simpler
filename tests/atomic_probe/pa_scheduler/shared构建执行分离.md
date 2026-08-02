@@ -132,7 +132,7 @@ completion vend 是 heap 进度快照，不是 output 数据地址或内存所�
 | A5 ordinary payload 发布/取得 | S2 独立 CCEC 跨核探针 | 不依赖 kernel-end 自动 DCCI，延迟注入和多 cacheline 均读到精确值 |
 | DCache preload 可选性能 hint | S2 先在关闭时闭合正确性，再于 S2/S3a/S3b 做编译变体 A/B | on/off 合同完全相同，只保留正确性不变且性能稳定改善的位置 |
 | 使用 shared payload 本身的代价 | S3a task-indexed cell，仍映射给 Build owner | 正确性不变，单独量出 publication/copy 税 |
-| 真正跨核的 args/context/vend/fanin 交接 | S3b 为每个 task 预路由两个兼容候选，再由 Build owner 唯一确定异核 executor | B1/B256 的 task/descriptor/fanin/vend/completion 精确校验全部一致；每 task 最多两个 control observer |
+| 真正跨核的 args/context/vend/fanin 交接 | S3b 为每个 task 预路由两个兼容候选；每核在实际 Submit 已知 `(task_id, Kind)` 时只登记属于自己的候选任务，再由 Build owner 唯一确定异核 executor | B1/B256 的 task/descriptor/fanin/vend/completion 精确校验全部一致；热发现路径每 task 最多两个 control observer |
 | 多 executor 唯一领取 | S4 动态 election | 先保证恰好一个 executor，再比较 atomic 成本 |
 | executor 本地容量与全局 backlog 解耦 | S0 定义单 execution token，S1/S3 验证忙核不 Claim | 没有空闲 token 时不发射 CAS，task 保持 `BUILT` 并可由其他兼容核领取 |
 | Build owner 扩大到其他 Scalar | S5 独立改候选核拓扑 | 不借助跨核发布的正确性掩盖 Build 角色变化 |
@@ -549,7 +549,9 @@ task-indexed 首版的 cell 容量与 task 数一一对应，不存在设备侧�
 
 `SharedExecCell[]` 本身是 GM 中的全局待执行 task list，不是每核 private ring 的拷贝。没有本地 token 容量时，task 保持 `BUILT`，当前核不得先 Claim 后堆入多项 pending 列表。
 
-S3 固定映射阶段必须让每个 executor 按 task id 递增处理自己的映射序列，不允许跳过早期任务去占住唯一 token。S4 动态任务池不得直接把“随机领取未 ready task”当最终策略；在引入广泛动态竞争前，必须先二选一地闭合活性：
+S3 固定映射阶段必须让每个 executor 按 task id 递增处理自己的映射序列，不允许跳过早期任务去占住唯一 token。这份序列不得通过“96 核各自重建整份 PA plan”事后推导：每核在自己的 Submit 路径中本来就同时拥有 `task_id` 和模板 `Kind`，应在本次 Submit 成功闭合时把候选身份登记到 Scalar 本地紧凑位图/任务号队列。非候选任务只体现为本地空位，不读 GM control，也不保存 batch/offset 重建游标。
+
+S4 动态任务池不得直接把“随机领取未 ready task”当最终策略；在引入广泛动态竞争前，必须先二选一地闭合活性：
 
 - 提供独立、可验证的 ready summary，使 executor 只对 dependency-ready task 发射 Claim；或
 - 给出不会让全部 token 被未 ready task 占满的容量和推进证明。
@@ -844,10 +846,11 @@ CPU 只验证状态机和交错，不用于证明 A5 cache 可见性。generatio
   primary，则由 secondary 执行。该规则保持现有 Build Claim 候选拓扑，
   同时确定性保证 `build_owner != execute_owner`；
 - QK/PV 只映射 AIC，SF/UP 只映射 AIV，Alloc 仍由 Build owner 本地 completion；
-- 非候选核从本地 PA task plan 直接跳过，不读取 shared cell control；两个候选
-  才能观察 control，而最终唯一指定 executor 才发射 Claim CAS。这里的两个
-  observer 不是两个执行竞争者；
+- 每个 worker 在实际 Submit 已知 `(task_id, Kind)` 时独立计算同一对候选；当且仅当自己是 primary/secondary 时，才把该 task 登记到 owner-local 紧凑位图/队列；
+- 非候选核不重建历史 PA batch plan，不保存 `batch/offset` 游标，也不读 shared cell control。候选队列是 Scalar owner-local 状态，不需要 DCCI；
+- 两个候选才能观察 control，而最终唯一指定 executor 才发射 Claim CAS。这里的两个 observer 不是两个执行竞争者；
 - 每个 executor 按 task id 递增处理自己的固定映射序列，token 忙时不跳过早期 task 领取更晚 task；
+- 候选看到 `EMPTY` 时保留队头；看到已带 `build_owner` 的 `BUILDING/BUILT/CLAIMED/DONE` 后，非 target 候选才能丢弃本地记录；只有全局停产后的残留 `EMPTY/BUILDING` 才是 terminal 缺口；
 - 先跑 B1 正确性，再跑 B256；host 精确检查 build owner 与 execute owner 不同、task/descriptor/fanin/vend/completion 全部一致；
 - FinalDrain 使用“所有 builder 停产 + 所有 kernel cell DONE + 每核 token IDLE + engine 无 in-flight”收口。
 
@@ -941,7 +944,7 @@ S3a 和 S3b 把“shared payload 发布税”与“跨核取得税”分开，�
 6. 保持现有 Build Claim 候选核拓扑；Build owner 对整个 payload 仅调用一次 `FlushRegion()`，随后才发布 BUILT/engine_class/payload_lines；
 7. 每个 executor 首版只定义一个紧凑 execution token；token 非 IDLE 时不发射 Claim CAS，不建立 private pending task list；
 8. 先让 Build owner 自己以 executor 身份取得 shared payload，量出 publication/rebind 代价；
-9. 再固定映射到另一个兼容核，每 executor 按 task id 递增处理映射序列，不做动态竞争；
+9. 再固定映射到另一个兼容核；每核在 Submit 成功闭合时用当下已知的 `(task_id, Kind)` 登记 owner-local 候选位，executor 按 task id 递增处理本地序列，不重建历史 PA plan，不做动态竞争；
 10. executor 消费 CAS 返回值、校验 payload_lines、对整个 payload 调用一次 `InvalidateRegion()`、一次 forward copy active prefix 到唯一 token binding，之后不再读 shared payload；
 11. 在唯一 token 内复用现有 `SlotReady -> ExecuteKernel` 的局部主体，completion 改为使用 task payload 中的 vend；发布 DONE 后才释放 token；
 12. A5 独立探针和 B1/B256 正确性闭合后，再引入受控的动态 execution election；
@@ -994,6 +997,22 @@ S3a 和 S3b 把“shared payload 发布税”与“跨核取得税”分开，�
 - S3a 新 execution control/DCCI 当前尚未形成独立 raw 事件，导致长
   EfDrain 在泳道中表现为空白 control 区。S3b 取证必须补齐这些操作的明确
   atomic/DCCI 事件，不能继续只依赖父区间推断。
+
+### 2026-08-02：撤销“全核重建 plan 后再跳过”的 S3b 过程态
+
+- 首个两候选实现仍让 96 个 worker 各自维护
+  `task/batch/offset` 三元组，先重建当前 PA batch plan，再决定是否读
+  cell。它虽然去掉了非候选的 GM atomic load，却没有真正去掉 96 份任务
+  发现状态。
+- A5 B1 实测出现了结构性反证：一轮语义全通过但 Submit
+  达 **849245.117 us**；紧接着一轮由 worker 63 在 task 2 发布
+  `invalid-built-control`，而 task 2 的合法 AIV observer 应为 34/36，cell 尚为
+  `EMPTY`。首错发生在 cell load 之前，证明本地 plan 游标/解析已不可作为
+  可靠的候选发现根据。
+- 两候选映射规则本身仍保留；撤销的是“每核事后重建 plan”的实现。
+  新合同直接复用当次 Submit 已经持有的 `(task_id, Kind)`，只在两个候选
+  核的 owner-local 紧凑位图/队列中登记。这一改动先经 CPU 状态机闭合，
+  再重新进入 A5 B1；现有异常二进制不进入 B256。
 
 ### 2026-08-02：S0/S1 落地并进入 S2 动态门槛
 
