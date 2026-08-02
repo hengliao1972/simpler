@@ -19,9 +19,12 @@
 | S1 | CPU 确定性交错测试闭合协议正确性 | 已完成 |
 | S2 | CCEC 最小 A5 跨核发布/领取探针 | 已完成 |
 | S3 | standalone PA 接入构建/执行分离 | 已完成：S3a 与固定两候选异核 S3b 均已闭合，S3b 通过 CPU、A5 B1/B256 和 B256 full-swimlane |
-| S4 | 泳道、PMU 与 perf-clock 三条证据链 | 进行中：perf-clock 与 full-swimlane 已可用；cross-core submit-PMU 尚未接入 |
-| S5 | 根据证据优化非 atomic 路径 | 未开始 |
-| S6 | 评估并迁移到 Simpler 真实路径 | 未开始 |
+| S4 | 受控的动态 Execute election | K2 首版已实现，完整 CPU build、B1 与 B256 均通过；A5 尚未运行 |
+| S5 | 独立扩大 Build owner 候选核拓扑 | 未开始 |
+| S6 | 引入 engine/Scalar overlap | 未开始 |
+| S7 | 基于累积证据做性能评估与容量/复用优化 | 未开始 |
+| 贯穿观测门槛（不编号） | 泳道、submit-PMU 与 perf-clock 三条互不混算的证据链 | perf-clock 与 full-swimlane 已可用；cross-core submit-PMU 尚未接入 |
+| Simpler 迁移门槛（不编号） | 评估并迁移到 Simpler 真实路径 | 未开始 |
 
 ## 2026-08-02：S0 首版协议与 ABI
 
@@ -607,3 +610,71 @@ tests/atomic_probe/pa_scheduler/outputs/
 其中 `merged_swimlane.json` 可直接载入 Perfetto。该轮证明 S3b 的完整业务
 边界和异核 kernel 均能被泳道导出；27.128 ms 仍是功能版本的观测构建耗时，
 不宣称相对 same-core 有性能收益，也不把它与 perf-clock ELF 直接相减。
+
+## 2026-08-02：S4 K2 动态 Execute election 实现与 CPU 门槛
+
+### 本节边界
+
+本节记录 S4 K2 首版实现和 CPU 取证。该版本只验证受控
+候选中的 exactly-once election，不宣称已建成通用动态任务池。
+**A5 尚未运行，当前没有 A5 性能结论。**
+
+### 首版 K2 候选集
+
+- 实现复用 S3b 已有的 `primary/secondary` 两个 observer 和每核
+  owner-local 候选位图，不新增全核扫描或中央队列。
+- 观察到 control 中的 `build_owner` 后，将 Build owner 从这两核
+  中排除：Build owner 不在 K2 时有 2 个 eligible executor，
+  Build owner 恰好在 K2 时有 1 个 eligible executor。
+- eligible 且 token 空闲的 observer 均有资格对同一 `BUILT` cell
+  发射 `BUILT -> CLAIMED(self)` CAS。唯一 CAS winner 进入 payload
+  invalidate/bind；`ExecClaimResult::Lost` 或竞争窗口中的
+  `NotBuilt` 只会保留候选位并重新观察 control。当后续观察到
+  另一合法候选发布的 `CLAIMED/DONE` 后，loser 才退役本 task；
+  这些都不是 fatal，loser 也不触碰 payload DCCI。
+
+### control、候选位与 FinalDrain 合同
+
+| 观察状态 | S4 K2 实际动作 |
+| -------- | ---------------- |
+| `EMPTY` | 生产未闭合时保留候选位，不发射 CAS，不读 payload |
+| `BUILDING` | 若本 observer 就是 `build_owner`，立即退役其本地候选位；其他 eligible observer 保留候选位等待 `BUILT` |
+| `BUILT` + token 空闲 | eligible observer 发射 Claim CAS；winner 绑定，`Lost/NotBuilt` 保留候选位并重新观察 |
+| token 忙 | 只推进已绑定 token，不观察、不 CAS、不读取新 cell；新 task 的候选位保留 |
+| `CLAIMED` / `DONE` | 校验 `execute_owner` 是排除 Build owner 后的 K2 合法候选；未中选 observer 退役本地位，不发布 fatal |
+
+`FinalDrain` 仍以“所有 builder 停产、所有 kernel cell 到达
+`DONE`、每核 token 为 `IDLE`、engine 无 in-flight”为权威收口。
+生产闭合后残留的 `EMPTY/BUILDING` 是未发布缺口；`BUILT`
+必须继续由空闲 eligible executor 竞争；`CLAIMED` 等待全局
+cell 到达 `DONE`，不得因本地候选位已退役就提前释放 final drain。
+终态校验不再假设唯一预定 executor；K2 中任一非 Build owner 的
+合法候选获胜都是可接受终态，但 exactly-once、payload、completion
+与 FinalDrain 断言仍全部保留。
+
+### 与 TensorMap 和 K3 的边界
+
+TensorMap/SharedOutput metadata 的严格有序插入仍由 Build owner 在发布
+`BUILT` 之前完成；S4 只改变 `BUILT` 之后的 Execute owner 选择，
+不改 `deps_prepared` 链、fanin 内容或 TensorMap 插入顺序。
+
+K3 候选是后续对照：预路由 3 个兼容 observer，排除 Build owner
+后再确定 2 个 eligible 竞争者，因而可以保证每个 task 始终有
+2 个 Execute 竞争者。但它使 control observer 数由 2 增加到 3，
+观察量增加 50%，所以不与 K2 首次实现混做。K3 尚未实现；
+当前对 K2/K3 都不宣称性能收益。
+
+### CPU 动态证据
+
+- 完整 CPU build 与全部公共/隔离门槛均为 PASS，包括 K2
+  eligibility、Build owner 跳过、primary/secondary 分别获胜、确定性
+  CAS `Lost`、忙 token 不接触新 cell、合法动态终态与
+  FinalDrain 收口。
+- CPU B1 的 semantic/postprocess 均为 PASS：5 个 task、4 个 kernel
+  全部闭合。
+- CPU B256 的 semantic/postprocess 均为 PASS：1280 个 task、1024 个
+  kernel 全部闭合；动态合法 owner、payload、completion terminal、
+  token 与 drain 等断言全部通过。
+
+CPU 结果证明协议状态机和 PA 功能规模已闭合，不能代替 A5
+的 atomic/DCCI 动态证据，CPU 耗时也不用于推导 A5 性能。

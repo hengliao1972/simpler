@@ -3487,9 +3487,10 @@ constexpr uint64_t kHostSyntheticValueBase = UINT64_C(0x400000000);
 constexpr uint64_t kHostSyntheticBlockTableBase = UINT64_C(0x500000000);
 constexpr uint64_t kHostPaScaleBits = UINT64_C(0x3F800000);
 
-// Host 必须独立复算 S3b owner，不能调用 device adapter 的
-// FixedPaExecuteOwner；否则两边复制了同一错误时，终态 oracle 仍会误判
-// 为正确。这里故意只依赖公开拓扑常量和最终 cell control。
+// Host 必须独立复算 S4 双候选集合，不能调用 device adapter；否则两边
+// 复制了同一错误时，终态 oracle 仍会误判为正确。S4 的 executor 由两个
+// 候选动态竞争产生，因此 host 只检查角色、候选成员关系和 build/execute
+// 分离，不再预测某个唯一 owner。
 inline bool HostExecOwnerMatchesEngine(
     uint32_t owner, cross_core::ExecEngineClass engine
 ) {
@@ -3502,16 +3503,13 @@ inline bool HostExecOwnerMatchesEngine(
     return false;
 }
 
-inline bool HostExpectedFixedPaExecuteOwner(
+inline bool HostDynamicPaExecuteOwnerIsLegal(
     uint32_t task_id, uint32_t build_owner,
-    cross_core::ExecEngineClass engine,
-    uint32_t *expected_execute_owner
+    uint32_t execute_owner,
+    cross_core::ExecEngineClass engine
 ) {
-    if (expected_execute_owner == nullptr) {
-        return false;
-    }
-    *expected_execute_owner = cross_core::kExecUnboundOwner;
-    if (!HostExecOwnerMatchesEngine(build_owner, engine)) {
+    if (!HostExecOwnerMatchesEngine(build_owner, engine) ||
+        !HostExecOwnerMatchesEngine(execute_owner, engine)) {
         return false;
     }
 
@@ -3528,12 +3526,10 @@ inline bool HostExpectedFixedPaExecuteOwner(
     } else {
         return false;
     }
-    *expected_execute_owner = build_owner == primary
-        ? secondary : primary;
-    return *expected_execute_owner != build_owner &&
-           HostExecOwnerMatchesEngine(
-               *expected_execute_owner, engine
-           );
+    return primary != secondary &&
+           (execute_owner == primary ||
+            execute_owner == secondary) &&
+           execute_owner != build_owner;
 }
 
 inline TensorDesc HostExternalTensorDescriptor(
@@ -3805,16 +3801,9 @@ ValidateCrossCoreExecPayloads(
                     task.kind == TaskKind::Pv
                 ? cross_core::ExecEngineClass::Aic
                 : cross_core::ExecEngineClass::Aiv;
-        uint32_t expected_execute_owner =
-            cross_core::kExecUnboundOwner;
         const bool owner_mapping_ok =
-            HostExpectedFixedPaExecuteOwner(
+            HostDynamicPaExecuteOwnerIsLegal(
                 task.task_id, decoded.build_owner,
-                expected_engine, &expected_execute_owner
-            ) &&
-            decoded.execute_owner == expected_execute_owner &&
-            decoded.build_owner != decoded.execute_owner &&
-            HostExecOwnerMatchesEngine(
                 decoded.execute_owner, expected_engine
             );
         const bool layout_ok =
@@ -3833,7 +3822,7 @@ ValidateCrossCoreExecPayloads(
         );
         record(
             owner_mapping_ok,
-            task.task_id, "fixed_execute_owner"
+            task.task_id, "dynamic_dual_candidate_execute_owner"
         );
         record(
             (cell.payload.words[0] >> 32U) == 0 &&
@@ -4521,12 +4510,12 @@ inline Metrics Validate(
         static_cast<uint64_t>(group_count) *
             (2U * kAicWorkers + 2U * kAivWorkers);
 
-    // S3b 的 host oracle 直接检查 task-indexed cell，不依赖新增的
+    // S4 的 host oracle 直接检查 task-indexed cell，不依赖新增的
     // WorkerResult 计数：Alloc 不产生执行包；其余 task 必须 DONE，并由
-    // host 独立复算两候选预路由的唯一 executor。该公式不能调用 device
-    // adapter，避免 device/host 同错后相互放行。
+    // host 独立复算双候选集合并检查动态 executor 合法性。该公式不能调用
+    // device adapter，避免 device/host 同错后相互放行。
     bool cross_core_exec_cells_ok = shared_plan_ok;
-    bool cross_core_exec_fixed_owner_ok = shared_plan_ok;
+    bool cross_core_exec_dynamic_candidate_owner_ok = shared_plan_ok;
     uint32_t first_bad_exec_task = UINT32_MAX;
     for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
         const SharedHostPlannedTask *planned_task =
@@ -4545,27 +4534,17 @@ inline Metrics Validate(
                         planned_task->kind == TaskKind::Pv
                     ? cross_core::ExecEngineClass::Aic
                     : cross_core::ExecEngineClass::Aiv;
-            uint32_t expected_execute_owner =
-                cross_core::kExecUnboundOwner;
             const bool owner_ok =
-                HostExpectedFixedPaExecuteOwner(
+                HostDynamicPaExecuteOwnerIsLegal(
                     task_id, decoded.build_owner,
-                    expected_engine, &expected_execute_owner
-                ) &&
-                HostExecOwnerMatchesEngine(
-                    decoded.build_owner, expected_engine
-                ) &&
-                HostExecOwnerMatchesEngine(
                     decoded.execute_owner, expected_engine
-                ) &&
-                decoded.build_owner != decoded.execute_owner &&
-                decoded.execute_owner == expected_execute_owner;
+                );
             cell_ok &=
                 decoded.phase == cross_core::ExecPhase::Done &&
                 decoded.task_id == task_id &&
                 decoded.engine_class == expected_engine &&
                 owner_ok;
-            cross_core_exec_fixed_owner_ok &= owner_ok;
+            cross_core_exec_dynamic_candidate_owner_ok &= owner_ok;
         }
         cross_core_exec_cells_ok &= cell_ok;
         if (!cell_ok && first_bad_exec_task == UINT32_MAX) {
@@ -5342,8 +5321,8 @@ inline Metrics Validate(
         &metrics
     );
     Expect(
-        cross_core_exec_fixed_owner_ok,
-        "S3b uses the host-independent fixed different-core executor",
+        cross_core_exec_dynamic_candidate_owner_ok,
+        "S4 uses a host-independent legal dynamic executor from the two candidates",
         &metrics
     );
     Expect(

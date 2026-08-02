@@ -5,12 +5,13 @@
 | 项目 | 状态 |
 | ---- | ---- |
 | 目标 | 让 task 的构建 owner 与 kernel 执行 owner 可以是不同物理核 |
-| 当前代码 | Claim winner 在本核构建 private `LocalSlot`，随后仍由本核 Drain 执行 |
+| 当前代码 | Build owner 发布 task-indexed shared payload，K2 排除 Build owner 后的 1 或 2 个 eligible executor 竞争执行 |
 | 本文性质 | 持续更新的架构与内存模型设计记录 |
-| 正式实现 | S0–S3b 固定两候选异核执行已接入并通过 B1/B256 |
-| CPU 正确性用例 | S1–S3b 协议、PA payload、两候选发现和 drain 门槛已完成 |
+| 正式实现 | S0–S3b 已通过 CPU/A5；S4 K2 已实现并通过 CPU B1/B256，A5 尚未运行 |
+| CPU 正确性用例 | S1–S4 K2 协议、PA payload、动态合法 owner 和 drain 门槛已完成 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
 | A5 PA 功能/性能 | S3b B1 4 轮、B256 perf-clock 与 full-swimlane 全部通过；full-swimlane Submit 27.128 ms，暂不作性能收益结论 |
+| S4 动态 Execute election | K2 首版已实现；完整 CPU build、B1/B256 semantic/postprocess 全部 PASS；**A5 尚未运行** |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
 
@@ -137,7 +138,7 @@ completion vend 是 heap 进度快照，不是 output 数据地址或内存所�
 | executor 本地容量与全局 backlog 解耦 | S0 定义单 execution token，S1/S3 验证忙核不 Claim | 没有空闲 token 时不发射 CAS，task 保持 `BUILT` 并可由其他兼容核领取 |
 | Build owner 扩大到其他 Scalar | S5 独立改候选核拓扑 | 不借助跨核发布的正确性掩盖 Build 角色变化 |
 | engine 执行与 Scalar 继续调度 | S6 continuation/`try_wait` | 只在 S0–S5 闭合后接入，不与跨核 payload 首次验证混做 |
-| 复用、队列和回收 | S7 之后的容量优化 | task-indexed 单轮先闭合；需复用时才引入 generation/ABA 证明 |
+| 复用、队列和回收 | S7 性能/容量优化 | task-indexed 单轮先闭合；需复用时才引入 generation/ABA 证明 |
 
 这个顺序刻意不在首版同时改 Build Claim、执行队列、cell 复用和 engine coroutine。否则即使出错，也无法确定是发布合同、owner 仲裁还是回收引起的。
 
@@ -551,7 +552,9 @@ task-indexed 首版的 cell 容量与 task 数一一对应，不存在设备侧�
 
 S3 固定映射阶段必须让每个 executor 按 task id 递增处理自己的映射序列，不允许跳过早期任务去占住唯一 token。这份序列不得通过“96 核各自重建整份 PA plan”事后推导：每核在自己的 Submit 路径中本来就同时拥有 `task_id` 和模板 `Kind`，应在本次 Submit 成功闭合时把候选身份登记到 Scalar 本地紧凑位图/任务号队列。非候选任务只体现为本地空位，不读 GM control，也不保存 batch/offset 重建游标。
 
-S4 动态任务池不得直接把“随机领取未 ready task”当最终策略；在引入广泛动态竞争前，必须先二选一地闭合活性：
+S4 首版只在 S3b 已有候选序列内做受控 election，不得直接把
+“随机领取未 ready task”当成通用动态任务池。若后续要从受控
+K2/K3 扩展到广泛动态领取，必须先二选一地闭合活性：
 
 - 提供独立、可验证的 ready summary，使 executor 只对 dependency-ready task 发射 Claim；或
 - 给出不会让全部 token 被未 ready task 占满的容量和推进证明。
@@ -658,7 +661,7 @@ fresh output cell 由 task 唯一 Build owner 独占，它的 descriptor 发布�
 
 不能用一个 bit 同时表达四种状态。
 
-这不只是扫描优化，也是“每 executor 一个 token”进入通用动态任务池前的首选活性条件：未 ready task 留在全局 cell 中，不提前占住某个 executor。ready summary 如何从 fanin completion 中低成本产生属于 S4 的独立设计门槛，不在 S0–S3 臆造新 atomic 协议。
+这不只是扫描优化，也是“每 executor 一个 token”进入通用动态任务池前的首选活性条件：未 ready task 留在全局 cell 中，不提前占住某个 executor。ready summary 如何从 fanin completion 中低成本产生是受控 S4 之后向通用动态池扩展时的独立设计门槛，不在 S0–S4 K2 首版中臆造新 atomic 协议。
 
 ## 9. 容量、背压和活性
 
@@ -780,6 +783,26 @@ PA 只是第一个算子，设计不得固化以下现状：
 
 ## 13. 建议的验证顺序
 
+### 贯穿 S0–S7 的观测门槛（不编号）
+
+三条证据链互不混算，不等到 S7 才补观测：
+
+- perf-clock：决定候选保留/撤销；
+- swimlane：检查 Build publish、Exec claim/bind、token
+  `WAITING_FANIN`、kernel 和 completion 落点；
+- submit-PMU：辅助解释 Scalar/I-cache 变化。
+
+每个功能阶段先过正确性门槛，再用同阶段的 perf-clock/泳道
+做异常级抽查；只有对应构建的绝对数可在同一证据链内比较，
+不把不同 ELF 的绝对时间直接相减。贯穿过程必须逐步补齐以下对照：
+
+1. 现有 private `LocalSlot` 同核执行基线；
+2. shared payload 但仍同核执行：单独量发布/取得/重绑税；
+3. shared payload、固定跨核映射：量跨核交接税；
+4. 受控动态 executor：量 election 成本和负载分布；
+5. 扩大 Build owner 候选核：量真正构建负载转移收益；
+6. full overlap：量最终端到端收益。
+
 ### S0：冻结 ABI 与合同，不接 PA 业务
 
 - 在 `cross_core/` 内定义独立的 task-indexed `SharedExecCell`，`same_core/` 只作对照；
@@ -858,13 +881,64 @@ S3a 和 S3b 把“shared payload 发布税”与“跨核取得税”分开，�
 
 ### S4：加入 exactly-once execution election
 
-- 多个兼容 executor 竞争同一 task；
-- loser 不读 payload；
-- 统计 duplicate/missing execution；
-- 忙 executor 不发射 CAS，未领取 task 始终保持 `BUILT`；
-- 受控测试覆盖 executor 延迟、乱序和单 token `WAITING_FANIN`；
-- 在扩展为通用动态任务池前，必须闭合 ready-only 发现或等价活性证明，防止所有 token 被未 ready task 占满；
-- 先在 task-indexed cell 上比较候选集和 atomic 数量，不在同一步引入中央 MPMC ring。
+本节已完成 K2 实现和 CPU 功能门槛。**A5 尚未运行，
+没有 A5 性能结论**。
+
+首版采用 K2，只改 S3b 中“两个 observer 里固定一个 executor”
+的最后一步：
+
+- 复用现有 `primary/secondary` 两个 observer 与 owner-local
+  候选位图，不扩散为全核扫描；
+- 从 K2 中排除 control 里的 `build_owner`。Build owner 不在 K2
+  时得到 2 个 eligible executor，Build owner 在 K2 时得到
+  1 个 eligible executor；
+- eligible 且 token 为 `IDLE` 的 observer 都可以对 `BUILT`
+  发射 `BUILT -> CLAIMED(self)` CAS；唯一 winner 读 payload，loser
+  不做 payload DCCI；
+- CAS 返回 `ExecClaimResult::Lost`，或竞争窗口中返回
+  `NotBuilt`，都保留候选位并重新观察 control；后续只在确认
+  另一合法候选已进入 `CLAIMED/DONE` 后退役本 task。这些结果
+  **不是 fatal**，不得被转换成 execution fatal 或全局 fatal。
+
+候选位的状态合同固定为：
+
+| cell/token 状态 | 动作 |
+| --------------- | ---- |
+| `EMPTY` | 生产未闭合时保留位图，不 CAS、不读 payload |
+| `BUILDING` | 若本 observer 就是 `build_owner`，立即退役其本地候选位；其他 eligible observer 保留位图等待 `BUILT` |
+| `BUILT` + token 空闲 | eligible 核发射 CAS；winner 绑定，`Lost/NotBuilt` 保留位图并重新观察 |
+| token 忙 | 只推进已绑定 token，不观察、不 CAS、不读取新 cell；新 task 候选位保留 |
+| `CLAIMED` / `DONE` | 确认 `execute_owner` 是排除 Build owner 后的 K2 合法候选，再退役本地位；不报 fatal，全局终态仍等待 `DONE` |
+
+TensorMap 严格有序插入、`deps_prepared` 发布和 fanin 冻结都在
+Build owner 发布 `BUILT` 之前完成。S4 不修改这条串行链；
+`EMPTY/BUILDING` observer 也不得提前读 payload。
+
+`FinalDrain` 继续使用已有全局合同：所有 builder 停产、所有
+kernel cell 为 `DONE`、每核 token 为 `IDLE`、engine 无 in-flight。
+生产闭合后的 `EMPTY/BUILDING` 是发布缺口；`BUILT` 必须继续
+election；`CLAIMED` 只能等待 `DONE`，不能因 loser 本地位图已清理
+就提前结束。
+终态 validator 接受 K2 中任一非 Build owner 的合法 Execute owner，
+不再要求唯一预定 owner；payload、completion、token 与 FinalDrain
+仍使用原有完整断言。
+
+K3 留作后续对照：预路由 3 个兼容 observer，排除 Build owner
+后再固定 2 个 eligible 竞争者，能保证始终有两个竞争者；
+代价是每 task 的 control observer 从 2 增到 3，观察量增加
+50%。所以 K3 不与 K2 首次实现混做，当前尚未实现。
+K2/K3 都不代表通用动态任务池，当前也不宣称它们有任何性能收益。
+
+CPU 已有的动态证据为：
+
+- 完整 CPU build 和全部公共/隔离门槛 PASS；
+- CPU B1 semantic/postprocess PASS：5 个 task、4 个 kernel；
+- CPU B256 semantic/postprocess PASS：1280 个 task、1024 个 kernel，动态
+  合法 owner、payload、completion terminal、token 和 drain 等断言
+  全部通过。
+
+CPU 耗时不用于推导 A5 性能，上述结果也不代替 A5 atomic/DCCI
+可见性与动态竞争门槛。
 
 ### S5：独立扩大 Build owner 候选核
 
@@ -880,24 +954,24 @@ S3a 和 S3b 把“shared payload 发布税”与“跨核取得税”分开，�
 - 最终仍执行原 wait，再发布 completion；
 - 同核 in-flight 从 1 开始，不另建多项 pending 列表，不直接扩展任意深度。
 
-### S7：性能证据与后续容量优化
+### S7：性能评估与容量/复用优化
 
-固定三条互不混算的证据链：
+- 使用贯穿 S0–S6 累积的三条证据链，对 publication、
+  handoff、election、Build 负载转移和 overlap 做同口径收益审计；
+- 先决定 task-indexed 方案是否已经满足性能和容量，不为了
+  预设最终架构就提前引入队列；
+- 只有 task-indexed 内存模型、受控动态 election 和端到端
+  收益都有证据后，才评估紧凑 ring/per-builder queue；
+- 需要复用时才引入 generation、ABA、容量背压和 device reclaim
+  门槛，并将每个新合同作为独立正确性阶段验证。
 
-- perf-clock：决定候选保留/撤销；
-- swimlane：看 Build publish、Exec claim/bind、token WAITING_FANIN、kernel 和 completion 落点；
-- submit-pmu：解释 Scalar/I-cache 变化。
+### Simpler 迁移门槛（不编号）
 
-必须增加的对照：
-
-1. 现有 private `LocalSlot` 同核执行基线；
-2. shared payload 但仍同核执行：单独量发布/取得/重绑税；
-3. shared payload、固定跨核映射：量跨核交接税；
-4. 动态 executor：量负载均衡收益与 election 成本；
-5. 扩大 Build owner 候选核：量真正构建负载转移收益；
-6. full overlap：量最终端到端收益。
-
-只有 task-indexed 内存模型、动态 election 和端到端收益都有证据后，才评估紧凑 ring/per-builder queue。到那一步再引入 generation、ABA、容量背压和 device reclaim 门槛。
+迁移不是 S4–S7 中的一个功能阶段。standalone 的对应协议通过
+CPU/CCEC 正确性、A5 动态和贯穿观测门槛后，再单独评估是否
+迁移到 Simpler 真实路径。迁移时必须逐项对照生产 TensorDesc/
+function ABI、heap/completion 合同、构建宏边界和现有 PA 正确性，
+不因 standalone 已通过就直接默认真实路径等价。
 
 ## 14. 性能上最危险的成本
 
@@ -968,7 +1042,7 @@ S3a 和 S3b 把“shared payload 发布税”与“跨核取得税”分开，�
 2. 最终版 executor 是直接 dispatch shared payload，还是复制 active prefix 到唯一紧凑 token？首版已决定后者，不复活 4-slot ring。
 3. portable payload 的最小通用 ABI 是什么，怎样兼容真实 function address 和 joint task？
 4. 更通用的 heap 协议中 completion vend 应如何表达？首版已决定在 Materialize reservation 成功后冻结。
-5. S4 通用动态版的 ready-only 发现由 completion 驱动的 ready summary、定向 scout，还是其他结构实现？S3 固定映射已决定为单 token + task-id 顺序。
+5. 受控 S4 之后的通用动态版，ready-only 发现由 completion 驱动的 ready summary、定向 scout，还是其他结构实现？S3 固定映射已决定为单 token + task-id 顺序。
 6. ready-only 发现如何避免一个未 ready task 导致 head-of-line blocking，同时不为每个 loser 引入 payload DCCI/读取？
 7. task-indexed cell 的内存开销是否可接受到哪个阶段？
 8. 动态 executor election 如何不新增 Claim 等级的同地址 atomic 热点？
@@ -978,6 +1052,24 @@ S3a 和 S3b 把“shared payload 发布税”与“跨核取得税”分开，�
 12. shared execution payload 是否能复用生产 RingSlot ABI，还是需要独立中间 ABI？
 
 ## 17. 更新记录
+
+### 2026-08-02：完成 S4 K2 动态 Execute election 的 CPU 门槛
+
+- S4 首版决定复用 S3b 的两个 observer 和 owner-local 位图，
+  排除 Build owner 后由剩余 1 或 2 个 eligible 核竞争 `BUILT` cell；
+- 明确正常 CAS `Lost` 不是 fatal，并固定 `EMPTY/BUILDING`、
+  token 忙、`CLAIMED/DONE` 与 `FinalDrain` 的候选位生命周期；
+- TensorMap 有序插入仍在 `BUILT` 之前完成，不被 execution
+  election 改写；
+- K3 可保证排除 Build owner 后始终有两个竞争者，但 control
+  observer 由 2 增至 3，观察量增加 50%，留作后续对照。
+- K2 代码已实现，确定性 CPU 用例覆盖 Build owner 跳过、
+  primary/secondary 分别获胜、CAS `Lost/NotBuilt` 重新观察、
+  忙 token 不接触新 cell、合法动态终态和 FinalDrain；
+- 完整 CPU build 全门槛 PASS；CPU B1 为 5 task/4 kernel，B256 为
+  1280 task/1024 kernel，两者 semantic/postprocess 均 PASS。
+
+A5 尚未运行；不宣称通用动态池，也不用 CPU 耗时推导 A5 性能收益。
 
 ### 2026-08-02：S3b B256 full-swimlane 与 host 终态口径闭合
 

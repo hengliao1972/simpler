@@ -53,7 +53,8 @@ void CheckMapping(bool condition, const char *message) {
         return;
     }
     std::fprintf(
-        stderr, "[FAIL] PA fixed execute owner: %s\n", message
+        stderr, "[FAIL] PA execute candidate eligibility: %s\n",
+        message
     );
     ++g_failures;
 }
@@ -72,17 +73,6 @@ uint32_t WorkerSubBlock(uint32_t owner) {
     return WorkerLane(owner) == 2U ? 1U : 0U;
 }
 
-bool MatchesFixedExecuteOwner(
-    uint32_t task_id, uint32_t build_owner,
-    ExecEngineClass engine,
-    uint32_t execute_owner
-) {
-    uint32_t mapped_owner = kExecUnboundOwner;
-    return FixedPaExecuteOwner(
-               task_id, build_owner, engine, mapped_owner
-           ) && mapped_owner == execute_owner;
-}
-
 void ConfigureWorkerIdentity(WorkerState &worker, uint32_t owner) {
     worker.core_idx = static_cast<int32_t>(owner);
     worker.role = owner < kAicWorkers
@@ -92,10 +82,9 @@ void ConfigureWorkerIdentity(WorkerState &worker, uint32_t owner) {
     worker.sub_block_id = static_cast<int32_t>(WorkerSubBlock(owner));
 }
 
-bool TestFixedExecuteOwnerMapping() {
+bool TestExecuteCandidateEligibility() {
     constexpr uint32_t kRoutingPeriod = kAivWorkers;
     std::array<bool, kWorkers> candidate_destinations{};
-    std::array<bool, kWorkers> actual_destinations{};
     bool exact = true;
     for (ExecEngineClass engine : {
              ExecEngineClass::Aic, ExecEngineClass::Aiv}) {
@@ -126,40 +115,38 @@ bool TestFixedExecuteOwnerMapping() {
                 candidate_destinations[secondary] = true;
             }
 
-            for (uint32_t build_owner = role_begin;
-                 build_owner < role_end; ++build_owner) {
-                uint32_t execute_owner = kExecUnboundOwner;
-                const bool resolved = FixedPaExecuteOwner(
-                    task_id, build_owner, engine, execute_owner
-                );
-                const uint32_t expected = build_owner == primary
-                    ? secondary : primary;
-                const uint32_t wrong_owner = execute_owner == primary
-                    ? secondary : primary;
-                exact &= resolved && execute_owner == expected &&
-                    execute_owner >= role_begin &&
-                    execute_owner < role_end &&
-                    execute_owner != build_owner &&
-                    (execute_owner == primary ||
-                     execute_owner == secondary) &&
-                    MatchesFixedExecuteOwner(
+            // Build owner 穷举全部 96 核，包含与 engine 不同类型
+            // 的 worker；execute owner 同样穷举，确保资格判定只
+            // 接受“同 engine 的双候选且非 builder”。
+            for (uint32_t build_owner = 0;
+                 build_owner < kWorkers; ++build_owner) {
+                for (uint32_t execute_owner = 0;
+                     execute_owner < kWorkers; ++execute_owner) {
+                    const bool expected =
+                        execute_owner != build_owner &&
+                        (execute_owner == primary ||
+                         execute_owner == secondary);
+                    exact &= PaExecuteOwnerEligible(
                         task_id, build_owner, engine, execute_owner
-                    ) &&
-                    !MatchesFixedExecuteOwner(
-                        task_id, build_owner, engine, build_owner
-                    ) &&
-                    !MatchesFixedExecuteOwner(
-                        task_id, build_owner, engine, wrong_owner
-                    );
-                if (resolved && execute_owner < kWorkers) {
-                    actual_destinations[execute_owner] = true;
+                    ) == expected;
                 }
             }
         }
     }
     for (uint32_t owner = 0; owner < kWorkers; ++owner) {
-        exact &= candidate_destinations[owner] &&
-            actual_destinations[owner];
+        exact &= candidate_destinations[owner];
+        exact &= PaExecOwnerMatchesEngine(
+                     owner,
+                     owner < kAicWorkers
+                         ? ExecEngineClass::Aic
+                         : ExecEngineClass::Aiv
+                 );
+        exact &= !PaExecOwnerMatchesEngine(
+                     owner,
+                     owner < kAicWorkers
+                         ? ExecEngineClass::Aiv
+                         : ExecEngineClass::Aic
+                 );
     }
 
     uint32_t primary = 0;
@@ -181,34 +168,96 @@ bool TestFixedExecuteOwnerMapping() {
              primary == kExecUnboundOwner &&
              secondary == kExecUnboundOwner;
 
-    uint32_t rejected_owner = 0;
-    exact &= !FixedPaExecuteOwner(
-                 7, kAicWorkers, ExecEngineClass::Aic,
-                 rejected_owner
-             ) && rejected_owner == kExecUnboundOwner;
-    exact &= !FixedPaExecuteOwner(
-                 7, kAicWorkers - 1U, ExecEngineClass::Aiv,
-                 rejected_owner
-             ) && rejected_owner == kExecUnboundOwner;
-    exact &= !FixedPaExecuteOwner(
-                 7, kWorkers, ExecEngineClass::Aic,
-                 rejected_owner
-             ) && rejected_owner == kExecUnboundOwner;
-    exact &= !FixedPaExecuteOwner(
-                 7, kWorkers, ExecEngineClass::Aiv,
-                 rejected_owner
-             ) && rejected_owner == kExecUnboundOwner;
-    exact &= !FixedPaExecuteOwner(
-                 7, 0, ExecEngineClass::None, rejected_owner
-             ) && rejected_owner == kExecUnboundOwner;
-    exact &= !FixedPaExecuteOwner(
-                 7, 0, ExecEngineClass::Joint, rejected_owner
-             ) && rejected_owner == kExecUnboundOwner;
+    uint32_t aic_primary = kExecUnboundOwner;
+    uint32_t aic_secondary = kExecUnboundOwner;
+    uint32_t aiv_primary = kExecUnboundOwner;
+    uint32_t aiv_secondary = kExecUnboundOwner;
+    exact &= FixedPaExecuteCandidates(
+        7, ExecEngineClass::Aic, aic_primary, aic_secondary
+    );
+    exact &= FixedPaExecuteCandidates(
+        7, ExecEngineClass::Aiv, aiv_primary, aiv_secondary
+    );
+
+    // Build owner 不要求匹配 engine：交叉核类型的 builder 仍可
+    // 把 payload 交给合法的执行候选。
+    exact &= PaExecuteOwnerEligible(
+        7, kAicWorkers, ExecEngineClass::Aic, aic_primary
+    );
+    exact &= PaExecuteOwnerEligible(
+        7, 0, ExecEngineClass::Aiv, aiv_primary
+    );
+
+    exact &= !PaExecOwnerMatchesEngine(
+        kWorkers, ExecEngineClass::Aic
+    );
+    exact &= !PaExecOwnerMatchesEngine(
+        kExecUnboundOwner, ExecEngineClass::Aiv
+    );
+    exact &= !PaExecOwnerMatchesEngine(
+        0, ExecEngineClass::None
+    );
+    exact &= !PaExecOwnerMatchesEngine(
+        0, ExecEngineClass::Joint
+    );
+    exact &= !PaExecuteOwnerEligible(
+        kMaxTasks, 0, ExecEngineClass::Aic, aic_primary
+    );
+    exact &= !PaExecuteOwnerEligible(
+        7, kWorkers, ExecEngineClass::Aic, aic_primary
+    );
+    exact &= !PaExecuteOwnerEligible(
+        7, kExecUnboundOwner, ExecEngineClass::Aiv, aiv_primary
+    );
+    exact &= !PaExecuteOwnerEligible(
+        7, 0, ExecEngineClass::Aic, kWorkers
+    );
+    exact &= !PaExecuteOwnerEligible(
+        7, 0, ExecEngineClass::Aiv, kExecUnboundOwner
+    );
+    exact &= !PaExecuteOwnerEligible(
+        7, 0, ExecEngineClass::None, aic_primary
+    );
+    exact &= !PaExecuteOwnerEligible(
+        7, 0, ExecEngineClass::Joint, aic_primary
+    );
+    exact &= !PaExecuteOwnerEligible(
+        7, aic_primary, ExecEngineClass::Aic, aic_primary
+    );
+    exact &= !PaExecuteOwnerEligible(
+        7, aiv_primary, ExecEngineClass::Aiv, aiv_primary
+    );
     CheckMapping(
         exact,
-        "two candidates and selected owners cover both role populations"
+        "two candidates and generic eligibility cover all workers"
     );
     return exact;
+}
+
+// 端到端 adapter 用例需要一个具体 executor 才能验证 payload
+// 搬运。这里仅在测试内从双候选中确定性挑选一个非 builder，
+// 不定义生产环境的 owner 仲裁语义。
+bool SelectTestExecuteOwner(
+    uint32_t task_id, uint32_t build_owner,
+    ExecEngineClass engine, uint32_t &execute_owner
+) {
+    execute_owner = kExecUnboundOwner;
+    uint32_t primary = kExecUnboundOwner;
+    uint32_t secondary = kExecUnboundOwner;
+    if (!FixedPaExecuteCandidates(
+            task_id, engine, primary, secondary
+        )) {
+        return false;
+    }
+    const uint32_t selected = primary != build_owner
+        ? primary : secondary;
+    if (!PaExecuteOwnerEligible(
+            task_id, build_owner, engine, selected
+        )) {
+        return false;
+    }
+    execute_owner = selected;
+    return true;
 }
 
 // 该 Ops 只承担 CPU 上的协议顺序与精确搬运门槛，不模拟 A5 DCache。
@@ -944,10 +993,10 @@ bool RunCase(SchedulerState &state, const CaseShape &shape) {
     const uint32_t build_owner = shape.engine == ExecEngineClass::Aic
         ? kBuildOwnerAic : kBuildOwnerAiv;
     uint32_t execute_owner = kExecUnboundOwner;
-    const bool mapped = FixedPaExecuteOwner(
+    const bool mapped = SelectTestExecuteOwner(
         shape.task_id, build_owner, shape.engine, execute_owner
     );
-    Check(mapped, shape.kind, "fixed different-core owner mapping");
+    Check(mapped, shape.kind, "test-only different-core owner selection");
     if (!mapped) {
         return false;
     }
@@ -1100,7 +1149,7 @@ bool RunCase(SchedulerState &state, const CaseShape &shape) {
             claimed.execute_owner == execute_owner &&
             claimed.build_owner != claimed.execute_owner &&
             claimed.engine_class == shape.engine,
-        shape.kind, "CLAIMED retains fixed different-core owners"
+        shape.kind, "CLAIMED retains selected different-core owners"
     );
     Check(
         TokenDispatchMatches(
@@ -1138,7 +1187,7 @@ int main() {
         return 1;
     }
 
-    bool all_cases_ran = TestFixedExecuteOwnerMapping();
+    bool all_cases_ran = TestExecuteCandidateEligibility();
     for (const CaseShape &shape : kCases) {
         all_cases_ran &= RunCase(*state, shape);
     }

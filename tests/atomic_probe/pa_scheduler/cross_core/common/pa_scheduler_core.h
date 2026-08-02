@@ -4133,7 +4133,6 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
         cross_core::ExecutionTokenHeader(token);
     TaskKind kind = TaskKind::Count;
     cross_core::PaExecRoute route{};
-    uint32_t mapped_execute_owner = cross_core::kExecUnboundOwner;
     if (!cross_core::PaTaskKindFromExecFunction(
             header.function_id, kind
         ) ||
@@ -4144,11 +4143,13 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
         header.task_id != token.control.task_id ||
         route.engine_class != token.control.engine_class ||
         route.engine_class != CrossCoreEngineForRole(worker.role) ||
-        !cross_core::FixedPaExecuteOwner(
-            header.task_id, token.control.build_owner,
-            route.engine_class, mapped_execute_owner
+        !cross_core::PaExecOwnerMatchesEngine(
+            token.control.build_owner, route.engine_class
         ) ||
-        mapped_execute_owner != worker_id ||
+        !cross_core::PaExecuteOwnerEligible(
+            header.task_id, token.control.build_owner,
+            route.engine_class, worker_id
+        ) ||
         token.control.execute_owner != worker_id ||
         token.control.build_owner == token.control.execute_owner) {
         PublishCrossCoreRuntimeFailure<Ops>(
@@ -4437,16 +4438,10 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
             return completed_count;
         }
 
-        uint32_t mapped_execute_owner =
-            cross_core::kExecUnboundOwner;
         if (observed.task_id != task_id ||
-            !cross_core::FixedPaExecuteOwner(
-                task_id, observed.build_owner, route_engine,
-                mapped_execute_owner
-            ) ||
-            (mapped_execute_owner != primary &&
-             mapped_execute_owner != secondary) ||
-            mapped_execute_owner == observed.build_owner) {
+            !cross_core::PaExecOwnerMatchesEngine(
+                observed.build_owner, route_engine
+            )) {
             PublishCrossCoreRuntimeFailure<Ops>(
                 state, stats,
                 cross_core::ExecFatalReason::InvalidBuiltControl,
@@ -4464,7 +4459,10 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
                 );
                 return completed_count;
             }
-            if (mapped_execute_owner == worker_id) {
+            // Build owner 永远不能再领取自己构造的执行包。若它碰巧也是
+            // 两个 observer 之一，看到 BUILDING 后即可永久越过；其余
+            // eligible observer 必须保留队头，等待 BUILT 后参与 CAS。
+            if (observed.build_owner != worker_id) {
                 return completed_count;
             }
             if (!AdvanceCrossCoreExecCandidateCursor(
@@ -4491,7 +4489,9 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
         }
 
         if (observed.phase == cross_core::ExecPhase::Built) {
-            if (mapped_execute_owner != worker_id) {
+            if (observed.build_owner == worker_id) {
+                // 与 BUILDING 相同，候选集合中的 Build owner 只负责发布，
+                // 不发射 execution Claim；另一个候选仍保留任务并负责执行。
                 if (!AdvanceCrossCoreExecCandidateCursor(
                         stats, worker_id, worker.role, task_id,
                         /*expected_candidate=*/true
@@ -4526,6 +4526,14 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
                     state->exec_fatal
                 );
             if (claim != cross_core::ExecClaimResult::Claimed) {
+                if (claim == cross_core::ExecClaimResult::Lost ||
+                    claim == cross_core::ExecClaimResult::NotBuilt) {
+                    // 另一个 eligible observer 可能在本核首次读到 BUILT
+                    // 之后抢先发布 CLAIMED，甚至已经推进到 DONE。CAS loser
+                    // 不接触 payload，也不是协议错误；保留当前 candidate
+                    // 记录并在本循环下一次原子观察后验证 winner 身份。
+                    continue;
+                }
                 if (claim ==
                         cross_core::ExecClaimResult::FatalObserved ||
                     cross_core::ExecFatalPublished<Ops>(
@@ -4618,10 +4626,14 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
             );
             return completed_count;
         }
-        if (observed.execute_owner != mapped_execute_owner ||
-            mapped_execute_owner == worker_id) {
-            // 非目标候选可以观察并越过目标核的 CLAIMED/DONE；实际目标
-            // 若自己的 cursor 仍停在这里，则说明 token/cursor 上下文丢失。
+        if (!cross_core::PaExecuteOwnerEligible(
+                task_id, observed.build_owner, route_engine,
+                observed.execute_owner
+            ) ||
+            observed.execute_owner == worker_id) {
+            // 合法 CAS loser 或稍后到达的 observer 可以越过 CLAIMED/DONE；
+            // 实际 winner 若自己的 cursor 仍停在这里，则说明 Claim 后的
+            // token/cursor 上下文丢失，不能把它伪装成普通 loser。
             PublishCrossCoreRuntimeFailure<Ops>(
                 state, stats,
                 cross_core::ExecFatalReason::InvalidBuiltControl,
@@ -4736,17 +4748,17 @@ PA_DEVICE bool ValidateCrossCoreExecTerminalCells(
                             planned.kind == TaskKind::Pv
                         ? cross_core::ExecEngineClass::Aic
                         : cross_core::ExecEngineClass::Aiv;
-                uint32_t expected_execute_owner =
-                    cross_core::kExecUnboundOwner;
                 valid =
                     decoded.phase == cross_core::ExecPhase::Done &&
                     decoded.task_id == task_id &&
                     decoded.engine_class == expected_engine &&
-                    cross_core::FixedPaExecuteOwner(
-                        task_id, decoded.build_owner,
-                        expected_engine, expected_execute_owner
+                    cross_core::PaExecOwnerMatchesEngine(
+                        decoded.build_owner, expected_engine
                     ) &&
-                    decoded.execute_owner == expected_execute_owner &&
+                    cross_core::PaExecuteOwnerEligible(
+                        task_id, decoded.build_owner,
+                        expected_engine, decoded.execute_owner
+                    ) &&
                     decoded.build_owner != decoded.execute_owner;
             }
             if (!valid) {

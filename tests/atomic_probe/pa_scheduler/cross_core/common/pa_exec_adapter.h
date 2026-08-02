@@ -170,18 +170,38 @@ PA_DEVICE bool FixedPaExecuteCandidates(
     return false;
 }
 
-// Build winner 仍来自原有完整候选拓扑。若它恰好是 primary，就把执行权
-// 交给 secondary；其余情况交给 primary，因此合法输入始终 build!=exec。
-// 失败时清空输出，调用方不能误用旧 owner。
-PA_DEVICE bool FixedPaExecuteOwner(
-    uint32_t task_id, uint32_t build_owner,
-    ExecEngineClass engine_class, uint32_t &execute_owner
+// engine 只约束执行 owner 的物理核类型，不约束 Build owner。
+// 两者分开表达，便于后续扩大 Build 候选拓扑，而不改写执行侧
+// 的 AIC/AIV 路由合同。
+PA_DEVICE bool PaExecOwnerMatchesEngine(
+    uint32_t owner, ExecEngineClass engine_class
 ) {
-    execute_owner = kExecUnboundOwner;
-    const bool aic_owner = build_owner < kAicWorkers;
-    if ((engine_class == ExecEngineClass::Aic && !aic_owner) ||
-        (engine_class == ExecEngineClass::Aiv &&
-         (aic_owner || build_owner >= kWorkers))) {
+    if (owner >= kWorkers) {
+        return false;
+    }
+    switch (engine_class) {
+        case ExecEngineClass::Aic:
+            return owner < kAicWorkers;
+        case ExecEngineClass::Aiv:
+            return owner >= kAicWorkers;
+        case ExecEngineClass::None:
+        case ExecEngineClass::Joint:
+            return false;
+    }
+    return false;
+}
+
+// S4 只判定一个已经选出的 execute_owner 是否可以执行该 task，
+// 不在 adapter 内指定唯一 owner。Build owner 只需是有效 worker；执行
+// owner 必须匹配 engine、属于 task 的固定双候选，且与 Build owner
+// 不同核。这样既保留 S3b 的窄扫描集，又不把仲裁策略写死在
+// PA adapter 中。
+PA_DEVICE bool PaExecuteOwnerEligible(
+    uint32_t task_id, uint32_t build_owner,
+    ExecEngineClass engine_class, uint32_t execute_owner
+) {
+    if (build_owner >= kWorkers || execute_owner == build_owner ||
+        !PaExecOwnerMatchesEngine(execute_owner, engine_class)) {
         return false;
     }
     uint32_t primary_owner = kExecUnboundOwner;
@@ -192,9 +212,8 @@ PA_DEVICE bool FixedPaExecuteOwner(
         )) {
         return false;
     }
-    execute_owner = build_owner == primary_owner
-        ? secondary_owner : primary_owner;
-    return execute_owner != build_owner;
+    return execute_owner == primary_owner ||
+           execute_owner == secondary_owner;
 }
 
 union PaExecTensorAddress {
