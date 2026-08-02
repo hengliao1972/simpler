@@ -1224,3 +1224,50 @@ skip=2 将 fanin load 从约 `42.5K` 降至约 `28.3K`；但两套独立 ELF 的
 必须同时核对机会式 placement 与 FinalDrain 增量；若目标仍定义为完整
 Submit 调度周期，则最终还需要把权威 perf-clock 结束边界扩到 execution
 drain 闭合，避免观察口径奖励工作后移。
+
+## 2026-08-02：S6.7 K2 主候选优先，保留有限兜底
+
+### 设计边界
+
+K2 仍为每个 task 提供 primary/secondary 两个合法 Execute 候选，不把执行
+owner 静态绑定到某一个核。正常路径优先选择与 Build owner 不同的 primary；
+若 primary 恰好是 Build owner，则优先 secondary。非首选候选首次观察到
+`BUILT` 时只在本核让出一次，第二次即可正常竞争；生产关闭后的 FinalDrain
+不等待首选核。
+
+该变化只改变同一 task 的两个合法候选何时发射 Claim CAS，不改变：
+
+- TensorMap 严格有序插入和 `BUILT` 发布顺序；
+- 96 个 Scalar 的 Build 资格；
+- K2 的候选集合与跨核执行约束；
+- execution control ABI、payload 发布/取得和 completion 协议；
+- 单 execution token 与 FinalDrain 完整排空。
+
+`LocalStats::max_occupied` 的取值上界是 `kPrivateSlots`，因此从 16 bit 收紧
+为 8 bit，并在原 4-byte 紧凑块中复用 1 byte 保存本地 defer 次数，没有扩大
+CCEC block-local 运行时。candidate cursor 一旦前进，defer 次数立即归零，
+不会串到下一 task。
+
+### 门槛与结果
+
+CPU 新增确定性交错，证明：首选先到时立即执行；备选先到时第一次零 CAS、
+首选随后执行；首选 token 忙时，备选在一次宽限后仍能接管。完整 CPU、CCEC
+AIC/AIV 编译与 A5 B256 的 1280 task、1024 kernel、strict insert、K2 owner、
+payload/fanin/vend/fatal/终态门槛均通过。
+
+十轮 perf-clock 中位为 `3.637995 ms`，相对同步基线 `3.678558 ms` 改善
+`1.103%`。七对独立 ELF 交错 A/B 中，候选 6 对更快；基线/候选中位分别为
+`3.773684/3.631773 ms`，改善 `3.761%`。FinalDrain 数量为候选 `39--48`、
+基线 `40--50`，fanin load 仍约 `42K`，没有把执行推进移出 Submit 窗口。
+
+full-swimlane 证据位于：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+pa_scheduler_cross_core_shared_swimlane_20260802_193244_139300/
+ccec/merged_swimlane.json
+```
+
+其 Submit 为 `3.655982 ms`，全部检查通过且 trace drop 为 0。宽限为 2 的候选
+未优于宽限为 1，已撤回。当前保留宽限 1，并继续以 B256 perf-clock 稳定
+不高于 `1.0 ms` 为最终目标。

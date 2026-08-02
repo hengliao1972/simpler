@@ -5924,3 +5924,54 @@ FinalDrain(skip=2) = 88,93,88
 token，又将工作移出当前 perf-clock 结束边界。skip=1/2 的生产与测试代码
 均已完整撤回，源码恢复干净基线。后续候选必须同时核对 Submit 与
 FinalDrain，禁止用改变工作落点制造表面收益。
+
+### 15.29 S6.7 K2 主候选优先与有限回退
+
+K2 原合同允许两个合法 executor 在看到 `BUILT` 后立即竞争同一个
+`BUILT -> CLAIMED` 返回型 CAS。该设计保证任一候选都能接管，但正常快路径
+会让两个核几乎同时向同一 control 行发射原子操作。本轮不改变 K2 候选集合，
+只为每个 task 确定一个稳定首选：primary 与 Build owner 不同时首选 primary，
+否则首选 secondary。备选核第一次看到 `BUILT` 时仅让出一个本地 progress
+机会；若首选核没有取得所有权，备选核下一次仍可 Claim。FinalDrain 关闭该
+宽限，避免结束阶段延后工作。
+
+实现没有扩大运行时结构：把只需表达 `kPrivateSlots` 高水位的
+`max_occupied` 从 16 bit 收紧到 8 bit，复用相邻 1 byte 保存 owner-local
+宽限计数。候选 cursor 前进时清零计数；共享 ABI、control phase、TensorMap
+有序插入、96 核 Build 资格和两个合法 Execute owner 均保持不变。
+
+CPU 定向用例覆盖首选先到、备选先到让出一次、首选 token 忙时备选有限接管，
+以及 cursor 前进后的状态清理；完整 CPU、CCEC AIC/AIV 和 A5 B256 业务终态
+全部通过。A5 十轮数据为：
+
+```text
+3.644218, 3.719845, 3.653230, 3.619783, 3.631773,
+3.626672, 3.661430, 3.624303, 3.587832, 3.867507 ms
+
+min/median/mean/max =
+3.587832 / 3.637995 / 3.663659 / 3.867507 ms
+```
+
+相对同步基线十轮中位 `3.678558 ms` 改善 `1.103%`。为排除设备慢漂移，
+又用两套独立 ELF 做七对交错 A/B：
+
+```text
+base median      = 3.773684 ms
+candidate median = 3.631773 ms
+median change    = -3.761%
+pair wins        = 6 / 7
+```
+
+候选的 FinalDrain 为 `39--48` 个 kernel，基线为 `40--50`，fanin load 仍在
+约 `42K`，没有沿 S6.6 的方式把工作推到计时窗外。full-swimlane Submit 为
+`3.655982 ms`；相同观察构建的旧样本为 `3.843832 ms`。聚合泳道变化较小，
+收益更可能来自减少两个 K2 候选同时发射 Claim CAS，并改善关键 AIC 的执行
+owner 分布，而不是减少业务工作量；因此只按已测端到端结果保留，不把泳道
+差值过度解释成单一根因。
+
+宽限从 1 增至 2 的三路交错小样本中，中位数为：基线 `3.824221 ms`、
+grace=1 `3.746564 ms`、grace=2 `3.786770 ms`。grace=2 没有进一步收益，
+已撤回；生产常量保持 1。
+
+当前正式目标已收紧为 B256 perf-clock 稳定不高于 `1.0 ms`。本阶段相对
+十轮基线仍有约 `2.638 ms` 的中位差额，只是可验证的小步，不代表目标完成。

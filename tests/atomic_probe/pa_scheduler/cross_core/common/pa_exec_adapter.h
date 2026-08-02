@@ -237,6 +237,30 @@ PA_DEVICE bool PaExecuteOwnerEligible(
            execute_owner == secondary_owner;
 }
 
+// K2 仍保留两个合法 executor；这里只给正常快路径一个稳定首选：
+// primary 与 Build owner 不同时优先 primary，否则优先 secondary。
+// 备选核是否、何时兜底由通用 scanner 决定，adapter 不把首选写成
+// 唯一合法 owner。
+PA_DEVICE bool PreferredPaExecuteOwner(
+    uint32_t task_id, uint32_t build_owner,
+    ExecEngineClass engine_class, uint32_t &preferred_owner
+) {
+    preferred_owner = kExecUnboundOwner;
+    uint32_t primary_owner = kExecUnboundOwner;
+    uint32_t secondary_owner = kExecUnboundOwner;
+    if (!FixedPaExecuteCandidates(
+            task_id, engine_class,
+            primary_owner, secondary_owner
+        )) {
+        return false;
+    }
+    preferred_owner = build_owner == primary_owner
+        ? secondary_owner : primary_owner;
+    return PaExecuteOwnerEligible(
+        task_id, build_owner, engine_class, preferred_owner
+    );
+}
+
 union PaExecTensorAddress {
     const TensorDesc *local_tensor;
     PA_GM const TensorDesc *gm_tensor;

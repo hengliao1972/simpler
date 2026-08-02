@@ -1197,3 +1197,21 @@ A5 尚未运行；不宣称通用动态池，也不用 CPU 耗时推导 A5 性�
 - 以现有 A5 DCCI/atomic 探针为依据，给出 payload publish/acquire/reclaim 基础合同；
 - 建议先做 task-indexed、固定跨核映射，分离验证内存模型与动态执行仲裁；
 - 当前没有实现和运行结果，本文所有新结构仍为待验证候选。
+
+### 2026-08-02：K2 正常快路径采用主候选优先、备选有限兜底
+
+K2 的架构含义保持为“两个核都具备合法执行资格”，不是把 task 静态分配给
+一个固定 executor。为减少两个候选同时争抢同一个 `BUILT -> CLAIMED` CAS，
+正常快路径增加稳定首选：优先选择与 Build owner 不同的 primary；如果它与
+Build owner 重合，则首选 secondary。另一个候选第一次看到 `BUILT` 时让出
+一个本地 progress 机会，随后仍可接管；FinalDrain 不执行该让出。
+
+这个选择保留了跨核执行和候选故障/繁忙时的有限前进性，同时没有增加共享
+状态、发布步骤或 cache-coherence 假设。本地宽限计数复用既有紧凑统计空间，
+候选 cursor 前进即清零。CPU 交错、CCEC 和 A5 B256 均已闭合；十轮
+perf-clock 中位从 `3.678558 ms` 降至 `3.637995 ms`，七对交错 A/B 中 6 对
+胜出，且 FinalDrain 未增加。该机制因此作为当前 K2 执行仲裁基线保留。
+
+最终性能验收目标已经调整为 B256 perf-clock 稳定不高于 `1.0 ms`。主候选
+优先只贡献约 1% 的已验证收益，后续仍需从 Claim、发布/取得以及 execution
+progress 的结构性原子和数据访问中继续消减，不能把候选优先视为目标闭合。

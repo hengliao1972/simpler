@@ -1132,41 +1132,51 @@ void RunDynamicCandidateFirstCase(
         RegisterLocalCandidate(second_stats, kTask, kKind);
 
     ExecScanTestOps::ResetObservations();
-    const uint32_t won = ProgressCrossCoreExec<ExecScanTestOps>(
+    const uint32_t first_progress = ProgressCrossCoreExec<ExecScanTestOps>(
         state, first_worker, kTask + 1U,
         /*production_closed=*/false,
         DrainPlace::EfDrain, first_stats
     );
-    const uint32_t observed = ProgressCrossCoreExec<ExecScanTestOps>(
+    const uint32_t second_progress = ProgressCrossCoreExec<ExecScanTestOps>(
         state, second_worker, kTask + 1U,
         /*production_closed=*/false,
         DrainPlace::EfDrain, second_stats
     );
+    const uint32_t first_terminal_progress = primary_first
+        ? 0U
+        : ProgressCrossCoreExec<ExecScanTestOps>(
+              state, first_worker, kTask + 1U,
+              /*production_closed=*/false,
+              DrainPlace::EfDrain, first_stats
+          );
     const DecodedExecState done = DecodeExecState(
         state->exec_cells[kTask].control.state
     );
-    all_ok &= won == 1 && observed == 0 &&
+    all_ok &= first_progress == (primary_first ? 1U : 0U) &&
+        second_progress == (primary_first ? 0U : 1U) &&
+        first_terminal_progress == 0 &&
         CrossCoreExecCandidateBitmapEmpty(first_stats) &&
         CrossCoreExecCandidateBitmapEmpty(second_stats) &&
         ExecScanTestOps::execute_calls == 1 &&
         ExecScanTestOps::executed_tasks[0] == kTask &&
         done.valid && done.phase == ExecPhase::Done &&
         done.build_owner == build_owner &&
-        done.execute_owner == first && state->tasks[kTask].flag == 1 &&
+        done.execute_owner == primary &&
+        state->tasks[kTask].flag == 1 &&
         NoFatal(*state);
     Check(
         all_ok, test,
-        "first legal observer wins once and the other advances normally"
+        "primary claims first or fallback yields one opportunity to primary"
     );
     std::printf("[PASS] %s\n", test);
 }
 
 void TestEitherCandidateMayWin() {
     RunDynamicCandidateFirstCase(
-        /*primary_first=*/true, "dynamic-primary-wins"
+        /*primary_first=*/true, "preferred-primary-wins"
     );
     RunDynamicCandidateFirstCase(
-        /*primary_first=*/false, "dynamic-secondary-wins"
+        /*primary_first=*/false, "fallback-yields-once"
     );
 }
 
@@ -2202,6 +2212,24 @@ void TestBusyCandidateDoesNotBlockPeerClaim() {
         CandidateBitForTask(
             busy_stats, primary, CoreRole::Aic, kNewTask
         );
+    bool peer_completed_grace = true;
+    for (uint8_t deferred = 0;
+         deferred < kCrossCoreExecFallbackGraceProgresses;
+         ++deferred) {
+        const uint32_t peer_deferred =
+            ProgressCrossCoreExec<ExecScanTestOps>(
+                state, peer_worker, kNewTask + 1U,
+                /*production_closed=*/false,
+                DrainPlace::EfDrain, peer_stats
+            );
+        peer_completed_grace &=
+            peer_deferred == 0 &&
+            CandidateBitForTask(
+                peer_stats, secondary, CoreRole::Aic, kNewTask
+            ) &&
+            peer_stats.exec_fallback_defer_count == deferred + 1U &&
+            ExecScanTestOps::watched_control_cas_calls == 0;
+    }
     const uint32_t peer_progress =
         ProgressCrossCoreExec<ExecScanTestOps>(
             state, peer_worker, kNewTask + 1U,
@@ -2211,7 +2239,8 @@ void TestBusyCandidateDoesNotBlockPeerClaim() {
     const DecodedExecState done = DecodeExecState(
         state->exec_cells[kNewTask].control.state
     );
-    all_ok &= busy_did_not_touch_new_cell && peer_progress == 1 &&
+    all_ok &= busy_did_not_touch_new_cell && peer_completed_grace &&
+        peer_progress == 1 &&
         CrossCoreExecCandidateBitmapEmpty(peer_stats) &&
         busy_token.control.phase == ExecTokenPhase::WaitingFanin &&
         ExecScanTestOps::watched_control_loads != 0 &&
@@ -2221,7 +2250,7 @@ void TestBusyCandidateDoesNotBlockPeerClaim() {
         done.execute_owner == secondary && NoFatal(*state);
     Check(
         all_ok, kTest,
-        "busy candidate performs zero new-cell access while peer executes"
+        "busy primary performs no new-cell access and fallback claims after one yield"
     );
     std::printf("[PASS] %s\n", kTest);
 }

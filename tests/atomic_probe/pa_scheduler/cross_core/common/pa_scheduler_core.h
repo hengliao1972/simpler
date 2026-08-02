@@ -47,7 +47,11 @@ struct LocalStats {
     // shared 的物理 slot 固定为极小有界数组；16bit 足以保存精确高水位，
     // 并与下面的本地退避位合计复用原先 max_occupied 的 4B，不扩大
     // CCEC [[block_local]] split runtime。
-    uint16_t max_occupied;
+    uint8_t max_occupied;
+    // K2 的备选 executor 在当前候选首次看到 BUILT 后让出有限次数，
+    // 避免与首选核同时发射 Claim CAS；达到上限后仍可由备选核接管。
+    // 该状态只跟随单调 candidate cursor，不跨核发布。
+    uint8_t exec_fallback_defer_count;
     // opportunistic EfDrain 的单槽轮询状态只属于当前 worker，既不进入
     // GM WorkerState，也不改变设备/host ABI。短等待每次只跳过一个
     // Submit；连续长等待才增加到两个。两槽背压和 FinalDrain 始终强制轮询。
@@ -85,7 +89,7 @@ static_assert(
 );
 #endif
 static_assert(
-    kPrivateSlots <= 0xFFFFU,
+    kPrivateSlots <= 0xFFU,
     "shared local occupancy must fit the packed local counter"
 );
 static_assert(
@@ -99,6 +103,9 @@ static_assert(
 constexpr uint8_t kSharedEfDrainNoProgressSkipSubmits = 1;
 constexpr uint8_t kSharedEfDrainLongWaitSkipSubmits = 2;
 constexpr uint8_t kSharedEfDrainLongWaitPollThreshold = 24;
+// K2 备选核允许首选核先取得执行所有权的 progress 次数。达到该上限后
+// 备选核仍可 Claim，保持主候选阻塞时的有限兜底。
+constexpr uint8_t kCrossCoreExecFallbackGraceProgresses = 1;
 static_assert(
     kSharedEfDrainNoProgressSkipSubmits != 0,
     "shared EfDrain backoff must retain a finite retry interval"
@@ -111,6 +118,10 @@ static_assert(
 static_assert(
     kSharedEfDrainLongWaitPollThreshold != 0,
     "long-wait EfDrain threshold must require observed stalls"
+);
+static_assert(
+    kCrossCoreExecFallbackGraceProgresses != 0,
+    "cross-core fallback grace must remain finite and nonzero"
 );
 #endif
 
@@ -3970,6 +3981,7 @@ PA_DEVICE bool AdvanceCrossCoreExecCandidateCursor(
         stats.exec_candidate_bitmap[word] &= ~mask;
     }
     ++stats.exec_candidate_slot;
+    stats.exec_fallback_defer_count = 0;
     return true;
 }
 
@@ -4570,6 +4582,29 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
                     return completed_count;
                 }
                 continue;
+            }
+            uint32_t preferred_owner =
+                cross_core::kExecUnboundOwner;
+            if (!cross_core::PreferredPaExecuteOwner(
+                    task_id, observed.build_owner, route_engine,
+                    preferred_owner
+                ) ||
+                (preferred_owner != primary &&
+                 preferred_owner != secondary)) {
+                PublishCrossCoreRuntimeFailure<Ops>(
+                    state, stats,
+                    cross_core::ExecFatalReason::InvalidBuiltControl,
+                    task_id, worker_id
+                );
+                return completed_count;
+            }
+            if (!production_closed && worker_id != preferred_owner &&
+                stats.exec_fallback_defer_count <
+                    kCrossCoreExecFallbackGraceProgresses) {
+                // 首选核在宽限窗口内通常可以完成 Claim；备选核达到固定
+                // 上限后仍会竞争，不会因首选 token 忙而永久饿死。
+                ++stats.exec_fallback_defer_count;
+                return completed_count;
             }
             // control 的首次观察只说明当时尚无 fatal；真正取得执行所有权
             // 前必须重新检查两条 terminal 线。exec fatal 已保存精确原因，
