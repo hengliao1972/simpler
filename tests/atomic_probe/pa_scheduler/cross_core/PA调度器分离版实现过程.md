@@ -517,6 +517,33 @@ CCEC perf-clock 整套重编后，B1 共运行 4 轮：
   全部通过；
 - global fatal 和 execution fatal 全部保持未发布。
 
-这一阶段只宣布 **S3b B1 固定两候选异核交接功能已闭合**。耗时从
-228 us 到 2.938 s 的巨大波动仍需后续单独定位；当前不宣称性能收益，也不宣称
-B256 已经通过。
+这一阶段宣布 **S3b B1 固定两候选异核交接功能已闭合**。耗时从
+228 us 到 2.938 s 的巨大波动仍需后续单独定位；当前不宣称性能收益。
+
+## 2026-08-02：S3b B256 完整规模功能闭合
+
+在与 B1 相同的 CCEC perf-clock ELF 上执行 B256，一轮完整通过：
+
+| 指标 | 实测值 |
+| ---- | ----: |
+| Submit | 27.243 ms |
+| 计划 task | 1280 |
+| Build winner | 1280 |
+| 异核 kernel | 1024 |
+| QK / SF / PV / UP | 256 / 256 / 256 / 256 |
+| fanin edge | 1280 |
+| shared output | 2048 |
+| TensorMap 插入完成前缀 | 1280 |
+
+设备和 host 终态证据同时闭合：
+
+- 96 个 worker 完整回放 1280 个 Submit，Claim 次数与既定拓扑精确相等；
+- 每个 kernel cell 都保留互异的 `build_owner/execute_owner` 并到达 `DONE`；
+- descriptor、scalar、fanin、completion vend 和核型 route 逐 task 匹配 host 独立计划；
+- QK/PV 仅在 AIC，SF/UP 仅在 AIV，四类结果 tile 全部通过数值检查；
+- 1280 个 completion flag/vend、全部 execution token reset、96 核 drain closure、
+  global fatal 和 execution fatal 全部符合终态合同。
+
+因此当前可以宣布 **S3b 固定两候选的非 Build 核执行功能已在 B1 和
+B256 闭合**。本轮 27.243 ms 只是功能构建的实测值；还没有生成同代码的
+B256 泳道，也没有对波动、非必要 atomic 或固定映射的性能作为保留判据。
