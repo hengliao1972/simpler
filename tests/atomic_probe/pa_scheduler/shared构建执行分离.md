@@ -13,6 +13,7 @@
 | A5 PA 功能/性能 | S3b/S4/S5a full-swimlane 为 27.128/27.476/27.301 ms；S5b B256 普通/完整泳道为 27.347/28.250 ms，均只记录单样本 |
 | S4 动态 Execute election | K2 首版已通过 CPU B1/B256 和 A5 B1/B256；B256 中两候选都有实际胜出，非法 owner 为 0 |
 | S5 Build 拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 五类 task 全 96/G8 已通过 CPU/CCEC/A5 B1/B256，物理 Claim CAS 精确闭合 |
+| 明确非目标 | 不引入 `try_wait`、engine continuation 或“kernel 运行期间同一 Scalar 继续调度” |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
 
@@ -138,10 +139,11 @@ completion vend 是 heap 进度快照，不是 output 数据地址或内存所�
 | 多 executor 唯一领取 | S4 动态 election | 先保证恰好一个 executor，再比较 atomic 成本 |
 | executor 本地容量与全局 backlog 解耦 | S0 定义单 execution token，S1/S3 验证忙核不 Claim | 没有空闲 token 时不发射 CAS，task 保持 `BUILT` 并可由其他兼容核领取 |
 | Build owner 扩大到其他 Scalar | S5 独立改候选核拓扑 | 不借助跨核发布的正确性掩盖 Build 角色变化 |
-| engine 执行与 Scalar 继续调度 | S6 continuation/`try_wait` | 只在 S0–S5 闭合后接入，不与跨核 payload 首次验证混做 |
-| 复用、队列和回收 | S7 性能/容量优化 | task-indexed 单轮先闭合；需复用时才引入 generation/ABA 证明 |
+| 复用、队列和回收 | S6 性能/容量优化 | task-indexed 单轮先闭合；需复用时才引入 generation/ABA 证明 |
 
-这个顺序刻意不在首版同时改 Build Claim、执行队列、cell 复用和 engine coroutine。否则即使出错，也无法确定是发布合同、owner 仲裁还是回收引起的。
+这个顺序刻意不在首版同时改 Build Claim、执行队列和 cell 复用。
+本轮性能优化也不引入 engine coroutine，避免把跨核发布、owner 仲裁、
+回收与另一套调度机制混在一起。
 
 ## 3. 当前 private `LocalSlot` 为什么不能直接共享
 
@@ -284,7 +286,7 @@ atomic CAS 取得唯一 Execute owner
 - `BUILT` 后 payload 全生命周期不可变；
 - 候选 executor 在 CAS 成功前只访问 atomic control，不预读 payload；
 - 只有 CAS 成功的 executor 执行 DCCI 和 ordinary load；
-- executor 若需要修改 fanin/context，先复制到 private continuation。
+- executor 若需要修改 fanin/context，先复制到 owner-private token。
 
 ### 4.4 禁止的写法
 
@@ -407,7 +409,7 @@ SharedExecCell[task_id]
 
 same-core 优化已经形成一条必须延续到 cross-core 的经验：**控制计算尽量只使用寄存器和栈上小型 POD；只有必须持久或跨核的结果才落 GM，并且每条 destination line 单向写一次、最后统一 DCCI 发布**。
 
-“owner-private”只表示没有其他核并发访问，不表示它不在 GM。当前 `WorkerState::LocalSlot` 虽是本 worker 私有，物理上仍是 GM 对象，同样可能付出 DCache miss。因此 owner-private GM 只用于必须跨 Submit/等待点存活的 continuation，不应冒充临时 staging。
+“owner-private”只表示没有其他核并发访问，不表示它不在 GM。当前 `WorkerState::LocalSlot` 虽是本 worker 私有，物理上仍是 GM 对象，同样可能付出 DCache miss。因此 owner-private GM 只用于必须跨 Submit/等待点存活的 token 状态，不应冒充临时 staging。
 
 现有 `same_core` 中的 [SharedTaskWriterDelta](same_core/common/pa_shared_submit_path.h#L19) 就是可复用的结构模式：先在调用栈上的 trivial object 中准备 ordinary entry、bucket/局部序号和 symbol key，取得有序插入资格后才消费这份不可变计划，不在热串行段重复扫描 GM/args。cross-core execution payload 应复制这个模式，而不是在 Materialize/Register/Fanin 每一阶段都去修改 shared cell。
 
@@ -469,7 +471,7 @@ executor-private binding 也必须区分两类：立即 ready 且在当前调用
 
 ### 5.7 `dc_preload` 的预埋点与边界
 
-本节只在 5.5 的“减少 GM 触碰次数”结构门槛已满足后才启用。`dc_preload` 不得用来给反复读写 shared payload、分段 DCCI 或过大 GM continuation 擦屁股。
+本节只在 5.5 的“减少 GM 触碰次数”结构门槛已满足后才启用。`dc_preload` 不得用来给反复读写 shared payload、分段 DCCI 或过大 GM token 擦屁股。
 
 现有 [cache_preload_usage_guide.md](../cache_preload_usage_guide.md) 已证明：A5 上 `dc_preload` 是可能被硬件当成 NOP 的性能 hint，不是可见性、顺序或所有权原语；128B/384B publish 和 128B consume 定向模型存在稳定改善，但不能直接外推为新 execution payload 的收益。
 
@@ -711,7 +713,7 @@ token != IDLE  : 不 Claim；其他 BUILT task 继续留在 GM task list
 - executor 的唯一 token 为 `IDLE` 时才允许对一个兼容 task 发射 Claim CAS；
 - CAS 失败不占 token，也不读 payload；
 - CAS 成功后该核对 task 负责到 `DONE`，不得再领取第二个 task；
-- token 可在 `WAITING_FANIN` 时让 Scalar 处理不需要第二 token 的工作，但不得把“继续 Claim”伪装成 overlap。
+- token 位于 `WAITING_FANIN` 时仍属于已领取 task；本 executor 不得继续 Claim 第二个 task。
 
 这一版主动放弃“一核囤积多个未 ready task”带来的绕过能力，换取最小所有权和内存模型。固定映射通过每 executor 的 task-id 顺序保证推进：所有 fanin producer 都严格小于 consumer task id，同一 executor 不跳过早期映射 task，因此跨 executor 等待链上的 task id 只能严格递减，不能形成环。这份证明依赖“兼容 executor 最终被调度、engine 最终完成”的基本活性前提。通用动态版则必须先有 ready-only 发现机制或独立的活性证明。
 
@@ -784,9 +786,9 @@ PA 只是第一个算子，设计不得固化以下现状：
 
 ## 13. 建议的验证顺序
 
-### 贯穿 S0–S7 的观测门槛（不编号）
+### 贯穿 S0–S6 的观测门槛（不编号）
 
-三条证据链互不混算，不等到 S7 才补观测：
+三条证据链互不混算，不等到 S6 才补观测：
 
 - perf-clock：决定候选保留/撤销；
 - swimlane：检查 Build publish、Exec claim/bind、token
@@ -802,7 +804,7 @@ PA 只是第一个算子，设计不得固化以下现状：
 3. shared payload、固定跨核映射：量跨核交接税；
 4. 受控动态 executor：量 election 成本和负载分布；
 5. 扩大 Build owner 候选核：量真正构建负载转移收益；
-6. full overlap：量最终端到端收益。
+6. 全 96 Scalar 自由 Build 竞争 + K2 异核 Execute：量当前目标架构的最终端到端收益。
 
 ### S0：冻结 ABI 与合同，不接 PA 业务
 
@@ -993,17 +995,10 @@ FinalDrain 轮询记录耗尽通用 trace 容量，因此不用它代替 A5 的
 `375/649` 个 kernel，非法 owner 为 0。相对 S5a 单样本未观察到性能收益；
 差异只用于说明没有倍数级异常，不宣称稳定回退。
 
-### S6：再接 engine/Scalar overlap
+### S6：性能评估与容量/复用优化
 
-- executor 发射 engine 后继续使用同一个 execution token 保存 continuation；
-- `try_wait(BUFFER_ID)` 只决定何时恢复；
-- 最终仍执行原 wait，再发布 completion；
-- 同核 in-flight 从 1 开始，不另建多项 pending 列表，不直接扩展任意深度。
-
-### S7：性能评估与容量/复用优化
-
-- 使用贯穿 S0–S6 累积的三条证据链，对 publication、
-  handoff、election、Build 负载转移和 overlap 做同口径收益审计；
+- 使用贯穿 S0–S5 累积的三条证据链，对 publication、
+  handoff、election 和 Build 负载转移做同口径收益审计；
 - 先决定 task-indexed 方案是否已经满足性能和容量，不为了
   预设最终架构就提前引入队列；
 - 只有 task-indexed 内存模型、受控动态 election 和端到端
@@ -1013,7 +1008,7 @@ FinalDrain 轮询记录耗尽通用 trace 容量，因此不用它代替 A5 的
 
 ### Simpler 迁移门槛（不编号）
 
-迁移不是 S4–S7 中的一个功能阶段。standalone 的对应协议通过
+迁移不是 S4–S6 中的一个功能阶段。standalone 的对应协议通过
 CPU/CCEC 正确性、A5 动态和贯穿观测门槛后，再单独评估是否
 迁移到 Simpler 真实路径。迁移时必须逐项对照生产 TensorDesc/
 function ABI、heap/completion 合同、构建宏边界和现有 PA 正确性，
@@ -1029,7 +1024,7 @@ function ABI、heap/completion 合同、构建宏边界和现有 PA 正确性，
 1,024 × 76 × 2 = 155,648 cacheline operations
 ```
 
-这还没有计算复制、队列 atomic 和 I-cache 膨胀，极可能吞掉 overlap 收益。因此不能为了尽快跨核，直接把现有最大结构逐 task 全量发布。
+这还没有计算复制、队列 atomic 和 I-cache 膨胀，极可能吞掉跨核构建/执行分离的潜在收益。因此不能为了尽快跨核，直接把现有最大结构逐 task 全量发布。
 
 ### 14.2 紧凑 payload 与重复 lookup 的权衡
 
@@ -1070,17 +1065,19 @@ function ABI、heap/completion 合同、构建宏边界和现有 PA 正确性，
 12. A5 独立探针和 B1/B256 正确性闭合后，再引入受控的动态 execution election；
 13. 通用动态任务池必须在 ready-only 发现或等价活性证明闭合后才启用，不允许所有 token 被未 ready task 占满；
 14. S2 正确性先在 DCache preload 关闭时闭合；之后才用预留 hook 为 S2/S3a/S3b 生成独立 A/B 变体；
-15. 动态 election 闭合后，再独立扩大 Build owner 候选核，最后才接 engine/Scalar overlap 和有界 ring。
+15. 动态 election 闭合后，再独立扩大 Build owner 候选核，最后基于观测证据评估有界 ring 和容量复用。
 
 这一版不是最终高性能形态。它的价值是把三个未知量拆开：
 
 ```text
 跨核 payload 内存模型
 ≠ 动态执行仲裁
-≠ Scalar/engine coroutine
+≠ Build owner 候选拓扑
 ```
 
-只有第一项闭合后，后两项的性能结果才有解释价值。而“Build owner 扩大到所有 Scalar”又是第四个正交变量，不与前三项首次实现混做。
+只有前一项闭合后，后两项的性能结果才有解释价值。当前三项均已
+分阶段闭合；S6 只在这一架构内优化，不再引入第四套 engine/Scalar
+协程机制。
 
 ## 16. 尚未决定的问题
 
@@ -1185,7 +1182,7 @@ A5 尚未运行；不宣称通用动态池，也不用 CPU 耗时推导 A5 性�
 - 去除“cross-core 继续每核维护多个 private pending slot”的默认：`SharedExecCell[]` 承担全局 backlog，每 executor 首版只有一个紧凑 execution token，忙时不 Claim；
 - 将动态任务池与受控 exactly-once election 分开：前者还必须闭合 ready-only 发现或等价活性证明，防止全部 token 被未 ready task 占满；
 - 预留 builder destination、executor source 和 executor-private destination 三类编译期 DCache preload hook，明确它们默认关闭、不改 ABI、不代替 DCCI/DSB/atomic；
-- 将验证拆为 same-owner shared publication、fixed different-core handoff、dynamic Execute election、Build 候选核扩大、engine continuation 五个正交阶段。
+- 将验证拆为 same-owner shared publication、fixed different-core handoff、dynamic Execute election 和 Build 候选核扩大四个正交阶段。
 
 ### 2026-08-01：建立问题边界
 

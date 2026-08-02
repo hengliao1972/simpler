@@ -10,6 +10,8 @@
 - 每个功能阶段闭合后都做一次轻量性能/泳道抽查：普通增量先记录后继续功能；出现倍数级回退、单一区域吞掉大部分时间或明显违背协议预期时，必须先定位和修正，不带着结构性异常进入下一阶段。
 - 当前只实现 CPU 与 CCEC，暂不实现 AscendC。
 - 当前目录是便于验证机制的 standalone；第一版不修改 Simpler 真实 PA 路径。
+- 当前性能目标保留 TensorMap 严格串行插入和 96 Scalar 自由 Build 竞争；
+  不引入 `try_wait`、engine continuation 或 kernel/调度 overlap。
 
 ## 阶段总览
 
@@ -21,8 +23,7 @@
 | S3 | standalone PA 接入构建/执行分离 | 已完成：S3a 与固定两候选异核 S3b 均已闭合，S3b 通过 CPU、A5 B1/B256 和 B256 full-swimlane |
 | S4 | 受控的动态 Execute election | K2 首版已通过完整 CPU、CCEC 和 A5 B1/B256 门槛 |
 | S5 | 独立扩大 Build owner 候选核拓扑 | S5a 与 S5b 全 96 Scalar 均已通过 CPU/CCEC/A5 B1/B256 |
-| S6 | 引入 engine/Scalar overlap | 未开始 |
-| S7 | 基于累积证据做性能评估与容量/复用优化 | 未开始 |
+| S6 | 基于累积证据做性能评估与容量/复用优化 | 进行中 |
 | 贯穿观测门槛（不编号） | 泳道、submit-PMU 与 perf-clock 三条互不混算的证据链 | perf-clock 与 full-swimlane 已可用；cross-core submit-PMU 尚未接入 |
 | Simpler 迁移门槛（不编号） | 评估并迁移到 Simpler 真实路径 | 未开始 |
 
@@ -442,9 +443,8 @@ completion。CPU 的顺序一致模型也能确定性构造这种交错，因此
   发布正常 vend/flag/DONE。
 
 这些复核不能宣称在两条独立 atomic line 之间建立“现实时间上的绝对同时
-停止”；其合同是：本核一旦在对应不可逆边界观察到 terminal fatal，就不再
-执行下一项副作用。未来 engine 改为异步 `try_wait` 后，`ENGINE_INFLIGHT`
-必须先等硬件真正完成再转 `Faulted`，不能照搬当前同步 helper 的处理。
+停止”；其合同是：本核一旦在对应不可逆边界观到 terminal fatal，就不再
+执行下一项副作用。当前 engine helper 保持同步边界，本轮不扩展异步查询协议。
 
 ### CPU 确定性注入门槛
 
@@ -889,8 +889,9 @@ Scalar 无 coherence 下的 DCCI/atomic 动态证据。
 S5b 普通运行与 S5a `27.143 ms` 单样本相比约 `+0.75%`；完整泳道与
 S5a `27.301 ms` 单样本相比约 `+3.48%`。已知长尾与单轮波动使这些数字
 不足以宣称稳定回退，但当前也没有证据说明全 96 Scalar 的到达式负载
-均衡已覆盖 60.5% 额外物理 Claim CAS。S5b 作为后续 Build/engine overlap 的
-功能基线保留，性能去留必须在 S6 有实际 overlap 后再做同口径对照。
+均衡已覆盖 60.5% 额外物理 Claim CAS。S5b 作为“TensorMap 严格串行插入
++ 96 Scalar 自由 Build 竞争 + K2 异核 Execute”的功能基线保留；S6 在此架构内
+直接优化，不依赖 `try_wait` 或 kernel/调度 overlap 才判定性能去留。
 
 完整 B256 泳道在：
 
