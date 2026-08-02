@@ -5770,3 +5770,55 @@ trace closure 全部 PASS，drop 为 0。
 `2.643625 ms`。后续优先细化 Submit 内剩余 `149.859 ms` EfDrainControl
 聚合核时和约 4 万次 fanin completion 读取；不得把工作推入 perf-clock
 窗口外的 FinalDrain 来制造表面数字。
+
+### 15.26 S6.4 负向取证：少一次 Claim 读取与双 token 均未形成端到端收益
+
+目标收紧为同口径 B256 `perf-clock <= 1.0 ms` 后，先从 `c3387747`
+干净源码重新构建，并取得十轮同步基线：
+
+```text
+3.622526, 3.678263, 3.611772, 3.678852, 3.733488,
+3.780690, 3.598456, 3.844624, 3.597437, 3.775583 ms
+
+min/median/mean/max =
+3.597437 / 3.678558 / 3.692169 / 3.844624 ms
+```
+
+第一项候选复用 scanner 已取得的 `BUILT` control 快照，避免
+`ClaimAndBindExecPayload()` 对同一地址再做一次返回型 atomic load；CAS
+继续用该快照作 expected，过期快照只会正常判 `Lost`。CPU 与 A5 正确性
+均通过，但十轮 `median=3.667069 ms`、`mean=3.701755 ms`：中位仅改善
+`0.312%`，均值反而回退 `0.260%`。该变化落在本机波动内，源码已完整撤回。
+
+第二项候选把每个 executor 从单 token 扩为两个 owner-local token。确定性
+CPU 交错证明：slot0 等待 fanin 时，slot1 可以领取并完成后续独立 ready
+任务；它不改变 TensorMap 严格插入、96 Scalar Build 资格、K2 候选、
+payload 发布或 completion 协议。A5 也全部 PASS，fanin load 从基线约
+`41K--43K` 降至约 `29K--31K`，说明单 token 队首阻塞真实存在。但贪心
+双槽十轮为：
+
+```text
+3.865082, 3.672370, 3.645832, 3.765677, 3.782223,
+3.889938, 3.795243, 3.722652, 3.920312, 3.737609 ms
+
+median/mean = 3.773950 / 3.779694 ms
+```
+
+相对同步基线分别回退 `2.593% / 2.370%`。full-swimlane Submit 为
+`3.873123 ms`；虽然 fanin 读取降至 `28388`，但单核 winner 长尾达到
+`39`，`EfDrainControl` 聚合核时升至 `153.562096 ms`，WinnerBuild 升至
+`31.923958 ms`。泳道位于：
+
+`pa_scheduler/outputs/pa_scheduler_cross_core_shared_swimlane_20260802_173753_9971/ccec/merged_swimlane.json`
+
+随后只对第二槽增加 primary 优先、Build owner 冲突时改 secondary 的
+均衡约束；首槽仍保留 K2 自由竞争。五轮 `median=3.746665 ms`、
+`mean=3.749903 ms`，仍相对基线回退 `1.852% / 1.563%`。因此问题不能靠
+“提前 Claim 更多未 ready task”解决：它减少轮询，却增加 payload 提前搬运、
+逐槽扫描和执行负载偏斜。双 token 与均衡过程代码均已撤回，未提交为生产
+候选。
+
+下一步改查 **ready-only 发现**：任务未 ready 时不取得执行所有权、不复制
+payload，也不占 owner-local token；只有证明可立即执行时才进入既有 Claim
+与绑定链。该方向必须先解决依赖信息如何低成本取得、延后候选如何重访以及
+两个候选恰好一个 winner，不能把 PA 特例依赖表硬编码进通用协议。

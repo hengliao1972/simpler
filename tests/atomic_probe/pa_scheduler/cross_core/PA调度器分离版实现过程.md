@@ -1113,3 +1113,34 @@ BetweenSubmitResidual `18.710 ms`。下一轮先解释 active token 仍有约
 4 万次 fanin completion 读取以及每次未 ready progress 的非 atomic
 固定成本，再考虑 payload/DCCI；FinalDrain 位于 perf-clock 窗口之外，
 不得靠把 Submit 工作机械后移到 FinalDrain 冒充 1 ms 收益。
+
+## 2026-08-02：S6.4 队首阻塞候选验证与撤回
+
+本阶段在 `c3387747` 干净源码上重新取得十轮基线，中位/均值为
+`3.678558/3.692169 ms`，并按 `perf-clock <= 1.0 ms` 作为后续统一门槛。
+
+先验证了 scanner 的 `BUILT` control 快照复用。它保持 CAS expected 和
+所有 fatal 边界，只删除 Claim helper 对同一 control 的第二次返回型读取；
+CPU/CCEC/A5 均通过，但十轮中位仅改善 `0.312%`、均值回退 `0.260%`，已
+判为波动内并撤回。
+
+随后验证每 worker 两个 owner-local execution token。新增 CPU 交错覆盖：
+第一个 token 持有未 ready SF 时，第二个 token 能领取并完成后续独立 UP；
+依赖就绪后第一个 token 再完成，两个 cell 均 exactly-once 到达 `DONE`。
+两个 token 都由同一 Scalar 普通读写；共享侧仍只有 task cell control CAS，
+没有新增跨核普通发布或 cache-coherence 假设。SchedulerState 增量仅为
+`4928 B × 96 = 473088 B`，host/device 初始化、终态检查、fatal 诊断和
+FinalDrain 排空均曾扩展到两槽并通过完整 CPU、CCEC 与 A5 门槛。
+
+动态结果却否定了该实现：fanin load 从约 `41K--43K` 降至约
+`29K--31K`，但贪心双槽十轮中位/均值升至
+`3.773950/3.779694 ms`。full-swimlane Submit 为 `3.873123 ms`，
+`EfDrainControl=153.562096 ms`、`WinnerBuild=31.923958 ms` 聚合核时，
+单核最大 winner 数达到 39。第二槽增加确定性 primary 优先后，五轮仍为
+`3.746665/3.749903 ms`，没有消除回退。
+
+因此单 token 的确存在未就绪队首阻塞，但“提前多领任务”会用 payload
+搬运、逐槽检查和 K2 负载偏斜交换较少的 fanin poll，端到端不成立。所有
+双 token 过程代码已完整撤回；当前源码恢复为单 token `c3387747`。后续若
+继续处理该瓶颈，应采用不提前 Claim、不占 token 的 ready-only 候选重访，
+并先闭合依赖可见性与活性证明。
