@@ -1,0 +1,1082 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#ifndef PA_SCHEDULER_CROSS_CORE_SHARED_EXEC_PROTOCOL_H
+#define PA_SCHEDULER_CROSS_CORE_SHARED_EXEC_PROTOCOL_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifndef PA_DEVICE
+#error "PA_DEVICE must be defined before including shared_exec_protocol.h"
+#endif
+
+#ifndef PA_GM
+#error "PA_GM must be defined before including shared_exec_protocol.h"
+#endif
+
+namespace pa_scheduler::cross_core {
+
+constexpr uint32_t kExecCacheLineBytes = 64;
+constexpr uint32_t kExecTensorDescBytes = 128;
+constexpr uint32_t kExecTensorDescWords =
+    kExecTensorDescBytes / sizeof(uint64_t);
+constexpr uint32_t kExecMaxTensors = 32;
+constexpr uint32_t kExecMaxScalars = 16;
+constexpr uint32_t kExecMaxFanin = 16;
+constexpr uint32_t kExecHeaderWords =
+    kExecCacheLineBytes / sizeof(uint64_t);
+constexpr uint32_t kExecMaxPayloadBytes =
+    kExecCacheLineBytes +
+    kExecMaxTensors * kExecTensorDescBytes +
+    kExecMaxScalars * sizeof(uint64_t) +
+    kExecMaxFanin * sizeof(int32_t);
+constexpr uint32_t kExecMaxPayloadLines =
+    (kExecMaxPayloadBytes + kExecCacheLineBytes - 1U) /
+    kExecCacheLineBytes;
+constexpr uint32_t kExecMaxPayloadWords =
+    kExecMaxPayloadLines * kExecHeaderWords;
+constexpr uint32_t kExecInvalidFunctionId = UINT32_MAX;
+constexpr uint32_t kExecMaxOwner = 254;
+
+static_assert(
+    kExecTensorDescBytes % sizeof(uint64_t) == 0,
+    "portable TensorDesc must be copied as complete uint64 words"
+);
+static_assert(
+    kExecMaxPayloadBytes == 4352 &&
+        kExecMaxPayloadLines == 68,
+    "shared execution payload capacity changed"
+);
+
+enum class ExecPhase : uint8_t {
+    Empty = 0,
+    Building = 1,
+    Built = 2,
+    Claimed = 3,
+    Done = 4,
+};
+
+enum class ExecEngineClass : uint8_t {
+    None = 0,
+    Aic = 1,
+    Aiv = 2,
+    Joint = 3,
+};
+
+enum class ExecTokenPhase : uint32_t {
+    Idle = 0,
+    Binding = 1,
+    WaitingFanin = 2,
+    EngineInflight = 3,
+    Completing = 4,
+    VendPublished = 5,
+    CompletionPublished = 6,
+    Faulted = 7,
+};
+
+enum class ExecFatalReason : uint8_t {
+    None = 0,
+    InvalidBuildInput = 1,
+    BuildPackFailed = 2,
+    InvalidBuiltControl = 3,
+    ClaimedPayloadInvalid = 4,
+    ControlPublishConflict = 5,
+    InvalidTokenPayload = 6,
+    CompletionPublishFailed = 7,
+    CompletionStateConflict = 8,
+};
+
+enum class ExecBuildResult : uint32_t {
+    Published = 0,
+    InvalidInput = 1,
+    CellUnavailable = 2,
+    PublishConflict = 3,
+    FatalObserved = 4,
+};
+
+enum class ExecClaimResult : uint32_t {
+    Claimed = 0,
+    TokenBusy = 1,
+    NotBuilt = 2,
+    Incompatible = 3,
+    Lost = 4,
+    InvalidControl = 5,
+    InvalidPayload = 6,
+    FatalObserved = 7,
+};
+
+enum class ExecDoneResult : uint32_t {
+    Done = 0,
+    TokenNotCompleting = 1,
+    InvalidTokenPayload = 2,
+    VendPublishFailed = 3,
+    FlagPublishFailed = 4,
+    StateConflict = 5,
+    FatalObserved = 6,
+};
+
+constexpr uint64_t kExecStatePhaseShift = 0;
+constexpr uint64_t kExecStatePhaseMask = 0x7ULL;
+constexpr uint64_t kExecStateOwnerShift = 3;
+constexpr uint64_t kExecStateOwnerMask = 0xFFULL;
+constexpr uint64_t kExecStateEngineShift = 11;
+constexpr uint64_t kExecStateEngineMask = 0x7ULL;
+constexpr uint64_t kExecStatePayloadLinesShift = 14;
+constexpr uint64_t kExecStatePayloadLinesMask = 0x7FULL;
+constexpr uint64_t kExecStateTaskIdShift = 21;
+constexpr uint64_t kExecStateTaskIdMask = 0xFFFFFFFFULL;
+constexpr uint64_t kExecStateKnownMask =
+    (kExecStatePhaseMask << kExecStatePhaseShift) |
+    (kExecStateOwnerMask << kExecStateOwnerShift) |
+    (kExecStateEngineMask << kExecStateEngineShift) |
+    (kExecStatePayloadLinesMask << kExecStatePayloadLinesShift) |
+    (kExecStateTaskIdMask << kExecStateTaskIdShift);
+
+constexpr uint64_t kExecFatalReasonShift = 0;
+constexpr uint64_t kExecFatalReasonMask = 0xFFULL;
+constexpr uint64_t kExecFatalOwnerShift = 8;
+constexpr uint64_t kExecFatalOwnerMask = 0xFFULL;
+constexpr uint64_t kExecFatalTaskIdShift = 16;
+constexpr uint64_t kExecFatalTaskIdMask = 0xFFFFFFFFULL;
+constexpr uint64_t kExecFatalKnownMask =
+    (kExecFatalReasonMask << kExecFatalReasonShift) |
+    (kExecFatalOwnerMask << kExecFatalOwnerShift) |
+    (kExecFatalTaskIdMask << kExecFatalTaskIdShift);
+
+struct DecodedExecState {
+    ExecPhase phase;
+    uint32_t owner;
+    ExecEngineClass engine_class;
+    uint32_t payload_lines;
+    uint32_t task_id;
+    bool valid;
+};
+
+struct DecodedExecFatal {
+    ExecFatalReason reason;
+    uint32_t reporter_owner;
+    uint32_t task_id;
+    bool valid;
+};
+
+struct ExecPayloadLayout {
+    uint32_t payload_bytes;
+    uint32_t payload_lines;
+    uint32_t tensor_word_offset;
+    uint32_t scalar_word_offset;
+    uint32_t fanin_word_offset;
+    uint32_t written_words;
+};
+
+struct ExecPayloadSpec {
+    uint32_t task_id;
+    uint64_t function_address;
+    uint64_t completion_vend;
+    uint32_t function_id;
+    uint16_t tensor_count;
+    uint16_t scalar_count;
+    uint16_t fanin_count;
+    ExecEngineClass engine_class;
+    uint8_t flags;
+    uint32_t multicore_group_id;
+    uint16_t multicore_rank;
+    uint16_t multicore_size;
+};
+
+struct ExecPayloadHeader {
+    uint32_t task_id;
+    uint64_t function_address;
+    uint64_t completion_vend;
+    uint32_t function_id;
+    uint32_t payload_bytes;
+    uint16_t tensor_count;
+    uint16_t scalar_count;
+    uint16_t fanin_count;
+    ExecEngineClass engine_class;
+    uint8_t flags;
+    uint32_t multicore_group_id;
+    uint16_t multicore_rank;
+    uint16_t multicore_size;
+};
+
+struct alignas(kExecCacheLineBytes) SharedExecControl {
+    volatile int64_t state;
+    uint8_t padding[kExecCacheLineBytes - sizeof(int64_t)];
+};
+
+struct alignas(kExecCacheLineBytes) SharedExecFatalControl {
+    volatile int64_t state;
+    uint8_t padding[kExecCacheLineBytes - sizeof(int64_t)];
+};
+
+struct alignas(kExecCacheLineBytes) ExecPayloadStorage {
+    volatile uint64_t words[kExecMaxPayloadWords];
+};
+
+struct alignas(kExecCacheLineBytes) SharedExecCell {
+    SharedExecControl control;
+    ExecPayloadStorage payload;
+};
+
+struct alignas(kExecCacheLineBytes) ExecutionTokenControl {
+    ExecTokenPhase phase;
+    uint32_t task_id;
+    uint32_t execute_owner;
+    ExecEngineClass engine_class;
+    uint32_t payload_lines;
+    uint32_t payload_bytes;
+    uint8_t padding[40];
+};
+
+struct alignas(kExecCacheLineBytes) ExecutionToken {
+    ExecutionTokenControl control;
+    ExecPayloadStorage payload;
+};
+
+static_assert(
+    sizeof(SharedExecControl) == kExecCacheLineBytes &&
+        alignof(SharedExecControl) == kExecCacheLineBytes,
+    "shared execution control must own one cache line"
+);
+static_assert(
+    sizeof(SharedExecFatalControl) == kExecCacheLineBytes &&
+        alignof(SharedExecFatalControl) == kExecCacheLineBytes,
+    "global fatal control must own one atomic-only cache line"
+);
+static_assert(
+    offsetof(SharedExecCell, payload) == kExecCacheLineBytes,
+    "shared execution payload must not share its control line"
+);
+static_assert(
+    sizeof(ExecPayloadStorage) == kExecMaxPayloadBytes &&
+        alignof(ExecPayloadStorage) == kExecCacheLineBytes,
+    "shared execution payload storage ABI changed"
+);
+static_assert(
+    sizeof(SharedExecCell) ==
+        kExecCacheLineBytes + kExecMaxPayloadBytes,
+    "adjacent shared execution cells must remain cache-line isolated"
+);
+static_assert(
+    sizeof(ExecutionTokenControl) == kExecCacheLineBytes &&
+        offsetof(ExecutionToken, payload) == kExecCacheLineBytes,
+    "execution token control and binding must remain separate"
+);
+static_assert(
+    sizeof(ExecutionToken) == sizeof(SharedExecCell),
+    "execution token must hold exactly one maximum active payload"
+);
+
+PA_DEVICE uint64_t EncodeExecState(
+    ExecPhase phase, uint32_t owner,
+    ExecEngineClass engine_class, uint32_t payload_lines,
+    uint32_t task_id
+) {
+    return
+        (static_cast<uint64_t>(phase) << kExecStatePhaseShift) |
+        (static_cast<uint64_t>(owner) << kExecStateOwnerShift) |
+        (static_cast<uint64_t>(engine_class) <<
+         kExecStateEngineShift) |
+        (static_cast<uint64_t>(payload_lines) <<
+         kExecStatePayloadLinesShift) |
+        (static_cast<uint64_t>(task_id) << kExecStateTaskIdShift);
+}
+
+PA_DEVICE bool ExecOwnerValid(uint32_t owner) {
+    return owner <= kExecMaxOwner;
+}
+
+PA_DEVICE bool ExecFatalReasonValid(ExecFatalReason reason) {
+    return reason >= ExecFatalReason::InvalidBuildInput &&
+           reason <= ExecFatalReason::CompletionStateConflict;
+}
+
+PA_DEVICE uint64_t EncodeExecFatal(
+    ExecFatalReason reason, uint32_t reporter_owner,
+    uint32_t task_id
+) {
+    return
+        (static_cast<uint64_t>(reason) << kExecFatalReasonShift) |
+        (static_cast<uint64_t>(reporter_owner) <<
+         kExecFatalOwnerShift) |
+        (static_cast<uint64_t>(task_id) << kExecFatalTaskIdShift);
+}
+
+PA_DEVICE DecodedExecFatal DecodeExecFatal(int64_t raw_state) {
+    const uint64_t raw = static_cast<uint64_t>(raw_state);
+    DecodedExecFatal fatal{
+        static_cast<ExecFatalReason>(
+            (raw >> kExecFatalReasonShift) &
+            kExecFatalReasonMask
+        ),
+        static_cast<uint32_t>(
+            (raw >> kExecFatalOwnerShift) & kExecFatalOwnerMask
+        ),
+        static_cast<uint32_t>(
+            (raw >> kExecFatalTaskIdShift) &
+            kExecFatalTaskIdMask
+        ),
+        false,
+    };
+    fatal.valid = raw != 0 &&
+                  (raw & ~kExecFatalKnownMask) == 0 &&
+                  ExecFatalReasonValid(fatal.reason) &&
+                  ExecOwnerValid(fatal.reporter_owner);
+    return fatal;
+}
+
+template <typename Ops>
+PA_DEVICE bool ExecFatalPublished(
+    PA_GM SharedExecFatalControl &fatal
+) {
+    // 任意非零值都必须 fail-closed；即使记录本身已损坏，也不能继续。
+    return Ops::Load(&fatal.state) != 0;
+}
+
+template <typename Ops>
+PA_DEVICE bool PublishExecFatal(
+    PA_GM SharedExecFatalControl &fatal,
+    ExecFatalReason reason, uint32_t task_id,
+    uint32_t reporter_owner
+) {
+    if (!ExecFatalReasonValid(reason) ||
+        !ExecOwnerValid(reporter_owner)) {
+        return false;
+    }
+    const int64_t desired = static_cast<int64_t>(
+        EncodeExecFatal(reason, reporter_owner, task_id)
+    );
+    // first-failure-wins。fatal line 永不清零，也不做 ordinary store/DCCI。
+    return Ops::CompareExchange(&fatal.state, 0, desired) == 0;
+}
+
+PA_DEVICE bool ExecEngineValid(ExecEngineClass engine_class) {
+    return engine_class == ExecEngineClass::Aic ||
+           engine_class == ExecEngineClass::Aiv ||
+           engine_class == ExecEngineClass::Joint;
+}
+
+PA_DEVICE DecodedExecState DecodeExecState(int64_t raw_state) {
+    const uint64_t raw = static_cast<uint64_t>(raw_state);
+    DecodedExecState state{
+        static_cast<ExecPhase>(
+            (raw >> kExecStatePhaseShift) & kExecStatePhaseMask
+        ),
+        static_cast<uint32_t>(
+            (raw >> kExecStateOwnerShift) & kExecStateOwnerMask
+        ),
+        static_cast<ExecEngineClass>(
+            (raw >> kExecStateEngineShift) & kExecStateEngineMask
+        ),
+        static_cast<uint32_t>(
+            (raw >> kExecStatePayloadLinesShift) &
+            kExecStatePayloadLinesMask
+        ),
+        static_cast<uint32_t>(
+            (raw >> kExecStateTaskIdShift) &
+            kExecStateTaskIdMask
+        ),
+        false,
+    };
+    if ((raw & ~kExecStateKnownMask) != 0) {
+        return state;
+    }
+    switch (state.phase) {
+        case ExecPhase::Empty:
+            state.valid = state.owner == 0 &&
+                          state.engine_class ==
+                              ExecEngineClass::None &&
+                          state.payload_lines == 0 &&
+                          state.task_id == 0;
+            break;
+        case ExecPhase::Building:
+            state.valid = ExecOwnerValid(state.owner) &&
+                          state.engine_class ==
+                              ExecEngineClass::None &&
+                          state.payload_lines == 0;
+            break;
+        case ExecPhase::Built:
+        case ExecPhase::Claimed:
+        case ExecPhase::Done:
+            state.valid = ExecOwnerValid(state.owner) &&
+                          ExecEngineValid(state.engine_class) &&
+                          state.payload_lines >= 1 &&
+                          state.payload_lines <=
+                              kExecMaxPayloadLines;
+            break;
+        default:
+            break;
+    }
+    return state;
+}
+
+PA_DEVICE bool ComputeExecPayloadLayout(
+    uint32_t tensor_count, uint32_t scalar_count,
+    uint32_t fanin_count, ExecPayloadLayout &layout
+) {
+    if (tensor_count > kExecMaxTensors ||
+        scalar_count > kExecMaxScalars ||
+        fanin_count > kExecMaxFanin) {
+        return false;
+    }
+    layout.tensor_word_offset = kExecHeaderWords;
+    layout.scalar_word_offset =
+        layout.tensor_word_offset +
+        tensor_count * kExecTensorDescWords;
+    layout.fanin_word_offset =
+        layout.scalar_word_offset + scalar_count;
+    layout.written_words =
+        layout.fanin_word_offset + (fanin_count + 1U) / 2U;
+    layout.payload_bytes =
+        kExecCacheLineBytes +
+        tensor_count * kExecTensorDescBytes +
+        scalar_count * sizeof(uint64_t) +
+        fanin_count * sizeof(int32_t);
+    layout.payload_lines =
+        (layout.payload_bytes + kExecCacheLineBytes - 1U) /
+        kExecCacheLineBytes;
+    return layout.payload_lines >= 1 &&
+           layout.payload_lines <= kExecMaxPayloadLines &&
+           layout.written_words <= kExecMaxPayloadWords;
+}
+
+PA_DEVICE bool ValidateExecPayloadSpec(
+    const ExecPayloadSpec &spec, ExecPayloadLayout &layout
+) {
+    if (!ExecEngineValid(spec.engine_class) ||
+        (spec.function_id == kExecInvalidFunctionId &&
+         spec.function_address == 0) ||
+        (spec.flags & ~1U) != 0) {
+        return false;
+    }
+    const bool multicore = (spec.flags & 1U) != 0;
+    if ((!multicore &&
+         (spec.multicore_group_id != 0 ||
+          spec.multicore_rank != 0 ||
+          spec.multicore_size != 1)) ||
+        (multicore &&
+         (spec.multicore_size < 2 ||
+          spec.multicore_rank >= spec.multicore_size))) {
+        return false;
+    }
+    return ComputeExecPayloadLayout(
+        spec.tensor_count, spec.scalar_count,
+        spec.fanin_count, layout
+    );
+}
+
+PA_DEVICE uint64_t PackExecHeaderWord0(uint32_t task_id) {
+    // 高 32 位保留并固定为 0。PA 的 output 由
+    // (producer task_id, output_slot) 标识，completion 也发布到
+    // 当前 task；这里不能再引入第二个含义不清的 task 身份。
+    return static_cast<uint64_t>(task_id);
+}
+
+PA_DEVICE uint64_t PackExecHeaderWord3(
+    uint32_t function_id, uint32_t payload_bytes
+) {
+    return static_cast<uint64_t>(function_id) |
+           (static_cast<uint64_t>(payload_bytes) << 32U);
+}
+
+PA_DEVICE uint64_t PackExecHeaderWord4(
+    const ExecPayloadSpec &spec
+) {
+    return static_cast<uint64_t>(spec.tensor_count) |
+           (static_cast<uint64_t>(spec.scalar_count) << 16U) |
+           (static_cast<uint64_t>(spec.fanin_count) << 32U) |
+           (static_cast<uint64_t>(spec.engine_class) << 48U) |
+           (static_cast<uint64_t>(spec.flags) << 56U);
+}
+
+PA_DEVICE uint64_t PackExecHeaderWord5(
+    const ExecPayloadSpec &spec
+) {
+    return static_cast<uint64_t>(spec.multicore_group_id) |
+           (static_cast<uint64_t>(spec.multicore_rank) << 32U) |
+           (static_cast<uint64_t>(spec.multicore_size) << 48U);
+}
+
+template <typename Ops, typename Source>
+PA_DEVICE bool PackExecPayload(
+    PA_GM SharedExecCell &cell, const ExecPayloadSpec &spec,
+    const Source &source, ExecPayloadLayout &layout
+) {
+    if (!ValidateExecPayloadSpec(spec, layout)) {
+        return false;
+    }
+    PA_GM volatile uint64_t *destination = cell.payload.words;
+    Ops::StorePayloadWord(
+        &destination[0],
+        PackExecHeaderWord0(spec.task_id)
+    );
+    Ops::StorePayloadWord(&destination[1], spec.function_address);
+    Ops::StorePayloadWord(&destination[2], spec.completion_vend);
+    Ops::StorePayloadWord(
+        &destination[3],
+        PackExecHeaderWord3(spec.function_id, layout.payload_bytes)
+    );
+    Ops::StorePayloadWord(
+        &destination[4], PackExecHeaderWord4(spec)
+    );
+    Ops::StorePayloadWord(
+        &destination[5], PackExecHeaderWord5(spec)
+    );
+    Ops::StorePayloadWord(&destination[6], 0);
+    Ops::StorePayloadWord(&destination[7], 0);
+
+    uint32_t destination_word = layout.tensor_word_offset;
+    for (uint32_t tensor = 0;
+         tensor < spec.tensor_count; ++tensor) {
+        for (uint32_t word = 0;
+             word < kExecTensorDescWords; ++word) {
+            Ops::StorePayloadWord(
+                &destination[destination_word++],
+                source.TensorWord(tensor, word)
+            );
+        }
+    }
+    for (uint32_t scalar = 0;
+         scalar < spec.scalar_count; ++scalar) {
+        Ops::StorePayloadWord(
+            &destination[destination_word++],
+            source.Scalar(scalar)
+        );
+    }
+    for (uint32_t fanin = 0;
+         fanin < spec.fanin_count; fanin += 2U) {
+        const int32_t low_producer = source.Fanin(fanin);
+        if (low_producer < 0 ||
+            static_cast<uint32_t>(low_producer) >= spec.task_id) {
+            return false;
+        }
+        const uint64_t low =
+            static_cast<uint32_t>(low_producer);
+        uint64_t high = 0;
+        if (fanin + 1U < spec.fanin_count) {
+            const int32_t high_producer = source.Fanin(fanin + 1U);
+            if (high_producer < 0 ||
+                static_cast<uint32_t>(high_producer) >=
+                    spec.task_id) {
+                return false;
+            }
+            high = static_cast<uint32_t>(high_producer);
+        }
+        Ops::StorePayloadWord(
+            &destination[destination_word++], low | (high << 32U)
+        );
+    }
+    return destination_word == layout.written_words;
+}
+
+PA_DEVICE ExecPayloadHeader DecodeExecPayloadHeader(
+    PA_GM const ExecPayloadStorage &payload
+) {
+    const uint64_t word0 = payload.words[0];
+    const uint64_t word3 = payload.words[3];
+    const uint64_t word4 = payload.words[4];
+    const uint64_t word5 = payload.words[5];
+    return ExecPayloadHeader{
+        static_cast<uint32_t>(word0),
+        payload.words[1],
+        payload.words[2],
+        static_cast<uint32_t>(word3),
+        static_cast<uint32_t>(word3 >> 32U),
+        static_cast<uint16_t>(word4),
+        static_cast<uint16_t>(word4 >> 16U),
+        static_cast<uint16_t>(word4 >> 32U),
+        static_cast<ExecEngineClass>(
+            static_cast<uint8_t>(word4 >> 48U)
+        ),
+        static_cast<uint8_t>(word4 >> 56U),
+        static_cast<uint32_t>(word5),
+        static_cast<uint16_t>(word5 >> 32U),
+        static_cast<uint16_t>(word5 >> 48U),
+    };
+}
+
+PA_DEVICE bool ValidateBoundExecPayload(
+    PA_GM const ExecutionToken &token,
+    uint32_t expected_task_id,
+    ExecEngineClass expected_engine,
+    uint32_t published_lines,
+    ExecPayloadHeader &header,
+    ExecPayloadLayout &layout
+) {
+    header = DecodeExecPayloadHeader(token.payload);
+    if ((token.payload.words[0] >> 32U) != 0 ||
+        token.payload.words[6] != 0 ||
+        token.payload.words[7] != 0 ||
+        header.task_id != expected_task_id ||
+        header.engine_class != expected_engine ||
+        (header.function_id == kExecInvalidFunctionId &&
+         header.function_address == 0) ||
+        (header.flags & ~1U) != 0 ||
+        !ComputeExecPayloadLayout(
+            header.tensor_count, header.scalar_count,
+            header.fanin_count, layout
+        ) ||
+        header.payload_bytes != layout.payload_bytes ||
+        published_lines != layout.payload_lines) {
+        return false;
+    }
+    const bool multicore = (header.flags & 1U) != 0;
+    return
+        (!multicore && header.multicore_group_id == 0 &&
+         header.multicore_rank == 0 &&
+         header.multicore_size == 1) ||
+        (multicore && header.multicore_size >= 2 &&
+         header.multicore_rank < header.multicore_size);
+}
+
+PA_DEVICE void ResetExecutionToken(
+    PA_GM ExecutionToken &token
+) {
+    token.control.task_id = UINT32_MAX;
+    token.control.execute_owner = UINT32_MAX;
+    token.control.engine_class = ExecEngineClass::None;
+    token.control.payload_lines = 0;
+    token.control.payload_bytes = 0;
+    token.control.phase = ExecTokenPhase::Idle;
+}
+
+template <typename Ops, typename Source>
+PA_DEVICE ExecBuildResult BuildAndPublishExecPayload(
+    PA_GM SharedExecCell &cell, uint32_t build_owner,
+    const ExecPayloadSpec &spec, const Source &source,
+    PA_GM SharedExecFatalControl &fatal
+) {
+    if (ExecFatalPublished<Ops>(fatal)) {
+        return ExecBuildResult::FatalObserved;
+    }
+    ExecPayloadLayout checked_layout{};
+    if (!ExecOwnerValid(build_owner) ||
+        !ValidateExecPayloadSpec(spec, checked_layout)) {
+        (void)PublishExecFatal<Ops>(
+            fatal, ExecFatalReason::InvalidBuildInput,
+            spec.task_id,
+            ExecOwnerValid(build_owner) ? build_owner : 0
+        );
+        return ExecBuildResult::InvalidInput;
+    }
+    const int64_t empty_state = static_cast<int64_t>(
+        EncodeExecState(
+            ExecPhase::Empty, 0, ExecEngineClass::None, 0, 0
+        )
+    );
+    const int64_t building_state = static_cast<int64_t>(
+        EncodeExecState(
+            ExecPhase::Building, build_owner,
+            ExecEngineClass::None, 0, spec.task_id
+        )
+    );
+    if (Ops::CompareExchange(
+            &cell.control.state, empty_state, building_state
+        ) != empty_state) {
+        return ExecBuildResult::CellUnavailable;
+    }
+    if (ExecFatalPublished<Ops>(fatal)) {
+        return ExecBuildResult::FatalObserved;
+    }
+    Ops::PreloadBuildDestination(
+        &cell.payload,
+        static_cast<uint64_t>(checked_layout.payload_lines) *
+            kExecCacheLineBytes
+    );
+    ExecPayloadLayout packed_layout{};
+    if (!PackExecPayload<Ops>(
+            cell, spec, source, packed_layout
+        ) ||
+        packed_layout.payload_bytes !=
+            checked_layout.payload_bytes ||
+        packed_layout.payload_lines !=
+            checked_layout.payload_lines) {
+        (void)PublishExecFatal<Ops>(
+            fatal, ExecFatalReason::BuildPackFailed,
+            spec.task_id, build_owner
+        );
+        return ExecBuildResult::InvalidInput;
+    }
+    if (ExecFatalPublished<Ops>(fatal)) {
+        return ExecBuildResult::FatalObserved;
+    }
+    Ops::FlushRegion(
+        &cell.payload,
+        static_cast<uint64_t>(packed_layout.payload_lines) *
+            kExecCacheLineBytes
+    );
+    // 默认实现只保留编译器边界；S2 探针会在这里注入受控延迟，
+    // 证明 Flush 返回并不等价于 BUILT 已经发布。
+    Ops::BeforeBuiltPublish(spec.task_id);
+    if (ExecFatalPublished<Ops>(fatal)) {
+        return ExecBuildResult::FatalObserved;
+    }
+    const int64_t built_state = static_cast<int64_t>(
+        EncodeExecState(
+            ExecPhase::Built, build_owner,
+            spec.engine_class, packed_layout.payload_lines,
+            spec.task_id
+        )
+    );
+    if (Ops::CompareExchange(
+            &cell.control.state, building_state, built_state
+        ) != building_state) {
+        (void)PublishExecFatal<Ops>(
+            fatal, ExecFatalReason::ControlPublishConflict,
+            spec.task_id, build_owner
+        );
+        return ExecBuildResult::PublishConflict;
+    }
+    return ExecBuildResult::Published;
+}
+
+PA_DEVICE bool ExecEngineCompatible(
+    ExecEngineClass task_engine, ExecEngineClass executor_engine
+) {
+    return task_engine == executor_engine;
+}
+
+template <typename Ops>
+PA_DEVICE ExecClaimResult ClaimAndBindExecPayload(
+    PA_GM SharedExecCell &cell, uint32_t task_id,
+    uint32_t execute_owner, ExecEngineClass executor_engine,
+    PA_GM ExecutionToken &token,
+    PA_GM SharedExecFatalControl &fatal
+) {
+    if (token.control.phase != ExecTokenPhase::Idle) {
+        return ExecClaimResult::TokenBusy;
+    }
+    if (ExecFatalPublished<Ops>(fatal)) {
+        return ExecClaimResult::FatalObserved;
+    }
+    if (!ExecOwnerValid(execute_owner) ||
+        !ExecEngineValid(executor_engine)) {
+        (void)PublishExecFatal<Ops>(
+            fatal, ExecFatalReason::InvalidBuiltControl,
+            task_id,
+            ExecOwnerValid(execute_owner) ? execute_owner : 0
+        );
+        return ExecClaimResult::InvalidControl;
+    }
+    const int64_t observed_raw = Ops::Load(&cell.control.state);
+    const DecodedExecState observed = DecodeExecState(observed_raw);
+    if (!observed.valid) {
+        (void)PublishExecFatal<Ops>(
+            fatal, ExecFatalReason::InvalidBuiltControl,
+            task_id, execute_owner
+        );
+        return ExecClaimResult::InvalidControl;
+    }
+    if (observed.phase != ExecPhase::Built) {
+        return ExecClaimResult::NotBuilt;
+    }
+    if (observed.task_id != task_id) {
+        (void)PublishExecFatal<Ops>(
+            fatal, ExecFatalReason::InvalidBuiltControl,
+            task_id, execute_owner
+        );
+        return ExecClaimResult::InvalidControl;
+    }
+    if (!ExecEngineCompatible(
+            observed.engine_class, executor_engine
+        )) {
+        return ExecClaimResult::Incompatible;
+    }
+    if (ExecFatalPublished<Ops>(fatal)) {
+        return ExecClaimResult::FatalObserved;
+    }
+    const int64_t claimed_raw = static_cast<int64_t>(
+        EncodeExecState(
+            ExecPhase::Claimed, execute_owner,
+            observed.engine_class, observed.payload_lines,
+            observed.task_id
+        )
+    );
+    if (Ops::CompareExchange(
+            &cell.control.state, observed_raw, claimed_raw
+        ) != observed_raw) {
+        return ExecClaimResult::Lost;
+    }
+
+    token.control.task_id = task_id;
+    token.control.execute_owner = execute_owner;
+    token.control.engine_class = observed.engine_class;
+    token.control.payload_lines = observed.payload_lines;
+    token.control.payload_bytes = 0;
+    token.control.phase = ExecTokenPhase::Binding;
+
+    if (ExecFatalPublished<Ops>(fatal)) {
+        token.control.phase = ExecTokenPhase::Faulted;
+        return ExecClaimResult::FatalObserved;
+    }
+
+    const uint64_t published_bytes =
+        static_cast<uint64_t>(observed.payload_lines) *
+        kExecCacheLineBytes;
+    // CAS 返回值已经在上面的分支中被消费。这个窄 hook 只用于比较
+    // “直接 Invalidate”与“额外前置 DSB”，不得在其中读取 payload。
+    Ops::BeforePayloadAcquire(task_id);
+    Ops::InvalidateRegion(&cell.payload, published_bytes);
+    Ops::PreloadPayloadSource(&cell.payload, published_bytes);
+    Ops::PreloadTokenDestination(&token.payload, published_bytes);
+    const uint32_t published_words =
+        observed.payload_lines * kExecHeaderWords;
+    for (uint32_t word = 0;
+         word < published_words; ++word) {
+        Ops::StoreTokenPayloadWord(
+            &token.payload.words[word],
+            Ops::LoadPayloadWord(&cell.payload.words[word])
+        );
+    }
+
+    ExecPayloadHeader header{};
+    ExecPayloadLayout layout{};
+    if (!ValidateBoundExecPayload(
+            token, task_id, observed.engine_class,
+            observed.payload_lines, header, layout
+        )) {
+        // 已取得共享所有权但 payload 不可信时必须永久 fail-closed；
+        // Faulted 既阻止再次 Claim，也不满足 completion 的入口状态。
+        token.control.phase = ExecTokenPhase::Faulted;
+        (void)PublishExecFatal<Ops>(
+            fatal, ExecFatalReason::ClaimedPayloadInvalid,
+            task_id, execute_owner
+        );
+        return ExecClaimResult::InvalidPayload;
+    }
+    token.control.payload_bytes = layout.payload_bytes;
+    token.control.phase = ExecTokenPhase::WaitingFanin;
+    return ExecClaimResult::Claimed;
+}
+
+PA_DEVICE ExecPayloadHeader ExecutionTokenHeader(
+    PA_GM const ExecutionToken &token
+) {
+    return DecodeExecPayloadHeader(token.payload);
+}
+
+PA_DEVICE bool ExecutionTokenTensorWord(
+    PA_GM const ExecutionToken &token, uint32_t tensor,
+    uint32_t word, uint64_t &value
+) {
+    const ExecPayloadHeader header = ExecutionTokenHeader(token);
+    if (tensor >= header.tensor_count ||
+        word >= kExecTensorDescWords) {
+        return false;
+    }
+    value = token.payload.words[
+        kExecHeaderWords +
+        tensor * kExecTensorDescWords + word
+    ];
+    return true;
+}
+
+PA_DEVICE bool ExecutionTokenScalar(
+    PA_GM const ExecutionToken &token, uint32_t scalar,
+    uint64_t &value
+) {
+    const ExecPayloadHeader header = ExecutionTokenHeader(token);
+    if (scalar >= header.scalar_count) {
+        return false;
+    }
+    value = token.payload.words[
+        kExecHeaderWords +
+        header.tensor_count * kExecTensorDescWords + scalar
+    ];
+    return true;
+}
+
+PA_DEVICE bool ExecutionTokenFanin(
+    PA_GM const ExecutionToken &token, uint32_t edge,
+    int32_t &producer
+) {
+    const ExecPayloadHeader header = ExecutionTokenHeader(token);
+    if (edge >= header.fanin_count) {
+        return false;
+    }
+    const uint32_t word_offset =
+        kExecHeaderWords +
+        header.tensor_count * kExecTensorDescWords +
+        header.scalar_count + edge / 2U;
+    const uint64_t packed = token.payload.words[word_offset];
+    producer = static_cast<int32_t>(
+        edge % 2U == 0
+            ? static_cast<uint32_t>(packed)
+            : static_cast<uint32_t>(packed >> 32U)
+    );
+    return true;
+}
+
+template <typename ReadySource>
+PA_DEVICE bool ExecutionTokenFaninReady(
+    PA_GM const ExecutionToken &token,
+    const ReadySource &ready_source
+) {
+    if (token.control.phase != ExecTokenPhase::WaitingFanin) {
+        return false;
+    }
+    const ExecPayloadHeader header = ExecutionTokenHeader(token);
+    for (uint32_t edge = 0; edge < header.fanin_count; ++edge) {
+        int32_t producer = -1;
+        if (!ExecutionTokenFanin(token, edge, producer) ||
+            producer < 0 ||
+            static_cast<uint32_t>(producer) >= header.task_id ||
+            !ready_source.IsReady(producer)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <typename Ops, typename ReadySource>
+PA_DEVICE bool TryMarkExecutionTokenEngineInflight(
+    PA_GM ExecutionToken &token,
+    const ReadySource &ready_source,
+    PA_GM SharedExecFatalControl &fatal
+) {
+    // fanin 判断与状态推进保持在同一个 helper 中，调用方不能绕过
+    // ready 检查直接把 WAITING_FANIN 改成 ENGINE_INFLIGHT。
+    if (ExecFatalPublished<Ops>(fatal)) {
+        token.control.phase = ExecTokenPhase::Faulted;
+        return false;
+    }
+    if (!ExecutionTokenFaninReady(token, ready_source)) {
+        return false;
+    }
+    if (ExecFatalPublished<Ops>(fatal)) {
+        token.control.phase = ExecTokenPhase::Faulted;
+        return false;
+    }
+    token.control.phase = ExecTokenPhase::EngineInflight;
+    return true;
+}
+
+template <typename Ops, typename EngineCompletionSource>
+PA_DEVICE bool TryMarkExecutionTokenCompleting(
+    PA_GM ExecutionToken &token,
+    const EngineCompletionSource &engine_completion,
+    PA_GM SharedExecFatalControl &fatal
+) {
+    if (token.control.phase != ExecTokenPhase::EngineInflight) {
+        return false;
+    }
+    // fatal 发生在 engine in-flight 时仍需先等真实 engine 完成，避免
+    // Scalar 提前退出而遗留尚在访问 GM 的 AIC/AIV 指令流。
+    if (!engine_completion.IsComplete(token)) return false;
+    if (ExecFatalPublished<Ops>(fatal)) {
+        token.control.phase = ExecTokenPhase::Faulted;
+        return false;
+    }
+    token.control.phase = ExecTokenPhase::Completing;
+    return true;
+}
+
+template <typename Ops, typename CompletionSink>
+PA_DEVICE ExecDoneResult PublishExecDoneAfterCompletion(
+    PA_GM SharedExecCell &cell, PA_GM ExecutionToken &token,
+    CompletionSink &completion,
+    PA_GM SharedExecFatalControl &fatal
+) {
+    if (token.control.phase != ExecTokenPhase::Completing &&
+        token.control.phase != ExecTokenPhase::VendPublished &&
+        token.control.phase != ExecTokenPhase::CompletionPublished) {
+        return ExecDoneResult::TokenNotCompleting;
+    }
+    if (!ExecOwnerValid(token.control.execute_owner) ||
+        !ExecEngineValid(token.control.engine_class) ||
+        token.control.payload_lines < 1 ||
+        token.control.payload_lines > kExecMaxPayloadLines) {
+        (void)PublishExecFatal<Ops>(
+            fatal, ExecFatalReason::InvalidTokenPayload,
+            token.control.task_id,
+            ExecOwnerValid(token.control.execute_owner)
+                ? token.control.execute_owner : 0
+        );
+        token.control.phase = ExecTokenPhase::Faulted;
+        return ExecDoneResult::InvalidTokenPayload;
+    }
+    if (ExecFatalPublished<Ops>(fatal)) {
+        return ExecDoneResult::FatalObserved;
+    }
+    const ExecPayloadHeader header = ExecutionTokenHeader(token);
+    if (header.task_id != token.control.task_id ||
+        header.engine_class != token.control.engine_class) {
+        token.control.phase = ExecTokenPhase::Faulted;
+        (void)PublishExecFatal<Ops>(
+            fatal, ExecFatalReason::InvalidTokenPayload,
+            token.control.task_id, token.control.execute_owner
+        );
+        return ExecDoneResult::InvalidTokenPayload;
+    }
+    if (token.control.phase == ExecTokenPhase::Completing) {
+        if (ExecFatalPublished<Ops>(fatal)) {
+            return ExecDoneResult::FatalObserved;
+        }
+        if (!completion.PublishVend(
+                header.task_id, header.completion_vend
+            )) {
+            (void)PublishExecFatal<Ops>(
+                fatal, ExecFatalReason::CompletionPublishFailed,
+                header.task_id, token.control.execute_owner
+            );
+            return ExecDoneResult::VendPublishFailed;
+        }
+        token.control.phase = ExecTokenPhase::VendPublished;
+    }
+    if (token.control.phase == ExecTokenPhase::VendPublished) {
+        if (ExecFatalPublished<Ops>(fatal)) {
+            return ExecDoneResult::FatalObserved;
+        }
+        if (!completion.PublishFlag(header.task_id)) {
+            (void)PublishExecFatal<Ops>(
+                fatal, ExecFatalReason::CompletionPublishFailed,
+                header.task_id, token.control.execute_owner
+            );
+            return ExecDoneResult::FlagPublishFailed;
+        }
+        token.control.phase = ExecTokenPhase::CompletionPublished;
+    }
+    const int64_t claimed_raw = static_cast<int64_t>(
+        EncodeExecState(
+            ExecPhase::Claimed, token.control.execute_owner,
+            token.control.engine_class,
+            token.control.payload_lines,
+            token.control.task_id
+        )
+    );
+    const int64_t done_raw = static_cast<int64_t>(
+        EncodeExecState(
+            ExecPhase::Done, token.control.execute_owner,
+            token.control.engine_class,
+            token.control.payload_lines,
+            token.control.task_id
+        )
+    );
+    if (ExecFatalPublished<Ops>(fatal)) {
+        return ExecDoneResult::FatalObserved;
+    }
+    if (Ops::CompareExchange(
+            &cell.control.state, claimed_raw, done_raw
+        ) != claimed_raw) {
+        (void)PublishExecFatal<Ops>(
+            fatal, ExecFatalReason::CompletionStateConflict,
+            header.task_id, token.control.execute_owner
+        );
+        return ExecDoneResult::StateConflict;
+    }
+    ResetExecutionToken(token);
+    return ExecDoneResult::Done;
+}
+
+}  // namespace pa_scheduler::cross_core
+
+#endif  // PA_SCHEDULER_CROSS_CORE_SHARED_EXEC_PROTOCOL_H
