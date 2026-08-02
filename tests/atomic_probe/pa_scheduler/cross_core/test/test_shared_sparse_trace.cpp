@@ -210,10 +210,38 @@ SharedHostTaskPlan MakeCompactTracePlan() {
     return plan;
 }
 
+void TestSharedClaimAttemptedBoundary() {
+    for (uint32_t worker = 0;
+         worker < pa_scheduler::kWorkers; ++worker) {
+        for (uint32_t kind = 0;
+             kind < static_cast<uint32_t>(TaskKind::Count);
+             ++kind) {
+            Check(
+                pa_scheduler::host::SharedTraceClaimAttempted(
+                    worker, 17U, static_cast<TaskKind>(kind)
+                ),
+                "every valid task kind is attempted by every Scalar"
+            );
+        }
+    }
+    Check(
+        !pa_scheduler::host::SharedTraceClaimAttempted(
+            pa_scheduler::kWorkers, 17U, TaskKind::Qk
+        ) &&
+            !pa_scheduler::host::SharedTraceClaimAttempted(
+                0U, 17U, TaskKind::Count
+            ) &&
+            !pa_scheduler::host::SharedTraceClaimAttempted(
+                0U, 17U, static_cast<TaskKind>(UINT32_MAX)
+            ),
+        "worker and task-kind boundaries fail closed"
+    );
+}
+
 void TestSharedCompactReconstruction() {
     // AIV worker 32 不属于旧 task0%4 的 24 核分片。用它作为
-    // Alloc winner 锁定当前 96 核全候选合同；同时用 PV winner
-    // 锁定 S5a 的异角色 Build 合同：QK/PV 必须由 AIV 竞争。
+    // Alloc winner 锁定当前 96 核全候选合同；S5b 下同一
+    // worker 对所有 kernel task 也都必须标记 Claim attempted。
     constexpr uint32_t worker = 32;
     constexpr uint64_t base_cycle = 5000;
     const SharedHostTaskPlan plan = MakeCompactTracePlan();
@@ -221,7 +249,7 @@ void TestSharedCompactReconstruction() {
         true, false, false, true, false,
     };
     constexpr bool attempted[] = {
-        true, true, false, true, false,
+        true, true, true, true, true,
     };
     std::vector<SharedSubmitClaimTraceRecord> compact(
         plan.total_tasks
@@ -416,25 +444,33 @@ void TestRejectsBadSharedCompactRecords() {
         );
     }
     TraceRecord unused_generic{};
-    auto rejected = [&](
+    auto rejected_for_worker = [&](
+        uint32_t candidate_worker,
         const std::vector<SharedSubmitClaimTraceRecord> &records
     ) {
         std::vector<TraceRecord> logical;
         return !ExpandSharedTraceRecords(
-            worker, &unused_generic, 0,
+            candidate_worker, &unused_generic, 0,
             records.data(), plan, &logical
         );
     };
+    auto rejected = [&rejected_for_worker, worker](
+        const std::vector<SharedSubmitClaimTraceRecord> &records
+    ) {
+        return rejected_for_worker(worker, records);
+    };
 
-    // worker 0 是 AIC，S5a 下它可以合法赢得 SF/UP Build，
-    // 但不能赢得 QK/PV Build。先锁定正例，再保留反例的
-    // role-ineligible 语义，避免只更换数组下标却未验证新合同。
+    // worker 0 是 AIC，S5b 下它对 AIC/AIV kernel 都是合法
+    // Build 候选。同时保留 worker 越界的反例，防止把
+    // “全部 96 核”错放宽成任意 worker id。
     std::vector<SharedSubmitClaimTraceRecord> legal = valid;
+    legal[1].claim_end_and_winner |=
+        pa_scheduler::kSharedClaimWinnerBit;
     legal[2].claim_end_and_winner |=
         pa_scheduler::kSharedClaimWinnerBit;
     Check(
         !rejected(legal),
-        "SF winner on an AIC worker is accepted"
+        "one AIC worker may win both AIC- and AIV-engine task Build"
     );
 
     std::vector<SharedSubmitClaimTraceRecord> bad = valid;
@@ -450,8 +486,8 @@ void TestRejectsBadSharedCompactRecords() {
     bad[1].claim_end_and_winner |=
         pa_scheduler::kSharedClaimWinnerBit;
     Check(
-        rejected(bad),
-        "winner on a role-ineligible Claim is rejected"
+        rejected_for_worker(pa_scheduler::kWorkers, bad),
+        "winner outside the 96-Scalar Claim population is rejected"
     );
 
     bad = valid;
@@ -1380,6 +1416,7 @@ void TestPlanClosesAllLogicalTasks() {
 
 int main() {
     TestTraceBinaryLayoutAndHeaderGate();
+    TestSharedClaimAttemptedBoundary();
     TestSharedCompactReconstruction();
     TestSharedCompactStageOnlyReconstruction();
     TestSharedCompactGenericMergeOrder();

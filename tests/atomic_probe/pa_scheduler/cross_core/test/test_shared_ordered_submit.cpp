@@ -615,13 +615,11 @@ bool LegacyTurnsMatch(
 uint32_t ExpectedClaimAttempts(TaskKind kind) {
     switch (kind) {
         case TaskKind::Alloc:
-            return kSharedAllocClaimParticipants;
         case TaskKind::Qk:
-        case TaskKind::Pv:
-            return kAivWorkers;
         case TaskKind::Sf:
+        case TaskKind::Pv:
         case TaskKind::Up:
-            return kAicWorkers;
+            return kWorkers;
         case TaskKind::Count:
             return 0;
     }
@@ -633,22 +631,21 @@ uint32_t ExpectedClaimGroups(TaskKind kind) {
         case TaskKind::Alloc:
             return kSharedAllocClaimTournamentGroups;
         case TaskKind::Qk:
-        case TaskKind::Pv:
-            return kSharedAivClaimTournamentGroups;
         case TaskKind::Sf:
+        case TaskKind::Pv:
         case TaskKind::Up:
-            return kSharedAicClaimTournamentGroups;
+            return kSharedKernelClaimTournamentGroups;
         case TaskKind::Count:
             return 0;
     }
     return 0;
 }
 
-bool CrossRoleBuildEvidenceMatches(
+bool PortableBuildEvidenceMatches(
     const SchedulerState &state, uint32_t task_count
 ) {
     uint32_t planned_tasks = 0;
-    uint32_t cross_role_tasks = 0;
+    uint32_t portable_kernel_tasks = 0;
     bool exact = true;
     for (uint32_t batch = 0;
          batch < state.config.batches; ++batch) {
@@ -678,27 +675,63 @@ bool CrossRoleBuildEvidenceMatches(
             const bool aic_kernel =
                 task.kind == TaskKind::Qk ||
                 task.kind == TaskKind::Pv;
-            const bool build_on_opposite_role = aic_kernel
-                ? decoded.build_owner >= kAicWorkers &&
-                    decoded.build_owner < kWorkers
-                : decoded.build_owner < kAicWorkers;
             const bool execute_on_kernel_role = aic_kernel
                 ? decoded.execute_owner < kAicWorkers
                 : decoded.execute_owner >= kAicWorkers &&
                     decoded.execute_owner < kWorkers;
+            uint32_t primary = 0;
+            uint32_t secondary = 0;
+            if (aic_kernel) {
+                primary = task_id % kAicWorkers;
+                secondary = (primary + 1U) % kAicWorkers;
+            } else {
+                primary = kAicWorkers + task_id % kAivWorkers;
+                secondary = kAicWorkers +
+                    ((primary - kAicWorkers + 2U) % kAivWorkers);
+            }
+            const bool execute_in_k2 =
+                decoded.execute_owner == primary ||
+                decoded.execute_owner == secondary;
             exact &= decoded.valid &&
                 decoded.phase == cross_core::ExecPhase::Done &&
                 decoded.task_id == task_id &&
-                build_on_opposite_role &&
+                decoded.build_owner < kWorkers &&
                 execute_on_kernel_role &&
+                execute_in_k2 &&
                 decoded.build_owner != decoded.execute_owner;
-            ++cross_role_tasks;
+            ++portable_kernel_tasks;
         }
         planned_tasks += plan.task_count;
     }
     return exact && planned_tasks == task_count &&
-        cross_role_tasks ==
+        portable_kernel_tasks ==
             task_count - state.config.batches;
+}
+
+bool RunB256ClaimCasBudgetContractTest() {
+    constexpr uint64_t kBatches = 256;
+    constexpr uint64_t kTasksPerBatch = 5;
+    constexpr uint64_t kTasks = kBatches * kTasksPerBatch;
+    constexpr uint64_t kLocalCas = kTasks * kWorkers;
+    constexpr uint64_t kRootCas =
+        kBatches * (
+            kSharedAllocClaimTournamentGroups +
+            4U * kSharedKernelClaimTournamentGroups
+        );
+    constexpr uint64_t kPhysicalCas = kLocalCas + kRootCas;
+    const bool ok =
+        kLocalCas == 122880U &&
+        kRootCas == 10240U &&
+        kPhysicalCas == 133120U;
+    std::printf(
+        "[ORDERED_SUBMIT] b256_claim_cas_budget=%s "
+        "local=%llu root=%llu physical=%llu\n",
+        ok ? "PASS" : "FAIL",
+        static_cast<unsigned long long>(kLocalCas),
+        static_cast<unsigned long long>(kRootCas),
+        static_cast<unsigned long long>(kPhysicalCas)
+    );
+    return ok;
 }
 
 bool RunLocalClaimAttemptAccountingTest() {
@@ -1543,7 +1576,7 @@ bool RunInsertReleaseBeforeBuildTest() {
         ClaimAndInsertEvidenceMatches(
             *state, kTaskCount
         ) &&
-        CrossRoleBuildEvidenceMatches(
+        PortableBuildEvidenceMatches(
             *state, kTaskCount
         ) &&
         OrderedSubmitTestOps::task4_insert_hook_calls.load(
@@ -1661,7 +1694,7 @@ bool RunIndependentKernelExecutionTest() {
         ClaimAndInsertEvidenceMatches(
             *state, kTaskCount
         ) &&
-        CrossRoleBuildEvidenceMatches(
+        PortableBuildEvidenceMatches(
             *state, kTaskCount
         ) &&
         OrderedSubmitTestOps::independent_insert_hook_calls.load(
@@ -1712,6 +1745,8 @@ bool RunIndependentKernelExecutionTest() {
 int main() {
     const bool claim_accounting_ok =
         RunLocalClaimAttemptAccountingTest();
+    const bool claim_cas_budget_ok =
+        RunB256ClaimCasBudgetContractTest();
     const bool task_id_prefix_ok =
         RunSplitReplayTaskIdPrefixTest();
     const bool loser_ok = RunLoserZeroTensorMapAccessTest();
@@ -1726,7 +1761,8 @@ int main() {
     const bool overlap_ok = RunInsertReleaseBeforeBuildTest();
     const bool execution_ok =
         RunIndependentKernelExecutionTest();
-    if (!claim_accounting_ok || !task_id_prefix_ok || !loser_ok ||
+    if (!claim_accounting_ok || !claim_cas_budget_ok ||
+        !task_id_prefix_ok || !loser_ok ||
         !output_prepare_ok ||
         !fanin_compaction_ok || !efdrain_skip_ok ||
         !pa_up_shape_ok ||
@@ -1739,7 +1775,8 @@ int main() {
     std::printf(
         "[PASS] shared loser skips TensorMap; lookup/Build and "
         "independent kernel execution cross prior owner Build; "
-        "QK/PV Build on AIV and SF/UP Build on AIC\n"
+        "all 96 Scalar workers can Build every kernel while execution "
+        "remains on a distinct legal K2 owner\n"
     );
     return 0;
 }

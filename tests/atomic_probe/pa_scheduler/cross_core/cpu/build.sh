@@ -214,10 +214,10 @@ echo "[TEST] atomic PollBatch boundary self-test"
     echo "[TEST] shared heap no-wrap reserve self-test"
     "$BUILD_DIR/test_shared_heap_reserve"
 
-    # shared Claim 使用每 task 两级 CAS Tournament：Alloc 为 96/G8，
-    # QK/PV 由对侧 64 个 AIV 以 G8 Build，SF/UP 由对侧 32 个 AIC
-    # 以 G6 Build。用例锁定每组一个 root 竞争者、最终唯一 owner、
-    # 重复 replay 全输，并证明未来 task 不会覆盖延迟的前序 task。
+    # shared Claim 使用每 task 两级 CAS Tournament：S5b 的 Alloc 与四类
+    # kernel 都由全部 96 个 Scalar 以 G8 竞争 Build。用例锁定每组一个
+    # root 竞争者、最终唯一 owner、重复 replay 全输，并证明未来 task
+    # 不会覆盖延迟的前序 task。
     # Claim 仍不触碰 deps_prepared；TensorMap 顺序由独立完成链验证。
     echo "[BUILD] shared Claim Tournament self-test"
     "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \

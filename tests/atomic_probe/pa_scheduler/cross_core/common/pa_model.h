@@ -236,30 +236,27 @@ constexpr uint32_t kRuntimeMaxWorkers = 108;
 constexpr uint32_t kCursorShards = 4;
 // shared Alloc 恢复全部 96 个 worker 参与 Claim。两级 Tournament
 // 仍把同地址竞争分散到八个 local 节点，但不再用 task-id
-// 分片剥夺空闲非候选核的接管机会。S5a 的 kernel Build 候选在
-// 人口不变时交换物理角色：AIC engine task 使用 64 个 AIV builder，
-// AIV engine task 使用 32 个 AIC builder。
+// 分片剥夺空闲非候选核的接管机会。S5b 将同一合同扩到全部 kernel：
+// 每个 task 都允许 96 个 Scalar 竞争 Build，kernel 类型只约束后续
+// Execute owner 的 engine，不再约束 Build owner。
 constexpr uint32_t kSharedAllocClaimParticipants = kWorkers;
 static_assert(
     kSharedAllocClaimParticipants == 96,
     "shared Alloc Claim participants must cover all workers"
 );
 #if PTO_FDWIC_SHARED_MAP
-// shared owner 仲裁保持 96/32/64 三档候选人口，只把它们分散到
+// shared owner 仲裁把每个 task 的 96 个候选分散到
 // per-task 两级 Tournament：每组先选一个 local owner，各 local owner
 // 再竞争唯一 root owner。组数来自 A5 同地址竞争探针的实测候选，不能
 // 解释为缩减 Submit 参与核数。
-// `kSharedAic/AivClaimTournamentGroups` 按实际 builder 的 Scalar 角色
-// 命名；S5a 中它们分别服务 SF/UP Build 与 QK/PV Build。
 // Alloc 恢复 96 候选后使用 8 组，把两级同地址宽度从
 // G4 的 24/4 收敛为 12/8。G12 的 A5 mean 只比 G8 改善
 // 0.029%，无法覆盖四个额外 local 节点带来的状态增量；因此
-// 复用已有 8 个 local 节点，不增加 SchedulerState 大小。
+// kernel 也复用同样的 96/G8，不增加 SchedulerState 大小。
 constexpr uint32_t kSharedAllocClaimTournamentGroups = 8;
-constexpr uint32_t kSharedAicClaimTournamentGroups = 6;
-constexpr uint32_t kSharedAivClaimTournamentGroups = 8;
+constexpr uint32_t kSharedKernelClaimTournamentGroups = 8;
 constexpr uint32_t kSharedClaimTournamentMaxGroups =
-    kSharedAivClaimTournamentGroups;
+    kSharedKernelClaimTournamentGroups;
 // A5 探针中，同一轮 local 节点相隔 512B 时取得当前最短结果。每个节点
 // 只有首 8B 是 atomic 状态，其余字节只负责把并发热点映射到不同地址；
 // 节点不与普通 store/DCCI 数据共线。
@@ -267,16 +264,18 @@ constexpr uint32_t kSharedClaimTournamentNodeStride = 512;
 static_assert(
     kSharedAllocClaimParticipants == 96 &&
         kAicWorkers == 32 && kAivWorkers == 64,
-    "shared Claim candidate populations must remain 96/32/64"
+    "shared S5b Claim requires all 96 Scalar workers"
 );
 static_assert(
     kSharedAllocClaimTournamentGroups > 0 &&
         kSharedAllocClaimTournamentGroups <=
             kSharedAllocClaimParticipants &&
-        kSharedAicClaimTournamentGroups > 0 &&
-        kSharedAicClaimTournamentGroups <= kAicWorkers &&
-        kSharedAivClaimTournamentGroups > 0 &&
-        kSharedAivClaimTournamentGroups <= kAivWorkers,
+        kSharedKernelClaimTournamentGroups > 0 &&
+        kSharedKernelClaimTournamentGroups <= kWorkers &&
+        kSharedClaimTournamentMaxGroups >=
+            kSharedAllocClaimTournamentGroups &&
+        kSharedClaimTournamentMaxGroups >=
+            kSharedKernelClaimTournamentGroups,
     "every shared Claim Tournament group must have a candidate"
 );
 #endif

@@ -7,12 +7,12 @@
 | 目标 | 让 task 的构建 owner 与 kernel 执行 owner 可以是不同物理核 |
 | 当前代码 | Build owner 发布 task-indexed shared payload，K2 排除 Build owner 后的 1 或 2 个 eligible executor 竞争执行 |
 | 本文性质 | 持续更新的架构与内存模型设计记录 |
-| 正式实现 | S0–S4 K2 及 S5a 跨角色 Build 已通过 CPU/CCEC/A5；S5b 全 96 Scalar Build 尚未开始 |
-| CPU 正确性用例 | S1–S4 K2 及 S5a 对侧角色 Build、PA payload、动态合法 owner 和 drain 门槛已完成 |
+| 正式实现 | S0–S4 K2 及 S5a 跨角色 Build 已通过 CPU/CCEC/A5；S5b 全 96 Scalar Build 已闭合 CPU，CCEC/A5 待验证 |
+| CPU 正确性用例 | S1–S4 K2、S5a 对侧角色 Build 与 S5b 全 96 Scalar Build 门槛已完成 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
 | A5 PA 功能/性能 | S3b full-swimlane 27.128 ms；S4 K2 为 27.476 ms；S5a B256 普通/完整泳道为 27.143/27.301 ms，均只记录单样本 |
 | S4 动态 Execute election | K2 首版已通过 CPU B1/B256 和 A5 B1/B256；B256 中两候选都有实际胜出，非法 owner 为 0 |
-| S5 Build 拓扑 | S5a 交换 QK/PV 与 SF/UP 的 Build 角色但保持候选人口和 CAS 总量不变，CPU/CCEC/A5 B1/B256 已闭合；S5b 全 96 Scalar 尚未开始 |
+| S5 Build 拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 已将五类 task 扩到 96/G8 并闭合 CPU B1/B256，CCEC/A5 待验证 |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
 
@@ -961,8 +961,8 @@ S5 拆成两个正交阶段，先证明可移植性，再扩大竞争人口：
    `73,728 / 9,216 / 82,944`，因此本阶段不会把 payload 可移植性与新增
    atomic 竞争混算。Build owner 位于 engine 对侧，也不会占用 K2 中的
    任一席位，两个 execute candidate 都保留竞争资格。
-2. **S5b 任意 Scalar Build**：S5a 的 CPU/CCEC/A5 证据闭合后，再把
-   kernel Build 扩到 96/G8。B256 预计 local/root/总物理 CAS 变为
+2. **S5b 任意 Scalar Build**：把 Alloc/QK/SF/PV/UP 的 Build 候选统一扩到
+   96/G8。B256 的 local/root/总物理 CAS 精确变为
    `122,880 / 10,240 / 133,120`，相对 S5a 总物理 CAS 增加约 60.5%；
    该代价必须单独和更好的到达式负载均衡比较。
 
@@ -979,6 +979,15 @@ Build owner 位于 AIC，Execute owner 仍匹配目标 engine、属于 host 独�
 分别为 `27.143 ms / 27.301 ms`，完整泳道中 primary/secondary 分别执行
 `363/661` 个 kernel，非法 owner 为 0、trace drop 为 0。该单轮数值只用于
 排除倍数级结构性异常，不宣称相对 S4 有稳定性能收益。
+
+S5b 的 CPU 阶段已闭合：五类 task 的 96 个 Scalar 都实际进入
+Build Claim，Build owner 可以是 AIC 或 AIV；Execute owner 仍必须匹配
+engine、位于 host 独立复算的 K2，且不得与 Build owner 相同。
+CPU B1/B256 real-compute 及全部独立门槛 PASS；B256 逻辑 Claim
+精确为 `122,880`，隔离 Tournament 门槛精确闭合
+`122,880 / 10,240 / 133,120`。CPU B256 全 atomic trace 会因
+FinalDrain 轮询记录耗尽通用 trace 容量，因此不用它代替 A5 的
+物理 CAS 与 DCCI 动态证据。CCEC/A5 在下一笔独立验证。
 
 ### S6：再接 engine/Scalar overlap
 
@@ -1071,7 +1080,7 @@ function ABI、heap/completion 合同、构建宏边界和现有 PA 正确性，
 
 ## 16. 尚未决定的问题
 
-1. S5 扩大 Build owner 时，候选应为所有 Scalar、只用 AIV，还是按当前 task 核型？S0–S4 已决定保持现有拓扑。
+1. S5b 已选择所有 96 个 Scalar 作为 Build 候选；尚需由 A5 证据决定负载均衡收益能否覆盖额外 60.5% 物理 Claim CAS。
 2. 最终版 executor 是直接 dispatch shared payload，还是复制 active prefix 到唯一紧凑 token？首版已决定后者，不复活 4-slot ring。
 3. portable payload 的最小通用 ABI 是什么，怎样兼容真实 function address 和 joint task？
 4. 更通用的 heap 协议中 completion vend 应如何表达？首版已决定在 Materialize reservation 成功后冻结。

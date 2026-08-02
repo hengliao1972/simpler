@@ -20,7 +20,7 @@
 | S2 | CCEC 最小 A5 跨核发布/领取探针 | 已完成 |
 | S3 | standalone PA 接入构建/执行分离 | 已完成：S3a 与固定两候选异核 S3b 均已闭合，S3b 通过 CPU、A5 B1/B256 和 B256 full-swimlane |
 | S4 | 受控的动态 Execute election | K2 首版已通过完整 CPU、CCEC 和 A5 B1/B256 门槛 |
-| S5 | 独立扩大 Build owner 候选核拓扑 | S5a 跨角色 Build 已通过完整 CPU/CCEC/A5 B1/B256；S5b 全 96 Scalar 尚未开始 |
+| S5 | 独立扩大 Build owner 候选核拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 全 96 Scalar 已闭合 CPU，CCEC/A5 待验证 |
 | S6 | 引入 engine/Scalar overlap | 未开始 |
 | S7 | 基于累积证据做性能评估与容量/复用优化 | 未开始 |
 | 贯穿观测门槛（不编号） | 泳道、submit-PMU 与 perf-clock 三条互不混算的证据链 | perf-clock 与 full-swimlane 已可用；cross-core submit-PMU 尚未接入 |
@@ -752,7 +752,8 @@ engine 对侧，因此不会占用 K2 的任何一席；primary、secondary 都�
 
 - `Claim()` 只在 shared 分支交换 QK/PV、SF/UP 的候选角色和
   Tournament 分组；private 分支保持原有 engine 同角色 cursor 语义。
-- 新增 `PaCrossRoleBuildOwnerEligible()` 作为生产拓扑策略。portable
+- 当时新增 `PaCrossRoleBuildOwnerEligible()` 作为 S5a 阶段性拓扑策略；
+  S5b 扩到全 96 Scalar 后，该 helper 已收敛为 `PaBuildOwnerEligible()`。portable
   `PaExecuteOwnerEligible()` 仍只要求 builder 有效、executor 匹配 engine、
   位于 K2 且不同于 builder，不把阶段性 Build 策略写死进通用 payload
   协议。
@@ -808,5 +809,54 @@ DCCI/atomic 动态证据。
 
 `outputs/pa_scheduler_cross_core_shared_swimlane_20260802_133108_3915277/ccec/merged_swimlane.json`
 
-至此 S5a 的 CPU/CCEC/A5 功能门槛闭合。下一阶段 S5b 才将 kernel Build
-候选扩大为 96/G8，并单独评估额外 Claim CAS 与到达式负载均衡的权衡。
+至此 S5a 的 CPU/CCEC/A5 功能门槛闭合。在此基础上，下节 S5b
+再将 kernel Build 候选扩大为 96/G8，并单独评估额外 Claim CAS
+与到达式负载均衡的权衡。
+
+## 2026-08-02：S5b 全 96 Scalar Build 的 CPU 门槛
+
+### 本阶段改变了什么
+
+- Alloc/QK/SF/PV/UP 的 Build Claim 统一扩为 96 个 Scalar、G8 两级
+  Tournament；每个 local 节点精确对应 12 个候选核。
+- kernel 类型只决定 function 和 Execute engine，不再决定 Build owner
+  是 AIC 还是 AIV。`PaBuildOwnerEligible()` 只接受 `[0,96)` 的有效
+  Scalar；Execute 仍需匹配 engine、位于 K2 且与 builder 不同核。
+- TensorMap 严格插入顺序仍由 `deps_prepared` commit chain 保证；
+  Claim 扩容没有把 metadata 插入或 kernel 执行塞入该串行链。
+- private TensorMap 的 engine 同角色候选、cursor 和 `atomicMax` 路径保持不变。
+- CCEC 两类 role 现在都可能赢得五类 task，因此预期每类入口
+  的 split-finish relocation 从 3 条变为 5 条；该形状留待下一阶段
+  CCEC 编译硬校验，本 CPU 提交不提前宣称通过。
+
+### 计数合同
+
+B256 共 1280 个 task，所以：
+
+```text
+local CAS = 1280 * 96 = 122880
+root CAS  = 1280 * 8  = 10240
+总物理 CAS = 133120
+```
+
+相对 S5a 的 `82,944` 次总物理 Claim CAS，S5b 增加约 60.5%。
+这是到达式 Build 负载均衡的明确代价，A5 评估时必须单独呈现，
+不能只看端到端单个数字。
+
+### CPU 证据
+
+- 完整 CPU build 及 Claim Tournament、portable adapter、K2 scanner、
+  ordered Submit、稀疏/紧凑 trace 和 FinalDrain 门槛全部 PASS。
+- 确定性用例覆盖 builder 位于 K2 primary、secondary、K2 外同角色
+  与跨角色四种形状，并覆盖 BUILDING/BUILT、busy token、fatal、
+  terminal 与 FinalDrain。
+- CPU B1/B256 real-compute 的 semantic/postprocess 全部 PASS；B256 逻辑
+  Claim 精确为 `122,880`。隔离 Tournament 门槛精确闭合
+  `122,880 / 10,240 / 133,120`；B1 atomic 分析闭合 `480 / 40 / 520`。
+- CPU B256 全 atomic trace 因 FinalDrain 轮询记录耗尽通用 trace 容量，
+  无法进入新增的物理 CAS 后处理。这是观察容量限制，不是协议卡死；
+  普通 B256 和隔离 Tournament 门槛已分别提供逻辑与物理计数证据。
+
+CCEC 编译和 A5 B1/B256 在下一阶段运行；CPU 耗时不用于推导 A5
+性能，CPU cache coherence 也不能代替 A5 Scalar 无 coherence 下的
+DCCI/atomic 动态证据。

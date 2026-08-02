@@ -947,16 +947,19 @@ PA_DEVICE ClaimOutcome Claim(
 ) {
     // private 继续在单调 cursor 上执行 atomicMax；shared 则用每 task
     // 独立的两级 CAS Tournament 选出唯一 owner。private 保持原有
-    // engine 同角色候选；shared S5a 则在候选人口不变的前提下交换
-    // kernel Build 角色：QK/PV 由 64 个 AIV 候选，SF/UP 由 32 个
-    // AIC 候选。这样每个 kernel 都能确定性验证跨角色 Build，同时不把
-    // 新增 Claim CAS 混入本阶段。shared TensorMap 的严格插入顺序不由
-    // Claim 承担，而由 winner 后续的 deps_prepared commit chain 保证。
+    // engine 同角色候选；shared S5b 则让每个 kernel 都由全部 96 个
+    // Scalar 竞争 Build。kernel 类型只决定 function/Execute engine，
+    // 不再限制 builder 角色。shared TensorMap 的严格插入顺序不由 Claim
+    // 承担，而由 winner 后续的 deps_prepared commit chain 保证。
     // role 来自 RunSchedulerImpl 的入口 SSA 值；不能在每个 task 中再从
     // WorkerState GM 回读同一字段，否则 B256 会产生 98,304 次冗余读取。
     ClaimOutcome outcome{false, false, 0, -1};
 #if PTO_FDWIC_SHARED_MAP
-    if (task_id >= kMaxTasks) {
+    const bool worker_role_matches =
+        (role == CoreRole::Aic && worker_id < kAicWorkers) ||
+        (role == CoreRole::Aiv && worker_id >= kAicWorkers &&
+         worker_id < kWorkers);
+    if (task_id >= kMaxTasks || !worker_role_matches) {
         return outcome;
     }
     uint32_t candidate_rank = 0;
@@ -1003,16 +1006,11 @@ PA_DEVICE ClaimOutcome Claim(
         }
         if ((core_mask & 1U) != 0) {
 #if PTO_FDWIC_SHARED_MAP
-            // QK/PV 最终仍在 AIC engine 执行，但 S5a 明确由对侧 AIV
-            // Scalar 构建 portable payload。rank 在 AIV 人口内连续编号，
-            // 沿用 64/G8 Tournament，不增加物理 CAS 数。
-            if (role != CoreRole::Aiv ||
-                worker_id < kAicWorkers || worker_id >= kWorkers) {
-                return outcome;
-            }
-            candidate_rank = worker_id - kAicWorkers;
+            // QK/PV 最终仍在 AIC engine 执行；S5b 允许任意 Scalar
+            // 构建 portable payload，worker_id 直接作为 96 核连续 rank。
+            candidate_rank = worker_id;
             tournament_groups =
-                kSharedAivClaimTournamentGroups;
+                kSharedKernelClaimTournamentGroups;
 #else
             if (role != CoreRole::Aic) return outcome;
             cursor = &state->cube_cursor[task_id % kCursorShards];
@@ -1020,14 +1018,11 @@ PA_DEVICE ClaimOutcome Claim(
             outcome.function_id = aic_kernel;
         } else if ((core_mask & 6U) != 0) {
 #if PTO_FDWIC_SHARED_MAP
-            // SF/UP 最终仍在 AIV engine 执行，但由对侧 32 个 AIC
-            // Scalar 构建；沿用 32/G6 Tournament。
-            if (role != CoreRole::Aic || worker_id >= kAicWorkers) {
-                return outcome;
-            }
+            // SF/UP 最终仍在 AIV engine 执行；Build 同样覆盖全部
+            // 96 个 Scalar，不把 engine 路由反向写进 Claim 资格。
             candidate_rank = worker_id;
             tournament_groups =
-                kSharedAicClaimTournamentGroups;
+                kSharedKernelClaimTournamentGroups;
 #else
             if (role != CoreRole::Aiv) return outcome;
             cursor = &state->vector_cursor[task_id % kCursorShards];
@@ -1047,7 +1042,7 @@ PA_DEVICE ClaimOutcome Claim(
 
     // 每个候选只等待自己唯一一次 local CAS 的返回。失败者立即返回；
     // 每组唯一 local owner 才继续访问 root，因此 root 同地址竞争者从
-    // 96/32/64 收敛为 8/6/8。
+    // 每个 task 的 96 个候选收敛为 8 个 root 竞争者。
     const int64_t local_observed =
         TraceAtomicCompareExchange<Ops>(
             stats.trace, stats.result,
@@ -4020,7 +4015,7 @@ PA_DEVICE_NOINLINE bool PublishCrossCoreExecTask(
         kind == TaskKind::Alloc || kind == TaskKind::Count ||
         function_id != FunctionId(kind) ||
         !cross_core::ResolvePaExecRoute(kind, function_id, route) ||
-        !cross_core::PaCrossRoleBuildOwnerEligible(
+        !cross_core::PaBuildOwnerEligible(
             worker_id, route.engine_class
         )) {
         PublishCrossCoreRuntimeFailure<Ops>(
@@ -4158,7 +4153,7 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
         header.task_id != token.control.task_id ||
         route.engine_class != token.control.engine_class ||
         route.engine_class != CrossCoreEngineForRole(worker.role) ||
-        !cross_core::PaCrossRoleBuildOwnerEligible(
+        !cross_core::PaBuildOwnerEligible(
             token.control.build_owner, route.engine_class
         ) ||
         !cross_core::PaExecuteOwnerEligible(
@@ -4454,7 +4449,7 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
         }
 
         if (observed.task_id != task_id ||
-            !cross_core::PaCrossRoleBuildOwnerEligible(
+            !cross_core::PaBuildOwnerEligible(
                 observed.build_owner, route_engine
             )) {
             PublishCrossCoreRuntimeFailure<Ops>(
@@ -4767,7 +4762,7 @@ PA_DEVICE bool ValidateCrossCoreExecTerminalCells(
                     decoded.phase == cross_core::ExecPhase::Done &&
                     decoded.task_id == task_id &&
                     decoded.engine_class == expected_engine &&
-                    cross_core::PaCrossRoleBuildOwnerEligible(
+                    cross_core::PaBuildOwnerEligible(
                         decoded.build_owner, expected_engine
                     ) &&
                     cross_core::PaExecuteOwnerEligible(

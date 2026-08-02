@@ -205,10 +205,11 @@ COMMON_FLAGS=(
 # 精确尺寸预留；runtime object、单 role section 与最终双 role 布局都必须
 # 使用同一数值，不能靠多留一条未说明的 cache line 掩盖 ABI 漂移。
 SPLIT_STATE_STORAGE_BYTES=1728
-# shared nonwinner 在 caller 内直接收尾，因此 AIC 只保留 Alloc/QK/PV，
-# AIV 只保留 Alloc/SF/UP 三条跨 TU winner finish。split-finish 是两种
-# 构建共同的固定调用形状，不能为 perf-clock 改成另一条 inline 路径。
-SPLIT_FINISH_CALL_SITES=3
+# shared nonwinner 在 caller 内直接收尾。S5b 的任意 Scalar Build 允许
+# AIC/AIV 都成为 Alloc/QK/SF/PV/UP winner，因此两个 role caller 都必须
+# 保留五条跨 TU winner finish relocation。split-finish 是两种构建共同的
+# 固定调用形状，不能为 perf-clock 改成另一条 inline 路径。
+SPLIT_FINISH_CALL_SITES=5
 COMMON_FLAGS+=(
     -mllvm -cce-block-local-relocate=true
     -mllvm "-cce-block-local-reserve-size=$SPLIT_STATE_STORAGE_BYTES"
