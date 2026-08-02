@@ -49,17 +49,39 @@ struct ExecScanTestOps {
     static inline std::array<uint32_t, 8> executed_tasks{};
     static inline volatile int64_t *watched_control = nullptr;
     static inline uint32_t watched_control_loads = 0;
+    static inline uint32_t watched_control_cas_calls = 0;
+    static inline volatile int64_t *fatal_after_load_address = nullptr;
+    static inline volatile int32_t *injected_global_fatal = nullptr;
+    static inline volatile int32_t *fatal_after_execute = nullptr;
 
     static void ResetObservations() {
         execute_calls = 0;
         executed_tasks.fill(UINT32_MAX);
         watched_control = nullptr;
         watched_control_loads = 0;
+        watched_control_cas_calls = 0;
+        fatal_after_load_address = nullptr;
+        injected_global_fatal = nullptr;
+        fatal_after_execute = nullptr;
     }
 
     static void WatchControl(volatile int64_t *control) {
         watched_control = control;
         watched_control_loads = 0;
+        watched_control_cas_calls = 0;
+    }
+
+    static void InjectGlobalFatalAfterLoad(
+        volatile int64_t *address, volatile int32_t *fatal
+    ) {
+        fatal_after_load_address = address;
+        injected_global_fatal = fatal;
+    }
+
+    static void InjectGlobalFatalAfterExecute(
+        volatile int32_t *fatal
+    ) {
+        fatal_after_execute = fatal;
     }
 
     static int32_t Load(volatile int32_t *address) {
@@ -72,9 +94,19 @@ struct ExecScanTestOps {
         if (address == watched_control) {
             ++watched_control_loads;
         }
-        return __atomic_fetch_add(
+        const int64_t value = __atomic_fetch_add(
             address, int64_t{0}, __ATOMIC_ACQUIRE
         );
+        if (address == fatal_after_load_address &&
+            injected_global_fatal != nullptr) {
+            volatile int32_t *fatal = injected_global_fatal;
+            // 单次注入必须先撤销触发器，避免被后续同地址 Load 重复解释
+            // 为多个并发故障窗口。
+            fatal_after_load_address = nullptr;
+            injected_global_fatal = nullptr;
+            __atomic_store_n(fatal, int32_t{1}, __ATOMIC_RELEASE);
+        }
+        return value;
     }
 
     static uint64_t Load(volatile uint64_t *address) {
@@ -111,6 +143,9 @@ struct ExecScanTestOps {
         volatile int64_t *address, int64_t expected,
         int64_t desired
     ) {
+        if (address == watched_control) {
+            ++watched_control_cas_calls;
+        }
         int64_t observed = expected;
         (void)__atomic_compare_exchange_n(
             address, &observed, desired, false,
@@ -184,6 +219,11 @@ struct ExecScanTestOps {
         }
         executed_tasks[execute_calls++] =
             ExecutionTokenHeader(token).task_id;
+        if (fatal_after_execute != nullptr) {
+            volatile int32_t *fatal = fatal_after_execute;
+            fatal_after_execute = nullptr;
+            __atomic_store_n(fatal, int32_t{1}, __ATOMIC_RELEASE);
+        }
         return true;
     }
 };
@@ -1105,6 +1145,382 @@ void TestInvalidStatesFailClosed() {
     std::printf("[PASS] %s\n", kTest);
 }
 
+void TestExistingGlobalFatalDoesNotFabricateExecFatal() {
+    constexpr const char *kTest =
+        "existing-global-fatal-preserves-first-failure";
+    MappedSchedulerState mapping;
+    SchedulerState *state = mapping.Get();
+    Check(state != nullptr, kTest, "state mapping");
+    if (state == nullptr) return;
+
+    constexpr uint32_t kTask = 1;
+    constexpr uint32_t kBuilder = 1;
+    WorkerState &worker = PrepareWorker(
+        *state, kBuilder, CoreRole::Aic
+    );
+    LocalStats stats{};
+    InitLocalStats(stats, kBuilder, CoreRole::Aic);
+    TaskArgs args{};
+    SubmitContext context{};
+    __atomic_store_n(
+        &state->fatal.value, int32_t{1}, __ATOMIC_RELEASE
+    );
+    ExecScanTestOps::ResetObservations();
+    ExecScanTestOps::WatchControl(
+        &state->exec_cells[kTask].control.state
+    );
+
+    const bool published =
+        PublishCrossCoreExecTask<ExecScanTestOps>(
+            state, worker, kTask, TaskKind::Qk,
+            FunctionId(TaskKind::Qk), args, context, stats
+        );
+    const DecodedExecState cell = DecodeExecState(
+        state->exec_cells[kTask].control.state
+    );
+    Check(
+        !published && state->fatal.value == 1 &&
+            state->exec_fatal.state == 0 &&
+            cell.valid && cell.phase == ExecPhase::Empty &&
+            ExecScanTestOps::watched_control_loads == 0 &&
+            ExecScanTestOps::watched_control_cas_calls == 0 &&
+            stats.result.slot_tensor_copies == 0 &&
+            stats.result.slot_scalar_copies == 0 &&
+            stats.result.fanin_edges == 0,
+        kTest,
+        "pre-existing scheduler fatal stops Build without fake exec fatal"
+    );
+    std::printf("[PASS] %s\n", kTest);
+}
+
+void TestGlobalFatalFaultsActiveTokens() {
+    constexpr const char *kTest =
+        "global-fatal-faults-active-token";
+    bool all_cases_ok = true;
+
+    // WAITING_FANIN 必须由真实 Claim/Bind 路径产生；producer 1 尚未
+    // ready，使第一次 progress 确定停在该阶段。
+    {
+        MappedSchedulerState mapping;
+        SchedulerState *state = mapping.Get();
+        all_cases_ok &= state != nullptr;
+        if (state != nullptr) {
+            constexpr uint32_t kTask = 2;
+            constexpr uint32_t kBuilder = 34;
+            uint32_t primary = 0;
+            uint32_t secondary = 0;
+            uint32_t executor = 0;
+            all_cases_ok &= PlannedOwners(
+                kTask, TaskKind::Sf, kBuilder,
+                primary, secondary, executor
+            ) && PublishKernelCell(
+                *state, kTask, kBuilder, TaskKind::Sf, {1}
+            );
+            WorkerState &worker = PrepareWorker(
+                *state, executor, CoreRole::Aiv
+            );
+            LocalStats stats{};
+            InitLocalStats(stats, executor, CoreRole::Aiv);
+            all_cases_ok &= RegisterLocalCandidate(
+                stats, kTask, TaskKind::Sf
+            );
+            ExecScanTestOps::ResetObservations();
+            (void)ProgressCrossCoreExec<ExecScanTestOps>(
+                state, worker, kTask + 1U, false,
+                DrainPlace::EfDrain, stats
+            );
+            all_cases_ok &=
+                state->exec_tokens[executor].control.phase ==
+                    ExecTokenPhase::WaitingFanin &&
+                DecodeExecState(
+                    state->exec_cells[kTask].control.state
+                ).phase == ExecPhase::Claimed &&
+                ExecScanTestOps::execute_calls == 0 && NoFatal(*state);
+
+            __atomic_store_n(
+                &state->fatal.value, int32_t{1}, __ATOMIC_RELEASE
+            );
+            const uint32_t progressed =
+                ProgressCrossCoreExec<ExecScanTestOps>(
+                    state, worker, kTask + 1U, false,
+                    DrainPlace::EfDrain, stats
+                );
+            all_cases_ok &= progressed == 0 &&
+                state->exec_tokens[executor].control.phase ==
+                    ExecTokenPhase::Faulted &&
+                DecodeExecState(
+                    state->exec_cells[kTask].control.state
+                ).phase == ExecPhase::Claimed &&
+                state->tasks[kTask].vend == 0 &&
+                state->tasks[kTask].flag == 0 &&
+                state->exec_fatal.state == 0 &&
+                ExecScanTestOps::execute_calls == 0;
+        }
+    }
+
+    // COMPLETING 由完整的 Claim/Bind/ready/kernel/engine-complete helper
+    // 链构造；测试只把 global fatal 放在下一次 completion progress 前。
+    {
+        MappedSchedulerState mapping;
+        SchedulerState *state = mapping.Get();
+        all_cases_ok &= state != nullptr;
+        if (state != nullptr) {
+            constexpr uint32_t kTask = 1;
+            constexpr uint32_t kBuilder = 1;
+            uint32_t primary = 0;
+            uint32_t secondary = 0;
+            uint32_t executor = 0;
+            all_cases_ok &= PlannedOwners(
+                kTask, TaskKind::Qk, kBuilder,
+                primary, secondary, executor
+            ) && PublishKernelCell(
+                *state, kTask, kBuilder, TaskKind::Qk
+            );
+            WorkerState &worker = PrepareWorker(
+                *state, executor, CoreRole::Aic
+            );
+            LocalStats stats{};
+            InitLocalStats(stats, executor, CoreRole::Aic);
+            ExecutionToken &token = state->exec_tokens[executor];
+            const ExecClaimResult claim =
+                ClaimAndBindExecPayload<ExecScanTestOps>(
+                    state->exec_cells[kTask], kTask, executor,
+                    ExecEngineClass::Aic, token, state->exec_fatal
+                );
+            PaExecReadySource<ExecScanTestOps> ready{
+                state, &stats.result
+            };
+            const PaExecSynchronousEngineCompletion engine_complete{};
+            all_cases_ok &= claim == ExecClaimResult::Claimed &&
+                BindPaExecutionTokenDispatchAfterClaim(token, worker) &&
+                TryMarkExecutionTokenEngineInflight<ExecScanTestOps>(
+                    token, ready, state->exec_fatal
+                ) &&
+                ExecutePaBoundKernel<ExecScanTestOps>(
+                    state, worker, token, TaskKind::Qk, 0
+                ) &&
+                TryMarkExecutionTokenCompleting<ExecScanTestOps>(
+                    token, engine_complete, state->exec_fatal
+                ) &&
+                token.control.phase == ExecTokenPhase::Completing;
+
+            ExecScanTestOps::ResetObservations();
+            __atomic_store_n(
+                &state->fatal.value, int32_t{1}, __ATOMIC_RELEASE
+            );
+            const uint32_t progressed =
+                ProgressCrossCoreExec<ExecScanTestOps>(
+                    state, worker, kTask + 1U, false,
+                    DrainPlace::EfDrain, stats
+                );
+            all_cases_ok &= progressed == 0 &&
+                token.control.phase == ExecTokenPhase::Faulted &&
+                DecodeExecState(
+                    state->exec_cells[kTask].control.state
+                ).phase == ExecPhase::Claimed &&
+                state->tasks[kTask].vend == 0 &&
+                state->tasks[kTask].flag == 0 &&
+                state->exec_fatal.state == 0 &&
+                ExecScanTestOps::execute_calls == 0 &&
+                stats.result.placement[
+                    static_cast<uint32_t>(DrainPlace::EfDrain)
+                ] == 0;
+        }
+    }
+
+    Check(
+        all_cases_ok, kTest,
+        "WAITING_FANIN/COMPLETING converge to Faulted without completion"
+    );
+    std::printf("[PASS] %s\n", kTest);
+}
+
+void TestGlobalFatalStopsIrreversibleBoundaries() {
+    constexpr const char *kTest =
+        "global-fatal-stops-irreversible-boundaries";
+    bool all_cases_ok = true;
+
+    // scanner 已取得 BUILT 快照后立刻注入 global fatal。下一步必须在
+    // Claim CAS 前停住；保留 BUILT 和候选 bit 是可重复观察的直接证据。
+    {
+        MappedSchedulerState mapping;
+        SchedulerState *state = mapping.Get();
+        all_cases_ok &= state != nullptr;
+        if (state != nullptr) {
+            constexpr uint32_t kTask = 1;
+            constexpr uint32_t kBuilder = 1;
+            uint32_t primary = 0;
+            uint32_t secondary = 0;
+            uint32_t executor = 0;
+            all_cases_ok &= PlannedOwners(
+                kTask, TaskKind::Qk, kBuilder,
+                primary, secondary, executor
+            ) && PublishKernelCell(
+                *state, kTask, kBuilder, TaskKind::Qk
+            );
+            WorkerState &worker = PrepareWorker(
+                *state, executor, CoreRole::Aic
+            );
+            LocalStats stats{};
+            InitLocalStats(stats, executor, CoreRole::Aic);
+            all_cases_ok &= RegisterLocalCandidate(
+                stats, kTask, TaskKind::Qk
+            );
+            ExecScanTestOps::ResetObservations();
+            ExecScanTestOps::WatchControl(
+                &state->exec_cells[kTask].control.state
+            );
+            ExecScanTestOps::InjectGlobalFatalAfterLoad(
+                &state->exec_cells[kTask].control.state,
+                &state->fatal.value
+            );
+            const uint32_t progressed =
+                ProgressCrossCoreExec<ExecScanTestOps>(
+                    state, worker, kTask + 1U, false,
+                    DrainPlace::EfDrain, stats
+                );
+            all_cases_ok &= progressed == 0 &&
+                state->fatal.value == 1 &&
+                state->exec_fatal.state == 0 &&
+                DecodeExecState(
+                    state->exec_cells[kTask].control.state
+                ).phase == ExecPhase::Built &&
+                state->exec_tokens[executor].control.phase ==
+                    ExecTokenPhase::Idle &&
+                CandidateBitForTask(
+                    stats, executor, CoreRole::Aic, kTask
+                ) &&
+                ExecScanTestOps::watched_control_loads == 1 &&
+                ExecScanTestOps::watched_control_cas_calls == 0 &&
+                ExecScanTestOps::execute_calls == 0 &&
+                state->tasks[kTask].vend == 0 &&
+                state->tasks[kTask].flag == 0;
+        }
+    }
+
+    // fanin 的最后一次 ready Load 返回后注入 fatal，精确覆盖
+    // WAITING_FANIN -> ENGINE_INFLIGHT 与真实 kernel 发射之间的窗口。
+    {
+        MappedSchedulerState mapping;
+        SchedulerState *state = mapping.Get();
+        all_cases_ok &= state != nullptr;
+        if (state != nullptr) {
+            constexpr uint32_t kTask = 2;
+            constexpr uint32_t kBuilder = 34;
+            uint32_t primary = 0;
+            uint32_t secondary = 0;
+            uint32_t executor = 0;
+            all_cases_ok &= PlannedOwners(
+                kTask, TaskKind::Sf, kBuilder,
+                primary, secondary, executor
+            ) && PublishKernelCell(
+                *state, kTask, kBuilder, TaskKind::Sf, {1}
+            );
+            __atomic_store_n(
+                &state->tasks[1].flag, int64_t{1}, __ATOMIC_RELEASE
+            );
+            WorkerState &worker = PrepareWorker(
+                *state, executor, CoreRole::Aiv
+            );
+            LocalStats stats{};
+            InitLocalStats(stats, executor, CoreRole::Aiv);
+            all_cases_ok &= RegisterLocalCandidate(
+                stats, kTask, TaskKind::Sf
+            );
+            ExecScanTestOps::ResetObservations();
+            ExecScanTestOps::WatchControl(
+                &state->exec_cells[kTask].control.state
+            );
+            ExecScanTestOps::InjectGlobalFatalAfterLoad(
+                &state->tasks[1].flag, &state->fatal.value
+            );
+            const uint32_t progressed =
+                ProgressCrossCoreExec<ExecScanTestOps>(
+                    state, worker, kTask + 1U, false,
+                    DrainPlace::EfDrain, stats
+                );
+            all_cases_ok &= progressed == 0 &&
+                state->fatal.value == 1 &&
+                state->exec_fatal.state == 0 &&
+                DecodeExecState(
+                    state->exec_cells[kTask].control.state
+                ).phase == ExecPhase::Claimed &&
+                state->exec_tokens[executor].control.phase ==
+                    ExecTokenPhase::Faulted &&
+                ExecScanTestOps::watched_control_cas_calls == 1 &&
+                ExecScanTestOps::execute_calls == 0 &&
+                state->tasks[kTask].vend == 0 &&
+                state->tasks[kTask].flag == 0 &&
+                stats.result.placement[
+                    static_cast<uint32_t>(DrainPlace::EfDrain)
+                ] == 0;
+        }
+    }
+
+    // ExecuteBoundKernel 是当前同步 engine 边界；在它返回时注入 fatal，
+    // 必须保留 CLAIMED 且不发布 vend、flag 或 DONE。
+    {
+        MappedSchedulerState mapping;
+        SchedulerState *state = mapping.Get();
+        all_cases_ok &= state != nullptr;
+        if (state != nullptr) {
+            constexpr uint32_t kTask = 1;
+            constexpr uint32_t kBuilder = 1;
+            uint32_t primary = 0;
+            uint32_t secondary = 0;
+            uint32_t executor = 0;
+            all_cases_ok &= PlannedOwners(
+                kTask, TaskKind::Qk, kBuilder,
+                primary, secondary, executor
+            ) && PublishKernelCell(
+                *state, kTask, kBuilder, TaskKind::Qk
+            );
+            WorkerState &worker = PrepareWorker(
+                *state, executor, CoreRole::Aic
+            );
+            LocalStats stats{};
+            InitLocalStats(stats, executor, CoreRole::Aic);
+            all_cases_ok &= RegisterLocalCandidate(
+                stats, kTask, TaskKind::Qk
+            );
+            ExecScanTestOps::ResetObservations();
+            ExecScanTestOps::WatchControl(
+                &state->exec_cells[kTask].control.state
+            );
+            ExecScanTestOps::InjectGlobalFatalAfterExecute(
+                &state->fatal.value
+            );
+            const uint32_t progressed =
+                ProgressCrossCoreExec<ExecScanTestOps>(
+                    state, worker, kTask + 1U, false,
+                    DrainPlace::EfDrain, stats
+                );
+            all_cases_ok &= progressed == 0 &&
+                state->fatal.value == 1 &&
+                state->exec_fatal.state == 0 &&
+                DecodeExecState(
+                    state->exec_cells[kTask].control.state
+                ).phase == ExecPhase::Claimed &&
+                state->exec_tokens[executor].control.phase ==
+                    ExecTokenPhase::Faulted &&
+                ExecScanTestOps::watched_control_cas_calls == 1 &&
+                ExecScanTestOps::execute_calls == 1 &&
+                ExecScanTestOps::executed_tasks[0] == kTask &&
+                state->tasks[kTask].vend == 0 &&
+                state->tasks[kTask].flag == 0 &&
+                stats.result.placement[
+                    static_cast<uint32_t>(DrainPlace::EfDrain)
+                ] == 0;
+        }
+    }
+
+    Check(
+        all_cases_ok, kTest,
+        "fatal at Claim/kernel/completion gates leaves no later side effect"
+    );
+    std::printf("[PASS] %s\n", kTest);
+}
+
 void TestBusyTokenResumesScanning() {
     constexpr const char *kTest = "busy-token-resumes-scanning";
     MappedSchedulerState mapping;
@@ -1331,6 +1747,9 @@ int main() {
     TestMappedBuildingDelayedPublication();
     TestOtherCandidateSkipsClaimedAndDone();
     TestInvalidStatesFailClosed();
+    TestExistingGlobalFatalDoesNotFabricateExecFatal();
+    TestGlobalFatalFaultsActiveTokens();
+    TestGlobalFatalStopsIrreversibleBoundaries();
     TestBusyTokenResumesScanning();
     TestFinalDrainClosesLastTask();
 

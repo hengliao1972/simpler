@@ -4007,13 +4007,22 @@ PA_DEVICE_NOINLINE bool PublishCrossCoreExecTask(
     if (state == nullptr || worker.core_idx < 0 ||
         worker_id >= kWorkers || task_id >= kMaxTasks ||
         kind == TaskKind::Alloc || kind == TaskKind::Count ||
-        function_id != FunctionId(kind) ||
-        Ops::Load(&state->fatal.value) != 0) {
+        function_id != FunctionId(kind)) {
         PublishCrossCoreRuntimeFailure<Ops>(
             state, stats,
-            cross_core::ExecFatalReason::InvalidBuiltControl,
+            cross_core::ExecFatalReason::InvalidBuildInput,
             task_id, worker_id
         );
+        return false;
+    }
+    // 已经存在的调度器首错只负责停止后续生产，不能再伪造成
+    // execution control 错误。exec_fatal 已存在时只把 terminal 状态
+    // 镜像到通用 fatal，不覆盖原始 execution reason。
+    if (Ops::Load(&state->fatal.value) != 0) {
+        return false;
+    }
+    if (cross_core::ExecFatalPublished<Ops>(state->exec_fatal)) {
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
 
@@ -4041,20 +4050,49 @@ PA_DEVICE_NOINLINE bool PublishCrossCoreExecTask(
         return false;
     }
 
+    // spec/source 解析可能包含普通 GM 读取；真正取得 fresh cell 前再看
+    // 一次全局停止条件，避免已观察到其他子系统 fatal 后继续发布 BUILT。
+    if (Ops::Load(&state->fatal.value) != 0) {
+        return false;
+    }
+    if (cross_core::ExecFatalPublished<Ops>(state->exec_fatal)) {
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
+
     const cross_core::ExecBuildResult build_result =
         cross_core::BuildAndPublishExecPayload<Ops>(
             state->exec_cells[task_id], worker_id, spec, source,
             state->exec_fatal
         );
     if (build_result != cross_core::ExecBuildResult::Published) {
-        // CellUnavailable 本身不会改写首错现场；完整 PA
-        // 中 fresh task cell 不应发生这种冲突，因此仍需发布
-        // terminal fatal，不能把重复 Build 当成可恢复竞争。
-        PublishCrossCoreRuntimeFailure<Ops>(
-            state, stats,
-            cross_core::ExecFatalReason::ControlPublishConflict,
-            task_id, worker_id
-        );
+        if (build_result ==
+            cross_core::ExecBuildResult::CellUnavailable) {
+            if (Ops::Load(&state->fatal.value) != 0) {
+                return false;
+            }
+            if (cross_core::ExecFatalPublished<Ops>(
+                    state->exec_fatal
+                )) {
+                SetFatal<Ops>(
+                    state, stats, static_cast<int32_t>(task_id)
+                );
+                return false;
+            }
+            // CellUnavailable 自身没有发布 execution reason；fresh
+            // task-indexed cell 出现占用即为真实 control 冲突。
+            PublishCrossCoreRuntimeFailure<Ops>(
+                state, stats,
+                cross_core::ExecFatalReason::ControlPublishConflict,
+                task_id, worker_id
+            );
+        } else {
+            // InvalidInput/PublishConflict 已由协议 helper 保存精确首错；
+            // FatalObserved 更必须保留先前 reason。这里只镜像通用 fatal。
+            SetFatal<Ops>(
+                state, stats, static_cast<int32_t>(task_id)
+            );
+        }
         return false;
     }
 
@@ -4087,6 +4125,10 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
     if (token.control.phase == cross_core::ExecTokenPhase::Idle) {
         return true;
     }
+    // Progress 入口已经检查过 global/exec fatal；这里仍在真正发射 kernel
+    // 和发布 completion 前复核 global fatal，覆盖另一 worker 在本次
+    // progress 内报告首错的交错。当前 engine helper 是同步边界，尚未
+    // 发射时可以直接把 owner-local token 收敛为 Faulted。
     const cross_core::ExecPayloadHeader header =
         cross_core::ExecutionTokenHeader(token);
     TaskKind kind = TaskKind::Count;
@@ -4137,6 +4179,12 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
             return true;
         }
 
+        if (Ops::Load(&state->fatal.value) != 0) {
+            token.control.phase =
+                cross_core::ExecTokenPhase::Faulted;
+            return false;
+        }
+
         const uint64_t kernel_begin =
             TraceTimestamp<Ops>(stats.trace, stats.result);
         if (!cross_core::ExecutePaBoundKernel<Ops>(
@@ -4164,6 +4212,15 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
         RecordKernelCycles(
             stats, kind, kernel_end - kernel_begin
         );
+
+        // ExecutePaBoundKernel 当前只在真实 engine wait 返回后退出；
+        // 因此此处观察到 terminal fatal 时 engine 已经停止访问 GM，
+        // 可以转 Faulted 且不得继续发布正常 completion。
+        if (Ops::Load(&state->fatal.value) != 0) {
+            token.control.phase =
+                cross_core::ExecTokenPhase::Faulted;
+            return false;
+        }
 
         const cross_core::PaExecSynchronousEngineCompletion
             engine_complete{};
@@ -4205,6 +4262,11 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
             cross_core::ExecTokenPhase::VendPublished ||
         token.control.phase ==
             cross_core::ExecTokenPhase::CompletionPublished) {
+        if (Ops::Load(&state->fatal.value) != 0) {
+            token.control.phase =
+                cross_core::ExecTokenPhase::Faulted;
+            return false;
+        }
         const uint32_t completed_task = token.control.task_id;
         const uint32_t completed_function =
             cross_core::ExecutionTokenHeader(token).function_id;
@@ -4261,9 +4323,23 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
     const uint32_t worker_id =
         static_cast<uint32_t>(worker.core_idx);
     if (Ops::Load(&state->fatal.value) != 0) {
+        PA_GM cross_core::ExecutionToken &token =
+            state->exec_tokens[worker_id];
+        if (token.control.phase !=
+            cross_core::ExecTokenPhase::Idle) {
+            token.control.phase =
+                cross_core::ExecTokenPhase::Faulted;
+        }
         return 0;
     }
     if (cross_core::ExecFatalPublished<Ops>(state->exec_fatal)) {
+        PA_GM cross_core::ExecutionToken &token =
+            state->exec_tokens[worker_id];
+        if (token.control.phase !=
+            cross_core::ExecTokenPhase::Idle) {
+            token.control.phase =
+                cross_core::ExecTokenPhase::Faulted;
+        }
         SetFatal<Ops>(state, stats, -1);
         return 0;
     }
@@ -4429,14 +4505,69 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
                 }
                 continue;
             }
+            // control 的首次观察只说明当时尚无 fatal；真正取得执行所有权
+            // 前必须重新检查两条 terminal 线。exec fatal 已保存精确原因，
+            // 此处只镜像通用 fatal，不改写首错。
+            if (Ops::Load(&state->fatal.value) != 0) {
+                return completed_count;
+            }
+            if (cross_core::ExecFatalPublished<Ops>(
+                    state->exec_fatal
+                )) {
+                SetFatal<Ops>(
+                    state, stats, static_cast<int32_t>(task_id)
+                );
+                return completed_count;
+            }
             const cross_core::ExecClaimResult claim =
                 cross_core::ClaimAndBindExecPayload<Ops>(
                     cell, task_id, worker_id, route_engine,
                     state->exec_tokens[worker_id],
                     state->exec_fatal
                 );
-            if (claim != cross_core::ExecClaimResult::Claimed ||
-                !cross_core::BindPaExecutionTokenDispatchAfterClaim(
+            if (claim != cross_core::ExecClaimResult::Claimed) {
+                if (claim ==
+                        cross_core::ExecClaimResult::FatalObserved ||
+                    cross_core::ExecFatalPublished<Ops>(
+                        state->exec_fatal
+                    )) {
+                    SetFatal<Ops>(
+                        state, stats, static_cast<int32_t>(task_id)
+                    );
+                    if (state->exec_tokens[worker_id].control.phase !=
+                        cross_core::ExecTokenPhase::Idle) {
+                        state->exec_tokens[worker_id].control.phase =
+                            cross_core::ExecTokenPhase::Faulted;
+                    }
+                    return completed_count;
+                }
+                PublishCrossCoreRuntimeFailure<Ops>(
+                    state, stats,
+                    cross_core::ExecFatalReason::InvalidTokenPayload,
+                    task_id, worker_id
+                );
+                state->exec_tokens[worker_id].control.phase =
+                    cross_core::ExecTokenPhase::Faulted;
+                return completed_count;
+            }
+            const bool global_fatal_after_claim =
+                Ops::Load(&state->fatal.value) != 0;
+            const bool exec_fatal_after_claim =
+                cross_core::ExecFatalPublished<Ops>(
+                    state->exec_fatal
+                );
+            if (global_fatal_after_claim ||
+                exec_fatal_after_claim) {
+                state->exec_tokens[worker_id].control.phase =
+                    cross_core::ExecTokenPhase::Faulted;
+                if (!global_fatal_after_claim) {
+                    SetFatal<Ops>(
+                        state, stats, static_cast<int32_t>(task_id)
+                    );
+                }
+                return completed_count;
+            }
+            if (!cross_core::BindPaExecutionTokenDispatchAfterClaim(
                     state->exec_tokens[worker_id], worker
                 )) {
                 PublishCrossCoreRuntimeFailure<Ops>(

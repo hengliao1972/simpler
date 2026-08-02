@@ -412,3 +412,52 @@ Submit、TensorMap、SharedOutput、writer intent、heap、Claim Tournament
 仍需在 Claim、kernel 发射与 completion 等不可逆边界收敛；新的 CCEC
 整套编译和 A5 B1 多轮也尚未执行。因此此处不宣称 S3b 已完成，更不使用
 旧的 849 ms 异常二进制进入 B256。
+
+## 2026-08-02：S3b fatal 首错与不可逆边界收敛
+
+### 为什么不能只在 Progress 入口检查一次
+
+global scheduler fatal 与 execution fatal 位于不同的独占 atomic line。
+如果 executor 只在 `ProgressCrossCoreExec()` 入口读取一次，另一 worker
+仍可能在本次调用内部发布首错，随后本核继续 Claim、发射 kernel 或发布
+completion。CPU 的顺序一致模型也能确定性构造这种交错，因此它不是只能
+留给 A5 才讨论的弱序问题。
+
+当前规则改为：
+
+- 已经存在的 global fatal 只负责停止 Build/Exec，不再伪造
+  `InvalidBuiltControl` execution reason；
+- `BuildAndPublishExecPayload()` 返回 `FatalObserved`、`InvalidInput` 或
+  `PublishConflict` 时保留 helper 已保存的精确 exec 首错，只把 terminal
+  状态镜像到通用 fatal；只有本身不发布原因的 fresh-cell
+  `CellUnavailable` 才补充 `ControlPublishConflict`；
+- Progress 入口若发现任一 fatal，非 Idle owner-local token 转为
+  `Faulted`；
+- target 在 Claim 前、Claim/Bind 后、`WAITING_FANIN` 转 engine 后且真正
+  发射 kernel 前、同步 kernel 返回后以及 completion 发布前重新检查停止
+  条件；尚未发射的 token 直接转 `Faulted`，已经同步返回的 engine 不再
+  发布正常 vend/flag/DONE。
+
+这些复核不能宣称在两条独立 atomic line 之间建立“现实时间上的绝对同时
+停止”；其合同是：本核一旦在对应不可逆边界观察到 terminal fatal，就不再
+执行下一项副作用。未来 engine 改为异步 `try_wait` 后，`ENGINE_INFLIGHT`
+必须先等硬件真正完成再转 `Faulted`，不能照搬当前同步 helper 的处理。
+
+### CPU 确定性注入门槛
+
+scanner 测试在生产 Ops 边界增加了只用于测试的注入点，并完成 20 轮重复：
+
+1. 预置 scheduler global fatal 后调用 Build，exec fatal 保持零、cell 保持
+   `EMPTY`，没有 control CAS 和 payload 统计，证明不伪造 execution 首错；
+2. 真实 Claim/Bind 得到 `WAITING_FANIN` token，或用完整 helper 链得到
+   `COMPLETING` token；下一次 Progress 观察 global fatal 后均转为
+   `Faulted`，cell 保持 `CLAIMED`，vend/flag 不发布；
+3. 在 target 首次读取 `BUILT` control 后注入 fatal，Claim CAS 为零；
+4. 在最后一条 fanin ready load 返回后注入 fatal，Claim 恰好一次但 kernel
+   调用为零；
+5. 在同步 kernel 返回时注入 fatal，kernel 恰好执行一次，但 vend、flag 和
+   cell `DONE` 均不发布；
+6. 所有只注入 global fatal 的场景都保持 `exec_fatal == 0`。
+
+完整 CPU 构建及 ordered Submit 等既有门槛再次全部通过。该阶段仍只提供
+CPU 状态机证据；CCEC 编译和 A5 B1 重复稳定性属于下一门槛。
