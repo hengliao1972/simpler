@@ -20,7 +20,7 @@
 | S2 | CCEC 最小 A5 跨核发布/领取探针 | 已完成 |
 | S3 | standalone PA 接入构建/执行分离 | 已完成：S3a 与固定两候选异核 S3b 均已闭合，S3b 通过 CPU、A5 B1/B256 和 B256 full-swimlane |
 | S4 | 受控的动态 Execute election | K2 首版已通过完整 CPU、CCEC 和 A5 B1/B256 门槛 |
-| S5 | 独立扩大 Build owner 候选核拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 全 96 Scalar 已闭合 CPU，CCEC/A5 待验证 |
+| S5 | 独立扩大 Build owner 候选核拓扑 | S5a 与 S5b 全 96 Scalar 均已通过 CPU/CCEC/A5 B1/B256 |
 | S6 | 引入 engine/Scalar overlap | 未开始 |
 | S7 | 基于累积证据做性能评估与容量/复用优化 | 未开始 |
 | 贯穿观测门槛（不编号） | 泳道、submit-PMU 与 perf-clock 三条互不混算的证据链 | perf-clock 与 full-swimlane 已可用；cross-core submit-PMU 尚未接入 |
@@ -857,6 +857,41 @@ root CAS  = 1280 * 8  = 10240
   无法进入新增的物理 CAS 后处理。这是观察容量限制，不是协议卡死；
   普通 B256 和隔离 Tournament 门槛已分别提供逻辑与物理计数证据。
 
-CCEC 编译和 A5 B1/B256 在下一阶段运行；CPU 耗时不用于推导 A5
-性能，CPU cache coherence 也不能代替 A5 Scalar 无 coherence 下的
-DCCI/atomic 动态证据。
+CPU 耗时不用于推导 A5 性能，CPU cache coherence 也不能代替 A5
+Scalar 无 coherence 下的 DCCI/atomic 动态证据。
+
+### CCEC 与 A5 动态证据
+
+- CCEC 通用协议实例、AIC/AIV 入口、两类 split runtime/finish、最终
+  1:2 混合 ELF 与 artifact manifest 全部通过。两类 role caller 均由
+  构建脚本硬校验 5 条 winner-finish relocation，与五类 task 都可能由
+  AIC/AIV Build 的实例化形状一致。
+- A5 B1 首轮业务、TensorMap、payload 和计算结果都通过，但 Submit
+  命中 `8570.183 ms` 长尾，FinalDrain 轮询将记录容量耗尽并 drop 1 条，
+  因此不作为正式证据。第二轮 Submit 为 `164.625 us`，5 task/4 kernel、
+  DCCI/atomic、执行终态和真实计算全部 PASS，trace drop 为 0。
+- A5 B256 普通运行 Submit 为 `27.347 ms`；完整泳道 Submit 为
+  `28.250 ms`。两轮均闭合 1280 task/1024 kernel、122,880 次逻辑 Claim、
+  1280 条 fanin edge、2048 个 shared output、严格 TensorMap 插入链与真实计算；
+  fatal 为 0，完整泳道 trace drop 为 0。
+- 完整泳道中 Claim local CAS 按角色精确为 AIC `40,960`、AIV
+  `81,920`，合计 `122,880`；root CAS 为 `10,240`，总物理 CAS 为
+  `133,120`。Alloc/QK/SF/PV/UP 的 Build winner 分布分别为 AIC/AIV
+  `47/209、34/222、39/217、45/211、39/217`，合计 `204/1076`；这证明
+  五类 task 的两种 Scalar 角色都在 A5 上实际完成过 Build。Alloc
+  使用 `alloc_complete` 与 `materialize` 位置交叉核对，四类 kernel 使用
+  `winner_build` 与 `materialize` 交叉核对，位置不一致数均为 0。
+- 1024 个 kernel 由 K2 primary/secondary 分别执行 `375/649` 次，非法
+  Execute owner 为 0。host 终态同时逐 task 校验 Build/Execute 不同核，
+  泳道交叉核对的同核数也为 0，因此 Build 候选扩容没有破坏 S4
+  exactly-once 执行合同。
+
+S5b 普通运行与 S5a `27.143 ms` 单样本相比约 `+0.75%`；完整泳道与
+S5a `27.301 ms` 单样本相比约 `+3.48%`。已知长尾与单轮波动使这些数字
+不足以宣称稳定回退，但当前也没有证据说明全 96 Scalar 的到达式负载
+均衡已覆盖 60.5% 额外物理 Claim CAS。S5b 作为后续 Build/engine overlap 的
+功能基线保留，性能去留必须在 S6 有实际 overlap 后再做同口径对照。
+
+完整 B256 泳道在：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260802_142824_3971096/ccec/merged_swimlane.json`

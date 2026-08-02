@@ -7,12 +7,12 @@
 | 目标 | 让 task 的构建 owner 与 kernel 执行 owner 可以是不同物理核 |
 | 当前代码 | Build owner 发布 task-indexed shared payload，K2 排除 Build owner 后的 1 或 2 个 eligible executor 竞争执行 |
 | 本文性质 | 持续更新的架构与内存模型设计记录 |
-| 正式实现 | S0–S4 K2 及 S5a 跨角色 Build 已通过 CPU/CCEC/A5；S5b 全 96 Scalar Build 已闭合 CPU，CCEC/A5 待验证 |
+| 正式实现 | S0–S5b 已通过 CPU/CCEC/A5；当前五类 task 均允许全 96 Scalar Build，kernel 仍由 K2 异核 Execute |
 | CPU 正确性用例 | S1–S4 K2、S5a 对侧角色 Build 与 S5b 全 96 Scalar Build 门槛已完成 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
-| A5 PA 功能/性能 | S3b full-swimlane 27.128 ms；S4 K2 为 27.476 ms；S5a B256 普通/完整泳道为 27.143/27.301 ms，均只记录单样本 |
+| A5 PA 功能/性能 | S3b/S4/S5a full-swimlane 为 27.128/27.476/27.301 ms；S5b B256 普通/完整泳道为 27.347/28.250 ms，均只记录单样本 |
 | S4 动态 Execute election | K2 首版已通过 CPU B1/B256 和 A5 B1/B256；B256 中两候选都有实际胜出，非法 owner 为 0 |
-| S5 Build 拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 已将五类 task 扩到 96/G8 并闭合 CPU B1/B256，CCEC/A5 待验证 |
+| S5 Build 拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 五类 task 全 96/G8 已通过 CPU/CCEC/A5 B1/B256，物理 Claim CAS 精确闭合 |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
 
@@ -980,14 +980,18 @@ Build owner 位于 AIC，Execute owner 仍匹配目标 engine、属于 host 独�
 `363/661` 个 kernel，非法 owner 为 0、trace drop 为 0。该单轮数值只用于
 排除倍数级结构性异常，不宣称相对 S4 有稳定性能收益。
 
-S5b 的 CPU 阶段已闭合：五类 task 的 96 个 Scalar 都实际进入
+S5b 已闭合 CPU/CCEC/A5：五类 task 的 96 个 Scalar 都实际进入
 Build Claim，Build owner 可以是 AIC 或 AIV；Execute owner 仍必须匹配
 engine、位于 host 独立复算的 K2，且不得与 Build owner 相同。
 CPU B1/B256 real-compute 及全部独立门槛 PASS；B256 逻辑 Claim
 精确为 `122,880`，隔离 Tournament 门槛精确闭合
 `122,880 / 10,240 / 133,120`。CPU B256 全 atomic trace 会因
 FinalDrain 轮询记录耗尽通用 trace 容量，因此不用它代替 A5 的
-物理 CAS 与 DCCI 动态证据。CCEC/A5 在下一笔独立验证。
+物理 CAS 与 DCCI 动态证据。A5 B256 普通/完整泳道 Submit 分别为
+`27.347 ms / 28.250 ms`；完整泳道内 local/root/总物理 Claim CAS
+为 `122,880 / 10,240 / 133,120`，K2 primary/secondary 分别执行
+`375/649` 个 kernel，非法 owner 为 0。相对 S5a 单样本未观察到性能收益；
+差异只用于说明没有倍数级异常，不宣称稳定回退。
 
 ### S6：再接 engine/Scalar overlap
 
