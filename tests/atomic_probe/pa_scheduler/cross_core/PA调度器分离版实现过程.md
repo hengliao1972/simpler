@@ -982,3 +982,61 @@ kernel、1280 条 fanin edge、2048 个 shared output 和 1280 个插入完成�
 `1.0 ms`。S6.1 只是把基线推进到约 `9.08 ms`；后续仍需重新拆解
 剩余 EfDrain、payload handoff、DCCI/DSB、Claim 与 FinalDrain，不能把
 本阶段的大幅收益误写成目标已经完成。
+
+## 2026-08-02：S6.2 删除 scanner 入口重复 fatal 原子读取
+
+### 删除范围与正确性边界
+
+S6.1 之后，完整 `ProgressCrossCoreExec()` 仍在任何 scanner 工作之前
+无条件读取 `state->fatal.value` 和 `exec_fatal.state`。这两个值在正常
+运行中始终为零，却由所有 executor 汇聚读取；A5 的 `int32_t/int64_t`
+共享读取分别是返回型恒等 RMW，不是普通 cache load。
+
+本阶段删除的只有公共入口这两次读取，并保留以下不可逆边界：
+
+- active token 在 kernel 发射前和 completion 发布前检查 global fatal，
+  token helper 在推进状态前检查 exec fatal；
+- Idle scanner 看到 `BUILT` 后，在 Claim CAS 前重新检查 global/exec
+  fatal；
+- Build publish、payload acquire、kernel、completion 和 FinalDrain 的
+  既有错误检查均不变。
+
+入口到这些边界之间只能读取 cell control，或推进 owner-local candidate
+cursor。`EMPTY/BUILDING`、非候选槽和合法 CAS loser 都不会在这一段发布
+跨核业务副作用。因此入口检查不是授权边界；删除后错误仍在第一个不可逆
+动作前 fail-closed。为了让已经占有 token、但 fanin 尚未 ready 的 worker
+及时响应 scheduler fatal，global fatal 检查被放到 active-token 专属入口，
+而不是恢复到所有 Idle scanner 都经过的公共入口。
+
+### 验证与性能
+
+- 执行 scanner 的定向 CPU 用例全部 PASS，包括已有 global fatal 在
+  `WAITING_FANIN/COMPLETING` 的收敛，以及 Claim/kernel/completion 三个
+  精确注入窗口；
+- 完整 CPU perf-clock build、自测和 B1/B256 real-compute 业务闭合；
+- CCEC AIC/AIV 通用实例、两类入口、split caller/runtime/finish、最终
+  1:2 ELF、无 relocation 和 manifest 全部通过；
+- A5 B256 十个独立 perf-clock 进程全部 execution/semantic/postprocess
+  PASS：
+
+```text
+min/median/mean/max =
+6.924365 / 7.303955 / 7.259680 / 7.595064 ms
+```
+
+相对 S6.1 十轮中位 `9.077919 ms` 改善 `19.542%`。B256 full-swimlane
+Submit 为 `6.894677 ms`，1280 task、1024 kernel、严格插入、K2 owner、
+payload、DCCI/atomic 和 trace closure 全部 PASS，drop 为 0；其
+`EfDrainControl` 聚合核时从 `517.839958 ms` 降到 `369.541582 ms`
+（`-28.638%`）。Claim 聚合核时仍为 `42.015425 ms`，说明本阶段没有
+缩减 96 Scalar Build 参与人口或 Tournament 物理工作。
+
+新泳道在：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260802_161626_4109966/ccec/merged_swimlane.json`
+
+当前距离 `1.0 ms` 仍有约 `6.30 ms`。剩余 full-swimlane 中
+`EfDrainControl=369.542 ms` 聚合核时，loser 的该项 p50 仅
+`0.203 us`、p95 却为 `23.310 us`；下一阶段应区分活跃 token 的 fanin
+等待、候选 cell 尚未 BUILT、payload acquire/bind 与 completion，不能再把
+全部长尾笼统归为 EfDrain。

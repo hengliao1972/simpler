@@ -10,7 +10,7 @@
 | 正式实现 | S0–S5b 已通过 CPU/CCEC/A5；当前五类 task 均允许全 96 Scalar Build，kernel 仍由 K2 异核 Execute |
 | CPU 正确性用例 | S1–S4 K2、S5a 对侧角色 Build 与 S5b 全 96 Scalar Build 门槛已完成 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
-| A5 PA 功能/性能 | S5b 十轮 perf-clock 中位 27.496 ms；S6.1 owner-local EfDrain 门控后十轮中位 9.078 ms、full-swimlane 8.765 ms；最终目标为同口径不高于 1.0 ms |
+| A5 PA 功能/性能 | S5b 十轮 perf-clock 中位 27.496 ms；S6.1 owner-local EfDrain 门控后为 9.078 ms；S6.2 删除无副作用 scanner 入口的重复 fatal 原子读取后十轮中位 7.304 ms、full-swimlane 6.895 ms；最终目标为同口径不高于 1.0 ms |
 | S4 动态 Execute election | K2 首版已通过 CPU B1/B256 和 A5 B1/B256；B256 中两候选都有实际胜出，非法 owner 为 0 |
 | S5 Build 拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 五类 task 全 96/G8 已通过 CPU/CCEC/A5 B1/B256，物理 Claim CAS 精确闭合 |
 | 明确非目标 | 不引入 `try_wait`、engine continuation 或“kernel 运行期间同一 Scalar 继续调度” |

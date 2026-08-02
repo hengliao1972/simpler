@@ -4206,6 +4206,13 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
         token.control.phase = cross_core::ExecTokenPhase::Faulted;
         return false;
     }
+    // active token 可能长时间停在 WAITING_FANIN；即使依赖尚未 ready，
+    // 也必须及时收敛已经发布的 scheduler fatal。把这次读取放在 active
+    // 路径而不是 Progress 公共入口，Idle scanner 不再为它付费。
+    if (Ops::Load(&state->fatal.value) != 0) {
+        token.control.phase = cross_core::ExecTokenPhase::Faulted;
+        return false;
+    }
     if (token.control.phase ==
             cross_core::ExecTokenPhase::WaitingFanin) {
         cross_core::PaExecReadySource<Ops> ready{
@@ -4369,27 +4376,17 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
     }
     const uint32_t worker_id =
         static_cast<uint32_t>(worker.core_idx);
-    if (Ops::Load(&state->fatal.value) != 0) {
-        PA_GM cross_core::ExecutionToken &token =
-            state->exec_tokens[worker_id];
-        if (token.control.phase !=
-            cross_core::ExecTokenPhase::Idle) {
-            token.control.phase =
-                cross_core::ExecTokenPhase::Faulted;
-        }
-        return 0;
-    }
-    if (cross_core::ExecFatalPublished<Ops>(state->exec_fatal)) {
-        PA_GM cross_core::ExecutionToken &token =
-            state->exec_tokens[worker_id];
-        if (token.control.phase !=
-            cross_core::ExecTokenPhase::Idle) {
-            token.control.phase =
-                cross_core::ExecTokenPhase::Faulted;
-        }
-        SetFatal<Ops>(state, stats, -1);
-        return 0;
-    }
+    // 不在无副作用的 scanner 入口重复读取两条全局 fatal 热点线：
+    //
+    // - active token 会在 kernel 发射和 completion 发布前复核 global
+    //   fatal，并由 token helper 在状态推进前复核 exec fatal；
+    // - Idle scanner 在真正发射 Claim CAS 前复核两条 fatal；
+    // - EMPTY/BUILDING、非候选槽和合法 loser 这里只读取共享 control 或
+    //   推进 owner-local cursor，不产生跨核业务副作用。
+    //
+    // 因而入口读取既不是不可逆边界，也不能阻止随后 Submit 的 Claim。
+    // 删除它们只消除正常路径上所有 executor 汇聚到同两个地址的返回型
+    // atomic；错误路径仍在第一个不可逆动作前 fail-closed。
 
     uint32_t completed_count = 0;
     bool completed = false;

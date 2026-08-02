@@ -5693,3 +5693,36 @@ CCEC 双角色编译和 A5 full-swimlane 均通过。
 剩余执行等待/控制、portable payload、DCCI/DSB、Claim 和 FinalDrain。
 完整实现细节与泳道路径见
 `pa_scheduler/cross_core/PA调度器分离版实现过程.md` 的 S6.1 记录。
+
+### 15.24 cross-core scanner 入口去除重复 fatal 读取：中位降至 7.304 ms
+
+S6.1 的 owner-local 门控只避免了“完全没有本核工作”的调用；一旦候选
+task 进入本核已 Close 前缀，完整 scanner 仍会在读取 candidate cell 前
+先对两条全局 fatal control 做返回型原子读取。正常路径中它们始终为零，
+却把所有 executor 再次汇聚到两个地址。
+
+本阶段只删除无副作用 scanner 公共入口的两次读取。Idle scanner 在发射
+Claim CAS 前、active token 在 kernel 发射和 completion 发布前、所有
+exec helper 状态推进点及 FinalDrain 都保留原终止检查。已有 token 若停在
+未 ready fanin，则在 active-token 专属入口检查 global fatal 并转
+`Faulted`；因此性能优化没有放宽错误路径，也没有改变 Claim、TensorMap
+严格插入、payload DCCI、K2 owner 或 96 Scalar Build 资格。
+
+完整 CPU 门槛、CCEC 双角色编译和 A5 B256 业务/执行/后处理均通过。十轮
+独立 perf-clock 为：
+
+```text
+6.924365, 6.929618, 7.313602, 7.595064, 7.411532,
+7.045913, 7.385931, 7.164954, 7.531511, 7.294308 ms
+
+min/median/mean/max =
+6.924365 / 7.303955 / 7.259680 / 7.595064 ms
+```
+
+相对 S6.1 中位 `9.077919 ms` 改善 `19.542%`。同代码 full-swimlane
+Submit 为 `6.894677 ms`，`EfDrainControl` 聚合核时从
+`517.839958 ms` 降到 `369.541582 ms`，全部 1280 task、1024 kernel、
+严格插入、payload、K2 owner 和 trace closure PASS，drop 为 0。该结果
+证明集中式正常态 fatal 读取仍是实质热点；但当前距离 `1.0 ms` 尚有
+约 `6.30 ms`，下一步需要把 EfDrain 长尾按 active-token/candidate/payload/
+completion 真实路径继续拆开，而不是继续删除未证明重复的检查。
