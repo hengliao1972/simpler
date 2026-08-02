@@ -1144,3 +1144,58 @@ FinalDrain 排空均曾扩展到两槽并通过完整 CPU、CCEC 与 A5 门槛�
 双 token 过程代码已完整撤回；当前源码恢复为单 token `c3387747`。后续若
 继续处理该瓶颈，应采用不提前 Claim、不占 token 的 ready-only 候选重访，
 并先闭合依赖可见性与活性证明。
+
+## 2026-08-02：S6.5 ready-only 候选与 readiness owner 负向实验
+
+### 第一版：保持 BUILT，双候选先看 fanin
+
+为避免 S6.4 的 payload 提前搬运，本版在 `SharedExecControl` 原有 64B
+atomic-only 行内增加不可变 fanin 摘要。摘要由 builder 在 payload flush 后、
+`BUILT` 发布前用返回型 CAS 发布；整个 control 行仍禁止 ordinary store 与
+DCCI。四条以内依赖可直接解出 producer，更多依赖显式回退原 payload 路径，
+没有把 PA 的 QK/SF/PV/UP 依赖形状写入通用协议。
+
+scanner 未看到全部依赖 ready 时不 Claim、不取得 token、不触碰 payload，
+只保留一个 owner-local deferred candidate slot 后继续扫描。确定性 CPU 用例
+逐项验证了 `BUILT` 保持不变、Claim CAS 为 0、payload invalidate/load 为 0，
+以及依赖发布后 deferred task 与后续 task 均 exactly-once 完成。
+
+该协议在 A5 上暴露出直接缺陷：两个 K2 候选都能看到 `BUILT`，因而同时轮询
+同一 fanin。B256 单样本 `Submit=3.902965 ms`，`fanin_loads=82561`，其中
+`ready/not-ready=13577/68984`；相较单 token 基线约 4.1 万至 4.3 万次读取
+明显恶化。该版立即停止，没有用更多样本掩盖结构性问题。
+
+### 第二版：先选唯一 readiness owner，延后 payload/token 绑定
+
+第二版没有增加新的共享 phase 或第二次 CAS，而是把现有 `CLAIMED` 的含义
+精确拆成两个本地步骤：
+
+1. `BUILT -> CLAIMED` 仍是唯一一次 K2 所有权 CAS；
+2. winner 若 fanin 未 ready，只保存 candidate slot 和已确认 ready prefix；
+3. 此时共享 cell 已有唯一 execute owner，但 owner-local token 仍为 Idle，
+   payload 未 invalidate、未复制；
+4. 依赖全部完成后，owner 才绑定 payload/dispatch 并进入原同步执行链；
+5. peer candidate 看到合法 `CLAIMED` 后清理自己的候选位。
+
+CPU 门槛覆盖任意 Build owner、两候选先后顺序、CAS loss、global/exec fatal
+注入、deferred resume、FinalDrain 和超出四条 fanin 的通用 fallback。完整
+CPU、协议 probe、CCEC AIC/AIV 和 A5 B256 均通过；A5 的 ready 读取精确等于
+业务依赖边 `1280`，说明 prefix 与唯一 owner 合同确实成立。
+
+性能却稳定回退。同步基线十轮中位为 `3.678558 ms`；该候选独立首样本
+`5.078318 ms`，后续五轮为：
+
+```text
+5.097780, 5.041501, 5.183033, 5.116527, 5.011070 ms
+min/median/mean/max =
+5.011070 / 5.097780 / 5.089182 / 5.183033 ms
+```
+
+中位回退 `38.580%`。唯一 owner 虽消除了双候选 fanin 读取，却会在延后槽
+占用时阻止第二个有依赖 candidate 取得 owner，并增加摘要发布、Claim/Bind
+分拆、恢复分支与 scanner 代码体。结果说明本架构下的 fanin 原子次数不是
+可以脱离整体推进顺序单独优化的指标。
+
+两版代码、ABI、host oracle 与测试改动均已完整撤回；没有形成生产提交。
+S6.5 的结论是停止 ready-only/提前 ownership 路线，回到单 token 干净基线，
+从实际 perf-clock 差额中寻找不引入新任务上下文的更小优化点。

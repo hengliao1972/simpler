@@ -5822,3 +5822,61 @@ median/mean = 3.773950 / 3.779694 ms
 payload，也不占 owner-local token；只有证明可立即执行时才进入既有 Claim
 与绑定链。该方向必须先解决依赖信息如何低成本取得、延后候选如何重访以及
 两个候选恰好一个 winner，不能把 PA 特例依赖表硬编码进通用协议。
+
+### 15.27 S6.5 负向取证：ready-only 发现与 readiness owner 均明显回退
+
+本阶段继续使用 S6.4 的同步基线：B256 real-compute 十轮
+`median=3.678558 ms`、`mean=3.692169 ms`。实现始终保留 96 Scalar Build
+资格、严格 TensorMap 插入、固定 K2 双候选和单 execution token，没有把
+kernel 或 FinalDrain 工作移出 perf-clock 窗口。
+
+第一版在每个 task 的 atomic-only control 行内发布不可变 fanin 摘要；小于
+等于四条依赖时用一个 64-bit atomic word 携带 producer id，超限时明确回退
+完整 payload。scanner 先判断摘要，未 ready 的 task 保持 `BUILT`、不发
+Claim CAS、不 invalidate/copy payload，并用一个 owner-local 延后槽继续扫描
+后续 candidate。CPU 门槛证明未 ready 路径的 token、payload 和 Claim 均无
+副作用，CCEC 也编译通过。但两个 K2 候选会同时轮询同一组 completion flag：
+
+```text
+Submit                 3.902965 ms
+fanin load total          82,561
+fanin ready               13,577
+fanin not-ready           68,984
+```
+
+相较基线约 4.1 万至 4.3 万次 fanin load 反而接近翻倍，因此该版不再扩展，
+未做十轮统计。
+
+第二版把“执行所有权”和“payload/token 绑定”拆开：仍只执行原来的一次
+`BUILT -> CLAIMED` CAS，但它先选出唯一 readiness owner；未 ready 时只在
+本核保存 candidate slot 与 ready prefix，不复制 payload、不占 token。另一
+候选看到 `CLAIMED` 后正常退出。依赖完成后 owner 才 invalidate/copy payload、
+重绑 dispatch 并执行。ready prefix 保证每条依赖只在最终完成时记一次 ready，
+CPU 通用协议、确定性交错、完整 CPU、CCEC 和 A5 业务/终态均通过，A5 计数
+也精确收敛为：
+
+```text
+fanin ready       1,280（等于全部业务依赖边）
+fanin not-ready  14,569（首个 A5 样本）
+```
+
+但性能显著回退。独立首样本为 `5.078318 ms`，随后五次复核为：
+
+```text
+5.097780, 5.041501, 5.183033, 5.116527, 5.011070 ms
+
+min/median/mean/max =
+5.011070 / 5.097780 / 5.089182 / 5.183033 ms
+```
+
+中位数相对同步基线回退 `38.580%`。这说明减少 completion atomic 次数本身
+不足以保证端到端收益：提前固定 readiness owner 会改变两个候选的推进节奏；
+单延后槽占用时，后续有依赖 task 不能继续取得 owner；同时新增摘要发布、
+状态分拆、延后恢复和更大的 scanner 控制流会增加 Scalar 指令与 I-cache
+压力。该结果与 S6.4 双 token 共同否定“为了绕开 fanin 等待而提前保留更多
+任务上下文”的方向。
+
+两版生产代码、ABI、host oracle 和测试改动均已完整撤回，当前源码恢复到
+`1bffd5dd` 的单 token 基线；只保留本节实验数据。后续不再沿 ready-only
+Claim 深挖，重新从干净 perf-clock 的实际 atomic/非 atomic 账本选择更小的
+优化点。
