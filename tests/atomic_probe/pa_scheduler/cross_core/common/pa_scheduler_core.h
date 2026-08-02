@@ -4206,24 +4206,25 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
         token.control.phase = cross_core::ExecTokenPhase::Faulted;
         return false;
     }
-    // active token 可能长时间停在 WAITING_FANIN；即使依赖尚未 ready，
-    // 也必须及时收敛已经发布的 scheduler fatal。把这次读取放在 active
-    // 路径而不是 Progress 公共入口，Idle scanner 不再为它付费。
-    if (Ops::Load(&state->fatal.value) != 0) {
-        token.control.phase = cross_core::ExecTokenPhase::Faulted;
-        return false;
-    }
     if (token.control.phase ==
             cross_core::ExecTokenPhase::WaitingFanin) {
         cross_core::PaExecReadySource<Ops> ready{
             state, &stats.result
         };
+        // 未 ready 只是一次纯观察，不推进共享状态，也不发射 kernel。
+        // 先在 owner-local token 上压缩 ready 前缀；只有全部依赖 ready，
+        // 准备进入 ENGINE_INFLIGHT 时才调用带 exec-fatal 门禁的 helper。
+        // 这样不会让每次 opportunistic poll 都汇聚读取同一 fatal line。
+        // replay 失败后的强制收敛由 production_closed 的 Progress 入口
+        // 负责，不能把这里的性能快路径外推到 FinalDrain。
+        if (!cross_core::ExecutionTokenFaninReady(token, ready)) {
+            return true;
+        }
         if (!cross_core::TryMarkExecutionTokenEngineInflight<Ops>(
                 token, ready, state->exec_fatal
             )) {
-            if (cross_core::ExecFatalPublished<Ops>(
-                    state->exec_fatal
-                )) {
+            if (token.control.phase ==
+                cross_core::ExecTokenPhase::Faulted) {
                 SetFatal<Ops>(
                     state, stats,
                     static_cast<int32_t>(token.control.task_id)
@@ -4376,6 +4377,28 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
     }
     const uint32_t worker_id =
         static_cast<uint32_t>(worker.core_idx);
+    if (production_closed) {
+        // FinalDrain 是错误路径的权威收敛边界：生产停止后即使 token
+        // 永久等不到 fanin，也必须观察 terminal 状态并转 Faulted。
+        // opportunistic EfDrain 不走这两次集中式读取。
+        const bool global_fatal =
+            Ops::Load(&state->fatal.value) != 0;
+        const bool exec_fatal =
+            cross_core::ExecFatalPublished<Ops>(state->exec_fatal);
+        if (global_fatal || exec_fatal) {
+            PA_GM cross_core::ExecutionToken &token =
+                state->exec_tokens[worker_id];
+            if (token.control.phase !=
+                cross_core::ExecTokenPhase::Idle) {
+                token.control.phase =
+                    cross_core::ExecTokenPhase::Faulted;
+            }
+            if (exec_fatal && !global_fatal) {
+                SetFatal<Ops>(state, stats, -1);
+            }
+            return 0;
+        }
+    }
     // 不在无副作用的 scanner 入口重复读取两条全局 fatal 热点线：
     //
     // - active token 会在 kernel 发射和 completion 发布前复核 global

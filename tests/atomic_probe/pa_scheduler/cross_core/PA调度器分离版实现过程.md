@@ -1040,3 +1040,76 @@ payload、DCCI/atomic 和 trace closure 全部 PASS，drop 为 0；其
 `0.203 us`、p95 却为 `23.310 us`；下一阶段应区分活跃 token 的 fanin
 等待、候选 cell 尚未 BUILT、payload acquire/bind 与 completion，不能再把
 全部长尾笼统归为 EfDrain。
+
+## 2026-08-02：S6.3 未就绪 fanin 轮询避开集中式 fatal 原子读取
+
+### 动态证据与改动边界
+
+S6.2 泳道逐 Submit 展开后，长 EfDrain 不是随机空白：一个 executor
+取得 task token 后，如果其首个 producer 尚未 ready，会在后续多个 Submit
+入口反复推进同一个 `WAITING_FANIN` token。旧路径每次未就绪尝试至少包含：
+
+1. active-token 入口的 global fatal 返回型读取；
+2. `TryMarkExecutionTokenEngineInflight()` 入口的 exec fatal 返回型读取；
+3. helper 返回未 ready 后由调用方再次读取 exec fatal。
+
+fanin 未就绪时只读取 completion flag、更新 owner-local ready prefix 并
+返回；它不发射 kernel、不发布 completion，也不推进任何共享业务状态。
+因此本阶段先调用 `ExecutionTokenFaninReady()`：未就绪直接返回；全部 ready
+后才进入保留 exec-fatal 门禁的状态转换 helper。helper 失败时根据
+owner-local token phase 判断是否已进入 `Faulted`，不再为了区分“未 ready”
+与“fatal”补读一次共享 fatal。
+
+错误路径没有被删除：kernel 发射前、kernel 返回后、completion 发布前以及
+Claim CAS 前仍保留原终止门禁；`production_closed=true` 的 FinalDrain
+入口强制读取 global/exec fatal，并把无法再等到 fanin 的 active token 收敛
+为 `Faulted`。机会式 EfDrain 遇到 global fatal 时可以暂时保持
+`WAITING_FANIN`，但在此期间不能产生不可逆副作用，最终必须由 FinalDrain
+闭合。
+
+### 正确性与 A5 结果
+
+- 定向 CPU 用例新增“机会式未 ready 不做副作用、FinalDrain 必须 fault”
+  的两段门槛；Claim、kernel、completion 注错窗口和全部 scanner 用例 PASS；
+- 完整 CPU perf-clock build 与全部 shared 协议、ordered Submit 用例 PASS；
+- CCEC AIC/AIV 通用实例、双入口、split runtime/finish、最终 1:2 ELF、
+  manifest 和无 relocation 门槛 PASS；
+- A5 B256 十个独立 perf-clock 进程全部 execution/semantic/postprocess PASS：
+
+```text
+3.644191 ms（进入十轮前的独立首样本）
+
+十轮：
+4.093007, 3.593300, 3.651752, 3.570847, 3.583781,
+3.904849, 3.635498, 3.814237, 3.701259, 3.529903 ms
+
+min/median/mean/max =
+3.529903 / 3.643625 / 3.707843 / 4.093007 ms
+```
+
+十轮中位相对 S6.2 的 `7.303955 ms` 改善 `50.113%`。同代码
+full-swimlane Submit 为 `3.843832 ms`，1280 task、1024 kernel、严格
+插入、96 Scalar Build 资格、K2 异核 Execute、payload、DCCI/atomic 和
+trace closure 全部 PASS，drop 为 0。local/root Claim CAS 仍精确为
+`122880/10240`，证明没有通过缩减竞争人口取得结果。
+
+full-swimlane 的关键聚合核时变化为：
+
+| 指标 | S6.2 | S6.3 | 变化 |
+| --- | ---: | ---: | ---: |
+| Submit 墙钟 | 6.894677 ms | 3.843832 ms | -44.249% |
+| SubmitUnion | 570.907881 ms | 302.512968 ms | -47.012% |
+| EfDrainControl | 369.541582 ms | 149.858920 ms | -59.447% |
+| Claim | 42.015425 ms | 42.439623 ms | +1.010% |
+
+新泳道在：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260802_163545_4133201/ccec/merged_swimlane.json`
+
+当前十轮中位距离 `1.0 ms` 仍差 `2.643625 ms`。新泳道中 Submit 内的
+主要聚合核时依次为 EfDrainControl `149.859 ms`、Claim `42.440 ms`、
+WinnerBuild `29.358 ms`、SubmitResidual `29.394 ms` 和
+BetweenSubmitResidual `18.710 ms`。下一轮先解释 active token 仍有约
+4 万次 fanin completion 读取以及每次未 ready progress 的非 atomic
+固定成本，再考虑 payload/DCCI；FinalDrain 位于 perf-clock 窗口之外，
+不得靠把 Submit 工作机械后移到 FinalDrain 冒充 1 ms 收益。

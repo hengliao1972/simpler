@@ -5726,3 +5726,47 @@ Submit 为 `6.894677 ms`，`EfDrainControl` 聚合核时从
 证明集中式正常态 fatal 读取仍是实质热点；但当前距离 `1.0 ms` 尚有
 约 `6.30 ms`，下一步需要把 EfDrain 长尾按 active-token/candidate/payload/
 completion 真实路径继续拆开，而不是继续删除未证明重复的检查。
+
+### 15.25 cross-core 未就绪 fanin 轮询去除 fatal 热点：中位降至 3.644 ms
+
+S6.2 的 active token 在 fanin 尚未 ready 时，每次机会式 EfDrain 都会先后
+读取 global fatal、exec fatal，并在 helper 返回后再次读取 exec fatal。
+该路径只观察 producer completion，不发射 kernel、不发布 completion，也不
+推进共享业务状态；三个集中式返回型读取因而不是不可逆动作的授权边界。
+
+本轮先用 `ExecutionTokenFaninReady()` 压缩 owner-local ready prefix，未
+ready 时直接返回；只有全部 fanin ready、准备推进到 `ENGINE_INFLIGHT` 时
+才进入保留 exec-fatal 门禁的 helper。kernel 发射前后、completion 发布前和
+Claim CAS 前的门禁保持不变；FinalDrain 入口强制检查两类 fatal，并负责把
+永久无法 ready 的 token 收敛为 `Faulted`。CPU 定向测试明确覆盖机会式
+轮询暂不 fault、FinalDrain 必须 fault 的两段语义，完整 CPU/CCEC 门槛均
+通过。
+
+A5 B256 十个独立 perf-clock 进程全部通过，结果为：
+
+```text
+3.644191 ms（独立首样本，不计入下列十轮）
+
+4.093007, 3.593300, 3.651752, 3.570847, 3.583781,
+3.904849, 3.635498, 3.814237, 3.701259, 3.529903 ms
+
+min/median/mean/max =
+3.529903 / 3.643625 / 3.707843 / 4.093007 ms
+```
+
+十轮中位相对 S6.2 的 `7.303955 ms` 改善 `50.113%`。同代码
+full-swimlane Submit 为 `3.843832 ms`；`EfDrainControl` 聚合核时从
+`369.541582 ms` 降到 `149.858920 ms`（`-59.447%`），而 local/root
+Claim CAS 仍为 `122880/10240`。1280 task、1024 kernel、严格 TensorMap
+插入、96 Scalar Build 资格、K2 异核 Execute、payload/DCCI/atomic 与
+trace closure 全部 PASS，drop 为 0。
+
+泳道路径为：
+
+`pa_scheduler/outputs/pa_scheduler_cross_core_shared_swimlane_20260802_163545_4133201/ccec/merged_swimlane.json`
+
+这轮证明未 ready progress 的 fatal 汇聚读取是 S6.2 之后的真实热点；它不
+证明目标已完成。当前 `perf-clock` 十轮中位仍比 `1.0 ms` 高
+`2.643625 ms`。后续优先细化 Submit 内剩余 `149.859 ms` EfDrainControl
+聚合核时和约 4 万次 fanin completion 读取；不得把工作推入 perf-clock
+窗口外的 FinalDrain 来制造表面数字。

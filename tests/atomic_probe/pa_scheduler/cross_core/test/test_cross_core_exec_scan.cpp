@@ -1747,12 +1747,28 @@ void TestGlobalFatalFaultsActiveTokens() {
             __atomic_store_n(
                 &state->fatal.value, int32_t{1}, __ATOMIC_RELEASE
             );
-            const uint32_t progressed =
+            const uint32_t opportunistic_progress =
                 ProgressCrossCoreExec<ExecScanTestOps>(
                     state, worker, kTask + 1U, false,
                     DrainPlace::EfDrain, stats
                 );
-            all_cases_ok &= progressed == 0 &&
+            all_cases_ok &= opportunistic_progress == 0 &&
+                state->exec_tokens[executor].control.phase ==
+                    ExecTokenPhase::WaitingFanin &&
+                DecodeExecState(
+                    state->exec_cells[kTask].control.state
+                ).phase == ExecPhase::Claimed &&
+                state->tasks[kTask].vend == 0 &&
+                state->tasks[kTask].flag == 0 &&
+                state->exec_fatal.state == 0 &&
+                ExecScanTestOps::execute_calls == 0;
+
+            const uint32_t final_progress =
+                ProgressCrossCoreExec<ExecScanTestOps>(
+                    state, worker, kTask + 1U, true,
+                    DrainPlace::FinalDrain, stats
+                );
+            all_cases_ok &= final_progress == 0 &&
                 state->exec_tokens[executor].control.phase ==
                     ExecTokenPhase::Faulted &&
                 DecodeExecState(
