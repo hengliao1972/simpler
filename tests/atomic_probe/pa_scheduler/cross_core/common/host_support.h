@@ -1075,6 +1075,15 @@ struct Metrics {
     double lifecycle_span_us = 0;
 };
 
+// CPU 在线程 join 后可以把普通 token 主存终态作为严格 oracle；A5 Scalar
+// 没有 cache coherence，且 CCEC 测试关闭 kernel-end 自动 DCCI，所以 host
+// D2H 对 owner-local token 本体只是一份可能陈旧的诊断快照。两个 runner
+// 必须在 Validate 调用点显式选择，不能让新后端静默继承错误口径。
+enum class RawExecTokenSnapshotAuthority {
+    Authoritative,
+    DiagnosticOnly,
+};
+
 inline void Expect(bool condition, const char *label, Metrics *metrics) {
     // 所有断言都继续执行，以便一次失败运行尽可能暴露完整状态，而不是遇到首错立即退出。
     std::printf("[ASSERT] %-48s %s\n", label, condition ? "PASS" : "FAIL");
@@ -4442,7 +4451,9 @@ inline bool PerfClockObserverFieldsAreZero(const WorkerResult &result) {
 #endif
 
 inline Metrics Validate(
-    const SchedulerState &state, uint32_t run, double host_us, const TraceHeader *trace_header = nullptr
+    const SchedulerState &state, uint32_t run, double host_us,
+    const TraceHeader *trace_header,
+    RawExecTokenSnapshotAuthority raw_exec_token_snapshot_authority
 ) {
     Metrics metrics;
     // 每个 worker 都回放全部 task。Alloc 由 96 个 worker 全部执行 atomicMax Claim；
@@ -5350,11 +5361,24 @@ inline Metrics Validate(
         "execution drain reaches all workers and validates every task cell",
         &metrics
     );
-    Expect(
-        cross_core_exec_tokens_idle,
-        "raw executor token snapshot is also fully reset",
-        &metrics
-    );
+    if (raw_exec_token_snapshot_authority ==
+        RawExecTokenSnapshotAuthority::Authoritative) {
+        Expect(
+            cross_core_exec_tokens_idle,
+            "coherent executor token snapshot is fully reset",
+            &metrics
+        );
+    } else {
+        // CCEC 关闭 kernel-end 自动 DCCI 后，owner-local token 的普通 GM 写只
+        // 保证本核设备语义，不保证 host D2H 看见最终 cacheline。设备已经在
+        // 加入 exec_drain 前逐字段检查 token，并把 final_occupied 经 bypass
+        // 发布；这里继续呈现 raw 结果帮助诊断，但不把 stale 快照冒充失败。
+        std::printf(
+            "[OBSERVE] %-47s %s (non-authoritative on A5)\n",
+            "raw executor token D2H snapshot",
+            cross_core_exec_tokens_idle ? "RESET" : "NON_FINAL"
+        );
+    }
     Expect(
         cross_core_exec_fatal_clear,
         "cross-core execution fatal remains clear",

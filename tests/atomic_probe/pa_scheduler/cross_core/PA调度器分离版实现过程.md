@@ -18,8 +18,8 @@
 | S0 | 固定跨核执行包 ABI、状态机和 cacheline 所有权 | standalone portable ABI 已闭合；真实 TensorDesc 对照留到 S3 |
 | S1 | CPU 确定性交错测试闭合协议正确性 | 已完成 |
 | S2 | CCEC 最小 A5 跨核发布/领取探针 | 已完成 |
-| S3 | standalone PA 接入构建/执行分离 | 进行中：S3a 已闭合；S3b 已完成 Submit 当场登记的 CPU 状态机门槛，尚需闭合 fatal 边界与 CCEC/A5 B1 |
-| S4 | 泳道、PMU 与 perf-clock 三条证据链 | 未开始 |
+| S3 | standalone PA 接入构建/执行分离 | 已完成：S3a 与固定两候选异核 S3b 均已闭合，S3b 通过 CPU、A5 B1/B256 和 B256 full-swimlane |
+| S4 | 泳道、PMU 与 perf-clock 三条证据链 | 进行中：perf-clock 与 full-swimlane 已可用；cross-core submit-PMU 尚未接入 |
 | S5 | 根据证据优化非 atomic 路径 | 未开始 |
 | S6 | 评估并迁移到 Simpler 真实路径 | 未开始 |
 
@@ -547,3 +547,63 @@ CCEC perf-clock 整套重编后，B1 共运行 4 轮：
 因此当前可以宣布 **S3b 固定两候选的非 Build 核执行功能已在 B1 和
 B256 闭合**。本轮 27.243 ms 只是功能构建的实测值；还没有生成同代码的
 B256 泳道，也没有对波动、非必要 atomic 或固定映射的性能作为保留判据。
+
+## 2026-08-02：S3b B256 full-swimlane 与终态观测口径闭合
+
+### 为什么 raw token 不能继续作为 A5 host 断言
+
+首次运行 S3b B256 full-swimlane 时，1280 个 task、1024 个 kernel、96 核
+execution drain、设备发布的 `final_occupied`、cell 终态和 fatal 均已通过，
+唯一失败项是 host 直接 D2H 后检查 `exec_tokens[]` 本体未全部呈现为
+`IDLE`。当时没有逐字段保存首个非 IDLE token，因此这里只能确定 raw
+快照没有通过，不能进一步声称 host 具体看到了哪一个中间 phase。
+
+该 raw 快照不具备 A5 语义权威性：
+
+1. `ExecutionToken` 是每个 Scalar owner-local 的普通 GM 状态；CCEC 构建
+   明确关闭 automatic scalar DCCI 和 kernel-end DCCI；
+2. A5 Scalar 之间没有 cache coherence，kernel 返回后的 D2H 可能读到
+   初始化值、自然回写的中间值或最终值；一次碰巧读到 `IDLE` 也不能反向
+   证明这个观察通道始终可靠；
+3. 每个 worker 只有在本核同时通过 `CrossCoreExecWorkerDrained()` 与
+   `CrossCoreExecTokenFullyReset()` 后才能加入 `exec_drain`；最后到达者还会
+   逐 task 验证终态并发布 drain release；
+4. release 后每核再次检查 scanner、候选位图和 token 全字段，并把
+   `final_occupied` 通过 bypass result 发布给 host。
+
+因此修正只发生在 host oracle：`Validate()` 的两个调用点显式选择
+`RawExecTokenSnapshotAuthority`。CPU 在线程 join 后采用
+`Authoritative`，raw token 仍是严格断言；CCEC 采用 `DiagnosticOnly`，继续
+打印 `RESET/NON_FINAL` 帮助诊断，但不再修改 `semantic_status`。设备侧 cell、
+token 自检、execution drain、bypass result 和 fatal 门槛一个都没有删除，
+也没有为了迎合 D2H 观察向设备热路径新增 DCCI、DSB 或 ordinary store。
+
+### 回归与 B256 泳道证据
+
+- 完整 CPU 公共构建和隔离测试通过；CPU B1 实跑继续显示
+  `coherent executor token snapshot is fully reset PASS`，证明一致内存后端的
+  严格门槛没有被放松；
+- CCEC AIC/AIV、split caller/runtime/finish、mixed ELF、host 与 manifest
+  整套重编通过；
+- A5 B256 full-swimlane 的 Submit 为 **27127.645 us**，semantic 与
+  postprocess 均为 PASS；本轮 raw D2H 恰好呈现 `RESET`，但仍只按诊断处理；
+- 1280 个 Build winner、1024 个异核 kernel、1280 条 fanin edge 精确闭合，
+  QK/SF/PV/UP 各 256；1016 个 kernel 落在 EfDrain、8 个落在 FinalDrain，
+  orphan 为 0；
+- 122880 个 Submit actor 精确拆成 1280 winner 与 121600 loser；raw trace
+  无 drop，exclusive analyzer 的 Submit、EfDrain、orchestration、final drain、
+  worker completion 和 winner/loser 分区全部 `exact=true`。
+
+本轮产物不提交到 Git：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_cross_core_shared_swimlane_20260802_112542_3784828/ccec/
+    l2_swimlane_records.json              23,784,330 B
+    merged_swimlane.json                  65,524,051 B
+    swimlane_exclusive_analysis.json         327,160 B
+```
+
+其中 `merged_swimlane.json` 可直接载入 Perfetto。该轮证明 S3b 的完整业务
+边界和异核 kernel 均能被泳道导出；27.128 ms 仍是功能版本的观测构建耗时，
+不宣称相对 same-core 有性能收益，也不把它与 perf-clock ELF 直接相减。

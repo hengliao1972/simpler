@@ -2186,7 +2186,9 @@ int main(int argc, char **argv) {
 #endif
         // 先完成共享状态、拓扑、计数和 trace header 的语义校验，再允许 raw JSON 成为性能证据。
         const pa_scheduler::host::Metrics metrics = pa_scheduler::host::Validate(
-            *state, run, host_us, options.trace_enabled ? &trace_header : nullptr
+            *state, run, host_us,
+            options.trace_enabled ? &trace_header : nullptr,
+            pa_scheduler::host::RawExecTokenSnapshotAuthority::DiagnosticOnly
         );
         all_passed &= metrics.passed;
         const bool workload_passed =

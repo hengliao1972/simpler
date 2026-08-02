@@ -10,7 +10,7 @@
 | 正式实现 | S0–S3b 固定两候选异核执行已接入并通过 B1/B256 |
 | CPU 正确性用例 | S1–S3b 协议、PA payload、两候选发现和 drain 门槛已完成 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
-| A5 PA 功能/性能 | S3b B1 4 轮、B256 1 轮全部通过；暂不作性能收益结论 |
+| A5 PA 功能/性能 | S3b B1 4 轮、B256 perf-clock 与 full-swimlane 全部通过；full-swimlane Submit 27.128 ms，暂不作性能收益结论 |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
 
@@ -978,6 +978,19 @@ S3a 和 S3b 把“shared payload 发布税”与“跨核取得税”分开，�
 12. shared execution payload 是否能复用生产 RingSlot ABI，还是需要独立中间 ABI？
 
 ## 17. 更新记录
+
+### 2026-08-02：S3b B256 full-swimlane 与 host 终态口径闭合
+
+- 固定两候选异核执行的 B256 full-swimlane 已完整通过：1280 个 Build、
+  1024 个异核 kernel、四类 kernel 各 256，fanin/payload/vend/route、96 核
+  execution drain 和 fatal 均闭合；Submit 为 **27127.645 us**，trace 无丢失。
+- A5 的 owner-local execution token 不做 kernel-end DCCI，host D2H 对 token
+  本体只能作为诊断快照。权威终态保持为设备侧逐核 token/scanner 自检、
+  全局 execution drain 和 bypass 发布的 `final_occupied`；不向设备热路径
+  增加只为 host 观察服务的 DCCI/DSB。
+- `Validate()` 现在要求 runner 显式声明 raw token 观察权威性：CPU coherent
+  路径继续严格断言，CCEC 只呈现 `RESET/NON_FINAL`。完整证据和泳道路径记录在
+  [PA调度器分离版实现过程](cross_core/PA调度器分离版实现过程.md)。
 
 ### 2026-08-02：S3a 泳道暴露全核扫描热点，修正 S3b 发现合同
 

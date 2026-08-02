@@ -517,7 +517,9 @@ int main(int argc, char **argv) {
         // 先完成严格语义校验，再允许写出；失败运行不会生成可误认成有效
         // 基线的泳道 JSON。
         const pa_scheduler::host::Metrics metrics = pa_scheduler::host::Validate(
-            *state, run, host_us, options.trace_enabled ? trace_header : nullptr
+            *state, run, host_us,
+            options.trace_enabled ? trace_header : nullptr,
+            pa_scheduler::host::RawExecTokenSnapshotAuthority::Authoritative
         );
 #if PA_BUILD_PERF_CLOCK
         const bool perf_clock_reads_ok =
