@@ -1199,3 +1199,28 @@ min/median/mean/max =
 两版代码、ABI、host oracle 与测试改动均已完整撤回；没有形成生产提交。
 S6.5 的结论是停止 ready-only/提前 ownership 路线，回到单 token 干净基线，
 从实际 perf-clock 差额中寻找不引入新任务上下文的更小优化点。
+
+## 2026-08-02：S6.6 fanin 轮询降频实验与计时边界复核
+
+本轮验证了一个不增加任务上下文的小候选：active token 在机会式 EfDrain
+读到未 ready fanin 后，跳过后续固定次数的 Submit 轮询；WaitForSlot 与
+FinalDrain 不经过该门控。CPU 定向用例、完整 CPU、CCEC 和 A5 业务终态均
+通过，说明协议活性没有丢失。
+
+动态数据却证明它不应保留。skip=1 的十轮中位为 `3.643993 ms`，仅比
+`3.678558 ms` 同步基线低 `0.940%`，同时 FinalDrain kernel 数明显增加。
+skip=2 将 fanin load 从约 `42.5K` 降至约 `28.3K`；但两套独立 ELF 的
+同时间段交错 A/B 中，基线三次为
+`3.650139/3.647333/3.634740 ms`，skip=2 为
+`3.763413/3.751776/3.915294 ms`，中位反而回退 `3.182%`。
+
+更关键的是，代码边界复核确认 perf-clock 的 `submit_end` 在最后一次
+`CloseSharedCallbackSubmit()` 内读取；replay-done barrier 和 FinalDrain
+发生在该边界之后。skip=1/2 分别把 FinalDrain kernel 数提高到约
+53--67 和 88--93，属于把执行推进移出计时窗，而不是消除调度工作。因此
+即使某组 Submit 数字下降，也不具备保留资格。
+
+所有降频过程代码和测试改动已经撤回。后续任何 execution-progress 候选都
+必须同时核对机会式 placement 与 FinalDrain 增量；若目标仍定义为完整
+Submit 调度周期，则最终还需要把权威 perf-clock 结束边界扩到 execution
+drain 闭合，避免观察口径奖励工作后移。

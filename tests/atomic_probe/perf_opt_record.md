@@ -5880,3 +5880,47 @@ min/median/mean/max =
 `1bffd5dd` 的单 token 基线；只保留本节实验数据。后续不再沿 ready-only
 Claim 深挖，重新从干净 perf-clock 的实际 atomic/非 atomic 账本选择更小的
 优化点。
+
+### 15.28 S6.6 负向取证：延长 fanin 轮询间隔会把工作推到计时窗外
+
+本阶段不增加任务上下文，也不提前 Claim。worker 已持有唯一 execution
+token、且机会式 EfDrain 发现 fanin 未 ready 后，仅跳过后续一个或两个
+Submit 入口的重复轮询；WaitForSlot 和 FinalDrain 仍强制推进。CPU 定向
+用例按常量验证完整跳过周期，完整 CPU、CCEC 构建以及 A5 的 1280 task、
+1024 kernel、严格插入、K2 owner、payload 和终态检查均通过。
+
+跳过一次时，十个顺序样本为：
+
+```text
+3.783569, 3.578274, 3.580711, 3.624233, 3.632962,
+3.785837, 3.655023, 3.550921, 3.762425, 3.684127 ms
+
+min/median/max = 3.550921 / 3.643993 / 3.785837 ms
+```
+
+表面中位数比同步基线 `3.678558 ms` 低 `0.940%`，但 FinalDrain kernel
+数从基线常见的约 37--48 个增加到 53--67 个。源码复核确认
+`submit_end` 在最后一个 `CloseSharedCallbackSubmit()` 内读取，随后才进入
+replay-done barrier 和 FinalDrain；因此该变化会把 execution progress
+移出 perf-clock 窗口，不能作为有效收益。
+
+跳过两次后，fanin 返回型读取从约 `42.5K` 降至约 `28.3K`，但
+FinalDrain 进一步增加。为排除设备随时间漂移，保留基线与 skip=2 的两套
+独立 CCEC 产物，在同一时段交错运行三对：
+
+```text
+base    = 3.650139, 3.647333, 3.634740 ms
+skip=2  = 3.763413, 3.751776, 3.915294 ms
+
+median(base/skip=2) = 3.647333 / 3.763413 ms
+skip=2 median regression = 3.182%
+
+fanin_load mean(base/skip=2) = 42511.7 / 28290.0
+FinalDrain(base) = 46,46,48
+FinalDrain(skip=2) = 88,93,88
+```
+
+结论：降低 fanin poll 次数本身不等于降低完整调度成本；该候选既延后可执行
+token，又将工作移出当前 perf-clock 结束边界。skip=1/2 的生产与测试代码
+均已完整撤回，源码恢复干净基线。后续候选必须同时核对 Submit 与
+FinalDrain，禁止用改变工作落点制造表面收益。
