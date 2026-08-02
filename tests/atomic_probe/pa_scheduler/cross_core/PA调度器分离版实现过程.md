@@ -611,13 +611,12 @@ tests/atomic_probe/pa_scheduler/outputs/
 边界和异核 kernel 均能被泳道导出；27.128 ms 仍是功能版本的观测构建耗时，
 不宣称相对 same-core 有性能收益，也不把它与 perf-clock ELF 直接相减。
 
-## 2026-08-02：S4 K2 动态 Execute election 实现与 CPU 门槛
+## 2026-08-02：S4 K2 动态 Execute election 实现与 CPU/A5 门槛
 
 ### 本节边界
 
-本节记录 S4 K2 首版实现和 CPU 取证。该版本只验证受控
+本节记录 S4 K2 首版实现和 CPU/A5 取证。该版本只验证受控
 候选中的 exactly-once election，不宣称已建成通用动态任务池。
-**A5 尚未运行，当前没有 A5 性能结论。**
 
 ### 首版 K2 候选集
 
@@ -678,3 +677,53 @@ K3 候选是后续对照：预路由 3 个兼容 observer，排除 Build owner
 
 CPU 结果证明协议状态机和 PA 功能规模已闭合，不能代替 A5
 的 atomic/DCCI 动态证据，CPU 耗时也不用于推导 A5 性能。
+
+### A5 动态证据
+
+- CCEC AIC/AIV 通用协议实例化、入口编译和 artifact manifest 全部通过。
+- B1 完整泳道 Submit 为 `280.683 us`，5 个 task、4 个 kernel、
+  payload、terminal snapshot、execution drain 和实际计算结果全部 PASS，
+  且无 trace drop。
+- B256 普通运行 Submit 为 `27.420 ms`；随后独立完整泳道 Submit
+  为 `27.476 ms`，1280 个 task、1024 个 kernel、1280 条 fanin edge、
+  2048 个 shared output 全部闭合，trace drop 为 0。
+- B256 泳道中 956 个 task 的 Build owner 不在 K2 内，实际由
+  primary/secondary 分别赢得 319/637 次；Build owner 是 primary 的
+  27 个 task 均由 secondary 执行，Build owner 是 secondary 的 41 个
+  task 均由 primary 执行，非法 owner 为 0。这证明上板实际走了
+  动态竞争，不是 host 只对唯一预定 owner 放行。
+
+完整 B256 泳道在：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260802_125404_3864346/ccec/merged_swimlane.json`
+
+干净 B1 泳道在：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260802_123052_3843470/ccec/merged_swimlane.json`
+
+### 长尾的定位边界
+
+B1 连续运行仍能观察到数十毫秒至数十秒的偶发长尾，但对照
+已经排除“S4 CAS 造成状态环”：
+
+- 父提交 `271ce596` 的 S3b fixed-owner perf-clock 同机 B1 五轮为
+  `308.638 us / 281.619 us / 36.922 s / 192.829 ms / 298.487 us`，
+  五轮语义均 PASS；因此几十秒长尾不是 K2 新增现象。
+- S4 的 `805.959 ms` 长尾泳道中，第一个异常是 AIC core26 在
+  task 3 `Materialize` 入口到第一个 heap atomic 之前停了约
+  `805.817 ms`；该 heap atomic 本身只有 `0.281 us`。
+- task 4 的 `register.wait_predecessor_tensormap_insert` 随后等待
+  `805.799 ms`，是 TensorMap 严格顺序链传播上游停顿的结果。
+  S4 election 只能在 task 3 `winner_build` 结束并发布 `BUILT` 后开始，
+  不可能导致该停顿。
+- 已到尾部的核在 FinalDrain 内无退避轮询，会将一次落后核
+  放大为大量 atomic 流量；这是后续独立的等待公平性/退避问题，
+  不在本 S4 功能提交中顺手改写。
+
+长尾取证泳道在：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260802_124840_3856072/ccec/merged_swimlane.json`
+
+与 S3b full-swimlane 的 `27.128 ms` 单样本相比，本轮 S4 为
+`27.476 ms`，约 `+1.28%`。两者都是观测 ELF 的单轮样本，且上述长尾
+已证实存在，因此只记录数值，不据此宣称稳定性能回退或收益。

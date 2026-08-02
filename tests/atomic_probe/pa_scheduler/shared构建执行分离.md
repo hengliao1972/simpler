@@ -7,11 +7,11 @@
 | 目标 | 让 task 的构建 owner 与 kernel 执行 owner 可以是不同物理核 |
 | 当前代码 | Build owner 发布 task-indexed shared payload，K2 排除 Build owner 后的 1 或 2 个 eligible executor 竞争执行 |
 | 本文性质 | 持续更新的架构与内存模型设计记录 |
-| 正式实现 | S0–S3b 已通过 CPU/A5；S4 K2 已实现并通过 CPU B1/B256，A5 尚未运行 |
+| 正式实现 | S0–S4 K2 已通过 CPU/CCEC/A5；S4 仍是受控双候选，不是通用动态任务池 |
 | CPU 正确性用例 | S1–S4 K2 协议、PA payload、动态合法 owner 和 drain 门槛已完成 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
-| A5 PA 功能/性能 | S3b B1 4 轮、B256 perf-clock 与 full-swimlane 全部通过；full-swimlane Submit 27.128 ms，暂不作性能收益结论 |
-| S4 动态 Execute election | K2 首版已实现；完整 CPU build、B1/B256 semantic/postprocess 全部 PASS；**A5 尚未运行** |
+| A5 PA 功能/性能 | S3b full-swimlane Submit 27.128 ms；S4 K2 B1/B256 全部闭合，B256 full-swimlane Submit 27.476 ms，仅记录单样本 |
+| S4 动态 Execute election | K2 首版已通过 CPU B1/B256 和 A5 B1/B256；B256 中两候选都有实际胜出，非法 owner 为 0 |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
 
@@ -881,8 +881,8 @@ S3a 和 S3b 把“shared payload 发布税”与“跨核取得税”分开，�
 
 ### S4：加入 exactly-once execution election
 
-本节已完成 K2 实现和 CPU 功能门槛。**A5 尚未运行，
-没有 A5 性能结论**。
+本节已完成 K2 实现以及 CPU/CCEC/A5 功能门槛。它仍是
+受控双候选，不是通用动态任务池。
 
 首版采用 K2，只改 S3b 中“两个 observer 里固定一个 executor”
 的最后一步：
@@ -938,7 +938,17 @@ CPU 已有的动态证据为：
   全部通过。
 
 CPU 耗时不用于推导 A5 性能，上述结果也不代替 A5 atomic/DCCI
-可见性与动态竞争门槛。
+可见性与动态竞争门槛。A5 证据已进一步闭合：B1 full-swimlane
+Submit 为 `280.683 us`；B256 full-swimlane Submit 为 `27.476 ms`，
+1280 个 task、1024 个 kernel 和全部 terminal/drain 断言 PASS，trace drop
+为 0。Build owner 不在 K2 的 956 个 task 中，primary/secondary 实际
+分别胜出 319/637 次；Build owner 命中 K2 时则均由另一候选执行。
+
+B1 偶发长尾不得归因于 S4：fixed-owner 父版同样在同机跑出
+`36.922 s`。已保存的 S4 `805.959 ms` 泳道又将第一个异常定位在
+task 3 `Materialize` 的第一个 heap atomic 之前，之后才被 TensorMap
+严格顺序链和 FinalDrain 无退避轮询放大。该公平性/退避问题留作
+独立性能课题，不改变 S4 已闭合的状态机结论。
 
 ### S5：独立扩大 Build owner 候选核
 
