@@ -641,10 +641,17 @@ PA_DEVICE void ConstructTaskArgs(TaskArgs &args) {
 }
 
 PA_DEVICE void ResetTaskArgs(TaskArgs &args) {
-    // reset 的输出是不含 tensor/scalar/显式依赖的新逻辑参数表，但保留已分配对象及
-    // launch_spec；QK/SF/PV/UP 在同一个 1 KiB TaskArgs 上依次复用这一状态。
+    // reset 的输出是不含 tensor/scalar/显式依赖的新逻辑参数表，并保留已分配
+    // 对象；QK/SF/PV/UP 在同一个 1 KiB TaskArgs 上依次复用这一状态。
+    // shared replay 中每个 task 的 winner 可以不同：某个 worker 可能没有赢过
+    // Alloc，却直接成为 QK/SF/PV/UP winner。此时它的栈上 TaskArgs 尚未经过
+    // ConstructTaskArgs，不能把 launch_spec 当成已初始化状态。standalone PA
+    // 没有 callback 修改 launch_spec，因此在每次 winner reset 时恢复默认值，
+    // 既保持业务合同，也避免跨核 payload 冻结未定义字段。
     args.tensor_count = 0;
     args.scalar_count = 0;
+    args.launch_spec.core_num = 1;
+    args.launch_spec.require_sync_start = false;
     ClearDumpArgSelection(args.dump_arg_selection);
     args.explicit_deps = 0;
     args.explicit_dep_count = 0;

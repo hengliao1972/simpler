@@ -23,6 +23,7 @@
 #include "pa_frontend.h"
 #if PTO_FDWIC_SHARED_MAP
 #include "pa_shared_tensormap.h"
+#include "pa_exec_adapter.h"
 #endif
 #include "pa_trace.h"
 
@@ -43,6 +44,10 @@ struct LocalStats {
     // 只在末个 shared Submit 成功收尾时写入 task_id+1；回放结束后与
     // local_index 对照，证明 ticket 的 last bit 没有提前或遗漏。
     uint32_t declared_task_count;
+    // S3a 每个 worker 按 task id 单调发现自己构建的执行包。
+    // 该游标属于 Scalar 本地调度上下文，不是跨核发布对象，
+    // 因此不放入 GM SchedulerState，也不增加 cacheline 竞争。
+    uint32_t exec_scan_task;
 #else
     uint32_t max_occupied;
 #endif
@@ -116,8 +121,8 @@ struct alignas(64) CompeteFirstSplitRuntimeState {
     uint64_t owner_worker_id;
     uint64_t reserved;
 };
-static_assert(sizeof(CompeteFirstSplitRuntimeState) % 64 == 0,
-              "split runtime state must occupy whole cache lines");
+static_assert(sizeof(CompeteFirstSplitRuntimeState) == 1728,
+              "split runtime logical ABI changed");
 static_assert(
     __is_trivially_constructible(CompeteFirstSplitRuntimeState) &&
         __has_trivial_destructor(CompeteFirstSplitRuntimeState),
@@ -3176,15 +3181,14 @@ PA_DEVICE bool PublishSharedTaskOutputs(
         return false;
     }
     PA_GM SharedOutputCell &cell = map.shared_outputs[task_id];
-    // 先完整预检所有 slot；异常重复发布不能覆盖已对 consumer 可见的
-    // descriptor，也不能让多输出 task 留下前半段控制字。
+    // 先只预检 builder 私有的 descriptor 地址。A5 Scalar 间没有 cache
+    // coherence，published/last_writer 即使独占 cache line，也不能用普通
+    // GM load 判断跨轮初始化值：前一 kernel 留在本核 DCache 中的旧值可能
+    // 遮住 host H2D 写入的 -1。下面的返回型 FetchMax 与 Exchange 才是
+    // 控制字的权威读取/线性化边界；异常旧值仍会在覆盖 payload 前被拒绝。
     for (uint32_t output = 0; output < context.result.count; ++output) {
         PA_GM TensorDesc *source = context.result.tensors[output];
-        // cell 由该 task 的唯一 Claim winner 独占；其他 task 只能在
-        // published 就绪后读取，因此预检用普通 volatile GM load 即可。
-        if (source == nullptr ||
-            cell.published[output].value != -1 ||
-            cell.last_writer[output].value != -1) {
+        if (source == nullptr) {
             return false;
         }
     }
@@ -3473,14 +3477,21 @@ PA_DEVICE void PrepareSharedWinnerContext(
     SubmitContext &context
 ) {
     // 这些字段都只会被 shared winner 的 Materialize/Fanin/Build 消费。
-    // tensor/scalar/register/output_bytes 由 MaterializeTask 在读取前覆盖；
-    // joint 字段属于 private BlockWon 路径，shared 单 lane PA 不读取。
+    // tensor/scalar/register/output_bytes 由 MaterializeTask 在读取前覆盖。
+    // cross-core payload adapter 会显式拒绝 Joint，因此这里必须把
+    // winner 复用的 SubmitContext 恢复成普通单 lane task；不能依赖
+    // CPU 栈或 CCEC block-local 旧值恰好为零。
     context.self = &worker;
     context.payload =
         &worker.payloads[task_id & kPayloadMask];
     context.result.task_id = task_id;
     context.result.count = 0;
     context.fanin_count = 0;
+    context.joint = false;
+    context.joint_init = false;
+    context.joint_block = -1;
+    context.joint_slot = -1;
+    context.joint_count = 0;
 }
 #endif
 
@@ -3707,6 +3718,571 @@ PA_DEVICE bool FinishSharedLoserSubmit(
     return CloseSharedCallbackSubmit<Ops, Profile>(
         state, stats, task_id, submit_begin, is_last_submit
     );
+}
+
+PA_DEVICE cross_core::ExecEngineClass CrossCoreEngineForRole(
+    CoreRole role
+) {
+    return role == CoreRole::Aic
+        ? cross_core::ExecEngineClass::Aic
+        : cross_core::ExecEngineClass::Aiv;
+}
+
+template <typename Ops>
+PA_DEVICE void PublishCrossCoreRuntimeFailure(
+    PA_GM SchedulerState *state, LocalStats &stats,
+    cross_core::ExecFatalReason reason, uint32_t task_id,
+    uint32_t worker_id
+) {
+    if (state == nullptr || worker_id >= kWorkers) {
+        return;
+    }
+    (void)cross_core::PublishExecFatal<Ops>(
+        state->exec_fatal, reason, task_id, worker_id
+    );
+    SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+}
+
+template <typename Ops>
+PA_DEVICE_NOINLINE bool PublishCrossCoreExecTask(
+    PA_GM SchedulerState *state, PA_GM WorkerState &worker,
+    uint32_t task_id, TaskKind kind, int32_t function_id,
+    const TaskArgs &args, const SubmitContext &context,
+    LocalStats &stats
+) {
+    const uint32_t worker_id =
+        static_cast<uint32_t>(worker.core_idx);
+    if (state == nullptr || worker.core_idx < 0 ||
+        worker_id >= kWorkers || task_id >= kMaxTasks ||
+        kind == TaskKind::Alloc || kind == TaskKind::Count ||
+        function_id != FunctionId(kind) ||
+        Ops::Load(&state->fatal.value) != 0) {
+        PublishCrossCoreRuntimeFailure<Ops>(
+            state, stats,
+            cross_core::ExecFatalReason::InvalidBuiltControl,
+            task_id, worker_id
+        );
+        return false;
+    }
+
+    cross_core::ExecPayloadSpec spec{};
+    cross_core::PaExecPayloadSource source{};
+    if (!cross_core::MakePaExecPayloadSpec(
+            task_id, kind, function_id,
+            /*function_address=*/0, worker, args, context, spec
+        )) {
+        PublishCrossCoreRuntimeFailure<Ops>(
+            state, stats,
+            cross_core::ExecFatalReason::InvalidBuildInput,
+            task_id, worker_id
+        );
+        return false;
+    }
+    if (!cross_core::ResolvePaExecPayloadSourceAfterFanin<Ops>(
+            *state, args, context, task_id, source
+        )) {
+        PublishCrossCoreRuntimeFailure<Ops>(
+            state, stats,
+            cross_core::ExecFatalReason::BuildPackFailed,
+            task_id, worker_id
+        );
+        return false;
+    }
+
+    const cross_core::ExecBuildResult build_result =
+        cross_core::BuildAndPublishExecPayload<Ops>(
+            state->exec_cells[task_id], worker_id, spec, source,
+            state->exec_fatal
+        );
+    if (build_result != cross_core::ExecBuildResult::Published) {
+        // CellUnavailable 本身不会改写首错现场；完整 PA
+        // 中 fresh task cell 不应发生这种冲突，因此仍需发布
+        // terminal fatal，不能把重复 Build 当成可恢复竞争。
+        PublishCrossCoreRuntimeFailure<Ops>(
+            state, stats,
+            cross_core::ExecFatalReason::ControlPublishConflict,
+            task_id, worker_id
+        );
+        return false;
+    }
+
+    // 沿用既有 host 统计字段的业务含义：它们现在表示
+    // portable payload 中实际发布的 tensor/scalar/fanin 数，
+    // 不再表示 private LocalSlot 的物理拷贝。
+    stats.result.slot_tensor_copies +=
+        static_cast<uint32_t>(context.tensor_count);
+    stats.result.slot_scalar_copies +=
+        static_cast<uint32_t>(context.scalar_count);
+    stats.result.fanin_edges +=
+        static_cast<uint32_t>(context.fanin_count);
+    return true;
+}
+
+template <typename Ops>
+PA_DEVICE bool ProgressCrossCoreActiveToken(
+    PA_GM SchedulerState *state, PA_GM WorkerState &worker,
+    DrainPlace place, LocalStats &stats, bool &completed
+) {
+    completed = false;
+    const uint32_t worker_id =
+        static_cast<uint32_t>(worker.core_idx);
+    if (state == nullptr || worker.core_idx < 0 ||
+        worker_id >= kWorkers) {
+        return false;
+    }
+    PA_GM cross_core::ExecutionToken &token =
+        state->exec_tokens[worker_id];
+    if (token.control.phase == cross_core::ExecTokenPhase::Idle) {
+        return true;
+    }
+    if (token.control.phase ==
+            cross_core::ExecTokenPhase::WaitingFanin) {
+        cross_core::PaExecReadySource<Ops> ready{
+            state, &stats.result
+        };
+        if (!cross_core::TryMarkExecutionTokenEngineInflight<Ops>(
+                token, ready, state->exec_fatal
+            )) {
+            if (cross_core::ExecFatalPublished<Ops>(
+                    state->exec_fatal
+                )) {
+                SetFatal<Ops>(
+                    state, stats,
+                    static_cast<int32_t>(token.control.task_id)
+                );
+                return false;
+            }
+            return true;
+        }
+
+        const cross_core::ExecPayloadHeader header =
+            cross_core::ExecutionTokenHeader(token);
+        TaskKind kind = TaskKind::Count;
+        cross_core::PaExecRoute route{};
+        if (!cross_core::PaTaskKindFromExecFunction(
+                header.function_id, kind
+            ) ||
+            !cross_core::ResolvePaExecRoute(
+                kind, static_cast<int32_t>(header.function_id),
+                route
+            ) ||
+            route.engine_class != CrossCoreEngineForRole(worker.role) ||
+            token.control.build_owner != worker_id ||
+            token.control.execute_owner != worker_id) {
+            PublishCrossCoreRuntimeFailure<Ops>(
+                state, stats,
+                cross_core::ExecFatalReason::InvalidTokenPayload,
+                token.control.task_id, worker_id
+            );
+            token.control.phase =
+                cross_core::ExecTokenPhase::Faulted;
+            return false;
+        }
+
+        const uint64_t kernel_begin =
+            TraceTimestamp<Ops>(stats.trace, stats.result);
+        if (!cross_core::ExecutePaBoundKernel<Ops>(
+                state, worker, token, kind,
+                NopCountForKind(state->config.nops, kind)
+            )) {
+            PublishCrossCoreRuntimeFailure<Ops>(
+                state, stats,
+                cross_core::ExecFatalReason::InvalidTokenPayload,
+                header.task_id, worker_id
+            );
+            token.control.phase =
+                cross_core::ExecTokenPhase::Faulted;
+            return false;
+        }
+        const uint64_t kernel_end =
+            TraceTimestamp<Ops>(stats.trace, stats.result);
+        WriteTrace<false>(
+            stats.trace, stats.result,
+            static_cast<int32_t>(header.task_id),
+            static_cast<int32_t>(header.function_id),
+            TracePhase::Kernel, ProfilePhase::ReplayTail,
+            kernel_begin, kernel_end
+        );
+        RecordKernelCycles(
+            stats, kind, kernel_end - kernel_begin
+        );
+
+        const cross_core::PaExecSynchronousEngineCompletion
+            engine_complete{};
+        if (!cross_core::TryMarkExecutionTokenCompleting<Ops>(
+                token, engine_complete, state->exec_fatal
+            )) {
+            PublishCrossCoreRuntimeFailure<Ops>(
+                state, stats,
+                cross_core::ExecFatalReason::InvalidTokenPayload,
+                header.task_id, worker_id
+            );
+            token.control.phase =
+                cross_core::ExecTokenPhase::Faulted;
+            return false;
+        }
+    } else if (
+        token.control.phase ==
+            cross_core::ExecTokenPhase::EngineInflight ||
+        token.control.phase ==
+            cross_core::ExecTokenPhase::Binding ||
+        token.control.phase ==
+            cross_core::ExecTokenPhase::Faulted
+    ) {
+        // 当前 ExecuteKernel 是同步边界，ENGINE_INFLIGHT/BINDING 不应
+        // 跨越一次 progress 返回。若观察到这些状态，必须
+        // fail-closed，否则可能在没有真正执行 kernel 时发布完成。
+        PublishCrossCoreRuntimeFailure<Ops>(
+            state, stats,
+            cross_core::ExecFatalReason::InvalidTokenPayload,
+            token.control.task_id, worker_id
+        );
+        token.control.phase = cross_core::ExecTokenPhase::Faulted;
+        return false;
+    }
+
+    if (token.control.phase ==
+            cross_core::ExecTokenPhase::Completing ||
+        token.control.phase ==
+            cross_core::ExecTokenPhase::VendPublished ||
+        token.control.phase ==
+            cross_core::ExecTokenPhase::CompletionPublished) {
+        const uint32_t completed_task = token.control.task_id;
+        const uint32_t completed_function =
+            cross_core::ExecutionTokenHeader(token).function_id;
+        cross_core::PaExecCompletionSink<Ops> completion{state};
+        if (cross_core::PublishExecDoneAfterCompletion<Ops>(
+                state->exec_cells[completed_task], token,
+                completion, state->exec_fatal
+            ) != cross_core::ExecDoneResult::Done) {
+            SetFatal<Ops>(
+                state, stats,
+                static_cast<int32_t>(completed_task)
+            );
+            return false;
+        }
+        const uint64_t commit_cycle =
+            TraceTimestamp<Ops>(stats.trace, stats.result);
+        WriteTrace<false>(
+            stats.trace, stats.result,
+            static_cast<int32_t>(completed_task),
+            static_cast<int32_t>(completed_function),
+            TracePhase::Commit, ProfilePhase::ReplayTail,
+            commit_cycle, commit_cycle
+        );
+        ++stats.result.placement[static_cast<uint32_t>(place)];
+        completed = true;
+    }
+    return token.control.phase == cross_core::ExecTokenPhase::Idle;
+}
+
+template <typename Ops>
+PA_DEVICE uint32_t ProgressCrossCoreExec(
+    PA_GM SchedulerState *state, PA_GM WorkerState &worker,
+    uint32_t replay_closed_exclusive, DrainPlace place,
+    LocalStats &stats
+) {
+    if (state == nullptr || worker.core_idx < 0 ||
+        static_cast<uint32_t>(worker.core_idx) >= kWorkers ||
+        replay_closed_exclusive > kMaxTasks) {
+        if (state != nullptr && worker.core_idx >= 0 &&
+            static_cast<uint32_t>(worker.core_idx) < kWorkers) {
+            PublishCrossCoreRuntimeFailure<Ops>(
+                state, stats,
+                cross_core::ExecFatalReason::InvalidTokenPayload,
+                replay_closed_exclusive,
+                static_cast<uint32_t>(worker.core_idx)
+            );
+        }
+        return 0;
+    }
+    const uint32_t worker_id =
+        static_cast<uint32_t>(worker.core_idx);
+    if (Ops::Load(&state->fatal.value) != 0) {
+        return 0;
+    }
+    if (cross_core::ExecFatalPublished<Ops>(state->exec_fatal)) {
+        SetFatal<Ops>(state, stats, -1);
+        return 0;
+    }
+
+    uint32_t completed_count = 0;
+    bool completed = false;
+    if (!ProgressCrossCoreActiveToken<Ops>(
+            state, worker, place, stats, completed
+        )) {
+        return 0;
+    }
+    completed_count += completed ? 1U : 0U;
+    if (state->exec_tokens[worker_id].control.phase !=
+        cross_core::ExecTokenPhase::Idle) {
+        return completed_count;
+    }
+
+    // replay_closed_exclusive 只由 CloseSharedCallbackSubmit 已成功闭合
+    // 的 Submit 数提供，不能使用 Begin 时已自增的
+    // worker.local_index。因此对已关闭 task 观察到 EMPTY/BUILDING
+    // 时，可以确定它不是本 worker 已发布的 winner task。
+    while (stats.exec_scan_task < replay_closed_exclusive) {
+        const uint32_t task_id = stats.exec_scan_task;
+        PA_GM cross_core::SharedExecCell &cell =
+            state->exec_cells[task_id];
+        const cross_core::DecodedExecState observed =
+            cross_core::DecodeExecState(Ops::Load(&cell.control.state));
+        if (!observed.valid) {
+            PublishCrossCoreRuntimeFailure<Ops>(
+                state, stats,
+                cross_core::ExecFatalReason::InvalidBuiltControl,
+                task_id, worker_id
+            );
+            return completed_count;
+        }
+
+        if (observed.phase == cross_core::ExecPhase::Built &&
+            observed.build_owner == worker_id) {
+            const cross_core::ExecEngineClass engine =
+                CrossCoreEngineForRole(worker.role);
+            if (!cross_core::ExecEngineCompatible(
+                    observed.engine_class, engine
+                )) {
+                PublishCrossCoreRuntimeFailure<Ops>(
+                    state, stats,
+                    cross_core::ExecFatalReason::InvalidBuiltControl,
+                    task_id, worker_id
+                );
+                return completed_count;
+            }
+            const cross_core::ExecClaimResult claim =
+                cross_core::ClaimAndBindExecPayload<Ops>(
+                    cell, task_id, worker_id, engine,
+                    state->exec_tokens[worker_id],
+                    state->exec_fatal
+                );
+            if (claim != cross_core::ExecClaimResult::Claimed ||
+                !cross_core::BindPaExecutionTokenDispatchAfterClaim(
+                    state->exec_tokens[worker_id], worker
+                )) {
+                PublishCrossCoreRuntimeFailure<Ops>(
+                    state, stats,
+                    cross_core::ExecFatalReason::InvalidTokenPayload,
+                    task_id, worker_id
+                );
+                state->exec_tokens[worker_id].control.phase =
+                    cross_core::ExecTokenPhase::Faulted;
+                return completed_count;
+            }
+            ++stats.exec_scan_task;
+            if (stats.max_occupied == 0) {
+                stats.max_occupied = 1;
+            }
+            completed = false;
+            if (!ProgressCrossCoreActiveToken<Ops>(
+                    state, worker, place, stats, completed
+                )) {
+                return completed_count;
+            }
+            completed_count += completed ? 1U : 0U;
+            if (state->exec_tokens[worker_id].control.phase !=
+                cross_core::ExecTokenPhase::Idle) {
+                return completed_count;
+            }
+            continue;
+        }
+
+        if ((observed.phase == cross_core::ExecPhase::Building ||
+             observed.phase == cross_core::ExecPhase::Claimed) &&
+            observed.build_owner == worker_id) {
+            // 本 worker 的 Build 是同步发布后才 Close Submit；执行
+            // cursor 又只在 Claim 成功后前移。已闭合前缀中出现
+            // 本 owner BUILDING/CLAIMED 表示状态机丢失了本地上下文。
+            PublishCrossCoreRuntimeFailure<Ops>(
+                state, stats,
+                cross_core::ExecFatalReason::InvalidBuiltControl,
+                task_id, worker_id
+            );
+            return completed_count;
+        }
+
+        // Alloc 始终为 EMPTY；其他 owner 的 EMPTY/BUILDING/BUILT/
+        // CLAIMED/DONE 也都不属于 S3a 本 worker 的执行序列。
+        // 本 worker 的 winner 在 Submit Close 前已同步达到 BUILT，
+        // 所以此处前移不会永久跳过自己稍后发布的 task。
+        ++stats.exec_scan_task;
+    }
+    return completed_count;
+}
+
+PA_DEVICE bool CrossCoreExecWorkerDrained(
+    PA_GM const SchedulerState *state,
+    PA_GM const WorkerState &worker, uint32_t task_count,
+    const LocalStats &stats
+) {
+    if (state == nullptr || worker.core_idx < 0 ||
+        static_cast<uint32_t>(worker.core_idx) >= kWorkers) {
+        return false;
+    }
+    return stats.exec_scan_task == task_count &&
+           state->exec_tokens[static_cast<uint32_t>(worker.core_idx)]
+                   .control.phase ==
+               cross_core::ExecTokenPhase::Idle;
+}
+
+PA_DEVICE bool CrossCoreExecTokenFullyReset(
+    PA_GM const cross_core::ExecutionToken &token
+) {
+    PA_GM const cross_core::ExecutionTokenControl &control =
+        token.control;
+    return control.phase == cross_core::ExecTokenPhase::Idle &&
+           control.task_id == UINT32_MAX &&
+           control.build_owner == UINT32_MAX &&
+           control.execute_owner == UINT32_MAX &&
+           control.engine_class ==
+               cross_core::ExecEngineClass::None &&
+           control.payload_lines == 0 &&
+           control.payload_bytes == 0 &&
+           control.fanin_ready_prefix == 0;
+}
+
+template <typename Ops>
+PA_DEVICE bool ValidateCrossCoreExecTerminalCells(
+    PA_GM SchedulerState *state, uint32_t task_count,
+    uint32_t &first_bad_task
+) {
+    first_bad_task = task_count;
+    if (state == nullptr || task_count > kMaxTasks ||
+        state->config.batches == 0 ||
+        state->config.batches > kMaxBatches) {
+        return false;
+    }
+
+    uint32_t task_cursor = 0;
+    for (uint32_t batch = 0;
+         batch < state->config.batches; ++batch) {
+        const int32_t context_length = state->context_lens[batch];
+        SharedPaBatchPlan plan{};
+        if (context_length < 0 ||
+            !BuildSharedPaBatchPlan(
+                static_cast<uint64_t>(context_length),
+                task_cursor, plan
+            )) {
+            first_bad_task = task_cursor;
+            return false;
+        }
+        for (uint32_t offset = 0;
+             offset < plan.task_count; ++offset) {
+            const uint32_t task_id = task_cursor + offset;
+            SharedPaPlannedTask planned{};
+            const cross_core::DecodedExecState decoded =
+                cross_core::DecodeExecState(
+                    Ops::Load(
+                        &state->exec_cells[task_id]
+                             .control.state
+                    )
+                );
+            bool valid =
+                SharedPaPlannedTaskAt(plan, offset, planned) &&
+                decoded.valid &&
+                Ops::Load(&state->tasks[task_id].flag) == 1;
+            if (valid && planned.kind == TaskKind::Alloc) {
+                valid = decoded.phase ==
+                    cross_core::ExecPhase::Empty;
+            } else if (valid) {
+                const cross_core::ExecEngineClass expected_engine =
+                    planned.kind == TaskKind::Qk ||
+                            planned.kind == TaskKind::Pv
+                        ? cross_core::ExecEngineClass::Aic
+                        : cross_core::ExecEngineClass::Aiv;
+                valid =
+                    decoded.phase == cross_core::ExecPhase::Done &&
+                    decoded.task_id == task_id &&
+                    decoded.engine_class == expected_engine &&
+                    decoded.build_owner == decoded.execute_owner;
+            }
+            if (!valid) {
+                first_bad_task = task_id;
+                return false;
+            }
+        }
+        task_cursor += plan.task_count;
+    }
+    return task_cursor == task_count;
+}
+
+template <typename Ops>
+PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
+    PA_GM SchedulerState *state, PA_GM WorkerState &worker,
+    uint32_t task_count, LocalStats &stats,
+    bool &arrived, bool &released
+) {
+    released = false;
+    if (state == nullptr || worker.core_idx < 0 ||
+        static_cast<uint32_t>(worker.core_idx) >= kWorkers) {
+        return false;
+    }
+    const uint32_t worker_id =
+        static_cast<uint32_t>(worker.core_idx);
+    PA_GM cross_core::ExecutionToken &token =
+        state->exec_tokens[worker_id];
+    if (!arrived) {
+        if (!CrossCoreExecWorkerDrained(
+                state, worker, task_count, stats
+            ) ||
+            !CrossCoreExecTokenFullyReset(token)) {
+            return true;
+        }
+        const int64_t prior = Ops::FetchAdd(
+            &state->exec_drain.arrived, 1
+        );
+        if (prior < 0 ||
+            prior >= static_cast<int64_t>(kWorkers)) {
+            PublishCrossCoreRuntimeFailure<Ops>(
+                state, stats,
+                cross_core::ExecFatalReason::CompletionStateConflict,
+                task_count, worker_id
+            );
+            return false;
+        }
+        arrived = true;
+        if (prior + 1 == static_cast<int64_t>(kWorkers)) {
+            uint32_t first_bad_task = task_count;
+            if (!ValidateCrossCoreExecTerminalCells<Ops>(
+                    state, task_count, first_bad_task
+                )) {
+                PublishCrossCoreRuntimeFailure<Ops>(
+                    state, stats,
+                    cross_core::ExecFatalReason::CompletionStateConflict,
+                    first_bad_task, worker_id
+                );
+                return false;
+            }
+            if (Ops::CompareExchange(
+                    &state->exec_drain.release, 0, 1
+                ) != 0) {
+                PublishCrossCoreRuntimeFailure<Ops>(
+                    state, stats,
+                    cross_core::ExecFatalReason::CompletionStateConflict,
+                    task_count, worker_id
+                );
+                return false;
+            }
+        }
+    }
+
+    const int64_t release =
+        Ops::Load(&state->exec_drain.release);
+    if (release == 1) {
+        released = true;
+        return true;
+    }
+    if (release != 0) {
+        PublishCrossCoreRuntimeFailure<Ops>(
+            state, stats,
+            cross_core::ExecFatalReason::CompletionStateConflict,
+            task_count, worker_id
+        );
+        return false;
+    }
+    return true;
 }
 
 #include "pa_shared_submit_path.h"
@@ -4226,7 +4802,15 @@ PA_DEVICE bool SubmitCallbackTask(
     const uint64_t efdrain_begin = submit_begin;
     BeginSubmitPmuPhase<SubmitPmuPhase::EfDrain, Ops>(pmu_context);
 #if PTO_FDWIC_SHARED_MAP
-    OpportunisticDrainReady<Ops>(state, worker, stats);
+    // BeginSharedCallbackSubmit 已经让 local_index 包含当前 task，
+    // 而 stats.result.submits 只包含已经 Close 的前缀。执行发现
+    // 必须使用后者，避免把尚未 Build 的当前 task 当成
+    // EMPTY 并永久跳过。
+    (void)ProgressCrossCoreExec<Ops>(
+        state, worker,
+        static_cast<uint32_t>(stats.result.submits),
+        DrainPlace::EfDrain, stats
+    );
 #else
     DrainReady<Ops>(state, worker, DrainPlace::EfDrain, stats);
 #endif
@@ -4591,6 +5175,14 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     worker.occupied_count = 0;
     worker.owned_total = 0;
     worker.swimlane_last_cycle = 0;
+#if PTO_FDWIC_SHARED_MAP
+    // ExecutionToken 是 worker 私有的普通 GM 状态，不由其他 Scalar 读取。
+    // A5 Scalar 间没有 cache coherence，host H2D 写入的 IDLE 不能替代
+    // 本核初始化：同一物理 Scalar 仍可能缓存上一 kernel 的 Waiting/Faulted
+    // 控制字。每轮由 owner Scalar 覆盖自己的完整控制字段，后续也只由
+    // 该 Scalar 消费；跨核可见性只通过 exec cell 的 atomic + DCCI 协议。
+    cross_core::ResetExecutionToken(state->exec_tokens[worker_id]);
+#endif
     for (uint32_t index = 0; index < kPrivateSlots; ++index) {
         worker.slots[index].occupied = false;
         worker.slots[index].built = false;
@@ -4987,11 +5579,28 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     bool leaf_released = false;
     bool global_release_observed = false;
 #if PTO_FDWIC_SHARED_MAP
-    uint32_t final_stall_polls = 0;
+    bool cross_core_exec_ok = true;
+    bool cross_core_drain_arrived = false;
+    bool cross_core_drain_released = false;
 #endif
     while (true) {
+#if PTO_FDWIC_SHARED_MAP
+        const uint32_t freed = cross_core_exec_ok
+            ? ProgressCrossCoreExec<Ops>(
+                  state, worker, task_count,
+                  DrainPlace::FinalDrain, stats
+              )
+            : 0;
+        if (Ops::Load(&state->fatal.value) != 0 ||
+            cross_core::ExecFatalPublished<Ops>(
+                state->exec_fatal
+            )) {
+            cross_core_exec_ok = false;
+        }
+#else
         const uint32_t freed =
             DrainReady<Ops>(state, worker, DrainPlace::FinalDrain, stats);
+#endif
         const bool all_replayed = hierarchical_final_barrier ?
                                       ProgressHierarchicalFinalBarrier<Ops>(
                                           state->final_barrier, final_barrier_shape, worker, stats,
@@ -5007,26 +5616,33 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             global_release_observed = true;
         }
 #if PTO_FDWIC_SHARED_MAP
-        // final barrier 证明所有 replay actor 已停止生产。只有本轮没有
-        // 释放任何 slot、且本核仍被未完成 fanin 阻塞时才按 1024 次一批
-        // 探测 fatal；正常 count==0 出口不新增原子，正常跨核推进也不会
-        // 被误清。fatal 时撤销本核执行资格，保证所有 worker 收敛退出。
-        if (global_release_observed && freed == 0 &&
-            worker.occupied_count != 0) {
-            ++final_stall_polls;
-            if ((final_stall_polls & 1023U) == 0) {
-                (void)DiscardSharedSlotsAfterReplayFatal<Ops>(
-                    state, worker, stats
+        // 第一层 final barrier 只证明不再生产新 BUILT cell。每个 worker
+        // 扫描完 closed prefix 且 token 完整复位后，再进入 execution
+        // drain 汇合；最后到达者逐 task 验证 Alloc=EMPTY、kernel=DONE，
+        // 随后才发布统一 release。这样 device 退出本身就证明没有遗失
+        // backlog，而不是依赖 host 事后发现。
+        if (global_release_observed && cross_core_exec_ok &&
+            CrossCoreExecWorkerDrained(
+                state, worker, task_count, stats
+            )) {
+            cross_core_exec_ok =
+                ProgressCrossCoreExecDrainClosure<Ops>(
+                    state, worker, task_count, stats,
+                    cross_core_drain_arrived,
+                    cross_core_drain_released
                 );
-            }
-        } else {
-            final_stall_polls = 0;
         }
-#endif
+        if (global_release_observed &&
+            (!cross_core_exec_ok ||
+             cross_core_drain_released)) {
+            break;
+        }
+#else
         // 必须同时满足“无人再生产新 slot”和“本核旧 slot 全部完成”，否则继续帮助系统推进 completion。
         if (global_release_observed && worker.occupied_count == 0) {
             break;
         }
+#endif
         if (freed == 0) {
             Ops::SpinHint();
         }
@@ -5135,7 +5751,22 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     stats.result.finish_cycle = Ops::Now();
 #endif
     stats.result.max_occupied = stats.max_occupied;
+#if PTO_FDWIC_SHARED_MAP
+    // CCEC 关闭 kernel-end 自动 DCCI，host 直接读取 token.control 可能只
+    // 看到初始化时的 IDLE。final_occupied 在本核最终检查后经 bypass
+    // PublishResult 导出：0 表示 scanner 已封口、token 全字段复位且全局
+    // execution drain 已发布，非零表示该轮不能宣称 executor 排空。
+    stats.result.final_occupied =
+        cross_core_drain_released &&
+                stats.exec_scan_task == task_count &&
+                CrossCoreExecTokenFullyReset(
+                    state->exec_tokens[worker_id]
+                )
+            ? 0
+            : 1;
+#else
     stats.result.final_occupied = worker.occupied_count;
+#endif
     stats.result.final_heap_next = worker.heap_next;
 #if PTO_FDWIC_SHARED_MAP
     // shared 后端没有每核 map 控制字；这里发布统一逻辑窗口摘要，实际

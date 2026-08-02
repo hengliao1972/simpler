@@ -200,16 +200,18 @@ COMMON_FLAGS=(
         "$SHARED_PROTOCOL_PROBE_AIV_OBJECT"
 )
 
-# CompeteFirstSplitRuntimeState 当前 ABI 为 1664B。只给 split 产物开启
-# block-local relocation，并按精确尺寸预留，避免影响局部 PMU 的 inline ELF。
-SPLIT_STATE_BYTES=1664
+# 跨核执行扫描游标使 CompeteFirstSplitRuntimeState 的当前 ABI 为 1728B。
+# 只给 split 产物开启 block-local relocation，并按头文件静态断言锁定的
+# 精确尺寸预留；runtime object、单 role section 与最终双 role 布局都必须
+# 使用同一数值，不能靠多留一条未说明的 cache line 掩盖 ABI 漂移。
+SPLIT_STATE_STORAGE_BYTES=1728
 # shared nonwinner 在 caller 内直接收尾，因此 AIC 只保留 Alloc/QK/PV，
 # AIV 只保留 Alloc/SF/UP 三条跨 TU winner finish。split-finish 是两种
 # 构建共同的固定调用形状，不能为 perf-clock 改成另一条 inline 路径。
 SPLIT_FINISH_CALL_SITES=3
 COMMON_FLAGS+=(
     -mllvm -cce-block-local-relocate=true
-    -mllvm "-cce-block-local-reserve-size=$SPLIT_STATE_BYTES"
+    -mllvm "-cce-block-local-reserve-size=$SPLIT_STATE_STORAGE_BYTES"
 )
 
 # 同一入口源码分别面向 cube 与 vector ISA 编译，宏只选择各自的全局入口和 mixed metadata。
@@ -318,7 +320,7 @@ check_split_role_objects() {
         exit 1
     fi
 
-    if ! awk -v name="$state_symbol" -v bytes="$SPLIT_STATE_BYTES" \
+    if ! awk -v name="$state_symbol" -v bytes="$SPLIT_STATE_STORAGE_BYTES" \
         '$4 == "OBJECT" && $5 == "GLOBAL" && $7 != "UND" && $NF == name && $3 + 0 == bytes {count++}
          END {exit count != 1}' <<<"$runtime_symbols"; then
         echo "Runtime must own one exact-size block-local state: $runtime ($state_symbol)" >&2
@@ -357,9 +359,9 @@ check_split_role_objects() {
     read -r block_local_section_index block_local_size_hex block_local_alignment \
         <<<"$block_local_record"
     if [[ -z "$block_local_section_index" || -z "$block_local_size_hex" ||
-          $((16#$block_local_size_hex)) -ne "$SPLIT_STATE_BYTES" ||
+          $((16#$block_local_size_hex)) -ne "$SPLIT_STATE_STORAGE_BYTES" ||
           "$block_local_alignment" -ne 64 ]]; then
-        echo "Runtime .bl.uninit must be exactly ${SPLIT_STATE_BYTES}B and 64B aligned: $runtime" >&2
+        echo "Runtime .bl.uninit must be exactly ${SPLIT_STATE_STORAGE_BYTES}B and 64B aligned: $runtime" >&2
         exit 1
     fi
     if ! awk -v name="$state_symbol" -v section="$block_local_section_index" \
@@ -395,7 +397,11 @@ check_split_role_objects() {
         echo "Finish object must define one non-empty strong finish: $finish ($finish_symbol)" >&2
         exit 1
     fi
-    for imported in "$state_symbol" "$dispatcher_symbol"; do
+    # cross_core 的 split finish 只负责 winner Materialize/Register/Build
+    # 和 execution payload 发布；执行进度由 orchestration caller 在每次
+    # Submit 收口及 FinalDrain 推进。因此 finish 只应导入 block-local
+    # runtime state，真实 AIC/AIV dispatcher 必须留在 caller 一侧。
+    for imported in "$state_symbol"; do
         if ! awk -v name="$imported" \
             '$5 == "GLOBAL" && $7 == "UND" && $NF == name {count++} END {exit count != 1}' \
             <<<"$finish_symbols"; then
@@ -407,6 +413,17 @@ check_split_role_objects() {
             exit 1
         fi
     done
+    if ! awk -v name="$dispatcher_symbol" \
+        '$4 == "FUNC" && $5 == "GLOBAL" && $7 != "UND" && $NF == name && $3 + 0 > 0 {count++}
+         END {exit count != 1}' <<<"$caller_symbols"; then
+        echo "Cross-core caller must own one non-empty matching dispatcher: $caller ($dispatcher_symbol)" >&2
+        exit 1
+    fi
+    if awk -v name="$dispatcher_symbol" \
+        '$NF == name {found = 1} END {exit !found}' <<<"$finish_symbols"; then
+        echo "Cross-core finish must not execute a kernel dispatcher: $finish ($dispatcher_symbol)" >&2
+        exit 1
+    fi
     if "$READELF_BIN" --sections --wide "$finish" | awk \
         'index($0, ".ascend.meta.") != 0 {found = 1} END {exit !found}'; then
         echo "Compete-first finish object must not define launch metadata: $finish" >&2
@@ -575,7 +592,7 @@ for role in aic aiv; do
                 exit 1
             fi
         done
-        if ! awk -v name="$state_symbol" -v bytes="$SPLIT_STATE_BYTES" \
+        if ! awk -v name="$state_symbol" -v bytes="$SPLIT_STATE_STORAGE_BYTES" \
             '$4 == "OBJECT" && $5 == "LOCAL" && $7 != "UND" && $NF == name && $3 + 0 == bytes {count++}
              END {exit count != 1}' <<<"$SYMBOL_TABLE"; then
             echo "Missing exact-size LOCAL compete-first state: $state_symbol" >&2
@@ -601,9 +618,9 @@ for role in aic aiv; do
         final_block_local_alignment <<<"$final_block_local_record"
     if [[ -z "$aic_state_hex" || -z "$aiv_state_hex" ||
           $((16#$aic_state_hex)) -ne 0 ||
-          $((16#$aiv_state_hex)) -ne "$SPLIT_STATE_BYTES" ||
+          $((16#$aiv_state_hex)) -ne "$SPLIT_STATE_STORAGE_BYTES" ||
           -z "$final_block_local_section_index" || -z "$final_block_local_size_hex" ||
-          $((16#$final_block_local_size_hex)) -ne $((2 * SPLIT_STATE_BYTES)) ||
+          $((16#$final_block_local_size_hex)) -ne $((2 * SPLIT_STATE_STORAGE_BYTES)) ||
           "$final_block_local_alignment" -ne 64 ]]; then
         echo "Final block-local layout must be two exact, non-overlapping 64B-aligned compete-first states." >&2
         exit 1

@@ -243,6 +243,34 @@ echo "[TEST] atomic PollBatch boundary self-test"
     echo "[TEST] shared winner materialize self-test"
     "$BUILD_DIR/test_shared_materialize"
 
+    # 通用 payload 协议门槛不能替代 PA adapter：这里逐 kind 锁定真实
+    # tensor/scalar/fanin 形状、completion vend 按值冻结、builder 源污染
+    # 后 cell 不变，以及 Claim 后 token-private dispatch/context 重绑。
+    echo "[BUILD] PA cross-core execution adapter self-test"
+    "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/test/test_pa_exec_adapter.cpp" \
+        -o "$BUILD_DIR/test_pa_exec_adapter"
+
+    echo "[TEST] PA cross-core execution adapter self-test"
+    "$BUILD_DIR/test_pa_exec_adapter"
+
+    # 扫描器必须只消费已经闭合的 Submit 前缀，并在 token busy 后继续从
+    # 原游标发现后续 task；FinalDrain 还要由 96 个 worker 汇合后在 device
+    # 侧证明 Alloc=EMPTY、kernel=DONE、token=IDLE，不能只靠 host 事后拒绝。
+    echo "[BUILD] PA cross-core execution scan/drain self-test"
+    "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_PERF_CLOCK=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/test/test_cross_core_exec_scan.cpp" \
+        -o "$BUILD_DIR/test_cross_core_exec_scan"
+
+    echo "[TEST] PA cross-core execution scan/drain self-test"
+    "$BUILD_DIR/test_cross_core_exec_scan"
+
     # 完整 96-worker Submit 逐 task 计数 cursor Claim、前驱 completion
     # load 和本 task completion CAS；同时锁定 loser 零 map 访问、旧
     # sidecar turn 零触碰，以及 lookup/Build/执行仍可跨前任 Build。

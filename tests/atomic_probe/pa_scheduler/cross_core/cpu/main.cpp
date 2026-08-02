@@ -247,6 +247,27 @@ struct CpuOps {
         RuntimeNop(nop_count);
     }
 
+    static inline bool ExecuteBoundKernel(
+        pa_scheduler::SchedulerState *state,
+        pa_scheduler::WorkerState &worker,
+        pa_scheduler::cross_core::ExecutionToken &token,
+        pa_scheduler::TaskKind kind, uint32_t nop_count
+    ) {
+        // standalone 计算体使用独立 workspace，不会真的解引用 PA
+        // TensorDesc；但执行入口必须消费 executor-private dispatch，不能
+        // 退回只凭 TaskKind 发射的旧边界。
+        if (token.dispatch.args[
+                pa_scheduler::cross_core::kExecDispatchLocalContextIndex
+            ] == 0 ||
+            token.dispatch.args[
+                pa_scheduler::cross_core::kExecDispatchGlobalContextIndex
+            ] == 0) {
+            return false;
+        }
+        ExecuteKernel(state, worker, kind, nop_count);
+        return true;
+    }
+
     static inline bool PmuWindowStart(pa_scheduler::SchedulerState *, uint32_t) { return false; }
 
     static inline void PmuWindowStop(pa_scheduler::SchedulerState *, uint32_t, bool) {}
@@ -256,6 +277,34 @@ struct CpuOps {
     static inline void PreloadDataCache(void *) {
         // CPU 只回归协议；不模拟 A5 DCache preload hint。
     }
+
+    static inline void StorePayloadWord(
+        volatile uint64_t *address, uint64_t value
+    ) {
+        *address = value;
+    }
+
+    static inline void StoreTokenPayloadWord(
+        volatile uint64_t *address, uint64_t value
+    ) {
+        *address = value;
+    }
+
+    static inline uint64_t LoadPayloadWord(
+        const volatile uint64_t *address
+    ) {
+        return *address;
+    }
+
+    static inline void PreloadBuildDestination(void *, uint64_t) {}
+
+    static inline void PreloadPayloadSource(const void *, uint64_t) {}
+
+    static inline void PreloadTokenDestination(void *, uint64_t) {}
+
+    static inline void BeforeBuiltPublish(uint32_t) {}
+
+    static inline void BeforePayloadAcquire(uint32_t) {}
 
     static inline void InvalidateRegion(const void *, uint64_t) {
         // CPU 没有 A5 DCache line 失效指令；这里仅提供保守的本线程顺序边界，

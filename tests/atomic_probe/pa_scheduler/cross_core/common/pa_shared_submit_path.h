@@ -982,11 +982,9 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     }
     if (kind == TaskKind::Alloc) {
         CompleteTask<Ops>(state, worker, task_id, stats);
-    } else if (!BuildWinner<Ops, Profile>(
-                   state, worker, task_id, kind, args, context,
-                   context.fanin,
-                   static_cast<uint32_t>(context.fanin_count),
-                   stats
+    } else if (!PublishCrossCoreExecTask<Ops>(
+                   state, worker, task_id, kind, function_id,
+                   args, context, stats
                )) {
         return false;
     }

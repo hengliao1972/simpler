@@ -149,7 +149,7 @@ constexpr uint32_t kBuildIdentityMagic = 0x50414249U;  // "PABI"
 constexpr uint32_t kBuildIdentityCompactGenericTraceBit =
     1U << 31U;
 #if PTO_FDWIC_SHARED_MAP
-constexpr uint32_t kBuildIdentityAbiGeneration = 12;
+constexpr uint32_t kBuildIdentityAbiGeneration = 13;
 #else
 constexpr uint32_t kBuildIdentityAbiGeneration = 4;
 #endif
@@ -2024,6 +2024,7 @@ struct alignas(64) SchedulerState {
     // 的所有既有 offset 均保持不动。每个 task 使用 fresh cell，不发生
     // 取模复用；每个 worker 只有一个 executor-private token。
     cross_core::SharedExecFatalControl exec_fatal;
+    cross_core::SharedExecDrainControl exec_drain;
     cross_core::SharedExecCell exec_cells[kMaxTasks];
     cross_core::ExecutionToken exec_tokens[kWorkers];
 #endif
@@ -2082,9 +2083,15 @@ static_assert(
     "cross-core fatal control must be an appended sidecar"
 );
 static_assert(
-    offsetof(SchedulerState, exec_cells) ==
+    offsetof(SchedulerState, exec_drain) ==
         offsetof(SchedulerState, exec_fatal) +
             sizeof(cross_core::SharedExecFatalControl),
+    "cross-core drain control must follow fatal control"
+);
+static_assert(
+    offsetof(SchedulerState, exec_cells) ==
+        offsetof(SchedulerState, exec_drain) +
+            sizeof(cross_core::SharedExecDrainControl),
     "task-indexed execution cells must follow the fatal control"
 );
 static_assert(
@@ -2094,7 +2101,9 @@ static_assert(
     "executor tokens must follow all task-indexed cells"
 );
 static_assert(
-    offsetof(SchedulerState, exec_fatal) %
+        offsetof(SchedulerState, exec_fatal) %
+                cross_core::kExecCacheLineBytes == 0 &&
+        offsetof(SchedulerState, exec_drain) %
                 cross_core::kExecCacheLineBytes == 0 &&
         offsetof(SchedulerState, exec_cells) %
                 cross_core::kExecCacheLineBytes == 0 &&
@@ -2104,6 +2113,7 @@ static_assert(
 );
 constexpr uint64_t kCrossCoreExecStateBytes =
     sizeof(cross_core::SharedExecFatalControl) +
+    sizeof(cross_core::SharedExecDrainControl) +
     sizeof(cross_core::SharedExecCell) * kMaxTasks +
     sizeof(cross_core::ExecutionToken) * kWorkers;
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128

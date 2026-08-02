@@ -17,7 +17,7 @@
 | S0 | 固定跨核执行包 ABI、状态机和 cacheline 所有权 | standalone portable ABI 已闭合；真实 TensorDesc 对照留到 S3 |
 | S1 | CPU 确定性交错测试闭合协议正确性 | 已完成 |
 | S2 | CCEC 最小 A5 跨核发布/领取探针 | 已完成 |
-| S3 | standalone PA 接入构建/执行分离 | 进行中：独立 PA fork 基线已闭合，S3a 协议接线中 |
+| S3 | standalone PA 接入构建/执行分离 | 进行中：S3a 同 owner 构建/执行已接线，S3b 异 owner 执行尚未实现 |
 | S4 | 泳道、PMU 与 perf-clock 三条证据链 | 未开始 |
 | S5 | 根据证据优化非 atomic 路径 | 未开始 |
 | S6 | 评估并迁移到 Simpler 真实路径 | 未开始 |
@@ -194,5 +194,101 @@ SharedOutput、shared heap、Claim Tournament、PA task plan 和 host oracle；
 5. completion vend 必须在 Materialize 后冻结进 payload，执行完成时不得读取
    Execute owner 自己的 `worker.heap_next`。
 
-上述项目闭合之前不运行 S3a A5 PA，也不宣称 shared payload 已经接入完整
-调度器。
+这是当时进入动态验证前的硬门槛：上述项目闭合之前不运行 S3a A5 PA，
+也不宣称 shared payload 已经接入完整调度器。后续闭合和实测证据记录如下。
+
+## 2026-08-02：S3a 同 owner 构建/执行接线
+
+### 当前实现边界
+
+S3a 已把非 Alloc task 的 Build 结果序列化到 task-indexed
+`SharedExecCell`，并由调度器扫描、领取、绑定和完成该执行包。这一阶段
+刻意限定 `build_owner == execute_owner`：只允许构建该 task 的 worker
+领取自己的 `BUILT` cell，用于先证明完整 PA payload、fanin、dispatch
+重建与 completion 链路。它仍是 **build == execute** 的同 owner 实现，
+并没有证明不同 Scalar 核可以接管执行。
+
+S3b 尚未实现。后续 S3b 需要放开兼容 executor 对其他 build owner
+的竞争，并用终态 `build_owner != execute_owner` 和跨核数据验证建立新证据；
+当前结果不能写成 S3b 已完成。
+
+### A5 Scalar 必须遵守的 cache 可见性合同
+
+A5 Scalar 核之间没有可依赖的 cache coherence，因此 S3a 没有把
+CPU 上的普通 load/store 可见性当作设备合同，而是固定了下面两条发布顺序：
+
+1. 构建侧先用 ordinary store 写完有效 payload，再对完整有效 cacheline
+   范围执行 DCCI `CACHELINE_OUT` clean-out 并以 DSB 收口，最后才用
+   atomic CAS 把 cell 从 `BUILDING` 发布为 `BUILT`。`BUILT` 是 payload
+   已对其他 Scalar 可见的唯一控制边界，不能提前。
+2. 执行侧必须消费 Claim CAS 的返回值并由其建立分支依赖；只有
+   Claim winner 才对已发布 payload 的精确范围做 invalidate，然后复制到
+   本 executor 的私有 token。Claim loser 不 invalidate，也不读 payload。
+
+`SharedExecCell.control`、global fatal 和 execution drain 控制字均独占
+64 B atomic-only cacheline，payload 从下一条 cacheline 开始。这些原子控制行
+不与 ordinary payload 共行，也不对它们执行会把 dirty snapshot 回写的
+DCCI clean-out。
+
+`ExecutionToken` 是 owner-local 普通 GM 状态，后续只由所属 Scalar 读写。
+host H2D 写入的 `IDLE` 不能替代设备核本地初始化：同一物理 Scalar
+仍可能保留前一 kernel 的 DCache 行。因此每轮 kernel 启动时，每个
+worker 都由本核对自己的 token 执行 `ResetExecutionToken()`；跨核交接只经过
+shared cell 的 atomic 和 DCCI 合同。
+
+### CCEC 接线中闭合的 ABI 与 host 问题
+
+- 修正 CCEC include order：先定义 `PA_DEVICE`、`PA_DEVICE_NOINLINE`、
+  `PA_LOOP_NOUNROLL` 和 `PA_GM`，再纳入 PMU、winner workload 与 scheduler
+  公共头。这保证公共闭包按 CCEC device 语义展开，不依赖头文件恰好
+  以某个顺序被首次解析。
+- 增加跨核执行扫描游标后，`CompeteFirstSplitRuntimeState` 的精确
+  block-local ABI 由 1664 B 变为 **1728 B**。CCEC reserve size、runtime
+  symbol、单 role `.bl.uninit` 和最终 AIC/AIV 双 role 布局都用同一
+  1728 B 静态/产物检查锁定，不用多保留一条 cacheline 掩盖漂移。
+- `SchedulerState` 尾部新增的 `exec_fatal + exec_drain + exec_cells +
+  exec_tokens` 是一段连续 **19,691,648 B** execution sidecar。先前
+  host 分段搬运只覆盖 shared TensorMap 和 Claim Tournament，漏掉了这个新尾段；
+  现在每轮在 launch 前完整 H2D，kernel 同步完成后再完整 D2H，并用
+  `offsetof(exec_fatal) + 19,691,648 == sizeof(SchedulerState)` 锁定无尾部缺口。
+- host 从 execution payload 读取 `TensorDesc` 时，不再把 `uint64_t`
+  word arena 直接 `reinterpret_cast` 成 `TensorDesc` 并解引用。现在先逐 word
+  取得 volatile payload 的稳定快照，再用 `memcpy` 复制对象表示，避免
+  strict-aliasing 未定义行为使优化后的 host oracle 前后读出不一致字段。
+- PA adapter 现在在 Build 入口、Claim 后 dispatch 绑定入口和 kernel 发射前
+  三处锁定精确 shape：QK=`4/2/0`、SF=`4/3/1`、PV=`4/2/1`、
+  UP=`7/2/3`（tensor/scalar/fanin）。通用 payload 的“未超过容量”不能替代
+  这份业务 ABI；畸形包必须在读取 fanin 或发射 kernel 前 fail-closed。
+- host 终态 oracle 除了逐项检查计划内 Alloc/kernel cell，还会扫描
+  `[task_count, kMaxTasks)`：control 必须保持 `EMPTY`，完整 payload 必须保持
+  全零。这样能捕获向计划外 cell 的 ordinary write，而不把 host 检查放进
+  Scalar 热路径。
+
+### 当前验证证据
+
+- S3a 接线后的 CPU B1 与 B256 此前已通过完整 host 正确性检查。
+  CPU 结果只证明 task plan、payload、owner、fanin、dispatch、completion 与终态
+  oracle 闭合，不代替 A5 cache/atomic 证据。
+- A5 perf-clock B1 在修正上述 include/ABI/搬运与 cache 初始化问题后
+  运行 10 轮，其中 **9 轮 PASS，1 轮 FAIL**。唯一失败轮在启动阶段已经
+  进入调度器 global fatal，而 execution cell 全部仍为 `EMPTY`、所有 token
+  仍为 `IDLE`；它没有进入 Build/Claim/payload 路径，因此不能归因于
+  S3a 执行包协议。该结果也不能写成 B1 稳定 10/10 PASS，启动 fatal
+  仍是独立的未闭合项。
+- A5 perf-clock B256 的 **1280 个 task 全量 PASS**，完整 Submit 为
+  **24986.974 us**。这一轮可以作为 S3a 在完整 PA 规模下未遗失
+  `BUILT` task、未重复执行、fanin/completion/终态通过的正确性证据。
+  24.987 ms 当前只是带有 S3a 机制的实测时间，没有同口径 A/B 能够将差值
+  归因到单一机制，因此明确不作性能收益结论。
+- A5 full-swimlane B256 也已闭合：1280 个 Submit、1024 个 kernel 全部
+  通过，Submit 跨度为 **25086.894 us**，trace 无丢记录。该产物同时包含
+  普通阶段、atomic 与 DCCI 事件，只用于检查 S3a 业务边界和发布动作是否
+  齐全；它带有 737046 条合并事件和约 63 MiB 的加工文件，不能与
+  perf-clock ELF 的绝对时间直接相减，也不作为 S3b 异核证据。
+
+### S3a 阶段结论
+
+S3a 已证明完整 PA task 可以被构造为共享执行包，再经由 atomic
+发布、精确 DCCI acquire、owner-local token 和设备终态闭合。它当前仅完成
+同 owner 的机制接线与正确性取证；B1 启动 fatal 仍需单独定位，性能优化与
+S3b 真正的异 owner 领取都还没有开始。

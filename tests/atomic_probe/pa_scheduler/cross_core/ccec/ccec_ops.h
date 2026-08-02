@@ -306,6 +306,27 @@ struct CcecOps {
 #endif
     }
 
+    __aicore__ static inline bool ExecuteBoundKernel(
+        __gm__ pa_scheduler::SchedulerState *state,
+        __gm__ pa_scheduler::WorkerState &worker,
+        __gm__ pa_scheduler::cross_core::ExecutionToken &token,
+        pa_scheduler::TaskKind kind, uint32_t nop_count
+    ) {
+        // 真正 Simpler dispatch 未来会直接消费 args 表；standalone 的
+        // Cube/Vector 模拟体仍使用专用 workspace，但必须从 token-private
+        // binding 进入，避免错误回读 builder 的 TaskArgs/SubmitContext。
+        if (token.dispatch.args[
+                pa_scheduler::cross_core::kExecDispatchLocalContextIndex
+            ] == 0 ||
+            token.dispatch.args[
+                pa_scheduler::cross_core::kExecDispatchGlobalContextIndex
+            ] == 0) {
+            return false;
+        }
+        ExecuteKernel(state, worker, kind, nop_count);
+        return true;
+    }
+
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
     __aicore__ static inline pa_scheduler::CompeteFirstSplitRuntimeState &CompeteFirstSplitState() {
 #if defined(PA_BUILD_AIC)
@@ -366,6 +387,40 @@ struct CcecOps {
             static_cast<int64_t>(0)
         );
     }
+
+    __aicore__ static inline void StorePayloadWord(
+        __gm__ volatile uint64_t *address, uint64_t value
+    ) {
+        *address = value;
+    }
+
+    __aicore__ static inline void StoreTokenPayloadWord(
+        __gm__ volatile uint64_t *address, uint64_t value
+    ) {
+        *address = value;
+    }
+
+    __aicore__ static inline uint64_t LoadPayloadWord(
+        __gm__ const volatile uint64_t *address
+    ) {
+        return *address;
+    }
+
+    __aicore__ static inline void PreloadBuildDestination(
+        __gm__ void *, uint64_t
+    ) {}
+
+    __aicore__ static inline void PreloadPayloadSource(
+        __gm__ const void *, uint64_t
+    ) {}
+
+    __aicore__ static inline void PreloadTokenDestination(
+        __gm__ void *, uint64_t
+    ) {}
+
+    __aicore__ static inline void BeforeBuiltPublish(uint32_t) {}
+
+    __aicore__ static inline void BeforePayloadAcquire(uint32_t) {}
 
     __aicore__ static inline void InvalidateRegion(__gm__ const void *address, uint64_t bytes) {
         // 逐 cache line 失效并以 dsb 收口：既供 worker 读取 host 写入的

@@ -69,6 +69,10 @@ struct OrderedSubmitTestOps {
         bad_completion_cas{0};
     static inline std::atomic<uint32_t>
         legacy_turn_atomic_accesses{0};
+    static inline std::atomic<uint32_t>
+        bound_dispatch_calls{0};
+    static inline std::atomic<uint32_t>
+        bad_bound_dispatch_calls{0};
 
     static void ResetHooks() {
         observed_state = nullptr;
@@ -103,6 +107,12 @@ struct OrderedSubmitTestOps {
             0, std::memory_order_relaxed
         );
         legacy_turn_atomic_accesses.store(
+            0, std::memory_order_relaxed
+        );
+        bound_dispatch_calls.store(
+            0, std::memory_order_relaxed
+        );
+        bad_bound_dispatch_calls.store(
             0, std::memory_order_relaxed
         );
     }
@@ -368,6 +378,34 @@ struct OrderedSubmitTestOps {
         // CPU 定向测试不模拟 A5 DCache hint。
     }
 
+    static void StorePayloadWord(
+        volatile uint64_t *address, uint64_t value
+    ) {
+        *address = value;
+    }
+
+    static void StoreTokenPayloadWord(
+        volatile uint64_t *address, uint64_t value
+    ) {
+        *address = value;
+    }
+
+    static uint64_t LoadPayloadWord(
+        const volatile uint64_t *address
+    ) {
+        return *address;
+    }
+
+    static void PreloadBuildDestination(void *, uint64_t) {}
+
+    static void PreloadPayloadSource(const void *, uint64_t) {}
+
+    static void PreloadTokenDestination(void *, uint64_t) {}
+
+    static void BeforeBuiltPublish(uint32_t) {}
+
+    static void BeforePayloadAcquire(uint32_t) {}
+
     static void InvalidateRegion(
         const void *address, uint64_t bytes
     ) {
@@ -394,6 +432,64 @@ struct OrderedSubmitTestOps {
     static void ExecuteKernel(
         SchedulerState *, WorkerState &, TaskKind, uint32_t
     ) {}
+
+    static bool ExecuteBoundKernel(
+        SchedulerState *, WorkerState &,
+        cross_core::ExecutionToken &token,
+        TaskKind kind, uint32_t
+    ) {
+        const cross_core::ExecPayloadHeader header =
+            cross_core::ExecutionTokenHeader(token);
+        uint32_t expected_tensors = 0;
+        uint32_t expected_scalars = 0;
+        uint32_t expected_fanin = 0;
+        switch (kind) {
+            case TaskKind::Qk:
+                expected_tensors = 4;
+                expected_scalars = 2;
+                break;
+            case TaskKind::Sf:
+                expected_tensors = 4;
+                expected_scalars = 3;
+                expected_fanin = 1;
+                break;
+            case TaskKind::Pv:
+                expected_tensors = 4;
+                expected_scalars = 2;
+                expected_fanin = 1;
+                break;
+            case TaskKind::Up:
+                expected_tensors = 7;
+                expected_scalars = 2;
+                expected_fanin = 3;
+                break;
+            case TaskKind::Alloc:
+            case TaskKind::Count:
+                break;
+        }
+        const bool valid =
+            kind != TaskKind::Alloc && kind != TaskKind::Count &&
+            header.function_id ==
+                static_cast<uint32_t>(FunctionId(kind)) &&
+            header.tensor_count == expected_tensors &&
+            header.scalar_count == expected_scalars &&
+            header.fanin_count == expected_fanin &&
+            token.dispatch.args[
+                cross_core::kExecDispatchLocalContextIndex
+            ] != 0 &&
+            token.dispatch.args[
+                cross_core::kExecDispatchGlobalContextIndex
+            ] != 0;
+        bound_dispatch_calls.fetch_add(
+            1, std::memory_order_relaxed
+        );
+        if (!valid) {
+            bad_bound_dispatch_calls.fetch_add(
+                1, std::memory_order_relaxed
+            );
+        }
+        return valid;
+    }
 
     static void AfterSharedTaskInsert(
         SchedulerState *state, WorkerState &, uint32_t task_id
@@ -1378,6 +1474,8 @@ bool RunInsertReleaseBeforeBuildTest() {
         OrderedSubmitTestOps::task8_built_before_task4_completion.load(
             std::memory_order_acquire
         );
+    const cross_core::DecodedExecFatal exec_fatal =
+        cross_core::DecodeExecFatal(state->exec_fatal.state);
     const bool ok =
         state->fatal.value == 0 &&
         LegacyTurnsMatch(*state, legacy) &&
@@ -1395,6 +1493,12 @@ bool RunInsertReleaseBeforeBuildTest() {
         ) &&
         overlap && worker_results_ok && all_tasks_ready &&
         claim_cells_match && final_group_writer_ok &&
+        OrderedSubmitTestOps::bound_dispatch_calls.load(
+            std::memory_order_relaxed
+        ) == 16 &&
+        OrderedSubmitTestOps::bad_bound_dispatch_calls.load(
+            std::memory_order_relaxed
+        ) == 0 &&
         kernel_counts[0] == 4 && kernel_counts[1] == 4 &&
         kernel_counts[2] == 4 && kernel_counts[3] == 4 &&
         pa_scheduler::host::FinalBarrierStateMatches(
@@ -1403,6 +1507,7 @@ bool RunInsertReleaseBeforeBuildTest() {
     std::printf(
         "[ORDERED_SUBMIT] release_before_build=%s "
         "completed=%u legacy_turn0=%lld overlap=%u "
+        "fatal=%d exec_fatal=%lld/%u/%u/%u "
         "kernels=%llu,%llu,%llu,%llu\n",
         ok ? "PASS" : "FAIL",
         kTaskCount,
@@ -1410,6 +1515,10 @@ bool RunInsertReleaseBeforeBuildTest() {
             state->shared_map.committed_tasks.value
         ),
         overlap ? 1U : 0U,
+        state->fatal.value,
+        static_cast<long long>(state->exec_fatal.state),
+        static_cast<uint32_t>(exec_fatal.reason),
+        exec_fatal.task_id, exec_fatal.reporter_owner,
         static_cast<unsigned long long>(kernel_counts[0]),
         static_cast<unsigned long long>(kernel_counts[1]),
         static_cast<unsigned long long>(kernel_counts[2]),
@@ -1480,6 +1589,8 @@ bool RunIndependentKernelExecutionTest() {
         OrderedSubmitTestOps::task6_executed_before_task4_build.load(
             std::memory_order_acquire
         );
+    const cross_core::DecodedExecFatal exec_fatal =
+        cross_core::DecodeExecFatal(state->exec_fatal.state);
     const bool ok =
         state->fatal.value == 0 &&
         LegacyTurnsMatch(*state, legacy) &&
@@ -1494,6 +1605,12 @@ bool RunIndependentKernelExecutionTest() {
         ) &&
         execution_overlap && worker_results_ok &&
         all_tasks_ready &&
+        OrderedSubmitTestOps::bound_dispatch_calls.load(
+            std::memory_order_relaxed
+        ) == 8 &&
+        OrderedSubmitTestOps::bad_bound_dispatch_calls.load(
+            std::memory_order_relaxed
+        ) == 0 &&
         kernel_counts[0] == 2 && kernel_counts[1] == 2 &&
         kernel_counts[2] == 2 && kernel_counts[3] == 2 &&
         pa_scheduler::host::FinalBarrierStateMatches(
@@ -1502,12 +1619,17 @@ bool RunIndependentKernelExecutionTest() {
     std::printf(
         "[ORDERED_SUBMIT] independent_kernel_overlap=%s "
         "completed=%u legacy_turn0=%lld "
+        "fatal=%d exec_fatal=%lld/%u/%u/%u "
         "kernels=%llu,%llu,%llu,%llu\n",
         ok ? "PASS" : "FAIL",
         kTaskCount,
         static_cast<long long>(
             state->shared_map.committed_tasks.value
         ),
+        state->fatal.value,
+        static_cast<long long>(state->exec_fatal.state),
+        static_cast<uint32_t>(exec_fatal.reason),
+        exec_fatal.task_id, exec_fatal.reporter_owner,
         static_cast<unsigned long long>(kernel_counts[0]),
         static_cast<unsigned long long>(kernel_counts[1]),
         static_cast<unsigned long long>(kernel_counts[2]),

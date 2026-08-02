@@ -236,6 +236,17 @@ struct alignas(kExecCacheLineBytes) SharedExecFatalControl {
     uint8_t padding[kExecCacheLineBytes - sizeof(int64_t)];
 };
 
+// 所有 replay actor 停产之后，再用一条独立 atomic-only line 汇合本核
+// execution token 的排空证据。最后到达者逐 task 核对 cell 终态后发布
+// release；这样 device 退出不依赖 host 事后发现遗失的 BUILT task。
+struct alignas(kExecCacheLineBytes) SharedExecDrainControl {
+    volatile int64_t arrived;
+    volatile int64_t release;
+    uint8_t padding[
+        kExecCacheLineBytes - 2U * sizeof(int64_t)
+    ];
+};
+
 struct alignas(kExecCacheLineBytes) ExecPayloadStorage {
     volatile uint64_t words[kExecMaxPayloadWords];
 };
@@ -286,6 +297,11 @@ static_assert(
     sizeof(SharedExecFatalControl) == kExecCacheLineBytes &&
         alignof(SharedExecFatalControl) == kExecCacheLineBytes,
     "global fatal control must own one atomic-only cache line"
+);
+static_assert(
+    sizeof(SharedExecDrainControl) == kExecCacheLineBytes &&
+        alignof(SharedExecDrainControl) == kExecCacheLineBytes,
+    "execution drain control must own one atomic-only cache line"
 );
 static_assert(
     offsetof(SharedExecCell, payload) == kExecCacheLineBytes,

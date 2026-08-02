@@ -59,6 +59,61 @@ struct PaExecRoute {
     ExecEngineClass engine_class;
 };
 
+// PA kernel 的 dispatch ABI 不只是“数量不超过上限”，而是每种 task
+// 都有唯一的 tensor/scalar/fanin 三元组。把这份合同放在 device adapter
+// 内，构建侧和最终发射侧共用；host oracle 不能替代 device fail-closed。
+struct PaExecShape {
+    uint16_t tensor_count;
+    uint16_t scalar_count;
+    uint16_t fanin_count;
+};
+
+PA_DEVICE bool ResolvePaExecShape(
+    TaskKind kind, PaExecShape &shape
+) {
+    switch (kind) {
+        case TaskKind::Qk:
+            shape = PaExecShape{4, 2, 0};
+            return true;
+        case TaskKind::Sf:
+            shape = PaExecShape{4, 3, 1};
+            return true;
+        case TaskKind::Pv:
+            shape = PaExecShape{4, 2, 1};
+            return true;
+        case TaskKind::Up:
+            shape = PaExecShape{7, 2, 3};
+            return true;
+        case TaskKind::Alloc:
+        case TaskKind::Count:
+            return false;
+    }
+    return false;
+}
+
+PA_DEVICE bool PaExecShapeMatches(
+    TaskKind kind, uint32_t tensor_count,
+    uint32_t scalar_count, uint32_t fanin_count
+) {
+    PaExecShape expected{};
+    return ResolvePaExecShape(kind, expected) &&
+           tensor_count == expected.tensor_count &&
+           scalar_count == expected.scalar_count &&
+           fanin_count == expected.fanin_count;
+}
+
+PA_DEVICE bool PaTaskKindFromExecFunction(
+    uint32_t function_id, TaskKind &kind
+) {
+    switch (function_id) {
+        case 0: kind = TaskKind::Qk; return true;
+        case 1: kind = TaskKind::Sf; return true;
+        case 2: kind = TaskKind::Pv; return true;
+        case 3: kind = TaskKind::Up; return true;
+        default: kind = TaskKind::Count; return false;
+    }
+}
+
 // PA adapter 负责 function-id 与合法 engine 的业务映射；portable 协议
 // 不认识 QK/SF/PV/UP。Alloc 没有 kernel，Joint 在第一版显式拒绝。
 PA_DEVICE bool ResolvePaExecRoute(
@@ -239,7 +294,14 @@ PA_DEVICE bool MakePaExecPayloadSpec(
         context.joint || context.joint_init ||
         args.launch_spec.core_num != 1 ||
         args.tensor_count < 0 || args.scalar_count < 0 ||
-        context.fanin_count < 0) {
+        context.fanin_count < 0 ||
+        !PaExecShapeMatches(
+            kind, static_cast<uint32_t>(args.tensor_count),
+            static_cast<uint32_t>(args.scalar_count),
+            static_cast<uint32_t>(context.fanin_count)
+        ) ||
+        context.tensor_count != args.tensor_count ||
+        context.scalar_count != args.scalar_count) {
         return false;
     }
     // completion_vend 必须在 Materialize 完成后从 worker.heap_next 取值并
@@ -292,16 +354,17 @@ PA_DEVICE bool BindPaExecutionTokenDispatchAfterClaim(
     const ExecPayloadHeader header = ExecutionTokenHeader(token);
     PaExecRoute route{};
     TaskKind kind = TaskKind::Count;
-    switch (header.function_id) {
-        case 0: kind = TaskKind::Qk; break;
-        case 1: kind = TaskKind::Sf; break;
-        case 2: kind = TaskKind::Pv; break;
-        case 3: kind = TaskKind::Up; break;
-        default: return false;
+    if (!PaTaskKindFromExecFunction(header.function_id, kind)) {
+        return false;
     }
     if (!ResolvePaExecRoute(
             kind, static_cast<int32_t>(header.function_id), route
-        ) || route.engine_class != header.engine_class) {
+        ) ||
+        !PaExecShapeMatches(
+            kind, header.tensor_count,
+            header.scalar_count, header.fanin_count
+        ) ||
+        route.engine_class != header.engine_class) {
         return false;
     }
 
@@ -333,14 +396,153 @@ PA_DEVICE bool BindPaExecutionTokenDispatchAfterClaim(
                ));
 }
 
+// kernel 发射前最后一次核对 executor-private binding。协议层已经检查
+// shared payload 的 header/range；这里进一步证明最终 dispatch 不含
+// builder/shared-cell 地址，并且 PA Local/GlobalContext 使用执行核身份。
+// 该检查是 standalone 首版的真实执行入口合同，不是 host 诊断逻辑。
+PA_DEVICE bool ValidatePaExecutionTokenDispatch(
+    PA_GM const ExecutionToken &token,
+    PA_GM const WorkerState &executor, TaskKind expected_kind
+) {
+    if (token.control.phase != ExecTokenPhase::EngineInflight ||
+        expected_kind == TaskKind::Alloc ||
+        expected_kind == TaskKind::Count) {
+        return false;
+    }
+    const ExecPayloadHeader header = ExecutionTokenHeader(token);
+    ExecPayloadLayout layout{};
+    PaExecRoute route{};
+    TaskKind payload_kind = TaskKind::Count;
+    if (!PaTaskKindFromExecFunction(
+            header.function_id, payload_kind
+        ) ||
+        payload_kind != expected_kind ||
+        !ResolvePaExecRoute(
+            payload_kind,
+            static_cast<int32_t>(header.function_id), route
+        ) ||
+        !PaExecShapeMatches(
+            payload_kind, header.tensor_count,
+            header.scalar_count, header.fanin_count
+        ) ||
+        route.engine_class != header.engine_class ||
+        route.engine_class != token.control.engine_class ||
+        !ComputeExecPayloadLayout(
+            header.tensor_count, header.scalar_count,
+            header.fanin_count, layout
+        ) ||
+        header.payload_bytes != layout.payload_bytes ||
+        token.control.payload_bytes != layout.payload_bytes ||
+        token.control.payload_lines != layout.payload_lines) {
+        return false;
+    }
+
+    const ExecEngineClass executor_engine =
+        executor.role == CoreRole::Aic
+            ? ExecEngineClass::Aic
+            : ExecEngineClass::Aiv;
+    if (route.engine_class != executor_engine) {
+        return false;
+    }
+    for (uint32_t tensor = 0;
+         tensor < header.tensor_count; ++tensor) {
+        const uint64_t expected_address = static_cast<uint64_t>(
+            reinterpret_cast<uintptr_t>(
+                &token.payload.words[
+                    layout.tensor_word_offset +
+                    tensor * kExecTensorDescWords
+                ]
+            )
+        );
+        if (token.dispatch.args[tensor] != expected_address) {
+            return false;
+        }
+    }
+    for (uint32_t scalar = 0;
+         scalar < header.scalar_count; ++scalar) {
+        if (token.dispatch.args[header.tensor_count + scalar] !=
+            token.payload.words[
+                layout.scalar_word_offset + scalar
+            ]) {
+            return false;
+        }
+    }
+
+    PA_GM const PaLocalContext &local =
+        *reinterpret_cast<PA_GM const PaLocalContext *>(
+            &token.dispatch.local_context[0]
+        );
+    PA_GM const PaGlobalContext &global =
+        *reinterpret_cast<PA_GM const PaGlobalContext *>(
+            &token.dispatch.global_context[0]
+        );
+    return
+        token.dispatch.args[kExecDispatchLocalContextIndex] ==
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                &token.dispatch.local_context[0]
+            )) &&
+        token.dispatch.args[kExecDispatchGlobalContextIndex] ==
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                &token.dispatch.global_context[0]
+            )) &&
+        local.block_index == 0 && local.block_count == 1 &&
+        local.async.completion_count == 0 &&
+        local.async.completion_error_code == 0 &&
+        local.async.completion_entries == 0 &&
+        local.async.completion_capacity == 0 &&
+        local.async.alignment_padding == 0 &&
+        local.async.task_token == kInvalidTaskId &&
+        global.sub_block_id == executor.sub_block_id;
+}
+
+template <typename Ops>
+PA_DEVICE bool ExecutePaBoundKernel(
+    PA_GM SchedulerState *state, PA_GM WorkerState &executor,
+    PA_GM ExecutionToken &token, TaskKind expected_kind,
+    uint32_t nop_count
+) {
+    if (!ValidatePaExecutionTokenDispatch(
+            token, executor, expected_kind
+        )) {
+        return false;
+    }
+    // Ops 收到的是 executor-private token，而不是 builder 的 TaskArgs 或
+    // SubmitContext。CPU/CCEC standalone 的计算体仍是受控模拟负载，但其
+    // 发射入口必须显式消费这份 binding，才能证明未来真实 dispatch 的边界。
+    return Ops::ExecuteBoundKernel(
+        state, executor, token, expected_kind, nop_count
+    );
+}
+
 template <typename Ops>
 struct PaExecReadySource {
     PA_GM SchedulerState *state;
+    WorkerResult *result;
 
     PA_DEVICE bool IsReady(int32_t producer) const {
-        return state != nullptr && producer >= 0 &&
-               static_cast<uint32_t>(producer) < kMaxTasks &&
-               Ops::Load(&state->tasks[producer].flag) == 1;
+        if (state == nullptr || result == nullptr || producer < 0 ||
+            static_cast<uint32_t>(producer) >= kMaxTasks) {
+            return false;
+        }
+        const bool ready =
+            Ops::Load(&state->tasks[producer].flag) == 1;
+        if (ready) {
+            ++result->fanin_ready_loads;
+        } else {
+            ++result->fanin_not_ready_loads;
+        }
+        return ready;
+    }
+};
+
+struct PaExecSynchronousEngineCompletion {
+    PA_DEVICE bool IsComplete(
+        PA_GM const ExecutionToken &token
+    ) const {
+        // standalone 的 ExecuteKernel 只在 AIC/AIV 流水线最终
+        // wait 返回后才退出；因此 helper 被调用时 engine 已完成。
+        // 未来接 try_wait 时必须替换该 source，不能沿用 true。
+        return token.control.phase == ExecTokenPhase::EngineInflight;
     }
 };
 

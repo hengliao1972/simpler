@@ -15,13 +15,12 @@
 #include <pto/common/pto_tile.hpp>
 #include <pto/pto-inst.hpp>
 
-#include "pmu_probe.h"
-#include "../common/winner_workload.h"
-
 #define PA_DEVICE __aicore__ inline
 #define PA_DEVICE_NOINLINE static __aicore__ __attribute__((noinline))
 #define PA_LOOP_NOUNROLL _Pragma("clang loop unroll(disable)")
 #define PA_GM __gm__
+#include "pmu_probe.h"
+#include "../common/winner_workload.h"
 #include "../common/pa_scheduler_core.h"
 
 #define PA_CCEC_OPS_DEFINE_REAL_WORKLOAD 1

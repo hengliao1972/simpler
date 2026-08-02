@@ -790,6 +790,7 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     // 上一轮未使用字节被随 payload 一起发布。token 再通过生产 helper
     // 建立 IDLE + 无绑定 owner 的完整控制状态。
     std::memset(&state->exec_fatal, 0, sizeof(state->exec_fatal));
+    std::memset(&state->exec_drain, 0, sizeof(state->exec_drain));
     std::memset(state->exec_cells, 0, sizeof(state->exec_cells));
     std::memset(state->exec_tokens, 0, sizeof(state->exec_tokens));
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
@@ -1017,8 +1018,9 @@ inline bool DecodeTraceStorageRecords(
 
 // 巨大的 WorkerState 不参与每轮 H2D/D2H。private 仍只搬前缀、控制量和
 // 结果三个既有范围；shared 额外把 results 后的 map sidecar 和其后的
-// per-task Claim Tournament 作为两个独立范围搬运。它们都不能混入
-// ControlBytes/ResultBytes，也不能因避免 1 GiB worker arena 而漏传。
+// per-task Claim Tournament 与 cross-core execution state 作为三个独立
+// 范围搬运。它们都不能混入 ControlBytes/ResultBytes，也不能因避免
+// 1 GiB worker arena 而漏传。
 inline constexpr size_t StatePrefixBytes() { return offsetof(SchedulerState, workers); }
 
 inline constexpr size_t ControlBytes() {
@@ -1043,6 +1045,20 @@ inline constexpr size_t SharedClaimTournamentBytes() {
 static_assert(
     SharedClaimTournamentBytes() == 20054016,
     "shared Claim Tournament transfer size changed"
+);
+
+inline constexpr size_t CrossCoreExecStateBytes() {
+    return kCrossCoreExecStateBytes;
+}
+static_assert(
+    CrossCoreExecStateBytes() == 19691648,
+    "cross-core execution state transfer size changed"
+);
+static_assert(
+    offsetof(SchedulerState, exec_fatal) +
+            CrossCoreExecStateBytes() ==
+        sizeof(SchedulerState),
+    "cross-core execution state must remain one contiguous tail range"
 );
 #endif
 
@@ -3398,34 +3414,493 @@ inline TensorDesc ExpectedSharedOutputDescriptorAtBase(
 }
 #endif
 
-inline bool TensorDescFieldsMatch(
+inline const char *TensorDescFirstMismatch(
     const TensorDesc &actual, const TensorDesc &expected
 ) {
-    if (actual.buffer_addr != expected.buffer_addr ||
-        actual.buffer_size != expected.buffer_size ||
-        actual.owner_task_id != expected.owner_task_id ||
-        actual.start_offset != expected.start_offset ||
-        actual.version != expected.version || actual.ndims != expected.ndims ||
-        actual.dtype != expected.dtype || actual.manual_dep != expected.manual_dep ||
-        actual.is_contiguous != expected.is_contiguous ||
-        actual.child_memory != expected.child_memory ||
-        actual.extent_elem_cache != expected.extent_elem_cache ||
-        actual.ndims > kMaxTensorDims) {
-        return false;
-    }
+    if (actual.buffer_addr != expected.buffer_addr) return "buffer_addr";
+    if (actual.buffer_size != expected.buffer_size) return "buffer_size";
+    if (actual.owner_task_id != expected.owner_task_id) return "owner_task_id";
+    if (actual.start_offset != expected.start_offset) return "start_offset";
+    if (actual.version != expected.version) return "version";
+    if (actual.ndims != expected.ndims) return "ndims";
+    if (actual.dtype != expected.dtype) return "dtype";
+    if (actual.manual_dep != expected.manual_dep) return "manual_dep";
+    if (actual.is_contiguous != expected.is_contiguous) return "is_contiguous";
+    if (actual.child_memory != expected.child_memory) return "child_memory";
+    if (actual.extent_elem_cache != expected.extent_elem_cache) return "extent_elem_cache";
+    if (actual.ndims > kMaxTensorDims) return "ndims_range";
     // PA 的 descriptor 构造器只定义 [0,ndims) 的 shape/stride；payload
     // arena 回绕后，inactive 维允许保留旧 task 字节。下游同样以 ndims
     // 为边界，host 不能把未定义尾部要求为零并误报业务 descriptor 损坏。
     for (uint32_t index = 0; index < expected.ndims; ++index) {
-        if (actual.shapes[index] != expected.shapes[index] ||
-            actual.strides[index] != expected.strides[index]) {
-            return false;
-        }
+        if (actual.shapes[index] != expected.shapes[index]) return "shape";
+        if (actual.strides[index] != expected.strides[index]) return "stride";
     }
-    return true;
+    return nullptr;
+}
+
+inline bool TensorDescFieldsMatch(
+    const TensorDesc &actual, const TensorDesc &expected
+) {
+    return TensorDescFirstMismatch(actual, expected) == nullptr;
+}
+
+inline const char *CrossCoreExecFatalReasonName(
+    cross_core::ExecFatalReason reason
+) {
+    switch (reason) {
+        case cross_core::ExecFatalReason::None:
+            return "none";
+        case cross_core::ExecFatalReason::InvalidBuildInput:
+            return "invalid-build-input";
+        case cross_core::ExecFatalReason::BuildPackFailed:
+            return "build-pack-failed";
+        case cross_core::ExecFatalReason::InvalidBuiltControl:
+            return "invalid-built-control";
+        case cross_core::ExecFatalReason::ClaimedPayloadInvalid:
+            return "claimed-payload-invalid";
+        case cross_core::ExecFatalReason::ControlPublishConflict:
+            return "control-publish-conflict";
+        case cross_core::ExecFatalReason::InvalidTokenPayload:
+            return "invalid-token-payload";
+        case cross_core::ExecFatalReason::CompletionPublishFailed:
+            return "completion-publish-failed";
+        case cross_core::ExecFatalReason::CompletionStateConflict:
+            return "completion-state-conflict";
+    }
+    return "unknown";
 }
 
 #if PTO_FDWIC_SHARED_MAP
+constexpr uint64_t kHostSyntheticQueryBase = UINT64_C(0x200000000);
+constexpr uint64_t kHostSyntheticKeyBase = UINT64_C(0x300000000);
+constexpr uint64_t kHostSyntheticValueBase = UINT64_C(0x400000000);
+constexpr uint64_t kHostSyntheticBlockTableBase = UINT64_C(0x500000000);
+constexpr uint64_t kHostPaScaleBits = UINT64_C(0x3F800000);
+
+inline TensorDesc HostExternalTensorDescriptor(
+    uint64_t address, uint32_t shape0, uint32_t shape1,
+    DataType dtype
+) {
+    TensorDesc tensor{};
+    tensor.buffer_addr = address;
+    tensor.buffer_size =
+        static_cast<uint64_t>(shape0) * shape1 *
+        HostElementSize(dtype);
+    tensor.owner_task_id = kHostInvalidTaskId;
+    tensor.start_offset = 0;
+    tensor.version = 0;
+    tensor.ndims = 2;
+    tensor.dtype = dtype;
+    tensor.manual_dep = false;
+    tensor.is_contiguous = true;
+    tensor.child_memory = 0;
+    tensor.shapes[0] = shape0;
+    tensor.shapes[1] = shape1;
+    tensor.strides[0] = shape1;
+    tensor.strides[1] = 1;
+    tensor.extent_elem_cache =
+        static_cast<uint64_t>(shape0) * shape1;
+    return tensor;
+}
+
+inline TensorDesc HostQueryViewDescriptor(
+    const SharedHostTaskPlan &plan, uint32_t batch
+) {
+    TensorDesc tensor = HostExternalTensorDescriptor(
+        kHostSyntheticQueryBase,
+        plan.batch_count * kHostPaHeads,
+        kHostPaHeadDim, DataType::Bfloat16
+    );
+    tensor.start_offset =
+        static_cast<uint64_t>(batch) *
+        kHostPaHeads * kHostPaHeadDim;
+    tensor.shapes[0] = kHostPaHeads;
+    tensor.shapes[1] = kHostPaHeadDim;
+    tensor.strides[0] = kHostPaHeadDim;
+    tensor.strides[1] = 1;
+    tensor.extent_elem_cache =
+        kHostPaHeads * kHostPaHeadDim;
+    return tensor;
+}
+
+inline TensorDesc HostOutputViewDescriptor(
+    const SharedHostTaskPlan &plan, uint32_t batch
+) {
+    TensorDesc tensor = HostExternalTensorDescriptor(
+        kHostSyntheticOutputBase,
+        plan.batch_count * kHostPaHeads,
+        kHostPaHeadDim, DataType::Float32
+    );
+    tensor.start_offset =
+        static_cast<uint64_t>(batch) *
+        kHostPaHeads * kHostPaHeadDim;
+    tensor.manual_dep = true;
+    tensor.shapes[0] = kHostPaHeads;
+    tensor.shapes[1] = kHostPaHeadDim;
+    tensor.strides[0] = kHostPaHeadDim;
+    tensor.strides[1] = 1;
+    tensor.extent_elem_cache =
+        kHostPaHeads * kHostPaHeadDim;
+    return tensor;
+}
+
+inline TensorDesc LoadCrossCorePayloadTensor(
+    const cross_core::SharedExecCell &cell,
+    const cross_core::ExecPayloadLayout &layout,
+    uint32_t tensor_index
+) {
+    TensorDesc tensor{};
+    uint64_t representation[cross_core::kExecTensorDescWords] = {};
+    const uint32_t source_word =
+        layout.tensor_word_offset +
+        tensor_index * cross_core::kExecTensorDescWords;
+    // payload 是 uint64_t word arena，TensorDesc 是另一种 C++ 对象。
+    // 不能通过 reinterpret_cast<uint64_t *> 写 TensorDesc：那会违反
+    // strict-aliasing，并可能让优化后的 host 比较器对同一字段前后读出
+    // 不一致结果。按对象表示复制既保留精确 128B ABI，又不引入未定义行为。
+    // payload word 在协议类型中是 volatile；先按协议粒度逐 word
+    // 取稳定快照，再把该快照作为字节表示复制到 TensorDesc。
+    for (uint32_t word = 0;
+         word < cross_core::kExecTensorDescWords; ++word) {
+        representation[word] =
+            cell.payload.words[source_word + word];
+    }
+    std::memcpy(&tensor, representation, sizeof(tensor));
+    return tensor;
+}
+
+inline bool ExpectedCrossCorePayloadTensor(
+    const SchedulerState &state,
+    const SharedHostTaskPlan &plan,
+    const SharedHostPlannedTask &task,
+    uint32_t tensor_index, TensorDesc *expected
+) {
+    if (expected == nullptr) {
+        return false;
+    }
+    const uint32_t cache_rows =
+        plan.batch_count * kHostPaBlocksPerRequest *
+        kHostPaBlockSize;
+    const uint32_t table_columns =
+        kHostSharedPaMaxContextLength /
+        kHostPaBlockSize;
+    const auto shared_output = [&state](
+        uint32_t producer, uint32_t slot,
+        TensorDesc *output
+    ) {
+        if (output == nullptr || producer >= kMaxTasks ||
+            slot >= kSharedOutputMaxPerTask) {
+            return false;
+        }
+        *output = state.shared_map.shared_outputs[producer]
+                      .tensors[slot];
+        return true;
+    };
+
+    switch (task.kind) {
+        case TaskKind::Qk:
+            if (tensor_index == 0) {
+                *expected = HostQueryViewDescriptor(
+                    plan, task.batch
+                );
+                return true;
+            }
+            if (tensor_index == 1) {
+                *expected = HostExternalTensorDescriptor(
+                    kHostSyntheticKeyBase, cache_rows,
+                    kHostPaHeadDim, DataType::Bfloat16
+                );
+                return true;
+            }
+            if (tensor_index == 2) {
+                *expected = HostExternalTensorDescriptor(
+                    kHostSyntheticBlockTableBase,
+                    plan.batch_count, table_columns,
+                    DataType::Int32
+                );
+                return true;
+            }
+            return tensor_index == 3 &&
+                   shared_output(
+                       task.task_id, 0, expected
+                   );
+        case TaskKind::Sf:
+            if (tensor_index == 0) {
+                return shared_output(
+                    task.task_id - 1U, 0, expected
+                );
+            }
+            return tensor_index >= 1 && tensor_index <= 3 &&
+                   shared_output(
+                       task.task_id, tensor_index - 1U,
+                       expected
+                   );
+        case TaskKind::Pv:
+            if (tensor_index == 0) {
+                return shared_output(
+                    task.task_id - 1U, 0, expected
+                );
+            }
+            if (tensor_index == 1) {
+                *expected = HostExternalTensorDescriptor(
+                    kHostSyntheticValueBase, cache_rows,
+                    kHostPaHeadDim, DataType::Bfloat16
+                );
+                return true;
+            }
+            if (tensor_index == 2) {
+                *expected = HostExternalTensorDescriptor(
+                    kHostSyntheticBlockTableBase,
+                    plan.batch_count, table_columns,
+                    DataType::Int32
+                );
+                return true;
+            }
+            return tensor_index == 3 &&
+                   shared_output(
+                       task.task_id, 0, expected
+                   );
+        case TaskKind::Up:
+            if (tensor_index == 0 || tensor_index == 1) {
+                return shared_output(
+                    task.task_id - 2U,
+                    tensor_index + 1U, expected
+                );
+            }
+            if (tensor_index == 2) {
+                return shared_output(
+                    task.task_id - 1U, 0, expected
+                );
+            }
+            if (tensor_index >= 3 && tensor_index <= 5) {
+                return shared_output(
+                    task.batch_start, 5U - tensor_index,
+                    expected
+                );
+            }
+            if (tensor_index == 6) {
+                *expected = HostOutputViewDescriptor(
+                    plan, task.batch
+                );
+                return true;
+            }
+            return false;
+        case TaskKind::Alloc:
+        case TaskKind::Count:
+            return false;
+    }
+    return false;
+}
+
+struct CrossCoreExecPayloadValidation {
+    bool protocol_ok = true;
+    uint32_t validated_tasks = 0;
+    uint32_t first_bad_task = UINT32_MAX;
+    uint32_t first_bad_tensor = UINT32_MAX;
+    const char *first_bad_reason = "none";
+    const char *first_bad_tensor_field = "none";
+    TensorDesc first_actual_tensor{};
+    TensorDesc first_expected_tensor{};
+};
+
+inline CrossCoreExecPayloadValidation
+ValidateCrossCoreExecPayloads(
+    const SchedulerState &state,
+    const SharedHostTaskPlan &plan
+) {
+    CrossCoreExecPayloadValidation validation;
+    const auto record = [&validation](
+        bool condition, uint32_t task_id,
+        const char *reason
+    ) {
+        validation.protocol_ok &= condition;
+        if (!condition &&
+            validation.first_bad_task == UINT32_MAX) {
+            validation.first_bad_task = task_id;
+            validation.first_bad_reason = reason;
+        }
+        return condition;
+    };
+
+    for (const SharedHostPlannedTask &task : plan.tasks) {
+        if (task.kind == TaskKind::Alloc) {
+            continue;
+        }
+        const cross_core::SharedExecCell &cell =
+            state.exec_cells[task.task_id];
+        const cross_core::DecodedExecState decoded =
+            cross_core::DecodeExecState(cell.control.state);
+        const cross_core::ExecPayloadHeader header =
+            cross_core::DecodeExecPayloadHeader(cell.payload);
+        cross_core::ExecPayloadLayout layout{};
+        const uint16_t expected_tensors =
+            task.kind == TaskKind::Up ? 7 : 4;
+        const uint16_t expected_scalars =
+            task.kind == TaskKind::Sf ? 3 : 2;
+        const uint16_t expected_fanin =
+            task.kind == TaskKind::Qk
+                ? 0
+                : (task.kind == TaskKind::Up ? 3 : 1);
+        const cross_core::ExecEngineClass expected_engine =
+            task.kind == TaskKind::Qk ||
+                    task.kind == TaskKind::Pv
+                ? cross_core::ExecEngineClass::Aic
+                : cross_core::ExecEngineClass::Aiv;
+        const bool layout_ok =
+            cross_core::ComputeExecPayloadLayout(
+                expected_tensors, expected_scalars,
+                expected_fanin, layout
+            );
+        record(layout_ok, task.task_id, "layout");
+        record(
+            decoded.valid &&
+                decoded.phase == cross_core::ExecPhase::Done &&
+                decoded.task_id == task.task_id &&
+                decoded.engine_class == expected_engine &&
+                decoded.payload_lines == layout.payload_lines,
+            task.task_id, "control"
+        );
+        record(
+            (cell.payload.words[0] >> 32U) == 0 &&
+                cell.payload.words[6] == 0 &&
+                cell.payload.words[7] == 0 &&
+                header.task_id == task.task_id &&
+                header.function_address == 0 &&
+                header.function_id ==
+                    static_cast<uint32_t>(task.kind) - 1U &&
+                header.completion_vend ==
+                    static_cast<uint64_t>(
+                        state.tasks[task.task_id].vend
+                    ) &&
+                header.payload_bytes == layout.payload_bytes &&
+                header.tensor_count == expected_tensors &&
+                header.scalar_count == expected_scalars &&
+                header.fanin_count == expected_fanin &&
+                header.engine_class == expected_engine &&
+                header.flags == 0 &&
+                header.multicore_group_id == 0 &&
+                header.multicore_rank == 0 &&
+                header.multicore_size == 1,
+            task.task_id, "header"
+        );
+
+        for (uint32_t tensor = 0;
+             tensor < expected_tensors; ++tensor) {
+            TensorDesc expected{};
+            const bool expected_ok =
+                ExpectedCrossCorePayloadTensor(
+                    state, plan, task, tensor, &expected
+                );
+            const TensorDesc actual =
+                LoadCrossCorePayloadTensor(
+                    cell, layout, tensor
+                );
+            const char *mismatch = expected_ok
+                ? TensorDescFirstMismatch(actual, expected)
+                : "expected_descriptor";
+            const bool tensor_ok = expected_ok && mismatch == nullptr;
+            if (!tensor_ok &&
+                validation.first_bad_task == UINT32_MAX) {
+                validation.first_bad_tensor = tensor;
+                validation.first_bad_tensor_field = mismatch;
+                validation.first_actual_tensor = actual;
+                validation.first_expected_tensor = expected;
+            }
+            record(tensor_ok, task.task_id, "tensor");
+        }
+
+        const SharedHostBatchPlan *batch =
+            plan.BatchAt(task.batch);
+        const uint64_t block_offset =
+            static_cast<uint64_t>(task.group_index) *
+            kHostPaBlocksPerRequest;
+        const uint64_t block_base =
+            static_cast<uint64_t>(task.batch) *
+                (kHostSharedPaMaxContextLength /
+                 kHostPaBlockSize) +
+            block_offset;
+        uint64_t expected_scalar[3] = {};
+        if (task.kind == TaskKind::Qk ||
+            task.kind == TaskKind::Pv) {
+            expected_scalar[0] = task.group_block_count;
+            expected_scalar[1] = block_base;
+        } else if (task.kind == TaskKind::Sf) {
+            const uint64_t last_block_begin =
+                (block_offset + task.group_block_count - 1U) *
+                kHostPaBlockSize;
+            const uint64_t remaining =
+                batch == nullptr
+                    ? 0
+                    : static_cast<uint64_t>(
+                          batch->context_length
+                      ) - last_block_begin;
+            expected_scalar[0] = kHostPaScaleBits;
+            expected_scalar[1] = task.group_block_count;
+            expected_scalar[2] = std::min<uint64_t>(
+                kHostPaBlockSize, remaining
+            );
+        } else {
+            expected_scalar[0] =
+                task.group_index == 0 ? 1 : 0;
+            expected_scalar[1] =
+                batch != nullptr &&
+                        task.group_index + 1U ==
+                            batch->group_count
+                    ? 1
+                    : 0;
+        }
+        record(batch != nullptr, task.task_id, "batch");
+        for (uint32_t scalar = 0;
+             scalar < expected_scalars; ++scalar) {
+            record(
+                cell.payload.words[
+                    layout.scalar_word_offset + scalar
+                ] == expected_scalar[scalar],
+                task.task_id, "scalar"
+            );
+        }
+
+        int32_t expected_producer[3] = {};
+        if (task.kind == TaskKind::Sf ||
+            task.kind == TaskKind::Pv) {
+            expected_producer[0] =
+                static_cast<int32_t>(task.task_id - 1U);
+        } else if (task.kind == TaskKind::Up) {
+            expected_producer[0] =
+                static_cast<int32_t>(task.task_id - 2U);
+            expected_producer[1] =
+                static_cast<int32_t>(task.task_id - 1U);
+            expected_producer[2] =
+                static_cast<int32_t>(
+                    task.group_index == 0
+                        ? task.batch_start
+                        : task.task_id - 4U
+                );
+        }
+        for (uint32_t edge = 0;
+             edge < expected_fanin; ++edge) {
+            const uint64_t packed = cell.payload.words[
+                layout.fanin_word_offset + edge / 2U
+            ];
+            const int32_t actual = static_cast<int32_t>(
+                edge % 2U == 0
+                    ? static_cast<uint32_t>(packed)
+                    : static_cast<uint32_t>(packed >> 32U)
+            );
+            record(
+                actual == expected_producer[edge],
+                task.task_id, "fanin"
+            );
+        }
+        ++validation.validated_tasks;
+    }
+    validation.protocol_ok &=
+        validation.validated_tasks ==
+            plan.total_tasks - plan.batch_count;
+    return validation;
+}
+
 struct SharedOutputValidation {
     bool protocol_ok = true;
     uint64_t published_outputs = 0;
@@ -3976,7 +4451,7 @@ inline Metrics Validate(
     // WorkerResult ABI，也能在 S3b 放开跨核 owner 前精确捕获语义漂移。
     bool cross_core_exec_cells_ok = shared_plan_ok;
     bool cross_core_exec_same_owner_ok = shared_plan_ok;
-    uint32_t first_bad_exec_task = task_count;
+    uint32_t first_bad_exec_task = UINT32_MAX;
     for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
         const SharedHostPlannedTask *planned_task =
             shared_plan.TaskAt(task_id);
@@ -4002,11 +4477,35 @@ inline Metrics Validate(
                 decoded.build_owner == decoded.execute_owner;
         }
         cross_core_exec_cells_ok &= cell_ok;
-        if (!cell_ok && first_bad_exec_task == task_count) {
+        if (!cell_ok && first_bad_exec_task == UINT32_MAX) {
+            first_bad_exec_task = task_id;
+        }
+    }
+    // 首版 cell 按 task id 静态分配且整轮不复用。计划外 cell 不只是
+    // control 必须保持 EMPTY，payload 也必须保持 host 初始化的全零值；
+    // 否则说明 device 曾向一个没有业务 task 的执行包做 ordinary write，
+    // 即使最终没有发布 BUILT 也属于协议越界。该检查只在 kernel 返回后的
+    // host oracle 中执行，不进入 Scalar 热路径。
+    for (uint32_t task_id = task_count;
+         task_id < kMaxTasks; ++task_id) {
+        const cross_core::SharedExecCell &cell =
+            state.exec_cells[task_id];
+        const cross_core::DecodedExecState decoded =
+            cross_core::DecodeExecState(cell.control.state);
+        bool cell_ok = decoded.valid &&
+            decoded.phase == cross_core::ExecPhase::Empty;
+        for (uint32_t word = 0;
+             word < cross_core::kExecMaxPayloadWords && cell_ok;
+             ++word) {
+            cell_ok = cell.payload.words[word] == 0;
+        }
+        cross_core_exec_cells_ok &= cell_ok;
+        if (!cell_ok && first_bad_exec_task == UINT32_MAX) {
             first_bad_exec_task = task_id;
         }
     }
     bool cross_core_exec_tokens_idle = true;
+    bool cross_core_exec_terminal_snapshot_ok = true;
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
         const cross_core::ExecutionTokenControl &control =
             state.exec_tokens[worker].control;
@@ -4019,9 +4518,53 @@ inline Metrics Validate(
             control.payload_lines == 0 &&
             control.payload_bytes == 0 &&
             control.fanin_ready_prefix == 0;
+        // final_occupied 由设备在本核检查 scanner/token 后通过 bypass
+        // result sidecar 发布，是 CCEC 关闭 kernel-end DCCI 时的权威终态；
+        // 上面的 raw token 回读只保留额外诊断价值。
+        cross_core_exec_terminal_snapshot_ok &=
+            state.results[worker].final_occupied == 0;
     }
+    const bool cross_core_exec_drain_ok =
+        state.exec_drain.arrived ==
+            static_cast<int64_t>(kWorkers) &&
+        state.exec_drain.release == 1;
     const bool cross_core_exec_fatal_clear =
         state.exec_fatal.state == 0;
+    if (!cross_core_exec_fatal_clear) {
+        const cross_core::DecodedExecFatal decoded =
+            cross_core::DecodeExecFatal(state.exec_fatal.state);
+        cross_core::DecodedExecState cell_state{};
+        cross_core::ExecutionTokenControl token_state{};
+        if (decoded.task_id < kMaxTasks) {
+            cell_state = cross_core::DecodeExecState(
+                state.exec_cells[decoded.task_id].control.state
+            );
+        }
+        if (decoded.reporter_owner < kWorkers) {
+            token_state =
+                state.exec_tokens[decoded.reporter_owner].control;
+        }
+        std::printf(
+            "[CROSS_CORE_EXEC_FATAL] raw=%lld valid=%u reason=%s(%u) "
+            "task=%u reporter=%u "
+            "cell={valid=%u,phase=%u,build=%u,exec=%u,engine=%u,lines=%u,task=%u} "
+            "token={phase=%u,build=%u,exec=%u,engine=%u,lines=%u,task=%u}\n",
+            static_cast<long long>(state.exec_fatal.state),
+            decoded.valid ? 1U : 0U,
+            CrossCoreExecFatalReasonName(decoded.reason),
+            static_cast<uint32_t>(decoded.reason),
+            decoded.task_id, decoded.reporter_owner,
+            cell_state.valid ? 1U : 0U,
+            static_cast<uint32_t>(cell_state.phase),
+            cell_state.build_owner, cell_state.execute_owner,
+            static_cast<uint32_t>(cell_state.engine_class),
+            cell_state.payload_lines, cell_state.task_id,
+            static_cast<uint32_t>(token_state.phase),
+            token_state.build_owner, token_state.execute_owner,
+            static_cast<uint32_t>(token_state.engine_class),
+            token_state.payload_lines, token_state.task_id
+        );
+    }
 #else
     const uint64_t expected_claims =
         static_cast<uint64_t>(batches) * (kWorkers + kAicWorkers + kAivWorkers + kAicWorkers + kAivWorkers);
@@ -4233,6 +4776,11 @@ inline Metrics Validate(
         ValidateSharedOutputs(
             state.shared_map, shared_plan, state.heap_size
         );
+    const CrossCoreExecPayloadValidation
+        cross_core_exec_payload_validation =
+            ValidateCrossCoreExecPayloads(
+                state, shared_plan
+            );
     if (!shared_output_validation.protocol_ok) {
         std::printf(
             "[SHARED_OUTPUT_FAILURE] first_bad_task=%u "
@@ -4240,6 +4788,39 @@ inline Metrics Validate(
             shared_output_validation.first_bad_task,
             shared_output_validation.first_bad_slot,
             shared_output_validation.first_bad_reason
+        );
+    }
+    if (!cross_core_exec_payload_validation.protocol_ok) {
+        const TensorDesc &actual =
+            cross_core_exec_payload_validation.first_actual_tensor;
+        const TensorDesc &expected =
+            cross_core_exec_payload_validation.first_expected_tensor;
+        std::printf(
+            "[CROSS_CORE_PAYLOAD_FAILURE] first_bad_task=%u "
+            "reason=%s tensor=%u field=%s validated=%u "
+            "actual={addr=%llu,size=%llu,owner=%llu,offset=%llu,ndims=%u,dtype=%u,manual=%u,contiguous=%u,extent=%llu} "
+            "expected={addr=%llu,size=%llu,owner=%llu,offset=%llu,ndims=%u,dtype=%u,manual=%u,contiguous=%u,extent=%llu}\n",
+            cross_core_exec_payload_validation.first_bad_task,
+            cross_core_exec_payload_validation.first_bad_reason,
+            cross_core_exec_payload_validation.first_bad_tensor,
+            cross_core_exec_payload_validation.first_bad_tensor_field,
+            cross_core_exec_payload_validation.validated_tasks,
+            static_cast<unsigned long long>(actual.buffer_addr),
+            static_cast<unsigned long long>(actual.buffer_size),
+            static_cast<unsigned long long>(actual.owner_task_id),
+            static_cast<unsigned long long>(actual.start_offset),
+            actual.ndims, static_cast<uint32_t>(actual.dtype),
+            actual.manual_dep ? 1U : 0U,
+            actual.is_contiguous ? 1U : 0U,
+            static_cast<unsigned long long>(actual.extent_elem_cache),
+            static_cast<unsigned long long>(expected.buffer_addr),
+            static_cast<unsigned long long>(expected.buffer_size),
+            static_cast<unsigned long long>(expected.owner_task_id),
+            static_cast<unsigned long long>(expected.start_offset),
+            expected.ndims, static_cast<uint32_t>(expected.dtype),
+            expected.manual_dep ? 1U : 0U,
+            expected.is_contiguous ? 1U : 0U,
+            static_cast<unsigned long long>(expected.extent_elem_cache)
         );
     }
     bool shared_output_heap_layout_ok =
@@ -4629,7 +5210,7 @@ inline Metrics Validate(
     }
     Expect(
         cross_core_exec_cells_ok,
-        "cross-core Alloc cells stay EMPTY and kernel cells reach DONE",
+        "planned cross-core cells reach exact terminal states and inactive cells stay zero",
         &metrics
     );
     Expect(
@@ -4638,8 +5219,23 @@ inline Metrics Validate(
         &metrics
     );
     Expect(
+        cross_core_exec_payload_validation.protocol_ok,
+        "every PA execution payload matches descriptor, scalar, fanin, vend, and route oracles",
+        &metrics
+    );
+    Expect(
+        cross_core_exec_terminal_snapshot_ok,
+        "device-published executor terminal snapshots are complete",
+        &metrics
+    );
+    Expect(
+        cross_core_exec_drain_ok,
+        "execution drain reaches all workers and validates every task cell",
+        &metrics
+    );
+    Expect(
         cross_core_exec_tokens_idle,
-        "all executor-private tokens return to IDLE",
+        "raw executor token snapshot is also fully reset",
         &metrics
     );
     Expect(

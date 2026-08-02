@@ -2014,6 +2014,16 @@ int main(int argc, char **argv) {
                     ACL_MEMCPY_HOST_TO_DEVICE
                 ),
                 "aclrtMemcpy(H2D shared Claim Tournament)"
+            ) ||
+            !CheckAcl(
+                aclrtMemcpy(
+                    &static_cast<pa_scheduler::SchedulerState *>(state_device)->exec_fatal,
+                    pa_scheduler::host::CrossCoreExecStateBytes(),
+                    &state->exec_fatal,
+                    pa_scheduler::host::CrossCoreExecStateBytes(),
+                    ACL_MEMCPY_HOST_TO_DEVICE
+                ),
+                "aclrtMemcpy(H2D cross-core execution state)"
             )) {
             execution_ok = false;
             break;
@@ -2086,6 +2096,16 @@ int main(int argc, char **argv) {
                     ACL_MEMCPY_DEVICE_TO_HOST
                 ),
                 "aclrtMemcpy(D2H shared Claim Tournament)"
+            ) ||
+            !CheckAcl(
+                aclrtMemcpy(
+                    &state->exec_fatal,
+                    pa_scheduler::host::CrossCoreExecStateBytes(),
+                    &static_cast<pa_scheduler::SchedulerState *>(state_device)->exec_fatal,
+                    pa_scheduler::host::CrossCoreExecStateBytes(),
+                    ACL_MEMCPY_DEVICE_TO_HOST
+                ),
+                "aclrtMemcpy(D2H cross-core execution state)"
             )) {
             execution_ok = false;
             break;
