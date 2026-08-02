@@ -24,7 +24,7 @@
 #define PA_DEVICE inline
 #define PA_GM
 #endif
-#include "../common/shared_exec_protocol.h"
+#include "../../common/shared_exec_protocol.h"
 
 namespace pa_scheduler::cross_core::probe {
 

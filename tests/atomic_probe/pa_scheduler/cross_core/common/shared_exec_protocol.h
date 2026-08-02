@@ -46,6 +46,13 @@ constexpr uint32_t kExecMaxPayloadWords =
     kExecMaxPayloadLines * kExecHeaderWords;
 constexpr uint32_t kExecInvalidFunctionId = UINT32_MAX;
 constexpr uint32_t kExecMaxOwner = 254;
+constexpr uint32_t kExecUnboundOwner = 255;
+constexpr uint32_t kExecDispatchArgCount = 50;
+constexpr uint32_t kExecLocalContextBytes = 48;
+constexpr uint32_t kExecGlobalContextBytes = 4;
+constexpr uint32_t kExecDispatchBindingBytes = 512;
+constexpr uint32_t kExecDispatchLocalContextIndex = 48;
+constexpr uint32_t kExecDispatchGlobalContextIndex = 49;
 
 static_assert(
     kExecTensorDescBytes % sizeof(uint64_t) == 0,
@@ -55,6 +62,13 @@ static_assert(
     kExecMaxPayloadBytes == 4352 &&
         kExecMaxPayloadLines == 68,
     "shared execution payload capacity changed"
+);
+static_assert(
+    kExecMaxTensors + kExecMaxScalars ==
+            kExecDispatchLocalContextIndex &&
+        kExecDispatchGlobalContextIndex + 1 ==
+            kExecDispatchArgCount,
+    "dispatch argument indexes no longer match payload capacity"
 );
 
 enum class ExecPhase : uint8_t {
@@ -126,17 +140,20 @@ enum class ExecDoneResult : uint32_t {
 
 constexpr uint64_t kExecStatePhaseShift = 0;
 constexpr uint64_t kExecStatePhaseMask = 0x7ULL;
-constexpr uint64_t kExecStateOwnerShift = 3;
-constexpr uint64_t kExecStateOwnerMask = 0xFFULL;
-constexpr uint64_t kExecStateEngineShift = 11;
+constexpr uint64_t kExecStateBuildOwnerShift = 3;
+constexpr uint64_t kExecStateBuildOwnerMask = 0xFFULL;
+constexpr uint64_t kExecStateExecuteOwnerShift = 11;
+constexpr uint64_t kExecStateExecuteOwnerMask = 0xFFULL;
+constexpr uint64_t kExecStateEngineShift = 19;
 constexpr uint64_t kExecStateEngineMask = 0x7ULL;
-constexpr uint64_t kExecStatePayloadLinesShift = 14;
+constexpr uint64_t kExecStatePayloadLinesShift = 22;
 constexpr uint64_t kExecStatePayloadLinesMask = 0x7FULL;
-constexpr uint64_t kExecStateTaskIdShift = 21;
+constexpr uint64_t kExecStateTaskIdShift = 29;
 constexpr uint64_t kExecStateTaskIdMask = 0xFFFFFFFFULL;
 constexpr uint64_t kExecStateKnownMask =
     (kExecStatePhaseMask << kExecStatePhaseShift) |
-    (kExecStateOwnerMask << kExecStateOwnerShift) |
+    (kExecStateBuildOwnerMask << kExecStateBuildOwnerShift) |
+    (kExecStateExecuteOwnerMask << kExecStateExecuteOwnerShift) |
     (kExecStateEngineMask << kExecStateEngineShift) |
     (kExecStatePayloadLinesMask << kExecStatePayloadLinesShift) |
     (kExecStateTaskIdMask << kExecStateTaskIdShift);
@@ -154,7 +171,8 @@ constexpr uint64_t kExecFatalKnownMask =
 
 struct DecodedExecState {
     ExecPhase phase;
-    uint32_t owner;
+    uint32_t build_owner;
+    uint32_t execute_owner;
     ExecEngineClass engine_class;
     uint32_t payload_lines;
     uint32_t task_id;
@@ -230,16 +248,33 @@ struct alignas(kExecCacheLineBytes) SharedExecCell {
 struct alignas(kExecCacheLineBytes) ExecutionTokenControl {
     ExecTokenPhase phase;
     uint32_t task_id;
+    uint32_t build_owner;
     uint32_t execute_owner;
     ExecEngineClass engine_class;
     uint32_t payload_lines;
     uint32_t payload_bytes;
-    uint8_t padding[40];
+    uint32_t fanin_ready_prefix;
+    uint8_t padding[32];
+};
+
+struct alignas(kExecCacheLineBytes) ExecutionDispatchBinding {
+    // 这 50 个入口对应通用 dispatch ABI：有效 tensor/scalar 参数在
+    // 前缀中，local/global context 固定占最后两个入口。这里不保存
+    // builder 侧 self-pointer，executor 取得 payload 后必须重新绑定。
+    uint64_t args[kExecDispatchArgCount];
+    uint8_t local_context[kExecLocalContextBytes];
+    uint8_t global_context[kExecGlobalContextBytes];
+    uint8_t padding[
+        kExecDispatchBindingBytes -
+        kExecDispatchArgCount * sizeof(uint64_t) -
+        kExecLocalContextBytes - kExecGlobalContextBytes
+    ];
 };
 
 struct alignas(kExecCacheLineBytes) ExecutionToken {
     ExecutionTokenControl control;
     ExecPayloadStorage payload;
+    ExecutionDispatchBinding dispatch;
 };
 
 static_assert(
@@ -272,23 +307,62 @@ static_assert(
     "execution token control and binding must remain separate"
 );
 static_assert(
-    sizeof(ExecutionToken) == sizeof(SharedExecCell),
-    "execution token must hold exactly one maximum active payload"
+    sizeof(ExecutionDispatchBinding) == kExecDispatchBindingBytes &&
+        alignof(ExecutionDispatchBinding) == kExecCacheLineBytes &&
+        offsetof(ExecutionDispatchBinding, args) == 0 &&
+        offsetof(ExecutionDispatchBinding, local_context) == 400 &&
+        offsetof(ExecutionDispatchBinding, global_context) == 448,
+    "executor-private dispatch binding ABI changed"
+);
+static_assert(
+    offsetof(ExecutionToken, dispatch) ==
+            kExecCacheLineBytes + kExecMaxPayloadBytes &&
+        offsetof(ExecutionToken, dispatch) % kExecCacheLineBytes == 0 &&
+        sizeof(ExecutionToken) ==
+            kExecCacheLineBytes + kExecMaxPayloadBytes +
+                kExecDispatchBindingBytes,
+    "token control, payload and dispatch binding must not share lines"
 );
 
 PA_DEVICE uint64_t EncodeExecState(
-    ExecPhase phase, uint32_t owner,
+    ExecPhase phase, uint32_t build_owner,
+    uint32_t execute_owner,
     ExecEngineClass engine_class, uint32_t payload_lines,
     uint32_t task_id
 ) {
     return
         (static_cast<uint64_t>(phase) << kExecStatePhaseShift) |
-        (static_cast<uint64_t>(owner) << kExecStateOwnerShift) |
+        (static_cast<uint64_t>(build_owner) <<
+         kExecStateBuildOwnerShift) |
+        (static_cast<uint64_t>(execute_owner) <<
+         kExecStateExecuteOwnerShift) |
         (static_cast<uint64_t>(engine_class) <<
          kExecStateEngineShift) |
         (static_cast<uint64_t>(payload_lines) <<
          kExecStatePayloadLinesShift) |
         (static_cast<uint64_t>(task_id) << kExecStateTaskIdShift);
+}
+
+// 仅保留给现有独立探针构造状态的源码兼容入口。正式协议必须调用上面的
+// 六参数版本，分别携带 build/execute owner；该入口不能用于验证跨核
+// owner 保留语义。
+PA_DEVICE uint64_t EncodeExecState(
+    ExecPhase phase, uint32_t owner,
+    ExecEngineClass engine_class, uint32_t payload_lines,
+    uint32_t task_id
+) {
+    if (phase == ExecPhase::Empty) {
+        return EncodeExecState(
+            phase, 0, 0, engine_class, payload_lines, task_id
+        );
+    }
+    const uint32_t execute_owner =
+        phase == ExecPhase::Claimed || phase == ExecPhase::Done
+            ? owner : kExecUnboundOwner;
+    return EncodeExecState(
+        phase, owner, execute_owner, engine_class,
+        payload_lines, task_id
+    );
 }
 
 PA_DEVICE bool ExecOwnerValid(uint32_t owner) {
@@ -372,7 +446,12 @@ PA_DEVICE DecodedExecState DecodeExecState(int64_t raw_state) {
             (raw >> kExecStatePhaseShift) & kExecStatePhaseMask
         ),
         static_cast<uint32_t>(
-            (raw >> kExecStateOwnerShift) & kExecStateOwnerMask
+            (raw >> kExecStateBuildOwnerShift) &
+            kExecStateBuildOwnerMask
+        ),
+        static_cast<uint32_t>(
+            (raw >> kExecStateExecuteOwnerShift) &
+            kExecStateExecuteOwnerMask
         ),
         static_cast<ExecEngineClass>(
             (raw >> kExecStateEngineShift) & kExecStateEngineMask
@@ -392,22 +471,34 @@ PA_DEVICE DecodedExecState DecodeExecState(int64_t raw_state) {
     }
     switch (state.phase) {
         case ExecPhase::Empty:
-            state.valid = state.owner == 0 &&
+            state.valid = state.build_owner == 0 &&
+                          state.execute_owner == 0 &&
                           state.engine_class ==
                               ExecEngineClass::None &&
                           state.payload_lines == 0 &&
                           state.task_id == 0;
             break;
         case ExecPhase::Building:
-            state.valid = ExecOwnerValid(state.owner) &&
+            state.valid = ExecOwnerValid(state.build_owner) &&
+                          state.execute_owner ==
+                              kExecUnboundOwner &&
                           state.engine_class ==
                               ExecEngineClass::None &&
                           state.payload_lines == 0;
             break;
         case ExecPhase::Built:
+            state.valid = ExecOwnerValid(state.build_owner) &&
+                          state.execute_owner ==
+                              kExecUnboundOwner &&
+                          ExecEngineValid(state.engine_class) &&
+                          state.payload_lines >= 1 &&
+                          state.payload_lines <=
+                              kExecMaxPayloadLines;
+            break;
         case ExecPhase::Claimed:
         case ExecPhase::Done:
-            state.valid = ExecOwnerValid(state.owner) &&
+            state.valid = ExecOwnerValid(state.build_owner) &&
+                          ExecOwnerValid(state.execute_owner) &&
                           ExecEngineValid(state.engine_class) &&
                           state.payload_lines >= 1 &&
                           state.payload_lines <=
@@ -638,14 +729,75 @@ PA_DEVICE bool ValidateBoundExecPayload(
          header.multicore_rank < header.multicore_size);
 }
 
+PA_DEVICE PA_GM uint64_t *ExecutionTokenDispatchArgs(
+    PA_GM ExecutionToken &token
+) {
+    return &token.dispatch.args[0];
+}
+
+PA_DEVICE PA_GM const uint64_t *ExecutionTokenDispatchArgs(
+    PA_GM const ExecutionToken &token
+) {
+    return &token.dispatch.args[0];
+}
+
+PA_DEVICE bool RebuildExecutionTokenDispatchArgs(
+    PA_GM ExecutionToken &token
+) {
+    const ExecPayloadHeader header =
+        DecodeExecPayloadHeader(token.payload);
+    ExecPayloadLayout layout{};
+    if ((token.control.phase != ExecTokenPhase::Binding &&
+         token.control.phase != ExecTokenPhase::WaitingFanin) ||
+        !ComputeExecPayloadLayout(
+            header.tensor_count, header.scalar_count,
+            header.fanin_count, layout
+        ) ||
+        header.payload_bytes != layout.payload_bytes ||
+        token.control.payload_bytes != layout.payload_bytes ||
+        token.control.payload_lines != layout.payload_lines) {
+        return false;
+    }
+
+    // tensor 参数不能继承 builder 的绝对地址；它们必须指向本 executor
+    // token 内刚完成绑定的 descriptor。scalar 参数仍按值传递。
+    for (uint32_t tensor = 0;
+         tensor < header.tensor_count; ++tensor) {
+        token.dispatch.args[tensor] = static_cast<uint64_t>(
+            reinterpret_cast<uintptr_t>(
+                &token.payload.words[
+                    layout.tensor_word_offset +
+                    tensor * kExecTensorDescWords
+                ]
+            )
+        );
+    }
+    for (uint32_t scalar = 0;
+         scalar < header.scalar_count; ++scalar) {
+        token.dispatch.args[header.tensor_count + scalar] =
+            token.payload.words[layout.scalar_word_offset + scalar];
+    }
+    token.dispatch.args[kExecDispatchLocalContextIndex] =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+            &token.dispatch.local_context[0]
+        ));
+    token.dispatch.args[kExecDispatchGlobalContextIndex] =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+            &token.dispatch.global_context[0]
+        ));
+    return true;
+}
+
 PA_DEVICE void ResetExecutionToken(
     PA_GM ExecutionToken &token
 ) {
     token.control.task_id = UINT32_MAX;
+    token.control.build_owner = UINT32_MAX;
     token.control.execute_owner = UINT32_MAX;
     token.control.engine_class = ExecEngineClass::None;
     token.control.payload_lines = 0;
     token.control.payload_bytes = 0;
+    token.control.fanin_ready_prefix = 0;
     token.control.phase = ExecTokenPhase::Idle;
 }
 
@@ -670,12 +822,14 @@ PA_DEVICE ExecBuildResult BuildAndPublishExecPayload(
     }
     const int64_t empty_state = static_cast<int64_t>(
         EncodeExecState(
-            ExecPhase::Empty, 0, ExecEngineClass::None, 0, 0
+            ExecPhase::Empty, 0, 0,
+            ExecEngineClass::None, 0, 0
         )
     );
     const int64_t building_state = static_cast<int64_t>(
         EncodeExecState(
             ExecPhase::Building, build_owner,
+            kExecUnboundOwner,
             ExecEngineClass::None, 0, spec.task_id
         )
     );
@@ -723,6 +877,7 @@ PA_DEVICE ExecBuildResult BuildAndPublishExecPayload(
     const int64_t built_state = static_cast<int64_t>(
         EncodeExecState(
             ExecPhase::Built, build_owner,
+            kExecUnboundOwner,
             spec.engine_class, packed_layout.payload_lines,
             spec.task_id
         )
@@ -796,7 +951,8 @@ PA_DEVICE ExecClaimResult ClaimAndBindExecPayload(
     }
     const int64_t claimed_raw = static_cast<int64_t>(
         EncodeExecState(
-            ExecPhase::Claimed, execute_owner,
+            ExecPhase::Claimed, observed.build_owner,
+            execute_owner,
             observed.engine_class, observed.payload_lines,
             observed.task_id
         )
@@ -808,10 +964,12 @@ PA_DEVICE ExecClaimResult ClaimAndBindExecPayload(
     }
 
     token.control.task_id = task_id;
+    token.control.build_owner = observed.build_owner;
     token.control.execute_owner = execute_owner;
     token.control.engine_class = observed.engine_class;
     token.control.payload_lines = observed.payload_lines;
     token.control.payload_bytes = 0;
+    token.control.fanin_ready_prefix = 0;
     token.control.phase = ExecTokenPhase::Binding;
 
     if (ExecFatalPublished<Ops>(fatal)) {
@@ -854,6 +1012,14 @@ PA_DEVICE ExecClaimResult ClaimAndBindExecPayload(
         return ExecClaimResult::InvalidPayload;
     }
     token.control.payload_bytes = layout.payload_bytes;
+    if (!RebuildExecutionTokenDispatchArgs(token)) {
+        token.control.phase = ExecTokenPhase::Faulted;
+        (void)PublishExecFatal<Ops>(
+            fatal, ExecFatalReason::InvalidTokenPayload,
+            task_id, execute_owner
+        );
+        return ExecClaimResult::InvalidPayload;
+    }
     token.control.phase = ExecTokenPhase::WaitingFanin;
     return ExecClaimResult::Claimed;
 }
@@ -918,14 +1084,18 @@ PA_DEVICE bool ExecutionTokenFanin(
 
 template <typename ReadySource>
 PA_DEVICE bool ExecutionTokenFaninReady(
-    PA_GM const ExecutionToken &token,
+    PA_GM ExecutionToken &token,
     const ReadySource &ready_source
 ) {
     if (token.control.phase != ExecTokenPhase::WaitingFanin) {
         return false;
     }
     const ExecPayloadHeader header = ExecutionTokenHeader(token);
-    for (uint32_t edge = 0; edge < header.fanin_count; ++edge) {
+    if (token.control.fanin_ready_prefix > header.fanin_count) {
+        return false;
+    }
+    for (uint32_t edge = token.control.fanin_ready_prefix;
+         edge < header.fanin_count; ++edge) {
         int32_t producer = -1;
         if (!ExecutionTokenFanin(token, edge, producer) ||
             producer < 0 ||
@@ -933,6 +1103,9 @@ PA_DEVICE bool ExecutionTokenFaninReady(
             !ready_source.IsReady(producer)) {
             return false;
         }
+        // 已完成的前缀属于 executor-private token，可在每一项确认后
+        // 立即推进；后续 poll 不再重复读取同一个 completion flag。
+        token.control.fanin_ready_prefix = edge + 1U;
     }
     return true;
 }
@@ -992,6 +1165,7 @@ PA_DEVICE ExecDoneResult PublishExecDoneAfterCompletion(
         return ExecDoneResult::TokenNotCompleting;
     }
     if (!ExecOwnerValid(token.control.execute_owner) ||
+        !ExecOwnerValid(token.control.build_owner) ||
         !ExecEngineValid(token.control.engine_class) ||
         token.control.payload_lines < 1 ||
         token.control.payload_lines > kExecMaxPayloadLines) {
@@ -1047,7 +1221,8 @@ PA_DEVICE ExecDoneResult PublishExecDoneAfterCompletion(
     }
     const int64_t claimed_raw = static_cast<int64_t>(
         EncodeExecState(
-            ExecPhase::Claimed, token.control.execute_owner,
+            ExecPhase::Claimed, token.control.build_owner,
+            token.control.execute_owner,
             token.control.engine_class,
             token.control.payload_lines,
             token.control.task_id
@@ -1055,7 +1230,8 @@ PA_DEVICE ExecDoneResult PublishExecDoneAfterCompletion(
     );
     const int64_t done_raw = static_cast<int64_t>(
         EncodeExecState(
-            ExecPhase::Done, token.control.execute_owner,
+            ExecPhase::Done, token.control.build_owner,
+            token.control.execute_owner,
             token.control.engine_class,
             token.control.payload_lines,
             token.control.task_id

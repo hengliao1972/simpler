@@ -17,7 +17,7 @@
 | S0 | 固定跨核执行包 ABI、状态机和 cacheline 所有权 | standalone portable ABI 已闭合；真实 TensorDesc 对照留到 S3 |
 | S1 | CPU 确定性交错测试闭合协议正确性 | 已完成 |
 | S2 | CCEC 最小 A5 跨核发布/领取探针 | 已完成 |
-| S3 | standalone PA 接入构建/执行分离 | 下一阶段 |
+| S3 | standalone PA 接入构建/执行分离 | 进行中：独立 PA fork 基线已闭合，S3a 协议接线中 |
 | S4 | 泳道、PMU 与 perf-clock 三条证据链 | 未开始 |
 | S5 | 根据证据优化非 atomic 路径 | 未开始 |
 | S6 | 评估并迁移到 Simpler 真实路径 | 未开始 |
@@ -58,8 +58,8 @@
 
 新增：
 
-- `test/test_shared_exec_protocol.cpp`
-- `cpu/build.sh`
+- `protocol_probe/test/test_shared_exec_protocol.cpp`
+- `protocol_probe/cpu/build.sh`
 
 现有测试覆盖 payload 布局边界、构建发布、领取绑定、fanin ready、engine 完成门控、vend/flag/DONE 顺序、构建中暂停、flush 后但 `BUILT` 前暂停、多 executor 竞争、busy token、重复 builder 和损坏 control/payload。
 
@@ -83,10 +83,10 @@ S1 的 CPU 结论只证明状态机、范围和受控交错，不能替代 S2 �
 
 新增：
 
-- `ccec/probe_shared.h`
-- `ccec/kernel.cpp`
-- `ccec/host.cpp`
-- `ccec/cross_core_device_exports.map`
+- `protocol_probe/ccec/probe_shared.h`
+- `protocol_probe/ccec/kernel.cpp`
+- `protocol_probe/ccec/host.cpp`
+- `protocol_probe/ccec/cross_core_device_exports.map`
 
 探针采用 1:1 mixed 构建、2 个 block，目标拓扑为 2 AIC + 2 AIV。覆盖 AIV→AIV、AIV→AIC、AIC→AIV、AIC→AIC 四种跨核方向，以及 1、2、8、68 条 cacheline 的 payload。每组同时比较：
 
@@ -111,8 +111,8 @@ host 为每个 cell 填充独立 sentinel，并检查 active payload 完整、in
 
 ```bash
 ATOMIC_PROBE_DEVICE=0 \
-  cross_core_payload_probe_host \
-  cross_core_payload_probe_kernel.o 100
+  protocol_probe/build/ccec/cross_core_payload_probe_host \
+  protocol_probe/build/ccec/cross_core_payload_probe_kernel.o 100
 ```
 
 结果为 `100 runs × 32 cases/run = 3200 cases` 全部 PASS：
@@ -131,3 +131,68 @@ ATOMIC_PROBE_DEVICE=0 \
 - 对本轮 fresh、task-indexed cell，消费返回型 Claim CAS 后直接执行精确范围 invalidate 已足够；额外前置 DSB 没有表现出正确性必要性，默认协议继续使用 minimal 路径。
 - 该结论只覆盖首轮不复用 cell，不外推到未来 generation/ring reclaim。
 - S2 证明跨核 payload 内存合同可行，但不代替完整 PA 的 task/fanin/vend/engine/FinalDrain 验证；下一步进入 S3a，再进入固定不同核的 S3b。
+
+### S3 接入前的协议补强回归
+
+为让 S3a/S3b 能从同一条 64-bit control 事后证明 owner 关系，packed
+state 已同时保存 Build owner 与 Execute owner；`BUILT` 明确使用未绑定的
+Execute owner，`CLAIMED/DONE` 同时保留两者。execution token 还增加了
+fanin ready 前缀和独立 dispatch binding：已确认 ready 的依赖不重复读取，
+executor 在取得 payload 后重建 tensor/scalar/context 参数，不能继承 builder
+的自引用地址。
+
+该布局变化不是只靠 CPU 推断。同步更新最小 CCEC 探针 host 的六参数终态
+oracle 后，A5 device 0 重新运行 20 轮：`20/20` 轮、`640/640` case 全部
+通过，core id 稳定为 `0,18,54,72`，四种 AIC/AIV 跨核方向、1/2/8/68
+条 cacheline 以及 minimal/pre-DSB 组合均未回退。
+
+## 2026-08-02：S3a 独立 PA fork 基线
+
+### 为什么先建立这条基线
+
+`cross_core/` 是从当前已经跑通的 shared-only same-core standalone 机械
+复制出的独立源码闭包。它与 `same_core/` 对称，直接承载完整 PA；
+只服务于 S0–S2 的小型协议探针则放在 `cross_core/protocol_probe/`。
+后续只在 `cross_core/` 中替换非 Alloc 的执行包发布、领取、绑定和完成路径，
+不在运行期或 include 路径上依赖 `same_core`。先运行原样
+基线，是为了证明目录拆分没有改变 Materialize、Register、TensorMap、
+SharedOutput、shared heap、Claim Tournament、PA task plan 和 host oracle；
+这一步不属于构建执行分离的功能或性能结果。
+
+### 已完成的基线门槛
+
+- 使用 `CXX=/usr/bin/g++` 完整构建 shared perf-clock 及其全部 shared CPU
+  隔离门槛，PollBatch、per-task insert completion、host task plan、普通
+  region ring、稀疏 trace、compact trace、SharedOutput、writer intent、
+  shared heap、Claim Tournament、Materialize 和 96-worker ordered Submit
+  全部通过。
+- 原样 fork 的 CPU B1 与 B256 均通过完整 host 语义检查，包括每 task 唯一
+  winner、AIC/AIV 路由、1280 个 task 完成、1280 条 fanin 边、shared heap
+  精确进度、writer history、descriptor 规范结果和 real-compute 输出。
+- CPU 数值只用作正确性证据，不解释为 A5 性能。原样 B256 的 CPU
+  perf-clock 约 14.65 s，主要受 96 个 pthread 与 CPU real-compute 影响，
+  不进入后续 A5 性能对比。
+
+### 工具链边界
+
+用户目录的实验版 GCC 15.0.1 会生成 binutils 2.42 不识别的 `.base64`
+伪指令；该失败发生在测试二进制汇编阶段，不是源码错误。same-core 既有指南
+已经固定 CPU 回归使用 `/usr/bin/g++`，本轮沿用同一口径。CCEC 设备构建仍
+使用 CANN 9.1 的 `ccec/ld.lld` 和用户目录 GCC 15 构建 host，二者不能混为
+同一条工具链证据。
+
+### 接入前审计发现的必须闭合项
+
+1. 单条 64-bit execution control 必须同时保留 Build owner 与 Execute
+   owner，否则终态只能看到后者，无法证明 S3a 同 owner 或 S3b 异 owner。
+2. execution token 必须保存已确认 ready 的 fanin 前缀，不能在每次推进时
+   从 edge 0 重复发射返回型 atomic load。
+3. executor 需要独立的 dispatch binding，重新生成 50 个 args 指针、48 B
+   LocalContext 与 4 B GlobalContext；不能复制 builder 的自引用指针。
+4. token 忙时，本 worker 后续构建的 `BUILT` task 必须留在 task-indexed
+   全局表，并由单调扫描游标重新发现；不能只在 Build 后尝试一次便遗失。
+5. completion vend 必须在 Materialize 后冻结进 payload，执行完成时不得读取
+   Execute owner 自己的 `worker.heap_next`。
+
+上述项目闭合之前不运行 S3a A5 PA，也不宣称 shared payload 已经接入完整
+调度器。

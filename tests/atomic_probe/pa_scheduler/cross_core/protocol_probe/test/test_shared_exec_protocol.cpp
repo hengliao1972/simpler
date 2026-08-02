@@ -21,7 +21,7 @@
 
 #define PA_DEVICE inline
 #define PA_GM
-#include "../common/shared_exec_protocol.h"
+#include "../../common/shared_exec_protocol.h"
 
 namespace {
 
@@ -368,10 +368,20 @@ struct SyntheticPayloadSource {
 
 struct ReadyTable {
     std::array<std::atomic<bool>, 64> ready{};
+    mutable std::array<std::atomic<uint32_t>, 64> reads{};
 
     bool IsReady(int32_t task_id) const {
+        reads[static_cast<uint32_t>(task_id)].fetch_add(
+            1, std::memory_order_relaxed
+        );
         return ready[static_cast<uint32_t>(task_id)].load(
             std::memory_order_acquire
+        );
+    }
+
+    uint32_t ReadCount(int32_t task_id) const {
+        return reads[static_cast<uint32_t>(task_id)].load(
+            std::memory_order_relaxed
         );
     }
 };
@@ -540,8 +550,17 @@ void TestLayoutAndStateAbi() {
         "task-indexed cell ABI is stable"
     );
     Check(
-        sizeof(ExecutionToken) == sizeof(SharedExecCell),
-        "one executor token holds one maximum payload"
+        sizeof(ExecutionDispatchBinding) == 512 &&
+            alignof(ExecutionDispatchBinding) == 64 &&
+            offsetof(ExecutionDispatchBinding, args) == 0 &&
+            offsetof(ExecutionDispatchBinding, local_context) == 400 &&
+            offsetof(ExecutionDispatchBinding, global_context) == 448,
+        "dispatch binding keeps 50 args and both context regions"
+    );
+    Check(
+        offsetof(ExecutionToken, dispatch) == 4416 &&
+            sizeof(ExecutionToken) == 4928,
+        "token control, payload and dispatch binding use disjoint lines"
     );
 
     ExecPayloadLayout empty{};
@@ -567,20 +586,40 @@ void TestLayoutAndStateAbi() {
     );
 
     const int64_t raw = static_cast<int64_t>(EncodeExecState(
-        ExecPhase::Built, 37, ExecEngineClass::Aic, 68, 901
+        ExecPhase::Claimed, 37, 19,
+        ExecEngineClass::Aic, 68, 901
     ));
     const DecodedExecState decoded = DecodeExecState(raw);
     Check(
-        decoded.valid && decoded.phase == ExecPhase::Built &&
-            decoded.owner == 37 &&
+        decoded.valid && decoded.phase == ExecPhase::Claimed &&
+            decoded.build_owner == 37 &&
+            decoded.execute_owner == 19 &&
             decoded.engine_class == ExecEngineClass::Aic &&
             decoded.payload_lines == 68 &&
             decoded.task_id == 901,
         "packed state round trip is exact"
     );
     Check(
-        !DecodeExecState(raw | (1LL << 60)).valid,
+        !DecodeExecState(raw | (1LL << 61)).valid,
         "reserved state bits fail closed"
+    );
+    const DecodedExecState built = DecodeExecState(
+        static_cast<int64_t>(EncodeExecState(
+            ExecPhase::Built, 37, kExecUnboundOwner,
+            ExecEngineClass::Aiv, 1, 902
+        ))
+    );
+    Check(
+        built.valid && built.build_owner == 37 &&
+            built.execute_owner == kExecUnboundOwner,
+        "BUILT carries an explicit unbound execute owner"
+    );
+    Check(
+        !DecodeExecState(static_cast<int64_t>(EncodeExecState(
+            ExecPhase::Built, 37, 19,
+            ExecEngineClass::Aiv, 1, 902
+        ))).valid,
+        "BUILT rejects a prematurely bound execute owner"
     );
     const int64_t fatal_raw = static_cast<int64_t>(EncodeExecFatal(
         ExecFatalReason::ClaimedPayloadInvalid, 19, 901
@@ -624,9 +663,10 @@ void TestPublishBindAndComplete() {
     const DecodedExecState built = CurrentState(cell);
     Check(
         built.valid && built.phase == ExecPhase::Built &&
-            built.owner == 3 &&
+            built.build_owner == 3 &&
+            built.execute_owner == kExecUnboundOwner &&
             built.payload_lines == layout.payload_lines,
-        "BUILT publishes owner, engine and exact line count"
+        "BUILT publishes build owner, unbound executor and line count"
     );
     Check(
         ProtocolTestOps::payload_stores.load() ==
@@ -667,8 +707,16 @@ void TestPublishBindAndComplete() {
     Check(
         token.control.phase == ExecTokenPhase::WaitingFanin &&
             token.control.task_id == spec.task_id &&
+            token.control.build_owner == 3 &&
             token.control.execute_owner == 9,
-        "binding occupies the executor's sole token"
+        "binding preserves both owners in the executor's sole token"
+    );
+    const DecodedExecState claimed = CurrentState(cell);
+    Check(
+        claimed.valid && claimed.phase == ExecPhase::Claimed &&
+            claimed.build_owner == 3 &&
+            claimed.execute_owner == 9,
+        "CLAIMED binds execute owner without discarding build owner"
     );
     Check(
         ProtocolTestOps::invalidate_calls.load() == 1 &&
@@ -711,6 +759,40 @@ void TestPublishBindAndComplete() {
     const uint64_t shared_reads_after_binding =
         ProtocolTestOps::payload_loads.load();
     CheckPayloadMatches(token, spec, source);
+    PA_GM const uint64_t *dispatch_args =
+        ExecutionTokenDispatchArgs(token);
+    bool dispatch_tensors_match = true;
+    for (uint32_t tensor = 0;
+         tensor < spec.tensor_count; ++tensor) {
+        dispatch_tensors_match = dispatch_tensors_match &&
+            dispatch_args[tensor] == static_cast<uint64_t>(
+                reinterpret_cast<uintptr_t>(
+                    &token.payload.words[
+                        layout.tensor_word_offset +
+                        tensor * kExecTensorDescWords
+                    ]
+                )
+            );
+    }
+    bool dispatch_scalars_match = true;
+    for (uint32_t scalar = 0;
+         scalar < spec.scalar_count; ++scalar) {
+        dispatch_scalars_match = dispatch_scalars_match &&
+            dispatch_args[spec.tensor_count + scalar] ==
+                source.scalars[scalar];
+    }
+    Check(
+        dispatch_tensors_match && dispatch_scalars_match &&
+            dispatch_args[kExecDispatchLocalContextIndex] ==
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                    &token.dispatch.local_context[0]
+                )) &&
+            dispatch_args[kExecDispatchGlobalContextIndex] ==
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                    &token.dispatch.global_context[0]
+                )),
+        "executor rebuilds tensor, scalar and context dispatch args"
+    );
     ReadyTable ready{};
     for (int32_t producer : source.fanin) {
         ready.ready[static_cast<uint32_t>(producer)].store(true);
@@ -766,12 +848,15 @@ void TestPublishBindAndComplete() {
     const DecodedExecState done = CurrentState(cell);
     Check(
         done.valid && done.phase == ExecPhase::Done &&
-            done.owner == 9,
-        "DONE retains the execute owner"
+            done.build_owner == 3 && done.execute_owner == 9,
+        "DONE retains both build and execute owners"
     );
     Check(
-        token.control.phase == ExecTokenPhase::Idle,
-        "token returns to IDLE only after DONE"
+        token.control.phase == ExecTokenPhase::Idle &&
+            token.control.build_owner == UINT32_MAX &&
+            token.control.execute_owner == UINT32_MAX &&
+            token.control.fanin_ready_prefix == 0,
+        "token returns to a fully reset IDLE state only after DONE"
     );
 }
 
@@ -1215,7 +1300,8 @@ void TestInvalidControlAndPayloadFailClosed() {
     InitializeFatal(control_fatal);
     invalid_control.control.state = static_cast<int64_t>(
         EncodeExecState(
-            ExecPhase::Built, 1, ExecEngineClass::Aiv,
+            ExecPhase::Built, 1, kExecUnboundOwner,
+            ExecEngineClass::Aiv,
             kExecMaxPayloadLines + 1, 42
         )
     );
@@ -1397,25 +1483,50 @@ void TestFaninGatesExecutionAndRejectsFutureProducer() {
         "one unfinished producer blocks execution"
     );
     Check(
+        token.control.fanin_ready_prefix == 2 &&
+            ready.ReadCount(source.fanin[0]) == 1 &&
+            ready.ReadCount(source.fanin[1]) == 1 &&
+            ready.ReadCount(source.fanin[2]) == 1 &&
+            ready.ReadCount(source.fanin[3]) == 0,
+        "fanin polling advances each successful ready prefix item"
+    );
+    Check(
         !TryMarkExecutionTokenEngineInflight<ProtocolTestOps>(
             token, ready, fatal
         ),
         "unfinished producer cannot be bypassed by state transition"
     );
     Check(
-        token.control.phase == ExecTokenPhase::WaitingFanin,
-        "blocked fanin does not advance the token"
+        token.control.phase == ExecTokenPhase::WaitingFanin &&
+            token.control.fanin_ready_prefix == 2 &&
+            ready.ReadCount(source.fanin[0]) == 1 &&
+            ready.ReadCount(source.fanin[1]) == 1 &&
+            ready.ReadCount(source.fanin[2]) == 2 &&
+            ready.ReadCount(source.fanin[3]) == 0,
+        "blocked poll never rereads the already-ready prefix"
     );
     ready.ready[17].store(true, std::memory_order_release);
     Check(
         ExecutionTokenFaninReady(token, ready),
         "task becomes ready after its final producer"
     );
+    const uint32_t first_reads = ready.ReadCount(source.fanin[0]);
+    const uint32_t second_reads = ready.ReadCount(source.fanin[1]);
+    const uint32_t third_reads = ready.ReadCount(source.fanin[2]);
+    const uint32_t fourth_reads = ready.ReadCount(source.fanin[3]);
     Check(
         TryMarkExecutionTokenEngineInflight<ProtocolTestOps>(
             token, ready, fatal
         ),
         "ready task advances through the combined gate"
+    );
+    Check(
+        token.control.fanin_ready_prefix == spec.fanin_count &&
+            ready.ReadCount(source.fanin[0]) == first_reads &&
+            ready.ReadCount(source.fanin[1]) == second_reads &&
+            ready.ReadCount(source.fanin[2]) == third_reads &&
+            ready.ReadCount(source.fanin[3]) == fourth_reads,
+        "fully-ready prefix is not reread at engine transition"
     );
     Check(
         ProtocolTestOps::payload_loads.load() ==
@@ -1438,6 +1549,7 @@ void TestFaninGatesExecutionAndRejectsFutureProducer() {
         (header.fanin_count - 1U) / 2U;
     const uint64_t original = token.payload.words[final_word];
     token.control.phase = ExecTokenPhase::WaitingFanin;
+    token.control.fanin_ready_prefix = 0;
     token.payload.words[final_word] =
         (original & 0xFFFFFFFFULL) |
         (static_cast<uint64_t>(spec.task_id) << 32U);
@@ -1710,7 +1822,8 @@ void TestCompletionFailureIsTerminalAndIdempotent() {
             const int64_t claimed = cell.control.state;
             cell.control.state = static_cast<int64_t>(
                 EncodeExecState(
-                    ExecPhase::Claimed, 3,
+                    ExecPhase::Claimed,
+                    token.control.build_owner, 3,
                     ExecEngineClass::Aiv,
                     token.control.payload_lines,
                     token.control.task_id
