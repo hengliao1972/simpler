@@ -7,12 +7,12 @@
 | 目标 | 让 task 的构建 owner 与 kernel 执行 owner 可以是不同物理核 |
 | 当前代码 | Build owner 发布 task-indexed shared payload，K2 排除 Build owner 后的 1 或 2 个 eligible executor 竞争执行 |
 | 本文性质 | 持续更新的架构与内存模型设计记录 |
-| 正式实现 | S0–S4 K2 已通过 CPU/CCEC/A5；S5a 已完成 CPU 跨角色 Build 门槛，CCEC/A5 尚未运行 |
+| 正式实现 | S0–S4 K2 及 S5a 跨角色 Build 已通过 CPU/CCEC/A5；S5b 全 96 Scalar Build 尚未开始 |
 | CPU 正确性用例 | S1–S4 K2 及 S5a 对侧角色 Build、PA payload、动态合法 owner 和 drain 门槛已完成 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
-| A5 PA 功能/性能 | S3b full-swimlane Submit 27.128 ms；S4 K2 B1/B256 全部闭合，B256 full-swimlane Submit 27.476 ms，仅记录单样本 |
+| A5 PA 功能/性能 | S3b full-swimlane 27.128 ms；S4 K2 为 27.476 ms；S5a B256 普通/完整泳道为 27.143/27.301 ms，均只记录单样本 |
 | S4 动态 Execute election | K2 首版已通过 CPU B1/B256 和 A5 B1/B256；B256 中两候选都有实际胜出，非法 owner 为 0 |
-| S5 Build 拓扑 | S5a 先交换 QK/PV 与 SF/UP 的 Build 角色但保持候选人口和 CAS 总量不变；CPU B1/B256 已闭合，S5b 全 96 Scalar 尚未开始 |
+| S5 Build 拓扑 | S5a 交换 QK/PV 与 SF/UP 的 Build 角色但保持候选人口和 CAS 总量不变，CPU/CCEC/A5 B1/B256 已闭合；S5b 全 96 Scalar 尚未开始 |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
 
@@ -971,12 +971,14 @@ S5 拆成两个正交阶段，先证明可移植性，再扩大竞争人口：
 严格发布，Build payload 和 kernel 执行不进入该串行链；host 必须独立
 复算 Build 角色、K2 和终态，不能调用设备 helper 形成同错 oracle。
 
-S5a 的 CPU 实现已经闭合。完整 CPU build、B1 和 B256 real-compute 均为
-semantic/postprocess PASS；逐 kernel 证明 QK/PV 的 Build owner 位于 AIV、
-SF/UP 的 Build owner 位于 AIC，Execute owner 仍匹配目标 engine、属于
-host 独立复算的 K2 且不同于 Build owner。fanin payload 发布量也随 Build
-角色反转，而 ready load 仍落在 Execute 角色。该结果目前只证明 CPU
-状态机；CCEC 编译、A5 DCCI/atomic 可见性与动态结果尚未运行。
+S5a 已通过完整 CPU build、CPU B1/B256 real-compute、CCEC 双入口编译和
+A5 B1/B256。逐 kernel 证明 QK/PV 的 Build owner 位于 AIV、SF/UP 的
+Build owner 位于 AIC，Execute owner 仍匹配目标 engine、属于 host 独立
+复算的 K2 且不同于 Build owner。fanin payload 发布量也随 Build 角色
+反转，而 ready load 仍落在 Execute 角色。A5 B256 普通/完整泳道 Submit
+分别为 `27.143 ms / 27.301 ms`，完整泳道中 primary/secondary 分别执行
+`363/661` 个 kernel，非法 owner 为 0、trace drop 为 0。该单轮数值只用于
+排除倍数级结构性异常，不宣称相对 S4 有稳定性能收益。
 
 ### S6：再接 engine/Scalar overlap
 

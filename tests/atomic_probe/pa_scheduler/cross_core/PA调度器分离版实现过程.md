@@ -20,7 +20,7 @@
 | S2 | CCEC 最小 A5 跨核发布/领取探针 | 已完成 |
 | S3 | standalone PA 接入构建/执行分离 | 已完成：S3a 与固定两候选异核 S3b 均已闭合，S3b 通过 CPU、A5 B1/B256 和 B256 full-swimlane |
 | S4 | 受控的动态 Execute election | K2 首版已通过完整 CPU、CCEC 和 A5 B1/B256 门槛 |
-| S5 | 独立扩大 Build owner 候选核拓扑 | S5a 跨角色 Build 已通过完整 CPU、B1/B256；CCEC/A5 尚未运行，S5b 全 96 Scalar 尚未开始 |
+| S5 | 独立扩大 Build owner 候选核拓扑 | S5a 跨角色 Build 已通过完整 CPU/CCEC/A5 B1/B256；S5b 全 96 Scalar 尚未开始 |
 | S6 | 引入 engine/Scalar overlap | 未开始 |
 | S7 | 基于累积证据做性能评估与容量/复用优化 | 未开始 |
 | 贯穿观测门槛（不编号） | 泳道、submit-PMU 与 perf-clock 三条互不混算的证据链 | perf-clock 与 full-swimlane 已可用；cross-core submit-PMU 尚未接入 |
@@ -778,7 +778,35 @@ engine 对侧，因此不会占用 K2 的任何一席；primary、secondary 都�
   匹配 engine、属于 host 独立 K2 且不同于 Build owner；payload、vend、
   completion、token、fanin、shared heap、TensorMap 和计算结果全部闭合。
 
-CPU 耗时只受 pthread 与 CPU real-compute 影响，不解释为 A5 性能。
-本阶段此时 **尚未运行 CCEC/A5**，不能用 CPU cache coherence 替代 A5
-Scalar 无 coherence 下的 DCCI/atomic 动态证据。下一步先做 CCEC 编译和
-A5 B1/B256，再以独立提交进入 S5b 全 96 Scalar Build。
+CPU 耗时只受 pthread 与 CPU real-compute 影响，不解释为 A5 性能，
+也不能用 CPU cache coherence 替代 A5 Scalar 无 coherence 下的
+DCCI/atomic 动态证据。
+
+### CCEC 与 A5 动态证据
+
+- CCEC 的 AIC/AIV 通用协议实例化、两类正式入口、compete-first
+  caller/runtime/finish 角色符号、最终混合 ELF 和 artifact manifest
+  全部通过；QK/PV 与 SF/UP 的 real-compute helper 仍只落在目标 engine，
+  Build 角色反转没有改写 kernel 路由。
+- A5 B1 real-compute 的 5 task/4 kernel、跨角色 Build、payload、fanin、
+  terminal、drain、TensorMap、shared heap 和数值结果全部 PASS。本轮
+  Submit 为 `1763.512 ms`，命中了 S4 已证明存在的偶发长尾；没有新增
+  协议错误，因此按既定边界不阻断功能推进。
+- A5 B256 普通运行 Submit 为 `27.143 ms`；完整泳道运行 Submit 为
+  `27.301 ms`。两轮均完成 1280 task/1024 kernel，execution/semantic/
+  postprocess 全部 PASS，完整泳道 trace drop 为 0。
+- 完整泳道的 `winner_build` 轨道逐 task 直接闭合 Build 角色：QK/PV
+  各 256 个均在 AIV Scalar，SF/UP 各 256 个均在 AIC Scalar。实际
+  Execute election 中 primary/secondary 分别胜出 `363/661` 次，非法
+  owner 为 0，证明两个 K2 候选均在 A5 上实际参与，而不是 host 只接受
+  一个预定 executor。
+- S5a full-swimlane `27.301 ms` 与 S4 单样本 `27.476 ms` 同量级，未出现
+  倍数级结构性回退。两者均为观测 ELF 单轮样本，且已知长尾存在，不能
+  据此宣称约 0.6% 的差异是稳定收益。
+
+完整 B256 泳道在：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260802_133108_3915277/ccec/merged_swimlane.json`
+
+至此 S5a 的 CPU/CCEC/A5 功能门槛闭合。下一阶段 S5b 才将 kernel Build
+候选扩大为 96/G8，并单独评估额外 Claim CAS 与到达式负载均衡的权衡。
