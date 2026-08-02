@@ -337,7 +337,9 @@ int main(int argc, char **argv) {
     RunVariant(
         function, stream, storage_device, results_device, Variant{12, kModeFlat, 1, 512, kOpCompareExchange}, result
     );
-    const uint32_t prefilter_delays[] = {0, 10, 50, 100};
+    const uint32_t prefilter_delays[] = {
+        0, 10, 50, 100, 200, 500,
+    };
     for (uint32_t delay : prefilter_delays) {
         RunVariant(
             function, stream, storage_device, results_device,

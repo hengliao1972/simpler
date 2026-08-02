@@ -96,6 +96,10 @@ __aicore__ inline void DelayByNops(uint32_t count) {
         EmitNops<50>();
     } else if (count == 100U) {
         EmitNops<100>();
+    } else if (count == 200U) {
+        EmitNops<200>();
+    } else if (count == 500U) {
+        EmitNops<500>();
     } else if (count == 1000U) {
         EmitNops<1000>();
     }
@@ -137,7 +141,8 @@ KERNEL_ENTRY(atomic_max_topology)(__gm__ uint8_t *storage, __gm__ ProbeResult *r
         ((mode == kModeFlat && group_count == 1) ||
          ((mode == kModeGrouped || mode == kModeTwoLevel) && group_count != 0 && group_count <= participants) ||
          (mode == kModeBypassPrefilter && group_count == 1 && operation == kOpCompareExchange &&
-          (prefilter_nops == 0U || prefilter_nops == 10U || prefilter_nops == 50U || prefilter_nops == 100U) &&
+          (prefilter_nops == 0U || prefilter_nops == 10U || prefilter_nops == 50U || prefilter_nops == 100U ||
+           prefilter_nops == 200U || prefilter_nops == 500U) &&
           (preferred_nops == 0U || preferred_nops == 1000U)));
 
     ccec_sync_all();
