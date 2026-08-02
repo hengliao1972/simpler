@@ -360,6 +360,16 @@ constexpr uint32_t kTaskWindow = 1 << 10;
 constexpr uint32_t kTaskWindowMask = kTaskWindow - 1;
 constexpr uint64_t kSystemCounterHz = 1000000000ULL;
 constexpr uint64_t kWatchdogTicks = 2 * kSystemCounterHz;
+// cross-core 首版允许 Build owner 与执行 owner 分离。A5 上多个后继 owner
+// 同时轮询严格插入链时，2 秒通用门槛可能先于前驱 owner 获得运行机会，
+// 把“仍在推进但很慢”误判成协议故障。这里仅放宽 TensorMap 有序插入等待；
+// 启动屏障及旧隔离 helper 继续使用 2 秒门槛，避免扩大其他故障收敛时间。
+constexpr uint64_t kSharedInsertWatchdogTicks =
+    60 * kSystemCounterHz;
+static_assert(
+    kSharedInsertWatchdogTicks > kWatchdogTicks,
+    "cross-core ordered insert watchdog must tolerate slow owner progress"
+);
 // trace_enabled 是位图而不是 bool：bit0 保持既有阶段泳道，bit1 额外开启
 // 逐条 atomic 源码括号记录。atomic 记录依赖同一份 trace buffer，因此 bit1
 // 只能与 bit0 一起配置。

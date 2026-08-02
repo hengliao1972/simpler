@@ -4787,13 +4787,20 @@ inline Metrics Validate(
     // 每个实际回放 task 的插入完成字最终必须恰好保存自己的 task_id；
     // 未使用的 TaskCell 必须继续保持 -1。
     bool shared_per_task_insert_completions_ok = true;
+    uint32_t shared_insert_completed_prefix = 0;
     for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
         const SharedHostPlannedTask *planned_task =
             shared_plan.TaskAt(task_id);
-        shared_per_task_insert_completions_ok &=
+        const bool task_insert_completed =
             planned_task != nullptr &&
             state.tasks[task_id].deps_prepared ==
                 static_cast<int64_t>(task_id);
+        shared_per_task_insert_completions_ok &=
+            task_insert_completed;
+        if (task_insert_completed &&
+            shared_insert_completed_prefix == task_id) {
+            ++shared_insert_completed_prefix;
+        }
     }
     for (uint32_t task_id = task_count;
          task_id < kMaxTasks; ++task_id) {
@@ -5662,7 +5669,7 @@ inline Metrics Validate(
         "region_appends=%llu region_physical=%llu region_logical=%llu "
         "region_raw_signature=%016llx normalized_writer_signature=%016llx "
         "published_outputs=%llu normalized_projection_floor=%llu\n",
-        shared_plan.total_tasks,
+        shared_insert_completed_prefix,
         static_cast<long long>(
             SharedInsertTurnValueHost(state.shared_map, 0)
         ),
@@ -6188,6 +6195,54 @@ inline Metrics Validate(
             incomplete_workers, occupied_workers,
             static_cast<unsigned long long>(max_final_occupied)
         );
+#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+        // split caller/finish 的异常只在少数 worker 上首先出现。失败时导出
+        // 不超过 8 个直接证据点，区分“回放提前停止”与“跨 TU ticket/状态
+        // 合同自身报错”；成功路径不增加任何 device 指令或结果字段。
+        uint32_t reported_split_workers = 0;
+        for (uint32_t worker = 0;
+             worker < kWorkers && reported_split_workers < 8U;
+             ++worker) {
+            const WorkerResult &result = state.results[worker];
+            if (result.submits == task_count &&
+                result.compete_first_split_protocol_errors == 0) {
+                continue;
+            }
+            std::printf(
+                "[SPLIT_FAILURE_WORKER] worker=%u role=%llu submits=%llu "
+                "claims=%llu wins=%llu caller=0x%llx finish=0x%llx "
+                "finish_calls=%llu protocol_errors=%llu task_id_sum=%llu "
+                "owner=%llu reserved=0x%llx\n",
+                worker,
+                static_cast<unsigned long long>(result.role),
+                static_cast<unsigned long long>(result.submits),
+                static_cast<unsigned long long>(result.claim_attempts),
+                static_cast<unsigned long long>(result.claim_wins),
+                static_cast<unsigned long long>(
+                    result.compete_first_split_caller_state_address
+                ),
+                static_cast<unsigned long long>(
+                    result.compete_first_split_finish_state_address
+                ),
+                static_cast<unsigned long long>(
+                    result.compete_first_split_finish_calls
+                ),
+                static_cast<unsigned long long>(
+                    result.compete_first_split_protocol_errors
+                ),
+                static_cast<unsigned long long>(
+                    result.compete_first_split_task_id_sum
+                ),
+                static_cast<unsigned long long>(
+                    result.compete_first_split_owner_worker_id
+                ),
+                static_cast<unsigned long long>(
+                    result.compete_first_split_reserved
+                )
+            );
+            ++reported_split_workers;
+        }
+#endif
 #else
         const int64_t retire =
             state.frontier.value - static_cast<int64_t>(kHeapWindow);

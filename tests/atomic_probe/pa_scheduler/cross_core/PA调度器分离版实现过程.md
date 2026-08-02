@@ -461,3 +461,62 @@ scanner 测试在生产 Ops 边界增加了只用于测试的注入点，并完�
 
 完整 CPU 构建及 ordered Submit 等既有门槛再次全部通过。该阶段仍只提供
 CPU 状态机证据；CCEC 编译和 A5 B1 重复稳定性属于下一门槛。
+
+## 2026-08-02：S3b B1 异核执行功能闭合
+
+### 为什么不能再用 2 秒判定有序插入失败
+
+S3b 首轮 A5 取证曾出现 `first_not_ready=1/2`、kernel 未全部执行和
+global fatal，但 execution fatal 始终为零。继续核对后确认：
+
+- `first_not_ready` 是首个未发布 completion flag 的 task，不是 TensorMap
+  插入失败原因；
+- 旧 `[TENSORMAP] completed_tasks` 误打印了 host 计划 task 数，不是设备实际
+  `deps_prepared` 连续完成前缀；
+- TaskCell 的 `flag/vend/deps_prepared` 仍是纯 atomic cacheline，写方 CAS、
+  读方 atomic Max，当前没有普通 dirty store 或 DCCI 覆盖这条 line 的证据；
+- 当前最有力的首错候选是 `WaitForSharedTaskInsertTurn()` 复用的通用
+  2 秒 watchdog：失败轮 execution fatal 为零，而未完成前缀正好从首个
+  未就绪 task 开始。但当前没有保存单次 predecessor wait 的精确起止时间，
+  因此不把这一归因写成已完全证明的硬件定理。
+
+修正后不删除有界终止，而是把两种口径分开：
+
+```text
+启动屏障/旧隔离 helper: 2 s
+cross-core TensorMap 有序插入等待: 60 s
+```
+
+60 秒只是 standalone 功能阶段的有界容忍值，不是对正常性能的许诺。
+同时 host 改为按 `deps_prepared[N] == N` 计算真实连续完成前缀；失败时
+最多打印 8 个未完整回放的 worker，用于区分回放截断与 split ticket 本身的错误。
+
+### A5 B1 实测证据
+
+CCEC perf-clock 整套重编后，B1 共运行 4 轮：
+
+| 轮次 | Submit | 结果 |
+| ---- | ----: | ---- |
+| 1 | 885.188 ms | PASS |
+| 2 | 2937.959 ms | PASS |
+| 3 | 278.501 us | PASS |
+| 4 | 228.422 us | PASS |
+
+第 2 轮的整个 Submit 超过 2 秒仍最终完整通过，说明这个功能阶段不能用
+一枚与观测开销、调度波动无关的 2 秒固定值代替协议正确性。这不能单独证明
+该轮的某一次 predecessor wait 也超过 2 秒；本次改动的精确结论是：
+先防止过早超时阻断 S3b 功能取证，后续再用独立时间证据定位巨幅波动。
+
+4 轮都精确闭合：
+
+- 5 个 task 只有 5 个 Build owner；
+- QK/SF/PV/UP 各执行一次，QK/PV 只在 AIC，SF/UP 只在 AIV；
+- host 独立复算的每 task `execute_owner` 都与 `build_owner` 不同；
+- portable payload 的 descriptor/scalar/fanin/vend/route 逐项匹配；
+- completion flag、vend、cell `DONE`、owner-local token reset 与 96 核 execution drain
+  全部通过；
+- global fatal 和 execution fatal 全部保持未发布。
+
+这一阶段只宣布 **S3b B1 固定两候选异核交接功能已闭合**。耗时从
+228 us 到 2.938 s 的巨大波动仍需后续单独定位；当前不宣称性能收益，也不宣称
+B256 已经通过。

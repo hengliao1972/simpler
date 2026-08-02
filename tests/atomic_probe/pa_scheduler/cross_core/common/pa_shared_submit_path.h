@@ -550,7 +550,7 @@ PA_DEVICE bool WaitForSharedTaskInsertTurn(
         if (IsFatal<Ops>(state, stats, task_id)) {
             return false;
         }
-        if (Ops::Now() - begin > kWatchdogTicks) {
+        if (Ops::Now() - begin > kSharedInsertWatchdogTicks) {
             SetFatal<Ops>(state, stats, task_id);
             return false;
         }
