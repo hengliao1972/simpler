@@ -24,7 +24,7 @@
 
 - [A5 FDWIC Paged Attention 安装与复现指南](a5_fdwic_atomic_swimlane_repo.md)；
 - [PA 原子操作与优化记录](pa_scheduler/PA-atomic情况分析.md)；
-- [PA 调度器独立复现与泳道使用指南](pa_scheduler/PA调度器独立复现与泳道使用指南.md)；
+- [PA 调度器独立复现与泳道使用指南](pa_scheduler/same_core/PA调度器独立复现与泳道使用指南.md)；
 - [FDWIC 泳道排他分区与闭合分析](pa_scheduler/swimlane_opt_anal.md)；
 - [I-cache Miss 采集与分析指南](icache_miss_usage_guide.md)。
 

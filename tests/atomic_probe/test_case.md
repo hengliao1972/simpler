@@ -664,7 +664,7 @@ PA scalar 分析只需要数量级时，使用 `T_icache_est_ns = CNT7_miss_tota
 1,000 个 I-cache miss 约为 90 us。compulsory、capacity、conflict miss 都包含在
 `CNT7_miss_total` 内。该乘积是 cold/warm 校准得到的一阶等效时间，不是逐次精确
 可加的 stall；方法、角色分项和原始日志见
-[`PA调度器独立复现与泳道使用指南.md`](pa_scheduler/PA调度器独立复现与泳道使用指南.md#单次-cnt7-i-cache-miss-的-scalar-估算标尺)。
+[`PA调度器独立复现与泳道使用指南.md`](pa_scheduler/same_core/PA调度器独立复现与泳道使用指南.md#单次-cnt7-i-cache-miss-的-scalar-估算标尺)。
 
 ## 判定标准与退出码规则
 
