@@ -5649,3 +5649,47 @@ cycles/次，即 1.65 GHz 下约 2.43 ns/次。该数字是紧循环吞吐口径
 已完成；`try_wait` 只负责选择何时恢复 continuation，恢复后继续执行原
 `wait_flag` 再发布 completion。当前四 ID 用例只给同一个最终 TSTORE 叠加
 四个 token，尚未证明四个不同 engine task 同时在途。
+
+### 15.23 cross-core 无执行工作门控：B256 perf-clock 从 27.50 ms 降到 9.08 ms
+
+在“不引入 `try_wait`/continuation、不缩减 96 Scalar Build 资格、保持
+TensorMap 严格串行插入和 K2 异核 Execute”的新性能阶段，先重新建立
+cross-core S5b 权威基线。10 个独立 `perf-clock` 进程的 Submit
+`min/median/mean/max` 为：
+
+```text
+27.190804 / 27.496232 / 27.489246 / 27.747057 ms
+```
+
+同提交 full-swimlane 的排他账本表明，`EfDrainControl` 占
+`2301.070442 ms` 聚合核时。源码与候选位图计数进一步排除了“全量 cell
+扫描”：B256 全局只有 5120 个 potential slot，但 96 核仍对 1280 个
+Submit 无条件调用执行推进，共 122880 次。绝大多数入口在 token Idle 且
+next candidate 尚未进入本核 Close 前缀时，只执行集中式 fatal control
+返回型读取和重复状态复核。
+
+保留的优化只增加 owner-local 门控：token 非 Idle，或 next candidate
+已经落入 Close 前缀时，才进入 opportunistic `ProgressCrossCoreExec()`；
+FinalDrain、非法入口、活跃 token 和已到期 candidate 继续走完整协议。
+该判断不读跨核普通发布数据，不改变 Claim、严格插入、payload、DCCI 或
+Execute owner。CPU 定向门槛、完整 CPU build、B1/B256 real-compute、
+CCEC 双角色编译和 A5 full-swimlane 均通过。
+
+候选 10 个独立 `perf-clock` 样本为：
+
+```text
+8.761150 / 9.077919 / 9.102288 / 9.680661 ms
+```
+
+中位数改善 `66.985%`。full-swimlane Submit 为 `8.765063 ms`，
+`EfDrainControl` 聚合核时从 `2301.070442 ms` 降到 `517.839958 ms`
+（`-77.500%`）；local/root Claim CAS 仍为 `122880/10240`，全部
+1280 task、1024 kernel、严格插入完成字、fanin、shared output、终态和
+真实计算 PASS，trace drop 为 0。该证据说明此前 27 ms 的主要矛盾不是
+业务计算，而是明知无本核工作仍重复进入集中式 control 读取。
+
+后续量化目标已明确为同口径 B256 `perf-clock <= 1.0 ms`。当前约
+`9.08 ms` 仍远未达成；下一阶段须以新泳道重新建立差额账本，再分别处理
+剩余执行等待/控制、portable payload、DCCI/DSB、Claim 和 FinalDrain。
+完整实现细节与泳道路径见
+`pa_scheduler/cross_core/PA调度器分离版实现过程.md` 的 S6.1 记录。

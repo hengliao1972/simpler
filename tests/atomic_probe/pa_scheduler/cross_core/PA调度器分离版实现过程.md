@@ -896,3 +896,89 @@ S5a `27.301 ms` 单样本相比约 `+3.48%`。已知长尾与单轮波动使这�
 完整 B256 泳道在：
 
 `outputs/pa_scheduler_cross_core_shared_swimlane_20260802_142824_3971096/ccec/merged_swimlane.json`
+
+## 2026-08-02：S6.1 跳过无本核执行工作的 EfDrain 完整入口
+
+### 问题不是候选扫描，而是无效入口的集中式 control 读取
+
+S5b 的 B256 `perf-clock` 重新编译后做了 10 个独立进程样本：
+
+```text
+min/median/mean/max =
+27.190804 / 27.496232 / 27.489246 / 27.747057 ms
+```
+
+对应 full-swimlane 的 Submit 为 `28.250448 ms`。排他分析中
+`EfDrainControl` 聚合核时为 `2301.070442 ms`，占
+`WorkerCompletion` 的 `81.992%`；而真正的 candidate potential slot
+全局只有 `5120` 个，不能用“扫描 1280 个 cell”解释这项成本。源码审计
+确认每个 actor 的每次 Submit 都无条件进入 `ProgressCrossCoreExec()`：
+B256 共 `96 * 1280 = 122880` 次。即使本核 token 为 Idle、下一个 K2
+候选还没有进入已 Close 前缀，入口仍先对 global fatal 和 exec fatal
+执行两次集中式返回型原子读取，再复核 owner-local token 和候选游标。
+
+### 门控合同
+
+新增 `CrossCoreExecHasLocalProgressWork()`，只在以下任一条件成立时才让
+opportunistic EfDrain 进入完整执行推进：
+
+1. 本 executor 的 owner-local token 不是 Idle；
+2. 本核紧凑候选游标指向的 task 已小于 `stats.result.submits`，即它已经
+   落入本核成功 Close 的 Submit 前缀。
+
+若两项都不成立，单调 cursor/registration 合同证明本核没有已经 Close
+的 candidate 可读，也没有在途 token 要推进。当前调用点本来就忽略
+`ProgressCrossCoreExec()` 的返回值；在 Idle/no-candidate 形状下，完整
+入口的 terminal 读取不会阻止随后 Claim，也不会改变 token/cursor。
+execution fatal 的首错仍由实际发布者镜像到 global fatal，所有 winner
+不可逆边界和 FinalDrain 继续执行原有 authoritative 检查。因此门控删除
+的是冗余观察，不是错误授权。非法参数一律返回“需要完整推进”，不能被
+快路径吞掉；FinalDrain 也始终绕过该门控。
+
+该判断只读取本 executor Scalar 独占的 token 与 LocalStats 游标，不把普通
+load 当成跨核发布依据，也不依赖 A5 Scalar cache coherence。Claim
+Tournament、TensorMap `deps_prepared` 严格插入链、96 Scalar Build 资格、
+K2 Execute owner 和 payload DCCI 合同均未修改。
+
+### 正确性与动态结果
+
+- 新增 CPU 定向测试覆盖：前缀未 Close 时跳过、Alloc 非候选槽 Close 后
+  必须进入 scanner 并推进、活跃 token 不得跳过、非法入口不得跳过。
+- 完整 CPU build、执行协议/ordered Submit 门槛及 B1/B256 real-compute
+  全部 PASS。
+- CCEC AIC/AIV 通用实例、两类入口、split caller/runtime/finish、最终
+  1:2 ELF、无 relocation 和 artifact manifest 全部 PASS。
+- A5 B256 `perf-clock` 10 个独立进程样本全部 semantic/execution/
+  postprocess PASS：
+
+```text
+min/median/mean/max =
+8.761150 / 9.077919 / 9.102288 / 9.680661 ms
+```
+
+相对同一提交改动前的 10 轮中位数改善 `66.985%`。本轮波动范围约为
+中位数的 `10.129%`，后续候选仍必须使用多轮 `perf-clock`，不能用单个
+最好值作为去留依据。
+
+新的 B256 full-swimlane Submit 为 `8.765063 ms`，全部业务、TensorMap、
+payload、终态、真实计算和 trace closure PASS，drop 为 0。local/root
+Claim CAS 仍精确为 `122880 / 10240`，总物理 CAS 仍是 `133120`；1024 个
+kernel、1280 条 fanin edge、2048 个 shared output 和 1280 个插入完成字
+均保持原合同。排他对比为：
+
+| 指标 | S5b 原泳道 | S6.1 门控 | 变化 |
+| --- | ---: | ---: | ---: |
+| Submit 墙钟 | 28.250448 ms | 8.765063 ms | -68.974% |
+| SubmitUnion 聚合核时 | 2572.730800 ms | 743.456767 ms | -71.102% |
+| EfDrainControl 聚合核时 | 2301.070442 ms | 517.839958 ms | -77.500% |
+| Claim 聚合核时 | 48.465912 ms | 44.030817 ms | -9.151% |
+| FinalDrainResidual 聚合核时 | 212.765162 ms | 174.918873 ms | -17.788% |
+
+新泳道在：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260802_153100_4051026/ccec/merged_swimlane.json`
+
+用户随后把最终量化目标明确为：同一 B256 `perf-clock` 口径压到
+`1.0 ms`。S6.1 只是把基线推进到约 `9.08 ms`；后续仍需重新拆解
+剩余 EfDrain、payload handoff、DCCI/DSB、Claim 与 FinalDrain，不能把
+本阶段的大幅收益误写成目标已经完成。

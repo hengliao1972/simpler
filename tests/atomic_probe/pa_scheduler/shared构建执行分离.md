@@ -10,7 +10,7 @@
 | 正式实现 | S0–S5b 已通过 CPU/CCEC/A5；当前五类 task 均允许全 96 Scalar Build，kernel 仍由 K2 异核 Execute |
 | CPU 正确性用例 | S1–S4 K2、S5a 对侧角色 Build 与 S5b 全 96 Scalar Build 门槛已完成 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
-| A5 PA 功能/性能 | S3b/S4/S5a full-swimlane 为 27.128/27.476/27.301 ms；S5b B256 普通/完整泳道为 27.347/28.250 ms，均只记录单样本 |
+| A5 PA 功能/性能 | S5b 十轮 perf-clock 中位 27.496 ms；S6.1 owner-local EfDrain 门控后十轮中位 9.078 ms、full-swimlane 8.765 ms；最终目标为同口径不高于 1.0 ms |
 | S4 动态 Execute election | K2 首版已通过 CPU B1/B256 和 A5 B1/B256；B256 中两候选都有实际胜出，非法 owner 为 0 |
 | S5 Build 拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 五类 task 全 96/G8 已通过 CPU/CCEC/A5 B1/B256，物理 Claim CAS 精确闭合 |
 | 明确非目标 | 不引入 `try_wait`、engine continuation 或“kernel 运行期间同一 Scalar 继续调度” |
@@ -997,8 +997,14 @@ FinalDrain 轮询记录耗尽通用 trace 容量，因此不用它代替 A5 的
 
 ### S6：性能评估与容量/复用优化
 
+- 量化终点为 B256、real-compute、96 Scalar、严格插入链与 K2 异核执行
+  保持不变时，`perf-clock <= 1.0 ms`；不得用缩减候选人口或
+  kernel/Scalar overlap 换取该数字；
 - 使用贯穿 S0–S5 累积的三条证据链，对 publication、
   handoff、election 和 Build 负载转移做同口径收益审计；
+- S6.1 已用 owner-local token/candidate 门控消除无本核执行工作时的
+  122880 次完整 EfDrain 入口，把十轮 perf-clock 中位从 27.496 ms
+  降至 9.078 ms；Claim CAS、严格插入和执行语义保持不变；
 - 先决定 task-indexed 方案是否已经满足性能和容量，不为了
   预设最终架构就提前引入队列；
 - 只有 task-indexed 内存模型、受控动态 election 和端到端

@@ -3985,6 +3985,42 @@ PA_DEVICE bool CrossCoreExecCandidateBitmapEmpty(
     return true;
 }
 
+// opportunistic EfDrain 只在“本核确实可能推进执行状态”时进入完整
+// ProgressCrossCoreExec：
+//
+// 1. owner-local token 非 Idle，说明此前已经领取的任务仍需等待 fanin、
+//    执行或发布 completion；
+// 2. 紧凑候选游标所指 task 已落入本核 Close 的 Submit 前缀，说明至少
+//    有一个登记位或可永久越过的非候选槽需要处理。
+//
+// 两个条件都不成立时，完整入口最终只会读取两条全局 fatal control、
+// 复核 Idle token，再在同一个候选边界返回。token 只由本 executor
+// Scalar 读写，候选游标也只属于本核，因此这里不依赖 A5 跨核 cache
+// coherence。FinalDrain 不使用该门控：生产关闭后的终态验证和 fatal
+// 汇合仍必须无条件进入完整协议。
+PA_DEVICE bool CrossCoreExecHasLocalProgressWork(
+    PA_GM const SchedulerState *state,
+    uint32_t worker_id, CoreRole role,
+    uint32_t replay_closed_exclusive,
+    const LocalStats &stats
+) {
+    if (state == nullptr || worker_id >= kWorkers ||
+        replay_closed_exclusive > kMaxTasks ||
+        !CrossCoreExecWorkerMatchesRole(worker_id, role)) {
+        // 非法入口必须交给完整协议发布精确 fatal，不能被快路径吞掉。
+        return true;
+    }
+    if (state->exec_tokens[worker_id].control.phase !=
+        cross_core::ExecTokenPhase::Idle) {
+        return true;
+    }
+    uint32_t task_id = kMaxTasks;
+    return CrossCoreExecPotentialTaskAt(
+               worker_id, role, stats.exec_candidate_slot, task_id
+           ) &&
+           task_id < replay_closed_exclusive;
+}
+
 template <typename Ops>
 PA_DEVICE void PublishCrossCoreRuntimeFailure(
     PA_GM SchedulerState *state, LocalStats &stats,
@@ -5379,12 +5415,20 @@ PA_DEVICE bool SubmitCallbackTask(
     // 而 stats.result.submits 只包含已经 Close 的前缀。执行发现
     // 必须使用后者，避免把尚未 Build 的当前 task 当成
     // EMPTY 并永久跳过。
-    (void)ProgressCrossCoreExec<Ops>(
-        state, worker,
-        static_cast<uint32_t>(stats.result.submits),
-        /*production_closed=*/false,
-        DrainPlace::EfDrain, stats
-    );
+    const uint32_t replay_closed_exclusive =
+        static_cast<uint32_t>(stats.result.submits);
+    const uint32_t worker_id =
+        static_cast<uint32_t>(worker.core_idx);
+    if (CrossCoreExecHasLocalProgressWork(
+            state, worker_id, role,
+            replay_closed_exclusive, stats
+        )) {
+        (void)ProgressCrossCoreExec<Ops>(
+            state, worker, replay_closed_exclusive,
+            /*production_closed=*/false,
+            DrainPlace::EfDrain, stats
+        );
+    }
 #else
     DrainReady<Ops>(state, worker, DrainPlace::EfDrain, stats);
 #endif

@@ -573,6 +573,62 @@ void TestPotentialSlotRoundTrip() {
     std::printf("[PASS] %s\n", kTest);
 }
 
+void TestOpportunisticProgressLocalGate() {
+    constexpr const char *kTest =
+        "opportunistic-progress-local-gate";
+    MappedSchedulerState mapping;
+    SchedulerState *state = mapping.Get();
+    Check(state != nullptr, kTest, "state mapping");
+    if (state == nullptr) return;
+
+    constexpr uint32_t kWorker = 0;
+    constexpr CoreRole kRole = CoreRole::Aic;
+    WorkerState &worker = PrepareWorker(*state, kWorker, kRole);
+    LocalStats stats{};
+    InitLocalStats(stats, kWorker, kRole);
+
+    // worker0 的首个潜在槽是 task0。前缀尚未 Close 时无事可做；
+    // Close task0 后即使它是 Alloc、没有登记 candidate bit，也必须进入
+    // scanner 把这个已知非候选槽永久越过。
+    bool all_ok = !CrossCoreExecHasLocalProgressWork(
+        state, kWorker, kRole, /*replay_closed_exclusive=*/0, stats
+    );
+    all_ok &= CloseSyntheticSubmit(
+        *state, stats, /*task_id=*/0, TaskKind::Alloc
+    );
+    all_ok &= CrossCoreExecHasLocalProgressWork(
+        state, kWorker, kRole, /*replay_closed_exclusive=*/1, stats
+    );
+    const uint32_t progressed =
+        ProgressCrossCoreExec<ExecScanTestOps>(
+            state, worker, /*replay_closed_exclusive=*/1,
+            /*production_closed=*/false,
+            DrainPlace::EfDrain, stats
+        );
+    all_ok &= progressed == 0 && stats.exec_candidate_slot == 1 &&
+        !CrossCoreExecHasLocalProgressWork(
+            state, kWorker, kRole,
+            /*replay_closed_exclusive=*/1, stats
+        );
+
+    // token 活跃时，即使下一个候选尚未进入已 Close 前缀也不得跳过。
+    state->exec_tokens[kWorker].control.phase =
+        ExecTokenPhase::WaitingFanin;
+    all_ok &= CrossCoreExecHasLocalProgressWork(
+        state, kWorker, kRole, /*replay_closed_exclusive=*/1, stats
+    );
+
+    // 非法输入必须返回 true，交给完整协议保存精确错误证据。
+    all_ok &= CrossCoreExecHasLocalProgressWork(
+        state, kWorkers, kRole, /*replay_closed_exclusive=*/1, stats
+    );
+    Check(
+        all_ok, kTest,
+        "gate skips only an Idle executor with no closed candidate"
+    );
+    std::printf("[PASS] %s\n", kTest);
+}
+
 void TestDynamicExecutorEligibility() {
     constexpr const char *kTest = "dynamic-executor-eligibility";
     bool all_ok = true;
@@ -2290,6 +2346,7 @@ void TestFinalDrainClosesLastTask() {
 
 int main() {
     TestPotentialSlotRoundTrip();
+    TestOpportunisticProgressLocalGate();
     TestDynamicExecutorEligibility();
     TestSubmitCloseRegistersOnlyCandidates();
     TestCloseAndRegistrationRejectHistoryRewrite();
