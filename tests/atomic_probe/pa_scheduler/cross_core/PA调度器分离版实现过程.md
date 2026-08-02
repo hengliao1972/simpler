@@ -19,8 +19,8 @@
 | S1 | CPU 确定性交错测试闭合协议正确性 | 已完成 |
 | S2 | CCEC 最小 A5 跨核发布/领取探针 | 已完成 |
 | S3 | standalone PA 接入构建/执行分离 | 已完成：S3a 与固定两候选异核 S3b 均已闭合，S3b 通过 CPU、A5 B1/B256 和 B256 full-swimlane |
-| S4 | 受控的动态 Execute election | K2 首版已实现，完整 CPU build、B1 与 B256 均通过；A5 尚未运行 |
-| S5 | 独立扩大 Build owner 候选核拓扑 | 未开始 |
+| S4 | 受控的动态 Execute election | K2 首版已通过完整 CPU、CCEC 和 A5 B1/B256 门槛 |
+| S5 | 独立扩大 Build owner 候选核拓扑 | S5a 跨角色 Build 已通过完整 CPU、B1/B256；CCEC/A5 尚未运行，S5b 全 96 Scalar 尚未开始 |
 | S6 | 引入 engine/Scalar overlap | 未开始 |
 | S7 | 基于累积证据做性能评估与容量/复用优化 | 未开始 |
 | 贯穿观测门槛（不编号） | 泳道、submit-PMU 与 perf-clock 三条互不混算的证据链 | perf-clock 与 full-swimlane 已可用；cross-core submit-PMU 尚未接入 |
@@ -727,3 +727,58 @@ B1 连续运行仍能观察到数十毫秒至数十秒的偶发长尾，但对�
 与 S3b full-swimlane 的 `27.128 ms` 单样本相比，本轮 S4 为
 `27.476 ms`，约 `+1.28%`。两者都是观测 ELF 的单轮样本，且上述长尾
 已证实存在，因此只记录数值，不据此宣称稳定性能回退或收益。
+
+## 2026-08-02：S5a 跨角色 Build 的 CPU 门槛
+
+### 为什么先做角色反转
+
+直接把所有 kernel 的 Build 候选扩成 96 核，会同时引入 portable Build
+可移植性和约 60.5% 的额外物理 Claim CAS，若失败或回退将无法归因。
+因此 S5a 先保持三档候选人口不变，只交换 kernel Build 角色：
+
+| task | Build 候选 | Execute 候选 |
+| ---- | ---------- | ------------ |
+| Alloc | 96 Scalar / G8 | 无 kernel |
+| QK、PV | 64 AIV / G8 | AIC K2 |
+| SF、UP | 32 AIC / G6 | AIV K2 |
+
+B256 的 local/root/总物理 Claim CAS 仍为
+`73,728 / 9,216 / 82,944`。每个 kernel 的 Build owner 必然位于目标
+engine 对侧，因此不会占用 K2 的任何一席；primary、secondary 都能参与
+`BUILT -> CLAIMED(self)`，S4 的动态 exactly-once 状态机不需要改成唯一
+指定 executor。
+
+### 实现与独立校验
+
+- `Claim()` 只在 shared 分支交换 QK/PV、SF/UP 的候选角色和
+  Tournament 分组；private 分支保持原有 engine 同角色 cursor 语义。
+- 新增 `PaCrossRoleBuildOwnerEligible()` 作为生产拓扑策略。portable
+  `PaExecuteOwnerEligible()` 仍只要求 builder 有效、executor 匹配 engine、
+  位于 K2 且不同于 builder，不把阶段性 Build 策略写死进通用 payload
+  协议。
+- Build 发布入口、执行扫描、active token 和 terminal cell 都显式校验
+  对侧 Build 角色；payload、DCCI 发布/失效顺序、TensorMap
+  `deps_prepared` 严格插入链没有改动。
+- host 独立实现同一数学合同，不调用设备 helper：分别核对 AIC/AIV Claim
+  尝试数、对侧 Build owner、目标 engine K2 Execute owner，以及 fanin
+  payload 发布角色与 ready-load 执行角色，避免总量对称时掩盖角色接反。
+- 稀疏泳道的 Claim attempted/winner 合法性同步采用新的 Build 角色；
+  execution kernel 轨道仍按 Execute owner 的 AIC/AIV 角色呈现。
+
+### CPU 证据
+
+- 完整 `CXX=/usr/bin/g++ ./run.sh build cpu` 通过全部公共和隔离门槛，
+  包括 Claim Tournament、稀疏/紧凑 trace、PA adapter、K2 scanner、
+  96-worker ordered Submit 和 FinalDrain。
+- Claim 门槛精确覆盖 Alloc 96/G8、QK/PV 64 AIV/G8、SF/UP 32 AIC/G6，
+  保留 exact-one、replay 全输、loser 零 TensorMap 访问和严格插入链。
+- CPU B1 real-compute 为 5 task/4 kernel，B256 real-compute 为
+  1280 task/1024 kernel；两者 semantic/postprocess 全部 PASS。
+- B1/B256 均逐 task 验证 Build owner 在目标 engine 对侧，Execute owner
+  匹配 engine、属于 host 独立 K2 且不同于 Build owner；payload、vend、
+  completion、token、fanin、shared heap、TensorMap 和计算结果全部闭合。
+
+CPU 耗时只受 pthread 与 CPU real-compute 影响，不解释为 A5 性能。
+本阶段此时 **尚未运行 CCEC/A5**，不能用 CPU cache coherence 替代 A5
+Scalar 无 coherence 下的 DCCI/atomic 动态证据。下一步先做 CCEC 编译和
+A5 B1/B256，再以独立提交进入 S5b 全 96 Scalar Build。

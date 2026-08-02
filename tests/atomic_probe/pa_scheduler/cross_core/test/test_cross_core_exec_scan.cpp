@@ -34,6 +34,9 @@ using namespace pa_scheduler::cross_core;
 
 int g_failures = 0;
 
+constexpr uint32_t kAicBuildOwner = 3;
+constexpr uint32_t kAivBuildOwner = 34;
+
 void Check(bool condition, const char *test, const char *message) {
     if (condition) {
         return;
@@ -436,10 +439,12 @@ bool SelectTestExecutor(
         return false;
     }
     // 只为需要一个确定 executor 的状态机构造选择合法候选；这不是
-    // 生产 owner 策略。build 在候选外时优先 primary，在候选内时选择
-    // 另一个候选，最终仍由生产 eligibility helper 验证。
+    // 生产 owner 仲裁策略。cross-role builder 与 engine 异类，
+    // 因此不会占用 K2 候选，测试默认选 primary。
     execute_owner = build_owner == primary ? secondary : primary;
-    return PaExecOwnerMatchesEngine(build_owner, route.engine_class) &&
+    return PaCrossRoleBuildOwnerEligible(
+               build_owner, route.engine_class
+           ) &&
            PaExecuteOwnerEligible(
                task_id, build_owner, route.engine_class, execute_owner
            );
@@ -584,9 +589,13 @@ void TestDynamicExecutorEligibility() {
         uint32_t primary = kExecUnboundOwner;
         uint32_t secondary = kExecUnboundOwner;
         uint32_t outside = kExecUnboundOwner;
-        all_ok &= ResolvePaExecRoute(
-                      kind, FunctionId(kind), route
-                  ) &&
+        const bool route_ok = ResolvePaExecRoute(
+            kind, FunctionId(kind), route
+        );
+        const uint32_t build_owner =
+            route.engine_class == ExecEngineClass::Aic
+                ? kAivBuildOwner : kAicBuildOwner;
+        all_ok &= route_ok &&
             FixedPaExecuteCandidates(
                 task_id, route.engine_class, primary, secondary
             ) &&
@@ -597,39 +606,31 @@ void TestDynamicExecutorEligibility() {
             continue;
         }
 
-        // Build owner 是 primary/secondary 时，只剩另一个候选合法；
-        // Build owner 在双候选外时，两个候选都可参加动态 CAS。
-        all_ok &= PaExecOwnerMatchesEngine(
-                      primary, route.engine_class
+        // cross-role builder 固定在 engine 对侧，不会占用 K2；
+        // 两个同 engine 候选均可竞争，第三个同角色核仍非法。
+        all_ok &= PaCrossRoleBuildOwnerEligible(
+                      build_owner, route.engine_class
                   ) &&
+            PaExecOwnerMatchesEngine(primary, route.engine_class) &&
             PaExecOwnerMatchesEngine(secondary, route.engine_class) &&
             PaExecOwnerMatchesEngine(outside, route.engine_class) &&
-            !PaExecuteOwnerEligible(
-                task_id, primary, route.engine_class, primary
+            PaExecuteOwnerEligible(
+                task_id, build_owner, route.engine_class, primary
             ) &&
             PaExecuteOwnerEligible(
-                task_id, primary, route.engine_class, secondary
-            ) &&
-            PaExecuteOwnerEligible(
-                task_id, secondary, route.engine_class, primary
+                task_id, build_owner, route.engine_class, secondary
             ) &&
             !PaExecuteOwnerEligible(
-                task_id, secondary, route.engine_class, secondary
+                task_id, build_owner, route.engine_class, outside
             ) &&
-            PaExecuteOwnerEligible(
-                task_id, outside, route.engine_class, primary
-            ) &&
-            PaExecuteOwnerEligible(
-                task_id, outside, route.engine_class, secondary
-            ) &&
-            !PaExecuteOwnerEligible(
-                task_id, outside, route.engine_class, outside
+            !PaCrossRoleBuildOwnerEligible(
+                primary, route.engine_class
             );
     }
 
     Check(
         all_ok, kTest,
-        "build placement yields the exact one-or-two executor set"
+        "opposite-role builder leaves exactly both K2 executors eligible"
     );
     std::printf("[PASS] %s\n", kTest);
 }
@@ -812,7 +813,7 @@ void TestOnlyTwoCandidatesObserveControl() {
         const bool aic_task = kKernelKinds[kind_index] == TaskKind::Qk ||
             kKernelKinds[kind_index] == TaskKind::Pv;
         const uint32_t build_owner =
-            aic_task ? task_id : kAicWorkers + task_id;
+            aic_task ? kAivBuildOwner : kAicBuildOwner;
         all_workers_ok &= SelectTestExecutor(
             task_id, kKernelKinds[kind_index], build_owner,
             primary, secondary, execute_owner
@@ -869,166 +870,84 @@ void TestOnlyTwoCandidatesObserveControl() {
     std::printf("[PASS] %s\n", kTest);
 }
 
-void TestBuildOwnerCandidateExclusion() {
-    constexpr const char *kTest = "build-owner-candidate-exclusion";
-    constexpr uint32_t kTask = 1;
-    constexpr TaskKind kKind = TaskKind::Qk;
-    PaExecRoute route{};
-    uint32_t primary = kExecUnboundOwner;
-    uint32_t secondary = kExecUnboundOwner;
-    uint32_t outside = kExecUnboundOwner;
-    bool all_ok = ResolvePaExecRoute(
-                      kKind, FunctionId(kKind), route
-                  ) &&
-        FixedPaExecuteCandidates(
-            kTask, route.engine_class, primary, secondary
-        ) &&
-        FindSameEngineNonCandidate(
-            route.engine_class, primary, secondary, outside
+void TestCrossRoleBuildingKeepsBothCandidates() {
+    constexpr const char *kTest =
+        "cross-role-building-keeps-both-candidates";
+    constexpr std::array<std::pair<uint32_t, TaskKind>, 2> kCases{{
+        {1, TaskKind::Qk}, {2, TaskKind::Sf}
+    }};
+    bool all_ok = true;
+
+    for (const auto &test_case : kCases) {
+        const uint32_t task_id = test_case.first;
+        const TaskKind kind = test_case.second;
+        PaExecRoute route{};
+        uint32_t primary = kExecUnboundOwner;
+        uint32_t secondary = kExecUnboundOwner;
+        const bool route_ok = ResolvePaExecRoute(
+            kind, FunctionId(kind), route
+        );
+        const uint32_t build_owner =
+            route.engine_class == ExecEngineClass::Aic
+                ? kAivBuildOwner : kAicBuildOwner;
+        all_ok &= route_ok &&
+            PaCrossRoleBuildOwnerEligible(
+                build_owner, route.engine_class
+            ) &&
+            FixedPaExecuteCandidates(
+                task_id, route.engine_class, primary, secondary
+            );
+
+        MappedSchedulerState mapping;
+        SchedulerState *state = mapping.Get();
+        all_ok &= state != nullptr;
+        if (state == nullptr) {
+            continue;
+        }
+        SetCellState(
+            *state, task_id, ExecPhase::Building,
+            build_owner, kExecUnboundOwner,
+            ExecEngineClass::None, 0
         );
 
-    for (uint32_t build_owner :
-         std::array<uint32_t, 2>{primary, secondary}) {
-        for (ExecPhase phase :
-             std::array<ExecPhase, 2>{
-                 ExecPhase::Building, ExecPhase::Built
-             }) {
-            MappedSchedulerState mapping;
-            SchedulerState *state = mapping.Get();
-            all_ok &= state != nullptr;
-            if (state == nullptr) {
-                continue;
-            }
-            if (phase == ExecPhase::Built) {
-                all_ok &= PublishKernelCell(
-                    *state, kTask, build_owner, kKind
-                );
-            } else {
-                SetCellState(
-                    *state, kTask, ExecPhase::Building,
-                    build_owner, kExecUnboundOwner,
-                    ExecEngineClass::None, 0
-                );
-            }
-
-            WorkerState &builder = PrepareWorker(
-                *state, build_owner, RoleForWorker(build_owner)
+        // opposite-role builder 不占用 K2 的任意一席。在 BUILT
+        // 发布前，两个执行候选都只观察一次控制字并保留 bit。
+        for (uint32_t candidate :
+             std::array<uint32_t, 2>{primary, secondary}) {
+            WorkerState &worker = PrepareWorker(
+                *state, candidate, RoleForWorker(candidate)
             );
-            LocalStats builder_stats{};
+            LocalStats stats{};
             InitLocalStats(
-                builder_stats, build_owner,
-                RoleForWorker(build_owner)
+                stats, candidate, RoleForWorker(candidate)
             );
             all_ok &= RegisterLocalCandidate(
-                builder_stats, kTask, kKind
+                stats, task_id, kind
             );
             ExecScanTestOps::ResetObservations();
             ExecScanTestOps::WatchControl(
-                &state->exec_cells[kTask].control.state
+                &state->exec_cells[task_id].control.state
             );
-            const uint32_t builder_progress =
+            const uint32_t progressed =
                 ProgressCrossCoreExec<ExecScanTestOps>(
-                    state, builder, kTask + 1U,
+                    state, worker, task_id + 1U,
                     /*production_closed=*/false,
-                    DrainPlace::EfDrain, builder_stats
+                    DrainPlace::EfDrain, stats
                 );
-            all_ok &= builder_progress == 0 &&
-                !CandidateBitForTask(
-                    builder_stats, build_owner,
-                    RoleForWorker(build_owner), kTask
+            all_ok &= progressed == 0 &&
+                CandidateBitForTask(
+                    stats, candidate,
+                    RoleForWorker(candidate), task_id
                 ) &&
                 ExecScanTestOps::watched_control_loads == 1 &&
                 ExecScanTestOps::watched_control_cas_calls == 0 &&
                 ExecScanTestOps::execute_calls == 0 && NoFatal(*state);
-
-            const uint32_t other =
-                build_owner == primary ? secondary : primary;
-            WorkerState &other_worker = PrepareWorker(
-                *state, other, RoleForWorker(other)
-            );
-            LocalStats other_stats{};
-            InitLocalStats(
-                other_stats, other, RoleForWorker(other)
-            );
-            all_ok &= RegisterLocalCandidate(
-                other_stats, kTask, kKind
-            );
-            ExecScanTestOps::ResetObservations();
-            const uint32_t other_progress =
-                ProgressCrossCoreExec<ExecScanTestOps>(
-                    state, other_worker, kTask + 1U,
-                    /*production_closed=*/false,
-                    DrainPlace::EfDrain, other_stats
-                );
-            if (phase == ExecPhase::Building) {
-                all_ok &= other_progress == 0 &&
-                    CandidateBitForTask(
-                        other_stats, other,
-                        RoleForWorker(other), kTask
-                    ) &&
-                    ExecScanTestOps::execute_calls == 0;
-            } else {
-                const DecodedExecState done = DecodeExecState(
-                    state->exec_cells[kTask].control.state
-                );
-                all_ok &= other_progress == 1 &&
-                    !CandidateBitForTask(
-                        other_stats, other,
-                        RoleForWorker(other), kTask
-                    ) &&
-                    ExecScanTestOps::execute_calls == 1 &&
-                    done.valid && done.phase == ExecPhase::Done &&
-                    done.build_owner == build_owner &&
-                    done.execute_owner == other;
-            }
-            all_ok &= NoFatal(*state);
-        }
-    }
-
-    // Build owner 不在执行双候选内时，BUILDING 尚未产生可领取包；两个
-    // 候选都必须保留各自 bit，不能提前替对方决定最终 winner。
-    {
-        MappedSchedulerState mapping;
-        SchedulerState *state = mapping.Get();
-        all_ok &= state != nullptr;
-        if (state != nullptr) {
-            SetCellState(
-                *state, kTask, ExecPhase::Building,
-                outside, kExecUnboundOwner,
-                ExecEngineClass::None, 0
-            );
-            for (uint32_t candidate :
-                 std::array<uint32_t, 2>{primary, secondary}) {
-                WorkerState &worker = PrepareWorker(
-                    *state, candidate, RoleForWorker(candidate)
-                );
-                LocalStats stats{};
-                InitLocalStats(
-                    stats, candidate, RoleForWorker(candidate)
-                );
-                all_ok &= RegisterLocalCandidate(
-                    stats, kTask, kKind
-                );
-                ExecScanTestOps::ResetObservations();
-                const uint32_t progressed =
-                    ProgressCrossCoreExec<ExecScanTestOps>(
-                        state, worker, kTask + 1U,
-                        /*production_closed=*/false,
-                        DrainPlace::EfDrain, stats
-                    );
-                all_ok &= progressed == 0 &&
-                    CandidateBitForTask(
-                        stats, candidate,
-                        RoleForWorker(candidate), kTask
-                    ) &&
-                    ExecScanTestOps::execute_calls == 0 && NoFatal(*state);
-            }
         }
     }
 
     Check(
         all_ok, kTest,
-        "builder candidate skips; every remaining eligible observer stays live"
+        "opposite-role BUILDING preserves both K2 observers"
     );
     std::printf("[PASS] %s\n", kTest);
 }
@@ -1041,15 +960,15 @@ void RunDynamicCandidateFirstCase(
     PaExecRoute route{};
     uint32_t primary = kExecUnboundOwner;
     uint32_t secondary = kExecUnboundOwner;
-    uint32_t build_owner = kExecUnboundOwner;
+    constexpr uint32_t build_owner = kAivBuildOwner;
     bool all_ok = ResolvePaExecRoute(
                       kKind, FunctionId(kKind), route
                   ) &&
         FixedPaExecuteCandidates(
             kTask, route.engine_class, primary, secondary
         ) &&
-        FindSameEngineNonCandidate(
-            route.engine_class, primary, secondary, build_owner
+        PaCrossRoleBuildOwnerEligible(
+            build_owner, route.engine_class
         );
     MappedSchedulerState mapping;
     SchedulerState *state = mapping.Get();
@@ -1127,8 +1046,9 @@ void TestMappedEmptyDelayedPublication() {
     uint32_t target = 0;
     Check(
         SelectTestExecutor(
-            1, TaskKind::Qk, 1, primary, secondary, target
-        ) && target == secondary,
+            1, TaskKind::Qk, kAivBuildOwner,
+            primary, secondary, target
+        ) && target == primary,
         kTest, "resolve delayed QK target"
     );
     WorkerState &worker = PrepareWorker(
@@ -1156,7 +1076,9 @@ void TestMappedEmptyDelayedPublication() {
     );
 
     Check(
-        PublishKernelCell(*state, 1, 1, TaskKind::Qk),
+        PublishKernelCell(
+            *state, 1, kAivBuildOwner, TaskKind::Qk
+        ),
         kTest, "builder publishes delayed QK"
     );
     const uint32_t built_progress =
@@ -1174,7 +1096,8 @@ void TestMappedEmptyDelayedPublication() {
             ) &&
             ExecScanTestOps::execute_calls == 1 &&
             done.valid && done.phase == ExecPhase::Done &&
-            done.build_owner == 1 && done.execute_owner == target &&
+            done.build_owner == kAivBuildOwner &&
+            done.execute_owner == target &&
             state->tasks[1].flag == 1 &&
             CrossCoreExecWorkerDrained(
                 state, worker, 2, stats
@@ -1197,21 +1120,21 @@ void TestMappedBuildingDelayedPublication() {
     uint32_t target = 0;
     Check(
         SelectTestExecutor(
-            2, TaskKind::Sf, 34,
+            2, TaskKind::Sf, kAicBuildOwner,
             primary, secondary, target
-        ) && target == secondary,
+        ) && target == primary,
         kTest, "resolve delayed SF target"
     );
     Check(
         PublishKernelCell(
-            *state, 2, 34, TaskKind::Sf, {1}
+            *state, 2, kAicBuildOwner, TaskKind::Sf, {1}
         ),
         kTest, "prepare delayed SF payload"
     );
     const int64_t built_state =
         state->exec_cells[2].control.state;
     SetCellState(
-        *state, 2, ExecPhase::Building, 34,
+        *state, 2, ExecPhase::Building, kAicBuildOwner,
         kExecUnboundOwner, ExecEngineClass::None, 0
     );
 
@@ -1245,11 +1168,11 @@ void TestMappedBuildingDelayedPublication() {
     );
 
     WorkerState &other_worker = PrepareWorker(
-        *state, primary, RoleForWorker(primary)
+        *state, secondary, RoleForWorker(secondary)
     );
     LocalStats other_stats{};
     InitLocalStats(
-        other_stats, primary, RoleForWorker(primary)
+        other_stats, secondary, RoleForWorker(secondary)
     );
     Check(
         RegisterLocalCandidate(
@@ -1265,11 +1188,11 @@ void TestMappedBuildingDelayedPublication() {
         );
     Check(
         skipped == 0 &&
-            !CandidateBitForTask(
-                other_stats, primary, RoleForWorker(primary), 2
+            CandidateBitForTask(
+                other_stats, secondary, RoleForWorker(secondary), 2
             ) &&
             NoFatal(*state),
-        kTest, "other candidate skips known-target BUILDING"
+        kTest, "both candidates retain BUILDING before publication"
     );
 
     state->exec_cells[2].control.state = built_state;
@@ -1279,17 +1202,26 @@ void TestMappedBuildingDelayedPublication() {
             /*production_closed=*/false,
             DrainPlace::EfDrain, target_stats
         );
+    const uint32_t terminal_observed =
+        ProgressCrossCoreExec<ExecScanTestOps>(
+            state, other_worker, 3,
+            /*production_closed=*/false,
+            DrainPlace::EfDrain, other_stats
+        );
     const DecodedExecState done = DecodeExecState(
         state->exec_cells[2].control.state
     );
     Check(
-        published == 1 &&
+        published == 1 && terminal_observed == 0 &&
             !CandidateBitForTask(
                 target_stats, target, RoleForWorker(target), 2
             ) &&
+            !CandidateBitForTask(
+                other_stats, secondary, RoleForWorker(secondary), 2
+            ) &&
             ExecScanTestOps::execute_calls == 1 &&
             done.valid && done.phase == ExecPhase::Done &&
-            done.build_owner == 34 &&
+            done.build_owner == kAicBuildOwner &&
             done.execute_owner == target && NoFatal(*state),
         kTest, "target observes later BUILT without losing the task"
     );
@@ -1308,7 +1240,7 @@ void RunOtherCandidateTerminalStateCase(
     uint32_t selected = 0;
     Check(
         SelectTestExecutor(
-            1, TaskKind::Qk, 3,
+            1, TaskKind::Qk, kAivBuildOwner,
             primary, secondary, selected
         ) && selected == primary,
         test, "resolve QK candidates"
@@ -1316,7 +1248,7 @@ void RunOtherCandidateTerminalStateCase(
     const uint32_t winner = primary_won ? primary : secondary;
     const uint32_t observer = primary_won ? secondary : primary;
     SetCellState(
-        *state, 1, phase, /*build_owner=*/3, winner,
+        *state, 1, phase, kAivBuildOwner, winner,
         ExecEngineClass::Aic, /*payload_lines=*/1
     );
     WorkerState &worker = PrepareWorker(
@@ -1375,10 +1307,12 @@ void TestDeterministicClaimLossIsNormal() {
     Check(state != nullptr, kTest, "state mapping");
     if (state == nullptr) return;
     bool all_ok = SelectTestExecutor(
-                      kTask, TaskKind::Qk, 3,
+                      kTask, TaskKind::Qk, kAivBuildOwner,
                       primary, secondary, selected
                   ) && selected == primary &&
-        PublishKernelCell(*state, kTask, 3, TaskKind::Qk);
+        PublishKernelCell(
+            *state, kTask, kAivBuildOwner, TaskKind::Qk
+        );
     const DecodedExecState built = DecodeExecState(
         state->exec_cells[kTask].control.state
     );
@@ -1395,7 +1329,7 @@ void TestDeterministicClaimLossIsNormal() {
     ExecScanTestOps::InjectClaimLoss(
         &state->exec_cells[kTask].control.state,
         static_cast<int64_t>(EncodeExecState(
-            ExecPhase::Claimed, 3, secondary,
+            ExecPhase::Claimed, kAivBuildOwner, secondary,
             ExecEngineClass::Aic, built.payload_lines, kTask
         ))
     );
@@ -1596,12 +1530,12 @@ void TestExistingGlobalFatalDoesNotFabricateExecFatal() {
     if (state == nullptr) return;
 
     constexpr uint32_t kTask = 1;
-    constexpr uint32_t kBuilder = 1;
+    constexpr uint32_t kBuilder = kAivBuildOwner;
     WorkerState &worker = PrepareWorker(
-        *state, kBuilder, CoreRole::Aic
+        *state, kBuilder, CoreRole::Aiv
     );
     LocalStats stats{};
-    InitLocalStats(stats, kBuilder, CoreRole::Aic);
+    InitLocalStats(stats, kBuilder, CoreRole::Aiv);
     TaskArgs args{};
     SubmitContext context{};
     __atomic_store_n(
@@ -1648,7 +1582,7 @@ void TestGlobalFatalFaultsActiveTokens() {
         all_cases_ok &= state != nullptr;
         if (state != nullptr) {
             constexpr uint32_t kTask = 2;
-            constexpr uint32_t kBuilder = 34;
+            constexpr uint32_t kBuilder = kAicBuildOwner;
             uint32_t primary = 0;
             uint32_t secondary = 0;
             uint32_t executor = 0;
@@ -1708,7 +1642,7 @@ void TestGlobalFatalFaultsActiveTokens() {
         all_cases_ok &= state != nullptr;
         if (state != nullptr) {
             constexpr uint32_t kTask = 1;
-            constexpr uint32_t kBuilder = 1;
+            constexpr uint32_t kBuilder = kAivBuildOwner;
             uint32_t primary = 0;
             uint32_t secondary = 0;
             uint32_t executor = 0;
@@ -1790,7 +1724,7 @@ void TestGlobalFatalStopsIrreversibleBoundaries() {
         all_cases_ok &= state != nullptr;
         if (state != nullptr) {
             constexpr uint32_t kTask = 1;
-            constexpr uint32_t kBuilder = 1;
+            constexpr uint32_t kBuilder = kAivBuildOwner;
             uint32_t primary = 0;
             uint32_t secondary = 0;
             uint32_t executor = 0;
@@ -1848,7 +1782,7 @@ void TestGlobalFatalStopsIrreversibleBoundaries() {
         all_cases_ok &= state != nullptr;
         if (state != nullptr) {
             constexpr uint32_t kTask = 2;
-            constexpr uint32_t kBuilder = 34;
+            constexpr uint32_t kBuilder = kAicBuildOwner;
             uint32_t primary = 0;
             uint32_t secondary = 0;
             uint32_t executor = 0;
@@ -1907,7 +1841,7 @@ void TestGlobalFatalStopsIrreversibleBoundaries() {
         all_cases_ok &= state != nullptr;
         if (state != nullptr) {
             constexpr uint32_t kTask = 1;
-            constexpr uint32_t kBuilder = 1;
+            constexpr uint32_t kBuilder = kAivBuildOwner;
             uint32_t primary = 0;
             uint32_t secondary = 0;
             uint32_t executor = 0;
@@ -1972,13 +1906,13 @@ void TestBusyTokenResumesScanning() {
     state->tasks[0].flag = 1;
     Check(
         PublishKernelCell(
-            *state, 2, 34, TaskKind::Sf, {1}
+            *state, 2, kAicBuildOwner, TaskKind::Sf, {1}
         ) &&
             SetTerminalKernelCell(
-                *state, 3, TaskKind::Pv, 3
+                *state, 3, TaskKind::Pv, kAivBuildOwner
             ) &&
             PublishKernelCell(
-                *state, 4, 40, TaskKind::Up, {2, 3, 0}
+                *state, 4, kAicBuildOwner, TaskKind::Up, {2, 3, 0}
             ),
         kTest, "publish blocked SF and later UP"
     );
@@ -2067,14 +2001,14 @@ void TestBusyCandidateDoesNotBlockPeerClaim() {
     Check(state != nullptr, kTest, "state mapping");
     if (state == nullptr) return;
     bool all_ok = SelectTestExecutor(
-                      kNewTask, TaskKind::Qk, 5,
+                      kNewTask, TaskKind::Qk, kAivBuildOwner,
                       primary, secondary, selected
                   ) && selected == primary &&
         PublishKernelCell(
-            *state, kBusyTask, 5, TaskKind::Pv, {1}
+            *state, kBusyTask, kAivBuildOwner, TaskKind::Pv, {1}
         ) &&
         PublishKernelCell(
-            *state, kNewTask, 5, TaskKind::Qk
+            *state, kNewTask, kAivBuildOwner, TaskKind::Qk
         );
     WorkerState &busy_worker = PrepareWorker(
         *state, primary, CoreRole::Aic
@@ -2156,19 +2090,19 @@ void TestFinalDrainClosesLastTask() {
     state->tasks[0].flag = 1;
     Check(
         SetTerminalKernelCell(
-            *state, 1, TaskKind::Qk, 3,
+            *state, 1, TaskKind::Qk, kAivBuildOwner,
             /*requested_execute_owner=*/2
         ) &&
             SetTerminalKernelCell(
-                *state, 2, TaskKind::Sf, 38,
+                *state, 2, TaskKind::Sf, kAicBuildOwner,
                 /*requested_execute_owner=*/34
             ) &&
             SetTerminalKernelCell(
-                *state, 3, TaskKind::Pv, 5,
+                *state, 3, TaskKind::Pv, kAivBuildOwner,
                 /*requested_execute_owner=*/4
             ) &&
             PublishKernelCell(
-                *state, 4, 40, TaskKind::Up, {2, 3, 0}
+                *state, 4, kAicBuildOwner, TaskKind::Up, {2, 3, 0}
             ),
         kTest, "prepare terminal prefix with either dynamic candidate"
     );
@@ -2285,7 +2219,7 @@ int main() {
     TestSubmitCloseRegistersOnlyCandidates();
     TestCloseAndRegistrationRejectHistoryRewrite();
     TestOnlyTwoCandidatesObserveControl();
-    TestBuildOwnerCandidateExclusion();
+    TestCrossRoleBuildingKeepsBothCandidates();
     TestEitherCandidateMayWin();
     TestMappedEmptyDelayedPublication();
     TestMappedBuildingDelayedPublication();

@@ -168,10 +168,10 @@ uint32_t ExpectedCandidates(TaskKind kind) {
             return kSharedAllocClaimParticipants;
         case TaskKind::Qk:
         case TaskKind::Pv:
-            return kAicWorkers;
+            return kAivWorkers;
         case TaskKind::Sf:
         case TaskKind::Up:
-            return kAivWorkers;
+            return kAicWorkers;
         case TaskKind::Count:
             return 0;
     }
@@ -184,10 +184,10 @@ uint32_t ExpectedGroups(TaskKind kind) {
             return kSharedAllocClaimTournamentGroups;
         case TaskKind::Qk:
         case TaskKind::Pv:
-            return kSharedAicClaimTournamentGroups;
+            return kSharedAivClaimTournamentGroups;
         case TaskKind::Sf:
         case TaskKind::Up:
-            return kSharedAivClaimTournamentGroups;
+            return kSharedAicClaimTournamentGroups;
         case TaskKind::Count:
             return 0;
     }
@@ -202,9 +202,11 @@ bool IsCandidate(
         return worker_id < kWorkers;
     }
     const bool is_aic = worker_id < kAicWorkers;
+    // S5a 只反转 Build 候选角色：AIC kernel 由 AIV Scalar Build，
+    // AIV kernel 由 AIC Scalar Build；Execute engine 合同不变。
     return kind == TaskKind::Qk || kind == TaskKind::Pv
-        ? is_aic
-        : !is_aic;
+        ? !is_aic
+        : is_aic;
 }
 
 uint32_t CandidateRank(
@@ -214,8 +216,14 @@ uint32_t CandidateRank(
         return worker_id;
     }
     return kind == TaskKind::Qk || kind == TaskKind::Pv
-        ? worker_id
-        : worker_id - kAicWorkers;
+        ? worker_id - kAicWorkers
+        : worker_id;
+}
+
+CoreRole ExpectedBuildRole(TaskKind kind) {
+    return kind == TaskKind::Qk || kind == TaskKind::Pv
+        ? CoreRole::Aiv
+        : CoreRole::Aic;
 }
 
 void ResetTournamentTask(
@@ -303,6 +311,7 @@ bool RunConcurrentClaim(
     uint32_t winners = 0;
     uint32_t root_attempts = 0;
     uint32_t physical_cas = 0;
+    uint32_t winner_worker = kWorkers;
     bool exact = true;
     for (uint32_t worker_id = 0;
          worker_id < kWorkers; ++worker_id) {
@@ -330,6 +339,7 @@ bool RunConcurrentClaim(
                 &tournament.root.owner.value;
         }
         if (entry.outcome.won) {
+            winner_worker = worker_id;
             exact &= kind == TaskKind::Alloc
                 ? entry.outcome.function_id == -1
                 : entry.outcome.function_id == FunctionId(kind);
@@ -342,11 +352,17 @@ bool RunConcurrentClaim(
         expect_winner ? groups : 0;
     const uint32_t expected_physical_cas =
         ExpectedCandidates(kind) + expected_root_attempts;
+    const bool winner_role_ok =
+        !expect_winner || kind == TaskKind::Alloc ||
+        (winner_worker < kWorkers &&
+         state.workers[winner_worker].role ==
+             ExpectedBuildRole(kind));
     return exact &&
         attempts == ExpectedCandidates(kind) &&
         winners == (expect_winner ? 1U : 0U) &&
         root_attempts == expected_root_attempts &&
         physical_cas == expected_physical_cas &&
+        winner_role_ok &&
         TournamentStateMatches(state, task_id, kind) &&
         state.tasks[task_id].deps_prepared == -1 &&
         state.fatal.value == 0;
@@ -380,9 +396,112 @@ void TestAllTaskKindsAndReplay() {
 
     Check(
         exact,
-        "all task kinds preserve 96/32/64 candidates, exact-one "
-        "owner, immediate replay losers, untouched deps_prepared, "
-        "and untouched legacy cursors"
+        "all task kinds preserve 96/64/32 candidates, G8/G8/G6, "
+        "cross-role exact-one Build owner, immediate replay losers, "
+        "untouched deps_prepared, and untouched legacy cursors"
+    );
+    (void)munmap(state, sizeof(*state));
+}
+
+bool RunDeterministicCrossRoleClaim(
+    SchedulerState &state, uint32_t task_id, TaskKind kind
+) {
+    ResetTournamentTask(state, task_id);
+    state.fatal.value = 0;
+    for (uint32_t worker_id = 0;
+         worker_id < kWorkers; ++worker_id) {
+        WorkerState &worker = state.workers[worker_id];
+        worker.role = worker_id < kAicWorkers
+            ? CoreRole::Aic
+            : CoreRole::Aiv;
+        worker.core_idx = static_cast<int32_t>(worker_id);
+    }
+
+    const bool aic_kernel =
+        kind == TaskKind::Qk || kind == TaskKind::Pv;
+    // 先让 kernel 的执行角色进入 Claim：S5a 必须把它判为
+    // not_attempted，且不能发出任何 CAS。随后由对侧角色的固定 worker
+    // 获胜，再由同一 Build 角色的另一个 group owner 进入 root 并失败。
+    const uint32_t rejected_worker = aic_kernel
+        ? 1U
+        : kAicWorkers + 1U;
+    const uint32_t winner_worker = aic_kernel
+        ? kAicWorkers + 1U
+        : 1U;
+    const uint32_t loser_worker = winner_worker + 1U;
+    LocalStats rejected_stats{};
+    LocalStats winner_stats{};
+    LocalStats loser_stats{};
+
+    ClaimTestOps::ResetThreadTrace();
+    const ClaimOutcome rejected = Claim<ClaimTestOps>(
+        &state, rejected_worker,
+        state.workers[rejected_worker].role,
+        task_id, kind, rejected_stats
+    );
+    const uint32_t rejected_cas = ClaimTestOps::cas_calls;
+
+    ClaimTestOps::ResetThreadTrace();
+    const ClaimOutcome winner = Claim<ClaimTestOps>(
+        &state, winner_worker,
+        state.workers[winner_worker].role,
+        task_id, kind, winner_stats
+    );
+    const uint32_t winner_cas = ClaimTestOps::cas_calls;
+
+    ClaimTestOps::ResetThreadTrace();
+    const ClaimOutcome loser = Claim<ClaimTestOps>(
+        &state, loser_worker,
+        state.workers[loser_worker].role,
+        task_id, kind, loser_stats
+    );
+    const uint32_t loser_cas = ClaimTestOps::cas_calls;
+
+    const uint32_t groups = ExpectedGroups(kind);
+    const uint32_t winner_group =
+        CandidateRank(kind, winner_worker) % groups;
+    const uint32_t loser_group =
+        CandidateRank(kind, loser_worker) % groups;
+    const SharedClaimTournamentTask &tournament =
+        state.claim_tournament[task_id];
+    return !rejected.attempted && !rejected.won &&
+        rejected.function_id == -1 && rejected_cas == 0 &&
+        winner.attempted && winner.won && winner_cas == 2 &&
+        winner.function_id == FunctionId(kind) &&
+        state.workers[winner_worker].role ==
+            ExpectedBuildRole(kind) &&
+        loser.attempted && !loser.won && loser_cas == 2 &&
+        loser.function_id == -1 &&
+        winner_group != loser_group &&
+        tournament.local[winner_group].owner.value ==
+            static_cast<int64_t>(task_id) &&
+        tournament.local[loser_group].owner.value ==
+            static_cast<int64_t>(task_id) &&
+        tournament.root.owner.value ==
+            static_cast<int64_t>(task_id) &&
+        state.tasks[task_id].deps_prepared == -1 &&
+        state.fatal.value == 0;
+}
+
+void TestDeterministicCrossRoleBuildElection() {
+    SchedulerState *state = MapSparseObject<SchedulerState>();
+    Check(
+        state != nullptr,
+        "sparse deterministic cross-role Claim state maps successfully"
+    );
+    if (state == nullptr) {
+        return;
+    }
+    bool exact = true;
+    for (uint32_t index = 1; index < kTaskKinds.size(); ++index) {
+        exact &= RunDeterministicCrossRoleClaim(
+            *state, 300U + index, kTaskKinds[index]
+        );
+    }
+    Check(
+        exact,
+        "QK/PV Build only on AIV and SF/UP Build only on AIC; "
+        "execution-role Claim is not_attempted and emits no CAS"
     );
     (void)munmap(state, sizeof(*state));
 }
@@ -430,6 +549,7 @@ void TestFutureTaskCannotOverwriteDelayedTask() {
 int main() {
     TestAllTaskKindsAndReplay();
     TestFutureTaskCannotOverwriteDelayedTask();
+    TestDeterministicCrossRoleBuildElection();
     if (g_failures != 0) {
         std::fprintf(
             stderr,

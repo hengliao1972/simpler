@@ -211,10 +211,10 @@ SharedHostTaskPlan MakeCompactTracePlan() {
 }
 
 void TestSharedCompactReconstruction() {
-    // worker 1 不属于旧 task0%4 的 24 核分片。用它作为
-    // Alloc winner 锁定当前 96 核全候选合同，避免 host 转换器
-    // 沿用旧 role-derived attempted 判断而拒绝有效设备记录。
-    constexpr uint32_t worker = 1;
+    // AIV worker 32 不属于旧 task0%4 的 24 核分片。用它作为
+    // Alloc winner 锁定当前 96 核全候选合同；同时用 PV winner
+    // 锁定 S5a 的异角色 Build 合同：QK/PV 必须由 AIV 竞争。
+    constexpr uint32_t worker = 32;
     constexpr uint64_t base_cycle = 5000;
     const SharedHostTaskPlan plan = MakeCompactTracePlan();
     constexpr bool winners[] = {
@@ -426,6 +426,17 @@ void TestRejectsBadSharedCompactRecords() {
         );
     };
 
+    // worker 0 是 AIC，S5a 下它可以合法赢得 SF/UP Build，
+    // 但不能赢得 QK/PV Build。先锁定正例，再保留反例的
+    // role-ineligible 语义，避免只更换数组下标却未验证新合同。
+    std::vector<SharedSubmitClaimTraceRecord> legal = valid;
+    legal[2].claim_end_and_winner |=
+        pa_scheduler::kSharedClaimWinnerBit;
+    Check(
+        !rejected(legal),
+        "SF winner on an AIC worker is accepted"
+    );
+
     std::vector<SharedSubmitClaimTraceRecord> bad = valid;
     bad[0].submit_begin = 0;
     Check(rejected(bad), "missing Submit.begin is rejected");
@@ -436,7 +447,7 @@ void TestRejectsBadSharedCompactRecords() {
     Check(rejected(bad), "Claim outside Submit is rejected");
 
     bad = valid;
-    bad[2].claim_end_and_winner |=
+    bad[1].claim_end_and_winner |=
         pa_scheduler::kSharedClaimWinnerBit;
     Check(
         rejected(bad),

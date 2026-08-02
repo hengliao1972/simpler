@@ -191,6 +191,28 @@ PA_DEVICE bool PaExecOwnerMatchesEngine(
     return false;
 }
 
+// 当前 cross-role Build 拓扑把 kernel payload 的构建者固定在执行
+// engine 的另一类 Scalar 上。这个策略与 portable payload/Claim 协议
+// 分离：后者仍允许任意有效 builder，生产 scheduler 在 Build、扫描和
+// terminal 校验边界显式调用本 helper。
+PA_DEVICE bool PaCrossRoleBuildOwnerEligible(
+    uint32_t build_owner, ExecEngineClass engine_class
+) {
+    if (build_owner >= kWorkers) {
+        return false;
+    }
+    switch (engine_class) {
+        case ExecEngineClass::Aic:
+            return build_owner >= kAicWorkers;
+        case ExecEngineClass::Aiv:
+            return build_owner < kAicWorkers;
+        case ExecEngineClass::None:
+        case ExecEngineClass::Joint:
+            return false;
+    }
+    return false;
+}
+
 // S4 只判定一个已经选出的 execute_owner 是否可以执行该 task，
 // 不在 adapter 内指定唯一 owner。Build owner 只需是有效 worker；执行
 // owner 必须匹配 engine、属于 task 的固定双候选，且与 Build owner

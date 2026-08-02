@@ -618,10 +618,10 @@ uint32_t ExpectedClaimAttempts(TaskKind kind) {
             return kSharedAllocClaimParticipants;
         case TaskKind::Qk:
         case TaskKind::Pv:
-            return kAicWorkers;
+            return kAivWorkers;
         case TaskKind::Sf:
         case TaskKind::Up:
-            return kAivWorkers;
+            return kAicWorkers;
         case TaskKind::Count:
             return 0;
     }
@@ -634,14 +634,71 @@ uint32_t ExpectedClaimGroups(TaskKind kind) {
             return kSharedAllocClaimTournamentGroups;
         case TaskKind::Qk:
         case TaskKind::Pv:
-            return kSharedAicClaimTournamentGroups;
+            return kSharedAivClaimTournamentGroups;
         case TaskKind::Sf:
         case TaskKind::Up:
-            return kSharedAivClaimTournamentGroups;
+            return kSharedAicClaimTournamentGroups;
         case TaskKind::Count:
             return 0;
     }
     return 0;
+}
+
+bool CrossRoleBuildEvidenceMatches(
+    const SchedulerState &state, uint32_t task_count
+) {
+    uint32_t planned_tasks = 0;
+    uint32_t cross_role_tasks = 0;
+    bool exact = true;
+    for (uint32_t batch = 0;
+         batch < state.config.batches; ++batch) {
+        SharedPaBatchPlan plan{};
+        exact &= BuildSharedPaBatchPlan(
+            static_cast<uint64_t>(state.context_lens[batch]),
+            planned_tasks, plan
+        );
+        if (!exact) {
+            return false;
+        }
+        for (uint32_t offset = 0;
+             offset < plan.task_count; ++offset) {
+            SharedPaPlannedTask task{};
+            exact &= SharedPaPlannedTaskAt(plan, offset, task);
+            if (!exact) {
+                return false;
+            }
+            const uint32_t task_id = plan.batch_start + offset;
+            if (task.kind == TaskKind::Alloc) {
+                continue;
+            }
+            const cross_core::DecodedExecState decoded =
+                cross_core::DecodeExecState(
+                    state.exec_cells[task_id].control.state
+                );
+            const bool aic_kernel =
+                task.kind == TaskKind::Qk ||
+                task.kind == TaskKind::Pv;
+            const bool build_on_opposite_role = aic_kernel
+                ? decoded.build_owner >= kAicWorkers &&
+                    decoded.build_owner < kWorkers
+                : decoded.build_owner < kAicWorkers;
+            const bool execute_on_kernel_role = aic_kernel
+                ? decoded.execute_owner < kAicWorkers
+                : decoded.execute_owner >= kAicWorkers &&
+                    decoded.execute_owner < kWorkers;
+            exact &= decoded.valid &&
+                decoded.phase == cross_core::ExecPhase::Done &&
+                decoded.task_id == task_id &&
+                build_on_opposite_role &&
+                execute_on_kernel_role &&
+                decoded.build_owner != decoded.execute_owner;
+            ++cross_role_tasks;
+        }
+        planned_tasks += plan.task_count;
+    }
+    return exact && planned_tasks == task_count &&
+        cross_role_tasks ==
+            task_count - state.config.batches;
 }
 
 bool RunLocalClaimAttemptAccountingTest() {
@@ -1486,6 +1543,9 @@ bool RunInsertReleaseBeforeBuildTest() {
         ClaimAndInsertEvidenceMatches(
             *state, kTaskCount
         ) &&
+        CrossRoleBuildEvidenceMatches(
+            *state, kTaskCount
+        ) &&
         OrderedSubmitTestOps::task4_insert_hook_calls.load(
             std::memory_order_relaxed
         ) == 1 &&
@@ -1601,6 +1661,9 @@ bool RunIndependentKernelExecutionTest() {
         ClaimAndInsertEvidenceMatches(
             *state, kTaskCount
         ) &&
+        CrossRoleBuildEvidenceMatches(
+            *state, kTaskCount
+        ) &&
         OrderedSubmitTestOps::independent_insert_hook_calls.load(
             std::memory_order_relaxed
         ) == 1 &&
@@ -1675,7 +1738,8 @@ int main() {
     }
     std::printf(
         "[PASS] shared loser skips TensorMap; lookup/Build and "
-        "independent kernel execution cross prior owner Build\n"
+        "independent kernel execution cross prior owner Build; "
+        "QK/PV Build on AIV and SF/UP Build on AIC\n"
     );
     return 0;
 }

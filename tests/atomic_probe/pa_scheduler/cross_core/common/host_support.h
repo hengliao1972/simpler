@@ -1886,9 +1886,13 @@ inline bool SharedTraceClaimAttempted(
         return worker < kWorkers;
     }
     const bool aic = worker < kAicWorkers;
+    // S5a 先只翻转 kernel task 的 Build 角色，不扩大 Claim 人口：
+    // QK/PV 由 64 个 AIV 竞争 Build，SF/UP 由 32 个 AIC 竞争 Build。
+    // Execute 仍由目标 engine 的 K2 候选动态竞争，因此 Build 与 Execute
+    // 在每个 kernel task 上都必然跨角色。
     return aic
-        ? kind == TaskKind::Qk || kind == TaskKind::Pv
-        : kind == TaskKind::Sf || kind == TaskKind::Up;
+        ? kind == TaskKind::Sf || kind == TaskKind::Up
+        : kind == TaskKind::Qk || kind == TaskKind::Pv;
 }
 
 inline int32_t SharedTraceFunctionId(TaskKind kind) {
@@ -2903,15 +2907,15 @@ inline bool AnalyzeSwimlaneRecords(
             atomic_durations[0][kWriterCommitSite].size();
         const uint64_t aiv_events =
             atomic_durations[1][kWriterCommitSite].size();
-        // 正式 PA 的 UP 只由 AIV winner 发布 writer metadata；generation
+        // S5a 的 UP 只由 AIC Build winner 发布 writer metadata；generation
         // 12 每组只允许一条物理 group CAS。逻辑上仍提交三个 symbol，
         // 因而不能拿 shared_symbol_inout_commits 代替本闭环。
-        if (aic_events != 0 ||
-            aiv_events != shared_plan.total_groups) {
+        if (aic_events != shared_plan.total_groups ||
+            aiv_events != 0) {
             std::fprintf(
                 stderr,
                 "shared PA writer group-CAS closure failed: "
-                "AIC=%llu AIV=%llu expected=0/%u\n",
+                "AIC=%llu AIV=%llu expected=%u/0\n",
                 static_cast<unsigned long long>(aic_events),
                 static_cast<unsigned long long>(aiv_events),
                 shared_plan.total_groups
@@ -2922,7 +2926,7 @@ inline bool AnalyzeSwimlaneRecords(
             "[TRACE_ATOMIC_CLOSURE] "
             "site=SharedMetadataLastWriterCommit "
             "physical_group_cas=%llu logical_symbol_commits=%u\n",
-            static_cast<unsigned long long>(aiv_events),
+            static_cast<unsigned long long>(aic_events),
             shared_plan.total_groups * 3U
         );
     }
@@ -3487,10 +3491,12 @@ constexpr uint64_t kHostSyntheticValueBase = UINT64_C(0x400000000);
 constexpr uint64_t kHostSyntheticBlockTableBase = UINT64_C(0x500000000);
 constexpr uint64_t kHostPaScaleBits = UINT64_C(0x3F800000);
 
-// Host 必须独立复算 S4 双候选集合，不能调用 device adapter；否则两边
-// 复制了同一错误时，终态 oracle 仍会误判为正确。S4 的 executor 由两个
-// 候选动态竞争产生，因此 host 只检查角色、候选成员关系和 build/execute
-// 分离，不再预测某个唯一 owner。
+// Host 必须独立复算 S5a 的 Build 角色合同和 S4 双候选集合，不能调用
+// device adapter；否则两边复制了同一错误时，终态 oracle 仍会误判为
+// 正确。S5a 规定 kernel task 必须由目标 engine 的异角色 Scalar Build；
+// executor 仍由目标 engine 的两个候选动态竞争产生。因此 host 同时检查
+// Build 角色、Execute 角色、候选成员关系和 build/execute 分离，不预测
+// 某个唯一 execute owner。
 inline bool HostExecOwnerMatchesEngine(
     uint32_t owner, cross_core::ExecEngineClass engine
 ) {
@@ -3503,12 +3509,24 @@ inline bool HostExecOwnerMatchesEngine(
     return false;
 }
 
+inline bool HostBuildOwnerMatchesS5aPolicy(
+    uint32_t owner, cross_core::ExecEngineClass engine
+) {
+    if (engine == cross_core::ExecEngineClass::Aic) {
+        return owner >= kAicWorkers && owner < kWorkers;
+    }
+    if (engine == cross_core::ExecEngineClass::Aiv) {
+        return owner < kAicWorkers;
+    }
+    return false;
+}
+
 inline bool HostDynamicPaExecuteOwnerIsLegal(
     uint32_t task_id, uint32_t build_owner,
     uint32_t execute_owner,
     cross_core::ExecEngineClass engine
 ) {
-    if (!HostExecOwnerMatchesEngine(build_owner, engine) ||
+    if (!HostBuildOwnerMatchesS5aPolicy(build_owner, engine) ||
         !HostExecOwnerMatchesEngine(execute_owner, engine)) {
         return false;
     }
@@ -4445,8 +4463,9 @@ inline Metrics Validate(
     RawExecTokenSnapshotAuthority raw_exec_token_snapshot_authority
 ) {
     Metrics metrics;
-    // 每个 worker 都回放全部 task。Alloc 由 96 个 worker 全部执行 atomicMax Claim；
-    // 其余 kernel task 只有与 active role 匹配的 AIC 或 AIV 参与 Claim。
+    // 每个 worker 都回放全部 task。Alloc 由 96 个 worker 全部参与 Claim；
+    // S5a 不扩大 kernel Claim 人口，只把 Build 角色翻转为目标 engine 的
+    // 对侧 Scalar：QK/PV 由 AIV Build，SF/UP 由 AIC Build。
     const uint32_t batches = state.config.batches;
 #if PTO_FDWIC_SHARED_MAP
     SharedHostTaskPlan shared_plan;
@@ -4504,16 +4523,24 @@ inline Metrics Validate(
     const auto final_barrier_shape = static_cast<FinalBarrierShape>(state.config.final_barrier_shape);
     const uint64_t expected_submits = static_cast<uint64_t>(kWorkers) * task_count;
 #if PTO_FDWIC_SHARED_MAP
+    // S5a 的总 Claim 人口与 S4 相同，但角色分布已经交换。分别保留 host
+    // 期望值，避免只核对对称总和时把 QK/PV 与 SF/UP 的角色接反也放过。
+    const uint64_t expected_aic_claims =
+        static_cast<uint64_t>(kAicWorkers) *
+        (static_cast<uint64_t>(batches) +
+         2ULL * static_cast<uint64_t>(group_count));
+    const uint64_t expected_aiv_claims =
+        static_cast<uint64_t>(kAivWorkers) *
+        (static_cast<uint64_t>(batches) +
+         2ULL * static_cast<uint64_t>(group_count));
     const uint64_t expected_claims =
-        static_cast<uint64_t>(batches) *
-            kSharedAllocClaimParticipants +
-        static_cast<uint64_t>(group_count) *
-            (2U * kAicWorkers + 2U * kAivWorkers);
+        expected_aic_claims + expected_aiv_claims;
 
-    // S4 的 host oracle 直接检查 task-indexed cell，不依赖新增的
+    // S5a 的 host oracle 直接检查 task-indexed cell，不依赖新增的
     // WorkerResult 计数：Alloc 不产生执行包；其余 task 必须 DONE，并由
-    // host 独立复算双候选集合并检查动态 executor 合法性。该公式不能调用
-    // device adapter，避免 device/host 同错后相互放行。
+    // host 独立检查异角色 Build policy、复算双候选集合和动态 executor
+    // 合法性。该公式不能调用 device adapter，避免 device/host 同错后
+    // 相互放行。
     bool cross_core_exec_cells_ok = shared_plan_ok;
     bool cross_core_exec_dynamic_candidate_owner_ok = shared_plan_ok;
     uint32_t first_bad_exec_task = UINT32_MAX;
@@ -4639,8 +4666,9 @@ inline Metrics Validate(
     const uint64_t expected_claims =
         static_cast<uint64_t>(batches) * (kWorkers + kAicWorkers + kAivWorkers + kAicWorkers + kAivWorkers);
 #endif
-    // shared Alloc 恢复全部 96 核候选；QK/SF/PV/UP 保持
-    // 32/64/32/64，默认 B256/G1 共 73,728 次 Claim。
+    // shared Alloc 保持全部 96 核候选；S5a 的 QK/SF/PV/UP 依次由
+    // 64/32/64/32 个异角色 Scalar 参与，默认 B256/G1 的总 Claim 仍为
+    // 73,728 次，不把“角色可移植性”与“扩大候选人口”混在同一阶段。
 
     // 聚合量分为调度核心计数、kernel 分布、前端操作数和最终状态四组，便于定位语义偏差。
     uint64_t first_submit = UINT64_MAX;
@@ -4714,6 +4742,7 @@ inline Metrics Validate(
 #else
     uint64_t fanin_ready_loads_by_role[2] = {};
     uint64_t fanin_edges_by_role[2] = {};
+    uint64_t claim_attempts_by_role[2] = {};
 #endif
     bool frontier_worker_counts_ok = true;
     bool role_kernel_routing_ok = true;
@@ -4990,6 +5019,15 @@ inline Metrics Validate(
 #endif
         submits += result.submits;
         claims += result.claim_attempts;
+#if PTO_FDWIC_SHARED_MAP
+        if (result.role == static_cast<uint32_t>(CoreRole::Aic)) {
+            claim_attempts_by_role[0] += result.claim_attempts;
+        } else if (
+            result.role == static_cast<uint32_t>(CoreRole::Aiv)
+        ) {
+            claim_attempts_by_role[1] += result.claim_attempts;
+        }
+#endif
         wins += result.claim_wins;
         if (result.claim_wins != 0) ++winning_workers;
         max_worker_wins = std::max(max_worker_wins, result.claim_wins);
@@ -5017,9 +5055,10 @@ inline Metrics Validate(
         slot_scalar_copies += result.slot_scalar_copies;
         fanin_edges += result.fanin_edges;
 #if PTO_FDWIC_SHARED_MAP
-        // Build 核记录 payload 中的 fanin_edges，异核 executor 记录
-        // fanin_ready_loads；跨核后逐 worker 不再相等，但两端始终保持同
-        // engine role，因此按 AIC/AIV 聚合仍必须严格守恒。
+        // Build 核记录 payload 中的 fanin_edges，executor 记录
+        // fanin_ready_loads。S5a 刻意让两端跨角色，因此不能再要求同一
+        // role 内相等；但 Build 端和 Execute 端各自的角色分布仍需精确
+        // 聚合，防止某类 task 偷跑回 same-role Build。
         if (result.role == static_cast<uint32_t>(CoreRole::Aic)) {
             fanin_edges_by_role[0] += result.fanin_edges;
             fanin_ready_loads_by_role[0] +=
@@ -5219,19 +5258,26 @@ inline Metrics Validate(
         worker_shape_ok &= seen;
 
 #if PTO_FDWIC_SHARED_MAP
-    // 每个 group 的 PV 有 1 条 AIC fanin；SF+UP 有 1+3 条 AIV
-    // fanin。builder 与 executor 可以是不同 worker，但不能改变同角色与
-    // 全局的业务总量；这里同时锁定 ready 端和 payload 发布端。
-    const uint64_t expected_aic_fanin_edges = group_count;
-    const uint64_t expected_aiv_fanin_edges =
+    // 每个 group 的 payload fanin 由异角色 Build 发布：AIV Build 的 PV
+    // 有 1 条，AIC Build 的 SF+UP 有 1+3 条。ready load 则仍由目标
+    // engine executor 消费：AIC 为 PV 的 1 条，AIV 为 SF+UP 的 4 条。
+    // 分开核对两个方向，才能证明 S5a 的 cross-role 搬运真实发生。
+    const uint64_t expected_aic_build_fanin_edges =
+        static_cast<uint64_t>(group_count) * 4U;
+    const uint64_t expected_aiv_build_fanin_edges = group_count;
+    const uint64_t expected_aic_execute_fanin_loads = group_count;
+    const uint64_t expected_aiv_execute_fanin_loads =
         static_cast<uint64_t>(group_count) * 4U;
     const bool shared_fanin_aggregate_counts_ok =
-        fanin_edges_by_role[0] == expected_aic_fanin_edges &&
-        fanin_ready_loads_by_role[0] == expected_aic_fanin_edges &&
-        fanin_edges_by_role[1] == expected_aiv_fanin_edges &&
-        fanin_ready_loads_by_role[1] == expected_aiv_fanin_edges &&
+        fanin_edges_by_role[0] == expected_aic_build_fanin_edges &&
+        fanin_edges_by_role[1] == expected_aiv_build_fanin_edges &&
+        fanin_ready_loads_by_role[0] ==
+            expected_aic_execute_fanin_loads &&
+        fanin_ready_loads_by_role[1] ==
+            expected_aiv_execute_fanin_loads &&
         fanin_edges ==
-            expected_aic_fanin_edges + expected_aiv_fanin_edges &&
+            expected_aic_build_fanin_edges +
+                expected_aiv_build_fanin_edges &&
         fanin_ready_loads == fanin_edges;
 #endif
 
@@ -5307,6 +5353,14 @@ inline Metrics Validate(
     );
     Expect(submits == expected_submits, "replay count is workers * tasks", &metrics);
     Expect(claims == expected_claims, "Claim attempt count matches PA topology", &metrics);
+#if PTO_FDWIC_SHARED_MAP
+    Expect(
+        claim_attempts_by_role[0] == expected_aic_claims &&
+            claim_attempts_by_role[1] == expected_aiv_claims,
+        "shared S5a Claim attempts match opposite-role AIC/AIV Build topology",
+        &metrics
+    );
+#endif
     Expect(wins == task_count, "exactly one winner per task", &metrics);
 #if PTO_FDWIC_SHARED_MAP
     if (!cross_core_exec_cells_ok) {
@@ -5322,7 +5376,7 @@ inline Metrics Validate(
     );
     Expect(
         cross_core_exec_dynamic_candidate_owner_ok,
-        "S4 uses a host-independent legal dynamic executor from the two candidates",
+        "S5a uses an opposite-role builder and a host-independent legal K2 executor",
         &metrics
     );
     Expect(
@@ -5424,7 +5478,7 @@ inline Metrics Validate(
                 2 * fanin_not_ready_loads,
 #endif
         kCompiledTensorMapMode == TensorMapBuildMode::Shared
-            ? "shared fanin edges and ready loads match exact AIC/AIV and global totals"
+            ? "shared fanin Build/Execute cross-role totals match exact AIC/AIV and global totals"
             : "fanin ready/failure load classification is complete",
         &metrics
     );
@@ -5754,10 +5808,10 @@ inline Metrics Validate(
                 return kSharedAllocClaimTournamentGroups;
             case TaskKind::Qk:
             case TaskKind::Pv:
-                return kSharedAicClaimTournamentGroups;
+                return kSharedAivClaimTournamentGroups;
             case TaskKind::Sf:
             case TaskKind::Up:
-                return kSharedAivClaimTournamentGroups;
+                return kSharedAicClaimTournamentGroups;
             case TaskKind::Count:
                 return 0;
         }

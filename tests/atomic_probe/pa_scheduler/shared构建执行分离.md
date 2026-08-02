@@ -7,11 +7,12 @@
 | 目标 | 让 task 的构建 owner 与 kernel 执行 owner 可以是不同物理核 |
 | 当前代码 | Build owner 发布 task-indexed shared payload，K2 排除 Build owner 后的 1 或 2 个 eligible executor 竞争执行 |
 | 本文性质 | 持续更新的架构与内存模型设计记录 |
-| 正式实现 | S0–S4 K2 已通过 CPU/CCEC/A5；S4 仍是受控双候选，不是通用动态任务池 |
-| CPU 正确性用例 | S1–S4 K2 协议、PA payload、动态合法 owner 和 drain 门槛已完成 |
+| 正式实现 | S0–S4 K2 已通过 CPU/CCEC/A5；S5a 已完成 CPU 跨角色 Build 门槛，CCEC/A5 尚未运行 |
+| CPU 正确性用例 | S1–S4 K2 及 S5a 对侧角色 Build、PA payload、动态合法 owner 和 drain 门槛已完成 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
 | A5 PA 功能/性能 | S3b full-swimlane Submit 27.128 ms；S4 K2 B1/B256 全部闭合，B256 full-swimlane Submit 27.476 ms，仅记录单样本 |
 | S4 动态 Execute election | K2 首版已通过 CPU B1/B256 和 A5 B1/B256；B256 中两候选都有实际胜出，非法 owner 为 0 |
+| S5 Build 拓扑 | S5a 先交换 QK/PV 与 SF/UP 的 Build 角色但保持候选人口和 CAS 总量不变；CPU B1/B256 已闭合，S5b 全 96 Scalar 尚未开始 |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
 
@@ -952,10 +953,30 @@ task 3 `Materialize` 的第一个 heap atomic 之前，之后才被 TensorMap
 
 ### S5：独立扩大 Build owner 候选核
 
-- 在 S3/S4 已证明的 execution handoff 上，再比较现有核型绑定 Build 与“任意兼容 Scalar Build”；
-- 先证明 Materialize/Register/Fanin/portable Build 不携带执行核私有状态；
-- 只有 TensorMap metadata 保持 task-id 严格串行，Build payload 和 kernel 执行不得因此串行；
-- 用独立 commit 记录该拓扑变化，不让它污染 S3 内存模型结论。
+S5 拆成两个正交阶段，先证明可移植性，再扩大竞争人口：
+
+1. **S5a 跨角色 Build 门槛**：Alloc 保持 96/G8；QK/PV 改由 64 个
+   AIV/G8 Build、仍由 AIC K2 Execute；SF/UP 改由 32 个 AIC/G6 Build、
+   仍由 AIV K2 Execute。B256 的 local/root/总物理 Claim CAS 仍精确为
+   `73,728 / 9,216 / 82,944`，因此本阶段不会把 payload 可移植性与新增
+   atomic 竞争混算。Build owner 位于 engine 对侧，也不会占用 K2 中的
+   任一席位，两个 execute candidate 都保留竞争资格。
+2. **S5b 任意 Scalar Build**：S5a 的 CPU/CCEC/A5 证据闭合后，再把
+   kernel Build 扩到 96/G8。B256 预计 local/root/总物理 CAS 变为
+   `122,880 / 10,240 / 133,120`，相对 S5a 总物理 CAS 增加约 60.5%；
+   该代价必须单独和更好的到达式负载均衡比较。
+
+两阶段共同保持：Materialize/Register/Fanin/portable Build 不携带执行
+核私有状态；只有 TensorMap metadata 通过 `deps_prepared` 按 task-id
+严格发布，Build payload 和 kernel 执行不进入该串行链；host 必须独立
+复算 Build 角色、K2 和终态，不能调用设备 helper 形成同错 oracle。
+
+S5a 的 CPU 实现已经闭合。完整 CPU build、B1 和 B256 real-compute 均为
+semantic/postprocess PASS；逐 kernel 证明 QK/PV 的 Build owner 位于 AIV、
+SF/UP 的 Build owner 位于 AIC，Execute owner 仍匹配目标 engine、属于
+host 独立复算的 K2 且不同于 Build owner。fanin payload 发布量也随 Build
+角色反转，而 ready load 仍落在 Execute 角色。该结果目前只证明 CPU
+状态机；CCEC 编译、A5 DCCI/atomic 可见性与动态结果尚未运行。
 
 ### S6：再接 engine/Scalar overlap
 

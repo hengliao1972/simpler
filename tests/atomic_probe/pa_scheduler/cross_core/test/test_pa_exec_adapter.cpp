@@ -115,11 +115,17 @@ bool TestExecuteCandidateEligibility() {
                 candidate_destinations[secondary] = true;
             }
 
-            // Build owner 穷举全部 96 核，包含与 engine 不同类型
-            // 的 worker；execute owner 同样穷举，确保资格判定只
-            // 接受“同 engine 的双候选且非 builder”。
+            // portable execute eligibility 仍穷举全部 96 个 builder；
+            // cross-role Build 则是生产 scheduler 另行叠加的拓扑约束。
             for (uint32_t build_owner = 0;
                  build_owner < kWorkers; ++build_owner) {
+                const bool expected_cross_role =
+                    engine == ExecEngineClass::Aic
+                        ? build_owner >= kAicWorkers
+                        : build_owner < kAicWorkers;
+                exact &= PaCrossRoleBuildOwnerEligible(
+                    build_owner, engine
+                ) == expected_cross_role;
                 for (uint32_t execute_owner = 0;
                      execute_owner < kWorkers; ++execute_owner) {
                     const bool expected =
@@ -187,6 +193,30 @@ bool TestExecuteCandidateEligibility() {
     exact &= PaExecuteOwnerEligible(
         7, 0, ExecEngineClass::Aiv, aiv_primary
     );
+    exact &= PaCrossRoleBuildOwnerEligible(
+        kAicWorkers, ExecEngineClass::Aic
+    );
+    exact &= PaCrossRoleBuildOwnerEligible(
+        0, ExecEngineClass::Aiv
+    );
+    exact &= !PaCrossRoleBuildOwnerEligible(
+        0, ExecEngineClass::Aic
+    );
+    exact &= !PaCrossRoleBuildOwnerEligible(
+        kAicWorkers, ExecEngineClass::Aiv
+    );
+    exact &= !PaCrossRoleBuildOwnerEligible(
+        kWorkers, ExecEngineClass::Aic
+    );
+    exact &= !PaCrossRoleBuildOwnerEligible(
+        kExecUnboundOwner, ExecEngineClass::Aiv
+    );
+    exact &= !PaCrossRoleBuildOwnerEligible(
+        0, ExecEngineClass::None
+    );
+    exact &= !PaCrossRoleBuildOwnerEligible(
+        0, ExecEngineClass::Joint
+    );
 
     exact &= !PaExecOwnerMatchesEngine(
         kWorkers, ExecEngineClass::Aic
@@ -229,7 +259,7 @@ bool TestExecuteCandidateEligibility() {
     );
     CheckMapping(
         exact,
-        "two candidates and generic eligibility cover all workers"
+        "cross-role Build policy and generic execute eligibility are exact"
     );
     return exact;
 }
@@ -991,12 +1021,16 @@ bool FinalValidatorRejectsMalformedShape(
 
 bool RunCase(SchedulerState &state, const CaseShape &shape) {
     const uint32_t build_owner = shape.engine == ExecEngineClass::Aic
-        ? kBuildOwnerAic : kBuildOwnerAiv;
+        ? kBuildOwnerAiv : kBuildOwnerAic;
     uint32_t execute_owner = kExecUnboundOwner;
     const bool mapped = SelectTestExecuteOwner(
         shape.task_id, build_owner, shape.engine, execute_owner
     );
     Check(mapped, shape.kind, "test-only different-core owner selection");
+    Check(
+        PaCrossRoleBuildOwnerEligible(build_owner, shape.engine),
+        shape.kind, "builder uses the opposite Scalar role"
+    );
     if (!mapped) {
         return false;
     }
