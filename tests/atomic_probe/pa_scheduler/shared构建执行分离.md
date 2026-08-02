@@ -132,7 +132,7 @@ completion vend 是 heap 进度快照，不是 output 数据地址或内存所�
 | A5 ordinary payload 发布/取得 | S2 独立 CCEC 跨核探针 | 不依赖 kernel-end 自动 DCCI，延迟注入和多 cacheline 均读到精确值 |
 | DCache preload 可选性能 hint | S2 先在关闭时闭合正确性，再于 S2/S3a/S3b 做编译变体 A/B | on/off 合同完全相同，只保留正确性不变且性能稳定改善的位置 |
 | 使用 shared payload 本身的代价 | S3a task-indexed cell，仍映射给 Build owner | 正确性不变，单独量出 publication/copy 税 |
-| 真正跨核的 args/context/vend/fanin 交接 | S3b 固定映射到另一个兼容核 | B1/B256 的 task/descriptor/fanin/vend/completion 精确校验全部一致 |
+| 真正跨核的 args/context/vend/fanin 交接 | S3b 为每个 task 预路由两个兼容候选，再由 Build owner 唯一确定异核 executor | B1/B256 的 task/descriptor/fanin/vend/completion 精确校验全部一致；每 task 最多两个 control observer |
 | 多 executor 唯一领取 | S4 动态 election | 先保证恰好一个 executor，再比较 atomic 成本 |
 | executor 本地容量与全局 backlog 解耦 | S0 定义单 execution token，S1/S3 验证忙核不 Claim | 没有空闲 token 时不发射 CAS，task 保持 `BUILT` 并可由其他兼容核领取 |
 | Build owner 扩大到其他 Scalar | S5 独立改候选核拓扑 | 不借助跨核发布的正确性掩盖 Build 角色变化 |
@@ -837,9 +837,16 @@ CPU 只验证状态机和交错，不用于证明 A5 cache 可见性。generatio
 
 ### S3b：固定不同核执行
 
-- 对每个 kernel task，确定性映射到“Build owner 之后的另一个兼容 worker”，确保物理核真的不同；
+- 为每个 kernel task 按 task id 和 engine 预先计算 `primary/secondary`
+  两个兼容 observer；AIC 候选相邻，AIV secondary 保持 lane 并移动到下一
+  物理 block；
+- 若 Build owner 不是 primary，则由 primary 执行；若 Build owner 恰好是
+  primary，则由 secondary 执行。该规则保持现有 Build Claim 候选拓扑，
+  同时确定性保证 `build_owner != execute_owner`；
 - QK/PV 只映射 AIC，SF/UP 只映射 AIV，Alloc 仍由 Build owner 本地 completion；
-- 不做多候选竞争，但指定 executor 仍用 CAS 完成 phase/owner 转换；
+- 非候选核从本地 PA task plan 直接跳过，不读取 shared cell control；两个候选
+  才能观察 control，而最终唯一指定 executor 才发射 Claim CAS。这里的两个
+  observer 不是两个执行竞争者；
 - 每个 executor 按 task id 递增处理自己的固定映射序列，token 忙时不跳过早期 task 领取更晚 task；
 - 先跑 B1 正确性，再跑 B256；host 精确检查 build owner 与 execute owner 不同、task/descriptor/fanin/vend/completion 全部一致；
 - FinalDrain 使用“所有 builder 停产 + 所有 kernel cell DONE + 每核 token IDLE + engine 无 in-flight”收口。
@@ -968,6 +975,25 @@ S3a 和 S3b 把“shared payload 发布税”与“跨核取得税”分开，�
 12. shared execution payload 是否能复用生产 RingSlot ABI，还是需要独立中间 ABI？
 
 ## 17. 更新记录
+
+### 2026-08-02：S3a 泳道暴露全核扫描热点，修正 S3b 发现合同
+
+- S3a B256 full-swimlane 的 122880 个 EfDrain 中位数为
+  **14.962 us**、p95 为 **20.549 us**、最大为 **217.371 us**；同口径
+  same-core 最优版本分别只有 0.025 us、0.791 us 和 70.860 us。
+- S3a EfDrain 占 Submit 聚合核时间的 **89.683%**，其中 control 占
+  EfDrain 的 **99.912%**，kernel 只占 0.088%。这不是 kernel 等待或偶然
+  尾部，而是发现协议本身主导了执行时间。
+- 根因是旧 S3a scanner 让 96 个 worker 对每个 closed task 都调用一次
+  `Ops::Load(exec_cell.control)`；A5 CCEC 将该 int64 load 实现为返回型恒等
+  `atomicMax(INT64_MIN)`，于是每 task 形成同地址的最多 96 核竞争。
+- 因此撤销“所有同 role executor 逐 task 读取 control，再从 build_owner
+  判断归属”的 S3b 计划。新合同改为 task-id 预路由的 primary/secondary：
+  非候选零 control load，最多两个候选观察，且只有由 build_owner 唯一确定的
+  target 发射 Claim CAS。这样不减少现有 Build Claim 候选，也不允许同核执行。
+- S3a 新 execution control/DCCI 当前尚未形成独立 raw 事件，导致长
+  EfDrain 在泳道中表现为空白 control 区。S3b 取证必须补齐这些操作的明确
+  atomic/DCCI 事件，不能继续只依赖父区间推断。
 
 ### 2026-08-02：S0/S1 落地并进入 S2 动态门槛
 

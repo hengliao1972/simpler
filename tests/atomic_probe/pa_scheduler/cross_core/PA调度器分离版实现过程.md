@@ -292,3 +292,43 @@ S3a 已证明完整 PA task 可以被构造为共享执行包，再经由 atomic
 发布、精确 DCCI acquire、owner-local token 和设备终态闭合。它当前仅完成
 同 owner 的机制接线与正确性取证；B1 启动 fatal 仍需单独定位，性能优化与
 S3b 真正的异 owner 领取都还没有开始。
+
+## 2026-08-02：S3a EfDrain 异常与 S3b 发现协议修正
+
+### 实测异常
+
+S3a B256 full-swimlane 不是只有个别 14 us EfDrain：122880 个样本的
+中位数为 **14.962 us**、p95 为 **20.549 us**、最大为
+**217.371 us**，其中 92692 个样本不低于 14 us。对照同口径
+same-core 最优泳道，中位数为 0.025 us、p95 为 0.791 us。
+
+exclusive analyzer 进一步表明：EfDrain 占 Submit 聚合核时间的
+89.683%，EfDrain 内 control 占 99.912%，kernel union 只占 0.088%。
+因此不能把它解释成正常 kernel overlap 或观察噪声。
+
+### 根因
+
+S3a 的 `exec_scan_task` 让每个 worker 对每个 closed task 都读取一次
+`exec_cells[task_id].control.state`。CCEC 的 int64 `Ops::Load()` 在 A5 上
+是返回型恒等 `atomicMax(INT64_MIN)`；B256 正好形成
+`96 workers × 1280 tasks = 122880` 次同地址分批竞争。Build owner 发布
+同一 cell 的 CAS 也会与这些 reader 竞争，这解释了部分 WinnerBuild 和
+EfDrain 的长尾。
+
+新 execution control 的 atomic 与 payload DCCI 尚未单独进入 raw trace，
+所以当前 merged 泳道把它们显示成没有子事件的 EfDrain control。现有父区间
+足以定位总成本，但不足以做后续微观归因；S3b 取证需要补齐这些事件。
+
+### 已修正的 S3b 方向
+
+不再让 32/64 个同 role worker 读取每个 task control。每个 kernel task
+根据 task id 和 engine 预路由 primary/secondary 两个 observer：
+
+- Build owner 不是 primary 时，由 primary 执行；
+- Build owner 等于 primary 时，由 secondary 执行；
+- 非候选仅推进本地计划游标，不读取 shared control；
+- 两个候选可以观察发布状态，但只有唯一实际 target 发射 Claim CAS。
+
+该规则不减少现有 Build Claim 候选，确定性保证 Build/Execute 异核，并把
+每 task 的 control observer 上限从 96 降到 2。它仍需经过 CPU 定向交错、
+A5 B1/B256 与泳道实测；在这些证据完成前只记为正在实现的 S3b 合同。
