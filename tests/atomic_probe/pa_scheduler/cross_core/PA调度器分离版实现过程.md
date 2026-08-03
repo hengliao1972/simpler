@@ -2135,3 +2135,52 @@ candidate mean   改善 0.080686 ms / 3.215%
 该候选同时减少了已定位的非必要返回型 Atomic，并在冻结交错 A/B 中得到稳定
 端到端收益，因此作为有效阶段保留。它不改变 Build/Execute 候选拓扑、
 TensorMap 插入顺序、payload 发布、fanin 判断或 completion 顺序。
+
+## 2026-08-04：S6.30 非零输出 heap vend 前置读取（无收益，已撤回）
+
+S6.29 泳道中 `shared_heap_vend_load` 有 1280 次，其中 1024 个非零输出 task
+随后还会执行 `shared_heap_vend_advance.fetch_add`，并消费 FetchAdd 返回的旧
+vend 做对齐、容量和 `int64_t` 边界校验。候选据此尝试让非零输出直接消费
+FetchAdd 返回值，仅为 256 个零输出 UP 保留 vend load。
+
+该改动需要同时调整冷失败合同：合法配置已经由 host 在 worker 启动前按 task
+plan 完成逐 shard 与总量准入；但若设备 control 已损坏，非零 reserve 只能在
+RMW 返回后发现异常，因此不再满足“失败时没有任何共享写入”，而是保留 cursor
+和 vend 的 terminal RMW 现场。CPU 定向测试先把正常非零 reservation 的原子
+记录从 4 次收紧为 3 次，并精确验证四类损坏 vend 的失败现场。完整 CPU 协议
+回归和 CCEC full-swimlane/perf-clock 构建均通过。
+
+A5 B256 full-swimlane 为：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260803_182840_345595/ccec/merged_swimlane.json`
+
+动态取证符合源码预期：
+
+- `shared_heap_vend_load`：`1280 -> 256`，减少 `1024` 次，即 `80%`；
+- `shared_heap_vend_advance`：仍为 `1024` 次；
+- 完整生命周期单次 `2.621299 ms`；
+- 1280 task、1024 kernel、heap、TensorMap、payload、fanin、completion 和
+  终态全部 PASS。
+
+候选十个独立 trace-free 进程全部 PASS：
+
+```text
+min / median / max / mean
+2.334857 / 2.383275 / 2.644366 / 2.406163 ms
+```
+
+单组绝对数不足以裁决，随后以提交 `308f26c6` 构建冻结 S6.29 基线，按
+B-C/C-B 交错各运行六个独立进程：
+
+```text
+S6.29 frozen baseline: min / median / max / mean
+                       2.376348 / 2.386710 / 2.574386 / 2.416577 ms
+S6.30 candidate      : min / median / max / mean
+                       2.379444 / 2.409327 / 2.702979 / 2.469979 ms
+candidate median 回退 0.022617 ms / 0.948%
+candidate mean   回退 0.053402 ms / 2.210%
+```
+
+因此，“返回型 Atomic 次数减少”在这里没有转化为端到端收益，反而削弱了冷
+失败的无写入合同。候选代码和测试修改已完整撤回，只保留本节反例；后续不再
+以删除 heap vend 前置读取作为优化方向。
