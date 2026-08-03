@@ -7,13 +7,13 @@
 | 目标 | 让 task 的构建 owner 与 kernel 执行 owner 可以是不同物理核 |
 | 当前代码 | 96 Scalar 通过中央 ticket 恰好一次 Build；Build owner 发布 task-indexed shared payload，K2 排除 Build owner 后的 1 或 2 个 eligible executor 竞争执行 |
 | 本文性质 | 持续更新的架构与内存模型设计记录 |
-| 正式实现 | S0–S6.26 已形成中央 ticket + 严格 TensorMap 插入 + K2 异核 Execute，并把成功路径的 terminal 观察集中到调度边界；descriptor 引用和 unique-ticket 单 CAS 两个回退候选均已撤销 |
+| 正式实现 | S0–S6.29 已形成中央 ticket + 严格 TensorMap 插入 + K2 异核 Execute；成功路径的 terminal 观察已集中到调度边界，执行扫描得到的完整 control 快照直接参与 Claim CAS；descriptor 引用和 unique-ticket 单 CAS 两个回退候选均已撤销 |
 | CPU 正确性用例 | S1–S4 K2、S5a 对侧角色 Build 与 S5b 全 96 Scalar Build 门槛已完成 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
-| A5 PA 功能/性能 | 旧 `2.323 ms` 是 Submit-only 数字，已退出性能裁决；当前唯一口径为首个 Submit 起点到 FinalDrain 结束。S6.27 的十个独立 B256 进程为 `2.421–2.691 ms`、中位 `2.519 ms`，功能与终态 10/10 PASS |
+| A5 PA 功能/性能 | 旧 `2.323 ms` 是 Submit-only 数字，已退出性能裁决；当前唯一口径为首个 Submit 起点到 FinalDrain 结束。S6.29 冻结交错 A/B 中，S6.27 基线中位 `2.507 ms`，候选中位 `2.426 ms`，改善 `3.27%`；功能与终态全部 PASS |
 | S4 动态 Execute election | K2 首版已通过 CPU B1/B256 和 A5 B1/B256；B256 中两候选都有实际胜出，非法 owner 为 0 |
 | S5 Build 拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 五类 task 全 96/G8 已通过 CPU/CCEC/A5 B1/B256，物理 Claim CAS 精确闭合 |
-| 当前调度缺口 | 双 token Claim-first 已解决旧的 FinalDrain backlog；S6.27 已将 FinalDrain terminal 改为低频最终观察，当前主要缺口继续转向仍承担真实业务判断的返回型 Atomic |
+| 当前调度缺口 | 双 token Claim-first 已解决旧的 FinalDrain backlog；S6.29 已消除 BUILT 扫描与 Claim 之间的重复返回型 load，当前主要缺口继续转向仍承担真实业务判断且不能复用既有快照的返回型 Atomic |
 | 明确非目标 | 不引入 `try_wait`、engine continuation 或“kernel 运行期间同一 Scalar 继续调度” |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
@@ -318,6 +318,13 @@ EMPTY
 
 现有 Claim 已经保证唯一 Build owner；`EMPTY -> BUILDING` 首版仍用返回型 CAS 检查，作为重复 builder 的显式正确性门。`BUILT -> CLAIMED` 即使在固定单 executor 阶段也保留 atomic phase transition，但该阶段没有仲裁竞争；它只验证发布与所有权转换。
 
+执行扫描读取到完整 packed control 后，若该快照已经是合法 `BUILT`，Claim
+必须直接把**同一个快照**作为 `BUILT -> CLAIMED` CAS 的 expected 值，不得在
+CAS 前再次返回型读取同一 control。CAS 才是唯一的执行所有权线性化点：快照
+若已过期，CAS 返回最新值并按 `Lost/NotBuilt` 进入既有重新观察路径；因此复用
+快照不会用旧状态取得所有权。只有没有上游扫描快照的独立 helper 调用，才允许
+自行读取一次 control 后进入同一 CAS 实现。
+
 每个 executor 当前固定保留两个本地 execution token。每个 token 的正常主干均为 `IDLE -> BINDING -> WAITING_FANIN -> ENGINE_INFLIGHT -> COMPLETING -> VEND_PUBLISHED -> COMPLETION_PUBLISHED -> IDLE`，错误收敛到 `FAULTED`。这些不是新的共享 atomic phase；跨核只需要清晰的 `BUILT`、`CLAIMED` 和 `DONE` 边界。每个 token 只保存 task id、有效 payload binding、fanin 游标和 completion 所需的紧凑状态，不是 4,824B `LocalSlot` 的另一份拷贝。
 
 executor 在读取 ordinary payload 之前，就必须知道自己是否兼容、cell 是否对应请求 task，以及需要 invalidate 多少条 line。因此首版 packed atomic state 除 phase/owner 外，还必须随 `BUILT` 一次性发布：
@@ -545,8 +552,10 @@ acquire 后，才检查该 task 的 fanin。每个核当前允许同时持有两
 1. 已领取的 Build ticket 必须完整发布到 BUILT；处理中途不切换角色
 2. 回到调度决策点后，先逐一检查本核两个已占用 execution token
 3. 任一 token 的 fanin ready：立即执行；不得先领取新 task 或 Build ticket
-4. 已占用 token 均未 ready、且仍有空 token：扫描本核 K2-compatible BUILT
-5. 对目标执行 CAS BUILT -> CLAIMED(self)；CAS loser 不占 token
+4. 已占用 token 均未 ready、且仍有空 token：扫描本核 K2-compatible cell，
+   并保留本次返回的完整 control 快照
+5. 快照为 BUILT 时，以该快照作为 expected 执行 CAS BUILT -> CLAIMED(self)；
+   CAS 前不重复 load，CAS loser 不占 token，并重新观察
 6. CAS winner 立即 Invalidate/复制完整 payload，重建对应 token 的 binding
 7. 抢到后立刻检查 fanin；不能把首次 ready 检查推迟到下个 Submit
 8. 第一个 token 未 ready 时，允许再抢一个 BUILT task 到第二个 token
@@ -1029,6 +1038,8 @@ S3a 和 S3b 把“shared payload 发布税”与“跨核取得税”分开，�
 - eligible 且至少有一个 token 为 `IDLE` 的 observer 都可以对 `BUILT`
   发射 `BUILT -> CLAIMED(self)` CAS；唯一 winner 读 payload，loser
   不做 payload DCCI；
+- observer 对 control 的一次返回型读取同时承担资格判断与 CAS expected；CAS
+  本身验证快照是否仍有效，失败后重新观察，不在二者之间插入重复 atomic load；
 - CAS 返回 `ExecClaimResult::Lost`，或竞争窗口中返回
   `NotBuilt`，都保留候选位并重新观察 control；后续只在确认
   另一合法候选已进入 `CLAIMED/DONE` 后退役本 task。这些结果

@@ -4836,12 +4836,11 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
 
         PA_GM cross_core::SharedExecCell &cell =
             state->exec_cells[task_id];
+        const int64_t observed_raw = observer.LoadCellState(
+            &cell.control.state, task_id
+        );
         const cross_core::DecodedExecState observed =
-            cross_core::DecodeExecState(
-                observer.LoadCellState(
-                    &cell.control.state, task_id
-                )
-            );
+            cross_core::DecodeExecState(observed_raw);
         if (!observed.valid) {
             PublishCrossCoreRuntimeFailure<Ops>(
                 state, stats,
@@ -4959,8 +4958,9 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
             PA_GM cross_core::ExecutionToken &claim_token =
                 state->exec_tokens[worker_id][idle_token_slot];
             const cross_core::ExecClaimResult claim =
-                cross_core::ClaimAndBindExecPayload<Ops>(
-                    cell, task_id, worker_id, route_engine,
+                cross_core::ClaimAndBindObservedExecPayload<Ops>(
+                    cell, observed_raw, task_id,
+                    worker_id, route_engine,
                     claim_token,
                     state->exec_fatal, observer
                 );

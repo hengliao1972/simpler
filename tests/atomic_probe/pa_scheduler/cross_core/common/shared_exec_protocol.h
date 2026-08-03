@@ -1196,8 +1196,9 @@ PA_DEVICE bool ExecEngineCompatible(
 }
 
 template <typename Ops, typename Observer>
-PA_DEVICE ExecClaimResult ClaimAndBindExecPayload(
-    PA_GM SharedExecCell &cell, uint32_t task_id,
+PA_DEVICE ExecClaimResult ClaimAndBindObservedExecPayload(
+    PA_GM SharedExecCell &cell, int64_t observed_raw,
+    uint32_t task_id,
     uint32_t execute_owner, ExecEngineClass executor_engine,
     PA_GM ExecutionToken &token,
     PA_GM SharedExecFatalControl &fatal, Observer &observer
@@ -1215,9 +1216,6 @@ PA_DEVICE ExecClaimResult ClaimAndBindExecPayload(
         );
         return ExecClaimResult::InvalidControl;
     }
-    const int64_t observed_raw = observer.LoadCellState(
-        &cell.control.state, task_id
-    );
     const DecodedExecState observed = DecodeExecState(observed_raw);
     if (!observed.valid) {
         (void)PublishExecFatal<Ops>(
@@ -1312,6 +1310,37 @@ PA_DEVICE ExecClaimResult ClaimAndBindExecPayload(
     }
     token.control.phase = ExecTokenPhase::WaitingFanin;
     return ExecClaimResult::Claimed;
+}
+
+template <typename Ops, typename Observer>
+PA_DEVICE ExecClaimResult ClaimAndBindExecPayload(
+    PA_GM SharedExecCell &cell, uint32_t task_id,
+    uint32_t execute_owner, ExecEngineClass executor_engine,
+    PA_GM ExecutionToken &token,
+    PA_GM SharedExecFatalControl &fatal, Observer &observer
+) {
+    // 忙 token 和非法 owner 必须在共享读取前拒绝，保持调用方可以用
+    // “无 shared operation”识别本地入口错误。正常路径读取一次完整
+    // control 快照，随后由 CAS 负责验证该快照是否仍是线性化前状态。
+    if (token.control.phase != ExecTokenPhase::Idle) {
+        return ExecClaimResult::TokenBusy;
+    }
+    if (!ExecOwnerValid(execute_owner) ||
+        !ExecEngineValid(executor_engine)) {
+        (void)PublishExecFatal<Ops>(
+            fatal, ExecFatalReason::InvalidBuiltControl,
+            task_id,
+            ExecOwnerValid(execute_owner) ? execute_owner : 0,
+            observer
+        );
+        return ExecClaimResult::InvalidControl;
+    }
+    return ClaimAndBindObservedExecPayload<Ops>(
+        cell,
+        observer.LoadCellState(&cell.control.state, task_id),
+        task_id, execute_owner, executor_engine,
+        token, fatal, observer
+    );
 }
 
 template <typename Ops>

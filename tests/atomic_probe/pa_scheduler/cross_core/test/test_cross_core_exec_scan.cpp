@@ -1147,11 +1147,12 @@ void TestArbitraryBuildOwnerCandidateBehavior() {
                     );
                     const uint32_t expected_executor =
                         build_owner == primary ? secondary : primary;
-                    // 唯一 winner 在同一 control 字上完成一次
-                    // BUILT->CLAIMED 和一次 CLAIMED->DONE CAS。
+                    // 唯一 winner 复用 scanner 已经返回的 BUILT
+                    // 快照完成 BUILT->CLAIMED CAS；稍后到达的 loser
+                    // 只需再读一次 DONE。CLAIMED->DONE 仍是独立 CAS。
                     all_ok &= total_progress == 1 &&
                         total_execute == 1 && total_claim_cas == 2 &&
-                        total_control_loads == 3 &&
+                        total_control_loads == 2 &&
                         done.valid && done.phase == ExecPhase::Done &&
                         done.build_owner == build_owner &&
                         done.execute_owner == expected_executor &&

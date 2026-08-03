@@ -2036,7 +2036,7 @@ AIC 的等价尾部由 `3` 个合并为 `1` 个，AIV 保持 `3` 个；对象仍
 - 全部 `fatal_poll` 逻辑调用：`12,611 -> 1,597`，下降 `87.336%`；
 - 1280 task、1024 kernel、execution/semantic/postprocess 与 raw 计数全部 PASS。
 
-唯一保留的最新泳道副本为：
+该阶段当时归档的泳道副本为：
 
 `tests/atomic_probe/pa_scheduler/test_record/2026-8-4/cross_b256_s627_2p686ms.json`
 
@@ -2081,3 +2081,57 @@ candidate median 回退 0.005687 ms / 0.230%
 大小的全局关键路径，删除后还会改变代码布局和并发相位。S6.28 的代码与新增
 门槛已完整撤回，只保留本节取证记录；后续不再以“调用次数减少”代替冻结 A/B
 性能裁决。
+
+## 2026-08-04：S6.29 复用执行扫描快照完成 Claim CAS
+
+S6.27 的最新泳道显示，`shared_exec_cell_state_load` 有 `5,054` 次逻辑调用，
+聚合约 `1,351.052 us`。源码核对发现，K2 scanner 已经返回了一次完整 packed
+control；当它判断 phase 为 `BUILT` 后，`ClaimAndBindExecPayload()` 又在同一
+control 上执行一次返回型 load，随后才做 `BUILT -> CLAIMED` CAS。第二次 load
+既不发布数据，也不是所有权线性化点。
+
+本阶段新增接收 `observed_raw` 的 Claim 入口。scanner 将自己刚读取的完整
+control 快照直接作为 CAS expected；CAS 仍是唯一执行所有权裁决点。若快照在
+扫描与 CAS 之间过期，CAS 必然失败并返回新状态，原有 `Lost/NotBuilt` 路径会
+保留候选并重新观察，因此不会凭旧快照错误取得执行权。原有无上游快照的公共
+helper 继续保留，并且仍只在本地 token/owner 参数检查通过后读取一次 control，
+没有改变定向测试依赖的“本地入口错误不产生 shared operation”合同。
+
+先将 BUILT 正常路径的精确 control-load 期望从 `3` 改为 `2`，旧代码按预期
+失败；实现后该门槛通过。完整 CPU 协议回归、CCEC full-swimlane/perf-clock
+构建以及 A5 B256 full-swimlane 全部 PASS，1280 个 Build、1024 个 kernel、
+TensorMap 严格插入、payload、fanin、completion 和终态均未改变。
+
+本阶段 full-swimlane 为：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260803_180902_328262/ccec/merged_swimlane.json`
+
+归档副本为：
+
+`tests/atomic_probe/pa_scheduler/test_record/2026-8-4/cross_b256_s629_2p690ms.json`
+
+动态结果：
+
+- 完整生命周期：`2.689998 ms`；
+- Submit：`1.141835 ms`；
+- FinalDrain：`1.692159 ms`；
+- `shared_exec_cell_state_load`：`5,054 -> 3,991`，减少 `1,063` 次，
+  即 `21.033%`；
+- `shared_exec_claim` 仍保留 `1,024` 次必要 CAS；
+- 1280 task、1024 kernel 和全部后处理检查 PASS。
+
+为避免把设备波动或泳道代码布局误判成收益，另用提交 `4431dbfd` 构建冻结
+基线，与候选按 B-C/C-B 交错各运行六个独立 trace-free 进程：
+
+```text
+S6.27 frozen baseline: min / median / max / mean
+                       2.424855 / 2.507471 / 2.615748 / 2.509293 ms
+S6.29 candidate      : min / median / max / mean
+                       2.345950 / 2.425596 / 2.540639 / 2.428607 ms
+candidate median 改善 0.081875 ms / 3.265%
+candidate mean   改善 0.080686 ms / 3.215%
+```
+
+该候选同时减少了已定位的非必要返回型 Atomic，并在冻结交错 A/B 中得到稳定
+端到端收益，因此作为有效阶段保留。它不改变 Build/Execute 候选拓扑、
+TensorMap 插入顺序、payload 发布、fanin 判断或 completion 顺序。
