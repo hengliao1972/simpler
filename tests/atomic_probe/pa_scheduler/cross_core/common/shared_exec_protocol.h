@@ -250,14 +250,19 @@ struct alignas(kExecCacheLineBytes) SharedExecFatalControl {
     uint8_t padding[kExecCacheLineBytes - sizeof(int64_t)];
 };
 
-// 所有 replay actor 停产之后，再用一条独立 atomic-only line 汇合本核
-// execution token 的排空证据。最后到达者逐 task 核对 cell 终态后发布
-// release；这样 device 退出不依赖 host 事后发现遗失的 BUILT task。
+// 所有 replay actor 停产之后，再汇合本核 execution token 的排空证据。
+// arrival 与 release 必须各自独占 atomic-only cache line：已到达 worker
+// 会持续 poll release，不能让这些读与尚未到达 worker 的 arrival FetchAdd
+// 发生伪共享。最后到达者逐 task 核对 cell 终态后发布 release；
+// 这样 device 退出不依赖 host 事后发现遗失的 BUILT task。
 struct alignas(kExecCacheLineBytes) SharedExecDrainControl {
     volatile int64_t arrived;
+    uint8_t arrived_padding[
+        kExecCacheLineBytes - sizeof(int64_t)
+    ];
     volatile int64_t release;
-    uint8_t padding[
-        kExecCacheLineBytes - 2U * sizeof(int64_t)
+    uint8_t release_padding[
+        kExecCacheLineBytes - sizeof(int64_t)
     ];
 };
 
@@ -431,9 +436,14 @@ static_assert(
     "global fatal control must own one atomic-only cache line"
 );
 static_assert(
-    sizeof(SharedExecDrainControl) == kExecCacheLineBytes &&
+    sizeof(SharedExecDrainControl) == 2U * kExecCacheLineBytes &&
         alignof(SharedExecDrainControl) == kExecCacheLineBytes,
-    "execution drain control must own one atomic-only cache line"
+    "execution drain arrival and release must own two cache lines"
+);
+static_assert(
+    offsetof(SharedExecDrainControl, release) ==
+        kExecCacheLineBytes,
+    "execution drain release must not share the arrival cache line"
 );
 static_assert(
     offsetof(SharedExecCell, payload) == kExecCacheLineBytes,

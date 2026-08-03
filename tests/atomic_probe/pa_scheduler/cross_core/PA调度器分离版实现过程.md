@@ -2224,3 +2224,55 @@ candidate mean   改善 0.003347 ms / 0.139%
 对“在 last_writer 预留与 published Exchange 之间发生非法并发写”
 的异常检测与回滚。因此候选代码、测试和 converter 口径已全部
 撤回，保留原有 `return_ready` 协议，本节只记录反例证据。
+
+## 2026-08-04：S6.32 拆分 execution drain 到达与释放 cache line
+
+S6.29 的 execution drain 使用 96 核同地址 `arrived` FetchAdd 汇合每核
+token 排空证据，已到达 worker 随后持续 atomic poll `release`。源码
+注释声称 arrival/release 已分行，但真实 `SharedExecDrainControl` 只有
+64B，`release` 位于偏移 8；两种访问实际争用同一 cache line。
+
+本阶段先将编译期门槛收紧为 `sizeof == 128` 且 `release offset == 64`，
+旧实现按预期以 `64 != 128` 和 `8 != 64` 失败。随后只在两个控制字
+之间增加精确 padding，使 `arrived` 与 `release` 各自独占 64B atomic-only
+行。cross-core execution tail 的精确搬运大小相应由 `20,182,272`
+增加到 `20,182,336` 字节，仍是 `exec_fatal` 到 `SchedulerState` 尾部的
+一段连续范围。
+
+该改动不改变原子次数和协议：每核仍只 arrival 一次，最后到达者
+仍逐 task 验证 Alloc `EMPTY` / kernel `DONE`，然后唯一发布 release；
+其他核仍等待 release 后退出。完整 CPU 协议回归、CPU B256、CCEC
+full-swimlane/perf-clock 构建以及 A5 B256 full-swimlane 全部 PASS。
+
+A5 full-swimlane 为：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260803_190217_376268/ccec/merged_swimlane.json`
+
+动态结果：
+
+- 完整生命周期：`2.669770 ms`；
+- Submit：`1.119853 ms`；
+- FinalDrain：`1.662478 ms`；
+- 96 次 arrival FetchAdd 泳道聚合：`731.706 -> 726.548 us`；
+- release poll 逻辑调用：`8,127 -> 7,728`；
+- 1280 task、1024 kernel、TensorMap、payload、fanin、completion 和终态全部 PASS。
+
+两份泳道不是同一 ELF 的多轮性能样本，上述局部值只用于证明 atomic
+数量与流程符合预期，不直接声称端到端收益。最终以提交
+`4fdfe905` 构建冻结 S6.29 基线，按 B-C/C-B 交错各运行六个独立
+trace-free 进程：
+
+```text
+S6.29 frozen baseline: min / median / max / mean
+                       2.347100 / 2.433064 / 2.662387 / 2.453087 ms
+S6.32 candidate      : min / median / max / mean
+                       2.310743 / 2.354961 / 2.506264 / 2.378929 ms
+candidate median 改善 0.078103 ms / 3.210%
+candidate mean   改善 0.074158 ms / 3.023%
+```
+
+中位数和均值同向，且改善幅度远大于一条指令级删减，说明收益主要
+来自不再让已到达核的 release poll 与未到达核的 arrival RMW 发生
+同行干扰，而不是单条 arrival FetchAdd 本身大幅变快。该阶段不改
+TensorMap 严格插入、Build/Execute owner、fanin、completion 或终态收口合同，
+因此作为有效优化保留。

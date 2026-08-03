@@ -7,13 +7,13 @@
 | 目标 | 让 task 的构建 owner 与 kernel 执行 owner 可以是不同物理核 |
 | 当前代码 | 96 Scalar 通过中央 ticket 恰好一次 Build；Build owner 发布 task-indexed shared payload，K2 排除 Build owner 后的 1 或 2 个 eligible executor 竞争执行 |
 | 本文性质 | 持续更新的架构与内存模型设计记录 |
-| 正式实现 | S0–S6.29 已形成中央 ticket + 严格 TensorMap 插入 + K2 异核 Execute；成功路径的 terminal 观察已集中到调度边界，执行扫描得到的完整 control 快照直接参与 Claim CAS；descriptor 引用和 unique-ticket 单 CAS 两个回退候选均已撤销 |
+| 正式实现 | S0–S6.32 已形成中央 ticket + 严格 TensorMap 插入 + K2 异核 Execute；执行扫描得到的完整 control 快照直接参与 Claim CAS，execution drain 的 arrival/release 已分开独占 cache line；descriptor 引用、unique-ticket 单 CAS 和发布 Exchange 非等待候选均已撤销 |
 | CPU 正确性用例 | S1–S4 K2、S5a 对侧角色 Build 与 S5b 全 96 Scalar Build 门槛已完成 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
-| A5 PA 功能/性能 | 旧 `2.323 ms` 是 Submit-only 数字，已退出性能裁决；当前唯一口径为首个 Submit 起点到 FinalDrain 结束。S6.29 冻结交错 A/B 中，S6.27 基线中位 `2.507 ms`，候选中位 `2.426 ms`，改善 `3.27%`；功能与终态全部 PASS |
+| A5 PA 功能/性能 | 旧 `2.323 ms` 是 Submit-only 数字，已退出性能裁决；当前唯一口径为首个 Submit 起点到 FinalDrain 结束。S6.32 冻结交错 A/B 中，S6.29 基线中位 `2.433 ms`，候选中位 `2.355 ms`，改善 `3.21%`；功能与终态全部 PASS |
 | S4 动态 Execute election | K2 首版已通过 CPU B1/B256 和 A5 B1/B256；B256 中两候选都有实际胜出，非法 owner 为 0 |
 | S5 Build 拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 五类 task 全 96/G8 已通过 CPU/CCEC/A5 B1/B256，物理 Claim CAS 精确闭合 |
-| 当前调度缺口 | 双 token Claim-first 已解决旧的 FinalDrain backlog；S6.29 已消除 BUILT 扫描与 Claim 之间的重复返回型 load，当前主要缺口继续转向仍承担真实业务判断且不能复用既有快照的返回型 Atomic |
+| 当前调度缺口 | 双 token Claim-first 已解决旧的 FinalDrain backlog；S6.29 已消除 BUILT 扫描与 Claim 之间的重复返回型 load，S6.32 已消除 drain arrival/release 的同行干扰；当前主要缺口继续转向仍承担真实业务判断且不能复用既有快照的返回型 Atomic |
 | 明确非目标 | 不引入 `try_wait`、engine continuation 或“kernel 运行期间同一 Scalar 继续调度” |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
@@ -251,6 +251,7 @@ CCEC 的 [StoreBarrier](same_core/ccec/ccec_ops.h#L237) 为刻意的 no-op；现
 - 不能只证明一个 8B word 没有竞争，必须说明它所在整条 64B line 的所有普通写、atomic 和 DCCI；
 - atomic 控制 line 与普通 payload line 必须分离；
 - 多个 atomic 可以在充分证明后共线，但整条 line 必须始终 atomic-only；第一版优先一条热点 atomic 独占一行。
+- 即使两个 control 都是 atomic-only，若一个被持续 poll、另一个仍有并发 RMW，也不应共享 cache line。execution drain 因此固定为 `arrived` 与 `release` 各自独占 64B，不能为节省状态字节再合并。
 
 ### 4.2 ordinary payload 的写者发布顺序
 
@@ -600,6 +601,12 @@ engine final wait
 
 在 task-indexed 首版中，`DONE` 是本轮终态，device 不执行 `DONE -> FREE`。host 在 kernel 结束后校验每个 cell 的唯一 owner、completion 和终态，从而先把“跨核交接”与“设备侧回收”彻底拆开。
 
+FinalDrain 中，每核证明 scanner 封口且两个 token 均已复位后，对
+`exec_drain.arrived` 执行一次 FetchAdd。已到达核随后只轮询独立的
+`exec_drain.release` 行；最后到达者校验所有 task cell 终态后发布
+release。两条线的拆分只消除伪共享，不改变 96 核全到达、最后者唯一
+校验或 device 退出合同。
+
 有界复用版才需要特别求证：新增加的 `DONE(g) -> FREE(g+1)` 与既有 completion atomic 之间采用什么硬件顺序。不能仅因源码中两个 atomic 前后相邻，就默认所有远端核观察顺序一致。
 
 该复用版的回收条件至少包括：
@@ -914,7 +921,7 @@ PA 只是第一个算子，设计不得固化以下现状：
 20. 第一个 token 未 ready 时允许领取第二项；任一 owner-local token ready 时，Execute 必须优先于新 Claim 和新 Build；
 21. 未被空闲 executor 领取的 task 保持 `BUILT`，不因某个忙核而移入无界私有队列；
 22. 正常路径先发布 completion 和 cell `DONE`，然后才把对应 execution token 恢复为 `IDLE`；
-23. FinalDrain 同时证明 builder 停止生产、所有 kernel cell 全部 DONE、每核两个 execution token 均为 `IDLE`、engine 无 in-flight；
+23. FinalDrain 同时证明 builder 停止生产、所有 kernel cell 全部 DONE、每核两个 execution token 均为 `IDLE`、engine 无 in-flight；drain arrival/release 必须各自独占 cache line；
 24. 后续 reuse 版额外证明慢 reader 不会把旧 generation 当新任务；
 25. AIC/AIV function 路由严格匹配；
 26. fatal 路径不会执行半构建或已取消 payload；

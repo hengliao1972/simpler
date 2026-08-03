@@ -1163,7 +1163,7 @@ inline constexpr size_t CrossCoreExecStateBytes() {
     return kCrossCoreExecStateBytes;
 }
 static_assert(
-    CrossCoreExecStateBytes() == 20182272,
+    CrossCoreExecStateBytes() == 20182336,
     "cross-core execution state transfer size changed"
 );
 static_assert(
