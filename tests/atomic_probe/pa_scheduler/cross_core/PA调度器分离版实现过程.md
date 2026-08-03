@@ -2731,3 +2731,65 @@ Scalar 无法接手；task 8 又必须等待 task 7 的 TensorMap 插入，结�
 实现、host oracle 和临时测试适配均已完整撤回，只保留本节论证。后续若优化
 中央 Build ticket，必须继续保持逐 task 可由任意可用 Scalar 独立取得，不能
 用私有批量所有权换取 Atomic 数量下降。
+
+## 2026-08-04：S6.41 省略 ordered Fanin 的 output-published 回读（无收益，已撤回）
+
+S6.38 的正式 Build 在发布 task N 的 `deps_prepared[N]` 之后才执行 Fanin。
+对任意合法引用 `P < N`，逐 task completion 链已经传递以下顺序：
+
+```text
+P descriptor 写入
+-> descriptor DCCI clean-out + DSB
+-> published[P,slot] 发布
+-> P writer metadata 发布
+-> deps_prepared[P] 发布
+-> ...
+-> N 取得并发布自己的 insert completion
+-> N Fanin lookup
+```
+
+因此候选只在明确携带该前置条件的正式 ordered/latest-writer 实例中省略
+`published[P,slot]` 回读；通用 helper 继续读取并拒绝未发布 producer，真正
+决定依赖的 `last_writer` 返回型读取、history invalidate/解析、fanin 范围检查
+和 execution completion flag 均保持不变。
+
+实现前先增加定向门槛，旧实现因不存在可信实例而按预期编译失败；实现后证明：
+
+- 通用实例仍恰好读取一次 published，并立即拒绝未发布 producer；
+- 可信实例对 published 地址零次读取，但仍从 last_writer 得到精确 producer；
+- 完整 CPU 协议回归、converter/analyzer 99 项回归以及 CCEC
+  full-swimlane/perf-clock 构建全部 PASS；
+- ordered-submit 的 `release_before_build` 和
+  `independent_kernel_overlap` 两项并发门槛保持 PASS。
+
+A5 B256 full-swimlane 位于：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260803_224932_583794/ccec/merged_swimlane.json`
+
+该次动态结果为：
+
+- 完整生命周期：`1.523871 ms`；
+- Submit：`1.107103 ms`；
+- `SharedFaninOutputPublishedLoad`：`2048 -> 0`；
+- 保留的 `SharedFaninLastWriterLoad` 仍为 2048 次；
+- 1280 task、1024 kernel、TensorMap、descriptor、history、fanin、payload、
+  completion 和全部终态 PASS，泳道记录无丢失。
+
+单次诊断不用于裁决。最终以提交 `88830ca4` 构建冻结 S6.38 基线，与候选按
+B-C/C-B 交错各运行六个独立 trace-free B256 进程：
+
+```text
+S6.38 frozen baseline: min / median / max / mean
+                       1.398461 / 1.423792 / 1.443002 / 1.421513 ms
+S6.41 candidate      : min / median / max / mean
+                       1.428045 / 1.438135 / 1.474755 / 1.442186 ms
+candidate median 回退 0.014343 ms / 1.007%
+candidate mean   回退 0.020673 ms / 1.454%
+```
+
+六对样本中五对回退。候选并非代码膨胀：perf-clock AIC/AIV finish `.text`
+分别从 `42,704/43,992 B` 缩小为 `42,112/43,472 B`。现有证据只能确认删除
+2048 次返回型读取改变了代码布局或并发相位，却没有带来端到端收益；不能在缺少
+进一步证据时把回退武断归因于某一项。候选实现与测试适配已完整撤回，保留原有
+publication 检查。本节再次说明：泳道中的 Atomic 聚合核时用于发现候选，不能
+替代冻结无观察 A/B 的保留裁决。
