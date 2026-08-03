@@ -293,7 +293,8 @@ echo "[TEST] atomic PollBatch boundary self-test"
 
     # 扫描器必须只消费已经闭合的 Submit 前缀，并在 token busy 后继续从
     # 原游标发现后续 task；FinalDrain 还要由 96 个 worker 汇合后在 device
-    # 侧证明 Alloc=EMPTY、kernel=DONE、token=IDLE，不能只靠 host 事后拒绝。
+    # 侧证明每组到达数、唯一 kernel completion 总数和 token=IDLE，不能
+    # 只靠 host 事后拒绝，也不能重新引入逐 task 原子终态扫描。
     echo "[BUILD] PA cross-core execution scan/drain self-test"
     "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \

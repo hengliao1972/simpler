@@ -7,13 +7,13 @@
 | 目标 | 让 task 的构建 owner 与 kernel 执行 owner 可以是不同物理核 |
 | 当前代码 | 96 Scalar 通过中央 ticket 恰好一次 Build；Build owner 发布 task-indexed shared payload，K2 排除 Build owner 后的 1 或 2 个 eligible executor 竞争执行 |
 | 本文性质 | 持续更新的架构与内存模型设计记录 |
-| 正式实现 | S0–S6.36 已形成中央 ticket + 严格 TensorMap 插入 + K2 异核 Execute；执行扫描得到的完整 control 快照直接参与 Claim CAS；execution drain 采用 16 组单向 arrival，非 root 到达后结束，固定 root 最后完成全量终态校验；descriptor 引用、unique-ticket 单 CAS、发布 Exchange 非等待和 winner fatal 重复读取候选均已撤销 |
+| 正式实现 | S0–S6.38 已形成中央 ticket + 严格 TensorMap 插入 + K2 异核 Execute；执行扫描得到的完整 control 快照直接参与 Claim CAS；execution drain 采用 16 组单向 arrival，并在同一次 FetchAdd 中汇合 owner-local 完成数，固定 root 不再逐 task 原子扫描；descriptor 引用、unique-ticket 单 CAS、发布 Exchange 非等待和 winner fatal 重复读取候选均已撤销 |
 | CPU 正确性用例 | S1–S4 K2、S5a 对侧角色 Build 与 S5b 全 96 Scalar Build 门槛已完成 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
-| A5 PA 功能/性能 | 旧 `2.323 ms` 是 Submit-only 数字，已退出性能裁决；当前唯一口径为首个 Submit 起点到 FinalDrain 结束。S6.36 相对 S6.35 的 12+12 冻结交错 A/B 中，中位由 `2.162 ms` 降至 `2.139 ms`，改善 `1.066%`；功能与终态全部 PASS |
+| A5 PA 功能/性能 | 旧 `2.323 ms` 是 Submit-only 数字，已退出性能裁决；当前唯一口径为首个 Submit 起点到 FinalDrain 结束。S6.38 相对 S6.36 的 6+6 冻结交错 A/B 中，中位由 `2.127 ms` 降至 `1.416 ms`，改善 `33.454%`；功能与终态全部 PASS |
 | S4 动态 Execute election | K2 首版已通过 CPU B1/B256 和 A5 B1/B256；B256 中两候选都有实际胜出，非法 owner 为 0 |
 | S5 Build 拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 五类 task 全 96/G8 已通过 CPU/CCEC/A5 B1/B256，物理 Claim CAS 精确闭合 |
-| 当前调度缺口 | 双 token Claim-first 已解决旧的 FinalDrain backlog；S6.29 已消除 BUILT 扫描与 Claim 之间的重复返回型 load，S6.32/S6.33 已把 drain arrival 拆行并分片，S6.35 证明 release 分片有效，S6.36 进一步证明反向 release 整体不需要；当前主要缺口继续转向仍承担真实业务判断且不能复用既有快照的返回型 Atomic |
+| 当前调度缺口 | 双 token Claim-first 已解决旧的 FinalDrain backlog；S6.29 复用 Claim 快照，S6.32–S6.36 收敛 drain，S6.38 再删除 root 的 2560 次逐 task 终态读取。当前 trace-free 中位约 `1.416 ms`，下一步继续从真实业务依赖和同地址竞争两侧审视剩余 Atomic，不能再用单次诊断 core-time 代替冻结 A/B |
 | 明确非目标 | 不引入 `try_wait`、engine continuation 或“kernel 运行期间同一 Scalar 继续调度” |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
@@ -604,12 +604,23 @@ engine final wait
 FinalDrain 中，每核证明 scanner 封口且两个 token 均已复位后，按
 `block_id % 16` 对所属 `exec_drain.arrivals[group]` 执行一次 FetchAdd。
 当前 32 block、每 block 1 AIC + 2 AIV 的拓扑使每组精确包含 6 个 worker。
-非 root 核发布 arrival 后即可结束本核；固定 root worker 轮询 16 个分组
-计数，确认每组均为 6 后校验所有 task cell 终态，最后结束整个 device
-kernel。之所以不再需要反向 release，是因为 replay barrier 已证明不会再
-生产 BUILT，而 arrival 只在本核 scanner 封口、两个 token 清空且 engine
-无 in-flight 后发布；root 的最终退出仍是全局收口点。host 逐组要求
-`arrival == 6`，并继续校验所有 cell 与每核 `final_occupied == 0`。
+同一个 64-bit arrival word 的低 8 位累加 worker 到达数，高位累加该 worker
+三个 placement 计数之和；即每核只发射一次
+`FetchAdd(1 + (completed << 8))`。低位最大为 6，不会向完成数字段进位。
+
+这份合计足以在 device 内证明本轮全部 kernel 已完成，前提来自现有合同而非
+统计猜测：中央 Build ticket 给出完整 task 集；`BUILT -> CLAIMED` CAS 使每个
+kernel 至多产生一个 Execute owner；placement 只在 completion flag 和 cell
+`DONE` 均发布成功后递增；每核又必须等 scanner 封口、两个 token 清空且 engine
+无 in-flight 才能到达。因此 16 组全部到齐且完成数合计等于
+`task_count - batches`，即可推出所有 kernel 恰好完成，不能由重复完成补齐缺口。
+
+非 root 发布后即可结束；固定 root 只读取 16 个分组 word，确认每组低位为 6、
+高位合计为计划 kernel 数后结束整个 device kernel。它不再串行读取 1280 个
+cell control 和 1280 个 completion flag。host 在 kernel 返回后仍逐 task
+校验 owner、cell、flag 和 payload，保留精确故障定位；这不是设备收口的替代。
+反向 release 继续不需要，因为 replay barrier 已证明不会再生产 BUILT，root
+的最终退出仍是全局收口点。
 
 有界复用版才需要特别求证：新增加的 `DONE(g) -> FREE(g+1)` 与既有 completion atomic 之间采用什么硬件顺序。不能仅因源码中两个 atomic 前后相邻，就默认所有远端核观察顺序一致。
 
@@ -925,7 +936,7 @@ PA 只是第一个算子，设计不得固化以下现状：
 20. 第一个 token 未 ready 时允许领取第二项；任一 owner-local token ready 时，Execute 必须优先于新 Claim 和新 Build；
 21. 未被空闲 executor 领取的 task 保持 `BUILT`，不因某个忙核而移入无界私有队列；
 22. 正常路径先发布 completion 和 cell `DONE`，然后才把对应 execution token 恢复为 `IDLE`；
-23. FinalDrain 同时证明 builder 停止生产、所有 kernel cell 全部 DONE、每核两个 execution token 均为 `IDLE`、engine 无 in-flight；每个 worker 只向所属 arrival group 到达一次，非 root 到达后可以结束，固定 root 只有看到 16 组各 6 个到达并完成全量 cell 校验后才允许最后结束；
+23. FinalDrain 同时证明 builder 停止生产、所有 kernel cell 全部 DONE、每核两个 execution token 均为 `IDLE`、engine 无 in-flight；每个 worker 只向所属 arrival group 到达一次，并在同一次 FetchAdd 中携带本核已成功发布 DONE 的完成数；非 root 到达后可以结束，固定 root 只有看到 16 组各 6 个到达且完成数合计等于 `task_count - batches` 后才允许最后结束；
 24. 后续 reuse 版额外证明慢 reader 不会把旧 generation 当新任务；
 25. AIC/AIV function 路由严格匹配；
 26. fatal 路径不会执行半构建或已取消 payload；
@@ -1029,7 +1040,7 @@ CPU 只验证状态机和交错，不用于证明 A5 cache 可见性。generatio
 - 每个 executor 按 task id 递增处理自己的固定映射序列；第一 token 已领取且未 ready 时允许继续领取下一项到第二 token，两个 token 都占用后不再领取；
 - 候选看到 `EMPTY` 时保留队头；看到已带 `build_owner` 的 `BUILDING/BUILT/CLAIMED/DONE` 后，非 target 候选才能丢弃本地记录；只有全局停产后的残留 `EMPTY/BUILDING` 才是 terminal 缺口；
 - 先跑 B1 正确性，再跑 B256；host 精确检查 build owner 与 execute owner 不同、task/descriptor/fanin/vend/completion 全部一致；
-- FinalDrain 使用“所有 builder 停产 + 所有 kernel cell DONE + 每核两个 token 全部 IDLE + engine 无 in-flight”收口。
+- FinalDrain 使用“所有 builder 停产 + 每核 scanner/token/engine 排空 + 16 组完成数精确等于计划 kernel 数”收口；唯一 Claim CAS 给出至多一次，完成数只在 DONE 成功后递增，因此该汇总仍证明所有 kernel cell DONE，不再由 root 逐项读取。
 
 S3a 和 S3b 把“shared payload 发布税”与“跨核取得税”分开，同时不混入动态 election。
 
@@ -1073,6 +1084,8 @@ Build owner 发布 `BUILT` 之前完成。S4 不修改这条串行链；
 
 `FinalDrain` 继续使用已有全局合同：所有 builder 停产、所有
 kernel cell 为 `DONE`、每核两个 token 均为 `IDLE`、engine 无 in-flight。
+设备侧通过 16 组 packed arrival 的完成数汇总证明该终态，host 返回后仍逐
+cell 校验；root 不再在性能边界内做全表 Atomic scan。
 生产闭合后的 `EMPTY/BUILDING` 是发布缺口；`BUILT` 必须继续
 election；`CLAIMED` 只能等待 `DONE`，不能因 loser 本地位图已清理
 就提前结束。

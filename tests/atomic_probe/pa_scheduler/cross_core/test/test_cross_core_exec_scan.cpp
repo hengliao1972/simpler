@@ -2504,6 +2504,9 @@ void TestFinalDrainClosesLastTask() {
     std::array<int64_t,
                cross_core::kExecDrainArrivalGroups>
         expected_group_arrivals{};
+    std::array<int64_t,
+               cross_core::kExecDrainArrivalGroups>
+        expected_group_completions{};
     bool all_arrivals_ok = true;
     for (uint32_t worker_id = 0;
          worker_id < kWorkers; ++worker_id) {
@@ -2514,6 +2517,22 @@ void TestFinalDrainClosesLastTask() {
             arrival_stats[worker_id], worker_id,
             RoleForWorker(worker_id)
         );
+        // drain arrival 必须携带本 worker 已成功发布 DONE 的 task 数。
+        // 前三个 terminal cell 由测试预置，最后一个由上面的真实
+        // FinalDrain 执行；这里按 control 中的 execute_owner 恢复四个
+        // owner-local completion，模拟生产中各 worker 的 placement 合计。
+        for (uint32_t task_id = 1; task_id < 5; ++task_id) {
+            const DecodedExecState terminal = DecodeExecState(
+                state->exec_cells[task_id].control.state
+            );
+            if (terminal.valid &&
+                terminal.phase == ExecPhase::Done &&
+                terminal.execute_owner == worker_id) {
+                ++arrival_stats[worker_id].result.placement[
+                    static_cast<uint32_t>(DrainPlace::FinalDrain)
+                ];
+            }
+        }
         // 该子用例从“所有 terminal task 已由其原 LocalStats 消费”之后
         // 开始，只验证单向 drain arrival；因此把新建的测试上下文
         // 定位到第一个计划外候选，不能让 execute owner 用丢失的旧游标
@@ -2538,21 +2557,42 @@ void TestFinalDrainClosesLastTask() {
             static_cast<uint32_t>(arrival_worker.block_id) %
             cross_core::kExecDrainArrivalGroups;
         ++expected_group_arrivals[arrival_group];
+        expected_group_completions[arrival_group] +=
+            arrival_stats[worker_id].result.placement[
+                static_cast<uint32_t>(DrainPlace::EfDrain)
+            ] +
+            arrival_stats[worker_id].result.placement[
+                static_cast<uint32_t>(DrainPlace::RingBackpressure)
+            ] +
+            arrival_stats[worker_id].result.placement[
+                static_cast<uint32_t>(DrainPlace::FinalDrain)
+            ];
+        const int64_t expected_group_state =
+            expected_group_arrivals[arrival_group] +
+            (expected_group_completions[arrival_group] <<
+             cross_core::kExecDrainArrivalCountBits);
         all_arrivals_ok &= closure_ok && arrived[worker_id] &&
             closed == (worker_id != 0) &&
             state->exec_drain.arrivals[arrival_group].state ==
-                expected_group_arrivals[arrival_group];
+                expected_group_state;
     }
+    int64_t expected_total_completions = 0;
     for (uint32_t group = 0;
          group < cross_core::kExecDrainArrivalGroups;
          ++group) {
+        expected_total_completions +=
+            expected_group_completions[group];
         all_arrivals_ok &=
             expected_group_arrivals[group] == 6 &&
-            state->exec_drain.arrivals[group].state == 6;
+            state->exec_drain.arrivals[group].state ==
+                6 + (expected_group_completions[group] <<
+                     cross_core::kExecDrainArrivalCountBits);
     }
     Check(
-        all_arrivals_ok && NoFatal(*state),
-        kTest, "six workers arrive in each of sixteen drain groups"
+        all_arrivals_ok && expected_total_completions == 4 &&
+            NoFatal(*state),
+        kTest,
+        "each drain group carries arrivals and owner-local completions"
     );
 
     // worker 0 是唯一 root observer；它在自己的首次到达时尚未看到
@@ -2578,8 +2618,56 @@ void TestFinalDrainClosesLastTask() {
         );
     Check(
         repeat_ok && repeat_closed &&
-            state->exec_drain.arrivals[0].state == 6,
+            state->exec_drain.arrivals[0].state ==
+                6 + (expected_group_completions[0] <<
+                     cross_core::kExecDrainArrivalCountBits),
         kTest, "one worker cannot increment drain twice"
+    );
+    std::printf("[PASS] %s\n", kTest);
+}
+
+void TestDrainCompletionCountMismatchFailsClosed() {
+    constexpr const char *kTest =
+        "drain-completion-count-mismatch-fail-closed";
+    MappedSchedulerState mapping;
+    SchedulerState *state = mapping.Get();
+    Check(state != nullptr, kTest, "state mapping");
+    if (state == nullptr) return;
+
+    state->config.batches = 1;
+    state->context_lens[0] = 1;
+    // B1 的五个 task 中只有四个 kernel。这里伪造 96 个 worker 已经全部
+    // 到达，但分组完成数合计只有 3；root 必须在 device 内拒绝收口，
+    // 不能依赖 kernel 返回后的 host 扫描才发现缺失。
+    for (uint32_t group = 0;
+         group < cross_core::kExecDrainArrivalGroups;
+         ++group) {
+        const uint64_t completions = group == 0 ? 3U : 0U;
+        state->exec_drain.arrivals[group].state =
+            static_cast<int64_t>(
+                6U +
+                (completions <<
+                 cross_core::kExecDrainArrivalCountBits)
+            );
+    }
+    WorkerState &root = PrepareWorker(*state, 0, CoreRole::Aic);
+    LocalStats stats{};
+    InitLocalStats(stats, 0, CoreRole::Aic);
+    bool arrived = true;
+    bool closed = false;
+    const bool closure_ok =
+        ProgressCrossCoreExecDrainClosure<ExecScanTestOps>(
+            state, root, 5, stats, arrived, closed
+        );
+    const DecodedExecFatal fatal =
+        DecodeExecFatal(state->exec_fatal.state);
+    Check(
+        !closure_ok && arrived && !closed &&
+            state->fatal.value == 1 && fatal.valid &&
+            fatal.reason ==
+                ExecFatalReason::CompletionStateConflict,
+        kTest,
+        "root rejects an all-arrived drain with one missing completion"
     );
     std::printf("[PASS] %s\n", kTest);
 }
@@ -2607,6 +2695,7 @@ int main() {
     TestBusyCandidateUsesSecondToken();
     TestTwoBlockedTokensStopClaimButPermitBuild();
     TestFinalDrainClosesLastTask();
+    TestDrainCompletionCountMismatchFailsClosed();
 
     if (g_failures != 0) {
         std::fprintf(

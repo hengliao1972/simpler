@@ -5263,15 +5263,38 @@ PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
             !CrossCoreExecAllTokensFullyReset(state, worker_id)) {
             return true;
         }
+        uint64_t local_completed = 0;
+        for (uint32_t place = 0;
+             place < static_cast<uint32_t>(DrainPlace::Count);
+             ++place) {
+            local_completed += stats.result.placement[place];
+        }
+        const int64_t contribution =
+            cross_core::EncodeExecDrainArrivalContribution(
+                local_completed
+            );
+        if (contribution < 0 || local_completed > task_count) {
+            PublishCrossCoreRuntimeFailure<Ops>(
+                state, stats,
+                cross_core::ExecFatalReason::CompletionStateConflict,
+                task_count, worker_id
+            );
+            return false;
+        }
         const int64_t prior = TraceAtomicFetchAdd<Ops>(
             stats.trace, stats.result, -1,
             AtomicSite::SharedExecDrainArrive,
             &state->exec_drain.arrivals[arrival_group].state,
-            1,
+            contribution,
             /*result_used=*/true
         );
-        if (prior < 0 ||
-            prior >= kWorkersPerArrivalGroup) {
+        const uint32_t prior_arrivals =
+            cross_core::DecodeExecDrainArrivalCount(prior);
+        const uint64_t prior_completed =
+            cross_core::DecodeExecDrainCompletionCount(prior);
+        if (prior_arrivals == UINT32_MAX ||
+            prior_arrivals >= kWorkersPerArrivalGroup ||
+            prior_completed > task_count) {
             PublishCrossCoreRuntimeFailure<Ops>(
                 state, stats,
                 cross_core::ExecFatalReason::CompletionStateConflict,
@@ -5285,23 +5308,30 @@ PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
     // replay barrier 已证明不会再产生 BUILT，且 arrival 只在本核
     // scanner/token/engine 全部排空后发布。非 root 此后没有任何新的
     // 可执行工作，可以直接结束本核；整个 device kernel 仍由固定 root
-    // 等待 16 组到齐并完成全量 task 终态校验后最后收口。
+    // 等待 16 组到齐并核对完成数后最后收口。
     if (worker_id != 0) {
         closed = true;
         return true;
     }
+    uint64_t completed_tasks = 0;
     for (uint32_t group = 0;
          group < cross_core::kExecDrainArrivalGroups;
          ++group) {
-        const int64_t group_arrivals =
+        const int64_t group_state =
             TraceAtomicLoad<Ops>(
                 stats.trace, stats.result, -1,
                 AtomicSite::SharedExecDrainArrivalPoll,
                 &state->exec_drain.arrivals[group].state,
                 /*result_used=*/true
             );
-        if (group_arrivals < 0 ||
-            group_arrivals > kWorkersPerArrivalGroup) {
+        const uint32_t group_arrivals =
+            cross_core::DecodeExecDrainArrivalCount(group_state);
+        const uint64_t group_completed =
+            cross_core::DecodeExecDrainCompletionCount(group_state);
+        if (group_arrivals == UINT32_MAX ||
+            group_arrivals > kWorkersPerArrivalGroup ||
+            group_completed > task_count ||
+            completed_tasks > task_count - group_completed) {
             PublishCrossCoreRuntimeFailure<Ops>(
                 state, stats,
                 cross_core::ExecFatalReason::CompletionStateConflict,
@@ -5312,16 +5342,16 @@ PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
         if (group_arrivals != kWorkersPerArrivalGroup) {
             return true;
         }
+        completed_tasks += group_completed;
     }
 
-    uint32_t first_bad_task = task_count;
-    if (!ValidateCrossCoreExecTerminalCells<Ops>(
-            state, task_count, first_bad_task, stats
-        )) {
+    const uint32_t alloc_tasks = state->config.batches;
+    if (alloc_tasks > task_count ||
+        completed_tasks != task_count - alloc_tasks) {
         PublishCrossCoreRuntimeFailure<Ops>(
             state, stats,
             cross_core::ExecFatalReason::CompletionStateConflict,
-            first_bad_task, worker_id
+            task_count, worker_id
         );
         return false;
     }
@@ -6816,9 +6846,9 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         // 第一层 final barrier 只证明不再生产新 BUILT cell。每个 worker
         // 扫描完 closed prefix 且 token 完整复位后，再进入 execution
         // drain 汇合。非 root 到达后即可结束；固定 root 等待 16 组
-        // 全部到齐并逐 task 验证 Alloc=EMPTY、kernel=DONE 后最后结束。
-        // 整个 device kernel 的完成仍证明没有遗失 backlog，不依赖 host
-        // 事后发现，也不需要反向 release 广播。
+        // 全部到齐并核对唯一完成数等于计划 kernel 数后最后结束。整个
+        // device kernel 的完成仍证明没有遗失 backlog，不依赖 host
+        // 事后发现，不做逐 task 原子扫描，也不需要反向 release 广播。
         if (global_release_observed && cross_core_exec_ok &&
             CrossCoreExecWorkerDrained(
                 state, worker, task_count, stats
@@ -6966,8 +6996,8 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     // CCEC 关闭 kernel-end 自动 DCCI，host 直接读取 token.control 可能只
     // 看到初始化时的 IDLE。final_occupied 在本核最终检查后经 bypass
     // PublishResult 导出：0 表示 scanner 已封口、token 全字段复位且本核
-    // 已发布 arrival；root 另外通过 16 组 arrival 和全 task 终态校验完成
-    // device 级收口。非零表示该轮不能宣称 executor 排空。
+    // 已发布携带本核完成数的 arrival；root 另外通过 16 组到达与完成数
+    // 汇总完成 device 级收口。非零表示该轮不能宣称 executor 排空。
     stats.result.final_occupied =
         cross_core_drain_closed &&
                 CrossCoreExecWorkerDrained(

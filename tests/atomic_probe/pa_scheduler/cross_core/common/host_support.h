@@ -4915,13 +4915,37 @@ inline Metrics Validate(
             kWorkers / cross_core::kExecDrainArrivalGroups
         );
     bool cross_core_exec_drain_ok = true;
+    uint64_t cross_core_exec_drain_completions = 0;
     for (uint32_t group = 0;
          group < cross_core::kExecDrainArrivalGroups;
          ++group) {
-        cross_core_exec_drain_ok &=
-            state.exec_drain.arrivals[group].state ==
-                kExecDrainWorkersPerGroup;
+        const int64_t group_state =
+            state.exec_drain.arrivals[group].state;
+        const uint32_t group_arrivals =
+            cross_core::DecodeExecDrainArrivalCount(group_state);
+        const uint64_t group_completions =
+            cross_core::DecodeExecDrainCompletionCount(group_state);
+        const bool group_ok =
+            group_arrivals == kExecDrainWorkersPerGroup &&
+            group_completions <= task_count &&
+            cross_core_exec_drain_completions <=
+                task_count - group_completions;
+        cross_core_exec_drain_ok &= group_ok;
+        if (group_ok) {
+            cross_core_exec_drain_completions +=
+                group_completions;
+        }
     }
+    const uint64_t expected_exec_completions =
+        shared_plan_ok
+        ? static_cast<uint64_t>(task_count) -
+              shared_plan.tasks_by_kind[
+                  static_cast<uint32_t>(TaskKind::Alloc)
+              ]
+        : 0;
+    cross_core_exec_drain_ok &=
+        cross_core_exec_drain_completions ==
+        expected_exec_completions;
     const bool cross_core_exec_fatal_clear =
         state.exec_fatal.state == 0;
     if (!cross_core_exec_fatal_clear) {
@@ -5755,7 +5779,7 @@ inline Metrics Validate(
     );
     Expect(
         cross_core_exec_drain_ok,
-        "execution drain reaches all workers and validates every task cell",
+        "execution drain reaches all workers and closes every unique kernel completion",
         &metrics
     );
     if (raw_exec_token_snapshot_authority ==

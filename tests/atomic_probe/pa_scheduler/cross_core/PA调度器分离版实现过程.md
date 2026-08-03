@@ -2572,3 +2572,82 @@ CAS 返回值”没有让当前 CCEC 生成更轻的热路径，也不能把泳�
 `return_ready` 聚合跨度直接等价成可删除的端到端开销。候选还把同 task
 异常从当前 owner 延迟到下一 owner/host 才报告，在没有收益时不值得放宽错误
 闭合窗口。因此实现、测试和泳道 ABI 修改已全部撤回，只保留本节反例。
+
+## 2026-08-04：S6.38 用分组完成数替代 root 逐 task 终态扫描
+
+S6.36 已删除 execution drain 的反向 release，但固定 root 在 96 个 worker
+全部到达后仍串行读取 1280 个 execution cell control 和 1280 个 completion
+flag。保留泳道中，该收口路径有以下直接证据：
+
+- root 的 cell-state 读取为 1324 次，聚合 `332.390 us`；
+- fanin/completion flag 读取为 1359 次；
+- FinalDrain 最大跨度为 `1315.149 us`；
+- 其中绝大部分不是推进业务，而是在已经排空后重新逐项证明终态。
+
+本阶段复用已有 16 个 drain arrival word，不增加 cache line，也不增加 Atomic
+调用。每个 worker 在 scanner 封口、两个 token 完整复位且 engine 无
+in-flight 后，汇总本核三个 placement 计数，并执行原有的唯一一次 FetchAdd：
+
+```text
+contribution = 1 + (local_completed << 8)
+```
+
+低 8 位累计到达 worker 数，每组固定为 6，不会向高位进位；高 56 位累计本组
+已经完整发布 completion flag 与 cell `DONE` 的 kernel 数。root 只读取 16 个
+分组 word，要求每组低位均为 6，且高位合计精确等于
+`task_count - alloc_task_count`。
+
+该汇总不是用统计量替代正确性：中央 Build ticket 给出完整 task 集；
+`BUILT -> CLAIMED` CAS 保证每个 kernel 至多一个 Execute owner；placement
+只在 vend、completion flag 和 cell `DONE` 都成功后递增；每个 worker 又只在
+本地 scanner/token/engine 全部排空后到达。因此“计划完成总数全部出现”与
+“每项至多完成一次”共同推出所有计划 kernel 恰好完成，重复完成不能掩盖
+缺项。host 在 kernel 返回后仍逐 task 核验 owner、cell、flag 与 payload，
+用于精确定位错误，但设备性能边界不再执行 2560 次逐 task 原子读取。
+
+测试先于实现收紧：
+
+- 原实现按预期未能让每组 arrival 携带 owner-local completion，定向用例失败；
+- 新增“96 核全部到达但 B1 少一个 completion”反例，root 必须发布 fatal 并
+  拒绝收口；
+- 完整 CPU 协议回归与 converter 63 项回归全部 PASS；
+- CCEC perf-clock 与 full-swimlane 构建 PASS。源码变化使 full-swimlane
+  AIC/AIV finish relocation 精确为 `4/3`，perf-clock 保持 `2/3`；
+  `readelf` 已确认全部 relocation 只指向各角色唯一 finish 符号，构建门槛
+  据实更新，没有放宽为范围。
+
+A5 B256 full-swimlane 为：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260803_215149_530746/ccec/merged_swimlane.json`
+
+归档副本为：
+
+`test_record/2026-8-4/cross_b256_s638_1p439ms.json`
+
+该次动态结果为：
+
+- 完整生命周期：`1.439066 ms`；
+- Submit：`1.139314 ms`；
+- FinalDrain：`0.442080 ms`；
+- root cell-state 读取：`1324 -> 44`；
+- root/fanin flag 相关逻辑读取：`1359 -> 78`；
+- drain arrival root poll：`171 -> 70`；
+- 1280 task、1024 kernel、TensorMap 严格插入、payload、fanin、completion、
+  16 组到达与完成数、全部 host 终态均 PASS，泳道记录无丢失。
+
+最终以提交 `0ad00700` 构建冻结 S6.36 基线，与候选按 B-C/C-B 交错各运行
+六个独立 trace-free B256 进程：
+
+```text
+S6.36 frozen baseline: min / median / max / mean
+                       2.084560 / 2.127268 / 2.159094 / 2.127638 ms
+S6.38 candidate      : min / median / max / mean
+                       1.404007 / 1.415611 / 1.433730 / 1.418414 ms
+candidate median 改善 0.711657 ms / 33.454%
+candidate mean   改善 0.709224 ms / 33.335%
+```
+
+六个候选样本与六个基线样本完全分离，中位数和均值同向改善。该阶段不改变
+TensorMap 插入顺序、Build/Execute owner、任务依赖、完成发布顺序或计时边界；
+只把已经存在的 owner-local 完成事实并入原有 arrival Atomic，删除 root 的
+重复全表读取，因此作为有效优化保留。

@@ -60,6 +60,42 @@ constexpr uint32_t kExecTokensPerWorker = 2;
 // execution drain 按物理 block 分成 16 组；96 个 Scalar 在当前
 // 1 AIC + 2 AIV/block 拓扑下每组精确包含 6 个 worker。
 constexpr uint32_t kExecDrainArrivalGroups = 16;
+// drain group word 复用同一次 FetchAdd 同时汇合两类单调证据：低 8 位
+// 累加到达 worker 数，高位累加各 worker 已成功发布 DONE 的 kernel 数。
+// 当前每组固定 6 个 worker，低位不会产生进位；完成数保持完整 56 位，
+// 不需要新增 cache line 或第二次 Atomic。
+constexpr uint32_t kExecDrainArrivalCountBits = 8;
+constexpr uint64_t kExecDrainArrivalCountMask =
+    (uint64_t{1} << kExecDrainArrivalCountBits) - 1U;
+
+PA_DEVICE int64_t EncodeExecDrainArrivalContribution(
+    uint64_t completed_tasks
+) {
+    if (completed_tasks >
+        (static_cast<uint64_t>(INT64_MAX) >>
+         kExecDrainArrivalCountBits)) {
+        return -1;
+    }
+    return static_cast<int64_t>(
+        (completed_tasks << kExecDrainArrivalCountBits) | 1U
+    );
+}
+
+PA_DEVICE uint32_t DecodeExecDrainArrivalCount(int64_t raw) {
+    return raw < 0
+        ? UINT32_MAX
+        : static_cast<uint32_t>(
+              static_cast<uint64_t>(raw) &
+              kExecDrainArrivalCountMask
+          );
+}
+
+PA_DEVICE uint64_t DecodeExecDrainCompletionCount(int64_t raw) {
+    return raw < 0
+        ? UINT64_MAX
+        : static_cast<uint64_t>(raw) >>
+              kExecDrainArrivalCountBits;
+}
 
 static_assert(
     kExecTensorDescBytes % sizeof(uint64_t) == 0,
@@ -256,8 +292,10 @@ struct alignas(kExecCacheLineBytes) SharedExecFatalControl {
 // 所有 replay actor 停产之后，再汇合本核 execution token 的排空证据。
 // 96 个 worker 不再竞争同一 arrival，而是按 block%16 分到 16 条
 // atomic-only line。非 root 在发布本核排空证据后即可结束；指定 root
-// worker 观察每组精确 6 个到达，再逐 task 核对 cell 终态后最后结束。
-// 整个 device kernel 由 root 的最终退出收口，不需要反向 release 广播。
+// worker 观察每组精确 6 个到达，并核对所有组携带的完成数等于计划 kernel
+// 数后最后结束。唯一 Claim CAS 保证每个 task 至多计数一次；所有 scanner
+// 与 owner-local token 排空保证没有已领取任务遗留。整个 device kernel
+// 由 root 的最终退出收口，不需要反向 release 广播或逐 task 原子扫描。
 struct alignas(kExecCacheLineBytes) SharedExecDrainControl {
     SharedExecControl arrivals[kExecDrainArrivalGroups];
 };

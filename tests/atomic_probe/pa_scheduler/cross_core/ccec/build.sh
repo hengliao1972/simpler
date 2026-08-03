@@ -224,11 +224,11 @@ SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIV=3
 # 符号。任务覆盖仍由 dispatch/动态门槛证明；这里继续精确锁定为 4，
 # 不放宽成范围。
 SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC=4
-# 单向 execution drain 让非 root AIV 提前收口后，full-swimlane AIV
-# 的尾合并形状变为五个 relocation；readelf 已逐条确认都只指向
-# 本角色唯一 finish 符号。任务覆盖由 CPU 动态门槛证明，这里继续
-# 精确冻结为 5，不放宽成范围判断。
-SPLIT_FINISH_CALL_SITES_SWIMLANE_AIV=5
+# root 不再逐 task 扫描 execution cell 后，full-swimlane AIV 的等价
+# 尾部重新合并为三个 relocation；readelf 已逐条确认都只指向本角色
+# 唯一 finish 符号。任务覆盖由 CPU 动态门槛证明，这里精确冻结为 3，
+# 不放宽成范围判断。
+SPLIT_FINISH_CALL_SITES_SWIMLANE_AIV=3
 COMMON_FLAGS+=(
     -mllvm -cce-block-local-relocate=true
     -mllvm "-cce-block-local-reserve-size=$SPLIT_STATE_STORAGE_BYTES"
