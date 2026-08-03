@@ -2000,3 +2000,54 @@ S6.24 median -> S6.26 median = -2.169893 ms / -43.462%
 
 该阶段原始泳道仍位于上述 `outputs` 路径；`test_record` 只保留后续最新最优
 版本，不重复保存被取代的 `2.99 ms` 副本。
+
+## 2026-08-04：S6.27 FinalDrain fatal 低频最终观察
+
+S6.26 后，FinalDrain 仍在每次循环读取 scheduler fatal；全局 replay release
+之后，`ProgressCrossCoreExec` 入口还会重复读取一次。当前候选删除 progress
+入口读取，并在 FinalDrain 外层使用 owner-local 计数器：第 0 轮立即检查，
+此后每 256 轮检查一次。命中后把本核两个 token 转为 Faulted，继续参与 replay
+barrier，随后退出；本核直接发现协议错误仍立即发布 fatal。
+
+### 正确性与结构门槛
+
+CPU 定向用例改为直接验证 FinalDrain 观察点：scheduler fatal 不伪造
+`exec_fatal`；blocked token 被收敛为 `FAULTED`；已经开始的合法 completion
+仍完整发布。定向用例和完整 CPU 回归全部 PASS。
+
+CCEC full-swimlane AIC/AIV 仍为 `3/4` 个同角色 finish relocation。trace-free
+AIC 的等价尾部由 `3` 个合并为 `1` 个，AIV 保持 `3` 个；对象仍只导入本角色
+唯一 finish/state，最终 mixed ELF 无残留 relocation。构建门槛据实冻结为
+`1/3`，没有放宽成范围。
+
+### A5 B256 full-swimlane
+
+产物为：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260803_170039_262883/ccec/merged_swimlane.json`
+
+动态结果：
+
+- Submit：`1.081578 ms`；
+- FinalDrain：`1.723799 ms`；
+- 完整生命周期：`2.685995 ms`；
+- EfDrain/FinalDrain kernel：`606/418`；
+- FinalDrain 批量 `fatal_poll` 逻辑调用：`11,139 -> 125`；
+- 全部 `fatal_poll` 逻辑调用：`12,611 -> 1,597`，下降 `87.336%`；
+- 1280 task、1024 kernel、execution/semantic/postprocess 与 raw 计数全部 PASS。
+
+唯一保留的最新泳道副本为：
+
+`tests/atomic_probe/pa_scheduler/test_record/2026-8-4/cross_b256_s627_2p686ms.json`
+
+trace-free 十个独立进程全部 PASS：
+
+```text
+min / median / max = 2.420601 / 2.519461 / 2.691250 ms
+mean = 2.519032 ms
+S6.26 median -> S6.27 median = -0.303410 ms / -10.748%
+```
+
+该结果同时满足正确性与性能门槛，因此 S6.27 作为有效阶段保留。它只改变
+terminal 的最终观察频率，不改变实际错误发布、本地错误立即退出、TensorMap
+插入顺序、Build/Claim/completion 发布或 FinalDrain 全局收口条件。

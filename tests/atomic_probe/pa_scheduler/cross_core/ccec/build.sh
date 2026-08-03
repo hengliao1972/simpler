@@ -211,13 +211,13 @@ COMMON_FLAGS=(
 # 使用同一数值，不能靠多留一条未说明的 cache line 掩盖 ABI 漂移。
 SPLIT_STATE_STORAGE_BYTES=1728
 # 中央 ticket 之后不再为五种 task 人为保留五份 replay 尾部。CCEC 会按
-# role/观察构建合并相同尾部：当前 perf-clock 与 swimlane 的两个 role
-# 均为 3 条。五种 kind 是否完整覆盖由 dispatch switch 和 CPU 动态协议
-# 测试证明；这里精确锁定当前每种产物的真实代码形状，防止 finish 被
+# role/观察构建合并相同尾部。五种 kind 是否完整覆盖由 dispatch switch 和
+# CPU 动态协议测试证明；这里精确锁定当前每种产物的真实代码形状，防止 finish 被
 # 内联/删除，又不把 CCEC 对等尾部的有益合并误判成覆盖缺失。
-# 调度边界集中读取 global fatal 后，perf-clock AIC 的等价尾部由两处
-# 变为三处；继续冻结实际调用形状，不把精确门槛放宽为范围判断。
-SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC=3
+# FinalDrain fatal 改为外层低频观察后，perf-clock AIC 的等价尾部进一步
+# 合并为一个调用点；AIV 保持三个。继续冻结实际机器码形状，并要求调用
+# 只能指向本角色唯一 finish 符号，不能放宽为范围判断。
+SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC=1
 SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIV=3
 # 新增执行包 atomic/DCCI 诊断后，full-swimlane AIC 的五类 Build dispatch
 # 再次被编译器尾合并为三个调用点；任务覆盖由 dispatch/动态门槛证明，

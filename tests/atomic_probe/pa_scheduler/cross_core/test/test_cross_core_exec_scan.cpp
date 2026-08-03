@@ -1753,26 +1753,22 @@ void TestFinalDrainGlobalFatalDoesNotFabricateExecFatal() {
     if (state == nullptr) return;
 
     constexpr uint32_t kBuilder = 1;
-    WorkerState &worker = PrepareWorker(
-        *state, kBuilder, CoreRole::Aic
-    );
+    (void)PrepareWorker(*state, kBuilder, CoreRole::Aic);
     LocalStats stats{};
     InitLocalStats(stats, kBuilder, CoreRole::Aic);
     __atomic_store_n(
         &state->fatal.value, int32_t{1}, __ATOMIC_RELEASE
     );
     ExecScanTestOps::ResetObservations();
-    const uint32_t progressed =
-        ProgressCrossCoreExec<ExecScanTestOps>(
-            state, worker, /*replay_closed_exclusive=*/0,
-            /*production_closed=*/true,
-            DrainPlace::FinalDrain, stats
+    const bool fatal_observed =
+        ObserveCrossCoreFinalDrainFatal<ExecScanTestOps>(
+            state, kBuilder, stats
         );
     const DecodedExecState cell0 = DecodeExecState(
         state->exec_cells[0].control.state
     );
     Check(
-        progressed == 0 && state->fatal.value == 1 &&
+        fatal_observed && state->fatal.value == 1 &&
             state->exec_fatal.state == 0 &&
             cell0.valid && cell0.phase == ExecPhase::Empty &&
             state->exec_tokens[kBuilder][0].control.phase ==
@@ -1849,12 +1845,11 @@ void TestGlobalFatalFaultsActiveTokens() {
                 state->exec_fatal.state == 0 &&
                 ExecScanTestOps::execute_calls == 0;
 
-            const uint32_t final_progress =
-                ProgressCrossCoreExec<ExecScanTestOps>(
-                    state, worker, kTask + 1U, true,
-                    DrainPlace::FinalDrain, stats
+            const bool final_fatal_observed =
+                ObserveCrossCoreFinalDrainFatal<ExecScanTestOps>(
+                    state, executor, stats
                 );
-            all_cases_ok &= final_progress == 0 &&
+            all_cases_ok &= final_fatal_observed &&
                 state->exec_tokens[executor][0].control.phase ==
                     ExecTokenPhase::Faulted &&
                 DecodeExecState(

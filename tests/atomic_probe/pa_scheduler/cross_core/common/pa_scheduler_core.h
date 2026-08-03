@@ -4659,6 +4659,28 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
 }
 
 template <typename Ops>
+PA_DEVICE bool ObserveCrossCoreFinalDrainFatal(
+    PA_GM SchedulerState *state, uint32_t worker_id,
+    LocalStats &stats
+) {
+    if (!IsFatal<Ops>(state, stats)) {
+        return false;
+    }
+    // 只在 FinalDrain 的节流观察点命中 terminal 后收敛本核 token。
+    // token 是 owner-local 普通状态，不需要额外 Atomic 或 DCCI。
+    for (uint32_t token_slot = 0;
+         token_slot < cross_core::kExecTokensPerWorker;
+         ++token_slot) {
+        PA_GM cross_core::ExecutionToken &token =
+            state->exec_tokens[worker_id][token_slot];
+        if (token.control.phase != cross_core::ExecTokenPhase::Idle) {
+            token.control.phase = cross_core::ExecTokenPhase::Faulted;
+        }
+    }
+    return true;
+}
+
+template <typename Ops>
 PA_DEVICE bool ProgressCrossCoreOwnedTokens(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker,
     DrainPlace place, LocalStats &stats,
@@ -4715,29 +4737,15 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
     const uint32_t worker_id =
         static_cast<uint32_t>(worker.core_idx);
     SharedExecTraceObserver<Ops> observer{&stats};
-    // 机会式 scanner 不在每次入口重复读取 global fatal 热点线：
+    // 不在 scanner 入口重复读取全局 fatal 热点线：
     //
     // - 当前合法 token 作为一个工作单元推进到 completion；
     // - 新 Build ticket 前有 replay 调度边界检查；
-    // - FinalDrain 在 production_closed 后执行权威 terminal 检查；
+    // - FinalDrain 由外层 owner-local 计数器周期性检查 terminal；
     // - EMPTY/BUILDING、非候选槽和合法 loser 这里只读取共享 control 或
     //   推进 owner-local cursor，不产生跨核业务副作用。
     //
-    // 因而正常 replay progress 不读取；只有 FinalDrain 的关闭路径负责把
-    // 尚未复位的 owner-local token 收敛为 Faulted。
-
-    if (production_closed && IsFatal<Ops>(state, stats)) {
-        for (uint32_t token_slot = 0;
-             token_slot < cross_core::kExecTokensPerWorker;
-             ++token_slot) {
-            PA_GM cross_core::ExecutionToken &token =
-                state->exec_tokens[worker_id][token_slot];
-            if (token.control.phase != cross_core::ExecTokenPhase::Idle) {
-                token.control.phase = cross_core::ExecTokenPhase::Faulted;
-            }
-        }
-        return 0;
-    }
+    // 因而每次 progress 入口读取既不是顺序边界，也不是必要的正确性动作。
 
     uint32_t completed_count = 0;
     if (!ProgressCrossCoreOwnedTokens<Ops>(
@@ -6749,10 +6757,18 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     bool cross_core_exec_ok = true;
     bool cross_core_drain_arrived = false;
     bool cross_core_drain_released = false;
+    uint32_t final_fatal_poll_iterations = 0;
 #endif
     while (true) {
 #if PTO_FDWIC_SHARED_MAP
-        if (cross_core_exec_ok && IsFatal<Ops>(state, stats)) {
+        // 错误只需最终可见，不为成功路径的每次 progress 付出同地址返回型
+        // Atomic。第 0 轮立即检查，随后每 256 轮检查一次；命中后本核 token
+        // 立即转 Faulted，但仍参与 replay barrier，确保所有 worker 可退出。
+        if (cross_core_exec_ok &&
+            ((final_fatal_poll_iterations++ & 255U) == 0U) &&
+            ObserveCrossCoreFinalDrainFatal<Ops>(
+                state, worker_id, stats
+            )) {
             cross_core_exec_ok = false;
         }
         const uint32_t freed = cross_core_exec_ok

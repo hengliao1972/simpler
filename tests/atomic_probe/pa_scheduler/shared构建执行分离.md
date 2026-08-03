@@ -10,10 +10,10 @@
 | 正式实现 | S0–S6.26 已形成中央 ticket + 严格 TensorMap 插入 + K2 异核 Execute，并把成功路径的 terminal 观察集中到调度边界；descriptor 引用和 unique-ticket 单 CAS 两个回退候选均已撤销 |
 | CPU 正确性用例 | S1–S4 K2、S5a 对侧角色 Build 与 S5b 全 96 Scalar Build 门槛已完成 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
-| A5 PA 功能/性能 | 旧 `2.323 ms` 是 Submit-only 数字，已退出性能裁决；当前唯一口径为首个 Submit 起点到 FinalDrain 结束。S6.26 的十个独立 B256 进程为 `2.689–2.945 ms`、中位 `2.823 ms`，功能与终态 10/10 PASS |
+| A5 PA 功能/性能 | 旧 `2.323 ms` 是 Submit-only 数字，已退出性能裁决；当前唯一口径为首个 Submit 起点到 FinalDrain 结束。S6.27 的十个独立 B256 进程为 `2.421–2.691 ms`、中位 `2.519 ms`，功能与终态 10/10 PASS |
 | S4 动态 Execute election | K2 首版已通过 CPU B1/B256 和 A5 B1/B256；B256 中两候选都有实际胜出，非法 owner 为 0 |
 | S5 Build 拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 五类 task 全 96/G8 已通过 CPU/CCEC/A5 B1/B256，物理 Claim CAS 精确闭合 |
-| 当前调度缺口 | 双 token Claim-first 已解决旧的 FinalDrain backlog；当前主要缺口转为成功路径仍有不承担顺序语义的返回型 Atomic，S6.27 正在验证 FinalDrain terminal 低频观察 |
+| 当前调度缺口 | 双 token Claim-first 已解决旧的 FinalDrain backlog；S6.27 已将 FinalDrain terminal 改为低频最终观察，当前主要缺口继续转向仍承担真实业务判断的返回型 Atomic |
 | 明确非目标 | 不引入 `try_wait`、engine continuation 或“kernel 运行期间同一 Scalar 继续调度” |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
@@ -1555,9 +1555,10 @@ Atomic 竞争带进正常热路径。
   `FAULTED`，并继续参与退出屏障，不能把 host 超时当设备终止协议。
 
 S6.26 已按该合同通过 CPU、CCEC 和 A5 B256，并把完整周期十轮中位降至
-`2.823 ms`。S6.27 只进一步尝试把 FinalDrain 的 global-fatal 读取从“每次
-progress”改为“第 0 轮立即检查、之后按 owner-local 计数低频检查”；该候选
-在 CPU、CCEC 与 A5 全部门槛通过前仍是待验证实现，不属于已冻结设计结论。
+`2.823 ms`。S6.27 进一步把 FinalDrain 的 global-fatal 读取从“每次
+progress”改为“第 0 轮立即检查、之后每 256 轮按 owner-local 计数检查”。
+CPU、CCEC、A5 B256 full-swimlane 和 trace-free 十轮已全部通过；完整周期中位
+进一步降至 `2.519 ms`，因此该低频最终观察已纳入当前设计合同。
 
 逐阶段代码、泳道与性能数字继续记录在
 [PA调度器分离版实现过程](cross_core/PA调度器分离版实现过程.md)，本文只保存
