@@ -2881,3 +2881,49 @@ S6.43 startup-to-FinalDrain: min / median / max / mean
 该数据是后续 startup 分组候选的新冻结基线。它比旧口径多包含
 启动屏障，因此不能与 S6.42 的 `1.423 ms` 直接相减后宣称性能
 回退，也不能再混用旧字段名做 A/B。
+
+## 2026-08-04：S6.44 startup 固定 G=16 两级屏障（明显回退，已撤回）
+
+S6.43 首次给出了 startup 起点到 FinalDrain 结束的无观察端到端口径。
+本轮才在不混用 Submit-only 旧数据的前提下，测试将 96 核 flat startup
+屏障替换为与 final `two-16` 同形、但独占状态的两级屏障。
+
+候选的物理原子发布为：
+
+```text
+96 次 leaf arrival
++ 16 次 leaf leader -> root arrival
++ 1 次 root release
++ 16 次 leaf release
+= 129 次 StartupIncrement
+```
+
+每个 leaf 由两个物理 block 的 AIC/AIV0/AIV1 组成，即 6 个 Scalar；
+只有 16 个 AIC leader 竞争 root。这确实把 flat 同地址 96 核竞争
+拆成了小组竞争和 leader 转发，但也新增了 33 次发布以及两级关键路径。
+
+完整 CPU 协议用例全部 PASS。CCEC 后端因大函数布局变化，将
+full-swimlane AIV 的等价 split-finish 尾部从 3 份拆成 4 份；修改前后
+对象文件的 relocation 逐条对照证明，4 条均仅指向 AIV 本角色的
+唯一 finish，没有跨角色调用。A5 B256 full-swimlane 进一步证明：
+
+- 1280 task、1024 kernel、TensorMap 严格插入和所有终态全部 PASS；
+- `StartupIncrement` 物理记录精确为 129；
+- 本次诊断生命周期为 `1.556463 ms`，仅用于确认协议形状，不用于保留裁决。
+
+最终以 S6.43 修改前产物为冻结基线，候选与基线按 B-C/C-B 顺序
+交错各运行 12 个独立 A5 B256 无泳道进程：
+
+```text
+S6.43 flat startup   : min / median / max / mean
+                       1.424651 / 1.446754 / 1.497455 / 1.452607 ms
+S6.44 two-level-16   : min / median / max / mean
+                       1.471507 / 1.496351 / 1.526530 / 1.495496 ms
+candidate median 回退 0.049597 ms / 3.428%
+candidate mean   回退 0.042889 ms / 2.953%
+```
+
+12 对样本中候选 0 对更快，结论不是普通波动。对当前 96 核 startup
+来说，分组降低同地址并发的收益，不足以覆盖 leader 转发、多级
+release 和新增原子发布的代价。候选的 device/host 状态、协议、构建门槛和
+测试适配已全部撤回；正式路径继续使用 flat `started_count`。
