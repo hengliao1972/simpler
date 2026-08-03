@@ -6167,3 +6167,33 @@ CPU 全套与 CCEC perf-clock 构建通过；A5 B1 为 `127.404 us` 且全检查
 同窗五对 B256 的旧/新中位为 `3.659993/3.666555 ms`，新路径 `+0.179%`；除
 一轮 3.948 ms 长尾外，其余候选为 3.642--3.687 ms。当前没有结构性回退证据，
 保留该必要前置修改，下一阶段删除全员 replay 与位图登记。
+
+### 15.39 S6.17 生产接入中央 Build ticket
+
+shared PA 已删除 96 核各自完整 replay 和 G8 Claim Tournament。1280 个 task
+由一条单调 ticket cursor 全局唯一发放，每个 worker 再做一次越界 FetchAdd
+确认退出，B256 返回型发放原子从 133120 次 CAS 降为 1376 次 FetchAdd。
+Build owner 从 immutable plan 随机访问构参；严格 TensorMap 插入仍由逐 task
+`deps_prepared` 链保证，K2 execute owner 仍从独立候选中竞争，三种身份没有
+重新耦合。
+
+完整 CPU、CCEC perf-clock/full-swimlane 构建与 A5 B1/B256 正确性均通过。
+host 精确验证 1280 个全局 owner、96 个 terminal ticket、旧 tournament 零
+使用、1024 个 kernel、strict insert、fanin/payload/vend、K2 owner 和终态。
+稀疏泳道导出按全局 task_count 清理 endpoint；分析器把 terminal ticket 前
+opportunistic drain 中的 Kernel 归入现有 Orchestration setup/tail，并从
+ScalarControl 扣除，不新增 raw 字段。
+
+本次 full-swimlane 产物：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+pa_scheduler_cross_core_shared_swimlane_20260803_052743_821381/
+ccec/merged_swimlane.json
+```
+
+该次 Submit 为 `2.280878 ms`。显式重编 perf-clock 后五次为
+`2.311447/2.511888/2.093339/2.641146/2.362004 ms`，中位
+`2.362004 ms`；相对 S6.16 的 `3.666555 ms` 下降 `35.580%`。当前距离
+`1.0 ms` 目标仍有 `1.362 ms`，中央同地址 ticket 本身也仍是后续需要量化的
+热点，不能把本阶段的大幅收益解释成目标已完成。

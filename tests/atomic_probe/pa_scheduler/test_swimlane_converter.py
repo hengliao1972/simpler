@@ -1578,6 +1578,35 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "complete QK/SF/PV/UP groups"):
             _derive_v4_task_kinds(semantics, 1)
 
+    def test_v5_central_ticket_derives_global_unique_task_plan(self) -> None:
+        semantics = {
+            (0, 0): (True, True),
+            (7, 1): (True, False),
+            (3, 2): (True, False),
+            (95, 3): (True, False),
+            (32, 4): (True, False),
+        }
+        self.assertEqual(
+            _derive_v4_task_kinds(
+                semantics, 96, "central_ticket"
+            ),
+            {0: 0, 1: 1, 2: 2, 3: 3, 4: 4},
+        )
+
+    def test_v5_central_ticket_rejects_duplicate_task_owner(self) -> None:
+        semantics = {
+            (0, 0): (True, True),
+            (1, 0): (True, True),
+            (2, 1): (True, False),
+            (3, 2): (True, False),
+            (4, 3): (True, False),
+            (5, 4): (True, False),
+        }
+        with self.assertRaisesRegex(ValueError, "multiple Submit owners"):
+            _derive_v4_task_kinds(
+                semantics, 96, "central_ticket"
+            )
+
     def test_v4_requires_both_parent_spans(self) -> None:
         capture = _v5_capture(
             [
@@ -2465,7 +2494,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             (0x42, 0, -1),  # 未消费返回值不能声明 return-ready
             (0x73, 4, -1),  # value_zero 只属于 Load
             ((1 << 8) | 0x50, 1, -1),  # retry payload 只属于 FetchMax
-            (0x50, 42, -1),  # 当前 AtomicSite::Count 以外的未定义站点
+            (0x50, 43, -1),  # 当前 AtomicSite::Count 以外的未定义站点
             (0x53, 4, 0),  # Atomic 不携带 function id
         )
         for flags, site, func_id in cases:

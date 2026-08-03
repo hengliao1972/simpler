@@ -1491,3 +1491,61 @@ owner；256 个 Alloc 不产生执行；task 0 延迟 Build 时后续 Build 仍�
 只读紧凑 task identity，并让 scanner 以该 identity 替代 owner-local 位图；
 在全体 Build owner 退出前，相关 `EMPTY/BUILDING` 仍只能解释为暂未发布，不能
 提前当成缺口或永久越过。
+
+## 2026-08-03：S6.17 中央 ticket 替换 96 份 Build replay
+
+本阶段把 S6.11--S6.16 的前置证明接入 shared PA 正式路径。96 个 Scalar 不再
+逐核回放 1280 个 task，也不再进入 per-task G8 Claim Tournament；每核从
+`SharedBuildDispatchState::next_task` 执行一次返回型 `FetchAdd` 领取 task，
+从 immutable plan 解码 task/batch/kind/group，再用已验证的随机访问入口构参。
+每个 task 只有一个 Build owner，但 owner 不绑定核型，也不等于后续 K2
+execute owner。
+
+TensorMap 的正确性合同没有被 ticket 取代：Build owner 仍在 Register 中等待
+`deps_prepared[N-1]`，只按 task-id 顺序发布 metadata 和本 task 完成字；完成
+字发布后，Fanin/Build 与后继 task 的 metadata 插入重新并发。K2 scanner 在
+每次取票前按 immutable plan 推进本核候选，最终阶段仍闭合全部 1024 个
+非 Alloc task，因此“严格插入”和“Scalar 自由 Build/独立 Execute”继续解耦。
+
+正常 B256 的发放原子预算从 G8 的 133120 次 CAS 变为：
+
+```text
+1280 个有效 task ticket + 96 个 worker 越界 ticket = 1376 FetchAdd
+```
+
+host 逐项验证全局 task `0..1279` 恰好一个 owner、每核恰一次越界 ticket、
+旧 tournament/cursor 保持初值、每类 task 计数、task-id sum、split caller/
+finish 稀疏所有权、严格插入链、K2 owner/payload/fanin/vend 和最终状态。
+CPU 还覆盖错 plan、重复/缺失 owner、错误 endpoint 及错误 terminal cursor。
+
+泳道 raw 继续使用既有 task-indexed endpoint 数组，不为中央发放增加每事件
+字段。稀疏 owner 使观察导出必须清理全局 `task_count` 个 endpoint，而不能只
+清理本核 `submits` 前缀；该 DCCI 位于 Submit/Kernel 计时之后。converter 和
+analyzer 以 `submit_topology=central_ticket` 校验全局唯一 ownership。越界
+ticket 前的 opportunistic drain 可能在末次有效 Submit 后执行 Kernel；分析器
+用既有 `OrchestrationReplay` 与 Submit 边界把它严格归入
+`OrchestrationTail`，并拆成 KernelUnion/ScalarControl，不增加 device raw。
+
+A5 B256 full-swimlane 已完整通过，产物为：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+pa_scheduler_cross_core_shared_swimlane_20260803_052743_821381/
+ccec/merged_swimlane.json
+```
+
+该次 Submit 为 `2.280878 ms`，1280 task、1024 kernel、1376 ticket、严格
+TensorMap 插入、K2 执行及 trace/atomic/DCCI 闭合均 PASS。
+
+显式重编 perf-clock 后的五次 B256 为：
+
+```text
+2.311447, 2.511888, 2.093339, 2.641146, 2.362004 ms
+median = 2.362004 ms
+```
+
+相对 S6.16 同阶段中位 `3.666555 ms`，下降 `1.304551 ms`，即
+`35.580%`。收益来自删除 96 份 replay 和 133120 次两级 Claim CAS 的结构性
+改动，不能只归因于单个 `FetchAdd`。中央 ticket 仍是一个约 0.25 ms 的 A5
+同地址返回型原子热点；下一阶段应先根据新泳道重新排序非 ticket 开销，再决定
+是分片发放还是继续消减随机访问构参/插入等待，不能在缺少协议证明时替换它。

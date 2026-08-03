@@ -114,6 +114,7 @@ PA_DEVICE AtomicOp TraceAtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::ReplayDoneIncrement:
         case AtomicSite::SharedHeapCursorReserve:
         case AtomicSite::SharedHeapVendAdvance:
+        case AtomicSite::SharedBuildDispatchTicket:
             return AtomicOp::FetchAdd;
         case AtomicSite::FatalSet:
         case AtomicSite::CompletionVendExchange:
@@ -1394,10 +1395,14 @@ PA_DEVICE void ResetTraceLap(
 }
 
 template <typename Ops>
-PA_DEVICE void FlushTraceCore(TraceContext &trace, WorkerResult &result) {
+PA_DEVICE void FlushTraceCore(
+    TraceContext &trace, WorkerResult &result,
+    uint32_t shared_task_count = 0
+) {
 #if PA_BUILD_TRACE_FREE
     (void)trace;
     (void)result;
+    (void)shared_task_count;
     return;
 #else
     if (!TraceStorageAttached(trace)) {
@@ -1429,15 +1434,20 @@ PA_DEVICE void FlushTraceCore(TraceContext &trace, WorkerResult &result) {
         result.submit_begin != 0 &&
         result.submit_end >= result.submit_begin &&
         (result.submit_end & kSharedClaimWinnerBit) == 0;
-    if (result.submits > kMaxTasks ||
+    // central-ticket 把 task-indexed endpoint 稀疏写入 0..task_count-1；
+    // result.submits 只是本核拥有数量，不能再作为连续 clean 长度。这里
+    // 在被测 Submit/Kernel 结束后一次性 clean 权威计划范围，既保证远端
+    // host 看到所有稀疏槽，也不向调度热路径插入逐 task DCCI。
+    if (result.submits > shared_task_count ||
+        shared_task_count > kMaxTasks ||
         !submit_claim_window_valid) {
         if (trace.dropped_records != UINT32_MAX) {
             ++trace.dropped_records;
         }
     }
     const uint64_t submit_claim_count =
-        result.submits <= kMaxTasks
-            ? result.submits
+        shared_task_count <= kMaxTasks
+            ? shared_task_count
             : kMaxTasks;
     const uint64_t submit_claim_bytes =
         submit_claim_count *
@@ -1446,6 +1456,7 @@ PA_DEVICE void FlushTraceCore(TraceContext &trace, WorkerResult &result) {
         (submit_claim_bytes + 63U) / 64U;
     constexpr uint32_t kObserverCallCount = 3;
 #else
+    (void)shared_task_count;
     const uint64_t submit_claim_lines = 0;
     constexpr uint32_t kObserverCallCount = 2;
 #endif

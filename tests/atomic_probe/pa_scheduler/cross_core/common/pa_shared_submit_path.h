@@ -579,7 +579,8 @@ PA_DEVICE bool WaitForSharedTaskInsertTurn(
     );
 }
 
-template <typename Ops, bool Profile, typename PmuContext>
+template <typename Ops, bool Profile, bool Dispatched,
+          typename PmuContext>
 PA_DEVICE bool FinishSharedWinnerSubmitBody(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker,
     const TaskArgs &args, SubmitContext &context, LocalStats &stats,
@@ -1004,6 +1005,12 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         ProfilePhase::ReplayTail, build_begin, build_end
     );
 
+    if constexpr (Dispatched) {
+        return CloseSharedDispatchedSubmit<Ops, Profile>(
+            state, stats, ticket.task_id, kind,
+            ticket.submit_begin
+        );
+    }
     return CloseSharedCallbackSubmit<Ops, Profile>(
         state, stats, ticket, task_meta, kind
     );

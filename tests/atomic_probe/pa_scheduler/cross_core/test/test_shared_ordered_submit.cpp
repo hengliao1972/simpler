@@ -612,35 +612,6 @@ bool LegacyTurnsMatch(
     return true;
 }
 
-uint32_t ExpectedClaimAttempts(TaskKind kind) {
-    switch (kind) {
-        case TaskKind::Alloc:
-        case TaskKind::Qk:
-        case TaskKind::Sf:
-        case TaskKind::Pv:
-        case TaskKind::Up:
-            return kWorkers;
-        case TaskKind::Count:
-            return 0;
-    }
-    return 0;
-}
-
-uint32_t ExpectedClaimGroups(TaskKind kind) {
-    switch (kind) {
-        case TaskKind::Alloc:
-            return kSharedAllocClaimTournamentGroups;
-        case TaskKind::Qk:
-        case TaskKind::Sf:
-        case TaskKind::Pv:
-        case TaskKind::Up:
-            return kSharedKernelClaimTournamentGroups;
-        case TaskKind::Count:
-            return 0;
-    }
-    return 0;
-}
-
 bool PortableBuildEvidenceMatches(
     const SchedulerState &state, uint32_t task_count
 ) {
@@ -708,28 +679,31 @@ bool PortableBuildEvidenceMatches(
             task_count - state.config.batches;
 }
 
-bool RunB256ClaimCasBudgetContractTest() {
+bool RunB256BuildTicketBudgetContractTest() {
     constexpr uint64_t kBatches = 256;
     constexpr uint64_t kTasksPerBatch = 5;
     constexpr uint64_t kTasks = kBatches * kTasksPerBatch;
-    constexpr uint64_t kLocalCas = kTasks * kWorkers;
-    constexpr uint64_t kRootCas =
-        kBatches * (
-            kSharedAllocClaimTournamentGroups +
-            4U * kSharedKernelClaimTournamentGroups
-        );
-    constexpr uint64_t kPhysicalCas = kLocalCas + kRootCas;
+    // 每个逻辑 task 只取得一次有效 ticket；每个 worker 退出循环时还会
+    // 取得一次越界 ticket。这里锁定 production 路径的精确调用预算，避免
+    // 后续误把旧 96 份 replay / 两级 Claim Tournament 接回热路径。
+    constexpr uint64_t kValidTickets = kTasks;
+    constexpr uint64_t kTerminalTickets = kWorkers;
+    constexpr uint64_t kPhysicalFetchAdds =
+        kValidTickets + kTerminalTickets;
+    constexpr uint64_t kLegacyPhysicalCas = 133120U;
     const bool ok =
-        kLocalCas == 122880U &&
-        kRootCas == 10240U &&
-        kPhysicalCas == 133120U;
+        kValidTickets == 1280U &&
+        kTerminalTickets == 96U &&
+        kPhysicalFetchAdds == 1376U &&
+        kPhysicalFetchAdds < kLegacyPhysicalCas;
     std::printf(
-        "[ORDERED_SUBMIT] b256_claim_cas_budget=%s "
-        "local=%llu root=%llu physical=%llu\n",
+        "[ORDERED_SUBMIT] b256_build_ticket_budget=%s "
+        "valid=%llu terminal=%llu physical=%llu legacy_claim_cas=%llu\n",
         ok ? "PASS" : "FAIL",
-        static_cast<unsigned long long>(kLocalCas),
-        static_cast<unsigned long long>(kRootCas),
-        static_cast<unsigned long long>(kPhysicalCas)
+        static_cast<unsigned long long>(kValidTickets),
+        static_cast<unsigned long long>(kTerminalTickets),
+        static_cast<unsigned long long>(kPhysicalFetchAdds),
+        static_cast<unsigned long long>(kLegacyPhysicalCas)
     );
     return ok;
 }
@@ -848,7 +822,7 @@ bool RunSplitReplayTaskIdPrefixTest() {
     return ok;
 }
 
-bool ClaimAndInsertEvidenceMatches(
+bool DispatchAndInsertEvidenceMatches(
     const SchedulerState &state, uint32_t task_count
 ) {
     uint32_t planned_tasks = 0;
@@ -873,29 +847,24 @@ bool ClaimAndInsertEvidenceMatches(
             );
             const uint32_t task_id =
                 plan.batch_start + offset;
-            exact &=
-                OrderedSubmitTestOps::
+            // 生产路径已经由中央 ticket 唯一发放；旧 Claim Tournament
+            // 不应再有任何逐 task CAS 证据。
+            exact &= OrderedSubmitTestOps::
                     claim_attempts_by_task[task_id].load(
                         std::memory_order_relaxed
-                    ) == ExpectedClaimAttempts(task.kind);
-            exact &=
-                OrderedSubmitTestOps::
+                    ) == 0;
+            exact &= OrderedSubmitTestOps::
                     claim_wins_by_task[task_id].load(
                         std::memory_order_relaxed
-                    ) == 1;
+                    ) == 0;
             const SharedClaimTournamentTask &tournament =
                 state.claim_tournament[task_id];
-            exact &= tournament.root.owner.value ==
-                static_cast<int64_t>(task_id);
-            const uint32_t groups =
-                ExpectedClaimGroups(task.kind);
+            exact &= tournament.root.owner.value == -1;
             for (uint32_t group = 0;
                  group < kSharedClaimTournamentMaxGroups;
                  ++group) {
                 exact &= tournament.local[group].owner.value ==
-                    (group < groups
-                         ? static_cast<int64_t>(task_id)
-                         : -1);
+                    -1;
             }
             exact &=
                 state.tasks[task_id].deps_prepared ==
@@ -942,6 +911,29 @@ bool ClaimAndInsertEvidenceMatches(
                     std::memory_order_relaxed
                 ) == 0;
     }
+    uint64_t submits = 0;
+    uint64_t attempts = 0;
+    uint64_t wins = 0;
+    uint64_t task_id_sum = 0;
+    for (uint32_t worker = 0; worker < kWorkers; ++worker) {
+        const WorkerResult &result = state.results[worker];
+        exact &= result.claim_attempts == result.submits + 1U;
+        exact &= result.claim_wins == result.submits;
+        exact &= state.workers[worker].local_index ==
+            static_cast<int32_t>(result.submits);
+        submits += result.submits;
+        attempts += result.claim_attempts;
+        wins += result.claim_wins;
+        task_id_sum += result.compete_first_split_task_id_sum;
+    }
+    exact &= submits == task_count;
+    exact &= wins == task_count;
+    exact &= attempts ==
+        static_cast<uint64_t>(task_count) + kWorkers;
+    exact &= task_id_sum ==
+        static_cast<uint64_t>(task_count) * (task_count - 1U) / 2U;
+    exact &= state.build_dispatch.next_task.value ==
+        static_cast<int64_t>(task_count + kWorkers);
     return exact &&
            OrderedSubmitTestOps::bad_completion_cas.load(
                std::memory_order_relaxed
@@ -1530,16 +1522,19 @@ bool RunInsertReleaseBeforeBuildTest() {
     constexpr uint32_t kTaskCount = 17;
     uint64_t kernel_counts[4] = {};
     bool worker_results_ok = true;
+    uint64_t completed_submits = 0;
     for (uint32_t worker_id = 0; worker_id < kWorkers; ++worker_id) {
         const WorkerResult &result = state->results[worker_id];
         worker_results_ok &=
             result.worker_id == worker_id &&
-            result.submits == kTaskCount &&
+            result.claim_wins == result.submits &&
+            result.claim_attempts == result.submits + 1U &&
             state->workers[worker_id].local_index ==
-                static_cast<int32_t>(kTaskCount) &&
+                static_cast<int32_t>(result.submits) &&
             result.finish_cycle != 0 &&
             result.final_occupied == 0 &&
             result.completion_duplicates == 0;
+        completed_submits += result.submits;
         for (uint32_t kind = 0; kind < 4; ++kind) {
             kernel_counts[kind] += result.kernel_counts[kind];
         }
@@ -1573,7 +1568,7 @@ bool RunInsertReleaseBeforeBuildTest() {
     const bool ok =
         state->fatal.value == 0 &&
         LegacyTurnsMatch(*state, legacy) &&
-        ClaimAndInsertEvidenceMatches(
+        DispatchAndInsertEvidenceMatches(
             *state, kTaskCount
         ) &&
         PortableBuildEvidenceMatches(
@@ -1588,7 +1583,8 @@ bool RunInsertReleaseBeforeBuildTest() {
         !OrderedSubmitTestOps::hook_timed_out.load(
             std::memory_order_relaxed
         ) &&
-        overlap && worker_results_ok && all_tasks_ready &&
+        overlap && worker_results_ok &&
+        completed_submits == kTaskCount && all_tasks_ready &&
         claim_cells_match && final_group_writer_ok &&
         OrderedSubmitTestOps::bound_dispatch_calls.load(
             std::memory_order_relaxed
@@ -1664,16 +1660,19 @@ bool RunIndependentKernelExecutionTest() {
     constexpr uint32_t kTaskCount = 10;
     uint64_t kernel_counts[4] = {};
     bool worker_results_ok = true;
+    uint64_t completed_submits = 0;
     for (uint32_t worker_id = 0; worker_id < kWorkers; ++worker_id) {
         const WorkerResult &result = state->results[worker_id];
         worker_results_ok &=
             result.worker_id == worker_id &&
-            result.submits == kTaskCount &&
+            result.claim_wins == result.submits &&
+            result.claim_attempts == result.submits + 1U &&
             state->workers[worker_id].local_index ==
-                static_cast<int32_t>(kTaskCount) &&
+                static_cast<int32_t>(result.submits) &&
             result.finish_cycle != 0 &&
             result.final_occupied == 0 &&
             result.completion_duplicates == 0;
+        completed_submits += result.submits;
         for (uint32_t kind = 0; kind < 4; ++kind) {
             kernel_counts[kind] += result.kernel_counts[kind];
         }
@@ -1691,7 +1690,7 @@ bool RunIndependentKernelExecutionTest() {
     const bool ok =
         state->fatal.value == 0 &&
         LegacyTurnsMatch(*state, legacy) &&
-        ClaimAndInsertEvidenceMatches(
+        DispatchAndInsertEvidenceMatches(
             *state, kTaskCount
         ) &&
         PortableBuildEvidenceMatches(
@@ -1704,6 +1703,7 @@ bool RunIndependentKernelExecutionTest() {
             std::memory_order_relaxed
         ) &&
         execution_overlap && worker_results_ok &&
+        completed_submits == kTaskCount &&
         all_tasks_ready &&
         OrderedSubmitTestOps::bound_dispatch_calls.load(
             std::memory_order_relaxed
@@ -1745,8 +1745,8 @@ bool RunIndependentKernelExecutionTest() {
 int main() {
     const bool claim_accounting_ok =
         RunLocalClaimAttemptAccountingTest();
-    const bool claim_cas_budget_ok =
-        RunB256ClaimCasBudgetContractTest();
+    const bool build_ticket_budget_ok =
+        RunB256BuildTicketBudgetContractTest();
     const bool task_id_prefix_ok =
         RunSplitReplayTaskIdPrefixTest();
     const bool loser_ok = RunLoserZeroTensorMapAccessTest();
@@ -1761,7 +1761,7 @@ int main() {
     const bool overlap_ok = RunInsertReleaseBeforeBuildTest();
     const bool execution_ok =
         RunIndependentKernelExecutionTest();
-    if (!claim_accounting_ok || !claim_cas_budget_ok ||
+    if (!claim_accounting_ok || !build_ticket_budget_ok ||
         !task_id_prefix_ok || !loser_ok ||
         !output_prepare_ok ||
         !fanin_compaction_ok || !efdrain_skip_ok ||
@@ -1773,10 +1773,9 @@ int main() {
         return 1;
     }
     std::printf(
-        "[PASS] shared loser skips TensorMap; lookup/Build and "
-        "independent kernel execution cross prior owner Build; "
-        "all 96 Scalar workers can Build every kernel while execution "
-        "remains on a distinct legal K2 owner\n"
+        "[PASS] central Build tickets assign every logical task once; "
+        "strict TensorMap insertion and independent K2 execution close; "
+        "all 96 Scalar workers remain eligible builders\n"
     );
     return 0;
 }

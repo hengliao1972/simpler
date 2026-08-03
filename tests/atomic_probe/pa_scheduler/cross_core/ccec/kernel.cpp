@@ -338,20 +338,19 @@ __aicore__ inline void CcecOps::PmuWindowStop(
         context.phase_requests == 0 && context.phase_misses == 0 &&
         context.phase_elapsed_ticks == 0;
 #if PTO_FDWIC_SHARED_MAP
-    // shared 的 task 数由各 batch 的 context_len 决定。Stop 时公共结果尚未
-    // 发布到 state->results，因此这里只能直接读取本 worker 已完成回放的
-    // local_index。Claim/EfDrain 仍严格覆盖全部逻辑 task；Materialize/
-    // Register 已改为 winner-only，设备端只验证不超过任务数，host 随后
-    // 用已发布的 claim_wins 做逐核精确校验。
-    const uint32_t replay_task_count =
+    // 中央 ticket 令 local_index 表示本 worker 实际取得并完成的 task 数。
+    // Claim/EfDrain 对每个有效 ticket 各覆盖一次；Materialize/Register
+    // 同样不会超过该 owner 的完成数。公共 WorkerResult 尚未发布，因此
+    // 设备端直接读取 owner-local 计数，host 再做逐核及全局精确闭合。
+    const uint32_t owned_task_count =
         static_cast<uint32_t>(state->workers[worker_id].local_index);
     const bool running_call_shape =
         pa_scheduler::kCompiledSubmitPmuPhase ==
                 pa_scheduler::SubmitPmuPhase::Claim ||
             pa_scheduler::kCompiledSubmitPmuPhase ==
                 pa_scheduler::SubmitPmuPhase::EfDrain
-        ? context.phase_calls == replay_task_count
-        : context.phase_calls <= replay_task_count;
+        ? context.phase_calls == owned_task_count
+        : context.phase_calls <= owned_task_count;
 #else
     const uint32_t expected_phase_calls =
         state->config.batches * pa_scheduler::kTasksPerBatch;

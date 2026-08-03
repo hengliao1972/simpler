@@ -150,8 +150,9 @@ static_assert(
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
 // runtime-entry TU 按核型各自拥有一份 external [[block_local]] 实例。
 // orchestration caller 与 noinline finish 只交换固定 ticket/TaskArgs，Submit
-// 内部的 context、统计与状态指针全部留在这份每核状态里。shared loser
-// 不跨 TU：finish_calls 是 winner 数，task_id_sum 仍证明全量 caller replay。
+// 内部的 context、统计与状态指针全部留在这份每核状态里。central ticket
+// 只让有效 owner 跨 TU：finish_calls 是本核取得的 task 数，task_id_sum
+// 证明本核稀疏且单调的 task 所有权集合。
 struct alignas(64) CompeteFirstSplitRuntimeState {
     PA_GM SchedulerState *scheduler;
     PA_GM WorkerState *worker;
@@ -3465,28 +3466,34 @@ static_assert(offsetof(CallbackSubmitTicket, won) == 14, "callback ticket winner
 
 #if PTO_FDWIC_SHARED_MAP && defined(PA_COMPETE_FIRST_SPLIT_FINISH)
 constexpr uint64_t kSharedSplitTicketBindingPresent = 1ULL << 63U;
+constexpr uint64_t kSharedSplitTicketDispatched = 1ULL << 62U;
 
 PA_DEVICE uint64_t SharedSplitTicketBinding(
-    const CallbackSubmitTicket &ticket
+    const CallbackSubmitTicket &ticket, bool dispatched = false
 ) {
     return kSharedSplitTicketBindingPresent |
+           (dispatched ? kSharedSplitTicketDispatched : 0U) |
            (static_cast<uint64_t>(ticket.task_id) << 8U) |
            static_cast<uint64_t>(ticket.reserved);
 }
 
 PA_DEVICE bool ArmSharedSplitTicket(
     CompeteFirstSplitRuntimeState &runtime,
-    const CallbackSubmitTicket &ticket
+    const CallbackSubmitTicket &ticket, bool dispatched = false
 ) {
     // caller 在跨 TU 前保存由动态 plan 推导出的唯一 task/meta 身份；
-    // finish 必须逐字匹配并消费。成功 Submit 数同时充当 next task id，
-    // 因而重复、跳号和乱序 ticket 都不能进入 Finish body。
-    if (runtime.reserved != 0 ||
-        static_cast<uint64_t>(ticket.task_id) !=
-            runtime.stats.result.submits) {
+    // finish 必须逐字匹配并消费。旧 replay 继续要求逐核 0..N-1；中央
+    // 发放模式允许每核取得不连续 task，但仍要求 task 位于权威计划内。
+    if (runtime.reserved != 0 || ticket.task_id >= runtime.task_count ||
+        (!dispatched &&
+         static_cast<uint64_t>(ticket.task_id) !=
+             runtime.stats.result.submits)) {
         return false;
     }
-    runtime.reserved = SharedSplitTicketBinding(ticket);
+    runtime.reserved = SharedSplitTicketBinding(ticket, dispatched);
+    if (dispatched) {
+        runtime.task_id_sum += ticket.task_id;
+    }
     return true;
 }
 
@@ -3815,6 +3822,33 @@ PA_DEVICE bool FinishSharedLoserSubmit(
     return CloseSharedCallbackSubmit<Ops, Profile>(
         state, stats, task_id, kind, submit_begin, is_last_submit
     );
+}
+
+template <typename Ops, bool Profile>
+PA_DEVICE bool CloseSharedDispatchedSubmit(
+    PA_GM SchedulerState *state, LocalStats &stats,
+    uint32_t task_id, TaskKind kind, uint64_t submit_begin
+) {
+    // 中央 ticket 已经给每个 task 唯一 Build owner，逐核 submits 因此只是
+    // 本核完成数，不再是 0..N 的 replay 前缀。task 终点仍写入按真实
+    // task_id 索引的独占泳道槽；整个调度窗口由外层循环统一封口。
+    if (task_id >= state->build_dispatch.task_count ||
+        kind >= TaskKind::Count) {
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
+    ++stats.result.submits;
+#if PA_BUILD_TRACE_FREE
+    const uint64_t submit_end = 0;
+#else
+    const uint64_t submit_end =
+        TraceTimestamp<Ops>(stats.trace, stats.result);
+#endif
+    WriteSharedSubmitTrace<Profile>(
+        stats.trace, stats.result, task_id,
+        submit_begin, submit_end
+    );
+    return true;
 }
 
 PA_DEVICE bool CrossCoreExecWorkerMatchesRole(
@@ -5019,7 +5053,8 @@ PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
 #include "pa_shared_submit_path.h"
 #endif
 
-template <typename Ops, bool Profile, typename PmuContext>
+template <typename Ops, bool Profile, bool SharedDispatched,
+          typename PmuContext>
 PA_DEVICE bool FinishCallbackSubmitBody(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker, uint32_t task_count,
     const TaskArgs &args, SubmitContext &context, LocalStats &stats,
@@ -5027,7 +5062,9 @@ PA_DEVICE bool FinishCallbackSubmitBody(
 ) {
 #if PTO_FDWIC_SHARED_MAP
     (void)task_count;
-    return FinishSharedWinnerSubmitBody<Ops, Profile>(
+    return FinishSharedWinnerSubmitBody<
+        Ops, Profile, SharedDispatched
+    >(
         state, worker, args, context, stats, pmu_context, ticket
     );
 #else
@@ -5373,9 +5410,13 @@ PA_DEVICE uint32_t FinishSplitCallbackSubmitFromRuntime(
     runtime.finish_state_address = state_address;
 #if PTO_FDWIC_SHARED_MAP
     SharedPaTaskMeta ticket_meta{};
+    const uint64_t ticket_binding = runtime.reserved;
+    const bool dispatched =
+        (ticket_binding & kSharedSplitTicketDispatched) != 0;
     const bool expected_ticket_bound =
         ticket != nullptr &&
-        runtime.reserved == SharedSplitTicketBinding(*ticket);
+        ticket_binding ==
+            SharedSplitTicketBinding(*ticket, dispatched);
     // binding 是一次性的 caller→finish 交接状态。无论 ticket 是否
     // 合法都在读取后清零，使 fatal 路也能收敛，并让最终协议检查继续
     // 要求 runtime.reserved==0。
@@ -5393,8 +5434,9 @@ PA_DEVICE uint32_t FinishSplitCallbackSubmitFromRuntime(
             runtime.worker_id, runtime.worker->role
         ) &&
         expected_ticket_bound && ticket->won != 0 &&
-        static_cast<uint64_t>(ticket->task_id) ==
-            runtime.stats.result.submits;
+        (dispatched ||
+         static_cast<uint64_t>(ticket->task_id) ==
+             runtime.stats.result.submits);
 #else
     bool valid = ticket != nullptr && args != nullptr && runtime.scheduler != nullptr &&
                  runtime.worker != nullptr && runtime.task_count != 0 &&
@@ -5459,9 +5501,19 @@ PA_DEVICE uint32_t FinishSplitCallbackSubmitFromRuntime(
     );
 #endif
     bool pmu_context = false;
-    return FinishCallbackSubmitBody<Ops, false>(
-        runtime.scheduler, *runtime.worker, runtime.task_count, *args,
-        runtime.context, runtime.stats, pmu_context, *ticket
+#if PTO_FDWIC_SHARED_MAP
+    if (dispatched) {
+        return FinishCallbackSubmitBody<Ops, false, true>(
+            runtime.scheduler, *runtime.worker,
+            runtime.task_count, *args, runtime.context,
+            runtime.stats, pmu_context, *ticket
+        ) ? 1U : 0U;
+    }
+#endif
+    return FinishCallbackSubmitBody<Ops, false, false>(
+        runtime.scheduler, *runtime.worker, runtime.task_count,
+        *args, runtime.context, runtime.stats,
+        pmu_context, *ticket
     ) ? 1U : 0U;
 }
 #endif
@@ -5708,11 +5760,246 @@ PA_DEVICE bool SubmitCallbackTask(
         0
     };
 #endif
-    return FinishCallbackSubmitBody<Ops, Profile>(
+    return FinishCallbackSubmitBody<Ops, Profile, false>(
         state, worker, task_count, args, context, stats, pmu_context, ticket
     );
 #endif
 }
+
+#if PTO_FDWIC_SHARED_MAP
+enum class SharedBuildTicketStatus : uint32_t {
+    Acquired = 0,
+    Exhausted = 1,
+    Invalid = 2,
+};
+
+struct SharedBuildTicketResult {
+    SharedBuildTicketStatus status;
+    uint32_t task_id;
+};
+
+template <typename Ops>
+PA_DEVICE SharedBuildTicketResult TakeSharedBuildTicket(
+    PA_GM SchedulerState *state, uint32_t task_count,
+    LocalStats &stats
+) {
+    // 每个 worker 最终还会执行一次越界 FetchAdd 以独立确认发放结束，
+    // 因而正常物理调用数是 task_count + kWorkers。返回旧值直接决定
+    // task 身份，必须按 return-ready 语义消费。
+    const int64_t observed = TraceAtomicFetchAdd<Ops>(
+        stats.trace, stats.result, -1,
+        AtomicSite::SharedBuildDispatchTicket,
+        &state->build_dispatch.next_task.value, 1,
+        /*result_used=*/true
+    );
+    ++stats.result.claim_attempts;
+    if (task_count == 0 || task_count > kMaxTasks || observed < 0) {
+        return SharedBuildTicketResult{
+            SharedBuildTicketStatus::Invalid, UINT32_MAX
+        };
+    }
+    if (observed >= static_cast<int64_t>(task_count)) {
+        return SharedBuildTicketResult{
+            SharedBuildTicketStatus::Exhausted, UINT32_MAX
+        };
+    }
+    return SharedBuildTicketResult{
+        SharedBuildTicketStatus::Acquired,
+        static_cast<uint32_t>(observed)
+    };
+}
+
+template <TaskKind Kind, typename Ops, bool Profile,
+          typename PmuContext>
+PA_DEVICE bool BuildDispatchedSharedTask(
+    PA_GM SchedulerState *state, PA_GM WorkerState &worker,
+    uint32_t task_count, const SharedBuildDispatchTask &planned,
+    PaOrchestrationState &orch, TaskArgs &args,
+    SubmitContext &context, LocalStats &stats,
+    PmuContext &pmu_context, uint64_t submit_begin,
+    uint64_t claim_begin, uint64_t claim_end
+) {
+    const uint32_t task_id = planned.task_id;
+    if (planned.meta.kind != Kind || task_id >= task_count ||
+        planned.batch >= state->build_dispatch.batch_count) {
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
+
+    // ticket 已经唯一决定 Build owner；这里沿用 Claim/win 统计字段承载
+    // “有效发放/成功取得”的既有 host 口径，但不再访问 Claim Tournament。
+    ++stats.result.claim_wins;
+    ++stats.result.wins[KindIndex(Kind)];
+    ++worker.local_index;
+    WriteSharedClaimTrace<Profile>(
+        stats.trace, stats.result, task_id,
+        claim_begin, claim_end, /*winner=*/true
+    );
+    AccumulatePhase<Profile>(
+        stats.result, ProfilePhase::EfDrain,
+        submit_begin, claim_begin
+    );
+
+    context.task_id = static_cast<int32_t>(task_id);
+    context.shared_result.Reset(static_cast<int32_t>(task_id));
+    if (!PrepareSharedTaskOutputs(
+            context.shared_result, static_cast<int32_t>(task_id), Kind
+        )) {
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
+    context.won = true;
+    context.kernel_id = FunctionId(Kind);
+    PrepareSharedWinnerContext(worker, task_id, context);
+
+    // 每个 ticket 只恢复当前 task 所需的最小 PA 状态。输出句柄由
+    // (producer task, slot) 确定，不要求本 worker 顺序经历前驱。
+    ++stats.result.context_reads;
+    if (!BindSharedPaTaskForRandomAccess(
+            orch, planned.batch, planned.meta.batch_start,
+            task_id, Kind, planned.meta.group_index
+        ) ||
+        !BuildCallbackSubmitArgs<Kind>(
+            orch, args, planned.batch, stats
+        )) {
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
+
+    const CallbackSubmitTicket ticket{
+        submit_begin,
+        task_id,
+        static_cast<int16_t>(FunctionId(Kind)),
+        1,
+        state->build_dispatch.tasks[task_id].encoded_meta
+    };
+#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+    CompeteFirstSplitRuntimeState &split_runtime =
+        Ops::CompeteFirstSplitState();
+    if (!ArmSharedSplitTicket(
+            split_runtime, ticket, /*dispatched=*/true
+        )) {
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
+    (void)pmu_context;
+    return Ops::FinishCompeteFirstCallback(&ticket, &args);
+#else
+    return FinishCallbackSubmitBody<Ops, Profile, true>(
+        state, worker, task_count, args, context, stats,
+        pmu_context, ticket
+    );
+#endif
+}
+
+template <typename Ops, bool Profile, typename PmuContext>
+PA_DEVICE bool DispatchOneSharedBuildTask(
+    PA_GM SchedulerState *state, PA_GM WorkerState &worker,
+    CoreRole role, uint32_t task_count,
+    PaOrchestrationState &orch, TaskArgs &args,
+    SubmitContext &context, LocalStats &stats,
+    PmuContext &pmu_context, bool &exhausted
+) {
+    exhausted = false;
+#if PA_BUILD_PERF_CLOCK || PA_BUILD_SUBMIT_PMU
+    const uint64_t submit_begin = 0;
+#else
+    const uint64_t submit_begin =
+        TraceTimestamp<Ops>(stats.trace, stats.result);
+#endif
+    BeginSubmitPmuPhase<SubmitPmuPhase::EfDrain, Ops>(pmu_context);
+    const uint32_t worker_id =
+        static_cast<uint32_t>(worker.core_idx);
+    if (CrossCoreExecHasLocalProgressWork(
+            state, worker_id, role, task_count, stats
+        )) {
+        (void)ProgressCrossCoreExec<Ops>(
+            state, worker, task_count,
+            /*production_closed=*/false,
+            DrainPlace::EfDrain, stats
+        );
+    }
+    EndSubmitPmuPhase<SubmitPmuPhase::EfDrain, Ops>(pmu_context);
+    if (IsFatal<Ops>(state, stats)) {
+        return false;
+    }
+
+    const uint64_t claim_begin =
+        TraceTimestamp<Ops>(stats.trace, stats.result);
+    BeginSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
+    const SharedBuildTicketResult ticket =
+        TakeSharedBuildTicket<Ops>(state, task_count, stats);
+    EndSubmitPmuPhase<SubmitPmuPhase::Claim, Ops>(pmu_context);
+    const uint64_t claim_end =
+        TraceTimestamp<Ops>(stats.trace, stats.result);
+    if (ticket.status == SharedBuildTicketStatus::Exhausted) {
+        exhausted = true;
+        return true;
+    }
+    if (ticket.status != SharedBuildTicketStatus::Acquired) {
+        SetFatal<Ops>(state, stats);
+        return false;
+    }
+
+    SharedBuildDispatchTask planned{};
+    if (!DecodeSharedBuildDispatchTask(
+            state->build_dispatch, ticket.task_id, planned
+        )) {
+        SetFatal<Ops>(
+            state, stats, static_cast<int32_t>(ticket.task_id)
+        );
+        return false;
+    }
+    switch (planned.meta.kind) {
+        case TaskKind::Alloc:
+            return BuildDispatchedSharedTask<
+                TaskKind::Alloc, Ops, Profile
+            >(
+                state, worker, task_count, planned, orch, args,
+                context, stats, pmu_context, submit_begin,
+                claim_begin, claim_end
+            );
+        case TaskKind::Qk:
+            return BuildDispatchedSharedTask<
+                TaskKind::Qk, Ops, Profile
+            >(
+                state, worker, task_count, planned, orch, args,
+                context, stats, pmu_context, submit_begin,
+                claim_begin, claim_end
+            );
+        case TaskKind::Sf:
+            return BuildDispatchedSharedTask<
+                TaskKind::Sf, Ops, Profile
+            >(
+                state, worker, task_count, planned, orch, args,
+                context, stats, pmu_context, submit_begin,
+                claim_begin, claim_end
+            );
+        case TaskKind::Pv:
+            return BuildDispatchedSharedTask<
+                TaskKind::Pv, Ops, Profile
+            >(
+                state, worker, task_count, planned, orch, args,
+                context, stats, pmu_context, submit_begin,
+                claim_begin, claim_end
+            );
+        case TaskKind::Up:
+            return BuildDispatchedSharedTask<
+                TaskKind::Up, Ops, Profile
+            >(
+                state, worker, task_count, planned, orch, args,
+                context, stats, pmu_context, submit_begin,
+                claim_begin, claim_end
+            );
+        case TaskKind::Count:
+            break;
+    }
+    SetFatal<Ops>(
+        state, stats, static_cast<int32_t>(ticket.task_id)
+    );
+    return false;
+}
+#endif
 
 PA_DEVICE uint32_t CountLiveMapEntries(PA_GM const TensorMap &map) {
     // AdvanceTensorMap 按 producer 精确维护 logical live_count；各桶 head
@@ -5948,12 +6235,6 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #else
     LocalStats stats{};
 #endif
-#if PTO_FDWIC_SHARED_MAP
-    // 逐次尝试数在 caller 自动对象中精确累计；相比 block-local
-    // WorkerResult 的每次 RMW，它不会被 winner Finish 访问或发布。
-    // 回放统一出口再写回一次，fatal 中途退出仍只统计已发射的 Claim。
-    uint64_t shared_claim_attempts = 0;
-#endif
     stats.result.worker_id = worker_id;
     stats.result.role = static_cast<uint32_t>(role);
     stats.result.checksum = 0;
@@ -6034,10 +6315,15 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 
     const uint32_t batches = state->config.batches;
 #if PTO_FDWIC_SHARED_MAP
-    // split Finish 在 replay 过程中只需容量上限；真实 task_count 随每批
-    // context_len 变化，回放结束后再由 local_index 封口。末次 Submit
-    // 的精确计时身份由 ticket 携带，不预扫 context_lens。
-    uint32_t task_count = kMaxTasks;
+    // host 已从 context_lens 独立构建并发布不可变计划。device 只接受与
+    // 本次 RunConfig 一致的 header；中央 ticket 与 K2 scanner 共用这一
+    // task_count，不再由任一 worker 的本地 replay 前缀反推。
+    const uint32_t task_count = state->build_dispatch.task_count;
+    if (task_count == 0 || task_count > kMaxTasks ||
+        state->build_dispatch.batch_count != batches ||
+        batches == 0 || batches > kMaxBatches) {
+        SetFatal<Ops>(state, stats);
+    }
 #else
     const uint32_t task_count = batches * kTasksPerBatch;
 #endif
@@ -6053,147 +6339,51 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #endif
     uint64_t orchestration_begin = 0;
     uint64_t orchestration_end = 0;
-#if PTO_FDWIC_SHARED_MAP
-    bool shared_replay_window_started = false;
-#endif
     if (!IsFatal<Ops>(state, stats)) {
-        // private 每批固定回放 Alloc/QK/SF/PV/UP；shared 则先按
-        // context_len 建立 1+4N task plan。所有 worker 的计划相同，执行
-        // lane 仍由 Claim 筛选。
+        // private 每批固定回放 Alloc/QK/SF/PV/UP；shared 直接消费 host
+        // 按 context_len 发布的 1+4N immutable plan，由中央 ticket 选择
+        // Build owner，K2 执行资格仍由独立双候选映射决定。
         // CCEC 可在这里开启本 worker 私有 PMU 窗口；CPU/AscendC 适配层是空实现。
         // 窗口覆盖本 worker 的全部调度期：从 orchestration 初始化前开始，
         // 依次包含 EfDrain、Claim、当前模式实际执行的参数构造与后续 Submit
         // 阶段，到末次 Submit 返回。private 为全员 eager；shared 五类
-        // task 都只由 Claim owner 构参。
+        // task 都只由 ticket owner 构参。
         // 它与全局“首 Submit.begin～末 Submit.end”口径接近但不相同，host sidecar
         // 必须按 per-worker 累计解释。泳道父边界在 PMU-only 构建中会被编译为空，
         // 不应污染 Submit 取数。
         auto pmu_context = Ops::PmuWindowStart(state, worker_id);
-#if PTO_FDWIC_SHARED_MAP
-        shared_replay_window_started = true;
-#endif
         orchestration_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
         InitPaOrchestration(orchestration, batches, &state->context_lens[0]);
 #if PTO_FDWIC_SHARED_MAP
-        bool replay_ok = true;
-        for (uint32_t batch = 0;
-             batch < batches && replay_ok; ++batch) {
-            BeginPaBatchForCallback(orchestration, batch);
-            ++stats.result.context_reads;
-            SharedPaBatchPlan batch_plan{};
-            if (!BuildSharedPaBatchPlan(
-                    orchestration.current_sequence,
-                    worker.local_index, batch_plan
-                )) {
-                SetFatal<Ops>(
-                    state, stats,
-                    static_cast<int32_t>(worker.local_index)
-                );
-                break;
-            }
-            if (!SubmitCallbackTask<TaskKind::Alloc, Ops, Profile>(
-                    state, worker, role, task_count, orchestration, args,
-                    batch, context, stats, pmu_context,
-                    shared_claim_attempts,
-                    batch_plan, 0, batches
+        // 中央单调 ticket 只让每个逻辑 task 构建一次。每个 Scalar 在
+        // 领取前先推进自己映射上的 K2 候选；取得 ticket 后可乱序构参，
+        // 但 Finish 内仍由 deps_prepared[N-1] 串行提交 TensorMap 元数据。
+#if PA_BUILD_PERF_CLOCK
+        stats.result.submit_begin = Ops::PerfClockNow();
+#elif PA_BUILD_SUBMIT_PMU
+        stats.result.submit_begin = Ops::Now();
+#else
+        stats.result.submit_begin = orchestration_begin;
+#endif
+        bool dispatch_exhausted = false;
+        while (!dispatch_exhausted &&
+               !IsFatal<Ops>(state, stats)) {
+            if (!DispatchOneSharedBuildTask<Ops, Profile>(
+                    state, worker, role, task_count,
+                    orchestration, args, context, stats,
+                    pmu_context, dispatch_exhausted
                 )) {
                 break;
-            }
-            AcceptTaskOutputs(
-                orchestration, TaskKind::Alloc,
-                OrchestrationOutputs(context)
-            );
-
-            for (uint32_t group = 0;
-                 group < batch_plan.group_count; ++group) {
-                // 这是 PA adapter 的正常 group 状态推进，不作为 shared
-                // runtime 的 winner-only 特例。所有 replay actor 保持同一
-                // orchestration 状态，通用调度优化不依赖 PA 参数布局。
-                const uint64_t block_offset =
-                    static_cast<uint64_t>(group) *
-                    kPaBlocksPerRequest;
-                PreparePaBlockGroup(orchestration, block_offset);
-                if (!SubmitCallbackTask<
-                        TaskKind::Qk, Ops, Profile
-                    >(
-                        state, worker, role, task_count, orchestration,
-                        args, batch, context, stats, pmu_context,
-                        shared_claim_attempts,
-                        batch_plan,
-                        SharedPaTaskOffset(TaskKind::Qk, group),
-                        batches
-                    )) {
-                    replay_ok = false;
-                    break;
-                }
-                AcceptTaskOutputs(
-                    orchestration, TaskKind::Qk,
-                    OrchestrationOutputs(context)
-                );
-
-                if (!SubmitCallbackTask<
-                        TaskKind::Sf, Ops, Profile
-                    >(
-                        state, worker, role, task_count, orchestration,
-                        args, batch, context, stats, pmu_context,
-                        shared_claim_attempts,
-                        batch_plan,
-                        SharedPaTaskOffset(TaskKind::Sf, group),
-                        batches
-                    )) {
-                    replay_ok = false;
-                    break;
-                }
-                AcceptTaskOutputs(
-                    orchestration, TaskKind::Sf,
-                    OrchestrationOutputs(context)
-                );
-
-                if (!SubmitCallbackTask<
-                        TaskKind::Pv, Ops, Profile
-                    >(
-                        state, worker, role, task_count, orchestration,
-                        args, batch, context, stats, pmu_context,
-                        shared_claim_attempts,
-                        batch_plan,
-                        SharedPaTaskOffset(TaskKind::Pv, group),
-                        batches
-                    )) {
-                    replay_ok = false;
-                    break;
-                }
-                AcceptTaskOutputs(
-                    orchestration, TaskKind::Pv,
-                    OrchestrationOutputs(context)
-                );
-
-                if (!SubmitCallbackTask<
-                        TaskKind::Up, Ops, Profile
-                    >(
-                        state, worker, role, task_count, orchestration,
-                        args, batch, context, stats, pmu_context,
-                        shared_claim_attempts,
-                        batch_plan,
-                        SharedPaTaskOffset(TaskKind::Up, group),
-                        batches
-                    )) {
-                    replay_ok = false;
-                    break;
-                }
-            }
-            const uint32_t expected_batch_end =
-                batch_plan.batch_start + batch_plan.task_count;
-            if (replay_ok &&
-                (worker.local_index < 0 ||
-                 static_cast<uint32_t>(worker.local_index) !=
-                     expected_batch_end)) {
-                SetFatal<Ops>(
-                    state, stats,
-                    static_cast<int32_t>(worker.local_index)
-                );
-                replay_ok = false;
             }
         }
+#if PA_BUILD_PERF_CLOCK
+        stats.result.submit_end = Ops::PerfClockNow();
+#elif PA_BUILD_SUBMIT_PMU
+        stats.result.submit_end = Ops::Now();
+#else
+        stats.result.submit_end =
+            TraceTimestamp<Ops>(stats.trace, stats.result);
+#endif
 #else
         for (uint32_t batch = 0; batch < batches; ++batch) {
             BeginPaBatchForCallback(orchestration, batch);
@@ -6252,39 +6442,12 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             }
         }
 #endif
-#if PTO_FDWIC_SHARED_MAP
-        // 先封口实际 task 数和唯一 last 身份，再停止 PMU。这样
-        // missing/early/duplicate-last 不会先产出看似合法的 phase shape；
-        // Stop 仍在 fatal 路无条件执行，保证本核计数器完成收口。
-        task_count = FinalizeSharedReplayTaskCount<Ops>(
-            state, worker, stats
-        );
-#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
-        split_runtime.task_count = task_count;
-#endif
-#endif
         Ops::PmuWindowStop(state, worker_id, pmu_context);
         orchestration_end = TraceTimestamp<Ops>(stats.trace, stats.result);
     }
-#if PTO_FDWIC_SHARED_MAP
-    // 构建身份或启动阶段已经 fatal 时 PMU 从未开启，但后续 split
-    // 协议仍必须使用实际的零 task 数，不能保留容量上限 kMaxTasks。
-    if (!shared_replay_window_started) {
-        task_count = FinalizeSharedReplayTaskCount<Ops>(
-            state, worker, stats
-        );
-#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
-        split_runtime.task_count = task_count;
-#endif
-    }
-    // 正常回放、Submit/plan 失败和启动前 fatal 都已在这里汇合；把
-    // caller 中按实际 attempted 累计的值一次写回原 WorkerResult 字段。
-    FinalizeSharedClaimAttempts(
-        stats, shared_claim_attempts
-    );
-#endif
 
-    // replay_done 表示所有 worker 已退出回放循环（成功路径即完整提交）；之后仍需 drain 到本核 slot 为空。
+    // replay_done 表示所有 worker 都已拿到越界 ticket；成功路径下这同时
+    // 证明所有有效 task 已完成 Build 发布。之后仍需 drain K2 到终态。
     // 成功路径复用 orchestration end 作为 final drain start，使两个业务父区间
     // 首尾相接；父记录延后到 final drain 结束再写，避免记录自身落进任一业务 span。
     const uint64_t final_drain_begin = orchestration_end != 0
@@ -6431,15 +6594,17 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #endif
 
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+#if !PTO_FDWIC_SHARED_MAP
     const uint64_t expected_task_id_sum =
         static_cast<uint64_t>(task_count) * (task_count - 1U) / 2U;
+#endif
     // terminal fatal 可能在某个 worker 进入首个 Submit 之前已经可见。
     // 该 worker 合法地没有 finish 调用，finish TU 地址也尚未回写；不能
     // 把这种零回放收敛误报成 split 状态错配。只要开始过任一 Submit，
     // 仍严格要求 caller/finish 是同一个 TLS runtime。
 #if PTO_FDWIC_SHARED_MAP
-    // shared 的 loser 不跨 TU；某个 worker 即使完整重放了 N 个任务，也
-    // 可能一个都没赢。finish 地址是否出现只取决于本核 winner 数。
+    // shared 中每个有效 ticket 都跨 TU 完成一次 winner Finish；某个
+    // worker 可以没有取得任何 task，此时 finish 地址合法地保持 0。
     const bool finish_state_matches =
         split_runtime.finish_calls == 0
             ? split_runtime.finish_state_address == 0
@@ -6447,6 +6612,10 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                   split_runtime.caller_state_address;
     const uint64_t expected_finish_calls =
         stats.result.claim_wins;
+    const bool split_task_accounting_ok =
+        split_runtime.finish_calls == stats.result.submits &&
+        stats.result.submits ==
+            static_cast<uint64_t>(worker.local_index);
 #else
     const bool finish_state_matches =
         task_count == 0
@@ -6457,6 +6626,8 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             : split_runtime.finish_state_address ==
                   split_runtime.caller_state_address;
     const uint64_t expected_finish_calls = task_count;
+    const bool split_task_accounting_ok =
+        split_runtime.task_id_sum == expected_task_id_sum;
 #endif
     const bool split_protocol_ok =
         split_runtime.scheduler == state && split_runtime.worker == &worker &&
@@ -6464,7 +6635,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         split_runtime.owner_worker_id == worker_id && split_runtime.caller_state_address != 0 &&
         finish_state_matches &&
         split_runtime.finish_calls == expected_finish_calls &&
-        split_runtime.task_id_sum == expected_task_id_sum &&
+        split_task_accounting_ok &&
         split_runtime.state_cookie == CompeteFirstSplitStateCookie(worker_id, role) &&
         split_runtime.reserved == 0;
     if (!split_protocol_ok) {
@@ -6483,7 +6654,9 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 
     // PA writes swimlane records through the ordinary GM cache and explicitly
     // cleans each worker's record range before the kernel finishes.
-    FlushTraceCore<Ops>(stats.trace, stats.result);
+    FlushTraceCore<Ops>(
+        stats.trace, stats.result, task_count
+    );
 #if PA_BUILD_PERF_CLOCK
     // 复用末个 Submit 的已保存边界满足结果有序性，不再为 worker 尾部
     // 增加一次纯诊断 SYS_CNT。

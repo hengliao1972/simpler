@@ -791,7 +791,10 @@ enum class AtomicSite : uint32_t {
     // 都参与胜负判断，必须按 return-ready 边界观察。
     SharedClaimTournamentLocal = 40,
     SharedClaimTournamentRoot = 41,
-    Count = 42,
+    // shared Build 中央发放器的单调 ticket。FetchAdd 返回旧值直接决定
+    // 本核取得的 task id；超过 task_count 的返回值表示该 worker 完成退场。
+    SharedBuildDispatchTicket = 42,
+    Count = 43,
 };
 
 // Atomic 记录 flags 的低四位保存操作种类；bit4 表示返回值参与后续判断，
@@ -870,6 +873,7 @@ PA_MODEL_INLINE constexpr AtomicOp AtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::ReplayDoneIncrement:
         case AtomicSite::SharedHeapCursorReserve:
         case AtomicSite::SharedHeapVendAdvance:
+        case AtomicSite::SharedBuildDispatchTicket:
             return AtomicOp::FetchAdd;
         case AtomicSite::FatalSet:
         case AtomicSite::CompletionVendExchange:
@@ -941,6 +945,7 @@ PA_MODEL_INLINE constexpr bool AtomicSiteResultUsed(AtomicSite site) {
         case AtomicSite::SharedMapAppendTailExchange:
         case AtomicSite::SharedClaimTournamentLocal:
         case AtomicSite::SharedClaimTournamentRoot:
+        case AtomicSite::SharedBuildDispatchTicket:
             return true;
         case AtomicSite::Count:
             return false;

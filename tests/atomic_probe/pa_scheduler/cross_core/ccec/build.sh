@@ -205,11 +205,14 @@ COMMON_FLAGS=(
 # 精确尺寸预留；runtime object、单 role section 与最终双 role 布局都必须
 # 使用同一数值，不能靠多留一条未说明的 cache line 掩盖 ABI 漂移。
 SPLIT_STATE_STORAGE_BYTES=1728
-# shared nonwinner 在 caller 内直接收尾。S5b 的任意 Scalar Build 允许
-# AIC/AIV 都成为 Alloc/QK/SF/PV/UP winner，因此两个 role caller 都必须
-# 保留五条跨 TU winner finish relocation。split-finish 是两种构建共同的
-# 固定调用形状，不能为 perf-clock 改成另一条 inline 路径。
-SPLIT_FINISH_CALL_SITES=5
+# 中央 ticket 之后不再为五种 task 人为保留五份 replay 尾部。CCEC 会按
+# role/观察构建合并相同尾部：perf-clock 两个 role 均为 3 条；swimlane
+# 因 AIC 的 trace 控制流不同而保留 5 条，AIV 仍为 3 条。五种 kind 是否
+# 完整覆盖由 dispatch switch 和 CPU 动态协议测试证明；这里精确锁定当前
+# 每种产物的真实代码形状，防止 finish 被内联/删除，又不阻止有益的合并。
+SPLIT_FINISH_CALL_SITES_PERF_CLOCK=3
+SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC=5
+SPLIT_FINISH_CALL_SITES_SWIMLANE_AIV=3
 COMMON_FLAGS+=(
     -mllvm -cce-block-local-relocate=true
     -mllvm "-cce-block-local-reserve-size=$SPLIT_STATE_STORAGE_BYTES"
@@ -279,6 +282,14 @@ text_relocation_count_for_symbol() {
 check_split_role_objects() {
     local role="$1"
     local wrong_role="$2"
+    local expected_finish_call_sites
+    if [[ "$BUILD_VARIANT" == "perf-clock" ]]; then
+        expected_finish_call_sites="$SPLIT_FINISH_CALL_SITES_PERF_CLOCK"
+    elif [[ "$role" == "aic" ]]; then
+        expected_finish_call_sites="$SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC"
+    else
+        expected_finish_call_sites="$SPLIT_FINISH_CALL_SITES_SWIMLANE_AIV"
+    fi
     local caller="$BUILD_DIR/pa_scheduler_${role}.o"
     local runtime="$BUILD_DIR/pa_scheduler_compete_first_callback_runtime_${role}.o"
     local finish="$BUILD_DIR/pa_scheduler_compete_first_callback_finish_${role}.o"
@@ -307,8 +318,8 @@ check_split_role_objects() {
         fi
     done
     if [[ "$(text_relocation_count_for_symbol "$caller" "$finish_symbol")" -ne \
-          "$SPLIT_FINISH_CALL_SITES" ]]; then
-        echo "Caller must contain exactly $SPLIT_FINISH_CALL_SITES role-compatible finish .rela.text relocations: $caller" >&2
+          "$expected_finish_call_sites" ]]; then
+        echo "Caller must contain exactly $expected_finish_call_sites role-compatible finish .rela.text relocations: $caller" >&2
         exit 1
     fi
     if [[ "$(text_relocation_count_for_symbol "$caller" "$state_symbol")" -eq 0 ]]; then

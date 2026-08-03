@@ -166,6 +166,7 @@ ATOMIC_SITE_NAMES = {
     39: "shared_output_rollback_exchange",
     40: "shared_claim_tournament_local",
     41: "shared_claim_tournament_root",
+    42: "shared_build_dispatch_ticket",
 }
 ATOMIC_OP_NAMES = {
     0: "load",
@@ -222,6 +223,7 @@ ATOMIC_SITE_OP_IDS = {
     39: 1,
     40: 4,
     41: 4,
+    42: 2,
 }
 # 这些发布型调用不消费 atomic 返回的旧值；其余 standalone site 的
 # 返回值都参与协议判断。v3 输入必须与源码语义完全一致。
@@ -238,7 +240,7 @@ POLL_BATCH_SITE_OP_IDS = {
     19: 0,
 }
 SHARED_REGISTER_ATOMIC_SITE_IDS = {19, 20}
-SCHEMA_V5_SHARED_ATOMIC_SITE_IDS = set(range(19, 42))
+SCHEMA_V5_SHARED_ATOMIC_SITE_IDS = set(range(19, 43))
 SHARED_INSERT_TURN_POLL_SITE_ID = 19
 SHARED_INSERT_TURN_HANDOFF_SITE_ID = 20
 SHARED_CLAIM_TOURNAMENT_SITE_IDS = {40, 41}
@@ -312,21 +314,27 @@ def _integer(value: Any, label: str) -> int:
         raise ValueError(f"{label} is not an integer: {value!r}") from error
 
 
-def _derive_v4_task_kinds(
+def _derive_v4_task_kinds(  # noqa: PLR0912
     submit_semantics: dict[tuple[int, int], tuple[bool, bool]],
     num_cores: int,
+    submit_topology: str = "all_worker_replay",
 ) -> dict[int, int]:
-    """从每核 Submit 的既有 Alloc 标记恢复动态 task 类型流。
+    """从 Submit 已有的 Alloc 标记恢复动态 task 类型流。
 
     schema-v5 的 ``Submit.auxiliary`` 已逐核记录 ``is_alloc``，因此无需给
-    设备 raw 再增加 task-kind 字段。这里先要求 96 核（或测试给定核数）
-    具有完全一致的连续 task 流，再按相邻 Alloc 边界验证每个 batch 必须是
-    ``Alloc + 0..4 × (QK,SF,PV,UP)``。返回值使用稳定 TaskKind 编号：
-    Alloc=0，QK/SF/PV/UP=1..4。
+    设备 raw 再增加 task-kind 字段。旧 ``all_worker_replay`` 要求每核具有
+    完全一致的连续 task 流；``central_ticket`` 则要求全局 task 0..N-1
+    恰好各出现一次。两种拓扑随后使用同一 PA batch 形状门禁：
+    ``Alloc + 0..4 × (QK,SF,PV,UP)``。返回稳定 TaskKind 编号：Alloc=0，
+    QK/SF/PV/UP=1..4。
     """
 
     if num_cores <= 0:
         raise ValueError(f"schema-v5 task plan requires positive num_cores, got {num_cores}")
+    if submit_topology not in ("all_worker_replay", "central_ticket"):
+        raise ValueError(
+            f"unsupported schema-v5 submit_topology: {submit_topology!r}"
+        )
 
     task_ids_by_core: dict[int, list[int]] = {
         core_id: [] for core_id in range(num_cores)
@@ -343,27 +351,48 @@ def _derive_v4_task_kinds(
         task_ids_by_core[core_id].append(task_id)
 
     reference_task_ids: list[int] | None = None
-    for core_id in range(num_cores):
-        task_ids = sorted(task_ids_by_core[core_id])
-        if reference_task_ids is None:
-            if not task_ids or task_ids != list(range(task_ids[-1] + 1)):
+    if submit_topology == "central_ticket":
+        owners_by_task: dict[int, int] = {}
+        for (core_id, task_id) in submit_semantics:
+            previous_owner = owners_by_task.setdefault(task_id, core_id)
+            if previous_owner != core_id:
                 raise ValueError(
-                    "schema-v5 Submit task IDs must be contiguous 0..N-1 on every "
-                    f"core: core={core_id} task_ids={task_ids}"
+                    "schema-v5 central-ticket task has multiple Submit owners: "
+                    f"task={task_id} owners={previous_owner},{core_id}"
                 )
-            reference_task_ids = task_ids
-        elif task_ids != reference_task_ids:
+        reference_task_ids = sorted(owners_by_task)
+        if (
+            not reference_task_ids
+            or reference_task_ids
+            != list(range(reference_task_ids[-1] + 1))
+        ):
             raise ValueError(
-                "schema-v5 Submit task IDs differ across cores: "
-                f"core={core_id} task_ids={task_ids}"
+                "schema-v5 central-ticket Submit task IDs must cover global "
+                f"0..N-1 exactly once: task_ids={reference_task_ids}"
             )
+    else:
+        for core_id in range(num_cores):
+            task_ids = sorted(task_ids_by_core[core_id])
+            if reference_task_ids is None:
+                if not task_ids or task_ids != list(range(task_ids[-1] + 1)):
+                    raise ValueError(
+                        "schema-v5 Submit task IDs must be contiguous 0..N-1 on every "
+                        f"core: core={core_id} task_ids={task_ids}"
+                    )
+                reference_task_ids = task_ids
+            elif task_ids != reference_task_ids:
+                raise ValueError(
+                    "schema-v5 Submit task IDs differ across cores: "
+                    f"core={core_id} task_ids={task_ids}"
+                )
 
     assert reference_task_ids is not None
     alloc_by_task: dict[int, bool] = {}
     for task_id in reference_task_ids:
         markers = {
-            submit_semantics[(core_id, task_id)][1]
-            for core_id in range(num_cores)
+            semantics[1]
+            for (core_id, observed_task_id), semantics in submit_semantics.items()
+            if observed_task_id == task_id
         }
         if len(markers) != 1:
             raise ValueError(
@@ -436,15 +465,37 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
             "metadata.trace_schema_version=5 requires l2_swimlane_level=1 or 4"
         )
     tensormap_mode = metadata.get("tensormap_mode")
+    submit_topology = metadata.get(
+        "submit_topology", "all_worker_replay"
+    )
     if trace_schema_version == 5:
         if tensormap_mode not in ("private", "shared"):
             raise ValueError(
                 "metadata.tensormap_mode must be private or shared for "
                 "trace_schema_version=5"
             )
+        if submit_topology not in (
+            "all_worker_replay", "central_ticket"
+        ):
+            raise ValueError(
+                "metadata.submit_topology must be all_worker_replay or "
+                "central_ticket for trace_schema_version=5"
+            )
+        if (
+            submit_topology == "central_ticket"
+            and tensormap_mode != "shared"
+        ):
+            raise ValueError(
+                "metadata.submit_topology=central_ticket requires shared "
+                "TensorMap mode"
+            )
     elif tensormap_mode is not None:
         raise ValueError(
             "metadata.tensormap_mode is only valid for trace_schema_version=5"
+        )
+    elif "submit_topology" in metadata:
+        raise ValueError(
+            "metadata.submit_topology is only valid for trace_schema_version=5"
         )
     num_cores = _integer(metadata.get("num_cores"), "metadata.num_cores")
     if num_cores <= 0:
@@ -1067,7 +1118,9 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                     )
         if set(v4_claims) != v4_submits:
             raise ValueError("schema-v5 Claim keys do not match Submit keys")
-        task_kind_by_id = _derive_v4_task_kinds(v4_submit_semantics, num_cores)
+        task_kind_by_id = _derive_v4_task_kinds(
+            v4_submit_semantics, num_cores, str(submit_topology)
+        )
         for task_key, (attempted, won, is_alloc) in v4_claims.items():
             submit_won, submit_alloc = v4_submit_semantics[task_key]
             task_kind = task_kind_by_id[task_key[1]]
@@ -1079,6 +1132,13 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                 )
             if won and not attempted:
                 raise ValueError(f"schema-v5 Claim won without attempt at {task_key}")
+            if submit_topology == "central_ticket" and (
+                not attempted or not won
+            ):
+                raise ValueError(
+                    "schema-v5 central-ticket Submit owner must have an "
+                    f"attempted winner Claim at {task_key}"
+                )
             if submit_won != won or submit_alloc != is_alloc:
                 raise ValueError(f"schema-v5 Submit/Claim semantics mismatch at {task_key}")
             expected_tail = (

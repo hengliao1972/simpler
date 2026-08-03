@@ -210,46 +210,15 @@ SharedHostTaskPlan MakeCompactTracePlan() {
     return plan;
 }
 
-void TestSharedClaimAttemptedBoundary() {
-    for (uint32_t worker = 0;
-         worker < pa_scheduler::kWorkers; ++worker) {
-        for (uint32_t kind = 0;
-             kind < static_cast<uint32_t>(TaskKind::Count);
-             ++kind) {
-            Check(
-                pa_scheduler::host::SharedTraceClaimAttempted(
-                    worker, 17U, static_cast<TaskKind>(kind)
-                ),
-                "every valid task kind is attempted by every Scalar"
-            );
-        }
-    }
-    Check(
-        !pa_scheduler::host::SharedTraceClaimAttempted(
-            pa_scheduler::kWorkers, 17U, TaskKind::Qk
-        ) &&
-            !pa_scheduler::host::SharedTraceClaimAttempted(
-                0U, 17U, TaskKind::Count
-            ) &&
-            !pa_scheduler::host::SharedTraceClaimAttempted(
-                0U, 17U, static_cast<TaskKind>(UINT32_MAX)
-            ),
-        "worker and task-kind boundaries fail closed"
-    );
-}
-
 void TestSharedCompactReconstruction() {
-    // AIV worker 32 不属于旧 task0%4 的 24 核分片。用它作为
-    // Alloc winner 锁定当前 96 核全候选合同；S5b 下同一
-    // worker 对所有 kernel task 也都必须标记 Claim attempted。
+    // central-ticket 下每个 worker 只保存自己取得的 task 槽；其余
+    // task-indexed 槽保持全零。这里让一个 AIV 稀疏拥有 task 0/3，
+    // 验证导出只展开这两个 winner，同时保留全局覆盖位供外层闭合。
     constexpr uint32_t worker = 32;
     constexpr uint64_t base_cycle = 5000;
     const SharedHostTaskPlan plan = MakeCompactTracePlan();
-    constexpr bool winners[] = {
+    constexpr bool owned[] = {
         true, false, false, true, false,
-    };
-    constexpr bool attempted[] = {
-        true, true, true, true, true,
     };
     std::vector<SharedSubmitClaimTraceRecord> compact(
         plan.total_tasks
@@ -259,9 +228,8 @@ void TestSharedCompactReconstruction() {
          task_id < plan.total_tasks; ++task_id) {
         const CompactTraceWindow window =
             WindowForTask(base_cycle, task_id);
-        compact[task_id] =
-            MakeCompactRecord(window, winners[task_id]);
-        if (attempted[task_id]) {
+        if (owned[task_id]) {
+            compact[task_id] = MakeCompactRecord(window, true);
             generic.push_back(
                 MakeRecord(
                     TracePhase::Atomic,
@@ -282,46 +250,50 @@ void TestSharedCompactReconstruction() {
     }
 
     std::vector<TraceRecord> logical;
+    std::vector<uint8_t> coverage(plan.total_tasks, 0);
+    constexpr uint32_t expected_submits = 2;
     Check(
         ExpandSharedTraceRecords(
             worker, generic.data(),
             static_cast<uint32_t>(generic.size()),
-            compact.data(), plan, &logical
+            compact.data(), plan, expected_submits,
+            coverage.data(), &logical
         ),
-        "four-endpoint records and generic ClaimMax rows reconstruct"
+        "sparse four-endpoint records and generic atomic rows reconstruct"
     );
     Check(
         logical.size() ==
-            generic.size() + 2U * plan.total_tasks,
-        "reconstruction preserves every generic row and adds Claim/Submit"
+            generic.size() + 2U * expected_submits,
+        "reconstruction preserves generic rows and adds owned Claim/Submit"
     );
     if (logical.size() !=
-        generic.size() + 2U * plan.total_tasks) {
+        generic.size() + 2U * expected_submits) {
         return;
     }
+    Check(
+        coverage[0] == 1 && coverage[3] == 1 &&
+            coverage[1] == 0 && coverage[2] == 0 &&
+            coverage[4] == 0,
+        "sparse expansion marks only this worker's owned tasks"
+    );
 
     size_t index = 0;
     for (uint32_t task_id = 0;
          task_id < plan.total_tasks; ++task_id) {
-        if (attempted[task_id]) {
-            Check(
-                logical[index].phase ==
-                        static_cast<uint16_t>(
-                            TracePhase::Atomic
-                        ) &&
-                    logical[index].task_id ==
-                        static_cast<int32_t>(task_id) &&
-                    logical[index].auxiliary ==
-                        static_cast<uint16_t>(
-                            AtomicSite::ClaimMax
-                        ) &&
-                    AtomicRecordSchemaValid(
-                        logical[index], true
-                    ),
-                "generic ClaimMax remains an exact return-ready Atomic row"
-            );
-            ++index;
+        if (!owned[task_id]) {
+            continue;
         }
+        Check(
+            logical[index].phase ==
+                    static_cast<uint16_t>(TracePhase::Atomic) &&
+                logical[index].task_id ==
+                    static_cast<int32_t>(task_id) &&
+                logical[index].auxiliary ==
+                    static_cast<uint16_t>(AtomicSite::ClaimMax) &&
+                AtomicRecordSchemaValid(logical[index], true),
+            "generic atomic row remains exact in sparse merge order"
+        );
+        ++index;
         const TraceRecord &claim = logical[index++];
         const TraceRecord &submit = logical[index++];
         const CompactTraceWindow window =
@@ -332,13 +304,9 @@ void TestSharedCompactReconstruction() {
                 claim.start_cycle == window.claim_begin &&
                 claim.end_cycle == window.claim_end &&
                 claim.flags ==
-                    ((winners[task_id]
-                          ? pa_scheduler::kClaimWon
-                          : 0U) |
-                     (attempted[task_id]
-                          ? pa_scheduler::kClaimAttempted
-                          : 0U)),
-            "Claim reconstructs absolute endpoints and role-derived attempted"
+                    (pa_scheduler::kClaimWon |
+                     pa_scheduler::kClaimAttempted),
+            "owned Claim reconstructs absolute winner endpoints"
         );
         Check(
             submit.phase ==
@@ -347,11 +315,8 @@ void TestSharedCompactReconstruction() {
                     ) &&
                 submit.start_cycle == window.submit_begin &&
                 submit.end_cycle == window.submit_end &&
-                submit.flags ==
-                    (winners[task_id]
-                         ? pa_scheduler::kClaimWon
-                         : 0U),
-            "Submit reconstructs absolute endpoints and winner"
+                submit.flags == pa_scheduler::kClaimWon,
+            "owned Submit reconstructs absolute winner endpoints"
         );
     }
 }
@@ -363,21 +328,24 @@ void TestSharedCompactStageOnlyReconstruction() {
     std::vector<SharedSubmitClaimTraceRecord> compact(
         plan.total_tasks
     );
-    for (uint32_t task_id = 0;
-         task_id < plan.total_tasks; ++task_id) {
-        compact[task_id] = MakeCompactRecord(
-            WindowForTask(base_cycle, task_id), false
-        );
-    }
+    compact[1] = MakeCompactRecord(
+        WindowForTask(base_cycle, 1), true
+    );
+    compact[4] = MakeCompactRecord(
+        WindowForTask(base_cycle, 4), true
+    );
     TraceRecord unused_generic{};
     std::vector<TraceRecord> logical;
+    std::vector<uint8_t> coverage(plan.total_tasks, 0);
     Check(
         ExpandSharedTraceRecords(
             worker, &unused_generic, 0,
-            compact.data(), plan, &logical
+            compact.data(), plan, 2,
+            coverage.data(), &logical
         ) &&
-            logical.size() == 2U * plan.total_tasks,
-        "stage-only records expand to Claim/Submit without Atomic"
+            logical.size() == 4 &&
+            coverage[1] == 1 && coverage[4] == 1,
+        "sparse stage-only records expand owned Claim/Submit without Atomic"
     );
 }
 
@@ -388,12 +356,9 @@ void TestSharedCompactGenericMergeOrder() {
     std::vector<SharedSubmitClaimTraceRecord> compact(
         plan.total_tasks
     );
-    for (uint32_t task_id = 0;
-         task_id < plan.total_tasks; ++task_id) {
-        compact[task_id] = MakeCompactRecord(
-            WindowForTask(base_cycle, task_id), false
-        );
-    }
+    compact[0] = MakeCompactRecord(
+        WindowForTask(base_cycle, 0), true
+    );
     const CompactTraceWindow task0 =
         WindowForTask(base_cycle, 0);
     std::vector<TraceRecord> generic{
@@ -412,21 +377,23 @@ void TestSharedCompactGenericMergeOrder() {
         ),
     };
     std::vector<TraceRecord> logical;
+    std::vector<uint8_t> coverage(plan.total_tasks, 0);
     Check(
         ExpandSharedTraceRecords(
             worker, generic.data(),
             static_cast<uint32_t>(generic.size()),
-            compact.data(), plan, &logical
+            compact.data(), plan, 1,
+            coverage.data(), &logical
         ) &&
             logical.size() ==
-                generic.size() + 2U * plan.total_tasks &&
+                generic.size() + 2U &&
             SameRecord(logical[0], generic[0]) &&
             logical[1].phase ==
                 static_cast<uint16_t>(TracePhase::Claim) &&
             SameRecord(logical[2], generic[1]) &&
             logical[3].phase ==
                 static_cast<uint16_t>(TracePhase::Submit),
-        "generic rows merge stably before their enclosing Claim/Submit endpoint"
+        "generic rows merge stably around one sparse owned Submit"
     );
 }
 
@@ -440,7 +407,7 @@ void TestRejectsBadSharedCompactRecords() {
     for (uint32_t task_id = 0;
          task_id < plan.total_tasks; ++task_id) {
         valid[task_id] = MakeCompactRecord(
-            WindowForTask(base_cycle, task_id), false
+            WindowForTask(base_cycle, task_id), true
         );
     }
     TraceRecord unused_generic{};
@@ -449,9 +416,11 @@ void TestRejectsBadSharedCompactRecords() {
         const std::vector<SharedSubmitClaimTraceRecord> &records
     ) {
         std::vector<TraceRecord> logical;
+        std::vector<uint8_t> coverage(plan.total_tasks, 0);
         return !ExpandSharedTraceRecords(
             candidate_worker, &unused_generic, 0,
-            records.data(), plan, &logical
+            records.data(), plan, plan.total_tasks,
+            coverage.data(), &logical
         );
     };
     auto rejected = [&rejected_for_worker, worker](
@@ -460,17 +429,9 @@ void TestRejectsBadSharedCompactRecords() {
         return rejected_for_worker(worker, records);
     };
 
-    // worker 0 是 AIC，S5b 下它对 AIC/AIV kernel 都是合法
-    // Build 候选。同时保留 worker 越界的反例，防止把
-    // “全部 96 核”错放宽成任意 worker id。
-    std::vector<SharedSubmitClaimTraceRecord> legal = valid;
-    legal[1].claim_end_and_winner |=
-        pa_scheduler::kSharedClaimWinnerBit;
-    legal[2].claim_end_and_winner |=
-        pa_scheduler::kSharedClaimWinnerBit;
     Check(
-        !rejected(legal),
-        "one AIC worker may win both AIC- and AIV-engine task Build"
+        !rejected(valid),
+        "one Scalar may own sparse Build tasks for both engine roles"
     );
 
     std::vector<SharedSubmitClaimTraceRecord> bad = valid;
@@ -482,12 +443,17 @@ void TestRejectsBadSharedCompactRecords() {
         bad[0].submit_end + 1U;
     Check(rejected(bad), "Claim outside Submit is rejected");
 
-    bad = valid;
-    bad[1].claim_end_and_winner |=
-        pa_scheduler::kSharedClaimWinnerBit;
     Check(
-        rejected_for_worker(pa_scheduler::kWorkers, bad),
-        "winner outside the 96-Scalar Claim population is rejected"
+        rejected_for_worker(pa_scheduler::kWorkers, valid),
+        "owner outside the 96-Scalar population is rejected"
+    );
+
+    bad = valid;
+    bad[1].claim_end_and_winner &=
+        ~pa_scheduler::kSharedClaimWinnerBit;
+    Check(
+        rejected(bad),
+        "central-ticket endpoint without winner ownership is rejected"
     );
 
     bad = valid;
@@ -506,12 +472,29 @@ void TestRejectsBadSharedCompactRecords() {
         ),
     };
     std::vector<TraceRecord> logical;
+    std::vector<uint8_t> coverage(plan.total_tasks, 0);
     Check(
         !ExpandSharedTraceRecords(
             worker, forbidden.data(), 1,
-            valid.data(), plan, &logical
+            valid.data(), plan, plan.total_tasks,
+            coverage.data(), &logical
         ),
         "generic stream cannot duplicate dedicated Claim rows"
+    );
+
+    coverage.assign(plan.total_tasks, 0);
+    Check(
+        ExpandSharedTraceRecords(
+            worker, &unused_generic, 0,
+            valid.data(), plan, plan.total_tasks,
+            coverage.data(), &logical
+        ) &&
+            !ExpandSharedTraceRecords(
+                worker, &unused_generic, 0,
+                valid.data(), plan, plan.total_tasks,
+                coverage.data(), &logical
+            ),
+        "global task coverage rejects a second owner for any task"
     );
 }
 
@@ -750,7 +733,7 @@ void TestAcceptsSparseWinnerAndLoserFlow() {
     );
 }
 
-void TestRejectsReplayPrefixDrift() {
+void TestSparseTaskOrderAndBoundaries() {
     {
         SharedSparseTraceValidator validator;
         Check(
@@ -763,10 +746,10 @@ void TestRejectsReplayPrefixDrift() {
     {
         SharedSparseTraceValidator validator;
         Check(
-            !validator.Observe(
+            validator.Observe(
                 MakeRecord(TracePhase::Claim, 1, -1, 12, 13)
             ),
-            "the first per-core task must be task 0"
+            "a sparse worker may begin from a nonzero owned task"
         );
     }
     {
@@ -784,13 +767,18 @@ void TestRejectsReplayPrefixDrift() {
         Check(
             trace.Begin(0, TaskKind::Alloc, false) &&
                 trace.FinishLoser(0, TaskKind::Alloc),
-            "task 0 loser establishes the sequence-gap test"
+            "task 0 establishes the sparse ordering test"
+        );
+        Check(
+            trace.Begin(2, TaskKind::Sf, false) &&
+                trace.FinishLoser(2, TaskKind::Sf),
+            "a worker may skip tasks owned by other Scalars"
         );
         Check(
             !validator.Observe(
-                MakeRecord(TracePhase::Claim, 2, -1, 20, 21)
+                MakeRecord(TracePhase::Claim, 1, -1, 30, 31)
             ),
-            "a skipped task_id is rejected after a loser"
+            "per-worker sparse task ids must remain strictly increasing"
         );
     }
     {
@@ -1390,7 +1378,9 @@ void TestPlanClosesAllLogicalTasks() {
         "authoritative plan contains one Alloc per empty batch"
     );
 
-    SharedSparseTraceValidator validator(&plan);
+    SharedSparseTraceValidator validator(
+        &plan, plan.total_tasks
+    );
     TaskTraceBuilder trace{validator};
     Check(
         trace.Begin(0, TaskKind::Alloc, true) &&
@@ -1399,12 +1389,12 @@ void TestPlanClosesAllLogicalTasks() {
     );
     Check(
         !validator.Closed(),
-        "plan-aware validator rejects a truncated per-core replay"
+        "plan-aware validator rejects a truncated sparse ownership set"
     );
     Check(
-        trace.Begin(1, TaskKind::Alloc, false) &&
-            trace.FinishLoser(1, TaskKind::Alloc),
-        "second planned Alloc loser closes through its Submit parent"
+        trace.Begin(1, TaskKind::Alloc, true) &&
+            trace.FinishWinner(1, TaskKind::Alloc),
+        "second sparse owned Alloc winner closes through its Submit parent"
     );
     Check(
         validator.Closed(),
@@ -1416,13 +1406,12 @@ void TestPlanClosesAllLogicalTasks() {
 
 int main() {
     TestTraceBinaryLayoutAndHeaderGate();
-    TestSharedClaimAttemptedBoundary();
     TestSharedCompactReconstruction();
     TestSharedCompactStageOnlyReconstruction();
     TestSharedCompactGenericMergeOrder();
     TestRejectsBadSharedCompactRecords();
     TestAcceptsSparseWinnerAndLoserFlow();
-    TestRejectsReplayPrefixDrift();
+    TestSparseTaskOrderAndBoundaries();
     TestRejectsMissingSubmit();
     TestRejectsEveryLoserOnlyForbiddenPhase();
     TestRejectsPrepareMapForWinnerAndOutsideSubmit();
