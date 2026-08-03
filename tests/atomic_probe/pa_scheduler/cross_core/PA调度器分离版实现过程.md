@@ -2528,3 +2528,47 @@ candidate mean   改善 0.022409 ms / 1.038%
 扩样后中位数和均值仍同向改善，没有出现 S6.34 的方向反转；候选最大值也低于
 基线最大值。该阶段既删除了所有反向 release Atomic 和 1024B 无用控制状态，
 又保留 device 内 root 的全局终态证明，因此作为有效优化保留。
+
+## 2026-08-04：S6.37 取消 insert-turn handoff CAS 返回依赖（无收益，已撤回）
+
+S6.36 泳道中，`SharedInsertTurnHandoff` 恰好出现 1280 次，聚合跨度约
+`520.208 us`。现有实现由每个 task 唯一的中央 Build ticket owner 执行
+`CAS(-1, task_id)`，并立即消费旧值以确认该 TaskCell 尚未发布。候选验证一个
+更弱但仍可闭合的协议：保留条件 CAS，防止异常旧值被覆盖，但当前 owner 不再
+等待和检查返回值；发布完成由 N+1 owner 对 `deps_prepared[N]` 的返回型 poll
+观察，最后一个 task 则由 host 终态校验。
+
+实现前先修改定向用例，要求当前 owner 只发射条件 CAS、异常值由下一有序 owner
+拒绝；旧实现按预期仅该项失败。候选随后同步修改了 CPU/CCEC 公共路径、Atomic
+site 的 `result_used/return_ready` 合同、泳道转换器和动态门槛。完整 CPU 协议
+回归、converter 63 项测试、CCEC full-swimlane/perf-clock 构建以及 A5 B256
+full-swimlane 均 PASS。候选泳道为：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260803_212408_507489/ccec/merged_swimlane.json`
+
+该次动态结果为：
+
+- 完整生命周期：`2.381547 ms`；
+- Submit：`1.118154 ms`；
+- 1280 条 handoff 记录全部为 `source_issue`，没有混入 `return_ready`；
+- 1280 task、1024 kernel、TensorMap、payload、fanin、completion 和全部终态
+  PASS。
+
+单次诊断结果不用于裁决。最终以提交 `2fda4052` 构建冻结 S6.36 基线，与候选
+按 B-C/C-B 交错各运行六个独立 trace-free B256 进程：
+
+```text
+S6.36 frozen baseline: min / median / max / mean
+                       2.099381 / 2.126659 / 2.151769 / 2.125906 ms
+S6.37 candidate      : min / median / max / mean
+                       2.119215 / 2.127761 / 2.149570 / 2.130045 ms
+candidate median 回退 0.001103 ms / 0.052%
+candidate mean   回退 0.004140 ms / 0.195%
+```
+
+中位数与均值均未改善，候选 CCEC finish 函数反而发生代码膨胀：AIC
+`35,252 -> 35,284 B`，AIV `36,532 -> 36,548 B`。这说明“不在 C++ 层消费
+CAS 返回值”没有让当前 CCEC 生成更轻的热路径，也不能把泳道里的
+`return_ready` 聚合跨度直接等价成可删除的端到端开销。候选还把同 task
+异常从当前 owner 延迟到下一 owner/host 才报告，在没有收益时不值得放宽错误
+闭合窗口。因此实现、测试和泳道 ABI 修改已全部撤回，只保留本节反例。
