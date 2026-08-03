@@ -6221,3 +6221,27 @@ CCEC finish 调用点从 3 改为 4，被现有结构门槛拒绝；复用第一
 只证明“可以在不扩 ABI、且保留 A5 非一致 cache 发布/获取合同的前提下压缩
 payload”，不宣称 `WinnerBuild` 或端到端已经改善。下一提交再按通用生命周期
 规则接线，并单独裁决实际 payload 行数和 A5 性能。
+
+### 15.41 S6.19 撤回正式 PA descriptor 引用候选
+
+正式接线候选只把生命周期稳定的 GM descriptor 改为地址引用：fresh Output
+和 `SharedOutputRef` 指向 task-indexed `SharedOutputCell`，local/builder 私有
+descriptor 保持内联。QK/SF/PV/UP 的 payload 从 `10/10/10/16` lines 降为
+`8/2/6/5` lines，每组由 46 降到 21 lines；CPU 全套、CCEC perf-clock 编译、
+A5 B1 和 B256 全部正确性检查均通过。
+
+性能却稳定反向。冻结 ELF 三对交错 A/B 的基线为
+`2104.853/2159.634/2272.761 us`，引用版为
+`2773.649/2433.551/2614.464 us`；中位 `2159.634 -> 2614.464 us`，回退
+`454.830 us / 21.060%`，三对无一改善。少发布 25 条 payload line 的同时，
+每组 13 个引用 descriptor 改由 executor 分散 invalidate/读取；B256 共涉及
+3328 个引用区域，实际代价显著大于 payload 压缩收益。更慢的执行推进还使
+`fanin_loads` 中位从 `15924` 增到 `17460`，但该放大项不是独立根因归因。
+
+候选 full-swimlane 构建当时触发了旧的 AIC=5 finish 重定位门槛，因此没有把
+该次局部结果纳入结论。后续精确父提交复核证明，基线和候选的 AIC/AIV 都是
+3 个重定位；这是既有门槛未随 S6.18 后的代码合并形态更新，不是候选引入的
+结构回退。撤回依据只有已经稳定复现的 `+21.060%` perf-clock 回退。生产
+adapter/host/PA 测试接线已完整撤回，通用引用协议门槛保留但默认 mask 继续
+为 0。后续不再整体后移 descriptor 获取；若继续利用引用能力，必须先证明
+批量 acquire 或更少 DCCI 的内存合同，并重新通过冻结 ELF A/B。

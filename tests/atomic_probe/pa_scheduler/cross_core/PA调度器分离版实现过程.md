@@ -1588,3 +1588,50 @@ perf-clock 构建均通过。
 选择引用：已经完整发布且在 kernel 完成前不可变的 GM descriptor 可引用；
 builder 栈、block-local 或会被复用的 descriptor 必须继续内联。接线后需要以
 CPU 故障门槛、A5 B1/B256、payload 行数和 perf-clock 交错 A/B 共同裁决。
+
+## 2026-08-03：S6.19 正式 PA descriptor 引用候选回退并撤回
+
+按 S6.18 的生命周期合同做了正式 PA 接线候选：fresh Output 和
+`SharedOutputRef` 只引用 task-indexed `SharedOutputCell`，外部稳定 GM
+descriptor 允许引用，builder 私有或 local descriptor 继续内联。host 不仅
+比较 descriptor 内容，还把 device 地址映射回 D2H `SchedulerState`，逐 tensor
+验证它精确指向预期 `(producer_task_id, output_slot)`，避免相同内容掩盖错误
+地址。
+
+隔离 adapter 测试得到如下真实布局：
+
+| task | 旧 payload | 引用候选 | reference mask |
+|---|---:|---:|---:|
+| QK | 592 B / 10 lines | 472 B / 8 lines | `0x8` |
+| SF | 604 B / 10 lines | 124 B / 2 lines | `0xf` |
+| PV | 596 B / 10 lines | 356 B / 6 lines | `0x9` |
+| UP | 988 B / 16 lines | 268 B / 5 lines | `0x3f` |
+| 每组合计 | 46 lines | 21 lines | 13 个引用 tensor |
+
+完整 CPU 回归通过；A5 B1 的 payload 精确地址、descriptor、fanin、K2 owner、
+执行结果和终态检查全部通过，Submit 为 `262.405 us`。B256 单次也全部通过，
+但 Submit 为 `2639.451 us`，已显示回退。随后冻结接线前/接线后两套 ELF，按
+`B-C / C-B / B-C` 交错三对：
+
+```text
+接线前：2104.853, 2159.634, 2272.761 us
+引用版：2773.649, 2433.551, 2614.464 us
+中位数：2159.634 -> 2614.464 us
+差值：+454.830 us（+21.060%）
+```
+
+三对均回退，不能用设备波动解释。相同样本中 `fanin_loads` 中位从 `15924`
+升到 `17460`；这反映更慢的执行推进会让轮询进一步放大，不单独解释成引用
+协议的直接成本。更直接的结构差异是：每组虽然少发布 25 条 payload cache
+line，却把 13 个稳定 descriptor 的获取推迟给 executor；B256 一共新增/迁移
+3328 个引用区域的 invalidate/读取，且执行侧地址更分散。
+
+候选 full-swimlane 构建当时被“旧 AIC caller 必须有 5 个 finish 重定位”的
+门槛拒绝，因此本节没有使用局部泳道数据。后续用精确父提交复核发现，基线与
+候选的 AIC/AIV caller 都同样为 3 个重定位；这属于 S6.18 后代码合并形态变化，
+不是 descriptor 引用候选造成的结构差异，不能当成第二条否决证据。正式 PA
+adapter、host 校验和 PA 形态测试的候选改动仍依据稳定的 `+21.060%` perf-clock
+回退全部撤回；S6.18 已提交的通用变长 payload 能力与隔离协议测试保留，但
+生产继续使用全内联 mask=0。后续 WinnerBuild 优化不能再用“把 descriptor
+读取整体后移到 executor”这一形态，应优先减少重复解析/发布操作，或先证明
+可以批量获取引用区域而不增加逐 descriptor acquire 成本。
