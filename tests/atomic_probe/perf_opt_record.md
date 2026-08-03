@@ -6075,3 +6075,31 @@ TensorDesc/CreateInfo/SharedOutputRef、tag、scalar 和统计计数逐字段一
 `batch_start` 权威来源，以及 K2 scanner 对每核 Close 前缀和 candidate 位图的
 依赖。下一阶段只在 CPU 协议层验证低原子 exactly-once task ticket、严格
 `deps_prepared` 插入链与全局发布前沿，证明后才进入 CCEC 热路径。
+
+### 15.34 S6.12 结构前置证明：低原子 Build ticket 与严格插入可解耦
+
+新增独立 CPU 协议测试，不改生产 Submit。96 个线程从 host 生成且执行期间
+只读的 flat plan 中，通过一个单调 `FetchAdd` 领取唯一 task id；随后复用
+S6.11 的随机构参入口。TensorMap 插入仍由逐 task `deps_prepared` 完成字串成
+严格顺序，但 owner 发布本 task 完成字后即可进行 Fanin/Build，不要求前一
+task 的 Build 已结束。
+
+测试连续十轮强制构造以下交错并全部通过：task 0 等 96 个 worker 均取得首张
+ticket 后才发布插入完成字；发布后又延迟自己的 Build，直至至少 16 个后继
+已 Build。最终插入日志仍精确为 `0..1279`，每 task 的 owner、构参和 Build
+计数均为 1，96 个 worker 全部参与，且停产只由最后一个退出 worker 发布。
+非法 task 身份、错 batch 边界和未来 producer 引用也均 fail closed。完整
+cross-core CPU `perf-clock` 回归通过。
+
+协议调用量对比如下：
+
+| 路径 | B256 返回型发放原子调用数 |
+|---|---:|
+| 当前 G8 两级 Claim | 133120 CAS |
+| 中央 ticket 候选 | 1280 有效 + 96 越界 = 1376 FetchAdd |
+
+调用数减少 `98.966%`，但这不是性能结论。CPU 无法代表 A5 的同地址 atomic
+竞争；中央 ticket 可能把原来的 per-task 分散地址变成单个持续热点。生产
+CCEC、K2 scanner/candidate 登记和 FinalDrain 均为 **NOT RUN/NOT CHANGED**。
+下一阶段必须先用 A5 独立微基准比较 G8 per-task CAS 与中央 FetchAdd，不能仅
+凭调用次数把候选接入热路径。

@@ -141,6 +141,20 @@ echo "[TEST] atomic PollBatch boundary self-test"
     echo "[TEST] shared random-access PA args self-test"
     "$BUILD_DIR/test_shared_random_access_args"
 
+    # 中央单调 ticket 是替换 96 份完整 replay 的候选，不先接生产热路。
+    # 独立 96-thread 门槛证明 exactly-once 发放、乱序构参/Build、严格
+    # deps_prepared 插入顺序和最终停产闭合；CPU 结果不冒充 A5 atomic 性能。
+    echo "[BUILD] shared dynamic Build dispatch protocol self-test"
+    "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/test/test_shared_build_dispatch.cpp" \
+        -o "$BUILD_DIR/test_shared_build_dispatch"
+
+    echo "[TEST] shared dynamic Build dispatch protocol self-test"
+    "$BUILD_DIR/test_shared_build_dispatch"
+
     for cap in 32 64 128 256 16384; do
         binary="$BUILD_DIR/test_shared_tensor_map_ring_cap${cap}"
         echo "[BUILD] isolated shared ordinary-region ring self-test CAP=$cap"

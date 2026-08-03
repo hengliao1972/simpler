@@ -1235,3 +1235,31 @@ winner 私有 TensorDesc 指针。基于这一合同，已增加随机访问构�
 因此该门槛不会被解释成已有性能收益，也不会直接删除当前 replay。下一阶段先
 在 CPU 协议用例闭合 task ticket、严格 TensorMap commit chain 和全局发布前沿，
 再决定是否接入 CCEC。
+
+### 2026-08-03：中央 ticket 候选先完成 CPU 协议证明
+
+新增的独立门槛把候选协议拆成四条明确边界：
+
+```text
+immutable host flat plan
+        │
+        ├─ global monotonic ticket ──> exactly-one Build owner/task
+        │
+        ├─ random-access args ───────> producer 只允许落在 [0, N)
+        │
+        ├─ deps_prepared[N-1] ──────> 严格串行 metadata commit
+        │                              发布 N 后立即释放插入 baton
+        │
+        └─ all workers retired ─────> production_closed
+```
+
+CPU B256 用 96 个线程连续跑十轮，证明 1280 个 task 恰好一次发放、插入严格
+保序、Build 可以在插入完成后乱序推进、最终停产只在全部 worker 退出后闭合。
+测试还强制 task 0 先交出插入 baton、后完成 Build，并要求至少 16 个后继先
+完成，避免只凭偶然线程时序得到“可并发”的假阳性。
+
+该候选把现有 B256 G8 Claim 的 133120 次物理 CAS，变为 1376 次 ticket
+`FetchAdd`。这只是静态调用量和 CPU 正确性证据；A5 对同一地址的返回型 atomic
+可能近似串行，尚不能判断其真实耗时。下一步先以独立 A5 微基准比较两种地址
+拓扑，再选择中央或分片发放。CCEC Submit、K2 candidate 可见性与 FinalDrain
+均未修改，因此此处没有生产性能结论。

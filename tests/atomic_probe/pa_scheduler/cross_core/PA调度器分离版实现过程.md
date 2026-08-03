@@ -1352,3 +1352,38 @@ SharedOutputRef；共 41 个 task 全部逐字段一致。门槛还在每次随�
   历史 batch，也不自行冒充全局 oracle；
 - 当前 K2 scanner 依赖每 worker 的连续 Close 前缀和 owner-local candidate
   位图；减少全量 replay 前，必须用全局发布前沿或等价合同替换这两项依赖。
+
+## 2026-08-03：S6.12 中央 Build ticket 的独立 CPU 协议门槛
+
+本阶段仍不改 CCEC 生产 Submit。新增独立 96-thread CPU 门槛，验证一种可与
+当前 96 份完整 replay 对照的候选协议：host 先产生不可变 flat plan，每个
+Scalar 通过一个单调 `FetchAdd` 取得唯一 task id，再使用 S6.11 已验证的
+随机构参入口准备该 task。
+
+门槛刻意把 TensorMap 串行边界和 Build 完成拆开：task N 只等待
+`deps_prepared[N-1]`，发布自己的 `deps_prepared[N]` 后立即交出插入 baton；
+Fanin/Build 不属于该串行区。测试让 task 0 在发布完成字后继续延迟，直到至少
+16 个后续 task 已完成 Build，稳定证明后继 Build 不会被前任 Build 串行化。
+插入日志仍必须严格等于 `0..1279`。
+
+十轮 B256 CPU 交错全部通过，逐轮同时满足：
+
+- 1280 个 task 的 ticket、随机访问构参、owner、Build 均恰好一次；
+- 96 个 worker 都取得过至少一个 task；
+- task 0 延迟期间至少 16 个后继完成 Build；
+- 每个 task 的插入完成字只由 `-1` 发布为自身 task id，顺序无跳跃；
+- 全部 96 个 worker 退出生产后，最后一个退出者才发布
+  `production_closed`；
+- 错 task id、错 `batch_start` 和 `producer >= consumer` 的输入均被拒绝；
+- flat plan 在并发执行前后指纹不变。
+
+在当前 B256 G1 形状下，候选路径的 ticket `FetchAdd` 调用数为
+`1280 + 96 = 1376`：每个有效 task 一次，另加每个 worker 一次越界取票后
+退出。现有 G8 两级 Claim 的物理 CAS 为 `122880 + 10240 = 133120`，因此
+这里只证明协议级原子调用数减少 `98.966%`。
+
+CPU 不模拟 A5 同地址 atomic 的线性退化，不能据此宣称延迟或 Submit 收益。
+在接入生产代码前必须先做 A5 微基准，对照当前 per-task G8 CAS 与中央
+`FetchAdd` 热点；如果中央地址的串行化代价抵消调用数收益，则改为分片 ticket
+或其他经过上板证据支持的发放结构。当前 K2 candidate 登记、执行发现和
+FinalDrain 尚未迁移，本阶段不宣称已经替换 96 份 replay。
