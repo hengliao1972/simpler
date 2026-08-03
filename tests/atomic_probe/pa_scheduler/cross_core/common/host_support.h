@@ -1181,7 +1181,7 @@ struct Metrics {
     // launch/synchronize 的外层参考，不与设备内分段时间混算。
     bool passed = true;
     double submit_span_us = 0;
-    double submit_to_final_drain_us = 0;
+    double startup_to_final_drain_us = 0;
     double startup_barrier_span_us = 0;
     double final_barrier_span_us = 0;
     double final_drain_span_us = 0;
@@ -5686,7 +5686,7 @@ inline Metrics Validate(
 #if PA_BUILD_PERF_CLOCK
     Expect(
         submit_timestamps_ok,
-        "first-Submit and FinalDrain-end markers are valid",
+        "startup and FinalDrain-end markers are valid",
         &metrics
     );
     Expect(
@@ -6478,7 +6478,7 @@ inline Metrics Validate(
 #if PA_BUILD_PERF_CLOCK
     if (first_submit != UINT64_MAX &&
         last_final_drain_end >= first_submit) {
-        metrics.submit_to_final_drain_us =
+        metrics.startup_to_final_drain_us =
             static_cast<double>(
                 last_final_drain_end - first_submit
             ) / 1000.0;
@@ -6486,7 +6486,7 @@ inline Metrics Validate(
     std::printf(
         "[PERF-E2E] run=%u global_start_tick=%llu "
         "global_end_tick=%llu global_span_ticks=%llu "
-        "scope=first-submit-begin-to-final-drain-end\n",
+        "scope=startup-begin-to-final-drain-end\n",
         run,
         static_cast<unsigned long long>(first_submit),
         static_cast<unsigned long long>(last_final_drain_end),
@@ -6530,10 +6530,10 @@ inline Metrics Validate(
 #endif
     std::printf(
 #if PA_BUILD_PERF_CLOCK
-        "[METRIC] run=%u submit_to_final_drain_us=%.3f "
+        "[METRIC] run=%u startup_to_final_drain_us=%.3f "
         "host_launch_us=%.3f "
         "claims=%llu fanin_loads=%llu cas_retries=%llu\n",
-        run, metrics.submit_to_final_drain_us, host_us,
+        run, metrics.startup_to_final_drain_us, host_us,
 #else
         "[METRIC] run=%u submit_span_us=%.3f host_launch_us=%.3f "
         "claims=%llu fanin_loads=%llu cas_retries=%llu\n",

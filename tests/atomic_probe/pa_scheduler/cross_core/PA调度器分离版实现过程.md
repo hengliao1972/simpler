@@ -2850,3 +2850,34 @@ candidate mean   改善 0.011142 ms / 0.777%
 不变量、完整正确性门槛和冻结无观察 A/B 三者同时成立。
 未来若引入任何 device 侧回收或 ring 复用，调用点必须切回通用实例，
 重新恢复 head 原子读取和 ABA 判定。
+
+## 2026-08-04：S6.43 将无观察性能口径前移到 startup
+
+启动屏障原子操作即将进入优化范围，但 S6.42 及之前的
+perf-clock 第一个时钟读取在 startup 屏障结束后，它无法裁决
+startup 候选的端到端收益。S6.43 因此只修正性能边界，不改
+调度协议：
+
+```text
+旧：最早 first Submit begin -> 最后 FinalDrain end
+新：最早 startup increment begin -> 最后 FinalDrain end
+```
+
+每核仍严格只读取两次专用性能时钟：startup increment 前一次、
+FinalDrain 完全排空后一次。为了不增加 `WorkerResult` 字段，
+perf-clock 构建复用 `submit_begin` 存放新起点；普通泳道与
+submit-PMU 构建仍保持原 Submit 语义。host 输出同步改名为
+`startup_to_final_drain_us`，避免用旧名称误导后续对比。
+
+CPU B256 证明每核两次时钟读取、新端点顺序、完整业务协议与
+终态全部 PASS；CCEC perf-clock 构建通过。A5 B256 新口径的
+6 个独立进程为：
+
+```text
+S6.43 startup-to-FinalDrain: min / median / max / mean
+                              1.434122 / 1.465285 / 1.485386 / 1.461014 ms
+```
+
+该数据是后续 startup 分组候选的新冻结基线。它比旧口径多包含
+启动屏障，因此不能与 S6.42 的 `1.423 ms` 直接相减后宣称性能
+回退，也不能再混用旧字段名做 A/B。

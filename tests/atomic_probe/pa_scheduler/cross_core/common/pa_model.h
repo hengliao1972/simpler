@@ -85,7 +85,7 @@
 // 三镜像统一的构建身份与 manifest 锁定，不能把 shared 目录指向 private 实现。
 
 // 三类证据链在编译期严格互斥：swimlane 保存普通阶段与 atomic 记录，
-// submit-pmu 只保留 PMU 窗口；无泳道性能构建只增加首个 Submit 与
+// submit-pmu 只保留 PMU 窗口；无泳道性能构建只增加 startup 与
 // FinalDrain 结束两个时间边界。未显式传宏的既有后端继续使用原有
 // 通用实现。
 #ifndef PA_BUILD_SWIMLANE
@@ -1900,7 +1900,9 @@ static_assert(offsetof(WorkerState, swimlane_last_cycle) == 842664, "WorkerState
 static_assert(offsetof(WorkerState, payloads) == 842688, "WorkerState task-payload offset mismatch");
 
 struct alignas(64) WorkerResult {
-    // 时间边界：Submit 口径不含启动屏障和最终 drain，finish_cycle 则覆盖完整 worker 生命周期。
+    // 普通诊断构建中，submit_begin/submit_end 仍表示 Submit 区间。
+    // perf-clock 不保留 Submit-only 边界，复用 submit_begin 保存
+    // startup increment 前的端到端起点，finish_cycle 保存 FinalDrain 终点。
     uint64_t submit_begin;
     uint64_t submit_end;
     uint64_t finish_cycle;

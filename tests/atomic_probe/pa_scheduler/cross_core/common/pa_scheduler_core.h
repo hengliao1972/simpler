@@ -6597,8 +6597,11 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     // 96 个参与者全部完成本地状态初始化后再进入 task 0，主要用于压低启动偏斜对
     // winner 分布和 Submit 时序的干扰；atomicMax 的唯一 winner 正确性本身不依赖该屏障。
 #if PA_BUILD_PERF_CLOCK
-    // perf-clock 不采集生命周期诊断。启动 watchdog 仍在下一行建立自己的
-    // 正确性超时起点，不能为了追求字面上的“两次 SYS_CNT”删除防挂死机制。
+    // perf-clock 的第一次权威读数从 startup increment 前开始，
+    // 与 FinalDrain 后的第二次读数组成完整端到端边界。复用
+    // submit_begin 字段避免增加 WorkerResult ABI；该构建不输出
+    // Submit-only 边界。启动 watchdog 仍用独立时钟建立超时起点。
+    stats.result.submit_begin = Ops::PerfClockNow();
     stats.result.startup_barrier_begin = 0;
 #else
     stats.result.startup_barrier_begin = Ops::Now();
@@ -6676,7 +6679,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         // 领取前先推进自己映射上的 K2 候选；取得 ticket 后可乱序构参，
         // 但 Finish 内仍由 deps_prepared[N-1] 串行提交 TensorMap 元数据。
 #if PA_BUILD_PERF_CLOCK
-        stats.result.submit_begin = Ops::PerfClockNow();
+        // 起点已在 startup increment 之前读取；这里不得覆盖。
 #elif PA_BUILD_SUBMIT_PMU
         stats.result.submit_begin = Ops::Now();
 #else

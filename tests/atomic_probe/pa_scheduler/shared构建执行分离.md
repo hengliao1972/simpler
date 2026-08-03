@@ -10,10 +10,10 @@
 | 正式实现 | S0–S6.42 已形成中央 ticket + 严格 TensorMap 插入 + K2 异核 Execute；执行扫描得到的完整 control 快照直接参与 Claim CAS；execution drain 采用 16 组单向 arrival，并在同一次 FetchAdd 中汇合 owner-local 完成数，固定 root 不再逐 task 原子扫描；正式单轮 TensorMap 实例明确禁止回收，lookup 不再读取恒为 0 的 bucket head；descriptor 引用、unique-ticket 单 CAS、发布 Exchange 非等待和 winner fatal 重复读取候选均已撤销 |
 | CPU 正确性用例 | S1–S4 K2、S5a 对侧角色 Build 与 S5b 全 96 Scalar Build 门槛已完成 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
-| A5 PA 功能/性能 | 旧 `2.323 ms` 是 Submit-only 数字，已退出性能裁决；当前唯一口径为首个 Submit 起点到 FinalDrain 结束。S6.38 相对 S6.36 的 6+6 冻结交错 A/B 中，中位由 `2.127 ms` 降至 `1.416 ms`，改善 `33.454%`；S6.42 再以 12+12 交错 A/B 确认中位 `1.430 -> 1.423 ms`、均值改善 `0.777%`；功能与终态全部 PASS |
+| A5 PA 功能/性能 | S6.43 起，唯一裁决口径为最早 startup 起点到最后 FinalDrain 结束；旧 Submit-only 与 first-Submit-to-FinalDrain 数据只保留为历史证据，不与新口径直接相减。S6.43 平面基线 6 次中位为 `1.465 ms`；功能与终态全部 PASS |
 | S4 动态 Execute election | K2 首版已通过 CPU B1/B256 和 A5 B1/B256；B256 中两候选都有实际胜出，非法 owner 为 0 |
 | S5 Build 拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 五类 task 全 96/G8 已通过 CPU/CCEC/A5 B1/B256，物理 Claim CAS 精确闭合 |
-| 当前调度缺口 | 双 token Claim-first 已解决旧的 FinalDrain backlog；S6.29 复用 Claim 快照，S6.32–S6.36 收敛 drain，S6.38 删除 root 的 2560 次逐 task 终态读取，S6.42 再删除 1280 次无回收 lookup head 原子读取。当前 trace-free 中位约 `1.423 ms`，下一步继续从真实业务依赖和同地址竞争两侧审视剩余 Atomic，不能再用单次诊断 core-time 代替冻结 A/B |
+| 当前调度缺口 | 双 token Claim-first 已解决旧的 FinalDrain backlog；S6.29 复用 Claim 快照，S6.32–S6.36 收敛 drain，S6.38 删除 root 的 2560 次逐 task 终态读取，S6.42 再删除 1280 次无回收 lookup head 原子读取。当前 startup-to-FinalDrain 的 trace-free 中位约 `1.465 ms`，下一步优先验证 startup 分组 Atomic，不能再用单次诊断 core-time 代替冻结 A/B |
 | 明确非目标 | 不引入 `try_wait`、engine continuation 或“kernel 运行期间同一 Scalar 继续调度” |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。

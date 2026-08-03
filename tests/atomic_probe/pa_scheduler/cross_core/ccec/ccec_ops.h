@@ -244,7 +244,7 @@ struct CcecOps {
     __aicore__ static inline uint64_t Now() { return static_cast<uint64_t>(get_sys_cnt()); }
 
 #if PA_BUILD_PERF_CLOCK
-    // 专用接口只允许出现在首个 Submit 和 FinalDrain 结束边界。
+    // 专用接口只允许出现在 startup 和 FinalDrain 结束边界。
     // 普通 Now 仍服务 watchdog；区分命名让源码审计不会把正确性超时读
     // 误算成新增的性能观察点。
     __aicore__ static inline uint64_t PerfClockNow() {
