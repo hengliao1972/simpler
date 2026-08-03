@@ -2051,3 +2051,33 @@ S6.26 median -> S6.27 median = -0.303410 ms / -10.748%
 该结果同时满足正确性与性能门槛，因此 S6.27 作为有效阶段保留。它只改变
 terminal 的最终观察频率，不改变实际错误发布、本地错误立即退出、TensorMap
 插入顺序、Build/Claim/completion 发布或 FinalDrain 全局收口条件。
+
+## 2026-08-04：S6.28 删除 WinnerBody fatal guard（无收益，已撤回）
+
+S6.27 泳道中 `shared_winner_fatal_guard_load` 共 1280 次，聚合约
+`1.366 ms`。它位于 Build ticket 已经取得之后，不参与 TensorMap 插入、
+payload 发布或 completion 的顺序判定；从 S6.26 的“合法工作单元完成、下一
+调度边界停产”合同看，可以复用 ticket 领取前的 global-fatal 观察。
+
+候选据此只删除 `FinishSharedWinnerSubmitBody()` 中这一条返回型读取，并增加
+源码门槛防止它被重新放回 cross-core winner。完整 CPU、CCEC 和 A5 B256
+full-swimlane 全部 PASS；泳道中该 site 确实由 `1280 -> 0`。候选单次完整
+生命周期为 `2.693160 ms`，与 S6.27 的 `2.685995 ms` 基本持平。
+
+首轮十个独立 trace-free 进程的候选中位为 `2.485622 ms`，低于先前 S6.27
+十轮的 `2.519461 ms`，但候选均值为 `2.524567 ms`，反而略高于基线均值
+`2.519032 ms`。由于结果受长尾影响，随后用提交 `7efdcc3e` 重新构建冻结基线，
+按 B-C/C-B 交错运行各六次：
+
+```text
+S6.27 baseline : min / median / max / mean
+                 2.422939 / 2.474204 / 2.495793 / 2.468115 ms
+S6.28 candidate: min / median / max / mean
+                 2.433765 / 2.479890 / 2.654143 / 2.502150 ms
+candidate median 回退 0.005687 ms / 0.230%
+```
+
+因此，泳道聚合 core-time 不能直接换算为端到端收益：这些 guard 并未形成同样
+大小的全局关键路径，删除后还会改变代码布局和并发相位。S6.28 的代码与新增
+门槛已完整撤回，只保留本节取证记录；后续不再以“调用次数减少”代替冻结 A/B
+性能裁决。
