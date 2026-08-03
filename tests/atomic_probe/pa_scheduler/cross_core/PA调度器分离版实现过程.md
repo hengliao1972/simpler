@@ -2927,3 +2927,30 @@ candidate mean   回退 0.042889 ms / 2.953%
 来说，分组降低同地址并发的收益，不足以覆盖 leader 转发、多级
 release 和新增原子发布的代价。候选的 device/host 状态、协议、构建门槛和
 测试适配已全部撤回；正式路径继续使用 flat `started_count`。
+
+## 2026-08-04：S6.45 用新端到端口径复审 root 直接扇出（仍不保留）
+
+S6.39 在旧口径下曾有中位数 `0.300%`、均值 `0.592%` 的表面改善，
+是全部回撤项中最接近可保留的候选之一。本轮在当前 S6.43/S6.42
+底座上完整重建该协议：两级 final barrier 的 root 收齐 16 个 leaf
+arrival 后，直接串行发布 16 条 leaf release，不再经过一条
+`root_release` 和 16 个 leaf leader 的转发。三级 barrier 保持不变。
+
+CPU 完整协议回归 PASS。CCEC 候选使 perf-clock AIC 的等价 split-finish
+尾部从 2 份合并为 1 份，relocation 仍只指向 AIC 本角色唯一 finish。
+最终按 B-C/C-B 顺序，对冻结当前基线与候选各运行 12 个独立 A5
+B256 进程，口径统一为 startup 起点到 FinalDrain 结束：
+
+```text
+current baseline : min / median / max / mean
+                   1.405892 / 1.450168 / 1.491611 / 1.453868 ms
+direct fan-out   : min / median / max / mean
+                   1.420853 / 1.456032 / 1.477817 / 1.455157 ms
+candidate median 回退 0.005864 ms / 0.404%
+candidate mean   回退 0.001289 ms / 0.089%
+```
+
+候选只有 5/12 对更快，中位数与均值均回退。这说明新口径并没有
+改变 S6.39 的判断：root 减少了一层返回型读，却串行承担了 16 次
+release 发布，两者互相抵消。候选代码、host 终态适配和精确机器码
+门槛已再次全部撤回，继续保留现有 leader 并行转发。
