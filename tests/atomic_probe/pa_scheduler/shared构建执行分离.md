@@ -7,13 +7,13 @@
 | 目标 | 让 task 的构建 owner 与 kernel 执行 owner 可以是不同物理核 |
 | 当前代码 | 96 Scalar 通过中央 ticket 恰好一次 Build；Build owner 发布 task-indexed shared payload，K2 排除 Build owner 后的 1 或 2 个 eligible executor 竞争执行 |
 | 本文性质 | 持续更新的架构与内存模型设计记录 |
-| 正式实现 | S0–S6.21 已形成中央 ticket + 严格 TensorMap 插入 + K2 异核 Execute；descriptor 引用和 unique-ticket 单 CAS 两个回退候选均已撤销 |
+| 正式实现 | S0–S6.26 已形成中央 ticket + 严格 TensorMap 插入 + K2 异核 Execute，并把成功路径的 terminal 观察集中到调度边界；descriptor 引用和 unique-ticket 单 CAS 两个回退候选均已撤销 |
 | CPU 正确性用例 | S1–S4 K2、S5a 对侧角色 Build 与 S5b 全 96 Scalar Build 门槛已完成 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
-| A5 PA 功能/性能 | 旧 `2.323 ms` 是 Submit-only 数字，已退出性能裁决；同底座过渡性端到端对照为单 token `9.345 ms`、双 token `5.881 ms`。唯一端到端口径的 B256 首轮复核为 `5.969 ms`，但该轮未加设备锁，不作为稳定基线 |
+| A5 PA 功能/性能 | 旧 `2.323 ms` 是 Submit-only 数字，已退出性能裁决；当前唯一口径为首个 Submit 起点到 FinalDrain 结束。S6.26 的十个独立 B256 进程为 `2.689–2.945 ms`、中位 `2.823 ms`，功能与终态 10/10 PASS |
 | S4 动态 Execute election | K2 首版已通过 CPU B1/B256 和 A5 B1/B256；B256 中两候选都有实际胜出，非法 owner 为 0 |
 | S5 Build 拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 五类 task 全 96/G8 已通过 CPU/CCEC/A5 B1/B256，物理 Claim CAS 精确闭合 |
-| 当前调度缺口 | 每核只在领取 Build ticket 前机会式推进一次 Execute，大量已 Build kernel 滞留 FinalDrain；下一步先补 ready/backlog/扫描成本基础数据，再决定发现结构 |
+| 当前调度缺口 | 双 token Claim-first 已解决旧的 FinalDrain backlog；当前主要缺口转为成功路径仍有不承担顺序语义的返回型 Atomic，S6.27 正在验证 FinalDrain terminal 低频观察 |
 | 明确非目标 | 不引入 `try_wait`、engine continuation 或“kernel 运行期间同一 Scalar 继续调度” |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
@@ -1520,3 +1520,45 @@ Submit 起点和 FinalDrain 终点两个时钟，不新增结果字段、泳道�
 因此双 token 的保留依据不是原 Submit 指标变快，而是 224 个 kernel 从尾部
 前移、完整周期下降约 3.464 ms。若只看 Submit，会把预期中的工作前移误判为
 回退；若只看 FinalDrain，则又会遗漏前移所付出的控制和 kernel 时间。
+
+### 2026-08-04：收敛有序链与 terminal 观察合同
+
+重新按共享副作用逐项核对后，当前 cross-core 设计只要求 **Register 的
+TensorMap metadata 插入**沿 task id 严格保序：task N 完成 metadata/history
+写入并发布 `deps_prepared[N]` 后，N+1 才能取得插入资格。该有序链不延伸到
+Fanin、portable payload Build 或 kernel Execute。
+
+因此 WinnerBuild 只保留单 task 内部的发布顺序：
+
+```text
+EMPTY -> BUILDING CAS
+-> pack portable payload
+-> payload DCCI clean-out + DSB
+-> BUILDING -> BUILT CAS
+```
+
+已经取得 Build ticket、已经 Claim 的 execution token 和已经开始的 completion
+均视为合法工作单元。并发出现其他 task 的 terminal 错误时，这些工作单元允许
+完成自身发布，不能为了“更早停止”在其每个内部边界重复读取同一全局 fatal
+cache line。否则既不加强 TensorMap 顺序，也会把 96 核对同一地址的返回型
+Atomic 竞争带进正常热路径。
+
+错误控制分为两个职责，不再互相充当第二条停止线：
+
+- `exec_fatal` 只由实际发现 execution 协议错误的核首写精确原因，供 host
+  定位；成功路径不读取它；
+- scheduler global fatal 是唯一跨 worker 停产条件，由实际错误发布者同步
+  设置；其他 worker 在领取下一 Build ticket 前的调度边界观察它；
+- 本核直接发现 payload/control/DCCI/completion 错误时仍立即发布两类信息并
+  返回，不等待下一调度边界；
+- FinalDrain 必须最终观察 global fatal、把本核尚未复位的 token 收敛为
+  `FAULTED`，并继续参与退出屏障，不能把 host 超时当设备终止协议。
+
+S6.26 已按该合同通过 CPU、CCEC 和 A5 B256，并把完整周期十轮中位降至
+`2.823 ms`。S6.27 只进一步尝试把 FinalDrain 的 global-fatal 读取从“每次
+progress”改为“第 0 轮立即检查、之后按 owner-local 计数低频检查”；该候选
+在 CPU、CCEC 与 A5 全部门槛通过前仍是待验证实现，不属于已冻结设计结论。
+
+逐阶段代码、泳道与性能数字继续记录在
+[PA调度器分离版实现过程](cross_core/PA调度器分离版实现过程.md)，本文只保存
+采用后的架构合同和仍待验证的设计边界。

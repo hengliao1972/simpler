@@ -68,6 +68,11 @@ fi
 # 也避免把 host 回归二进制误当成 A5 产物。
 mkdir -p "$BUILD_DIR"
 
+echo "[CHECK] cross-core atomic/DCCI source coverage"
+PA_ATOMIC_DCCI_COVERAGE_ROOT="$ROOT_DIR" \
+    "${PYTHON:-python3}" \
+    "$ROOT_DIR/../same_core/test_atomic_dcci_source_coverage.py"
+
 echo "[BUILD] CPU scheduler executable"
 echo "[BUILD] shared insert-turn groups=$SHARED_INSERT_TURN_GROUPS"
 # -pthread 同时提供编译期线程宏和链接期 pthread 支持；严格告警用于防止

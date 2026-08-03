@@ -1788,3 +1788,215 @@ EfDrain/OrchestrationTail/FinalDrain 分别容纳 `342/96/586` 个 kernel。与�
 
 本机 shell 没有 `task-submit` 和 `npu-smi`，两轮均为 device 0 未加锁单样本。
 B1 明显长尾和 B256 数字只证明新边界可用，不作为性能收益或稳定基线。
+
+## 2026-08-03：S6.23 补齐跨核执行包 Atomic/DCCI 泳道
+
+本阶段只完善观察边界，不改变 cross-core 调度、内存发布或执行语义。此前
+`WinnerBuild` 与 `EfDrain` 已能显示业务父区间和 kernel，但跨核 execution
+control 内部的大量 Atomic/DCCI 仍直接调用 `Ops`，导致长区间看起来像普通
+Scalar 代码。现在通过同一个 `SharedExecTraceObserver` 把生产路径已有操作各
+记录一次，覆盖以下协议边界：
+
+- execution fatal 的读取与首错发布；
+- execution cell state 读取、Build reserve、BUILT 发布和 Execute claim；
+- completion vend/flag 发布、DONE 发布；
+- FinalDrain 的 arrive、release 发布和 release poll；
+- Build 源 descriptor invalidate、payload flush/invalidate、token 引用
+  descriptor invalidate。
+
+返回值未参与协议判断的 completion vend Exchange 保持
+`source_issue`；其余实际消费返回值的调用保持 `return_ready`。observer 在
+Atomic 结束计时后才写 trace record，且没有额外发射 Atomic 或 DCCI。测试专用
+直连入口继续存在，但必须带精确豁免标记；源码审计同时要求 CCEC intrinsic
+只能集中在 `ccec_ops.h`，防止后来新增一条绕过 observer 的设备原语。
+
+`WinnerBuild` 中剩余最大的连续普通 Scalar 区间是
+`PreloadBuildDestination + PackExecPayload`。正常成功 Build 的 reserve CAS 结束
+到 payload-flush DCCI 开始恰好包围 payload 预取和打包。converter 据此离线
+生成 `winner_build.pack_execution_payload`，错误路径缺少任一边界时不猜测。
+该做法不依赖保留多余 fatal load，也不增加设备 raw 行；本次 B256 只在
+merged 中增加 1024 条派生事件。
+
+### A5 B256 实测闭合
+
+经用户确认可直接使用 device 0 后，使用用户 `.venv`、本机 CANN 9.1 和
+real-compute `6,28,4,1` 运行 B256。1280 个 task、1024 个 kernel、payload、
+依赖、执行终态与全部 trace 计数检查 PASS，`dropped_records=0`。产物为：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260803_153817_181367/ccec/merged_swimlane.json`
+
+旧泳道 `efdrain#558` 为 `409.005 us`，其中两个 QK kernel 合计
+`83.238 us`，此前约 `325.4 us` 没有细化。新泳道中形态最接近的
+`efdrain#518` 为 `412.563 us`，总长和 kernel 时间分别只差
+`+0.87%/+0.75%`，可作为同型解释：
+
+| 组成 | 时间 | 父区间占比 |
+|---|---:|---:|
+| Atomic | 304.410 us | 73.79% |
+| 两个 QK kernel | 83.864 us | 20.33% |
+| DCCI | 0.308 us | 0.07% |
+| 其余普通 Scalar | 23.981 us | 5.81% |
+
+其中仅 29 次 `shared_exec_fatal_load` 就占 `294.998 us`，单次范围
+`8.511--12.487 us`。这证明旧 `409 us` 不是单次 task execute 变成数百微秒，
+主要是 96 核反复读取同一 `exec_fatal` 地址时的返回型 Atomic 竞争。DCCI 在该
+区间只有三次 payload invalidate，不是主因。
+
+对全部含 kernel 的 281 个 EfDrain 做同一口径聚合，Atomic、kernel、DCCI 和
+其余普通 Scalar 分别占 `68.89%`、`22.49%`、`0.03%`、`8.59%`，已解释
+`91.41%`。1024 个 WinnerBuild 的总 core-time 为 `60,335.301 us`，其中
+Atomic 占 `83.73%`、DCCI 占 `2.58%`、其余普通 Scalar 占 `13.69%`。
+离线派生的 payload 打包区间共 1024 条，单次 `2.457--17.361 us`、均值
+`5.005 us`；最长 `winner_build#1279` 中该区间为 `13.457 us`。长父区间中已
+不再存在一整段数百微秒、却无法判断是 Atomic、DCCI、kernel 还是普通 Scalar
+的空白。
+
+### 验证结果
+
+- standalone CPU 全量协议、adapter、scan/drain 和 ordered-submit：PASS；
+- CCEC AIC/AIV、split runtime/finish、mixed ELF 与 manifest：PASS；
+- converter：`63 passed`；
+- same-core 与 cross-core Atomic/DCCI 源码审计：各 `5 passed`；
+- A5 B256：功能、执行与观察计数全部 PASS。
+
+本次 host Submit 为 `2.508790 ms`、完整生命周期为 `6.046633 ms`，但它是
+full-swimlane 单次诊断数据，只用于解释区间，不与 trace-free 性能基线相减。
+
+## 2026-08-04：S6.24 取消 WinnerBuild 的跨 task 伪保序
+
+### 顺序合同复核
+
+代码与业务依赖重新逐项核对后确认，shared TensorMap 只有 Register 元数据
+插入必须保持 task-id 顺序。task N 发布插入完成字后，N+1 可以进入自己的
+Register；N 的 Fanin、WinnerBuild 和 Execute 不再占用这条有序链。
+
+WinnerBuild 只需要保持单 task 内部的 payload 发布顺序：
+
+```text
+EMPTY -> BUILDING CAS
+-> Pack payload
+-> payload DCCI clean-out + DSB
+-> BUILDING -> BUILT CAS
+```
+
+因此，原本围绕同一个 Build 重复读取 scheduler fatal 和 execution fatal 的
+操作不是保序协议，只是为了让并发错误更早终止。新的性能优先合同允许已经
+开始的合法 Build 完成 BUILT；executor Claim 与 FinalDrain 仍能观察错误并
+最终退出。
+
+正常成功 WinnerBuild 的 terminal 读取由七次缩减为两次：入口一次 scheduler
+fatal、helper 入口一次 execution fatal；reserve/Built 两次 CAS 和 payload
+DCCI 不变。converter 的 `winner_build.pack_execution_payload` 改由
+`build_reserve CAS.end -> payload_flush DCCI.start` 离线推导，不再依赖为了
+观测而保留的 fatal load，也没有增加 raw 记录。
+
+### 正确性和 A5 结果
+
+CPU adapter 增加 flush 后并发 fatal 的定向交错，证明 Build 仍可发布 BUILT，
+后续路径能观察并退出；完整 CPU、CCEC AIC/AIV、split runtime/finish、mixed
+ELF 和源码覆盖门槛均通过。
+
+对应 B256 full-swimlane：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260803_161231_209267/ccec/merged_swimlane.json`
+
+相对 S6.23：
+
+| 指标 | S6.23 | S6.24 | 变化 |
+|---|---:|---:|---:|
+| WinnerBuild 聚合 core-time | 60,335.301 us | 17,115.987 us | -71.63% |
+| WinnerBuild Atomic | 50,518.268 us | 8,529.341 us | -83.12% |
+| full-swimlane 生命周期 | 6.046633 ms | 5.123835 ms | -15.26% |
+
+同一版本的 trace-free B256 共十个独立进程，完整边界均为首个 Submit 起点到
+FinalDrain 结束，10/10 execution、semantic、postprocess PASS：
+
+```text
+min / median / max = 4.856928 / 4.992764 / 5.199626 ms
+```
+
+## 2026-08-04：S6.25 将 exec_fatal 收敛为只写首错原因
+
+S6.24 的新泳道进一步显示，`shared_exec_fatal_load` 全局仍有 28,426 次，
+聚合 `280,067.777 us`，其中 FinalDrain 有 20,001 次。该 control 保存
+execution 协议的精确错误原因；生产错误路径在 helper 返回失败后还会同步
+设置权威 scheduler fatal，因此它没有必要再充当第二条停止线。
+
+本阶段保留所有首错发布和 host 原因校验，删除成功路径中以下原因读取：
+
+- Build helper 入口；
+- Claim 前、CAS 前和 Claim 后；
+- fanin ready 前后与 engine-complete 后；
+- vend、flag、DONE 发布前；
+- scanner、FinalDrain 和 Claim 失败后的重复原因复核。
+
+测试明确锁定新的职责边界：只写 `exec_fatal`、但没有像生产错误路径一样写
+scheduler fatal 时，原因记录本身不阻止一个合法 Claim。FinalDrain 的退出仍
+由 scheduler fatal 负责。完整 CPU 回归、CCEC 两种构建和 A5 B256 全部通过。
+
+对应 full-swimlane：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260803_162909_227171/ccec/merged_swimlane.json`
+
+动态结果：
+
+- `shared_exec_fatal_load`：`28,426 -> 0`；
+- full-swimlane Submit：`1.773787 ms`；
+- full-swimlane FinalDrain：`2.843175 ms`；
+- full-swimlane 完整生命周期：`4.329033 ms`；
+- 1280 task、1024 kernel、payload、依赖、终态和 raw 计数全部 PASS。
+
+trace-free 十个独立进程为：
+
+```text
+min / median / max = 3.985452 / 4.052038 / 4.219944 ms
+S6.24 median -> S6.25 median = -0.940726 ms / -18.842%
+```
+
+## 2026-08-04：S6.26 将 global fatal 集中到 replay 调度边界
+
+继续审视 scheduler fatal 后发现，成功路径仍有 7,190 次逐条返回型读取：
+WinnerBuild、Claim 前后、kernel 前后、completion 前以及外层 Build 循环都在
+重复读取同一 cache line。它们同样不是 TensorMap、Build 或 Execute 的顺序
+边界。
+
+本阶段采用“合法工作单元完整完成、下一调度边界停止”的合同：
+
+1. 每次准备领取新 Build ticket 前保留一次权威 scheduler fatal 检查；
+2. 已取得的合法 Build、Claim、kernel 和 completion 允许完成；
+3. 本核实际发现 payload/control/发布错误时仍立即写精确原因、设置 scheduler
+   fatal 并返回失败；
+4. 其他核在下一次 ticket 调度边界或 FinalDrain 最终观察并退出。
+
+CPU 定向测试不再维护“fatal 恰好插在 Claim/kernel/completion 中间时必须留下
+半完成 task”的旧合同，改为证明：blocked token 在 FinalDrain 会转 Faulted；
+已经开始的合法 task 即使与并发 fatal 相遇，也会完整发布 vend、flag 和 DONE，
+不会遗留 CLAIMED 半状态。完整 CPU 回归通过。
+
+源代码收敛改变了 CCEC 的等价尾合并形状。实际 object 证明 full-swimlane
+AIC/AIV finish relocation 为 `3/4`，perf-clock 为 `3/3`；全部仍只指向本角色
+唯一 finish/state，五类 task 和 1280 次唯一 Build 继续由动态门槛证明。构建
+脚本据此更新精确冻结值，没有放宽为范围判断。
+
+对应 full-swimlane：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260803_164608_247533/ccec/merged_swimlane.json`
+
+动态结果：
+
+- 逐条 `fatal_poll`：`7,190 -> 1,472`；
+- full-swimlane Submit：`1.142582 ms`；
+- full-swimlane FinalDrain：`1.971008 ms`；
+- full-swimlane 完整生命周期：`2.990625 ms`；
+- 所有业务与观察门槛 PASS。
+
+trace-free 十个独立进程为：
+
+```text
+min / median / max = 2.689313 / 2.822871 / 2.945247 ms
+S6.25 median -> S6.26 median = -1.229167 ms / -30.334%
+S6.24 median -> S6.26 median = -2.169893 ms / -43.462%
+```
+
+该阶段原始泳道仍位于上述 `outputs` 路径；`test_record` 只保留后续最新最优
+版本，不重复保存被取代的 `2.99 ms` 副本。

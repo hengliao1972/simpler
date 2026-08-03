@@ -1744,50 +1744,44 @@ void TestInvalidStatesFailClosed() {
     std::printf("[PASS] %s\n", kTest);
 }
 
-void TestExistingGlobalFatalDoesNotFabricateExecFatal() {
+void TestFinalDrainGlobalFatalDoesNotFabricateExecFatal() {
     constexpr const char *kTest =
-        "existing-global-fatal-preserves-first-failure";
+        "final-drain-global-fatal-preserves-first-failure";
     MappedSchedulerState mapping;
     SchedulerState *state = mapping.Get();
     Check(state != nullptr, kTest, "state mapping");
     if (state == nullptr) return;
 
-    constexpr uint32_t kTask = 1;
     constexpr uint32_t kBuilder = 1;
     WorkerState &worker = PrepareWorker(
         *state, kBuilder, CoreRole::Aic
     );
     LocalStats stats{};
     InitLocalStats(stats, kBuilder, CoreRole::Aic);
-    TaskArgs args{};
-    SubmitContext context{};
     __atomic_store_n(
         &state->fatal.value, int32_t{1}, __ATOMIC_RELEASE
     );
     ExecScanTestOps::ResetObservations();
-    ExecScanTestOps::WatchControl(
-        &state->exec_cells[kTask].control.state
-    );
-
-    const bool published =
-        PublishCrossCoreExecTask<ExecScanTestOps>(
-            state, worker, kTask, TaskKind::Qk,
-            FunctionId(TaskKind::Qk), args, context, stats
+    const uint32_t progressed =
+        ProgressCrossCoreExec<ExecScanTestOps>(
+            state, worker, /*replay_closed_exclusive=*/0,
+            /*production_closed=*/true,
+            DrainPlace::FinalDrain, stats
         );
-    const DecodedExecState cell = DecodeExecState(
-        state->exec_cells[kTask].control.state
+    const DecodedExecState cell0 = DecodeExecState(
+        state->exec_cells[0].control.state
     );
     Check(
-        !published && state->fatal.value == 1 &&
+        progressed == 0 && state->fatal.value == 1 &&
             state->exec_fatal.state == 0 &&
-            cell.valid && cell.phase == ExecPhase::Empty &&
-            ExecScanTestOps::watched_control_loads == 0 &&
-            ExecScanTestOps::watched_control_cas_calls == 0 &&
-            stats.result.slot_tensor_copies == 0 &&
-            stats.result.slot_scalar_copies == 0 &&
-            stats.result.fanin_edges == 0,
+            cell0.valid && cell0.phase == ExecPhase::Empty &&
+            state->exec_tokens[kBuilder][0].control.phase ==
+                ExecTokenPhase::Idle &&
+            state->exec_tokens[kBuilder][1].control.phase ==
+                ExecTokenPhase::Idle &&
+            ExecScanTestOps::execute_calls == 0,
         kTest,
-        "pre-existing scheduler fatal stops Build without fake exec fatal"
+        "FinalDrain observes scheduler fatal without fake exec fatal"
     );
     std::printf("[PASS] %s\n", kTest);
 }
@@ -1874,7 +1868,8 @@ void TestGlobalFatalFaultsActiveTokens() {
     }
 
     // COMPLETING 由完整的 Claim/Bind/ready/kernel/engine-complete helper
-    // 链构造；测试只把 global fatal 放在下一次 completion progress 前。
+    // 链构造。global fatal 与已开始的合法工作单元并发时，当前 task 完整
+    // 发布 completion，避免人为留下 CLAIMED 半状态；外层调度边界随后停止。
     {
         MappedSchedulerState mapping;
         SchedulerState *state = mapping.Get();
@@ -1923,40 +1918,66 @@ void TestGlobalFatalFaultsActiveTokens() {
             __atomic_store_n(
                 &state->fatal.value, int32_t{1}, __ATOMIC_RELEASE
             );
-            const uint32_t progressed =
-                ProgressCrossCoreExec<ExecScanTestOps>(
-                    state, worker, kTask + 1U, false,
-                    DrainPlace::EfDrain, stats
+            bool completed = false;
+            const bool progress_ok =
+                ProgressCrossCoreActiveToken<ExecScanTestOps>(
+                    state, worker, /*token_slot=*/0,
+                    DrainPlace::EfDrain, stats, completed
                 );
-            all_cases_ok &= progressed == 0 &&
-                token.control.phase == ExecTokenPhase::Faulted &&
+            const DecodedExecState completed_cell =
                 DecodeExecState(
                     state->exec_cells[kTask].control.state
-                ).phase == ExecPhase::Claimed &&
-                state->tasks[kTask].vend == 0 &&
-                state->tasks[kTask].flag == 0 &&
+                );
+            const bool completing_case_ok = progress_ok && completed &&
+                token.control.phase == ExecTokenPhase::Idle &&
+                completed_cell.phase == ExecPhase::Done &&
+                state->tasks[kTask].vend != 0 &&
+                state->tasks[kTask].flag == 1 &&
                 state->exec_fatal.state == 0 &&
                 ExecScanTestOps::execute_calls == 0 &&
                 stats.result.placement[
                     static_cast<uint32_t>(DrainPlace::EfDrain)
-                ] == 0;
+                ] == 1;
+            if (!completing_case_ok) {
+                std::fprintf(
+                    stderr,
+                    "[DETAIL] completing progress_ok=%u completed=%u "
+                    "token=%u cell=%u "
+                    "vend=%lld flag=%lld exec_fatal=%lld execute=%u "
+                    "placement=%llu\n",
+                    progress_ok ? 1U : 0U,
+                    completed ? 1U : 0U,
+                    static_cast<uint32_t>(token.control.phase),
+                    static_cast<uint32_t>(completed_cell.phase),
+                    static_cast<long long>(state->tasks[kTask].vend),
+                    static_cast<long long>(state->tasks[kTask].flag),
+                    static_cast<long long>(state->exec_fatal.state),
+                    ExecScanTestOps::execute_calls,
+                    static_cast<unsigned long long>(
+                        stats.result.placement[
+                            static_cast<uint32_t>(DrainPlace::EfDrain)
+                        ]
+                    )
+                );
+            }
+            all_cases_ok &= completing_case_ok;
         }
     }
 
     Check(
         all_cases_ok, kTest,
-        "WAITING_FANIN/COMPLETING converge to Faulted without completion"
+        "FinalDrain faults blocked token; valid completing token closes atomically"
     );
     std::printf("[PASS] %s\n", kTest);
 }
 
-void TestGlobalFatalStopsIrreversibleBoundaries() {
+void TestConcurrentGlobalFatalCompletesCurrentValidUnit() {
     constexpr const char *kTest =
-        "global-fatal-stops-irreversible-boundaries";
+        "concurrent-global-fatal-completes-current-valid-unit";
     bool all_cases_ok = true;
 
-    // scanner 已取得 BUILT 快照后立刻注入 global fatal。下一步必须在
-    // Claim CAS 前停住；保留 BUILT 和候选 bit 是可重复观察的直接证据。
+    // scanner 已取得 BUILT 快照后立刻注入 global fatal。当前合法 task
+    // 允许继续 Claim、执行和完成；这证明正常路径不再逐边界轮询停止线。
     {
         MappedSchedulerState mapping;
         SchedulerState *state = mapping.Get();
@@ -1994,27 +2015,22 @@ void TestGlobalFatalStopsIrreversibleBoundaries() {
                     state, worker, kTask + 1U, false,
                     DrainPlace::EfDrain, stats
                 );
-            all_cases_ok &= progressed == 0 &&
+            all_cases_ok &= progressed == 1 &&
                 state->fatal.value == 1 &&
                 state->exec_fatal.state == 0 &&
                 DecodeExecState(
                     state->exec_cells[kTask].control.state
-                ).phase == ExecPhase::Built &&
+                ).phase == ExecPhase::Done &&
                 state->exec_tokens[executor][0].control.phase ==
                     ExecTokenPhase::Idle &&
-                CandidateBitForTask(
-                    stats, executor, CoreRole::Aic, kTask
-                ) &&
-                ExecScanTestOps::watched_control_loads == 1 &&
-                ExecScanTestOps::watched_control_cas_calls == 0 &&
-                ExecScanTestOps::execute_calls == 0 &&
-                state->tasks[kTask].vend == 0 &&
-                state->tasks[kTask].flag == 0;
+                ExecScanTestOps::execute_calls == 1 &&
+                state->tasks[kTask].vend != 0 &&
+                state->tasks[kTask].flag == 1;
         }
     }
 
-    // fanin 的最后一次 ready Load 返回后注入 fatal，精确覆盖
-    // WAITING_FANIN -> ENGINE_INFLIGHT 与真实 kernel 发射之间的窗口。
+    // fanin 的最后一次 ready Load 返回后注入 fatal，当前已经验证有效的
+    // task 同样完整执行并发布 DONE。
     {
         MappedSchedulerState mapping;
         SchedulerState *state = mapping.Get();
@@ -2054,26 +2070,25 @@ void TestGlobalFatalStopsIrreversibleBoundaries() {
                     state, worker, kTask + 1U, false,
                     DrainPlace::EfDrain, stats
                 );
-            all_cases_ok &= progressed == 0 &&
+            all_cases_ok &= progressed == 1 &&
                 state->fatal.value == 1 &&
                 state->exec_fatal.state == 0 &&
                 DecodeExecState(
                     state->exec_cells[kTask].control.state
-                ).phase == ExecPhase::Claimed &&
+                ).phase == ExecPhase::Done &&
                 state->exec_tokens[executor][0].control.phase ==
-                    ExecTokenPhase::Faulted &&
-                ExecScanTestOps::watched_control_cas_calls == 1 &&
-                ExecScanTestOps::execute_calls == 0 &&
-                state->tasks[kTask].vend == 0 &&
-                state->tasks[kTask].flag == 0 &&
+                    ExecTokenPhase::Idle &&
+                ExecScanTestOps::execute_calls == 1 &&
+                state->tasks[kTask].vend != 0 &&
+                state->tasks[kTask].flag == 1 &&
                 stats.result.placement[
                     static_cast<uint32_t>(DrainPlace::EfDrain)
-                ] == 0;
+                ] == 1;
         }
     }
 
     // ExecuteBoundKernel 是当前同步 engine 边界；在它返回时注入 fatal，
-    // 必须保留 CLAIMED 且不发布 vend、flag 或 DONE。
+    // completion 仍必须闭合，不能把已经执行的 task 留在 CLAIMED。
     {
         MappedSchedulerState mapping;
         SchedulerState *state = mapping.Get();
@@ -2110,28 +2125,27 @@ void TestGlobalFatalStopsIrreversibleBoundaries() {
                     state, worker, kTask + 1U, false,
                     DrainPlace::EfDrain, stats
                 );
-            all_cases_ok &= progressed == 0 &&
+            all_cases_ok &= progressed == 1 &&
                 state->fatal.value == 1 &&
                 state->exec_fatal.state == 0 &&
                 DecodeExecState(
                     state->exec_cells[kTask].control.state
-                ).phase == ExecPhase::Claimed &&
+                ).phase == ExecPhase::Done &&
                 state->exec_tokens[executor][0].control.phase ==
-                    ExecTokenPhase::Faulted &&
-                ExecScanTestOps::watched_control_cas_calls == 1 &&
+                    ExecTokenPhase::Idle &&
                 ExecScanTestOps::execute_calls == 1 &&
                 ExecScanTestOps::executed_tasks[0] == kTask &&
-                state->tasks[kTask].vend == 0 &&
-                state->tasks[kTask].flag == 0 &&
+                state->tasks[kTask].vend != 0 &&
+                state->tasks[kTask].flag == 1 &&
                 stats.result.placement[
                     static_cast<uint32_t>(DrainPlace::EfDrain)
-                ] == 0;
+                ] == 1;
         }
     }
 
     Check(
         all_cases_ok, kTest,
-        "fatal at Claim/kernel/completion gates leaves no later side effect"
+        "fatal races never leave a valid current task half-completed"
     );
     std::printf("[PASS] %s\n", kTest);
 }
@@ -2557,9 +2571,9 @@ int main() {
     TestOtherCandidateSkipsClaimedAndDone();
     TestDeterministicClaimLossIsNormal();
     TestInvalidStatesFailClosed();
-    TestExistingGlobalFatalDoesNotFabricateExecFatal();
+    TestFinalDrainGlobalFatalDoesNotFabricateExecFatal();
     TestGlobalFatalFaultsActiveTokens();
-    TestGlobalFatalStopsIrreversibleBoundaries();
+    TestConcurrentGlobalFatalCompletesCurrentValidUnit();
     TestBusyTokenResumesScanning();
     TestBusyCandidateUsesSecondToken();
     TestTwoBlockedTokensStopClaimButPermitBuild();

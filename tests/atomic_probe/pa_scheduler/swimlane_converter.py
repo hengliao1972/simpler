@@ -167,6 +167,18 @@ ATOMIC_SITE_NAMES = {
     40: "shared_claim_tournament_local",
     41: "shared_claim_tournament_root",
     42: "shared_build_dispatch_ticket",
+    43: "shared_exec_fatal_load",
+    44: "shared_exec_fatal_set",
+    45: "shared_exec_cell_state_load",
+    46: "shared_exec_build_reserve",
+    47: "shared_exec_built_publish",
+    48: "shared_exec_claim",
+    49: "shared_exec_completion_vend_publish",
+    50: "shared_exec_completion_flag_publish",
+    51: "shared_exec_done_publish",
+    52: "shared_exec_drain_arrive",
+    53: "shared_exec_drain_release_publish",
+    54: "shared_exec_drain_release_poll",
 }
 ATOMIC_OP_NAMES = {
     0: "load",
@@ -224,10 +236,22 @@ ATOMIC_SITE_OP_IDS = {
     40: 4,
     41: 4,
     42: 2,
+    43: 0,
+    44: 4,
+    45: 0,
+    46: 4,
+    47: 4,
+    48: 4,
+    49: 1,
+    50: 1,
+    51: 4,
+    52: 2,
+    53: 4,
+    54: 0,
 }
 # 这些发布型调用不消费 atomic 返回的旧值；其余 standalone site 的
 # 返回值都参与协议判断。v3 输入必须与源码语义完全一致。
-ATOMIC_RESULT_UNUSED_SITE_IDS = {0, 3, 6, 7, 13, 39}
+ATOMIC_RESULT_UNUSED_SITE_IDS = {0, 3, 6, 7, 13, 39, 49}
 # common/private 的六类等待 Load 与 shared Register insert-turn Load 可以
 # 合并；frontier 扫描和 Claim 即使调用很多次也必须继续保留逐调用记录。
 POLL_BATCH_SITE_OP_IDS = {
@@ -238,9 +262,10 @@ POLL_BATCH_SITE_OP_IDS = {
     12: 0,
     14: 0,
     19: 0,
+    54: 0,
 }
 SHARED_REGISTER_ATOMIC_SITE_IDS = {19, 20}
-SCHEMA_V5_SHARED_ATOMIC_SITE_IDS = set(range(19, 43))
+SCHEMA_V5_SHARED_ATOMIC_SITE_IDS = set(range(19, 55))
 SHARED_INSERT_TURN_POLL_SITE_ID = 19
 SHARED_INSERT_TURN_HANDOFF_SITE_ID = 20
 SHARED_CLAIM_TOURNAMENT_SITE_IDS = {40, 41}
@@ -266,6 +291,10 @@ DCCI_SITE_NAMES = {
     7: "shared_winner_build_descriptor_invalidate",
     8: "observer_trace_export",
     9: "startup_config_invalidate",
+    10: "shared_exec_build_source_descriptor_invalidate",
+    11: "shared_exec_payload_flush",
+    12: "shared_exec_payload_invalidate",
+    13: "shared_exec_token_descriptor_invalidate",
 }
 DCCI_OP_NAMES = {
     0: "invalidate",
@@ -282,8 +311,12 @@ DCCI_SITE_OP_IDS = {
     7: 0,
     8: 1,
     9: 0,
+    10: 0,
+    11: 1,
+    12: 0,
+    13: 0,
 }
-DCCI_SHARED_ONLY_SITE_IDS = set(range(8))
+DCCI_SHARED_ONLY_SITE_IDS = set(range(8)) | set(range(10, 14))
 DCCI_OBSERVER_SITE_ID = 8
 DCCI_STARTUP_SITE_ID = 9
 DCCI_OP_MASK = 0x3
@@ -1600,6 +1633,82 @@ def _restore_v5_shared_efdrain(
         rows.append(expected)
 
 
+def _iter_v5_cross_core_winner_build_pack_spans(
+    rows: list[tuple[Any, ...]],
+    trace_schema_version: int,
+    tensormap_mode: str | None,
+    submit_topology: str | None,
+) -> Iterator[tuple[int, int, int, int, int, str]]:
+    """用 reserve 与 payload flush 边界标出本地打包区间。
+
+    cross-core 正常 Build 的顺序固定为：reserve CAS、Preload/Pack、
+    payload DCCI、BUILT CAS。因此 reserve.end 到 payload-flush.start
+    正好包围纯 Scalar 的 Preload/Pack，不依赖正常路径保留多余的 fatal
+    读取。该区间完全在离线侧派生，不增加设备 raw 记录；错误路径缺少
+    任一边界时不猜测，也不伪造该 span。
+    """
+
+    if (
+        trace_schema_version != 5
+        or tensormap_mode != "shared"
+        or submit_topology != "central_ticket"
+    ):
+        return
+
+    parents: dict[tuple[int, int, int], tuple[Any, ...]] = {}
+    reserves: dict[
+        tuple[int, int, int], list[tuple[Any, ...]]
+    ] = {}
+    payload_flushes: dict[
+        tuple[int, int, int], list[tuple[Any, ...]]
+    ] = {}
+    for row in rows:
+        core_id, _block_id, lane, task_id, _function_id, phase, *_rest = row
+        key = (int(core_id), int(lane), int(task_id))
+        if phase == "WinnerBuild":
+            if key in parents:
+                raise ValueError(
+                    "schema-v5 cross-core payload-pack derivation found "
+                    f"duplicate WinnerBuild {key}"
+                )
+            parents[key] = row
+        elif phase == "Atomic" and int(row[9]) == 46:
+            reserves.setdefault(key, []).append(row)
+        elif phase == "Dcci" and int(row[9]) == 11:
+            payload_flushes.setdefault(key, []).append(row)
+
+    for key in sorted(parents):
+        parent = parents[key]
+        parent_start = int(parent[6])
+        parent_end = int(parent[7])
+        contained_reserves = [
+            row
+            for row in reserves.get(key, [])
+            if parent_start <= int(row[6])
+            and int(row[7]) <= parent_end
+        ]
+        contained_flushes = [
+            row
+            for row in payload_flushes.get(key, [])
+            if parent_start <= int(row[6])
+            and int(row[7]) <= parent_end
+        ]
+        if len(contained_reserves) != 1 or len(contained_flushes) != 1:
+            continue
+        pack_start = int(contained_reserves[0][7])
+        pack_end = int(contained_flushes[0][6])
+        if pack_end <= pack_start:
+            continue
+        yield (
+            int(parent[0]),
+            int(parent[1]),
+            int(parent[2]),
+            pack_start,
+            pack_end,
+            f"winner_build.pack_execution_payload#{int(parent[3])}",
+        )
+
+
 # 写一个 Chrome Trace Event，并统一处理数组元素间的逗号。
 def _emit_event(output: TextIO, event: dict[str, Any], first: bool) -> bool:
     # 逐事件写出，避免再在内存中构造一份体积可达数百 MiB 的 merged 列表。
@@ -1940,6 +2049,15 @@ def convert(  # noqa: PLR0912, PLR0915
             if row[5] == "Kernel" and int(row[4]) >= 0
         )
     if trace_schema_version == 5:
+        ordered_items.extend(
+            ("derived", *span)
+            for span in _iter_v5_cross_core_winner_build_pack_spans(
+                rows,
+                trace_schema_version,
+                capture_metadata.get("tensormap_mode"),
+                capture_metadata.get("submit_topology"),
+            )
+        )
         ordered_items.extend(
             ("derived", *span)
             for span in _iter_v5_shared_register_derived_spans(

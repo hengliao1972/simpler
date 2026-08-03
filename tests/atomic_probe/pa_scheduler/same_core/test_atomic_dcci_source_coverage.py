@@ -19,6 +19,7 @@ Ops 原语，测试就逐条报告文件、行号和源码。以后新增调用�
 from __future__ import annotations
 
 import ast
+import os
 import re
 import unittest
 from dataclasses import dataclass
@@ -26,7 +27,12 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Sequence
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(
+    os.environ.get(
+        "PA_ATOMIC_DCCI_COVERAGE_ROOT",
+        str(Path(__file__).resolve().parent),
+    )
+).resolve()
 COMMON = ROOT / "common"
 MODEL = COMMON / "pa_model.h"
 HOST_SUPPORT = COMMON / "host_support.h"
@@ -45,6 +51,9 @@ CONTROLLED_CALL = re.compile(
     r"\b(?:Ops|[A-Za-z_]\w*Ops)\s*::\s*("
     + "|".join(CONTROLLED_OPS)
     + r")\s*\("
+)
+CCEC_INTRINSIC_CALL = re.compile(
+    r"\b(atomicAdd|atomicMax|atomicCAS|dcci)\s*\("
 )
 EXEMPT_PREFIX = "PA_ATOMIC_DCCI_SOURCE_EXEMPT:"
 EXEMPT_MARKER = re.compile(
@@ -455,6 +464,38 @@ class AtomicDcciSourceCoverageTest(unittest.TestCase):
                 + "\n  ".join(malformed)
             )
 
+    def test_ccec_intrinsics_are_centralized_in_ops(self) -> None:
+        """设备 ISA 原语只能由 CcecOps 实现，业务源码不得绕过 Ops。"""
+
+        ccec_dir = ROOT / "ccec"
+        violations: List[str] = []
+        central_calls = 0
+        for path in sorted(
+            item
+            for item in ccec_dir.rglob("*")
+            if item.suffix in (".h", ".cpp") and "build" not in item.parts
+        ):
+            searchable = _strip_cpp_comments_and_literals(
+                path.read_text(encoding="utf-8")
+            )
+            for match in CCEC_INTRINSIC_CALL.finditer(searchable):
+                line = searchable.count("\n", 0, match.start()) + 1
+                if path.name == "ccec_ops.h":
+                    central_calls += 1
+                    continue
+                violations.append(
+                    f"{path.relative_to(ROOT)}:{line}: {match.group(1)}"
+                )
+        self.assertGreater(
+            central_calls, 0,
+            "ccec_ops.h 应集中实现真实 atomic/DCCI ISA 原语",
+        )
+        if violations:
+            self.fail(
+                "发现绕过 CcecOps 的设备 atomic/DCCI ISA 调用：\n  "
+                + "\n  ".join(violations)
+            )
+
     def test_atomic_site_mapping_counts_and_ops_match(self) -> None:
         sites, count = _parse_atomic_site_enum()
         expected_ids = list(range(count))
@@ -478,18 +519,15 @@ class AtomicDcciSourceCoverageTest(unittest.TestCase):
         python_ops = python_values["ATOMIC_SITE_OP_IDS"]
         self.assertIsInstance(python_names, dict)
         self.assertIsInstance(python_ops, dict)
-        self.assertEqual(
-            sorted(python_names),
-            expected_ids,
-            "Python ATOMIC_SITE_NAMES 键必须完整覆盖 [0, Count)",
+        self.assertEqual(sorted(python_names), list(range(len(python_names))))
+        self.assertEqual(sorted(python_ops), list(range(len(python_ops))))
+        self.assertTrue(
+            set(expected_ids).issubset(python_names),
+            "共享 converter 必须覆盖本实现的全部 AtomicSite",
         )
+        self.assertTrue(set(expected_ids).issubset(python_ops))
         self.assertEqual(
-            sorted(python_ops),
-            expected_ids,
-            "Python ATOMIC_SITE_OP_IDS 键必须完整覆盖 [0, Count)",
-        )
-        self.assertEqual(
-            python_ops,
+            {site: python_ops[site] for site in expected_ids},
             _parse_cpp_atomic_site_ops(sites),
             "Python site->op 映射必须与 C++ AtomicSiteExpectedOp 一致",
         )
@@ -514,10 +552,12 @@ class AtomicDcciSourceCoverageTest(unittest.TestCase):
         python_ops = python_values["DCCI_SITE_OP_IDS"]
         self.assertIsInstance(python_names, dict)
         self.assertIsInstance(python_ops, dict)
-        self.assertEqual(sorted(python_names), expected_ids)
-        self.assertEqual(sorted(python_ops), expected_ids)
+        self.assertEqual(sorted(python_names), list(range(len(python_names))))
+        self.assertEqual(sorted(python_ops), list(range(len(python_ops))))
+        self.assertTrue(set(expected_ids).issubset(python_names))
+        self.assertTrue(set(expected_ids).issubset(python_ops))
         self.assertEqual(
-            python_ops,
+            {site: python_ops[site] for site in expected_ids},
             _parse_cpp_dcci_site_ops(sites),
             "Python DCCI site->op 映射必须与 C++ DcciSiteExpectedOp 一致",
         )

@@ -1938,6 +1938,138 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             atomic_names,
         )
 
+    def test_v5_cross_core_exec_atomic_and_dcci_sites_are_named(self) -> None:
+        # 复用一份结构闭合的 shared Submit，再把真实 cross-core 执行包
+        # 的 Build/EfDrain 原语压入 task 1 的时间窗；EfDrain 父区间仍按
+        # 正式格式由 Submit.start->Claim.start 离线恢复。这里只验证 raw ABI、
+        # 边界语义和可见名称，不用 CPU 时间模拟 A5 延迟。
+        capture = _v5_shared_register_atomic_capture()
+        capture_rows = capture["fdwic_events"]
+        assert isinstance(capture_rows, list)
+        capture_rows.extend(
+            [
+                [0, 0, 0, 1, -1, "Atomic", 152, 153, 0x50, 43],
+                [0, 0, 0, 1, -1, "Atomic", 153, 154, 0x50, 45],
+                [0, 0, 0, 1, -1, "Atomic", 154, 155, 0x54, 48],
+                [0, 0, 0, 1, -1, "Dcci", 155, 156, 0xA0C, 12],
+                [0, 0, 0, 1, -1, "Atomic", 156, 157, 0x01, 49],
+                [0, 0, 0, 1, -1, "Atomic", 157, 158, 0x51, 50],
+                [0, 0, 0, 1, -1, "Atomic", 158, 159, 0x54, 51],
+                [0, 0, 0, 1, -1, "Atomic", 193, 194, 0x54, 46],
+                [0, 0, 0, 1, -1, "Dcci", 193, 194, 0xA0D, 11],
+                [0, 0, 0, 1, -1, "Atomic", 194, 195, 0x54, 47],
+                [0, 0, 0, -1, -1, "Dcci", 390, 391, 0x31D, 8],
+            ]
+        )
+        _refresh_summary(capture)
+
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            convert(input_path, output_path)
+            merged = json.loads(output_path.read_text(encoding="utf-8"))
+
+        names = {
+            event["name"]
+            for event in merged["traceEvents"]
+            if event.get("ph") == "X"
+        }
+        self.assertIn(
+            "atomic.return_ready.shared_exec_fatal_load.load#1", names
+        )
+        self.assertIn(
+            "atomic.return_ready.shared_exec_cell_state_load.load#1",
+            names,
+        )
+        self.assertIn(
+            "atomic.return_ready.shared_exec_claim.compare_exchange#1",
+            names,
+        )
+        self.assertIn(
+            "atomic.source_issue.shared_exec_completion_vend_publish."
+            "exchange#1",
+            names,
+        )
+        self.assertIn(
+            "atomic.return_ready.shared_exec_completion_flag_publish."
+            "exchange#1",
+            names,
+        )
+        self.assertIn(
+            "atomic.return_ready.shared_exec_done_publish."
+            "compare_exchange#1",
+            names,
+        )
+        self.assertIn(
+            "atomic.return_ready.shared_exec_build_reserve."
+            "compare_exchange#1",
+            names,
+        )
+        self.assertIn(
+            "atomic.return_ready.shared_exec_built_publish."
+            "compare_exchange#1",
+            names,
+        )
+        self.assertIn(
+            "dcci.shared_exec_payload_invalidate.invalidate×1.lines10#1",
+            names,
+        )
+        self.assertIn(
+            "dcci.shared_exec_payload_flush.clean_out×1.lines10#1",
+            names,
+        )
+
+    def test_v5_cross_core_winner_build_pack_span_uses_existing_edges(
+        self,
+    ) -> None:
+        capture = _v5_shared_register_atomic_capture()
+        rows = capture["fdwic_events"]
+        metadata = capture["metadata"]
+        assert isinstance(rows, list)
+        assert isinstance(metadata, dict)
+        metadata["submit_topology"] = "central_ticket"
+
+        # 扩大最后一个 task 的父区间，放入正常成功 Build 的 reserve CAS
+        # 与 payload-flush DCCI。两者之间是唯一可从现有记录严格推出的
+        # Preload/Pack 边界；转换器不得为此增加 raw 行。
+        for row in rows:
+            if row[0] == 0 and row[3] == 4 and row[5] == "WinnerBuild":
+                row[6:8] = [343, 380]
+            elif row[0] == 0 and row[3] == 4 and row[5] == "Submit":
+                row[7] = 390
+            elif row[0] == 0 and row[5] == "OrchestrationReplay":
+                row[7] = 390
+            elif row[0] == 0 and row[5] == "FinalDrain":
+                row[6:8] = [390, 410]
+        rows.extend(
+            [
+                [0, 0, 0, 4, -1, "Atomic", 348, 349, 0x54, 46],
+                [0, 0, 0, 4, -1, "Dcci", 360, 361, 0x100D, 11],
+                [0, 0, 0, -1, -1, "Dcci", 400, 401, 0x31D, 8],
+            ]
+        )
+        raw_count = len(rows)
+        _refresh_summary(capture)
+
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            convert(input_path, output_path)
+            merged = json.loads(output_path.read_text(encoding="utf-8"))
+
+        pack_events = [
+            event
+            for event in merged["traceEvents"]
+            if event.get("name")
+            == "winner_build.pack_execution_payload#4"
+        ]
+        self.assertEqual(len(pack_events), 1)
+        self.assertEqual(pack_events[0]["ts"], 0.339)
+        self.assertEqual(pack_events[0]["dur"], 0.011)
+        self.assertEqual(len(rows), raw_count)
+
     def test_v4_shared_task_zero_forbids_insert_turn_poll_batch(self) -> None:
         capture = _v5_shared_register_atomic_capture()
         rows = capture["fdwic_events"]
@@ -2494,7 +2626,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             (0x42, 0, -1),  # 未消费返回值不能声明 return-ready
             (0x73, 4, -1),  # value_zero 只属于 Load
             ((1 << 8) | 0x50, 1, -1),  # retry payload 只属于 FetchMax
-            (0x50, 43, -1),  # 当前 AtomicSite::Count 以外的未定义站点
+            (0x50, 43, -1),  # cross-core shared 站点不能出现在 schema-v3
             (0x53, 4, 0),  # Atomic 不携带 function id
         )
         for flags, site, func_id in cases:

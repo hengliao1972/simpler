@@ -302,6 +302,124 @@ struct alignas(kExecCacheLineBytes) ExecutionToken {
     ExecutionDispatchBinding dispatch;
 };
 
+// portable execution 协议不依赖 standalone 的 TraceContext/AtomicSite，
+// 但正式接线必须能够在真实原语边界观察 atomic 与 DCCI。这里定义一份
+// 最窄的操作适配器：隔离测试沿用 DirectExecObserver，scheduler 则传入
+// 带泳道记录的 observer。这样观察逻辑不会反向污染协议数据结构，也不会
+// 让无泳道构建多执行一次共享原语。
+template <typename Ops>
+struct DirectExecObserver {
+    PA_DEVICE int64_t LoadFatal(
+        PA_GM volatile int64_t *address, uint32_t
+    ) const {
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: trace-free - portable 协议单测与无观察构建的中央 observer fallback
+        return Ops::Load(address);
+    }
+
+    PA_DEVICE int64_t PublishFatal(
+        PA_GM volatile int64_t *address, int64_t expected,
+        int64_t desired, uint32_t
+    ) const {
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: trace-free - portable 协议单测与无观察构建的中央 observer fallback
+        return Ops::CompareExchange(address, expected, desired);
+    }
+
+    PA_DEVICE int64_t LoadCellState(
+        PA_GM volatile int64_t *address, uint32_t
+    ) const {
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: trace-free - portable 协议单测与无观察构建的中央 observer fallback
+        return Ops::Load(address);
+    }
+
+    PA_DEVICE int64_t ReserveBuild(
+        PA_GM volatile int64_t *address, int64_t expected,
+        int64_t desired, uint32_t
+    ) const {
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: trace-free - portable 协议单测与无观察构建的中央 observer fallback
+        return Ops::CompareExchange(address, expected, desired);
+    }
+
+    PA_DEVICE int64_t PublishBuilt(
+        PA_GM volatile int64_t *address, int64_t expected,
+        int64_t desired, uint32_t
+    ) const {
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: trace-free - portable 协议单测与无观察构建的中央 observer fallback
+        return Ops::CompareExchange(address, expected, desired);
+    }
+
+    PA_DEVICE int64_t ClaimCell(
+        PA_GM volatile int64_t *address, int64_t expected,
+        int64_t desired, uint32_t
+    ) const {
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: trace-free - portable 协议单测与无观察构建的中央 observer fallback
+        return Ops::CompareExchange(address, expected, desired);
+    }
+
+    PA_DEVICE int64_t PublishDone(
+        PA_GM volatile int64_t *address, int64_t expected,
+        int64_t desired, uint32_t
+    ) const {
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: trace-free - portable 协议单测与无观察构建的中央 observer fallback
+        return Ops::CompareExchange(address, expected, desired);
+    }
+
+    template <typename Pointer>
+    PA_DEVICE void FlushBuildPayload(
+        Pointer address, uint64_t bytes, uint32_t
+    ) const {
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: trace-free - portable 协议单测与无观察构建的中央 observer fallback
+        Ops::FlushRegion(address, bytes);
+    }
+
+    template <typename Pointer>
+    PA_DEVICE void InvalidateClaimPayload(
+        Pointer address, uint64_t bytes, uint32_t
+    ) const {
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: trace-free - portable 协议单测与无观察构建的中央 observer fallback
+        Ops::InvalidateRegion(address, bytes);
+    }
+
+    template <typename Pointer>
+    PA_DEVICE void InvalidateTokenDescriptor(
+        Pointer address, uint64_t bytes, uint32_t
+    ) const {
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: trace-free - portable 协议单测与无观察构建的中央 observer fallback
+        Ops::InvalidateRegion(address, bytes);
+    }
+
+    template <typename Pointer>
+    PA_DEVICE void InvalidateBuildDescriptor(
+        Pointer address, uint64_t bytes, uint32_t
+    ) const {
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: trace-free - portable 协议单测与无观察构建的中央 observer fallback
+        Ops::InvalidateRegion(address, bytes);
+    }
+
+    PA_DEVICE int64_t LoadFaninFlag(
+        PA_GM volatile int64_t *address, uint32_t
+    ) const {
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: trace-free - portable 协议单测与无观察构建的中央 observer fallback
+        return Ops::Load(address);
+    }
+
+    template <typename T>
+    PA_DEVICE T PublishCompletionVend(
+        PA_GM volatile T *address, T value,
+        uint32_t
+    ) const {
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: trace-free - portable 协议单测与无观察构建的中央 observer fallback
+        return Ops::Exchange(address, value);
+    }
+
+    PA_DEVICE int64_t PublishCompletionFlag(
+        PA_GM volatile int64_t *address, int64_t value,
+        uint32_t
+    ) const {
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: trace-free - portable 协议单测与无观察构建的中央 observer fallback
+        return Ops::Exchange(address, value);
+    }
+};
+
 static_assert(
     sizeof(SharedExecControl) == kExecCacheLineBytes &&
         alignof(SharedExecControl) == kExecCacheLineBytes,
@@ -438,19 +556,28 @@ PA_DEVICE DecodedExecFatal DecodeExecFatal(int64_t raw_state) {
     return fatal;
 }
 
+template <typename Ops, typename Observer>
+PA_DEVICE bool ExecFatalPublished(
+    PA_GM SharedExecFatalControl &fatal, uint32_t task_id,
+    Observer &observer
+) {
+    // 任意非零值都必须 fail-closed；即使记录本身已损坏，也不能继续。
+    return observer.LoadFatal(&fatal.state, task_id) != 0;
+}
+
 template <typename Ops>
 PA_DEVICE bool ExecFatalPublished(
     PA_GM SharedExecFatalControl &fatal
 ) {
-    // 任意非零值都必须 fail-closed；即使记录本身已损坏，也不能继续。
-    return Ops::Load(&fatal.state) != 0;
+    DirectExecObserver<Ops> observer{};
+    return ExecFatalPublished<Ops>(fatal, 0, observer);
 }
 
-template <typename Ops>
+template <typename Ops, typename Observer>
 PA_DEVICE bool PublishExecFatal(
     PA_GM SharedExecFatalControl &fatal,
     ExecFatalReason reason, uint32_t task_id,
-    uint32_t reporter_owner
+    uint32_t reporter_owner, Observer &observer
 ) {
     if (!ExecFatalReasonValid(reason) ||
         !ExecOwnerValid(reporter_owner)) {
@@ -460,7 +587,21 @@ PA_DEVICE bool PublishExecFatal(
         EncodeExecFatal(reason, reporter_owner, task_id)
     );
     // first-failure-wins。fatal line 永不清零，也不做 ordinary store/DCCI。
-    return Ops::CompareExchange(&fatal.state, 0, desired) == 0;
+    return observer.PublishFatal(
+               &fatal.state, 0, desired, task_id
+           ) == 0;
+}
+
+template <typename Ops>
+PA_DEVICE bool PublishExecFatal(
+    PA_GM SharedExecFatalControl &fatal,
+    ExecFatalReason reason, uint32_t task_id,
+    uint32_t reporter_owner
+) {
+    DirectExecObserver<Ops> observer{};
+    return PublishExecFatal<Ops>(
+        fatal, reason, task_id, reporter_owner, observer
+    );
 }
 
 PA_DEVICE bool ExecEngineValid(ExecEngineClass engine_class) {
@@ -857,9 +998,9 @@ PA_DEVICE PA_GM const uint64_t *ExecutionTokenDispatchArgs(
     return &token.dispatch.args[0];
 }
 
-template <typename Ops>
+template <typename Ops, typename Observer>
 PA_DEVICE bool RebuildExecutionTokenDispatchArgs(
-    PA_GM ExecutionToken &token
+    PA_GM ExecutionToken &token, Observer &observer
 ) {
     const ExecPayloadHeader header =
         DecodeExecPayloadHeader(token.payload);
@@ -894,8 +1035,9 @@ PA_DEVICE bool RebuildExecutionTokenDispatchArgs(
                 reinterpret_cast<PA_GM const void *>(
                     static_cast<uintptr_t>(reference)
                 );
-            Ops::InvalidateRegion(
-                descriptor, kExecTensorDescBytes
+            observer.InvalidateTokenDescriptor(
+                descriptor, kExecTensorDescBytes,
+                token.control.task_id
             );
             token.dispatch.args[tensor] = reference;
         } else {
@@ -922,6 +1064,14 @@ PA_DEVICE bool RebuildExecutionTokenDispatchArgs(
     return true;
 }
 
+template <typename Ops>
+PA_DEVICE bool RebuildExecutionTokenDispatchArgs(
+    PA_GM ExecutionToken &token
+) {
+    DirectExecObserver<Ops> observer{};
+    return RebuildExecutionTokenDispatchArgs<Ops>(token, observer);
+}
+
 PA_DEVICE void ResetExecutionToken(
     PA_GM ExecutionToken &token
 ) {
@@ -935,22 +1085,24 @@ PA_DEVICE void ResetExecutionToken(
     token.control.phase = ExecTokenPhase::Idle;
 }
 
-template <typename Ops, typename Source>
+template <typename Ops, typename Source, typename Observer>
 PA_DEVICE ExecBuildResult BuildAndPublishExecPayload(
     PA_GM SharedExecCell &cell, uint32_t build_owner,
     const ExecPayloadSpec &spec, const Source &source,
-    PA_GM SharedExecFatalControl &fatal
+    PA_GM SharedExecFatalControl &fatal, Observer &observer
 ) {
-    if (ExecFatalPublished<Ops>(fatal)) {
-        return ExecBuildResult::FatalObserved;
-    }
+    // exec_fatal 只保存 execution 协议的精确首错，不再充当第二条全局
+    // 停止线。生产调用方在进入 Build 前检查 scheduler fatal；本 helper
+    // 发现错误后发布精确原因并把失败结果返回给调用方，由调用方同步置
+    // scheduler fatal。正常成功路径不需要再读取原因记录。
     ExecPayloadLayout checked_layout{};
     if (!ExecOwnerValid(build_owner) ||
         !ValidateExecPayloadSpec(spec, checked_layout)) {
         (void)PublishExecFatal<Ops>(
             fatal, ExecFatalReason::InvalidBuildInput,
             spec.task_id,
-            ExecOwnerValid(build_owner) ? build_owner : 0
+            ExecOwnerValid(build_owner) ? build_owner : 0,
+            observer
         );
         return ExecBuildResult::InvalidInput;
     }
@@ -967,13 +1119,11 @@ PA_DEVICE ExecBuildResult BuildAndPublishExecPayload(
             ExecEngineClass::None, 0, spec.task_id
         )
     );
-    if (Ops::CompareExchange(
-            &cell.control.state, empty_state, building_state
+    if (observer.ReserveBuild(
+            &cell.control.state, empty_state, building_state,
+            spec.task_id
         ) != empty_state) {
         return ExecBuildResult::CellUnavailable;
-    }
-    if (ExecFatalPublished<Ops>(fatal)) {
-        return ExecBuildResult::FatalObserved;
     }
     Ops::PreloadBuildDestination(
         &cell.payload,
@@ -990,24 +1140,22 @@ PA_DEVICE ExecBuildResult BuildAndPublishExecPayload(
             checked_layout.payload_lines) {
         (void)PublishExecFatal<Ops>(
             fatal, ExecFatalReason::BuildPackFailed,
-            spec.task_id, build_owner
+            spec.task_id, build_owner, observer
         );
         return ExecBuildResult::InvalidInput;
     }
-    if (ExecFatalPublished<Ops>(fatal)) {
-        return ExecBuildResult::FatalObserved;
-    }
-    Ops::FlushRegion(
+    observer.FlushBuildPayload(
         &cell.payload,
         static_cast<uint64_t>(packed_layout.payload_lines) *
-            kExecCacheLineBytes
+            kExecCacheLineBytes,
+        spec.task_id
     );
     // 默认实现只保留编译器边界；S2 探针会在这里注入受控延迟，
     // 证明 Flush 返回并不等价于 BUILT 已经发布。
     Ops::BeforeBuiltPublish(spec.task_id);
-    if (ExecFatalPublished<Ops>(fatal)) {
-        return ExecBuildResult::FatalObserved;
-    }
+    // 性能优先合同：Build 开始后不再轮询全局错误。并发 fatal 即使发生在
+    // reserve、Pack 或 flush 期间，也允许当前 task 完成 BUILT 发布；
+    // executor 在 Claim 和执行前检查 fatal，FinalDrain 负责最终退出。
     const int64_t built_state = static_cast<int64_t>(
         EncodeExecState(
             ExecPhase::Built, build_owner,
@@ -1016,16 +1164,29 @@ PA_DEVICE ExecBuildResult BuildAndPublishExecPayload(
             spec.task_id
         )
     );
-    if (Ops::CompareExchange(
-            &cell.control.state, building_state, built_state
+    if (observer.PublishBuilt(
+            &cell.control.state, building_state, built_state,
+            spec.task_id
         ) != building_state) {
         (void)PublishExecFatal<Ops>(
             fatal, ExecFatalReason::ControlPublishConflict,
-            spec.task_id, build_owner
+            spec.task_id, build_owner, observer
         );
         return ExecBuildResult::PublishConflict;
     }
     return ExecBuildResult::Published;
+}
+
+template <typename Ops, typename Source>
+PA_DEVICE ExecBuildResult BuildAndPublishExecPayload(
+    PA_GM SharedExecCell &cell, uint32_t build_owner,
+    const ExecPayloadSpec &spec, const Source &source,
+    PA_GM SharedExecFatalControl &fatal
+) {
+    DirectExecObserver<Ops> observer{};
+    return BuildAndPublishExecPayload<Ops>(
+        cell, build_owner, spec, source, fatal, observer
+    );
 }
 
 PA_DEVICE bool ExecEngineCompatible(
@@ -1034,34 +1195,34 @@ PA_DEVICE bool ExecEngineCompatible(
     return task_engine == executor_engine;
 }
 
-template <typename Ops>
+template <typename Ops, typename Observer>
 PA_DEVICE ExecClaimResult ClaimAndBindExecPayload(
     PA_GM SharedExecCell &cell, uint32_t task_id,
     uint32_t execute_owner, ExecEngineClass executor_engine,
     PA_GM ExecutionToken &token,
-    PA_GM SharedExecFatalControl &fatal
+    PA_GM SharedExecFatalControl &fatal, Observer &observer
 ) {
     if (token.control.phase != ExecTokenPhase::Idle) {
         return ExecClaimResult::TokenBusy;
-    }
-    if (ExecFatalPublished<Ops>(fatal)) {
-        return ExecClaimResult::FatalObserved;
     }
     if (!ExecOwnerValid(execute_owner) ||
         !ExecEngineValid(executor_engine)) {
         (void)PublishExecFatal<Ops>(
             fatal, ExecFatalReason::InvalidBuiltControl,
             task_id,
-            ExecOwnerValid(execute_owner) ? execute_owner : 0
+            ExecOwnerValid(execute_owner) ? execute_owner : 0,
+            observer
         );
         return ExecClaimResult::InvalidControl;
     }
-    const int64_t observed_raw = Ops::Load(&cell.control.state);
+    const int64_t observed_raw = observer.LoadCellState(
+        &cell.control.state, task_id
+    );
     const DecodedExecState observed = DecodeExecState(observed_raw);
     if (!observed.valid) {
         (void)PublishExecFatal<Ops>(
             fatal, ExecFatalReason::InvalidBuiltControl,
-            task_id, execute_owner
+            task_id, execute_owner, observer
         );
         return ExecClaimResult::InvalidControl;
     }
@@ -1071,7 +1232,7 @@ PA_DEVICE ExecClaimResult ClaimAndBindExecPayload(
     if (observed.task_id != task_id) {
         (void)PublishExecFatal<Ops>(
             fatal, ExecFatalReason::InvalidBuiltControl,
-            task_id, execute_owner
+            task_id, execute_owner, observer
         );
         return ExecClaimResult::InvalidControl;
     }
@@ -1079,9 +1240,6 @@ PA_DEVICE ExecClaimResult ClaimAndBindExecPayload(
             observed.engine_class, executor_engine
         )) {
         return ExecClaimResult::Incompatible;
-    }
-    if (ExecFatalPublished<Ops>(fatal)) {
-        return ExecClaimResult::FatalObserved;
     }
     const int64_t claimed_raw = static_cast<int64_t>(
         EncodeExecState(
@@ -1091,8 +1249,9 @@ PA_DEVICE ExecClaimResult ClaimAndBindExecPayload(
             observed.task_id
         )
     );
-    if (Ops::CompareExchange(
-            &cell.control.state, observed_raw, claimed_raw
+    if (observer.ClaimCell(
+            &cell.control.state, observed_raw, claimed_raw,
+            task_id
         ) != observed_raw) {
         return ExecClaimResult::Lost;
     }
@@ -1106,18 +1265,15 @@ PA_DEVICE ExecClaimResult ClaimAndBindExecPayload(
     token.control.fanin_ready_prefix = 0;
     token.control.phase = ExecTokenPhase::Binding;
 
-    if (ExecFatalPublished<Ops>(fatal)) {
-        token.control.phase = ExecTokenPhase::Faulted;
-        return ExecClaimResult::FatalObserved;
-    }
-
     const uint64_t published_bytes =
         static_cast<uint64_t>(observed.payload_lines) *
         kExecCacheLineBytes;
     // CAS 返回值已经在上面的分支中被消费。这个窄 hook 只用于比较
     // “直接 Invalidate”与“额外前置 DSB”，不得在其中读取 payload。
     Ops::BeforePayloadAcquire(task_id);
-    Ops::InvalidateRegion(&cell.payload, published_bytes);
+    observer.InvalidateClaimPayload(
+        &cell.payload, published_bytes, task_id
+    );
     Ops::PreloadPayloadSource(&cell.payload, published_bytes);
     Ops::PreloadTokenDestination(&token.payload, published_bytes);
     const uint32_t published_words =
@@ -1141,21 +1297,35 @@ PA_DEVICE ExecClaimResult ClaimAndBindExecPayload(
         token.control.phase = ExecTokenPhase::Faulted;
         (void)PublishExecFatal<Ops>(
             fatal, ExecFatalReason::ClaimedPayloadInvalid,
-            task_id, execute_owner
+            task_id, execute_owner, observer
         );
         return ExecClaimResult::InvalidPayload;
     }
     token.control.payload_bytes = layout.payload_bytes;
-    if (!RebuildExecutionTokenDispatchArgs<Ops>(token)) {
+    if (!RebuildExecutionTokenDispatchArgs<Ops>(token, observer)) {
         token.control.phase = ExecTokenPhase::Faulted;
         (void)PublishExecFatal<Ops>(
             fatal, ExecFatalReason::InvalidTokenPayload,
-            task_id, execute_owner
+            task_id, execute_owner, observer
         );
         return ExecClaimResult::InvalidPayload;
     }
     token.control.phase = ExecTokenPhase::WaitingFanin;
     return ExecClaimResult::Claimed;
+}
+
+template <typename Ops>
+PA_DEVICE ExecClaimResult ClaimAndBindExecPayload(
+    PA_GM SharedExecCell &cell, uint32_t task_id,
+    uint32_t execute_owner, ExecEngineClass executor_engine,
+    PA_GM ExecutionToken &token,
+    PA_GM SharedExecFatalControl &fatal
+) {
+    DirectExecObserver<Ops> observer{};
+    return ClaimAndBindExecPayload<Ops>(
+        cell, task_id, execute_owner, executor_engine,
+        token, fatal, observer
+    );
 }
 
 PA_DEVICE ExecPayloadHeader ExecutionTokenHeader(
@@ -1270,26 +1440,51 @@ PA_DEVICE bool ExecutionTokenFaninReady(
     return true;
 }
 
+template <typename Ops, typename ReadySource, typename Observer>
+PA_DEVICE bool TryMarkExecutionTokenEngineInflight(
+    PA_GM ExecutionToken &token,
+    const ReadySource &ready_source,
+    PA_GM SharedExecFatalControl &fatal, Observer &observer
+) {
+    // fanin 判断与状态推进保持在同一个 helper 中，调用方不能绕过
+    // ready 检查直接把 WAITING_FANIN 改成 ENGINE_INFLIGHT。
+    (void)fatal;
+    (void)observer;
+    if (!ExecutionTokenFaninReady(token, ready_source)) {
+        return false;
+    }
+    token.control.phase = ExecTokenPhase::EngineInflight;
+    return true;
+}
+
 template <typename Ops, typename ReadySource>
 PA_DEVICE bool TryMarkExecutionTokenEngineInflight(
     PA_GM ExecutionToken &token,
     const ReadySource &ready_source,
     PA_GM SharedExecFatalControl &fatal
 ) {
-    // fanin 判断与状态推进保持在同一个 helper 中，调用方不能绕过
-    // ready 检查直接把 WAITING_FANIN 改成 ENGINE_INFLIGHT。
-    if (ExecFatalPublished<Ops>(fatal)) {
-        token.control.phase = ExecTokenPhase::Faulted;
+    DirectExecObserver<Ops> observer{};
+    return TryMarkExecutionTokenEngineInflight<Ops>(
+        token, ready_source, fatal, observer
+    );
+}
+
+template <typename Ops, typename EngineCompletionSource,
+          typename Observer>
+PA_DEVICE bool TryMarkExecutionTokenCompleting(
+    PA_GM ExecutionToken &token,
+    const EngineCompletionSource &engine_completion,
+    PA_GM SharedExecFatalControl &fatal, Observer &observer
+) {
+    if (token.control.phase != ExecTokenPhase::EngineInflight) {
         return false;
     }
-    if (!ExecutionTokenFaninReady(token, ready_source)) {
-        return false;
-    }
-    if (ExecFatalPublished<Ops>(fatal)) {
-        token.control.phase = ExecTokenPhase::Faulted;
-        return false;
-    }
-    token.control.phase = ExecTokenPhase::EngineInflight;
+    // fatal 发生在 engine in-flight 时仍需先等真实 engine 完成，避免
+    // Scalar 提前退出而遗留尚在访问 GM 的 AIC/AIV 指令流。
+    if (!engine_completion.IsComplete(token)) return false;
+    (void)fatal;
+    (void)observer;
+    token.control.phase = ExecTokenPhase::Completing;
     return true;
 }
 
@@ -1299,25 +1494,17 @@ PA_DEVICE bool TryMarkExecutionTokenCompleting(
     const EngineCompletionSource &engine_completion,
     PA_GM SharedExecFatalControl &fatal
 ) {
-    if (token.control.phase != ExecTokenPhase::EngineInflight) {
-        return false;
-    }
-    // fatal 发生在 engine in-flight 时仍需先等真实 engine 完成，避免
-    // Scalar 提前退出而遗留尚在访问 GM 的 AIC/AIV 指令流。
-    if (!engine_completion.IsComplete(token)) return false;
-    if (ExecFatalPublished<Ops>(fatal)) {
-        token.control.phase = ExecTokenPhase::Faulted;
-        return false;
-    }
-    token.control.phase = ExecTokenPhase::Completing;
-    return true;
+    DirectExecObserver<Ops> observer{};
+    return TryMarkExecutionTokenCompleting<Ops>(
+        token, engine_completion, fatal, observer
+    );
 }
 
-template <typename Ops, typename CompletionSink>
+template <typename Ops, typename CompletionSink, typename Observer>
 PA_DEVICE ExecDoneResult PublishExecDoneAfterCompletion(
     PA_GM SharedExecCell &cell, PA_GM ExecutionToken &token,
     CompletionSink &completion,
-    PA_GM SharedExecFatalControl &fatal
+    PA_GM SharedExecFatalControl &fatal, Observer &observer
 ) {
     if (token.control.phase != ExecTokenPhase::Completing &&
         token.control.phase != ExecTokenPhase::VendPublished &&
@@ -1333,13 +1520,11 @@ PA_DEVICE ExecDoneResult PublishExecDoneAfterCompletion(
             fatal, ExecFatalReason::InvalidTokenPayload,
             token.control.task_id,
             ExecOwnerValid(token.control.execute_owner)
-                ? token.control.execute_owner : 0
+                ? token.control.execute_owner : 0,
+            observer
         );
         token.control.phase = ExecTokenPhase::Faulted;
         return ExecDoneResult::InvalidTokenPayload;
-    }
-    if (ExecFatalPublished<Ops>(fatal)) {
-        return ExecDoneResult::FatalObserved;
     }
     const ExecPayloadHeader header = ExecutionTokenHeader(token);
     if (header.task_id != token.control.task_id ||
@@ -1347,33 +1532,30 @@ PA_DEVICE ExecDoneResult PublishExecDoneAfterCompletion(
         token.control.phase = ExecTokenPhase::Faulted;
         (void)PublishExecFatal<Ops>(
             fatal, ExecFatalReason::InvalidTokenPayload,
-            token.control.task_id, token.control.execute_owner
+            token.control.task_id, token.control.execute_owner,
+            observer
         );
         return ExecDoneResult::InvalidTokenPayload;
     }
     if (token.control.phase == ExecTokenPhase::Completing) {
-        if (ExecFatalPublished<Ops>(fatal)) {
-            return ExecDoneResult::FatalObserved;
-        }
         if (!completion.PublishVend(
                 header.task_id, header.completion_vend
             )) {
             (void)PublishExecFatal<Ops>(
                 fatal, ExecFatalReason::CompletionPublishFailed,
-                header.task_id, token.control.execute_owner
+                header.task_id, token.control.execute_owner,
+                observer
             );
             return ExecDoneResult::VendPublishFailed;
         }
         token.control.phase = ExecTokenPhase::VendPublished;
     }
     if (token.control.phase == ExecTokenPhase::VendPublished) {
-        if (ExecFatalPublished<Ops>(fatal)) {
-            return ExecDoneResult::FatalObserved;
-        }
         if (!completion.PublishFlag(header.task_id)) {
             (void)PublishExecFatal<Ops>(
                 fatal, ExecFatalReason::CompletionPublishFailed,
-                header.task_id, token.control.execute_owner
+                header.task_id, token.control.execute_owner,
+                observer
             );
             return ExecDoneResult::FlagPublishFailed;
         }
@@ -1397,20 +1579,31 @@ PA_DEVICE ExecDoneResult PublishExecDoneAfterCompletion(
             token.control.task_id
         )
     );
-    if (ExecFatalPublished<Ops>(fatal)) {
-        return ExecDoneResult::FatalObserved;
-    }
-    if (Ops::CompareExchange(
-            &cell.control.state, claimed_raw, done_raw
+    if (observer.PublishDone(
+            &cell.control.state, claimed_raw, done_raw,
+            header.task_id
         ) != claimed_raw) {
         (void)PublishExecFatal<Ops>(
             fatal, ExecFatalReason::CompletionStateConflict,
-            header.task_id, token.control.execute_owner
+            header.task_id, token.control.execute_owner,
+            observer
         );
         return ExecDoneResult::StateConflict;
     }
     ResetExecutionToken(token);
     return ExecDoneResult::Done;
+}
+
+template <typename Ops, typename CompletionSink>
+PA_DEVICE ExecDoneResult PublishExecDoneAfterCompletion(
+    PA_GM SharedExecCell &cell, PA_GM ExecutionToken &token,
+    CompletionSink &completion,
+    PA_GM SharedExecFatalControl &fatal
+) {
+    DirectExecObserver<Ops> observer{};
+    return PublishExecDoneAfterCompletion<Ops>(
+        cell, token, completion, fatal, observer
+    );
 }
 
 }  // namespace pa_scheduler::cross_core

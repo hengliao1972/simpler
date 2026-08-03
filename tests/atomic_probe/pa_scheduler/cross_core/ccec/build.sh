@@ -89,6 +89,11 @@ else
     TRACE_WORKER_STRIDE_BYTES=1048576
 fi
 
+echo "[CHECK] cross-core atomic/DCCI source coverage"
+PA_ATOMIC_DCCI_COVERAGE_ROOT="$ROOT_DIR" \
+    "${PYTHON:-python3}" \
+    "$ROOT_DIR/../same_core/test_atomic_dcci_source_coverage.py"
+
 # 正式 standalone CCEC 产物先固定使用已验证的 128×128 布局；CAP 仍
 # 显式进入三镜像编译身份和 manifest，避免默认值漂移后静默混件。
 VARIANT_DEFINES+=("-DPTO_FDWIC_TENSORMAP_RING_CAP=$TENSORMAP_RING_CAP")
@@ -210,12 +215,18 @@ SPLIT_STATE_STORAGE_BYTES=1728
 # 均为 3 条。五种 kind 是否完整覆盖由 dispatch switch 和 CPU 动态协议
 # 测试证明；这里精确锁定当前每种产物的真实代码形状，防止 finish 被
 # 内联/删除，又不把 CCEC 对等尾部的有益合并误判成覆盖缺失。
-SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC=2
+# 调度边界集中读取 global fatal 后，perf-clock AIC 的等价尾部由两处
+# 变为三处；继续冻结实际调用形状，不把精确门槛放宽为范围判断。
+SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC=3
 SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIV=3
-# 两 token 让 full-swimlane AIC 的五类 Build dispatch 不再被编译器
-# 尾合并成三个调用点；仍逐一要求它们只指向本角色的唯一 finish 符号。
-SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC=5
-SPLIT_FINISH_CALL_SITES_SWIMLANE_AIV=3
+# 新增执行包 atomic/DCCI 诊断后，full-swimlane AIC 的五类 Build dispatch
+# 再次被编译器尾合并为三个调用点；任务覆盖由 dispatch/动态门槛证明，
+# 此处仍精确锁定当前形状，并要求它们只指向本角色的唯一 finish 符号。
+SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC=3
+# 调度边界集中读取 global fatal 后，AIV 的等价尾部由三处变为四处；
+# AIC 仍为三处。任务覆盖由 CPU 动态门槛证明，这里只冻结当前 CCEC
+# 机器码形状，并继续要求全部 relocation 指向本角色唯一 finish 符号。
+SPLIT_FINISH_CALL_SITES_SWIMLANE_AIV=4
 COMMON_FLAGS+=(
     -mllvm -cce-block-local-relocate=true
     -mllvm "-cce-block-local-reserve-size=$SPLIT_STATE_STORAGE_BYTES"

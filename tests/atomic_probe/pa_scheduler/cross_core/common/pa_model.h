@@ -795,7 +795,22 @@ enum class AtomicSite : uint32_t {
     // shared Build 中央发放器的单调 ticket。FetchAdd 返回旧值直接决定
     // 本核取得的 task id；超过 task_count 的返回值表示该 worker 完成退场。
     SharedBuildDispatchTicket = 42,
-    Count = 43,
+    // cross-core execution package 的共享协议原语。原先这些调用直接落到
+    // Ops，导致 WinnerBuild、EfDrain/FinalDrain 中存在无法解释的大段空白；
+    // 这里按“终止态、cell 生命周期、completion、drain”追加稳定站点。
+    SharedExecFatalLoad = 43,
+    SharedExecFatalSet = 44,
+    SharedExecCellStateLoad = 45,
+    SharedExecBuildReserve = 46,
+    SharedExecBuiltPublish = 47,
+    SharedExecClaim = 48,
+    SharedExecCompletionVendPublish = 49,
+    SharedExecCompletionFlagPublish = 50,
+    SharedExecDonePublish = 51,
+    SharedExecDrainArrive = 52,
+    SharedExecDrainReleasePublish = 53,
+    SharedExecDrainReleasePoll = 54,
+    Count = 55,
 };
 
 // Atomic 记录 flags 的低四位保存操作种类；bit4 表示返回值参与后续判断，
@@ -817,7 +832,7 @@ constexpr uint32_t kAtomicPollBatch = 1U << 7;
 constexpr uint32_t kAtomicRetriesShift = 8;
 constexpr uint32_t kAtomicPollCountShift = 8;
 constexpr uint32_t kAtomicPollCountMax = 0x00ffffffU;
-constexpr uint32_t kAtomicPollBatchSiteCount = 6;
+constexpr uint32_t kAtomicPollBatchSiteCount = 7;
 static_assert(kAtomicPollBatchSiteCount <= 32, "PollBatch enable mask supports at most 32 compact indices");
 
 // DCCI 与 Atomic 使用同一个 32B TraceRecord，但拥有完全独立的 raw ABI。
@@ -848,7 +863,12 @@ enum class DcciSite : uint32_t {
     // RunConfig DCCI 发生在 AttachTrace 之前；正常握手成功后用已保存的
     // begin/end 补记这一条。它同时存在于 private/shared 构建。
     StartupConfigInvalidate = 9,
-    Count = 10,
+    // cross-core Build/Claim 的 payload 与 descriptor cache 传递。
+    SharedExecBuildSourceDescriptorInvalidate = 10,
+    SharedExecPayloadFlush = 11,
+    SharedExecPayloadInvalidate = 12,
+    SharedExecTokenDescriptorInvalidate = 13,
+    Count = 14,
 };
 
 constexpr uint32_t kDcciOpMask = 0x03U;
@@ -875,6 +895,7 @@ PA_MODEL_INLINE constexpr AtomicOp AtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::SharedHeapCursorReserve:
         case AtomicSite::SharedHeapVendAdvance:
         case AtomicSite::SharedBuildDispatchTicket:
+        case AtomicSite::SharedExecDrainArrive:
             return AtomicOp::FetchAdd;
         case AtomicSite::FatalSet:
         case AtomicSite::CompletionVendExchange:
@@ -887,6 +908,12 @@ PA_MODEL_INLINE constexpr AtomicOp AtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::SharedMetadataLastWriterCommit:
         case AtomicSite::SharedClaimTournamentLocal:
         case AtomicSite::SharedClaimTournamentRoot:
+        case AtomicSite::SharedExecFatalSet:
+        case AtomicSite::SharedExecBuildReserve:
+        case AtomicSite::SharedExecBuiltPublish:
+        case AtomicSite::SharedExecClaim:
+        case AtomicSite::SharedExecDonePublish:
+        case AtomicSite::SharedExecDrainReleasePublish:
             return AtomicOp::CompareExchange;
         case AtomicSite::SharedOutputWriterReserve:
             return AtomicOp::FetchMax;
@@ -895,6 +922,8 @@ PA_MODEL_INLINE constexpr AtomicOp AtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::SharedMapAppendSeqPublishExchange:
         case AtomicSite::SharedMapAppendTailExchange:
         case AtomicSite::SharedOutputRollbackExchange:
+        case AtomicSite::SharedExecCompletionVendPublish:
+        case AtomicSite::SharedExecCompletionFlagPublish:
             return AtomicOp::Exchange;
         default:
             return AtomicOp::Load;
@@ -909,6 +938,7 @@ PA_MODEL_INLINE constexpr bool AtomicSiteResultUsed(AtomicSite site) {
         case AtomicSite::CompletionFlagExchange:
         case AtomicSite::ReplayDoneIncrement:
         case AtomicSite::SharedOutputRollbackExchange:
+        case AtomicSite::SharedExecCompletionVendPublish:
             return false;
         case AtomicSite::StartupPoll:
         case AtomicSite::FatalPoll:
@@ -947,6 +977,17 @@ PA_MODEL_INLINE constexpr bool AtomicSiteResultUsed(AtomicSite site) {
         case AtomicSite::SharedClaimTournamentLocal:
         case AtomicSite::SharedClaimTournamentRoot:
         case AtomicSite::SharedBuildDispatchTicket:
+        case AtomicSite::SharedExecFatalLoad:
+        case AtomicSite::SharedExecFatalSet:
+        case AtomicSite::SharedExecCellStateLoad:
+        case AtomicSite::SharedExecBuildReserve:
+        case AtomicSite::SharedExecBuiltPublish:
+        case AtomicSite::SharedExecClaim:
+        case AtomicSite::SharedExecCompletionFlagPublish:
+        case AtomicSite::SharedExecDonePublish:
+        case AtomicSite::SharedExecDrainArrive:
+        case AtomicSite::SharedExecDrainReleasePublish:
+        case AtomicSite::SharedExecDrainReleasePoll:
             return true;
         case AtomicSite::Count:
             return false;
@@ -968,6 +1009,8 @@ PA_MODEL_INLINE constexpr int32_t AtomicPollBatchIndex(AtomicSite site) {
             return 4;
         case AtomicSite::ReplayDonePoll:
             return 5;
+        case AtomicSite::SharedExecDrainReleasePoll:
+            return 6;
         default:
             return -1;
     }
@@ -987,6 +1030,8 @@ PA_MODEL_INLINE constexpr AtomicSite AtomicPollBatchSite(uint32_t index) {
             return AtomicSite::HeapVendLoad;
         case 5:
             return AtomicSite::ReplayDonePoll;
+        case 6:
+            return AtomicSite::SharedExecDrainReleasePoll;
         default:
             return AtomicSite::Count;
     }
@@ -1018,6 +1063,7 @@ PA_MODEL_INLINE constexpr DcciOp DcciSiteExpectedOp(DcciSite site) {
         case DcciSite::SharedOutputDescriptorFlush:
         case DcciSite::SharedRegionAppendFlush:
         case DcciSite::ObserverTraceExport:
+        case DcciSite::SharedExecPayloadFlush:
             return DcciOp::CleanOut;
         default:
             return DcciOp::Invalidate;
@@ -1026,7 +1072,11 @@ PA_MODEL_INLINE constexpr DcciOp DcciSiteExpectedOp(DcciSite site) {
 
 PA_MODEL_INLINE constexpr bool DcciSiteIsSharedOnly(DcciSite site) {
     return static_cast<uint32_t>(site) <
-           static_cast<uint32_t>(DcciSite::ObserverTraceExport);
+               static_cast<uint32_t>(DcciSite::ObserverTraceExport) ||
+           static_cast<uint32_t>(site) >=
+               static_cast<uint32_t>(
+                   DcciSite::SharedExecBuildSourceDescriptorInvalidate
+               );
 }
 
 static_assert(

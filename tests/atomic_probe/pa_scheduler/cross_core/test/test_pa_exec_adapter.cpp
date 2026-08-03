@@ -291,10 +291,24 @@ bool SelectTestExecuteOwner(
 struct AdapterTestOps {
     static inline uint32_t flush_calls = 0;
     static inline uint32_t invalidate_calls = 0;
+    static inline volatile int64_t *fatal_before_built = nullptr;
+    static inline int64_t fatal_before_built_value = 0;
 
     static void ResetCounters() {
         flush_calls = 0;
         invalidate_calls = 0;
+        fatal_before_built = nullptr;
+        fatal_before_built_value = 0;
+    }
+
+    static void ArmFatalBeforeBuilt(
+        SharedExecFatalControl &fatal, ExecFatalReason reason,
+        uint32_t reporter_owner, uint32_t task_id
+    ) {
+        fatal_before_built = &fatal.state;
+        fatal_before_built_value = static_cast<int64_t>(
+            EncodeExecFatal(reason, reporter_owner, task_id)
+        );
     }
 
     static int64_t Load(volatile int64_t *address) {
@@ -339,7 +353,17 @@ struct AdapterTestOps {
 
     static void PreloadTokenDestination(void *, uint64_t) {}
 
-    static void BeforeBuiltPublish(uint32_t) {}
+    static void BeforeBuiltPublish(uint32_t) {
+        if (fatal_before_built != nullptr) {
+            // 模拟另一个 Scalar 在 payload flush 之后发布首错。性能优先
+            // Build 允许继续发布 BUILT；后续 Claim 必须看到 fatal 并拒绝
+            // 获取执行所有权。
+            __atomic_store_n(
+                fatal_before_built, fatal_before_built_value,
+                __ATOMIC_RELEASE
+            );
+        }
+    }
 
     static void BeforePayloadAcquire(uint32_t) {}
 
@@ -1145,6 +1169,49 @@ bool RunCase(SchedulerState &state, const CaseShape &shape) {
         );
     }
     AdapterTestOps::ResetCounters();
+
+    // exec_fatal 是精确首错记录，不再是第二条停止线。若测试只写原因记录
+    // 而没有像生产错误路径那样同步写 scheduler fatal，后续 Claim 仍按
+    // 正常协议取得 cell。该门槛防止以后为“更早看见原因”重新污染热路径。
+    SharedExecCell late_fatal_cell{};
+    SharedExecFatalControl late_fatal{};
+    ExecutionToken late_fatal_token{};
+    ResetExecutionToken(late_fatal_token);
+    AdapterTestOps::ArmFatalBeforeBuilt(
+        late_fatal, ExecFatalReason::InvalidBuildInput,
+        execute_owner, shape.task_id
+    );
+    const ExecBuildResult late_fatal_build =
+        BuildAndPublishExecPayload<AdapterTestOps>(
+            late_fatal_cell, build_owner, spec, source,
+            late_fatal
+        );
+    const uint32_t late_fatal_flush_calls =
+        AdapterTestOps::flush_calls;
+    const DecodedExecState late_fatal_built =
+        DecodeExecState(late_fatal_cell.control.state);
+    AdapterTestOps::ResetCounters();
+    const ExecClaimResult late_fatal_claim =
+        ClaimAndBindExecPayload<AdapterTestOps>(
+            late_fatal_cell, shape.task_id, execute_owner,
+            shape.engine, late_fatal_token, late_fatal
+        );
+    const DecodedExecState late_fatal_claimed =
+        DecodeExecState(late_fatal_cell.control.state);
+    Check(
+        late_fatal_build == ExecBuildResult::Published &&
+            late_fatal_flush_calls == 1 &&
+            late_fatal_built.valid &&
+            late_fatal_built.phase == ExecPhase::Built &&
+            late_fatal_claimed.valid &&
+            late_fatal_claimed.phase == ExecPhase::Claimed &&
+            late_fatal_claim == ExecClaimResult::Claimed &&
+            late_fatal_token.control.phase ==
+                ExecTokenPhase::WaitingFanin &&
+            ExecFatalPublished<AdapterTestOps>(late_fatal),
+        shape.kind,
+        "reason-only exec fatal is diagnostic and does not gate Claim"
+    );
 
     ExecPayloadLayout expected_layout{};
     Check(

@@ -123,6 +123,189 @@ static_assert(
     kCrossCoreExecFallbackGraceProgresses != 0,
     "cross-core fallback grace must remain finite and nonzero"
 );
+
+// cross-core execution package 的统一观测适配器。shared_exec_protocol.h
+// 只描述业务原语，不能依赖 standalone 的 raw ABI；这里把每个真实原语
+// 映射到稳定 AtomicSite/DcciSite。PA_BUILD_TRACE_FREE 时下列封装均在
+// 编译期退化为一次原始 Ops 调用，不改变 perf/PMU 构建的协议形态。
+template <typename Ops>
+struct SharedExecTraceObserver {
+    LocalStats *stats;
+
+    PA_DEVICE int64_t LoadFatal(
+        PA_GM volatile int64_t *address, uint32_t task_id
+    ) const {
+        return TraceAtomicLoad<Ops>(
+            stats->trace, stats->result,
+            static_cast<int32_t>(task_id),
+            AtomicSite::SharedExecFatalLoad, address,
+            /*result_used=*/true
+        );
+    }
+
+    PA_DEVICE int64_t PublishFatal(
+        PA_GM volatile int64_t *address, int64_t expected,
+        int64_t desired, uint32_t task_id
+    ) const {
+        return TraceAtomicCompareExchange<Ops>(
+            stats->trace, stats->result,
+            static_cast<int32_t>(task_id),
+            AtomicSite::SharedExecFatalSet,
+            address, expected, desired,
+            /*result_used=*/true
+        );
+    }
+
+    PA_DEVICE int64_t LoadCellState(
+        PA_GM volatile int64_t *address, uint32_t task_id
+    ) const {
+        return TraceAtomicLoad<Ops>(
+            stats->trace, stats->result,
+            static_cast<int32_t>(task_id),
+            AtomicSite::SharedExecCellStateLoad, address,
+            /*result_used=*/true
+        );
+    }
+
+    PA_DEVICE int64_t ReserveBuild(
+        PA_GM volatile int64_t *address, int64_t expected,
+        int64_t desired, uint32_t task_id
+    ) const {
+        return TraceAtomicCompareExchange<Ops>(
+            stats->trace, stats->result,
+            static_cast<int32_t>(task_id),
+            AtomicSite::SharedExecBuildReserve,
+            address, expected, desired,
+            /*result_used=*/true
+        );
+    }
+
+    PA_DEVICE int64_t PublishBuilt(
+        PA_GM volatile int64_t *address, int64_t expected,
+        int64_t desired, uint32_t task_id
+    ) const {
+        return TraceAtomicCompareExchange<Ops>(
+            stats->trace, stats->result,
+            static_cast<int32_t>(task_id),
+            AtomicSite::SharedExecBuiltPublish,
+            address, expected, desired,
+            /*result_used=*/true
+        );
+    }
+
+    PA_DEVICE int64_t ClaimCell(
+        PA_GM volatile int64_t *address, int64_t expected,
+        int64_t desired, uint32_t task_id
+    ) const {
+        return TraceAtomicCompareExchange<Ops>(
+            stats->trace, stats->result,
+            static_cast<int32_t>(task_id),
+            AtomicSite::SharedExecClaim,
+            address, expected, desired,
+            /*result_used=*/true
+        );
+    }
+
+    PA_DEVICE int64_t PublishDone(
+        PA_GM volatile int64_t *address, int64_t expected,
+        int64_t desired, uint32_t task_id
+    ) const {
+        return TraceAtomicCompareExchange<Ops>(
+            stats->trace, stats->result,
+            static_cast<int32_t>(task_id),
+            AtomicSite::SharedExecDonePublish,
+            address, expected, desired,
+            /*result_used=*/true
+        );
+    }
+
+    template <typename Pointer>
+    PA_DEVICE void FlushBuildPayload(
+        Pointer address, uint64_t bytes, uint32_t task_id
+    ) const {
+        (void)TraceConfiguredDcciFlush<
+            Ops, PA_BUILD_ATOMIC_SWIMLANE
+        >(
+            &stats->trace, static_cast<int32_t>(task_id), -1,
+            DcciSite::SharedExecPayloadFlush, address, bytes
+        );
+    }
+
+    template <typename Pointer>
+    PA_DEVICE void InvalidateClaimPayload(
+        Pointer address, uint64_t bytes, uint32_t task_id
+    ) const {
+        (void)TraceConfiguredDcciInvalidate<
+            Ops, PA_BUILD_ATOMIC_SWIMLANE
+        >(
+            &stats->trace, static_cast<int32_t>(task_id), -1,
+            DcciSite::SharedExecPayloadInvalidate,
+            address, bytes
+        );
+    }
+
+    template <typename Pointer>
+    PA_DEVICE void InvalidateTokenDescriptor(
+        Pointer address, uint64_t bytes, uint32_t task_id
+    ) const {
+        (void)TraceConfiguredDcciInvalidate<
+            Ops, PA_BUILD_ATOMIC_SWIMLANE
+        >(
+            &stats->trace, static_cast<int32_t>(task_id), -1,
+            DcciSite::SharedExecTokenDescriptorInvalidate,
+            address, bytes
+        );
+    }
+
+    template <typename Pointer>
+    PA_DEVICE void InvalidateBuildDescriptor(
+        Pointer address, uint64_t bytes, uint32_t task_id
+    ) const {
+        (void)TraceConfiguredDcciInvalidate<
+            Ops, PA_BUILD_ATOMIC_SWIMLANE
+        >(
+            &stats->trace, static_cast<int32_t>(task_id), -1,
+            DcciSite::SharedExecBuildSourceDescriptorInvalidate,
+            address, bytes
+        );
+    }
+
+    PA_DEVICE int64_t LoadFaninFlag(
+        PA_GM volatile int64_t *address, uint32_t producer
+    ) const {
+        return TraceAtomicLoad<Ops>(
+            stats->trace, stats->result,
+            static_cast<int32_t>(producer),
+            AtomicSite::FaninFlagLoad, address,
+            /*result_used=*/true
+        );
+    }
+
+    template <typename T>
+    PA_DEVICE T PublishCompletionVend(
+        PA_GM volatile T *address, T value,
+        uint32_t task_id
+    ) const {
+        return TraceAtomicExchange<Ops>(
+            stats->trace, stats->result,
+            static_cast<int32_t>(task_id),
+            AtomicSite::SharedExecCompletionVendPublish,
+            address, value, /*result_used=*/false
+        );
+    }
+
+    PA_DEVICE int64_t PublishCompletionFlag(
+        PA_GM volatile int64_t *address, int64_t value,
+        uint32_t task_id
+    ) const {
+        return TraceAtomicExchange<Ops>(
+            stats->trace, stats->result,
+            static_cast<int32_t>(task_id),
+            AtomicSite::SharedExecCompletionFlagPublish,
+            address, value, /*result_used=*/true
+        );
+    }
+};
 #endif
 
 #if PTO_FDWIC_SHARED_MAP && !PA_BUILD_TRACE_FREE
@@ -4175,8 +4358,10 @@ PA_DEVICE void PublishCrossCoreRuntimeFailure(
     if (state == nullptr || worker_id >= kWorkers) {
         return;
     }
+    SharedExecTraceObserver<Ops> observer{&stats};
     (void)cross_core::PublishExecFatal<Ops>(
-        state->exec_fatal, reason, task_id, worker_id
+        state->exec_fatal, reason, task_id, worker_id,
+        observer
     );
     SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
 }
@@ -4190,6 +4375,7 @@ PA_DEVICE_NOINLINE bool PublishCrossCoreExecTask(
 ) {
     const uint32_t worker_id =
         static_cast<uint32_t>(worker.core_idx);
+    SharedExecTraceObserver<Ops> observer{&stats};
     cross_core::PaExecRoute route{};
     if (state == nullptr || worker.core_idx < 0 ||
         worker_id >= kWorkers || task_id >= kMaxTasks ||
@@ -4206,16 +4392,9 @@ PA_DEVICE_NOINLINE bool PublishCrossCoreExecTask(
         );
         return false;
     }
-    // 已经存在的调度器首错只负责停止后续生产，不能再伪造成
-    // execution control 错误。exec_fatal 已存在时只把 terminal 状态
-    // 镜像到通用 fatal，不覆盖原始 execution reason。
-    if (Ops::Load(&state->fatal.value) != 0) {
-        return false;
-    }
-    if (cross_core::ExecFatalPublished<Ops>(state->exec_fatal)) {
-        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
-        return false;
-    }
+    // scheduler fatal 由领取新 Build ticket 前的调度边界统一检查。
+    // 本 helper 接收已经取得的合法 task，并只对本 task 的 Build 结果负责；
+    // 不在 WinnerBuild 内再次读取同一全局停止线。
 
     cross_core::ExecPayloadSpec spec{};
     cross_core::PaExecPayloadSource source{};
@@ -4231,7 +4410,8 @@ PA_DEVICE_NOINLINE bool PublishCrossCoreExecTask(
         return false;
     }
     if (!cross_core::ResolvePaExecPayloadSourceAfterFanin<Ops>(
-            *state, args, context, task_id, source
+            *state, args, context, task_id, source,
+            observer
         )) {
         PublishCrossCoreRuntimeFailure<Ops>(
             state, stats,
@@ -4241,28 +4421,24 @@ PA_DEVICE_NOINLINE bool PublishCrossCoreExecTask(
         return false;
     }
 
-    // spec/source 解析可能包含普通 GM 读取；真正取得 fresh cell 前再看
-    // 一次全局停止条件，避免已观察到其他子系统 fatal 后继续发布 BUILT。
-    if (Ops::Load(&state->fatal.value) != 0) {
-        return false;
-    }
-
-    // 下一条 helper 在接触 cell 前首先读取同一个 exec_fatal；两次读取
-    // 之间只有参数求值，没有共享副作用。保留 helper 内的协议边界，避免
-    // 每个成功 Build 在同一地址上连续执行两次返回型原子读取。
+    // helper 在接触 cell 前只检查一次 exec_fatal。source 解析期间并发
+    // 出现的通用 fatal 不要求中断当前 Build；即使发布 BUILT，后续 Claim
+    // 也会拒绝执行，FinalDrain 仍能按首错收敛。
     const cross_core::ExecBuildResult build_result =
         cross_core::BuildAndPublishExecPayload<Ops>(
             state->exec_cells[task_id], worker_id, spec, source,
-            state->exec_fatal
+            state->exec_fatal, observer
         );
     if (build_result != cross_core::ExecBuildResult::Published) {
         if (build_result ==
             cross_core::ExecBuildResult::CellUnavailable) {
-            if (Ops::Load(&state->fatal.value) != 0) {
+            if (IsFatal<Ops>(
+                    state, stats, static_cast<int32_t>(task_id)
+                )) {
                 return false;
             }
             if (cross_core::ExecFatalPublished<Ops>(
-                    state->exec_fatal
+                    state->exec_fatal, task_id, observer
                 )) {
                 SetFatal<Ops>(
                     state, stats, static_cast<int32_t>(task_id)
@@ -4307,6 +4483,7 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
     completed = false;
     const uint32_t worker_id =
         static_cast<uint32_t>(worker.core_idx);
+    SharedExecTraceObserver<Ops> observer{&stats};
     if (state == nullptr || worker.core_idx < 0 ||
         worker_id >= kWorkers ||
         token_slot >= cross_core::kExecTokensPerWorker) {
@@ -4317,10 +4494,9 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
     if (token.control.phase == cross_core::ExecTokenPhase::Idle) {
         return true;
     }
-    // Progress 入口已经检查过 global/exec fatal；这里仍在真正发射 kernel
-    // 和发布 completion 前复核 global fatal，覆盖另一 worker 在本次
-    // progress 内报告首错的交错。当前 engine helper 是同步边界，尚未
-    // 发射时可以直接把 owner-local token 收敛为 Faulted。
+    // global fatal 在外层调度边界观察。已经取得的合法 token 作为一个
+    // 不可拆分工作单元推进到完成；不在 fanin、kernel 和 completion 之间
+    // 反复读取共享停止线。
     const cross_core::ExecPayloadHeader header =
         cross_core::ExecutionTokenHeader(token);
     TaskKind kind = TaskKind::Count;
@@ -4354,8 +4530,10 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
     }
     if (token.control.phase ==
             cross_core::ExecTokenPhase::WaitingFanin) {
-        cross_core::PaExecReadySource<Ops> ready{
-            state, &stats.result
+        cross_core::ObservedPaExecReadySource<
+            Ops, SharedExecTraceObserver<Ops>
+        > ready{
+            state, &stats.result, &observer
         };
         // 未 ready 只是一次纯观察，不推进共享状态，也不发射 kernel。
         // 先在 owner-local token 上压缩 ready 前缀；只有全部依赖 ready，
@@ -4367,7 +4545,7 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
             return true;
         }
         if (!cross_core::TryMarkExecutionTokenEngineInflight<Ops>(
-                token, ready, state->exec_fatal
+                token, ready, state->exec_fatal, observer
             )) {
             if (token.control.phase ==
                 cross_core::ExecTokenPhase::Faulted) {
@@ -4378,12 +4556,6 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
                 return false;
             }
             return true;
-        }
-
-        if (Ops::Load(&state->fatal.value) != 0) {
-            token.control.phase =
-                cross_core::ExecTokenPhase::Faulted;
-            return false;
         }
 
         const uint64_t kernel_begin =
@@ -4414,19 +4586,11 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
             stats, kind, kernel_end - kernel_begin
         );
 
-        // ExecutePaBoundKernel 当前只在真实 engine wait 返回后退出；
-        // 因此此处观察到 terminal fatal 时 engine 已经停止访问 GM，
-        // 可以转 Faulted 且不得继续发布正常 completion。
-        if (Ops::Load(&state->fatal.value) != 0) {
-            token.control.phase =
-                cross_core::ExecTokenPhase::Faulted;
-            return false;
-        }
-
         const cross_core::PaExecSynchronousEngineCompletion
             engine_complete{};
         if (!cross_core::TryMarkExecutionTokenCompleting<Ops>(
-                token, engine_complete, state->exec_fatal
+                token, engine_complete, state->exec_fatal,
+                observer
             )) {
             PublishCrossCoreRuntimeFailure<Ops>(
                 state, stats,
@@ -4463,18 +4627,15 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
             cross_core::ExecTokenPhase::VendPublished ||
         token.control.phase ==
             cross_core::ExecTokenPhase::CompletionPublished) {
-        if (Ops::Load(&state->fatal.value) != 0) {
-            token.control.phase =
-                cross_core::ExecTokenPhase::Faulted;
-            return false;
-        }
         const uint32_t completed_task = token.control.task_id;
         const uint32_t completed_function =
             cross_core::ExecutionTokenHeader(token).function_id;
-        cross_core::PaExecCompletionSink<Ops> completion{state};
+        cross_core::ObservedPaExecCompletionSink<
+            Ops, SharedExecTraceObserver<Ops>
+        > completion{state, &observer};
         if (cross_core::PublishExecDoneAfterCompletion<Ops>(
                 state->exec_cells[completed_task], token,
-                completion, state->exec_fatal
+                completion, state->exec_fatal, observer
             ) != cross_core::ExecDoneResult::Done) {
             SetFatal<Ops>(
                 state, stats,
@@ -4553,43 +4714,30 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
     }
     const uint32_t worker_id =
         static_cast<uint32_t>(worker.core_idx);
-    if (production_closed) {
-        // FinalDrain 是错误路径的权威收敛边界：生产停止后即使 token
-        // 永久等不到 fanin，也必须观察 terminal 状态并转 Faulted。
-        // opportunistic EfDrain 不走这两次集中式读取。
-        const bool global_fatal =
-            Ops::Load(&state->fatal.value) != 0;
-        const bool exec_fatal =
-            cross_core::ExecFatalPublished<Ops>(state->exec_fatal);
-        if (global_fatal || exec_fatal) {
-            for (uint32_t token_slot = 0;
-                 token_slot < cross_core::kExecTokensPerWorker;
-                 ++token_slot) {
-                PA_GM cross_core::ExecutionToken &token =
-                    state->exec_tokens[worker_id][token_slot];
-                if (token.control.phase !=
-                    cross_core::ExecTokenPhase::Idle) {
-                    token.control.phase =
-                        cross_core::ExecTokenPhase::Faulted;
-                }
-            }
-            if (exec_fatal && !global_fatal) {
-                SetFatal<Ops>(state, stats, -1);
-            }
-            return 0;
-        }
-    }
-    // 不在无副作用的 scanner 入口重复读取两条全局 fatal 热点线：
+    SharedExecTraceObserver<Ops> observer{&stats};
+    // 机会式 scanner 不在每次入口重复读取 global fatal 热点线：
     //
-    // - active token 会在 kernel 发射和 completion 发布前复核 global
-    //   fatal，并由 token helper 在状态推进前复核 exec fatal；
-    // - Idle scanner 在真正发射 Claim CAS 前复核两条 fatal；
+    // - 当前合法 token 作为一个工作单元推进到 completion；
+    // - 新 Build ticket 前有 replay 调度边界检查；
+    // - FinalDrain 在 production_closed 后执行权威 terminal 检查；
     // - EMPTY/BUILDING、非候选槽和合法 loser 这里只读取共享 control 或
     //   推进 owner-local cursor，不产生跨核业务副作用。
     //
-    // 因而入口读取既不是不可逆边界，也不能阻止随后 Submit 的 Claim。
-    // 删除它们只消除正常路径上所有 executor 汇聚到同两个地址的返回型
-    // atomic；错误路径仍在第一个不可逆动作前 fail-closed。
+    // 因而正常 replay progress 不读取；只有 FinalDrain 的关闭路径负责把
+    // 尚未复位的 owner-local token 收敛为 Faulted。
+
+    if (production_closed && IsFatal<Ops>(state, stats)) {
+        for (uint32_t token_slot = 0;
+             token_slot < cross_core::kExecTokensPerWorker;
+             ++token_slot) {
+            PA_GM cross_core::ExecutionToken &token =
+                state->exec_tokens[worker_id][token_slot];
+            if (token.control.phase != cross_core::ExecTokenPhase::Idle) {
+                token.control.phase = cross_core::ExecTokenPhase::Faulted;
+            }
+        }
+        return 0;
+    }
 
     uint32_t completed_count = 0;
     if (!ProgressCrossCoreOwnedTokens<Ops>(
@@ -4681,7 +4829,11 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
         PA_GM cross_core::SharedExecCell &cell =
             state->exec_cells[task_id];
         const cross_core::DecodedExecState observed =
-            cross_core::DecodeExecState(Ops::Load(&cell.control.state));
+            cross_core::DecodeExecState(
+                observer.LoadCellState(
+                    &cell.control.state, task_id
+                )
+            );
         if (!observed.valid) {
             PublishCrossCoreRuntimeFailure<Ops>(
                 state, stats,
@@ -4793,27 +4945,16 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
                 ++stats.exec_fallback_defer_count;
                 return completed_count;
             }
-            // control 的首次观察只说明当时尚无 fatal；真正取得执行所有权
-            // 前必须重新检查两条 terminal 线。exec fatal 已保存精确原因，
-            // 此处只镜像通用 fatal，不改写首错。
-            if (Ops::Load(&state->fatal.value) != 0) {
-                return completed_count;
-            }
-            if (cross_core::ExecFatalPublished<Ops>(
-                    state->exec_fatal
-                )) {
-                SetFatal<Ops>(
-                    state, stats, static_cast<int32_t>(task_id)
-                );
-                return completed_count;
-            }
+            // 权威 scheduler fatal 已在本次调度边界进入前检查；这里直接
+            // 完成 Claim。并发首错最多让当前合法工作单元完成，不再为每个
+            // Claim 重复读取全局停止线。
             PA_GM cross_core::ExecutionToken &claim_token =
                 state->exec_tokens[worker_id][idle_token_slot];
             const cross_core::ExecClaimResult claim =
                 cross_core::ClaimAndBindExecPayload<Ops>(
                     cell, task_id, worker_id, route_engine,
                     claim_token,
-                    state->exec_fatal
+                    state->exec_fatal, observer
                 );
             if (claim != cross_core::ExecClaimResult::Claimed) {
                 if (claim == cross_core::ExecClaimResult::Lost ||
@@ -4824,21 +4965,6 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
                     // 记录并在本循环下一次原子观察后验证 winner 身份。
                     continue;
                 }
-                if (claim ==
-                        cross_core::ExecClaimResult::FatalObserved ||
-                    cross_core::ExecFatalPublished<Ops>(
-                        state->exec_fatal
-                    )) {
-                    SetFatal<Ops>(
-                        state, stats, static_cast<int32_t>(task_id)
-                    );
-                    if (claim_token.control.phase !=
-                        cross_core::ExecTokenPhase::Idle) {
-                        claim_token.control.phase =
-                            cross_core::ExecTokenPhase::Faulted;
-                    }
-                    return completed_count;
-                }
                 PublishCrossCoreRuntimeFailure<Ops>(
                     state, stats,
                     cross_core::ExecFatalReason::InvalidTokenPayload,
@@ -4846,23 +4972,6 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
                 );
                 claim_token.control.phase =
                     cross_core::ExecTokenPhase::Faulted;
-                return completed_count;
-            }
-            const bool global_fatal_after_claim =
-                Ops::Load(&state->fatal.value) != 0;
-            const bool exec_fatal_after_claim =
-                cross_core::ExecFatalPublished<Ops>(
-                    state->exec_fatal
-                );
-            if (global_fatal_after_claim ||
-                exec_fatal_after_claim) {
-                claim_token.control.phase =
-                    cross_core::ExecTokenPhase::Faulted;
-                if (!global_fatal_after_claim) {
-                    SetFatal<Ops>(
-                        state, stats, static_cast<int32_t>(task_id)
-                    );
-                }
                 return completed_count;
             }
             if (!cross_core::BindPaExecutionTokenDispatchAfterClaim(
@@ -5010,10 +5119,10 @@ PA_DEVICE bool CrossCoreExecAllTokensFullyReset(
     return true;
 }
 
-template <typename Ops>
-PA_DEVICE bool ValidateCrossCoreExecTerminalCells(
+template <typename Ops, typename Observer>
+PA_DEVICE bool ValidateCrossCoreExecTerminalCellsObserved(
     PA_GM SchedulerState *state, uint32_t task_count,
-    uint32_t &first_bad_task
+    uint32_t &first_bad_task, Observer &observer
 ) {
     first_bad_task = task_count;
     if (state == nullptr || task_count > kMaxTasks ||
@@ -5041,15 +5150,19 @@ PA_DEVICE bool ValidateCrossCoreExecTerminalCells(
             SharedPaPlannedTask planned{};
             const cross_core::DecodedExecState decoded =
                 cross_core::DecodeExecState(
-                    Ops::Load(
+                    observer.LoadCellState(
                         &state->exec_cells[task_id]
-                             .control.state
+                             .control.state,
+                        task_id
                     )
                 );
             bool valid =
                 SharedPaPlannedTaskAt(plan, offset, planned) &&
                 decoded.valid &&
-                Ops::Load(&state->tasks[task_id].flag) == 1;
+                observer.LoadFaninFlag(
+                    &state->tasks[task_id].flag,
+                    task_id
+                ) == 1;
             if (valid && planned.kind == TaskKind::Alloc) {
                 valid = decoded.phase ==
                     cross_core::ExecPhase::Empty;
@@ -5083,6 +5196,30 @@ PA_DEVICE bool ValidateCrossCoreExecTerminalCells(
 }
 
 template <typename Ops>
+PA_DEVICE bool ValidateCrossCoreExecTerminalCells(
+    PA_GM SchedulerState *state, uint32_t task_count,
+    uint32_t &first_bad_task, LocalStats &stats
+) {
+    SharedExecTraceObserver<Ops> observer{&stats};
+    return ValidateCrossCoreExecTerminalCellsObserved<Ops>(
+        state, task_count, first_bad_task, observer
+    );
+}
+
+// 无 TraceContext 的协议门槛仍复用同一终态判定；正式 scheduler 只走
+// 上面的观察版本，不会因保留测试入口而多执行共享原语。
+template <typename Ops>
+PA_DEVICE bool ValidateCrossCoreExecTerminalCells(
+    PA_GM SchedulerState *state, uint32_t task_count,
+    uint32_t &first_bad_task
+) {
+    cross_core::DirectExecObserver<Ops> observer{};
+    return ValidateCrossCoreExecTerminalCellsObserved<Ops>(
+        state, task_count, first_bad_task, observer
+    );
+}
+
+template <typename Ops>
 PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker,
     uint32_t task_count, LocalStats &stats,
@@ -5102,8 +5239,11 @@ PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
             !CrossCoreExecAllTokensFullyReset(state, worker_id)) {
             return true;
         }
-        const int64_t prior = Ops::FetchAdd(
-            &state->exec_drain.arrived, 1
+        const int64_t prior = TraceAtomicFetchAdd<Ops>(
+            stats.trace, stats.result, -1,
+            AtomicSite::SharedExecDrainArrive,
+            &state->exec_drain.arrived, 1,
+            /*result_used=*/true
         );
         if (prior < 0 ||
             prior >= static_cast<int64_t>(kWorkers)) {
@@ -5118,7 +5258,7 @@ PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
         if (prior + 1 == static_cast<int64_t>(kWorkers)) {
             uint32_t first_bad_task = task_count;
             if (!ValidateCrossCoreExecTerminalCells<Ops>(
-                    state, task_count, first_bad_task
+                    state, task_count, first_bad_task, stats
                 )) {
                 PublishCrossCoreRuntimeFailure<Ops>(
                     state, stats,
@@ -5127,8 +5267,11 @@ PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
                 );
                 return false;
             }
-            if (Ops::CompareExchange(
-                    &state->exec_drain.release, 0, 1
+            if (TraceAtomicCompareExchange<Ops>(
+                    stats.trace, stats.result, -1,
+                    AtomicSite::SharedExecDrainReleasePublish,
+                    &state->exec_drain.release, 0, 1,
+                    /*result_used=*/true
                 ) != 0) {
                 PublishCrossCoreRuntimeFailure<Ops>(
                     state, stats,
@@ -5141,7 +5284,12 @@ PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
     }
 
     const int64_t release =
-        Ops::Load(&state->exec_drain.release);
+        TraceAtomicLoad<Ops>(
+            stats.trace, stats.result, -1,
+            AtomicSite::SharedExecDrainReleasePoll,
+            &state->exec_drain.release,
+            /*result_used=*/true
+        );
     if (release == 1) {
         released = true;
         return true;
@@ -6476,8 +6624,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         stats.result.submit_begin = orchestration_begin;
 #endif
         bool dispatch_exhausted = false;
-        while (!dispatch_exhausted &&
-               !IsFatal<Ops>(state, stats)) {
+        while (!dispatch_exhausted) {
             if (!DispatchOneSharedBuildTask<Ops, Profile>(
                     state, worker, role, task_count,
                     orchestration, args, context, stats,
@@ -6586,6 +6733,11 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         TraceAtomicPollBatchMask(AtomicSite::ReplayDonePoll) |
             TraceAtomicPollBatchMask(AtomicSite::FaninFlagLoad) |
             TraceAtomicPollBatchMask(AtomicSite::FatalPoll)
+#if PTO_FDWIC_SHARED_MAP
+            | TraceAtomicPollBatchMask(
+                AtomicSite::SharedExecDrainReleasePoll
+            )
+#endif
     );
     bool leaf_forwarded = false;
     bool middle_forwarded = false;
@@ -6600,6 +6752,9 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #endif
     while (true) {
 #if PTO_FDWIC_SHARED_MAP
+        if (cross_core_exec_ok && IsFatal<Ops>(state, stats)) {
+            cross_core_exec_ok = false;
+        }
         const uint32_t freed = cross_core_exec_ok
             ? ProgressCrossCoreExec<Ops>(
                   state, worker, task_count,
@@ -6607,12 +6762,6 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                   DrainPlace::FinalDrain, stats
               )
             : 0;
-        if (Ops::Load(&state->fatal.value) != 0 ||
-            cross_core::ExecFatalPublished<Ops>(
-                state->exec_fatal
-            )) {
-            cross_core_exec_ok = false;
-        }
 #else
         const uint32_t freed =
             DrainReady<Ops>(state, worker, DrainPlace::FinalDrain, stats);

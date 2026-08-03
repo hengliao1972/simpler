@@ -320,11 +320,11 @@ static_assert(
 );
 
 #if PTO_FDWIC_SHARED_MAP
-template <typename Ops>
+template <typename Ops, typename Observer>
 PA_DEVICE bool ResolvePaExecPayloadSourceAfterFanin(
     PA_GM SchedulerState &state, const TaskArgs &args,
     const SubmitContext &context, uint32_t task_id,
-    PaExecPayloadSource &source
+    PaExecPayloadSource &source, Observer &observer
 ) {
     if (task_id >= kMaxTasks || context.task_id < 0 ||
         static_cast<uint32_t>(context.task_id) != task_id ||
@@ -376,8 +376,9 @@ PA_DEVICE bool ResolvePaExecPayloadSourceAfterFanin(
             // published，adapter 不得再做一次返回型 atomic load。这里仅
             // 对 descriptor 做一次 invalidate；fresh descriptor 此后不可变，
             // Pack 可直接逐 word 读取，不把 SharedOutputRef 带给 executor。
-            Ops::InvalidateRegion(
-                &output_cell.tensors[output_slot], sizeof(TensorDesc)
+            observer.InvalidateBuildDescriptor(
+                &output_cell.tensors[output_slot],
+                sizeof(TensorDesc), task_id
             );
             source.tensors[tensor_index].gm_tensor =
                 &output_cell.tensors[output_slot];
@@ -411,6 +412,18 @@ PA_DEVICE bool ResolvePaExecPayloadSourceAfterFanin(
         source.fanin[static_cast<uint32_t>(edge)] = producer;
     }
     return true;
+}
+
+template <typename Ops>
+PA_DEVICE bool ResolvePaExecPayloadSourceAfterFanin(
+    PA_GM SchedulerState &state, const TaskArgs &args,
+    const SubmitContext &context, uint32_t task_id,
+    PaExecPayloadSource &source
+) {
+    DirectExecObserver<Ops> observer{};
+    return ResolvePaExecPayloadSourceAfterFanin<Ops>(
+        state, args, context, task_id, source, observer
+    );
 }
 
 PA_DEVICE bool MakePaExecPayloadSpec(
@@ -659,7 +672,36 @@ struct PaExecReadySource {
             return false;
         }
         const bool ready =
+            // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 无 TraceContext 的 adapter/协议单测使用直接 ready source
             Ops::Load(&state->tasks[producer].flag) == 1;
+        if (ready) {
+            ++result->fanin_ready_loads;
+        } else {
+            ++result->fanin_not_ready_loads;
+        }
+        return ready;
+    }
+};
+
+// 正式 scheduler 使用 observer 版本，把 fanin completion load 记入与
+// private 路径相同的原子泳道；无 TraceContext 的协议/adapter 单测继续
+// 使用上面的直接版本。
+template <typename Ops, typename Observer>
+struct ObservedPaExecReadySource {
+    PA_GM SchedulerState *state;
+    WorkerResult *result;
+    Observer *observer;
+
+    PA_DEVICE bool IsReady(int32_t producer) const {
+        if (state == nullptr || result == nullptr || observer == nullptr ||
+            producer < 0 ||
+            static_cast<uint32_t>(producer) >= kMaxTasks) {
+            return false;
+        }
+        const bool ready = observer->LoadFaninFlag(
+            &state->tasks[producer].flag,
+            static_cast<uint32_t>(producer)
+        ) == 1;
         if (ready) {
             ++result->fanin_ready_loads;
         } else {
@@ -689,6 +731,7 @@ struct PaExecCompletionSink {
             vend % kOutputAlignment != 0) {
             return false;
         }
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 无 TraceContext 的 adapter/协议单测使用直接 completion sink
         (void)Ops::Exchange(&state->tasks[task_id].vend, vend);
         return true;
     }
@@ -699,7 +742,38 @@ struct PaExecCompletionSink {
         }
         // 与原 CompleteTask 相同：vend 先发布，store barrier 后再发布 flag。
         Ops::StoreBarrier();
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 无 TraceContext 的 adapter/协议单测使用直接 completion sink
         return Ops::Exchange(&state->tasks[task_id].flag, int64_t{1}) == 0;
+    }
+};
+
+
+template <typename Ops, typename Observer>
+struct ObservedPaExecCompletionSink {
+    PA_GM SchedulerState *state;
+    Observer *observer;
+
+    PA_DEVICE bool PublishVend(uint32_t task_id, uint64_t vend) {
+        if (state == nullptr || observer == nullptr ||
+            task_id >= kMaxTasks || vend % kOutputAlignment != 0) {
+            return false;
+        }
+        (void)observer->PublishCompletionVend(
+            &state->tasks[task_id].vend, vend, task_id
+        );
+        return true;
+    }
+
+    PA_DEVICE bool PublishFlag(uint32_t task_id) {
+        if (state == nullptr || observer == nullptr ||
+            task_id >= kMaxTasks) {
+            return false;
+        }
+        Ops::StoreBarrier();
+        return observer->PublishCompletionFlag(
+                   &state->tasks[task_id].flag,
+                   int64_t{1}, task_id
+               ) == 0;
     }
 };
 #endif  // PTO_FDWIC_SHARED_MAP

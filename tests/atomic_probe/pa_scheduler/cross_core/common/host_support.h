@@ -1386,6 +1386,18 @@ inline const char *AtomicSiteName(uint32_t site) {
         "SharedClaimTournamentLocal",
         "SharedClaimTournamentRoot",
         "SharedBuildDispatchTicket",
+        "SharedExecFatalLoad",
+        "SharedExecFatalSet",
+        "SharedExecCellStateLoad",
+        "SharedExecBuildReserve",
+        "SharedExecBuiltPublish",
+        "SharedExecClaim",
+        "SharedExecCompletionVendPublish",
+        "SharedExecCompletionFlagPublish",
+        "SharedExecDonePublish",
+        "SharedExecDrainArrive",
+        "SharedExecDrainReleasePublish",
+        "SharedExecDrainReleasePoll",
     };
     static_assert(
         sizeof(names) / sizeof(names[0]) ==
@@ -1415,6 +1427,10 @@ inline const char *DcciSiteName(uint32_t site) {
         "SharedWinnerBuildDescriptorInvalidate",
         "ObserverTraceExport",
         "StartupConfigInvalidate",
+        "SharedExecBuildSourceDescriptorInvalidate",
+        "SharedExecPayloadFlush",
+        "SharedExecPayloadInvalidate",
+        "SharedExecTokenDescriptorInvalidate",
     };
     static_assert(
         sizeof(names) / sizeof(names[0]) ==

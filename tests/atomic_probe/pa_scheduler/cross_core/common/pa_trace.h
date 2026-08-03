@@ -115,6 +115,7 @@ PA_DEVICE AtomicOp TraceAtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::SharedHeapCursorReserve:
         case AtomicSite::SharedHeapVendAdvance:
         case AtomicSite::SharedBuildDispatchTicket:
+        case AtomicSite::SharedExecDrainArrive:
             return AtomicOp::FetchAdd;
         case AtomicSite::FatalSet:
         case AtomicSite::CompletionVendExchange:
@@ -127,6 +128,12 @@ PA_DEVICE AtomicOp TraceAtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::SharedMetadataLastWriterCommit:
         case AtomicSite::SharedClaimTournamentLocal:
         case AtomicSite::SharedClaimTournamentRoot:
+        case AtomicSite::SharedExecFatalSet:
+        case AtomicSite::SharedExecBuildReserve:
+        case AtomicSite::SharedExecBuiltPublish:
+        case AtomicSite::SharedExecClaim:
+        case AtomicSite::SharedExecDonePublish:
+        case AtomicSite::SharedExecDrainReleasePublish:
             return AtomicOp::CompareExchange;
         case AtomicSite::SharedOutputWriterReserve:
             return AtomicOp::FetchMax;
@@ -135,6 +142,8 @@ PA_DEVICE AtomicOp TraceAtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::SharedMapAppendSeqPublishExchange:
         case AtomicSite::SharedMapAppendTailExchange:
         case AtomicSite::SharedOutputRollbackExchange:
+        case AtomicSite::SharedExecCompletionVendPublish:
+        case AtomicSite::SharedExecCompletionFlagPublish:
             return AtomicOp::Exchange;
         default:
             return AtomicOp::Load;
@@ -155,6 +164,8 @@ PA_DEVICE int32_t TraceAtomicPollBatchIndex(AtomicSite site) {
             return 4;
         case AtomicSite::ReplayDonePoll:
             return 5;
+        case AtomicSite::SharedExecDrainReleasePoll:
+            return 6;
         default:
             return -1;
     }
@@ -174,6 +185,8 @@ PA_DEVICE AtomicSite TraceAtomicPollBatchSite(uint32_t index) {
             return AtomicSite::HeapVendLoad;
         case 5:
             return AtomicSite::ReplayDonePoll;
+        case 6:
+            return AtomicSite::SharedExecDrainReleasePoll;
         default:
             return AtomicSite::Count;
     }
@@ -341,6 +354,7 @@ PA_DEVICE DcciOp TraceDcciSiteExpectedOp(DcciSite site) {
         case DcciSite::SharedOutputDescriptorFlush:
         case DcciSite::SharedRegionAppendFlush:
         case DcciSite::ObserverTraceExport:
+        case DcciSite::SharedExecPayloadFlush:
             return DcciOp::CleanOut;
         default:
             return DcciOp::Invalidate;
@@ -732,7 +746,7 @@ PA_DEVICE_NOINLINE void AtomicPollBoundaryAtSlow(
     (void)end_cycle;
 #else
     const uint32_t active_mask = trace.poll_burst.active_mask;
-    // CCEC 默认会把固定 6-site 循环完整展开，再随几十个 phase 边界复制。
+    // CCEC 默认会把固定站点循环完整展开，再随几十个 phase 边界复制。
     // 禁止展开只控制代码体积；循环次数、site 顺序和同 cycle 关闭语义不变。
     PA_LOOP_NOUNROLL
     for (uint32_t index = 0; index < kAtomicPollBatchSiteCount; ++index) {
@@ -786,7 +800,7 @@ PA_DEVICE void AtomicPollBoundaryAt(
     (void)result;
 #else
     // 绝大多数阶段边界没有活跃等待 episode；先用一个可预测分支返回，
-    // 只有真正需要落 PollBatch 时才进入共享慢函数，避免把固定 6-site
+    // 只有真正需要落 PollBatch 时才进入共享慢函数，避免把固定站点
     // 收口逻辑复制到每个 TraceTimestamp 调用点。
     if (!AtomicSwimlaneEnabled(trace) ||
         trace.poll_burst.active_mask == 0) {
