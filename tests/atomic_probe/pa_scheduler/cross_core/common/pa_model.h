@@ -85,8 +85,9 @@
 // 三镜像统一的构建身份与 manifest 锁定，不能把 shared 目录指向 private 实现。
 
 // 三类证据链在编译期严格互斥：swimlane 保存普通阶段与 atomic 记录，
-// submit-pmu 只保留 PMU 窗口，perf-clock 则只增加首个/末个 Submit
-// 两个性能时间边界。未显式传宏的既有后端继续使用原有通用实现。
+// submit-pmu 只保留 PMU 窗口；无泳道性能构建只增加首个 Submit 与
+// FinalDrain 结束两个时间边界。未显式传宏的既有后端继续使用原有
+// 通用实现。
 #ifndef PA_BUILD_SWIMLANE
 #define PA_BUILD_SWIMLANE 0
 #endif
@@ -2086,11 +2087,12 @@ struct alignas(64) SchedulerState {
     // S3 构建/执行分离状态只追加在既有 standalone sidecar 尾部：
     // production prefix、WorkerResult、shared TensorMap 与 Claim Tournament
     // 的所有既有 offset 均保持不动。每个 task 使用 fresh cell，不发生
-    // 取模复用；每个 worker 只有一个 executor-private token。
+    // 取模复用；每个 worker 固定持有两个 executor-private token。
     cross_core::SharedExecFatalControl exec_fatal;
     cross_core::SharedExecDrainControl exec_drain;
     cross_core::SharedExecCell exec_cells[kMaxTasks];
-    cross_core::ExecutionToken exec_tokens[kWorkers];
+    cross_core::ExecutionToken
+        exec_tokens[kWorkers][cross_core::kExecTokensPerWorker];
     // 低原子 Build 发放状态继续追加在 standalone sidecar 尾部，不移动
     // production prefix、TensorMap、Claim Tournament 或执行 cell。
     SharedBuildDispatchState build_dispatch;
@@ -2170,7 +2172,8 @@ static_assert(
 static_assert(
     offsetof(SchedulerState, build_dispatch) ==
         offsetof(SchedulerState, exec_tokens) +
-            sizeof(cross_core::ExecutionToken) * kWorkers,
+            sizeof(cross_core::ExecutionToken) * kWorkers *
+                cross_core::kExecTokensPerWorker,
     "shared Build dispatch state must follow executor tokens"
 );
 static_assert(
@@ -2190,7 +2193,8 @@ constexpr uint64_t kCrossCoreExecStateBytes =
     sizeof(cross_core::SharedExecFatalControl) +
     sizeof(cross_core::SharedExecDrainControl) +
     sizeof(cross_core::SharedExecCell) * kMaxTasks +
-    sizeof(cross_core::ExecutionToken) * kWorkers +
+    sizeof(cross_core::ExecutionToken) * kWorkers *
+        cross_core::kExecTokensPerWorker +
     sizeof(SharedBuildDispatchState);
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)

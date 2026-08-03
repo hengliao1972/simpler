@@ -24,7 +24,7 @@
 | S4 | 受控的动态 Execute election | K2 首版已通过完整 CPU、CCEC 和 A5 B1/B256 门槛 |
 | S5 | 独立扩大 Build owner 候选核拓扑 | S5a 与 S5b 全 96 Scalar 均已通过 CPU/CCEC/A5 B1/B256 |
 | S6 | 基于累积证据做性能评估与容量/复用优化 | 进行中 |
-| 贯穿观测门槛（不编号） | 泳道、submit-PMU 与 perf-clock 三条互不混算的证据链 | perf-clock 与 full-swimlane 已可用；cross-core submit-PMU 尚未接入 |
+| 贯穿观测门槛（不编号） | 泳道、submit-PMU 与无泳道端到端三条互不混算的证据链 | 端到端与 full-swimlane 已可用；cross-core submit-PMU 尚未接入 |
 | Simpler 迁移门槛（不编号） | 评估并迁移到 Simpler 真实路径 | 未开始 |
 
 ## 2026-08-02：S0 首版协议与 ABI
@@ -1682,3 +1682,109 @@ A5 B1/B256 正确性均通过，AIC/AIV `PublishCrossCoreExecTask` 机器码各�
 撤回，继续使用通用的 `EMPTY -> BUILDING -> BUILT` 双 CAS 协议。本结果只
 否决当前中央 ticket + PA payload 形态下的实现，不推导为其他 payload 或硬件
 上的普遍结论。
+
+## 2026-08-03：S6.22 Claim-first 每核双 token 与完整周期计时
+
+### 调度合同
+
+本阶段没有引入 ready-before-Claim 或真正 Ready queue，只把原单 token
+admission 严格扩为两个 owner-local token：
+
+1. 每次调度点先推进本核两个已领取 token；任一 ready task 先于新 Claim 和
+   新 Build 执行；
+2. 一个 token 占用且未 ready 时，允许对后续合法 `BUILT` task 发射 Claim，
+   winner 绑定到第二槽并立即检查依赖；
+3. 两槽都占用时不观察、不 CAS 第三个 task，但外层仍可领取并完整 Build 一个
+   ticket；下一次调度点再次先检查两个 token；
+4. Build ticket 一旦取得仍不可中途挂起；没有把 Build 改成协程；
+5. FinalDrain 只有在 scanner 封口、两个 token 全字段复位、全部 execution cell
+   到达终态并发布 drain release 后才允许退出。
+
+两个 token 都只由 owner Scalar 普通读写；跨核可见性仍完全复用既有
+`SharedExecCell` 的 payload DCCI/DSB、`BUILT -> CLAIMED` CAS 和 completion
+发布。`SchedulerState` 只增加一个 `ExecutionToken`/worker：
+`4928 B × 96 = 473088 B`；TaskCell、TensorMap、Build ticket 和 raw trace ABI
+均未改变。
+
+### 正确性门槛
+
+CPU 定向用例先在旧单 token 代码上得到预期失败，再由新实现闭合：
+
+- `busy-token-resumes-scanning`：slot0 持有 blocked task，slot1 领取并执行后续
+  ready task；前者依赖发布后再 exactly-once 完成；
+- `busy-candidate-second-token`：一个 occupied token 不再阻止第二次合法 Claim，
+  `max_occupied` 精确达到 2；
+- `two-blocked-tokens-stop-claim-permit-build`：两槽 blocked 时第三个 task 不发生
+  control load/CAS，但同一 worker 仍能取得 Build ticket；
+- `final-drain-closes-last-task`：两个 token、全部 cell 和全局 drain 一起闭合。
+
+完整 CPU perf-clock build 的 shared plan、随机构参、动态 Build dispatch、
+TensorMap ring、execution adapter、scan/drain 和 ordered Submit 全部通过；CCEC
+AIC/AIV 通用实例、双入口、split runtime/finish、1:2 mixed ELF、manifest 和
+无残留 relocation 门槛通过。A5 B1/B256 的 1280 task、1024 kernel、严格插入、
+payload、K2 路由和终态检查也全部 PASS。
+
+### 收敛为唯一端到端性能边界
+
+旧无泳道构建只保存首个 Submit 起点和最后一个 Submit 终点。双 token 会主动
+把 kernel 从 FinalDrain 前移到 Submit，单看该指标会把有效工作前移误判成调度
+回退。新实现复用 `WorkerResult::finish_cycle`，在全部 execution drain 闭合后
+通过单独 noinline helper 读取终点，唯一性能区间为：
+
+```text
+global min(first-submit-begin) -> global max(FinalDrain.end)
+```
+
+最终版本删除了末个 Submit 的性能取时，`submit_end` 在无泳道构建中固定为
+0。每核只读取首个 Submit 和 FinalDrain 结束两个边界，没有新增状态字段、
+泳道事件或逐 task 诊断。CPU runner 明确校验 `2 × 96 = 192` 次；host 只输出
+`PERF-E2E` 和 `submit_to_final_drain_us`。
+
+### A5 严格同底座对照
+
+对照从父提交 `afad388d` 构建单 token ELF，只移植相同的完整周期时钟，并同步
+主工作区本轮开始前已有的“删除成功 Build 重复 exec-fatal 读取”改动。候选为
+双 token；两边均为 trace-free real-compute B256，按 `B-C / C-B / B-C`
+交错运行：
+
+```text
+过渡性诊断中的单 token Submit：2022.789, 1871.997, 1861.860 us
+过渡性诊断中的双 token Submit：2357.425, 2455.617, 2553.549 us
+诊断中位：1871.997 -> 2455.617 us，+583.620 us / +31.176%
+
+单 token 完整周期：9368.900, 9345.107, 9198.695 us
+双 token 完整周期：5894.576, 5880.792, 5737.620 us
+中位：9345.107 -> 5880.792 us，-3464.315 us / -37.071%
+```
+
+同一组三轮的分布闭合为：EfDrain kernel 中位 `208 -> 432`，FinalDrain
+`816 -> 592`，恰有 224 个 kernel 从尾部前移；fanin load 中位
+`16472 -> 13361`，下降 `18.887%`。所以双 token 的保留依据是完整周期显著
+下降，不宣称原 Submit 窗改善。
+
+随后还验证了“只在必要时回看较早 token”的最小轮询序列。它把 fanin load
+中位从 `13392` 降到 `12224`，但三对交错中 Submit 中位
+`2375.742 -> 2418.871 us`、完整周期中位
+`5829.593 -> 5902.238 us`，分别回退 `1.815%/1.246%`；该过程改动已撤回。
+这再次说明返回型读取数量只能作为解释量，不能替代完整周期性能裁决。
+
+本阶段 full-swimlane 产物为：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260803_105154_1488931/ccec/merged_swimlane.json`
+
+该次 host Submit 为 `2.714662 ms`；分析器全局 Submit 为 `1.952273 ms`，
+EfDrain/OrchestrationTail/FinalDrain 分别容纳 `342/96/586` 个 kernel。与此前
+单 token 最佳泳道的 `158/52/814` 相比，方向与 trace-free 完整周期一致。
+
+### 唯一端到端口径复核
+
+进一步删除末个 Submit 的性能取时后，CPU B1 明确闭合每核两次、全局
+`2 × 96 = 192` 次边界读取；完整 CPU 回归和 CCEC AIC/AIV/mixed ELF
+结构门槛均通过。A5 动态结果为：
+
+- B1：`submit_to_final_drain_us=9287.240`，4 个 kernel 全部闭合；
+- B256：`submit_to_final_drain_us=5969.437`，1280 个 task、1024 个 kernel
+  和全部终态检查通过，EfDrain/FinalDrain 分别执行 `430/594` 个 kernel。
+
+本机 shell 没有 `task-submit` 和 `npu-smi`，两轮均为 device 0 未加锁单样本。
+B1 明显长尾和 B256 数字只证明新边界可用，不作为性能收益或稳定基线。

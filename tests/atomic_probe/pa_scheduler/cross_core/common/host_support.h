@@ -890,7 +890,13 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
         sizeof(state->build_dispatch)
     );
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
-        cross_core::ResetExecutionToken(state->exec_tokens[worker]);
+        for (uint32_t token_slot = 0;
+             token_slot < cross_core::kExecTokensPerWorker;
+             ++token_slot) {
+            cross_core::ResetExecutionToken(
+                state->exec_tokens[worker][token_slot]
+            );
+        }
     }
 #endif
     state->heap_window = kHeapWindow;
@@ -1157,7 +1163,7 @@ inline constexpr size_t CrossCoreExecStateBytes() {
     return kCrossCoreExecStateBytes;
 }
 static_assert(
-    CrossCoreExecStateBytes() == 19709184,
+    CrossCoreExecStateBytes() == 20182272,
     "cross-core execution state transfer size changed"
 );
 static_assert(
@@ -1175,6 +1181,7 @@ struct Metrics {
     // launch/synchronize 的外层参考，不与设备内分段时间混算。
     bool passed = true;
     double submit_span_us = 0;
+    double submit_to_final_drain_us = 0;
     double startup_barrier_span_us = 0;
     double final_barrier_span_us = 0;
     double final_drain_span_us = 0;
@@ -4841,17 +4848,22 @@ inline Metrics Validate(
     bool cross_core_exec_tokens_idle = true;
     bool cross_core_exec_terminal_snapshot_ok = true;
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
-        const cross_core::ExecutionTokenControl &control =
-            state.exec_tokens[worker].control;
-        cross_core_exec_tokens_idle &=
-            control.phase == cross_core::ExecTokenPhase::Idle &&
-            control.task_id == UINT32_MAX &&
-            control.build_owner == UINT32_MAX &&
-            control.execute_owner == UINT32_MAX &&
-            control.engine_class == cross_core::ExecEngineClass::None &&
-            control.payload_lines == 0 &&
-            control.payload_bytes == 0 &&
-            control.fanin_ready_prefix == 0;
+        for (uint32_t token_slot = 0;
+             token_slot < cross_core::kExecTokensPerWorker;
+             ++token_slot) {
+            const cross_core::ExecutionTokenControl &control =
+                state.exec_tokens[worker][token_slot].control;
+            cross_core_exec_tokens_idle &=
+                control.phase == cross_core::ExecTokenPhase::Idle &&
+                control.task_id == UINT32_MAX &&
+                control.build_owner == UINT32_MAX &&
+                control.execute_owner == UINT32_MAX &&
+                control.engine_class ==
+                    cross_core::ExecEngineClass::None &&
+                control.payload_lines == 0 &&
+                control.payload_bytes == 0 &&
+                control.fanin_ready_prefix == 0;
+        }
         // final_occupied 由设备在本核检查 scanner/token 后通过 bypass
         // result sidecar 发布，是 CCEC 关闭 kernel-end DCCI 时的权威终态；
         // 上面的 raw token 回读只保留额外诊断价值。
@@ -4875,8 +4887,24 @@ inline Metrics Validate(
             );
         }
         if (decoded.reporter_owner < kWorkers) {
-            token_state =
-                state.exec_tokens[decoded.reporter_owner].control;
+            bool selected = false;
+            for (uint32_t token_slot = 0;
+                 token_slot < cross_core::kExecTokensPerWorker;
+                 ++token_slot) {
+                const cross_core::ExecutionTokenControl &candidate =
+                    state.exec_tokens[decoded.reporter_owner]
+                                     [token_slot].control;
+                if (candidate.task_id == decoded.task_id) {
+                    token_state = candidate;
+                    selected = true;
+                    break;
+                }
+                if (!selected && candidate.phase !=
+                        cross_core::ExecTokenPhase::Idle) {
+                    token_state = candidate;
+                    selected = true;
+                }
+            }
         }
         std::printf(
             "[CROSS_CORE_EXEC_FATAL] raw=%lld valid=%u reason=%s(%u) "
@@ -4911,8 +4939,10 @@ inline Metrics Validate(
 
     // 聚合量分为调度核心计数、kernel 分布、前端操作数和最终状态四组，便于定位语义偏差。
     uint64_t first_submit = UINT64_MAX;
+#if PA_BUILD_PERF_CLOCK
+    uint64_t last_final_drain_end = 0;
+#else
     uint64_t last_submit = 0;
-#if !PA_BUILD_PERF_CLOCK
     uint64_t first_startup_begin = UINT64_MAX;
     uint64_t last_startup_end = 0;
     uint64_t first_final_begin = UINT64_MAX;
@@ -5229,8 +5259,9 @@ inline Metrics Validate(
         worker_shape_ok &= result.final_occupied == 0;
         submit_timestamps_ok &= result.submit_begin != 0;
 #if PA_BUILD_PERF_CLOCK
-        submit_timestamps_ok &= result.submit_end > result.submit_begin;
-        submit_timestamps_ok &= result.finish_cycle == result.submit_end;
+        submit_timestamps_ok &= result.submit_end == 0;
+        submit_timestamps_ok &=
+            result.finish_cycle > result.submit_begin;
         lifecycle_timestamps_ok &=
             result.startup_barrier_begin == 0 &&
             result.startup_barrier_end == 0 &&
@@ -5254,8 +5285,12 @@ inline Metrics Validate(
         shared_symbol_input_loads += result.shared_symbol_input_loads;
         shared_symbol_inout_commits += result.shared_symbol_inout_commits;
         first_submit = std::min(first_submit, result.submit_begin);
+#if PA_BUILD_PERF_CLOCK
+        last_final_drain_end = std::max(
+            last_final_drain_end, result.finish_cycle
+        );
+#else
         last_submit = std::max(last_submit, result.submit_end);
-#if !PA_BUILD_PERF_CLOCK
         first_startup_begin = std::min(first_startup_begin, result.startup_barrier_begin);
         last_startup_end = std::max(last_startup_end, result.startup_barrier_end);
         first_final_begin = std::min(first_final_begin, result.final_barrier_begin);
@@ -5576,16 +5611,20 @@ inline Metrics Validate(
         &metrics
     );
 #endif
-    Expect(submit_timestamps_ok, "all Submit timing markers are valid", &metrics);
 #if PA_BUILD_PERF_CLOCK
     Expect(
+        submit_timestamps_ok,
+        "first-Submit and FinalDrain-end markers are valid",
+        &metrics
+    );
+    Expect(
         lifecycle_timestamps_ok,
-        "perf-clock lifecycle-only timing fields stay zero",
+        "trace-free lifecycle-only timing fields stay zero",
         &metrics
     );
     Expect(
         perf_clock_observer_fields_zero,
-        "perf-clock excludes phase, atomic-trace, PMU, and kernel timing observations",
+        "trace-free build excludes phase, atomic, PMU, and kernel timing",
         &metrics
     );
     Expect(
@@ -5593,10 +5632,15 @@ inline Metrics Validate(
             state.config.trace_base == 0 &&
             state.config.trace_records_per_core == 0 &&
             state.config.profile_phases == 0,
-        "perf-clock runtime trace and phase controls stay disabled",
+        "trace-free runtime trace and phase controls stay disabled",
         &metrics
     );
 #else
+    Expect(
+        submit_timestamps_ok,
+        "all Submit timing markers are valid",
+        &metrics
+    );
     Expect(lifecycle_timestamps_ok, "all lifecycle timing markers are valid", &metrics);
 #endif
     Expect(final_barrier_shape_valid, "final barrier selector is valid", &metrics);
@@ -6359,24 +6403,35 @@ inline Metrics Validate(
         );
     }
 
-    if (first_submit != UINT64_MAX && last_submit >= first_submit) {
-        // 性能口径只覆盖最早 Submit.begin 到最晚 Submit.end，不含启动屏障、最终 drain 和 host 同步。
-        metrics.submit_span_us = static_cast<double>(last_submit - first_submit) / 1000.0;
-    }
 #if PA_BUILD_PERF_CLOCK
+    if (first_submit != UINT64_MAX &&
+        last_final_drain_end >= first_submit) {
+        metrics.submit_to_final_drain_us =
+            static_cast<double>(
+                last_final_drain_end - first_submit
+            ) / 1000.0;
+    }
     std::printf(
-        "[PERF-CLOCK] run=%u global_start_tick=%llu global_end_tick=%llu "
-        "global_span_ticks=%llu scope=first-submit-begin-to-last-submit-end\n",
+        "[PERF-E2E] run=%u global_start_tick=%llu "
+        "global_end_tick=%llu global_span_ticks=%llu "
+        "scope=first-submit-begin-to-final-drain-end\n",
         run,
         static_cast<unsigned long long>(first_submit),
-        static_cast<unsigned long long>(last_submit),
+        static_cast<unsigned long long>(last_final_drain_end),
         static_cast<unsigned long long>(
-            first_submit == UINT64_MAX || last_submit < first_submit
+            first_submit == UINT64_MAX ||
+                    last_final_drain_end < first_submit
                 ? 0
-                : last_submit - first_submit
+                : last_final_drain_end - first_submit
         )
     );
 #else
+    if (first_submit != UINT64_MAX && last_submit >= first_submit) {
+        metrics.submit_span_us =
+            static_cast<double>(
+                last_submit - first_submit
+            ) / 1000.0;
+    }
     if (first_startup_begin != UINT64_MAX && last_startup_end >= first_startup_begin &&
         first_final_begin != UINT64_MAX && last_final_release >= first_final_begin &&
         last_final_end >= first_final_begin && last_final_end >= first_startup_begin) {
@@ -6402,8 +6457,17 @@ inline Metrics Validate(
     );
 #endif
     std::printf(
-        "[METRIC] run=%u submit_span_us=%.3f host_launch_us=%.3f claims=%llu fanin_loads=%llu cas_retries=%llu\n", run,
-        metrics.submit_span_us, host_us, static_cast<unsigned long long>(claims),
+#if PA_BUILD_PERF_CLOCK
+        "[METRIC] run=%u submit_to_final_drain_us=%.3f "
+        "host_launch_us=%.3f "
+        "claims=%llu fanin_loads=%llu cas_retries=%llu\n",
+        run, metrics.submit_to_final_drain_us, host_us,
+#else
+        "[METRIC] run=%u submit_span_us=%.3f host_launch_us=%.3f "
+        "claims=%llu fanin_loads=%llu cas_retries=%llu\n",
+        run, metrics.submit_span_us, host_us,
+#endif
+        static_cast<unsigned long long>(claims),
         static_cast<unsigned long long>(fanin_loads), static_cast<unsigned long long>(cas_retries)
     );
     const uint64_t submit_completion_ops =

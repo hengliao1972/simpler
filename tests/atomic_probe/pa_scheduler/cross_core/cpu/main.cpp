@@ -392,6 +392,7 @@ int main(int argc, char **argv) {
     }
     auto *trace_header = static_cast<pa_scheduler::TraceHeader *>(trace_memory);
     std::vector<double> spans;
+    std::vector<double> submit_to_final_drain_spans;
     std::vector<double> startup_barrier_spans;
     std::vector<double> final_barrier_spans;
     std::vector<double> final_drain_spans;
@@ -526,7 +527,7 @@ int main(int argc, char **argv) {
             perf_clock_read_shape_ok.load(std::memory_order_relaxed) &&
             perf_clock_reads.load(std::memory_order_relaxed) == 2U * pa_scheduler::kWorkers;
         std::printf(
-            "[PERF-CLOCK] perf_boundary_reads_per_worker=2 "
+            "[PERF-E2E] perf_boundary_reads_per_worker=2 "
             "perf_boundary_total_reads=%u expected=%u status=%s\n",
             perf_clock_reads.load(std::memory_order_relaxed),
             2U * pa_scheduler::kWorkers,
@@ -542,6 +543,9 @@ int main(int argc, char **argv) {
         all_passed &= perf_clock_reads_ok;
 #endif
         spans.push_back(metrics.submit_span_us);
+        submit_to_final_drain_spans.push_back(
+            metrics.submit_to_final_drain_us
+        );
         startup_barrier_spans.push_back(metrics.startup_barrier_span_us);
         final_barrier_spans.push_back(metrics.final_barrier_span_us);
         final_drain_spans.push_back(metrics.final_drain_span_us);
@@ -596,20 +600,26 @@ int main(int argc, char **argv) {
 
     // host 准入可以在第一个 worker 启动前拒绝本轮，此时没有可统计样本。
     // 显式输出 0 和 completed_runs=0，避免把空 vector 交给 Median()。
-    const double median_submit_span_us =
-        spans.empty() ? 0.0 : pa_scheduler::host::Median(spans);
 #if PA_BUILD_PERF_CLOCK
+    const double median_submit_to_final_drain_us =
+        submit_to_final_drain_spans.empty()
+            ? 0.0
+            : pa_scheduler::host::Median(
+                  submit_to_final_drain_spans
+              );
     std::printf(
         "[SUMMARY] runs=%u completed_runs=%zu final_shape=%s "
-        "median_submit_span_us=%.3f "
+        "median_submit_to_final_drain_us=%.3f "
         "lifecycle_timing=disabled semantic_status=%s postprocess_status=%s\n",
-        options.runs, spans.size(),
+        options.runs, submit_to_final_drain_spans.size(),
         pa_scheduler::host::FinalBarrierShapeName(options.final_barrier_shape),
-        median_submit_span_us,
+        median_submit_to_final_drain_us,
         all_passed ? "PASS" : "FAIL",
         postprocess_ok ? "PASS" : "FAIL"
     );
 #else
+    const double median_submit_span_us =
+        spans.empty() ? 0.0 : pa_scheduler::host::Median(spans);
     const double median_startup_barrier_us =
         startup_barrier_spans.empty()
             ? 0.0

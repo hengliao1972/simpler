@@ -1713,8 +1713,8 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 #elif PA_BUILD_PERF_CLOCK
-    // perf-clock 是唯一决定候选净性能的低扰动构建。它只允许完整
-    // Submit 首尾边界，不能借运行时参数重新打开泳道、atomic、PMU
+    // perf-clock 是低扰动的无泳道端到端构建，只保留首个 Submit 与
+    // FinalDrain 结束两个边界。运行时不能重新打开泳道、atomic、PMU
     // 或 phase-profile。
     if (pmu_options.mode != pa_scheduler::ccec_pmu::WindowMode::Off ||
         !pmu_options.json_path.empty()) {
@@ -1886,6 +1886,7 @@ int main(int argc, char **argv) {
     std::unique_ptr<pa_scheduler::SchedulerState> state(new pa_scheduler::SchedulerState);
     pa_scheduler::TraceHeader trace_header{};
     std::vector<double> spans;
+    std::vector<double> submit_to_final_drain_spans;
     std::vector<double> startup_barrier_spans;
     std::vector<double> final_barrier_spans;
     std::vector<double> final_drain_spans;
@@ -2204,6 +2205,9 @@ int main(int argc, char **argv) {
         );
         all_passed &= pmu_passed;
         spans.push_back(metrics.submit_span_us);
+        submit_to_final_drain_spans.push_back(
+            metrics.submit_to_final_drain_us
+        );
         startup_barrier_spans.push_back(metrics.startup_barrier_span_us);
         final_barrier_spans.push_back(metrics.final_barrier_span_us);
         final_drain_spans.push_back(metrics.final_drain_span_us);
@@ -2268,20 +2272,28 @@ int main(int argc, char **argv) {
         }
     }
 
-    const double median_submit_span_us = spans.empty() ? 0.0 : pa_scheduler::host::Median(spans);
 #if PA_BUILD_PERF_CLOCK
+    const double median_submit_to_final_drain_us =
+        submit_to_final_drain_spans.empty()
+            ? 0.0
+            : pa_scheduler::host::Median(
+                  submit_to_final_drain_spans
+              );
     std::printf(
         "[SUMMARY] runs=%u completed_runs=%zu final_shape=%s "
-        "median_submit_span_us=%.3f lifecycle_timing=disabled "
+        "median_submit_to_final_drain_us=%.3f "
+        "lifecycle_timing=disabled "
         "execution_status=%s semantic_status=%s postprocess_status=%s\n",
-        options.runs, spans.size(),
+        options.runs, submit_to_final_drain_spans.size(),
         pa_scheduler::host::FinalBarrierShapeName(options.final_barrier_shape),
-        median_submit_span_us,
+        median_submit_to_final_drain_us,
         execution_ok ? "PASS" : "FAIL",
         all_passed ? "PASS" : "FAIL",
         postprocess_ok ? "PASS" : "FAIL"
     );
 #else
+    const double median_submit_span_us =
+        spans.empty() ? 0.0 : pa_scheduler::host::Median(spans);
     const double median_startup_barrier_us =
         startup_barrier_spans.empty() ? 0.0 : pa_scheduler::host::Median(startup_barrier_spans);
     const double median_final_barrier_us =

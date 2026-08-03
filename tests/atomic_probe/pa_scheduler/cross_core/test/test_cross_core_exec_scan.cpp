@@ -380,7 +380,12 @@ WorkerState &PrepareWorker(
     worker.core_idx = static_cast<int32_t>(worker_id);
     worker.role = role;
     worker.sub_block_id = static_cast<int32_t>(worker_id & 1U);
-    ResetExecutionToken(state.exec_tokens[worker_id]);
+    for (uint32_t token_slot = 0;
+         token_slot < kExecTokensPerWorker; ++token_slot) {
+        ResetExecutionToken(
+            state.exec_tokens[worker_id][token_slot]
+        );
+    }
     return worker;
 }
 
@@ -678,7 +683,7 @@ void TestOpportunisticProgressLocalGate() {
         );
 
     // token 活跃时，即使下一个候选尚未进入已 Close 前缀也不得跳过。
-    state->exec_tokens[kWorker].control.phase =
+    state->exec_tokens[kWorker][0].control.phase =
         ExecTokenPhase::WaitingFanin;
     all_ok &= CrossCoreExecHasLocalProgressWork(
         state, kWorker, kRole, /*replay_closed_exclusive=*/1, stats
@@ -1562,7 +1567,7 @@ void TestDeterministicClaimLossIsNormal() {
     );
     all_ok &= progressed == 0 &&
         CrossCoreExecCandidateBitmapEmpty(stats) &&
-        CrossCoreExecTokenFullyReset(state->exec_tokens[primary]) &&
+        CrossCoreExecAllTokensFullyReset(state, primary) &&
         ExecScanTestOps::watched_control_cas_calls == 1 &&
         ExecScanTestOps::invalidate_calls == 0 &&
         ExecScanTestOps::payload_loads == 0 &&
@@ -1824,7 +1829,7 @@ void TestGlobalFatalFaultsActiveTokens() {
                 DrainPlace::EfDrain, stats
             );
             all_cases_ok &=
-                state->exec_tokens[executor].control.phase ==
+                state->exec_tokens[executor][0].control.phase ==
                     ExecTokenPhase::WaitingFanin &&
                 DecodeExecState(
                     state->exec_cells[kTask].control.state
@@ -1840,7 +1845,7 @@ void TestGlobalFatalFaultsActiveTokens() {
                     DrainPlace::EfDrain, stats
                 );
             all_cases_ok &= opportunistic_progress == 0 &&
-                state->exec_tokens[executor].control.phase ==
+                state->exec_tokens[executor][0].control.phase ==
                     ExecTokenPhase::WaitingFanin &&
                 DecodeExecState(
                     state->exec_cells[kTask].control.state
@@ -1856,7 +1861,7 @@ void TestGlobalFatalFaultsActiveTokens() {
                     DrainPlace::FinalDrain, stats
                 );
             all_cases_ok &= final_progress == 0 &&
-                state->exec_tokens[executor].control.phase ==
+                state->exec_tokens[executor][0].control.phase ==
                     ExecTokenPhase::Faulted &&
                 DecodeExecState(
                     state->exec_cells[kTask].control.state
@@ -1891,7 +1896,7 @@ void TestGlobalFatalFaultsActiveTokens() {
             );
             LocalStats stats{};
             InitLocalStats(stats, executor, CoreRole::Aic);
-            ExecutionToken &token = state->exec_tokens[executor];
+            ExecutionToken &token = state->exec_tokens[executor][0];
             const ExecClaimResult claim =
                 ClaimAndBindExecPayload<ExecScanTestOps>(
                     state->exec_cells[kTask], kTask, executor,
@@ -1995,7 +2000,7 @@ void TestGlobalFatalStopsIrreversibleBoundaries() {
                 DecodeExecState(
                     state->exec_cells[kTask].control.state
                 ).phase == ExecPhase::Built &&
-                state->exec_tokens[executor].control.phase ==
+                state->exec_tokens[executor][0].control.phase ==
                     ExecTokenPhase::Idle &&
                 CandidateBitForTask(
                     stats, executor, CoreRole::Aic, kTask
@@ -2055,7 +2060,7 @@ void TestGlobalFatalStopsIrreversibleBoundaries() {
                 DecodeExecState(
                     state->exec_cells[kTask].control.state
                 ).phase == ExecPhase::Claimed &&
-                state->exec_tokens[executor].control.phase ==
+                state->exec_tokens[executor][0].control.phase ==
                     ExecTokenPhase::Faulted &&
                 ExecScanTestOps::watched_control_cas_calls == 1 &&
                 ExecScanTestOps::execute_calls == 0 &&
@@ -2111,7 +2116,7 @@ void TestGlobalFatalStopsIrreversibleBoundaries() {
                 DecodeExecState(
                     state->exec_cells[kTask].control.state
                 ).phase == ExecPhase::Claimed &&
-                state->exec_tokens[executor].control.phase ==
+                state->exec_tokens[executor][0].control.phase ==
                     ExecTokenPhase::Faulted &&
                 ExecScanTestOps::watched_control_cas_calls == 1 &&
                 ExecScanTestOps::execute_calls == 1 &&
@@ -2146,9 +2151,9 @@ void TestBusyTokenResumesScanning() {
                 *state, 3, TaskKind::Pv, 3
             ) &&
             PublishKernelCell(
-                *state, 4, 40, TaskKind::Up, {2, 3, 0}
+                *state, 4, 40, TaskKind::Up, {0, 3, 0}
             ),
-        kTest, "publish blocked SF and later UP"
+        kTest, "publish blocked SF and independent ready UP"
     );
     const uint32_t executor = 36;
     WorkerState &worker = PrepareWorker(
@@ -2169,20 +2174,23 @@ void TestBusyTokenResumesScanning() {
             DrainPlace::EfDrain, stats
         );
     Check(
-        first == 0 && stats.exec_candidate_slot == 1 &&
-            CandidateBitForTask(
-                stats, executor, CoreRole::Aiv, 4
-            ) &&
-            state->exec_tokens[executor].control.phase ==
+        first == 1 && stats.exec_candidate_slot == 2 &&
+            CrossCoreExecCandidateBitmapEmpty(stats) &&
+            state->exec_tokens[executor][0].control.phase ==
                 ExecTokenPhase::WaitingFanin &&
+            state->exec_tokens[executor][1].control.phase ==
+                ExecTokenPhase::Idle &&
             DecodeExecState(
                 state->exec_cells[2].control.state
             ).phase == ExecPhase::Claimed &&
             DecodeExecState(
                 state->exec_cells[4].control.state
-            ).phase == ExecPhase::Built &&
-            ExecScanTestOps::execute_calls == 0 && NoFatal(*state),
-        kTest, "busy token pauses before later candidate task"
+            ).phase == ExecPhase::Done &&
+            ExecScanTestOps::execute_calls == 1 &&
+            ExecScanTestOps::executed_tasks[0] == 4 &&
+            NoFatal(*state),
+        kTest,
+        "slot0 blocked while slot1 claims and immediately executes ready work"
     );
     const uint32_t still_blocked =
         ProgressCrossCoreExec<ExecScanTestOps>(
@@ -2190,9 +2198,9 @@ void TestBusyTokenResumesScanning() {
             DrainPlace::EfDrain, stats
         );
     Check(
-        still_blocked == 0 && stats.exec_candidate_slot == 1 &&
-            ExecScanTestOps::execute_calls == 0 && NoFatal(*state),
-        kTest, "repeated fanin poll keeps candidate cursor"
+        still_blocked == 0 && stats.exec_candidate_slot == 2 &&
+            ExecScanTestOps::execute_calls == 1 && NoFatal(*state),
+        kTest, "repeated fanin poll preserves the blocked first token"
     );
 
     __atomic_store_n(
@@ -2204,13 +2212,12 @@ void TestBusyTokenResumesScanning() {
             DrainPlace::EfDrain, stats
         );
     Check(
-        resumed == 2 && stats.exec_candidate_slot == 2 &&
+        resumed == 1 && stats.exec_candidate_slot == 2 &&
             CrossCoreExecCandidateBitmapEmpty(stats) &&
-            state->exec_tokens[executor].control.phase ==
-                ExecTokenPhase::Idle &&
+            CrossCoreExecAllTokensFullyReset(state, executor) &&
             ExecScanTestOps::execute_calls == 2 &&
-            ExecScanTestOps::executed_tasks[0] == 2 &&
-            ExecScanTestOps::executed_tasks[1] == 4 &&
+            ExecScanTestOps::executed_tasks[0] == 4 &&
+            ExecScanTestOps::executed_tasks[1] == 2 &&
             DecodeExecState(
                 state->exec_cells[2].control.state
             ).phase == ExecPhase::Done &&
@@ -2218,13 +2225,13 @@ void TestBusyTokenResumesScanning() {
                 state->exec_cells[4].control.state
             ).phase == ExecPhase::Done &&
             NoFatal(*state),
-        kTest, "ready token completes before later task is claimed"
+        kTest, "the formerly blocked first token completes after its fanin"
     );
     std::printf("[PASS] %s\n", kTest);
 }
 
-void TestBusyCandidateDoesNotBlockPeerClaim() {
-    constexpr const char *kTest = "busy-candidate-peer-claim";
+void TestBusyCandidateUsesSecondToken() {
+    constexpr const char *kTest = "busy-candidate-second-token";
     constexpr uint32_t kBusyTask = 3;
     constexpr uint32_t kNewTask = 35;
     uint32_t primary = kExecUnboundOwner;
@@ -2247,10 +2254,7 @@ void TestBusyCandidateDoesNotBlockPeerClaim() {
     WorkerState &busy_worker = PrepareWorker(
         *state, primary, CoreRole::Aic
     );
-    WorkerState &peer_worker = PrepareWorker(
-        *state, secondary, CoreRole::Aic
-    );
-    ExecutionToken &busy_token = state->exec_tokens[primary];
+    ExecutionToken &busy_token = state->exec_tokens[primary][0];
     const ExecClaimResult busy_claim =
         ClaimAndBindExecPayload<ExecScanTestOps>(
             state->exec_cells[kBusyTask], kBusyTask, primary,
@@ -2263,15 +2267,19 @@ void TestBusyCandidateDoesNotBlockPeerClaim() {
         busy_token.control.phase == ExecTokenPhase::WaitingFanin;
 
     LocalStats busy_stats{};
-    LocalStats peer_stats{};
     InitLocalStats(busy_stats, primary, CoreRole::Aic);
-    InitLocalStats(peer_stats, secondary, CoreRole::Aic);
-    all_ok &= RegisterLocalCandidate(
-                  busy_stats, kNewTask, TaskKind::Qk
+    uint32_t new_candidate_slot = kCrossCoreExecMaxCandidateSlots;
+    all_ok &= CrossCoreExecPotentialSlotForTask(
+                  primary, CoreRole::Aic, kNewTask,
+                  new_candidate_slot
               ) &&
         RegisterLocalCandidate(
-            peer_stats, kNewTask, TaskKind::Qk
+            busy_stats, kNewTask, TaskKind::Qk
         );
+    // kBusyTask 由本测试直接绑定到 token0，没有经过 scanner；因此把
+    // owner-local cursor 定位到随后登记的 kNewTask，避免重访自己的
+    // CLAIMED cell 冒充正常调度交错。
+    busy_stats.exec_candidate_slot = new_candidate_slot;
     ExecScanTestOps::ResetObservations();
     ExecScanTestOps::WatchControl(
         &state->exec_cells[kNewTask].control.state
@@ -2282,52 +2290,117 @@ void TestBusyCandidateDoesNotBlockPeerClaim() {
             /*production_closed=*/false,
             DrainPlace::EfDrain, busy_stats
         );
-    const bool busy_did_not_touch_new_cell =
-        busy_progress == 0 &&
-        ExecScanTestOps::watched_control_loads == 0 &&
-        ExecScanTestOps::watched_control_cas_calls == 0 &&
-        CandidateBitForTask(
-            busy_stats, primary, CoreRole::Aic, kNewTask
-        );
-    bool peer_completed_grace = true;
-    for (uint8_t deferred = 0;
-         deferred < kCrossCoreExecFallbackGraceProgresses;
-         ++deferred) {
-        const uint32_t peer_deferred =
-            ProgressCrossCoreExec<ExecScanTestOps>(
-                state, peer_worker, kNewTask + 1U,
-                /*production_closed=*/false,
-                DrainPlace::EfDrain, peer_stats
-            );
-        peer_completed_grace &=
-            peer_deferred == 0 &&
-            CandidateBitForTask(
-                peer_stats, secondary, CoreRole::Aic, kNewTask
-            ) &&
-            peer_stats.exec_fallback_defer_count == deferred + 1U &&
-            ExecScanTestOps::watched_control_cas_calls == 0;
-    }
-    const uint32_t peer_progress =
-        ProgressCrossCoreExec<ExecScanTestOps>(
-            state, peer_worker, kNewTask + 1U,
-            /*production_closed=*/false,
-            DrainPlace::EfDrain, peer_stats
-        );
     const DecodedExecState done = DecodeExecState(
         state->exec_cells[kNewTask].control.state
     );
-    all_ok &= busy_did_not_touch_new_cell && peer_completed_grace &&
-        peer_progress == 1 &&
-        CrossCoreExecCandidateBitmapEmpty(peer_stats) &&
+    all_ok &= busy_progress == 1 &&
+        CrossCoreExecCandidateBitmapEmpty(busy_stats) &&
         busy_token.control.phase == ExecTokenPhase::WaitingFanin &&
+        state->exec_tokens[primary][1].control.phase ==
+            ExecTokenPhase::Idle &&
+        busy_stats.max_occupied == 2 &&
         ExecScanTestOps::watched_control_loads != 0 &&
         ExecScanTestOps::watched_control_cas_calls != 0 &&
         ExecScanTestOps::execute_calls == 1 &&
         done.valid && done.phase == ExecPhase::Done &&
-        done.execute_owner == secondary && NoFatal(*state);
+        done.execute_owner == primary && NoFatal(*state);
     Check(
         all_ok, kTest,
-        "busy primary performs no new-cell access and fallback claims after one yield"
+        "one occupied token does not prevent Claim into the second token"
+    );
+    std::printf("[PASS] %s\n", kTest);
+}
+
+void TestTwoBlockedTokensStopClaimButPermitBuild() {
+    constexpr const char *kTest =
+        "two-blocked-tokens-stop-claim-permit-build";
+    constexpr uint32_t kExecutor = 36;
+    constexpr uint32_t kFirstTask = 2;
+    constexpr uint32_t kSecondTask = 4;
+    constexpr uint32_t kThirdTask = 66;
+    MappedSchedulerState mapping;
+    SchedulerState *state = mapping.Get();
+    Check(state != nullptr, kTest, "state mapping");
+    if (state == nullptr) return;
+
+    state->tasks[0].flag = 1;
+    state->tasks[3].flag = 1;
+    bool all_ok =
+        PublishKernelCell(
+            *state, kFirstTask, 34, TaskKind::Sf, {1}
+        ) &&
+        PublishKernelCell(
+            *state, kSecondTask, 40, TaskKind::Up,
+            {2, 3, 0}
+        ) &&
+        PublishKernelCell(
+            *state, kThirdTask, 34, TaskKind::Sf, {0}
+        );
+    WorkerState &worker = PrepareWorker(
+        *state, kExecutor, CoreRole::Aiv
+    );
+    LocalStats stats{};
+    InitLocalStats(stats, kExecutor, CoreRole::Aiv);
+    all_ok &= RegisterLocalCandidate(
+                  stats, kFirstTask, TaskKind::Sf
+              ) &&
+        RegisterLocalCandidate(
+            stats, kSecondTask, TaskKind::Up
+        ) &&
+        RegisterLocalCandidate(
+            stats, kThirdTask, TaskKind::Sf
+        );
+    ExecScanTestOps::ResetObservations();
+
+    const uint32_t first_progress =
+        ProgressCrossCoreExec<ExecScanTestOps>(
+            state, worker, kThirdTask + 1U,
+            /*production_closed=*/false,
+            DrainPlace::EfDrain, stats
+        );
+    const uint32_t not_ready_after_claim =
+        stats.result.fanin_not_ready_loads;
+    ExecScanTestOps::WatchControl(
+        &state->exec_cells[kThirdTask].control.state
+    );
+    const uint32_t second_progress =
+        ProgressCrossCoreExec<ExecScanTestOps>(
+            state, worker, kThirdTask + 1U,
+            /*production_closed=*/false,
+            DrainPlace::EfDrain, stats
+        );
+    const SharedBuildTicketResult build_ticket =
+        TakeSharedBuildTicket<ExecScanTestOps>(
+            state, kThirdTask + 1U, stats
+        );
+
+    all_ok &= first_progress == 0 && second_progress == 0 &&
+        stats.exec_candidate_slot == 2 &&
+        CandidateBitForTask(
+            stats, kExecutor, CoreRole::Aiv, kThirdTask
+        ) &&
+        state->exec_tokens[kExecutor][0].control.phase ==
+            ExecTokenPhase::WaitingFanin &&
+        state->exec_tokens[kExecutor][1].control.phase ==
+            ExecTokenPhase::WaitingFanin &&
+        DecodeExecState(
+            state->exec_cells[kFirstTask].control.state
+        ).phase == ExecPhase::Claimed &&
+        DecodeExecState(
+            state->exec_cells[kSecondTask].control.state
+        ).phase == ExecPhase::Claimed &&
+        DecodeExecState(
+            state->exec_cells[kThirdTask].control.state
+        ).phase == ExecPhase::Built &&
+        not_ready_after_claim >= 2 &&
+        ExecScanTestOps::watched_control_loads == 0 &&
+        ExecScanTestOps::watched_control_cas_calls == 0 &&
+        stats.max_occupied == 2 &&
+        build_ticket.status == SharedBuildTicketStatus::Acquired &&
+        build_ticket.task_id == 0 && NoFatal(*state);
+    Check(
+        all_ok, kTest,
+        "full token capacity blocks a third Claim but not the outer Build ticket"
     );
     std::printf("[PASS] %s\n", kTest);
 }
@@ -2400,9 +2473,7 @@ void TestFinalDrainClosesLastTask() {
             CrossCoreExecWorkerDrained(
                 state, worker, 5, stats
             ) &&
-            CrossCoreExecTokenFullyReset(
-                state->exec_tokens[executor]
-            ) &&
+            CrossCoreExecAllTokensFullyReset(state, executor) &&
             ValidateCrossCoreExecTerminalCells<ExecScanTestOps>(
                 state, 5, first_bad_task
             ) &&
@@ -2490,7 +2561,8 @@ int main() {
     TestGlobalFatalFaultsActiveTokens();
     TestGlobalFatalStopsIrreversibleBoundaries();
     TestBusyTokenResumesScanning();
-    TestBusyCandidateDoesNotBlockPeerClaim();
+    TestBusyCandidateUsesSecondToken();
+    TestTwoBlockedTokensStopClaimButPermitBuild();
     TestFinalDrainClosesLastTask();
 
     if (g_failures != 0) {

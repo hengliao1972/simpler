@@ -28,7 +28,8 @@ Usage:
 本目录固定为 cross-core shared TensorMap PA：
   - 不接受 private/shared 模式参数；
   - 不构建 AscendC；
-  - 首阶段只保留 swimlane 与 perf-clock，不提供 submit-PMU。
+  - 首阶段只保留 swimlane 与无泳道端到端构建，不提供 submit-PMU；
+  - perf-clock 是现有命令名，唯一结果覆盖首个 Submit 到 FinalDrain 结束。
 
 常用 benchmark 参数：
   --device N

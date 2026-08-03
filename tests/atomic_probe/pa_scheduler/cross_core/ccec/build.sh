@@ -210,8 +210,11 @@ SPLIT_STATE_STORAGE_BYTES=1728
 # 均为 3 条。五种 kind 是否完整覆盖由 dispatch switch 和 CPU 动态协议
 # 测试证明；这里精确锁定当前每种产物的真实代码形状，防止 finish 被
 # 内联/删除，又不把 CCEC 对等尾部的有益合并误判成覆盖缺失。
-SPLIT_FINISH_CALL_SITES_PERF_CLOCK=3
-SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC=3
+SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC=2
+SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIV=3
+# 两 token 让 full-swimlane AIC 的五类 Build dispatch 不再被编译器
+# 尾合并成三个调用点；仍逐一要求它们只指向本角色的唯一 finish 符号。
+SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC=5
 SPLIT_FINISH_CALL_SITES_SWIMLANE_AIV=3
 COMMON_FLAGS+=(
     -mllvm -cce-block-local-relocate=true
@@ -284,7 +287,11 @@ check_split_role_objects() {
     local wrong_role="$2"
     local expected_finish_call_sites
     if [[ "$BUILD_VARIANT" == "perf-clock" ]]; then
-        expected_finish_call_sites="$SPLIT_FINISH_CALL_SITES_PERF_CLOCK"
+        if [[ "$role" == "aic" ]]; then
+            expected_finish_call_sites="$SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC"
+        else
+            expected_finish_call_sites="$SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIV"
+        fi
     elif [[ "$role" == "aic" ]]; then
         expected_finish_call_sites="$SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC"
     else

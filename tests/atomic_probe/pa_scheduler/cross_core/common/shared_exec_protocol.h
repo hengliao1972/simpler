@@ -53,6 +53,10 @@ constexpr uint32_t kExecGlobalContextBytes = 4;
 constexpr uint32_t kExecDispatchBindingBytes = 512;
 constexpr uint32_t kExecDispatchLocalContextIndex = 48;
 constexpr uint32_t kExecDispatchGlobalContextIndex = 49;
+// 当前调度模型允许同一个 Scalar 同时保存两个已领取、尚未完成的 task。
+// 容量先作为协议常量固定为 2；以后若参数化，必须重新验证状态大小、
+// FinalDrain 和“容量满时不再 Claim”的边界。
+constexpr uint32_t kExecTokensPerWorker = 2;
 
 static_assert(
     kExecTensorDescBytes % sizeof(uint64_t) == 0,
@@ -69,6 +73,10 @@ static_assert(
         kExecDispatchGlobalContextIndex + 1 ==
             kExecDispatchArgCount,
     "dispatch argument indexes no longer match payload capacity"
+);
+static_assert(
+    kExecTokensPerWorker == 2,
+    "the first Claim-first implementation requires exactly two tokens"
 );
 
 enum class ExecPhase : uint8_t {

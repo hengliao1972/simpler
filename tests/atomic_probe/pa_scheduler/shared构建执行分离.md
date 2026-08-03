@@ -5,14 +5,15 @@
 | 项目 | 状态 |
 | ---- | ---- |
 | 目标 | 让 task 的构建 owner 与 kernel 执行 owner 可以是不同物理核 |
-| 当前代码 | Build owner 发布 task-indexed shared payload，K2 排除 Build owner 后的 1 或 2 个 eligible executor 竞争执行 |
+| 当前代码 | 96 Scalar 通过中央 ticket 恰好一次 Build；Build owner 发布 task-indexed shared payload，K2 排除 Build owner 后的 1 或 2 个 eligible executor 竞争执行 |
 | 本文性质 | 持续更新的架构与内存模型设计记录 |
-| 正式实现 | S0–S5b 已通过 CPU/CCEC/A5；当前五类 task 均允许全 96 Scalar Build，kernel 仍由 K2 异核 Execute |
+| 正式实现 | S0–S6.21 已形成中央 ticket + 严格 TensorMap 插入 + K2 异核 Execute；descriptor 引用和 unique-ticket 单 CAS 两个回退候选均已撤销 |
 | CPU 正确性用例 | S1–S4 K2、S5a 对侧角色 Build 与 S5b 全 96 Scalar Build 门槛已完成 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
-| A5 PA 功能/性能 | S5b 十轮 perf-clock 中位 27.496 ms；S6.1 为 9.078 ms；S6.2 为 7.304 ms；S6.3 将未 ready fanin 轮询移出集中式 fatal 读取后十轮中位 3.644 ms、full-swimlane 3.844 ms；最终目标为同口径不高于 1.0 ms |
+| A5 PA 功能/性能 | 旧 `2.323 ms` 是 Submit-only 数字，已退出性能裁决；同底座过渡性端到端对照为单 token `9.345 ms`、双 token `5.881 ms`。唯一端到端口径的 B256 首轮复核为 `5.969 ms`，但该轮未加设备锁，不作为稳定基线 |
 | S4 动态 Execute election | K2 首版已通过 CPU B1/B256 和 A5 B1/B256；B256 中两候选都有实际胜出，非法 owner 为 0 |
 | S5 Build 拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 五类 task 全 96/G8 已通过 CPU/CCEC/A5 B1/B256，物理 Claim CAS 精确闭合 |
+| 当前调度缺口 | 每核只在领取 Build ticket 前机会式推进一次 Execute，大量已 Build kernel 滞留 FinalDrain；下一步先补 ready/backlog/扫描成本基础数据，再决定发现结构 |
 | 明确非目标 | 不引入 `try_wait`、engine continuation 或“kernel 运行期间同一 Scalar 继续调度” |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
@@ -116,11 +117,11 @@ Build 和 Execute 虽然在时间上分离，但仍绑定同一个物理 worker�
 | payload publication | `built` 可早于 payload 填充，因为只有本核读 | payload 全部写完并 `FlushRegion()` 后才 atomic 发布 `BUILT` |
 | payload acquire | 无跨核 acquire | Execute owner 先取得所有权，再 invalidate payload，最后 ordinary load |
 | `args/context` | Build 时直接指向本核 slot/context | portable payload 不带 builder 私有指针；executor 在本地重建 |
-| fanin 执行期状态 | `SlotReady()` 可原地压缩本核 private fanin | shared payload 在 `BUILT` 后不可变；首版每核只有一个紧凑 execution token，压缩/游标只放该 token |
+| fanin 执行期状态 | `SlotReady()` 可原地压缩本核 private fanin | shared payload 在 `BUILT` 后不可变；当前每核固定两个紧凑 execution token，压缩/游标只放对应 token |
 | completion vend | shared Materialize 把 `reservation.aggregate_vend` 写入 Build owner 的 `worker.heap_next`，同核 `CompleteTask()` 随后消费 | Build 时冻结 task 的 completion-vend 快照并显式随 payload 交接；不得读 executor 的 `heap_next` |
 | Execute exactly-once | 隐含由同一 Claim winner 保证 | 先用单一指定 executor + atomic phase transition 验证，再单独加多候选仲裁 |
 | cell 生命周期 | 本核 `occupied_count` 与 private ring 回收 | 首版 task-indexed 且单轮不复用；后续环形复用才引入 generation/reclaim |
-| FinalDrain | 所有 replay actor 停产 + 本核 private slot 为空 | 还要证明所有 kernel cell 已 DONE、每核 execution token 为 IDLE、engine 无 in-flight |
+| FinalDrain | 所有 replay actor 停产 + 本核 private slot 为空 | 还要证明所有 kernel cell 已 DONE、每核两个 execution token 均为 IDLE、engine 无 in-flight |
 | Build 候选核 | 当前与 task 核型拓扑绑定 | 首版不改；扩大到所有 Scalar 是后续独立性能阶段 |
 
 completion vend 是 heap 进度快照，不是 output 数据地址或内存所有权 token。真正的 output 地址已经在 `TensorDesc` 中，executor 对该 GM 区域执行 kernel。
@@ -137,7 +138,7 @@ completion vend 是 heap 进度快照，不是 output 数据地址或内存所�
 | 使用 shared payload 本身的代价 | S3a task-indexed cell，仍映射给 Build owner | 正确性不变，单独量出 publication/copy 税 |
 | 真正跨核的 args/context/vend/fanin 交接 | S3b 为每个 task 预路由两个兼容候选；每核在实际 Submit 已知 `(task_id, Kind)` 时只登记属于自己的候选任务，再由 Build owner 唯一确定异核 executor | B1/B256 的 task/descriptor/fanin/vend/completion 精确校验全部一致；热发现路径每 task 最多两个 control observer |
 | 多 executor 唯一领取 | S4 动态 election | 先保证恰好一个 executor，再比较 atomic 成本 |
-| executor 本地容量与全局 backlog 解耦 | S0 定义单 execution token，S1/S3 验证忙核不 Claim | 没有空闲 token 时不发射 CAS，task 保持 `BUILT` 并可由其他兼容核领取 |
+| executor 本地容量与全局 backlog 解耦 | S0–S5 先用单 token 闭合协议；S6 当前固定扩为两个 token | 有空 token 才发射 CAS；抢到后立即检查依赖，任一 owner-local ready task 优先执行 |
 | Build owner 扩大到其他 Scalar | S5 独立改候选核拓扑 | 不借助跨核发布的正确性掩盖 Build 角色变化 |
 | 复用、队列和回收 | S6 性能/容量优化 | task-indexed 单轮先闭合；需复用时才引入 generation/ABA 证明 |
 
@@ -192,7 +193,7 @@ args[global_context_index] = &slot.global_context
 代码见 [pa_frontend.h](same_core/common/pa_frontend.h#L1752)。因此有两种完全不同的消费方式：
 
 1. **执行核直接使用同一份共享 slot**：这些绝对地址仍有效，但 slot 在 kernel 完成前不能回收，且 executor 不得修改共享 payload；
-2. **执行核复制 active prefix 到自己唯一的紧凑 execution token**：所有 self-pointer 必须重建，不能原样复制 `args[]`；不为此恢复 4-slot private ring。
+2. **执行核复制 active prefix 到自己的一个紧凑 execution token**：所有 self-pointer 必须重建，不能原样复制 `args[]`；当前每核固定两个 token，但不为此恢复 4-slot private ring。
 
 第一版协议必须明确选一种，不能既复制 payload 又沿用 builder 写出的 self-pointer。
 
@@ -218,12 +219,13 @@ Executor binding：block/lane/sub_block/engine token/local context/workspace
 
 [SlotReady](same_core/common/pa_scheduler_core.h#L564) 在 shared 模式下会把已经 ready 的 fanin 前缀从 private slot 中移除，并修改 `fanin[]/fanin_count`。
 
-共享执行 payload 应在 `BUILT` 后保持不可变，否则 executor 的普通写会形成 dirty cacheline，给后续 DCCI 和复用带来 stale writeback 风险。首版不再建立“每核多个 private pending slot”，而是：
+共享执行 payload 应在 `BUILT` 后保持不可变，否则 executor 的普通写会形成 dirty cacheline，给后续 DCCI 和复用带来 stale writeback 风险。当前不恢复每核 4 个完整 `LocalSlot`，而是采用固定容量为 2 的紧凑领取状态：
 
 - `SharedExecCell[]` 是全局 backlog，未领取任务始终保留在 `BUILT`；
-- 每个 executor 只有一个紧凑 execution token，只在 token 为 `IDLE` 时参与 `BUILT -> CLAIMED`；
-- 领取后把有效 fanin 和执行必要字段一次复制到该 token，在本地压缩或只记 ready-prefix 游标；
-- token 未回到 `IDLE` 前，本 executor 不再领取第二个 task。
+- 每个 executor 固定两个紧凑 execution token；至少一个 token 为 `IDLE` 时才允许参与 `BUILT -> CLAIMED`；
+- Claim winner 领取后把有效 fanin 和执行必要字段一次复制到所选 token，并立即完成第一次 fanin 检查；
+- 第一个 token 未 ready 时允许领取第二个 task；两个 token 都占用时不得发射第三次 Claim；
+- 任一已领取 token ready 时，Execute 优先于新 Claim 和新 Build。
 
 不应直接在共享 payload 上复用现有原地压缩逻辑。
 
@@ -316,7 +318,7 @@ EMPTY
 
 现有 Claim 已经保证唯一 Build owner；`EMPTY -> BUILDING` 首版仍用返回型 CAS 检查，作为重复 builder 的显式正确性门。`BUILT -> CLAIMED` 即使在固定单 executor 阶段也保留 atomic phase transition，但该阶段没有仲裁竞争；它只验证发布与所有权转换。
 
-每个 executor 首版只保留一个本地 execution token。正常主干为 `IDLE -> BINDING -> WAITING_FANIN -> ENGINE_INFLIGHT -> COMPLETING -> VEND_PUBLISHED -> COMPLETION_PUBLISHED -> IDLE`，错误收敛到 `FAULTED`。这些不是新的共享 atomic phase；跨核只需要清晰的 `BUILT`、`CLAIMED` 和 `DONE` 边界。该 token 只保存 task id、有效 payload binding、fanin 游标和 completion 所需的紧凑状态，不是 4,824B `LocalSlot` 的另一份拷贝。
+每个 executor 当前固定保留两个本地 execution token。每个 token 的正常主干均为 `IDLE -> BINDING -> WAITING_FANIN -> ENGINE_INFLIGHT -> COMPLETING -> VEND_PUBLISHED -> COMPLETION_PUBLISHED -> IDLE`，错误收敛到 `FAULTED`。这些不是新的共享 atomic phase；跨核只需要清晰的 `BUILT`、`CLAIMED` 和 `DONE` 边界。每个 token 只保存 task id、有效 payload binding、fanin 游标和 completion 所需的紧凑状态，不是 4,824B `LocalSlot` 的另一份拷贝。
 
 executor 在读取 ordinary payload 之前，就必须知道自己是否兼容、cell 是否对应请求 task，以及需要 invalidate 多少条 line。因此首版 packed atomic state 除 phase/owner 外，还必须随 `BUILT` 一次性发布：
 
@@ -403,7 +405,7 @@ SharedExecCell[task_id]
 - 未使用尾部不必清零，但不得被执行、checksum 或 host 校验当成有效数据；
 - cell stride 必须是 64B 整数倍，一个 cell 的最后一条 payload line 不得与下一 cell 共线。
 
-首版不直接把 4,824B `LocalSlot` 当 shared payload。它只序列化 active prefix，然后由 executor 绑定到自己唯一的紧凑 execution token/context。
+当前实现不直接把 4,824B `LocalSlot` 当 shared payload。它只序列化 active prefix，然后由 executor 绑定到自己的一个紧凑 execution token/context；每核固定两个此类 token。
 
 ### 5.5 默认性能合同：本地准备，GM 只单向经过一次
 
@@ -427,13 +429,13 @@ Build owner:
   -> atomic BUILT
 
 Execute owner:
-  先确认本核 execution token == IDLE
+  先确认本核两个 execution token 中至少一个为 IDLE
   -> 只 poll/CAS atomic control
   -> 取得 CLAIMED 后对完整 payload 调用一次 InvalidateRegion
   -> 执行一次 forward read/copy 到 executor-private binding
   -> 从此只操作 private fanin/context/args
   -> 等待、kernel 和 completion 不再回读 shared payload
-  -> 发布 DONE 后才把 execution token 恢复为 IDLE
+  -> 发布 DONE 后才把对应 execution token 恢复为 IDLE
 ```
 
 这里的“一次 DCCI”指一次**批量发布 helper**：多 line payload 在硬件上仍需要每条 line 一条 DCCI，但中间不夹杂业务读写，末尾只一次 DSB。禁止把 `FlushRegion()` 放入 tensor/scalar/fanin 的字段循环，也禁止“先写 header -> flush -> 再补 count -> 再 flush”。
@@ -444,7 +446,7 @@ Execute owner:
 - 128B `TensorDesc` 等大前缀可以在最终 pack 时从已验证的源地址直接流式复制到最终 GM 位置，不再经过另一份 4KB 级栈镜像；
 - S0 必须记录 staging 结构大小并检查编译后栈框/溢出；“写成栈变量”不能用来掩盖过大本地对象造成的反向回退。
 
-executor-private binding 也必须区分两类：立即 ready 且在当前调用内完成的参数尽量保留在寄存器/栈；需跨 fanin 等待点存活的唯一 execution token 才写 owner-private GM。后者只写紧凑必要字段，不复制整个 4,824B `LocalSlot`，也不扩展为本核多项 pending 列表。
+executor-private binding 也必须区分两类：立即 ready 且在当前调用内完成的参数尽量保留在寄存器/栈；需跨 fanin 等待点存活的两个 execution token 才写 owner-private GM。每个 token 只写紧凑必要字段，不复制整个 4,824B `LocalSlot`，也不扩展为无界 pending 列表。
 
 对应的专项开发门槛：
 
@@ -465,9 +467,9 @@ executor-private binding 也必须区分两类：立即 ready 且在当前调用
 | 策略 | 优点 | 主要问题 |
 | ---- | ---- | -------- |
 | executor 直接从 shared payload dispatch | 少一次 4KB 级复制；self-pointer 可指向稳定 shared 地址 | payload 必须保持到 kernel 完成；mutable context 必须外置；执行侧 DCCI 覆盖较多 line |
-| executor 复制有效前缀到唯一紧凑 token | 执行期状态和 fanin 可本地修改；不继承每核 4 个完整 slot | 必须重建 args 指针；增加一次有效前缀复制；token 占用时不能再领取 |
+| executor 复制有效前缀到两个紧凑 token | 执行期状态和 fanin 可本地修改；第一项未 ready 时可领取第二项 | 必须重建 args 指针并增加一次有效前缀复制；两个 token 都占用时不能再领取 |
 
-第一版更建议“共享 portable payload + 每 executor 一个紧凑 binding”：descriptor/scalar/fanin 只复制 active prefix，`args/local_context/global_context` 由 executor 重建。这样保留现有 `DrainReady()` 的局部执行逻辑，但不把 same-core 的 4-slot ring 带入 cross-core。
+当前建议“共享 portable payload + 每 executor 两个紧凑 binding”：descriptor/scalar/fanin 只复制 active prefix，`args/local_context/global_context` 由 executor 重建。两个 token 是固定有界 admission，不恢复 same-core 的 4-slot ring，也不建立无界任务列表。
 
 ### 5.7 `dc_preload` 的预埋点与边界
 
@@ -490,7 +492,7 @@ Execute owner:
   CAS BUILT -> CLAIMED 成功
   -> InvalidateRegion(payload) 完成
   -> optional preload 后续要读的 shared payload source line
-  -> 预留唯一 execution token、初始化 executor-local context 等独立工作
+  -> 选择一个空闲 execution token、初始化 executor-local context 等独立工作
   -> ordinary copy/read shared payload
 ```
 
@@ -531,38 +533,49 @@ Execute owner:
 
 task-indexed 首版的 cell 容量与 task 数一一对应，不存在设备侧等空槽。后续改成有界 ring 时，才必须在进入 Register 有序段之前预留容量；不能占住 `deps_prepared` 链等 executor 释放 slot。
 
-### 6.2 Execute candidate/owner
+### 6.2 Execute candidate/owner 与调度优先级
+
+`SharedExecCell[]` 已经是 GM 中单轮不复用的全局 Built queue。当前选定的
+调度模型不是 producer-driven Ready queue，也不是 ready-before-Claim；
+executor 先竞争一个已经 `BUILT` 的 task，取得执行所有权并完成 payload
+acquire 后，才检查该 task 的 fanin。每个核当前允许同时持有两个已领取 task，
+槽数以后再参数化，首版固定为 2。
 
 ```text
-1. 先检查本核 execution token == IDLE；非 IDLE 时不扫描、不发射 Claim CAS
-2. 只读取 atomic state，筛选 engine kind 兼容的 BUILT
-3. S3 的唯一指定 executor 执行 CAS BUILT -> CLAIMED(self)
-4. S4 才允许多候选竞争；只有 CAS winner 继续，loser 不接触 payload DCCI
-5. 消费 CAS 返回值，先校验 atomic state 中的 engine_class/payload_lines 上界
-6. 将本核唯一 execution token 绑定到该 task，直到 DONE/fatal 前不再领取其他 task
-7. 调用 InvalidateRegion(payload)
-8. 可选对后续要读的 payload source 发起 dc_preload；不参与正确性
-9. 检查 task/count/function/engine kind 和由 counts 重算的 payload 边界；reuse 版再检查 generation
-10. 一次复制有效字段并重建紧凑 executor-private args/context
-11. 若 fanin 未 ready，token 转为 WAITING_FANIN；本核可继续不需要第二 execution token 的 Scalar 工作，但不再 Claim task
-12. fanin ready 后发射 kernel，token 转为 ENGINE_INFLIGHT
-13. 等待 engine 真正完成
-14. 使用 payload 中的 task id/completion-vend 发布原有 vend/flag
-15. atomic 发布 DONE，然后才将本核 token 恢复为 IDLE
+1. 已领取的 Build ticket 必须完整发布到 BUILT；处理中途不切换角色
+2. 回到调度决策点后，先逐一检查本核两个已占用 execution token
+3. 任一 token 的 fanin ready：立即执行；不得先领取新 task 或 Build ticket
+4. 已占用 token 均未 ready、且仍有空 token：扫描本核 K2-compatible BUILT
+5. 对目标执行 CAS BUILT -> CLAIMED(self)；CAS loser 不占 token
+6. CAS winner 立即 Invalidate/复制完整 payload，重建对应 token 的 binding
+7. 抢到后立刻检查 fanin；不能把首次 ready 检查推迟到下个 Submit
+8. 第一个 token 未 ready 时，允许再抢一个 BUILT task 到第二个 token
+9. 第二个 task 抢到后同样立即检查；随后再次复核两个已占用 token
+10. 只要有一个 token ready，就优先同步执行 kernel 并发布 vend/flag/DONE
+11. 两个 token 都占用且都未 ready，或 Built queue 暂无可抢任务，才领取 Build ticket
+12. Build 完整发布后回到步骤 2；Build 全部停产后继续轮询/执行直到全部 DONE
 ```
 
-`SharedExecCell[]` 本身是 GM 中的全局待执行 task list，不是每核 private ring 的拷贝。没有本地 token 容量时，task 保持 `BUILT`，当前核不得先 Claim 后堆入多项 pending 列表。
+这里的“Execute 优先”存在一个必要的非抢占边界：Scalar 一旦已经取得 Build
+ticket，就必须完成该 task 的 Materialize、严格有序 Register、Fanin/Build 和
+`BUILT` 发布。否则持有 `deps_prepared[N]` 下一棒的 worker 若中途执行较长
+kernel，会把 TensorMap 串行插入链一起拖住。优先级只在**没有未完成 Build
+ticket 的调度决策点**生效。
 
-S3 固定映射阶段必须让每个 executor 按 task id 递增处理自己的映射序列，不允许跳过早期任务去占住唯一 token。这份序列不得通过“96 核各自重建整份 PA plan”事后推导：每核在自己的 Submit 路径中本来就同时拥有 `task_id` 和模板 `Kind`，应在本次 Submit 成功闭合时把候选身份登记到 Scalar 本地紧凑位图/任务号队列。非候选任务只体现为本地空位，不读 GM control，也不保存 batch/offset 重建游标。
+两个 token 都是 executor-private 的已领取上下文；对应 shared cell 已经进入
+`CLAIMED`，不得被其他核重复领取，也不得因暂时未 ready 悄悄退回 `BUILT`。
+每个 token 各自保存 task id、完整 active payload binding 和 fanin ready
+prefix，避免轮询时反复读取已经确认完成的依赖。
 
-S4 首版只在 S3b 已有候选序列内做受控 election，不得直接把
-“随机领取未 ready task”当成通用动态任务池。若后续要从受控
-K2/K3 扩展到广泛动态领取，必须先二选一地闭合活性：
+K2 的 primary/secondary 都保持合法执行资格。首选核宽限若继续保留，只能
+影响谁取得空 token，不能让已经 ready 的 owner-local token 排在 Build 之后。
+CAS loser 必须继续扫描队列或处理本核已有 token，不能把一次竞争失败解释成
+“本核没有 Execute 工作”。
 
-- 提供独立、可验证的 ready summary，使 executor 只对 dependency-ready task 发射 Claim；或
-- 给出不会让全部 token 被未 ready task 占满的容量和推进证明。
-
-首选是 ready summary；没有这份证明前，S4 只做受控任务的 exactly-once election，不宣称已形成通用动态调度器。
+槽数从 1 增到 2 会扩大 owner-private GM token 容量，但不会改变 shared
+payload 的发布协议，也不需要真正 Ready queue、反向 fanout 或 Claim 前的
+额外 payload DCCI。它的主要风险是两个槽同时被未 ready task 占满；首版必须
+用定向交错测试和 A5 占用分布证明 PA 不会因此丢失可执行工作或永久停顿。
 
 ### 6.3 Completion 与生命周期
 
@@ -612,15 +625,74 @@ fresh output cell 由 task 唯一 Build owner 独占，它的 descriptor 发布�
 
 因此，一个简单按 task id 排序的单 FIFO 可能产生 head-of-line blocking。它可以作为第一版正确性模型，但不能未经数据就当最终高性能结构。
 
+### 7.1 当前调度优化的理论边界
+
+在明确不引入 `try_wait`、不让同一个 Scalar 在 kernel 运行期间继续调度的
+前提下，理想完成时间应尽量逼近下面几项的最大值，而不是把它们串行相加：
+
+```text
+max(
+  TensorMap 严格插入关键链，
+  全部 Build Scalar 工作 / 96，
+  全部 AIC kernel 工作 / 32，
+  全部 AIV kernel 工作 / 64，
+  task DAG 关键路径
+)
+```
+
+因此当前候选采用有界 admission 的 work-conserving list scheduling：每个
+兼容 Scalar 最多从 Built queue 领取两个 task。每次取得所有权后立即检查
+依赖；owner-local token 中只要有 ready task 就优先 Execute。两个已领取 task
+都未 ready、或队列暂时没有可领取 task 时，该 Scalar 才领取一个 Build
+ticket。不同 Scalar 上的 Build 和 Execute 可以重叠；同一 Scalar 上已开始的
+Build 与同步 kernel 都不做抢占。
+
+首版明确不做 producer-driven Ready queue。`SharedExecCell[task_id]` 固定槽
+继续承载 Built queue 与 payload；K2 scanner 竞争 `BUILT -> CLAIMED` 即完成
+领取。基础数据用于判断两个槽是否足够，以及第二槽带来的绕过收益，而不是
+重新讨论是否应在 Claim 前构造 ready summary。
+
+### 7.2 改调度器前必须补齐的基础数据
+
+现有 `2026-08-03` B256 full-swimlane 已提供第一条结构证据：1024 个 kernel
+中只有 158 个落在 EfDrain、52 个落在 OrchestrationTail，**814 个落在
+FinalDrain**。它证明当前“每次取 Build ticket 前只给 Execute 一次推进机会”
+确实留下了大量执行 backlog；但它还不能决定应使用哪种发现结构。
+
+下一步先在独立诊断构建中累计每核计数，不给每次扫描增加 raw 事件：
+
+| 基础数据 | 要回答的问题 |
+| -------- | ------------ |
+| 每核第一个/第二个 token 的 Claim 成功数 | 第二槽是否真实承担了绕过工作，而不是只扩大状态 |
+| Claim 后首次检查即 ready / not-ready 的数量 | Built task 中实际有多少需要等待 |
+| 第一槽未 ready、第二槽 ready 并先执行的次数 | 两槽模型消除 head-of-line blocking 的直接收益 |
+| 两槽同时未 ready 的次数、持续轮数和最大时长 | 固定容量 2 是否仍经常把本核 admission 填满 |
+| 每次调度决策中 token-ready poll、queue scan、CAS 数 | Execute 优先的控制开销和重复观察量 |
+| 两个 K2 候选的 CAS win/lost 与首选宽限次数 | 第二候选是否造成无效原子竞争 |
+| 有 pending token 时继续 Build 的次数及插入等待分布 | 等依赖期间做 Build 是否拖慢或帮助 TensorMap baton |
+| replay 结束时 Built/Claimed/DONE 数及 kernel 区域分布 | 工作是否只是从 Submit 搬到 FinalDrain |
+
+诊断计数只用于结构归因。权威性能由无泳道、无诊断计数的端到端构建裁决，
+边界固定为全局最早的首个 Submit 起点到全局最晚的 FinalDrain 结束。旧
+Submit-only 数字只保留为历史诊断证据，不再决定候选保留或撤销。
+
 ## 8. 队列/任务发现机制的候选
 
 ### 8.1 Task-indexed execution cell
 
 每个 task id 独占一个 execution cell，本轮不复用。
 
+从调度视角看，这组 cell 本身就是一份**单轮、固定容量、全局可见的
+GM task list**：Build owner 把 portable payload 写入对应 task 的固定
+cell，批量 `FlushRegion()` 后以 atomic `BUILT` 发布；Execute winner
+观察到发布状态后，先对 payload 执行 `InvalidateRegion()`，再加载并执行。
+这条跨核发布/取得合同已经由现有 standalone 探针闭合，并不存在额外的
+cache coherence 假设。
+
 优点：
 
 - 没有 wrap/ABA；
+- 容量在 launch 前按 `task_count` 固定，本轮不需要反压、回收或复用；
 - task/state/payload 一一对应，最容易建立内存模型；
 - 失败定位和 host 精确检查简单。
 
@@ -634,13 +706,53 @@ fresh output cell 由 task 唯一 Build owner 独占，它的 descriptor 发布�
 
 建议第一版正确性原型采用 task-indexed cell，但只发布紧凑有效前缀，不把它直接宣布为最终结构。
 
-### 8.2 中央 MPMC ring
+### 8.2 单轮全局 Built list 与真正 Ready queue 的区别
+
+这里不能把 `BUILT` 和 `dependency ready` 混成同一个概念：
+
+```text
+Build owner 完成 payload 发布
+        -> task 进入全局 Built list
+
+所有 fanin producer 完成
+        -> task 才真正可以执行
+```
+
+PA 中 SF/PV/UP 的 Build 可能早于其 QK/SF/PV producer kernel 完成。因此，
+“Build 完即发布到 GM，winner DCCI 后加载执行”在**内存模型上没有问题**，
+当前已经选择 **Built queue + Claim 后检查**：task 一旦 `BUILT` 就可以由
+兼容 executor 竞争；CAS winner 取得 payload 后立刻检查 fanin。若未 ready，
+task 保持 `CLAIMED` 并占用该核一个 owner-local token；第一项阻塞时允许再抢
+第二项。正常路径不构造真正 Ready queue，也不增加反向 fanout、剩余依赖计数
+或 producer-driven 入队协议。
+
+“抢到后立刻检查”是调度合同，不只是实现偏好。若把首次检查延迟到下一次
+Submit，第二槽可能在本可立即执行的任务已经 ready 时仍被错误闲置；若在检查
+第一槽前直接连续抢满两个，又会不必要地扩大 pending 集合。因此顺序固定为：
+
+```text
+Claim slot 0 -> acquire -> check slot 0
+    ready     -> execute slot 0
+    not ready -> Claim slot 1 -> acquire -> check slot 1
+                    -> 再次优先检查/执行两个 owner-local token
+```
+
+若 Built list 仍采用 `SharedExecCell[task_id]` 固定槽，就不需要 append tail；
+immutable plan 已经能推导 task kind 和 K2 候选，executor 只需发现哪些固定
+cell 已经 `BUILT`。这里所说的“队列抢占”由 task control 的
+`BUILT -> CLAIMED` CAS 完成，不额外建立 append tail，也不增加第二套队列
+发布状态。
+
+### 8.3 可复用中央 MPMC ring
 
 优点是结构紧凑、天然提供已构建 task 流。问题是 producer/consumer head、tail 和 slot seq 会成为新的 atomic 热点；A5 同地址并发 atomic 代价可能抵消构建/执行 overlap。
 
 如果采用，必须有 per-slot generation/seq；仅靠全局 head/tail 不能防止 consumer 读取尚未发布或已经复用的 payload。
 
-### 8.3 Per-builder queue + work stealing
+这些容量、ABA 和回收问题只属于未来的**复用 ring**，不能反向否定
+8.1/8.2 的单轮固定槽方案。
+
+### 8.4 Per-builder queue + work stealing
 
 每个 builder 对自己的 SPSC/MPSC 队列发布，executor 扫描或窃取兼容 task。
 
@@ -653,7 +765,7 @@ fresh output cell 由 task 唯一 Build owner 独占，它的 descriptor 发布�
 
 该方案应在 task-indexed 内存模型已经闭合后再评估，不作为第一步。
 
-### 8.4 Ready bitmask/summary
+### 8.5 Ready bitmask/summary
 
 按组发布 AIC/AIV built/ready bitmask 可以减少 executor 全表扫描，但 bitmask 更新本身是共享 atomic。需要区分：
 
@@ -664,7 +776,9 @@ fresh output cell 由 task 唯一 Build owner 独占，它的 descriptor 发布�
 
 不能用一个 bit 同时表达四种状态。
 
-这不只是扫描优化，也是“每 executor 一个 token”进入通用动态任务池前的首选活性条件：未 ready task 留在全局 cell 中，不提前占住某个 executor。ready summary 如何从 fanin completion 中低成本产生是受控 S4 之后向通用动态池扩展时的独立设计门槛，不在 S0–S4 K2 首版中臆造新 atomic 协议。
+该方案当前不采用。首版明确允许每核两个 token 持有未 ready task，以第二槽
+绕过第一槽等待；只有 A5 数据证明“两槽同时长期未 ready”仍是主要瓶颈时，
+才重新评估 ready summary。不能在没有这条反证时先增加新的共享 atomic 协议。
 
 ## 9. 容量、背压和活性
 
@@ -672,7 +786,10 @@ fresh output cell 由 task 唯一 Build owner 独占，它的 descriptor 发布�
 
 当前每 worker 有 4 个物理 slot，其中 2 个给 BlockWon 预留，普通 kernel 只能使用 2 个。而且该容量检查发生在 Claim winner 已经产生之后：满时是本核 Drain/等待，不是放弃已经赢得的 task。这是 same-core “owner 必须保存到执行完”的局部背压，不是 cross-core 应继承的任务池形态。
 
-task-indexed 首版为每个 task 预留一个 GM cell，它们共同承担全局 backlog；builder 发布后不需要占有本核执行 slot。每个 executor 只有一个紧凑 execution token，该 token 是“已领取执行责任”的本地容量，不是 task 存储容量。
+task-indexed 首版为每个 task 预留一个 GM cell，它们共同承担全局 backlog；
+builder 发布后不需要占有本核执行 slot。当前每个 executor 固定两个紧凑
+execution token；它们只是“本核已经领取的执行责任”容量，不是全局 task
+存储容量。槽数以后再参数化，首版按 2 验证。
 
 后续把 task-indexed cell 改为有界 ring 时，才需要按 builder 生产率、AIC/AIV kernel 时长和 fanin 等待确定全局容量；不能简单沿用 `96 × 2` 或每核 4-slot 布局。
 
@@ -693,7 +810,7 @@ task N owner 取得 Register turn
 
 ### 9.3 全局 backlog 与本核 execution token
 
-首版明确不实现 executor-private pending task list：
+首版不实现无界 executor-private pending list，只定义两个有界 token：
 
 ```text
 GM task list:
@@ -702,20 +819,30 @@ GM task list:
   ...
 
 Executor local admission:
-  one execution token: IDLE -> WAITING_FANIN -> ENGINE_INFLIGHT
-                              -> COMPLETING -> IDLE
+  token[0..1]: IDLE -> Binding -> WAITING_FANIN -> ENGINE_INFLIGHT
+                                -> COMPLETING -> IDLE
 
-token == IDLE  : 允许对一个兼容 BUILT task 发射 Claim CAS
-token != IDLE  : 不 Claim；其他 BUILT task 继续留在 GM task list
+任一 token ready : 优先 Execute，不领取新 task/Build ticket
+存在 IDLE token  : 允许竞争一个兼容 BUILT，winner 立即 acquire/check
+两个 token 均占用且未 ready : 不再 Claim，可以完成一个 Build ticket
 ```
 
 - 未领取 task 一直位于 GM `SharedExecCell[task_id]`，状态为 `BUILT`；
-- executor 的唯一 token 为 `IDLE` 时才允许对一个兼容 task 发射 Claim CAS；
-- CAS 失败不占 token，也不读 payload；
-- CAS 成功后该核对 task 负责到 `DONE`，不得再领取第二个 task；
-- token 位于 `WAITING_FANIN` 时仍属于已领取 task；本 executor 不得继续 Claim 第二个 task。
+- executor 有 IDLE token 时才允许对兼容 `BUILT` 发射 Claim CAS；
+- CAS 失败不占 token，也不读取完整 payload；
+- CAS 成功后立即 acquire/bind 到具体 token，并马上执行第一次 fanin 检查；
+- 未 ready task 保持 `CLAIMED`，由该 token 保存 ready prefix；不回退状态；
+- 第一 token 未 ready 且第二 token 空闲时，允许继续领取一个后续 task；
+- 第二 token 取得后也必须立即检查；任一 ready 时先执行 ready token；
+- CAS 成功后该核对 task 负责到 `DONE`，fatal 路径继续 fail-closed；
+- 两个 token 都未 ready 时仍允许本核完成 Build 工作，但每次回到调度点必须
+  先复核两个 token，不能连续 Build 而饿死已经 ready 的已领取 task。
 
-这一版主动放弃“一核囤积多个未 ready task”带来的绕过能力，换取最小所有权和内存模型。固定映射通过每 executor 的 task-id 顺序保证推进：所有 fanin producer 都严格小于 consumer task id，同一 executor 不跳过早期映射 task，因此跨 executor 等待链上的 task id 只能严格递减，不能形成环。这份证明依赖“兼容 executor 最终被调度、engine 最终完成”的基本活性前提。通用动态版则必须先有 ready-only 发现机制或独立的活性证明。
+两槽模型只能绕过一个未 ready task，不自动获得任意深度的 work stealing。
+其活性门槛必须覆盖：第一槽阻塞而第二槽 ready、两个槽均阻塞但 Build 仍推进、
+较早 producer 后发布、K2 两候选负载不均，以及生产关闭后全部 token 收口。
+若真实 PA 经常出现两个槽同时长期阻塞，再用数据决定把容量参数增大或引入
+ready 摘要，不能在首版同时改两套机制。
 
 ### 9.4 Alloc 的特殊边界
 
@@ -773,16 +900,18 @@ PA 只是第一个算子，设计不得固化以下现状：
 15. completion vend 来自 task 的构建/分配上下文，不来自错误 executor heap cursor；
 16. task completion 只发布一次；
 17. task-indexed 首版在整轮 kernel 内不复用 cell；
-18. execution token 非 IDLE 时本 executor 不发射新的 Claim CAS，任一时刻最多持有一个已领取 task；
-19. 未被空闲 executor 领取的 task 保持 `BUILT`，不因某个忙核而移入私有队列；
-20. 正常路径先发布 completion 和 cell `DONE`，然后才把本核 execution token 恢复为 IDLE；
-21. FinalDrain 同时证明 builder 停止生产、所有 kernel cell 全部 DONE、每核 execution token 为 IDLE、engine 无 in-flight；
-22. 后续 reuse 版额外证明慢 reader 不会把旧 generation 当新任务；
-23. AIC/AIV function 路由严格匹配；
-24. fatal 路径不会执行半构建或已取消 payload；
-25. ordinary TensorMap 和 INOUT writer history 语义不因执行 owner 改变；
-26. `dc_preload` 关闭/开启变体通过同一 oracle，hint 被硬件忽略也不改变正确性；
-27. CPU 模型通过不代替 A5 DCCI/atomic 同构门槛。
+18. 每个 executor 最多持有两个已领取 task；两个 token 都非 `IDLE` 时不得发射第三次 Claim CAS；
+19. Claim winner 必须完成 payload acquire/bind 并立即做第一次 fanin 检查，不能把首次检查推迟到下一轮调度；
+20. 第一个 token 未 ready 时允许领取第二项；任一 owner-local token ready 时，Execute 必须优先于新 Claim 和新 Build；
+21. 未被空闲 executor 领取的 task 保持 `BUILT`，不因某个忙核而移入无界私有队列；
+22. 正常路径先发布 completion 和 cell `DONE`，然后才把对应 execution token 恢复为 `IDLE`；
+23. FinalDrain 同时证明 builder 停止生产、所有 kernel cell 全部 DONE、每核两个 execution token 均为 `IDLE`、engine 无 in-flight；
+24. 后续 reuse 版额外证明慢 reader 不会把旧 generation 当新任务；
+25. AIC/AIV function 路由严格匹配；
+26. fatal 路径不会执行半构建或已取消 payload；
+27. ordinary TensorMap 和 INOUT writer history 语义不因执行 owner 改变；
+28. `dc_preload` 关闭/开启变体通过同一 oracle，hint 被硬件忽略也不改变正确性；
+29. CPU 模型通过不代替 A5 DCCI/atomic 同构门槛。
 
 ## 13. 建议的验证顺序
 
@@ -790,12 +919,13 @@ PA 只是第一个算子，设计不得固化以下现状：
 
 三条证据链互不混算，不等到 S6 才补观测：
 
-- perf-clock：决定候选保留/撤销；
+- 无泳道端到端构建：决定候选保留/撤销；现有命令名仍为
+  `perf-clock`，但唯一结果是首个 Submit 到 FinalDrain 结束；
 - swimlane：检查 Build publish、Exec claim/bind、token
   `WAITING_FANIN`、kernel 和 completion 落点；
 - submit-PMU：辅助解释 Scalar/I-cache 变化。
 
-每个功能阶段先过正确性门槛，再用同阶段的 perf-clock/泳道
+每个功能阶段先过正确性门槛，再用同阶段的端到端构建/泳道
 做异常级抽查；只有对应构建的绝对数可在同一证据链内比较，
 不把不同 ELF 的绝对时间直接相减。贯穿过程必须逐步补齐以下对照：
 
@@ -810,7 +940,7 @@ PA 只是第一个算子，设计不得固化以下现状：
 
 - 在 `cross_core/` 内定义独立的 task-indexed `SharedExecCell`，`same_core/` 只作对照；
 - 首版 packed state 包含 `phase + owner + engine_class + payload_lines + task_id`，phase 只有 `EMPTY/BUILDING/BUILT/CLAIMED/DONE`，不包含 generation/reclaim；
-- 定义每 executor 唯一的紧凑 execution token，以及 `IDLE/BINDING/WAITING_FANIN/ENGINE_INFLIGHT/COMPLETING/VEND_PUBLISHED/COMPLETION_PUBLISHED/FAULTED` 本地状态，不定义 private pending 数组；
+- 定义每 executor 固定两个紧凑 execution token，以及 `IDLE/BINDING/WAITING_FANIN/ENGINE_INFLIGHT/COMPLETING/VEND_PUBLISHED/COMPLETION_PUBLISHED/FAULTED` 本地状态；容量固定为 2，不定义无界 pending 数组；
 - 静态断言 control/payload/cell 64B 隔离；
 - 列出 portable payload 的有效字段，锁定 `TensorDesc` 和 compact offset，禁止 builder-private pointer；
 - 将所有 shared payload ordinary write 收口到唯一 `PackExecPayload()`，将 DCCI/DSB 收口到唯一 publish helper；
@@ -827,8 +957,9 @@ PA 只是第一个算子，设计不得固化以下现状：
 - flush 完成但 BUILT 尚未发布，executor 不得读取；
 - 固定单 executor 的 `BUILT -> CLAIMED` 只成功一次；
 - 多 executor 同时 CAS 时恰好一个成功；
-- execution token 非 IDLE 的 executor 不得发射 Claim CAS，待领取 cell 仍保持 `BUILT` 并能被另一兼容空闲 executor 领取；
-- 任一时刻每 executor 最多一个 token 处于 `WAITING_FANIN/ENGINE_INFLIGHT/COMPLETING`，不存在第二个 private pending task；
+- 两个 execution token 均非 IDLE 时不得发射第三次 Claim CAS；仍有一个 IDLE token 时允许领取第二项；
+- 第一 token 未 ready、第二 token ready 时必须先执行第二项；任一时刻每 executor 最多两个 token 处于占用状态；
+- 每次 Claim winner 完成 payload acquire 后必须立即执行首次 fanin 检查，不能延迟到下个 Submit；
 - test Ops 观察每个 kernel task 恰好一次完整 payload `FlushRegion`、一次 winner `InvalidateRegion`，所有 loser 为零次；
 - private binding 建立后继续推进 fanin/completion，test-only shared-payload read 计数必须保持零；
 - executor claim 后延迟，cell 不会被任何 builder 改写；
@@ -860,7 +991,7 @@ CPU 只验证状态机和交错，不用于证明 A5 cache 可见性。generatio
 
 - 保持现有 Build Claim 候选核拓扑；
 - Build owner 发布 shared portable payload，再以 executor 身份取得它；
-- 只在本核唯一 execution token 为 IDLE 时取得，复制 active prefix 并重建 args/context，使用 payload vend 完成；
+- 只在本核存在 IDLE execution token 时取得，复制 active prefix 并重建 args/context，使用 payload vend 完成；
 - 此时 Build/Execute 仍是同一物理核，分开量 forward pack、批量 flush、整体 invalidate 和一次 private copy，不用一个混合端到端值掩盖重复 GM 触碰。
 
 ### S3b：固定不同核执行
@@ -875,10 +1006,10 @@ CPU 只验证状态机和交错，不用于证明 A5 cache 可见性。generatio
 - 每个 worker 在实际 Submit 已知 `(task_id, Kind)` 时独立计算同一对候选；当且仅当自己是 primary/secondary 时，才把该 task 登记到 owner-local 紧凑位图/队列；
 - 非候选核不重建历史 PA batch plan，不保存 `batch/offset` 游标，也不读 shared cell control。候选队列是 Scalar owner-local 状态，不需要 DCCI；
 - 两个候选才能观察 control，而最终唯一指定 executor 才发射 Claim CAS。这里的两个 observer 不是两个执行竞争者；
-- 每个 executor 按 task id 递增处理自己的固定映射序列，token 忙时不跳过早期 task 领取更晚 task；
+- 每个 executor 按 task id 递增处理自己的固定映射序列；第一 token 已领取且未 ready 时允许继续领取下一项到第二 token，两个 token 都占用后不再领取；
 - 候选看到 `EMPTY` 时保留队头；看到已带 `build_owner` 的 `BUILDING/BUILT/CLAIMED/DONE` 后，非 target 候选才能丢弃本地记录；只有全局停产后的残留 `EMPTY/BUILDING` 才是 terminal 缺口；
 - 先跑 B1 正确性，再跑 B256；host 精确检查 build owner 与 execute owner 不同、task/descriptor/fanin/vend/completion 全部一致；
-- FinalDrain 使用“所有 builder 停产 + 所有 kernel cell DONE + 每核 token IDLE + engine 无 in-flight”收口。
+- FinalDrain 使用“所有 builder 停产 + 所有 kernel cell DONE + 每核两个 token 全部 IDLE + engine 无 in-flight”收口。
 
 S3a 和 S3b 把“shared payload 发布税”与“跨核取得税”分开，同时不混入动态 election。
 
@@ -895,7 +1026,7 @@ S3a 和 S3b 把“shared payload 发布税”与“跨核取得税”分开，�
 - 从 K2 中排除 control 里的 `build_owner`。Build owner 不在 K2
   时得到 2 个 eligible executor，Build owner 在 K2 时得到
   1 个 eligible executor；
-- eligible 且 token 为 `IDLE` 的 observer 都可以对 `BUILT`
+- eligible 且至少有一个 token 为 `IDLE` 的 observer 都可以对 `BUILT`
   发射 `BUILT -> CLAIMED(self)` CAS；唯一 winner 读 payload，loser
   不做 payload DCCI；
 - CAS 返回 `ExecClaimResult::Lost`，或竞争窗口中返回
@@ -909,8 +1040,9 @@ S3a 和 S3b 把“shared payload 发布税”与“跨核取得税”分开，�
 | --------------- | ---- |
 | `EMPTY` | 生产未闭合时保留位图，不 CAS、不读 payload |
 | `BUILDING` | 若本 observer 就是 `build_owner`，立即退役其本地候选位；其他 eligible observer 保留位图等待 `BUILT` |
-| `BUILT` + token 空闲 | eligible 核发射 CAS；winner 绑定，`Lost/NotBuilt` 保留位图并重新观察 |
-| token 忙 | 只推进已绑定 token，不观察、不 CAS、不读取新 cell；新 task 候选位保留 |
+| `BUILT` + 存在空 token | eligible 核发射 CAS；winner 绑定到一个确定空槽并立即检查 fanin，`Lost/NotBuilt` 保留位图并重新观察 |
+| 一个 token 忙、另一个空闲 | 先检查已绑定 token；若未 ready，允许扫描并领取第二项 |
+| 两个 token 均忙 | 只推进两个已绑定 token，不观察、不 CAS 第三项；新 task 候选位保留 |
 | `CLAIMED` / `DONE` | 确认 `execute_owner` 是排除 Build owner 后的 K2 合法候选，再退役本地位；不报 fatal，全局终态仍等待 `DONE` |
 
 TensorMap 严格有序插入、`deps_prepared` 发布和 fanin 冻结都在
@@ -918,7 +1050,7 @@ Build owner 发布 `BUILT` 之前完成。S4 不修改这条串行链；
 `EMPTY/BUILDING` observer 也不得提前读 payload。
 
 `FinalDrain` 继续使用已有全局合同：所有 builder 停产、所有
-kernel cell 为 `DONE`、每核 token 为 `IDLE`、engine 无 in-flight。
+kernel cell 为 `DONE`、每核两个 token 均为 `IDLE`、engine 无 in-flight。
 生产闭合后的 `EMPTY/BUILDING` 是发布缺口；`BUILT` 必须继续
 election；`CLAIMED` 只能等待 `DONE`，不能因 loser 本地位图已清理
 就提前结束。
@@ -998,13 +1130,16 @@ FinalDrain 轮询记录耗尽通用 trace 容量，因此不用它代替 A5 的
 ### S6：性能评估与容量/复用优化
 
 - 量化终点为 B256、real-compute、96 Scalar、严格插入链与 K2 异核执行
-  保持不变时，`perf-clock <= 1.0 ms`；不得用缩减候选人口或
+  保持不变时，`submit_to_final_drain <= 1.0 ms`；不得用缩减候选人口或
   kernel/Scalar overlap 换取该数字；
 - 使用贯穿 S0–S5 累积的三条证据链，对 publication、
   handoff、election 和 Build 负载转移做同口径收益审计；
 - S6.1 已用 owner-local token/candidate 门控消除无本核执行工作时的
   122880 次完整 EfDrain 入口，把十轮 perf-clock 中位从 27.496 ms
   降至 9.078 ms；Claim CAS、严格插入和执行语义保持不变；
+- 当前 S6 调度候选把 owner-local token 固定从 1 扩为 2：每次 Claim winner
+  必须立即检查依赖；第一项未 ready 时才领取第二项，任一 ready token 始终
+  排在新 Claim 和 Build ticket 之前；
 - 先决定 task-indexed 方案是否已经满足性能和容量，不为了
   预设最终架构就提前引入队列；
 - 只有 task-indexed 内存模型、受控动态 election 和端到端
@@ -1047,7 +1182,9 @@ function ABI、heap/completion 合同、构建宏边界和现有 PA 正确性，
 
 当前主要瓶颈已经是多核同地址返回型 atomic。若每个 built task 再让 32/64 个 executor 竞争一个中央状态，会新增一套 Claim 级热点。
 
-第一版固定映射用于闭合内存模型；动态版本应优先评估 ready summary、分组、bitmask 或分散任务发现结构，而不是默认全核 CAS 同一地址，也不是让每核提前囤积多个未 ready task。
+第一版固定映射用于闭合内存模型；动态版本不能默认让 32/64 核 CAS 同一地址，
+也不能建立无界 pending 列表。当前只允许 K2 候选和每核两个 token；若两槽
+同时等待仍是瓶颈，再依据 A5 数据比较扩大有界容量与 ready summary。
 
 ### 14.4 观测代码不能进入协议 cacheline
 
@@ -1062,16 +1199,16 @@ function ABI、heap/completion 合同、构建宏边界和现有 PA 正确性，
 3. 每 cell 一个独占 atomic state line，payload 独立 64B 对齐；
 4. payload 只保存有效 tensor/scalar/fanin、task id 和 Materialize 后冻结的 completion vend，不保存 self-pointer；
 5. 小型 staging 只用寄存器/栈/owner-private 状态；数量全部确定后才一次 forward pack 到 GM，不创建完整 payload 栈镜像；
-6. 保持现有 Build Claim 候选核拓扑；Build owner 对整个 payload 仅调用一次 `FlushRegion()`，随后才发布 BUILT/engine_class/payload_lines；
-7. 每个 executor 首版只定义一个紧凑 execution token；token 非 IDLE 时不发射 Claim CAS，不建立 private pending task list；
-8. 先让 Build owner 自己以 executor 身份取得 shared payload，量出 publication/rebind 代价；
-9. 再固定映射到另一个兼容核；每核在 Submit 成功闭合时用当下已知的 `(task_id, Kind)` 登记 owner-local 候选位，executor 按 task id 递增处理本地序列，不重建历史 PA plan，不做动态竞争；
-10. executor 消费 CAS 返回值、校验 payload_lines、对整个 payload 调用一次 `InvalidateRegion()`、一次 forward copy active prefix 到唯一 token binding，之后不再读 shared payload；
-11. 在唯一 token 内复用现有 `SlotReady -> ExecuteKernel` 的局部主体，completion 改为使用 task payload 中的 vend；发布 DONE 后才释放 token；
-12. A5 独立探针和 B1/B256 正确性闭合后，再引入受控的动态 execution election；
-13. 通用动态任务池必须在 ready-only 发现或等价活性证明闭合后才启用，不允许所有 token 被未 ready task 占满；
-14. S2 正确性先在 DCache preload 关闭时闭合；之后才用预留 hook 为 S2/S3a/S3b 生成独立 A/B 变体；
-15. 动态 election 闭合后，再独立扩大 Build owner 候选核，最后基于观测证据评估有界 ring 和容量复用。
+6. 全部 96 Scalar 继续通过中央 ticket 恰好一次 Build；Build owner 对整个 payload 仅调用一次 `FlushRegion()`，随后才发布 BUILT/engine_class/payload_lines；
+7. 每个 executor 当前固定两个紧凑 execution token；两个槽均占用时不发射第三次 Claim CAS，不建立无界 pending list；
+8. immutable plan 继续提供 task kind 和 K2 候选，本核按单调候选序列观察固定 task-indexed Built queue；
+9. 存在空 token 时直接竞争 `BUILT -> CLAIMED`；CAS loser 不读 payload，winner 绑定到确定空槽；
+10. winner 校验 payload_lines、对完整 payload 调用一次 `InvalidateRegion()`、一次 forward copy active prefix 到该 token，之后不再读 shared payload；
+11. payload acquire 完成后立刻检查该 token 的 fanin；ready 就立即执行，未 ready 且第二槽空闲才继续领取下一项；
+12. 每次调度点先检查两个已占用 token；任一 ready 都先于新 Claim 和 Build ticket，两个都未 ready 时才完成一个 Build task；
+13. completion 使用 token payload 中的 vend；发布 DONE 后才释放对应 token，FinalDrain 要求两槽均 IDLE；
+14. DCache preload 默认关闭；只有双 token 正确性和基线性能闭合后才做独立 A/B；
+15. 槽数以后再参数化；当前先固定 2，只有两槽同时等待的 A5 数据支持时才比较其他容量或 ready summary。
 
 这一版不是最终高性能形态。它的价值是把三个未知量拆开：
 
@@ -1085,18 +1222,25 @@ function ABI、heap/completion 合同、构建宏边界和现有 PA 正确性，
 分阶段闭合；S6 只在这一架构内优化，不再引入第四套 engine/Scalar
 协程机制。
 
+上面的 1--15 是 S0--S5 首版落地顺序，不再代表 S6 当前调度策略。其中
+“每核只有一个 token，未 ready 后不能领取第二项”已经被最新泳道中的
+FinalDrain backlog 反证为性能瓶颈。S6 下一候选只替换本核 admission 与调度
+优先级：保持 task-indexed Built queue、portable payload、K2 exactly-once、
+同步 kernel 和 completion/FinalDrain 内存合同不变，改为 6.2/7.1/9.3 定义的
+Claim 后立即检查、每核两个 token、owner-local ready 优先模型。
+
 ## 16. 尚未决定的问题
 
 1. S5b 已选择所有 96 个 Scalar 作为 Build 候选；尚需由 A5 证据决定负载均衡收益能否覆盖额外 60.5% 物理 Claim CAS。
-2. 最终版 executor 是直接 dispatch shared payload，还是复制 active prefix 到唯一紧凑 token？首版已决定后者，不复活 4-slot ring。
+2. 最终版 executor 是直接 dispatch shared payload，还是复制 active prefix 到紧凑 token？首版继续复制，并把 token 数从 1 固定扩为 2；以后才参数化。
 3. portable payload 的最小通用 ABI 是什么，怎样兼容真实 function address 和 joint task？
 4. 更通用的 heap 协议中 completion vend 应如何表达？首版已决定在 Materialize reservation 成功后冻结。
-5. 受控 S4 之后的通用动态版，ready-only 发现由 completion 驱动的 ready summary、定向 scout，还是其他结构实现？S3 固定映射已决定为单 token + task-id 顺序。
-6. ready-only 发现如何避免一个未 ready task 导致 head-of-line blocking，同时不为每个 loser 引入 payload DCCI/读取？
+5. 两个 token 同时未 ready 在 AIC/AIV 上的发生率和持续时间是否足以要求继续扩容？
+6. 若容量 2 仍不够，应先增加可配置 token 数，还是再引入 completion-driven ready summary？
 7. task-indexed cell 的内存开销是否可接受到哪个阶段？
 8. 动态 executor election 如何不新增 Claim 等级的同地址 atomic 热点？
 9. AIC 与 AIV 是否使用完全独立的执行发现结构？
-10. 动态队列版 FinalDrain 如何证明 builder 停产、queue 为空、每核 token IDLE 和 engine in-flight 为零？task-indexed 版先用全 cell 终态计数收口。
+10. 动态队列版 FinalDrain 如何证明 builder 停产、queue 为空、每核全部 token 均为 IDLE 和 engine in-flight 为零？task-indexed 版先用全 cell 终态计数收口。
 11. BlockWon/multicore task 的 portable context 与执行 owner 如何表达？
 12. shared execution payload 是否能复用生产 RingSlot ABI，还是需要独立中间 ABI？
 
@@ -1170,7 +1314,7 @@ A5 尚未运行；不宣称通用动态池，也不用 CPU 耗时推导 A5 性�
 
 ### 2026-08-02：S0/S1 落地并进入 S2 动态门槛
 
-- `cross_core` 已形成独立 portable payload、task-indexed cell、每 executor 单 token 和 global fatal 首版；
+- `cross_core` 当时形成独立 portable payload、task-indexed cell、每 executor 单 token 和 global fatal 首版；单 token 已在 2026-08-03 的 S6 设计中被两个 token 取代；
 - packed state 增加 task id；删除无独立生产语义的 `output_task_id`，header 高 32 位改为强制零保留位；
 - CPU 确定性交错、100 次重复、ASan/UBSan、TSan 已通过，详细证据见 [PA调度器分离版实现过程](cross_core/PA调度器分离版实现过程.md)；
 - AIC/AIV CCEC 编译及 Claim CAS 返回依赖、DCCI/DSB 顺序的自动 IR 门槛已通过；A5 最小探针完成 100 × 32 case，全量覆盖四种跨核方向、四种 payload 大小和两种 acquire 路径，详细证据见实现过程文档；
@@ -1185,7 +1329,7 @@ A5 尚未运行；不宣称通用动态池，也不用 CPU 耗时推导 A5 性�
 - 将 task-indexed 首版与 ring 复用版拆开：首版无 generation/reclaim/ABA，避免不必要的状态和 atomic；
 - 补齐 execution payload 逻辑布局，将 `engine_class/payload_lines` 纳入 atomic `BUILT` 发布，解决 executor 不能在 invalidate 前读 header 的前置依赖；
 - 把 same-core 已有的“owner-local staging -> 单向 GM pack -> 末尾一次批量 DCCI”提升为 cross-core 默认性能合同，并增加 flush/invalidate 次数、binding 后零回读、栈框/溢出等专项门槛；
-- 去除“cross-core 继续每核维护多个 private pending slot”的默认：`SharedExecCell[]` 承担全局 backlog，每 executor 首版只有一个紧凑 execution token，忙时不 Claim；
+- 当时去除“cross-core 继续每核维护多个 private pending slot”的默认：`SharedExecCell[]` 承担全局 backlog，每 executor 首版只有一个紧凑 execution token，忙时不 Claim；该历史合同已被 2026-08-03 的两槽 Claim-first 模型取代；
 - 将动态任务池与受控 exactly-once election 分开：前者还必须闭合 ready-only 发现或等价活性证明，防止全部 token 被未 ready task 占满；
 - 预留 builder destination、executor source 和 executor-private destination 三类编译期 DCache preload hook，明确它们默认关闭、不改 ABI、不代替 DCCI/DSB/atomic；
 - 将验证拆为 same-owner shared publication、fixed different-core handoff、dynamic Execute election 和 Build 候选核扩大四个正交阶段。
@@ -1329,3 +1473,50 @@ CPU 全套、CCEC 构建、A5 B1/B256 均通过。五对同窗 B256 中位从旧
 `3.659993 ms` 变为 `3.666555 ms`，差 `+0.179%`，处于运行波动量级。由此可以
 进入 central ticket 接入；下一步必须同时删除 replay Close/位图登记，不能把
 本阶段过渡形态当成最终实现。
+
+### 2026-08-03：确定两槽 Claim-first Execute 调度模型
+
+最新 B256 full-swimlane 显示 1024 个 kernel 中只有 158 个位于 EfDrain、
+52 个位于 OrchestrationTail，814 个滞留 FinalDrain。该证据足以否定“每次
+领取 Build ticket 前只推进一个单 token”是最终模型。
+
+设计合同先修正为：单轮 `SharedExecCell[task_id]` 本身就是固定容量的全局
+Built list，不存在复用 ring 的容量反压、ABA 和回收问题；Build payload
+`FlushRegion -> BUILT`、Execute winner `InvalidateRegion -> load` 的跨核内存
+合同也已经闭合。当前不构造真正 Ready queue，也不在 Claim 前预读 fanin。
+每核固定两个 execution token：抢到 `BUILT` 后立即 acquire 并检查依赖；第一
+项未 ready 时允许再抢第二项，任一 owner-local task ready 都必须优先执行。
+两个 token 均未 ready 时，本核仍可完成一个 Build ticket，返回调度点后先
+复核已领取 task。
+
+该模型已经接入 standalone 正式路径。CPU 定向交错证明了“第一槽 blocked、
+第二槽 ready”、两槽 pending 时停止第三次 Claim 但仍允许完成一个 Build ticket，
+以及两个 token 的 FinalDrain/错误终态收口；完整 CPU、CCEC 和 A5 B1/B256
+均通过。状态只增加 `96 × 4928 B = 473088 B` 的第二 token，没有新增逐次 raw
+记录、共享 ready 状态或跨核普通发布。
+
+无泳道性能构建只保留一个权威区间：
+
+```text
+global min(first Submit.begin) -> global max(FinalDrain.end)
+```
+
+设备端复用 `finish_cycle` 保存本核 FinalDrain 排空后的终点；性能构建中的
+`submit_end` 固定为 0，不再读取或输出 Submit-only 边界。每核只读取首个
+Submit 起点和 FinalDrain 终点两个时钟，不新增结果字段、泳道事件或逐 task
+记录。
+
+严格同底座的三对交错 A5 B256 过渡性对照如下。表中的 Submit 行来自收敛
+口径前的诊断版本，只用于解释工作从 FinalDrain 前移，不再是当前性能输出：
+
+| 指标 | 单 token | 双 token | 变化 |
+|---|---:|---:|---:|
+| Submit 中位 | 1.871997 ms | 2.455617 ms | +31.18% |
+| 完整周期中位 | 9.345107 ms | 5.880792 ms | -37.07% |
+| EfDrain kernel 中位 | 208 | 432 | +224 |
+| FinalDrain kernel 中位 | 816 | 592 | -224 |
+| fanin load 中位 | 16472 | 13361 | -18.89% |
+
+因此双 token 的保留依据不是原 Submit 指标变快，而是 224 个 kernel 从尾部
+前移、完整周期下降约 3.464 ms。若只看 Submit，会把预期中的工作前移误判为
+回退；若只看 FinalDrain，则又会遗漏前移所付出的控制和 kernel 时间。
