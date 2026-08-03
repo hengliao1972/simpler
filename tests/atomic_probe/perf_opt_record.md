@@ -6253,3 +6253,19 @@ adapter/host/PA 测试接线已完整撤回，通用引用协议门槛保留但�
 动态测试闭合，CCEC 仍逐项检查 split 强符号、角色隔离、block-local state 和
 最终 ELF。因此只把 AIC 的精确期望收敛为 3，没有放宽为范围，也没有改 kernel。
 两套 full-swimlane 构建均通过；本项是观察链路修正，不声明性能收益。
+
+### 15.43 S6.21 unique-ticket 单 CAS 候选无局部收益，完整撤回
+
+中央 ticket 已提供“每 task 唯一 builder”证明，因此隔离验证了只在 payload
+flush 后以一次 `EMPTY -> BUILT` CAS 发布、去掉初始 `BUILDING` CAS 的候选。
+CPU 暂停点证明半包和已 flush 未发布包在 `EMPTY` 下均不可见；CCEC IR 证明
+payload DCCI/DSB 位于唯一发布 CAS 之前；完整 CPU、A5 B1/B256 正确性通过，
+AIC/AIV 热函数各缩小 172B。
+
+冻结 ELF 六对 perf-clock 交错 A/B 的基线/候选中位为
+`2323.130/2353.698 us`，候选回退 `1.316%`，且 4/6 对回退。随后用同一版
+full-swimlane 分析器直接量 `WinnerBuild`：基线为 `71,461,026 cycles`，
+候选为 `73,034,423 cycles`，局部同样回退 `2.202%`；global Submit makespan
+由 `1687.422 us` 增至 `1793.707 us`。因此不存在“端到端波动掩盖明确局部
+收益”的保留理由。候选代码和过程测试均撤回，正式路径继续使用通用双 CAS
+状态机；本轮只保留负结果，避免以后再次凭原子数量重复该试验。

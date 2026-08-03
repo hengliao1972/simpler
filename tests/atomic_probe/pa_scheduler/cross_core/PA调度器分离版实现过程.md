@@ -1650,3 +1650,35 @@ caller/runtime/finish 的唯一强符号、角色隔离、外部 block-local sta
 perf-clock 保持一致；没有改成范围判断，也没有修改 device kernel。修正后，
 精确父提交与后继候选的 AIC/AIV full-swimlane 构建均通过。该提交只恢复观察
 链路，不包含 A5 性能收益。
+
+## 2026-08-03：S6.21 撤回 unique-ticket 单 CAS 发布候选
+
+中央 Build ticket 已证明每个 task 只有一个 builder，因此测试了去掉
+`EMPTY -> BUILDING` CAS、只在 payload flush 后执行一次 `EMPTY -> BUILT`
+CAS 的候选。隔离协议测试覆盖了 pack 中点和 flush 后两个暂停点：control
+保持 `EMPTY` 时 executor 均返回 `NotBuilt`，不 invalidate、不读取半包；
+优化后 AIC IR 也证明 payload DCCI/DSB 先于唯一发布 CAS。完整 CPU、CCEC、
+A5 B1/B256 正确性均通过，AIC/AIV `PublishCrossCoreExecTask` 机器码各缩小
+172B。
+
+但性能证据不支持保留。冻结精确父提交和候选 ELF 后，六对交错 perf-clock
+样本为：
+
+```text
+基线：2371.584, 2284.384, 2124.627, 2257.413, 2573.571, 2361.875 us
+候选：2531.046, 2331.260, 2376.136, 2135.396, 2323.952, 2598.416 us
+中位：2323.130 -> 2353.698 us，+30.569 us / +1.316%
+逐对：4 对回退，2 对改善
+```
+
+为排除端到端波动掩盖局部收益，又在修正后的同一 full-swimlane 观察链上各跑
+一次 B256。基线/候选的 `WinnerBuild` 聚合分别为
+`71,461,026 / 73,034,423 cycles`，候选增加 `1,573,397 cycles / 2.202%`；
+分析器的 global Submit makespan 也由 `1687.422 us` 增至 `1793.707 us`。
+两边结构与分段闭合检查均通过，所以这不是观察结构不同造成的假差异。
+
+该候选的正确性合同成立，但“少一次原子”在本机并没有转化为局部或端到端
+收益；不能仅凭指令数量保留。生产调用、通用单 CAS 分支和对应过程测试已全部
+撤回，继续使用通用的 `EMPTY -> BUILDING -> BUILT` 双 CAS 协议。本结果只
+否决当前中央 ticket + PA payload 形态下的实现，不推导为其他 payload 或硬件
+上的普遍结论。
