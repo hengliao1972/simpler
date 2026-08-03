@@ -120,6 +120,7 @@ PA_DEVICE AtomicOp TraceAtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::FatalSet:
         case AtomicSite::CompletionVendExchange:
         case AtomicSite::CompletionFlagExchange:
+        case AtomicSite::SharedExecDrainReleasePublish:
             return AtomicOp::Exchange;
         case AtomicSite::ClaimMax:
         case AtomicSite::FrontierMax:
@@ -133,7 +134,6 @@ PA_DEVICE AtomicOp TraceAtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::SharedExecBuiltPublish:
         case AtomicSite::SharedExecClaim:
         case AtomicSite::SharedExecDonePublish:
-        case AtomicSite::SharedExecDrainReleasePublish:
             return AtomicOp::CompareExchange;
         case AtomicSite::SharedOutputWriterReserve:
             return AtomicOp::FetchMax;

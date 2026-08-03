@@ -5233,6 +5233,9 @@ PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
     uint32_t task_count, LocalStats &stats,
     bool &arrived, bool &released
 ) {
+    if (released) {
+        return true;
+    }
     released = false;
     if (state == nullptr || worker.core_idx < 0 ||
         static_cast<uint32_t>(worker.core_idx) >= kWorkers ||
@@ -5279,29 +5282,31 @@ PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
         arrived = true;
     }
 
-    const int64_t release =
-        TraceAtomicLoad<Ops>(
-            stats.trace, stats.result, -1,
-            AtomicSite::SharedExecDrainReleasePoll,
-            &state->exec_drain.release.state,
-            /*result_used=*/true
-        );
-    if (release == 1) {
-        released = true;
-        return true;
-    }
-    if (release != 0) {
-        PublishCrossCoreRuntimeFailure<Ops>(
-            state, stats,
-            cross_core::ExecFatalReason::CompletionStateConflict,
-            task_count, worker_id
-        );
-        return false;
-    }
     // 只让固定 root worker 扫描 16 条 arrival line；其余 95 个 worker
-    // 只轮询独立 release。这样既把 RMW 竞争从 96 路降到每地址 6 路，
-    // 又不会把“检查所有分组”的读取复制到全部 Scalar。
+    // 只轮询所属分组 release。这样 arrival RMW 和 release load 的
+    // 同地址竞争人口都从 96 路降为每地址 6 路，又不会把“检查所有
+    // 分组”的读取复制到全部 Scalar。root 自己不轮询 release：它只有
+    // 在验证全部 arrival 和 task 终态后才会进入发布分支。
     if (worker_id != 0) {
+        const int64_t release =
+            TraceAtomicLoad<Ops>(
+                stats.trace, stats.result, -1,
+                AtomicSite::SharedExecDrainReleasePoll,
+                &state->exec_drain.releases[arrival_group].state,
+                /*result_used=*/true
+            );
+        if (release == 1) {
+            released = true;
+            return true;
+        }
+        if (release != 0) {
+            PublishCrossCoreRuntimeFailure<Ops>(
+                state, stats,
+                cross_core::ExecFatalReason::CompletionStateConflict,
+                task_count, worker_id
+            );
+            return false;
+        }
         return true;
     }
     for (uint32_t group = 0;
@@ -5339,18 +5344,20 @@ PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
         );
         return false;
     }
-    if (TraceAtomicCompareExchange<Ops>(
+    // root 身份固定且本地 arrived/released 状态保证本轮只进入一次。
+    // 这里不消费 Exchange 旧值：16 个分组发布彼此独立，消费者的
+    // atomic poll 才是完成可见性的权威边界。若 host 初始化或唯一 root
+    // 合同损坏，逐组终态快照仍会把它判为错误。
+    for (uint32_t group = 0;
+         group < cross_core::kExecDrainArrivalGroups;
+         ++group) {
+        (void)TraceAtomicExchange<Ops>(
             stats.trace, stats.result, -1,
             AtomicSite::SharedExecDrainReleasePublish,
-            &state->exec_drain.release.state, 0, 1,
-            /*result_used=*/true
-        ) != 0) {
-        PublishCrossCoreRuntimeFailure<Ops>(
-            state, stats,
-            cross_core::ExecFatalReason::CompletionStateConflict,
-            task_count, worker_id
+            &state->exec_drain.releases[group].state,
+            static_cast<int64_t>(1),
+            /*result_used=*/false
         );
-        return false;
     }
     released = true;
     return true;

@@ -2548,12 +2548,11 @@ void TestFinalDrainClosesLastTask() {
          ++group) {
         all_arrivals_ok &=
             expected_group_arrivals[group] == 6 &&
-            state->exec_drain.arrivals[group].state == 6;
+            state->exec_drain.arrivals[group].state == 6 &&
+            state->exec_drain.releases[group].state == 0;
     }
     Check(
-        all_arrivals_ok &&
-            state->exec_drain.release.state == 0 &&
-            NoFatal(*state),
+        all_arrivals_ok && NoFatal(*state),
         kTest, "six workers arrive in each of sixteen drain groups"
     );
 
@@ -2566,11 +2565,18 @@ void TestFinalDrainClosesLastTask() {
             state, state->workers[0], 5, arrival_stats[0],
             arrived[0], root_released
         );
+    bool all_groups_released = true;
+    for (uint32_t group = 0;
+         group < cross_core::kExecDrainArrivalGroups;
+         ++group) {
+        all_groups_released &=
+            state->exec_drain.releases[group].state == 1;
+    }
     Check(
-        root_ok && root_released &&
-            state->exec_drain.release.state == 1 &&
+        root_ok && root_released && all_groups_released &&
             NoFatal(*state),
-        kTest, "root validates terminal cells after every group arrives"
+        kTest,
+        "root validates terminal cells and releases every arrival group"
     );
 
     bool repeat_released = false;
@@ -2581,7 +2587,7 @@ void TestFinalDrainClosesLastTask() {
         );
     Check(
         repeat_ok && repeat_released &&
-            state->exec_drain.release.state == 1 &&
+            state->exec_drain.releases[0].state == 1 &&
             state->exec_drain.arrivals[0].state == 6,
         kTest, "one worker cannot increment drain twice"
     );

@@ -903,6 +903,7 @@ PA_MODEL_INLINE constexpr AtomicOp AtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::FatalSet:
         case AtomicSite::CompletionVendExchange:
         case AtomicSite::CompletionFlagExchange:
+        case AtomicSite::SharedExecDrainReleasePublish:
             return AtomicOp::Exchange;
         case AtomicSite::ClaimMax:
         case AtomicSite::FrontierMax:
@@ -916,7 +917,6 @@ PA_MODEL_INLINE constexpr AtomicOp AtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::SharedExecBuiltPublish:
         case AtomicSite::SharedExecClaim:
         case AtomicSite::SharedExecDonePublish:
-        case AtomicSite::SharedExecDrainReleasePublish:
             return AtomicOp::CompareExchange;
         case AtomicSite::SharedOutputWriterReserve:
             return AtomicOp::FetchMax;
@@ -942,6 +942,7 @@ PA_MODEL_INLINE constexpr bool AtomicSiteResultUsed(AtomicSite site) {
         case AtomicSite::ReplayDoneIncrement:
         case AtomicSite::SharedOutputRollbackExchange:
         case AtomicSite::SharedExecCompletionVendPublish:
+        case AtomicSite::SharedExecDrainReleasePublish:
             return false;
         case AtomicSite::StartupPoll:
         case AtomicSite::FatalPoll:
@@ -989,7 +990,6 @@ PA_MODEL_INLINE constexpr bool AtomicSiteResultUsed(AtomicSite site) {
         case AtomicSite::SharedExecCompletionFlagPublish:
         case AtomicSite::SharedExecDonePublish:
         case AtomicSite::SharedExecDrainArrive:
-        case AtomicSite::SharedExecDrainReleasePublish:
         case AtomicSite::SharedExecDrainReleasePoll:
         case AtomicSite::SharedExecDrainArrivalPoll:
             return true;

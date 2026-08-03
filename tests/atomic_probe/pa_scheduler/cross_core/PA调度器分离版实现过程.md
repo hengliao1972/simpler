@@ -2397,3 +2397,71 @@ candidate mean   回退 0.014835 ms / 0.612%
 扩大 fatal 已发布后继续 Materialize/Register 的窗口。因此代码、动态门槛和
 构建产物改动均完整撤回，只保留本节反例，不把 Atomic 次数减少本身当作性能
 优化成果。
+
+## 2026-08-04：S6.35 分片 execution drain release
+
+S6.33 已把 arrival RMW 拆成 16 组，但全部非 root worker 仍轮询同一条
+release line。保留泳道中，`shared_exec_drain_release_poll` 有 8196 次逻辑
+load，96 个等待 episode 的聚合跨度为 `129059.980 us`；root 的唯一 release
+CAS 也因与 96 路读共享地址达到约 `16.244 us`。因此本阶段验证：保持同一份
+全量终态校验，把 release 也按 arrival group 分片，是否能降低 A5 同地址并发。
+
+实现前先把 `SharedExecDrainControl` 布局门槛由 1088B 收紧为 2048B，旧实现
+按预期以 `1088 != 2048` 编译失败。候选协议为：
+
+```text
+每个 worker 排空本核 scanner/token
+-> arrivals[block_id % 16] FetchAdd 一次
+-> 非 root 只轮询 releases[block_id % 16]
+-> root 轮询 16 个 arrival，要求每组精确为 6
+-> root 全量校验 Alloc EMPTY / kernel DONE
+-> root 向 16 条 release line 各发布一次 Exchange
+-> 各组 worker 观察本组 release 后退出
+```
+
+root 身份固定，且本地 `released` 状态阻止重复推进再次发布，因此 16 次
+Exchange 不消费旧值；消费者的 atomic poll 是发布完成可见性的权威边界。
+这避免把 Exchange 强制改成返回型路径。host 最终逐组检查
+`arrival == 6 && release == 1`，full-swimlane 还精确要求 release publish
+事件为 16 次、操作为 source-issue Exchange。execution state 精确搬运大小
+由 `20,183,296` 增加为 `20,184,256` 字节。
+
+完整 CPU 协议回归、converter 63 项测试、CCEC full-swimlane/perf-clock
+构建以及 A5 B256 full-swimlane 均 PASS。A5 full-swimlane 为：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_s635_20260803_202002_449213/ccec/merged_swimlane.json`
+
+归档副本为：
+
+`test_record/2026-8-4/cross_b256_s635_2p437ms.json`
+
+该次动态结果为：
+
+- 完整生命周期：`2.436915 ms`；
+- Submit：`1.099908 ms`；
+- FinalDrain：`1.451253 ms`；
+- release publish：16 次 source-issue Exchange，聚合 `12.465 us`；
+- release poll：95 个 episode，聚合跨度 `99,839.692 us`，相对 S6.33 的
+  `129,059.980 us` 下降 `22.64%`；
+- release poll 逻辑 load 由约 8196 增至 41389，说明分片后单次轮询更快，
+  在等待最慢 worker 的同一业务窗口内能推进更多次；该调用数不能单独当作
+  回退；
+- 1280 task、1024 kernel、TensorMap、payload、fanin、completion、逐组
+  arrival/release 和全部终态 PASS。
+
+最终以提交 `4efd9eb6` 构建冻结 S6.33 基线，与候选按 B-C/C-B 交错各运行
+六个独立 trace-free B256 进程：
+
+```text
+S6.33 frozen baseline: min / median / max / mean
+                       2.416024 / 2.453325 / 2.510049 / 2.456007 ms
+S6.35 candidate      : min / median / max / mean
+                       2.145582 / 2.168356 / 2.192012 / 2.167784 ms
+candidate median 改善 0.284969 ms / 11.616%
+candidate mean   改善 0.288223 ms / 11.735%
+```
+
+中位数、均值和全部六个候选样本都与基线清晰分离，改善远大于设备波动。
+性能收益来自把 release 的同地址并发人口由 96 降为每地址 6；没有减少
+worker、跳过终态校验、缩短计时边界或改变 TensorMap/Build/Execute 业务
+语义。该阶段作为有效优化保留。

@@ -1163,7 +1163,7 @@ inline constexpr size_t CrossCoreExecStateBytes() {
     return kCrossCoreExecStateBytes;
 }
 static_assert(
-    CrossCoreExecStateBytes() == 20183296,
+    CrossCoreExecStateBytes() == 20184256,
     "cross-core execution state transfer size changed"
 );
 static_assert(
@@ -3175,21 +3175,34 @@ inline bool AnalyzeSwimlaneRecords(
         const uint64_t expected_ticket_events =
             static_cast<uint64_t>(shared_plan.total_tasks) +
             kWorkers;
+        constexpr uint32_t kDrainReleasePublishSite =
+            static_cast<uint32_t>(
+                AtomicSite::SharedExecDrainReleasePublish
+            );
+        const uint64_t drain_release_publish_events =
+            atomic_durations[0][kDrainReleasePublishSite].size() +
+            atomic_durations[1][kDrainReleasePublishSite].size();
         if (aic_local_events != 0 || aiv_local_events != 0 ||
             local_events != 0 || root_events != 0 ||
-            ticket_events != expected_ticket_events) {
+            ticket_events != expected_ticket_events ||
+            drain_release_publish_events !=
+                cross_core::kExecDrainArrivalGroups) {
             std::fprintf(
                 stderr,
-                "shared PA Build ticket closure failed: "
+                "shared PA atomic closure failed: "
                 "legacy_local_aic=%llu legacy_local_aiv=%llu "
                 "legacy_local=%llu legacy_root=%llu "
-                "tickets=%llu/%llu\n",
+                "tickets=%llu/%llu drain_release_publishes=%llu/%u\n",
                 static_cast<unsigned long long>(aic_local_events),
                 static_cast<unsigned long long>(aiv_local_events),
                 static_cast<unsigned long long>(local_events),
                 static_cast<unsigned long long>(root_events),
                 static_cast<unsigned long long>(ticket_events),
-                static_cast<unsigned long long>(expected_ticket_events)
+                static_cast<unsigned long long>(expected_ticket_events),
+                static_cast<unsigned long long>(
+                    drain_release_publish_events
+                ),
+                cross_core::kExecDrainArrivalGroups
             );
             return false;
         }
@@ -3206,6 +3219,15 @@ inline bool AnalyzeSwimlaneRecords(
             "fetch_add=%llu valid_tasks=%u terminal_fetches=%u\n",
             static_cast<unsigned long long>(ticket_events),
             shared_plan.total_tasks, kWorkers
+        );
+        std::printf(
+            "[TRACE_ATOMIC_CLOSURE] "
+            "site=SharedExecDrainReleasePublish "
+            "group_exchanges=%llu arrival_groups=%u\n",
+            static_cast<unsigned long long>(
+                drain_release_publish_events
+            ),
+            cross_core::kExecDrainArrivalGroups
         );
     }
 #endif
@@ -4895,14 +4917,14 @@ inline Metrics Validate(
         static_cast<int64_t>(
             kWorkers / cross_core::kExecDrainArrivalGroups
         );
-    bool cross_core_exec_drain_ok =
-        state.exec_drain.release.state == 1;
+    bool cross_core_exec_drain_ok = true;
     for (uint32_t group = 0;
          group < cross_core::kExecDrainArrivalGroups;
          ++group) {
         cross_core_exec_drain_ok &=
             state.exec_drain.arrivals[group].state ==
-                kExecDrainWorkersPerGroup;
+                kExecDrainWorkersPerGroup &&
+            state.exec_drain.releases[group].state == 1;
     }
     const bool cross_core_exec_fatal_clear =
         state.exec_fatal.state == 0;
