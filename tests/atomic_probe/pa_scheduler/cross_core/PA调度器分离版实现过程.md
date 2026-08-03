@@ -2651,3 +2651,45 @@ candidate mean   改善 0.709224 ms / 33.335%
 TensorMap 插入顺序、Build/Execute owner、任务依赖、完成发布顺序或计时边界；
 只把已经存在的 owner-local 完成事实并入原有 arrival Atomic，删除 root 的
 重复全表读取，因此作为有效优化保留。
+
+## 2026-08-04：S6.39 两级终态 barrier 由 root 直接扇出 release（无稳定收益，已撤回）
+
+S6.38 的两级 replay/final barrier 先由 16 个 leaf leader 向
+`root_arrival` 发布到达；root 收齐后发布一条 `root_release`，再由
+16 个 leaf leader 分别读取该返回型 Atomic，并转发本组
+`leaf_release`。候选协议利用“root 已收齐所有 leaf arrival”这个现有证据，
+删除 `root_release` 中间层，改为 root 直接发布 16 条 `leaf_release`。
+
+定向 CPU 用例先收紧为“两级形态的 `root_release` 必须保持 0”，旧实现按预期
+仅在两个终态 barrier 集成用例失败；候选实现后，完整 CPU 协议回归、
+converter/analyzer 99 项回归、CCEC full-swimlane/perf-clock 构建以及
+A5 B256 full-swimlane 均 PASS。诊断泳道为：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260803_221321_552522/ccec/merged_swimlane.json`
+
+该次诊断结果为：
+
+- 完整生命周期：`1.474642 ms`；
+- Submit：`1.119619 ms`；
+- final barrier：`0.382604 ms`；
+- `replay_done` 轮询的逻辑调用数：`6345 -> 3449`；
+- 1280 task、1024 kernel、TensorMap、payload、fanin、completion 与全部终态
+  PASS，泳道记录无丢失。
+
+单次诊断不用于裁决。最终以提交 `88830ca4` 构建冻结 S6.38 基线，
+与候选按 B-C/C-B 交错各运行六个独立 trace-free B256 进程：
+
+```text
+S6.38 frozen baseline: min / median / max / mean
+                       1.402857 / 1.431680 / 1.457888 / 1.431833 ms
+S6.39 candidate      : min / median / max / mean
+                       1.407996 / 1.427383 / 1.434691 / 1.423352 ms
+candidate median 表面改善 0.004297 ms / 0.300%
+candidate mean   表面改善 0.008481 ms / 0.592%
+```
+
+六对成对差值既有改善也有回退，中位数改善只有 0.3%，不足以证明稳定收益。
+候选虽然减少了共享 `root_release` 的返回型读取，却把原本由 16 个 leaf leader
+并行发布的 release 集中成 root 串行发布 16 次，净收益被抵消。因此实现和
+构建门槛修改已全部撤回，仅保留本节反例；后续不再用“减少返回型读取数”
+单一指标代替端到端裁决。
