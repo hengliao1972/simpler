@@ -803,3 +803,341 @@ metadata_committed     == task 数
    一致（退化对照）；
 4. shared scheduler 终态（DEPSIG / TMOPS / owner 数 / metadata
    顺序）相对基线不变，仅 `participating` / CAS 计数下降。
+
+---
+
+## 19. Same-Core Scalar Coroutine：执行期交错下一轮 Claim
+
+### 19.1 动机：编排优化逼近上限后的下一瓶颈
+
+当前方案族（两级 per-task CAS tournament、Selective Participation、
+`deps_prepared` 提交链）的主目标是压缩 **orchestration** 开销：
+task claim 竞争与依赖构建。实测与模型都显示这条路径已明显变窄，
+继续在 Claim 拓扑上抠收益会进入边际递减。
+
+每个物理核上的 worker 大致交替两段工作：
+
+```text
+orchestration（Claim / Register / deps / Submit 外壳）
+        ↕ 串行切换
+execution（in-core QK/SF/PV/UP …：Cube / Vector / MTE 主导）
+```
+
+关键观察：
+
+1. **执行阶段标量单元并不总是满载**。In-core kernel 的主体负载在
+   Cube / Vector / MTE；scalar 主要发指令、维护循环索引、做
+   `SetFlag` / `WaitFlag` 与少量地址算术。长算子在异步管线上跑时，
+   scalar 常处于「等 flag / 等 pipe」的轻载或阻塞态。
+2. **编排阶段几乎吃满 scalar**，且大量时间花在 GM 原子与控制流上，
+   与 Cube/Vector 重叠度低。
+3. 若能在**同一物理核**上，让 scalar 在执行期的空档去推进**下一
+   task 的 Claim 竞争**，则可把编排延迟藏进已有的执行气泡，而不把
+   工作扔到别的核（因而**不增加跨核 GM 热线流量**）。
+
+本方案是相对 Claim 拓扑的**正交下一阶段**：不改「谁赢」的合同，
+改「何时用本核 scalar 做 Claim」。
+
+> 与 `shared构建执行分离.md` 刻意不引入 engine coroutine 的边界
+> 不冲突：那份文档排除的是把跨核发布 / owner 仲裁 / 回收与另一套
+> 调度混做；本章讨论的是**同核、协作式、仅交错「已在跑的
+> in-core」与「本核下一轮 Claim」**，且默认不改变跨核 publication
+> 合同。若落地，应作为独立开关与探针，不并入首版 build/execute
+> 分离路径。
+
+### 19.2 方案概述
+
+把每个 worker 拆成两个协作式协程（cooperative coroutine），共享
+同一物理核、同一 GM 视图、同一本地 ring/slot，但分时占用 **scalar
+控制流**：
+
+| 协程 | 职责 | 主要占用 |
+| ---- | ---- | -------- |
+| `ExecCoro` | 跑当前已 claim 且 fanin ready 的 in-core kernel | Cube / Vector / MTE + 间歇 scalar |
+| `OrchCoro` | 对后续 task 做 Selective / 两级 CAS Claim、轻量编排 | 几乎纯 scalar + GM atomic |
+
+调度模型（协作式，非抢占）：
+
+```text
+ExecCoro 发出长时 Cube/Vector/MTE 操作
+    → 到达 yield 点（见 §19.3）
+    → 保存 Exec 标量上下文，切换到 OrchCoro
+OrchCoro 推进下一 task 的 Claim（local/root CAS 等）
+    → 自己的原子返回或到达预算上限
+    → 切回 ExecCoro
+ExecCoro 恢复 WaitFlag / 后续 tile
+    → …
+```
+
+约束（第一版建议写死）：
+
+1. **同核 only**：OrchCoro 只服务本 `worker_id` 的 Claim 参与，不
+   代替异核 executor、不跨核偷任务执行。
+2. **只交错 Claim / 极轻编排**：第一版禁止在 yield 窗口内做
+   Register、metadata publish、`deps_prepared` CAS、大块 GM 拷贝；
+   这些仍留在传统编排段，避免与 in-core 的 UB/L1/GM 流水纠缠。
+3. **协作式 yield**：只在明确插入的调度点切换；不依赖硬件抢占
+   scalar。
+4. **Cube/Vector 不中断**：切换发生在「算子已下发、scalar 本可空等」
+   的窗口；不假设能抢 Cube/Vector 流水线。
+
+收益假设：
+
+```text
+隐藏延迟 ≈ min( Claim_scalar_work , Σ bubble_i )
+bubble_i = 第 i 个 yield 窗口内 Cube/Vector/MTE 仍在飞、scalar 本会空等的时间
+```
+
+且 Claim 的 GM 原子仍由**本核**发出，不引入新的跨核编排角色，
+因此不额外制造「为编排而编排」的 GM 多播；只是把本就会发生的
+本核原子时间前移到执行气泡里。
+
+### 19.3 可插入的协程调度点（scheduling points）
+
+Ascend in-core 函数里，scalar 是控制平面：它 **issue** 异步管线
+操作，再 **WaitFlag** 回收完成。真正可让出 scalar 的窗口，是
+「长操作已 issue、完成尚未回收」之间——或等价的、已知 Cube/Vector
+仍忙碌的间隙。
+
+推荐按**安全与收益**分级插入：
+
+#### A 级（首选）：异步 issue 之后、对应 `WaitFlag` 之前
+
+```text
+// 伪代码：tile / 流水节拍内
+IssueCubeOrVectorOp(...);          // 或 MTE copy，长延迟
+SetFlag<PIPE_M / PIPE_V / ...>(...);
+
+// >>> SCHED_POINT: scalar 本将空等管线 <<<
+CoroutineYieldToOrch(budget);      // OrchCoro 做下一 task Claim
+
+WaitFlag<PIPE_M / PIPE_V / ...>(...);
+```
+
+这是最干净的点：管线已有活，scalar 若不 yield 也会在 `WaitFlag`
+上阻塞；把阻塞换成「有限预算的 Claim 工作」是直接的气泡填充。
+
+#### B 级：双缓冲 / 多 tile 流水的「另一侧仍在飞」处
+
+例如 ping-pong：buffer0 上 Vector 仍在算，scalar 已可启动 buffer1
+的 MTE；在启动下一拍之前或之后插入 yield，用「另一侧未完成」作
+为气泡证明。
+
+#### C 级：显式软件预算点（无硬件 flag 时）
+
+在已知耗时的大循环边界（如按 block-group / head 维的外环）插入：
+
+```text
+for (tile = ...) {
+    RunTile(...);
+    if ((tile % YIELD_EVERY) == 0)
+        CoroutineYieldToOrch(budget);
+}
+```
+
+收益依赖「tile 内 Cube/Vector 是否仍有未回收工作」。若 tile 结尾
+已经 `WaitFlag` 排空所有 pipe，则此处**没有**硬件气泡，yield 只会
+拉长执行关键路径——只适合探针对比，不适合作为默认点。
+
+#### 不推荐作为默认点
+
+| 点 | 原因 |
+| -- | ---- |
+| 任意算术指令之间 | 无异步重叠；纯拉长 kernel |
+| UB/L1 上正在被 MTE/Cube 使用的数据的标量读写附近 | 易破坏 pipe 依赖与 hazard 假设 |
+| kernel 内已有的 GM atomic / 完成字发布前后 | 与 OrchCoro 的 Claim 原子可能形成同核重入与顺序难题 |
+| `deps_prepared` / metadata publish 路径 | 有跨核可见性合同，不应放进执行气泡 |
+
+**插桩合同（给 codegen / kernel 作者）：**
+
+```text
+在 CoroutineYieldToOrch 调用处，必须成立：
+1. 本核至少一条非 scalar 管线仍有未 Wait 的未完成操作；或
+2. 调用方能证明 yield 预算 << 该未完成操作的剩余延迟；
+3. kernel 的标量现场（栈、自动变量、pipe 计数、flag id）可被保存/
+   恢复，且 OrchCoro 不得破坏 ExecCoro 的 UB/L1/PIPE 状态；
+4. yield 窗口内禁止假设「当前 tile 的输出已对后继可见」。
+```
+
+### 19.4 运行时草图
+
+```cpp
+struct WorkerCoroState {
+    // Exec
+    void* exec_stack;
+    KernelFrame exec_frame;     // PC / 标定的可恢复断点 id
+    PipeSnapshot pipes;         // 哪些 flag 已 Set 未 Wait
+
+    // Orch
+    void* orch_stack;
+    ClaimCursor orch_claim;     // 下一个要尝试的 task_id 等
+    uint32_t orch_budget_atomics;
+
+    enum { EXEC, ORCH } running;
+};
+
+// ExecCoro 内由 kernel 调用
+void CoroutineYieldToOrch(uint32_t budget) {
+    SaveExecScalarContext();
+    worker.orch_budget_atomics = budget;
+    SwitchTo(ORCH);
+    // Orch 返回后：
+    RestoreExecScalarContext();
+}
+
+// OrchCoro 主循环片段
+void OrchCoroMain(WorkerCoroState& w) {
+    while (w.orch_budget_atomics > 0 && HasPendingClaimWork(w)) {
+        ClaimOutcome o = ClaimSelective(...);   // §18 + §4
+        --w.orch_budget_atomics;
+        if (o.won) {
+            ArmLocalSlotForLaterDrain(o);       // 只写本核私有状态
+            break;                              // 赢了就尽快还 Exec
+        }
+        if (ShouldReturnToExec(w)) break;
+    }
+    SwitchTo(EXEC);
+}
+```
+
+第一版建议的 **预算** 以「允许的 GM CAS 次数」计量（例如 1～2 次
+local/root），而不是墙钟时间——A5 上墙钟难在 kernel 内可靠读取，
+且 CAS 次数与 §10 的 `α` 模型直接对应。
+
+### 19.5 与现有 Claim / Selective / Drain 的衔接
+
+```text
+时间线（单核）：
+
+Claim(T) 胜 → Build/Register（传统编排段）→ Drain 启动 Kernel(T)
+    → Kernel(T) 中多次 Yield → 其间 Orch 可能 Claim(T+k) 胜/负
+    → Kernel(T) 结束 → Drain 收尾 / completion
+    → 若 T+k 已 claim 且 fanin ready，可立刻 Drain；否则再 Orch
+```
+
+要点：
+
+- **Yield 中的 Claim 不得要求当前 kernel 已完成**；它只提前做
+  owner election。`deps_prepared` 与 metadata 顺序仍走 §5 链，
+  不因 Claim 提前而越序写共享历史。
+- **winner 在 yield 窗口内**只应把结果落到**本核私有**结构（例如
+  「下一 slot 已选举」标记）；完整 Register / publish 仍回传统
+  编排段，避免与 in-core GM/UB 并发。
+- Selective（§18）仍然适用：OrchCoro 只对参与余数类发 CAS，进一
+  步减少 yield 窗口内的原子次数。
+
+### 19.6 预期收益与不收益的情形
+
+| 情形 | 预期 |
+| ---- | ---- |
+| 长 Cube/Vector tile + A 级 WaitFlag 前 yield；Claim 已是短路径（两级+Selective） | Claim 延迟被气泡吃掉，核间等待 fanin/owner 的尾部下降 |
+| kernel 标量密集、几乎无异步气泡（短 kernel / 纯 scalar） | **负收益**：切换成本直接加在关键路径 |
+| Claim 仍极热、单次 CAS ≈ 数百 ns，而单次气泡 < CAS | 需要多次 yield 才能藏完；否则只藏一部分 |
+| 执行已是全局瓶颈、编排已不是关键路径 | 端到端加速有限；应用 PMU/泳道先确认 scalar 空等占比 |
+
+验收应看三类信号，而不是只看 Claim 微基准：
+
+1. kernel 内 `yield` 次数与每次 Orch 完成的 CAS 数；
+2. 从「Kernel(T) 结束 → Claim(T+k) 完成」的间隔是否下降；
+3. 端到端 perf-clock 与 scalar 空等 PMU（若有）是否同向改善。
+
+### 19.7 挑战与风险
+
+#### 19.7.1 硬件 / 编程模型是否允许「Wait 中干别的」
+
+协作式 yield 的前提是：长操作 issue 之后，scalar **可以**在
+`WaitFlag` 之前跑别的代码，且管线继续推进。若某工具链把
+issue+wait 固化成不可拆开的 intrinsic，或 wait 期间不允许触碰
+GM 原子，则 A 级调度点不成立，方案退化为 C 级软件猜测。
+
+需要 A5 最小探针证明：
+
+```text
+Issue long Vector/Cube
+  → 中间插入 N 次 GM CAS（或 dummy scalar 工作）
+  → WaitFlag
+结果正确，且总时间 < Issue+Wait 与 CAS 串行相加
+```
+
+#### 19.7.2 上下文切换成本
+
+Exec/Orch 切换需保存：scalar 寄存器、栈指针、（可选）PC/断点 id、
+pipe/flag 记账。若由软件完整保存大量寄存器，切换可能吃掉短气泡。
+第一版应：
+
+- 限制 `KernelFrame` 为**显式断点**（标注可恢复的 yield id），避免
+  任意指令级续跑；
+- 测量「空 yield」（Orch 立即返回）的成本，作为气泡准入阈值。
+
+#### 19.7.3 同核重入与状态机
+
+当前 runtime 默认「单核单线程栈」：Claim、Drain、kernel 顺序占用
+scalar。引入协程后：
+
+- kernel 未完成时 Orch 可能改 `task_id`、slot、统计、trace；
+- 必须证明 Orch 触摸的集合与 Exec 触摸的集合在第一版**不相交**
+  （Exec：UB/L1/pipe/当前 slot；Orch：tournament 节点 + 下一
+  slot 的选举结果字）；
+- trace / PMU bracket 在切换点可能嵌套错误，泳道需新的
+  `coro_yield` / `coro_orch` 事件。
+
+#### 19.7.4 GM 原子与 in-core GM 流量的干扰
+
+即便不增加**跨核编排角色**，本核在 kernel 中段发 Claim CAS 仍会：
+
+- 占用 GM / 原子单元带宽，可能干扰同核 kernel 的 GM load/store；
+- 拉长其它核在同一 tournament 节点上的排队。
+
+因此「不增加跨核编排流量」≠「对 GM 零影响」。需要对「执行中段
+CAS」与「执行结束后 CAS」做对比探针。
+
+#### 19.7.5 正确性合同不自动继承
+
+§6 的「恰好一个 owner」与「metadata 有序」在逻辑上仍由 CAS 与
+`deps_prepared` 保证，但实现上要防：
+
+- yield 窗口内误调用 publish / completion；
+- fanin 未 ready 时提前 Drain；
+- kernel 失败路径与 Orch 已写入的「下一 winner」之间的回滚。
+
+#### 19.7.6 Codegen / 内核源侵入
+
+调度点必须打进**每个**目标 in-core 函数（或公共 tile 模板）。这是
+跨 runtime 与 codegen 的契约：
+
+- 手写 kernel：易漏插、易插在无气泡处；
+- 模板/codegen：需要统一的 `YIELD_IF_CORO_` 宏与静态检查
+  （「yield 前存在未 wait 的 issue」）；
+- 第三方/闭源 kernel：无法插桩则该核无法受益。
+
+#### 19.7.7 与「标量已满」现实的偏差
+
+本章的前提是「执行期 scalar 相对轻」。若泳道/PMU 显示某类
+kernel（例如大量地址计算 + 短向量）scalar 已是瓶颈，则 coroutine
+会加剧争用。必须以 kind 为单位门控（例如仅 PV/QK 长大 tile 开启）。
+
+### 19.8 建议推进顺序
+
+1. **PMU / 泳道取证**：量化执行期 scalar 空等 vs Cube/Vector 活跃
+   的比例；无气泡则停。
+2. **A5 微探针**：issue → N×CAS → wait 的正确性与重叠收益。
+3. **空 yield 成本探针**：标定最小有用气泡长度。
+4. **单 kind 试点**：在一个 tile 模板的 A 级点接入
+   `CoroutineYieldToOrch(1)`，Orch 只做 Selective+local CAS。
+5. **合同测试**：切换点注入、禁止 publish、owner 唯一、
+   DEPSIG/TMOPS 不变。
+6. **再扩 root CAS / 多预算**；最后才考虑在 yield 窗口做更多编排。
+
+### 19.9 小结
+
+| 维度 | 内容 |
+| ---- | ---- |
+| 想法 | 同核协作式协程：Exec 在管线气泡让出 scalar，Orch 提前做下一 task Claim |
+| 调度点 | 优先「异步 issue 之后、WaitFlag 之前」；其次双缓冲间隙；避免无气泡处乱插 |
+| 收益 | 隐藏编排延迟；不引入异核编排角色、不额外制造跨核 GM 编排多播 |
+| 代价 / 风险 | 切换成本、同核重入、GM 带宽干扰、kernel 侵入、气泡前提可能不成立 |
+| 定位 | Claim 拓扑优化见顶后的**下一正交阶段**；独立开关，不并入首版跨核 build/execute 分离 |
+
+当前结论：该方向**值得作为研究候选**，但必须先用 A5 证明
+「issue–CAS–wait」真能重叠，再用单一 kind 证明端到端收益；在此
+之前不应假设它能继续兑现与两级 tournament 同量级的加速。
