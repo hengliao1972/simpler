@@ -1440,6 +1440,33 @@ host 从独立 `SharedHostTaskPlan` 一次发布计划；device 解码同时校�
 本阶段生产仍走原 96 份 replay，A5 为 **NOT RUN**；新增 plan 只是下一阶段
 scanner 与 ticket 共用的唯一只读身份源，不能单独解释成性能收益。
 
+## 2026-08-03：S6.16 K2 scanner 改用 immutable plan
+
+在仍保留 96 份完整 replay 的过渡形态下，生产 scanner 已不再用
+`exec_candidate_bitmap` 判断 task 是否存在。每个潜在 task 先解码 host 发布
+的 4B identity：Alloc 和错 engine task 直接推进本地候选游标；属于本核 K2
+的 task 在 `EMPTY/BUILDING` 时保留队头，`BUILT` 后继续走原主候选优先、备选
+有限兜底和 exactly-once execution CAS。
+
+旧 replay 目前仍在 Close 时登记位图，以便单独比较 scanner 改动；plan scanner
+只在推进游标时清除过渡 bit，不读取它决定任务资格。CPU 状态机据此修正了旧
+假设：权威计划已声明的相关 `EMPTY` 不能因“本地尚无 bit”而永久越过；独立
+FinalDrain 测试也保持原 LocalStats cursor 生命周期，不再重建后让 execute
+owner 重读自己的 `DONE` task。
+
+完整 CPU 回归和 CCEC perf-clock 构建通过。A5 B1 为 `127.404 us`，全部语义
+与终态检查通过。同一时段交错五对 B256，旧 scanner 与 plan scanner 分别为：
+
+```text
+旧位图：3.664350, 3.673144, 3.648508, 3.659993, 3.616991 ms
+新计划：3.686876, 3.666555, 3.641949, 3.947700, 3.652301 ms
+中位数：3.659993 ms -> 3.666555 ms（+0.179%）
+```
+
+新路径有一轮 3.948 ms 长尾，其余四轮为 3.642--3.687 ms；中位差处于当前
+运行波动量级，没有证据表明结构性回退。该阶段保留，因为它关闭了 central
+ticket 接入前的任务发现缺口；下一阶段才删除全员 replay 和过渡位图写。
+
 ## 2026-08-03：S6.14 去除全员 replay 后的 K2 发现门槛
 
 生产接入前的源码审计发现，现有 `exec_candidate_bitmap` 不是共享任务队列：

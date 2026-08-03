@@ -6155,3 +6155,15 @@ host 侧拒绝不连续 task id；device 侧拒绝非法 task/batch、reserved�
 末次标记。混合 G0/G1/G2/G4 逐 task 解码与随机构参绑定通过；完整 CPU 回归及
 CCEC perf-clock 双入口/mixed ELF 构建通过。本阶段旧 96-worker replay 仍未改，
 A5 为 **NOT RUN**，因此没有性能结论。
+
+### 15.38 S6.16 用紧凑计划替代 K2 本地登记作为发现依据
+
+生产 scanner 已先切换为读取 immutable task plan，旧 96 份 replay 暂时保留。
+计划声明的相关 `EMPTY/BUILDING` 必须等待；Alloc/错 engine 直接越过；K2
+`BUILT` 后仍走原主/备候选协议。旧 candidate bit 仅作过渡清理，不再决定
+任务是否存在。
+
+CPU 全套与 CCEC perf-clock 构建通过；A5 B1 为 `127.404 us` 且全检查通过。
+同窗五对 B256 的旧/新中位为 `3.659993/3.666555 ms`，新路径 `+0.179%`；除
+一轮 3.948 ms 长尾外，其余候选为 3.642--3.687 ms。当前没有结构性回退证据，
+保留该必要前置修改，下一阶段删除全员 replay 与位图登记。

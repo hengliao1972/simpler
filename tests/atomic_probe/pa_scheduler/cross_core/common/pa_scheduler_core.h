@@ -4013,6 +4013,34 @@ PA_DEVICE bool AdvanceCrossCoreExecCandidateCursor(
     return true;
 }
 
+PA_DEVICE bool AdvanceCrossCoreExecPlanCursor(
+    LocalStats &stats, uint32_t worker_id, CoreRole role,
+    uint32_t task_id
+) {
+    const uint32_t candidate_slot = stats.exec_candidate_slot;
+    uint32_t mapped_task = kMaxTasks;
+    if (task_id >= kMaxTasks ||
+        !CrossCoreExecPotentialTaskAt(
+            worker_id, role, candidate_slot, mapped_task
+        ) ||
+        mapped_task != task_id) {
+        return false;
+    }
+    // 旧全员 replay 仍会在 Close 时登记位图；plan scanner 不再依赖
+    // 该位判断任务是否存在，但在过渡阶段顺手清除已有 bit，保持现有
+    // FinalDrain/host 终态检查不变。central ticket 接入时会删除登记源。
+    if (CrossCoreExecCandidateRegistered(
+            stats, candidate_slot
+        )) {
+        const uint32_t word = candidate_slot / 32U;
+        const uint32_t mask = 1U << (candidate_slot % 32U);
+        stats.exec_candidate_bitmap[word] &= ~mask;
+    }
+    ++stats.exec_candidate_slot;
+    stats.exec_fallback_defer_count = 0;
+    return true;
+}
+
 PA_DEVICE bool CrossCoreExecCandidateBitmapEmpty(
     const LocalStats &stats
 ) {
@@ -4464,11 +4492,11 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
         return completed_count;
     }
 
-    // replay_closed_exclusive 只由本 worker 已成功 Close 的 Submit 数
-    // 提供；production_closed 则只在全局 replay barrier 发布后为 true。
-    // 两者不能混用：异核 executor 可能已经 Close 自己的 Submit，却仍要
-    // 等另一个 builder 发布 cell。只有 production_closed 才能把残留
-    // EMPTY/BUILDING 判成永久缺口。
+    // replay_closed_exclusive 在当前过渡版本仍由本 worker 已成功 Close
+    // 的 Submit 数提供；task kind/engine 则只从 host 发布的 immutable
+    // dispatch plan 读取，不再把 owner-local candidate bit 当任务存在性。
+    // production_closed 仍只在全局 replay barrier 后为 true；只有它才能
+    // 把相关 task 的残留 EMPTY/BUILDING 判成永久缺口。
     while (true) {
         const uint32_t candidate_slot = stats.exec_candidate_slot;
         uint32_t task_id = kMaxTasks;
@@ -4478,17 +4506,49 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
             task_id >= replay_closed_exclusive) {
             break;
         }
-        const bool registered =
-            CrossCoreExecCandidateRegistered(
-                stats, candidate_slot
+        SharedBuildDispatchTask planned{};
+        if (!DecodeSharedBuildDispatchTask(
+                state->build_dispatch, task_id, planned
+            )) {
+            PublishCrossCoreRuntimeFailure<Ops>(
+                state, stats,
+                cross_core::ExecFatalReason::InvalidBuiltControl,
+                task_id, worker_id
             );
-        if (!registered) {
-            // 该 task 在本 worker 的真实 Submit 闭合时没有登记：
-            // 它要么是 Alloc，要么本 worker 不是两候选之一。
-            // 这条路径只读 owner-local 位图，绝不读 shared cell。
-            if (!AdvanceCrossCoreExecCandidateCursor(
-                    stats, worker_id, worker.role, task_id,
-                    /*expected_candidate=*/false
+            return completed_count;
+        }
+        bool executable = planned.meta.kind != TaskKind::Alloc;
+        cross_core::PaExecRoute route{};
+        uint32_t primary = cross_core::kExecUnboundOwner;
+        uint32_t secondary = cross_core::kExecUnboundOwner;
+        if (executable) {
+            executable = cross_core::ResolvePaExecRoute(
+                             planned.meta.kind,
+                             FunctionId(planned.meta.kind), route
+                         ) &&
+                         cross_core::FixedPaExecuteCandidates(
+                             task_id, route.engine_class,
+                             primary, secondary
+                         ) &&
+                         primary != secondary;
+            if (!executable) {
+                PublishCrossCoreRuntimeFailure<Ops>(
+                    state, stats,
+                    cross_core::ExecFatalReason::InvalidBuiltControl,
+                    task_id, worker_id
+                );
+                return completed_count;
+            }
+        }
+        const cross_core::ExecEngineClass route_engine =
+            CrossCoreEngineForRole(worker.role);
+        if (!executable || route.engine_class != route_engine ||
+            (worker_id != primary && worker_id != secondary)) {
+            // PotentialTaskAt 只按 task-id residue 枚举；计划中的 kind
+            // 决定真实 engine。Alloc 与错角色 task 直接越过，不等待
+            // 一个永远不会为本角色发布的本地登记位或 shared cell。
+            if (!AdvanceCrossCoreExecPlanCursor(
+                    stats, worker_id, worker.role, task_id
                 )) {
                 PublishCrossCoreRuntimeFailure<Ops>(
                     state, stats,
@@ -4498,23 +4558,6 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
                 return completed_count;
             }
             continue;
-        }
-
-        const cross_core::ExecEngineClass route_engine =
-            CrossCoreEngineForRole(worker.role);
-        uint32_t primary = cross_core::kExecUnboundOwner;
-        uint32_t secondary = cross_core::kExecUnboundOwner;
-        if (!cross_core::FixedPaExecuteCandidates(
-                task_id, route_engine, primary, secondary
-            ) ||
-            primary == secondary ||
-            (worker_id != primary && worker_id != secondary)) {
-            PublishCrossCoreRuntimeFailure<Ops>(
-                state, stats,
-                cross_core::ExecFatalReason::InvalidBuiltControl,
-                task_id, worker_id
-            );
-            return completed_count;
         }
 
         PA_GM cross_core::SharedExecCell &cell =
@@ -4571,9 +4614,8 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
             if (observed.build_owner != worker_id) {
                 return completed_count;
             }
-            if (!AdvanceCrossCoreExecCandidateCursor(
-                    stats, worker_id, worker.role, task_id,
-                    /*expected_candidate=*/true
+            if (!AdvanceCrossCoreExecPlanCursor(
+                    stats, worker_id, worker.role, task_id
                 )) {
                 PublishCrossCoreRuntimeFailure<Ops>(
                     state, stats,
@@ -4598,9 +4640,8 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
             if (observed.build_owner == worker_id) {
                 // 与 BUILDING 相同，候选集合中的 Build owner 只负责发布，
                 // 不发射 execution Claim；另一个候选仍保留任务并负责执行。
-                if (!AdvanceCrossCoreExecCandidateCursor(
-                        stats, worker_id, worker.role, task_id,
-                        /*expected_candidate=*/true
+                if (!AdvanceCrossCoreExecPlanCursor(
+                        stats, worker_id, worker.role, task_id
                     )) {
                     PublishCrossCoreRuntimeFailure<Ops>(
                         state, stats,
@@ -4716,9 +4757,8 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
                     cross_core::ExecTokenPhase::Faulted;
                 return completed_count;
             }
-            if (!AdvanceCrossCoreExecCandidateCursor(
-                    stats, worker_id, worker.role, task_id,
-                    /*expected_candidate=*/true
+            if (!AdvanceCrossCoreExecPlanCursor(
+                    stats, worker_id, worker.role, task_id
                 )) {
                 PublishCrossCoreRuntimeFailure<Ops>(
                     state, stats,
@@ -4770,9 +4810,8 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
             );
             return completed_count;
         }
-        if (!AdvanceCrossCoreExecCandidateCursor(
-                stats, worker_id, worker.role, task_id,
-                /*expected_candidate=*/true
+        if (!AdvanceCrossCoreExecPlanCursor(
+                stats, worker_id, worker.role, task_id
             )) {
             PublishCrossCoreRuntimeFailure<Ops>(
                 state, stats,

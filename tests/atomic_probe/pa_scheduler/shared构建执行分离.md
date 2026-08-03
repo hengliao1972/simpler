@@ -1317,3 +1317,15 @@ payload 或 owner 地址。host 从独立 task planner 填充，device 解码后
 
 混合 G0/G1/G2/G4 的 host 发布和 device 解码门槛已通过，CPU 全套与 CCEC
 perf-clock 构建也已通过。Submit 尚未切换到该计划，A5 尚未运行。
+
+### 2026-08-03：执行发现切换到计划，发放尚未切换
+
+K2 scanner 现在以 immutable plan 的 kind/engine 为任务资格依据：Alloc 与错
+engine 直接越过，相关 `EMPTY/BUILDING` 保留队头，`BUILT` 后继续使用原 K2
+仲裁。旧 `exec_candidate_bitmap` 不再决定 scanner 是否读取 cell；它只因旧
+96 份 replay 尚未删除而暂时保留登记，并在游标推进时清理。
+
+CPU 全套、CCEC 构建、A5 B1/B256 均通过。五对同窗 B256 中位从旧路径
+`3.659993 ms` 变为 `3.666555 ms`，差 `+0.179%`，处于运行波动量级。由此可以
+进入 central ticket 接入；下一步必须同时删除 replay Close/位图登记，不能把
+本阶段过渡形态当成最终实现。

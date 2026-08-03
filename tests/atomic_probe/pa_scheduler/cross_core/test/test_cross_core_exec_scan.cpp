@@ -317,9 +317,60 @@ private:
     SchedulerState *state_ = nullptr;
 };
 
+void EnsureDefaultDispatchPlan(SchedulerState &state) {
+    if (state.build_dispatch.task_count != 0) {
+        return;
+    }
+    constexpr uint32_t kPlanTasks =
+        kMaxBatches * kTasksPerBatch;
+    state.build_dispatch.task_count = kPlanTasks;
+    state.build_dispatch.batch_count = kMaxBatches;
+    for (uint32_t task_id = 0;
+         task_id < kPlanTasks; ++task_id) {
+        const uint32_t task_offset = task_id % kTasksPerBatch;
+        const TaskKind kind = task_offset == 0
+            ? TaskKind::Alloc
+            : static_cast<TaskKind>(task_offset);
+        SharedBuildDispatchTaskIdentity &identity =
+            state.build_dispatch.tasks[task_id];
+        identity.batch = static_cast<uint16_t>(
+            task_id / kTasksPerBatch
+        );
+        identity.encoded_meta = EncodeSharedPaTaskMeta(
+            kind, 0, false,
+            task_id + 1U == kPlanTasks
+        );
+        identity.reserved = 0;
+    }
+}
+
+bool SetDispatchTaskKind(
+    SchedulerState &state, uint32_t task_id, TaskKind kind
+) {
+    EnsureDefaultDispatchPlan(state);
+    if (task_id >= state.build_dispatch.task_count ||
+        kind >= TaskKind::Count) {
+        return false;
+    }
+    const uint32_t task_offset =
+        SharedPaTaskOffset(kind, 0);
+    if (task_id < task_offset) {
+        return false;
+    }
+    SharedBuildDispatchTaskIdentity &identity =
+        state.build_dispatch.tasks[task_id];
+    identity.encoded_meta = EncodeSharedPaTaskMeta(
+        kind, 0, false,
+        task_id + 1U == state.build_dispatch.task_count
+    );
+    identity.reserved = 0;
+    return identity.encoded_meta != 0;
+}
+
 WorkerState &PrepareWorker(
     SchedulerState &state, uint32_t worker_id, CoreRole role
 ) {
+    EnsureDefaultDispatchPlan(state);
     WorkerState &worker = state.workers[worker_id];
     worker.core_idx = static_cast<int32_t>(worker_id);
     worker.role = role;
@@ -333,6 +384,9 @@ bool PublishKernelCell(
     uint32_t build_owner, TaskKind kind,
     std::initializer_list<int32_t> fanin = {}
 ) {
+    if (!SetDispatchTaskKind(state, task_id, kind)) {
+        return false;
+    }
     PaExecRoute route{};
     PaExecShape shape{};
     if (!ResolvePaExecRoute(kind, FunctionId(kind), route) ||
@@ -409,6 +463,9 @@ bool CloseSyntheticSubmit(
     SchedulerState &state, LocalStats &stats,
     uint32_t task_id, TaskKind kind
 ) {
+    if (!SetDispatchTaskKind(state, task_id, kind)) {
+        return false;
+    }
     // 走生产 Close 边界来登记候选，避免测试直接预填 bitmap 后
     // 错把测试搭建方式当成真实 Submit 合同。
     return CloseSharedCallbackSubmit<ExecScanTestOps, false>(
@@ -479,6 +536,9 @@ bool SetTerminalKernelCell(
     TaskKind kind, uint32_t build_owner,
     uint32_t requested_execute_owner = kExecUnboundOwner
 ) {
+    if (!SetDispatchTaskKind(state, task_id, kind)) {
+        return false;
+    }
     PaExecRoute route{};
     uint32_t primary = kExecUnboundOwner;
     uint32_t secondary = kExecUnboundOwner;
@@ -816,8 +876,9 @@ void TestCloseAndRegistrationRejectHistoryRewrite() {
         }
     }
 
-    // worker 2 的第一个潜在 AIC task 是 task 1。scanner 已将这个
-    // 未登记槽永久越过后，登记原语必须拒绝把历史 bit 写回游标后方。
+    // worker 2 的第一个潜在 AIC task 是 task 1。immutable plan 已声明
+    // 它是本核 K2 候选，因此 EMPTY 时必须保留队头；不能再因本地 bit
+    // 尚未登记而永久越过。
     {
         MappedSchedulerState mapping;
         SchedulerState *state = mapping.Get();
@@ -835,12 +896,14 @@ void TestCloseAndRegistrationRejectHistoryRewrite() {
                     /*production_closed=*/false,
                     DrainPlace::EfDrain, stats
                 );
-            const bool late_registration =
+            const bool transitional_registration =
                 RegisterLocalCandidate(stats, 1, TaskKind::Qk);
             all_ok &= progressed == 0 &&
-                stats.exec_candidate_slot == 1 &&
-                !late_registration &&
-                CrossCoreExecCandidateBitmapEmpty(stats) &&
+                stats.exec_candidate_slot == 0 &&
+                transitional_registration &&
+                CandidateBitForTask(
+                    stats, kWorker, CoreRole::Aic, 1
+                ) &&
                 NoFatal(*state);
         }
     }
@@ -861,7 +924,7 @@ void TestCloseAndRegistrationRejectHistoryRewrite() {
 
     Check(
         all_ok, kTest,
-        "out-of-order/duplicate Close and stale candidate bit fail"
+        "Close history fails closed while planned EMPTY keeps its cursor"
     );
     std::printf("[PASS] %s\n", kTest);
 }
@@ -902,6 +965,14 @@ void TestOnlyTwoCandidatesObserveControl() {
             InitLocalStats(
                 stats, worker_id, RoleForWorker(worker_id)
             );
+            uint32_t target_slot =
+                kCrossCoreExecMaxCandidateSlots;
+            if (CrossCoreExecPotentialSlotForTask(
+                    worker_id, RoleForWorker(worker_id),
+                    task_id, target_slot
+                )) {
+                stats.exec_candidate_slot = target_slot;
+            }
             all_workers_ok &= RegisterLocalCandidate(
                 stats, task_id, kKernelKinds[kind_index]
             );
@@ -2345,13 +2416,19 @@ void TestFinalDrainClosesLastTask() {
             arrival_stats[worker_id], worker_id,
             RoleForWorker(worker_id)
         );
-        // 汇合测试只需要把本核所有未登记的潜在槽交给生产 scanner
-        // 越过；不能再伪造一个全局 task cursor。
-        (void)ProgressCrossCoreExec<ExecScanTestOps>(
-            state, arrival_worker, 5,
-            /*production_closed=*/true,
-            DrainPlace::FinalDrain, arrival_stats[worker_id]
-        );
+        // 该子用例从“所有 terminal task 已由其原 LocalStats 消费”之后
+        // 开始，只验证 drain arrival/release；因此把新建的测试上下文
+        // 定位到第一个计划外候选，不能让 execute owner 用丢失的旧游标
+        // 重新观察自己的 DONE task。
+        uint32_t next_task = 0;
+        while (CrossCoreExecPotentialTaskAt(
+                   worker_id, RoleForWorker(worker_id),
+                   arrival_stats[worker_id].exec_candidate_slot,
+                   next_task
+               ) &&
+               next_task < 5) {
+            ++arrival_stats[worker_id].exec_candidate_slot;
+        }
         bool released = false;
         const bool closure_ok =
             ProgressCrossCoreExecDrainClosure<ExecScanTestOps>(
