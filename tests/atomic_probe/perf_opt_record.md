@@ -6103,3 +6103,29 @@ cross-core CPU `perf-clock` 回归通过。
 CCEC、K2 scanner/candidate 登记和 FinalDrain 均为 **NOT RUN/NOT CHANGED**。
 下一阶段必须先用 A5 独立微基准比较 G8 per-task CAS 与中央 FetchAdd，不能仅
 凭调用次数把候选接入热路径。
+
+### 15.35 S6.13 A5 mixed 原子流证明中央 ticket 值得接入
+
+新增独立 CCEC 探针，以真实 mixed 1:2 metadata 同时启动 32 AIC + 64 AIV。
+当前路径按 B256/G8 精确执行 1280 × `(96 local CAS + 8 root CAS)`，节点间距
+保持生产的 512B；候选路径从一条单调 cursor 执行 1280 次有效 FetchAdd 和
+96 次越界退出。计时窗口外先完成 96 核启动会合，同一 ELF 另跑 empty 控制。
+
+三种模式轮换 11 轮，task 数、task-id sum/xor、全部 per-task node 终值、
+最终 cursor 和 96 条结果行全部 PASS：
+
+```text
+                         empty      G8 CAS      ticket
+device span median      16.535 us  556.900 us  253.851 us
+max-worker median        6.615 us  554.644 us  251.557 us
+physical atomics             0        133120         1376
+```
+
+ticket raw span 相对 G8 缩短 `54.417%`，绝对差 `303.049 us`；empty 对照证明
+差值并非启动测量假象。但 1376 次同地址 FetchAdd 自身仍约 0.25 ms，CPU
+调用数降幅不能代表 A5 延迟降幅。
+
+本阶段仍未修改生产 Submit，完整 PA 性能为 **NOT RUN**。结论只把中央
+ticket 从“CPU 协议候选”提升为“允许进入生产 A/B 的候选”。下一阶段需要
+一起解决 K2 candidate 的跨核发布、连续关闭前缀替代和 FinalDrain 闭合，
+再以 B1/B256 正确性及 perf-clock 决定是否保留。

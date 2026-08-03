@@ -1387,3 +1387,33 @@ CPU 不模拟 A5 同地址 atomic 的线性退化，不能据此宣称延迟或 
 `FetchAdd` 热点；如果中央地址的串行化代价抵消调用数收益，则改为分片 ticket
 或其他经过上板证据支持的发放结构。当前 K2 candidate 登记、执行发现和
 FinalDrain 尚未迁移，本阶段不宣称已经替换 96 份 replay。
+
+## 2026-08-03：S6.13 A5 mixed Build 发放原子拓扑取证
+
+在接生产 Submit 前，新增独立 CCEC mixed 探针，直接复刻当前 B256 Claim
+的物理形状：32 AIC + 64 AIV、全部 96 核参与、1280 个 task、每 task 八个
+local node、512B node 间距，以及 `96 local CAS + 8 root CAS`。候选路径让
+同一批 96 核从一个单调 `FetchAdd` cursor 领取 1280 个唯一 ticket，每核
+取得首个越界值后退出。
+
+同一 ELF 的 empty/G8/ticket 三模式轮换 11 轮。计时点位于 96 核启动会合
+之后；host 同时按最早 begin 到最晚 end 计算 device span，并记录最慢单核
+elapsed 和 begin spread。每轮均精确验证 task 总数、task-id sum/xor、全部
+tournament node 终值、每核身份和最终 cursor。
+
+```text
+模式                    原子数    device span 中位    最慢单核 elapsed 中位
+empty                        0          16.535 us                6.615 us
+当前 per-task G8 CAS    133120         556.900 us              554.644 us
+中央 FetchAdd ticket      1376         253.851 us              251.557 us
+```
+
+中央 ticket 在隔离原子流中缩短 `303.049 us`，相对 G8 的 raw span 降低
+`54.417%`。empty 只有 16.535 us，说明约 0.303 ms 差值不是 mixed 启动
+假象；同时 ticket 自身仍需约 0.25 ms，证明 A5 同地址返回型原子会形成明显
+串行代价。
+
+该证据支持继续做生产候选，但不等于完整 Submit 可直接减少 0.303 ms：真实
+路径还会改变 replay、EfDrain、随机构参、TensorMap 插入等待和 K2 candidate
+发布。下一阶段接入时必须保留严格插入链与最终闭合，并用独立 perf-clock
+A/B 决定保留或撤销。

@@ -1263,3 +1263,16 @@ CPU B256 用 96 个线程连续跑十轮，证明 1280 个 task 恰好一次发�
 可能近似串行，尚不能判断其真实耗时。下一步先以独立 A5 微基准比较两种地址
 拓扑，再选择中央或分片发放。CCEC Submit、K2 candidate 可见性与 FinalDrain
 均未修改，因此此处没有生产性能结论。
+
+### 2026-08-03：A5 原子拓扑允许中央 ticket 进入生产候选
+
+独立 mixed CCEC 探针已按真实 32 AIC + 64 AIV、B256/1280 task 对比当前
+G8 per-task CAS 与中央 ticket。11 轮中位 device span 为
+`556.900 us` 对 `253.851 us`；empty 为 `16.535 us`，三种模式全部语义
+检查通过。中央路径虽然把物理调用从 133120 降到 1376，但仍消耗约
+0.25 ms，不能视作免费全局 cursor。
+
+因此下一步可以进入生产 CCEC 小步接入，但验收口径仍是完整 B1/B256 终态与
+perf-clock A/B，不从微基准外推收益。接入还必须显式替换“每核 replay 才能
+形成连续 Close 前缀和 owner-local K2 candidate 位”的旧合同；不能只换 Claim
+函数便宣称完成动态发放。
