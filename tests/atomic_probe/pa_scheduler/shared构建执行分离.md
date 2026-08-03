@@ -1215,3 +1215,23 @@ perf-clock 中位从 `3.678558 ms` 降至 `3.637995 ms`，七对交错 A/B 中 6
 最终性能验收目标已经调整为 B256 perf-clock 稳定不高于 `1.0 ms`。主候选
 优先只贡献约 1% 的已验证收益，后续仍需从 Claim、发布/取得以及 execution
 progress 的结构性原子和数据访问中继续消减，不能把候选优先视为目标闭合。
+
+### 2026-08-03：解除任意 Build owner 对本核完整 replay 历史的依赖
+
+shared `PaOutputHandle` 是确定性的 `(producer_task_id, output_slot)`，不是
+winner 私有 TensorDesc 指针。基于这一合同，已增加随机访问构参 helper：从
+权威 task 身份重建 batch/group 动态状态，并只恢复当前 callback 实际消费的
+前驱 handle。混合 G0/G1/G2/G4 的 41 个 task 与原顺序 replay 逐字段一致，
+所有 active producer 都严格小于当前 task id。
+
+这只证明“单个任意 Scalar 无须保存前序 `AcceptTaskOutputs()` 状态也能正确
+构参”，尚未把生产改为中央 task queue。完整发放协议还必须同时提供：
+
+1. 全局连续、不可变且由 host 独立校验的 batch/task plan；
+2. exactly-once Build ticket，保持 96 个 Scalar 都能竞争新工作；
+3. 替代每核 Close 前缀与 candidate 位图的 execution 可见性合同；
+4. builder 停产、全部 task 已 Build、K2 token 全空和 kernel 全完成的终态闭合。
+
+因此该门槛不会被解释成已有性能收益，也不会直接删除当前 replay。下一阶段先
+在 CPU 协议用例闭合 task ticket、严格 TensorMap commit chain 和全局发布前沿，
+再决定是否接入 CCEC。

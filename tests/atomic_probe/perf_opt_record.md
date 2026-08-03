@@ -6054,3 +6054,24 @@ median = 3.675272 ms
 微基准新增的 200/500 NOP 档位，作为“减少物理 CAS 不自动等于减少完整
 调度时间”的硬件证据。后续不继续微调该延后常数，转向减少协议级返回型
 原子数量的方案。
+
+### 15.33 S6.11 结构前置证明：shared PA 支持随机访问构参
+
+最新 full-swimlane 中共有 121,600 个 loser actor；其 control 聚合核时为
+`236.412 ms`，其中 EfDrain control、Claim、Claim 后 tail 和 Submit 间转换
+分别为 `149.751/43.134/25.483/18.044 ms`。继续微调单条 Claim 无法覆盖
+`1.0 ms` 目标，因此开始审计能否减少 96 份完整 replay。
+
+审计确认 shared `AcceptTaskOutputs()` 只保存确定性的
+`(producer_task_id, output_slot)`。新增随机访问构参 helper 后，CPU 门槛用
+混合 G0/G1/G2/G4 的 41 个 task 对比原顺序 replay：全部五类 task 的 active
+TensorDesc/CreateInfo/SharedOutputRef、tag、scalar 和统计计数逐字段一致；每次
+构参前主动污染动态 orchestration 状态仍通过，且所有 shared producer 均满足
+`producer < task_id`。非法 batch 边界和 task-local kind/group 身份均被拒绝。
+完整 CPU `perf-clock` 回归与 CCEC `perf-clock` 双入口/mixed ELF 构建门槛
+全部通过。
+
+本阶段没有替换生产 replay，A5 性能为 **NOT RUN**。尚未关闭的风险是全局
+`batch_start` 权威来源，以及 K2 scanner 对每核 Close 前缀和 candidate 位图的
+依赖。下一阶段只在 CPU 协议层验证低原子 exactly-once task ticket、严格
+`deps_prepared` 插入链与全局发布前沿，证明后才进入 CCEC 热路径。

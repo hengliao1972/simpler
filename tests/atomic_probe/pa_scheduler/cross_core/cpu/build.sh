@@ -127,6 +127,20 @@ echo "[TEST] atomic PollBatch boundary self-test"
     echo "[TEST] shared authoritative host task-plan self-test"
     "$BUILD_DIR/test_shared_host_task_plan"
 
+    # 任意 Scalar 若不再全量 replay，必须能从不可变 task 身份恢复与顺序
+    # callback 完全相同的参数。该门槛覆盖混合 G0/G1/G2/G4、全部五种
+    # task、动态 shape/view/scalar 和 SharedOutputRef 前驱过滤。
+    echo "[BUILD] shared random-access PA args self-test"
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/test/test_shared_random_access_args.cpp" \
+        -o "$BUILD_DIR/test_shared_random_access_args"
+
+    echo "[TEST] shared random-access PA args self-test"
+    "$BUILD_DIR/test_shared_random_access_args"
+
     for cap in 32 64 128 256 16384; do
         binary="$BUILD_DIR/test_shared_tensor_map_ring_cap${cap}"
         echo "[BUILD] isolated shared ordinary-region ring self-test CAP=$cap"

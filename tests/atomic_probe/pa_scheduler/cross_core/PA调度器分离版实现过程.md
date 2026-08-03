@@ -499,7 +499,7 @@ cross-core TensorMap 有序插入等待: 60 s
 CCEC perf-clock 整套重编后，B1 共运行 4 轮：
 
 | 轮次 | Submit | 结果 |
-| ---- | ----: | ---- |
+| ---- | -----: | ---- |
 | 1 | 885.188 ms | PASS |
 | 2 | 2937.959 ms | PASS |
 | 3 | 278.501 us | PASS |
@@ -528,7 +528,7 @@ CCEC perf-clock 整套重编后，B1 共运行 4 轮：
 在与 B1 相同的 CCEC perf-clock ELF 上执行 B256，一轮完整通过：
 
 | 指标 | 实测值 |
-| ---- | ----: |
+| ---- | -----: |
 | Submit | 27.243 ms |
 | 计划 task | 1280 |
 | Build winner | 1280 |
@@ -635,7 +635,7 @@ tests/atomic_probe/pa_scheduler/outputs/
 ### control、候选位与 FinalDrain 合同
 
 | 观察状态 | S4 K2 实际动作 |
-| -------- | ---------------- |
+| -------- | -------------- |
 | `EMPTY` | 生产未闭合时保留候选位，不发射 CAS，不读 payload |
 | `BUILDING` | 若本 observer 就是 `build_owner`，立即退役其本地候选位；其他 eligible observer 保留候选位等待 `BUILT` |
 | `BUILT` + token 空闲 | eligible observer 发射 Claim CAS；winner 绑定，`Lost/NotBuilt` 保留候选位并重新观察 |
@@ -889,8 +889,8 @@ Scalar 无 coherence 下的 DCCI/atomic 动态证据。
 S5b 普通运行与 S5a `27.143 ms` 单样本相比约 `+0.75%`；完整泳道与
 S5a `27.301 ms` 单样本相比约 `+3.48%`。已知长尾与单轮波动使这些数字
 不足以宣称稳定回退，但当前也没有证据说明全 96 Scalar 的到达式负载
-均衡已覆盖 60.5% 额外物理 Claim CAS。S5b 作为“TensorMap 严格串行插入
-+ 96 Scalar 自由 Build 竞争 + K2 异核 Execute”的功能基线保留；S6 在此架构内
+均衡已覆盖 60.5% 额外物理 Claim CAS。S5b 作为“TensorMap 严格串行插入 +
+96 Scalar 自由 Build 竞争 + K2 异核 Execute”的功能基线保留；S6 在此架构内
 直接优化，不依赖 `try_wait` 或 kernel/调度 overlap 才判定性能去留。
 
 完整 B256 泳道在：
@@ -967,7 +967,7 @@ kernel、1280 条 fanin edge、2048 个 shared output 和 1280 个插入完成�
 均保持原合同。排他对比为：
 
 | 指标 | S5b 原泳道 | S6.1 门控 | 变化 |
-| --- | ---: | ---: | ---: |
+| ---- | ---------: | --------: | ---: |
 | Submit 墙钟 | 28.250448 ms | 8.765063 ms | -68.974% |
 | SubmitUnion 聚合核时 | 2572.730800 ms | 743.456767 ms | -71.102% |
 | EfDrainControl 聚合核时 | 2301.070442 ms | 517.839958 ms | -77.500% |
@@ -1096,7 +1096,7 @@ trace closure 全部 PASS，drop 为 0。local/root Claim CAS 仍精确为
 full-swimlane 的关键聚合核时变化为：
 
 | 指标 | S6.2 | S6.3 | 变化 |
-| --- | ---: | ---: | ---: |
+| ---- | ---: | ---: | ---: |
 | Submit 墙钟 | 6.894677 ms | 3.843832 ms | -44.249% |
 | SubmitUnion | 570.907881 ms | 302.512968 ms | -47.012% |
 | EfDrainControl | 369.541582 ms | 149.858920 ms | -59.447% |
@@ -1323,3 +1323,32 @@ nop500 3.671612 ms  (-0.100%)
 并重新编译干净 perf-clock 产物确认。仅保留探针的 200/500 NOP 档位和本次
 负向结论。下一步不再微调 prefilter 延后，而是寻找能直接减少协议级返回型
 原子数量、且不在每次 Claim 前新增共享读取的结构性方案。
+
+## 2026-08-03：S6.11 随机访问构参等价门槛
+
+当前 96 个 worker 各自顺序 replay 1,280 个 task，除了参与 Claim，还用
+`AcceptTaskOutputs()` 保存本核后继 callback 所需的输出 handle。源码审计确认
+shared handle 只是确定性的 `(producer_task_id, output_slot)`，不携带 winner
+私有地址；因此“任意 Scalar 能 Build”不必以“每核必须先回放全部前驱”为
+唯一实现方式。
+
+新增 `BindSharedPaTaskForRandomAccess()`，只从经过校验的
+`(batch, batch_start, task_id, kind, group_index)` 重建当前 callback 会读取的
+动态 batch/group 状态和前驱 output ref。它不触碰 TensorMap、Claim、执行
+cell 或发布状态，并且只为 SF/PV/UP 写入严格早于当前 task 的 producer。
+
+CPU 等价门槛逐 task 比较顺序 replay 与随机访问构参，覆盖混合
+G0/G1/G2/G4、全部五类 task、动态 shape、query/output view、scalar 和
+SharedOutputRef；共 41 个 task 全部逐字段一致。门槛还在每次随机构参前污染
+上一 task 的动态状态，证明结果不依赖历史 `AcceptTaskOutputs()` 遗留值，并
+验证所有 active shared producer 均满足 `producer < task_id`。
+完整 CPU `perf-clock` 构建与全部门槛已通过；CCEC `perf-clock`
+的 AIC/AIV 入口、split runtime/finish、mixed ELF、符号和重定位检查也已通过。
+
+本阶段没有改生产调用点，也没有 A5 性能结论。它只关闭任务发放重构的第一项
+前置证明。仍需独立解决：
+
+- `batch_start` 必须来自全局连续且不可变的权威 plan；单 task helper 不扫描
+  历史 batch，也不自行冒充全局 oracle；
+- 当前 K2 scanner 依赖每 worker 的连续 Close 前缀和 owner-local candidate
+  位图；减少全量 replay 前，必须用全局发布前沿或等价合同替换这两项依赖。
