@@ -2276,3 +2276,84 @@ candidate mean   改善 0.074158 ms / 3.023%
 同行干扰，而不是单条 arrival FetchAdd 本身大幅变快。该阶段不改
 TensorMap 严格插入、Build/Execute owner、fanin、completion 或终态收口合同，
 因此作为有效优化保留。
+
+## 2026-08-04：S6.33 分片 execution drain arrival
+
+S6.32 已把 arrival 与 release 拆到不同 cache line，但 96 个 worker 在
+execution token 排空后仍对同一个 arrival 字执行返回型 FetchAdd。A5 对同地址
+并发返回型 Atomic 的延迟会随竞争人口显著增长；上一阶段泳道中仅 96 次
+arrival FetchAdd 的聚合核时仍为 `726.548 us`，说明“消除同行干扰”之后，
+同地址 RMW 本身已成为下一处明确开销。
+
+本阶段没有减少必须到达的 worker，也没有把 FinalDrain 终态检查交给 host。
+实现将 execution drain 固定划为 16 个 arrival group：
+
+```text
+worker 完成本核 scanner/token 排空
+-> group = block_id % 16
+-> 对 arrivals[group] 做且只做一次 FetchAdd
+-> 普通 worker 只轮询独立 release
+-> 固定 root 轮询 16 个 group count
+-> 每组精确等于 6
+-> root 全量校验 Alloc EMPTY / kernel DONE
+-> root 唯一 CAS 发布 release
+```
+
+当前 32 block、每 block `1 AIC + 2 AIV`，所以每个 group 正好覆盖两个
+block、六个 Scalar。同地址返回型 FetchAdd 的最大并发人口由 96 降为 6；
+代价是 root 增加 16 条分组计数的累计轮询。arrival、release 以及每个分组
+计数仍各自独占 64B atomic-only cache line，所有 worker 全到达、所有 task
+终态闭合和唯一 release 的正确性合同保持不变。
+
+实现前先把布局门槛改为 `16 * 64B arrival + 64B release = 1088B`，并要求
+release 偏移为 `1024B`；S6.32 旧实现按预期以 `128 != 1088`、`64 != 1024`
+失败。实现后补齐了以下门槛：
+
+- CPU worker 初始化严格复用生产拓扑的 block/lane/sub-block 映射；
+- 定向用例证明 16 组各到达 6 次、root 在全组到达前不发布、全组到达后
+  完成唯一 release，重复推进不会重复 arrival；
+- host 从设备快照逐组核对 `arrival == 6`，不只检查 release；
+- 新增 `shared_exec_drain_arrival_poll` AtomicSite 和 PollBatch 映射，避免把
+  root 的 group load 混入所有 worker 的 release poll；
+- execution state 精确搬运字节数由 `20,182,336` 更新为 `20,183,296`；
+- full-swimlane AIC 对象经 `readelf` 求证为 4 个 split-finish relocation，
+  且全部指向本角色唯一 finish 符号，构建门槛据此精确更新为 4，没有放宽
+  成范围判断。
+
+完整 CPU 协议回归、CPU B256、converter 63 项测试、CCEC
+full-swimlane/perf-clock 构建以及 A5 B256 full-swimlane 全部 PASS。A5
+full-swimlane 为：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260803_192526_397391/ccec/merged_swimlane.json`
+
+归档副本为：
+
+`test_record/2026-8-4/cross_b256_s633_2p725ms.json`
+
+该次动态结果为：
+
+- 完整生命周期：`2.725357 ms`；
+- Submit：`1.134504 ms`；
+- FinalDrain：`1.744753 ms`；
+- arrival FetchAdd：96 次、聚合 `726.548 -> 65.585 us`，下降 `90.97%`；
+- arrival FetchAdd 最大值：`18.208 -> 5.314 us`；
+- root arrival poll：43 次逻辑 load；
+- 1280 task、1024 kernel、TensorMap、payload、fanin、completion 和终态全部
+  PASS。
+
+单次 full-swimlane 受诊断布局与设备波动影响，不用于裁决。最终以提交
+`74c97937` 构建冻结 S6.32 基线，与候选按 B-C/C-B 交错各运行六个独立
+trace-free B256 进程：
+
+```text
+S6.32 frozen baseline: min / median / max / mean
+                       2.342994 / 2.553943 / 2.752440 / 2.551345 ms
+S6.33 candidate      : min / median / max / mean
+                       2.388638 / 2.427673 / 2.513362 / 2.435302 ms
+candidate median 改善 0.126270 ms / 4.944%
+candidate mean   改善 0.116043 ms / 4.548%
+```
+
+中位数与均值同向，且候选六个样本的长尾明显低于基线。结合泳道中 arrival
+RMW 聚合核时下降 `90.97%`，可以把端到端收益归因到竞争人口缩减，而不是
+减少 worker、跳过终态检查或把工作移出计时边界。该阶段作为有效优化保留。

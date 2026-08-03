@@ -166,6 +166,8 @@ PA_DEVICE int32_t TraceAtomicPollBatchIndex(AtomicSite site) {
             return 5;
         case AtomicSite::SharedExecDrainReleasePoll:
             return 6;
+        case AtomicSite::SharedExecDrainArrivalPoll:
+            return 7;
         default:
             return -1;
     }
@@ -187,6 +189,8 @@ PA_DEVICE AtomicSite TraceAtomicPollBatchSite(uint32_t index) {
             return AtomicSite::ReplayDonePoll;
         case 6:
             return AtomicSite::SharedExecDrainReleasePoll;
+        case 7:
+            return AtomicSite::SharedExecDrainArrivalPoll;
         default:
             return AtomicSite::Count;
     }

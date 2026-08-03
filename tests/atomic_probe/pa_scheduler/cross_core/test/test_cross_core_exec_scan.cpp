@@ -379,7 +379,15 @@ WorkerState &PrepareWorker(
     WorkerState &worker = state.workers[worker_id];
     worker.core_idx = static_cast<int32_t>(worker_id);
     worker.role = role;
-    worker.sub_block_id = static_cast<int32_t>(worker_id & 1U);
+    if (role == CoreRole::Aic) {
+        worker.block_id = static_cast<int32_t>(worker_id);
+        worker.lane = 0;
+    } else {
+        const uint32_t vector_id = worker_id - kAicWorkers;
+        worker.block_id = static_cast<int32_t>(vector_id / 2U);
+        worker.lane = static_cast<int32_t>(1U + vector_id % 2U);
+    }
+    worker.sub_block_id = worker.lane == 2 ? 1 : 0;
     for (uint32_t token_slot = 0;
          token_slot < kExecTokensPerWorker; ++token_slot) {
         ResetExecutionToken(
@@ -2493,6 +2501,9 @@ void TestFinalDrainClosesLastTask() {
 
     std::array<bool, kWorkers> arrived{};
     std::array<LocalStats, kWorkers> arrival_stats{};
+    std::array<int64_t,
+               cross_core::kExecDrainArrivalGroups>
+        expected_group_arrivals{};
     bool all_arrivals_ok = true;
     for (uint32_t worker_id = 0;
          worker_id < kWorkers; ++worker_id) {
@@ -2523,17 +2534,43 @@ void TestFinalDrainClosesLastTask() {
                 arrival_stats[worker_id],
                 arrived[worker_id], released
             );
+        const uint32_t arrival_group =
+            static_cast<uint32_t>(arrival_worker.block_id) %
+            cross_core::kExecDrainArrivalGroups;
+        ++expected_group_arrivals[arrival_group];
         all_arrivals_ok &= closure_ok && arrived[worker_id] &&
-            released == (worker_id + 1U == kWorkers) &&
-            state->exec_drain.arrived ==
-                static_cast<int64_t>(worker_id + 1U);
+            !released &&
+            state->exec_drain.arrivals[arrival_group].state ==
+                expected_group_arrivals[arrival_group];
+    }
+    for (uint32_t group = 0;
+         group < cross_core::kExecDrainArrivalGroups;
+         ++group) {
+        all_arrivals_ok &=
+            expected_group_arrivals[group] == 6 &&
+            state->exec_drain.arrivals[group].state == 6;
     }
     Check(
         all_arrivals_ok &&
-            state->exec_drain.arrived ==
-                static_cast<int64_t>(kWorkers) &&
-            state->exec_drain.release == 1 && NoFatal(*state),
-        kTest, "last arrival validates dynamic legal terminal owners"
+            state->exec_drain.release.state == 0 &&
+            NoFatal(*state),
+        kTest, "six workers arrive in each of sixteen drain groups"
+    );
+
+    // worker 0 是唯一 root observer；它在自己的首次到达时尚未看到
+    // 其余分组闭合。全部 96 个 worker 到达后再次推进，才校验所有
+    // terminal cell 并发布 release。
+    bool root_released = false;
+    const bool root_ok =
+        ProgressCrossCoreExecDrainClosure<ExecScanTestOps>(
+            state, state->workers[0], 5, arrival_stats[0],
+            arrived[0], root_released
+        );
+    Check(
+        root_ok && root_released &&
+            state->exec_drain.release.state == 1 &&
+            NoFatal(*state),
+        kTest, "root validates terminal cells after every group arrives"
     );
 
     bool repeat_released = false;
@@ -2544,8 +2581,8 @@ void TestFinalDrainClosesLastTask() {
         );
     Check(
         repeat_ok && repeat_released &&
-            state->exec_drain.arrived ==
-                static_cast<int64_t>(kWorkers),
+            state->exec_drain.release.state == 1 &&
+            state->exec_drain.arrivals[0].state == 6,
         kTest, "one worker cannot increment drain twice"
     );
     std::printf("[PASS] %s\n", kTest);

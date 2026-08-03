@@ -57,6 +57,9 @@ constexpr uint32_t kExecDispatchGlobalContextIndex = 49;
 // 容量先作为协议常量固定为 2；以后若参数化，必须重新验证状态大小、
 // FinalDrain 和“容量满时不再 Claim”的边界。
 constexpr uint32_t kExecTokensPerWorker = 2;
+// execution drain 按物理 block 分成 16 组；96 个 Scalar 在当前
+// 1 AIC + 2 AIV/block 拓扑下每组精确包含 6 个 worker。
+constexpr uint32_t kExecDrainArrivalGroups = 16;
 
 static_assert(
     kExecTensorDescBytes % sizeof(uint64_t) == 0,
@@ -251,19 +254,13 @@ struct alignas(kExecCacheLineBytes) SharedExecFatalControl {
 };
 
 // 所有 replay actor 停产之后，再汇合本核 execution token 的排空证据。
-// arrival 与 release 必须各自独占 atomic-only cache line：已到达 worker
-// 会持续 poll release，不能让这些读与尚未到达 worker 的 arrival FetchAdd
-// 发生伪共享。最后到达者逐 task 核对 cell 终态后发布 release；
-// 这样 device 退出不依赖 host 事后发现遗失的 BUILT task。
+// 96 个 worker 不再竞争同一 arrival，而是按 block%16 分到 16 条
+// atomic-only line；指定 root worker 观察每组精确 6 个到达后，
+// 逐 task 核对 cell 终态并发布唯一 release。release 仍独占最后一行，
+// 已到达 worker 的轮询不会干扰任一 arrival RMW。
 struct alignas(kExecCacheLineBytes) SharedExecDrainControl {
-    volatile int64_t arrived;
-    uint8_t arrived_padding[
-        kExecCacheLineBytes - sizeof(int64_t)
-    ];
-    volatile int64_t release;
-    uint8_t release_padding[
-        kExecCacheLineBytes - sizeof(int64_t)
-    ];
+    SharedExecControl arrivals[kExecDrainArrivalGroups];
+    SharedExecControl release;
 };
 
 struct alignas(kExecCacheLineBytes) ExecPayloadStorage {
@@ -436,14 +433,16 @@ static_assert(
     "global fatal control must own one atomic-only cache line"
 );
 static_assert(
-    sizeof(SharedExecDrainControl) == 2U * kExecCacheLineBytes &&
+    sizeof(SharedExecDrainControl) ==
+            (kExecDrainArrivalGroups + 1U) *
+                kExecCacheLineBytes &&
         alignof(SharedExecDrainControl) == kExecCacheLineBytes,
-    "execution drain arrival and release must own two cache lines"
+    "execution drain groups and release must own separate cache lines"
 );
 static_assert(
     offsetof(SharedExecDrainControl, release) ==
-        kExecCacheLineBytes,
-    "execution drain release must not share the arrival cache line"
+        kExecDrainArrivalGroups * kExecCacheLineBytes,
+    "execution drain release must follow all arrival group lines"
 );
 static_assert(
     offsetof(SharedExecCell, payload) == kExecCacheLineBytes,

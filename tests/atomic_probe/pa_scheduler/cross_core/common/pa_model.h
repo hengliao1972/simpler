@@ -810,7 +810,10 @@ enum class AtomicSite : uint32_t {
     SharedExecDrainArrive = 52,
     SharedExecDrainReleasePublish = 53,
     SharedExecDrainReleasePoll = 54,
-    Count = 55,
+    // 只由指定 root worker 轮询 16 条分组 arrival，与所有
+    // worker 轮询的 release 分开命名，不在泳道中混淆地址语义。
+    SharedExecDrainArrivalPoll = 55,
+    Count = 56,
 };
 
 // Atomic 记录 flags 的低四位保存操作种类；bit4 表示返回值参与后续判断，
@@ -832,7 +835,7 @@ constexpr uint32_t kAtomicPollBatch = 1U << 7;
 constexpr uint32_t kAtomicRetriesShift = 8;
 constexpr uint32_t kAtomicPollCountShift = 8;
 constexpr uint32_t kAtomicPollCountMax = 0x00ffffffU;
-constexpr uint32_t kAtomicPollBatchSiteCount = 7;
+constexpr uint32_t kAtomicPollBatchSiteCount = 8;
 static_assert(kAtomicPollBatchSiteCount <= 32, "PollBatch enable mask supports at most 32 compact indices");
 
 // DCCI 与 Atomic 使用同一个 32B TraceRecord，但拥有完全独立的 raw ABI。
@@ -988,6 +991,7 @@ PA_MODEL_INLINE constexpr bool AtomicSiteResultUsed(AtomicSite site) {
         case AtomicSite::SharedExecDrainArrive:
         case AtomicSite::SharedExecDrainReleasePublish:
         case AtomicSite::SharedExecDrainReleasePoll:
+        case AtomicSite::SharedExecDrainArrivalPoll:
             return true;
         case AtomicSite::Count:
             return false;
@@ -1011,6 +1015,8 @@ PA_MODEL_INLINE constexpr int32_t AtomicPollBatchIndex(AtomicSite site) {
             return 5;
         case AtomicSite::SharedExecDrainReleasePoll:
             return 6;
+        case AtomicSite::SharedExecDrainArrivalPoll:
+            return 7;
         default:
             return -1;
     }
@@ -1032,6 +1038,8 @@ PA_MODEL_INLINE constexpr AtomicSite AtomicPollBatchSite(uint32_t index) {
             return AtomicSite::ReplayDonePoll;
         case 6:
             return AtomicSite::SharedExecDrainReleasePoll;
+        case 7:
+            return AtomicSite::SharedExecDrainArrivalPoll;
         default:
             return AtomicSite::Count;
     }

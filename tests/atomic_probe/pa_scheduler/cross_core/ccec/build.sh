@@ -219,10 +219,11 @@ SPLIT_STATE_STORAGE_BYTES=1728
 # 只能指向本角色唯一 finish 符号，不能放宽为范围判断。
 SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC=1
 SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIV=3
-# 新增执行包 atomic/DCCI 诊断后，full-swimlane AIC 的五类 Build dispatch
-# 再次被编译器尾合并为三个调用点；任务覆盖由 dispatch/动态门槛证明，
-# 此处仍精确锁定当前形状，并要求它们只指向本角色的唯一 finish 符号。
-SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC=3
+# execution drain 分组 root 分支改变了 full-swimlane AIC 的尾合并形状：
+# 对象文件实测为四个 relocation，且全部只指向本角色唯一 finish
+# 符号。任务覆盖仍由 dispatch/动态门槛证明；这里继续精确锁定为 4，
+# 不放宽成范围。
+SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC=4
 # 调度边界集中读取 global fatal 后，AIV 的等价尾部由三处变为四处；
 # AIC 仍为三处。任务覆盖由 CPU 动态门槛证明，这里只冻结当前 CCEC
 # 机器码形状，并继续要求全部 relocation 指向本角色唯一 finish 符号。

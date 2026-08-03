@@ -1163,7 +1163,7 @@ inline constexpr size_t CrossCoreExecStateBytes() {
     return kCrossCoreExecStateBytes;
 }
 static_assert(
-    CrossCoreExecStateBytes() == 20182336,
+    CrossCoreExecStateBytes() == 20183296,
     "cross-core execution state transfer size changed"
 );
 static_assert(
@@ -1398,6 +1398,7 @@ inline const char *AtomicSiteName(uint32_t site) {
         "SharedExecDrainArrive",
         "SharedExecDrainReleasePublish",
         "SharedExecDrainReleasePoll",
+        "SharedExecDrainArrivalPoll",
     };
     static_assert(
         sizeof(names) / sizeof(names[0]) ==
@@ -4886,10 +4887,23 @@ inline Metrics Validate(
         cross_core_exec_terminal_snapshot_ok &=
             state.results[worker].final_occupied == 0;
     }
-    const bool cross_core_exec_drain_ok =
-        state.exec_drain.arrived ==
-            static_cast<int64_t>(kWorkers) &&
-        state.exec_drain.release == 1;
+    static_assert(
+        kWorkers % cross_core::kExecDrainArrivalGroups == 0,
+        "host drain oracle requires balanced arrival groups"
+    );
+    constexpr int64_t kExecDrainWorkersPerGroup =
+        static_cast<int64_t>(
+            kWorkers / cross_core::kExecDrainArrivalGroups
+        );
+    bool cross_core_exec_drain_ok =
+        state.exec_drain.release.state == 1;
+    for (uint32_t group = 0;
+         group < cross_core::kExecDrainArrivalGroups;
+         ++group) {
+        cross_core_exec_drain_ok &=
+            state.exec_drain.arrivals[group].state ==
+                kExecDrainWorkersPerGroup;
+    }
     const bool cross_core_exec_fatal_clear =
         state.exec_fatal.state == 0;
     if (!cross_core_exec_fatal_clear) {

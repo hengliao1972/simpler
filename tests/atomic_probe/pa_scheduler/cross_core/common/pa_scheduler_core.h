@@ -5235,11 +5235,24 @@ PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
 ) {
     released = false;
     if (state == nullptr || worker.core_idx < 0 ||
-        static_cast<uint32_t>(worker.core_idx) >= kWorkers) {
+        static_cast<uint32_t>(worker.core_idx) >= kWorkers ||
+        worker.block_id < 0 ||
+        static_cast<uint32_t>(worker.block_id) >= kAicWorkers) {
         return false;
     }
     const uint32_t worker_id =
         static_cast<uint32_t>(worker.core_idx);
+    static_assert(
+        kWorkers % cross_core::kExecDrainArrivalGroups == 0,
+        "execution drain groups must evenly partition workers"
+    );
+    constexpr int64_t kWorkersPerArrivalGroup =
+        static_cast<int64_t>(
+            kWorkers / cross_core::kExecDrainArrivalGroups
+        );
+    const uint32_t arrival_group =
+        static_cast<uint32_t>(worker.block_id) %
+        cross_core::kExecDrainArrivalGroups;
     if (!arrived) {
         if (!CrossCoreExecWorkerDrained(
                 state, worker, task_count, stats
@@ -5250,11 +5263,12 @@ PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
         const int64_t prior = TraceAtomicFetchAdd<Ops>(
             stats.trace, stats.result, -1,
             AtomicSite::SharedExecDrainArrive,
-            &state->exec_drain.arrived, 1,
+            &state->exec_drain.arrivals[arrival_group].state,
+            1,
             /*result_used=*/true
         );
         if (prior < 0 ||
-            prior >= static_cast<int64_t>(kWorkers)) {
+            prior >= kWorkersPerArrivalGroup) {
             PublishCrossCoreRuntimeFailure<Ops>(
                 state, stats,
                 cross_core::ExecFatalReason::CompletionStateConflict,
@@ -5263,39 +5277,13 @@ PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
             return false;
         }
         arrived = true;
-        if (prior + 1 == static_cast<int64_t>(kWorkers)) {
-            uint32_t first_bad_task = task_count;
-            if (!ValidateCrossCoreExecTerminalCells<Ops>(
-                    state, task_count, first_bad_task, stats
-                )) {
-                PublishCrossCoreRuntimeFailure<Ops>(
-                    state, stats,
-                    cross_core::ExecFatalReason::CompletionStateConflict,
-                    first_bad_task, worker_id
-                );
-                return false;
-            }
-            if (TraceAtomicCompareExchange<Ops>(
-                    stats.trace, stats.result, -1,
-                    AtomicSite::SharedExecDrainReleasePublish,
-                    &state->exec_drain.release, 0, 1,
-                    /*result_used=*/true
-                ) != 0) {
-                PublishCrossCoreRuntimeFailure<Ops>(
-                    state, stats,
-                    cross_core::ExecFatalReason::CompletionStateConflict,
-                    task_count, worker_id
-                );
-                return false;
-            }
-        }
     }
 
     const int64_t release =
         TraceAtomicLoad<Ops>(
             stats.trace, stats.result, -1,
             AtomicSite::SharedExecDrainReleasePoll,
-            &state->exec_drain.release,
+            &state->exec_drain.release.state,
             /*result_used=*/true
         );
     if (release == 1) {
@@ -5310,6 +5298,61 @@ PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
         );
         return false;
     }
+    // 只让固定 root worker 扫描 16 条 arrival line；其余 95 个 worker
+    // 只轮询独立 release。这样既把 RMW 竞争从 96 路降到每地址 6 路，
+    // 又不会把“检查所有分组”的读取复制到全部 Scalar。
+    if (worker_id != 0) {
+        return true;
+    }
+    for (uint32_t group = 0;
+         group < cross_core::kExecDrainArrivalGroups;
+         ++group) {
+        const int64_t group_arrivals =
+            TraceAtomicLoad<Ops>(
+                stats.trace, stats.result, -1,
+                AtomicSite::SharedExecDrainArrivalPoll,
+                &state->exec_drain.arrivals[group].state,
+                /*result_used=*/true
+            );
+        if (group_arrivals < 0 ||
+            group_arrivals > kWorkersPerArrivalGroup) {
+            PublishCrossCoreRuntimeFailure<Ops>(
+                state, stats,
+                cross_core::ExecFatalReason::CompletionStateConflict,
+                task_count, worker_id
+            );
+            return false;
+        }
+        if (group_arrivals != kWorkersPerArrivalGroup) {
+            return true;
+        }
+    }
+
+    uint32_t first_bad_task = task_count;
+    if (!ValidateCrossCoreExecTerminalCells<Ops>(
+            state, task_count, first_bad_task, stats
+        )) {
+        PublishCrossCoreRuntimeFailure<Ops>(
+            state, stats,
+            cross_core::ExecFatalReason::CompletionStateConflict,
+            first_bad_task, worker_id
+        );
+        return false;
+    }
+    if (TraceAtomicCompareExchange<Ops>(
+            stats.trace, stats.result, -1,
+            AtomicSite::SharedExecDrainReleasePublish,
+            &state->exec_drain.release.state, 0, 1,
+            /*result_used=*/true
+        ) != 0) {
+        PublishCrossCoreRuntimeFailure<Ops>(
+            state, stats,
+            cross_core::ExecFatalReason::CompletionStateConflict,
+            task_count, worker_id
+        );
+        return false;
+    }
+    released = true;
     return true;
 }
 
@@ -6744,6 +6787,9 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #if PTO_FDWIC_SHARED_MAP
             | TraceAtomicPollBatchMask(
                 AtomicSite::SharedExecDrainReleasePoll
+            )
+            | TraceAtomicPollBatchMask(
+                AtomicSite::SharedExecDrainArrivalPoll
             )
 #endif
     );
