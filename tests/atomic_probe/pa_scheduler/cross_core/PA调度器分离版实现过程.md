@@ -2184,3 +2184,43 @@ candidate mean   回退 0.053402 ms / 2.210%
 因此，“返回型 Atomic 次数减少”在这里没有转化为端到端收益，反而削弱了冷
 失败的无写入合同。候选代码和测试修改已完整撤回，只保留本节反例；后续不再
 以删除 heap vend 前置读取作为优化方向。
+
+## 2026-08-04：S6.31 发布 Exchange 改为只记发射边界（无稳定收益，已撤回）
+
+S6.29 泳道中 `shared_output_published_exchange` 有 2048 次。它在
+descriptor 拷贝、DCCI 和 StoreBarrier 之后发布 `published=task_id`，
+并消费 Exchange 返回的旧值检查是否为 `-1`。候选方案利用
+`SharedExecCell EMPTY -> BUILDING` 已确立唯一 Build owner、每个 output
+的 `last_writer` FetchMax 已完成单次预留这两个条件，尝试不再消费
+published Exchange 的旧值；消费者仍通过 atomic poll 等待对应
+`task_id`。
+
+定向测试先冻结该 site 为 `source_issue`，旧实现按预期失败。候选
+实现后，完整 CPU 协议回归、CCEC full-swimlane/perf-clock 构建和
+A5 B256 full-swimlane 均 PASS，1280 task、1024 kernel、TensorMap 严格
+插入、payload、fanin、completion 和终态均未变。候选 raw 为：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260803_184300_359040/ccec/l2_swimlane_records.json`
+
+修正候选 converter 的站点语义后，2048 次 Exchange 全部显示为
+`atomic.source_issue.shared_output_published_exchange.exchange`，不再误标为
+`return_ready`。该次完整生命周期为 `2.641440 ms`，Submit 为
+`1.078390 ms`，FinalDrain 为 `1.677379 ms`。
+
+随后以提交 `2d0e6c95` 构建冻结 S6.29 基线，按 B-C/C-B 交错各
+运行六个独立 trace-free 进程：
+
+```text
+S6.29 frozen baseline: min / median / max / mean
+                       2.362611 / 2.396578 / 2.494395 / 2.408258 ms
+S6.31 candidate      : min / median / max / mean
+                       2.330193 / 2.405667 / 2.488242 / 2.404911 ms
+candidate median 回退 0.009089 ms / 0.379%
+candidate mean   改善 0.003347 ms / 0.139%
+```
+
+中位数和均值方向相反，且差异明显小于当前运行波动，无法证明
+取消返回等待带来稳定端到端收益。同时，它会去掉生产者侧
+对“在 last_writer 预留与 published Exchange 之间发生非法并发写”
+的异常检测与回滚。因此候选代码、测试和 converter 口径已全部
+撤回，保留原有 `return_ready` 协议，本节只记录反例证据。
