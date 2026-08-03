@@ -1635,3 +1635,18 @@ adapter、host 校验和 PA 形态测试的候选改动仍依据稳定的 `+21.0
 生产继续使用全内联 mask=0。后续 WinnerBuild 优化不能再用“把 descriptor
 读取整体后移到 executor”这一形态，应优先减少重复解析/发布操作，或先证明
 可以批量获取引用区域而不增加逐 descriptor acquire 成本。
+
+## 2026-08-03：S6.20 收敛 full-swimlane split-finish 结构门槛
+
+S6.19 后用精确父提交和后继候选分别重编 full-swimlane，确认两套源码的
+AIC/AIV caller 都恰好生成 3 个 role-compatible finish `.rela.text`
+重定位；旧门槛仍把 swimlane AIC 固定为 5，因而会同时误拒绝干净基线和候选。
+这不是 task kind 覆盖减少：中央 ticket 的五类 dispatch、1280 个 task 唯一
+Build、1024 个 kernel 闭合继续由 CPU 动态测试验证，CCEC 结构检查也仍要求
+caller/runtime/finish 的唯一强符号、角色隔离、外部 block-local state 引用和
+最终 mixed ELF 无残留重定位。
+
+本阶段只把 swimlane AIC 的精确期望从旧值 5 更新为当前真实值 3，与 AIV 和
+perf-clock 保持一致；没有改成范围判断，也没有修改 device kernel。修正后，
+精确父提交与后继候选的 AIC/AIV full-swimlane 构建均通过。该提交只恢复观察
+链路，不包含 A5 性能收益。

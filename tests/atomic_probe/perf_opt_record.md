@@ -6245,3 +6245,11 @@ A5 B1 和 B256 全部正确性检查均通过。
 adapter/host/PA 测试接线已完整撤回，通用引用协议门槛保留但默认 mask 继续
 为 0。后续不再整体后移 descriptor 获取；若继续利用引用能力，必须先证明
 批量 acquire 或更少 DCCI 的内存合同，并重新通过冻结 ELF A/B。
+
+### 15.42 S6.20 修正 full-swimlane 的旧 finish 重定位期望
+
+精确父提交与后继候选的 AIC/AIV swimlane caller 实际都为 3 个 finish
+重定位，旧 AIC=5 门槛会同时拒绝二者。五类 task 覆盖由中央 ticket 的 CPU
+动态测试闭合，CCEC 仍逐项检查 split 强符号、角色隔离、block-local state 和
+最终 ELF。因此只把 AIC 的精确期望收敛为 3，没有放宽为范围，也没有改 kernel。
+两套 full-swimlane 构建均通过；本项是观察链路修正，不声明性能收益。

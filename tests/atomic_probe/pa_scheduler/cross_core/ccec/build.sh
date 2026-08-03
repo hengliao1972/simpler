@@ -206,12 +206,12 @@ COMMON_FLAGS=(
 # 使用同一数值，不能靠多留一条未说明的 cache line 掩盖 ABI 漂移。
 SPLIT_STATE_STORAGE_BYTES=1728
 # 中央 ticket 之后不再为五种 task 人为保留五份 replay 尾部。CCEC 会按
-# role/观察构建合并相同尾部：perf-clock 两个 role 均为 3 条；swimlane
-# 因 AIC 的 trace 控制流不同而保留 5 条，AIV 仍为 3 条。五种 kind 是否
-# 完整覆盖由 dispatch switch 和 CPU 动态协议测试证明；这里精确锁定当前
-# 每种产物的真实代码形状，防止 finish 被内联/删除，又不阻止有益的合并。
+# role/观察构建合并相同尾部：当前 perf-clock 与 swimlane 的两个 role
+# 均为 3 条。五种 kind 是否完整覆盖由 dispatch switch 和 CPU 动态协议
+# 测试证明；这里精确锁定当前每种产物的真实代码形状，防止 finish 被
+# 内联/删除，又不把 CCEC 对等尾部的有益合并误判成覆盖缺失。
 SPLIT_FINISH_CALL_SITES_PERF_CLOCK=3
-SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC=5
+SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC=3
 SPLIT_FINISH_CALL_SITES_SWIMLANE_AIV=3
 COMMON_FLAGS+=(
     -mllvm -cce-block-local-relocate=true
