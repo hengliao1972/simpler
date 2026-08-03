@@ -842,6 +842,51 @@ void TestVersionsWindowAndMultipleBuckets() {
     ExpectEqual(producer, -1, kTest, "touching half-open ranges do not overlap");
 }
 
+void TestNoReclaimLookupSkipsHeadControl() {
+    constexpr const char *kTest = "no-reclaim-lookup-head-elision";
+    auto map = NewMap();
+    RecordingOps::DisableEvents();
+
+    const SharedRegionValue entry =
+        MakeRegion(0x238000000ULL, 0, 64, 0);
+    const uint32_t bucket = TensorMapHash(entry.buffer_addr);
+    Expect(
+        TryCommitTask(*map, 0, {entry}) ==
+            CommitResult::Committed,
+        kTest, "setup publishes one immutable-prefix entry"
+    );
+
+    RecordingOps::ResetEvents();
+    bool protocol_ok = false;
+    const int32_t producer =
+        SharedLookupRegion<RecordingOps, false, true>(
+            *map, MakeRegion(
+                entry.buffer_addr, 8, 24, -1
+            ),
+            /*current_task=*/1, /*heap_window=*/8,
+            protocol_ok
+        );
+    const void *const head = const_cast<const int64_t *>(
+        &map->buckets[bucket].head.value
+    );
+    const void *const tail = const_cast<const int64_t *>(
+        &map->buckets[bucket].tail.value
+    );
+    Expect(
+        protocol_ok && producer == 0,
+        kTest, "no-reclaim lookup returns the exact producer"
+    );
+    Expect(
+        FindEvent(EventKind::Load, head, 0) ==
+                RecordingOps::events.size() &&
+            FindEvent(EventKind::Load, tail, 0) <
+                RecordingOps::events.size(),
+        kTest,
+        "compile-time no-reclaim contract removes only the head load"
+    );
+    RecordingOps::DisableEvents();
+}
+
 void TestOrderedReclaimFormulaAndExactTurn() {
     constexpr const char *kTest = "ordered-reclaim-exact-turn";
     int64_t candidate = -2;
@@ -2814,6 +2859,7 @@ int main() {
     TestAbiResetAndZeroEntryCommit();
     TestPublicationOrderAndDoubleSeqCheck();
     TestVersionsWindowAndMultipleBuckets();
+    TestNoReclaimLookupSkipsHeadControl();
     TestOrderedReclaimFormulaAndExactTurn();
     TestAbsoluteSeqMultipleLapsAndAba();
     TestCapacityFailureIsAllOrNothing();

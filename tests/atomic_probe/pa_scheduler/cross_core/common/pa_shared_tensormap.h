@@ -92,7 +92,10 @@ PA_DEVICE bool SharedReadRegionSlot(
 
 // lookup 的权威时间窗为 [current_task-H, current_task)。即使更快 winner
 // 已经发布未来 entry，也不能把 producer>=current_task 引入本核 fanin。
-template <typename Ops, bool ObserveAtomics = false>
+template <
+    typename Ops, bool ObserveAtomics = false,
+    bool NoReclaim = false
+>
 PA_DEVICE int32_t SharedLookupRegion(
     PA_GM SharedTensorMapSidecar &map, const SharedRegionValue &query,
     int32_t current_task, int32_t heap_window, bool &protocol_ok,
@@ -103,12 +106,15 @@ PA_DEVICE int32_t SharedLookupRegion(
         return -1;
     }
     const uint32_t bucket = TensorMapHash(query.buffer_addr);
-    int64_t signed_head =
-        TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
-        trace, result, current_task,
-        AtomicSite::SharedMapLookupHeadLoad,
-        &map.buckets[bucket].head.value
-    );
+    int64_t signed_head = 0;
+    if constexpr (!NoReclaim) {
+        signed_head =
+            TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
+            trace, result, current_task,
+            AtomicSite::SharedMapLookupHeadLoad,
+            &map.buckets[bucket].head.value
+        );
+    }
     const int64_t signed_tail =
         TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
         trace, result, current_task,
@@ -121,27 +127,34 @@ PA_DEVICE int32_t SharedLookupRegion(
                     kMapBucketCapacity,
             0
         )) {
-        if (signed_head < 0 || signed_tail < 0) {
+        if constexpr (NoReclaim) {
+            // insert-before-lookup 的正式基线不推进 head，也不复用槽；
+            // 因此 head 恒为 0，tail 越界只能是协议错误，不能通过一次
+            // 重读 head 恢复。
             return -1;
+        } else {
+            if (signed_head < 0 || signed_tail < 0) {
+                return -1;
+            }
+            // head/tail 是两个独立 control atomic。reader 先读旧 head 后，
+            // writer 可能合法回收前缀、复用槽并发布新 tail，从而让混合快照
+            // 暂时呈现 span>CAP。异常支路只重读一次 head；唯有 head 单调
+            // 前进后能把同一 tail 重新约束到容量内，才接受该快照。
+            const int64_t refreshed_head =
+                TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
+                    trace, result, current_task,
+                    AtomicSite::SharedMapLookupHeadLoad,
+                    &map.buckets[bucket].head.value
+                );
+            if (refreshed_head < signed_head ||
+                refreshed_head > signed_tail ||
+                static_cast<uint64_t>(
+                    signed_tail - refreshed_head
+                ) > kMapBucketCapacity) {
+                return -1;
+            }
+            signed_head = refreshed_head;
         }
-        // head/tail 是两个独立 control atomic。reader 先读旧 head 后，
-        // writer 可能合法回收前缀、复用槽并发布新 tail，从而让混合快照
-        // 暂时呈现 span>CAP。异常支路只重读一次 head；唯有 head 单调
-        // 前进后能把同一 tail 重新约束到容量内，才接受该快照。
-        const int64_t refreshed_head =
-            TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
-                trace, result, current_task,
-                AtomicSite::SharedMapLookupHeadLoad,
-                &map.buckets[bucket].head.value
-            );
-        if (refreshed_head < signed_head ||
-            refreshed_head > signed_tail ||
-            static_cast<uint64_t>(
-                signed_tail - refreshed_head
-            ) > kMapBucketCapacity) {
-            return -1;
-        }
-        signed_head = refreshed_head;
     }
 
     const int32_t lower =
@@ -158,22 +171,29 @@ PA_DEVICE int32_t SharedLookupRegion(
                 ),
                 0
             )) {
-            // reader 保存旧 head 后，未来唯一 writer 仍可合法回收
-            // producer < current_task-H 的无关前缀，并复用其物理槽。只有
-            // head 已单调越过当前 cursor，才能把 seq 双检失败解释为这类
-            // 合法复用；否则继续 fail-closed，不能吞掉真实 slot 损坏。
-            const int64_t refreshed_head =
-                TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
-                    trace, result, current_task,
-                    AtomicSite::SharedMapLookupHeadLoad,
-                    &map.buckets[bucket].head.value
-                );
-            if (refreshed_head < signed_head ||
-                refreshed_head > signed_tail ||
-                cursor >= static_cast<uint64_t>(refreshed_head)) {
+            if constexpr (NoReclaim) {
+                // 无回收实例不存在合法 ABA 或并发复用；seq 双检失败
+                // 直接按协议错误返回。
                 return -1;
+            } else {
+                // reader 保存旧 head 后，未来唯一 writer 仍可合法回收
+                // producer < current_task-H 的无关前缀，并复用其物理槽。只有
+                // head 已单调越过当前 cursor，才能把 seq 双检失败解释为这类
+                // 合法复用；否则继续 fail-closed，不能吞掉真实 slot 损坏。
+                const int64_t refreshed_head =
+                    TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
+                        trace, result, current_task,
+                        AtomicSite::SharedMapLookupHeadLoad,
+                        &map.buckets[bucket].head.value
+                    );
+                if (refreshed_head < signed_head ||
+                    refreshed_head > signed_tail ||
+                    cursor >=
+                        static_cast<uint64_t>(refreshed_head)) {
+                    return -1;
+                }
+                cursor = static_cast<uint64_t>(refreshed_head);
             }
-            cursor = static_cast<uint64_t>(refreshed_head);
             continue;
         }
         if (candidate.producer >= lower &&
@@ -190,6 +210,7 @@ PA_DEVICE int32_t SharedLookupRegion(
 
 template <
     typename Ops, bool ObserveAtomics = false,
+    bool NoReclaim = false,
     typename TensorReference
 >
 PA_DEVICE int32_t SharedLookupTensor(
@@ -198,7 +219,7 @@ PA_DEVICE int32_t SharedLookupTensor(
     TraceContext *trace = nullptr, WorkerResult *result = nullptr
 ) {
     const SharedRegionValue query = MakeSharedRegionValue(tensor, -1);
-    return SharedLookupRegion<Ops, ObserveAtomics>(
+    return SharedLookupRegion<Ops, ObserveAtomics, NoReclaim>(
         map, query, current_task, heap_window, protocol_ok,
         trace, result
     );

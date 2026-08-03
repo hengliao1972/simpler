@@ -1872,7 +1872,8 @@ PA_DEVICE bool ResolveSharedSymbolWriterBefore(
 template <
     typename Ops, bool ChainedWriter = false,
     bool AcceptLatestWriter = false,
-    bool UsePaAccumulatorGroupWriter = false
+    bool UsePaAccumulatorGroupWriter = false,
+    bool NoOrdinaryReclaim = false
 >
 PA_DEVICE uint32_t CollectSharedFanin(
     PA_GM SharedTensorMapSidecar &map, const TaskArgs &args,
@@ -2103,7 +2104,9 @@ PA_DEVICE uint32_t CollectSharedFanin(
                  (owner != kInvalidTaskId || AcceptLatestWriter))) {
                 bool lookup_ok = false;
                 const int32_t producer =
-                    SharedLookupTensor<Ops, true>(
+                    SharedLookupTensor<
+                        Ops, true, NoOrdinaryReclaim
+                    >(
                     map, tensor, task_id, heap_window, lookup_ok,
                     &stats.trace, &stats.result
                 );
@@ -2142,7 +2145,9 @@ PA_DEVICE uint32_t CollectSharedFanin(
                  (owner != kInvalidTaskId || AcceptLatestWriter))) {
                 bool lookup_ok = false;
                 const int32_t producer =
-                    SharedLookupTensor<Ops, true>(
+                    SharedLookupTensor<
+                        Ops, true, NoOrdinaryReclaim
+                    >(
                     map, tensor, task_id, heap_window, lookup_ok,
                     &stats.trace, &stats.result
                 );

@@ -2793,3 +2793,60 @@ candidate mean   回退 0.020673 ms / 1.454%
 进一步证据时把回退武断归因于某一项。候选实现与测试适配已完整撤回，保留原有
 publication 检查。本节再次说明：泳道中的 Atomic 聚合核时用于发现候选，不能
 替代冻结无观察 A/B 的保留裁决。
+
+## 2026-08-04：S6.42 用无回收合同删除 TensorMap head 原子读取
+
+S6.38 的正式 PA 路径仍为每次 ordinary TensorMap lookup 读取
+bucket `head` 和 `tail` 两个 control Atomic。但当前正式实例是
+单轮不回收模式：
+
+```text
+host init: reclaim_upto = -1, bucket head = 0
+device:    不调用 ordered reclaim，不推进 head
+host end:  校验 reclaim_upto 仍为 -1
+```
+
+所以在这一个明确实例中，`head` 的动态读值恒为 0。候选给
+`SharedLookupRegion/SharedLookupTensor/CollectSharedFanin` 增加默认为
+false 的编译期无回收参数，只在正式 ordered PA 调用点显式选用。
+这个实例：
+
+- 以常量 0 作为 `head`，删除 `SharedMapLookupHeadLoad`；
+- 保留会被前序插入更新的 `tail` 原子读取；
+- 容量越界或 slot seq 双检失败时直接 fail-closed，不进入回收重读；
+- 通用可回收实例保留原有 `head/tail` 混合快照、前缀回收和
+  ABA 处理，没有用 PA 假设改写通用语义。
+
+定向 CPU 用例证明无回收 lookup 返回精确 producer，对 bucket
+head 零次 Load，对 tail 仍恰好一次 Load。完整 CPU 协议回归、
+converter/analyzer 99 项回归、CCEC full-swimlane/perf-clock 构建和
+A5 B256 full-swimlane 全部 PASS。诊断泳道为：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260803_230133_596174/ccec/merged_swimlane.json`
+
+该次诊断结果为：
+
+- 完整生命周期：`1.452110 ms`；
+- Submit：`1.113723 ms`；
+- `SharedMapLookupHeadLoad`：`1280 -> 0`；
+- `SharedMapLookupTailLoad`：保持 1280 次，聚合核时 `316.830 us`；
+- 1280 task、1024 kernel、TensorMap 严格插入、payload、fanin、
+  completion 和全部终态 PASS，泳道记录无丢失。
+
+单次诊断不用于裁决。最终以提交 `88830ca4` 构建冻结 S6.38 基线，
+与候选按 B-C/C-B 交错各运行 12 个独立 trace-free B256 进程：
+
+```text
+S6.38 frozen baseline: min / median / max / mean
+                       1.405662 / 1.429825 / 1.470568 / 1.434233 ms
+S6.42 candidate      : min / median / max / mean
+                       1.390242 / 1.423283 / 1.461963 / 1.423091 ms
+candidate median 改善 0.006543 ms / 0.458%
+candidate mean   改善 0.011142 ms / 0.777%
+```
+
+12 对样本中候选有 10 对更快，中位数和均值同向改善。这是一项
+小幅但可重复的收益；保留依据不是泳道聚合核时，而是正式无回收
+不变量、完整正确性门槛和冻结无观察 A/B 三者同时成立。
+未来若引入任何 device 侧回收或 ring 复用，调用点必须切回通用实例，
+重新恢复 head 原子读取和 ABA 判定。

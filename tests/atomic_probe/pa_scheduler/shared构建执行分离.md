@@ -7,13 +7,13 @@
 | 目标 | 让 task 的构建 owner 与 kernel 执行 owner 可以是不同物理核 |
 | 当前代码 | 96 Scalar 通过中央 ticket 恰好一次 Build；Build owner 发布 task-indexed shared payload，K2 排除 Build owner 后的 1 或 2 个 eligible executor 竞争执行 |
 | 本文性质 | 持续更新的架构与内存模型设计记录 |
-| 正式实现 | S0–S6.38 已形成中央 ticket + 严格 TensorMap 插入 + K2 异核 Execute；执行扫描得到的完整 control 快照直接参与 Claim CAS；execution drain 采用 16 组单向 arrival，并在同一次 FetchAdd 中汇合 owner-local 完成数，固定 root 不再逐 task 原子扫描；descriptor 引用、unique-ticket 单 CAS、发布 Exchange 非等待和 winner fatal 重复读取候选均已撤销 |
+| 正式实现 | S0–S6.42 已形成中央 ticket + 严格 TensorMap 插入 + K2 异核 Execute；执行扫描得到的完整 control 快照直接参与 Claim CAS；execution drain 采用 16 组单向 arrival，并在同一次 FetchAdd 中汇合 owner-local 完成数，固定 root 不再逐 task 原子扫描；正式单轮 TensorMap 实例明确禁止回收，lookup 不再读取恒为 0 的 bucket head；descriptor 引用、unique-ticket 单 CAS、发布 Exchange 非等待和 winner fatal 重复读取候选均已撤销 |
 | CPU 正确性用例 | S1–S4 K2、S5a 对侧角色 Build 与 S5b 全 96 Scalar Build 门槛已完成 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
-| A5 PA 功能/性能 | 旧 `2.323 ms` 是 Submit-only 数字，已退出性能裁决；当前唯一口径为首个 Submit 起点到 FinalDrain 结束。S6.38 相对 S6.36 的 6+6 冻结交错 A/B 中，中位由 `2.127 ms` 降至 `1.416 ms`，改善 `33.454%`；功能与终态全部 PASS |
+| A5 PA 功能/性能 | 旧 `2.323 ms` 是 Submit-only 数字，已退出性能裁决；当前唯一口径为首个 Submit 起点到 FinalDrain 结束。S6.38 相对 S6.36 的 6+6 冻结交错 A/B 中，中位由 `2.127 ms` 降至 `1.416 ms`，改善 `33.454%`；S6.42 再以 12+12 交错 A/B 确认中位 `1.430 -> 1.423 ms`、均值改善 `0.777%`；功能与终态全部 PASS |
 | S4 动态 Execute election | K2 首版已通过 CPU B1/B256 和 A5 B1/B256；B256 中两候选都有实际胜出，非法 owner 为 0 |
 | S5 Build 拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 五类 task 全 96/G8 已通过 CPU/CCEC/A5 B1/B256，物理 Claim CAS 精确闭合 |
-| 当前调度缺口 | 双 token Claim-first 已解决旧的 FinalDrain backlog；S6.29 复用 Claim 快照，S6.32–S6.36 收敛 drain，S6.38 再删除 root 的 2560 次逐 task 终态读取。当前 trace-free 中位约 `1.416 ms`，下一步继续从真实业务依赖和同地址竞争两侧审视剩余 Atomic，不能再用单次诊断 core-time 代替冻结 A/B |
+| 当前调度缺口 | 双 token Claim-first 已解决旧的 FinalDrain backlog；S6.29 复用 Claim 快照，S6.32–S6.36 收敛 drain，S6.38 删除 root 的 2560 次逐 task 终态读取，S6.42 再删除 1280 次无回收 lookup head 原子读取。当前 trace-free 中位约 `1.423 ms`，下一步继续从真实业务依赖和同地址竞争两侧审视剩余 Atomic，不能再用单次诊断 core-time 代替冻结 A/B |
 | 明确非目标 | 不引入 `try_wait`、engine continuation 或“kernel 运行期间同一 Scalar 继续调度” |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
@@ -653,6 +653,17 @@ fresh output cell 由 task 唯一 Build owner 独占，它的 descriptor 发布�
 - 有依赖 task 必须等 producer completion flag；
 - 一个 task 已经 `BUILT` 不表示其 fanin ready；
 - executor 不能因为队列头未 ready 阻止后续独立 task 执行。
+
+当前正式 PA 是单轮、不复用的 TensorMap 实例：host 将
+`reclaim_upto` 初始化为 `-1`，device 不推进它，host 终态也要求它
+仍为 `-1`。因此每个 bucket 的 `head` 在整个 kernel 内恒为 0，
+正式 Fanin lookup 可在编译期选用无回收实例，不再对 `head`
+执行返回型原子读取。`tail` 仍由前序插入 owner 推进，lookup
+必须保留其原子读取。无回收实例若遇到 `tail < 0`、
+`tail - head > capacity` 或 slot seq 双检失败，必须直接报协议错误，
+不能伪装成可回收场景。通用可回收实例仍保留 `head/tail`
+双读、混合快照重读和 ABA 判定；未来一旦正式路径引入复用，
+必须撤销该编译期选项，不得仅修改运行时 `reclaim_upto`。
 
 因此，一个简单按 task id 排序的单 FIFO 可能产生 head-of-line blocking。它可以作为第一版正确性模型，但不能未经数据就当最终高性能结构。
 
