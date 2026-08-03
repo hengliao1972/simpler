@@ -688,6 +688,48 @@ int main() {
         initialized_mixed_ok,
         "InitializeState writes the exact shared CLI context vector"
     );
+    bool dispatch_plan_ok =
+        state->build_dispatch.next_task.value == 0 &&
+        state->build_dispatch.task_count == mixed.total_tasks &&
+        state->build_dispatch.batch_count == mixed.batch_count;
+    for (uint32_t task_id = 0;
+         task_id < mixed.total_tasks; ++task_id) {
+        const SharedBuildDispatchTaskIdentity &identity =
+            state->build_dispatch.tasks[task_id];
+        dispatch_plan_ok &=
+            identity.batch == mixed.tasks[task_id].batch &&
+            identity.encoded_meta ==
+                EncodeSharedHostDispatchMeta(
+                    mixed.tasks[task_id], mixed.total_tasks
+                ) &&
+            identity.reserved == 0;
+    }
+    for (uint32_t task_id = mixed.total_tasks;
+         task_id < kMaxTasks; ++task_id) {
+        const SharedBuildDispatchTaskIdentity &identity =
+            state->build_dispatch.tasks[task_id];
+        dispatch_plan_ok &= identity.batch == 0 &&
+            identity.encoded_meta == 0 &&
+            identity.reserved == 0;
+    }
+    ok &= Check(
+        dispatch_plan_ok,
+        "InitializeState publishes one compact immutable identity per task"
+    );
+
+    SharedHostTaskPlan malformed_dispatch = mixed;
+    malformed_dispatch.tasks[1].task_id = 2;
+    std::string malformed_dispatch_error;
+    ok &= Check(
+        !PopulateSharedBuildDispatchPlan(
+            state.get(), malformed_dispatch,
+            &malformed_dispatch_error
+        ) &&
+            !malformed_dispatch_error.empty() &&
+            state->build_dispatch.task_count == 0,
+        "dispatch-plan publication rejects a non-contiguous task identity"
+    );
+    InitializeState(state.get(), mixed_options);
 
     ok &= Check(
         CheckCli(),

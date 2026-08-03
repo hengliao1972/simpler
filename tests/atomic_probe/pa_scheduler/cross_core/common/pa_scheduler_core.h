@@ -246,13 +246,6 @@ PA_DEVICE uint64_t TraceTimestampAfterAtomicResult(
 PA_DEVICE uint32_t KindIndex(TaskKind kind) { return static_cast<uint32_t>(kind); }
 
 #if PTO_FDWIC_SHARED_MAP
-constexpr uint8_t kSharedPaTicketMetaPresent = 1U << 7;
-constexpr uint8_t kSharedPaTicketLastSubmit = 1U << 6;
-constexpr uint8_t kSharedPaTicketHasFollowing = 1U << 5;
-constexpr uint8_t kSharedPaTicketKindMask = 0x07U;
-constexpr uint8_t kSharedPaTicketGroupShift = 3;
-constexpr uint8_t kSharedPaTicketGroupMask = 0x03U;
-
 struct SharedPaTaskMeta {
     TaskKind kind;
     uint32_t group_index;
@@ -327,6 +320,41 @@ PA_DEVICE bool DecodeSharedPaTaskMeta(
     meta.is_last_submit = is_last_submit;
     meta.chained_writer =
         kind == TaskKind::Up && group_index != 0;
+    return true;
+}
+
+struct SharedBuildDispatchTask {
+    uint32_t task_id;
+    uint32_t batch;
+    SharedPaTaskMeta meta;
+};
+
+PA_DEVICE bool DecodeSharedBuildDispatchTask(
+    PA_GM const SharedBuildDispatchState &dispatch,
+    uint32_t task_id, SharedBuildDispatchTask &task
+) {
+    if (dispatch.task_count == 0 ||
+        dispatch.task_count > kMaxTasks ||
+        dispatch.batch_count == 0 ||
+        dispatch.batch_count > kMaxBatches ||
+        task_id >= dispatch.task_count) {
+        return false;
+    }
+    PA_GM const SharedBuildDispatchTaskIdentity &identity =
+        dispatch.tasks[task_id];
+    SharedPaTaskMeta meta{};
+    if (identity.reserved != 0 ||
+        identity.batch >= dispatch.batch_count ||
+        !DecodeSharedPaTaskMeta(
+            identity.encoded_meta, task_id, meta
+        ) ||
+        meta.is_last_submit !=
+            (task_id + 1U == dispatch.task_count)) {
+        return false;
+    }
+    task.task_id = task_id;
+    task.batch = identity.batch;
+    task.meta = meta;
     return true;
 }
 #endif

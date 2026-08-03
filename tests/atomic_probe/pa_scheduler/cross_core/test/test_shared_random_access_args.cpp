@@ -221,11 +221,94 @@ bool CheckInvalidIdentityRejection() {
            !BindSharedPaTaskForRandomAccess(orch, 0, 0, 5, TaskKind::Count, 0);
 }
 
+bool CheckCompactDispatchIdentity() {
+    constexpr uint32_t kBatches = 5;
+    constexpr uint32_t kTasks = 41;
+    int32_t contexts[kBatches] = {
+        0, 8192, 8193, 16384, 32768,
+    };
+    SharedBuildDispatchState dispatch{};
+    dispatch.task_count = kTasks;
+    dispatch.batch_count = kBatches;
+    uint32_t task_cursor = 0;
+    for (uint32_t batch = 0; batch < kBatches; ++batch) {
+        SharedPaBatchPlan plan{};
+        if (!BuildSharedPaBatchPlan(
+                static_cast<uint64_t>(contexts[batch]),
+                task_cursor, plan
+            )) {
+            return false;
+        }
+        for (uint32_t offset = 0;
+             offset < plan.task_count; ++offset) {
+            SharedPaPlannedTask planned{};
+            if (!SharedPaPlannedTaskAt(
+                    plan, offset, planned
+                )) {
+                return false;
+            }
+            const uint32_t task_id = task_cursor + offset;
+            SharedBuildDispatchTaskIdentity &identity =
+                dispatch.tasks[task_id];
+            identity.batch = static_cast<uint16_t>(batch);
+            identity.encoded_meta = EncodeSharedPaTaskMeta(
+                planned.kind, planned.group_index,
+                planned.has_following_group,
+                task_id + 1U == kTasks
+            );
+            identity.reserved = 0;
+        }
+        task_cursor += plan.task_count;
+    }
+    if (task_cursor != kTasks) {
+        return false;
+    }
+
+    PaOrchestrationState orch{};
+    InitPaOrchestration(orch, kBatches, contexts);
+    for (uint32_t task_id = 0; task_id < kTasks; ++task_id) {
+        SharedBuildDispatchTask task{};
+        if (!DecodeSharedBuildDispatchTask(
+                dispatch, task_id, task
+            ) ||
+            task.task_id != task_id ||
+            !BindSharedPaTaskForRandomAccess(
+                orch, task.batch, task.meta.batch_start,
+                task.task_id, task.meta.kind,
+                task.meta.group_index
+            )) {
+            return false;
+        }
+    }
+
+    SharedBuildDispatchTask ignored{};
+    dispatch.tasks[1].reserved = 1;
+    const bool rejects_reserved =
+        !DecodeSharedBuildDispatchTask(dispatch, 1, ignored);
+    dispatch.tasks[1].reserved = 0;
+    dispatch.tasks[1].batch = kBatches;
+    const bool rejects_batch =
+        !DecodeSharedBuildDispatchTask(dispatch, 1, ignored);
+    dispatch.tasks[1].batch = 1;
+    dispatch.tasks[kTasks - 1U].encoded_meta &=
+        static_cast<uint8_t>(~kSharedPaTicketLastSubmit);
+    const bool rejects_missing_last =
+        !DecodeSharedBuildDispatchTask(
+            dispatch, kTasks - 1U, ignored
+        );
+    return rejects_reserved && rejects_batch &&
+           rejects_missing_last &&
+           !DecodeSharedBuildDispatchTask(
+               dispatch, kTasks, ignored
+           );
+}
+
 }  // namespace
 
 int main() {
     Check(CheckSequentialEquivalence(), "random-access args equal complete sequential G0/G1/G2/G4 replay");
     Check(CheckInvalidIdentityRejection(), "invalid batch bounds and task-local identities fail closed");
+    Check(CheckCompactDispatchIdentity(), "compact immutable dispatch identities decode and bind each task");
     std::printf("[RANDOM_ARGS_TEST] status=%s\n", g_failures == 0 ? "PASS" : "FAIL");
     return g_failures == 0 ? 0 : 1;
 }

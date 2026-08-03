@@ -6143,3 +6143,15 @@ plan 跳过 Alloc/错 engine，相关 task 未 Build 时保留队头，Build 后
 后继 Build 推进。完整 CPU `perf-clock` 回归通过。本阶段生产 CCEC 和 A5
 性能仍为 **NOT CHANGED / NOT RUN**；它只为下一提交替换本地 candidate 位图
 提供正确性门槛。
+
+### 15.37 S6.15 增加紧凑 Build dispatch 只读计划
+
+为避免生产接入时临时扫描 `context_lens` 或复制大对象，standalone state 尾部
+增加 17,536 B 的 `SharedBuildDispatchState`。第一条 cache line 独占未来的
+ticket atomic；计划 header 与每 task 4B identity 均由 host 在 launch 前写定、
+device 只读。B256 有效 identity 数据为 5 KiB，不携带 TensorDesc/TaskArgs。
+
+host 侧拒绝不连续 task id；device 侧拒绝非法 task/batch、reserved、meta 和
+末次标记。混合 G0/G1/G2/G4 逐 task 解码与随机构参绑定通过；完整 CPU 回归及
+CCEC perf-clock 双入口/mixed ELF 构建通过。本阶段旧 96-worker replay 仍未改，
+A5 为 **NOT RUN**，因此没有性能结论。

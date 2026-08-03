@@ -1418,6 +1418,28 @@ empty                        0          16.535 us                6.615 us
 发布。下一阶段接入时必须保留严格插入链与最终闭合，并用独立 perf-clock
 A/B 决定保留或撤销。
 
+## 2026-08-03：S6.15 发布 device 可读的紧凑 task plan
+
+在不改 Submit 控制流的前提下，先把 S6.11--S6.14 使用的权威 task identity
+落入 standalone state 尾部。`SharedBuildDispatchState` 的第一条 cache line
+只放未来的 `next_task` atomic；只读 header 从第二条 cache line 开始，随后
+每个 task 只占 4 字节：`uint16 batch + uint8 encoded_meta + uint8 reserved`。
+task id 由数组下标给出，`batch_start` 由既有 meta 中的 kind/group 和 task id
+反推，因此不复制 TensorDesc、TaskArgs 或 worker 私有地址。
+
+B256/G1 的 1280 个 task 只增加 5 KiB 计划数据；按编译上限 4352 task 计算，
+整个 dispatch sidecar 为 17,536 B。它追加在 execution token 之后，不移动
+production prefix、shared TensorMap、Claim Tournament、exec cell 或 token 的
+既有 offset；host/device 尾部传输范围同步扩展。
+
+host 从独立 `SharedHostTaskPlan` 一次发布计划；device 解码同时校验 task/batch
+上限、reserved、meta 和全局末次标记。混合 G0/G1/G2/G4 自检逐 task 完成解码
+与随机构参绑定，并拒绝非连续 host task id、越界 batch、非零 reserved 和丢失
+末次标记。完整 CPU `perf-clock` 回归和 CCEC AIC/AIV/mixed ELF 构建均通过。
+
+本阶段生产仍走原 96 份 replay，A5 为 **NOT RUN**；新增 plan 只是下一阶段
+scanner 与 ticket 共用的唯一只读身份源，不能单独解释成性能收益。
+
 ## 2026-08-03：S6.14 去除全员 replay 后的 K2 发现门槛
 
 生产接入前的源码审计发现，现有 `exec_candidate_bitmap` 不是共享任务队列：

@@ -227,6 +227,18 @@ static_assert(
 #else
 constexpr uint32_t kMaxTasks = kMaxBatches * kTasksPerBatch;
 #endif
+
+#if PTO_FDWIC_SHARED_MAP
+// shared PA 的紧凑 task meta 同时供 host 预构建的只读计划与 device
+// 随机访问构参使用。bit7 表示有效，bit6 表示整轮最后一个 Submit，
+// bit5 表示同 batch 仍有下一 group；低 5 bit 保存 group 与 kind。
+constexpr uint8_t kSharedPaTicketMetaPresent = 1U << 7;
+constexpr uint8_t kSharedPaTicketLastSubmit = 1U << 6;
+constexpr uint8_t kSharedPaTicketHasFollowing = 1U << 5;
+constexpr uint8_t kSharedPaTicketKindMask = 0x07U;
+constexpr uint8_t kSharedPaTicketGroupShift = 3;
+constexpr uint8_t kSharedPaTicketGroupMask = 0x03U;
+#endif
 constexpr uint32_t kTaskCellCapacity = 1U << 16;
 
 constexpr uint32_t kAicWorkers = 32;
@@ -1316,6 +1328,41 @@ static_assert(
         kSharedClaimTournamentNodeStride,
     "shared Claim local nodes must follow the root"
 );
+
+struct SharedBuildDispatchTaskIdentity {
+    // task_id 由数组下标给出；batch_start 可由 task_id、kind 和 group
+    // 反推，因此只需保存随机访问 view 所需的 batch 与既有 1B meta。
+    uint16_t batch;
+    uint8_t encoded_meta;
+    uint8_t reserved;
+};
+static_assert(
+    sizeof(SharedBuildDispatchTaskIdentity) == 4,
+    "shared Build dispatch task identity must remain compact"
+);
+
+struct alignas(64) SharedBuildDispatchState {
+    // next_task 是本结构唯一的 device 可写字段，并独占第一条 cache line。
+    // 后续 header/plan 均由 host 在 launch 前一次写定，device 只读。
+    AtomicLine next_task;
+    uint32_t task_count;
+    uint32_t batch_count;
+    uint8_t header_padding[64 - 2 * sizeof(uint32_t)];
+    SharedBuildDispatchTaskIdentity tasks[kMaxTasks];
+};
+static_assert(
+    offsetof(SharedBuildDispatchState, tasks) == 128,
+    "shared Build dispatch plan must start on its own cache line"
+);
+static_assert(
+    sizeof(SharedBuildDispatchState) ==
+        128 + sizeof(SharedBuildDispatchTaskIdentity) * kMaxTasks,
+    "shared Build dispatch state size changed"
+);
+static_assert(
+    sizeof(SharedBuildDispatchState) % 64 == 0,
+    "shared Build dispatch state must occupy whole cache lines"
+);
 #endif
 
 // final 分层汇合把 arrival 与 release 分到不同 cache line：等待 release
@@ -2039,6 +2086,9 @@ struct alignas(64) SchedulerState {
     cross_core::SharedExecDrainControl exec_drain;
     cross_core::SharedExecCell exec_cells[kMaxTasks];
     cross_core::ExecutionToken exec_tokens[kWorkers];
+    // 低原子 Build 发放状态继续追加在 standalone sidecar 尾部，不移动
+    // production prefix、TensorMap、Claim Tournament 或执行 cell。
+    SharedBuildDispatchState build_dispatch;
 #endif
 };
 static_assert(offsetof(SchedulerState, cube_cursor) == 0, "cube cursor offset must match PA DistGlobal");
@@ -2113,6 +2163,12 @@ static_assert(
     "executor tokens must follow all task-indexed cells"
 );
 static_assert(
+    offsetof(SchedulerState, build_dispatch) ==
+        offsetof(SchedulerState, exec_tokens) +
+            sizeof(cross_core::ExecutionToken) * kWorkers,
+    "shared Build dispatch state must follow executor tokens"
+);
+static_assert(
         offsetof(SchedulerState, exec_fatal) %
                 cross_core::kExecCacheLineBytes == 0 &&
         offsetof(SchedulerState, exec_drain) %
@@ -2120,6 +2176,8 @@ static_assert(
         offsetof(SchedulerState, exec_cells) %
                 cross_core::kExecCacheLineBytes == 0 &&
         offsetof(SchedulerState, exec_tokens) %
+                cross_core::kExecCacheLineBytes == 0 &&
+        offsetof(SchedulerState, build_dispatch) %
                 cross_core::kExecCacheLineBytes == 0,
     "cross-core execution sidecars must remain cache-line aligned"
 );
@@ -2127,7 +2185,8 @@ constexpr uint64_t kCrossCoreExecStateBytes =
     sizeof(cross_core::SharedExecFatalControl) +
     sizeof(cross_core::SharedExecDrainControl) +
     sizeof(cross_core::SharedExecCell) * kMaxTasks +
-    sizeof(cross_core::ExecutionToken) * kWorkers;
+    sizeof(cross_core::ExecutionToken) * kWorkers +
+    sizeof(SharedBuildDispatchState);
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
 static_assert(

@@ -584,6 +584,98 @@ inline bool BuildSharedHostTaskPlan(
     return true;
 }
 
+inline uint8_t EncodeSharedHostDispatchMeta(
+    const SharedHostPlannedTask &task, uint32_t total_tasks
+) {
+    const bool is_last_submit =
+        task.task_id + 1U == total_tasks;
+    if (task.task_id >= total_tasks ||
+        task.kind >= TaskKind::Count ||
+        task.group_index >= kSharedPaMaxBlockGroups ||
+        (task.kind == TaskKind::Alloc &&
+         (task.group_index != 0 || task.has_following_group)) ||
+        (task.kind != TaskKind::Up &&
+         task.has_following_group) ||
+        (task.has_following_group &&
+         task.group_index + 1U >= kSharedPaMaxBlockGroups) ||
+        (is_last_submit &&
+         (task.has_following_group ||
+          (task.kind != TaskKind::Alloc &&
+           task.kind != TaskKind::Up)))) {
+        return 0;
+    }
+    return static_cast<uint8_t>(
+        kSharedPaTicketMetaPresent |
+        (is_last_submit ? kSharedPaTicketLastSubmit : 0U) |
+        (task.has_following_group
+             ? kSharedPaTicketHasFollowing
+             : 0U) |
+        (task.group_index << kSharedPaTicketGroupShift) |
+        static_cast<uint32_t>(task.kind)
+    );
+}
+
+inline bool PopulateSharedBuildDispatchPlan(
+    SchedulerState *state, const SharedHostTaskPlan &plan,
+    std::string *error = nullptr
+) {
+    if (state == nullptr || plan.total_tasks == 0 ||
+        plan.total_tasks > kMaxTasks ||
+        plan.batch_count == 0 ||
+        plan.batch_count > kMaxBatches ||
+        plan.tasks.size() != plan.total_tasks) {
+        if (error != nullptr) {
+            *error = "invalid shared Build dispatch plan";
+        }
+        return false;
+    }
+    std::memset(
+        &state->build_dispatch, 0,
+        sizeof(state->build_dispatch)
+    );
+    state->build_dispatch.task_count = plan.total_tasks;
+    state->build_dispatch.batch_count = plan.batch_count;
+    for (uint32_t expected_task = 0;
+         expected_task < plan.total_tasks; ++expected_task) {
+        const SharedHostPlannedTask &task =
+            plan.tasks[expected_task];
+        if (task.task_id != expected_task ||
+            task.batch >= plan.batch_count ||
+            task.batch > UINT16_MAX) {
+            if (error != nullptr) {
+                *error =
+                    "shared Build dispatch task identity is out of range";
+            }
+            std::memset(
+                &state->build_dispatch, 0,
+                sizeof(state->build_dispatch)
+            );
+            return false;
+        }
+        const uint8_t encoded =
+            EncodeSharedHostDispatchMeta(
+                task, plan.total_tasks
+            );
+        if (encoded == 0) {
+            if (error != nullptr) {
+                *error =
+                    "shared Build dispatch task meta is invalid";
+            }
+            std::memset(
+                &state->build_dispatch, 0,
+                sizeof(state->build_dispatch)
+            );
+            return false;
+        }
+        SharedBuildDispatchTaskIdentity &identity =
+            state->build_dispatch.tasks[task.task_id];
+        identity.batch = static_cast<uint16_t>(task.batch);
+        identity.encoded_meta = encoded;
+        identity.reserved = 0;
+    }
+    return true;
+}
+
 struct SharedHostHeapAdmission {
     uint64_t heap_size = 0;
     uint64_t shard_span = 0;
@@ -793,6 +885,10 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     std::memset(&state->exec_drain, 0, sizeof(state->exec_drain));
     std::memset(state->exec_cells, 0, sizeof(state->exec_cells));
     std::memset(state->exec_tokens, 0, sizeof(state->exec_tokens));
+    std::memset(
+        &state->build_dispatch, 0,
+        sizeof(state->build_dispatch)
+    );
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
         cross_core::ResetExecutionToken(state->exec_tokens[worker]);
     }
@@ -834,6 +930,16 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
         state->context_lens[batch] = 8192;
 #endif
     }
+#if PTO_FDWIC_SHARED_MAP
+    SharedHostTaskPlan build_dispatch_plan;
+    if (BuildSharedHostTaskPlan(
+            *state, &build_dispatch_plan
+        )) {
+        (void)PopulateSharedBuildDispatchPlan(
+            state, build_dispatch_plan
+        );
+    }
+#endif
     for (uint32_t shard = 0; shard < kCursorShards; ++shard) {
         // -1 表示尚无 task 被 claim；task 0 的 atomicMax 因而也能正常判定唯一 winner。
         state->cube_cursor[shard].value = -1;
@@ -1051,7 +1157,7 @@ inline constexpr size_t CrossCoreExecStateBytes() {
     return kCrossCoreExecStateBytes;
 }
 static_assert(
-    CrossCoreExecStateBytes() == 19691648,
+    CrossCoreExecStateBytes() == 19709184,
     "cross-core execution state transfer size changed"
 );
 static_assert(

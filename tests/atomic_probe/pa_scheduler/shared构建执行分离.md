@@ -1297,3 +1297,23 @@ immutable flat plan + owner-local candidate cursor
 candidate 位图写。下一版 device 计划只携带构参和判断 engine 所需的紧凑身份，
 不携带 TensorDesc 或 worker 私有地址。生产关闭仍以“全部 ticket owner 已完成
 Build”作为 EMPTY 可判缺口的唯一边界。
+
+### 2026-08-03：紧凑 device plan 的内存布局
+
+standalone state 尾部新增 `SharedBuildDispatchState`，不移动此前已验证的共享
+对象。布局固定为：
+
+```text
+cache line 0 : next_task atomic（device 可写）
+cache line 1 : task_count / batch_count / reserved（launch 前写定）
+remaining    : 4 B × task_count 的只读 identity
+```
+
+每条 identity 只保存 `batch` 与已有 `encoded_meta`；task id 是下标，
+`batch_start` 从 task id 与 kind/group 恢复。计划不包含任何 descriptor、args、
+payload 或 owner 地址。host 从独立 task planner 填充，device 解码后继续调用已
+验证的随机访问构参入口。编译上限下 sidecar 为 17,536 B，B256 实际有效计划
+仅 5 KiB。
+
+混合 G0/G1/G2/G4 的 host 发布和 device 解码门槛已通过，CPU 全套与 CCEC
+perf-clock 构建也已通过。Submit 尚未切换到该计划，A5 尚未运行。
