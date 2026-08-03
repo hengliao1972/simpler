@@ -75,6 +75,8 @@ struct TaskEvidence {
     std::atomic<int32_t> owner;
     std::atomic<uint32_t> prepare_count;
     std::atomic<uint32_t> build_count;
+    std::atomic<int32_t> execute_owner;
+    std::atomic<uint32_t> execute_count;
 };
 
 struct RunEvidence {
@@ -82,6 +84,7 @@ struct RunEvidence {
     std::atomic<uint32_t> prepared_tasks{0};
     std::atomic<uint32_t> inserted_tasks{0};
     std::atomic<uint32_t> built_tasks{0};
+    std::atomic<uint32_t> executed_tasks{0};
     std::atomic<uint32_t> insert_order{0};
     std::atomic<uint32_t> ticket_fetch_adds{0};
     std::atomic<uint32_t> retire_fetch_adds{0};
@@ -89,6 +92,107 @@ struct RunEvidence {
     std::atomic<uint32_t> later_built_before_task0{0};
     std::atomic<bool> abort{false};
 };
+
+void RecordFailure(RunEvidence &evidence);
+bool DecodeDispatchIdentity(
+    const DispatchTaskIdentity &identity, uint32_t expected_task, uint32_t total_tasks, SharedPaTaskMeta &meta
+);
+
+CoreRole WorkerRole(uint32_t worker) { return worker < kAicWorkers ? CoreRole::Aic : CoreRole::Aiv; }
+
+bool TaskExecutionCandidates(
+    const DispatchTaskIdentity &identity, uint32_t total_tasks, uint32_t &primary, uint32_t &secondary,
+    cross_core::ExecEngineClass &engine
+) {
+    SharedPaTaskMeta meta{};
+    primary = cross_core::kExecUnboundOwner;
+    secondary = cross_core::kExecUnboundOwner;
+    engine = cross_core::ExecEngineClass::None;
+    if (!DecodeDispatchIdentity(identity, identity.task_id, total_tasks, meta) || meta.kind == TaskKind::Alloc) {
+        return false;
+    }
+    cross_core::PaExecRoute route{};
+    if (!cross_core::ResolvePaExecRoute(meta.kind, FunctionId(meta.kind), route) ||
+        !cross_core::FixedPaExecuteCandidates(identity.task_id, route.engine_class, primary, secondary) ||
+        primary == secondary) {
+        return false;
+    }
+    engine = route.engine_class;
+    return true;
+}
+
+bool ScanAvailableExecutions(
+    uint32_t worker, uint32_t total_tasks, const std::vector<DispatchTaskIdentity> &plan, TaskEvidence *task_evidence,
+    uint32_t &candidate_slot, bool production_closed, RunEvidence &evidence
+) {
+    const CoreRole role = WorkerRole(worker);
+    const cross_core::ExecEngineClass worker_engine = CrossCoreEngineForRole(role);
+    while (!evidence.abort.load(std::memory_order_acquire)) {
+        uint32_t task_id = kMaxTasks;
+        if (!CrossCoreExecPotentialTaskAt(worker, role, candidate_slot, task_id) || task_id >= total_tasks) {
+            return true;
+        }
+
+        uint32_t primary = cross_core::kExecUnboundOwner;
+        uint32_t secondary = cross_core::kExecUnboundOwner;
+        cross_core::ExecEngineClass task_engine = cross_core::ExecEngineClass::None;
+        const bool executable = TaskExecutionCandidates(plan[task_id], total_tasks, primary, secondary, task_engine);
+        if (!executable) {
+            SharedPaTaskMeta meta{};
+            if (!DecodeDispatchIdentity(plan[task_id], task_id, total_tasks, meta) || meta.kind != TaskKind::Alloc) {
+                RecordFailure(evidence);
+                return false;
+            }
+            ++candidate_slot;
+            continue;
+        }
+        if (task_engine != worker_engine || (worker != primary && worker != secondary)) {
+            // PotentialTaskAt 只按 task-id residue 枚举；计划中的 kind
+            // 决定真实 engine。错角色 task 必须由只读计划直接越过，不能
+            // 等待永远不会为本角色发布的 owner-local 登记位。
+            ++candidate_slot;
+            continue;
+        }
+
+        if (task_evidence[task_id].build_count.load(std::memory_order_acquire) == 0) {
+            if (production_closed) {
+                RecordFailure(evidence);
+                return false;
+            }
+            return true;
+        }
+        const int32_t build_owner = task_evidence[task_id].owner.load(std::memory_order_acquire);
+        if (build_owner < 0 || static_cast<uint32_t>(build_owner) >= kDispatchWorkers) {
+            RecordFailure(evidence);
+            return false;
+        }
+        if (static_cast<uint32_t>(build_owner) == worker) {
+            // 与生产 K2 合同相同：Build owner 若恰好也是候选，只负责
+            // 发布执行包；另一候选负责执行，避免同核 Build+Execute。
+            ++candidate_slot;
+            continue;
+        }
+
+        int32_t expected = -1;
+        if (task_evidence[task_id].execute_owner.compare_exchange_strong(
+                expected, static_cast<int32_t>(worker), std::memory_order_acq_rel, std::memory_order_acquire
+            )) {
+            if (task_evidence[task_id].execute_count.fetch_add(1, std::memory_order_acq_rel) != 0) {
+                RecordFailure(evidence);
+                return false;
+            }
+            evidence.executed_tasks.fetch_add(1, std::memory_order_release);
+        } else if (expected < 0 || static_cast<uint32_t>(expected) >= kDispatchWorkers ||
+                   static_cast<uint32_t>(expected) == worker ||
+                   (static_cast<uint32_t>(expected) != primary && static_cast<uint32_t>(expected) != secondary) ||
+                   static_cast<uint32_t>(expected) == static_cast<uint32_t>(build_owner)) {
+            RecordFailure(evidence);
+            return false;
+        }
+        ++candidate_slot;
+    }
+    return false;
+}
 
 struct TestOps {
     static int64_t Load(volatile int64_t *address) {
@@ -292,6 +396,8 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
         task_evidence[task].owner.store(-1, std::memory_order_relaxed);
         task_evidence[task].prepare_count.store(0, std::memory_order_relaxed);
         task_evidence[task].build_count.store(0, std::memory_order_relaxed);
+        task_evidence[task].execute_owner.store(-1, std::memory_order_relaxed);
+        task_evidence[task].execute_count.store(0, std::memory_order_relaxed);
         insert_completion[task].value = -1;
     }
     for (uint32_t worker = 0; worker < kDispatchWorkers; ++worker) {
@@ -307,6 +413,7 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
             PaOrchestrationState orch{};
             TaskArgs args{};
             LocalStats stats{};
+            uint32_t candidate_slot = 0;
             InitPaOrchestration(orch, kDispatchBatches, &state.context_lens[0]);
             workers_ready.fetch_add(1, std::memory_order_release);
             while (!start.load(std::memory_order_acquire)) {
@@ -384,6 +491,12 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
                 }
                 evidence.built_tasks.fetch_add(1, std::memory_order_release);
                 tasks_by_worker[worker].fetch_add(1, std::memory_order_relaxed);
+                if (!ScanAvailableExecutions(
+                        worker, static_cast<uint32_t>(plan.size()), plan, task_evidence.get(), candidate_slot,
+                        /*production_closed=*/false, evidence
+                    )) {
+                    break;
+                }
             }
 
             evidence.retire_fetch_adds.fetch_add(1, std::memory_order_relaxed);
@@ -404,6 +517,12 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
                     std::this_thread::yield();
                 }
             }
+            if (!evidence.abort.load(std::memory_order_acquire)) {
+                (void)ScanAvailableExecutions(
+                    worker, static_cast<uint32_t>(plan.size()), plan, task_evidence.get(), candidate_slot,
+                    /*production_closed=*/true, evidence
+                );
+            }
         });
     }
 
@@ -419,6 +538,7 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
               evidence.prepared_tasks.load(std::memory_order_acquire) == plan.size() &&
               evidence.inserted_tasks.load(std::memory_order_acquire) == plan.size() &&
               evidence.built_tasks.load(std::memory_order_acquire) == plan.size() &&
+              evidence.executed_tasks.load(std::memory_order_acquire) == plan.size() - kDispatchBatches &&
               evidence.insert_order.load(std::memory_order_acquire) == plan.size() &&
               evidence.later_built_before_task0.load(std::memory_order_acquire) >= kDelayedBuildEvidence &&
               TestOps::Load(&control.retired_workers.value) == static_cast<int64_t>(kDispatchWorkers) &&
@@ -433,6 +553,24 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
         ok &= task_evidence[task].prepare_count.load(std::memory_order_acquire) == 1;
         ok &= task_evidence[task].build_count.load(std::memory_order_acquire) == 1;
         ok &= TestOps::Load(&insert_completion[task].value) == static_cast<int64_t>(task);
+        SharedPaTaskMeta meta{};
+        ok &= DecodeDispatchIdentity(plan[task], task, static_cast<uint32_t>(plan.size()), meta);
+        const int32_t build_owner = task_evidence[task].owner.load(std::memory_order_acquire);
+        const int32_t execute_owner = task_evidence[task].execute_owner.load(std::memory_order_acquire);
+        if (meta.kind == TaskKind::Alloc) {
+            ok &= execute_owner == -1;
+            ok &= task_evidence[task].execute_count.load(std::memory_order_acquire) == 0;
+        } else {
+            uint32_t primary = cross_core::kExecUnboundOwner;
+            uint32_t secondary = cross_core::kExecUnboundOwner;
+            cross_core::ExecEngineClass engine = cross_core::ExecEngineClass::None;
+            ok &= TaskExecutionCandidates(plan[task], static_cast<uint32_t>(plan.size()), primary, secondary, engine);
+            ok &= execute_owner >= 0 &&
+                  (static_cast<uint32_t>(execute_owner) == primary || static_cast<uint32_t>(execute_owner) == secondary
+                  ) &&
+                  execute_owner != build_owner;
+            ok &= task_evidence[task].execute_count.load(std::memory_order_acquire) == 1;
+        }
     }
     const uint32_t expected_ticket_calls = static_cast<uint32_t>(plan.size()) + kDispatchWorkers;
     ok &= evidence.ticket_fetch_adds.load(std::memory_order_acquire) == expected_ticket_calls;
@@ -441,9 +579,10 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
 
     std::printf(
         "[BUILD_DISPATCH] run=%u status=%s active_workers=%u tickets=%u "
-        "insert_cas=%zu later_before_task0=%u predecessor_loads=%u\n",
+        "insert_cas=%zu executes=%u later_before_task0=%u predecessor_loads=%u\n",
         run, ok ? "PASS" : "FAIL", active_workers, evidence.ticket_fetch_adds.load(std::memory_order_relaxed),
-        plan.size(), evidence.later_built_before_task0.load(std::memory_order_relaxed),
+        plan.size(), evidence.executed_tasks.load(std::memory_order_relaxed),
+        evidence.later_built_before_task0.load(std::memory_order_relaxed),
         evidence.predecessor_loads.load(std::memory_order_relaxed)
     );
     return ok;

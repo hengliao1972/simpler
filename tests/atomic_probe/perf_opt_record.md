@@ -6129,3 +6129,17 @@ ticket raw span 相对 G8 缩短 `54.417%`，绝对差 `303.049 us`；empty 对�
 ticket 从“CPU 协议候选”提升为“允许进入生产 A/B 的候选”。下一阶段需要
 一起解决 K2 candidate 的跨核发布、连续关闭前缀替代和 FinalDrain 闭合，
 再以 B1/B256 正确性及 perf-clock 决定是否保留。
+
+### 15.36 S6.14 关闭低原子发放后的 K2 任务发现缺口
+
+审计确认旧 K2 位图依赖 96 个 worker 各自 Close 全部 task；它不能与“每 task
+只有一个 Build owner”的中央 ticket 直接组合。现有 S6.12 CPU 门槛因此增加
+真实 K2 发现与执行状态机：每核用单调候选游标枚举潜在 task，以 immutable
+plan 跳过 Alloc/错 engine，相关 task 未 Build 时保留队头，Build 后由两个
+候选 exactly-once 取得执行；Build owner 即使属于候选也不执行本 task。
+
+96 线程 B256 连续十轮均得到 1280 次唯一 Build、1024 次唯一 Execute，全部
+执行 owner 属于 K2 且不同于 Build owner；task 0 延迟 Build 的受控交错仍允许
+后继 Build 推进。完整 CPU `perf-clock` 回归通过。本阶段生产 CCEC 和 A5
+性能仍为 **NOT CHANGED / NOT RUN**；它只为下一提交替换本地 candidate 位图
+提供正确性门槛。

@@ -1276,3 +1276,24 @@ G8 per-task CAS 与中央 ticket。11 轮中位 device span 为
 perf-clock A/B，不从微基准外推收益。接入还必须显式替换“每核 replay 才能
 形成连续 Close 前缀和 owner-local K2 candidate 位”的旧合同；不能只换 Claim
 函数便宣称完成动态发放。
+
+### 2026-08-03：K2 发现不再依赖每核完整 Close 历史
+
+中央 ticket 不能继续沿用 `exec_candidate_bitmap`：该位图由每个 worker 在
+顺序 Close 自己的全量 replay 时建立，而新的 Build owner 只会看见自己取得的
+task。替代合同已经先在现有 CPU 发放门槛中闭合：
+
+```text
+immutable flat plan + owner-local candidate cursor
+        │
+        ├─ Alloc / wrong-engine task ──> 直接越过
+        ├─ relevant EMPTY/BUILDING ────> production open 时保留队头
+        └─ relevant BUILT ─────────────> 固定 K2 唯一 Execute
+                                         Build owner 不执行本 task
+```
+
+十轮 B256 中 1024 个 kernel task 全部 exactly-once 执行，执行者均为合法 K2
+候选且不同于 Build owner；不需要每核 replay 1280 次 Submit，也没有新增共享
+candidate 位图写。下一版 device 计划只携带构参和判断 engine 所需的紧凑身份，
+不携带 TensorDesc 或 worker 私有地址。生产关闭仍以“全部 ticket owner 已完成
+Build”作为 EMPTY 可判缺口的唯一边界。

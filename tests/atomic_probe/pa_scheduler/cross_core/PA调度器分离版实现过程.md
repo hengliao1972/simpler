@@ -1417,3 +1417,28 @@ empty                        0          16.535 us                6.615 us
 路径还会改变 replay、EfDrain、随机构参、TensorMap 插入等待和 K2 candidate
 发布。下一阶段接入时必须保留严格插入链与最终闭合，并用独立 perf-clock
 A/B 决定保留或撤销。
+
+## 2026-08-03：S6.14 去除全员 replay 后的 K2 发现门槛
+
+生产接入前的源码审计发现，现有 `exec_candidate_bitmap` 不是共享任务队列：
+每个 worker 顺序 Close 全部 Submit 时，只有真实 K2 候选在自己的本地位图
+登记该 task。中央 ticket 让每个 task 只经过一个 Build owner 后，这一隐含
+前提不再成立；若只替换 Claim，执行侧会漏掉没有在本核 Close 的 task。
+
+因此扩展 S6.12 的同一个 96-thread CPU 门槛，不增加第二套发放模型。每个
+worker 只持有单调 `candidate_slot`，按生产 `FixedPaExecuteCandidates()` 的
+K2 映射枚举自己可能执行的 task，再用不可变 flat plan 判定 task kind 与
+engine：Alloc 和错角色 task 直接越过；相关 task 在 Build 发布前保留队头，
+发布后由两个候选竞争唯一 Execute owner。Build owner 若恰好属于 K2，只发布
+执行包并越过，另一候选负责执行。
+
+B256 连续十轮均满足：1280 个 task 恰好一次 Build，1024 个非 Alloc task
+恰好一次执行；每个 Execute owner 都属于独立复算的 K2 集合且不等于 Build
+owner；256 个 Alloc 不产生执行；task 0 延迟 Build 时后续 Build 仍继续推进；
+全体 worker 退出生产后，最终扫描越过完整计划且没有等待未发布 task。
+
+完整 `cross_core/cpu/build.sh perf-clock` 回归通过。该阶段仍是 CPU 状态机证明，
+没有修改 CCEC Submit，也没有 A5 性能数据。生产接入必须让 device 获得同一份
+只读紧凑 task identity，并让 scanner 以该 identity 替代 owner-local 位图；
+在全体 Build owner 退出前，相关 `EMPTY/BUILDING` 仍只能解释为暂未发布，不能
+提前当成缺口或永久越过。
