@@ -2693,3 +2693,41 @@ candidate mean   表面改善 0.008481 ms / 0.592%
 并行发布的 release 集中成 root 串行发布 16 次，净收益被抵消。因此实现和
 构建门槛修改已全部撤回，仅保留本节反例；后续不再用“减少返回型读取数”
 单一指标代替端到端裁决。
+
+## 2026-08-04：S6.40 中央 Build ticket 按连续小段领取（破坏并行合同，已撤回）
+
+S6.38 中央 Build 发放对 1280 个 task 各执行一次返回型 `FetchAdd(1)`，96 个
+worker 还各执行一次越界领取后退场，共计 1376 次同地址 Atomic。候选尝试让
+每个 worker 通过 `FetchAdd(4)` 一次预留 4 个连续 task，再用栈上局部游标逐个
+消费；理论物理调用数可降为：
+
+```text
+ceil(1280 / 4) + 96 = 416
+```
+
+实现阶段补充了非整段尾部、越界退场、逐 task 恰好一次和 96 worker 并发领取
+检查。独立 Build-dispatch 用例十轮全部 PASS，确认小段本身不会造成 task
+遗漏或重复；其余 CPU 单元用例也通过。
+
+但是，完整 ordered-submit 集成用例稳定拒绝了该协议：
+
+- `release_before_build=FAIL`；
+- `independent_kernel_overlap=FAIL`；
+- 所有 task/kernel 最终仍能完成，fatal 也保持 0，因此失败不是普通计数错误，
+  而是既定并行合同被破坏。
+
+反例中，一个 worker 预留 task 4--7，并在 task 4 已完成 TensorMap 有序插入、
+但尚未完成 Build 时被刻意暂停。由于 task 5--7 已被同一 worker 私有预留，其他
+Scalar 无法接手；task 8 又必须等待 task 7 的 TensorMap 插入，结果原本只覆盖
+单个 task 的暂停扩张成整个连续段的阻塞。相同原因也使本应与 task 4 Build
+重叠的独立 kernel 无法及时执行。
+
+这与 cross-core 的核心合同冲突：TensorMap metadata 必须按 task id 严格串行
+插入，但插入 baton 交出后，Fanin/Build/Execute 不应继续受前一 task 的 owner
+约束。小段领取虽然减少 Atomic 次数，却引入了额外的 owner-local 串行区，
+因此不能作为通用优化保留。
+
+本阶段在 CPU 集成门槛已经得到确定反例，未浪费时间执行 A5 性能测试。候选的
+实现、host oracle 和临时测试适配均已完整撤回，只保留本节论证。后续若优化
+中央 Build ticket，必须继续保持逐 task 可由任意可用 Scalar 独立取得，不能
+用私有批量所有权换取 Atomic 数量下降。
