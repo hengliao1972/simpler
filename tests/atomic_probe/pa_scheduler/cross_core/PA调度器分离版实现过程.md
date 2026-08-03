@@ -2357,3 +2357,43 @@ candidate mean   改善 0.116043 ms / 4.548%
 中位数与均值同向，且候选六个样本的长尾明显低于基线。结合泳道中 arrival
 RMW 聚合核时下降 `90.97%`，可以把端到端收益归因到竞争人口缩减，而不是
 减少 worker、跳过终态检查或把工作移出计时边界。该阶段作为有效优化保留。
+
+## 2026-08-04：S6.34 删除 per-task winner fatal guard（无稳定收益，已撤回）
+
+S6.33 全泳道中 `SharedWinnerFatalGuardLoad` 恰好出现 1280 次，聚合核时
+`1382.670 us`。每个 dispatched winner 在进入 Materialize 前读取一次全局
+scheduler fatal；同一 dispatch 入口在领取 Build ticket 前已经通过
+`IsFatal()` 读取该控制字，而 execution payload 路径也采用“调度边界统一
+观察、已经取得的合法工作单元允许完成”的合同。因此本阶段验证：删除 winner
+内的第二次读取，是否能在不改变正常业务语义的前提下获得端到端收益。
+
+先在 host 原子闭合门槛中要求该 site 为 0，保留旧 device 代码运行 B1，结果
+按预期为：业务 execution/semantic 全部 PASS，但后处理精确报告
+`winner_fatal_guards=5/0` 并失败。候选随后删除第二次 load；下一 ticket 边界、
+插入等待中的低频 fatal 检查和 FinalDrain 最终观察均保持不变。完整 CPU 协议
+回归、converter 63 项测试、CCEC full-swimlane/perf-clock 构建和 A5 B256
+full-swimlane 均 PASS，候选泳道中该 site 由 `1280 -> 0`，其余 1280 task、
+1024 kernel、TensorMap、payload、fanin、completion 和终态均闭合。候选泳道为：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_s634_20260803_194554_416031/ccec/merged_swimlane.json`
+
+该次完整生命周期为 `2.662796 ms`，Submit 为 `1.100522 ms`，FinalDrain 为
+`1.669444 ms`。单次诊断结果不用于裁决。首次以提交 `9dea7d83` 构建冻结
+S6.33 基线，交错各跑六个 trace-free B256 进程时，候选中位改善 `1.307%`、
+均值改善 `1.050%`；由于幅度接近设备波动，继续反向顺序补足到每版 12 个
+独立进程。合并结果为：
+
+```text
+S6.33 frozen baseline: min / median / max / mean
+                       2.374750 / 2.421990 / 2.458060 / 2.422280 ms
+S6.34 candidate      : min / median / max / mean
+                       2.360702 / 2.425896 / 2.591560 / 2.437115 ms
+candidate median 回退 0.003906 ms / 0.161%
+candidate mean   回退 0.014835 ms / 0.612%
+```
+
+扩样后中位数和均值同时转为回退，证明前六轮的约 1% 差异只是时间段波动。
+该 load 虽然在源码上与 ticket 前检查重复，但删除它没有形成稳定性能收益，且会
+扩大 fatal 已发布后继续 Materialize/Register 的窗口。因此代码、动态门槛和
+构建产物改动均完整撤回，只保留本节反例，不把 Atomic 次数减少本身当作性能
+优化成果。
