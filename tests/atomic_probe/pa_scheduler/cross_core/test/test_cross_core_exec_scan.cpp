@@ -2515,7 +2515,7 @@ void TestFinalDrainClosesLastTask() {
             RoleForWorker(worker_id)
         );
         // 该子用例从“所有 terminal task 已由其原 LocalStats 消费”之后
-        // 开始，只验证 drain arrival/release；因此把新建的测试上下文
+        // 开始，只验证单向 drain arrival；因此把新建的测试上下文
         // 定位到第一个计划外候选，不能让 execute owner 用丢失的旧游标
         // 重新观察自己的 DONE task。
         uint32_t next_task = 0;
@@ -2527,19 +2527,19 @@ void TestFinalDrainClosesLastTask() {
                next_task < 5) {
             ++arrival_stats[worker_id].exec_candidate_slot;
         }
-        bool released = false;
+        bool closed = false;
         const bool closure_ok =
             ProgressCrossCoreExecDrainClosure<ExecScanTestOps>(
                 state, arrival_worker, 5,
                 arrival_stats[worker_id],
-                arrived[worker_id], released
+                arrived[worker_id], closed
             );
         const uint32_t arrival_group =
             static_cast<uint32_t>(arrival_worker.block_id) %
             cross_core::kExecDrainArrivalGroups;
         ++expected_group_arrivals[arrival_group];
         all_arrivals_ok &= closure_ok && arrived[worker_id] &&
-            !released &&
+            closed == (worker_id != 0) &&
             state->exec_drain.arrivals[arrival_group].state ==
                 expected_group_arrivals[arrival_group];
     }
@@ -2548,8 +2548,7 @@ void TestFinalDrainClosesLastTask() {
          ++group) {
         all_arrivals_ok &=
             expected_group_arrivals[group] == 6 &&
-            state->exec_drain.arrivals[group].state == 6 &&
-            state->exec_drain.releases[group].state == 0;
+            state->exec_drain.arrivals[group].state == 6;
     }
     Check(
         all_arrivals_ok && NoFatal(*state),
@@ -2558,36 +2557,27 @@ void TestFinalDrainClosesLastTask() {
 
     // worker 0 是唯一 root observer；它在自己的首次到达时尚未看到
     // 其余分组闭合。全部 96 个 worker 到达后再次推进，才校验所有
-    // terminal cell 并发布 release。
-    bool root_released = false;
+    // terminal cell 并完成 device 级收口。
+    bool root_closed = false;
     const bool root_ok =
         ProgressCrossCoreExecDrainClosure<ExecScanTestOps>(
             state, state->workers[0], 5, arrival_stats[0],
-            arrived[0], root_released
+            arrived[0], root_closed
         );
-    bool all_groups_released = true;
-    for (uint32_t group = 0;
-         group < cross_core::kExecDrainArrivalGroups;
-         ++group) {
-        all_groups_released &=
-            state->exec_drain.releases[group].state == 1;
-    }
     Check(
-        root_ok && root_released && all_groups_released &&
-            NoFatal(*state),
+        root_ok && root_closed && NoFatal(*state),
         kTest,
-        "root validates terminal cells and releases every arrival group"
+        "root validates terminal cells after every group arrives"
     );
 
-    bool repeat_released = false;
+    bool repeat_closed = root_closed;
     const bool repeat_ok =
         ProgressCrossCoreExecDrainClosure<ExecScanTestOps>(
             state, state->workers[0], 5, arrival_stats[0],
-            arrived[0], repeat_released
+            arrived[0], repeat_closed
         );
     Check(
-        repeat_ok && repeat_released &&
-            state->exec_drain.releases[0].state == 1 &&
+        repeat_ok && repeat_closed &&
             state->exec_drain.arrivals[0].state == 6,
         kTest, "one worker cannot increment drain twice"
     );

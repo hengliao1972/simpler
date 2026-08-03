@@ -214,20 +214,21 @@ SPLIT_STATE_STORAGE_BYTES=1728
 # role/观察构建合并相同尾部。五种 kind 是否完整覆盖由 dispatch switch 和
 # CPU 动态协议测试证明；这里精确锁定当前每种产物的真实代码形状，防止 finish 被
 # 内联/删除，又不把 CCEC 对等尾部的有益合并误判成覆盖缺失。
-# FinalDrain fatal 改为外层低频观察后，perf-clock AIC 的等价尾部进一步
-# 合并为一个调用点；AIV 保持三个。继续冻结实际机器码形状，并要求调用
-# 只能指向本角色唯一 finish 符号，不能放宽为范围判断。
-SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC=1
+# 单向 execution drain 在 perf-clock AIC 中形成两个等价 finish 尾部；
+# AIV 保持三个。readelf 已确认它们都只指向本角色唯一 finish 符号，
+# 继续精确冻结实际机器码形状，不放宽为范围判断。
+SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC=2
 SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIV=3
 # execution drain 分组 root 分支改变了 full-swimlane AIC 的尾合并形状：
 # 对象文件实测为四个 relocation，且全部只指向本角色唯一 finish
 # 符号。任务覆盖仍由 dispatch/动态门槛证明；这里继续精确锁定为 4，
 # 不放宽成范围。
 SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC=4
-# 调度边界集中读取 global fatal 后，AIV 的等价尾部由三处变为四处；
-# AIC 仍为三处。任务覆盖由 CPU 动态门槛证明，这里只冻结当前 CCEC
-# 机器码形状，并继续要求全部 relocation 指向本角色唯一 finish 符号。
-SPLIT_FINISH_CALL_SITES_SWIMLANE_AIV=4
+# 单向 execution drain 让非 root AIV 提前收口后，full-swimlane AIV
+# 的尾合并形状变为五个 relocation；readelf 已逐条确认都只指向
+# 本角色唯一 finish 符号。任务覆盖由 CPU 动态门槛证明，这里继续
+# 精确冻结为 5，不放宽成范围判断。
+SPLIT_FINISH_CALL_SITES_SWIMLANE_AIV=5
 COMMON_FLAGS+=(
     -mllvm -cce-block-local-relocate=true
     -mllvm "-cce-block-local-reserve-size=$SPLIT_STATE_STORAGE_BYTES"

@@ -1163,7 +1163,7 @@ inline constexpr size_t CrossCoreExecStateBytes() {
     return kCrossCoreExecStateBytes;
 }
 static_assert(
-    CrossCoreExecStateBytes() == 20184256,
+    CrossCoreExecStateBytes() == 20183232,
     "cross-core execution state transfer size changed"
 );
 static_assert(
@@ -3185,14 +3185,13 @@ inline bool AnalyzeSwimlaneRecords(
         if (aic_local_events != 0 || aiv_local_events != 0 ||
             local_events != 0 || root_events != 0 ||
             ticket_events != expected_ticket_events ||
-            drain_release_publish_events !=
-                cross_core::kExecDrainArrivalGroups) {
+            drain_release_publish_events != 0) {
             std::fprintf(
                 stderr,
                 "shared PA atomic closure failed: "
                 "legacy_local_aic=%llu legacy_local_aiv=%llu "
                 "legacy_local=%llu legacy_root=%llu "
-                "tickets=%llu/%llu drain_release_publishes=%llu/%u\n",
+                "tickets=%llu/%llu drain_release_publishes=%llu/0\n",
                 static_cast<unsigned long long>(aic_local_events),
                 static_cast<unsigned long long>(aiv_local_events),
                 static_cast<unsigned long long>(local_events),
@@ -3201,8 +3200,7 @@ inline bool AnalyzeSwimlaneRecords(
                 static_cast<unsigned long long>(expected_ticket_events),
                 static_cast<unsigned long long>(
                     drain_release_publish_events
-                ),
-                cross_core::kExecDrainArrivalGroups
+                )
             );
             return false;
         }
@@ -3223,11 +3221,10 @@ inline bool AnalyzeSwimlaneRecords(
         std::printf(
             "[TRACE_ATOMIC_CLOSURE] "
             "site=SharedExecDrainReleasePublish "
-            "group_exchanges=%llu arrival_groups=%u\n",
+            "group_exchanges=%llu expected=0\n",
             static_cast<unsigned long long>(
                 drain_release_publish_events
-            ),
-            cross_core::kExecDrainArrivalGroups
+            )
         );
     }
 #endif
@@ -4923,8 +4920,7 @@ inline Metrics Validate(
          ++group) {
         cross_core_exec_drain_ok &=
             state.exec_drain.arrivals[group].state ==
-                kExecDrainWorkersPerGroup &&
-            state.exec_drain.releases[group].state == 1;
+                kExecDrainWorkersPerGroup;
     }
     const bool cross_core_exec_fatal_clear =
         state.exec_fatal.state == 0;

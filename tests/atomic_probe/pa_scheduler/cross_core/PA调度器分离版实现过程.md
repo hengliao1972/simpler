@@ -2465,3 +2465,66 @@ candidate mean   改善 0.288223 ms / 11.735%
 性能收益来自把 release 的同地址并发人口由 96 降为每地址 6；没有减少
 worker、跳过终态校验、缩短计时边界或改变 TensorMap/Build/Execute 业务
 语义。该阶段作为有效优化保留。
+
+## 2026-08-04：S6.36 单向 execution drain 收口
+
+S6.35 已把 release 轮询分到 16 条地址并获得明显收益，但协议仍要求 95 个
+非 root worker 在本核完全排空后持续轮询，等待 root 完成全局校验再反向
+放行。重新核对生命周期后，这层反向 release 并不是正确性必需条件：
+
+1. replay barrier 已证明所有 Build ticket 耗尽，不会再出现新 BUILT；
+2. 每核只有在 scanner 封口、两个 execution token 完全复位、engine 无
+   in-flight 后才发布 arrival；
+3. 非 root 此后没有新的本核工作，可以结束本核；
+4. 固定 root 仍等待 16 组 arrival 各为 6，并全量校验 Alloc `EMPTY` 与
+   kernel `DONE`；
+5. 整个 device kernel 只有在 root 最后结束后才完成，因此全局终态证明
+   没有转移给 host。
+
+本阶段据此把 drain 改为单向协议。实现前先将布局门槛从 2048B 收紧为
+`16 * 64B = 1024B`，S6.35 按预期以 `2048 != 1024` 编译失败。实现后删除
+全部 release control、publish 和 poll；非 root 的本地 `closed` 在 arrival
+成功后置位，root 的 `closed` 只在所有组到齐且全 task 校验成功后置位。
+host 继续逐组检查 `arrival == 6`、逐核检查 `final_occupied == 0`，并在
+full-swimlane 中精确要求 release publish 为 0。execution state 精确搬运
+大小由 `20,184,256` 降为 `20,183,232` 字节。
+
+单向分支改变了 CCEC 尾合并形状。`readelf` 逐条求证后，full-swimlane
+AIC/AIV 的 finish relocation 精确为 `4/5`，perf-clock 精确为 `2/3`，
+全部只指向各自角色唯一 finish 符号；构建门槛据实更新，没有改成范围。
+
+完整 CPU 协议回归、converter 63 项测试、CCEC full-swimlane/perf-clock
+构建以及 A5 B256 full-swimlane 均 PASS。A5 full-swimlane 为：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_s636_20260803_203637_464219/ccec/merged_swimlane.json`
+
+归档副本为：
+
+`test_record/2026-8-4/cross_b256_s636_2p408ms.json`
+
+该次动态结果为：
+
+- 完整生命周期：`2.407780 ms`；
+- Submit：`1.150132 ms`；
+- FinalDrain：`1.404917 ms`；
+- `shared_exec_drain_release_publish`：`16 -> 0`；
+- `shared_exec_drain_release_poll`：全部消失；
+- 16 组 arrival 各为 6，root 全量校验、1280 task、1024 kernel、TensorMap、
+  payload、fanin、completion 和全部终态 PASS。
+
+由于首轮 6+6 交错 A/B 只有约 1% 改善，继续按反向顺序扩展到每版 12 个
+独立 trace-free B256 进程。最终以提交 `ad22756c` 构建的冻结 S6.35 基线
+与候选结果为：
+
+```text
+S6.35 frozen baseline: min / median / max / mean
+                       2.127455 / 2.162082 / 2.187897 / 2.157836 ms
+S6.36 candidate      : min / median / max / mean
+                       2.099396 / 2.139029 / 2.157356 / 2.135427 ms
+candidate median 改善 0.023053 ms / 1.066%
+candidate mean   改善 0.022409 ms / 1.038%
+```
+
+扩样后中位数和均值仍同向改善，没有出现 S6.34 的方向反转；候选最大值也低于
+基线最大值。该阶段既删除了所有反向 release Atomic 和 1024B 无用控制状态，
+又保留 device 内 root 的全局终态证明，因此作为有效优化保留。

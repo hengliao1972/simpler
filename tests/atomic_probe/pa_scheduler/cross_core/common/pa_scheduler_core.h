@@ -5231,12 +5231,12 @@ template <typename Ops>
 PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker,
     uint32_t task_count, LocalStats &stats,
-    bool &arrived, bool &released
+    bool &arrived, bool &closed
 ) {
-    if (released) {
+    if (closed) {
         return true;
     }
-    released = false;
+    closed = false;
     if (state == nullptr || worker.core_idx < 0 ||
         static_cast<uint32_t>(worker.core_idx) >= kWorkers ||
         worker.block_id < 0 ||
@@ -5282,31 +5282,12 @@ PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
         arrived = true;
     }
 
-    // 只让固定 root worker 扫描 16 条 arrival line；其余 95 个 worker
-    // 只轮询所属分组 release。这样 arrival RMW 和 release load 的
-    // 同地址竞争人口都从 96 路降为每地址 6 路，又不会把“检查所有
-    // 分组”的读取复制到全部 Scalar。root 自己不轮询 release：它只有
-    // 在验证全部 arrival 和 task 终态后才会进入发布分支。
+    // replay barrier 已证明不会再产生 BUILT，且 arrival 只在本核
+    // scanner/token/engine 全部排空后发布。非 root 此后没有任何新的
+    // 可执行工作，可以直接结束本核；整个 device kernel 仍由固定 root
+    // 等待 16 组到齐并完成全量 task 终态校验后最后收口。
     if (worker_id != 0) {
-        const int64_t release =
-            TraceAtomicLoad<Ops>(
-                stats.trace, stats.result, -1,
-                AtomicSite::SharedExecDrainReleasePoll,
-                &state->exec_drain.releases[arrival_group].state,
-                /*result_used=*/true
-            );
-        if (release == 1) {
-            released = true;
-            return true;
-        }
-        if (release != 0) {
-            PublishCrossCoreRuntimeFailure<Ops>(
-                state, stats,
-                cross_core::ExecFatalReason::CompletionStateConflict,
-                task_count, worker_id
-            );
-            return false;
-        }
+        closed = true;
         return true;
     }
     for (uint32_t group = 0;
@@ -5344,22 +5325,7 @@ PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
         );
         return false;
     }
-    // root 身份固定且本地 arrived/released 状态保证本轮只进入一次。
-    // 这里不消费 Exchange 旧值：16 个分组发布彼此独立，消费者的
-    // atomic poll 才是完成可见性的权威边界。若 host 初始化或唯一 root
-    // 合同损坏，逐组终态快照仍会把它判为错误。
-    for (uint32_t group = 0;
-         group < cross_core::kExecDrainArrivalGroups;
-         ++group) {
-        (void)TraceAtomicExchange<Ops>(
-            stats.trace, stats.result, -1,
-            AtomicSite::SharedExecDrainReleasePublish,
-            &state->exec_drain.releases[group].state,
-            static_cast<int64_t>(1),
-            /*result_used=*/false
-        );
-    }
-    released = true;
+    closed = true;
     return true;
 }
 
@@ -6793,9 +6759,6 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             TraceAtomicPollBatchMask(AtomicSite::FatalPoll)
 #if PTO_FDWIC_SHARED_MAP
             | TraceAtomicPollBatchMask(
-                AtomicSite::SharedExecDrainReleasePoll
-            )
-            | TraceAtomicPollBatchMask(
                 AtomicSite::SharedExecDrainArrivalPoll
             )
 #endif
@@ -6809,7 +6772,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #if PTO_FDWIC_SHARED_MAP
     bool cross_core_exec_ok = true;
     bool cross_core_drain_arrived = false;
-    bool cross_core_drain_released = false;
+    bool cross_core_drain_closed = false;
     uint32_t final_fatal_poll_iterations = 0;
 #endif
     while (true) {
@@ -6852,9 +6815,10 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #if PTO_FDWIC_SHARED_MAP
         // 第一层 final barrier 只证明不再生产新 BUILT cell。每个 worker
         // 扫描完 closed prefix 且 token 完整复位后，再进入 execution
-        // drain 汇合；最后到达者逐 task 验证 Alloc=EMPTY、kernel=DONE，
-        // 随后才发布统一 release。这样 device 退出本身就证明没有遗失
-        // backlog，而不是依赖 host 事后发现。
+        // drain 汇合。非 root 到达后即可结束；固定 root 等待 16 组
+        // 全部到齐并逐 task 验证 Alloc=EMPTY、kernel=DONE 后最后结束。
+        // 整个 device kernel 的完成仍证明没有遗失 backlog，不依赖 host
+        // 事后发现，也不需要反向 release 广播。
         if (global_release_observed && cross_core_exec_ok &&
             CrossCoreExecWorkerDrained(
                 state, worker, task_count, stats
@@ -6863,12 +6827,12 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 ProgressCrossCoreExecDrainClosure<Ops>(
                     state, worker, task_count, stats,
                     cross_core_drain_arrived,
-                    cross_core_drain_released
+                    cross_core_drain_closed
                 );
         }
         if (global_release_observed &&
             (!cross_core_exec_ok ||
-             cross_core_drain_released)) {
+             cross_core_drain_closed)) {
             break;
         }
 #else
@@ -7001,10 +6965,11 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #if PTO_FDWIC_SHARED_MAP
     // CCEC 关闭 kernel-end 自动 DCCI，host 直接读取 token.control 可能只
     // 看到初始化时的 IDLE。final_occupied 在本核最终检查后经 bypass
-    // PublishResult 导出：0 表示 scanner 已封口、token 全字段复位且全局
-    // execution drain 已发布，非零表示该轮不能宣称 executor 排空。
+    // PublishResult 导出：0 表示 scanner 已封口、token 全字段复位且本核
+    // 已发布 arrival；root 另外通过 16 组 arrival 和全 task 终态校验完成
+    // device 级收口。非零表示该轮不能宣称 executor 排空。
     stats.result.final_occupied =
-        cross_core_drain_released &&
+        cross_core_drain_closed &&
                 CrossCoreExecWorkerDrained(
                     state, worker, task_count, stats
                 ) &&

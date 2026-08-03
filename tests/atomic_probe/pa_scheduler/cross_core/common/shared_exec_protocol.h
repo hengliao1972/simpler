@@ -255,12 +255,11 @@ struct alignas(kExecCacheLineBytes) SharedExecFatalControl {
 
 // 所有 replay actor 停产之后，再汇合本核 execution token 的排空证据。
 // 96 个 worker 不再竞争同一 arrival，而是按 block%16 分到 16 条
-// atomic-only line；指定 root worker 观察每组精确 6 个到达后，
-// 逐 task 核对 cell 终态并向 16 条分组 release line 各发布一次。
-// 每个 worker 只轮询所属 release，arrival 与 release 也不会互相干扰。
+// atomic-only line。非 root 在发布本核排空证据后即可结束；指定 root
+// worker 观察每组精确 6 个到达，再逐 task 核对 cell 终态后最后结束。
+// 整个 device kernel 由 root 的最终退出收口，不需要反向 release 广播。
 struct alignas(kExecCacheLineBytes) SharedExecDrainControl {
     SharedExecControl arrivals[kExecDrainArrivalGroups];
-    SharedExecControl releases[kExecDrainArrivalGroups];
 };
 
 struct alignas(kExecCacheLineBytes) ExecPayloadStorage {
@@ -434,15 +433,10 @@ static_assert(
 );
 static_assert(
     sizeof(SharedExecDrainControl) ==
-            (2U * kExecDrainArrivalGroups) *
+            kExecDrainArrivalGroups *
                 kExecCacheLineBytes &&
         alignof(SharedExecDrainControl) == kExecCacheLineBytes,
-    "execution drain groups and release must own separate cache lines"
-);
-static_assert(
-    offsetof(SharedExecDrainControl, releases) ==
-        kExecDrainArrivalGroups * kExecCacheLineBytes,
-    "execution drain releases must follow all arrival group lines"
+    "execution drain arrival groups must own separate cache lines"
 );
 static_assert(
     offsetof(SharedExecCell, payload) == kExecCacheLineBytes,
