@@ -279,7 +279,7 @@ struct PaExecPayloadSource {
     uint64_t scalars[kExecMaxScalars];
     int32_t fanin[kExecMaxFanin];
     uint32_t gm_tensor_mask;
-    uint32_t reserved;
+    uint32_t reference_mask;
 
     PA_DEVICE uint64_t TensorWord(uint32_t tensor, uint32_t word) const {
         if ((gm_tensor_mask & (uint32_t{1} << tensor)) != 0) {
@@ -294,6 +294,16 @@ struct PaExecPayloadSource {
                 tensors[tensor].local_tensor
             );
         return words[word];
+    }
+
+    PA_DEVICE uint64_t TensorReference(uint32_t tensor) const {
+        if ((reference_mask & (uint32_t{1} << tensor)) == 0 ||
+            (gm_tensor_mask & (uint32_t{1} << tensor)) == 0) {
+            return 0;
+        }
+        return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+            tensors[tensor].gm_tensor
+        ));
     }
 
     PA_DEVICE uint64_t Scalar(uint32_t scalar) const {
@@ -331,7 +341,7 @@ PA_DEVICE bool ResolvePaExecPayloadSourceAfterFanin(
     }
 
     source.gm_tensor_mask = 0;
-    source.reserved = 0;
+    source.reference_mask = 0;
 
     for (int32_t index = 0; index < args.tensor_count; ++index) {
         const uint32_t tensor_index = static_cast<uint32_t>(index);
@@ -439,6 +449,7 @@ PA_DEVICE bool MakePaExecPayloadSpec(
         0,
         0,
         1,
+        0,
     };
     ExecPayloadLayout layout{};
     return ValidateExecPayloadSpec(spec, layout);
@@ -549,7 +560,8 @@ PA_DEVICE bool ValidatePaExecutionTokenDispatch(
         route.engine_class != token.control.engine_class ||
         !ComputeExecPayloadLayout(
             header.tensor_count, header.scalar_count,
-            header.fanin_count, layout
+            header.fanin_count,
+            header.tensor_reference_mask, layout
         ) ||
         header.payload_bytes != layout.payload_bytes ||
         token.control.payload_bytes != layout.payload_bytes ||
@@ -566,14 +578,16 @@ PA_DEVICE bool ValidatePaExecutionTokenDispatch(
     }
     for (uint32_t tensor = 0;
          tensor < header.tensor_count; ++tensor) {
-        const uint64_t expected_address = static_cast<uint64_t>(
-            reinterpret_cast<uintptr_t>(
-                &token.payload.words[
-                    layout.tensor_word_offset +
-                    tensor * kExecTensorDescWords
-                ]
-            )
+        const uint32_t word_offset = ExecTensorPayloadWordOffset(
+            tensor, header.tensor_reference_mask
         );
+        const uint64_t expected_address =
+            (header.tensor_reference_mask &
+             (uint32_t{1} << tensor)) != 0
+            ? token.payload.words[word_offset]
+            : static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                  &token.payload.words[word_offset]
+              ));
         if (token.dispatch.args[tensor] != expected_address) {
             return false;
         }

@@ -346,12 +346,23 @@ struct SyntheticPayloadSource {
     std::array<int32_t, 4> fanin{};
     bool pause_mid_pack = false;
     bool pause_invalid_fanin = false;
+    uint32_t null_reference_mask = 0;
 
     uint64_t TensorWord(uint32_t tensor, uint32_t word) const {
         if (pause_mid_pack && tensor == 1 && word == 0) {
             g_mid_pack_pause.StopHereIfEnabled();
         }
         return tensors[tensor][word];
+    }
+
+    uint64_t TensorReference(uint32_t tensor) const {
+        if ((null_reference_mask &
+             (uint32_t{1} << tensor)) != 0) {
+            return 0;
+        }
+        return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+            tensors[tensor].data()
+        ));
     }
 
     uint64_t Scalar(uint32_t index) const {
@@ -440,6 +451,7 @@ ExecPayloadSpec MakeSpec(
         0,
         0,
         1,
+        0,
     };
 }
 
@@ -584,6 +596,25 @@ void TestLayoutAndStateAbi() {
         !ComputeExecPayloadLayout(33, 0, 0, overflow),
         "tensor overflow is rejected"
     );
+    ExecPayloadLayout referenced{};
+    Check(
+        ComputeExecPayloadLayout(
+            3, 4, 4, /*tensor_reference_mask=*/0x5,
+            referenced
+        ) &&
+            referenced.payload_bytes == 256 &&
+            referenced.payload_lines == 4 &&
+            referenced.written_words == 32 &&
+            referenced.inline_tensor_count == 1,
+        "two stable descriptor references shrink the active payload"
+    );
+    Check(
+        !ComputeExecPayloadLayout(
+            3, 0, 0, /*tensor_reference_mask=*/0x8,
+            referenced
+        ),
+        "reference bits outside the active tensor prefix are rejected"
+    );
 
     const int64_t raw = static_cast<int64_t>(EncodeExecState(
         ExecPhase::Claimed, 37, 19,
@@ -635,6 +666,80 @@ void TestLayoutAndStateAbi() {
     Check(
         !DecodeExecFatal(fatal_raw | (1LL << 60)).valid,
         "fatal reserved bits fail closed"
+    );
+}
+
+void TestMixedInlineAndReferencedDescriptors() {
+    SharedExecCell cell{};
+    ExecutionToken token{};
+    SharedExecFatalControl fatal{};
+    InitializeCell(cell);
+    InitializeToken(token);
+    InitializeFatal(fatal);
+    ProtocolTestOps::ResetTrace();
+
+    ExecPayloadSpec spec = MakeSpec();
+    spec.tensor_reference_mask = 0x5;
+    const SyntheticPayloadSource source = MakeSource();
+    ExecPayloadLayout layout{};
+    Check(
+        ValidateExecPayloadSpec(spec, layout) &&
+            layout.payload_lines == 4,
+        "mixed descriptor payload validates with four active lines"
+    );
+    Check(
+        BuildAndPublishExecPayload<ProtocolTestOps>(
+            cell, 3, spec, source, fatal
+        ) == ExecBuildResult::Published,
+        "builder publishes mixed inline/reference payload"
+    );
+    Check(
+        ProtocolTestOps::payload_stores.load() ==
+            layout.written_words &&
+            ProtocolTestOps::flush_bytes.load() == 4U * 64U,
+        "builder writes and flushes only the compact mixed payload"
+    );
+    Check(
+        ClaimAndBindExecPayload<ProtocolTestOps>(
+            cell, spec.task_id, 4, spec.engine_class,
+            token, fatal
+        ) == ExecClaimResult::Claimed,
+        "executor binds mixed inline/reference payload"
+    );
+    CheckPayloadMatches(token, spec, source);
+    const uint64_t reference0 = source.TensorReference(0);
+    const uint64_t reference2 = source.TensorReference(2);
+    const uint32_t inline1_offset = ExecTensorPayloadWordOffset(
+        1, spec.tensor_reference_mask
+    );
+    Check(
+        token.dispatch.args[0] == reference0 &&
+            token.dispatch.args[2] == reference2 &&
+            token.dispatch.args[1] == static_cast<uint64_t>(
+                reinterpret_cast<uintptr_t>(
+                    &token.payload.words[inline1_offset]
+                )
+            ),
+        "referenced descriptors keep stable GM addresses while inline descriptor rebinds"
+    );
+    Check(
+        ProtocolTestOps::invalidate_calls.load() == 3,
+        "claim invalidates the payload and both referenced descriptors"
+    );
+
+    SharedExecCell invalid{};
+    SharedExecFatalControl invalid_fatal{};
+    InitializeCell(invalid);
+    InitializeFatal(invalid_fatal);
+    SyntheticPayloadSource null_source = MakeSource();
+    null_source.null_reference_mask = 0x1;
+    ProtocolTestOps::ResetTrace();
+    Check(
+        BuildAndPublishExecPayload<ProtocolTestOps>(
+            invalid, 3, spec, null_source, invalid_fatal
+        ) == ExecBuildResult::InvalidInput &&
+            ExecFatalPublished<ProtocolTestOps>(invalid_fatal),
+        "null stable descriptor reference fails closed during pack"
     );
 }
 
@@ -1948,6 +2053,7 @@ void TestEngineRoutingAndInputValidation() {
 
 int main() {
     TestLayoutAndStateAbi();
+    TestMixedInlineAndReferencedDescriptors();
     TestPublishBindAndComplete();
     TestHalfBuiltPayloadIsInvisible();
     TestFlushedPayloadIsInvisibleBeforeBuilt();

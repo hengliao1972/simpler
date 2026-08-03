@@ -6197,3 +6197,27 @@ ccec/merged_swimlane.json
 `2.362004 ms`；相对 S6.16 的 `3.666555 ms` 下降 `35.580%`。当前距离
 `1.0 ms` 目标仍有 `1.362 ms`，中央同地址 ticket 本身也仍是后续需要量化的
 热点，不能把本阶段的大幅收益解释成目标已完成。
+
+### 15.40 S6.18 WinnerBuild 负候选取证与稳定 GM descriptor 引用门槛
+
+中央 ticket 后的泳道把下一热点指向 1024 次 `WinnerBuild`，聚合核时约
+`72.954 ms`。本轮先逐项排除了四个低风险表面候选：destination preload
+十轮中位回退约 `3.10%`；source preload 的冻结 ELF 六对交错 A/B 中位回退
+`3.21%`，且泳道 `WinnerBuild` 聚合回退 `1.39%`；failure helper 冷外提把
+CCEC finish 调用点从 3 改为 4，被现有结构门槛拒绝；复用第一次 layout 校验的
+源码改写则在 AIC/AIV 上生成与基线逐字相同的热函数机器码。四项生产修改均已
+撤回，没有把顺序采样、源码行数或预取直觉写成收益。
+
+当前只提交后续结构候选所需的通用协议门槛：payload 可按 tensor mask 混合
+“完整内联 128B descriptor”和“稳定 GM descriptor 的 8B 地址”，全内联
+4352B/68-line 最大容量及 cell/token ABI 不变。executor 对共享 payload 和每个
+引用 descriptor 分别 invalidate；dispatch 只保留明确声明稳定的 GM 地址，
+其余 descriptor 仍重绑到 executor token。CPU 的 2-reference/1-inline 用例把
+8 lines 压到 4 lines，并覆盖逐值等价、地址绑定、DCCI 次数、越界 mask 和空
+引用 fail-closed。AIC/AIV 优化后 IR 门槛证明 CAS 返回依赖之后依次存在 payload
+与引用 descriptor 的 DCCI/DSB；完整 CPU 与正式 CCEC perf-clock 构建通过。
+
+正式 PA adapter 尚未设置任何 reference bit，A5 结果为 **NOT RUN**。因此本节
+只证明“可以在不扩 ABI、且保留 A5 非一致 cache 发布/获取合同的前提下压缩
+payload”，不宣称 `WinnerBuild` 或端到端已经改善。下一提交再按通用生命周期
+规则接线，并单独裁决实际 payload 行数和 A5 性能。

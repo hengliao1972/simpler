@@ -226,15 +226,16 @@ verify_ir_variant() {
         exit 1
     fi
 
-    local cas_count dcci_count dsb_count cas_line dcci_line
+    local cas_count dcci_count dsb_count cas_line
+    local dcci_matches first_dcci_line reference_dcci_line
     cas_count="$({
         grep -F '@llvm.hivm.atom.CAS.G.s64' <<<"$block" |
             grep -vcE 'i64 0,[[:space:]]+i64' || true
     })"
     dcci_count="$(grep -Fc '@llvm.hivm.DCCI.DST' <<<"$block" || true)"
     dsb_count="$(grep -Fc '@llvm.hivm.DSB' <<<"$block" || true)"
-    if [[ "$cas_count" -ne 1 || "$dcci_count" -ne 1 ]]; then
-        echo "$role $variant requires one claim CAS and one DCCI; got claim-CAS=$cas_count DCCI=$dcci_count." >&2
+    if [[ "$cas_count" -ne 1 || "$dcci_count" -ne 2 ]]; then
+        echo "$role $variant requires one claim CAS, one payload DCCI and one conditional descriptor-reference DCCI; got claim-CAS=$cas_count DCCI=$dcci_count." >&2
         exit 1
     fi
     cas_line="$({
@@ -242,38 +243,53 @@ verify_ir_variant() {
             grep -vE 'i64 0,[[:space:]]+i64' |
             cut -d: -f1
     })"
-    dcci_line="$(grep -nF '@llvm.hivm.DCCI.DST' <<<"$block" | cut -d: -f1)"
+    dcci_matches="$(grep -nF '@llvm.hivm.DCCI.DST' <<<"$block")"
+    first_dcci_line="${dcci_matches%%:*}"
+    reference_dcci_line="${dcci_matches##*$'\n'}"
+    reference_dcci_line="${reference_dcci_line%%:*}"
 
-    verify_return_dependency "$block" "$role" "$variant" "$dcci_line"
+    verify_return_dependency \
+        "$block" "$role" "$variant" "$first_dcci_line"
 
-    local dsb_matches first_dsb_line tail_dsb_line
+    local dsb_matches first_dsb_line payload_dsb_line tail_dsb_line
     dsb_matches="$(grep -nF '@llvm.hivm.DSB' <<<"$block" || true)"
     if [[ "$variant" == "minimal" ]]; then
-        if [[ "$dsb_count" -ne 1 ]]; then
-            echo "$role minimal requires one unique tail DSB; found $dsb_count." >&2
+        if [[ "$dsb_count" -ne 2 ]]; then
+            echo "$role minimal requires payload/reference invalidate tail DSBs; found $dsb_count." >&2
             exit 1
         fi
+        payload_dsb_line="${dsb_matches%%:*}"
         tail_dsb_line="${dsb_matches%%:*}"
-        if ! (( cas_line < dcci_line && dcci_line < tail_dsb_line )); then
-            echo "$role minimal must preserve CAS < DCCI < unique tail DSB." >&2
+        tail_dsb_line="${dsb_matches##*$'\n'}"
+        tail_dsb_line="${tail_dsb_line%%:*}"
+        if ! (( cas_line < first_dcci_line &&
+                first_dcci_line < payload_dsb_line &&
+                payload_dsb_line < reference_dcci_line &&
+                reference_dcci_line < tail_dsb_line )); then
+            echo "$role minimal must preserve CAS < payload DCCI/DSB < reference DCCI/DSB." >&2
             exit 1
         fi
     else
-        if [[ "$dsb_count" -ne 2 ]]; then
-            echo "$role pre_dsb requires exactly two DSB calls; found $dsb_count." >&2
+        if [[ "$dsb_count" -ne 3 ]]; then
+            echo "$role pre_dsb requires pre-acquire plus payload/reference tail DSBs; found $dsb_count." >&2
             exit 1
         fi
         first_dsb_line="${dsb_matches%%:*}"
+        payload_dsb_line="$(sed -n '2p' <<<"$dsb_matches")"
+        payload_dsb_line="${payload_dsb_line%%:*}"
         tail_dsb_line="${dsb_matches##*$'\n'}"
         tail_dsb_line="${tail_dsb_line%%:*}"
-        if ! (( cas_line < first_dsb_line && first_dsb_line < dcci_line &&
-                dcci_line < tail_dsb_line )); then
-            echo "$role pre_dsb must preserve CAS < first DSB < DCCI < tail DSB." >&2
+        if ! (( cas_line < first_dsb_line &&
+                first_dsb_line < first_dcci_line &&
+                first_dcci_line < payload_dsb_line &&
+                payload_dsb_line < reference_dcci_line &&
+                reference_dcci_line < tail_dsb_line )); then
+            echo "$role pre_dsb must preserve CAS < pre-DSB < payload DCCI/DSB < reference DCCI/DSB." >&2
             exit 1
         fi
     fi
 
-    echo "[CHECK] $role $variant IR: returning CAS dependency and barrier order are exact"
+    echo "[CHECK] $role $variant IR: returning CAS dependency and payload/reference invalidate order are exact"
 }
 
 verify_device_object() {

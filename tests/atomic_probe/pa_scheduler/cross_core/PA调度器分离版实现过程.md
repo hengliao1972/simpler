@@ -1549,3 +1549,42 @@ median = 2.362004 ms
 改动，不能只归因于单个 `FetchAdd`。中央 ticket 仍是一个约 0.25 ms 的 A5
 同地址返回型原子热点；下一阶段应先根据新泳道重新排序非 ticket 开销，再决定
 是分片发放还是继续消减随机访问构参/插入等待，不能在缺少协议证明时替换它。
+
+## 2026-08-03：S6.18 为 WinnerBuild 建立稳定 descriptor 引用协议门槛
+
+S6.17 的完整泳道中，1024 个非 Alloc task 的 `WinnerBuild` 聚合约
+`72.954 ms`，单次常见为 `60--80 us`。源码审计确认当前 portable payload
+不区分 descriptor 生命周期：即使 `SharedOutputCell` 或外部 GM 中的
+`TensorDesc` 已经稳定发布，builder 仍复制完整 128B，executor 随后还要再次
+搬入自己的 token。PA G1 每组共携带 19 个 tensor 参数，旧布局合计发布
+`10+10+10+16=46` 条 cache line。
+
+先验证了四个更小的候选，均未保留：目的 cache-line preload 的十轮中位相对
+干净基线回退约 `3.10%`；source descriptor preload 的初次顺序样本看似改善，
+但冻结 ELF 的六对交错 A/B 中位回退 `3.21%`，且 `WinnerBuild` 聚合反而增加
+`1.39%`；把 failure-only helper 标成 cold/noinline 会把 AIC/AIV 既有 finish
+调用点从 3 改为 4，结构审计直接拒绝。另一个“复用已验证 layout”候选经函数
+机器字节逐字比较，AIC/AIV 都与基线完全一致，证明 CCEC 已做等价消除，也已
+撤回。上述结果避免把设备漂移、源码简化或预取直觉冒充收益。
+
+随后只增加通用协议能力，尚未让正式 PA 选用引用。`ExecPayloadSpec` 新增 active
+tensor reference mask：bit=0 继续内联完整 128B descriptor；bit=1 只携带一个
+8B、非空且对齐的稳定 GM 地址。变长布局按 mask 计算每个逻辑 tensor 的真实
+word offset，因此全内联最大 payload 仍是 4352B/68 lines，`SharedExecCell` 和
+`ExecutionToken` 容量 ABI 均未扩张。executor 取得 cell 后先 invalidate/copy
+payload，再对每个引用 descriptor 独立 invalidate 128B；内联 descriptor 仍
+重绑到 executor-private token，引用地址则直接进入 dispatch args。
+
+CPU 协议门槛覆盖 3 个 tensor 中 2 引用、1 内联的混合形态：payload 从
+496B/8 lines 降为 256B/4 lines，tensor/scalar/fanin 值逐项一致，两个引用地址
+保持、内联地址重绑，claim 总计执行一次 payload invalidate 和两次 descriptor
+invalidate；越界 mask 与空引用均 fail-closed。AIC/AIV 优化后 IR 进一步精确
+验证 `CAS -> payload DCCI/DSB -> conditional reference DCCI/DSB`，pre-DSB
+对照也保持额外屏障位于 payload acquire 之前。完整 CPU 回归和正式 CCEC
+perf-clock 构建均通过。
+
+本阶段正式 PA 仍使用 `tensor_reference_mask=0`，因此 A5 引用正确性和性能为
+**NOT RUN**，也没有性能收益声明。下一阶段只能由 adapter 按地址空间与生命周期
+选择引用：已经完整发布且在 kernel 完成前不可变的 GM descriptor 可引用；
+builder 栈、block-local 或会被复用的 descriptor 必须继续内联。接线后需要以
+CPU 故障门槛、A5 B1/B256、payload 行数和 perf-clock 交错 A/B 共同裁决。

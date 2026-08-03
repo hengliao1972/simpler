@@ -220,6 +220,12 @@ struct ProbePayloadSource {
         return TensorWordValue(case_id, tensor, word);
     }
 
+    __aicore__ inline uint64_t TensorReference(uint32_t) const {
+        // 当前 CCEC return-dependency probe 只覆盖内联 descriptor；
+        // 引用型 payload 由 standalone PA 与 CPU 协议门槛验证。
+        return 0;
+    }
+
     __aicore__ inline uint64_t Scalar(uint32_t scalar) const {
         if (DelayPointForCase(case_id) ==
                 ProbeDelayPoint::MidPack &&

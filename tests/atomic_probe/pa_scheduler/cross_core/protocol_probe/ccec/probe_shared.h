@@ -235,6 +235,7 @@ PA_DEVICE ExecPayloadSpec SpecForCase(uint32_t case_id) {
         0,
         0,
         1,
+        0,
     };
 }
 

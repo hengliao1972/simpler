@@ -269,6 +269,11 @@ struct ScanPayloadSource {
         return 0;
     }
 
+
+    uint64_t TensorReference(uint32_t) const {
+        return 0;
+    }
+
     uint64_t Scalar(uint32_t) const {
         return 0;
     }
@@ -412,6 +417,7 @@ bool PublishKernelCell(
         /*multicore_group_id=*/0,
         /*multicore_rank=*/0,
         /*multicore_size=*/1,
+        /*tensor_reference_mask=*/0,
     };
     return BuildAndPublishExecPayload<ExecScanTestOps>(
                state.exec_cells[task_id], build_owner,

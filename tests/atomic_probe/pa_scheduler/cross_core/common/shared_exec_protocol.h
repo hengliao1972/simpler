@@ -193,6 +193,8 @@ struct ExecPayloadLayout {
     uint32_t scalar_word_offset;
     uint32_t fanin_word_offset;
     uint32_t written_words;
+    uint32_t tensor_reference_mask;
+    uint32_t inline_tensor_count;
 };
 
 struct ExecPayloadSpec {
@@ -208,6 +210,9 @@ struct ExecPayloadSpec {
     uint32_t multicore_group_id;
     uint16_t multicore_rank;
     uint16_t multicore_size;
+    // bit=1 表示对应 tensor 参数携带一个生命周期稳定的 GM TensorDesc
+    // 地址；bit=0 仍在 payload 内完整内联 128B descriptor。
+    uint32_t tensor_reference_mask;
 };
 
 struct ExecPayloadHeader {
@@ -224,6 +229,7 @@ struct ExecPayloadHeader {
     uint32_t multicore_group_id;
     uint16_t multicore_rank;
     uint16_t multicore_size;
+    uint32_t tensor_reference_mask;
 };
 
 struct alignas(kExecCacheLineBytes) SharedExecControl {
@@ -526,34 +532,86 @@ PA_DEVICE DecodedExecState DecodeExecState(int64_t raw_state) {
     return state;
 }
 
+PA_DEVICE uint32_t ExecTensorMaskForCount(uint32_t tensor_count) {
+    return tensor_count >= 32U
+        ? UINT32_MAX
+        : ((uint32_t{1} << tensor_count) - 1U);
+}
+
+PA_DEVICE uint32_t ExecTensorReferenceCount(
+    uint32_t tensor_reference_mask
+) {
+    uint32_t count = 0;
+    while (tensor_reference_mask != 0) {
+        count += tensor_reference_mask & 1U;
+        tensor_reference_mask >>= 1U;
+    }
+    return count;
+}
+
+PA_DEVICE uint32_t ExecTensorPayloadWordOffset(
+    uint32_t tensor, uint32_t tensor_reference_mask
+) {
+    const uint32_t preceding_mask = tensor == 0
+        ? 0
+        : tensor_reference_mask &
+              ExecTensorMaskForCount(tensor);
+    const uint32_t preceding_references =
+        ExecTensorReferenceCount(preceding_mask);
+    return kExecHeaderWords +
+           tensor * kExecTensorDescWords -
+           preceding_references * (kExecTensorDescWords - 1U);
+}
+
 PA_DEVICE bool ComputeExecPayloadLayout(
     uint32_t tensor_count, uint32_t scalar_count,
-    uint32_t fanin_count, ExecPayloadLayout &layout
+    uint32_t fanin_count, uint32_t tensor_reference_mask,
+    ExecPayloadLayout &layout
 ) {
     if (tensor_count > kExecMaxTensors ||
         scalar_count > kExecMaxScalars ||
-        fanin_count > kExecMaxFanin) {
+        fanin_count > kExecMaxFanin ||
+        (tensor_reference_mask &
+         ~ExecTensorMaskForCount(tensor_count)) != 0) {
         return false;
     }
+    const uint32_t reference_count =
+        ExecTensorReferenceCount(tensor_reference_mask);
+    const uint32_t inline_tensor_count =
+        tensor_count - reference_count;
     layout.tensor_word_offset = kExecHeaderWords;
     layout.scalar_word_offset =
         layout.tensor_word_offset +
-        tensor_count * kExecTensorDescWords;
+        inline_tensor_count * kExecTensorDescWords +
+        reference_count;
     layout.fanin_word_offset =
         layout.scalar_word_offset + scalar_count;
     layout.written_words =
         layout.fanin_word_offset + (fanin_count + 1U) / 2U;
     layout.payload_bytes =
         kExecCacheLineBytes +
-        tensor_count * kExecTensorDescBytes +
+        inline_tensor_count * kExecTensorDescBytes +
+        reference_count * sizeof(uint64_t) +
         scalar_count * sizeof(uint64_t) +
         fanin_count * sizeof(int32_t);
     layout.payload_lines =
         (layout.payload_bytes + kExecCacheLineBytes - 1U) /
         kExecCacheLineBytes;
+    layout.tensor_reference_mask = tensor_reference_mask;
+    layout.inline_tensor_count = inline_tensor_count;
     return layout.payload_lines >= 1 &&
            layout.payload_lines <= kExecMaxPayloadLines &&
            layout.written_words <= kExecMaxPayloadWords;
+}
+
+PA_DEVICE bool ComputeExecPayloadLayout(
+    uint32_t tensor_count, uint32_t scalar_count,
+    uint32_t fanin_count, ExecPayloadLayout &layout
+) {
+    return ComputeExecPayloadLayout(
+        tensor_count, scalar_count, fanin_count,
+        /*tensor_reference_mask=*/0, layout
+    );
 }
 
 PA_DEVICE bool ValidateExecPayloadSpec(
@@ -577,7 +635,7 @@ PA_DEVICE bool ValidateExecPayloadSpec(
     }
     return ComputeExecPayloadLayout(
         spec.tensor_count, spec.scalar_count,
-        spec.fanin_count, layout
+        spec.fanin_count, spec.tensor_reference_mask, layout
     );
 }
 
@@ -638,12 +696,27 @@ PA_DEVICE bool PackExecPayload(
     Ops::StorePayloadWord(
         &destination[5], PackExecHeaderWord5(spec)
     );
-    Ops::StorePayloadWord(&destination[6], 0);
+    Ops::StorePayloadWord(
+        &destination[6], spec.tensor_reference_mask
+    );
     Ops::StorePayloadWord(&destination[7], 0);
 
     uint32_t destination_word = layout.tensor_word_offset;
     for (uint32_t tensor = 0;
          tensor < spec.tensor_count; ++tensor) {
+        if ((spec.tensor_reference_mask &
+             (uint32_t{1} << tensor)) != 0) {
+            const uint64_t reference =
+                source.TensorReference(tensor);
+            if (reference == 0 ||
+                reference % alignof(uint64_t) != 0) {
+                return false;
+            }
+            Ops::StorePayloadWord(
+                &destination[destination_word++], reference
+            );
+            continue;
+        }
         for (uint32_t word = 0;
              word < kExecTensorDescWords; ++word) {
             Ops::StorePayloadWord(
@@ -692,6 +765,7 @@ PA_DEVICE ExecPayloadHeader DecodeExecPayloadHeader(
     const uint64_t word3 = payload.words[3];
     const uint64_t word4 = payload.words[4];
     const uint64_t word5 = payload.words[5];
+    const uint64_t word6 = payload.words[6];
     return ExecPayloadHeader{
         static_cast<uint32_t>(word0),
         payload.words[1],
@@ -708,6 +782,7 @@ PA_DEVICE ExecPayloadHeader DecodeExecPayloadHeader(
         static_cast<uint32_t>(word5),
         static_cast<uint16_t>(word5 >> 32U),
         static_cast<uint16_t>(word5 >> 48U),
+        static_cast<uint32_t>(word6),
     };
 }
 
@@ -721,7 +796,7 @@ PA_DEVICE bool ValidateBoundExecPayload(
 ) {
     header = DecodeExecPayloadHeader(token.payload);
     if ((token.payload.words[0] >> 32U) != 0 ||
-        token.payload.words[6] != 0 ||
+        (token.payload.words[6] >> 32U) != 0 ||
         token.payload.words[7] != 0 ||
         header.task_id != expected_task_id ||
         header.engine_class != expected_engine ||
@@ -730,11 +805,28 @@ PA_DEVICE bool ValidateBoundExecPayload(
         (header.flags & ~1U) != 0 ||
         !ComputeExecPayloadLayout(
             header.tensor_count, header.scalar_count,
-            header.fanin_count, layout
+            header.fanin_count,
+            header.tensor_reference_mask, layout
         ) ||
         header.payload_bytes != layout.payload_bytes ||
         published_lines != layout.payload_lines) {
         return false;
+    }
+    for (uint32_t tensor = 0;
+         tensor < header.tensor_count; ++tensor) {
+        if ((header.tensor_reference_mask &
+             (uint32_t{1} << tensor)) == 0) {
+            continue;
+        }
+        const uint64_t reference = token.payload.words[
+            ExecTensorPayloadWordOffset(
+                tensor, header.tensor_reference_mask
+            )
+        ];
+        if (reference == 0 ||
+            reference % alignof(uint64_t) != 0) {
+            return false;
+        }
     }
     const bool multicore = (header.flags & 1U) != 0;
     return
@@ -757,6 +849,7 @@ PA_DEVICE PA_GM const uint64_t *ExecutionTokenDispatchArgs(
     return &token.dispatch.args[0];
 }
 
+template <typename Ops>
 PA_DEVICE bool RebuildExecutionTokenDispatchArgs(
     PA_GM ExecutionToken &token
 ) {
@@ -767,7 +860,8 @@ PA_DEVICE bool RebuildExecutionTokenDispatchArgs(
          token.control.phase != ExecTokenPhase::WaitingFanin) ||
         !ComputeExecPayloadLayout(
             header.tensor_count, header.scalar_count,
-            header.fanin_count, layout
+            header.fanin_count,
+            header.tensor_reference_mask, layout
         ) ||
         header.payload_bytes != layout.payload_bytes ||
         token.control.payload_bytes != layout.payload_bytes ||
@@ -775,18 +869,34 @@ PA_DEVICE bool RebuildExecutionTokenDispatchArgs(
         return false;
     }
 
-    // tensor 参数不能继承 builder 的绝对地址；它们必须指向本 executor
-    // token 内刚完成绑定的 descriptor。scalar 参数仍按值传递。
+    // builder-local descriptor 必须重绑到本 executor token；只有由
+    // adapter 明确声明生命周期稳定的 GM descriptor 才保留绝对地址。
+    // A5 Scalar 间没有 cache coherence，executor 在第一次使用引用前
+    // 必须 invalidate 对应 128B，不能依赖 builder 或前一轮的 DCache。
     for (uint32_t tensor = 0;
          tensor < header.tensor_count; ++tensor) {
-        token.dispatch.args[tensor] = static_cast<uint64_t>(
-            reinterpret_cast<uintptr_t>(
-                &token.payload.words[
-                    layout.tensor_word_offset +
-                    tensor * kExecTensorDescWords
-                ]
-            )
+        const uint32_t word_offset = ExecTensorPayloadWordOffset(
+            tensor, header.tensor_reference_mask
         );
+        if ((header.tensor_reference_mask &
+             (uint32_t{1} << tensor)) != 0) {
+            const uint64_t reference =
+                token.payload.words[word_offset];
+            PA_GM const void *descriptor =
+                reinterpret_cast<PA_GM const void *>(
+                    static_cast<uintptr_t>(reference)
+                );
+            Ops::InvalidateRegion(
+                descriptor, kExecTensorDescBytes
+            );
+            token.dispatch.args[tensor] = reference;
+        } else {
+            token.dispatch.args[tensor] = static_cast<uint64_t>(
+                reinterpret_cast<uintptr_t>(
+                    &token.payload.words[word_offset]
+                )
+            );
+        }
     }
     for (uint32_t scalar = 0;
          scalar < header.scalar_count; ++scalar) {
@@ -1028,7 +1138,7 @@ PA_DEVICE ExecClaimResult ClaimAndBindExecPayload(
         return ExecClaimResult::InvalidPayload;
     }
     token.control.payload_bytes = layout.payload_bytes;
-    if (!RebuildExecutionTokenDispatchArgs(token)) {
+    if (!RebuildExecutionTokenDispatchArgs<Ops>(token)) {
         token.control.phase = ExecTokenPhase::Faulted;
         (void)PublishExecFatal<Ops>(
             fatal, ExecFatalReason::InvalidTokenPayload,
@@ -1055,10 +1165,25 @@ PA_DEVICE bool ExecutionTokenTensorWord(
         word >= kExecTensorDescWords) {
         return false;
     }
-    value = token.payload.words[
-        kExecHeaderWords +
-        tensor * kExecTensorDescWords + word
-    ];
+    const uint32_t word_offset = ExecTensorPayloadWordOffset(
+        tensor, header.tensor_reference_mask
+    );
+    if ((header.tensor_reference_mask &
+         (uint32_t{1} << tensor)) != 0) {
+        const uint64_t reference =
+            token.payload.words[word_offset];
+        if (reference == 0 ||
+            reference % alignof(uint64_t) != 0) {
+            return false;
+        }
+        PA_GM const volatile uint64_t *words =
+            reinterpret_cast<PA_GM const volatile uint64_t *>(
+                static_cast<uintptr_t>(reference)
+            );
+        value = words[word];
+    } else {
+        value = token.payload.words[word_offset + word];
+    }
     return true;
 }
 
@@ -1070,10 +1195,15 @@ PA_DEVICE bool ExecutionTokenScalar(
     if (scalar >= header.scalar_count) {
         return false;
     }
-    value = token.payload.words[
-        kExecHeaderWords +
-        header.tensor_count * kExecTensorDescWords + scalar
-    ];
+    ExecPayloadLayout layout{};
+    if (!ComputeExecPayloadLayout(
+            header.tensor_count, header.scalar_count,
+            header.fanin_count,
+            header.tensor_reference_mask, layout
+        )) {
+        return false;
+    }
+    value = token.payload.words[layout.scalar_word_offset + scalar];
     return true;
 }
 
@@ -1085,10 +1215,16 @@ PA_DEVICE bool ExecutionTokenFanin(
     if (edge >= header.fanin_count) {
         return false;
     }
+    ExecPayloadLayout layout{};
+    if (!ComputeExecPayloadLayout(
+            header.tensor_count, header.scalar_count,
+            header.fanin_count,
+            header.tensor_reference_mask, layout
+        )) {
+        return false;
+    }
     const uint32_t word_offset =
-        kExecHeaderWords +
-        header.tensor_count * kExecTensorDescWords +
-        header.scalar_count + edge / 2U;
+        layout.fanin_word_offset + edge / 2U;
     const uint64_t packed = token.payload.words[word_offset];
     producer = static_cast<int32_t>(
         edge % 2U == 0
