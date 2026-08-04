@@ -1211,7 +1211,10 @@ inline constexpr size_t CrossCoreExecStateBytes() {
     return kCrossCoreExecStateBytes;
 }
 static_assert(
-    CrossCoreExecStateBytes() == 20183232,
+    // 192 个 owner-local token 已删除各自从未被正式路径使用的
+    // 4352B 私有 payload：20183232 - 192 * 4352 = 19347648。
+    // task-indexed SharedExecCell payload 和其 DCCI 发布边界保持不变。
+    CrossCoreExecStateBytes() == 19347648,
     "cross-core execution state transfer size changed"
 );
 static_assert(

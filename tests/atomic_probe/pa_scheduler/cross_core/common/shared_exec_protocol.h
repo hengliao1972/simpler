@@ -402,20 +402,18 @@ struct alignas(kExecCacheLineBytes) ExecutionDispatchBinding {
 
 struct alignas(kExecCacheLineBytes) ExecutionToken {
     ExecutionTokenControl control;
-    ExecPayloadStorage payload;
     ExecutionDispatchBinding dispatch;
 };
 
-// payload_address==0 只服务于未 Claim 的初始化状态和隔离单测；正式
-// Claim 成功后它始终指向对应 task-indexed SharedExecCell 的 immutable
-// payload。旧 token.payload 暂时保留以冻结 ABI，待本阶段真机闭合后再单独
-// 判断是否缩小结构，避免把消费协议与大范围布局修改混在一起。
+// Claim 成功后 payload_address 始终指向对应 task-indexed
+// SharedExecCell 的 immutable payload。S6.63 已证明正式路径不再向
+// token 复制 payload；因此 token 只保留 owner-local control 和 dispatch
+// 两个独占区域，不再为已删除的私有副本保留 68 条 cache line。
+// 调用者必须在解引用前验证 payload_address 非零；Reset 后的 IDLE
+// token 不得读取 payload。
 PA_DEVICE PA_GM const ExecPayloadStorage &ExecutionTokenPayload(
     PA_GM const ExecutionToken &token
 ) {
-    if (token.control.payload_address == 0) {
-        return token.payload;
-    }
     return *reinterpret_cast<PA_GM const ExecPayloadStorage *>(
         static_cast<uintptr_t>(token.control.payload_address)
     );
@@ -643,8 +641,7 @@ static_assert(
         offsetof(ExecutionTokenControl, payload_address) == 32 &&
         offsetof(ExecutionTokenControl, completion_vend) == 40 &&
         offsetof(ExecutionTokenControl, function_and_reference) == 48 &&
-        offsetof(ExecutionTokenControl, shape_and_scalar_offset) == 56 &&
-        offsetof(ExecutionToken, payload) == kExecCacheLineBytes,
+        offsetof(ExecutionTokenControl, shape_and_scalar_offset) == 56,
     "execution token control and binding must remain separate"
 );
 static_assert(
@@ -657,12 +654,11 @@ static_assert(
 );
 static_assert(
     offsetof(ExecutionToken, dispatch) ==
-            kExecCacheLineBytes + kExecMaxPayloadBytes &&
+            kExecCacheLineBytes &&
         offsetof(ExecutionToken, dispatch) % kExecCacheLineBytes == 0 &&
         sizeof(ExecutionToken) ==
-            kExecCacheLineBytes + kExecMaxPayloadBytes +
-                kExecDispatchBindingBytes,
-    "token control, payload and dispatch binding must not share lines"
+            kExecCacheLineBytes + kExecDispatchBindingBytes,
+    "token control and dispatch binding must own disjoint lines"
 );
 
 PA_DEVICE uint64_t EncodeExecState(
@@ -1136,6 +1132,9 @@ PA_DEVICE bool ValidateBoundExecPayload(
     ExecPayloadHeader &header,
     ExecPayloadLayout &layout
 ) {
+    if (token.control.payload_address == 0) {
+        return false;
+    }
     PA_GM const ExecPayloadStorage &payload =
         ExecutionTokenPayload(token);
     header = DecodeExecPayloadHeader(payload);
@@ -1200,6 +1199,9 @@ PA_DEVICE bool RebuildExecutionTokenDispatchArgsFromValidatedPayload(
     const ExecPayloadLayout &layout,
     Observer &observer
 ) {
+    if (token.control.payload_address == 0) {
+        return false;
+    }
     PA_GM const ExecPayloadStorage &payload =
         ExecutionTokenPayload(token);
     if ((token.control.phase != ExecTokenPhase::Binding &&
@@ -1260,6 +1262,9 @@ template <typename Ops, typename Observer>
 PA_DEVICE bool RebuildExecutionTokenDispatchArgs(
     PA_GM ExecutionToken &token, Observer &observer
 ) {
+    if (token.control.payload_address == 0) {
+        return false;
+    }
     PA_GM const ExecPayloadStorage &payload =
         ExecutionTokenPayload(token);
     const ExecPayloadHeader header =
@@ -1578,6 +1583,9 @@ PA_DEVICE ExecClaimResult ClaimAndBindExecPayload(
 PA_DEVICE ExecPayloadHeader ExecutionTokenHeader(
     PA_GM const ExecutionToken &token
 ) {
+    if (token.control.payload_address == 0) {
+        return ExecPayloadHeader{};
+    }
     return DecodeExecPayloadHeader(ExecutionTokenPayload(token));
 }
 
@@ -1585,6 +1593,9 @@ PA_DEVICE bool ExecutionTokenTensorWord(
     PA_GM const ExecutionToken &token, uint32_t tensor,
     uint32_t word, uint64_t &value
 ) {
+    if (token.control.payload_address == 0) {
+        return false;
+    }
     PA_GM const ExecPayloadStorage &payload =
         ExecutionTokenPayload(token);
     const uint32_t tensor_count =
@@ -1621,6 +1632,9 @@ PA_DEVICE bool ExecutionTokenScalar(
     PA_GM const ExecutionToken &token, uint32_t scalar,
     uint64_t &value
 ) {
+    if (token.control.payload_address == 0) {
+        return false;
+    }
     PA_GM const ExecPayloadStorage &payload =
         ExecutionTokenPayload(token);
     const uint32_t scalar_count =
@@ -1640,6 +1654,9 @@ PA_DEVICE bool ExecutionTokenFanin(
     PA_GM const ExecutionToken &token, uint32_t edge,
     int32_t &producer
 ) {
+    if (token.control.payload_address == 0) {
+        return false;
+    }
     PA_GM const ExecPayloadStorage &payload =
         ExecutionTokenPayload(token);
     const uint32_t fanin_count =

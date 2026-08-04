@@ -4158,3 +4158,65 @@ S6.65 gated rescan   : min / median / max / mean
 因此 S6.65 的两种实现都不保留，生产源码已完整恢复到 S6.64。
 后续不再以“减少单次局部 poll”作为充分优化目标，而要同时证明全周期
 Atomic/GM 读取总量、Execute 消费进度和 FinalDrain backlog 不回退。
+
+## 2026-08-04：S6.66 删除 execution token 的已废弃私有 payload
+
+### 结构收敛与协议边界
+
+S6.63 已把 Execute owner 改为直接引用 task-indexed、Build 后不再修改的
+`SharedExecCell::payload`；Claim winner 完成 payload invalidate 后，不再向
+`ExecutionToken` 复制 10--16 条 active line。但 token ABI 仍为旧私有副本保留
+`ExecPayloadStorage payload`，每个 token 白白占用 4352B。
+
+本阶段删除该字段，token 只保留：
+
+- 1 条 64B owner-local control line；
+- 8 条、共 512B 的 dispatch binding；
+- control 中的 `payload_address` 仍指向唯一 shared immutable payload。
+
+因此每 token 从 `4928B` 降为 `576B`，96 worker × 2 token 共减少：
+
+```text
+192 * 4352B = 835584B
+```
+
+cross-core execution 连续尾状态从 `20183232B` 精确降到
+`19347648B`。control 和 dispatch 仍各自独占 cache line；
+`SharedExecCell::payload`、BUILT CAS、payload clean-out/invalidate、descriptor invalidate、
+fanin、completion 和 TensorMap 严格插入链全部不变。
+
+删除 fallback 后，`payload_address == 0` 只能出现在 IDLE/Reset token；
+payload validator 和独立访问 helper 在解引用前显式 fail-closed。协议单测也不再
+制造一份假的 token-private payload，而是直接锁定所有 dispatch TensorDesc
+指针均落在 shared payload。
+
+### 门槛与 A5 结果
+
+- portable execution protocol CPU 门槛 PASS；
+- 完整 CPU scheduler 回归 PASS；
+- CCEC perf-clock 和 full-swimlane 的 AIC/AIV generic、mixed ELF、唯一
+  role finish 和最终无 relocation 门槛全部 PASS；
+- perf-clock device `.text` 与 S6.64 同为 `250424B`，AIC/AIV finish
+  relocation 同为精确 `2/4`，因而没有代码膨胀干扰；
+- A5 B256 完成 1280 task、1024 kernel，payload、descriptor、fanin、
+  executor route、completion、TensorMap、heap 和终态门槛全部 PASS。
+
+以 S6.64 冻结 ELF 为基线运行 12 对独立 B256 trace-free 交错 A/B：
+
+```text
+S6.64 frozen baseline: min / median / max / mean
+                       1.379104 / 1.395028 / 1.423784 / 1.396554 ms
+S6.66 compact token  : min / median / max / mean
+                       1.376696 / 1.396500 / 1.413027 / 1.396231 ms
+
+独立中位数回退 = 0.001472 ms / 0.106%
+配对回退中位数 = 0.003596 ms / 0.258%
+配对均值改善   = 0.000323 ms / 0.023%
+12 对中候选获胜 5 对
+```
+
+数据证明该布局变化在当前 A5 B256 上是端到端近中性，不宣称性能收益；
+但它完整删除 835584B 不可达生产状态，不增加任何发布操作，且
+消除了一份容易被未来代码误用的第二 payload 权威副本，因此作为通用
+协议布局收敛保留。它不缩短当前 `~1.4 ms` 性能基线；下一阶段不再微调
+token 布局，直接转向 Register 严格插入链的串行 Atomic/到达乱序大头。

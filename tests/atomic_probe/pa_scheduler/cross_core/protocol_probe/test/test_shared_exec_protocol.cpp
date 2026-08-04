@@ -590,9 +590,9 @@ void TestLayoutAndStateAbi() {
         "dispatch binding keeps 50 args and both context regions"
     );
     Check(
-        offsetof(ExecutionToken, dispatch) == 4416 &&
-            sizeof(ExecutionToken) == 4928,
-        "token control, payload and dispatch binding use disjoint lines"
+        offsetof(ExecutionToken, dispatch) == 64 &&
+            sizeof(ExecutionToken) == 576,
+        "token control and dispatch binding use adjacent disjoint lines"
     );
 
     ExecPayloadLayout empty{};
@@ -879,23 +879,14 @@ void TestPublishBindAndComplete() {
 
     const uint64_t shared_reads_after_binding =
         ProtocolTestOps::payload_loads.load();
-    // 旧 token.payload 只为本阶段冻结 ABI；正式执行必须完全依赖 Claim
-    // 时保存的 shared payload 地址，不能悄悄退回已经删除的私有副本。
-    token.payload.words[0] = ~cell.payload.words[0];
+    // 正式执行只依赖 Claim 时保存的 shared payload 地址；
+    // ExecutionToken 已不再包含私有 payload 副本。
     CheckPayloadMatches(token, spec, source);
     PA_GM const uint64_t *dispatch_args =
         ExecutionTokenDispatchArgs(token);
     bool dispatch_tensors_match = true;
     for (uint32_t tensor = 0;
          tensor < spec.tensor_count; ++tensor) {
-        const uint64_t token_pointer = static_cast<uint64_t>(
-            reinterpret_cast<uintptr_t>(
-                &token.payload.words[
-                    layout.tensor_word_offset +
-                    tensor * kExecTensorDescWords
-                ]
-            )
-        );
         const uint64_t shared_pointer = static_cast<uint64_t>(
             reinterpret_cast<uintptr_t>(
                 &cell.payload.words[
@@ -905,7 +896,6 @@ void TestPublishBindAndComplete() {
             )
         );
         dispatch_tensors_match = dispatch_tensors_match &&
-            dispatch_args[tensor] != token_pointer &&
             dispatch_args[tensor] == shared_pointer;
     }
     bool dispatch_scalars_match = true;
