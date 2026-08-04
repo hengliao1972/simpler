@@ -3684,3 +3684,90 @@ core-time。补齐后的分布为：
   收口分别显示；
 - 可审阅泳道为
   `test_record/2026-8-4/cross_b256_s657_full.json`（产物不提交）。
+
+## 2026-08-04：S6.59 直接消费 immutable execution payload，删除二次 GM 拷贝
+
+### 原因与内存合同
+
+S6.58 的离线归因显示，`execute.bind_payload_and_rebuild_args` 在 B256 中有
+约 `4.0 ms` 累计 core-time，单条均值约 `5.66 us`。源码确认 Claim winner
+已经先对 `SharedExecCell[task_id].payload` 做完整 invalidate，随后却把 PA
+实际使用的 `10--16` 条 cacheline 从 shared GM 读出、再写入 owner token 的
+另一份 GM payload，之后才从 token 重建 dispatch。B256 有 `1024` 个 kernel
+task，这一轮读写不是可见性协议所需，而是旧 compact-copy 设计留下的重复搬运。
+
+本阶段只在以下已证明的边界内删除拷贝：
+
+1. `SharedExecCell` 由 task id 唯一索引，本轮不回收、不复用；
+2. builder 完整写 payload，统一 DCCI+DSB 后才 atomic 发布 `BUILT`；
+3. `BUILT` 后不存在 ordinary writer；
+4. 唯一 Execute owner 先用返回型 CAS 取得 `CLAIMED`，再对完整 active payload
+   做一次 invalidate；
+5. inline TensorDesc/scalar/fanin 在 kernel 完成前只读，真正可变的 phase、
+   `fanin_ready_prefix`、local/global context 和 dispatch binding 仍属于 owner
+   token；
+6. `DONE` 后 token 清空 payload 地址。未来若引入 cell ring 复用，必须重新
+   增加 generation/lifetime 证明，不能直接沿用本合同。
+
+实现因此在 `ExecutionTokenControl` 原有 64B control line 中复用 padding 保存
+`payload_address`，不增加结构尺寸；Claim 成功后记录 `&cell.payload`，删除
+`LoadPayloadWord -> StoreTokenPayloadWord` 的完整循环和 token destination
+预取。header、TensorDesc、scalar、fanin 与 PA dispatch 重建统一通过
+`ExecutionTokenPayload()` 读取 immutable shared storage；inline TensorDesc
+指针直接指向该稳定地址，本核 local/global context 仍指向 token。旧
+`ExecutionToken::payload` 暂时保留以冻结 ABI，但正式热路径不再读写，缩小
+结构留给下一独立阶段验证。
+
+### 正确性与生成物门槛
+
+- 完整 CPU scheduler 回归通过；PA adapter、双 token 扫描、中央 Build ticket、
+  TensorMap 严格插入和 FinalDrain 均闭合；
+- portable protocol CPU 门槛新增“破坏旧 token payload 仍必须读取 shared
+  payload”和 Reset 清空地址的断言并全部 PASS；同时把 11 条早已落后于现实现
+  的断言修正为真实合同：`exec_fatal` 只保存精确首错，外层 scheduler fatal
+  才是停止线，helper 不为此恢复冗余返回型 atomic poll；
+- CCEC AIC/AIV protocol probe 的 IR 继续证明 Claim CAS 返回 SSA 参与分支，
+  CAS -> DCCI 顺序保持；最终 mixed ELF 无未定义 helper；
+- A5 独立跨核探针运行 `100 × 32 = 3200` 个 case，覆盖 AIC/AIV 四种方向、
+  `1/2/8/68` 条 cacheline、两种 acquire 方式和四类受控延迟，全部 PASS；
+- A5 PA B1 与 B256 均通过 1280 task、1024 kernel、payload/descriptor/fanin/
+  completion、TensorMap 严格插入及全部终态检查；泳道无 drop；
+- direct payload 让 full-swimlane AIV 的等价 finish 尾部由 CCEC 生成四条
+  `.rela.text` relocation；`readelf` 确认四条都只指向本角色唯一 finish，
+  构建门槛按真实机器码精确冻结为 4，没有放宽成范围。
+
+### A5 冻结交替 A/B
+
+以 S6.57 的冻结 host/kernel ELF 为基线，冻结本阶段候选后按 B-C/C-B 顺序
+运行 12 对独立 B256 trace-free 进程。唯一裁决口径均为最早 startup 起点到
+最后 FinalDrain 结束：
+
+```text
+S6.57 frozen baseline: min / median / max / mean
+                       1.398359 / 1.412288 / 1.453442 / 1.419014 ms
+S6.59 direct payload : min / median / max / mean
+                       1.387992 / 1.403286 / 1.418861 / 1.402182 ms
+
+candidate median 改善 0.009002 ms / 0.637%
+candidate mean   改善 0.016833 ms / 1.186%
+12 对中 11 对候选更快；成对收益中位数为 0.972%
+```
+
+最新 full-swimlane 位于：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260804_063931_1012726/ccec/merged_swimlane.json`
+
+与 S6.57 同类归因相比：
+
+| 指标 | S6.57 | S6.59 | 变化 |
+| ---- | ----: | ----: | ----: |
+| `bind_payload_and_rebuild_args` 累计 core-time | 3989.984 us | 2692.903 us | -32.508% |
+| 同区间单条均值 | 5.660 us | 3.869 us | -31.636% |
+| Submit 全局区间 | 1032.361 us | 971.406 us | -5.904% |
+
+该派生区间只输出不少于 `1 us` 的空白，因此条数从 `705` 变为 `696`，不能把
+条数直接解释成 task 数变化；host 仍证明 1024 个 kernel task 全部唯一执行。
+端到端与目标局部区间同向下降，且改动不读取 PA task kind、batch 或固定图形，
+因此作为通用 shared cross-core GM 消减保留。下一阶段不做 DCache preload，
+继续审计可以减少调用次数的返回型 Atomic，以及 token 旧 payload storage 是否
+能在不扩大协议风险的前提下移除。

@@ -783,6 +783,8 @@ bool TokenDispatchMatches(
     uint64_t expected_vend
 ) {
     const ExecPayloadHeader header = ExecutionTokenHeader(token);
+    const ExecPayloadStorage &payload =
+        ExecutionTokenPayload(token);
     ExecPayloadLayout layout{};
     if (!ComputeExecPayloadLayout(
             header.tensor_count, header.scalar_count,
@@ -804,7 +806,7 @@ bool TokenDispatchMatches(
          tensor < shape.tensor_count; ++tensor) {
         const uint64_t expected_pointer = static_cast<uint64_t>(
             reinterpret_cast<uintptr_t>(
-                &token.payload.words[
+                &payload.words[
                     layout.tensor_word_offset +
                     tensor * kExecTensorDescWords
                 ]
@@ -989,6 +991,9 @@ bool ClaimBindingRejectsMalformedShape(
 void CorruptTokenShape(
     ExecutionToken &token, const CaseShape &shape, ShapeField field
 ) {
+    ExecPayloadStorage &payload = const_cast<ExecPayloadStorage &>(
+        ExecutionTokenPayload(token)
+    );
     constexpr uint64_t kFieldMask = UINT64_C(0xFFFF);
     uint32_t shift = 0;
     uint16_t expected = shape.tensor_count;
@@ -1000,8 +1005,8 @@ void CorruptTokenShape(
         expected = shape.fanin_count;
     }
     const uint64_t mask = kFieldMask << shift;
-    token.payload.words[4] =
-        (token.payload.words[4] & ~mask) |
+    payload.words[4] =
+        (payload.words[4] & ~mask) |
         (static_cast<uint64_t>(MalformedCount(expected)) << shift);
 }
 
@@ -1297,7 +1302,7 @@ bool RunCase(SchedulerState &state, const CaseShape &shape) {
             token, shape, fixture, executor, completion_vend
         ),
         shape.kind,
-        "token payload, self pointers and PA contexts"
+        "shared payload pointers and executor-local PA contexts"
     );
     token.control.phase = ExecTokenPhase::EngineInflight;
     Check(

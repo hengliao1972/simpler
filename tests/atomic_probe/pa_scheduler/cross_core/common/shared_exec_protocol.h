@@ -372,7 +372,11 @@ struct alignas(kExecCacheLineBytes) ExecutionTokenControl {
     uint32_t payload_lines;
     uint32_t payload_bytes;
     uint32_t fanin_ready_prefix;
-    uint8_t padding[32];
+    // 首版 SharedExecCell 按 task-id 固定且全程不复用；Claim winner 完成
+    // payload invalidate 后可直接引用这份 immutable storage。地址只由
+    // execute owner 写入和消费，不参与跨核发布，也不替代 control CAS。
+    uint64_t payload_address;
+    uint8_t padding[24];
 };
 
 struct alignas(kExecCacheLineBytes) ExecutionDispatchBinding {
@@ -394,6 +398,21 @@ struct alignas(kExecCacheLineBytes) ExecutionToken {
     ExecPayloadStorage payload;
     ExecutionDispatchBinding dispatch;
 };
+
+// payload_address==0 只服务于未 Claim 的初始化状态和隔离单测；正式
+// Claim 成功后它始终指向对应 task-indexed SharedExecCell 的 immutable
+// payload。旧 token.payload 暂时保留以冻结 ABI，待本阶段真机闭合后再单独
+// 判断是否缩小结构，避免把消费协议与大范围布局修改混在一起。
+PA_DEVICE PA_GM const ExecPayloadStorage &ExecutionTokenPayload(
+    PA_GM const ExecutionToken &token
+) {
+    if (token.control.payload_address == 0) {
+        return token.payload;
+    }
+    return *reinterpret_cast<PA_GM const ExecPayloadStorage *>(
+        static_cast<uintptr_t>(token.control.payload_address)
+    );
+}
 
 // portable execution 协议不依赖 standalone 的 TraceContext/AtomicSite，
 // 但正式接线必须能够在真实原语边界观察 atomic 与 DCCI。这里定义一份
@@ -546,6 +565,7 @@ static_assert(
 );
 static_assert(
     sizeof(ExecutionTokenControl) == kExecCacheLineBytes &&
+        offsetof(ExecutionTokenControl, payload_address) == 32 &&
         offsetof(ExecutionToken, payload) == kExecCacheLineBytes,
     "execution token control and binding must remain separate"
 );
@@ -1038,10 +1058,12 @@ PA_DEVICE bool ValidateBoundExecPayload(
     ExecPayloadHeader &header,
     ExecPayloadLayout &layout
 ) {
-    header = DecodeExecPayloadHeader(token.payload);
-    if ((token.payload.words[0] >> 32U) != 0 ||
-        (token.payload.words[6] >> 32U) != 0 ||
-        token.payload.words[7] != 0 ||
+    PA_GM const ExecPayloadStorage &payload =
+        ExecutionTokenPayload(token);
+    header = DecodeExecPayloadHeader(payload);
+    if ((payload.words[0] >> 32U) != 0 ||
+        (payload.words[6] >> 32U) != 0 ||
+        payload.words[7] != 0 ||
         header.task_id != expected_task_id ||
         header.engine_class != expected_engine ||
         (header.function_id == kExecInvalidFunctionId &&
@@ -1062,7 +1084,7 @@ PA_DEVICE bool ValidateBoundExecPayload(
              (uint32_t{1} << tensor)) == 0) {
             continue;
         }
-        const uint64_t reference = token.payload.words[
+        const uint64_t reference = payload.words[
             ExecTensorPayloadWordOffset(
                 tensor, header.tensor_reference_mask
             )
@@ -1097,8 +1119,10 @@ template <typename Ops, typename Observer>
 PA_DEVICE bool RebuildExecutionTokenDispatchArgs(
     PA_GM ExecutionToken &token, Observer &observer
 ) {
+    PA_GM const ExecPayloadStorage &payload =
+        ExecutionTokenPayload(token);
     const ExecPayloadHeader header =
-        DecodeExecPayloadHeader(token.payload);
+        DecodeExecPayloadHeader(payload);
     ExecPayloadLayout layout{};
     if ((token.control.phase != ExecTokenPhase::Binding &&
          token.control.phase != ExecTokenPhase::WaitingFanin) ||
@@ -1113,10 +1137,10 @@ PA_DEVICE bool RebuildExecutionTokenDispatchArgs(
         return false;
     }
 
-    // builder-local descriptor 必须重绑到本 executor token；只有由
-    // adapter 明确声明生命周期稳定的 GM descriptor 才保留绝对地址。
-    // A5 Scalar 间没有 cache coherence，executor 在第一次使用引用前
-    // 必须 invalidate 对应 128B，不能依赖 builder 或前一轮的 DCache。
+    // inline descriptor 已位于本轮不复用的 immutable shared payload，可
+    // 直接保留稳定地址；adapter 明确声明的外部 GM descriptor 同样保留
+    // 绝对地址。A5 Scalar 间没有 cache coherence，executor 在第一次使用
+    // 外部引用前必须 invalidate 对应 128B，不能依赖 builder 的 DCache。
     for (uint32_t tensor = 0;
          tensor < header.tensor_count; ++tensor) {
         const uint32_t word_offset = ExecTensorPayloadWordOffset(
@@ -1125,7 +1149,7 @@ PA_DEVICE bool RebuildExecutionTokenDispatchArgs(
         if ((header.tensor_reference_mask &
              (uint32_t{1} << tensor)) != 0) {
             const uint64_t reference =
-                token.payload.words[word_offset];
+                payload.words[word_offset];
             PA_GM const void *descriptor =
                 reinterpret_cast<PA_GM const void *>(
                     static_cast<uintptr_t>(reference)
@@ -1138,7 +1162,7 @@ PA_DEVICE bool RebuildExecutionTokenDispatchArgs(
         } else {
             token.dispatch.args[tensor] = static_cast<uint64_t>(
                 reinterpret_cast<uintptr_t>(
-                    &token.payload.words[word_offset]
+                    &payload.words[word_offset]
                 )
             );
         }
@@ -1146,7 +1170,7 @@ PA_DEVICE bool RebuildExecutionTokenDispatchArgs(
     for (uint32_t scalar = 0;
          scalar < header.scalar_count; ++scalar) {
         token.dispatch.args[header.tensor_count + scalar] =
-            token.payload.words[layout.scalar_word_offset + scalar];
+            payload.words[layout.scalar_word_offset + scalar];
     }
     token.dispatch.args[kExecDispatchLocalContextIndex] =
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
@@ -1177,6 +1201,7 @@ PA_DEVICE void ResetExecutionToken(
     token.control.payload_lines = 0;
     token.control.payload_bytes = 0;
     token.control.fanin_ready_prefix = 0;
+    token.control.payload_address = 0;
     token.control.phase = ExecTokenPhase::Idle;
 }
 
@@ -1356,6 +1381,9 @@ PA_DEVICE ExecClaimResult ClaimAndBindObservedExecPayload(
     token.control.payload_lines = observed.payload_lines;
     token.control.payload_bytes = 0;
     token.control.fanin_ready_prefix = 0;
+    token.control.payload_address = static_cast<uint64_t>(
+        reinterpret_cast<uintptr_t>(&cell.payload)
+    );
     token.control.phase = ExecTokenPhase::Binding;
 
     const uint64_t published_bytes =
@@ -1368,16 +1396,10 @@ PA_DEVICE ExecClaimResult ClaimAndBindObservedExecPayload(
         &cell.payload, published_bytes, task_id
     );
     Ops::PreloadPayloadSource(&cell.payload, published_bytes);
-    Ops::PreloadTokenDestination(&token.payload, published_bytes);
-    const uint32_t published_words =
-        observed.payload_lines * kExecHeaderWords;
-    for (uint32_t word = 0;
-         word < published_words; ++word) {
-        Ops::StoreTokenPayloadWord(
-            &token.payload.words[word],
-            Ops::LoadPayloadWord(&cell.payload.words[word])
-        );
-    }
+    // SharedExecCell 由 task-id 唯一索引，当前一轮运行内既不回收也不复用；
+    // BUILT 发布后没有 ordinary writer。唯一 Claim winner invalidate 后直接
+    // 使用这份 immutable payload，只把可变 phase/fanin 前缀留在 owner-local
+    // token，避免再向 GM token 复制 10~16 条 cacheline。
 
     ExecPayloadHeader header{};
     ExecPayloadLayout layout{};
@@ -1455,13 +1477,15 @@ PA_DEVICE ExecClaimResult ClaimAndBindExecPayload(
 PA_DEVICE ExecPayloadHeader ExecutionTokenHeader(
     PA_GM const ExecutionToken &token
 ) {
-    return DecodeExecPayloadHeader(token.payload);
+    return DecodeExecPayloadHeader(ExecutionTokenPayload(token));
 }
 
 PA_DEVICE bool ExecutionTokenTensorWord(
     PA_GM const ExecutionToken &token, uint32_t tensor,
     uint32_t word, uint64_t &value
 ) {
+    PA_GM const ExecPayloadStorage &payload =
+        ExecutionTokenPayload(token);
     const ExecPayloadHeader header = ExecutionTokenHeader(token);
     if (tensor >= header.tensor_count ||
         word >= kExecTensorDescWords) {
@@ -1473,7 +1497,7 @@ PA_DEVICE bool ExecutionTokenTensorWord(
     if ((header.tensor_reference_mask &
          (uint32_t{1} << tensor)) != 0) {
         const uint64_t reference =
-            token.payload.words[word_offset];
+            payload.words[word_offset];
         if (reference == 0 ||
             reference % alignof(uint64_t) != 0) {
             return false;
@@ -1484,7 +1508,7 @@ PA_DEVICE bool ExecutionTokenTensorWord(
             );
         value = words[word];
     } else {
-        value = token.payload.words[word_offset + word];
+        value = payload.words[word_offset + word];
     }
     return true;
 }
@@ -1493,6 +1517,8 @@ PA_DEVICE bool ExecutionTokenScalar(
     PA_GM const ExecutionToken &token, uint32_t scalar,
     uint64_t &value
 ) {
+    PA_GM const ExecPayloadStorage &payload =
+        ExecutionTokenPayload(token);
     const ExecPayloadHeader header = ExecutionTokenHeader(token);
     if (scalar >= header.scalar_count) {
         return false;
@@ -1505,7 +1531,7 @@ PA_DEVICE bool ExecutionTokenScalar(
         )) {
         return false;
     }
-    value = token.payload.words[layout.scalar_word_offset + scalar];
+    value = payload.words[layout.scalar_word_offset + scalar];
     return true;
 }
 
@@ -1513,6 +1539,8 @@ PA_DEVICE bool ExecutionTokenFanin(
     PA_GM const ExecutionToken &token, uint32_t edge,
     int32_t &producer
 ) {
+    PA_GM const ExecPayloadStorage &payload =
+        ExecutionTokenPayload(token);
     const ExecPayloadHeader header = ExecutionTokenHeader(token);
     if (edge >= header.fanin_count) {
         return false;
@@ -1527,7 +1555,7 @@ PA_DEVICE bool ExecutionTokenFanin(
     }
     const uint32_t word_offset =
         layout.fanin_word_offset + edge / 2U;
-    const uint64_t packed = token.payload.words[word_offset];
+    const uint64_t packed = payload.words[word_offset];
     producer = static_cast<int32_t>(
         edge % 2U == 0
             ? static_cast<uint32_t>(packed)

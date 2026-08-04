@@ -717,10 +717,10 @@ void TestMixedInlineAndReferencedDescriptors() {
             token.dispatch.args[2] == reference2 &&
             token.dispatch.args[1] == static_cast<uint64_t>(
                 reinterpret_cast<uintptr_t>(
-                    &token.payload.words[inline1_offset]
+                    &cell.payload.words[inline1_offset]
                 )
             ),
-        "referenced descriptors keep stable GM addresses while inline descriptor rebinds"
+        "referenced and inline descriptors keep stable shared GM addresses"
     );
     Check(
         ProtocolTestOps::invalidate_calls.load() == 3,
@@ -832,52 +832,61 @@ void TestPublishBindAndComplete() {
         "winner invalidates exactly the published payload once"
     );
     Check(
-        ProtocolTestOps::payload_loads.load() ==
-            layout.payload_lines * kExecHeaderWords &&
-            ProtocolTestOps::token_stores.load() ==
-                layout.payload_lines * kExecHeaderWords,
-        "binding makes one forward copy of the published lines"
+        token.control.payload_address ==
+                reinterpret_cast<uintptr_t>(&cell.payload) &&
+            ProtocolTestOps::payload_loads.load() == 0 &&
+            ProtocolTestOps::token_stores.load() == 0,
+        "binding references immutable shared payload without a GM copy"
     );
     Check(
         ProtocolTestOps::preload_source_calls.load() == 1 &&
-            ProtocolTestOps::preload_token_calls.load() == 1 &&
+            ProtocolTestOps::preload_token_calls.load() == 0 &&
             ProtocolTestOps::preload_source_address.load() ==
                 reinterpret_cast<uintptr_t>(&cell.payload) &&
-            ProtocolTestOps::preload_token_address.load() ==
-                reinterpret_cast<uintptr_t>(&token.payload) &&
             ProtocolTestOps::preload_source_bytes.load() ==
                 static_cast<uint64_t>(layout.payload_lines) * 64 &&
-            ProtocolTestOps::preload_token_bytes.load() ==
-                static_cast<uint64_t>(layout.payload_lines) * 64,
-        "executor preload hooks share the exact acquire boundary"
+            ProtocolTestOps::preload_token_address.load() == 0 &&
+            ProtocolTestOps::preload_token_bytes.load() == 0,
+        "executor source hook stays inside the exact acquire boundary"
     );
     Check(
         ProtocolTestOps::claim_cas_event.load() <
                 ProtocolTestOps::invalidate_event.load() &&
-            ProtocolTestOps::invalidate_event.load() <
-                ProtocolTestOps::first_payload_load_event.load() &&
-            ProtocolTestOps::first_payload_load_event.load() <
-                ProtocolTestOps::first_token_store_event.load(),
-        "claim CAS precedes invalidate, shared load and token store"
+            ProtocolTestOps::first_payload_load_event.load() == 0 &&
+            ProtocolTestOps::first_token_store_event.load() == 0,
+        "claim CAS precedes invalidate and binding performs no copy"
     );
 
     const uint64_t shared_reads_after_binding =
         ProtocolTestOps::payload_loads.load();
+    // 旧 token.payload 只为本阶段冻结 ABI；正式执行必须完全依赖 Claim
+    // 时保存的 shared payload 地址，不能悄悄退回已经删除的私有副本。
+    token.payload.words[0] = ~cell.payload.words[0];
     CheckPayloadMatches(token, spec, source);
     PA_GM const uint64_t *dispatch_args =
         ExecutionTokenDispatchArgs(token);
     bool dispatch_tensors_match = true;
     for (uint32_t tensor = 0;
          tensor < spec.tensor_count; ++tensor) {
+        const uint64_t token_pointer = static_cast<uint64_t>(
+            reinterpret_cast<uintptr_t>(
+                &token.payload.words[
+                    layout.tensor_word_offset +
+                    tensor * kExecTensorDescWords
+                ]
+            )
+        );
+        const uint64_t shared_pointer = static_cast<uint64_t>(
+            reinterpret_cast<uintptr_t>(
+                &cell.payload.words[
+                    layout.tensor_word_offset +
+                    tensor * kExecTensorDescWords
+                ]
+            )
+        );
         dispatch_tensors_match = dispatch_tensors_match &&
-            dispatch_args[tensor] == static_cast<uint64_t>(
-                reinterpret_cast<uintptr_t>(
-                    &token.payload.words[
-                        layout.tensor_word_offset +
-                        tensor * kExecTensorDescWords
-                    ]
-                )
-            );
+            dispatch_args[tensor] != token_pointer &&
+            dispatch_args[tensor] == shared_pointer;
     }
     bool dispatch_scalars_match = true;
     for (uint32_t scalar = 0;
@@ -909,7 +918,7 @@ void TestPublishBindAndComplete() {
     Check(
         ProtocolTestOps::payload_loads.load() ==
             shared_reads_after_binding,
-        "token access never rereads the shared payload"
+        "direct immutable payload reads do not invoke the removed copy hook"
     );
     Check(
         TryMarkExecutionTokenEngineInflight<ProtocolTestOps>(
@@ -960,7 +969,8 @@ void TestPublishBindAndComplete() {
         token.control.phase == ExecTokenPhase::Idle &&
             token.control.build_owner == UINT32_MAX &&
             token.control.execute_owner == UINT32_MAX &&
-            token.control.fanin_ready_prefix == 0,
+            token.control.fanin_ready_prefix == 0 &&
+            token.control.payload_address == 0,
         "token returns to a fully reset IDLE state only after DONE"
     );
 }
@@ -1112,9 +1122,9 @@ void TestConcurrentExecutorsHaveOneWinner() {
     Check(winners == 1, "concurrent executors elect exactly one owner");
     Check(
         ProtocolTestOps::invalidate_calls.load() == 1 &&
-            ProtocolTestOps::payload_loads.load() ==
-                layout.payload_lines * kExecHeaderWords,
-        "only the CAS winner invalidates and copies payload"
+            ProtocolTestOps::payload_loads.load() == 0 &&
+            ProtocolTestOps::token_stores.load() == 0,
+        "only the CAS winner invalidates and no executor copies payload"
     );
     for (uint32_t index = 0; index < kExecutorCount; ++index) {
         if (index == winner_index) {
@@ -1127,8 +1137,8 @@ void TestConcurrentExecutorsHaveOneWinner() {
                 ProtocolTestOps::actor_invalidate_calls[index].load() ==
                         1 &&
                     ProtocolTestOps::actor_payload_loads[index].load() ==
-                        layout.payload_lines * kExecHeaderWords,
-                "winner alone performs acquire and payload reads"
+                        0,
+                "winner alone performs acquire without a payload copy"
             );
         } else {
             Check(
@@ -1517,11 +1527,10 @@ void TestCorruptCountsRemainBounded() {
                     static_cast<uint64_t>(
                         published_layout.payload_lines
                     ) * kExecCacheLineBytes &&
-                ProtocolTestOps::payload_loads.load() ==
-                    published_layout.payload_lines *
-                        kExecHeaderWords &&
+                ProtocolTestOps::payload_loads.load() == 0 &&
+                ProtocolTestOps::token_stores.load() == 0 &&
                 token.control.phase == ExecTokenPhase::Faulted,
-            "corrupt count cannot expand bounded DCCI or copy"
+            "corrupt count cannot expand bounded DCCI or trigger a copy"
         );
         Check(
             ExecFatalPublished<ProtocolTestOps>(fatal),
@@ -1652,10 +1661,13 @@ void TestFaninGatesExecutionAndRejectsFutureProducer() {
     const uint32_t final_word =
         layout.fanin_word_offset +
         (header.fanin_count - 1U) / 2U;
-    const uint64_t original = token.payload.words[final_word];
+    ExecPayloadStorage &payload = const_cast<ExecPayloadStorage &>(
+        ExecutionTokenPayload(token)
+    );
+    const uint64_t original = payload.words[final_word];
     token.control.phase = ExecTokenPhase::WaitingFanin;
     token.control.fanin_ready_prefix = 0;
-    token.payload.words[final_word] =
+    payload.words[final_word] =
         (original & 0xFFFFFFFFULL) |
         (static_cast<uint64_t>(spec.task_id) << 32U);
     ready.ready[spec.task_id].store(true);
@@ -1700,7 +1712,7 @@ void TestBuildRejectsInvalidFaninBeforePublication() {
     }
 }
 
-void TestBuildingFailurePublishesFatalAndCutsOffWork() {
+void TestBuildingFailurePublishesDiagnosticFatal() {
     SharedExecCell broken{};
     SharedExecCell untouched{};
     ExecutionToken token{};
@@ -1750,24 +1762,27 @@ void TestBuildingFailurePublishesFatalAndCutsOffWork() {
         "failed pack publishes first fatal without BUILT or DCCI"
     );
 
+    const SyntheticPayloadSource valid_source = MakeSource();
+    const int64_t first_fatal = fatal.state;
     ProtocolTestOps::ResetTrace();
     Check(
         BuildAndPublishExecPayload<ProtocolTestOps>(
-            untouched, 7, spec, source, fatal
-        ) == ExecBuildResult::FatalObserved &&
+            untouched, 7, spec, valid_source, fatal
+        ) == ExecBuildResult::Published &&
         ClaimAndBindExecPayload<ProtocolTestOps>(
             broken, spec.task_id, 8,
             ExecEngineClass::Aiv, token, fatal
-        ) == ExecClaimResult::FatalObserved,
-        "fatal stops later builders and claimants"
+        ) == ExecClaimResult::NotBuilt,
+        "diagnostic exec fatal does not replace the outer scheduler stop line"
     );
     Check(
-        ProtocolTestOps::cas_calls.load() == 0 &&
-            ProtocolTestOps::payload_stores.load() == 0 &&
-            ProtocolTestOps::flush_calls.load() == 0 &&
+        ProtocolTestOps::fatal_cas_calls.load() == 0 &&
+            ProtocolTestOps::payload_stores.load() > 0 &&
+            ProtocolTestOps::flush_calls.load() == 1 &&
             ProtocolTestOps::invalidate_calls.load() == 0 &&
-            CurrentState(untouched).phase == ExecPhase::Empty,
-        "post-fatal roles perform no irreversible shared operation"
+            CurrentState(untouched).phase == ExecPhase::Built &&
+            fatal.state == first_fatal,
+        "helpers do not add a redundant exec-fatal atomic poll"
     );
 }
 
@@ -1828,15 +1843,25 @@ void TestFatalFirstFailureWins() {
     );
 }
 
-void TestFatalStopsWaitingAndInflightTokens() {
+void TestDiagnosticFatalDoesNotAbortActiveToken() {
+    SharedExecCell cell{};
     SharedExecFatalControl fatal{};
-    ExecutionToken waiting{};
-    ExecutionToken inflight{};
+    ExecutionToken token{};
+    InitializeCell(cell);
     InitializeFatal(fatal);
-    InitializeToken(waiting);
-    InitializeToken(inflight);
-    waiting.control.phase = ExecTokenPhase::WaitingFanin;
-    inflight.control.phase = ExecTokenPhase::EngineInflight;
+    InitializeToken(token);
+    const ExecPayloadSpec spec = MakeSpec();
+    const SyntheticPayloadSource source = MakeSource();
+    Check(
+        BuildAndPublishExecPayload<ProtocolTestOps>(
+            cell, 1, spec, source, fatal
+        ) == ExecBuildResult::Published &&
+        ClaimAndBindExecPayload<ProtocolTestOps>(
+            cell, spec.task_id, 2,
+            ExecEngineClass::Aiv, token, fatal
+        ) == ExecClaimResult::Claimed,
+        "active-token fatal test reaches WAITING_FANIN"
+    );
     Check(
         PublishExecFatal<ProtocolTestOps>(
             fatal, ExecFatalReason::ClaimedPayloadInvalid, 42, 3
@@ -1844,30 +1869,33 @@ void TestFatalStopsWaitingAndInflightTokens() {
         "fatal trigger is published for token convergence"
     );
     ReadyTable ready{};
+    for (int32_t producer : source.fanin) {
+        ready.ready[static_cast<uint32_t>(producer)].store(true);
+    }
     Check(
-        !TryMarkExecutionTokenEngineInflight<ProtocolTestOps>(
-            waiting, ready, fatal
-        ) && waiting.control.phase == ExecTokenPhase::Faulted,
-        "waiting token stops before engine launch"
+        TryMarkExecutionTokenEngineInflight<ProtocolTestOps>(
+            token, ready, fatal
+        ) && token.control.phase == ExecTokenPhase::EngineInflight,
+        "outer scheduler owns stopping; active token can finish safely"
     );
     EngineCompletion incomplete{false};
     Check(
         !TryMarkExecutionTokenCompleting<ProtocolTestOps>(
-            inflight, incomplete, fatal
-        ) && inflight.control.phase ==
+            token, incomplete, fatal
+        ) && token.control.phase ==
                 ExecTokenPhase::EngineInflight,
-        "inflight token waits for the real engine completion after fatal"
+        "diagnostic fatal never bypasses real engine completion"
     );
     EngineCompletion complete{true};
     Check(
-        !TryMarkExecutionTokenCompleting<ProtocolTestOps>(
-            inflight, complete, fatal
-        ) && inflight.control.phase == ExecTokenPhase::Faulted,
-        "completed engine converges without vend, flag or DONE"
+        TryMarkExecutionTokenCompleting<ProtocolTestOps>(
+            token, complete, fatal
+        ) && token.control.phase == ExecTokenPhase::Completing,
+        "completed engine reaches the normal completion path"
     );
 }
 
-void TestCompletionFailureIsTerminalAndIdempotent() {
+void TestCompletionFailureRetriesWithoutRepeatingSuccess() {
     const ExecPayloadSpec spec = MakeSpec();
     const SyntheticPayloadSource source = MakeSource();
     ReadyTable ready{};
@@ -1951,36 +1979,37 @@ void TestCompletionFailureIsTerminalAndIdempotent() {
         Check(
             PublishExecDoneAfterCompletion<ProtocolTestOps>(
                 cell, token, completion, fatal
-            ) == ExecDoneResult::FatalObserved,
-            "terminal fatal blocks any completion retry"
-        );
-        Check(
-            completion.event_count == event_count &&
-                completion.vend_calls == vend_calls &&
-                completion.flag_calls == flag_calls,
-            "fatal retry repeats no completion side effect"
+            ) == ExecDoneResult::Done &&
+                token.control.phase == ExecTokenPhase::Idle &&
+                CurrentState(cell).phase == ExecPhase::Done,
+            "completion retry closes the task despite diagnostic exec fatal"
         );
         if (failure_case == 0) {
             Check(
-                completion.event_count == 0 &&
-                    completion.vend_calls == 1 &&
-                    completion.flag_calls == 0,
-                "failed vend publishes no flag"
+                event_count == 0 && vend_calls == 1 &&
+                    flag_calls == 0 &&
+                    completion.event_count == 2 &&
+                    completion.vend_calls == 2 &&
+                    completion.flag_calls == 1,
+                "failed vend retries vend once before one flag publication"
             );
         } else if (failure_case == 1) {
             Check(
-                completion.vend_calls == 1 &&
-                    completion.flag_calls == 1 &&
-                    completion.event_count == 1 &&
-                    completion.events[0] == 1,
-                "flag failure preserves the single successful vend"
+                event_count == 1 && vend_calls == 1 &&
+                    flag_calls == 1 &&
+                    completion.vend_calls == 1 &&
+                    completion.flag_calls == 2 &&
+                    completion.event_count == 2,
+                "flag retry does not repeat the successful vend"
             );
         } else {
             Check(
-                completion.vend_calls == 1 &&
-                    completion.flag_calls == 1 &&
-                    completion.event_count == 2,
-                "DONE conflict preserves one vend and one flag"
+                event_count == 2 && vend_calls == 1 &&
+                    flag_calls == 1 &&
+                    completion.vend_calls == vend_calls &&
+                    completion.flag_calls == flag_calls &&
+                    completion.event_count == event_count,
+                "DONE retry repeats neither vend nor flag"
             );
         }
         Check(
@@ -2066,10 +2095,10 @@ int main() {
     TestCorruptCountsRemainBounded();
     TestFaninGatesExecutionAndRejectsFutureProducer();
     TestBuildRejectsInvalidFaninBeforePublication();
-    TestBuildingFailurePublishesFatalAndCutsOffWork();
+    TestBuildingFailurePublishesDiagnosticFatal();
     TestFatalFirstFailureWins();
-    TestFatalStopsWaitingAndInflightTokens();
-    TestCompletionFailureIsTerminalAndIdempotent();
+    TestDiagnosticFatalDoesNotAbortActiveToken();
+    TestCompletionFailureRetriesWithoutRepeatingSuccess();
     TestEngineRoutingAndInputValidation();
     if (g_failures != 0) {
         std::fprintf(

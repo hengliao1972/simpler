@@ -462,9 +462,11 @@ __aicore__ inline void ExecuteCase(
     uint64_t observed_hash = kHashSeed;
     uint64_t expected_hash = kHashSeed;
     if (payload_valid) {
+        __gm__ const ExecPayloadStorage &payload =
+            ExecutionTokenPayload(token);
         for (uint32_t word = 0;
              word < layout.written_words; ++word) {
-            const uint64_t observed = token.payload.words[word];
+            const uint64_t observed = payload.words[word];
             const uint64_t expected = ExpectedPayloadWord(
                 case_id, spec, layout, word
             );

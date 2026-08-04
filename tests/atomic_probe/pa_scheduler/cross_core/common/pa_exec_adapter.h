@@ -420,10 +420,10 @@ PA_DEVICE bool BindPaExecutionTokenDispatchAfterClaim(
                ));
 }
 
-// kernel 发射前最后一次核对 executor-private binding。协议层已经检查
-// shared payload 的 header/range；这里进一步证明最终 dispatch 不含
-// builder/shared-cell 地址，并且 PA Local/GlobalContext 使用执行核身份。
-// 该检查是 standalone 首版的真实执行入口合同，不是 host 诊断逻辑。
+// kernel 发射前最后一次核对 executor binding。协议层已经检查 immutable
+// shared payload 的 header/range；inline TensorDesc 可以直接引用该
+// task-indexed storage，真正可变的 Local/GlobalContext 仍必须使用执行核
+// 自己的 token。该检查是 standalone 的真实执行入口合同，不是 host 诊断。
 PA_DEVICE bool ValidatePaExecutionTokenDispatch(
     PA_GM const ExecutionToken &token,
     PA_GM const WorkerState &executor, TaskKind expected_kind
@@ -434,6 +434,8 @@ PA_DEVICE bool ValidatePaExecutionTokenDispatch(
         return false;
     }
     const ExecPayloadHeader header = ExecutionTokenHeader(token);
+    PA_GM const ExecPayloadStorage &payload =
+        ExecutionTokenPayload(token);
     ExecPayloadLayout layout{};
     PaExecRoute route{};
     TaskKind payload_kind = TaskKind::Count;
@@ -477,9 +479,9 @@ PA_DEVICE bool ValidatePaExecutionTokenDispatch(
         const uint64_t expected_address =
             (header.tensor_reference_mask &
              (uint32_t{1} << tensor)) != 0
-            ? token.payload.words[word_offset]
+            ? payload.words[word_offset]
             : static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
-                  &token.payload.words[word_offset]
+                  &payload.words[word_offset]
               ));
         if (token.dispatch.args[tensor] != expected_address) {
             return false;
@@ -488,7 +490,7 @@ PA_DEVICE bool ValidatePaExecutionTokenDispatch(
     for (uint32_t scalar = 0;
          scalar < header.scalar_count; ++scalar) {
         if (token.dispatch.args[header.tensor_count + scalar] !=
-            token.payload.words[
+            payload.words[
                 layout.scalar_word_offset + scalar
             ]) {
             return false;
