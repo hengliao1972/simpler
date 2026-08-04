@@ -4109,3 +4109,52 @@ S6.64 metadata once  : min / median / max / mean
 因此作为通用 cross-core execution ownership 优化保留。当前可信中位数仍约
 `1.405 ms`，尚未达到 `1 ms` 目标；下一阶段继续按第 18 节审计 Register 到达
 乱序以及 Execute scanner/token/FinalDrain 的重复状态观察。
+
+## 2026-08-04：S6.65 证伪 Claim 后延迟 token 复扫（未保留）
+
+### 假设与两次收敛
+
+S6.64 泳道和源码审计发现：新 execution token Claim 成功后，代码先
+单独推进新 token，紧接着又全量扫描两个 token。候选试图删除
+“新 token 未 ready 时立即重读同一 fanin”。严格 TensorMap 插入链、
+Claim CAS、fanin 顺序、completion 发布和 FinalDrain 条件都不改。
+
+第一版在 Claim 分支内显式复查 peer token，并在 peer 完成时再复查
+新 token。CPU 协议门槛通过，但额外的 `ProgressCrossCoreActiveToken()` 展开
+使 device `.text` 从 `250424B` 增加到 `276280B`，增长
+`25856B / 10.32%`。8 对冻结交错 A/B 只胜 `4/8`，配对中位收益仅
+`1.155 us / 0.083%`，属于噪声。该展开方式立即撤回。
+
+第二版收敛为单一条件：只有新 token 完成时才调用既有双 token
+helper；新 token 未 ready 时不立即复扫。定向 CPU 门槛证明，同一次
+Progress 中两个 blocked token 的首轮 not-ready 读取精确收敛为 2；
+CCEC AIC/AIV 精确 finish relocation 保持 `2/4`，device `.text` 也保持
+`250424B`，排除了代码膨胀干扰。A5 B256 的 1280 task、1024 kernel、
+payload、fanin、completion、TensorMap、heap 和终态门槛全部 PASS。
+
+### 冻结交错 A/B 与否定结论
+
+以 S6.64 冻结 ELF 为基线，对代码大小不变的第二版运行 8 对独立
+B256 trace-free 交错 A/B，奇偶轮反转顺序，口径均为 startup 起点到
+最后 FinalDrain 结束：
+
+```text
+S6.64 frozen baseline: min / median / max / mean
+                       1.376302 / 1.385292 / 1.405388 / 1.387647 ms
+S6.65 gated rescan   : min / median / max / mean
+                       1.376262 / 1.404504 / 1.432139 / 1.403722 ms
+
+独立中位数回退 = 0.019213 ms / 1.387%
+配对回退中位数 = 0.023282 ms
+配对回退均值   = 0.016075 ms
+8 对中候选仅胜 2 对
+```
+
+更重要的是，完整调度期的 fanin load 中位数没有随局部读取删除而
+下降，反而从 `30138.5` 增加到 `30567.0`。这证明被删的即时复扫并非
+纯粹死工作：它在 Build/Claim 生产窗口内及时消费远端 completion；延迟后，
+同样的观察被转移到更后的 Progress/FinalDrain，还放大了 backlog 长尾。
+
+因此 S6.65 的两种实现都不保留，生产源码已完整恢复到 S6.64。
+后续不再以“减少单次局部 poll”作为充分优化目标，而要同时证明全周期
+Atomic/GM 读取总量、Execute 消费进度和 FinalDrain backlog 不回退。
