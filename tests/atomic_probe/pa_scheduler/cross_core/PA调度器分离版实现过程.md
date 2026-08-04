@@ -3771,3 +3771,45 @@ candidate mean   改善 0.016833 ms / 1.186%
 因此作为通用 shared cross-core GM 消减保留。下一阶段不做 DCache preload，
 继续审计可以减少调用次数的返回型 Atomic，以及 token 旧 payload storage 是否
 能在不扩大协议风险的前提下移除。
+
+## 2026-08-04：S6.60 证伪 completion 前缀位消除空 ordinary tail load
+
+### 候选与正确性证明
+
+S6.59 的 full-swimlane 中，PA 的 ordinary writer 数为 0，但通用
+`CollectSharedFanin()` 仍执行了 1280 次
+`shared_tensormap_lookup_tail_load`。本轮尝试复用已有
+`TaskCell::deps_prepared`：低 32 bit 继续保存 task id，bit32 单调携带
+“截至本 task 的已提交前缀是否出现过 ordinary writer”。N 的 owner 已经从
+唯一一次 N-1 completion load 得到该位，再与本 task 的 `ordinary_count`
+合并并通过原 completion CAS 传给 N+1，因此理论上不增加 GM 字段或 Atomic。
+只有该位证明整个前缀为空时，才跳过 ordinary bucket-tail load；一旦任一算子
+插入 ordinary writer，后续永久回落到原通用查询路径，不依赖 PA task kind。
+
+CPU 定向门槛证明：首个 ordinary writer 正确置位、后续空 task 单调继承、
+未知保留位和越界 task id 被拒绝；空前缀把 bucket-tail load 从 1 次降为 0，
+未知前缀仍执行原查询。完整 CPU 回归、CCEC AIC/AIV 编译和 A5 B1 的 5 task、
+4 kernel、fanin、TensorMap、heap 与终态检查也全部通过；B1 的物理 ordinary
+lookup 从旧口径 4 次降为 0。
+
+### A5 端到端否决
+
+以 S6.59 冻结 ELF 为基线，与候选运行 12 对独立 B256 trace-free 进程；口径
+仍为最早 startup 起点到最后 FinalDrain 结束：
+
+```text
+S6.59 frozen baseline: min / median / max / mean
+                       1.391164 / 1.416211 / 1.438538 / 1.415585 ms
+completion-prefix bit: min / median / max / mean
+                       1.435485 / 1.452361 / 1.505723 / 1.457319 ms
+
+候选配对收益中位数 = -3.023%
+候选配对收益均值   = -2.961%
+12 对中候选获胜 0 对
+```
+
+结论：调用数减少是真实的，但每个 task 都新增的 completion 解码、前缀传播和
+fanin 热分支改变了关键路径及代码布局，代价显著高于空 bucket-tail load。
+该候选的全部代码、ABI generation 和 host 口径修改均已撤销，只保留本记录；
+后续不再通过扩展 completion 编码消除这批查询，应优先寻找不增加每 task 热
+控制流的 GM/Atomic 消减。
