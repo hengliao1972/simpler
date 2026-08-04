@@ -4332,3 +4332,62 @@ S6.67 FetchAdd publish: min / median / max / mean
 与均值均同向，因此作为通用有序发布优化保留。当前可信端到端中位数约
 `1.400 ms`，距离 `1 ms` 仍有明显差距；下一阶段继续按完整泳道挑选未被
 kernel overlap 掩盖的 FinalDrain/执行推进大头。
+
+## 2026-08-04：S6.68-a 发布 AIC/AIV 双中央 Execute 静态计划
+
+### 目标合同
+
+本阶段先固定下一版 Execute owner 的输入，不同时改运行时状态机：
+
+```text
+Build owner：96 Scalar 共用既有中央 Build ticket
+Execute owner：
+  32 AIC 共用 AIC Execute ticket，只消费 AIC task
+  64 AIV 共用 AIV Execute ticket，只消费 AIV task
+```
+
+Build 与 Execute 是两次独立的 owner 决策，但不增加
+`build_owner != execute_owner` 条件。同一 Scalar 恰好构建并执行同一 task 是
+合法结果；真正跨核时仍使用已经闭合的 payload DCCI publish/acquire 合同。
+
+### 结构与发布
+
+在既有 `SharedBuildDispatchState` 后追加 `SharedExecDispatchState`，不移动
+production prefix、TensorMap、execution cell/token 或 Build dispatch：
+
+```text
+cache line 0 : aic_next
+cache line 1 : aiv_next
+cache line 2 : aic_task_count / aiv_task_count
+remaining    : uint32 aic_task_ids[kMaxTasks]
+               uint32 aiv_task_ids[kMaxTasks]
+```
+
+两条 cursor、header 和两份数组都从独立 cache line 开始。host 在 launch 前
+只根据公共 `exec_route` 生成两份按 task-id 排序的只读表，不让公共执行器读取
+PA `TaskKind`。新增状态共 `35008B`；cross-core 连续尾传输区从
+`19347648B` 增至 `19382656B`。
+
+PA-G1/B256 的计划静态包含 512 个 AIC task 与 512 个 AIV task。下一阶段若
+每个 worker 在表尾只领取一次越界 ticket，预期物理 FetchAdd 为：
+
+```text
+AIC: 512 + 32 = 544
+AIV: 512 + 64 = 576
+合计: 1120，分散在两条 cache line
+```
+
+该数值只是协议预算，不是 A5 性能结论。
+
+### 本阶段门槛
+
+- Atomic raw schema 以 append-only 方式新增 `SharedExecDispatchTicket=56`，
+  C++/host/converter 的名称、操作和返回值口径一致；
+- host mixed G0/G1/G2/G4 计划逐 task 交叉校验两份执行表、角色、顺序、数量
+  与清零尾部；畸形非连续 task 计划会同时清空 Build/Execute 两份状态；
+- cross-core 完整 CPU 构建与回归 PASS，包括 96-thread B256 Build、严格
+  TensorMap 插入、旧 K2 Execute 与 FinalDrain。
+
+运行时本阶段仍使用 K2 scanner；`WAITING_BUILT`、Execute ticket 领取和 owner
+约束替换尚未接入，CCEC/A5 也为 **NOT RUN**。这个阶段只证明 host 能独立、
+连续且无 PA 业务泄漏地发布下一版 Execute 任务集合。

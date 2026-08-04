@@ -115,6 +115,7 @@ PA_DEVICE AtomicOp TraceAtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::SharedHeapCursorReserve:
         case AtomicSite::SharedHeapVendAdvance:
         case AtomicSite::SharedBuildDispatchTicket:
+        case AtomicSite::SharedExecDispatchTicket:
         case AtomicSite::SharedExecDrainArrive:
             return AtomicOp::FetchAdd;
         case AtomicSite::FatalSet:

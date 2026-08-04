@@ -813,7 +813,10 @@ enum class AtomicSite : uint32_t {
     // 只由指定 root worker 轮询 16 条分组 arrival，与所有
     // worker 轮询的 release 分开命名，不在泳道中混淆地址语义。
     SharedExecDrainArrivalPoll = 55,
-    Count = 56,
+    // AIC/AIV 各自中央 Execute 发放器的返回型 ticket。两种角色使用
+    // 不同 cache line，但共享同一个语义站点；role 由泳道归属区分。
+    SharedExecDispatchTicket = 56,
+    Count = 57,
 };
 
 // Atomic 记录 flags 的低四位保存操作种类；bit4 表示返回值参与后续判断，
@@ -898,6 +901,7 @@ PA_MODEL_INLINE constexpr AtomicOp AtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::SharedHeapCursorReserve:
         case AtomicSite::SharedHeapVendAdvance:
         case AtomicSite::SharedBuildDispatchTicket:
+        case AtomicSite::SharedExecDispatchTicket:
         case AtomicSite::SharedInsertTurnHandoff:
         case AtomicSite::SharedExecDrainArrive:
             return AtomicOp::FetchAdd;
@@ -981,6 +985,7 @@ PA_MODEL_INLINE constexpr bool AtomicSiteResultUsed(AtomicSite site) {
         case AtomicSite::SharedClaimTournamentLocal:
         case AtomicSite::SharedClaimTournamentRoot:
         case AtomicSite::SharedBuildDispatchTicket:
+        case AtomicSite::SharedExecDispatchTicket:
         case AtomicSite::SharedExecFatalLoad:
         case AtomicSite::SharedExecFatalSet:
         case AtomicSite::SharedExecCellStateLoad:
@@ -1445,6 +1450,34 @@ static_assert(
 static_assert(
     sizeof(SharedBuildDispatchState) % 64 == 0,
     "shared Build dispatch state must occupy whole cache lines"
+);
+
+// Execute 与 Build 使用两套独立 owner 决策。host 只按公共 exec_route
+// 生成两份 task-id 表；device 侧 32 个 AIC 与 64 个 AIV 分别竞争自己的
+// 单调 cursor。cursor 各自独占 cache line，静态计划也从独立行开始，避免
+// AIC/AIV ticket 以及只读 header 之间发生伪共享。
+struct alignas(64) SharedExecDispatchState {
+    AtomicLine aic_next;
+    AtomicLine aiv_next;
+    uint32_t aic_task_count;
+    uint32_t aiv_task_count;
+    uint8_t header_padding[64 - 2 * sizeof(uint32_t)];
+    uint32_t aic_task_ids[kMaxTasks];
+    uint32_t aiv_task_ids[kMaxTasks];
+};
+static_assert(
+    offsetof(SharedExecDispatchState, aic_task_ids) == 192,
+    "shared Execute AIC plan must start on its own cache line"
+);
+static_assert(
+    offsetof(SharedExecDispatchState, aiv_task_ids) ==
+        192 + sizeof(uint32_t) * kMaxTasks,
+    "shared Execute AIV plan offset changed"
+);
+static_assert(
+    offsetof(SharedExecDispatchState, aiv_task_ids) % 64 == 0 &&
+        sizeof(SharedExecDispatchState) % 64 == 0,
+    "shared Execute dispatch state must occupy whole cache lines"
 );
 #endif
 
@@ -2176,6 +2209,9 @@ struct alignas(64) SchedulerState {
     // 低原子 Build 发放状态继续追加在 standalone sidecar 尾部，不移动
     // production prefix、TensorMap、Claim Tournament 或执行 cell。
     SharedBuildDispatchState build_dispatch;
+    // AIC/AIV 双中央 Execute ticket 继续追加，不移动已经验证的 Build
+    // 发放 ABI。task 表由 host 写定，device 只更新两条 cursor line。
+    SharedExecDispatchState exec_dispatch;
 #endif
 };
 static_assert(offsetof(SchedulerState, cube_cursor) == 0, "cube cursor offset must match PA DistGlobal");
@@ -2257,6 +2293,12 @@ static_assert(
     "shared Build dispatch state must follow executor tokens"
 );
 static_assert(
+    offsetof(SchedulerState, exec_dispatch) ==
+        offsetof(SchedulerState, build_dispatch) +
+            sizeof(SharedBuildDispatchState),
+    "shared Execute dispatch state must follow Build dispatch"
+);
+static_assert(
         offsetof(SchedulerState, exec_fatal) %
                 cross_core::kExecCacheLineBytes == 0 &&
         offsetof(SchedulerState, exec_drain) %
@@ -2266,6 +2308,8 @@ static_assert(
         offsetof(SchedulerState, exec_tokens) %
                 cross_core::kExecCacheLineBytes == 0 &&
         offsetof(SchedulerState, build_dispatch) %
+                cross_core::kExecCacheLineBytes == 0 &&
+        offsetof(SchedulerState, exec_dispatch) %
                 cross_core::kExecCacheLineBytes == 0,
     "cross-core execution sidecars must remain cache-line aligned"
 );
@@ -2275,7 +2319,8 @@ constexpr uint64_t kCrossCoreExecStateBytes =
     sizeof(cross_core::SharedExecCell) * kMaxTasks +
     sizeof(cross_core::ExecutionToken) * kWorkers *
         cross_core::kExecTokensPerWorker +
-    sizeof(SharedBuildDispatchState);
+    sizeof(SharedBuildDispatchState) +
+    sizeof(SharedExecDispatchState);
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
 static_assert(

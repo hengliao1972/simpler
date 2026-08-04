@@ -669,6 +669,10 @@ inline bool PopulateSharedBuildDispatchPlan(
         &state->build_dispatch, 0,
         sizeof(state->build_dispatch)
     );
+    std::memset(
+        &state->exec_dispatch, 0,
+        sizeof(state->exec_dispatch)
+    );
     state->build_dispatch.task_count = plan.total_tasks;
     state->build_dispatch.batch_count = plan.batch_count;
     uint32_t executable_task_count = 0;
@@ -686,6 +690,10 @@ inline bool PopulateSharedBuildDispatchPlan(
             std::memset(
                 &state->build_dispatch, 0,
                 sizeof(state->build_dispatch)
+            );
+            std::memset(
+                &state->exec_dispatch, 0,
+                sizeof(state->exec_dispatch)
             );
             return false;
         }
@@ -710,6 +718,10 @@ inline bool PopulateSharedBuildDispatchPlan(
                 &state->build_dispatch, 0,
                 sizeof(state->build_dispatch)
             );
+            std::memset(
+                &state->exec_dispatch, 0,
+                sizeof(state->exec_dispatch)
+            );
             return false;
         }
         SharedBuildDispatchTaskIdentity &identity =
@@ -717,11 +729,46 @@ inline bool PopulateSharedBuildDispatchPlan(
         identity.batch = static_cast<uint16_t>(task.batch);
         identity.encoded_meta = encoded;
         identity.exec_route = exec_route;
-        executable_task_count += executable ? 1U : 0U;
+        if (executable) {
+            uint32_t *task_ids = nullptr;
+            uint32_t *task_count = nullptr;
+            if (engine_class ==
+                cross_core::ExecEngineClass::Aic) {
+                task_ids = state->exec_dispatch.aic_task_ids;
+                task_count =
+                    &state->exec_dispatch.aic_task_count;
+            } else if (engine_class ==
+                       cross_core::ExecEngineClass::Aiv) {
+                task_ids = state->exec_dispatch.aiv_task_ids;
+                task_count =
+                    &state->exec_dispatch.aiv_task_count;
+            } else {
+                if (error != nullptr) {
+                    *error =
+                        "shared Execute dispatch route is unsupported";
+                }
+                std::memset(
+                    &state->build_dispatch, 0,
+                    sizeof(state->build_dispatch)
+                );
+                std::memset(
+                    &state->exec_dispatch, 0,
+                    sizeof(state->exec_dispatch)
+                );
+                return false;
+            }
+            task_ids[*task_count] = task.task_id;
+            ++*task_count;
+            ++executable_task_count;
+        }
     }
     state->build_dispatch.executable_task_count =
         executable_task_count;
-    return true;
+    return state->exec_dispatch.aic_task_count <= kMaxTasks &&
+        state->exec_dispatch.aiv_task_count <= kMaxTasks &&
+        state->exec_dispatch.aic_task_count +
+                state->exec_dispatch.aiv_task_count ==
+            executable_task_count;
 }
 
 struct SharedHostHeapAdmission {
@@ -937,6 +984,10 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     std::memset(
         &state->build_dispatch, 0,
         sizeof(state->build_dispatch)
+    );
+    std::memset(
+        &state->exec_dispatch, 0,
+        sizeof(state->exec_dispatch)
     );
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
         for (uint32_t token_slot = 0;
@@ -1214,8 +1265,10 @@ inline constexpr size_t CrossCoreExecStateBytes() {
 static_assert(
     // 192 个 owner-local token 已删除各自从未被正式路径使用的
     // 4352B 私有 payload：20183232 - 192 * 4352 = 19347648。
-    // task-indexed SharedExecCell payload 和其 DCCI 发布边界保持不变。
-    CrossCoreExecStateBytes() == 19347648,
+    // 双中央 Execute ticket 追加 35008B：两条 64B cursor、1 条 64B
+    // header，以及 AIC/AIV 各 4352 个 uint32 task id。task-indexed
+    // SharedExecCell payload 和其 DCCI 发布边界保持不变。
+    CrossCoreExecStateBytes() == 19382656,
     "cross-core execution state transfer size changed"
 );
 static_assert(
@@ -1470,6 +1523,7 @@ inline const char *AtomicSiteName(uint32_t site) {
         "SharedExecDrainReleasePublish",
         "SharedExecDrainReleasePoll",
         "SharedExecDrainArrivalPoll",
+        "SharedExecDispatchTicket",
     };
     static_assert(
         sizeof(names) / sizeof(names[0]) ==

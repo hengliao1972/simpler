@@ -690,12 +690,16 @@ int main() {
     );
     bool dispatch_plan_ok =
         state->build_dispatch.next_task.value == 0 &&
+        state->exec_dispatch.aic_next.value == 0 &&
+        state->exec_dispatch.aiv_next.value == 0 &&
         state->build_dispatch.task_count == mixed.total_tasks &&
         state->build_dispatch.batch_count == mixed.batch_count &&
         state->build_dispatch.executable_task_count ==
             mixed.total_tasks - mixed.tasks_by_kind[
                 static_cast<uint32_t>(TaskKind::Alloc)
             ];
+    uint32_t expected_aic_tasks = 0;
+    uint32_t expected_aiv_tasks = 0;
     for (uint32_t task_id = 0;
          task_id < mixed.total_tasks; ++task_id) {
         const SharedBuildDispatchTaskIdentity &identity =
@@ -710,7 +714,34 @@ int main() {
                 EncodeSharedHostExecRoute(
                     mixed.tasks[task_id].kind
                 );
+        bool executable = false;
+        cross_core::ExecEngineClass engine =
+            cross_core::ExecEngineClass::None;
+        dispatch_plan_ok &=
+            cross_core::DecodeExecDispatchRoute(
+                identity.exec_route, executable, engine
+            );
+        if (executable &&
+            engine == cross_core::ExecEngineClass::Aic) {
+            dispatch_plan_ok &=
+                state->exec_dispatch
+                    .aic_task_ids[expected_aic_tasks++] ==
+                task_id;
+        } else if (executable &&
+                   engine == cross_core::ExecEngineClass::Aiv) {
+            dispatch_plan_ok &=
+                state->exec_dispatch
+                    .aiv_task_ids[expected_aiv_tasks++] ==
+                task_id;
+        }
     }
+    dispatch_plan_ok &=
+        state->exec_dispatch.aic_task_count ==
+            expected_aic_tasks &&
+        state->exec_dispatch.aiv_task_count ==
+            expected_aiv_tasks &&
+        expected_aic_tasks + expected_aiv_tasks ==
+            state->build_dispatch.executable_task_count;
     for (uint32_t task_id = mixed.total_tasks;
          task_id < kMaxTasks; ++task_id) {
         const SharedBuildDispatchTaskIdentity &identity =
@@ -733,7 +764,9 @@ int main() {
             &malformed_dispatch_error
         ) &&
             !malformed_dispatch_error.empty() &&
-            state->build_dispatch.task_count == 0,
+            state->build_dispatch.task_count == 0 &&
+            state->exec_dispatch.aic_task_count == 0 &&
+            state->exec_dispatch.aiv_task_count == 0,
         "dispatch-plan publication rejects a non-contiguous task identity"
     );
     InitializeState(state.get(), mixed_options);

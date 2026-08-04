@@ -180,6 +180,7 @@ ATOMIC_SITE_NAMES = {
     53: "shared_exec_drain_release_publish",
     54: "shared_exec_drain_release_poll",
     55: "shared_exec_drain_arrival_poll",
+    56: "shared_exec_dispatch_ticket",
 }
 ATOMIC_OP_NAMES = {
     0: "load",
@@ -250,6 +251,7 @@ ATOMIC_SITE_OP_IDS = {
     53: 1,
     54: 0,
     55: 0,
+    56: 2,
 }
 # 这些发布型调用不消费 atomic 返回的旧值；其余 standalone site 的
 # 返回值都参与协议判断。v3 输入必须与源码语义完全一致。
@@ -268,7 +270,7 @@ POLL_BATCH_SITE_OP_IDS = {
     55: 0,
 }
 SHARED_REGISTER_ATOMIC_SITE_IDS = {19, 20}
-SCHEMA_V5_SHARED_ATOMIC_SITE_IDS = set(range(19, 56))
+SCHEMA_V5_SHARED_ATOMIC_SITE_IDS = set(range(19, 57))
 SHARED_INSERT_TURN_POLL_SITE_ID = 19
 SHARED_INSERT_TURN_HANDOFF_SITE_ID = 20
 SHARED_CLAIM_TOURNAMENT_SITE_IDS = {40, 41}

@@ -5,7 +5,7 @@
 | 项目 | 状态 |
 | ---- | ---- |
 | 目标 | 让 task 的构建 owner 与 kernel 执行 owner 可以是不同物理核 |
-| 当前代码 | 96 Scalar 通过中央 ticket 恰好一次 Build；Build owner 发布 task-indexed shared payload，K2 排除 Build owner 后的 1 或 2 个 eligible executor 竞争执行 |
+| 当前代码 | 96 Scalar 通过中央 ticket 恰好一次 Build；Build owner 发布 task-indexed shared payload；Execute 暂由 K2 候选扫描领取，正在按本文已确认合同替换为 AIC/AIV 双中央 Execute ticket |
 | 本文性质 | 持续更新的架构与内存模型设计记录 |
 | 正式实现 | S0–S6.59 已形成中央 ticket + 严格 TensorMap 插入 + K2 异核 Execute；公共计划显式发布 execution route/count，A5 单 lane placement 已独立于 PA adapter；执行扫描得到的完整 control 快照直接参与 Claim CAS；execution drain 采用 16 组单向 arrival，并在同一次 FetchAdd 中汇合 owner-local 完成数，固定 root 不再逐 task 原子扫描；正式单轮 TensorMap 实例明确禁止回收，lookup 不再读取恒为 0 的 bucket head；executor 已直接消费 task-indexed immutable payload，删除 shared cell 到 owner token 的二次 GM 拷贝 |
 | CPU 正确性用例 | S1–S4 K2、S5a 对侧角色 Build 与 S5b 全 96 Scalar Build 门槛已完成 |
@@ -13,7 +13,7 @@
 | A5 PA 功能/性能 | S6.43 起，唯一裁决口径为最早 startup 起点到最后 FinalDrain 结束；旧 Submit-only 与 first-Submit-to-FinalDrain 数据只保留为历史证据，不与新口径直接相减。S6.59 的 12 对冻结 A/B 中，S6.57 基线中位 `1.412 ms`、direct-payload 候选中位 `1.403 ms`，改善 `0.637%`；功能与终态全部 PASS |
 | S4 动态 Execute election | K2 首版已通过 CPU B1/B256 和 A5 B1/B256；B256 中两候选都有实际胜出，非法 owner 为 0 |
 | S5 Build 拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 五类 task 全 96/G8 已通过 CPU/CCEC/A5 B1/B256，物理 Claim CAS 精确闭合 |
-| 当前调度缺口 | 双 token Claim-first 已解决旧的 FinalDrain backlog；S6.29 复用 Claim 快照，S6.32–S6.36 收敛 drain，S6.38 删除 root 的 2560 次逐 task 终态读取，S6.42 删除 1280 次无回收 lookup head 原子读取，S6.59 删除 1024 个执行 task 的 10–16 cacheline 二次 GM 拷贝。当前 startup-to-FinalDrain 的 trace-free 中位约 `1.403 ms`，下一步继续审计可减少调用次数的返回型 Atomic 和残余 GM 访问 |
+| 当前调度缺口 | K2 把每个 task 的执行资格静态限制在两个核，无法让全部 32 个 AIC 或 64 个 AIV 按实际空闲程度动态分担任务。下一阶段改为 AIC/AIV 两条独立中央 Execute ticket；每核保留两个 token，允许 Build owner 与 Execute owner 相同 |
 | 明确非目标 | 不引入 `try_wait`、engine continuation 或“kernel 运行期间同一 Scalar 继续调度” |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
@@ -50,7 +50,11 @@ Build 和 Execute 虽然在时间上分离，但仍绑定同一个物理 worker�
 执行 worker：领取兼容 task -> 绑定本核上下文 -> 等 fanin -> kernel -> completion
 ```
 
-长期预期收益是让 AIC 主要负责 QK/PV 的 Cube 发射与完成，让其他有空闲 Scalar 能在 Cube 执行期间继续构建后续 task。SF/UP 同理可以由空闲 Scalar 构建，再交给 AIV 执行。但是，“Build owner 扩大到所有 Scalar”与“已构建执行包可以跨核消费”是两个独立改动；第一版先保持现有 Build 候选核拓扑，只证明后者。
+长期预期收益是让全部 Scalar 动态分担 Build，让全部同角色 Scalar 动态分担
+Execute：32 个 AIC 可以领取任意 AIC task，64 个 AIV 可以领取任意 AIV
+task。Build 与 Execute 的 owner **完全解耦**，但“解耦”只表示两次所有权
+独立决定，不附加两者必须不同的限制；同一核恰好同时成为某个 task 的 Build
+owner 与 Execute owner 是合法且无需绕开的结果。
 
 这个目标新增了两类共享对象：
 
@@ -72,7 +76,7 @@ Build 和 Execute 虽然在时间上分离，但仍绑定同一个物理 worker�
 当前代码把三者隐式合并为 Claim winner。分离之后，必须分别证明：
 
 - 每个 task 恰好一个 Build owner；
-- 每个非 Alloc task 恰好一个 Execute owner；
+- 每个非 Alloc task 恰好一个 Execute owner；Build/Execute owner 可以相同；
 - 只有 Execute/Completion owner 能发布 task 完成；
 - Build 完成不等于 kernel 完成；
 - TensorMap 插入完成不等于执行包已经发布；
@@ -136,7 +140,7 @@ completion vend 是 heap 进度快照，不是 output 数据地址或内存所�
 | A5 ordinary payload 发布/取得 | S2 独立 CCEC 跨核探针 | 不依赖 kernel-end 自动 DCCI，延迟注入和多 cacheline 均读到精确值 |
 | DCache preload 可选性能 hint | S2 先在关闭时闭合正确性，再于 S2/S3a/S3b 做编译变体 A/B | on/off 合同完全相同，只保留正确性不变且性能稳定改善的位置 |
 | 使用 shared payload 本身的代价 | S3a task-indexed cell，仍映射给 Build owner | 正确性不变，单独量出 publication/copy 税 |
-| 真正跨核的 args/context/vend/fanin 交接 | S3b 为每个 task 预路由两个兼容候选；每核在实际 Submit 已知 `(task_id, Kind)` 时只登记属于自己的候选任务，再由 Build owner 唯一确定异核 executor | B1/B256 的 task/descriptor/fanin/vend/completion 精确校验全部一致；热发现路径每 task 最多两个 control observer |
+| args/context/vend/fanin 交接 | S3b 已证明跨核取得成立；下一阶段由 AIC/AIV 双中央 Execute ticket 动态决定 owner，不再预路由 K2，也不强制异核 | B1/B256 的 task/descriptor/fanin/vend/completion 精确校验一致；同核与跨核领取都通过同一协议 |
 | 多 executor 唯一领取 | S4 动态 election | 先保证恰好一个 executor，再比较 atomic 成本 |
 | executor 本地容量与全局 backlog 解耦 | S0–S5 先用单 token 闭合协议；S6 当前固定扩为两个 token | 有空 token 才发射 CAS；抢到后立即检查依赖，任一 owner-local ready task 优先执行 |
 | Build owner 扩大到其他 Scalar | S5 独立改候选核拓扑 | 不借助跨核发布的正确性掩盖 Build 角色变化 |
@@ -549,29 +553,43 @@ Execute owner:
 
 task-indexed 首版的 cell 容量与 task 数一一对应，不存在设备侧等空槽。后续改成有界 ring 时，才必须在进入 Register 有序段之前预留容量；不能占住 `deps_prepared` 链等 executor 释放 slot。
 
-### 6.2 Execute candidate/owner 与调度优先级
+### 6.2 AIC/AIV 双中央 Execute ticket 与调度优先级
 
-`SharedExecCell[]` 已经是 GM 中单轮不复用的全局 Built queue。当前选定的
-调度模型不是 producer-driven Ready queue，也不是 ready-before-Claim；
-executor 先竞争一个已经 `BUILT` 的 task，取得执行所有权并完成 payload
-acquire 后，才检查该 task 的 fanin。每个核当前允许同时持有两个已领取 task，
-槽数以后再参数化，首版固定为 2。
+`SharedExecCell[]` 继续保存 task-indexed payload 与状态，但任务发现不再由
+K2 扫描完成。host 在 launch 前从算子无关的 `exec_route` 生成两份只读、按
+task-id 排序的执行任务表：AIC 表只含 AIC task，AIV 表只含 AIV task；两份
+表各有一条独占 cache line 的 device 可写 cursor。32 个 AIC 只竞争 AIC
+cursor，64 个 AIV 只竞争 AIV cursor。这样同角色的任一空闲 Scalar 都能领取
+下一项，实际执行量由完成速度动态决定，而不是静态绑在两个候选核上。
+
+Execute ticket 分配的是“待执行 task 的唯一领取权”，不是 ready 证明。
+executor 可以在对应 cell 尚为 `EMPTY/BUILDING` 时取得 ticket，并把它保存在
+owner-local token 的 `WAITING_BUILT` 状态；看到 `BUILT` 后再执行
+`BUILT -> CLAIMED(self)` CAS、取得 payload，随后检查 fanin。CAS 在这个协议中
+不再做多核竞争，只验证唯一 ticket 对应的状态转换；CAS 失败是协议冲突，不能
+当作正常 loser。
 
 ```text
 1. 已领取的 Build ticket 必须完整发布到 BUILT；处理中途不切换角色
 2. 回到调度决策点后，先逐一检查本核两个已占用 execution token
 3. 任一 token 的 fanin ready：立即执行；不得先领取新 task 或 Build ticket
-4. 已占用 token 均未 ready、且仍有空 token：扫描本核 K2-compatible cell，
-   并保留本次返回的完整 control 快照
-5. 快照为 BUILT 时，以该快照作为 expected 执行 CAS BUILT -> CLAIMED(self)；
-   CAS 前不重复 load，CAS loser 不占 token，并重新观察
-6. CAS winner立即 Invalidate 完整 payload，保存其稳定地址并重建对应 token 的 executor-local binding；不复制 active payload
-7. 抢到后立刻检查 fanin；不能把首次 ready 检查推迟到下个 Submit
-8. 第一个 token 未 ready 时，允许再抢一个 BUILT task 到第二个 token
-9. 第二个 task 抢到后同样立即检查；随后再次复核两个已占用 token
-10. 只要有一个 token ready，就优先同步执行 kernel 并发布 vend/flag/DONE
-11. 两个 token 都占用且都未 ready，或 Built queue 暂无可抢任务，才领取 Build ticket
-12. Build 完整发布后回到步骤 2；Build 全部停产后继续轮询/执行直到全部 DONE
+4. 已占用 token 均不能执行且仍有空 token：对本核角色的中央 cursor 做一次
+   返回型 `FetchAdd(+1)`；表内 ordinal 唯一映射到一个 task id
+5. 立即把 task id、execute owner 和 engine 写入空闲 token，并进入
+   `WAITING_BUILT`；这里不读取 payload，也不要求 Build owner 不同
+6. cell 为 `EMPTY/BUILDING`：保留 token，先尝试领取第二项；两槽占满后可继续
+   完成一张已领取的 Build ticket
+7. cell 为 `BUILT`：用完整快照执行 CAS `BUILT -> CLAIMED(self)`；失败即发布
+   协议错误，不存在正常 CAS loser
+8. CAS 成功后 Invalidate 完整 payload，保存稳定地址并重建 executor-local
+   binding；不复制 active payload
+9. 取得 payload 后立刻检查 fanin；ready 就执行，未 ready 时保留该 token
+10. 第一个 token 未 ready 时允许领取第二个 Execute ticket；第二项也必须立刻
+    经历 `WAITING_BUILT/CLAIMED/fanin` 检查
+11. 只要有一个 token ready，就优先同步执行 kernel 并发布 vend/flag/DONE
+12. 本核角色 cursor 第一次返回越界 ordinal 后记为 exhausted，不再重复触碰
+    热点 cursor；两个 token 清空且 exhausted 后，本核才满足执行排空条件
+13. Build 完整发布后回到步骤 2；Build 全部停产后继续推进 token，直到全部 DONE
 ```
 
 这里的“Execute 优先”存在一个必要的非抢占边界：Scalar 一旦已经取得 Build
@@ -585,10 +603,15 @@ ticket 的调度决策点**生效。
 每个 token 各自保存 task id、immutable payload 地址、executor-local binding
 和 fanin ready prefix，避免轮询时反复读取已经确认完成的依赖。
 
-K2 的 primary/secondary 都保持合法执行资格。首选核宽限若继续保留，只能
-影响谁取得空 token，不能让已经 ready 的 owner-local token 排在 Build 之后。
-CAS loser 必须继续扫描队列或处理本核已有 token，不能把一次竞争失败解释成
-“本核没有 Execute 工作”。
+Build owner 与 Execute owner 的关系不参与 eligibility：只校验 Execute owner
+属于 task 的 engine 角色。两者相同意味着本次恰好未发生跨核 payload 迁移，
+两者不同则继续走已经验证过的 DCCI publish/acquire 合同；两种情形都使用同一
+状态机，不能为了制造“跨核”而把本核排除。
+
+B256 PA-G1 的静态计划含 512 个 AIC task 和 512 个 AIV task。若每个 worker
+在表尾只做一次越界领取，AIC cursor 共 544 次 FetchAdd，AIV cursor 共 576
+次，总计 1120 次并分散在两条 cache line；这只是预期调用量，真实 A5 收益
+必须由冻结 ELF 的 startup-to-FinalDrain A/B 决定。
 
 槽数从 1 增到 2 会扩大 owner-private GM token 容量，但不会改变 shared
 payload 的发布协议，也不需要真正 Ready queue、反向 fanout 或 Claim 前的

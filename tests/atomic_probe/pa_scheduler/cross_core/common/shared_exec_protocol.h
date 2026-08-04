@@ -196,6 +196,9 @@ enum class ExecTokenPhase : uint32_t {
     VendPublished = 5,
     CompletionPublished = 6,
     Faulted = 7,
+    // Execute ticket 已唯一分配给本核，但 Build owner 尚未发布 BUILT。
+    // 该状态只存在于 owner-local token，不写入 SharedExecCell control。
+    WaitingBuilt = 8,
 };
 
 enum class ExecFatalReason : uint8_t {
