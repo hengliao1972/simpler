@@ -6322,3 +6322,23 @@ S6.49。
 均值只改善 `0.078%`，且只有 5/12 对更快。结果不能推翻旧泳道中
 WinnerBuild 局部回退 `2.202%` 的证据，因此候选完整撤回，保留通用双
 CAS 状态机。详见实现过程 S6.50。
+
+### 15.49 历史回撤项完整周期复核封账
+
+以 S6.46 为冻结底座，对仍可能受旧 Submit-only 计时边界影响的回撤项完成
+最后一轮筛选。四组复核实验合计 48 次冻结基线的
+`min/median/max/mean` 为
+`1.402488/1.436027/1.504823/1.437986 ms`，仅用于描述当前底座波动；
+候选仍按各自 12+12 交错成对数据裁决。
+
+最终只有 winner 重复 fatal 读取消减（S6.46）被恢复；root 直接扇出、
+Fanin published 回读删除、insert handoff 非返回、output published 非返回、
+unique-ticket 单 CAS 和 startup 两级 G16 均未形成稳定收益，全部保持撤回。
+旧单 token、旧 Build Claim Tournament、ready-only、descriptor 引用和连续段
+ticket 等候选则已被新架构取代、存在明确大幅回退或有确定协议反例，不再机械
+复跑。完整逐项矩阵见
+`pa_scheduler/cross_core/PA调度器分离版实现过程.md` 的 S6.51。
+
+下一阶段转为泛化审计：动态性能收益只能证明“当前 PA 实例更快”，不能证明
+实现可进入公共调度器。每项保留机制还必须用算子无关不变量表达；PA 的
+TaskKind、每 batch 一个 Alloc、UP/INOUT 形状和固定 fanin 只能留在适配层。

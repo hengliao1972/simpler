@@ -3113,3 +3113,65 @@ candidate mean   改善 0.001123 ms / 0.078%
 撤回，当前继续使用通用 `EMPTY -> BUILDING -> BUILT` 双 CAS 状态机。
 这一结论只针对当前 A5、payload 布局和并发相位，不否定单 CAS 作为其他
 硬件/负载的显式可选实例。
+
+## 2026-08-04：S6.51 历史回撤项完整复核封账
+
+### 复核范围与统一基线
+
+S6.43 把无观察性能边界修正为“最早 startup 起点到最晚 FinalDrain
+结束”后，旧的 Submit-only 数字已经不能直接决定候选去留。本阶段因此
+重新盘点 S6 的全部回撤项；凡是满足以下任一条件的候选，都在当前
+S6.46 源码底座上重建并做冻结 ELF 交错 A/B：
+
+- 旧实验的终点早于 FinalDrain，可能奖励把工作后移；
+- 旧结果接近波动范围，且协议在后续阶段已经明显变化；
+- 候选减少的是当前泳道中仍然存在的返回型 Atomic。
+
+四组 12+12 复核实验中的冻结基线合计 48 次 A5 B256 运行，统一口径为：
+
+```text
+min / median / max / mean =
+1.402488 / 1.436027 / 1.504823 / 1.437986 ms
+```
+
+这些 48 次运行只用于说明当前干净底座的波动范围；每个候选的去留仍使用
+同一次交错实验里的成对基线，不能把不同时间段的绝对数直接相减。
+
+### 逐项结论
+
+| 历史项 | 本轮处理 | 最终结论 |
+| ------ | -------- | -------- |
+| S6.4 旧 control 快照复用 | 已由 S6.29 的“同一次 scanner 快照直接作为 Claim expected”完整取代 | 旧候选不再存在，保留 S6.29 |
+| S6.4 单 token 后的双 token 候选 | 已由 S6.22 以 Claim-first、完整 FinalDrain 口径重新设计并验证 | 旧过程态不再复跑，保留 S6.22 |
+| S6.5 ready-only/readiness owner | 已有 `+38.58%` 结构性回退，并新增共享状态和 ownership | 不保留，不因计时边界变化复活 |
+| S6.6 固定 fanin poll skip | 当前已由“短等待 skip1、连续 24 次无进展后 skip2”的自适应策略取代 | 旧固定 skip 被现实现覆盖，不重复叠加 |
+| S6.8 次候选首次读取前让出 | 依赖旧的单 token/登记位 scanner，当前拓扑已不存在 | 架构过时，不迁移 |
+| S6.10 Claim 旁路预过滤 | 针对已删除的 Build Claim Tournament；当前 Build 使用中央 ticket | 架构过时；不能偷换成 K2 Execute 的新实验 |
+| S6.19 descriptor 引用 | 稳定回退 `21.06%`，且扩大跨核 GM 读取面 | 不保留；只保留通用引用 ABI 门槛 |
+| S6.21 unique-ticket 单 CAS Build | S6.50 复核：中位回退 `0.627%`，均值改善仅 `0.078%`，5/12 对更快 | 不保留 |
+| S6.28/S6.34 winner 重复 fatal 读取 | S6.46 复核：中位改善 `2.117%`，均值改善 `1.742%`，12/12 对更快 | 恢复并保留 |
+| S6.30 heap vend 前置读取删除 | 旧中位/均值回退 `0.948%/2.210%`，还把越界检测推迟到 FetchAdd 之后 | 不保留；不能以弱化失败前无写入合同换性能 |
+| S6.31 output published 非返回 | S6.49 复核：中位/均值回退 `0.265%/0.458%`，4/12 对更快 | 不保留 |
+| S6.37 insert handoff 非返回 | S6.48 复核：中位/均值回退 `0.226%/0.411%`，且延迟冲突诊断 | 不保留 |
+| S6.39 root 直接扇出终态 release | S6.45 复核：中位/均值回退 `0.404%/0.089%`，5/12 对更快 | 不保留 |
+| S6.40 连续段 Build ticket | CPU 反例已证明破坏 `release-before-build` 与独立 task overlap | 协议不成立，不做 A5 性能复跑 |
+| S6.41 省略 Fanin output-published 回读 | S6.47 复核：中位/均值回退 `0.134%/0.580%`，6/12 对更快 | 不保留 |
+| S6.44 startup 固定 G16 两级屏障 | 完整周期中位/均值回退 `3.428%/2.953%`，0/12 对更快 | 不保留 |
+
+S6 之前或 same-core 时期的 `ld_dev+nop`、fanin 逆序、lazy C、16B/指针
+ticket、伪 loser replay、UP/PV 邻接身份复用、EfDrain 恒假判断、Claim
+逻辑 Atomic 聚合、context-read 前缀覆盖、第三轮 Tournament、grouped
+completion bitmask、独占 `deps_prepared` cache line、本地 fanin cache、统一
+NOP 退避、DAG 传递约简和 youngest-producer-first，均已在原架构下得到
+明确负结果，或其调用拓扑已被 central Build ticket + K2 双 token 完全
+替代。它们不再冒充“漏测候选”机械移植到 cross-core；若将来以新的通用
+协议重新提出，必须重新写出不变量、失败反例和独立 A/B，不能沿用旧名字
+直接恢复。
+
+### 封账结论
+
+本轮复核只恢复 S6.46 一项有效优化，其余可疑历史项均已由当前完整周期
+数据、确定性协议反例或架构替代关系闭合。当前工作树不残留任一候选过程
+代码。下一阶段不再继续翻旧 patch，而是审计所有**已保留**优化的适用前提：
+公共调度协议不得依赖 PA 的五类 task、每 batch 一个 Alloc、UP 三个 INOUT
+或固定 fanin 形状；这些信息只能由算子计划/适配层提供。
