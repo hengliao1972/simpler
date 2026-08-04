@@ -503,6 +503,14 @@ void CheckPayloadMatches(
     const SyntheticPayloadSource &source
 ) {
     const ExecPayloadHeader header = ExecutionTokenHeader(token);
+    ExecPayloadLayout layout{};
+    Check(
+        ComputeExecPayloadLayout(
+            spec.tensor_count, spec.scalar_count,
+            spec.fanin_count, spec.tensor_reference_mask, layout
+        ),
+        "reference payload layout is valid"
+    );
     Check(header.task_id == spec.task_id, "task id survives binding");
     Check(
         header.function_address == spec.function_address,
@@ -517,6 +525,18 @@ void CheckPayloadMatches(
             header.scalar_count == spec.scalar_count &&
             header.fanin_count == spec.fanin_count,
         "active counts survive binding"
+    );
+    Check(
+        token.control.completion_vend == spec.completion_vend &&
+            ExecutionTokenFunctionId(token) == spec.function_id &&
+            ExecutionTokenTensorReferenceMask(token) ==
+                spec.tensor_reference_mask &&
+            ExecutionTokenTensorCount(token) == spec.tensor_count &&
+            ExecutionTokenScalarCount(token) == spec.scalar_count &&
+            ExecutionTokenFaninCount(token) == spec.fanin_count &&
+            ExecutionTokenScalarWordOffset(token) ==
+                layout.scalar_word_offset,
+        "Claim caches the validated immutable metadata in owner-local state"
     );
     for (uint32_t tensor = 0; tensor < spec.tensor_count; ++tensor) {
         for (uint32_t word = 0; word < kExecTensorDescWords; ++word) {
@@ -957,7 +977,7 @@ void TestPublishBindAndComplete() {
             completion.flag_task == spec.task_id &&
             completion.vend == spec.completion_vend &&
             completion.vend != unrelated_executor_heap_cursor,
-        "completion consumes payload vend before publishing the flag"
+        "completion consumes Claim-cached vend before publishing the flag"
     );
     const DecodedExecState done = CurrentState(cell);
     Check(
@@ -970,7 +990,10 @@ void TestPublishBindAndComplete() {
             token.control.build_owner == UINT32_MAX &&
             token.control.execute_owner == UINT32_MAX &&
             token.control.fanin_ready_prefix == 0 &&
-            token.control.payload_address == 0,
+            token.control.payload_address == 0 &&
+            token.control.completion_vend == 0 &&
+            token.control.function_and_reference == 0 &&
+            token.control.shape_and_scalar_offset == 0,
         "token returns to a fully reset IDLE state only after DONE"
     );
 }

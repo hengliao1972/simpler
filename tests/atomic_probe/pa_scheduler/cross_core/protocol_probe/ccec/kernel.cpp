@@ -451,14 +451,22 @@ __aicore__ inline void ExecuteCase(
         header.tensor_count == spec.tensor_count &&
         header.scalar_count == spec.scalar_count &&
         header.fanin_count == spec.fanin_count &&
-        header.engine_class == spec.engine_class;
+        header.engine_class == spec.engine_class &&
+        token.control.completion_vend == spec.completion_vend &&
+        ExecutionTokenFunctionId(token) == spec.function_id &&
+        ExecutionTokenTensorReferenceMask(token) ==
+            spec.tensor_reference_mask &&
+        ExecutionTokenTensorCount(token) == spec.tensor_count &&
+        ExecutionTokenScalarCount(token) == spec.scalar_count &&
+        ExecutionTokenFaninCount(token) == spec.fanin_count;
     if (header_valid) result.status |= ProbeHeaderValid;
 
     ExecPayloadLayout layout{};
     bool payload_valid = ComputeExecPayloadLayout(
         spec.tensor_count, spec.scalar_count,
         spec.fanin_count, layout
-    );
+    ) && ExecutionTokenScalarWordOffset(token) ==
+             layout.scalar_word_offset;
     uint64_t observed_hash = kHashSeed;
     uint64_t expected_hash = kHashSeed;
     if (payload_valid) {

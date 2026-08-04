@@ -296,7 +296,11 @@ bool ValidateState(const ProbeState &state, std::string *reason) {
             control.engine_class != ExecEngineClass::None ||
             control.payload_lines != 0 ||
             control.payload_bytes != 0 ||
-            control.fanin_ready_prefix != 0) {
+            control.fanin_ready_prefix != 0 ||
+            control.payload_address != 0 ||
+            control.completion_vend != 0 ||
+            control.function_and_reference != 0 ||
+            control.shape_and_scalar_offset != 0) {
             *reason = "token-not-idle-" +
                       std::to_string(participant);
             return false;

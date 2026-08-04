@@ -4972,7 +4972,11 @@ inline Metrics Validate(
                     cross_core::ExecEngineClass::None &&
                 control.payload_lines == 0 &&
                 control.payload_bytes == 0 &&
-                control.fanin_ready_prefix == 0;
+                control.fanin_ready_prefix == 0 &&
+                control.payload_address == 0 &&
+                control.completion_vend == 0 &&
+                control.function_and_reference == 0 &&
+                control.shape_and_scalar_offset == 0;
         }
         // final_occupied 由设备在本核检查 scanner/token 后通过 bypass
         // result sidecar 发布，是 CCEC 关闭 kernel-end DCCI 时的权威终态；

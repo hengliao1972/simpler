@@ -219,22 +219,18 @@ SPLIT_STATE_STORAGE_BYTES=1728
 # AIC 尾部多一组等价出口被 CCEC 合并；A5 placement 仍保留原 switch 形状，
 # readelf 确认它们仍只指向本角色唯一 finish 符号；继续精确冻结实际
 # 机器码形状，不放宽为范围判断。
-# Build ticket 前的 global-fatal 低频分支让 perf-clock AIC 的等价尾部
-# 从两组重新拆成三组；readelf 逐条确认三条 relocation 仍只指向本角色
-# 唯一 finish。任务种类覆盖继续由 dispatch 与动态门槛证明，这里按实际
-# 机器码精确冻结为 3，不放宽成范围。
-SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC=3
+# Claim 后删除 immutable payload 的逐参数二次复核，使 perf-clock AIC 的
+# 三组等价出口重新合并为两组；readelf 逐条确认两条 relocation 都只指向
+# 本角色唯一 finish。任务种类覆盖继续由 dispatch、CPU 动态协议门槛和 A5
+# finish_calls 精确终态共同证明；这里按实际机器码冻结为 2，不放宽成范围。
+SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC=2
 SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIV=4
-# execution drain 分组 root 分支改变了 full-swimlane AIC 的尾合并形状；
-# 删除 replay barrier 后 CCEC 又合并一组等价出口，对象文件为四个 relocation，
-# 且全部只指向本角色唯一 finish 符号。任务覆盖由 dispatch/动态门槛证明；
-# 这里精确锁定为 4，不放宽成范围。
-SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC=4
-# executor 改为直接消费 task-indexed immutable payload 后，full-swimlane
-# AIV 的等价尾部由 CCEC 拆成四个 relocation；readelf 已逐条确认都只
-# 指向本角色唯一 finish 符号。任务覆盖仍由 CPU 动态门槛证明，这里精确
-# 冻结实际机器码形状为 4，不放宽成范围判断。
-SPLIT_FINISH_CALL_SITES_SWIMLANE_AIV=4
+# Claim 证明缓存与逐参数二次复核消减改变了 full-swimlane 中 trace 分支的
+# 尾合并形状：AIC 为五组、AIV 为三组。readelf 逐条确认它们都只指向本角色
+# 唯一 finish 符号；任务覆盖继续由 dispatch、CPU 动态门槛和 A5 finish_calls
+# 精确终态证明。这里按实际机器码冻结为 5/3，不放宽成范围判断。
+SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC=5
+SPLIT_FINISH_CALL_SITES_SWIMLANE_AIV=3
 COMMON_FLAGS+=(
     -mllvm -cce-block-local-relocate=true
     -mllvm "-cce-block-local-reserve-size=$SPLIT_STATE_STORAGE_BYTES"

@@ -376,7 +376,14 @@ struct alignas(kExecCacheLineBytes) ExecutionTokenControl {
     // payload invalidate 后可直接引用这份 immutable storage。地址只由
     // execute owner 写入和消费，不参与跨核发布，也不替代 control CAS。
     uint64_t payload_address;
-    uint8_t padding[24];
+    // Claim 已经验证过的 immutable payload 元数据缓存在 owner-local control
+    // line。A5 Scalar 间没有 cache coherence，但这些字段从写入到 Reset 都只
+    // 由 execute owner 消费；因此不需要 DCCI，也不能被其他核当发布证据。
+    uint64_t completion_vend;
+    // low32=function_id，high32=tensor_reference_mask。
+    uint64_t function_and_reference;
+    // 依次打包 tensor/scalar/fanin count 与 scalar_word_offset，各占 16 bit。
+    uint64_t shape_and_scalar_offset;
 };
 
 struct alignas(kExecCacheLineBytes) ExecutionDispatchBinding {
@@ -412,6 +419,74 @@ PA_DEVICE PA_GM const ExecPayloadStorage &ExecutionTokenPayload(
     return *reinterpret_cast<PA_GM const ExecPayloadStorage *>(
         static_cast<uintptr_t>(token.control.payload_address)
     );
+}
+
+PA_DEVICE uint32_t ExecutionTokenFunctionId(
+    PA_GM const ExecutionToken &token
+) {
+    return static_cast<uint32_t>(
+        token.control.function_and_reference
+    );
+}
+
+PA_DEVICE uint32_t ExecutionTokenTensorReferenceMask(
+    PA_GM const ExecutionToken &token
+) {
+    return static_cast<uint32_t>(
+        token.control.function_and_reference >> 32U
+    );
+}
+
+PA_DEVICE uint16_t ExecutionTokenTensorCount(
+    PA_GM const ExecutionToken &token
+) {
+    return static_cast<uint16_t>(
+        token.control.shape_and_scalar_offset
+    );
+}
+
+PA_DEVICE uint16_t ExecutionTokenScalarCount(
+    PA_GM const ExecutionToken &token
+) {
+    return static_cast<uint16_t>(
+        token.control.shape_and_scalar_offset >> 16U
+    );
+}
+
+PA_DEVICE uint16_t ExecutionTokenFaninCount(
+    PA_GM const ExecutionToken &token
+) {
+    return static_cast<uint16_t>(
+        token.control.shape_and_scalar_offset >> 32U
+    );
+}
+
+PA_DEVICE uint16_t ExecutionTokenScalarWordOffset(
+    PA_GM const ExecutionToken &token
+) {
+    return static_cast<uint16_t>(
+        token.control.shape_and_scalar_offset >> 48U
+    );
+}
+
+PA_DEVICE void CacheValidatedExecPayloadMetadata(
+    PA_GM ExecutionToken &token,
+    const ExecPayloadHeader &header,
+    const ExecPayloadLayout &layout
+) {
+    static_assert(
+        kExecMaxPayloadWords <= UINT16_MAX,
+        "token-local scalar offset must fit 16 bits"
+    );
+    token.control.completion_vend = header.completion_vend;
+    token.control.function_and_reference =
+        static_cast<uint64_t>(header.function_id) |
+        (static_cast<uint64_t>(header.tensor_reference_mask) << 32U);
+    token.control.shape_and_scalar_offset =
+        static_cast<uint64_t>(header.tensor_count) |
+        (static_cast<uint64_t>(header.scalar_count) << 16U) |
+        (static_cast<uint64_t>(header.fanin_count) << 32U) |
+        (static_cast<uint64_t>(layout.scalar_word_offset) << 48U);
 }
 
 // portable execution 协议不依赖 standalone 的 TraceContext/AtomicSite，
@@ -566,6 +641,9 @@ static_assert(
 static_assert(
     sizeof(ExecutionTokenControl) == kExecCacheLineBytes &&
         offsetof(ExecutionTokenControl, payload_address) == 32 &&
+        offsetof(ExecutionTokenControl, completion_vend) == 40 &&
+        offsetof(ExecutionTokenControl, function_and_reference) == 48 &&
+        offsetof(ExecutionTokenControl, shape_and_scalar_offset) == 56 &&
         offsetof(ExecutionToken, payload) == kExecCacheLineBytes,
     "execution token control and binding must remain separate"
 );
@@ -1216,6 +1294,9 @@ PA_DEVICE void ResetExecutionToken(
     token.control.payload_bytes = 0;
     token.control.fanin_ready_prefix = 0;
     token.control.payload_address = 0;
+    token.control.completion_vend = 0;
+    token.control.function_and_reference = 0;
+    token.control.shape_and_scalar_offset = 0;
     token.control.phase = ExecTokenPhase::Idle;
 }
 
@@ -1444,6 +1525,7 @@ PA_DEVICE ExecClaimResult ClaimAndBindObservedExecPayload(
         );
         return ExecClaimResult::InvalidPayload;
     }
+    CacheValidatedExecPayloadMetadata(token, header, layout);
     token.control.phase = ExecTokenPhase::WaitingFanin;
     return ExecClaimResult::Claimed;
 }
@@ -1505,15 +1587,18 @@ PA_DEVICE bool ExecutionTokenTensorWord(
 ) {
     PA_GM const ExecPayloadStorage &payload =
         ExecutionTokenPayload(token);
-    const ExecPayloadHeader header = ExecutionTokenHeader(token);
-    if (tensor >= header.tensor_count ||
+    const uint32_t tensor_count =
+        ExecutionTokenTensorCount(token);
+    const uint32_t tensor_reference_mask =
+        ExecutionTokenTensorReferenceMask(token);
+    if (tensor >= tensor_count ||
         word >= kExecTensorDescWords) {
         return false;
     }
     const uint32_t word_offset = ExecTensorPayloadWordOffset(
-        tensor, header.tensor_reference_mask
+        tensor, tensor_reference_mask
     );
-    if ((header.tensor_reference_mask &
+    if ((tensor_reference_mask &
          (uint32_t{1} << tensor)) != 0) {
         const uint64_t reference =
             payload.words[word_offset];
@@ -1538,19 +1623,16 @@ PA_DEVICE bool ExecutionTokenScalar(
 ) {
     PA_GM const ExecPayloadStorage &payload =
         ExecutionTokenPayload(token);
-    const ExecPayloadHeader header = ExecutionTokenHeader(token);
-    if (scalar >= header.scalar_count) {
+    const uint32_t scalar_count =
+        ExecutionTokenScalarCount(token);
+    const uint32_t word_offset =
+        ExecutionTokenScalarWordOffset(token) + scalar;
+    if (scalar >= scalar_count ||
+        word_offset >=
+            token.control.payload_lines * kExecHeaderWords) {
         return false;
     }
-    ExecPayloadLayout layout{};
-    if (!ComputeExecPayloadLayout(
-            header.tensor_count, header.scalar_count,
-            header.fanin_count,
-            header.tensor_reference_mask, layout
-        )) {
-        return false;
-    }
-    value = payload.words[layout.scalar_word_offset + scalar];
+    value = payload.words[word_offset];
     return true;
 }
 
@@ -1560,20 +1642,18 @@ PA_DEVICE bool ExecutionTokenFanin(
 ) {
     PA_GM const ExecPayloadStorage &payload =
         ExecutionTokenPayload(token);
-    const ExecPayloadHeader header = ExecutionTokenHeader(token);
-    if (edge >= header.fanin_count) {
-        return false;
-    }
-    ExecPayloadLayout layout{};
-    if (!ComputeExecPayloadLayout(
-            header.tensor_count, header.scalar_count,
-            header.fanin_count,
-            header.tensor_reference_mask, layout
-        )) {
-        return false;
-    }
+    const uint32_t fanin_count =
+        ExecutionTokenFaninCount(token);
+    const uint32_t fanin_word_offset =
+        ExecutionTokenScalarWordOffset(token) +
+        ExecutionTokenScalarCount(token);
     const uint32_t word_offset =
-        layout.fanin_word_offset + edge / 2U;
+        fanin_word_offset + edge / 2U;
+    if (edge >= fanin_count ||
+        word_offset >=
+            token.control.payload_lines * kExecHeaderWords) {
+        return false;
+    }
     const uint64_t packed = payload.words[word_offset];
     producer = static_cast<int32_t>(
         edge % 2U == 0
@@ -1591,16 +1671,18 @@ PA_DEVICE bool ExecutionTokenFaninReady(
     if (token.control.phase != ExecTokenPhase::WaitingFanin) {
         return false;
     }
-    const ExecPayloadHeader header = ExecutionTokenHeader(token);
-    if (token.control.fanin_ready_prefix > header.fanin_count) {
+    const uint32_t fanin_count =
+        ExecutionTokenFaninCount(token);
+    const uint32_t task_id = token.control.task_id;
+    if (token.control.fanin_ready_prefix > fanin_count) {
         return false;
     }
     for (uint32_t edge = token.control.fanin_ready_prefix;
-         edge < header.fanin_count; ++edge) {
+         edge < fanin_count; ++edge) {
         int32_t producer = -1;
         if (!ExecutionTokenFanin(token, edge, producer) ||
             producer < 0 ||
-            static_cast<uint32_t>(producer) >= header.task_id ||
+            static_cast<uint32_t>(producer) >= task_id ||
             !ready_source.IsReady(producer)) {
             return false;
         }
@@ -1697,24 +1779,19 @@ PA_DEVICE ExecDoneResult PublishExecDoneAfterCompletion(
         token.control.phase = ExecTokenPhase::Faulted;
         return ExecDoneResult::InvalidTokenPayload;
     }
-    const ExecPayloadHeader header = ExecutionTokenHeader(token);
-    if (header.task_id != token.control.task_id ||
-        header.engine_class != token.control.engine_class) {
-        token.control.phase = ExecTokenPhase::Faulted;
-        (void)PublishExecFatal<Ops>(
-            fatal, ExecFatalReason::InvalidTokenPayload,
-            token.control.task_id, token.control.execute_owner,
-            observer
-        );
-        return ExecDoneResult::InvalidTokenPayload;
-    }
+    // payload 的 immutable header 已在 Claim 成功前完整校验，并把完成
+    // 所需的 vend 留在 execute owner 的 control line。完成路径不再为了
+    // 重取 task/vend 再访问 shared payload；该缓存不承担跨核发布语义。
+    const uint32_t task_id = token.control.task_id;
+    const uint64_t completion_vend =
+        token.control.completion_vend;
     if (token.control.phase == ExecTokenPhase::Completing) {
         if (!completion.PublishVend(
-                header.task_id, header.completion_vend
+                task_id, completion_vend
             )) {
             (void)PublishExecFatal<Ops>(
                 fatal, ExecFatalReason::CompletionPublishFailed,
-                header.task_id, token.control.execute_owner,
+                task_id, token.control.execute_owner,
                 observer
             );
             return ExecDoneResult::VendPublishFailed;
@@ -1722,10 +1799,10 @@ PA_DEVICE ExecDoneResult PublishExecDoneAfterCompletion(
         token.control.phase = ExecTokenPhase::VendPublished;
     }
     if (token.control.phase == ExecTokenPhase::VendPublished) {
-        if (!completion.PublishFlag(header.task_id)) {
+        if (!completion.PublishFlag(task_id)) {
             (void)PublishExecFatal<Ops>(
                 fatal, ExecFatalReason::CompletionPublishFailed,
-                header.task_id, token.control.execute_owner,
+                task_id, token.control.execute_owner,
                 observer
             );
             return ExecDoneResult::FlagPublishFailed;
@@ -1752,11 +1829,11 @@ PA_DEVICE ExecDoneResult PublishExecDoneAfterCompletion(
     );
     if (observer.PublishDone(
             &cell.control.state, claimed_raw, done_raw,
-            header.task_id
+            task_id
         ) != claimed_raw) {
         (void)PublishExecFatal<Ops>(
             fatal, ExecFatalReason::CompletionStateConflict,
-            header.task_id, token.control.execute_owner,
+            task_id, token.control.execute_owner,
             observer
         );
         return ExecDoneResult::StateConflict;

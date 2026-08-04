@@ -788,7 +788,8 @@ bool TokenDispatchMatches(
     ExecPayloadLayout layout{};
     if (!ComputeExecPayloadLayout(
             header.tensor_count, header.scalar_count,
-            header.fanin_count, layout
+            header.fanin_count,
+            header.tensor_reference_mask, layout
         )) {
         return false;
     }
@@ -799,7 +800,16 @@ bool TokenDispatchMatches(
         token.control.engine_class == shape.engine &&
         token.control.payload_lines == shape.payload_lines &&
         token.control.payload_bytes == shape.payload_bytes &&
-        header.completion_vend == expected_vend;
+        header.completion_vend == expected_vend &&
+        token.control.completion_vend == expected_vend &&
+        ExecutionTokenFunctionId(token) == header.function_id &&
+        ExecutionTokenTensorReferenceMask(token) ==
+            header.tensor_reference_mask &&
+        ExecutionTokenTensorCount(token) == header.tensor_count &&
+        ExecutionTokenScalarCount(token) == header.scalar_count &&
+        ExecutionTokenFaninCount(token) == header.fanin_count &&
+        ExecutionTokenScalarWordOffset(token) ==
+            layout.scalar_word_offset;
 
     const uint64_t *dispatch = ExecutionTokenDispatchArgs(token);
     for (uint32_t tensor = 0;
@@ -988,12 +998,9 @@ bool ClaimBindingRejectsMalformedShape(
            !BindPaExecutionTokenDispatchAfterClaim(token, worker);
 }
 
-void CorruptTokenShape(
+void CorruptCachedTokenShape(
     ExecutionToken &token, const CaseShape &shape, ShapeField field
 ) {
-    ExecPayloadStorage &payload = const_cast<ExecPayloadStorage &>(
-        ExecutionTokenPayload(token)
-    );
     constexpr uint64_t kFieldMask = UINT64_C(0xFFFF);
     uint32_t shift = 0;
     uint16_t expected = shape.tensor_count;
@@ -1005,8 +1012,8 @@ void CorruptTokenShape(
         expected = shape.fanin_count;
     }
     const uint64_t mask = kFieldMask << shift;
-    payload.words[4] =
-        (payload.words[4] & ~mask) |
+    token.control.shape_and_scalar_offset =
+        (token.control.shape_and_scalar_offset & ~mask) |
         (static_cast<uint64_t>(MalformedCount(expected)) << shift);
 }
 
@@ -1036,7 +1043,10 @@ bool FinalValidatorRejectsMalformedShape(
         !BindPaExecutionTokenDispatchAfterClaim(token, worker)) {
         return false;
     }
-    CorruptTokenShape(token, shape, field);
+    // Claim 后 shared payload 已由协议冻结；最终执行入口真正需要防守的是
+    // owner-local 缓存/dispatch 被本核错误路径改坏，而不是虚构第二个
+    // shared payload writer。这里因此破坏缓存 shape 并要求 validator 拒绝。
+    CorruptCachedTokenShape(token, shape, field);
     token.control.phase = ExecTokenPhase::EngineInflight;
     return !ValidatePaExecutionTokenDispatch(
         token, worker, shape.kind
@@ -1309,6 +1319,38 @@ bool RunCase(SchedulerState &state, const CaseShape &shape) {
         ValidatePaExecutionTokenDispatch(token, executor, shape.kind),
         shape.kind, "valid exact-shape dispatch passes final validator"
     );
+    auto &bound_local = *reinterpret_cast<PaLocalContext *>(
+        &token.dispatch.local_context[0]
+    );
+    const uint32_t saved_block_count = bound_local.block_count;
+    bound_local.block_count = 0;
+    Check(
+        !ValidatePaExecutionTokenDispatch(token, executor, shape.kind),
+        shape.kind, "final validator rejects corrupted local binding"
+    );
+    bound_local.block_count = saved_block_count;
+
+    auto &bound_global = *reinterpret_cast<PaGlobalContext *>(
+        &token.dispatch.global_context[0]
+    );
+    const uint32_t saved_sub_block_id = bound_global.sub_block_id;
+    bound_global.sub_block_id = saved_sub_block_id ^ 1U;
+    Check(
+        !ValidatePaExecutionTokenDispatch(token, executor, shape.kind),
+        shape.kind, "final validator rejects corrupted global binding"
+    );
+    bound_global.sub_block_id = saved_sub_block_id;
+
+    const uint64_t saved_local_pointer = token.dispatch.args[
+        kExecDispatchLocalContextIndex
+    ];
+    token.dispatch.args[kExecDispatchLocalContextIndex] = 0;
+    Check(
+        !ValidatePaExecutionTokenDispatch(token, executor, shape.kind),
+        shape.kind, "final validator rejects corrupted context pointer"
+    );
+    token.dispatch.args[kExecDispatchLocalContextIndex] =
+        saved_local_pointer;
     token.control.phase = ExecTokenPhase::WaitingFanin;
     Check(
         PayloadEqualsSnapshot(cell.payload, snapshot),

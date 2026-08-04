@@ -3963,3 +3963,149 @@ S6.63 reuse validated: min / median / max / mean
 生成物缩小、热路径 GM 读取减少和 trace-free 端到端收益三者同向，因此保留。
 下一阶段继续审计同一 Claim→Execute 链上是否还存在已经由前序验证覆盖的
 header/layout 读取，仍以完整 startup→FinalDrain 配对数据裁决。
+
+## 2026-08-04：S6.64 缓存 Claim 证明并删除 Execute 前逐参数二次复核
+
+### 重复工作的来源与不可越过的边界
+
+S6.63 只删除了 Claim 函数内部对同一 header/layout 的第二次读取。Claim 成功后，
+后续路径仍在多个 helper 中反复执行以下工作：
+
+- `BindPaExecutionTokenDispatchAfterClaim()` 重新解码 function/shape；
+- 每次 fanin poll 都重新解码 header、计算 fanin offset；
+- kernel 发射前重新计算完整 payload layout，并逐 tensor/scalar 比较已经由 Claim
+  重建好的 dispatch；
+- completion 再从 shared payload 读取 task/vend；
+- scheduler 为 route、trace 和 completion 分别重取 function/task。
+
+这些读取发生在 Execute owner 已经通过返回型 Claim CAS 取得唯一所有权之后。
+此时的可见性与生命周期证明为：
+
+1. builder 先完成 ordinary payload 写入和完整 active-prefix DCCI clean-out + DSB，
+   再原子发布 `BUILT`；
+2. Execute owner 取得 `CLAIMED` 后，对完整 payload 做 invalidate；
+3. `ValidateBoundExecPayload()` 一次性校验 task、engine、function、shape、line、
+   descriptor reference 和 multicore 字段；
+4. 同一调用中根据已验证 header/layout 重建 dispatch；
+5. 从 Claim 到 kernel 完成，shared payload immutable，token 也只有当前 Execute
+   owner 一个 writer；
+6. 因而后续重复读取不能形成第二条发布证明，真正仍需在 kernel 前核对的只有 PA
+   adapter 后写入的 executor-local `LocalContext/GlobalContext` 与两个 context 指针。
+
+本阶段没有删除 payload clean-out、Claim CAS、payload invalidate、descriptor
+reference invalidate、fanin completion atomic、DONE 发布或 TensorMap
+`deps_prepared[N-1] -> metadata(N) -> deps_prepared[N]` 严格插入链。
+
+### 实现
+
+在 `ExecutionTokenControl` 原有 64B control line 的 24B padding 中保存三份
+owner-local、非发布型数据：
+
+- `completion_vend`；
+- `function_id + tensor_reference_mask`；
+- `tensor/scalar/fanin count + scalar_word_offset`。
+
+Claim 只在完整校验和 dispatch 重建都成功后写入这三项；Reset 全部清零。它们不被
+其他 Scalar 消费，不新增 cache line、DCCI 或 Atomic。fanin/scalar/TensorDesc
+访问、scheduler route/trace 以及 completion 改为消费这份缓存，并保留基于
+`payload_lines` 的范围检查。
+
+kernel 前 validator 删除 immutable payload 的 layout 重算和逐 tensor/scalar GM
+比较，只保留 function/shape/engine、executor role、context 指针以及
+`LocalContext/GlobalContext` 内容检查。CPU 门槛额外破坏缓存 shape、local binding、
+global binding 和 context pointer，均必须 fail-closed；这避免把“删除重复读取”
+误写成“取消执行入口检查”。
+
+第一版只做元数据缓存、仍保留逐参数复核。20 对冻结交错 A/B 的结果为：
+
+```text
+S6.63 baseline median       = 1.408277 ms
+cache-only candidate median = 1.410750 ms
+独立中位数回退             = 0.002473 ms / 0.176%
+配对收益中位数             = -0.000556 ms
+20 对中候选获胜 9 对
+```
+
+因此“只缓存、继续二次复核”不作为独立优化提交；最终 S6.64 必须包含二次复核消减，
+并重新独立冻结、重新上板裁决。
+
+### 编译、正确性与生成物证据
+
+- portable execution protocol CPU 门槛 PASS；
+- 完整 CPU scheduler 回归 PASS，覆盖中央 Build ticket、PA 四种 kernel shape、
+  双 token、fanin 前缀、完成失败重试、严格 TensorMap 插入和 FinalDrain；
+- CCEC AIC/AIV generic instantiation 和最终 mixed ELF 门槛 PASS；
+- perf-clock AIC 的等价 finish 出口由 3 组重新合并为 2 组，AIV 保持 4 组；
+  build 门槛仍按实际机器码精确锁定 `2/4` 条 relocation，且只允许指向本角色唯一
+  finish，不放宽为范围；
+- full-swimlane 的 trace 分支改变了尾部合并形状，AIC/AIV 实际为精确
+  `5/3` 条 relocation；`readelf` 逐条确认只指向对应角色的唯一 finish，
+  因此单独冻结 `5/3` 门槛，没有用范围判断遮掩出口漂移；
+- A5 B256 的 caller/finish 同一 block-local state、精确 finish_calls、1280 task、
+  1024 kernel、payload/descriptor/fanin、executor route、completion、TensorMap、
+  heap 和全部终态检查均为 PASS；
+- 最终 device ELF text 从 S6.63 的 `374076B` 降至 `251196B`，减少
+  `122880B / 32.85%`。
+
+### full-swimlane 完整归因复核
+
+以最终 S6.64 生成 B256 full-swimlane，位于：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+pa_scheduler_cross_core_shared_swimlane_20260804_094842_1172211/ccec/
+```
+
+该次运行完成 1280 task、1024 kernel，所有语义、payload、fanin、
+completion、TensorMap、heap 和终态门槛 PASS，trace 丢失为 0。泳道的
+startup 到 FinalDrain 为 `1.438518 ms`；这是观察构建，只用来定位，
+不与 trace-free 的 `1.405079 ms` 中位数直接相减。
+
+主要归因如下：
+
+- Register 聚合核时为 `37.127 ms`，其中等待前序插入为
+  `36.458 ms / 98.2%`。这是严格 TensorMap 插入链上的到达乱序，
+  不是可以直接删除的 Atomic；
+- 1024 次 execution payload clean-out 聚合核时 `1.446 ms`，平均
+  `1.413 us`；1024 次 Execute owner payload invalidate 仅聚合 `84.083 us`。
+  下一轮若继续压缩 payload，必须保持完整 clean-out 和 control/payload
+  cache-line 隔离；
+- EfDrain 中 `scan_exec_candidates` 和 `defer_token_and_scan_plan` 分别为
+  `397.786 us` 和 `369.556 us` 聚合核时；FinalDrain 中
+  `recycle_token_and_scan_candidates` 为 `230.418 us`。它们都是可继续审计的
+  GM + Scalar 扫描；
+- `shared_insert_predecessor_poll`、`fanin_flag_load` 和 `fatal_poll` 的
+  poll-batch 时长是整个等待 episode，不能当作单条 Atomic 指令延迟。
+  其中前两者分别对应严格插入前沿与真实 fanin 未 ready；
+  FinalDrain 的 fatal 观察已经节流，只能在保留最终错误收口的前提下
+  继续消减。
+
+源码复核还发现一个与 PA task 形状无关的明确重复：Claim 成功后，
+当前代码先单独调用 `ProgressCrossCoreActiveToken()` 推进新 token，
+紧接着又调用 `ProgressCrossCoreOwnedTokens()` 扫描两个 token。如果新 token
+尚未 ready，同一 route/control/fanin 会立即重读一次。下一阶段应只复查
+“新 token 完成后可能被解锁的其他 token”，不再立即复查新 token 本身。
+
+### A5 冻结交错 A/B
+
+以 S6.63 的冻结 host/kernel 为基线，冻结最终 S6.64 后运行 12 对独立 B256
+trace-free 交错 A/B，奇偶轮反转执行顺序，统一测量 startup 起点到最后一个
+FinalDrain 结束：
+
+```text
+S6.63 frozen baseline: min / median / max / mean
+                       1.375252 / 1.416564 / 1.451484 / 1.417631 ms
+S6.64 metadata once  : min / median / max / mean
+                       1.386103 / 1.405079 / 1.418048 / 1.403745 ms
+
+独立中位数改善 = 0.011486 ms / 0.811%
+配对收益中位数 = 0.019548 ms / 1.380%
+配对收益均值   = 0.013886 ms / 0.979%
+12 对中候选获胜 10 对
+```
+
+最终版本同时满足“热路径 shared GM 重复读取减少”“device text 显著缩小”和
+“完整 startup→FinalDrain 稳定改善”，且不依赖 PA task id、batch 数或固定图形，
+因此作为通用 cross-core execution ownership 优化保留。当前可信中位数仍约
+`1.405 ms`，尚未达到 `1 ms` 目标；下一阶段继续按第 18 节审计 Register 到达
+乱序以及 Execute scanner/token/FinalDrain 的重复状态观察。

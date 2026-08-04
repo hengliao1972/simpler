@@ -377,20 +377,26 @@ PA_DEVICE bool BindPaExecutionTokenDispatchAfterClaim(
         token.control.engine_class == ExecEngineClass::Joint) {
         return false;
     }
-    const ExecPayloadHeader header = ExecutionTokenHeader(token);
+    const uint32_t function_id =
+        ExecutionTokenFunctionId(token);
+    const uint32_t tensor_count =
+        ExecutionTokenTensorCount(token);
+    const uint32_t scalar_count =
+        ExecutionTokenScalarCount(token);
+    const uint32_t fanin_count =
+        ExecutionTokenFaninCount(token);
     PaExecRoute route{};
     TaskKind kind = TaskKind::Count;
-    if (!PaTaskKindFromExecFunction(header.function_id, kind)) {
+    if (!PaTaskKindFromExecFunction(function_id, kind)) {
         return false;
     }
     if (!ResolvePaExecRoute(
-            kind, static_cast<int32_t>(header.function_id), route
+            kind, static_cast<int32_t>(function_id), route
         ) ||
         !PaExecShapeMatches(
-            kind, header.tensor_count,
-            header.scalar_count, header.fanin_count
+            kind, tensor_count, scalar_count, fanin_count
         ) ||
-        route.engine_class != header.engine_class) {
+        route.engine_class != token.control.engine_class) {
         return false;
     }
 
@@ -422,10 +428,11 @@ PA_DEVICE bool BindPaExecutionTokenDispatchAfterClaim(
                ));
 }
 
-// kernel 发射前最后一次核对 executor binding。协议层已经检查 immutable
-// shared payload 的 header/range；inline TensorDesc 可以直接引用该
-// task-indexed storage，真正可变的 Local/GlobalContext 仍必须使用执行核
-// 自己的 token。该检查是 standalone 的真实执行入口合同，不是 host 诊断。
+// kernel 发射前只核对 Claim 后仍可能由 PA adapter 写入的 executor-local
+// binding。immutable shared payload 的 header/range、TensorDesc 地址和 scalar
+// dispatch 已在 Claim 内完成一次校验/重建，且 Claim 到 kernel 之间没有第二个
+// token writer；因此这里不能再逐 tensor/scalar 回读 payload 冒充第二次发布
+// 证明。真正可变的 Local/GlobalContext 仍逐项核对。
 PA_DEVICE bool ValidatePaExecutionTokenDispatch(
     PA_GM const ExecutionToken &token,
     PA_GM const WorkerState &executor, TaskKind expected_kind
@@ -435,34 +442,31 @@ PA_DEVICE bool ValidatePaExecutionTokenDispatch(
         expected_kind == TaskKind::Count) {
         return false;
     }
-    const ExecPayloadHeader header = ExecutionTokenHeader(token);
-    PA_GM const ExecPayloadStorage &payload =
-        ExecutionTokenPayload(token);
-    ExecPayloadLayout layout{};
+    const uint32_t function_id =
+        ExecutionTokenFunctionId(token);
+    const uint32_t tensor_count =
+        ExecutionTokenTensorCount(token);
+    const uint32_t scalar_count =
+        ExecutionTokenScalarCount(token);
+    const uint32_t fanin_count =
+        ExecutionTokenFaninCount(token);
     PaExecRoute route{};
     TaskKind payload_kind = TaskKind::Count;
     if (!PaTaskKindFromExecFunction(
-            header.function_id, payload_kind
+            function_id, payload_kind
         ) ||
         payload_kind != expected_kind ||
         !ResolvePaExecRoute(
             payload_kind,
-            static_cast<int32_t>(header.function_id), route
+            static_cast<int32_t>(function_id), route
         ) ||
         !PaExecShapeMatches(
-            payload_kind, header.tensor_count,
-            header.scalar_count, header.fanin_count
+            payload_kind, tensor_count,
+            scalar_count, fanin_count
         ) ||
-        route.engine_class != header.engine_class ||
         route.engine_class != token.control.engine_class ||
-        !ComputeExecPayloadLayout(
-            header.tensor_count, header.scalar_count,
-            header.fanin_count,
-            header.tensor_reference_mask, layout
-        ) ||
-        header.payload_bytes != layout.payload_bytes ||
-        token.control.payload_bytes != layout.payload_bytes ||
-        token.control.payload_lines != layout.payload_lines) {
+        token.control.payload_bytes == 0 ||
+        token.control.payload_lines == 0) {
         return false;
     }
 
@@ -472,31 +476,6 @@ PA_DEVICE bool ValidatePaExecutionTokenDispatch(
             : ExecEngineClass::Aiv;
     if (route.engine_class != executor_engine) {
         return false;
-    }
-    for (uint32_t tensor = 0;
-         tensor < header.tensor_count; ++tensor) {
-        const uint32_t word_offset = ExecTensorPayloadWordOffset(
-            tensor, header.tensor_reference_mask
-        );
-        const uint64_t expected_address =
-            (header.tensor_reference_mask &
-             (uint32_t{1} << tensor)) != 0
-            ? payload.words[word_offset]
-            : static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
-                  &payload.words[word_offset]
-              ));
-        if (token.dispatch.args[tensor] != expected_address) {
-            return false;
-        }
-    }
-    for (uint32_t scalar = 0;
-         scalar < header.scalar_count; ++scalar) {
-        if (token.dispatch.args[header.tensor_count + scalar] !=
-            payload.words[
-                layout.scalar_word_offset + scalar
-            ]) {
-            return false;
-        }
     }
 
     PA_GM const PaLocalContext &local =

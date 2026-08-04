@@ -4582,25 +4582,25 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
     // global fatal 在外层调度边界观察。已经取得的合法 token 作为一个
     // 不可拆分工作单元推进到完成；不在 fanin、kernel 和 completion 之间
     // 反复读取共享停止线。
-    const cross_core::ExecPayloadHeader header =
-        cross_core::ExecutionTokenHeader(token);
+    const uint32_t token_task_id = token.control.task_id;
+    const uint32_t token_function_id =
+        cross_core::ExecutionTokenFunctionId(token);
     TaskKind kind = TaskKind::Count;
     cross_core::PaExecRoute route{};
     if (!cross_core::PaTaskKindFromExecFunction(
-            header.function_id, kind
+            token_function_id, kind
         ) ||
         !cross_core::ResolvePaExecRoute(
-            kind, static_cast<int32_t>(header.function_id), route
+            kind, static_cast<int32_t>(token_function_id), route
         ) ||
-        header.task_id >= kMaxTasks ||
-        header.task_id != token.control.task_id ||
+        token_task_id >= kMaxTasks ||
         route.engine_class != token.control.engine_class ||
         route.engine_class != CrossCoreEngineForRole(worker.role) ||
         !cross_core::A5SingleLaneBuildOwnerEligible(
             token.control.build_owner, route.engine_class
         ) ||
         !cross_core::A5SingleLaneExecuteOwnerEligible(
-            header.task_id, token.control.build_owner,
+            token_task_id, token.control.build_owner,
             route.engine_class, worker_id
         ) ||
         token.control.execute_owner != worker_id ||
@@ -4652,7 +4652,7 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
             PublishCrossCoreRuntimeFailure<Ops>(
                 state, stats,
                 cross_core::ExecFatalReason::InvalidTokenPayload,
-                header.task_id, worker_id
+                token_task_id, worker_id
             );
             token.control.phase =
                 cross_core::ExecTokenPhase::Faulted;
@@ -4662,8 +4662,8 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
             TraceTimestamp<Ops>(stats.trace, stats.result);
         WriteTrace<false>(
             stats.trace, stats.result,
-            static_cast<int32_t>(header.task_id),
-            static_cast<int32_t>(header.function_id),
+            static_cast<int32_t>(token_task_id),
+            static_cast<int32_t>(token_function_id),
             TracePhase::Kernel, ProfilePhase::ReplayTail,
             kernel_begin, kernel_end
         );
@@ -4680,7 +4680,7 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
             PublishCrossCoreRuntimeFailure<Ops>(
                 state, stats,
                 cross_core::ExecFatalReason::InvalidTokenPayload,
-                header.task_id, worker_id
+                token_task_id, worker_id
             );
             token.control.phase =
                 cross_core::ExecTokenPhase::Faulted;
@@ -4714,7 +4714,7 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
             cross_core::ExecTokenPhase::CompletionPublished) {
         const uint32_t completed_task = token.control.task_id;
         const uint32_t completed_function =
-            cross_core::ExecutionTokenHeader(token).function_id;
+            cross_core::ExecutionTokenFunctionId(token);
         cross_core::ObservedPaExecCompletionSink<
             Ops, SharedExecTraceObserver<Ops>
         > completion{state, &observer};
