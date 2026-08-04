@@ -6603,3 +6603,22 @@ CPU 全量、CCEC 两种构建及 A5 B1/B256 全部通过。相对冻结基线
 `12.051%`，12/12 对候选获胜。full-swimlane 中 predecessor wait 的累计
 core-work 从 `22.901 ms` 降至 `11.360 ms`，1279 条严格依赖边保持不变，
 DCCI 调用仍为 6528 次。详细协议、原始数据和归因见实现过程 S6.70-d。
+
+### 15.55 以三槽占满证据扩为四 token
+
+三 token 的 full-swimlane 重建显示，96/96 个 executor 都曾占满三槽，
+三槽占满累计 `62.869 ms` core-time、每核中位 `672.945 us`，且仍有 170 个
+kernel 留到 FinalDrain。因此本轮只把 owner-local 有界前视从 3 扩为 4，
+不改变中央 Execute ticket、共享 payload、TensorMap 严格插入、atomic/DCCI
+协议或完成顺序。
+
+CPU 全套、CCEC perf-clock/full-swimlane 和 A5 B1/B256 全部通过。相对冻结
+`a8854a4e` 三 token 产物的 12+12 正反顺序交错 A/B 中，完整周期中位从
+`1.076359 ms` 降至 `1.036396 ms`，改善 `3.713%`；均值从
+`1.077493 ms` 降至 `1.035564 ms`，改善 `3.891%`，11/12 对候选更快。
+full-swimlane lifecycle 为 `1.087601 ms`，FinalDrain kernel 降至 145。
+
+代价是 cross-core state 增加 `55296B`、perf-clock `.text` 增加 `1280B`；
+没有增加任何共享原子操作或 DCCI。该机制只依赖中央唯一发放和 owner-local
+有界 admission，不读取 PA task kind，因此正式保留。详细证据见实现过程
+S6.71。

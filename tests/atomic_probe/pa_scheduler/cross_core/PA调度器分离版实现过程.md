@@ -4897,3 +4897,76 @@ FinalDrain 结束：
 `test_record/2026-8-4/cross_b256_128b_1p120ms.json`。该优化只依赖“每 task
 一个严格完成字”的通用有序提交合同，不读取 PA task kind、batch 或固定 DAG，
 因此正式保留。
+
+## 2026-08-04：S6.71 以实测占用证据扩为四 token
+
+### 为什么继续扩容不是盲试
+
+S6.70-d 的三 token full-swimlane 可用既有 Execute ticket、cell state 与
+DONE 事件重建 owner-local token 生命周期，无需新增 raw 字段。重建结果为：
+
+- 1024 个有效 ticket 全部与 DONE 一一配对；
+- 96/96 个 worker 都曾同时占满三个 token；
+- 三槽占满累计 core-time 为 `62869.469 us`，每核中位 `672.945 us`、
+  95 分位 `833.130 us`、最大 `928.772 us`；
+- ticket 到 DONE 的中位/95 分位/最大生命期为
+  `234.567/421.293/588.269 us`；
+- 完整泳道仍有 170 个 kernel 留在 FinalDrain。
+
+因此容量 3 不是偶然触顶，而是在大部分完整周期内限制了 executor 前视。
+本阶段只把每核固定容量从 3 增至 4，不改变中央 Execute ticket、
+`BUILT -> CLAIMED -> DONE`、payload publish/acquire、fanin、TensorMap 严格
+插入链或 FinalDrain 证明。
+
+### 实现和正确性闭合
+
+- `kExecTokensPerWorker` 改为 4，所有遍历、排空与容量判断继续由该常量派生；
+- CPU 定向用例改为四个未 Built task 占满四个唯一 token，第五张 ticket
+  必须被阻止，随后恢复发布并完整排空；
+- shared ABI generation 从 14 提升到 15；cross-core execution sidecar
+  从 `19438144B` 增至 `19493440B`，总 state 从 `1059049856B` 增至
+  `1059105152B`；
+- CCEC perf-clock/full-swimlane 的 AIC 等价 finish 出口均由编译器生成 4 个，
+  AIV 仍为 3 个；readelf 逐条确认只指向各自唯一的 role finish 后，构建门槛
+  精确锁定为 4/3，没有放宽为范围；
+- CPU 全套、CCEC 两类构建、A5 B1/B256 real-compute `6,28,4,1` 的业务、
+  payload、严格插入、1024 kernel exactly-once 和终态断言全部 PASS。
+
+perf-clock 混合 ELF `.text` 相对三 token 增加 `1280B`。增加的是每 worker
+一个 owner-private 有界 token；没有新增共享 atomic、DCCI 或 task 级协议。
+
+### 冻结交错 A/B
+
+基线固定为提交 `a8854a4e` 的三 token CCEC 产物，候选只扩为四 token。
+两边各预热一次后，按 B-C/C-B 反转顺序交错运行 12 对独立 A5 B256 进程，
+唯一口径均为 startup 起点到最后 FinalDrain 结束：
+
+```text
+三 token B: min / median / max / mean
+              1.052238 / 1.076359 / 1.102872 / 1.077493 ms
+四 token C: min / median / max / mean
+              1.002272 / 1.036396 / 1.072756 / 1.035564 ms
+
+独立中位数改善 = 39.963 us / 3.713%
+独立均值改善   = 41.929 us / 3.891%
+配对收益中位数 = 39.803 us
+候选获胜       = 11 / 12 对
+```
+
+### 完整泳道复核
+
+四 token B256 full-swimlane 的所有断言通过，结果为：
+
+- startup→FinalDrain lifecycle：`1087.601 us`；
+- Submit：`1002.100 us`；
+- placement：EfDrain 879、FinalDrain 145；相对三 token 证据中的
+  FinalDrain 170 继续下降；
+- TensorMap 仍为逐 task 128B completion 严格链；1280 task、1024 kernel、
+  6528 次 DCCI 均精确闭合；
+- 泳道归档为 `test_record/2026-8-4/cross_4token_1p088ms.json`，该 JSON 受
+  `.gitignore` 管理，不进入提交。
+
+结论：正式保留四 token。收益来自更深的 owner-local 有界前视和更早的
+Execute 推进，不依赖 PA task kind、batch 图形或固定依赖模板；它仍不是无界
+pending list。下一轮若继续扩容，必须重新从四槽占用分布出发，并用同样的
+冻结 A/B 证明边际收益，不能按整数顺序机械增加。

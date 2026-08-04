@@ -150,7 +150,7 @@ constexpr uint32_t kBuildIdentityMagic = 0x50414249U;  // "PABI"
 constexpr uint32_t kBuildIdentityCompactGenericTraceBit =
     1U << 31U;
 #if PTO_FDWIC_SHARED_MAP
-constexpr uint32_t kBuildIdentityAbiGeneration = 14;
+constexpr uint32_t kBuildIdentityAbiGeneration = 15;
 #else
 constexpr uint32_t kBuildIdentityAbiGeneration = 4;
 #endif

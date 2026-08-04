@@ -214,19 +214,19 @@ SPLIT_STATE_STORAGE_BYTES=1728
 # role/观察构建合并相同尾部。五种 kind 是否完整覆盖由 dispatch switch 和
 # CPU 动态协议测试证明；这里精确锁定当前每种产物的真实代码形状，防止 finish 被
 # 内联/删除，又不把 CCEC 对等尾部的有益合并误判成覆盖缺失。
-# 双中央 Execute ticket 删除 K2 扫描与候选分支后，perf-clock AIC 的等价
-# 出口保持两组，AIV 从四组合并为三组；readelf 逐条确认这些 relocation
+# 四 token 正式配置使 perf-clock AIC 的等价出口由两组合成为四组，AIV 仍为
+# 三组；readelf 逐条确认这些 relocation
 # 都只指向本角色唯一 finish。任务种类覆盖继续由 dispatch、CPU 动态协议
-# 门槛和 A5 finish_calls 精确终态共同证明；这里按实际机器码冻结为 2/3，
+# 门槛和 A5 finish_calls 精确终态共同证明；这里按实际机器码冻结为 4/3，
 # 不放宽成范围。
-SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC=2
+SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC=4
 SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIV=3
-# 双中央 Execute ticket 删除 K2 扫描与候选分支后，full-swimlane AIC 的
-# 等价 finish 出口由 CCEC 进一步合并为三组；AIV 同样为三组。readelf
-# 逐条确认它们都只指向本角色唯一 finish 符号；任务覆盖继续由 dispatch、
-# CPU 动态协议门槛和 A5 finish_calls 精确终态共同证明。这里按实际机器码
-# 冻结为 3/3，不放宽成范围判断。
-SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC=3
+# 四 token 也改变了 full-swimlane AIC 的退出形状：CCEC 生成四个等价
+# finish 出口，AIV 仍合并为三组。readelf 逐条确认这些 relocation 都只
+# 指向本角色唯一 finish 符号；任务覆盖继续由 dispatch、CPU 动态协议门槛
+# 和 A5 finish_calls 精确终态共同证明。这里按实际机器码冻结为 4/3，
+# 不放宽成范围判断。
+SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC=4
 SPLIT_FINISH_CALL_SITES_SWIMLANE_AIV=3
 COMMON_FLAGS+=(
     -mllvm -cce-block-local-relocate=true

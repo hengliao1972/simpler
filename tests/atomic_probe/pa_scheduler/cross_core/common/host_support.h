@@ -1271,9 +1271,11 @@ inline constexpr size_t CrossCoreExecStateBytes() {
 static_assert(
     // S6.63 两 token 删除废弃私有 payload 后为 19347648B；
     // 双中央 Execute ticket 追加 35008B。S6.69 三 token 正式配置再追加
-    // 96 * sizeof(ExecutionToken) = 55296B。task-indexed payload 和其
-    // DCCI 发布边界保持不变。
-    CrossCoreExecStateBytes() == 19437952,
+    // 96 * sizeof(ExecutionToken) = 55296B。S6.71 四 token 再追加
+    // 96 * sizeof(ExecutionToken) = 55296B。未保留无稳定收益的双 Execute
+    // cursor 128B 空槽，因此 task-indexed payload 与其 DCCI 发布边界之外
+    // 只增加一个 owner-local token。
+    CrossCoreExecStateBytes() == 19493248,
     "cross-core execution state transfer size changed"
 );
 static_assert(

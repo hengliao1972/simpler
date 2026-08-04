@@ -6316,7 +6316,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     worker.owned_total = 0;
     worker.swimlane_last_cycle = 0;
 #if PTO_FDWIC_SHARED_MAP
-    // 两个 ExecutionToken 都是 worker 私有的普通 GM 状态，不由其他
+    // 全部 ExecutionToken 都是 worker 私有的普通 GM 状态，不由其他
     // Scalar 读取。
     // A5 Scalar 间没有 cache coherence，host H2D 写入的 IDLE 不能替代
     // 本核初始化：同一物理 Scalar 仍可能缓存上一 kernel 的 Waiting/Faulted
@@ -6718,7 +6718,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #endif
     AtomicPollRegionEnd<Ops>(stats.trace, stats.result, final_poll_region);
 #if PA_BUILD_PERF_CLOCK
-    // 权威性能终点在全部 execution cell 排空、两个 owner-local token
+    // 权威性能终点在全部 execution cell 排空、全部 owner-local token
     // 复位且全局 drain 发布后读取。复用 WorkerResult::finish_cycle，
     // 不增加状态字段或逐 task 记录。
     const uint64_t final_drain_end_clock =

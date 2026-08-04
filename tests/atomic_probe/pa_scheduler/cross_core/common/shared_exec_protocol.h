@@ -53,10 +53,10 @@ constexpr uint32_t kExecGlobalContextBytes = 4;
 constexpr uint32_t kExecDispatchBindingBytes = 512;
 constexpr uint32_t kExecDispatchLocalContextIndex = 48;
 constexpr uint32_t kExecDispatchGlobalContextIndex = 49;
-// S6.69 正式配置：同一 Scalar 最多保存三个已领取、尚未完成的 task。
-// 它只扩大 owner-local 前视深度，不改 Execute ticket 唯一领取、payload
-// DCCI 或 TensorMap 严格插入合同；A5 冻结 A/B 已完成并支持保留。
-constexpr uint32_t kExecTokensPerWorker = 3;
+// S6.71 正式配置：同一 Scalar 最多保存四个已领取、尚未完成的 task。
+// 最新三槽泳道显示 96/96 worker 均达到容量上限，三槽占满时间每核中位
+// 672.945 us；扩容只改变 owner-local 前视深度，不改共享发布或插入合同。
+constexpr uint32_t kExecTokensPerWorker = 4;
 // execution drain 按物理 block 分成 16 组；96 个 Scalar 在当前
 // 1 AIC + 2 AIV/block 拓扑下每组精确包含 6 个 worker。
 constexpr uint32_t kExecDrainArrivalGroups = 16;
@@ -114,8 +114,8 @@ static_assert(
     "dispatch argument indexes no longer match payload capacity"
 );
 static_assert(
-    kExecTokensPerWorker == 3,
-    "the S6.69 bounded-lookahead protocol requires exactly three tokens"
+    kExecTokensPerWorker == 4,
+    "the S6.71 bounded-lookahead protocol requires exactly four tokens"
 );
 
 enum class ExecPhase : uint8_t {

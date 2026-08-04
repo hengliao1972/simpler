@@ -780,9 +780,9 @@ void TestDualTicketWaitingBuiltAndOwnerIndependence() {
     std::printf("[PASS] %s\n", kTest);
 }
 
-void TestThreeBlockedTokensBoundLookahead() {
+void TestFourBlockedTokensBoundLookahead() {
     constexpr const char *kTest =
-        "three-blocked-tokens-bound-lookahead";
+        "four-blocked-tokens-bound-lookahead";
     MappedSchedulerState mapping;
     SchedulerState *state = mapping.Get();
     Check(state != nullptr, kTest, "state mapping");
@@ -804,8 +804,8 @@ void TestThreeBlockedTokensBoundLookahead() {
         );
     Check(
         first_progress == 0 &&
-            state->exec_dispatch.aic_next.value == 3 &&
-            stats.max_occupied == 3 &&
+            state->exec_dispatch.aic_next.value == 4 &&
+            stats.max_occupied == 4 &&
             stats.exec_dispatch_exhausted == 0 &&
             state->exec_tokens[kExecutor][0].control.phase ==
                 ExecTokenPhase::WaitingBuilt &&
@@ -816,9 +816,12 @@ void TestThreeBlockedTokensBoundLookahead() {
             state->exec_tokens[kExecutor][2].control.phase ==
                 ExecTokenPhase::WaitingBuilt &&
             state->exec_tokens[kExecutor][2].control.task_id == 6 &&
+            state->exec_tokens[kExecutor][3].control.phase ==
+                ExecTokenPhase::WaitingBuilt &&
+            state->exec_tokens[kExecutor][3].control.task_id == 8 &&
             NoFatal(*state),
         kTest,
-        "three unpublished tasks occupy three unique owner-local tokens"
+        "four unpublished tasks occupy four unique owner-local tokens"
     );
 
     const uint32_t capacity_limited_progress =
@@ -828,14 +831,14 @@ void TestThreeBlockedTokensBoundLookahead() {
         );
     Check(
         capacity_limited_progress == 0 &&
-            state->exec_dispatch.aic_next.value == 3 &&
-            stats.max_occupied == 3 &&
+            state->exec_dispatch.aic_next.value == 4 &&
+            stats.max_occupied == 4 &&
             stats.exec_dispatch_exhausted == 0 &&
             !CrossCoreExecWorkerDrained(
                 state, worker, 10, stats
             ) && NoFatal(*state),
         kTest,
-        "three occupied tokens prevent a fourth Execute ticket"
+        "four occupied tokens prevent a fifth Execute ticket"
     );
     std::printf("[PASS] %s\n", kTest);
 }
@@ -896,7 +899,7 @@ void TestDualTicketDuplicateConsumerFailsClosed() {
 int main() {
     TestDualTicketRoleDistribution();
     TestDualTicketWaitingBuiltAndOwnerIndependence();
-    TestThreeBlockedTokensBoundLookahead();
+    TestFourBlockedTokensBoundLookahead();
     TestDualTicketDuplicateConsumerFailsClosed();
     TestDrainCompletionCountMismatchFailsClosed();
     TestDrainUsesPublishedExecutableTaskCount();
