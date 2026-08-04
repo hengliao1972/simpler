@@ -3059,3 +3059,29 @@ candidate mean   回退 0.005921 ms / 0.411%
 可保留的完整周期收益。在没有性能收益时，不值得用延迟异常检测
 换取源码层面的“不使用返回值”。候选已完整撤回，当前 owner 仍使用
 CAS 旧值当场验证 handoff 成功。
+
+## 2026-08-04：S6.49 用完整周期复审 output published 非返回候选（仍不保留）
+
+S6.31 曾利用唯一 Build owner 和 output writer 预留条件，将 descriptor
+copy、DCCI 和 StoreBarrier 之后的 published Exchange 改为只发射、不消费
+旧值。消费者的 poll 仍可以等到 `task_id`，但生产者不再能当场检测
+last-writer 预留与 published 之间的非法并发写，因此这也是错误诊断合同
+变弱的候选。
+
+本轮在 S6.46 底座上重建无泳道候选，CCEC perf-clock 构建和
+Atomic/DCCI 源码覆盖门槛 PASS。以提交 `253a2e8a` 冻结基线，按
+B-C/C-B 交错各运行 12 个 A5 B256 trace-free 进程：
+
+```text
+S6.46 frozen baseline: min / median / max / mean
+                       1.407474 / 1.443516 / 1.456336 / 1.439355 ms
+S6.49 candidate      : min / median / max / mean
+                       1.414010 / 1.447342 / 1.465090 / 1.445944 ms
+candidate median 回退 0.003826 ms / 0.265%
+candidate mean   回退 0.006589 ms / 0.458%
+```
+
+候选只有 4/12 对更快，中位数和均值同向回退。最新底座仍然没有为该
+候选提供稳定收益，也就没有理由删除生产者侧的非法重复发布检测。
+候选已完整撤回，`SharedOutputPublishedExchange` 继续使用返回值验证
+旧状态为 `-1`。
