@@ -7,7 +7,7 @@
 | 目标 | 让 task 的构建 owner 与 kernel 执行 owner 可以是不同物理核 |
 | 当前代码 | 96 Scalar 通过中央 ticket 恰好一次 Build；Build owner 发布 task-indexed shared payload，K2 排除 Build owner 后的 1 或 2 个 eligible executor 竞争执行 |
 | 本文性质 | 持续更新的架构与内存模型设计记录 |
-| 正式实现 | S0–S6.42 已形成中央 ticket + 严格 TensorMap 插入 + K2 异核 Execute；执行扫描得到的完整 control 快照直接参与 Claim CAS；execution drain 采用 16 组单向 arrival，并在同一次 FetchAdd 中汇合 owner-local 完成数，固定 root 不再逐 task 原子扫描；正式单轮 TensorMap 实例明确禁止回收，lookup 不再读取恒为 0 的 bucket head；descriptor 引用、unique-ticket 单 CAS、发布 Exchange 非等待和 winner fatal 重复读取候选均已撤销 |
+| 正式实现 | S0–S6.53 已形成中央 ticket + 严格 TensorMap 插入 + K2 异核 Execute；公共计划显式发布 execution route/count，A5 单 lane placement 已独立于 PA adapter；执行扫描得到的完整 control 快照直接参与 Claim CAS；execution drain 采用 16 组单向 arrival，并在同一次 FetchAdd 中汇合 owner-local 完成数，固定 root 不再逐 task 原子扫描；正式单轮 TensorMap 实例明确禁止回收，lookup 不再读取恒为 0 的 bucket head；descriptor 引用、unique-ticket 单 CAS、发布 Exchange 非等待和 winner fatal 重复读取候选均已撤销 |
 | CPU 正确性用例 | S1–S4 K2、S5a 对侧角色 Build 与 S5b 全 96 Scalar Build 门槛已完成 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
 | A5 PA 功能/性能 | S6.43 起，唯一裁决口径为最早 startup 起点到最后 FinalDrain 结束；旧 Submit-only 与 first-Submit-to-FinalDrain 数据只保留为历史证据，不与新口径直接相减。S6.43 平面基线 6 次中位为 `1.465 ms`；功能与终态全部 PASS |
@@ -917,6 +917,13 @@ PA 只是第一个算子，设计不得固化以下现状：
 engine class”。PA 的 `batch/encoded_meta` 只由 Build adapter 解码，并在发布
 execution cell 前交叉验证两份路由一致。终态完成数同样来自计划显式发布的
 `executable_task_count`，不再由 PA 任务拓扑推导。
+
+代码边界也按这三层收敛：`shared_exec_protocol.h` 保存算子无关的 execution
+状态、payload 与 route；`a5_exec_policy.h` 只实现当前 A5 单 lane 的
+32/64 worker、K2 候选和 owner eligibility；`pa_exec_adapter.h` 只解释 PA
+function 与参数。A5 placement 不再读取 `kMaxTasks` 或 PA task kind，计划
+容量由 dispatch 解码层独立拒绝。以后接入 Joint、固定 block affinity 或
+multicore task 时，应替换/扩展后端 placement，而不是向 PA adapter 增加分支。
 
 首版可以在 standalone PA 上缩小验证范围，但协议字段和失败检查必须为通用算子留出明确扩展点。K2、双 token 和 no-reclaim 都是必须显式选择的调度/生命周期能力，不是 PA 身份带来的默认事实。PA adapter 特例不能进入通用 shared execution runtime。
 

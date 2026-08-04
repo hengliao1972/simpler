@@ -112,8 +112,13 @@ bool TaskExecutionCandidates(
         return false;
     }
     cross_core::PaExecRoute route{};
-    if (!cross_core::ResolvePaExecRoute(meta.kind, FunctionId(meta.kind), route) ||
-        !cross_core::FixedPaExecuteCandidates(identity.task_id, route.engine_class, primary, secondary) ||
+    if (!cross_core::ResolvePaExecRoute(
+            meta.kind, FunctionId(meta.kind), route
+        ) ||
+        !cross_core::A5SingleLaneExecuteCandidates(
+            identity.task_id, route.engine_class,
+            primary, secondary
+        ) ||
         primary == secondary) {
         return false;
     }

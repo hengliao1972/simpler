@@ -535,7 +535,7 @@ bool SelectTestExecutor(
     PaExecRoute route{};
     execute_owner = kExecUnboundOwner;
     if (!ResolvePaExecRoute(kind, FunctionId(kind), route) ||
-        !FixedPaExecuteCandidates(
+        !A5SingleLaneExecuteCandidates(
             task_id, route.engine_class, primary, secondary
         )) {
         return false;
@@ -544,8 +544,8 @@ bool SelectTestExecutor(
     // 生产 owner 仲裁策略。builder 在 K2 外时选 primary，
     // builder 占用 primary 时选 secondary。
     execute_owner = build_owner == primary ? secondary : primary;
-    return PaBuildOwnerEligible(build_owner, route.engine_class) &&
-           PaExecuteOwnerEligible(
+    return A5SingleLaneBuildOwnerEligible(build_owner, route.engine_class) &&
+           A5SingleLaneExecuteOwnerEligible(
                task_id, build_owner, route.engine_class, execute_owner
            );
 }
@@ -568,7 +568,7 @@ bool FindSameEngineNonCandidate(
     owner = kExecUnboundOwner;
     for (uint32_t worker_id = 0; worker_id < kWorkers; ++worker_id) {
         if (worker_id != primary && worker_id != secondary &&
-            PaExecOwnerMatchesEngine(worker_id, engine)) {
+            A5SingleLaneOwnerMatchesEngine(worker_id, engine)) {
             owner = worker_id;
             return true;
         }
@@ -598,7 +598,7 @@ bool SetTerminalKernelCell(
     const uint32_t execute_owner =
         requested_execute_owner == kExecUnboundOwner
             ? selected_execute_owner : requested_execute_owner;
-    if (!PaExecuteOwnerEligible(
+    if (!A5SingleLaneExecuteOwnerEligible(
             task_id, build_owner, route.engine_class, execute_owner
         )) {
         return false;
@@ -652,7 +652,7 @@ void TestPotentialSlotRoundTrip() {
         for (ExecEngineClass engine : kEngines) {
             uint32_t primary = kExecUnboundOwner;
             uint32_t secondary = kExecUnboundOwner;
-            all_ok &= FixedPaExecuteCandidates(
+            all_ok &= A5SingleLaneExecuteCandidates(
                 task_id, engine, primary, secondary
             );
             for (uint32_t worker_id :
@@ -751,7 +751,7 @@ void TestDynamicExecutorEligibility() {
         all_ok &= ResolvePaExecRoute(
                       kind, FunctionId(kind), route
                   ) &&
-            FixedPaExecuteCandidates(
+            A5SingleLaneExecuteCandidates(
                 task_id, route.engine_class, primary, secondary
             ) &&
             FindSameEngineNonCandidate(
@@ -764,44 +764,44 @@ void TestDynamicExecutorEligibility() {
         // S5b 允许任意有效 Scalar 构建。Build owner 是
         // primary/secondary 时只剩另一候选合法；在 K2 外
         // 时两候选都可参加 CAS。
-        all_ok &= PaBuildOwnerEligible(primary, route.engine_class) &&
-            PaBuildOwnerEligible(secondary, route.engine_class) &&
-            PaBuildOwnerEligible(outside, route.engine_class) &&
-            PaExecOwnerMatchesEngine(primary, route.engine_class) &&
-            PaExecOwnerMatchesEngine(secondary, route.engine_class) &&
-            PaExecOwnerMatchesEngine(outside, route.engine_class) &&
-            !PaExecuteOwnerEligible(
+        all_ok &= A5SingleLaneBuildOwnerEligible(primary, route.engine_class) &&
+            A5SingleLaneBuildOwnerEligible(secondary, route.engine_class) &&
+            A5SingleLaneBuildOwnerEligible(outside, route.engine_class) &&
+            A5SingleLaneOwnerMatchesEngine(primary, route.engine_class) &&
+            A5SingleLaneOwnerMatchesEngine(secondary, route.engine_class) &&
+            A5SingleLaneOwnerMatchesEngine(outside, route.engine_class) &&
+            !A5SingleLaneExecuteOwnerEligible(
                 task_id, primary, route.engine_class, primary
             ) &&
-            PaExecuteOwnerEligible(
+            A5SingleLaneExecuteOwnerEligible(
                 task_id, primary, route.engine_class, secondary
             ) &&
-            PaExecuteOwnerEligible(
+            A5SingleLaneExecuteOwnerEligible(
                 task_id, secondary, route.engine_class, primary
             ) &&
-            !PaExecuteOwnerEligible(
+            !A5SingleLaneExecuteOwnerEligible(
                 task_id, secondary, route.engine_class, secondary
             ) &&
-            PaExecuteOwnerEligible(
+            A5SingleLaneExecuteOwnerEligible(
                 task_id, outside, route.engine_class, primary
             ) &&
-            PaExecuteOwnerEligible(
+            A5SingleLaneExecuteOwnerEligible(
                 task_id, outside, route.engine_class, secondary
             ) &&
-            !PaExecuteOwnerEligible(
+            !A5SingleLaneExecuteOwnerEligible(
                 task_id, outside, route.engine_class, outside
             );
 
         const uint32_t cross_role =
             route.engine_class == ExecEngineClass::Aic
                 ? kAivBuildOwner : kAicBuildOwner;
-        all_ok &= PaBuildOwnerEligible(
+        all_ok &= A5SingleLaneBuildOwnerEligible(
                       cross_role, route.engine_class
                   ) &&
-            PaExecuteOwnerEligible(
+            A5SingleLaneExecuteOwnerEligible(
                 task_id, cross_role, route.engine_class, primary
             ) &&
-            PaExecuteOwnerEligible(
+            A5SingleLaneExecuteOwnerEligible(
                 task_id, cross_role, route.engine_class, secondary
             );
     }
@@ -850,7 +850,7 @@ void TestSubmitCloseRegistersOnlyCandidates() {
             all_ok &= ResolvePaExecRoute(
                           kind, FunctionId(kind), route
                       ) &&
-                FixedPaExecuteCandidates(
+                A5SingleLaneExecuteCandidates(
                     task_id, route.engine_class, primary, secondary
                 );
         }
@@ -1077,7 +1077,7 @@ void TestArbitraryBuildOwnerCandidateBehavior() {
         all_ok &= ResolvePaExecRoute(
                       kind, FunctionId(kind), route
                   ) &&
-            FixedPaExecuteCandidates(
+            A5SingleLaneExecuteCandidates(
                 task_id, route.engine_class, primary, secondary
             ) &&
             FindSameEngineNonCandidate(
@@ -1096,7 +1096,7 @@ void TestArbitraryBuildOwnerCandidateBehavior() {
         for (uint32_t build_owner : std::array<uint32_t, 4>{
                  primary, secondary, outside, opposite_role
              }) {
-            all_ok &= PaBuildOwnerEligible(
+            all_ok &= A5SingleLaneBuildOwnerEligible(
                 build_owner, route.engine_class
             );
             for (ExecPhase phase : std::array<ExecPhase, 2>{
@@ -1216,10 +1216,10 @@ void RunDynamicCandidateFirstCase(
     bool all_ok = ResolvePaExecRoute(
                       kKind, FunctionId(kKind), route
                   ) &&
-        FixedPaExecuteCandidates(
+        A5SingleLaneExecuteCandidates(
             kTask, route.engine_class, primary, secondary
         ) &&
-        PaBuildOwnerEligible(
+        A5SingleLaneBuildOwnerEligible(
             build_owner, route.engine_class
         );
     MappedSchedulerState mapping;

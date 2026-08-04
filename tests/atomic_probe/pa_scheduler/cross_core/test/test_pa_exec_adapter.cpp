@@ -26,6 +26,7 @@
 #define PA_DEVICE inline
 #define PA_GM
 #include "pa_exec_adapter.h"
+#include "a5_exec_policy.h"
 
 namespace {
 
@@ -96,7 +97,7 @@ bool TestExecuteCandidateEligibility() {
              task_id < kRoutingPeriod; ++task_id) {
             uint32_t primary = kExecUnboundOwner;
             uint32_t secondary = kExecUnboundOwner;
-            const bool candidates_ok = FixedPaExecuteCandidates(
+            const bool candidates_ok = A5SingleLaneExecuteCandidates(
                 task_id, engine, primary, secondary
             );
             exact &= candidates_ok &&
@@ -120,14 +121,14 @@ bool TestExecuteCandidateEligibility() {
             // “匹配 engine 的 K2 候选且不是 builder”。
             for (uint32_t build_owner = 0;
                  build_owner < kWorkers; ++build_owner) {
-                exact &= PaBuildOwnerEligible(build_owner, engine);
+                exact &= A5SingleLaneBuildOwnerEligible(build_owner, engine);
                 for (uint32_t execute_owner = 0;
                      execute_owner < kWorkers; ++execute_owner) {
                     const bool expected =
                         execute_owner != build_owner &&
                         (execute_owner == primary ||
                          execute_owner == secondary);
-                    exact &= PaExecuteOwnerEligible(
+                    exact &= A5SingleLaneExecuteOwnerEligible(
                         task_id, build_owner, engine, execute_owner
                     ) == expected;
                 }
@@ -136,13 +137,13 @@ bool TestExecuteCandidateEligibility() {
     }
     for (uint32_t owner = 0; owner < kWorkers; ++owner) {
         exact &= candidate_destinations[owner];
-        exact &= PaExecOwnerMatchesEngine(
+        exact &= A5SingleLaneOwnerMatchesEngine(
                      owner,
                      owner < kAicWorkers
                          ? ExecEngineClass::Aic
                          : ExecEngineClass::Aiv
                  );
-        exact &= !PaExecOwnerMatchesEngine(
+        exact &= !A5SingleLaneOwnerMatchesEngine(
                      owner,
                      owner < kAicWorkers
                          ? ExecEngineClass::Aiv
@@ -152,104 +153,103 @@ bool TestExecuteCandidateEligibility() {
 
     uint32_t primary = 0;
     uint32_t secondary = 0;
-    exact &= !FixedPaExecuteCandidates(
+    exact &= !A5SingleLaneExecuteCandidates(
                  7, ExecEngineClass::None, primary, secondary
              ) &&
              primary == kExecUnboundOwner &&
              secondary == kExecUnboundOwner;
-    exact &= !FixedPaExecuteCandidates(
+    exact &= !A5SingleLaneExecuteCandidates(
                  7, ExecEngineClass::Joint, primary, secondary
              ) &&
              primary == kExecUnboundOwner &&
              secondary == kExecUnboundOwner;
-    exact &= !FixedPaExecuteCandidates(
+    // placement 只处理 A5 物理拓扑，不重复猜测算子的 task-plan 容量。
+    // task_id 是否越过有效计划由 dispatch 解码层独立拒绝。
+    exact &= A5SingleLaneExecuteCandidates(
                  kMaxTasks, ExecEngineClass::Aic,
                  primary, secondary
              ) &&
-             primary == kExecUnboundOwner &&
-             secondary == kExecUnboundOwner;
+             primary < kAicWorkers &&
+             secondary < kAicWorkers;
 
     uint32_t aic_primary = kExecUnboundOwner;
     uint32_t aic_secondary = kExecUnboundOwner;
     uint32_t aiv_primary = kExecUnboundOwner;
     uint32_t aiv_secondary = kExecUnboundOwner;
-    exact &= FixedPaExecuteCandidates(
+    exact &= A5SingleLaneExecuteCandidates(
         7, ExecEngineClass::Aic, aic_primary, aic_secondary
     );
-    exact &= FixedPaExecuteCandidates(
+    exact &= A5SingleLaneExecuteCandidates(
         7, ExecEngineClass::Aiv, aiv_primary, aiv_secondary
     );
 
     // Build owner 不要求匹配 engine：交叉核类型的 builder 仍可
     // 把 payload 交给合法的执行候选。
-    exact &= PaExecuteOwnerEligible(
+    exact &= A5SingleLaneExecuteOwnerEligible(
         7, kAicWorkers, ExecEngineClass::Aic, aic_primary
     );
-    exact &= PaExecuteOwnerEligible(
+    exact &= A5SingleLaneExecuteOwnerEligible(
         7, 0, ExecEngineClass::Aiv, aiv_primary
     );
-    exact &= PaBuildOwnerEligible(
+    exact &= A5SingleLaneBuildOwnerEligible(
         kAicWorkers, ExecEngineClass::Aic
     );
-    exact &= PaBuildOwnerEligible(
+    exact &= A5SingleLaneBuildOwnerEligible(
         0, ExecEngineClass::Aiv
     );
-    exact &= PaBuildOwnerEligible(
+    exact &= A5SingleLaneBuildOwnerEligible(
         0, ExecEngineClass::Aic
     );
-    exact &= PaBuildOwnerEligible(
+    exact &= A5SingleLaneBuildOwnerEligible(
         kAicWorkers, ExecEngineClass::Aiv
     );
-    exact &= !PaBuildOwnerEligible(
+    exact &= !A5SingleLaneBuildOwnerEligible(
         kWorkers, ExecEngineClass::Aic
     );
-    exact &= !PaBuildOwnerEligible(
+    exact &= !A5SingleLaneBuildOwnerEligible(
         kExecUnboundOwner, ExecEngineClass::Aiv
     );
-    exact &= !PaBuildOwnerEligible(
+    exact &= !A5SingleLaneBuildOwnerEligible(
         0, ExecEngineClass::None
     );
-    exact &= !PaBuildOwnerEligible(
+    exact &= !A5SingleLaneBuildOwnerEligible(
         0, ExecEngineClass::Joint
     );
 
-    exact &= !PaExecOwnerMatchesEngine(
+    exact &= !A5SingleLaneOwnerMatchesEngine(
         kWorkers, ExecEngineClass::Aic
     );
-    exact &= !PaExecOwnerMatchesEngine(
+    exact &= !A5SingleLaneOwnerMatchesEngine(
         kExecUnboundOwner, ExecEngineClass::Aiv
     );
-    exact &= !PaExecOwnerMatchesEngine(
+    exact &= !A5SingleLaneOwnerMatchesEngine(
         0, ExecEngineClass::None
     );
-    exact &= !PaExecOwnerMatchesEngine(
+    exact &= !A5SingleLaneOwnerMatchesEngine(
         0, ExecEngineClass::Joint
     );
-    exact &= !PaExecuteOwnerEligible(
-        kMaxTasks, 0, ExecEngineClass::Aic, aic_primary
-    );
-    exact &= !PaExecuteOwnerEligible(
+    exact &= !A5SingleLaneExecuteOwnerEligible(
         7, kWorkers, ExecEngineClass::Aic, aic_primary
     );
-    exact &= !PaExecuteOwnerEligible(
+    exact &= !A5SingleLaneExecuteOwnerEligible(
         7, kExecUnboundOwner, ExecEngineClass::Aiv, aiv_primary
     );
-    exact &= !PaExecuteOwnerEligible(
+    exact &= !A5SingleLaneExecuteOwnerEligible(
         7, 0, ExecEngineClass::Aic, kWorkers
     );
-    exact &= !PaExecuteOwnerEligible(
+    exact &= !A5SingleLaneExecuteOwnerEligible(
         7, 0, ExecEngineClass::Aiv, kExecUnboundOwner
     );
-    exact &= !PaExecuteOwnerEligible(
+    exact &= !A5SingleLaneExecuteOwnerEligible(
         7, 0, ExecEngineClass::None, aic_primary
     );
-    exact &= !PaExecuteOwnerEligible(
+    exact &= !A5SingleLaneExecuteOwnerEligible(
         7, 0, ExecEngineClass::Joint, aic_primary
     );
-    exact &= !PaExecuteOwnerEligible(
+    exact &= !A5SingleLaneExecuteOwnerEligible(
         7, aic_primary, ExecEngineClass::Aic, aic_primary
     );
-    exact &= !PaExecuteOwnerEligible(
+    exact &= !A5SingleLaneExecuteOwnerEligible(
         7, aiv_primary, ExecEngineClass::Aiv, aiv_primary
     );
     CheckMapping(
@@ -269,14 +269,14 @@ bool SelectTestExecuteOwner(
     execute_owner = kExecUnboundOwner;
     uint32_t primary = kExecUnboundOwner;
     uint32_t secondary = kExecUnboundOwner;
-    if (!FixedPaExecuteCandidates(
+    if (!A5SingleLaneExecuteCandidates(
             task_id, engine, primary, secondary
         )) {
         return false;
     }
     const uint32_t selected = primary != build_owner
         ? primary : secondary;
-    if (!PaExecuteOwnerEligible(
+    if (!A5SingleLaneExecuteOwnerEligible(
             task_id, build_owner, engine, selected
         )) {
         return false;
@@ -1043,7 +1043,7 @@ bool SelectTestBuildOwner(
 ) {
     uint32_t primary = kExecUnboundOwner;
     uint32_t secondary = kExecUnboundOwner;
-    if (!FixedPaExecuteCandidates(
+    if (!A5SingleLaneExecuteCandidates(
             shape.task_id, shape.engine, primary, secondary
         )) {
         return false;
@@ -1063,7 +1063,7 @@ bool SelectTestBuildOwner(
             build_owner = kExecUnboundOwner;
             for (uint32_t owner = 0; owner < kWorkers; ++owner) {
                 if (owner != primary && owner != secondary &&
-                    PaExecOwnerMatchesEngine(owner, shape.engine)) {
+                    A5SingleLaneOwnerMatchesEngine(owner, shape.engine)) {
                     build_owner = owner;
                     break;
                 }
@@ -1077,7 +1077,7 @@ bool SelectTestBuildOwner(
         case TaskKind::Count:
             return false;
     }
-    return PaBuildOwnerEligible(build_owner, shape.engine);
+    return A5SingleLaneBuildOwnerEligible(build_owner, shape.engine);
 }
 
 bool RunCase(SchedulerState &state, const CaseShape &shape) {
@@ -1092,7 +1092,7 @@ bool RunCase(SchedulerState &state, const CaseShape &shape) {
     Check(mapped, shape.kind, "test-only different-core owner selection");
     Check(
         build_owner_selected &&
-            PaBuildOwnerEligible(build_owner, shape.engine),
+            A5SingleLaneBuildOwnerEligible(build_owner, shape.engine),
         shape.kind, "builder is one of all 96 valid Scalar workers"
     );
     if (!mapped) {

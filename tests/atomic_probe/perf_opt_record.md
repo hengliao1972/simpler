@@ -6365,3 +6365,25 @@ no-reclaim 属于必须显式选择的生命周期能力。PA 随机构参、pay
 UP writer-group 仍是适配实现，不能以当前 PA 正确性冒充通用能力。Joint、
 固定 block/multicore 以及一个逻辑 task 多 completion 尚未闭合，接入这类算子
 前必须扩展 placement/completion 合同。完整矩阵见实现过程 S6.52。
+
+### 15.51 泛化审计：A5 单 lane placement 从 PA adapter 独立
+
+继续反查 S6.52 的三层边界后，确认 K2 候选、32/64 role 匹配、任意 Scalar
+Build eligibility 和 primary/fallback 选择都只依赖 A5 拓扑，不是 PA 业务。
+它们原先位于 `pa_exec_adapter.h` 且使用 `Pa*` 名字，功能虽然未硬编码
+Alloc/QK/SF/PV/UP，代码归属却会迫使其他算子依赖 PA adapter。
+
+本轮将这些 helper 移入 `a5_exec_policy.h`，公共 scanner/终态统一调用 A5
+策略；PA adapter 只保留 function 与 payload 解释。placement 同时删除对
+`kMaxTasks` 的容量判断，任务计划越界继续由 dispatch 层拒绝。
+
+过程中曾将 Build-owner 的显式 `switch` 化简成布尔表达式，CCEC
+热代码随即膨胀，12+12 交错 B256 中位/均值回退
+`1.655%/1.975%`。该过程改法已完整撤回，最终显式 `switch`
+与 S6.52 基线的 AIC/AIV `.text` 大小、SHA-256 逐字节一致。
+因此正式改动不改变 atomic、DCCI、状态布局、候选人口或热路径控制流。
+
+最终 CPU 全套、CCEC 两类构建、A5 B1 和 B256 full-swimlane 全部
+PASS；B256 完整周期为 `1460.694 us`。同一 A5 单 engine 合同可被其他
+算子直接复用；Joint、固定 block affinity 和 multicore 仍需新增后端策略，
+不能把当前 K2 当作全平台默认。详细取证见实现过程 S6.53。

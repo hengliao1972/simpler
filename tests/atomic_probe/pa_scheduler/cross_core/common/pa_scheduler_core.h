@@ -24,12 +24,19 @@
 #if PTO_FDWIC_SHARED_MAP
 #include "pa_shared_tensormap.h"
 #include "pa_exec_adapter.h"
+#include "a5_exec_policy.h"
 #endif
 #include "pa_trace.h"
 
 namespace pa_scheduler {
 
 #if PTO_FDWIC_SHARED_MAP
+static_assert(
+    kAicWorkers == cross_core::kA5AicScalarWorkers &&
+        kAivWorkers == cross_core::kA5AivScalarWorkers &&
+        kWorkers == cross_core::kA5ScalarWorkers,
+    "standalone worker model must match the selected A5 backend policy"
+);
 // S3b 的候选登记只是 owner-local 任务发现索引，不是共享
 // payload 或多项 execution token。固定映射下，一个 AIC worker
 // 最多命中 task_id%32 的两个余数类；AIV 的候选更少。因此只为
@@ -4247,7 +4254,7 @@ PA_DEVICE bool RegisterCrossCoreExecCandidate(
     if (!cross_core::ResolvePaExecRoute(
             kind, FunctionId(kind), route
         ) ||
-        !cross_core::FixedPaExecuteCandidates(
+        !cross_core::A5SingleLaneExecuteCandidates(
             task_id, route.engine_class, primary, secondary
         ) ||
         primary == secondary) {
@@ -4449,7 +4456,7 @@ PA_DEVICE_NOINLINE bool PublishCrossCoreExecTask(
         kind == TaskKind::Alloc || kind == TaskKind::Count ||
         function_id != FunctionId(kind) ||
         !cross_core::ResolvePaExecRoute(kind, function_id, route) ||
-        !cross_core::PaBuildOwnerEligible(
+        !cross_core::A5SingleLaneBuildOwnerEligible(
             worker_id, route.engine_class
         )) {
         PublishCrossCoreRuntimeFailure<Ops>(
@@ -4578,10 +4585,10 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
         header.task_id != token.control.task_id ||
         route.engine_class != token.control.engine_class ||
         route.engine_class != CrossCoreEngineForRole(worker.role) ||
-        !cross_core::PaBuildOwnerEligible(
+        !cross_core::A5SingleLaneBuildOwnerEligible(
             token.control.build_owner, route.engine_class
         ) ||
-        !cross_core::PaExecuteOwnerEligible(
+        !cross_core::A5SingleLaneExecuteOwnerEligible(
             header.task_id, token.control.build_owner,
             route.engine_class, worker_id
         ) ||
@@ -4863,7 +4870,7 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
         uint32_t secondary = cross_core::kExecUnboundOwner;
         if (executable) {
             executable =
-                cross_core::FixedPaExecuteCandidates(
+                cross_core::A5SingleLaneExecuteCandidates(
                     task_id, planned.engine_class,
                     primary, secondary
                 ) &&
@@ -4928,7 +4935,7 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
         }
 
         if (observed.task_id != task_id ||
-            !cross_core::PaBuildOwnerEligible(
+            !cross_core::A5SingleLaneBuildOwnerEligible(
                 observed.build_owner, route_engine
             )) {
             PublishCrossCoreRuntimeFailure<Ops>(
@@ -4994,7 +5001,7 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
             }
             uint32_t preferred_owner =
                 cross_core::kExecUnboundOwner;
-            if (!cross_core::PreferredPaExecuteOwner(
+            if (!cross_core::A5PreferredSingleLaneExecuteOwner(
                     task_id, observed.build_owner, route_engine,
                     preferred_owner
                 ) ||
@@ -5105,7 +5112,7 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
             );
             return completed_count;
         }
-        if (!cross_core::PaExecuteOwnerEligible(
+        if (!cross_core::A5SingleLaneExecuteOwnerEligible(
                 task_id, observed.build_owner, route_engine,
                 observed.execute_owner
             ) ||
@@ -5236,10 +5243,10 @@ PA_DEVICE bool ValidateCrossCoreExecTerminalCellsObserved(
                 decoded.phase == cross_core::ExecPhase::Done &&
                 decoded.task_id == task_id &&
                 decoded.engine_class == planned.engine_class &&
-                cross_core::PaBuildOwnerEligible(
+                cross_core::A5SingleLaneBuildOwnerEligible(
                     decoded.build_owner, planned.engine_class
                 ) &&
-                cross_core::PaExecuteOwnerEligible(
+                cross_core::A5SingleLaneExecuteOwnerEligible(
                     task_id, decoded.build_owner,
                     planned.engine_class, decoded.execute_owner
                 ) &&

@@ -753,8 +753,8 @@ engine 对侧，因此不会占用 K2 的任何一席；primary、secondary 都�
 - `Claim()` 只在 shared 分支交换 QK/PV、SF/UP 的候选角色和
   Tournament 分组；private 分支保持原有 engine 同角色 cursor 语义。
 - 当时新增 `PaCrossRoleBuildOwnerEligible()` 作为 S5a 阶段性拓扑策略；
-  S5b 扩到全 96 Scalar 后，该 helper 已收敛为 `PaBuildOwnerEligible()`。portable
-  `PaExecuteOwnerEligible()` 仍只要求 builder 有效、executor 匹配 engine、
+  S5b 扩到全 96 Scalar 后，该 helper 已收敛为 `A5SingleLaneBuildOwnerEligible()`。portable
+  `A5SingleLaneExecuteOwnerEligible()` 仍只要求 builder 有效、executor 匹配 engine、
   位于 K2 且不同于 builder，不把阶段性 Build 策略写死进通用 payload
   协议。
 - Build 发布入口、执行扫描、active token 和 terminal cell 都显式校验
@@ -820,7 +820,7 @@ DCCI/atomic 动态证据。
 - Alloc/QK/SF/PV/UP 的 Build Claim 统一扩为 96 个 Scalar、G8 两级
   Tournament；每个 local 节点精确对应 12 个候选核。
 - kernel 类型只决定 function 和 Execute engine，不再决定 Build owner
-  是 AIC 还是 AIV。`PaBuildOwnerEligible()` 只接受 `[0,96)` 的有效
+  是 AIC 还是 AIV。`A5SingleLaneBuildOwnerEligible()` 只接受 `[0,96)` 的有效
   Scalar；Execute 仍需匹配 engine、位于 K2 且与 builder 不同核。
 - TensorMap 严格插入顺序仍由 `deps_prepared` commit chain 保证；
   Claim 扩容没有把 metadata 插入或 kernel 执行塞入该串行链。
@@ -1475,7 +1475,7 @@ ticket 接入前的任务发现缺口；下一阶段才删除全员 replay 和�
 前提不再成立；若只替换 Claim，执行侧会漏掉没有在本核 Close 的 task。
 
 因此扩展 S6.12 的同一个 96-thread CPU 门槛，不增加第二套发放模型。每个
-worker 只持有单调 `candidate_slot`，按生产 `FixedPaExecuteCandidates()` 的
+worker 只持有单调 `candidate_slot`，按生产 `A5SingleLaneExecuteCandidates()` 的
 K2 映射枚举自己可能执行的 task，再用不可变 flat plan 判定 task kind 与
 engine：Alloc 和错角色 task 直接越过；相关 task 在 Build 发布前保留队头，
 发布后由两个候选竞争唯一 Execute owner。Build owner 若恰好属于 K2，只发布
@@ -3253,3 +3253,53 @@ K2/PA dispatch 只支持单 lane AIC 或 AIV task；需要固定 block、联合�
 
 收益来自 scanner 不再为每个候选解析 PA identity，不能外推为其他算子固定
 收益；重要结论是修正公共语义后没有性能回退，也没有增加 state 大小。
+
+## 2026-08-04：S6.53 A5 placement 策略脱离 PA 适配器
+
+S6.52 修正了公共执行器对 PA 五段任务图的真实依赖，本阶段继续审查名字和
+代码归属，确认原 `FixedPaExecuteCandidates()`、Build/Execute owner
+eligibility 及 preferred/fallback 选择虽然不读取 task kind，却全部放在
+`pa_exec_adapter.h` 并使用 `Pa*` 命名。这会把 A5 物理拓扑策略误写成 PA
+业务规则，使其他算子要么依赖 PA adapter，要么复制同一套 K2 逻辑。
+
+本阶段新增 `a5_exec_policy.h`，把以下合同完整移到 A5 后端层：
+
+- 32 个 AIC Scalar、64 个 AIV Scalar 及 AIV 双 lane 编号；
+- task-id 到 primary/secondary 的 K2 映射；
+- 任意有效 Scalar 都可 Build 单 engine portable payload；
+- Execute owner 必须匹配 engine、位于 K2 且不同于 Build owner；
+- primary 与 Build owner 重合时改选 secondary 的稳定首选规则。
+
+新策略不再读取 standalone 的 `kMaxTasks`。task-id 是否属于已发布计划由
+dispatch 层独立验证；placement 对任意 task-id 只回答物理落点。公共 scanner、
+active token 和终态 validator 均调用 A5 策略，PA adapter 只剩 function、
+TensorDesc/scalar/fanin payload 的构造和执行解释。Joint、固定 block affinity
+与 multicore task 继续明确拒绝，未来必须选择另一份 placement 合同，不能
+伪装为当前单 lane K2。
+
+实现中曾尝试把 Build-owner 的显式 `switch` 化简为
+`engine == Aic || engine == Aiv`。两者的 C++ 语义等价，但 CCEC 产生了
+不同的热路径代码：AIC/AIV `.text` 由 `147008/149204 B`
+增至 `148448/149972 B`。12+12 交错 A5 B256 中，该过程候选相对
+S6.52 冻结基线中位回退 `1.655%`、均值回退 `1.975%`，只有
+2/12 对更快。因此完整撤回布尔化简，最终 A5 策略仍保留原显式
+`switch` 机器码形状；这不是业务特判，而是 CCEC 代码生成约束。
+
+最终代码不改变 state、atomic、DCCI、候选人口或热路径控制流。
+以 S6.52 冻结 ELF 为基线，重新提取 perf-clock `.text`：
+
+```text
+                 bytes    SHA-256
+AIC baseline/new 146496   0946ca406de36e533f77b6c14eb124a3cb3a65d46c7dce903c9e60fe8bd0c1ac
+AIV baseline/new 149048   350e9fc0a2979b69cf2da118fd191b256d95aa96b1a9da99fb3031df62c5c023
+```
+
+两类核的新旧 `.text` 均逐字节一致，说明最终分层只改善代码归属，
+没有把过程回退带入正式路径。验证结果：
+
+- CPU 全套协议测试 PASS，包含超出 PA 计划容量仍可做 A5 物理映射的边界断言；
+- CCEC perf-clock/full-swimlane 均构建 PASS，finish relocation 继续精确为
+  perf-clock AIC/AIV `3/4`、full-swimlane `5/3`；
+- A5 B1 从 startup 到 FinalDrain 结束为 `219.311 us`，全部语义断言 PASS；
+- A5 B256 full-swimlane 完整周期为 `1460.694 us`，1,280 个 Build、1,024 个
+  kernel、K2 owner、TensorMap 与终态计数全部闭合，无 trace drop。
