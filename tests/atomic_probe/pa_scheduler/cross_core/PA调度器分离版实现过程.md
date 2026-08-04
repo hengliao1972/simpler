@@ -3085,3 +3085,31 @@ candidate mean   回退 0.006589 ms / 0.458%
 候选提供稳定收益，也就没有理由删除生产者侧的非法重复发布检测。
 候选已完整撤回，`SharedOutputPublishedExchange` 继续使用返回值验证
 旧状态为 `-1`。
+
+## 2026-08-04：S6.50 用完整周期复审 unique-ticket 单 CAS Build（仍不保留）
+
+S6.21 曾利用中央 ticket 保证每 task 唯一 builder，省略
+`EMPTY -> BUILDING` CAS，在 payload DCCI/DSB 后只做一次
+`EMPTY -> BUILT` CAS。该协议上的发布边界曾经通过隔离暂停点、CCEC IR
+和 A5 正确性验证：executor 在唯一 CAS 前只能看见 `EMPTY`，不会读取
+半包。但旧底座上它的完整周期和 WinnerBuild 局部数据均回退。
+
+本轮在 S6.46 底座上重建正式无泳道实例，保留通用 helper 的默认双 CAS
+语义，CCEC perf-clock 构建和 Atomic/DCCI 源码门槛 PASS。以提交
+`253a2e8a` 冻结基线，按 B-C/C-B 交错各运行 12 个 A5 B256
+trace-free 进程：
+
+```text
+S6.46 frozen baseline: min / median / max / mean
+                       1.416851 / 1.431355 / 1.504823 / 1.441326 ms
+S6.50 candidate      : min / median / max / mean
+                       1.405064 / 1.440325 / 1.493713 / 1.440203 ms
+candidate median 回退 0.008971 ms / 0.627%
+candidate mean   改善 0.001123 ms / 0.078%
+```
+
+候选只有 5/12 对更快，中位数和均值方向相反；均值差仅 `0.078%`，
+不能推翻旧泳道中 WinnerBuild 局部回退 `2.202%` 的证据。候选已完整
+撤回，当前继续使用通用 `EMPTY -> BUILDING -> BUILT` 双 CAS 状态机。
+这一结论只针对当前 A5、payload 布局和并发相位，不否定单 CAS 作为其他
+硬件/负载的显式可选实例。
