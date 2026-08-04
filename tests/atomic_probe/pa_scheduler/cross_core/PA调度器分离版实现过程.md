@@ -4547,3 +4547,125 @@ S6.68 dual ticket:      min / median / max / mean
 AIC/AIV 双中央 Execute ticket，并把当前可信端到端水平更新为约 `1.28 ms`。
 距离 `1 ms` 目标仍约 `0.28 ms`；下一阶段必须以新泳道重新挑选大头，不再对
 已经退出生产路径的 K2 scanner 做局部优化。
+
+## 2026-08-04：S6.69-a 用现有泳道证明两 token 容量持续饱和
+
+本阶段先不改 device 代码，也不新增 raw 记录。以 S6.68-c 的 B256
+full-swimlane 为唯一取证样本，按同一 Scalar 轨道上的
+`shared_exec_dispatch_ticket` 、首次 `shared_exec_cell_state_load#task`
+和 `shared_exec_done_publish#task` 重建 token 生命期。重建结果为：
+
+```text
+有效 Execute ticket / 唯一 task / DONE   1024 / 1024 / 1024
+角色表越界 ticket                          96
+曾达到两 token 同时占用的 worker        96 / 96
+每核双槽占满时间 total / median / p95 / max
+  94047.639 / 1002.686 / 1133.785 / 1186.951 us
+ticket -> DONE 生命期 median / p95 / max
+  203.206 / 370.767 / 529.046 us
+EfDrain / FinalDrain kernel                  793 / 231
+```
+
+上述一一配对还反向确认了重建算法没有把 96 次越界取票冒充为
+task。两槽并非只在少数尾部时刻偶然打满，而是每个 worker 在本轮的
+大部分生命周期中都受到两槽前视上限。同时，严格 Register 链的 task 0
+到 task 1279 时间仍约为 `928.815 us`，所以扩槽不能删除 TensorMap
+保序工作；它只可能把更多独立 batch 的 task 提前带入 owner-local 等待集合，
+减少队首未 ready 导致的角色执行能力空置。
+
+因此下一个单变量候选是把 owner-local token 容量从 2 增到 3。候选不改
+Build/Execute owner 关系、两条角色 ticket、TensorMap 严格插入、payload
+DCCI、fanin 或 completion 合同。先补 CPU 的容量/交错证明和 CCEC 门槛，再用
+A5 B256 startup→FinalDrain 冻结 A/B 裁决；在此之前不宣称收益，状态为
+**NOT RUN**。
+
+## 2026-08-04：S6.69-b 实现三 token 有界前视并闭合正确性
+
+本阶段只把 `kExecTokensPerWorker` 从 2 扩为 3，未改变任务发放、
+TensorMap 严格插入、payload publish/acquire、fanin 和 completion 合同。
+这是固定有界前视，不是无界 pending list：三个 token 占满后不得取
+第四张 Execute ticket，但 worker 仍可完成一张已领取的 Build ticket。
+
+实现同步修正了两处非 PA 特例的通用门槛：
+
+- shared host 终态不再用 same-core `kUsableSlots` 验证
+  `max_occupied`，而是与 `kExecTokensPerWorker` 同源；private 路径仍保持
+  原来的 slot 上界；
+- `CrossCoreExecStateBytes()` 精确大小由 `19382656 B` 更新为
+  `19437952 B`，增量精确是 `96 * sizeof(ExecutionToken) = 55296 B`。
+
+CPU 定向用例新增 B2 交错：AIC worker 依次取得 task `1/3/6`，三个
+cell 均未发布时精确占用三个 `WAITING_BUILT` token；再调度一次时
+cursor 不前进，证明三槽背压阻止了第四张 ticket。完整 CPU B1/B256
+同时通过：
+
+```text
+Build task / kernel                 1280 / 1024
+Execute ticket                      1120
+strict insert / role / payload      PASS
+exactly-once / FinalDrain           PASS
+```
+
+CCEC perf-clock 构建通过既有精确门槛，关键 relocation 次数不变；
+A5 B1 的 5 task、4 kernel、ABI、角色、payload、严格插入和 FinalDrain
+全部 PASS。不以 B1 时间裁决 B256 性能。
+
+## 2026-08-04：S6.69-c 冻结 A/B 验收三 token
+
+为避免重新编译和运行顺序污染，双 token 基线在临时 detached
+worktree 固定为 `21dc431d`，候选为同一基线上只扩三 token 的独立
+CCEC perf-clock ELF。两边各运行 12 个独立 A5 B256 real-compute
+`6,28,4,1` 进程，以 B-C/C-B 反转顺序交错，统一统计最早 startup
+起点到最后 FinalDrain 结束：
+
+```text
+双 token B (us):
+1297.729 1266.810 1291.961 1297.784 1328.543 1316.298
+1320.334 1296.556 1280.142 1304.734 1312.668 1282.044
+
+三 token C (us):
+1219.464 1253.595 1252.318 1215.192 1231.329 1225.622
+1242.513 1243.868 1236.379 1261.840 1213.763 1215.660
+
+B min / median / max / mean
+  1.266810 / 1.297757 / 1.328543 / 1.299634 ms
+C min / median / max / mean
+  1.213763 / 1.233854 / 1.261840 / 1.234295 ms
+
+独立中位数改善 = 63.9025 us / 4.924%
+独立均值改善   = 65.3383 us / 5.027%
+配对 B-C 收益中位数 = 72.1025 us
+三 token 获胜             = 12 / 12 对
+```
+
+FinalDrain kernel 中位数由 `188` 降到 `125`，取值范围由
+`166–200` 收窄到 `116–135`。这与“第三槽减少队头未 ready 时的
+角色执行能力空置”预期一致；不是把 FinalDrain 排除出性能分母。
+
+三 token full-swimlane 的完整 lifecycle 为 `1.183392 ms`，EfDrain/
+FinalDrain kernel 为 `915/109`，全部业务、终态和 trace 断言 PASS。
+该单次观察数只用于归因，不与无观察冻结 A/B 的绝对时间相减。
+
+两份 full-swimlane 进一步闭合了改动边界：
+
+```text
+                                      双 token        三 token
+严格 Register task0->1279       928.815 us      926.760 us
+生产 DCCI calls / lines           6240/33056      6240/33056
+atomic logical calls                    118778          93383
+cell-state load                           1677           3419
+fanin batched poll                       16660           5444
+insert-predecessor batched poll          73687          57695
+```
+
+生产 DCCI 的 7 个类别也逐项完全相同，包括 payload flush/acquire、
+SharedOutput descriptor/history 和 startup config。三 token 确实为更多 cell-state
+观察付出 `+1742` 次，但将被阻塞调度中的 fanin/插入前驱轮询减少
+得更多。Register 关键链和 DCCI 不变，说明没有删除 TensorMap 严格插入
+或跨核 payload 内存合同换取性能。
+
+CCEC 混合 ELF `.text` 从 `299064 B` 增到 `300344 B`，增加 `1280 B`；
+AIC/AIV finish symbol 仍分别为 `31188/32136 B`。结合 12/12 配对获胜、
+精确终态、Register/DCCI 不回退和可接受的内存/代码增量，本阶段
+正式保留三 token。它只依赖“中央唯一 Execute ticket + owner-local 有界前视”
+通用协议，没有引入 PA task kind、batch 或固定 DAG 特例。

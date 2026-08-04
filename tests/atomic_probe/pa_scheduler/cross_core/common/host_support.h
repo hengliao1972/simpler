@@ -1263,12 +1263,11 @@ inline constexpr size_t CrossCoreExecStateBytes() {
     return kCrossCoreExecStateBytes;
 }
 static_assert(
-    // 192 个 owner-local token 已删除各自从未被正式路径使用的
-    // 4352B 私有 payload：20183232 - 192 * 4352 = 19347648。
-    // 双中央 Execute ticket 追加 35008B：两条 64B cursor、1 条 64B
-    // header，以及 AIC/AIV 各 4352 个 uint32 task id。task-indexed
-    // SharedExecCell payload 和其 DCCI 发布边界保持不变。
-    CrossCoreExecStateBytes() == 19382656,
+    // S6.63 两 token 删除废弃私有 payload 后为 19347648B；
+    // 双中央 Execute ticket 追加 35008B。S6.69 三 token 正式配置再追加
+    // 96 * sizeof(ExecutionToken) = 55296B。task-indexed payload 和其
+    // DCCI 发布边界保持不变。
+    CrossCoreExecStateBytes() == 19437952,
     "cross-core execution state transfer size changed"
 );
 static_assert(
@@ -5498,10 +5497,13 @@ inline Metrics Validate(
         worker_shape_ok &= result.submits <= task_count;
         worker_shape_ok &= result.claim_wins == result.submits;
         worker_shape_ok &= result.claim_attempts == result.submits + 1U;
+        worker_shape_ok &=
+            result.max_occupied <=
+                cross_core::kExecTokensPerWorker;
 #else
         worker_shape_ok &= result.submits == task_count;
-#endif
         worker_shape_ok &= result.max_occupied <= kUsableSlots;
+#endif
         worker_shape_ok &= result.final_occupied == 0;
         submit_timestamps_ok &= result.submit_begin != 0;
 #if PA_BUILD_PERF_CLOCK

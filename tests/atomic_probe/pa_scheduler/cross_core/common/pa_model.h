@@ -2200,7 +2200,7 @@ struct alignas(64) SchedulerState {
     // S3 构建/执行分离状态只追加在既有 standalone sidecar 尾部：
     // production prefix、WorkerResult、shared TensorMap 与 Claim Tournament
     // 的所有既有 offset 均保持不动。每个 task 使用 fresh cell，不发生
-    // 取模复用；每个 worker 固定持有两个 executor-private token。
+    // 取模复用；每个 worker 持有编译期固定数量的 executor-private token。
     cross_core::SharedExecFatalControl exec_fatal;
     cross_core::SharedExecDrainControl exec_drain;
     cross_core::SharedExecCell exec_cells[kMaxTasks];

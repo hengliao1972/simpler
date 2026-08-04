@@ -4717,7 +4717,8 @@ PA_DEVICE bool ProgressCrossCoreOwnedTokens(
     uint32_t &completed_count
 ) {
     // 固定按 token 号检查，但只要后一个 token 的完成可能解开前一个
-    // token，就再扫一轮。两个同步 token 最多各完成一次，因此循环有界。
+    // token，就再扫一轮。每个同步 token 在本次调用中最多完成一次，
+    // 循环上界由 kExecTokensPerWorker 给出。
     bool completed_in_round = false;
     do {
         completed_in_round = false;
@@ -6578,7 +6579,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     }
 
     // shared 的中央 ticket 循环保证每个 worker 只有在拿到越界 ticket
-    // 后才进入这里；执行排空到达又要求本核扫描完全部候选、两个 token
+    // 后才进入这里；执行排空到达又要求本核取完本角色全部 ticket、所有 token
     // 完整复位。因而 shared 可以直接用更强的执行排空汇合收口，不再先做
     // 一遍 ReplayDone 树。private 仍保留原 replay barrier 协议。
     // 成功路径复用 orchestration end 作为 final drain start，使两个业务父区间

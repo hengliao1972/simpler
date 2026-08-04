@@ -710,28 +710,15 @@ void TestDualTicketWaitingBuiltAndOwnerIndependence() {
         state->exec_tokens[kExecutor][1].control;
     Check(
         empty_progress == 0 &&
-            state->exec_dispatch.aic_next.value == 2 &&
+            state->exec_dispatch.aic_next.value == 3 &&
             first_wait.phase == ExecTokenPhase::WaitingBuilt &&
             first_wait.task_id == 1 &&
             second_wait.phase == ExecTokenPhase::WaitingBuilt &&
             second_wait.task_id == 3 &&
-            stats.max_occupied == 2 && NoFatal(*state),
+            stats.max_occupied == 2 &&
+            stats.exec_dispatch_exhausted == 1 && NoFatal(*state),
         kTest,
         "two tokens retain unique tickets without reading unpublished payload"
-    );
-
-    const uint32_t no_third_ticket =
-        ProgressCrossCoreExec<ExecScanTestOps>(
-            state, worker, 5, false,
-            DrainPlace::EfDrain, stats
-        );
-    Check(
-        no_third_ticket == 0 &&
-            state->exec_dispatch.aic_next.value == 2 &&
-            !CrossCoreExecWorkerDrained(
-                state, worker, 5, stats
-            ) && NoFatal(*state),
-        kTest, "two occupied tokens prevent a third Execute ticket"
     );
 
     Check(
@@ -793,6 +780,66 @@ void TestDualTicketWaitingBuiltAndOwnerIndependence() {
     std::printf("[PASS] %s\n", kTest);
 }
 
+void TestThreeBlockedTokensBoundLookahead() {
+    constexpr const char *kTest =
+        "three-blocked-tokens-bound-lookahead";
+    MappedSchedulerState mapping;
+    SchedulerState *state = mapping.Get();
+    Check(state != nullptr, kTest, "state mapping");
+    if (state == nullptr) return;
+    LimitDefaultPlanToBatches(*state, 2);
+
+    constexpr uint32_t kExecutor = 0;
+    WorkerState &worker = PrepareWorker(
+        *state, kExecutor, CoreRole::Aic
+    );
+    LocalStats stats{};
+    InitLocalStats(stats, kExecutor, CoreRole::Aic);
+    ExecScanTestOps::ResetObservations();
+
+    const uint32_t first_progress =
+        ProgressCrossCoreExec<ExecScanTestOps>(
+            state, worker, 10, false,
+            DrainPlace::EfDrain, stats
+        );
+    Check(
+        first_progress == 0 &&
+            state->exec_dispatch.aic_next.value == 3 &&
+            stats.max_occupied == 3 &&
+            stats.exec_dispatch_exhausted == 0 &&
+            state->exec_tokens[kExecutor][0].control.phase ==
+                ExecTokenPhase::WaitingBuilt &&
+            state->exec_tokens[kExecutor][0].control.task_id == 1 &&
+            state->exec_tokens[kExecutor][1].control.phase ==
+                ExecTokenPhase::WaitingBuilt &&
+            state->exec_tokens[kExecutor][1].control.task_id == 3 &&
+            state->exec_tokens[kExecutor][2].control.phase ==
+                ExecTokenPhase::WaitingBuilt &&
+            state->exec_tokens[kExecutor][2].control.task_id == 6 &&
+            NoFatal(*state),
+        kTest,
+        "three unpublished tasks occupy three unique owner-local tokens"
+    );
+
+    const uint32_t capacity_limited_progress =
+        ProgressCrossCoreExec<ExecScanTestOps>(
+            state, worker, 10, false,
+            DrainPlace::EfDrain, stats
+        );
+    Check(
+        capacity_limited_progress == 0 &&
+            state->exec_dispatch.aic_next.value == 3 &&
+            stats.max_occupied == 3 &&
+            stats.exec_dispatch_exhausted == 0 &&
+            !CrossCoreExecWorkerDrained(
+                state, worker, 10, stats
+            ) && NoFatal(*state),
+        kTest,
+        "three occupied tokens prevent a fourth Execute ticket"
+    );
+    std::printf("[PASS] %s\n", kTest);
+}
+
 void TestDualTicketDuplicateConsumerFailsClosed() {
     constexpr const char *kTest =
         "dual-ticket-duplicate-consumer-fails-closed";
@@ -849,6 +896,7 @@ void TestDualTicketDuplicateConsumerFailsClosed() {
 int main() {
     TestDualTicketRoleDistribution();
     TestDualTicketWaitingBuiltAndOwnerIndependence();
+    TestThreeBlockedTokensBoundLookahead();
     TestDualTicketDuplicateConsumerFailsClosed();
     TestDrainCompletionCountMismatchFailsClosed();
     TestDrainUsesPublishedExecutableTaskCount();
