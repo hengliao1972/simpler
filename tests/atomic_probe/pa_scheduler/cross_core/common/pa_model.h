@@ -758,7 +758,7 @@ enum class AtomicSite : uint32_t {
     SharedHeapCursorReserve = 17,
     SharedHeapVendAdvance = 18,
     // shared Register 的 insert-turn 等待只按一次 Wait episode 聚合，
-    // 不为循环内每次 Load 写 raw；handoff CAS 则保留一条 return-ready。
+    // 不为循环内每次 Load 写 raw；handoff FetchAdd 只保留 source-issue。
     SharedInsertTurnPoll = 19,
     SharedInsertTurnHandoff = 20,
     // shared 正式 Submit 中原先绕过 TraceAtomic* 的固定调用点。读取类按
@@ -898,6 +898,7 @@ PA_MODEL_INLINE constexpr AtomicOp AtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::SharedHeapCursorReserve:
         case AtomicSite::SharedHeapVendAdvance:
         case AtomicSite::SharedBuildDispatchTicket:
+        case AtomicSite::SharedInsertTurnHandoff:
         case AtomicSite::SharedExecDrainArrive:
             return AtomicOp::FetchAdd;
         case AtomicSite::FatalSet:
@@ -908,7 +909,6 @@ PA_MODEL_INLINE constexpr AtomicOp AtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::ClaimMax:
         case AtomicSite::FrontierMax:
             return AtomicOp::FetchMax;
-        case AtomicSite::SharedInsertTurnHandoff:
         case AtomicSite::SharedMetadataLastWriterCommit:
         case AtomicSite::SharedClaimTournamentLocal:
         case AtomicSite::SharedClaimTournamentRoot:
@@ -943,6 +943,7 @@ PA_MODEL_INLINE constexpr bool AtomicSiteResultUsed(AtomicSite site) {
         case AtomicSite::SharedOutputRollbackExchange:
         case AtomicSite::SharedExecCompletionVendPublish:
         case AtomicSite::SharedExecDrainReleasePublish:
+        case AtomicSite::SharedInsertTurnHandoff:
             return false;
         case AtomicSite::StartupPoll:
         case AtomicSite::FatalPoll:
@@ -959,7 +960,6 @@ PA_MODEL_INLINE constexpr bool AtomicSiteResultUsed(AtomicSite site) {
         case AtomicSite::SharedHeapCursorReserve:
         case AtomicSite::SharedHeapVendAdvance:
         case AtomicSite::SharedInsertTurnPoll:
-        case AtomicSite::SharedInsertTurnHandoff:
         case AtomicSite::SharedWinnerFatalGuardLoad:
         case AtomicSite::SharedMetadataFatalGuardLoad:
         case AtomicSite::SharedFaninOutputPublishedLoad:
@@ -1086,6 +1086,17 @@ PA_MODEL_INLINE constexpr bool DcciSiteIsSharedOnly(DcciSite site) {
                    DcciSite::SharedExecBuildSourceDescriptorInvalidate
                );
 }
+
+#if PTO_FDWIC_SHARED_MAP
+// task-specific 初值让唯一 owner 可以用非返回型 FetchAdd(+1) 发布完成，
+// 同时保留重复发布可检错性：合法终值严格等于 task_id，重复一次则为
+// task_id+1。该值只用于 atomic-only TaskCell，不参与普通 store/DCCI。
+PA_MODEL_INLINE constexpr int64_t SharedInsertCompletionInitialValue(
+    uint32_t task_id
+) {
+    return static_cast<int64_t>(task_id) - 1;
+}
+#endif
 
 static_assert(
     AtomicSiteIsSharedOnly(AtomicSite::SharedInsertTurnPoll) &&
@@ -1462,9 +1473,10 @@ struct alignas(64) TaskCell {
     volatile int64_t flag;
     volatile uint64_t vend;
 #if PTO_FDWIC_SHARED_MAP
-    // shared 热路径把该字作为 per-task TensorMap 插入完成原子：初值
-    // -1，task N 的唯一 Claim owner 完成 writer 元数据发布后用 CAS
-    // 写成 N；N+1 owner 只轮询这一字。它与 flag/vend 共处 TaskCell，
+    // shared 热路径把该字作为 per-task TensorMap 插入完成原子：task N
+    // 的初值是 N-1，唯一 Build owner 完成 writer 元数据发布后只发射
+    // FetchAdd(+1) 写成 N；N+1 owner 只轮询这一字。重复发布会把它推进
+    // 到 N+1，由下一 owner 或 host 终态检查拒绝。它与 flag/vend 共处 TaskCell，
     // 但当前热路径不对该 cache line 执行 DCCI。旧 writer-ready helper
     // 只供隔离协议测试，不能与本热路径混用。
     volatile int64_t deps_prepared;

@@ -429,7 +429,7 @@ def _v5_shared_register_atomic_capture(
                     19,
                 ]
             )
-        # CompareExchange(4) | result-used | return-ready。每个 task 都发布
+        # FetchAdd(2) source-issue。每个 task 都发布
         # 自己的 completion，包括没有前驱的 task 0。
         capture_rows.append(
             [
@@ -441,7 +441,7 @@ def _v5_shared_register_atomic_capture(
                 "Atomic",
                 base + 34,
                 base + 40,
-                0x54,
+                0x02,
                 20,
             ]
         )
@@ -945,7 +945,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             # writer metadata 子区间。
             [0, 0, 0, 0, -1, "Atomic", 130, 131, 0x54, 27],
             [0, 0, 0, 0, -1, "Dcci", 131, 132, 0x10D, 1],
-            [0, 0, 0, 0, -1, "Atomic", 136, 137, 0x54, 20],
+            [0, 0, 0, 0, -1, "Atomic", 136, 137, 0x02, 20],
             [0, 0, 0, 0, -1, "AllocComplete", 140, 145, 0, 0],
             [0, 0, 0, 0, -1, "Submit", 100, 150, 1, 1],
             [0, 0, 0, -1, -1, "ClockBaseline", 10, 11, 0, 0],
@@ -1870,8 +1870,8 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             for event in events
             if event.get("name")
             == (
-                "atomic.return_ready.shared_insert_completion_publish."
-                "compare_exchange#0"
+                "atomic.source_issue.shared_insert_completion_publish."
+                "fetch_add#0"
             )
         )
         register = next(
@@ -1881,7 +1881,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
         self.assertEqual((handoff["pid"], handoff["tid"]), (0, 1))
         self.assertEqual((register["pid"], register["tid"]), (0, 1))
         # schema-v5 为控制近 300 MiB 产物，只保留 Perfetto duration
-        # 必需字段；poll_batch/return_ready/site/op/call_count 已完整编码
+        # 必需字段；poll_batch/return_ready/source_issue/site/op/call_count 已完整编码
         # 在可见名称中。
         self.assertEqual(
             set(poll), {"ph", "name", "pid", "tid", "ts", "dur"}
@@ -2347,7 +2347,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             ),
             "handoff_without_task": (
                 20,
-                [0, 0, 0, -1, -1, "Atomic", 134, 140, 0x54, 20],
+                [0, 0, 0, -1, -1, "Atomic", 134, 140, 0x02, 20],
             ),
         }
         for label, (site_id, replacement) in cases.items():
@@ -2380,10 +2380,10 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             ("missing_poll", "SharedInsertTurnPoll PollBatch"),
             ("duplicate_poll", "SharedInsertTurnPoll PollBatch"),
             ("poll_boundary", "SharedInsertTurnPoll PollBatch"),
-            ("missing_handoff", "SharedInsertTurnHandoff direct CAS"),
-            ("duplicate_handoff", "SharedInsertTurnHandoff direct CAS"),
+            ("missing_handoff", "SharedInsertTurnHandoff direct FetchAdd"),
+            ("duplicate_handoff", "SharedInsertTurnHandoff direct FetchAdd"),
             ("handoff_boundary", "identity or boundary"),
-            ("handoff_task", "SharedInsertTurnHandoff direct CAS"),
+            ("handoff_task", "SharedInsertTurnHandoff direct FetchAdd"),
         )
         for label, expected in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
@@ -2447,13 +2447,13 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             names,
         )
         self.assertIn(
-            "atomic.source_issue.shared_insert_completion_publish.compare_exchange#0",
+            "atomic.source_issue.shared_insert_completion_publish.fetch_add#0",
             names,
         )
 
     def test_v4_shared_poll_return_ready_requires_dependency_evidence(self) -> None:
         capture = _v5_shared_register_atomic_capture(dependency_applied=False)
-        # CAS 同样要求 return_ready；先删除它，精确验证 PollBatch 自己的门禁。
+        # Handoff 是 source-issue；先删除它，精确验证 PollBatch 自己的门禁。
         rows = capture["fdwic_events"]
         assert isinstance(rows, list)
         capture["fdwic_events"] = [
@@ -2474,7 +2474,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
     def test_shared_register_atomic_sites_require_shared_schema_v4(self) -> None:
         cases = (
             [0, 0, 0, -1, -1, "Atomic", 100, 110, (3 << 8) | 0x90, 19],
-            [0, 0, 0, 0, -1, "Atomic", 100, 110, 0x54, 20],
+            [0, 0, 0, 0, -1, "Atomic", 100, 110, 0x02, 20],
         )
         for row in cases:
             with self.subTest(site=row[9]), tempfile.TemporaryDirectory() as directory:
@@ -2490,7 +2490,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
 
         for site_id, row in (
             (19, [0, 0, 0, -1, -1, "Atomic", 120, 124, (3 << 8) | 0xD0, 19]),
-            (20, [0, 0, 0, 0, -1, "Atomic", 134, 140, 0x54, 20]),
+            (20, [0, 0, 0, 0, -1, "Atomic", 134, 140, 0x02, 20]),
         ):
             with self.subTest(private_v4_site=site_id), tempfile.TemporaryDirectory() as directory:
                 capture = _v5_capture(
@@ -2524,7 +2524,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
     def test_v4_shared_loser_forbids_insert_turn_atomics(self) -> None:
         for site_id, row in (
             (19, [0, 0, 0, -1, -1, "Atomic", 120, 124, (3 << 8) | 0xD0, 19]),
-            (20, [0, 0, 0, 0, -1, "Atomic", 134, 140, 0x54, 20]),
+            (20, [0, 0, 0, 0, -1, "Atomic", 134, 140, 0x02, 20]),
         ):
             with self.subTest(site=site_id), tempfile.TemporaryDirectory() as directory:
                 capture = _v5_capture(

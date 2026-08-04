@@ -191,7 +191,7 @@ ATOMIC_OP_NAMES = {
 
 # schema-v3/4 的校验表必须与 standalone C++ 的稳定 AtomicSite 编号一致。
 # 0..14 是既有 common/private 站点，15..18 是 shared heap，19/20 是
-# shared Register 插入轮次的等待 Load 与交接 CAS；真实 PA 的 BlockWon
+# shared Register 插入轮次的等待 Load 与单写者 FetchAdd 发布；真实 PA 的 BlockWon
 # 不属于本用例，不能为了兼容生产 converter 凭空放宽。
 ATOMIC_SITE_OP_IDS = {
     0: 2,
@@ -214,7 +214,7 @@ ATOMIC_SITE_OP_IDS = {
     17: 2,
     18: 2,
     19: 0,
-    20: 4,
+    20: 2,
     21: 0,
     22: 0,
     23: 0,
@@ -253,7 +253,7 @@ ATOMIC_SITE_OP_IDS = {
 }
 # 这些发布型调用不消费 atomic 返回的旧值；其余 standalone site 的
 # 返回值都参与协议判断。v3 输入必须与源码语义完全一致。
-ATOMIC_RESULT_UNUSED_SITE_IDS = {0, 3, 6, 7, 13, 39, 49, 53}
+ATOMIC_RESULT_UNUSED_SITE_IDS = {0, 3, 6, 7, 13, 20, 39, 49, 53}
 # common/private 的六类等待 Load 与 shared Register insert-turn Load 可以
 # 合并；frontier 扫描和 Claim 即使调用很多次也必须继续保留逐调用记录。
 POLL_BATCH_SITE_OP_IDS = {
@@ -1376,7 +1376,7 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                     if len(handoffs) != 1:
                         raise ValueError(
                             "shared schema-v5 level4 requires exactly one "
-                            "SharedInsertTurnHandoff direct CAS per winner at "
+                            "SharedInsertTurnHandoff direct FetchAdd per winner at "
                             f"{task_key}: count={len(handoffs)}"
                         )
                     handoff = handoffs[0]

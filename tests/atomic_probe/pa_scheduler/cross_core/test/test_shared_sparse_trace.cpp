@@ -1332,22 +1332,21 @@ void TestSharedInsertTurnAtomicSchema() {
     TraceRecord handoff = MakeRecord(
         TracePhase::Atomic, 3, -1, 200, 230,
         static_cast<uint32_t>(
-            AtomicOp::CompareExchange
-        ) |
-            kAtomicResultUsed | kAtomicReturnReady,
+            AtomicOp::FetchAdd
+        ),
         static_cast<uint32_t>(
             AtomicSite::SharedInsertTurnHandoff
         )
     );
     Check(
         AtomicRecordSchemaValid(handoff, true),
-        "shared insert-turn handoff CAS schema is accepted"
+        "shared insert-turn handoff FetchAdd schema is accepted"
     );
     TraceRecord anonymous_handoff = handoff;
     anonymous_handoff.task_id = -1;
     Check(
         !AtomicRecordSchemaValid(anonymous_handoff, true),
-        "handoff CAS requires its shared winner task identity"
+        "handoff FetchAdd requires its shared winner task identity"
     );
     TraceRecord wrong_handoff_op = handoff;
     wrong_handoff_op.flags =
@@ -1355,7 +1354,7 @@ void TestSharedInsertTurnAtomicSchema() {
         static_cast<uint32_t>(AtomicOp::Exchange);
     Check(
         !AtomicRecordSchemaValid(wrong_handoff_op, true),
-        "handoff site rejects a non-CAS atomic op"
+        "handoff site rejects a non-FetchAdd atomic op"
     );
 }
 

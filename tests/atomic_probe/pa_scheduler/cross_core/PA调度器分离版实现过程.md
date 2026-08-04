@@ -4220,3 +4220,115 @@ S6.66 compact token  : min / median / max / mean
 消除了一份容易被未来代码误用的第二 payload 权威副本，因此作为通用
 协议布局收敛保留。它不缩短当前 `~1.4 ms` 性能基线；下一阶段不再微调
 token 布局，直接转向 Register 严格插入链的串行 Atomic/到达乱序大头。
+
+## 2026-08-04：S6.67 用单写者非返回型 FetchAdd 发布插入完成
+
+### 瓶颈与协议改造
+
+S6.64 的完整泳道证明，1280 个 Register 虽然在 96 核上并行到达，但
+`deps_prepared[N-1] -> metadata(N) -> deps_prepared[N]` 构成一条不可并行的
+严格 TensorMap 插入链。旧协议把每个完成字初始化为 `-1`，唯一 Build owner
+使用返回型 `CAS(-1, N)` 发布，并在当前 owner 内消费旧值判断成功。旧泳道从
+task 0 Register 起点到 task 1279 Register 终点共 `985.799 us`；1279 个后继
+全部在前驱完成前到达，说明该次运行不是 owner 到达不足，而是完成发布本身在
+限制有序前沿。
+
+本阶段保持 TensorMap side effect、metadata DCCI、中央 Build ticket、执行
+token、fanin 和 kernel 路径不变，只改完成字编码与发布原语：
+
+```text
+deps_prepared[N] 初值 = N - 1
+唯一 Build owner 完成 metadata(N) 后发射 FetchAdd(+1)
+合法终值 = N
+task N+1 对 deps_prepared[N] 做返回型 Load：
+  读到 N     -> 前驱完成，可以进入 metadata(N+1)
+  读到 N - 1 -> 前驱尚未完成，继续等待
+  其他值      -> 协议错误，设置 fatal
+```
+
+这样发布端不再需要 atomic 旧值，只保留 source-issue 边界；真正的跨核完成
+边界仍由下一 owner 消费返回值的 Load 建立。metadata(N) 仍严格发生在完成
+发布之前，因此插入顺序没有放宽。重复发布会把完成字推进到 `N+1`，由下一
+owner 拒绝；若错误发生在最后一个 task，则由 host 对每个有效 task
+`deps_prepared[N] == N` 的精确终态检查拒绝。未使用 TaskCell 也必须保持各自
+的 `N-1` 初值。
+
+这项改造的前提是中央 ticket 已经保证每个 task 恰有一个 Build owner。它把
+“当前 owner 立即检查发布旧值”换成“下一 owner/host 检查单调终态”，没有
+删除错误收口，但错误报告可能延迟一个 task。该协议不依赖 PA 的 task kind、
+batch 数、固定 fanin 图或 AIC/AIV 比例。
+
+### 正确性、生成与观察门槛
+
+- task-specific 初值、顺序推进、空 writer、跨线程唤醒均通过 CPU 定向测试；
+- 破坏前驱值、重复发布和异常当前值都会被下一 owner 拒绝；
+- 完整 96-worker CPU scheduler 回归 PASS，覆盖 1280 个唯一完成发布、前驱
+  Load、TensorMap writer、fanin、cross-core execution 与 FinalDrain；
+- converter 的 65 项测试 PASS，site 20 被精确锁定为
+  `FetchAdd + result_unused + source_issue`；
+- CCEC AIC/AIV 通用模板实例化、role-specific split、mixed ELF、精确
+  relocation 与 manifest 门槛 PASS；
+- CCEC 9.1 的 device 前端实际拒绝 `-emit-llvm` 与 `-S`，因此本阶段不声称
+  获得了可读 ISA 反汇编。可核实的生成证据是：热路径丢弃 `FetchAdd` 返回值、
+  AtomicSite schema 拒绝 result-used/return-ready、A5 泳道中 1280 个发布
+  全部为 `atomic.source_issue...fetch_add`，并且最终 device ELF 相比 S6.66
+  缩小 24B；
+- A5 B256 perf-clock 与 full-swimlane 均完成 1280 task、1024 kernel，
+  payload、descriptor、fanin、completion、TensorMap、heap、执行结果和终态
+  门槛全部 PASS，泳道丢记录为 0。
+
+### 严格插入链变化
+
+对比泳道：
+
+```text
+旧：outputs/pa_scheduler_cross_core_shared_swimlane_20260804_094842_1172211/ccec/
+新：outputs/pa_scheduler_cross_core_shared_swimlane_20260804_111044_1248475/ccec/
+```
+
+按 task-id 重建 Register 完成前沿：
+
+```text
+                                      S6.66 CAS     S6.67 FetchAdd
+task0.start -> task1279.end            985.799 us     919.057 us
+每 task 链步 median                      0.752 us       0.679 us
+每 task 链步 mean                        0.770 us       0.718 us
+Register completion 子区间聚合         501.524 us     128.699 us
+```
+
+严格链 wall time 缩短 `66.742 us / 6.77%`。新泳道只有 task 2 和 task 23
+在前驱完成后才到达，空档分别为 `0.275 us` 和 `5.720 us`；其余 1277 个
+后继仍提前到达。五种 task 的链步均值也都同向下降：
+
+```text
+Alloc 0.725 -> 0.637 us   QK 0.715 -> 0.675 us
+SF    0.730 -> 0.682 us   PV 0.729 -> 0.672 us
+UP    0.952 -> 0.924 us
+```
+
+completion 子区间的旧值是 CAS return-ready，新值是 FetchAdd source-issue，
+两者口径不同，不能把 `501.524 -> 128.699 us` 解释为同口径硬件完成延迟；
+真正可比较的主证据是完整 task-id 串行链 wall time。
+
+### 冻结交错 A/B 与保留结论
+
+以 S6.66 和 S6.67 各自冻结的 host/kernel 运行 12 对独立 B256 trace-free
+交错 A/B，奇偶轮反转顺序，统一测量 startup 起点到 FinalDrain 结束：
+
+```text
+S6.66 frozen baseline: min / median / max / mean
+                       1.378067 / 1.405425 / 1.447738 / 1.404446 ms
+S6.67 FetchAdd publish: min / median / max / mean
+                       1.377962 / 1.400267 / 1.412246 / 1.397209 ms
+
+独立中位数改善 = 0.005159 ms / 0.367%
+配对收益中位数 = 0.003332 ms / 0.237%
+配对收益均值   = 0.007236 ms / 0.515%
+12 对中候选获胜 7 对
+```
+
+端到端收益较小，不能把单次最快值当作新基线；但严格串行链稳定缩短
+`66.742 us`、device 生成物不膨胀、协议对算子形状无特化，且 A/B 的中位数
+与均值均同向，因此作为通用有序发布优化保留。当前可信端到端中位数约
+`1.400 ms`，距离 `1 ms` 仍有明显差距；下一阶段继续按完整泳道挑选未被
+kernel overlap 掩盖的 FinalDrain/执行推进大头。

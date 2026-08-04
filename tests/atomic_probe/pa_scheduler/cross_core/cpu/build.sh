@@ -307,7 +307,7 @@ echo "[TEST] atomic PollBatch boundary self-test"
     "$BUILD_DIR/test_cross_core_exec_scan"
 
     # 完整 96-worker Submit 逐 task 计数 cursor Claim、前驱 completion
-    # load 和本 task completion CAS；同时锁定 loser 零 map 访问、旧
+    # load 和本 task completion FetchAdd；同时锁定 loser 零 map 访问、旧
     # sidecar turn 零触碰，以及 lookup/Build/执行仍可跨前任 Build。
     echo "[BUILD] shared ordered-insert Submit self-test"
     "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \

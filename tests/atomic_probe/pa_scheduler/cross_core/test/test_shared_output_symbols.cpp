@@ -192,6 +192,14 @@ struct SymbolTestOps {
         return observed;
     }
 
+    static int64_t FetchAdd(
+        volatile int64_t *address, int64_t value
+    ) {
+        return __atomic_fetch_add(
+            address, value, __ATOMIC_ACQ_REL
+        );
+    }
+
     static int64_t FetchMax(
         volatile int64_t *address, int64_t value, uint64_t &retries
     ) {

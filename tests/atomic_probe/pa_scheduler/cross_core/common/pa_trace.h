@@ -986,9 +986,8 @@ PA_DEVICE T TraceAtomicExchange(
 #endif
 }
 
-// Handoff 先只捕获 CAS 的 source/return-ready 边界。调用方完成成功判断并
-// 固定 Register 父区间后才写 raw，避免 32B 记录写入污染父区间，同时
-// 不把 CAS 后的比较和函数返回从 RegisterHandoffNextTurn 中删掉。
+// 需要延后落 raw 的返回型 CAS 只先捕获端点；调用方完成成功判断并
+// 固定父区间后再写记录，避免观察写入污染被测区间。
 template <typename Ops>
 PA_DEVICE int64_t CaptureAtomicCompareExchange(
     TraceContext &trace, PA_GM volatile int64_t *address,
@@ -1011,6 +1010,33 @@ PA_DEVICE int64_t CaptureAtomicCompareExchange(
         Ops::CompareExchange(address, expected, desired);
     trace_end = Ops::NowAfterAtomicResult(old);
     return old;
+#endif
+}
+
+// insert completion 的单写者 FetchAdd 只捕获 source-issue 边界。调用方
+// 固定 Register 父区间后才写 raw，避免 32B 记录写入污染有序链；真正
+// 的完成边界由 N+1 owner 对本字的返回型 Load 建立。
+template <typename Ops>
+PA_DEVICE void CaptureAtomicFetchAddIssue(
+    TraceContext &trace, PA_GM volatile int64_t *address,
+    int64_t increment,
+    uint64_t &trace_begin, uint64_t &trace_end
+) {
+#if PA_BUILD_TRACE_FREE
+    (void)trace;
+    trace_begin = 0;
+    trace_end = 0;
+    (void)Ops::FetchAdd(address, increment);
+#else
+    if (!AtomicSwimlaneEnabled(trace)) {
+        trace_begin = 0;
+        trace_end = 0;
+        (void)Ops::FetchAdd(address, increment);
+        return;
+    }
+    trace_begin = Ops::Now();
+    (void)Ops::FetchAdd(address, increment);
+    trace_end = Ops::Now();
 #endif
 }
 

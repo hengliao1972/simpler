@@ -357,38 +357,34 @@ PA_DEVICE bool PublishSharedTaskWriterMetadata(
 PA_DEVICE void RecordCommittedSharedTaskWriterStats(
     const SharedTaskWriterDelta &delta, LocalStats &stats
 ) {
-    // 这两个字段统计已经越过 task-level completion CAS 的完整事务。
-    // metadata 已写入但 CAS 失败的 terminal task 不计入成功统计；故障现场
-    // 仍由 fatal、共享元数据与 CAS observed value 保留。
+    // 这两个字段只在 task-level completion FetchAdd 已发射后更新。
+    // 发布端不等待返回值；严格完成与顺序由 N+1 的返回型 Load、最终 task
+    // 的 host 精确终态共同闭合。
     stats.result.map_inserts += delta.ordinary_count;
     stats.result.shared_symbol_inout_commits += delta.symbol_count;
 }
 
 template <typename Ops>
 PA_DEVICE bool HandoffSharedTaskInsertTurn(
-    PA_GM SchedulerState *state, int32_t task_id, LocalStats &stats,
-    int64_t &cas_observed
+    PA_GM SchedulerState *state, int32_t task_id, LocalStats &stats
 ) {
     if (state == nullptr || task_id < 0 ||
         task_id >= static_cast<int32_t>(kMaxTasks)) {
-        cas_observed = INT64_MIN;
         return false;
     }
     // ordinary payload 的 DCCI、symbol history/latest 与 fresh descriptor
     // 都必须先于本 task 的插入完成字对 N+1 owner 可见。每个 task 使用
     // 自己的 TaskCell，不再把一枚 baton 在 G 条 sidecar 线上轮换。
     Ops::StoreBarrier();
-    // PA_ATOMIC_DCCI_SOURCE_EXEMPT: trace-free - swimlane 构建走 CaptureAtomicCompareExchange；这里只是无泳道构建和隔离测试出口
-    cas_observed = Ops::CompareExchange(
+    // swimlane 构建走 CaptureAtomicFetchAddIssue；这里是无泳道构建和
+    // 隔离测试共用的 trace-free helper。
+    // PA_ATOMIC_DCCI_SOURCE_EXEMPT: trace-free - swimlane 使用统一捕获 helper
+    (void)Ops::FetchAdd(
         &state->tasks[static_cast<uint32_t>(task_id)]
              .deps_prepared,
-        static_cast<int64_t>(-1),
-        static_cast<int64_t>(task_id)
+        static_cast<int64_t>(1)
     );
-    if (cas_observed != -1) {
-        SetFatal<Ops>(state, stats, task_id);
-        return false;
-    }
+    (void)stats;
     return true;
 }
 
@@ -396,29 +392,22 @@ PA_DEVICE bool HandoffSharedTaskInsertTurn(
 template <typename Ops>
 PA_DEVICE bool TraceHandoffSharedTaskInsertTurn(
     PA_GM SchedulerState *state, int32_t task_id, LocalStats &stats,
-    int64_t &cas_observed, uint64_t &cas_trace_begin,
-    uint64_t &cas_trace_end
+    uint64_t &publish_trace_begin, uint64_t &publish_trace_end
 ) {
-    cas_trace_begin = 0;
-    cas_trace_end = 0;
+    publish_trace_begin = 0;
+    publish_trace_end = 0;
     if (state == nullptr || task_id < 0 ||
         task_id >= static_cast<int32_t>(kMaxTasks)) {
-        cas_observed = INT64_MIN;
         return false;
     }
     Ops::StoreBarrier();
-    cas_observed = CaptureAtomicCompareExchange<Ops>(
+    CaptureAtomicFetchAddIssue<Ops>(
         stats.trace,
         &state->tasks[static_cast<uint32_t>(task_id)]
              .deps_prepared,
-        static_cast<int64_t>(-1),
-        static_cast<int64_t>(task_id),
-        cas_trace_begin, cas_trace_end
+        static_cast<int64_t>(1),
+        publish_trace_begin, publish_trace_end
     );
-    if (cas_observed != -1) {
-        SetFatal<Ops>(state, stats, task_id);
-        return false;
-    }
     return true;
 }
 #endif
@@ -477,9 +466,8 @@ PA_DEVICE bool PublishSharedTaskWriterDelta(
         );
         return false;
     }
-    int64_t ignored_cas_observed = INT64_MIN;
     const bool inserted = HandoffSharedTaskInsertTurn<Ops>(
-        state, context.task_id, stats, ignored_cas_observed
+        state, context.task_id, stats
     );
     if (!inserted) {
         RollbackSharedTaskOutputs<Ops>(
@@ -537,7 +525,11 @@ PA_DEVICE bool WaitForSharedTaskInsertTurn(
             load_count = static_cast<uint64_t>(polls) + 1;
             return true;
         }
-        if (compare_observed != -1) {
+        const int64_t pending =
+            SharedInsertCompletionInitialValue(
+                static_cast<uint32_t>(task_id - 1)
+            );
+        if (compare_observed != pending) {
             SetFatal<Ops>(state, stats, task_id);
             return false;
         }
@@ -771,39 +763,34 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         ? TraceTimestamp<Ops>(stats.trace, stats.result)
         : metadata_begin;
 
-    int64_t cas_observed = INT64_MIN;
 #if PA_BUILD_TRACE_FREE
     const bool inserted =
         metadata_published &&
         HandoffSharedTaskInsertTurn<Ops>(
-            state, static_cast<int32_t>(task_id), stats,
-            cas_observed
+            state, static_cast<int32_t>(task_id), stats
         );
 #else
-    uint64_t cas_trace_begin = 0;
-    uint64_t cas_trace_end = 0;
+    uint64_t publish_trace_begin = 0;
+    uint64_t publish_trace_end = 0;
     const bool inserted =
         metadata_published &&
         TraceHandoffSharedTaskInsertTurn<Ops>(
             state, static_cast<int32_t>(task_id), stats,
-            cas_observed, cas_trace_begin, cas_trace_end
+            publish_trace_begin, publish_trace_end
         );
 #endif
-    // 正常路径的父区间终点依赖 CAS 返回值，表示本核已经取得
-    // task[N].deps_prepared 的发布结果；不加 DSB，也不把它解释成
-    // N+1 已经完成读取的时刻。
+    // 发布端只记录 FetchAdd 的 source-issue 边界，不等待返回值；真正
+    // 的完成与顺序证据由 N+1 owner 的返回型 predecessor Load 建立。
     const uint64_t register_end = metadata_published
-        ? TraceTimestampAfterAtomicResult<Ops>(
-              stats.trace, stats.result, cas_observed
-          )
+        ? TraceTimestamp<Ops>(stats.trace, stats.result)
         : metadata_end;
     EndSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(
         pmu_context
     );
 #if !PA_BUILD_TRACE_FREE
-    // task[N].deps_prepared 已经完成 CAS handoff，下一 owner 可开始推进；
-    // 现在才落 history DCCI 和单次 group writer CAS 的 raw，既保留端点
-    // 与事件数量，也不再让 16B 记录写入延长全局有序发布链。
+    // task[N] 的 completion FetchAdd 已经发射；下一 owner 的返回型 Load
+    // 会在新值真正可见后推进。现在才落 history DCCI 和 writer CAS 的
+    // raw，既保留端点与事件数量，也不再让 16B 记录写入延长全局有序发布链。
     if (writer_metadata_trace.history_dcci_lines != 0) {
         (void)WriteDcciTrace(
             stats.trace, static_cast<int32_t>(task_id), -1,
@@ -896,9 +883,9 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
             stats.trace, stats.result,
             static_cast<int32_t>(task_id),
             AtomicSite::SharedInsertTurnHandoff,
-            AtomicOp::CompareExchange,
-            cas_trace_begin, cas_trace_end,
-            true, Ops::kAtomicReturnReadyObserved
+            AtomicOp::FetchAdd,
+            publish_trace_begin, publish_trace_end,
+            false, false
         );
     }
 #endif
@@ -914,8 +901,8 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         return false;
     }
     // Register 的业务终点已经取完，失败分支也已经退出；成功统计因此
-    // 既不污染串行区泳道，也不会把 completion CAS 失败的 metadata
-    // 前缀误算成已提交事务。
+    // 既不污染串行区泳道，也不会把发布前失败的 metadata 前缀误算成
+    // 已提交事务。
     RecordCommittedSharedTaskWriterStats(
         writer_delta, stats
     );

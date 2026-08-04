@@ -894,9 +894,10 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     // 不对 task_id 取模，避免在本阶段提前引入 generation 语义。
     for (uint32_t task_id = 0; task_id < kMaxTasks; ++task_id) {
         // task 表位于 production prefix，前面的 memset 会把该字段清零；
-        // shared per-task 插入完成链必须用 -1 区分“尚未发布”与 task 0
-        // 已完成 TensorMap writer 元数据插入。
-        state->tasks[task_id].deps_prepared = -1;
+        // 每个 task 使用 task-specific pending 值 N-1；唯一 owner 用
+        // FetchAdd(+1) 发布为 N，重复发布会留下可被终态拒绝的 N+1。
+        state->tasks[task_id].deps_prepared =
+            SharedInsertCompletionInitialValue(task_id);
         for (uint32_t slot = 0; slot < kSharedOutputMaxPerTask; ++slot) {
             state->shared_map.shared_outputs[task_id].published[slot].value = -1;
             state->shared_map.shared_outputs[task_id].last_writer[slot].value = -1;
@@ -5231,7 +5232,7 @@ inline Metrics Validate(
 #if PTO_FDWIC_SHARED_MAP
     bool shared_heap_state_ok = shared_heap_capacity_ok;
     // 每个实际回放 task 的插入完成字最终必须恰好保存自己的 task_id；
-    // 未使用的 TaskCell 必须继续保持 -1。
+    // 未使用的 TaskCell 必须继续保持各自的 task-specific pending 值。
     bool shared_per_task_insert_completions_ok = true;
     uint32_t shared_insert_completed_prefix = 0;
     for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
@@ -5251,7 +5252,8 @@ inline Metrics Validate(
     for (uint32_t task_id = task_count;
          task_id < kMaxTasks; ++task_id) {
         shared_per_task_insert_completions_ok &=
-            state.tasks[task_id].deps_prepared == -1;
+            state.tasks[task_id].deps_prepared ==
+                SharedInsertCompletionInitialValue(task_id);
     }
     uint64_t actual_shared_cursor_sum = 0;
     uint64_t expected_shared_cursor_sum = 0;

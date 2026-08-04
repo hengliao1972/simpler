@@ -106,6 +106,14 @@ struct WriterIntentTestOps {
         return observed;
     }
 
+    static int64_t FetchAdd(
+        volatile int64_t *address, int64_t value
+    ) {
+        return __atomic_fetch_add(
+            address, value, __ATOMIC_ACQ_REL
+        );
+    }
+
     static int64_t FetchMax(
         volatile int64_t *address, int64_t value,
         uint64_t &retries
@@ -206,6 +214,9 @@ void ResetProtocolState(SchedulerState &state) {
         state.shared_map.reader_done[worker].value = -1;
     }
     for (uint32_t task = 0; task < kMaxTasks; ++task) {
+        // 旧 generic writer-ready 隔离测试仍以 -1 为未发布值；正式
+        // per-task ordered completion 测试由 SetInsertCompletionsAfterTasks
+        // 单独建立 task-specific pending 状态。
         state.tasks[task].deps_prepared = -1;
         SharedOutputCell &outputs =
             state.shared_map.shared_outputs[task];
@@ -231,6 +242,17 @@ void SetInsertCompletionsAfterTasks(
         state.tasks[task].deps_prepared =
             static_cast<int64_t>(task);
     }
+    if (completed_tasks < kMaxTasks) {
+        state.tasks[completed_tasks].deps_prepared =
+            SharedInsertCompletionInitialValue(completed_tasks);
+    }
+}
+
+void ResetOrderedCompletionWords(SchedulerState &state) {
+    for (uint32_t task = 0; task < kMaxTasks; ++task) {
+        state.tasks[task].deps_prepared =
+            SharedInsertCompletionInitialValue(task);
+    }
 }
 
 bool InsertCompletionsMatch(
@@ -247,7 +269,9 @@ bool InsertCompletionsMatch(
     if (completed_tasks < kMaxTasks &&
         WriterIntentTestOps::Load(
             &state.tasks[completed_tasks].deps_prepared
-        ) != -1) {
+        ) != SharedInsertCompletionInitialValue(
+                 completed_tasks
+             )) {
         return false;
     }
     for (uint32_t lane = 0;
@@ -1220,6 +1244,7 @@ void TestWriterDeltaPrecomputesInterleavedBuckets(
     SchedulerState &state
 ) {
     ResetProtocolState(state);
+    ResetOrderedCompletionWords(state);
     constexpr uint64_t kBase = 0x458000000ULL;
     const uint32_t bucket_a = TensorMapHash(kBase);
     const uint32_t bucket_b =
@@ -1291,6 +1316,7 @@ void TestOrderedOrdinaryInsertBeforeLookup(
     SchedulerState &state
 ) {
     ResetProtocolState(state);
+    ResetOrderedCompletionWords(state);
     TensorDesc tensor = MakeTensor(0x460000000ULL);
 
     TaskArgs first_args;
@@ -1434,6 +1460,7 @@ void TestOrderedSymbolInsertBeforeLookup(
     SchedulerState &state
 ) {
     ResetProtocolState(state);
+    ResetOrderedCompletionWords(state);
     TensorDesc descriptor = MakeTensor(0x470000000ULL, 0);
 
     TaskArgs producer_args;
@@ -1570,6 +1597,7 @@ void TestOrderedMixedWriterTransaction(
     SchedulerState &state
 ) {
     ResetProtocolState(state);
+    ResetOrderedCompletionWords(state);
     TensorDesc ordinary = MakeTensor(0x478000000ULL);
     TensorDesc seed_output = MakeTensor(0x478100000ULL, 0);
 
@@ -1975,7 +2003,7 @@ void TestOrderedPublishRejectsFullBucketAtomically(
     );
 }
 
-void TestCommitStatsRequireCompletionCas(
+void TestCorruptCompletionIsRejectedByNextOwner(
     SchedulerState &state
 ) {
     ResetProtocolState(state);
@@ -2014,25 +2042,33 @@ void TestCommitStatsRequireCompletionCas(
         "completion failure test prepares a mixed writer delta"
     );
 
-    // metadata 可以完整落地，但 task-level completion CAS 必须因非法旧值
-    // 失败。成功统计只描述完成事务，不能把这个 terminal 前缀算进去。
+    // 非返回型完成发布不在当前 owner 上等待旧值；人为破坏当前字后，
+    // FetchAdd 会保留异常终值，下一 owner 必须据此 fail-closed。
     state.tasks[1].deps_prepared = 77;
     const uint32_t bucket = TensorMapHash(ordinary.buffer_addr);
     Check(
-        !PublishSharedTaskWriterDelta<WriterIntentTestOps>(
+        PublishSharedTaskWriterDelta<WriterIntentTestOps>(
             &state, context, delta, stats
         ),
-        "completion CAS conflict rejects the ordered transaction"
+        "single-writer completion publication issues without consuming old value"
     );
+    LocalStats next_stats{};
+    int64_t ready_observed = INT64_MIN;
+    uint64_t load_count = 0;
+    const bool next_ready =
+        WaitForSharedTaskInsertTurn<WriterIntentTestOps>(
+            &state, 2, next_stats, ready_observed,
+            load_count
+        );
     Check(
-        state.fatal.value == 1 &&
-            state.tasks[1].deps_prepared == 77 &&
+        !next_ready && state.fatal.value == 1 &&
+            state.tasks[1].deps_prepared == 78 &&
             state.shared_map.buckets[bucket].tail.value == 1 &&
             symbol.last_writer[0].value == 1 &&
             state.shared_map.writer_history[1].count == 1 &&
-            stats.result.map_inserts == 0 &&
-            stats.result.shared_symbol_inout_commits == 0,
-        "failed completion keeps metadata evidence but records no committed writers"
+            stats.result.map_inserts == 1 &&
+            stats.result.shared_symbol_inout_commits == 1,
+        "next owner rejects corrupt completion while preserving terminal metadata evidence"
     );
 }
 
@@ -2158,7 +2194,7 @@ int main() {
     TestManualWriterNeedsNoGate(*state);
     const bool fatal_clean = state->fatal.value == 0;
     Check(fatal_clean, "all positive paths leave fatal clear");
-    TestCommitStatsRequireCompletionCas(*state);
+    TestCorruptCompletionIsRejectedByNextOwner(*state);
     TestOrderedPublishRejectsFullBucketAtomically(*state);
     TestOutOfOrderSymbolWriterFailsClosed(*state);
     TestMultiSymbolConflictKeepsTerminalPrefix(*state);

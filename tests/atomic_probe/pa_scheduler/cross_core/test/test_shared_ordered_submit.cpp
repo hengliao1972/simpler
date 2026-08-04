@@ -63,11 +63,11 @@ struct OrderedSubmitTestOps {
     static inline std::atomic<uint32_t>
         completion_loads_by_cell[kMaxTasks]{};
     static inline std::atomic<uint32_t>
-        completion_cas_by_task[kMaxTasks]{};
+        completion_atomic_writes_by_task[kMaxTasks]{};
     static inline std::atomic<uint32_t>
         completion_publish_by_task[kMaxTasks]{};
     static inline std::atomic<uint32_t>
-        bad_completion_cas{0};
+        bad_completion_publish{0};
     static inline std::atomic<uint32_t>
         legacy_turn_atomic_accesses{0};
     static inline std::atomic<uint32_t>
@@ -99,14 +99,14 @@ struct OrderedSubmitTestOps {
             completion_loads_by_cell[task].store(
                 0, std::memory_order_relaxed
             );
-            completion_cas_by_task[task].store(
+            completion_atomic_writes_by_task[task].store(
                 0, std::memory_order_relaxed
             );
             completion_publish_by_task[task].store(
                 0, std::memory_order_relaxed
             );
         }
-        bad_completion_cas.store(
+        bad_completion_publish.store(
             0, std::memory_order_relaxed
         );
         legacy_turn_atomic_accesses.store(
@@ -255,12 +255,12 @@ struct OrderedSubmitTestOps {
         if (completion_task >= 0) {
             const uint32_t task =
                 static_cast<uint32_t>(completion_task);
-            completion_cas_by_task[task].fetch_add(
+            completion_atomic_writes_by_task[task].fetch_add(
                 1, std::memory_order_relaxed
             );
             if (expected != -1 ||
                 desired != completion_task) {
-                bad_completion_cas.fetch_add(
+                bad_completion_publish.fetch_add(
                     1, std::memory_order_relaxed
                 );
             }
@@ -294,7 +294,32 @@ struct OrderedSubmitTestOps {
 
     static int64_t FetchAdd(volatile int64_t *address, int64_t value) {
         CountSharedMapAccess(address, sizeof(*address));
-        return __atomic_fetch_add(address, value, __ATOMIC_ACQ_REL);
+        const int32_t completion_task =
+            CompletionTaskCell(address);
+        if (completion_task >= 0) {
+            completion_atomic_writes_by_task[
+                static_cast<uint32_t>(completion_task)
+            ].fetch_add(1, std::memory_order_relaxed);
+        }
+        const int64_t observed = __atomic_fetch_add(
+            address, value, __ATOMIC_ACQ_REL
+        );
+        if (completion_task >= 0) {
+            const uint32_t task =
+                static_cast<uint32_t>(completion_task);
+            const int64_t expected =
+                SharedInsertCompletionInitialValue(task);
+            if (value != 1 || observed != expected) {
+                bad_completion_publish.fetch_add(
+                    1, std::memory_order_relaxed
+                );
+            } else {
+                completion_publish_by_task[task].fetch_add(
+                    1, std::memory_order_relaxed
+                );
+            }
+        }
+        return observed;
     }
 
     static int64_t FetchMax(
@@ -928,7 +953,7 @@ bool DispatchAndInsertEvidenceMatches(
                 static_cast<int64_t>(task_id);
             exact &=
                 OrderedSubmitTestOps::
-                    completion_cas_by_task[task_id]
+                    completion_atomic_writes_by_task[task_id]
                         .load(std::memory_order_relaxed) == 1;
             exact &=
                 OrderedSubmitTestOps::
@@ -956,7 +981,7 @@ bool DispatchAndInsertEvidenceMatches(
         }
         exact &=
             OrderedSubmitTestOps::
-                completion_cas_by_task[task].load(
+                completion_atomic_writes_by_task[task].load(
                     std::memory_order_relaxed
                 ) == 0 &&
             OrderedSubmitTestOps::
@@ -992,7 +1017,7 @@ bool DispatchAndInsertEvidenceMatches(
     exact &= state.build_dispatch.next_task.value ==
         static_cast<int64_t>(task_count + kWorkers);
     return exact &&
-           OrderedSubmitTestOps::bad_completion_cas.load(
+           OrderedSubmitTestOps::bad_completion_publish.load(
                std::memory_order_relaxed
            ) == 0 &&
            OrderedSubmitTestOps::
@@ -1123,7 +1148,8 @@ bool RunLoserZeroTensorMapAccessTest() {
         stats.result.submits == kTask + 1U &&
         stats.declared_task_count == 0 &&
         turns_unchanged &&
-        state->tasks[kTask].deps_prepared == -1 &&
+        state->tasks[kTask].deps_prepared ==
+            SharedInsertCompletionInitialValue(kTask) &&
         OrderedSubmitTestOps::shared_map_accesses.load(
             std::memory_order_relaxed
         ) == 0;
@@ -1534,7 +1560,8 @@ bool RunPaUpWriterShapeContractTest() {
         non_up_empty_ok && up_empty_rejected &&
         state->fatal.value == 1 &&
         state->shared_map.writer_history[kTask].magic == 0 &&
-        state->tasks[kTask].deps_prepared == -1;
+        state->tasks[kTask].deps_prepared ==
+            SharedInsertCompletionInitialValue(kTask);
     std::printf(
         "[ORDERED_SUBMIT] pa_up_writer_shape_contract=%s\n",
         ok ? "PASS" : "FAIL"
