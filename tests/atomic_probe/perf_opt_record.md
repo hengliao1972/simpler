@@ -6622,3 +6622,26 @@ full-swimlane lifecycle 为 `1.087601 ms`，FinalDrain kernel 降至 145。
 没有增加任何共享原子操作或 DCCI。该机制只依赖中央唯一发放和 owner-local
 有界 admission，不读取 PA task kind，因此正式保留。详细证据见实现过程
 S6.71。
+
+### 15.56 未发布 Execute task 停止单边界连续预领
+
+S6.71 四槽泳道中的 `EfDrain#80` 在第一个新 ticket 对应 cell 尚未
+`BUILT` 时仍连续领取其余三张未来票：四次返回型 Execute ticket FetchAdd
+合计 `33.724 us`，四次 cell-state load 合计约 `0.996 us`，整个 EfDrain
+达到 `39.361 us`。本轮保留四槽容量，只在新 token 首次观察后仍为
+`WAITING_BUILT` 时结束本次取票循环；后续调度边界仍可逐步填充四槽，已经
+Claim 到 `BUILT`、仅等待 fanin 的 token 不触发该快退。全程 Execute ticket
+总数、唯一 owner、payload/DCCI、严格 TensorMap 插入和 FinalDrain 合同均不变。
+
+CPU 定向用例证明单边界只保留一张未发布票、四个独立边界仍可占满四槽；
+CCEC perf-clock/full-swimlane 与 A5 B1/B256 全部通过。相对冻结提交
+`2b4110d3` 的 12 对正反交错 B256 中，完整周期中位从 `1.047032 ms`
+降至 `1.010589 ms`，改善 `3.481%`；均值改善 `3.551%`，逐对收益中位
+`32.977 us`，候选 11/12 对更快。
+
+新 full-swimlane lifecycle 为 `1.084321 ms`；`EfDrain#80` 只剩一次 ticket
+FetchAdd 和一次 state load，耗时 `2.595 us`。同时确认首个 AIC 仍可能因
+Execute owner 正在不可抢占的 Build/Register 长路径而滞后：task 6 在
+`81.307 us` 已 BUILT，但 owner 直到 `114.426 us` 才再次观察并在
+`118.135 us` 执行。这是下一阶段独立问题，不与本轮收益混算。详细证据见
+实现过程 S6.72。

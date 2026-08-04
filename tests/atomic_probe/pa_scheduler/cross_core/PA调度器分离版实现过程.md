@@ -4970,3 +4970,109 @@ perf-clock 混合 ELF `.text` 相对三 token 增加 `1280B`。增加的是每 w
 Execute 推进，不依赖 PA task kind、batch 图形或固定依赖模板；它仍不是无界
 pending list。下一轮若继续扩容，必须重新从四槽占用分布出发，并用同样的
 冻结 A/B 证明边际收益，不能按整数顺序机械增加。
+
+## 2026-08-04：S6.72 未发布 Execute task 停止单边界连续预领
+
+### 从 `EfDrain#80` 确认突发竞争
+
+S6.71 四 token 泳道
+`test_record/2026-8-4/cross_4token_1p088ms.json` 中，`EfDrain#80`
+位于 block 14 AIV0 Scalar，时间为 `39.781--79.142 us`，总计
+`39.361 us`。它没有执行任何 kernel，内部依次发生：
+
+```text
+Execute ticket FetchAdd -> cell 182 state load
+Execute ticket FetchAdd -> cell 359 state load
+Execute ticket FetchAdd -> cell 509 state load
+Execute ticket FetchAdd -> cell 594 state load
+```
+
+四次 ticket 返回型 Atomic 分别为 `7.554/11.276/9.434/5.460 us`，合计
+`33.724 us`；四次 state load 合计约 `0.996 us`。四个 cell 都没有进入
+Claim/payload acquire/kernel，说明它们只是同一调度边界囤积的未来票。
+后三次预领本身约占该 EfDrain 的 `68%`，还把本核取得 Build ticket 的时间
+整体后推。
+
+这不否定 S6.71 的四槽容量收益。四槽解决的是跨多个调度边界保存独立等待
+任务的前视深度；这里的问题是一个 payload 都没有发布时，在同一边界集中向
+角色 cursor 发射四次返回型 Atomic。总 ticket 数最终固定，不需要在冷启动
+瞬间成批领取。
+
+### 最小调度修改
+
+`ProgressCrossCoreExec()` 仍先推进所有 owner-local token。取得一张新
+Execute ticket 后也仍立即检查 cell；唯一新增规则是：
+
+```text
+新 token 检查后仍为 WAITING_BUILT
+    -> 保留 ticket 和 token
+    -> 结束本次取票循环
+
+新 token 已 Claim BUILT、仅为 WAITING_FANIN
+    -> 仍允许使用其余空槽继续前视
+```
+
+因此没有 cursor 回退、ticket 归还或重复 owner。下一次 EfDrain 可以再次
+取得一张票，四个独立调度边界仍可逐步占满四槽；四槽全占用后仍不能取得
+第五张。该规则只读取通用 `ExecTokenPhase`，不识别 PA task kind、batch、
+fanin 形状或 engine 负载。
+
+CPU 定向用例由“单次调用占满四个未发布 token”改为两层证明：第一次调用
+只保存 task 1；后续三个独立调用依次保存 task 3/6/8，最终仍精确占满四槽。
+另一个双 ticket 用例同样用独立边界取得 task 1/3，再证明同核和跨核
+Build/Execute owner 都可完成。cross-core CPU 全套与 CCEC perf-clock、
+full-swimlane 构建均通过。
+
+### A5 功能和冻结 A/B
+
+A5 B1、B256 real-compute `6,28,4,1` 全部业务、payload、严格插入、
+1024 kernel exactly-once、四槽排空和 FinalDrain 断言通过。B256 首轮候选为
+`988.875 us`，只作功能烟测。
+
+随后冻结提交 `2b4110d3` 的 S6.71 四槽 host/kernel 产物，与候选各预热一次，
+按 B-C/C-B 反转顺序交错运行 12 对独立进程：
+
+```text
+四槽基线 B: min / median / max / mean
+              1.017825 / 1.047032 / 1.068297 / 1.045586 ms
+停止连领 C: min / median / max / mean
+              0.972515 / 1.010589 / 1.031347 / 1.008459 ms
+
+独立中位数改善 = 36.443 us / 3.481%
+独立均值改善   = 37.128 us / 3.551%
+配对收益中位数 = 32.977 us
+配对收益均值   = 37.128 us
+候选获胜       = 11 / 12 对
+```
+
+### 新泳道与 AIC 首次执行的第二层原因
+
+新 B256 full-swimlane 位于
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260804_172534_1600144/`：
+
+- lifecycle `1084.321 us`，Submit `1022.595 us`；
+- 1280 个 Build、1024 个 kernel、6528 次 DCCI 全部闭合；
+- placement 为 EfDrain 909、FinalDrain 115；
+- `EfDrain#80` 降为 `2.595 us`，只剩一次 `0.214 us` ticket FetchAdd 和
+  一次 `0.297 us` cell-state load，随后立即进入本核 Build Claim。
+
+但本轮最早 AIC kernel 仍到 `113.609 us`，说明首个 AIC 执行滞后不能全归给
+连续预领。task 6 给出了完整反例：
+
+```text
+40.394 us  AIC execute owner 首次观察 cell 6，尚未 BUILT
+41.965 us  同一 Scalar 取得 Build task 36
+76.457 us  task 36 进入严格 Register 等待
+81.307 us  另一 Build owner 已发布 task 6 BUILT
+101.313 us task 36 才离开 Register 并继续 Fanin/Build
+113.502 us task 36 完成 BUILT 发布并返回调度点
+114.426 us AIC owner 再次观察 cell 6
+118.135 us QK#6 开始执行
+```
+
+task 6 已发布后仍等待约 `33.1 us`，原因是 Execute owner 正在不可抢占地完成
+自己已经取得的 Build task，其中 task 36 的 Register poll 为 `24.856 us`。
+这是当前“Build ticket 一旦取得必须完整完成”的调度边界，不是 AIC engine
+启动指令慢，也不是本阶段漏掉的后三张 Execute ticket。下一阶段应单独比较
+冷启动先 Build、Build owner 调度选择或严格 Register 交接结构；不能用本阶段
+的端到端收益宣称已经解决 AIC 首次执行滞后。

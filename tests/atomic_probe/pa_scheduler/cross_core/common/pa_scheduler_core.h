@@ -4854,6 +4854,18 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
             return completed_count;
         }
         completed_count += completed ? 1U : 0U;
+        // 新领到的 Execute ticket 只代表未来 task 的唯一消费权，并不
+        // 代表对应 cell 已经 BUILT。若首次观察后仍停在 WaitingBuilt，
+        // 本次执行推进边界没有理由继续用其余空 token 囤积更多未来 ticket：
+        // 它们大概率同样尚未发布，却会在 AIC/AIV 中央 cursor 上叠加
+        // 返回型 Atomic 竞争。保留当前 token，下一次调度边界再推进；
+        // 已经 Claim 到 BUILT、仅在等待 fanin 的 token 不走这条快退，
+        // 仍允许利用其余槽位承接可独立执行的后续任务。
+        if (!completed &&
+            token.control.phase ==
+                cross_core::ExecTokenPhase::WaitingBuilt) {
+            break;
+        }
         if (completed &&
             !ProgressCrossCoreOwnedTokens<Ops>(
                 state, worker, place, stats, completed_count

@@ -704,12 +704,37 @@ void TestDualTicketWaitingBuiltAndOwnerIndependence() {
             state, worker, 5, false,
             DrainPlace::EfDrain, stats
         );
+    Check(
+        empty_progress == 0 &&
+            state->exec_dispatch.aic_next.value == 1 &&
+            state->exec_tokens[kExecutor][0].control.phase ==
+                ExecTokenPhase::WaitingBuilt &&
+            state->exec_tokens[kExecutor][0].control.task_id == 1 &&
+            state->exec_tokens[kExecutor][1].control.phase ==
+                ExecTokenPhase::Idle &&
+            stats.max_occupied == 1 &&
+            stats.exec_dispatch_exhausted == 0 && NoFatal(*state),
+        kTest,
+        "one boundary retains only its first unpublished ticket"
+    );
+
+    const uint32_t second_empty_progress =
+        ProgressCrossCoreExec<ExecScanTestOps>(
+            state, worker, 5, false,
+            DrainPlace::EfDrain, stats
+        );
+    const uint32_t exhaust_probe_progress =
+        ProgressCrossCoreExec<ExecScanTestOps>(
+            state, worker, 5, false,
+            DrainPlace::EfDrain, stats
+        );
     const ExecutionTokenControl &first_wait =
         state->exec_tokens[kExecutor][0].control;
     const ExecutionTokenControl &second_wait =
         state->exec_tokens[kExecutor][1].control;
     Check(
-        empty_progress == 0 &&
+        second_empty_progress == 0 &&
+            exhaust_probe_progress == 0 &&
             state->exec_dispatch.aic_next.value == 3 &&
             first_wait.phase == ExecTokenPhase::WaitingBuilt &&
             first_wait.task_id == 1 &&
@@ -718,7 +743,7 @@ void TestDualTicketWaitingBuiltAndOwnerIndependence() {
             stats.max_occupied == 2 &&
             stats.exec_dispatch_exhausted == 1 && NoFatal(*state),
         kTest,
-        "two tokens retain unique tickets without reading unpublished payload"
+        "later boundaries retain distinct tickets and eventually observe exhaustion"
     );
 
     Check(
@@ -780,9 +805,9 @@ void TestDualTicketWaitingBuiltAndOwnerIndependence() {
     std::printf("[PASS] %s\n", kTest);
 }
 
-void TestFourBlockedTokensBoundLookahead() {
+void TestBlockedTokenStopsSameBoundaryLookahead() {
     constexpr const char *kTest =
-        "four-blocked-tokens-bound-lookahead";
+        "blocked-token-stops-same-boundary-lookahead";
     MappedSchedulerState mapping;
     SchedulerState *state = mapping.Get();
     Check(state != nullptr, kTest, "state mapping");
@@ -804,6 +829,32 @@ void TestFourBlockedTokensBoundLookahead() {
         );
     Check(
         first_progress == 0 &&
+            state->exec_dispatch.aic_next.value == 1 &&
+            stats.max_occupied == 1 &&
+            stats.exec_dispatch_exhausted == 0 &&
+            state->exec_tokens[kExecutor][0].control.phase ==
+                ExecTokenPhase::WaitingBuilt &&
+            state->exec_tokens[kExecutor][0].control.task_id == 1 &&
+            state->exec_tokens[kExecutor][1].control.phase ==
+                ExecTokenPhase::Idle &&
+            state->exec_tokens[kExecutor][2].control.phase ==
+                ExecTokenPhase::Idle &&
+            state->exec_tokens[kExecutor][3].control.phase ==
+                ExecTokenPhase::Idle &&
+            NoFatal(*state),
+        kTest,
+        "one unpublished task stops further tickets in the same boundary"
+    );
+
+    uint32_t later_progress = 0;
+    for (uint32_t boundary = 0; boundary < 3; ++boundary) {
+        later_progress += ProgressCrossCoreExec<ExecScanTestOps>(
+            state, worker, 10, false,
+            DrainPlace::EfDrain, stats
+        );
+    }
+    Check(
+        later_progress == 0 &&
             state->exec_dispatch.aic_next.value == 4 &&
             stats.max_occupied == 4 &&
             stats.exec_dispatch_exhausted == 0 &&
@@ -819,26 +870,58 @@ void TestFourBlockedTokensBoundLookahead() {
             state->exec_tokens[kExecutor][3].control.phase ==
                 ExecTokenPhase::WaitingBuilt &&
             state->exec_tokens[kExecutor][3].control.task_id == 8 &&
-            NoFatal(*state),
+            !CrossCoreExecWorkerDrained(
+                state, worker, 10, stats
+            ) && NoFatal(*state),
         kTest,
-        "four unpublished tasks occupy four unique owner-local tokens"
+        "separate progress boundaries can still fill the four-token capacity"
+    );
+    std::printf("[PASS] %s\n", kTest);
+}
+
+void TestFaninWaitStillAllowsBoundedLookahead() {
+    constexpr const char *kTest =
+        "fanin-wait-allows-bounded-lookahead";
+    MappedSchedulerState mapping;
+    SchedulerState *state = mapping.Get();
+    Check(state != nullptr, kTest, "state mapping");
+    if (state == nullptr) return;
+    LimitDefaultPlanToBatches(*state, 2);
+
+    constexpr uint32_t kExecutor = 0;
+    WorkerState &worker = PrepareWorker(
+        *state, kExecutor, CoreRole::Aic
+    );
+    LocalStats stats{};
+    InitLocalStats(stats, kExecutor, CoreRole::Aic);
+    ExecScanTestOps::ResetObservations();
+    // 跳过无 fanin 的 QK#1，从真实依赖 QK#1 的 PV#3 开始领取。
+    state->exec_dispatch.aic_next.value = 1;
+    Check(
+        PublishKernelCell(
+            *state, 3, kAivBuildOwner,
+            TaskKind::Pv, {1}
+        ),
+        kTest, "publish PV payload with an unready QK fanin"
     );
 
-    const uint32_t capacity_limited_progress =
+    const uint32_t progressed =
         ProgressCrossCoreExec<ExecScanTestOps>(
             state, worker, 10, false,
             DrainPlace::EfDrain, stats
         );
     Check(
-        capacity_limited_progress == 0 &&
-            state->exec_dispatch.aic_next.value == 4 &&
-            stats.max_occupied == 4 &&
-            stats.exec_dispatch_exhausted == 0 &&
-            !CrossCoreExecWorkerDrained(
-                state, worker, 10, stats
-            ) && NoFatal(*state),
+        progressed == 0 &&
+            state->exec_dispatch.aic_next.value == 3 &&
+            state->exec_tokens[kExecutor][0].control.phase ==
+                ExecTokenPhase::WaitingFanin &&
+            state->exec_tokens[kExecutor][0].control.task_id == 3 &&
+            state->exec_tokens[kExecutor][1].control.phase ==
+                ExecTokenPhase::WaitingBuilt &&
+            state->exec_tokens[kExecutor][1].control.task_id == 6 &&
+            stats.max_occupied == 2 && NoFatal(*state),
         kTest,
-        "four occupied tokens prevent a fifth Execute ticket"
+        "claimed fanin wait permits one more ticket before an unpublished task stops the boundary"
     );
     std::printf("[PASS] %s\n", kTest);
 }
@@ -899,7 +982,8 @@ void TestDualTicketDuplicateConsumerFailsClosed() {
 int main() {
     TestDualTicketRoleDistribution();
     TestDualTicketWaitingBuiltAndOwnerIndependence();
-    TestFourBlockedTokensBoundLookahead();
+    TestBlockedTokenStopsSameBoundaryLookahead();
+    TestFaninWaitStillAllowsBoundedLookahead();
     TestDualTicketDuplicateConsumerFailsClosed();
     TestDrainCompletionCountMismatchFailsClosed();
     TestDrainUsesPublishedExecutableTaskCount();
