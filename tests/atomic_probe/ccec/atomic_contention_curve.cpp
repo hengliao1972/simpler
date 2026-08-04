@@ -9,9 +9,11 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-// One timed wave contains exactly one same-address atomicAdd from every active
-// Scalar.  A GM atomic barrier is used only once, before a common future
-// SYS_CNT deadline, so its traffic is outside every measured interval.
+// One timed wave contains exactly one atomicAdd from every active Scalar.  The
+// address can be shared, derived from participant_id with a fixed stride, or
+// selected from two group-local hot addresses.  A GM atomic barrier is used
+// only once, before a common future SYS_CNT deadline, so its traffic is outside
+// every measured interval.
 
 #include "atomic_contention_curve_shared.h"
 #include "ccec_utils.h"
@@ -65,25 +67,41 @@ __aicore__ inline bool ConfigValid(__gm__ ProbeState *state, const WorkerIdentit
     const uint32_t block_dim = LoadConfigWord(state, 6U);
     const uint32_t active_start = LoadConfigWord(state, 9U);
     const uint64_t target_address = LoadConfigDoubleWord(state, 5U);
+    const uint32_t address_layout = LoadConfigWord(state, 12U);
+    const uint32_t target_stride_bytes = LoadConfigWord(state, 13U);
+    const uint32_t primary_group_workers = LoadConfigWord(state, 14U);
+    const bool shared_layout = address_layout == static_cast<uint32_t>(AddressLayout::Shared);
+    const bool participant_stride_layout = address_layout == static_cast<uint32_t>(AddressLayout::ParticipantStride);
+    const bool two_groups_layout = address_layout == static_cast<uint32_t>(AddressLayout::TwoGroups);
     if (LoadConfigWord(state, 0U) != kConfigMagic || active == 0U || active > launched || launched > kMaxWorkers ||
         active_aic + active_aiv != active || block_dim == 0U || block_dim > kMaxWorkers ||
         LoadConfigWord(state, 7U) != kTotalWaves || LoadConfigWord(state, 8U) != kWarmupWaves ||
         active_start > launched || active > launched - active_start || target_address == 0U ||
-        target_address % alignof(AtomicLine) != 0U || identity.worker_slot_id >= launched ||
-        identity.hardware_core_id >= kHardwareSubcoreCount) {
+        target_address % alignof(AtomicLine) != 0U ||
+        (!shared_layout && !participant_stride_layout && !two_groups_layout) ||
+        (shared_layout && (target_stride_bytes != 0U || primary_group_workers != 0U)) ||
+        (participant_stride_layout && (target_stride_bytes < sizeof(AtomicLine) ||
+                                       target_stride_bytes % alignof(AtomicLine) != 0U || primary_group_workers != 0U)
+        ) ||
+        (two_groups_layout &&
+         (target_stride_bytes < sizeof(AtomicLine) || target_stride_bytes % alignof(AtomicLine) != 0U ||
+          primary_group_workers == 0U || primary_group_workers >= active)) ||
+        identity.worker_slot_id >= launched || identity.hardware_core_id >= kHardwareSubcoreCount) {
         return false;
     }
 
 #if defined(ATOMIC_CURVE_BUILD_MIXED_AIC) || defined(ATOMIC_CURVE_BUILD_MIXED_AIV)
     return scenario == static_cast<uint32_t>(Scenario::Mixed) && block_dim <= kMaxAicWorkers &&
            launched == block_dim * 3U && active_start == 0U && active_aic == (active + 2U) / 3U &&
-           active_aiv == active - active_aic;
+           active_aiv == active - active_aic && (!two_groups_layout || primary_group_workers == active_aic);
 #elif defined(ATOMIC_CURVE_BUILD_AIC)
     return scenario == static_cast<uint32_t>(Scenario::Aic) && block_dim <= kMaxAicWorkers && launched == block_dim &&
-           active_aic == active && active_aiv == 0U;
+           active_aic == active && active_aiv == 0U &&
+           (!two_groups_layout || primary_group_workers == (active + 1U) / 2U);
 #elif defined(ATOMIC_CURVE_BUILD_AIV)
     return scenario == static_cast<uint32_t>(Scenario::Aiv) && block_dim <= kMaxAivWorkers && launched == block_dim &&
-           active_aic == 0U && active_aiv == active;
+           active_aic == 0U && active_aiv == active &&
+           (!two_groups_layout || primary_group_workers == (active + 1U) / 2U);
 #else
     return false;
 #endif
@@ -170,10 +188,25 @@ RunProbe(__gm__ ProbeState *state, __gm__ ProbeResults *results, const WorkerIde
     const uint32_t active_workers = LoadConfigWord(state, 2U);
     const uint32_t launched_workers = LoadConfigWord(state, 3U);
     const uint32_t active_start = LoadConfigWord(state, 9U);
-    __gm__ volatile int64_t *target = reinterpret_cast<__gm__ volatile int64_t *>(LoadConfigDoubleWord(state, 5U));
     const uint32_t active =
         identity.worker_slot_id >= active_start && identity.worker_slot_id - active_start < active_workers ? 1U : 0U;
     const uint32_t participant_id = active != 0U ? identity.worker_slot_id - active_start : 0U;
+    const uint64_t primary_target_address = LoadConfigDoubleWord(state, 5U);
+    const uint32_t scenario = LoadConfigWord(state, 1U);
+    const uint32_t address_layout = LoadConfigWord(state, 12U);
+    const uint32_t target_stride_bytes = LoadConfigWord(state, 13U);
+    const uint32_t primary_group_workers = LoadConfigWord(state, 14U);
+    uint64_t participant_offset = 0U;
+    if (address_layout == static_cast<uint32_t>(AddressLayout::ParticipantStride)) {
+        participant_offset = static_cast<uint64_t>(participant_id) * target_stride_bytes;
+    } else if (address_layout == static_cast<uint32_t>(AddressLayout::TwoGroups)) {
+        const bool secondary_group = scenario == static_cast<uint32_t>(Scenario::Mixed) ?
+                                         identity.role == static_cast<uint32_t>(Role::Aiv) :
+                                         participant_id >= primary_group_workers;
+        if (secondary_group) participant_offset = target_stride_bytes;
+    }
+    __gm__ volatile int64_t *target =
+        reinterpret_cast<__gm__ volatile int64_t *>(primary_target_address + participant_offset);
     uint64_t first_deadline = 0U;
     if (!WaitForFirstDeadline(state, launched_workers, first_deadline)) {
         status |= kStatusBarrierTimeout;

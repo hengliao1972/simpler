@@ -49,6 +49,14 @@ enum class Role : uint32_t {
     Aiv = 1U,
 };
 
+enum class AddressLayout : uint32_t {
+    Shared = 0U,
+    ParticipantStride = 1U,
+    // Pure-role probes split by participant id; mixed probes map AIC to the
+    // primary address and AIV to the secondary address.
+    TwoGroups = 2U,
+};
+
 enum StatusFlag : uint32_t {
     kStatusOk = 0U,
     kStatusConfigInvalid = 1U << 0U,
@@ -69,7 +77,10 @@ struct alignas(64) ProbeConfig {
     uint32_t warmup_waves;
     uint32_t active_worker_start;
     uint64_t target_address;
-    uint64_t reserved[2];
+    uint32_t address_layout;
+    uint32_t target_stride_bytes;
+    uint32_t primary_group_workers;
+    uint32_t reserved;
 };
 static_assert(sizeof(ProbeConfig) == 64U, "probe config must occupy one cache line");
 

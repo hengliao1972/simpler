@@ -1,0 +1,187 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1230" viewBox="0 0 1200 1230">
+<rect width="100%" height="100%" fill="white"/>
+<style>text{font-family:"Noto Sans CJK SC","Microsoft YaHei",sans-serif;fill:#222}.axis{stroke:#333;stroke-width:1}.grid{stroke:#ddd;stroke-width:1}.series{fill:none;stroke-width:2}.mark{stroke:white;stroke-width:1}</style>
+<text x="50" y="34" font-size="22" font-weight="700">Atomic 不同地址 bank 冲突实测</text>
+<line class="grid" x1="75.0" y1="70.0" x2="75.0" y2="370.0"/>
+<text x="75.0" y="389.0" text-anchor="middle" font-size="11">0</text>
+<line class="grid" x1="210.0" y1="70.0" x2="210.0" y2="370.0"/>
+<text x="210.0" y="389.0" text-anchor="middle" font-size="11">512</text>
+<line class="grid" x1="345.0" y1="70.0" x2="345.0" y2="370.0"/>
+<text x="345.0" y="389.0" text-anchor="middle" font-size="11">1024</text>
+<line class="grid" x1="480.0" y1="70.0" x2="480.0" y2="370.0"/>
+<text x="480.0" y="389.0" text-anchor="middle" font-size="11">1536</text>
+<line class="grid" x1="615.0" y1="70.0" x2="615.0" y2="370.0"/>
+<text x="615.0" y="389.0" text-anchor="middle" font-size="11">2048</text>
+<line class="grid" x1="750.0" y1="70.0" x2="750.0" y2="370.0"/>
+<text x="750.0" y="389.0" text-anchor="middle" font-size="11">2560</text>
+<line class="grid" x1="885.0" y1="70.0" x2="885.0" y2="370.0"/>
+<text x="885.0" y="389.0" text-anchor="middle" font-size="11">3072</text>
+<line class="grid" x1="1020.0" y1="70.0" x2="1020.0" y2="370.0"/>
+<text x="1020.0" y="389.0" text-anchor="middle" font-size="11">3584</text>
+<line class="grid" x1="1155.0" y1="70.0" x2="1155.0" y2="370.0"/>
+<text x="1155.0" y="389.0" text-anchor="middle" font-size="11">4096</text>
+<line class="grid" x1="75.0" y1="370.0" x2="1155.0" y2="370.0"/>
+<text x="65.0" y="374.0" text-anchor="end" font-size="11">0.0</text>
+<line class="grid" x1="75.0" y1="270.0" x2="1155.0" y2="270.0"/>
+<text x="65.0" y="274.0" text-anchor="end" font-size="11">0.5</text>
+<line class="grid" x1="75.0" y1="170.0" x2="1155.0" y2="170.0"/>
+<text x="65.0" y="174.0" text-anchor="end" font-size="11">1.0</text>
+<line class="grid" x1="75.0" y1="70.0" x2="1155.0" y2="70.0"/>
+<text x="65.0" y="74.0" text-anchor="end" font-size="11">1.5</text>
+<line class="axis" x1="75.0" y1="370.0" x2="1155.0" y2="370.0"/>
+<line class="axis" x1="75.0" y1="70.0" x2="75.0" y2="370.0"/>
+<text x="615.0" y="412.0" text-anchor="middle" font-size="13">两个不同地址的间距（B）</text>
+<text transform="translate(20 220.0) rotate(-90)" text-anchor="middle" font-size="13">归一化串行比例</text>
+<polyline class="series" stroke="#0072B2" points="75.0,170.0 91.9,170.0 108.8,361.0 125.6,360.4 142.5,360.7 159.4,360.7 176.2,360.4 193.1,360.1 210.0,383.5 226.9,383.5 243.8,383.5 260.6,383.5 277.5,383.5 294.4,383.5 311.2,383.5 328.1,383.5 345.0,375.6 361.9,375.6 378.8,375.6 395.6,374.5 412.5,375.1 429.4,375.6 446.2,375.6 463.1,374.5 480.0,355.4 496.9,355.4 513.8,355.4 530.6,355.0 547.5,355.3 564.4,355.3 581.2,355.4 598.1,355.4 615.0,367.2 631.9,366.6 648.8,366.6 665.6,366.6 682.5,366.6 699.4,366.6 716.2,366.6 733.1,366.6 750.0,375.6 766.9,375.6 783.8,375.6 800.6,375.1 817.5,374.8 834.4,375.6 851.2,374.5 868.1,375.4 885.0,368.9 901.9,368.9 918.8,369.2 935.6,368.9 952.5,368.9 969.4,368.9 986.2,368.9 1003.1,368.9 1020.0,366.6 1036.9,366.6 1053.8,366.6 1070.6,366.6 1087.5,366.6 1104.4,366.6 1121.2,366.6 1138.1,366.1 1155.0,368.9"/>
+<line x1="790" y1="48" x2="814" y2="48" stroke="#0072B2" stroke-width="3"/>
+<text x="820" y="52" font-size="12">纯 AIC</text>
+<polyline class="series" stroke="#D55E00" points="75.0,170.0 91.9,170.0 108.8,367.7 125.6,367.7 142.5,367.7 159.4,367.7 176.2,367.7 193.1,367.7 210.0,368.8 226.9,368.8 243.8,368.8 260.6,368.8 277.5,368.8 294.4,368.8 311.2,368.8 328.1,368.8 345.0,368.8 361.9,368.8 378.8,368.8 395.6,368.8 412.5,368.8 429.4,368.8 446.2,368.8 463.1,368.8 480.0,368.8 496.9,369.4 513.8,368.8 530.6,368.8 547.5,368.8 564.4,369.1 581.2,368.8 598.1,369.4 615.0,367.7 631.9,367.7 648.8,367.7 665.6,367.7 682.5,366.8 699.4,367.7 716.2,367.7 733.1,367.7 750.0,368.8 766.9,368.8 783.8,368.8 800.6,368.8 817.5,368.8 834.4,369.1 851.2,368.8 868.1,368.8 885.0,368.8 901.9,368.8 918.8,368.8 935.6,368.8 952.5,368.8 969.4,369.4 986.2,370.0 1003.1,368.8 1020.0,369.1 1036.9,369.1 1053.8,368.8 1070.6,368.5 1087.5,368.8 1104.4,369.1 1121.2,368.8 1138.1,370.0 1155.0,369.7"/>
+<line x1="915" y1="48" x2="939" y2="48" stroke="#D55E00" stroke-width="3"/>
+<text x="945" y="52" font-size="12">纯 AIV</text>
+<polyline class="series" stroke="#009E73" points="75.0,170.0 91.9,170.0 108.8,367.6 125.6,367.6 142.5,367.6 159.4,367.6 176.2,367.6 193.1,367.6 210.0,368.8 226.9,369.7 243.8,369.7 260.6,368.8 277.5,369.7 294.4,370.0 311.2,370.0 328.1,370.0 345.0,368.8 361.9,368.8 378.8,368.8 395.6,368.8 412.5,368.8 429.4,368.8 446.2,368.8 463.1,368.8 480.0,370.0 496.9,370.0 513.8,370.0 530.6,370.0 547.5,370.0 564.4,370.0 581.2,369.7 598.1,370.0 615.0,367.6 631.9,367.7 648.8,367.9 665.6,367.7 682.5,367.6 699.4,367.7 716.2,367.6 733.1,367.6 750.0,368.8 766.9,369.1 783.8,369.1 800.6,369.4 817.5,370.0 834.4,369.1 851.2,369.1 868.1,370.0 885.0,368.8 901.9,368.2 918.8,368.5 935.6,368.5 952.5,368.8 969.4,368.8 986.2,368.8 1003.1,368.8 1020.0,370.0 1036.9,370.0 1053.8,369.1 1070.6,368.8 1087.5,369.7 1104.4,369.1 1121.2,369.1 1138.1,370.0 1155.0,368.8"/>
+<line x1="1040" y1="48" x2="1064" y2="48" stroke="#009E73" stroke-width="3"/>
+<text x="1070" y="52" font-size="12">AIC+AIV 混合</text>
+<line class="grid" x1="75.0" y1="745.0" x2="1155.0" y2="745.0"/>
+<text x="65.0" y="749.0" text-anchor="end" font-size="11">0</text>
+<line class="grid" x1="75.0" y1="688.0" x2="1155.0" y2="688.0"/>
+<text x="65.0" y="692.0" text-anchor="end" font-size="11">1700</text>
+<line class="grid" x1="75.0" y1="631.0" x2="1155.0" y2="631.0"/>
+<text x="65.0" y="635.0" text-anchor="end" font-size="11">3400</text>
+<line class="grid" x1="75.0" y1="574.0" x2="1155.0" y2="574.0"/>
+<text x="65.0" y="578.0" text-anchor="end" font-size="11">5100</text>
+<line class="grid" x1="75.0" y1="517.0" x2="1155.0" y2="517.0"/>
+<text x="65.0" y="521.0" text-anchor="end" font-size="11">6800</text>
+<line class="grid" x1="75.0" y1="460.0" x2="1155.0" y2="460.0"/>
+<text x="65.0" y="464.0" text-anchor="end" font-size="11">8500</text>
+<line class="grid" x1="75.0" y1="460.0" x2="75.0" y2="745.0"/>
+<text x="75.0" y="764.0" text-anchor="middle" font-size="11">1</text>
+<line class="grid" x1="235.9" y1="460.0" x2="235.9" y2="745.0"/>
+<text x="235.9" y="764.0" text-anchor="middle" font-size="11">8</text>
+<line class="grid" x1="419.7" y1="460.0" x2="419.7" y2="745.0"/>
+<text x="419.7" y="764.0" text-anchor="middle" font-size="11">16</text>
+<line class="grid" x1="603.5" y1="460.0" x2="603.5" y2="745.0"/>
+<text x="603.5" y="764.0" text-anchor="middle" font-size="11">24</text>
+<line class="grid" x1="787.3" y1="460.0" x2="787.3" y2="745.0"/>
+<text x="787.3" y="764.0" text-anchor="middle" font-size="11">32</text>
+<line class="grid" x1="1155.0" y1="460.0" x2="1155.0" y2="745.0"/>
+<text x="1155.0" y="764.0" text-anchor="middle" font-size="11">48</text>
+<line class="axis" x1="75.0" y1="745.0" x2="1155.0" y2="745.0"/>
+<line class="axis" x1="75.0" y1="460.0" x2="75.0" y2="745.0"/>
+<text x="615.0" y="788.0" text-anchor="middle" font-size="13">并发 Core 数 N（AIC+AIV 混合）</text>
+<text transform="translate(20 602.5) rotate(-90)" text-anchor="middle" font-size="13">全局跨度（ns）</text>
+<circle class="mark" cx="75.0" cy="737.8" r="3.5" fill="#333333"/>
+<circle class="mark" cx="98.0" cy="732.1" r="3.5" fill="#333333"/>
+<circle class="mark" cx="143.9" cy="720.4" r="3.5" fill="#333333"/>
+<circle class="mark" cx="235.9" cy="697.4" r="3.5" fill="#333333"/>
+<circle class="mark" cx="419.7" cy="651.6" r="3.5" fill="#333333"/>
+<circle class="mark" cx="603.5" cy="605.7" r="3.5" fill="#333333"/>
+<circle class="mark" cx="787.3" cy="557.1" r="3.5" fill="#333333"/>
+<circle class="mark" cx="1155.0" cy="464.6" r="3.5" fill="#333333"/>
+<polyline class="series" stroke="#333333" points="75.0,737.8 98.0,732.1 143.9,720.4 235.9,697.4 419.7,651.6 603.5,605.7 787.3,557.1 1155.0,464.6"/>
+<line x1="640" y1="438" x2="662" y2="438" stroke="#333333" stroke-width="3"/>
+<text x="668" y="442" font-size="12">同址</text>
+<circle class="mark" cx="75.0" cy="737.8" r="3.5" fill="#CC79A7"/>
+<circle class="mark" cx="98.0" cy="732.1" r="3.5" fill="#CC79A7"/>
+<circle class="mark" cx="143.9" cy="731.7" r="3.5" fill="#CC79A7"/>
+<circle class="mark" cx="235.9" cy="730.4" r="3.5" fill="#CC79A7"/>
+<circle class="mark" cx="419.7" cy="727.8" r="3.5" fill="#CC79A7"/>
+<circle class="mark" cx="603.5" cy="727.7" r="3.5" fill="#CC79A7"/>
+<circle class="mark" cx="787.3" cy="727.5" r="3.5" fill="#CC79A7"/>
+<circle class="mark" cx="1155.0" cy="727.5" r="3.5" fill="#CC79A7"/>
+<polyline class="series" stroke="#CC79A7" points="75.0,737.8 98.0,732.1 143.9,731.7 235.9,730.4 419.7,727.8 603.5,727.7 787.3,727.5 1155.0,727.5"/>
+<line x1="775" y1="438" x2="797" y2="438" stroke="#CC79A7" stroke-width="3"/>
+<text x="803" y="442" font-size="12">步长 64B</text>
+<circle class="mark" cx="75.0" cy="737.8" r="3.5" fill="#56B4E9"/>
+<circle class="mark" cx="98.0" cy="734.8" r="3.5" fill="#56B4E9"/>
+<circle class="mark" cx="143.9" cy="734.8" r="3.5" fill="#56B4E9"/>
+<circle class="mark" cx="235.9" cy="734.7" r="3.5" fill="#56B4E9"/>
+<circle class="mark" cx="419.7" cy="734.6" r="3.5" fill="#56B4E9"/>
+<circle class="mark" cx="603.5" cy="734.5" r="3.5" fill="#56B4E9"/>
+<circle class="mark" cx="787.3" cy="734.4" r="3.5" fill="#56B4E9"/>
+<circle class="mark" cx="1155.0" cy="734.2" r="3.5" fill="#56B4E9"/>
+<polyline class="series" stroke="#56B4E9" points="75.0,737.8 98.0,734.8 143.9,734.8 235.9,734.7 419.7,734.6 603.5,734.5 787.3,734.4 1155.0,734.2"/>
+<line x1="910" y1="438" x2="932" y2="438" stroke="#56B4E9" stroke-width="3"/>
+<text x="938" y="442" font-size="12">步长 512B</text>
+<circle class="mark" cx="75.0" cy="737.8" r="3.5" fill="#E69F00"/>
+<circle class="mark" cx="98.0" cy="737.8" r="3.5" fill="#E69F00"/>
+<circle class="mark" cx="143.9" cy="737.7" r="3.5" fill="#E69F00"/>
+<circle class="mark" cx="235.9" cy="737.4" r="3.5" fill="#E69F00"/>
+<circle class="mark" cx="419.7" cy="737.3" r="3.5" fill="#E69F00"/>
+<circle class="mark" cx="603.5" cy="734.3" r="3.5" fill="#E69F00"/>
+<circle class="mark" cx="787.3" cy="734.1" r="3.5" fill="#E69F00"/>
+<circle class="mark" cx="1155.0" cy="734.0" r="3.5" fill="#E69F00"/>
+<polyline class="series" stroke="#E69F00" points="75.0,737.8 98.0,737.8 143.9,737.7 235.9,737.4 419.7,737.3 603.5,734.3 787.3,734.1 1155.0,734.0"/>
+<line x1="1045" y1="438" x2="1067" y2="438" stroke="#E69F00" stroke-width="3"/>
+<text x="1073" y="442" font-size="12">步长 4096B</text>
+<line class="grid" x1="75.0" y1="1150.0" x2="1155.0" y2="1150.0"/>
+<text x="65.0" y="1154.0" text-anchor="end" font-size="11">0</text>
+<line class="grid" x1="75.0" y1="1090.0" x2="1155.0" y2="1090.0"/>
+<text x="65.0" y="1094.0" text-anchor="end" font-size="11">1800</text>
+<line class="grid" x1="75.0" y1="1030.0" x2="1155.0" y2="1030.0"/>
+<text x="65.0" y="1034.0" text-anchor="end" font-size="11">3600</text>
+<line class="grid" x1="75.0" y1="970.0" x2="1155.0" y2="970.0"/>
+<text x="65.0" y="974.0" text-anchor="end" font-size="11">5400</text>
+<line class="grid" x1="75.0" y1="910.0" x2="1155.0" y2="910.0"/>
+<text x="65.0" y="914.0" text-anchor="end" font-size="11">7200</text>
+<line class="grid" x1="75.0" y1="850.0" x2="1155.0" y2="850.0"/>
+<text x="65.0" y="854.0" text-anchor="end" font-size="11">9000</text>
+<line class="grid" x1="75.0" y1="850.0" x2="75.0" y2="1150.0"/>
+<text x="75.0" y="1169.0" text-anchor="middle" font-size="11">2</text>
+<line class="grid" x1="122.0" y1="850.0" x2="122.0" y2="1150.0"/>
+<text x="122.0" y="1169.0" text-anchor="middle" font-size="11">4</text>
+<line class="grid" x1="215.9" y1="850.0" x2="215.9" y2="1150.0"/>
+<text x="215.9" y="1169.0" text-anchor="middle" font-size="11">8</text>
+<line class="grid" x1="403.7" y1="850.0" x2="403.7" y2="1150.0"/>
+<text x="403.7" y="1169.0" text-anchor="middle" font-size="11">16</text>
+<line class="grid" x1="591.5" y1="850.0" x2="591.5" y2="1150.0"/>
+<text x="591.5" y="1169.0" text-anchor="middle" font-size="11">24</text>
+<line class="grid" x1="779.3" y1="850.0" x2="779.3" y2="1150.0"/>
+<text x="779.3" y="1169.0" text-anchor="middle" font-size="11">32</text>
+<line class="grid" x1="1155.0" y1="850.0" x2="1155.0" y2="1150.0"/>
+<text x="1155.0" y="1169.0" text-anchor="middle" font-size="11">48</text>
+<line class="axis" x1="75.0" y1="1150.0" x2="1155.0" y2="1150.0"/>
+<line class="axis" x1="75.0" y1="850.0" x2="75.0" y2="1150.0"/>
+<text x="615.0" y="1193.0" text-anchor="middle" font-size="13">总 Core 数 N（混合场景按 AIC/AIV 分成两组）</text>
+<text transform="translate(20 1000.0) rotate(-90)" text-anchor="middle" font-size="13">全局跨度（ns）</text>
+<text x="75" y="827" font-size="14" font-weight="700">两个组内同址热点的并发曲线</text>
+<circle class="mark" cx="75.0" cy="1137.1" r="3.5" fill="#333333"/>
+<circle class="mark" cx="122.0" cy="1125.6" r="3.5" fill="#333333"/>
+<circle class="mark" cx="215.9" cy="1102.7" r="3.5" fill="#333333"/>
+<circle class="mark" cx="403.7" cy="1057.2" r="3.5" fill="#333333"/>
+<circle class="mark" cx="591.5" cy="1011.4" r="3.5" fill="#333333"/>
+<circle class="mark" cx="779.3" cy="963.6" r="3.5" fill="#333333"/>
+<circle class="mark" cx="1155.0" cy="871.2" r="3.5" fill="#333333"/>
+<polyline class="series" stroke="#333333" points="75.0,1137.1 122.0,1125.6 215.9,1102.7 403.7,1057.2 591.5,1011.4 779.3,963.6 1155.0,871.2"/>
+<line x1="485" y1="823" x2="507" y2="823" stroke="#333333" stroke-width="3"/>
+<text x="513" y="827" font-size="12">同址</text>
+<circle class="mark" cx="75.0" cy="1137.1" r="3.5" fill="#CC79A7"/>
+<circle class="mark" cx="122.0" cy="1125.5" r="3.5" fill="#CC79A7"/>
+<circle class="mark" cx="215.9" cy="1102.7" r="3.5" fill="#CC79A7"/>
+<circle class="mark" cx="403.7" cy="1057.2" r="3.5" fill="#CC79A7"/>
+<circle class="mark" cx="591.5" cy="1011.5" r="3.5" fill="#CC79A7"/>
+<circle class="mark" cx="779.3" cy="963.6" r="3.5" fill="#CC79A7"/>
+<circle class="mark" cx="1155.0" cy="871.1" r="3.5" fill="#CC79A7"/>
+<polyline class="series" stroke="#CC79A7" stroke-dasharray="7 4" points="75.0,1137.1 122.0,1125.5 215.9,1102.7 403.7,1057.2 591.5,1011.5 779.3,963.6 1155.0,871.1"/>
+<line x1="650" y1="823" x2="672" y2="823" stroke="#CC79A7" stroke-width="3" stroke-dasharray="7 4"/>
+<text x="678" y="827" font-size="12">64B 同 128B</text>
+<circle class="mark" cx="75.0" cy="1142.7" r="3.5" fill="#009E73"/>
+<circle class="mark" cx="122.0" cy="1136.8" r="3.5" fill="#009E73"/>
+<circle class="mark" cx="215.9" cy="1119.3" r="3.5" fill="#009E73"/>
+<circle class="mark" cx="403.7" cy="1090.4" r="3.5" fill="#009E73"/>
+<circle class="mark" cx="591.5" cy="1055.9" r="3.5" fill="#009E73"/>
+<circle class="mark" cx="779.3" cy="1026.9" r="3.5" fill="#009E73"/>
+<circle class="mark" cx="1155.0" cy="961.0" r="3.5" fill="#009E73"/>
+<polyline class="series" stroke="#009E73" points="75.0,1142.7 122.0,1136.8 215.9,1119.3 403.7,1090.4 591.5,1055.9 779.3,1026.9 1155.0,961.0"/>
+<line x1="815" y1="823" x2="837" y2="823" stroke="#009E73" stroke-width="3"/>
+<text x="843" y="827" font-size="12">64B 跨 128B</text>
+<circle class="mark" cx="75.0" cy="1139.9" r="3.5" fill="#56B4E9"/>
+<circle class="mark" cx="122.0" cy="1133.4" r="3.5" fill="#56B4E9"/>
+<circle class="mark" cx="215.9" cy="1116.6" r="3.5" fill="#56B4E9"/>
+<circle class="mark" cx="403.7" cy="1088.0" r="3.5" fill="#56B4E9"/>
+<circle class="mark" cx="591.5" cy="1053.9" r="3.5" fill="#56B4E9"/>
+<circle class="mark" cx="779.3" cy="1025.3" r="3.5" fill="#56B4E9"/>
+<circle class="mark" cx="1155.0" cy="959.9" r="3.5" fill="#56B4E9"/>
+<polyline class="series" stroke="#56B4E9" points="75.0,1139.9 122.0,1133.4 215.9,1116.6 403.7,1088.0 591.5,1053.9 779.3,1025.3 1155.0,959.9"/>
+<line x1="980" y1="823" x2="1002" y2="823" stroke="#56B4E9" stroke-width="3"/>
+<text x="1008" y="827" font-size="12">相隔 512B</text>
+</svg>
