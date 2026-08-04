@@ -3621,3 +3621,66 @@ candidate mean   改善 0.013058 ms / 0.908%
 收敛门槛均闭合，因此本阶段作为有效优化保留。它没有达到 1 ms 目标；后续仍需
 继续审视必要返回型 Atomic，并依据 S6.56 的大块归因处理 exec payload 的 GM
 访问。按用户要求，下一阶段先把 FinalDrain 内所有 `>=1 us` 未解释区间补齐。
+
+## 2026-08-04：S6.58 补齐 FinalDrain 的大块开销归因
+
+### 观察口径
+
+本阶段复用 S6.57 的同一份 B256 full-swimlane raw，不修改设备代码，也不增加
+设备记录。FinalDrain 内的 fanin/fatal/drain-arrival PollBatch 只是“从第一次
+到最后一次轮询”的汇总区间；其中会穿插 GM token/plan 访问、Scalar 判断甚至
+同步 kernel，不能把整段时长解释成 atomic 指令耗时。
+
+转换器因此采用以下边界：
+
+- direct Atomic、DCCI、Kernel、Commit 保持设备记录的精确起止；
+- PollBatch 继续作为带调用次数的等待背景显示，但不拿它切割普通代码空白；
+- 只在相邻 direct 边界之间，根据 FinalDrain 源码状态机派生不少于 `1 us`
+  的业务 span；标签明确写出 `[GM+Scalar]` 或
+  `[AtomicPoll+GM+Scalar]`，不伪装成单一硬件事件；
+- 派生仅发生在 merged 转换阶段，raw 仍为 `53,242` 条。
+
+### FinalDrain 组成
+
+96 核 FinalDrain 父区间累计 `30.432 ms` core-time，单核范围
+`182.950–431.108 us`。其中同步 kernel 共 `382` 段、累计
+`11.699 ms`；direct atomic 共 `2,043` 条、累计约 `0.513 ms`；payload
+invalidate DCCI 共 `228` 条、累计 `15.660 us`。另外有 96 条 fanin
+PollBatch，汇总 `12,827` 次 completion flag load；它们的显示区间与普通
+控制代码重叠，不能再与上述项目直接相加。
+
+原先共有 `815` 段不少于 `1 us` 的未解释空白，累计 `17.712 ms`
+core-time。补齐后的分布为：
+
+| 离线业务区间 | 条数 | 累计 core-time | 单条范围 | 解释 |
+| ---- | ----: | ----: | ----: | ---- |
+| `wait_fanin_and_prepare_engine[AtomicPoll+GM+Scalar]` | 382 | 16.433 ms | 1.046–211.539 us | 等待 fanin completion，读取 owner token/payload，完成 ready 判断并准备 engine；不含随后单独显示的 kernel |
+| `defer_token_and_scan_candidates[AtomicPoll+GM+Scalar]` | 41 | 0.371 ms | 6.314–12.199 us | payload invalidate 后首次推进新 token；未 ready 时继续扫描候选 |
+| `recycle_token_and_scan_candidates[GM+Scalar]` | 133 | 0.331 ms | 1.001–4.994 us | completion 后复位 token，并读取 plan/control 寻找后续候选 |
+| `reobserve_blocked_candidate[GM+Scalar]` | 62 | 0.180 ms | 1.021–4.896 us | 当前 `EMPTY/BUILDING` 候选尚不能越过，下一轮再次观察同一 cell |
+| `verify_local_drain_and_encode_arrival[GM+Scalar]` | 87 | 0.144 ms | 1.010–2.949 us | 核对 scanner、两个 token 和本核 completion 计数，再编码 drain arrival |
+| `inspect_tokens_and_plan[GM+Scalar]` | 30 | 0.107 ms | 1.111–9.885 us | FinalDrain 入口恢复本核 token，并读取不可变 dispatch plan |
+| `scan_exec_candidates[GM+Scalar]` | 68 | 0.094 ms | 1.004–2.039 us | 在候选 cursor 上跳过不属于本核或已由另一候选处理的任务 |
+| `root_wait_arrivals_and_validate[AtomicPoll+GM+Scalar]` | 1 | 39.706 us | 39.706 us | root 轮询 16 个 arrival group，并核对完成总数 |
+| `close_after_arrival[Scalar]` | 8 | 8.639 us | 1.031–1.214 us | 非 root 发布 arrival 后关闭本核 FinalDrain |
+| `evaluate_exec_claim[GM+Scalar]` | 3 | 4.111 us | 1.108–1.790 us | 从 cell state 观察结果计算本核 Claim 条件 |
+
+`wait_fanin_and_prepare_engine` 占派生 core-time 的 `92.78%`，但其长尾大多
+是依赖尚未完成时的并行等待，不等价于可直接删除的 Scalar 指令。更明确的
+可优化证据是 Claim 后的控制流：当前先单独推进新 token，随后又调用
+`ProgressCrossCoreOwnedTokens()` 扫描两个 token；当新 token 尚未 ready 时，
+会在同一调度边界立即重复检查它，既重复执行 GM/header 校验，也多做一次必要
+返回型 fanin atomic load。下一阶段优先消除这次重复推进，再用 fanin load
+调用数、非 kernel 泳道区间和端到端 perf-clock 三条证据共同裁决。
+
+### 闭合结果
+
+- 新增 815 条离线派生事件，merged 共 `71,753` 条、约 `7.8 MiB`；设备 raw
+  数量、ABI 和运行开销完全不变；
+- direct Atomic/DCCI/Kernel/Commit 与派生 span 没有重叠；
+- 把两者做区间并集后，96 核 FinalDrain 中仍未标识的 `>=1 us` 空白为 0；
+- converter 65 项单测全部通过，新增门槛专门证明：即使 PollBatch 覆盖整个
+  FinalDrain，也不会吞掉内部 GM/Scalar 派生区间；root 与非 root 的尾部
+  收口分别显示；
+- 可审阅泳道为
+  `test_record/2026-8-4/cross_b256_s657_full.json`（产物不提交）。

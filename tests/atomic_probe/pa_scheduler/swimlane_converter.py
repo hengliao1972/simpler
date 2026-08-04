@@ -1990,6 +1990,115 @@ def _iter_v5_cross_core_semantic_gap_spans(
                 cursor = current_end
                 previous = current
 
+    # FinalDrain 不再生产 Build，只反复推进 owner-local token、扫描可执行
+    # candidate，并在本核排空后参加全局 drain 汇合。设备侧 PollBatch 记录
+    # 覆盖整个轮询 episode，里面既有 fanin/drain atomic load，也夹着 GM
+    # control/payload 读取和 Scalar 判断，不能把其总时长冒充成 atomic 指令
+    # 延迟。因此这里仍以逐调用 direct Atomic、DCCI、Kernel、Commit 为切点，
+    # 再把相邻切点间不少于 1 us 的业务代码离线标出；不增加 raw 记录。
+    for parent in (row for row in rows if row[5] == "FinalDrain"):
+        boundaries = [
+            row for row in contained(parent)
+            if row[5] in ("Atomic", "Dcci", "Kernel", "Commit")
+            and not (
+                row[5] == "Atomic"
+                and int(row[8]) & ATOMIC_POLL_BATCH
+            )
+        ]
+        boundaries.sort(
+            key=lambda row: (int(row[6]), int(row[7]), str(row[5]))
+        )
+        cursor = int(parent[6])
+        previous: tuple[Any, ...] | None = None
+        for current in boundaries:
+            current_start = int(current[6])
+            current_end = int(current[7])
+            if current_start > cursor:
+                previous_phase = None if previous is None else str(previous[5])
+                previous_site = (
+                    None if previous is None else int(previous[9])
+                )
+                previous_task = (
+                    None if previous is None else int(previous[3])
+                )
+                current_phase = str(current[5])
+                current_site = int(current[9])
+                current_task = int(current[3])
+                name: str | None = None
+
+                # Kernel 前的长区间可能包含多轮 fanin flag load；PollBatch
+                # 已在泳道中显示其调用次数，这里只补齐同一时间内的 GM
+                # token/payload 访问、Scalar ready 判断与 engine 参数准备。
+                if current_phase == "Kernel":
+                    name = (
+                        "final_drain.wait_fanin_and_prepare_engine"
+                        f"[AtomicPoll+GM+Scalar]#{current_task}"
+                    )
+                elif current_phase == "Atomic" and current_site == 45:
+                    if previous is None:
+                        name = (
+                            "final_drain.inspect_tokens_and_plan[GM+Scalar]"
+                        )
+                    elif previous_phase == "Dcci" and previous_site == 12:
+                        name = (
+                            "final_drain.defer_token_and_scan_candidates"
+                            "[AtomicPoll+GM+Scalar]"
+                        )
+                    elif previous_phase == "Commit":
+                        name = (
+                            "final_drain.recycle_token_and_scan_candidates"
+                            "[GM+Scalar]"
+                        )
+                    elif previous_phase == "Atomic" and previous_site == 45:
+                        if previous_task == current_task:
+                            name = (
+                                "final_drain.reobserve_blocked_candidate"
+                                f"[GM+Scalar]#{current_task}"
+                            )
+                        else:
+                            name = (
+                                "final_drain.scan_exec_candidates[GM+Scalar]"
+                            )
+                elif (
+                    current_phase == "Atomic"
+                    and current_site == 48
+                    and previous_phase == "Atomic"
+                    and previous_site == 45
+                    and previous_task == current_task
+                ):
+                    name = (
+                        "final_drain.evaluate_exec_claim[GM+Scalar]"
+                        f"#{current_task}"
+                    )
+                elif current_phase == "Atomic" and current_site == 52:
+                    name = (
+                        "final_drain.verify_local_drain_and_encode_arrival"
+                        "[GM+Scalar]"
+                    )
+
+                if name is not None:
+                    yield from emit_if_large(
+                        parent, cursor, current_start, name,
+                    )
+            if current_end > cursor:
+                cursor = current_end
+                previous = current
+
+        # 非 root 发布 arrival 后直接关闭本核；root 继续轮询所有 arrival
+        # group 并核对完成数。后者包含 PollBatch 记录所汇总的 atomic loads，
+        # 因而显式标成混合区间，不能解释为纯 Scalar 或纯 atomic。
+        if int(parent[7]) > cursor and previous is not None:
+            if previous[5] == "Atomic" and int(previous[9]) == 52:
+                tail_name = (
+                    "final_drain.root_wait_arrivals_and_validate"
+                    "[AtomicPoll+GM+Scalar]"
+                    if int(parent[0]) == 0
+                    else "final_drain.close_after_arrival[Scalar]"
+                )
+                yield from emit_if_large(
+                    parent, cursor, int(parent[7]), tail_name,
+                )
+
 
 # 写一个 Chrome Trace Event，并统一处理数组元素间的逗号。
 def _emit_event(output: TextIO, event: dict[str, Any], first: bool) -> bool:

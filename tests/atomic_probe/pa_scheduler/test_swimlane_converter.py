@@ -2206,6 +2206,99 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             "execute.recycle_token_and_continue[GM+Scalar]#20", by_name
         )
 
+    def test_v5_cross_core_final_drain_gaps_ignore_poll_batch_overlay(
+        self,
+    ) -> None:
+        # PollBatch 覆盖整个 FinalDrain，但它只是多次 atomic load 的汇总
+        # 时间区间，中间仍会执行 GM/Scalar 工作。派生器必须忽略它作为
+        # 切点，并用已有 direct Atomic/DCCI/Kernel/Commit 端点补齐大缝。
+        rows = [
+            (0, 0, 0, -1, -1, "FinalDrain", 200_000, 260_000, 0, 0),
+            (
+                0, 0, 0, -1, -1, "Atomic",
+                200_000, 260_000, 0x290, 5,
+            ),
+            (0, 0, 0, 100, -1, "Atomic", 202_000, 202_200, 0x50, 45),
+            (0, 0, 0, 100, -1, "Atomic", 204_000, 204_200, 0x54, 48),
+            (0, 0, 0, 100, -1, "Dcci", 205_000, 205_200, 0x10C, 12),
+            (0, 0, 0, 101, -1, "Atomic", 209_000, 209_200, 0x50, 45),
+            (0, 0, 0, 101, -1, "Atomic", 211_000, 211_200, 0x50, 45),
+            (0, 0, 0, 101, -1, "Atomic", 213_000, 213_200, 0x54, 48),
+            (0, 0, 0, 101, -1, "Dcci", 214_000, 214_200, 0x10C, 12),
+            (0, 0, 0, 101, 1, "Kernel", 220_000, 230_000, 0, 0),
+            (0, 0, 0, 101, 1, "Commit", 231_000, 231_000, 0, 0),
+            (0, 0, 0, 102, -1, "Atomic", 234_000, 234_200, 0x50, 45),
+            (0, 0, 0, -1, -1, "Atomic", 237_000, 237_200, 0x52, 52),
+            # 非 root 用独立父区间验证 arrival 后只执行本核关闭逻辑。
+            (1, 1, 0, -1, -1, "FinalDrain", 301_500, 306_000, 0, 0),
+            (1, 1, 0, -1, -1, "Atomic", 302_000, 302_200, 0x52, 52),
+        ]
+        raw_count = len(rows)
+        spans = list(
+            _iter_v5_cross_core_semantic_gap_spans(
+                rows, 1_000_000_000, 5, "shared", "central_ticket"
+            )
+        )
+        self.assertEqual(len(rows), raw_count)
+        by_name = {span[5]: span[3:5] for span in spans}
+        self.assertEqual(
+            by_name["final_drain.inspect_tokens_and_plan[GM+Scalar]"],
+            (200_000, 202_000),
+        )
+        self.assertEqual(
+            by_name[
+                "final_drain.evaluate_exec_claim[GM+Scalar]#100"
+            ],
+            (202_200, 204_000),
+        )
+        self.assertEqual(
+            by_name[
+                "final_drain.defer_token_and_scan_candidates"
+                "[AtomicPoll+GM+Scalar]"
+            ],
+            (205_200, 209_000),
+        )
+        self.assertEqual(
+            by_name[
+                "final_drain.reobserve_blocked_candidate[GM+Scalar]#101"
+            ],
+            (209_200, 211_000),
+        )
+        self.assertEqual(
+            by_name[
+                "final_drain.wait_fanin_and_prepare_engine"
+                "[AtomicPoll+GM+Scalar]#101"
+            ],
+            (214_200, 220_000),
+        )
+        self.assertEqual(
+            by_name[
+                "final_drain.recycle_token_and_scan_candidates[GM+Scalar]"
+            ],
+            (231_000, 234_000),
+        )
+        self.assertEqual(
+            by_name[
+                "final_drain.verify_local_drain_and_encode_arrival"
+                "[GM+Scalar]"
+            ],
+            (234_200, 237_000),
+        )
+        self.assertEqual(
+            by_name[
+                "final_drain.root_wait_arrivals_and_validate"
+                "[AtomicPoll+GM+Scalar]"
+            ],
+            (237_200, 260_000),
+        )
+        self.assertEqual(
+            by_name["final_drain.close_after_arrival[Scalar]"],
+            (302_200, 306_000),
+        )
+        self.assertTrue(
+            all(end - start >= 1_000 for *_, start, end, _name in spans)
+        )
+
     def test_v4_shared_task_zero_forbids_insert_turn_poll_batch(self) -> None:
         capture = _v5_shared_register_atomic_capture()
         rows = capture["fdwic_events"]
