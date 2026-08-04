@@ -3813,3 +3813,59 @@ fanin 热分支改变了关键路径及代码布局，代价显著高于空 buck
 该候选的全部代码、ABI generation 和 host 口径修改均已撤销，只保留本记录；
 后续不再通过扩展 completion 编码消除这批查询，应优先寻找不增加每 task 热
 控制流的 GM/Atomic 消减。
+
+## 2026-08-04：S6.61 复用严格插入完成链，删除 SharedOutputRef 重复发布读取
+
+### 冗余读取与可见性证明
+
+S6.59 的 cross-core 正式路径在每个 `SharedOutputRef` fanin 上都会读一次
+`SharedOutputCell::published[slot]`，B256 共产生 `2048` 次返回型 Atomic load。
+该 load 原本是为了确认 producer 已完成 TensorDesc 发布，但在当前严格
+TensorMap 插入协议中已经有更强的顺序证据：
+
+1. producer 先写完 TensorDesc，对 descriptor 执行 DCCI clean-out + DSB；
+2. producer 再用 Exchange 发布 `published`；
+3. 该 task 的 insert-completion CAS 发生在上述两步之后；
+4. reader N 在严格 N-1 completion chain 上前进，并在完成自己的
+   insert-completion 发布后才执行 fanin lookup；
+5. 因此对任意 producer P < N，completion chain 已经递归证明 P 的
+   descriptor flush 和 `published` 先于 reader 的 fanin lookup；
+6. latest-writer load/history 解析仍然保留，它负责校验 symbol writer 链；
+   adapter 也仍然对 TensorDesc 本体执行 invalidate。因此删除的只是重复
+   control-line 读取，没有删除 descriptor 的跨核可见性操作。
+
+实现上为 `CollectSharedFanin` 增加一个编译期协议身份。只有当调用者
+同时使用 ordered latest-writer 路径、且明确持有完整 completion-chain 证明时，
+编译器才删除 `published` load。旧 generic/ordered 调用者继续保留原有校验或等待，
+不把 cross-core 的强协议假设泄漏给其他路径。
+
+### 正确性、调用数与 A5 性能
+
+- CPU 定向门槛证明：旧 ordered 路径仍执行 1 次 publication load；
+  trusted completion-chain 路径执行 0 次，两者解析出完全相同的 writer。
+- 完整 CPU scheduler 回归、CCEC AIC/AIV 编译与 A5 B1 全部 PASS。
+- A5 B256 full-swimlane 中，`shared_output_ref_fanin_output_published_load`
+  从 `2048` 次、累计 `513.655 us` core-time 精确变为 0；1280 task、1024
+  kernel 全部完成，trace drop 为 0，分区校验全部 PASS。
+- 最新诊断构建的 Submit 全局区间为 `1.006 ms`；按统一口径从
+  startup 起点到最后一个 FinalDrain 结束为 `1.442 ms`。该单次泳道时间只用于
+  诊断，不与 trace-free ELF 直接相减。
+
+以 S6.59 冻结 ELF 为基线，执行 24 对独立 B256 trace-free 交替 A/B，并在
+后 12 对反转执行顺序：
+
+```text
+S6.59 frozen baseline: min / median / max / mean
+                       1.394955 / 1.419225 / 1.451736 / 1.420348 ms
+S6.61 no reload      : min / median / max / mean
+                       1.384210 / 1.411355 / 1.452462 / 1.412715 ms
+
+配对收益中位数 = +0.556%
+配对收益均值   = +0.525%
+24 对中候选获胜 15 对
+```
+
+这次变更同时满足“返回型 Atomic 调用数减少”和“trace-free 端到端收益”，
+且不依赖 PA task kind、batch 数或固定图形，因此作为通用 shared cross-core
+协议优化保留。可审阅泳道为
+`test_record/2026-8-4/cross_b256_no_publish_reload_1p442ms.json`（产物不提交）。

@@ -2400,6 +2400,37 @@ void TestOrderedPreparedSymbolUsesSinglePublicationCheck() {
         "ordered latest-writer lookup also uses one check without waiting"
     );
 
+    // 正式 cross-core Build 在 reader 自己发布 insert completion 后才调用
+    // fanin：producer descriptor flush/published 已由逐 task completion 链
+    // 传递，latest-writer load 继续验证 symbol 链，不应再重复读 published。
+    LocalStats trusted_reader_stats{};
+    int32_t trusted_fanin[kMaxFanin] = {};
+    bool trusted_protocol_ok = false;
+    uint32_t trusted_ordinary_lookups = UINT32_MAX;
+    SymbolTestOps::wait_address =
+        &map->shared_outputs[kProducer].published[0].value;
+    SymbolTestOps::wait_loads.store(0, std::memory_order_relaxed);
+    const uint32_t trusted_fanin_count =
+        CollectSharedFanin<
+            SymbolTestOps, false, true, false, true, true
+        >(
+            *map, reader_args, kReader, kHeapWindow,
+            trusted_reader_stats, trusted_fanin,
+            trusted_protocol_ok, trusted_ordinary_lookups,
+            &fatal
+        );
+    SymbolTestOps::wait_address = nullptr;
+    Check(
+        trusted_protocol_ok && trusted_fanin_count == 1 &&
+            trusted_fanin[0] == kWriter &&
+            trusted_ordinary_lookups == 0 &&
+            SymbolTestOps::wait_loads.load(
+                std::memory_order_relaxed
+            ) == 0,
+        "completion-chain fanin resolves the same writer without a "
+        "second published load"
+    );
+
     ResetSharedState(*map);
     fatal = 0;
     SymbolTestOps::wait_address =

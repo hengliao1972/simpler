@@ -1942,7 +1942,8 @@ template <
     typename Ops, bool ChainedWriter = false,
     bool AcceptLatestWriter = false,
     bool UsePaAccumulatorGroupWriter = false,
-    bool NoOrdinaryReclaim = false
+    bool NoOrdinaryReclaim = false,
+    bool TrustOutputPublishedFromInsertChain = false
 >
 PA_DEVICE uint32_t CollectSharedFanin(
     PA_GM SharedTensorMapSidecar &map, const TaskArgs &args,
@@ -1961,6 +1962,10 @@ PA_DEVICE uint32_t CollectSharedFanin(
     static_assert(
         !UsePaAccumulatorGroupWriter || AcceptLatestWriter,
         "PA accumulator group writer requires latest-writer history lookup"
+    );
+    static_assert(
+        !TrustOutputPublishedFromInsertChain || AcceptLatestWriter,
+        "output-publication proof requires the ordered latest-writer path"
     );
     protocol_ok = true;
     ordinary_lookup_count = 0;
@@ -2041,30 +2046,30 @@ PA_DEVICE uint32_t CollectSharedFanin(
                 protocol_ok = false;
                 return 0;
             }
-            PA_GM SharedOutputCell &cell =
-                map.shared_outputs[static_cast<uint32_t>(output_ref.producer_task_id)];
-            bool output_published = false;
-            if constexpr (AcceptLatestWriter) {
-                // ordered Submit 在本 task 的 I commit 后才进入该实例；
-                // predecessor completion 链已经证明 producer 完成了 output
-                // 发布，未就绪只能立即按协议错误返回，不能重新打开轮询。
-                output_published =
-                    CheckSharedOutputPublishedAfterInsertTurn<
-                        Ops, true
-                    >(
-                        map, output_ref, task_id,
-                        AtomicSite::SharedFaninOutputPublishedLoad,
-                        &stats
-                    );
-            } else {
-                output_published =
-                    WaitForSharedOutputPublished<Ops>(
-                        map, output_ref, fatal
-                    );
-            }
-            if (!output_published) {
-                protocol_ok = false;
-                return 0;
+            if constexpr (!TrustOutputPublishedFromInsertChain) {
+                bool output_published = false;
+                if constexpr (AcceptLatestWriter) {
+                    // 旧 ordered 调用者只证明“不必等待”，仍保留一次
+                    // published 权威校验；完整 completion-chain 证明由
+                    // 独立 template 身份在编译期删除这枚 load。
+                    output_published =
+                        CheckSharedOutputPublishedAfterInsertTurn<
+                            Ops, true
+                        >(
+                            map, output_ref, task_id,
+                            AtomicSite::SharedFaninOutputPublishedLoad,
+                            &stats
+                        );
+                } else {
+                    output_published =
+                        WaitForSharedOutputPublished<Ops>(
+                            map, output_ref, fatal
+                        );
+                }
+                if (!output_published) {
+                    protocol_ok = false;
+                    return 0;
+                }
             }
             if (tag != TensorArgType::Input &&
                 tag != TensorArgType::Inout &&
@@ -2117,6 +2122,12 @@ PA_DEVICE uint32_t CollectSharedFanin(
                 // PA 迁移完成前保留原来的精确 oracle：默认单组要求
                 // writer==descriptor producer，ChainedWriter 只允许调用方
                 // 指定的 accumulator 链。两种口径不能静默混用。
+                PA_GM SharedOutputCell &cell =
+                    map.shared_outputs[
+                        static_cast<uint32_t>(
+                            output_ref.producer_task_id
+                        )
+                    ];
                 const bool chained_ref =
                     ChainedWriter &&
                     output_ref.producer_task_id ==

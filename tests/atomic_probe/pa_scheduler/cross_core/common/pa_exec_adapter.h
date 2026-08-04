@@ -252,10 +252,12 @@ PA_DEVICE bool ResolvePaExecPayloadSourceAfterFanin(
                 ];
             const uint32_t output_slot =
                 static_cast<uint32_t>(output_ref.output_slot);
-            // AfterFanin 是硬前置合同：CollectSharedFanin 已经成功验证
-            // published，adapter 不得再做一次返回型 atomic load。这里仅
-            // 对 descriptor 做一次 invalidate；fresh descriptor 此后不可变，
-            // Pack 可直接逐 word 读取，不把 SharedOutputRef 带给 executor。
+            // AfterFanin 是硬前置合同：strict insert completion chain 已经
+            // 证明 producer 的 descriptor flush 与 published 先于当前
+            // Build；latest-writer 解析又验证了该 symbol 的 writer 链。
+            // adapter 不得再做返回型 published load，只对 descriptor 做
+            // 一次 invalidate；fresh descriptor 此后不可变，Pack 可直接
+            // 逐 word 读取，不把 SharedOutputRef 带给 executor。
             observer.InvalidateBuildDescriptor(
                 &output_cell.tensors[output_slot],
                 sizeof(TensorDesc), task_id

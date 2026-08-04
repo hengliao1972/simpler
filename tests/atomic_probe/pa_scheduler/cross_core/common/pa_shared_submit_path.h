@@ -939,7 +939,7 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         // latest 沿不可变 history 回退到 max(writer < task_id)。这同时
         // 覆盖首组与后续组，不再依赖 PA 专用 chained-writer 特判。
         context.fanin_count = static_cast<int32_t>(
-            CollectSharedFanin<Ops, false, true, true, true>(
+            CollectSharedFanin<Ops, false, true, true, true, true>(
                 state->shared_map, args,
                 static_cast<int32_t>(task_id),
                 static_cast<int32_t>(state->heap_window),
