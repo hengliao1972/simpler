@@ -219,7 +219,11 @@ SPLIT_STATE_STORAGE_BYTES=1728
 # AIC 尾部多一组等价出口被 CCEC 合并；A5 placement 仍保留原 switch 形状，
 # readelf 确认它们仍只指向本角色唯一 finish 符号；继续精确冻结实际
 # 机器码形状，不放宽为范围判断。
-SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC=2
+# Build ticket 前的 global-fatal 低频分支让 perf-clock AIC 的等价尾部
+# 从两组重新拆成三组；readelf 逐条确认三条 relocation 仍只指向本角色
+# 唯一 finish。任务种类覆盖继续由 dispatch 与动态门槛证明，这里按实际
+# 机器码精确冻结为 3，不放宽成范围。
+SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC=3
 SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIV=4
 # execution drain 分组 root 分支改变了 full-swimlane AIC 的尾合并形状；
 # 删除 replay barrier 后 CCEC 又合并一组等价出口，对象文件为四个 relocation，

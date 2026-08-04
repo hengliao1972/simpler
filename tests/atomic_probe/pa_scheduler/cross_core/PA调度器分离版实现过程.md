@@ -3538,3 +3538,86 @@ Register 和 FinalDrain 中的 PollBatch 继续保持原名。它只证明该 ep
 优化应优先区分两条证据链：必要返回型 atomic 继续从原语数量/竞争协议入手；
 非 atomic 则优先检查 exec payload 的 GM 写入与跨核 bind 搬运，不能再把它们
 归入笼统空白或 atomic 波动。
+
+## 2026-08-04：S6.57 降低中央 Build 循环的 global-fatal 观察频率
+
+### 原因与停止合同
+
+S6.55 的 B256 full-swimlane 中有 `1,472` 条直接
+`atomic.return_ready.fatal_poll.load`：其中 `96` 条是进入 orchestration 前
+每核一次的立即观察，余下 `1,376` 条恰好对应 `1,280` 张有效中央 Build
+ticket 加每核一张越界 ticket。后者让所有 Scalar 在每次领取 ticket 前读取
+同一条 global-fatal cache line，但它不参与 TensorMap 严格插入、Build
+所有权、执行 Claim 或 completion 发布。
+
+本阶段不删除错误传播，只把成功热路收敛为以下有界合同：
+
+1. 启动同步结束后、进入中央 ticket 循环前仍立即观察一次 global fatal；
+2. 每个 worker 每完成 `8` 个 Build 再观察一次，远端错误发生后最多额外处理
+   `7` 个尚未领取的 task；
+3. 已经取得的合法 Build 工作单元允许完整结束；
+4. central ticket 总量固定为 `task_count + workers`，不会因降低观察频率形成
+   无限生产；
+5. strict-insert、fanin 等真正可能阻塞的等待慢路继续保留自己的低频 fatal
+   观察与 watchdog；
+6. worker 进入 FinalDrain 后第 `0` 轮立即观察 terminal，随后沿用既有低频
+   最终观察；本核发现协议错误仍立即发布首错。
+
+该合同只依赖“有界中央唯一 ticket + 等待慢路可终止 + FinalDrain 最终观察”，
+不读取 PA 的五段 task 图、batch 形状或具体 kernel 类型，因而属于公共
+cross-core 调度优化。
+
+CPU 增加两层门槛：纯函数门槛精确锁定 `0` 不重复观察、`8/16/24` 观察；
+96-worker 动态门槛在 task 32 的合法 Build 后只注入 scheduler fatal。结果为：
+
+```text
+remote_fatal_cadence_closure=PASS
+injections=1
+attempts=396
+terminal ticket upper bound=320+96=416
+```
+
+所有 worker 均返回，scheduler fatal 保持为 1，execution reason 保持为空，
+证明低频观察既不会挂死，也不会伪造第二种错误原因。完整 CPU 协议回归通过。
+
+### A5 full-swimlane
+
+候选 B256 泳道位于：
+
+`outputs/pa_scheduler_cross_core_shared_swimlane_20260804_044632_898837/ccec/merged_swimlane.json`
+
+1280 个 Build、1024 个 kernel、TensorMap 严格插入、payload、fanin、completion、
+execution drain 与全部后处理检查均 PASS，且无 trace drop。与 S6.55 同口径对比：
+
+| 指标 | S6.55 | S6.57 | 变化 |
+| ---- | ----: | ----: | ----: |
+| direct `fatal_poll` | 1,472 | 207 | -1,265 / -85.938% |
+| direct `fatal_poll` 累计 core-time | 1,420.134 us | 178.039 us | -1,242.095 us |
+| physical Atomic records | 33,280 | 31,930 | -1,350 |
+| full-swimlane 完整周期 | 1,466.841 us | 1,448.855 us | -17.986 us / -1.226% |
+
+full-swimlane 单次只证明调用数量、正确性和方向，不作为最终性能裁决。候选分支
+使 perf-clock AIC 的等价 split-finish relocation 从 `2` 变成 `3`，AIV 保持
+`4`；`readelf` 已逐条确认 `3/4` 都只指向本角色唯一 finish，构建门槛按真实
+机器码精确冻结，没有放宽为范围。
+
+### 冻结交错 A/B
+
+复用 S6.55 冻结 host/kernel ELF，与候选按 B-C/C-B 顺序各运行 12 个独立
+A5 B256 trace-free 进程；口径均为最早 startup 起点到最晚 FinalDrain 结束：
+
+```text
+S6.55 frozen baseline: min / median / max / mean
+                       1.405035 / 1.434675 / 1.483715 / 1.437695 ms
+S6.57 candidate      : min / median / max / mean
+                       1.397445 / 1.420883 / 1.467921 / 1.424637 ms
+
+candidate median 改善 0.013792 ms / 0.961%
+candidate mean   改善 0.013058 ms / 0.908%
+12 对中 7 对候选更快
+```
+
+调用数量大幅、确定下降，完整周期的 median 与 mean 同向改善，正确性与错误
+收敛门槛均闭合，因此本阶段作为有效优化保留。它没有达到 1 ms 目标；后续仍需
+继续审视必要返回型 Atomic，并依据 S6.56 的大块归因处理 exec payload 的 GM
+访问。按用户要求，下一阶段先把 FinalDrain 内所有 `>=1 us` 未解释区间补齐。

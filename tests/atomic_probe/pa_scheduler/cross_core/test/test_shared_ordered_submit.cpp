@@ -37,6 +37,7 @@ enum class OrderedSubmitHookMode : uint32_t {
     None = 0,
     BuildOverlap = 1,
     ExecutionOverlap = 2,
+    RemoteFatalAfterBuild = 3,
 };
 
 struct OrderedSubmitTestOps {
@@ -73,6 +74,8 @@ struct OrderedSubmitTestOps {
         bound_dispatch_calls{0};
     static inline std::atomic<uint32_t>
         bad_bound_dispatch_calls{0};
+    static inline std::atomic<uint32_t>
+        remote_fatal_injections{0};
 
     static void ResetHooks() {
         observed_state = nullptr;
@@ -113,6 +116,9 @@ struct OrderedSubmitTestOps {
             0, std::memory_order_relaxed
         );
         bad_bound_dispatch_calls.store(
+            0, std::memory_order_relaxed
+        );
+        remote_fatal_injections.store(
             0, std::memory_order_relaxed
         );
     }
@@ -545,6 +551,20 @@ struct OrderedSubmitTestOps {
     static void AfterSharedTaskBuild(
         SchedulerState *state, WorkerState &, uint32_t task_id, TaskKind kind
     ) {
+        constexpr uint32_t kRemoteFatalTask = 32;
+        if (hook_mode == OrderedSubmitHookMode::RemoteFatalAfterBuild) {
+            if (task_id == kRemoteFatalTask) {
+                remote_fatal_injections.fetch_add(
+                    1, std::memory_order_relaxed
+                );
+                // 模拟其他子系统在一个合法 Build 工作单元结束后广播首错。
+                // 这里只设置 scheduler fatal，不能伪造 execution reason。
+                __atomic_store_n(
+                    &state->fatal.value, int32_t{1}, __ATOMIC_RELEASE
+                );
+            }
+            return;
+        }
         constexpr uint32_t kPausedUp = 4;
         constexpr uint32_t kFollowingUp = 8;
         if (task_id != kFollowingUp || kind != TaskKind::Up) {
@@ -715,6 +735,32 @@ bool RunB256BuildTicketBudgetContractTest() {
         static_cast<unsigned long long>(kTerminalTickets),
         static_cast<unsigned long long>(kPhysicalFetchAdds),
         static_cast<unsigned long long>(kLegacyPhysicalCas)
+    );
+    return ok;
+}
+
+bool RunSharedBuildFatalPollCadenceTest() {
+    // RunScheduler 在进入中央 ticket 循环前已经立即观察一次 fatal。
+    // 循环内只需锁定“每 8 个成功 Build 一次”的边界：0 不能重复读，
+    // 8/16 必须读，其余位置不读。这样远端错误传播最多多做 7 个 task。
+    bool exact = true;
+    for (uint64_t completed = 0; completed <= 24U; ++completed) {
+        const bool expected =
+            completed == 8U || completed == 16U || completed == 24U;
+        exact &= SharedBuildFatalPollDue(completed) == expected;
+    }
+    const bool ok =
+        exact && (kSharedBuildFatalPollPeriod - 1U) == 7U;
+    std::printf(
+        "[ORDERED_SUBMIT] build_fatal_poll_cadence=%s "
+        "period=%llu max_extra_tasks=%llu\n",
+        ok ? "PASS" : "FAIL",
+        static_cast<unsigned long long>(
+            kSharedBuildFatalPollPeriod
+        ),
+        static_cast<unsigned long long>(
+            kSharedBuildFatalPollPeriod - 1U
+        )
     );
     return ok;
 }
@@ -1753,6 +1799,76 @@ bool RunIndependentKernelExecutionTest() {
     return ok;
 }
 
+bool RunRemoteFatalCadenceClosureTest() {
+    SchedulerState *state = MapSchedulerState();
+    if (state == nullptr) {
+        return false;
+    }
+    pa_scheduler::host::Options options;
+    options.batches = 64;
+    options.runs = 1;
+    options.trace_enabled = false;
+    options.shared_context_lens = {8192};
+    options.final_barrier_shape = FinalBarrierShape::TwoLevel16;
+    pa_scheduler::host::InitializeState(state, options);
+    pa_scheduler::host::ConfigureTrace(state, options, nullptr);
+    OrderedSubmitTestOps::ResetHooks();
+    OrderedSubmitTestOps::hook_mode =
+        OrderedSubmitHookMode::RemoteFatalAfterBuild;
+    OrderedSubmitTestOps::observed_state = state;
+
+    std::vector<std::thread> workers;
+    workers.reserve(kWorkers);
+    for (uint32_t worker_id = 0; worker_id < kWorkers; ++worker_id) {
+        const CoreRole role =
+            worker_id < kAicWorkers ? CoreRole::Aic : CoreRole::Aiv;
+        workers.emplace_back([state, worker_id, role]() {
+            RunScheduler<OrderedSubmitTestOps>(
+                state, worker_id, role
+            );
+        });
+    }
+    for (std::thread &worker : workers) {
+        worker.join();
+    }
+
+    bool all_workers_returned = true;
+    uint64_t total_attempts = 0;
+    for (uint32_t worker_id = 0; worker_id < kWorkers; ++worker_id) {
+        const WorkerResult &result = state->results[worker_id];
+        all_workers_returned &=
+            result.worker_id == worker_id && result.finish_cycle != 0;
+        total_attempts += result.claim_attempts;
+    }
+    constexpr uint32_t kTaskCount = 64U * kTasksPerBatch;
+    const cross_core::DecodedExecFatal exec_fatal =
+        cross_core::DecodeExecFatal(state->exec_fatal.state);
+    const bool ok =
+        OrderedSubmitTestOps::remote_fatal_injections.load(
+            std::memory_order_relaxed
+        ) == 1U &&
+        state->fatal.value == 1 &&
+        exec_fatal.reason == cross_core::ExecFatalReason::None &&
+        all_workers_returned &&
+        total_attempts <=
+            static_cast<uint64_t>(kTaskCount + kWorkers) &&
+        state->build_dispatch.next_task.value <=
+            static_cast<int64_t>(kTaskCount + kWorkers);
+    std::printf(
+        "[ORDERED_SUBMIT] remote_fatal_cadence_closure=%s "
+        "injections=%u attempts=%llu cursor=%lld\n",
+        ok ? "PASS" : "FAIL",
+        OrderedSubmitTestOps::remote_fatal_injections.load(
+            std::memory_order_relaxed
+        ),
+        static_cast<unsigned long long>(total_attempts),
+        static_cast<long long>(state->build_dispatch.next_task.value)
+    );
+    OrderedSubmitTestOps::observed_state = nullptr;
+    (void)munmap(state, sizeof(SchedulerState));
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -1760,6 +1876,8 @@ int main() {
         RunLocalClaimAttemptAccountingTest();
     const bool build_ticket_budget_ok =
         RunB256BuildTicketBudgetContractTest();
+    const bool build_fatal_poll_cadence_ok =
+        RunSharedBuildFatalPollCadenceTest();
     const bool task_id_prefix_ok =
         RunSplitReplayTaskIdPrefixTest();
     const bool loser_ok = RunLoserZeroTensorMapAccessTest();
@@ -1774,12 +1892,15 @@ int main() {
     const bool overlap_ok = RunInsertReleaseBeforeBuildTest();
     const bool execution_ok =
         RunIndependentKernelExecutionTest();
+    const bool remote_fatal_ok =
+        RunRemoteFatalCadenceClosureTest();
     if (!claim_accounting_ok || !build_ticket_budget_ok ||
+        !build_fatal_poll_cadence_ok ||
         !task_id_prefix_ok || !loser_ok ||
         !output_prepare_ok ||
         !fanin_compaction_ok || !efdrain_skip_ok ||
         !pa_up_shape_ok ||
-        !overlap_ok || !execution_ok) {
+        !overlap_ok || !execution_ok || !remote_fatal_ok) {
         std::fprintf(
             stderr, "[FAIL] shared ordered-insert Submit tests\n"
         );
