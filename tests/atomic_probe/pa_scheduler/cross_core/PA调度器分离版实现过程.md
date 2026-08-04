@@ -3869,3 +3869,97 @@ S6.61 no reload      : min / median / max / mean
 且不依赖 PA task kind、batch 数或固定图形，因此作为通用 shared cross-core
 协议优化保留。可审阅泳道为
 `test_record/2026-8-4/cross_b256_no_publish_reload_1p442ms.json`（产物不提交）。
+
+## 2026-08-04：S6.62 证伪紧凑 execution payload 头
+
+### 候选与边界
+
+为减少第 18.1 节指出的跨核 payload 搬运，本轮尝试了一种不依赖 PA task kind
+的双格式 ABI：满足“按 function-id 分发、单核执行、无外部 descriptor 引用，
+且 scalar/fanin 尾部不超过 4 个 word”的 task，把 64B 完整头压成 4 个 word，
+并将 scalar/fanin 回填到首条 cache line；TensorDesc 仍从第二条 cache line
+开始，保持 64B 对齐。其余 function-address、多核和 descriptor-reference
+场景继续走原完整格式。
+
+B256 的 QK/SF/PV/UP 均满足该通用条件，payload 从 `10/10/10/16` 条 line
+降为 `9/9/9/15` 条 line。理论上 builder 和 executor 各减少 `1024` 条
+cache-line 流量，合计减少 `2048` 条 DCCI 处理 line；payload clean-out、
+`BUILT` 发布、Claim CAS、payload invalidate 和 TensorMap 严格插入链均未删除。
+CPU 通用协议、PA 四类精确 payload、双 token 扫描及 FinalDrain 全部通过，
+CCEC AIC/AIV 也能完整编译，A5 B256 的 1280 task、1024 kernel 和所有终态
+检查均为 PASS。
+
+### CCEC 体积与 A5 否决
+
+双格式的 pack/decode/layout 分支使最终 device ELF text 从 `376124B` 增至
+`406716B`，增加 `30592B / 8.13%`；AIC/AIV 主入口分别增加约 `8.0KB` 和
+`13.3KB`。用 S6.61 冻结 ELF 与候选执行 8 对独立 B256 交错 A/B：
+
+```text
+S6.61 frozen baseline median = 1.407741 ms
+compact-header candidate     = 1.421326 ms
+
+候选配对时延中位数增加 0.005011 ms / 0.356%
+独立中位数增加 0.013585 ms / 0.965%
+8 对中候选仅获胜 2 对
+```
+
+结论：减少的 DCCI line 数是真实的，但运行时双格式控制流和 I-cache 体积代价
+抵消并超过收益。该候选的协议、适配器、host 口径和测试代码已全部撤销，不进入
+阶段提交。后续若重试 payload 压缩，只能采用能在 CCEC 编译期消除格式分支的
+方案；在此之前先删除现有 Claim/Bind 热路径中的重复 header/layout 读取。
+
+## 2026-08-04：S6.63 复用已验证 header/layout，删除 Claim 内二次 GM 读取
+
+### 冗余与改法
+
+`ClaimAndBindExecPayload()` 在 Claim CAS 成功并完成 payload invalidate 后，先由
+`ValidateBoundExecPayload()` 从 volatile shared payload 读取完整 header、计算
+layout，并核对 task、engine、payload line、引用地址和多核字段。随后原实现调用
+`RebuildExecutionTokenDispatchArgs()` 时，又读取一次同一 header 并重复计算同一
+layout。该 payload 在 `BUILT` 后 immutable，唯一 Execute owner 也已经取得
+`CLAIMED`，第二轮读取不能提供新的发布或正确性证据。
+
+本阶段为通用 rebuild helper 增加“消费已验证 header/layout”的入口，Claim 热
+路径直接复用栈上的两份结果；保留原自验证入口供独立调用者使用。没有改变：
+
+- `SharedExecCell`、token 和 payload ABI；
+- Claim CAS、payload invalidate、descriptor-reference invalidate；
+- payload line 数、dispatch 参数地址和 fanin 数据；
+- TensorMap 严格插入链、completion 发布及 FinalDrain 终点。
+
+该修改只依赖 immutable payload 协议，不读取 PA kind、batch 或固定图形。
+
+### 编译与正确性证据
+
+- 通用 execution protocol CPU 门槛 PASS；
+- 完整 CPU scheduler 回归 PASS，包含 PA adapter、中央 Build ticket、双 token
+  scanner、严格 TensorMap 插入和 execution drain；
+- CCEC AIC/AIV generic protocol instantiation 及最终 mixed ELF 门槛 PASS；
+- 最终 device ELF text 从 `376124B` 降至 `374076B`，减少 `2048B`；AIC/AIV
+  主入口各减少 `1024B`，证明重复 volatile GM 读取和 layout 计算已从两类热
+  入口生成物中消失；
+- A5 B256 完成 1280 task、1024 kernel，payload/descriptor/fanin、动态 executor、
+  TensorMap、heap、completion 和全部终态检查均为 PASS。
+
+### A5 冻结交错 A/B
+
+以 S6.61 冻结 ELF 为基线，冻结本阶段 host/kernel 后运行 12 对独立 B256
+trace-free 交错 A/B，逐对翻转执行顺序，统一测量 startup 起点到最后一个
+FinalDrain 结束：
+
+```text
+S6.61 frozen baseline: min / median / max / mean
+                       1.381880 / 1.420133 / 1.439699 / 1.417541 ms
+S6.63 reuse validated: min / median / max / mean
+                       1.374713 / 1.402894 / 1.435852 / 1.403156 ms
+
+配对收益中位数 = 0.020315 ms / 1.430%
+配对收益均值   = 0.014385 ms / 1.015%
+独立中位数改善 = 0.017239 ms / 1.214%
+12 对中候选获胜 10 对
+```
+
+生成物缩小、热路径 GM 读取减少和 trace-free 端到端收益三者同向，因此保留。
+下一阶段继续审计同一 Claim→Execute 链上是否还存在已经由前序验证覆盖的
+header/layout 读取，仍以完整 startup→FinalDrain 配对数据裁决。

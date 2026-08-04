@@ -1116,21 +1116,16 @@ PA_DEVICE PA_GM const uint64_t *ExecutionTokenDispatchArgs(
 }
 
 template <typename Ops, typename Observer>
-PA_DEVICE bool RebuildExecutionTokenDispatchArgs(
-    PA_GM ExecutionToken &token, Observer &observer
+PA_DEVICE bool RebuildExecutionTokenDispatchArgsFromValidatedPayload(
+    PA_GM ExecutionToken &token,
+    const ExecPayloadHeader &header,
+    const ExecPayloadLayout &layout,
+    Observer &observer
 ) {
     PA_GM const ExecPayloadStorage &payload =
         ExecutionTokenPayload(token);
-    const ExecPayloadHeader header =
-        DecodeExecPayloadHeader(payload);
-    ExecPayloadLayout layout{};
     if ((token.control.phase != ExecTokenPhase::Binding &&
          token.control.phase != ExecTokenPhase::WaitingFanin) ||
-        !ComputeExecPayloadLayout(
-            header.tensor_count, header.scalar_count,
-            header.fanin_count,
-            header.tensor_reference_mask, layout
-        ) ||
         header.payload_bytes != layout.payload_bytes ||
         token.control.payload_bytes != layout.payload_bytes ||
         token.control.payload_lines != layout.payload_lines) {
@@ -1181,6 +1176,25 @@ PA_DEVICE bool RebuildExecutionTokenDispatchArgs(
             &token.dispatch.global_context[0]
         ));
     return true;
+}
+
+template <typename Ops, typename Observer>
+PA_DEVICE bool RebuildExecutionTokenDispatchArgs(
+    PA_GM ExecutionToken &token, Observer &observer
+) {
+    PA_GM const ExecPayloadStorage &payload =
+        ExecutionTokenPayload(token);
+    const ExecPayloadHeader header =
+        DecodeExecPayloadHeader(payload);
+    ExecPayloadLayout layout{};
+    return ComputeExecPayloadLayout(
+               header.tensor_count, header.scalar_count,
+               header.fanin_count,
+               header.tensor_reference_mask, layout
+           ) &&
+           RebuildExecutionTokenDispatchArgsFromValidatedPayload<Ops>(
+               token, header, layout, observer
+           );
 }
 
 template <typename Ops>
@@ -1417,7 +1431,12 @@ PA_DEVICE ExecClaimResult ClaimAndBindObservedExecPayload(
         return ExecClaimResult::InvalidPayload;
     }
     token.control.payload_bytes = layout.payload_bytes;
-    if (!RebuildExecutionTokenDispatchArgs<Ops>(token, observer)) {
+    // ValidateBoundExecPayload 已从 immutable volatile payload 取得完整 header
+    // 并计算 layout；同一 Claim 边界直接复用这份本地证据，避免再次读取首行
+    // 和重复执行布局计算。BUILT 后没有 ordinary writer，因此无需二次确认。
+    if (!RebuildExecutionTokenDispatchArgsFromValidatedPayload<Ops>(
+            token, header, layout, observer
+        )) {
         token.control.phase = ExecTokenPhase::Faulted;
         (void)PublishExecFatal<Ops>(
             fatal, ExecFatalReason::InvalidTokenPayload,
