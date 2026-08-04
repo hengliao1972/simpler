@@ -3033,3 +3033,29 @@ candidate mean   回退 0.008302 ms / 0.580%
 受益。候选代码已完整撤回，正式 ordered Fanin 继续显式确认 output
 publication。该结果不否定 completion 链的内存顺序论证，只是否决它在
 当前机器码和并发相位下的性能保留价值。
+
+## 2026-08-04：S6.48 用完整周期复审 insert handoff 非返回候选（仍不保留）
+
+S6.37 曾利用中央 Build ticket 的唯一 builder 不变量，保留
+`deps_prepared[N]` 的条件 CAS，但不再消费旧值。这会让当前 owner
+不能当场发现同 task 异常旧值；N+1 owner 仍会因未观察到 N 而
+fail-closed，末 task 则由 host 终态拒绝，所以它是可收口但会延迟报错的
+候选，不是等价的错误观察合同。
+
+本轮在 S6.46 底座上重建无泳道候选，CCEC perf-clock 构建与源码
+Atomic/DCCI 覆盖门槛 PASS。以提交 `253a2e8a` 冻结基线，按
+B-C/C-B 交错各运行 12 个 A5 B256 trace-free 进程：
+
+```text
+S6.46 frozen baseline: min / median / max / mean
+                       1.408208 / 1.436211 / 1.474566 / 1.440698 ms
+S6.48 candidate      : min / median / max / mean
+                       1.422702 / 1.439456 / 1.515063 / 1.446619 ms
+candidate median 回退 0.003245 ms / 0.226%
+candidate mean   回退 0.005921 ms / 0.411%
+```
+
+候选有 7/12 对更快，但中位数、均值和最大值均差于基线，没有形成
+可保留的完整周期收益。在没有性能收益时，不值得用延迟异常检测
+换取源码层面的“不使用返回值”。候选已完整撤回，当前 owner 仍使用
+CAS 旧值当场验证 handoff 成功。
