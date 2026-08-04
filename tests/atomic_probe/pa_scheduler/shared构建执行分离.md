@@ -1595,6 +1595,10 @@ Atomic 竞争带进正常热路径。
   定位；成功路径不读取它；
 - scheduler global fatal 是唯一跨 worker 停产条件，由实际错误发布者同步
   设置；其他 worker 在领取下一 Build ticket 前的调度边界观察它；
+- 已通过调度边界并成功领取 ticket 的 winner 不在
+  `FinishSharedWinnerSubmitBody()` 入口重复读取 global fatal，而是完成该
+  合法工作单元；该读取不是 TensorMap 严格插入或 payload 发布的
+  正确性边界；
 - 本核直接发现 payload/control/DCCI/completion 错误时仍立即发布两类信息并
   返回，不等待下一调度边界；
 - FinalDrain 必须最终观察 global fatal、把本核尚未复位的 token 收敛为

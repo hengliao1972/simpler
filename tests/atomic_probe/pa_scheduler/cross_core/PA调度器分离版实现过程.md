@@ -2954,3 +2954,54 @@ candidate mean   回退 0.001289 ms / 0.089%
 改变 S6.39 的判断：root 减少了一层返回型读，却串行承担了 16 次
 release 发布，两者互相抵消。候选代码、host 终态适配和精确机器码
 门槛已再次全部撤回，继续保留现有 leader 并行转发。
+
+## 2026-08-04：S6.46 用完整周期复审并恢复 winner 重复 fatal 读取消减
+
+S6.34 曾删除 `FinishSharedWinnerSubmitBody()` 入口的
+`SharedWinnerFatalGuardLoad`，但在当时底座上扩样后中位回退
+`0.161%`，因此撤回。当前调度、fatal 收口、TensorMap 查询和
+性能边界均已发生明确变化，本轮把它作为历史回撤项重新独立裁决，
+不沿用旧数据直接翻案。
+
+当前协议中，worker 在领取新 Build ticket 前已经读取权威
+scheduler fatal。ticket 一旦成功领取，它就是必须闭合的合法工作单元；
+本核在 Materialize、Register、Fanin 或 Build 中直接发现错误时仍立即
+发布 fatal，其他核在下一个 ticket 调度边界或 FinalDrain 最终观察并
+收口。因此 winner body 内对同一 global fatal cache line 的第二次
+返回型读取不参与 TensorMap 严格插入、payload 发布或执行所有权
+线性化，可以删除。代价是并发 fatal 发布后，已取得工作单元继续
+闭合的窗口变大；这与当前已采用的“调度边界停产”合同一致，
+而不是将错误吞掉或依赖 host 超时。
+
+完整 CPU 协议回归和 CCEC perf-clock/full-swimlane 构建全部 PASS。
+A5 B256 full-swimlane 结果为：
+
+```text
+outputs/pa_scheduler_cross_core_shared_swimlane_20260804_001737_669218/
+ccec/merged_swimlane.json
+
+startup -> FinalDrain      : 1.453484 ms
+Submit                     : 1.056485 ms
+SharedWinnerFatalGuardLoad : 1280 -> 0
+```
+
+同次上板中 1280 task、1024 kernel、TensorMap 严格插入、payload、
+fanin、vend、completion、DCCI 闭合和所有终态全部 PASS，泳道记录无丢失。
+
+最终以冻结当前基线与候选按 B-C/C-B 顺序交错各运行 12 个独立
+A5 B256 trace-free 进程，口径统一为 startup 最早起点到 FinalDrain
+最晚结束：
+
+```text
+current baseline : min / median / max / mean
+                   1.435604 / 1.467659 / 1.486151 / 1.463602 ms
+candidate        : min / median / max / mean
+                   1.415616 / 1.436587 / 1.469359 / 1.438105 ms
+candidate median 改善 0.031072 ms / 2.117%
+candidate mean   改善 0.025497 ms / 1.742%
+```
+
+12/12 对样本均由候选更快，中位数和均值同向，且 A5 泳道确认
+目标点位从 1280 次降为 0。这组新证据满足当前的正确性合同与
+完整周期性能门槛，因此将该历史回撤项重新恢复。改善不按泳道
+Atomic 聚合核时推算，也不声称能与历史 S6.34 的旧底座数据直接相减。

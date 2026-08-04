@@ -439,7 +439,7 @@ PA_DEVICE bool PublishSharedTaskWriterDelta(
     // predecessor；最终 deps_prepared handoff 仍同时封口两类发布。
     if (state == nullptr || !context.won || context.task_id < 0 ||
         context.task_id >= static_cast<int32_t>(kMaxTasks) ||
-        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - generic 组合入口只供隔离测试，正式 winner 入口已使用 SharedWinnerFatalGuardLoad
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - generic 组合入口只供隔离测试；正式 dispatched 路径在领取新 Build ticket 前统一观察 scheduler fatal，已取得的合法工作单元允许闭合
         Ops::Load(&state->fatal.value) != 0 ||
         !PublishSharedTaskOutputs<Ops>(
             state->shared_map, context,
@@ -595,13 +595,7 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
             static_cast<int32_t>(ticket.function_id)
         ) ||
         context.task_id != static_cast<int32_t>(task_id) ||
-        !context.won ||
-        TraceAtomicLoad<Ops>(
-            stats.trace, stats.result,
-            static_cast<int32_t>(task_id),
-            AtomicSite::SharedWinnerFatalGuardLoad,
-            &state->fatal.value
-        ) != 0) {
+        !context.won) {
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }

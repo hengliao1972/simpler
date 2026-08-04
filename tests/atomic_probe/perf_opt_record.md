@@ -6269,3 +6269,20 @@ full-swimlane 分析器直接量 `WinnerBuild`：基线为 `71,461,026 cycles`�
 由 `1687.422 us` 增至 `1793.707 us`。因此不存在“端到端波动掩盖明确局部
 收益”的保留理由。候选代码和过程测试均撤回，正式路径继续使用通用双 CAS
 状态机；本轮只保留负结果，避免以后再次凭原子数量重复该试验。
+
+### 15.44 用 startup 到 FinalDrain 口径恢复 winner 重复 fatal 读取消减
+
+当前调度合同已把 global fatal 集中到领取新 Build ticket 前的
+调度边界，已领取的合法工作单元允许完整闭合。因此删除
+`FinishSharedWinnerSubmitBody()` 入口的第二次
+`SharedWinnerFatalGuardLoad`，不改 TensorMap 严格插入、payload 发布、
+execution Claim 或 completion 语义。
+
+该项在旧底座上曾因扩样回退而撤回；本轮不沿用旧结论，而是用
+当前基线、startup 最早起点到 FinalDrain 最晚结束的新口径，按
+B-C/C-B 交错各测 12 次。基线/候选中位分别为
+`1.467659/1.436587 ms`，候选改善 `2.117%`；均值改善
+`1.742%`，12/12 对样本均更快。A5 B256 full-swimlane 的 1280 task、
+1024 kernel 和所有协议终态均 PASS，目标返回型原子从 `1280 -> 0`。
+据此恢复该优化；具体协议边界、风险与完整数据见
+`pa_scheduler/cross_core/PA调度器分离版实现过程.md` 的 S6.46。
