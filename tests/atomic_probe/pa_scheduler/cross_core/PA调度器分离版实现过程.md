@@ -4391,3 +4391,75 @@ AIV: 512 + 64 = 576
 运行时本阶段仍使用 K2 scanner；`WAITING_BUILT`、Execute ticket 领取和 owner
 约束替换尚未接入，CCEC/A5 也为 **NOT RUN**。这个阶段只证明 host 能独立、
 连续且无 PA 业务泄漏地发布下一版 Execute 任务集合。
+
+## 2026-08-04：S6.68-b 接入双中央 Execute ticket 并删除 K2 运行时
+
+### 运行时合同
+
+本阶段把 S6.68-a 已发布的两份角色计划接入正式 cross-core 调度循环：
+
+```text
+Build：96 Scalar -> SharedBuildDispatchState::next_task
+Execute：
+  32 AIC -> SharedExecDispatchState::aic_next -> AIC task-id 表
+  64 AIV -> SharedExecDispatchState::aiv_next -> AIV task-id 表
+```
+
+Build owner 与 Execute owner 是两次独立的中央 ticket 结果，不再要求物理核
+不同。Execute ticket 是 task 的唯一领取权，不表示 payload 已经发布：领取者
+先把 `(task_id, execute_owner, engine)` 保存在自己的空 token，并进入新增的
+`WAITING_BUILT`。cell 为 `EMPTY/BUILDING` 时只保留 token，不读 payload；看到
+`BUILT` 后才执行 `BUILT -> CLAIMED(self)`、invalidate active payload、重建本核
+binding、检查 fanin 并执行。由于 task-id 表无重复且 ordinal 唯一，CAS 不再
+承担正常多核竞争；任何失败都按协议冲突终止，不能解释为普通 loser。
+
+每核仍只有两个 owner-local token。调度点先推进已经持有的 token，再用空槽
+取得角色 ticket；两个槽占满后不领取第三项，但仍允许完成一张已经取得的 Build
+ticket。角色 cursor 第一次返回越界后设置本地 `exec_dispatch_exhausted`，后续
+EfDrain/FinalDrain 不再反复触碰热点 cursor。FinalDrain 到达条件同步改为：
+本角色 cursor 已越界、两个 token 全部复位、engine 无 in-flight；TensorMap
+严格插入链、payload DCCI、completion 和 16 组 arrival 归约均未改变。
+
+### K2 物理清理
+
+运行时切换完成后，没有保留双实现或隐藏 fallback：
+
+- 删除 task-id residue 到 primary/secondary 的 K2 placement；
+- 删除 `candidate_slot`、owner-local candidate bitmap 和 fallback grace；
+- 删除 Close Submit 时的候选登记；
+- 删除 K2 scanner、普通 CAS loser 分支和 Build owner 必须异核的条件；
+- 删除旧 K2 定向测试，改为角色 ticket、`WAITING_BUILT`、同核/跨核 owner 和
+  唯一领取冲突门槛；
+- host 终态 oracle 独立检查 Execute owner 与 engine 角色匹配，不调用 device
+  eligibility helper，也不再复算 K2。
+
+历史 S3/S4/S5 中的 K2 数据继续作为被替代方案的证据保留，但不再描述当前
+生产合同。
+
+### CPU 正确性与精确预算
+
+`cross_core/cpu/build.sh` 全量通过，覆盖 source atomic/DCCI、host plan、
+random-access args、96-thread Build、execution adapter、Execute ticket、严格
+插入交错、FinalDrain 和 fatal 收口。B256 PA-G1 的精确结果为：
+
+```text
+Build ticket：1280 个有效 ordinal + 96 个越界 ordinal = 1376
+AIC Execute：512 个有效 ordinal + 32 个越界 ordinal = 544
+AIV Execute：512 个有效 ordinal + 64 个越界 ordinal = 576
+Execute ticket 合计：1120
+kernel completion：1024，全部 exactly once
+```
+
+定向交错还证明：
+
+- 同一 Scalar 可以同时成为同一 task 的 Build owner 与 Execute owner；
+- 跨角色 builder 发布的 payload 可由目标 engine 角色领取；
+- 两张 ticket 可在 cell 尚未 Build 时分别占住两个 `WAITING_BUILT` token；
+- task 4 插入后暂停时，后续 task 仍可 Build；无依赖的后续 kernel 也可在
+  task 4 Build 完成前执行；
+- 唯一 ticket 对应的 cell 若提前进入 `CLAIMED`，运行时会 fail-closed，不会
+  伪装成正常 loser。
+
+本阶段尚未进行 CCEC 生成、A5 B1/B256、atomic raw 闭合、泳道或冻结端到端
+A/B，统一标记为 **NOT RUN**。CPU 结果只证明协议和调用数量，不宣称 A5 性能
+收益；下一阶段必须先通过 CCEC/A5 正确性，再决定是否保留该调度结构。

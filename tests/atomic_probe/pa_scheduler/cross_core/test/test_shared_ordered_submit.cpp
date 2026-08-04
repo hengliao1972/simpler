@@ -695,26 +695,11 @@ bool PortableBuildEvidenceMatches(
                 ? decoded.execute_owner < kAicWorkers
                 : decoded.execute_owner >= kAicWorkers &&
                     decoded.execute_owner < kWorkers;
-            uint32_t primary = 0;
-            uint32_t secondary = 0;
-            if (aic_kernel) {
-                primary = task_id % kAicWorkers;
-                secondary = (primary + 1U) % kAicWorkers;
-            } else {
-                primary = kAicWorkers + task_id % kAivWorkers;
-                secondary = kAicWorkers +
-                    ((primary - kAicWorkers + 2U) % kAivWorkers);
-            }
-            const bool execute_in_k2 =
-                decoded.execute_owner == primary ||
-                decoded.execute_owner == secondary;
             exact &= decoded.valid &&
                 decoded.phase == cross_core::ExecPhase::Done &&
                 decoded.task_id == task_id &&
                 decoded.build_owner < kWorkers &&
-                execute_on_kernel_role &&
-                execute_in_k2 &&
-                decoded.build_owner != decoded.execute_owner;
+                execute_on_kernel_role;
             ++portable_kernel_tasks;
         }
         planned_tasks += plan.task_count;
@@ -1935,7 +1920,7 @@ int main() {
     }
     std::printf(
         "[PASS] central Build tickets assign every logical task once; "
-        "strict TensorMap insertion and independent K2 execution close; "
+        "strict TensorMap insertion and independent role-ticket execution close; "
         "all 96 Scalar workers remain eligible builders\n"
     );
     return 0;

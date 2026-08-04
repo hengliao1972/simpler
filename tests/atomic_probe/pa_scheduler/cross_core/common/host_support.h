@@ -3300,6 +3300,22 @@ inline bool AnalyzeSwimlaneRecords(
         const uint64_t expected_ticket_events =
             static_cast<uint64_t>(shared_plan.total_tasks) +
             kWorkers;
+        constexpr uint32_t kExecTicketSite =
+            static_cast<uint32_t>(
+                AtomicSite::SharedExecDispatchTicket
+            );
+        const uint64_t aic_exec_ticket_events =
+            atomic_durations[0][kExecTicketSite].size();
+        const uint64_t aiv_exec_ticket_events =
+            atomic_durations[1][kExecTicketSite].size();
+        const uint64_t expected_aic_exec_ticket_events =
+            static_cast<uint64_t>(
+                state.exec_dispatch.aic_task_count
+            ) + kAicWorkers;
+        const uint64_t expected_aiv_exec_ticket_events =
+            static_cast<uint64_t>(
+                state.exec_dispatch.aiv_task_count
+            ) + kAivWorkers;
         constexpr uint32_t kDrainReleasePublishSite =
             static_cast<uint32_t>(
                 AtomicSite::SharedExecDrainReleasePublish
@@ -3310,19 +3326,38 @@ inline bool AnalyzeSwimlaneRecords(
         if (aic_local_events != 0 || aiv_local_events != 0 ||
             local_events != 0 || root_events != 0 ||
             ticket_events != expected_ticket_events ||
+            aic_exec_ticket_events !=
+                expected_aic_exec_ticket_events ||
+            aiv_exec_ticket_events !=
+                expected_aiv_exec_ticket_events ||
             drain_release_publish_events != 0) {
             std::fprintf(
                 stderr,
                 "shared PA atomic closure failed: "
                 "legacy_local_aic=%llu legacy_local_aiv=%llu "
                 "legacy_local=%llu legacy_root=%llu "
-                "tickets=%llu/%llu drain_release_publishes=%llu/0\n",
+                "build_tickets=%llu/%llu "
+                "exec_tickets_aic=%llu/%llu "
+                "exec_tickets_aiv=%llu/%llu "
+                "drain_release_publishes=%llu/0\n",
                 static_cast<unsigned long long>(aic_local_events),
                 static_cast<unsigned long long>(aiv_local_events),
                 static_cast<unsigned long long>(local_events),
                 static_cast<unsigned long long>(root_events),
                 static_cast<unsigned long long>(ticket_events),
                 static_cast<unsigned long long>(expected_ticket_events),
+                static_cast<unsigned long long>(
+                    aic_exec_ticket_events
+                ),
+                static_cast<unsigned long long>(
+                    expected_aic_exec_ticket_events
+                ),
+                static_cast<unsigned long long>(
+                    aiv_exec_ticket_events
+                ),
+                static_cast<unsigned long long>(
+                    expected_aiv_exec_ticket_events
+                ),
                 static_cast<unsigned long long>(
                     drain_release_publish_events
                 )
@@ -3342,6 +3377,23 @@ inline bool AnalyzeSwimlaneRecords(
             "fetch_add=%llu valid_tasks=%u terminal_fetches=%u\n",
             static_cast<unsigned long long>(ticket_events),
             shared_plan.total_tasks, kWorkers
+        );
+        std::printf(
+            "[TRACE_ATOMIC_CLOSURE] "
+            "site=SharedExecDispatchTicket "
+            "AIC=%llu/%llu AIV=%llu/%llu\n",
+            static_cast<unsigned long long>(
+                aic_exec_ticket_events
+            ),
+            static_cast<unsigned long long>(
+                expected_aic_exec_ticket_events
+            ),
+            static_cast<unsigned long long>(
+                aiv_exec_ticket_events
+            ),
+            static_cast<unsigned long long>(
+                expected_aiv_exec_ticket_events
+            )
         );
         std::printf(
             "[TRACE_ATOMIC_CLOSURE] "
@@ -3913,10 +3965,9 @@ constexpr uint64_t kHostSyntheticValueBase = UINT64_C(0x400000000);
 constexpr uint64_t kHostSyntheticBlockTableBase = UINT64_C(0x500000000);
 constexpr uint64_t kHostPaScaleBits = UINT64_C(0x3F800000);
 
-// Host 必须独立复算 S5b 的 Build 合同和 S4 双候选集合，不能调用
-// device adapter；否则两边复制了同一错误时，终态 oracle 仍会误判为
-// 正确。S5b 允许任意有效 Scalar Build kernel task；executor 仍必须
-// 匹配目标 engine、属于 host 独立复算的 K2，且不能与 builder 相同。
+// Host 必须独立复算 Build 与 Execute 合同，不能调用 device adapter；否则
+// 两边复制了同一错误时，终态 oracle 仍会误判为正确。任意有效 Scalar
+// 可以 Build；Execute owner 必须匹配目标 engine，但允许与 builder 相同。
 inline bool HostExecOwnerMatchesEngine(
     uint32_t owner, cross_core::ExecEngineClass engine
 ) {
@@ -3942,24 +3993,8 @@ inline bool HostDynamicPaExecuteOwnerIsLegal(
         !HostExecOwnerMatchesEngine(execute_owner, engine)) {
         return false;
     }
-
-    uint32_t primary = cross_core::kExecUnboundOwner;
-    uint32_t secondary = cross_core::kExecUnboundOwner;
-    if (engine == cross_core::ExecEngineClass::Aic) {
-        primary = task_id % kAicWorkers;
-        secondary = (primary + 1U) % kAicWorkers;
-    } else if (engine == cross_core::ExecEngineClass::Aiv) {
-        const uint32_t primary_local = task_id % kAivWorkers;
-        primary = kAicWorkers + primary_local;
-        secondary = kAicWorkers +
-            ((primary_local + 2U) % kAivWorkers);
-    } else {
-        return false;
-    }
-    return primary != secondary &&
-           (execute_owner == primary ||
-            execute_owner == secondary) &&
-           execute_owner != build_owner;
+    (void)task_id;
+    return true;
 }
 
 inline TensorDesc HostExternalTensorDescriptor(
@@ -4252,7 +4287,7 @@ ValidateCrossCoreExecPayloads(
         );
         record(
             owner_mapping_ok,
-            task.task_id, "dynamic_dual_candidate_execute_owner"
+            task.task_id, "dynamic_role_ticket_execute_owner"
         );
         record(
             (cell.payload.words[0] >> 32U) == 0 &&
@@ -4950,11 +4985,11 @@ inline Metrics Validate(
 
     // S5b 的 host oracle 直接检查 task-indexed cell，不依赖新增的
     // WorkerResult 计数：Alloc 不产生执行包；其余 task 必须 DONE，并由
-    // host 独立检查 Build owner 在 96 核范围、复算双候选集合和动态 executor
-    // 合法性。该公式不能调用 device adapter，避免 device/host 同错后
-    // 相互放行。
+    // host 独立检查 Build owner 在 96 核范围，以及 Execute owner 与目标
+    // engine 角色一致。该公式不能调用 device adapter，避免 device/host
+    // 同错后相互放行。
     bool cross_core_exec_cells_ok = shared_plan_ok;
-    bool cross_core_exec_dynamic_candidate_owner_ok = shared_plan_ok;
+    bool cross_core_exec_role_owner_ok = shared_plan_ok;
     uint32_t first_bad_exec_task = UINT32_MAX;
     for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
         const SharedHostPlannedTask *planned_task =
@@ -4983,7 +5018,7 @@ inline Metrics Validate(
                 decoded.task_id == task_id &&
                 decoded.engine_class == expected_engine &&
                 owner_ok;
-            cross_core_exec_dynamic_candidate_owner_ok &= owner_ok;
+            cross_core_exec_role_owner_ok &= owner_ok;
         }
         cross_core_exec_cells_ok &= cell_ok;
         if (!cell_ok && first_bad_exec_task == UINT32_MAX) {
@@ -5912,8 +5947,8 @@ inline Metrics Validate(
         &metrics
     );
     Expect(
-        cross_core_exec_dynamic_candidate_owner_ok,
-        "S5b accepts any valid Scalar builder and requires a host-independent legal K2 executor",
+        cross_core_exec_role_owner_ok,
+        "Build owner is any Scalar and Execute owner independently matches its engine role",
         &metrics
     );
     Expect(
@@ -6385,6 +6420,25 @@ inline Metrics Validate(
             state.build_dispatch.next_task.value ==
                 static_cast<int64_t>(expected_claims),
         "shared Build dispatch header and terminal ticket cursor are exact",
+        &metrics
+    );
+    const int64_t expected_aic_exec_ticket_calls =
+        static_cast<int64_t>(
+            state.exec_dispatch.aic_task_count + kAicWorkers
+        );
+    const int64_t expected_aiv_exec_ticket_calls =
+        static_cast<int64_t>(
+            state.exec_dispatch.aiv_task_count + kAivWorkers
+        );
+    Expect(
+        state.exec_dispatch.aic_task_count +
+                state.exec_dispatch.aiv_task_count ==
+            expected_exec_completions &&
+        state.exec_dispatch.aic_next.value ==
+            expected_aic_exec_ticket_calls &&
+        state.exec_dispatch.aiv_next.value ==
+            expected_aiv_exec_ticket_calls,
+        "AIC/AIV Execute plans and one terminal ticket per worker are exact",
         &metrics
     );
 #else

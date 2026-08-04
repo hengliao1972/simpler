@@ -25,41 +25,15 @@ constexpr uint32_t kA5AivScalarWorkers = 64;
 constexpr uint32_t kA5ScalarWorkers =
     kA5AicScalarWorkers + kA5AivScalarWorkers;
 static_assert(
-    kA5AicScalarWorkers > 1 &&
-        kA5AivScalarWorkers > 2 &&
+    kA5AicScalarWorkers > 0 &&
+        kA5AivScalarWorkers > 0 &&
         kA5AivScalarWorkers % 2U == 0,
-    "A5 K2 routing requires two AICs and paired AIV lanes"
+    "A5 single-lane execution requires AIC and paired AIV Scalars"
 );
 static_assert(
     kA5ScalarWorkers <= kExecUnboundOwner,
     "A5 worker ids must not collide with the unbound owner sentinel"
 );
-
-PA_DEVICE bool A5SingleLaneExecuteCandidates(
-    uint32_t task_id, ExecEngineClass engine_class,
-    uint32_t &primary_owner, uint32_t &secondary_owner
-) {
-    primary_owner = kExecUnboundOwner;
-    secondary_owner = kExecUnboundOwner;
-    switch (engine_class) {
-        case ExecEngineClass::Aic:
-            primary_owner = task_id % kA5AicScalarWorkers;
-            secondary_owner =
-                (primary_owner + 1U) % kA5AicScalarWorkers;
-            return true;
-        case ExecEngineClass::Aiv:
-            primary_owner = kA5AicScalarWorkers +
-                task_id % kA5AivScalarWorkers;
-            secondary_owner = kA5AicScalarWorkers +
-                ((primary_owner - kA5AicScalarWorkers + 2U) %
-                 kA5AivScalarWorkers);
-            return true;
-        case ExecEngineClass::None:
-        case ExecEngineClass::Joint:
-            return false;
-    }
-    return false;
-}
 
 PA_DEVICE bool A5SingleLaneOwnerMatchesEngine(
     uint32_t owner, ExecEngineClass engine_class
@@ -101,43 +75,14 @@ PA_DEVICE bool A5SingleLaneExecuteOwnerEligible(
     uint32_t task_id, uint32_t build_owner,
     ExecEngineClass engine_class, uint32_t execute_owner
 ) {
-    if (build_owner >= kA5ScalarWorkers ||
-        execute_owner == build_owner ||
-        !A5SingleLaneOwnerMatchesEngine(
+    // 双中央 Execute ticket 已经按 engine role 把每个 task 唯一发给一个
+    // Scalar。Build/Execute owner 是两次独立决定，但不强制物理核不同。
+    // task_id 仍保留在公共签名中，便于终态诊断与未来 placement 扩展。
+    (void)task_id;
+    return build_owner < kA5ScalarWorkers &&
+        A5SingleLaneOwnerMatchesEngine(
             execute_owner, engine_class
-        )) {
-        return false;
-    }
-    uint32_t primary_owner = kExecUnboundOwner;
-    uint32_t secondary_owner = kExecUnboundOwner;
-    if (!A5SingleLaneExecuteCandidates(
-            task_id, engine_class,
-            primary_owner, secondary_owner
-        )) {
-        return false;
-    }
-    return execute_owner == primary_owner ||
-           execute_owner == secondary_owner;
-}
-
-PA_DEVICE bool A5PreferredSingleLaneExecuteOwner(
-    uint32_t task_id, uint32_t build_owner,
-    ExecEngineClass engine_class, uint32_t &preferred_owner
-) {
-    preferred_owner = kExecUnboundOwner;
-    uint32_t primary_owner = kExecUnboundOwner;
-    uint32_t secondary_owner = kExecUnboundOwner;
-    if (!A5SingleLaneExecuteCandidates(
-            task_id, engine_class,
-            primary_owner, secondary_owner
-        )) {
-        return false;
-    }
-    preferred_owner = build_owner == primary_owner
-        ? secondary_owner : primary_owner;
-    return A5SingleLaneExecuteOwnerEligible(
-        task_id, build_owner, engine_class, preferred_owner
-    );
+        );
 }
 
 }  // namespace pa_scheduler::cross_core
