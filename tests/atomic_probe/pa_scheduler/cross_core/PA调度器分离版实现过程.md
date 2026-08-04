@@ -4669,3 +4669,82 @@ AIC/AIV finish symbol 仍分别为 `31188/32136 B`。结合 12/12 配对获胜�
 精确终态、Register/DCCI 不回退和可接受的内存/代码增量，本阶段
 正式保留三 token。它只依赖“中央唯一 Execute ticket + owner-local 有界前视”
 通用协议，没有引入 PA task kind、batch 或固定 DAG 特例。
+
+## 2026-08-04：S6.70-a 定位严格 Register 链并冻结下一候选合同
+
+### 先分清“后继没来”与“完成字观察慢”
+
+本阶段不改 device 代码。继续使用 S6.69-c 已闭合的 B256 full-swimlane：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+pa_scheduler_cross_core_shared_swimlane_20260804_140639_1394761/ccec/
+merged_swimlane.json
+```
+
+按 task-id 将 `Register`、`register.publish_writer_metadata` 和
+`register.publish_tensormap_insert_completion` 逐项配对，并用前一个 task
+completion 终点切分后一个 task 的 predecessor wait。1,280 个 task、1,279
+次交接全部闭合：
+
+```text
+task0 completion -> task1279 completion       926.730 us
+后继观察前序完成                              744.332 us  (80.32%)
+writer metadata                                80.205 us   (8.65%)
+insert completion                             102.193 us  (11.03%)
+
+observation lag median / p95 / max
+  0.565 / 0.923 / 3.572 us
+完整单次 handoff median / p95 / max
+  0.692 / 1.232 / 4.062 us
+```
+
+再检查“前序 completion 已结束，但后继 Register 尚未开始”的真实空档，仅
+task 1 与 task 2 两次，分别为 `1.124/3.303 us`，总计 `4.427 us`；没有
+任何 task 的 Claim 晚于前序 completion。按 task 类型分解为：
+
+| task 类型 | 交接数 | 观察完成 | metadata | completion | 合计 |
+| --------- | -----: | -------: | -------: | ---------: | ---: |
+| Alloc | 255 | 143.482 us | 4.062 us | 18.677 us | 166.221 us |
+| QK | 256 | 149.458 us | 4.090 us | 18.537 us | 172.085 us |
+| SF | 256 | 157.298 us | 3.973 us | 20.911 us | 182.182 us |
+| PV | 256 | 150.599 us | 4.257 us | 23.083 us | 177.939 us |
+| UP | 256 | 143.495 us | 63.823 us | 20.985 us | 228.303 us |
+
+结论是：Materialize/Build 到达离散不是当前严格链主因。三 token 已经解决
+execution admission 的独立瓶颈，不能继续扩槽来解释 Register；历史 turn-G
+只把一枚 baton 换物理地址，而 R5e 的 per-task completion 已经优于它，不能
+简单复活。S6.48 取消当前 owner 的 handoff 返回依赖也已经回退 `0.226%`，
+它没有减少后继串行返回观察，同样不是本问题的答案。
+
+### A5 内存合同复核
+
+`ATOMIC_USAGE_GUIDE.md` 的受控 AIV 用例已经证明：
+
+- ordinary payload 只有在 `ordinary store -> DCCI OUT -> DSB -> atomic
+  publish` 后，远端 atomic 观察者才可据此读取；
+- 远端取得发布证据后仍须 invalidate payload，再作 ordinary load；
+- atomic 控制字必须与 ordinary/DCCI payload 分 cacheline，关键控制默认
+  atomic-only；同一 dirty line 上的后续 DCCI 会把已经发布的 atomic 新值
+  冲回旧快照；
+- 没有 DCCI 的 ordinary store 只能作负对照，不能成为跨 Scalar 协议。
+
+因此不尝试把 `deps_prepared` 改成普通读写，也不对 atomic line 做 DCCI。
+
+### 冻结的下一候选
+
+下一阶段只实现 grouped ordered Register drainer 的 CPU 协议原型：每个唯一
+Build owner 发布变长 writer intent 与唯一 ready bit；每组一个 drainer 等
+本组完整、只在组边界等待上一组最后 completion，再按 task-id 发布整组
+metadata/completion。原 owner 等自己的 completion 后才允许复用 task-indexed
+payload 做 execution Build。
+
+首版参数候选为 `G=8`，但必须同时证明：尾组 mask 精确、乱序到达仍严格
+提交、重复/缺失 bit 与损坏 header fail-closed、组内任何 task 未发布时不能
+越过、intent overwrite 不早于 drainer 完成，以及 Build ticket 单调前提下
+不存在占满 96 worker 的等待环。公共协议不得读取 PA `TaskKind`；PA 专有
+expected writer 只允许由 adapter 从 immutable plan 推导。
+
+本阶段状态：**设计与实证边界已闭合，device code NOT CHANGED，A5 NOT
+RUN**。只有 CPU 原型通过后才进入 CCEC/A5；最终仍由 startup→FinalDrain
+冻结交错 A/B 决定保留或完整撤回。

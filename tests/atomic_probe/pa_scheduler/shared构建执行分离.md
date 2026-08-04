@@ -788,6 +788,82 @@ Build 与同步 kernel 都不做抢占。
 基础数据已证明两槽持续饱和，并以冻结 A/B 验收三槽；这不等于需要在
 Claim 前构造 ready summary。
 
+#### 7.1.1 S6.70 严格 Register 链的下一候选
+
+S6.69 三 token 的 full-swimlane 继续保留了逐 task 的严格插入链。对
+`task 0 -> task 1279` 的 1,280 个 Register 逐项重建后，得到：
+
+| 严格链组成 | 时间 | 占 926.730 us 链长 |
+| ---------- | ---: | -----------------: |
+| 后继观察前序 `deps_prepared` 完成 | 744.332 us | 80.32% |
+| writer metadata 发布 | 80.205 us | 8.65% |
+| 本 task 插入完成发布 | 102.193 us | 11.03% |
+
+1279 次交接中，仅有 2 次是“前序已经完成、后继尚未进入 Register”，合计
+`4.427 us`；所有 task 的 Claim 都早于其前序完成。因而当前关键链不是
+Materialize/Build owner 来得太晚，而是每个 task 都把一次返回型前序完成
+观察串在全局链上。继续扩 execution token、缩短 Materialize 或让 Build
+更早到达，均不能直接消除这 `744.332 us`。
+
+下一候选采用 **grouped ordered Register drainer**，但不改变 TensorMap
+严格顺序：
+
+```text
+每个 task 的唯一 Build owner：
+  在本核准备最小 writer delta
+  -> 把实际使用的 intent 前缀写入 task-indexed GM payload
+  -> 对该前缀逐行 clean-out，并以 DSB 收口
+  -> 向本组 ready-mask 发布自己的唯一 bit
+
+每组唯一 drainer：
+  等本组所有 bit 就绪
+  -> 仅在跨组边界等待上一组最后一个 task 完成
+  -> invalidate 并校验组内各 task intent
+  -> 严格按 task-id 发布 metadata(N) 与 deps_prepared[N]
+
+原 Build owner：
+  等自己的 deps_prepared[N]
+  -> Fanin/Build；此后才允许覆盖同一 task 的 intent payload
+```
+
+这样，跨组返回型观察进入严格链的数量从 `N-1` 降到约
+`ceil(N/G)-1`；组内每个 task 的 completion 仍完整保留，原 owner 的等待
+可以并行发生，不再决定 metadata 串行前沿。该协议不是并行插入：组内仍由
+一个 drainer 按 task-id 串行提交，下一组也必须取得上一组最后一个完成字。
+
+首版暂定 `G=8`，它只是待 A/B 的编译期候选，不是已验收参数。选择边界是：
+
+- `G` 必须不大于首波可同时持有的 Build task 数，防止所有 Scalar 都卡在
+  未凑齐的组上；当前 96 worker、每核最多一个同步 Build task，`G=8`
+  留有充分余量；
+- Build ticket 单调且每 worker 只持有一个 Build task，所以一个已领取的
+  后组 task 不可能反向占住尚未领取的前组 ticket；同步 kernel 只会延迟
+  ready bit，不形成组间等待环；
+- ready mask 与 `deps_prepared` 必须各自使用 atomic-only cacheline，禁止
+  ordinary store 或 DCCI；唯一 Build ticket 证明每 task 只发布一个 bit；
+- intent 是 ordinary payload，必须遵守“本核写 -> DCCI OUT -> DSB ->
+  atomic bit”的 A5 发布合同；drainer 必须在观察 ready 后 invalidate，再
+  读取 payload；
+- intent 只序列化实际存在的 ordinary entry/symbol key，不能把固定 32 项
+  `SharedTaskWriterDelta` 全量写回。空 writer 集合和 PA 的三个 symbol 应只
+  占一个 cacheline，最大通用形状仍须 fail-closed；
+- `SharedExecCell.control` 在 intent 阶段保持 `EMPTY`，executor 只看 control，
+  不得提前读取 payload；原 owner 只有观察到本 task completion 后才能用
+  最终 execution payload 覆盖 intent。drainer 已经读完并发布 completion，
+  因而两次 ordinary payload 生命周期不重叠；
+- 失败时不得跳过 task 或继续下一组。magic/task-id/count、ready mask、上一组
+  完成字和每项 metadata 校验任一失败，都设置 terminal fatal，且不发布
+  当前 task completion；
+- 公共协议只认识 task-id、变长 writer delta 和严格顺序。PA 的 UP/Alloc
+  形状以及 expected previous/producer 仍由 PA adapter 从 immutable plan
+  推导，禁止写进通用 ready-mask 或 drainer 调度语义。
+
+这一候选会新增 intent clean/invalidate 和 ready-bit atomic，不能只凭
+`O(N) -> O(N/G)` 宣称收益。验收顺序固定为：CPU 构造乱序到达、尾组、重复/
+缺失 bit、payload 未发布和覆盖时序；随后 CCEC/A5 正确性；最后以冻结
+startup→FinalDrain 交错 A/B 裁决。若 DCCI/组内等待抵消收益，完整撤回，
+不削弱现有逐 task completion 合同。
+
 ### 7.2 改调度器前必须补齐的基础数据
 
 现有 `2026-08-03` B256 full-swimlane 已提供第一条结构证据：1024 个 kernel
@@ -1390,6 +1466,9 @@ cell 同地址竞争，而是用 AIC/AIV 两条中央 ticket 唯一发放 task�
 13. completion 使用 token payload 中的 vend；发布 DONE 后才释放对应 token，FinalDrain 要求三槽均 IDLE；
 14. DCache preload 默认关闭；hint 的任何候选都单独 A/B，不参与正确性合同；
 15. token 容量当前为编译期常量 3；若后续参数化或再扩容，必须重做 state size、容量背压、FinalDrain 和 A5 冻结 A/B。
+16. S6.70 的 grouped ordered Register drainer 当前仅是已完成合同审查的下一
+    候选，尚未进入生产路径；在 CPU/A5 门槛闭合前，现行逐 task
+    `deps_prepared[N-1] -> metadata(N) -> deps_prepared[N]` 仍是权威实现。
 
 这一版不是最终高性能形态。它的价值是把三个未知量拆开：
 
