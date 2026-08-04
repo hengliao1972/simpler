@@ -7,13 +7,13 @@
 | 目标 | 让 task 的构建 owner 与 kernel 执行 owner 可以是不同物理核 |
 | 当前代码 | 96 Scalar 通过中央 Build ticket 恰好一次 Build；32 AIC 与 64 AIV 分别通过各自中央 Execute ticket 动态领取同角色 task；每核两个 token 可在 payload 尚未发布时保存 `WAITING_BUILT`，Build/Execute owner 独立且允许同核 |
 | 本文性质 | 持续更新的架构与内存模型设计记录 |
-| 正式实现 | S0–S6.68-b 已形成三条独立发放流：一条全 96 Scalar Build ticket、两条 AIC/AIV Execute ticket；严格 TensorMap 插入链、task-indexed immutable payload、跨核 DCCI publish/acquire、两个 owner-local token 和 16 组 FinalDrain 收口均保持不变；旧 K2 扫描、候选位图和 fallback 已从生产代码物理删除 |
+| 正式实现 | S0–S6.68-c 已形成三条独立发放流：一条全 96 Scalar Build ticket、两条 AIC/AIV Execute ticket；严格 TensorMap 插入链、task-indexed immutable payload、跨核 DCCI publish/acquire、两个 owner-local token 和 16 组 FinalDrain 收口均保持不变；旧 K2 扫描、候选位图和 fallback 已从生产代码物理删除 |
 | CPU 正确性用例 | 双角色 Execute ticket、同核/跨核 owner、`WAITING_BUILT` 双 token、严格插入与乱序 Build、1024 kernel exactly-once 和 FinalDrain 完整回归均已通过 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
-| A5 PA 功能/性能 | S6.43 起，唯一裁决口径为最早 startup 起点到最后 FinalDrain 结束；旧 Submit-only 与 first-Submit-to-FinalDrain 数据只保留为历史证据，不与新口径直接相减。S6.59 的 12 对冻结 A/B 中，S6.57 基线中位 `1.412 ms`、direct-payload 候选中位 `1.403 ms`，改善 `0.637%`；功能与终态全部 PASS |
+| A5 PA 功能/性能 | S6.43 起，唯一裁决口径为最早 startup 起点到最后 FinalDrain 结束；旧 Submit-only 与 first-Submit-to-FinalDrain 数据只保留为历史证据，不与新口径直接相减。S6.68-c 的 12 对冻结 A/B 中，K2 基线中位 `1.410142 ms`、双中央 Execute ticket 中位 `1.281905 ms`，改善 `9.094%`，12/12 对候选更快；B1/B256 功能与终态全部 PASS |
 | 历史 S4 Execute election | K2 首版曾通过 CPU B1/B256 和 A5 B1/B256，现已被 S6.68-b 的角色中央 ticket 替代，仅作为历史证据保留 |
 | S5 Build 拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 五类 task 全 96/G8 已通过 CPU/CCEC/A5 B1/B256，物理 Claim CAS 精确闭合 |
-| 当前验证缺口 | 新 Execute 运行时已完成 CPU 门槛，但 CCEC 生成、A5 B1/B256、atomic 调用闭合、泳道与 startup-to-FinalDrain 冻结 A/B 尚未完成；在这些证据完成前不宣称性能收益 |
+| 当前验证缺口 | 双中央 Execute ticket 的 CPU、CCEC、A5 B1/B256、atomic 调用闭合、完整泳道和冻结 A/B 均已完成；距 `1 ms` 目标仍约 `0.282 ms`，下一阶段应以新泳道重新选择结构性大头，不回到 K2 局部微调 |
 | 明确非目标 | 不引入 `try_wait`、engine continuation 或“kernel 运行期间同一 Scalar 继续调度” |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
@@ -140,7 +140,7 @@ completion vend 是 heap 进度快照，不是 output 数据地址或内存所�
 | A5 ordinary payload 发布/取得 | S2 独立 CCEC 跨核探针 | 不依赖 kernel-end 自动 DCCI，延迟注入和多 cacheline 均读到精确值 |
 | DCache preload 可选性能 hint | S2 先在关闭时闭合正确性，再于 S2/S3a/S3b 做编译变体 A/B | on/off 合同完全相同，只保留正确性不变且性能稳定改善的位置 |
 | 使用 shared payload 本身的代价 | S3a task-indexed cell，仍映射给 Build owner | 正确性不变，单独量出 publication/copy 税 |
-| args/context/vend/fanin 交接 | S3b 已证明跨核取得成立；S6.68-b 已由 AIC/AIV 双中央 Execute ticket 动态决定 owner，不再预路由 K2，也不强制异核 | CPU B1/B256 的 task/descriptor/fanin/vend/completion 精确校验一致；A5 仍待验证 |
+| args/context/vend/fanin 交接 | S3b 已证明跨核取得成立；S6.68-b 已由 AIC/AIV 双中央 Execute ticket 动态决定 owner，不再预路由 K2，也不强制异核 | CPU B1/B256 与 A5 B1/B256 的 task/descriptor/fanin/vend/completion 精确校验一致 |
 | Execute 唯一领取 | S6.68-b 双角色中央 ticket | 每个可执行 task 只出现在一张角色表一次；每个表项只由一个 FetchAdd ordinal 取得，CAS 冲突直接报协议错误 |
 | executor 本地容量与全局 backlog 解耦 | S0–S5 先用单 token 闭合协议；S6 当前固定扩为两个 token | 有空 token 才发射 CAS；抢到后立即检查依赖，任一 owner-local ready task 优先执行 |
 | Build owner 扩大到其他 Scalar | S5 已完成全 96 Scalar Build | 不借助跨核发布的正确性掩盖 Build 角色变化 |
@@ -615,8 +615,10 @@ Build owner 与 Execute owner 的关系不参与 eligibility：只校验 Execute
 
 B256 PA-G1 的静态计划含 512 个 AIC task 和 512 个 AIV task。若每个 worker
 在表尾只做一次越界领取，AIC cursor 共 544 次 FetchAdd，AIV cursor 共 576
-次，总计 1120 次并分散在两条 cache line；这只是预期调用量，真实 A5 收益
-必须由冻结 ELF 的 startup-to-FinalDrain A/B 决定。
+次，总计 1120 次并分散在两条 cache line。S6.68-c 的 A5 full-swimlane 已按
+atomic raw 精确得到这 1120 次调用，且未出现旧 K2 扫描/候选事件；12 对冻结
+ELF 的 startup-to-FinalDrain A/B 中，双 ticket 相对 K2 中位改善 `9.094%`，
+12/12 对均更快。因此该结构已从“协议预算”升级为当前正式执行发放合同。
 
 槽数从 1 增到 2 会扩大 owner-private GM token 容量，但不会改变 shared
 payload 的发布协议，也不需要真正 Ready queue、反向 fanout 或 Claim 前的

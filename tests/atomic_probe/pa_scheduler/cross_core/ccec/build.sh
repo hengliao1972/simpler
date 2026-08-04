@@ -205,7 +205,7 @@ COMMON_FLAGS=(
         "$SHARED_PROTOCOL_PROBE_AIV_OBJECT"
 )
 
-# 跨核执行扫描游标使 CompeteFirstSplitRuntimeState 的当前 ABI 为 1728B。
+# split callback 的跨 TU 运行状态 ABI 当前为 1728B。
 # 只给 split 产物开启 block-local relocation，并按头文件静态断言锁定的
 # 精确尺寸预留；runtime object、单 role section 与最终双 role 布局都必须
 # 使用同一数值，不能靠多留一条未说明的 cache line 掩盖 ABI 漂移。
@@ -214,22 +214,19 @@ SPLIT_STATE_STORAGE_BYTES=1728
 # role/观察构建合并相同尾部。五种 kind 是否完整覆盖由 dispatch switch 和
 # CPU 动态协议测试证明；这里精确锁定当前每种产物的真实代码形状，防止 finish 被
 # 内联/删除，又不把 CCEC 对等尾部的有益合并误判成覆盖缺失。
-# execution scanner 只解码通用 route 后，CCEC 的等价尾部合并形状为
-# perf-clock AIC 两个、AIV 四个。shared 删除重复 replay barrier 后，
-# AIC 尾部多一组等价出口被 CCEC 合并；A5 placement 仍保留原 switch 形状，
-# readelf 确认它们仍只指向本角色唯一 finish 符号；继续精确冻结实际
-# 机器码形状，不放宽为范围判断。
-# Claim 后删除 immutable payload 的逐参数二次复核，使 perf-clock AIC 的
-# 三组等价出口重新合并为两组；readelf 逐条确认两条 relocation 都只指向
-# 本角色唯一 finish。任务种类覆盖继续由 dispatch、CPU 动态协议门槛和 A5
-# finish_calls 精确终态共同证明；这里按实际机器码冻结为 2，不放宽成范围。
+# 双中央 Execute ticket 删除 K2 扫描与候选分支后，perf-clock AIC 的等价
+# 出口保持两组，AIV 从四组合并为三组；readelf 逐条确认这些 relocation
+# 都只指向本角色唯一 finish。任务种类覆盖继续由 dispatch、CPU 动态协议
+# 门槛和 A5 finish_calls 精确终态共同证明；这里按实际机器码冻结为 2/3，
+# 不放宽成范围。
 SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC=2
-SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIV=4
-# Claim 证明缓存与逐参数二次复核消减改变了 full-swimlane 中 trace 分支的
-# 尾合并形状：AIC 为五组、AIV 为三组。readelf 逐条确认它们都只指向本角色
-# 唯一 finish 符号；任务覆盖继续由 dispatch、CPU 动态门槛和 A5 finish_calls
-# 精确终态证明。这里按实际机器码冻结为 5/3，不放宽成范围判断。
-SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC=5
+SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIV=3
+# 双中央 Execute ticket 删除 K2 扫描与候选分支后，full-swimlane AIC 的
+# 等价 finish 出口由 CCEC 进一步合并为三组；AIV 同样为三组。readelf
+# 逐条确认它们都只指向本角色唯一 finish 符号；任务覆盖继续由 dispatch、
+# CPU 动态协议门槛和 A5 finish_calls 精确终态共同证明。这里按实际机器码
+# 冻结为 3/3，不放宽成范围判断。
+SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC=3
 SPLIT_FINISH_CALL_SITES_SWIMLANE_AIV=3
 COMMON_FLAGS+=(
     -mllvm -cce-block-local-relocate=true

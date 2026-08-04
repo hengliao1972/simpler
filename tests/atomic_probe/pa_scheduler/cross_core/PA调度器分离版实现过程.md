@@ -4463,3 +4463,87 @@ kernel completion：1024，全部 exactly once
 本阶段尚未进行 CCEC 生成、A5 B1/B256、atomic raw 闭合、泳道或冻结端到端
 A/B，统一标记为 **NOT RUN**。CPU 结果只证明协议和调用数量，不宣称 A5 性能
 收益；下一阶段必须先通过 CCEC/A5 正确性，再决定是否保留该调度结构。
+
+## 2026-08-04：S6.68-c 闭合双中央 Execute ticket 的 CCEC 与 A5 证据
+
+### CCEC 代码生成门槛
+
+双中央 Execute ticket 删除 K2 scanner、候选位图和 fallback 分支后，CCEC 对
+等价 split-finish 出口进行了新的尾合并。先用 `readelf` 逐条确认 relocation
+仍只指向本角色唯一 finish 符号，再把构建门槛精确冻结为：
+
+```text
+                 AIC   AIV
+perf-clock        2     3
+full-swimlane     3     3
+```
+
+这里没有把检查放宽为范围。两类构建同时通过 generic shared protocol、角色
+dispatcher 不串线、caller/runtime/finish 唯一符号、两个 1728B block-local
+state、最终 mixed ELF 无 relocation，以及 perf-clock 不含泳道 writer 的全部
+门槛。
+
+### A5 正确性与调用闭合
+
+B1 full-swimlane 先完成 5 task、4 kernel，startup 到 FinalDrain 完整周期为
+`87.938 us`，所有 payload、descriptor、fanin、角色、completion、严格插入链
+和 fatal 终态断言 PASS。
+
+B256 real-compute `6,28,4,1` 随后完成 1280 task、1024 kernel，AIC 只执行
+QK/PV、AIV 只执行 SF/UP；Build/Execute owner 独立，host 不再要求二者异核。
+本次泳道位于：
+
+```text
+outputs/pa_scheduler_cross_core_shared_swimlane_20260804_132246_1352824/ccec/
+```
+
+泳道无丢记录，exclusive analyzer 的 Submit、EfDrain、orchestration、FinalDrain、
+worker completion 和 kernel containment 全部精确闭合。关键 atomic raw 数量为：
+
+```text
+Build dispatch ticket       1280 + 96 = 1376
+AIC Execute ticket           512 + 32 =  544
+AIV Execute ticket           512 + 64 =  576
+Execute ticket 合计                       1120
+BUILT -> CLAIMED CAS                      1024
+kernel completion                         1024
+```
+
+1120 条 Execute ticket 与静态预算完全一致，且泳道中不再存在旧 K2 scan、
+candidate 或 fallback 事件。与 S6.67 的同类泳道相比，
+`shared_exec_cell_state_load` 从 `2749` 次降为 `1677` 次，fanin flag 返回型读取
+从 `3794` 次降为 `3406` 次；新增的是分散在 AIC/AIV 两条 cache line 上的
+1120 次 Execute ticket FetchAdd。payload/TensorMap 的生产 DCCI 调用形状保持
+一致：每个 task 的 descriptor source invalidate、payload flush/acquire、
+SharedOutput descriptor/history 发布次数均未改变。因此性能变化来自执行发现和
+角色内动态分工，不是删掉跨核 payload 发布或 TensorMap 严格插入合同换来的。
+
+本次 full-swimlane 的完整 lifecycle 为 `1320.006 us`，1024 个 kernel 中
+`793` 个在 EfDrain 完成、`231` 个在 FinalDrain 完成。泳道只用于解释工作分布，
+性能裁决继续使用无观察构建。
+
+### 冻结交错 A/B
+
+为隔离“增加静态 Execute 表”和“替换 Execute 运行时”两件事，以提交
+`03e0e8f2` 冻结基线：该版本已经发布相同的 AIC/AIV 静态表，但运行时仍使用
+K2；候选为 S6.68-b 双中央 ticket。两边分别构建独立 perf-clock ELF，按
+B-C/C-B 反转顺序运行 12 对独立 A5 B256 进程，统一口径为 startup 起点到
+FinalDrain 结束：
+
+```text
+03e0e8f2 K2 baseline: min / median / max / mean
+                         1.374352 / 1.410142 / 1.446076 / 1.409733 ms
+S6.68 dual ticket:      min / median / max / mean
+                         1.239124 / 1.281905 / 1.311761 / 1.282614 ms
+
+独立中位数改善 = 0.128237 ms / 9.094%
+独立均值改善   = 0.127119 ms / 9.017%
+配对收益中位数 = 0.119547 ms
+12 对中候选获胜 12 对
+```
+
+另跑 12 个候选独立进程得到 `1.271261 / 1.286555 / 1.320377 /
+1.288326 ms` 的 min/median/max/mean，与交错 A/B 候选组方向一致。由此保留
+AIC/AIV 双中央 Execute ticket，并把当前可信端到端水平更新为约 `1.28 ms`。
+距离 `1 ms` 目标仍约 `0.28 ms`；下一阶段必须以新泳道重新挑选大头，不再对
+已经退出生产路径的 K2 scanner 做局部优化。
