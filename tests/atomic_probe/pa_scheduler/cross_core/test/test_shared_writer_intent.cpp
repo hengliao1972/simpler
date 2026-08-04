@@ -192,6 +192,13 @@ void UnmapSparseSchedulerState(SchedulerState *state) {
     }
 }
 
+volatile int64_t &InsertCompletion(
+    SchedulerState &state, uint32_t task
+) {
+    return state.claim_tournament[task]
+        .root.insert_completion.value;
+}
+
 void ResetProtocolState(SchedulerState &state) {
     state.fatal.value = 0;
     state.heap_window = kHeapWindow;
@@ -218,6 +225,8 @@ void ResetProtocolState(SchedulerState &state) {
         // per-task ordered completion 测试由 SetInsertCompletionsAfterTasks
         // 单独建立 task-specific pending 状态。
         state.tasks[task].deps_prepared = -1;
+        InsertCompletion(state, task) =
+            SharedInsertCompletionInitialValue(task);
         SharedOutputCell &outputs =
             state.shared_map.shared_outputs[task];
         for (uint32_t output = 0;
@@ -239,11 +248,11 @@ void SetInsertCompletionsAfterTasks(
 ) {
     for (uint32_t task = 0; task < completed_tasks;
          ++task) {
-        state.tasks[task].deps_prepared =
+        InsertCompletion(state, task) =
             static_cast<int64_t>(task);
     }
     if (completed_tasks < kMaxTasks) {
-        state.tasks[completed_tasks].deps_prepared =
+        InsertCompletion(state, completed_tasks) =
             SharedInsertCompletionInitialValue(completed_tasks);
     }
 }
@@ -252,6 +261,8 @@ void ResetOrderedCompletionWords(SchedulerState &state) {
     for (uint32_t task = 0; task < kMaxTasks; ++task) {
         state.tasks[task].deps_prepared =
             SharedInsertCompletionInitialValue(task);
+        InsertCompletion(state, task) =
+            SharedInsertCompletionInitialValue(task);
     }
 }
 
@@ -259,16 +270,16 @@ bool InsertCompletionsMatch(
     SchedulerState &state, uint32_t completed_tasks
 ) {
     for (uint32_t task = 0; task < completed_tasks;
-         ++task) {
+        ++task) {
         if (WriterIntentTestOps::Load(
-                &state.tasks[task].deps_prepared
+                &InsertCompletion(state, task)
             ) != static_cast<int64_t>(task)) {
             return false;
         }
     }
     if (completed_tasks < kMaxTasks &&
         WriterIntentTestOps::Load(
-            &state.tasks[completed_tasks].deps_prepared
+            &InsertCompletion(state, completed_tasks)
         ) != SharedInsertCompletionInitialValue(
                  completed_tasks
              )) {
@@ -2044,7 +2055,7 @@ void TestCorruptCompletionIsRejectedByNextOwner(
 
     // 非返回型完成发布不在当前 owner 上等待旧值；人为破坏当前字后，
     // FetchAdd 会保留异常终值，下一 owner 必须据此 fail-closed。
-    state.tasks[1].deps_prepared = 77;
+    InsertCompletion(state, 1) = 77;
     const uint32_t bucket = TensorMapHash(ordinary.buffer_addr);
     Check(
         PublishSharedTaskWriterDelta<WriterIntentTestOps>(
@@ -2062,7 +2073,7 @@ void TestCorruptCompletionIsRejectedByNextOwner(
         );
     Check(
         !next_ready && state.fatal.value == 1 &&
-            state.tasks[1].deps_prepared == 78 &&
+            InsertCompletion(state, 1) == 78 &&
             state.shared_map.buckets[bucket].tail.value == 1 &&
             symbol.last_writer[0].value == 1 &&
             state.shared_map.writer_history[1].count == 1 &&

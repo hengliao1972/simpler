@@ -368,16 +368,18 @@ struct OrderedSubmitTestOps {
             reinterpret_cast<uintptr_t>(address);
         const uintptr_t begin =
             reinterpret_cast<uintptr_t>(
-                &observed_state->tasks[0].deps_prepared
+                &observed_state->claim_tournament[0]
+                     .root.insert_completion.value
             );
         if (current < begin) {
             return -1;
         }
         const uintptr_t delta = current - begin;
-        if (delta % sizeof(TaskCell) != 0) {
+        if (delta % sizeof(SharedClaimTournamentTask) != 0) {
             return -1;
         }
-        const uintptr_t task = delta / sizeof(TaskCell);
+        const uintptr_t task =
+            delta / sizeof(SharedClaimTournamentTask);
         return task < kMaxTasks
             ? static_cast<int32_t>(task)
             : -1;
@@ -934,8 +936,10 @@ bool DispatchAndInsertEvidenceMatches(
                     -1;
             }
             exact &=
-                state.tasks[task_id].deps_prepared ==
+                tournament.root.insert_completion.value ==
                 static_cast<int64_t>(task_id);
+            exact &= state.tasks[task_id].deps_prepared ==
+                SharedInsertCompletionInitialValue(task_id);
             exact &=
                 OrderedSubmitTestOps::
                     completion_atomic_writes_by_task[task_id]
@@ -959,6 +963,11 @@ bool DispatchAndInsertEvidenceMatches(
          task < kMaxTasks; ++task) {
         exact &=
             state.claim_tournament[task].root.owner.value == -1;
+        exact &= state.claim_tournament[task]
+                .root.insert_completion.value ==
+            SharedInsertCompletionInitialValue(task);
+        exact &= state.tasks[task].deps_prepared ==
+            SharedInsertCompletionInitialValue(task);
         for (uint32_t group = 0;
              group < kSharedClaimTournamentMaxGroups; ++group) {
             exact &= state.claim_tournament[task]
@@ -1134,6 +1143,9 @@ bool RunLoserZeroTensorMapAccessTest() {
         stats.declared_task_count == 0 &&
         turns_unchanged &&
         state->tasks[kTask].deps_prepared ==
+            SharedInsertCompletionInitialValue(kTask) &&
+        state->claim_tournament[kTask]
+                .root.insert_completion.value ==
             SharedInsertCompletionInitialValue(kTask) &&
         OrderedSubmitTestOps::shared_map_accesses.load(
             std::memory_order_relaxed
@@ -1546,6 +1558,9 @@ bool RunPaUpWriterShapeContractTest() {
         state->fatal.value == 1 &&
         state->shared_map.writer_history[kTask].magic == 0 &&
         state->tasks[kTask].deps_prepared ==
+            SharedInsertCompletionInitialValue(kTask) &&
+        state->claim_tournament[kTask]
+                .root.insert_completion.value ==
             SharedInsertCompletionInitialValue(kTask);
     std::printf(
         "[ORDERED_SUBMIT] pa_up_writer_shape_contract=%s\n",
@@ -1614,8 +1629,11 @@ bool RunInsertReleaseBeforeBuildTest() {
     for (uint32_t task = 0; task < kTaskCount; ++task) {
         all_tasks_ready &= state->tasks[task].flag == 1;
         claim_cells_match &=
-            state->tasks[task].deps_prepared ==
+            state->claim_tournament[task]
+                    .root.insert_completion.value ==
             static_cast<int64_t>(task);
+        claim_cells_match &= state->tasks[task].deps_prepared ==
+            SharedInsertCompletionInitialValue(task);
     }
     // 正式 PA 将三个 lockstep accumulator 的 latest 收敛为 slot0 的
     // group word；slot1/2 保持 Alloc producer，供 generic slot-specific

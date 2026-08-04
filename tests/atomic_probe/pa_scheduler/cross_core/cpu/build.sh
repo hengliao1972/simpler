@@ -102,9 +102,10 @@ echo "[TEST] atomic PollBatch boundary self-test"
 # shared ring 是当前 ordered writer-delta 的 ordinary-region 原语，隔离
 # 覆盖 seq/ABA、回收与容量预检。PA Case1 当前 ordinary entry 为零，
 # 因此这些门槛仍不能代替后面的完整 96-worker Submit 测试。
-    # shared writer 插入完成链位于 TaskCell::deps_prepared：task 0 无前驱，
-    # task N 只等 N-1，发布时只 CAS 自己的完成字。旧 sidecar turn 全部
-    # 写入 canary 并要求零触碰；另覆盖空写、损坏值与重复发布 fatal。
+    # shared writer 插入完成链位于每 task 独占的 128B atomic 冲突单元：
+    # task 0 无前驱，task N 只等 N-1，发布时只 FetchAdd 自己的完成字。
+    # 旧 TaskCell 完成字和 sidecar turn 均作为 canary 要求零触碰；另覆盖
+    # 空写、损坏值与重复发布 fatal。
     echo "[BUILD] shared per-task insert-completion self-test"
     "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \
@@ -148,7 +149,8 @@ echo "[TEST] atomic PollBatch boundary self-test"
 
     # 中央单调 ticket 是替换 96 份完整 replay 的候选，不先接生产热路。
     # 独立 96-thread 门槛证明 exactly-once 发放、乱序构参/Build、严格
-    # deps_prepared 插入顺序和最终停产闭合；CPU 结果不冒充 A5 atomic 性能。
+    # per-task 完成字插入顺序和最终停产闭合；CPU 结果不冒充 A5 atomic
+    # 性能。
     echo "[BUILD] shared dynamic Build dispatch protocol self-test"
     "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \
@@ -251,7 +253,9 @@ echo "[TEST] atomic PollBatch boundary self-test"
     # kernel 都由全部 96 个 Scalar 以 G8 竞争 Build。用例锁定每组一个
     # root 竞争者、最终唯一 owner、重复 replay 全输，并证明未来 task
     # 不会覆盖延迟的前序 task。
-    # Claim 仍不触碰 deps_prepared；TensorMap 顺序由独立完成链验证。
+    # Claim owner 与 insert-completion 虽复用同一个 task sidecar，但分别
+    # 独占 cache line；Claim 必须保持 insert-completion 与旧 TaskCell
+    # canary 不变，TensorMap 顺序由独立完成链验证。
     echo "[BUILD] shared Claim Tournament self-test"
     "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \

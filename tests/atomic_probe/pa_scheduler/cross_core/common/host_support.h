@@ -940,9 +940,9 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     // -1 表示“尚无可消费 descriptor”。TensorDesc 区已由上方 memset 清零；
     // 不对 task_id 取模，避免在本阶段提前引入 generation 语义。
     for (uint32_t task_id = 0; task_id < kMaxTasks; ++task_id) {
-        // task 表位于 production prefix，前面的 memset 会把该字段清零；
-        // 每个 task 使用 task-specific pending 值 N-1；唯一 owner 用
-        // FetchAdd(+1) 发布为 N，重复发布会留下可被终态拒绝的 N+1。
+        // production TaskCell 的旧 deps_prepared 保持 task-specific pending
+        // 值并充当未触碰 canary；正式插入完成字在下面的 per-task atomic
+        // sidecar 中另行初始化。
         state->tasks[task_id].deps_prepared =
             SharedInsertCompletionInitialValue(task_id);
         for (uint32_t slot = 0; slot < kSharedOutputMaxPerTask; ++slot) {
@@ -967,12 +967,18 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
         state->shared_map.reader_done[worker].value = -1;
     }
-    // 每个 task 的 root/local 节点只在线性化一次；整表置为 -1 后，本轮
-    // 不复用、不普通写，也不对这些 atomic-only 地址执行 DCCI。
+    // 先把旧 Claim root/local owner 及 padding 全部恢复 -1；随后只把
+    // root 第二条 atomic line 初始化成 task-specific pending 值。正式
+    // Build 不触碰 owner 字段，也不对任何 atomic-only 地址执行 DCCI。
     std::memset(
         state->claim_tournament, 0xff,
         sizeof(state->claim_tournament)
     );
+    for (uint32_t task_id = 0; task_id < kMaxTasks; ++task_id) {
+        state->claim_tournament[task_id]
+            .root.insert_completion.value =
+            SharedInsertCompletionInitialValue(task_id);
+    }
     // cross-core 执行协议使用 fresh task cell。整块清零既建立精确 EMPTY
     // control，也把每个已发布 cache line 的尾部 padding 固定为零，避免
     // 上一轮未使用字节被随 payload 一起发布。token 再通过生产 helper
@@ -1230,7 +1236,7 @@ inline bool DecodeTraceStorageRecords(
 
 // 巨大的 WorkerState 不参与每轮 H2D/D2H。private 仍只搬前缀、控制量和
 // 结果三个既有范围；shared 额外把 results 后的 map sidecar 和其后的
-// per-task Claim Tournament 与 cross-core execution state 作为三个独立
+// per-task atomic sidecar 与 cross-core execution state 作为三个独立
 // 范围搬运。它们都不能混入 ControlBytes/ResultBytes，也不能因避免
 // 1 GiB worker arena 而漏传。
 inline constexpr size_t StatePrefixBytes() { return offsetof(SchedulerState, workers); }
@@ -5319,17 +5325,23 @@ inline Metrics Validate(
     }
 #if PTO_FDWIC_SHARED_MAP
     bool shared_heap_state_ok = shared_heap_capacity_ok;
-    // 每个实际回放 task 的插入完成字最终必须恰好保存自己的 task_id；
-    // 未使用的 TaskCell 必须继续保持各自的 task-specific pending 值。
+    // 每个实际回放 task 的 sidecar 插入完成字最终必须恰好保存自己的
+    // task_id；未使用 sidecar 与全部 production TaskCell canary 必须继续
+    // 保持各自的 task-specific pending 值。
     bool shared_per_task_insert_completions_ok = true;
+    bool legacy_task_completion_canary_ok = true;
     uint32_t shared_insert_completed_prefix = 0;
     for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
         const SharedHostPlannedTask *planned_task =
             shared_plan.TaskAt(task_id);
         const bool task_insert_completed =
             planned_task != nullptr &&
-            state.tasks[task_id].deps_prepared ==
+            state.claim_tournament[task_id]
+                    .root.insert_completion.value ==
                 static_cast<int64_t>(task_id);
+        legacy_task_completion_canary_ok &=
+            state.tasks[task_id].deps_prepared ==
+                SharedInsertCompletionInitialValue(task_id);
         shared_per_task_insert_completions_ok &=
             task_insert_completed;
         if (task_insert_completed &&
@@ -5340,6 +5352,10 @@ inline Metrics Validate(
     for (uint32_t task_id = task_count;
          task_id < kMaxTasks; ++task_id) {
         shared_per_task_insert_completions_ok &=
+            state.claim_tournament[task_id]
+                    .root.insert_completion.value ==
+                SharedInsertCompletionInitialValue(task_id);
+        legacy_task_completion_canary_ok &=
             state.tasks[task_id].deps_prepared ==
                 SharedInsertCompletionInitialValue(task_id);
     }
@@ -6101,6 +6117,11 @@ inline Metrics Validate(
         "shared per-task insert-completion words reach exact task ids",
         &metrics
     );
+    Expect(
+        legacy_task_completion_canary_ok,
+        "shared hot path leaves production TaskCell completion canaries unchanged",
+        &metrics
+    );
 #else
     Expect(
         state.frontier.value == static_cast<int64_t>(task_count) - 1,
@@ -6306,7 +6327,7 @@ inline Metrics Validate(
         &metrics
     );
     std::printf(
-        "[TENSORMAP] mode=shared insert_order=per_task_deps_prepared "
+        "[TENSORMAP] mode=shared insert_order=per_task_128b_completion "
         "completed_tasks=%u legacy_turns=[%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld] "
         "reclaim_upto=%lld "
         "region_appends=%llu region_physical=%llu region_logical=%llu "
@@ -6392,6 +6413,9 @@ inline Metrics Validate(
         claim_state_ok &=
             state.claim_tournament[task_id].root.owner.value ==
                 -1;
+        claim_state_ok &=
+            state.tasks[task_id].deps_prepared ==
+                SharedInsertCompletionInitialValue(task_id);
         for (uint32_t group = 0;
              group < kSharedClaimTournamentMaxGroups; ++group) {
             claim_state_ok &=
@@ -6411,7 +6435,7 @@ inline Metrics Validate(
     }
     Expect(
         claim_state_ok,
-        "central Build dispatch leaves Claim Tournaments and legacy cursors unused",
+        "central Build dispatch leaves Claim owners, TaskCell completion canaries, and legacy cursors unused",
         &metrics
     );
     Expect(

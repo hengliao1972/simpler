@@ -201,7 +201,29 @@ void ResetCompletionWords(SchedulerState &state, uint32_t count) {
     for (uint32_t task = 0; task < count; ++task) {
         state.tasks[task].deps_prepared =
             SharedInsertCompletionInitialValue(task);
+        state.claim_tournament[task]
+            .root.insert_completion.value =
+            SharedInsertCompletionInitialValue(task);
     }
+}
+
+volatile int64_t &CompletionWord(
+    SchedulerState &state, uint32_t task
+) {
+    return state.claim_tournament[task]
+        .root.insert_completion.value;
+}
+
+bool TaskCellCompletionCanariesMatch(
+    const SchedulerState &state, uint32_t count
+) {
+    for (uint32_t task = 0; task < count; ++task) {
+        if (state.tasks[task].deps_prepared !=
+            SharedInsertCompletionInitialValue(task)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool AddressEquals(uintptr_t observed, volatile int64_t *expected) {
@@ -230,7 +252,7 @@ void TestSequentialCompletionChain(SchedulerState &state) {
                      CompletionTestOps::load_calls.load(std::memory_order_relaxed) == 1 &&
                      AddressEquals(
                          CompletionTestOps::last_load_address.load(std::memory_order_relaxed),
-                         &state.tasks[task - 1U].deps_prepared
+                         &CompletionWord(state, task - 1U)
                      );
         }
         exact &= CompletionTestOps::cas_calls.load(std::memory_order_relaxed) == 0 &&
@@ -242,22 +264,25 @@ void TestSequentialCompletionChain(SchedulerState &state) {
             &state, static_cast<int32_t>(task), publish_stats
         );
         exact &=
-            published && state.tasks[task].deps_prepared == static_cast<int64_t>(task) &&
+            published && CompletionWord(state, task) == static_cast<int64_t>(task) &&
             CompletionTestOps::cas_calls.load(std::memory_order_relaxed) == 0 &&
             CompletionTestOps::fetch_add_calls.load(std::memory_order_relaxed) == 1 &&
             AddressEquals(
                 CompletionTestOps::last_fetch_add_address.load(std::memory_order_relaxed),
-                &state.tasks[task].deps_prepared
+                &CompletionWord(state, task)
             ) &&
             CompletionTestOps::legacy_turn_touches.load(std::memory_order_relaxed) == 0 &&
             LegacyTurnsMatch(state, legacy);
     }
 
     for (uint32_t task = 0; task < kSequentialTasks; ++task) {
-        exact &= state.tasks[task].deps_prepared == static_cast<int64_t>(task);
+        exact &= CompletionWord(state, task) == static_cast<int64_t>(task);
     }
-    exact &= state.tasks[kSequentialTasks].deps_prepared ==
+    exact &= CompletionWord(state, kSequentialTasks) ==
         SharedInsertCompletionInitialValue(kSequentialTasks);
+    exact &= TaskCellCompletionCanariesMatch(
+        state, kSequentialTasks + 1U
+    );
     Check(
         exact, "task 0 skips predecessor; every N waits only N-1, "
                "publishes only N, and never touches legacy turns"
@@ -294,9 +319,10 @@ void TestPendingOwnerWakesOnPredecessor(SchedulerState &state) {
 
     Check(
         observed_pending && published && wait_ok && ready_observed == 0 && load_count >= 2 &&
-            state.tasks[0].deps_prepared == 0 &&
-            state.tasks[1].deps_prepared ==
+            CompletionWord(state, 0) == 0 &&
+            CompletionWord(state, 1) ==
                 SharedInsertCompletionInitialValue(1) &&
+            TaskCellCompletionCanariesMatch(state, 2) &&
             state.fatal.value == 0 &&
             CompletionTestOps::legacy_turn_touches.load(std::memory_order_relaxed) == 0 &&
             LegacyTurnsMatch(state, legacy),
@@ -324,17 +350,19 @@ void TestEmptyWriterStillCompletes(SchedulerState &state) {
         exact &= PrepareSharedTaskWriterDelta(args, context, delta) && delta.ordinary_count == 0 &&
                  !delta.writer_intent_required &&
                  PublishSharedTaskWriterDelta<CompletionTestOps>(&state, context, delta, stats) &&
-                 state.tasks[static_cast<uint32_t>(task)].deps_prepared == task &&
+                 CompletionWord(state, static_cast<uint32_t>(task)) == task &&
                  CompletionTestOps::fetch_add_calls.load(std::memory_order_relaxed) == 1 &&
                  AddressEquals(
                      CompletionTestOps::last_fetch_add_address.load(std::memory_order_relaxed),
-                     &state.tasks[static_cast<uint32_t>(task)].deps_prepared
+                     &CompletionWord(state, static_cast<uint32_t>(task))
                  ) &&
                  CompletionTestOps::legacy_turn_touches.load(std::memory_order_relaxed) == 0;
     }
 
     Check(
-        exact && state.fatal.value == 0 && LegacyTurnsMatch(state, legacy),
+        exact && state.fatal.value == 0 &&
+            TaskCellCompletionCanariesMatch(state, 2) &&
+            LegacyTurnsMatch(state, legacy),
         "empty metadata transactions still publish one "
         "completion per task without a sidecar baton"
     );
@@ -396,7 +424,7 @@ void TestOutputsPublishBeforePredecessorWait(
             &cell.published[0].value, __ATOMIC_ACQUIRE
         ) == 1 &&
         __atomic_load_n(
-            &state.tasks[1].deps_prepared, __ATOMIC_ACQUIRE
+            &CompletionWord(state, 1), __ATOMIC_ACQUIRE
         ) == SharedInsertCompletionInitialValue(1) &&
         !publish_finished.load(std::memory_order_acquire);
 
@@ -412,8 +440,9 @@ void TestOutputsPublishBeforePredecessorWait(
             predecessor_published &&
             publish_ok &&
             state.fatal.value == 0 &&
-            state.tasks[0].deps_prepared == 0 &&
-            state.tasks[1].deps_prepared == 1 &&
+            CompletionWord(state, 0) == 0 &&
+            CompletionWord(state, 1) == 1 &&
+            TaskCellCompletionCanariesMatch(state, 2) &&
             cell.tensors[0].buffer_addr ==
                 descriptor.buffer_addr &&
             LegacyTurnsMatch(state, legacy),
@@ -427,7 +456,7 @@ void TestCorruptionAndDuplicateFailClosed(SchedulerState &state) {
 
     ResetCompletionWords(state, 5);
     LegacyTurnSnapshot legacy = SeedLegacyTurns(state);
-    state.tasks[2].deps_prepared = -9;
+    CompletionWord(state, 2) = -9;
     CompletionTestOps::ResetTrace(state);
     LocalStats corrupt_predecessor_stats{};
     int64_t ready_observed = INT64_MIN;
@@ -435,7 +464,7 @@ void TestCorruptionAndDuplicateFailClosed(SchedulerState &state) {
     exact &= !WaitForSharedTaskInsertTurn<CompletionTestOps>(
                  &state, 3, corrupt_predecessor_stats, ready_observed, load_count
              ) &&
-             state.fatal.value == 1 && state.tasks[2].deps_prepared == -9 &&
+             state.fatal.value == 1 && CompletionWord(state, 2) == -9 &&
              CompletionTestOps::cas_calls.load(std::memory_order_relaxed) == 0 &&
              CompletionTestOps::legacy_turn_touches.load(std::memory_order_relaxed) == 0 &&
              LegacyTurnsMatch(state, legacy);
@@ -453,7 +482,7 @@ void TestCorruptionAndDuplicateFailClosed(SchedulerState &state) {
     exact &= HandoffSharedTaskInsertTurn<CompletionTestOps>(
                  &state, 0, duplicate_stats
              ) &&
-             state.tasks[0].deps_prepared == 1 &&
+             CompletionWord(state, 0) == 1 &&
              state.fatal.value == 0 &&
              CompletionTestOps::fetch_add_calls.load(std::memory_order_relaxed) == 1 &&
              CompletionTestOps::legacy_turn_touches.load(std::memory_order_relaxed) == 0 &&
@@ -469,13 +498,13 @@ void TestCorruptionAndDuplicateFailClosed(SchedulerState &state) {
 
     ResetCompletionWords(state, 2);
     legacy = SeedLegacyTurns(state);
-    state.tasks[1].deps_prepared = 99;
+    CompletionWord(state, 1) = 99;
     CompletionTestOps::ResetTrace(state);
     LocalStats bad_current_stats{};
     exact &= HandoffSharedTaskInsertTurn<CompletionTestOps>(
                  &state, 1, bad_current_stats
              ) &&
-             state.tasks[1].deps_prepared == 100 &&
+             CompletionWord(state, 1) == 100 &&
              state.fatal.value == 0 &&
              CompletionTestOps::fetch_add_calls.load(std::memory_order_relaxed) == 1 &&
              CompletionTestOps::legacy_turn_touches.load(std::memory_order_relaxed) == 0 &&
@@ -490,7 +519,8 @@ void TestCorruptionAndDuplicateFailClosed(SchedulerState &state) {
              state.fatal.value == 1;
 
     Check(
-        exact, "corrupt predecessor, duplicate completion, and "
+        exact && TaskCellCompletionCanariesMatch(state, 2),
+        "corrupt predecessor, duplicate completion, and "
                "unexpected current value are rejected by the next owner"
     );
 }

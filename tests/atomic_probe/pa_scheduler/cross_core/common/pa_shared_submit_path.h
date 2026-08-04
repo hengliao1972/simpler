@@ -374,14 +374,15 @@ PA_DEVICE bool HandoffSharedTaskInsertTurn(
     }
     // ordinary payload 的 DCCI、symbol history/latest 与 fresh descriptor
     // 都必须先于本 task 的插入完成字对 N+1 owner 可见。每个 task 使用
-    // 自己的 TaskCell，不再把一枚 baton 在 G 条 sidecar 线上轮换。
+    // 自己的 128B-isolated sidecar completion，不再与相邻 TaskCell atomic
+    // 共用冲突单元，也不把一枚 baton 在 G 条线上轮换。
     Ops::StoreBarrier();
     // swimlane 构建走 CaptureAtomicFetchAddIssue；这里是无泳道构建和
     // 隔离测试共用的 trace-free helper。
     // PA_ATOMIC_DCCI_SOURCE_EXEMPT: trace-free - swimlane 使用统一捕获 helper
     (void)Ops::FetchAdd(
-        &state->tasks[static_cast<uint32_t>(task_id)]
-             .deps_prepared,
+        &state->claim_tournament[static_cast<uint32_t>(task_id)]
+             .root.insert_completion.value,
         static_cast<int64_t>(1)
     );
     (void)stats;
@@ -403,8 +404,8 @@ PA_DEVICE bool TraceHandoffSharedTaskInsertTurn(
     Ops::StoreBarrier();
     CaptureAtomicFetchAddIssue<Ops>(
         stats.trace,
-        &state->tasks[static_cast<uint32_t>(task_id)]
-             .deps_prepared,
+        &state->claim_tournament[static_cast<uint32_t>(task_id)]
+             .root.insert_completion.value,
         static_cast<int64_t>(1),
         publish_trace_begin, publish_trace_end
     );
@@ -425,7 +426,8 @@ PA_DEVICE bool PublishSharedTaskWriterDelta(
 ) {
     // fresh output cell 由本 task 的唯一 Claim winner 独占，不参与
     // ordinary/symbol 的 task-ID 串行插入。先发布 descriptor，再等待
-    // predecessor；最终 deps_prepared handoff 仍同时封口两类发布。
+    // predecessor；最终 per-task insert-completion handoff 仍同时封口
+    // 两类发布。
     if (state == nullptr || !context.won || context.task_id < 0 ||
         context.task_id >= static_cast<int32_t>(kMaxTasks) ||
         // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - generic 组合入口只供隔离测试；正式 dispatched 路径在领取新 Build ticket 前统一观察 scheduler fatal，已取得的合法工作单元允许闭合
@@ -495,15 +497,17 @@ PA_DEVICE bool WaitForSharedTaskInsertTurn(
     }
 
     // task 0 没有前驱，直接进入有序插入段。它完成后仍必须把自己的
-    // deps_prepared 从 -1 发布为 0，供 task 1 建立真实跨核依赖。
+    // task 0 的 insert-completion 从 -1 发布为 0，供 task 1 建立真实
+    // 跨核依赖。
     if (task_id == 0) {
         ready_observed = -1;
         return true;
     }
 
     PA_GM volatile int64_t *predecessor =
-        &state->tasks[static_cast<uint32_t>(task_id - 1)]
-             .deps_prepared;
+        &state->claim_tournament[
+             static_cast<uint32_t>(task_id - 1)
+         ].root.insert_completion.value;
     const uint64_t begin = Ops::Now();
     uint32_t polls = 0;
     while (true) {
@@ -713,8 +717,8 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     const uint64_t materialize_end =
         TraceTimestamp<Ops>(stats.trace, stats.result);
 
-    // 仅这一段全局串行：N>0 只等待 task[N-1].deps_prepared，随后插入
-    // N 的 ordinary/symbol writer 元数据，再发布 task[N].deps_prepared。
+    // 仅这一段全局串行：N>0 只等待 task[N-1] 的独立完成字，随后插入
+    // N 的 ordinary/symbol writer 元数据，再发布 task[N] 的独立完成字。
     // fresh output descriptor 已在 Materialize 尾部按 task-cell 独占发布；
     // 空 writer 集合也必须推进，loser 完全不参与。
     const uint64_t register_begin = materialize_end;

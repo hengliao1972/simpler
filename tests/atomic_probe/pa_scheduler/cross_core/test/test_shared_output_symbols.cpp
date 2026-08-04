@@ -2094,8 +2094,16 @@ void TestPaUpSplitWriterPublicationStages() {
     constexpr int32_t kProducer = 0;
     constexpr int32_t kPredecessor = 3;
     constexpr int32_t kWriter = 4;
-    state->tasks[kPredecessor].deps_prepared = -1;
-    state->tasks[kWriter].deps_prepared = -1;
+    state->tasks[kPredecessor].deps_prepared =
+        SharedInsertCompletionInitialValue(kPredecessor);
+    state->tasks[kWriter].deps_prepared =
+        SharedInsertCompletionInitialValue(kWriter);
+    state->claim_tournament[kPredecessor]
+        .root.insert_completion.value =
+        SharedInsertCompletionInitialValue(kPredecessor);
+    state->claim_tournament[kWriter]
+        .root.insert_completion.value =
+        SharedInsertCompletionInitialValue(kWriter);
     SharedOutputCell &cell =
         state->shared_map.shared_outputs[kProducer];
     for (uint32_t slot = 0; slot < 3; ++slot) {
@@ -2124,7 +2132,11 @@ void TestPaUpSplitWriterPublicationStages() {
         history.magic == kSharedWriterHistoryMagic &&
         history.writer_task == kWriter &&
         history.count == 3 &&
-        state->tasks[kWriter].deps_prepared == -1;
+        state->claim_tournament[kWriter]
+                .root.insert_completion.value ==
+            SharedInsertCompletionInitialValue(kWriter) &&
+        state->tasks[kWriter].deps_prepared ==
+            SharedInsertCompletionInitialValue(kWriter);
     for (uint32_t index = 0; index < 3; ++index) {
         prepared_but_unpublished &=
             history.entries[index].symbol_key ==
@@ -2166,7 +2178,8 @@ void TestPaUpSplitWriterPublicationStages() {
         "reader cannot discover a pre-turn orphan history"
     );
 
-    state->tasks[kPredecessor].deps_prepared = kPredecessor;
+    state->claim_tournament[kPredecessor]
+        .root.insert_completion.value = kPredecessor;
     int64_t ready_observed = -1;
     GroupWriterCountingOps::compare_exchange_calls.store(
         0, std::memory_order_relaxed

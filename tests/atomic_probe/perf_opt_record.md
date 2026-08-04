@@ -6588,3 +6588,18 @@ cursor 更快通过后，请求会更早抵达同一个 aggregate vend。site 15
 本轮没有扩张 production `TaskCell`，也没有改 final barrier、shared output
 cell 或 ordinary ring。后者即使存在相邻 64B 原子行，也需要先证明同一时段
 确有跨核并发访问；不能仅凭结构体相邻就继续批量填充 64B padding。
+
+### 15.55 以 128B 冲突单元隔离 cross-core 严格插入完成字
+
+A5 受控探针证明同一对齐 128B 区间内的不同 atomic 地址仍会互相串行。旧
+64B `TaskCell` 使相邻 task 的 `deps_prepared` 两两共用该冲突单元；本轮复用
+standalone 旧 Claim root 的空闲第二条 cache line，形成按 task 绝对 128B
+对齐的 `insert_completion`，不增加 state 大小，也不改变严格插入的 Atomic
+次数、返回值和顺序。
+
+CPU 全量、CCEC 两种构建及 A5 B1/B256 全部通过。相对冻结基线
+`574ef6a3` 的 12+12 正反顺序交错 A/B 中，完整周期中位从
+`1.227488 ms` 降至 `1.076732 ms`，改善 `12.282%`；均值改善
+`12.051%`，12/12 对候选获胜。full-swimlane 中 predecessor wait 的累计
+core-work 从 `22.901 ms` 降至 `11.360 ms`，1279 条严格依赖边保持不变，
+DCCI 调用仍为 6528 次。详细协议、原始数据和归因见实现过程 S6.70-d。

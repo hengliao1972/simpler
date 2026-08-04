@@ -4748,3 +4748,152 @@ expected writer 只允许由 adapter 从 immutable plan 推导。
 本阶段状态：**设计与实证边界已闭合，device code NOT CHANGED，A5 NOT
 RUN**。只有 CPU 原型通过后才进入 CCEC/A5；最终仍由 startup→FinalDrain
 冻结交错 A/B 决定保留或完整撤回。
+
+## 2026-08-04：S6.70-b 否决 grouped drainer，改做 128B 地址隔离
+
+用户明确决定不实现 grouped ordered Register drainer。该方向对应的未提交
+CPU 原型已经完整删除，device 代码从未进入 grouped 协议；S6.70-a 只作为
+曾经完成过的瓶颈诊断和否决记录保留，不能再解释成当前实施计划。
+
+同日合入的 A5 受控 Atomic 地址冲突用例给出了更直接的低改动候选：DIE0
+Core 到 GM0 的 `atomicAdd` 中，两个热点位于同一对齐 128B 区间时，请求按
+两组总人数串行；跨 128B 边界后，两组队列可并行。每个热点内部的斜率约为
+`170--175 ns/core`。该结论来自 10 轮、431800 条原始记录和 6350 次 launch，
+不是用泳道空白反推的假设。
+
+对当前 ABI 直接计算偏移后得到：
+
+```text
+SharedExecDispatchState
+  aic_next = +0
+  aiv_next = +64
+  => 两条中央 Execute cursor 位于同一个 128B 冲突单元
+
+TaskCell
+  sizeof = 64
+  deps_prepared = +16
+  => 相邻 task 的 completion atomic 两两共享 128B 冲突单元
+```
+
+因此实施顺序改为：
+
+1. 只把 AIC/AIV Execute cursor 隔离到两个独立的 128B 对齐槽；
+2. CPU/CCEC/A5 正确性闭合后，对冻结基线做 startup→FinalDrain 交错 A/B；
+3. 再单独把 `deps_prepared` 移到每 task 128B 步长的 sidecar，重复同一验收；
+4. 每步均不改 atomic 次数、返回值消费、Build/Execute owner 或 TensorMap
+   插入顺序；若没有稳定收益，完整撤回该步。
+
+不把公共 `AtomicLine` 全局改成 128B：受控结论只要求独立热点跨越冲突单元，
+机械扩大所有控制字会显著膨胀接近 1GiB 的状态，同时混入大量无关变量。
+
+## 2026-08-04：S6.70-c 验证并撤回双 Execute cursor 的 128B 地址隔离
+
+### 代码与正确性边界
+
+本阶段只调整 `SharedExecDispatchState` 的物理布局：
+
+- `aic_next` 与 `aiv_next` 从相邻两个 64B `AtomicLine` 改为各自占用一个
+  128B 对齐槽；
+- 两份只读 task-id 表整体后移 192B，Atomic 数量、FetchAdd 返回值消费、
+  AIC/AIV 路由和唯一 ticket 语义均不变；
+- `SchedulerState` 对齐提升到 128B，host 对最终 device 分配地址作同样校验；
+- cross-core execution sidecar 从 `19437952B` 增至 `19438144B`。
+
+CPU 全构建通过；CCEC AIC/AIV 编译通过；A5 real-compute `6,28,4,1` 的 B1、
+B256 均通过完整语义、TensorMap、payload、执行次数和终态校验。B256 首次
+候选样本为 `1239.970 us`，只用于正确性烟测，不进入 A/B 统计。
+
+### 冻结交错 A/B
+
+基线固定为 `946d2cb2`，候选只包含上述布局修改。两者在 device 0 上各预热
+一次，然后按 B-C/C-B 交替顺序各运行 12 次；环境没有 `task-submit` 和
+`npu-smi` 命令，因此本次为未加队列锁的同设备串行结果：
+
+| 指标 | 基线 | 候选 |
+| ---- | ---: | ---: |
+| 中位 | 1218.139 us | 1231.229 us |
+| 均值 | 1219.104 us | 1229.917 us |
+| 最小--最大 | 1190.260--1254.979 us | 1192.251--1269.496 us |
+
+逐对差值中位为 `+12.459 us`（`+1.023%`），均值为 `+10.813 us`，候选
+4 胜 8 负。但逐对均值差的 95% 区间为 `[-1.634, +23.261] us`，逐对
+中位 bootstrap 95% 区间为 `[-5.402, +26.909] us`，均跨过零；双侧符号
+检验 `p=0.388`。AIC/AIV `.text` 大小分别保持 `0x1ae80/0x1b438`，没有
+代码膨胀。
+
+因此这组端到端样本只能判定“未量出稳定收益”，不能把约 1% 的表观差值
+归因为真实回退。后续 BUILT-ready 方案又使这两条 cursor 退出设备热路径，
+继续保留两个 128B 空槽已经没有性能意义。本地提交收敛时撤回该代码，只保留
+本段负结果和 A5 128B Atomic 冲突单元的基础结论；下一候选只处理严格
+Register 链中仍真实访问的 per-task completion 地址，不与本阶段混测。
+
+## 2026-08-04：S6.70-d 隔离每 task 插入完成字并验收
+
+### 单变量实现
+
+旧 `TaskCell` 大小为 64B，`deps_prepared` 位于 `+16B`，因此相邻两个 task
+的严格插入完成字落在同一个 A5 128B atomic 冲突单元。task N 发布完成的
+FetchAdd 与 task N+1 等待前驱的返回型 Load 虽然访问不同 8B 地址，仍会在
+同一硬件冲突单元中互相串行。
+
+本阶段没有扩大公共 `AtomicLine`，也没有新增 SchedulerState 字节：中央 Build
+ticket 已使旧 Claim Tournament owner 退出生产路径，现复用每 task root 原本
+空闲的第二条 64B line 保存 `insert_completion`。该地址绝对 128B 对齐，task
+stride 也能被 128 整除。原 `TaskCell::deps_prepared` 保持 task-specific
+pending 值，作为生产热路径零触碰的 canary。
+
+Atomic 协议保持不变：task N 仍只在 writer metadata 发布后执行一次非返回型
+FetchAdd(+1)，task N+1 仍用返回型 Load 等待精确值 N；没有改变调用数、返回值
+消费、Build/Execute owner、TensorMap 严格顺序或 DCCI。shared ABI generation
+从 13 提升到 14，阻止旧 host/device 产物交叉使用。state 总大小保持
+`1059049856B`，perf-clock 混合 ELF `.text` 只增加 `256B`。
+
+### 正确性门槛
+
+- CPU 全量构建通过：插入完成链、writer intent、symbol、Claim Tournament、
+  96-worker ordered Submit、三 token 与 FinalDrain 全部 PASS；
+- Claim Tournament 用例额外证明 owner CAS 不触碰同 root 的完成字；
+- CCEC perf-clock/full-swimlane 两种构建通过；
+- A5 B1/B256 real-compute `6,28,4,1` 全部业务、payload、严格插入、1024
+  kernel exactly-once 和终态断言 PASS；
+- host 逐 task 验证 sidecar 最终精确等于 task id，并验证所有旧 TaskCell
+  canary 保持初值。
+
+### 冻结交错 A/B
+
+基线固定为 `574ef6a3`，候选只包含完成字地址隔离。预热后按 B-C/C-B 反转
+顺序交错运行 12 对独立 A5 B256 进程，口径均为 startup 起点到最后
+FinalDrain 结束：
+
+```text
+基线 B: min / median / max / mean
+          1.206982 / 1.227488 / 1.262953 / 1.228352 ms
+候选 C: min / median / max / mean
+          1.055210 / 1.076732 / 1.118343 / 1.080329 ms
+
+独立中位数改善 = 150.756 us / 12.282%
+独立均值改善   = 148.023 us / 12.051%
+配对收益中位数 = 151.026 us
+候选获胜       = 12 / 12 对
+```
+
+### 泳道归因
+
+优化前后 B256 full-swimlane 的 1280 task、1024 kernel 和 6528 次 DCCI
+调用均不变。exclusive analyzer 的严格 Register 分解为：
+
+| 指标 | 基线 | 候选 | 变化 |
+| ---- | ---: | ---: | ---: |
+| Submit wall-clock makespan | 967.378 us | 830.068 us | -137.310 us |
+| Register aggregate core-work | 23089.785 us | 11768.390 us | -49.03% |
+| predecessor wait core-work | 22900.976 us | 11360.344 us | -50.39% |
+| predecessor wait 平均/次 | 17.905 us | 8.882 us | -50.39% |
+| atomic logical calls | 96816 | 81160 | -15656 |
+| batched poll logical loads | 67087 | 51400 | -15687 |
+
+每轮仍精确存在 1279 个 predecessor PollBatch；减少的是每批内部因 128B
+冲突反复重试的 Load 数，而不是删除严格插入边。候选完整 lifecycle 为
+`1.119745 ms`，泳道已保存为
+`test_record/2026-8-4/cross_b256_128b_1p120ms.json`。该优化只依赖“每 task
+一个严格完成字”的通用有序提交合同，不读取 PA task kind、batch 或固定 DAG，
+因此正式保留。

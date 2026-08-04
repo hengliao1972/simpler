@@ -1217,7 +1217,7 @@ PA_DEVICE ClaimOutcome Claim(
     // engine 同角色候选；shared S5b 则让每个 kernel 都由全部 96 个
     // Scalar 竞争 Build。kernel 类型只决定 function/Execute engine，
     // 不再限制 builder 角色。shared TensorMap 的严格插入顺序不由 Claim
-    // 承担，而由 winner 后续的 deps_prepared commit chain 保证。
+    // 承担，而由 winner 后续的 per-task insert-completion chain 保证。
     // role 来自 RunSchedulerImpl 的入口 SSA 值；不能在每个 task 中再从
     // WorkerState GM 回读同一字段，否则 B256 会产生 98,304 次冗余读取。
     ClaimOutcome outcome{false, false, 0, -1};
@@ -1245,7 +1245,7 @@ PA_DEVICE ClaimOutcome Claim(
         // Alloc 的 96 个 worker 全部可候选；worker_id 本身就是
         // 稳定的 [0,96) rank，取模后八个 local 节点各承担
         // 12 个候选。这只改变 owner 仲裁人口，不改变后续
-        // deps_prepared 严格插入链。
+        // per-task insert-completion 严格插入链。
         candidate_rank = worker_id;
         tournament_groups =
             kSharedAllocClaimTournamentGroups;
@@ -3375,8 +3375,8 @@ PA_DEVICE bool ValidatePaSharedWriterIntentShape(
 }
 
 // 调用者已经完成只读 fanin 解析和 ordinary registration 校验后，登记
-// 三个 accumulator writer，再发布 deps_prepared。它位于 winner Build
-// 之前；后续 Finish 必须复用 context.fanin，并在 Build 后跳过第二次
+// 三个 accumulator writer，再发布本 task 的 insert-completion。它位于
+// winner Build 之前；后续 Finish 必须复用 context.fanin，并在 Build 后跳过第二次
 // Commit。默认实例处理首组，ChainedWriter 处理中间组。
 template <typename Ops, bool ChainedWriter = false>
 PA_DEVICE bool CommitPaSharedWriterIntentAfterFanin(
@@ -5413,7 +5413,7 @@ PA_DEVICE bool FinishCallbackSubmitBody(
 #if PTO_FDWIC_SHARED_MAP && \
     defined(PA_TEST_SHARED_POST_GATE_BUILD_FAILURE)
         // 只供 host 96-worker 故障门槛使用：non-final UP 已完成 writer
-        // intent 与 deps_prepared 发布后、建立可执行 slot 前注入失败。
+        // intent 与 insert-completion 发布后、建立可执行 slot 前注入失败。
         // 普通 CPU/CCEC 不定义该宏，预处理后不保留调用或分支。
         if (shared_writers_prepared &&
             Ops::InjectSharedPostGateBuildFailure(
@@ -6487,7 +6487,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #if PTO_FDWIC_SHARED_MAP
         // Build 中央单调 ticket 只让每个逻辑 task 构建一次。每个 Scalar
         // 在领取前先推进自己已经持有的 Execute token；取得 Build ticket
-        // 后可乱序构参，但 Finish 内仍由 deps_prepared[N-1] 串行提交
+        // 后可乱序构参，但 Finish 内仍由 insert-completion[N-1] 串行提交
         // TensorMap 元数据。
 #if PA_BUILD_PERF_CLOCK
         // 起点已在 startup increment 之前读取；这里不得覆盖。

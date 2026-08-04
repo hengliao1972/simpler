@@ -7,13 +7,13 @@
 | 目标 | 让 task 的构建 owner 与 kernel 执行 owner 可以是不同物理核 |
 | 当前代码 | 96 Scalar 通过中央 Build ticket 恰好一次 Build；32 AIC 与 64 AIV 分别通过各自中央 Execute ticket 动态领取同角色 task；每核三个 token 可在 payload 尚未发布时保存 `WAITING_BUILT`，Build/Execute owner 独立且允许同核 |
 | 本文性质 | 持续更新的架构与内存模型设计记录 |
-| 正式实现 | S0–S6.69-c 已形成三条独立发放流：一条全 96 Scalar Build ticket、两条 AIC/AIV Execute ticket；严格 TensorMap 插入链、task-indexed immutable payload、跨核 DCCI publish/acquire、三个 owner-local token 和 16 组 FinalDrain 收口均保持；旧 K2 扫描、候选位图和 fallback 已从生产代码物理删除 |
+| 正式实现 | S0–S6.70-d 已形成三条独立发放流：一条全 96 Scalar Build ticket、两条 AIC/AIV Execute ticket；严格 TensorMap 插入链、task-indexed immutable payload、跨核 DCCI publish/acquire、三个 owner-local token 和 16 组 FinalDrain 收口均保持；严格插入完成字已按 task 隔离到独占 128B atomic 冲突单元 |
 | CPU 正确性用例 | 双角色 Execute ticket、同核/跨核 owner、`WAITING_BUILT` 三 token 容量上界、严格插入与乱序 Build、1024 kernel exactly-once 和 FinalDrain 完整回归均已通过 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
-| A5 PA 功能/性能 | S6.43 起，唯一裁决口径为最早 startup 起点到最后 FinalDrain 结束；旧 Submit-only 与 first-Submit-to-FinalDrain 数据只保留为历史证据。S6.69-c 的 12 对冻结 A/B 中，双 token 基线中位 `1.297757 ms`、三 token 中位 `1.233854 ms`，改善 `4.924%`，12/12 对候选更快；B1/B256 功能与终态全部 PASS |
+| A5 PA 功能/性能 | 唯一裁决口径为最早 startup 起点到最后 FinalDrain 结束。S6.70-d 的 12 对冻结 A/B 中，旧相邻 TaskCell 完成字中位 `1.227488 ms`、每 task 128B 隔离完成字中位 `1.076732 ms`，改善 `12.282%`，12/12 对候选更快；B1/B256 功能与终态全部 PASS |
 | 历史 S4 Execute election | K2 首版曾通过 CPU B1/B256 和 A5 B1/B256，现已被 S6.68-b 的角色中央 ticket 替代，仅作为历史证据保留 |
 | S5 Build 拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 五类 task 全 96/G8 已通过 CPU/CCEC/A5 B1/B256，物理 Claim CAS 精确闭合 |
-| 当前验证缺口 | 三 token 的 CPU、CCEC、A5 B1/B256、atomic/DCCI 调用闭合、完整泳道和冻结 A/B 均已完成；距 `1 ms` 目标仍约 `0.234 ms`，下一阶段应以新泳道重新选择结构性大头，不继续无证据扩容 token |
+| 当前验证缺口 | 三 token 与 per-task 128B 插入完成字的 CPU、CCEC、A5 B1/B256、完整泳道和冻结 A/B 均已完成；距 `1 ms` 目标仍约 `0.077 ms`，下一阶段依据新泳道重新选择结构性大头，不继续无证据扩容 token |
 | 明确非目标 | 不引入 `try_wait`、engine continuation 或“kernel 运行期间同一 Scalar 继续调度” |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
@@ -1466,9 +1466,12 @@ cell 同地址竞争，而是用 AIC/AIV 两条中央 ticket 唯一发放 task�
 13. completion 使用 token payload 中的 vend；发布 DONE 后才释放对应 token，FinalDrain 要求三槽均 IDLE；
 14. DCache preload 默认关闭；hint 的任何候选都单独 A/B，不参与正确性合同；
 15. token 容量当前为编译期常量 3；若后续参数化或再扩容，必须重做 state size、容量背压、FinalDrain 和 A5 冻结 A/B。
-16. S6.70 的 grouped ordered Register drainer 当前仅是已完成合同审查的下一
-    候选，尚未进入生产路径；在 CPU/A5 门槛闭合前，现行逐 task
-    `deps_prepared[N-1] -> metadata(N) -> deps_prepared[N]` 仍是权威实现。
+16. S6.70 的 grouped ordered Register drainer 已否决且未进入 device 路径；
+     现行逐 task `insert_completion[N-1] -> metadata(N) ->
+     insert_completion[N]` 仍是权威实现。每 task insert-completion 独占
+     A5 的 128B atomic 冲突单元，并复用旧 Claim root 的空闲第二条 cache
+     line，不增加 SchedulerState 大小。双 Execute cursor 的 128B 隔离未量出
+     稳定收益且后续不再属于热路径，因此不作为现行代码合同保留。
 
 这一版不是最终高性能形态。它的价值是把三个未知量拆开：
 
@@ -1482,7 +1485,7 @@ cell 同地址竞争，而是用 AIC/AIV 两条中央 ticket 唯一发放 task�
 分阶段闭合；S6 只在这一架构内优化，不再引入第四套 engine/Scalar
 协程机制。
 
-上面的 1--15 是 S6.69 后的当前合同。它保持 task-indexed Built queue、
+上面的 1--16 是 S6.70-d 后的当前合同。它保持 task-indexed Built queue、
 portable payload、双角色中央 Execute ticket、同步 kernel 和 completion/FinalDrain
 内存合同，并采用“领取后立即检查、每核三 token、owner-local ready
 优先”模型。

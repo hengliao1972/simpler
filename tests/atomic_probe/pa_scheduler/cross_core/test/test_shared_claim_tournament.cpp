@@ -223,7 +223,8 @@ bool TournamentStateMatches(
     const uint32_t active_groups = ExpectedGroups(kind);
     const SharedClaimTournamentTask &tournament =
         state.claim_tournament[task_id];
-    bool exact = tournament.root.owner.value == expected;
+    bool exact = tournament.root.owner.value == expected &&
+        tournament.root.insert_completion.value == -1;
     for (uint32_t group = 0;
          group < kSharedClaimTournamentMaxGroups; ++group) {
         exact &= tournament.local[group].owner.value ==
@@ -374,7 +375,7 @@ void TestAllTaskKindsAndReplay() {
         exact,
         "all task kinds preserve 96 candidates and G8 Tournament, "
         "exact-one Build owner, immediate replay losers, "
-        "untouched deps_prepared, and untouched legacy cursors"
+        "untouched insert-completion/TaskCell canaries, and untouched legacy cursors"
     );
     (void)munmap(state, sizeof(*state));
 }

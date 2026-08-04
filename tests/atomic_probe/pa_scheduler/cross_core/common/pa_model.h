@@ -150,7 +150,7 @@ constexpr uint32_t kBuildIdentityMagic = 0x50414249U;  // "PABI"
 constexpr uint32_t kBuildIdentityCompactGenericTraceBit =
     1U << 31U;
 #if PTO_FDWIC_SHARED_MAP
-constexpr uint32_t kBuildIdentityAbiGeneration = 13;
+constexpr uint32_t kBuildIdentityAbiGeneration = 14;
 #else
 constexpr uint32_t kBuildIdentityAbiGeneration = 4;
 #endif
@@ -1392,8 +1392,29 @@ static_assert(
     "shared Claim Tournament owner must start its node"
 );
 
+// 中央 Build ticket 启用后，root owner 与全部 local owner 都只作为旧 Claim
+// canary 保留。root 原本未使用的第二条 cache line 复用为严格 TensorMap
+// 插入完成字；它不增加 sidecar 字节数，也不与普通 payload/DCCI 共线。
+struct alignas(64) SharedClaimTournamentRoot {
+    AtomicLine owner;
+    AtomicLine insert_completion;
+    uint8_t padding[
+        kSharedClaimTournamentNodeStride - 2 * sizeof(AtomicLine)
+    ];
+};
+static_assert(
+    sizeof(SharedClaimTournamentRoot) ==
+        kSharedClaimTournamentNodeStride,
+    "shared Claim root stride changed"
+);
+static_assert(
+    offsetof(SharedClaimTournamentRoot, owner) == 0 &&
+        offsetof(SharedClaimTournamentRoot, insert_completion) == 64,
+    "shared Claim root atomic-line offsets changed"
+);
+
 struct alignas(64) SharedClaimTournamentTask {
-    SharedClaimTournamentNode root;
+    SharedClaimTournamentRoot root;
     SharedClaimTournamentNode
         local[kSharedClaimTournamentMaxGroups];
 };
@@ -1506,12 +1527,10 @@ struct alignas(64) TaskCell {
     volatile int64_t flag;
     volatile uint64_t vend;
 #if PTO_FDWIC_SHARED_MAP
-    // shared 热路径把该字作为 per-task TensorMap 插入完成原子：task N
-    // 的初值是 N-1，唯一 Build owner 完成 writer 元数据发布后只发射
-    // FetchAdd(+1) 写成 N；N+1 owner 只轮询这一字。重复发布会把它推进
-    // 到 N+1，由下一 owner 或 host 终态检查拒绝。它与 flag/vend 共处 TaskCell，
-    // 但当前热路径不对该 cache line 执行 DCCI。旧 writer-ready helper
-    // 只供隔离协议测试，不能与本热路径混用。
+    // 该旧字属于 production TaskCell ABI，只供 writer-ready 隔离测试并在
+    // cross-core 正式运行中充当未触碰 canary。严格 TensorMap 插入完成字
+    // 已迁到 standalone per-task atomic sidecar，避免与相邻 task 的
+    // flag/vend/deps_prepared 共用 A5 的 128B atomic 冲突单元。
     volatile int64_t deps_prepared;
     uint8_t padding[64 - 3 * sizeof(int64_t)];
 #else
@@ -2194,8 +2213,9 @@ struct alignas(64) SchedulerState {
     // shared 后端状态只追加在完整 production prefix、standalone controls
     // 和 results 之后，不移动 RunConfig、WorkerState 或任何被测生产字段。
     SharedTensorMapSidecar shared_map;
-    // standalone-only owner-election 状态继续追加在 shared TensorMap 后面；
-    // 它既不改变 production prefix，也不混入需要 DCCI 的 metadata。
+    // standalone-only per-task atomic 状态继续追加在 shared TensorMap 后面。
+    // 旧 Claim owner 保留为 canary；root 的第二条 atomic-only line 承载
+    // TensorMap insert completion。两者都不混入需要 DCCI 的 metadata。
     SharedClaimTournamentTask claim_tournament[kMaxTasks];
     // S3 构建/执行分离状态只追加在既有 standalone sidecar 尾部：
     // production prefix、WorkerResult、shared TensorMap 与 Claim Tournament
@@ -2260,6 +2280,13 @@ static_assert(
         offsetof(SchedulerState, shared_map) +
             sizeof(SharedTensorMapSidecar),
     "shared Claim Tournament must follow the TensorMap sidecar"
+);
+static_assert(
+    (offsetof(SchedulerState, claim_tournament) +
+     offsetof(SharedClaimTournamentTask, root) +
+     offsetof(SharedClaimTournamentRoot, insert_completion)) % 128 == 0 &&
+        sizeof(SharedClaimTournamentTask) % 128 == 0,
+    "per-task insert completions must occupy distinct aligned A5 conflict units"
 );
 static_assert(
     offsetof(SchedulerState, exec_fatal) ==
