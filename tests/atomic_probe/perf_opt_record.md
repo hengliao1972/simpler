@@ -6387,3 +6387,29 @@ Alloc/QK/SF/PV/UP，代码归属却会迫使其他算子依赖 PA adapter。
 PASS；B256 完整周期为 `1460.694 us`。同一 A5 单 engine 合同可被其他
 算子直接复用；Joint、固定 block affinity 和 multicore 仍需新增后端策略，
 不能把当前 K2 当作全平台默认。详细取证见实现过程 S6.53。
+
+### 15.52 已保留优化的最终算子泛化结论
+
+对当前生效行为逐项回溯后，确认两个真正的公共边界问题：
+FinalDrain 曾用 PA 的 `task_count - batches` 推导可执行数，K2/owner
+placement 曾错放在 PA adapter。两者已由 S6.52/S6.53 分别修正。
+
+其余已保留机制可归入三类：
+
+- 公共协议：central ticket、双 token、快照 Claim、fatal 边界、显式
+  route/count；
+- A5 后端：32/64 role、单 lane K2、16×6 单向 drain；
+- 显式能力：随机访问 Build、稠密 task-id、单 completion、no-reclaim
+  TensorMap 实例。
+
+没有发现第三个正在生效的 PA 任务图捷径。7 月 31 日已撤回的
+slot0/1-only drain、AIC/AIV 消费矩阵省写、UP/PV 邻接身份复用、
+PA task-kind 跳过校验和 group 派生量下沉均未回流。
+
+但这不等于 standalone 整体已是全算子公共库。PA batch/meta、
+QK/SF/PV/UP payload、SharedOutputRef 和 UP writer-group 仍是合法的
+PA adapter 实现，不能迁入公共快路。当前公共机制只覆盖 A5 单
+AIC/AIV lane、每 task 一 completion 且不超过 32 tensor/16 scalar/16 fanin
+的算子。Joint、固定 block、multicore、稀疏/复用 task-id 和可回收
+TensorMap 需要新的明确能力，不得用 PA 分支补洞。完整逐项表见
+实现过程 S6.54。

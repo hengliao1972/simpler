@@ -3303,3 +3303,84 @@ AIV baseline/new 149048   350e9fc0a2979b69cf2da118fd191b256d95aa96b1a9da99fb3031
 - A5 B1 从 startup 到 FinalDrain 结束为 `219.311 us`，全部语义断言 PASS；
 - A5 B256 full-swimlane 完整周期为 `1460.694 us`，1,280 个 Build、1,024 个
   kernel、K2 owner、TensorMap 与终态计数全部闭合，无 trace drop。
+
+## 2026-08-04：S6.54 已保留优化的最终算子泛化复核
+
+### 复核口径
+
+本轮复核的是当前正式生产行为，不把文档中已撤回的试验代码
+冒充为现实问题。准入标准是：
+
+1. 公共协议的每个快路必须能由 task-id、route、owner、fanin、completion
+   或明确生命周期能力表达；
+2. A5 后端可以依赖 32 AIC + 64 AIV、单 lane K2 和 16×6 收口拓扑，
+   但不得解释 PA task kind；
+3. 只有 PA adapter 可以解释 batch/group、Alloc/QK/SF/PV/UP、三个 INOUT
+   和 SharedOutputRef；
+4. “对 PA 等价”不能替代“对任意合法算子计划等价”。
+
+### 当前保留机制逐项结论
+
+| 保留机制 | 所需不变量 | 归属与结论 |
+| ---- | ---- | ---- |
+| 本核无工作快退 | token 和候选 cursor 仅由本核修改，plan 只读 | 公共调度优化；不依赖 PA task kind |
+| 中央唯一 Build ticket | task-id 稠密且 adapter 可按 task-id 随机访问构参 | 通用能力合同，不是所有 adapter 天然具备的默认能力 |
+| 不可变紧凑 plan | host 在 launch 前完整发布，device 只读 | 公共协议；PA batch/meta 只是当前 adapter 的 opaque identity |
+| 每核两个 token | 容量满后不再 Claim，已领取 task 保持单一 owner | 算子无关的有界调度策略；容量 2 不是 PA 语义 |
+| 取消 WinnerBuild 跨 task 伪保序 | 只有 TensorMap metadata side effect 必须严格有序，Build payload 互相独立 | 公共调度优化 |
+| scanner 快照直接做 Claim expected | control 快照含完整 generation/task/owner/phase，CAS 失败不读 payload | 公共原子协议优化 |
+| fatal 只在调度和不可逆边界观察 | 已取得的合法工作单元可完成，FinalDrain 有终止收口 | 公共 fail-closed 合同；不按 PA kind 跳过检查 |
+| K2 primary/fallback | A5 单 engine task，executor 必须与 builder 异核 | A5 后端策略；所有满足合同的算子可复用，不是全平台默认 |
+| 16 组单向 execution drain | A5 当前 96 Scalar 且每组精确 6 核 | A5 后端优化；不依赖 PA task 数量或类型 |
+| arrival 中合并 owner-local completion 数 | 每个逻辑 executable task 恰好一个 completion unit | 公共单 completion 合同；multicore/多 completion 必须扩展 |
+| 无回收 TensorMap lookup | launch 显式保证整轮 `reclaim_upto == -1` | 可选生命周期能力；可回收算子不得选用 |
+| winner 重复 fatal 读取消 | 调度边界已观察权威 fatal，当前 winner 负责一个不可拆工作单元 | 公共调度优化 |
+| 显式 `exec_route` 与 `executable_task_count` | 算子计划器逐 task 发布并独立核对 | 公共合同；已删除“每 batch 一个 Alloc”的隐式公式 |
+
+7 月 30–31 日保留的 role SSA、batch-count SSA、loser 支配关系内的
+重复校验消减、winner-only 字段写入、Claim 统计本地累计、三角诊断
+前缀和 AIC 8B output header 快照，全部位于 PA adapter/诊断路径。
+它们中 `batch-count SSA` 和 output 构造本来就是 PA 实现细节，不应迁移为
+公共算法；其余项只能以“支配校验或布局合同已证明”的形式在新
+adapter 中重新选用，不能因 PA 已测过就自动继承。
+
+### 确认存在、但不属于公共优化的 PA 代码
+
+当前 standalone 仍是 PA 首个 adapter，下列代码有意保留算子语义：
+
+- `SharedBuildDispatchTaskIdentity.batch/encoded_meta` 及 PA 随机访问构参；
+- QK/SF/PV/UP 的 function、TensorDesc/scalar/fanin payload shape；
+- task-indexed `SharedOutputRef` 快路与 UP 的 writer-group/history 发布；
+- PA heap/output 规格、batch/group 展开和 host 结果 oracle；
+- 旧 same-core Claim Tournament 的 state/门槛，当前 central-ticket cross-core
+  生产行为不再消费它。
+
+这些内容说明 `pa_scheduler_core.h` 和 `pa_model.h` 不能整份搬入
+simpler 公共调度器。可迁移的边界是 `shared_exec_protocol.h`、
+`a5_exec_policy.h` 以及用通用不变量表达的 scanner/drain 状态机；
+真实公共接入还需要把 plan builder、payload builder、kernel dispatch 和
+completion sink 变为显式 adapter 接口。
+
+### 仍未满足的“所有算子”能力
+
+最终结论不是“已经无条件支持任意算子”。当前只证明了满足以下合同
+的 A5 算子可复用公共机制：稠密 task-id、可随机访问 Build、单 AIC 或
+AIV lane、一 task 一 completion，且 payload 不超过 32 tensor/16 scalar/16 fanin。
+下列算子必须先扩展合同：
+
+- Joint、固定 block affinity、multicore 或一 task 多 completion；
+- 不能按 task-id 独立重建 Build 参数的流式前端；
+- 稀疏/可复用 task-id 或要求 cell generation/ABA 保护的长生命调度；
+- payload 容量超过现有 ABI，或需要不同 completion 发布形式的算子；
+- 一轮内需要 TensorMap 回收的算子不得选用 no-reclaim 实例。
+
+### 最终结论
+
+复核找到的两个真正公共边界问题已分别由 S6.52/S6.53 修正：
+
+1. 删除 `task_count - batches` 的 PA 任务图推导；
+2. 将 K2/owner placement 从 PA adapter 下沉到 A5 后端策略。
+
+当前没有发现第三个**正在生效且改变公共调度语义**的 PA 特例优化。
+但 PA adapter 仍然必然是 PA 代码，并且当前 A5 后端只支持上述单 lane
+算子集。后续迁移应复用协议与能力接口，不应整份复制 PA standalone。

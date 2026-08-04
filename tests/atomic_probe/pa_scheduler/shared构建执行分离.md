@@ -927,6 +927,21 @@ multicore task 时，应替换/扩展后端 placement，而不是向 PA adapter 
 
 首版可以在 standalone PA 上缩小验证范围，但协议字段和失败检查必须为通用算子留出明确扩展点。K2、双 token 和 no-reclaim 都是必须显式选择的调度/生命周期能力，不是 PA 身份带来的默认事实。PA adapter 特例不能进入通用 shared execution runtime。
 
+迁移时不能整份复制 `pa_scheduler_core.h`或 `pa_model.h`。前者同时
+包含 PA replay/adapter 与通用 scanner 原型，后者仍有 batch/meta、
+SharedOutputRef、UP writer history 和旧 Claim Tournament 状态。正式公共化
+应抽取以下四个接口：
+
+1. plan builder：发布 task-id、execution route 与 opaque operator metadata；
+2. payload builder：按 task-id 构建 portable tensor/scalar/fanin payload；
+3. backend placement/dispatch：在 A5 上选 owner 并发射相应 engine；
+4. completion sink：解释 vend/flag 或算子自己的 completion unit。
+
+当前通用原型的明确上限是：稠密 task-id、可随机访问 Build、单
+AIC/AIV lane、一 task 一 completion，payload 不超过 32 tensor/16 scalar/
+16 fanin。超出这些上限的算子是尚未实现的能力扩展，不能使用
+PA task kind 特判冒充支持。
+
 ## 11. 失败、取消和终止
 
 首版 task-indexed cell 不复用，因此失败时不尝试在 device 上“撤销后继续跑”。任一部分发布都进入全局 terminal fatal，半构建 cell 保留现场，host 做精确状态校验。至少需要定义以下路径：

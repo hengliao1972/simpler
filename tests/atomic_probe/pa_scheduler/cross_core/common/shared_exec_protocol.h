@@ -884,9 +884,9 @@ PA_DEVICE bool ValidateExecPayloadSpec(
 }
 
 PA_DEVICE uint64_t PackExecHeaderWord0(uint32_t task_id) {
-    // 高 32 位保留并固定为 0。PA 的 output 由
-    // (producer task_id, output_slot) 标识，completion 也发布到
-    // 当前 task；这里不能再引入第二个含义不清的 task 身份。
+    // 高 32 位保留并固定为 0。公共 execution payload 只携带
+    // 当前逻辑 task-id；output/completion 的索引方式由算子适配层
+    // 和 completion sink 解释，不在通用 header 中隐式增加第二个身份。
     return static_cast<uint64_t>(task_id);
 }
 
